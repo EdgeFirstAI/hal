@@ -1,0 +1,11 @@
+/dist
+/target
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.wheel
+*.egg
+*.egg-info
+cobertura.xml
+coverage.xml
