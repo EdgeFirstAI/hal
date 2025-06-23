@@ -1,0 +1,2 @@
+testdata/camera1080p.* filter=lfs diff=lfs merge=lfs -text
+testdata/camera4k.* filter=lfs diff=lfs merge=lfs -text

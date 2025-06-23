@@ -1,0 +1,14 @@
+[project]
+name = "edgefirst_hal"
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://edgefirst.studio"
+Documentation = "https://doc.edgefirst.ai"
+
+[build-system]
+requires = ["maturin>=1,<2"]
+build-backend = "maturin"
+
+[tool.maturin]
+all-features = false
