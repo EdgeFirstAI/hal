@@ -286,7 +286,7 @@ mod edgefirst_hal {
         ) -> PyResult<Self> {
             let memory = match memory {
                 Some("dma") => Some(crate::TensorMemory::Dma),
-                Some("shm") => Some(crate::TensorMemory::Shm),                
+                Some("shm") => Some(crate::TensorMemory::Shm),
                 Some(inv) => {
                     return Err(PyBufferError::new_err(format!(
                         "Invalid memory type: {}",
