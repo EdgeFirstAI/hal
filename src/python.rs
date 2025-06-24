@@ -277,17 +277,23 @@ mod edgefirst_hal {
     #[pymethods]
     impl Tensor {
         #[new]
-        #[pyo3(signature = (shape, dtype = "float32", memory = "shm", name = None))]
+        #[pyo3(signature = (shape, dtype = "float32", memory = None, name = None))]
         fn __init__(
             shape: Vec<usize>,
             dtype: &str,
-            memory: &str,
+            memory: Option<&str>,
             name: Option<&str>,
         ) -> PyResult<Self> {
             let memory = match memory {
-                "shm" => crate::TensorMemory::Shm,
-                "dma" => crate::TensorMemory::Dma,
-                _ => return Err(PyBufferError::new_err("Invalid memory type")),
+                Some("dma") => Some(crate::TensorMemory::Dma),
+                Some("shm") => Some(crate::TensorMemory::Shm),                
+                Some(inv) => {
+                    return Err(PyBufferError::new_err(format!(
+                        "Invalid memory type: {}",
+                        inv
+                    )));
+                }
+                None => None,
             };
 
             let tensor = match dtype {
