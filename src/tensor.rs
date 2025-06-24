@@ -1,10 +1,6 @@
 use crate::error::{Error, Result};
-use log::warn;
-use nix::{
-    fcntl::OFlag,
-    sys::stat::{fstat, major, minor},
-    unistd::ftruncate,
-};
+use log::{debug, warn};
+use nix::{fcntl::OFlag, sys::stat::fstat, unistd::ftruncate};
 use num_traits::Num;
 use std::{
     ffi::c_void,
@@ -14,6 +10,9 @@ use std::{
     ptr::NonNull,
     sync::{Arc, Mutex},
 };
+
+#[cfg(target_os = "linux")]
+use nix::sys::stat::{major, minor};
 
 pub trait TensorTrait<T>
 where
@@ -103,6 +102,7 @@ where
         Self::new(shape, None, name)
     }
 
+    #[cfg(target_os = "linux")]
     fn from_fd(fd: OwnedFd, shape: &[usize], name: Option<&str>) -> Result<Self> {
         let stat = fstat(&fd)?;
         let major = major(stat.st_dev);
@@ -127,6 +127,21 @@ where
                 Err(Error::UnknownDeviceType(major, minor))
             }
         }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn from_fd(fd: OwnedFd, shape: &[usize], name: Option<&str>) -> Result<Self> {
+        if shape.is_empty() {
+            return Err(Error::InvalidSize(0));
+        }
+
+        let size = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+        if size == 0 {
+            return Err(Error::InvalidSize(0));
+        }
+
+        // Default to shared memory for non-Linux platforms
+        ShmTensor::<T>::from_fd(fd, shape, name).map(Tensor::Shm)
     }
 
     fn clone_fd(&self) -> Result<OwnedFd> {
@@ -239,6 +254,7 @@ impl<T> TensorTrait<T> for DmaTensor<T>
 where
     T: Num + Clone + std::fmt::Debug,
 {
+    #[cfg(target_os = "linux")]
     fn new(shape: &[usize], name: Option<&str>) -> Result<Self> {
         let size = shape.iter().product::<usize>() * std::mem::size_of::<T>();
         let name = match name {
@@ -256,7 +272,7 @@ where
 
         let dma_fd = heap.allocate(size)?;
         let stat = fstat(&dma_fd)?;
-        println!("DMA memory stat: {:?}", stat);
+        debug!("DMA memory stat: {:?}", stat);
 
         Ok(DmaTensor::<T> {
             name: name.to_owned(),
@@ -264,6 +280,13 @@ where
             shape: shape.to_vec(),
             _marker: std::marker::PhantomData,
         })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn new(_shape: &[usize], _name: Option<&str>) -> Result<Self> {
+        Err(Error::UnsupportedOperation(
+            "DMA tensors are not supported on this platform".to_owned(),
+        ))
     }
 
     fn from_fd(fd: OwnedFd, shape: &[usize], name: Option<&str>) -> Result<Self> {
@@ -442,14 +465,8 @@ where
         }
 
         ftruncate(&shm_fd, size as i64)?;
-
         let stat = fstat(&shm_fd)?;
-        println!("Shared memory stat: {:?}", stat);
-        println!(
-            "Shared memory major: {}, minor: {}",
-            major(stat.st_dev),
-            minor(stat.st_dev)
-        );
+        debug!("Shared memory stat: {:?}", stat);
 
         Ok(ShmTensor::<T> {
             name: name.to_owned(),
