@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use log::{debug, warn};
+use log::{debug, trace, warn};
 use nix::{fcntl::OFlag, sys::stat::fstat, unistd::ftruncate};
 use num_traits::Num;
 use std::{
@@ -346,7 +346,7 @@ where
             )?
         };
 
-        println!("Mapping DMA memory: {:?}", ptr);
+        trace!("Mapping DMA memory: {:?}", ptr);
 
         Ok(TensorMap::Dma(DmaMap {
             ptr: Arc::new(Mutex::new(
@@ -401,7 +401,6 @@ where
     }
 
     fn unmap(&mut self) {
-        println!("Unmapping DMA memory...");
         let ptr = self.ptr.lock().expect("Failed to lock DmaMap pointer");
         let err = unsafe { nix::sys::mman::munmap(*ptr, self.size()) };
         if let Err(e) = err {
@@ -415,7 +414,7 @@ where
     T: Num + Clone + std::fmt::Debug,
 {
     fn drop(&mut self) {
-        println!("DmaMap dropped, unmapping memory: {:?}", self.to_vec());
+        trace!("DmaMap dropped, unmapping memory: {:?}", self.to_vec());
         self.unmap();
     }
 }
@@ -450,7 +449,7 @@ where
             nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
         )?;
 
-        println!("Creating shared memory: {}", name);
+        trace!("Creating shared memory: {}", name);
 
         // We drop the shared memory object name after creating it to avoid
         // leaving it in the system after the program exits.  The sharing model
@@ -533,7 +532,7 @@ where
             )?
         };
 
-        println!("Mapping shared memory: {:?}", ptr);
+        trace!("Mapping shared memory: {:?}", ptr);
 
         Ok(TensorMap::Shm(ShmMap {
             ptr: Arc::new(Mutex::new(
@@ -588,7 +587,6 @@ where
     }
 
     fn unmap(&mut self) {
-        println!("Unmapping shared memory...");
         let ptr = self.ptr.lock().expect("Failed to lock ShmMap pointer");
         let err = unsafe { nix::sys::mman::munmap(*ptr, self.size()) };
         if let Err(e) = err {
@@ -602,7 +600,7 @@ where
     T: Num + Clone + std::fmt::Debug,
 {
     fn drop(&mut self) {
-        println!("ShmMap dropped, unmapping memory: {:?}", self.to_vec());
+        trace!("ShmMap dropped, unmapping memory: {:?}", self.to_vec());
         self.unmap();
     }
 }
@@ -613,6 +611,11 @@ mod tests {
     use std::io::Write as _;
 
     use super::*;
+
+    #[ctor::ctor]
+    fn init() {
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    }
 
     #[test]
     fn test_tensor() {
@@ -655,9 +658,11 @@ mod tests {
         let tensor =
             DmaTensor::<f32>::new(&shape, Some("test_tensor")).expect("Failed to create tensor");
 
+        assert_eq!(tensor.memory(), TensorMemory::Dma);
+        assert_eq!(tensor.name(), "test_tensor");
         assert_eq!(tensor.shape(), &shape);
         assert_eq!(tensor.size(), 2 * 3 * 4 * std::mem::size_of::<f32>());
-        assert_eq!(tensor.name(), "test_tensor");
+        assert_eq!(tensor.len(), 2 * 3 * 4);
 
         {
             let mut tensor_map = tensor.map().expect("Failed to map DMA memory");
@@ -676,6 +681,7 @@ mod tests {
             .expect("Failed to create tensor from fd");
 
             assert_eq!(shared.memory(), TensorMemory::Dma);
+            assert_eq!(shared.name(), "test_tensor_shared");
             assert_eq!(shared.shape(), &shape);
 
             let mut tensor_map = shared.map().expect("Failed to map DMA memory from fd");
@@ -685,7 +691,7 @@ mod tests {
 
         {
             let tensor_map = tensor.map().expect("Failed to map DMA memory");
-            println!("Mapped tensor: {:?}", tensor_map.to_vec());
+            assert!(tensor_map.iter().all(|&x| x == 3.14));
         }
 
         let mut tensor = DmaTensor::<u8>::new(&shape, None).expect("Failed to create tensor");
@@ -714,8 +720,8 @@ mod tests {
         {
             let mut tensor_map = tensor.map().expect("Failed to map DMA memory");
             tensor_map[2] = 42;
+            assert_eq!(tensor_map[1], 1, "Value at index 1 should be 1");
             assert_eq!(tensor_map[2], 42, "Value at index 2 should be 42");
-            println!("Mapped tensor: {:?}", tensor_map.to_vec());
         }
     }
 
@@ -745,6 +751,7 @@ mod tests {
             .expect("Failed to create tensor from fd");
 
             assert_eq!(shared.memory(), TensorMemory::Shm);
+            assert_eq!(shared.name(), "test_tensor_shared");
             assert_eq!(shared.shape(), &shape);
 
             let mut tensor_map = shared.map().expect("Failed to map shared memory from fd");
@@ -754,7 +761,7 @@ mod tests {
 
         {
             let tensor_map = tensor.map().expect("Failed to map shared memory");
-            println!("Mapped tensor: {:?}", tensor_map.to_vec());
+            assert!(tensor_map.iter().all(|&x| x == 3.14));
         }
 
         let mut tensor = ShmTensor::<u8>::new(&shape, None).expect("Failed to create tensor");
@@ -783,8 +790,8 @@ mod tests {
         {
             let mut tensor_map = tensor.map().expect("Failed to map shared memory");
             tensor_map[2] = 42;
+            assert_eq!(tensor_map[1], 1, "Value at index 1 should be 1");
             assert_eq!(tensor_map[2], 42, "Value at index 2 should be 42");
-            println!("Mapped tensor: {:?}", tensor_map.to_vec());
         }
     }
 }
