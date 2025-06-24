@@ -31,50 +31,6 @@ mod edgefirst_hal {
     }
 
     impl TensorT {
-        // pub fn new(
-        //     shape: &[usize],
-        //     dtype: &str,
-        //     memory: TensorMemory,
-        //     name: Option<&str>,
-        // ) -> Result<Self> {
-        //     match dtype {
-        //         "u8" => Ok(TensorT::TensorU8(crate::Tensor::<u8>::new(
-        //             shape, memory, name,
-        //         )?)),
-        //         "int8" => Ok(TensorT::TensorI8(crate::Tensor::<i8>::new(
-        //             shape, memory, name,
-        //         )?)),
-        //         "u16" => Ok(TensorT::TensorU16(crate::Tensor::<u16>::new(
-        //             shape, memory, name,
-        //         )?)),
-        //         "i16" => Ok(TensorT::TensorI16(crate::Tensor::<i16>::new(
-        //             shape, memory, name,
-        //         )?)),
-        //         "u32" => Ok(TensorT::TensorU32(crate::Tensor::<u32>::new(
-        //             shape, memory, name,
-        //         )?)),
-        //         "i32" => Ok(TensorT::TensorI32(crate::Tensor::<i32>::new(
-        //             shape, memory, name,
-        //         )?)),
-        //         "u64" => Ok(TensorT::TensorU64(crate::Tensor::<u64>::new(
-        //             shape, memory, name,
-        //         )?)),
-        //         "i64" => Ok(TensorT::TensorI64(crate::Tensor::<i64>::new(
-        //             shape, memory, name,
-        //         )?)),
-        //         "f32" => Ok(TensorT::TensorF32(crate::Tensor::<f32>::new(
-        //             shape, memory, name,
-        //         )?)),
-        //         "f64" => Ok(TensorT::TensorF64(crate::Tensor::<f64>::new(
-        //             shape, memory, name,
-        //         )?)),
-        //         _ => Err(Error::NotImplemented(format!(
-        //             "Unsupported dtype: {}",
-        //             dtype
-        //         ))),
-        //     }
-        // }
-
         pub fn dtype(&self) -> String {
             match self {
                 TensorT::TensorU8(_) => "uint8".to_string(),
@@ -104,21 +60,6 @@ mod edgefirst_hal {
                 TensorT::TensorF64(t) => t.size(),
             }
         }
-
-        // pub fn element_size(&self) -> usize {
-        //     match self {
-        //         TensorT::TensorU8(_) => std::mem::size_of::<u8>(),
-        //         TensorT::TensorI8(_) => std::mem::size_of::<i8>(),
-        //         TensorT::TensorU16(_) => std::mem::size_of::<u16>(),
-        //         TensorT::TensorI16(_) => std::mem::size_of::<i16>(),
-        //         TensorT::TensorU32(_) => std::mem::size_of::<u32>(),
-        //         TensorT::TensorI32(_) => std::mem::size_of::<i32>(),
-        //         TensorT::TensorU64(_) => std::mem::size_of::<u64>(),
-        //         TensorT::TensorI64(_) => std::mem::size_of::<i64>(),
-        //         TensorT::TensorF32(_) => std::mem::size_of::<f32>(),
-        //         TensorT::TensorF64(_) => std::mem::size_of::<f64>(),
-        //     }
-        // }
 
         pub fn memory(&self) -> TensorMemory {
             match self {
@@ -255,6 +196,7 @@ mod edgefirst_hal {
             }
         }
 
+        #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
         pub fn element_size(&self) -> usize {
             match self {
                 TensorMapT::TensorU8(_) => std::mem::size_of::<u8>(),
