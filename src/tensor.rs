@@ -115,16 +115,12 @@ where
 
         match minor {
             10 => {
-                // Major number 10 indicates DMA memory
+                // minor number 10 indicates DMA memory
                 DmaTensor::<T>::from_fd(fd, shape, name).map(Tensor::Dma)
             }
-            27 => {
-                // Major number 27 indicates shared memory
-                ShmTensor::<T>::from_fd(fd, shape, name).map(Tensor::Shm)
-            }
             _ => {
-                // Unknown memory type, return an error
-                Err(Error::UnknownDeviceType(major, minor))
+                // other minor numbers are assumed to be shared memory
+                ShmTensor::<T>::from_fd(fd, shape, name).map(Tensor::Shm)
             }
         }
     }
