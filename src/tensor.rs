@@ -613,8 +613,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use nix::unistd::AccessFlags;
-    use nix::unistd::access;
+    use nix::unistd::{AccessFlags, access};
     use std::io::Write as _;
 
     use super::*;
