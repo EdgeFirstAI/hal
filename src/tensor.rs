@@ -1,6 +1,10 @@
 use crate::error::{Error, Result};
 use log::warn;
-use nix::{fcntl::OFlag, unistd::ftruncate};
+use nix::{
+    fcntl::OFlag,
+    sys::stat::{fstat, major, minor},
+    unistd::ftruncate,
+};
 use num_traits::Num;
 use std::{
     ffi::c_void,
@@ -71,6 +75,7 @@ pub enum Tensor<T>
 where
     T: Num + Clone + std::fmt::Debug,
 {
+    Dma(DmaTensor<T>),
     Shm(ShmTensor<T>),
 }
 
@@ -78,12 +83,14 @@ impl<T> Tensor<T>
 where
     T: Num + Clone + std::fmt::Debug,
 {
-    pub fn new(shape: &[usize], memory: TensorMemory, name: Option<&str>) -> Result<Self> {
+    pub fn new(shape: &[usize], memory: Option<TensorMemory>, name: Option<&str>) -> Result<Self> {
         match memory {
-            TensorMemory::Dma => Err(Error::NotImplemented(
-                "DMA tensor not implemented".to_string(),
-            )),
-            TensorMemory::Shm => ShmTensor::<T>::new(shape, name).map(Tensor::Shm),
+            Some(TensorMemory::Dma) => DmaTensor::<T>::new(shape, name).map(Tensor::Dma),
+            Some(TensorMemory::Shm) => ShmTensor::<T>::new(shape, name).map(Tensor::Shm),
+            None => match DmaTensor::<T>::new(shape, name) {
+                Ok(tensor) => Ok(Tensor::Dma(tensor)),
+                Err(_) => ShmTensor::<T>::new(shape, name).map(Tensor::Shm),
+            },
         }
     }
 }
@@ -93,45 +100,73 @@ where
     T: Num + Clone + std::fmt::Debug,
 {
     fn new(shape: &[usize], name: Option<&str>) -> Result<Self> {
-        Self::new(shape, TensorMemory::Shm, name)
+        Self::new(shape, None, name)
     }
 
     fn from_fd(fd: OwnedFd, shape: &[usize], name: Option<&str>) -> Result<Self> {
-        ShmTensor::<T>::from_fd(fd, shape, name).map(Tensor::Shm)
+        let stat = fstat(&fd)?;
+        let major = major(stat.st_dev);
+        let minor = minor(stat.st_dev);
+
+        if major != 0 {
+            // Dma and Shm tensors are expected to have major number 0
+            return Err(Error::UnknownDeviceType(major, minor));
+        }
+
+        match minor {
+            10 => {
+                // Major number 10 indicates DMA memory
+                DmaTensor::<T>::from_fd(fd, shape, name).map(Tensor::Dma)
+            }
+            27 => {
+                // Major number 27 indicates shared memory
+                ShmTensor::<T>::from_fd(fd, shape, name).map(Tensor::Shm)
+            }
+            _ => {
+                // Unknown memory type, return an error
+                Err(Error::UnknownDeviceType(major, minor))
+            }
+        }
     }
 
     fn clone_fd(&self) -> Result<OwnedFd> {
         match self {
+            Tensor::Dma(t) => t.clone_fd(),
             Tensor::Shm(t) => t.clone_fd(),
         }
     }
 
     fn memory(&self) -> TensorMemory {
         match self {
-            Tensor::Shm(t) => t.memory(),
+            Tensor::Dma(_) => TensorMemory::Dma,
+            Tensor::Shm(_) => TensorMemory::Shm,
         }
     }
 
     fn name(&self) -> String {
         match self {
+            Tensor::Dma(t) => t.name(),
             Tensor::Shm(t) => t.name(),
         }
     }
 
     fn shape(&self) -> &[usize] {
         match self {
+            Tensor::Dma(t) => t.shape(),
             Tensor::Shm(t) => t.shape(),
         }
     }
 
     fn reshape(&mut self, shape: &[usize]) -> Result<()> {
         match self {
+            Tensor::Dma(t) => t.reshape(shape),
             Tensor::Shm(t) => t.reshape(shape),
         }
     }
 
     fn map(&self) -> Result<TensorMap<T>> {
         match self {
+            Tensor::Dma(t) => t.map(),
             Tensor::Shm(t) => t.map(),
         }
     }
@@ -141,6 +176,7 @@ pub enum TensorMap<T>
 where
     T: Num + Clone + std::fmt::Debug,
 {
+    Dma(DmaMap<T>),
     Shm(ShmMap<T>),
 }
 
@@ -150,12 +186,14 @@ where
 {
     fn shape(&self) -> &[usize] {
         match self {
+            TensorMap::Dma(map) => &map.shape,
             TensorMap::Shm(map) => &map.shape,
         }
     }
 
     fn unmap(&mut self) {
         match self {
+            TensorMap::Dma(map) => map.unmap(),
             TensorMap::Shm(map) => map.unmap(),
         }
     }
@@ -169,6 +207,7 @@ where
 
     fn deref(&self) -> &[T] {
         match self {
+            TensorMap::Dma(map) => map.deref(),
             TensorMap::Shm(map) => map.deref(),
         }
     }
@@ -180,8 +219,185 @@ where
 {
     fn deref_mut(&mut self) -> &mut [T] {
         match self {
+            TensorMap::Dma(map) => map.deref_mut(),
             TensorMap::Shm(map) => map.deref_mut(),
         }
+    }
+}
+
+pub struct DmaTensor<T>
+where
+    T: Num + Clone + std::fmt::Debug,
+{
+    pub name: String,
+    pub fd: OwnedFd,
+    pub shape: Vec<usize>,
+    pub _marker: std::marker::PhantomData<T>,
+}
+
+impl<T> TensorTrait<T> for DmaTensor<T>
+where
+    T: Num + Clone + std::fmt::Debug,
+{
+    fn new(shape: &[usize], name: Option<&str>) -> Result<Self> {
+        let size = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+        let name = match name {
+            Some(name) => name.to_owned(),
+            None => format!(
+                "/{}",
+                random_string::generate(16, random_string::charsets::ALPHANUMERIC)
+            ),
+        };
+
+        let heap = match dma_heap::Heap::new(dma_heap::HeapKind::Cma) {
+            Ok(heap) => heap,
+            Err(_) => dma_heap::Heap::new(dma_heap::HeapKind::System)?,
+        };
+
+        let dma_fd = heap.allocate(size)?;
+        let stat = fstat(&dma_fd)?;
+        println!("DMA memory stat: {:?}", stat);
+
+        Ok(DmaTensor::<T> {
+            name: name.to_owned(),
+            fd: dma_fd,
+            shape: shape.to_vec(),
+            _marker: std::marker::PhantomData,
+        })
+    }
+
+    fn from_fd(fd: OwnedFd, shape: &[usize], name: Option<&str>) -> Result<Self> {
+        if shape.is_empty() {
+            return Err(Error::InvalidSize(0));
+        }
+
+        let size = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+        if size == 0 {
+            return Err(Error::InvalidSize(0));
+        }
+
+        Ok(DmaTensor {
+            name: name.unwrap_or("").to_owned(),
+            fd,
+            shape: shape.to_vec(),
+            _marker: std::marker::PhantomData,
+        })
+    }
+
+    fn clone_fd(&self) -> Result<OwnedFd> {
+        Ok(self.fd.try_clone()?)
+    }
+
+    fn memory(&self) -> TensorMemory {
+        TensorMemory::Dma
+    }
+
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    fn reshape(&mut self, shape: &[usize]) -> Result<()> {
+        if shape.is_empty() {
+            return Err(Error::InvalidSize(0));
+        }
+
+        let new_size = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+        if new_size != self.size() {
+            return Err(Error::ShapeVolumeMismatch);
+        }
+
+        self.shape = shape.to_vec();
+        Ok(())
+    }
+
+    fn map(&self) -> Result<TensorMap<T>> {
+        let size = NonZero::new(self.size()).ok_or(Error::InvalidSize(self.size()))?;
+        let ptr = unsafe {
+            nix::sys::mman::mmap(
+                None,
+                size,
+                nix::sys::mman::ProtFlags::PROT_READ | nix::sys::mman::ProtFlags::PROT_WRITE,
+                nix::sys::mman::MapFlags::MAP_SHARED,
+                &self.fd,
+                0,
+            )?
+        };
+
+        println!("Mapping DMA memory: {:?}", ptr);
+
+        Ok(TensorMap::Dma(DmaMap {
+            ptr: Arc::new(Mutex::new(
+                NonNull::new(ptr.as_ptr()).ok_or(Error::InvalidSize(self.size()))?,
+            )),
+            shape: self.shape.clone(),
+            _marker: std::marker::PhantomData,
+        }))
+    }
+}
+
+pub struct DmaMap<T>
+where
+    T: Num + Clone + std::fmt::Debug,
+{
+    ptr: Arc<Mutex<NonNull<c_void>>>,
+    shape: Vec<usize>,
+    _marker: std::marker::PhantomData<T>,
+}
+
+unsafe impl<T> Send for DmaMap<T> where T: Num + Clone + std::fmt::Debug {}
+unsafe impl<T> Sync for DmaMap<T> where T: Num + Clone + std::fmt::Debug {}
+
+impl<T> Deref for DmaMap<T>
+where
+    T: Num + Clone + std::fmt::Debug,
+{
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        let ptr = self.ptr.lock().expect("Failed to lock DmaMap pointer");
+        unsafe { std::slice::from_raw_parts(ptr.as_ptr() as *const T, self.len()) }
+    }
+}
+
+impl<T> DerefMut for DmaMap<T>
+where
+    T: Num + Clone + std::fmt::Debug,
+{
+    fn deref_mut(&mut self) -> &mut [T] {
+        let ptr = self.ptr.lock().expect("Failed to lock DmaMap pointer");
+        unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr() as *mut T, self.len()) }
+    }
+}
+
+impl<T> TensorMapTrait<T> for DmaMap<T>
+where
+    T: Num + Clone + std::fmt::Debug,
+{
+    fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    fn unmap(&mut self) {
+        println!("Unmapping DMA memory...");
+        let ptr = self.ptr.lock().expect("Failed to lock DmaMap pointer");
+        let err = unsafe { nix::sys::mman::munmap(*ptr, self.size()) };
+        if let Err(e) = err {
+            warn!("Failed to unmap DMA memory: {}", e);
+        }
+    }
+}
+
+impl<T> Drop for DmaMap<T>
+where
+    T: Num + Clone + std::fmt::Debug,
+{
+    fn drop(&mut self) {
+        println!("DmaMap dropped, unmapping memory: {:?}", self.to_vec());
+        self.unmap();
     }
 }
 
@@ -226,6 +442,14 @@ where
         }
 
         ftruncate(&shm_fd, size as i64)?;
+
+        let stat = fstat(&shm_fd)?;
+        println!("Shared memory stat: {:?}", stat);
+        println!(
+            "Shared memory major: {}, minor: {}",
+            major(stat.st_dev),
+            minor(stat.st_dev)
+        );
 
         Ok(ShmTensor::<T> {
             name: name.to_owned(),
@@ -327,10 +551,7 @@ where
     type Target = [T];
 
     fn deref(&self) -> &[T] {
-        let ptr = self
-            .ptr
-            .lock()
-            .expect("Failed to lock ShmMap pointer");
+        let ptr = self.ptr.lock().expect("Failed to lock ShmMap pointer");
         unsafe { std::slice::from_raw_parts(ptr.as_ptr() as *const T, self.len()) }
     }
 }
@@ -340,10 +561,7 @@ where
     T: Num + Clone + std::fmt::Debug,
 {
     fn deref_mut(&mut self) -> &mut [T] {
-        let ptr = self
-            .ptr
-            .lock()
-            .expect("Failed to lock ShmMap pointer");
+        let ptr = self.ptr.lock().expect("Failed to lock ShmMap pointer");
         unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr() as *mut T, self.len()) }
     }
 }
@@ -358,10 +576,7 @@ where
 
     fn unmap(&mut self) {
         println!("Unmapping shared memory...");
-        let ptr = self
-            .ptr
-            .lock()
-            .expect("Failed to lock ShmMap pointer");
+        let ptr = self.ptr.lock().expect("Failed to lock ShmMap pointer");
         let err = unsafe { nix::sys::mman::munmap(*ptr, self.size()) };
         if let Err(e) = err {
             warn!("Failed to unmap shared memory: {}", e);
@@ -381,7 +596,116 @@ where
 
 #[cfg(test)]
 mod tests {
+    use nix::unistd::AccessFlags;
+    use nix::unistd::access;
+    use std::io::Write as _;
+
     use super::*;
+
+    #[test]
+    fn test_tensor() {
+        let shape = vec![1];
+        let tensor = DmaTensor::<f32>::new(&shape, Some("dma_tensor"));
+        let dma_enabled = tensor.is_ok();
+
+        let tensor = Tensor::<f32>::new(&shape, None, None).expect("Failed to create tensor");
+        match dma_enabled {
+            true => assert_eq!(tensor.memory(), TensorMemory::Dma),
+            false => assert_eq!(tensor.memory(), TensorMemory::Shm),
+        }
+    }
+
+    #[test]
+    fn test_dma_tensor() {
+        match access(
+            "/dev/dma_heap/linux,cma",
+            AccessFlags::R_OK | AccessFlags::W_OK,
+        ) {
+            Ok(_) => println!("/dev/dma_heap/linux,cma is available"),
+            Err(_) => match access(
+                "/dev/dma_heap/system",
+                AccessFlags::R_OK | AccessFlags::W_OK,
+            ) {
+                Ok(_) => println!("/dev/dma_heap/system is available"),
+                Err(e) => {
+                    write!(
+                        &mut std::io::stdout(),
+                        "[WARNING] DMA Heap is unavailable: {}\n",
+                        e
+                    )
+                    .unwrap();
+                    return;
+                }
+            },
+        }
+
+        let shape = vec![2, 3, 4];
+        let tensor =
+            DmaTensor::<f32>::new(&shape, Some("test_tensor")).expect("Failed to create tensor");
+
+        assert_eq!(tensor.shape(), &shape);
+        assert_eq!(tensor.size(), 2 * 3 * 4 * std::mem::size_of::<f32>());
+        assert_eq!(tensor.name(), "test_tensor");
+
+        {
+            let mut tensor_map = tensor.map().expect("Failed to map DMA memory");
+            tensor_map.fill(42.0);
+            assert!(tensor_map.iter().all(|&x| x == 42.0));
+        }
+
+        {
+            let shared = Tensor::<f32>::from_fd(
+                tensor
+                    .clone_fd()
+                    .expect("Failed to duplicate tensor file descriptor"),
+                &shape,
+                Some("test_tensor_shared"),
+            )
+            .expect("Failed to create tensor from fd");
+
+            assert_eq!(shared.memory(), TensorMemory::Dma);
+            assert_eq!(shared.shape(), &shape);
+
+            let mut tensor_map = shared.map().expect("Failed to map DMA memory from fd");
+            tensor_map.fill(3.14);
+            assert!(tensor_map.iter().all(|&x| x == 3.14));
+        }
+
+        {
+            let tensor_map = tensor.map().expect("Failed to map DMA memory");
+            println!("Mapped tensor: {:?}", tensor_map.to_vec());
+        }
+
+        let mut tensor = DmaTensor::<u8>::new(&shape, None).expect("Failed to create tensor");
+        assert_eq!(tensor.shape(), &shape);
+        let new_shape = vec![3, 4, 4];
+        assert!(
+            tensor.reshape(&new_shape).is_err(),
+            "Reshape should fail due to size mismatch"
+        );
+        assert_eq!(tensor.shape(), &shape, "Shape should remain unchanged");
+
+        let new_shape = vec![2, 3, 4];
+        tensor.reshape(&new_shape).expect("Reshape should succeed");
+        assert_eq!(
+            tensor.shape(),
+            &new_shape,
+            "Shape should be updated after successful reshape"
+        );
+
+        {
+            let mut tensor_map = tensor.map().expect("Failed to map DMA memory");
+            tensor_map.fill(1);
+            assert!(tensor_map.iter().all(|&x| x == 1));
+        }
+
+        {
+            let mut tensor_map = tensor.map().expect("Failed to map DMA memory");
+            tensor_map[2] = 42;
+            assert_eq!(tensor_map[2], 42, "Value at index 2 should be 42");
+            println!("Mapped tensor: {:?}", tensor_map.to_vec());
+        }
+    }
 
     #[test]
     fn test_shm_tensor() {
@@ -399,7 +723,7 @@ mod tests {
         }
 
         {
-            let shared = ShmTensor::<f32>::from_fd(
+            let shared = Tensor::<f32>::from_fd(
                 tensor
                     .clone_fd()
                     .expect("Failed to duplicate tensor file descriptor"),
@@ -407,6 +731,9 @@ mod tests {
                 Some("test_tensor_shared"),
             )
             .expect("Failed to create tensor from fd");
+
+            assert_eq!(shared.memory(), TensorMemory::Shm);
+            assert_eq!(shared.shape(), &shape);
 
             let mut tensor_map = shared.map().expect("Failed to map shared memory from fd");
             tensor_map.fill(3.14);

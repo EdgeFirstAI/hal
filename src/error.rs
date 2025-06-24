@@ -7,6 +7,7 @@ pub enum Error {
     NotImplemented(String),
     InvalidSize(usize),
     ShapeVolumeMismatch,
+    UnknownDeviceType(u64, u64),
 }
 
 impl From<std::io::Error> for Error {
@@ -29,6 +30,9 @@ impl std::fmt::Display for Error {
             Error::NotImplemented(msg) => write!(f, "Not implemented: {}", msg),
             Error::InvalidSize(size) => write!(f, "Invalid size: {}", size),
             Error::ShapeVolumeMismatch => write!(f, "Shape volume mismatch"),
+            Error::UnknownDeviceType(major, minor) => {
+                write!(f, "Unknown device type: {}:{}", major, minor)
+            }
         }
     }
 }
