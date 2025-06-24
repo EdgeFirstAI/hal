@@ -8,6 +8,7 @@ pub enum Error {
     InvalidSize(usize),
     ShapeVolumeMismatch,
     UnknownDeviceType(u64, u64),
+    UnsupportedOperation(String),
 }
 
 impl From<std::io::Error> for Error {
@@ -33,6 +34,7 @@ impl std::fmt::Display for Error {
             Error::UnknownDeviceType(major, minor) => {
                 write!(f, "Unknown device type: {}:{}", major, minor)
             }
+            Error::UnsupportedOperation(op) => write!(f, "Unsupported operation: {}", op),
         }
     }
 }
