@@ -368,6 +368,7 @@ where
             return Err(Error::InvalidSize(0));
         }
 
+        #[cfg(target_os = "linux")]
         crate::dmabuf::start_readwrite(&fd)?;
 
         let ptr = unsafe {
@@ -431,6 +432,7 @@ where
             warn!("Failed to unmap DMA memory: {}", e);
         }
 
+        #[cfg(target_os = "linux")]
         if let Err(e) = crate::dmabuf::end_readwrite(&self.fd) {
             warn!("Failed to end read/write on DMA memory: {}", e);
         }
