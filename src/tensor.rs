@@ -334,27 +334,10 @@ where
     }
 
     fn map(&self) -> Result<TensorMap<T>> {
-        let size = NonZero::new(self.size()).ok_or(Error::InvalidSize(self.size()))?;
-        let ptr = unsafe {
-            nix::sys::mman::mmap(
-                None,
-                size,
-                nix::sys::mman::ProtFlags::PROT_READ | nix::sys::mman::ProtFlags::PROT_WRITE,
-                nix::sys::mman::MapFlags::MAP_SHARED,
-                &self.fd,
-                0,
-            )?
-        };
-
-        trace!("Mapping DMA memory: {:?}", ptr);
-
-        Ok(TensorMap::Dma(DmaMap {
-            ptr: Arc::new(Mutex::new(
-                NonNull::new(ptr.as_ptr()).ok_or(Error::InvalidSize(self.size()))?,
-            )),
-            shape: self.shape.clone(),
-            _marker: std::marker::PhantomData,
-        }))
+        Ok(TensorMap::Dma(DmaMap::new(
+            self.fd.try_clone()?,
+            &self.shape,
+        )?))
     }
 }
 
@@ -363,12 +346,53 @@ where
     T: Num + Clone + std::fmt::Debug,
 {
     ptr: Arc<Mutex<NonNull<c_void>>>,
+    fd: OwnedFd,
     shape: Vec<usize>,
     _marker: std::marker::PhantomData<T>,
 }
 
 unsafe impl<T> Send for DmaMap<T> where T: Num + Clone + std::fmt::Debug {}
 unsafe impl<T> Sync for DmaMap<T> where T: Num + Clone + std::fmt::Debug {}
+
+impl<T> DmaMap<T>
+where
+    T: Num + Clone + std::fmt::Debug,
+{
+    pub fn new(fd: OwnedFd, shape: &[usize]) -> Result<Self> {
+        if shape.is_empty() {
+            return Err(Error::InvalidSize(0));
+        }
+
+        let size = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+        if size == 0 {
+            return Err(Error::InvalidSize(0));
+        }
+
+        crate::dmabuf::start_readwrite(&fd)?;
+
+        let ptr = unsafe {
+            nix::sys::mman::mmap(
+                None,
+                NonZero::new(size).ok_or(Error::InvalidSize(size))?,
+                nix::sys::mman::ProtFlags::PROT_READ | nix::sys::mman::ProtFlags::PROT_WRITE,
+                nix::sys::mman::MapFlags::MAP_SHARED,
+                &fd,
+                0,
+            )?
+        };
+
+        trace!("Mapping DMA memory: {:?}", ptr);
+
+        Ok(DmaMap {
+            ptr: Arc::new(Mutex::new(
+                NonNull::new(ptr.as_ptr()).ok_or(Error::InvalidSize(size))?,
+            )),
+            fd,
+            shape: shape.to_vec(),
+            _marker: std::marker::PhantomData,
+        })
+    }
+}
 
 impl<T> Deref for DmaMap<T>
 where
@@ -402,9 +426,13 @@ where
 
     fn unmap(&mut self) {
         let ptr = self.ptr.lock().expect("Failed to lock DmaMap pointer");
-        let err = unsafe { nix::sys::mman::munmap(*ptr, self.size()) };
-        if let Err(e) = err {
+
+        if let Err(e) = unsafe { nix::sys::mman::munmap(*ptr, self.size()) } {
             warn!("Failed to unmap DMA memory: {}", e);
+        }
+
+        if let Err(e) = crate::dmabuf::end_readwrite(&self.fd) {
+            warn!("Failed to end read/write on DMA memory: {}", e);
         }
     }
 }
