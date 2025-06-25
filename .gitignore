@@ -11,3 +11,4 @@ __pycache__
 cobertura.xml
 coverage.xml
 .DS_Store
+/*.jpg

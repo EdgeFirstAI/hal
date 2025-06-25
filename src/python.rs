@@ -270,6 +270,7 @@ mod edgefirst_hal {
             match self.0.memory() {
                 crate::TensorMemory::Shm => "shm".to_string(),
                 crate::TensorMemory::Dma => "dma".to_string(),
+                crate::TensorMemory::Mem => "mem".to_string(),
             }
         }
 
@@ -625,25 +626,11 @@ mod edgefirst_hal {
                 (*view).obj = slf.into_ptr();
             }
 
-            unsafe {
-                println!(
-                    "Buffer view created ptr: {:?} len: {:?} itemsize: {:?} ndim: {:?}",
-                    (*view).buf,
-                    (*view).len,
-                    (*view).itemsize,
-                    (*view).ndim,
-                );
-            }
-
             Ok(())
         }
 
         #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
         unsafe fn __releasebuffer__(&mut self, view: *mut Py_buffer) {
-            println!(
-                "tensorMap::__releasebuffer__ buffer: {:?}",
-                self.mapped.as_ref().map(|m| m.shape())
-            );
             drop(unsafe { CString::from_raw((*view).format) });
             drop(unsafe { Box::from_raw((*view).shape) });
         }
@@ -657,10 +644,6 @@ mod edgefirst_hal {
         }
 
         fn __exit__(&mut self, _exc_type: PyObject, _exc_value: PyObject, _traceback: PyObject) {
-            println!(
-                "TensorMap::__exit__ - unmapping buffer: {:?}",
-                self.mapped.as_ref().map(|m| m.shape())
-            );
             self.mapped = None; // Release the mapped buffer
         }
 
