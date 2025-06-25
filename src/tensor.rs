@@ -68,6 +68,7 @@ where
 pub enum TensorMemory {
     Dma,
     Shm,
+    Mem,
 }
 
 pub enum Tensor<T>
@@ -76,6 +77,7 @@ where
 {
     Dma(DmaTensor<T>),
     Shm(ShmTensor<T>),
+    Mem(MemTensor<T>),
 }
 
 impl<T> Tensor<T>
@@ -86,9 +88,13 @@ where
         match memory {
             Some(TensorMemory::Dma) => DmaTensor::<T>::new(shape, name).map(Tensor::Dma),
             Some(TensorMemory::Shm) => ShmTensor::<T>::new(shape, name).map(Tensor::Shm),
+            Some(TensorMemory::Mem) => MemTensor::<T>::new(shape, name).map(Tensor::Mem),
             None => match DmaTensor::<T>::new(shape, name) {
                 Ok(tensor) => Ok(Tensor::Dma(tensor)),
-                Err(_) => ShmTensor::<T>::new(shape, name).map(Tensor::Shm),
+                Err(_) => match ShmTensor::<T>::new(shape, name).map(Tensor::Shm) {
+                    Ok(tensor) => Ok(tensor),
+                    Err(_) => MemTensor::<T>::new(shape, name).map(Tensor::Mem),
+                },
             },
         }
     }
@@ -144,6 +150,7 @@ where
         match self {
             Tensor::Dma(t) => t.clone_fd(),
             Tensor::Shm(t) => t.clone_fd(),
+            Tensor::Mem(t) => t.clone_fd(),
         }
     }
 
@@ -151,6 +158,7 @@ where
         match self {
             Tensor::Dma(_) => TensorMemory::Dma,
             Tensor::Shm(_) => TensorMemory::Shm,
+            Tensor::Mem(_) => TensorMemory::Mem,
         }
     }
 
@@ -158,6 +166,7 @@ where
         match self {
             Tensor::Dma(t) => t.name(),
             Tensor::Shm(t) => t.name(),
+            Tensor::Mem(t) => t.name(),
         }
     }
 
@@ -165,6 +174,7 @@ where
         match self {
             Tensor::Dma(t) => t.shape(),
             Tensor::Shm(t) => t.shape(),
+            Tensor::Mem(t) => t.shape(),
         }
     }
 
@@ -172,6 +182,7 @@ where
         match self {
             Tensor::Dma(t) => t.reshape(shape),
             Tensor::Shm(t) => t.reshape(shape),
+            Tensor::Mem(t) => t.reshape(shape),
         }
     }
 
@@ -179,6 +190,7 @@ where
         match self {
             Tensor::Dma(t) => t.map(),
             Tensor::Shm(t) => t.map(),
+            Tensor::Mem(t) => t.map(),
         }
     }
 }
@@ -189,6 +201,7 @@ where
 {
     Dma(DmaMap<T>),
     Shm(ShmMap<T>),
+    Mem(MemMap<T>),
 }
 
 impl<T> TensorMapTrait<T> for TensorMap<T>
@@ -199,6 +212,7 @@ where
         match self {
             TensorMap::Dma(map) => &map.shape,
             TensorMap::Shm(map) => &map.shape,
+            TensorMap::Mem(map) => &map.shape,
         }
     }
 
@@ -206,6 +220,7 @@ where
         match self {
             TensorMap::Dma(map) => map.unmap(),
             TensorMap::Shm(map) => map.unmap(),
+            TensorMap::Mem(map) => map.unmap(),
         }
     }
 }
@@ -220,6 +235,7 @@ where
         match self {
             TensorMap::Dma(map) => map.deref(),
             TensorMap::Shm(map) => map.deref(),
+            TensorMap::Mem(map) => map.deref(),
         }
     }
 }
@@ -232,6 +248,7 @@ where
         match self {
             TensorMap::Dma(map) => map.deref_mut(),
             TensorMap::Shm(map) => map.deref_mut(),
+            TensorMap::Mem(map) => map.deref_mut(),
         }
     }
 }
@@ -635,6 +652,145 @@ where
     }
 }
 
+pub struct MemTensor<T>
+where
+    T: Num + Clone + std::fmt::Debug,
+{
+    pub name: String,
+    pub shape: Vec<usize>,
+    pub data: Vec<T>,
+}
+
+impl<T> TensorTrait<T> for MemTensor<T>
+where
+    T: Num + Clone + std::fmt::Debug,
+{
+    fn new(shape: &[usize], name: Option<&str>) -> Result<Self> {
+        if shape.is_empty() {
+            return Err(Error::InvalidSize(0));
+        }
+
+        let size = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+        if size == 0 {
+            return Err(Error::InvalidSize(0));
+        }
+
+        let name = name.unwrap_or("mem_tensor").to_owned();
+        let data = vec![T::zero(); size / std::mem::size_of::<T>()];
+
+        Ok(MemTensor {
+            name,
+            shape: shape.to_vec(),
+            data,
+        })
+    }
+
+    fn from_fd(_fd: OwnedFd, _shape: &[usize], _name: Option<&str>) -> Result<Self> {
+        Err(Error::UnsupportedOperation(
+            "MemTensor does not support from_fd".to_owned(),
+        ))
+    }
+
+    fn clone_fd(&self) -> Result<OwnedFd> {
+        Err(Error::UnsupportedOperation(
+            "MemTensor does not support clone_fd".to_owned(),
+        ))
+    }
+
+    fn memory(&self) -> TensorMemory {
+        TensorMemory::Mem
+    }
+
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    fn reshape(&mut self, shape: &[usize]) -> Result<()> {
+        if shape.is_empty() {
+            return Err(Error::InvalidSize(0));
+        }
+
+        let new_size = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+        if new_size != self.size() {
+            return Err(Error::ShapeVolumeMismatch);
+        }
+
+        self.shape = shape.to_vec();
+        Ok(())
+    }
+
+    fn map(&self) -> Result<TensorMap<T>> {
+        Ok(TensorMap::Mem(MemMap {
+            ptr: Arc::new(Mutex::new(
+                NonNull::new(self.data.as_ptr() as *mut c_void)
+                    .ok_or(Error::InvalidSize(self.size()))?,
+            )),
+            shape: self.shape.clone(),
+            _marker: std::marker::PhantomData,
+        }))
+    }
+}
+
+pub struct MemMap<T>
+where
+    T: Num + Clone + std::fmt::Debug,
+{
+    ptr: Arc<Mutex<NonNull<c_void>>>,
+    shape: Vec<usize>,
+    _marker: std::marker::PhantomData<T>,
+}
+
+unsafe impl<T> Send for MemMap<T> where T: Num + Clone + std::fmt::Debug {}
+unsafe impl<T> Sync for MemMap<T> where T: Num + Clone + std::fmt::Debug {}
+
+impl<T> Deref for MemMap<T>
+where
+    T: Num + Clone + std::fmt::Debug,
+{
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        let ptr = self.ptr.lock().expect("Failed to lock MemMap pointer");
+        unsafe { std::slice::from_raw_parts(ptr.as_ptr() as *const T, self.len()) }
+    }
+}
+
+impl<T> DerefMut for MemMap<T>
+where
+    T: Num + Clone + std::fmt::Debug,
+{
+    fn deref_mut(&mut self) -> &mut [T] {
+        let ptr = self.ptr.lock().expect("Failed to lock MemMap pointer");
+        unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr() as *mut T, self.len()) }
+    }
+}
+
+impl<T> TensorMapTrait<T> for MemMap<T>
+where
+    T: Num + Clone + std::fmt::Debug,
+{
+    fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    fn unmap(&mut self) {
+        trace!("Unmapping MemMap memory: {:?}", self.to_vec());
+    }
+}
+
+impl<T> Drop for MemMap<T>
+where
+    T: Num + Clone + std::fmt::Debug,
+{
+    fn drop(&mut self) {
+        self.unmap();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nix::unistd::{AccessFlags, access};
@@ -819,6 +975,52 @@ mod tests {
 
         {
             let mut tensor_map = tensor.map().expect("Failed to map shared memory");
+            tensor_map[2] = 42;
+            assert_eq!(tensor_map[1], 1, "Value at index 1 should be 1");
+            assert_eq!(tensor_map[2], 42, "Value at index 2 should be 42");
+        }
+    }
+
+    #[test]
+    fn test_mem_tensor() {
+        let shape = vec![2, 3, 4];
+        let tensor =
+            MemTensor::<f32>::new(&shape, Some("test_tensor")).expect("Failed to create tensor");
+        assert_eq!(tensor.shape(), &shape);
+        assert_eq!(tensor.size(), 2 * 3 * 4 * std::mem::size_of::<f32>());
+        assert_eq!(tensor.name(), "test_tensor");
+
+        {
+            let mut tensor_map = tensor.map().expect("Failed to map memory");
+            tensor_map.fill(42.0);
+            assert!(tensor_map.iter().all(|&x| x == 42.0));
+        }
+
+        let mut tensor = MemTensor::<u8>::new(&shape, None).expect("Failed to create tensor");
+        assert_eq!(tensor.shape(), &shape);
+        let new_shape = vec![3, 4, 4];
+        assert!(
+            tensor.reshape(&new_shape).is_err(),
+            "Reshape should fail due to size mismatch"
+        );
+        assert_eq!(tensor.shape(), &shape, "Shape should remain unchanged");
+
+        let new_shape = vec![2, 3, 4];
+        tensor.reshape(&new_shape).expect("Reshape should succeed");
+        assert_eq!(
+            tensor.shape(),
+            &new_shape,
+            "Shape should be updated after successful reshape"
+        );
+
+        {
+            let mut tensor_map = tensor.map().expect("Failed to map memory");
+            tensor_map.fill(1);
+            assert!(tensor_map.iter().all(|&x| x == 1));
+        }
+
+        {
+            let mut tensor_map = tensor.map().expect("Failed to map memory");
             tensor_map[2] = 42;
             assert_eq!(tensor_map[1], 1, "Value at index 1 should be 1");
             assert_eq!(tensor_map[2], 42, "Value at index 2 should be 42");

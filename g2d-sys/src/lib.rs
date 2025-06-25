@@ -16,11 +16,24 @@ use std::{
     os::fd::AsRawFd,
 };
 
-const RGB3: FourCC = FourCC(*b"RGB3");
-const RGBX: FourCC = FourCC(*b"RGBX");
-const RGBA: FourCC = FourCC(*b"RGBA");
-const YUYV: FourCC = FourCC(*b"YUYV");
-const NV12: FourCC = FourCC(*b"NV12");
+pub const RGB3: FourCC = FourCC(*b"RGB3");
+pub const RGBX: FourCC = FourCC(*b"RGBX");
+pub const RGBA: FourCC = FourCC(*b"RGBA");
+pub const YUYV: FourCC = FourCC(*b"YUYV");
+pub const NV12: FourCC = FourCC(*b"NV12");
+
+impl FourCC {
+    pub fn channels(&self) -> usize {
+        match *self {
+            RGB3 => 3,
+            RGBX => 4,
+            RGBA => 4,
+            YUYV => 2,
+            NV12 => 1, // Y plane only
+            _ => todo!(),
+        }
+    }
+}
 
 pub struct G2DFormat(g2d_format);
 
