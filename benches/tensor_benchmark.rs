@@ -62,7 +62,7 @@ fn tensor_dma_alloc(c: &mut Criterion) {
                     None,
                 )
                 .expect("Failed to allocate DMA tensor");
-            
+
                 let mut tensor_map = tensor.map().expect("Failed to map DMA tensor");
                 tensor_map.fill(1);
             });
@@ -87,7 +87,7 @@ fn tensor_shm_alloc(c: &mut Criterion) {
     }
     group.finish();
 
-        let mut group = c.benchmark_group("tensor_shm_fill");
+    let mut group = c.benchmark_group("tensor_shm_fill");
     for (batch, height, width, channels) in SHAPES {
         group.bench_function(format!("{}x{}", width, height), |b| {
             b.iter(|| {
