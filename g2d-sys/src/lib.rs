@@ -11,7 +11,7 @@ pub use ffi_new::*;
 use fourcc::FourCC;
 use nix::ioctl_write_ptr;
 use std::{
-    ffi::{c_char, CStr},
+    ffi::{CStr, c_char},
     fmt::Display,
     os::fd::AsRawFd,
 };
