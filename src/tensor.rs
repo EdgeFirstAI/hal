@@ -6,7 +6,7 @@ use std::{
     ffi::c_void,
     num::NonZero,
     ops::{Deref, DerefMut},
-    os::fd::OwnedFd,
+    os::fd::{AsRawFd, OwnedFd},
     ptr::NonNull,
     sync::{Arc, Mutex},
 };
@@ -381,6 +381,15 @@ where
     }
 }
 
+impl<T> AsRawFd for DmaTensor<T>
+where
+    T: Num + Clone + std::fmt::Debug,
+{
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
 pub struct DmaMap<T>
 where
     T: Num + Clone + std::fmt::Debug,
@@ -611,6 +620,15 @@ where
             shape: self.shape.clone(),
             _marker: std::marker::PhantomData,
         }))
+    }
+}
+
+impl<T> AsRawFd for ShmTensor<T>
+where
+    T: Num + Clone + std::fmt::Debug,
+{
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.fd.as_raw_fd()
     }
 }
 
