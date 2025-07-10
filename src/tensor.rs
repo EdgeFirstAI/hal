@@ -71,6 +71,29 @@ pub enum TensorMemory {
     Mem,
 }
 
+impl From<TensorMemory> for String {
+    fn from(memory: TensorMemory) -> Self {
+        match memory {
+            TensorMemory::Dma => "dma".to_owned(),
+            TensorMemory::Shm => "shm".to_owned(),
+            TensorMemory::Mem => "mem".to_owned(),
+        }
+    }
+}
+
+impl TryFrom<&str> for TensorMemory {
+    type Error = Error;
+
+    fn try_from(s: &str) -> Result<Self> {
+        match s {
+            "dma" => Ok(TensorMemory::Dma),
+            "shm" => Ok(TensorMemory::Shm),
+            "mem" => Ok(TensorMemory::Mem),
+            _ => Err(Error::InvalidMemoryType(s.to_owned())),
+        }
+    }
+}
+
 pub enum Tensor<T>
 where
     T: Num + Clone + std::fmt::Debug,

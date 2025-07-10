@@ -9,6 +9,7 @@ pub enum Error {
     ShapeVolumeMismatch,
     UnknownDeviceType(u64, u64),
     UnsupportedOperation(String),
+    InvalidMemoryType(String),
     ResizeError(fast_image_resize::ResizeError),
     ImageBufferError(fast_image_resize::ImageBufferError),
     JpegDecodeError(zune_jpeg::errors::DecodeErrors),
@@ -63,6 +64,7 @@ impl std::fmt::Display for Error {
                 write!(f, "Unknown device type: {}:{}", major, minor)
             }
             Error::UnsupportedOperation(op) => write!(f, "Unsupported operation: {}", op),
+            Error::InvalidMemoryType(mem_type) => write!(f, "Invalid memory type: {}", mem_type),
             Error::ResizeError(e) => write!(f, "{}", e),
             Error::ImageBufferError(e) => write!(f, "{}", e),
             Error::JpegDecodeError(e) => write!(f, "{}", e),
