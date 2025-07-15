@@ -1,0 +1,24 @@
+[package]
+name = "image-converter"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+license.workspace = true
+
+[dependencies]
+ctor = { workspace = true }
+env_logger = { workspace = true }
+fast_image_resize = { workspace = true }
+four-char-code = { workspace = true }
+jpeg-encoder = { workspace = true }
+libloading = { workspace = true }
+log = { workspace = true }
+tensor = { path = "../tensor" }
+zune-jpeg = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+g2d-sys = { version = "1.0.1", path = "../g2d-sys" }

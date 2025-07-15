@@ -273,14 +273,14 @@ impl g2d {
     pub unsafe fn new<P>(path: P) -> Result<Self, ::libloading::Error>
     where
         P: AsRef<::std::ffi::OsStr>,
-    {
+    { unsafe {
         let library = ::libloading::Library::new(path)?;
         Self::from_library(library)
-    }
+    }}
     pub unsafe fn from_library<L>(library: L) -> Result<Self, ::libloading::Error>
     where
         L: Into<::libloading::Library>,
-    {
+    { unsafe {
         let __library = library.into();
         let g2d_open = __library.get(b"g2d_open\0").map(|sym| *sym);
         let g2d_close = __library.get(b"g2d_close\0").map(|sym| *sym);
@@ -325,187 +325,187 @@ impl g2d {
             g2d_flush,
             g2d_finish,
         })
-    }
+    }}
     pub unsafe fn g2d_open(
         &self,
         handle: *mut *mut ::std::os::raw::c_void,
-    ) -> ::std::os::raw::c_int {
+    ) -> ::std::os::raw::c_int { unsafe {
         (self
             .g2d_open
             .as_ref()
             .expect("Expected function, got error."))(handle)
-    }
-    pub unsafe fn g2d_close(&self, handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int {
+    }}
+    pub unsafe fn g2d_close(&self, handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int { unsafe {
         (self
             .g2d_close
             .as_ref()
             .expect("Expected function, got error."))(handle)
-    }
+    }}
     pub unsafe fn g2d_make_current(
         &self,
         handle: *mut ::std::os::raw::c_void,
         type_: g2d_hardware_type,
-    ) -> ::std::os::raw::c_int {
+    ) -> ::std::os::raw::c_int { unsafe {
         (self
             .g2d_make_current
             .as_ref()
             .expect("Expected function, got error."))(handle, type_)
-    }
+    }}
     pub unsafe fn g2d_clear(
         &self,
         handle: *mut ::std::os::raw::c_void,
         area: *mut g2d_surface,
-    ) -> ::std::os::raw::c_int {
+    ) -> ::std::os::raw::c_int { unsafe {
         (self
             .g2d_clear
             .as_ref()
             .expect("Expected function, got error."))(handle, area)
-    }
+    }}
     pub unsafe fn g2d_blit(
         &self,
         handle: *mut ::std::os::raw::c_void,
         src: *mut g2d_surface,
         dst: *mut g2d_surface,
-    ) -> ::std::os::raw::c_int {
+    ) -> ::std::os::raw::c_int { unsafe {
         (self
             .g2d_blit
             .as_ref()
             .expect("Expected function, got error."))(handle, src, dst)
-    }
+    }}
     pub unsafe fn g2d_copy(
         &self,
         handle: *mut ::std::os::raw::c_void,
         d: *mut g2d_buf,
         s: *mut g2d_buf,
         size: ::std::os::raw::c_int,
-    ) -> ::std::os::raw::c_int {
+    ) -> ::std::os::raw::c_int { unsafe {
         (self
             .g2d_copy
             .as_ref()
             .expect("Expected function, got error."))(handle, d, s, size)
-    }
+    }}
     pub unsafe fn g2d_multi_blit(
         &self,
         handle: *mut ::std::os::raw::c_void,
         sp: *mut *mut g2d_surface_pair,
         layers: ::std::os::raw::c_int,
-    ) -> ::std::os::raw::c_int {
+    ) -> ::std::os::raw::c_int { unsafe {
         (self
             .g2d_multi_blit
             .as_ref()
             .expect("Expected function, got error."))(handle, sp, layers)
-    }
+    }}
     pub unsafe fn g2d_query_hardware(
         &self,
         handle: *mut ::std::os::raw::c_void,
         type_: g2d_hardware_type,
         available: *mut ::std::os::raw::c_int,
-    ) -> ::std::os::raw::c_int {
+    ) -> ::std::os::raw::c_int { unsafe {
         (self
             .g2d_query_hardware
             .as_ref()
             .expect("Expected function, got error."))(handle, type_, available)
-    }
+    }}
     pub unsafe fn g2d_query_feature(
         &self,
         handle: *mut ::std::os::raw::c_void,
         feature: g2d_feature,
         available: *mut ::std::os::raw::c_int,
-    ) -> ::std::os::raw::c_int {
+    ) -> ::std::os::raw::c_int { unsafe {
         (self
             .g2d_query_feature
             .as_ref()
             .expect("Expected function, got error."))(handle, feature, available)
-    }
+    }}
     pub unsafe fn g2d_query_cap(
         &self,
         handle: *mut ::std::os::raw::c_void,
         cap: g2d_cap_mode,
         enable: *mut ::std::os::raw::c_int,
-    ) -> ::std::os::raw::c_int {
+    ) -> ::std::os::raw::c_int { unsafe {
         (self
             .g2d_query_cap
             .as_ref()
             .expect("Expected function, got error."))(handle, cap, enable)
-    }
+    }}
     pub unsafe fn g2d_enable(
         &self,
         handle: *mut ::std::os::raw::c_void,
         cap: g2d_cap_mode,
-    ) -> ::std::os::raw::c_int {
+    ) -> ::std::os::raw::c_int { unsafe {
         (self
             .g2d_enable
             .as_ref()
             .expect("Expected function, got error."))(handle, cap)
-    }
+    }}
     pub unsafe fn g2d_disable(
         &self,
         handle: *mut ::std::os::raw::c_void,
         cap: g2d_cap_mode,
-    ) -> ::std::os::raw::c_int {
+    ) -> ::std::os::raw::c_int { unsafe {
         (self
             .g2d_disable
             .as_ref()
             .expect("Expected function, got error."))(handle, cap)
-    }
+    }}
     pub unsafe fn g2d_cache_op(
         &self,
         buf: *mut g2d_buf,
         op: g2d_cache_mode,
-    ) -> ::std::os::raw::c_int {
+    ) -> ::std::os::raw::c_int { unsafe {
         (self
             .g2d_cache_op
             .as_ref()
             .expect("Expected function, got error."))(buf, op)
-    }
+    }}
     pub unsafe fn g2d_alloc(
         &self,
         size: ::std::os::raw::c_int,
         cacheable: ::std::os::raw::c_int,
-    ) -> *mut g2d_buf {
+    ) -> *mut g2d_buf { unsafe {
         (self
             .g2d_alloc
             .as_ref()
             .expect("Expected function, got error."))(size, cacheable)
-    }
-    pub unsafe fn g2d_buf_from_fd(&self, fd: ::std::os::raw::c_int) -> *mut g2d_buf {
+    }}
+    pub unsafe fn g2d_buf_from_fd(&self, fd: ::std::os::raw::c_int) -> *mut g2d_buf { unsafe {
         (self
             .g2d_buf_from_fd
             .as_ref()
             .expect("Expected function, got error."))(fd)
-    }
-    pub unsafe fn g2d_buf_export_fd(&self, arg1: *mut g2d_buf) -> ::std::os::raw::c_int {
+    }}
+    pub unsafe fn g2d_buf_export_fd(&self, arg1: *mut g2d_buf) -> ::std::os::raw::c_int { unsafe {
         (self
             .g2d_buf_export_fd
             .as_ref()
             .expect("Expected function, got error."))(arg1)
-    }
+    }}
     pub unsafe fn g2d_buf_from_virt_addr(
         &self,
         vaddr: *mut ::std::os::raw::c_void,
         size: ::std::os::raw::c_int,
-    ) -> *mut g2d_buf {
+    ) -> *mut g2d_buf { unsafe {
         (self
             .g2d_buf_from_virt_addr
             .as_ref()
             .expect("Expected function, got error."))(vaddr, size)
-    }
-    pub unsafe fn g2d_free(&self, buf: *mut g2d_buf) -> ::std::os::raw::c_int {
+    }}
+    pub unsafe fn g2d_free(&self, buf: *mut g2d_buf) -> ::std::os::raw::c_int { unsafe {
         (self
             .g2d_free
             .as_ref()
             .expect("Expected function, got error."))(buf)
-    }
-    pub unsafe fn g2d_flush(&self, handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int {
+    }}
+    pub unsafe fn g2d_flush(&self, handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int { unsafe {
         (self
             .g2d_flush
             .as_ref()
             .expect("Expected function, got error."))(handle)
-    }
-    pub unsafe fn g2d_finish(&self, handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int {
+    }}
+    pub unsafe fn g2d_finish(&self, handle: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int { unsafe {
         (self
             .g2d_finish
             .as_ref()
             .expect("Expected function, got error."))(handle)
-    }
+    }}
 }
