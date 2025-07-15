@@ -19,3 +19,10 @@ random-string = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 dma-heap = { workspace = true }
+
+[dev-dependencies]
+divan = { workspace = true }
+
+[[bench]]
+name = "tensor_benchmark"
+harness = false
