@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use crate::{Error, ImageConverterTrait, Rect, Result, Rotation, TensorImage};
 use g2d_sys::{G2D, G2DFormat, G2DPhysical, G2DSurface};
 use log::debug;

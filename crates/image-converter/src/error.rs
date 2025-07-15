@@ -8,6 +8,7 @@ pub enum Error {
     DecodingError(zune_jpeg::errors::DecodeErrors),
     ImageBufferError(fast_image_resize::ImageBufferError),
     ResizeError(fast_image_resize::ResizeError),
+    #[cfg(target_os = "linux")]
     G2DError(g2d_sys::Error),
     TensorError(tensor::Error),
     NotImplemented(String),
@@ -50,6 +51,7 @@ impl From<fast_image_resize::ResizeError> for Error {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl From<g2d_sys::Error> for Error {
     fn from(err: g2d_sys::Error) -> Self {
         Error::G2DError(err)
