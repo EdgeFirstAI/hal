@@ -223,11 +223,13 @@ pub trait ImageConverterTrait {
 
 pub enum ImageConverter {
     CPU(Box<cpu::CPUConverter>),
+    #[cfg(target_os = "linux")]
     G2D(Box<g2d::G2DConverter>),
 }
 
 impl ImageConverter {
     pub fn new() -> Result<Self> {
+        #[cfg(target_os = "linux")]
         match g2d::G2DConverter::new() {
             Ok(g2d_converter) => return Ok(Self::G2D(Box::new(g2d_converter))),
             Err(err) => debug!("Failed to initialize G2D converter: {err:?}"),
@@ -240,6 +242,7 @@ impl ImageConverter {
     pub fn convert(&mut self, dst: &mut TensorImage, src: &TensorImage) -> Result<()> {
         match self {
             ImageConverter::CPU(converter) => converter.convert(dst, src, Rotation::None, None),
+            #[cfg(target_os = "linux")]
             ImageConverter::G2D(converter) => converter.convert(dst, src, Rotation::None, None),
         }
     }

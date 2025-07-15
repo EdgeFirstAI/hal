@@ -60,7 +60,7 @@ where
 
     #[cfg(not(target_os = "linux"))]
     fn new(_shape: &[usize], _name: Option<&str>) -> Result<Self> {
-        Err(Error::UnsupportedOperation(
+        Err(Error::NotImplemented(
             "DMA tensors are not supported on this platform".to_owned(),
         ))
     }
