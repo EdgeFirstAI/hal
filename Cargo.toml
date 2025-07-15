@@ -1,48 +1,31 @@
-[package]
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+exclude = ["crates/python"]
+
+[workspace.package]
 name = "edgefirst-hal"
 description = "EdgeFirst Hardware Abstraction Layer"
+authors = ["Au-Zone Technologies <support@au-zone.com>"]
+homepage = "https://edgefirst.ai"
+repository = "https://github.com/EdgeFirstAI/hal"
+license = "Proprietary"
 version = "0.0.0"
 edition = "2024"
 
-[lib]
-crate-type = ["lib", "cdylib"]
-
-[features]
-default = []
-python = ["pyo3"]
-python-abi38 = ["python", "pyo3/abi3-py38"]
-python-abi311 = ["python", "pyo3/abi3-py311"]
-
-[dependencies]
+[workspace.dependencies]
 ctor = "0.4.2"
+dma-heap = "0.4.1"
 env_logger = "0.11.8"
-fast_image_resize = { version = "5.1.4", features = ["image", "rayon"] }
-glob = "0.3.2"
+fast_image_resize = { version = "5.2.0", features = ["image", "rayon"] }
+four-char-code = "2.3.0"
 jpeg-encoder = { version = "0.6.1", features = ["simd"] }
+libloading = "0.8.8"
 log = "0.4.27"
 nix = { version = "0.30.1", features = ["fs", "ioctl", "mman"] }
 num-traits = "0.2.19"
-pyo3 = { version = "0.25.1", optional = true, features = ["extension-module"] }
 random-string = "1.1.0"
-zune-jpeg = "0.4.18"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-dma-heap = "0.4.1"
-g2d-sys = { version = "1.0.1", path = "g2d-sys" }
-
-[build-dependencies]
-pyo3-build-config = { version = "0.25.1", features = ["resolve-config"] }
-
-[dev-dependencies]
-criterion = "0.6.0"
-
-[[bench]]
-name = "tensor_benchmark"
-harness = false
-
-[[bench]]
-name = "image_benchmark"
-harness = false
+zune-jpeg = "0.4.19"
 
 [profile.release]
 opt-level = 3

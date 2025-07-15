@@ -1,0 +1,11 @@
+[package]
+name = "g2d-sys"
+description = "Low-level FFI bindings for the G2D Library"
+license = "MIT"
+version = "1.0.1"
+edition = "2024"
+
+[dependencies]
+libloading = { workspace = true }
+nix = { workspace = true }
+four-char-code = { workspace = true }
