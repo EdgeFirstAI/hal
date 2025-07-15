@@ -5,7 +5,6 @@ use crate::{
     mem::{MemMap, MemTensor},
     shm::{ShmMap, ShmTensor},
 };
-use nix::sys::stat::fstat;
 use num_traits::Num;
 use std::{
     ops::{Deref, DerefMut},
@@ -140,13 +139,13 @@ where
 
     #[cfg(target_os = "linux")]
     fn from_fd(fd: OwnedFd, shape: &[usize], name: Option<&str>) -> Result<Self> {
-        use log::debug;
+        use nix::sys::stat::fstat;
 
         let stat = fstat(&fd)?;
         let major = major(stat.st_dev);
         let minor = minor(stat.st_dev);
 
-        debug!("Creating tensor from fd: major={major}, minor={minor}");
+        log::debug!("Creating tensor from fd: major={major}, minor={minor}");
 
         if major != 0 {
             // Dma and Shm tensors are expected to have major number 0

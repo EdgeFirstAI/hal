@@ -7,14 +7,13 @@
 //! environments where hardware acceleration is not present or not suitable.
 
 use four_char_code::{FourCharCode, four_char_code};
-use log::debug;
 use tensor::{Tensor, TensorMemory, TensorTrait as _};
-
-pub use error::{Error, Result};
 use zune_jpeg::{
     JpegDecoder,
     zune_core::{colorspace::ColorSpace, options::DecoderOptions},
 };
+
+pub use error::{Error, Result};
 
 mod cpu;
 mod error;
@@ -232,7 +231,7 @@ impl ImageConverter {
         #[cfg(target_os = "linux")]
         match g2d::G2DConverter::new() {
             Ok(g2d_converter) => return Ok(Self::G2D(Box::new(g2d_converter))),
-            Err(err) => debug!("Failed to initialize G2D converter: {err:?}"),
+            Err(err) => log::debug!("Failed to initialize G2D converter: {err:?}"),
         }
 
         let cpu_converter = cpu::CPUConverter::new()?;

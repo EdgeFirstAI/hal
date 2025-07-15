@@ -198,10 +198,42 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
+name = "clap"
+version = "4.5.41"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be92d32e80243a54711e5d7ce823c35c41c9d929dc4ab58e1276f625841aadf9"
+dependencies = [
+ "clap_builder",
+]
+
+[[package]]
+name = "clap_builder"
+version = "4.5.41"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "707eab41e9622f9139419d573eca0900137718000c517d47da73045f54331c3d"
+dependencies = [
+ "anstyle",
+ "clap_lex",
+ "terminal_size",
+]
+
+[[package]]
+name = "clap_lex"
+version = "0.7.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b94f61472cee1439c0b966b47e3aca9ae07e45d070759512cd390ea2bebc6675"
+
+[[package]]
 name = "colorchoice"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b05b61dc5112cbb17e4b6cd61790d9845d13888356391624cbe7e41efeac1e75"
+
+[[package]]
+name = "condtype"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "baf0a07a401f374238ab8e2f11a104d2851bf9ce711ec69804834de8af45c7af"
 
 [[package]]
 name = "crossbeam-deque"
@@ -243,6 +275,31 @@ name = "ctor-proc-macro"
 version = "0.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f211af61d8efdd104f96e57adf5e426ba1bc3ed7a4ead616e15e5881fd79c4d"
+
+[[package]]
+name = "divan"
+version = "0.1.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a405457ec78b8fe08b0e32b4a3570ab5dff6dd16eb9e76a5ee0a9d9cbd898933"
+dependencies = [
+ "cfg-if",
+ "clap",
+ "condtype",
+ "divan-macros",
+ "libc",
+ "regex-lite",
+]
+
+[[package]]
+name = "divan-macros"
+version = "0.1.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9556bc800956545d6420a640173e5ba7dfa82f38d3ea5a167eb555bc69ac3323"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "dma-heap"
@@ -435,6 +492,7 @@ name = "image-converter"
 version = "0.0.0"
 dependencies = [
  "ctor",
+ "divan",
  "env_logger",
  "fast_image_resize",
  "four-char-code",
@@ -926,6 +984,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "regex-lite"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53a49587ad06b26609c52e423de037e7f57f20d53535d66e08c695f347df952a"
+
+[[package]]
 name = "regex-syntax"
 version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -939,15 +1003,15 @@ checksum = "0c6a884d2998352bb4daf0183589aec883f16a6da1f4dde84d8e2e9a5409a1ce"
 
 [[package]]
 name = "rustix"
-version = "1.0.7"
+version = "1.0.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c71e83d6afe7ff64890ec6b71d6a69bb8a610ab78ce364b3352876bb4c801266"
+checksum = "11181fbabf243db407ef8df94a6ce0b2f9a733bd8be4ad02b4eda9602296cac8"
 dependencies = [
  "bitflags",
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1041,12 +1105,23 @@ name = "tensor"
 version = "0.0.0"
 dependencies = [
  "ctor",
+ "divan",
  "dma-heap",
  "env_logger",
  "log",
  "nix",
  "num-traits",
  "random-string",
+]
+
+[[package]]
+name = "terminal_size"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45c6481c4829e4cc63825e62c49186a34538b7b2750b73b266581ffb612fb5ed"
+dependencies = [
+ "rustix",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
