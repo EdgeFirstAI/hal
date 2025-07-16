@@ -22,6 +22,7 @@ zune-jpeg = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 g2d-sys = { version = "1.0.1", path = "../g2d-sys" }
+dma-heap = { workspace = true }
 
 [dev-dependencies]
 divan = { workspace = true }
