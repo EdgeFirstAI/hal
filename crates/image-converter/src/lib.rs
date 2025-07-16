@@ -240,12 +240,20 @@ impl ImageConverter {
         let cpu_converter = CPUConverter::new()?;
         Ok(Self::CPU(Box::new(cpu_converter)))
     }
+}
 
-    pub fn convert(&mut self, dst: &mut TensorImage, src: &TensorImage) -> Result<()> {
+impl ImageConverterTrait for ImageConverter {
+    fn convert(
+        &mut self,
+        dst: &mut TensorImage,
+        src: &TensorImage,
+        rotation: Rotation,
+        crop: Option<Rect>,
+    ) -> Result<()> {
         match self {
-            ImageConverter::CPU(converter) => converter.convert(dst, src, Rotation::None, None),
+            ImageConverter::CPU(converter) => converter.convert(dst, src, rotation, crop),
             #[cfg(target_os = "linux")]
-            ImageConverter::G2D(converter) => converter.convert(dst, src, Rotation::None, None),
+            ImageConverter::G2D(converter) => converter.convert(dst, src, rotation, crop),
         }
     }
 }
@@ -296,7 +304,9 @@ mod tests {
 
         let mut dst = TensorImage::new(640, 360, RGBA, None).unwrap();
         let mut converter = ImageConverter::new().unwrap();
-        converter.convert(&mut dst, &img).unwrap();
+        converter
+            .convert(&mut dst, &img, Rotation::None, None)
+            .unwrap();
         assert_eq!(dst.width(), 640);
         assert_eq!(dst.height(), 360);
 
