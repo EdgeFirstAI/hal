@@ -1,5 +1,8 @@
-use image_converter::{ImageConverter, RGBA, TensorImage};
+use image_converter::{
+    CPUConverter, ImageConverter, ImageConverterTrait as _, RGBA, Rotation, TensorImage,
+};
 use std::path::Path;
+use tensor::TensorMemory;
 
 trait TestImage {
     fn filename() -> &'static str;
@@ -21,8 +24,92 @@ macro_rules! test_images {
 
 test_images!(Person, Jaguar, Zidane);
 
+#[divan::bench(types = [Jaguar, Person, Zidane])]
+fn load_image_mem<IMAGE>(bencher: divan::Bencher)
+where
+    IMAGE: TestImage,
+{
+    let name = format!("{}.jpg", IMAGE::filename());
+    let path = Path::new("testdata").join(&name);
+    let path = match path.exists() {
+        true => path,
+        false => {
+            let path = Path::new("../testdata").join(&name);
+            if path.exists() {
+                path
+            } else {
+                Path::new("../../testdata").join(&name)
+            }
+        }
+    };
+
+    assert!(path.exists(), "unable to locate test image at {path:?}");
+
+    bencher.bench_local(|| {
+        let file = std::fs::read(&path).unwrap();
+        TensorImage::load(&file, Some(RGBA), Some(TensorMemory::Mem)).expect("Failed to load image")
+    });
+}
+
+#[divan::bench(types = [Jaguar, Person, Zidane])]
+fn load_image_shm<IMAGE>(bencher: divan::Bencher)
+where
+    IMAGE: TestImage,
+{
+    let name = format!("{}.jpg", IMAGE::filename());
+    let path = Path::new("testdata").join(&name);
+    let path = match path.exists() {
+        true => path,
+        false => {
+            let path = Path::new("../testdata").join(&name);
+            if path.exists() {
+                path
+            } else {
+                Path::new("../../testdata").join(&name)
+            }
+        }
+    };
+
+    assert!(path.exists(), "unable to locate test image at {path:?}");
+
+    bencher.bench_local(|| {
+        let file = std::fs::read(&path).unwrap();
+        TensorImage::load(&file, Some(RGBA), Some(TensorMemory::Shm)).expect("Failed to load image")
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[divan::bench(types = [Jaguar, Person, Zidane], ignore = !dma_available())]
+fn load_image_dma<IMAGE>(bencher: divan::Bencher)
+where
+    IMAGE: TestImage,
+{
+    let name = format!("{}.jpg", IMAGE::filename());
+    let path = Path::new("testdata").join(&name);
+    let path = match path.exists() {
+        true => path,
+        false => {
+            let path = Path::new("../testdata").join(&name);
+            if path.exists() {
+                path
+            } else {
+                Path::new("../../testdata").join(&name)
+            }
+        }
+    };
+
+    assert!(path.exists(), "unable to locate test image at {path:?}");
+
+    bencher.bench_local(|| {
+        use tensor::TensorMemory;
+
+        let file = std::fs::read(&path).unwrap();
+        TensorImage::load(&file, Some(RGBA), Some(TensorMemory::Dma)).expect("Failed to load image")
+    });
+}
+
 #[divan::bench(types = [Jaguar, Person, Zidane], args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
-fn image_benchmark<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
+fn converter_cpu<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
 where
     IMAGE: TestImage,
 {
@@ -46,11 +133,64 @@ where
     let file = std::fs::read(path).unwrap();
     let src = TensorImage::load(&file, Some(RGBA), None).unwrap();
     let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
-    let mut converter = ImageConverter::new().unwrap();
 
-    bencher.bench_local(|| converter.convert(&mut dst, &src).unwrap());
+    let mut converter = CPUConverter::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&mut dst, &src, Rotation::None, None)
+            .unwrap()
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[divan::bench(types = [Jaguar, Person, Zidane], args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+fn converter_g2d<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
+where
+    IMAGE: TestImage,
+{
+    let (width, height) = size;
+    let name = format!("{}.jpg", IMAGE::filename());
+    let path = Path::new("testdata").join(&name);
+    let path = match path.exists() {
+        true => path,
+        false => {
+            let path = Path::new("../testdata").join(&name);
+            if path.exists() {
+                path
+            } else {
+                Path::new("../../testdata").join(&name)
+            }
+        }
+    };
+
+    assert!(path.exists(), "unable to locate test image at {path:?}");
+
+    let file = std::fs::read(path).unwrap();
+    let src = TensorImage::load(&file, Some(RGBA), None).unwrap();
+    let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
+
+    let mut converter = image_converter::G2DConverter::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&mut dst, &src, Rotation::None, None)
+            .unwrap()
+    });
+}
+
+fn dma_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        dma_heap::Heap::new(dma_heap::HeapKind::Cma)
+            .or_else(|_| dma_heap::Heap::new(dma_heap::HeapKind::System))
+            .is_ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    false
 }
 
 fn main() {
+    env_logger::init();
     divan::main();
 }
