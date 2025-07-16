@@ -11,14 +11,19 @@ license.workspace = true
 
 [dependencies]
 ctor = { workspace = true }
+drm = "0.14.1"
 edgefirst-tensor = { version = "*", path = "../tensor" }
 env_logger = { workspace = true }
 fast_image_resize = { workspace = true }
 four-char-code = { workspace = true }
+gbm = "0.18.0"
+gls = "0.1.6"
 jpeg-encoder = { workspace = true }
+khronos-egl = { version = "6.0.0", features = ["dynamic"] }
 libloading = { workspace = true }
 log = { workspace = true }
 zune-jpeg = { workspace = true }
+libc = "0.2.174"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 dma-heap = { workspace = true }
@@ -26,6 +31,9 @@ g2d-sys = { version = "*", path = "../g2d-sys" }
 
 [dev-dependencies]
 divan = { workspace = true }
+image-compare = "0.4.2"
+image = { version = "0.25.6", default-features = false}
+
 
 [[bench]]
 name = "image_benchmark"

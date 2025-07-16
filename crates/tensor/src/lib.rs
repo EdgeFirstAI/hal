@@ -1,6 +1,6 @@
 pub use error::{Error, Result};
 
-use crate::{
+pub use crate::{
     dma::{DmaMap, DmaTensor},
     mem::{MemMap, MemTensor},
     shm::{ShmMap, ShmTensor},
@@ -43,6 +43,10 @@ where
         self.shape().iter().product()
     }
 
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     fn size(&self) -> usize {
         self.len() * std::mem::size_of::<T>()
     }
@@ -64,6 +68,10 @@ where
 
     fn len(&self) -> usize {
         self.shape().iter().product()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     fn size(&self) -> usize {
@@ -127,6 +135,7 @@ where
     T: Num + Clone + fmt::Debug,
 {
     Dma(DmaTensor<T>),
+    DmaOpenGl((DmaTensor<T>, gbm::BufferObject<()>)),
     Shm(ShmTensor<T>),
     Mem(MemTensor<T>),
 }
@@ -204,6 +213,7 @@ where
     fn clone_fd(&self) -> Result<OwnedFd> {
         match self {
             Tensor::Dma(t) => t.clone_fd(),
+            Tensor::DmaOpenGl((t, _)) => t.clone_fd(),
             Tensor::Shm(t) => t.clone_fd(),
             Tensor::Mem(t) => t.clone_fd(),
         }
@@ -212,6 +222,7 @@ where
     fn memory(&self) -> TensorMemory {
         match self {
             Tensor::Dma(_) => TensorMemory::Dma,
+            Tensor::DmaOpenGl(_) => TensorMemory::Dma,
             Tensor::Shm(_) => TensorMemory::Shm,
             Tensor::Mem(_) => TensorMemory::Mem,
         }
@@ -220,6 +231,7 @@ where
     fn name(&self) -> String {
         match self {
             Tensor::Dma(t) => t.name(),
+            Tensor::DmaOpenGl((t, _)) => t.name(),
             Tensor::Shm(t) => t.name(),
             Tensor::Mem(t) => t.name(),
         }
@@ -228,6 +240,7 @@ where
     fn shape(&self) -> &[usize] {
         match self {
             Tensor::Dma(t) => t.shape(),
+            Tensor::DmaOpenGl((t, _)) => t.shape(),
             Tensor::Shm(t) => t.shape(),
             Tensor::Mem(t) => t.shape(),
         }
@@ -236,6 +249,7 @@ where
     fn reshape(&mut self, shape: &[usize]) -> Result<()> {
         match self {
             Tensor::Dma(t) => t.reshape(shape),
+            Tensor::DmaOpenGl((t, _)) => t.reshape(shape),
             Tensor::Shm(t) => t.reshape(shape),
             Tensor::Mem(t) => t.reshape(shape),
         }
@@ -244,6 +258,7 @@ where
     fn map(&self) -> Result<TensorMap<T>> {
         match self {
             Tensor::Dma(t) => t.map(),
+            Tensor::DmaOpenGl((t, _)) => t.map(),
             Tensor::Shm(t) => t.map(),
             Tensor::Mem(t) => t.map(),
         }
@@ -376,6 +391,8 @@ mod tests {
         let tensor =
             DmaTensor::<f32>::new(&shape, Some("test_tensor")).expect("Failed to create tensor");
 
+        const DUMMY_VALUE: f32 = 12.34;
+
         assert_eq!(tensor.memory(), TensorMemory::Dma);
         assert_eq!(tensor.name(), "test_tensor");
         assert_eq!(tensor.shape(), &shape);
@@ -403,13 +420,13 @@ mod tests {
             assert_eq!(shared.shape(), &shape);
 
             let mut tensor_map = shared.map().expect("Failed to map DMA memory from fd");
-            tensor_map.fill(3.14);
-            assert!(tensor_map.iter().all(|&x| x == 3.14));
+            tensor_map.fill(DUMMY_VALUE);
+            assert!(tensor_map.iter().all(|&x| x == DUMMY_VALUE));
         }
 
         {
             let tensor_map = tensor.map().expect("Failed to map DMA memory");
-            assert!(tensor_map.iter().all(|&x| x == 3.14));
+            assert!(tensor_map.iter().all(|&x| x == DUMMY_VALUE));
         }
 
         let mut tensor = DmaTensor::<u8>::new(&shape, None).expect("Failed to create tensor");
@@ -452,6 +469,7 @@ mod tests {
         assert_eq!(tensor.size(), 2 * 3 * 4 * std::mem::size_of::<f32>());
         assert_eq!(tensor.name(), "test_tensor");
 
+        const DUMMY_VALUE: f32 = 12.34;
         {
             let mut tensor_map = tensor.map().expect("Failed to map shared memory");
             tensor_map.fill(42.0);
@@ -473,13 +491,13 @@ mod tests {
             assert_eq!(shared.shape(), &shape);
 
             let mut tensor_map = shared.map().expect("Failed to map shared memory from fd");
-            tensor_map.fill(3.14);
-            assert!(tensor_map.iter().all(|&x| x == 3.14));
+            tensor_map.fill(DUMMY_VALUE);
+            assert!(tensor_map.iter().all(|&x| x == DUMMY_VALUE));
         }
 
         {
             let tensor_map = tensor.map().expect("Failed to map shared memory");
-            assert!(tensor_map.iter().all(|&x| x == 3.14));
+            assert!(tensor_map.iter().all(|&x| x == DUMMY_VALUE));
         }
 
         let mut tensor = ShmTensor::<u8>::new(&shape, None).expect("Failed to create tensor");

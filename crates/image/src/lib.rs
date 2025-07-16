@@ -17,10 +17,12 @@ pub use cpu::CPUConverter;
 pub use error::{Error, Result};
 #[cfg(target_os = "linux")]
 pub use g2d::G2DConverter;
-
+#[cfg(target_os = "linux")]
+pub use opengl_headless::GLConverter;
 mod cpu;
 mod error;
 mod g2d;
+mod opengl_headless;
 
 pub const YUYV: FourCharCode = four_char_code!("YUYV");
 pub const RGBA: FourCharCode = four_char_code!("RGBA");
@@ -106,7 +108,7 @@ impl TensorImage {
         )?;
 
         {
-            let mut tensor_map = img.tensor.map()?;
+            let mut tensor_map: edgefirst_tensor::TensorMap<u8> = img.tensor.map()?;
             decoder.decode_into(&mut tensor_map)?;
         }
 
@@ -272,9 +274,10 @@ fn fourcc_channels(fourcc: FourCharCode) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use super::*;
+    use crate::{CPUConverter, Rotation};
+    use edgefirst_tensor::TensorMemory;
+    use std::path::Path;
 
     #[ctor::ctor]
     fn init() {
@@ -317,5 +320,57 @@ mod tests {
         assert_eq!(img.width(), 640);
         assert_eq!(img.height(), 360);
         assert_eq!(img.fourcc(), RGB);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_opengl() {
+        let dst_width = 640;
+        let dst_height = 360;
+        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let src = TensorImage::load(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
+
+        let mut gl_dst =
+            TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
+        let mut gl_converter = GLConverter::new_with_size(dst_width, dst_height, false).unwrap();
+        gl_converter
+            .convert(&mut gl_dst, &src, Rotation::None, None)
+            .unwrap();
+        assert!(
+            matches!(gl_dst.tensor, edgefirst_tensor::Tensor::DmaOpenGl(_)),
+            "GL converted destination is not OpenGL DMA tensor",
+        );
+
+        let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
+        let mut cpu_converter = CPUConverter::new().unwrap();
+        cpu_converter
+            .convert(&mut cpu_dst, &src, Rotation::None, None)
+            .unwrap();
+
+        let _ = gl_dst.save("opengl.jpg", 80);
+        let _ = cpu_dst.save("cpu.jpg", 80);
+
+        let opengl_image = image::RgbaImage::from_vec(
+            dst_width as u32,
+            dst_height as u32,
+            gl_dst.tensor().map().unwrap().to_vec(),
+        )
+        .unwrap();
+        let cpu_image = image::RgbaImage::from_vec(
+            dst_width as u32,
+            dst_height as u32,
+            cpu_dst.tensor().map().unwrap().to_vec(),
+        )
+        .unwrap();
+
+        let similarity = image_compare::rgba_hybrid_compare(&opengl_image, &cpu_image)
+            .expect("Image Comparison failed");
+        assert!(
+            similarity.score > 0.99,
+            "OpenGL and CPU converted image have similarity score too low: {}",
+            similarity.score
+        );
+
+        drop(gl_dst);
     }
 }

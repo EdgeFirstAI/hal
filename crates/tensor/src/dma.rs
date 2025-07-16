@@ -134,6 +134,21 @@ where
     }
 }
 
+impl<T> DmaTensor<T>
+where
+    T: Num + Clone + Send + Sync + std::fmt::Debug,
+{
+    pub fn try_clone(&self) -> Result<Self> {
+        let fd = self.clone_fd()?;
+        Ok(Self {
+            name: self.name.clone(),
+            fd,
+            shape: self.shape.clone(),
+            _marker: std::marker::PhantomData,
+        })
+    }
+}
+
 pub struct DmaMap<T>
 where
     T: Num + Clone + fmt::Debug,

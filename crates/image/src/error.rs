@@ -12,7 +12,17 @@ pub enum Error {
     G2DError(g2d_sys::Error),
     TensorError(edgefirst_tensor::Error),
     NotImplemented(String),
+    NotSupported(String),
     InvalidShape(String),
+    #[cfg(target_os = "linux")]
+    EGLError(khronos_egl::Error),
+    #[cfg(target_os = "linux")]
+    EGLLoadError(khronos_egl::LoadError<libloading::Error>),
+    #[cfg(target_os = "linux")]
+    InvalidFdError(gbm::InvalidFdError),
+    #[cfg(target_os = "linux")]
+    FrontBufferError(gbm::FrontBufferError),
+    GlError(String),
 }
 
 impl From<std::io::Error> for Error {
@@ -61,5 +71,32 @@ impl From<g2d_sys::Error> for Error {
 impl From<edgefirst_tensor::Error> for Error {
     fn from(err: edgefirst_tensor::Error) -> Self {
         Error::TensorError(err)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl From<khronos_egl::Error> for Error {
+    fn from(err: khronos_egl::Error) -> Self {
+        Error::EGLError(err)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl From<khronos_egl::LoadError<libloading::Error>> for Error {
+    fn from(err: khronos_egl::LoadError<libloading::Error>) -> Self {
+        Error::EGLLoadError(err)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl From<gbm::InvalidFdError> for Error {
+    fn from(err: gbm::InvalidFdError) -> Self {
+        Error::InvalidFdError(err)
+    }
+}
+#[cfg(target_os = "linux")]
+impl From<gbm::FrontBufferError> for Error {
+    fn from(err: gbm::FrontBufferError) -> Self {
+        Error::FrontBufferError(err)
     }
 }
