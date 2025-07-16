@@ -13,7 +13,10 @@ use zune_jpeg::{
     zune_core::{colorspace::ColorSpace, options::DecoderOptions},
 };
 
+pub use cpu::CPUConverter;
 pub use error::{Error, Result};
+#[cfg(target_os = "linux")]
+pub use g2d::G2DConverter;
 
 mod cpu;
 mod error;
@@ -221,20 +224,20 @@ pub trait ImageConverterTrait {
 }
 
 pub enum ImageConverter {
-    CPU(Box<cpu::CPUConverter>),
+    CPU(Box<CPUConverter>),
     #[cfg(target_os = "linux")]
-    G2D(Box<g2d::G2DConverter>),
+    G2D(Box<G2DConverter>),
 }
 
 impl ImageConverter {
     pub fn new() -> Result<Self> {
         #[cfg(target_os = "linux")]
-        match g2d::G2DConverter::new() {
+        match G2DConverter::new() {
             Ok(g2d_converter) => return Ok(Self::G2D(Box::new(g2d_converter))),
             Err(err) => log::debug!("Failed to initialize G2D converter: {err:?}"),
         }
 
-        let cpu_converter = cpu::CPUConverter::new()?;
+        let cpu_converter = CPUConverter::new()?;
         Ok(Self::CPU(Box::new(cpu_converter)))
     }
 

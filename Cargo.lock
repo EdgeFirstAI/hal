@@ -493,6 +493,7 @@ version = "0.0.0"
 dependencies = [
  "ctor",
  "divan",
+ "dma-heap",
  "env_logger",
  "fast_image_resize",
  "four-char-code",
