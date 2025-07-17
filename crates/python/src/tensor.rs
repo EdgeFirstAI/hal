@@ -1,6 +1,6 @@
-use pyo3::{exceptions::PyBufferError, ffi::PyMemoryView_FromMemory, prelude::*};
 use edgefirst::tensor;
 use edgefirst::tensor::{TensorMapTrait as _, TensorTrait as _};
+use pyo3::{exceptions::PyBufferError, ffi::PyMemoryView_FromMemory, prelude::*};
 
 #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
 use pyo3::ffi::Py_buffer;
@@ -9,15 +9,23 @@ use pyo3::ffi::Py_buffer;
 use std::ffi::{CString, c_int, c_void};
 use std::fmt;
 
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
 #[derive(Debug)]
 enum Error {
     TensorError(tensor::Error),
+    UnsupportedMemoryType(String),
+    UnsupportedDataType(String),
+    TensorMapError(String),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::TensorError(e) => write!(f, "Tensor error: {e:?}"),
+            Error::UnsupportedMemoryType(msg) => write!(f, "Invalid memory type: {msg}"),
+            Error::UnsupportedDataType(msg) => write!(f, "Invalid data type: {msg}"),
+            Error::TensorMapError(msg) => write!(f, "Tensor map error: {msg}"),
         }
     }
 }
@@ -242,50 +250,26 @@ impl PyTensor {
         dtype: &str,
         memory: Option<&str>,
         name: Option<&str>,
-    ) -> PyResult<Self> {
+    ) -> Result<Self> {
         let memory = match memory {
             Some("dma") => Some(tensor::TensorMemory::Dma),
             Some("shm") => Some(tensor::TensorMemory::Shm),
-            Some(inv) => {
-                return Err(PyBufferError::new_err(format!(
-                    "Invalid memory type: {inv}"
-                )));
-            }
+            Some(inv) => return Err(Error::UnsupportedMemoryType(inv.to_string()).into()),
             None => None,
         };
 
         let tensor = match dtype {
-            "uint8" => TensorT::TensorU8(
-                tensor::Tensor::new(&shape, memory, name).map_err(Error::from)?,
-            ),
-            "int8" => TensorT::TensorI8(
-                tensor::Tensor::new(&shape, memory, name).map_err(Error::from)?,
-            ),
-            "uint16" => TensorT::TensorU16(
-                tensor::Tensor::new(&shape, memory, name).map_err(Error::from)?,
-            ),
-            "int16" => TensorT::TensorI16(
-                tensor::Tensor::new(&shape, memory, name).map_err(Error::from)?,
-            ),
-            "uint32" => TensorT::TensorU32(
-                tensor::Tensor::new(&shape, memory, name).map_err(Error::from)?,
-            ),
-            "int32" => TensorT::TensorI32(
-                tensor::Tensor::new(&shape, memory, name).map_err(Error::from)?,
-            ),
-            "uint64" => TensorT::TensorU64(
-                tensor::Tensor::new(&shape, memory, name).map_err(Error::from)?,
-            ),
-            "int64" => TensorT::TensorI64(
-                tensor::Tensor::new(&shape, memory, name).map_err(Error::from)?,
-            ),
-            "float32" => TensorT::TensorF32(
-                tensor::Tensor::new(&shape, memory, name).map_err(Error::from)?,
-            ),
-            "float64" => TensorT::TensorF64(
-                tensor::Tensor::new(&shape, memory, name).map_err(Error::from)?,
-            ),
-            _ => return Err(PyBufferError::new_err("Invalid dtype")),
+            "uint8" => TensorT::TensorU8(tensor::Tensor::new(&shape, memory, name)?),
+            "int8" => TensorT::TensorI8(tensor::Tensor::new(&shape, memory, name)?),
+            "uint16" => TensorT::TensorU16(tensor::Tensor::new(&shape, memory, name)?),
+            "int16" => TensorT::TensorI16(tensor::Tensor::new(&shape, memory, name)?),
+            "uint32" => TensorT::TensorU32(tensor::Tensor::new(&shape, memory, name)?),
+            "int32" => TensorT::TensorI32(tensor::Tensor::new(&shape, memory, name)?),
+            "uint64" => TensorT::TensorU64(tensor::Tensor::new(&shape, memory, name)?),
+            "int64" => TensorT::TensorI64(tensor::Tensor::new(&shape, memory, name)?),
+            "float32" => TensorT::TensorF32(tensor::Tensor::new(&shape, memory, name)?),
+            "float64" => TensorT::TensorF64(tensor::Tensor::new(&shape, memory, name)?),
+            _ => return Err(Error::UnsupportedDataType(dtype.to_string()).into()),
         };
 
         Ok(PyTensor(tensor))
@@ -320,21 +304,24 @@ impl PyTensor {
         self.0.shape()
     }
 
-    fn reshape(&mut self, shape: Vec<usize>) -> PyResult<()> {
-        self.0.reshape(&shape).map_err(|e| Error::from(e).into())
+    fn reshape(&mut self, shape: Vec<usize>) -> Result<()> {
+        Ok(self.0.reshape(&shape)?)
     }
 
-    fn map(&self) -> PyResult<TensorMap> {
+    fn map(&self) -> Result<TensorMap> {
         Ok(TensorMap {
-            mapped: Some(self.0.map().map_err(Error::from)?),
+            mapped: Some(self.0.map()?),
         })
     }
 }
 
-#[pyclass(unsendable)]
+#[pyclass]
 struct TensorMap {
     mapped: Option<TensorMapT>,
 }
+
+unsafe impl Send for TensorMap {}
+unsafe impl Sync for TensorMap {}
 
 #[pymethods]
 impl TensorMap {

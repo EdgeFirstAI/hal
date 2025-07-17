@@ -7,6 +7,7 @@ use crate::{
 };
 use num_traits::Num;
 use std::{
+    fmt,
     ops::{Deref, DerefMut},
     os::fd::OwnedFd,
 };
@@ -22,7 +23,7 @@ use nix::sys::stat::{major, minor};
 
 pub trait TensorTrait<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     fn new(shape: &[usize], name: Option<&str>) -> Result<Self>
     where
@@ -55,7 +56,7 @@ where
 
 pub trait TensorMapTrait<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     fn shape(&self) -> &[usize];
 
@@ -123,7 +124,7 @@ impl TryFrom<&str> for TensorMemory {
 
 pub enum Tensor<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     Dma(DmaTensor<T>),
     Shm(ShmTensor<T>),
@@ -132,7 +133,7 @@ where
 
 impl<T> Tensor<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     pub fn new(shape: &[usize], memory: Option<TensorMemory>, name: Option<&str>) -> Result<Self> {
         match memory {
@@ -152,7 +153,7 @@ where
 
 impl<T> TensorTrait<T> for Tensor<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     fn new(shape: &[usize], name: Option<&str>) -> Result<Self> {
         Self::new(shape, None, name)
@@ -251,7 +252,7 @@ where
 
 pub enum TensorMap<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     Dma(DmaMap<T>),
     Shm(ShmMap<T>),
@@ -260,7 +261,7 @@ where
 
 impl<T> TensorMapTrait<T> for TensorMap<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     fn shape(&self) -> &[usize] {
         match self {
@@ -297,7 +298,7 @@ where
 
 impl<T> Deref for TensorMap<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     type Target = [T];
 
@@ -312,7 +313,7 @@ where
 
 impl<T> DerefMut for TensorMap<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     fn deref_mut(&mut self) -> &mut [T] {
         match self {

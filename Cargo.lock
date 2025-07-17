@@ -367,6 +367,7 @@ version = "0.0.0"
 dependencies = [
  "edgefirst",
  "env_logger",
+ "four-char-code",
  "pyo3",
  "pyo3-build-config",
 ]
