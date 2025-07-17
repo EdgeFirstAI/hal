@@ -1,10 +1,10 @@
 #![cfg(target_os = "linux")]
 
 use crate::{Error, ImageConverterTrait, Rect, Result, Rotation, TensorImage};
+use edgefirst_tensor::Tensor;
 use g2d_sys::{G2D, G2DFormat, G2DPhysical, G2DSurface};
 use log::debug;
 use std::os::fd::AsRawFd;
-use edgefirst_tensor::Tensor;
 
 /// G2DConverter implements the ImageConverter trait using the NXP G2D
 /// library for hardware-accelerated image processing on i.MX platforms.

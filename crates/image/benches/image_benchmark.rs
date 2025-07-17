@@ -1,5 +1,5 @@
+use edgefirst_image::{ImageConverterTrait as _, RGBA, Rotation, TensorImage};
 use edgefirst_tensor::TensorMemory;
-use edgefirst_image::{ImageConverterTrait as _, Rotation, TensorImage, RGBA};
 use std::path::Path;
 
 trait TestImage {
@@ -110,7 +110,7 @@ where
     IMAGE: TestImage,
 {
     use edgefirst_image::CPUConverter;
-    
+
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
     let path = Path::new("testdata").join(&name);
