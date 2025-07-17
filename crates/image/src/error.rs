@@ -10,7 +10,7 @@ pub enum Error {
     ResizeError(fast_image_resize::ResizeError),
     #[cfg(target_os = "linux")]
     G2DError(g2d_sys::Error),
-    TensorError(tensor::Error),
+    TensorError(edgefirst_tensor::Error),
     NotImplemented(String),
     InvalidShape(String),
 }
@@ -58,8 +58,8 @@ impl From<g2d_sys::Error> for Error {
     }
 }
 
-impl From<tensor::Error> for Error {
-    fn from(err: tensor::Error) -> Self {
+impl From<edgefirst_tensor::Error> for Error {
+    fn from(err: edgefirst_tensor::Error) -> Self {
         Error::TensorError(err)
     }
 }

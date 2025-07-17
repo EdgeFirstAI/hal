@@ -1,5 +1,5 @@
 [package]
-name = "tensor"
+name = "edgefirst-tensor"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

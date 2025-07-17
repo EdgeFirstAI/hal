@@ -1,5 +1,5 @@
 [package]
-name = "image-converter"
+name = "edgefirst-image"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -17,12 +17,12 @@ four-char-code = { workspace = true }
 jpeg-encoder = { workspace = true }
 libloading = { workspace = true }
 log = { workspace = true }
-tensor = { path = "../tensor" }
+edgefirst-tensor = { version = "*", path = "../tensor" }
 zune-jpeg = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-g2d-sys = { version = "1.0.1", path = "../g2d-sys" }
 dma-heap = { workspace = true }
+g2d-sys = { version = "*", path = "../g2d-sys" }
 
 [dev-dependencies]
 divan = { workspace = true }

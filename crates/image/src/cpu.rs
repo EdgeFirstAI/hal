@@ -1,5 +1,5 @@
 use crate::{Error, ImageConverterTrait, Rect, Result, Rotation, TensorImage};
-use tensor::TensorTrait;
+use edgefirst_tensor::TensorTrait;
 
 /// CPUConverter implements the ImageConverter trait using the fallback CPU
 /// implementation for image processing.
