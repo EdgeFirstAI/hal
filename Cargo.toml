@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-exclude = ["crates/python"]
+default-members = ["crates/edgefirst", "crates/tensor", "crates/image"]
 
 [workspace.package]
 name = "edgefirst-hal"

@@ -1,5 +1,6 @@
 use pyo3::{exceptions::PyBufferError, ffi::PyMemoryView_FromMemory, prelude::*};
-use tensor::{Result, TensorMapTrait, TensorMemory, TensorTrait};
+use edgefirst::tensor;
+use edgefirst::tensor::{TensorMapTrait as _, TensorTrait as _};
 
 #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
 use pyo3::ffi::Py_buffer;
@@ -77,7 +78,7 @@ impl TensorT {
         }
     }
 
-    pub fn memory(&self) -> TensorMemory {
+    pub fn memory(&self) -> tensor::TensorMemory {
         match self {
             TensorT::TensorU8(t) => t.memory(),
             TensorT::TensorI8(t) => t.memory(),
@@ -122,7 +123,7 @@ impl TensorT {
         }
     }
 
-    pub fn reshape(&mut self, shape: &[usize]) -> Result<()> {
+    pub fn reshape(&mut self, shape: &[usize]) -> tensor::Result<()> {
         match self {
             TensorT::TensorU8(t) => t.reshape(shape),
             TensorT::TensorI8(t) => t.reshape(shape),
@@ -137,7 +138,7 @@ impl TensorT {
         }
     }
 
-    pub fn map(&self) -> Result<TensorMapT> {
+    pub fn map(&self) -> tensor::Result<TensorMapT> {
         match self {
             TensorT::TensorU8(t) => t.map().map(TensorMapT::TensorU8),
             TensorT::TensorI8(t) => t.map().map(TensorMapT::TensorI8),
@@ -714,12 +715,3 @@ impl TensorMap {
         unsafe { PyObject::from_owned_ptr_or_err(py, mem) }
     }
 }
-
-// #[pymodule_init]
-// fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
-//     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
-//     m.add_class::<Tensor>()?;
-
-//     Ok(())
-// }
