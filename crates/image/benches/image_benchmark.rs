@@ -1,8 +1,6 @@
-use image_converter::{
-    CPUConverter, ImageConverter, ImageConverterTrait as _, RGBA, Rotation, TensorImage,
-};
+use edgefirst_tensor::TensorMemory;
+use edgefirst_image::{ImageConverterTrait as _, Rotation, TensorImage, RGBA};
 use std::path::Path;
-use tensor::TensorMemory;
 
 trait TestImage {
     fn filename() -> &'static str;
@@ -101,8 +99,6 @@ where
     assert!(path.exists(), "unable to locate test image at {path:?}");
 
     bencher.bench_local(|| {
-        use tensor::TensorMemory;
-
         let file = std::fs::read(&path).unwrap();
         TensorImage::load(&file, Some(RGBA), Some(TensorMemory::Dma)).expect("Failed to load image")
     });
@@ -113,6 +109,8 @@ fn converter_cpu<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
 where
     IMAGE: TestImage,
 {
+    use edgefirst_image::CPUConverter;
+    
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
     let path = Path::new("testdata").join(&name);
@@ -149,6 +147,8 @@ fn converter_g2d<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
 where
     IMAGE: TestImage,
 {
+    use edgefirst_image::G2DConverter;
+
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
     let path = Path::new("testdata").join(&name);
@@ -170,7 +170,7 @@ where
     let src = TensorImage::load(&file, Some(RGBA), None).unwrap();
     let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
 
-    let mut converter = image_converter::G2DConverter::new().unwrap();
+    let mut converter = G2DConverter::new().unwrap();
 
     bencher.bench_local(|| {
         converter

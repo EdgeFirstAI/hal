@@ -7,7 +7,7 @@
 //! environments where hardware acceleration is not present or not suitable.
 
 use four_char_code::{FourCharCode, four_char_code};
-use tensor::{Tensor, TensorMemory, TensorTrait as _};
+use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait as _};
 use zune_jpeg::{
     JpegDecoder,
     zune_core::{colorspace::ColorSpace, options::DecoderOptions},
