@@ -114,8 +114,7 @@ where
     type Target = [T];
 
     fn deref(&self) -> &[T] {
-        let ptr = self.ptr.lock().expect("Failed to lock MemMap pointer");
-        unsafe { std::slice::from_raw_parts(ptr.as_ptr() as *const T, self.len()) }
+        self.as_slice()
     }
 }
 
@@ -124,8 +123,7 @@ where
     T: Num + Clone + Send + Sync + std::fmt::Debug,
 {
     fn deref_mut(&mut self) -> &mut [T] {
-        let ptr = self.ptr.lock().expect("Failed to lock MemMap pointer");
-        unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr() as *mut T, self.len()) }
+        self.as_mut_slice()
     }
 }
 
@@ -139,6 +137,16 @@ where
 
     fn unmap(&mut self) {
         trace!("Unmapping MemMap memory: {:?}", self.to_vec());
+    }
+
+    fn as_slice(&self) -> &[T] {
+        let ptr = self.ptr.lock().expect("Failed to lock MemMap pointer");
+        unsafe { std::slice::from_raw_parts(ptr.as_ptr() as *const T, self.len()) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [T] {
+        let ptr = self.ptr.lock().expect("Failed to lock MemMap pointer");
+        unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr() as *mut T, self.len()) }
     }
 }
 

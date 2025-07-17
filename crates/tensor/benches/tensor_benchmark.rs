@@ -1,7 +1,5 @@
-use std::env;
-
+use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait as _};
 use num_traits::Num;
-use tensor::{Tensor, TensorMemory, TensorTrait as _};
 
 #[divan::bench(types = [u8, f64], args = [[1, 360, 640, 4], [1, 720, 1280, 4], [1, 1080, 1920, 4], [1, 2160, 3840, 4]])]
 fn tensor_alloc_mem<T>(size: [usize; 4])

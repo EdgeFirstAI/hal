@@ -68,6 +68,27 @@ where
     fn size(&self) -> usize {
         self.len() * std::mem::size_of::<T>()
     }
+
+    fn as_slice(&self) -> &[T];
+
+    fn as_mut_slice(&mut self) -> &mut [T];
+
+    #[cfg(feature = "ndarray")]
+    fn view(&self) -> Result<ndarray::ArrayView<T, ndarray::Dim<ndarray::IxDynImpl>>> {
+        Ok(ndarray::ArrayView::from_shape(
+            self.shape(),
+            self.as_slice(),
+        )?)
+    }
+
+    #[cfg(feature = "ndarray")]
+    fn view_mut(&mut self) -> Result<ndarray::ArrayViewMut<T, ndarray::Dim<ndarray::IxDynImpl>>> {
+        let shape = self.shape().to_vec();
+        Ok(ndarray::ArrayViewMut::from_shape(
+            shape,
+            self.as_mut_slice(),
+        )?)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,6 +275,22 @@ where
             TensorMap::Dma(map) => map.unmap(),
             TensorMap::Shm(map) => map.unmap(),
             TensorMap::Mem(map) => map.unmap(),
+        }
+    }
+
+    fn as_slice(&self) -> &[T] {
+        match self {
+            TensorMap::Dma(map) => map.as_slice(),
+            TensorMap::Shm(map) => map.as_slice(),
+            TensorMap::Mem(map) => map.as_slice(),
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [T] {
+        match self {
+            TensorMap::Dma(map) => map.as_mut_slice(),
+            TensorMap::Shm(map) => map.as_mut_slice(),
+            TensorMap::Mem(map) => map.as_mut_slice(),
         }
     }
 }
@@ -519,5 +556,26 @@ mod tests {
             assert_eq!(tensor_map[1], 1, "Value at index 1 should be 1");
             assert_eq!(tensor_map[2], 42, "Value at index 2 should be 42");
         }
+    }
+
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn test_ndarray() {
+        let shape = vec![2, 3, 4];
+        let tensor = Tensor::<f32>::new(&shape, None, None).expect("Failed to create tensor");
+
+        let mut tensor_map = tensor.map().expect("Failed to map tensor memory");
+        tensor_map.fill(1.0);
+
+        let view = tensor_map.view().expect("Failed to get ndarray view");
+        assert_eq!(view.shape(), &[2, 3, 4]);
+        assert!(view.iter().all(|&x| x == 1.0));
+
+        let mut view_mut = tensor_map
+            .view_mut()
+            .expect("Failed to get mutable ndarray view");
+        view_mut[[0, 0, 0]] = 42.0;
+        assert_eq!(view_mut[[0, 0, 0]], 42.0);
+        assert_eq!(tensor_map[0], 42.0, "Value at index 0 should be 42");
     }
 }
