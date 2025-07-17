@@ -4,7 +4,7 @@ use pyo3::prelude::*;
 mod tensor;
 
 #[pymodule]
-mod edgefirst_hal {
+mod edgefirst {
     use super::*;
 
     #[pymodule_init]

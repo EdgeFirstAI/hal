@@ -1,5 +1,5 @@
 [project]
-name = "edgefirst_hal"
+name = "edgefirst"
 dynamic = ["version"]
 
 [project.urls]
