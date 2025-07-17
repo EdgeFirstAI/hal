@@ -7,6 +7,7 @@ use nix::{fcntl::OFlag, sys::stat::fstat, unistd::ftruncate};
 use num_traits::Num;
 use std::{
     ffi::c_void,
+    fmt,
     num::NonZero,
     ops::{Deref, DerefMut},
     os::fd::{AsRawFd, OwnedFd},
@@ -16,7 +17,7 @@ use std::{
 
 pub struct ShmTensor<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     pub name: String,
     pub fd: OwnedFd,
@@ -26,7 +27,7 @@ where
 
 impl<T> TensorTrait<T> for ShmTensor<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     fn new(shape: &[usize], name: Option<&str>) -> Result<Self> {
         let size = shape.iter().product::<usize>() * std::mem::size_of::<T>();
@@ -144,7 +145,7 @@ where
 
 impl<T> AsRawFd for ShmTensor<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
         self.fd.as_raw_fd()
@@ -153,7 +154,7 @@ where
 
 pub struct ShmMap<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     ptr: Arc<Mutex<NonNull<c_void>>>,
     shape: Vec<usize>,
@@ -162,7 +163,7 @@ where
 
 impl<T> Deref for ShmMap<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     type Target = [T];
 
@@ -173,7 +174,7 @@ where
 
 impl<T> DerefMut for ShmMap<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     fn deref_mut(&mut self) -> &mut [T] {
         self.as_mut_slice()
@@ -182,7 +183,7 @@ where
 
 impl<T> TensorMapTrait<T> for ShmMap<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     fn shape(&self) -> &[usize] {
         &self.shape
@@ -209,7 +210,7 @@ where
 
 impl<T> Drop for ShmMap<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     fn drop(&mut self) {
         trace!("ShmMap dropped, unmapping memory: {:?}", self.to_vec());

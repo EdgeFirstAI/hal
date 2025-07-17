@@ -6,6 +6,7 @@ use log::trace;
 use num_traits::Num;
 use std::{
     ffi::c_void,
+    fmt,
     ops::{Deref, DerefMut},
     os::fd::OwnedFd,
     ptr::NonNull,
@@ -14,7 +15,7 @@ use std::{
 
 pub struct MemTensor<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     pub name: String,
     pub shape: Vec<usize>,
@@ -23,7 +24,7 @@ where
 
 impl<T> TensorTrait<T> for MemTensor<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     fn new(shape: &[usize], name: Option<&str>) -> Result<Self> {
         if shape.is_empty() {
@@ -100,7 +101,7 @@ where
 
 pub struct MemMap<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     ptr: Arc<Mutex<NonNull<c_void>>>,
     shape: Vec<usize>,
@@ -109,7 +110,7 @@ where
 
 impl<T> Deref for MemMap<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     type Target = [T];
 
@@ -120,7 +121,7 @@ where
 
 impl<T> DerefMut for MemMap<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     fn deref_mut(&mut self) -> &mut [T] {
         self.as_mut_slice()
@@ -129,7 +130,7 @@ where
 
 impl<T> TensorMapTrait<T> for MemMap<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     fn shape(&self) -> &[usize] {
         &self.shape
@@ -152,7 +153,7 @@ where
 
 impl<T> Drop for MemMap<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     fn drop(&mut self) {
         self.unmap();
