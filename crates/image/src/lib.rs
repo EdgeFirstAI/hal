@@ -6,8 +6,8 @@
 //! acceleration when available, but also provides a CPU-based fallback for
 //! environments where hardware acceleration is not present or not suitable.
 
-use four_char_code::{FourCharCode, four_char_code};
 use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait as _};
+use four_char_code::{FourCharCode, four_char_code};
 use zune_jpeg::{
     JpegDecoder,
     zune_core::{colorspace::ColorSpace, options::DecoderOptions},
