@@ -1,5 +1,7 @@
-use edgefirst::tensor;
-use edgefirst::tensor::{TensorMapTrait as _, TensorTrait as _};
+use edgefirst::{
+    tensor,
+    tensor::{TensorMapTrait as _, TensorTrait as _},
+};
 use pyo3::{exceptions::PyBufferError, ffi::PyMemoryView_FromMemory, prelude::*};
 
 #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
