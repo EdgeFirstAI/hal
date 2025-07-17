@@ -336,6 +336,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7454e41ff9012c00d53cf7f475c5e3afa3b91b7c90568495495e8d9bf47a1055"
 
 [[package]]
+name = "edgefirst-image"
+version = "0.0.0"
+dependencies = [
+ "ctor",
+ "divan",
+ "dma-heap",
+ "edgefirst-tensor",
+ "env_logger",
+ "fast_image_resize",
+ "four-char-code",
+ "g2d-sys",
+ "jpeg-encoder",
+ "libloading",
+ "log",
+ "zune-jpeg",
+]
+
+[[package]]
+name = "edgefirst-tensor"
+version = "0.0.0"
+dependencies = [
+ "ctor",
+ "divan",
+ "dma-heap",
+ "env_logger",
+ "log",
+ "nix",
+ "num-traits",
+ "random-string",
+]
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -485,24 +517,6 @@ dependencies = [
  "num-traits",
  "ravif",
  "rayon",
-]
-
-[[package]]
-name = "image-converter"
-version = "0.0.0"
-dependencies = [
- "ctor",
- "divan",
- "dma-heap",
- "env_logger",
- "fast_image_resize",
- "four-char-code",
- "g2d-sys",
- "jpeg-encoder",
- "libloading",
- "log",
- "tensor",
- "zune-jpeg",
 ]
 
 [[package]]
@@ -1100,20 +1114,6 @@ name = "target-lexicon"
 version = "0.12.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61c41af27dd6d1e27b1b16b489db798443478cef1f06a660c96db617ba5de3b1"
-
-[[package]]
-name = "tensor"
-version = "0.0.0"
-dependencies = [
- "ctor",
- "divan",
- "dma-heap",
- "env_logger",
- "log",
- "nix",
- "num-traits",
- "random-string",
-]
 
 [[package]]
 name = "terminal_size"
