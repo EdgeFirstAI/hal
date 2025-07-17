@@ -11,13 +11,13 @@ license.workspace = true
 
 [dependencies]
 ctor = { workspace = true }
+edgefirst-tensor = { version = "*", path = "../tensor" }
 env_logger = { workspace = true }
 fast_image_resize = { workspace = true }
 four-char-code = { workspace = true }
 jpeg-encoder = { workspace = true }
 libloading = { workspace = true }
 log = { workspace = true }
-edgefirst-tensor = { version = "*", path = "../tensor" }
 zune-jpeg = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

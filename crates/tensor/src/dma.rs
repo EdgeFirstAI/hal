@@ -6,6 +6,7 @@ use log::{trace, warn};
 use num_traits::Num;
 use std::{
     ffi::c_void,
+    fmt,
     num::NonZero,
     ops::{Deref, DerefMut},
     os::fd::{AsRawFd, OwnedFd},
@@ -15,7 +16,7 @@ use std::{
 
 pub struct DmaTensor<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     pub name: String,
     pub fd: OwnedFd,
@@ -25,7 +26,7 @@ where
 
 impl<T> TensorTrait<T> for DmaTensor<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     #[cfg(target_os = "linux")]
     fn new(shape: &[usize], name: Option<&str>) -> Result<Self> {
@@ -126,7 +127,7 @@ where
 
 impl<T> AsRawFd for DmaTensor<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
         self.fd.as_raw_fd()
@@ -135,7 +136,7 @@ where
 
 pub struct DmaMap<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     ptr: Arc<Mutex<NonNull<c_void>>>,
     fd: OwnedFd,
@@ -148,7 +149,7 @@ where
 
 impl<T> DmaMap<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     pub fn new(fd: OwnedFd, shape: &[usize]) -> Result<Self> {
         if shape.is_empty() {
@@ -189,7 +190,7 @@ where
 
 impl<T> Deref for DmaMap<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     type Target = [T];
 
@@ -200,7 +201,7 @@ where
 
 impl<T> DerefMut for DmaMap<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     fn deref_mut(&mut self) -> &mut [T] {
         self.as_mut_slice()
@@ -209,7 +210,7 @@ where
 
 impl<T> TensorMapTrait<T> for DmaMap<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     fn shape(&self) -> &[usize] {
         &self.shape
@@ -241,7 +242,7 @@ where
 
 impl<T> Drop for DmaMap<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + fmt::Debug,
 {
     fn drop(&mut self) {
         trace!("DmaMap dropped, unmapping memory: {:?}", self.to_vec());
