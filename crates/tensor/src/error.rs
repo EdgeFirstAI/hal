@@ -9,6 +9,8 @@ pub enum Error {
     ShapeMismatch(String),
     UnknownDeviceType(u64, u64),
     InvalidMemoryType(String),
+    #[cfg(feature = "ndarray")]
+    NdArrayError(ndarray::ShapeError),
 }
 
 impl From<std::io::Error> for Error {
@@ -20,5 +22,12 @@ impl From<std::io::Error> for Error {
 impl From<nix::Error> for Error {
     fn from(err: nix::Error) -> Self {
         Error::NixError(err)
+    }
+}
+
+#[cfg(feature = "ndarray")]
+impl From<ndarray::ShapeError> for Error {
+    fn from(err: ndarray::ShapeError) -> Self {
+        Error::NdArrayError(err)
     }
 }
