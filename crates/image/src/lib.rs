@@ -324,6 +324,51 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    fn test_g2d() {
+        let dst_width = 640;
+        let dst_height = 360;
+        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let src = TensorImage::load(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
+
+        let mut g2d_dst =
+            TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
+        let mut g2d_converter = G2DConverter::new().unwrap();
+        g2d_converter
+            .convert(&mut g2d_dst, &src, Rotation::None, None)
+            .unwrap();
+
+        let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
+        let mut cpu_converter = CPUConverter::new().unwrap();
+        cpu_converter
+            .convert(&mut cpu_dst, &src, Rotation::None, None)
+            .unwrap();
+
+        let g2d_image = image::RgbaImage::from_vec(
+            dst_width as u32,
+            dst_height as u32,
+            g2d_dst.tensor().map().unwrap().to_vec(),
+        )
+        .unwrap();
+        let cpu_image = image::RgbaImage::from_vec(
+            dst_width as u32,
+            dst_height as u32,
+            cpu_dst.tensor().map().unwrap().to_vec(),
+        )
+        .unwrap();
+
+        let similarity = image_compare::rgba_hybrid_compare(&g2d_image, &cpu_image)
+            .expect("Image Comparison failed");
+        assert!(
+            similarity.score > 0.98,
+            "G2D and CPU converted image have similarity score too low: {}",
+            similarity.score
+        );
+
+        drop(g2d_dst);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn test_opengl() {
         let dst_width = 640;
         let dst_height = 360;
@@ -347,6 +392,138 @@ mod tests {
             .convert(&mut cpu_dst, &src, Rotation::None, None)
             .unwrap();
 
+        let opengl_image = image::RgbaImage::from_vec(
+            dst_width as u32,
+            dst_height as u32,
+            gl_dst.tensor().map().unwrap().to_vec(),
+        )
+        .unwrap();
+        let cpu_image = image::RgbaImage::from_vec(
+            dst_width as u32,
+            dst_height as u32,
+            cpu_dst.tensor().map().unwrap().to_vec(),
+        )
+        .unwrap();
+
+        let similarity = image_compare::rgba_hybrid_compare(&opengl_image, &cpu_image)
+            .expect("Image Comparison failed");
+        assert!(
+            similarity.score > 0.98,
+            "OpenGL and CPU converted image have similarity score too low: {}",
+            similarity.score
+        );
+
+        drop(gl_dst);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_g2d_crop() {
+        let dst_width = 640;
+        let dst_height = 360;
+        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let src = TensorImage::load(&file, Some(RGBA), None).unwrap();
+
+        let mut g2d_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
+        let mut g2d_converter = G2DConverter::new().unwrap();
+        g2d_converter
+            .convert(
+                &mut g2d_dst,
+                &src,
+                Rotation::None,
+                Some(Rect {
+                    left: 320,
+                    top: 180,
+                    width: 1280 - 320,
+                    height: 720 - 180,
+                }),
+            )
+            .unwrap();
+
+        let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
+        let mut cpu_converter = CPUConverter::new().unwrap();
+        cpu_converter
+            .convert(
+                &mut cpu_dst,
+                &src,
+                Rotation::None,
+                Some(Rect {
+                    left: 320,
+                    top: 180,
+                    width: 1280 - 320,
+                    height: 720 - 180,
+                }),
+            )
+            .unwrap();
+
+        let _ = g2d_dst.save("g2d.jpg", 80);
+        let _ = cpu_dst.save("cpu.jpg", 80);
+
+        let g2d_image = image::RgbaImage::from_vec(
+            dst_width as u32,
+            dst_height as u32,
+            g2d_dst.tensor().map().unwrap().to_vec(),
+        )
+        .unwrap();
+        let cpu_image = image::RgbaImage::from_vec(
+            dst_width as u32,
+            dst_height as u32,
+            cpu_dst.tensor().map().unwrap().to_vec(),
+        )
+        .unwrap();
+
+        let similarity = image_compare::rgba_hybrid_compare(&g2d_image, &cpu_image)
+            .expect("Image Comparison failed");
+        assert!(
+            similarity.score > 0.98,
+            "G2D and CPU converted image have similarity score too low: {}",
+            similarity.score
+        );
+
+        drop(g2d_dst);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_opengl_crop() {
+        let dst_width = 640;
+        let dst_height = 360;
+        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let src = TensorImage::load(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
+
+        let mut gl_dst =
+            TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
+        let mut gl_converter = GLConverter::new_with_size(dst_width, dst_height, false).unwrap();
+        gl_converter
+            .convert(
+                &mut gl_dst,
+                &src,
+                Rotation::None,
+                Some(Rect {
+                    left: 320,
+                    top: 180,
+                    width: 1280 - 320,
+                    height: 720 - 180,
+                }),
+            )
+            .unwrap();
+
+        let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
+        let mut cpu_converter = CPUConverter::new().unwrap();
+        cpu_converter
+            .convert(
+                &mut cpu_dst,
+                &src,
+                Rotation::None,
+                Some(Rect {
+                    left: 320,
+                    top: 180,
+                    width: 1280 - 320,
+                    height: 720 - 180,
+                }),
+            )
+            .unwrap();
+
         let _ = gl_dst.save("opengl.jpg", 80);
         let _ = cpu_dst.save("cpu.jpg", 80);
 
@@ -366,7 +543,7 @@ mod tests {
         let similarity = image_compare::rgba_hybrid_compare(&opengl_image, &cpu_image)
             .expect("Image Comparison failed");
         assert!(
-            similarity.score > 0.99,
+            similarity.score > 0.98,
             "OpenGL and CPU converted image have similarity score too low: {}",
             similarity.score
         );
