@@ -57,10 +57,10 @@ impl ImageConverterTrait for G2DConverter {
         };
 
         if let Some(crop_rect) = crop {
-            src_surface.left = crop_rect.x as i32;
-            src_surface.top = crop_rect.y as i32;
-            src_surface.right = (crop_rect.x + crop_rect.width) as i32;
-            src_surface.bottom = (crop_rect.y + crop_rect.height) as i32;
+            src_surface.left = crop_rect.left as i32;
+            src_surface.top = crop_rect.top as i32;
+            src_surface.right = (crop_rect.left + crop_rect.width) as i32;
+            src_surface.bottom = (crop_rect.top + crop_rect.height) as i32;
         }
 
         debug!("Blitting from {src_surface:?} to {dst_surface:?}");
