@@ -18,6 +18,14 @@ impl CPUConverter {
             .use_alpha(false);
         Ok(Self { resizer, options })
     }
+
+    pub fn new_nearest() -> Result<Self> {
+        let resizer = fast_image_resize::Resizer::new();
+        let options = fast_image_resize::ResizeOptions::new()
+            .resize_alg(fast_image_resize::ResizeAlg::Nearest)
+            .use_alpha(false);
+        Ok(Self { resizer, options })
+    }
 }
 
 impl ImageConverterTrait for CPUConverter {
@@ -31,12 +39,6 @@ impl ImageConverterTrait for CPUConverter {
         if rotation != Rotation::None {
             return Err(Error::NotImplemented(
                 "Rotation is not supported in CPUConverter".to_string(),
-            ));
-        }
-
-        if crop.is_some() {
-            return Err(Error::NotImplemented(
-                "Cropping is not supported in CPUConverter".to_string(),
             ));
         }
 
@@ -77,9 +79,18 @@ impl ImageConverterTrait for CPUConverter {
             &mut dst_map,
             dst_type,
         )?;
+        let options = if let Some(crop) = crop {
+            self.options.crop(
+                crop.left as f64,
+                crop.top as f64,
+                crop.width as f64,
+                crop.height as f64,
+            )
+        } else {
+            self.options
+        };
 
-        self.resizer
-            .resize(&src_view, &mut dst_view, &self.options)?;
+        self.resizer.resize(&src_view, &mut dst_view, &options)?;
 
         Ok(())
     }
