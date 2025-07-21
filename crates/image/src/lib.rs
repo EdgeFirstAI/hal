@@ -195,8 +195,8 @@ pub enum Rotation {
 }
 
 pub struct Rect {
-    pub x: usize,
-    pub y: usize,
+    pub left: usize,
+    pub top: usize,
     pub width: usize,
     pub height: usize,
 }
