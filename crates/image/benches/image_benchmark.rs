@@ -1,5 +1,5 @@
-use edgefirst_image::{CPUConverter, ImageConverterTrait as _, RGBA, Rotation, TensorImage};
-use edgefirst_tensor::{TensorMemory, TensorTrait};
+use edgefirst_image::{ImageConverterTrait as _, RGBA, Rotation, TensorImage};
+use edgefirst_tensor::TensorMemory;
 use std::path::Path;
 
 trait TestImage {
