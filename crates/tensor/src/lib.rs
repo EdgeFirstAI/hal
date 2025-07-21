@@ -324,6 +324,47 @@ where
     }
 }
 
+pub fn dequantize_cpu(zero_point: i32, scale: f32, input: &[u8], output: &mut [f32]) {
+    assert!(input.len() == output.len());
+    let scaled_zero = -zero_point as f32 * scale; // scale * (d - zero_point) = d * scale - zero_point * scale
+
+    input
+        .iter()
+        .zip(output)
+        .for_each(|(d, deq)| *deq = (*d as f32) * scale + scaled_zero);
+    // .for_each(|(d, deq)| *deq = (*d as f32).mul_add(scale, scaled_zero));
+}
+
+pub fn dequantize_simd(zero_point: i32, scale: f32, input: &[u8], output: &mut [f32]) {
+    assert!(input.len() == output.len());
+    let scaled_zero = -zero_point as f32 * scale;
+    let scaled_zero_packed = wide::f32x8::splat(scaled_zero);
+    let scale_packed = wide::f32x8::splat(scale);
+    let len = input.len() / 8 * 8;
+    input[0..len]
+        .chunks_exact(8)
+        .zip(&mut output[0..len].chunks_exact_mut(8))
+        .for_each(|(v, out)| {
+            let inp = wide::f32x8::new([
+                f32::from(v[0]),
+                f32::from(v[1]),
+                f32::from(v[2]),
+                f32::from(v[3]),
+                f32::from(v[4]),
+                f32::from(v[5]),
+                f32::from(v[6]),
+                f32::from(v[7]),
+            ]);
+            let out_data = inp.mul_add(scale_packed, scaled_zero_packed);
+            // let out_data = inp * scale_packed + scaled_zero_packed;
+            out.copy_from_slice(out_data.as_array_ref());
+        });
+    input[len..]
+        .iter()
+        .zip(&mut output[len..])
+        .for_each(|(d, deq)| *deq = (*d as f32) * scale + scaled_zero);
+}
+
 #[cfg(test)]
 mod tests {
     use nix::unistd::{AccessFlags, access};
@@ -578,5 +619,35 @@ mod tests {
         view_mut[[0, 0, 0]] = 42.0;
         assert_eq!(view_mut[[0, 0, 0]], 42.0);
         assert_eq!(tensor_map[0], 42.0, "Value at index 0 should be 42");
+    }
+    #[test]
+    fn test_dequant_cpu() {
+        let eps = 1e-8;
+        let input = vec![128, 200];
+        let mut output = vec![0.0, 0.0];
+        let zero_point: u8 = 128;
+        let scale: f32 = 0.01;
+        dequantize_cpu(zero_point as i32, scale, &input, &mut output);
+        assert!((output[0] - 0.0).abs() < eps, "zero point is not 0");
+        assert!((output[1] - 0.72).abs() < eps, "dequant values incorrect");
+    }
+
+    #[test]
+    fn test_dequant_simd() {
+        let size = 10000;
+        let input = rand::random_iter().take(size).collect::<Vec<_>>();
+        let mut output_cpu = vec![0.0; size];
+        let mut output_simd = vec![0.0; size];
+        let zero_point: u8 = rand::random();
+        let scale: f32 = rand::random_range(0.0..0.1);
+
+        dequantize_cpu(zero_point as i32, scale, &input, &mut output_cpu);
+
+        dequantize_simd(zero_point as i32, scale, &input, &mut output_simd);
+
+        assert_eq!(
+            output_cpu, output_simd,
+            "CPU and SIMD dequant are not equal"
+        )
     }
 }
