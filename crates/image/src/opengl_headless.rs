@@ -208,6 +208,13 @@ impl Card {
     }
 }
 
+struct RegionOfInterest {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+}
+
 pub struct GLConverter {
     gbm_rendering: Headless,
     texture_program: GlProgram,
@@ -231,13 +238,13 @@ impl ImageConverterTrait for GLConverter {
                     .new_surface(dst.width() / 4, dst.height() * 3)?;
             }
 
-            self.convert_to_planar(src)?;
+            self.convert_to_planar(src, crop)?;
         } else {
             if self.gbm_rendering.size != (dst.width(), dst.height()) {
                 self.gbm_rendering.new_surface(dst.width(), dst.height())?;
             }
 
-            self.convert_to(src)?;
+            self.convert_to(src, crop)?;
         }
 
         self.gbm_rendering
@@ -328,18 +335,43 @@ impl GLConverter {
         })
     }
 
-    pub fn convert_to(&self, src: &TensorImage) -> Result<(), crate::Error> {
+    pub fn convert_to(
+        &self,
+        src: &TensorImage,
+        crop: Option<crate::Rect>,
+    ) -> Result<(), crate::Error> {
         let new_egl_image = self.create_image_from_dma2(src)?;
         unsafe {
             gls::gl::ClearColor(0.0, 0.0, 0.5, 0.5);
             gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
         };
-        self.draw_camera_texture(&self.camera_texture, &new_egl_image);
+
+        let roi = if let Some(crop) = crop {
+            RegionOfInterest {
+                left: crop.left as f32 / src.width() as f32,
+                top: (crop.top + crop.height) as f32 / src.height() as f32,
+                right: (crop.left + crop.width) as f32 / src.width() as f32,
+                bottom: crop.top as f32 / src.height() as f32,
+            }
+        } else {
+            RegionOfInterest {
+                left: 0.,
+                top: 1.,
+                right: 1.,
+                bottom: 0.,
+            }
+        };
+
+        self.draw_camera_texture(&self.camera_texture, &new_egl_image, roi);
         unsafe { gls::gl::Finish() };
         Ok(())
     }
 
-    pub fn convert_to_planar(&self, src: &TensorImage) -> Result<(), crate::Error> {
+    pub fn convert_to_planar(
+        &self,
+        src: &TensorImage,
+        crop: Option<crate::Rect>,
+    ) -> Result<(), crate::Error> {
         let new_egl_image = self.create_image_from_dma2(src)?;
         unsafe {
             gls::gl::ClearColor(0.0, 0.0, 0.0, 0.0);
@@ -428,7 +460,7 @@ impl GLConverter {
         }
     }
 
-    fn draw_camera_texture(&self, texture: &Texture, egl_img: &EglImage) {
+    fn draw_camera_texture(&self, texture: &Texture, egl_img: &EglImage, roi: RegionOfInterest) {
         let texture_target = gls::gl::TEXTURE_2D;
         unsafe {
             gls::gl::UseProgram(self.texture_program.id);
@@ -458,7 +490,9 @@ impl GLConverter {
 
             gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
             gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
-            let texture_vertices: [f32; 8] = [0., 1., 1., 1., 1., 0., 0., 0.];
+            let texture_vertices: [f32; 8] = [
+                roi.left, roi.top, roi.right, roi.top, roi.right, roi.bottom, roi.left, roi.bottom,
+            ];
             gls::gl::BufferData(
                 gls::gl::ARRAY_BUFFER,
                 (size_of::<f32>() * texture_vertices.len()) as isize,
