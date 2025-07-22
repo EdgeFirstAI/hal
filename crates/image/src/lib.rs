@@ -375,45 +375,65 @@ mod tests {
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
         let src = TensorImage::load(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
 
-        let mut gl_dst =
-            TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
-        let mut gl_converter = GLConverter::new_with_size(dst_width, dst_height, false).unwrap();
-        gl_converter
-            .convert(&mut gl_dst, &src, Rotation::None, None)
-            .unwrap();
-        assert!(
-            matches!(gl_dst.tensor, edgefirst_tensor::Tensor::DmaOpenGl(_)),
-            "GL converted destination is not OpenGL DMA tensor",
-        );
-
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
         let mut cpu_converter = CPUConverter::new().unwrap();
         cpu_converter
             .convert(&mut cpu_dst, &src, Rotation::None, None)
             .unwrap();
+        let mut gl_dst =
+            TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
+        let mut gl_converter = GLConverter::new_with_size(dst_width, dst_height, false).unwrap();
 
-        let opengl_image = image::RgbaImage::from_vec(
-            dst_width as u32,
-            dst_height as u32,
-            gl_dst.tensor().map().unwrap().to_vec(),
-        )
-        .unwrap();
-        let cpu_image = image::RgbaImage::from_vec(
-            dst_width as u32,
-            dst_height as u32,
-            cpu_dst.tensor().map().unwrap().to_vec(),
-        )
-        .unwrap();
+        for _ in 0..5 {
+            gl_converter
+                .convert(&mut gl_dst, &src, Rotation::None, None)
+                .unwrap();
+            assert!(
+                matches!(gl_dst.tensor, edgefirst_tensor::Tensor::DmaOpenGl(_)),
+                "GL converted destination is not OpenGL DMA tensor",
+            );
 
-        let similarity = image_compare::rgba_hybrid_compare(&opengl_image, &cpu_image)
-            .expect("Image Comparison failed");
-        assert!(
-            similarity.score > 0.98,
-            "OpenGL and CPU converted image have similarity score too low: {}",
-            similarity.score
-        );
+            let cpu_image = image::RgbaImage::from_vec(
+                dst_width as u32,
+                dst_height as u32,
+                cpu_dst.tensor().map().unwrap().to_vec(),
+            )
+            .unwrap();
+            let opengl_image = image::RgbaImage::from_vec(
+                dst_width as u32,
+                dst_height as u32,
+                gl_dst.tensor().map().unwrap().to_vec(),
+            )
+            .unwrap();
+
+            let similarity = image_compare::rgba_hybrid_compare(&opengl_image, &cpu_image)
+                .expect("Image Comparison failed");
+            assert!(
+                similarity.score > 0.98,
+                "OpenGL and CPU converted image have similarity score too low: {}",
+                similarity.score
+            );
+        }
 
         drop(gl_dst);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_opengl_10_threads() {
+        let handles: Vec<_> = (0..10)
+            .map(|i| {
+                std::thread::Builder::new()
+                    .name(format!("Thread {i}"))
+                    .spawn(test_opengl)
+                    .unwrap()
+            })
+            .collect();
+        handles.into_iter().for_each(|h| {
+            if let Err(e) = h.join() {
+                std::panic::resume_unwind(e)
+            }
+        });
     }
 
     #[test]
@@ -424,11 +444,11 @@ mod tests {
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
         let src = TensorImage::load(&file, Some(RGBA), None).unwrap();
 
-        let mut g2d_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
-        let mut g2d_converter = G2DConverter::new().unwrap();
-        g2d_converter
+        let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
+        let mut cpu_converter = CPUConverter::new().unwrap();
+        cpu_converter
             .convert(
-                &mut g2d_dst,
+                &mut cpu_dst,
                 &src,
                 Rotation::None,
                 Some(Rect {
@@ -440,11 +460,11 @@ mod tests {
             )
             .unwrap();
 
-        let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
-        let mut cpu_converter = CPUConverter::new().unwrap();
-        cpu_converter
+        let mut g2d_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
+        let mut g2d_converter = G2DConverter::new().unwrap();
+        g2d_converter
             .convert(
-                &mut cpu_dst,
+                &mut g2d_dst,
                 &src,
                 Rotation::None,
                 Some(Rect {
@@ -491,23 +511,6 @@ mod tests {
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
         let src = TensorImage::load(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
 
-        let mut gl_dst =
-            TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
-        let mut gl_converter = GLConverter::new_with_size(dst_width, dst_height, false).unwrap();
-        gl_converter
-            .convert(
-                &mut gl_dst,
-                &src,
-                Rotation::None,
-                Some(Rect {
-                    left: 320,
-                    top: 180,
-                    width: 1280 - 320,
-                    height: 720 - 180,
-                }),
-            )
-            .unwrap();
-
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
         let mut cpu_converter = CPUConverter::new().unwrap();
         cpu_converter
@@ -524,29 +527,47 @@ mod tests {
             )
             .unwrap();
 
-        let _ = gl_dst.save("opengl.jpg", 80);
-        let _ = cpu_dst.save("cpu.jpg", 80);
+        let mut gl_dst =
+            TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
+        let mut gl_converter = GLConverter::new_with_size(dst_width, dst_height, false).unwrap();
 
-        let opengl_image = image::RgbaImage::from_vec(
-            dst_width as u32,
-            dst_height as u32,
-            gl_dst.tensor().map().unwrap().to_vec(),
-        )
-        .unwrap();
-        let cpu_image = image::RgbaImage::from_vec(
-            dst_width as u32,
-            dst_height as u32,
-            cpu_dst.tensor().map().unwrap().to_vec(),
-        )
-        .unwrap();
+        for _ in 0..5 {
+            gl_converter
+                .convert(
+                    &mut gl_dst,
+                    &src,
+                    Rotation::None,
+                    Some(Rect {
+                        left: 320,
+                        top: 180,
+                        width: 1280 - 320,
+                        height: 720 - 180,
+                    }),
+                )
+                .unwrap();
 
-        let similarity = image_compare::rgba_hybrid_compare(&opengl_image, &cpu_image)
-            .expect("Image Comparison failed");
-        assert!(
-            similarity.score > 0.98,
-            "OpenGL and CPU converted image have similarity score too low: {}",
-            similarity.score
-        );
+            let opengl_image = image::RgbaImage::from_vec(
+                dst_width as u32,
+                dst_height as u32,
+                gl_dst.tensor().map().unwrap().to_vec(),
+            )
+            .unwrap();
+            let cpu_image = image::RgbaImage::from_vec(
+                dst_width as u32,
+                dst_height as u32,
+                cpu_dst.tensor().map().unwrap().to_vec(),
+            )
+            .unwrap();
+
+            let similarity = image_compare::rgba_hybrid_compare(&opengl_image, &cpu_image)
+                .expect("Image Comparison failed");
+
+            assert!(
+                similarity.score > 0.98,
+                "OpenGL and CPU converted image have similarity score too low: {}",
+                similarity.score
+            );
+        }
 
         drop(gl_dst);
     }

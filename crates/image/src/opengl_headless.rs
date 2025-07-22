@@ -111,7 +111,7 @@ impl Headless {
         egl.make_current(display, Some(surface), Some(surface), Some(ctx))?;
         let _ = egl.swap_interval(display, 0);
 
-        Ok(Headless {
+        let headless = Headless {
             surface,
             display,
             ctx,
@@ -120,7 +120,9 @@ impl Headless {
             egl,
             config,
             size: (width, height),
-        })
+        };
+        headless.warmup(10)?;
+        Ok(headless)
     }
 
     fn new_surface(&mut self, width: usize, height: usize) -> Result<(), crate::Error> {
@@ -142,31 +144,29 @@ impl Headless {
             )?
         };
         debug!("surface: {surface:?}");
-        self.egl
-            .make_current(self.display, Some(surface), Some(surface), Some(self.ctx))?;
 
         self.gbm_surface = gbm_surface;
         self.surface = surface;
         self.size = (width, height);
 
-        unsafe {
-            gls::gl::ClearColor(0.5, 0.0, 0.0, 0.5);
-            gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
-            gls::gl::Finish();
+        self.egl.make_current(
+            self.display,
+            Some(self.surface),
+            Some(self.surface),
+            Some(self.ctx),
+        )?;
+
+        self.warmup(10)?;
+
+        Ok(())
+    }
+
+    fn warmup(&self, n: usize) -> Result<(), crate::Error> {
+        let mut _bo;
+        for _ in 0..n {
+            self.egl.swap_buffers(self.display, self.surface)?;
+            _bo = unsafe { self.gbm_surface.lock_front_buffer()? };
         }
-
-        self.egl.swap_buffers(self.display, self.surface)?;
-        let _ = unsafe { self.gbm_surface.lock_front_buffer()? };
-
-        unsafe {
-            gls::gl::ClearColor(0.5, 0.0, 0.0, 0.5);
-            gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
-            gls::gl::Finish();
-        }
-
-        self.egl.swap_buffers(self.display, self.surface)?;
-        let _ = unsafe { self.gbm_surface.lock_front_buffer()? };
-
         Ok(())
     }
 }
@@ -251,7 +251,7 @@ impl ImageConverterTrait for GLConverter {
             .egl
             .swap_buffers(self.gbm_rendering.display, self.gbm_rendering.surface)?;
 
-        let mut bo = unsafe { self.gbm_rendering.gbm_surface.lock_front_buffer()? };
+        let bo = unsafe { self.gbm_rendering.gbm_surface.lock_front_buffer()? };
         let fd = bo.fd()?;
 
         // TODO: Add offset handling to DmaTensors
@@ -262,11 +262,11 @@ impl ImageConverterTrait for GLConverter {
                 dst.tensor = edgefirst_tensor::Tensor::DmaOpenGl((
                     DmaTensor::from_fd(fd, &dma_tensor.shape, Some(&dma_tensor.name))?,
                     bo,
-                ))
+                ));
             }
             edgefirst_tensor::Tensor::DmaOpenGl((dma_tensor, bo_old)) => {
-                dma_tensor.fd = fd;
-                std::mem::swap(&mut bo, bo_old);
+                _ = std::mem::replace(&mut dma_tensor.fd, fd);
+                _ = std::mem::replace(bo_old, bo);
             }
             edgefirst_tensor::Tensor::Shm(_shm_tensor) => todo!(),
             edgefirst_tensor::Tensor::Mem(_mem_tensor) => todo!(),
@@ -302,28 +302,6 @@ impl GLConverter {
 
         let vertex_buffer = Buffer::new(0, 3, 100);
         let texture_buffer = Buffer::new(1, 2, 100);
-
-        unsafe {
-            gls::gl::ClearColor(0.5, 0.5, 0.0, 0.5);
-            gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
-            gls::gl::Finish();
-        }
-
-        gbm_rendering
-            .egl
-            .swap_buffers(gbm_rendering.display, gbm_rendering.surface)?;
-        let _ = unsafe { gbm_rendering.gbm_surface.lock_front_buffer()? };
-
-        unsafe {
-            gls::gl::ClearColor(0.5, 0.5, 0.0, 0.5);
-            gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
-            gls::gl::Finish();
-        }
-
-        gbm_rendering
-            .egl
-            .swap_buffers(gbm_rendering.display, gbm_rendering.surface)?;
-        let _ = unsafe { gbm_rendering.gbm_surface.lock_front_buffer()? };
 
         Ok(GLConverter {
             gbm_rendering,
