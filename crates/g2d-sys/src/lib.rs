@@ -352,8 +352,8 @@ impl G2D {
             unsafe {
                 self.lib.g2d_blit(
                     self.handle,
-                    &src as *const _ as *mut g2d_surface,
-                    &dst as *const _ as *mut g2d_surface,
+                    src as *const _ as *mut g2d_surface,
+                    dst as *const _ as *mut g2d_surface,
                 )
             }
         } else {
