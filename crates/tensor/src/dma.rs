@@ -260,7 +260,7 @@ where
     T: Num + Clone + fmt::Debug,
 {
     fn drop(&mut self) {
-        trace!("DmaMap dropped, unmapping memory: {:?}", self.to_vec());
+        trace!("DmaMap dropped, unmapping memory");
         self.unmap();
     }
 }
