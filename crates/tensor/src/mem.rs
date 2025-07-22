@@ -137,7 +137,7 @@ where
     }
 
     fn unmap(&mut self) {
-        trace!("Unmapping MemMap memory: {:?}", self.to_vec());
+        trace!("Unmapping MemMap memory");
     }
 
     fn as_slice(&self) -> &[T] {
