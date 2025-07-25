@@ -1,4 +1,6 @@
-use edgefirst_image::{ImageConverterTrait as _, RGBA, Rotation, TensorImage};
+use edgefirst_image::{
+    CPUConverter, G2DConverter, GLConverter, ImageConverterTrait as _, RGBA, Rotation, TensorImage,
+};
 use edgefirst_tensor::TensorMemory;
 use std::path::Path;
 
@@ -21,6 +23,27 @@ macro_rules! test_images {
 }
 
 test_images!(Person, Jaguar, Zidane);
+
+trait TestRotation {
+    fn value() -> Rotation;
+}
+
+macro_rules! test_rotations{
+    ($($name:ident),* $(,)?) => {
+        $(
+            struct $name;
+
+            impl TestRotation for $name {
+                fn value() -> Rotation {
+                    let angle = stringify!($name).to_lowercase().strip_prefix("rotate").unwrap().parse::<usize>().unwrap();
+                    Rotation::from_degrees_clockwise(angle)
+                }
+            }
+        )*
+    };
+}
+
+test_rotations!(Rotate90, Rotate180, Rotate270);
 
 #[divan::bench(types = [Jaguar, Person, Zidane])]
 fn load_image_mem<IMAGE>(bencher: divan::Bencher)
@@ -215,6 +238,69 @@ where
             .unwrap()
     });
     drop(gl_dst);
+}
+
+#[divan::bench(types = [Rotate90, Rotate180, Rotate270], args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn cpu_rotate<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) {
+    let (mut width, mut height) = params;
+    let rot = R::value();
+
+    match rot {
+        Rotation::Rotate90Clockwise | Rotation::Rotate90CounterClockwise => {
+            (width, height) = (height, width)
+        }
+        _ => {}
+    }
+    let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+    let src = TensorImage::load(&file, Some(RGBA), None).unwrap();
+    let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
+
+    let mut converter = CPUConverter::new().unwrap();
+
+    bencher.bench_local(|| converter.convert(&mut dst, &src, rot, None).unwrap());
+}
+
+#[divan::bench(types = [Rotate90, Rotate180, Rotate270], args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn opengl_rotate<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) {
+    let (mut width, mut height) = params;
+    let rot = R::value();
+
+    match rot {
+        Rotation::Rotate90Clockwise | Rotation::Rotate90CounterClockwise => {
+            (width, height) = (height, width)
+        }
+        _ => {}
+    }
+    let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+
+    let src = TensorImage::load(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
+    let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
+
+    let mut converter = GLConverter::new_with_size(width, height, false).unwrap();
+
+    bencher.bench_local(|| converter.convert(&mut dst, &src, rot, None).unwrap());
+    drop(dst);
+}
+
+#[divan::bench(types = [Rotate90, Rotate180, Rotate270], args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn g2d_rotate<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) {
+    let (mut width, mut height) = params;
+    let rot = R::value();
+
+    match rot {
+        Rotation::Rotate90Clockwise | Rotation::Rotate90CounterClockwise => {
+            (width, height) = (height, width)
+        }
+        _ => {}
+    }
+    let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+
+    let src = TensorImage::load(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
+    let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
+
+    let mut converter = G2DConverter::new().unwrap();
+
+    bencher.bench_local(|| converter.convert(&mut dst, &src, rot, None).unwrap());
 }
 
 fn dma_available() -> bool {

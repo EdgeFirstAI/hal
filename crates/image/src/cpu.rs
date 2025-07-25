@@ -26,6 +26,55 @@ impl CPUConverter {
             .use_alpha(false);
         Ok(Self { resizer, options })
     }
+
+    fn rotate(
+        &self,
+        src_map: &[u8],
+        dst_map: &mut [u8],
+        dst: &TensorImage,
+        rotation: Rotation,
+    ) -> Result<(), crate::Error> {
+        match rotation {
+            Rotation::None => {
+                dst_map.copy_from_slice(src_map);
+            }
+            Rotation::Rotate90Clockwise => {
+                fast_transpose::transpose_rgba(
+                    src_map,
+                    dst.height() * 4,
+                    dst_map,
+                    dst.row_stride(),
+                    dst.height(),
+                    dst.width(),
+                    fast_transpose::FlipMode::Flip,
+                    fast_transpose::FlopMode::Flop,
+                )?;
+            }
+            Rotation::Rotate180 => {
+                fast_transpose::rotate180_rgba(
+                    src_map,
+                    dst.width() * 4,
+                    dst_map,
+                    dst.row_stride(),
+                    dst.width(),
+                    dst.height(),
+                )?;
+            }
+            Rotation::Rotate90CounterClockwise => {
+                fast_transpose::transpose_rgba(
+                    src_map,
+                    dst.height() * 4,
+                    dst_map,
+                    dst.row_stride(),
+                    dst.height(),
+                    dst.width(),
+                    fast_transpose::FlipMode::NoFlip,
+                    fast_transpose::FlopMode::NoFlop,
+                )?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl ImageConverterTrait for CPUConverter {
@@ -36,11 +85,11 @@ impl ImageConverterTrait for CPUConverter {
         rotation: Rotation,
         crop: Option<Rect>,
     ) -> Result<()> {
-        if rotation != Rotation::None {
-            return Err(Error::NotImplemented(
-                "Rotation is not supported in CPUConverter".to_string(),
-            ));
-        }
+        // if rotation != Rotation::None {
+        //     return Err(Error::NotImplemented(
+        //         "Rotation is not supported in CPUConverter".to_string(),
+        //     ));
+        // }
 
         let src_type = match src.channels() {
             1 => fast_image_resize::PixelType::U8,
@@ -65,20 +114,9 @@ impl ImageConverterTrait for CPUConverter {
         };
 
         let mut src_map = src.tensor().map()?;
-        let src_view = fast_image_resize::images::Image::from_slice_u8(
-            src.width() as u32,
-            src.height() as u32,
-            &mut src_map,
-            src_type,
-        )?;
 
         let mut dst_map = dst.tensor().map()?;
-        let mut dst_view = fast_image_resize::images::Image::from_slice_u8(
-            dst.width() as u32,
-            dst.height() as u32,
-            &mut dst_map,
-            dst_type,
-        )?;
+
         let options = if let Some(crop) = crop {
             self.options.crop(
                 crop.left as f64,
@@ -90,7 +128,60 @@ impl ImageConverterTrait for CPUConverter {
             self.options
         };
 
-        self.resizer.resize(&src_view, &mut dst_view, &options)?;
+        let needs_resize = src.width() != dst.width()
+            || src.height() != dst.height()
+            || crop.is_some_and(|crop| {
+                crop != Rect {
+                    left: 0,
+                    top: 0,
+                    width: src.width(),
+                    height: src.height(),
+                }
+            });
+
+        if needs_resize {
+            let src_view = fast_image_resize::images::Image::from_slice_u8(
+                src.width() as u32,
+                src.height() as u32,
+                &mut src_map,
+                src_type,
+            )?;
+            match rotation {
+                Rotation::None => {
+                    let mut dst_view = fast_image_resize::images::Image::from_slice_u8(
+                        dst.width() as u32,
+                        dst.height() as u32,
+                        &mut dst_map,
+                        dst_type,
+                    )?;
+                    self.resizer.resize(&src_view, &mut dst_view, &options)?;
+                }
+                Rotation::Rotate90Clockwise | Rotation::Rotate90CounterClockwise => {
+                    let mut tmp = vec![0; dst.row_stride() * dst.height()];
+                    let mut tmp_view = fast_image_resize::images::Image::from_slice_u8(
+                        dst.height() as u32,
+                        dst.width() as u32,
+                        &mut tmp,
+                        dst_type,
+                    )?;
+                    self.resizer.resize(&src_view, &mut tmp_view, &options)?;
+                    self.rotate(&tmp, &mut dst_map, dst, rotation)?;
+                }
+                Rotation::Rotate180 => {
+                    let mut tmp = vec![0; dst.row_stride() * dst.height()];
+                    let mut tmp_view = fast_image_resize::images::Image::from_slice_u8(
+                        dst.width() as u32,
+                        dst.height() as u32,
+                        &mut tmp,
+                        dst_type,
+                    )?;
+                    self.resizer.resize(&src_view, &mut tmp_view, &options)?;
+                    self.rotate(&tmp, &mut dst_map, dst, rotation)?;
+                }
+            }
+        } else {
+            self.rotate(&src_map, &mut dst_map, dst, rotation)?;
+        }
 
         Ok(())
     }

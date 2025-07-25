@@ -51,9 +51,9 @@ impl ImageConverterTrait for G2DConverter {
 
         src_surface.rot = match rotation {
             Rotation::None => g2d_sys::g2d_rotation_G2D_ROTATION_0,
-            Rotation::Rotate90 => g2d_sys::g2d_rotation_G2D_ROTATION_90,
+            Rotation::Rotate90Clockwise => g2d_sys::g2d_rotation_G2D_ROTATION_270,
             Rotation::Rotate180 => g2d_sys::g2d_rotation_G2D_ROTATION_180,
-            Rotation::Rotate270 => g2d_sys::g2d_rotation_G2D_ROTATION_270,
+            Rotation::Rotate90CounterClockwise => g2d_sys::g2d_rotation_G2D_ROTATION_90,
         };
 
         if let Some(crop_rect) = crop {

@@ -50,7 +50,7 @@ impl Headless {
         debug!("gbm: {gbm:?}");
         let display = unsafe {
             egl.get_platform_display(
-                PLATFORM_GBM_KHR,
+                egl_ext::PLATFORM_GBM_KHR,
                 gbm.as_raw() as *mut c_void,
                 &[egl::ATTRIB_NONE],
             )?
@@ -244,7 +244,7 @@ impl ImageConverterTrait for GLConverter {
                 self.gbm_rendering.new_surface(dst.width(), dst.height())?;
             }
 
-            self.convert_to(src, crop)?;
+            self.convert_to(src, rotation, crop)?;
         }
 
         self.gbm_rendering
@@ -316,6 +316,7 @@ impl GLConverter {
     pub fn convert_to(
         &self,
         src: &TensorImage,
+        rotation: crate::Rotation,
         crop: Option<crate::Rect>,
     ) -> Result<(), crate::Error> {
         let new_egl_image = self.create_image_from_dma2(src)?;
@@ -340,7 +341,13 @@ impl GLConverter {
             }
         };
 
-        self.draw_camera_texture(&self.camera_texture, &new_egl_image, roi);
+        let rotation_offset = match rotation {
+            crate::Rotation::None => 0,
+            crate::Rotation::Rotate90Clockwise => 1,
+            crate::Rotation::Rotate180 => 2,
+            crate::Rotation::Rotate90CounterClockwise => 3,
+        };
+        self.draw_camera_texture(&self.camera_texture, &new_egl_image, roi, rotation_offset);
         unsafe { gls::gl::Finish() };
         Ok(())
     }
@@ -438,7 +445,13 @@ impl GLConverter {
         }
     }
 
-    fn draw_camera_texture(&self, texture: &Texture, egl_img: &EglImage, roi: RegionOfInterest) {
+    fn draw_camera_texture(
+        &self,
+        texture: &Texture,
+        egl_img: &EglImage,
+        roi: RegionOfInterest,
+        rotation_offset: usize,
+    ) {
         let texture_target = gls::gl::TEXTURE_2D;
         unsafe {
             gls::gl::UseProgram(self.texture_program.id);
@@ -468,13 +481,14 @@ impl GLConverter {
 
             gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
             gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
-            let texture_vertices: [f32; 8] = [
+            let texture_vertices: [f32; 16] = [
+                roi.left, roi.top, roi.right, roi.top, roi.right, roi.bottom, roi.left, roi.bottom,
                 roi.left, roi.top, roi.right, roi.top, roi.right, roi.bottom, roi.left, roi.bottom,
             ];
             gls::gl::BufferData(
                 gls::gl::ARRAY_BUFFER,
-                (size_of::<f32>() * texture_vertices.len()) as isize,
-                texture_vertices.as_ptr() as *const c_void,
+                (size_of::<f32>() * 8) as isize,
+                (texture_vertices[(rotation_offset * 2)..]).as_ptr() as *const c_void,
                 gls::gl::DYNAMIC_DRAW,
             );
 
@@ -515,23 +529,23 @@ impl GLConverter {
         };
 
         let egl_img_attr = [
-            LINUX_DRM_FOURCC as Attrib,
+            egl_ext::LINUX_DRM_FOURCC as Attrib,
             fourcc_to_drm(src.fourcc()) as Attrib,
             khronos_egl::WIDTH as Attrib,
             src.width() as Attrib,
             khronos_egl::HEIGHT as Attrib,
             src.height() as Attrib,
-            DMA_BUF_PLANE0_PITCH as Attrib,
+            egl_ext::DMA_BUF_PLANE0_PITCH as Attrib,
             src.row_stride() as Attrib,
-            DMA_BUF_PLANE0_OFFSET as Attrib,
+            egl_ext::DMA_BUF_PLANE0_OFFSET as Attrib,
             0 as Attrib,
-            DMA_BUF_PLANE0_FD as Attrib,
+            egl_ext::DMA_BUF_PLANE0_FD as Attrib,
             fd as Attrib,
             khronos_egl::NONE as Attrib,
         ];
 
         match self.new_egl_image_owned(
-            LINUX_DMA_BUF,
+            egl_ext::LINUX_DMA_BUF,
             unsafe { egl::ClientBuffer::from_ptr(null_mut()) },
             &egl_img_attr,
         ) {
@@ -689,14 +703,6 @@ impl GlProgram {
             gls::gl::Uniform1i(location, value);
         }
     }
-
-    fn bind_texture_location(&self, name: &CStr, texture_index: i32) {
-        unsafe {
-            gls::gl::UseProgram(self.id);
-            let location = gls::gl::GetUniformLocation(self.id, name.as_ptr());
-            gls::gl::Uniform1i(location, texture_index);
-        }
-    }
 }
 
 impl Drop for GlProgram {
@@ -762,33 +768,36 @@ fn fourcc_to_drm(fourcc: FourCharCode) -> DrmFourcc {
     }
 }
 
-pub const LINUX_DMA_BUF: u32 = 0x3270;
-pub const LINUX_DRM_FOURCC: u32 = 0x3271;
-pub const DMA_BUF_PLANE0_FD: u32 = 0x3272;
-pub const DMA_BUF_PLANE0_OFFSET: u32 = 0x3273;
-pub const DMA_BUF_PLANE0_PITCH: u32 = 0x3274;
-pub const DMA_BUF_PLANE1_FD: u32 = 0x3275;
-pub const DMA_BUF_PLANE1_OFFSET: u32 = 0x3276;
-pub const DMA_BUF_PLANE1_PITCH: u32 = 0x3277;
-pub const DMA_BUF_PLANE2_FD: u32 = 0x3278;
-pub const DMA_BUF_PLANE2_OFFSET: u32 = 0x3279;
-pub const DMA_BUF_PLANE2_PITCH: u32 = 0x327A;
-pub const YUV_COLOR_SPACE_HINT: u32 = 0x327B;
-pub const SAMPLE_RANGE_HINT: u32 = 0x327C;
-pub const YUV_CHROMA_HORIZONTAL_SITING_HINT: u32 = 0x327D;
-pub const YUV_CHROMA_VERTICAL_SITING_HINT: u32 = 0x327E;
+mod egl_ext {
+    #![allow(dead_code)]
+    pub const LINUX_DMA_BUF: u32 = 0x3270;
+    pub const LINUX_DRM_FOURCC: u32 = 0x3271;
+    pub const DMA_BUF_PLANE0_FD: u32 = 0x3272;
+    pub const DMA_BUF_PLANE0_OFFSET: u32 = 0x3273;
+    pub const DMA_BUF_PLANE0_PITCH: u32 = 0x3274;
+    pub const DMA_BUF_PLANE1_FD: u32 = 0x3275;
+    pub const DMA_BUF_PLANE1_OFFSET: u32 = 0x3276;
+    pub const DMA_BUF_PLANE1_PITCH: u32 = 0x3277;
+    pub const DMA_BUF_PLANE2_FD: u32 = 0x3278;
+    pub const DMA_BUF_PLANE2_OFFSET: u32 = 0x3279;
+    pub const DMA_BUF_PLANE2_PITCH: u32 = 0x327A;
+    pub const YUV_COLOR_SPACE_HINT: u32 = 0x327B;
+    pub const SAMPLE_RANGE_HINT: u32 = 0x327C;
+    pub const YUV_CHROMA_HORIZONTAL_SITING_HINT: u32 = 0x327D;
+    pub const YUV_CHROMA_VERTICAL_SITING_HINT: u32 = 0x327E;
 
-pub const ITU_REC601: u32 = 0x327F;
-pub const ITU_REC709: u32 = 0x3280;
-pub const ITU_REC2020: u32 = 0x3281;
+    pub const ITU_REC601: u32 = 0x327F;
+    pub const ITU_REC709: u32 = 0x3280;
+    pub const ITU_REC2020: u32 = 0x3281;
 
-pub const YUV_FULL_RANGE: u32 = 0x3282;
-pub const YUV_NARROW_RANGE: u32 = 0x3283;
+    pub const YUV_FULL_RANGE: u32 = 0x3282;
+    pub const YUV_NARROW_RANGE: u32 = 0x3283;
 
-pub const YUV_CHROMA_SITING_0: u32 = 0x3284;
-pub const YUV_CHROMA_SITING_0_5: u32 = 0x3285;
+    pub const YUV_CHROMA_SITING_0: u32 = 0x3284;
+    pub const YUV_CHROMA_SITING_0_5: u32 = 0x3285;
 
-pub const PLATFORM_GBM_KHR: u32 = 0x31D7;
+    pub const PLATFORM_GBM_KHR: u32 = 0x31D7;
+}
 
 pub fn generate_vertex_shader() -> &'static str {
     "
