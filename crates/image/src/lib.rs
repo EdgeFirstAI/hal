@@ -188,12 +188,24 @@ impl TensorImage {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rotation {
-    None,
-    Rotate90,
-    Rotate180,
-    Rotate270,
+    None = 0,
+    Rotate90Clockwise = 1,
+    Rotate180 = 2,
+    Rotate90CounterClockwise = 3,
+}
+impl Rotation {
+    pub fn from_degrees_clockwise(angle: usize) -> Rotation {
+        match angle.rem_euclid(90) {
+            0 => Rotation::None,
+            90 => Rotation::Rotate90Clockwise,
+            180 => Rotation::Rotate180,
+            270 => Rotation::Rotate90CounterClockwise,
+            _ => panic!("rotation angle is not a multiple of 90"),
+        }
+    }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
     pub left: usize,
     pub top: usize,
@@ -476,9 +488,6 @@ mod tests {
             )
             .unwrap();
 
-        let _ = g2d_dst.save("g2d.jpg", 80);
-        let _ = cpu_dst.save("cpu.jpg", 80);
-
         let g2d_image = image::RgbaImage::from_vec(
             dst_width as u32,
             dst_height as u32,
@@ -570,5 +579,157 @@ mod tests {
         }
 
         drop(gl_dst);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_opengl_rotate() {
+        let size = (1280, 720);
+        for rot in [
+            // Rotation::Rotate90Clockwise,
+            // Rotation::Rotate180,
+            Rotation::Rotate90CounterClockwise,
+        ] {
+            test_opengl_rotate_(size, rot);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_opengl_rotate_(size: (usize, usize), rot: Rotation) {
+        let (dst_width, dst_height) = match rot {
+            Rotation::None | Rotation::Rotate180 => size,
+            Rotation::Rotate90Clockwise | Rotation::Rotate90CounterClockwise => (size.1, size.0),
+        };
+
+        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let src = TensorImage::load(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
+
+        let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
+        let mut cpu_converter = CPUConverter::new().unwrap();
+
+        cpu_converter
+            .convert(&mut cpu_dst, &src, rot, None)
+            .unwrap();
+
+        let mut gl_dst =
+            TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
+        let mut gl_converter = GLConverter::new_with_size(dst_width, dst_height, false).unwrap();
+
+        for _ in 0..5 {
+            gl_converter.convert(&mut gl_dst, &src, rot, None).unwrap();
+
+            let opengl_image = image::RgbaImage::from_vec(
+                dst_width as u32,
+                dst_height as u32,
+                gl_dst.tensor().map().unwrap().to_vec(),
+            )
+            .unwrap();
+            let cpu_image = image::RgbaImage::from_vec(
+                dst_width as u32,
+                dst_height as u32,
+                cpu_dst.tensor().map().unwrap().to_vec(),
+            )
+            .unwrap();
+
+            let _ = gl_dst.save("opengl.jpg", 80);
+            let _ = cpu_dst.save("cpu.jpg", 80);
+
+            let similarity = image_compare::rgba_hybrid_compare(&opengl_image, &cpu_image)
+                .expect("Image Comparison failed");
+            if similarity.score <= 1.0 {
+                similarity
+                    .image
+                    .to_color_map()
+                    .save("gl_cpu_similarity.png")
+                    .unwrap();
+            }
+            assert!(
+                similarity.score > 0.99,
+                "OpenGL and CPU {:?} converted image have similarity score too low: {}",
+                rot,
+                similarity.score
+            );
+        }
+
+        drop(gl_dst);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_g2d_rotate() {
+        let size = (1280, 720);
+        for rot in [
+            // Rotation::Rotate90Clockwise,
+            // Rotation::Rotate180,
+            Rotation::Rotate90CounterClockwise,
+        ] {
+            test_g2d_rotate_(size, rot);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_g2d_rotate_(size: (usize, usize), rot: Rotation) {
+        let (dst_width, dst_height) = match rot {
+            Rotation::None | Rotation::Rotate180 => size,
+            Rotation::Rotate90Clockwise | Rotation::Rotate90CounterClockwise => (size.1, size.0),
+        };
+
+        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let src = TensorImage::load(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
+
+        let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
+        let mut cpu_converter = CPUConverter::new().unwrap();
+
+        cpu_converter
+            .convert(&mut cpu_dst, &src, rot, None)
+            .unwrap();
+
+        let mut g2d_dst =
+            TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
+        let mut g2d_converter = G2DConverter::new().unwrap();
+
+        for _ in 0..5 {
+            use image::{DynamicImage, buffer::ConvertBuffer};
+
+            g2d_converter
+                .convert(&mut g2d_dst, &src, rot, None)
+                .unwrap();
+
+            let g2d_image = image::RgbaImage::from_vec(
+                dst_width as u32,
+                dst_height as u32,
+                g2d_dst.tensor().map().unwrap().to_vec(),
+            )
+            .unwrap();
+            let cpu_image = image::RgbaImage::from_vec(
+                dst_width as u32,
+                dst_height as u32,
+                cpu_dst.tensor().map().unwrap().to_vec(),
+            )
+            .unwrap();
+
+            let _ = g2d_dst.save("g2d.jpg", 80);
+            let _ = cpu_dst.save("cpu.jpg", 80);
+
+            let similarity = image_compare::rgb_similarity_structure(
+                &image_compare::Algorithm::RootMeanSquared,
+                &g2d_image.convert(),
+                &cpu_image.convert(),
+            )
+            .expect("Image Comparison failed");
+            if similarity.score <= 0.99 {
+                similarity
+                    .image
+                    .to_color_map()
+                    .save("g2d_cpu_similarity.png")
+                    .unwrap();
+            }
+            assert!(
+                similarity.score > 0.99,
+                "G2D and CPU {:?} converted image have similarity score too low: {}",
+                rot,
+                similarity.score
+            );
+        }
     }
 }
