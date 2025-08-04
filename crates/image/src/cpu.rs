@@ -1,5 +1,6 @@
 use crate::{Error, ImageConverterTrait, Rect, Result, Rotation, TensorImage};
 use edgefirst_tensor::TensorTrait;
+use ndarray::{ArrayView3, ArrayViewMut3, Axis};
 
 /// CPUConverter implements the ImageConverter trait using the fallback CPU
 /// implementation for image processing.
@@ -27,7 +28,7 @@ impl CPUConverter {
         Ok(Self { resizer, options })
     }
 
-    fn rotate(
+    fn rotate_ndarray(
         &self,
         src_map: &[u8],
         dst_map: &mut [u8],
@@ -39,38 +40,46 @@ impl CPUConverter {
                 dst_map.copy_from_slice(src_map);
             }
             Rotation::Rotate90Clockwise => {
-                fast_transpose::transpose_rgba(
-                    src_map,
-                    dst.height() * 4,
-                    dst_map,
-                    dst.row_stride(),
-                    dst.height(),
-                    dst.width(),
-                    fast_transpose::FlipMode::Flip,
-                    fast_transpose::FlopMode::Flop,
-                )?;
+                let mut src_view =
+                    ArrayView3::from_shape((dst.width(), dst.height(), dst.channels()), src_map)
+                        .expect("rotate src shape incorrect");
+                let mut dst_view =
+                    ArrayViewMut3::from_shape((dst.height(), dst.width(), dst.channels()), dst_map)
+                        .expect("rotate dst shape incorrect");
+                src_view.swap_axes(0, 1);
+                src_view.invert_axis(Axis(1));
+                src_view
+                    .iter()
+                    .zip(dst_view.iter_mut())
+                    .for_each(|(s, d)| *d = *s);
             }
             Rotation::Rotate180 => {
-                fast_transpose::rotate180_rgba(
-                    src_map,
-                    dst.width() * 4,
-                    dst_map,
-                    dst.row_stride(),
-                    dst.width(),
-                    dst.height(),
-                )?;
+                let mut src_view =
+                    ArrayView3::from_shape((dst.height(), dst.width(), dst.channels()), src_map)
+                        .expect("rotate src shape incorrect");
+                let mut dst_view =
+                    ArrayViewMut3::from_shape((dst.height(), dst.width(), dst.channels()), dst_map)
+                        .expect("rotate dst shape incorrect");
+                src_view.invert_axis(Axis(0));
+                src_view.invert_axis(Axis(1));
+                src_view
+                    .iter()
+                    .zip(dst_view.iter_mut())
+                    .for_each(|(s, d)| *d = *s);
             }
             Rotation::Rotate90CounterClockwise => {
-                fast_transpose::transpose_rgba(
-                    src_map,
-                    dst.height() * 4,
-                    dst_map,
-                    dst.row_stride(),
-                    dst.height(),
-                    dst.width(),
-                    fast_transpose::FlipMode::NoFlip,
-                    fast_transpose::FlopMode::NoFlop,
-                )?;
+                let mut src_view =
+                    ArrayView3::from_shape((dst.width(), dst.height(), dst.channels()), src_map)
+                        .expect("rotate src shape incorrect");
+                let mut dst_view =
+                    ArrayViewMut3::from_shape((dst.height(), dst.width(), dst.channels()), dst_map)
+                        .expect("rotate dst shape incorrect");
+                src_view.swap_axes(0, 1);
+                src_view.invert_axis(Axis(0));
+                src_view
+                    .iter()
+                    .zip(dst_view.iter_mut())
+                    .for_each(|(s, d)| *d = *s);
             }
         }
         Ok(())
@@ -165,7 +174,7 @@ impl ImageConverterTrait for CPUConverter {
                         dst_type,
                     )?;
                     self.resizer.resize(&src_view, &mut tmp_view, &options)?;
-                    self.rotate(&tmp, &mut dst_map, dst, rotation)?;
+                    self.rotate_ndarray(&tmp, &mut dst_map, dst, rotation)?;
                 }
                 Rotation::Rotate180 => {
                     let mut tmp = vec![0; dst.row_stride() * dst.height()];
@@ -176,11 +185,11 @@ impl ImageConverterTrait for CPUConverter {
                         dst_type,
                     )?;
                     self.resizer.resize(&src_view, &mut tmp_view, &options)?;
-                    self.rotate(&tmp, &mut dst_map, dst, rotation)?;
+                    self.rotate_ndarray(&tmp, &mut dst_map, dst, rotation)?;
                 }
             }
         } else {
-            self.rotate(&src_map, &mut dst_map, dst, rotation)?;
+            self.rotate_ndarray(&src_map, &mut dst_map, dst, rotation)?;
         }
 
         Ok(())
