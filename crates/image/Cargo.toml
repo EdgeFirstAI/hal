@@ -24,7 +24,6 @@ libloading = { workspace = true }
 log = { workspace = true }
 zune-jpeg = { workspace = true }
 libc = "0.2.174"
-fast_transpose = { version = "0.2.5", default-features = false }
 ndarray = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

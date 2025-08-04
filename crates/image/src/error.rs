@@ -8,7 +8,6 @@ pub enum Error {
     DecodingError(zune_jpeg::errors::DecodeErrors),
     ImageBufferError(fast_image_resize::ImageBufferError),
     ResizeError(fast_image_resize::ResizeError),
-    TransposeError(fast_transpose::TransposeError),
     #[cfg(target_os = "linux")]
     G2DError(g2d_sys::Error),
     TensorError(edgefirst_tensor::Error),
@@ -59,12 +58,6 @@ impl From<fast_image_resize::ImageBufferError> for Error {
 impl From<fast_image_resize::ResizeError> for Error {
     fn from(err: fast_image_resize::ResizeError) -> Self {
         Error::ResizeError(err)
-    }
-}
-
-impl From<fast_transpose::TransposeError> for Error {
-    fn from(err: fast_transpose::TransposeError) -> Self {
-        Error::TransposeError(err)
     }
 }
 
