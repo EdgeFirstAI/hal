@@ -453,7 +453,6 @@ dependencies = [
  "edgefirst-tensor",
  "env_logger",
  "fast_image_resize",
- "fast_transpose",
  "four-char-code",
  "g2d-sys",
  "gbm",
@@ -575,15 +574,6 @@ dependencies = [
  "num-traits",
  "rayon",
  "thiserror 1.0.69",
-]
-
-[[package]]
-name = "fast_transpose"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87fd7bef897517e02c834586f88572f4e2f485d5e9c0bbd1f3497ed6b5a7f6e2"
-dependencies = [
- "bytemuck",
 ]
 
 [[package]]

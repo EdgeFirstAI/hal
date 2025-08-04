@@ -289,6 +289,7 @@ mod tests {
     use super::*;
     use crate::{CPUConverter, Rotation};
     use edgefirst_tensor::TensorMemory;
+    use image::buffer::ConvertBuffer;
     use std::path::Path;
 
     #[ctor::ctor]
@@ -368,8 +369,12 @@ mod tests {
         )
         .unwrap();
 
-        let similarity = image_compare::rgba_hybrid_compare(&g2d_image, &cpu_image)
-            .expect("Image Comparison failed");
+        let similarity = image_compare::rgb_similarity_structure(
+            &image_compare::Algorithm::RootMeanSquared,
+            &g2d_image.convert(),
+            &cpu_image.convert(),
+        )
+        .expect("Image Comparison failed");
         assert!(
             similarity.score > 0.98,
             "G2D and CPU converted image have similarity score too low: {}",
@@ -418,8 +423,12 @@ mod tests {
             )
             .unwrap();
 
-            let similarity = image_compare::rgba_hybrid_compare(&opengl_image, &cpu_image)
-                .expect("Image Comparison failed");
+            let similarity = image_compare::rgb_similarity_structure(
+                &image_compare::Algorithm::RootMeanSquared,
+                &opengl_image.convert(),
+                &cpu_image.convert(),
+            )
+            .expect("Image Comparison failed");
             assert!(
                 similarity.score > 0.98,
                 "OpenGL and CPU converted image have similarity score too low: {}",
@@ -501,8 +510,12 @@ mod tests {
         )
         .unwrap();
 
-        let similarity = image_compare::rgba_hybrid_compare(&g2d_image, &cpu_image)
-            .expect("Image Comparison failed");
+        let similarity = image_compare::rgb_similarity_structure(
+            &image_compare::Algorithm::RootMeanSquared,
+            &g2d_image.convert(),
+            &cpu_image.convert(),
+        )
+        .expect("Image Comparison failed");
         assert!(
             similarity.score > 0.98,
             "G2D and CPU converted image have similarity score too low: {}",
@@ -568,9 +581,12 @@ mod tests {
             )
             .unwrap();
 
-            let similarity = image_compare::rgba_hybrid_compare(&opengl_image, &cpu_image)
-                .expect("Image Comparison failed");
-
+            let similarity = image_compare::rgb_similarity_structure(
+                &image_compare::Algorithm::RootMeanSquared,
+                &opengl_image.convert(),
+                &cpu_image.convert(),
+            )
+            .expect("Image Comparison failed");
             assert!(
                 similarity.score > 0.98,
                 "OpenGL and CPU converted image have similarity score too low: {}",
@@ -583,11 +599,95 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    fn test_cpu_rotate() {
+        for rot in [
+            Rotation::Rotate90Clockwise,
+            Rotation::Rotate180,
+            Rotation::Rotate90CounterClockwise,
+        ] {
+            test_cpu_rotate_(rot);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_cpu_rotate_(rot: Rotation) {
+        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+
+        let unchanged_src = TensorImage::load(&file, Some(RGBA), None).unwrap();
+        let mut src = TensorImage::load(&file, Some(RGBA), None).unwrap();
+
+        let (dst_width, dst_height) = match rot {
+            Rotation::None | Rotation::Rotate180 => (src.width(), src.height()),
+            Rotation::Rotate90Clockwise | Rotation::Rotate90CounterClockwise => {
+                (src.height(), src.width())
+            }
+        };
+
+        let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
+        let mut cpu_converter = CPUConverter::new().unwrap();
+
+        // After rotating 4 times, the image should be the same as the original
+
+        cpu_converter
+            .convert(&mut cpu_dst, &src, rot, None)
+            .unwrap();
+
+        cpu_converter
+            .convert(&mut src, &cpu_dst, rot, None)
+            .unwrap();
+
+        cpu_converter
+            .convert(&mut cpu_dst, &src, rot, None)
+            .unwrap();
+
+        cpu_converter
+            .convert(&mut src, &cpu_dst, rot, None)
+            .unwrap();
+
+        let cpu_image = image::RgbaImage::from_vec(
+            src.width() as u32,
+            src.height() as u32,
+            src.tensor().map().unwrap().to_vec(),
+        )
+        .unwrap();
+
+        let src_image = image::RgbaImage::from_vec(
+            unchanged_src.width() as u32,
+            unchanged_src.height() as u32,
+            unchanged_src.tensor().map().unwrap().to_vec(),
+        )
+        .unwrap();
+
+        let similarity = image_compare::rgb_similarity_structure(
+            &image_compare::Algorithm::RootMeanSquared,
+            &src_image.convert(),
+            &cpu_image.convert(),
+        )
+        .expect("Image Comparison failed");
+
+        if similarity.score <= 0.999999 {
+            let _ = src.save("cpu.jpg", 80);
+            similarity
+                .image
+                .to_color_map()
+                .save("cpu_similarity.png")
+                .unwrap();
+        }
+        assert!(
+            similarity.score > 0.999999,
+            "OpenGL and CPU {:?} converted image have similarity score too low: {}",
+            rot,
+            similarity.score
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn test_opengl_rotate() {
         let size = (1280, 720);
         for rot in [
-            // Rotation::Rotate90Clockwise,
-            // Rotation::Rotate180,
+            Rotation::Rotate90Clockwise,
+            Rotation::Rotate180,
             Rotation::Rotate90CounterClockwise,
         ] {
             test_opengl_rotate_(size, rot);
@@ -631,12 +731,15 @@ mod tests {
             )
             .unwrap();
 
-            let _ = gl_dst.save("opengl.jpg", 80);
-            let _ = cpu_dst.save("cpu.jpg", 80);
-
-            let similarity = image_compare::rgba_hybrid_compare(&opengl_image, &cpu_image)
-                .expect("Image Comparison failed");
+            let similarity = image_compare::rgb_similarity_structure(
+                &image_compare::Algorithm::RootMeanSquared,
+                &opengl_image.convert(),
+                &cpu_image.convert(),
+            )
+            .expect("Image Comparison failed");
             if similarity.score <= 1.0 {
+                let _ = gl_dst.save("opengl.jpg", 80);
+                let _ = cpu_dst.save("cpu.jpg", 80);
                 similarity
                     .image
                     .to_color_map()
@@ -659,8 +762,8 @@ mod tests {
     fn test_g2d_rotate() {
         let size = (1280, 720);
         for rot in [
-            // Rotation::Rotate90Clockwise,
-            // Rotation::Rotate180,
+            Rotation::Rotate90Clockwise,
+            Rotation::Rotate180,
             Rotation::Rotate90CounterClockwise,
         ] {
             test_g2d_rotate_(size, rot);
@@ -689,8 +792,6 @@ mod tests {
         let mut g2d_converter = G2DConverter::new().unwrap();
 
         for _ in 0..5 {
-            use image::{DynamicImage, buffer::ConvertBuffer};
-
             g2d_converter
                 .convert(&mut g2d_dst, &src, rot, None)
                 .unwrap();
@@ -708,9 +809,6 @@ mod tests {
             )
             .unwrap();
 
-            let _ = g2d_dst.save("g2d.jpg", 80);
-            let _ = cpu_dst.save("cpu.jpg", 80);
-
             let similarity = image_compare::rgb_similarity_structure(
                 &image_compare::Algorithm::RootMeanSquared,
                 &g2d_image.convert(),
@@ -718,6 +816,8 @@ mod tests {
             )
             .expect("Image Comparison failed");
             if similarity.score <= 0.99 {
+                let _ = g2d_dst.save("g2d.jpg", 80);
+                let _ = cpu_dst.save("cpu.jpg", 80);
                 similarity
                     .image
                     .to_color_map()

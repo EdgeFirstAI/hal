@@ -43,7 +43,7 @@ macro_rules! test_rotations{
     };
 }
 
-test_rotations!(Rotate90, Rotate180, Rotate270);
+test_rotations!(Rotate0, Rotate90, Rotate180, Rotate270);
 
 #[divan::bench(types = [Jaguar, Person, Zidane])]
 fn load_image_mem<IMAGE>(bencher: divan::Bencher)
@@ -240,7 +240,7 @@ where
     drop(gl_dst);
 }
 
-#[divan::bench(types = [Rotate90, Rotate180, Rotate270], args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+#[divan::bench(types = [Rotate0, Rotate90, Rotate180, Rotate270], args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
 fn cpu_rotate<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) {
     let (mut width, mut height) = params;
     let rot = R::value();
@@ -260,7 +260,7 @@ fn cpu_rotate<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) 
     bencher.bench_local(|| converter.convert(&mut dst, &src, rot, None).unwrap());
 }
 
-#[divan::bench(types = [Rotate90, Rotate180, Rotate270], args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+#[divan::bench(types = [Rotate90, Rotate180, Rotate270], args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
 fn opengl_rotate<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) {
     let (mut width, mut height) = params;
     let rot = R::value();
@@ -282,7 +282,7 @@ fn opengl_rotate<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize
     drop(dst);
 }
 
-#[divan::bench(types = [Rotate90, Rotate180, Rotate270], args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+#[divan::bench(types = [Rotate90, Rotate180, Rotate270], args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
 fn g2d_rotate<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) {
     let (mut width, mut height) = params;
     let rot = R::value();
