@@ -945,15 +945,16 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_yuyv_to_rgba_g2d() {
-        let file = include_bytes!("../../../testdata/camera720p.yuyv").to_vec();
-        let src = TensorImage::new(1280, 720, YUYV, None).unwrap();
-        src.tensor()
-            .map()
-            .unwrap()
-            .as_mut_slice()
-            .copy_from_slice(&file);
+        let src = load_bytes_to_tensor(
+            1280,
+            720,
+            YUYV,
+            None,
+            include_bytes!("../../../testdata/camera720p.yuyv"),
+        )
+        .unwrap();
 
-        let mut dst = TensorImage::new(1280, 720, RGBA, None).unwrap();
+        let mut dst = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma)).unwrap();
         let mut g2d_converter = G2DConverter::new().unwrap();
 
         g2d_converter
@@ -989,5 +990,83 @@ mod tests {
             "G2D converted image and target image have similarity score too low: {}",
             similarity.score
         );
+    }
+
+    #[test]
+    fn test_yuyv_to_rgba_resize_cpu() {
+        let src = load_bytes_to_tensor(
+            1280,
+            720,
+            YUYV,
+            None,
+            include_bytes!("../../../testdata/camera720p.yuyv"),
+        )
+        .unwrap();
+
+        let (dst_width, dst_height) = (960, 540);
+
+        let mut dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
+        let mut cpu_converter = CPUConverter::new().unwrap();
+
+        cpu_converter
+            .convert(&mut dst, &src, Rotation::None, None)
+            .unwrap();
+
+        let cpu_image = image::RgbaImage::from_vec(
+            dst_width as u32,
+            dst_height as u32,
+            dst.tensor().map().unwrap().to_vec(),
+        )
+        .unwrap();
+        let mut dst_target = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
+        let src_target = load_bytes_to_tensor(
+            1280,
+            720,
+            RGBA,
+            None,
+            include_bytes!("../../../testdata/camera720p.rgba"),
+        )
+        .unwrap();
+        cpu_converter
+            .convert(&mut dst_target, &src_target, Rotation::None, None)
+            .unwrap();
+        let target_image = image::RgbaImage::from_vec(
+            dst_width as u32,
+            dst_height as u32,
+            dst_target.tensor().map().unwrap().to_vec(),
+        )
+        .unwrap();
+
+        let similarity = image_compare::rgb_similarity_structure(
+            &image_compare::Algorithm::RootMeanSquared,
+            &cpu_image.convert(),
+            &target_image.convert(),
+        )
+        .expect("Image Comparison failed");
+        if similarity.score <= 0.99 {
+            let _ = dst.save("cpu.jpg", 80);
+            similarity
+                .image
+                .to_color_map()
+                .save("yuyv_to_rgba_resize_cpu_similarity.png")
+                .unwrap();
+        }
+        assert!(
+            similarity.score > 0.99,
+            "CPU converted image and target image have similarity score too low: {}",
+            similarity.score
+        );
+    }
+
+    fn load_bytes_to_tensor(
+        width: usize,
+        height: usize,
+        fourcc: FourCharCode,
+        memory: Option<TensorMemory>,
+        bytes: &[u8],
+    ) -> Result<TensorImage, Error> {
+        let src = TensorImage::new(width, height, fourcc, memory)?;
+        src.tensor().map()?.as_mut_slice().copy_from_slice(bytes);
+        Ok(src)
     }
 }
