@@ -465,6 +465,7 @@ dependencies = [
  "libloading",
  "log",
  "ndarray",
+ "yuv",
  "zune-jpeg",
 ]
 
@@ -2071,6 +2072,15 @@ name = "xml-rs"
 version = "0.8.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6fd8403733700263c6eb89f192880191f1b83e332f7a20371ddcf421c4a337c7"
+
+[[package]]
+name = "yuv"
+version = "0.8.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b08262a503468e0123115a872ac2fd250f965e0178489d393686e9dd19b47e6"
+dependencies = [
+ "num-traits",
+]
 
 [[package]]
 name = "zerocopy"
