@@ -611,6 +611,9 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn test_cpu_rotate_(rot: Rotation) {
+        // This test rotates the image 4 times and checks that the image was returned to
+        // be the same Currently doesn't check if rotations actually rotated in
+        // right direction
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
 
         let unchanged_src = TensorImage::load(&file, Some(RGBA), None).unwrap();
