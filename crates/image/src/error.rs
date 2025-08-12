@@ -8,6 +8,7 @@ pub enum Error {
     DecodingError(zune_jpeg::errors::DecodeErrors),
     ImageBufferError(fast_image_resize::ImageBufferError),
     ResizeError(fast_image_resize::ResizeError),
+    YuvError(yuv::YuvError),
     #[cfg(target_os = "linux")]
     G2DError(g2d_sys::Error),
     TensorError(edgefirst_tensor::Error),
@@ -58,6 +59,12 @@ impl From<fast_image_resize::ImageBufferError> for Error {
 impl From<fast_image_resize::ResizeError> for Error {
     fn from(err: fast_image_resize::ResizeError) -> Self {
         Error::ResizeError(err)
+    }
+}
+
+impl From<yuv::YuvError> for Error {
+    fn from(err: yuv::YuvError) -> Self {
+        Error::YuvError(err)
     }
 }
 
