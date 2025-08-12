@@ -1,6 +1,6 @@
 // #![cfg(target_os = "linux")]
 use drm::{Device as DrmDevice, buffer::DrmFourcc, control::Device as DrmControlDevice};
-use edgefirst_tensor::{DmaTensor, TensorTrait};
+use edgefirst_tensor::{DmaTensor, TensorMapTrait, TensorTrait};
 use four_char_code::FourCharCode;
 use gbm::{AsRaw, Device};
 use khronos_egl::{self as egl, Attrib, Config};
@@ -268,8 +268,18 @@ impl ImageConverterTrait for GLConverter {
                 _ = std::mem::replace(&mut dma_tensor.fd, fd);
                 _ = std::mem::replace(bo_old, bo);
             }
-            edgefirst_tensor::Tensor::Shm(_shm_tensor) => todo!(),
-            edgefirst_tensor::Tensor::Mem(_mem_tensor) => todo!(),
+            edgefirst_tensor::Tensor::Shm(_shm_tensor) => {
+                let mut mmap = _shm_tensor.map()?;
+                bo.map(0, 0, bo.width(), bo.height(), |x| {
+                    mmap.copy_from_slice(x.buffer())
+                })?;
+            }
+            edgefirst_tensor::Tensor::Mem(_mem_tensor) => {
+                let mut mmap = _mem_tensor.map()?;
+                bo.map(0, 0, bo.width(), bo.height(), |x| {
+                    mmap.copy_from_slice(x.buffer())
+                })?;
+            }
         }
 
         Ok(())
@@ -319,9 +329,8 @@ impl GLConverter {
         rotation: crate::Rotation,
         crop: Option<crate::Rect>,
     ) -> Result<(), crate::Error> {
-        let new_egl_image = self.create_image_from_dma2(src)?;
         unsafe {
-            gls::gl::ClearColor(0.0, 0.0, 0.5, 0.5);
+            gls::gl::ClearColor(0.0, 0.0, 0.0, 0.5);
             gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
         };
 
@@ -347,9 +356,18 @@ impl GLConverter {
             crate::Rotation::Rotate180 => 2,
             crate::Rotation::Rotate90CounterClockwise => 3,
         };
-        self.draw_camera_texture(&self.camera_texture, &new_egl_image, roi, rotation_offset);
+        let result = if let Ok(new_egl_image) = self.create_image_from_dma2(src) {
+            self.draw_camera_texture_eglimage(
+                &self.camera_texture,
+                &new_egl_image,
+                roi,
+                rotation_offset,
+            )
+        } else {
+            self.draw_camera_texture(&self.camera_texture, src, roi, rotation_offset)
+        };
         unsafe { gls::gl::Finish() };
-        Ok(())
+        result
     }
 
     pub fn convert_to_planar(
@@ -448,10 +466,87 @@ impl GLConverter {
     fn draw_camera_texture(
         &self,
         texture: &Texture,
+        img: &TensorImage,
+        roi: RegionOfInterest,
+        rotation_offset: usize,
+    ) -> Result<(), Error> {
+        let texture_target = gls::gl::TEXTURE_2D;
+        let texture_format = match img.fourcc() {
+            RGB => gls::gl::RGB,
+            RGBA => gls::gl::RGBA,
+            _ => {
+                return Err(Error::NotSupported(
+                    "YUYV textures aren't supposed by OpenGL".to_string(),
+                ));
+            }
+        };
+        unsafe {
+            gls::gl::UseProgram(self.texture_program.id);
+            gls::gl::BindTexture(texture_target, texture.id);
+            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+            gls::gl::TexParameteri(
+                texture_target,
+                gls::gl::TEXTURE_MIN_FILTER,
+                gls::gl::LINEAR as i32,
+            );
+            gls::gl::TexParameteri(
+                texture_target,
+                gls::gl::TEXTURE_MAG_FILTER,
+                gls::gl::LINEAR as i32,
+            );
+            gls::gl::TexImage2D(
+                texture_target,
+                0,
+                texture_format as i32,
+                img.width() as i32,
+                img.height() as i32,
+                0,
+                texture_format,
+                gls::gl::UNSIGNED_BYTE,
+                img.tensor().map()?.as_ptr() as *const c_void,
+            );
+            check_gl_error();
+            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
+            gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
+            let camera_vertices: [f32; 12] = [-1., -1., 0., 1., -1., 0., 1., 1., 0., -1., 1., 0.];
+            gls::gl::BufferData(
+                gls::gl::ARRAY_BUFFER,
+                (size_of::<f32>() * camera_vertices.len()) as isize,
+                camera_vertices.as_ptr() as *const c_void,
+                gls::gl::DYNAMIC_DRAW,
+            );
+
+            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
+            gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
+            let texture_vertices: [f32; 16] = [
+                roi.left, roi.top, roi.right, roi.top, roi.right, roi.bottom, roi.left, roi.bottom,
+                roi.left, roi.top, roi.right, roi.top, roi.right, roi.bottom, roi.left, roi.bottom,
+            ];
+            gls::gl::BufferData(
+                gls::gl::ARRAY_BUFFER,
+                (size_of::<f32>() * 8) as isize,
+                (texture_vertices[(rotation_offset * 2)..]).as_ptr() as *const c_void,
+                gls::gl::DYNAMIC_DRAW,
+            );
+
+            let vertices_index: [u32; 4] = [0, 1, 2, 3];
+            gls::gl::DrawElements(
+                gls::gl::TRIANGLE_FAN,
+                vertices_index.len() as i32,
+                gls::gl::UNSIGNED_INT,
+                vertices_index.as_ptr() as *const c_void,
+            );
+            check_gl_error()
+        }
+    }
+
+    fn draw_camera_texture_eglimage(
+        &self,
+        texture: &Texture,
         egl_img: &EglImage,
         roi: RegionOfInterest,
         rotation_offset: usize,
-    ) {
+    ) -> Result<(), Error> {
         let texture_target = gls::gl::TEXTURE_2D;
         unsafe {
             gls::gl::UseProgram(self.texture_program.id);
@@ -499,8 +594,8 @@ impl GLConverter {
                 gls::gl::UNSIGNED_INT,
                 vertices_index.as_ptr() as *const c_void,
             );
-            check_gl_error();
         }
+        check_gl_error()
     }
 
     fn create_image_from_dma2<'a>(
@@ -749,14 +844,15 @@ fn compile_shader_from_str(shader: u32, shader_source: &str, shader_name: &str) 
     }
 }
 
-fn check_gl_error() {
+fn check_gl_error() -> Result<(), Error> {
     unsafe {
-        let mut err = gls::gl::GetError();
-        while (err) != gls::gl::NO_ERROR {
+        let err = gls::gl::GetError();
+        if err != gls::gl::NO_ERROR {
             error!("GL Error: {err}");
-            err = gls::gl::GetError();
+            return Err(Error::GlError(format!("{err}")));
         }
     }
+    Ok(())
 }
 
 fn fourcc_to_drm(fourcc: FourCharCode) -> DrmFourcc {
