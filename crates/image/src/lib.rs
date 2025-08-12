@@ -288,7 +288,7 @@ fn fourcc_channels(fourcc: FourCharCode) -> Result<usize> {
 mod tests {
     use super::*;
     use crate::{CPUConverter, Rotation};
-    use edgefirst_tensor::TensorMemory;
+    use edgefirst_tensor::{TensorMapTrait, TensorMemory};
     use image::buffer::ConvertBuffer;
     use std::path::Path;
 
@@ -693,19 +693,30 @@ mod tests {
             Rotation::Rotate180,
             Rotation::Rotate90CounterClockwise,
         ] {
-            test_opengl_rotate_(size, rot);
+            for mem in [
+                None,
+                Some(TensorMemory::Dma),
+                Some(TensorMemory::Shm),
+                Some(TensorMemory::Mem),
+            ] {
+                test_opengl_rotate_(size, rot, mem);
+            }
         }
     }
 
     #[cfg(target_os = "linux")]
-    fn test_opengl_rotate_(size: (usize, usize), rot: Rotation) {
+    fn test_opengl_rotate_(
+        size: (usize, usize),
+        rot: Rotation,
+        tensor_memory: Option<TensorMemory>,
+    ) {
         let (dst_width, dst_height) = match rot {
             Rotation::None | Rotation::Rotate180 => size,
             Rotation::Rotate90Clockwise | Rotation::Rotate90CounterClockwise => (size.1, size.0),
         };
 
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
-        let src = TensorImage::load(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
+        let src = TensorImage::load(&file, Some(RGBA), tensor_memory).unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
         let mut cpu_converter = CPUConverter::new().unwrap();
@@ -714,8 +725,7 @@ mod tests {
             .convert(&mut cpu_dst, &src, rot, None)
             .unwrap();
 
-        let mut gl_dst =
-            TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
+        let mut gl_dst = TensorImage::new(dst_width, dst_height, RGBA, tensor_memory).unwrap();
         let mut gl_converter = GLConverter::new_with_size(dst_width, dst_height, false).unwrap();
 
         for _ in 0..5 {
