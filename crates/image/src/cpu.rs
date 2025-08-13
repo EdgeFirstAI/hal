@@ -1,6 +1,5 @@
 use crate::{Error, ImageConverterTrait, RGB, RGBA, Rect, Result, Rotation, TensorImage, YUYV};
 use edgefirst_tensor::{TensorMapTrait, TensorTrait};
-use four_char_code::FourCharCode;
 use ndarray::{ArrayView3, ArrayViewMut3, Axis};
 
 /// CPUConverter implements the ImageConverter trait using the fallback CPU
