@@ -22,6 +22,7 @@ pub struct Headless {
     pub egl: egl::Instance<egl::Dynamic<libloading::Library, egl::EGL1_5>>,
     pub _gbm: Device<Card>,
     pub size: (usize, usize),
+    pub format: FourCharCode,
     pub config: Config,
 }
 
@@ -69,8 +70,6 @@ impl Headless {
             egl::GREEN_SIZE,
             8,
             egl::BLUE_SIZE,
-            8,
-            egl::ALPHA_SIZE,
             8,
             egl::NONE,
         ];
@@ -120,18 +119,34 @@ impl Headless {
             egl,
             config,
             size: (width, height),
+            format: RGBA,
         };
-        headless.warmup(10)?;
         Ok(headless)
     }
 
-    fn new_surface(&mut self, width: usize, height: usize) -> Result<(), crate::Error> {
+    fn new_surface(
+        &mut self,
+        width: usize,
+        height: usize,
+        fourcc: FourCharCode,
+    ) -> Result<(), crate::Error> {
         let _ = self.egl.destroy_surface(self.display, self.surface);
+
+        let format = match fourcc {
+            RGBA => DrmFourcc::Abgr8888,
+            RGB => DrmFourcc::Bgr888,
+            YUYV => DrmFourcc::Yuyv,
+            _ => {
+                return Err(Error::NotSupported(
+                    "Destination format not supported".to_string(),
+                ));
+            }
+        };
 
         let gbm_surface: gbm::Surface<()> = self._gbm.create_surface(
             width as u32,
             height as u32,
-            DrmFourcc::Abgr8888,
+            format,
             gbm::BufferObjectFlags::RENDERING,
         )?;
         debug!("gbm_surface: {gbm_surface:?}");
@@ -148,25 +163,13 @@ impl Headless {
         self.gbm_surface = gbm_surface;
         self.surface = surface;
         self.size = (width, height);
-
+        self.format = fourcc;
         self.egl.make_current(
             self.display,
             Some(self.surface),
             Some(self.surface),
             Some(self.ctx),
         )?;
-
-        self.warmup(10)?;
-
-        Ok(())
-    }
-
-    fn warmup(&self, n: usize) -> Result<(), crate::Error> {
-        let mut _bo;
-        for _ in 0..n {
-            self.egl.swap_buffers(self.display, self.surface)?;
-            _bo = unsafe { self.gbm_surface.lock_front_buffer()? };
-        }
         Ok(())
     }
 }
@@ -233,17 +236,33 @@ impl ImageConverterTrait for GLConverter {
         crop: Option<crate::Rect>,
     ) -> crate::Result<()> {
         if dst.is_planar() {
-            if self.gbm_rendering.size != (dst.width() / 4, dst.height() * 3) {
-                self.gbm_rendering
-                    .new_surface(dst.width() / 4, dst.height() * 3)?;
+            if self.gbm_rendering.size != (dst.width() / 4, dst.height() * 3)
+                && self
+                    .resize(dst.width() / 4, dst.height() * 3, RGBA)
+                    .is_err()
+            {
+                return Err(Error::NotSupported(format!(
+                    "Could not resize OpenGL context to {}x{} with format {}",
+                    dst.width() / 4,
+                    dst.height() * 3,
+                    RGBA.display(),
+                )));
             }
-
             self.convert_to_planar(src, crop)?;
         } else {
-            if self.gbm_rendering.size != (dst.width(), dst.height()) {
-                self.gbm_rendering.new_surface(dst.width(), dst.height())?;
+            if (self.gbm_rendering.size != (dst.width(), dst.height())
+                || self.gbm_rendering.format != dst.fourcc())
+                && self
+                    .resize(dst.width(), dst.height(), dst.fourcc())
+                    .is_err()
+            {
+                return Err(Error::NotSupported(format!(
+                    "Could not resize OpenGL context to {}x{} with format {}",
+                    dst.width(),
+                    dst.height(),
+                    dst.fourcc().display(),
+                )));
             }
-
             self.convert_to(src, rotation, crop)?;
         }
 
@@ -312,25 +331,34 @@ impl GLConverter {
 
         let vertex_buffer = Buffer::new(0, 3, 100);
         let texture_buffer = Buffer::new(1, 2, 100);
-
-        Ok(GLConverter {
+        let converter = GLConverter {
             gbm_rendering,
             texture_program,
             texture_program_planar,
             camera_texture,
             vertex_buffer,
             texture_buffer,
-        })
+        };
+        converter.warmup(3)?;
+        Ok(converter)
     }
 
-    pub fn convert_to(
+    fn resize(&mut self, width: usize, height: usize, fourcc: FourCharCode) -> Result<(), Error> {
+        self.gbm_rendering.new_surface(width, height, fourcc)?;
+        unsafe {
+            gls::gl::Viewport(0, 0, width as i32, height as i32);
+        }
+        self.warmup(1)
+    }
+
+    fn convert_to(
         &mut self,
         src: &TensorImage,
         rotation: crate::Rotation,
         crop: Option<crate::Rect>,
     ) -> Result<(), crate::Error> {
         unsafe {
-            gls::gl::ClearColor(0.0, 0.0, 0.0, 0.5);
+            gls::gl::ClearColor(0.0, 0.0, 0.5, 0.5);
             gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
         };
 
@@ -370,7 +398,22 @@ impl GLConverter {
         result
     }
 
-    pub fn convert_to_planar(
+    fn warmup(&self, n: usize) -> Result<(), crate::Error> {
+        let mut _bo;
+        for _ in 0..n {
+            unsafe {
+                gls::gl::ClearColor(0.0, 0.0, 0.0, 0.0);
+                gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
+            };
+            self.gbm_rendering
+                .egl
+                .swap_buffers(self.gbm_rendering.display, self.gbm_rendering.surface)?;
+            _bo = unsafe { self.gbm_rendering.gbm_surface.lock_front_buffer()? };
+        }
+        Ok(())
+    }
+
+    fn convert_to_planar(
         &self,
         src: &TensorImage,
         crop: Option<crate::Rect>,
@@ -618,11 +661,7 @@ impl GLConverter {
         let fd = match &src.tensor {
             edgefirst_tensor::Tensor::Dma(dma_tensor) => dma_tensor.fd.as_raw_fd(),
             edgefirst_tensor::Tensor::DmaOpenGl((dma_tensor, _)) => dma_tensor.fd.as_raw_fd(),
-            edgefirst_tensor::Tensor::Shm(_) => {
-                return Err(Error::NotImplemented(
-                    "OpenGL EGLImage doesn't support SHM".to_string(),
-                ));
-            }
+            edgefirst_tensor::Tensor::Shm(shm) => shm.fd.as_raw_fd(),
             edgefirst_tensor::Tensor::Mem(_) => {
                 return Err(Error::NotImplemented(
                     "OpenGL EGLImage doesn't support MEM".to_string(),
@@ -828,14 +867,16 @@ impl GlProgram {
             gls::gl::AttachShader(id, fragment_id);
             gls::gl::LinkProgram(id);
             gls::gl::UseProgram(id);
+        }
 
-            let pv = [
-                1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
-            ];
-            let m = [
-                1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
-            ];
+        let pv = [
+            1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
+        ];
+        let m = [
+            1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
+        ];
 
+        unsafe {
             let pv_location = gls::gl::GetUniformLocation(id, c"PV".as_ptr());
             gls::gl::UniformMatrix4fv(pv_location, 1, 0, pv.as_ptr());
 
@@ -929,7 +970,7 @@ fn fourcc_to_drm(fourcc: FourCharCode) -> DrmFourcc {
     match fourcc {
         RGBA => DrmFourcc::Abgr8888,
         YUYV => DrmFourcc::Yuyv,
-        RGB => DrmFourcc::Rgb888,
+        RGB => DrmFourcc::Bgr888,
         _ => todo!(),
     }
 }

@@ -993,6 +993,56 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn test_yuyv_to_rgba_opengl() {
+        let src = load_bytes_to_tensor(
+            1280,
+            720,
+            YUYV,
+            Some(TensorMemory::Dma),
+            include_bytes!("../../../testdata/camera720p.yuyv"),
+        )
+        .unwrap();
+
+        let mut dst = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Mem)).unwrap();
+        let mut gl_converter = GLConverter::new().unwrap();
+
+        gl_converter
+            .convert(&mut dst, &src, Rotation::None, None)
+            .unwrap();
+
+        let gl_image =
+            image::RgbaImage::from_vec(1280, 720, dst.tensor().map().unwrap().to_vec()).unwrap();
+
+        let target_image = image::RgbaImage::from_vec(
+            1280,
+            720,
+            include_bytes!("../../../testdata/camera720p.rgba").to_vec(),
+        )
+        .unwrap();
+
+        let similarity = image_compare::rgb_similarity_structure(
+            &image_compare::Algorithm::RootMeanSquared,
+            &gl_image.convert(),
+            &target_image.convert(),
+        )
+        .expect("Image Comparison failed");
+        if similarity.score <= 0.99 {
+            let _ = dst.save("opengl.jpg", 80);
+            similarity
+                .image
+                .to_color_map()
+                .save("yuyv_to_rgba_opengl_similarity.png")
+                .unwrap();
+        }
+        assert!(
+            similarity.score > 0.99,
+            "OpenGL converted image and target image have similarity score too low: {}",
+            similarity.score
+        );
+    }
+
+    #[test]
     fn test_yuyv_to_rgba_resize_cpu() {
         let src = load_bytes_to_tensor(
             1280,

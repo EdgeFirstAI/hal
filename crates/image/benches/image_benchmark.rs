@@ -386,6 +386,29 @@ fn convert_g2d(bencher: divan::Bencher, params: (usize, usize)) {
     });
 }
 
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+fn convert_opengl(bencher: divan::Bencher, params: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera720p.yuyv").to_vec();
+    let src = TensorImage::new(1280, 720, YUYV, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = params;
+    let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
+
+    let mut converter = GLConverter::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&mut dst, &src, Rotation::None, None)
+            .unwrap()
+    });
+    drop(dst);
+}
+
 fn dma_available() -> bool {
     #[cfg(target_os = "linux")]
     {

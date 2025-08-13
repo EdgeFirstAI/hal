@@ -135,6 +135,8 @@ impl ImageConverterTrait for CPUConverter {
         let mut src = src;
         let mut tmp;
         if src.fourcc() == YUYV {
+            // when there is no crop, no rotation, and width/height is the same, we can
+            // directly convert into the dest
             if crop.is_none()
                 && rotation == Rotation::None
                 && dst.width() == src.width()
@@ -150,7 +152,14 @@ impl ImageConverterTrait for CPUConverter {
                     }
                 }
             } else {
-                tmp = TensorImage::new(src.width(), src.height(), dst.fourcc(), None)?;
+                // otherwise we convert into a temporary buffer that will be used later for
+                // resize/rotate
+                tmp = TensorImage::new(
+                    src.width(),
+                    src.height(),
+                    dst.fourcc(),
+                    Some(edgefirst_tensor::TensorMemory::Mem),
+                )?;
                 match dst.fourcc() {
                     RGB => self.convert_yuyv_to_rgb(src, &mut tmp)?,
                     RGBA => self.convert_yuyv_to_rgba(src, &mut tmp)?,
