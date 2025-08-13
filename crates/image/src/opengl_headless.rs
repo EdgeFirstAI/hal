@@ -1,6 +1,6 @@
 // #![cfg(target_os = "linux")]
 use drm::{Device as DrmDevice, buffer::DrmFourcc, control::Device as DrmControlDevice};
-use edgefirst_tensor::{DmaTensor, TensorMapTrait, TensorTrait};
+use edgefirst_tensor::{DmaTensor, TensorTrait};
 use four_char_code::FourCharCode;
 use gbm::{AsRaw, Device};
 use khronos_egl::{self as egl, Attrib, Config};
@@ -324,7 +324,7 @@ impl GLConverter {
     }
 
     pub fn convert_to(
-        &self,
+        &mut self,
         src: &TensorImage,
         rotation: crate::Rotation,
         crop: Option<crate::Rect>,
@@ -364,7 +364,7 @@ impl GLConverter {
                 rotation_offset,
             )
         } else {
-            self.draw_camera_texture(&self.camera_texture, src, roi, rotation_offset)
+            self.draw_camera_texture(src, roi, rotation_offset)
         };
         unsafe { gls::gl::Finish() };
         result
@@ -384,7 +384,7 @@ impl GLConverter {
             &self.camera_texture,
             &new_egl_image,
             self.gbm_rendering.size.0,
-        );
+        )?;
         unsafe { gls::gl::Finish() };
 
         Ok(())
@@ -395,7 +395,7 @@ impl GLConverter {
         texture: &Texture,
         egl_img: &EglImage,
         width: usize,
-    ) {
+    ) -> Result<(), Error> {
         let texture_target = gls::gl::TEXTURE_2D;
         unsafe {
             self.texture_program.load_uniform_1f(c"width", width as f32);
@@ -413,7 +413,7 @@ impl GLConverter {
                 gls::gl::LINEAR as i32,
             );
             gls::egl_image_target_texture_2d_oes(texture_target, egl_img.egl_image.as_ptr());
-            check_gl_error();
+            check_gl_error()?;
 
             // starts from bottom
             for i in 0..3 {
@@ -458,14 +458,14 @@ impl GLConverter {
                     gls::gl::UNSIGNED_INT,
                     vertices_index.as_ptr() as *const c_void,
                 );
-                check_gl_error();
+                check_gl_error()?;
             }
         }
+        Ok(())
     }
 
     fn draw_camera_texture(
-        &self,
-        texture: &Texture,
+        &mut self,
         img: &TensorImage,
         roi: RegionOfInterest,
         rotation_offset: usize,
@@ -482,7 +482,7 @@ impl GLConverter {
         };
         unsafe {
             gls::gl::UseProgram(self.texture_program.id);
-            gls::gl::BindTexture(texture_target, texture.id);
+            gls::gl::BindTexture(texture_target, self.camera_texture.id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
             gls::gl::TexParameteri(
                 texture_target,
@@ -494,18 +494,25 @@ impl GLConverter {
                 gls::gl::TEXTURE_MAG_FILTER,
                 gls::gl::LINEAR as i32,
             );
-            gls::gl::TexImage2D(
+            self.camera_texture.update_texture(
                 texture_target,
-                0,
-                texture_format as i32,
-                img.width() as i32,
-                img.height() as i32,
-                0,
+                img.width(),
+                img.height(),
                 texture_format,
-                gls::gl::UNSIGNED_BYTE,
-                img.tensor().map()?.as_ptr() as *const c_void,
+                &img.tensor().map()?,
             );
-            check_gl_error();
+            // gls::gl::TexImage2D(
+            //     texture_target,
+            //     0,
+            //     texture_format as i32,
+            //     img.width() as i32,
+            //     img.height() as i32,
+            //     0,
+            //     texture_format,
+            //     gls::gl::UNSIGNED_BYTE,
+            //     img.tensor().map()?.as_ptr() as *const c_void,
+            // );
+            check_gl_error()?;
             gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
             gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
             let camera_vertices: [f32; 12] = [-1., -1., 0., 1., -1., 0., 1., 1., 0., -1., 1., 0.];
@@ -563,15 +570,15 @@ impl GLConverter {
                 gls::gl::LINEAR as i32,
             );
             gls::egl_image_target_texture_2d_oes(texture_target, egl_img.egl_image.as_ptr());
-            check_gl_error();
+            check_gl_error()?;
             gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
             gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
             let camera_vertices: [f32; 12] = [-1., -1., 0., 1., -1., 0., 1., 1., 0., -1., 1., 0.];
-            gls::gl::BufferData(
+            gls::gl::BufferSubData(
                 gls::gl::ARRAY_BUFFER,
+                0,
                 (size_of::<f32>() * camera_vertices.len()) as isize,
                 camera_vertices.as_ptr() as *const c_void,
-                gls::gl::DYNAMIC_DRAW,
             );
 
             gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
@@ -580,11 +587,11 @@ impl GLConverter {
                 roi.left, roi.top, roi.right, roi.top, roi.right, roi.bottom, roi.left, roi.bottom,
                 roi.left, roi.top, roi.right, roi.top, roi.right, roi.bottom, roi.left, roi.bottom,
             ];
-            gls::gl::BufferData(
+            gls::gl::BufferSubData(
                 gls::gl::ARRAY_BUFFER,
+                0,
                 (size_of::<f32>() * 8) as isize,
                 (texture_vertices[(rotation_offset * 2)..]).as_ptr() as *const c_void,
-                gls::gl::DYNAMIC_DRAW,
             );
 
             let vertices_index: [u32; 4] = [0, 1, 2, 3];
@@ -683,6 +690,10 @@ impl Drop for EglImage<'_> {
 
 pub struct Texture {
     id: u32,
+    target: gls::gl::types::GLenum,
+    width: usize,
+    height: usize,
+    format: gls::gl::types::GLenum,
 }
 
 impl Default for Texture {
@@ -695,7 +706,60 @@ impl Texture {
     pub fn new() -> Self {
         let mut id = 0;
         unsafe { gls::gl::GenTextures(1, &raw mut id) };
-        Self { id }
+        Self {
+            id,
+            target: 0,
+            width: 0,
+            height: 0,
+            format: 0,
+        }
+    }
+
+    pub fn update_texture(
+        &mut self,
+        target: gls::gl::types::GLenum,
+        width: usize,
+        height: usize,
+        format: gls::gl::types::GLenum,
+        data: &[u8],
+    ) {
+        if target != self.target
+            || width != self.width
+            || height != self.height
+            || format != self.format
+        {
+            unsafe {
+                gls::gl::TexImage2D(
+                    target,
+                    0,
+                    format as i32,
+                    width as i32,
+                    height as i32,
+                    0,
+                    format,
+                    gls::gl::UNSIGNED_BYTE,
+                    data.as_ptr() as *const c_void,
+                );
+            }
+            self.target = target;
+            self.format = format;
+            self.width = width;
+            self.height = height;
+        } else {
+            unsafe {
+                gls::gl::TexSubImage2D(
+                    target,
+                    0,
+                    0,
+                    0,
+                    width as i32,
+                    height as i32,
+                    format,
+                    gls::gl::UNSIGNED_BYTE,
+                    data.as_ptr() as *const c_void,
+                );
+            }
+        }
     }
 }
 
@@ -728,6 +792,12 @@ impl Buffer {
         }
 
         Buffer { id, buffer_index }
+    }
+}
+
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        unsafe { gls::gl::DeleteBuffers(1, &raw mut self.id) };
     }
 }
 
