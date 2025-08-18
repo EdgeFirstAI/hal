@@ -1,4 +1,6 @@
-use crate::{Error, ImageConverterTrait, RGB, RGBA, Rect, Result, Rotation, TensorImage, YUYV};
+use crate::{
+    Error, ImageConverterTrait, NV12, RGB, RGBA, Rect, Result, Rotation, TensorImage, YUYV,
+};
 use edgefirst_tensor::{TensorMapTrait, TensorTrait};
 use ndarray::{ArrayView3, ArrayViewMut3, Axis};
 
@@ -85,6 +87,66 @@ impl CPUConverter {
         Ok(())
     }
 
+    fn convert_nv12_to_rgb(&self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), YUYV);
+        assert_eq!(dst.fourcc(), RGB);
+        // let src = yuv::YuvPackedImage::<u8> {
+        //     yuy: &src.tensor.map()?,
+        //     yuy_stride: src.width() as u32 * 2, // we assume packed yuyv
+        //     width: src.width() as u32,
+        //     height: src.height() as u32,
+        // };
+        let map = src.tensor.map()?;
+        let y_stride = src.width() as u32;
+        let uv_stride = src.width() as u32;
+        let slices = map.as_slice().split_at(y_stride as usize * src.height());
+
+        let src = yuv::YuvBiPlanarImage {
+            y_plane: slices.0,
+            y_stride,
+            uv_plane: slices.1,
+            uv_stride,
+            width: src.width() as u32,
+            height: src.height() as u32,
+        };
+
+        Ok(yuv::yuv_nv12_to_rgb(
+            &src,
+            dst.tensor.map()?.as_mut_slice(),
+            dst.width() as u32 * 3,
+            yuv::YuvRange::Limited,
+            yuv::YuvStandardMatrix::Bt709,
+            yuv::YuvConversionMode::Balanced,
+        )?)
+    }
+
+    fn convert_nv12_to_rgba(&self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), YUYV);
+        assert_eq!(dst.fourcc(), RGBA);
+        let map = src.tensor.map()?;
+        let y_stride = src.width() as u32;
+        let uv_stride = src.width() as u32;
+        let slices = map.as_slice().split_at(y_stride as usize * src.height());
+
+        let src = yuv::YuvBiPlanarImage {
+            y_plane: slices.0,
+            y_stride,
+            uv_plane: slices.1,
+            uv_stride,
+            width: src.width() as u32,
+            height: src.height() as u32,
+        };
+
+        Ok(yuv::yuv_nv12_to_rgba(
+            &src,
+            dst.tensor.map()?.as_mut_slice(),
+            dst.width() as u32 * 4,
+            yuv::YuvRange::Limited,
+            yuv::YuvStandardMatrix::Bt709,
+            yuv::YuvConversionMode::Balanced,
+        )?)
+    }
+
     fn convert_yuyv_to_rgb(&self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), YUYV);
         assert_eq!(dst.fourcc(), RGB);
@@ -134,44 +196,89 @@ impl ImageConverterTrait for CPUConverter {
     ) -> Result<()> {
         let mut src = src;
         let mut tmp;
-        if src.fourcc() == YUYV {
-            // when there is no crop, no rotation, and width/height is the same, we can
-            // directly convert into the dest
-            if crop.is_none()
-                && rotation == Rotation::None
-                && dst.width() == src.width()
-                && dst.height() == src.height()
-            {
-                match dst.fourcc() {
-                    RGB => return self.convert_yuyv_to_rgb(src, dst),
-                    RGBA => return self.convert_yuyv_to_rgba(src, dst),
-                    _ => {
-                        return Err(Error::NotSupported(
-                            "YUYV destination not supported".to_string(),
-                        ));
+        match src.fourcc() {
+            YUYV => {
+                // when there is no crop, no rotation, and width/height is the same, we can
+                // directly convert into the dest
+                if crop.is_none()
+                    && rotation == Rotation::None
+                    && dst.width() == src.width()
+                    && dst.height() == src.height()
+                {
+                    match dst.fourcc() {
+                        RGB => return self.convert_yuyv_to_rgb(src, dst),
+                        RGBA => return self.convert_yuyv_to_rgba(src, dst),
+                        _ => {
+                            return Err(Error::NotSupported(
+                                "YUYV destination not supported".to_string(),
+                            ));
+                        }
                     }
-                }
-            } else {
-                // otherwise we convert into a temporary buffer that will be used later for
-                // resize/rotate
-                tmp = TensorImage::new(
-                    src.width(),
-                    src.height(),
-                    dst.fourcc(),
-                    Some(edgefirst_tensor::TensorMemory::Mem),
-                )?;
-                match dst.fourcc() {
-                    RGB => self.convert_yuyv_to_rgb(src, &mut tmp)?,
-                    RGBA => self.convert_yuyv_to_rgba(src, &mut tmp)?,
-                    _ => {
-                        return Err(Error::NotSupported(
-                            "YUYV destination not supported".to_string(),
-                        ));
+                } else {
+                    // otherwise we convert into a temporary buffer that will be used later for
+                    // resize/rotate
+                    tmp = TensorImage::new(
+                        src.width(),
+                        src.height(),
+                        dst.fourcc(),
+                        Some(edgefirst_tensor::TensorMemory::Mem),
+                    )?;
+                    match dst.fourcc() {
+                        RGB => self.convert_yuyv_to_rgb(src, &mut tmp)?,
+                        RGBA => self.convert_yuyv_to_rgba(src, &mut tmp)?,
+                        _ => {
+                            return Err(Error::NotSupported(
+                                "YUYV destination not supported".to_string(),
+                            ));
+                        }
                     }
+                    src = &tmp;
                 }
-                src = &tmp;
+            }
+            NV12 => {
+                // when there is no crop, no rotation, and width/height is the same, we can
+                // directly convert into the dest
+                if crop.is_none()
+                    && rotation == Rotation::None
+                    && dst.width() == src.width()
+                    && dst.height() == src.height()
+                {
+                    match dst.fourcc() {
+                        RGB => return self.convert_nv12_to_rgb(src, dst),
+                        RGBA => return self.convert_nv12_to_rgba(src, dst),
+                        _ => {
+                            return Err(Error::NotSupported(
+                                "destination format not supported".to_string(),
+                            ));
+                        }
+                    }
+                } else {
+                    // otherwise we convert into a temporary buffer that will be used later for
+                    // resize/rotate
+                    tmp = TensorImage::new(
+                        src.width(),
+                        src.height(),
+                        dst.fourcc(),
+                        Some(edgefirst_tensor::TensorMemory::Mem),
+                    )?;
+                    match dst.fourcc() {
+                        RGB => self.convert_nv12_to_rgb(src, &mut tmp)?,
+                        RGBA => self.convert_nv12_to_rgba(src, &mut tmp)?,
+                        _ => {
+                            return Err(Error::NotSupported(
+                                "destination format not supported".to_string(),
+                            ));
+                        }
+                    }
+                    src = &tmp;
+                }
+            }
+            RGB | RGBA => {}
+            _ => {
+                return Err(Error::NotSupported("unknown format".to_string()));
             }
         }
+
         let src_type = match src.channels() {
             1 => fast_image_resize::PixelType::U8,
             3 => fast_image_resize::PixelType::U8x3,

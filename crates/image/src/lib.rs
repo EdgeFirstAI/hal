@@ -7,6 +7,7 @@
 //! environments where hardware acceleration is not present or not suitable.
 
 use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait as _};
+use enum_dispatch::enum_dispatch;
 use four_char_code::{FourCharCode, four_char_code};
 use zune_jpeg::{
     JpegDecoder,
@@ -25,6 +26,7 @@ mod g2d;
 mod opengl_headless;
 
 pub const YUYV: FourCharCode = four_char_code!("YUYV");
+pub const NV12: FourCharCode = four_char_code!("NV12");
 pub const RGBA: FourCharCode = four_char_code!("RGBA");
 pub const RGB: FourCharCode = four_char_code!("RGB ");
 
@@ -213,6 +215,7 @@ pub struct Rect {
     pub height: usize,
 }
 
+#[enum_dispatch(ImageConverter)]
 pub trait ImageConverterTrait {
     /// Converts the source image to the destination image format and size.
     ///
@@ -237,38 +240,31 @@ pub trait ImageConverterTrait {
     ) -> Result<()>;
 }
 
+#[enum_dispatch]
 pub enum ImageConverter {
-    CPU(Box<CPUConverter>),
+    CPU(CPUConverter),
     #[cfg(target_os = "linux")]
-    G2D(Box<G2DConverter>),
+    G2D(G2DConverter),
+    #[cfg(target_os = "linux")]
+    OpenGL(GLConverter),
 }
 
 impl ImageConverter {
     pub fn new() -> Result<Self> {
         #[cfg(target_os = "linux")]
         match G2DConverter::new() {
-            Ok(g2d_converter) => return Ok(Self::G2D(Box::new(g2d_converter))),
+            Ok(g2d_converter) => return Ok(Self::G2D(g2d_converter)),
             Err(err) => log::debug!("Failed to initialize G2D converter: {err:?}"),
         }
 
-        let cpu_converter = CPUConverter::new()?;
-        Ok(Self::CPU(Box::new(cpu_converter)))
-    }
-}
-
-impl ImageConverterTrait for ImageConverter {
-    fn convert(
-        &mut self,
-        dst: &mut TensorImage,
-        src: &TensorImage,
-        rotation: Rotation,
-        crop: Option<Rect>,
-    ) -> Result<()> {
-        match self {
-            ImageConverter::CPU(converter) => converter.convert(dst, src, rotation, crop),
-            #[cfg(target_os = "linux")]
-            ImageConverter::G2D(converter) => converter.convert(dst, src, rotation, crop),
+        #[cfg(target_os = "linux")]
+        match GLConverter::new() {
+            Ok(gl_converter) => return Ok(Self::OpenGL(gl_converter)),
+            Err(err) => log::debug!("Failed to initialize GL converter: {err:?}"),
         }
+
+        let cpu_converter = CPUConverter::new()?;
+        Ok(Self::CPU(cpu_converter))
     }
 }
 

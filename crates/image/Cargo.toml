@@ -14,6 +14,7 @@ ctor = { workspace = true }
 drm = "0.14.1"
 edgefirst-tensor = { version = "*", path = "../tensor" }
 env_logger = { workspace = true }
+enum_dispatch = { workspace = true }
 fast_image_resize = { workspace = true }
 four-char-code = { workspace = true }
 gbm = "0.18.0"
