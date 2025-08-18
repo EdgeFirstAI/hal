@@ -18,6 +18,7 @@ ctor = "0.4.2"
 divan = "0.1.21"
 dma-heap = "0.4.1"
 env_logger = "0.11.8"
+enum_dispatch = "0.3.13"
 fast_image_resize = { version = "5.2.0", features = ["image", "rayon"] }
 four-char-code = "2.3.0"
 glob = "0.3.2"
