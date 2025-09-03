@@ -4,7 +4,7 @@ mod image;
 mod tensor;
 
 #[pymodule]
-mod edgefirst {
+mod edgefirst_python {
     use super::*;
 
     #[pymodule_init]
