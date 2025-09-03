@@ -184,6 +184,126 @@ impl CPUConverter {
             yuv::YuvStandardMatrix::Bt709,
         )?)
     }
+
+    fn convert_rgba_to_rgb(&self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), RGBA);
+        assert_eq!(dst.fourcc(), RGB);
+
+        Ok(yuv::rgba_to_rgb(
+            src.tensor.map()?.as_slice(),
+            (src.width() * src.channels()) as u32,
+            dst.tensor.map()?.as_mut_slice(),
+            (dst.width() * dst.channels()) as u32,
+            src.width() as u32,
+            src.height() as u32,
+        )?)
+    }
+
+    fn convert_rgb_to_rgba(&self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), RGB);
+        assert_eq!(dst.fourcc(), RGBA);
+
+        Ok(yuv::rgb_to_rgba(
+            src.tensor.map()?.as_slice(),
+            (src.width() * src.channels()) as u32,
+            dst.tensor.map()?.as_mut_slice(),
+            (dst.width() * dst.channels()) as u32,
+            src.width() as u32,
+            src.height() as u32,
+        )?)
+    }
+
+    fn resize_and_rotate(
+        &mut self,
+        dst: &mut TensorImage,
+        src: &TensorImage,
+        rotation: Rotation,
+        crop: Option<Rect>,
+    ) -> Result<()> {
+        assert_eq!(src.fourcc(), dst.fourcc());
+
+        let src_type = match src.channels() {
+            1 => fast_image_resize::PixelType::U8,
+            3 => fast_image_resize::PixelType::U8x3,
+            4 => fast_image_resize::PixelType::U8x4,
+            _ => {
+                return Err(Error::NotImplemented(
+                    "Unsupported source image format".to_string(),
+                ));
+            }
+        };
+
+        let mut src_map = src.tensor().map()?;
+
+        let mut dst_map = dst.tensor().map()?;
+
+        let options = if let Some(crop) = crop {
+            self.options.crop(
+                crop.left as f64,
+                crop.top as f64,
+                crop.width as f64,
+                crop.height as f64,
+            )
+        } else {
+            self.options
+        };
+
+        let needs_resize = src.width() != dst.width()
+            || src.height() != dst.height()
+            || crop.is_some_and(|crop| {
+                crop != Rect {
+                    left: 0,
+                    top: 0,
+                    width: src.width(),
+                    height: src.height(),
+                }
+            });
+
+        if needs_resize {
+            let src_view = fast_image_resize::images::Image::from_slice_u8(
+                src.width() as u32,
+                src.height() as u32,
+                &mut src_map,
+                src_type,
+            )?;
+            match rotation {
+                Rotation::None => {
+                    let mut dst_view = fast_image_resize::images::Image::from_slice_u8(
+                        dst.width() as u32,
+                        dst.height() as u32,
+                        &mut dst_map,
+                        src_type,
+                    )?;
+                    self.resizer.resize(&src_view, &mut dst_view, &options)?;
+                }
+                Rotation::Rotate90Clockwise | Rotation::Rotate90CounterClockwise => {
+                    let mut tmp = vec![0; dst.row_stride() * dst.height()];
+                    let mut tmp_view = fast_image_resize::images::Image::from_slice_u8(
+                        dst.height() as u32,
+                        dst.width() as u32,
+                        &mut tmp,
+                        src_type,
+                    )?;
+                    self.resizer.resize(&src_view, &mut tmp_view, &options)?;
+                    self.rotate_ndarray(&tmp, &mut dst_map, dst, rotation)?;
+                }
+                Rotation::Rotate180 => {
+                    let mut tmp = vec![0; dst.row_stride() * dst.height()];
+                    let mut tmp_view = fast_image_resize::images::Image::from_slice_u8(
+                        dst.width() as u32,
+                        dst.height() as u32,
+                        &mut tmp,
+                        src_type,
+                    )?;
+                    self.resizer.resize(&src_view, &mut tmp_view, &options)?;
+                    self.rotate_ndarray(&tmp, &mut dst_map, dst, rotation)?;
+                }
+            }
+        } else {
+            self.rotate_ndarray(&src_map, &mut dst_map, dst, rotation)?;
+        }
+        Ok(())
+    }
 }
 
 impl ImageConverterTrait for CPUConverter {
@@ -196,6 +316,8 @@ impl ImageConverterTrait for CPUConverter {
     ) -> Result<()> {
         let mut src = src;
         let mut tmp;
+
+        // YUV conversions need to happen at the start
         match src.fourcc() {
             YUYV => {
                 // when there is no crop, no rotation, and width/height is the same, we can
@@ -273,102 +395,50 @@ impl ImageConverterTrait for CPUConverter {
                     src = &tmp;
                 }
             }
-            RGB | RGBA => {}
+            RGB | RGBA => {
+                if src.fourcc() != dst.fourcc()
+                    && src.width() * src.height() < dst.width() * dst.height()
+                {
+                    // we do the RGB/RGBA conversion early only when enlarging the image
+                    tmp = TensorImage::new(
+                        src.width(),
+                        src.height(),
+                        dst.fourcc(),
+                        Some(edgefirst_tensor::TensorMemory::Mem),
+                    )?;
+                    match dst.fourcc() {
+                        RGB => self.convert_rgba_to_rgb(src, &mut tmp)?,
+                        RGBA => self.convert_rgb_to_rgba(src, &mut tmp)?,
+                        _ => {
+                            return Err(Error::NotSupported(
+                                "destination format not supported".to_string(),
+                            ));
+                        }
+                    }
+                    src = &tmp;
+                }
+            }
             _ => {
                 return Err(Error::NotSupported("unknown format".to_string()));
             }
         }
 
-        let src_type = match src.channels() {
-            1 => fast_image_resize::PixelType::U8,
-            3 => fast_image_resize::PixelType::U8x3,
-            4 => fast_image_resize::PixelType::U8x4,
-            _ => {
-                return Err(Error::NotImplemented(
-                    "Unsupported source image format".to_string(),
-                ));
-            }
-        };
-
-        let dst_type = match dst.channels() {
-            1 => fast_image_resize::PixelType::U8,
-            3 => fast_image_resize::PixelType::U8x3,
-            4 => fast_image_resize::PixelType::U8x4,
-            _ => {
-                return Err(Error::NotImplemented(
-                    "Unsupported destination image format".to_string(),
-                ));
-            }
-        };
-
-        let mut src_map = src.tensor().map()?;
-
-        let mut dst_map = dst.tensor().map()?;
-
-        let options = if let Some(crop) = crop {
-            self.options.crop(
-                crop.left as f64,
-                crop.top as f64,
-                crop.width as f64,
-                crop.height as f64,
-            )
+        matches!(src.fourcc(), RGB | RGBA);
+        if src.fourcc() == dst.fourcc() {
+            self.resize_and_rotate(dst, src, rotation, crop)?;
         } else {
-            self.options
-        };
-
-        let needs_resize = src.width() != dst.width()
-            || src.height() != dst.height()
-            || crop.is_some_and(|crop| {
-                crop != Rect {
-                    left: 0,
-                    top: 0,
-                    width: src.width(),
-                    height: src.height(),
-                }
-            });
-
-        if needs_resize {
-            let src_view = fast_image_resize::images::Image::from_slice_u8(
-                src.width() as u32,
-                src.height() as u32,
-                &mut src_map,
-                src_type,
+            let mut tmp2 = TensorImage::new(
+                dst.width(),
+                dst.height(),
+                src.fourcc(),
+                Some(edgefirst_tensor::TensorMemory::Mem),
             )?;
-            match rotation {
-                Rotation::None => {
-                    let mut dst_view = fast_image_resize::images::Image::from_slice_u8(
-                        dst.width() as u32,
-                        dst.height() as u32,
-                        &mut dst_map,
-                        dst_type,
-                    )?;
-                    self.resizer.resize(&src_view, &mut dst_view, &options)?;
-                }
-                Rotation::Rotate90Clockwise | Rotation::Rotate90CounterClockwise => {
-                    let mut tmp = vec![0; dst.row_stride() * dst.height()];
-                    let mut tmp_view = fast_image_resize::images::Image::from_slice_u8(
-                        dst.height() as u32,
-                        dst.width() as u32,
-                        &mut tmp,
-                        dst_type,
-                    )?;
-                    self.resizer.resize(&src_view, &mut tmp_view, &options)?;
-                    self.rotate_ndarray(&tmp, &mut dst_map, dst, rotation)?;
-                }
-                Rotation::Rotate180 => {
-                    let mut tmp = vec![0; dst.row_stride() * dst.height()];
-                    let mut tmp_view = fast_image_resize::images::Image::from_slice_u8(
-                        dst.width() as u32,
-                        dst.height() as u32,
-                        &mut tmp,
-                        dst_type,
-                    )?;
-                    self.resizer.resize(&src_view, &mut tmp_view, &options)?;
-                    self.rotate_ndarray(&tmp, &mut dst_map, dst, rotation)?;
-                }
+            self.resize_and_rotate(&mut tmp2, src, rotation, crop)?;
+            match dst.fourcc() {
+                RGB => self.convert_rgba_to_rgb(&tmp2, dst)?,
+                RGBA => self.convert_rgb_to_rgba(&tmp2, dst)?,
+                _ => unreachable!(),
             }
-        } else {
-            self.rotate_ndarray(&src_map, &mut dst_map, dst, rotation)?;
         }
 
         Ok(())
