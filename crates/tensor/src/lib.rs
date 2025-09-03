@@ -135,7 +135,6 @@ where
     T: Num + Clone + fmt::Debug,
 {
     Dma(DmaTensor<T>),
-    DmaOpenGl((DmaTensor<T>, gbm::BufferObject<()>)),
     Shm(ShmTensor<T>),
     Mem(MemTensor<T>),
 }
@@ -213,7 +212,6 @@ where
     fn clone_fd(&self) -> Result<OwnedFd> {
         match self {
             Tensor::Dma(t) => t.clone_fd(),
-            Tensor::DmaOpenGl((t, _)) => t.clone_fd(),
             Tensor::Shm(t) => t.clone_fd(),
             Tensor::Mem(t) => t.clone_fd(),
         }
@@ -222,7 +220,6 @@ where
     fn memory(&self) -> TensorMemory {
         match self {
             Tensor::Dma(_) => TensorMemory::Dma,
-            Tensor::DmaOpenGl(_) => TensorMemory::Dma,
             Tensor::Shm(_) => TensorMemory::Shm,
             Tensor::Mem(_) => TensorMemory::Mem,
         }
@@ -231,7 +228,6 @@ where
     fn name(&self) -> String {
         match self {
             Tensor::Dma(t) => t.name(),
-            Tensor::DmaOpenGl((t, _)) => t.name(),
             Tensor::Shm(t) => t.name(),
             Tensor::Mem(t) => t.name(),
         }
@@ -240,7 +236,6 @@ where
     fn shape(&self) -> &[usize] {
         match self {
             Tensor::Dma(t) => t.shape(),
-            Tensor::DmaOpenGl((t, _)) => t.shape(),
             Tensor::Shm(t) => t.shape(),
             Tensor::Mem(t) => t.shape(),
         }
@@ -249,7 +244,6 @@ where
     fn reshape(&mut self, shape: &[usize]) -> Result<()> {
         match self {
             Tensor::Dma(t) => t.reshape(shape),
-            Tensor::DmaOpenGl((t, _)) => t.reshape(shape),
             Tensor::Shm(t) => t.reshape(shape),
             Tensor::Mem(t) => t.reshape(shape),
         }
@@ -258,7 +252,6 @@ where
     fn map(&self) -> Result<TensorMap<T>> {
         match self {
             Tensor::Dma(t) => t.map(),
-            Tensor::DmaOpenGl((t, _)) => t.map(),
             Tensor::Shm(t) => t.map(),
             Tensor::Mem(t) => t.map(),
         }
