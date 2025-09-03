@@ -1,5 +1,5 @@
 [package]
-name = "edgefirst-python"
+name = "edgefirst_python"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

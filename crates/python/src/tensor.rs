@@ -256,7 +256,7 @@ impl PyTensor {
         let memory = match memory {
             Some("dma") => Some(tensor::TensorMemory::Dma),
             Some("shm") => Some(tensor::TensorMemory::Shm),
-            Some(inv) => return Err(Error::UnsupportedMemoryType(inv.to_string()).into()),
+            Some(inv) => return Err(Error::UnsupportedMemoryType(inv.to_string())),
             None => None,
         };
 
@@ -271,7 +271,7 @@ impl PyTensor {
             "int64" => TensorT::TensorI64(tensor::Tensor::new(&shape, memory, name)?),
             "float32" => TensorT::TensorF32(tensor::Tensor::new(&shape, memory, name)?),
             "float64" => TensorT::TensorF64(tensor::Tensor::new(&shape, memory, name)?),
-            _ => return Err(Error::UnsupportedDataType(dtype.to_string()).into()),
+            _ => return Err(Error::UnsupportedDataType(dtype.to_string())),
         };
 
         Ok(PyTensor(tensor))
