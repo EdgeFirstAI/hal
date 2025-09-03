@@ -1,6 +1,6 @@
 use edgefirst_image::{
-    CPUConverter, G2DConverter, GLConverter, ImageConverterTrait as _, RGBA, Rotation, TensorImage,
-    YUYV,
+    CPUConverter, G2DConverter, GLConverter, ImageConverterTrait as _, RGB, RGBA, Rotation,
+    TensorImage, YUYV,
 };
 use edgefirst_tensor::{TensorMapTrait, TensorMemory, TensorTrait};
 use std::path::Path;
@@ -354,6 +354,41 @@ fn convert_cpu(bencher: divan::Bencher, params: (usize, usize)) {
 
     let (width, height) = params;
     let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
+
+    let mut converter = CPUConverter::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&mut dst, &src, Rotation::None, None)
+            .unwrap()
+    });
+}
+
+#[divan::bench(types = [Jaguar, Person, Zidane])]
+fn convert_cpu_rgba_to_rgb<IMAGE>(bencher: divan::Bencher)
+where
+    IMAGE: TestImage,
+{
+    let name = format!("{}.jpg", IMAGE::filename());
+    let path = Path::new("testdata").join(&name);
+    let path = match path.exists() {
+        true => path,
+        false => {
+            let path = Path::new("../testdata").join(&name);
+            if path.exists() {
+                path
+            } else {
+                Path::new("../../testdata").join(&name)
+            }
+        }
+    };
+
+    assert!(path.exists(), "unable to locate test image at {path:?}");
+
+    let file = std::fs::read(path).unwrap();
+
+    let src = TensorImage::load(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
+    let mut dst = TensorImage::new(src.width(), src.height(), RGB, None).unwrap();
 
     let mut converter = CPUConverter::new().unwrap();
 

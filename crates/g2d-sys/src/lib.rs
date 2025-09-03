@@ -96,7 +96,7 @@ pub struct G2DPhysical(c_ulong);
 impl G2DPhysical {
     pub fn new(fd: RawFd) -> Result<Self> {
         let phys = dma_buf_phys(0);
-        let err = unsafe { ioctl_dma_buf_phys(fd, &phys.0).unwrap_or(0) };
+        let err = unsafe { ioctl_dma_buf_phys(fd, &phys.0).unwrap_or(1) };
         if err != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
