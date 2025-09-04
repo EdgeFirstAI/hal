@@ -443,6 +443,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgefirst-decoder"
+version = "0.0.0"
+dependencies = [
+ "divan",
+ "edgefirst-tensor",
+ "enum_dispatch",
+ "env_logger",
+ "image",
+ "log",
+ "ndarray",
+ "num-traits",
+]
+
+[[package]]
 name = "edgefirst-image"
 version = "0.0.0"
 dependencies = [
@@ -1021,6 +1035,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "rawpointer",
+ "rayon",
 ]
 
 [[package]]

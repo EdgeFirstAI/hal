@@ -1,2 +1,8 @@
+testdata/yolov8s_80_classes.bin filter=lfs diff=lfs merge=lfs -text
+testdata/person.jpg filter=lfs diff=lfs merge=lfs -text
+testdata/zidane.jpg filter=lfs diff=lfs merge=lfs -text
+testdata/camera720p.rgba filter=lfs diff=lfs merge=lfs -text
+testdata/camera720p.yuyv filter=lfs diff=lfs merge=lfs -text
+testdata/jaguar.jpg filter=lfs diff=lfs merge=lfs -text
 testdata/camera1080p.* filter=lfs diff=lfs merge=lfs -text
 testdata/camera4k.* filter=lfs diff=lfs merge=lfs -text
