@@ -1,10 +1,10 @@
 use pyo3::prelude::*;
 
+mod decoder;
 mod image;
 mod tensor;
-
 #[pymodule]
-mod edgefirst_python {
+pub mod edgefirst_python {
     use super::*;
 
     #[pymodule_init]
@@ -13,8 +13,9 @@ mod edgefirst_python {
 
         m.add_function(wrap_pyfunction!(version, m)?)?;
 
-        m.add_class::<tensor::PyTensor>()?;
-        m.add_class::<image::FourCC>()?;
+        // m.add_class::<tensor::PyTensor>()?;
+        // m.add_class::<image::FourCC>()?;
+        m.add_class::<decoder::PyDecoder>()?;
 
         Ok(())
     }

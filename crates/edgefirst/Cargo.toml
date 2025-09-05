@@ -16,3 +16,4 @@ ndarray = ["edgefirst-tensor/ndarray"]
 [dependencies]
 edgefirst-image = { version = "*", path = "../image" }
 edgefirst-tensor = { version = "*", path = "../tensor" }
+edgefirst-decoder = { version = "*", path = "../decoder" }
