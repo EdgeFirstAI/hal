@@ -1,7 +1,9 @@
 use divan::black_box_drop;
 use edgefirst_decoder::{
-    Quantization, decode_boxes_and_nms_f32, decode_boxes_and_nms_i8, decode_boxes_f32,
-    decode_boxes_i8, dequant_detect_box, dequantize_cpu, dequantize_cpu_chunked, nms_f32, nms_i16,
+    Quantization,
+    bits8::{decode_boxes_i8, decode_i8, nms_i16},
+    dequant_detect_box, dequantize_cpu, dequantize_cpu_chunked,
+    float::{decode_boxes_f32, decode_f32, nms_f32},
 };
 use ndarray::s;
 
@@ -70,19 +72,18 @@ fn decoder_quant(bencher: divan::Bencher) {
         scale: 0.0040811873,
         zero_point: -123i8,
     };
-    bencher
-        .with_inputs(|| ndarray::Array2::from_shape_vec((84, 8400), out.clone()).unwrap())
-        .bench_local_values(|out| {
-            let mut output_boxes: Vec<_> = Vec::with_capacity(50);
-            decode_boxes_and_nms_i8(
-                score_threshold,
-                iou_threshold,
-                out,
-                80,
-                &quant,
-                &mut output_boxes,
-            );
-        });
+    let out = ndarray::Array2::from_shape_vec((84, 8400), out).unwrap();
+    bencher.bench_local(|| {
+        let mut output_boxes: Vec<_> = Vec::with_capacity(50);
+        decode_i8(
+            out.view(),
+            80,
+            &quant,
+            score_threshold,
+            iou_threshold,
+            &mut output_boxes,
+        );
+    });
 }
 
 #[divan::bench()]
@@ -106,7 +107,13 @@ fn decoder_f32(bencher: divan::Bencher) {
             dequantize_cpu_chunked(&quant, &out, &mut buf);
             let mut output_boxes: Vec<_> = Vec::with_capacity(50);
             let out = ndarray::Array2::from_shape_vec((84, 8400), buf).unwrap();
-            decode_boxes_and_nms_f32(score_threshold, iou_threshold, out, 80, &mut output_boxes);
+            decode_f32(
+                out.view(),
+                80,
+                score_threshold,
+                iou_threshold,
+                &mut output_boxes,
+            );
             black_box_drop(output_boxes);
         });
 }
@@ -134,7 +141,7 @@ fn decoder_f32_dequantize(bencher: divan::Bencher) {
 }
 
 #[divan::bench()]
-fn decoder_f32_dequantize_simd(bencher: divan::Bencher) {
+fn decoder_f32_dequantize_chunked(bencher: divan::Bencher) {
     let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
     let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
     let out = out.to_vec();

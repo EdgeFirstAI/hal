@@ -9,7 +9,7 @@ use pyo3::ffi::Py_buffer;
 
 #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
 use std::ffi::{CString, c_int, c_void};
-use std::fmt;
+use std::{fmt, os::raw::c_char};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -681,16 +681,16 @@ impl TensorMap {
 
         // Create a memory view from the mapped buffer
         let ptr = match mapped {
-            TensorMapT::TensorU8(m) => m.as_ref().as_ptr() as *mut i8,
-            TensorMapT::TensorI8(m) => m.as_ref().as_ptr() as *mut i8,
-            TensorMapT::TensorU16(m) => m.as_ref().as_ptr() as *mut i8,
-            TensorMapT::TensorI16(m) => m.as_ref().as_ptr() as *mut i8,
-            TensorMapT::TensorU32(m) => m.as_ref().as_ptr() as *mut i8,
-            TensorMapT::TensorI32(m) => m.as_ref().as_ptr() as *mut i8,
-            TensorMapT::TensorU64(m) => m.as_ref().as_ptr() as *mut i8,
-            TensorMapT::TensorI64(m) => m.as_ref().as_ptr() as *mut i8,
-            TensorMapT::TensorF32(m) => m.as_ref().as_ptr() as *mut i8,
-            TensorMapT::TensorF64(m) => m.as_ref().as_ptr() as *mut i8,
+            TensorMapT::TensorU8(m) => m.as_ref().as_ptr() as *mut c_char,
+            TensorMapT::TensorI8(m) => m.as_ref().as_ptr() as *mut c_char,
+            TensorMapT::TensorU16(m) => m.as_ref().as_ptr() as *mut c_char,
+            TensorMapT::TensorI16(m) => m.as_ref().as_ptr() as *mut c_char,
+            TensorMapT::TensorU32(m) => m.as_ref().as_ptr() as *mut c_char,
+            TensorMapT::TensorI32(m) => m.as_ref().as_ptr() as *mut c_char,
+            TensorMapT::TensorU64(m) => m.as_ref().as_ptr() as *mut c_char,
+            TensorMapT::TensorI64(m) => m.as_ref().as_ptr() as *mut c_char,
+            TensorMapT::TensorF32(m) => m.as_ref().as_ptr() as *mut c_char,
+            TensorMapT::TensorF64(m) => m.as_ref().as_ptr() as *mut c_char,
         };
 
         let mem = unsafe {
