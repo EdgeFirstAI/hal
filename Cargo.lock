@@ -449,7 +449,6 @@ version = "0.0.0"
 dependencies = [
  "divan",
  "edgefirst-tensor",
- "enum_dispatch",
  "env_logger",
  "image",
  "log",

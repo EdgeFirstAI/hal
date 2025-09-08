@@ -1,11 +1,11 @@
-use crate::{DetectBox, DetectBoxQuantized, Quantization, dequant_detect_box};
+use crate::{BBoxTypeTrait, DetectBox, DetectBoxQuantized, Quantization, XYWH, dequant_detect_box};
 use ndarray::{
     ArrayView2, Zip,
     parallel::prelude::{IntoParallelIterator, ParallelIterator as _},
     s,
 };
 
-pub fn decode_u8(
+pub fn decode_u8<T: BBoxTypeTrait>(
     output: ArrayView2<u8>,
     num_classes: usize,
     quant: &Quantization<u8>,
@@ -16,7 +16,7 @@ pub fn decode_u8(
     let score_threshold = (score_threshold / quant.scale + quant.zero_point as f32) as u8;
     let boxes_tensor = output.slice(s![..4, ..,]);
     let scores_tensor = output.slice(s![4..(num_classes + 4), ..,]);
-    let boxes = decode_boxes_u8(
+    let boxes = decode_boxes_u8::<T>(
         score_threshold,
         scores_tensor,
         boxes_tensor,
@@ -31,7 +31,7 @@ pub fn decode_u8(
     }
 }
 
-pub fn decode_boxes_u8(
+pub fn decode_boxes_u8<T: BBoxTypeTrait>(
     threshold: u8,
     scores: ArrayView2<u8>,
     boxes: ArrayView2<u8>,
@@ -54,19 +54,21 @@ pub fn decode_boxes_u8(
             if score_ < threshold {
                 return None;
             }
+
+            let bbox_quant = T::ndarray_to_xyxy_quant(bbox, zp);
             Some(DetectBoxQuantized::<i16> {
                 label,
                 score: score_ as i16,
-                xmin: 2 * (bbox[0] as i16 - zp) - (bbox[2] as i16 - zp),
-                ymin: 2 * (bbox[1] as i16 - zp) - (bbox[3] as i16 - zp),
-                xmax: 2 * (bbox[0] as i16 - zp) + (bbox[2] as i16 - zp),
-                ymax: 2 * (bbox[1] as i16 - zp) + (bbox[3] as i16 - zp),
+                xmin: bbox_quant[0],
+                ymin: bbox_quant[1],
+                xmax: bbox_quant[2],
+                ymax: bbox_quant[3],
             })
         })
         .collect()
 }
 
-pub fn decode_i8(
+pub fn decode_i8<T: BBoxTypeTrait>(
     output: ArrayView2<i8>,
     num_classes: usize,
     quant: &Quantization<i8>,
@@ -77,7 +79,7 @@ pub fn decode_i8(
     let score_threshold = (score_threshold / quant.scale + quant.zero_point as f32) as i8;
     let boxes_tensor = output.slice(s![..4, ..,]);
     let scores_tensor = output.slice(s![4..(num_classes + 4), ..,]);
-    let boxes = decode_boxes_i8(
+    let boxes = decode_boxes_i8::<XYWH>(
         score_threshold,
         scores_tensor,
         boxes_tensor,
@@ -92,7 +94,7 @@ pub fn decode_i8(
     }
 }
 
-pub fn decode_boxes_i8(
+pub fn decode_boxes_i8<T: BBoxTypeTrait>(
     threshold: i8,
     scores: ArrayView2<i8>,
     boxes: ArrayView2<i8>,
@@ -115,13 +117,15 @@ pub fn decode_boxes_i8(
             if score_ < threshold {
                 return None;
             }
+
+            let bbox_quant = T::ndarray_to_xyxy_quant(bbox, zp);
             Some(DetectBoxQuantized::<i16> {
                 label,
                 score: score_ as i16,
-                xmin: 2 * (bbox[0] as i16 - zp) - (bbox[2] as i16 - zp),
-                ymin: 2 * (bbox[1] as i16 - zp) - (bbox[3] as i16 - zp),
-                xmax: 2 * (bbox[0] as i16 - zp) + (bbox[2] as i16 - zp),
-                ymax: 2 * (bbox[1] as i16 - zp) + (bbox[3] as i16 - zp),
+                xmin: bbox_quant[0],
+                ymin: bbox_quant[1],
+                xmax: bbox_quant[2],
+                ymax: bbox_quant[3],
             })
         })
         .collect()
