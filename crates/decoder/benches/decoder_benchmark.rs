@@ -1,6 +1,6 @@
 use divan::black_box_drop;
 use edgefirst_decoder::{
-    Quantization,
+    Quantization, XYWH,
     bits8::{decode_boxes_i8, decode_i8, nms_i16},
     dequant_detect_box, dequantize_cpu, dequantize_cpu_chunked,
     float::{decode_boxes_f32, decode_f32, nms_f32},
@@ -8,28 +8,50 @@ use edgefirst_decoder::{
 use ndarray::s;
 
 #[divan::bench()]
-fn decoder_decode_boxes(bencher: divan::Bencher) {
+fn decoder_quant(bencher: divan::Bencher) {
     let score_threshold = 0.25;
+    let iou_threshold = 0.70;
     let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
     let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
-    let out = out.to_vec();
+    let out = ndarray::Array2::from_shape_vec((84, 8400), out.to_vec()).unwrap();
     let quant = Quantization::<i8> {
         scale: 0.0040811873,
         zero_point: -123i8,
     };
-    bencher
-        .with_inputs(|| ndarray::Array2::from_shape_vec((84, 8400), out.clone()).unwrap())
-        .bench_local_values(|out| {
-            let score_threshold = (score_threshold / quant.scale + quant.zero_point as f32) as i8;
-            let boxes_tensor = out.slice(s![..4, ..,]);
-            let scores_tensor = out.slice(s![4..(80 + 4), ..,]);
-            let boxes = decode_boxes_i8(score_threshold, scores_tensor, boxes_tensor, 80, &quant);
-            black_box_drop(boxes);
-        });
+
+    bencher.bench_local(|| {
+        let mut output_boxes: Vec<_> = Vec::with_capacity(50);
+        decode_i8::<XYWH>(
+            out.view(),
+            80,
+            &quant,
+            score_threshold,
+            iou_threshold,
+            &mut output_boxes,
+        );
+    });
 }
 
 #[divan::bench()]
-fn decoder_nms(bencher: divan::Bencher) {
+fn decoder_quant_decode_boxes(bencher: divan::Bencher) {
+    let score_threshold = 0.25;
+    let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
+    let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
+    let out = ndarray::Array2::from_shape_vec((84, 8400), out.to_vec()).unwrap();
+    let quant = Quantization::<i8> {
+        scale: 0.0040811873,
+        zero_point: -123i8,
+    };
+    let score_threshold = (score_threshold / quant.scale + quant.zero_point as f32) as i8;
+    let boxes_tensor = out.slice(s![..4, ..,]);
+    let scores_tensor = out.slice(s![4..(80 + 4), ..,]);
+    bencher.bench_local(|| {
+        let _ = decode_boxes_i8::<XYWH>(score_threshold, scores_tensor, boxes_tensor, 80, &quant);
+    });
+}
+
+#[divan::bench()]
+fn decoder_quant_nms(bencher: divan::Bencher) {
     let score_threshold = 0.25;
     let iou_threshold = 0.70;
     let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
@@ -46,7 +68,7 @@ fn decoder_nms(bencher: divan::Bencher) {
     let score_threshold = (score_threshold / quant.scale + quant.zero_point as f32) as i8;
     let boxes_tensor = out.slice(s![..4, ..,]);
     let scores_tensor = out.slice(s![4..(80 + 4), ..,]);
-    let boxes = decode_boxes_i8(score_threshold, scores_tensor, boxes_tensor, 80, &quant);
+    let boxes = decode_boxes_i8::<XYWH>(score_threshold, scores_tensor, boxes_tensor, 80, &quant);
     bencher
         .with_inputs(|| boxes.clone())
         .bench_local_values(|boxes| {
@@ -57,33 +79,6 @@ fn decoder_nms(bencher: divan::Bencher) {
                 output_boxes.push(dequant_detect_box(b, &quant));
             }
         });
-}
-
-#[divan::bench()]
-fn decoder_quant(bencher: divan::Bencher) {
-    let score_threshold = 0.25;
-    let iou_threshold = 0.70;
-    let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
-    let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
-    let out = out.to_vec();
-    // let output = ndarray::Array2::from_shape_vec((84, 8400),
-    // output.clone()).unwrap();
-    let quant = Quantization::<i8> {
-        scale: 0.0040811873,
-        zero_point: -123i8,
-    };
-    let out = ndarray::Array2::from_shape_vec((84, 8400), out).unwrap();
-    bencher.bench_local(|| {
-        let mut output_boxes: Vec<_> = Vec::with_capacity(50);
-        decode_i8(
-            out.view(),
-            80,
-            &quant,
-            score_threshold,
-            iou_threshold,
-            &mut output_boxes,
-        );
-    });
 }
 
 #[divan::bench()]
@@ -107,7 +102,7 @@ fn decoder_f32(bencher: divan::Bencher) {
             dequantize_cpu_chunked(&quant, &out, &mut buf);
             let mut output_boxes: Vec<_> = Vec::with_capacity(50);
             let out = ndarray::Array2::from_shape_vec((84, 8400), buf).unwrap();
-            decode_f32(
+            decode_f32::<XYWH>(
                 out.view(),
                 80,
                 score_threshold,
@@ -183,7 +178,7 @@ fn decoder_f32_decode_boxes(bencher: divan::Bencher) {
             let out = ndarray::Array2::from_shape_vec((84, 8400), out).unwrap();
             let boxes_tensor = out.slice(s![..4, ..,]);
             let scores_tensor = out.slice(s![4..(80 + 4), ..,]);
-            let boxes = decode_boxes_f32(score_threshold, scores_tensor, boxes_tensor, 80);
+            let boxes = decode_boxes_f32::<XYWH>(score_threshold, scores_tensor, boxes_tensor, 80);
             black_box_drop(boxes);
         });
 }
@@ -206,7 +201,7 @@ fn decoder_f32_nms(bencher: divan::Bencher) {
     let out = ndarray::Array2::from_shape_vec((84, 8400), buf).unwrap();
     let boxes_tensor = out.slice(s![..4, ..,]);
     let scores_tensor = out.slice(s![4..(80 + 4), ..,]);
-    let boxes = decode_boxes_f32(score_threshold, scores_tensor, boxes_tensor, 80);
+    let boxes = decode_boxes_f32::<XYWH>(score_threshold, scores_tensor, boxes_tensor, 80);
     bencher
         .with_inputs(|| boxes.clone())
         .bench_local_values(|boxes| {

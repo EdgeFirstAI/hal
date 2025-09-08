@@ -1,13 +1,141 @@
 //! EdgeFirst HAL - Decoders
 use std::ops::{Add, Mul, Sub};
 
-use num_traits::AsPrimitive;
+use ndarray::ArrayView1;
+use num_traits::{AsPrimitive, Float, PrimInt};
 
 pub mod bits8;
 mod error;
 pub mod float;
 
 pub use error::Error;
+
+pub trait BBoxTypeTrait {
+    /// Converts the bbox into XYXY quantized format. The XYXY quantized values
+    /// are scaled to the zero point and and doubled. Doubled values ensure that
+    /// no rounding is needed when converting BBox formats that typically
+    /// require dividing some of the inputs by 2.
+    ///
+    /// Generally, A should be a wider, signed, integer type than B. This
+    /// ensures no over or under flow.
+    fn to_xyxy_quant<A: PrimInt + 'static, B: AsPrimitive<A>>(input: &[B; 4], zp: A) -> [A; 4];
+
+    /// Converts the bbox into XYXY float format.
+    fn to_xyxy_float<A: Float + 'static, B: AsPrimitive<A>>(input: &[B; 4]) -> [A; 4];
+
+    #[inline(always)]
+    /// Converts the bbox into XYXY quantized format. The XYXY quantized values
+    /// are scaled to the zero point and and doubled. Doubled values ensure that
+    /// no rounding is needed when converting BBox formats that typically
+    /// require dividing some of the inputs by 2.
+    ///
+    /// Generally, A should be a wider, signed, integer type than B. This
+    /// ensures no over or under flow.
+    fn ndarray_to_xyxy_quant<A: PrimInt + 'static, B: AsPrimitive<A>>(
+        input: ArrayView1<B>,
+        zp: A,
+    ) -> [A; 4] {
+        Self::to_xyxy_quant(&[input[0], input[1], input[2], input[3]], zp)
+    }
+
+    #[inline(always)]
+    /// Converts the bbox into XYXY float format.
+    fn ndarray_to_xyxy_float<A: Float + 'static, B: AsPrimitive<A>>(
+        input: ArrayView1<B>,
+    ) -> [A; 4] {
+        Self::to_xyxy_float(&[input[0], input[1], input[2], input[3]])
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XYXY {}
+
+impl BBoxTypeTrait for XYXY {
+    fn to_xyxy_quant<A: PrimInt + 'static, B: AsPrimitive<A>>(input: &[B; 4], zp: A) -> [A; 4] {
+        input.map(|b| (b.as_() - zp) << 1)
+    }
+
+    fn to_xyxy_float<A: Float + 'static, B: AsPrimitive<A>>(input: &[B; 4]) -> [A; 4] {
+        input.map(|b| b.as_())
+    }
+
+    #[inline(always)]
+    fn ndarray_to_xyxy_quant<A: PrimInt + 'static, B: AsPrimitive<A>>(
+        input: ArrayView1<B>,
+        zp: A,
+    ) -> [A; 4] {
+        [
+            (input[0].as_() - zp) << 1,
+            (input[1].as_() - zp) << 1,
+            (input[2].as_() - zp) << 1,
+            (input[3].as_() - zp) << 1,
+        ]
+    }
+
+    #[inline(always)]
+    fn ndarray_to_xyxy_float<A: Float + 'static, B: AsPrimitive<A>>(
+        input: ArrayView1<B>,
+    ) -> [A; 4] {
+        [
+            input[0].as_(),
+            input[1].as_(),
+            input[2].as_(),
+            input[3].as_(),
+        ]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XYWH {}
+
+impl BBoxTypeTrait for XYWH {
+    #[inline(always)]
+    fn to_xyxy_quant<A: PrimInt + 'static, B: AsPrimitive<A>>(input: &[B; 4], zp: A) -> [A; 4] {
+        [
+            ((input[0].as_() - zp) << 1) - (input[2].as_() - zp),
+            ((input[1].as_() - zp) << 1) - (input[3].as_() - zp),
+            ((input[0].as_() - zp) << 1) + (input[2].as_() - zp),
+            ((input[1].as_() - zp) << 1) + (input[3].as_() - zp),
+        ]
+    }
+
+    #[inline(always)]
+    fn to_xyxy_float<A: Float + 'static, B: AsPrimitive<A>>(input: &[B; 4]) -> [A; 4] {
+        let half = A::from(0.5).unwrap();
+        [
+            (input[0].as_()) - (input[2].as_() * half),
+            (input[1].as_()) - (input[3].as_() * half),
+            (input[0].as_()) + (input[2].as_() * half),
+            (input[1].as_()) + (input[3].as_() * half),
+        ]
+    }
+
+    #[inline(always)]
+    fn ndarray_to_xyxy_quant<A: PrimInt + 'static, B: AsPrimitive<A>>(
+        input: ArrayView1<B>,
+        zp: A,
+    ) -> [A; 4] {
+        [
+            ((input[0].as_() - zp) << 1) - (input[2].as_() - zp),
+            ((input[1].as_() - zp) << 1) - (input[3].as_() - zp),
+            ((input[0].as_() - zp) << 1) + (input[2].as_() - zp),
+            ((input[1].as_() - zp) << 1) + (input[3].as_() - zp),
+        ]
+    }
+
+    #[inline(always)]
+    fn ndarray_to_xyxy_float<A: Float + 'static, B: AsPrimitive<A>>(
+        input: ArrayView1<B>,
+    ) -> [A; 4] {
+        let half = A::from(0.5).unwrap();
+        [
+            (input[0].as_()) - (input[2].as_() * half),
+            (input[1].as_()) - (input[3].as_() * half),
+            (input[0].as_()) + (input[2].as_() * half),
+            (input[1].as_()) + (input[3].as_() * half),
+        ]
+    }
+}
 
 #[derive(Debug, Copy, Clone)]
 pub struct Quantization<T: AsPrimitive<f32>> {
@@ -245,7 +373,7 @@ mod tests {
             zero_point: -123i8,
         };
         let mut output_boxes: Vec<_> = Vec::with_capacity(50);
-        decode_i8(
+        decode_i8::<XYWH>(
             out.view(),
             80,
             &quant,
@@ -295,7 +423,7 @@ mod tests {
         let out = ndarray::Array2::from_shape_vec((84, 8400), out_dequant).unwrap();
 
         let mut output_boxes: Vec<_> = Vec::with_capacity(50);
-        decode_f32(
+        decode_f32::<XYWH>(
             out.view(),
             80,
             score_threshold,
