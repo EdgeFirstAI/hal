@@ -44,6 +44,14 @@ pub enum PyBBoxType {
     Xywh = 1,
 }
 
+#[pymethods]
+impl PyBBoxType {
+    #[getter]
+    fn value(&self) -> isize {
+        self.__pyo3__int__()
+    }
+}
+
 #[derive(Default)]
 #[pyclass(name = "Decoder")]
 pub struct PyDecoder();

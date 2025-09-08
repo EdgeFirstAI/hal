@@ -4,9 +4,12 @@ import numpy.typing as npt
 from typing import Union
 
 
-class BBoxType(Enum):
-    XYXY = 0
-    XYWH = 1
+class BBoxType:
+    XYXY: BBoxType
+    XYWH: BBoxType
+
+    @property
+    def value(self) -> int: ...
 
 
 class Decoder:
