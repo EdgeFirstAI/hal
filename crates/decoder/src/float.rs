@@ -1,11 +1,11 @@
-use crate::{DetectBox, DetectBoxF64};
+use crate::{BBoxTypeTrait, DetectBox, DetectBoxF64};
 use ndarray::{
     ArrayView2, Zip,
     parallel::prelude::{IntoParallelIterator, ParallelIterator as _},
     s,
 };
 
-pub fn decode_f32(
+pub fn decode_f32<T: BBoxTypeTrait>(
     output: ArrayView2<f32>,
     num_classes: usize,
     score_threshold: f32,
@@ -15,17 +15,17 @@ pub fn decode_f32(
     let boxes_tensor = output.slice(s![..4, ..,]);
     let scores_tensor = output.slice(s![4..(num_classes + 4), ..,]);
 
-    let boxes = decode_boxes_f32(score_threshold, scores_tensor, boxes_tensor, num_classes);
+    let boxes = decode_boxes_f32::<T>(score_threshold, scores_tensor, boxes_tensor, num_classes);
 
     let boxes = nms_f32(iou_threshold, boxes);
     let len = output_boxes.capacity().min(boxes.len());
     output_boxes.clear();
     for b in boxes.into_iter().take(len) {
-        output_boxes.push(b.into());
+        output_boxes.push(b);
     }
 }
 
-pub fn decode_boxes_f32(
+pub fn decode_boxes_f32<T: BBoxTypeTrait>(
     threshold: f32,
     scores: ArrayView2<f32>,
     boxes: ArrayView2<f32>,
@@ -46,13 +46,15 @@ pub fn decode_boxes_f32(
             if score_ < threshold {
                 return None;
             }
+
+            let bbox = T::ndarray_to_xyxy_float(bbox);
             Some(DetectBox {
                 label,
                 score: score_,
-                xmin: bbox[0] - bbox[2] * 0.5,
-                ymin: bbox[1] - bbox[3] * 0.5,
-                xmax: bbox[0] + bbox[2] * 0.5,
-                ymax: bbox[1] + bbox[3] * 0.5,
+                xmin: bbox[0],
+                ymin: bbox[1],
+                xmax: bbox[2],
+                ymax: bbox[3],
             })
         })
         .collect()
@@ -102,7 +104,7 @@ fn jaccard_f32(a: &DetectBox, b: &DetectBox) -> f32 {
     intersection / union
 }
 
-pub fn decode_f64(
+pub fn decode_f64<T: BBoxTypeTrait>(
     output: ArrayView2<f64>,
     num_classes: usize,
     score_threshold: f64,
@@ -112,7 +114,7 @@ pub fn decode_f64(
     let boxes_tensor = output.slice(s![..4, ..,]);
     let scores_tensor = output.slice(s![4..(num_classes + 4), ..,]);
 
-    let boxes = decode_boxes_f64(score_threshold, scores_tensor, boxes_tensor, num_classes);
+    let boxes = decode_boxes_f64::<T>(score_threshold, scores_tensor, boxes_tensor, num_classes);
 
     let boxes = nms_f64(iou_threshold, boxes);
     let len = output_boxes.capacity().min(boxes.len());
@@ -122,7 +124,7 @@ pub fn decode_f64(
     }
 }
 
-pub fn decode_boxes_f64(
+pub fn decode_boxes_f64<T: BBoxTypeTrait>(
     threshold: f64,
     scores: ArrayView2<f64>,
     boxes: ArrayView2<f64>,
@@ -143,13 +145,14 @@ pub fn decode_boxes_f64(
             if score_ < threshold {
                 return None;
             }
+            let bbox = T::ndarray_to_xyxy_float(bbox);
             Some(DetectBoxF64 {
                 label,
                 score: score_,
-                xmin: bbox[0] - bbox[2] * 0.5,
-                ymin: bbox[1] - bbox[3] * 0.5,
-                xmax: bbox[0] + bbox[2] * 0.5,
-                ymax: bbox[1] + bbox[3] * 0.5,
+                xmin: bbox[0],
+                ymin: bbox[1],
+                xmax: bbox[2],
+                ymax: bbox[3],
             })
         })
         .collect()
