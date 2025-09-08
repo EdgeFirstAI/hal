@@ -1,6 +1,5 @@
 import edgefirst_python
 import numpy as np
-print(edgefirst_python.BBoxType.XYWH)
 boxes, scores, classes = edgefirst_python.Decoder.decode_i8(
     np.fromfile('../../testdata/yolov8s_80_classes.bin',
                 dtype=np.int8).reshape(84, 8400),
