@@ -1,7 +1,7 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 use edgefirst::decoder::{
-    BBoxTypeTrait, DetectBox, DetectBoxF64, Quantization, QuantizationF64, XYWH, XYXY,
-    dequantize_cpu_chunked, dequantize_cpu_chunked_f64,
+    DetectBox, DetectBoxF64, Quantization, QuantizationF64, XYWH, XYXY, dequantize_cpu_chunked,
+    dequantize_cpu_chunked_f64,
 };
 use ndarray::{Array1, Array2};
 use numpy::{
@@ -67,11 +67,10 @@ impl PyDecoder {
     // }
 
     #[staticmethod]
-    #[pyo3(signature = (model_output, num_classes, scale=1.0, zero_point=0, score_threshold=0.1, iou_threshold=0.7, max_boxes=100, bbox_type=PyBBoxType::Xyxy))]
+    #[pyo3(signature = (model_output, scale=1.0, zero_point=0, score_threshold=0.1, iou_threshold=0.7, max_boxes=100, bbox_type=PyBBoxType::Xyxy))]
     pub fn decode<'py>(
         py: Python<'py>,
         model_output: ReadOnlyArrayGeneric2,
-        num_classes: usize,
         scale: f64,
         zero_point: i64,
         score_threshold: f64,
@@ -83,7 +82,6 @@ impl PyDecoder {
             ReadOnlyArrayGeneric2::UInt8(output) => Self::decode_u8(
                 py,
                 output,
-                num_classes,
                 scale as f32,
                 u8::try_from(zero_point)?,
                 score_threshold as f32,
@@ -94,7 +92,6 @@ impl PyDecoder {
             ReadOnlyArrayGeneric2::Int8(output) => Self::decode_i8(
                 py,
                 output,
-                num_classes,
                 scale as f32,
                 i8::try_from(zero_point)?,
                 score_threshold as f32,
@@ -105,7 +102,6 @@ impl PyDecoder {
             ReadOnlyArrayGeneric2::Float32(output) => Self::decode_f32(
                 py,
                 output,
-                num_classes,
                 score_threshold as f32,
                 iou_threshold as f32,
                 max_boxes,
@@ -114,7 +110,6 @@ impl PyDecoder {
             ReadOnlyArrayGeneric2::Float64(output) => Self::decode_f64(
                 py,
                 output,
-                num_classes,
                 score_threshold,
                 iou_threshold,
                 max_boxes,
@@ -125,11 +120,10 @@ impl PyDecoder {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (model_output, num_classes, scale, zero_point, score_threshold=0.1, iou_threshold=0.7, max_boxes=100, bbox_type=PyBBoxType::Xyxy))]
+    #[pyo3(signature = (model_output, scale, zero_point, score_threshold=0.1, iou_threshold=0.7, max_boxes=100, bbox_type=PyBBoxType::Xyxy))]
     pub fn decode_u8<'py>(
         py: Python<'py>,
         model_output: PyReadonlyArray2<u8>,
-        num_classes: usize,
         scale: f32,
         zero_point: u8,
         score_threshold: f32,
@@ -139,12 +133,11 @@ impl PyDecoder {
     ) -> PyBoxesOutput<'py> {
         let mut output_boxes = Vec::with_capacity(max_boxes);
         let func = match bbox_type {
-            PyBBoxType::Xyxy => edgefirst::decoder::bits8::decode_u8::<XYXY>,
-            PyBBoxType::Xywh => edgefirst::decoder::bits8::decode_u8::<XYWH>,
+            PyBBoxType::Xyxy => edgefirst::decoder::yolo::decode_yolo_u8::<XYXY>,
+            PyBBoxType::Xywh => edgefirst::decoder::yolo::decode_yolo_u8::<XYWH>,
         };
         func(
             model_output.as_array(),
-            num_classes,
             &Quantization { zero_point, scale },
             score_threshold,
             iou_threshold,
@@ -154,11 +147,10 @@ impl PyDecoder {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (model_output, num_classes, scale, zero_point, score_threshold=0.1, iou_threshold=0.7, max_boxes=100, bbox_type=PyBBoxType::Xyxy))]
+    #[pyo3(signature = (model_output, scale, zero_point, score_threshold=0.1, iou_threshold=0.7, max_boxes=100, bbox_type=PyBBoxType::Xyxy))]
     pub fn decode_i8<'py>(
         py: Python<'py>,
         model_output: PyReadonlyArray2<i8>,
-        num_classes: usize,
         scale: f32,
         zero_point: i8,
         score_threshold: f32,
@@ -168,12 +160,11 @@ impl PyDecoder {
     ) -> PyBoxesOutput<'py> {
         let mut output_boxes = Vec::with_capacity(max_boxes);
         let func = match bbox_type {
-            PyBBoxType::Xyxy => edgefirst::decoder::bits8::decode_i8::<XYXY>,
-            PyBBoxType::Xywh => edgefirst::decoder::bits8::decode_i8::<XYWH>,
+            PyBBoxType::Xyxy => edgefirst::decoder::yolo::decode_yolo_i8::<XYXY>,
+            PyBBoxType::Xywh => edgefirst::decoder::yolo::decode_yolo_i8::<XYWH>,
         };
         func(
             model_output.as_array(),
-            num_classes,
             &Quantization { zero_point, scale },
             score_threshold,
             iou_threshold,
@@ -183,11 +174,10 @@ impl PyDecoder {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (model_output, num_classes, score_threshold=0.1, iou_threshold=0.7, max_boxes=100, bbox_type=PyBBoxType::Xyxy))]
+    #[pyo3(signature = (model_output, score_threshold=0.1, iou_threshold=0.7, max_boxes=100, bbox_type=PyBBoxType::Xyxy))]
     pub fn decode_f32<'py>(
         py: Python<'py>,
         model_output: PyReadonlyArray2<f32>,
-        num_classes: usize,
         score_threshold: f32,
         iou_threshold: f32,
         max_boxes: usize,
@@ -195,12 +185,11 @@ impl PyDecoder {
     ) -> PyBoxesOutput<'py> {
         let mut output_boxes = Vec::with_capacity(max_boxes);
         let func = match bbox_type {
-            PyBBoxType::Xyxy => edgefirst::decoder::float::decode_f32::<XYXY>,
-            PyBBoxType::Xywh => edgefirst::decoder::float::decode_f32::<XYWH>,
+            PyBBoxType::Xyxy => edgefirst::decoder::yolo::decode_yolo_f32::<XYXY>,
+            PyBBoxType::Xywh => edgefirst::decoder::yolo::decode_yolo_f32::<XYWH>,
         };
         func(
             model_output.as_array(),
-            num_classes,
             score_threshold,
             iou_threshold,
             &mut output_boxes,
@@ -209,11 +198,10 @@ impl PyDecoder {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (model_output, num_classes, score_threshold=0.1, iou_threshold=0.7, max_boxes=100, bbox_type=PyBBoxType::Xyxy))]
+    #[pyo3(signature = (model_output, score_threshold=0.1, iou_threshold=0.7, max_boxes=100, bbox_type=PyBBoxType::Xyxy))]
     pub fn decode_f64<'py>(
         py: Python<'py>,
         model_output: PyReadonlyArray2<f64>,
-        num_classes: usize,
         score_threshold: f64,
         iou_threshold: f64,
         max_boxes: usize,
@@ -221,12 +209,11 @@ impl PyDecoder {
     ) -> PyBoxesOutput<'py> {
         let mut output_boxes = Vec::with_capacity(max_boxes);
         let func = match bbox_type {
-            PyBBoxType::Xyxy => edgefirst::decoder::float::decode_f64::<XYXY>,
-            PyBBoxType::Xywh => edgefirst::decoder::float::decode_f64::<XYWH>,
+            PyBBoxType::Xyxy => edgefirst::decoder::yolo::decode_yolo_f64::<XYXY>,
+            PyBBoxType::Xywh => edgefirst::decoder::yolo::decode_yolo_f64::<XYWH>,
         };
         func(
             model_output.as_array(),
-            num_classes,
             score_threshold,
             iou_threshold,
             &mut output_boxes,

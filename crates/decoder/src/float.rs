@@ -1,48 +1,21 @@
-use crate::{BBoxTypeTrait, DetectBox, DetectBoxF64};
+use crate::{BBoxTypeTrait, DetectBox, DetectBoxF64, arg_max};
 use ndarray::{
-    ArrayView2, Zip,
+    ArrayView1, ArrayView2, Zip,
     parallel::prelude::{IntoParallelIterator, ParallelIterator as _},
-    s,
 };
 
-pub fn decode_f32<T: BBoxTypeTrait>(
-    output: ArrayView2<f32>,
-    num_classes: usize,
-    score_threshold: f32,
-    iou_threshold: f32,
-    output_boxes: &mut Vec<DetectBox>,
-) {
-    let boxes_tensor = output.slice(s![..4, ..,]);
-    let scores_tensor = output.slice(s![4..(num_classes + 4), ..,]);
-
-    let boxes = decode_boxes_f32::<T>(score_threshold, scores_tensor, boxes_tensor, num_classes);
-
-    let boxes = nms_f32(iou_threshold, boxes);
-    let len = output_boxes.capacity().min(boxes.len());
-    output_boxes.clear();
-    for b in boxes.into_iter().take(len) {
-        output_boxes.push(b);
-    }
-}
-
-pub fn decode_boxes_f32<T: BBoxTypeTrait>(
+pub fn postprocess_boxes_f32<T: BBoxTypeTrait>(
     threshold: f32,
-    scores: ArrayView2<f32>,
     boxes: ArrayView2<f32>,
-    num_classes: usize,
+    scores: ArrayView2<f32>,
 ) -> Vec<DetectBox> {
-    assert_eq!(scores.len() / num_classes, boxes.len() / 4);
-    Zip::from(scores.columns())
-        .and(boxes.columns())
+    assert_eq!(scores.dim().0, boxes.dim().0);
+    assert_eq!(boxes.dim().1, 4);
+    Zip::from(scores.rows())
+        .and(boxes.rows())
         .into_par_iter()
         .filter_map(|(score, bbox)| {
-            let (score_, label) =
-                score
-                    .iter()
-                    .enumerate()
-                    .fold((score[0], 0), |(max, arg_max), (ind, s)| {
-                        if max > *s { (max, arg_max) } else { (*s, ind) }
-                    });
+            let (score_, label) = arg_max(score);
             if score_ < threshold {
                 return None;
             }
@@ -56,6 +29,40 @@ pub fn decode_boxes_f32<T: BBoxTypeTrait>(
                 xmax: bbox[2],
                 ymax: bbox[3],
             })
+        })
+        .collect()
+}
+
+pub fn postprocess_boxes_extra_f32<'a, T: BBoxTypeTrait>(
+    threshold: f32,
+    boxes: ArrayView2<f32>,
+    scores: ArrayView2<f32>,
+    extra: &'a ArrayView2<f32>,
+) -> Vec<(DetectBox, ArrayView1<'a, f32>)> {
+    assert_eq!(scores.dim().0, boxes.dim().0);
+    assert_eq!(boxes.dim().1, 4);
+    Zip::from(scores.rows())
+        .and(boxes.rows())
+        .and(extra.rows())
+        .into_par_iter()
+        .filter_map(|(score, bbox, mask)| {
+            let (score_, label) = arg_max(score);
+            if score_ < threshold {
+                return None;
+            }
+
+            let bbox = T::ndarray_to_xyxy_float(bbox);
+            Some((
+                DetectBox {
+                    label,
+                    score: score_,
+                    xmin: bbox[0],
+                    ymin: bbox[1],
+                    xmax: bbox[2],
+                    ymax: bbox[3],
+                },
+                mask,
+            ))
         })
         .collect()
 }
@@ -88,6 +95,37 @@ pub fn nms_f32(iou: f32, mut boxes: Vec<DetectBox>) -> Vec<DetectBox> {
     boxes.into_iter().filter(|b| b.score > 0.0).collect()
 }
 
+pub fn nms_extra_f32(
+    iou: f32,
+    mut boxes: Vec<(DetectBox, ArrayView1<f32>)>,
+) -> Vec<(DetectBox, ArrayView1<f32>)> {
+    // Boxes get sorted by score in descending order so we know based on the
+    // index the scoring of the boxes and can skip parts of the loop.
+    boxes.sort_by(|a, b| b.0.score.total_cmp(&a.0.score));
+    // Outer loop over all boxes.
+    for i in 0..boxes.len() {
+        if boxes[i].0.score <= 0.0 {
+            // this box was merged with a different box earlier
+            continue;
+        }
+        for j in (i + 1)..boxes.len() {
+            // Inner loop over boxes with lower score (later in the list).
+
+            if boxes[j].0.score <= 0.0 {
+                // this box was suppressed by different box earlier
+                continue;
+            }
+            if jaccard_f32(&boxes[j].0, &boxes[i].0) > iou {
+                // max_box(boxes[j].bbox, &mut boxes[i].bbox);
+                boxes[j].0.score = 0.0;
+            }
+        }
+    }
+
+    // Filter out boxes with a score of 0.0.
+    boxes.into_iter().filter(|b| b.0.score > 0.0).collect()
+}
+
 fn jaccard_f32(a: &DetectBox, b: &DetectBox) -> f32 {
     let left = a.xmin.max(b.xmin);
     let top = a.ymin.max(b.ymin);
@@ -104,35 +142,16 @@ fn jaccard_f32(a: &DetectBox, b: &DetectBox) -> f32 {
     intersection / union
 }
 
-pub fn decode_f64<T: BBoxTypeTrait>(
-    output: ArrayView2<f64>,
-    num_classes: usize,
-    score_threshold: f64,
-    iou_threshold: f64,
-    output_boxes: &mut Vec<DetectBoxF64>,
-) {
-    let boxes_tensor = output.slice(s![..4, ..,]);
-    let scores_tensor = output.slice(s![4..(num_classes + 4), ..,]);
-
-    let boxes = decode_boxes_f64::<T>(score_threshold, scores_tensor, boxes_tensor, num_classes);
-
-    let boxes = nms_f64(iou_threshold, boxes);
-    let len = output_boxes.capacity().min(boxes.len());
-    output_boxes.clear();
-    for b in boxes.into_iter().take(len) {
-        output_boxes.push(b);
-    }
-}
-
-pub fn decode_boxes_f64<T: BBoxTypeTrait>(
+pub fn postprocess_boxes_f64<T: BBoxTypeTrait>(
     threshold: f64,
-    scores: ArrayView2<f64>,
     boxes: ArrayView2<f64>,
-    num_classes: usize,
+    scores: ArrayView2<f64>,
 ) -> Vec<DetectBoxF64> {
-    assert_eq!(scores.len() / num_classes, boxes.len() / 4);
-    Zip::from(scores.columns())
-        .and(boxes.columns())
+    assert_eq!(scores.dim().0, boxes.dim().0);
+    assert_eq!(boxes.dim().1, 4);
+
+    Zip::from(scores.rows())
+        .and(boxes.rows())
         .into_par_iter()
         .filter_map(|(score, bbox)| {
             let (score_, label) =

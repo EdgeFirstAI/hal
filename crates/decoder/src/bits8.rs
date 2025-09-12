@@ -1,56 +1,23 @@
-use crate::{BBoxTypeTrait, DetectBox, DetectBoxQuantized, Quantization, XYWH, dequant_detect_box};
+use crate::{BBoxTypeTrait, DetectBoxQuantized, Quantization, arg_max};
 use ndarray::{
     ArrayView2, Zip,
     parallel::prelude::{IntoParallelIterator, ParallelIterator as _},
-    s,
 };
 
-pub fn decode_u8<T: BBoxTypeTrait>(
-    output: ArrayView2<u8>,
-    num_classes: usize,
-    quant: &Quantization<u8>,
-    score_threshold: f32,
-    iou_threshold: f32,
-    output_boxes: &mut Vec<DetectBox>,
-) {
-    let score_threshold = (score_threshold / quant.scale + quant.zero_point as f32) as u8;
-    let boxes_tensor = output.slice(s![..4, ..,]);
-    let scores_tensor = output.slice(s![4..(num_classes + 4), ..,]);
-    let boxes = decode_boxes_u8::<T>(
-        score_threshold,
-        scores_tensor,
-        boxes_tensor,
-        num_classes,
-        quant,
-    );
-    let boxes = nms_i16(iou_threshold, boxes);
-    let len = output_boxes.capacity().min(boxes.len());
-    output_boxes.clear();
-    for b in boxes.iter().take(len) {
-        output_boxes.push(dequant_detect_box(b, quant));
-    }
-}
-
-pub fn decode_boxes_u8<T: BBoxTypeTrait>(
+pub fn postprocess_boxes_u8<T: BBoxTypeTrait>(
     threshold: u8,
-    scores: ArrayView2<u8>,
     boxes: ArrayView2<u8>,
-    num_classes: usize,
+    scores: ArrayView2<u8>,
     quant: &Quantization<u8>,
 ) -> Vec<DetectBoxQuantized<i16>> {
-    assert_eq!(scores.len() / num_classes, boxes.len() / 4);
+    assert_eq!(scores.dim().0, boxes.dim().0);
+    assert_eq!(boxes.dim().1, 4);
     let zp = quant.zero_point as i16;
-    Zip::from(scores.columns())
-        .and(boxes.columns())
+    Zip::from(scores.rows())
+        .and(boxes.rows())
         .into_par_iter()
         .filter_map(|(score, bbox)| {
-            let (score_, label) =
-                score
-                    .iter()
-                    .enumerate()
-                    .fold((score[0], 0), |(max, arg_max), (ind, s)| {
-                        if max > *s { (max, arg_max) } else { (*s, ind) }
-                    });
+            let (score_, label) = arg_max(score);
             if score_ < threshold {
                 return None;
             }
@@ -68,52 +35,20 @@ pub fn decode_boxes_u8<T: BBoxTypeTrait>(
         .collect()
 }
 
-pub fn decode_i8<T: BBoxTypeTrait>(
-    output: ArrayView2<i8>,
-    num_classes: usize,
-    quant: &Quantization<i8>,
-    score_threshold: f32,
-    iou_threshold: f32,
-    output_boxes: &mut Vec<DetectBox>,
-) {
-    let score_threshold = (score_threshold / quant.scale + quant.zero_point as f32) as i8;
-    let boxes_tensor = output.slice(s![..4, ..,]);
-    let scores_tensor = output.slice(s![4..(num_classes + 4), ..,]);
-    let boxes = decode_boxes_i8::<XYWH>(
-        score_threshold,
-        scores_tensor,
-        boxes_tensor,
-        num_classes,
-        quant,
-    );
-    let boxes = nms_i16(iou_threshold, boxes);
-    let len = output_boxes.capacity().min(boxes.len());
-    output_boxes.clear();
-    for b in boxes.iter().take(len) {
-        output_boxes.push(dequant_detect_box(b, quant));
-    }
-}
-
-pub fn decode_boxes_i8<T: BBoxTypeTrait>(
+pub fn postprocess_boxes_i8<T: BBoxTypeTrait>(
     threshold: i8,
-    scores: ArrayView2<i8>,
     boxes: ArrayView2<i8>,
-    num_classes: usize,
+    scores: ArrayView2<i8>,
     quant: &Quantization<i8>,
 ) -> Vec<DetectBoxQuantized<i16>> {
-    assert_eq!(scores.len() / num_classes, boxes.len() / 4);
+    assert_eq!(scores.dim().0, boxes.dim().0);
+    assert_eq!(boxes.dim().1, 4);
     let zp = quant.zero_point as i16;
-    Zip::from(scores.columns())
-        .and(boxes.columns())
+    Zip::from(scores.rows())
+        .and(boxes.rows())
         .into_par_iter()
         .filter_map(|(score, bbox)| {
-            let (score_, label) =
-                score
-                    .iter()
-                    .enumerate()
-                    .fold((score[0], 0), |(max, arg_max), (ind, s)| {
-                        if max > *s { (max, arg_max) } else { (*s, ind) }
-                    });
+            let (score_, label) = arg_max(score);
             if score_ < threshold {
                 return None;
             }

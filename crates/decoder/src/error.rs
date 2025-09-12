@@ -3,10 +3,13 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug)]
 pub enum Error {
     Io(std::io::Error),
-    Tensor(edgefirst_tensor::Error),
     NotImplemented(String),
     NotSupported(String),
     InvalidShape(String),
+    Yaml(serde_yaml::Error),
+    Json(serde_json::Error),
+    NoConfig,
+    InvalidConfig(String),
 }
 
 impl From<std::io::Error> for Error {
@@ -15,8 +18,14 @@ impl From<std::io::Error> for Error {
     }
 }
 
-impl From<edgefirst_tensor::Error> for Error {
-    fn from(err: edgefirst_tensor::Error) -> Self {
-        Error::Tensor(err)
+impl From<serde_yaml::Error> for Error {
+    fn from(err: serde_yaml::Error) -> Self {
+        Error::Yaml(err)
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(err: serde_json::Error) -> Self {
+        Error::Json(err)
     }
 }
