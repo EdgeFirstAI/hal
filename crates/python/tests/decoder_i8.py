@@ -1,6 +1,6 @@
 import edgefirst_python
 import numpy as np
-boxes, scores, classes = edgefirst_python.Decoder.decode_i8(
+boxes, scores, classes = edgefirst_python.Decoder.decode_yolo_i8(
     np.fromfile('../../testdata/yolov8s_80_classes.bin',
                 dtype=np.int8).reshape(84, 8400),
     0.0040811873,
