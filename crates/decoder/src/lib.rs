@@ -1,12 +1,18 @@
 //! EdgeFirst HAL - Decoders
+#![allow(clippy::excessive_precision)]
 use std::ops::{Add, Mul, Sub};
 
-use ndarray::ArrayView1;
+use ndarray::{Array, Array3, ArrayView, ArrayView1, Dimension};
 use num_traits::{AsPrimitive, Float, PrimInt};
 
 pub mod bits8;
-mod error;
+pub mod error;
 pub mod float;
+pub mod modelpack;
+pub mod yolo;
+
+mod decoder;
+pub use decoder::*;
 
 pub use error::Error;
 
@@ -29,8 +35,8 @@ pub trait BBoxTypeTrait {
     /// no rounding is needed when converting BBox formats that typically
     /// require dividing some of the inputs by 2.
     ///
-    /// Generally, A should be a wider, signed, integer type than B. This
-    /// ensures no over or under flow.
+    /// Generally, A should be a signed integer type wider than B. This
+    /// ensures no overflow or underflow errors.
     fn ndarray_to_xyxy_quant<A: PrimInt + 'static, B: AsPrimitive<A>>(
         input: ArrayView1<B>,
         zp: A,
@@ -143,6 +149,33 @@ pub struct Quantization<T: AsPrimitive<f32>> {
     pub zero_point: T,
 }
 
+impl From<[f32; 2]> for Quantization<i8> {
+    fn from(value: [f32; 2]) -> Self {
+        Quantization {
+            scale: value[0],
+            zero_point: value[1] as i8,
+        }
+    }
+}
+
+impl From<[f32; 2]> for Quantization<u8> {
+    fn from(value: [f32; 2]) -> Self {
+        Quantization {
+            scale: value[0],
+            zero_point: value[1] as u8,
+        }
+    }
+}
+
+impl From<[f32; 2]> for Quantization<f32> {
+    fn from(value: [f32; 2]) -> Self {
+        Quantization {
+            scale: value[0],
+            zero_point: value[1],
+        }
+    }
+}
+
 #[derive(Debug, Copy, Clone)]
 pub struct QuantizationF64<T: AsPrimitive<f64>> {
     pub scale: f64,
@@ -151,33 +184,33 @@ pub struct QuantizationF64<T: AsPrimitive<f64>> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct DetectBox {
-    #[doc = " left-most normalized coordinate of the bounding box."]
+    /// left-most normalized coordinate of the bounding box
     pub xmin: f32,
-    #[doc = " top-most normalized coordinate of the bounding box."]
+    /// top-most normalized coordinate of the bounding box
     pub ymin: f32,
-    #[doc = " right-most normalized coordinate of the bounding box."]
+    /// right-most normalized coordinate of the bounding box
     pub xmax: f32,
-    #[doc = " bottom-most normalized coordinate of the bounding box."]
+    /// bottom-most normalized coordinate of the bounding box
     pub ymax: f32,
-    #[doc = " model-specific score for this detection, higher implies more confidence."]
+    /// model-specific score for this detection, higher implies more confidence
     pub score: f32,
-    #[doc = " label index for this detection, text representation can be retrived using\n @ref VAALContext::vaal_label()"]
+    /// label index for this detection
     pub label: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct DetectBoxF64 {
-    #[doc = " left-most normalized coordinate of the bounding box."]
+    /// left-most normalized coordinate of the bounding box
     pub xmin: f64,
-    #[doc = " top-most normalized coordinate of the bounding box."]
+    /// top-most normalized coordinate of the bounding box
     pub ymin: f64,
-    #[doc = " right-most normalized coordinate of the bounding box."]
+    /// right-most normalized coordinate of the bounding box
     pub xmax: f64,
-    #[doc = " bottom-most normalized coordinate of the bounding box."]
+    /// bottom-most normalized coordinate of the bounding box
     pub ymax: f64,
-    #[doc = " model-specific score for this detection, higher implies more confidence."]
+    /// model-specific score for this detection, higher implies more confidence
     pub score: f64,
-    #[doc = " label index for this detection, text representation can be retrived using\n @ref VAALContext::vaal_label()"]
+    /// label index for this detection
     pub label: usize,
 }
 
@@ -195,37 +228,72 @@ impl DetectBox {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SegmentationMask {
+    /// left-most normalized coordinate of the segmentation box
+    pub xmin: f32,
+    /// top-most normalized coordinate of the segmentation box
+    pub ymin: f32,
+    /// right-most normalized coordinate of the segmentation box
+    pub xmax: f32,
+    /// bottom-most normalized coordinate of the segmentation box
+    pub ymax: f32,
+    /// 3D mask array. If the last dimension is 1, values above 128 are
+    /// considered objects. Otherwise the object is the argmax index
+    pub mask: Array3<u8>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DetectBoxQuantized<T: Clone + Mul + Add + Sub + Ord + AsPrimitive<f32>> {
-    #[doc = " 2x the left-most coordinate of the bounding box. Should already be scaled to zero point"]
+    /// 2x the left-most coordinate of the bounding box. Should already be
+    /// scaled to zero point
     pub xmin: T,
-    #[doc = " 2x top-most coordinate of the bounding box. Should already be scaled to zero point"]
+    /// 2x top-most coordinate of the bounding box. Should already be scaled to
+    /// zero point
     pub ymin: T,
-    #[doc = " 2x right-most coordinate of the bounding box. Should already be scaled to zero point"]
+    /// 2x right-most coordinate of the bounding box. Should already be scaled
+    /// to zero point
     pub xmax: T,
-    #[doc = " 2x bottom-most coordinate of the bounding box. Should already be scaled to zero point"]
+    /// 2x bottom-most coordinate of the bounding box. Should already be scaled
+    /// to zero point
     pub ymax: T,
-    #[doc = " model-specific score for this detection, higher implies more confidence."]
+    /// model-specific score for this detection, higher implies more
+    /// confidence.
     pub score: T,
-    #[doc = " label index for this detection, text representation can be retrived using\n @ref VAALContext::vaal_label()"]
+    /// label index for this detect
     pub label: usize,
 }
 
 pub fn dequant_detect_box<
     T: Clone + Mul + Add + Sub + Ord + AsPrimitive<f32>,
-    Q: AsPrimitive<f32>,
+    Q: AsPrimitive<f32> + std::fmt::Debug,
 >(
     detect: &DetectBoxQuantized<T>,
-    quant: &Quantization<Q>,
+    quant_boxes: &Quantization<Q>,
+    quant_scores: &Quantization<Q>,
 ) -> DetectBox {
-    let scaled_zp = -quant.scale * quant.zero_point.as_();
+    let scaled_zp = -quant_scores.scale * quant_scores.zero_point.as_();
     DetectBox {
-        xmin: quant.scale * detect.xmin.as_() * 0.5,
-        ymin: quant.scale * detect.ymin.as_() * 0.5,
-        xmax: quant.scale * detect.xmax.as_() * 0.5,
-        ymax: quant.scale * detect.ymax.as_() * 0.5,
-        score: quant.scale * detect.score.as_() + scaled_zp,
+        xmin: quant_boxes.scale * detect.xmin.as_() * 0.5,
+        ymin: quant_boxes.scale * detect.ymin.as_() * 0.5,
+        xmax: quant_boxes.scale * detect.xmax.as_() * 0.5,
+        ymax: quant_boxes.scale * detect.ymax.as_() * 0.5,
+        score: quant_scores.scale * detect.score.as_() + scaled_zp,
         label: detect.label,
+    }
+}
+
+pub fn dequantize_ndarray<T: AsPrimitive<f32>, D: Dimension>(
+    quant: &Quantization<T>,
+    input: ArrayView<T, D>,
+) -> Array<f32, D> {
+    let zero_point = quant.zero_point.as_();
+    let scale = quant.scale;
+    if zero_point != 0.0 {
+        let scaled_zero = -zero_point * scale; // scale * (d - zero_point) = d * scale - zero_point * scale
+        input.mapv(|d| d.as_() * scale + scaled_zero)
+    } else {
+        input.mapv(|d| d.as_() * scale)
     }
 }
 
@@ -357,12 +425,24 @@ pub fn dequantize_cpu_chunked_f64<T: AsPrimitive<f64>>(
     }
 }
 
+fn arg_max<T: PartialOrd + Copy>(score: ArrayView1<T>) -> (T, usize) {
+    score
+        .iter()
+        .enumerate()
+        .fold((score[0], 0), |(max, arg_max), (ind, s)| {
+            if max > *s { (max, arg_max) } else { (*s, ind) }
+        })
+}
 #[cfg(test)]
 mod tests {
-    use crate::{bits8::decode_i8, float::decode_f32, *};
+    use crate::{
+        modelpack::{ModelPackDetectionConfig, decode_modelpack_split, decode_modelpack_u8},
+        yolo::{decode_yolo_f32, decode_yolo_i8, decode_yolo_masks_f32},
+        *,
+    };
 
     #[test]
-    fn test_decoder_i8() {
+    fn test_decoder_yolo_i8() {
         let score_threshold = 0.25;
         let iou_threshold = 0.7;
         let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
@@ -373,9 +453,8 @@ mod tests {
             zero_point: -123i8,
         };
         let mut output_boxes: Vec<_> = Vec::with_capacity(50);
-        decode_i8::<XYWH>(
+        decode_yolo_i8::<XYWH>(
             out.view(),
-            80,
             &quant,
             score_threshold,
             iou_threshold,
@@ -408,7 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decoder_f32() {
+    fn test_decoder_yolo_f32() {
         let score_threshold = 0.25;
         let iou_threshold = 0.7;
         let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
@@ -423,9 +502,8 @@ mod tests {
         let out = ndarray::Array2::from_shape_vec((84, 8400), out_dequant).unwrap();
 
         let mut output_boxes: Vec<_> = Vec::with_capacity(50);
-        decode_f32::<XYWH>(
+        decode_yolo_f32::<XYWH>(
             out.view(),
-            80,
             score_threshold,
             iou_threshold,
             &mut output_boxes,
@@ -457,6 +535,148 @@ mod tests {
     }
 
     #[test]
+    fn test_decoder_modelpack_u8() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+        let boxes = include_bytes!("../../../testdata/modelpack_boxes_1935x1x4.bin");
+        let boxes = ndarray::Array2::from_shape_vec((1935, 4), boxes.to_vec()).unwrap();
+
+        let scores = include_bytes!("../../../testdata/modelpack_scores_1935x1.bin");
+        let scores = ndarray::Array2::from_shape_vec((1935, 1), scores.to_vec()).unwrap();
+
+        let quant_boxes = Quantization::<u8> {
+            scale: 0.004656755365431309,
+            zero_point: 21,
+        };
+
+        let quant_scores = Quantization::<u8> {
+            scale: 0.0019603664986789227,
+            zero_point: 0,
+        };
+
+        let mut output_boxes: Vec<_> = Vec::with_capacity(50);
+        decode_modelpack_u8::<XYXY>(
+            boxes.view(),
+            scores.view(),
+            &quant_boxes,
+            &quant_scores,
+            score_threshold,
+            iou_threshold,
+            &mut output_boxes,
+        );
+        println!("output_boxes {output_boxes:?}");
+        assert!(output_boxes[0].equal_within_delta(
+            &DetectBox {
+                xmin: 0.40513772,
+                ymin: 0.6379755,
+                xmax: 0.5122431,
+                ymax: 0.7730214,
+                score: 0.4861709,
+                label: 0
+            },
+            1e-6
+        ));
+    }
+
+    #[test]
+    fn test_decoder_modelpack_split_u8() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+        let detect0 = include_bytes!("../../../testdata/modelpack_split_9x15x18.bin");
+        let detect0 = ndarray::Array3::from_shape_vec((9, 15, 18), detect0.to_vec()).unwrap();
+        let config0 = ModelPackDetectionConfig {
+            anchors: vec![
+                [0.36666667461395264, 0.31481480598449707],
+                [0.38749998807907104, 0.4740740656852722],
+                [0.5333333611488342, 0.644444465637207],
+            ],
+            quantization: Some(Quantization {
+                scale: 0.08547406643629074,
+                zero_point: 174,
+            }),
+        };
+
+        let detect1 = include_bytes!("../../../testdata/modelpack_split_17x30x18.bin");
+        let detect1 = ndarray::Array3::from_shape_vec((17, 30, 18), detect1.to_vec()).unwrap();
+        let config1 = ModelPackDetectionConfig {
+            anchors: vec![
+                [0.13750000298023224, 0.2074074000120163],
+                [0.2541666626930237, 0.21481481194496155],
+                [0.23125000298023224, 0.35185185074806213],
+            ],
+            quantization: Some(Quantization {
+                scale: 0.09929127991199493,
+                zero_point: 183,
+            }),
+        };
+
+        let mut output_boxes: Vec<_> = Vec::with_capacity(2);
+        decode_modelpack_split::<XYWH, _>(
+            &[detect0.view(), detect1.view()],
+            &[config0, config1],
+            score_threshold,
+            iou_threshold,
+            &mut output_boxes,
+        );
+
+        println!("output_boxes {output_boxes:?}");
+        assert!(output_boxes[0].equal_within_delta(
+            &DetectBox {
+                xmin: 0.43171933,
+                ymin: 0.68243736,
+                xmax: 0.5626645,
+                ymax: 0.808863,
+                score: 0.49577647,
+                label: 0
+            },
+            1e-6
+        ));
+    }
+
+    #[test]
+    fn test_decoder_parse_config_modelpack_split_u8() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+        let detect0 = include_bytes!("../../../testdata/modelpack_split_9x15x18.bin");
+        let detect0 = ndarray::Array4::from_shape_vec((1, 9, 15, 18), detect0.to_vec()).unwrap();
+
+        let detect1 = include_bytes!("../../../testdata/modelpack_split_17x30x18.bin");
+        let detect1 = ndarray::Array4::from_shape_vec((1, 17, 30, 18), detect1.to_vec()).unwrap();
+
+        let decoder = DecoderBuilder::default()
+            .with_config_yaml_str(
+                include_str!("../../../testdata/modelpack_split.yaml").to_string(),
+            )
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .build()
+            .unwrap();
+
+        let mut output_boxes: Vec<_> = Vec::with_capacity(10);
+        let mut output_masks: Vec<_> = Vec::with_capacity(10);
+        decoder
+            .decode_u8(
+                &[detect1.view().into_dyn(), detect0.view().into_dyn()],
+                &mut output_boxes,
+                &mut output_masks,
+            )
+            .unwrap();
+
+        println!("output_boxes {output_boxes:?}");
+        assert!(output_boxes[0].equal_within_delta(
+            &DetectBox {
+                xmin: 0.43171933,
+                ymin: 0.68243736,
+                xmax: 0.5626645,
+                ymax: 0.808863,
+                score: 0.49577647,
+                label: 0
+            },
+            1e-6
+        ));
+    }
+
+    #[test]
     fn test_dequant_chunked() {
         let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
         let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
@@ -471,5 +691,48 @@ mod tests {
         dequantize_cpu_chunked(&quant, out, &mut out_dequant_simd);
 
         assert_eq!(out_dequant, out_dequant_simd);
+    }
+
+    #[test]
+    fn test_decoder_masks() {
+        let score_threshold = 0.001;
+        let iou_threshold = 0.70;
+        let seg = include_bytes!("../../../testdata/yolov8_segmentation_37x8400.bin");
+        let seg = unsafe { std::slice::from_raw_parts(seg.as_ptr() as *const i8, seg.len()) };
+        let seg = ndarray::Array2::from_shape_vec((37, 8400), seg.to_vec()).unwrap();
+        let seg_quant = Quantization::<i8> {
+            scale: 0.01948494464159012,
+            zero_point: 20,
+        };
+
+        let protos = include_bytes!("../../../testdata/yolov8_protos_160x160x32.bin");
+        let protos =
+            unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
+        let protos = ndarray::Array3::from_shape_vec((160, 160, 32), protos.to_vec()).unwrap();
+        let protos_quant = Quantization::<i8> {
+            scale: 0.020889872685074806,
+            zero_point: -115,
+        };
+
+        let protos = dequantize_ndarray(&protos_quant, protos.view());
+        let seg = dequantize_ndarray(&seg_quant, seg.view());
+        let mut output_boxes: Vec<_> = Vec::with_capacity(10);
+        let mut output_masks: Vec<_> = Vec::with_capacity(10);
+        decode_yolo_masks_f32::<XYWH>(
+            seg.view(),
+            protos.view(),
+            score_threshold,
+            iou_threshold,
+            &mut output_boxes,
+            &mut output_masks,
+        );
+
+        assert_eq!(output_boxes.len(), output_masks.len());
+        for (b, m) in output_boxes.iter().zip(output_masks) {
+            assert!(b.xmin >= m.xmin);
+            assert!(b.ymin >= m.ymin);
+            assert!(b.xmax >= m.xmax);
+            assert!(b.ymax >= m.ymax);
+        }
     }
 }
