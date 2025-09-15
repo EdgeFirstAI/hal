@@ -7,7 +7,10 @@ use ndarray_stats::QuantileExt;
 
 use crate::{
     BBoxTypeTrait, DetectBox, DetectBoxF64, Quantization, SegmentationMask,
-    bits8::{nms_i16, postprocess_boxes_i8, postprocess_boxes_u8},
+    bits8::{
+        nms_extra_i16, nms_i16, postprocess_boxes_extra_i8, postprocess_boxes_i8,
+        postprocess_boxes_u8, quantize_score_threshold,
+    },
     dequant_detect_box,
     float::{
         nms_extra_f32, nms_f32, nms_f64, postprocess_boxes_extra_f32, postprocess_boxes_f32,
@@ -22,7 +25,7 @@ pub fn decode_yolo_u8<T: BBoxTypeTrait>(
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
 ) {
-    let score_threshold = (score_threshold / quant.scale + quant.zero_point as f32) as u8;
+    let score_threshold = quantize_score_threshold(score_threshold, quant);
     let (boxes_tensor, scores_tensor) = postprocess_yolo(&output);
     let boxes = postprocess_boxes_u8::<T>(score_threshold, boxes_tensor, scores_tensor, quant);
     let boxes = nms_i16(iou_threshold, boxes);
@@ -40,7 +43,7 @@ pub fn decode_yolo_i8<T: BBoxTypeTrait>(
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
 ) {
-    let score_threshold = (score_threshold / quant.scale + quant.zero_point as f32) as i8;
+    let score_threshold = quantize_score_threshold(score_threshold, quant);
     let (boxes_tensor, scores_tensor) = postprocess_yolo(&output);
     let boxes = postprocess_boxes_i8::<T>(score_threshold, boxes_tensor, scores_tensor, quant);
     let boxes = nms_i16(iou_threshold, boxes);
@@ -92,15 +95,57 @@ pub fn postprocess_yolo<'a, T>(
     (boxes_tensor, scores_tensor)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn decode_yolo_masks_i8<T: BBoxTypeTrait>(
+    boxes: ArrayView2<i8>,
+    protos: ArrayView3<i8>,
+    quant_boxes: &Quantization<i8>,
+    quant_protos: &Quantization<i8>,
+    score_threshold: f32,
+    iou_threshold: f32,
+    output_boxes: &mut Vec<DetectBox>,
+    output_masks: &mut Vec<SegmentationMask>,
+) {
+    let score_threshold = quantize_score_threshold(score_threshold, quant_boxes);
+    let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&boxes);
+
+    let boxes = postprocess_boxes_extra_i8::<T, _>(
+        score_threshold,
+        boxes_tensor,
+        scores_tensor,
+        &mask_tensor,
+        quant_boxes,
+    );
+    let mut boxes = nms_extra_i16(iou_threshold, boxes);
+    boxes.truncate(output_boxes.capacity());
+    let boxes = boxes
+        .into_iter()
+        .map(|(b, m)| (dequant_detect_box(&b, quant_boxes, quant_boxes), m))
+        .collect();
+    let boxes = decode_masks_i8(boxes, protos, quant_boxes, quant_protos);
+    output_boxes.clear();
+    output_masks.clear();
+    for (b, m) in boxes.into_iter() {
+        output_boxes.push(b);
+        output_masks.push(SegmentationMask {
+            xmin: b.xmin,
+            ymin: b.ymin,
+            xmax: b.xmax,
+            ymax: b.ymax,
+            mask: m,
+        });
+    }
+}
+
 pub fn decode_yolo_masks_f32<T: BBoxTypeTrait>(
-    output: ArrayView2<f32>,
+    boxes: ArrayView2<f32>,
     protos: ArrayView3<f32>,
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<SegmentationMask>,
 ) {
-    let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&output);
+    let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&boxes);
 
     let boxes = postprocess_boxes_extra_f32::<T>(
         score_threshold,
@@ -157,10 +202,33 @@ pub fn decode_masks_f32(
         .collect()
 }
 
-pub fn protobox<'a>(
-    protos: &'a ArrayView3<f32>,
-    roi: &[f32; 4],
-) -> (ArrayView3<'a, f32>, [f32; 4]) {
+pub fn decode_masks_i8(
+    boxes: Vec<(DetectBox, ArrayView1<i8>)>,
+    protos: ArrayView3<i8>,
+    quant_boxes: &Quantization<i8>,
+    quant_protos: &Quantization<i8>,
+) -> Vec<(DetectBox, Array3<u8>)> {
+    if boxes.is_empty() {
+        return Vec::new();
+    }
+    boxes
+        .into_par_iter()
+        .map(|mut b| {
+            let mask = &b.1;
+            let (protos, roi) = protobox(&protos, &[b.0.xmin, b.0.ymin, b.0.xmax, b.0.ymax]);
+            b.0.xmin = roi[0];
+            b.0.ymin = roi[1];
+            b.0.xmax = roi[2];
+            b.0.ymax = roi[3];
+            (
+                b.0,
+                make_mask_i8(mask.view(), protos.view(), quant_boxes, quant_protos),
+            )
+        })
+        .collect()
+}
+
+pub fn protobox<'a, T>(protos: &'a ArrayView3<T>, roi: &[f32; 4]) -> (ArrayView3<'a, T>, [f32; 4]) {
     let width = protos.dim().1 as f32;
     let height = protos.dim().0 as f32;
 
@@ -202,4 +270,30 @@ pub fn make_mask(mask: ArrayView1<f32>, protos: ArrayView3<f32>) -> Array3<u8> {
     let max = mask.max_skipnan();
 
     mask.map(|x| ((x - min) / max * 255.0) as u8)
+}
+
+pub fn make_mask_i8(
+    mask: ArrayView1<i8>,
+    protos: ArrayView3<i8>,
+    quant_boxes: &Quantization<i8>,
+    quant_protos: &Quantization<i8>,
+) -> Array3<u8> {
+    let shape = protos.shape();
+    let mask = mask.to_shape((1, mask.len())).unwrap();
+    let scaled_zero_mask = -quant_boxes.zero_point as f32 * quant_boxes.scale;
+
+    let protos = protos.to_shape([shape[0] * shape[1], shape[2]]).unwrap();
+    let protos = protos.reversed_axes();
+    let scaled_zero_protos = -quant_protos.zero_point as f32 * quant_protos.scale;
+
+    let mask = mask
+        .mapv(|x| x as f32 * quant_boxes.scale + scaled_zero_mask)
+        .dot(&protos.mapv(|x| x as f32 * quant_protos.scale + scaled_zero_protos))
+        .into_shape_with_order((shape[0], shape[1], 1))
+        .unwrap();
+
+    let min = mask.min_skipnan();
+    let max = mask.max_skipnan();
+
+    mask.map(|x| ((x - min) / *max * 255.0) as u8)
 }

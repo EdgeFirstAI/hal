@@ -1,5 +1,6 @@
 //! EdgeFirst HAL - Decoders
 #![allow(clippy::excessive_precision)]
+#![feature(f16)]
 use std::ops::{Add, Mul, Sub};
 
 use ndarray::{Array, Array3, ArrayView, ArrayView1, Dimension};
@@ -435,9 +436,10 @@ fn arg_max<T: PartialOrd + Copy>(score: ArrayView1<T>) -> (T, usize) {
 }
 #[cfg(test)]
 mod tests {
+
     use crate::{
         modelpack::{ModelPackDetectionConfig, decode_modelpack_split, decode_modelpack_u8},
-        yolo::{decode_yolo_f32, decode_yolo_i8, decode_yolo_masks_f32},
+        yolo::{decode_yolo_f32, decode_yolo_i8, decode_yolo_masks_f32, decode_yolo_masks_i8},
         *,
     };
 
@@ -696,11 +698,11 @@ mod tests {
     #[test]
     fn test_decoder_masks() {
         let score_threshold = 0.001;
-        let iou_threshold = 0.70;
-        let seg = include_bytes!("../../../testdata/yolov8_segmentation_37x8400.bin");
-        let seg = unsafe { std::slice::from_raw_parts(seg.as_ptr() as *const i8, seg.len()) };
-        let seg = ndarray::Array2::from_shape_vec((37, 8400), seg.to_vec()).unwrap();
-        let seg_quant = Quantization::<i8> {
+        let iou_threshold = 0.60;
+        let boxes = include_bytes!("../../../testdata/yolov8_segmentation_37x8400.bin");
+        let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
+        let boxes = ndarray::Array2::from_shape_vec((37, 8400), boxes.to_vec()).unwrap();
+        let quant_boxes = Quantization::<i8> {
             scale: 0.01948494464159012,
             zero_point: 20,
         };
@@ -709,13 +711,13 @@ mod tests {
         let protos =
             unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
         let protos = ndarray::Array3::from_shape_vec((160, 160, 32), protos.to_vec()).unwrap();
-        let protos_quant = Quantization::<i8> {
+        let quant_protos = Quantization::<i8> {
             scale: 0.020889872685074806,
             zero_point: -115,
         };
 
-        let protos = dequantize_ndarray(&protos_quant, protos.view());
-        let seg = dequantize_ndarray(&seg_quant, seg.view());
+        let protos = dequantize_ndarray(&quant_protos, protos.view());
+        let seg = dequantize_ndarray(&quant_boxes, boxes.view());
         let mut output_boxes: Vec<_> = Vec::with_capacity(10);
         let mut output_masks: Vec<_> = Vec::with_capacity(10);
         decode_yolo_masks_f32::<XYWH>(
@@ -734,5 +736,64 @@ mod tests {
             assert!(b.xmax >= m.xmax);
             assert!(b.ymax >= m.ymax);
         }
+    }
+
+    #[test]
+    fn test_decoder_masks_i8() {
+        let score_threshold = 0.001;
+        let iou_threshold = 0.60;
+        let boxes = include_bytes!("../../../testdata/yolov8_segmentation_37x8400.bin");
+        let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
+        let boxes = ndarray::Array2::from_shape_vec((37, 8400), boxes.to_vec()).unwrap();
+        let quant_boxes = Quantization::<i8> {
+            scale: 0.01948494464159012,
+            zero_point: 20,
+        };
+
+        let protos = include_bytes!("../../../testdata/yolov8_protos_160x160x32.bin");
+        let protos =
+            unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
+        let protos = ndarray::Array3::from_shape_vec((160, 160, 32), protos.to_vec()).unwrap();
+        let quant_protos = Quantization::<i8> {
+            scale: 0.020889872685074806,
+            zero_point: -115,
+        };
+        let mut output_boxes: Vec<_> = Vec::with_capacity(500);
+        let mut output_masks: Vec<_> = Vec::with_capacity(500);
+
+        decode_yolo_masks_i8::<XYWH>(
+            boxes.view(),
+            protos.view(),
+            &quant_boxes,
+            &quant_protos,
+            score_threshold,
+            iou_threshold,
+            &mut output_boxes,
+            &mut output_masks,
+        );
+
+        let protos = dequantize_ndarray(&quant_protos, protos.view());
+        let seg = dequantize_ndarray(&quant_boxes, boxes.view());
+        let mut output_boxes_f32: Vec<_> = Vec::with_capacity(500);
+        let mut output_masks_f32: Vec<_> = Vec::with_capacity(500);
+        decode_yolo_masks_f32::<XYWH>(
+            seg.view(),
+            protos.view(),
+            score_threshold,
+            iou_threshold,
+            &mut output_boxes_f32,
+            &mut output_masks_f32,
+        );
+
+        assert_eq!(output_boxes.len(), output_boxes_f32.len());
+        assert_eq!(output_masks.len(), output_masks_f32.len());
+
+        for (b_i8, b_f32) in output_boxes.iter().zip(&output_boxes_f32) {
+            assert!(
+                b_i8.equal_within_delta(b_f32, 1e-6),
+                "{b_i8:?} is not equal to {b_f32:?}"
+            );
+        }
+        assert_eq!(output_masks, output_masks_f32);
     }
 }

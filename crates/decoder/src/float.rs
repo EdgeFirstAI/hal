@@ -84,7 +84,7 @@ pub fn nms_f32(iou: f32, mut boxes: Vec<DetectBox>) -> Vec<DetectBox> {
                 // this box was suppressed by different box earlier
                 continue;
             }
-            if jaccard_f32(&boxes[j], &boxes[i]) > iou {
+            if jaccard_f32(&boxes[j], &boxes[i], iou) {
                 // max_box(boxes[j].bbox, &mut boxes[i].bbox);
                 boxes[j].score = 0.0;
             }
@@ -115,7 +115,7 @@ pub fn nms_extra_f32(
                 // this box was suppressed by different box earlier
                 continue;
             }
-            if jaccard_f32(&boxes[j].0, &boxes[i].0) > iou {
+            if jaccard_f32(&boxes[j].0, &boxes[i].0, iou) {
                 // max_box(boxes[j].bbox, &mut boxes[i].bbox);
                 boxes[j].0.score = 0.0;
             }
@@ -126,7 +126,8 @@ pub fn nms_extra_f32(
     boxes.into_iter().filter(|b| b.0.score > 0.0).collect()
 }
 
-fn jaccard_f32(a: &DetectBox, b: &DetectBox) -> f32 {
+// Returns true if the IOU of the given boxes are greater than the iou threshold
+fn jaccard_f32(a: &DetectBox, b: &DetectBox, iou: f32) -> bool {
     let left = a.xmin.max(b.xmin);
     let top = a.ymin.max(b.ymin);
     let right = a.xmax.min(b.xmax);
@@ -139,7 +140,7 @@ fn jaccard_f32(a: &DetectBox, b: &DetectBox) -> f32 {
     // need to make sure we are not dividing by zero
     let union = (area_a + area_b - intersection).max(0.0000001);
 
-    intersection / union
+    intersection / union > iou
 }
 
 pub fn postprocess_boxes_f64<T: BBoxTypeTrait>(
@@ -194,7 +195,7 @@ pub fn nms_f64(iou: f64, mut boxes: Vec<DetectBoxF64>) -> Vec<DetectBoxF64> {
                 // this box was suppressed by different box earlier
                 continue;
             }
-            if jaccard_f64(&boxes[j], &boxes[i]) > iou {
+            if jaccard_f64(&boxes[j], &boxes[i], iou) {
                 // max_box(boxes[j].bbox, &mut boxes[i].bbox);
                 boxes[j].score = 0.0;
             }
@@ -205,7 +206,8 @@ pub fn nms_f64(iou: f64, mut boxes: Vec<DetectBoxF64>) -> Vec<DetectBoxF64> {
     boxes.into_iter().filter(|b| b.score > 0.0).collect()
 }
 
-fn jaccard_f64(a: &DetectBoxF64, b: &DetectBoxF64) -> f64 {
+// Returns true if the IOU of the given boxes are greater than the iou threshold
+fn jaccard_f64(a: &DetectBoxF64, b: &DetectBoxF64, iou: f64) -> bool {
     let left = a.xmin.max(b.xmin);
     let top = a.ymin.max(b.ymin);
     let right = a.xmax.min(b.xmax);
@@ -218,5 +220,5 @@ fn jaccard_f64(a: &DetectBoxF64, b: &DetectBoxF64) -> f64 {
     // need to make sure we are not dividing by zero
     let union = (area_a + area_b - intersection).max(0.000000001);
 
-    intersection / union
+    intersection / union > iou
 }
