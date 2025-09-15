@@ -3,7 +3,7 @@ use num_traits::AsPrimitive;
 
 use crate::{
     BBoxTypeTrait, DetectBox, Detection, Quantization,
-    bits8::{nms_i16, postprocess_boxes_i8, postprocess_boxes_u8},
+    bits8::{nms_i16, postprocess_boxes_i8, postprocess_boxes_u8, quantize_score_threshold},
     dequant_detect_box,
     error::Result,
     float::{nms_f32, postprocess_boxes_f32},
@@ -41,8 +41,7 @@ pub fn decode_modelpack_i8<T: BBoxTypeTrait>(
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
 ) {
-    let score_threshold =
-        (score_threshold / quant_scores.scale + quant_scores.zero_point as f32) as i8;
+    let score_threshold = quantize_score_threshold(score_threshold, quant_scores);
     let boxes =
         postprocess_boxes_i8::<T>(score_threshold, boxes_tensor, scores_tensor, quant_boxes);
     let boxes = nms_i16(iou_threshold, boxes);
@@ -62,8 +61,7 @@ pub fn decode_modelpack_u8<T: BBoxTypeTrait>(
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
 ) {
-    let score_threshold =
-        (score_threshold / quant_scores.scale + quant_scores.zero_point as f32) as u8;
+    let score_threshold = quantize_score_threshold(score_threshold, quant_scores);
     let boxes =
         postprocess_boxes_u8::<T>(score_threshold, boxes_tensor, scores_tensor, quant_boxes);
     let boxes = nms_i16(iou_threshold, boxes);
