@@ -43,7 +43,7 @@ pub fn postprocess_boxes_extra_8bit<
     'a,
     B: BBoxTypeTrait,
     T: PrimInt + AsPrimitive<i16> + AsPrimitive<f32> + Send + Sync,
-    E: Send + Sync + PrimInt,
+    E: Send + Sync,
 >(
     threshold: T,
     boxes: ArrayView2<T>,

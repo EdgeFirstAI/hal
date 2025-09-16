@@ -441,7 +441,7 @@ mod tests {
             zero_point: -123i8,
         };
         let mut output_boxes: Vec<_> = Vec::with_capacity(50);
-        decode_yolo_i8::<XYWH>(
+        decode_yolo_i8(
             out.view(),
             &quant,
             score_threshold,
@@ -490,7 +490,7 @@ mod tests {
         let out = ndarray::Array2::from_shape_vec((84, 8400), out_dequant).unwrap();
 
         let mut output_boxes: Vec<_> = Vec::with_capacity(50);
-        decode_yolo_f32::<XYWH>(
+        decode_yolo_f32(
             out.view(),
             score_threshold,
             iou_threshold,
@@ -543,7 +543,7 @@ mod tests {
         };
 
         let mut output_boxes: Vec<_> = Vec::with_capacity(50);
-        decode_modelpack_u8::<XYXY>(
+        decode_modelpack_u8(
             boxes.view(),
             scores.view(),
             &quant_boxes,
@@ -599,7 +599,7 @@ mod tests {
         };
 
         let mut output_boxes: Vec<_> = Vec::with_capacity(2);
-        decode_modelpack_split::<XYWH, _>(
+        decode_modelpack_split(
             &[detect0.view(), detect1.view()],
             &[config0, config1],
             score_threshold,
@@ -706,7 +706,7 @@ mod tests {
         let seg = dequantize_ndarray(&quant_boxes, boxes.view());
         let mut output_boxes: Vec<_> = Vec::with_capacity(10);
         let mut output_masks: Vec<_> = Vec::with_capacity(10);
-        decode_yolo_masks_f32::<XYWH>(
+        decode_yolo_masks_f32(
             seg.view(),
             protos.view(),
             score_threshold,
@@ -747,7 +747,7 @@ mod tests {
         let mut output_boxes: Vec<_> = Vec::with_capacity(500);
         let mut output_masks: Vec<_> = Vec::with_capacity(500);
 
-        decode_yolo_masks_i8::<XYWH>(
+        decode_yolo_masks_i8(
             boxes.view(),
             protos.view(),
             &quant_boxes,
@@ -762,7 +762,7 @@ mod tests {
         let seg = dequantize_ndarray(&quant_boxes, boxes.view());
         let mut output_boxes_f32: Vec<_> = Vec::with_capacity(500);
         let mut output_masks_f32: Vec<_> = Vec::with_capacity(500);
-        decode_yolo_masks_f32::<XYWH>(
+        decode_yolo_masks_f32(
             seg.view(),
             protos.view(),
             score_threshold,

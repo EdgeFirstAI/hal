@@ -7,5 +7,4 @@ boxes, scores, classes = edgefirst_python.Decoder.decode_yolo_i8(
     -123,
     0.25,
     0.7,
-    50,
-    edgefirst_python.BBoxType.XYWH)
+    50)
