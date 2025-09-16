@@ -1,12 +1,11 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 use edgefirst::decoder::{
-    Decoder, DecoderBuilder, DetectBox, DetectBoxF64, Quantization, QuantizationF64,
-    SegmentationMask, XYWH, XYXY, dequantize_cpu_chunked, dequantize_cpu_chunked_f64,
-    dequantize_ndarray,
+    Decoder, DecoderBuilder, DetectBox, Quantization, QuantizationF64, SegmentationMask, XYWH,
+    XYXY, dequantize_cpu_chunked, dequantize_cpu_chunked_f64, dequantize_ndarray,
 };
 use ndarray::{Array1, Array2};
 use numpy::{
-    IntoPyArray, PyArray1, PyArray2, PyArray3, PyArray4, PyReadonlyArray2, PyReadonlyArray3,
+    IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray2, PyReadonlyArray3,
     PyReadonlyArrayDyn, PyReadwriteArrayDyn, ToPyArray,
 };
 use pyo3::{Bound, FromPyObject, PyRef, PyResult, Python, pyclass, pymethods};
@@ -308,7 +307,7 @@ impl PyDecoder {
             iou_threshold,
             &mut output_boxes,
         );
-        convert_detect_box_f64(py, &output_boxes)
+        convert_detect_box(py, &output_boxes)
     }
 
     #[staticmethod]
@@ -488,28 +487,6 @@ fn convert_detect_box<'py>(py: Python<'py>, output_boxes: &[DetectBox]) -> PyDet
     let boxes = Array2::from_shape_vec((num_boxes, 4), boxes).unwrap();
     let scores = Array1::from_vec(scores);
     let classes = Array1::from_vec(classes);
-    (
-        boxes.into_pyarray(py),
-        scores.into_pyarray(py),
-        classes.into_pyarray(py),
-    )
-}
-
-fn convert_detect_box_f64<'py>(py: Python<'py>, output_boxes: &[DetectBoxF64]) -> PyDetOutput<'py> {
-    let boxes = output_boxes
-        .iter()
-        .flat_map(|b| [b.xmin as f32, b.ymin as f32, b.xmax as f32, b.ymax as f32])
-        .collect::<Vec<_>>();
-    let scores = output_boxes
-        .iter()
-        .map(|b| b.score as f32)
-        .collect::<Vec<_>>();
-    let classes = output_boxes.iter().map(|b| b.label).collect::<Vec<_>>();
-    let num_boxes = output_boxes.len();
-    let boxes = Array2::from_shape_vec((num_boxes, 4), boxes).unwrap();
-    let scores = Array1::from_vec(scores);
-    let classes = Array1::from_vec(classes);
-    // let py = self_.py();
     (
         boxes.into_pyarray(py),
         scores.into_pyarray(py),

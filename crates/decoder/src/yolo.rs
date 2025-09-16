@@ -7,14 +7,14 @@ use ndarray_stats::QuantileExt;
 use num_traits::{AsPrimitive, PrimInt};
 
 use crate::{
-    BBoxTypeTrait, DetectBox, DetectBoxF64, Quantization, SegmentationMask,
+    BBoxTypeTrait, DetectBox, Quantization, SegmentationMask,
     byte::{
         nms_extra_i16, nms_i16, postprocess_boxes_8bit, postprocess_boxes_extra_8bit,
         quantize_score_threshold,
     },
     dequant_detect_box,
     float::{
-        nms_extra_f32, nms_f32, nms_f64, postprocess_boxes_extra_f32, postprocess_boxes_f32,
+        nms_extra_f32, nms_f32, postprocess_boxes_extra_f32, postprocess_boxes_f32,
         postprocess_boxes_f64,
     },
 };
@@ -26,20 +26,71 @@ pub fn decode_yolo_u8<B: BBoxTypeTrait>(
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
 ) {
-    let score_threshold = quantize_score_threshold(score_threshold, quant);
-    let (boxes_tensor, scores_tensor) = postprocess_yolo(&output);
-    let boxes = postprocess_boxes_8bit::<B, _>(score_threshold, boxes_tensor, scores_tensor, quant);
-    let boxes = nms_i16(iou_threshold, boxes);
-    let len = output_boxes.capacity().min(boxes.len());
-    output_boxes.clear();
-    for b in boxes.iter().take(len) {
-        output_boxes.push(dequant_detect_box(b, quant, quant));
-    }
+    decode_yolo_8bit::<B, u8>(output, quant, score_threshold, iou_threshold, output_boxes);
 }
 
 pub fn decode_yolo_i8<B: BBoxTypeTrait>(
     output: ArrayView2<i8>,
     quant: &Quantization<i8>,
+    score_threshold: f32,
+    iou_threshold: f32,
+    output_boxes: &mut Vec<DetectBox>,
+) {
+    decode_yolo_8bit::<B, i8>(output, quant, score_threshold, iou_threshold, output_boxes);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn decode_yolo_masks_i8<B: BBoxTypeTrait>(
+    boxes: ArrayView2<i8>,
+    protos: ArrayView3<i8>,
+    quant_boxes: &Quantization<i8>,
+    quant_protos: &Quantization<i8>,
+    score_threshold: f32,
+    iou_threshold: f32,
+    output_boxes: &mut Vec<DetectBox>,
+    output_masks: &mut Vec<SegmentationMask>,
+) {
+    decode_yolo_masks_8bit::<B, i8>(
+        boxes,
+        protos,
+        quant_boxes,
+        quant_protos,
+        score_threshold,
+        iou_threshold,
+        output_boxes,
+        output_masks,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn decode_yolo_masks_u8<B: BBoxTypeTrait>(
+    boxes: ArrayView2<u8>,
+    protos: ArrayView3<u8>,
+    quant_boxes: &Quantization<u8>,
+    quant_protos: &Quantization<u8>,
+    score_threshold: f32,
+    iou_threshold: f32,
+    output_boxes: &mut Vec<DetectBox>,
+    output_masks: &mut Vec<SegmentationMask>,
+) {
+    decode_yolo_masks_8bit::<B, u8>(
+        boxes,
+        protos,
+        quant_boxes,
+        quant_protos,
+        score_threshold,
+        iou_threshold,
+        output_boxes,
+        output_masks,
+    );
+}
+
+fn decode_yolo_8bit<
+    B: BBoxTypeTrait,
+    T: PrimInt + AsPrimitive<i16> + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
+>(
+    output: ArrayView2<T>,
+    quant: &Quantization<T>,
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
@@ -75,12 +126,12 @@ pub fn decode_yolo_f64<B: BBoxTypeTrait>(
     output: ArrayView2<f64>,
     score_threshold: f64,
     iou_threshold: f64,
-    output_boxes: &mut Vec<DetectBoxF64>,
+    output_boxes: &mut Vec<DetectBox>,
 ) {
     let (boxes_tensor, scores_tensor) = postprocess_yolo(&output);
     let boxes = postprocess_boxes_f64::<B>(score_threshold, boxes_tensor, scores_tensor);
 
-    let boxes = nms_f64(iou_threshold, boxes);
+    let boxes = nms_f32(iou_threshold as f32, boxes);
     let len = output_boxes.capacity().min(boxes.len());
     output_boxes.clear();
     for b in boxes.into_iter().take(len) {
@@ -94,52 +145,6 @@ pub fn postprocess_yolo<'a, T>(
     let boxes_tensor = output.slice(s![..4, ..,]).reversed_axes();
     let scores_tensor = output.slice(s![4.., ..,]).reversed_axes();
     (boxes_tensor, scores_tensor)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn decode_yolo_masks_i8<B: BBoxTypeTrait>(
-    boxes: ArrayView2<i8>,
-    protos: ArrayView3<i8>,
-    quant_boxes: &Quantization<i8>,
-    quant_protos: &Quantization<i8>,
-    score_threshold: f32,
-    iou_threshold: f32,
-    output_boxes: &mut Vec<DetectBox>,
-    output_masks: &mut Vec<SegmentationMask>,
-) {
-    decode_yolo_masks_8bit::<B, _>(
-        boxes,
-        protos,
-        quant_boxes,
-        quant_protos,
-        score_threshold,
-        iou_threshold,
-        output_boxes,
-        output_masks,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn decode_yolo_masks_u8<B: BBoxTypeTrait>(
-    boxes: ArrayView2<u8>,
-    protos: ArrayView3<u8>,
-    quant_boxes: &Quantization<u8>,
-    quant_protos: &Quantization<u8>,
-    score_threshold: f32,
-    iou_threshold: f32,
-    output_boxes: &mut Vec<DetectBox>,
-    output_masks: &mut Vec<SegmentationMask>,
-) {
-    decode_yolo_masks_8bit::<B, _>(
-        boxes,
-        protos,
-        quant_boxes,
-        quant_protos,
-        score_threshold,
-        iou_threshold,
-        output_boxes,
-        output_masks,
-    );
 }
 
 #[allow(clippy::too_many_arguments)]
