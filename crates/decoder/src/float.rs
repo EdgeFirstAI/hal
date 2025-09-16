@@ -4,7 +4,7 @@ use ndarray::{
     parallel::prelude::{IntoParallelIterator, ParallelIterator as _},
 };
 
-pub fn postprocess_boxes_f32<T: BBoxTypeTrait>(
+pub fn postprocess_boxes_f32<B: BBoxTypeTrait>(
     threshold: f32,
     boxes: ArrayView2<f32>,
     scores: ArrayView2<f32>,
@@ -20,7 +20,7 @@ pub fn postprocess_boxes_f32<T: BBoxTypeTrait>(
                 return None;
             }
 
-            let bbox = T::ndarray_to_xyxy_float(bbox);
+            let bbox = B::ndarray_to_xyxy_float(bbox);
             Some(DetectBox {
                 label,
                 score: score_,
@@ -33,7 +33,7 @@ pub fn postprocess_boxes_f32<T: BBoxTypeTrait>(
         .collect()
 }
 
-pub fn postprocess_boxes_extra_f32<'a, T: BBoxTypeTrait>(
+pub fn postprocess_boxes_extra_f32<'a, B: BBoxTypeTrait>(
     threshold: f32,
     boxes: ArrayView2<f32>,
     scores: ArrayView2<f32>,
@@ -51,7 +51,7 @@ pub fn postprocess_boxes_extra_f32<'a, T: BBoxTypeTrait>(
                 return None;
             }
 
-            let bbox = T::ndarray_to_xyxy_float(bbox);
+            let bbox = B::ndarray_to_xyxy_float(bbox);
             Some((
                 DetectBox {
                     label,
@@ -143,7 +143,7 @@ fn jaccard_f32(a: &DetectBox, b: &DetectBox, iou: f32) -> bool {
     intersection / union > iou
 }
 
-pub fn postprocess_boxes_f64<T: BBoxTypeTrait>(
+pub fn postprocess_boxes_f64<B: BBoxTypeTrait>(
     threshold: f64,
     boxes: ArrayView2<f64>,
     scores: ArrayView2<f64>,
@@ -165,7 +165,7 @@ pub fn postprocess_boxes_f64<T: BBoxTypeTrait>(
             if score_ < threshold {
                 return None;
             }
-            let bbox = T::ndarray_to_xyxy_float(bbox);
+            let bbox = B::ndarray_to_xyxy_float(bbox);
             Some(DetectBoxF64 {
                 label,
                 score: score_,

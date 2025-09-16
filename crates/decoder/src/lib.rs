@@ -6,7 +6,7 @@ use std::ops::{Add, Mul, Sub};
 use ndarray::{Array, Array3, ArrayView, ArrayView1, Dimension};
 use num_traits::{AsPrimitive, Float, PrimInt};
 
-pub mod bits8;
+pub mod byte;
 pub mod error;
 pub mod float;
 pub mod modelpack;
@@ -267,7 +267,7 @@ pub struct DetectBoxQuantized<T: Clone + Mul + Add + Sub + Ord + AsPrimitive<f32
 
 pub fn dequant_detect_box<
     T: Clone + Mul + Add + Sub + Ord + AsPrimitive<f32>,
-    Q: AsPrimitive<f32> + std::fmt::Debug,
+    Q: AsPrimitive<f32>,
 >(
     detect: &DetectBoxQuantized<T>,
     quant_boxes: &Quantization<Q>,
