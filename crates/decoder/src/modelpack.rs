@@ -2,11 +2,11 @@ use ndarray::{Array2, ArrayView2, ArrayView3};
 use num_traits::{AsPrimitive, PrimInt};
 
 use crate::{
-    BBoxTypeTrait, DetectBox, Detection, Quantization,
+    BBoxTypeTrait, DetectBox, Detection, Quantization, XYWH, XYXY,
     byte::{nms_i16, postprocess_boxes_8bit, quantize_score_threshold},
     dequant_detect_box,
     error::Result,
-    float::{nms_f32, postprocess_boxes_f32},
+    float::{nms_f32, postprocess_boxes_float},
 };
 
 pub struct ModelPackDetectionConfig<D: AsPrimitive<f32>> {
@@ -32,7 +32,7 @@ impl From<&Detection> for ModelPackDetectionConfig<f32> {
     }
 }
 
-pub fn decode_modelpack_i8<B: BBoxTypeTrait>(
+pub fn decode_modelpack_i8(
     boxes_tensor: ArrayView2<i8>,
     scores_tensor: ArrayView2<i8>,
     quant_boxes: &Quantization<i8>,
@@ -41,7 +41,7 @@ pub fn decode_modelpack_i8<B: BBoxTypeTrait>(
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
 ) {
-    decode_modelpack_8bit::<B, i8>(
+    impl_modelpack_8bit::<XYXY, i8>(
         boxes_tensor,
         scores_tensor,
         quant_boxes,
@@ -52,7 +52,7 @@ pub fn decode_modelpack_i8<B: BBoxTypeTrait>(
     )
 }
 
-pub fn decode_modelpack_u8<B: BBoxTypeTrait>(
+pub fn decode_modelpack_u8(
     boxes_tensor: ArrayView2<u8>,
     scores_tensor: ArrayView2<u8>,
     quant_boxes: &Quantization<u8>,
@@ -61,7 +61,7 @@ pub fn decode_modelpack_u8<B: BBoxTypeTrait>(
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
 ) {
-    decode_modelpack_8bit::<B, u8>(
+    impl_modelpack_8bit::<XYXY, u8>(
         boxes_tensor,
         scores_tensor,
         quant_boxes,
@@ -72,7 +72,7 @@ pub fn decode_modelpack_u8<B: BBoxTypeTrait>(
     )
 }
 
-fn decode_modelpack_8bit<
+pub fn impl_modelpack_8bit<
     B: BBoxTypeTrait,
     T: PrimInt + AsPrimitive<i16> + AsPrimitive<f32> + Send + Sync,
 >(
@@ -86,7 +86,7 @@ fn decode_modelpack_8bit<
 ) {
     let score_threshold = quantize_score_threshold(score_threshold, quant_scores);
     let boxes =
-        postprocess_boxes_8bit::<B, _>(score_threshold, boxes_tensor, scores_tensor, quant_boxes);
+        postprocess_boxes_8bit::<B, T>(score_threshold, boxes_tensor, scores_tensor, quant_boxes);
     let boxes = nms_i16(iou_threshold, boxes);
     let len = output_boxes.capacity().min(boxes.len());
     output_boxes.clear();
@@ -95,7 +95,23 @@ fn decode_modelpack_8bit<
     }
 }
 
-pub fn decode_modelpack_split<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
+pub fn decode_modelpack_split<D: AsPrimitive<f32>>(
+    outputs: &[ArrayView3<D>],
+    configs: &[ModelPackDetectionConfig<D>],
+    score_threshold: f32,
+    iou_threshold: f32,
+    output_boxes: &mut Vec<DetectBox>,
+) {
+    impl_modelpack_split::<XYWH, D>(
+        outputs,
+        configs,
+        score_threshold,
+        iou_threshold,
+        output_boxes,
+    );
+}
+
+pub fn impl_modelpack_split<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
     outputs: &[ArrayView3<D>],
     configs: &[ModelPackDetectionConfig<D>],
     score_threshold: f32,
@@ -103,8 +119,11 @@ pub fn decode_modelpack_split<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
     output_boxes: &mut Vec<DetectBox>,
 ) {
     let (boxes_tensor, scores_tensor) = postprocess_modelpack_split(outputs, configs).unwrap();
-    let boxes =
-        postprocess_boxes_f32::<B>(score_threshold, boxes_tensor.view(), scores_tensor.view());
+    let boxes = postprocess_boxes_float::<B, f32>(
+        score_threshold,
+        boxes_tensor.view(),
+        scores_tensor.view(),
+    );
     let boxes = nms_f32(iou_threshold, boxes);
     let len = output_boxes.capacity().min(boxes.len());
     output_boxes.clear();

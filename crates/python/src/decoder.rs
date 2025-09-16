@@ -1,7 +1,7 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 use edgefirst::decoder::{
-    Decoder, DecoderBuilder, DetectBox, Quantization, QuantizationF64, SegmentationMask, XYWH,
-    XYXY, dequantize_cpu_chunked, dequantize_cpu_chunked_f64, dequantize_ndarray,
+    Decoder, DecoderBuilder, DetectBox, Quantization, QuantizationF64, SegmentationMask,
+    dequantize_cpu_chunked, dequantize_cpu_chunked_f64,
 };
 use ndarray::{Array1, Array2};
 use numpy::{
@@ -58,24 +58,6 @@ pub enum ArrayGenericFloat<'a> {
     Float32(PyReadwriteArrayDyn<'a, f32>),
     Float64(PyReadwriteArrayDyn<'a, f64>),
 }
-
-#[pyclass(name = "BBoxType", eq)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PyBBoxType {
-    #[pyo3(name = "XYXY")]
-    Xyxy = 0,
-    #[pyo3(name = "XYWH")]
-    Xywh = 1,
-}
-
-#[pymethods]
-impl PyBBoxType {
-    #[getter]
-    fn value(&self) -> isize {
-        self.__pyo3__int__()
-    }
-}
-
 #[pyclass(name = "Decoder")]
 pub struct PyDecoder {
     decoder: Decoder,
@@ -156,7 +138,7 @@ impl PyDecoder {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (model_output, scale=1.0, zero_point=0, score_threshold=0.1, iou_threshold=0.7, max_boxes=100, bbox_type=PyBBoxType::Xywh))]
+    #[pyo3(signature = (model_output, scale=1.0, zero_point=0, score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
     pub fn decode_yolo<'py>(
         py: Python<'py>,
         model_output: ReadOnlyArrayGeneric2,
@@ -165,7 +147,6 @@ impl PyDecoder {
         score_threshold: f64,
         iou_threshold: f64,
         max_boxes: usize,
-        bbox_type: PyBBoxType,
     ) -> PyResult<PyDetOutput<'py>> {
         let out = match model_output {
             ReadOnlyArrayGeneric2::UInt8(output) => Self::decode_yolo_u8(
@@ -176,7 +157,6 @@ impl PyDecoder {
                 score_threshold as f32,
                 iou_threshold as f32,
                 max_boxes,
-                bbox_type,
             ),
             ReadOnlyArrayGeneric2::Int8(output) => Self::decode_yolo_i8(
                 py,
@@ -186,7 +166,6 @@ impl PyDecoder {
                 score_threshold as f32,
                 iou_threshold as f32,
                 max_boxes,
-                bbox_type,
             ),
             ReadOnlyArrayGeneric2::Float32(output) => Self::decode_yolo_f32(
                 py,
@@ -194,22 +173,16 @@ impl PyDecoder {
                 score_threshold as f32,
                 iou_threshold as f32,
                 max_boxes,
-                bbox_type,
             ),
-            ReadOnlyArrayGeneric2::Float64(output) => Self::decode_yolo_f64(
-                py,
-                output,
-                score_threshold,
-                iou_threshold,
-                max_boxes,
-                bbox_type,
-            ),
+            ReadOnlyArrayGeneric2::Float64(output) => {
+                Self::decode_yolo_f64(py, output, score_threshold, iou_threshold, max_boxes)
+            }
         };
         Ok(out)
     }
 
     #[staticmethod]
-    #[pyo3(signature = (model_output, scale, zero_point, score_threshold=0.1, iou_threshold=0.7, max_boxes=100, bbox_type=PyBBoxType::Xywh))]
+    #[pyo3(signature = (model_output, scale, zero_point, score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
     pub fn decode_yolo_u8<'py>(
         py: Python<'py>,
         model_output: PyReadonlyArray2<u8>,
@@ -218,14 +191,9 @@ impl PyDecoder {
         score_threshold: f32,
         iou_threshold: f32,
         max_boxes: usize,
-        bbox_type: PyBBoxType,
     ) -> PyDetOutput<'py> {
         let mut output_boxes = Vec::with_capacity(max_boxes);
-        let func = match bbox_type {
-            PyBBoxType::Xyxy => edgefirst::decoder::yolo::decode_yolo_u8::<XYXY>,
-            PyBBoxType::Xywh => edgefirst::decoder::yolo::decode_yolo_u8::<XYWH>,
-        };
-        func(
+        edgefirst::decoder::yolo::decode_yolo_u8(
             model_output.as_array(),
             &Quantization { zero_point, scale },
             score_threshold,
@@ -236,7 +204,7 @@ impl PyDecoder {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (model_output, scale, zero_point, score_threshold=0.1, iou_threshold=0.7, max_boxes=100, bbox_type=PyBBoxType::Xywh))]
+    #[pyo3(signature = (model_output, scale, zero_point, score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
     pub fn decode_yolo_i8<'py>(
         py: Python<'py>,
         model_output: PyReadonlyArray2<i8>,
@@ -245,14 +213,9 @@ impl PyDecoder {
         score_threshold: f32,
         iou_threshold: f32,
         max_boxes: usize,
-        bbox_type: PyBBoxType,
     ) -> PyDetOutput<'py> {
         let mut output_boxes = Vec::with_capacity(max_boxes);
-        let func = match bbox_type {
-            PyBBoxType::Xyxy => edgefirst::decoder::yolo::decode_yolo_i8::<XYXY>,
-            PyBBoxType::Xywh => edgefirst::decoder::yolo::decode_yolo_i8::<XYWH>,
-        };
-        func(
+        edgefirst::decoder::yolo::decode_yolo_i8(
             model_output.as_array(),
             &Quantization { zero_point, scale },
             score_threshold,
@@ -263,21 +226,16 @@ impl PyDecoder {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (model_output, score_threshold=0.1, iou_threshold=0.7, max_boxes=100, bbox_type=PyBBoxType::Xywh))]
+    #[pyo3(signature = (model_output, score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
     pub fn decode_yolo_f32<'py>(
         py: Python<'py>,
         model_output: PyReadonlyArray2<f32>,
         score_threshold: f32,
         iou_threshold: f32,
         max_boxes: usize,
-        bbox_type: PyBBoxType,
     ) -> PyDetOutput<'py> {
         let mut output_boxes = Vec::with_capacity(max_boxes);
-        let func = match bbox_type {
-            PyBBoxType::Xyxy => edgefirst::decoder::yolo::decode_yolo_f32::<XYXY>,
-            PyBBoxType::Xywh => edgefirst::decoder::yolo::decode_yolo_f32::<XYWH>,
-        };
-        func(
+        edgefirst::decoder::yolo::decode_yolo_f32(
             model_output.as_array(),
             score_threshold,
             iou_threshold,
@@ -287,21 +245,16 @@ impl PyDecoder {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (model_output, score_threshold=0.1, iou_threshold=0.7, max_boxes=100, bbox_type=PyBBoxType::Xywh))]
+    #[pyo3(signature = (model_output, score_threshold=0.1, iou_threshold=0.7, max_boxes=100,))]
     pub fn decode_yolo_f64<'py>(
         py: Python<'py>,
         model_output: PyReadonlyArray2<f64>,
         score_threshold: f64,
         iou_threshold: f64,
         max_boxes: usize,
-        bbox_type: PyBBoxType,
     ) -> PyDetOutput<'py> {
         let mut output_boxes = Vec::with_capacity(max_boxes);
-        let func = match bbox_type {
-            PyBBoxType::Xyxy => edgefirst::decoder::yolo::decode_yolo_f64::<XYXY>,
-            PyBBoxType::Xywh => edgefirst::decoder::yolo::decode_yolo_f64::<XYWH>,
-        };
-        func(
+        edgefirst::decoder::yolo::decode_yolo_f64(
             model_output.as_array(),
             score_threshold,
             iou_threshold,
@@ -311,7 +264,7 @@ impl PyDecoder {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (boxes, protos, quant_boxes=(1.0, 0), quant_protos=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, max_boxes=100, bbox_type=PyBBoxType::Xywh))]
+    #[pyo3(signature = (boxes, protos, quant_boxes=(1.0, 0), quant_protos=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
     pub fn decode_yolo_segdet<'py>(
         py: Python<'py>,
         boxes: ReadOnlyArrayGeneric2,
@@ -321,62 +274,77 @@ impl PyDecoder {
         score_threshold: f64,
         iou_threshold: f64,
         max_boxes: usize,
-        bbox_type: PyBBoxType,
     ) -> PyResult<PySegDetOutput<'py>> {
         let mut output_boxes = Vec::with_capacity(max_boxes);
         let mut output_masks = Vec::with_capacity(max_boxes);
 
-        let boxes = match boxes {
-            ReadOnlyArrayGeneric2::UInt8(output) => dequantize_ndarray(
-                &Quantization {
-                    scale: quant_boxes.0 as f32,
-                    zero_point: u8::try_from(quant_boxes.1)?,
-                },
-                output.as_array(),
-            ),
-            ReadOnlyArrayGeneric2::Int8(output) => dequantize_ndarray(
-                &Quantization {
-                    scale: quant_boxes.0 as f32,
-                    zero_point: i8::try_from(quant_boxes.1)?,
-                },
-                output.as_array(),
-            ),
-            ReadOnlyArrayGeneric2::Float32(output) => output.as_array().to_owned(),
-            ReadOnlyArrayGeneric2::Float64(output) => output.as_array().mapv(|x| x as f32),
+        match (boxes, protos) {
+            (ReadOnlyArrayGeneric2::UInt8(boxes), ReadOnlyArrayGeneric3::UInt8(protos)) => {
+                let (boxes, protos) = (boxes.as_array(), protos.as_array());
+                edgefirst::decoder::yolo::decode_yolo_masks_u8(
+                    boxes.view(),
+                    protos.view(),
+                    &Quantization {
+                        scale: quant_boxes.0 as f32,
+                        zero_point: quant_boxes.1 as u8,
+                    },
+                    &Quantization {
+                        scale: quant_protos.0 as f32,
+                        zero_point: quant_protos.1 as u8,
+                    },
+                    score_threshold as f32,
+                    iou_threshold as f32,
+                    &mut output_boxes,
+                    &mut output_masks,
+                );
+            }
+            (ReadOnlyArrayGeneric2::Int8(boxes), ReadOnlyArrayGeneric3::Int8(protos)) => {
+                let (boxes, protos) = (boxes.as_array(), protos.as_array());
+                edgefirst::decoder::yolo::decode_yolo_masks_i8(
+                    boxes.view(),
+                    protos.view(),
+                    &Quantization {
+                        scale: quant_boxes.0 as f32,
+                        zero_point: quant_boxes.1 as i8,
+                    },
+                    &Quantization {
+                        scale: quant_protos.0 as f32,
+                        zero_point: quant_protos.1 as i8,
+                    },
+                    score_threshold as f32,
+                    iou_threshold as f32,
+                    &mut output_boxes,
+                    &mut output_masks,
+                );
+            }
+            (ReadOnlyArrayGeneric2::Float32(boxes), ReadOnlyArrayGeneric3::Float32(protos)) => {
+                let (boxes, protos) = (boxes.as_array(), protos.as_array());
+                edgefirst::decoder::yolo::decode_yolo_masks_f32(
+                    boxes.view(),
+                    protos.view(),
+                    score_threshold as f32,
+                    iou_threshold as f32,
+                    &mut output_boxes,
+                    &mut output_masks,
+                );
+            }
+            (ReadOnlyArrayGeneric2::Float64(boxes), ReadOnlyArrayGeneric3::Float64(protos)) => {
+                let (boxes, protos) = (boxes.as_array(), protos.as_array());
+                edgefirst::decoder::yolo::decode_yolo_masks_f64(
+                    boxes.view(),
+                    protos.view(),
+                    score_threshold,
+                    iou_threshold,
+                    &mut output_boxes,
+                    &mut output_masks,
+                );
+            }
+            _ => {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "Box and Protos are not the same type".to_string(),
+                ));
+            }
         };
-
-        let protos = match protos {
-            ReadOnlyArrayGeneric3::UInt8(output) => dequantize_ndarray(
-                &Quantization {
-                    scale: quant_protos.0 as f32,
-                    zero_point: u8::try_from(quant_protos.1)?,
-                },
-                output.as_array(),
-            ),
-            ReadOnlyArrayGeneric3::Int8(output) => dequantize_ndarray(
-                &Quantization {
-                    scale: quant_protos.0 as f32,
-                    zero_point: i8::try_from(quant_protos.1)?,
-                },
-                output.as_array(),
-            ),
-            ReadOnlyArrayGeneric3::Float32(output) => output.as_array().to_owned(),
-            ReadOnlyArrayGeneric3::Float64(output) => output.as_array().mapv(|x| x as f32),
-        };
-
-        let func = match bbox_type {
-            PyBBoxType::Xyxy => edgefirst::decoder::yolo::decode_yolo_masks_f32::<XYXY>,
-            PyBBoxType::Xywh => edgefirst::decoder::yolo::decode_yolo_masks_f32::<XYWH>,
-        };
-
-        func(
-            boxes.view(),
-            protos.view(),
-            score_threshold as f32,
-            iou_threshold as f32,
-            &mut output_boxes,
-            &mut output_masks,
-        );
 
         let (boxes, scores, classes) = convert_detect_box(py, &output_boxes);
         let masks = convert_seg_mask(py, &output_masks);

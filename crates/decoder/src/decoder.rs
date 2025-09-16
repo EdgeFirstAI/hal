@@ -3,7 +3,7 @@ use num_traits::{AsPrimitive, FromPrimitive};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DetectBox, Error, Quantization, SegmentationMask, XYWH, XYXY,
+    DetectBox, Error, Quantization, SegmentationMask,
     modelpack::{
         ModelPackDetectionConfig, decode_modelpack_i8, decode_modelpack_split, decode_modelpack_u8,
     },
@@ -471,7 +471,7 @@ impl Decoder {
                 }),
             })
             .collect::<Vec<_>>();
-        decode_modelpack_split::<XYWH, D>(
+        decode_modelpack_split(
             &new_outputs,
             &new_detection,
             self.score_threshold,
@@ -515,7 +515,7 @@ impl Decoder {
         let scores = Self::find_outputs_with_shape(&scores.shape, outputs)?;
         let scores = scores.slice(s![0, .., ..]);
 
-        decode_modelpack_i8::<XYXY>(
+        decode_modelpack_i8(
             boxes,
             scores,
             &quant_boxes,
@@ -537,7 +537,7 @@ impl Decoder {
         let box_output = Self::find_outputs_with_shape(&boxes.shape, outputs)?;
         let box_output = box_output.slice(s![0, .., ..]);
 
-        decode_yolo_i8::<XYWH>(
+        decode_yolo_i8(
             box_output,
             &quant_boxes,
             self.score_threshold,
@@ -563,7 +563,7 @@ impl Decoder {
         let protos = Self::find_outputs_with_shape(&protos.shape, outputs)?;
         let protos = protos.slice(s![0, .., .., ..]);
 
-        decode_yolo_masks_i8::<XYWH>(
+        decode_yolo_masks_i8(
             box_output,
             protos,
             &quant_boxes,
@@ -613,7 +613,7 @@ impl Decoder {
         let scores = Self::find_outputs_with_shape(&scores.shape, outputs)?;
         let scores = scores.slice(s![0, .., ..]);
 
-        decode_modelpack_u8::<XYXY>(
+        decode_modelpack_u8(
             boxes,
             scores,
             &quant_boxes,
@@ -635,7 +635,7 @@ impl Decoder {
         let box_output = Self::find_outputs_with_shape(&boxes.shape, outputs)?;
         let box_output = box_output.slice(s![0, .., ..]);
 
-        decode_yolo_u8::<XYWH>(
+        decode_yolo_u8(
             box_output,
             &quant_boxes,
             self.score_threshold,
@@ -661,7 +661,7 @@ impl Decoder {
         let protos = Self::find_outputs_with_shape(&protos.shape, outputs)?;
         let protos = protos.slice(s![0, .., .., ..]);
 
-        decode_yolo_masks_u8::<XYWH>(
+        decode_yolo_masks_u8(
             box_output,
             protos,
             &quant_boxes,
