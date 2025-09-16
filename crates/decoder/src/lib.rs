@@ -199,22 +199,6 @@ pub struct DetectBox {
     pub label: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct DetectBoxF64 {
-    /// left-most normalized coordinate of the bounding box
-    pub xmin: f64,
-    /// top-most normalized coordinate of the bounding box
-    pub ymin: f64,
-    /// right-most normalized coordinate of the bounding box
-    pub xmax: f64,
-    /// bottom-most normalized coordinate of the bounding box
-    pub ymax: f64,
-    /// model-specific score for this detection, higher implies more confidence
-    pub score: f64,
-    /// label index for this detection
-    pub label: usize,
-}
-
 impl DetectBox {
     // Check if one detect box is equal to another detect box, within the given
     // delta
