@@ -3,11 +3,11 @@ use num_traits::{AsPrimitive, FromPrimitive};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DetectBox, Error, Quantization, SegmentationMask, XYWH, XYXY, dequantize_ndarray,
+    DetectBox, Error, Quantization, SegmentationMask, XYWH, XYXY,
     modelpack::{
         ModelPackDetectionConfig, decode_modelpack_i8, decode_modelpack_split, decode_modelpack_u8,
     },
-    yolo::{decode_yolo_i8, decode_yolo_masks_f32, decode_yolo_u8},
+    yolo::{decode_yolo_i8, decode_yolo_masks_i8, decode_yolo_masks_u8, decode_yolo_u8},
 };
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
@@ -507,19 +507,19 @@ impl Decoder {
         scores: &Scores,
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<(), Error> {
-        let box_quant = boxes.quantization.unwrap_or([1.0, 0.0]).into();
+        let quant_boxes = boxes.quantization.unwrap_or([1.0, 0.0]).into();
         let boxes = Self::find_outputs_with_shape(&boxes.shape, outputs)?;
         let boxes = boxes.slice(s![0, .., 0, ..]);
 
-        let scores_quant = scores.quantization.unwrap_or([1.0, 0.0]).into();
+        let quant_scores = scores.quantization.unwrap_or([1.0, 0.0]).into();
         let scores = Self::find_outputs_with_shape(&scores.shape, outputs)?;
         let scores = scores.slice(s![0, .., ..]);
 
         decode_modelpack_i8::<XYXY>(
             boxes,
             scores,
-            &box_quant,
-            &scores_quant,
+            &quant_boxes,
+            &quant_scores,
             self.score_threshold,
             self.iou_threshold,
             output_boxes,
@@ -533,13 +533,13 @@ impl Decoder {
         boxes: &Detection,
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<(), Error> {
-        let box_quant = boxes.quantization.unwrap_or([1.0, 0.0]).into();
+        let quant_boxes = boxes.quantization.unwrap_or([1.0, 0.0]).into();
         let box_output = Self::find_outputs_with_shape(&boxes.shape, outputs)?;
         let box_output = box_output.slice(s![0, .., ..]);
 
         decode_yolo_i8::<XYWH>(
             box_output,
-            &box_quant,
+            &quant_boxes,
             self.score_threshold,
             self.iou_threshold,
             output_boxes,
@@ -555,22 +555,19 @@ impl Decoder {
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<SegmentationMask>,
     ) -> Result<(), Error> {
-        let box_quant = boxes.quantization.unwrap_or([1.0, 0.0]).into();
-        let box_output: &ndarray::ArrayBase<
-            ndarray::ViewRepr<&i8>,
-            ndarray::Dim<ndarray::IxDynImpl>,
-        > = Self::find_outputs_with_shape(&boxes.shape, outputs)?;
-        let box_output = dequantize_ndarray(&box_quant, box_output.into());
+        let quant_boxes = boxes.quantization.unwrap_or([1.0, 0.0]).into();
+        let box_output = Self::find_outputs_with_shape(&boxes.shape, outputs)?;
         let box_output = box_output.slice(s![0, .., ..]);
 
-        let protos_quant = protos.quantization.unwrap_or([1.0, 0.0]).into();
+        let quant_protos = protos.quantization.unwrap_or([1.0, 0.0]).into();
         let protos = Self::find_outputs_with_shape(&protos.shape, outputs)?;
-        let protos = dequantize_ndarray(&protos_quant, protos.into());
         let protos = protos.slice(s![0, .., .., ..]);
 
-        decode_yolo_masks_f32::<XYWH>(
+        decode_yolo_masks_i8::<XYWH>(
             box_output,
             protos,
+            &quant_boxes,
+            &quant_protos,
             self.score_threshold,
             self.iou_threshold,
             output_boxes,
@@ -608,19 +605,19 @@ impl Decoder {
         scores: &Scores,
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<(), Error> {
-        let box_quant = boxes.quantization.unwrap_or([1.0, 0.0]).into();
+        let quant_boxes = boxes.quantization.unwrap_or([1.0, 0.0]).into();
         let boxes = Self::find_outputs_with_shape(&boxes.shape, outputs)?;
         let boxes = boxes.slice(s![0, .., 0, ..]);
 
-        let scores_quant = scores.quantization.unwrap_or([1.0, 0.0]).into();
+        let quant_scores = scores.quantization.unwrap_or([1.0, 0.0]).into();
         let scores = Self::find_outputs_with_shape(&scores.shape, outputs)?;
         let scores = scores.slice(s![0, .., ..]);
 
         decode_modelpack_u8::<XYXY>(
             boxes,
             scores,
-            &box_quant,
-            &scores_quant,
+            &quant_boxes,
+            &quant_scores,
             self.score_threshold,
             self.iou_threshold,
             output_boxes,
@@ -634,13 +631,13 @@ impl Decoder {
         boxes: &Detection,
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<(), Error> {
-        let box_quant = boxes.quantization.unwrap_or([1.0, 0.0]).into();
+        let quant_boxes = boxes.quantization.unwrap_or([1.0, 0.0]).into();
         let box_output = Self::find_outputs_with_shape(&boxes.shape, outputs)?;
         let box_output = box_output.slice(s![0, .., ..]);
 
         decode_yolo_u8::<XYWH>(
             box_output,
-            &box_quant,
+            &quant_boxes,
             self.score_threshold,
             self.iou_threshold,
             output_boxes,
@@ -656,19 +653,19 @@ impl Decoder {
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<SegmentationMask>,
     ) -> Result<(), Error> {
-        let box_quant = boxes.quantization.unwrap_or([1.0, 0.0]).into();
+        let quant_boxes = boxes.quantization.unwrap_or([1.0, 0.0]).into();
         let box_output = Self::find_outputs_with_shape(&boxes.shape, outputs)?;
-        let box_output = dequantize_ndarray(&box_quant, box_output.into());
         let box_output = box_output.slice(s![0, .., ..]);
 
-        let protos_quant = protos.quantization.unwrap_or([1.0, 0.0]).into();
+        let quant_protos = protos.quantization.unwrap_or([1.0, 0.0]).into();
         let protos = Self::find_outputs_with_shape(&protos.shape, outputs)?;
-        let protos = dequantize_ndarray(&protos_quant, protos.into());
         let protos = protos.slice(s![0, .., .., ..]);
 
-        decode_yolo_masks_f32::<XYWH>(
+        decode_yolo_masks_u8::<XYWH>(
             box_output,
             protos,
+            &quant_boxes,
+            &quant_protos,
             self.score_threshold,
             self.iou_threshold,
             output_boxes,
