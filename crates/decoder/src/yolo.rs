@@ -280,20 +280,21 @@ pub fn make_mask_i8(
 ) -> Array3<u8> {
     let shape = protos.shape();
     let mask = mask.to_shape((1, mask.len())).unwrap();
-    let scaled_zero_mask = -quant_boxes.zero_point as f32 * quant_boxes.scale;
 
     let protos = protos.to_shape([shape[0] * shape[1], shape[2]]).unwrap();
     let protos = protos.reversed_axes();
-    let scaled_zero_protos = -quant_protos.zero_point as f32 * quant_protos.scale;
 
+    // This cannot overflow because in the dot product, we have i8 * i8 and then 32
+    // proto layers are summed together. Which means in the result of the matrix
+    // multiply, the maximum value of a single element is 256 * 256 * 32 = 2^21
     let mask = mask
-        .mapv(|x| x as f32 * quant_boxes.scale + scaled_zero_mask)
-        .dot(&protos.mapv(|x| x as f32 * quant_protos.scale + scaled_zero_protos))
+        .mapv(|x| x as i32 - quant_boxes.zero_point as i32)
+        .dot(&protos.mapv(|x| x as i32 - quant_protos.zero_point as i32))
         .into_shape_with_order((shape[0], shape[1], 1))
         .unwrap();
 
-    let min = mask.min_skipnan();
-    let max = mask.max_skipnan();
+    let min = mask.min().unwrap();
+    let max = mask.max().unwrap();
 
-    mask.map(|x| ((x - min) / *max * 255.0) as u8)
+    mask.map(|x| ((x - min) as f32 / *max as f32 * 255.0) as u8)
 }

@@ -437,6 +437,8 @@ fn arg_max<T: PartialOrd + Copy>(score: ArrayView1<T>) -> (T, usize) {
 #[cfg(test)]
 mod tests {
 
+    use ndarray_stats::DeviationExt;
+
     use crate::{
         modelpack::{ModelPackDetectionConfig, decode_modelpack_split, decode_modelpack_u8},
         yolo::{decode_yolo_f32, decode_yolo_i8, decode_yolo_masks_f32, decode_yolo_masks_i8},
@@ -794,6 +796,27 @@ mod tests {
                 "{b_i8:?} is not equal to {b_f32:?}"
             );
         }
-        assert_eq!(output_masks, output_masks_f32);
+
+        for (m_i8, m_f32) in output_masks.iter().zip(&output_masks_f32) {
+            assert_eq!(
+                [m_i8.xmin, m_i8.ymin, m_i8.xmax, m_i8.ymax],
+                [m_f32.xmin, m_f32.ymin, m_f32.xmax, m_f32.ymax],
+            );
+            assert_eq!(m_i8.mask.shape(), m_f32.mask.shape());
+            let mask_i8 = m_i8.mask.map(|x| *x as i32);
+            let mask_f32 = m_f32.mask.map(|x| *x as i32);
+            let diff = &mask_i8 - &mask_f32;
+            assert!(
+                !diff.iter().any(|x| *x > 1),
+                "Difference between mask i8 and mask f32 is greater than 1: {:#?}",
+                diff
+            );
+            let mean_sq_err = mask_i8.mean_sq_err(&mask_f32).unwrap();
+            assert!(
+                mean_sq_err < 1e-2,
+                "Mean Square Error between masks was greater than 1%: {:.2}%",
+                mean_sq_err * 100.0
+            );
+        }
     }
 }
