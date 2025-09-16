@@ -16,7 +16,6 @@ pub mod edgefirst_python {
         // m.add_class::<tensor::PyTensor>()?;
         // m.add_class::<image::FourCC>()?;
         m.add_class::<decoder::PyDecoder>()?;
-        m.add_class::<decoder::PyBBoxType>()?;
 
         Ok(())
     }

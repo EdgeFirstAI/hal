@@ -3,11 +3,12 @@ use ndarray::{
     ArrayView1, ArrayView2, Zip,
     parallel::prelude::{IntoParallelIterator, ParallelIterator as _},
 };
+use num_traits::{AsPrimitive, Float};
 
-pub fn postprocess_boxes_f32<B: BBoxTypeTrait>(
-    threshold: f32,
-    boxes: ArrayView2<f32>,
-    scores: ArrayView2<f32>,
+pub fn postprocess_boxes_float<B: BBoxTypeTrait, T: Float + AsPrimitive<f32> + Send + Sync>(
+    threshold: T,
+    boxes: ArrayView2<T>,
+    scores: ArrayView2<T>,
 ) -> Vec<DetectBox> {
     assert_eq!(scores.dim().0, boxes.dim().0);
     assert_eq!(boxes.dim().1, 4);
@@ -23,7 +24,7 @@ pub fn postprocess_boxes_f32<B: BBoxTypeTrait>(
             let bbox = B::ndarray_to_xyxy_float(bbox);
             Some(DetectBox {
                 label,
-                score: score_,
+                score: score_.as_(),
                 xmin: bbox[0],
                 ymin: bbox[1],
                 xmax: bbox[2],
@@ -33,12 +34,17 @@ pub fn postprocess_boxes_f32<B: BBoxTypeTrait>(
         .collect()
 }
 
-pub fn postprocess_boxes_extra_f32<'a, B: BBoxTypeTrait>(
-    threshold: f32,
-    boxes: ArrayView2<f32>,
-    scores: ArrayView2<f32>,
-    extra: &'a ArrayView2<f32>,
-) -> Vec<(DetectBox, ArrayView1<'a, f32>)> {
+pub fn postprocess_boxes_extra_float<
+    'a,
+    B: BBoxTypeTrait,
+    T: Float + AsPrimitive<f32> + Send + Sync,
+    E: Send + Sync,
+>(
+    threshold: T,
+    boxes: ArrayView2<T>,
+    scores: ArrayView2<T>,
+    extra: &'a ArrayView2<T>,
+) -> Vec<(DetectBox, ArrayView1<'a, T>)> {
     assert_eq!(scores.dim().0, boxes.dim().0);
     assert_eq!(boxes.dim().1, 4);
     Zip::from(scores.rows())
@@ -55,7 +61,7 @@ pub fn postprocess_boxes_extra_f32<'a, B: BBoxTypeTrait>(
             Some((
                 DetectBox {
                     label,
-                    score: score_,
+                    score: score_.as_(),
                     xmin: bbox[0],
                     ymin: bbox[1],
                     xmax: bbox[2],
@@ -95,10 +101,10 @@ pub fn nms_f32(iou: f32, mut boxes: Vec<DetectBox>) -> Vec<DetectBox> {
     boxes.into_iter().filter(|b| b.score > 0.0).collect()
 }
 
-pub fn nms_extra_f32(
+pub fn nms_extra_f32<E: Send + Sync>(
     iou: f32,
-    mut boxes: Vec<(DetectBox, ArrayView1<f32>)>,
-) -> Vec<(DetectBox, ArrayView1<f32>)> {
+    mut boxes: Vec<(DetectBox, ArrayView1<E>)>,
+) -> Vec<(DetectBox, ArrayView1<E>)> {
     // Boxes get sorted by score in descending order so we know based on the
     // index the scoring of the boxes and can skip parts of the loop.
     boxes.sort_by(|a, b| b.0.score.total_cmp(&a.0.score));
@@ -141,39 +147,4 @@ fn jaccard_f32(a: &DetectBox, b: &DetectBox, iou: f32) -> bool {
     let union = (area_a + area_b - intersection).max(0.0000001);
 
     intersection / union > iou
-}
-
-pub fn postprocess_boxes_f64<B: BBoxTypeTrait>(
-    threshold: f64,
-    boxes: ArrayView2<f64>,
-    scores: ArrayView2<f64>,
-) -> Vec<DetectBox> {
-    assert_eq!(scores.dim().0, boxes.dim().0);
-    assert_eq!(boxes.dim().1, 4);
-
-    Zip::from(scores.rows())
-        .and(boxes.rows())
-        .into_par_iter()
-        .filter_map(|(score, bbox)| {
-            let (score_, label) =
-                score
-                    .iter()
-                    .enumerate()
-                    .fold((score[0], 0), |(max, arg_max), (ind, s)| {
-                        if max > *s { (max, arg_max) } else { (*s, ind) }
-                    });
-            if score_ < threshold {
-                return None;
-            }
-            let bbox = B::ndarray_to_xyxy_float(bbox);
-            Some(DetectBox {
-                label,
-                score: score_ as f32,
-                xmin: bbox[0],
-                ymin: bbox[1],
-                xmax: bbox[2],
-                ymax: bbox[3],
-            })
-        })
-        .collect()
 }
