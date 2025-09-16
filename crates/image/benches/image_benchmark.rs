@@ -370,19 +370,15 @@ where
     IMAGE: TestImage,
 {
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = Path::new("testdata").join(&name);
-    let path = match path.exists() {
-        true => path,
-        false => {
-            let path = Path::new("../testdata").join(&name);
-            if path.exists() {
-                path
-            } else {
-                Path::new("../../testdata").join(&name)
-            }
-        }
+    let path = if Path::new("./testdata").join(&name).exists() {
+        Path::new("./testdata").join(&name)
+    } else if Path::new("../testdata").join(&name).exists() {
+        Path::new("../testdata").join(&name)
+    } else if Path::new("../../testdata").join(&name).exists() {
+        Path::new("../../testdata").join(&name)
+    } else {
+        Path::new("../../../testdata").join(&name)
     };
-
     assert!(path.exists(), "unable to locate test image at {path:?}");
 
     let file = std::fs::read(path).unwrap();

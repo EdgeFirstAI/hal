@@ -3,7 +3,7 @@
 use divan::black_box_drop;
 use edgefirst_decoder::{
     Quantization, XYWH, XYXY,
-    bits8::{nms_i16, postprocess_boxes_i8},
+    byte::{nms_i16, postprocess_boxes_8bit},
     dequant_detect_box, dequantize_cpu, dequantize_cpu_chunked, dequantize_ndarray,
     float::{nms_f32, postprocess_boxes_f32},
     modelpack::{ModelPackDetectionConfig, decode_modelpack_split, decode_modelpack_u8},
@@ -49,7 +49,8 @@ fn decoder_quant_decode_boxes(bencher: divan::Bencher) {
     let boxes_tensor = out.slice(s![..4, ..,]).reversed_axes();
     let scores_tensor = out.slice(s![4..(80 + 4), ..,]).reversed_axes();
     bencher.bench_local(|| {
-        let _ = postprocess_boxes_i8::<XYWH>(score_threshold, boxes_tensor, scores_tensor, &quant);
+        let _ =
+            postprocess_boxes_8bit::<XYWH, _>(score_threshold, boxes_tensor, scores_tensor, &quant);
     });
 }
 
@@ -71,7 +72,8 @@ fn decoder_quant_nms(bencher: divan::Bencher) {
     let score_threshold = (score_threshold / quant.scale + quant.zero_point as f32) as i8;
     let boxes_tensor = out.slice(s![..4, ..,]).reversed_axes();
     let scores_tensor = out.slice(s![4..(80 + 4), ..,]).reversed_axes();
-    let boxes = postprocess_boxes_i8::<XYWH>(score_threshold, boxes_tensor, scores_tensor, &quant);
+    let boxes =
+        postprocess_boxes_8bit::<XYWH, _>(score_threshold, boxes_tensor, scores_tensor, &quant);
     bencher
         .with_inputs(|| boxes.clone())
         .bench_local_values(|boxes| {

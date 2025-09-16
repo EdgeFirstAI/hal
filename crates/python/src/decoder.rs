@@ -312,13 +312,13 @@ impl PyDecoder {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (boxes, protos, boxes_quant=(1.0, 0), protos_quant=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, max_boxes=100, bbox_type=PyBBoxType::Xywh))]
+    #[pyo3(signature = (boxes, protos, quant_boxes=(1.0, 0), quant_protos=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, max_boxes=100, bbox_type=PyBBoxType::Xywh))]
     pub fn decode_yolo_segdet<'py>(
         py: Python<'py>,
         boxes: ReadOnlyArrayGeneric2,
         protos: ReadOnlyArrayGeneric3,
-        boxes_quant: (f64, i64),
-        protos_quant: (f64, i64),
+        quant_boxes: (f64, i64),
+        quant_protos: (f64, i64),
         score_threshold: f64,
         iou_threshold: f64,
         max_boxes: usize,
@@ -330,15 +330,15 @@ impl PyDecoder {
         let boxes = match boxes {
             ReadOnlyArrayGeneric2::UInt8(output) => dequantize_ndarray(
                 &Quantization {
-                    scale: boxes_quant.0 as f32,
-                    zero_point: u8::try_from(boxes_quant.1)?,
+                    scale: quant_boxes.0 as f32,
+                    zero_point: u8::try_from(quant_boxes.1)?,
                 },
                 output.as_array(),
             ),
             ReadOnlyArrayGeneric2::Int8(output) => dequantize_ndarray(
                 &Quantization {
-                    scale: boxes_quant.0 as f32,
-                    zero_point: i8::try_from(boxes_quant.1)?,
+                    scale: quant_boxes.0 as f32,
+                    zero_point: i8::try_from(quant_boxes.1)?,
                 },
                 output.as_array(),
             ),
@@ -349,15 +349,15 @@ impl PyDecoder {
         let protos = match protos {
             ReadOnlyArrayGeneric3::UInt8(output) => dequantize_ndarray(
                 &Quantization {
-                    scale: protos_quant.0 as f32,
-                    zero_point: u8::try_from(protos_quant.1)?,
+                    scale: quant_protos.0 as f32,
+                    zero_point: u8::try_from(quant_protos.1)?,
                 },
                 output.as_array(),
             ),
             ReadOnlyArrayGeneric3::Int8(output) => dequantize_ndarray(
                 &Quantization {
-                    scale: protos_quant.0 as f32,
-                    zero_point: i8::try_from(protos_quant.1)?,
+                    scale: quant_protos.0 as f32,
+                    zero_point: i8::try_from(quant_protos.1)?,
                 },
                 output.as_array(),
             ),

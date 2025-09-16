@@ -5,15 +5,18 @@ use ndarray::{
 };
 use num_traits::{AsPrimitive, PrimInt};
 
-pub fn postprocess_boxes_u8<T: BBoxTypeTrait>(
-    threshold: u8,
-    boxes: ArrayView2<u8>,
-    scores: ArrayView2<u8>,
-    quant: &Quantization<u8>,
+pub fn postprocess_boxes_8bit<
+    B: BBoxTypeTrait,
+    T: PrimInt + AsPrimitive<i16> + AsPrimitive<f32> + Send + Sync,
+>(
+    threshold: T,
+    boxes: ArrayView2<T>,
+    scores: ArrayView2<T>,
+    quant: &Quantization<T>,
 ) -> Vec<DetectBoxQuantized<i16>> {
     assert_eq!(scores.dim().0, boxes.dim().0);
     assert_eq!(boxes.dim().1, 4);
-    let zp = quant.zero_point as i16;
+    let zp = quant.zero_point.as_();
     Zip::from(scores.rows())
         .and(boxes.rows())
         .into_par_iter()
@@ -23,10 +26,10 @@ pub fn postprocess_boxes_u8<T: BBoxTypeTrait>(
                 return None;
             }
 
-            let bbox_quant = T::ndarray_to_xyxy_quant(bbox, zp);
+            let bbox_quant = B::ndarray_to_xyxy_quant(bbox, zp);
             Some(DetectBoxQuantized::<i16> {
                 label,
-                score: score_ as i16,
+                score: score_.as_(),
                 xmin: bbox_quant[0],
                 ymin: bbox_quant[1],
                 xmax: bbox_quant[2],
@@ -36,47 +39,21 @@ pub fn postprocess_boxes_u8<T: BBoxTypeTrait>(
         .collect()
 }
 
-pub fn postprocess_boxes_i8<T: BBoxTypeTrait>(
-    threshold: i8,
-    boxes: ArrayView2<i8>,
-    scores: ArrayView2<i8>,
-    quant: &Quantization<i8>,
-) -> Vec<DetectBoxQuantized<i16>> {
-    assert_eq!(scores.dim().0, boxes.dim().0);
-    assert_eq!(boxes.dim().1, 4);
-    let zp = quant.zero_point as i16;
-    Zip::from(scores.rows())
-        .and(boxes.rows())
-        .into_par_iter()
-        .filter_map(|(score, bbox)| {
-            let (score_, label) = arg_max(score);
-            if score_ < threshold {
-                return None;
-            }
-
-            let bbox_quant = T::ndarray_to_xyxy_quant(bbox, zp);
-            Some(DetectBoxQuantized::<i16> {
-                label,
-                score: score_ as i16,
-                xmin: bbox_quant[0],
-                ymin: bbox_quant[1],
-                xmax: bbox_quant[2],
-                ymax: bbox_quant[3],
-            })
-        })
-        .collect()
-}
-
-pub fn postprocess_boxes_extra_i8<'a, T: BBoxTypeTrait, E: Send + Sync + PrimInt>(
-    threshold: i8,
-    boxes: ArrayView2<i8>,
-    scores: ArrayView2<i8>,
+pub fn postprocess_boxes_extra_8bit<
+    'a,
+    B: BBoxTypeTrait,
+    T: PrimInt + AsPrimitive<i16> + AsPrimitive<f32> + Send + Sync,
+    E: Send + Sync + PrimInt,
+>(
+    threshold: T,
+    boxes: ArrayView2<T>,
+    scores: ArrayView2<T>,
     extra: &'a ArrayView2<E>,
-    quant_boxes: &Quantization<i8>,
+    quant_boxes: &Quantization<T>,
 ) -> Vec<(DetectBoxQuantized<i16>, ArrayView1<'a, E>)> {
     assert_eq!(scores.dim().0, boxes.dim().0);
     assert_eq!(boxes.dim().1, 4);
-    let zp = quant_boxes.zero_point as i16;
+    let zp = quant_boxes.zero_point.as_();
     Zip::from(scores.rows())
         .and(boxes.rows())
         .and(extra.rows())
@@ -86,11 +63,11 @@ pub fn postprocess_boxes_extra_i8<'a, T: BBoxTypeTrait, E: Send + Sync + PrimInt
             if score_ < threshold {
                 return None;
             }
-            let bbox_quant = T::ndarray_to_xyxy_quant(bbox, zp);
+            let bbox_quant = B::ndarray_to_xyxy_quant(bbox, zp);
             Some((
                 DetectBoxQuantized::<i16> {
                     label,
-                    score: score_ as i16,
+                    score: score_.as_(),
                     xmin: bbox_quant[0],
                     ymin: bbox_quant[1],
                     xmax: bbox_quant[2],
@@ -100,6 +77,35 @@ pub fn postprocess_boxes_extra_i8<'a, T: BBoxTypeTrait, E: Send + Sync + PrimInt
             ))
         })
         .collect()
+}
+
+pub fn nms_i16(iou: f32, mut boxes: Vec<DetectBoxQuantized<i16>>) -> Vec<DetectBoxQuantized<i16>> {
+    // Boxes get sorted by score in descending order so we know based on the
+    // index the scoring of the boxes and can skip parts of the loop.
+    boxes.sort_by(|a, b| b.score.cmp(&a.score));
+    let min_val = i16::MIN;
+    // Outer loop over all boxes.
+    for i in 0..boxes.len() {
+        if boxes[i].score <= min_val {
+            // this box was merged with a different box earlier
+            continue;
+        }
+        for j in (i + 1)..boxes.len() {
+            // Inner loop over boxes with lower score (later in the list).
+
+            if boxes[j].score <= min_val {
+                // this box was suppressed by different box earlier
+                continue;
+            }
+            if jaccard_i16(&boxes[j], &boxes[i], iou) {
+                // suppress this box
+                boxes[j].score = min_val;
+            }
+        }
+    }
+
+    // Filter out boxes that were suppressed.
+    boxes.into_iter().filter(|b| b.score > min_val).collect()
 }
 
 pub fn nms_extra_i16<E>(
@@ -132,35 +138,6 @@ pub fn nms_extra_i16<E>(
 
     // Filter out boxes that were suppressed.
     boxes.into_iter().filter(|b| b.0.score > min_val).collect()
-}
-
-pub fn nms_i16(iou: f32, mut boxes: Vec<DetectBoxQuantized<i16>>) -> Vec<DetectBoxQuantized<i16>> {
-    // Boxes get sorted by score in descending order so we know based on the
-    // index the scoring of the boxes and can skip parts of the loop.
-    boxes.sort_by(|a, b| b.score.cmp(&a.score));
-    let min_val = i16::MIN;
-    // Outer loop over all boxes.
-    for i in 0..boxes.len() {
-        if boxes[i].score <= min_val {
-            // this box was merged with a different box earlier
-            continue;
-        }
-        for j in (i + 1)..boxes.len() {
-            // Inner loop over boxes with lower score (later in the list).
-
-            if boxes[j].score <= min_val {
-                // this box was suppressed by different box earlier
-                continue;
-            }
-            if jaccard_i16(&boxes[j], &boxes[i], iou) {
-                // suppress this box
-                boxes[j].score = min_val;
-            }
-        }
-    }
-
-    // Filter out boxes that were suppressed.
-    boxes.into_iter().filter(|b| b.score > min_val).collect()
 }
 
 // Returns true if the IOU of the given boxes are greater than the iou threshold
