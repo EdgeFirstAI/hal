@@ -3,11 +3,12 @@ use num_traits::AsPrimitive;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DetectBox, Error, Quantization, SegmentationMask,
+    DetectBox, Error, Quantization, Segmentation,
+    configs::{DecoderType, ModelType},
     modelpack::{
         ModelPackDetectionConfig, decode_modelpack_i8, decode_modelpack_split, decode_modelpack_u8,
     },
-    yolo::{decode_yolo_i8, decode_yolo_masks_i8, decode_yolo_masks_u8, decode_yolo_u8},
+    yolo::{decode_yolo_i8, decode_yolo_segdet_i8, decode_yolo_segdet_u8, decode_yolo_u8},
 };
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
@@ -19,15 +20,15 @@ pub struct ConfigOutputs {
 #[serde(tag = "type")]
 pub enum ConfigOutput {
     #[serde(rename = "detection")]
-    Detection(Detection),
+    Detection(configs::Detection),
     #[serde(rename = "masks")]
-    Mask(Mask),
+    Mask(configs::Mask),
     #[serde(rename = "segmentation")]
-    Segmentation(Segmentation),
+    Segmentation(configs::Segmentation),
     #[serde(rename = "scores")]
-    Scores(Scores),
+    Scores(configs::Scores),
     #[serde(rename = "boxes")]
-    Boxes(Boxes),
+    Boxes(configs::Boxes),
 }
 
 impl ConfigOutput {
@@ -41,7 +42,7 @@ impl ConfigOutput {
         }
     }
 
-    pub fn decoder(&self) -> &DecoderType {
+    pub fn decoder(&self) -> &configs::DecoderType {
         match self {
             ConfigOutput::Detection(detection) => &detection.decoder,
             ConfigOutput::Mask(mask) => &mask.decoder,
@@ -51,7 +52,7 @@ impl ConfigOutput {
         }
     }
 
-    pub fn dtype(&self) -> &DataType {
+    pub fn dtype(&self) -> &configs::DataType {
         match self {
             ConfigOutput::Detection(detection) => &detection.dtype,
             ConfigOutput::Mask(mask) => &mask.dtype,
@@ -72,107 +73,111 @@ impl ConfigOutput {
     }
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
-pub struct Segmentation {
-    pub decode: bool,
-    #[serde(rename = "decoder")]
-    pub decoder: DecoderType,
-    pub dtype: DataType,
-    pub name: String,
-    pub quantization: Option<(f64, i64)>,
-    pub shape: Vec<usize>,
-}
+pub mod configs {
+    use serde::{Deserialize, Serialize};
 
-#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
-pub struct Mask {
-    pub decode: bool,
-    pub decoder: DecoderType,
-    pub dtype: DataType,
-    pub name: String,
-    pub quantization: Option<(f64, i64)>,
-    pub shape: Vec<usize>,
-}
+    #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
+    pub struct Segmentation {
+        pub decode: bool,
+        #[serde(rename = "decoder")]
+        pub decoder: DecoderType,
+        pub dtype: DataType,
+        pub name: String,
+        pub quantization: Option<(f64, i64)>,
+        pub shape: Vec<usize>,
+    }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
-pub struct Detection {
-    pub anchors: Option<Vec<[f32; 2]>>,
-    pub decode: bool,
-    pub decoder: DecoderType,
-    pub dtype: DataType,
-    pub quantization: Option<(f64, i64)>,
-    pub shape: Vec<usize>,
-}
+    #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
+    pub struct Mask {
+        pub decode: bool,
+        pub decoder: DecoderType,
+        pub dtype: DataType,
+        pub name: String,
+        pub quantization: Option<(f64, i64)>,
+        pub shape: Vec<usize>,
+    }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
-pub struct Scores {
-    pub decoder: DecoderType,
-    pub dtype: DataType,
-    pub quantization: Option<(f64, i64)>,
-    pub shape: Vec<usize>,
-}
+    #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
+    pub struct Detection {
+        pub anchors: Option<Vec<[f32; 2]>>,
+        pub decode: bool,
+        pub decoder: DecoderType,
+        pub dtype: DataType,
+        pub quantization: Option<(f64, i64)>,
+        pub shape: Vec<usize>,
+    }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
-pub struct Boxes {
-    pub decoder: DecoderType,
-    pub dtype: DataType,
-    pub name: String,
-    pub quantization: Option<(f64, i64)>,
-    pub shape: Vec<usize>,
-}
+    #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
+    pub struct Scores {
+        pub decoder: DecoderType,
+        pub dtype: DataType,
+        pub quantization: Option<(f64, i64)>,
+        pub shape: Vec<usize>,
+    }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
-pub enum DecoderType {
-    #[serde(rename = "modelpack")]
-    ModelPack,
-    #[serde(rename = "yolov8")]
-    Yolov8,
-}
+    #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
+    pub struct Boxes {
+        pub decoder: DecoderType,
+        pub dtype: DataType,
+        pub name: String,
+        pub quantization: Option<(f64, i64)>,
+        pub shape: Vec<usize>,
+    }
 
-pub enum ModelType {
-    ModelPackSegDet {
-        boxes: Boxes,
-        scores: Scores,
-        segmentation: Segmentation,
-    },
-    ModelPackSegDetSplit {
-        detection: Vec<Detection>,
-        segmentation: Segmentation,
-    },
-    ModelPackDet {
-        boxes: Boxes,
-        scores: Scores,
-    },
-    ModelPackDetSplit {
-        detection: Vec<Detection>,
-    },
-    ModelPackSeg {
-        segmentation: Segmentation,
-    },
-    YoloDet {
-        boxes: Detection,
-    },
-    YoloSegDet {
-        boxes: Segmentation,
-        protos: Segmentation,
-    },
-}
+    #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
+    pub enum DecoderType {
+        #[serde(rename = "modelpack")]
+        ModelPack,
+        #[serde(rename = "yolov8")]
+        Yolov8,
+    }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DataType {
-    Raw = 0,
-    Int8 = 1,
-    UInt8 = 2,
-    Int16 = 3,
-    UInt16 = 4,
-    Float16 = 5,
-    Int32 = 6,
-    UInt32 = 7,
-    Float32 = 8,
-    Int64 = 9,
-    UInt64 = 10,
-    Float64 = 11,
-    String = 12,
+    pub enum ModelType {
+        ModelPackSegDet {
+            boxes: Boxes,
+            scores: Scores,
+            segmentation: Segmentation,
+        },
+        ModelPackSegDetSplit {
+            detection: Vec<Detection>,
+            segmentation: Segmentation,
+        },
+        ModelPackDet {
+            boxes: Boxes,
+            scores: Scores,
+        },
+        ModelPackDetSplit {
+            detection: Vec<Detection>,
+        },
+        ModelPackSeg {
+            segmentation: Segmentation,
+        },
+        YoloDet {
+            boxes: Detection,
+        },
+        YoloSegDet {
+            boxes: Segmentation,
+            protos: Segmentation,
+        },
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum DataType {
+        Raw = 0,
+        Int8 = 1,
+        UInt8 = 2,
+        Int16 = 3,
+        UInt16 = 4,
+        Float16 = 5,
+        Int32 = 6,
+        UInt32 = 7,
+        Float32 = 8,
+        Int64 = 9,
+        UInt64 = 10,
+        Float64 = 11,
+        String = 12,
+    }
 }
 
 pub struct DecoderBuilder {
@@ -368,7 +373,7 @@ impl Decoder {
         &self,
         outputs: &[ArrayViewD<u8>],
         output_boxes: &mut Vec<DetectBox>,
-        output_masks: &mut Vec<SegmentationMask>,
+        output_masks: &mut Vec<Segmentation>,
     ) -> Result<(), Error> {
         output_boxes.clear();
         output_masks.clear();
@@ -411,7 +416,7 @@ impl Decoder {
         &self,
         outputs: &[ArrayViewD<i8>],
         output_boxes: &mut Vec<DetectBox>,
-        output_masks: &mut Vec<SegmentationMask>,
+        output_masks: &mut Vec<Segmentation>,
     ) -> Result<(), Error> {
         output_boxes.clear();
         output_masks.clear();
@@ -453,7 +458,7 @@ impl Decoder {
     fn decode_modelpack_det_split<D>(
         &self,
         outputs: &[ArrayViewD<D>],
-        detection: &[Detection],
+        detection: &[configs::Detection],
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<(), Error>
     where
@@ -485,13 +490,13 @@ impl Decoder {
     fn decode_modelpack_seg_i8(
         &self,
         outputs: &[ArrayViewD<i8>],
-        segmentation: &Segmentation,
-        output_masks: &mut Vec<SegmentationMask>,
+        segmentation: &configs::Segmentation,
+        output_masks: &mut Vec<Segmentation>,
     ) -> Result<(), Error> {
         let seg = Self::find_outputs_with_shape(&segmentation.shape, outputs)?;
         let seg = seg.slice(s![0, .., .., ..]);
         let seg = seg.mapv(|x| (x as i16 + 128) as u8);
-        output_masks.push(SegmentationMask {
+        output_masks.push(Segmentation {
             xmin: 0.0,
             ymin: 0.0,
             xmax: 1.0,
@@ -504,8 +509,8 @@ impl Decoder {
     fn decode_modelpack_det_i8(
         &self,
         outputs: &[ArrayViewD<i8>],
-        boxes: &Boxes,
-        scores: &Scores,
+        boxes: &configs::Boxes,
+        scores: &configs::Scores,
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<(), Error> {
         let quant_boxes = boxes
@@ -537,7 +542,7 @@ impl Decoder {
     fn decode_yolo_det_i8(
         &self,
         outputs: &[ArrayViewD<i8>],
-        boxes: &Detection,
+        boxes: &configs::Detection,
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<(), Error> {
         let quant_boxes = boxes
@@ -560,10 +565,10 @@ impl Decoder {
     fn decode_yolo_segdet_i8(
         &self,
         outputs: &[ArrayViewD<i8>],
-        boxes: &Segmentation,
-        protos: &Segmentation,
+        boxes: &configs::Segmentation,
+        protos: &configs::Segmentation,
         output_boxes: &mut Vec<DetectBox>,
-        output_masks: &mut Vec<SegmentationMask>,
+        output_masks: &mut Vec<Segmentation>,
     ) -> Result<(), Error> {
         let quant_boxes = boxes
             .quantization
@@ -579,7 +584,7 @@ impl Decoder {
         let protos = Self::find_outputs_with_shape(&protos.shape, outputs)?;
         let protos = protos.slice(s![0, .., .., ..]);
 
-        decode_yolo_masks_i8(
+        decode_yolo_segdet_i8(
             box_output,
             protos,
             &quant_boxes,
@@ -595,8 +600,8 @@ impl Decoder {
     fn decode_modelpack_seg_u8(
         &self,
         outputs: &[ArrayViewD<u8>],
-        segmentation: &Segmentation,
-        output_masks: &mut Vec<SegmentationMask>,
+        segmentation: &configs::Segmentation,
+        output_masks: &mut Vec<Segmentation>,
     ) -> Result<(), Error> {
         let seg = Self::find_outputs_with_shape(&segmentation.shape, outputs)?;
         let seg = seg.slice(s![0, .., .., ..]);
@@ -604,7 +609,7 @@ impl Decoder {
         // TODO: Adjust signatures so this doesn't need to clone the entire backing
         // array?
         let seg = seg.to_owned();
-        output_masks.push(SegmentationMask {
+        output_masks.push(Segmentation {
             xmin: 0.0,
             ymin: 0.0,
             xmax: 1.0,
@@ -617,8 +622,8 @@ impl Decoder {
     fn decode_modelpack_det_u8(
         &self,
         outputs: &[ArrayViewD<u8>],
-        boxes: &Boxes,
-        scores: &Scores,
+        boxes: &configs::Boxes,
+        scores: &configs::Scores,
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<(), Error> {
         let quant_boxes = boxes
@@ -650,7 +655,7 @@ impl Decoder {
     fn decode_yolo_det_u8(
         &self,
         outputs: &[ArrayViewD<u8>],
-        boxes: &Detection,
+        boxes: &configs::Detection,
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<(), Error> {
         let quant_boxes = boxes
@@ -673,10 +678,10 @@ impl Decoder {
     fn decode_yolo_segdet_u8(
         &self,
         outputs: &[ArrayViewD<u8>],
-        boxes: &Segmentation,
-        protos: &Segmentation,
+        boxes: &configs::Segmentation,
+        protos: &configs::Segmentation,
         output_boxes: &mut Vec<DetectBox>,
-        output_masks: &mut Vec<SegmentationMask>,
+        output_masks: &mut Vec<Segmentation>,
     ) -> Result<(), Error> {
         let quant_boxes = boxes
             .quantization
@@ -692,7 +697,7 @@ impl Decoder {
         let protos = Self::find_outputs_with_shape(&protos.shape, outputs)?;
         let protos = protos.slice(s![0, .., .., ..]);
 
-        decode_yolo_masks_u8(
+        decode_yolo_segdet_u8(
             box_output,
             protos,
             &quant_boxes,
@@ -706,7 +711,7 @@ impl Decoder {
     }
 
     fn match_outputs_to_detect<'a, 'b, T>(
-        configs: &[Detection],
+        configs: &[configs::Detection],
         outputs: &'a [ArrayViewD<'b, T>],
     ) -> Result<Vec<&'a ArrayViewD<'b, T>>, Error> {
         let mut new_output_order = Vec::new();

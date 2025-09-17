@@ -2,8 +2,9 @@ use ndarray::{Array2, ArrayView2, ArrayView3};
 use num_traits::{AsPrimitive, Float, PrimInt};
 
 use crate::{
-    BBoxTypeTrait, DetectBox, Detection, Quantization, XYWH, XYXY,
+    BBoxTypeTrait, DetectBox, Quantization, XYWH, XYXY,
     byte::{nms_i16, postprocess_boxes_8bit, quantize_score_threshold},
+    configs::Detection,
     dequant_detect_box,
     error::Result,
     float::{nms_f32, postprocess_boxes_float},
@@ -253,7 +254,7 @@ pub fn postprocess_modelpack_split<T: AsPrimitive<f32>>(
     Ok((bboxes, bscores))
 }
 
-#[inline]
+#[inline(always)]
 pub fn fast_sigmoid(f: &mut f32) {
     *f = fast_sigmoid_impl(*f);
 }
@@ -266,4 +267,23 @@ pub fn fast_sigmoid_impl(f: f32) -> f32 {
         // these values are only valid for -88 < x < 88
         1.0 / (1.0 + fast_math::exp_raw(-f))
     }
+}
+
+pub fn modelpack_segmentation_to_mask(segmentation: ArrayView3<u8>) -> Array2<u8> {
+    use argminmax::ArgMinMax;
+    assert!(
+        segmentation.shape()[2] > 1,
+        "Model Instance Segmentation should have shape (H, W, x) where x > 1"
+    );
+    let height = segmentation.shape()[0];
+    let width = segmentation.shape()[1];
+    let channels = segmentation.shape()[2];
+    let segmentation = segmentation.as_standard_layout();
+    let seg = segmentation.as_slice().unwrap();
+    let argmax = seg
+        .chunks_exact(channels)
+        .map(|x| x.argmax() as u8)
+        .collect::<Vec<_>>();
+
+    Array2::from_shape_vec((height, width), argmax).unwrap()
 }

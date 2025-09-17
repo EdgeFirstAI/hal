@@ -1,7 +1,8 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 use edgefirst::decoder::{
-    Decoder, DecoderBuilder, DetectBox, Quantization, QuantizationF64, SegmentationMask,
+    Decoder, DecoderBuilder, DetectBox, Quantization, QuantizationF64, Segmentation,
     dequantize_cpu_chunked, dequantize_cpu_chunked_f64, modelpack::ModelPackDetectionConfig,
+    segmentation_to_mask,
 };
 use ndarray::{Array1, Array2};
 use numpy::{
@@ -206,7 +207,7 @@ impl PyDecoder {
 
         match (boxes, protos) {
             (ReadOnlyArrayGeneric2::UInt8(boxes), ReadOnlyArrayGeneric3::UInt8(protos)) => {
-                edgefirst::decoder::yolo::decode_yolo_masks_u8(
+                edgefirst::decoder::yolo::decode_yolo_segdet_u8(
                     boxes.as_array(),
                     protos.as_array(),
                     &Quantization::new(quant_boxes.0 as f32, u8::try_from(quant_boxes.1)?),
@@ -218,7 +219,7 @@ impl PyDecoder {
                 );
             }
             (ReadOnlyArrayGeneric2::Int8(boxes), ReadOnlyArrayGeneric3::Int8(protos)) => {
-                edgefirst::decoder::yolo::decode_yolo_masks_i8(
+                edgefirst::decoder::yolo::decode_yolo_segdet_i8(
                     boxes.as_array(),
                     protos.as_array(),
                     &Quantization::new(quant_boxes.0 as f32, i8::try_from(quant_boxes.1)?),
@@ -230,7 +231,7 @@ impl PyDecoder {
                 );
             }
             (ReadOnlyArrayGeneric2::Float32(boxes), ReadOnlyArrayGeneric3::Float32(protos)) => {
-                edgefirst::decoder::yolo::decode_yolo_masks_f32(
+                edgefirst::decoder::yolo::decode_yolo_segdet_f32(
                     boxes.as_array(),
                     protos.as_array(),
                     score_threshold as f32,
@@ -240,7 +241,7 @@ impl PyDecoder {
                 );
             }
             (ReadOnlyArrayGeneric2::Float64(boxes), ReadOnlyArrayGeneric3::Float64(protos)) => {
-                edgefirst::decoder::yolo::decode_yolo_masks_f64(
+                edgefirst::decoder::yolo::decode_yolo_segdet_f64(
                     boxes.as_array(),
                     protos.as_array(),
                     score_threshold,
@@ -453,6 +454,7 @@ impl PyDecoder {
     }
 
     #[staticmethod]
+    #[pyo3(signature = (quantized, quant_boxes, dequant_into))]
     pub fn dequantize<'py>(
         quantized: ReadOnlyArrayGenericQuantized<'py>,
         quant_boxes: (f64, i64),
@@ -528,6 +530,14 @@ impl PyDecoder {
         }
         Ok(())
     }
+
+    #[staticmethod]
+    #[pyo3(signature = (segmentation))]
+    pub fn segmentation_to_mask<'py>(
+        segmentation: PyReadonlyArray3<'py, u8>,
+    ) -> Bound<'py, PyArray2<u8>> {
+        segmentation_to_mask(segmentation.as_array()).to_pyarray(segmentation.py())
+    }
 }
 
 fn convert_detect_box<'py>(py: Python<'py>, output_boxes: &[DetectBox]) -> PyDetOutput<'py> {
@@ -550,7 +560,7 @@ fn convert_detect_box<'py>(py: Python<'py>, output_boxes: &[DetectBox]) -> PyDet
 
 fn convert_seg_mask<'py>(
     py: Python<'py>,
-    output_masks: &[SegmentationMask],
+    output_masks: &[Segmentation],
 ) -> Vec<Bound<'py, PyArray3<u8>>> {
     output_masks.iter().map(|x| x.mask.to_pyarray(py)).collect()
 }

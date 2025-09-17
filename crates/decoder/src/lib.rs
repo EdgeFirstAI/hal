@@ -2,7 +2,7 @@
 #![allow(clippy::excessive_precision)]
 use std::ops::{Add, Mul, Sub};
 
-use ndarray::{Array, Array3, ArrayView, ArrayView1, Dimension};
+use ndarray::{Array, Array2, Array3, ArrayView, ArrayView1, ArrayView3, Dimension};
 use num_traits::{AsPrimitive, Float, PrimInt};
 
 pub mod byte;
@@ -15,6 +15,8 @@ mod decoder;
 pub use decoder::*;
 
 pub use error::Error;
+
+use crate::{modelpack::modelpack_segmentation_to_mask, yolo::yolo_segmentation_to_mask};
 
 pub trait BBoxTypeTrait {
     /// Converts the bbox into XYXY quantized format. The XYXY quantized values
@@ -237,7 +239,7 @@ impl DetectBox {
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct SegmentationMask {
+pub struct Segmentation {
     /// left-most normalized coordinate of the segmentation box
     pub xmin: f32,
     /// top-most normalized coordinate of the segmentation box
@@ -433,6 +435,15 @@ pub fn dequantize_cpu_chunked_f64<T: AsPrimitive<f64>>(
     }
 }
 
+pub fn segmentation_to_mask(segmentation: ArrayView3<u8>) -> Array2<u8> {
+    assert!(segmentation.shape()[2] > 0);
+    if segmentation.shape()[2] == 1 {
+        yolo_segmentation_to_mask(segmentation, 128)
+    } else {
+        modelpack_segmentation_to_mask(segmentation)
+    }
+}
+
 fn arg_max<T: PartialOrd + Copy>(score: ArrayView1<T>) -> (T, usize) {
     score
         .iter()
@@ -448,7 +459,7 @@ mod tests {
 
     use crate::{
         modelpack::{ModelPackDetectionConfig, decode_modelpack_split, decode_modelpack_u8},
-        yolo::{decode_yolo_f32, decode_yolo_i8, decode_yolo_masks_f32, decode_yolo_masks_i8},
+        yolo::{decode_yolo_f32, decode_yolo_i8, decode_yolo_segdet_f32, decode_yolo_segdet_i8},
         *,
     };
 
@@ -703,7 +714,7 @@ mod tests {
         let seg = dequantize_ndarray(&quant_boxes, boxes.view());
         let mut output_boxes: Vec<_> = Vec::with_capacity(10);
         let mut output_masks: Vec<_> = Vec::with_capacity(10);
-        decode_yolo_masks_f32(
+        decode_yolo_segdet_f32(
             seg.view(),
             protos.view(),
             score_threshold,
@@ -738,7 +749,7 @@ mod tests {
         let mut output_boxes: Vec<_> = Vec::with_capacity(500);
         let mut output_masks: Vec<_> = Vec::with_capacity(500);
 
-        decode_yolo_masks_i8(
+        decode_yolo_segdet_i8(
             boxes.view(),
             protos.view(),
             &quant_boxes,
@@ -753,7 +764,7 @@ mod tests {
         let seg = dequantize_ndarray(&quant_boxes, boxes.view());
         let mut output_boxes_f32: Vec<_> = Vec::with_capacity(500);
         let mut output_masks_f32: Vec<_> = Vec::with_capacity(500);
-        decode_yolo_masks_f32(
+        decode_yolo_segdet_f32(
             seg.view(),
             protos.view(),
             score_threshold,

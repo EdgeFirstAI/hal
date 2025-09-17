@@ -7,7 +7,7 @@ use edgefirst_decoder::{
     dequant_detect_box, dequantize_cpu, dequantize_cpu_chunked, dequantize_ndarray,
     float::{nms_f32, postprocess_boxes_float},
     modelpack::{ModelPackDetectionConfig, decode_modelpack_split, decode_modelpack_u8},
-    yolo::{decode_yolo_f32, decode_yolo_i8, decode_yolo_masks_f32, decode_yolo_masks_i8},
+    yolo::{decode_yolo_f32, decode_yolo_i8, decode_yolo_segdet_f32, decode_yolo_segdet_i8},
 };
 use ndarray::s;
 
@@ -131,7 +131,7 @@ fn decoder_f32_dequantize(bencher: divan::Bencher) {
     bencher
         .with_inputs(|| buf.clone())
         .bench_local_values(|mut buf| {
-            dequantize_cpu_chunked(&out, &quant, &mut buf);
+            dequantize_cpu(&out, &quant, &mut buf);
             let out = ndarray::Array2::from_shape_vec((84, 8400), buf).unwrap();
             black_box_drop(out);
         });
@@ -322,7 +322,7 @@ fn decoder_masks(bencher: divan::Bencher) {
         let seg = dequantize_ndarray(&quant_boxes, boxes.view());
         let mut output_boxes: Vec<_> = Vec::with_capacity(10);
         let mut output_masks: Vec<_> = Vec::with_capacity(10);
-        decode_yolo_masks_f32(
+        decode_yolo_segdet_f32(
             seg.view(),
             protos.view(),
             score_threshold,
@@ -358,7 +358,7 @@ fn decoder_masks_i8(bencher: divan::Bencher) {
     bencher.bench_local(|| {
         let mut output_boxes: Vec<_> = Vec::with_capacity(10);
         let mut output_masks: Vec<_> = Vec::with_capacity(10);
-        decode_yolo_masks_i8(
+        decode_yolo_segdet_i8(
             boxes.view(),
             protos.view(),
             &quant_boxes,
