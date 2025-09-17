@@ -150,30 +150,54 @@ pub struct Quantization<T: AsPrimitive<f32>> {
     pub zero_point: T,
 }
 
-impl From<[f32; 2]> for Quantization<i8> {
-    fn from(value: [f32; 2]) -> Self {
-        Quantization {
-            scale: value[0],
-            zero_point: value[1] as i8,
+impl<T: AsPrimitive<f32>> Quantization<T> {
+    pub fn new(scale: f32, zero_point: T) -> Self {
+        Self { scale, zero_point }
+    }
+
+    pub fn from_tuple_truncate<S: AsPrimitive<f32>, Z: AsPrimitive<T>>(
+        (scale, zero_point): (S, Z),
+    ) -> Self {
+        Quantization::<T> {
+            scale: scale.as_(),
+            zero_point: zero_point.as_(),
         }
     }
 }
 
-impl From<[f32; 2]> for Quantization<u8> {
-    fn from(value: [f32; 2]) -> Self {
-        Quantization {
-            scale: value[0],
-            zero_point: value[1] as u8,
+impl<T> Quantization<T>
+where
+    T: AsPrimitive<f32>,
+{
+    pub fn from_array_truncate<F: AsPrimitive<T> + AsPrimitive<f32>>(value: [F; 2]) -> Self {
+        Quantization::<T> {
+            scale: value[0].as_(),
+            zero_point: value[1].as_(),
         }
     }
 }
 
-impl From<[f32; 2]> for Quantization<f32> {
-    fn from(value: [f32; 2]) -> Self {
-        Quantization {
-            scale: value[0],
-            zero_point: value[1],
+impl<T: AsPrimitive<f32> + PrimInt> Default for Quantization<T> {
+    fn default() -> Self {
+        Self {
+            scale: 1.0,
+            zero_point: T::zero(),
         }
+    }
+}
+
+impl<T, S, Z> TryFrom<(S, Z)> for Quantization<T>
+where
+    T: AsPrimitive<f32> + TryFrom<Z>,
+    S: AsPrimitive<f32>,
+{
+    type Error = <T as TryFrom<Z>>::Error;
+
+    fn try_from((scale, zero_point): (S, Z)) -> Result<Self, Self::Error> {
+        Ok(Quantization::<T> {
+            scale: scale.as_(),
+            zero_point: T::try_from(zero_point)?,
+        })
     }
 }
 
@@ -283,8 +307,8 @@ pub fn dequantize_ndarray<T: AsPrimitive<f32>, D: Dimension>(
 }
 
 pub fn dequantize_cpu<T: AsPrimitive<f32>>(
-    quant: &Quantization<T>,
     input: &[T],
+    quant: &Quantization<T>,
     output: &mut [f32],
 ) {
     assert!(input.len() == output.len());
@@ -306,8 +330,8 @@ pub fn dequantize_cpu<T: AsPrimitive<f32>>(
 }
 
 pub fn dequantize_cpu_chunked<T: AsPrimitive<f32>>(
-    quant: &Quantization<T>,
     input: &[T],
+    quant: &Quantization<T>,
     output: &mut [f32],
 ) {
     assert!(input.len() == output.len());
@@ -370,8 +394,8 @@ pub fn dequantize_cpu_f64<T: AsPrimitive<f64>>(
 }
 
 pub fn dequantize_cpu_chunked_f64<T: AsPrimitive<f64>>(
-    quant: &QuantizationF64<T>,
     input: &[T],
+    quant: &QuantizationF64<T>,
     output: &mut [f64],
 ) {
     assert!(input.len() == output.len());
@@ -436,10 +460,7 @@ mod tests {
         let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
         let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
         let out = ndarray::Array2::from_shape_vec((84, 8400), out.to_vec()).unwrap();
-        let quant = Quantization::<i8> {
-            scale: 0.0040811873,
-            zero_point: -123i8,
-        };
+        let quant = Quantization::new(0.0040811873, -123);
         let mut output_boxes: Vec<_> = Vec::with_capacity(50);
         decode_yolo_i8(
             out.view(),
@@ -482,11 +503,8 @@ mod tests {
         let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
         let mut out_dequant = vec![0.0; 84 * 8400];
 
-        let quant = Quantization::<i8> {
-            scale: 0.0040811873,
-            zero_point: -123i8,
-        };
-        dequantize_cpu(&quant, out, &mut out_dequant);
+        let quant = Quantization::new(0.0040811873, -123);
+        dequantize_cpu(out, &quant, &mut out_dequant);
         let out = ndarray::Array2::from_shape_vec((84, 8400), out_dequant).unwrap();
 
         let mut output_boxes: Vec<_> = Vec::with_capacity(50);
@@ -532,15 +550,8 @@ mod tests {
         let scores = include_bytes!("../../../testdata/modelpack_scores_1935x1.bin");
         let scores = ndarray::Array2::from_shape_vec((1935, 1), scores.to_vec()).unwrap();
 
-        let quant_boxes = Quantization::<u8> {
-            scale: 0.004656755365431309,
-            zero_point: 21,
-        };
-
-        let quant_scores = Quantization::<u8> {
-            scale: 0.0019603664986789227,
-            zero_point: 0,
-        };
+        let quant_boxes = Quantization::new(0.004656755365431309, 21);
+        let quant_scores = Quantization::new(0.0019603664986789227, 0);
 
         let mut output_boxes: Vec<_> = Vec::with_capacity(50);
         decode_modelpack_u8(
@@ -578,10 +589,7 @@ mod tests {
                 [0.38749998807907104, 0.4740740656852722],
                 [0.5333333611488342, 0.644444465637207],
             ],
-            quantization: Some(Quantization {
-                scale: 0.08547406643629074,
-                zero_point: 174,
-            }),
+            quantization: Some(Quantization::new(0.08547406643629074, 174)),
         };
 
         let detect1 = include_bytes!("../../../testdata/modelpack_split_17x30x18.bin");
@@ -670,13 +678,10 @@ mod tests {
         let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
         let mut out_dequant = vec![0.0; 84 * 8400];
         let mut out_dequant_simd = vec![0.0; 84 * 8400];
-        let quant = Quantization::<i8> {
-            scale: 0.0040811873,
-            zero_point: -123i8,
-        };
-        dequantize_cpu(&quant, out, &mut out_dequant);
+        let quant = Quantization::new(0.0040811873, -123);
+        dequantize_cpu(out, &quant, &mut out_dequant);
 
-        dequantize_cpu_chunked(&quant, out, &mut out_dequant_simd);
+        dequantize_cpu_chunked(out, &quant, &mut out_dequant_simd);
 
         assert_eq!(out_dequant, out_dequant_simd);
     }
@@ -688,20 +693,13 @@ mod tests {
         let boxes = include_bytes!("../../../testdata/yolov8_segmentation_37x8400.bin");
         let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
         let boxes = ndarray::Array2::from_shape_vec((37, 8400), boxes.to_vec()).unwrap();
-        let quant_boxes = Quantization::<i8> {
-            scale: 0.01948494464159012,
-            zero_point: 20,
-        };
+        let quant_boxes = Quantization::new(0.01948494464159012, 20);
 
         let protos = include_bytes!("../../../testdata/yolov8_protos_160x160x32.bin");
         let protos =
             unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
         let protos = ndarray::Array3::from_shape_vec((160, 160, 32), protos.to_vec()).unwrap();
-        let quant_protos = Quantization::<i8> {
-            scale: 0.020889872685074806,
-            zero_point: -115,
-        };
-
+        let quant_protos = Quantization::new(0.020889872685074806, -115);
         let protos = dequantize_ndarray(&quant_protos, protos.view());
         let seg = dequantize_ndarray(&quant_boxes, boxes.view());
         let mut output_boxes: Vec<_> = Vec::with_capacity(10);
@@ -731,19 +729,13 @@ mod tests {
         let boxes = include_bytes!("../../../testdata/yolov8_segmentation_37x8400.bin");
         let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
         let boxes = ndarray::Array2::from_shape_vec((37, 8400), boxes.to_vec()).unwrap();
-        let quant_boxes = Quantization::<i8> {
-            scale: 0.01948494464159012,
-            zero_point: 20,
-        };
+        let quant_boxes = Quantization::new(0.01948494464159012, 20);
 
         let protos = include_bytes!("../../../testdata/yolov8_protos_160x160x32.bin");
         let protos =
             unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
         let protos = ndarray::Array3::from_shape_vec((160, 160, 32), protos.to_vec()).unwrap();
-        let quant_protos = Quantization::<i8> {
-            scale: 0.020889872685074806,
-            zero_point: -115,
-        };
+        let quant_protos = Quantization::new(0.020889872685074806, -115);
         let mut output_boxes: Vec<_> = Vec::with_capacity(500);
         let mut output_masks: Vec<_> = Vec::with_capacity(500);
 
