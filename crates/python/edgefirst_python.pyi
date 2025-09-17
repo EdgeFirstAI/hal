@@ -59,7 +59,7 @@ class Decoder:
     ) -> SegDetOutput:
         ...
 
-# [pyo3(signature = (boxes, scores, quant_boxes=(1.0, 0), quant_scores=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
+    # [pyo3(signature = (boxes, scores, quant_boxes=(1.0, 0), quant_scores=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
     @staticmethod
     def decode_modelpack_det(
         boxes: Union[npt.NDArray[np.uint8], npt.NDArray[np.int8], npt.NDArray[np.float32]],
@@ -73,6 +73,7 @@ class Decoder:
         ...
 
     # [pyo3(signature = (boxes, anchors, quant=Vec::new(), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
+    @staticmethod
     def decode_modelpack_det_split(
         boxes: list[Union[npt.NDArray[np.uint8], npt.NDArray[np.int8], npt.NDArray[np.float32]]],
         anchors: list[list[list[int]]],
@@ -83,10 +84,16 @@ class Decoder:
     ) -> DetectionOutput:
         ...
 
+    # [pyo3(signature = (quantized, quant_boxes, dequant_into))]
     @staticmethod
     def dequantize(
         quantized: Union[npt.NDArray[np.uint8], npt.NDArray[np.int8]],
         quant_boxes: tuple[float, int],
         dequant_into: Union[npt.NDArray[np.float32], npt.NDArray[np.float64]]
     ) -> None:
+        ...
+
+    # [pyo3(signature = (segmentation))]
+    @staticmethod
+    def segmentation_to_mask(segmentation: npt.NDArray[np.uint8]) -> None:
         ...

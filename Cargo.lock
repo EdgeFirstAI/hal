@@ -109,6 +109,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "argminmax"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70f13d10a41ac8d2ec79ee34178d61e6f47a29c2edfe7ef1721c7383b0359e65"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "arrayvec"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -447,6 +456,7 @@ dependencies = [
 name = "edgefirst-decoder"
 version = "0.0.0"
 dependencies = [
+ "argminmax",
  "divan",
  "env_logger",
  "fast-math",
