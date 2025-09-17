@@ -1,7 +1,7 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 use edgefirst::decoder::{
     Decoder, DecoderBuilder, DetectBox, Quantization, QuantizationF64, SegmentationMask,
-    dequantize_cpu_chunked, dequantize_cpu_chunked_f64,
+    dequantize_cpu_chunked, dequantize_cpu_chunked_f64, modelpack::ModelPackDetectionConfig,
 };
 use ndarray::{Array1, Array2};
 use numpy::{
@@ -24,27 +24,35 @@ pub type PySegDetOutput<'py> = (
 );
 
 #[derive(FromPyObject)]
-pub enum ListOfReadOnlyArrayGenericDyn<'a> {
-    UInt8(Vec<PyReadonlyArrayDyn<'a, u8>>),
-    Int8(Vec<PyReadonlyArrayDyn<'a, i8>>),
-    Float32(Vec<PyReadonlyArrayDyn<'a, f32>>),
-    Float64(Vec<PyReadonlyArrayDyn<'a, f64>>),
+pub enum ListOfReadOnlyArrayGenericDyn<'py> {
+    UInt8(Vec<PyReadonlyArrayDyn<'py, u8>>),
+    Int8(Vec<PyReadonlyArrayDyn<'py, i8>>),
+    Float32(Vec<PyReadonlyArrayDyn<'py, f32>>),
+    Float64(Vec<PyReadonlyArrayDyn<'py, f64>>),
 }
 
 #[derive(FromPyObject)]
-pub enum ReadOnlyArrayGeneric2<'a> {
-    UInt8(PyReadonlyArray2<'a, u8>),
-    Int8(PyReadonlyArray2<'a, i8>),
-    Float32(PyReadonlyArray2<'a, f32>),
-    Float64(PyReadonlyArray2<'a, f64>),
+pub enum ListOfReadOnlyArrayGeneric3<'py> {
+    UInt8(Vec<PyReadonlyArray3<'py, u8>>),
+    Int8(Vec<PyReadonlyArray3<'py, i8>>),
+    Float32(Vec<PyReadonlyArray3<'py, f32>>),
+    Float64(Vec<PyReadonlyArray3<'py, f64>>),
 }
 
 #[derive(FromPyObject)]
-pub enum ReadOnlyArrayGeneric3<'a> {
-    UInt8(PyReadonlyArray3<'a, u8>),
-    Int8(PyReadonlyArray3<'a, i8>),
-    Float32(PyReadonlyArray3<'a, f32>),
-    Float64(PyReadonlyArray3<'a, f64>),
+pub enum ReadOnlyArrayGeneric2<'py> {
+    UInt8(PyReadonlyArray2<'py, u8>),
+    Int8(PyReadonlyArray2<'py, i8>),
+    Float32(PyReadonlyArray2<'py, f32>),
+    Float64(PyReadonlyArray2<'py, f64>),
+}
+
+#[derive(FromPyObject)]
+pub enum ReadOnlyArrayGeneric3<'py> {
+    UInt8(PyReadonlyArray3<'py, u8>),
+    Int8(PyReadonlyArray3<'py, i8>),
+    Float32(PyReadonlyArray3<'py, f32>),
+    Float64(PyReadonlyArray3<'py, f64>),
 }
 
 #[derive(FromPyObject)]
@@ -138,129 +146,47 @@ impl PyDecoder {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (model_output, scale=1.0, zero_point=0, score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
+    #[pyo3(signature = (boxes, quant_boxes=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
     pub fn decode_yolo<'py>(
         py: Python<'py>,
-        model_output: ReadOnlyArrayGeneric2,
-        scale: f64,
-        zero_point: i64,
+        boxes: ReadOnlyArrayGeneric2,
+        quant_boxes: (f64, i64),
         score_threshold: f64,
         iou_threshold: f64,
         max_boxes: usize,
     ) -> PyResult<PyDetOutput<'py>> {
-        let out = match model_output {
-            ReadOnlyArrayGeneric2::UInt8(output) => Self::decode_yolo_u8(
-                py,
-                output,
-                scale as f32,
-                u8::try_from(zero_point)?,
+        let mut output_boxes = Vec::with_capacity(max_boxes);
+        match boxes {
+            ReadOnlyArrayGeneric2::UInt8(output) => edgefirst::decoder::yolo::decode_yolo_u8(
+                output.as_array(),
+                &Quantization::new(quant_boxes.0 as f32, u8::try_from(quant_boxes.1)?),
                 score_threshold as f32,
                 iou_threshold as f32,
-                max_boxes,
+                &mut output_boxes,
             ),
-            ReadOnlyArrayGeneric2::Int8(output) => Self::decode_yolo_i8(
-                py,
-                output,
-                scale as f32,
-                i8::try_from(zero_point)?,
+            ReadOnlyArrayGeneric2::Int8(output) => edgefirst::decoder::yolo::decode_yolo_i8(
+                output.as_array(),
+                &Quantization::new(quant_boxes.0 as f32, i8::try_from(quant_boxes.1)?),
                 score_threshold as f32,
                 iou_threshold as f32,
-                max_boxes,
+                &mut output_boxes,
             ),
-            ReadOnlyArrayGeneric2::Float32(output) => Self::decode_yolo_f32(
-                py,
-                output,
+            ReadOnlyArrayGeneric2::Float32(output) => edgefirst::decoder::yolo::decode_yolo_f32(
+                output.as_array(),
                 score_threshold as f32,
                 iou_threshold as f32,
-                max_boxes,
+                &mut output_boxes,
             ),
             ReadOnlyArrayGeneric2::Float64(output) => {
-                Self::decode_yolo_f64(py, output, score_threshold, iou_threshold, max_boxes)
+                edgefirst::decoder::yolo::decode_yolo_f64(
+                    output.as_array(),
+                    score_threshold,
+                    iou_threshold,
+                    &mut output_boxes,
+                );
             }
         };
-        Ok(out)
-    }
-
-    #[staticmethod]
-    #[pyo3(signature = (model_output, scale, zero_point, score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
-    pub fn decode_yolo_u8<'py>(
-        py: Python<'py>,
-        model_output: PyReadonlyArray2<u8>,
-        scale: f32,
-        zero_point: u8,
-        score_threshold: f32,
-        iou_threshold: f32,
-        max_boxes: usize,
-    ) -> PyDetOutput<'py> {
-        let mut output_boxes = Vec::with_capacity(max_boxes);
-        edgefirst::decoder::yolo::decode_yolo_u8(
-            model_output.as_array(),
-            &Quantization { zero_point, scale },
-            score_threshold,
-            iou_threshold,
-            &mut output_boxes,
-        );
-        convert_detect_box(py, &output_boxes)
-    }
-
-    #[staticmethod]
-    #[pyo3(signature = (model_output, scale, zero_point, score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
-    pub fn decode_yolo_i8<'py>(
-        py: Python<'py>,
-        model_output: PyReadonlyArray2<i8>,
-        scale: f32,
-        zero_point: i8,
-        score_threshold: f32,
-        iou_threshold: f32,
-        max_boxes: usize,
-    ) -> PyDetOutput<'py> {
-        let mut output_boxes = Vec::with_capacity(max_boxes);
-        edgefirst::decoder::yolo::decode_yolo_i8(
-            model_output.as_array(),
-            &Quantization { zero_point, scale },
-            score_threshold,
-            iou_threshold,
-            &mut output_boxes,
-        );
-        convert_detect_box(py, &output_boxes)
-    }
-
-    #[staticmethod]
-    #[pyo3(signature = (model_output, score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
-    pub fn decode_yolo_f32<'py>(
-        py: Python<'py>,
-        model_output: PyReadonlyArray2<f32>,
-        score_threshold: f32,
-        iou_threshold: f32,
-        max_boxes: usize,
-    ) -> PyDetOutput<'py> {
-        let mut output_boxes = Vec::with_capacity(max_boxes);
-        edgefirst::decoder::yolo::decode_yolo_f32(
-            model_output.as_array(),
-            score_threshold,
-            iou_threshold,
-            &mut output_boxes,
-        );
-        convert_detect_box(py, &output_boxes)
-    }
-
-    #[staticmethod]
-    #[pyo3(signature = (model_output, score_threshold=0.1, iou_threshold=0.7, max_boxes=100,))]
-    pub fn decode_yolo_f64<'py>(
-        py: Python<'py>,
-        model_output: PyReadonlyArray2<f64>,
-        score_threshold: f64,
-        iou_threshold: f64,
-        max_boxes: usize,
-    ) -> PyDetOutput<'py> {
-        let mut output_boxes = Vec::with_capacity(max_boxes);
-        edgefirst::decoder::yolo::decode_yolo_f64(
-            model_output.as_array(),
-            score_threshold,
-            iou_threshold,
-            &mut output_boxes,
-        );
-        convert_detect_box(py, &output_boxes)
+        Ok(convert_detect_box(py, &output_boxes))
     }
 
     #[staticmethod]
@@ -280,18 +206,11 @@ impl PyDecoder {
 
         match (boxes, protos) {
             (ReadOnlyArrayGeneric2::UInt8(boxes), ReadOnlyArrayGeneric3::UInt8(protos)) => {
-                let (boxes, protos) = (boxes.as_array(), protos.as_array());
                 edgefirst::decoder::yolo::decode_yolo_masks_u8(
-                    boxes.view(),
-                    protos.view(),
-                    &Quantization {
-                        scale: quant_boxes.0 as f32,
-                        zero_point: quant_boxes.1 as u8,
-                    },
-                    &Quantization {
-                        scale: quant_protos.0 as f32,
-                        zero_point: quant_protos.1 as u8,
-                    },
+                    boxes.as_array(),
+                    protos.as_array(),
+                    &Quantization::new(quant_boxes.0 as f32, u8::try_from(quant_boxes.1)?),
+                    &Quantization::new(quant_protos.0 as f32, u8::try_from(quant_protos.1)?),
                     score_threshold as f32,
                     iou_threshold as f32,
                     &mut output_boxes,
@@ -299,18 +218,11 @@ impl PyDecoder {
                 );
             }
             (ReadOnlyArrayGeneric2::Int8(boxes), ReadOnlyArrayGeneric3::Int8(protos)) => {
-                let (boxes, protos) = (boxes.as_array(), protos.as_array());
                 edgefirst::decoder::yolo::decode_yolo_masks_i8(
-                    boxes.view(),
-                    protos.view(),
-                    &Quantization {
-                        scale: quant_boxes.0 as f32,
-                        zero_point: quant_boxes.1 as i8,
-                    },
-                    &Quantization {
-                        scale: quant_protos.0 as f32,
-                        zero_point: quant_protos.1 as i8,
-                    },
+                    boxes.as_array(),
+                    protos.as_array(),
+                    &Quantization::new(quant_boxes.0 as f32, i8::try_from(quant_boxes.1)?),
+                    &Quantization::new(quant_protos.0 as f32, i8::try_from(quant_protos.1)?),
                     score_threshold as f32,
                     iou_threshold as f32,
                     &mut output_boxes,
@@ -318,10 +230,9 @@ impl PyDecoder {
                 );
             }
             (ReadOnlyArrayGeneric2::Float32(boxes), ReadOnlyArrayGeneric3::Float32(protos)) => {
-                let (boxes, protos) = (boxes.as_array(), protos.as_array());
                 edgefirst::decoder::yolo::decode_yolo_masks_f32(
-                    boxes.view(),
-                    protos.view(),
+                    boxes.as_array(),
+                    protos.as_array(),
                     score_threshold as f32,
                     iou_threshold as f32,
                     &mut output_boxes,
@@ -329,10 +240,9 @@ impl PyDecoder {
                 );
             }
             (ReadOnlyArrayGeneric2::Float64(boxes), ReadOnlyArrayGeneric3::Float64(protos)) => {
-                let (boxes, protos) = (boxes.as_array(), protos.as_array());
                 edgefirst::decoder::yolo::decode_yolo_masks_f64(
-                    boxes.view(),
-                    protos.view(),
+                    boxes.as_array(),
+                    protos.as_array(),
                     score_threshold,
                     iou_threshold,
                     &mut output_boxes,
@@ -341,7 +251,7 @@ impl PyDecoder {
             }
             _ => {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    "Box and Protos are not the same type".to_string(),
+                    "Boxes and Protos are not the same type".to_string(),
                 ));
             }
         };
@@ -352,10 +262,200 @@ impl PyDecoder {
     }
 
     #[staticmethod]
+    #[pyo3(signature = (boxes, scores, quant_boxes=(1.0, 0), quant_scores=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
+    pub fn decode_modelpack_det<'py>(
+        py: Python<'py>,
+        boxes: ReadOnlyArrayGeneric2,
+        scores: ReadOnlyArrayGeneric2,
+        quant_boxes: (f64, i64),
+        quant_scores: (f64, i64),
+        score_threshold: f64,
+        iou_threshold: f64,
+        max_boxes: usize,
+    ) -> PyResult<PyDetOutput<'py>> {
+        let mut output_boxes = Vec::with_capacity(max_boxes);
+
+        match (boxes, scores) {
+            (ReadOnlyArrayGeneric2::UInt8(boxes), ReadOnlyArrayGeneric2::UInt8(scores)) => {
+                let (boxes, scores) = (boxes.as_array(), scores.as_array());
+                edgefirst::decoder::modelpack::decode_modelpack_u8(
+                    boxes.view(),
+                    scores.view(),
+                    &Quantization {
+                        scale: quant_boxes.0 as f32,
+                        zero_point: quant_boxes.1 as u8,
+                    },
+                    &Quantization {
+                        scale: quant_scores.0 as f32,
+                        zero_point: quant_scores.1 as u8,
+                    },
+                    score_threshold as f32,
+                    iou_threshold as f32,
+                    &mut output_boxes,
+                );
+            }
+            (ReadOnlyArrayGeneric2::Int8(boxes), ReadOnlyArrayGeneric2::Int8(scores)) => {
+                let (boxes, scores) = (boxes.as_array(), scores.as_array());
+                edgefirst::decoder::modelpack::decode_modelpack_i8(
+                    boxes.view(),
+                    scores.view(),
+                    &Quantization {
+                        scale: quant_boxes.0 as f32,
+                        zero_point: quant_boxes.1 as i8,
+                    },
+                    &Quantization {
+                        scale: quant_scores.0 as f32,
+                        zero_point: quant_scores.1 as i8,
+                    },
+                    score_threshold as f32,
+                    iou_threshold as f32,
+                    &mut output_boxes,
+                );
+            }
+            (ReadOnlyArrayGeneric2::Float32(boxes), ReadOnlyArrayGeneric2::Float32(scores)) => {
+                let (boxes, scores) = (boxes.as_array(), scores.as_array());
+                edgefirst::decoder::modelpack::decode_modelpack_f32(
+                    boxes.view(),
+                    scores.view(),
+                    score_threshold as f32,
+                    iou_threshold as f32,
+                    &mut output_boxes,
+                );
+            }
+            (ReadOnlyArrayGeneric2::Float64(boxes), ReadOnlyArrayGeneric2::Float64(scores)) => {
+                let (boxes, scores) = (boxes.as_array(), scores.as_array());
+                edgefirst::decoder::modelpack::decode_modelpack_f64(
+                    boxes.view(),
+                    scores.view(),
+                    score_threshold,
+                    iou_threshold,
+                    &mut output_boxes,
+                );
+            }
+            _ => {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "Box and Scores are not the same type".to_string(),
+                ));
+            }
+        };
+
+        Ok(convert_detect_box(py, &output_boxes))
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (boxes, anchors, quant=Vec::new(), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
+    pub fn decode_modelpack_det_split<'py>(
+        py: Python<'py>,
+        boxes: ListOfReadOnlyArrayGeneric3,
+        anchors: Vec<Vec<[f32; 2]>>,
+        quant: Vec<(f64, i64)>,
+        score_threshold: f64,
+        iou_threshold: f64,
+        max_boxes: usize,
+    ) -> PyResult<PyDetOutput<'py>> {
+        let mut output_boxes = Vec::with_capacity(max_boxes);
+
+        match boxes {
+            ListOfReadOnlyArrayGeneric3::UInt8(items) => {
+                let outputs = items.iter().map(|x| x.as_array()).collect::<Vec<_>>();
+
+                let mut quant = quant
+                    .into_iter()
+                    .map(|x| Some(Quantization::<u8>::from_tuple_truncate(x)))
+                    .collect::<Vec<_>>();
+                if quant.len() < outputs.len() {
+                    quant.extend(std::iter::repeat_n(None, outputs.len() - quant.len()));
+                }
+                let configs = anchors
+                    .into_iter()
+                    .zip(quant)
+                    .map(|(a, q)| ModelPackDetectionConfig {
+                        anchors: a,
+                        quantization: q,
+                    })
+                    .collect::<Vec<_>>();
+
+                edgefirst::decoder::modelpack::decode_modelpack_split(
+                    &outputs,
+                    &configs,
+                    score_threshold as f32,
+                    iou_threshold as f32,
+                    &mut output_boxes,
+                )
+            }
+            ListOfReadOnlyArrayGeneric3::Int8(items) => {
+                let outputs = items.iter().map(|x| x.as_array()).collect::<Vec<_>>();
+
+                let mut quant = quant
+                    .into_iter()
+                    .map(|x| Some(Quantization::<i8>::from_tuple_truncate(x)))
+                    .collect::<Vec<_>>();
+                if quant.len() < outputs.len() {
+                    quant.extend(std::iter::repeat_n(None, outputs.len() - quant.len()));
+                }
+                let configs = anchors
+                    .into_iter()
+                    .zip(quant)
+                    .map(|(a, q)| ModelPackDetectionConfig {
+                        anchors: a,
+                        quantization: q,
+                    })
+                    .collect::<Vec<_>>();
+
+                edgefirst::decoder::modelpack::decode_modelpack_split(
+                    &outputs,
+                    &configs,
+                    score_threshold as f32,
+                    iou_threshold as f32,
+                    &mut output_boxes,
+                )
+            }
+            ListOfReadOnlyArrayGeneric3::Float32(items) => {
+                let outputs = items.iter().map(|x| x.as_array()).collect::<Vec<_>>();
+
+                let configs = anchors
+                    .into_iter()
+                    .map(|a| ModelPackDetectionConfig {
+                        anchors: a,
+                        quantization: None,
+                    })
+                    .collect::<Vec<_>>();
+
+                edgefirst::decoder::modelpack::decode_modelpack_split(
+                    &outputs,
+                    &configs,
+                    score_threshold as f32,
+                    iou_threshold as f32,
+                    &mut output_boxes,
+                )
+            }
+            ListOfReadOnlyArrayGeneric3::Float64(items) => {
+                let outputs = items.iter().map(|x| x.as_array()).collect::<Vec<_>>();
+                let configs = anchors
+                    .into_iter()
+                    .map(|a| ModelPackDetectionConfig {
+                        anchors: a,
+                        quantization: None,
+                    })
+                    .collect::<Vec<_>>();
+
+                edgefirst::decoder::modelpack::decode_modelpack_split(
+                    &outputs,
+                    &configs,
+                    score_threshold as f32,
+                    iou_threshold as f32,
+                    &mut output_boxes,
+                )
+            }
+        };
+
+        Ok(convert_detect_box(py, &output_boxes))
+    }
+
+    #[staticmethod]
     pub fn dequantize<'py>(
         quantized: ReadOnlyArrayGenericQuantized<'py>,
-        scale: f64,
-        zero_point: i128,
+        quant_boxes: (f64, i64),
         dequant_into: ArrayGenericFloat<'py>,
     ) -> PyResult<()> {
         match (quantized, dequant_into) {
@@ -370,14 +470,7 @@ impl PyDecoder {
                         "Output tensor length is too short".to_string(),
                     ));
                 }
-                dequantize_cpu_chunked(
-                    &Quantization {
-                        scale: scale as f32,
-                        zero_point: i8::try_from(zero_point)?,
-                    },
-                    input,
-                    output,
-                );
+                dequantize_cpu_chunked(input, &Quantization::try_from(quant_boxes)?, output);
             }
             (
                 ReadOnlyArrayGenericQuantized::UInt8(input),
@@ -390,14 +483,7 @@ impl PyDecoder {
                         "Output tensor length is too short".to_string(),
                     ));
                 }
-                dequantize_cpu_chunked(
-                    &Quantization {
-                        scale: scale as f32,
-                        zero_point: u8::try_from(zero_point)?,
-                    },
-                    input,
-                    output,
-                );
+                dequantize_cpu_chunked(input, &Quantization::try_from(quant_boxes)?, output);
             }
             (
                 ReadOnlyArrayGenericQuantized::Int8(input),
@@ -411,11 +497,11 @@ impl PyDecoder {
                     ));
                 }
                 dequantize_cpu_chunked_f64(
-                    &QuantizationF64 {
-                        scale,
-                        zero_point: i8::try_from(zero_point)?,
-                    },
                     input,
+                    &QuantizationF64 {
+                        scale: quant_boxes.0,
+                        zero_point: i8::try_from(quant_boxes.1)?,
+                    },
                     output,
                 );
             }
@@ -431,11 +517,11 @@ impl PyDecoder {
                     ));
                 }
                 dequantize_cpu_chunked_f64(
-                    &QuantizationF64 {
-                        scale,
-                        zero_point: u8::try_from(zero_point)?,
-                    },
                     input,
+                    &QuantizationF64 {
+                        scale: quant_boxes.0,
+                        zero_point: u8::try_from(quant_boxes.1)?,
+                    },
                     output,
                 );
             }

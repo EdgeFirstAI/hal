@@ -102,7 +102,7 @@ fn decoder_yolo_f32(bencher: divan::Bencher) {
         .with_inputs(|| out.clone())
         .bench_local_values(|out| {
             let mut buf = vec![0.0; 84 * 8400];
-            dequantize_cpu_chunked(&quant, &out, &mut buf);
+            dequantize_cpu_chunked(&out, &quant, &mut buf);
             let mut output_boxes: Vec<_> = Vec::with_capacity(50);
             let out = ndarray::Array2::from_shape_vec((84, 8400), buf).unwrap();
             decode_yolo_f32(
@@ -131,7 +131,7 @@ fn decoder_f32_dequantize(bencher: divan::Bencher) {
     bencher
         .with_inputs(|| buf.clone())
         .bench_local_values(|mut buf| {
-            dequantize_cpu(&quant, &out, &mut buf);
+            dequantize_cpu_chunked(&out, &quant, &mut buf);
             let out = ndarray::Array2::from_shape_vec((84, 8400), buf).unwrap();
             black_box_drop(out);
         });
@@ -152,7 +152,7 @@ fn decoder_f32_dequantize_chunked(bencher: divan::Bencher) {
     bencher
         .with_inputs(|| buf.clone())
         .bench_local_values(|mut buf| {
-            dequantize_cpu_chunked(&quant, &out, &mut buf);
+            dequantize_cpu_chunked(&out, &quant, &mut buf);
             let out = ndarray::Array2::from_shape_vec((84, 8400), buf).unwrap();
             black_box_drop(out);
         });
@@ -171,7 +171,7 @@ fn decoder_f32_decode_boxes(bencher: divan::Bencher) {
         zero_point: -123i8,
     };
     let mut buf = vec![0.0; 84 * 8400];
-    dequantize_cpu_chunked(&quant, &out, &mut buf);
+    dequantize_cpu_chunked(&out, &quant, &mut buf);
 
     bencher
         .with_inputs(|| buf.clone())
@@ -199,7 +199,7 @@ fn decoder_f32_nms(bencher: divan::Bencher) {
         zero_point: -123i8,
     };
     let mut buf = vec![0.0; 84 * 8400];
-    dequantize_cpu_chunked(&quant, &out, &mut buf);
+    dequantize_cpu_chunked(&out, &quant, &mut buf);
     let out = ndarray::Array2::from_shape_vec((84, 8400), buf).unwrap();
     let boxes_tensor = out.slice(s![..4, ..,]).reversed_axes();
     let scores_tensor = out.slice(s![4..(80 + 4), ..,]).reversed_axes();
