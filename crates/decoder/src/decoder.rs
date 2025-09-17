@@ -1,5 +1,5 @@
 use ndarray::{ArrayViewD, s};
-use num_traits::{AsPrimitive, FromPrimitive};
+use num_traits::AsPrimitive;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -61,7 +61,7 @@ impl ConfigOutput {
         }
     }
 
-    pub fn quantization(&self) -> &Option<[f32; 2]> {
+    pub fn quantization(&self) -> &Option<(f64, i64)> {
         match self {
             ConfigOutput::Detection(detection) => &detection.quantization,
             ConfigOutput::Mask(mask) => &mask.quantization,
@@ -79,7 +79,7 @@ pub struct Segmentation {
     pub decoder: DecoderType,
     pub dtype: DataType,
     pub name: String,
-    pub quantization: Option<[f32; 2]>,
+    pub quantization: Option<(f64, i64)>,
     pub shape: Vec<usize>,
 }
 
@@ -89,7 +89,7 @@ pub struct Mask {
     pub decoder: DecoderType,
     pub dtype: DataType,
     pub name: String,
-    pub quantization: Option<[f32; 2]>,
+    pub quantization: Option<(f64, i64)>,
     pub shape: Vec<usize>,
 }
 
@@ -99,7 +99,7 @@ pub struct Detection {
     pub decode: bool,
     pub decoder: DecoderType,
     pub dtype: DataType,
-    pub quantization: Option<[f32; 2]>, // this quantization isn't used for dequant
+    pub quantization: Option<(f64, i64)>,
     pub shape: Vec<usize>,
 }
 
@@ -107,7 +107,7 @@ pub struct Detection {
 pub struct Scores {
     pub decoder: DecoderType,
     pub dtype: DataType,
-    pub quantization: Option<[f32; 2]>, // this quantization isn't used for dequant
+    pub quantization: Option<(f64, i64)>,
     pub shape: Vec<usize>,
 }
 
@@ -116,7 +116,7 @@ pub struct Boxes {
     pub decoder: DecoderType,
     pub dtype: DataType,
     pub name: String,
-    pub quantization: Option<[f32; 2]>, // this quantization isn't used for dequant
+    pub quantization: Option<(f64, i64)>,
     pub shape: Vec<usize>,
 }
 
@@ -450,12 +450,16 @@ impl Decoder {
         Ok(())
     }
 
-    fn decode_modelpack_det_split<D: AsPrimitive<f32> + FromPrimitive>(
+    fn decode_modelpack_det_split<D>(
         &self,
         outputs: &[ArrayViewD<D>],
         detection: &[Detection],
         output_boxes: &mut Vec<DetectBox>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error>
+    where
+        D: AsPrimitive<f32>,
+        i64: AsPrimitive<D>,
+    {
         let new_outputs = Self::match_outputs_to_detect(detection, outputs)?;
         let new_outputs = new_outputs
             .into_iter()
@@ -465,10 +469,7 @@ impl Decoder {
             .iter()
             .map(|x| ModelPackDetectionConfig {
                 anchors: x.anchors.clone().unwrap(),
-                quantization: x.quantization.map(|x| Quantization {
-                    scale: x[0],
-                    zero_point: D::from_f32(x[1]).unwrap(),
-                }),
+                quantization: x.quantization.map(Quantization::from_tuple_truncate),
             })
             .collect::<Vec<_>>();
         decode_modelpack_split(
@@ -507,11 +508,17 @@ impl Decoder {
         scores: &Scores,
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<(), Error> {
-        let quant_boxes = boxes.quantization.unwrap_or([1.0, 0.0]).into();
+        let quant_boxes = boxes
+            .quantization
+            .map(Quantization::from_tuple_truncate)
+            .unwrap_or_default();
         let boxes = Self::find_outputs_with_shape(&boxes.shape, outputs)?;
         let boxes = boxes.slice(s![0, .., 0, ..]);
 
-        let quant_scores = scores.quantization.unwrap_or([1.0, 0.0]).into();
+        let quant_scores = scores
+            .quantization
+            .map(Quantization::from_tuple_truncate)
+            .unwrap_or_default();
         let scores = Self::find_outputs_with_shape(&scores.shape, outputs)?;
         let scores = scores.slice(s![0, .., ..]);
 
@@ -533,7 +540,10 @@ impl Decoder {
         boxes: &Detection,
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<(), Error> {
-        let quant_boxes = boxes.quantization.unwrap_or([1.0, 0.0]).into();
+        let quant_boxes = boxes
+            .quantization
+            .map(Quantization::from_tuple_truncate)
+            .unwrap_or_default();
         let box_output = Self::find_outputs_with_shape(&boxes.shape, outputs)?;
         let box_output = box_output.slice(s![0, .., ..]);
 
@@ -555,11 +565,17 @@ impl Decoder {
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<SegmentationMask>,
     ) -> Result<(), Error> {
-        let quant_boxes = boxes.quantization.unwrap_or([1.0, 0.0]).into();
+        let quant_boxes = boxes
+            .quantization
+            .map(Quantization::from_tuple_truncate)
+            .unwrap_or_default();
         let box_output = Self::find_outputs_with_shape(&boxes.shape, outputs)?;
         let box_output = box_output.slice(s![0, .., ..]);
 
-        let quant_protos = protos.quantization.unwrap_or([1.0, 0.0]).into();
+        let quant_protos = protos
+            .quantization
+            .map(Quantization::from_tuple_truncate)
+            .unwrap_or_default();
         let protos = Self::find_outputs_with_shape(&protos.shape, outputs)?;
         let protos = protos.slice(s![0, .., .., ..]);
 
@@ -605,11 +621,17 @@ impl Decoder {
         scores: &Scores,
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<(), Error> {
-        let quant_boxes = boxes.quantization.unwrap_or([1.0, 0.0]).into();
+        let quant_boxes = boxes
+            .quantization
+            .map(Quantization::from_tuple_truncate)
+            .unwrap_or_default();
         let boxes = Self::find_outputs_with_shape(&boxes.shape, outputs)?;
         let boxes = boxes.slice(s![0, .., 0, ..]);
 
-        let quant_scores = scores.quantization.unwrap_or([1.0, 0.0]).into();
+        let quant_scores = scores
+            .quantization
+            .map(Quantization::from_tuple_truncate)
+            .unwrap_or_default();
         let scores = Self::find_outputs_with_shape(&scores.shape, outputs)?;
         let scores = scores.slice(s![0, .., ..]);
 
@@ -631,7 +653,10 @@ impl Decoder {
         boxes: &Detection,
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<(), Error> {
-        let quant_boxes = boxes.quantization.unwrap_or([1.0, 0.0]).into();
+        let quant_boxes = boxes
+            .quantization
+            .map(Quantization::from_tuple_truncate)
+            .unwrap_or_default();
         let box_output = Self::find_outputs_with_shape(&boxes.shape, outputs)?;
         let box_output = box_output.slice(s![0, .., ..]);
 
@@ -653,11 +678,17 @@ impl Decoder {
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<SegmentationMask>,
     ) -> Result<(), Error> {
-        let quant_boxes = boxes.quantization.unwrap_or([1.0, 0.0]).into();
+        let quant_boxes = boxes
+            .quantization
+            .map(Quantization::from_tuple_truncate)
+            .unwrap_or_default();
         let box_output = Self::find_outputs_with_shape(&boxes.shape, outputs)?;
         let box_output = box_output.slice(s![0, .., ..]);
 
-        let quant_protos = protos.quantization.unwrap_or([1.0, 0.0]).into();
+        let quant_protos = protos
+            .quantization
+            .map(Quantization::from_tuple_truncate)
+            .unwrap_or_default();
         let protos = Self::find_outputs_with_shape(&protos.shape, outputs)?;
         let protos = protos.slice(s![0, .., .., ..]);
 
