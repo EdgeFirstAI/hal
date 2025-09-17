@@ -1,5 +1,5 @@
 use ndarray::{
-    Array3, ArrayView1, ArrayView2, ArrayView3,
+    Array2, Array3, ArrayView1, ArrayView2, ArrayView3,
     parallel::prelude::{IntoParallelIterator, ParallelIterator},
     s,
 };
@@ -7,7 +7,7 @@ use ndarray_stats::QuantileExt;
 use num_traits::{AsPrimitive, Float, PrimInt};
 
 use crate::{
-    BBoxTypeTrait, DetectBox, Quantization, SegmentationMask, XYWH,
+    BBoxTypeTrait, DetectBox, Quantization, Segmentation, XYWH,
     byte::{
         nms_extra_i16, nms_i16, postprocess_boxes_8bit, postprocess_boxes_extra_8bit,
         quantize_score_threshold,
@@ -55,7 +55,7 @@ pub fn decode_yolo_f64(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn decode_yolo_masks_i8(
+pub fn decode_yolo_segdet_i8(
     boxes: ArrayView2<i8>,
     protos: ArrayView3<i8>,
     quant_boxes: &Quantization<i8>,
@@ -63,9 +63,9 @@ pub fn decode_yolo_masks_i8(
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
-    output_masks: &mut Vec<SegmentationMask>,
+    output_masks: &mut Vec<Segmentation>,
 ) {
-    impl_yolo_masks_8bit::<XYWH, i8>(
+    impl_yolo_segdet_8bit::<XYWH, i8>(
         boxes,
         protos,
         quant_boxes,
@@ -78,7 +78,7 @@ pub fn decode_yolo_masks_i8(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn decode_yolo_masks_u8(
+pub fn decode_yolo_segdet_u8(
     boxes: ArrayView2<u8>,
     protos: ArrayView3<u8>,
     quant_boxes: &Quantization<u8>,
@@ -86,9 +86,9 @@ pub fn decode_yolo_masks_u8(
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
-    output_masks: &mut Vec<SegmentationMask>,
+    output_masks: &mut Vec<Segmentation>,
 ) {
-    impl_yolo_masks_8bit::<XYWH, u8>(
+    impl_yolo_segdet_8bit::<XYWH, u8>(
         boxes,
         protos,
         quant_boxes,
@@ -100,15 +100,15 @@ pub fn decode_yolo_masks_u8(
     );
 }
 
-pub fn decode_yolo_masks_f32(
+pub fn decode_yolo_segdet_f32(
     boxes: ArrayView2<f32>,
     protos: ArrayView3<f32>,
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
-    output_masks: &mut Vec<SegmentationMask>,
+    output_masks: &mut Vec<Segmentation>,
 ) {
-    impl_yolo_masks_float::<XYWH, f32>(
+    impl_yolo_segdet_float::<XYWH, f32>(
         boxes,
         protos,
         score_threshold,
@@ -118,15 +118,15 @@ pub fn decode_yolo_masks_f32(
     );
 }
 
-pub fn decode_yolo_masks_f64(
+pub fn decode_yolo_segdet_f64(
     boxes: ArrayView2<f64>,
     protos: ArrayView3<f64>,
     score_threshold: f64,
     iou_threshold: f64,
     output_boxes: &mut Vec<DetectBox>,
-    output_masks: &mut Vec<SegmentationMask>,
+    output_masks: &mut Vec<Segmentation>,
 ) {
-    impl_yolo_masks_float::<XYWH, f64>(
+    impl_yolo_segdet_float::<XYWH, f64>(
         boxes,
         protos,
         score_threshold,
@@ -174,7 +174,7 @@ pub fn impl_yolo_float<B: BBoxTypeTrait, T: Float + AsPrimitive<f32> + Send + Sy
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn impl_yolo_masks_8bit<
+pub fn impl_yolo_segdet_8bit<
     B: BBoxTypeTrait,
     T: PrimInt + AsPrimitive<i16> + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
 >(
@@ -185,7 +185,7 @@ pub fn impl_yolo_masks_8bit<
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
-    output_masks: &mut Vec<SegmentationMask>,
+    output_masks: &mut Vec<Segmentation>,
 ) {
     let score_threshold = quantize_score_threshold(score_threshold, quant_boxes);
     let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&boxes);
@@ -203,12 +203,12 @@ pub fn impl_yolo_masks_8bit<
         .into_iter()
         .map(|(b, m)| (dequant_detect_box(&b, quant_boxes, quant_boxes), m))
         .collect();
-    let boxes = decode_masks_8bit(boxes, protos, quant_boxes, quant_protos);
+    let boxes = decode_segdet_8bit(boxes, protos, quant_boxes, quant_protos);
     output_boxes.clear();
     output_masks.clear();
     for (b, m) in boxes.into_iter() {
         output_boxes.push(b);
-        output_masks.push(SegmentationMask {
+        output_masks.push(Segmentation {
             xmin: b.xmin,
             ymin: b.ymin,
             xmax: b.xmax,
@@ -218,7 +218,7 @@ pub fn impl_yolo_masks_8bit<
     }
 }
 
-pub fn impl_yolo_masks_float<
+pub fn impl_yolo_segdet_float<
     B: BBoxTypeTrait,
     T: Float + AsPrimitive<f32> + AsPrimitive<u8> + Send + Sync,
 >(
@@ -227,7 +227,7 @@ pub fn impl_yolo_masks_float<
     score_threshold: T,
     iou_threshold: T,
     output_boxes: &mut Vec<DetectBox>,
-    output_masks: &mut Vec<SegmentationMask>,
+    output_masks: &mut Vec<Segmentation>,
 ) {
     let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&boxes);
 
@@ -239,12 +239,12 @@ pub fn impl_yolo_masks_float<
     );
     let mut boxes = nms_extra_f32(iou_threshold.as_(), boxes);
     boxes.truncate(output_boxes.capacity());
-    let boxes = decode_masks_f32(boxes, protos);
+    let boxes = decode_segdet_f32(boxes, protos);
     output_boxes.clear();
     output_masks.clear();
     for (b, m) in boxes.into_iter() {
         output_boxes.push(b);
-        output_masks.push(SegmentationMask {
+        output_masks.push(Segmentation {
             xmin: b.xmin,
             ymin: b.ymin,
             xmax: b.xmax,
@@ -273,7 +273,7 @@ fn postprocess_yolo_seg<'a, T>(
     (boxes_tensor, scores_tensor, mask_tensor)
 }
 
-fn decode_masks_f32<T: Float + Send + Sync + AsPrimitive<u8>>(
+fn decode_segdet_f32<T: Float + Send + Sync + AsPrimitive<u8>>(
     boxes: Vec<(DetectBox, ArrayView1<T>)>,
     protos: ArrayView3<T>,
 ) -> Vec<(DetectBox, Array3<u8>)> {
@@ -289,12 +289,12 @@ fn decode_masks_f32<T: Float + Send + Sync + AsPrimitive<u8>>(
             b.0.ymin = roi[1];
             b.0.xmax = roi[2];
             b.0.ymax = roi[3];
-            (b.0, make_mask(mask.view(), protos.view()))
+            (b.0, make_segmentation(mask.view(), protos.view()))
         })
         .collect()
 }
 
-fn decode_masks_8bit<T: AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync>(
+fn decode_segdet_8bit<T: AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync>(
     boxes: Vec<(DetectBox, ArrayView1<T>)>,
     protos: ArrayView3<T>,
     quant_boxes: &Quantization<T>,
@@ -314,7 +314,7 @@ fn decode_masks_8bit<T: AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync>(
             b.0.ymax = roi[3];
             (
                 b.0,
-                mask_mask_8bit(mask.view(), protos.view(), quant_boxes, quant_protos),
+                make_segmentation_8bit(mask.view(), protos.view(), quant_boxes, quant_protos),
             )
         })
         .collect()
@@ -348,7 +348,7 @@ fn protobox<'a, T>(protos: &'a ArrayView3<T>, roi: &[f32; 4]) -> (ArrayView3<'a,
     (cropped, roi_norm)
 }
 
-fn make_mask<T: Float + Send + Sync + AsPrimitive<u8>>(
+fn make_segmentation<T: Float + Send + Sync + AsPrimitive<u8>>(
     mask: ArrayView1<T>,
     protos: ArrayView3<T>,
 ) -> Array3<u8> {
@@ -367,7 +367,7 @@ fn make_mask<T: Float + Send + Sync + AsPrimitive<u8>>(
     mask.map(|x| ((*x - min) / max * u8_max).as_())
 }
 
-fn mask_mask_8bit<T: AsPrimitive<i32> + AsPrimitive<f32>>(
+fn make_segmentation_8bit<T: AsPrimitive<i32> + AsPrimitive<f32>>(
     mask: ArrayView1<T>,
     protos: ArrayView3<T>,
     quant_boxes: &Quantization<T>,
@@ -383,14 +383,25 @@ fn mask_mask_8bit<T: AsPrimitive<i32> + AsPrimitive<f32>>(
     // This cannot overflow because in the dot product, we have u8 * u8 and then 32
     // proto layers are summed together. Which means in the result of the matrix
     // multiply, the maximum value of a single element is 256 * 256 * 32 = 2^21
-    let mask = mask
+    let segmentation = mask
         .mapv(|x| to_i32(x) - to_i32(quant_boxes.zero_point))
         .dot(&protos.mapv(|x| to_i32(x) - to_i32(quant_protos.zero_point)))
         .into_shape_with_order((shape[0], shape[1], 1))
         .unwrap();
 
-    let min = mask.min().unwrap();
-    let max = mask.max().unwrap();
+    let min = segmentation.min().unwrap();
+    let max = segmentation.max().unwrap();
 
-    mask.map(|x| ((x - min) as f32 / *max as f32 * 255.0) as u8)
+    segmentation.map(|x| ((x - min) as f32 / *max as f32 * 255.0) as u8)
+}
+
+pub fn yolo_segmentation_to_mask(segmentation: ArrayView3<u8>, threshold: u8) -> Array2<u8> {
+    assert_eq!(
+        segmentation.shape()[2],
+        1,
+        "Yolo Instance Segmentation should have shape (H, W, 1)"
+    );
+    segmentation
+        .slice(s![.., .., 0])
+        .map(|x| if *x >= threshold { 1 } else { 0 })
 }

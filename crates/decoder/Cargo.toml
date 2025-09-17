@@ -10,6 +10,7 @@ readme.workspace = true
 license.workspace = true
 
 [dependencies]
+argminmax = { version = "0.6.3", default-features = false}
 env_logger = { workspace = true }
 fast-math = "0.1.1"
 log = { workspace = true }
