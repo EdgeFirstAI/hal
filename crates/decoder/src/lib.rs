@@ -1,6 +1,5 @@
 //! EdgeFirst HAL - Decoders
 #![allow(clippy::excessive_precision)]
-#![feature(f16)]
 use std::ops::{Add, Mul, Sub};
 
 use ndarray::{Array, Array3, ArrayView, ArrayView1, Dimension};
