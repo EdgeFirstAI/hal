@@ -9,8 +9,13 @@ repository.workspace = true
 readme.workspace = true
 license.workspace = true
 
+[features]
+default = ["tracker"]
+tracker = ["dep:edgefirst-tracker"]
+
 [dependencies]
 argminmax = { version = "0.6.3", default-features = false}
+edgefirst-tracker = { version = "*", path = "../tracker", optional=true }
 env_logger = { workspace = true }
 fast-math = "0.1.1"
 log = { workspace = true }
@@ -20,6 +25,7 @@ num-traits.workspace = true
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.143"
 serde_yaml = "0.9.34"
+
 
 [dev-dependencies]
 divan = { workspace = true }

@@ -7,7 +7,7 @@ use ndarray_stats::QuantileExt;
 use num_traits::{AsPrimitive, Float, PrimInt};
 
 use crate::{
-    BBoxTypeTrait, DetectBox, Quantization, Segmentation, XYWH,
+    BBoxTypeTrait, BoundingBox, DetectBox, Quantization, Segmentation, XYWH,
     byte::{
         nms_extra_i16, nms_i16, postprocess_boxes_8bit, postprocess_boxes_extra_8bit,
         quantize_score_threshold,
@@ -209,10 +209,10 @@ pub fn impl_yolo_segdet_8bit<
     for (b, m) in boxes.into_iter() {
         output_boxes.push(b);
         output_masks.push(Segmentation {
-            xmin: b.xmin,
-            ymin: b.ymin,
-            xmax: b.xmax,
-            ymax: b.ymax,
+            xmin: b.bbox.xmin,
+            ymin: b.bbox.ymin,
+            xmax: b.bbox.xmax,
+            ymax: b.bbox.ymax,
             mask: m,
         });
     }
@@ -245,10 +245,10 @@ pub fn impl_yolo_segdet_float<
     for (b, m) in boxes.into_iter() {
         output_boxes.push(b);
         output_masks.push(Segmentation {
-            xmin: b.xmin,
-            ymin: b.ymin,
-            xmax: b.xmax,
-            ymax: b.ymax,
+            xmin: b.bbox.xmin,
+            ymin: b.bbox.ymin,
+            xmax: b.bbox.xmax,
+            ymax: b.bbox.ymax,
             mask: m,
         });
     }
@@ -284,11 +284,8 @@ fn decode_segdet_f32<T: Float + Send + Sync + AsPrimitive<u8>>(
         .into_par_iter()
         .map(|mut b| {
             let mask = &b.1;
-            let (protos, roi) = protobox(&protos, &[b.0.xmin, b.0.ymin, b.0.xmax, b.0.ymax]);
-            b.0.xmin = roi[0];
-            b.0.ymin = roi[1];
-            b.0.xmax = roi[2];
-            b.0.ymax = roi[3];
+            let (protos, roi) = protobox(&protos, &b.0.bbox);
+            b.0.bbox = roi;
             (b.0, make_segmentation(mask.view(), protos.view()))
         })
         .collect()
@@ -307,11 +304,8 @@ fn decode_segdet_8bit<T: AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync>(
         .into_par_iter()
         .map(|mut b| {
             let mask = &b.1;
-            let (protos, roi) = protobox(&protos, &[b.0.xmin, b.0.ymin, b.0.xmax, b.0.ymax]);
-            b.0.xmin = roi[0];
-            b.0.ymin = roi[1];
-            b.0.xmax = roi[2];
-            b.0.ymax = roi[3];
+            let (protos, roi) = protobox(&protos, &b.0.bbox);
+            b.0.bbox = roi;
             (
                 b.0,
                 make_segmentation_8bit(mask.view(), protos.view(), quant_boxes, quant_protos),
@@ -320,15 +314,18 @@ fn decode_segdet_8bit<T: AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync>(
         .collect()
 }
 
-fn protobox<'a, T>(protos: &'a ArrayView3<T>, roi: &[f32; 4]) -> (ArrayView3<'a, T>, [f32; 4]) {
+fn protobox<'a, T>(
+    protos: &'a ArrayView3<T>,
+    roi: &BoundingBox,
+) -> (ArrayView3<'a, T>, BoundingBox) {
     let width = protos.dim().1 as f32;
     let height = protos.dim().0 as f32;
 
     let roi = [
-        (roi[0] * width - 0.5).clamp(0.0, width) as usize,
-        (roi[1] * height - 0.5).clamp(0.0, height) as usize,
-        (roi[2] * width + 0.5).clamp(0.0, width).ceil() as usize,
-        (roi[3] * height + 0.5).clamp(0.0, height).ceil() as usize,
+        (roi.xmin * width - 0.5).clamp(0.0, width) as usize,
+        (roi.ymin * height - 0.5).clamp(0.0, height) as usize,
+        (roi.xmax * width + 0.5).clamp(0.0, width).ceil() as usize,
+        (roi.ymax * height + 0.5).clamp(0.0, height).ceil() as usize,
     ];
 
     let roi_norm = [
@@ -336,7 +333,8 @@ fn protobox<'a, T>(protos: &'a ArrayView3<T>, roi: &[f32; 4]) -> (ArrayView3<'a,
         roi[1] as f32 / height,
         roi[2] as f32 / width,
         roi[3] as f32 / height,
-    ];
+    ]
+    .into();
 
     let shape = [(roi[3] - roi[1]), (roi[2] - roi[0]), protos.dim().2];
     if shape[0] * shape[1] * shape[2] == 0 {

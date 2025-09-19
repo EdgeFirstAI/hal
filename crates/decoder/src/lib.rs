@@ -3,8 +3,7 @@
 use std::ops::{Add, Mul, Sub};
 
 use ndarray::{Array, Array2, Array3, ArrayView, ArrayView1, ArrayView3, Dimension};
-use num_traits::{AsPrimitive, Float, PrimInt};
-
+use num_traits::{AsPrimitive, Float, PrimInt, Signed};
 pub mod byte;
 pub mod error;
 pub mod float;
@@ -210,6 +209,15 @@ pub struct QuantizationF64<T: AsPrimitive<f64>> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct DetectBox {
+    pub bbox: BoundingBox,
+    /// model-specific score for this detection, higher implies more confidence
+    pub score: f32,
+    /// label index for this detection
+    pub label: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct BoundingBox {
     /// left-most normalized coordinate of the bounding box
     pub xmin: f32,
     /// top-most normalized coordinate of the bounding box
@@ -218,10 +226,23 @@ pub struct DetectBox {
     pub xmax: f32,
     /// bottom-most normalized coordinate of the bounding box
     pub ymax: f32,
-    /// model-specific score for this detection, higher implies more confidence
-    pub score: f32,
-    /// label index for this detection
-    pub label: usize,
+}
+
+impl From<BoundingBox> for [f32; 4] {
+    fn from(b: BoundingBox) -> Self {
+        [b.xmin, b.ymin, b.xmax, b.ymax]
+    }
+}
+
+impl From<[f32; 4]> for BoundingBox {
+    fn from(arr: [f32; 4]) -> Self {
+        BoundingBox {
+            xmin: arr[0],
+            ymin: arr[1],
+            xmax: arr[2],
+            ymax: arr[3],
+        }
+    }
 }
 
 impl DetectBox {
@@ -231,10 +252,25 @@ impl DetectBox {
         let eq_delta = |a: f32, b: f32| (a - b).abs() <= delta;
         self.label == rhs.label
             && eq_delta(self.score, rhs.score)
-            && eq_delta(self.xmin, rhs.xmin)
-            && eq_delta(self.ymin, rhs.ymin)
-            && eq_delta(self.xmax, rhs.xmax)
-            && eq_delta(self.ymax, rhs.ymax)
+            && eq_delta(self.bbox.xmin, rhs.bbox.xmin)
+            && eq_delta(self.bbox.ymin, rhs.bbox.ymin)
+            && eq_delta(self.bbox.xmax, rhs.bbox.xmax)
+            && eq_delta(self.bbox.ymax, rhs.bbox.ymax)
+    }
+}
+
+#[cfg(feature = "tracker")]
+impl edgefirst_tracker::DetectionBox for DetectBox {
+    fn bbox(&self) -> [f32; 4] {
+        self.bbox.into()
+    }
+
+    fn score(&self) -> f32 {
+        self.score
+    }
+
+    fn label(&self) -> usize {
+        self.label
     }
 }
 
@@ -253,20 +289,15 @@ pub struct Segmentation {
     pub mask: Array3<u8>,
 }
 
+/// A quantized bounding box used to process boxes faster. The coordinates are
+/// 2x the actual coordinates to prevent needing to round for XYWH boxes. The
+/// coordinates should be shifted to the zero point already.
+///
+/// When choosing T, make sure to choose a type that is wider than the input
+/// data to prevent overflow or underflow
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct DetectBoxQuantized<T: Clone + Mul + Add + Sub + Ord + AsPrimitive<f32>> {
-    /// 2x the left-most coordinate of the bounding box. Should already be
-    /// scaled to zero point
-    pub xmin: T,
-    /// 2x top-most coordinate of the bounding box. Should already be scaled to
-    /// zero point
-    pub ymin: T,
-    /// 2x right-most coordinate of the bounding box. Should already be scaled
-    /// to zero point
-    pub xmax: T,
-    /// 2x bottom-most coordinate of the bounding box. Should already be scaled
-    /// to zero point
-    pub ymax: T,
+pub struct DetectBoxQuantized<T: Copy + Signed + Mul + Add + Sub + Ord + AsPrimitive<f32>> {
+    pub bbox: BoundingBoxQuantized<T>,
     /// model-specific score for this detection, higher implies more
     /// confidence.
     pub score: T,
@@ -274,8 +305,42 @@ pub struct DetectBoxQuantized<T: Clone + Mul + Add + Sub + Ord + AsPrimitive<f32
     pub label: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct BoundingBoxQuantized<T: Copy + Signed + Mul + Add + Sub + Ord + AsPrimitive<f32>> {
+    /// 2x left-most coordinate of the bounding box. Should already be shifted
+    /// to zero point
+    pub xmin: T,
+    /// 2x top-most coordinate of the bounding box. Should already be shifted to
+    /// zero point
+    pub ymin: T,
+    /// 2x right-most coordinate of the bounding box. Should already be shifted
+    /// to zero point
+    pub xmax: T,
+    /// 2x bottom-most coordinate of the bounding box. Should already be shifted
+    /// to zero point
+    pub ymax: T,
+}
+
+impl<T: Copy + Signed + Mul + Add + Sub + Ord + AsPrimitive<f32>> BoundingBoxQuantized<T> {
+    pub fn to_array(&self) -> [T; 4] {
+        [self.xmin, self.ymin, self.xmax, self.ymax]
+    }
+
+    pub fn from_array(arr: &[T; 4]) -> Self {
+        Self {
+            xmin: arr[0],
+            ymin: arr[1],
+            xmax: arr[2],
+            ymax: arr[3],
+        }
+    }
+}
+
+/// Turns a DetectBoxQuantized into a DetectBox. The zero point is not used
+/// for quant_boxes as the DetectBoxQuantized is already be shifted to
+/// the zero points
 pub fn dequant_detect_box<
-    T: Clone + Mul + Add + Sub + Ord + AsPrimitive<f32>,
+    T: Clone + Signed + Mul + Add + Sub + Ord + AsPrimitive<f32>,
     Q: AsPrimitive<f32>,
 >(
     detect: &DetectBoxQuantized<T>,
@@ -284,10 +349,12 @@ pub fn dequant_detect_box<
 ) -> DetectBox {
     let scaled_zp = -quant_scores.scale * quant_scores.zero_point.as_();
     DetectBox {
-        xmin: quant_boxes.scale * detect.xmin.as_() * 0.5,
-        ymin: quant_boxes.scale * detect.ymin.as_() * 0.5,
-        xmax: quant_boxes.scale * detect.xmax.as_() * 0.5,
-        ymax: quant_boxes.scale * detect.ymax.as_() * 0.5,
+        bbox: BoundingBox {
+            xmin: quant_boxes.scale * detect.bbox.xmin.as_() * 0.5,
+            ymin: quant_boxes.scale * detect.bbox.ymin.as_() * 0.5,
+            xmax: quant_boxes.scale * detect.bbox.xmax.as_() * 0.5,
+            ymax: quant_boxes.scale * detect.bbox.ymax.as_() * 0.5,
+        },
         score: quant_scores.scale * detect.score.as_() + scaled_zp,
         label: detect.label,
     }
@@ -482,10 +549,12 @@ mod tests {
         println!("output_boxes {output_boxes:?}");
         assert!(output_boxes[0].equal_within_delta(
             &DetectBox {
-                xmin: 0.5285137,
-                ymin: 0.05305544,
-                xmax: 0.87541467,
-                ymax: 0.9998909,
+                bbox: BoundingBox {
+                    xmin: 0.5285137,
+                    ymin: 0.05305544,
+                    xmax: 0.87541467,
+                    ymax: 0.9998909,
+                },
                 score: 0.5591227,
                 label: 0
             },
@@ -494,10 +563,12 @@ mod tests {
 
         assert!(output_boxes[1].equal_within_delta(
             &DetectBox {
-                xmin: 0.130598,
-                ymin: 0.43260583,
-                xmax: 0.35098213,
-                ymax: 0.9958097,
+                bbox: BoundingBox {
+                    xmin: 0.130598,
+                    ymin: 0.43260583,
+                    xmax: 0.35098213,
+                    ymax: 0.9958097,
+                },
                 score: 0.33057618,
                 label: 75
             },
@@ -527,10 +598,12 @@ mod tests {
         println!("output_boxes {output_boxes:?}");
         assert!(output_boxes[0].equal_within_delta(
             &DetectBox {
-                xmin: 0.5285137,
-                ymin: 0.05305544,
-                xmax: 0.87541467,
-                ymax: 0.9998909,
+                bbox: BoundingBox {
+                    xmin: 0.5285137,
+                    ymin: 0.05305544,
+                    xmax: 0.87541467,
+                    ymax: 0.9998909,
+                },
                 score: 0.5591227,
                 label: 0
             },
@@ -539,10 +612,12 @@ mod tests {
 
         assert!(output_boxes[1].equal_within_delta(
             &DetectBox {
-                xmin: 0.130598,
-                ymin: 0.43260583,
-                xmax: 0.35098213,
-                ymax: 0.9958097,
+                bbox: BoundingBox {
+                    xmin: 0.130598,
+                    ymin: 0.43260583,
+                    xmax: 0.35098213,
+                    ymax: 0.9958097,
+                },
                 score: 0.33057618,
                 label: 75
             },
@@ -576,10 +651,12 @@ mod tests {
         println!("output_boxes {output_boxes:?}");
         assert!(output_boxes[0].equal_within_delta(
             &DetectBox {
-                xmin: 0.40513772,
-                ymin: 0.6379755,
-                xmax: 0.5122431,
-                ymax: 0.7730214,
+                bbox: BoundingBox {
+                    xmin: 0.40513772,
+                    ymin: 0.6379755,
+                    xmax: 0.5122431,
+                    ymax: 0.7730214,
+                },
                 score: 0.4861709,
                 label: 0
             },
@@ -628,10 +705,12 @@ mod tests {
         println!("output_boxes {output_boxes:?}");
         assert!(output_boxes[0].equal_within_delta(
             &DetectBox {
-                xmin: 0.43171933,
-                ymin: 0.68243736,
-                xmax: 0.5626645,
-                ymax: 0.808863,
+                bbox: BoundingBox {
+                    xmin: 0.43171933,
+                    ymin: 0.68243736,
+                    xmax: 0.5626645,
+                    ymax: 0.808863,
+                },
                 score: 0.49577647,
                 label: 0
             },
@@ -671,10 +750,12 @@ mod tests {
         println!("output_boxes {output_boxes:?}");
         assert!(output_boxes[0].equal_within_delta(
             &DetectBox {
-                xmin: 0.43171933,
-                ymin: 0.68243736,
-                xmax: 0.5626645,
-                ymax: 0.808863,
+                bbox: BoundingBox {
+                    xmin: 0.43171933,
+                    ymin: 0.68243736,
+                    xmax: 0.5626645,
+                    ymax: 0.808863,
+                },
                 score: 0.49577647,
                 label: 0
             },
@@ -725,10 +806,10 @@ mod tests {
 
         assert_eq!(output_boxes.len(), output_masks.len());
         for (b, m) in output_boxes.iter().zip(output_masks) {
-            assert!(b.xmin >= m.xmin);
-            assert!(b.ymin >= m.ymin);
-            assert!(b.xmax >= m.xmax);
-            assert!(b.ymax >= m.ymax);
+            assert!(b.bbox.xmin >= m.xmin);
+            assert!(b.bbox.ymin >= m.ymin);
+            assert!(b.bbox.xmax >= m.xmax);
+            assert!(b.bbox.ymax >= m.ymax);
         }
     }
 

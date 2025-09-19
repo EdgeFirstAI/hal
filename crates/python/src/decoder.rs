@@ -543,7 +543,10 @@ impl PyDecoder {
 fn convert_detect_box<'py>(py: Python<'py>, output_boxes: &[DetectBox]) -> PyDetOutput<'py> {
     let boxes = output_boxes
         .iter()
-        .flat_map(|b| [b.xmin, b.ymin, b.xmax, b.ymax])
+        .flat_map(|b| {
+            let b = b.bbox;
+            [b.xmin, b.ymin, b.xmax, b.ymax]
+        })
         .collect::<Vec<_>>();
     let scores = output_boxes.iter().map(|b| b.score).collect::<Vec<_>>();
     let classes = output_boxes.iter().map(|b| b.label).collect::<Vec<_>>();

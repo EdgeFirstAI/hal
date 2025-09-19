@@ -1,4 +1,4 @@
-use crate::{BBoxTypeTrait, DetectBoxQuantized, Quantization, arg_max};
+use crate::{BBoxTypeTrait, BoundingBoxQuantized, DetectBoxQuantized, Quantization, arg_max};
 use ndarray::{
     ArrayView1, ArrayView2, Zip,
     parallel::prelude::{IntoParallelIterator, ParallelIterator as _},
@@ -30,10 +30,7 @@ pub fn postprocess_boxes_8bit<
             Some(DetectBoxQuantized::<i16> {
                 label,
                 score: score_.as_(),
-                xmin: bbox_quant[0],
-                ymin: bbox_quant[1],
-                xmax: bbox_quant[2],
-                ymax: bbox_quant[3],
+                bbox: BoundingBoxQuantized::from_array(&bbox_quant),
             })
         })
         .collect()
@@ -68,10 +65,7 @@ pub fn postprocess_boxes_extra_8bit<
                 DetectBoxQuantized::<i16> {
                     label,
                     score: score_.as_(),
-                    xmin: bbox_quant[0],
-                    ymin: bbox_quant[1],
-                    xmax: bbox_quant[2],
-                    ymax: bbox_quant[3],
+                    bbox: BoundingBoxQuantized::from_array(&bbox_quant),
                 },
                 mask,
             ))
@@ -97,7 +91,7 @@ pub fn nms_i16(iou: f32, mut boxes: Vec<DetectBoxQuantized<i16>>) -> Vec<DetectB
                 // this box was suppressed by different box earlier
                 continue;
             }
-            if jaccard_i16(&boxes[j], &boxes[i], iou) {
+            if jaccard_i16(&boxes[j].bbox, &boxes[i].bbox, iou) {
                 // suppress this box
                 boxes[j].score = min_val;
             }
@@ -129,7 +123,7 @@ pub fn nms_extra_i16<E>(
                 // this box was suppressed by different box earlier
                 continue;
             }
-            if jaccard_i16(&boxes[j].0, &boxes[i].0, iou) {
+            if jaccard_i16(&boxes[j].0.bbox, &boxes[i].0.bbox, iou) {
                 // suppress this box
                 boxes[j].0.score = min_val;
             }
@@ -141,7 +135,7 @@ pub fn nms_extra_i16<E>(
 }
 
 // Returns true if the IOU of the given boxes are greater than the iou threshold
-fn jaccard_i16(a: &DetectBoxQuantized<i16>, b: &DetectBoxQuantized<i16>, iou: f32) -> bool {
+fn jaccard_i16(a: &BoundingBoxQuantized<i16>, b: &BoundingBoxQuantized<i16>, iou: f32) -> bool {
     let left = a.xmin.max(b.xmin);
     let top = a.ymin.max(b.ymin);
     let right = a.xmax.min(b.xmax);
