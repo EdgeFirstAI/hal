@@ -344,8 +344,8 @@ pub fn dequant_detect_box<
     Q: AsPrimitive<f32>,
 >(
     detect: &DetectBoxQuantized<T>,
-    quant_boxes: &Quantization<Q>,
-    quant_scores: &Quantization<Q>,
+    quant_boxes: Quantization<Q>,
+    quant_scores: Quantization<Q>,
 ) -> DetectBox {
     let scaled_zp = -quant_scores.scale * quant_scores.zero_point.as_();
     DetectBox {
@@ -361,7 +361,7 @@ pub fn dequant_detect_box<
 }
 
 pub fn dequantize_ndarray<T: AsPrimitive<f32>, D: Dimension>(
-    quant: &Quantization<T>,
+    quant: Quantization<T>,
     input: ArrayView<T, D>,
 ) -> Array<f32, D> {
     let zero_point = quant.zero_point.as_();
@@ -376,7 +376,7 @@ pub fn dequantize_ndarray<T: AsPrimitive<f32>, D: Dimension>(
 
 pub fn dequantize_cpu<T: AsPrimitive<f32>>(
     input: &[T],
-    quant: &Quantization<T>,
+    quant: Quantization<T>,
     output: &mut [f32],
 ) {
     assert!(input.len() == output.len());
@@ -399,7 +399,7 @@ pub fn dequantize_cpu<T: AsPrimitive<f32>>(
 
 pub fn dequantize_cpu_chunked<T: AsPrimitive<f32>>(
     input: &[T],
-    quant: &Quantization<T>,
+    quant: Quantization<T>,
     output: &mut [f32],
 ) {
     assert!(input.len() == output.len());
@@ -439,7 +439,7 @@ pub fn dequantize_cpu_chunked<T: AsPrimitive<f32>>(
 }
 
 pub fn dequantize_cpu_f64<T: AsPrimitive<f64>>(
-    quant: &QuantizationF64<T>,
+    quant: QuantizationF64<T>,
     input: &[T],
     output: &mut [f64],
 ) {
@@ -463,7 +463,7 @@ pub fn dequantize_cpu_f64<T: AsPrimitive<f64>>(
 
 pub fn dequantize_cpu_chunked_f64<T: AsPrimitive<f64>>(
     input: &[T],
-    quant: &QuantizationF64<T>,
+    quant: QuantizationF64<T>,
     output: &mut [f64],
 ) {
     assert!(input.len() == output.len());
@@ -540,8 +540,7 @@ mod tests {
         let quant = Quantization::new(0.0040811873, -123);
         let mut output_boxes: Vec<_> = Vec::with_capacity(50);
         decode_yolo_i8(
-            out.view(),
-            &quant,
+            (out.view(), quant),
             score_threshold,
             iou_threshold,
             &mut output_boxes,
@@ -585,7 +584,7 @@ mod tests {
         let mut out_dequant = vec![0.0; 84 * 8400];
 
         let quant = Quantization::new(0.0040811873, -123);
-        dequantize_cpu(out, &quant, &mut out_dequant);
+        dequantize_cpu(out, quant, &mut out_dequant);
         let out = ndarray::Array2::from_shape_vec((84, 8400), out_dequant).unwrap();
 
         let mut output_boxes: Vec<_> = Vec::with_capacity(50);
@@ -640,10 +639,8 @@ mod tests {
 
         let mut output_boxes: Vec<_> = Vec::with_capacity(50);
         decode_modelpack_u8(
-            boxes.view(),
-            scores.view(),
-            &quant_boxes,
-            &quant_scores,
+            (boxes.view(), quant_boxes),
+            (scores.view(), quant_scores),
             score_threshold,
             iou_threshold,
             &mut output_boxes,
@@ -770,9 +767,9 @@ mod tests {
         let mut out_dequant = vec![0.0; 84 * 8400];
         let mut out_dequant_simd = vec![0.0; 84 * 8400];
         let quant = Quantization::new(0.0040811873, -123);
-        dequantize_cpu(out, &quant, &mut out_dequant);
+        dequantize_cpu(out, quant, &mut out_dequant);
 
-        dequantize_cpu_chunked(out, &quant, &mut out_dequant_simd);
+        dequantize_cpu_chunked(out, quant, &mut out_dequant_simd);
 
         assert_eq!(out_dequant, out_dequant_simd);
     }
@@ -791,8 +788,8 @@ mod tests {
             unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
         let protos = ndarray::Array3::from_shape_vec((160, 160, 32), protos.to_vec()).unwrap();
         let quant_protos = Quantization::new(0.020889872685074806, -115);
-        let protos = dequantize_ndarray(&quant_protos, protos.view());
-        let seg = dequantize_ndarray(&quant_boxes, boxes.view());
+        let protos = dequantize_ndarray(quant_protos, protos.view());
+        let seg = dequantize_ndarray(quant_boxes, boxes.view());
         let mut output_boxes: Vec<_> = Vec::with_capacity(10);
         let mut output_masks: Vec<_> = Vec::with_capacity(10);
         decode_yolo_segdet_f32(
@@ -831,18 +828,16 @@ mod tests {
         let mut output_masks: Vec<_> = Vec::with_capacity(500);
 
         decode_yolo_segdet_i8(
-            boxes.view(),
-            protos.view(),
-            &quant_boxes,
-            &quant_protos,
+            (boxes.view(), quant_boxes),
+            (protos.view(), quant_protos),
             score_threshold,
             iou_threshold,
             &mut output_boxes,
             &mut output_masks,
         );
 
-        let protos = dequantize_ndarray(&quant_protos, protos.view());
-        let seg = dequantize_ndarray(&quant_boxes, boxes.view());
+        let protos = dequantize_ndarray(quant_protos, protos.view());
+        let seg = dequantize_ndarray(quant_boxes, boxes.view());
         let mut output_boxes_f32: Vec<_> = Vec::with_capacity(500);
         let mut output_masks_f32: Vec<_> = Vec::with_capacity(500);
         decode_yolo_segdet_f32(

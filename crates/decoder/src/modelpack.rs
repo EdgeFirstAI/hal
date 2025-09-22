@@ -34,10 +34,8 @@ impl From<&Detection> for ModelPackDetectionConfig<f32> {
 }
 
 pub fn decode_modelpack_i8(
-    boxes_tensor: ArrayView2<i8>,
-    scores_tensor: ArrayView2<i8>,
-    quant_boxes: &Quantization<i8>,
-    quant_scores: &Quantization<i8>,
+    boxes_tensor: (ArrayView2<i8>, Quantization<i8>),
+    scores_tensor: (ArrayView2<i8>, Quantization<i8>),
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
@@ -45,8 +43,6 @@ pub fn decode_modelpack_i8(
     impl_modelpack_8bit::<XYXY, i8>(
         boxes_tensor,
         scores_tensor,
-        quant_boxes,
-        quant_scores,
         score_threshold,
         iou_threshold,
         output_boxes,
@@ -54,10 +50,8 @@ pub fn decode_modelpack_i8(
 }
 
 pub fn decode_modelpack_u8(
-    boxes_tensor: ArrayView2<u8>,
-    scores_tensor: ArrayView2<u8>,
-    quant_boxes: &Quantization<u8>,
-    quant_scores: &Quantization<u8>,
+    boxes_tensor: (ArrayView2<u8>, Quantization<u8>),
+    scores_tensor: (ArrayView2<u8>, Quantization<u8>),
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
@@ -65,8 +59,6 @@ pub fn decode_modelpack_u8(
     impl_modelpack_8bit::<XYXY, u8>(
         boxes_tensor,
         scores_tensor,
-        quant_boxes,
-        quant_scores,
         score_threshold,
         iou_threshold,
         output_boxes,
@@ -125,17 +117,17 @@ pub fn impl_modelpack_8bit<
     B: BBoxTypeTrait,
     T: PrimInt + AsPrimitive<i16> + AsPrimitive<f32> + Send + Sync,
 >(
-    boxes_tensor: ArrayView2<T>,
-    scores_tensor: ArrayView2<T>,
-    quant_boxes: &Quantization<T>,
-    quant_scores: &Quantization<T>,
+    boxes: (ArrayView2<T>, Quantization<T>),
+    scores: (ArrayView2<T>, Quantization<T>),
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
 ) {
+    let (boxes, quant_boxes) = boxes;
+    let (scores, quant_scores) = scores;
+
     let score_threshold = quantize_score_threshold(score_threshold, quant_scores);
-    let boxes =
-        postprocess_boxes_8bit::<B, T>(score_threshold, boxes_tensor, scores_tensor, quant_boxes);
+    let boxes = postprocess_boxes_8bit::<B, T>(score_threshold, boxes, scores, quant_boxes);
     let boxes = nms_i16(iou_threshold, boxes);
     let len = output_boxes.capacity().min(boxes.len());
     output_boxes.clear();

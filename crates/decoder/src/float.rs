@@ -71,6 +71,13 @@ pub fn nms_f32(iou: f32, mut boxes: Vec<DetectBox>) -> Vec<DetectBox> {
     // Boxes get sorted by score in descending order so we know based on the
     // index the scoring of the boxes and can skip parts of the loop.
     boxes.sort_by(|a, b| b.score.total_cmp(&a.score));
+
+    // When the iou is 1.0 or larger, no boxes will be filtered so we just return
+    // immediately
+    if iou >= 1.0 {
+        return boxes;
+    }
+
     // Outer loop over all boxes.
     for i in 0..boxes.len() {
         if boxes[i].score <= 0.0 {

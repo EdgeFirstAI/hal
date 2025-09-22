@@ -208,7 +208,7 @@ fn test_dequantize() -> PyResult<()> {
         let mut rust_dequantize = vec![0.0; 84 * 8400];
         dequantize_cpu(
             input,
-            &Quantization {
+            Quantization {
                 scale: 0.0040811873,
                 zero_point: -123,
             },

@@ -585,10 +585,8 @@ impl Decoder {
         let scores = scores.slice(s![0, .., ..]);
 
         decode_modelpack_i8(
-            boxes,
-            scores,
-            &quant_boxes,
-            &quant_scores,
+            (boxes, quant_boxes),
+            (scores, quant_scores),
             self.score_threshold,
             self.iou_threshold,
             output_boxes,
@@ -610,8 +608,7 @@ impl Decoder {
         let box_output = box_output.slice(s![0, .., ..]);
 
         decode_yolo_i8(
-            box_output,
-            &quant_boxes,
+            (box_output, quant_boxes),
             self.score_threshold,
             self.iou_threshold,
             output_boxes,
@@ -642,10 +639,8 @@ impl Decoder {
         let protos = protos.slice(s![0, .., .., ..]);
 
         decode_yolo_segdet_i8(
-            box_output,
-            protos,
-            &quant_boxes,
-            &quant_protos,
+            (box_output, quant_boxes),
+            (protos, quant_protos),
             self.score_threshold,
             self.iou_threshold,
             output_boxes,
@@ -698,10 +693,8 @@ impl Decoder {
         let scores = scores.slice(s![0, .., ..]);
 
         decode_modelpack_u8(
-            boxes,
-            scores,
-            &quant_boxes,
-            &quant_scores,
+            (boxes, quant_boxes),
+            (scores, quant_scores),
             self.score_threshold,
             self.iou_threshold,
             output_boxes,
@@ -723,8 +716,7 @@ impl Decoder {
         let box_output = box_output.slice(s![0, .., ..]);
 
         decode_yolo_u8(
-            box_output,
-            &quant_boxes,
+            (box_output, quant_boxes),
             self.score_threshold,
             self.iou_threshold,
             output_boxes,
@@ -744,8 +736,8 @@ impl Decoder {
             .quantization
             .map(Quantization::from_tuple_truncate)
             .unwrap_or_default();
-        let box_output = Self::find_outputs_with_shape(&boxes.shape, outputs)?;
-        let box_output = box_output.slice(s![0, .., ..]);
+        let boxes = Self::find_outputs_with_shape(&boxes.shape, outputs)?;
+        let boxes = boxes.slice(s![0, .., ..]);
 
         let quant_protos = protos
             .quantization
@@ -755,10 +747,8 @@ impl Decoder {
         let protos = protos.slice(s![0, .., .., ..]);
 
         decode_yolo_segdet_u8(
-            box_output,
-            protos,
-            &quant_boxes,
-            &quant_protos,
+            (boxes, quant_boxes),
+            (protos, quant_protos),
             self.score_threshold,
             self.iou_threshold,
             output_boxes,
