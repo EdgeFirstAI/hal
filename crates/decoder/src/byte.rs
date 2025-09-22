@@ -12,7 +12,7 @@ pub fn postprocess_boxes_8bit<
     threshold: T,
     boxes: ArrayView2<T>,
     scores: ArrayView2<T>,
-    quant: &Quantization<T>,
+    quant: Quantization<T>,
 ) -> Vec<DetectBoxQuantized<i16>> {
     assert_eq!(scores.dim().0, boxes.dim().0);
     assert_eq!(boxes.dim().1, 4);
@@ -46,7 +46,7 @@ pub fn postprocess_boxes_extra_8bit<
     boxes: ArrayView2<T>,
     scores: ArrayView2<T>,
     extra: &'a ArrayView2<E>,
-    quant_boxes: &Quantization<T>,
+    quant_boxes: Quantization<T>,
 ) -> Vec<(DetectBoxQuantized<i16>, ArrayView1<'a, E>)> {
     assert_eq!(scores.dim().0, boxes.dim().0);
     assert_eq!(boxes.dim().1, 4);
@@ -155,7 +155,7 @@ fn jaccard_i16(a: &BoundingBoxQuantized<i16>, b: &BoundingBoxQuantized<i16>, iou
 
 pub(crate) fn quantize_score_threshold<T: AsPrimitive<f32> + PrimInt>(
     score: f32,
-    quant: &Quantization<T>,
+    quant: Quantization<T>,
 ) -> T {
     if quant.scale == 0.0 {
         return T::max_value();
