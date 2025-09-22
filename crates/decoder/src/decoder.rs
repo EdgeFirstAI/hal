@@ -52,16 +52,6 @@ impl ConfigOutput {
         }
     }
 
-    pub fn dtype(&self) -> &configs::DataType {
-        match self {
-            ConfigOutput::Detection(detection) => &detection.dtype,
-            ConfigOutput::Mask(mask) => &mask.dtype,
-            ConfigOutput::Segmentation(segmentation) => &segmentation.dtype,
-            ConfigOutput::Scores(scores) => &scores.dtype,
-            ConfigOutput::Boxes(boxes) => &boxes.dtype,
-        }
-    }
-
     pub fn quantization(&self) -> &Option<(f64, i64)> {
         match self {
             ConfigOutput::Detection(detection) => &detection.quantization,
@@ -79,10 +69,7 @@ pub mod configs {
     #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
     pub struct Segmentation {
         pub decode: bool,
-        #[serde(rename = "decoder")]
         pub decoder: DecoderType,
-        pub dtype: DataType,
-        pub name: String,
         pub quantization: Option<(f64, i64)>,
         pub shape: Vec<usize>,
     }
@@ -91,8 +78,6 @@ pub mod configs {
     pub struct Mask {
         pub decode: bool,
         pub decoder: DecoderType,
-        pub dtype: DataType,
-        pub name: String,
         pub quantization: Option<(f64, i64)>,
         pub shape: Vec<usize>,
     }
@@ -100,9 +85,7 @@ pub mod configs {
     #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
     pub struct Detection {
         pub anchors: Option<Vec<[f32; 2]>>,
-        pub decode: bool,
         pub decoder: DecoderType,
-        pub dtype: DataType,
         pub quantization: Option<(f64, i64)>,
         pub shape: Vec<usize>,
     }
@@ -110,7 +93,6 @@ pub mod configs {
     #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
     pub struct Scores {
         pub decoder: DecoderType,
-        pub dtype: DataType,
         pub quantization: Option<(f64, i64)>,
         pub shape: Vec<usize>,
     }
@@ -118,8 +100,6 @@ pub mod configs {
     #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
     pub struct Boxes {
         pub decoder: DecoderType,
-        pub dtype: DataType,
-        pub name: String,
         pub quantization: Option<(f64, i64)>,
         pub shape: Vec<usize>,
     }
@@ -213,7 +193,84 @@ impl DecoderBuilder {
         self
     }
 
-    pub fn with_config(mut self, config: ConfigOutputs) -> Self {
+    pub fn with_config_yolo_det(mut self, boxes: configs::Boxes) -> Self {
+        let config = ConfigOutputs {
+            outputs: vec![ConfigOutput::Boxes(boxes)],
+        };
+        self.config_src.replace(ConfigSource::Config(config));
+        self
+    }
+
+    pub fn with_config_yolo_setdet(
+        mut self,
+        boxes: configs::Boxes,
+        protos: configs::Segmentation,
+    ) -> Self {
+        let config = ConfigOutputs {
+            outputs: vec![
+                ConfigOutput::Boxes(boxes),
+                ConfigOutput::Segmentation(protos),
+            ],
+        };
+        self.config_src.replace(ConfigSource::Config(config));
+        self
+    }
+
+    pub fn with_config_modelpack_det(
+        mut self,
+        boxes: configs::Boxes,
+        scores: configs::Scores,
+    ) -> Self {
+        let config = ConfigOutputs {
+            outputs: vec![ConfigOutput::Boxes(boxes), ConfigOutput::Scores(scores)],
+        };
+        self.config_src.replace(ConfigSource::Config(config));
+        self
+    }
+
+    pub fn with_config_modelpack_det_split(mut self, boxes: Vec<configs::Detection>) -> Self {
+        let outputs = boxes.into_iter().map(ConfigOutput::Detection).collect();
+        let config = ConfigOutputs { outputs };
+        self.config_src.replace(ConfigSource::Config(config));
+        self
+    }
+
+    pub fn with_config_modelpack_segdet(
+        mut self,
+        boxes: configs::Boxes,
+        scores: configs::Scores,
+        segmentation: configs::Segmentation,
+    ) -> Self {
+        let config = ConfigOutputs {
+            outputs: vec![
+                ConfigOutput::Boxes(boxes),
+                ConfigOutput::Scores(scores),
+                ConfigOutput::Segmentation(segmentation),
+            ],
+        };
+        self.config_src.replace(ConfigSource::Config(config));
+        self
+    }
+
+    pub fn with_config_modelpack_segdet_split(
+        mut self,
+        boxes: Vec<configs::Detection>,
+        segmentation: configs::Segmentation,
+    ) -> Self {
+        let mut outputs = boxes
+            .into_iter()
+            .map(ConfigOutput::Detection)
+            .collect::<Vec<_>>();
+        outputs.push(ConfigOutput::Segmentation(segmentation));
+        let config = ConfigOutputs { outputs };
+        self.config_src.replace(ConfigSource::Config(config));
+        self
+    }
+
+    pub fn with_config_modelpack_seg(mut self, segmentation: configs::Segmentation) -> Self {
+        let config = ConfigOutputs {
+            outputs: vec![ConfigOutput::Segmentation(segmentation)],
+        };
         self.config_src.replace(ConfigSource::Config(config));
         self
     }
