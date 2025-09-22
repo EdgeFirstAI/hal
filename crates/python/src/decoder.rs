@@ -134,8 +134,18 @@ impl PyDecoder {
                     .decoder
                     .decode_i8(&outputs, &mut output_boxes, &mut output_masks)
             }
-            ListOfReadOnlyArrayGenericDyn::Float32(_) => todo!(),
-            ListOfReadOnlyArrayGenericDyn::Float64(_) => todo!(),
+            ListOfReadOnlyArrayGenericDyn::Float32(items) => {
+                let outputs = items.iter().map(|x| x.as_array()).collect::<Vec<_>>();
+                self_
+                    .decoder
+                    .decode_f32(&outputs, &mut output_boxes, &mut output_masks)
+            }
+            ListOfReadOnlyArrayGenericDyn::Float64(items) => {
+                let outputs = items.iter().map(|x| x.as_array()).collect::<Vec<_>>();
+                self_
+                    .decoder
+                    .decode_f64(&outputs, &mut output_boxes, &mut output_masks)
+            }
         };
         if let Err(e) = result {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")));
