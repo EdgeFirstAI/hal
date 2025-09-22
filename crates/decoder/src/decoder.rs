@@ -1,4 +1,5 @@
 use ndarray::{ArrayViewD, s};
+use ndarray_stats::QuantileExt;
 use num_traits::AsPrimitive;
 use serde::{Deserialize, Serialize};
 
@@ -6,9 +7,13 @@ use crate::{
     DetectBox, Error, Quantization, Segmentation,
     configs::{DecoderType, ModelType},
     modelpack::{
-        ModelPackDetectionConfig, decode_modelpack_i8, decode_modelpack_split, decode_modelpack_u8,
+        ModelPackDetectionConfig, decode_modelpack_f32, decode_modelpack_f64, decode_modelpack_i8,
+        decode_modelpack_split, decode_modelpack_split_float, decode_modelpack_u8,
     },
-    yolo::{decode_yolo_i8, decode_yolo_segdet_i8, decode_yolo_segdet_u8, decode_yolo_u8},
+    yolo::{
+        decode_yolo_f32, decode_yolo_f64, decode_yolo_i8, decode_yolo_segdet_f32,
+        decode_yolo_segdet_f64, decode_yolo_segdet_i8, decode_yolo_segdet_u8, decode_yolo_u8,
+    },
 };
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
@@ -512,6 +517,92 @@ impl Decoder {
         Ok(())
     }
 
+    pub fn decode_f32(
+        &self,
+        outputs: &[ArrayViewD<f32>],
+        output_boxes: &mut Vec<DetectBox>,
+        output_masks: &mut Vec<Segmentation>,
+    ) -> Result<(), Error> {
+        output_boxes.clear();
+        output_masks.clear();
+        match &self.model_type {
+            ModelType::ModelPackSegDet {
+                boxes,
+                scores,
+                segmentation,
+            } => {
+                self.decode_modelpack_det_f32(outputs, boxes, scores, output_boxes)?;
+                self.decode_modelpack_seg_f32(outputs, segmentation, output_masks)?;
+            }
+            ModelType::ModelPackSegDetSplit {
+                detection,
+                segmentation,
+            } => {
+                self.decode_modelpack_det_split_float(outputs, detection, output_boxes)?;
+                self.decode_modelpack_seg_f32(outputs, segmentation, output_masks)?;
+            }
+            ModelType::ModelPackDet { boxes, scores } => {
+                self.decode_modelpack_det_f32(outputs, boxes, scores, output_boxes)?;
+            }
+            ModelType::ModelPackDetSplit { detection } => {
+                self.decode_modelpack_det_split_float(outputs, detection, output_boxes)?;
+            }
+            ModelType::ModelPackSeg { segmentation } => {
+                self.decode_modelpack_seg_f32(outputs, segmentation, output_masks)?;
+            }
+            ModelType::YoloDet { boxes } => {
+                self.decode_yolo_det_f32(outputs, boxes, output_boxes)?;
+            }
+            ModelType::YoloSegDet { boxes, protos } => {
+                self.decode_yolo_segdet_f32(outputs, boxes, protos, output_boxes, output_masks)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn decode_f64(
+        &self,
+        outputs: &[ArrayViewD<f64>],
+        output_boxes: &mut Vec<DetectBox>,
+        output_masks: &mut Vec<Segmentation>,
+    ) -> Result<(), Error> {
+        output_boxes.clear();
+        output_masks.clear();
+        match &self.model_type {
+            ModelType::ModelPackSegDet {
+                boxes,
+                scores,
+                segmentation,
+            } => {
+                self.decode_modelpack_det_f64(outputs, boxes, scores, output_boxes)?;
+                self.decode_modelpack_seg_f64(outputs, segmentation, output_masks)?;
+            }
+            ModelType::ModelPackSegDetSplit {
+                detection,
+                segmentation,
+            } => {
+                self.decode_modelpack_det_split_float(outputs, detection, output_boxes)?;
+                self.decode_modelpack_seg_f64(outputs, segmentation, output_masks)?;
+            }
+            ModelType::ModelPackDet { boxes, scores } => {
+                self.decode_modelpack_det_f64(outputs, boxes, scores, output_boxes)?;
+            }
+            ModelType::ModelPackDetSplit { detection } => {
+                self.decode_modelpack_det_split_float(outputs, detection, output_boxes)?;
+            }
+            ModelType::ModelPackSeg { segmentation } => {
+                self.decode_modelpack_seg_f64(outputs, segmentation, output_masks)?;
+            }
+            ModelType::YoloDet { boxes } => {
+                self.decode_yolo_det_f64(outputs, boxes, output_boxes)?;
+            }
+            ModelType::YoloSegDet { boxes, protos } => {
+                self.decode_yolo_segdet_f64(outputs, boxes, protos, output_boxes, output_masks)?;
+            }
+        }
+        Ok(())
+    }
+
     fn decode_modelpack_det_split<D>(
         &self,
         outputs: &[ArrayViewD<D>],
@@ -535,6 +626,38 @@ impl Decoder {
             })
             .collect::<Vec<_>>();
         decode_modelpack_split(
+            &new_outputs,
+            &new_detection,
+            self.score_threshold,
+            self.iou_threshold,
+            output_boxes,
+        );
+        Ok(())
+    }
+
+    fn decode_modelpack_det_split_float<D>(
+        &self,
+        outputs: &[ArrayViewD<D>],
+        detection: &[configs::Detection],
+        output_boxes: &mut Vec<DetectBox>,
+    ) -> Result<(), Error>
+    where
+        D: AsPrimitive<f32>,
+        i64: AsPrimitive<D>,
+    {
+        let new_outputs = Self::match_outputs_to_detect(detection, outputs)?;
+        let new_outputs = new_outputs
+            .into_iter()
+            .map(|x| x.slice(s![0, .., .., ..]))
+            .collect::<Vec<_>>();
+        let new_detection = detection
+            .iter()
+            .map(|x| ModelPackDetectionConfig {
+                anchors: x.anchors.clone().unwrap(),
+                quantization: None,
+            })
+            .collect::<Vec<_>>();
+        decode_modelpack_split_float(
             &new_outputs,
             &new_detection,
             self.score_threshold,
@@ -751,6 +874,180 @@ impl Decoder {
             (protos, quant_protos),
             self.score_threshold,
             self.iou_threshold,
+            output_boxes,
+            output_masks,
+        );
+        Ok(())
+    }
+
+    fn decode_modelpack_seg_f32(
+        &self,
+        outputs: &[ArrayViewD<f32>],
+        segmentation: &configs::Segmentation,
+        output_masks: &mut Vec<Segmentation>,
+    ) -> Result<(), Error> {
+        let seg = Self::find_outputs_with_shape(&segmentation.shape, outputs)?;
+        let seg = seg.slice(s![0, .., .., ..]);
+        let max = seg.max().unwrap_or(&255.0);
+        let min = seg.min().unwrap_or(&0.0);
+        let seg = seg.mapv(|x| ((x - min) / (max - min) * 255.0) as u8);
+        output_masks.push(Segmentation {
+            xmin: 0.0,
+            ymin: 0.0,
+            xmax: 1.0,
+            ymax: 1.0,
+            mask: seg,
+        });
+        Ok(())
+    }
+
+    fn decode_modelpack_det_f32(
+        &self,
+        outputs: &[ArrayViewD<f32>],
+        boxes: &configs::Boxes,
+        scores: &configs::Scores,
+        output_boxes: &mut Vec<DetectBox>,
+    ) -> Result<(), Error> {
+        let boxes = Self::find_outputs_with_shape(&boxes.shape, outputs)?;
+        let boxes = boxes.slice(s![0, .., 0, ..]);
+
+        let scores = Self::find_outputs_with_shape(&scores.shape, outputs)?;
+        let scores = scores.slice(s![0, .., ..]);
+
+        decode_modelpack_f32(
+            boxes,
+            scores,
+            self.score_threshold,
+            self.iou_threshold,
+            output_boxes,
+        );
+        Ok(())
+    }
+
+    fn decode_yolo_det_f32(
+        &self,
+        outputs: &[ArrayViewD<f32>],
+        boxes: &configs::Detection,
+        output_boxes: &mut Vec<DetectBox>,
+    ) -> Result<(), Error> {
+        let box_output = Self::find_outputs_with_shape(&boxes.shape, outputs)?;
+        let box_output = box_output.slice(s![0, .., ..]);
+
+        decode_yolo_f32(
+            box_output,
+            self.score_threshold,
+            self.iou_threshold,
+            output_boxes,
+        );
+        Ok(())
+    }
+
+    fn decode_yolo_segdet_f32(
+        &self,
+        outputs: &[ArrayViewD<f32>],
+        boxes: &configs::Segmentation,
+        protos: &configs::Segmentation,
+        output_boxes: &mut Vec<DetectBox>,
+        output_masks: &mut Vec<Segmentation>,
+    ) -> Result<(), Error> {
+        let box_output = Self::find_outputs_with_shape(&boxes.shape, outputs)?;
+        let box_output = box_output.slice(s![0, .., ..]);
+
+        let protos = Self::find_outputs_with_shape(&protos.shape, outputs)?;
+        let protos = protos.slice(s![0, .., .., ..]);
+
+        decode_yolo_segdet_f32(
+            box_output,
+            protos,
+            self.score_threshold,
+            self.iou_threshold,
+            output_boxes,
+            output_masks,
+        );
+        Ok(())
+    }
+
+    fn decode_modelpack_seg_f64(
+        &self,
+        outputs: &[ArrayViewD<f64>],
+        segmentation: &configs::Segmentation,
+        output_masks: &mut Vec<Segmentation>,
+    ) -> Result<(), Error> {
+        let seg = Self::find_outputs_with_shape(&segmentation.shape, outputs)?;
+        let seg = seg.slice(s![0, .., .., ..]);
+        let max = seg.max().unwrap_or(&255.0);
+        let min = seg.min().unwrap_or(&0.0);
+        let seg = seg.mapv(|x| ((x - min) / (max - min) * 255.0) as u8);
+        output_masks.push(Segmentation {
+            xmin: 0.0,
+            ymin: 0.0,
+            xmax: 1.0,
+            ymax: 1.0,
+            mask: seg,
+        });
+        Ok(())
+    }
+
+    fn decode_modelpack_det_f64(
+        &self,
+        outputs: &[ArrayViewD<f64>],
+        boxes: &configs::Boxes,
+        scores: &configs::Scores,
+        output_boxes: &mut Vec<DetectBox>,
+    ) -> Result<(), Error> {
+        let boxes = Self::find_outputs_with_shape(&boxes.shape, outputs)?;
+        let boxes = boxes.slice(s![0, .., 0, ..]);
+
+        let scores = Self::find_outputs_with_shape(&scores.shape, outputs)?;
+        let scores = scores.slice(s![0, .., ..]);
+
+        decode_modelpack_f64(
+            boxes,
+            scores,
+            self.score_threshold as f64,
+            self.iou_threshold as f64,
+            output_boxes,
+        );
+        Ok(())
+    }
+
+    fn decode_yolo_det_f64(
+        &self,
+        outputs: &[ArrayViewD<f64>],
+        boxes: &configs::Detection,
+        output_boxes: &mut Vec<DetectBox>,
+    ) -> Result<(), Error> {
+        let box_output = Self::find_outputs_with_shape(&boxes.shape, outputs)?;
+        let box_output = box_output.slice(s![0, .., ..]);
+
+        decode_yolo_f64(
+            box_output,
+            self.score_threshold as f64,
+            self.iou_threshold as f64,
+            output_boxes,
+        );
+        Ok(())
+    }
+
+    fn decode_yolo_segdet_f64(
+        &self,
+        outputs: &[ArrayViewD<f64>],
+        boxes: &configs::Segmentation,
+        protos: &configs::Segmentation,
+        output_boxes: &mut Vec<DetectBox>,
+        output_masks: &mut Vec<Segmentation>,
+    ) -> Result<(), Error> {
+        let box_output = Self::find_outputs_with_shape(&boxes.shape, outputs)?;
+        let box_output = box_output.slice(s![0, .., ..]);
+
+        let protos = Self::find_outputs_with_shape(&protos.shape, outputs)?;
+        let protos = protos.slice(s![0, .., .., ..]);
+
+        decode_yolo_segdet_f64(
+            box_output,
+            protos,
+            self.score_threshold as f64,
+            self.iou_threshold as f64,
             output_boxes,
             output_masks,
         );
