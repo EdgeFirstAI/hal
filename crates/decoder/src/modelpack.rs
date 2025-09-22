@@ -107,6 +107,24 @@ pub fn decode_modelpack_split<D: AsPrimitive<f32>>(
     impl_modelpack_split::<XYWH, D>(
         outputs,
         configs,
+        false,
+        score_threshold,
+        iou_threshold,
+        output_boxes,
+    );
+}
+
+pub fn decode_modelpack_split_float<D: AsPrimitive<f32>>(
+    outputs: &[ArrayView3<D>],
+    configs: &[ModelPackDetectionConfig<D>],
+    score_threshold: f32,
+    iou_threshold: f32,
+    output_boxes: &mut Vec<DetectBox>,
+) {
+    impl_modelpack_split::<XYWH, D>(
+        outputs,
+        configs,
+        true,
         score_threshold,
         iou_threshold,
         output_boxes,
@@ -155,11 +173,13 @@ pub fn impl_modelpack_float<B: BBoxTypeTrait, T: Float + AsPrimitive<f32> + Send
 pub fn impl_modelpack_split<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
     outputs: &[ArrayView3<D>],
     configs: &[ModelPackDetectionConfig<D>],
+    skip_dequant: bool,
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
 ) {
-    let (boxes_tensor, scores_tensor) = postprocess_modelpack_split(outputs, configs).unwrap();
+    let (boxes_tensor, scores_tensor) =
+        postprocess_modelpack_split(outputs, configs, skip_dequant).unwrap();
     let boxes = postprocess_boxes_float::<B, f32>(
         score_threshold,
         boxes_tensor.view(),
@@ -176,6 +196,7 @@ pub fn impl_modelpack_split<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
 pub fn postprocess_modelpack_split<T: AsPrimitive<f32>>(
     outputs: &[ArrayView3<T>],
     config: &[ModelPackDetectionConfig<T>],
+    skip_dequant: bool,
 ) -> Result<(Array2<f32>, Array2<f32>)> {
     let mut total_capacity = 0;
     let mut nc = 0;
@@ -197,7 +218,7 @@ pub fn postprocess_modelpack_split<T: AsPrimitive<f32>>(
             p.len(),
             "Shape product doesn't match tensor length"
         );
-        let p_sigmoid = if let Some(quant) = &detail.quantization {
+        let p_sigmoid = if !skip_dequant && let Some(quant) = &detail.quantization {
             let scaled_zero = -quant.zero_point.as_() * quant.scale;
             p.mapv(|x| fast_sigmoid_impl(x.as_() * quant.scale + scaled_zero))
         } else {
