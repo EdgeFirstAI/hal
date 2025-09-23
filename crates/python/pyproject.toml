@@ -1,0 +1,11 @@
+[project]
+name = "edgefirst_python"
+dynamic = ["name", "version", "summary", "description", "description_content_type", "keywords", "home_page", "author", "author_email", "license", "project_url"]
+
+dependencies = [
+  "numpy",
+]
+
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
