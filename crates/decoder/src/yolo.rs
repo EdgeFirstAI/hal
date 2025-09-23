@@ -296,7 +296,7 @@ fn decode_segdet_8bit<T: AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync>(
         .into_par_iter()
         .map(|mut b| {
             let mask = &b.1;
-            let (protos, roi) = protobox(&protos, &b.0.bbox);
+            let (protos, roi) = protobox(&protos, &b.0.bbox.to_canonical());
             b.0.bbox = roi;
             (
                 b.0,
@@ -313,15 +313,11 @@ fn protobox<'a, T>(
     let width = protos.dim().1 as f32;
     let height = protos.dim().0 as f32;
 
-    let xmin = roi.xmin.min(roi.xmax);
-    let xmax = roi.xmin.max(roi.xmax);
-    let ymin = roi.ymin.min(roi.ymax);
-    let ymax = roi.ymin.max(roi.ymax);
     let roi = [
-        (xmin * width).clamp(0.0, width) as usize,
-        (ymin * height).clamp(0.0, height) as usize,
-        (xmax * width).clamp(0.0, width).ceil() as usize,
-        (ymax * height).clamp(0.0, height).ceil() as usize,
+        (roi.xmin * width).clamp(0.0, width) as usize,
+        (roi.ymin * height).clamp(0.0, height) as usize,
+        (roi.xmax * width).clamp(0.0, width).ceil() as usize,
+        (roi.ymax * height).clamp(0.0, height).ceil() as usize,
     ];
 
     let roi_norm = [
