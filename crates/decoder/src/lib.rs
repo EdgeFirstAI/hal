@@ -2,7 +2,7 @@
 #![allow(clippy::excessive_precision)]
 use std::ops::{Add, Mul, Sub};
 
-use ndarray::{Array, Array2, Array3, ArrayView, ArrayView1, ArrayView3, Dimension};
+use ndarray::{Array, Array2, Array3, ArrayView, ArrayView1, ArrayView3, Dimension, Slice};
 use num_traits::{AsPrimitive, Float, PrimInt, Signed};
 pub mod byte;
 pub mod error;
@@ -228,6 +228,22 @@ pub struct BoundingBox {
     pub ymax: f32,
 }
 
+impl BoundingBox {
+    /// Transforms BoundingBox so that xmin <= xmax and ymin <= ymax
+    pub fn to_canonical(&self) -> Self {
+        let xmin = self.xmin.min(self.xmax);
+        let xmax = self.xmin.max(self.xmax);
+        let ymin = self.ymin.min(self.ymax);
+        let ymax = self.ymin.max(self.ymax);
+        BoundingBox {
+            xmin,
+            ymin,
+            xmax,
+            ymax,
+        }
+    }
+}
+
 impl From<BoundingBox> for [f32; 4] {
     fn from(b: BoundingBox) -> Self {
         [b.xmin, b.ymin, b.xmax, b.ymax]
@@ -246,8 +262,8 @@ impl From<[f32; 4]> for BoundingBox {
 }
 
 impl DetectBox {
-    // Check if one detect box is equal to another detect box, within the given
-    // delta
+    /// Check if one detect box is equal to another detect box, within the given
+    /// delta
     pub fn equal_within_delta(&self, rhs: &DetectBox, delta: f32) -> bool {
         let eq_delta = |a: f32, b: f32| (a - b).abs() <= delta;
         self.label == rhs.label
