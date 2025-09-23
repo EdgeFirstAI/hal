@@ -313,11 +313,15 @@ fn protobox<'a, T>(
     let width = protos.dim().1 as f32;
     let height = protos.dim().0 as f32;
 
+    let xmin = roi.xmin.min(roi.xmax);
+    let xmax = roi.xmin.max(roi.xmax);
+    let ymin = roi.ymin.min(roi.ymax);
+    let ymax = roi.ymin.max(roi.ymax);
     let roi = [
-        (roi.xmin * width).clamp(0.0, width) as usize,
-        (roi.ymin * height).clamp(0.0, height) as usize,
-        (roi.xmax * width).clamp(0.0, width).ceil() as usize,
-        (roi.ymax * height).clamp(0.0, height).ceil() as usize,
+        (xmin * width).clamp(0.0, width) as usize,
+        (ymin * height).clamp(0.0, height) as usize,
+        (xmax * width).clamp(0.0, width).ceil() as usize,
+        (ymax * height).clamp(0.0, height).ceil() as usize,
     ];
 
     let roi_norm = [
@@ -327,11 +331,6 @@ fn protobox<'a, T>(
         roi[3] as f32 / height,
     ]
     .into();
-
-    let shape = [(roi[3] - roi[1]), (roi[2] - roi[0]), protos.dim().2];
-    if shape[0] * shape[1] * shape[2] == 0 {
-        return (protos.slice(s![0..0, 0..0, ..]), roi_norm);
-    }
 
     let cropped = protos.slice(s![roi[1]..roi[3], roi[0]..roi[2], ..]);
 
