@@ -205,7 +205,7 @@ pub fn impl_yolo_segdet_8bit<
             ymin: b.bbox.ymin,
             xmax: b.bbox.xmax,
             ymax: b.bbox.ymax,
-            mask: m,
+            segmentation: m,
         });
     }
 }
@@ -241,7 +241,7 @@ pub fn impl_yolo_segdet_float<
             ymin: b.bbox.ymin,
             xmax: b.bbox.xmax,
             ymax: b.bbox.ymax,
-            mask: m,
+            segmentation: m,
         });
     }
 }
@@ -314,10 +314,10 @@ fn protobox<'a, T>(
     let height = protos.dim().0 as f32;
 
     let roi = [
-        (roi.xmin * width - 0.5).clamp(0.0, width) as usize,
-        (roi.ymin * height - 0.5).clamp(0.0, height) as usize,
-        (roi.xmax * width + 0.5).clamp(0.0, width).ceil() as usize,
-        (roi.ymax * height + 0.5).clamp(0.0, height).ceil() as usize,
+        (roi.xmin * width).clamp(0.0, width) as usize,
+        (roi.ymin * height).clamp(0.0, height) as usize,
+        (roi.xmax * width).clamp(0.0, width).ceil() as usize,
+        (roi.ymax * height).clamp(0.0, height).ceil() as usize,
     ];
 
     let roi_norm = [
@@ -353,8 +353,10 @@ fn make_segmentation<T: Float + Send + Sync + AsPrimitive<u8>>(
 
     let min = *mask.min().unwrap_or(&T::zero());
     let max = *mask.max().unwrap_or(&T::one());
-    let u8_max = T::from(255.0).unwrap();
-    mask.map(|x| ((*x - min) / max * u8_max).as_())
+    let max = max.max(-min);
+    let min = -max;
+    let u8_max = T::from(256.0).unwrap();
+    mask.map(|x| ((*x - min) / (max - min) * u8_max).as_())
 }
 
 fn make_segmentation_8bit<T: AsPrimitive<i32> + AsPrimitive<f32>>(
@@ -379,10 +381,11 @@ fn make_segmentation_8bit<T: AsPrimitive<i32> + AsPrimitive<f32>>(
         .into_shape_with_order((shape[0], shape[1], 1))
         .unwrap();
 
-    let min = segmentation.min().unwrap();
-    let max = segmentation.max().unwrap();
-
-    segmentation.map(|x| ((x - min) as f32 / *max as f32 * 255.0) as u8)
+    let min = *segmentation.min().unwrap_or(&-1);
+    let max = *segmentation.max().unwrap_or(&1);
+    let max = max.max(-min);
+    let min = -max;
+    segmentation.map(|x| ((x - min) as f32 / (max - min) as f32 * 256.0) as u8)
 }
 
 pub fn yolo_segmentation_to_mask(segmentation: ArrayView3<u8>, threshold: u8) -> Array2<u8> {

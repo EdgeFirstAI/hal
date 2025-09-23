@@ -298,9 +298,9 @@ fn decoder_modelpack_split_u8(bencher: divan::Bencher) {
 fn decoder_masks(bencher: divan::Bencher) {
     let score_threshold = 0.001;
     let iou_threshold = 0.70;
-    let boxes = include_bytes!("../../../testdata/yolov8_segmentation_37x8400.bin");
+    let boxes = include_bytes!("../../../testdata/yolov8_boxes_116x8400.bin");
     let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
-    let boxes = ndarray::Array2::from_shape_vec((37, 8400), boxes.to_vec()).unwrap();
+    let boxes = ndarray::Array2::from_shape_vec((116, 8400), boxes.to_vec()).unwrap();
     let quant_boxes = Quantization::<i8> {
         scale: 0.01948494464159012,
         zero_point: 20,
@@ -336,9 +336,9 @@ fn decoder_masks(bencher: divan::Bencher) {
 fn decoder_masks_i8(bencher: divan::Bencher) {
     let score_threshold = 0.001;
     let iou_threshold = 0.70;
-    let boxes = include_bytes!("../../../testdata/yolov8_segmentation_37x8400.bin");
+    let boxes = include_bytes!("../../../testdata/yolov8_boxes_116x8400.bin");
     let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
-    let boxes = ndarray::Array2::from_shape_vec((37, 8400), boxes.to_vec()).unwrap();
+    let boxes = ndarray::Array2::from_shape_vec((116, 8400), boxes.to_vec()).unwrap();
     let quant_boxes = Quantization::<i8> {
         scale: 0.01948494464159012,
         zero_point: 20,

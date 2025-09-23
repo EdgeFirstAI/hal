@@ -284,9 +284,9 @@ pub struct Segmentation {
     pub xmax: f32,
     /// bottom-most normalized coordinate of the segmentation box
     pub ymax: f32,
-    /// 3D mask array. If the last dimension is 1, values above 128 are
-    /// considered objects. Otherwise the object is the argmax index
-    pub mask: Array3<u8>,
+    /// 3D segmentation array. If the last dimension is 1, values equal or above
+    /// 128 are considered objects. Otherwise the object is the argmax index
+    pub segmentation: Array3<u8>,
 }
 
 /// A quantized bounding box used to process boxes faster. The coordinates are
@@ -776,18 +776,18 @@ mod tests {
 
     #[test]
     fn test_decoder_masks() {
-        let score_threshold = 0.001;
-        let iou_threshold = 0.60;
-        let boxes = include_bytes!("../../../testdata/yolov8_segmentation_37x8400.bin");
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+        let boxes = include_bytes!("../../../testdata/yolov8_boxes_116x8400.bin");
         let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
-        let boxes = ndarray::Array2::from_shape_vec((37, 8400), boxes.to_vec()).unwrap();
-        let quant_boxes = Quantization::new(0.01948494464159012, 20);
+        let boxes = ndarray::Array2::from_shape_vec((116, 8400), boxes.to_vec()).unwrap();
+        let quant_boxes = Quantization::new(0.021287761628627777, 31);
 
         let protos = include_bytes!("../../../testdata/yolov8_protos_160x160x32.bin");
         let protos =
             unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
         let protos = ndarray::Array3::from_shape_vec((160, 160, 32), protos.to_vec()).unwrap();
-        let quant_protos = Quantization::new(0.020889872685074806, -115);
+        let quant_protos = Quantization::new(0.02491161972284317, -117);
         let protos = dequantize_ndarray(quant_protos, protos.view());
         let seg = dequantize_ndarray(quant_boxes, boxes.view());
         let mut output_boxes: Vec<_> = Vec::with_capacity(10);
@@ -800,30 +800,71 @@ mod tests {
             &mut output_boxes,
             &mut output_masks,
         );
-
+        assert_eq!(output_boxes.len(), 2);
         assert_eq!(output_boxes.len(), output_masks.len());
-        for (b, m) in output_boxes.iter().zip(output_masks) {
+
+        for (b, m) in output_boxes.iter().zip(&output_masks) {
             assert!(b.bbox.xmin >= m.xmin);
             assert!(b.bbox.ymin >= m.ymin);
             assert!(b.bbox.xmax >= m.xmax);
             assert!(b.bbox.ymax >= m.ymax);
         }
+        assert!(output_boxes[0].equal_within_delta(
+            &DetectBox {
+                bbox: BoundingBox {
+                    xmin: 0.08515105,
+                    ymin: 0.7131401,
+                    xmax: 0.29802868,
+                    ymax: 0.8195788,
+                },
+                score: 0.91537374,
+                label: 23
+            },
+            1.0 / 160.0, // wider range because mask will expand the box
+        ));
+
+        assert!(output_boxes[1].equal_within_delta(
+            &DetectBox {
+                bbox: BoundingBox {
+                    xmin: 0.59605736,
+                    ymin: 0.25545314,
+                    xmax: 0.93666154,
+                    ymax: 0.72378385,
+                },
+                score: 0.91537374,
+                label: 23
+            },
+            1.0 / 160.0, // wider range because mask will expand the box
+        ));
+
+        let full_mask = include_bytes!("../../../testdata/yolov8_mask_results.bin");
+        let full_mask = ndarray::Array2::from_shape_vec((160, 160), full_mask.to_vec()).unwrap();
+
+        let cropped_mask = full_mask.slice(ndarray::s![
+            (output_masks[1].ymin * 160.0) as usize..(output_masks[1].ymax * 160.0) as usize,
+            (output_masks[1].xmin * 160.0) as usize..(output_masks[1].xmax * 160.0) as usize,
+        ]);
+
+        assert_eq!(
+            cropped_mask,
+            segmentation_to_mask(output_masks[1].segmentation.view())
+        );
     }
 
     #[test]
     fn test_decoder_masks_i8() {
-        let score_threshold = 0.001;
-        let iou_threshold = 0.60;
-        let boxes = include_bytes!("../../../testdata/yolov8_segmentation_37x8400.bin");
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+        let boxes = include_bytes!("../../../testdata/yolov8_boxes_116x8400.bin");
         let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
-        let boxes = ndarray::Array2::from_shape_vec((37, 8400), boxes.to_vec()).unwrap();
-        let quant_boxes = Quantization::new(0.01948494464159012, 20);
+        let boxes = ndarray::Array2::from_shape_vec((116, 8400), boxes.to_vec()).unwrap();
+        let quant_boxes = Quantization::new(0.021287761628627777, 31);
 
         let protos = include_bytes!("../../../testdata/yolov8_protos_160x160x32.bin");
         let protos =
             unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
         let protos = ndarray::Array3::from_shape_vec((160, 160, 32), protos.to_vec()).unwrap();
-        let quant_protos = Quantization::new(0.020889872685074806, -115);
+        let quant_protos = Quantization::new(0.02491161972284317, -117);
         let mut output_boxes: Vec<_> = Vec::with_capacity(500);
         let mut output_masks: Vec<_> = Vec::with_capacity(500);
 
@@ -864,12 +905,12 @@ mod tests {
                 [m_i8.xmin, m_i8.ymin, m_i8.xmax, m_i8.ymax],
                 [m_f32.xmin, m_f32.ymin, m_f32.xmax, m_f32.ymax],
             );
-            assert_eq!(m_i8.mask.shape(), m_f32.mask.shape());
-            let mask_i8 = m_i8.mask.map(|x| *x as i32);
-            let mask_f32 = m_f32.mask.map(|x| *x as i32);
+            assert_eq!(m_i8.segmentation.shape(), m_f32.segmentation.shape());
+            let mask_i8 = m_i8.segmentation.map(|x| *x as i32);
+            let mask_f32 = m_f32.segmentation.map(|x| *x as i32);
             let diff = &mask_i8 - &mask_f32;
             assert!(
-                !diff.iter().any(|x| *x > 1),
+                !diff.iter().any(|x| x.abs() > 1),
                 "Difference between mask i8 and mask f32 is greater than 1: {:#?}",
                 diff
             );
