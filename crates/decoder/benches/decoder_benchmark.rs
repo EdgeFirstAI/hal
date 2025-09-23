@@ -296,8 +296,8 @@ fn decoder_modelpack_split_u8(bencher: divan::Bencher) {
 
 #[divan::bench()]
 fn decoder_masks(bencher: divan::Bencher) {
-    let score_threshold = 0.001;
-    let iou_threshold = 0.70;
+    let score_threshold = 0.45;
+    let iou_threshold = 0.45;
     let boxes = include_bytes!("../../../testdata/yolov8_boxes_116x8400.bin");
     let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
     let boxes = ndarray::Array2::from_shape_vec((116, 8400), boxes.to_vec()).unwrap();
@@ -334,8 +334,8 @@ fn decoder_masks(bencher: divan::Bencher) {
 
 #[divan::bench()]
 fn decoder_masks_i8(bencher: divan::Bencher) {
-    let score_threshold = 0.001;
-    let iou_threshold = 0.70;
+    let score_threshold = 0.45;
+    let iou_threshold = 0.45;
     let boxes = include_bytes!("../../../testdata/yolov8_boxes_116x8400.bin");
     let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
     let boxes = ndarray::Array2::from_shape_vec((116, 8400), boxes.to_vec()).unwrap();
