@@ -556,5 +556,8 @@ fn convert_seg_mask<'py>(
     py: Python<'py>,
     output_masks: &[Segmentation],
 ) -> Vec<Bound<'py, PyArray3<u8>>> {
-    output_masks.iter().map(|x| x.mask.to_pyarray(py)).collect()
+    output_masks
+        .iter()
+        .map(|x| x.segmentation.to_pyarray(py))
+        .collect()
 }

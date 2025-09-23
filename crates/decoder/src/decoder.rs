@@ -681,7 +681,7 @@ impl Decoder {
             ymin: 0.0,
             xmax: 1.0,
             ymax: 1.0,
-            mask: seg,
+            segmentation: seg,
         });
         Ok(())
     }
@@ -789,7 +789,7 @@ impl Decoder {
             ymin: 0.0,
             xmax: 1.0,
             ymax: 1.0,
-            mask: seg,
+            segmentation: seg,
         });
         Ok(())
     }
@@ -896,7 +896,7 @@ impl Decoder {
             ymin: 0.0,
             xmax: 1.0,
             ymax: 1.0,
-            mask: seg,
+            segmentation: seg,
         });
         Ok(())
     }
@@ -983,7 +983,7 @@ impl Decoder {
             ymin: 0.0,
             xmax: 1.0,
             ymax: 1.0,
-            mask: seg,
+            segmentation: seg,
         });
         Ok(())
     }
