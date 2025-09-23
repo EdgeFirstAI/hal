@@ -11,3 +11,5 @@ testdata/modelpack_split_9x15x18.bin filter=lfs diff=lfs merge=lfs -text
 testdata/yolov8_protos_160x160x32.bin filter=lfs diff=lfs merge=lfs -text
 testdata/yolov8_segmentation_37x8400.bin filter=lfs diff=lfs merge=lfs -text
 testdata/modelpack_boxes_1935x1x4.bin filter=lfs diff=lfs merge=lfs -text
+testdata/yolov8_boxes_116x8400.bin filter=lfs diff=lfs merge=lfs -text
+testdata/yolov8_mask_results.bin filter=lfs diff=lfs merge=lfs -text
