@@ -37,11 +37,13 @@ impl From<Error> for PyErr {
 
 #[pyclass]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::upper_case_acronyms)]
 pub enum FourCC {
     YUYV,
     RGBA,
     RGB,
     NV12,
+    GREY,
 }
 
 impl TryFrom<&str> for FourCC {
@@ -51,9 +53,9 @@ impl TryFrom<&str> for FourCC {
         match value.to_uppercase().as_str() {
             "YUYV" => Ok(FourCC::YUYV),
             "RGBA" => Ok(FourCC::RGBA),
-            "RGB" => Ok(FourCC::RGB),
-            "RGB " => Ok(FourCC::RGB),
+            "RGB" | "RGB " => Ok(FourCC::RGB),
             "NV12" => Ok(FourCC::RGB),
+            "Y800" | "GREY" | "GRAY" => Ok(FourCC::GREY),
             _ => Err(Error::FormatError(value.to_string())),
         }
     }
@@ -66,6 +68,7 @@ impl From<FourCC> for FourCharCode {
             FourCC::RGBA => image::RGBA,
             FourCC::RGB => image::RGB,
             FourCC::NV12 => image::NV12,
+            FourCC::GREY => image::GREY,
         }
     }
 }
@@ -74,14 +77,7 @@ impl TryFrom<FourCharCode> for FourCC {
     type Error = Error;
 
     fn try_from(value: FourCharCode) -> Result<Self, Self::Error> {
-        match value.to_string().to_uppercase().as_str() {
-            "YUYV" => Ok(FourCC::YUYV),
-            "RGBA" => Ok(FourCC::RGBA),
-            "RGB " => Ok(FourCC::RGB),
-            "RGB" => Ok(FourCC::RGB),
-            "NV12" => Ok(FourCC::NV12),
-            _ => Err(Error::FormatError(value.to_string())),
-        }
+        Self::try_from(value.to_string().to_uppercase().as_str())
     }
 }
 
