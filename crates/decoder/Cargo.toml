@@ -10,12 +10,12 @@ readme.workspace = true
 license.workspace = true
 
 [features]
-default = ["tracker"]
-tracker = ["dep:edgefirst-tracker"]
+#default = ["tracker"]
+#tracker = ["dep:edgefirst-tracker"]
 
 [dependencies]
 argminmax = { version = "0.6.3", default-features = false}
-edgefirst-tracker = { version = "*", path = "../tracker", optional=true }
+#edgefirst-tracker = { version = "*", path = "../tracker", optional=true }
 env_logger = { workspace = true }
 fast-math = "0.1.1"
 log = { workspace = true }
