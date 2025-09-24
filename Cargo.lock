@@ -458,7 +458,6 @@ version = "0.0.0"
 dependencies = [
  "argminmax",
  "divan",
- "edgefirst-tracker",
  "env_logger",
  "fast-math",
  "image",

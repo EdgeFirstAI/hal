@@ -2,7 +2,7 @@
 #![allow(clippy::excessive_precision)]
 use std::ops::{Add, Mul, Sub};
 
-use ndarray::{Array, Array2, Array3, ArrayView, ArrayView1, ArrayView3, Dimension, Slice};
+use ndarray::{Array, Array2, Array3, ArrayView, ArrayView1, ArrayView3, Dimension};
 use num_traits::{AsPrimitive, Float, PrimInt, Signed};
 pub mod byte;
 pub mod error;
@@ -275,20 +275,19 @@ impl DetectBox {
     }
 }
 
-#[cfg(feature = "tracker")]
-impl edgefirst_tracker::DetectionBox for DetectBox {
-    fn bbox(&self) -> [f32; 4] {
-        self.bbox.into()
-    }
+// impl edgefirst_tracker::DetectionBox for DetectBox {
+//     fn bbox(&self) -> [f32; 4] {
+//         self.bbox.into()
+//     }
 
-    fn score(&self) -> f32 {
-        self.score
-    }
+//     fn score(&self) -> f32 {
+//         self.score
+//     }
 
-    fn label(&self) -> usize {
-        self.label
-    }
-}
+//     fn label(&self) -> usize {
+//         self.label
+//     }
+// }
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Segmentation {
