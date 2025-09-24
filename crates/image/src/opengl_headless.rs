@@ -1,6 +1,6 @@
-// #![cfg(target_os = "linux")]
+#![cfg(target_os = "linux")]
 use drm::{Device as DrmDevice, buffer::DrmFourcc, control::Device as DrmControlDevice};
-use edgefirst_tensor::{DmaTensor, TensorTrait};
+use edgefirst_tensor::TensorTrait;
 use four_char_code::FourCharCode;
 use gbm::{AsRaw, Device};
 use khronos_egl::{self as egl, Attrib, Config};
@@ -13,7 +13,7 @@ use std::{
     str::FromStr,
 };
 
-use crate::{Error, ImageConverterTrait, RGB, RGBA, Rect, TensorImage, YUYV};
+use crate::{Error, GREY, ImageConverterTrait, RGB, RGBA, TensorImage, YUYV};
 
 pub struct Headless {
     pub surface: egl::Surface,
@@ -449,13 +449,7 @@ impl GLConverter {
         };
         check_gl_error().unwrap();
         let result = if let Ok(new_egl_image) = self.create_image_from_dma2(src) {
-            self.draw_camera_texture_eglimage(
-                &self.camera_texture,
-                &new_egl_image,
-                roi,
-                rotation_offset,
-                flip,
-            )
+            self.draw_camera_texture_eglimage(src, &new_egl_image, roi, rotation_offset, flip)
         } else {
             self.draw_camera_texture(src, roi, rotation_offset, flip)
         };
@@ -483,6 +477,17 @@ impl GLConverter {
         src: &TensorImage,
         crop: Option<crate::Rect>,
     ) -> Result<(), crate::Error> {
+        if let Some(crop) = crop
+            && (crop.left > 0
+                || crop.top > 0
+                || crop.height < src.height()
+                || crop.width < src.width())
+        {
+            return Err(crate::Error::NotSupported(
+                "Cropping in planar RGB mode is not supported".to_string(),
+            ));
+        }
+
         self.gbm_rendering.make_current()?;
         let new_egl_image = self.create_image_from_dma2(src)?;
         unsafe {
@@ -584,6 +589,7 @@ impl GLConverter {
         let texture_format = match img.fourcc() {
             RGB => gls::gl::RGB,
             RGBA => gls::gl::RGBA,
+            GREY => gls::gl::RED,
             _ => {
                 return Err(Error::NotSupported(
                     "YUYV textures aren't supposed by OpenGL".to_string(),
@@ -604,6 +610,23 @@ impl GLConverter {
                 gls::gl::TEXTURE_MAG_FILTER,
                 gls::gl::LINEAR as i32,
             );
+            if img.fourcc() == GREY {
+                for swizzle in [
+                    gls::gl::TEXTURE_SWIZZLE_R,
+                    gls::gl::TEXTURE_SWIZZLE_G,
+                    gls::gl::TEXTURE_SWIZZLE_B,
+                ] {
+                    gls::gl::TexParameteri(gls::gl::TEXTURE_2D, swizzle, gls::gl::RED as i32);
+                }
+            } else {
+                for (swizzle, src) in [
+                    (gls::gl::TEXTURE_SWIZZLE_R, gls::gl::RED),
+                    (gls::gl::TEXTURE_SWIZZLE_G, gls::gl::GREEN),
+                    (gls::gl::TEXTURE_SWIZZLE_B, gls::gl::BLUE),
+                ] {
+                    gls::gl::TexParameteri(gls::gl::TEXTURE_2D, swizzle, src as i32);
+                }
+            }
 
             self.camera_texture.update_texture(
                 texture_target,
@@ -668,7 +691,7 @@ impl GLConverter {
 
     fn draw_camera_texture_eglimage(
         &self,
-        texture: &Texture,
+        src: &TensorImage,
         egl_img: &EglImage,
         roi: RegionOfInterest,
         rotation_offset: usize,
@@ -677,7 +700,7 @@ impl GLConverter {
         let texture_target = gls::gl::TEXTURE_2D;
         unsafe {
             gls::gl::UseProgram(self.texture_program.id);
-            gls::gl::BindTexture(texture_target, texture.id);
+            gls::gl::BindTexture(texture_target, self.camera_texture.id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
             gls::gl::TexParameteri(
                 texture_target,
@@ -689,6 +712,25 @@ impl GLConverter {
                 gls::gl::TEXTURE_MAG_FILTER,
                 gls::gl::LINEAR as i32,
             );
+
+            if src.fourcc() == GREY {
+                for swizzle in [
+                    gls::gl::TEXTURE_SWIZZLE_R,
+                    gls::gl::TEXTURE_SWIZZLE_G,
+                    gls::gl::TEXTURE_SWIZZLE_B,
+                ] {
+                    gls::gl::TexParameteri(gls::gl::TEXTURE_2D, swizzle, gls::gl::RED as i32);
+                }
+            } else {
+                for (swizzle, src) in [
+                    (gls::gl::TEXTURE_SWIZZLE_R, gls::gl::RED),
+                    (gls::gl::TEXTURE_SWIZZLE_G, gls::gl::GREEN),
+                    (gls::gl::TEXTURE_SWIZZLE_B, gls::gl::BLUE),
+                ] {
+                    gls::gl::TexParameteri(gls::gl::TEXTURE_2D, swizzle, src as i32);
+                }
+            }
+
             gls::egl_image_target_texture_2d_oes(texture_target, egl_img.egl_image.as_ptr());
             check_gl_error().unwrap();
             gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
@@ -1075,14 +1117,6 @@ impl GlProgram {
         Ok(Self { id })
     }
 
-    fn load_uniform_4fv(&self, name: &CStr, value: &[[f32; 4]]) {
-        unsafe {
-            gls::gl::UseProgram(self.id);
-            let location = gls::gl::GetUniformLocation(self.id, name.as_ptr());
-            gls::gl::Uniform4fv(location, value.len() as i32, value.as_flattened().as_ptr());
-        }
-    }
-
     fn load_uniform_1f(&self, name: &CStr, value: f32) {
         unsafe {
             gls::gl::UseProgram(self.id);
@@ -1160,6 +1194,7 @@ fn fourcc_to_drm(fourcc: FourCharCode) -> DrmFourcc {
         RGBA => DrmFourcc::Abgr8888,
         YUYV => DrmFourcc::Yuyv,
         RGB => DrmFourcc::Bgr888,
+        GREY => DrmFourcc::R8,
         _ => todo!(),
     }
 }
