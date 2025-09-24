@@ -496,6 +496,7 @@ dependencies = [
  "ndarray 0.16.1",
  "yuv",
  "zune-jpeg",
+ "zune-png",
 ]
 
 [[package]]
@@ -2373,10 +2374,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f423a2c17029964870cfaabb1f13dfab7d092a62a29a89264f4d36990ca414a"
 
 [[package]]
+name = "zune-inflate"
+version = "0.2.54"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73ab332fe2f6680068f3582b16a24f90ad7096d5d39b974d1c0aff0125116f02"
+dependencies = [
+ "simd-adler32",
+]
+
+[[package]]
 name = "zune-jpeg"
 version = "0.4.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2c9e525af0a6a658e031e95f14b7f889976b74a11ba0eca5a5fc9ac8a1c43a6a"
 dependencies = [
  "zune-core",
+]
+
+[[package]]
+name = "zune-png"
+version = "0.4.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d29c085769c6f29effea890f093120ac019375fdc789d2a496ba8ba96c77509"
+dependencies = [
+ "zune-core",
+ "zune-inflate",
 ]

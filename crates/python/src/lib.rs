@@ -13,8 +13,12 @@ pub mod edgefirst_python {
 
         m.add_function(wrap_pyfunction!(version, m)?)?;
 
-        // m.add_class::<tensor::PyTensor>()?;
-        // m.add_class::<image::FourCC>()?;
+        m.add_class::<tensor::PyTensor>()?;
+        m.add_class::<image::FourCC>()?;
+        m.add_class::<image::PyRect>()?;
+        m.add_class::<image::PyRotation>()?;
+        m.add_class::<image::PyImageConverter>()?;
+        m.add_class::<image::PyTensorImage>()?;
         m.add_class::<decoder::PyDecoder>()?;
 
         Ok(())
