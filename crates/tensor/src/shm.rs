@@ -132,11 +132,9 @@ where
         };
 
         trace!("Mapping shared memory: {ptr:?}");
-
+        let shm_ptr = ShmPtr(NonNull::new(ptr.as_ptr()).ok_or(Error::InvalidSize(self.size()))?);
         Ok(TensorMap::Shm(ShmMap {
-            ptr: Arc::new(Mutex::new(
-                NonNull::new(ptr.as_ptr()).ok_or(Error::InvalidSize(self.size()))?,
-            )),
+            ptr: Arc::new(Mutex::new(shm_ptr)),
             shape: self.shape.clone(),
             _marker: std::marker::PhantomData,
         }))
@@ -156,7 +154,7 @@ pub struct ShmMap<T>
 where
     T: Num + Clone + fmt::Debug,
 {
-    ptr: Arc<Mutex<NonNull<c_void>>>,
+    ptr: Arc<Mutex<ShmPtr>>,
     shape: Vec<usize>,
     _marker: std::marker::PhantomData<T>,
 }
@@ -181,6 +179,17 @@ where
     }
 }
 
+struct ShmPtr(NonNull<c_void>);
+impl Deref for ShmPtr {
+    type Target = NonNull<c_void>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+unsafe impl Send for ShmPtr {}
+
 impl<T> TensorMapTrait<T> for ShmMap<T>
 where
     T: Num + Clone + fmt::Debug,
@@ -191,7 +200,7 @@ where
 
     fn unmap(&mut self) {
         let ptr = self.ptr.lock().expect("Failed to lock ShmMap pointer");
-        let err = unsafe { nix::sys::mman::munmap(*ptr, self.size()) };
+        let err = unsafe { nix::sys::mman::munmap(**ptr, self.size()) };
         if let Err(e) = err {
             warn!("Failed to unmap shared memory: {e}");
         }

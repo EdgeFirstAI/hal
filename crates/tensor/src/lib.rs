@@ -83,7 +83,7 @@ where
     fn as_mut_slice(&mut self) -> &mut [T];
 
     #[cfg(feature = "ndarray")]
-    fn view(&self) -> Result<ndarray::ArrayView<T, ndarray::Dim<ndarray::IxDynImpl>>> {
+    fn view(&'_ self) -> Result<ndarray::ArrayView<'_, T, ndarray::Dim<ndarray::IxDynImpl>>> {
         Ok(ndarray::ArrayView::from_shape(
             self.shape(),
             self.as_slice(),
@@ -91,7 +91,9 @@ where
     }
 
     #[cfg(feature = "ndarray")]
-    fn view_mut(&mut self) -> Result<ndarray::ArrayViewMut<T, ndarray::Dim<ndarray::IxDynImpl>>> {
+    fn view_mut(
+        &'_ mut self,
+    ) -> Result<ndarray::ArrayViewMut<'_, T, ndarray::Dim<ndarray::IxDynImpl>>> {
         let shape = self.shape().to_vec();
         Ok(ndarray::ArrayViewMut::from_shape(
             shape,

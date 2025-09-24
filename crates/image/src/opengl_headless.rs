@@ -43,12 +43,13 @@ impl Headless {
             height *= 3;
         }
 
-        // init a GBM device
-        let gbm = Device::new(Card::open_global()?)?;
-
         // Create an EGL API instance.
         let lib = unsafe { libloading::Library::new("libEGL.so.1") }?;
         let egl = unsafe { egl::DynamicInstance::<egl::EGL1_5>::load_required_from(lib)? };
+
+        // init a GBM device
+        let gbm = Device::new(Card::open_global()?)?;
+
         debug!("gbm: {gbm:?}");
         let display = unsafe {
             egl.get_platform_display(

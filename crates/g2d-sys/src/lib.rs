@@ -15,18 +15,14 @@ use std::{
         raw::{c_ulong, c_void},
     },
     ptr::null_mut,
+    rc::Rc,
 };
 
 pub const YUYV: FourCharCode = four_char_code!("YUYV");
 pub const RGBA: FourCharCode = four_char_code!("RGBA");
 pub const RGB: FourCharCode = four_char_code!("RGB ");
 
-const G2D_2_3_0: Version = Version {
-    major: 6,
-    minor: 4,
-    patch: 11,
-    num: 1049711,
-};
+const G2D_2_3_0: Version = Version::new(6, 4, 11, 1049711);
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -156,7 +152,7 @@ impl Display for Version {
 }
 
 impl Version {
-    fn new(major: i64, minor: i64, patch: i64, num: i64) -> Self {
+    const fn new(major: i64, minor: i64, patch: i64, num: i64) -> Self {
         Version {
             major,
             minor,
@@ -182,25 +178,25 @@ fn guess_version(g2d: &g2d) -> Option<Version> {
         let s: Vec<_> = s[9..].split(":").collect();
 
         let v: Vec<_> = s[0].split(".").collect();
-        if let Some(s) = v.first() {
-            if let Ok(major) = s.parse() {
-                version.major = major;
-            }
+        if let Some(s) = v.first()
+            && let Ok(major) = s.parse()
+        {
+            version.major = major;
         }
-        if let Some(s) = v.get(1) {
-            if let Ok(minor) = s.parse() {
-                version.minor = minor;
-            }
+        if let Some(s) = v.get(1)
+            && let Ok(minor) = s.parse()
+        {
+            version.minor = minor;
         }
-        if let Some(s) = v.get(2) {
-            if let Ok(patch) = s.parse() {
-                version.patch = patch;
-            }
+        if let Some(s) = v.get(2)
+            && let Ok(patch) = s.parse()
+        {
+            version.patch = patch;
         }
-        if let Some(s) = s.get(1) {
-            if let Ok(num) = s.parse() {
-                version.num = num;
-            }
+        if let Some(s) = s.get(1)
+            && let Ok(num) = s.parse()
+        {
+            version.num = num;
         }
         Some(version)
     }
@@ -317,7 +313,7 @@ impl From<&G2DSurface> for G2DSurfaceLegacy {
 }
 
 pub struct G2D {
-    pub lib: g2d,
+    pub lib: Rc<g2d>,
     pub handle: *mut c_void,
     pub version: Version,
 }
@@ -337,7 +333,7 @@ impl G2D {
         let version = guess_version(&lib).unwrap_or(G2D_2_3_0);
 
         Ok(Self {
-            lib,
+            lib: Rc::new(lib),
             version,
             handle,
         })

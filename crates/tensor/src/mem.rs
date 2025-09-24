@@ -88,11 +88,12 @@ where
     }
 
     fn map(&self) -> Result<TensorMap<T>> {
+        let mem_ptr = MemPtr(
+            NonNull::new(self.data.as_ptr() as *mut c_void)
+                .ok_or(Error::InvalidSize(self.size()))?,
+        );
         Ok(TensorMap::Mem(MemMap {
-            ptr: Arc::new(Mutex::new(
-                NonNull::new(self.data.as_ptr() as *mut c_void)
-                    .ok_or(Error::InvalidSize(self.size()))?,
-            )),
+            ptr: Arc::new(Mutex::new(mem_ptr)),
             shape: self.shape.clone(),
             _marker: std::marker::PhantomData,
         }))
@@ -103,7 +104,7 @@ pub struct MemMap<T>
 where
     T: Num + Clone + fmt::Debug,
 {
-    ptr: Arc<Mutex<NonNull<c_void>>>,
+    ptr: Arc<Mutex<MemPtr>>,
     shape: Vec<usize>,
     _marker: std::marker::PhantomData<T>,
 }
@@ -127,6 +128,17 @@ where
         self.as_mut_slice()
     }
 }
+
+struct MemPtr(NonNull<c_void>);
+impl Deref for MemPtr {
+    type Target = NonNull<c_void>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+unsafe impl Send for MemPtr {}
 
 impl<T> TensorMapTrait<T> for MemMap<T>
 where
