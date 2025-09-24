@@ -1,31 +1,60 @@
-use edgefirst::image::{self, ImageConverterTrait, Rect, Rotation};
-use four_char_code::FourCharCode;
-use pyo3::prelude::*;
-use std::{
-    fmt,
-    sync::{Arc, Mutex},
+use edgefirst::{
+    image::{self, ImageConverterTrait, Rect, Rotation},
+    tensor::{self, TensorMapTrait, TensorTrait},
 };
+use four_char_code::FourCharCode;
+use ndarray::{Array3, ArrayView3};
+use numpy::{
+    IntoPyArray, PyArray2, PyArray3, PyArrayLike3, PyReadwriteArray3, PyUntypedArray,
+    PyUntypedArrayMethods, ToPyArray,
+};
+use pyo3::prelude::*;
+use std::{fmt, sync::Mutex};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug)]
 pub enum Error {
-    ImageError(image::Error),
-    FormatError(String),
+    Image(image::Error),
+    Tensor(edgefirst::tensor::Error),
+    NdArrayShape(ndarray::ShapeError),
+    Io(std::io::Error),
+    Format(String),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::ImageError(e) => write!(f, "Tensor error: {e:?}"),
-            Error::FormatError(msg) => write!(f, "Format error: {msg}"),
+            Error::Image(e) => write!(f, "Image error: {e:?}"),
+            Error::Tensor(e) => write!(f, "Tensor error: {e:?}"),
+            Error::NdArrayShape(e) => write!(f, "Ndarray shape error: {e:?}"),
+            Error::Io(e) => write!(f, "Io error: {e:?}"),
+            Error::Format(msg) => write!(f, "Format error: {msg}"),
         }
     }
 }
 
 impl From<image::Error> for Error {
     fn from(err: image::Error) -> Self {
-        Error::ImageError(err)
+        Error::Image(err)
+    }
+}
+
+impl From<tensor::Error> for Error {
+    fn from(err: tensor::Error) -> Self {
+        Error::Tensor(err)
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        Error::Io(err)
+    }
+}
+
+impl From<ndarray::ShapeError> for Error {
+    fn from(err: ndarray::ShapeError) -> Self {
+        Error::NdArrayShape(err)
     }
 }
 
@@ -46,6 +75,14 @@ pub enum FourCC {
     GREY,
 }
 
+#[pymethods]
+impl FourCC {
+    #[new]
+    pub fn new(fourcc: &str) -> Result<Self> {
+        Self::try_from(fourcc)
+    }
+}
+
 impl TryFrom<&str> for FourCC {
     type Error = Error;
 
@@ -56,7 +93,7 @@ impl TryFrom<&str> for FourCC {
             "RGB" | "RGB " => Ok(FourCC::RGB),
             "NV12" => Ok(FourCC::RGB),
             "Y800" | "GREY" | "GRAY" => Ok(FourCC::GREY),
-            _ => Err(Error::FormatError(value.to_string())),
+            _ => Err(Error::Format(value.to_string())),
         }
     }
 }
@@ -81,7 +118,7 @@ impl TryFrom<FourCharCode> for FourCC {
     }
 }
 
-#[pyclass]
+#[pyclass(name = "TensorImage")]
 pub struct PyTensorImage(image::TensorImage);
 
 #[pymethods]
@@ -92,6 +129,59 @@ impl PyTensorImage {
         let fourcc: FourCharCode = fourcc.into();
         let tensor_image = image::TensorImage::new(width, height, fourcc, None)?;
         Ok(PyTensorImage(tensor_image))
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (data, fourcc = FourCC::RGB))]
+    pub fn load_from_bytes(data: &[u8], fourcc: FourCC) -> Result<Self> {
+        let fourcc: FourCharCode = fourcc.into();
+        let tensor_image = image::TensorImage::load(data, Some(fourcc), None)?;
+        Ok(PyTensorImage(tensor_image))
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (filename, fourcc = FourCC::RGB))]
+    pub fn load(filename: &str, fourcc: FourCC) -> Result<Self> {
+        let fourcc: FourCharCode = fourcc.into();
+        let data = std::fs::read(filename)?;
+        let tensor_image = image::TensorImage::load(&data, Some(fourcc), None)?;
+        Ok(PyTensorImage(tensor_image))
+    }
+
+    #[pyo3(signature = (filename, quality=80))]
+    pub fn save_jpeg(&self, filename: &str, quality: u8) -> Result<()> {
+        self.0.save_jpeg(filename, quality)?;
+        Ok(())
+    }
+
+    pub fn to_numpy<'py>(self_: PyRef<'py, Self>) -> Result<Bound<'py, PyArray3<u8>>> {
+        let map = self_.0.tensor().map()?;
+        let data = map.as_slice().to_vec();
+        let ndarray = Array3::from_shape_vec(
+            [self_.0.height(), self_.0.width(), self_.0.channels()],
+            data,
+        )?;
+        Ok(ndarray.into_pyarray(self_.py()))
+    }
+
+    pub fn copy_into_numpy(&self, mut dst: PyReadwriteArray3<u8>) -> Result<()> {
+        let mut dst = dst.as_array_mut();
+        let tensor = &self.0;
+        let shape = [tensor.height(), tensor.width(), tensor.channels()];
+        if dst.shape() != shape {
+            return Err(Error::Format(format!(
+                "Shape Mismatch: Expected {:?} but got {:?}",
+                shape,
+                dst.shape()
+            )));
+        }
+
+        let map = tensor.tensor().map()?;
+        let data = map.as_slice();
+        let ndarray = ArrayView3::from_shape(shape, data)?;
+
+        dst.assign(&ndarray);
+        Ok(())
     }
 
     #[getter]
@@ -115,7 +205,7 @@ impl PyTensorImage {
     }
 }
 
-#[pyclass]
+#[pyclass(name = "ImageConverter")]
 pub struct PyImageConverter(Mutex<image::ImageConverter>);
 
 unsafe impl Send for PyImageConverter {}
@@ -123,36 +213,45 @@ unsafe impl Sync for PyImageConverter {}
 
 #[pymethods]
 impl PyImageConverter {
-    #[pyo3(signature = (dst, src, rotation = PyRotation::None, crop = None))]
-    fn convert(
+    #[new]
+    pub fn new() -> Result<Self> {
+        let converter = image::ImageConverter::new()?;
+        Ok(PyImageConverter(Mutex::new(converter)))
+    }
+
+    #[pyo3(signature = (src, dst, rotation = PyRotation::Rotate0, crop = None))]
+    pub fn convert(
         &mut self,
-        dst: &mut PyTensorImage,
         src: &PyTensorImage,
+        dst: &mut PyTensorImage,
         rotation: PyRotation,
         crop: Option<PyRect>,
     ) -> Result<()> {
         if let Ok(mut l) = self.0.lock() {
-            l.convert(&mut dst.0, &src.0, rotation.into(), crop.map(|x| x.into()))?
+            l.convert(&src.0, &mut dst.0, rotation.into(), crop.map(|x| x.into()))?
         };
         Ok(())
     }
 }
 
-#[pyclass]
+#[pyclass(name = "Rotation")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PyRotation {
-    None = 0,
-    Rotate90Clockwise = 1,
+    Rotate0 = 0,
+    Clockwise90 = 1,
     Rotate180 = 2,
-    Rotate90CounterClockwise = 3,
+    CounterClockwise90 = 3,
 }
+
+#[pymethods]
 impl PyRotation {
-    pub fn from_degrees_clockwise(angle: usize) -> Rotation {
+    #[staticmethod]
+    pub fn degrees_clockwise(angle: usize) -> PyRotation {
         match angle.rem_euclid(90) {
-            0 => Rotation::None,
-            90 => Rotation::Rotate90Clockwise,
-            180 => Rotation::Rotate180,
-            270 => Rotation::Rotate90CounterClockwise,
+            0 => PyRotation::Rotate0,
+            90 => PyRotation::Clockwise90,
+            180 => PyRotation::Rotate180,
+            270 => PyRotation::CounterClockwise90,
             _ => panic!("rotation angle is not a multiple of 90"),
         }
     }
@@ -161,21 +260,38 @@ impl PyRotation {
 impl From<PyRotation> for Rotation {
     fn from(val: PyRotation) -> Self {
         match val {
-            PyRotation::None => Rotation::None,
-            PyRotation::Rotate90Clockwise => Rotation::Rotate90Clockwise,
+            PyRotation::Rotate0 => Rotation::None,
+            PyRotation::Clockwise90 => Rotation::Clockwise90,
             PyRotation::Rotate180 => Rotation::Rotate180,
-            PyRotation::Rotate90CounterClockwise => Rotation::Rotate90CounterClockwise,
+            PyRotation::CounterClockwise90 => Rotation::CounterClockwise90,
         }
     }
 }
 
-#[pyclass]
+#[pyclass(name = "Rect")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PyRect {
+    #[pyo3(get, set)]
     pub left: usize,
+    #[pyo3(get, set)]
     pub top: usize,
+    #[pyo3(get, set)]
     pub width: usize,
+    #[pyo3(get, set)]
     pub height: usize,
+}
+
+#[pymethods]
+impl PyRect {
+    #[new]
+    pub fn new(left: usize, top: usize, width: usize, height: usize) -> PyRect {
+        PyRect {
+            left,
+            top,
+            width,
+            height,
+        }
+    }
 }
 
 impl From<PyRect> for Rect {

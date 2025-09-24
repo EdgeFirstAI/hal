@@ -41,8 +41,8 @@ impl ImageConverterTrait for G2DConverter {
     /// A `Result` indicating success or failure of the conversion.
     fn convert(
         &mut self,
-        dst: &mut TensorImage,
         src: &TensorImage,
+        dst: &mut TensorImage,
         rotation: Rotation,
         crop: Option<Rect>,
     ) -> Result<()> {
@@ -51,9 +51,9 @@ impl ImageConverterTrait for G2DConverter {
 
         src_surface.rot = match rotation {
             Rotation::None => g2d_sys::g2d_rotation_G2D_ROTATION_0,
-            Rotation::Rotate90Clockwise => g2d_sys::g2d_rotation_G2D_ROTATION_270,
+            Rotation::Clockwise90 => g2d_sys::g2d_rotation_G2D_ROTATION_270,
             Rotation::Rotate180 => g2d_sys::g2d_rotation_G2D_ROTATION_180,
-            Rotation::Rotate90CounterClockwise => g2d_sys::g2d_rotation_G2D_ROTATION_90,
+            Rotation::CounterClockwise90 => g2d_sys::g2d_rotation_G2D_ROTATION_90,
         };
 
         if let Some(crop_rect) = crop {

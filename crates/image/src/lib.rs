@@ -20,6 +20,7 @@ pub use error::{Error, Result};
 pub use g2d::G2DConverter;
 #[cfg(target_os = "linux")]
 pub use opengl_headless::GLConverter;
+use zune_png::PngDecoder;
 mod cpu;
 mod error;
 mod g2d;
@@ -93,6 +94,23 @@ impl TensorImage {
         format: Option<FourCharCode>,
         memory: Option<TensorMemory>,
     ) -> Result<Self> {
+        if let Ok(i) = Self::load_jpeg(image, format, memory) {
+            return Ok(i);
+        }
+        if let Ok(i) = Self::load_png(image, format, memory) {
+            return Ok(i);
+        }
+
+        Err(Error::NotSupported(
+            "Could not decode as jpeg or png".to_string(),
+        ))
+    }
+
+    pub fn load_jpeg(
+        image: &[u8],
+        format: Option<FourCharCode>,
+        memory: Option<TensorMemory>,
+    ) -> Result<Self> {
         let format = format.unwrap_or(RGB);
         let colour = match format {
             RGB => ColorSpace::RGB,
@@ -106,7 +124,7 @@ impl TensorImage {
 
         let options = DecoderOptions::default().jpeg_set_out_colorspace(colour);
         let mut decoder = JpegDecoder::new_with_options(image, options);
-        decoder.decode_headers().unwrap();
+        decoder.decode_headers()?;
         let image_info = decoder.info().unwrap();
 
         let img = Self::new(
@@ -116,15 +134,44 @@ impl TensorImage {
             memory,
         )?;
 
-        {
-            let mut tensor_map: edgefirst_tensor::TensorMap<u8> = img.tensor.map()?;
-            decoder.decode_into(&mut tensor_map)?;
-        }
+        let mut tensor_map: edgefirst_tensor::TensorMap<u8> = img.tensor.map()?;
+        decoder.decode_into(&mut tensor_map)?;
 
         Ok(img)
     }
 
-    pub fn save(&self, path: &str, quality: u8) -> Result<()> {
+    pub fn load_png(
+        image: &[u8],
+        format: Option<FourCharCode>,
+        memory: Option<TensorMemory>,
+    ) -> Result<Self> {
+        let format = format.unwrap_or(RGB);
+        let alpha = match format {
+            RGB => false,
+            RGBA => true,
+            _ => {
+                return Err(Error::NotImplemented(
+                    "Unsupported image format".to_string(),
+                ));
+            }
+        };
+
+        let options = DecoderOptions::default()
+            .png_set_add_alpha_channel(alpha)
+            .png_set_decode_animated(false);
+        let mut decoder = PngDecoder::new_with_options(image, options);
+        decoder.decode_headers()?;
+        let image_info = decoder.get_info().unwrap();
+
+        let img = Self::new(image_info.width, image_info.height, format, memory)?;
+
+        let mut tensor_map: edgefirst_tensor::TensorMap<u8> = img.tensor.map()?;
+        decoder.decode_into(&mut tensor_map)?;
+
+        Ok(img)
+    }
+
+    pub fn save_jpeg(&self, path: &str, quality: u8) -> Result<()> {
         if self.is_planar {
             return Err(Error::NotImplemented(
                 "Saving planar images is not supported".to_string(),
@@ -198,17 +245,17 @@ impl TensorImage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rotation {
     None = 0,
-    Rotate90Clockwise = 1,
+    Clockwise90 = 1,
     Rotate180 = 2,
-    Rotate90CounterClockwise = 3,
+    CounterClockwise90 = 3,
 }
 impl Rotation {
     pub fn from_degrees_clockwise(angle: usize) -> Rotation {
         match angle.rem_euclid(90) {
             0 => Rotation::None,
-            90 => Rotation::Rotate90Clockwise,
+            90 => Rotation::Clockwise90,
             180 => Rotation::Rotate180,
-            270 => Rotation::Rotate90CounterClockwise,
+            270 => Rotation::CounterClockwise90,
             _ => panic!("rotation angle is not a multiple of 90"),
         }
     }
@@ -240,8 +287,8 @@ pub trait ImageConverterTrait {
     /// A `Result` indicating success or failure of the conversion.
     fn convert(
         &mut self,
-        dst: &mut TensorImage,
         src: &TensorImage,
+        dst: &mut TensorImage,
         rotation: Rotation,
         crop: Option<Rect>,
     ) -> Result<()>;
@@ -269,7 +316,6 @@ impl ImageConverter {
             Ok(gl_converter) => return Ok(Self::OpenGL(gl_converter)),
             Err(err) => log::debug!("Failed to initialize GL converter: {err:?}"),
         }
-
         let cpu_converter = CPUConverter::new()?;
         Ok(Self::CPU(cpu_converter))
     }
@@ -318,25 +364,71 @@ mod tests {
         assert!(path.exists(), "Test image not found at {path:?}");
 
         let file = std::fs::read(path).unwrap();
-        let img = TensorImage::load(&file, Some(RGBA), None).unwrap();
+        let img = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
         assert_eq!(img.width(), 1280);
         assert_eq!(img.height(), 720);
 
         let mut dst = TensorImage::new(640, 360, RGBA, None).unwrap();
         let mut converter = ImageConverter::new().unwrap();
         converter
-            .convert(&mut dst, &img, Rotation::None, None)
+            .convert(&img, &mut dst, Rotation::None, None)
             .unwrap();
         assert_eq!(dst.width(), 640);
         assert_eq!(dst.height(), 360);
 
-        dst.save("zidane_resized.jpg", 80).unwrap();
+        dst.save_jpeg("zidane_resized.jpg", 80).unwrap();
 
         let file = std::fs::read("zidane_resized.jpg").unwrap();
-        let img = TensorImage::load(&file, None, None).unwrap();
+        let img = TensorImage::load_jpeg(&file, None, None).unwrap();
         assert_eq!(img.width(), 640);
         assert_eq!(img.height(), 360);
         assert_eq!(img.fourcc(), RGB);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_new_image_converter() {
+        let dst_width = 640;
+        let dst_height = 360;
+        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
+
+        let mut converter_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
+        let mut converter = ImageConverter::new().unwrap();
+        converter
+            .convert(&src, &mut converter_dst, Rotation::None, None)
+            .unwrap();
+
+        let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
+        let mut cpu_converter = CPUConverter::new().unwrap();
+        cpu_converter
+            .convert(&src, &mut cpu_dst, Rotation::None, None)
+            .unwrap();
+
+        let converter_image = image::RgbaImage::from_vec(
+            dst_width as u32,
+            dst_height as u32,
+            converter_dst.tensor().map().unwrap().to_vec(),
+        )
+        .unwrap();
+        let cpu_image = image::RgbaImage::from_vec(
+            dst_width as u32,
+            dst_height as u32,
+            cpu_dst.tensor().map().unwrap().to_vec(),
+        )
+        .unwrap();
+
+        let similarity = image_compare::rgb_similarity_structure(
+            &image_compare::Algorithm::RootMeanSquared,
+            &converter_image.convert(),
+            &cpu_image.convert(),
+        )
+        .expect("Image Comparison failed");
+        assert!(
+            similarity.score > 0.98,
+            "G2D and CPU converted image have similarity score too low: {}",
+            similarity.score
+        );
     }
 
     #[test]
@@ -345,19 +437,19 @@ mod tests {
         let dst_width = 640;
         let dst_height = 360;
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
-        let src = TensorImage::load(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
+        let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
 
         let mut g2d_dst =
             TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
         let mut g2d_converter = G2DConverter::new().unwrap();
         g2d_converter
-            .convert(&mut g2d_dst, &src, Rotation::None, None)
+            .convert(&src, &mut g2d_dst, Rotation::None, None)
             .unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
         let mut cpu_converter = CPUConverter::new().unwrap();
         cpu_converter
-            .convert(&mut cpu_dst, &src, Rotation::None, None)
+            .convert(&src, &mut cpu_dst, Rotation::None, None)
             .unwrap();
 
         let g2d_image = image::RgbaImage::from_vec(
@@ -394,12 +486,12 @@ mod tests {
         let dst_width = 640;
         let dst_height = 360;
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
-        let src = TensorImage::load(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
+        let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
         let mut cpu_converter = CPUConverter::new().unwrap();
         cpu_converter
-            .convert(&mut cpu_dst, &src, Rotation::None, None)
+            .convert(&src, &mut cpu_dst, Rotation::None, None)
             .unwrap();
         let mut gl_dst =
             TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
@@ -407,7 +499,7 @@ mod tests {
 
         for _ in 0..5 {
             gl_converter
-                .convert(&mut gl_dst, &src, Rotation::None, None)
+                .convert(&src, &mut gl_dst, Rotation::None, None)
                 .unwrap();
             // assert!(
             //     matches!(gl_dst.tensor, edgefirst_tensor::Tensor::DmaOpenGl(_)),
@@ -467,14 +559,14 @@ mod tests {
         let dst_width = 640;
         let dst_height = 360;
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
-        let src = TensorImage::load(&file, Some(RGBA), None).unwrap();
+        let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
         let mut cpu_converter = CPUConverter::new().unwrap();
         cpu_converter
             .convert(
-                &mut cpu_dst,
                 &src,
+                &mut cpu_dst,
                 Rotation::None,
                 Some(Rect {
                     left: 320,
@@ -489,8 +581,8 @@ mod tests {
         let mut g2d_converter = G2DConverter::new().unwrap();
         g2d_converter
             .convert(
-                &mut g2d_dst,
                 &src,
+                &mut g2d_dst,
                 Rotation::None,
                 Some(Rect {
                     left: 320,
@@ -535,14 +627,14 @@ mod tests {
         let dst_width = 640;
         let dst_height = 360;
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
-        let src = TensorImage::load(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
+        let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
         let mut cpu_converter = CPUConverter::new().unwrap();
         cpu_converter
             .convert(
-                &mut cpu_dst,
                 &src,
+                &mut cpu_dst,
                 Rotation::None,
                 Some(Rect {
                     left: 320,
@@ -560,8 +652,8 @@ mod tests {
         for _ in 0..5 {
             gl_converter
                 .convert(
-                    &mut gl_dst,
                     &src,
+                    &mut gl_dst,
                     Rotation::None,
                     Some(Rect {
                         left: 320,
@@ -605,9 +697,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn test_cpu_rotate() {
         for rot in [
-            Rotation::Rotate90Clockwise,
+            Rotation::Clockwise90,
             Rotation::Rotate180,
-            Rotation::Rotate90CounterClockwise,
+            Rotation::CounterClockwise90,
         ] {
             test_cpu_rotate_(rot);
         }
@@ -620,14 +712,12 @@ mod tests {
         // right direction
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
 
-        let unchanged_src = TensorImage::load(&file, Some(RGBA), None).unwrap();
-        let mut src = TensorImage::load(&file, Some(RGBA), None).unwrap();
+        let unchanged_src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
+        let mut src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         let (dst_width, dst_height) = match rot {
             Rotation::None | Rotation::Rotate180 => (src.width(), src.height()),
-            Rotation::Rotate90Clockwise | Rotation::Rotate90CounterClockwise => {
-                (src.height(), src.width())
-            }
+            Rotation::Clockwise90 | Rotation::CounterClockwise90 => (src.height(), src.width()),
         };
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
@@ -636,19 +726,19 @@ mod tests {
         // After rotating 4 times, the image should be the same as the original
 
         cpu_converter
-            .convert(&mut cpu_dst, &src, rot, None)
+            .convert(&src, &mut cpu_dst, rot, None)
             .unwrap();
 
         cpu_converter
-            .convert(&mut src, &cpu_dst, rot, None)
+            .convert(&cpu_dst, &mut src, rot, None)
             .unwrap();
 
         cpu_converter
-            .convert(&mut cpu_dst, &src, rot, None)
+            .convert(&src, &mut cpu_dst, rot, None)
             .unwrap();
 
         cpu_converter
-            .convert(&mut src, &cpu_dst, rot, None)
+            .convert(&cpu_dst, &mut src, rot, None)
             .unwrap();
 
         let cpu_image = image::RgbaImage::from_vec(
@@ -684,9 +774,9 @@ mod tests {
     fn test_opengl_rotate() {
         let size = (1280, 720);
         for rot in [
-            Rotation::Rotate90Clockwise,
+            Rotation::Clockwise90,
             Rotation::Rotate180,
-            Rotation::Rotate90CounterClockwise,
+            Rotation::CounterClockwise90,
         ] {
             for mem in [
                 None,
@@ -707,24 +797,24 @@ mod tests {
     ) {
         let (dst_width, dst_height) = match rot {
             Rotation::None | Rotation::Rotate180 => size,
-            Rotation::Rotate90Clockwise | Rotation::Rotate90CounterClockwise => (size.1, size.0),
+            Rotation::Clockwise90 | Rotation::CounterClockwise90 => (size.1, size.0),
         };
 
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
-        let src = TensorImage::load(&file, Some(RGBA), tensor_memory).unwrap();
+        let src = TensorImage::load_jpeg(&file, Some(RGBA), tensor_memory).unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
         let mut cpu_converter = CPUConverter::new().unwrap();
 
         cpu_converter
-            .convert(&mut cpu_dst, &src, rot, None)
+            .convert(&src, &mut cpu_dst, rot, None)
             .unwrap();
 
         let mut gl_dst = TensorImage::new(dst_width, dst_height, RGBA, tensor_memory).unwrap();
         let mut gl_converter = GLConverter::new_with_size(dst_width, dst_height, false).unwrap();
 
         for _ in 0..5 {
-            gl_converter.convert(&mut gl_dst, &src, rot, None).unwrap();
+            gl_converter.convert(&src, &mut gl_dst, rot, None).unwrap();
             // assert!(
             //     matches!(gl_dst.tensor, edgefirst_tensor::Tensor::DmaOpenGl(_)),
             //     "GL converted destination is not OpenGL DMA tensor",
@@ -764,9 +854,9 @@ mod tests {
     fn test_g2d_rotate() {
         let size = (1280, 720);
         for rot in [
-            Rotation::Rotate90Clockwise,
+            Rotation::Clockwise90,
             Rotation::Rotate180,
-            Rotation::Rotate90CounterClockwise,
+            Rotation::CounterClockwise90,
         ] {
             test_g2d_rotate_(size, rot);
         }
@@ -776,17 +866,17 @@ mod tests {
     fn test_g2d_rotate_(size: (usize, usize), rot: Rotation) {
         let (dst_width, dst_height) = match rot {
             Rotation::None | Rotation::Rotate180 => size,
-            Rotation::Rotate90Clockwise | Rotation::Rotate90CounterClockwise => (size.1, size.0),
+            Rotation::Clockwise90 | Rotation::CounterClockwise90 => (size.1, size.0),
         };
 
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
-        let src = TensorImage::load(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
+        let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
         let mut cpu_converter = CPUConverter::new().unwrap();
 
         cpu_converter
-            .convert(&mut cpu_dst, &src, rot, None)
+            .convert(&src, &mut cpu_dst, rot, None)
             .unwrap();
 
         let mut g2d_dst =
@@ -795,7 +885,7 @@ mod tests {
 
         for _ in 0..5 {
             g2d_converter
-                .convert(&mut g2d_dst, &src, rot, None)
+                .convert(&src, &mut g2d_dst, rot, None)
                 .unwrap();
 
             let g2d_image = image::RgbaImage::from_vec(
@@ -840,7 +930,7 @@ mod tests {
         let mut cpu_converter = CPUConverter::new().unwrap();
 
         cpu_converter
-            .convert(&mut dst, &src, Rotation::None, None)
+            .convert(&src, &mut dst, Rotation::None, None)
             .unwrap();
 
         let cpu_image =
@@ -880,7 +970,7 @@ mod tests {
         let mut cpu_converter = CPUConverter::new().unwrap();
 
         cpu_converter
-            .convert(&mut dst, &src, Rotation::None, None)
+            .convert(&src, &mut dst, Rotation::None, None)
             .unwrap();
 
         let cpu_image =
@@ -922,7 +1012,7 @@ mod tests {
         let mut g2d_converter = G2DConverter::new().unwrap();
 
         g2d_converter
-            .convert(&mut dst, &src, Rotation::None, None)
+            .convert(&src, &mut dst, Rotation::None, None)
             .unwrap();
 
         let g2d_image =
@@ -964,7 +1054,7 @@ mod tests {
         let mut gl_converter = GLConverter::new().unwrap();
 
         gl_converter
-            .convert(&mut dst, &src, Rotation::None, None)
+            .convert(&src, &mut dst, Rotation::None, None)
             .unwrap();
 
         let gl_image =
@@ -1007,7 +1097,7 @@ mod tests {
         let mut cpu_converter = CPUConverter::new().unwrap();
 
         cpu_converter
-            .convert(&mut dst, &src, Rotation::None, None)
+            .convert(&src, &mut dst, Rotation::None, None)
             .unwrap();
 
         let cpu_image = image::RgbaImage::from_vec(
@@ -1026,7 +1116,7 @@ mod tests {
         )
         .unwrap();
         cpu_converter
-            .convert(&mut dst_target, &src_target, Rotation::None, None)
+            .convert(&src_target, &mut dst_target, Rotation::None, None)
             .unwrap();
         let target_image = image::RgbaImage::from_vec(
             dst_width as u32,
