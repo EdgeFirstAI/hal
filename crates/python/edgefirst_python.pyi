@@ -1,6 +1,7 @@
 import numpy as np
 import numpy.typing as npt
 from typing import Union, Tuple
+import enum
 
 
 DetectionOutput = Tuple[npt.NDArray[np.float32],
@@ -96,4 +97,99 @@ class Decoder:
     # [pyo3(signature = (segmentation))]
     @staticmethod
     def segmentation_to_mask(segmentation: npt.NDArray[np.uint8]) -> None:
+        ...
+
+
+class FourCC(enum.Enum):
+    YUYV: FourCC
+    RGBA: FourCC
+    RGB: FourCC
+    NV12: FourCC
+    GREY: FourCC
+
+    def __init__(fourcc: str):
+        ...
+
+
+class TensorImage:
+
+    def __init__(width: int, height: int, fourcc: FourCC) -> TensorImage:
+        ...
+
+    # [pyo3(signature = (data, fourcc = FourCC::RGB))]
+    @staticmethod
+    def load_from_bytes(data: bytes, fourcc: FourCC = FourCC.RGB) -> TensorImage:
+        ...
+
+    # [pyo3(signature = (filename, fourcc = FourCC::RGB))]
+    @staticmethod
+    def load(filename: str, fourcc: FourCC = FourCC.RGB) -> TensorImage:
+        ...
+
+    # [pyo3(signature = (filename, quality=80))]
+    def save_jpeg(self, filename:  str, quality: int):
+        ...
+
+    def to_numpy(self) -> npt.NDArray[np.uint8]:
+        ...
+
+    def copy_into_numpy(self, dst: npt.NDArray[np.uint8]):
+        ...
+
+    @property
+    def format(self) -> FourCC:
+        ...
+
+    @property
+    def width(self) -> int:
+        ...
+
+    @property
+    def height(self) -> int:
+        ...
+
+    @property
+    def is_planar(self) -> bool:
+        ...
+
+
+class Rotation(enum.Enum):
+    Rotate0: Rotation
+    Clockwise90: Rotation
+    Rotate180: Rotation
+    CounterClockwise90: Rotation
+
+    @staticmethod
+    def degrees_clockwise(angle: int) -> Rotation:
+        ...
+
+
+class Rect:
+
+    def __init__(left: int, top: int, width: int, height: int) -> Rect:
+        ...
+
+    @property
+    def left(self) -> int:
+        ...
+
+    @property
+    def top(self) -> int:
+        ...
+
+    @property
+    def width(self) -> int:
+        ...
+
+    @property
+    def height(self) -> int:
+        ...
+
+
+class ImageConverter:
+    def __init__() -> ImageConverter:
+        ...
+
+    # [pyo3(signature = (src, dst, rotation = Rotation::Rotate0, crop = None))]
+    def convert(src: TensorImage, dst: TensorImage, rotation: Rotation = Rotation.Rotate0, crop: Rect | None = None):
         ...

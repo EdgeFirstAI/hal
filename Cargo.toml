@@ -29,6 +29,7 @@ nix = { version = "0.30.1", features = ["fs", "ioctl", "mman"] }
 num-traits = "0.2.19"
 random-string = "1.1.0"
 zune-jpeg = "0.4.19"
+zune-png = "0.4.10"
 
 [profile.release]
 opt-level = 3

@@ -46,7 +46,7 @@ impl CPUConverter {
             Rotation::None => {
                 dst_map.copy_from_slice(src_map);
             }
-            Rotation::Rotate90Clockwise => {
+            Rotation::Clockwise90 => {
                 let mut src_view =
                     ArrayView3::from_shape((dst.width(), dst.height(), dst.channels()), src_map)
                         .expect("rotate src shape incorrect");
@@ -74,7 +74,7 @@ impl CPUConverter {
                     .zip(dst_view.iter_mut())
                     .for_each(|(s, d)| *d = *s);
             }
-            Rotation::Rotate90CounterClockwise => {
+            Rotation::CounterClockwise90 => {
                 let mut src_view =
                     ArrayView3::from_shape((dst.width(), dst.height(), dst.channels()), src_map)
                         .expect("rotate src shape incorrect");
@@ -397,7 +397,7 @@ impl CPUConverter {
                     )?;
                     self.resizer.resize(&src_view, &mut dst_view, &options)?;
                 }
-                Rotation::Rotate90Clockwise | Rotation::Rotate90CounterClockwise => {
+                Rotation::Clockwise90 | Rotation::CounterClockwise90 => {
                     let mut tmp = vec![0; dst.row_stride() * dst.height()];
                     let mut tmp_view = fast_image_resize::images::Image::from_slice_u8(
                         dst.height() as u32,
@@ -430,8 +430,9 @@ impl CPUConverter {
 impl ImageConverterTrait for CPUConverter {
     fn convert(
         &mut self,
-        dst: &mut TensorImage,
+
         src: &TensorImage,
+        dst: &mut TensorImage,
         rotation: Rotation,
         crop: Option<Rect>,
     ) -> Result<()> {

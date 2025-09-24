@@ -106,7 +106,7 @@ impl Headless {
             )
         } {
             Ok(v) => v,
-            Err(e) => return Err(crate::Error::EGLError(e)),
+            Err(e) => return Err(crate::Error::EGL(e)),
         };
         debug!("surface: {surface:?}");
         egl.make_current(display, Some(surface), Some(surface), Some(ctx))?;
@@ -236,8 +236,8 @@ pub struct GLConverter {
 impl ImageConverterTrait for GLConverter {
     fn convert(
         &mut self,
-        dst: &mut TensorImage,
         src: &TensorImage,
+        dst: &mut TensorImage,
         rotation: crate::Rotation,
         crop: Option<crate::Rect>,
     ) -> crate::Result<()> {
@@ -444,9 +444,9 @@ impl GLConverter {
 
         let rotation_offset = match rotation {
             crate::Rotation::None => 0,
-            crate::Rotation::Rotate90Clockwise => 1,
+            crate::Rotation::Clockwise90 => 1,
             crate::Rotation::Rotate180 => 2,
-            crate::Rotation::Rotate90CounterClockwise => 3,
+            crate::Rotation::CounterClockwise90 => 3,
         };
         check_gl_error().unwrap();
         let result = if let Ok(new_egl_image) = self.create_image_from_dma2(src) {
@@ -858,7 +858,7 @@ impl GLConverter {
             &egl_img_attr,
         ) {
             Ok(v) => Ok(v),
-            Err(e) => Err(crate::Error::EGLError(e)),
+            Err(e) => Err(crate::Error::EGL(e)),
         }
     }
 
@@ -1083,7 +1083,7 @@ impl GlProgram {
         unsafe {
             let vertex_id = gls::gl::CreateShader(gls::gl::VERTEX_SHADER);
             if compile_shader_from_str(vertex_id, vertex_shader, "shader_vert").is_err() {
-                return Err(crate::Error::GlError(format!(
+                return Err(crate::Error::OpenGl(format!(
                     "Shader compile error: {vertex_shader}"
                 )));
             }
@@ -1091,7 +1091,7 @@ impl GlProgram {
 
             let fragment_id = gls::gl::CreateShader(gls::gl::FRAGMENT_SHADER);
             if compile_shader_from_str(fragment_id, fragment_shader, "shader_frag").is_err() {
-                return Err(crate::Error::GlError(format!(
+                return Err(crate::Error::OpenGl(format!(
                     "Shader compile error: {fragment_shader}"
                 )));
             }
@@ -1184,7 +1184,7 @@ fn check_gl_error() -> Result<(), Error> {
         let err = gls::gl::GetError();
         if err != gls::gl::NO_ERROR {
             error!("GL Error: {err}");
-            return Err(Error::GlError(format!("{err}")));
+            return Err(Error::OpenGl(format!("{err}")));
         }
     }
     Ok(())

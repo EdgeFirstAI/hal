@@ -69,7 +69,8 @@ where
 
     bencher.bench_local(|| {
         let file = std::fs::read(&path).unwrap();
-        TensorImage::load(&file, Some(RGBA), Some(TensorMemory::Mem)).expect("Failed to load image")
+        TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Mem))
+            .expect("Failed to load image")
     });
 }
 
@@ -96,7 +97,8 @@ where
 
     bencher.bench_local(|| {
         let file = std::fs::read(&path).unwrap();
-        TensorImage::load(&file, Some(RGBA), Some(TensorMemory::Shm)).expect("Failed to load image")
+        TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Shm))
+            .expect("Failed to load image")
     });
 }
 
@@ -124,7 +126,8 @@ where
 
     bencher.bench_local(|| {
         let file = std::fs::read(&path).unwrap();
-        TensorImage::load(&file, Some(RGBA), Some(TensorMemory::Dma)).expect("Failed to load image")
+        TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma))
+            .expect("Failed to load image")
     });
 }
 
@@ -153,14 +156,14 @@ where
     assert!(path.exists(), "unable to locate test image at {path:?}");
 
     let file = std::fs::read(path).unwrap();
-    let src = TensorImage::load(&file, Some(RGBA), None).unwrap();
+    let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
     let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
 
     let mut converter = CPUConverter::new().unwrap();
 
     bencher.bench_local(|| {
         converter
-            .convert(&mut dst, &src, Rotation::None, None)
+            .convert(&src, &mut dst, Rotation::None, None)
             .unwrap()
     });
 }
@@ -191,14 +194,14 @@ where
     assert!(path.exists(), "unable to locate test image at {path:?}");
 
     let file = std::fs::read(path).unwrap();
-    let src = TensorImage::load(&file, Some(RGBA), None).unwrap();
+    let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
     let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
 
     let mut converter = G2DConverter::new().unwrap();
 
     bencher.bench_local(|| {
         converter
-            .convert(&mut dst, &src, Rotation::None, None)
+            .convert(&src, &mut dst, Rotation::None, None)
             .unwrap()
     });
 }
@@ -228,14 +231,14 @@ where
 
     let file = std::fs::read(path).unwrap();
 
-    let src = TensorImage::load(&file, Some(RGBA), Some(TensorMemory::Mem)).unwrap();
+    let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Mem)).unwrap();
     let mut gl_dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
     let mut gl_converter =
         edgefirst_image::GLConverter::new_with_size(width, height, false).unwrap();
 
     bencher.bench_local(|| {
         gl_converter
-            .convert(&mut gl_dst, &src, Rotation::None, None)
+            .convert(&src, &mut gl_dst, Rotation::None, None)
             .unwrap()
     });
     drop(gl_dst);
@@ -266,14 +269,14 @@ where
 
     let file = std::fs::read(path).unwrap();
 
-    let src = TensorImage::load(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
+    let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
     let mut gl_dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
     let mut gl_converter =
         edgefirst_image::GLConverter::new_with_size(width, height, false).unwrap();
 
     bencher.bench_local(|| {
         gl_converter
-            .convert(&mut gl_dst, &src, Rotation::None, None)
+            .convert(&src, &mut gl_dst, Rotation::None, None)
             .unwrap()
     });
     drop(gl_dst);
@@ -285,18 +288,18 @@ fn rotate_cpu<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) 
     let rot = R::value();
 
     match rot {
-        Rotation::Rotate90Clockwise | Rotation::Rotate90CounterClockwise => {
+        Rotation::Clockwise90 | Rotation::CounterClockwise90 => {
             (width, height) = (height, width)
         }
         _ => {}
     }
     let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
-    let src = TensorImage::load(&file, Some(RGBA), None).unwrap();
+    let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
     let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
 
     let mut converter = CPUConverter::new().unwrap();
 
-    bencher.bench_local(|| converter.convert(&mut dst, &src, rot, None).unwrap());
+    bencher.bench_local(|| converter.convert(&src, &mut dst, rot, None).unwrap());
 }
 
 #[divan::bench(types = [Rotate90, Rotate180, Rotate270], args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
@@ -305,19 +308,19 @@ fn rotate_opengl<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize
     let rot = R::value();
 
     match rot {
-        Rotation::Rotate90Clockwise | Rotation::Rotate90CounterClockwise => {
+        Rotation::Clockwise90 | Rotation::CounterClockwise90 => {
             (width, height) = (height, width)
         }
         _ => {}
     }
     let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
 
-    let src = TensorImage::load(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
+    let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
     let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
 
     let mut converter = GLConverter::new_with_size(width, height, false).unwrap();
 
-    bencher.bench_local(|| converter.convert(&mut dst, &src, rot, None).unwrap());
+    bencher.bench_local(|| converter.convert(&src, &mut dst, rot, None).unwrap());
     drop(dst);
 }
 
@@ -327,19 +330,19 @@ fn rotate_g2d<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) 
     let rot = R::value();
 
     match rot {
-        Rotation::Rotate90Clockwise | Rotation::Rotate90CounterClockwise => {
+        Rotation::Clockwise90 | Rotation::CounterClockwise90 => {
             (width, height) = (height, width)
         }
         _ => {}
     }
     let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
 
-    let src = TensorImage::load(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
+    let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
     let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
 
     let mut converter = G2DConverter::new().unwrap();
 
-    bencher.bench_local(|| converter.convert(&mut dst, &src, rot, None).unwrap());
+    bencher.bench_local(|| converter.convert(&src, &mut dst, rot, None).unwrap());
 }
 
 #[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
@@ -359,7 +362,7 @@ fn convert_cpu(bencher: divan::Bencher, params: (usize, usize)) {
 
     bencher.bench_local(|| {
         converter
-            .convert(&mut dst, &src, Rotation::None, None)
+            .convert(&src, &mut dst, Rotation::None, None)
             .unwrap()
     });
 }
@@ -383,14 +386,14 @@ where
 
     let file = std::fs::read(path).unwrap();
 
-    let src = TensorImage::load(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
+    let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
     let mut dst = TensorImage::new(src.width(), src.height(), RGB, None).unwrap();
 
     let mut converter = CPUConverter::new().unwrap();
 
     bencher.bench_local(|| {
         converter
-            .convert(&mut dst, &src, Rotation::None, None)
+            .convert(&src, &mut dst, Rotation::None, None)
             .unwrap()
     });
 }
@@ -412,7 +415,7 @@ fn convert_g2d(bencher: divan::Bencher, params: (usize, usize)) {
 
     bencher.bench_local(|| {
         converter
-            .convert(&mut dst, &src, Rotation::None, None)
+            .convert(&src, &mut dst, Rotation::None, None)
             .unwrap()
     });
 }
@@ -434,7 +437,7 @@ fn convert_opengl(bencher: divan::Bencher, params: (usize, usize)) {
 
     bencher.bench_local(|| {
         converter
-            .convert(&mut dst, &src, Rotation::None, None)
+            .convert(&src, &mut dst, Rotation::None, None)
             .unwrap()
     });
     drop(dst);
