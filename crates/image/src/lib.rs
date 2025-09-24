@@ -25,10 +25,17 @@ mod error;
 mod g2d;
 mod opengl_headless;
 
+/// 8 bit interleaved YUV422, limited range
 pub const YUYV: FourCharCode = four_char_code!("YUYV");
+/// 8 bit planar YUV420, limited range
 pub const NV12: FourCharCode = four_char_code!("NV12");
+/// 8 bit RGBA
 pub const RGBA: FourCharCode = four_char_code!("RGBA");
+/// 8 bit RGB
 pub const RGB: FourCharCode = four_char_code!("RGB ");
+/// 8 bit grayscale, full range
+pub const GREY: FourCharCode = four_char_code!("Y800");
+// TODO: planar RGB is 4BPS? https://fourcc.org/8bps/
 
 pub struct TensorImage {
     tensor: Tensor<u8>,
@@ -273,6 +280,7 @@ fn fourcc_channels(fourcc: FourCharCode) -> Result<usize> {
         RGBA => Ok(4), // RGBA has 4 channels (R, G, B, A)
         RGB => Ok(3),  // RGB has 3 channels (R, G, B)
         YUYV => Ok(2), // YUYV has 2 channels (Y and UV)
+        GREY => Ok(1), // Y800 has 1 channel (Y)
         _ => Err(Error::InvalidShape(format!(
             "Unsupported fourcc: {}",
             fourcc.to_string()
