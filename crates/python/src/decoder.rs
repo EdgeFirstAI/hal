@@ -7,7 +7,7 @@ use edgefirst::decoder::{
 use ndarray::{Array1, Array2};
 use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayLike2, PyArrayLike3, PyArrayLikeDyn,
-    PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArrayDyn, PyReadwriteArrayDyn, ToPyArray,
+    PyReadonlyArray3, PyReadwriteArrayDyn, ToPyArray,
 };
 use pyo3::{Bound, FromPyObject, PyRef, PyResult, Python, pyclass, pymethods};
 

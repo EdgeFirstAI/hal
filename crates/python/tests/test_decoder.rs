@@ -15,7 +15,7 @@ fn test_yolo_det() -> PyResult<()> {
     Python::with_gil(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
         py.run(
-            c_str!(include_str!("decoder_yolo_det.py")),
+            c_str!(include_str!("decoder/yolo_det.py")),
             None,
             Some(&out),
         )?;
@@ -74,7 +74,7 @@ fn test_decoder_parse_config_modelpack_split_u8() -> PyResult<()> {
     Python::with_gil(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
         py.run(
-            c_str!(include_str!("decoder_modelpack_config.py")),
+            c_str!(include_str!("decoder/modelpack_config.py")),
             None,
             Some(&out),
         )?;
@@ -135,7 +135,7 @@ fn test_modelpack_split_u8() -> PyResult<()> {
     Python::with_gil(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
         py.run(
-            c_str!(include_str!("decoder_modelpack_split.py")),
+            c_str!(include_str!("decoder/modelpack_split.py")),
             None,
             Some(&out),
         )?;
@@ -192,7 +192,7 @@ fn test_dequantize() -> PyResult<()> {
     Python::with_gil(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
         py.run(
-            c_str!(include_str!("decoder_dequantize.py")),
+            c_str!(include_str!("decoder/dequantize.py")),
             None,
             Some(&out),
         )?;

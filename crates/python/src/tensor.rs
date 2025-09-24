@@ -14,27 +14,27 @@ use std::{fmt, os::raw::c_char};
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug)]
-enum Error {
-    TensorError(tensor::Error),
+pub enum Error {
+    Tensor(tensor::Error),
     UnsupportedMemoryType(String),
     UnsupportedDataType(String),
-    TensorMapError(String),
+    TensorMap(String),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::TensorError(e) => write!(f, "Tensor error: {e:?}"),
+            Error::Tensor(e) => write!(f, "Tensor error: {e:?}"),
             Error::UnsupportedMemoryType(msg) => write!(f, "Invalid memory type: {msg}"),
             Error::UnsupportedDataType(msg) => write!(f, "Invalid data type: {msg}"),
-            Error::TensorMapError(msg) => write!(f, "Tensor map error: {msg}"),
+            Error::TensorMap(msg) => write!(f, "Tensor map error: {msg}"),
         }
     }
 }
 
 impl From<tensor::Error> for Error {
     fn from(err: tensor::Error) -> Self {
-        Error::TensorError(err)
+        Error::Tensor(err)
     }
 }
 
