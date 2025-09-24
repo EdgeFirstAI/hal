@@ -153,14 +153,11 @@ pub struct DmaMap<T>
 where
     T: Num + Clone + fmt::Debug,
 {
-    ptr: Arc<Mutex<NonNull<c_void>>>,
+    ptr: Arc<Mutex<DmaPtr>>,
     fd: OwnedFd,
     shape: Vec<usize>,
     _marker: std::marker::PhantomData<T>,
 }
-
-// unsafe impl<T> Send for DmaMap<T> where T: Num + Clone + std::fmt::Debug {}
-// unsafe impl<T> Sync for DmaMap<T> where T: Num + Clone + std::fmt::Debug {}
 
 impl<T> DmaMap<T>
 where
@@ -191,11 +188,9 @@ where
         };
 
         trace!("Mapping DMA memory: {ptr:?}");
-
+        let dma_ptr = DmaPtr(NonNull::new(ptr.as_ptr()).ok_or(Error::InvalidSize(size))?);
         Ok(DmaMap {
-            ptr: Arc::new(Mutex::new(
-                NonNull::new(ptr.as_ptr()).ok_or(Error::InvalidSize(size))?,
-            )),
+            ptr: Arc::new(Mutex::new(dma_ptr)),
             fd,
             shape: shape.to_vec(),
             _marker: std::marker::PhantomData,
@@ -223,6 +218,17 @@ where
     }
 }
 
+struct DmaPtr(NonNull<c_void>);
+impl Deref for DmaPtr {
+    type Target = NonNull<c_void>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+unsafe impl Send for DmaPtr {}
+
 impl<T> TensorMapTrait<T> for DmaMap<T>
 where
     T: Num + Clone + fmt::Debug,
@@ -234,7 +240,7 @@ where
     fn unmap(&mut self) {
         let ptr = self.ptr.lock().expect("Failed to lock DmaMap pointer");
 
-        if let Err(e) = unsafe { nix::sys::mman::munmap(*ptr, self.size()) } {
+        if let Err(e) = unsafe { nix::sys::mman::munmap(**ptr, self.size()) } {
             warn!("Failed to unmap DMA memory: {e}");
         }
 
