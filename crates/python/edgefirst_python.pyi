@@ -16,7 +16,7 @@ class Decoder:
     def new_from_json_str(
         json_str: str,
         score_threshold: float = 0.1,
-        iou_threshold=0.7
+        iou_threshold: float = 0.7
     ) -> Decoder:
         ...
 

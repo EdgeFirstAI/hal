@@ -4,10 +4,7 @@ use edgefirst::{
 };
 use four_char_code::FourCharCode;
 use ndarray::{Array3, ArrayView3};
-use numpy::{
-    IntoPyArray, PyArray2, PyArray3, PyArrayLike3, PyReadwriteArray3, PyUntypedArray,
-    PyUntypedArrayMethods, ToPyArray,
-};
+use numpy::{IntoPyArray, PyArray3, PyReadwriteArray3};
 use pyo3::prelude::*;
 use std::{fmt, sync::Mutex};
 

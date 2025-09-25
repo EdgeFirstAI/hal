@@ -1,11 +1,11 @@
 use pyo3::prelude::*;
 
-mod decoder;
-mod image;
-mod tensor;
+pub mod decoder;
+pub mod image;
+pub mod tensor;
 #[pymodule]
 pub mod edgefirst_python {
-    use super::*;
+    pub use super::*;
 
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
