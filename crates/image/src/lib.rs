@@ -294,30 +294,62 @@ pub trait ImageConverterTrait {
     ) -> Result<()>;
 }
 
-#[enum_dispatch]
-pub enum ImageConverter {
-    CPU(CPUConverter),
+pub struct ImageConverter {
+    pub cpu: CPUConverter,
+
     #[cfg(target_os = "linux")]
-    G2D(G2DConverter),
+    pub g2d: Option<G2DConverter>,
     #[cfg(target_os = "linux")]
-    OpenGL(GLConverter),
+    pub opengl: Option<GLConverter>,
 }
 
 impl ImageConverter {
     pub fn new() -> Result<Self> {
         #[cfg(target_os = "linux")]
-        match G2DConverter::new() {
-            Ok(g2d_converter) => return Ok(Self::G2D(g2d_converter)),
-            Err(err) => log::debug!("Failed to initialize G2D converter: {err:?}"),
+        let g2d = match G2DConverter::new() {
+            Ok(g2d_converter) => Some(g2d_converter),
+            Err(err) => {
+                log::debug!("Failed to initialize G2D converter: {err:?}");
+                None
+            }
+        };
+
+        #[cfg(target_os = "linux")]
+        let opengl = match GLConverter::new() {
+            Ok(gl_converter) => Some(gl_converter),
+            Err(err) => {
+                log::debug!("Failed to initialize GL converter: {err:?}");
+                None
+            }
+        };
+        let cpu = CPUConverter::new()?;
+        Ok(Self { cpu, g2d, opengl })
+    }
+}
+
+impl ImageConverterTrait for ImageConverter {
+    fn convert(
+        &mut self,
+        src: &TensorImage,
+        dst: &mut TensorImage,
+        rotation: Rotation,
+        crop: Option<Rect>,
+    ) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(g2d) = self.g2d.as_mut()
+            && g2d.convert(src, dst, rotation, crop).is_ok()
+        {
+            return Ok(());
         }
 
         #[cfg(target_os = "linux")]
-        match GLConverter::new() {
-            Ok(gl_converter) => return Ok(Self::OpenGL(gl_converter)),
-            Err(err) => log::debug!("Failed to initialize GL converter: {err:?}"),
+        if let Some(opengl) = self.opengl.as_mut()
+            && opengl.convert(src, dst, rotation, crop).is_ok()
+        {
+            return Ok(());
         }
-        let cpu_converter = CPUConverter::new()?;
-        Ok(Self::CPU(cpu_converter))
+
+        self.cpu.convert(src, dst, rotation, crop)
     }
 }
 
