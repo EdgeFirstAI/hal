@@ -136,6 +136,9 @@ class TensorImage:
     def copy_into_numpy(self, dst: npt.NDArray[np.uint8]):
         ...
 
+    def copy_from_numpy(self, src: npt.NDArray[np.uint8]):
+        ...
+
     @property
     def format(self) -> FourCC:
         ...

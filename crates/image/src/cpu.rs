@@ -55,10 +55,7 @@ impl CPUConverter {
                         .expect("rotate dst shape incorrect");
                 src_view.swap_axes(0, 1);
                 src_view.invert_axis(Axis(1));
-                src_view
-                    .iter()
-                    .zip(dst_view.iter_mut())
-                    .for_each(|(s, d)| *d = *s);
+                dst_view.assign(&src_view);
             }
             Rotation::Rotate180 => {
                 let mut src_view =
@@ -69,10 +66,7 @@ impl CPUConverter {
                         .expect("rotate dst shape incorrect");
                 src_view.invert_axis(Axis(0));
                 src_view.invert_axis(Axis(1));
-                src_view
-                    .iter()
-                    .zip(dst_view.iter_mut())
-                    .for_each(|(s, d)| *d = *s);
+                dst_view.assign(&src_view);
             }
             Rotation::CounterClockwise90 => {
                 let mut src_view =
@@ -83,10 +77,7 @@ impl CPUConverter {
                         .expect("rotate dst shape incorrect");
                 src_view.swap_axes(0, 1);
                 src_view.invert_axis(Axis(0));
-                src_view
-                    .iter()
-                    .zip(dst_view.iter_mut())
-                    .for_each(|(s, d)| *d = *s);
+                dst_view.assign(&src_view);
             }
         }
         Ok(())

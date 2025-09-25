@@ -6,9 +6,10 @@
 //! acceleration when available, but also provides a CPU-based fallback for
 //! environments where hardware acceleration is not present or not suitable.
 
-use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait as _};
+use edgefirst_tensor::{Tensor, TensorMapTrait, TensorMemory, TensorTrait as _};
 use enum_dispatch::enum_dispatch;
 use four_char_code::{FourCharCode, four_char_code};
+use ndarray::{ArrayView3, ArrayViewMut3, Axis};
 use zune_jpeg::{
     JpegDecoder,
     zune_core::{colorspace::ColorSpace, options::DecoderOptions},
@@ -125,19 +126,61 @@ impl TensorImage {
         let options = DecoderOptions::default().jpeg_set_out_colorspace(colour);
         let mut decoder = JpegDecoder::new_with_options(image, options);
         decoder.decode_headers()?;
+
         let image_info = decoder.info().unwrap();
 
-        let img = Self::new(
+        let (rotation, flip_x) = decoder
+            .exif()
+            .map(|x| Self::read_exif_orientation(x))
+            .unwrap_or((Rotation::None, false));
+
+        if (rotation, flip_x) == (Rotation::None, false) {
+            let img = Self::new(
+                image_info.width as usize,
+                image_info.height as usize,
+                format,
+                memory,
+            )?;
+
+            let mut tensor_map: edgefirst_tensor::TensorMap<u8> = img.tensor.map()?;
+            decoder.decode_into(&mut tensor_map)?;
+            return Ok(img);
+        }
+
+        let tmp = Self::new(
             image_info.width as usize,
             image_info.height as usize,
             format,
-            memory,
+            Some(TensorMemory::Mem),
         )?;
+        decoder.decode_into(tmp.tensor.map()?.as_mut_slice())?;
 
-        let mut tensor_map: edgefirst_tensor::TensorMap<u8> = img.tensor.map()?;
-        decoder.decode_into(&mut tensor_map)?;
+        rotate_flip_to_tensor_image(&tmp, rotation, flip_x, memory)
+    }
 
-        Ok(img)
+    fn read_exif_orientation(exif_: &[u8]) -> (Rotation, bool) {
+        let exifreader = exif::Reader::new();
+        let Ok(exif_) = exifreader.read_raw(exif_.to_vec()) else {
+            return (Rotation::None, false);
+        };
+        let Some(orientation) = exif_.get_field(exif::Tag::Orientation, exif::In::PRIMARY) else {
+            return (Rotation::None, false);
+        };
+        match orientation.value.get_uint(0) {
+            Some(1) => (Rotation::None, false),
+            Some(2) => (Rotation::None, true),
+            Some(3) => (Rotation::Rotate180, false),
+            Some(4) => (Rotation::Rotate180, true),
+            Some(5) => (Rotation::CounterClockwise90, true),
+            Some(6) => (Rotation::CounterClockwise90, false),
+            Some(7) => (Rotation::Clockwise90, true),
+            Some(8) => (Rotation::Clockwise90, false),
+            Some(v) => {
+                log::warn!("broken orientation EXIF value: {v}");
+                (Rotation::None, false)
+            }
+            None => (Rotation::None, false),
+        }
     }
 
     pub fn load_png(
@@ -163,12 +206,27 @@ impl TensorImage {
         decoder.decode_headers()?;
         let image_info = decoder.get_info().unwrap();
 
-        let img = Self::new(image_info.width, image_info.height, format, memory)?;
+        let (rotation, flip_x) = image_info
+            .exif
+            .as_ref()
+            .map(|x| Self::read_exif_orientation(x))
+            .unwrap_or((Rotation::None, false));
 
-        let mut tensor_map: edgefirst_tensor::TensorMap<u8> = img.tensor.map()?;
-        decoder.decode_into(&mut tensor_map)?;
+        if (rotation, flip_x) == (Rotation::None, false) {
+            let img = Self::new(image_info.width, image_info.height, format, memory)?;
+            decoder.decode_into(&mut img.tensor.map()?)?;
+            return Ok(img);
+        }
 
-        Ok(img)
+        let tmp = Self::new(
+            image_info.width,
+            image_info.height,
+            format,
+            Some(TensorMemory::Mem),
+        )?;
+        decoder.decode_into(&mut tmp.tensor.map()?)?;
+
+        rotate_flip_to_tensor_image(&tmp, rotation, flip_x, memory)
     }
 
     pub fn save_jpeg(&self, path: &str, quality: u8) -> Result<()> {
@@ -240,6 +298,55 @@ impl TensorImage {
             false => self.width() * self.channels(),
         }
     }
+}
+
+/// Flips the image, and the rotates it.
+fn rotate_flip_to_tensor_image(
+    src: &TensorImage,
+    rotation: Rotation,
+    flip_x: bool,
+    memory: Option<TensorMemory>,
+) -> Result<TensorImage, Error> {
+    let src_map = src.tensor.map()?;
+    let src_map = src_map.as_slice();
+    let mut src_view = ArrayView3::from_shape((src.height(), src.width(), src.channels()), src_map)
+        .expect("rotate src shape incorrect");
+
+    if flip_x {
+        src_view.invert_axis(Axis(1));
+    }
+
+    match rotation {
+        Rotation::None => {}
+        Rotation::Clockwise90 => {
+            src_view.swap_axes(0, 1);
+            src_view.invert_axis(Axis(1));
+        }
+        Rotation::Rotate180 => {
+            src_view.invert_axis(Axis(0));
+            src_view.invert_axis(Axis(1));
+        }
+        Rotation::CounterClockwise90 => {
+            src_view.swap_axes(0, 1);
+            src_view.invert_axis(Axis(0));
+        }
+    }
+
+    let dst = TensorImage::new(
+        src_view.shape()[1],
+        src_view.shape()[0],
+        src.fourcc(),
+        memory,
+    )?;
+
+    let mut dst_map = dst.tensor.map()?;
+    let dst_map = dst_map.as_mut_slice();
+    let mut dst_view =
+        ArrayViewMut3::from_shape((dst.height(), dst.width(), dst.channels()), dst_map)
+            .expect("rotate dst shape incorrect");
+
+    dst_view.assign(&src_view);
+    Ok(dst)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -461,6 +568,15 @@ mod tests {
             "G2D and CPU converted image have similarity score too low: {}",
             similarity.score
         );
+    }
+
+    #[test]
+    fn test_load_with_exif() {
+        let file = include_bytes!("../../../testdata/zidane_rotated_exif.jpg").to_vec();
+        let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
+
+        assert_eq!(src.height(), 1280);
+        assert_eq!(src.width(), 720);
     }
 
     #[test]

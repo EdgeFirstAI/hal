@@ -3,8 +3,8 @@ use edgefirst::{
     tensor::{self, TensorMapTrait, TensorTrait},
 };
 use four_char_code::FourCharCode;
-use ndarray::{Array3, ArrayView3};
-use numpy::{IntoPyArray, PyArray3, PyReadwriteArray3};
+use ndarray::{Array3, ArrayView3, ArrayViewMut3};
+use numpy::{IntoPyArray, PyArray3, PyArrayLike3, PyReadwriteArray3};
 use pyo3::prelude::*;
 use std::{fmt, sync::Mutex};
 
@@ -178,6 +178,25 @@ impl PyTensorImage {
         let ndarray = ArrayView3::from_shape(shape, data)?;
 
         dst.assign(&ndarray);
+        Ok(())
+    }
+
+    pub fn copy_from_numpy(&mut self, src: PyArrayLike3<u8>) -> Result<()> {
+        let src = src.as_array();
+        let tensor = &self.0;
+        let shape = [tensor.height(), tensor.width(), tensor.channels()];
+        if src.shape() != shape {
+            return Err(Error::Format(format!(
+                "Shape Mismatch: Expected {:?} but got {:?}",
+                shape,
+                src.shape()
+            )));
+        }
+
+        let mut map = tensor.tensor().map()?;
+        let data = map.as_mut_slice();
+        let mut ndarray = ArrayViewMut3::from_shape(shape, data)?;
+        ndarray.assign(&src);
         Ok(())
     }
 
