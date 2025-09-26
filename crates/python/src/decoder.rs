@@ -26,10 +26,19 @@ pub type PySegDetOutput<'py> = (
 
 #[derive(FromPyObject)]
 pub enum ListOfReadOnlyArrayGenericDyn<'py> {
-    UInt8(Vec<PyArrayLikeDyn<'py, u8>>),
-    Int8(Vec<PyArrayLikeDyn<'py, i8>>),
-    Float32(Vec<PyArrayLikeDyn<'py, f32>>),
-    Float64(Vec<PyArrayLikeDyn<'py, f64>>),
+    UInt8(Vec<WithInt32Array<'py, PyArrayLikeDyn<'py, u8>>>),
+    Int8(Vec<WithInt32Array<'py, PyArrayLikeDyn<'py, i8>>>),
+    Float32(Vec<WithInt32Array<'py, PyArrayLikeDyn<'py, f32>>>),
+    Float64(Vec<WithInt32Array<'py, PyArrayLikeDyn<'py, f64>>>),
+}
+
+#[derive(FromPyObject)]
+pub enum WithInt32Array<'py, T>
+where
+    T: FromPyObject<'py>,
+{
+    Val(T),
+    Int32(PyArrayLikeDyn<'py, i32>),
 }
 
 #[derive(FromPyObject)]
@@ -138,25 +147,49 @@ impl PyDecoder {
         let mut output_masks = Vec::with_capacity(max_boxes);
         let result = match model_output {
             ListOfReadOnlyArrayGenericDyn::UInt8(items) => {
-                let outputs = items.iter().map(|x| x.as_array()).collect::<Vec<_>>();
+                let outputs = items
+                    .iter()
+                    .filter_map(|x| match x {
+                        WithInt32Array::Val(x) => Some(x.as_array()),
+                        WithInt32Array::Int32(_) => None,
+                    })
+                    .collect::<Vec<_>>();
                 self_
                     .decoder
                     .decode_u8(&outputs, &mut output_boxes, &mut output_masks)
             }
             ListOfReadOnlyArrayGenericDyn::Int8(items) => {
-                let outputs = items.iter().map(|x| x.as_array()).collect::<Vec<_>>();
+                let outputs = items
+                    .iter()
+                    .filter_map(|x| match x {
+                        WithInt32Array::Val(x) => Some(x.as_array()),
+                        WithInt32Array::Int32(_) => None,
+                    })
+                    .collect::<Vec<_>>();
                 self_
                     .decoder
                     .decode_i8(&outputs, &mut output_boxes, &mut output_masks)
             }
             ListOfReadOnlyArrayGenericDyn::Float32(items) => {
-                let outputs = items.iter().map(|x| x.as_array()).collect::<Vec<_>>();
+                let outputs = items
+                    .iter()
+                    .filter_map(|x| match x {
+                        WithInt32Array::Val(x) => Some(x.as_array()),
+                        WithInt32Array::Int32(_) => None,
+                    })
+                    .collect::<Vec<_>>();
                 self_
                     .decoder
                     .decode_f32(&outputs, &mut output_boxes, &mut output_masks)
             }
             ListOfReadOnlyArrayGenericDyn::Float64(items) => {
-                let outputs = items.iter().map(|x| x.as_array()).collect::<Vec<_>>();
+                let outputs = items
+                    .iter()
+                    .filter_map(|x| match x {
+                        WithInt32Array::Val(x) => Some(x.as_array()),
+                        WithInt32Array::Int32(_) => None,
+                    })
+                    .collect::<Vec<_>>();
                 self_
                     .decoder
                     .decode_f64(&outputs, &mut output_boxes, &mut output_masks)
