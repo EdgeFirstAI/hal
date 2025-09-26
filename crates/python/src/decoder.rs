@@ -9,7 +9,7 @@ use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayLike2, PyArrayLike3, PyArrayLikeDyn,
     PyReadonlyArray3, PyReadwriteArrayDyn, ToPyArray,
 };
-use pyo3::{Bound, FromPyObject, PyRef, PyResult, Python, pyclass, pymethods};
+use pyo3::{Bound, FromPyObject, PyAny, PyRef, PyResult, Python, pyclass, pymethods};
 
 pub type PyDetOutput<'py> = (
     Bound<'py, PyArray2<f32>>,
@@ -77,6 +77,21 @@ unsafe impl Sync for PyDecoder {}
 
 #[pymethods]
 impl PyDecoder {
+    #[new]
+    #[pyo3(signature = (config, score_threshold=0.1, iou_threshold=0.7))]
+    pub fn new(config: Bound<PyAny>, score_threshold: f32, iou_threshold: f32) -> PyResult<Self> {
+        let config = pythonize::depythonize(&config)?;
+        let decoder = DecoderBuilder::default()
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .with_config(config)
+            .build();
+        match decoder {
+            Ok(decoder) => Ok(Self { decoder }),
+            Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}"))),
+        }
+    }
+
     #[staticmethod]
     #[pyo3(signature = (json_str, score_threshold=0.1, iou_threshold=0.7))]
     pub fn new_from_json_str(

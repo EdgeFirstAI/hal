@@ -25,6 +25,7 @@ four-char-code = { workspace = true }
 numpy = "0.25.0"
 pyo3 = { version = "0.25.1" }
 ndarray = { workspace = true }
+pythonize = "0.25.0"
 
 [build-dependencies]
 pyo3-build-config = { version = "0.25.1", features = ["resolve-config"] }

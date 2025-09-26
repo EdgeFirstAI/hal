@@ -76,7 +76,6 @@ fn test_flip() -> PyResult<()> {
             edgefirst_python::image::FourCC::RGBA
         );
         let n = out.get_item("n").unwrap().downcast_into::<PyArray3<u8>>()?;
-
         Ok(())
     })
 }
