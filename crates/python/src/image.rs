@@ -1,5 +1,5 @@
 use edgefirst::{
-    image::{self, ImageConverterTrait, Rect, Rotation},
+    image::{self, Flip, ImageConverterTrait, Rect, Rotation},
     tensor::{self, TensorMapTrait, TensorTrait},
 };
 use four_char_code::FourCharCode;
@@ -235,16 +235,23 @@ impl PyImageConverter {
         Ok(PyImageConverter(Mutex::new(converter)))
     }
 
-    #[pyo3(signature = (src, dst, rotation = PyRotation::Rotate0, crop = None))]
+    #[pyo3(signature = (src, dst, rotation = PyRotation::Rotate0, flip = PyFlip::NoFlip, crop = None))]
     pub fn convert(
         &mut self,
         src: &PyTensorImage,
         dst: &mut PyTensorImage,
         rotation: PyRotation,
+        flip: PyFlip,
         crop: Option<PyRect>,
     ) -> Result<()> {
         if let Ok(mut l) = self.0.lock() {
-            l.convert(&src.0, &mut dst.0, rotation.into(), crop.map(|x| x.into()))?
+            l.convert(
+                &src.0,
+                &mut dst.0,
+                rotation.into(),
+                flip.into(),
+                crop.map(|x| x.into()),
+            )?
         };
         Ok(())
     }
@@ -280,6 +287,24 @@ impl From<PyRotation> for Rotation {
             PyRotation::Clockwise90 => Rotation::Clockwise90,
             PyRotation::Rotate180 => Rotation::Rotate180,
             PyRotation::CounterClockwise90 => Rotation::CounterClockwise90,
+        }
+    }
+}
+
+#[pyclass(name = "Flip")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PyFlip {
+    NoFlip = 0,
+    Horizontal = 1,
+    Vertical = 2,
+}
+
+impl From<PyFlip> for Flip {
+    fn from(val: PyFlip) -> Self {
+        match val {
+            PyFlip::NoFlip => Flip::None,
+            PyFlip::Horizontal => Flip::Horizontal,
+            PyFlip::Vertical => Flip::Vertical,
         }
     }
 }

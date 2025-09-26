@@ -1,5 +1,5 @@
 use edgefirst_image::{
-    CPUConverter, G2DConverter, GLConverter, ImageConverterTrait as _, RGB, RGBA, Rotation,
+    CPUConverter, Flip, GLConverter, GREY, ImageConverterTrait as _, RGB, RGBA, Rotation,
     TensorImage, YUYV,
 };
 use edgefirst_tensor::{TensorMapTrait, TensorMemory, TensorTrait};
@@ -163,7 +163,49 @@ where
 
     bencher.bench_local(|| {
         converter
-            .convert(&src, &mut dst, Rotation::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .unwrap()
+    });
+}
+
+#[divan::bench(types = [Jaguar, Person, Zidane], args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn resize_cpu_grayscale_upscale<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
+where
+    IMAGE: TestImage,
+{
+    use edgefirst_image::CPUConverter;
+
+    let (width, height) = size;
+    let name = format!("{}.jpg", IMAGE::filename());
+    let path = Path::new("testdata").join(&name);
+    let path = match path.exists() {
+        true => path,
+        false => {
+            let path = Path::new("../testdata").join(&name);
+            if path.exists() {
+                path
+            } else {
+                Path::new("../../testdata").join(&name)
+            }
+        }
+    };
+
+    assert!(path.exists(), "unable to locate test image at {path:?}");
+
+    let file = std::fs::read(path).unwrap();
+    let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
+    let mut grey = TensorImage::new(160, 160, GREY, None).unwrap();
+    let mut dst = TensorImage::new(width, height, GREY, None).unwrap();
+
+    let mut converter = CPUConverter::new().unwrap();
+
+    converter
+        .convert(&src, &mut grey, Rotation::None, Flip::None, None)
+        .unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&grey, &mut dst, Rotation::None, Flip::None, None)
             .unwrap()
     });
 }
@@ -174,7 +216,7 @@ fn resize_g2d<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
 where
     IMAGE: TestImage,
 {
-    use edgefirst_image::G2DConverter;
+    use edgefirst_image::CPUConverter;
 
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
@@ -197,11 +239,11 @@ where
     let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
     let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
 
-    let mut converter = G2DConverter::new().unwrap();
+    let mut converter = CPUConverter::new().unwrap();
 
     bencher.bench_local(|| {
         converter
-            .convert(&src, &mut dst, Rotation::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
             .unwrap()
     });
 }
@@ -238,7 +280,7 @@ where
 
     bencher.bench_local(|| {
         gl_converter
-            .convert(&src, &mut gl_dst, Rotation::None, None)
+            .convert(&src, &mut gl_dst, Rotation::None, Flip::None, None)
             .unwrap()
     });
     drop(gl_dst);
@@ -276,7 +318,7 @@ where
 
     bencher.bench_local(|| {
         gl_converter
-            .convert(&src, &mut gl_dst, Rotation::None, None)
+            .convert(&src, &mut gl_dst, Rotation::None, Flip::None, None)
             .unwrap()
     });
     drop(gl_dst);
@@ -288,9 +330,7 @@ fn rotate_cpu<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) 
     let rot = R::value();
 
     match rot {
-        Rotation::Clockwise90 | Rotation::CounterClockwise90 => {
-            (width, height) = (height, width)
-        }
+        Rotation::Clockwise90 | Rotation::CounterClockwise90 => (width, height) = (height, width),
         _ => {}
     }
     let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
@@ -299,7 +339,11 @@ fn rotate_cpu<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) 
 
     let mut converter = CPUConverter::new().unwrap();
 
-    bencher.bench_local(|| converter.convert(&src, &mut dst, rot, None).unwrap());
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, rot, Flip::None, None)
+            .unwrap()
+    });
 }
 
 #[divan::bench(types = [Rotate90, Rotate180, Rotate270], args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
@@ -308,9 +352,7 @@ fn rotate_opengl<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize
     let rot = R::value();
 
     match rot {
-        Rotation::Clockwise90 | Rotation::CounterClockwise90 => {
-            (width, height) = (height, width)
-        }
+        Rotation::Clockwise90 | Rotation::CounterClockwise90 => (width, height) = (height, width),
         _ => {}
     }
     let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
@@ -320,7 +362,11 @@ fn rotate_opengl<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize
 
     let mut converter = GLConverter::new_with_size(width, height, false).unwrap();
 
-    bencher.bench_local(|| converter.convert(&src, &mut dst, rot, None).unwrap());
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, rot, Flip::None, None)
+            .unwrap()
+    });
     drop(dst);
 }
 
@@ -330,9 +376,7 @@ fn rotate_g2d<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) 
     let rot = R::value();
 
     match rot {
-        Rotation::Clockwise90 | Rotation::CounterClockwise90 => {
-            (width, height) = (height, width)
-        }
+        Rotation::Clockwise90 | Rotation::CounterClockwise90 => (width, height) = (height, width),
         _ => {}
     }
     let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
@@ -340,9 +384,13 @@ fn rotate_g2d<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) 
     let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
     let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
 
-    let mut converter = G2DConverter::new().unwrap();
+    let mut converter = CPUConverter::new().unwrap();
 
-    bencher.bench_local(|| converter.convert(&src, &mut dst, rot, None).unwrap());
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, rot, Flip::None, None)
+            .unwrap()
+    });
 }
 
 #[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
@@ -362,7 +410,7 @@ fn convert_cpu(bencher: divan::Bencher, params: (usize, usize)) {
 
     bencher.bench_local(|| {
         converter
-            .convert(&src, &mut dst, Rotation::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
             .unwrap()
     });
 }
@@ -393,7 +441,7 @@ where
 
     bencher.bench_local(|| {
         converter
-            .convert(&src, &mut dst, Rotation::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
             .unwrap()
     });
 }
@@ -411,11 +459,11 @@ fn convert_g2d(bencher: divan::Bencher, params: (usize, usize)) {
     let (width, height) = params;
     let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
 
-    let mut converter = G2DConverter::new().unwrap();
+    let mut converter = CPUConverter::new().unwrap();
 
     bencher.bench_local(|| {
         converter
-            .convert(&src, &mut dst, Rotation::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
             .unwrap()
     });
 }
@@ -437,7 +485,7 @@ fn convert_opengl(bencher: divan::Bencher, params: (usize, usize)) {
 
     bencher.bench_local(|| {
         converter
-            .convert(&src, &mut dst, Rotation::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
             .unwrap()
     });
     drop(dst);

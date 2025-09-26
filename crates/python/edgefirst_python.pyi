@@ -127,16 +127,16 @@ class TensorImage:
         ...
 
     # [pyo3(signature = (filename, quality=80))]
-    def save_jpeg(self, filename:  str, quality: int):
+    def save_jpeg(self, filename:  str, quality: int = 80) -> None:
         ...
 
     def to_numpy(self) -> npt.NDArray[np.uint8]:
         ...
 
-    def copy_into_numpy(self, dst: npt.NDArray[np.uint8]):
+    def copy_into_numpy(self, dst: npt.NDArray[np.uint8]) -> None:
         ...
 
-    def copy_from_numpy(self, src: npt.NDArray[np.uint8]):
+    def copy_from_numpy(self, src: npt.NDArray[np.uint8]) -> None:
         ...
 
     @property
@@ -154,6 +154,12 @@ class TensorImage:
     @property
     def is_planar(self) -> bool:
         ...
+
+
+class Flip(enum.Enum):
+    NoFlip: Flip
+    Horizontal: Flip
+    Vertical: Flip
 
 
 class Rotation(enum.Enum):
@@ -194,5 +200,5 @@ class ImageConverter:
         ...
 
     # [pyo3(signature = (src, dst, rotation = Rotation::Rotate0, crop = None))]
-    def convert(src: TensorImage, dst: TensorImage, rotation: Rotation = Rotation.Rotate0, crop: Rect | None = None):
+    def convert(src: TensorImage, dst: TensorImage, rotation: Rotation = Rotation.Rotate0, flip: Flip = Flip.NoFlip, crop: Rect | None = None) -> None:
         ...
