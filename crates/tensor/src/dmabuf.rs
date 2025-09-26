@@ -1,4 +1,5 @@
-use nix::ioctl_write_ptr;
+#![allow(dead_code)]
+use nix::{ioctl_read, ioctl_write_ptr};
 use std::os::fd::{AsRawFd, OwnedFd};
 
 const DMA_BUF_BASE: u8 = b'b';
@@ -12,7 +13,7 @@ const DMA_BUF_SYNC_END: u64 = 1 << 2;
 
 #[derive(Default)]
 #[repr(C)]
-struct dma_buf_sync {
+struct DmaBufSync {
     flags: u64,
 }
 
@@ -20,10 +21,10 @@ ioctl_write_ptr!(
     ioctl_dma_buf_sync,
     DMA_BUF_BASE,
     DMA_BUF_IOCTL_SYNC,
-    dma_buf_sync
+    DmaBufSync
 );
 
-ioctl_write_ptr!(
+ioctl_read!(
     ioctl_dma_buf_phys,
     DMA_BUF_BASE,
     DMA_BUF_IOCTL_PHYS,
@@ -31,8 +32,8 @@ ioctl_write_ptr!(
 );
 
 fn sync(fd: &OwnedFd, flags: u64) -> nix::Result<()> {
-    let mut sync = dma_buf_sync { flags };
-    unsafe { ioctl_dma_buf_sync(fd.as_raw_fd(), &mut sync) }?;
+    let sync = DmaBufSync { flags };
+    unsafe { ioctl_dma_buf_sync(fd.as_raw_fd(), &sync) }?;
     Ok(())
 }
 

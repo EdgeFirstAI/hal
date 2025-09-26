@@ -1,5 +1,5 @@
 use edgefirst_python::edgefirst_python as edgefirst_python_module;
-use numpy::{PyArray3, PyArrayMethods, PyUntypedArrayMethods};
+use numpy::{PyArray3, PyUntypedArrayMethods};
 use pyo3::{
     PyResult, Python,
     ffi::c_str,
@@ -75,7 +75,7 @@ fn test_flip() -> PyResult<()> {
             src.borrow().format().unwrap(),
             edgefirst_python::image::FourCC::RGBA
         );
-        let n = out.get_item("n").unwrap().downcast_into::<PyArray3<u8>>()?;
+        let _ = out.get_item("n").unwrap().downcast_into::<PyArray3<u8>>()?;
         Ok(())
     })
 }
