@@ -13,7 +13,7 @@ use std::{
     str::FromStr,
 };
 
-use crate::{Error, GREY, ImageConverterTrait, RGB, RGBA, TensorImage, YUYV};
+use crate::{Error, Flip, GREY, ImageConverterTrait, RGB, RGBA, Rotation, TensorImage, YUYV};
 
 pub struct Headless {
     pub surface: egl::Surface,
@@ -239,11 +239,17 @@ impl ImageConverterTrait for GLConverter {
         src: &TensorImage,
         dst: &mut TensorImage,
         rotation: crate::Rotation,
+        flip: Flip,
         crop: Option<crate::Rect>,
     ) -> crate::Result<()> {
+        if dst.fourcc == GREY {
+            return Err(Error::NotSupported(
+                "OpenGL doesn't support Grey destination".to_string(),
+            ));
+        }
         check_gl_error().unwrap();
-        if matches!(dst.tensor(), edgefirst_tensor::Tensor::Dma(_)) {
-            return self.convert_dest_dma(dst, src, rotation, crop);
+        if let edgefirst_tensor::Tensor::Dma(_) = dst.tensor() {
+            return self.convert_dest_dma(dst, src, rotation, flip, crop);
         }
 
         if dst.is_planar() {
@@ -258,6 +264,11 @@ impl ImageConverterTrait for GLConverter {
                     dst.height() * 3,
                     RGBA.display(),
                 )));
+            }
+            if rotation != Rotation::None || flip != Flip::None {
+                return Err(Error::NotSupported(
+                    "Rotation or Flip not supported for planar RGB".to_string(),
+                ));
             }
             self.convert_to_planar(src, crop)?;
         } else {
@@ -274,7 +285,7 @@ impl ImageConverterTrait for GLConverter {
                     dst.fourcc().display(),
                 )));
             }
-            self.convert_to(src, rotation, crop, true)?;
+            self.convert_to(src, rotation, flip, crop, true)?;
         }
 
         self.gbm_rendering
@@ -356,6 +367,7 @@ impl GLConverter {
         dst: &mut TensorImage,
         src: &TensorImage,
         rotation: crate::Rotation,
+        flip: Flip,
         crop: Option<crate::Rect>,
     ) -> crate::Result<()> {
         let frame_buffer = FrameBuffer::new();
@@ -408,18 +420,18 @@ impl GLConverter {
             );
             gls::gl::Viewport(0, 0, dst.width() as i32, dst.height() as i32);
         }
-        self.convert_to(src, rotation, crop, false)
+        self.convert_to(src, rotation, flip, crop, false)
     }
 
     fn convert_to(
         &mut self,
         src: &TensorImage,
         rotation: crate::Rotation,
+        flip: Flip,
         crop: Option<crate::Rect>,
-        flip: bool,
+        flip_y: bool,
     ) -> Result<(), crate::Error> {
         check_gl_error().unwrap();
-        // self.gbm_rendering.make_current()?;
         unsafe {
             gls::gl::ClearColor(1.0, 1.0, 1.0, 1.0);
             gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
@@ -448,11 +460,18 @@ impl GLConverter {
             crate::Rotation::Rotate180 => 2,
             crate::Rotation::CounterClockwise90 => 3,
         };
-        check_gl_error().unwrap();
+
         let result = if let Ok(new_egl_image) = self.create_image_from_dma2(src) {
-            self.draw_camera_texture_eglimage(src, &new_egl_image, roi, rotation_offset, flip)
+            self.draw_camera_texture_eglimage(
+                src,
+                &new_egl_image,
+                roi,
+                rotation_offset,
+                flip,
+                flip_y,
+            )
         } else {
-            self.draw_camera_texture(src, roi, rotation_offset, flip)
+            self.draw_camera_texture(src, roi, rotation_offset, flip, flip_y)
         };
         unsafe { gls::gl::Finish() };
         result
@@ -584,7 +603,8 @@ impl GLConverter {
         img: &TensorImage,
         roi: RegionOfInterest,
         rotation_offset: usize,
-        flip: bool,
+        flip: Flip,
+        flip_y: bool,
     ) -> Result<(), Error> {
         let texture_target = gls::gl::TEXTURE_2D;
         let texture_format = match img.fourcc() {
@@ -646,9 +666,19 @@ impl GLConverter {
                 right: 1.,
                 top: 1.,
             };
-            if flip {
+            if flip_y {
                 std::mem::swap(&mut cam.top, &mut cam.bottom);
             }
+            match flip {
+                Flip::None => {}
+                Flip::Vertical => {
+                    std::mem::swap(&mut cam.top, &mut cam.bottom);
+                }
+                Flip::Horizontal => {
+                    std::mem::swap(&mut cam.left, &mut cam.right);
+                }
+            }
+
             let camera_vertices: [f32; 12] = [
                 cam.left, cam.top, 0., // left top
                 cam.right, cam.top, 0., // right top
@@ -696,7 +726,8 @@ impl GLConverter {
         egl_img: &EglImage,
         roi: RegionOfInterest,
         rotation_offset: usize,
-        flip: bool,
+        flip: Flip,
+        flip_y: bool,
     ) -> Result<(), Error> {
         let texture_target = gls::gl::TEXTURE_2D;
         unsafe {
@@ -742,9 +773,20 @@ impl GLConverter {
                 right: 1.,
                 top: 1.,
             };
-            if flip {
+            if flip_y {
                 std::mem::swap(&mut cam.top, &mut cam.bottom);
             }
+
+            match flip {
+                Flip::None => {}
+                Flip::Vertical => {
+                    std::mem::swap(&mut cam.top, &mut cam.bottom);
+                }
+                Flip::Horizontal => {
+                    std::mem::swap(&mut cam.left, &mut cam.right);
+                }
+            }
+
             let camera_vertices: [f32; 12] = [
                 cam.left, cam.top, 0., // left top
                 cam.right, cam.top, 0., // right top

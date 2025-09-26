@@ -9,7 +9,6 @@
 use edgefirst_tensor::{Tensor, TensorMapTrait, TensorMemory, TensorTrait as _};
 use enum_dispatch::enum_dispatch;
 use four_char_code::{FourCharCode, four_char_code};
-use ndarray::{ArrayView3, ArrayViewMut3, Axis};
 use zune_jpeg::{
     JpegDecoder,
     zune_core::{colorspace::ColorSpace, options::DecoderOptions},
@@ -129,12 +128,12 @@ impl TensorImage {
 
         let image_info = decoder.info().unwrap();
 
-        let (rotation, flip_x) = decoder
+        let (rotation, flip) = decoder
             .exif()
             .map(|x| Self::read_exif_orientation(x))
-            .unwrap_or((Rotation::None, false));
+            .unwrap_or((Rotation::None, Flip::None));
 
-        if (rotation, flip_x) == (Rotation::None, false) {
+        if (rotation, flip) == (Rotation::None, Flip::None) {
             let img = Self::new(
                 image_info.width as usize,
                 image_info.height as usize,
@@ -155,32 +154,7 @@ impl TensorImage {
         )?;
         decoder.decode_into(tmp.tensor.map()?.as_mut_slice())?;
 
-        rotate_flip_to_tensor_image(&tmp, rotation, flip_x, memory)
-    }
-
-    fn read_exif_orientation(exif_: &[u8]) -> (Rotation, bool) {
-        let exifreader = exif::Reader::new();
-        let Ok(exif_) = exifreader.read_raw(exif_.to_vec()) else {
-            return (Rotation::None, false);
-        };
-        let Some(orientation) = exif_.get_field(exif::Tag::Orientation, exif::In::PRIMARY) else {
-            return (Rotation::None, false);
-        };
-        match orientation.value.get_uint(0) {
-            Some(1) => (Rotation::None, false),
-            Some(2) => (Rotation::None, true),
-            Some(3) => (Rotation::Rotate180, false),
-            Some(4) => (Rotation::Rotate180, true),
-            Some(5) => (Rotation::CounterClockwise90, true),
-            Some(6) => (Rotation::CounterClockwise90, false),
-            Some(7) => (Rotation::Clockwise90, true),
-            Some(8) => (Rotation::Clockwise90, false),
-            Some(v) => {
-                log::warn!("broken orientation EXIF value: {v}");
-                (Rotation::None, false)
-            }
-            None => (Rotation::None, false),
-        }
+        rotate_flip_to_tensor_image(&tmp, rotation, flip, memory)
     }
 
     pub fn load_png(
@@ -206,13 +180,13 @@ impl TensorImage {
         decoder.decode_headers()?;
         let image_info = decoder.get_info().unwrap();
 
-        let (rotation, flip_x) = image_info
+        let (rotation, flip) = image_info
             .exif
             .as_ref()
             .map(|x| Self::read_exif_orientation(x))
-            .unwrap_or((Rotation::None, false));
+            .unwrap_or((Rotation::None, Flip::None));
 
-        if (rotation, flip_x) == (Rotation::None, false) {
+        if (rotation, flip) == (Rotation::None, Flip::None) {
             let img = Self::new(image_info.width, image_info.height, format, memory)?;
             decoder.decode_into(&mut img.tensor.map()?)?;
             return Ok(img);
@@ -226,7 +200,32 @@ impl TensorImage {
         )?;
         decoder.decode_into(&mut tmp.tensor.map()?)?;
 
-        rotate_flip_to_tensor_image(&tmp, rotation, flip_x, memory)
+        rotate_flip_to_tensor_image(&tmp, rotation, flip, memory)
+    }
+
+    fn read_exif_orientation(exif_: &[u8]) -> (Rotation, Flip) {
+        let exifreader = exif::Reader::new();
+        let Ok(exif_) = exifreader.read_raw(exif_.to_vec()) else {
+            return (Rotation::None, Flip::None);
+        };
+        let Some(orientation) = exif_.get_field(exif::Tag::Orientation, exif::In::PRIMARY) else {
+            return (Rotation::None, Flip::None);
+        };
+        match orientation.value.get_uint(0) {
+            Some(1) => (Rotation::None, Flip::None),
+            Some(2) => (Rotation::None, Flip::Horizontal),
+            Some(3) => (Rotation::Rotate180, Flip::None),
+            Some(4) => (Rotation::Rotate180, Flip::Horizontal),
+            Some(5) => (Rotation::Clockwise90, Flip::Horizontal),
+            Some(6) => (Rotation::Clockwise90, Flip::None),
+            Some(7) => (Rotation::CounterClockwise90, Flip::Horizontal),
+            Some(8) => (Rotation::CounterClockwise90, Flip::None),
+            Some(v) => {
+                log::warn!("broken orientation EXIF value: {v}");
+                (Rotation::None, Flip::None)
+            }
+            None => (Rotation::None, Flip::None),
+        }
     }
 
     pub fn save_jpeg(&self, path: &str, quality: u8) -> Result<()> {
@@ -304,48 +303,23 @@ impl TensorImage {
 fn rotate_flip_to_tensor_image(
     src: &TensorImage,
     rotation: Rotation,
-    flip_x: bool,
+    flip: Flip,
     memory: Option<TensorMemory>,
 ) -> Result<TensorImage, Error> {
     let src_map = src.tensor.map()?;
-    let src_map = src_map.as_slice();
-    let mut src_view = ArrayView3::from_shape((src.height(), src.width(), src.channels()), src_map)
-        .expect("rotate src shape incorrect");
-
-    if flip_x {
-        src_view.invert_axis(Axis(1));
-    }
-
-    match rotation {
-        Rotation::None => {}
-        Rotation::Clockwise90 => {
-            src_view.swap_axes(0, 1);
-            src_view.invert_axis(Axis(1));
+    let dst = match rotation {
+        Rotation::None | Rotation::Rotate180 => {
+            TensorImage::new(src.width(), src.height(), src.fourcc(), memory)?
         }
-        Rotation::Rotate180 => {
-            src_view.invert_axis(Axis(0));
-            src_view.invert_axis(Axis(1));
+        Rotation::Clockwise90 | Rotation::CounterClockwise90 => {
+            TensorImage::new(src.height(), src.width(), src.fourcc(), memory)?
         }
-        Rotation::CounterClockwise90 => {
-            src_view.swap_axes(0, 1);
-            src_view.invert_axis(Axis(0));
-        }
-    }
-
-    let dst = TensorImage::new(
-        src_view.shape()[1],
-        src_view.shape()[0],
-        src.fourcc(),
-        memory,
-    )?;
+    };
 
     let mut dst_map = dst.tensor.map()?;
-    let dst_map = dst_map.as_mut_slice();
-    let mut dst_view =
-        ArrayViewMut3::from_shape((dst.height(), dst.width(), dst.channels()), dst_map)
-            .expect("rotate dst shape incorrect");
 
-    dst_view.assign(&src_view);
+    CPUConverter::flip_rotate_ndarray(&src_map, &mut dst_map, &dst, rotation, flip)?;
+
     Ok(dst)
 }
 
@@ -369,6 +343,13 @@ impl Rotation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flip {
+    None = 0,
+    Vertical = 1,
+    Horizontal = 2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
     pub left: usize,
     pub top: usize,
@@ -378,14 +359,15 @@ pub struct Rect {
 
 #[enum_dispatch(ImageConverter)]
 pub trait ImageConverterTrait {
-    /// Converts the source image to the destination image format and size.
+    /// Converts the source image to the destination image format and size. The
+    /// image is cropped first, then flipped, then rotated
     ///
     /// # Arguments
     ///
     /// * `dst` - The destination image to be converted to.
     /// * `src` - The source image to convert from.
-    /// * `rotation` - The rotation to apply to the destination image (after
-    ///   crop if specified).
+    /// * `rotation` - The rotation to apply to the destination image.
+    /// * `flip` - Flips the image
     /// * `crop` - An optional rectangle specifying the area to crop from the
     ///   source image
     ///
@@ -397,6 +379,7 @@ pub trait ImageConverterTrait {
         src: &TensorImage,
         dst: &mut TensorImage,
         rotation: Rotation,
+        flip: Flip,
         crop: Option<Rect>,
     ) -> Result<()>;
 }
@@ -405,7 +388,7 @@ pub struct ImageConverter {
     pub cpu: CPUConverter,
 
     #[cfg(target_os = "linux")]
-    pub g2d: Option<G2DConverter>,
+    pub g2d: Option<CPUConverter>,
     #[cfg(target_os = "linux")]
     pub opengl: Option<GLConverter>,
 }
@@ -413,7 +396,7 @@ pub struct ImageConverter {
 impl ImageConverter {
     pub fn new() -> Result<Self> {
         #[cfg(target_os = "linux")]
-        let g2d = match G2DConverter::new() {
+        let g2d = match CPUConverter::new() {
             Ok(g2d_converter) => Some(g2d_converter),
             Err(err) => {
                 log::debug!("Failed to initialize G2D converter: {err:?}");
@@ -422,6 +405,7 @@ impl ImageConverter {
         };
 
         #[cfg(target_os = "linux")]
+        // let opengl = None;
         let opengl = match GLConverter::new() {
             Ok(gl_converter) => Some(gl_converter),
             Err(err) => {
@@ -440,23 +424,24 @@ impl ImageConverterTrait for ImageConverter {
         src: &TensorImage,
         dst: &mut TensorImage,
         rotation: Rotation,
+        flip: Flip,
         crop: Option<Rect>,
     ) -> Result<()> {
         #[cfg(target_os = "linux")]
         if let Some(g2d) = self.g2d.as_mut()
-            && g2d.convert(src, dst, rotation, crop).is_ok()
+            && g2d.convert(src, dst, rotation, flip, crop).is_ok()
         {
             return Ok(());
         }
 
         #[cfg(target_os = "linux")]
         if let Some(opengl) = self.opengl.as_mut()
-            && opengl.convert(src, dst, rotation, crop).is_ok()
+            && opengl.convert(src, dst, rotation, flip, crop).is_ok()
         {
             return Ok(());
         }
 
-        self.cpu.convert(src, dst, rotation, crop)
+        self.cpu.convert(src, dst, rotation, flip, crop)
     }
 }
 
@@ -486,6 +471,22 @@ mod tests {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     }
 
+    macro_rules! function {
+        () => {{
+            fn f() {}
+            fn type_name_of<T>(_: T) -> &'static str {
+                std::any::type_name::<T>()
+            }
+            let name = type_name_of(f);
+
+            // Find and cut the rest of the path
+            match &name[..name.len() - 3].rfind(':') {
+                Some(pos) => &name[pos + 1..name.len() - 3],
+                None => &name[..name.len() - 3],
+            }
+        }};
+    }
+
     #[test]
     fn test_load_resize_save() {
         let path = Path::new("testdata/zidane.jpg");
@@ -510,7 +511,7 @@ mod tests {
         let mut dst = TensorImage::new(640, 360, RGBA, None).unwrap();
         let mut converter = ImageConverter::new().unwrap();
         converter
-            .convert(&img, &mut dst, Rotation::None, None)
+            .convert(&img, &mut dst, Rotation::None, Flip::None, None)
             .unwrap();
         assert_eq!(dst.width(), 640);
         assert_eq!(dst.height(), 360);
@@ -524,6 +525,42 @@ mod tests {
         assert_eq!(img.fourcc(), RGB);
     }
 
+    // #[test]
+    // fn test_opengl_grey() {
+    //     let path = Path::new("testdata/zidane.jpg");
+    //     let path = match path.exists() {
+    //         true => path,
+    //         false => {
+    //             let path = Path::new("../testdata/zidane.jpg");
+    //             if path.exists() {
+    //                 path
+    //             } else {
+    //                 Path::new("../../testdata/zidane.jpg")
+    //             }
+    //         }
+    //     };
+    //     assert!(path.exists(), "Test image not found at {path:?}");
+
+    //     let file = std::fs::read(path).unwrap();
+    //     let img = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
+    //     assert_eq!(img.width(), 1280);
+    //     assert_eq!(img.height(), 720);
+
+    //     let mut grey = TensorImage::new(1280, 720, GREY,
+    // Some(TensorMemory::Dma)).unwrap();     let mut dst =
+    // TensorImage::new(640, 640, GREY, Some(TensorMemory::Dma)).unwrap();
+
+    //     let mut converter = CPUConverter::new().unwrap();
+
+    //     converter
+    //         .convert(&img, &mut grey, Rotation::None, Flip::None, None)
+    //         .unwrap();
+
+    //     let mut gl = GLConverter::new().unwrap();
+    //     gl.convert(&grey, &mut dst, Rotation::None, Flip::None, None)
+    //         .unwrap()
+    // }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn test_new_image_converter() {
@@ -535,48 +572,45 @@ mod tests {
         let mut converter_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
         let mut converter = ImageConverter::new().unwrap();
         converter
-            .convert(&src, &mut converter_dst, Rotation::None, None)
+            .convert(&src, &mut converter_dst, Rotation::None, Flip::None, None)
             .unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
         let mut cpu_converter = CPUConverter::new().unwrap();
         cpu_converter
-            .convert(&src, &mut cpu_dst, Rotation::None, None)
+            .convert(&src, &mut cpu_dst, Rotation::None, Flip::None, None)
             .unwrap();
 
-        let converter_image = image::RgbaImage::from_vec(
-            dst_width as u32,
-            dst_height as u32,
-            converter_dst.tensor().map().unwrap().to_vec(),
-        )
-        .unwrap();
-        let cpu_image = image::RgbaImage::from_vec(
-            dst_width as u32,
-            dst_height as u32,
-            cpu_dst.tensor().map().unwrap().to_vec(),
-        )
-        .unwrap();
-
-        let similarity = image_compare::rgb_similarity_structure(
-            &image_compare::Algorithm::RootMeanSquared,
-            &converter_image.convert(),
-            &cpu_image.convert(),
-        )
-        .expect("Image Comparison failed");
-        assert!(
-            similarity.score > 0.98,
-            "G2D and CPU converted image have similarity score too low: {}",
-            similarity.score
-        );
+        compare_images(&converter_dst, &cpu_dst, 0.98, function!());
     }
 
     #[test]
     fn test_load_with_exif() {
         let file = include_bytes!("../../../testdata/zidane_rotated_exif.jpg").to_vec();
-        let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
+        let loaded = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
-        assert_eq!(src.height(), 1280);
-        assert_eq!(src.width(), 720);
+        assert_eq!(loaded.height(), 1280);
+        assert_eq!(loaded.width(), 720);
+
+        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let cpu_src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
+
+        let (dst_width, dst_height) = (cpu_src.height(), cpu_src.width());
+
+        let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
+        let mut cpu_converter = CPUConverter::new().unwrap();
+
+        cpu_converter
+            .convert(
+                &cpu_src,
+                &mut cpu_dst,
+                Rotation::Clockwise90,
+                Flip::None,
+                None,
+            )
+            .unwrap();
+
+        compare_images(&loaded, &cpu_dst, 0.99, function!());
     }
 
     #[test]
@@ -591,41 +625,16 @@ mod tests {
             TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
         let mut g2d_converter = G2DConverter::new().unwrap();
         g2d_converter
-            .convert(&src, &mut g2d_dst, Rotation::None, None)
+            .convert(&src, &mut g2d_dst, Rotation::None, Flip::None, None)
             .unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
         let mut cpu_converter = CPUConverter::new().unwrap();
         cpu_converter
-            .convert(&src, &mut cpu_dst, Rotation::None, None)
+            .convert(&src, &mut cpu_dst, Rotation::None, Flip::None, None)
             .unwrap();
 
-        let g2d_image = image::RgbaImage::from_vec(
-            dst_width as u32,
-            dst_height as u32,
-            g2d_dst.tensor().map().unwrap().to_vec(),
-        )
-        .unwrap();
-        let cpu_image = image::RgbaImage::from_vec(
-            dst_width as u32,
-            dst_height as u32,
-            cpu_dst.tensor().map().unwrap().to_vec(),
-        )
-        .unwrap();
-
-        let similarity = image_compare::rgb_similarity_structure(
-            &image_compare::Algorithm::RootMeanSquared,
-            &g2d_image.convert(),
-            &cpu_image.convert(),
-        )
-        .expect("Image Comparison failed");
-        assert!(
-            similarity.score > 0.98,
-            "G2D and CPU converted image have similarity score too low: {}",
-            similarity.score
-        );
-
-        drop(g2d_dst);
+        compare_images(&g2d_dst, &cpu_dst, 0.98, function!());
     }
 
     #[test]
@@ -639,7 +648,7 @@ mod tests {
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
         let mut cpu_converter = CPUConverter::new().unwrap();
         cpu_converter
-            .convert(&src, &mut cpu_dst, Rotation::None, None)
+            .convert(&src, &mut cpu_dst, Rotation::None, Flip::None, None)
             .unwrap();
         let mut gl_dst =
             TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
@@ -647,37 +656,10 @@ mod tests {
 
         for _ in 0..5 {
             gl_converter
-                .convert(&src, &mut gl_dst, Rotation::None, None)
+                .convert(&src, &mut gl_dst, Rotation::None, Flip::None, None)
                 .unwrap();
-            // assert!(
-            //     matches!(gl_dst.tensor, edgefirst_tensor::Tensor::DmaOpenGl(_)),
-            //     "GL converted destination is not OpenGL DMA tensor",
-            // );
 
-            let cpu_image = image::RgbaImage::from_vec(
-                dst_width as u32,
-                dst_height as u32,
-                cpu_dst.tensor().map().unwrap().to_vec(),
-            )
-            .unwrap();
-            let opengl_image = image::RgbaImage::from_vec(
-                dst_width as u32,
-                dst_height as u32,
-                gl_dst.tensor().map().unwrap().to_vec(),
-            )
-            .unwrap();
-
-            let similarity = image_compare::rgb_similarity_structure(
-                &image_compare::Algorithm::RootMeanSquared,
-                &opengl_image.convert(),
-                &cpu_image.convert(),
-            )
-            .expect("Image Comparison failed");
-            assert!(
-                similarity.score > 0.98,
-                "OpenGL and CPU converted image have similarity score too low: {}",
-                similarity.score
-            );
+            compare_images(&gl_dst, &cpu_dst, 0.98, function!());
         }
 
         drop(gl_dst);
@@ -705,7 +687,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn test_g2d_crop() {
         let dst_width = 640;
-        let dst_height = 360;
+        let dst_height = 640;
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
         let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
@@ -716,11 +698,12 @@ mod tests {
                 &src,
                 &mut cpu_dst,
                 Rotation::None,
+                Flip::None,
                 Some(Rect {
-                    left: 320,
-                    top: 180,
-                    width: 1280 - 320,
-                    height: 720 - 180,
+                    left: 0,
+                    top: 0,
+                    width: 640,
+                    height: 360,
                 }),
             )
             .unwrap();
@@ -732,41 +715,17 @@ mod tests {
                 &src,
                 &mut g2d_dst,
                 Rotation::None,
+                Flip::None,
                 Some(Rect {
-                    left: 320,
-                    top: 180,
-                    width: 1280 - 320,
-                    height: 720 - 180,
+                    left: 0,
+                    top: 0,
+                    width: 640,
+                    height: 360,
                 }),
             )
             .unwrap();
 
-        let g2d_image = image::RgbaImage::from_vec(
-            dst_width as u32,
-            dst_height as u32,
-            g2d_dst.tensor().map().unwrap().to_vec(),
-        )
-        .unwrap();
-        let cpu_image = image::RgbaImage::from_vec(
-            dst_width as u32,
-            dst_height as u32,
-            cpu_dst.tensor().map().unwrap().to_vec(),
-        )
-        .unwrap();
-
-        let similarity = image_compare::rgb_similarity_structure(
-            &image_compare::Algorithm::RootMeanSquared,
-            &g2d_image.convert(),
-            &cpu_image.convert(),
-        )
-        .expect("Image Comparison failed");
-        assert!(
-            similarity.score > 0.98,
-            "G2D and CPU converted image have similarity score too low: {}",
-            similarity.score
-        );
-
-        drop(g2d_dst);
+        compare_images(&g2d_dst, &cpu_dst, 0.98, function!());
     }
 
     #[test]
@@ -784,6 +743,7 @@ mod tests {
                 &src,
                 &mut cpu_dst,
                 Rotation::None,
+                Flip::None,
                 Some(Rect {
                     left: 320,
                     top: 180,
@@ -803,6 +763,7 @@ mod tests {
                     &src,
                     &mut gl_dst,
                     Rotation::None,
+                    Flip::None,
                     Some(Rect {
                         left: 320,
                         top: 180,
@@ -812,33 +773,8 @@ mod tests {
                 )
                 .unwrap();
 
-            let opengl_image = image::RgbaImage::from_vec(
-                dst_width as u32,
-                dst_height as u32,
-                gl_dst.tensor().map().unwrap().to_vec(),
-            )
-            .unwrap();
-            let cpu_image = image::RgbaImage::from_vec(
-                dst_width as u32,
-                dst_height as u32,
-                cpu_dst.tensor().map().unwrap().to_vec(),
-            )
-            .unwrap();
-
-            let similarity = image_compare::rgb_similarity_structure(
-                &image_compare::Algorithm::RootMeanSquared,
-                &opengl_image.convert(),
-                &cpu_image.convert(),
-            )
-            .expect("Image Comparison failed");
-            assert!(
-                similarity.score > 0.98,
-                "OpenGL and CPU converted image have similarity score too low: {}",
-                similarity.score
-            );
+            compare_images(&gl_dst, &cpu_dst, 0.98, function!());
         }
-
-        drop(gl_dst);
     }
 
     #[test]
@@ -874,47 +810,22 @@ mod tests {
         // After rotating 4 times, the image should be the same as the original
 
         cpu_converter
-            .convert(&src, &mut cpu_dst, rot, None)
+            .convert(&src, &mut cpu_dst, rot, Flip::None, None)
             .unwrap();
 
         cpu_converter
-            .convert(&cpu_dst, &mut src, rot, None)
+            .convert(&cpu_dst, &mut src, rot, Flip::None, None)
             .unwrap();
 
         cpu_converter
-            .convert(&src, &mut cpu_dst, rot, None)
+            .convert(&src, &mut cpu_dst, rot, Flip::None, None)
             .unwrap();
 
         cpu_converter
-            .convert(&cpu_dst, &mut src, rot, None)
+            .convert(&cpu_dst, &mut src, rot, Flip::None, None)
             .unwrap();
 
-        let cpu_image = image::RgbaImage::from_vec(
-            src.width() as u32,
-            src.height() as u32,
-            src.tensor().map().unwrap().to_vec(),
-        )
-        .unwrap();
-
-        let src_image = image::RgbaImage::from_vec(
-            unchanged_src.width() as u32,
-            unchanged_src.height() as u32,
-            unchanged_src.tensor().map().unwrap().to_vec(),
-        )
-        .unwrap();
-
-        let similarity = image_compare::rgb_similarity_structure(
-            &image_compare::Algorithm::RootMeanSquared,
-            &src_image.convert(),
-            &cpu_image.convert(),
-        )
-        .expect("Image Comparison failed");
-        assert!(
-            similarity.score > 0.99,
-            "OpenGL and CPU {:?} converted image have similarity score too low: {}",
-            rot,
-            similarity.score
-        );
+        compare_images(&src, &unchanged_src, 0.99, function!());
     }
 
     #[test]
@@ -955,46 +866,19 @@ mod tests {
         let mut cpu_converter = CPUConverter::new().unwrap();
 
         cpu_converter
-            .convert(&src, &mut cpu_dst, rot, None)
+            .convert(&src, &mut cpu_dst, rot, Flip::None, None)
             .unwrap();
 
         let mut gl_dst = TensorImage::new(dst_width, dst_height, RGBA, tensor_memory).unwrap();
         let mut gl_converter = GLConverter::new_with_size(dst_width, dst_height, false).unwrap();
 
         for _ in 0..5 {
-            gl_converter.convert(&src, &mut gl_dst, rot, None).unwrap();
-            // assert!(
-            //     matches!(gl_dst.tensor, edgefirst_tensor::Tensor::DmaOpenGl(_)),
-            //     "GL converted destination is not OpenGL DMA tensor",
-            // );
+            gl_converter
+                .convert(&src, &mut gl_dst, rot, Flip::None, None)
+                .unwrap();
 
-            let cpu_image = image::RgbaImage::from_vec(
-                dst_width as u32,
-                dst_height as u32,
-                cpu_dst.tensor().map().unwrap().to_vec(),
-            )
-            .unwrap();
-            let opengl_image = image::RgbaImage::from_vec(
-                dst_width as u32,
-                dst_height as u32,
-                gl_dst.tensor().map().unwrap().to_vec(),
-            )
-            .unwrap();
-
-            let similarity = image_compare::rgb_similarity_structure(
-                &image_compare::Algorithm::RootMeanSquared,
-                &opengl_image.convert(),
-                &cpu_image.convert(),
-            )
-            .expect("Image Comparison failed");
-            assert!(
-                similarity.score > 0.98,
-                "OpenGL and CPU converted image have similarity score too low: {}",
-                similarity.score
-            );
+            compare_images(&gl_dst, &cpu_dst, 0.99, function!());
         }
-
-        drop(gl_dst);
     }
 
     #[test]
@@ -1024,44 +908,18 @@ mod tests {
         let mut cpu_converter = CPUConverter::new().unwrap();
 
         cpu_converter
-            .convert(&src, &mut cpu_dst, rot, None)
+            .convert(&src, &mut cpu_dst, rot, Flip::None, None)
             .unwrap();
 
         let mut g2d_dst =
             TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
         let mut g2d_converter = G2DConverter::new().unwrap();
 
-        for _ in 0..5 {
-            g2d_converter
-                .convert(&src, &mut g2d_dst, rot, None)
-                .unwrap();
-
-            let g2d_image = image::RgbaImage::from_vec(
-                dst_width as u32,
-                dst_height as u32,
-                g2d_dst.tensor().map().unwrap().to_vec(),
-            )
-            .unwrap();
-            let cpu_image = image::RgbaImage::from_vec(
-                dst_width as u32,
-                dst_height as u32,
-                cpu_dst.tensor().map().unwrap().to_vec(),
-            )
+        g2d_converter
+            .convert(&src, &mut g2d_dst, rot, Flip::None, None)
             .unwrap();
 
-            let similarity = image_compare::rgb_similarity_structure(
-                &image_compare::Algorithm::RootMeanSquared,
-                &g2d_image.convert(),
-                &cpu_image.convert(),
-            )
-            .expect("Image Comparison failed");
-            assert!(
-                similarity.score > 0.99,
-                "G2D and CPU {:?} converted image have similarity score too low: {}",
-                rot,
-                similarity.score
-            );
-        }
+        compare_images(&g2d_dst, &cpu_dst, 0.99, function!());
     }
 
     #[test]
@@ -1078,30 +936,18 @@ mod tests {
         let mut cpu_converter = CPUConverter::new().unwrap();
 
         cpu_converter
-            .convert(&src, &mut dst, Rotation::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
             .unwrap();
 
-        let cpu_image =
-            image::RgbaImage::from_vec(1280, 720, dst.tensor().map().unwrap().to_vec()).unwrap();
+        let target_image = TensorImage::new(1280, 720, RGBA, None).unwrap();
+        target_image
+            .tensor()
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(include_bytes!("../../../testdata/camera720p.rgba"));
 
-        let target_image = image::RgbaImage::from_vec(
-            1280,
-            720,
-            include_bytes!("../../../testdata/camera720p.rgba").to_vec(),
-        )
-        .unwrap();
-
-        let similarity = image_compare::rgb_similarity_structure(
-            &image_compare::Algorithm::RootMeanSquared,
-            &cpu_image.convert(),
-            &target_image.convert(),
-        )
-        .expect("Image Comparison failed");
-        assert!(
-            similarity.score > 0.99,
-            "CPU converted image and target image have similarity score too low: {}",
-            similarity.score
-        );
+        compare_images(&dst, &target_image, 0.99, function!());
     }
 
     #[test]
@@ -1118,30 +964,26 @@ mod tests {
         let mut cpu_converter = CPUConverter::new().unwrap();
 
         cpu_converter
-            .convert(&src, &mut dst, Rotation::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
             .unwrap();
 
-        let cpu_image =
-            image::RgbImage::from_vec(1280, 720, dst.tensor().map().unwrap().to_vec()).unwrap();
+        let target_image = TensorImage::new(1280, 720, RGB, None).unwrap();
+        target_image
+            .tensor()
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .as_chunks_mut::<3>()
+            .0
+            .iter_mut()
+            .zip(
+                include_bytes!("../../../testdata/camera720p.rgba")
+                    .as_chunks::<4>()
+                    .0,
+            )
+            .for_each(|(dst, src)| *dst = [src[0], src[1], src[2]]);
 
-        let target_image = image::RgbaImage::from_vec(
-            1280,
-            720,
-            include_bytes!("../../../testdata/camera720p.rgba").to_vec(),
-        )
-        .unwrap();
-
-        let similarity = image_compare::rgb_similarity_structure(
-            &image_compare::Algorithm::RootMeanSquared,
-            &cpu_image,
-            &target_image.convert(),
-        )
-        .expect("Image Comparison failed");
-        assert!(
-            similarity.score > 0.99,
-            "CPU converted image and target image have similarity score too low: {}",
-            similarity.score
-        );
+        compare_images(&dst, &target_image, 0.99, function!());
     }
 
     #[test]
@@ -1160,30 +1002,18 @@ mod tests {
         let mut g2d_converter = G2DConverter::new().unwrap();
 
         g2d_converter
-            .convert(&src, &mut dst, Rotation::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
             .unwrap();
 
-        let g2d_image =
-            image::RgbaImage::from_vec(1280, 720, dst.tensor().map().unwrap().to_vec()).unwrap();
+        let target_image = TensorImage::new(1280, 720, RGBA, None).unwrap();
+        target_image
+            .tensor()
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(include_bytes!("../../../testdata/camera720p.rgba"));
 
-        let target_image = image::RgbaImage::from_vec(
-            1280,
-            720,
-            include_bytes!("../../../testdata/camera720p.rgba").to_vec(),
-        )
-        .unwrap();
-
-        let similarity = image_compare::rgb_similarity_structure(
-            &image_compare::Algorithm::RootMeanSquared,
-            &g2d_image.convert(),
-            &target_image.convert(),
-        )
-        .expect("Image Comparison failed");
-        assert!(
-            similarity.score > 0.99,
-            "G2D converted image and target image have similarity score too low: {}",
-            similarity.score
-        );
+        compare_images(&dst, &target_image, 0.99, function!());
     }
 
     #[test]
@@ -1202,30 +1032,18 @@ mod tests {
         let mut gl_converter = GLConverter::new().unwrap();
 
         gl_converter
-            .convert(&src, &mut dst, Rotation::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
             .unwrap();
 
-        let gl_image =
-            image::RgbaImage::from_vec(1280, 720, dst.tensor().map().unwrap().to_vec()).unwrap();
+        let target_image = TensorImage::new(1280, 720, RGBA, None).unwrap();
+        target_image
+            .tensor()
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(include_bytes!("../../../testdata/camera720p.rgba"));
 
-        let target_image = image::RgbaImage::from_vec(
-            1280,
-            720,
-            include_bytes!("../../../testdata/camera720p.rgba").to_vec(),
-        )
-        .unwrap();
-
-        let similarity = image_compare::rgb_similarity_structure(
-            &image_compare::Algorithm::RootMeanSquared,
-            &gl_image.convert(),
-            &target_image.convert(),
-        )
-        .expect("Image Comparison failed");
-        assert!(
-            similarity.score > 0.99,
-            "OpenGL converted image and target image have similarity score too low: {}",
-            similarity.score
-        );
+        compare_images(&dst, &target_image, 0.99, function!());
     }
 
     #[test]
@@ -1245,15 +1063,9 @@ mod tests {
         let mut cpu_converter = CPUConverter::new().unwrap();
 
         cpu_converter
-            .convert(&src, &mut dst, Rotation::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
             .unwrap();
 
-        let cpu_image = image::RgbaImage::from_vec(
-            dst_width as u32,
-            dst_height as u32,
-            dst.tensor().map().unwrap().to_vec(),
-        )
-        .unwrap();
         let mut dst_target = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
         let src_target = load_bytes_to_tensor(
             1280,
@@ -1264,26 +1076,69 @@ mod tests {
         )
         .unwrap();
         cpu_converter
-            .convert(&src_target, &mut dst_target, Rotation::None, None)
+            .convert(
+                &src_target,
+                &mut dst_target,
+                Rotation::None,
+                Flip::None,
+                None,
+            )
             .unwrap();
-        let target_image = image::RgbaImage::from_vec(
-            dst_width as u32,
-            dst_height as u32,
-            dst_target.tensor().map().unwrap().to_vec(),
+
+        compare_images(&dst, &dst_target, 0.99, function!());
+    }
+
+    #[test]
+    fn test_yuyv_to_rgba_crop_flip_g2d() {
+        let src = load_bytes_to_tensor(
+            1280,
+            720,
+            YUYV,
+            Some(TensorMemory::Dma),
+            include_bytes!("../../../testdata/camera720p.yuyv"),
         )
         .unwrap();
 
-        let similarity = image_compare::rgb_similarity_structure(
-            &image_compare::Algorithm::RootMeanSquared,
-            &cpu_image.convert(),
-            &target_image.convert(),
-        )
-        .expect("Image Comparison failed");
-        assert!(
-            similarity.score > 0.99,
-            "CPU converted image and target image have similarity score too low: {}",
-            similarity.score
-        );
+        let (dst_width, dst_height) = (640, 640);
+
+        let mut dst_g2d =
+            TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
+        let mut g2d_converter = G2DConverter::new().unwrap();
+
+        g2d_converter
+            .convert(
+                &src,
+                &mut dst_g2d,
+                Rotation::None,
+                Flip::Horizontal,
+                Some(Rect {
+                    left: 20,
+                    top: 15,
+                    width: 400,
+                    height: 300,
+                }),
+            )
+            .unwrap();
+
+        let mut dst_cpu =
+            TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
+        let mut cpu_converter = CPUConverter::new().unwrap();
+
+        cpu_converter
+            .convert(
+                &src,
+                &mut dst_cpu,
+                Rotation::None,
+                Flip::Horizontal,
+                Some(Rect {
+                    left: 20,
+                    top: 15,
+                    width: 400,
+                    height: 300,
+                }),
+            )
+            .unwrap();
+        compare_images(&dst_g2d, &dst_cpu, 0.99, function!());
     }
 
     fn load_bytes_to_tensor(
@@ -1296,5 +1151,68 @@ mod tests {
         let src = TensorImage::new(width, height, fourcc, memory)?;
         src.tensor().map()?.as_mut_slice().copy_from_slice(bytes);
         Ok(src)
+    }
+
+    fn compare_images(img1: &TensorImage, img2: &TensorImage, threshold: f64, name: &str) {
+        assert_eq!(img1.height(), img2.height(), "Heights differ");
+        assert_eq!(img1.width(), img2.width(), "Widths differ");
+        assert_eq!(img1.fourcc(), img2.fourcc(), "FourCC differ");
+        assert!(
+            matches!(img1.fourcc(), RGB | RGBA,),
+            "FourCC must be RGB or RGBA for comparison"
+        );
+        let image1 = match img1.fourcc() {
+            RGB => image::RgbImage::from_vec(
+                img1.width() as u32,
+                img1.height() as u32,
+                img1.tensor().map().unwrap().to_vec(),
+            )
+            .unwrap(),
+            RGBA => image::RgbaImage::from_vec(
+                img1.width() as u32,
+                img1.height() as u32,
+                img1.tensor().map().unwrap().to_vec(),
+            )
+            .unwrap()
+            .convert(),
+
+            _ => return,
+        };
+
+        let image2 = match img2.fourcc() {
+            RGB => image::RgbImage::from_vec(
+                img2.width() as u32,
+                img2.height() as u32,
+                img2.tensor().map().unwrap().to_vec(),
+            )
+            .unwrap(),
+            RGBA => image::RgbaImage::from_vec(
+                img2.width() as u32,
+                img2.height() as u32,
+                img2.tensor().map().unwrap().to_vec(),
+            )
+            .unwrap()
+            .convert(),
+
+            _ => return,
+        };
+
+        let similarity = image_compare::rgb_similarity_structure(
+            &image_compare::Algorithm::RootMeanSquared,
+            &image1,
+            &image2,
+        )
+        .expect("Image Comparison failed");
+        if similarity.score < threshold {
+            similarity
+                .image
+                .to_color_map()
+                .save(format!("{name}.png"))
+                .unwrap();
+            panic!(
+                "{name}: converted image and target image have similarity score too low: {} < {}",
+                similarity.score, threshold
+            )
+        }
     }
 }

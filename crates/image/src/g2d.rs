@@ -1,6 +1,6 @@
 #![cfg(target_os = "linux")]
 
-use crate::{Error, ImageConverterTrait, Rect, Result, Rotation, TensorImage};
+use crate::{Error, Flip, ImageConverterTrait, Rect, Result, Rotation, TensorImage};
 use edgefirst_tensor::Tensor;
 use g2d_sys::{G2D, G2DFormat, G2DPhysical, G2DSurface};
 use log::debug;
@@ -44,16 +44,23 @@ impl ImageConverterTrait for G2DConverter {
         src: &TensorImage,
         dst: &mut TensorImage,
         rotation: Rotation,
+        flip: Flip,
         crop: Option<Rect>,
     ) -> Result<()> {
         let mut src_surface: G2DSurface = src.try_into()?;
-        let dst_surface: G2DSurface = dst.try_into()?;
+        let mut dst_surface: G2DSurface = dst.try_into()?;
 
-        src_surface.rot = match rotation {
+        src_surface.rot = match flip {
+            Flip::None => g2d_sys::g2d_rotation_G2D_ROTATION_0,
+            Flip::Vertical => g2d_sys::g2d_rotation_G2D_FLIP_V,
+            Flip::Horizontal => g2d_sys::g2d_rotation_G2D_FLIP_H,
+        };
+
+        dst_surface.rot = match rotation {
             Rotation::None => g2d_sys::g2d_rotation_G2D_ROTATION_0,
-            Rotation::Clockwise90 => g2d_sys::g2d_rotation_G2D_ROTATION_270,
+            Rotation::Clockwise90 => g2d_sys::g2d_rotation_G2D_ROTATION_90,
             Rotation::Rotate180 => g2d_sys::g2d_rotation_G2D_ROTATION_180,
-            Rotation::CounterClockwise90 => g2d_sys::g2d_rotation_G2D_ROTATION_90,
+            Rotation::CounterClockwise90 => g2d_sys::g2d_rotation_G2D_ROTATION_270,
         };
 
         if let Some(crop_rect) = crop {

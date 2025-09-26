@@ -25,6 +25,7 @@ pub enum Error {
     #[cfg(target_os = "linux")]
     GbmFrontBuffer(gbm::FrontBufferError),
     OpenGl(String),
+    Internal(String),
 }
 
 impl From<std::io::Error> for Error {
@@ -112,5 +113,11 @@ impl From<gbm::InvalidFdError> for Error {
 impl From<gbm::FrontBufferError> for Error {
     fn from(err: gbm::FrontBufferError) -> Self {
         Error::GbmFrontBuffer(err)
+    }
+}
+
+impl From<ndarray::ShapeError> for Error {
+    fn from(err: ndarray::ShapeError) -> Self {
+        Error::Internal(format!("{err}"))
     }
 }

@@ -17,6 +17,7 @@ pub mod edgefirst_python {
         m.add_class::<image::FourCC>()?;
         m.add_class::<image::PyRect>()?;
         m.add_class::<image::PyRotation>()?;
+        m.add_class::<image::PyFlip>()?;
         m.add_class::<image::PyImageConverter>()?;
         m.add_class::<image::PyTensorImage>()?;
         m.add_class::<decoder::PyDecoder>()?;

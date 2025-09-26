@@ -1,5 +1,6 @@
 use crate::{
-    Error, GREY, ImageConverterTrait, NV12, RGB, RGBA, Rect, Result, Rotation, TensorImage, YUYV,
+    Error, Flip, GREY, ImageConverterTrait, NV12, RGB, RGBA, Rect, Result, Rotation, TensorImage,
+    YUYV,
 };
 use edgefirst_tensor::{TensorMapTrait, TensorTrait};
 use ndarray::{ArrayView3, ArrayViewMut3, Axis};
@@ -35,51 +36,52 @@ impl CPUConverter {
         Ok(Self { resizer, options })
     }
 
-    fn rotate_ndarray(
-        &self,
+    pub(crate) fn flip_rotate_ndarray(
         src_map: &[u8],
         dst_map: &mut [u8],
         dst: &TensorImage,
         rotation: Rotation,
+        flip: Flip,
     ) -> Result<(), crate::Error> {
-        match rotation {
-            Rotation::None => {
-                dst_map.copy_from_slice(src_map);
+        let mut dst_view =
+            ArrayViewMut3::from_shape((dst.height(), dst.width(), dst.channels()), dst_map)?;
+        let mut src_view = match rotation {
+            Rotation::None | Rotation::Rotate180 => {
+                ArrayView3::from_shape((dst.height(), dst.width(), dst.channels()), src_map)?
             }
-            Rotation::Clockwise90 => {
-                let mut src_view =
-                    ArrayView3::from_shape((dst.width(), dst.height(), dst.channels()), src_map)
-                        .expect("rotate src shape incorrect");
-                let mut dst_view =
-                    ArrayViewMut3::from_shape((dst.height(), dst.width(), dst.channels()), dst_map)
-                        .expect("rotate dst shape incorrect");
-                src_view.swap_axes(0, 1);
-                src_view.invert_axis(Axis(1));
-                dst_view.assign(&src_view);
+            Rotation::Clockwise90 | Rotation::CounterClockwise90 => {
+                ArrayView3::from_shape((dst.width(), dst.height(), dst.channels()), src_map)?
             }
-            Rotation::Rotate180 => {
-                let mut src_view =
-                    ArrayView3::from_shape((dst.height(), dst.width(), dst.channels()), src_map)
-                        .expect("rotate src shape incorrect");
-                let mut dst_view =
-                    ArrayViewMut3::from_shape((dst.height(), dst.width(), dst.channels()), dst_map)
-                        .expect("rotate dst shape incorrect");
+        };
+
+        match flip {
+            Flip::None => {}
+            Flip::Vertical => {
                 src_view.invert_axis(Axis(0));
-                src_view.invert_axis(Axis(1));
-                dst_view.assign(&src_view);
             }
-            Rotation::CounterClockwise90 => {
-                let mut src_view =
-                    ArrayView3::from_shape((dst.width(), dst.height(), dst.channels()), src_map)
-                        .expect("rotate src shape incorrect");
-                let mut dst_view =
-                    ArrayViewMut3::from_shape((dst.height(), dst.width(), dst.channels()), dst_map)
-                        .expect("rotate dst shape incorrect");
-                src_view.swap_axes(0, 1);
-                src_view.invert_axis(Axis(0));
-                dst_view.assign(&src_view);
+            Flip::Horizontal => {
+                src_view.invert_axis(Axis(1));
             }
         }
+
+        match rotation {
+            Rotation::None => {}
+            Rotation::Clockwise90 => {
+                src_view.swap_axes(0, 1);
+                src_view.invert_axis(Axis(1));
+            }
+            Rotation::Rotate180 => {
+                src_view.invert_axis(Axis(0));
+                src_view.invert_axis(Axis(1));
+            }
+            Rotation::CounterClockwise90 => {
+                src_view.swap_axes(0, 1);
+                src_view.invert_axis(Axis(0));
+            }
+        }
+
+        dst_view.assign(&src_view);
+
         Ok(())
     }
 
@@ -142,7 +144,7 @@ impl CPUConverter {
         assert_eq!(dst.fourcc(), RGB);
         let src = yuv::YuvPackedImage::<u8> {
             yuy: &src.tensor.map()?,
-            yuy_stride: src.width() as u32 * 2, // we assume packed yuyv
+            yuy_stride: src.row_stride() as u32, // we assume packed yuyv
             width: src.width() as u32,
             height: src.height() as u32,
         };
@@ -325,11 +327,12 @@ impl CPUConverter {
     /// output. If the format is not 1, 3, or 4 bits per pixel, and error will
     /// be returned. The src and dest img must have the same fourcc,
     /// otherwise the function will panic.
-    fn resize_and_rotate(
+    fn resize_flip_rotate(
         &mut self,
         dst: &mut TensorImage,
         src: &TensorImage,
         rotation: Rotation,
+        flip: Flip,
         crop: Option<Rect>,
     ) -> Result<()> {
         assert_eq!(src.fourcc(), dst.fourcc());
@@ -378,8 +381,8 @@ impl CPUConverter {
                 &mut src_map,
                 src_type,
             )?;
-            match rotation {
-                Rotation::None => {
+            match (rotation, flip) {
+                (Rotation::None, Flip::None) => {
                     let mut dst_view = fast_image_resize::images::Image::from_slice_u8(
                         dst.width() as u32,
                         dst.height() as u32,
@@ -388,7 +391,7 @@ impl CPUConverter {
                     )?;
                     self.resizer.resize(&src_view, &mut dst_view, &options)?;
                 }
-                Rotation::Clockwise90 | Rotation::CounterClockwise90 => {
+                (Rotation::Clockwise90, _) | (Rotation::CounterClockwise90, _) => {
                     let mut tmp = vec![0; dst.row_stride() * dst.height()];
                     let mut tmp_view = fast_image_resize::images::Image::from_slice_u8(
                         dst.height() as u32,
@@ -397,9 +400,9 @@ impl CPUConverter {
                         src_type,
                     )?;
                     self.resizer.resize(&src_view, &mut tmp_view, &options)?;
-                    self.rotate_ndarray(&tmp, &mut dst_map, dst, rotation)?;
+                    Self::flip_rotate_ndarray(&tmp, &mut dst_map, dst, rotation, flip)?;
                 }
-                Rotation::Rotate180 => {
+                (Rotation::None, _) | (Rotation::Rotate180, _) => {
                     let mut tmp = vec![0; dst.row_stride() * dst.height()];
                     let mut tmp_view = fast_image_resize::images::Image::from_slice_u8(
                         dst.width() as u32,
@@ -408,11 +411,11 @@ impl CPUConverter {
                         src_type,
                     )?;
                     self.resizer.resize(&src_view, &mut tmp_view, &options)?;
-                    self.rotate_ndarray(&tmp, &mut dst_map, dst, rotation)?;
+                    Self::flip_rotate_ndarray(&tmp, &mut dst_map, dst, rotation, flip)?;
                 }
             }
         } else {
-            self.rotate_ndarray(&src_map, &mut dst_map, dst, rotation)?;
+            Self::flip_rotate_ndarray(&src_map, &mut dst_map, dst, rotation, flip)?;
         }
         Ok(())
     }
@@ -421,10 +424,10 @@ impl CPUConverter {
 impl ImageConverterTrait for CPUConverter {
     fn convert(
         &mut self,
-
         src: &TensorImage,
         dst: &mut TensorImage,
         rotation: Rotation,
+        flip: Flip,
         crop: Option<Rect>,
     ) -> Result<()> {
         let mut src = src;
@@ -437,6 +440,7 @@ impl ImageConverterTrait for CPUConverter {
                 // directly convert into the dest
                 if crop.is_none()
                     && rotation == Rotation::None
+                    && flip == Flip::None
                     && dst.width() == src.width()
                     && dst.height() == src.height()
                 {
@@ -477,6 +481,7 @@ impl ImageConverterTrait for CPUConverter {
                 // directly convert into the dest
                 if crop.is_none()
                     && rotation == Rotation::None
+                    && flip == Flip::None
                     && dst.width() == src.width()
                     && dst.height() == src.height()
                 {
@@ -554,7 +559,7 @@ impl ImageConverterTrait for CPUConverter {
 
         matches!(src.fourcc(), RGB | RGBA | GREY);
         if src.fourcc() == dst.fourcc() {
-            self.resize_and_rotate(dst, src, rotation, crop)?;
+            self.resize_flip_rotate(dst, src, rotation, flip, crop)?;
         } else {
             let mut tmp2 = TensorImage::new(
                 dst.width(),
@@ -562,7 +567,7 @@ impl ImageConverterTrait for CPUConverter {
                 src.fourcc(),
                 Some(edgefirst_tensor::TensorMemory::Mem),
             )?;
-            self.resize_and_rotate(&mut tmp2, src, rotation, crop)?;
+            self.resize_flip_rotate(&mut tmp2, src, rotation, flip, crop)?;
             match (src.fourcc(), dst.fourcc()) {
                 (RGBA, RGB) => self.convert_rgba_to_rgb(&tmp2, dst)?,
                 (RGBA, GREY) => self.convert_rgba_to_grey(&tmp2, dst)?,
