@@ -198,6 +198,11 @@ impl DecoderBuilder {
         self
     }
 
+    pub fn with_config(mut self, config: ConfigOutputs) -> Self {
+        self.config_src.replace(ConfigSource::Config(config));
+        self
+    }
+
     pub fn with_config_yolo_det(mut self, boxes: configs::Boxes) -> Self {
         let config = ConfigOutputs {
             outputs: vec![ConfigOutput::Boxes(boxes)],
