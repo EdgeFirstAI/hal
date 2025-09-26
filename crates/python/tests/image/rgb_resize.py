@@ -1,7 +1,7 @@
-import edgefirst_python
-src = edgefirst_python.TensorImage.load(
-    "../../testdata/zidane.jpg", edgefirst_python.FourCC.RGB)
-dst = edgefirst_python.TensorImage(640, 640)
-converter = edgefirst_python.ImageConverter()
+from edgefirst_python import TensorImage, ImageConverter,  FourCC
+src = TensorImage.load(
+    "../../testdata/zidane.jpg", FourCC.RGB)
+dst = TensorImage(640, 640)
+converter = ImageConverter()
 converter.convert(src, dst)
 n = dst.to_numpy()
