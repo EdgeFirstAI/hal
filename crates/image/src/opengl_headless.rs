@@ -1,4 +1,5 @@
 #![cfg(target_os = "linux")]
+#![cfg(feature = "opengl")]
 use drm::{Device as DrmDevice, buffer::DrmFourcc, control::Device as DrmControlDevice};
 use edgefirst_tensor::TensorTrait;
 use four_char_code::FourCharCode;

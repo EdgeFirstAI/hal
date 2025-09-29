@@ -17,12 +17,16 @@ pub enum Error {
     NotSupported(String),
     InvalidShape(String),
     #[cfg(target_os = "linux")]
+    #[cfg(feature = "opengl")]
     EGL(khronos_egl::Error),
     #[cfg(target_os = "linux")]
+    #[cfg(feature = "opengl")]
     EGLLoad(khronos_egl::LoadError<libloading::Error>),
     #[cfg(target_os = "linux")]
+    #[cfg(feature = "opengl")]
     GbmInvalidFd(gbm::InvalidFdError),
     #[cfg(target_os = "linux")]
+    #[cfg(feature = "opengl")]
     GbmFrontBuffer(gbm::FrontBufferError),
     OpenGl(String),
     Internal(String),
@@ -90,6 +94,7 @@ impl From<edgefirst_tensor::Error> for Error {
 }
 
 #[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
 impl From<khronos_egl::Error> for Error {
     fn from(err: khronos_egl::Error) -> Self {
         Error::EGL(err)
@@ -97,6 +102,7 @@ impl From<khronos_egl::Error> for Error {
 }
 
 #[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
 impl From<khronos_egl::LoadError<libloading::Error>> for Error {
     fn from(err: khronos_egl::LoadError<libloading::Error>) -> Self {
         Error::EGLLoad(err)
@@ -104,12 +110,15 @@ impl From<khronos_egl::LoadError<libloading::Error>> for Error {
 }
 
 #[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
 impl From<gbm::InvalidFdError> for Error {
     fn from(err: gbm::InvalidFdError) -> Self {
         Error::GbmInvalidFd(err)
     }
 }
+
 #[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
 impl From<gbm::FrontBufferError> for Error {
     fn from(err: gbm::FrontBufferError) -> Self {
         Error::GbmFrontBuffer(err)
