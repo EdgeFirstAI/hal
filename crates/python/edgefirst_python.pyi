@@ -11,6 +11,14 @@ SegDetOutput = Tuple[npt.NDArray[np.float32],
 
 
 class Decoder:
+    # [pyo3(signature = (config, score_threshold=0.1, iou_threshold=0.7))]
+    def __init__(
+        config: dict,
+        score_threshold: float = 0.1,
+        iou_threshold: float = 0.7
+    ) -> Decoder:
+        ...
+
     # [pyo3(signature = (json_str, score_threshold=0.1, iou_threshold=0.7))]
     @staticmethod
     def new_from_json_str(
