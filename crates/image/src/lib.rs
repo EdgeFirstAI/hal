@@ -36,6 +36,7 @@ pub const RGBA: FourCharCode = four_char_code!("RGBA");
 pub const RGB: FourCharCode = four_char_code!("RGB ");
 /// 8 bit grayscale, full range
 pub const GREY: FourCharCode = four_char_code!("Y800");
+
 // TODO: planar RGB is 4BPS? https://fourcc.org/8bps/
 
 pub struct TensorImage {
@@ -920,6 +921,47 @@ mod tests {
             .unwrap();
 
         compare_images(&g2d_dst, &cpu_dst, 0.99, function!());
+    }
+
+    #[test]
+    fn test_rgba_to_yuyv_resize_cpu() {
+        let src = load_bytes_to_tensor(
+            1280,
+            720,
+            RGBA,
+            None,
+            include_bytes!("../../../testdata/camera720p.rgba"),
+        )
+        .unwrap();
+
+        let (dst_width, dst_height) = (640, 360);
+
+        let mut dst = TensorImage::new(dst_width, dst_height, YUYV, None).unwrap();
+
+        let mut dst_through_yuyv = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
+        let mut dst_direct = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
+
+        let mut cpu_converter = CPUConverter::new().unwrap();
+
+        cpu_converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .unwrap();
+
+        cpu_converter
+            .convert(
+                &dst,
+                &mut dst_through_yuyv,
+                Rotation::None,
+                Flip::None,
+                None,
+            )
+            .unwrap();
+
+        cpu_converter
+            .convert(&src, &mut dst_direct, Rotation::None, Flip::None, None)
+            .unwrap();
+
+        compare_images(&dst_through_yuyv, &dst_direct, 0.99, function!());
     }
 
     #[test]
