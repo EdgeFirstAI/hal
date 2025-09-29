@@ -66,7 +66,7 @@ impl Headless {
             egl::SURFACE_TYPE,
             egl::WINDOW_BIT,
             egl::RENDERABLE_TYPE,
-            egl::OPENGL_ES2_BIT,
+            egl::OPENGL_ES3_BIT,
             egl::RED_SIZE,
             8,
             egl::GREEN_SIZE,
