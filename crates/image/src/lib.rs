@@ -19,6 +19,7 @@ pub use error::{Error, Result};
 #[cfg(target_os = "linux")]
 pub use g2d::G2DConverter;
 #[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
 pub use opengl_headless::GLConverter;
 use zune_png::PngDecoder;
 mod cpu;
@@ -391,6 +392,7 @@ pub struct ImageConverter {
     #[cfg(target_os = "linux")]
     pub g2d: Option<CPUConverter>,
     #[cfg(target_os = "linux")]
+    #[cfg(feature = "opengl")]
     pub opengl: Option<GLConverter>,
 }
 
@@ -406,7 +408,7 @@ impl ImageConverter {
         };
 
         #[cfg(target_os = "linux")]
-        // let opengl = None;
+        #[cfg(feature = "opengl")]
         let opengl = match GLConverter::new() {
             Ok(gl_converter) => Some(gl_converter),
             Err(err) => {
@@ -414,8 +416,14 @@ impl ImageConverter {
                 None
             }
         };
+
         let cpu = CPUConverter::new()?;
-        Ok(Self { cpu, g2d, opengl })
+        Ok(Self {
+            cpu,
+            g2d,
+            #[cfg(feature = "opengl")]
+            opengl,
+        })
     }
 }
 
@@ -436,6 +444,7 @@ impl ImageConverterTrait for ImageConverter {
         }
 
         #[cfg(target_os = "linux")]
+        #[cfg(feature = "opengl")]
         if let Some(opengl) = self.opengl.as_mut()
             && opengl.convert(src, dst, rotation, flip, crop).is_ok()
         {
