@@ -17,6 +17,11 @@ fn limit_to_full(l: u8) -> u8 {
     (((l as u16 - 16) * 255) / (240 - 16)) as u8
 }
 
+#[inline(always)]
+fn full_to_limit(l: u8) -> u8 {
+    ((l as u16 * (240 - 16)) / 255 + 16) as u8
+}
+
 impl CPUConverter {
     pub fn new() -> Result<Self> {
         let resizer = fast_image_resize::Resizer::new();
@@ -257,6 +262,30 @@ impl CPUConverter {
         )?)
     }
 
+    fn convert_grey_to_yuyv(&self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), GREY);
+        assert_eq!(dst.fourcc(), YUYV);
+
+        let src = src.tensor().map()?;
+        let src = src.as_slice();
+
+        let mut dst = dst.tensor().map()?;
+        let dst = dst.as_mut_slice();
+        for (s, d) in src
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(dst.as_chunks_mut::<4>().0.iter_mut())
+        {
+            d[0] = full_to_limit(s[0]);
+            d[1] = 0;
+
+            d[2] = full_to_limit(s[1]);
+            d[3] = 0;
+        }
+        Ok(())
+    }
+
     fn convert_rgba_to_rgb(&self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), RGBA);
         assert_eq!(dst.fourcc(), RGB);
@@ -290,6 +319,62 @@ impl CPUConverter {
         )?)
     }
 
+    fn convert_rgba_to_yuyv(&self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), RGBA);
+        assert_eq!(dst.fourcc(), YUYV);
+
+        let src = src.tensor().map()?;
+        let src = src.as_slice();
+
+        let mut dst = dst.tensor().map()?;
+        let dst = dst.as_mut_slice();
+
+        // compute quantized Bt.709 limited range RGB to YUV matrix
+        const BIAS: i32 = 20;
+        const Y_R: i32 = (0.2126_f64 * ((235 - 16) * (1 << BIAS)) as f64 / 255.0).round() as i32;
+        const Y_G: i32 = (0.7152_f64 * ((235 - 16) * (1 << BIAS)) as f64 / 255.0).round() as i32;
+        const Y_B: i32 = (((235 - 16) * (1 << BIAS)) as f64 / 255.0).ceil() as i32 - Y_R - Y_G;
+        const U_R: i32 = (-0.114572_f64 * ((240 - 16) * (1 << BIAS)) as f64 / 255.0).round() as i32;
+        const U_B: i32 = (0.5_f64 * ((240 - 16) * (1 << BIAS)) as f64 / 255.0).round() as i32;
+        const U_G: i32 = -U_R - U_B;
+        const V_R: i32 = (0.5_f64 * ((240 - 16) * (1 << BIAS)) as f64 / 255.0).round() as i32;
+        const V_B: i32 = (-0.045847_f64 * ((240 - 16) * (1 << BIAS)) as f64 / 255.0).round() as i32;
+        const V_G: i32 = -V_R - V_B;
+
+        let process_rgba_to_yuyv = |s: &[u8; 8], d: &mut [u8; 4]| {
+            let [r0, g0, b0, _, r1, g1, b1, _] = *s;
+            d[0] = (((Y_R * r0 as i32 + Y_G * g0 as i32 + Y_B * b0 as i32) >> BIAS) + 16) as u8;
+            d[1] = ((((U_R * (r0 as i32) + U_G * (g0 as i32) + U_B * (b0 as i32)) >> BIAS)
+                + ((U_R * (r1 as i32) + U_G * (g1 as i32) + U_B * (b1 as i32)) >> BIAS))
+                / 2
+                + 128) as u8;
+            d[2] = ((Y_R * r1 as i32 + Y_G * g1 as i32 + Y_B * b1 as i32) >> BIAS) as u8 + 16;
+            d[3] = ((((V_R * (r0 as i32) + V_G * (g0 as i32) + V_B * (b0 as i32)) >> BIAS)
+                + ((V_R * (r1 as i32) + V_G * (g1 as i32) + V_B * (b1 as i32)) >> BIAS))
+                / 2
+                + 128) as u8;
+        };
+
+        let src = src.as_chunks::<{ 8 * 32 }>();
+        let dst = dst.as_chunks_mut::<{ 4 * 32 }>();
+
+        for (s, d) in src.0.iter().zip(dst.0.iter_mut()) {
+            let s = s.as_chunks::<8>().0;
+            let d = d.as_chunks_mut::<4>().0;
+            for (s, d) in s.iter().zip(d.iter_mut()) {
+                process_rgba_to_yuyv(s, d);
+            }
+        }
+
+        let s = src.1.as_chunks::<8>().0;
+        let d = dst.1.as_chunks_mut::<4>().0;
+        for (s, d) in s.iter().zip(d.iter_mut()) {
+            process_rgba_to_yuyv(s, d);
+        }
+
+        Ok(())
+    }
+
     fn convert_rgb_to_rgba(&self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), RGB);
         assert_eq!(dst.fourcc(), RGBA);
@@ -321,6 +406,100 @@ impl CPUConverter {
             yuv::YuvRange::Full,
             yuv::YuvStandardMatrix::Bt709,
         )?)
+    }
+
+    fn convert_rgb_to_yuyv(&self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), RGB);
+        assert_eq!(dst.fourcc(), YUYV);
+
+        let src = src.tensor().map()?;
+        let src = src.as_slice();
+
+        let mut dst = dst.tensor().map()?;
+        let dst = dst.as_mut_slice();
+
+        // compute quantized Bt.709 limited range RGB to YUV matrix
+        const BIAS: i32 = 20;
+        const Y_R: i32 = (0.2126_f64 * ((235 - 16) * (1 << BIAS)) as f64 / 255.0).round() as i32;
+        const Y_G: i32 = (0.7152_f64 * ((235 - 16) * (1 << BIAS)) as f64 / 255.0).round() as i32;
+        const Y_B: i32 = (((235 - 16) * (1 << BIAS)) as f64 / 255.0).ceil() as i32 - Y_R - Y_G;
+        const U_R: i32 = (-0.114572_f64 * ((240 - 16) * (1 << BIAS)) as f64 / 255.0).round() as i32;
+        const U_B: i32 = (0.5_f64 * ((240 - 16) * (1 << BIAS)) as f64 / 255.0).round() as i32;
+        const U_G: i32 = -U_R - U_B;
+        const V_R: i32 = (0.5_f64 * ((240 - 16) * (1 << BIAS)) as f64 / 255.0).round() as i32;
+        const V_B: i32 = (-0.045847_f64 * ((240 - 16) * (1 << BIAS)) as f64 / 255.0).round() as i32;
+        const V_G: i32 = -V_R - V_B;
+
+        let process_rgb_to_yuyv = |s: &[u8; 6], d: &mut [u8; 4]| {
+            let [r0, g0, b0, r1, g1, b1] = *s;
+            d[0] = (((Y_R * r0 as i32 + Y_G * g0 as i32 + Y_B * b0 as i32) >> BIAS) + 16) as u8;
+            d[1] = ((((U_R * (r0 as i32) + U_G * (g0 as i32) + U_B * (b0 as i32)) >> BIAS)
+                + ((U_R * (r1 as i32) + U_G * (g1 as i32) + U_B * (b1 as i32)) >> BIAS))
+                / 2
+                + 128) as u8;
+            d[2] = ((Y_R * r1 as i32 + Y_G * g1 as i32 + Y_B * b1 as i32) >> BIAS) as u8 + 16;
+            d[3] = ((((V_R * (r0 as i32) + V_G * (g0 as i32) + V_B * (b0 as i32)) >> BIAS)
+                + ((V_R * (r1 as i32) + V_G * (g1 as i32) + V_B * (b1 as i32)) >> BIAS))
+                / 2
+                + 128) as u8;
+        };
+
+        let src = src.as_chunks::<{ 6 * 32 }>();
+        let dst = dst.as_chunks_mut::<{ 4 * 32 }>();
+        for (s, d) in src.0.iter().zip(dst.0.iter_mut()) {
+            let s = s.as_chunks::<6>().0;
+            let d = d.as_chunks_mut::<4>().0;
+            for (s, d) in s.iter().zip(d.iter_mut()) {
+                process_rgb_to_yuyv(s, d);
+            }
+        }
+
+        let s = src.1.as_chunks::<6>().0;
+        let d = dst.1.as_chunks_mut::<4>().0;
+        for (s, d) in s.iter().zip(d.iter_mut()) {
+            process_rgb_to_yuyv(s, d);
+        }
+
+        Ok(())
+    }
+
+    fn copy_image(&self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), dst.fourcc());
+        dst.tensor().map()?.copy_from_slice(&src.tensor().map()?);
+        Ok(())
+    }
+
+    fn convert_format(&self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        // shapes should be equal
+        assert_eq!(src.height(), dst.height());
+        assert_eq!(src.width(), dst.width());
+
+        match (src.fourcc(), dst.fourcc()) {
+            (NV12, RGB) => self.convert_nv12_to_rgb(src, dst),
+            (NV12, RGBA) => self.convert_nv12_to_rgba(src, dst),
+            (NV12, GREY) => self.convert_nv12_to_grey(src, dst),
+            (YUYV, RGB) => self.convert_yuyv_to_rgb(src, dst),
+            (YUYV, RGBA) => self.convert_yuyv_to_rgba(src, dst),
+            (YUYV, GREY) => self.convert_yuyv_to_grey(src, dst),
+            (YUYV, YUYV) => self.copy_image(src, dst),
+            (RGBA, RGB) => self.convert_rgba_to_rgb(src, dst),
+            (RGBA, RGBA) => self.copy_image(src, dst),
+            (RGBA, GREY) => self.convert_rgba_to_grey(src, dst),
+            (RGBA, YUYV) => self.convert_rgba_to_yuyv(src, dst),
+            (RGB, RGB) => self.copy_image(src, dst),
+            (RGB, RGBA) => self.convert_rgb_to_rgba(src, dst),
+            (RGB, GREY) => self.convert_rgb_to_grey(src, dst),
+            (RGB, YUYV) => self.convert_rgb_to_yuyv(src, dst),
+            (GREY, RGB) => self.convert_grey_to_rgb(src, dst),
+            (GREY, RGBA) => self.convert_grey_to_rgba(src, dst),
+            (GREY, GREY) => self.copy_image(src, dst),
+            (GREY, YUYV) => self.convert_grey_to_yuyv(src, dst),
+            (s, d) => Err(Error::NotSupported(format!(
+                "Conversion from {} to {} is not supported",
+                s.display(),
+                d.display()
+            ))),
+        }
     }
 
     /// The src and dest img should be in RGB/RGBA/grey format for correct
@@ -430,154 +609,78 @@ impl ImageConverterTrait for CPUConverter {
         flip: Flip,
         crop: Option<Rect>,
     ) -> Result<()> {
-        let mut src = src;
-        let mut tmp;
+        // supported destinations and srcs:
+        let intermediate = match (src.fourcc(), dst.fourcc()) {
+            (NV12, RGB) => RGB,
+            (NV12, RGBA) => RGBA,
+            (NV12, GREY) => GREY,
+            (NV12, YUYV) => RGB, // RGB intermediary for YUYV dest resize/convert/rotation/flip
+            (YUYV, RGB) => RGB,
+            (YUYV, RGBA) => RGBA,
+            (YUYV, GREY) => GREY,
+            (YUYV, YUYV) => RGB, // RGB intermediary for YUYV dest resize/convert/rotation/flip
+            (RGBA, RGB) => RGB,
+            (RGBA, RGBA) => RGBA,
+            (RGBA, GREY) => GREY,
+            (RGBA, YUYV) => RGBA, // RGB intermediary for YUYV dest resize/convert/rotation/flip
+            (RGB, RGB) => RGB,
+            (RGB, RGBA) => RGB,
+            (RGB, GREY) => GREY,
+            (RGB, YUYV) => RGB, // RGB intermediary for YUYV dest resize/convert/rotation/flip
+            (GREY, RGB) => RGB,
+            (GREY, RGBA) => RGBA,
+            (GREY, GREY) => GREY,
+            (GREY, YUYV) => GREY,
+            (s, d) => {
+                return Err(Error::NotSupported(format!(
+                    "Conversion from {} to {} is not supported",
+                    s.display(),
+                    d.display()
+                )));
+            }
+        };
 
-        // YUV conversions need to happen at the start
-        match src.fourcc() {
-            YUYV => {
-                // when there is no crop, no rotation, and width/height is the same, we can
-                // directly convert into the dest
-                if crop.is_none()
-                    && rotation == Rotation::None
-                    && flip == Flip::None
-                    && dst.width() == src.width()
-                    && dst.height() == src.height()
-                {
-                    match dst.fourcc() {
-                        RGB => return self.convert_yuyv_to_rgb(src, dst),
-                        RGBA => return self.convert_yuyv_to_rgba(src, dst),
-                        GREY => self.convert_yuyv_to_grey(src, dst)?,
-                        _ => {
-                            return Err(Error::NotSupported(
-                                "YUYV destination not supported".to_string(),
-                            ));
-                        }
-                    }
-                } else {
-                    // otherwise we convert into a temporary buffer that will be used later for
-                    // resize/rotate
-                    tmp = TensorImage::new(
-                        src.width(),
-                        src.height(),
-                        dst.fourcc(),
-                        Some(edgefirst_tensor::TensorMemory::Mem),
-                    )?;
-                    match dst.fourcc() {
-                        RGB => self.convert_yuyv_to_rgb(src, &mut tmp)?,
-                        RGBA => self.convert_yuyv_to_rgba(src, &mut tmp)?,
-                        GREY => self.convert_yuyv_to_grey(src, &mut tmp)?,
-                        _ => {
-                            return Err(Error::NotSupported(
-                                "YUYV destination not supported".to_string(),
-                            ));
-                        }
-                    }
-                    src = &tmp;
-                }
-            }
-            NV12 => {
-                // when there is no crop, no rotation, and width/height is the same, we can
-                // directly convert into the dest
-                if crop.is_none()
-                    && rotation == Rotation::None
-                    && flip == Flip::None
-                    && dst.width() == src.width()
-                    && dst.height() == src.height()
-                {
-                    match dst.fourcc() {
-                        RGB => return self.convert_nv12_to_rgb(src, dst),
-                        RGBA => return self.convert_nv12_to_rgba(src, dst),
-                        GREY => return self.convert_nv12_to_grey(src, dst),
-                        _ => {
-                            return Err(Error::NotSupported(
-                                "destination format not supported".to_string(),
-                            ));
-                        }
-                    }
-                } else {
-                    // otherwise we convert into a temporary buffer that will be used later for
-                    // resize/rotate
-                    tmp = TensorImage::new(
-                        src.width(),
-                        src.height(),
-                        dst.fourcc(),
-                        Some(edgefirst_tensor::TensorMemory::Mem),
-                    )?;
-                    match dst.fourcc() {
-                        RGB => self.convert_nv12_to_rgb(src, &mut tmp)?,
-                        RGBA => self.convert_nv12_to_rgba(src, &mut tmp)?,
-                        GREY => self.convert_nv12_to_grey(src, &mut tmp)?,
-                        _ => {
-                            return Err(Error::NotSupported(
-                                "destination format not supported".to_string(),
-                            ));
-                        }
-                    }
-                    src = &tmp;
-                }
-            }
-            RGB | RGBA => {
-                // we do the RGB/RGBA conversion early only when enlarging the image
-                // This is faster than doing it later
+        // check if a direct conversion can be done
+        if crop.is_none()
+            && rotation == Rotation::None
+            && flip == Flip::None
+            && dst.width() == src.width()
+            && dst.height() == src.height()
+        {
+            return self.convert_format(src, dst);
+        };
 
-                // we always do Greyscale conversion early
-                if src.fourcc() != dst.fourcc()
-                    && (src.width() * src.height() < dst.width() * dst.height()
-                        || dst.fourcc() == GREY)
-                {
-                    tmp = TensorImage::new(
-                        src.width(),
-                        src.height(),
-                        dst.fourcc(),
-                        Some(edgefirst_tensor::TensorMemory::Mem),
-                    )?;
-                    match (src.fourcc(), dst.fourcc()) {
-                        (RGBA, RGB) => self.convert_rgba_to_rgb(src, &mut tmp)?,
-                        (RGBA, GREY) => self.convert_rgba_to_grey(src, &mut tmp)?,
-                        (RGB, RGBA) => self.convert_rgb_to_rgba(src, &mut tmp)?,
-                        (RGB, GREY) => self.convert_rgb_to_grey(src, &mut tmp)?,
-                        (GREY, RGB) => self.convert_grey_to_rgb(src, &mut tmp)?,
-                        (GREY, RGBA) => self.convert_grey_to_rgba(src, &mut tmp)?,
-                        (RGBA, RGBA) | (RGB, RGB) | (GREY, GREY) => {} // this is unreachable
-                        _ => {
-                            return Err(Error::NotSupported(
-                                "destination format not supported".to_string(),
-                            ));
-                        }
-                    }
-                    src = &tmp;
-                }
-            }
-            GREY => {
-                // we never convert away from Greyscale early
-            }
-            _ => {
-                return Err(Error::NotSupported("unknown format".to_string()));
-            }
+        // any extra checks
+        if dst.fourcc() == YUYV && !dst.width().is_multiple_of(2) {
+            return Err(Error::NotSupported(format!(
+                "{} destination must have width divisible by 2",
+                dst.fourcc().display(),
+            )));
         }
 
-        matches!(src.fourcc(), RGB | RGBA | GREY);
-        if src.fourcc() == dst.fourcc() {
-            self.resize_flip_rotate(dst, src, rotation, flip, crop)?;
+        // create tmp buffer
+        let mut tmp = TensorImage::new(
+            src.width(),
+            src.height(),
+            intermediate,
+            Some(edgefirst_tensor::TensorMemory::Mem),
+        )?;
+
+        self.convert_format(src, &mut tmp)?;
+
+        // format must be RGB/RGBA/GREY
+        matches!(tmp.fourcc(), RGB | RGBA | GREY);
+        if tmp.fourcc() == dst.fourcc() {
+            self.resize_flip_rotate(dst, &tmp, rotation, flip, crop)?;
         } else {
             let mut tmp2 = TensorImage::new(
                 dst.width(),
                 dst.height(),
-                src.fourcc(),
+                tmp.fourcc(),
                 Some(edgefirst_tensor::TensorMemory::Mem),
             )?;
-            self.resize_flip_rotate(&mut tmp2, src, rotation, flip, crop)?;
-            match (src.fourcc(), dst.fourcc()) {
-                (RGBA, RGB) => self.convert_rgba_to_rgb(&tmp2, dst)?,
-                (RGBA, GREY) => self.convert_rgba_to_grey(&tmp2, dst)?,
-                (RGB, RGBA) => self.convert_rgb_to_rgba(&tmp2, dst)?,
-                (RGB, GREY) => self.convert_rgb_to_grey(&tmp2, dst)?,
-                (GREY, RGB) => self.convert_grey_to_rgb(&tmp2, dst)?,
-                (GREY, RGBA) => self.convert_grey_to_rgba(&tmp2, dst)?,
-                (RGBA, RGBA) | (RGB, RGB) | (GREY, GREY) => {} // this is unreachable
-                _ => unreachable!(),
-            }
+            self.resize_flip_rotate(&mut tmp2, &tmp, rotation, flip, crop)?;
+            self.convert_format(&tmp2, dst)?;
         }
 
         Ok(())

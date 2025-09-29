@@ -415,6 +415,28 @@ fn convert_cpu(bencher: divan::Bencher, params: (usize, usize)) {
     });
 }
 
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn convert_cpu_rgba_to_yuyv(bencher: divan::Bencher, params: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera720p.rgba").to_vec();
+    let src = TensorImage::new(1280, 720, RGBA, None).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = params;
+    let mut dst = TensorImage::new(width, height, YUYV, None).unwrap();
+
+    let mut converter = CPUConverter::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .unwrap()
+    });
+}
+
 #[divan::bench(types = [Jaguar, Person, Zidane])]
 fn convert_cpu_rgba_to_rgb<IMAGE>(bencher: divan::Bencher)
 where
