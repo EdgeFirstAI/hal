@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 use crate::{
     TensorMap, TensorMapTrait, TensorMemory, TensorTrait,
     error::{Error, Result},
