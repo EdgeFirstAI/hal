@@ -1,4 +1,3 @@
-#![cfg(target_os = "linux")]
 #![allow(dead_code)]
 use nix::{ioctl_read, ioctl_write_ptr};
 use std::os::fd::{AsRawFd, OwnedFd};
