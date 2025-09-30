@@ -348,6 +348,18 @@ fn test_dequantize() -> PyResult<()> {
 }
 
 #[test]
+fn test_nms_against_tensorflow() -> PyResult<()> {
+    pyo3::append_to_inittab!(edgefirst_python);
+    pyo3::prepare_freethreaded_python();
+    Python::with_gil(|py| {
+        let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
+        py.run(c_str!(include_str!("decoder/nms.py")), None, Some(&out))?;
+
+        Ok(())
+    })
+}
+
+#[test]
 fn test_import_numpy() -> PyResult<()> {
     pyo3::prepare_freethreaded_python();
     Python::with_gil(|py| {
