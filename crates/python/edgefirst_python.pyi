@@ -1,22 +1,23 @@
 import numpy as np
 import numpy.typing as npt
-from typing import Union, Tuple
+from typing import Union, Tuple, List
 import enum
 
 
 DetectionOutput = Tuple[npt.NDArray[np.float32],
                         npt.NDArray[np.float32], npt.NDArray[np.uintp]]
 SegDetOutput = Tuple[npt.NDArray[np.float32],
-                     npt.NDArray[np.float32], npt.NDArray[np.uintp], list[npt.NDArray[np.uint8]]]
+                     npt.NDArray[np.float32], npt.NDArray[np.uintp], List[npt.NDArray[np.uint8]]]
 
 
 class Decoder:
     # [pyo3(signature = (config, score_threshold=0.1, iou_threshold=0.7))]
     def __init__(
+        self,
         config: dict,
         score_threshold: float = 0.1,
         iou_threshold: float = 0.7
-    ) -> Decoder:
+    ) -> None:
         ...
 
     # [pyo3(signature = (json_str, score_threshold=0.1, iou_threshold=0.7))]
@@ -39,7 +40,8 @@ class Decoder:
 
     # [pyo3(signature = (model_output, max_boxes=100))]
     def decode(
-        model_output: list[np.ndarray],
+        self,
+        model_output: List[np.ndarray],
         max_boxes=100
     ) -> SegDetOutput:
         ...
@@ -48,7 +50,7 @@ class Decoder:
     @staticmethod
     def decode_yolo(
         model_output: Union[npt.NDArray[np.uint8], npt.NDArray[np.int8], npt.NDArray[np.float32], npt.NDArray[np.float64]],
-        quant_boxes: tuple[float, int] = (1.0, 0),
+        quant_boxes: Tuple[float, int] = (1.0, 0),
         score_threshold: float = 0.1,
         iou_threshold: float = 0.7,
         max_boxes: int = 100
@@ -56,12 +58,12 @@ class Decoder:
         ...
 
     # [pyo3(signature = (boxes, protos, quant_boxes=(1.0, 0), quant_protos=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
-
+    @staticmethod
     def decode_yolo_segdet(
         boxes: Union[npt.NDArray[np.uint8], npt.NDArray[np.int8], npt.NDArray[np.float32]],
         protos: Union[npt.NDArray[np.uint8], npt.NDArray[np.int8], npt.NDArray[np.float32]],
-        quant_boxes: tuple[float, int] = (1.0, 0),
-        quant_protos: tuple[float, int] = (1.0, 0),
+        quant_boxes: Tuple[float, int] = (1.0, 0),
+        quant_protos: Tuple[float, int] = (1.0, 0),
         score_threshold: float = 0.1,
         iou_threshold: float = 0.7,
         max_boxes: int = 100
@@ -73,8 +75,8 @@ class Decoder:
     def decode_modelpack_det(
         boxes: Union[npt.NDArray[np.uint8], npt.NDArray[np.int8], npt.NDArray[np.float32]],
         scores: Union[npt.NDArray[np.uint8], npt.NDArray[np.int8], npt.NDArray[np.float32]],
-        quant_boxes: tuple[float, int] = (1.0, 0),
-        quant_scores: tuple[float, int] = (1.0, 0),
+        quant_boxes: Tuple[float, int] = (1.0, 0),
+        quant_scores: Tuple[float, int] = (1.0, 0),
         score_threshold: float = 0.1,
         iou_threshold: float = 0.7,
         max_boxes: int = 100
@@ -84,9 +86,9 @@ class Decoder:
     # [pyo3(signature = (boxes, anchors, quant=Vec::new(), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
     @staticmethod
     def decode_modelpack_det_split(
-        boxes: list[Union[npt.NDArray[np.uint8], npt.NDArray[np.int8], npt.NDArray[np.float32]]],
-        anchors: list[list[list[int]]],
-        quant: list[tuple[float, int]] = [],
+        boxes: List[Union[npt.NDArray[np.uint8], npt.NDArray[np.int8], npt.NDArray[np.float32]]],
+        anchors: List[List[List[float]]],
+        quant: List[Tuple[float, int]] = [],
         score_threshold: float = 0.1,
         iou_threshold: float = 0.7,
         max_boxes: int = 100
@@ -97,7 +99,7 @@ class Decoder:
     @staticmethod
     def dequantize(
         quantized: Union[npt.NDArray[np.uint8], npt.NDArray[np.int8]],
-        quant_boxes: tuple[float, int],
+        quant_boxes: Tuple[float, int],
         dequant_into: Union[npt.NDArray[np.float32], npt.NDArray[np.float64]]
     ) -> None:
         ...
@@ -105,6 +107,22 @@ class Decoder:
     # [pyo3(signature = (segmentation))]
     @staticmethod
     def segmentation_to_mask(segmentation: npt.NDArray[np.uint8]) -> None:
+        ...
+
+    @property
+    def score_threshold(self) -> float:
+        ...
+
+    @score_threshold.setter
+    def score_threshold(self, value: float):
+        ...
+
+    @property
+    def iou_threshold(self) -> float:
+        ...
+
+    @iou_threshold.setter
+    def iou_threshold(self, value: float):
         ...
 
 
@@ -115,13 +133,13 @@ class FourCC(enum.Enum):
     NV12: FourCC
     GREY: FourCC
 
-    def __init__(fourcc: str):
+    def __init__(self, fourcc: str) -> None:
         ...
 
 
 class TensorImage:
 
-    def __init__(width: int, height: int, fourcc: FourCC) -> TensorImage:
+    def __init__(self, width: int, height: int, fourcc: FourCC) -> None:
         ...
 
     # [pyo3(signature = (data, fourcc = FourCC::RGB))]
@@ -183,7 +201,7 @@ class Rotation(enum.Enum):
 
 class Rect:
 
-    def __init__(left: int, top: int, width: int, height: int) -> Rect:
+    def __init__(self, left: int, top: int, width: int, height: int):
         ...
 
     @property
@@ -204,9 +222,9 @@ class Rect:
 
 
 class ImageConverter:
-    def __init__() -> ImageConverter:
+    def __init__(self) -> None:
         ...
 
     # [pyo3(signature = (src, dst, rotation = Rotation::Rotate0, crop = None))]
-    def convert(src: TensorImage, dst: TensorImage, rotation: Rotation = Rotation.Rotate0, flip: Flip = Flip.NoFlip, crop: Rect | None = None) -> None:
+    def convert(self, src: TensorImage, dst: TensorImage, rotation: Rotation = Rotation.Rotate0, flip: Flip = Flip.NoFlip, crop: Rect | None = None) -> None:
         ...
