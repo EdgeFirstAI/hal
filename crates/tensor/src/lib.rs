@@ -1,22 +1,26 @@
-pub use error::{Error, Result};
-
-pub use crate::{
-    dma::{DmaMap, DmaTensor},
-    mem::{MemMap, MemTensor},
-    shm::{ShmMap, ShmTensor},
-};
-use num_traits::Num;
-use std::{
-    fmt,
-    ops::{Deref, DerefMut},
-    os::fd::OwnedFd,
-};
-
+#[cfg(target_os = "linux")]
 mod dma;
+#[cfg(target_os = "linux")]
 mod dmabuf;
 mod error;
 mod mem;
+#[cfg(target_os = "linux")]
 mod shm;
+
+pub use crate::mem::{MemMap, MemTensor};
+#[cfg(target_os = "linux")]
+pub use crate::{
+    dma::{DmaMap, DmaTensor},
+    shm::{ShmMap, ShmTensor},
+};
+pub use error::{Error, Result};
+use num_traits::Num;
+#[cfg(target_os = "linux")]
+use std::os::fd::OwnedFd;
+use std::{
+    fmt,
+    ops::{Deref, DerefMut},
+};
 
 #[cfg(target_os = "linux")]
 use nix::sys::stat::{major, minor};
@@ -29,11 +33,13 @@ where
     where
         Self: Sized;
 
-    fn from_fd(fd: OwnedFd, shape: &[usize], name: Option<&str>) -> Result<Self>
+    #[cfg(target_os = "linux")]
+    fn from_fd(fd: std::os::fd::OwnedFd, shape: &[usize], name: Option<&str>) -> Result<Self>
     where
         Self: Sized;
 
-    fn clone_fd(&self) -> Result<OwnedFd>;
+    #[cfg(target_os = "linux")]
+    fn clone_fd(&self) -> Result<std::os::fd::OwnedFd>;
 
     fn memory(&self) -> TensorMemory;
 
@@ -104,7 +110,9 @@ where
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TensorMemory {
+    #[cfg(target_os = "linux")]
     Dma,
+    #[cfg(target_os = "linux")]
     Shm,
     Mem,
 }
@@ -112,7 +120,9 @@ pub enum TensorMemory {
 impl From<TensorMemory> for String {
     fn from(memory: TensorMemory) -> Self {
         match memory {
+            #[cfg(target_os = "linux")]
             TensorMemory::Dma => "dma".to_owned(),
+            #[cfg(target_os = "linux")]
             TensorMemory::Shm => "shm".to_owned(),
             TensorMemory::Mem => "mem".to_owned(),
         }
@@ -124,7 +134,9 @@ impl TryFrom<&str> for TensorMemory {
 
     fn try_from(s: &str) -> Result<Self> {
         match s {
+            #[cfg(target_os = "linux")]
             "dma" => Ok(TensorMemory::Dma),
+            #[cfg(target_os = "linux")]
             "shm" => Ok(TensorMemory::Shm),
             "mem" => Ok(TensorMemory::Mem),
             _ => Err(Error::InvalidMemoryType(s.to_owned())),
@@ -136,7 +148,9 @@ pub enum Tensor<T>
 where
     T: Num + Clone + fmt::Debug,
 {
+    #[cfg(target_os = "linux")]
     Dma(DmaTensor<T>),
+    #[cfg(target_os = "linux")]
     Shm(ShmTensor<T>),
     Mem(MemTensor<T>),
 }
@@ -147,16 +161,23 @@ where
 {
     pub fn new(shape: &[usize], memory: Option<TensorMemory>, name: Option<&str>) -> Result<Self> {
         match memory {
+            #[cfg(target_os = "linux")]
             Some(TensorMemory::Dma) => DmaTensor::<T>::new(shape, name).map(Tensor::Dma),
+            #[cfg(target_os = "linux")]
             Some(TensorMemory::Shm) => ShmTensor::<T>::new(shape, name).map(Tensor::Shm),
             Some(TensorMemory::Mem) => MemTensor::<T>::new(shape, name).map(Tensor::Mem),
-            None => match DmaTensor::<T>::new(shape, name) {
-                Ok(tensor) => Ok(Tensor::Dma(tensor)),
-                Err(_) => match ShmTensor::<T>::new(shape, name).map(Tensor::Shm) {
-                    Ok(tensor) => Ok(tensor),
-                    Err(_) => MemTensor::<T>::new(shape, name).map(Tensor::Mem),
-                },
-            },
+            None => {
+                #[cfg(target_os = "linux")]
+                match DmaTensor::<T>::new(shape, name) {
+                    Ok(tensor) => Ok(Tensor::Dma(tensor)),
+                    Err(_) => match ShmTensor::<T>::new(shape, name).map(Tensor::Shm) {
+                        Ok(tensor) => Ok(tensor),
+                        Err(_) => MemTensor::<T>::new(shape, name).map(Tensor::Mem),
+                    },
+                }
+                #[cfg(not(target_os = "linux"))]
+                MemTensor::<T>::new(shape, name).map(Tensor::Mem)
+            }
         }
     }
 }
@@ -196,21 +217,7 @@ where
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
-    fn from_fd(fd: OwnedFd, shape: &[usize], name: Option<&str>) -> Result<Self> {
-        if shape.is_empty() {
-            return Err(Error::InvalidSize(0));
-        }
-
-        let size = shape.iter().product::<usize>() * std::mem::size_of::<T>();
-        if size == 0 {
-            return Err(Error::InvalidSize(0));
-        }
-
-        // Default to shared memory for non-Linux platforms
-        ShmTensor::<T>::from_fd(fd, shape, name).map(Tensor::Shm)
-    }
-
+    #[cfg(target_os = "linux")]
     fn clone_fd(&self) -> Result<OwnedFd> {
         match self {
             Tensor::Dma(t) => t.clone_fd(),
@@ -221,7 +228,9 @@ where
 
     fn memory(&self) -> TensorMemory {
         match self {
+            #[cfg(target_os = "linux")]
             Tensor::Dma(_) => TensorMemory::Dma,
+            #[cfg(target_os = "linux")]
             Tensor::Shm(_) => TensorMemory::Shm,
             Tensor::Mem(_) => TensorMemory::Mem,
         }
@@ -229,7 +238,9 @@ where
 
     fn name(&self) -> String {
         match self {
+            #[cfg(target_os = "linux")]
             Tensor::Dma(t) => t.name(),
+            #[cfg(target_os = "linux")]
             Tensor::Shm(t) => t.name(),
             Tensor::Mem(t) => t.name(),
         }
@@ -237,7 +248,9 @@ where
 
     fn shape(&self) -> &[usize] {
         match self {
+            #[cfg(target_os = "linux")]
             Tensor::Dma(t) => t.shape(),
+            #[cfg(target_os = "linux")]
             Tensor::Shm(t) => t.shape(),
             Tensor::Mem(t) => t.shape(),
         }
@@ -245,7 +258,9 @@ where
 
     fn reshape(&mut self, shape: &[usize]) -> Result<()> {
         match self {
+            #[cfg(target_os = "linux")]
             Tensor::Dma(t) => t.reshape(shape),
+            #[cfg(target_os = "linux")]
             Tensor::Shm(t) => t.reshape(shape),
             Tensor::Mem(t) => t.reshape(shape),
         }
@@ -253,7 +268,9 @@ where
 
     fn map(&self) -> Result<TensorMap<T>> {
         match self {
+            #[cfg(target_os = "linux")]
             Tensor::Dma(t) => t.map(),
+            #[cfg(target_os = "linux")]
             Tensor::Shm(t) => t.map(),
             Tensor::Mem(t) => t.map(),
         }
@@ -264,7 +281,9 @@ pub enum TensorMap<T>
 where
     T: Num + Clone + fmt::Debug,
 {
+    #[cfg(target_os = "linux")]
     Dma(DmaMap<T>),
+    #[cfg(target_os = "linux")]
     Shm(ShmMap<T>),
     Mem(MemMap<T>),
 }
@@ -275,7 +294,9 @@ where
 {
     fn shape(&self) -> &[usize] {
         match self {
+            #[cfg(target_os = "linux")]
             TensorMap::Dma(map) => map.shape(),
+            #[cfg(target_os = "linux")]
             TensorMap::Shm(map) => map.shape(),
             TensorMap::Mem(map) => map.shape(),
         }
@@ -283,7 +304,9 @@ where
 
     fn unmap(&mut self) {
         match self {
+            #[cfg(target_os = "linux")]
             TensorMap::Dma(map) => map.unmap(),
+            #[cfg(target_os = "linux")]
             TensorMap::Shm(map) => map.unmap(),
             TensorMap::Mem(map) => map.unmap(),
         }
@@ -291,7 +314,9 @@ where
 
     fn as_slice(&self) -> &[T] {
         match self {
+            #[cfg(target_os = "linux")]
             TensorMap::Dma(map) => map.as_slice(),
+            #[cfg(target_os = "linux")]
             TensorMap::Shm(map) => map.as_slice(),
             TensorMap::Mem(map) => map.as_slice(),
         }
@@ -299,7 +324,9 @@ where
 
     fn as_mut_slice(&mut self) -> &mut [T] {
         match self {
+            #[cfg(target_os = "linux")]
             TensorMap::Dma(map) => map.as_mut_slice(),
+            #[cfg(target_os = "linux")]
             TensorMap::Shm(map) => map.as_mut_slice(),
             TensorMap::Mem(map) => map.as_mut_slice(),
         }
@@ -314,7 +341,9 @@ where
 
     fn deref(&self) -> &[T] {
         match self {
+            #[cfg(target_os = "linux")]
             TensorMap::Dma(map) => map.deref(),
+            #[cfg(target_os = "linux")]
             TensorMap::Shm(map) => map.deref(),
             TensorMap::Mem(map) => map.deref(),
         }
@@ -327,7 +356,9 @@ where
 {
     fn deref_mut(&mut self) -> &mut [T] {
         match self {
+            #[cfg(target_os = "linux")]
             TensorMap::Dma(map) => map.deref_mut(),
+            #[cfg(target_os = "linux")]
             TensorMap::Shm(map) => map.deref_mut(),
             TensorMap::Mem(map) => map.deref_mut(),
         }
@@ -336,6 +367,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
     use nix::unistd::{AccessFlags, access};
     use std::io::Write as _;
 
@@ -347,6 +379,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_tensor() {
         let shape = vec![1];
         let tensor = DmaTensor::<f32>::new(&shape, Some("dma_tensor"));
@@ -360,6 +393,15 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn test_tensor() {
+        let shape = vec![1];
+        let tensor = Tensor::<f32>::new(&shape, None, None).expect("Failed to create tensor");
+        assert_eq!(tensor.memory(), TensorMemory::Mem);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn test_dma_tensor() {
         match access(
             "/dev/dma_heap/linux,cma",
@@ -456,6 +498,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_shm_tensor() {
         let shape = vec![2, 3, 4];
         let tensor =

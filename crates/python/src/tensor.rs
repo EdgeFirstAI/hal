@@ -254,7 +254,9 @@ impl PyTensor {
         name: Option<&str>,
     ) -> Result<Self> {
         let memory = match memory {
+            #[cfg(target_os = "linux")]
             Some("dma") => Some(tensor::TensorMemory::Dma),
+            #[cfg(target_os = "linux")]
             Some("shm") => Some(tensor::TensorMemory::Shm),
             Some(inv) => return Err(Error::UnsupportedMemoryType(inv.to_string())),
             None => None,
@@ -290,7 +292,9 @@ impl PyTensor {
     #[getter]
     fn memory(&self) -> String {
         match self.0.memory() {
+            #[cfg(target_os = "linux")]
             tensor::TensorMemory::Shm => "shm".to_string(),
+            #[cfg(target_os = "linux")]
             tensor::TensorMemory::Dma => "dma".to_string(),
             tensor::TensorMemory::Mem => "mem".to_string(),
         }
