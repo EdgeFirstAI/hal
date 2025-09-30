@@ -431,11 +431,15 @@ impl DecoderBuilder {
 
 pub struct Decoder {
     model_type: ModelType,
-    iou_threshold: f32,
-    score_threshold: f32,
+    pub iou_threshold: f32,
+    pub score_threshold: f32,
 }
 
 impl Decoder {
+    pub fn model_type(&self) -> &ModelType {
+        &self.model_type
+    }
+
     pub fn decode_u8(
         &self,
         outputs: &[ArrayViewD<u8>],
