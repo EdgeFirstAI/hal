@@ -138,8 +138,8 @@ class FourCC(enum.Enum):
 
 
 class TensorImage:
-
-    def __init__(self, width: int, height: int, fourcc: FourCC) -> None:
+    # [pyo3(signature = (width, height, fourcc = FourCC::RGB))]
+    def __init__(self, width: int, height: int, fourcc: FourCC = FourCC.RGB) -> None:
         ...
 
     # [pyo3(signature = (data, fourcc = FourCC::RGB))]

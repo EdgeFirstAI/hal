@@ -441,6 +441,7 @@ impl ImageConverterTrait for ImageConverter {
         if let Some(g2d) = self.g2d.as_mut()
             && g2d.convert(src, dst, rotation, flip, crop).is_ok()
         {
+            log::debug!("image converted with g2d");
             return Ok(());
         }
 
@@ -449,10 +450,13 @@ impl ImageConverterTrait for ImageConverter {
         if let Some(opengl) = self.opengl.as_mut()
             && opengl.convert(src, dst, rotation, flip, crop).is_ok()
         {
+            log::debug!("image converted with opengl");
             return Ok(());
         }
 
-        self.cpu.convert(src, dst, rotation, flip, crop)
+        self.cpu.convert(src, dst, rotation, flip, crop)?;
+        log::debug!("image converted with cpu");
+        Ok(())
     }
 }
 
