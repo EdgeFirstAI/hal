@@ -1,6 +1,8 @@
 #![cfg(target_os = "linux")]
 
-use crate::{Error, Flip, ImageConverterTrait, Rect, Result, Rotation, TensorImage};
+use crate::{
+    Error, Flip, GREY, ImageConverterTrait, NV12, RGB, Rect, Result, Rotation, TensorImage, YUYV,
+};
 use edgefirst_tensor::Tensor;
 use g2d_sys::{G2D, G2DFormat, G2DPhysical, G2DSurface};
 use log::debug;
@@ -47,6 +49,12 @@ impl ImageConverterTrait for G2DConverter {
         flip: Flip,
         crop: Option<Rect>,
     ) -> Result<()> {
+        if matches!(dst.fourcc(), YUYV | GREY | NV12 | RGB) {
+            return Err(Error::NotSupported(format!(
+                "G2D does not support {} destination",
+                dst.fourcc().display()
+            )));
+        }
         let mut src_surface: G2DSurface = src.try_into()?;
         let mut dst_surface: G2DSurface = dst.try_into()?;
 
