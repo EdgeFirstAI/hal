@@ -580,6 +580,28 @@ impl PyDecoder {
     ) -> Bound<'py, PyArray2<u8>> {
         segmentation_to_mask(segmentation.as_array()).to_pyarray(segmentation.py())
     }
+
+    #[getter(score_threshold)]
+    fn get_score_threshold(&self) -> PyResult<f32> {
+        Ok(self.decoder.score_threshold)
+    }
+
+    #[setter(score_threshold)]
+    fn set_score_threshold(&mut self, value: f32) -> PyResult<()> {
+        self.decoder.score_threshold = value;
+        Ok(())
+    }
+
+    #[getter(iou_threshold)]
+    fn get_iou_threshold(&self) -> PyResult<f32> {
+        Ok(self.decoder.iou_threshold)
+    }
+
+    #[setter(iou_threshold)]
+    fn set_iou_threshold(&mut self, value: f32) -> PyResult<()> {
+        self.decoder.iou_threshold = value;
+        Ok(())
+    }
 }
 
 fn convert_detect_box<'py>(py: Python<'py>, output_boxes: &[DetectBox]) -> PyDetOutput<'py> {
