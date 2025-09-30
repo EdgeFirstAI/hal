@@ -1,6 +1,10 @@
+#[cfg(target_os = "linux")]
+use edgefirst_image::G2DConverter;
+#[cfg(feature = "opengl")]
+#[cfg(target_os = "linux")]
+use edgefirst_image::GLConverter;
 use edgefirst_image::{
-    CPUConverter, Flip, GLConverter, GREY, ImageConverterTrait as _, RGB, RGBA, Rotation,
-    TensorImage, YUYV,
+    CPUConverter, Flip, GREY, ImageConverterTrait as _, RGB, RGBA, Rotation, TensorImage, YUYV,
 };
 use edgefirst_tensor::{TensorMapTrait, TensorMemory, TensorTrait};
 use std::path::Path;
@@ -74,6 +78,7 @@ where
     });
 }
 
+#[cfg(target_os = "linux")]
 #[divan::bench(types = [Jaguar, Person, Zidane])]
 fn load_image_shm<IMAGE>(bencher: divan::Bencher)
 where
@@ -216,7 +221,7 @@ fn resize_g2d<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
 where
     IMAGE: TestImage,
 {
-    use edgefirst_image::CPUConverter;
+    use edgefirst_image::G2DConverter;
 
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
@@ -239,7 +244,7 @@ where
     let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
     let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
 
-    let mut converter = CPUConverter::new().unwrap();
+    let mut converter = G2DConverter::new().unwrap();
 
     bencher.bench_local(|| {
         converter
@@ -249,6 +254,7 @@ where
 }
 
 #[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
 #[divan::bench(types = [Person, Zidane], args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
 fn resize_opengl_mem<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
 where
@@ -287,6 +293,7 @@ where
 }
 
 #[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
 #[divan::bench(types = [Person, Zidane], args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
 fn resize_opengl_dma<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
 where
@@ -346,6 +353,8 @@ fn rotate_cpu<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) 
     });
 }
 
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
 #[divan::bench(types = [Rotate90, Rotate180, Rotate270], args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
 fn rotate_opengl<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) {
     let (mut width, mut height) = params;
@@ -370,6 +379,7 @@ fn rotate_opengl<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize
     drop(dst);
 }
 
+#[cfg(target_os = "linux")]
 #[divan::bench(types = [Rotate90, Rotate180, Rotate270], args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
 fn rotate_g2d<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) {
     let (mut width, mut height) = params;
@@ -384,7 +394,7 @@ fn rotate_g2d<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) 
     let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
     let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
 
-    let mut converter = CPUConverter::new().unwrap();
+    let mut converter = G2DConverter::new().unwrap();
 
     bencher.bench_local(|| {
         converter
@@ -456,7 +466,7 @@ where
 
     let file = std::fs::read(path).unwrap();
 
-    let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
+    let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
     let mut dst = TensorImage::new(src.width(), src.height(), RGB, None).unwrap();
 
     let mut converter = CPUConverter::new().unwrap();
@@ -468,6 +478,7 @@ where
     });
 }
 
+#[cfg(target_os = "linux")]
 #[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
 fn convert_g2d(bencher: divan::Bencher, params: (usize, usize)) {
     let file = include_bytes!("../../../testdata/camera720p.yuyv").to_vec();
@@ -481,7 +492,7 @@ fn convert_g2d(bencher: divan::Bencher, params: (usize, usize)) {
     let (width, height) = params;
     let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
 
-    let mut converter = CPUConverter::new().unwrap();
+    let mut converter = G2DConverter::new().unwrap();
 
     bencher.bench_local(|| {
         converter
@@ -490,6 +501,8 @@ fn convert_g2d(bencher: divan::Bencher, params: (usize, usize)) {
     });
 }
 
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
 #[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
 fn convert_opengl(bencher: divan::Bencher, params: (usize, usize)) {
     let file = include_bytes!("../../../testdata/camera720p.yuyv").to_vec();
@@ -513,6 +526,7 @@ fn convert_opengl(bencher: divan::Bencher, params: (usize, usize)) {
     drop(dst);
 }
 
+#[cfg(target_os = "linux")]
 fn dma_available() -> bool {
     #[cfg(target_os = "linux")]
     {

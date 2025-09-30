@@ -17,13 +17,11 @@ opengl = ["dep:khronos-egl", "dep:gbm", "dep:drm"]
 
 [dependencies]
 ctor = { workspace = true }
-drm = { version = "0.14.1", optional = true }
 edgefirst-tensor = { version = "*", path = "../tensor" }
 env_logger = { workspace = true }
 enum_dispatch = { workspace = true }
 fast_image_resize = { workspace = true }
 four-char-code = { workspace = true }
-gbm = { version = "0.18.0", optional = true }
 gls = "0.1.6"
 jpeg-encoder = { workspace = true }
 khronos-egl = { version = "6.0.0", features = ["dynamic"], optional = true }
@@ -39,6 +37,8 @@ kamadak-exif = "0.6.1"
 [target.'cfg(target_os = "linux")'.dependencies]
 dma-heap = { workspace = true }
 g2d-sys = { version = "*", path = "../g2d-sys" }
+gbm = { version = "0.18.0", optional = true }
+drm = { version = "0.14.1", optional = true }
 
 [dev-dependencies]
 divan = { workspace = true }

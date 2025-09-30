@@ -508,7 +508,6 @@ dependencies = [
  "divan",
  "dma-heap",
  "env_logger",
- "gbm",
  "log",
  "ndarray 0.16.1",
  "nix",

@@ -8,7 +8,6 @@ use std::{
     ffi::c_void,
     fmt,
     ops::{Deref, DerefMut},
-    os::fd::OwnedFd,
     ptr::NonNull,
     sync::{Arc, Mutex},
 };
@@ -46,13 +45,15 @@ where
         })
     }
 
-    fn from_fd(_fd: OwnedFd, _shape: &[usize], _name: Option<&str>) -> Result<Self> {
+    #[cfg(target_os = "linux")]
+    fn from_fd(_fd: std::os::fd::OwnedFd, _shape: &[usize], _name: Option<&str>) -> Result<Self> {
         Err(Error::NotImplemented(
             "MemTensor does not support from_fd".to_owned(),
         ))
     }
 
-    fn clone_fd(&self) -> Result<OwnedFd> {
+    #[cfg(target_os = "linux")]
+    fn clone_fd(&self) -> Result<std::os::fd::OwnedFd> {
         Err(Error::NotImplemented(
             "MemTensor does not support clone_fd".to_owned(),
         ))

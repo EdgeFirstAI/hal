@@ -20,6 +20,7 @@ where
     bench.bench_local(|| tensor.map().expect("Failed to map tensor"));
 }
 
+#[cfg(target_os = "linux")]
 #[divan::bench(types = [u8, f64], args = [[1, 360, 640, 4], [1, 720, 1280, 4], [1, 1080, 1920, 4], [1, 2160, 3840, 4]])]
 fn tensor_alloc_shm<T>(size: [usize; 4])
 where
@@ -29,6 +30,7 @@ where
         Tensor::<T>::new(&size, Some(TensorMemory::Shm), None).expect("Failed to allocate tensor");
 }
 
+#[cfg(target_os = "linux")]
 #[divan::bench(types = [u8, f64], args = [[1, 360, 640, 4], [1, 720, 1280, 4], [1, 1080, 1920, 4], [1, 2160, 3840, 4]])]
 fn tensor_map_shm<T>(bench: divan::Bencher, size: [usize; 4])
 where

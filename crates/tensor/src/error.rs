@@ -3,6 +3,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug)]
 pub enum Error {
     IoError(std::io::Error),
+    #[cfg(target_os = "linux")]
     NixError(nix::Error),
     NotImplemented(String),
     InvalidSize(usize),
@@ -18,7 +19,7 @@ impl From<std::io::Error> for Error {
         Error::IoError(err)
     }
 }
-
+#[cfg(target_os = "linux")]
 impl From<nix::Error> for Error {
     fn from(err: nix::Error) -> Self {
         Error::NixError(err)

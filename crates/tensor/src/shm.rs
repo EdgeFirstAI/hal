@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 use crate::{
     TensorMap, TensorMapTrait, TensorMemory, TensorTrait,
     error::{Error, Result},
@@ -20,6 +21,7 @@ where
     T: Num + Clone + fmt::Debug,
 {
     pub name: String,
+    #[cfg(target_os = "linux")]
     pub fd: OwnedFd,
     pub shape: Vec<usize>,
     pub _marker: std::marker::PhantomData<T>,

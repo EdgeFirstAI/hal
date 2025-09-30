@@ -390,7 +390,7 @@ pub struct ImageConverter {
     pub cpu: CPUConverter,
 
     #[cfg(target_os = "linux")]
-    pub g2d: Option<CPUConverter>,
+    pub g2d: Option<G2DConverter>,
     #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
     pub opengl: Option<GLConverter>,
@@ -399,7 +399,7 @@ pub struct ImageConverter {
 impl ImageConverter {
     pub fn new() -> Result<Self> {
         #[cfg(target_os = "linux")]
-        let g2d = match CPUConverter::new() {
+        let g2d = match G2DConverter::new() {
             Ok(g2d_converter) => Some(g2d_converter),
             Err(err) => {
                 log::debug!("Failed to initialize G2D converter: {err:?}");
@@ -420,6 +420,7 @@ impl ImageConverter {
         let cpu = CPUConverter::new()?;
         Ok(Self {
             cpu,
+            #[cfg(target_os = "linux")]
             g2d,
             #[cfg(feature = "opengl")]
             opengl,
@@ -649,6 +650,7 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    #[cfg(feature = "opengl")]
     fn test_opengl() {
         let dst_width = 640;
         let dst_height = 360;
@@ -677,6 +679,7 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    #[cfg(feature = "opengl")]
     fn test_opengl_10_threads() {
         let handles: Vec<_> = (0..10)
             .map(|i| {
@@ -740,6 +743,7 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    #[cfg(feature = "opengl")]
     fn test_opengl_crop() {
         let dst_width = 640;
         let dst_height = 360;
@@ -840,6 +844,7 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    #[cfg(feature = "opengl")]
     fn test_opengl_rotate() {
         let size = (1280, 720);
         for rot in [
@@ -859,6 +864,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(feature = "opengl")]
     fn test_opengl_rotate_(
         size: (usize, usize),
         rot: Rotation,
@@ -1069,6 +1075,7 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    #[cfg(feature = "opengl")]
     fn test_yuyv_to_rgba_opengl() {
         let src = load_bytes_to_tensor(
             1280,
@@ -1140,6 +1147,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_yuyv_to_rgba_crop_flip_g2d() {
         let src = load_bytes_to_tensor(
             1280,
