@@ -4,7 +4,7 @@ use drm::{Device as DrmDevice, buffer::DrmFourcc, control::Device as DrmControlD
 use edgefirst_tensor::TensorTrait;
 use four_char_code::FourCharCode;
 use gbm::{AsRaw, Device};
-use khronos_egl::{self as egl, Attrib, Config};
+use khronos_egl::{self as egl, Attrib, Config, Display, EGL1_4, NativeWindowType, Surface};
 use log::{debug, error};
 use std::{
     ffi::{CStr, CString, c_char, c_void},
@@ -21,7 +21,7 @@ pub struct Headless {
     pub gbm_surface: gbm::Surface<()>,
     pub ctx: egl::Context,
     pub display: egl::Display,
-    pub egl: Rc<egl::Instance<egl::Dynamic<libloading::Library, egl::EGL1_5>>>,
+    pub egl: Rc<egl::Instance<egl::Dynamic<libloading::Library, egl::EGL1_4>>>,
     pub _gbm: Device<Card>,
     pub size: (usize, usize),
     pub format: FourCharCode,
@@ -46,19 +46,27 @@ impl Headless {
 
         // Create an EGL API instance.
         let lib = unsafe { libloading::Library::new("libEGL.so.1") }?;
-        let egl = unsafe { egl::DynamicInstance::<egl::EGL1_5>::load_required_from(lib)? };
-
+        let egl = unsafe { egl::DynamicInstance::<egl::EGL1_4>::load_required_from(lib)? };
+        if !Self::egl_check_support(&egl) {
+            return Err(Error::NotSupported("EGL version not supported".to_string()));
+        }
         // init a GBM device
         let gbm = Device::new(Card::open_global()?)?;
 
         debug!("gbm: {gbm:?}");
-        let display = unsafe {
-            egl.get_platform_display(
-                egl_ext::PLATFORM_GBM_KHR,
-                gbm.as_raw() as *mut c_void,
-                &[egl::ATTRIB_NONE],
-            )?
-        };
+        // let display = unsafe {
+        //     get_platform_display_ext(
+        //         egl_ext::PLATFORM_GBM_KHR,
+        //         gbm.as_raw() as *mut c_void,
+        //         &[egl::ATTRIB_NONE],
+        //     )?
+        // };
+        let display = Self::egl_get_platform_display_with_fallback(
+            &egl,
+            egl_ext::PLATFORM_GBM_KHR,
+            gbm.as_raw() as *mut c_void,
+            &[egl::ATTRIB_NONE],
+        )?;
 
         debug!("display: {display:?}");
 
@@ -98,17 +106,13 @@ impl Headless {
             gbm::BufferObjectFlags::RENDERING | gbm::BufferObjectFlags::SCANOUT,
         )?;
         debug!("gbm_surface: {gbm_surface:?}");
-        let surface = match unsafe {
-            egl.create_platform_window_surface(
-                display,
-                config,
-                gbm_surface.as_raw() as *mut c_void,
-                &[egl::ATTRIB_NONE],
-            )
-        } {
-            Ok(v) => v,
-            Err(e) => return Err(crate::Error::EGL(e)),
-        };
+        let surface = Self::egl_create_platform_window_surface_with_fallback(
+            &egl,
+            display,
+            config,
+            gbm_surface.as_raw() as *mut c_void,
+            &[egl::ATTRIB_NONE],
+        )?;
         debug!("surface: {surface:?}");
         egl.make_current(display, Some(surface), Some(surface), Some(ctx))?;
         let _ = egl.swap_interval(display, 0);
@@ -153,14 +157,13 @@ impl Headless {
             gbm::BufferObjectFlags::RENDERING,
         )?;
         debug!("gbm_surface: {gbm_surface:?}");
-        let surface = unsafe {
-            self.egl.create_platform_window_surface(
-                self.display,
-                self.config,
-                gbm_surface.as_raw() as *mut c_void,
-                &[egl::ATTRIB_NONE],
-            )?
-        };
+        let surface = Self::egl_create_platform_window_surface_with_fallback(
+            &self.egl,
+            self.display,
+            self.config,
+            gbm_surface.as_raw() as *mut c_void,
+            &[egl::ATTRIB_NONE],
+        )?;
         debug!("surface: {surface:?}");
 
         self.gbm_surface = gbm_surface;
@@ -178,6 +181,160 @@ impl Headless {
             Some(self.surface),
             Some(self.ctx),
         )?)
+    }
+
+    fn egl_check_support(egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>) -> bool {
+        if egl.upcast::<egl::EGL1_5>().is_some() {
+            return true;
+        }
+        if egl.get_proc_address("eglGetPlatformDisplayEXT").is_none() {
+            return false;
+        }
+        if egl
+            .get_proc_address("eglCreatePlatformWindowSurfaceEXT")
+            .is_none()
+        {
+            return false;
+        }
+
+        if egl.get_proc_address("eglCreateImageKHR").is_none() {
+            return false;
+        }
+
+        if egl.get_proc_address("eglDestroyImageKHR").is_none() {
+            return false;
+        }
+        true
+    }
+
+    fn egl_get_platform_display_with_fallback(
+        egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
+        platform: egl::Enum,
+        native_display: *mut c_void,
+        attrib_list: &[Attrib],
+    ) -> Result<Display, Error> {
+        if let Some(egl) = egl.upcast::<egl::EGL1_5>() {
+            unsafe { egl.get_platform_display(platform, native_display, attrib_list) }
+                .map_err(|e| e.into())
+        } else if let Some(ext) = egl.get_proc_address("eglGetPlatformDisplayEXT") {
+            let func: fn(
+                platform: egl::Enum,
+                native_display: *mut c_void,
+                attrib_list: *const Attrib,
+            ) -> egl::EGLDisplay = unsafe { std::mem::transmute(ext) };
+            let disp = func(platform, native_display, attrib_list.as_ptr());
+            if disp != egl::NO_DISPLAY {
+                Ok(unsafe { Display::from_ptr(disp) })
+            } else {
+                Err(egl.get_error().unwrap().into())
+            }
+        } else {
+            Err(Error::EGLLoad(egl::LoadError::InvalidVersion {
+                provided: egl.version(),
+                required: khronos_egl::Version::EGL1_5,
+            }))
+        }
+    }
+
+    fn egl_create_platform_window_surface_with_fallback(
+        egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
+        display: Display,
+        config: Config,
+        native_window: NativeWindowType,
+        attrib_list: &[Attrib],
+    ) -> Result<Surface, Error> {
+        if let Some(egl) = egl.upcast::<egl::EGL1_5>() {
+            unsafe {
+                egl.create_platform_window_surface(display, config, native_window, attrib_list)
+            }
+            .map_err(|e| e.into())
+        } else if let Some(ext) = egl.get_proc_address("eglCreatePlatformWindowSurfaceEXT") {
+            let func: fn(
+                display: egl::EGLDisplay,
+                config: egl::EGLConfig,
+                native_window: *mut c_void,
+                attrib_list: *const Attrib,
+            ) -> egl::EGLSurface = unsafe { std::mem::transmute(ext) };
+            let surf = func(
+                display.as_ptr(),
+                config.as_ptr(),
+                native_window,
+                attrib_list.as_ptr(),
+            );
+            if surf != egl::NO_SURFACE {
+                Ok(unsafe { Surface::from_ptr(surf) })
+            } else {
+                Err(egl.get_error().unwrap().into())
+            }
+        } else {
+            Err(Error::EGLLoad(egl::LoadError::InvalidVersion {
+                provided: egl.version(),
+                required: khronos_egl::Version::EGL1_5,
+            }))
+        }
+    }
+
+    fn egl_create_image_with_fallback(
+        egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
+        display: Display,
+        ctx: egl::Context,
+        target: egl::Enum,
+        buffer: egl::ClientBuffer,
+        attrib_list: &[Attrib],
+    ) -> Result<egl::Image, Error> {
+        if let Some(egl) = egl.upcast::<egl::EGL1_5>() {
+            egl.create_image(display, ctx, target, buffer, attrib_list)
+                .map_err(|e| e.into())
+        } else if let Some(ext) = egl.get_proc_address("eglCreateImageKHR") {
+            let func: fn(
+                display: egl::EGLDisplay,
+                ctx: egl::EGLContext,
+                target: egl::Enum,
+                buffer: egl::EGLClientBuffer,
+                attrib_list: *const Attrib,
+            ) -> egl::EGLImage = unsafe { std::mem::transmute(ext) };
+            let image = func(
+                display.as_ptr(),
+                ctx.as_ptr(),
+                target,
+                buffer.as_ptr(),
+                attrib_list.as_ptr(),
+            );
+            if image != egl::NO_IMAGE {
+                Ok(unsafe { egl::Image::from_ptr(image) })
+            } else {
+                Err(egl.get_error().unwrap().into())
+            }
+        } else {
+            Err(Error::EGLLoad(egl::LoadError::InvalidVersion {
+                provided: egl.version(),
+                required: khronos_egl::Version::EGL1_5,
+            }))
+        }
+    }
+
+    fn egl_destory_image_with_fallback(
+        egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
+        display: Display,
+        image: egl::Image,
+    ) -> Result<(), Error> {
+        if let Some(egl) = egl.upcast::<egl::EGL1_5>() {
+            egl.destroy_image(display, image).map_err(|e| e.into())
+        } else if let Some(ext) = egl.get_proc_address("eglDestroyImageKHR") {
+            let func: fn(display: egl::EGLDisplay, image: egl::EGLImage) -> egl::Boolean =
+                unsafe { std::mem::transmute(ext) };
+            let res = func(display.as_ptr(), image.as_ptr());
+            if res == egl::TRUE {
+                Ok(())
+            } else {
+                Err(egl.get_error().unwrap().into())
+            }
+        } else {
+            Err(Error::EGLLoad(egl::LoadError::InvalidVersion {
+                provided: egl.version(),
+                required: khronos_egl::Version::EGL1_5,
+            }))
+        }
     }
 }
 
@@ -210,11 +367,25 @@ impl Card {
         let mut options = std::fs::OpenOptions::new();
         options.read(true);
         options.write(true);
-        Ok(Card(options.open(path)?))
+        let c = options.open(path);
+        match c {
+            Ok(c) => Ok(Card(c)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(Error::NotFound(format!("File not found: {path}")))
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub fn open_global() -> Result<Self, crate::Error> {
-        Self::open("/dev/dri/card0")
+        let e = Self::open("/dev/dri/card0");
+        if e.is_err() {
+            let nv = Self::open("drm-nvdc");
+            if nv.is_ok() {
+                return nv;
+            }
+        }
+        return e;
     }
 }
 
@@ -908,7 +1079,7 @@ impl GLConverter {
             &egl_img_attr,
         ) {
             Ok(v) => Ok(v),
-            Err(e) => Err(crate::Error::EGL(e)),
+            Err(e) => Err(e),
         }
     }
 
@@ -917,14 +1088,22 @@ impl GLConverter {
         target: egl::Enum,
         buffer: egl::ClientBuffer,
         attrib_list: &[Attrib],
-    ) -> Result<EglImage, egl::Error> {
-        let image = self.gbm_rendering.egl.create_image(
+    ) -> Result<EglImage, Error> {
+        let image = Headless::egl_create_image_with_fallback(
+            &self.gbm_rendering.egl,
             self.gbm_rendering.display,
             unsafe { egl::Context::from_ptr(egl::NO_CONTEXT) },
             target,
             buffer,
             attrib_list,
         )?;
+        // let image = self.gbm_rendering.egl.create_image(
+        //     self.gbm_rendering.display,
+        //     unsafe { egl::Context::from_ptr(egl::NO_CONTEXT) },
+        //     target,
+        //     buffer,
+        //     attrib_list,
+        // )?;
         Ok(EglImage {
             egl_image: image,
             display: self.gbm_rendering.display,
@@ -934,13 +1113,13 @@ impl GLConverter {
 }
 struct EglImage {
     egl_image: egl::Image,
-    egl: Rc<egl::Instance<egl::Dynamic<libloading::Library, egl::EGL1_5>>>,
+    egl: Rc<egl::Instance<egl::Dynamic<libloading::Library, egl::EGL1_4>>>,
     display: egl::Display,
 }
 
 impl Drop for EglImage {
     fn drop(&mut self) {
-        let e = self.egl.destroy_image(self.display, self.egl_image);
+        let e = Headless::egl_destory_image_with_fallback(&self.egl, self.display, self.egl_image);
         if let Err(e) = e {
             error!("Could not destroy EGL image: {e:?}");
         }
