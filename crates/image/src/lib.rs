@@ -630,7 +630,7 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn test_g2d() {
+    fn test_g2d_resize() {
         let dst_width = 640;
         let dst_height = 360;
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
@@ -655,7 +655,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
-    fn test_opengl() {
+    fn test_opengl_resize() {
         let dst_width = 640;
         let dst_height = 360;
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
@@ -689,7 +689,7 @@ mod tests {
             .map(|i| {
                 std::thread::Builder::new()
                     .name(format!("Thread {i}"))
-                    .spawn(test_opengl)
+                    .spawn(test_opengl_resize)
                     .unwrap()
             })
             .collect();
@@ -1106,6 +1106,64 @@ mod tests {
             .copy_from_slice(include_bytes!("../../../testdata/camera720p.rgba"));
 
         compare_images(&dst, &target_image, 0.98, function!());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_yuyv_to_rgb_g2d() {
+        let src = load_bytes_to_tensor(
+            1280,
+            720,
+            YUYV,
+            None,
+            include_bytes!("../../../testdata/camera720p.yuyv"),
+        )
+        .unwrap();
+
+        let mut g2d_dst = TensorImage::new(1280, 720, RGB, Some(TensorMemory::Dma)).unwrap();
+        let mut g2d_converter = G2DConverter::new().unwrap();
+
+        g2d_converter
+            .convert(&src, &mut g2d_dst, Rotation::None, Flip::None, None)
+            .unwrap();
+
+        let mut cpu_dst = TensorImage::new(1280, 720, RGB, None).unwrap();
+        let mut cpu_converter: CPUConverter = CPUConverter::new().unwrap();
+
+        cpu_converter
+            .convert(&src, &mut cpu_dst, Rotation::None, Flip::None, None)
+            .unwrap();
+
+        compare_images(&g2d_dst, &cpu_dst, 0.98, function!());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_yuyv_to_yuyv_resize_g2d() {
+        let src = load_bytes_to_tensor(
+            1280,
+            720,
+            YUYV,
+            None,
+            include_bytes!("../../../testdata/camera720p.yuyv"),
+        )
+        .unwrap();
+
+        let mut g2d_dst = TensorImage::new(600, 400, YUYV, Some(TensorMemory::Dma)).unwrap();
+        let mut g2d_converter = G2DConverter::new().unwrap();
+
+        g2d_converter
+            .convert(&src, &mut g2d_dst, Rotation::None, Flip::None, None)
+            .unwrap();
+
+        let mut cpu_dst = TensorImage::new(600, 400, YUYV, None).unwrap();
+        let mut cpu_converter: CPUConverter = CPUConverter::new().unwrap();
+
+        cpu_converter
+            .convert(&src, &mut cpu_dst, Rotation::None, Flip::None, None)
+            .unwrap();
+
+        compare_images(&g2d_dst, &cpu_dst, 0.98, function!());
     }
 
     #[test]
