@@ -19,9 +19,12 @@ use std::{
     rc::Rc,
 };
 
+/// 8 bit grayscale, full range
+// pub const GREY: FourCharCode = four_char_code!("Y800");
 pub const YUYV: FourCharCode = four_char_code!("YUYV");
 pub const RGBA: FourCharCode = four_char_code!("RGBA");
 pub const RGB: FourCharCode = four_char_code!("RGB ");
+pub const NV12: FourCharCode = four_char_code!("NV12");
 
 const G2D_2_3_0: Version = Version::new(6, 4, 11, 1049711);
 
@@ -67,6 +70,8 @@ impl TryFrom<FourCharCode> for G2DFormat {
             RGB => Ok(G2DFormat(g2d_format_G2D_RGB888)),
             RGBA => Ok(G2DFormat(g2d_format_G2D_RGBA8888)),
             YUYV => Ok(G2DFormat(g2d_format_G2D_YUYV)),
+            NV12 => Ok(G2DFormat(g2d_format_G2D_NV12)),
+            // GREY => Ok(G2DFormat(g2d_format_G2D_NV12)),
             _ => Err(Error::InvalidFormat(format.to_string())),
         }
     }
