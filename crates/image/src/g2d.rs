@@ -16,9 +16,9 @@ pub struct G2DConverter {
 
 impl G2DConverter {
     pub fn new() -> Result<Self> {
-        Ok(Self {
-            g2d: G2D::new("libg2d.so.2")?,
-        })
+        let mut g2d = G2D::new("libg2d.so.2")?;
+        g2d.set_bt709_colorspace()?;
+        Ok(Self { g2d })
     }
 
     pub fn version(&self) -> g2d_sys::Version {

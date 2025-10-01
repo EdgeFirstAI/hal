@@ -14,7 +14,7 @@ use std::{
     str::FromStr,
 };
 
-use crate::{Error, Flip, GREY, ImageConverterTrait, RGB, RGBA, Rotation, TensorImage, YUYV};
+use crate::{Error, Flip, GREY, ImageConverterTrait, NV12, RGB, RGBA, Rotation, TensorImage, YUYV};
 
 pub struct Headless {
     pub surface: egl::Surface,
@@ -243,12 +243,12 @@ impl ImageConverterTrait for GLConverter {
         flip: Flip,
         crop: Option<crate::Rect>,
     ) -> crate::Result<()> {
-        if dst.fourcc == GREY {
-            return Err(Error::NotSupported(
-                "OpenGL doesn't support Grey destination".to_string(),
-            ));
-        }
-        check_gl_error().unwrap();
+        // if dst.fourcc == GREY {
+        //     return Err(Error::NotSupported(
+        //         "OpenGL doesn't support Grey destination".to_string(),
+        //     ));
+        // }
+        check_gl_error()?;
         if let edgefirst_tensor::Tensor::Dma(_) = dst.tensor() {
             return self.convert_dest_dma(dst, src, rotation, flip, crop);
         }
@@ -341,7 +341,6 @@ impl GLConverter {
 
         let vertex_buffer = Buffer::new(0, 3, 100);
         let texture_buffer = Buffer::new(1, 2, 100);
-        check_gl_error().unwrap();
         let converter = GLConverter {
             gbm_rendering,
             texture_program,
@@ -351,7 +350,7 @@ impl GLConverter {
             texture_buffer,
         };
         converter.warmup(3)?;
-        check_gl_error().unwrap();
+        check_gl_error()?;
         Ok(converter)
     }
 
@@ -372,12 +371,10 @@ impl GLConverter {
         crop: Option<crate::Rect>,
     ) -> crate::Result<()> {
         let frame_buffer = FrameBuffer::new();
-        let render_buffer = RenderBuffer::new();
-
-        render_buffer.bind();
+        let render_texture = Texture::new();
         frame_buffer.bind();
 
-        if dst.is_planar() {
+        let (width, height) = if dst.is_planar() {
             let width = src.width() / 4;
             let height = match src.fourcc() {
                 RGBA => src.height() * 4,
@@ -388,40 +385,43 @@ impl GLConverter {
                     )));
                 }
             };
-
-            let dest_img = self.create_image_from_dma2(dst).unwrap();
-
-            unsafe {
-                gls::gl::EGLImageTargetRenderbufferStorageOES(
-                    gls::gl::RENDERBUFFER,
-                    dest_img.egl_image.as_ptr(),
-                );
-                gls::gl::FramebufferRenderbuffer(
-                    gls::gl::FRAMEBUFFER,
-                    gls::gl::COLOR_ATTACHMENT0,
-                    gls::gl::RENDERBUFFER,
-                    render_buffer.id,
-                );
-                gls::gl::Viewport(0, 0, width as i32, height as i32);
-            }
-            return self.convert_to_planar(src, crop);
-        }
-
+            (width as i32, height as i32)
+        } else {
+            (dst.width() as i32, dst.height() as i32)
+        };
         let dest_img = self.create_image_from_dma2(dst).unwrap();
+
         unsafe {
-            gls::gl::EGLImageTargetRenderbufferStorageOES(
-                gls::gl::RENDERBUFFER,
-                dest_img.egl_image.as_ptr(),
+            gls::gl::UseProgram(self.texture_program_planar.id);
+            gls::gl::BindTexture(gls::gl::TEXTURE_2D, render_texture.id);
+            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+            gls::gl::TexParameteri(
+                gls::gl::TEXTURE_2D,
+                gls::gl::TEXTURE_MIN_FILTER,
+                gls::gl::NEAREST as i32,
             );
-            gls::gl::FramebufferRenderbuffer(
+            gls::gl::TexParameteri(
+                gls::gl::TEXTURE_2D,
+                gls::gl::TEXTURE_MAG_FILTER,
+                gls::gl::LINEAR as i32,
+            );
+            gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, dest_img.egl_image.as_ptr());
+            gls::gl::FramebufferTexture2D(
                 gls::gl::FRAMEBUFFER,
                 gls::gl::COLOR_ATTACHMENT0,
-                gls::gl::RENDERBUFFER,
-                render_buffer.id,
+                gls::gl::TEXTURE_2D,
+                render_texture.id,
+                0,
             );
-            gls::gl::Viewport(0, 0, dst.width() as i32, dst.height() as i32);
+            check_gl_error()?;
+            gls::gl::Viewport(0, 0, width, height);
         }
-        self.convert_to(src, rotation, flip, crop, false)
+
+        if dst.is_planar() {
+            self.convert_to_planar(src, crop)
+        } else {
+            self.convert_to(src, rotation, flip, crop, false)
+        }
     }
 
     fn convert_to(
@@ -432,12 +432,11 @@ impl GLConverter {
         crop: Option<crate::Rect>,
         flip_y: bool,
     ) -> Result<(), crate::Error> {
-        check_gl_error().unwrap();
+        check_gl_error()?;
         unsafe {
             gls::gl::ClearColor(1.0, 1.0, 1.0, 1.0);
             gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
         };
-
         let roi = if let Some(crop) = crop {
             // top and bottom are flipped because OpenGL uses 0,0 as bottom left
             RegionOfInterest {
@@ -475,6 +474,7 @@ impl GLConverter {
             self.draw_camera_texture(src, roi, rotation_offset, flip, flip_y)
         };
         unsafe { gls::gl::Finish() };
+        check_gl_error()?;
         result
     }
 
@@ -614,7 +614,7 @@ impl GLConverter {
             GREY => gls::gl::RED,
             _ => {
                 return Err(Error::NotSupported(
-                    "YUYV textures aren't supposed by OpenGL".to_string(),
+                    "YUYV textures aren't supported by OpenGL".to_string(),
                 ));
             }
         };
@@ -658,7 +658,6 @@ impl GLConverter {
                 &img.tensor().map()?,
             );
 
-            check_gl_error().unwrap();
             gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
             gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
             let mut cam = RegionOfInterest {
@@ -715,7 +714,6 @@ impl GLConverter {
                 gls::gl::UNSIGNED_INT,
                 vertices_index.as_ptr() as *const c_void,
             );
-            check_gl_error().unwrap();
 
             Ok(())
         }
@@ -765,7 +763,7 @@ impl GLConverter {
             }
 
             gls::egl_image_target_texture_2d_oes(texture_target, egl_img.egl_image.as_ptr());
-            check_gl_error().unwrap();
+            check_gl_error()?;
             gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
             gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
             let mut cam = RegionOfInterest {
@@ -822,7 +820,7 @@ impl GLConverter {
                 vertices_index.as_ptr() as *const c_void,
             );
         }
-        check_gl_error().unwrap();
+        check_gl_error()?;
         Ok(())
     }
 
@@ -879,7 +877,7 @@ impl GLConverter {
             }
         };
 
-        let egl_img_attr = [
+        let mut egl_img_attr = vec![
             egl_ext::LINUX_DRM_FOURCC as Attrib,
             format as Attrib,
             khronos_egl::WIDTH as Attrib,
@@ -892,8 +890,17 @@ impl GLConverter {
             0 as Attrib,
             egl_ext::DMA_BUF_PLANE0_FD as Attrib,
             fd as Attrib,
-            khronos_egl::NONE as Attrib,
         ];
+        if matches!(src.fourcc(), YUYV | NV12) {
+            egl_img_attr.append(&mut vec![
+                egl_ext::YUV_COLOR_SPACE_HINT as Attrib,
+                egl_ext::ITU_REC709 as Attrib,
+                egl_ext::SAMPLE_RANGE_HINT as Attrib,
+                egl_ext::YUV_NARROW_RANGE as Attrib,
+            ]);
+        }
+
+        egl_img_attr.push(khronos_egl::NONE as Attrib);
 
         match self.new_egl_image_owned(
             egl_ext::LINUX_DMA_BUF,
@@ -1050,36 +1057,6 @@ impl Buffer {
 impl Drop for Buffer {
     fn drop(&mut self) {
         unsafe { gls::gl::DeleteBuffers(1, &raw mut self.id) };
-    }
-}
-
-pub struct RenderBuffer {
-    id: u32,
-}
-
-impl RenderBuffer {
-    pub fn new() -> RenderBuffer {
-        let mut id = 0;
-        unsafe {
-            gls::gl::GenRenderbuffers(1, &raw mut id);
-        }
-
-        RenderBuffer { id }
-    }
-
-    pub fn bind(&self) {
-        unsafe { gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, self.id) };
-    }
-
-    pub fn unbind(&self) {
-        unsafe { gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, 0) };
-    }
-}
-
-impl Drop for RenderBuffer {
-    fn drop(&mut self) {
-        self.unbind();
-        unsafe { gls::gl::DeleteRenderbuffers(1, &raw mut self.id) };
     }
 }
 
