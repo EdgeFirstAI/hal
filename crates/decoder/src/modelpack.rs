@@ -257,9 +257,13 @@ pub fn postprocess_modelpack_split<T: AsPrimitive<f32>>(
             bboxes.push(w);
             bboxes.push(h);
 
-            let obj = p[4];
-            let probs = p[5..].iter().map(|x| *x * obj);
-            bscores.extend(probs);
+            if nc == 1 {
+                bscores.push(p[4]);
+            } else {
+                let obj = p[4];
+                let probs = p[5..].iter().map(|x| *x * obj);
+                bscores.extend(probs);
+            }
         }
     }
     let bboxes = Array2::from_shape_vec((bboxes.len() / 4, 4), bboxes).unwrap();

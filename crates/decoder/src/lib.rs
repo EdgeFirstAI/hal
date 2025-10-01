@@ -723,7 +723,7 @@ mod tests {
                     xmax: 0.5626645,
                     ymax: 0.808863,
                 },
-                score: 0.49577647,
+                score: 0.99240804,
                 label: 0
             },
             1e-6
@@ -768,7 +768,7 @@ mod tests {
                     xmax: 0.5626645,
                     ymax: 0.808863,
                 },
-                score: 0.49577647,
+                score: 0.99240804,
                 label: 0
             },
             1e-6
