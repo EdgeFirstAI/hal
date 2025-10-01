@@ -1,11 +1,11 @@
 #![cfg(target_os = "linux")]
 
 use crate::{
-    Error, Flip, GREY, ImageConverterTrait, NV12, RGB, Rect, Result, Rotation, TensorImage, YUYV,
+    Error, Flip, ImageConverterTrait, RGB, RGBA, Rect, Result, Rotation, TensorImage, YUYV,
 };
 use edgefirst_tensor::Tensor;
 use g2d_sys::{G2D, G2DFormat, G2DPhysical, G2DSurface};
-use log::debug;
+use log::trace;
 use std::os::fd::AsRawFd;
 
 /// G2DConverter implements the ImageConverter trait using the NXP G2D
@@ -23,6 +23,43 @@ impl G2DConverter {
 
     pub fn version(&self) -> g2d_sys::Version {
         self.g2d.version()
+    }
+
+    fn convert_(
+        &mut self,
+        src: &TensorImage,
+        dst: &mut TensorImage,
+        rotation: Rotation,
+        flip: Flip,
+        crop: Option<Rect>,
+    ) -> Result<()> {
+        let mut src_surface: G2DSurface = src.try_into()?;
+        let mut dst_surface: G2DSurface = dst.try_into()?;
+
+        src_surface.rot = match flip {
+            Flip::None => g2d_sys::g2d_rotation_G2D_ROTATION_0,
+            Flip::Vertical => g2d_sys::g2d_rotation_G2D_FLIP_V,
+            Flip::Horizontal => g2d_sys::g2d_rotation_G2D_FLIP_H,
+        };
+
+        dst_surface.rot = match rotation {
+            Rotation::None => g2d_sys::g2d_rotation_G2D_ROTATION_0,
+            Rotation::Clockwise90 => g2d_sys::g2d_rotation_G2D_ROTATION_90,
+            Rotation::Rotate180 => g2d_sys::g2d_rotation_G2D_ROTATION_180,
+            Rotation::CounterClockwise90 => g2d_sys::g2d_rotation_G2D_ROTATION_270,
+        };
+
+        if let Some(crop_rect) = crop {
+            src_surface.left = crop_rect.left as i32;
+            src_surface.top = crop_rect.top as i32;
+            src_surface.right = (crop_rect.left + crop_rect.width) as i32;
+            src_surface.bottom = (crop_rect.top + crop_rect.height) as i32;
+        }
+
+        trace!("Blitting from {src_surface:?} to {dst_surface:?}");
+        self.g2d.blit(&src_surface, &dst_surface)?;
+
+        Ok(())
     }
 }
 
@@ -49,40 +86,26 @@ impl ImageConverterTrait for G2DConverter {
         flip: Flip,
         crop: Option<Rect>,
     ) -> Result<()> {
-        if matches!(dst.fourcc(), YUYV | GREY | NV12 | RGB) {
-            return Err(Error::NotSupported(format!(
-                "G2D does not support {} destination",
-                dst.fourcc().display()
-            )));
+        match (src.fourcc(), dst.fourcc()) {
+            (RGBA, RGBA) => {}
+            (RGBA, YUYV) => {}
+            (RGBA, RGB) => {}
+            (YUYV, RGBA) => {}
+            (YUYV, YUYV) => {}
+            (YUYV, RGB) => {}
+            // (YUYV, NV12) => {}
+            // (NV12, RGBA) => {}
+            // (NV12, YUYV) => {}
+            // (NV12, RGB) => {}
+            (s, d) => {
+                return Err(Error::NotSupported(format!(
+                    "G2D does not support {} to {} conversion",
+                    s.display(),
+                    d.display()
+                )));
+            }
         }
-        let mut src_surface: G2DSurface = src.try_into()?;
-        let mut dst_surface: G2DSurface = dst.try_into()?;
-
-        src_surface.rot = match flip {
-            Flip::None => g2d_sys::g2d_rotation_G2D_ROTATION_0,
-            Flip::Vertical => g2d_sys::g2d_rotation_G2D_FLIP_V,
-            Flip::Horizontal => g2d_sys::g2d_rotation_G2D_FLIP_H,
-        };
-
-        dst_surface.rot = match rotation {
-            Rotation::None => g2d_sys::g2d_rotation_G2D_ROTATION_0,
-            Rotation::Clockwise90 => g2d_sys::g2d_rotation_G2D_ROTATION_90,
-            Rotation::Rotate180 => g2d_sys::g2d_rotation_G2D_ROTATION_180,
-            Rotation::CounterClockwise90 => g2d_sys::g2d_rotation_G2D_ROTATION_270,
-        };
-
-        if let Some(crop_rect) = crop {
-            src_surface.left = crop_rect.left as i32;
-            src_surface.top = crop_rect.top as i32;
-            src_surface.right = (crop_rect.left + crop_rect.width) as i32;
-            src_surface.bottom = (crop_rect.top + crop_rect.height) as i32;
-        }
-
-        debug!("Blitting from {src_surface:?} to {dst_surface:?}");
-
-        self.g2d.blit(&src_surface, &dst_surface)?;
-
-        Ok(())
+        self.convert_(src, dst, rotation, flip, crop)
     }
 }
 
@@ -149,5 +172,186 @@ impl TryFrom<&mut TensorImage> for G2DSurface {
             rot: 0,
             global_alpha: 0,
         })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::{
+        CPUConverter, Flip, G2DConverter, GREY, ImageConverterTrait, RGB, RGBA, Rotation,
+        TensorImage, YUYV,
+    };
+    use edgefirst_tensor::{TensorMemory, TensorTrait};
+    use four_char_code::FourCharCode;
+    use image::buffer::ConvertBuffer;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_g2d_formats_no_resize() {
+        for i in [RGBA, YUYV, RGB, GREY] {
+            for o in [RGBA, YUYV, RGB, GREY] {
+                let res = test_g2d_format_no_resize_(i, o);
+                if let Err(e) = res {
+                    println!("{} to {} failed: {e:?}", i.display(), o.display());
+                } else {
+                    println!("{} to {} success", i.display(), o.display());
+                }
+            }
+        }
+    }
+
+    fn test_g2d_format_no_resize_(
+        g2d_in_fmt: FourCharCode,
+        g2d_out_fmt: FourCharCode,
+    ) -> Result<(), crate::Error> {
+        let dst_width = 1280;
+        let dst_height = 720;
+        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let src = TensorImage::load_jpeg(&file, Some(RGB), None)?;
+
+        let mut src2 = TensorImage::new(1280, 720, g2d_in_fmt, Some(TensorMemory::Dma))?;
+
+        let mut cpu_converter = CPUConverter::new()?;
+
+        cpu_converter.convert(&src, &mut src2, Rotation::None, Flip::None, None)?;
+
+        let mut g2d_dst =
+            TensorImage::new(dst_width, dst_height, g2d_out_fmt, Some(TensorMemory::Dma))?;
+        let mut g2d_converter = G2DConverter::new()?;
+        g2d_converter.convert_(&src2, &mut g2d_dst, Rotation::None, Flip::None, None)?;
+
+        let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGB, None)?;
+        cpu_converter.convert(&g2d_dst, &mut cpu_dst, Rotation::None, Flip::None, None)?;
+
+        compare_images(
+            &src,
+            &cpu_dst,
+            0.98,
+            &format!("{}_to_{}", g2d_in_fmt.display(), g2d_out_fmt.display()),
+        )
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_g2d_formats_with_resize() {
+        for i in [RGBA, YUYV, RGB, GREY] {
+            for o in [RGBA, YUYV, RGB, GREY] {
+                let res = test_g2d_format_with_resize_(i, o);
+                if let Err(e) = res {
+                    println!("{} to {} failed: {e:?}", i.display(), o.display());
+                } else {
+                    println!("{} to {} success", i.display(), o.display());
+                }
+            }
+        }
+    }
+
+    fn test_g2d_format_with_resize_(
+        g2d_in_fmt: FourCharCode,
+        g2d_out_fmt: FourCharCode,
+    ) -> Result<(), crate::Error> {
+        let dst_width = 600;
+        let dst_height = 400;
+        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let src = TensorImage::load_jpeg(&file, Some(RGB), None)?;
+
+        let mut cpu_converter = CPUConverter::new()?;
+
+        let mut reference = TensorImage::new(dst_width, dst_height, RGB, Some(TensorMemory::Dma))?;
+        cpu_converter.convert(&src, &mut reference, Rotation::None, Flip::None, None)?;
+
+        let mut src2 = TensorImage::new(1280, 720, g2d_in_fmt, Some(TensorMemory::Dma))?;
+        cpu_converter.convert(&src, &mut src2, Rotation::None, Flip::None, None)?;
+
+        let mut g2d_dst =
+            TensorImage::new(dst_width, dst_height, g2d_out_fmt, Some(TensorMemory::Dma))?;
+        let mut g2d_converter = G2DConverter::new()?;
+        g2d_converter.convert_(&src2, &mut g2d_dst, Rotation::None, Flip::None, None)?;
+
+        let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGB, None)?;
+        cpu_converter.convert(&g2d_dst, &mut cpu_dst, Rotation::None, Flip::None, None)?;
+
+        compare_images(
+            &reference,
+            &cpu_dst,
+            0.98,
+            &format!(
+                "{}_to_{}_resized",
+                g2d_in_fmt.display(),
+                g2d_out_fmt.display()
+            ),
+        )
+    }
+
+    fn compare_images(
+        img1: &TensorImage,
+        img2: &TensorImage,
+        threshold: f64,
+        name: &str,
+    ) -> Result<(), crate::Error> {
+        assert_eq!(img1.height(), img2.height(), "Heights differ");
+        assert_eq!(img1.width(), img2.width(), "Widths differ");
+        assert_eq!(img1.fourcc(), img2.fourcc(), "FourCC differ");
+        assert!(
+            matches!(img1.fourcc(), RGB | RGBA),
+            "FourCC must be RGB or RGBA for comparison"
+        );
+        let image1 = match img1.fourcc() {
+            RGB => image::RgbImage::from_vec(
+                img1.width() as u32,
+                img1.height() as u32,
+                img1.tensor().map().unwrap().to_vec(),
+            )
+            .unwrap(),
+            RGBA => image::RgbaImage::from_vec(
+                img1.width() as u32,
+                img1.height() as u32,
+                img1.tensor().map().unwrap().to_vec(),
+            )
+            .unwrap()
+            .convert(),
+
+            _ => unreachable!(),
+        };
+
+        let image2 = match img2.fourcc() {
+            RGB => image::RgbImage::from_vec(
+                img2.width() as u32,
+                img2.height() as u32,
+                img2.tensor().map().unwrap().to_vec(),
+            )
+            .unwrap(),
+            RGBA => image::RgbaImage::from_vec(
+                img2.width() as u32,
+                img2.height() as u32,
+                img2.tensor().map().unwrap().to_vec(),
+            )
+            .unwrap()
+            .convert(),
+
+            _ => unreachable!(),
+        };
+
+        let similarity = image_compare::rgb_similarity_structure(
+            &image_compare::Algorithm::RootMeanSquared,
+            &image1,
+            &image2,
+        )
+        .expect("Image Comparison failed");
+        if similarity.score < threshold {
+            image1.save(format!("{name}_1.png")).unwrap();
+            image2.save(format!("{name}_2.png")).unwrap();
+            // similarity
+            //     .image
+            //     .to_color_map()
+            //     .save(format!("{name}.png"))
+            //     .unwrap();
+            return Err(Error::Internal(format!(
+                "{name}: converted image and target image have similarity score too low: {} < {}",
+                similarity.score, threshold
+            )));
+        }
+        Ok(())
     }
 }

@@ -243,11 +243,11 @@ impl ImageConverterTrait for GLConverter {
         flip: Flip,
         crop: Option<crate::Rect>,
     ) -> crate::Result<()> {
-        // if dst.fourcc == GREY {
-        //     return Err(Error::NotSupported(
-        //         "OpenGL doesn't support Grey destination".to_string(),
-        //     ));
-        // }
+        if dst.fourcc() == GREY && src.fourcc() != GREY {
+            return Err(Error::NotSupported(
+                "OpenGL doesn't support conversion to Grey".to_string(),
+            ));
+        }
         check_gl_error()?;
         if let edgefirst_tensor::Tensor::Dma(_) = dst.tensor() {
             return self.convert_dest_dma(dst, src, rotation, flip, crop);
@@ -389,7 +389,7 @@ impl GLConverter {
         } else {
             (dst.width() as i32, dst.height() as i32)
         };
-        let dest_img = self.create_image_from_dma2(dst).unwrap();
+        let dest_img = self.create_image_from_dma2(dst)?;
 
         unsafe {
             gls::gl::UseProgram(self.texture_program_planar.id);

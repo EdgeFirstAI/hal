@@ -404,7 +404,7 @@ fn rotate_g2d<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) 
 }
 
 #[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
-fn convert_cpu(bencher: divan::Bencher, params: (usize, usize)) {
+fn convert_cpu_yuyv_to_rgba(bencher: divan::Bencher, params: (usize, usize)) {
     let file = include_bytes!("../../../testdata/camera720p.yuyv").to_vec();
     let src = TensorImage::new(1280, 720, YUYV, None).unwrap();
     src.tensor()
@@ -415,6 +415,50 @@ fn convert_cpu(bencher: divan::Bencher, params: (usize, usize)) {
 
     let (width, height) = params;
     let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
+
+    let mut converter = CPUConverter::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .unwrap()
+    });
+}
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn convert_cpu_yuyv_to_rgb(bencher: divan::Bencher, params: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera720p.yuyv").to_vec();
+    let src = TensorImage::new(1280, 720, YUYV, None).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = params;
+    let mut dst = TensorImage::new(width, height, RGB, None).unwrap();
+
+    let mut converter = CPUConverter::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .unwrap()
+    });
+}
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn convert_cpu_yuyv_to_yuyv(bencher: divan::Bencher, params: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera720p.yuyv").to_vec();
+    let src = TensorImage::new(1280, 720, YUYV, None).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = params;
+    let mut dst = TensorImage::new(width, height, YUYV, None).unwrap();
 
     let mut converter = CPUConverter::new().unwrap();
 
@@ -480,7 +524,7 @@ where
 
 #[cfg(target_os = "linux")]
 #[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
-fn convert_g2d(bencher: divan::Bencher, params: (usize, usize)) {
+fn convert_g2d_yuyv_to_rgba(bencher: divan::Bencher, params: (usize, usize)) {
     let file = include_bytes!("../../../testdata/camera720p.yuyv").to_vec();
     let src = TensorImage::new(1280, 720, YUYV, None).unwrap();
     src.tensor()
@@ -502,9 +546,55 @@ fn convert_g2d(bencher: divan::Bencher, params: (usize, usize)) {
 }
 
 #[cfg(target_os = "linux")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+fn convert_g2d_yuyv_to_rgb(bencher: divan::Bencher, params: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera720p.yuyv").to_vec();
+    let src = TensorImage::new(1280, 720, YUYV, None).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = params;
+    let mut dst = TensorImage::new(width, height, RGB, Some(TensorMemory::Dma)).unwrap();
+
+    let mut converter = G2DConverter::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .unwrap()
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+fn convert_g2d_yuyv_to_yuyv(bencher: divan::Bencher, params: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera720p.yuyv").to_vec();
+    let src = TensorImage::new(1280, 720, YUYV, None).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = params;
+    let mut dst = TensorImage::new(width, height, YUYV, Some(TensorMemory::Dma)).unwrap();
+
+    let mut converter = G2DConverter::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .unwrap()
+    });
+}
+
+#[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
 #[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
-fn convert_opengl(bencher: divan::Bencher, params: (usize, usize)) {
+fn convert_opengl_yuyv_to_rgba(bencher: divan::Bencher, params: (usize, usize)) {
     let file = include_bytes!("../../../testdata/camera720p.yuyv").to_vec();
     let src = TensorImage::new(1280, 720, YUYV, Some(TensorMemory::Dma)).unwrap();
     src.tensor()
@@ -515,6 +605,31 @@ fn convert_opengl(bencher: divan::Bencher, params: (usize, usize)) {
 
     let (width, height) = params;
     let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
+
+    let mut converter = GLConverter::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .unwrap()
+    });
+    drop(dst);
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+fn convert_opengl_yuyv_to_yuyv(bencher: divan::Bencher, params: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera720p.yuyv").to_vec();
+    let src = TensorImage::new(1280, 720, YUYV, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = params;
+    let mut dst = TensorImage::new(width, height, YUYV, None).unwrap();
 
     let mut converter = GLConverter::new().unwrap();
 
