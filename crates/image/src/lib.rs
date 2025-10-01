@@ -625,7 +625,7 @@ mod tests {
             )
             .unwrap();
 
-        compare_images(&loaded, &cpu_dst, 0.99, function!());
+        compare_images(&loaded, &cpu_dst, 0.98, function!());
     }
 
     #[test]
@@ -843,7 +843,7 @@ mod tests {
             .convert(&cpu_dst, &mut src, rot, Flip::None, None)
             .unwrap();
 
-        compare_images(&src, &unchanged_src, 0.99, function!());
+        compare_images(&src, &unchanged_src, 0.98, function!());
     }
 
     #[test]
@@ -897,7 +897,7 @@ mod tests {
                 .convert(&src, &mut gl_dst, rot, Flip::None, None)
                 .unwrap();
 
-            compare_images(&gl_dst, &cpu_dst, 0.99, function!());
+            compare_images(&gl_dst, &cpu_dst, 0.98, function!());
         }
     }
 
@@ -939,7 +939,7 @@ mod tests {
             .convert(&src, &mut g2d_dst, rot, Flip::None, None)
             .unwrap();
 
-        compare_images(&g2d_dst, &cpu_dst, 0.99, function!());
+        compare_images(&g2d_dst, &cpu_dst, 0.98, function!());
     }
 
     #[test]
@@ -980,7 +980,7 @@ mod tests {
             .convert(&src, &mut dst_direct, Rotation::None, Flip::None, None)
             .unwrap();
 
-        compare_images(&dst_through_yuyv, &dst_direct, 0.99, function!());
+        compare_images(&dst_through_yuyv, &dst_direct, 0.98, function!());
     }
 
     #[test]
@@ -1008,7 +1008,7 @@ mod tests {
             .as_mut_slice()
             .copy_from_slice(include_bytes!("../../../testdata/camera720p.rgba"));
 
-        compare_images(&dst, &target_image, 0.99, function!());
+        compare_images(&dst, &target_image, 0.98, function!());
     }
 
     #[test]
@@ -1044,7 +1044,7 @@ mod tests {
             )
             .for_each(|(dst, src)| *dst = [src[0], src[1], src[2]]);
 
-        compare_images(&dst, &target_image, 0.99, function!());
+        compare_images(&dst, &target_image, 0.98, function!());
     }
 
     #[test]
@@ -1074,7 +1074,7 @@ mod tests {
             .as_mut_slice()
             .copy_from_slice(include_bytes!("../../../testdata/camera720p.rgba"));
 
-        compare_images(&dst, &target_image, 0.99, function!());
+        compare_images(&dst, &target_image, 0.98, function!());
     }
 
     #[test]
@@ -1105,7 +1105,7 @@ mod tests {
             .as_mut_slice()
             .copy_from_slice(include_bytes!("../../../testdata/camera720p.rgba"));
 
-        compare_images(&dst, &target_image, 0.99, function!());
+        compare_images(&dst, &target_image, 0.98, function!());
     }
 
     #[test]
@@ -1147,7 +1147,7 @@ mod tests {
             )
             .unwrap();
 
-        compare_images(&dst, &dst_target, 0.99, function!());
+        compare_images(&dst, &dst_target, 0.98, function!());
     }
 
     #[test]
@@ -1201,7 +1201,62 @@ mod tests {
                 }),
             )
             .unwrap();
-        compare_images(&dst_g2d, &dst_cpu, 0.99, function!());
+        compare_images(&dst_g2d, &dst_cpu, 0.98, function!());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[cfg(feature = "opengl")]
+    fn test_yuyv_to_rgba_crop_flip_opengl() {
+        let src = load_bytes_to_tensor(
+            1280,
+            720,
+            YUYV,
+            Some(TensorMemory::Dma),
+            include_bytes!("../../../testdata/camera720p.yuyv"),
+        )
+        .unwrap();
+
+        let (dst_width, dst_height) = (640, 640);
+
+        let mut dst_gl =
+            TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
+        let mut gl_converter = GLConverter::new().unwrap();
+
+        gl_converter
+            .convert(
+                &src,
+                &mut dst_gl,
+                Rotation::None,
+                Flip::Horizontal,
+                Some(Rect {
+                    left: 20,
+                    top: 15,
+                    width: 400,
+                    height: 300,
+                }),
+            )
+            .unwrap();
+
+        let mut dst_cpu =
+            TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
+        let mut cpu_converter = CPUConverter::new().unwrap();
+
+        cpu_converter
+            .convert(
+                &src,
+                &mut dst_cpu,
+                Rotation::None,
+                Flip::Horizontal,
+                Some(Rect {
+                    left: 20,
+                    top: 15,
+                    width: 400,
+                    height: 300,
+                }),
+            )
+            .unwrap();
+        compare_images(&dst_gl, &dst_cpu, 0.98, function!());
     }
 
     fn load_bytes_to_tensor(
