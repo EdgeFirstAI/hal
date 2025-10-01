@@ -376,6 +376,59 @@ impl G2D {
 
         Ok(())
     }
+
+    pub fn set_bt601_colorspace(&mut self) -> Result<()> {
+        if unsafe {
+            self.lib
+                .g2d_enable(self.handle, g2d_cap_mode_G2D_YUV_BT_601)
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if unsafe {
+            self.lib
+                .g2d_disable(self.handle, g2d_cap_mode_G2D_YUV_BT_709)
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+
+    pub fn set_bt709_colorspace(&mut self) -> Result<()> {
+        if unsafe {
+            self.lib
+                .g2d_disable(self.handle, g2d_cap_mode_G2D_YUV_BT_601)
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+
+        if unsafe {
+            self.lib
+                .g2d_disable(self.handle, g2d_cap_mode_G2D_YUV_BT_601FR)
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+
+        if unsafe {
+            self.lib
+                .g2d_disable(self.handle, g2d_cap_mode_G2D_YUV_BT_709FR)
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+
+        if unsafe {
+            self.lib
+                .g2d_enable(self.handle, g2d_cap_mode_G2D_YUV_BT_709)
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
 }
 
 impl Drop for G2D {
