@@ -104,7 +104,7 @@ fn test_grey_load() -> PyResult<()> {
             .get_item("default")
             .unwrap()
             .downcast_into::<PyArray3<u8>>()?;
-        assert_eq!(default.shape(), [681, 1024, 1]);
+        assert_eq!(default.shape(), [681, 1024, 3]);
         Ok(())
     })
 }
