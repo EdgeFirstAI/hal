@@ -108,7 +108,7 @@ fn test_decoder_parse_config_modelpack_split_u8() -> PyResult<()> {
 
         let py_scores = py_scores.readonly();
 
-        let scores = [0.49577647];
+        let scores = [0.99240804];
 
         assert!(approx::abs_diff_eq!(
             py_scores.as_slice()?,
@@ -169,7 +169,7 @@ fn test_decoder_parse_config_from_dict() -> PyResult<()> {
 
         let py_scores = py_scores.readonly();
 
-        let scores = [0.49577647];
+        let scores = [0.99240804];
 
         assert!(approx::abs_diff_eq!(
             py_scores.as_slice()?,
@@ -228,7 +228,7 @@ fn test_modelpack_split_u8() -> PyResult<()> {
 
         let py_scores = py_scores.readonly();
 
-        let scores = [0.49577647];
+        let scores = [0.99240804];
 
         assert!(approx::abs_diff_eq!(
             py_scores.as_slice()?,
@@ -287,7 +287,7 @@ fn test_filter_int32() -> PyResult<()> {
 
         let py_scores = py_scores.readonly();
 
-        let scores = [0.49577647];
+        let scores = [0.99240804];
 
         assert!(approx::abs_diff_eq!(
             py_scores.as_slice()?,

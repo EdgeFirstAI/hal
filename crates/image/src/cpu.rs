@@ -90,7 +90,7 @@ impl CPUConverter {
         Ok(())
     }
 
-    fn convert_nv12_to_rgb(&self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+    fn convert_nv12_to_rgb(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), NV12);
         assert_eq!(dst.fourcc(), RGB);
         let map = src.tensor.map()?;
@@ -117,7 +117,7 @@ impl CPUConverter {
         )?)
     }
 
-    fn convert_nv12_to_rgba(&self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+    fn convert_nv12_to_rgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), NV12);
         assert_eq!(dst.fourcc(), RGBA);
         let map = src.tensor.map()?;
@@ -144,7 +144,7 @@ impl CPUConverter {
         )?)
     }
 
-    fn convert_yuyv_to_rgb(&self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+    fn convert_yuyv_to_rgb(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), YUYV);
         assert_eq!(dst.fourcc(), RGB);
         let src = yuv::YuvPackedImage::<u8> {
@@ -163,7 +163,7 @@ impl CPUConverter {
         )?)
     }
 
-    fn convert_nv12_to_grey(&self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+    fn convert_nv12_to_grey(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), NV12);
         assert_eq!(dst.fourcc(), GREY);
         let src_map = src.tensor.map()?;
@@ -186,7 +186,7 @@ impl CPUConverter {
         Ok(())
     }
 
-    fn convert_yuyv_to_rgba(&self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+    fn convert_yuyv_to_rgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), YUYV);
         assert_eq!(dst.fourcc(), RGBA);
         let src = yuv::YuvPackedImage::<u8> {
@@ -205,7 +205,7 @@ impl CPUConverter {
         )?)
     }
 
-    fn convert_yuyv_to_grey(&self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+    fn convert_yuyv_to_grey(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), YUYV);
         assert_eq!(dst.fourcc(), GREY);
         let src_map = src.tensor.map()?;
@@ -226,7 +226,7 @@ impl CPUConverter {
         Ok(())
     }
 
-    fn convert_grey_to_rgb(&self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+    fn convert_grey_to_rgb(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), GREY);
         assert_eq!(dst.fourcc(), RGB);
         let src = yuv::YuvGrayImage::<u8> {
@@ -244,7 +244,7 @@ impl CPUConverter {
         )?)
     }
 
-    fn convert_grey_to_rgba(&self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+    fn convert_grey_to_rgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), GREY);
         assert_eq!(dst.fourcc(), RGBA);
         let src = yuv::YuvGrayImage::<u8> {
@@ -262,7 +262,7 @@ impl CPUConverter {
         )?)
     }
 
-    fn convert_grey_to_yuyv(&self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+    fn convert_grey_to_yuyv(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), GREY);
         assert_eq!(dst.fourcc(), YUYV);
 
@@ -286,7 +286,7 @@ impl CPUConverter {
         Ok(())
     }
 
-    fn convert_rgba_to_rgb(&self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+    fn convert_rgba_to_rgb(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), RGBA);
         assert_eq!(dst.fourcc(), RGB);
 
@@ -300,7 +300,7 @@ impl CPUConverter {
         )?)
     }
 
-    fn convert_rgba_to_grey(&self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+    fn convert_rgba_to_grey(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), RGBA);
         assert_eq!(dst.fourcc(), GREY);
 
@@ -319,7 +319,7 @@ impl CPUConverter {
         )?)
     }
 
-    fn convert_rgba_to_yuyv(&self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+    fn convert_rgba_to_yuyv(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), RGBA);
         assert_eq!(dst.fourcc(), YUYV);
 
@@ -375,7 +375,7 @@ impl CPUConverter {
         Ok(())
     }
 
-    fn convert_rgb_to_rgba(&self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+    fn convert_rgb_to_rgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), RGB);
         assert_eq!(dst.fourcc(), RGBA);
 
@@ -389,7 +389,7 @@ impl CPUConverter {
         )?)
     }
 
-    fn convert_rgb_to_grey(&self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+    fn convert_rgb_to_grey(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), RGB);
         assert_eq!(dst.fourcc(), GREY);
 
@@ -408,7 +408,7 @@ impl CPUConverter {
         )?)
     }
 
-    fn convert_rgb_to_yuyv(&self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+    fn convert_rgb_to_yuyv(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), RGB);
         assert_eq!(dst.fourcc(), YUYV);
 
@@ -463,37 +463,37 @@ impl CPUConverter {
         Ok(())
     }
 
-    fn copy_image(&self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+    fn copy_image(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), dst.fourcc());
         dst.tensor().map()?.copy_from_slice(&src.tensor().map()?);
         Ok(())
     }
 
-    fn convert_format(&self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+    pub(crate) fn convert_format(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         // shapes should be equal
         assert_eq!(src.height(), dst.height());
         assert_eq!(src.width(), dst.width());
 
         match (src.fourcc(), dst.fourcc()) {
-            (NV12, RGB) => self.convert_nv12_to_rgb(src, dst),
-            (NV12, RGBA) => self.convert_nv12_to_rgba(src, dst),
-            (NV12, GREY) => self.convert_nv12_to_grey(src, dst),
-            (YUYV, RGB) => self.convert_yuyv_to_rgb(src, dst),
-            (YUYV, RGBA) => self.convert_yuyv_to_rgba(src, dst),
-            (YUYV, GREY) => self.convert_yuyv_to_grey(src, dst),
-            (YUYV, YUYV) => self.copy_image(src, dst),
-            (RGBA, RGB) => self.convert_rgba_to_rgb(src, dst),
-            (RGBA, RGBA) => self.copy_image(src, dst),
-            (RGBA, GREY) => self.convert_rgba_to_grey(src, dst),
-            (RGBA, YUYV) => self.convert_rgba_to_yuyv(src, dst),
-            (RGB, RGB) => self.copy_image(src, dst),
-            (RGB, RGBA) => self.convert_rgb_to_rgba(src, dst),
-            (RGB, GREY) => self.convert_rgb_to_grey(src, dst),
-            (RGB, YUYV) => self.convert_rgb_to_yuyv(src, dst),
-            (GREY, RGB) => self.convert_grey_to_rgb(src, dst),
-            (GREY, RGBA) => self.convert_grey_to_rgba(src, dst),
-            (GREY, GREY) => self.copy_image(src, dst),
-            (GREY, YUYV) => self.convert_grey_to_yuyv(src, dst),
+            (NV12, RGB) => Self::convert_nv12_to_rgb(src, dst),
+            (NV12, RGBA) => Self::convert_nv12_to_rgba(src, dst),
+            (NV12, GREY) => Self::convert_nv12_to_grey(src, dst),
+            (YUYV, RGB) => Self::convert_yuyv_to_rgb(src, dst),
+            (YUYV, RGBA) => Self::convert_yuyv_to_rgba(src, dst),
+            (YUYV, GREY) => Self::convert_yuyv_to_grey(src, dst),
+            (YUYV, YUYV) => Self::copy_image(src, dst),
+            (RGBA, RGB) => Self::convert_rgba_to_rgb(src, dst),
+            (RGBA, RGBA) => Self::copy_image(src, dst),
+            (RGBA, GREY) => Self::convert_rgba_to_grey(src, dst),
+            (RGBA, YUYV) => Self::convert_rgba_to_yuyv(src, dst),
+            (RGB, RGB) => Self::copy_image(src, dst),
+            (RGB, RGBA) => Self::convert_rgb_to_rgba(src, dst),
+            (RGB, GREY) => Self::convert_rgb_to_grey(src, dst),
+            (RGB, YUYV) => Self::convert_rgb_to_yuyv(src, dst),
+            (GREY, RGB) => Self::convert_grey_to_rgb(src, dst),
+            (GREY, RGBA) => Self::convert_grey_to_rgba(src, dst),
+            (GREY, GREY) => Self::copy_image(src, dst),
+            (GREY, YUYV) => Self::convert_grey_to_yuyv(src, dst),
             (s, d) => Err(Error::NotSupported(format!(
                 "Conversion from {} to {} is not supported",
                 s.display(),
@@ -647,7 +647,7 @@ impl ImageConverterTrait for CPUConverter {
             && dst.width() == src.width()
             && dst.height() == src.height()
         {
-            return self.convert_format(src, dst);
+            return Self::convert_format(src, dst);
         };
 
         // any extra checks
@@ -666,7 +666,7 @@ impl ImageConverterTrait for CPUConverter {
             Some(edgefirst_tensor::TensorMemory::Mem),
         )?;
 
-        self.convert_format(src, &mut tmp)?;
+        Self::convert_format(src, &mut tmp)?;
 
         // format must be RGB/RGBA/GREY
         matches!(tmp.fourcc(), RGB | RGBA | GREY);
@@ -680,7 +680,7 @@ impl ImageConverterTrait for CPUConverter {
                 Some(edgefirst_tensor::TensorMemory::Mem),
             )?;
             self.resize_flip_rotate(&mut tmp2, &tmp, rotation, flip, crop)?;
-            self.convert_format(&tmp2, dst)?;
+            Self::convert_format(&tmp2, dst)?;
         }
 
         Ok(())

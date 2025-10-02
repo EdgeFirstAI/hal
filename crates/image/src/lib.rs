@@ -6,7 +6,7 @@
 //! acceleration when available, but also provides a CPU-based fallback for
 //! environments where hardware acceleration is not present or not suitable.
 
-use edgefirst_tensor::{Tensor, TensorMapTrait, TensorMemory, TensorTrait as _};
+use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait as _};
 use enum_dispatch::enum_dispatch;
 use four_char_code::{FourCharCode, four_char_code};
 use zune_jpeg::{
@@ -113,22 +113,37 @@ impl TensorImage {
         format: Option<FourCharCode>,
         memory: Option<TensorMemory>,
     ) -> Result<Self> {
-        let format = format.unwrap_or(RGB);
         let colour = match format {
-            RGB => ColorSpace::RGB,
-            RGBA => ColorSpace::RGBA,
+            Some(RGB) => ColorSpace::RGB,
+            Some(RGBA) => ColorSpace::RGBA,
+            Some(GREY) => ColorSpace::Luma,
+            None => ColorSpace::RGB,
             _ => {
-                return Err(Error::NotImplemented(
-                    "Unsupported image format".to_string(),
-                ));
+                return Err(Error::NotSupported("Unsupported image format".to_string()));
             }
         };
-
         let options = DecoderOptions::default().jpeg_set_out_colorspace(colour);
         let mut decoder = JpegDecoder::new_with_options(image, options);
         decoder.decode_headers()?;
 
         let image_info = decoder.info().unwrap();
+
+        let converted_color_space = decoder
+            .get_output_colorspace()
+            .ok_or(Error::Internal("No output colorspace".to_string()))?;
+
+        let converted_color_space = match converted_color_space {
+            ColorSpace::RGB => RGB,
+            ColorSpace::RGBA => RGBA,
+            ColorSpace::Luma => GREY,
+            _ => {
+                return Err(Error::NotSupported(
+                    "Unsupported JPEG decoder output".to_string(),
+                ));
+            }
+        };
+
+        let dest_format = format.unwrap_or(converted_color_space);
 
         let (rotation, flip) = decoder
             .exif()
@@ -136,25 +151,51 @@ impl TensorImage {
             .unwrap_or((Rotation::None, Flip::None));
 
         if (rotation, flip) == (Rotation::None, Flip::None) {
-            let img = Self::new(
+            let mut img = Self::new(
                 image_info.width as usize,
                 image_info.height as usize,
-                format,
+                dest_format,
                 memory,
             )?;
 
-            let mut tensor_map: edgefirst_tensor::TensorMap<u8> = img.tensor.map()?;
-            decoder.decode_into(&mut tensor_map)?;
+            if converted_color_space != dest_format {
+                let tmp = Self::new(
+                    image_info.width as usize,
+                    image_info.height as usize,
+                    converted_color_space,
+                    Some(TensorMemory::Mem),
+                )?;
+
+                decoder.decode_into(&mut tmp.tensor.map()?)?;
+
+                CPUConverter::convert_format(&tmp, &mut img)?;
+                return Ok(img);
+            }
+            decoder.decode_into(&mut img.tensor.map()?)?;
             return Ok(img);
         }
 
-        let tmp = Self::new(
+        let mut tmp = Self::new(
             image_info.width as usize,
             image_info.height as usize,
-            format,
+            dest_format,
             Some(TensorMemory::Mem),
         )?;
-        decoder.decode_into(tmp.tensor.map()?.as_mut_slice())?;
+
+        if converted_color_space != dest_format {
+            let tmp2 = Self::new(
+                image_info.width as usize,
+                image_info.height as usize,
+                converted_color_space,
+                Some(TensorMemory::Mem),
+            )?;
+
+            decoder.decode_into(&mut tmp2.tensor.map()?)?;
+
+            CPUConverter::convert_format(&tmp2, &mut tmp)?;
+        } else {
+            decoder.decode_into(&mut tmp.tensor.map()?)?;
+        }
 
         rotate_flip_to_tensor_image(&tmp, rotation, flip, memory)
     }
@@ -540,42 +581,24 @@ mod tests {
         assert_eq!(img.fourcc(), RGB);
     }
 
-    // #[test]
-    // fn test_opengl_grey() {
-    //     let path = Path::new("testdata/zidane.jpg");
-    //     let path = match path.exists() {
-    //         true => path,
-    //         false => {
-    //             let path = Path::new("../testdata/zidane.jpg");
-    //             if path.exists() {
-    //                 path
-    //             } else {
-    //                 Path::new("../../testdata/zidane.jpg")
-    //             }
-    //         }
-    //     };
-    //     assert!(path.exists(), "Test image not found at {path:?}");
+    #[test]
+    fn test_load_grey() {
+        let grey_img = TensorImage::load_jpeg(
+            include_bytes!("../../../testdata/grey.jpg"),
+            Some(RGBA),
+            None,
+        )
+        .unwrap();
 
-    //     let file = std::fs::read(path).unwrap();
-    //     let img = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
-    //     assert_eq!(img.width(), 1280);
-    //     assert_eq!(img.height(), 720);
+        let grey_but_rgb_img = TensorImage::load_jpeg(
+            include_bytes!("../../../testdata/grey-rgb.jpg"),
+            Some(RGBA),
+            None,
+        )
+        .unwrap();
 
-    //     let mut grey = TensorImage::new(1280, 720, GREY,
-    // Some(TensorMemory::Dma)).unwrap();     let mut dst =
-    // TensorImage::new(640, 640, GREY, Some(TensorMemory::Dma)).unwrap();
-
-    //     let mut converter = CPUConverter::new().unwrap();
-
-    //     converter
-    //         .convert(&img, &mut grey, Rotation::None, Flip::None, None)
-    //         .unwrap();
-
-    //     let mut gl = GLConverter::new().unwrap();
-    //     gl.convert(&grey, &mut dst, Rotation::None, Flip::None, None)
-    //         .unwrap()
-    // }
-
+        compare_images(&grey_img, &grey_but_rgb_img, 0.99, function!());
+    }
     #[test]
     #[cfg(target_os = "linux")]
     fn test_new_image_converter() {
@@ -698,6 +721,32 @@ mod tests {
                 std::panic::resume_unwind(e)
             }
         });
+    }
+
+    #[test]
+    #[cfg(feature = "opengl")]
+    fn test_opengl_grey() {
+        let img = TensorImage::load_jpeg(
+            include_bytes!("../../../testdata/grey.jpg"),
+            Some(GREY),
+            None,
+        )
+        .unwrap();
+
+        let mut gl_dst = TensorImage::new(640, 640, GREY, Some(TensorMemory::Dma)).unwrap();
+        let mut cpu_dst = TensorImage::new(640, 640, GREY, Some(TensorMemory::Dma)).unwrap();
+
+        let mut converter = CPUConverter::new().unwrap();
+
+        converter
+            .convert(&img, &mut cpu_dst, Rotation::None, Flip::None, None)
+            .unwrap();
+
+        let mut gl = GLConverter::new().unwrap();
+        gl.convert(&img, &mut gl_dst, Rotation::None, Flip::None, None)
+            .unwrap();
+
+        compare_images(&gl_dst, &cpu_dst, 0.98, function!());
     }
 
     #[test]
@@ -1163,7 +1212,20 @@ mod tests {
             .convert(&src, &mut cpu_dst, Rotation::None, Flip::None, None)
             .unwrap();
 
-        compare_images(&g2d_dst, &cpu_dst, 0.98, function!());
+        // TODO: compare YUYV and YUYV images without having to convert them to RGB
+
+        let mut g2d_rgb = TensorImage::new(600, 400, RGB, None).unwrap();
+        let mut cpu_rgb = TensorImage::new(600, 400, RGB, None).unwrap();
+
+        cpu_converter
+            .convert(&g2d_dst, &mut g2d_rgb, Rotation::None, Flip::None, None)
+            .unwrap();
+
+        cpu_converter
+            .convert(&cpu_dst, &mut cpu_rgb, Rotation::None, Flip::None, None)
+            .unwrap();
+
+        compare_images(&g2d_rgb, &cpu_rgb, 0.98, function!());
     }
 
     #[test]
@@ -1334,7 +1396,7 @@ mod tests {
         assert_eq!(img1.width(), img2.width(), "Widths differ");
         assert_eq!(img1.fourcc(), img2.fourcc(), "FourCC differ");
         assert!(
-            matches!(img1.fourcc(), RGB | RGBA,),
+            matches!(img1.fourcc(), RGB | RGBA | GREY),
             "FourCC must be RGB or RGBA for comparison"
         );
         let image1 = match img1.fourcc() {
@@ -1351,7 +1413,13 @@ mod tests {
             )
             .unwrap()
             .convert(),
-
+            GREY => image::GrayImage::from_vec(
+                img1.width() as u32,
+                img1.height() as u32,
+                img1.tensor().map().unwrap().to_vec(),
+            )
+            .unwrap()
+            .convert(),
             _ => return,
         };
 
@@ -1369,7 +1437,13 @@ mod tests {
             )
             .unwrap()
             .convert(),
-
+            GREY => image::GrayImage::from_vec(
+                img2.width() as u32,
+                img2.height() as u32,
+                img2.tensor().map().unwrap().to_vec(),
+            )
+            .unwrap()
+            .convert(),
             _ => return,
         };
 
