@@ -11,7 +11,7 @@ license.workspace = true
 
 
 [features]
-default = ["opengl"]
+default = []
 opengl = ["dep:khronos-egl", "dep:gbm", "dep:drm"]
 
 

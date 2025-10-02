@@ -79,3 +79,32 @@ fn test_flip() -> PyResult<()> {
         Ok(())
     })
 }
+
+#[test]
+fn test_grey_load() -> PyResult<()> {
+    pyo3::append_to_inittab!(edgefirst_python_module);
+    pyo3::prepare_freethreaded_python();
+    Python::with_gil(|py| {
+        let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
+        py.run(c_str!(include_str!("image/grey_load.py")), None, Some(&out))?;
+        let rgba = out
+            .get_item("rgba")
+            .unwrap()
+            .downcast_into::<PyArray3<u8>>()?;
+
+        assert_eq!(rgba.shape(), [681, 1024, 4]);
+
+        let grey = out
+            .get_item("grey")
+            .unwrap()
+            .downcast_into::<PyArray3<u8>>()?;
+        assert_eq!(grey.shape(), [681, 1024, 1]);
+
+        let default = out
+            .get_item("default")
+            .unwrap()
+            .downcast_into::<PyArray3<u8>>()?;
+        assert_eq!(default.shape(), [681, 1024, 1]);
+        Ok(())
+    })
+}
