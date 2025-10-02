@@ -144,12 +144,12 @@ class TensorImage:
 
     # [pyo3(signature = (data, fourcc = None))]
     @staticmethod
-    def load_from_bytes(data: bytes, fourcc: Union[None, FourCC] = None) -> TensorImage:
+    def load_from_bytes(data: bytes, fourcc: Union[None, FourCC] = FourCC.RGB) -> TensorImage:
         ...
 
     # [pyo3(signature = (filename, fourcc = None))]
     @staticmethod
-    def load(filename: str, fourcc: Union[None, FourCC] = None) -> TensorImage:
+    def load(filename: str, fourcc: Union[None, FourCC] = FourCC.RGB) -> TensorImage:
         ...
 
     # [pyo3(signature = (filename, quality=80))]
