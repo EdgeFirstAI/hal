@@ -13,5 +13,8 @@ testdata/yolov8_segmentation_37x8400.bin filter=lfs diff=lfs merge=lfs -text
 testdata/modelpack_boxes_1935x1x4.bin filter=lfs diff=lfs merge=lfs -text
 testdata/yolov8_boxes_116x8400.bin filter=lfs diff=lfs merge=lfs -text
 testdata/yolov8_mask_results.bin filter=lfs diff=lfs merge=lfs -text
+testdata/grey-rgb.jpg filter=lfs diff=lfs merge=lfs -text
+testdata/grey.jpg filter=lfs diff=lfs merge=lfs -text
+testdata/zidane_rotated_exif.jpg filter=lfs diff=lfs merge=lfs -text
 testdata/camera1080p.* filter=lfs diff=lfs merge=lfs -text
 testdata/camera4k.* filter=lfs diff=lfs merge=lfs -text

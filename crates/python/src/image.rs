@@ -129,19 +129,19 @@ impl PyTensorImage {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (data, fourcc = FourCC::RGB))]
-    pub fn load_from_bytes(data: &[u8], fourcc: FourCC) -> Result<Self> {
-        let fourcc: FourCharCode = fourcc.into();
-        let tensor_image = image::TensorImage::load(data, Some(fourcc), None)?;
+    #[pyo3(signature = (data, fourcc = None))]
+    pub fn load_from_bytes(data: &[u8], fourcc: Option<FourCC>) -> Result<Self> {
+        let fourcc = fourcc.map(|f| f.into());
+        let tensor_image = image::TensorImage::load(data, fourcc, None)?;
         Ok(PyTensorImage(tensor_image))
     }
 
     #[staticmethod]
-    #[pyo3(signature = (filename, fourcc = FourCC::RGB))]
-    pub fn load(filename: &str, fourcc: FourCC) -> Result<Self> {
-        let fourcc: FourCharCode = fourcc.into();
+    #[pyo3(signature = (filename, fourcc = None))]
+    pub fn load(filename: &str, fourcc: Option<FourCC>) -> Result<Self> {
+        let fourcc = fourcc.map(|f| f.into());
         let data = std::fs::read(filename)?;
-        let tensor_image = image::TensorImage::load(&data, Some(fourcc), None)?;
+        let tensor_image = image::TensorImage::load(&data, fourcc, None)?;
         Ok(PyTensorImage(tensor_image))
     }
 
