@@ -118,15 +118,20 @@ impl TensorImage {
             Some(RGBA) => ColorSpace::RGBA,
             Some(GREY) => ColorSpace::Luma,
             None => ColorSpace::RGB,
-            _ => {
-                return Err(Error::NotSupported("Unsupported image format".to_string()));
+            Some(f) => {
+                return Err(Error::NotSupported(format!(
+                    "Unsupported image format {}",
+                    f.display()
+                )));
             }
         };
         let options = DecoderOptions::default().jpeg_set_out_colorspace(colour);
         let mut decoder = JpegDecoder::new_with_options(image, options);
         decoder.decode_headers()?;
 
-        let image_info = decoder.info().unwrap();
+        let image_info = decoder.info().ok_or(Error::Internal(
+            "JPEG did not return decoded image info".to_string(),
+        ))?;
 
         let converted_color_space = decoder
             .get_output_colorspace()
@@ -221,7 +226,9 @@ impl TensorImage {
             .png_set_decode_animated(false);
         let mut decoder = PngDecoder::new_with_options(image, options);
         decoder.decode_headers()?;
-        let image_info = decoder.get_info().unwrap();
+        let image_info = decoder.get_info().ok_or(Error::Internal(
+            "PNG did not return decoded image info".to_string(),
+        ))?;
 
         let (rotation, flip) = image_info
             .exif
