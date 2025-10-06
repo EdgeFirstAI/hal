@@ -50,10 +50,11 @@ impl Headless {
         let lib = unsafe { libloading::Library::new("libEGL.so.1") }?;
         let egl = unsafe { egl::DynamicInstance::<egl::EGL1_4>::load_required_from(lib)? };
         Self::egl_check_support(&egl)?;
+
         // init a GBM device
         let gbm = Device::new(Card::open_global()?)?;
 
-        // egl.get_display(display_id)
+        // let disp = unsafe { egl.get_display(egl::DEFAULT_DISPLAY) };
         debug!("gbm: {gbm:?}");
         let display = Self::egl_get_platform_display_with_fallback(
             &egl,
@@ -97,7 +98,7 @@ impl Headless {
             width as u32,
             height as u32,
             DrmFourcc::Abgr8888,
-            gbm::BufferObjectFlags::RENDERING | gbm::BufferObjectFlags::SCANOUT,
+            gbm::BufferObjectFlags::RENDERING,
         )?;
         debug!("gbm_surface: {gbm_surface:?}");
         let surface = Self::egl_create_platform_window_surface_with_fallback(
@@ -123,61 +124,6 @@ impl Headless {
             format: RGBA,
         };
         Ok(headless)
-    }
-
-    fn new_surface(
-        &mut self,
-        width: usize,
-        height: usize,
-        fourcc: FourCharCode,
-    ) -> Result<(), crate::Error> {
-        let _ = self.egl.destroy_surface(self.display, self.surface);
-
-        let format = match fourcc {
-            RGBA => DrmFourcc::Abgr8888,
-            RGB => DrmFourcc::Bgr888,
-            YUYV => DrmFourcc::Yuyv,
-            NV12 => DrmFourcc::Nv12,
-            GREY => DrmFourcc::R8,
-            f => {
-                return Err(Error::NotSupported(format!(
-                    "Destination format {}",
-                    f.display()
-                )));
-            }
-        };
-
-        let gbm_surface: gbm::Surface<()> = self._gbm.create_surface(
-            width as u32,
-            height as u32,
-            format,
-            gbm::BufferObjectFlags::RENDERING,
-        )?;
-        debug!("gbm_surface: {gbm_surface:?}");
-        let surface = Self::egl_create_platform_window_surface_with_fallback(
-            &self.egl,
-            self.display,
-            self.config,
-            gbm_surface.as_raw() as *mut c_void,
-            &[egl::ATTRIB_NONE],
-        )?;
-        debug!("surface: {surface:?}");
-
-        self.gbm_surface = gbm_surface;
-        self.surface = surface;
-        self.size = (width, height);
-        self.format = fourcc;
-        self.make_current()?;
-        Ok(())
-    }
-
-    fn make_current(&self) -> Result<(), crate::Error> {
-        Ok(self.egl.make_current(
-            self.display,
-            Some(self.surface),
-            Some(self.surface),
-            Some(self.ctx),
-        )?)
     }
 
     fn egl_check_support(
@@ -354,7 +300,7 @@ impl Headless {
 
 impl Drop for Headless {
     fn drop(&mut self) {
-        let _ = self.egl.destroy_surface(self.display, self.surface);
+        // let _ = self.egl.destroy_surface(self.display, self.surface);
         let _ = self.egl.destroy_context(self.display, self.ctx);
     }
 }
@@ -417,6 +363,7 @@ pub struct GLConverter {
     camera_texture: Texture,
     vertex_buffer: Buffer,
     texture_buffer: Buffer,
+    render_texture: Texture,
 }
 
 impl ImageConverterTrait for GLConverter {
@@ -434,62 +381,64 @@ impl ImageConverterTrait for GLConverter {
         }
 
         if dst.is_planar() && matches!(dst.fourcc(), RGB | RGBA) {
-            if self.gbm_rendering.size != (dst.width() / 4, dst.height() * 3)
-                && self
-                    .resize(dst.width() / 4, dst.height() * 3, RGBA)
-                    .is_err()
-            {
-                return Err(Error::NotSupported(format!(
-                    "Could not resize OpenGL context to {}x{} with format {}",
-                    dst.width() / 4,
-                    dst.height() * 3,
-                    RGBA.display(),
-                )));
-            }
+            // if self.gbm_rendering.size != (dst.width() / 4, dst.height() * 3)
+            //     && self
+            //         .resize(dst.width() / 4, dst.height() * 3, RGBA)
+            //         .is_err()
+            // {
+            //     return Err(Error::NotSupported(format!(
+            //         "Could not resize OpenGL context to {}x{} with format {}",
+            //         dst.width() / 4,
+            //         dst.height() * 3,
+            //         RGBA.display(),
+            //     )));
+            // }
             if rotation != Rotation::None || flip != Flip::None {
                 return Err(Error::NotSupported(
                     "Rotation or Flip not supported for planar RGB".to_string(),
                 ));
             }
-            self.convert_to_planar(src, crop)?;
+            // self.resize(dst.width() / 4, dst.height() * 3, RGBA)?;
+            // self.convert_to_planar(src, crop)?;
+            self.convert_dest_non_dma(dst, src, rotation, flip, crop)?;
         } else {
-            if (self.gbm_rendering.size != (dst.width(), dst.height())
-                || self.gbm_rendering.format != dst.fourcc())
-                && self
-                    .resize(dst.width(), dst.height(), dst.fourcc())
-                    .is_err()
-            {
-                return Err(Error::NotSupported(format!(
-                    "Could not resize OpenGL context to {}x{} with format {}",
-                    dst.width(),
-                    dst.height(),
-                    dst.fourcc().display(),
-                )));
-            }
-            self.convert_to(src, rotation, flip, crop, true)?;
+            // if self
+            //     .resize(dst.width(), dst.height(), dst.fourcc())
+            //     .is_err()
+            // {
+            //     return Err(Error::NotSupported(format!(
+            //         "Could not resize OpenGL context to {}x{} with format {}",
+            //         dst.width(),
+            //         dst.height(),
+            //         dst.fourcc().display(),
+            //     )));
+            // }
+            // self.resize(dst.width(), dst.height(), dst.fourcc())?;
+            // self.convert_to(src, rotation, flip, crop, false)?;
+            self.convert_dest_non_dma(dst, src, rotation, flip, crop)?;
         }
 
-        self.gbm_rendering
-            .egl
-            .swap_buffers(self.gbm_rendering.display, self.gbm_rendering.surface)?;
+        // self.gbm_rendering
+        //     .egl
+        //     .swap_buffers(self.gbm_rendering.display, self.gbm_rendering.surface)?;
 
-        let bo = unsafe { self.gbm_rendering.gbm_surface.lock_front_buffer()? };
+        // let bo = unsafe { self.gbm_rendering.gbm_surface.lock_front_buffer()? };
 
-        match &mut dst.tensor {
-            edgefirst_tensor::Tensor::Shm(_shm_tensor) => {
-                let mut mmap = _shm_tensor.map()?;
-                bo.map(0, 0, bo.width(), bo.height(), |x| {
-                    mmap.copy_from_slice(x.buffer())
-                })?;
-            }
-            edgefirst_tensor::Tensor::Mem(_mem_tensor) => {
-                let mut mmap = _mem_tensor.map()?;
-                bo.map(0, 0, bo.width(), bo.height(), |x| {
-                    mmap.copy_from_slice(x.buffer())
-                })?;
-            }
-            edgefirst_tensor::Tensor::Dma(_) => unreachable!(),
-        }
+        // match &mut dst.tensor {
+        //     edgefirst_tensor::Tensor::Shm(_shm_tensor) => {
+        //         let mut mmap = _shm_tensor.map()?;
+        //         bo.map(0, 0, bo.width(), bo.height(), |x| {
+        //             mmap.copy_from_slice(x.buffer())
+        //         })?;
+        //     }
+        //     edgefirst_tensor::Tensor::Mem(_mem_tensor) => {
+        //         let mut mmap = _mem_tensor.map()?;
+        //         bo.map(0, 0, bo.width(), bo.height(), |x| {
+        //             mmap.copy_from_slice(x.buffer())
+        //         })?;
+        //     }
+        //     edgefirst_tensor::Tensor::Dma(_) => unreachable!(),
+        // }
 
         Ok(())
     }
@@ -518,7 +467,7 @@ impl GLConverter {
         let texture_program =
             GlProgram::new(generate_vertex_shader(), generate_texture_fragment_shader())?;
         let camera_texture = Texture::new();
-
+        let render_texture = Texture::new();
         let vertex_buffer = Buffer::new(0, 3, 100);
         let texture_buffer = Buffer::new(1, 2, 100);
         let converter = GLConverter {
@@ -528,18 +477,11 @@ impl GLConverter {
             camera_texture,
             vertex_buffer,
             texture_buffer,
+            render_texture,
         };
-        converter.warmup(3)?;
+        // converter.warmup(3)?;
         check_gl_error()?;
         Ok(converter)
-    }
-
-    fn resize(&mut self, width: usize, height: usize, fourcc: FourCharCode) -> Result<(), Error> {
-        self.gbm_rendering.new_surface(width, height, fourcc)?;
-        unsafe {
-            gls::gl::Viewport(0, 0, width as i32, height as i32);
-        }
-        self.warmup(1)
     }
 
     fn convert_dest_dma(
@@ -551,7 +493,6 @@ impl GLConverter {
         crop: Option<crate::Rect>,
     ) -> crate::Result<()> {
         let frame_buffer = FrameBuffer::new();
-        let render_texture = Texture::new();
         frame_buffer.bind();
 
         let (width, height) = if dst.is_planar() && matches!(dst.fourcc(), RGB | RGBA) {
@@ -572,8 +513,8 @@ impl GLConverter {
         let dest_img = self.create_image_from_dma2(dst)?;
 
         unsafe {
-            gls::gl::UseProgram(self.texture_program_planar.id);
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D, render_texture.id);
+            gls::gl::UseProgram(self.texture_program.id);
+            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
             gls::gl::TexParameteri(
                 gls::gl::TEXTURE_2D,
@@ -590,7 +531,7 @@ impl GLConverter {
                 gls::gl::FRAMEBUFFER,
                 gls::gl::COLOR_ATTACHMENT0,
                 gls::gl::TEXTURE_2D,
-                render_texture.id,
+                self.render_texture.id,
                 0,
             );
             check_gl_error()?;
@@ -602,6 +543,131 @@ impl GLConverter {
         } else {
             self.convert_to(src, rotation, flip, crop, false)
         }
+    }
+
+    fn convert_dest_non_dma(
+        &mut self,
+        dst: &mut TensorImage,
+        src: &TensorImage,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: Option<crate::Rect>,
+    ) -> crate::Result<()> {
+        let frame_buffer = FrameBuffer::new();
+        frame_buffer.bind();
+
+        let (width, height) = if dst.is_planar() && matches!(dst.fourcc(), RGB | RGBA) {
+            let width = src.width() / 4;
+            let height = match src.fourcc() {
+                RGBA => src.height() * 4,
+                RGB => src.height() * 3,
+                fourcc => {
+                    return Err(crate::Error::NotSupported(format!(
+                        "Unsupported Planar FourCC {}",
+                        fourcc.display()
+                    )));
+                }
+            };
+            (width as i32, height as i32)
+        } else {
+            (dst.width() as i32, dst.height() as i32)
+        };
+
+        let format = if dst.is_planar() {
+            gls::gl::RGBA
+        } else {
+            match dst.fourcc() {
+                RGB => gls::gl::RGB,
+                RGBA => gls::gl::RGBA,
+                GREY => gls::gl::R8,
+                f => {
+                    return Err(crate::Error::NotSupported(format!(
+                        "Opengl doesn't support {} destination texture",
+                        f.display()
+                    )));
+                }
+            }
+        };
+
+        unsafe {
+            gls::gl::UseProgram(self.texture_program.id);
+            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
+            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+            gls::gl::TexParameteri(
+                gls::gl::TEXTURE_2D,
+                gls::gl::TEXTURE_MIN_FILTER,
+                gls::gl::NEAREST as i32,
+            );
+            gls::gl::TexParameteri(
+                gls::gl::TEXTURE_2D,
+                gls::gl::TEXTURE_MAG_FILTER,
+                gls::gl::LINEAR as i32,
+            );
+            gls::gl::TexImage2D(
+                gls::gl::TEXTURE_2D,
+                0,
+                format as i32,
+                width,
+                height,
+                0,
+                format,
+                gls::gl::UNSIGNED_BYTE,
+                std::ptr::null(),
+            );
+            gls::gl::FramebufferTexture2D(
+                gls::gl::FRAMEBUFFER,
+                gls::gl::COLOR_ATTACHMENT0,
+                gls::gl::TEXTURE_2D,
+                self.render_texture.id,
+                0,
+            );
+            check_gl_error()?;
+            gls::gl::Viewport(0, 0, width, height);
+        }
+
+        if dst.is_planar() {
+            self.convert_to_planar(src, crop)?;
+        } else {
+            self.convert_to(src, rotation, flip, crop, false)?;
+        }
+
+        let dest_format = match dst.fourcc() {
+            RGB => gls::gl::RGB,
+            RGBA => gls::gl::RGBA,
+            GREY => gls::gl::RED,
+            f => {
+                return Err(Error::NotSupported(format!(
+                    "{} textures aren't supported by OpenGL",
+                    f.display()
+                )));
+            }
+        };
+        unsafe {
+            gls::gl::PixelStorei(gls::gl::PACK_ALIGNMENT, 1);
+            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
+            // gls::gl::GetActiveAttrib
+            let func = self
+                .gbm_rendering
+                .egl
+                .get_proc_address("glGetTexImage")
+                .unwrap();
+
+            let gl_get_tex_image: fn(
+                target: gls::gl::GLenum,
+                level: gls::gl::GLint,
+                format: gls::gl::GLenum,
+                type_: gls::gl::GLenum,
+                pixels: *mut c_void,
+            ) = std::mem::transmute(func);
+            gl_get_tex_image(
+                gls::gl::TEXTURE_2D,
+                0,
+                dest_format,
+                gls::gl::UNSIGNED_BYTE,
+                dst.tensor().map()?.as_mut_ptr() as *mut c_void,
+            );
+        }
+        Ok(())
     }
 
     fn convert_to(
@@ -658,20 +724,20 @@ impl GLConverter {
         result
     }
 
-    fn warmup(&self, n: usize) -> Result<(), crate::Error> {
-        let mut _bo;
-        for _ in 0..n {
-            unsafe {
-                gls::gl::ClearColor(0.0, 0.0, 0.0, 0.0);
-                gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
-            };
-            self.gbm_rendering
-                .egl
-                .swap_buffers(self.gbm_rendering.display, self.gbm_rendering.surface)?;
-            _bo = unsafe { self.gbm_rendering.gbm_surface.lock_front_buffer()? };
-        }
-        Ok(())
-    }
+    // fn warmup(&self, n: usize) -> Result<(), crate::Error> {
+    //     let mut _bo;
+    //     for _ in 0..n {
+    //         unsafe {
+    //             gls::gl::ClearColor(0.0, 0.0, 0.0, 0.0);
+    //             gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
+    //         };
+    //         self.gbm_rendering
+    //             .egl
+    //             .swap_buffers(self.gbm_rendering.display,
+    // self.gbm_rendering.surface)?;         _bo = unsafe {
+    // self.gbm_rendering.gbm_surface.lock_front_buffer()? };     }
+    //     Ok(())
+    // }
 
     fn convert_to_planar(
         &self,
@@ -689,7 +755,6 @@ impl GLConverter {
             ));
         }
 
-        self.gbm_rendering.make_current()?;
         let new_egl_image = self.create_image_from_dma2(src)?;
         unsafe {
             gls::gl::ClearColor(0.0, 0.0, 0.0, 0.0);
@@ -1366,7 +1431,7 @@ fn compile_shader_from_str(shader: u32, shader_source: &str, shader_name: &str) 
         if is_compiled == 0 {
             let mut max_length = 0;
             gls::gl::GetShaderiv(shader, gls::gl::INFO_LOG_LENGTH, &raw mut max_length);
-            let mut error_log: Vec<u8> = vec![0; max_length as usize];
+            let mut error_log: Vec<u8> = vec![0; max_length as usize + 1];
             gls::gl::GetShaderInfoLog(
                 shader,
                 max_length,
@@ -1393,6 +1458,7 @@ fn check_gl_error() -> Result<(), Error> {
         let err = gls::gl::GetError();
         if err != gls::gl::NO_ERROR {
             error!("GL Error: {err}");
+            // panic!("GL Error: {err}");
             return Err(Error::OpenGl(format!("{err}")));
         }
     }
