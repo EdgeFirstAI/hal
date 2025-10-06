@@ -1,9 +1,11 @@
 #![cfg(target_os = "linux")]
 #![cfg(feature = "opengl")]
-use drm::{Device as DrmDevice, buffer::DrmFourcc, control::Device as DrmControlDevice};
 use edgefirst_tensor::TensorTrait;
 use four_char_code::FourCharCode;
-use gbm::{AsRaw, Device};
+use gbm::{
+    AsRaw, Device,
+    drm::{Device as DrmDevice, buffer::DrmFourcc, control::Device as DrmControlDevice},
+};
 use khronos_egl::{self as egl, Attrib, Config, Display, EGL1_4, NativeWindowType, Surface};
 use log::{debug, error};
 use std::{
@@ -47,20 +49,12 @@ impl Headless {
         // Create an EGL API instance.
         let lib = unsafe { libloading::Library::new("libEGL.so.1") }?;
         let egl = unsafe { egl::DynamicInstance::<egl::EGL1_4>::load_required_from(lib)? };
-        if !Self::egl_check_support(&egl) {
-            return Err(Error::NotSupported("EGL version not supported".to_string()));
-        }
+        Self::egl_check_support(&egl)?;
         // init a GBM device
         let gbm = Device::new(Card::open_global()?)?;
 
+        // egl.get_display(display_id)
         debug!("gbm: {gbm:?}");
-        // let display = unsafe {
-        //     get_platform_display_ext(
-        //         egl_ext::PLATFORM_GBM_KHR,
-        //         gbm.as_raw() as *mut c_void,
-        //         &[egl::ATTRIB_NONE],
-        //     )?
-        // };
         let display = Self::egl_get_platform_display_with_fallback(
             &egl,
             egl_ext::PLATFORM_GBM_KHR,
@@ -143,10 +137,13 @@ impl Headless {
             RGBA => DrmFourcc::Abgr8888,
             RGB => DrmFourcc::Bgr888,
             YUYV => DrmFourcc::Yuyv,
-            _ => {
-                return Err(Error::NotSupported(
-                    "Destination format not supported".to_string(),
-                ));
+            NV12 => DrmFourcc::Nv12,
+            GREY => DrmFourcc::R8,
+            f => {
+                return Err(Error::NotSupported(format!(
+                    "Destination format {}",
+                    f.display()
+                )));
             }
         };
 
@@ -183,28 +180,45 @@ impl Headless {
         )?)
     }
 
-    fn egl_check_support(egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>) -> bool {
+    fn egl_check_support(
+        egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
+    ) -> Result<(), crate::Error> {
         if egl.upcast::<egl::EGL1_5>().is_some() {
-            return true;
+            // eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
+            let s = egl.query_string(None, egl::EXTENSIONS)?;
+            if !s.to_string_lossy().contains("EGL_KHR_platform_gbm") {
+                return Err(crate::Error::EGLVersion(
+                    "EGL does not support EGL_KHR_platform_gbm extension".to_string(),
+                ));
+            }
+            return Ok(());
         }
         if egl.get_proc_address("eglGetPlatformDisplayEXT").is_none() {
-            return false;
+            return Err(crate::Error::EGLVersion(
+                "EGL does not support eglGetPlatformDisplayEXT function".to_string(),
+            ));
         }
         if egl
             .get_proc_address("eglCreatePlatformWindowSurfaceEXT")
             .is_none()
         {
-            return false;
+            return Err(crate::Error::EGLVersion(
+                "EGL does not support eglCreatePlatformWindowSurfaceEXT function".to_string(),
+            ));
         }
 
         if egl.get_proc_address("eglCreateImageKHR").is_none() {
-            return false;
+            return Err(crate::Error::EGLVersion(
+                "EGL does not support eglCreateImageKHR function".to_string(),
+            ));
         }
 
         if egl.get_proc_address("eglDestroyImageKHR").is_none() {
-            return false;
+            return Err(crate::Error::EGLVersion(
+                "EGL does not support eglDestroyImageKHR function".to_string(),
+            ));
         }
-        true
+        Ok(())
     }
 
     fn egl_get_platform_display_with_fallback(
@@ -385,7 +399,7 @@ impl Card {
                 return nv;
             }
         }
-        return e;
+        e
     }
 }
 
@@ -414,17 +428,12 @@ impl ImageConverterTrait for GLConverter {
         flip: Flip,
         crop: Option<crate::Rect>,
     ) -> crate::Result<()> {
-        if dst.fourcc() == GREY && src.fourcc() != GREY {
-            return Err(Error::NotSupported(
-                "OpenGL doesn't support conversion to Grey".to_string(),
-            ));
-        }
         check_gl_error()?;
         if let edgefirst_tensor::Tensor::Dma(_) = dst.tensor() {
             return self.convert_dest_dma(dst, src, rotation, flip, crop);
         }
 
-        if dst.is_planar() {
+        if dst.is_planar() && matches!(dst.fourcc(), RGB | RGBA) {
             if self.gbm_rendering.size != (dst.width() / 4, dst.height() * 3)
                 && self
                     .resize(dst.width() / 4, dst.height() * 3, RGBA)
@@ -545,7 +554,7 @@ impl GLConverter {
         let render_texture = Texture::new();
         frame_buffer.bind();
 
-        let (width, height) = if dst.is_planar() {
+        let (width, height) = if dst.is_planar() && matches!(dst.fourcc(), RGB | RGBA) {
             let width = src.width() / 4;
             let height = match src.fourcc() {
                 RGBA => src.height() * 4,
@@ -783,10 +792,11 @@ impl GLConverter {
             RGB => gls::gl::RGB,
             RGBA => gls::gl::RGBA,
             GREY => gls::gl::RED,
-            _ => {
-                return Err(Error::NotSupported(
-                    "YUYV textures aren't supported by OpenGL".to_string(),
-                ));
+            f => {
+                return Err(Error::NotSupported(format!(
+                    "{} textures aren't supported by OpenGL",
+                    f.display()
+                )));
             }
         };
         unsafe {

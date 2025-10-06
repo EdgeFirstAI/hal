@@ -4,8 +4,7 @@ use edgefirst_image::G2DConverter;
 #[cfg(target_os = "linux")]
 use edgefirst_image::GLConverter;
 use edgefirst_image::{
-    CPUConverter, Flip, GREY, ImageConverterTrait as _, NV12, RGB, RGBA, Rotation, TensorImage,
-    YUYV,
+    CPUConverter, Flip, GREY, ImageConverterTrait as _, RGB, RGBA, Rotation, TensorImage, YUYV,
 };
 use edgefirst_tensor::{TensorMapTrait, TensorMemory, TensorTrait};
 use four_char_code::FourCharCode;
@@ -49,13 +48,6 @@ impl FourCC for RgbType {
     }
 }
 
-struct YuyvType;
-impl FourCC for YuyvType {
-    fn val() -> FourCharCode {
-        YUYV
-    }
-}
-
 struct GreyType;
 impl FourCC for GreyType {
     fn val() -> FourCharCode {
@@ -63,12 +55,19 @@ impl FourCC for GreyType {
     }
 }
 
-struct Nv12Type;
-impl FourCC for Nv12Type {
-    fn val() -> FourCharCode {
-        NV12
-    }
-}
+// struct YuyvType;
+// impl FourCC for YuyvType {
+//     fn val() -> FourCharCode {
+//         YUYV
+//     }
+// }
+
+// struct Nv12Type;
+// impl FourCC for Nv12Type {
+//     fn val() -> FourCharCode {
+//         NV12
+//     }
+// }
 trait TestRotation {
     fn value() -> Rotation;
 }
@@ -181,7 +180,6 @@ fn load_image_types<T>(bencher: divan::Bencher)
 where
     T: FourCC,
 {
-    let fourcc = T::val();
     let file = include_bytes!("../../../testdata/person.jpg");
     bencher.bench_local(|| {
         let im = TensorImage::load_jpeg(file, Some(T::val()), Some(TensorMemory::Mem))

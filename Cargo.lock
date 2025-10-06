@@ -462,7 +462,6 @@ dependencies = [
  "ctor",
  "divan",
  "dma-heap",
- "drm",
  "edgefirst-tensor",
  "enum_dispatch",
  "env_logger",
@@ -676,10 +675,10 @@ dependencies = [
 [[package]]
 name = "gbm"
 version = "0.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce852e998d3ca5e4a97014fb31c940dc5ef344ec7d364984525fd11e8a547e6a"
+source = "git+https://github.com/Charlie-AuZone/gbm.rs.git?branch=dynamic#22a1423539379cd918e3fb1dd2246ff5901d3967"
 dependencies = [
  "bitflags 2.9.1",
+ "drm",
  "drm-fourcc",
  "gbm-sys",
  "libc",
@@ -688,10 +687,10 @@ dependencies = [
 [[package]]
 name = "gbm-sys"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c13a5f2acc785d8fb6bf6b7ab6bfb0ef5dad4f4d97e8e70bb8e470722312f76f"
+source = "git+https://github.com/Charlie-AuZone/gbm.rs.git?branch=dynamic#22a1423539379cd918e3fb1dd2246ff5901d3967"
 dependencies = [
  "libc",
+ "libloading",
 ]
 
 [[package]]

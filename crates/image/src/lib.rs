@@ -54,6 +54,18 @@ impl TensorImage {
         memory: Option<TensorMemory>,
     ) -> Result<Self> {
         let channels = fourcc_channels(fourcc)?;
+
+        if fourcc == NV12 {
+            let shape = vec![channels, height, width];
+            let tensor = Tensor::new(&shape, memory, None)?;
+
+            return Ok(Self {
+                tensor,
+                fourcc,
+                is_planar: true,
+            });
+        }
+
         let shape = vec![height, width, channels];
         let tensor = Tensor::new(&shape, memory, None)?;
 
@@ -514,6 +526,7 @@ fn fourcc_channels(fourcc: FourCharCode) -> Result<usize> {
         RGB => Ok(3),  // RGB has 3 channels (R, G, B)
         YUYV => Ok(2), // YUYV has 2 channels (Y and UV)
         GREY => Ok(1), // Y800 has 1 channel (Y)
+        NV12 => Ok(2), // NV12 has 2 channel. 2nd channel is half empty
         _ => Err(Error::InvalidShape(format!(
             "Unsupported fourcc: {}",
             fourcc.to_string()
@@ -606,6 +619,17 @@ mod tests {
 
         compare_images(&grey_img, &grey_but_rgb_img, 0.99, function!());
     }
+
+    #[test]
+    fn test_new_nv12() {
+        let nv12 = TensorImage::new(1280, 720, NV12, None).unwrap();
+        assert_eq!(nv12.height(), 720);
+        assert_eq!(nv12.width(), 1280);
+        assert_eq!(nv12.fourcc(), NV12);
+        assert_eq!(nv12.channels(), 2);
+        assert!(nv12.is_planar())
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn test_new_image_converter() {
@@ -1220,19 +1244,7 @@ mod tests {
             .unwrap();
 
         // TODO: compare YUYV and YUYV images without having to convert them to RGB
-
-        let mut g2d_rgb = TensorImage::new(600, 400, RGB, None).unwrap();
-        let mut cpu_rgb = TensorImage::new(600, 400, RGB, None).unwrap();
-
-        cpu_converter
-            .convert(&g2d_dst, &mut g2d_rgb, Rotation::None, Flip::None, None)
-            .unwrap();
-
-        cpu_converter
-            .convert(&cpu_dst, &mut cpu_rgb, Rotation::None, Flip::None, None)
-            .unwrap();
-
-        compare_images(&g2d_rgb, &cpu_rgb, 0.98, function!());
+        compare_images_convert_to_rgb(&g2d_dst, &cpu_dst, 0.98, function!());
     }
 
     #[test]
@@ -1386,6 +1398,98 @@ mod tests {
         compare_images(&dst_gl, &dst_cpu, 0.98, function!());
     }
 
+    #[test]
+    fn test_nv12_to_rgba_cpu() {
+        let file = include_bytes!("../../../testdata/zidane.nv12").to_vec();
+        let src = TensorImage::new(1280, 720, NV12, None).unwrap();
+        src.tensor().map().unwrap().as_mut_slice()[0..(1280 * 720 * 3 / 2)].copy_from_slice(&file);
+
+        let mut dst = TensorImage::new(1280, 720, RGBA, None).unwrap();
+        let mut cpu_converter = CPUConverter::new().unwrap();
+
+        cpu_converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .unwrap();
+
+        let target_image = TensorImage::load_jpeg(
+            include_bytes!("../../../testdata/zidane.jpg"),
+            Some(RGBA),
+            None,
+        )
+        .unwrap();
+
+        compare_images(&dst, &target_image, 0.98, function!());
+    }
+
+    #[test]
+    fn test_nv12_to_rgb_cpu() {
+        let file = include_bytes!("../../../testdata/zidane.nv12").to_vec();
+        let src = TensorImage::new(1280, 720, NV12, None).unwrap();
+        src.tensor().map().unwrap().as_mut_slice()[0..(1280 * 720 * 3 / 2)].copy_from_slice(&file);
+
+        let mut dst = TensorImage::new(1280, 720, RGB, None).unwrap();
+        let mut cpu_converter = CPUConverter::new().unwrap();
+
+        cpu_converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .unwrap();
+
+        let target_image = TensorImage::load_jpeg(
+            include_bytes!("../../../testdata/zidane.jpg"),
+            Some(RGB),
+            None,
+        )
+        .unwrap();
+
+        compare_images(&dst, &target_image, 0.98, function!());
+    }
+
+    #[test]
+    fn test_nv12_to_grey_cpu() {
+        let file = include_bytes!("../../../testdata/zidane.nv12").to_vec();
+        let src = TensorImage::new(1280, 720, NV12, None).unwrap();
+        src.tensor().map().unwrap().as_mut_slice()[0..(1280 * 720 * 3 / 2)].copy_from_slice(&file);
+
+        let mut dst = TensorImage::new(1280, 720, GREY, None).unwrap();
+        let mut cpu_converter = CPUConverter::new().unwrap();
+
+        cpu_converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .unwrap();
+
+        let target_image = TensorImage::load_jpeg(
+            include_bytes!("../../../testdata/zidane.jpg"),
+            Some(GREY),
+            None,
+        )
+        .unwrap();
+
+        compare_images(&dst, &target_image, 0.98, function!());
+    }
+
+    #[test]
+    fn test_nv12_to_yuyv_cpu() {
+        let file = include_bytes!("../../../testdata/zidane.nv12").to_vec();
+        let src = TensorImage::new(1280, 720, NV12, None).unwrap();
+        src.tensor().map().unwrap().as_mut_slice()[0..(1280 * 720 * 3 / 2)].copy_from_slice(&file);
+
+        let mut dst = TensorImage::new(1280, 720, YUYV, None).unwrap();
+        let mut cpu_converter = CPUConverter::new().unwrap();
+
+        cpu_converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .unwrap();
+
+        let target_image = TensorImage::load_jpeg(
+            include_bytes!("../../../testdata/zidane.jpg"),
+            Some(RGB),
+            None,
+        )
+        .unwrap();
+
+        compare_images_convert_to_rgb(&dst, &target_image, 0.98, function!());
+    }
+
     fn load_bytes_to_tensor(
         width: usize,
         height: usize,
@@ -1453,6 +1557,55 @@ mod tests {
             .convert(),
             _ => return,
         };
+
+        let similarity = image_compare::rgb_similarity_structure(
+            &image_compare::Algorithm::RootMeanSquared,
+            &image1,
+            &image2,
+        )
+        .expect("Image Comparison failed");
+        if similarity.score < threshold {
+            similarity
+                .image
+                .to_color_map()
+                .save(format!("{name}.png"))
+                .unwrap();
+            panic!(
+                "{name}: converted image and target image have similarity score too low: {} < {}",
+                similarity.score, threshold
+            )
+        }
+    }
+
+    fn compare_images_convert_to_rgb(
+        img1: &TensorImage,
+        img2: &TensorImage,
+        threshold: f64,
+        name: &str,
+    ) {
+        assert_eq!(img1.height(), img2.height(), "Heights differ");
+        assert_eq!(img1.width(), img2.width(), "Widths differ");
+
+        let mut img_rgb1 =
+            TensorImage::new(img1.width(), img1.height(), RGB, Some(TensorMemory::Mem)).unwrap();
+        let mut img_rgb2 =
+            TensorImage::new(img1.width(), img1.height(), RGB, Some(TensorMemory::Mem)).unwrap();
+        CPUConverter::convert_format(img1, &mut img_rgb1).unwrap();
+        CPUConverter::convert_format(img2, &mut img_rgb2).unwrap();
+
+        let image1 = image::RgbImage::from_vec(
+            img_rgb1.width() as u32,
+            img_rgb1.height() as u32,
+            img_rgb1.tensor().map().unwrap().to_vec(),
+        )
+        .unwrap();
+
+        let image2 = image::RgbImage::from_vec(
+            img_rgb2.width() as u32,
+            img_rgb2.height() as u32,
+            img_rgb2.tensor().map().unwrap().to_vec(),
+        )
+        .unwrap();
 
         let similarity = image_compare::rgb_similarity_structure(
             &image_compare::Algorithm::RootMeanSquared,
