@@ -10,8 +10,9 @@ readme.workspace = true
 license.workspace = true
 
 [features]
-default = ["ndarray"]
+default = ["ndarray", "opengl"]
 ndarray = ["edgefirst-tensor/ndarray"]
+opengl = ["edgefirst-image/opengl"]
 
 [dependencies]
 edgefirst-image = { version = "*", path = "../image" }

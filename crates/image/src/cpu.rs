@@ -186,6 +186,12 @@ impl CPUConverter {
         Ok(())
     }
 
+    fn convert_nv12_to_yuyv(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), NV12);
+        assert_eq!(dst.fourcc(), YUYV);
+        Err(Error::NotImplemented("NV12 to YUYV".to_string()))
+    }
+
     fn convert_yuyv_to_rgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), YUYV);
         assert_eq!(dst.fourcc(), RGBA);
@@ -278,10 +284,10 @@ impl CPUConverter {
             .zip(dst.as_chunks_mut::<4>().0.iter_mut())
         {
             d[0] = full_to_limit(s[0]);
-            d[1] = 0;
+            d[1] = 128;
 
             d[2] = full_to_limit(s[1]);
-            d[3] = 0;
+            d[3] = 128;
         }
         Ok(())
     }
@@ -478,6 +484,7 @@ impl CPUConverter {
             (NV12, RGB) => Self::convert_nv12_to_rgb(src, dst),
             (NV12, RGBA) => Self::convert_nv12_to_rgba(src, dst),
             (NV12, GREY) => Self::convert_nv12_to_grey(src, dst),
+            (NV12, YUYV) => Self::convert_nv12_to_yuyv(src, dst),
             (YUYV, RGB) => Self::convert_yuyv_to_rgb(src, dst),
             (YUYV, RGBA) => Self::convert_yuyv_to_rgba(src, dst),
             (YUYV, GREY) => Self::convert_yuyv_to_grey(src, dst),
@@ -495,7 +502,7 @@ impl CPUConverter {
             (GREY, GREY) => Self::copy_image(src, dst),
             (GREY, YUYV) => Self::convert_grey_to_yuyv(src, dst),
             (s, d) => Err(Error::NotSupported(format!(
-                "Conversion from {} to {} is not supported",
+                "Conversion from {} to {}",
                 s.display(),
                 d.display()
             ))),
@@ -633,19 +640,29 @@ impl ImageConverterTrait for CPUConverter {
             (GREY, YUYV) => GREY,
             (s, d) => {
                 return Err(Error::NotSupported(format!(
-                    "Conversion from {} to {} is not supported",
+                    "Conversion from {} to {}",
                     s.display(),
                     d.display()
                 )));
             }
         };
 
+        let need_resize_flip_rotation = rotation != Rotation::None
+            || flip != Flip::None
+            || src.width() != dst.width()
+            || src.height() != dst.height()
+            || crop.is_some_and(|crop| {
+                crop != Rect {
+                    left: 0,
+                    top: 0,
+                    width: src.width(),
+                    height: src.height(),
+                }
+            });
+
         // check if a direct conversion can be done
-        if crop.is_none()
-            && rotation == Rotation::None
-            && flip == Flip::None
-            && dst.width() == src.width()
-            && dst.height() == src.height()
+        if !need_resize_flip_rotation
+            && (src.fourcc() == intermediate || dst.fourcc() == intermediate)
         {
             return Self::convert_format(src, dst);
         };
@@ -672,6 +689,8 @@ impl ImageConverterTrait for CPUConverter {
         matches!(tmp.fourcc(), RGB | RGBA | GREY);
         if tmp.fourcc() == dst.fourcc() {
             self.resize_flip_rotate(dst, &tmp, rotation, flip, crop)?;
+        } else if !need_resize_flip_rotation {
+            Self::convert_format(&tmp, dst)?;
         } else {
             let mut tmp2 = TensorImage::new(
                 dst.width(),
