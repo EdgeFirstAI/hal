@@ -976,7 +976,11 @@ mod tests {
             gl_converter
                 .convert(&src, &mut gl_dst, rot, Flip::None, None)
                 .unwrap();
-
+            std::fs::write(
+                format!("{}.rgba", function!()),
+                &*gl_dst.tensor.map().unwrap(),
+            )
+            .unwrap();
             compare_images(&gl_dst, &cpu_dst, 0.98, function!());
         }
     }
