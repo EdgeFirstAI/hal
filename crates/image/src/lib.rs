@@ -722,7 +722,7 @@ mod tests {
             .unwrap();
         let mut gl_dst =
             TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
-        let mut gl_converter = GLConverter::new_with_size(dst_width, dst_height, false).unwrap();
+        let mut gl_converter = GLConverter::new().unwrap();
 
         for _ in 0..5 {
             gl_converter
@@ -853,7 +853,7 @@ mod tests {
 
         let mut gl_dst =
             TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
-        let mut gl_converter = GLConverter::new_with_size(dst_width, dst_height, false).unwrap();
+        let mut gl_converter = GLConverter::new().unwrap();
 
         for _ in 0..5 {
             gl_converter
@@ -970,7 +970,7 @@ mod tests {
             .unwrap();
 
         let mut gl_dst = TensorImage::new(dst_width, dst_height, RGBA, tensor_memory).unwrap();
-        let mut gl_converter = GLConverter::new_with_size(dst_width, dst_height, false).unwrap();
+        let mut gl_converter = GLConverter::new().unwrap();
 
         for _ in 0..5 {
             gl_converter
