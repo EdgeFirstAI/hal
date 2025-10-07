@@ -334,8 +334,7 @@ where
 
     let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Mem)).unwrap();
     let mut gl_dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
-    let mut gl_converter =
-        edgefirst_image::GLConverter::new_with_size(width, height, false).unwrap();
+    let mut gl_converter = edgefirst_image::GLConverter::new().unwrap();
 
     bencher.bench_local(|| {
         gl_converter
@@ -373,8 +372,7 @@ where
 
     let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
     let mut gl_dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
-    let mut gl_converter =
-        edgefirst_image::GLConverter::new_with_size(width, height, false).unwrap();
+    let mut gl_converter = edgefirst_image::GLConverter::new().unwrap();
 
     bencher.bench_local(|| {
         gl_converter
@@ -422,7 +420,7 @@ fn rotate_opengl<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize
     let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
     let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
 
-    let mut converter = GLConverter::new_with_size(width, height, false).unwrap();
+    let mut converter = GLConverter::new().unwrap();
 
     bencher.bench_local(|| {
         converter

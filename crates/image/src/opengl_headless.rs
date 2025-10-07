@@ -6,9 +6,10 @@ use gbm::{
     AsRaw, Device,
     drm::{Device as DrmDevice, buffer::DrmFourcc, control::Device as DrmControlDevice},
 };
-use khronos_egl::{self as egl, Attrib, Config, Display, EGL1_4, NativeWindowType, Surface};
+use khronos_egl::{self as egl, Attrib, Display, EGL1_4};
 use log::{debug, error};
 use std::{
+    collections::BTreeSet,
     ffi::{CStr, CString, c_char, c_void},
     os::fd::AsRawFd,
     ptr::{null, null_mut},
@@ -16,59 +17,44 @@ use std::{
     str::FromStr,
 };
 
-use crate::{Error, Flip, GREY, ImageConverterTrait, NV12, RGB, RGBA, Rotation, TensorImage, YUYV};
+macro_rules! function {
+    () => {{
+        fn f() {}
+        fn type_name_of<T>(_: T) -> &'static str {
+            std::any::type_name::<T>()
+        }
+        let name = type_name_of(f);
 
-pub struct Headless {
-    pub surface: egl::Surface,
-    pub gbm_surface: gbm::Surface<()>,
-    pub ctx: egl::Context,
-    pub display: egl::Display,
-    pub egl: Rc<egl::Instance<egl::Dynamic<libloading::Library, egl::EGL1_4>>>,
-    pub _gbm: Device<Card>,
-    pub size: (usize, usize),
-    pub format: FourCharCode,
-    pub config: Config,
+        // Find and cut the rest of the path
+        match &name[..name.len() - 3].rfind(':') {
+            Some(pos) => &name[pos + 1..name.len() - 3],
+            None => &name[..name.len() - 3],
+        }
+    }};
 }
 
-impl Headless {
-    pub fn new_with_dest(
-        mut width: usize,
-        mut height: usize,
-        is_planar: bool,
-    ) -> Result<Headless, crate::Error> {
-        if is_planar {
-            if !width.is_multiple_of(4) {
-                return Err(crate::Error::InvalidShape(
-                    "OpenGL converter requires planar RGB width to be a multiple of 4".to_string(),
-                ));
-            }
-            width /= 4;
-            height *= 3;
-        }
+use crate::{Error, Flip, GREY, ImageConverterTrait, NV12, RGB, RGBA, Rotation, TensorImage, YUYV};
 
+pub(crate) struct GlContext {
+    pub(crate) ctx: egl::Context,
+    pub(crate) display: egl::Display,
+    pub(crate) egl: Rc<egl::Instance<egl::Dynamic<libloading::Library, egl::EGL1_4>>>,
+    pub(crate) support_dma: bool,
+    pub(crate) surface: egl::Surface,
+}
+
+impl GlContext {
+    pub(crate) fn new() -> Result<GlContext, crate::Error> {
         // Create an EGL API instance.
         let lib = unsafe { libloading::Library::new("libEGL.so.1") }?;
         let egl = unsafe { egl::DynamicInstance::<egl::EGL1_4>::load_required_from(lib)? };
-        Self::egl_check_support(&egl)?;
-
-        // init a GBM device
-        let gbm = Device::new(Card::open_global()?)?;
-
-        // let disp = unsafe { egl.get_display(egl::DEFAULT_DISPLAY) };
-        debug!("gbm: {gbm:?}");
-        let display = Self::egl_get_platform_display_with_fallback(
-            &egl,
-            egl_ext::PLATFORM_GBM_KHR,
-            gbm.as_raw() as *mut c_void,
-            &[egl::ATTRIB_NONE],
-        )?;
-
-        debug!("display: {display:?}");
+        let support_dma = Self::egl_check_support_dma(&egl).is_ok();
+        let display = Self::egl_get_display(&egl)?;
 
         egl.initialize(display)?;
         let attributes = [
             egl::SURFACE_TYPE,
-            egl::WINDOW_BIT,
+            egl::PBUFFER_BIT,
             egl::RENDERABLE_TYPE,
             egl::OPENGL_ES3_BIT,
             egl::RED_SIZE,
@@ -92,75 +78,104 @@ impl Headless {
 
         let context_attributes = [egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE, egl::NONE];
 
-        let ctx = egl.create_context(display, config, None, &context_attributes)?;
+        let ctx = egl
+            .create_context(display, config, None, &context_attributes)
+            .unwrap();
         debug!("ctx: {ctx:?}");
-        let gbm_surface: gbm::Surface<()> = gbm.create_surface(
-            width as u32,
-            height as u32,
-            DrmFourcc::Abgr8888,
-            gbm::BufferObjectFlags::RENDERING,
-        )?;
-        debug!("gbm_surface: {gbm_surface:?}");
-        let surface = Self::egl_create_platform_window_surface_with_fallback(
-            &egl,
+
+        let surface = egl.create_pbuffer_surface(
             display,
             config,
-            gbm_surface.as_raw() as *mut c_void,
-            &[egl::ATTRIB_NONE],
+            &[egl::WIDTH, 1, egl::HEIGHT, 1, egl::NONE],
         )?;
-        debug!("surface: {surface:?}");
         egl.make_current(display, Some(surface), Some(surface), Some(ctx))?;
         let _ = egl.swap_interval(display, 0);
 
-        let headless = Headless {
-            surface,
+        let headless = GlContext {
             display,
             ctx,
-            gbm_surface,
-            _gbm: gbm,
             egl: Rc::new(egl),
-            config,
-            size: (width, height),
-            format: RGBA,
+            surface,
+            support_dma,
         };
         Ok(headless)
     }
 
-    fn egl_check_support(
+    fn make_current(&self) -> Result<(), crate::Error> {
+        self.egl.make_current(
+            self.display,
+            Some(self.surface),
+            Some(self.surface),
+            Some(self.ctx),
+        )?;
+        Ok(())
+    }
+
+    fn egl_get_display(
+        egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
+    ) -> Result<Display, crate::Error> {
+        // get the default display
+        if let Some(display) = unsafe { egl.get_display(egl::DEFAULT_DISPLAY) } {
+            debug!("default display: {display:?}");
+            return Ok(display);
+        }
+
+        //  Fallback for EVK which doesn't have a default display
+        if let Ok(display) = Self::egl_get_gbm_display(egl) {
+            debug!("gbm display: {display:?}");
+            return Ok(display);
+        }
+
+        if let Ok(display) = Self::egl_get_platform_display_from_device(egl) {
+            debug!("platform display from device: {display:?}");
+            return Ok(display);
+        }
+
+        Err(Error::OpenGl("Could not obtain EGL Display".to_string()))
+    }
+
+    fn egl_get_gbm_display(
+        egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
+    ) -> Result<Display, crate::Error> {
+        // init a GBM device
+        let gbm = Device::new(Card::open_global()?)?;
+
+        debug!("gbm: {gbm:?}");
+        let display = Self::egl_get_platform_display_with_fallback(
+            egl,
+            egl_ext::PLATFORM_GBM_KHR,
+            gbm.as_raw() as *mut c_void,
+            &[egl::ATTRIB_NONE],
+        )?;
+
+        Ok(display)
+    }
+
+    fn egl_check_support_dma(
         egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
     ) -> Result<(), crate::Error> {
+        let extensions = egl.query_string(None, egl::EXTENSIONS)?;
+        let extensions = extensions.to_string_lossy();
+        log::debug!("EGL Extensions: {}", extensions);
+
         if egl.upcast::<egl::EGL1_5>().is_some() {
-            // eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
-            let s = egl.query_string(None, egl::EXTENSIONS)?;
-            if !s.to_string_lossy().contains("EGL_KHR_platform_gbm") {
-                return Err(crate::Error::EGLVersion(
-                    "EGL does not support EGL_KHR_platform_gbm extension".to_string(),
-                ));
-            }
             return Ok(());
         }
-        if egl.get_proc_address("eglGetPlatformDisplayEXT").is_none() {
-            return Err(crate::Error::EGLVersion(
-                "EGL does not support eglGetPlatformDisplayEXT function".to_string(),
-            ));
-        }
-        if egl
-            .get_proc_address("eglCreatePlatformWindowSurfaceEXT")
-            .is_none()
-        {
-            return Err(crate::Error::EGLVersion(
-                "EGL does not support eglCreatePlatformWindowSurfaceEXT function".to_string(),
+
+        if !extensions.contains("EGL_EXT_image_dma_buf_import") {
+            return Err(crate::Error::GLVersion(
+                "EGL does not support EGL_EXT_image_dma_buf_import extension".to_string(),
             ));
         }
 
         if egl.get_proc_address("eglCreateImageKHR").is_none() {
-            return Err(crate::Error::EGLVersion(
+            return Err(crate::Error::GLVersion(
                 "EGL does not support eglCreateImageKHR function".to_string(),
             ));
         }
 
         if egl.get_proc_address("eglDestroyImageKHR").is_none() {
-            return Err(crate::Error::EGLVersion(
+            return Err(crate::Error::GLVersion(
                 "EGL does not support eglDestroyImageKHR function".to_string(),
             ));
         }
@@ -177,52 +192,14 @@ impl Headless {
             unsafe { egl.get_platform_display(platform, native_display, attrib_list) }
                 .map_err(|e| e.into())
         } else if let Some(ext) = egl.get_proc_address("eglGetPlatformDisplayEXT") {
-            let func: fn(
+            let func: unsafe extern "system" fn(
                 platform: egl::Enum,
                 native_display: *mut c_void,
                 attrib_list: *const Attrib,
             ) -> egl::EGLDisplay = unsafe { std::mem::transmute(ext) };
-            let disp = func(platform, native_display, attrib_list.as_ptr());
+            let disp = unsafe { func(platform, native_display, attrib_list.as_ptr()) };
             if disp != egl::NO_DISPLAY {
                 Ok(unsafe { Display::from_ptr(disp) })
-            } else {
-                Err(egl.get_error().unwrap().into())
-            }
-        } else {
-            Err(Error::EGLLoad(egl::LoadError::InvalidVersion {
-                provided: egl.version(),
-                required: khronos_egl::Version::EGL1_5,
-            }))
-        }
-    }
-
-    fn egl_create_platform_window_surface_with_fallback(
-        egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
-        display: Display,
-        config: Config,
-        native_window: NativeWindowType,
-        attrib_list: &[Attrib],
-    ) -> Result<Surface, Error> {
-        if let Some(egl) = egl.upcast::<egl::EGL1_5>() {
-            unsafe {
-                egl.create_platform_window_surface(display, config, native_window, attrib_list)
-            }
-            .map_err(|e| e.into())
-        } else if let Some(ext) = egl.get_proc_address("eglCreatePlatformWindowSurfaceEXT") {
-            let func: fn(
-                display: egl::EGLDisplay,
-                config: egl::EGLConfig,
-                native_window: *mut c_void,
-                attrib_list: *const Attrib,
-            ) -> egl::EGLSurface = unsafe { std::mem::transmute(ext) };
-            let surf = func(
-                display.as_ptr(),
-                config.as_ptr(),
-                native_window,
-                attrib_list.as_ptr(),
-            );
-            if surf != egl::NO_SURFACE {
-                Ok(unsafe { Surface::from_ptr(surf) })
             } else {
                 Err(egl.get_error().unwrap().into())
             }
@@ -246,20 +223,28 @@ impl Headless {
             egl.create_image(display, ctx, target, buffer, attrib_list)
                 .map_err(|e| e.into())
         } else if let Some(ext) = egl.get_proc_address("eglCreateImageKHR") {
-            let func: fn(
+            log::trace!("eglCreateImageKHR addr: {:?}", ext);
+            let func: unsafe extern "system" fn(
                 display: egl::EGLDisplay,
                 ctx: egl::EGLContext,
                 target: egl::Enum,
                 buffer: egl::EGLClientBuffer,
-                attrib_list: *const Attrib,
+                attrib_list: *const egl::Int,
             ) -> egl::EGLImage = unsafe { std::mem::transmute(ext) };
-            let image = func(
-                display.as_ptr(),
-                ctx.as_ptr(),
-                target,
-                buffer.as_ptr(),
-                attrib_list.as_ptr(),
-            );
+            let new_attrib_list = attrib_list
+                .iter()
+                .map(|x| *x as egl::Int)
+                .collect::<Vec<_>>();
+
+            let image = unsafe {
+                func(
+                    display.as_ptr(),
+                    ctx.as_ptr(),
+                    target,
+                    buffer.as_ptr(),
+                    new_attrib_list.as_ptr(),
+                )
+            };
             if image != egl::NO_IMAGE {
                 Ok(unsafe { egl::Image::from_ptr(image) })
             } else {
@@ -281,9 +266,11 @@ impl Headless {
         if let Some(egl) = egl.upcast::<egl::EGL1_5>() {
             egl.destroy_image(display, image).map_err(|e| e.into())
         } else if let Some(ext) = egl.get_proc_address("eglDestroyImageKHR") {
-            let func: fn(display: egl::EGLDisplay, image: egl::EGLImage) -> egl::Boolean =
-                unsafe { std::mem::transmute(ext) };
-            let res = func(display.as_ptr(), image.as_ptr());
+            let func: unsafe extern "system" fn(
+                display: egl::EGLDisplay,
+                image: egl::EGLImage,
+            ) -> egl::Boolean = unsafe { std::mem::transmute(ext) };
+            let res = unsafe { func(display.as_ptr(), image.as_ptr()) };
             if res == egl::TRUE {
                 Ok(())
             } else {
@@ -296,12 +283,61 @@ impl Headless {
             }))
         }
     }
+
+    fn egl_get_platform_display_from_device(
+        egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
+    ) -> Result<Display, Error> {
+        let extensions = egl.query_string(None, egl::EXTENSIONS)?;
+        let extensions = extensions.to_string_lossy();
+        log::debug!("EGL Extensions: {}", extensions);
+
+        if !extensions.contains("EGL_EXT_device_enumeration") {
+            return Err(Error::GLVersion(
+                "EGL doesn't supported EGL_EXT_device_enumeration extension".to_string(),
+            ));
+        }
+
+        type EGLDeviceEXT = *mut c_void;
+        let devices = if let Some(ext) = egl.get_proc_address("eglQueryDevicesEXT") {
+            let func: unsafe extern "system" fn(
+                max_devices: egl::Int,
+                devices: *mut EGLDeviceEXT,
+                num_devices: *mut egl::Int,
+            ) -> *const c_char = unsafe { std::mem::transmute(ext) };
+            let mut devices = [std::ptr::null_mut(); 10];
+            let mut num_devices = 0;
+            unsafe { func(devices.len() as i32, devices.as_mut_ptr(), &mut num_devices) };
+            for i in 0..num_devices {
+                log::debug!("EGL device: {:?}", devices[i as usize]);
+            }
+            devices[0..num_devices as usize].to_vec()
+        } else {
+            return Err(Error::GLVersion(
+                "EGL doesn't supported eglQueryDevicesEXT function".to_string(),
+            ));
+        };
+
+        if !extensions.contains("EGL_EXT_platform_device") {
+            return Err(Error::GLVersion(
+                "EGL doesn't supported EGL_EXT_platform_device extension".to_string(),
+            ));
+        }
+
+        // just use the first device?
+        Self::egl_get_platform_display_with_fallback(
+            egl,
+            egl_ext::PLATFORM_DEVICE_EXT,
+            devices[0],
+            &[egl::ATTRIB_NONE],
+        )
+    }
 }
 
-impl Drop for Headless {
+impl Drop for GlContext {
     fn drop(&mut self) {
-        // let _ = self.egl.destroy_surface(self.display, self.surface);
+        let _ = self.egl.destroy_surface(self.display, self.surface);
         let _ = self.egl.destroy_context(self.display, self.ctx);
+        let _ = self.egl.terminate(self.display);
     }
 }
 
@@ -357,13 +393,14 @@ struct RegionOfInterest {
 }
 
 pub struct GLConverter {
-    gbm_rendering: Headless,
     texture_program: GlProgram,
     texture_program_planar: GlProgram,
     camera_texture: Texture,
+    render_texture: Texture,
     vertex_buffer: Buffer,
     texture_buffer: Buffer,
-    render_texture: Texture,
+
+    gl_context: GlContext,
 }
 
 impl ImageConverterTrait for GLConverter {
@@ -375,92 +412,39 @@ impl ImageConverterTrait for GLConverter {
         flip: Flip,
         crop: Option<crate::Rect>,
     ) -> crate::Result<()> {
-        check_gl_error()?;
-        if let edgefirst_tensor::Tensor::Dma(_) = dst.tensor() {
+        check_gl_error(function!(), line!())?;
+        self.gl_context.make_current()?;
+        if self.gl_context.support_dma
+            && let edgefirst_tensor::Tensor::Dma(_) = dst.tensor()
+        {
             return self.convert_dest_dma(dst, src, rotation, flip, crop);
         }
-
         if dst.is_planar() && matches!(dst.fourcc(), RGB | RGBA) {
-            // if self.gbm_rendering.size != (dst.width() / 4, dst.height() * 3)
-            //     && self
-            //         .resize(dst.width() / 4, dst.height() * 3, RGBA)
-            //         .is_err()
-            // {
-            //     return Err(Error::NotSupported(format!(
-            //         "Could not resize OpenGL context to {}x{} with format {}",
-            //         dst.width() / 4,
-            //         dst.height() * 3,
-            //         RGBA.display(),
-            //     )));
-            // }
             if rotation != Rotation::None || flip != Flip::None {
                 return Err(Error::NotSupported(
                     "Rotation or Flip not supported for planar RGB".to_string(),
                 ));
             }
-            // self.resize(dst.width() / 4, dst.height() * 3, RGBA)?;
-            // self.convert_to_planar(src, crop)?;
             self.convert_dest_non_dma(dst, src, rotation, flip, crop)?;
         } else {
-            // if self
-            //     .resize(dst.width(), dst.height(), dst.fourcc())
-            //     .is_err()
-            // {
-            //     return Err(Error::NotSupported(format!(
-            //         "Could not resize OpenGL context to {}x{} with format {}",
-            //         dst.width(),
-            //         dst.height(),
-            //         dst.fourcc().display(),
-            //     )));
-            // }
-            // self.resize(dst.width(), dst.height(), dst.fourcc())?;
-            // self.convert_to(src, rotation, flip, crop, false)?;
             self.convert_dest_non_dma(dst, src, rotation, flip, crop)?;
         }
-
-        // self.gbm_rendering
-        //     .egl
-        //     .swap_buffers(self.gbm_rendering.display, self.gbm_rendering.surface)?;
-
-        // let bo = unsafe { self.gbm_rendering.gbm_surface.lock_front_buffer()? };
-
-        // match &mut dst.tensor {
-        //     edgefirst_tensor::Tensor::Shm(_shm_tensor) => {
-        //         let mut mmap = _shm_tensor.map()?;
-        //         bo.map(0, 0, bo.width(), bo.height(), |x| {
-        //             mmap.copy_from_slice(x.buffer())
-        //         })?;
-        //     }
-        //     edgefirst_tensor::Tensor::Mem(_mem_tensor) => {
-        //         let mut mmap = _mem_tensor.map()?;
-        //         bo.map(0, 0, bo.width(), bo.height(), |x| {
-        //             mmap.copy_from_slice(x.buffer())
-        //         })?;
-        //     }
-        //     edgefirst_tensor::Tensor::Dma(_) => unreachable!(),
-        // }
-
         Ok(())
     }
 }
 
 impl GLConverter {
     pub fn new() -> Result<GLConverter, crate::Error> {
-        Self::new_with_size(640, 640, false)
-    }
+        let gl_context = GlContext::new()?;
 
-    pub fn new_with_size(
-        width: usize,
-        height: usize,
-        is_planar: bool,
-    ) -> Result<GLConverter, crate::Error> {
-        let gbm_rendering = Headless::new_with_dest(width, height, is_planar)?;
         gls::load_with(|s| {
-            gbm_rendering
+            gl_context
                 .egl
                 .get_proc_address(s)
                 .map_or(std::ptr::null(), |p| p as *const _)
         });
+        Self::gl_check_support()?;
+
         let texture_program_planar =
             GlProgram::new(generate_vertex_shader(), generate_planar_rgb_shader())?;
 
@@ -471,7 +455,7 @@ impl GLConverter {
         let vertex_buffer = Buffer::new(0, 3, 100);
         let texture_buffer = Buffer::new(1, 2, 100);
         let converter = GLConverter {
-            gbm_rendering,
+            gl_context,
             texture_program,
             texture_program_planar,
             camera_texture,
@@ -479,9 +463,34 @@ impl GLConverter {
             texture_buffer,
             render_texture,
         };
-        // converter.warmup(3)?;
-        check_gl_error()?;
+        check_gl_error(function!(), line!())?;
+        log::debug!("GLConverter created");
         Ok(converter)
+    }
+
+    fn gl_check_support() -> Result<(), crate::Error> {
+        let extensions = unsafe {
+            let str = gls::gl::GetString(gls::gl::EXTENSIONS);
+            if str.is_null() {
+                return Err(crate::Error::GLVersion(
+                    "GL returned no supported extensions".to_string(),
+                ));
+            }
+            CStr::from_ptr(str as *const c_char)
+                .to_string_lossy()
+                .to_string()
+        };
+        log::debug!("GL Extensions: {extensions}");
+        let required_ext = ["GL_OES_EGL_image_external", "GL_OES_surfaceless_context"];
+        let extensions = extensions.split_ascii_whitespace().collect::<BTreeSet<_>>();
+        for required in required_ext {
+            if !extensions.contains(required) {
+                return Err(crate::Error::GLVersion(format!(
+                    "GL does not support {required} extension",
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn convert_dest_dma(
@@ -492,6 +501,7 @@ impl GLConverter {
         flip: Flip,
         crop: Option<crate::Rect>,
     ) -> crate::Result<()> {
+        assert!(self.gl_context.support_dma);
         let frame_buffer = FrameBuffer::new();
         frame_buffer.bind();
 
@@ -511,7 +521,6 @@ impl GLConverter {
             (dst.width() as i32, dst.height() as i32)
         };
         let dest_img = self.create_image_from_dma2(dst)?;
-
         unsafe {
             gls::gl::UseProgram(self.texture_program.id);
             gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
@@ -534,12 +543,12 @@ impl GLConverter {
                 self.render_texture.id,
                 0,
             );
-            check_gl_error()?;
+            check_gl_error(function!(), line!())?;
             gls::gl::Viewport(0, 0, width, height);
         }
 
         if dst.is_planar() {
-            self.convert_to_planar(src, crop)
+            self.convert_to_planar(src, width as usize, crop)
         } else {
             self.convert_to(src, rotation, flip, crop, false)
         }
@@ -579,7 +588,8 @@ impl GLConverter {
             match dst.fourcc() {
                 RGB => gls::gl::RGB,
                 RGBA => gls::gl::RGBA,
-                GREY => gls::gl::R8,
+                GREY => gls::gl::RGB,
+                // GREY => gls::gl::R8,
                 f => {
                     return Err(crate::Error::NotSupported(format!(
                         "Opengl doesn't support {} destination texture",
@@ -614,6 +624,7 @@ impl GLConverter {
                 gls::gl::UNSIGNED_BYTE,
                 std::ptr::null(),
             );
+            check_gl_error(function!(), line!())?;
             gls::gl::FramebufferTexture2D(
                 gls::gl::FRAMEBUFFER,
                 gls::gl::COLOR_ATTACHMENT0,
@@ -621,12 +632,12 @@ impl GLConverter {
                 self.render_texture.id,
                 0,
             );
-            check_gl_error()?;
+            check_gl_error(function!(), line!())?;
             gls::gl::Viewport(0, 0, width, height);
         }
 
         if dst.is_planar() {
-            self.convert_to_planar(src, crop)?;
+            self.convert_to_planar(src, width as usize, crop)?;
         } else {
             self.convert_to(src, rotation, flip, crop, false)?;
         }
@@ -647,12 +658,12 @@ impl GLConverter {
             gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
             // gls::gl::GetActiveAttrib
             let func = self
-                .gbm_rendering
+                .gl_context
                 .egl
                 .get_proc_address("glGetTexImage")
                 .unwrap();
 
-            let gl_get_tex_image: fn(
+            let gl_get_tex_image: extern "system" fn(
                 target: gls::gl::GLenum,
                 level: gls::gl::GLint,
                 format: gls::gl::GLenum,
@@ -678,7 +689,7 @@ impl GLConverter {
         crop: Option<crate::Rect>,
         flip_y: bool,
     ) -> Result<(), crate::Error> {
-        check_gl_error()?;
+        check_gl_error(function!(), line!())?;
         unsafe {
             gls::gl::ClearColor(1.0, 1.0, 1.0, 1.0);
             gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
@@ -720,28 +731,14 @@ impl GLConverter {
             self.draw_camera_texture(src, roi, rotation_offset, flip, flip_y)
         };
         unsafe { gls::gl::Finish() };
-        check_gl_error()?;
+        check_gl_error(function!(), line!())?;
         result
     }
-
-    // fn warmup(&self, n: usize) -> Result<(), crate::Error> {
-    //     let mut _bo;
-    //     for _ in 0..n {
-    //         unsafe {
-    //             gls::gl::ClearColor(0.0, 0.0, 0.0, 0.0);
-    //             gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
-    //         };
-    //         self.gbm_rendering
-    //             .egl
-    //             .swap_buffers(self.gbm_rendering.display,
-    // self.gbm_rendering.surface)?;         _bo = unsafe {
-    // self.gbm_rendering.gbm_surface.lock_front_buffer()? };     }
-    //     Ok(())
-    // }
 
     fn convert_to_planar(
         &self,
         src: &TensorImage,
+        width: usize,
         crop: Option<crate::Rect>,
     ) -> Result<(), crate::Error> {
         if let Some(crop) = crop
@@ -760,11 +757,7 @@ impl GLConverter {
             gls::gl::ClearColor(0.0, 0.0, 0.0, 0.0);
             gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
         };
-        self.draw_camera_texture_to_rgb_planar(
-            &self.camera_texture,
-            &new_egl_image,
-            self.gbm_rendering.size.0,
-        )?;
+        self.draw_camera_texture_to_rgb_planar(&self.camera_texture, &new_egl_image, width)?;
         unsafe { gls::gl::Finish() };
 
         Ok(())
@@ -793,7 +786,7 @@ impl GLConverter {
                 gls::gl::LINEAR as i32,
             );
             gls::egl_image_target_texture_2d_oes(texture_target, egl_img.egl_image.as_ptr());
-            check_gl_error()?;
+            check_gl_error(function!(), line!())?;
 
             // starts from bottom
             for i in 0..3 {
@@ -838,7 +831,7 @@ impl GLConverter {
                     gls::gl::UNSIGNED_INT,
                     vertices_index.as_ptr() as *const c_void,
                 );
-                check_gl_error()?;
+                check_gl_error(function!(), line!())?;
             }
         }
         Ok(())
@@ -1009,7 +1002,7 @@ impl GLConverter {
             }
 
             gls::egl_image_target_texture_2d_oes(texture_target, egl_img.egl_image.as_ptr());
-            check_gl_error()?;
+            check_gl_error(function!(), line!())?;
             gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
             gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
             let mut cam = RegionOfInterest {
@@ -1066,7 +1059,7 @@ impl GLConverter {
                 vertices_index.as_ptr() as *const c_void,
             );
         }
-        check_gl_error()?;
+        check_gl_error(function!(), line!())?;
         Ok(())
     }
 
@@ -1148,11 +1141,7 @@ impl GLConverter {
 
         egl_img_attr.push(khronos_egl::NONE as Attrib);
 
-        match self.new_egl_image_owned(
-            egl_ext::LINUX_DMA_BUF,
-            unsafe { egl::ClientBuffer::from_ptr(null_mut()) },
-            &egl_img_attr,
-        ) {
+        match self.new_egl_image_owned(egl_ext::LINUX_DMA_BUF, &egl_img_attr) {
             Ok(v) => Ok(v),
             Err(e) => Err(e),
         }
@@ -1161,28 +1150,20 @@ impl GLConverter {
     fn new_egl_image_owned(
         &'_ self,
         target: egl::Enum,
-        buffer: egl::ClientBuffer,
         attrib_list: &[Attrib],
     ) -> Result<EglImage, Error> {
-        let image = Headless::egl_create_image_with_fallback(
-            &self.gbm_rendering.egl,
-            self.gbm_rendering.display,
+        let image = GlContext::egl_create_image_with_fallback(
+            &self.gl_context.egl,
+            self.gl_context.display,
             unsafe { egl::Context::from_ptr(egl::NO_CONTEXT) },
             target,
-            buffer,
+            unsafe { egl::ClientBuffer::from_ptr(null_mut()) },
             attrib_list,
         )?;
-        // let image = self.gbm_rendering.egl.create_image(
-        //     self.gbm_rendering.display,
-        //     unsafe { egl::Context::from_ptr(egl::NO_CONTEXT) },
-        //     target,
-        //     buffer,
-        //     attrib_list,
-        // )?;
         Ok(EglImage {
             egl_image: image,
-            display: self.gbm_rendering.display,
-            egl: self.gbm_rendering.egl.clone(),
+            display: self.gl_context.display,
+            egl: self.gl_context.egl.clone(),
         })
     }
 }
@@ -1194,7 +1175,11 @@ struct EglImage {
 
 impl Drop for EglImage {
     fn drop(&mut self) {
-        let e = Headless::egl_destory_image_with_fallback(&self.egl, self.display, self.egl_image);
+        if self.egl_image.as_ptr() == egl::NO_IMAGE {
+            return;
+        }
+
+        let e = GlContext::egl_destory_image_with_fallback(&self.egl, self.display, self.egl_image);
         if let Err(e) = e {
             error!("Could not destroy EGL image: {e:?}");
         }
@@ -1273,6 +1258,12 @@ impl Texture {
                 );
             }
         }
+    }
+}
+
+impl Drop for Texture {
+    fn drop(&mut self) {
+        unsafe { gls::gl::DeleteTextures(1, &raw mut self.id) };
     }
 }
 
@@ -1453,13 +1444,13 @@ fn compile_shader_from_str(shader: u32, shader_source: &str, shader_name: &str) 
     }
 }
 
-fn check_gl_error() -> Result<(), Error> {
+fn check_gl_error(name: &str, line: u32) -> Result<(), Error> {
     unsafe {
         let err = gls::gl::GetError();
         if err != gls::gl::NO_ERROR {
-            error!("GL Error: {err}");
+            error!("GL Error: {name}:{line}: {err:#X}");
             // panic!("GL Error: {err}");
-            return Err(Error::OpenGl(format!("{err}")));
+            return Err(Error::OpenGl(format!("{err:#X}")));
         }
     }
     Ok(())
@@ -1504,6 +1495,8 @@ mod egl_ext {
     pub const YUV_CHROMA_SITING_0_5: u32 = 0x3285;
 
     pub const PLATFORM_GBM_KHR: u32 = 0x31D7;
+
+    pub const PLATFORM_DEVICE_EXT: u32 = 0x313F;
 }
 
 pub fn generate_vertex_shader() -> &'static str {

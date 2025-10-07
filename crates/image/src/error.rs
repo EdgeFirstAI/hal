@@ -20,7 +20,7 @@ pub enum Error {
     #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
     EGL(khronos_egl::Error),
-    EGLVersion(String),
+    GLVersion(String),
     #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
     EGLLoad(khronos_egl::LoadError<libloading::Error>),
