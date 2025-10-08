@@ -33,14 +33,16 @@ macro_rules! function {
     }};
 }
 
-use crate::{Error, Flip, GREY, ImageConverterTrait, NV12, RGB, RGBA, Rotation, TensorImage, YUYV};
+use crate::{
+    Crop, Error, Flip, GREY, ImageConverterTrait, NV12, RGB, RGBA, Rotation, TensorImage, YUYV,
+};
 
 pub(crate) struct GlContext {
-    pub(crate) ctx: egl::Context,
-    pub(crate) display: egl::Display,
-    pub(crate) egl: Rc<egl::Instance<egl::Dynamic<libloading::Library, egl::EGL1_4>>>,
     pub(crate) support_dma: bool,
     pub(crate) surface: egl::Surface,
+    pub(crate) display: egl::Display,
+    pub(crate) ctx: egl::Context,
+    pub(crate) egl: Rc<egl::Instance<egl::Dynamic<libloading::Library, egl::EGL1_4>>>,
 }
 
 impl GlContext {
@@ -114,15 +116,14 @@ impl GlContext {
     fn egl_get_display(
         egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
     ) -> Result<Display, crate::Error> {
-        // get the default display
-        if let Some(display) = unsafe { egl.get_display(egl::DEFAULT_DISPLAY) } {
-            debug!("default display: {display:?}");
+        if let Ok(display) = Self::egl_get_gbm_display(egl) {
+            debug!("gbm display: {display:?}");
             return Ok(display);
         }
 
-        //  Fallback for EVK which doesn't have a default display
-        if let Ok(display) = Self::egl_get_gbm_display(egl) {
-            debug!("gbm display: {display:?}");
+        // get the default display
+        if let Some(display) = unsafe { egl.get_display(egl::DEFAULT_DISPLAY) } {
+            debug!("default display: {display:?}");
             return Ok(display);
         }
 
@@ -374,17 +375,21 @@ impl Card {
     }
 
     pub fn open_global() -> Result<Self, crate::Error> {
-        let e = Self::open("/dev/dri/card0");
-        if e.is_err() {
-            let nv = Self::open("drm-nvdc");
-            if nv.is_ok() {
-                return nv;
+        let targets = ["/dev/dri/card0", "/dev/dri/card1", "/dev/dri/render128"];
+        let e = Self::open(targets[0]);
+        if let Ok(t) = e {
+            return Ok(t);
+        }
+        for t in &targets[1..] {
+            if let Ok(t) = Self::open(t) {
+                return Ok(t);
             }
         }
         e
     }
 }
 
+#[derive(Debug)]
 struct RegionOfInterest {
     left: f32,
     top: f32,
@@ -393,13 +398,12 @@ struct RegionOfInterest {
 }
 
 pub struct GLConverter {
-    texture_program: GlProgram,
-    texture_program_planar: GlProgram,
     camera_texture: Texture,
     render_texture: Texture,
     vertex_buffer: Buffer,
     texture_buffer: Buffer,
-
+    texture_program: GlProgram,
+    texture_program_planar: GlProgram,
     gl_context: GlContext,
 }
 
@@ -410,8 +414,9 @@ impl ImageConverterTrait for GLConverter {
         dst: &mut TensorImage,
         rotation: crate::Rotation,
         flip: Flip,
-        crop: Option<crate::Rect>,
+        crop: Crop,
     ) -> crate::Result<()> {
+        crop.check_crop(src, dst)?;
         check_gl_error(function!(), line!())?;
         self.gl_context.make_current()?;
         if self.gl_context.support_dma
@@ -499,7 +504,7 @@ impl GLConverter {
         src: &TensorImage,
         rotation: crate::Rotation,
         flip: Flip,
-        crop: Option<crate::Rect>,
+        crop: Crop,
     ) -> crate::Result<()> {
         assert!(self.gl_context.support_dma);
         let frame_buffer = FrameBuffer::new();
@@ -550,7 +555,7 @@ impl GLConverter {
         if dst.is_planar() {
             self.convert_to_planar(src, width as usize, crop)
         } else {
-            self.convert_to(src, rotation, flip, crop, false)
+            self.convert_to(src, dst, rotation, flip, crop)
         }
     }
 
@@ -560,7 +565,7 @@ impl GLConverter {
         src: &TensorImage,
         rotation: crate::Rotation,
         flip: Flip,
-        crop: Option<crate::Rect>,
+        crop: Crop,
     ) -> crate::Result<()> {
         let frame_buffer = FrameBuffer::new();
         frame_buffer.bind();
@@ -588,8 +593,8 @@ impl GLConverter {
             match dst.fourcc() {
                 RGB => gls::gl::RGB,
                 RGBA => gls::gl::RGBA,
-                GREY => gls::gl::RGB,
-                // GREY => gls::gl::R8,
+                // GREY => gls::gl::RGB,
+                GREY => gls::gl::R8,
                 f => {
                     return Err(crate::Error::NotSupported(format!(
                         "Opengl doesn't support {} destination texture",
@@ -597,6 +602,19 @@ impl GLConverter {
                     )));
                 }
             }
+        };
+
+        let map;
+        let pixels = if crop.dst_rect.is_none_or(|crop| {
+            crop.top == 0
+                && crop.left == 0
+                && crop.height == dst.height()
+                && crop.width == dst.width()
+        }) {
+            std::ptr::null()
+        } else {
+            map = dst.tensor().map()?;
+            map.as_ptr() as *const c_void
         };
 
         unsafe {
@@ -613,6 +631,7 @@ impl GLConverter {
                 gls::gl::TEXTURE_MAG_FILTER,
                 gls::gl::LINEAR as i32,
             );
+
             gls::gl::TexImage2D(
                 gls::gl::TEXTURE_2D,
                 0,
@@ -622,9 +641,8 @@ impl GLConverter {
                 0,
                 format,
                 gls::gl::UNSIGNED_BYTE,
-                std::ptr::null(),
+                pixels,
             );
-            check_gl_error(function!(), line!())?;
             gls::gl::FramebufferTexture2D(
                 gls::gl::FRAMEBUFFER,
                 gls::gl::COLOR_ATTACHMENT0,
@@ -639,7 +657,7 @@ impl GLConverter {
         if dst.is_planar() {
             self.convert_to_planar(src, width as usize, crop)?;
         } else {
-            self.convert_to(src, rotation, flip, crop, false)?;
+            self.convert_to(src, dst, rotation, flip, crop)?;
         }
 
         let dest_format = match dst.fourcc() {
@@ -656,12 +674,13 @@ impl GLConverter {
         unsafe {
             gls::gl::PixelStorei(gls::gl::PACK_ALIGNMENT, 1);
             gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
-            // gls::gl::GetActiveAttrib
+
+            // TODO: the gls library doesn't have bindings for glGetTexImage?
             let func = self
                 .gl_context
                 .egl
                 .get_proc_address("glGetTexImage")
-                .unwrap();
+                .ok_or_else(|| Error::GLVersion("Missing glGetTexImage function".to_string()))?;
 
             let gl_get_tex_image: extern "system" fn(
                 target: gls::gl::GLenum,
@@ -670,6 +689,7 @@ impl GLConverter {
                 type_: gls::gl::GLenum,
                 pixels: *mut c_void,
             ) = std::mem::transmute(func);
+
             gl_get_tex_image(
                 gls::gl::TEXTURE_2D,
                 0,
@@ -684,18 +704,19 @@ impl GLConverter {
     fn convert_to(
         &mut self,
         src: &TensorImage,
+        dst: &TensorImage,
         rotation: crate::Rotation,
         flip: Flip,
-        crop: Option<crate::Rect>,
-        flip_y: bool,
+        crop: Crop,
     ) -> Result<(), crate::Error> {
         check_gl_error(function!(), line!())?;
-        unsafe {
-            gls::gl::ClearColor(1.0, 1.0, 1.0, 1.0);
-            gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
-        };
-        let roi = if let Some(crop) = crop {
-            // top and bottom are flipped because OpenGL uses 0,0 as bottom left
+        // unsafe {
+        //     gls::gl::ClearColor(1.0, 1.0, 1.0, 1.0);
+        //     gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
+        // };
+
+        // top and bottom are flipped because OpenGL uses 0,0 as bottom left
+        let src_roi = if let Some(crop) = crop.src_rect {
             RegionOfInterest {
                 left: crop.left as f32 / src.width() as f32,
                 top: (crop.top + crop.height) as f32 / src.height() as f32,
@@ -711,6 +732,23 @@ impl GLConverter {
             }
         };
 
+        // top and bottom are flipped because OpenGL uses 0,0 as bottom left
+        let cvt_screen_coord = |normalized| normalized * 2.0 - 1.0;
+        let dst_roi = if let Some(crop) = crop.dst_rect {
+            RegionOfInterest {
+                left: cvt_screen_coord(crop.left as f32 / dst.width() as f32),
+                top: cvt_screen_coord((crop.top + crop.height) as f32 / dst.height() as f32),
+                right: cvt_screen_coord((crop.left + crop.width) as f32 / dst.width() as f32),
+                bottom: cvt_screen_coord(crop.top as f32 / dst.height() as f32),
+            }
+        } else {
+            RegionOfInterest {
+                left: -1.,
+                top: 1.,
+                right: 1.,
+                bottom: -1.,
+            }
+        };
         let rotation_offset = match rotation {
             crate::Rotation::None => 0,
             crate::Rotation::Clockwise90 => 1,
@@ -722,13 +760,13 @@ impl GLConverter {
             self.draw_camera_texture_eglimage(
                 src,
                 &new_egl_image,
-                roi,
+                src_roi,
+                dst_roi,
                 rotation_offset,
                 flip,
-                flip_y,
             )
         } else {
-            self.draw_camera_texture(src, roi, rotation_offset, flip, flip_y)
+            self.draw_camera_texture(src, src_roi, dst_roi, rotation_offset, flip)
         };
         unsafe { gls::gl::Finish() };
         check_gl_error(function!(), line!())?;
@@ -739,9 +777,20 @@ impl GLConverter {
         &self,
         src: &TensorImage,
         width: usize,
-        crop: Option<crate::Rect>,
+        crop: Crop,
     ) -> Result<(), crate::Error> {
-        if let Some(crop) = crop
+        if let Some(crop) = crop.src_rect
+            && (crop.left > 0
+                || crop.top > 0
+                || crop.height < src.height()
+                || crop.width < src.width())
+        {
+            return Err(crate::Error::NotSupported(
+                "Cropping in planar RGB mode is not supported".to_string(),
+            ));
+        }
+
+        if let Some(crop) = crop.dst_rect
             && (crop.left > 0
                 || crop.top > 0
                 || crop.height < src.height()
@@ -840,10 +889,10 @@ impl GLConverter {
     fn draw_camera_texture(
         &mut self,
         img: &TensorImage,
-        roi: RegionOfInterest,
+        src_roi: RegionOfInterest,
+        mut dst_roi: RegionOfInterest,
         rotation_offset: usize,
         flip: Flip,
-        flip_y: bool,
     ) -> Result<(), Error> {
         let texture_target = gls::gl::TEXTURE_2D;
         let texture_format = match img.fourcc() {
@@ -899,30 +948,30 @@ impl GLConverter {
 
             gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
             gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
-            let mut cam = RegionOfInterest {
-                left: -1.,
-                bottom: -1.,
-                right: 1.,
-                top: 1.,
-            };
-            if flip_y {
-                std::mem::swap(&mut cam.top, &mut cam.bottom);
-            }
+
             match flip {
                 Flip::None => {}
                 Flip::Vertical => {
-                    std::mem::swap(&mut cam.top, &mut cam.bottom);
+                    std::mem::swap(&mut dst_roi.top, &mut dst_roi.bottom);
                 }
                 Flip::Horizontal => {
-                    std::mem::swap(&mut cam.left, &mut cam.right);
+                    std::mem::swap(&mut dst_roi.left, &mut dst_roi.right);
                 }
             }
 
             let camera_vertices: [f32; 12] = [
-                cam.left, cam.top, 0., // left top
-                cam.right, cam.top, 0., // right top
-                cam.right, cam.bottom, 0., // right bottom
-                cam.left, cam.bottom, 0., // left bottom
+                dst_roi.left,
+                dst_roi.top,
+                0., // left top
+                dst_roi.right,
+                dst_roi.top,
+                0., // right top
+                dst_roi.right,
+                dst_roi.bottom,
+                0., // right bottom
+                dst_roi.left,
+                dst_roi.bottom,
+                0., // left bottom
             ];
             gls::gl::BufferData(
                 gls::gl::ARRAY_BUFFER,
@@ -935,8 +984,22 @@ impl GLConverter {
             gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
 
             let texture_vertices: [f32; 16] = [
-                roi.left, roi.top, roi.right, roi.top, roi.right, roi.bottom, roi.left, roi.bottom,
-                roi.left, roi.top, roi.right, roi.top, roi.right, roi.bottom, roi.left, roi.bottom,
+                src_roi.left,
+                src_roi.top,
+                src_roi.right,
+                src_roi.top,
+                src_roi.right,
+                src_roi.bottom,
+                src_roi.left,
+                src_roi.bottom,
+                src_roi.left,
+                src_roi.top,
+                src_roi.right,
+                src_roi.top,
+                src_roi.right,
+                src_roi.bottom,
+                src_roi.left,
+                src_roi.bottom,
             ];
 
             gls::gl::BufferData(
@@ -962,10 +1025,10 @@ impl GLConverter {
         &self,
         src: &TensorImage,
         egl_img: &EglImage,
-        roi: RegionOfInterest,
+        src_roi: RegionOfInterest,
+        mut dst_roi: RegionOfInterest,
         rotation_offset: usize,
         flip: Flip,
-        flip_y: bool,
     ) -> Result<(), Error> {
         let texture_target = gls::gl::TEXTURE_2D;
         unsafe {
@@ -1005,31 +1068,30 @@ impl GLConverter {
             check_gl_error(function!(), line!())?;
             gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
             gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
-            let mut cam = RegionOfInterest {
-                left: -1.,
-                bottom: -1.,
-                right: 1.,
-                top: 1.,
-            };
-            if flip_y {
-                std::mem::swap(&mut cam.top, &mut cam.bottom);
-            }
 
             match flip {
                 Flip::None => {}
                 Flip::Vertical => {
-                    std::mem::swap(&mut cam.top, &mut cam.bottom);
+                    std::mem::swap(&mut dst_roi.top, &mut dst_roi.bottom);
                 }
                 Flip::Horizontal => {
-                    std::mem::swap(&mut cam.left, &mut cam.right);
+                    std::mem::swap(&mut dst_roi.left, &mut dst_roi.right);
                 }
             }
 
             let camera_vertices: [f32; 12] = [
-                cam.left, cam.top, 0., // left top
-                cam.right, cam.top, 0., // right top
-                cam.right, cam.bottom, 0., // right bottom
-                cam.left, cam.bottom, 0., // left bottom
+                dst_roi.left,
+                dst_roi.top,
+                0., // left top
+                dst_roi.right,
+                dst_roi.top,
+                0., // right top
+                dst_roi.right,
+                dst_roi.bottom,
+                0., // right bottom
+                dst_roi.left,
+                dst_roi.bottom,
+                0., // left bottom
             ];
             gls::gl::BufferSubData(
                 gls::gl::ARRAY_BUFFER,
@@ -1041,8 +1103,22 @@ impl GLConverter {
             gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
             gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
             let texture_vertices: [f32; 16] = [
-                roi.left, roi.top, roi.right, roi.top, roi.right, roi.bottom, roi.left, roi.bottom,
-                roi.left, roi.top, roi.right, roi.top, roi.right, roi.bottom, roi.left, roi.bottom,
+                src_roi.left,
+                src_roi.top,
+                src_roi.right,
+                src_roi.top,
+                src_roi.right,
+                src_roi.bottom,
+                src_roi.left,
+                src_roi.bottom,
+                src_roi.left,
+                src_roi.top,
+                src_roi.right,
+                src_roi.top,
+                src_roi.right,
+                src_roi.bottom,
+                src_roi.left,
+                src_roi.bottom,
             ];
             gls::gl::BufferSubData(
                 gls::gl::ARRAY_BUFFER,
@@ -1129,6 +1205,8 @@ impl GLConverter {
             0 as Attrib,
             egl_ext::DMA_BUF_PLANE0_FD as Attrib,
             fd as Attrib,
+            egl::IMAGE_PRESERVED as Attrib,
+            egl::TRUE as Attrib,
         ];
         if matches!(src.fourcc(), YUYV | NV12) {
             egl_img_attr.append(&mut vec![

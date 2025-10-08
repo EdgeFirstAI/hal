@@ -1,7 +1,7 @@
 #![cfg(target_os = "linux")]
 
 use crate::{
-    Error, Flip, ImageConverterTrait, RGB, RGBA, Rect, Result, Rotation, TensorImage, YUYV,
+    Crop, Error, Flip, ImageConverterTrait, RGB, RGBA, Result, Rotation, TensorImage, YUYV,
 };
 use edgefirst_tensor::Tensor;
 use g2d_sys::{G2D, G2DFormat, G2DPhysical, G2DSurface};
@@ -18,6 +18,7 @@ impl G2DConverter {
     pub fn new() -> Result<Self> {
         let mut g2d = G2D::new("libg2d.so.2")?;
         g2d.set_bt709_colorspace()?;
+        log::debug!("G2DConverter created");
         Ok(Self { g2d })
     }
 
@@ -31,8 +32,10 @@ impl G2DConverter {
         dst: &mut TensorImage,
         rotation: Rotation,
         flip: Flip,
-        crop: Option<Rect>,
+        crop: Crop,
     ) -> Result<()> {
+        crop.check_crop(src, dst)?;
+
         let mut src_surface: G2DSurface = src.try_into()?;
         let mut dst_surface: G2DSurface = dst.try_into()?;
 
@@ -49,11 +52,18 @@ impl G2DConverter {
             Rotation::CounterClockwise90 => g2d_sys::g2d_rotation_G2D_ROTATION_270,
         };
 
-        if let Some(crop_rect) = crop {
+        if let Some(crop_rect) = crop.src_rect {
             src_surface.left = crop_rect.left as i32;
             src_surface.top = crop_rect.top as i32;
             src_surface.right = (crop_rect.left + crop_rect.width) as i32;
             src_surface.bottom = (crop_rect.top + crop_rect.height) as i32;
+        }
+
+        if let Some(crop_rect) = crop.dst_rect {
+            dst_surface.left = crop_rect.left as i32;
+            dst_surface.top = crop_rect.top as i32;
+            dst_surface.right = (crop_rect.left + crop_rect.width) as i32;
+            dst_surface.bottom = (crop_rect.top + crop_rect.height) as i32;
         }
 
         trace!("Blitting from {src_surface:?} to {dst_surface:?}");
@@ -84,7 +94,7 @@ impl ImageConverterTrait for G2DConverter {
         dst: &mut TensorImage,
         rotation: Rotation,
         flip: Flip,
-        crop: Option<Rect>,
+        crop: Crop,
     ) -> Result<()> {
         match (src.fourcc(), dst.fourcc()) {
             (RGBA, RGBA) => {}
@@ -175,8 +185,9 @@ impl TryFrom<&mut TensorImage> for G2DSurface {
     }
 }
 
+#[cfg(feature = "g2d_test_formats")]
 #[cfg(test)]
-mod test {
+mod g2d_tests {
     use super::*;
     use crate::{
         CPUConverter, Flip, G2DConverter, GREY, ImageConverterTrait, RGB, RGBA, Rotation,
@@ -214,15 +225,27 @@ mod test {
 
         let mut cpu_converter = CPUConverter::new()?;
 
-        cpu_converter.convert(&src, &mut src2, Rotation::None, Flip::None, None)?;
+        cpu_converter.convert(&src, &mut src2, Rotation::None, Flip::None, Crop::no_crop())?;
 
         let mut g2d_dst =
             TensorImage::new(dst_width, dst_height, g2d_out_fmt, Some(TensorMemory::Dma))?;
         let mut g2d_converter = G2DConverter::new()?;
-        g2d_converter.convert_(&src2, &mut g2d_dst, Rotation::None, Flip::None, None)?;
+        g2d_converter.convert_(
+            &src2,
+            &mut g2d_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )?;
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGB, None)?;
-        cpu_converter.convert(&g2d_dst, &mut cpu_dst, Rotation::None, Flip::None, None)?;
+        cpu_converter.convert(
+            &g2d_dst,
+            &mut cpu_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )?;
 
         compare_images(
             &src,
@@ -259,18 +282,36 @@ mod test {
         let mut cpu_converter = CPUConverter::new()?;
 
         let mut reference = TensorImage::new(dst_width, dst_height, RGB, Some(TensorMemory::Dma))?;
-        cpu_converter.convert(&src, &mut reference, Rotation::None, Flip::None, None)?;
+        cpu_converter.convert(
+            &src,
+            &mut reference,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )?;
 
         let mut src2 = TensorImage::new(1280, 720, g2d_in_fmt, Some(TensorMemory::Dma))?;
-        cpu_converter.convert(&src, &mut src2, Rotation::None, Flip::None, None)?;
+        cpu_converter.convert(&src, &mut src2, Rotation::None, Flip::None, Crop::no_crop())?;
 
         let mut g2d_dst =
             TensorImage::new(dst_width, dst_height, g2d_out_fmt, Some(TensorMemory::Dma))?;
         let mut g2d_converter = G2DConverter::new()?;
-        g2d_converter.convert_(&src2, &mut g2d_dst, Rotation::None, Flip::None, None)?;
+        g2d_converter.convert_(
+            &src2,
+            &mut g2d_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )?;
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGB, None)?;
-        cpu_converter.convert(&g2d_dst, &mut cpu_dst, Rotation::None, Flip::None, None)?;
+        cpu_converter.convert(
+            &g2d_dst,
+            &mut cpu_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )?;
 
         compare_images(
             &reference,

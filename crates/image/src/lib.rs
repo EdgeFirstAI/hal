@@ -6,6 +6,10 @@
 //! acceleration when available, but also provides a CPU-based fallback for
 //! environments where hardware acceleration is not present or not suitable.
 
+#[cfg(feature = "opengl")]
+#[cfg(target_os = "linux")]
+use std::env;
+
 use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait as _};
 use enum_dispatch::enum_dispatch;
 use four_char_code::{FourCharCode, four_char_code};
@@ -411,12 +415,53 @@ pub enum Flip {
     Horizontal = 2,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Crop {
+    pub src_rect: Option<Rect>,
+    pub dst_rect: Option<Rect>,
+}
+impl Crop {
+    pub fn new() -> Self {
+        Crop::default()
+    }
+
+    pub fn no_crop() -> Self {
+        Crop::default()
+    }
+
+    pub fn check_crop(&self, src: &TensorImage, dst: &TensorImage) -> Result<(), Error> {
+        let src = self.src_rect.is_none_or(|x| x.check_rect(src));
+        let dst = self.dst_rect.is_none_or(|x| x.check_rect(dst));
+        match (src, dst) {
+            (true, true) => Ok(()),
+            (true, false) => Err(Error::CropInvalid("Dest crop invalid".to_string())),
+            (false, true) => Err(Error::CropInvalid("Src crop invalid".to_string())),
+            (false, false) => Err(Error::CropInvalid("Dest and Src crop invalid".to_string())),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
     pub left: usize,
     pub top: usize,
     pub width: usize,
     pub height: usize,
+}
+
+impl Rect {
+    pub fn new(left: usize, top: usize, width: usize, height: usize) -> Self {
+        Self {
+            left,
+            top,
+            width,
+            height,
+        }
+    }
+
+    pub fn check_rect(&self, image: &TensorImage) -> bool {
+        self.left + self.width <= image.width() && self.top + self.height <= image.height()
+    }
 }
 
 #[enum_dispatch(ImageConverter)]
@@ -442,7 +487,7 @@ pub trait ImageConverterTrait {
         dst: &mut TensorImage,
         rotation: Rotation,
         flip: Flip,
-        crop: Option<Rect>,
+        crop: Crop,
     ) -> Result<()>;
 }
 
@@ -459,22 +504,34 @@ pub struct ImageConverter {
 impl ImageConverter {
     pub fn new() -> Result<Self> {
         #[cfg(target_os = "linux")]
-        let g2d = match G2DConverter::new() {
-            Ok(g2d_converter) => Some(g2d_converter),
-            Err(err) => {
-                log::debug!("Failed to initialize G2D converter: {err:?}");
-                None
+        let g2d = if !env::var("EDGEFIRST_DISABLE_G2D")
+            .is_ok_and(|x| x != "0" && x.to_lowercase() != "false")
+        {
+            match G2DConverter::new() {
+                Ok(g2d_converter) => Some(g2d_converter),
+                Err(err) => {
+                    log::debug!("Failed to initialize G2D converter: {err:?}");
+                    None
+                }
             }
+        } else {
+            None
         };
 
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
-        let opengl = match GLConverter::new() {
-            Ok(gl_converter) => Some(gl_converter),
-            Err(err) => {
-                log::debug!("Failed to initialize GL converter: {err:?}");
-                None
+        let opengl = if !env::var("EDGEFIRST_DISABLE_GL")
+            .is_ok_and(|x| x != "0" && x.to_lowercase() != "false")
+        {
+            match GLConverter::new() {
+                Ok(gl_converter) => Some(gl_converter),
+                Err(err) => {
+                    log::debug!("Failed to initialize GL converter: {err:?}");
+                    None
+                }
             }
+        } else {
+            None
         };
 
         let cpu = CPUConverter::new()?;
@@ -495,23 +552,33 @@ impl ImageConverterTrait for ImageConverter {
         dst: &mut TensorImage,
         rotation: Rotation,
         flip: Flip,
-        crop: Option<Rect>,
+        crop: Crop,
     ) -> Result<()> {
         #[cfg(target_os = "linux")]
-        if let Some(g2d) = self.g2d.as_mut()
-            && g2d.convert(src, dst, rotation, flip, crop).is_ok()
-        {
-            log::debug!("image converted with g2d");
-            return Ok(());
+        if let Some(g2d) = self.g2d.as_mut() {
+            match g2d.convert(src, dst, rotation, flip, crop) {
+                Ok(_) => {
+                    log::debug!("image converted with g2d");
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::trace!("image didn't convert with g2d: {e:?}")
+                }
+            }
         }
 
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
-        if let Some(opengl) = self.opengl.as_mut()
-            && opengl.convert(src, dst, rotation, flip, crop).is_ok()
-        {
-            log::debug!("image converted with opengl");
-            return Ok(());
+        if let Some(opengl) = self.opengl.as_mut() {
+            match opengl.convert(src, dst, rotation, flip, crop) {
+                Ok(_) => {
+                    log::debug!("image converted with opengl");
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::trace!("image didn't convert with opengl: {e:?}")
+                }
+            }
         }
 
         self.cpu.convert(src, dst, rotation, flip, crop)?;
@@ -587,7 +654,7 @@ mod tests {
         let mut dst = TensorImage::new(640, 360, RGBA, None).unwrap();
         let mut converter = ImageConverter::new().unwrap();
         converter
-            .convert(&img, &mut dst, Rotation::None, Flip::None, None)
+            .convert(&img, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
             .unwrap();
         assert_eq!(dst.width(), 640);
         assert_eq!(dst.height(), 360);
@@ -641,13 +708,25 @@ mod tests {
         let mut converter_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
         let mut converter = ImageConverter::new().unwrap();
         converter
-            .convert(&src, &mut converter_dst, Rotation::None, Flip::None, None)
+            .convert(
+                &src,
+                &mut converter_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
             .unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
         let mut cpu_converter = CPUConverter::new().unwrap();
         cpu_converter
-            .convert(&src, &mut cpu_dst, Rotation::None, Flip::None, None)
+            .convert(
+                &src,
+                &mut cpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
             .unwrap();
 
         compare_images(&converter_dst, &cpu_dst, 0.98, function!());
@@ -675,7 +754,7 @@ mod tests {
                 &mut cpu_dst,
                 Rotation::Clockwise90,
                 Flip::None,
-                None,
+                Crop::no_crop(),
             )
             .unwrap();
 
@@ -694,13 +773,25 @@ mod tests {
             TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
         let mut g2d_converter = G2DConverter::new().unwrap();
         g2d_converter
-            .convert(&src, &mut g2d_dst, Rotation::None, Flip::None, None)
+            .convert(
+                &src,
+                &mut g2d_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
             .unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
         let mut cpu_converter = CPUConverter::new().unwrap();
         cpu_converter
-            .convert(&src, &mut cpu_dst, Rotation::None, Flip::None, None)
+            .convert(
+                &src,
+                &mut cpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
             .unwrap();
 
         compare_images(&g2d_dst, &cpu_dst, 0.98, function!());
@@ -718,7 +809,13 @@ mod tests {
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
         let mut cpu_converter = CPUConverter::new().unwrap();
         cpu_converter
-            .convert(&src, &mut cpu_dst, Rotation::None, Flip::None, None)
+            .convert(
+                &src,
+                &mut cpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
             .unwrap();
         let mut gl_dst =
             TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
@@ -726,7 +823,13 @@ mod tests {
 
         for _ in 0..5 {
             gl_converter
-                .convert(&src, &mut gl_dst, Rotation::None, Flip::None, None)
+                .convert(
+                    &src,
+                    &mut gl_dst,
+                    Rotation::None,
+                    Flip::None,
+                    Crop::no_crop(),
+                )
                 .unwrap();
 
             compare_images(&gl_dst, &cpu_dst, 0.98, function!());
@@ -770,19 +873,31 @@ mod tests {
         let mut converter = CPUConverter::new().unwrap();
 
         converter
-            .convert(&img, &mut cpu_dst, Rotation::None, Flip::None, None)
+            .convert(
+                &img,
+                &mut cpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
             .unwrap();
 
         let mut gl = GLConverter::new().unwrap();
-        gl.convert(&img, &mut gl_dst, Rotation::None, Flip::None, None)
-            .unwrap();
+        gl.convert(
+            &img,
+            &mut gl_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
 
         compare_images(&gl_dst, &cpu_dst, 0.98, function!());
     }
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn test_g2d_crop() {
+    fn test_g2d_src_crop() {
         let dst_width = 640;
         let dst_height = 640;
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
@@ -796,12 +911,15 @@ mod tests {
                 &mut cpu_dst,
                 Rotation::None,
                 Flip::None,
-                Some(Rect {
-                    left: 0,
-                    top: 0,
-                    width: 640,
-                    height: 360,
-                }),
+                Crop {
+                    src_rect: Some(Rect {
+                        left: 0,
+                        top: 0,
+                        width: 640,
+                        height: 360,
+                    }),
+                    dst_rect: None,
+                },
             )
             .unwrap();
 
@@ -813,12 +931,15 @@ mod tests {
                 &mut g2d_dst,
                 Rotation::None,
                 Flip::None,
-                Some(Rect {
-                    left: 0,
-                    top: 0,
-                    width: 640,
-                    height: 360,
-                }),
+                Crop {
+                    src_rect: Some(Rect {
+                        left: 0,
+                        top: 0,
+                        width: 640,
+                        height: 360,
+                    }),
+                    dst_rect: None,
+                },
             )
             .unwrap();
 
@@ -827,8 +948,105 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    fn test_g2d_dst_crop() {
+        let dst_width = 640;
+        let dst_height = 640;
+        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
+
+        let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
+        let mut cpu_converter = CPUConverter::new().unwrap();
+        cpu_converter
+            .convert(
+                &src,
+                &mut cpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop {
+                    src_rect: None,
+                    dst_rect: Some(Rect::new(100, 100, 512, 288)),
+                },
+            )
+            .unwrap();
+
+        let mut g2d_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
+        let mut g2d_converter = G2DConverter::new().unwrap();
+        g2d_converter
+            .convert(
+                &src,
+                &mut g2d_dst,
+                Rotation::None,
+                Flip::None,
+                Crop {
+                    src_rect: None,
+                    dst_rect: Some(Rect::new(100, 100, 512, 288)),
+                },
+            )
+            .unwrap();
+
+        compare_images(&g2d_dst, &cpu_dst, 0.98, function!());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_g2d_all_rgba() {
+        let dst_width = 640;
+        let dst_height = 640;
+        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
+
+        let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
+        let mut cpu_converter = CPUConverter::new().unwrap();
+        let mut g2d_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
+        let mut g2d_converter = G2DConverter::new().unwrap();
+
+        for rot in [
+            Rotation::None,
+            Rotation::Clockwise90,
+            Rotation::Rotate180,
+            Rotation::CounterClockwise90,
+        ] {
+            for flip in [Flip::None, Flip::Horizontal, Flip::Vertical] {
+                cpu_converter
+                    .convert(
+                        &src,
+                        &mut cpu_dst,
+                        Rotation::None,
+                        Flip::None,
+                        Crop {
+                            src_rect: Some(Rect::new(50, 120, 1024, 576)),
+                            dst_rect: Some(Rect::new(100, 100, 512, 288)),
+                        },
+                    )
+                    .unwrap();
+
+                g2d_converter
+                    .convert(
+                        &src,
+                        &mut g2d_dst,
+                        Rotation::None,
+                        Flip::None,
+                        Crop {
+                            src_rect: Some(Rect::new(50, 120, 1024, 576)),
+                            dst_rect: Some(Rect::new(100, 100, 512, 288)),
+                        },
+                    )
+                    .unwrap();
+
+                compare_images(
+                    &g2d_dst,
+                    &cpu_dst,
+                    0.98,
+                    &format!("{} {:?} {:?}", function!(), rot, flip),
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
-    fn test_opengl_crop() {
+    fn test_opengl_src_crop() {
         let dst_width = 640;
         let dst_height = 360;
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
@@ -842,12 +1060,15 @@ mod tests {
                 &mut cpu_dst,
                 Rotation::None,
                 Flip::None,
-                Some(Rect {
-                    left: 320,
-                    top: 180,
-                    width: 1280 - 320,
-                    height: 720 - 180,
-                }),
+                Crop {
+                    src_rect: Some(Rect {
+                        left: 320,
+                        top: 180,
+                        width: 1280 - 320,
+                        height: 720 - 180,
+                    }),
+                    dst_rect: None,
+                },
             )
             .unwrap();
 
@@ -855,23 +1076,129 @@ mod tests {
             TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
         let mut gl_converter = GLConverter::new().unwrap();
 
-        for _ in 0..5 {
-            gl_converter
-                .convert(
-                    &src,
-                    &mut gl_dst,
-                    Rotation::None,
-                    Flip::None,
-                    Some(Rect {
+        gl_converter
+            .convert(
+                &src,
+                &mut gl_dst,
+                Rotation::None,
+                Flip::None,
+                Crop {
+                    src_rect: Some(Rect {
                         left: 320,
                         top: 180,
                         width: 1280 - 320,
                         height: 720 - 180,
                     }),
-                )
-                .unwrap();
+                    dst_rect: None,
+                },
+            )
+            .unwrap();
 
-            compare_images(&gl_dst, &cpu_dst, 0.98, function!());
+        compare_images(&gl_dst, &cpu_dst, 0.98, function!());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_opengl_dst_crop() {
+        let dst_width = 640;
+        let dst_height = 640;
+        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
+
+        let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
+        let mut cpu_converter = CPUConverter::new().unwrap();
+        cpu_converter
+            .convert(
+                &src,
+                &mut cpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop {
+                    src_rect: None,
+                    dst_rect: Some(Rect::new(100, 100, 512, 288)),
+                },
+            )
+            .unwrap();
+
+        let mut gl_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
+        let mut gl_converter = GLConverter::new().unwrap();
+        gl_converter
+            .convert(
+                &src,
+                &mut gl_dst,
+                Rotation::None,
+                Flip::None,
+                Crop {
+                    src_rect: None,
+                    dst_rect: Some(Rect::new(100, 100, 512, 288)),
+                },
+            )
+            .unwrap();
+
+        compare_images(&gl_dst, &cpu_dst, 0.98, function!());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_opengl_all_rgba() {
+        let dst_width = 640;
+        let dst_height = 640;
+        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
+
+        let mut cpu_converter = CPUConverter::new().unwrap();
+
+        let mut gl_converter = GLConverter::new().unwrap();
+
+        for mem in [
+            None,
+            Some(TensorMemory::Dma),
+            Some(TensorMemory::Mem),
+            Some(TensorMemory::Shm),
+        ] {
+            let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, mem).unwrap();
+            let mut gl_dst = TensorImage::new(dst_width, dst_height, RGBA, mem).unwrap();
+            for rot in [
+                Rotation::None,
+                Rotation::Clockwise90,
+                Rotation::Rotate180,
+                Rotation::CounterClockwise90,
+            ] {
+                for flip in [Flip::None, Flip::Horizontal, Flip::Vertical] {
+                    cpu_converter
+                        .convert(
+                            &src,
+                            &mut cpu_dst,
+                            Rotation::None,
+                            Flip::None,
+                            Crop {
+                                src_rect: Some(Rect::new(50, 120, 1024, 576)),
+                                dst_rect: Some(Rect::new(100, 100, 512, 288)),
+                            },
+                        )
+                        .unwrap();
+
+                    gl_converter
+                        .convert(
+                            &src,
+                            &mut gl_dst,
+                            Rotation::None,
+                            Flip::None,
+                            Crop {
+                                src_rect: Some(Rect::new(50, 120, 1024, 576)),
+                                dst_rect: Some(Rect::new(100, 100, 512, 288)),
+                            },
+                        )
+                        .unwrap();
+
+                    compare_images(
+                        &gl_dst,
+                        &cpu_dst,
+                        0.98,
+                        &format!("{} {:?} {:?}", function!(), rot, flip),
+                    );
+                }
+            }
         }
     }
 
@@ -908,19 +1235,19 @@ mod tests {
         // After rotating 4 times, the image should be the same as the original
 
         cpu_converter
-            .convert(&src, &mut cpu_dst, rot, Flip::None, None)
+            .convert(&src, &mut cpu_dst, rot, Flip::None, Crop::no_crop())
             .unwrap();
 
         cpu_converter
-            .convert(&cpu_dst, &mut src, rot, Flip::None, None)
+            .convert(&cpu_dst, &mut src, rot, Flip::None, Crop::no_crop())
             .unwrap();
 
         cpu_converter
-            .convert(&src, &mut cpu_dst, rot, Flip::None, None)
+            .convert(&src, &mut cpu_dst, rot, Flip::None, Crop::no_crop())
             .unwrap();
 
         cpu_converter
-            .convert(&cpu_dst, &mut src, rot, Flip::None, None)
+            .convert(&cpu_dst, &mut src, rot, Flip::None, Crop::no_crop())
             .unwrap();
 
         compare_images(&src, &unchanged_src, 0.98, function!());
@@ -966,7 +1293,7 @@ mod tests {
         let mut cpu_converter = CPUConverter::new().unwrap();
 
         cpu_converter
-            .convert(&src, &mut cpu_dst, rot, Flip::None, None)
+            .convert(&src, &mut cpu_dst, rot, Flip::None, Crop::no_crop())
             .unwrap();
 
         let mut gl_dst = TensorImage::new(dst_width, dst_height, RGBA, tensor_memory).unwrap();
@@ -974,13 +1301,8 @@ mod tests {
 
         for _ in 0..5 {
             gl_converter
-                .convert(&src, &mut gl_dst, rot, Flip::None, None)
+                .convert(&src, &mut gl_dst, rot, Flip::None, Crop::no_crop())
                 .unwrap();
-            std::fs::write(
-                format!("{}.rgba", function!()),
-                &*gl_dst.tensor.map().unwrap(),
-            )
-            .unwrap();
             compare_images(&gl_dst, &cpu_dst, 0.98, function!());
         }
     }
@@ -1012,7 +1334,7 @@ mod tests {
         let mut cpu_converter = CPUConverter::new().unwrap();
 
         cpu_converter
-            .convert(&src, &mut cpu_dst, rot, Flip::None, None)
+            .convert(&src, &mut cpu_dst, rot, Flip::None, Crop::no_crop())
             .unwrap();
 
         let mut g2d_dst =
@@ -1020,7 +1342,7 @@ mod tests {
         let mut g2d_converter = G2DConverter::new().unwrap();
 
         g2d_converter
-            .convert(&src, &mut g2d_dst, rot, Flip::None, None)
+            .convert(&src, &mut g2d_dst, rot, Flip::None, Crop::no_crop())
             .unwrap();
 
         compare_images(&g2d_dst, &cpu_dst, 0.98, function!());
@@ -1047,7 +1369,7 @@ mod tests {
         let mut cpu_converter = CPUConverter::new().unwrap();
 
         cpu_converter
-            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
             .unwrap();
 
         cpu_converter
@@ -1056,12 +1378,18 @@ mod tests {
                 &mut dst_through_yuyv,
                 Rotation::None,
                 Flip::None,
-                None,
+                Crop::no_crop(),
             )
             .unwrap();
 
         cpu_converter
-            .convert(&src, &mut dst_direct, Rotation::None, Flip::None, None)
+            .convert(
+                &src,
+                &mut dst_direct,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
             .unwrap();
 
         compare_images(&dst_through_yuyv, &dst_direct, 0.98, function!());
@@ -1081,7 +1409,7 @@ mod tests {
         let mut cpu_converter = CPUConverter::new().unwrap();
 
         cpu_converter
-            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
             .unwrap();
 
         let target_image = TensorImage::new(1280, 720, RGBA, None).unwrap();
@@ -1109,7 +1437,7 @@ mod tests {
         let mut cpu_converter = CPUConverter::new().unwrap();
 
         cpu_converter
-            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
             .unwrap();
 
         let target_image = TensorImage::new(1280, 720, RGB, None).unwrap();
@@ -1147,7 +1475,7 @@ mod tests {
         let mut g2d_converter = G2DConverter::new().unwrap();
 
         g2d_converter
-            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
             .unwrap();
 
         let target_image = TensorImage::new(1280, 720, RGBA, None).unwrap();
@@ -1178,7 +1506,7 @@ mod tests {
         let mut gl_converter = GLConverter::new().unwrap();
 
         gl_converter
-            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
             .unwrap();
 
         let target_image = TensorImage::new(1280, 720, RGBA, None).unwrap();
@@ -1208,14 +1536,26 @@ mod tests {
         let mut g2d_converter = G2DConverter::new().unwrap();
 
         g2d_converter
-            .convert(&src, &mut g2d_dst, Rotation::None, Flip::None, None)
+            .convert(
+                &src,
+                &mut g2d_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
             .unwrap();
 
         let mut cpu_dst = TensorImage::new(1280, 720, RGB, None).unwrap();
         let mut cpu_converter: CPUConverter = CPUConverter::new().unwrap();
 
         cpu_converter
-            .convert(&src, &mut cpu_dst, Rotation::None, Flip::None, None)
+            .convert(
+                &src,
+                &mut cpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
             .unwrap();
 
         compare_images(&g2d_dst, &cpu_dst, 0.98, function!());
@@ -1237,14 +1577,26 @@ mod tests {
         let mut g2d_converter = G2DConverter::new().unwrap();
 
         g2d_converter
-            .convert(&src, &mut g2d_dst, Rotation::None, Flip::None, None)
+            .convert(
+                &src,
+                &mut g2d_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
             .unwrap();
 
         let mut cpu_dst = TensorImage::new(600, 400, YUYV, None).unwrap();
         let mut cpu_converter: CPUConverter = CPUConverter::new().unwrap();
 
         cpu_converter
-            .convert(&src, &mut cpu_dst, Rotation::None, Flip::None, None)
+            .convert(
+                &src,
+                &mut cpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
             .unwrap();
 
         // TODO: compare YUYV and YUYV images without having to convert them to RGB
@@ -1268,7 +1620,7 @@ mod tests {
         let mut cpu_converter = CPUConverter::new().unwrap();
 
         cpu_converter
-            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
             .unwrap();
 
         let mut dst_target = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
@@ -1286,7 +1638,7 @@ mod tests {
                 &mut dst_target,
                 Rotation::None,
                 Flip::None,
-                None,
+                Crop::no_crop(),
             )
             .unwrap();
 
@@ -1317,12 +1669,15 @@ mod tests {
                 &mut dst_g2d,
                 Rotation::None,
                 Flip::Horizontal,
-                Some(Rect {
-                    left: 20,
-                    top: 15,
-                    width: 400,
-                    height: 300,
-                }),
+                Crop {
+                    src_rect: Some(Rect {
+                        left: 20,
+                        top: 15,
+                        width: 400,
+                        height: 300,
+                    }),
+                    dst_rect: None,
+                },
             )
             .unwrap();
 
@@ -1336,12 +1691,15 @@ mod tests {
                 &mut dst_cpu,
                 Rotation::None,
                 Flip::Horizontal,
-                Some(Rect {
-                    left: 20,
-                    top: 15,
-                    width: 400,
-                    height: 300,
-                }),
+                Crop {
+                    src_rect: Some(Rect {
+                        left: 20,
+                        top: 15,
+                        width: 400,
+                        height: 300,
+                    }),
+                    dst_rect: None,
+                },
             )
             .unwrap();
         compare_images(&dst_g2d, &dst_cpu, 0.98, function!());
@@ -1372,12 +1730,15 @@ mod tests {
                 &mut dst_gl,
                 Rotation::None,
                 Flip::Horizontal,
-                Some(Rect {
-                    left: 20,
-                    top: 15,
-                    width: 400,
-                    height: 300,
-                }),
+                Crop {
+                    src_rect: Some(Rect {
+                        left: 20,
+                        top: 15,
+                        width: 400,
+                        height: 300,
+                    }),
+                    dst_rect: None,
+                },
             )
             .unwrap();
 
@@ -1391,12 +1752,15 @@ mod tests {
                 &mut dst_cpu,
                 Rotation::None,
                 Flip::Horizontal,
-                Some(Rect {
-                    left: 20,
-                    top: 15,
-                    width: 400,
-                    height: 300,
-                }),
+                Crop {
+                    src_rect: Some(Rect {
+                        left: 20,
+                        top: 15,
+                        width: 400,
+                        height: 300,
+                    }),
+                    dst_rect: None,
+                },
             )
             .unwrap();
         compare_images(&dst_gl, &dst_cpu, 0.98, function!());
@@ -1412,7 +1776,7 @@ mod tests {
         let mut cpu_converter = CPUConverter::new().unwrap();
 
         cpu_converter
-            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
             .unwrap();
 
         let target_image = TensorImage::load_jpeg(
@@ -1435,7 +1799,7 @@ mod tests {
         let mut cpu_converter = CPUConverter::new().unwrap();
 
         cpu_converter
-            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
             .unwrap();
 
         let target_image = TensorImage::load_jpeg(
@@ -1458,7 +1822,7 @@ mod tests {
         let mut cpu_converter = CPUConverter::new().unwrap();
 
         cpu_converter
-            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
             .unwrap();
 
         let target_image = TensorImage::load_jpeg(
@@ -1481,7 +1845,7 @@ mod tests {
         let mut cpu_converter = CPUConverter::new().unwrap();
 
         cpu_converter
-            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
             .unwrap();
 
         let target_image = TensorImage::load_jpeg(
@@ -1569,6 +1933,8 @@ mod tests {
         )
         .expect("Image Comparison failed");
         if similarity.score < threshold {
+            // image1.save(format!("{name}_1.png"));
+            // image2.save(format!("{name}_2.png"));
             similarity
                 .image
                 .to_color_map()
