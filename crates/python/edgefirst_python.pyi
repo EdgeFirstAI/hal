@@ -225,6 +225,6 @@ class ImageConverter:
     def __init__(self) -> None:
         ...
 
-    # [pyo3(signature = (src, dst, rotation = Rotation::Rotate0, crop = None))]
-    def convert(self, src: TensorImage, dst: TensorImage, rotation: Rotation = Rotation.Rotate0, flip: Flip = Flip.NoFlip, crop: Rect | None = None) -> None:
+    # [pyo3(signature = (src, dst, rotation = Rotation::Rotate0, flip = Flip::NoFlip, src_crop = None, dst_crop = None))]
+    def convert(self, src: TensorImage, dst: TensorImage, rotation: Rotation = Rotation.Rotate0, flip: Flip = Flip.NoFlip, src_crop: Rect | None = None, dst_crop: Rect | None = None) -> None:
         ...

@@ -1,12 +1,15 @@
 use edgefirst::{
-    image::{self, Flip, ImageConverterTrait, Rect, Rotation},
+    image::{self, Crop, Flip, ImageConverterTrait, RGBA, Rect, Rotation},
     tensor::{self, TensorMapTrait, TensorTrait},
 };
 use four_char_code::FourCharCode;
 use ndarray::{Array3, ArrayView3, ArrayViewMut3};
-use numpy::{IntoPyArray, PyArray3, PyArrayLike3, PyReadwriteArray3};
+use numpy::{IntoPyArray, PyArray3, PyArrayLike3, PyReadwriteArray3, PyUntypedArrayMethods};
 use pyo3::prelude::*;
-use std::{fmt, sync::Mutex};
+use std::{
+    fmt::{self},
+    sync::Mutex,
+};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -17,6 +20,7 @@ pub enum Error {
     NdArrayShape(ndarray::ShapeError),
     Io(std::io::Error),
     Format(String),
+    Shape(String),
 }
 
 impl fmt::Display for Error {
@@ -27,6 +31,7 @@ impl fmt::Display for Error {
             Error::NdArrayShape(e) => write!(f, "Ndarray shape error: {e:?}"),
             Error::Io(e) => write!(f, "Io error: {e:?}"),
             Error::Format(msg) => write!(f, "Format error: {msg}"),
+            Error::Shape(msg) => write!(f, "Shape error: {msg}"),
         }
     }
 }
@@ -59,6 +64,14 @@ impl From<Error> for PyErr {
     fn from(err: Error) -> PyErr {
         pyo3::exceptions::PyRuntimeError::new_err(format!("{err:?}"))
     }
+}
+
+#[derive(FromPyObject)]
+pub enum ImageDest3<'py> {
+    UInt8(PyReadwriteArray3<'py, u8>),
+    Int8(PyReadwriteArray3<'py, i8>),
+    Float32(PyReadwriteArray3<'py, f32>),
+    Float64(PyReadwriteArray3<'py, f64>),
 }
 
 #[pyclass]
@@ -161,23 +174,92 @@ impl PyTensorImage {
         Ok(ndarray.into_pyarray(self_.py()))
     }
 
-    pub fn copy_into_numpy(&self, mut dst: PyReadwriteArray3<u8>) -> Result<()> {
-        let mut dst = dst.as_array_mut();
+    pub fn copy_into_numpy(&self, dst: ImageDest3) -> Result<()> {
         let tensor = &self.0;
         let shape = [tensor.height(), tensor.width(), tensor.channels()];
-        if dst.shape() != shape {
+        let dst_shape = match &dst {
+            ImageDest3::UInt8(dst) => dst.shape(),
+            ImageDest3::Int8(dst) => dst.shape(),
+            ImageDest3::Float32(dst) => dst.shape(),
+            ImageDest3::Float64(dst) => dst.shape(),
+        }
+        .to_vec();
+
+        if dst_shape[..2] != shape[..2] {
             return Err(Error::Format(format!(
                 "Shape Mismatch: Expected {:?} but got {:?}",
-                shape,
-                dst.shape()
+                shape, dst_shape
             )));
         }
 
-        let map = tensor.tensor().map()?;
-        let data = map.as_slice();
-        let ndarray = ArrayView3::from_shape(shape, data)?;
+        match self.0.fourcc() {
+            RGBA => {
+                if dst_shape[2] != 4 && dst_shape[2] != 3 {
+                    return Err(Error::Format(format!(
+                        "Shape Mismatch: Expected {:?} but got {:?}",
+                        shape, dst_shape
+                    )));
+                }
+            }
+            _ => {
+                if dst_shape[2] != shape[2] {
+                    return Err(Error::Format(format!(
+                        "Shape Mismatch: Expected {:?} but got {:?}",
+                        shape, dst_shape
+                    )));
+                }
+            }
+        }
 
-        dst.assign(&ndarray);
+        match dst {
+            ImageDest3::UInt8(mut dst) => {
+                let mut dst = dst.as_array_mut();
+                let map = tensor.tensor().map()?;
+                let data = map.as_slice();
+                let ndarray = ArrayView3::from_shape(shape, data)?;
+
+                if self.0.fourcc() == RGBA
+                    && dst_shape[2] == 3
+                    && let Some(dst) = dst.as_slice_mut()
+                {
+                    let dst = dst.as_chunks_mut::<3>().0;
+                    let src = data.as_chunks::<4>().0;
+                    dst.iter_mut().zip(src).for_each(|(d, s)| {
+                        d[0] = s[0];
+                        d[1] = s[1];
+                        d[2] = s[2];
+                    });
+                    return Ok(());
+                }
+                dst.assign(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]));
+            }
+            ImageDest3::Int8(mut dst) => {
+                let mut dst = dst.as_array_mut();
+                let map = tensor.tensor().map()?;
+                let data = map.as_slice();
+                let ndarray = ArrayView3::from_shape(shape, data)?;
+                if self.0.fourcc() == RGBA
+                    && dst_shape[2] == 3
+                    && let Some(dst) = dst.as_slice_mut()
+                {
+                    let dst = dst.as_chunks_mut::<3>().0;
+                    let src = data.as_chunks::<4>().0;
+                    dst.iter_mut().zip(src).for_each(|(d, s)| {
+                        d[0] = (s[0] as i16 - 128) as i8;
+                        d[1] = (s[1] as i16 - 128) as i8;
+                        d[2] = (s[2] as i16 - 128) as i8;
+                    });
+                    return Ok(());
+                }
+                dst.zip_mut_with(
+                    &ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]),
+                    |x, y| *x = (*y as i16 - 128) as i8,
+                );
+            }
+            ImageDest3::Float32(_dst) => todo!(),
+            ImageDest3::Float64(_dst) => todo!(),
+        }
+
         Ok(())
     }
 
@@ -235,14 +317,15 @@ impl PyImageConverter {
         Ok(PyImageConverter(Mutex::new(converter)))
     }
 
-    #[pyo3(signature = (src, dst, rotation = PyRotation::Rotate0, flip = PyFlip::NoFlip, crop = None))]
+    #[pyo3(signature = (src, dst, rotation = PyRotation::Rotate0, flip = PyFlip::NoFlip, src_crop = None, dst_crop = None))]
     pub fn convert(
         &mut self,
         src: &PyTensorImage,
         dst: &mut PyTensorImage,
         rotation: PyRotation,
         flip: PyFlip,
-        crop: Option<PyRect>,
+        src_crop: Option<PyRect>,
+        dst_crop: Option<PyRect>,
     ) -> Result<()> {
         if let Ok(mut l) = self.0.lock() {
             l.convert(
@@ -250,7 +333,10 @@ impl PyImageConverter {
                 &mut dst.0,
                 rotation.into(),
                 flip.into(),
-                crop.map(|x| x.into()),
+                Crop {
+                    src_rect: src_crop.map(|x| x.into()),
+                    dst_rect: dst_crop.map(|x| x.into()),
+                },
             )?
         };
         Ok(())
