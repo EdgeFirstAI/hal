@@ -13,7 +13,7 @@ license.workspace = true
 [features]
 default = ["opengl"]
 opengl = ["dep:khronos-egl", "dep:gbm"]
-
+g2d_test_formats = []
 
 [dependencies]
 ctor = { workspace = true }

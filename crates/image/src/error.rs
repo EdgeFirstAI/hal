@@ -32,6 +32,7 @@ pub enum Error {
     GbmFrontBuffer(gbm::FrontBufferError),
     OpenGl(String),
     Internal(String),
+    CropInvalid(String),
 }
 
 impl From<std::io::Error> for Error {
@@ -129,6 +130,12 @@ impl From<gbm::FrontBufferError> for Error {
 
 impl From<ndarray::ShapeError> for Error {
     fn from(err: ndarray::ShapeError) -> Self {
+        Error::Internal(format!("{err}"))
+    }
+}
+
+impl From<fast_image_resize::CropBoxError> for Error {
+    fn from(err: fast_image_resize::CropBoxError) -> Self {
         Error::Internal(format!("{err}"))
     }
 }
