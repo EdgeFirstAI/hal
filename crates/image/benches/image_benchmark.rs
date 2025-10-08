@@ -4,7 +4,8 @@ use edgefirst_image::G2DConverter;
 #[cfg(target_os = "linux")]
 use edgefirst_image::GLConverter;
 use edgefirst_image::{
-    CPUConverter, Flip, GREY, ImageConverterTrait as _, RGB, RGBA, Rotation, TensorImage, YUYV,
+    CPUConverter, Crop, Flip, GREY, ImageConverterTrait as _, RGB, RGBA, Rotation, TensorImage,
+    YUYV,
 };
 use edgefirst_tensor::{TensorMapTrait, TensorMemory, TensorTrait};
 use four_char_code::FourCharCode;
@@ -221,7 +222,7 @@ where
 
     bencher.bench_local(|| {
         converter
-            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
             .unwrap()
     });
 }
@@ -258,12 +259,12 @@ where
     let mut converter = CPUConverter::new().unwrap();
 
     converter
-        .convert(&src, &mut grey, Rotation::None, Flip::None, None)
+        .convert(&src, &mut grey, Rotation::None, Flip::None, Crop::no_crop())
         .unwrap();
 
     bencher.bench_local(|| {
         converter
-            .convert(&grey, &mut dst, Rotation::None, Flip::None, None)
+            .convert(&grey, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
             .unwrap()
     });
 }
@@ -301,7 +302,7 @@ where
 
     bencher.bench_local(|| {
         converter
-            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
             .unwrap()
     });
 }
@@ -338,7 +339,13 @@ where
 
     bencher.bench_local(|| {
         gl_converter
-            .convert(&src, &mut gl_dst, Rotation::None, Flip::None, None)
+            .convert(
+                &src,
+                &mut gl_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
             .unwrap()
     });
     drop(gl_dst);
@@ -376,7 +383,13 @@ where
 
     bencher.bench_local(|| {
         gl_converter
-            .convert(&src, &mut gl_dst, Rotation::None, Flip::None, None)
+            .convert(
+                &src,
+                &mut gl_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
             .unwrap()
     });
     drop(gl_dst);
@@ -399,7 +412,7 @@ fn rotate_cpu<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) 
 
     bencher.bench_local(|| {
         converter
-            .convert(&src, &mut dst, rot, Flip::None, None)
+            .convert(&src, &mut dst, rot, Flip::None, Crop::no_crop())
             .unwrap()
     });
 }
@@ -424,7 +437,7 @@ fn rotate_opengl<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize
 
     bencher.bench_local(|| {
         converter
-            .convert(&src, &mut dst, rot, Flip::None, None)
+            .convert(&src, &mut dst, rot, Flip::None, Crop::no_crop())
             .unwrap()
     });
     drop(dst);
@@ -449,7 +462,7 @@ fn rotate_g2d<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) 
 
     bencher.bench_local(|| {
         converter
-            .convert(&src, &mut dst, rot, Flip::None, None)
+            .convert(&src, &mut dst, rot, Flip::None, Crop::no_crop())
             .unwrap()
     });
 }
@@ -471,7 +484,7 @@ fn convert_cpu_yuyv_to_rgba(bencher: divan::Bencher, params: (usize, usize)) {
 
     bencher.bench_local(|| {
         converter
-            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
             .unwrap()
     });
 }
@@ -493,7 +506,7 @@ fn convert_cpu_yuyv_to_rgb(bencher: divan::Bencher, params: (usize, usize)) {
 
     bencher.bench_local(|| {
         converter
-            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
             .unwrap()
     });
 }
@@ -515,7 +528,7 @@ fn convert_cpu_yuyv_to_yuyv(bencher: divan::Bencher, params: (usize, usize)) {
 
     bencher.bench_local(|| {
         converter
-            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
             .unwrap()
     });
 }
@@ -537,7 +550,7 @@ fn convert_cpu_rgba_to_yuyv(bencher: divan::Bencher, params: (usize, usize)) {
 
     bencher.bench_local(|| {
         converter
-            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
             .unwrap()
     });
 }
@@ -568,7 +581,7 @@ where
 
     bencher.bench_local(|| {
         converter
-            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
             .unwrap()
     });
 }
@@ -591,7 +604,7 @@ fn convert_g2d_yuyv_to_rgba(bencher: divan::Bencher, params: (usize, usize)) {
 
     bencher.bench_local(|| {
         converter
-            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
             .unwrap()
     });
 }
@@ -614,7 +627,7 @@ fn convert_g2d_yuyv_to_rgb(bencher: divan::Bencher, params: (usize, usize)) {
 
     bencher.bench_local(|| {
         converter
-            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
             .unwrap()
     });
 }
@@ -637,7 +650,7 @@ fn convert_g2d_yuyv_to_yuyv(bencher: divan::Bencher, params: (usize, usize)) {
 
     bencher.bench_local(|| {
         converter
-            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
             .unwrap()
     });
 }
@@ -661,7 +674,7 @@ fn convert_opengl_yuyv_to_rgba(bencher: divan::Bencher, params: (usize, usize)) 
 
     bencher.bench_local(|| {
         converter
-            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
             .unwrap()
     });
     drop(dst);
@@ -686,7 +699,7 @@ fn convert_opengl_yuyv_to_yuyv(bencher: divan::Bencher, params: (usize, usize)) 
 
     bencher.bench_local(|| {
         converter
-            .convert(&src, &mut dst, Rotation::None, Flip::None, None)
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
             .unwrap()
     });
     drop(dst);

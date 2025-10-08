@@ -1,6 +1,6 @@
 use crate::{
-    Error, Flip, GREY, ImageConverterTrait, NV12, RGB, RGBA, Rect, Result, Rotation, TensorImage,
-    YUYV,
+    Crop, Error, Flip, GREY, ImageConverterTrait, NV12, RGB, RGBA, Rect, Result, Rotation,
+    TensorImage, YUYV,
 };
 use edgefirst_tensor::{TensorMapTrait, TensorTrait};
 use ndarray::{ArrayView3, ArrayViewMut3, Axis};
@@ -26,10 +26,11 @@ impl CPUConverter {
     pub fn new() -> Result<Self> {
         let resizer = fast_image_resize::Resizer::new();
         let options = fast_image_resize::ResizeOptions::new()
-            .resize_alg(fast_image_resize::ResizeAlg::Convolution(
-                fast_image_resize::FilterType::Hamming,
+            .resize_alg(fast_image_resize::ResizeAlg::Interpolation(
+                fast_image_resize::FilterType::Bilinear,
             ))
             .use_alpha(false);
+        log::debug!("CPUConverter created");
         Ok(Self { resizer, options })
     }
 
@@ -519,7 +520,7 @@ impl CPUConverter {
         src: &TensorImage,
         rotation: Rotation,
         flip: Flip,
-        crop: Option<Rect>,
+        crop: Crop,
     ) -> Result<()> {
         assert_eq!(src.fourcc(), dst.fourcc());
 
@@ -538,7 +539,7 @@ impl CPUConverter {
 
         let mut dst_map = dst.tensor().map()?;
 
-        let options = if let Some(crop) = crop {
+        let options = if let Some(crop) = crop.src_rect {
             self.options.crop(
                 crop.left as f64,
                 crop.top as f64,
@@ -549,9 +550,27 @@ impl CPUConverter {
             self.options
         };
 
+        let mut dst_rect = crop.dst_rect.unwrap_or_else(|| Rect {
+            left: 0,
+            top: 0,
+            width: dst.width(),
+            height: dst.height(),
+        });
+
+        // adjust crop box for rotation/flip
+        Self::adjust_dest_rect_for_rotate_flip(&mut dst_rect, dst, rotation, flip);
+
         let needs_resize = src.width() != dst.width()
             || src.height() != dst.height()
-            || crop.is_some_and(|crop| {
+            || crop.src_rect.is_some_and(|crop| {
+                crop != Rect {
+                    left: 0,
+                    top: 0,
+                    width: src.width(),
+                    height: src.height(),
+                }
+            })
+            || crop.dst_rect.is_some_and(|crop| {
                 crop != Rect {
                     left: 0,
                     top: 0,
@@ -567,6 +586,7 @@ impl CPUConverter {
                 &mut src_map,
                 src_type,
             )?;
+
             match (rotation, flip) {
                 (Rotation::None, Flip::None) => {
                     let mut dst_view = fast_image_resize::images::Image::from_slice_u8(
@@ -575,6 +595,15 @@ impl CPUConverter {
                         &mut dst_map,
                         src_type,
                     )?;
+
+                    let mut dst_view = fast_image_resize::images::CroppedImageMut::new(
+                        &mut dst_view,
+                        dst_rect.left as u32,
+                        dst_rect.top as u32,
+                        dst_rect.width as u32,
+                        dst_rect.height as u32,
+                    )?;
+
                     self.resizer.resize(&src_view, &mut dst_view, &options)?;
                 }
                 (Rotation::Clockwise90, _) | (Rotation::CounterClockwise90, _) => {
@@ -585,6 +614,15 @@ impl CPUConverter {
                         &mut tmp,
                         src_type,
                     )?;
+
+                    let mut tmp_view = fast_image_resize::images::CroppedImageMut::new(
+                        &mut tmp_view,
+                        dst_rect.left as u32,
+                        dst_rect.top as u32,
+                        dst_rect.width as u32,
+                        dst_rect.height as u32,
+                    )?;
+
                     self.resizer.resize(&src_view, &mut tmp_view, &options)?;
                     Self::flip_rotate_ndarray(&tmp, &mut dst_map, dst, rotation, flip)?;
                 }
@@ -596,6 +634,15 @@ impl CPUConverter {
                         &mut tmp,
                         src_type,
                     )?;
+
+                    let mut tmp_view = fast_image_resize::images::CroppedImageMut::new(
+                        &mut tmp_view,
+                        dst_rect.left as u32,
+                        dst_rect.top as u32,
+                        dst_rect.width as u32,
+                        dst_rect.height as u32,
+                    )?;
+
                     self.resizer.resize(&src_view, &mut tmp_view, &options)?;
                     Self::flip_rotate_ndarray(&tmp, &mut dst_map, dst, rotation, flip)?;
                 }
@@ -604,6 +651,47 @@ impl CPUConverter {
             Self::flip_rotate_ndarray(&src_map, &mut dst_map, dst, rotation, flip)?;
         }
         Ok(())
+    }
+
+    fn adjust_dest_rect_for_rotate_flip(
+        crop: &mut Rect,
+        dst: &TensorImage,
+        rot: Rotation,
+        flip: Flip,
+    ) {
+        match rot {
+            Rotation::None => {}
+            Rotation::Clockwise90 => {
+                *crop = Rect {
+                    left: crop.top,
+                    top: dst.width() - crop.left - crop.width,
+                    width: crop.height,
+                    height: crop.width,
+                }
+            }
+            Rotation::Rotate180 => {
+                *crop = Rect {
+                    left: dst.width() - crop.left - crop.width,
+                    top: dst.height() - crop.top - crop.height,
+                    width: crop.width,
+                    height: crop.height,
+                }
+            }
+            Rotation::CounterClockwise90 => {
+                *crop = Rect {
+                    left: dst.height() - crop.top - crop.height,
+                    top: crop.left,
+                    width: crop.height,
+                    height: crop.width,
+                }
+            }
+        }
+
+        match flip {
+            Flip::None => {}
+            Flip::Vertical => crop.top = dst.height() - crop.top - crop.height,
+            Flip::Horizontal => crop.left = dst.width() - crop.left - crop.width,
+        }
     }
 }
 
@@ -614,8 +702,9 @@ impl ImageConverterTrait for CPUConverter {
         dst: &mut TensorImage,
         rotation: Rotation,
         flip: Flip,
-        crop: Option<Rect>,
+        crop: Crop,
     ) -> Result<()> {
+        crop.check_crop(src, dst)?;
         // supported destinations and srcs:
         let intermediate = match (src.fourcc(), dst.fourcc()) {
             (NV12, RGB) => RGB,
@@ -647,11 +736,21 @@ impl ImageConverterTrait for CPUConverter {
             }
         };
 
+        // let crop = crop.src_rect;
+
         let need_resize_flip_rotation = rotation != Rotation::None
             || flip != Flip::None
             || src.width() != dst.width()
             || src.height() != dst.height()
-            || crop.is_some_and(|crop| {
+            || crop.src_rect.is_some_and(|crop| {
+                crop != Rect {
+                    left: 0,
+                    top: 0,
+                    width: src.width(),
+                    height: src.height(),
+                }
+            })
+            || crop.dst_rect.is_some_and(|crop| {
                 crop != Rect {
                     left: 0,
                     top: 0,
