@@ -137,19 +137,27 @@ class FourCC(enum.Enum):
         ...
 
 
+class TensorMemory(enum.Enum):
+    import sys
+    if sys.platform == 'linux':
+        DMA: TensorMemory
+        SHM: TensorMemory
+    MEM: TensorMemory
+
+
 class TensorImage:
     # [pyo3(signature = (width, height, fourcc = FourCC::RGB))]
-    def __init__(self, width: int, height: int, fourcc: FourCC = FourCC.RGB) -> None:
+    def __init__(self, width: int, height: int, fourcc: FourCC = FourCC.RGB, mem: Union[None, TensorMemory] = None) -> None:
         ...
 
     # [pyo3(signature = (data, fourcc = None))]
     @staticmethod
-    def load_from_bytes(data: bytes, fourcc: Union[None, FourCC] = FourCC.RGB) -> TensorImage:
+    def load_from_bytes(data: bytes, fourcc: Union[None, FourCC] = FourCC.RGB, mem: Union[None, TensorMemory] = None) -> TensorImage:
         ...
 
     # [pyo3(signature = (filename, fourcc = None))]
     @staticmethod
-    def load(filename: str, fourcc: Union[None, FourCC] = FourCC.RGB) -> TensorImage:
+    def load(filename: str, fourcc: Union[None, FourCC] = FourCC.RGB, mem: Union[None, TensorMemory] = None) -> TensorImage:
         ...
 
     # [pyo3(signature = (filename, quality=80))]
@@ -159,7 +167,7 @@ class TensorImage:
     def to_numpy(self) -> npt.NDArray[np.uint8]:
         ...
 
-    def copy_into_numpy(self, dst: npt.NDArray[np.uint8]) -> None:
+    def copy_into_numpy(self, dst: Union[npt.NDArray[np.uint8], npt.NDArray[np.int8]]) -> None:
         ...
 
     def copy_from_numpy(self, src: npt.NDArray[np.uint8]) -> None:
