@@ -1,6 +1,6 @@
 use edgefirst::{
     image::{self, Crop, Flip, ImageConverterTrait, RGBA, Rect, Rotation},
-    tensor::{self, TensorMapTrait, TensorTrait},
+    tensor::{self, TensorMapTrait, TensorMemory, TensorTrait},
 };
 use four_char_code::FourCharCode;
 use ndarray::{Array3, ArrayView3, ArrayViewMut3};
@@ -128,33 +128,72 @@ impl TryFrom<FourCharCode> for FourCC {
     }
 }
 
+#[pyclass(name = "TensorMemory")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::upper_case_acronyms)]
+pub enum PyTensorMemory {
+    #[cfg(target_os = "linux")]
+    DMA,
+    #[cfg(target_os = "linux")]
+    SHM,
+    MEM,
+}
+
+impl From<PyTensorMemory> for TensorMemory {
+    fn from(value: PyTensorMemory) -> Self {
+        match value {
+            #[cfg(target_os = "linux")]
+            PyTensorMemory::DMA => TensorMemory::Dma,
+            #[cfg(target_os = "linux")]
+            PyTensorMemory::SHM => TensorMemory::Shm,
+            PyTensorMemory::MEM => TensorMemory::Mem,
+        }
+    }
+}
+
 #[pyclass(name = "TensorImage")]
 pub struct PyTensorImage(image::TensorImage);
 
 #[pymethods]
 impl PyTensorImage {
     #[new]
-    #[pyo3(signature = (width, height, fourcc = FourCC::RGB))]
-    pub fn new(width: usize, height: usize, fourcc: FourCC) -> Result<Self> {
+    #[pyo3(signature = (width, height, fourcc = FourCC::RGB, mem = None))]
+    pub fn new(
+        width: usize,
+        height: usize,
+        fourcc: FourCC,
+        mem: Option<PyTensorMemory>,
+    ) -> Result<Self> {
         let fourcc: FourCharCode = fourcc.into();
-        let tensor_image = image::TensorImage::new(width, height, fourcc, None)?;
+        let mem = mem.map(|x| x.into());
+        let tensor_image = image::TensorImage::new(width, height, fourcc, mem)?;
         Ok(PyTensorImage(tensor_image))
     }
 
     #[staticmethod]
-    #[pyo3(signature = (data, fourcc = Some(FourCC::RGB)))]
-    pub fn load_from_bytes(data: &[u8], fourcc: Option<FourCC>) -> Result<Self> {
+    #[pyo3(signature = (data, fourcc = Some(FourCC::RGB), mem = None))]
+    pub fn load_from_bytes(
+        data: &[u8],
+        fourcc: Option<FourCC>,
+        mem: Option<PyTensorMemory>,
+    ) -> Result<Self> {
         let fourcc = fourcc.map(|f| f.into());
-        let tensor_image = image::TensorImage::load(data, fourcc, None)?;
+        let mem = mem.map(|x| x.into());
+        let tensor_image = image::TensorImage::load(data, fourcc, mem)?;
         Ok(PyTensorImage(tensor_image))
     }
 
     #[staticmethod]
-    #[pyo3(signature = (filename, fourcc = Some(FourCC::RGB)))]
-    pub fn load(filename: &str, fourcc: Option<FourCC>) -> Result<Self> {
+    #[pyo3(signature = (filename, fourcc = Some(FourCC::RGB), mem = None))]
+    pub fn load(
+        filename: &str,
+        fourcc: Option<FourCC>,
+        mem: Option<PyTensorMemory>,
+    ) -> Result<Self> {
         let fourcc = fourcc.map(|f| f.into());
         let data = std::fs::read(filename)?;
-        let tensor_image = image::TensorImage::load(&data, fourcc, None)?;
+        let mem = mem.map(|x| x.into());
+        let tensor_image = image::TensorImage::load(&data, fourcc, mem)?;
         Ok(PyTensorImage(tensor_image))
     }
 
