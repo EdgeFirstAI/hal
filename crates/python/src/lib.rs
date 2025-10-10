@@ -20,6 +20,7 @@ pub mod edgefirst_python {
         m.add_class::<image::PyFlip>()?;
         m.add_class::<image::PyImageConverter>()?;
         m.add_class::<image::PyTensorImage>()?;
+        m.add_class::<image::PyTensorMemory>()?;
         m.add_class::<decoder::PyDecoder>()?;
 
         Ok(())
