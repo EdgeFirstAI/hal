@@ -9,6 +9,7 @@
 #[cfg(feature = "opengl")]
 #[cfg(target_os = "linux")]
 use std::env;
+use std::time::Instant;
 
 use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait as _};
 use enum_dispatch::enum_dispatch;
@@ -554,11 +555,12 @@ impl ImageConverterTrait for ImageConverter {
         flip: Flip,
         crop: Crop,
     ) -> Result<()> {
+        let start = Instant::now();
         #[cfg(target_os = "linux")]
         if let Some(g2d) = self.g2d.as_mut() {
             match g2d.convert(src, dst, rotation, flip, crop) {
                 Ok(_) => {
-                    log::debug!("image converted with g2d");
+                    log::debug!("image converted with g2d in {:?}", start.elapsed());
                     return Ok(());
                 }
                 Err(e) => {
@@ -572,7 +574,7 @@ impl ImageConverterTrait for ImageConverter {
         if let Some(opengl) = self.opengl.as_mut() {
             match opengl.convert(src, dst, rotation, flip, crop) {
                 Ok(_) => {
-                    log::debug!("image converted with opengl");
+                    log::debug!("image converted with opengl in {:?}", start.elapsed());
                     return Ok(());
                 }
                 Err(e) => {
@@ -582,7 +584,7 @@ impl ImageConverterTrait for ImageConverter {
         }
 
         self.cpu.convert(src, dst, rotation, flip, crop)?;
-        log::debug!("image converted with cpu");
+        log::debug!("image converted with cpu in {:?}", start.elapsed());
         Ok(())
     }
 }

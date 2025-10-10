@@ -1,8 +1,11 @@
+use std::time::Instant;
+
 use crate::{
     Crop, Error, Flip, GREY, ImageConverterTrait, NV12, RGB, RGBA, Rect, Result, Rotation,
     TensorImage, YUYV,
 };
 use edgefirst_tensor::{TensorMapTrait, TensorTrait};
+use four_char_code::FourCharCode;
 use ndarray::{ArrayView3, ArrayViewMut3, Axis};
 
 /// CPUConverter implements the ImageConverter trait using the fallback CPU
@@ -30,6 +33,7 @@ impl CPUConverter {
                 fast_image_resize::FilterType::Bilinear,
             ))
             .use_alpha(false);
+
         log::debug!("CPUConverter created");
         Ok(Self { resizer, options })
     }
@@ -476,6 +480,32 @@ impl CPUConverter {
         Ok(())
     }
 
+    pub(crate) fn support_conversion(src: FourCharCode, dst: FourCharCode) -> bool {
+        matches!(
+            (src, dst),
+            (NV12, RGB)
+                | (NV12, RGBA)
+                | (NV12, GREY)
+                | (NV12, YUYV)
+                | (YUYV, RGB)
+                | (YUYV, RGBA)
+                | (YUYV, GREY)
+                | (YUYV, YUYV)
+                | (RGBA, RGB)
+                | (RGBA, RGBA)
+                | (RGBA, GREY)
+                | (RGBA, YUYV)
+                | (RGB, RGB)
+                | (RGB, RGBA)
+                | (RGB, GREY)
+                | (RGB, YUYV)
+                | (GREY, RGB)
+                | (GREY, RGBA)
+                | (GREY, GREY)
+                | (GREY, YUYV)
+        )
+    }
+
     pub(crate) fn convert_format(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         // shapes should be equal
         assert_eq!(src.height(), dst.height());
@@ -580,6 +610,7 @@ impl CPUConverter {
             });
 
         if needs_resize {
+            let start = Instant::now();
             let src_view = fast_image_resize::images::Image::from_slice_u8(
                 src.width() as u32,
                 src.height() as u32,
@@ -605,6 +636,7 @@ impl CPUConverter {
                     )?;
 
                     self.resizer.resize(&src_view, &mut dst_view, &options)?;
+                    log::debug!("resize takes {:?}", start.elapsed());
                 }
                 (Rotation::Clockwise90, _) | (Rotation::CounterClockwise90, _) => {
                     let mut tmp = vec![0; dst.row_stride() * dst.height()];
@@ -624,6 +656,7 @@ impl CPUConverter {
                     )?;
 
                     self.resizer.resize(&src_view, &mut tmp_view, &options)?;
+                    log::debug!("resize takes {:?}", start.elapsed());
                     Self::flip_rotate_ndarray(&tmp, &mut dst_map, dst, rotation, flip)?;
                 }
                 (Rotation::None, _) | (Rotation::Rotate180, _) => {
@@ -644,6 +677,7 @@ impl CPUConverter {
                     )?;
 
                     self.resizer.resize(&src_view, &mut tmp_view, &options)?;
+                    log::debug!("resize takes {:?}", start.elapsed());
                     Self::flip_rotate_ndarray(&tmp, &mut dst_map, dst, rotation, flip)?;
                 }
             }
@@ -760,9 +794,7 @@ impl ImageConverterTrait for CPUConverter {
             });
 
         // check if a direct conversion can be done
-        if !need_resize_flip_rotation
-            && (src.fourcc() == intermediate || dst.fourcc() == intermediate)
-        {
+        if !need_resize_flip_rotation && Self::support_conversion(src.fourcc(), dst.fourcc()) {
             return Self::convert_format(src, dst);
         };
 
@@ -775,21 +807,28 @@ impl ImageConverterTrait for CPUConverter {
         }
 
         // create tmp buffer
-        let mut tmp = TensorImage::new(
-            src.width(),
-            src.height(),
-            intermediate,
-            Some(edgefirst_tensor::TensorMemory::Mem),
-        )?;
+        let mut tmp_buffer;
+        let tmp;
+        if intermediate != src.fourcc() {
+            tmp_buffer = TensorImage::new(
+                src.width(),
+                src.height(),
+                intermediate,
+                Some(edgefirst_tensor::TensorMemory::Mem),
+            )?;
 
-        Self::convert_format(src, &mut tmp)?;
+            Self::convert_format(src, &mut tmp_buffer)?;
+            tmp = &tmp_buffer;
+        } else {
+            tmp = src;
+        }
 
         // format must be RGB/RGBA/GREY
         matches!(tmp.fourcc(), RGB | RGBA | GREY);
         if tmp.fourcc() == dst.fourcc() {
-            self.resize_flip_rotate(dst, &tmp, rotation, flip, crop)?;
+            self.resize_flip_rotate(dst, tmp, rotation, flip, crop)?;
         } else if !need_resize_flip_rotation {
-            Self::convert_format(&tmp, dst)?;
+            Self::convert_format(tmp, dst)?;
         } else {
             let mut tmp2 = TensorImage::new(
                 dst.width(),
@@ -797,7 +836,7 @@ impl ImageConverterTrait for CPUConverter {
                 tmp.fourcc(),
                 Some(edgefirst_tensor::TensorMemory::Mem),
             )?;
-            self.resize_flip_rotate(&mut tmp2, &tmp, rotation, flip, crop)?;
+            self.resize_flip_rotate(&mut tmp2, tmp, rotation, flip, crop)?;
             Self::convert_format(&tmp2, dst)?;
         }
 
