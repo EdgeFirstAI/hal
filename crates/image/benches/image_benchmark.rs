@@ -334,7 +334,7 @@ where
     let file = std::fs::read(path).unwrap();
 
     let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Mem)).unwrap();
-    let mut gl_dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
+    let mut gl_dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Mem)).unwrap();
     let mut gl_converter = edgefirst_image::GLConverter::new().unwrap();
 
     bencher.bench_local(|| {

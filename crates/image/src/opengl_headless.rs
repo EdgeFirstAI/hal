@@ -1,6 +1,6 @@
 #![cfg(target_os = "linux")]
 #![cfg(feature = "opengl")]
-use edgefirst_tensor::TensorTrait;
+use edgefirst_tensor::{TensorMemory, TensorTrait};
 use four_char_code::FourCharCode;
 use gbm::{
     AsRaw, Device,
@@ -15,6 +15,7 @@ use std::{
     ptr::{null, null_mut},
     rc::Rc,
     str::FromStr,
+    time::Instant,
 };
 
 macro_rules! function {
@@ -33,13 +34,11 @@ macro_rules! function {
     }};
 }
 
-use crate::{
-    Crop, Error, Flip, GREY, ImageConverterTrait, NV12, RGB, RGBA, Rotation, TensorImage, YUYV,
-};
+use crate::{Crop, Error, Flip, GREY, ImageConverterTrait, NV12, RGB, RGBA, TensorImage, YUYV};
 
 pub(crate) struct GlContext {
     pub(crate) support_dma: bool,
-    pub(crate) surface: egl::Surface,
+    pub(crate) surface: Option<egl::Surface>,
     pub(crate) display: egl::Display,
     pub(crate) ctx: egl::Context,
     pub(crate) egl: Rc<egl::Instance<egl::Dynamic<libloading::Library, egl::EGL1_4>>>,
@@ -49,7 +48,7 @@ impl GlContext {
     pub(crate) fn new() -> Result<GlContext, crate::Error> {
         // Create an EGL API instance.
         let lib = unsafe { libloading::Library::new("libEGL.so.1") }?;
-        let egl = unsafe { egl::DynamicInstance::<egl::EGL1_4>::load_required_from(lib)? };
+        let egl = Rc::new(unsafe { egl::DynamicInstance::<egl::EGL1_4>::load_required_from(lib)? });
         let support_dma = Self::egl_check_support_dma(&egl).is_ok();
         let display = Self::egl_get_display(&egl)?;
 
@@ -78,25 +77,23 @@ impl GlContext {
 
         debug!("config: {config:?}");
 
-        let context_attributes = [egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE, egl::NONE];
+        let context_attributes = [egl::CONTEXT_MAJOR_VERSION, 3, egl::NONE, egl::NONE];
 
         let ctx = egl
             .create_context(display, config, None, &context_attributes)
             .unwrap();
         debug!("ctx: {ctx:?}");
 
-        let surface = egl.create_pbuffer_surface(
+        let surface = Some(egl.create_pbuffer_surface(
             display,
             config,
-            &[egl::WIDTH, 1, egl::HEIGHT, 1, egl::NONE],
-        )?;
-        egl.make_current(display, Some(surface), Some(surface), Some(ctx))?;
-        let _ = egl.swap_interval(display, 0);
+            &[egl::WIDTH, 64, egl::HEIGHT, 64, egl::NONE],
+        )?);
 
         let headless = GlContext {
             display,
             ctx,
-            egl: Rc::new(egl),
+            egl,
             surface,
             support_dma,
         };
@@ -104,26 +101,29 @@ impl GlContext {
     }
 
     fn make_current(&self) -> Result<(), crate::Error> {
-        self.egl.make_current(
-            self.display,
-            Some(self.surface),
-            Some(self.surface),
-            Some(self.ctx),
-        )?;
+        self.egl
+            .make_current(self.display, self.surface, self.surface, Some(self.ctx))?;
         Ok(())
+    }
+
+    fn detach(&self) {
+        if let Err(e) = self.egl.make_current(self.display, None, None, None) {
+            log::error!("Error while detaching context: {e:?}");
+        }
     }
 
     fn egl_get_display(
         egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
     ) -> Result<Display, crate::Error> {
-        if let Ok(display) = Self::egl_get_gbm_display(egl) {
-            debug!("gbm display: {display:?}");
-            return Ok(display);
-        }
-
         // get the default display
         if let Some(display) = unsafe { egl.get_display(egl::DEFAULT_DISPLAY) } {
             debug!("default display: {display:?}");
+            return Ok(display);
+        }
+
+        // EVK doesn't have default display set so we use a GBM display
+        if let Ok(display) = Self::egl_get_gbm_display(egl) {
+            debug!("gbm display: {display:?}");
             return Ok(display);
         }
 
@@ -180,6 +180,7 @@ impl GlContext {
                 "EGL does not support eglDestroyImageKHR function".to_string(),
             ));
         }
+        // Err(crate::Error::GLVersion("EGL Version too low".to_string()))
         Ok(())
     }
 
@@ -336,7 +337,10 @@ impl GlContext {
 
 impl Drop for GlContext {
     fn drop(&mut self) {
-        let _ = self.egl.destroy_surface(self.display, self.surface);
+        let _ = self.egl.make_current(self.display, None, None, None);
+        if let Some(surface) = self.surface.take() {
+            let _ = self.egl.destroy_surface(self.display, surface);
+        }
         let _ = self.egl.destroy_context(self.display, self.ctx);
         let _ = self.egl.terminate(self.display);
     }
@@ -397,6 +401,16 @@ struct RegionOfInterest {
     bottom: f32,
 }
 
+// pub struct GLConvertThread {
+//     camera_texture: Texture,
+//     render_texture: Texture,
+//     vertex_buffer: Buffer,
+//     texture_buffer: Buffer,
+//     texture_program: GlProgram,
+//     texture_program_planar: GlProgram,
+//     gl_context: GlContext,
+// }
+
 pub struct GLConverter {
     camera_texture: Texture,
     render_texture: Texture,
@@ -417,37 +431,51 @@ impl ImageConverterTrait for GLConverter {
         crop: Crop,
     ) -> crate::Result<()> {
         crop.check_crop(src, dst)?;
-        check_gl_error(function!(), line!())?;
+        if !self.check_format_supported(src) {
+            return Err(crate::Error::NotSupported(format!(
+                "Opengl doesn't support {} source texture",
+                src.fourcc().display()
+            )));
+        }
+
+        if !self.check_format_supported(dst) {
+            return Err(crate::Error::NotSupported(format!(
+                "Opengl doesn't support {} destination texture",
+                dst.fourcc().display()
+            )));
+        }
+        log::debug!(
+            "dst tensor: {:?} src tensor :{:?}",
+            dst.tensor().memory(),
+            src.tensor().memory()
+        );
         self.gl_context.make_current()?;
-        if self.gl_context.support_dma
-            && let edgefirst_tensor::Tensor::Dma(_) = dst.tensor()
-        {
-            return self.convert_dest_dma(dst, src, rotation, flip, crop);
+        check_gl_error(function!(), line!())?;
+        unsafe { gls::gl::Finish() };
+        if self.gl_context.support_dma && dst.tensor().memory() == TensorMemory::Dma {
+            let res = self.convert_dest_dma(dst, src, rotation, flip, crop);
+            self.gl_context.detach();
+            return res;
         }
-        if dst.is_planar() && matches!(dst.fourcc(), RGB | RGBA) {
-            if rotation != Rotation::None || flip != Flip::None {
-                return Err(Error::NotSupported(
-                    "Rotation or Flip not supported for planar RGB".to_string(),
-                ));
-            }
-            self.convert_dest_non_dma(dst, src, rotation, flip, crop)?;
-        } else {
-            self.convert_dest_non_dma(dst, src, rotation, flip, crop)?;
-        }
-        Ok(())
+        let start = Instant::now();
+        let res = self.convert_dest_non_dma(dst, src, rotation, flip, crop);
+        self.gl_context.detach();
+        log::debug!("convert_dest_non_dma+detach takes {:?}", start.elapsed());
+        res
     }
 }
 
 impl GLConverter {
     pub fn new() -> Result<GLConverter, crate::Error> {
         let gl_context = GlContext::new()?;
-
+        gl_context.make_current()?;
         gls::load_with(|s| {
             gl_context
                 .egl
                 .get_proc_address(s)
                 .map_or(std::ptr::null(), |p| p as *const _)
         });
+
         Self::gl_check_support()?;
 
         let texture_program_planar =
@@ -459,6 +487,8 @@ impl GLConverter {
         let render_texture = Texture::new();
         let vertex_buffer = Buffer::new(0, 3, 100);
         let texture_buffer = Buffer::new(1, 2, 100);
+
+        gl_context.detach();
         let converter = GLConverter {
             gl_context,
             texture_program,
@@ -469,8 +499,19 @@ impl GLConverter {
             render_texture,
         };
         check_gl_error(function!(), line!())?;
+
         log::debug!("GLConverter created");
         Ok(converter)
+    }
+
+    fn check_format_supported(&self, img: &TensorImage) -> bool {
+        if self.gl_context.support_dma && img.tensor().memory() == TensorMemory::Dma {
+            // we don't know what specifically the system supports so we can't
+            // check here
+            true
+        } else {
+            matches!(img.fourcc(), RGB | RGBA | GREY)
+        }
     }
 
     fn gl_check_support() -> Result<(), crate::Error> {
@@ -533,7 +574,7 @@ impl GLConverter {
             gls::gl::TexParameteri(
                 gls::gl::TEXTURE_2D,
                 gls::gl::TEXTURE_MIN_FILTER,
-                gls::gl::NEAREST as i32,
+                gls::gl::LINEAR as i32,
             );
             gls::gl::TexParameteri(
                 gls::gl::TEXTURE_2D,
@@ -567,20 +608,15 @@ impl GLConverter {
         flip: Flip,
         crop: Crop,
     ) -> crate::Result<()> {
-        let frame_buffer = FrameBuffer::new();
-        frame_buffer.bind();
-
-        let (width, height) = if dst.is_planar() && matches!(dst.fourcc(), RGB | RGBA) {
+        log::trace!("convert_dest_non_dma: rot: {rotation:?} flip: {flip:?} crop: {crop:?}");
+        debug_assert!(matches!(dst.fourcc(), RGB | RGBA | GREY));
+        let (width, height) = if dst.is_planar() {
             let width = src.width() / 4;
             let height = match src.fourcc() {
                 RGBA => src.height() * 4,
                 RGB => src.height() * 3,
-                fourcc => {
-                    return Err(crate::Error::NotSupported(format!(
-                        "Unsupported Planar FourCC {}",
-                        fourcc.display()
-                    )));
-                }
+                GREY => src.height(),
+                _ => unreachable!(),
             };
             (width as i32, height as i32)
         } else {
@@ -595,16 +631,15 @@ impl GLConverter {
                 RGBA => gls::gl::RGBA,
                 // GREY => gls::gl::RGB,
                 GREY => gls::gl::R8,
-                f => {
-                    return Err(crate::Error::NotSupported(format!(
-                        "Opengl doesn't support {} destination texture",
-                        f.display()
-                    )));
-                }
+                _ => unreachable!(),
             }
         };
+        let start = Instant::now();
+        let frame_buffer = FrameBuffer::new();
+        frame_buffer.bind();
 
         let map;
+
         let pixels = if crop.dst_rect.is_none_or(|crop| {
             crop.top == 0
                 && crop.left == 0
@@ -616,7 +651,6 @@ impl GLConverter {
             map = dst.tensor().map()?;
             map.as_ptr() as *const c_void
         };
-
         unsafe {
             gls::gl::UseProgram(self.texture_program.id);
             gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
@@ -624,7 +658,7 @@ impl GLConverter {
             gls::gl::TexParameteri(
                 gls::gl::TEXTURE_2D,
                 gls::gl::TEXTURE_MIN_FILTER,
-                gls::gl::NEAREST as i32,
+                gls::gl::LINEAR as i32,
             );
             gls::gl::TexParameteri(
                 gls::gl::TEXTURE_2D,
@@ -643,6 +677,7 @@ impl GLConverter {
                 gls::gl::UNSIGNED_BYTE,
                 pixels,
             );
+            check_gl_error(function!(), line!())?;
             gls::gl::FramebufferTexture2D(
                 gls::gl::FRAMEBUFFER,
                 gls::gl::COLOR_ATTACHMENT0,
@@ -653,51 +688,37 @@ impl GLConverter {
             check_gl_error(function!(), line!())?;
             gls::gl::Viewport(0, 0, width, height);
         }
-
+        log::debug!("Set up framebuffer takes {:?}", start.elapsed());
+        let start = Instant::now();
         if dst.is_planar() {
             self.convert_to_planar(src, width as usize, crop)?;
         } else {
             self.convert_to(src, dst, rotation, flip, crop)?;
         }
-
+        log::debug!("Draw to framebuffer takes {:?}", start.elapsed());
+        let start = Instant::now();
         let dest_format = match dst.fourcc() {
             RGB => gls::gl::RGB,
             RGBA => gls::gl::RGBA,
             GREY => gls::gl::RED,
-            f => {
-                return Err(Error::NotSupported(format!(
-                    "{} textures aren't supported by OpenGL",
-                    f.display()
-                )));
-            }
+            _ => unreachable!(),
         };
+
         unsafe {
             gls::gl::PixelStorei(gls::gl::PACK_ALIGNMENT, 1);
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
-
-            // TODO: the gls library doesn't have bindings for glGetTexImage?
-            let func = self
-                .gl_context
-                .egl
-                .get_proc_address("glGetTexImage")
-                .ok_or_else(|| Error::GLVersion("Missing glGetTexImage function".to_string()))?;
-
-            let gl_get_tex_image: extern "system" fn(
-                target: gls::gl::GLenum,
-                level: gls::gl::GLint,
-                format: gls::gl::GLenum,
-                type_: gls::gl::GLenum,
-                pixels: *mut c_void,
-            ) = std::mem::transmute(func);
-
-            gl_get_tex_image(
-                gls::gl::TEXTURE_2D,
+            let mut dst_map = dst.tensor().map()?;
+            gls::gl::ReadnPixels(
                 0,
+                0,
+                dst.width() as i32,
+                dst.height() as i32,
                 dest_format,
                 gls::gl::UNSIGNED_BYTE,
-                dst.tensor().map()?.as_mut_ptr() as *mut c_void,
+                dst.tensor.len() as i32,
+                dst_map.as_mut_ptr() as *mut c_void,
             );
         }
+        log::debug!("Read from fraembuffer takes {:?}", start.elapsed());
         Ok(())
     }
 
@@ -755,8 +776,10 @@ impl GLConverter {
             crate::Rotation::Rotate180 => 2,
             crate::Rotation::CounterClockwise90 => 3,
         };
-
-        let result = if let Ok(new_egl_image) = self.create_image_from_dma2(src) {
+        let start = Instant::now();
+        let result = if self.gl_context.support_dma
+            && let Ok(new_egl_image) = self.create_image_from_dma2(src)
+        {
             self.draw_camera_texture_eglimage(
                 src,
                 &new_egl_image,
@@ -766,9 +789,12 @@ impl GLConverter {
                 flip,
             )
         } else {
-            self.draw_camera_texture(src, src_roi, dst_roi, rotation_offset, flip)
+            self.draw_src_texture(src, src_roi, dst_roi, rotation_offset, flip)
         };
+        log::debug!("draw_src_texture takes {:?}", start.elapsed());
+        let start = Instant::now();
         unsafe { gls::gl::Finish() };
+        log::debug!("gl_Finish takes {:?}", start.elapsed());
         check_gl_error(function!(), line!())?;
         result
     }
@@ -827,7 +853,7 @@ impl GLConverter {
             gls::gl::TexParameteri(
                 texture_target,
                 gls::gl::TEXTURE_MIN_FILTER,
-                gls::gl::NEAREST as i32,
+                gls::gl::LINEAR as i32,
             );
             gls::gl::TexParameteri(
                 texture_target,
@@ -886,25 +912,20 @@ impl GLConverter {
         Ok(())
     }
 
-    fn draw_camera_texture(
+    fn draw_src_texture(
         &mut self,
-        img: &TensorImage,
+        src: &TensorImage,
         src_roi: RegionOfInterest,
         mut dst_roi: RegionOfInterest,
         rotation_offset: usize,
         flip: Flip,
     ) -> Result<(), Error> {
         let texture_target = gls::gl::TEXTURE_2D;
-        let texture_format = match img.fourcc() {
+        let texture_format = match src.fourcc() {
             RGB => gls::gl::RGB,
             RGBA => gls::gl::RGBA,
             GREY => gls::gl::RED,
-            f => {
-                return Err(Error::NotSupported(format!(
-                    "{} textures aren't supported by OpenGL",
-                    f.display()
-                )));
-            }
+            _ => unreachable!(),
         };
         unsafe {
             gls::gl::UseProgram(self.texture_program.id);
@@ -920,7 +941,7 @@ impl GLConverter {
                 gls::gl::TEXTURE_MAG_FILTER,
                 gls::gl::LINEAR as i32,
             );
-            if img.fourcc() == GREY {
+            if src.fourcc() == GREY {
                 for swizzle in [
                     gls::gl::TEXTURE_SWIZZLE_R,
                     gls::gl::TEXTURE_SWIZZLE_G,
@@ -940,10 +961,10 @@ impl GLConverter {
 
             self.camera_texture.update_texture(
                 texture_target,
-                img.width(),
-                img.height(),
+                src.width(),
+                src.height(),
                 texture_format,
-                &img.tensor().map()?,
+                &src.tensor().map()?,
             );
 
             gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
@@ -1417,28 +1438,31 @@ impl Drop for FrameBuffer {
 
 pub struct GlProgram {
     id: u32,
+    vertex_id: u32,
+    fragment_id: u32,
 }
 
 impl GlProgram {
     pub fn new(vertex_shader: &str, fragment_shader: &str) -> Result<Self, crate::Error> {
         let id = unsafe { gls::gl::CreateProgram() };
+        let vertex_id = unsafe { gls::gl::CreateShader(gls::gl::VERTEX_SHADER) };
+        if compile_shader_from_str(vertex_id, vertex_shader, "shader_vert").is_err() {
+            return Err(crate::Error::OpenGl(format!(
+                "Shader compile error: {vertex_shader}"
+            )));
+        }
+        unsafe {
+            gls::gl::AttachShader(id, vertex_id);
+        }
+
+        let fragment_id = unsafe { gls::gl::CreateShader(gls::gl::FRAGMENT_SHADER) };
+        if compile_shader_from_str(fragment_id, fragment_shader, "shader_frag").is_err() {
+            return Err(crate::Error::OpenGl(format!(
+                "Shader compile error: {fragment_shader}"
+            )));
+        }
 
         unsafe {
-            let vertex_id = gls::gl::CreateShader(gls::gl::VERTEX_SHADER);
-            if compile_shader_from_str(vertex_id, vertex_shader, "shader_vert").is_err() {
-                return Err(crate::Error::OpenGl(format!(
-                    "Shader compile error: {vertex_shader}"
-                )));
-            }
-            gls::gl::AttachShader(id, vertex_id);
-
-            let fragment_id = gls::gl::CreateShader(gls::gl::FRAGMENT_SHADER);
-            if compile_shader_from_str(fragment_id, fragment_shader, "shader_frag").is_err() {
-                return Err(crate::Error::OpenGl(format!(
-                    "Shader compile error: {fragment_shader}"
-                )));
-            }
-
             gls::gl::AttachShader(id, fragment_id);
             gls::gl::LinkProgram(id);
             gls::gl::UseProgram(id);
@@ -1458,7 +1482,11 @@ impl GlProgram {
             let m_location = gls::gl::GetUniformLocation(id, c"M".as_ptr());
             gls::gl::UniformMatrix4fv(m_location, 1, 0, m.as_ptr());
         }
-        Ok(Self { id })
+        Ok(Self {
+            id,
+            vertex_id,
+            fragment_id,
+        })
     }
 
     fn load_uniform_1f(&self, name: &CStr, value: f32) {
@@ -1482,6 +1510,8 @@ impl Drop for GlProgram {
     fn drop(&mut self) {
         unsafe {
             gls::gl::DeleteProgram(self.id);
+            gls::gl::DeleteShader(self.fragment_id);
+            gls::gl::DeleteShader(self.vertex_id);
         }
     }
 }
