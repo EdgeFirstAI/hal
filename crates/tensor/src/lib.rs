@@ -25,7 +25,7 @@ use std::{
 #[cfg(target_os = "linux")]
 use nix::sys::stat::{major, minor};
 
-pub trait TensorTrait<T>
+pub trait TensorTrait<T>: Send + Sync
 where
     T: Num + Clone + fmt::Debug,
 {
@@ -146,7 +146,7 @@ impl TryFrom<&str> for TensorMemory {
 
 pub enum Tensor<T>
 where
-    T: Num + Clone + fmt::Debug,
+    T: Num + Clone + fmt::Debug + Send + Sync,
 {
     #[cfg(target_os = "linux")]
     Dma(DmaTensor<T>),
@@ -157,7 +157,7 @@ where
 
 impl<T> Tensor<T>
 where
-    T: Num + Clone + fmt::Debug,
+    T: Num + Clone + fmt::Debug + Send + Sync,
 {
     pub fn new(shape: &[usize], memory: Option<TensorMemory>, name: Option<&str>) -> Result<Self> {
         match memory {
@@ -184,7 +184,7 @@ where
 
 impl<T> TensorTrait<T> for Tensor<T>
 where
-    T: Num + Clone + fmt::Debug,
+    T: Num + Clone + fmt::Debug + Send + Sync,
 {
     fn new(shape: &[usize], name: Option<&str>) -> Result<Self> {
         Self::new(shape, None, name)

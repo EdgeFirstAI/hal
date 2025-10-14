@@ -17,7 +17,7 @@ use std::{
 
 pub struct ShmTensor<T>
 where
-    T: Num + Clone + fmt::Debug,
+    T: Num + Clone + fmt::Debug + Send + Sync,
 {
     pub name: String,
     pub fd: OwnedFd,
@@ -25,9 +25,11 @@ where
     pub _marker: std::marker::PhantomData<T>,
 }
 
+unsafe impl<T> Send for ShmTensor<T> where T: Num + Clone + fmt::Debug + Send + Sync {}
+unsafe impl<T> Sync for ShmTensor<T> where T: Num + Clone + fmt::Debug + Send + Sync {}
 impl<T> TensorTrait<T> for ShmTensor<T>
 where
-    T: Num + Clone + fmt::Debug,
+    T: Num + Clone + fmt::Debug + Send + Sync,
 {
     fn new(shape: &[usize], name: Option<&str>) -> Result<Self> {
         let size = shape.iter().product::<usize>() * std::mem::size_of::<T>();
@@ -143,7 +145,7 @@ where
 
 impl<T> AsRawFd for ShmTensor<T>
 where
-    T: Num + Clone + fmt::Debug,
+    T: Num + Clone + fmt::Debug + Send + Sync,
 {
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
         self.fd.as_raw_fd()

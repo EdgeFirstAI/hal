@@ -14,16 +14,18 @@ use std::{
 
 pub struct MemTensor<T>
 where
-    T: Num + Clone + fmt::Debug,
+    T: Num + Clone + fmt::Debug + Send + Sync,
 {
     pub name: String,
     pub shape: Vec<usize>,
     pub data: Vec<T>,
 }
 
+unsafe impl<T> Send for MemTensor<T> where T: Num + Clone + fmt::Debug + Send + Sync {}
+unsafe impl<T> Sync for MemTensor<T> where T: Num + Clone + fmt::Debug + Send + Sync {}
 impl<T> TensorTrait<T> for MemTensor<T>
 where
-    T: Num + Clone + fmt::Debug,
+    T: Num + Clone + fmt::Debug + Send + Sync,
 {
     fn new(shape: &[usize], name: Option<&str>) -> Result<Self> {
         if shape.is_empty() {

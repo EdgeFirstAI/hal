@@ -18,6 +18,7 @@ use zune_jpeg::{
     JpegDecoder,
     zune_core::{colorspace::ColorSpace, options::DecoderOptions},
 };
+use zune_png::PngDecoder;
 
 pub use cpu::CPUConverter;
 pub use error::{Error, Result};
@@ -25,8 +26,8 @@ pub use error::{Error, Result};
 pub use g2d::G2DConverter;
 #[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
-pub use opengl_headless::GLConverter;
-use zune_png::PngDecoder;
+pub use opengl_headless::GLConverterThreaded;
+
 mod cpu;
 mod error;
 mod g2d;
@@ -499,7 +500,7 @@ pub struct ImageConverter {
     pub g2d: Option<G2DConverter>,
     #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
-    pub opengl: Option<GLConverter>,
+    pub opengl: Option<GLConverterThreaded>,
 }
 
 impl ImageConverter {
@@ -524,7 +525,7 @@ impl ImageConverter {
         let opengl = if !env::var("EDGEFIRST_DISABLE_GL")
             .is_ok_and(|x| x != "0" && x.to_lowercase() != "false")
         {
-            match GLConverter::new() {
+            match GLConverterThreaded::new() {
                 Ok(gl_converter) => Some(gl_converter),
                 Err(err) => {
                     log::debug!("Failed to initialize GL converter: {err:?}");
@@ -572,6 +573,7 @@ impl ImageConverterTrait for ImageConverter {
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
         if let Some(opengl) = self.opengl.as_mut() {
+            log::debug!("image started with opengl in {:?}", start.elapsed());
             match opengl.convert(src, dst, rotation, flip, crop) {
                 Ok(_) => {
                     log::debug!("image converted with opengl in {:?}", start.elapsed());
@@ -582,7 +584,7 @@ impl ImageConverterTrait for ImageConverter {
                 }
             }
         }
-
+        log::debug!("image started with cpu in {:?}", start.elapsed());
         self.cpu.convert(src, dst, rotation, flip, crop)?;
         log::debug!("image converted with cpu in {:?}", start.elapsed());
         Ok(())
@@ -821,7 +823,7 @@ mod tests {
             .unwrap();
         let mut gl_dst =
             TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
-        let mut gl_converter = GLConverter::new().unwrap();
+        let mut gl_converter = GLConverterThreaded::new().unwrap();
 
         for _ in 0..5 {
             gl_converter
@@ -884,7 +886,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut gl = GLConverter::new().unwrap();
+        let mut gl = GLConverterThreaded::new().unwrap();
         gl.convert(
             &img,
             &mut gl_dst,
@@ -1076,7 +1078,7 @@ mod tests {
 
         let mut gl_dst =
             TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
-        let mut gl_converter = GLConverter::new().unwrap();
+        let mut gl_converter = GLConverterThreaded::new().unwrap();
 
         gl_converter
             .convert(
@@ -1123,7 +1125,7 @@ mod tests {
             .unwrap();
 
         let mut gl_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
-        let mut gl_converter = GLConverter::new().unwrap();
+        let mut gl_converter = GLConverterThreaded::new().unwrap();
         gl_converter
             .convert(
                 &src,
@@ -1150,7 +1152,7 @@ mod tests {
 
         let mut cpu_converter = CPUConverter::new().unwrap();
 
-        let mut gl_converter = GLConverter::new().unwrap();
+        let mut gl_converter = GLConverterThreaded::new().unwrap();
 
         for mem in [
             None,
@@ -1299,7 +1301,7 @@ mod tests {
             .unwrap();
 
         let mut gl_dst = TensorImage::new(dst_width, dst_height, RGBA, tensor_memory).unwrap();
-        let mut gl_converter = GLConverter::new().unwrap();
+        let mut gl_converter = GLConverterThreaded::new().unwrap();
 
         for _ in 0..5 {
             gl_converter
@@ -1505,7 +1507,7 @@ mod tests {
         .unwrap();
 
         let mut dst = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma)).unwrap();
-        let mut gl_converter = GLConverter::new().unwrap();
+        let mut gl_converter = GLConverterThreaded::new().unwrap();
 
         gl_converter
             .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
@@ -1724,7 +1726,7 @@ mod tests {
 
         let mut dst_gl =
             TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
-        let mut gl_converter = GLConverter::new().unwrap();
+        let mut gl_converter = GLConverterThreaded::new().unwrap();
 
         gl_converter
             .convert(
