@@ -2,7 +2,7 @@
 use edgefirst_image::G2DConverter;
 #[cfg(feature = "opengl")]
 #[cfg(target_os = "linux")]
-use edgefirst_image::GLConverter;
+use edgefirst_image::GLConverterThreaded;
 use edgefirst_image::{
     CPUConverter, Crop, Flip, GREY, ImageConverterTrait as _, RGB, RGBA, Rotation, TensorImage,
     YUYV,
@@ -335,12 +335,123 @@ where
 
     let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Mem)).unwrap();
     let mut gl_dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Mem)).unwrap();
-    let mut gl_converter = edgefirst_image::GLConverter::new().unwrap();
-
+    let mut gl_converter = edgefirst_image::GLConverterThreaded::new().unwrap();
     bencher.bench_local(|| {
         gl_converter
             .convert(
                 &src,
+                &mut gl_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap()
+    });
+    drop(gl_dst);
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[divan::bench(types = [Person, Zidane], args = [(640, 480), (960, 540), (1280, 720), (1920, 1080)])]
+fn resize_opengl_mem_yuyv_to_640x640_rgba<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
+where
+    IMAGE: TestImage,
+{
+    let (width, height) = size;
+    let name = format!("{}.jpg", IMAGE::filename());
+    let path = Path::new("testdata").join(&name);
+    let path = match path.exists() {
+        true => path,
+        false => {
+            let path = Path::new("../testdata").join(&name);
+            if path.exists() {
+                path
+            } else {
+                Path::new("../../testdata").join(&name)
+            }
+        }
+    };
+
+    assert!(path.exists(), "unable to locate test image at {path:?}");
+
+    let file = std::fs::read(path).unwrap();
+
+    let jpeg = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Mem)).unwrap();
+    let mut src = TensorImage::new(width, height, YUYV, Some(TensorMemory::Mem)).unwrap();
+    let mut tmp = TensorImage::new(width, height, RGBA, Some(TensorMemory::Mem)).unwrap();
+
+    let mut gl_converter = edgefirst_image::GLConverterThreaded::new().unwrap();
+    let mut cpu_converter = edgefirst_image::CPUConverter::new().unwrap();
+
+    cpu_converter
+        .convert(&jpeg, &mut src, Rotation::None, Flip::None, Crop::no_crop())
+        .unwrap();
+
+    let mut gl_dst = TensorImage::new(640, 640, RGBA, Some(TensorMemory::Mem)).unwrap();
+
+    bencher.bench_local(|| {
+        cpu_converter
+            .convert(&src, &mut tmp, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap();
+        gl_converter
+            .convert(
+                &tmp,
+                &mut gl_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap()
+    });
+    drop(gl_dst);
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[divan::bench(types = [Person, Zidane], args = [(640, 480), (960, 540), (1280, 720), (1920, 1080)])]
+fn resize_opengl_mem_yuyv_to_640x640_rgb<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
+where
+    IMAGE: TestImage,
+{
+    let (width, height) = size;
+    let name = format!("{}.jpg", IMAGE::filename());
+    let path = Path::new("testdata").join(&name);
+    let path = match path.exists() {
+        true => path,
+        false => {
+            let path = Path::new("../testdata").join(&name);
+            if path.exists() {
+                path
+            } else {
+                Path::new("../../testdata").join(&name)
+            }
+        }
+    };
+
+    assert!(path.exists(), "unable to locate test image at {path:?}");
+
+    let file = std::fs::read(path).unwrap();
+
+    let jpeg = TensorImage::load_jpeg(&file, Some(RGB), Some(TensorMemory::Mem)).unwrap();
+    let mut src = TensorImage::new(width, height, YUYV, Some(TensorMemory::Mem)).unwrap();
+    let mut tmp = TensorImage::new(width, height, RGB, Some(TensorMemory::Mem)).unwrap();
+
+    let mut gl_converter = edgefirst_image::GLConverterThreaded::new().unwrap();
+    let mut cpu_converter = edgefirst_image::CPUConverter::new().unwrap();
+
+    cpu_converter
+        .convert(&jpeg, &mut src, Rotation::None, Flip::None, Crop::no_crop())
+        .unwrap();
+
+    let mut gl_dst = TensorImage::new(640, 640, RGB, Some(TensorMemory::Mem)).unwrap();
+
+    bencher.bench_local(|| {
+        cpu_converter
+            .convert(&src, &mut tmp, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap();
+        gl_converter
+            .convert(
+                &tmp,
                 &mut gl_dst,
                 Rotation::None,
                 Flip::None,
@@ -379,7 +490,7 @@ where
 
     let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
     let mut gl_dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
-    let mut gl_converter = edgefirst_image::GLConverter::new().unwrap();
+    let mut gl_converter = edgefirst_image::GLConverterThreaded::new().unwrap();
 
     bencher.bench_local(|| {
         gl_converter
@@ -433,7 +544,7 @@ fn rotate_opengl<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize
     let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
     let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
 
-    let mut converter = GLConverter::new().unwrap();
+    let mut converter = GLConverterThreaded::new().unwrap();
 
     bencher.bench_local(|| {
         converter
@@ -670,7 +781,7 @@ fn convert_opengl_yuyv_to_rgba(bencher: divan::Bencher, params: (usize, usize)) 
     let (width, height) = params;
     let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
 
-    let mut converter = GLConverter::new().unwrap();
+    let mut converter = GLConverterThreaded::new().unwrap();
 
     bencher.bench_local(|| {
         converter
@@ -695,7 +806,7 @@ fn convert_opengl_yuyv_to_yuyv(bencher: divan::Bencher, params: (usize, usize)) 
     let (width, height) = params;
     let mut dst = TensorImage::new(width, height, YUYV, None).unwrap();
 
-    let mut converter = GLConverter::new().unwrap();
+    let mut converter = GLConverterThreaded::new().unwrap();
 
     bencher.bench_local(|| {
         converter
