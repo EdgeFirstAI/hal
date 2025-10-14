@@ -406,6 +406,7 @@ type GLConverterMessage = (
 pub struct GLConverterThreaded {
     handle: Option<JoinHandle<()>>,
     sender: Option<Sender<GLConverterMessage>>,
+    support_dma: bool,
 }
 
 pub struct SendablePtr<T: Send> {
@@ -424,17 +425,17 @@ impl GLConverterThreaded {
     pub fn new() -> Result<Self, Error> {
         let (send, mut recv) = tokio::sync::mpsc::channel::<GLConverterMessage>(1);
 
-        let (err_send, err_recv) = tokio::sync::oneshot::channel();
+        let (create_ctx_send, create_ctx_recv) = tokio::sync::oneshot::channel();
 
         let func = move || {
             let mut gl_converter = match GLConverterST::new() {
                 Ok(gl) => gl,
                 Err(e) => {
-                    let _ = err_send.send(Err(e));
+                    let _ = create_ctx_send.send(Err(e));
                     return;
                 }
             };
-            let _ = err_send.send(Ok(()));
+            let _ = create_ctx_send.send(Ok(gl_converter.gl_context.support_dma));
             while let Some((src, dst, rotation, flip, crop, resp)) = recv.blocking_recv() {
                 // SAFETY: This is safe because the convert() function waits for the resp to be
                 // sent before dropping the borrow for src and dst
@@ -448,19 +449,20 @@ impl GLConverterThreaded {
         // let handle = tokio::task::spawn(func());
         let handle = std::thread::spawn(func);
 
-        match err_recv.blocking_recv() {
+        let support_dma = match create_ctx_recv.blocking_recv() {
             Ok(Err(e)) => return Err(e),
             Err(_) => {
                 return Err(Error::Internal(
                     "GL converter error messaging closed without update".to_string(),
                 ));
             }
-            _ => {}
-        }
+            Ok(Ok(supports_dma)) => supports_dma,
+        };
 
         Ok(Self {
             handle: Some(handle),
             sender: Some(send),
+            support_dma,
         })
     }
 }
@@ -473,6 +475,21 @@ impl ImageConverterTrait for GLConverterThreaded {
         flip: Flip,
         crop: Crop,
     ) -> crate::Result<()> {
+        crop.check_crop(src, dst)?;
+        if !GLConverterST::check_format_supported(self.support_dma, src) {
+            return Err(crate::Error::NotSupported(format!(
+                "Opengl doesn't support {} source texture",
+                src.fourcc().display()
+            )));
+        }
+
+        if !GLConverterST::check_format_supported(self.support_dma, dst) {
+            return Err(crate::Error::NotSupported(format!(
+                "Opengl doesn't support {} destination texture",
+                dst.fourcc().display()
+            )));
+        }
+
         let (err_send, err_recv) = tokio::sync::oneshot::channel();
         self.sender
             .as_ref()
@@ -520,14 +537,14 @@ impl ImageConverterTrait for GLConverterST {
         crop: Crop,
     ) -> crate::Result<()> {
         crop.check_crop(src, dst)?;
-        if !self.check_format_supported(src) {
+        if Self::check_format_supported(self.gl_context.support_dma, src) {
             return Err(crate::Error::NotSupported(format!(
                 "Opengl doesn't support {} source texture",
                 src.fourcc().display()
             )));
         }
 
-        if !self.check_format_supported(dst) {
+        if Self::check_format_supported(self.gl_context.support_dma, dst) {
             return Err(crate::Error::NotSupported(format!(
                 "Opengl doesn't support {} destination texture",
                 dst.fourcc().display()
@@ -587,8 +604,8 @@ impl GLConverterST {
         Ok(converter)
     }
 
-    fn check_format_supported(&self, img: &TensorImage) -> bool {
-        if self.gl_context.support_dma && img.tensor().memory() == TensorMemory::Dma {
+    fn check_format_supported(support_dma: bool, img: &TensorImage) -> bool {
+        if support_dma && img.tensor().memory() == TensorMemory::Dma {
             // we don't know what specifically the system supports so we can't
             // check here
             true
