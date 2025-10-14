@@ -16,7 +16,7 @@ use std::{
 
 pub struct DmaTensor<T>
 where
-    T: Num + Clone + fmt::Debug,
+    T: Num + Clone + fmt::Debug + Send + Sync,
 {
     pub name: String,
     pub fd: OwnedFd,
@@ -24,9 +24,12 @@ where
     pub _marker: std::marker::PhantomData<T>,
 }
 
+unsafe impl<T> Send for DmaTensor<T> where T: Num + Clone + fmt::Debug + Send + Sync {}
+unsafe impl<T> Sync for DmaTensor<T> where T: Num + Clone + fmt::Debug + Send + Sync {}
+
 impl<T> TensorTrait<T> for DmaTensor<T>
 where
-    T: Num + Clone + fmt::Debug,
+    T: Num + Clone + fmt::Debug + Send + Sync,
 {
     #[cfg(target_os = "linux")]
     fn new(shape: &[usize], name: Option<&str>) -> Result<Self> {
@@ -127,7 +130,7 @@ where
 
 impl<T> AsRawFd for DmaTensor<T>
 where
-    T: Num + Clone + fmt::Debug,
+    T: Num + Clone + fmt::Debug + Send + Sync,
 {
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
         self.fd.as_raw_fd()
@@ -136,7 +139,7 @@ where
 
 impl<T> DmaTensor<T>
 where
-    T: Num + Clone + Send + Sync + std::fmt::Debug,
+    T: Num + Clone + Send + Sync + std::fmt::Debug + Send + Sync,
 {
     pub fn try_clone(&self) -> Result<Self> {
         let fd = self.clone_fd()?;

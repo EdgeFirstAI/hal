@@ -15,8 +15,10 @@ use std::{
     ptr::{null, null_mut},
     rc::Rc,
     str::FromStr,
+    thread::JoinHandle,
     time::Instant,
 };
+use tokio::sync::mpsc::Sender;
 
 macro_rules! function {
     () => {{
@@ -34,7 +36,9 @@ macro_rules! function {
     }};
 }
 
-use crate::{Crop, Error, Flip, GREY, ImageConverterTrait, NV12, RGB, RGBA, TensorImage, YUYV};
+use crate::{
+    Crop, Error, Flip, GREY, ImageConverterTrait, NV12, RGB, RGBA, Rotation, TensorImage, YUYV,
+};
 
 pub(crate) struct GlContext {
     pub(crate) support_dma: bool,
@@ -90,6 +94,8 @@ impl GlContext {
             &[egl::WIDTH, 64, egl::HEIGHT, 64, egl::NONE],
         )?);
 
+        egl.make_current(display, surface, surface, Some(ctx))?;
+
         let headless = GlContext {
             display,
             ctx,
@@ -98,18 +104,6 @@ impl GlContext {
             support_dma,
         };
         Ok(headless)
-    }
-
-    fn make_current(&self) -> Result<(), crate::Error> {
-        self.egl
-            .make_current(self.display, self.surface, self.surface, Some(self.ctx))?;
-        Ok(())
-    }
-
-    fn detach(&self) {
-        if let Err(e) = self.egl.make_current(self.display, None, None, None) {
-            log::error!("Error while detaching context: {e:?}");
-        }
     }
 
     fn egl_get_display(
@@ -401,17 +395,112 @@ struct RegionOfInterest {
     bottom: f32,
 }
 
-// pub struct GLConvertThread {
-//     camera_texture: Texture,
-//     render_texture: Texture,
-//     vertex_buffer: Buffer,
-//     texture_buffer: Buffer,
-//     texture_program: GlProgram,
-//     texture_program_planar: GlProgram,
-//     gl_context: GlContext,
-// }
+type GLConverterMessage = (
+    SendablePtr<TensorImage>,
+    SendablePtrMut<TensorImage>,
+    Rotation,
+    Flip,
+    Crop,
+    tokio::sync::oneshot::Sender<Result<(), Error>>,
+);
+pub struct GLConverterThreaded {
+    handle: Option<JoinHandle<()>>,
+    sender: Option<Sender<GLConverterMessage>>,
+}
 
-pub struct GLConverter {
+pub struct SendablePtr<T: Send> {
+    ptr: *const T,
+}
+
+unsafe impl<T> Send for SendablePtr<T> where T: Send {}
+
+pub struct SendablePtrMut<T: Send> {
+    ptr: *mut T,
+}
+
+unsafe impl<T> Send for SendablePtrMut<T> where T: Send {}
+
+impl GLConverterThreaded {
+    pub fn new() -> Result<Self, Error> {
+        let (send, mut recv) = tokio::sync::mpsc::channel::<GLConverterMessage>(1);
+
+        let (err_send, err_recv) = tokio::sync::oneshot::channel();
+
+        let func = move || {
+            let mut gl_converter = match GLConverterST::new() {
+                Ok(gl) => gl,
+                Err(e) => {
+                    let _ = err_send.send(Err(e));
+                    return;
+                }
+            };
+            let _ = err_send.send(Ok(()));
+            while let Some((src, dst, rotation, flip, crop, resp)) = recv.blocking_recv() {
+                // SAFETY: This is safe because the convert() function waits for the resp to be
+                // sent before dropping the borrow for src and dst
+                let src = unsafe { src.ptr.as_ref().unwrap() };
+                let dst = unsafe { dst.ptr.as_mut().unwrap() };
+                let res = gl_converter.convert(src, dst, rotation, flip, crop);
+                let _ = resp.send(res);
+            }
+        };
+
+        // let handle = tokio::task::spawn(func());
+        let handle = std::thread::spawn(func);
+
+        match err_recv.blocking_recv() {
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(Error::Internal(
+                    "GL converter error messaging closed without update".to_string(),
+                ));
+            }
+            _ => {}
+        }
+
+        Ok(Self {
+            handle: Some(handle),
+            sender: Some(send),
+        })
+    }
+}
+impl ImageConverterTrait for GLConverterThreaded {
+    fn convert(
+        &mut self,
+        src: &TensorImage,
+        dst: &mut TensorImage,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> crate::Result<()> {
+        let (err_send, err_recv) = tokio::sync::oneshot::channel();
+        self.sender
+            .as_ref()
+            .unwrap()
+            .blocking_send((
+                SendablePtr {
+                    ptr: src as *const _,
+                },
+                SendablePtrMut { ptr: dst as *mut _ },
+                rotation,
+                flip,
+                crop,
+                err_send,
+            ))
+            .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
+        err_recv.blocking_recv().map_err(|_| {
+            Error::Internal("GL converter error messaging closed without update".to_string())
+        })?
+    }
+}
+
+impl Drop for GLConverterThreaded {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        let _ = self.handle.take().unwrap().join();
+    }
+}
+pub struct GLConverterST {
     camera_texture: Texture,
     render_texture: Texture,
     vertex_buffer: Buffer,
@@ -421,7 +510,7 @@ pub struct GLConverter {
     gl_context: GlContext,
 }
 
-impl ImageConverterTrait for GLConverter {
+impl ImageConverterTrait for GLConverterST {
     fn convert(
         &mut self,
         src: &TensorImage,
@@ -449,26 +538,22 @@ impl ImageConverterTrait for GLConverter {
             dst.tensor().memory(),
             src.tensor().memory()
         );
-        self.gl_context.make_current()?;
         check_gl_error(function!(), line!())?;
         unsafe { gls::gl::Finish() };
         if self.gl_context.support_dma && dst.tensor().memory() == TensorMemory::Dma {
             let res = self.convert_dest_dma(dst, src, rotation, flip, crop);
-            self.gl_context.detach();
             return res;
         }
         let start = Instant::now();
         let res = self.convert_dest_non_dma(dst, src, rotation, flip, crop);
-        self.gl_context.detach();
-        log::debug!("convert_dest_non_dma+detach takes {:?}", start.elapsed());
+        log::debug!("convert_dest_non_dma takes {:?}", start.elapsed());
         res
     }
 }
 
-impl GLConverter {
-    pub fn new() -> Result<GLConverter, crate::Error> {
+impl GLConverterST {
+    pub fn new() -> Result<GLConverterST, crate::Error> {
         let gl_context = GlContext::new()?;
-        gl_context.make_current()?;
         gls::load_with(|s| {
             gl_context
                 .egl
@@ -487,9 +572,7 @@ impl GLConverter {
         let render_texture = Texture::new();
         let vertex_buffer = Buffer::new(0, 3, 100);
         let texture_buffer = Buffer::new(1, 2, 100);
-
-        gl_context.detach();
-        let converter = GLConverter {
+        let converter = GLConverterST {
             gl_context,
             texture_program,
             texture_program_planar,
