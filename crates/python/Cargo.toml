@@ -22,10 +22,11 @@ extension-module = ["pyo3/extension-module"]
 edgefirst = { version = "*", path = "../edgefirst" }
 env_logger = { workspace = true }
 four-char-code = { workspace = true }
-numpy = "0.25.0"
+numpy = { version = "0.25.0", features = ["half"] }
 pyo3 = { version = "0.25.1" }
 ndarray = { workspace = true }
 pythonize = "0.25.0"
+half = "2.7.1"
 
 [build-dependencies]
 pyo3-build-config = { version = "0.25.1", features = ["resolve-config"] }
