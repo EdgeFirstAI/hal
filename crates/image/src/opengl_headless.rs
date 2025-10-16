@@ -83,9 +83,7 @@ impl GlContext {
 
         let context_attributes = [egl::CONTEXT_MAJOR_VERSION, 3, egl::NONE, egl::NONE];
 
-        let ctx = egl
-            .create_context(display, config, None, &context_attributes)
-            .unwrap();
+        let ctx = egl.create_context(display, config, None, &context_attributes)?;
         debug!("ctx: {ctx:?}");
 
         let surface = Some(egl.create_pbuffer_surface(
@@ -537,14 +535,14 @@ impl ImageConverterTrait for GLConverterST {
         crop: Crop,
     ) -> crate::Result<()> {
         crop.check_crop(src, dst)?;
-        if Self::check_format_supported(self.gl_context.support_dma, src) {
+        if !Self::check_format_supported(self.gl_context.support_dma, src) {
             return Err(crate::Error::NotSupported(format!(
                 "Opengl doesn't support {} source texture",
                 src.fourcc().display()
             )));
         }
 
-        if Self::check_format_supported(self.gl_context.support_dma, dst) {
+        if !Self::check_format_supported(self.gl_context.support_dma, dst) {
             return Err(crate::Error::NotSupported(format!(
                 "Opengl doesn't support {} destination texture",
                 dst.fourcc().display()
@@ -579,6 +577,12 @@ impl GLConverterST {
         });
 
         Self::gl_check_support()?;
+
+        // Uploads and downloads are all packed with no alignment requirements
+        unsafe {
+            gls::gl::PixelStorei(gls::gl::PACK_ALIGNMENT, 1);
+            gls::gl::PixelStorei(gls::gl::UNPACK_ALIGNMENT, 1);
+        }
 
         let texture_program_planar =
             GlProgram::new(generate_vertex_shader(), generate_planar_rgb_shader())?;
@@ -805,7 +809,6 @@ impl GLConverterST {
         };
 
         unsafe {
-            gls::gl::PixelStorei(gls::gl::PACK_ALIGNMENT, 1);
             let mut dst_map = dst.tensor().map()?;
             gls::gl::ReadnPixels(
                 0,
