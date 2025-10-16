@@ -522,9 +522,11 @@ impl ImageConverter {
 
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
-        let opengl = if !env::var("EDGEFIRST_DISABLE_GL")
+        let opengl = if env::var("EDGEFIRST_DISABLE_GL")
             .is_ok_and(|x| x != "0" && x.to_lowercase() != "false")
         {
+            None
+        } else {
             match GLConverterThreaded::new() {
                 Ok(gl_converter) => Some(gl_converter),
                 Err(err) => {
@@ -532,8 +534,6 @@ impl ImageConverter {
                     None
                 }
             }
-        } else {
-            None
         };
 
         let cpu = CPUConverter::new()?;
@@ -541,6 +541,7 @@ impl ImageConverter {
             cpu,
             #[cfg(target_os = "linux")]
             g2d,
+            #[cfg(target_os = "linux")]
             #[cfg(feature = "opengl")]
             opengl,
         })
@@ -1148,7 +1149,6 @@ mod tests {
         let dst_width = 640;
         let dst_height = 640;
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
-        let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         let mut cpu_converter = CPUConverter::new().unwrap();
 
@@ -1160,8 +1160,8 @@ mod tests {
             Some(TensorMemory::Mem),
             Some(TensorMemory::Shm),
         ] {
-            let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, mem).unwrap();
-            let mut gl_dst = TensorImage::new(dst_width, dst_height, RGBA, mem).unwrap();
+            let src = TensorImage::load_jpeg(&file, Some(RGBA), mem).unwrap();
+
             for rot in [
                 Rotation::None,
                 Rotation::Clockwise90,
@@ -1169,6 +1169,10 @@ mod tests {
                 Rotation::CounterClockwise90,
             ] {
                 for flip in [Flip::None, Flip::Horizontal, Flip::Vertical] {
+                    let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGB, mem).unwrap();
+                    let mut gl_dst = TensorImage::new(dst_width, dst_height, RGB, mem).unwrap();
+                    cpu_dst.tensor.map().unwrap().as_mut_slice().fill(114);
+                    gl_dst.tensor.map().unwrap().as_mut_slice().fill(114);
                     cpu_converter
                         .convert(
                             &src,
