@@ -1011,6 +1011,8 @@ mod tests {
             Rotation::Rotate180,
             Rotation::CounterClockwise90,
         ] {
+            cpu_dst.tensor.map().unwrap().as_mut_slice().fill(114);
+            g2d_dst.tensor.map().unwrap().as_mut_slice().fill(114);
             for flip in [Flip::None, Flip::Horizontal, Flip::Vertical] {
                 cpu_converter
                     .convert(
@@ -1169,8 +1171,8 @@ mod tests {
                 Rotation::CounterClockwise90,
             ] {
                 for flip in [Flip::None, Flip::Horizontal, Flip::Vertical] {
-                    let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGB, mem).unwrap();
-                    let mut gl_dst = TensorImage::new(dst_width, dst_height, RGB, mem).unwrap();
+                    let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, mem).unwrap();
+                    let mut gl_dst = TensorImage::new(dst_width, dst_height, RGBA, mem).unwrap();
                     cpu_dst.tensor.map().unwrap().as_mut_slice().fill(114);
                     gl_dst.tensor.map().unwrap().as_mut_slice().fill(114);
                     cpu_converter
