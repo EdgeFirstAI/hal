@@ -34,8 +34,6 @@ impl G2DConverter {
         flip: Flip,
         crop: Crop,
     ) -> Result<()> {
-        crop.check_crop(src, dst)?;
-
         let mut src_surface: G2DSurface = src.try_into()?;
         let mut dst_surface: G2DSurface = dst.try_into()?;
 
@@ -96,6 +94,7 @@ impl ImageConverterTrait for G2DConverter {
         flip: Flip,
         crop: Crop,
     ) -> Result<()> {
+        crop.check_crop(src, dst)?;
         match (src.fourcc(), dst.fourcc()) {
             (RGBA, RGBA) => {}
             (RGBA, YUYV) => {}
@@ -114,6 +113,18 @@ impl ImageConverterTrait for G2DConverter {
                     d.display()
                 )));
             }
+        }
+        if dst.fourcc() == RGB
+            && crop.dst_rect.is_some_and(|crop| {
+                crop.left != 0
+                    || crop.top != 0
+                    || crop.width != dst.width()
+                    || crop.height != dst.height()
+            })
+        {
+            return Err(Error::NotSupported(
+                "G2D does not support conversion to RGB with destination crop".to_string(),
+            ));
         }
         self.convert_(src, dst, rotation, flip, crop)
     }
