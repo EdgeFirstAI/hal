@@ -4,13 +4,16 @@ use edgefirst::decoder::{
     dequantize_cpu_chunked, dequantize_cpu_chunked_f64, modelpack::ModelPackDetectionConfig,
     segmentation_to_mask,
 };
+// use half::f16;
 use ndarray::{Array1, Array2};
 use numpy::{
-    IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayLike2, PyArrayLike3, PyArrayLikeDyn,
-    PyReadonlyArray3, PyReadwriteArrayDyn, ToPyArray,
+    IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayDyn, PyArrayLike2, PyArrayLike3,
+    PyArrayLikeDyn, PyArrayMethods, PyReadonlyArray3, PyReadonlyArrayDyn, PyReadwriteArrayDyn,
+    ToPyArray,
 };
-use pyo3::{Bound, FromPyObject, PyAny, PyRef, PyResult, Python, pyclass, pymethods};
-
+use pyo3::{
+    Bound, FromPyObject, PyAny, PyRef, PyResult, Python, pyclass, pymethods, types::PyAnyMethods,
+};
 pub type PyDetOutput<'py> = (
     Bound<'py, PyArray2<f32>>,
     Bound<'py, PyArray1<f32>>,
@@ -28,8 +31,26 @@ pub type PySegDetOutput<'py> = (
 pub enum ListOfReadOnlyArrayGenericDyn<'py> {
     UInt8(Vec<WithInt32Array<'py, PyArrayLikeDyn<'py, u8>>>),
     Int8(Vec<WithInt32Array<'py, PyArrayLikeDyn<'py, i8>>>),
+    Float16(Vec<WithInt32Array<'py, PyArrayF16_<'py>>>),
     Float32(Vec<WithInt32Array<'py, PyArrayLikeDyn<'py, f32>>>),
     Float64(Vec<WithInt32Array<'py, PyArrayLikeDyn<'py, f64>>>),
+}
+
+pub struct PyArrayF16_<'py> {
+    pub arr: PyReadonlyArrayDyn<'py, half::f16>,
+}
+
+impl<'py> FromPyObject<'py> for PyArrayF16_<'py> {
+    fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
+        if let Ok(array) = ob.downcast::<PyArrayDyn<half::f16>>() {
+            return Ok(Self {
+                arr: array.readonly(),
+            });
+        }
+        Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Could not parse array as f16 numpy array".to_string(),
+        ))
+    }
 }
 
 #[derive(FromPyObject)]
@@ -169,6 +190,27 @@ impl PyDecoder {
                 self_
                     .decoder
                     .decode_i8(&outputs, &mut output_boxes, &mut output_masks)
+            }
+            ListOfReadOnlyArrayGenericDyn::Float16(items) => {
+                let outputs = items
+                    .iter()
+                    .filter_map(|x| match x {
+                        WithInt32Array::Val(x) => Some(x.arr.as_array()),
+                        WithInt32Array::Int32(_) => None,
+                    })
+                    .collect::<Vec<_>>();
+
+                let outputs = outputs
+                    .iter()
+                    .map(|arr| arr.map(|x| x.to_f32()))
+                    .collect::<Vec<_>>();
+                let output_views = outputs
+                    .iter()
+                    .map(|output| output.view())
+                    .collect::<Vec<_>>();
+                self_
+                    .decoder
+                    .decode_f32(&output_views, &mut output_boxes, &mut output_masks)
             }
             ListOfReadOnlyArrayGenericDyn::Float32(items) => {
                 let outputs = items
