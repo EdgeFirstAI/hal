@@ -836,6 +836,19 @@ impl ImageConverterTrait for CPUConverter {
                 tmp.fourcc(),
                 Some(edgefirst_tensor::TensorMemory::Mem),
             )?;
+            if crop.dst_rect.is_some_and(|crop| {
+                crop != Rect {
+                    left: 0,
+                    top: 0,
+                    width: src.width(),
+                    height: src.height(),
+                }
+            }) {
+                // convert the dst into tmp2 when there is a dst crop
+                // TODO: this could be optimized by changing convert_format to take a
+                // destination crop?
+                Self::convert_format(dst, &mut tmp2)?;
+            }
             self.resize_flip_rotate(&mut tmp2, tmp, rotation, flip, crop)?;
             Self::convert_format(&tmp2, dst)?;
         }

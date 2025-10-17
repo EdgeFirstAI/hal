@@ -1406,6 +1406,92 @@ mod tests {
     }
 
     #[test]
+    fn test_rgba_to_yuyv_resize_opengl() {
+        let src = load_bytes_to_tensor(
+            1280,
+            720,
+            RGBA,
+            None,
+            include_bytes!("../../../testdata/camera720p.rgba"),
+        )
+        .unwrap();
+
+        let (dst_width, dst_height) = (640, 360);
+
+        let mut dst =
+            TensorImage::new(dst_width, dst_height, YUYV, Some(TensorMemory::Dma)).unwrap();
+
+        let mut gl_converter = GLConverterThreaded::new().unwrap();
+
+        gl_converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap();
+        let target_image = TensorImage::new(1280, 720, YUYV, None).unwrap();
+        target_image
+            .tensor()
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(include_bytes!("../../../testdata/camera720p.yuyv"));
+        let target = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
+
+        compare_images_convert_to_rgb(&target, &dst, 0.98, function!());
+    }
+
+    #[test]
+    fn test_rgba_to_yuyv_resize_g2d() {
+        let src = load_bytes_to_tensor(
+            1280,
+            720,
+            RGBA,
+            Some(TensorMemory::Dma),
+            include_bytes!("../../../testdata/camera720p.rgba"),
+        )
+        .unwrap();
+
+        let (dst_width, dst_height) = (1280, 720);
+
+        let mut cpu_dst =
+            TensorImage::new(dst_width, dst_height, YUYV, Some(TensorMemory::Dma)).unwrap();
+
+        let mut g2d_dst =
+            TensorImage::new(dst_width, dst_height, YUYV, Some(TensorMemory::Dma)).unwrap();
+
+        let mut g2d_converter = G2DConverter::new().unwrap();
+
+        g2d_dst.tensor.map().unwrap().as_mut_slice().fill(128);
+        g2d_converter
+            .convert(
+                &src,
+                &mut g2d_dst,
+                Rotation::None,
+                Flip::None,
+                Crop {
+                    src_rect: None,
+                    dst_rect: Some(Rect::new(100, 100, 2, 2)),
+                },
+            )
+            .unwrap();
+
+        cpu_dst.tensor.map().unwrap().as_mut_slice().fill(128);
+        CPUConverter::new()
+            .unwrap()
+            .convert(
+                &src,
+                &mut cpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop {
+                    src_rect: None,
+                    dst_rect: Some(Rect::new(100, 100, 2, 2)),
+                },
+            )
+            .unwrap();
+
+        compare_images_convert_to_rgb(&cpu_dst, &g2d_dst, 0.98, function!());
+    }
+
+    #[test]
     fn test_yuyv_to_rgba_cpu() {
         let file = include_bytes!("../../../testdata/camera720p.yuyv").to_vec();
         let src = TensorImage::new(1280, 720, YUYV, None).unwrap();
@@ -1994,6 +2080,8 @@ mod tests {
         )
         .expect("Image Comparison failed");
         if similarity.score < threshold {
+            // image1.save(format!("{name}_1.png"));
+            // image2.save(format!("{name}_2.png"));
             similarity
                 .image
                 .to_color_map()
