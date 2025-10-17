@@ -555,7 +555,11 @@ impl ImageConverterTrait for GLConverterST {
         );
         check_gl_error(function!(), line!())?;
         unsafe { gls::gl::Finish() };
-        if self.gl_context.support_dma && dst.tensor().memory() == TensorMemory::Dma {
+        if self.gl_context.support_dma
+            && dst.tensor().memory() == TensorMemory::Dma
+            && dst.fourcc() != RGB
+        // DMA generally doesn't support RGB
+        {
             let res = self.convert_dest_dma(dst, src, rotation, flip, crop);
             return res;
         }
