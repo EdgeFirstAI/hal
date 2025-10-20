@@ -1,7 +1,4 @@
-use edgefirst::{
-    tensor,
-    tensor::{TensorMapTrait as _, TensorTrait as _},
-};
+use edgefirst::tensor::{self, TensorMapTrait as _, TensorTrait as _};
 use pyo3::{exceptions::PyBufferError, ffi::PyMemoryView_FromMemory, prelude::*};
 
 #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
@@ -314,23 +311,23 @@ impl PyTensor {
         Ok(self.0.reshape(&shape)?)
     }
 
-    fn map(&self) -> Result<TensorMap> {
-        Ok(TensorMap {
+    fn map(&self) -> Result<PyTensorMap> {
+        Ok(PyTensorMap {
             mapped: Some(self.0.map()?),
         })
     }
 }
 
-#[pyclass]
-struct TensorMap {
-    mapped: Option<TensorMapT>,
+#[pyclass(name = "TensorMap")]
+pub struct PyTensorMap {
+    pub(crate) mapped: Option<TensorMapT>,
 }
 
-unsafe impl Send for TensorMap {}
-unsafe impl Sync for TensorMap {}
+unsafe impl Send for PyTensorMap {}
+unsafe impl Sync for PyTensorMap {}
 
 #[pymethods]
-impl TensorMap {
+impl PyTensorMap {
     fn unmap(&mut self) {
         if let Some(map) = &mut self.mapped {
             map.unmap();

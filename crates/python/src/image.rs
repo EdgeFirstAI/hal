@@ -11,6 +11,8 @@ use std::{
     sync::Mutex,
 };
 
+use crate::tensor::{PyTensorMap, TensorMapT};
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug)]
@@ -340,6 +342,12 @@ impl PyTensorImage {
     pub fn is_planar(&self) -> bool {
         self.0.is_planar()
     }
+
+    pub fn map(&self) -> Result<PyTensorMap> {
+        Ok(PyTensorMap {
+            mapped: Some(self.0.tensor().map().map(TensorMapT::TensorU8)?),
+        })
+    }
 }
 
 #[pyclass(name = "ImageConverter")]
@@ -356,7 +364,8 @@ impl PyImageConverter {
         Ok(PyImageConverter(Mutex::new(converter)))
     }
 
-    #[pyo3(signature = (src, dst, rotation = PyRotation::Rotate0, flip = PyFlip::NoFlip, src_crop = None, dst_crop = None))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (src, dst, rotation = PyRotation::Rotate0, flip = PyFlip::NoFlip, src_crop = None, dst_crop = None, dst_color = None))]
     pub fn convert(
         &mut self,
         src: &PyTensorImage,
@@ -365,6 +374,7 @@ impl PyImageConverter {
         flip: PyFlip,
         src_crop: Option<PyRect>,
         dst_crop: Option<PyRect>,
+        dst_color: Option<[u8; 4]>,
     ) -> Result<()> {
         if let Ok(mut l) = self.0.lock() {
             l.convert(
@@ -375,6 +385,7 @@ impl PyImageConverter {
                 Crop {
                     src_rect: src_crop.map(|x| x.into()),
                     dst_rect: dst_crop.map(|x| x.into()),
+                    dst_color,
                 },
             )?
         };

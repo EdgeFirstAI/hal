@@ -137,6 +137,38 @@ class FourCC(enum.Enum):
         ...
 
 
+class TensorMap:
+    def unmap(self) -> None:
+        ...
+
+    def view(self) -> object:
+        ...
+
+    def __repr__(self) -> str:
+        ...
+
+    def __len__(self) -> int:
+        ...
+
+    def __getitem__(self) -> object:
+        ...
+
+    def __setitem__(self, index: int, value: object) -> None:
+        ...
+
+    def __getbuffer__(self, view, _flags) -> None:
+        ...
+
+    def __releasebuffer__(self, view) -> None:
+        ...
+
+    def __enter__(self) -> TensorMap:
+        ...
+
+    def __exit__(self) -> None:
+        ...
+
+
 class TensorMemory(enum.Enum):
     import sys
     if sys.platform == 'linux':
