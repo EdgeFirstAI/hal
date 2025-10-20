@@ -27,6 +27,7 @@ pyo3 = { version = "0.25.1" }
 ndarray = { workspace = true }
 pythonize = "0.25.0"
 half = "2.7.1"
+log = { workspace = true }
 
 [build-dependencies]
 pyo3-build-config = { version = "0.25.1", features = ["resolve-config"] }

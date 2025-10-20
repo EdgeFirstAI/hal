@@ -1,12 +1,13 @@
 #![cfg(target_os = "linux")]
 
 use crate::{
-    Crop, Error, Flip, ImageConverterTrait, RGB, RGBA, Result, Rotation, TensorImage, YUYV,
+    CPUConverter, Crop, Error, Flip, ImageConverterTrait, RGB, RGBA, Result, Rotation, TensorImage,
+    YUYV,
 };
-use edgefirst_tensor::Tensor;
+use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait};
 use g2d_sys::{G2D, G2DFormat, G2DPhysical, G2DSurface};
 use log::trace;
-use std::os::fd::AsRawFd;
+use std::{os::fd::AsRawFd, time::Instant};
 
 /// G2DConverter implements the ImageConverter trait using the NXP G2D
 /// library for hardware-accelerated image processing on i.MX platforms.
@@ -18,6 +19,8 @@ impl G2DConverter {
     pub fn new() -> Result<Self> {
         let mut g2d = G2D::new("libg2d.so.2")?;
         g2d.set_bt709_colorspace()?;
+
+        let tensor = TensorImage::new(1, 1, RGBA, Some(TensorMemory::Dma))?;
         log::debug!("G2DConverter created");
         Ok(Self { g2d })
     }
@@ -57,11 +60,44 @@ impl G2DConverter {
             src_surface.bottom = (crop_rect.top + crop_rect.height) as i32;
         }
 
+        // need to clear before assigning the crop
+        if crop.dst_rect.is_some_and(|x| {
+            x.left != 0 || x.top != 0 || x.width != dst.width() || x.height != dst.height()
+        }) && let Some(dst_color) = crop.dst_color
+        {
+            let start = Instant::now();
+            if dst.fourcc() != RGB {
+                self.g2d.clear(&mut dst_surface, dst_color)?;
+            } else {
+                // g2d clear doesn't work on RGB format, so we need to use a CPU fallback
+                CPUConverter::fill_image_rgba(dst, dst_color)?;
+                // self.tmp.tensor.map()?.copy_from_slice(&dst_color);
+                // let tmp_surface = (&self.tmp).try_into()?;
+                // self.g2d.blit(&tmp_surface, &dst_surface)?;
+            }
+
+            log::trace!("clear takes {:?}", start.elapsed());
+        }
+
         if let Some(crop_rect) = crop.dst_rect {
-            dst_surface.left = crop_rect.left as i32;
-            dst_surface.top = crop_rect.top as i32;
-            dst_surface.right = (crop_rect.left + crop_rect.width) as i32;
-            dst_surface.bottom = (crop_rect.top + crop_rect.height) as i32;
+            dst_surface.planes[0] += ((crop_rect.top * dst_surface.width as usize + crop_rect.left)
+                * dst.channels()) as u64;
+
+            dst_surface.right = crop_rect.width as i32;
+            dst_surface.bottom = crop_rect.height as i32;
+            dst_surface.width = crop_rect.width as i32;
+            dst_surface.height = crop_rect.height as i32;
+
+            // right: img.width() as i32,
+            // bottom: img.height() as i32,
+            // stride: img.width() as i32,
+            // width: img.width() as i32,
+            // height: img.height() as i32,
+
+            // dst_surface.left = crop_rect.left as i32;
+            // dst_surface.top = crop_rect.top as i32;
+            // dst_surface.right = (crop_rect.left + crop_rect.width) as i32;
+            // dst_surface.bottom = (crop_rect.top + crop_rect.height) as i32;
         }
 
         trace!("Blitting from {src_surface:?} to {dst_surface:?}");
@@ -114,18 +150,18 @@ impl ImageConverterTrait for G2DConverter {
                 )));
             }
         }
-        if dst.fourcc() == RGB
-            && crop.dst_rect.is_some_and(|crop| {
-                crop.left != 0
-                    || crop.top != 0
-                    || crop.width != dst.width()
-                    || crop.height != dst.height()
-            })
-        {
-            return Err(Error::NotSupported(
-                "G2D does not support conversion to RGB with destination crop".to_string(),
-            ));
-        }
+        // if dst.fourcc() == RGB
+        //     && crop.dst_rect.is_some_and(|crop| {
+        //         crop.left != 0
+        //             || crop.top != 0
+        //             || crop.width != dst.width()
+        //             || crop.height != dst.height()
+        //     })
+        // {
+        //     return Err(Error::NotSupported(
+        //         "G2D does not support conversion to RGB with destination
+        // crop".to_string(),     ));
+        // }
         self.convert_(src, dst, rotation, flip, crop)
     }
 }

@@ -553,6 +553,7 @@ dependencies = [
  "env_logger",
  "four-char-code",
  "half",
+ "log",
  "ndarray 0.16.1",
  "numpy",
  "pyo3",

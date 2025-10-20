@@ -349,6 +349,33 @@ impl G2D {
         self.version
     }
 
+    pub fn clear(&self, dst: &mut G2DSurface, color: [u8; 4]) -> Result<()> {
+        dst.clrcolor = i32::from_le_bytes(color);
+        let ret = if self.version >= G2D_2_3_0 {
+            unsafe {
+                self.lib
+                    .g2d_clear(self.handle, dst as *const _ as *mut g2d_surface)
+            }
+        } else {
+            let dst: G2DSurfaceLegacy = (dst as &G2DSurface).into();
+            unsafe {
+                self.lib
+                    .g2d_clear(self.handle, &dst as *const _ as *mut g2d_surface)
+            }
+        };
+
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+
+        if unsafe { self.lib.g2d_finish(self.handle) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        dst.clrcolor = 0;
+
+        Ok(())
+    }
+
     pub fn blit(&self, src: &G2DSurface, dst: &G2DSurface) -> Result<()> {
         let ret = if self.version >= G2D_2_3_0 {
             unsafe {

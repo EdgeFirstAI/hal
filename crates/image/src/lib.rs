@@ -421,6 +421,7 @@ pub enum Flip {
 pub struct Crop {
     pub src_rect: Option<Rect>,
     pub dst_rect: Option<Rect>,
+    pub dst_color: Option<[u8; 4]>,
 }
 impl Crop {
     pub fn new() -> Self {
@@ -924,6 +925,7 @@ mod tests {
                         height: 360,
                     }),
                     dst_rect: None,
+                    dst_color: None,
                 },
             )
             .unwrap();
@@ -944,6 +946,7 @@ mod tests {
                         height: 360,
                     }),
                     dst_rect: None,
+                    dst_color: None,
                 },
             )
             .unwrap();
@@ -970,6 +973,7 @@ mod tests {
                 Crop {
                     src_rect: None,
                     dst_rect: Some(Rect::new(100, 100, 512, 288)),
+                    dst_color: None,
                 },
             )
             .unwrap();
@@ -985,6 +989,7 @@ mod tests {
                 Crop {
                     src_rect: None,
                     dst_rect: Some(Rect::new(100, 100, 512, 288)),
+                    dst_color: None,
                 },
             )
             .unwrap();
@@ -1023,6 +1028,7 @@ mod tests {
                         Crop {
                             src_rect: Some(Rect::new(50, 120, 1024, 576)),
                             dst_rect: Some(Rect::new(100, 100, 512, 288)),
+                            dst_color: None,
                         },
                     )
                     .unwrap();
@@ -1036,6 +1042,7 @@ mod tests {
                         Crop {
                             src_rect: Some(Rect::new(50, 120, 1024, 576)),
                             dst_rect: Some(Rect::new(100, 100, 512, 288)),
+                            dst_color: None,
                         },
                     )
                     .unwrap();
@@ -1075,6 +1082,7 @@ mod tests {
                         height: 720 - 180,
                     }),
                     dst_rect: None,
+                    dst_color: None,
                 },
             )
             .unwrap();
@@ -1097,6 +1105,7 @@ mod tests {
                         height: 720 - 180,
                     }),
                     dst_rect: None,
+                    dst_color: None,
                 },
             )
             .unwrap();
@@ -1123,6 +1132,7 @@ mod tests {
                 Crop {
                     src_rect: None,
                     dst_rect: Some(Rect::new(100, 100, 512, 288)),
+                    dst_color: None,
                 },
             )
             .unwrap();
@@ -1138,6 +1148,7 @@ mod tests {
                 Crop {
                     src_rect: None,
                     dst_rect: Some(Rect::new(100, 100, 512, 288)),
+                    dst_color: None,
                 },
             )
             .unwrap();
@@ -1184,6 +1195,7 @@ mod tests {
                             Crop {
                                 src_rect: Some(Rect::new(50, 120, 1024, 576)),
                                 dst_rect: Some(Rect::new(100, 100, 512, 288)),
+                                dst_color: None,
                             },
                         )
                         .unwrap();
@@ -1197,6 +1209,7 @@ mod tests {
                             Crop {
                                 src_rect: Some(Rect::new(50, 120, 1024, 576)),
                                 dst_rect: Some(Rect::new(100, 100, 512, 288)),
+                                dst_color: None,
                             },
                         )
                         .unwrap();
@@ -1469,6 +1482,7 @@ mod tests {
                 Crop {
                     src_rect: None,
                     dst_rect: Some(Rect::new(100, 100, 2, 2)),
+                    dst_color: None,
                 },
             )
             .unwrap();
@@ -1484,6 +1498,7 @@ mod tests {
                 Crop {
                     src_rect: None,
                     dst_rect: Some(Rect::new(100, 100, 2, 2)),
+                    dst_color: None,
                 },
             )
             .unwrap();
@@ -1773,6 +1788,7 @@ mod tests {
                         height: 300,
                     }),
                     dst_rect: None,
+                    dst_color: None,
                 },
             )
             .unwrap();
@@ -1795,6 +1811,7 @@ mod tests {
                         height: 300,
                     }),
                     dst_rect: None,
+                    dst_color: None,
                 },
             )
             .unwrap();
@@ -1834,6 +1851,7 @@ mod tests {
                         height: 300,
                     }),
                     dst_rect: None,
+                    dst_color: None,
                 },
             )
             .unwrap();
@@ -1856,6 +1874,7 @@ mod tests {
                         height: 300,
                     }),
                     dst_rect: None,
+                    dst_color: None,
                 },
             )
             .unwrap();

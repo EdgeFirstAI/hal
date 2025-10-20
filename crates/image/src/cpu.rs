@@ -727,6 +727,78 @@ impl CPUConverter {
             Flip::Horizontal => crop.left = dst.width() - crop.left - crop.width,
         }
     }
+
+    pub(crate) fn fill_image_rgba(dst: &mut TensorImage, pix: [u8; 4]) -> Result<()> {
+        match dst.fourcc() {
+            RGBA => Self::fill_image(dst, pix),
+            RGB => Self::fill_image(dst, Self::rgba_to_rgb(pix)),
+            GREY => Self::fill_image(dst, Self::rgba_to_grey(pix)),
+            YUYV => Self::fill_image(dst, Self::rgba_to_yuyv(pix)),
+            _ => Err(Error::Internal(format!(
+                "Found unexpected destination {}",
+                dst.fourcc.display()
+            ))),
+        }
+    }
+
+    fn fill_image<const N: usize>(dst: &mut TensorImage, pix: [u8; N]) -> Result<()> {
+        let mut map = dst.tensor.map()?;
+        if N == 1 {
+            map.fill(pix[0]);
+            return Ok(());
+        }
+
+        let image = map.as_chunks_mut::<N>().0;
+        for p in image {
+            *p = pix
+        }
+        Ok(())
+    }
+
+    fn rgba_to_rgb(rgba: [u8; 4]) -> [u8; 3] {
+        let [r, g, b, _] = rgba;
+        [r, g, b]
+    }
+
+    fn rgba_to_grey(rgba: [u8; 4]) -> [u8; 1] {
+        const BIAS: usize = 20;
+        const Y_R: i32 = (0.2126_f64 * (255 * (1 << BIAS)) as f64 / 255.0).round() as i32;
+        const Y_G: i32 = (0.7152_f64 * (255 * (1 << BIAS)) as f64 / 255.0).round() as i32;
+        const Y_B: i32 = ((255 * (1 << BIAS)) as f64 / 255.0).ceil() as i32 - Y_R - Y_G;
+        let [r, g, b, _] = rgba;
+        let y = ((Y_R * r as i32 + Y_G * g as i32 + Y_B * b as i32) >> BIAS) as u8;
+        [y]
+    }
+
+    fn rgba_to_yuyv(rgba: [u8; 4]) -> [u8; 4] {
+        // compute quantized Bt.709 limited range RGB to YUV matrix
+        const BIAS: i32 = 20;
+        const Y_R: i32 = (0.2126_f64 * ((235 - 16) * (1 << BIAS)) as f64 / 255.0).round() as i32;
+        const Y_G: i32 = (0.7152_f64 * ((235 - 16) * (1 << BIAS)) as f64 / 255.0).round() as i32;
+        const Y_B: i32 = (((235 - 16) * (1 << BIAS)) as f64 / 255.0).ceil() as i32 - Y_R - Y_G;
+        const U_R: i32 = (-0.114572_f64 * ((240 - 16) * (1 << BIAS)) as f64 / 255.0).round() as i32;
+        const U_B: i32 = (0.5_f64 * ((240 - 16) * (1 << BIAS)) as f64 / 255.0).round() as i32;
+        const U_G: i32 = -U_R - U_B;
+        const V_R: i32 = (0.5_f64 * ((240 - 16) * (1 << BIAS)) as f64 / 255.0).round() as i32;
+        const V_B: i32 = (-0.045847_f64 * ((240 - 16) * (1 << BIAS)) as f64 / 255.0).round() as i32;
+        const V_G: i32 = -V_R - V_B;
+
+        let [r, g, b, _] = rgba;
+        let y = (((Y_R * r as i32 + Y_G * g as i32 + Y_B * b as i32) >> BIAS) + 16) as u8;
+        let u = (((U_R * (r as i32) + U_G * (g as i32) + U_B * (b as i32)) >> BIAS) + 128) as u8;
+        let v = (((V_R * (r as i32) + V_G * (g as i32) + V_B * (b as i32)) >> BIAS) + 128) as u8;
+
+        [y, u, y, v]
+    }
+    // fn paint_mk_onto_rgba(
+    //     src: &TensorImage,
+    //     dst: &mut TensorImage,
+    //     rotation: Rotation,
+    //     flip: Flip,
+    //     crop: Crop,
+    // ) {
+    //     crop.check_crop(src, dst)?;
+    // }
 }
 
 impl ImageConverterTrait for CPUConverter {
@@ -823,6 +895,18 @@ impl ImageConverterTrait for CPUConverter {
             tmp = src;
         }
 
+        if crop.dst_rect.is_some_and(|crop| {
+            crop != Rect {
+                left: 0,
+                top: 0,
+                width: src.width(),
+                height: src.height(),
+            }
+        }) && let Some(dst_color) = crop.dst_color
+        {
+            Self::fill_image_rgba(dst, dst_color)?;
+        }
+
         // format must be RGB/RGBA/GREY
         matches!(tmp.fourcc(), RGB | RGBA | GREY);
         if tmp.fourcc() == dst.fourcc() {
@@ -843,10 +927,12 @@ impl ImageConverterTrait for CPUConverter {
                     width: src.width(),
                     height: src.height(),
                 }
-            }) {
+            }) && crop.dst_color.is_none()
+            {
                 // convert the dst into tmp2 when there is a dst crop
                 // TODO: this could be optimized by changing convert_format to take a
                 // destination crop?
+
                 Self::convert_format(dst, &mut tmp2)?;
             }
             self.resize_flip_rotate(&mut tmp2, tmp, rotation, flip, crop)?;

@@ -554,7 +554,6 @@ impl ImageConverterTrait for GLConverterST {
             src.tensor().memory()
         );
         check_gl_error(function!(), line!())?;
-        unsafe { gls::gl::Finish() };
         if self.gl_context.support_dma
             && dst.tensor().memory() == TensorMemory::Dma
             && dst.fourcc() != RGB
@@ -838,10 +837,21 @@ impl GLConverterST {
         crop: Crop,
     ) -> Result<(), crate::Error> {
         check_gl_error(function!(), line!())?;
-        // unsafe {
-        //     gls::gl::ClearColor(1.0, 1.0, 1.0, 1.0);
-        //     gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
-        // };
+
+        if crop.dst_rect.is_some_and(|x| {
+            x.left != 0 || x.top != 0 || x.width != dst.width() || x.height != dst.height()
+        }) && let Some(dst_color) = crop.dst_color
+        {
+            unsafe {
+                gls::gl::ClearColor(
+                    dst_color[0] as f32 / 255.0,
+                    dst_color[1] as f32 / 255.0,
+                    dst_color[2] as f32 / 255.0,
+                    dst_color[3] as f32 / 255.0,
+                );
+                gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
+            };
+        }
 
         // top and bottom are flipped because OpenGL uses 0,0 as bottom left
         let src_roi = if let Some(crop) = crop.src_rect {
