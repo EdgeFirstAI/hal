@@ -173,6 +173,12 @@ class TensorImage:
     def copy_from_numpy(self, src: npt.NDArray[np.uint8]) -> None:
         ...
 
+    def fill(self, value: Union[np.uint8, list[np.uint8]]) -> None:
+        ...
+
+    def map(self) -> TensorMap:
+        ...
+
     @property
     def format(self) -> FourCC:
         ...
@@ -233,6 +239,6 @@ class ImageConverter:
     def __init__(self) -> None:
         ...
 
-    # [pyo3(signature = (src, dst, rotation = Rotation::Rotate0, flip = Flip::NoFlip, src_crop = None, dst_crop = None))]
-    def convert(self, src: TensorImage, dst: TensorImage, rotation: Rotation = Rotation.Rotate0, flip: Flip = Flip.NoFlip, src_crop: Rect | None = None, dst_crop: Rect | None = None) -> None:
+    # [pyo3(signature = (src, dst, rotation = PyRotation::Rotate0, flip = PyFlip::NoFlip, src_crop = None, dst_crop = None, dst_color = None))]
+    def convert(self, src: TensorImage, dst: TensorImage, rotation: Rotation = Rotation.Rotate0, flip: Flip = Flip.NoFlip, src_crop: Rect | None = None, dst_crop: Rect | None = None, dst_color: List[np.uint8] | None = None) -> None:
         ...
