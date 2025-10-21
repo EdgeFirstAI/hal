@@ -297,29 +297,6 @@ impl CPUConverter {
         Ok(())
     }
 
-    fn convert_mask_to_rgba(
-        src: &TensorImage,
-        dst: &mut TensorImage,
-        color_fg: [u8; 4],
-        color_bg: [u8; 4],
-    ) -> Result<()> {
-        assert_eq!(src.fourcc(), GREY);
-        assert_eq!(dst.fourcc(), RGBA);
-        let src = src.tensor().map()?;
-        let src = src.as_slice();
-
-        let mut dst = dst.tensor().map()?;
-        let dst = dst.as_mut_slice();
-        for (s, d) in src.iter().zip(dst.as_chunks_mut::<4>().0.iter_mut()) {
-            if *s > 0 {
-                *d = color_fg;
-            } else {
-                *d = color_bg;
-            }
-        }
-        Ok(())
-    }
-
     fn convert_rgba_to_rgb(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), RGBA);
         assert_eq!(dst.fourcc(), RGB);
@@ -779,13 +756,14 @@ impl CPUConverter {
         // calculate the top/bottom
         let top_offset = (0, (crop.top * dst.width() + crop.left));
         let bottom_offset = (
-            ((crop.top + crop.height) * dst.width() + crop.left),
+            ((crop.top + crop.height) * dst.width() + crop.left).min(s.len()),
             s.len(),
         );
 
         for p in &mut s[top_offset.0..top_offset.1] {
             *p = pix;
         }
+
         for p in &mut s[bottom_offset.0..bottom_offset.1] {
             *p = pix;
         }
@@ -798,7 +776,7 @@ impl CPUConverter {
         let middle_stride = dst.width() - crop.width;
         let middle_offset = (
             (crop.top * dst.width() + crop.left + crop.width),
-            ((crop.top + crop.height) * dst.width() + crop.left + crop.width),
+            ((crop.top + crop.height) * dst.width() + crop.left + crop.width).min(s.len()),
         );
 
         let middle = s[middle_offset.0..middle_offset.1].chunks_exact_mut(dst.width());
