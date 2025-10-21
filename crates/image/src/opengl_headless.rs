@@ -736,11 +736,11 @@ impl GLConverterST {
             match dst.fourcc() {
                 RGB => gls::gl::RGB,
                 RGBA => gls::gl::RGBA,
-                // GREY => gls::gl::RGB,
-                GREY => gls::gl::R8,
+                GREY => gls::gl::R8, // TODO: Check if opengl version supports this
                 _ => unreachable!(),
             }
         };
+
         let start = Instant::now();
         let frame_buffer = FrameBuffer::new();
         frame_buffer.bind();
@@ -813,6 +813,7 @@ impl GLConverterST {
 
         unsafe {
             let mut dst_map = dst.tensor().map()?;
+            gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
             gls::gl::ReadnPixels(
                 0,
                 0,
@@ -824,7 +825,7 @@ impl GLConverterST {
                 dst_map.as_mut_ptr() as *mut c_void,
             );
         }
-        log::debug!("Read from fraembuffer takes {:?}", start.elapsed());
+        log::debug!("Read from framebuffer takes {:?}", start.elapsed());
         Ok(())
     }
 
@@ -838,10 +839,10 @@ impl GLConverterST {
     ) -> Result<(), crate::Error> {
         check_gl_error(function!(), line!())?;
 
-        if crop.dst_rect.is_some_and(|x| {
+        let has_crop = crop.dst_rect.is_some_and(|x| {
             x.left != 0 || x.top != 0 || x.width != dst.width() || x.height != dst.height()
-        }) && let Some(dst_color) = crop.dst_color
-        {
+        });
+        if has_crop && let Some(dst_color) = crop.dst_color {
             unsafe {
                 gls::gl::ClearColor(
                     dst_color[0] as f32 / 255.0,
@@ -893,8 +894,8 @@ impl GLConverterST {
             crate::Rotation::Rotate180 => 2,
             crate::Rotation::CounterClockwise90 => 3,
         };
-        let start = Instant::now();
-        let result = if self.gl_context.support_dma
+
+        if self.gl_context.support_dma
             && let Ok(new_egl_image) = self.create_image_from_dma2(src)
         {
             self.draw_camera_texture_eglimage(
@@ -904,16 +905,18 @@ impl GLConverterST {
                 dst_roi,
                 rotation_offset,
                 flip,
-            )
+            )?
         } else {
-            self.draw_src_texture(src, src_roi, dst_roi, rotation_offset, flip)
-        };
-        log::debug!("draw_src_texture takes {:?}", start.elapsed());
+            let start = Instant::now();
+            self.draw_src_texture(src, src_roi, dst_roi, rotation_offset, flip)?;
+            log::debug!("draw_src_texture takes {:?}", start.elapsed());
+        }
+
         let start = Instant::now();
         unsafe { gls::gl::Finish() };
         log::debug!("gl_Finish takes {:?}", start.elapsed());
         check_gl_error(function!(), line!())?;
-        result
+        Ok(())
     }
 
     fn convert_to_planar(
