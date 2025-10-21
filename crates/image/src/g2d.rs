@@ -4,7 +4,7 @@ use crate::{
     CPUConverter, Crop, Error, Flip, ImageConverterTrait, RGB, RGBA, Result, Rotation, TensorImage,
     YUYV,
 };
-use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait};
+use edgefirst_tensor::{Tensor, TensorMemory};
 use g2d_sys::{G2D, G2DFormat, G2DPhysical, G2DSurface};
 use log::trace;
 use std::{os::fd::AsRawFd, time::Instant};
@@ -20,7 +20,6 @@ impl G2DConverter {
         let mut g2d = G2D::new("libg2d.so.2")?;
         g2d.set_bt709_colorspace()?;
 
-        let tensor = TensorImage::new(1, 1, RGBA, Some(TensorMemory::Dma))?;
         log::debug!("G2DConverter created");
         Ok(Self { g2d })
     }
