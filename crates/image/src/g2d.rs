@@ -60,25 +60,6 @@ impl G2DConverter {
             src_surface.bottom = (crop_rect.top + crop_rect.height) as i32;
         }
 
-        // need to clear before assigning the crop
-        if crop.dst_rect.is_some_and(|x| {
-            x.left != 0 || x.top != 0 || x.width != dst.width() || x.height != dst.height()
-        }) && let Some(dst_color) = crop.dst_color
-        {
-            let start = Instant::now();
-            if dst.fourcc() != RGB {
-                self.g2d.clear(&mut dst_surface, dst_color)?;
-            } else {
-                // g2d clear doesn't work on RGB format, so we need to use a CPU fallback
-                CPUConverter::fill_image_rgba(dst, dst_color)?;
-                // self.tmp.tensor.map()?.copy_from_slice(&dst_color);
-                // let tmp_surface = (&self.tmp).try_into()?;
-                // self.g2d.blit(&tmp_surface, &dst_surface)?;
-            }
-
-            log::trace!("clear takes {:?}", start.elapsed());
-        }
-
         if let Some(crop_rect) = crop.dst_rect {
             dst_surface.planes[0] += ((crop_rect.top * dst_surface.width as usize + crop_rect.left)
                 * dst.channels()) as u64;
@@ -100,8 +81,44 @@ impl G2DConverter {
             // dst_surface.bottom = (crop_rect.top + crop_rect.height) as i32;
         }
 
+        // need to clear before assigning the crop
+        let needs_clear = if let Some(dst_rect) = crop.dst_rect
+            && (dst_rect.left != 0
+                || dst_rect.top != 0
+                || dst_rect.width != dst.width()
+                || dst_rect.height != dst.height())
+            && crop.dst_color.is_some()
+        {
+            true
+        } else {
+            false
+        };
+
+        let mut cleared = false;
+        if needs_clear
+            && dst.fourcc != RGB
+            && let Some(dst_rect) = crop.dst_rect
+            && dst_rect.width * dst_rect.height < dst.width() * dst.height() / 2
+            && let Some(dst_color) = crop.dst_color
+        {
+            let start = Instant::now();
+            self.g2d.clear(&mut dst_surface, dst_color)?;
+            log::trace!("clear takes {:?}", start.elapsed());
+            cleared = true;
+        }
+
         trace!("Blitting from {src_surface:?} to {dst_surface:?}");
         self.g2d.blit(&src_surface, &dst_surface)?;
+
+        if needs_clear
+            && !cleared
+            && let Some(dst_color) = crop.dst_color
+            && let Some(dst_rect) = crop.dst_rect
+        {
+            let start = Instant::now();
+            CPUConverter::fill_image_outside_crop(dst, dst_color, dst_rect)?;
+            log::trace!("clear takes {:?}", start.elapsed());
+        }
 
         Ok(())
     }
