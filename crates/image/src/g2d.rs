@@ -4,7 +4,7 @@ use crate::{
     CPUConverter, Crop, Error, Flip, ImageConverterTrait, RGB, RGBA, Result, Rotation, TensorImage,
     YUYV,
 };
-use edgefirst_tensor::{Tensor, TensorMemory};
+use edgefirst_tensor::Tensor;
 use g2d_sys::{G2D, G2DFormat, G2DPhysical, G2DSurface};
 use log::trace;
 use std::{os::fd::AsRawFd, time::Instant};
