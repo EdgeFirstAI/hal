@@ -3,8 +3,8 @@ use edgefirst::{
     tensor::{self, TensorMapTrait, TensorMemory, TensorTrait},
 };
 use four_char_code::FourCharCode;
-use ndarray::{Array3, ArrayView3, ArrayViewMut3};
-use numpy::{IntoPyArray, PyArray3, PyArrayLike3, PyReadwriteArray3, PyUntypedArrayMethods};
+use ndarray::{ArrayView3, ArrayViewMut3};
+use numpy::{PyArrayLike3, PyReadwriteArray3, PyUntypedArrayMethods};
 use pyo3::prelude::*;
 use std::{
     fmt::{self},
@@ -23,6 +23,7 @@ pub enum Error {
     Io(std::io::Error),
     Format(String),
     Shape(String),
+    InvalidArg(String),
 }
 
 impl fmt::Display for Error {
@@ -34,6 +35,7 @@ impl fmt::Display for Error {
             Error::Io(e) => write!(f, "Io error: {e:?}"),
             Error::Format(msg) => write!(f, "Format error: {msg}"),
             Error::Shape(msg) => write!(f, "Shape error: {msg}"),
+            Error::InvalidArg(msg) => write!(f, "Invalid Argument: {msg}"),
         }
     }
 }
@@ -85,6 +87,16 @@ pub enum FourCC {
     RGB,
     NV12,
     GREY,
+}
+
+#[pyclass]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::upper_case_acronyms)]
+pub enum Normalization {
+    DEFAULT,
+    SIGNED,
+    UNSIGNED,
+    RAW,
 }
 
 #[pymethods]
@@ -205,17 +217,8 @@ impl PyTensorImage {
         Ok(())
     }
 
-    pub fn to_numpy<'py>(self_: PyRef<'py, Self>) -> Result<Bound<'py, PyArray3<u8>>> {
-        let map = self_.0.tensor().map()?;
-        let data = map.as_slice().to_vec();
-        let ndarray = Array3::from_shape_vec(
-            [self_.0.height(), self_.0.width(), self_.0.channels()],
-            data,
-        )?;
-        Ok(ndarray.into_pyarray(self_.py()))
-    }
-
-    pub fn copy_into_numpy(&self, dst: ImageDest3) -> Result<()> {
+    #[pyo3(signature = (dst, normalization=Normalization::DEFAULT))]
+    pub fn normalize_to_numpy(&self, dst: ImageDest3, normalization: Normalization) -> Result<()> {
         let tensor = &self.0;
         let shape = [tensor.height(), tensor.width(), tensor.channels()];
         let dst_shape = match &dst {
@@ -254,6 +257,11 @@ impl PyTensorImage {
 
         match dst {
             ImageDest3::UInt8(mut dst) => {
+                if !matches!(normalization, Normalization::RAW | Normalization::DEFAULT) {
+                    return Err(Error::InvalidArg(
+                        "UInt8 destination only supports RAW normalization".to_string(),
+                    ));
+                }
                 let mut dst = dst.as_array_mut();
                 let map = tensor.tensor().map()?;
                 let data = map.as_slice();
@@ -275,6 +283,14 @@ impl PyTensorImage {
                 dst.assign(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]));
             }
             ImageDest3::Int8(mut dst) => {
+                if !matches!(
+                    normalization,
+                    Normalization::SIGNED | Normalization::DEFAULT
+                ) {
+                    return Err(Error::InvalidArg(
+                        "Int8 destination only supports SIGNED normalization".to_string(),
+                    ));
+                }
                 let mut dst = dst.as_array_mut();
                 let map = tensor.tensor().map()?;
                 let data = map.as_slice();
@@ -297,8 +313,68 @@ impl PyTensorImage {
                     |x, y| *x = (*y as i16 - 128) as i8,
                 );
             }
-            ImageDest3::Float32(_dst) => todo!(),
-            ImageDest3::Float64(_dst) => todo!(),
+            ImageDest3::Float32(mut dst) => {
+                let normalization_func = match normalization {
+                    Normalization::SIGNED | Normalization::DEFAULT => {
+                        |s| s as f32 / 255.0 * 2.0 - 1.0
+                    }
+                    Normalization::UNSIGNED => |s| s as f32 / 255.0,
+                    Normalization::RAW => |s| s as f32,
+                };
+
+                let mut dst = dst.as_array_mut();
+                let map = tensor.tensor().map()?;
+                let data = map.as_slice();
+                let ndarray = ArrayView3::from_shape(shape, data)?;
+                if self.0.fourcc() == RGBA
+                    && dst_shape[2] == 3
+                    && let Some(dst) = dst.as_slice_mut()
+                {
+                    let dst = dst.as_chunks_mut::<3>().0;
+                    let src = data.as_chunks::<4>().0;
+                    dst.iter_mut().zip(src).for_each(|(d, s)| {
+                        d[0] = normalization_func(s[0]);
+                        d[1] = normalization_func(s[1]);
+                        d[2] = normalization_func(s[2]);
+                    });
+                    return Ok(());
+                }
+                dst.zip_mut_with(
+                    &ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]),
+                    |x, y| *x = normalization_func(*y),
+                );
+            }
+            ImageDest3::Float64(mut dst) => {
+                let normalization_func = match normalization {
+                    Normalization::SIGNED | Normalization::DEFAULT => {
+                        |s| s as f64 / 255.0 * 2.0 - 1.0
+                    }
+                    Normalization::UNSIGNED => |s| s as f64 / 255.0,
+                    Normalization::RAW => |s| s as f64,
+                };
+
+                let mut dst = dst.as_array_mut();
+                let map = tensor.tensor().map()?;
+                let data = map.as_slice();
+                let ndarray = ArrayView3::from_shape(shape, data)?;
+                if self.0.fourcc() == RGBA
+                    && dst_shape[2] == 3
+                    && let Some(dst) = dst.as_slice_mut()
+                {
+                    let dst = dst.as_chunks_mut::<3>().0;
+                    let src = data.as_chunks::<4>().0;
+                    dst.iter_mut().zip(src).for_each(|(d, s)| {
+                        d[0] = normalization_func(s[0]);
+                        d[1] = normalization_func(s[1]);
+                        d[2] = normalization_func(s[2]);
+                    });
+                    return Ok(());
+                }
+                dst.zip_mut_with(
+                    &ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]),
+                    |x, y| *x = normalization_func(*y),
+                );
+            }
         }
 
         Ok(())
