@@ -78,7 +78,7 @@ pub enum ImageDest3<'py> {
     Float64(PyReadwriteArray3<'py, f64>),
 }
 
-#[pyclass]
+#[pyclass(eq, eq_int)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum FourCC {
@@ -89,7 +89,7 @@ pub enum FourCC {
     GREY,
 }
 
-#[pyclass]
+#[pyclass(eq, eq_int)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum Normalization {
@@ -142,7 +142,7 @@ impl TryFrom<FourCharCode> for FourCC {
     }
 }
 
-#[pyclass(name = "TensorMemory")]
+#[pyclass(name = "TensorMemory", eq, eq_int)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum PyTensorMemory {
@@ -469,7 +469,7 @@ impl PyImageConverter {
     }
 }
 
-#[pyclass(name = "Rotation")]
+#[pyclass(name = "Rotation", eq, eq_int)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PyRotation {
     Rotate0 = 0,
@@ -503,7 +503,7 @@ impl From<PyRotation> for Rotation {
     }
 }
 
-#[pyclass(name = "Flip")]
+#[pyclass(name = "Flip", eq, eq_int)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PyFlip {
     NoFlip = 0,
@@ -521,7 +521,7 @@ impl From<PyFlip> for Flip {
     }
 }
 
-#[pyclass(name = "Rect")]
+#[pyclass(name = "Rect", eq)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PyRect {
     #[pyo3(get, set)]
