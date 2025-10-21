@@ -171,7 +171,7 @@ pub struct PyTensorImage(image::TensorImage);
 #[pymethods]
 impl PyTensorImage {
     #[new]
-    #[pyo3(signature = (width, height, fourcc = FourCC::RGB, mem = None))]
+    #[pyo3(signature = (width, height, fourcc = FourCC::RGBA, mem = None))]
     pub fn new(
         width: usize,
         height: usize,
@@ -185,7 +185,7 @@ impl PyTensorImage {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (data, fourcc = Some(FourCC::RGB), mem = None))]
+    #[pyo3(signature = (data, fourcc = Some(FourCC::RGBA), mem = None))]
     pub fn load_from_bytes(
         data: &[u8],
         fourcc: Option<FourCC>,
@@ -198,7 +198,7 @@ impl PyTensorImage {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (filename, fourcc = Some(FourCC::RGB), mem = None))]
+    #[pyo3(signature = (filename, fourcc = Some(FourCC::RGBA), mem = None))]
     pub fn load(
         filename: &str,
         fourcc: Option<FourCC>,
