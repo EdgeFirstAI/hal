@@ -810,7 +810,7 @@ mod tests {
         let dst_width = 640;
         let dst_height = 360;
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
-        let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
+        let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
         let mut cpu_converter = CPUConverter::new().unwrap();
@@ -823,8 +823,7 @@ mod tests {
                 Crop::no_crop(),
             )
             .unwrap();
-        let mut gl_dst =
-            TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
+        let mut gl_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
         let mut gl_converter = GLConverterThreaded::new().unwrap();
 
         for _ in 0..5 {
@@ -873,8 +872,8 @@ mod tests {
         )
         .unwrap();
 
-        let mut gl_dst = TensorImage::new(640, 640, GREY, Some(TensorMemory::Dma)).unwrap();
-        let mut cpu_dst = TensorImage::new(640, 640, GREY, Some(TensorMemory::Dma)).unwrap();
+        let mut gl_dst = TensorImage::new(640, 640, GREY, None).unwrap();
+        let mut cpu_dst = TensorImage::new(640, 640, GREY, None).unwrap();
 
         let mut converter = CPUConverter::new().unwrap();
 
@@ -1064,7 +1063,7 @@ mod tests {
         let dst_width = 640;
         let dst_height = 360;
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
-        let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
+        let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
         let mut cpu_converter = CPUConverter::new().unwrap();
@@ -1087,8 +1086,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut gl_dst =
-            TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
+        let mut gl_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
         let mut gl_converter = GLConverterThreaded::new().unwrap();
 
         gl_converter
@@ -1281,20 +1279,31 @@ mod tests {
     #[cfg(feature = "opengl")]
     fn test_opengl_rotate() {
         let size = (1280, 720);
-        for rot in [
-            Rotation::Clockwise90,
-            Rotation::Rotate180,
-            Rotation::CounterClockwise90,
-        ] {
-            for mem in [
-                None,
-                Some(TensorMemory::Dma),
-                Some(TensorMemory::Shm),
-                Some(TensorMemory::Mem),
+        let mut mem = vec![None, Some(TensorMemory::Shm), Some(TensorMemory::Mem)];
+        if dma_available() {
+            mem.push(Some(TensorMemory::Dma));
+        }
+        for m in mem {
+            for rot in [
+                Rotation::Clockwise90,
+                Rotation::Rotate180,
+                Rotation::CounterClockwise90,
             ] {
-                test_opengl_rotate_(size, rot, mem);
+                test_opengl_rotate_(size, rot, m);
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn dma_available() -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            dma_heap::Heap::new(dma_heap::HeapKind::Cma)
+                .or_else(|_| dma_heap::Heap::new(dma_heap::HeapKind::System))
+                .is_ok()
+        }
+        #[cfg(not(target_os = "linux"))]
+        false
     }
 
     #[cfg(target_os = "linux")]
