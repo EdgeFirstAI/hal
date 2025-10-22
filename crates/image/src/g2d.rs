@@ -15,6 +15,9 @@ pub struct G2DConverter {
     g2d: G2D,
 }
 
+unsafe impl Send for G2DConverter {}
+unsafe impl Sync for G2DConverter {}
+
 impl G2DConverter {
     pub fn new() -> Result<Self> {
         let mut g2d = G2D::new("libg2d.so.2")?;

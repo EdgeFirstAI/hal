@@ -504,6 +504,9 @@ pub struct ImageConverter {
     pub opengl: Option<GLConverterThreaded>,
 }
 
+unsafe impl Send for ImageConverter {}
+unsafe impl Sync for ImageConverter {}
+
 impl ImageConverter {
     pub fn new() -> Result<Self> {
         #[cfg(target_os = "linux")]

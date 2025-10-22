@@ -15,6 +15,9 @@ pub struct CPUConverter {
     options: fast_image_resize::ResizeOptions,
 }
 
+unsafe impl Send for CPUConverter {}
+unsafe impl Sync for CPUConverter {}
+
 #[inline(always)]
 fn limit_to_full(l: u8) -> u8 {
     (((l as u16 - 16) * 255) / (240 - 16)) as u8
