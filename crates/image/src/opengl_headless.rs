@@ -1,6 +1,6 @@
 #![cfg(target_os = "linux")]
 #![cfg(feature = "opengl")]
-use edgefirst_tensor::{TensorMapTrait, TensorMemory, TensorTrait};
+use edgefirst_tensor::{TensorMemory, TensorTrait};
 use four_char_code::FourCharCode;
 use gbm::{
     AsRaw, Device,
@@ -67,8 +67,6 @@ impl GlContext {
             egl::GREEN_SIZE,
             8,
             egl::BLUE_SIZE,
-            8,
-            egl::ALPHA_SIZE,
             8,
             egl::NONE,
         ];
@@ -727,9 +725,9 @@ impl GLConverterST {
                 GREY => src.height(),
                 _ => unreachable!(),
             };
-            (width, height)
+            (width as i32, height as i32)
         } else {
-            (dst.width(), dst.height())
+            (dst.width() as i32, dst.height() as i32)
         };
 
         let format = if dst.is_planar() {
@@ -755,19 +753,37 @@ impl GLConverterST {
                 && crop.height == dst.height()
                 && crop.width == dst.width()
         }) {
-            None
+            std::ptr::null()
         } else {
             map = dst.tensor().map()?;
-            Some(map.as_slice())
+            map.as_ptr() as *const c_void
         };
         unsafe {
             gls::gl::UseProgram(self.texture_program.id);
             gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+            gls::gl::TexParameteri(
+                gls::gl::TEXTURE_2D,
+                gls::gl::TEXTURE_MIN_FILTER,
+                gls::gl::LINEAR as i32,
+            );
+            gls::gl::TexParameteri(
+                gls::gl::TEXTURE_2D,
+                gls::gl::TEXTURE_MAG_FILTER,
+                gls::gl::LINEAR as i32,
+            );
 
-            self.render_texture
-                .update_texture(gls::gl::TEXTURE_2D, width, height, format, pixels);
-
+            gls::gl::TexImage2D(
+                gls::gl::TEXTURE_2D,
+                0,
+                format as i32,
+                width,
+                height,
+                0,
+                format,
+                gls::gl::UNSIGNED_BYTE,
+                pixels,
+            );
             check_gl_error(function!(), line!())?;
             gls::gl::FramebufferTexture2D(
                 gls::gl::FRAMEBUFFER,
@@ -777,12 +793,12 @@ impl GLConverterST {
                 0,
             );
             check_gl_error(function!(), line!())?;
-            gls::gl::Viewport(0, 0, width as i32, height as i32);
+            gls::gl::Viewport(0, 0, width, height);
         }
         log::debug!("Set up framebuffer takes {:?}", start.elapsed());
         let start = Instant::now();
         if dst.is_planar() {
-            self.convert_to_planar(src, width, crop)?;
+            self.convert_to_planar(src, width as usize, crop)?;
         } else {
             self.convert_to(src, dst, rotation, flip, crop)?;
         }
@@ -1068,7 +1084,7 @@ impl GLConverterST {
                 src.width(),
                 src.height(),
                 texture_format,
-                Some(&src.tensor().map()?),
+                &src.tensor().map()?,
             );
 
             gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
@@ -1422,9 +1438,8 @@ impl Texture {
         width: usize,
         height: usize,
         format: gls::gl::types::GLenum,
-        data: Option<&[u8]>,
+        data: &[u8],
     ) {
-        let data = data.map(|x| x.as_ptr() as *const c_void).unwrap_or(null());
         if target != self.target
             || width != self.width
             || height != self.height
@@ -1440,7 +1455,7 @@ impl Texture {
                     0,
                     format,
                     gls::gl::UNSIGNED_BYTE,
-                    data,
+                    data.as_ptr() as *const c_void,
                 );
             }
             self.target = target;
@@ -1458,7 +1473,7 @@ impl Texture {
                     height as i32,
                     format,
                     gls::gl::UNSIGNED_BYTE,
-                    data,
+                    data.as_ptr() as *const c_void,
                 );
             }
         }
