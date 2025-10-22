@@ -167,16 +167,22 @@ where
             Some(TensorMemory::Shm) => ShmTensor::<T>::new(shape, name).map(Tensor::Shm),
             Some(TensorMemory::Mem) => MemTensor::<T>::new(shape, name).map(Tensor::Mem),
             None => {
-                #[cfg(target_os = "linux")]
-                match DmaTensor::<T>::new(shape, name) {
-                    Ok(tensor) => Ok(Tensor::Dma(tensor)),
-                    Err(_) => match ShmTensor::<T>::new(shape, name).map(Tensor::Shm) {
-                        Ok(tensor) => Ok(tensor),
-                        Err(_) => MemTensor::<T>::new(shape, name).map(Tensor::Mem),
-                    },
+                if std::env::var("EDGEFIRST_TENSOR_FORCE_MEM")
+                    .is_ok_and(|x| x != "0" && x.to_lowercase() != "false")
+                {
+                    MemTensor::<T>::new(shape, name).map(Tensor::Mem)
+                } else {
+                    #[cfg(target_os = "linux")]
+                    match DmaTensor::<T>::new(shape, name) {
+                        Ok(tensor) => Ok(Tensor::Dma(tensor)),
+                        Err(_) => match ShmTensor::<T>::new(shape, name).map(Tensor::Shm) {
+                            Ok(tensor) => Ok(tensor),
+                            Err(_) => MemTensor::<T>::new(shape, name).map(Tensor::Mem),
+                        },
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    MemTensor::<T>::new(shape, name).map(Tensor::Mem)
                 }
-                #[cfg(not(target_os = "linux"))]
-                MemTensor::<T>::new(shape, name).map(Tensor::Mem)
             }
         }
     }

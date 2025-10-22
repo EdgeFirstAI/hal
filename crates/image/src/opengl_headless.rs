@@ -407,6 +407,9 @@ pub struct GLConverterThreaded {
     support_dma: bool,
 }
 
+unsafe impl Send for GLConverterThreaded {}
+unsafe impl Sync for GLConverterThreaded {}
+
 pub struct SendablePtr<T: Send> {
     ptr: *const T,
 }
