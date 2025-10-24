@@ -6,7 +6,6 @@ use crate::{
 };
 use edgefirst_tensor::Tensor;
 use g2d_sys::{G2D, G2DFormat, G2DPhysical, G2DSurface};
-use log::trace;
 use std::{os::fd::AsRawFd, time::Instant};
 
 /// G2DConverter implements the ImageConverter trait using the NXP G2D
@@ -62,27 +61,6 @@ impl G2DConverter {
             src_surface.bottom = (crop_rect.top + crop_rect.height) as i32;
         }
 
-        if let Some(crop_rect) = crop.dst_rect {
-            dst_surface.planes[0] += ((crop_rect.top * dst_surface.width as usize + crop_rect.left)
-                * dst.channels()) as u64;
-
-            dst_surface.right = crop_rect.width as i32;
-            dst_surface.bottom = crop_rect.height as i32;
-            dst_surface.width = crop_rect.width as i32;
-            dst_surface.height = crop_rect.height as i32;
-
-            // right: img.width() as i32,
-            // bottom: img.height() as i32,
-            // stride: img.width() as i32,
-            // width: img.width() as i32,
-            // height: img.height() as i32,
-
-            // dst_surface.left = crop_rect.left as i32;
-            // dst_surface.top = crop_rect.top as i32;
-            // dst_surface.right = (crop_rect.left + crop_rect.width) as i32;
-            // dst_surface.bottom = (crop_rect.top + crop_rect.height) as i32;
-        }
-
         // need to clear before assigning the crop
         let needs_clear = if let Some(dst_rect) = crop.dst_rect
             && (dst_rect.left != 0
@@ -109,7 +87,28 @@ impl G2DConverter {
             cleared = true;
         }
 
-        trace!("Blitting from {src_surface:?} to {dst_surface:?}");
+        if let Some(crop_rect) = crop.dst_rect {
+            dst_surface.planes[0] += ((crop_rect.top * dst_surface.width as usize + crop_rect.left)
+                * dst.channels()) as u64;
+
+            dst_surface.right = crop_rect.width as i32;
+            dst_surface.bottom = crop_rect.height as i32;
+            dst_surface.width = crop_rect.width as i32;
+            dst_surface.height = crop_rect.height as i32;
+
+            // right: img.width() as i32,
+            // bottom: img.height() as i32,
+            // stride: img.width() as i32,
+            // width: img.width() as i32,
+            // height: img.height() as i32,
+
+            // dst_surface.left = crop_rect.left as i32;
+            // dst_surface.top = crop_rect.top as i32;
+            // dst_surface.right = (crop_rect.left + crop_rect.width) as i32;
+            // dst_surface.bottom = (crop_rect.top + crop_rect.height) as i32;
+        }
+
+        log::trace!("Blitting from {src_surface:?} to {dst_surface:?}");
         self.g2d.blit(&src_surface, &dst_surface)?;
 
         if needs_clear
