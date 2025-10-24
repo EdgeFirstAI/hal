@@ -428,6 +428,21 @@ impl Crop {
         Crop::default()
     }
 
+    pub fn with_src_rect(mut self, src_rect: Option<Rect>) -> Self {
+        self.src_rect = src_rect;
+        self
+    }
+
+    pub fn with_dst_rect(mut self, dst_rect: Option<Rect>) -> Self {
+        self.dst_rect = dst_rect;
+        self
+    }
+
+    pub fn with_dst_color(mut self, dst_color: Option<[u8; 4]>) -> Self {
+        self.dst_color = dst_color;
+        self
+    }
+
     pub fn no_crop() -> Self {
         Crop::default()
     }
@@ -437,9 +452,18 @@ impl Crop {
         let dst = self.dst_rect.is_none_or(|x| x.check_rect(dst));
         match (src, dst) {
             (true, true) => Ok(()),
-            (true, false) => Err(Error::CropInvalid("Dest crop invalid".to_string())),
-            (false, true) => Err(Error::CropInvalid("Src crop invalid".to_string())),
-            (false, false) => Err(Error::CropInvalid("Dest and Src crop invalid".to_string())),
+            (true, false) => Err(Error::CropInvalid(format!(
+                "Dest crop invalid: {:?}",
+                self.dst_rect
+            ))),
+            (false, true) => Err(Error::CropInvalid(format!(
+                "Src crop invalid: {:?}",
+                self.src_rect
+            ))),
+            (false, false) => Err(Error::CropInvalid(format!(
+                "Dest and Src crop invalid: {:?} {:?}",
+                self.dst_rect, self.src_rect
+            ))),
         }
     }
 }
@@ -495,7 +519,7 @@ pub trait ImageConverterTrait {
 }
 
 pub struct ImageConverter {
-    pub cpu: CPUConverter,
+    pub cpu: Option<CPUConverter>,
 
     #[cfg(target_os = "linux")]
     pub g2d: Option<G2DConverter>,
@@ -510,37 +534,57 @@ unsafe impl Sync for ImageConverter {}
 impl ImageConverter {
     pub fn new() -> Result<Self> {
         #[cfg(target_os = "linux")]
-        let g2d = if !env::var("EDGEFIRST_DISABLE_G2D")
-            .is_ok_and(|x| x != "0" && x.to_lowercase() != "false")
+        let g2d = if let Ok(x) = env::var("EDGEFIRST_DISABLE_G2D")
+            && x != "0"
+            && x.to_lowercase() != "false"
         {
+            log::debug!("EDGEFIRST_DISABLE_G2D = {x}");
+            None
+        } else {
             match G2DConverter::new() {
                 Ok(g2d_converter) => Some(g2d_converter),
                 Err(err) => {
-                    log::debug!("Failed to initialize G2D converter: {err:?}");
+                    log::warn!("Failed to initialize G2D converter: {err:?}");
                     None
                 }
             }
-        } else {
-            None
         };
 
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
-        let opengl = if env::var("EDGEFIRST_DISABLE_GL")
-            .is_ok_and(|x| x != "0" && x.to_lowercase() != "false")
+        let opengl = if let Ok(x) = env::var("EDGEFIRST_DISABLE_GL")
+            && x != "0"
+            && x.to_lowercase() != "false"
         {
+            log::debug!("EDGEFIRST_DISABLE_GL = {x}");
             None
         } else {
             match GLConverterThreaded::new() {
                 Ok(gl_converter) => Some(gl_converter),
                 Err(err) => {
-                    log::debug!("Failed to initialize GL converter: {err:?}");
+                    log::warn!("Failed to initialize GL converter: {err:?}");
                     None
                 }
             }
         };
 
-        let cpu = CPUConverter::new()?;
+        #[cfg(target_os = "linux")]
+        #[cfg(feature = "opengl")]
+        let cpu = if let Ok(x) = env::var("EDGEFIRST_DISABLE_CPU")
+            && x != "0"
+            && x.to_lowercase() != "false"
+        {
+            log::debug!("EDGEFIRST_DISABLE_CPU = {x}");
+            None
+        } else {
+            match CPUConverter::new() {
+                Ok(cpu_converter) => Some(cpu_converter),
+                Err(err) => {
+                    log::warn!("Failed to initialize CPU converter: {err:?}");
+                    None
+                }
+            }
+        };
         Ok(Self {
             cpu,
             #[cfg(target_os = "linux")]
@@ -590,9 +634,19 @@ impl ImageConverterTrait for ImageConverter {
             }
         }
         log::debug!("image started with cpu in {:?}", start.elapsed());
-        self.cpu.convert(src, dst, rotation, flip, crop)?;
-        log::debug!("image converted with cpu in {:?}", start.elapsed());
-        Ok(())
+        if let Some(cpu) = self.cpu.as_mut() {
+            match cpu.convert(src, dst, rotation, flip, crop) {
+                Ok(_) => {
+                    log::debug!("image converted with cpu in {:?}", start.elapsed());
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::trace!("image didn't convert with cpu: {e:?}");
+                    return Err(e);
+                }
+            }
+        }
+        Err(Error::NoConverter)
     }
 }
 
