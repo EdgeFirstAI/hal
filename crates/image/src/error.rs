@@ -33,6 +33,7 @@ pub enum Error {
     OpenGl(String),
     Internal(String),
     CropInvalid(String),
+    NoConverter,
 }
 
 impl From<std::io::Error> for Error {

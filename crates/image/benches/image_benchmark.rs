@@ -506,6 +506,63 @@ where
     drop(gl_dst);
 }
 
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[divan::bench(types = [Person, Zidane], args = [(640, 640), (960, 960), (1280, 1280), (1920, 1920)], ignore = !dma_available())]
+fn resize_opengl_dma_letterbox<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
+where
+    IMAGE: TestImage,
+{
+    let (width, height) = size;
+    let name = format!("{}.jpg", IMAGE::filename());
+    let path = Path::new("testdata").join(&name);
+    let path = match path.exists() {
+        true => path,
+        false => {
+            let path = Path::new("../testdata").join(&name);
+            if path.exists() {
+                path
+            } else {
+                Path::new("../../testdata").join(&name)
+            }
+        }
+    };
+
+    assert!(path.exists(), "unable to locate test image at {path:?}");
+
+    let file = std::fs::read(path).unwrap();
+
+    let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
+    let mut gl_dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
+    let mut gl_converter = edgefirst_image::GLConverterThreaded::new().unwrap();
+
+    let scale = (width as f32 / src.width() as f32).min(height as f32 / src.height() as f32);
+    let new_width = ((src.width() as f32 * scale).round()) as usize;
+    let new_height = ((src.height() as f32 * scale).round()) as usize;
+
+    let top = (height - new_height) / 2;
+    let left = (width - new_width) / 2;
+
+    bencher.bench_local(|| {
+        use edgefirst_image::Rect;
+
+        gl_converter
+            .convert(
+                &src,
+                &mut gl_dst,
+                Rotation::None,
+                Flip::None,
+                Crop {
+                    src_rect: None,
+                    dst_rect: Some(Rect::new(left, top, new_width, new_height)),
+                    dst_color: Some([114, 114, 144, 255]),
+                },
+            )
+            .unwrap()
+    });
+    drop(gl_dst);
+}
+
 #[divan::bench(types = [Rotate0, Rotate90, Rotate180, Rotate270], args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
 fn rotate_cpu<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) {
     let (mut width, mut height) = params;
@@ -814,6 +871,62 @@ fn convert_opengl_yuyv_to_yuyv(bencher: divan::Bencher, params: (usize, usize)) 
             .unwrap()
     });
     drop(dst);
+}
+
+#[cfg(target_os = "linux")]
+#[divan::bench(types = [Person, Zidane], args = [(640, 640), (960, 960), (1280, 1280), (1920, 1920)], ignore = !dma_available())]
+fn resize_g2d_letterbox<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
+where
+    IMAGE: TestImage,
+{
+    let (width, height) = size;
+    let name = format!("{}.jpg", IMAGE::filename());
+    let path = Path::new("testdata").join(&name);
+    let path = match path.exists() {
+        true => path,
+        false => {
+            let path = Path::new("../testdata").join(&name);
+            if path.exists() {
+                path
+            } else {
+                Path::new("../../testdata").join(&name)
+            }
+        }
+    };
+
+    assert!(path.exists(), "unable to locate test image at {path:?}");
+
+    let file = std::fs::read(path).unwrap();
+
+    let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
+    let mut g2d_dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
+    let mut g2d_converter = edgefirst_image::G2DConverter::new().unwrap();
+
+    let scale = (width as f32 / src.width() as f32).min(height as f32 / src.height() as f32);
+    let new_width = ((src.width() as f32 * scale).round()) as usize;
+    let new_height = ((src.height() as f32 * scale).round()) as usize;
+
+    let top = (height - new_height) / 2;
+    let left = (width - new_width) / 2;
+
+    bencher.bench_local(|| {
+        use edgefirst_image::Rect;
+
+        g2d_converter
+            .convert(
+                &src,
+                &mut g2d_dst,
+                Rotation::None,
+                Flip::None,
+                Crop {
+                    src_rect: None,
+                    dst_rect: Some(Rect::new(left, top, new_width, new_height)),
+                    dst_color: Some([114, 114, 144, 255]),
+                },
+            )
+            .unwrap()
+    });
+    drop(g2d_dst);
 }
 
 #[cfg(target_os = "linux")]
