@@ -753,9 +753,12 @@ impl CPUConverter {
         pix: [u8; N],
         crop: Rect,
     ) -> Result<()> {
+        use rayon::{
+            iter::{IntoParallelRefMutIterator, ParallelIterator},
+            prelude::ParallelSliceMut,
+        };
         let mut map = dst.tensor.map()?;
         let s = map.as_mut_slice().as_chunks_mut::<N>().0;
-
         // calculate the top/bottom
         let top_offset = (0, (crop.top * dst.width() + crop.left));
         let bottom_offset = (
@@ -763,13 +766,19 @@ impl CPUConverter {
             s.len(),
         );
 
-        for p in &mut s[top_offset.0..top_offset.1] {
-            *p = pix;
-        }
+        s[top_offset.0..top_offset.1]
+            .par_iter_mut()
+            .for_each(|x| *x = pix);
+        // for p in &mut s[top_offset.0..top_offset.1] {
+        //     *p = pix;
+        // }
 
-        for p in &mut s[bottom_offset.0..bottom_offset.1] {
-            *p = pix;
-        }
+        s[bottom_offset.0..bottom_offset.1]
+            .par_iter_mut()
+            .for_each(|x| *x = pix);
+        // for p in &mut s[bottom_offset.0..bottom_offset.1] {
+        //     *p = pix;
+        // }
 
         if dst.width() == crop.width {
             return Ok(());
@@ -782,12 +791,21 @@ impl CPUConverter {
             ((crop.top + crop.height) * dst.width() + crop.left + crop.width).min(s.len()),
         );
 
-        let middle = s[middle_offset.0..middle_offset.1].chunks_exact_mut(dst.width());
-        for row in middle {
-            for p in &mut row[0..middle_stride] {
-                *p = pix;
-            }
-        }
+        s[middle_offset.0..middle_offset.1]
+            .par_chunks_exact_mut(dst.width())
+            .for_each(|row| {
+                for p in &mut row[0..middle_stride] {
+                    *p = pix;
+                }
+            });
+
+        // let middle =
+        // s[middle_offset.0..middle_offset.1].chunks_exact_mut(dst.width());
+        // for row in middle {
+        //     for p in &mut row[0..middle_stride] {
+        //         *p = pix;
+        //     }
+        // }
 
         Ok(())
     }
