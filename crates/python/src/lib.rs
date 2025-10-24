@@ -1,8 +1,28 @@
 use pyo3::prelude::*;
-
 pub mod decoder;
 pub mod image;
 pub mod tensor;
+
+pub struct FunctionTimer {
+    name: String,
+    start: std::time::Instant,
+}
+
+impl FunctionTimer {
+    pub fn new(name: String) -> Self {
+        Self {
+            name,
+            start: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for FunctionTimer {
+    fn drop(&mut self) {
+        log::trace!("{} elapsed: {:?}", self.name, self.start.elapsed())
+    }
+}
+
 #[pymodule]
 pub mod edgefirst_python {
     pub use super::*;
