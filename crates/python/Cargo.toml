@@ -17,6 +17,7 @@ default = ["extension-module"]
 python-abi38 = ["pyo3/abi3-py38"]
 python-abi311 = ["pyo3/abi3-py311"]
 extension-module = ["pyo3/extension-module"]
+nightly-f16 = []
 
 [dependencies]
 edgefirst = { version = "*", path = "../edgefirst" }

@@ -1,11 +1,18 @@
+use crate::{
+    FunctionTimer,
+    tensor::{PyTensorMap, TensorMapT},
+};
 use edgefirst::{
-    image::{self, Crop, Flip, ImageConverterTrait, RGBA, Rect, Rotation},
+    image::{self, Crop, Flip, ImageConverterTrait, RGBA, Rect, Rotation, TensorImage},
     tensor::{self, TensorMapTrait, TensorMemory, TensorTrait},
 };
 use four_char_code::FourCharCode;
+
 use ndarray::{
     ArrayView3, ArrayViewMut3, Zip,
-    parallel::prelude::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator},
+    parallel::prelude::{
+        IndexedParallelIterator, IntoParallelIterator, IntoParallelRefMutIterator, ParallelIterator,
+    },
 };
 use numpy::{PyArrayLike3, PyReadwriteArray3, PyUntypedArrayMethods};
 use pyo3::prelude::*;
@@ -14,12 +21,24 @@ use std::{
     sync::Mutex,
 };
 
-use crate::{
-    FunctionTimer,
-    tensor::{PyTensorMap, TensorMapT},
-};
-
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+// pub struct PyArrayF16_<'py> {
+//     pub arr: PyReadonlyArrayDyn<'py, half::f16>,
+// }
+
+// impl<'py> FromPyObject<'py> for PyArrayF16_<'py> {
+//     fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
+//         if let Ok(array) = ob.downcast::<PyArrayDyn<half::f16>>() {
+//             return Ok(Self {
+//                 arr: array.readonly(),
+//             });
+//         }
+//         Err(pyo3::exceptions::PyRuntimeError::new_err(
+//             "Could not parse array as f16 numpy array".to_string(),
+//         ))
+//     }
+// }
 
 #[derive(Debug)]
 pub enum Error {
@@ -226,7 +245,6 @@ impl PyTensorImage {
 
     #[pyo3(signature = (dst, normalization=Normalization::DEFAULT))]
     pub fn normalize_to_numpy(&self, dst: ImageDest3, normalization: Normalization) -> Result<()> {
-        use ndarray::parallel::prelude::IntoParallelRefMutIterator;
         let _timer = FunctionTimer::new("normalize_to_numpy".to_string());
 
         let tensor = &self.0;
@@ -267,236 +285,42 @@ impl PyTensorImage {
         }
 
         match dst {
-            ImageDest3::UInt8(mut dst) => {
-                if !matches!(normalization, Normalization::RAW | Normalization::DEFAULT) {
-                    return Err(Error::InvalidArg(
-                        "UInt8 destination only supports RAW normalization".to_string(),
-                    ));
-                }
-                let mut dst = dst.as_array_mut();
-                let map = tensor.tensor().map()?;
-                let data = map.as_slice();
-                let ndarray = ArrayView3::from_shape(shape, data)?;
-
-                if self.0.fourcc() == RGBA
-                    && dst_shape[2] == 3
-                    && let Some(dst) = dst.as_slice_mut()
-                {
-                    let dst = dst.as_chunks_mut::<3>().0;
-                    let src = data.as_chunks::<4>().0;
-                    dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-                        d[0] = s[0];
-                        d[1] = s[1];
-                        d[2] = s[2];
-                    });
-
-                    return Ok(());
-                }
-
-                Zip::from(dst)
-                    .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
-                    .into_par_iter()
-                    .for_each(|(x, y)| *x = *y)
-            }
-            ImageDest3::Int8(mut dst) => {
-                if !matches!(
-                    normalization,
-                    Normalization::SIGNED | Normalization::DEFAULT
-                ) {
-                    return Err(Error::InvalidArg(
-                        "Int8 destination only supports SIGNED normalization".to_string(),
-                    ));
-                }
-                let mut dst = dst.as_array_mut();
-                let map = tensor.tensor().map()?;
-                let data = map.as_slice();
-                let ndarray = ArrayView3::from_shape(shape, data)?;
-                if self.0.fourcc() == RGBA
-                    && dst_shape[2] == 3
-                    && let Some(dst) = dst.as_slice_mut()
-                {
-                    let dst = dst.as_chunks_mut::<3>().0;
-                    let src = data.as_chunks::<4>().0;
-                    dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-                        d[0] = (s[0] as i16 - 128) as i8;
-                        d[1] = (s[1] as i16 - 128) as i8;
-                        d[2] = (s[2] as i16 - 128) as i8;
-                    });
-                    return Ok(());
-                }
-
-                Zip::from(dst)
-                    .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
-                    .into_par_iter()
-                    .for_each(|(x, y)| *x = (*y as i16 - 128) as i8)
-            }
-            ImageDest3::Float16(mut dst) => {
-                let mut dst = dst.as_array_mut();
-                let map = tensor.tensor().map()?;
-                let data = map.as_slice();
-                let ndarray = ArrayView3::from_shape(shape, data)?;
-                if self.0.fourcc() == RGBA
-                    && dst_shape[2] == 3
-                    && let Some(dst) = dst.as_slice_mut()
-                {
-                    // let mut tmp = vec![0.0; dst.len()];
-                    // let tmp_ = tmp.as_chunks_mut::<3>().0;
-                    let dst = dst.as_chunks_mut::<3>().0;
-                    let src = data.as_chunks::<4>().0;
-                    match normalization {
-                        Normalization::SIGNED | Normalization::DEFAULT => {
-                            dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-                                d[0] = half::f16::from_f32(s[0] as f32 / 255.0 * 2.0 - 1.0);
-                                d[1] = half::f16::from_f32(s[1] as f32 / 255.0 * 2.0 - 1.0);
-                                d[2] = half::f16::from_f32(s[2] as f32 / 255.0 * 2.0 - 1.0);
-                            });
-                        }
-                        Normalization::UNSIGNED => {
-                            dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-                                d[0] = half::f16::from_f32(s[0] as f32 / 255.0);
-                                d[1] = half::f16::from_f32(s[1] as f32 / 255.0);
-                                d[2] = half::f16::from_f32(s[2] as f32 / 255.0);
-                            });
-                        }
-                        Normalization::RAW => {
-                            dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-                                d[0] = half::f16::from(s[0]);
-                                d[1] = half::f16::from(s[1]);
-                                d[2] = half::f16::from(s[2]);
-                            });
-                        }
-                    }
-
-                    return Ok(());
-                }
-
-                match normalization {
-                    Normalization::DEFAULT | Normalization::SIGNED => Zip::from(dst)
-                        .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
-                        .into_par_iter()
-                        .for_each(|(x, y)| *x = half::f16::from_f32(*y as f32 / 255.0 * 2.0 - 1.0)),
-
-                    Normalization::UNSIGNED => Zip::from(dst)
-                        .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
-                        .into_par_iter()
-                        .for_each(|(x, y)| *x = half::f16::from_f32(*y as f32 / 255.0)),
-
-                    Normalization::RAW => Zip::from(dst)
-                        .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
-                        .into_par_iter()
-                        .for_each(|(x, y)| *x = half::f16::from(*y)),
-                }
-            }
-            ImageDest3::Float32(mut dst) => {
-                let mut dst = dst.as_array_mut();
-                let map = tensor.tensor().map()?;
-                let data = map.as_slice();
-                let ndarray = ArrayView3::from_shape(shape, data)?;
-                if self.0.fourcc() == RGBA
-                    && dst_shape[2] == 3
-                    && let Some(dst) = dst.as_slice_mut()
-                {
-                    let dst = dst.as_chunks_mut::<3>().0;
-                    let src = data.as_chunks::<4>().0;
-                    match normalization {
-                        Normalization::SIGNED | Normalization::DEFAULT => {
-                            dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-                                d[0] = s[0] as f32 / 255.0 * 2.0 - 1.0;
-                                d[1] = s[1] as f32 / 255.0 * 2.0 - 1.0;
-                                d[2] = s[2] as f32 / 255.0 * 2.0 - 1.0;
-                            });
-                        }
-                        Normalization::UNSIGNED => {
-                            dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-                                d[0] = s[0] as f32 / 255.0;
-                                d[1] = s[1] as f32 / 255.0;
-                                d[2] = s[2] as f32 / 255.0;
-                            });
-                        }
-                        Normalization::RAW => {
-                            dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-                                d[0] = s[0] as f32;
-                                d[1] = s[1] as f32;
-                                d[2] = s[2] as f32;
-                            });
-                        }
-                    }
-                    return Ok(());
-                }
-
-                match normalization {
-                    Normalization::DEFAULT | Normalization::SIGNED => Zip::from(dst)
-                        .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
-                        .into_par_iter()
-                        .for_each(|(x, y)| *x = *y as f32 / 255.0 * 2.0 - 1.0),
-
-                    Normalization::UNSIGNED => Zip::from(dst)
-                        .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
-                        .into_par_iter()
-                        .for_each(|(x, y)| *x = *y as f32 / 255.0),
-
-                    Normalization::RAW => Zip::from(dst)
-                        .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
-                        .into_par_iter()
-                        .for_each(|(x, y)| *x = *y as f32),
-                }
-            }
-            ImageDest3::Float64(mut dst) => {
-                let mut dst = dst.as_array_mut();
-                let map = tensor.tensor().map()?;
-                let data = map.as_slice();
-                let ndarray = ArrayView3::from_shape(shape, data)?;
-                if self.0.fourcc() == RGBA
-                    && dst_shape[2] == 3
-                    && let Some(dst) = dst.as_slice_mut()
-                {
-                    let dst = dst.as_chunks_mut::<3>().0;
-                    let src = data.as_chunks::<4>().0;
-                    match normalization {
-                        Normalization::SIGNED | Normalization::DEFAULT => {
-                            dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-                                d[0] = s[0] as f64 / 255.0 * 2.0 - 1.0;
-                                d[1] = s[1] as f64 / 255.0 * 2.0 - 1.0;
-                                d[2] = s[2] as f64 / 255.0 * 2.0 - 1.0;
-                            });
-                        }
-                        Normalization::UNSIGNED => {
-                            dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-                                d[0] = s[0] as f64 / 255.0;
-                                d[1] = s[1] as f64 / 255.0;
-                                d[2] = s[2] as f64 / 255.0;
-                            });
-                        }
-                        Normalization::RAW => {
-                            dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-                                d[0] = s[0] as f64;
-                                d[1] = s[1] as f64;
-                                d[2] = s[2] as f64;
-                            });
-                        }
-                    }
-                    return Ok(());
-                }
-                match normalization {
-                    Normalization::DEFAULT | Normalization::SIGNED => Zip::from(dst)
-                        .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
-                        .into_par_iter()
-                        .for_each(|(x, y)| *x = *y as f64 / 255.0 * 2.0 - 1.0),
-
-                    Normalization::UNSIGNED => Zip::from(dst)
-                        .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
-                        .into_par_iter()
-                        .for_each(|(x, y)| *x = *y as f64 / 255.0),
-
-                    Normalization::RAW => Zip::from(dst)
-                        .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
-                        .into_par_iter()
-                        .for_each(|(x, y)| *x = *y as f64),
-                }
-            }
+            ImageDest3::UInt8(mut dst) => normalize_to_uint8(
+                &self.0,
+                shape,
+                &mut dst,
+                [dst_shape[0], dst_shape[1], dst_shape[2]],
+                normalization,
+            ),
+            ImageDest3::Int8(mut dst) => normalize_to_int8(
+                &self.0,
+                shape,
+                &mut dst,
+                [dst_shape[0], dst_shape[1], dst_shape[2]],
+                normalization,
+            ),
+            ImageDest3::Float16(mut dst) => normalize_to_float_16(
+                &self.0,
+                shape,
+                &mut dst,
+                [dst_shape[0], dst_shape[1], dst_shape[2]],
+                normalization,
+            ),
+            ImageDest3::Float32(mut dst) => normalize_to_float_32(
+                &self.0,
+                shape,
+                &mut dst,
+                [dst_shape[0], dst_shape[1], dst_shape[2]],
+                normalization,
+            ),
+            ImageDest3::Float64(mut dst) => normalize_to_float_64(
+                &self.0,
+                shape,
+                &mut dst,
+                [dst_shape[0], dst_shape[1], dst_shape[2]],
+                normalization,
+            ),
         }
-
-        Ok(())
     }
 
     pub fn copy_from_numpy(&mut self, src: PyArrayLike3<u8>) -> Result<()> {
@@ -543,6 +367,363 @@ impl PyTensorImage {
             mapped: Some(self.0.tensor().map().map(TensorMapT::TensorU8)?),
         })
     }
+}
+
+#[inline(always)]
+fn normalize_to_uint8<'py>(
+    tensor: &TensorImage,
+    shape: [usize; 3],
+    dst: &mut PyReadwriteArray3<'py, u8>,
+    dst_shape: [usize; 3],
+    normalization: Normalization,
+) -> Result<()> {
+    if !matches!(normalization, Normalization::RAW | Normalization::DEFAULT) {
+        return Err(Error::InvalidArg(
+            "UInt8 destination only supports RAW normalization".to_string(),
+        ));
+    }
+    let mut dst = dst.as_array_mut();
+    let map = tensor.tensor().map()?;
+    let data = map.as_slice();
+    let ndarray = ArrayView3::from_shape(shape, data)?;
+
+    if tensor.fourcc() == RGBA
+        && dst_shape[2] == 3
+        && let Some(dst) = dst.as_slice_mut()
+    {
+        let dst = dst.as_chunks_mut::<3>().0;
+        let src = data.as_chunks::<4>().0;
+        dst.par_iter_mut().zip(src).for_each(|(d, s)| {
+            d[0] = s[0];
+            d[1] = s[1];
+            d[2] = s[2];
+        });
+
+        return Ok(());
+    }
+
+    Zip::from(dst)
+        .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
+        .into_par_iter()
+        .for_each(|(x, y)| *x = *y);
+    Ok(())
+}
+
+#[inline(always)]
+fn normalize_to_int8<'py>(
+    tensor: &TensorImage,
+    shape: [usize; 3],
+    dst: &mut PyReadwriteArray3<'py, i8>,
+    dst_shape: [usize; 3],
+    normalization: Normalization,
+) -> Result<()> {
+    if !matches!(
+        normalization,
+        Normalization::SIGNED | Normalization::DEFAULT
+    ) {
+        return Err(Error::InvalidArg(
+            "Int8 destination only supports SIGNED normalization".to_string(),
+        ));
+    }
+    let mut dst = dst.as_array_mut();
+    let map = tensor.tensor().map()?;
+    let data = map.as_slice();
+    let ndarray = ArrayView3::from_shape(shape, data)?;
+    if tensor.fourcc() == RGBA
+        && dst_shape[2] == 3
+        && let Some(dst) = dst.as_slice_mut()
+    {
+        let dst = dst.as_chunks_mut::<3>().0;
+        let src = data.as_chunks::<4>().0;
+        dst.par_iter_mut().zip(src).for_each(|(d, s)| {
+            d[0] = (s[0] as i16 - 128) as i8;
+            d[1] = (s[1] as i16 - 128) as i8;
+            d[2] = (s[2] as i16 - 128) as i8;
+        });
+        return Ok(());
+    }
+
+    Zip::from(dst)
+        .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
+        .into_par_iter()
+        .for_each(|(x, y)| *x = (*y as i16 - 128) as i8);
+    Ok(())
+}
+
+#[inline(always)]
+#[cfg(feature = "nightly-f16")]
+fn normalize_to_float_16<'py>(
+    tensor: &TensorImage,
+    shape: [usize; 3],
+    dst: &mut PyReadwriteArray3<'py, half::f16>,
+    dst_shape: [usize; 3],
+    normalization: Normalization,
+) -> Result<()> {
+    let dst: ArrayViewMut3<half::f16> = dst.as_array_mut();
+    // this is safe because half::f16 has the same representation as f16
+    let mut dst: ArrayViewMut3<f16> = unsafe { std::mem::transmute(dst) };
+
+    let map = tensor.tensor().map()?;
+    let data = map.as_slice();
+    let ndarray = ArrayView3::from_shape(shape, data)?;
+    if tensor.fourcc() == RGBA
+        && dst_shape[2] == 3
+        && let Some(dst) = dst.as_slice_mut()
+    {
+        let dst = dst.as_chunks_mut::<3>().0;
+        let src = data.as_chunks::<4>().0;
+
+        match normalization {
+            Normalization::SIGNED | Normalization::DEFAULT => {
+                dst.par_iter_mut().zip(src).for_each(|(d, s)| {
+                    d[0] = (s[0] as f32 / 255.0 * 2.0 - 1.0) as f16;
+                    d[1] = (s[1] as f32 / 255.0 * 2.0 - 1.0) as f16;
+                    d[2] = (s[2] as f32 / 255.0 * 2.0 - 1.0) as f16;
+                });
+            }
+            Normalization::UNSIGNED => {
+                dst.par_iter_mut().zip(src).for_each(|(d, s)| {
+                    d[0] = (s[0] as f32 / 255.0) as f16;
+                    d[1] = (s[1] as f32 / 255.0) as f16;
+                    d[2] = (s[2] as f32 / 255.0) as f16;
+                });
+            }
+            Normalization::RAW => {
+                dst.par_iter_mut().zip(src).for_each(|(d, s)| {
+                    d[0] = (s[0] as f32) as f16;
+                    d[1] = (s[1] as f32) as f16;
+                    d[2] = (s[2] as f32) as f16;
+                });
+            }
+        }
+
+        return Ok(());
+    }
+
+    match normalization {
+        Normalization::DEFAULT | Normalization::SIGNED => Zip::from(dst)
+            .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
+            .into_par_iter()
+            .for_each(|(x, y)| *x = (*y as f32 / 255.0 * 2.0 - 1.0) as f16),
+
+        Normalization::UNSIGNED => Zip::from(dst)
+            .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
+            .into_par_iter()
+            .for_each(|(x, y)| *x = (*y as f32 / 255.0) as f16),
+
+        Normalization::RAW => Zip::from(dst)
+            .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
+            .into_par_iter()
+            .for_each(|(x, y)| *x = (*y) as f16),
+    }
+    Ok(())
+}
+
+#[inline(always)]
+#[cfg(not(feature = "nightly-f16"))]
+fn normalize_to_float_16<'py>(
+    tensor: &TensorImage,
+    shape: [usize; 3],
+    dst: &mut PyReadwriteArray3<'py, half::f16>,
+    dst_shape: [usize; 3],
+    normalization: Normalization,
+) -> Result<()> {
+    use half::slice::HalfFloatSliceExt;
+    let mut dst: ArrayViewMut3<half::f16> = dst.as_array_mut();
+    let map = tensor.tensor().map()?;
+    let data = map.as_slice();
+    let ndarray = ArrayView3::from_shape(shape, data)?;
+    if tensor.fourcc() == RGBA
+        && dst_shape[2] == 3
+        && let Some(dst) = dst.as_slice_mut()
+    {
+        let mut tmp = vec![0.0; dst.len()];
+        let tmp_ = tmp.as_chunks_mut::<3>().0;
+        let src = data.as_chunks::<4>().0;
+
+        match normalization {
+            Normalization::SIGNED | Normalization::DEFAULT => {
+                tmp_.par_iter_mut().zip(src).for_each(|(d, s)| {
+                    d[0] = s[0] as f32 / 255.0 * 2.0 - 1.0;
+                    d[1] = s[1] as f32 / 255.0 * 2.0 - 1.0;
+                    d[2] = s[2] as f32 / 255.0 * 2.0 - 1.0;
+                });
+            }
+            Normalization::UNSIGNED => {
+                tmp_.par_iter_mut().zip(src).for_each(|(d, s)| {
+                    d[0] = s[0] as f32 / 255.0;
+                    d[1] = s[1] as f32 / 255.0;
+                    d[2] = s[2] as f32 / 255.0;
+                });
+            }
+            Normalization::RAW => {
+                tmp_.par_iter_mut().zip(src).for_each(|(d, s)| {
+                    d[0] = s[0] as f32;
+                    d[1] = s[1] as f32;
+                    d[2] = s[2] as f32;
+                });
+            }
+        }
+        // split into chunks of 256
+        let dst = dst.as_chunks_mut::<256>();
+        let tmp_ = tmp.as_chunks_mut::<256>();
+        dst.0.par_iter_mut().zip(tmp_.0).for_each(|(d, s)| {
+            d.convert_from_f32_slice(s);
+        });
+        dst.1.convert_from_f32_slice(tmp_.1);
+    }
+    match normalization {
+        Normalization::SIGNED | Normalization::DEFAULT => {
+            Zip::from(dst)
+                .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
+                .into_par_iter()
+                .for_each(|(d, s)| {
+                    *d = half::f16::from_f32(*s as f32 / 255.0 * 2.0 - 1.0);
+                });
+        }
+        Normalization::UNSIGNED => {
+            Zip::from(dst)
+                .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
+                .into_par_iter()
+                .for_each(|(d, s)| {
+                    *d = half::f16::from_f32(*s as f32 / 255.0);
+                });
+        }
+        Normalization::RAW => {
+            Zip::from(dst)
+                .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
+                .into_par_iter()
+                .for_each(|(d, s)| {
+                    *d = half::f16::from(*s);
+                });
+        }
+    }
+
+    Ok(())
+}
+
+#[inline(always)]
+fn normalize_to_float_32<'py>(
+    tensor: &TensorImage,
+    shape: [usize; 3],
+    dst: &mut PyReadwriteArray3<'py, f32>,
+    dst_shape: [usize; 3],
+    normalization: Normalization,
+) -> Result<()> {
+    let mut dst = dst.as_array_mut();
+    let map = tensor.tensor().map()?;
+    let data = map.as_slice();
+    let ndarray = ArrayView3::from_shape(shape, data)?;
+    if tensor.fourcc() == RGBA
+        && dst_shape[2] == 3
+        && let Some(dst) = dst.as_slice_mut()
+    {
+        let dst = dst.as_chunks_mut::<3>().0;
+        let src = data.as_chunks::<4>().0;
+        match normalization {
+            Normalization::SIGNED | Normalization::DEFAULT => {
+                dst.par_iter_mut().zip(src).for_each(|(d, s)| {
+                    d[0] = s[0] as f32 / 255.0 * 2.0 - 1.0;
+                    d[1] = s[1] as f32 / 255.0 * 2.0 - 1.0;
+                    d[2] = s[2] as f32 / 255.0 * 2.0 - 1.0;
+                });
+            }
+            Normalization::UNSIGNED => {
+                dst.par_iter_mut().zip(src).for_each(|(d, s)| {
+                    d[0] = s[0] as f32 / 255.0;
+                    d[1] = s[1] as f32 / 255.0;
+                    d[2] = s[2] as f32 / 255.0;
+                });
+            }
+            Normalization::RAW => {
+                dst.par_iter_mut().zip(src).for_each(|(d, s)| {
+                    d[0] = s[0] as f32;
+                    d[1] = s[1] as f32;
+                    d[2] = s[2] as f32;
+                });
+            }
+        }
+        return Ok(());
+    }
+    match normalization {
+        Normalization::DEFAULT | Normalization::SIGNED => Zip::from(dst)
+            .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
+            .into_par_iter()
+            .for_each(|(x, y)| *x = *y as f32 / 255.0 * 2.0 - 1.0),
+
+        Normalization::UNSIGNED => Zip::from(dst)
+            .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
+            .into_par_iter()
+            .for_each(|(x, y)| *x = *y as f32 / 255.0),
+
+        Normalization::RAW => Zip::from(dst)
+            .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
+            .into_par_iter()
+            .for_each(|(x, y)| *x = *y as f32),
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn normalize_to_float_64<'py>(
+    tensor: &TensorImage,
+    shape: [usize; 3],
+    dst: &mut PyReadwriteArray3<'py, f64>,
+    dst_shape: [usize; 3],
+    normalization: Normalization,
+) -> Result<()> {
+    let mut dst = dst.as_array_mut();
+    let map = tensor.tensor().map()?;
+    let data = map.as_slice();
+    let ndarray = ArrayView3::from_shape(shape, data)?;
+    if tensor.fourcc() == RGBA
+        && dst_shape[2] == 3
+        && let Some(dst) = dst.as_slice_mut()
+    {
+        let dst = dst.as_chunks_mut::<3>().0;
+        let src = data.as_chunks::<4>().0;
+        match normalization {
+            Normalization::SIGNED | Normalization::DEFAULT => {
+                dst.par_iter_mut().zip(src).for_each(|(d, s)| {
+                    d[0] = s[0] as f64 / 255.0 * 2.0 - 1.0;
+                    d[1] = s[1] as f64 / 255.0 * 2.0 - 1.0;
+                    d[2] = s[2] as f64 / 255.0 * 2.0 - 1.0;
+                });
+            }
+            Normalization::UNSIGNED => {
+                dst.par_iter_mut().zip(src).for_each(|(d, s)| {
+                    d[0] = s[0] as f64 / 255.0;
+                    d[1] = s[1] as f64 / 255.0;
+                    d[2] = s[2] as f64 / 255.0;
+                });
+            }
+            Normalization::RAW => {
+                dst.par_iter_mut().zip(src).for_each(|(d, s)| {
+                    d[0] = s[0] as f64;
+                    d[1] = s[1] as f64;
+                    d[2] = s[2] as f64;
+                });
+            }
+        }
+        return Ok(());
+    }
+    match normalization {
+        Normalization::DEFAULT | Normalization::SIGNED => Zip::from(dst)
+            .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
+            .into_par_iter()
+            .for_each(|(x, y)| *x = *y as f64 / 255.0 * 2.0 - 1.0),
+
+        Normalization::UNSIGNED => Zip::from(dst)
+            .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
+            .into_par_iter()
+            .for_each(|(x, y)| *x = *y as f64 / 255.0),
+
+        Normalization::RAW => Zip::from(dst)
+            .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
+            .into_par_iter()
+            .for_each(|(x, y)| *x = *y as f64),
+    }
+    Ok(())
 }
 
 #[pyclass(name = "ImageConverter")]
