@@ -211,7 +211,7 @@ impl DecoderBuilder {
         self
     }
 
-    pub fn with_config_yolo_setdet(
+    pub fn with_config_yolo_segdet(
         mut self,
         boxes: configs::Boxes,
         protos: configs::Segmentation,
