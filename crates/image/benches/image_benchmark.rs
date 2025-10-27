@@ -215,8 +215,8 @@ where
     assert!(path.exists(), "unable to locate test image at {path:?}");
 
     let file = std::fs::read(path).unwrap();
-    let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
-    let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
+    let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Mem)).unwrap();
+    let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Mem)).unwrap();
 
     let mut converter = CPUConverter::new().unwrap();
 
