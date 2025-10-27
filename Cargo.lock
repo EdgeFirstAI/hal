@@ -509,6 +509,7 @@ dependencies = [
  "libloading",
  "log",
  "ndarray 0.16.1",
+ "rayon",
  "tokio",
  "yuv",
  "zune-jpeg",
