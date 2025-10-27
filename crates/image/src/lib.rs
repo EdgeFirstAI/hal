@@ -606,11 +606,13 @@ impl ImageConverterTrait for ImageConverter {
         crop: Crop,
     ) -> Result<()> {
         let start = Instant::now();
+
         #[cfg(target_os = "linux")]
         if let Some(g2d) = self.g2d.as_mut() {
+            log::trace!("image started with g2d in {:?}", start.elapsed());
             match g2d.convert(src, dst, rotation, flip, crop) {
                 Ok(_) => {
-                    log::debug!("image converted with g2d in {:?}", start.elapsed());
+                    log::trace!("image converted with g2d in {:?}", start.elapsed());
                     return Ok(());
                 }
                 Err(e) => {
@@ -619,13 +621,42 @@ impl ImageConverterTrait for ImageConverter {
             }
         }
 
+        // if the image is just a copy without an resizing, the send it to the CPU and
+        // skip OpenGL
+        let src_shape = match crop.src_rect {
+            Some(s) => (s.width, s.height),
+            None => (src.width(), src.height()),
+        };
+        let dst_shape = match crop.dst_rect {
+            Some(d) => (d.width, d.height),
+            None => (dst.width(), dst.height()),
+        };
+
+        // TODO: Check if still use CPU when rotation or flip is enabled
+        if src_shape == dst_shape
+            && flip == Flip::None
+            && rotation == Rotation::None
+            && let Some(cpu) = self.cpu.as_mut()
+        {
+            match cpu.convert(src, dst, rotation, flip, crop) {
+                Ok(_) => {
+                    log::trace!("image converted with cpu in {:?}", start.elapsed());
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::trace!("image didn't convert with cpu: {e:?}");
+                    return Err(e);
+                }
+            }
+        }
+
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
         if let Some(opengl) = self.opengl.as_mut() {
-            log::debug!("image started with opengl in {:?}", start.elapsed());
+            log::trace!("image started with opengl in {:?}", start.elapsed());
             match opengl.convert(src, dst, rotation, flip, crop) {
                 Ok(_) => {
-                    log::debug!("image converted with opengl in {:?}", start.elapsed());
+                    log::trace!("image converted with opengl in {:?}", start.elapsed());
                     return Ok(());
                 }
                 Err(e) => {
@@ -633,11 +664,11 @@ impl ImageConverterTrait for ImageConverter {
                 }
             }
         }
-        log::debug!("image started with cpu in {:?}", start.elapsed());
+        log::trace!("image started with cpu in {:?}", start.elapsed());
         if let Some(cpu) = self.cpu.as_mut() {
             match cpu.convert(src, dst, rotation, flip, crop) {
                 Ok(_) => {
-                    log::debug!("image converted with cpu in {:?}", start.elapsed());
+                    log::trace!("image converted with cpu in {:?}", start.elapsed());
                     return Ok(());
                 }
                 Err(e) => {
