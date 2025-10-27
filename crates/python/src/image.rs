@@ -476,9 +476,9 @@ fn normalize_to_float_16<'py>(
         match normalization {
             Normalization::SIGNED | Normalization::DEFAULT => {
                 dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-                    d[0] = (s[0] as f32 / 255.0 * 2.0 - 1.0) as f16;
-                    d[1] = (s[1] as f32 / 255.0 * 2.0 - 1.0) as f16;
-                    d[2] = (s[2] as f32 / 255.0 * 2.0 - 1.0) as f16;
+                    d[0] = (s[0] as f32 / 127.5 - 1.0) as f16;
+                    d[1] = (s[1] as f32 / 127.5 - 1.0) as f16;
+                    d[2] = (s[2] as f32 / 127.5 - 1.0) as f16;
                 });
             }
             Normalization::UNSIGNED => {
@@ -504,7 +504,7 @@ fn normalize_to_float_16<'py>(
         Normalization::DEFAULT | Normalization::SIGNED => Zip::from(dst)
             .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
             .into_par_iter()
-            .for_each(|(x, y)| *x = (*y as f32 / 255.0 * 2.0 - 1.0) as f16),
+            .for_each(|(x, y)| *x = (*y as f32 / 127.5 - 1.0) as f16),
 
         Normalization::UNSIGNED => Zip::from(dst)
             .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
@@ -544,9 +544,9 @@ fn normalize_to_float_16<'py>(
         match normalization {
             Normalization::SIGNED | Normalization::DEFAULT => {
                 tmp_.par_iter_mut().zip(src).for_each(|(d, s)| {
-                    d[0] = s[0] as f32 / 255.0 * 2.0 - 1.0;
-                    d[1] = s[1] as f32 / 255.0 * 2.0 - 1.0;
-                    d[2] = s[2] as f32 / 255.0 * 2.0 - 1.0;
+                    d[0] = s[0] as f32 / 127.5 - 1.0;
+                    d[1] = s[1] as f32 / 127.5 - 1.0;
+                    d[2] = s[2] as f32 / 127.5 - 1.0;
                 });
             }
             Normalization::UNSIGNED => {
@@ -578,7 +578,7 @@ fn normalize_to_float_16<'py>(
                 .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
                 .into_par_iter()
                 .for_each(|(d, s)| {
-                    *d = half::f16::from_f32(*s as f32 / 255.0 * 2.0 - 1.0);
+                    *d = half::f16::from_f32(*s as f32 / 127.5 - 1.0);
                 });
         }
         Normalization::UNSIGNED => {
@@ -623,9 +623,9 @@ fn normalize_to_float_32<'py>(
         match normalization {
             Normalization::SIGNED | Normalization::DEFAULT => {
                 dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-                    d[0] = s[0] as f32 / 255.0 * 2.0 - 1.0;
-                    d[1] = s[1] as f32 / 255.0 * 2.0 - 1.0;
-                    d[2] = s[2] as f32 / 255.0 * 2.0 - 1.0;
+                    d[0] = s[0] as f32 / 127.5 - 1.0;
+                    d[1] = s[1] as f32 / 127.5 - 1.0;
+                    d[2] = s[2] as f32 / 127.5 - 1.0;
                 });
             }
             Normalization::UNSIGNED => {
@@ -649,7 +649,7 @@ fn normalize_to_float_32<'py>(
         Normalization::DEFAULT | Normalization::SIGNED => Zip::from(dst)
             .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
             .into_par_iter()
-            .for_each(|(x, y)| *x = *y as f32 / 255.0 * 2.0 - 1.0),
+            .for_each(|(x, y)| *x = *y as f32 / 127.5 - 1.0),
 
         Normalization::UNSIGNED => Zip::from(dst)
             .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
@@ -685,9 +685,9 @@ fn normalize_to_float_64<'py>(
         match normalization {
             Normalization::SIGNED | Normalization::DEFAULT => {
                 dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-                    d[0] = s[0] as f64 / 255.0 * 2.0 - 1.0;
-                    d[1] = s[1] as f64 / 255.0 * 2.0 - 1.0;
-                    d[2] = s[2] as f64 / 255.0 * 2.0 - 1.0;
+                    d[0] = s[0] as f64 / 127.5 - 1.0;
+                    d[1] = s[1] as f64 / 127.5 - 1.0;
+                    d[2] = s[2] as f64 / 127.5 - 1.0;
                 });
             }
             Normalization::UNSIGNED => {
@@ -711,7 +711,7 @@ fn normalize_to_float_64<'py>(
         Normalization::DEFAULT | Normalization::SIGNED => Zip::from(dst)
             .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
             .into_par_iter()
-            .for_each(|(x, y)| *x = *y as f64 / 255.0 * 2.0 - 1.0),
+            .for_each(|(x, y)| *x = *y as f64 / 127.5 - 1.0),
 
         Normalization::UNSIGNED => Zip::from(dst)
             .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
