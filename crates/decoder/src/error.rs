@@ -12,6 +12,7 @@ pub enum Error {
     Json(serde_json::Error),
     NoConfig,
     InvalidConfig(String),
+    NDArrayShape(ndarray::ShapeError),
 }
 
 impl fmt::Display for Error {
@@ -37,5 +38,11 @@ impl From<serde_yaml::Error> for Error {
 impl From<serde_json::Error> for Error {
     fn from(err: serde_json::Error) -> Self {
         Error::Json(err)
+    }
+}
+
+impl From<ndarray::ShapeError> for Error {
+    fn from(err: ndarray::ShapeError) -> Self {
+        Error::NDArrayShape(err)
     }
 }
