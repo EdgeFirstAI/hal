@@ -1,3 +1,5 @@
+#![cfg_attr(feature = "nightly-f16", feature(f16))]
+
 use pyo3::prelude::*;
 pub mod decoder;
 pub mod image;
