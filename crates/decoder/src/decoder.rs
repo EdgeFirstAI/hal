@@ -276,13 +276,13 @@ impl DecoderBuilder {
 
     pub fn with_config_yolo_segdet(
         mut self,
-        boxes: configs::Boxes,
-        protos: configs::Segmentation,
+        boxes: configs::Segmentation,
+        protos: configs::Protos,
     ) -> Self {
         let config = ConfigOutputs {
             outputs: vec![
-                ConfigOutput::Boxes(boxes),
-                ConfigOutput::Segmentation(protos),
+                ConfigOutput::Segmentation(boxes),
+                ConfigOutput::Protos(protos),
             ],
         };
         self.config_src.replace(ConfigSource::Config(config));
