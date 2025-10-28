@@ -86,7 +86,6 @@ pub mod configs {
 
     #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
     pub struct Segmentation {
-        pub decode: bool,
         pub decoder: DecoderType,
         pub quantization: Option<(f64, i64)>,
         pub shape: Vec<usize>,
@@ -114,7 +113,6 @@ pub mod configs {
 
     #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
     pub struct Mask {
-        pub decode: bool,
         pub decoder: DecoderType,
         pub quantization: Option<(f64, i64)>,
         pub shape: Vec<usize>,
