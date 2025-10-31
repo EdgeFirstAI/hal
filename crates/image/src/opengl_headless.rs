@@ -1006,6 +1006,7 @@ impl GLConverterST {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_camera_texture_to_rgb_planar(
         &self,
         texture: &Texture,
@@ -1018,6 +1019,15 @@ impl GLConverterST {
     ) -> Result<(), Error> {
         log::info!("draw_camera_texture_to_rgb_planar");
         let texture_target = gls::gl::TEXTURE_2D;
+        match flip {
+            Flip::None => {}
+            Flip::Vertical => {
+                std::mem::swap(&mut dst_roi.top, &mut dst_roi.bottom);
+            }
+            Flip::Horizontal => {
+                std::mem::swap(&mut dst_roi.left, &mut dst_roi.right);
+            }
+        }
         unsafe {
             self.texture_program_planar
                 .load_uniform_1f(c"width", width as f32);
@@ -1034,26 +1044,42 @@ impl GLConverterST {
                 gls::gl::TEXTURE_MAG_FILTER,
                 gls::gl::LINEAR as i32,
             );
-            gls::egl_image_target_texture_2d_oes(texture_target, egl_img.egl_image.as_ptr());
+            // TODO: This segfaults on exit despite the EVK supposedly supporting the
+            // GL_EXT_texture_border_clamp extension. Adjust shader to handle it instead?
+
+            //  gls::gl::TexParameteri(
+            //     texture_target,
+            //     gls::gl::TEXTURE_WRAP_S,
+            //     gls::gl::CLAMP_TO_BORDER as i32,
+            // );
+
+            // gls::gl::TexParameteri(
+            //     texture_target,
+            //     gls::gl::TEXTURE_WRAP_T,
+            //     gls::gl::CLAMP_TO_BORDER as i32,
+            // );
             check_gl_error(function!(), line!())?;
 
+            gls::egl_image_target_texture_2d_oes(texture_target, egl_img.egl_image.as_ptr());
+            check_gl_error(function!(), line!())?;
+            let y_centers = [-2.0 / 3.0, 0.0, 2.0 / 3.0];
             // starts from bottom
-            for i in 0..3 {
+            for (i, y_center) in y_centers.iter().enumerate() {
                 gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
                 gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
                 let camera_vertices: [f32; 12] = [
-                    -1.,
-                    -1. + i as f32 * 2. / 3.,
-                    0.,
-                    1.,
-                    -1. + i as f32 * 2. / 3.,
-                    0.,
-                    1.,
-                    -1. / 3. + i as f32 * 2. / 3.,
-                    0.,
-                    -1.,
-                    -1. / 3. + i as f32 * 2. / 3.,
-                    0.,
+                    dst_roi.left,
+                    dst_roi.top / 3.0 + y_center,
+                    0., // left top
+                    dst_roi.right,
+                    dst_roi.top / 3.0 + y_center,
+                    0., // right top
+                    dst_roi.right,
+                    dst_roi.bottom / 3.0 + y_center,
+                    0., // right bottom
+                    dst_roi.left,
+                    dst_roi.bottom / 3.0 + y_center,
+                    0., // left bottom
                 ];
                 log::info!("camera_vertices: {camera_vertices:?}");
                 gls::gl::BufferData(
@@ -1065,18 +1091,34 @@ impl GLConverterST {
 
                 gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
                 gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
-                let texture_vertices: [f32; 8] = [0., 1., 1., 1., 1., 0., 0., 0.];
+                let texture_vertices: [f32; 16] = [
+                    src_roi.left,
+                    src_roi.top,
+                    src_roi.right,
+                    src_roi.top,
+                    src_roi.right,
+                    src_roi.bottom,
+                    src_roi.left,
+                    src_roi.bottom,
+                    src_roi.left,
+                    src_roi.top,
+                    src_roi.right,
+                    src_roi.top,
+                    src_roi.right,
+                    src_roi.bottom,
+                    src_roi.left,
+                    src_roi.bottom,
+                ];
 
-                gls::gl::BufferSubData(
+                gls::gl::BufferData(
                     gls::gl::ARRAY_BUFFER,
-                    0,
                     (size_of::<f32>() * 8) as isize,
-                    texture_vertices.as_ptr() as *const c_void,
+                    (texture_vertices[(rotation_offset * 2)..]).as_ptr() as *const c_void,
+                    gls::gl::DYNAMIC_DRAW,
                 );
-
                 let vertices_index: [u32; 4] = [0, 1, 2, 3];
                 self.texture_program_planar
-                    .load_uniform_1i(c"color_index", 2 - i);
+                    .load_uniform_1i(c"color_index", 2 - i as i32);
                 gls::gl::DrawElements(
                     gls::gl::TRIANGLE_FAN,
                     vertices_index.len() as i32,
@@ -1831,6 +1873,7 @@ precision mediump float;
 uniform sampler2D tex;
 uniform float width;
 uniform int color_index;
+uniform float bg_color;
 in vec3 fragPos;
 in vec2 tc;
 
@@ -1841,7 +1884,7 @@ void main(){
     float g = texture(tex, vec2(tc[0] + 0.0/width, tc[1]))[color_index];
     float b = texture(tex, vec2(tc[0] + 1.0/width, tc[1]))[color_index];
     float a = texture(tex, vec2(tc[0] + 2.0/width, tc[1]))[color_index];
- 
+    
     color = vec4(r, g, b, a);
 }
 "
