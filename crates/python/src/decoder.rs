@@ -1,8 +1,7 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 use edgefirst::decoder::{
-    Decoder, DecoderBuilder, DetectBox, Quantization, QuantizationF64, Segmentation,
-    dequantize_cpu_chunked, dequantize_cpu_chunked_f64, modelpack::ModelPackDetectionConfig,
-    segmentation_to_mask,
+    Decoder, DecoderBuilder, DetectBox, Quantization, Segmentation, dequantize_cpu_chunked,
+    dequantize_cpu_chunked_f64, modelpack::ModelPackDetectionConfig, segmentation_to_mask,
 };
 // use half::f16;
 use ndarray::{Array1, Array2};
@@ -247,11 +246,11 @@ impl PyDecoder {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (boxes, quant_boxes=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
+    #[pyo3(signature = (boxes, quant_boxes=(1.0, 0, false), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
     pub fn decode_yolo<'py>(
         py: Python<'py>,
         boxes: ReadOnlyArrayGeneric2,
-        quant_boxes: (f64, i64),
+        quant_boxes: (f64, i64, bool),
         score_threshold: f64,
         iou_threshold: f64,
         max_boxes: usize,
@@ -259,19 +258,13 @@ impl PyDecoder {
         let mut output_boxes = Vec::with_capacity(max_boxes);
         match boxes {
             ReadOnlyArrayGeneric2::UInt8(output) => edgefirst::decoder::yolo::decode_yolo_u8(
-                (
-                    output.as_array(),
-                    Quantization::try_from((quant_boxes.0, quant_boxes.1))?,
-                ),
+                (output.as_array(), Quantization::from(quant_boxes)),
                 score_threshold as f32,
                 iou_threshold as f32,
                 &mut output_boxes,
             ),
             ReadOnlyArrayGeneric2::Int8(output) => edgefirst::decoder::yolo::decode_yolo_i8(
-                (
-                    output.as_array(),
-                    Quantization::try_from((quant_boxes.0, quant_boxes.1))?,
-                ),
+                (output.as_array(), Quantization::from(quant_boxes)),
                 score_threshold as f32,
                 iou_threshold as f32,
                 &mut output_boxes,
@@ -295,13 +288,13 @@ impl PyDecoder {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (boxes, protos, quant_boxes=(1.0, 0), quant_protos=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
+    #[pyo3(signature = (boxes, protos, quant_boxes=(1.0, 0, false), quant_protos=(1.0, 0, false), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
     pub fn decode_yolo_segdet<'py>(
         py: Python<'py>,
         boxes: ReadOnlyArrayGeneric2,
         protos: ReadOnlyArrayGeneric3,
-        quant_boxes: (f64, i64),
-        quant_protos: (f64, i64),
+        quant_boxes: (f64, i64, bool),
+        quant_protos: (f64, i64, bool),
         score_threshold: f64,
         iou_threshold: f64,
         max_boxes: usize,
@@ -312,8 +305,8 @@ impl PyDecoder {
         match (boxes, protos) {
             (ReadOnlyArrayGeneric2::UInt8(boxes), ReadOnlyArrayGeneric3::UInt8(protos)) => {
                 edgefirst::decoder::yolo::decode_yolo_segdet_u8(
-                    (boxes.as_array(), Quantization::try_from(quant_boxes)?),
-                    (protos.as_array(), Quantization::try_from(quant_protos)?),
+                    (boxes.as_array(), Quantization::from(quant_boxes)),
+                    (protos.as_array(), Quantization::from(quant_protos)),
                     score_threshold as f32,
                     iou_threshold as f32,
                     &mut output_boxes,
@@ -322,8 +315,8 @@ impl PyDecoder {
             }
             (ReadOnlyArrayGeneric2::Int8(boxes), ReadOnlyArrayGeneric3::Int8(protos)) => {
                 edgefirst::decoder::yolo::decode_yolo_segdet_i8(
-                    (boxes.as_array(), Quantization::try_from(quant_boxes)?),
-                    (protos.as_array(), Quantization::try_from(quant_protos)?),
+                    (boxes.as_array(), Quantization::from(quant_boxes)),
+                    (protos.as_array(), Quantization::from(quant_protos)),
                     score_threshold as f32,
                     iou_threshold as f32,
                     &mut output_boxes,
@@ -363,13 +356,13 @@ impl PyDecoder {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (boxes, scores, quant_boxes=(1.0, 0), quant_scores=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
+    #[pyo3(signature = (boxes, scores, quant_boxes=(1.0, 0, false), quant_scores=(1.0, 0, false), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
     pub fn decode_modelpack_det<'py>(
         py: Python<'py>,
         boxes: ReadOnlyArrayGeneric2,
         scores: ReadOnlyArrayGeneric2,
-        quant_boxes: (f64, i64),
-        quant_scores: (f64, i64),
+        quant_boxes: (f64, i64, bool),
+        quant_scores: (f64, i64, bool),
         score_threshold: f64,
         iou_threshold: f64,
         max_boxes: usize,
@@ -380,8 +373,8 @@ impl PyDecoder {
             (ReadOnlyArrayGeneric2::UInt8(boxes), ReadOnlyArrayGeneric2::UInt8(scores)) => {
                 let (boxes, scores) = (boxes.as_array(), scores.as_array());
                 edgefirst::decoder::modelpack::decode_modelpack_u8(
-                    (boxes.view(), Quantization::try_from(quant_boxes)?),
-                    (scores.view(), Quantization::try_from(quant_scores)?),
+                    (boxes.view(), Quantization::from(quant_boxes)),
+                    (scores.view(), Quantization::from(quant_scores)),
                     score_threshold as f32,
                     iou_threshold as f32,
                     &mut output_boxes,
@@ -390,8 +383,8 @@ impl PyDecoder {
             (ReadOnlyArrayGeneric2::Int8(boxes), ReadOnlyArrayGeneric2::Int8(scores)) => {
                 let (boxes, scores) = (boxes.as_array(), scores.as_array());
                 edgefirst::decoder::modelpack::decode_modelpack_i8(
-                    (boxes.view(), Quantization::try_from(quant_boxes)?),
-                    (scores.view(), Quantization::try_from(quant_scores)?),
+                    (boxes.view(), Quantization::from(quant_boxes)),
+                    (scores.view(), Quantization::from(quant_scores)),
                     score_threshold as f32,
                     iou_threshold as f32,
                     &mut output_boxes,
@@ -433,7 +426,7 @@ impl PyDecoder {
         py: Python<'py>,
         boxes: ListOfReadOnlyArrayGeneric3,
         anchors: Vec<Vec<[f32; 2]>>,
-        quant: Vec<(f64, i64)>,
+        quant: Vec<(f64, i64, bool)>,
         score_threshold: f64,
         iou_threshold: f64,
         max_boxes: usize,
@@ -446,7 +439,7 @@ impl PyDecoder {
 
                 let mut quant = quant
                     .into_iter()
-                    .map(|x| Some(Quantization::<u8>::from_tuple_truncate(x)))
+                    .map(|x| Some(Quantization::from(x)))
                     .collect::<Vec<_>>();
                 if quant.len() < outputs.len() {
                     quant.extend(std::iter::repeat_n(None, outputs.len() - quant.len()));
@@ -473,7 +466,7 @@ impl PyDecoder {
 
                 let mut quant = quant
                     .into_iter()
-                    .map(|x| Some(Quantization::<i8>::from_tuple_truncate(x)))
+                    .map(|x| Some(Quantization::from(x)))
                     .collect::<Vec<_>>();
                 if quant.len() < outputs.len() {
                     quant.extend(std::iter::repeat_n(None, outputs.len() - quant.len()));
@@ -506,7 +499,7 @@ impl PyDecoder {
                     })
                     .collect::<Vec<_>>();
 
-                edgefirst::decoder::modelpack::decode_modelpack_split(
+                edgefirst::decoder::modelpack::decode_modelpack_split_float(
                     &outputs,
                     &configs,
                     score_threshold as f32,
@@ -524,7 +517,7 @@ impl PyDecoder {
                     })
                     .collect::<Vec<_>>();
 
-                edgefirst::decoder::modelpack::decode_modelpack_split(
+                edgefirst::decoder::modelpack::decode_modelpack_split_float(
                     &outputs,
                     &configs,
                     score_threshold as f32,
@@ -541,7 +534,7 @@ impl PyDecoder {
     #[pyo3(signature = (quantized, quant_boxes, dequant_into))]
     pub fn dequantize<'py>(
         quantized: ReadOnlyArrayGenericQuantized<'py>,
-        quant_boxes: (f64, i64),
+        quant_boxes: (f64, i64, bool),
         dequant_into: ArrayGenericFloat<'py>,
     ) -> PyResult<()> {
         match (quantized, dequant_into) {
@@ -556,7 +549,7 @@ impl PyDecoder {
                         "Output tensor length is too short".to_string(),
                     ));
                 }
-                dequantize_cpu_chunked(input, Quantization::try_from(quant_boxes)?, output);
+                dequantize_cpu_chunked(input, Quantization::from(quant_boxes), output);
             }
             (
                 ReadOnlyArrayGenericQuantized::UInt8(input),
@@ -569,7 +562,7 @@ impl PyDecoder {
                         "Output tensor length is too short".to_string(),
                     ));
                 }
-                dequantize_cpu_chunked(input, Quantization::try_from(quant_boxes)?, output);
+                dequantize_cpu_chunked(input, Quantization::from(quant_boxes), output);
             }
             (
                 ReadOnlyArrayGenericQuantized::Int8(input),
@@ -582,14 +575,7 @@ impl PyDecoder {
                         "Output tensor length is too short".to_string(),
                     ));
                 }
-                dequantize_cpu_chunked_f64(
-                    input,
-                    QuantizationF64 {
-                        scale: quant_boxes.0,
-                        zero_point: i8::try_from(quant_boxes.1)?,
-                    },
-                    output,
-                );
+                dequantize_cpu_chunked_f64(input, Quantization::from(quant_boxes), output);
             }
             (
                 ReadOnlyArrayGenericQuantized::UInt8(input),
@@ -602,14 +588,7 @@ impl PyDecoder {
                         "Output tensor length is too short".to_string(),
                     ));
                 }
-                dequantize_cpu_chunked_f64(
-                    input,
-                    QuantizationF64 {
-                        scale: quant_boxes.0,
-                        zero_point: u8::try_from(quant_boxes.1)?,
-                    },
-                    output,
-                );
+                dequantize_cpu_chunked_f64(input, Quantization::from(quant_boxes), output);
             }
         }
         Ok(())

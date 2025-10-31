@@ -1,4 +1,7 @@
-use crate::{BBoxTypeTrait, BoundingBoxQuantized, DetectBoxQuantized, Quantization, arg_max};
+use crate::{
+    BBoxTypeTrait, BoundingBoxQuantized, DetectBoxQuantized, Quantization, ReinterpretSigns,
+    arg_max,
+};
 use ndarray::{
     ArrayView1, ArrayView2, Zip,
     parallel::prelude::{IntoParallelIterator, ParallelIterator as _},
@@ -7,12 +10,13 @@ use num_traits::{AsPrimitive, PrimInt};
 
 pub fn postprocess_boxes_8bit<
     B: BBoxTypeTrait,
-    T: PrimInt + AsPrimitive<i16> + AsPrimitive<f32> + Send + Sync,
+    Boxes: PrimInt + Send + Sync + ReinterpretSigns<Signed = i8, Unsigned = u8>,
+    Scores: PrimInt + AsPrimitive<i16> + Send + Sync,
 >(
-    threshold: T,
-    boxes: ArrayView2<T>,
-    scores: ArrayView2<T>,
-    quant: Quantization<T>,
+    threshold: Scores,
+    boxes: ArrayView2<Boxes>,
+    scores: ArrayView2<Scores>,
+    quant: Quantization,
 ) -> Vec<DetectBoxQuantized<i16>> {
     assert_eq!(scores.dim().0, boxes.dim().0);
     assert_eq!(boxes.dim().1, 4);
@@ -26,7 +30,11 @@ pub fn postprocess_boxes_8bit<
                 return None;
             }
 
-            let bbox_quant = B::ndarray_to_xyxy_quant(bbox, zp);
+            let bbox_quant = if quant.signed {
+                B::ndarray_to_xyxy_quant(bbox.map(|x| x.reinterp_signed()).view(), zp)
+            } else {
+                B::ndarray_to_xyxy_quant(bbox.map(|x| x.reinterp_unsigned()).view(), zp)
+            };
             Some(DetectBoxQuantized::<i16> {
                 label,
                 score: score_.as_(),
@@ -39,18 +47,19 @@ pub fn postprocess_boxes_8bit<
 pub fn postprocess_boxes_extra_8bit<
     'a,
     B: BBoxTypeTrait,
-    T: PrimInt + AsPrimitive<i16> + AsPrimitive<f32> + Send + Sync,
+    Boxes: PrimInt + Send + Sync + ReinterpretSigns<Signed = i8, Unsigned = u8>,
+    Scores: PrimInt + AsPrimitive<i16> + Send + Sync,
     E: Send + Sync,
 >(
-    threshold: T,
-    boxes: ArrayView2<T>,
-    scores: ArrayView2<T>,
+    threshold: Scores,
+    boxes: ArrayView2<Boxes>,
+    scores: ArrayView2<Scores>,
     extra: &'a ArrayView2<E>,
-    quant_boxes: Quantization<T>,
+    quant_boxes: Quantization,
 ) -> Vec<(DetectBoxQuantized<i16>, ArrayView1<'a, E>)> {
     assert_eq!(scores.dim().0, boxes.dim().0);
     assert_eq!(boxes.dim().1, 4);
-    let zp = quant_boxes.zero_point.as_();
+    let zp = quant_boxes.zero_point as i16;
     Zip::from(scores.rows())
         .and(boxes.rows())
         .and(extra.rows())
@@ -60,7 +69,13 @@ pub fn postprocess_boxes_extra_8bit<
             if score_ < threshold {
                 return None;
             }
-            let bbox_quant = B::ndarray_to_xyxy_quant(bbox, zp);
+
+            let bbox_quant = if quant_boxes.signed {
+                B::ndarray_to_xyxy_quant(bbox.map(|x| x.reinterp_signed()).view(), zp)
+            } else {
+                B::ndarray_to_xyxy_quant(bbox.map(|x| x.reinterp_unsigned()).view(), zp)
+            };
+
             Some((
                 DetectBoxQuantized::<i16> {
                     label,
@@ -153,14 +168,14 @@ fn jaccard_i16(a: &BoundingBoxQuantized<i16>, b: &BoundingBoxQuantized<i16>, iou
     intersection as f32 / union as f32 > iou
 }
 
-pub(crate) fn quantize_score_threshold<T: AsPrimitive<f32> + PrimInt>(
+pub(crate) fn quantize_score_threshold<T: PrimInt + AsPrimitive<f32>>(
     score: f32,
-    quant: Quantization<T>,
+    quant: Quantization,
 ) -> T {
     if quant.scale == 0.0 {
         return T::max_value();
     }
-    let v = (score / quant.scale + quant.zero_point.as_()).ceil();
+    let v = (score / quant.scale + quant.zero_point as f32).ceil();
     let v = v.clamp(T::min_value().as_(), T::max_value().as_());
     T::from(v).unwrap()
 }
