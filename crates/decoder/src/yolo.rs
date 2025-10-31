@@ -346,6 +346,9 @@ pub fn impl_yolo_split_8bit<
         quant_scores.signed = true;
     }
 
+    let boxes_tensor = boxes_tensor.reversed_axes();
+    let scores_tensor = scores_tensor.reversed_axes();
+
     let boxes = if quant_scores.signed {
         let scores_tensor: ArrayView2<i8> = unsafe { std::mem::transmute(scores_tensor) };
         let score_threshold = quantize_score_threshold(score_threshold, quant_scores);
@@ -381,6 +384,8 @@ pub fn impl_yolo_split_float<B: BBoxTypeTrait, T: Float + AsPrimitive<f32> + Sen
     iou_threshold: T,
     output_boxes: &mut Vec<DetectBox>,
 ) {
+    let boxes_tensor = boxes_tensor.reversed_axes();
+    let scores_tensor = scores_tensor.reversed_axes();
     let boxes = postprocess_boxes_float::<B, T>(score_threshold, boxes_tensor, scores_tensor);
     let boxes = nms_f32(iou_threshold.as_(), boxes);
     let len = output_boxes.capacity().min(boxes.len());
@@ -528,6 +533,10 @@ pub fn impl_yolo_split_segdet_8bit<
         quant_protos.signed = true;
     }
 
+    let boxes_tensor = boxes_tensor.reversed_axes();
+    let scores_tensor = scores_tensor.reversed_axes();
+    let mask_tensor = mask_tensor.reversed_axes();
+
     let boxes = if quant_boxes.signed {
         let scores_tensor: ArrayView2<i8> = unsafe { std::mem::transmute(scores_tensor) };
         let score_threshold = quantize_score_threshold(score_threshold, quant_boxes);
@@ -584,6 +593,10 @@ pub fn impl_yolo_split_segdet_float<
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
 ) {
+    let boxes_tensor = boxes_tensor.reversed_axes();
+    let scores_tensor = scores_tensor.reversed_axes();
+    let mask_tensor = mask_tensor.reversed_axes();
+
     let boxes = postprocess_boxes_extra_float::<B, T, T>(
         score_threshold,
         boxes_tensor,

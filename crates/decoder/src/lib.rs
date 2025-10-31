@@ -423,18 +423,20 @@ pub fn dequant_detect_box_i16(
     }
 }
 
-pub fn dequantize_ndarray<T: ReinterpretSigns, D: Dimension>(
+pub fn dequantize_ndarray<T: ReinterpretSigns, D: Dimension, F: Float + 'static>(
     quant: Quantization,
     input: ArrayView<T, D>,
-) -> Array<f32, D>
+) -> Array<F, D>
 where
-    <T as ReinterpretSigns>::Signed: num_traits::AsPrimitive<f32>,
-    <T as ReinterpretSigns>::Unsigned: num_traits::AsPrimitive<f32>,
+    <T as ReinterpretSigns>::Signed: num_traits::AsPrimitive<F>,
+    <T as ReinterpretSigns>::Unsigned: num_traits::AsPrimitive<F>,
+    i32: num_traits::AsPrimitive<F>,
+    f32: num_traits::AsPrimitive<F>,
 {
-    let zero_point = quant.zero_point as f32;
-    let scale = quant.scale;
+    let zero_point = quant.zero_point.as_();
+    let scale = quant.scale.as_();
     let signed = T::zero().checked_sub(&T::one()).is_some() || quant.signed;
-    if zero_point != 0.0 {
+    if zero_point != F::zero() {
         let scaled_zero = -zero_point * scale;
         if signed {
             input.mapv(|d| d.reinterp_signed().as_() * scale + scaled_zero)
@@ -448,133 +450,21 @@ where
     }
 }
 
-pub fn dequantize_cpu<T: ReinterpretSigns>(input: &[T], quant: Quantization, output: &mut [f32])
-where
-    <T as ReinterpretSigns>::Signed: num_traits::AsPrimitive<f32>,
-    <T as ReinterpretSigns>::Unsigned: num_traits::AsPrimitive<f32>,
-{
-    assert!(input.len() == output.len());
-    let zero_point = quant.zero_point as f32;
-    let scale = quant.scale;
-    let signed = T::zero().checked_sub(&T::one()).is_some() || quant.signed;
-    if zero_point != 0.0 {
-        let scaled_zero = -zero_point * scale; // scale * (d - zero_point) = d * scale - zero_point * scale
-        if signed {
-            input
-                .iter()
-                .zip(output)
-                .for_each(|(d, deq)| *deq = d.reinterp_signed().as_() * scale + scaled_zero);
-        } else {
-            input
-                .iter()
-                .zip(output)
-                .for_each(|(d, deq)| *deq = d.reinterp_unsigned().as_() * scale + scaled_zero);
-        }
-    } else if signed {
-        input
-            .iter()
-            .zip(output)
-            .for_each(|(d, deq)| *deq = d.reinterp_signed().as_() * scale);
-    } else {
-        input
-            .iter()
-            .zip(output)
-            .for_each(|(d, deq)| *deq = d.reinterp_unsigned().as_() * scale);
-    }
-}
-
-pub fn dequantize_cpu_chunked<T: ReinterpretSigns>(
+pub fn dequantize_cpu<T: ReinterpretSigns, F: Float + 'static>(
     input: &[T],
     quant: Quantization,
-    output: &mut [f32],
+    output: &mut [F],
 ) where
-    <T as ReinterpretSigns>::Signed: num_traits::AsPrimitive<f32>,
-    <T as ReinterpretSigns>::Unsigned: num_traits::AsPrimitive<f32>,
+    <T as ReinterpretSigns>::Signed: num_traits::AsPrimitive<F>,
+    <T as ReinterpretSigns>::Unsigned: num_traits::AsPrimitive<F>,
+    f32: num_traits::AsPrimitive<F>,
+    i32: num_traits::AsPrimitive<F>,
 {
     assert!(input.len() == output.len());
-    let zero_point = quant.zero_point as f32;
-    let scale = quant.scale;
+    let zero_point = quant.zero_point.as_();
+    let scale = quant.scale.as_();
     let signed = T::zero().checked_sub(&T::one()).is_some() || quant.signed;
-    if zero_point != 0.0 {
-        let scaled_zero = -zero_point * scale; // scale * (d - zero_point) = d * scale - zero_point * scale
-        if signed {
-            for (d, deq) in input.chunks_exact(4).zip(output.chunks_exact_mut(4)) {
-                unsafe {
-                    *deq.get_unchecked_mut(0) =
-                        d.get_unchecked(0).reinterp_signed().as_() * scale + scaled_zero;
-                    *deq.get_unchecked_mut(1) =
-                        d.get_unchecked(1).reinterp_signed().as_() * scale + scaled_zero;
-                    *deq.get_unchecked_mut(2) =
-                        d.get_unchecked(2).reinterp_signed().as_() * scale + scaled_zero;
-                    *deq.get_unchecked_mut(3) =
-                        d.get_unchecked(3).reinterp_signed().as_() * scale + scaled_zero;
-                }
-            }
-            let rem = input.len() / 4 * 4;
-            input[rem..]
-                .iter()
-                .zip(&mut output[rem..])
-                .for_each(|(d, deq)| *deq = d.reinterp_signed().as_() * scale + scaled_zero);
-        } else {
-            for (d, deq) in input.chunks_exact(4).zip(output.chunks_exact_mut(4)) {
-                unsafe {
-                    *deq.get_unchecked_mut(0) =
-                        d.get_unchecked(0).reinterp_unsigned().as_() * scale + scaled_zero;
-                    *deq.get_unchecked_mut(1) =
-                        d.get_unchecked(1).reinterp_unsigned().as_() * scale + scaled_zero;
-                    *deq.get_unchecked_mut(2) =
-                        d.get_unchecked(2).reinterp_unsigned().as_() * scale + scaled_zero;
-                    *deq.get_unchecked_mut(3) =
-                        d.get_unchecked(3).reinterp_unsigned().as_() * scale + scaled_zero;
-                }
-            }
-            let rem = input.len() / 4 * 4;
-            input[rem..]
-                .iter()
-                .zip(&mut output[rem..])
-                .for_each(|(d, deq)| *deq = d.reinterp_unsigned().as_() * scale + scaled_zero);
-        }
-    } else if signed {
-        for (d, deq) in input.chunks_exact(4).zip(output.chunks_exact_mut(4)) {
-            unsafe {
-                *deq.get_unchecked_mut(0) = d.get_unchecked(0).reinterp_signed().as_() * scale;
-                *deq.get_unchecked_mut(1) = d.get_unchecked(1).reinterp_signed().as_() * scale;
-                *deq.get_unchecked_mut(2) = d.get_unchecked(2).reinterp_signed().as_() * scale;
-                *deq.get_unchecked_mut(3) = d.get_unchecked(3).reinterp_signed().as_() * scale;
-            }
-        }
-        let rem = input.len() / 4 * 4;
-        input[rem..]
-            .iter()
-            .zip(&mut output[rem..])
-            .for_each(|(d, deq)| *deq = d.reinterp_signed().as_() * scale);
-    } else {
-        for (d, deq) in input.chunks_exact(4).zip(output.chunks_exact_mut(4)) {
-            unsafe {
-                *deq.get_unchecked_mut(0) = d.get_unchecked(0).reinterp_unsigned().as_() * scale;
-                *deq.get_unchecked_mut(1) = d.get_unchecked(1).reinterp_unsigned().as_() * scale;
-                *deq.get_unchecked_mut(2) = d.get_unchecked(2).reinterp_unsigned().as_() * scale;
-                *deq.get_unchecked_mut(3) = d.get_unchecked(3).reinterp_unsigned().as_() * scale;
-            }
-        }
-        let rem = input.len() / 4 * 4;
-        input[rem..]
-            .iter()
-            .zip(&mut output[rem..])
-            .for_each(|(d, deq)| *deq = d.reinterp_unsigned().as_() * scale);
-    }
-}
-
-pub fn dequantize_cpu_f64<T: ReinterpretSigns>(input: &[T], quant: Quantization, output: &mut [f64])
-where
-    <T as ReinterpretSigns>::Signed: num_traits::AsPrimitive<f64>,
-    <T as ReinterpretSigns>::Unsigned: num_traits::AsPrimitive<f64>,
-{
-    assert!(input.len() == output.len());
-    let zero_point = quant.zero_point as f64;
-    let scale = quant.scale as f64;
-    let signed = T::zero().checked_sub(&T::one()).is_some() || quant.signed;
-    if zero_point != 0.0 {
+    if zero_point != F::zero() {
         let scaled_zero = -zero_point * scale; // scale * (d - zero_point) = d * scale - zero_point * scale
         if signed {
             input
@@ -600,19 +490,21 @@ where
     }
 }
 
-pub fn dequantize_cpu_chunked_f64<T: ReinterpretSigns>(
+pub fn dequantize_cpu_chunked<T: ReinterpretSigns, F: Float + 'static>(
     input: &[T],
     quant: Quantization,
-    output: &mut [f64],
+    output: &mut [F],
 ) where
-    <T as ReinterpretSigns>::Signed: num_traits::AsPrimitive<f64>,
-    <T as ReinterpretSigns>::Unsigned: num_traits::AsPrimitive<f64>,
+    <T as ReinterpretSigns>::Signed: num_traits::AsPrimitive<F>,
+    <T as ReinterpretSigns>::Unsigned: num_traits::AsPrimitive<F>,
+    f32: num_traits::AsPrimitive<F>,
+    i32: num_traits::AsPrimitive<F>,
 {
     assert!(input.len() == output.len());
-    let zero_point = quant.zero_point as f64;
-    let scale = quant.scale as f64;
+    let zero_point = quant.zero_point.as_();
+    let scale = quant.scale.as_();
     let signed = T::zero().checked_sub(&T::one()).is_some() || quant.signed;
-    if zero_point != 0.0 {
+    if zero_point != F::zero() {
         let scaled_zero = -zero_point * scale; // scale * (d - zero_point) = d * scale - zero_point * scale
         if signed {
             for (d, deq) in input.chunks_exact(4).zip(output.chunks_exact_mut(4)) {
