@@ -1,18 +1,20 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 use edgefirst::decoder::{
-    Decoder, DecoderBuilder, DetectBox, Quantization, Segmentation, dequantize_cpu_chunked,
-    dequantize_cpu_chunked_f64, modelpack::ModelPackDetectionConfig, segmentation_to_mask,
+    Decoder, DecoderBuilder, DetectBox, Quantization, Segmentation, dequantize_cpu,
+    modelpack::ModelPackDetectionConfig, segmentation_to_mask,
 };
-// use half::f16;
+
 use ndarray::{Array1, Array2};
 use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayDyn, PyArrayLike2, PyArrayLike3,
     PyArrayLikeDyn, PyArrayMethods, PyReadonlyArray3, PyReadonlyArrayDyn, PyReadwriteArrayDyn,
-    ToPyArray,
+    PyUntypedArray, ToPyArray,
 };
 use pyo3::{
     Bound, FromPyObject, PyAny, PyRef, PyResult, Python, pyclass, pymethods, types::PyAnyMethods,
 };
+
+use crate::FunctionTimer;
 pub type PyDetOutput<'py> = (
     Bound<'py, PyArray2<f32>>,
     Bound<'py, PyArray1<f32>>,
@@ -85,10 +87,50 @@ pub enum ReadOnlyArrayGeneric3<'py> {
     Float64(PyArrayLike3<'py, f64>),
 }
 
-#[derive(FromPyObject)]
+// #[derive(FromPyObject)]
 pub enum ReadOnlyArrayGenericQuantized<'a> {
-    UInt8(PyArrayLikeDyn<'a, u8>),
-    Int8(PyArrayLikeDyn<'a, i8>),
+    UInt8(PyReadonlyArrayDyn<'a, u8>),
+    Int8(PyReadonlyArrayDyn<'a, i8>),
+    UInt16(PyReadonlyArrayDyn<'a, u16>),
+    Int16(PyReadonlyArrayDyn<'a, i16>),
+    UInt32(PyReadonlyArrayDyn<'a, u32>),
+    Int32(PyReadonlyArrayDyn<'a, i32>),
+}
+
+impl<'py> FromPyObject<'py> for ReadOnlyArrayGenericQuantized<'py> {
+    fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
+        let _time = FunctionTimer::new("ReadOnlyArrayGenericQuantized FromPyObject".to_string());
+        let untyped: &Bound<'_, PyUntypedArray>;
+        if let Ok(array) = ob.downcast::<PyUntypedArray>() {
+            untyped = array;
+        } else {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Could not parse array as u8, i8, u16, i16, u32, or i32 numpy array".to_string(),
+            ));
+        }
+
+        if let Ok(array) = untyped.downcast::<PyArrayDyn<u8>>() {
+            return Ok(Self::UInt8(array.readonly()));
+        }
+        if let Ok(array) = untyped.downcast::<PyArrayDyn<i8>>() {
+            return Ok(Self::Int8(array.readonly()));
+        }
+        if let Ok(array) = untyped.downcast::<PyArrayDyn<u16>>() {
+            return Ok(Self::UInt16(array.readonly()));
+        }
+        if let Ok(array) = untyped.downcast::<PyArrayDyn<i16>>() {
+            return Ok(Self::Int16(array.readonly()));
+        }
+        if let Ok(array) = untyped.downcast::<PyArrayDyn<u32>>() {
+            return Ok(Self::UInt32(array.readonly()));
+        }
+        if let Ok(array) = untyped.downcast::<PyArrayDyn<i32>>() {
+            return Ok(Self::Int32(array.readonly()));
+        }
+        Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Could not parse array as u8, i8, u16, i16, u32, or i32 numpy array".to_string(),
+        ))
+    }
 }
 
 #[derive(FromPyObject)]
@@ -103,6 +145,19 @@ pub struct PyDecoder {
 
 unsafe impl Send for PyDecoder {}
 unsafe impl Sync for PyDecoder {}
+
+macro_rules! dequantize {
+    ($inp:expr, $outp:expr, $quant_boxes:expr) => {{
+        let input = $inp.as_slice()?;
+        let output = $outp.as_slice_mut()?;
+        if output.len() < input.len() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Output tensor length is too short".to_string(),
+            ));
+        }
+        dequantize_cpu(input, Quantization::from($quant_boxes), output);
+    }};
+}
 
 #[pymethods]
 impl PyDecoder {
@@ -463,7 +518,6 @@ impl PyDecoder {
             }
             ListOfReadOnlyArrayGeneric3::Int8(items) => {
                 let outputs = items.iter().map(|x| x.as_array()).collect::<Vec<_>>();
-
                 let mut quant = quant
                     .into_iter()
                     .map(|x| Some(Quantization::from(x)))
@@ -537,60 +591,59 @@ impl PyDecoder {
         quant_boxes: (f64, i64, bool),
         dequant_into: ArrayGenericFloat<'py>,
     ) -> PyResult<()> {
+        log::trace!("enter {:?}", std::time::Instant::now());
+        let timer = FunctionTimer::new("dequant".to_string());
         match (quantized, dequant_into) {
             (
                 ReadOnlyArrayGenericQuantized::Int8(input),
                 ArrayGenericFloat::Float32(mut output),
-            ) => {
-                let input = input.as_slice()?;
-                let output = output.as_slice_mut()?;
-                if output.len() < input.len() {
-                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                        "Output tensor length is too short".to_string(),
-                    ));
-                }
-                dequantize_cpu_chunked(input, Quantization::from(quant_boxes), output);
-            }
+            ) => dequantize!(input, output, quant_boxes),
             (
                 ReadOnlyArrayGenericQuantized::UInt8(input),
                 ArrayGenericFloat::Float32(mut output),
-            ) => {
-                let input = input.as_slice()?;
-                let output = output.as_slice_mut()?;
-                if output.len() < input.len() {
-                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                        "Output tensor length is too short".to_string(),
-                    ));
-                }
-                dequantize_cpu_chunked(input, Quantization::from(quant_boxes), output);
-            }
+            ) => dequantize!(input, output, quant_boxes),
             (
                 ReadOnlyArrayGenericQuantized::Int8(input),
                 ArrayGenericFloat::Float64(mut output),
-            ) => {
-                let input = input.as_slice()?;
-                let output = output.as_slice_mut()?;
-                if output.len() < input.len() {
-                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                        "Output tensor length is too short".to_string(),
-                    ));
-                }
-                dequantize_cpu_chunked_f64(input, Quantization::from(quant_boxes), output);
-            }
+            ) => dequantize!(input, output, quant_boxes),
             (
                 ReadOnlyArrayGenericQuantized::UInt8(input),
                 ArrayGenericFloat::Float64(mut output),
-            ) => {
-                let input = input.as_slice()?;
-                let output = output.as_slice_mut()?;
-                if output.len() < input.len() {
-                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                        "Output tensor length is too short".to_string(),
-                    ));
-                }
-                dequantize_cpu_chunked_f64(input, Quantization::from(quant_boxes), output);
-            }
+            ) => dequantize!(input, output, quant_boxes),
+            (
+                ReadOnlyArrayGenericQuantized::UInt16(input),
+                ArrayGenericFloat::Float32(mut output),
+            ) => dequantize!(input, output, quant_boxes),
+            (
+                ReadOnlyArrayGenericQuantized::UInt16(input),
+                ArrayGenericFloat::Float64(mut output),
+            ) => dequantize!(input, output, quant_boxes),
+            (
+                ReadOnlyArrayGenericQuantized::Int16(input),
+                ArrayGenericFloat::Float32(mut output),
+            ) => dequantize!(input, output, quant_boxes),
+            (
+                ReadOnlyArrayGenericQuantized::Int16(input),
+                ArrayGenericFloat::Float64(mut output),
+            ) => dequantize!(input, output, quant_boxes),
+            (
+                ReadOnlyArrayGenericQuantized::UInt32(input),
+                ArrayGenericFloat::Float32(mut output),
+            ) => dequantize!(input, output, quant_boxes),
+            (
+                ReadOnlyArrayGenericQuantized::UInt32(input),
+                ArrayGenericFloat::Float64(mut output),
+            ) => dequantize!(input, output, quant_boxes),
+            (
+                ReadOnlyArrayGenericQuantized::Int32(input),
+                ArrayGenericFloat::Float32(mut output),
+            ) => dequantize!(input, output, quant_boxes),
+            (
+                ReadOnlyArrayGenericQuantized::Int32(input),
+                ArrayGenericFloat::Float64(mut output),
+            ) => dequantize!(input, output, quant_boxes),
         }
+        log::trace!("exit {:?}", std::time::Instant::now());
         Ok(())
     }
 
