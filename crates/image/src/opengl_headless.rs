@@ -698,7 +698,7 @@ impl GLConverterST {
         }
 
         if dst.is_planar() {
-            self.convert_to_planar(src, dst, crop)
+            self.convert_to_planar(src, dst, rotation, flip, crop)
         } else {
             self.convert_to(src, dst, rotation, flip, crop)
         }
@@ -795,7 +795,7 @@ impl GLConverterST {
         log::debug!("Set up framebuffer takes {:?}", start.elapsed());
         let start = Instant::now();
         if dst.is_planar() {
-            self.convert_to_planar(src, dst, crop)?;
+            self.convert_to_planar(src, dst, rotation, flip, crop)?;
         } else {
             self.convert_to(src, dst, rotation, flip, crop)?;
         }
@@ -920,6 +920,8 @@ impl GLConverterST {
         &self,
         src: &TensorImage,
         dst: &TensorImage,
+        rotation: crate::Rotation,
+        flip: Flip,
         crop: Crop,
     ) -> Result<(), crate::Error> {
         if let Some(crop) = crop.src_rect
@@ -944,12 +946,61 @@ impl GLConverterST {
             ));
         }
 
+        // top and bottom are flipped because OpenGL uses 0,0 as bottom left
+        let src_roi = if let Some(crop) = crop.src_rect {
+            RegionOfInterest {
+                left: crop.left as f32 / src.width() as f32,
+                top: (crop.top + crop.height) as f32 / src.height() as f32,
+                right: (crop.left + crop.width) as f32 / src.width() as f32,
+                bottom: crop.top as f32 / src.height() as f32,
+            }
+        } else {
+            RegionOfInterest {
+                left: 0.,
+                top: 1.,
+                right: 1.,
+                bottom: 0.,
+            }
+        };
+
+        // top and bottom are flipped because OpenGL uses 0,0 as bottom left
+        let cvt_screen_coord = |normalized| normalized * 2.0 - 1.0;
+        let dst_roi = if let Some(crop) = crop.dst_rect {
+            RegionOfInterest {
+                left: cvt_screen_coord(crop.left as f32 / dst.width() as f32),
+                top: cvt_screen_coord((crop.top + crop.height) as f32 / dst.height() as f32),
+                right: cvt_screen_coord((crop.left + crop.width) as f32 / dst.width() as f32),
+                bottom: cvt_screen_coord(crop.top as f32 / dst.height() as f32),
+            }
+        } else {
+            RegionOfInterest {
+                left: -1.,
+                top: 1.,
+                right: 1.,
+                bottom: -1.,
+            }
+        };
+        let rotation_offset = match rotation {
+            crate::Rotation::None => 0,
+            crate::Rotation::Clockwise90 => 1,
+            crate::Rotation::Rotate180 => 2,
+            crate::Rotation::CounterClockwise90 => 3,
+        };
+
         let new_egl_image = self.create_image_from_dma2(src)?;
         unsafe {
             gls::gl::ClearColor(0.0, 0.0, 0.0, 0.0);
             gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
         };
-        self.draw_camera_texture_to_rgb_planar(&self.camera_texture, &new_egl_image, dst.width())?;
+        self.draw_camera_texture_to_rgb_planar(
+            &self.camera_texture,
+            &new_egl_image,
+            dst.width(),
+            src_roi,
+            dst_roi,
+            rotation_offset,
+            flip,
+        )?;
         unsafe { gls::gl::Finish() };
 
         Ok(())
@@ -960,6 +1011,10 @@ impl GLConverterST {
         texture: &Texture,
         egl_img: &EglImage,
         width: usize,
+        src_roi: RegionOfInterest,
+        mut dst_roi: RegionOfInterest,
+        rotation_offset: usize,
+        flip: Flip,
     ) -> Result<(), Error> {
         log::info!("draw_camera_texture_to_rgb_planar");
         let texture_target = gls::gl::TEXTURE_2D;
