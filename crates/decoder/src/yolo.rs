@@ -7,17 +7,17 @@ use ndarray_stats::QuantileExt;
 use num_traits::{AsPrimitive, Float, PrimInt};
 
 use crate::{
-    BBoxTypeTrait, BoundingBox, DetectBox, Quantization, Segmentation, XYWH,
+    BBoxTypeTrait, BoundingBox, DetectBox, Quantization, ReinterpretSigns, Segmentation, XYWH,
     byte::{
         nms_extra_i16, nms_i16, postprocess_boxes_8bit, postprocess_boxes_extra_8bit,
         quantize_score_threshold,
     },
-    dequant_detect_box,
+    dequant_detect_box_i16,
     float::{nms_extra_f32, nms_f32, postprocess_boxes_extra_float, postprocess_boxes_float},
 };
 
 pub fn decode_yolo_u8(
-    output: (ArrayView2<u8>, Quantization<u8>),
+    output: (ArrayView2<u8>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
@@ -26,7 +26,7 @@ pub fn decode_yolo_u8(
 }
 
 pub fn decode_yolo_i8(
-    output: (ArrayView2<i8>, Quantization<i8>),
+    output: (ArrayView2<i8>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
@@ -54,8 +54,8 @@ pub fn decode_yolo_f64(
 
 #[allow(clippy::too_many_arguments)]
 pub fn decode_yolo_segdet_i8(
-    boxes: (ArrayView2<i8>, Quantization<i8>),
-    protos: (ArrayView3<i8>, Quantization<i8>),
+    boxes: (ArrayView2<i8>, Quantization),
+    protos: (ArrayView3<i8>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
@@ -73,8 +73,8 @@ pub fn decode_yolo_segdet_i8(
 
 #[allow(clippy::too_many_arguments)]
 pub fn decode_yolo_segdet_u8(
-    boxes: (ArrayView2<u8>, Quantization<u8>),
-    protos: (ArrayView3<u8>, Quantization<u8>),
+    boxes: (ArrayView2<u8>, Quantization),
+    protos: (ArrayView3<u8>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
@@ -127,8 +127,8 @@ pub fn decode_yolo_segdet_f64(
 }
 
 pub fn decode_yolo_split_det_u8(
-    boxes: (ArrayView2<u8>, Quantization<u8>),
-    scores: (ArrayView2<u8>, Quantization<u8>),
+    boxes: (ArrayView2<u8>, Quantization),
+    scores: (ArrayView2<u8>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
@@ -137,8 +137,8 @@ pub fn decode_yolo_split_det_u8(
 }
 
 pub fn decode_yolo_split_det_i8(
-    boxes: (ArrayView2<i8>, Quantization<i8>),
-    scores: (ArrayView2<i8>, Quantization<i8>),
+    boxes: (ArrayView2<i8>, Quantization),
+    scores: (ArrayView2<i8>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
@@ -167,10 +167,10 @@ pub fn decode_yolo_split_det_f64(
 }
 
 pub fn decode_yolo_split_segdet_u8(
-    boxes: (ArrayView2<u8>, Quantization<u8>),
-    scores: (ArrayView2<u8>, Quantization<u8>),
-    mask_coeff: (ArrayView2<u8>, Quantization<u8>),
-    protos: (ArrayView3<u8>, Quantization<u8>),
+    boxes: (ArrayView2<u8>, Quantization),
+    scores: (ArrayView2<u8>, Quantization),
+    mask_coeff: (ArrayView2<u8>, Quantization),
+    protos: (ArrayView3<u8>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
@@ -189,10 +189,10 @@ pub fn decode_yolo_split_segdet_u8(
 }
 
 pub fn decode_yolo_split_segdet_i8(
-    boxes: (ArrayView2<i8>, Quantization<i8>),
-    scores: (ArrayView2<i8>, Quantization<i8>),
-    mask_coeff: (ArrayView2<i8>, Quantization<i8>),
-    protos: (ArrayView3<i8>, Quantization<i8>),
+    boxes: (ArrayView2<i8>, Quantization),
+    scores: (ArrayView2<i8>, Quantization),
+    mask_coeff: (ArrayView2<i8>, Quantization),
+    protos: (ArrayView3<i8>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
@@ -256,23 +256,51 @@ pub fn decode_yolo_split_segdet_f64(
 
 pub fn impl_yolo_8bit<
     B: BBoxTypeTrait,
-    T: PrimInt + AsPrimitive<i16> + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
+    T: PrimInt
+        + AsPrimitive<i16>
+        + AsPrimitive<f32>
+        + Send
+        + Sync
+        + ReinterpretSigns<Signed = i8, Unsigned = u8>,
 >(
-    output: (ArrayView2<T>, Quantization<T>),
+    output: (ArrayView2<T>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
 ) {
-    let (boxes, quant_boxes) = output;
-    let score_threshold = quantize_score_threshold(score_threshold, quant_boxes);
+    let (boxes, mut quant_boxes) = output;
     let (boxes_tensor, scores_tensor) = postprocess_yolo(&boxes);
-    let boxes =
-        postprocess_boxes_8bit::<B, _>(score_threshold, boxes_tensor, scores_tensor, quant_boxes);
+
+    // TODO: This is for backwards compatilibity
+    if T::zero().checked_sub(&T::one()).is_some() {
+        quant_boxes.signed = true;
+    }
+
+    let boxes = if quant_boxes.signed {
+        let scores_tensor: ArrayView2<i8> = unsafe { std::mem::transmute(scores_tensor) };
+        let score_threshold = quantize_score_threshold(score_threshold, quant_boxes);
+        postprocess_boxes_8bit::<B, _, i8>(
+            score_threshold,
+            boxes_tensor,
+            scores_tensor,
+            quant_boxes,
+        )
+    } else {
+        let scores_tensor: ArrayView2<u8> = unsafe { std::mem::transmute(scores_tensor) };
+        let score_threshold = quantize_score_threshold(score_threshold, quant_boxes);
+        postprocess_boxes_8bit::<B, _, u8>(
+            score_threshold,
+            boxes_tensor,
+            scores_tensor,
+            quant_boxes,
+        )
+    };
+
     let boxes = nms_i16(iou_threshold, boxes);
     let len = output_boxes.capacity().min(boxes.len());
     output_boxes.clear();
     for b in boxes.iter().take(len) {
-        output_boxes.push(dequant_detect_box(b, quant_boxes, quant_boxes));
+        output_boxes.push(dequant_detect_box_i16(b, quant_boxes, quant_boxes));
     }
 }
 
@@ -294,24 +322,55 @@ pub fn impl_yolo_float<B: BBoxTypeTrait, T: Float + AsPrimitive<f32> + Send + Sy
 
 pub fn impl_yolo_split_8bit<
     B: BBoxTypeTrait,
-    T: PrimInt + AsPrimitive<i16> + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
+    T: PrimInt
+        + AsPrimitive<i16>
+        + AsPrimitive<f32>
+        + Send
+        + Sync
+        + ReinterpretSigns
+        + ReinterpretSigns<Signed = i8>
+        + ReinterpretSigns<Unsigned = u8>,
 >(
-    boxes: (ArrayView2<T>, Quantization<T>),
-    scores: (ArrayView2<T>, Quantization<T>),
+    boxes: (ArrayView2<T>, Quantization),
+    scores: (ArrayView2<T>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
 ) {
-    let (boxes_tensor, quant_boxes) = boxes;
-    let (scores_tensor, quant_scores) = scores;
-    let score_threshold = quantize_score_threshold(score_threshold, quant_scores);
-    let boxes =
-        postprocess_boxes_8bit::<B, _>(score_threshold, boxes_tensor, scores_tensor, quant_boxes);
+    let (boxes_tensor, mut quant_boxes) = boxes;
+    let (scores_tensor, mut quant_scores) = scores;
+
+    // TODO: This is for backwards compatilibity
+    if T::zero().checked_sub(&T::one()).is_some() {
+        quant_boxes.signed = true;
+        quant_scores.signed = true;
+    }
+
+    let boxes = if quant_scores.signed {
+        let scores_tensor: ArrayView2<i8> = unsafe { std::mem::transmute(scores_tensor) };
+        let score_threshold = quantize_score_threshold(score_threshold, quant_scores);
+        postprocess_boxes_8bit::<B, _, i8>(
+            score_threshold,
+            boxes_tensor,
+            scores_tensor,
+            quant_boxes,
+        )
+    } else {
+        let scores_tensor: ArrayView2<u8> = unsafe { std::mem::transmute(scores_tensor) };
+        let score_threshold = quantize_score_threshold(score_threshold, quant_scores);
+        postprocess_boxes_8bit::<B, _, u8>(
+            score_threshold,
+            boxes_tensor,
+            scores_tensor,
+            quant_boxes,
+        )
+    };
+
     let boxes = nms_i16(iou_threshold, boxes);
     let len = output_boxes.capacity().min(boxes.len());
     output_boxes.clear();
     for b in boxes.iter().take(len) {
-        output_boxes.push(dequant_detect_box(b, quant_boxes, quant_boxes));
+        output_boxes.push(dequant_detect_box_i16(b, quant_boxes, quant_boxes));
     }
 }
 
@@ -334,33 +393,57 @@ pub fn impl_yolo_split_float<B: BBoxTypeTrait, T: Float + AsPrimitive<f32> + Sen
 #[allow(clippy::too_many_arguments)]
 pub fn impl_yolo_segdet_8bit<
     B: BBoxTypeTrait,
-    T: PrimInt + AsPrimitive<i16> + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
+    T: PrimInt
+        + AsPrimitive<i16>
+        + AsPrimitive<i32>
+        + AsPrimitive<f32>
+        + Send
+        + Sync
+        + ReinterpretSigns<Signed = i8, Unsigned = u8>,
 >(
-    boxes: (ArrayView2<T>, Quantization<T>),
-    protos: (ArrayView3<T>, Quantization<T>),
+    boxes: (ArrayView2<T>, Quantization),
+    protos: (ArrayView3<T>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
 ) {
-    let (boxes, quant_boxes) = boxes;
-    let (protos, quant_protos) = protos;
+    let (boxes, mut quant_boxes) = boxes;
+    let (protos, mut quant_protos) = protos;
+    if T::zero().checked_sub(&T::one()).is_some() {
+        quant_boxes.signed = true;
+        quant_protos.signed = true;
+    }
 
-    let score_threshold = quantize_score_threshold(score_threshold, quant_boxes);
     let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&boxes);
 
-    let boxes = postprocess_boxes_extra_8bit::<B, T, T>(
-        score_threshold,
-        boxes_tensor,
-        scores_tensor,
-        &mask_tensor,
-        quant_boxes,
-    );
+    let boxes = if quant_boxes.signed {
+        let scores_tensor: ArrayView2<i8> = unsafe { std::mem::transmute(scores_tensor) };
+        let score_threshold = quantize_score_threshold(score_threshold, quant_boxes);
+        postprocess_boxes_extra_8bit::<B, T, i8, T>(
+            score_threshold,
+            boxes_tensor,
+            scores_tensor,
+            &mask_tensor,
+            quant_boxes,
+        )
+    } else {
+        let scores_tensor: ArrayView2<u8> = unsafe { std::mem::transmute(scores_tensor) };
+        let score_threshold = quantize_score_threshold(score_threshold, quant_boxes);
+        postprocess_boxes_extra_8bit::<B, T, u8, T>(
+            score_threshold,
+            boxes_tensor,
+            scores_tensor,
+            &mask_tensor,
+            quant_boxes,
+        )
+    };
+
     let mut boxes = nms_extra_i16(iou_threshold, boxes);
     boxes.truncate(output_boxes.capacity());
     let boxes = boxes
         .into_iter()
-        .map(|(b, m)| (dequant_detect_box(&b, quant_boxes, quant_boxes), m))
+        .map(|(b, m)| (dequant_detect_box_i16(&b, quant_boxes, quant_boxes), m))
         .collect();
     let boxes = decode_segdet_8bit(boxes, protos, quant_boxes, quant_protos);
     output_boxes.clear();
@@ -416,37 +499,62 @@ pub fn impl_yolo_segdet_float<
 #[allow(clippy::too_many_arguments)]
 pub fn impl_yolo_split_segdet_8bit<
     B: BBoxTypeTrait,
-    T: PrimInt + AsPrimitive<i16> + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
+    T: PrimInt
+        + AsPrimitive<i16>
+        + AsPrimitive<i32>
+        + AsPrimitive<f32>
+        + Send
+        + Sync
+        + ReinterpretSigns<Signed = i8, Unsigned = u8>,
 >(
-    boxes: (ArrayView2<T>, Quantization<T>),
-    scores: (ArrayView2<T>, Quantization<T>),
-    mask_coeff: (ArrayView2<T>, Quantization<T>),
-    protos: (ArrayView3<T>, Quantization<T>),
+    boxes: (ArrayView2<T>, Quantization),
+    scores: (ArrayView2<T>, Quantization),
+    mask_coeff: (ArrayView2<T>, Quantization),
+    protos: (ArrayView3<T>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
 ) {
-    let (boxes_tensor, quant_boxes) = boxes;
-    let (scores_tensor, quant_scores) = scores;
-    let (mask_tensor, quant_masks) = mask_coeff;
-    let (protos, quant_protos) = protos;
+    let (boxes_tensor, mut quant_boxes) = boxes;
+    let (scores_tensor, mut quant_scores) = scores;
+    let (mask_tensor, mut quant_masks) = mask_coeff;
+    let (protos, mut quant_protos) = protos;
 
-    let score_threshold = quantize_score_threshold(score_threshold, quant_scores);
+    if T::zero().checked_sub(&T::one()).is_some() {
+        quant_boxes.signed = true;
+        quant_scores.signed = true;
+        quant_masks.signed = true;
+        quant_protos.signed = true;
+    }
 
-    let boxes = postprocess_boxes_extra_8bit::<B, T, T>(
-        score_threshold,
-        boxes_tensor,
-        scores_tensor,
-        &mask_tensor,
-        quant_boxes,
-    );
+    let boxes = if quant_boxes.signed {
+        let scores_tensor: ArrayView2<i8> = unsafe { std::mem::transmute(scores_tensor) };
+        let score_threshold = quantize_score_threshold(score_threshold, quant_boxes);
+        postprocess_boxes_extra_8bit::<B, T, i8, T>(
+            score_threshold,
+            boxes_tensor,
+            scores_tensor,
+            &mask_tensor,
+            quant_boxes,
+        )
+    } else {
+        let scores_tensor: ArrayView2<u8> = unsafe { std::mem::transmute(scores_tensor) };
+        let score_threshold = quantize_score_threshold(score_threshold, quant_boxes);
+        postprocess_boxes_extra_8bit::<B, T, u8, T>(
+            score_threshold,
+            boxes_tensor,
+            scores_tensor,
+            &mask_tensor,
+            quant_boxes,
+        )
+    };
 
     let mut boxes = nms_extra_i16(iou_threshold, boxes);
     boxes.truncate(output_boxes.capacity());
     let boxes = boxes
         .into_iter()
-        .map(|(b, m)| (dequant_detect_box(&b, quant_boxes, quant_scores), m))
+        .map(|(b, m)| (dequant_detect_box_i16(&b, quant_boxes, quant_scores), m))
         .collect();
     let boxes = decode_segdet_8bit(boxes, protos, quant_masks, quant_protos);
     output_boxes.clear();
@@ -536,11 +644,11 @@ fn decode_segdet_f32<T: Float + Send + Sync + AsPrimitive<u8>>(
         .collect()
 }
 
-fn decode_segdet_8bit<T: AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync>(
+fn decode_segdet_8bit<T: ReinterpretSigns<Signed = i8, Unsigned = u8> + Send + Sync>(
     boxes: Vec<(DetectBox, ArrayView1<T>)>,
     protos: ArrayView3<T>,
-    quant_masks: Quantization<T>,
-    quant_protos: Quantization<T>,
+    quant_masks: Quantization,
+    quant_protos: Quantization,
 ) -> Vec<(DetectBox, Array3<u8>)> {
     if boxes.is_empty() {
         return Vec::new();
@@ -607,11 +715,11 @@ fn make_segmentation<T: Float + Send + Sync + AsPrimitive<u8>>(
     mask.map(|x| ((*x - min) / (max - min) * u8_max).as_())
 }
 
-fn make_segmentation_8bit<T: AsPrimitive<i32> + AsPrimitive<f32>>(
+fn make_segmentation_8bit<T: ReinterpretSigns<Signed = i8, Unsigned = u8>>(
     mask: ArrayView1<T>,
     protos: ArrayView3<T>,
-    quant_masks: Quantization<T>,
-    quant_protos: Quantization<T>,
+    quant_masks: Quantization,
+    quant_protos: Quantization,
 ) -> Array3<u8> {
     let shape = protos.shape();
     let mask = mask.to_shape((1, mask.len())).unwrap();
@@ -619,13 +727,23 @@ fn make_segmentation_8bit<T: AsPrimitive<i32> + AsPrimitive<f32>>(
     let protos = protos.to_shape([shape[0] * shape[1], shape[2]]).unwrap();
     let protos = protos.reversed_axes();
 
-    let to_i32 = |x| <T as num_traits::AsPrimitive<i32>>::as_(x);
     // This cannot overflow because in the dot product, we have u8 * u8 and then 32
     // proto layers are summed together. Which means in the result of the matrix
     // multiply, the maximum value of a single element is 256 * 256 * 32 = 2^21
+    let mask = if quant_masks.signed {
+        mask.mapv(|x| x.reinterp_signed() as i32 - quant_masks.zero_point)
+    } else {
+        mask.mapv(|x| x.reinterp_unsigned() as i32 - quant_masks.zero_point)
+    };
+
+    let protos = if quant_protos.signed {
+        protos.mapv(|x| x.reinterp_signed() as i32 - quant_protos.zero_point)
+    } else {
+        protos.mapv(|x| x.reinterp_unsigned() as i32 - quant_protos.zero_point)
+    };
+
     let segmentation = mask
-        .mapv(|x| to_i32(x) - to_i32(quant_masks.zero_point))
-        .dot(&protos.mapv(|x| to_i32(x) - to_i32(quant_protos.zero_point)))
+        .dot(&protos)
         .into_shape_with_order((shape[0], shape[1], 1))
         .unwrap();
 

@@ -15,7 +15,10 @@ pub use decoder::*;
 
 pub use error::Error;
 
-use crate::{modelpack::modelpack_segmentation_to_mask, yolo::yolo_segmentation_to_mask};
+use crate::{
+    decoder::configs::QuantTuple, modelpack::modelpack_segmentation_to_mask,
+    yolo::yolo_segmentation_to_mask,
+};
 
 pub trait BBoxTypeTrait {
     /// Converts the bbox into XYXY quantized format. The XYXY quantized values
@@ -145,66 +148,71 @@ impl BBoxTypeTrait for XYWH {
 }
 
 #[derive(Debug, Copy, Clone)]
-pub struct Quantization<T: AsPrimitive<f32>> {
+pub struct Quantization {
     pub scale: f32,
-    pub zero_point: T,
+    pub zero_point: i32,
+    pub signed: bool,
 }
 
-impl<T: AsPrimitive<f32>> Quantization<T> {
-    pub fn new(scale: f32, zero_point: T) -> Self {
-        Self { scale, zero_point }
-    }
-
-    pub fn from_tuple_truncate<S: AsPrimitive<f32>, Z: AsPrimitive<T>>(
-        (scale, zero_point): (S, Z),
-    ) -> Self {
-        Quantization::<T> {
-            scale: scale.as_(),
-            zero_point: zero_point.as_(),
+impl Quantization {
+    pub fn new(scale: f32, zero_point: i32) -> Self {
+        Self {
+            scale,
+            zero_point,
+            signed: false,
         }
     }
-}
 
-impl<T> Quantization<T>
-where
-    T: AsPrimitive<f32>,
-{
-    pub fn from_array_truncate<F: AsPrimitive<T> + AsPrimitive<f32>>(value: [F; 2]) -> Self {
-        Quantization::<T> {
+    pub fn new_with_sign(scale: f32, zero_point: i32, signed: bool) -> Self {
+        Self {
+            scale,
+            zero_point,
+            signed,
+        }
+    }
+
+    pub fn from_array<F: AsPrimitive<i32> + AsPrimitive<f32>>(value: [F; 3]) -> Self {
+        let signed: f32 = value[2].as_();
+        Quantization {
             scale: value[0].as_(),
             zero_point: value[1].as_(),
+            signed: signed > 0.0,
         }
     }
 }
 
-impl<T: AsPrimitive<f32> + PrimInt> Default for Quantization<T> {
+impl From<QuantTuple> for Quantization {
+    fn from(quant_tuple: QuantTuple) -> Quantization {
+        Quantization {
+            scale: quant_tuple.0,
+            zero_point: quant_tuple.1,
+            signed: quant_tuple.2,
+        }
+    }
+}
+
+impl<S, Z> From<(S, Z, bool)> for Quantization
+where
+    S: AsPrimitive<f32>,
+    Z: AsPrimitive<i32>,
+{
+    fn from((scale, zp, signed): (S, Z, bool)) -> Quantization {
+        Self {
+            scale: scale.as_(),
+            zero_point: zp.as_(),
+            signed,
+        }
+    }
+}
+
+impl Default for Quantization {
     fn default() -> Self {
         Self {
             scale: 1.0,
-            zero_point: T::zero(),
+            zero_point: 0,
+            signed: false,
         }
     }
-}
-
-impl<T, S, Z> TryFrom<(S, Z)> for Quantization<T>
-where
-    T: AsPrimitive<f32> + TryFrom<Z>,
-    S: AsPrimitive<f32>,
-{
-    type Error = <T as TryFrom<Z>>::Error;
-
-    fn try_from((scale, zero_point): (S, Z)) -> Result<Self, Self::Error> {
-        Ok(Quantization::<T> {
-            scale: scale.as_(),
-            zero_point: T::try_from(zero_point)?,
-        })
-    }
-}
-
-#[derive(Debug, Copy, Clone)]
-pub struct QuantizationF64<T: AsPrimitive<f64>> {
-    pub scale: f64,
-    pub zero_point: T,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -351,169 +359,326 @@ impl<T: Copy + Signed + Mul + Add + Sub + Ord + AsPrimitive<f32>> BoundingBoxQua
     }
 }
 
+pub trait ReinterpretSigns: PrimInt + 'static {
+    type Unsigned: PrimInt + 'static;
+    type Signed: PrimInt + 'static;
+    fn reinterp_unsigned(self) -> Self::Unsigned;
+    fn reinterp_signed(self) -> Self::Signed;
+}
+
+macro_rules! impl_reinterpret_signed {
+    ($signed:ty, $unsigned:ty) => {
+        impl ReinterpretSigns for $signed {
+            type Signed = $signed;
+            type Unsigned = $unsigned;
+
+            fn reinterp_unsigned(self) -> Self::Unsigned {
+                self as $unsigned
+            }
+
+            fn reinterp_signed(self) -> Self::Signed {
+                self
+            }
+        }
+
+        impl ReinterpretSigns for $unsigned {
+            type Signed = $signed;
+            type Unsigned = $unsigned;
+
+            fn reinterp_unsigned(self) -> Self::Unsigned {
+                self
+            }
+
+            fn reinterp_signed(self) -> Self::Signed {
+                self as $signed
+            }
+        }
+    };
+}
+
+impl_reinterpret_signed!(i8, u8);
+impl_reinterpret_signed!(i16, u16);
+impl_reinterpret_signed!(i32, u32);
+impl_reinterpret_signed!(i64, u64);
+impl_reinterpret_signed!(i128, u128);
+
 /// Turns a DetectBoxQuantized into a DetectBox. The zero point is not used
 /// for quant_boxes as the DetectBoxQuantized is already be shifted to
 /// the zero points
-pub fn dequant_detect_box<
-    T: Clone + Signed + Mul + Add + Sub + Ord + AsPrimitive<f32>,
-    Q: AsPrimitive<f32>,
->(
-    detect: &DetectBoxQuantized<T>,
-    quant_boxes: Quantization<Q>,
-    quant_scores: Quantization<Q>,
+pub fn dequant_detect_box_i16(
+    detect: &DetectBoxQuantized<i16>,
+    quant_boxes: Quantization,
+    quant_scores: Quantization,
 ) -> DetectBox {
-    let scaled_zp = -quant_scores.scale * quant_scores.zero_point.as_();
+    let scaled_zp = -quant_scores.scale * quant_scores.zero_point as f32;
     DetectBox {
         bbox: BoundingBox {
-            xmin: quant_boxes.scale * detect.bbox.xmin.as_() * 0.5,
-            ymin: quant_boxes.scale * detect.bbox.ymin.as_() * 0.5,
-            xmax: quant_boxes.scale * detect.bbox.xmax.as_() * 0.5,
-            ymax: quant_boxes.scale * detect.bbox.ymax.as_() * 0.5,
+            xmin: quant_boxes.scale * detect.bbox.xmin as f32 * 0.5,
+            ymin: quant_boxes.scale * detect.bbox.ymin as f32 * 0.5,
+            xmax: quant_boxes.scale * detect.bbox.xmax as f32 * 0.5,
+            ymax: quant_boxes.scale * detect.bbox.ymax as f32 * 0.5,
         },
-        score: quant_scores.scale * detect.score.as_() + scaled_zp,
+        score: quant_scores.scale * detect.score as f32 + scaled_zp,
         label: detect.label,
     }
 }
 
-pub fn dequantize_ndarray<T: AsPrimitive<f32>, D: Dimension>(
-    quant: Quantization<T>,
+pub fn dequantize_ndarray<T: ReinterpretSigns, D: Dimension>(
+    quant: Quantization,
     input: ArrayView<T, D>,
-) -> Array<f32, D> {
-    let zero_point = quant.zero_point.as_();
+) -> Array<f32, D>
+where
+    <T as ReinterpretSigns>::Signed: num_traits::AsPrimitive<f32>,
+    <T as ReinterpretSigns>::Unsigned: num_traits::AsPrimitive<f32>,
+{
+    let zero_point = quant.zero_point as f32;
     let scale = quant.scale;
+    let signed = T::zero().checked_sub(&T::one()).is_some() || quant.signed;
     if zero_point != 0.0 {
-        let scaled_zero = -zero_point * scale; // scale * (d - zero_point) = d * scale - zero_point * scale
-        input.mapv(|d| d.as_() * scale + scaled_zero)
+        let scaled_zero = -zero_point * scale;
+        if signed {
+            input.mapv(|d| d.reinterp_signed().as_() * scale + scaled_zero)
+        } else {
+            input.mapv(|d| d.reinterp_unsigned().as_() * scale + scaled_zero)
+        }
+    } else if signed {
+        input.mapv(|d| d.reinterp_signed().as_() * scale)
     } else {
-        input.mapv(|d| d.as_() * scale)
+        input.mapv(|d| d.reinterp_unsigned().as_() * scale)
     }
 }
 
-pub fn dequantize_cpu<T: AsPrimitive<f32>>(
+pub fn dequantize_cpu<T: ReinterpretSigns>(input: &[T], quant: Quantization, output: &mut [f32])
+where
+    <T as ReinterpretSigns>::Signed: num_traits::AsPrimitive<f32>,
+    <T as ReinterpretSigns>::Unsigned: num_traits::AsPrimitive<f32>,
+{
+    assert!(input.len() == output.len());
+    let zero_point = quant.zero_point as f32;
+    let scale = quant.scale;
+    let signed = T::zero().checked_sub(&T::one()).is_some() || quant.signed;
+    if zero_point != 0.0 {
+        let scaled_zero = -zero_point * scale; // scale * (d - zero_point) = d * scale - zero_point * scale
+        if signed {
+            input
+                .iter()
+                .zip(output)
+                .for_each(|(d, deq)| *deq = d.reinterp_signed().as_() * scale + scaled_zero);
+        } else {
+            input
+                .iter()
+                .zip(output)
+                .for_each(|(d, deq)| *deq = d.reinterp_unsigned().as_() * scale + scaled_zero);
+        }
+    } else if signed {
+        input
+            .iter()
+            .zip(output)
+            .for_each(|(d, deq)| *deq = d.reinterp_signed().as_() * scale);
+    } else {
+        input
+            .iter()
+            .zip(output)
+            .for_each(|(d, deq)| *deq = d.reinterp_unsigned().as_() * scale);
+    }
+}
+
+pub fn dequantize_cpu_chunked<T: ReinterpretSigns>(
     input: &[T],
-    quant: Quantization<T>,
+    quant: Quantization,
     output: &mut [f32],
-) {
+) where
+    <T as ReinterpretSigns>::Signed: num_traits::AsPrimitive<f32>,
+    <T as ReinterpretSigns>::Unsigned: num_traits::AsPrimitive<f32>,
+{
     assert!(input.len() == output.len());
-    let zero_point = quant.zero_point.as_();
+    let zero_point = quant.zero_point as f32;
     let scale = quant.scale;
+    let signed = T::zero().checked_sub(&T::one()).is_some() || quant.signed;
     if zero_point != 0.0 {
         let scaled_zero = -zero_point * scale; // scale * (d - zero_point) = d * scale - zero_point * scale
-
-        input
-            .iter()
-            .zip(output)
-            .for_each(|(d, deq)| *deq = d.as_() * scale + scaled_zero);
-    } else {
-        input
-            .iter()
-            .zip(output)
-            .for_each(|(d, deq)| *deq = d.as_() * scale);
-    }
-}
-
-pub fn dequantize_cpu_chunked<T: AsPrimitive<f32>>(
-    input: &[T],
-    quant: Quantization<T>,
-    output: &mut [f32],
-) {
-    assert!(input.len() == output.len());
-    let zero_point = quant.zero_point.as_();
-    let scale = quant.scale;
-
-    if zero_point != 0.0 {
-        let scaled_zero = -zero_point * scale; // scale * (d - zero_point) = d * scale - zero_point * scale
+        if signed {
+            for (d, deq) in input.chunks_exact(4).zip(output.chunks_exact_mut(4)) {
+                unsafe {
+                    *deq.get_unchecked_mut(0) =
+                        d.get_unchecked(0).reinterp_signed().as_() * scale + scaled_zero;
+                    *deq.get_unchecked_mut(1) =
+                        d.get_unchecked(1).reinterp_signed().as_() * scale + scaled_zero;
+                    *deq.get_unchecked_mut(2) =
+                        d.get_unchecked(2).reinterp_signed().as_() * scale + scaled_zero;
+                    *deq.get_unchecked_mut(3) =
+                        d.get_unchecked(3).reinterp_signed().as_() * scale + scaled_zero;
+                }
+            }
+            let rem = input.len() / 4 * 4;
+            input[rem..]
+                .iter()
+                .zip(&mut output[rem..])
+                .for_each(|(d, deq)| *deq = d.reinterp_signed().as_() * scale + scaled_zero);
+        } else {
+            for (d, deq) in input.chunks_exact(4).zip(output.chunks_exact_mut(4)) {
+                unsafe {
+                    *deq.get_unchecked_mut(0) =
+                        d.get_unchecked(0).reinterp_unsigned().as_() * scale + scaled_zero;
+                    *deq.get_unchecked_mut(1) =
+                        d.get_unchecked(1).reinterp_unsigned().as_() * scale + scaled_zero;
+                    *deq.get_unchecked_mut(2) =
+                        d.get_unchecked(2).reinterp_unsigned().as_() * scale + scaled_zero;
+                    *deq.get_unchecked_mut(3) =
+                        d.get_unchecked(3).reinterp_unsigned().as_() * scale + scaled_zero;
+                }
+            }
+            let rem = input.len() / 4 * 4;
+            input[rem..]
+                .iter()
+                .zip(&mut output[rem..])
+                .for_each(|(d, deq)| *deq = d.reinterp_unsigned().as_() * scale + scaled_zero);
+        }
+    } else if signed {
         for (d, deq) in input.chunks_exact(4).zip(output.chunks_exact_mut(4)) {
             unsafe {
-                *deq.get_unchecked_mut(0) = d.get_unchecked(0).as_() * scale + scaled_zero;
-                *deq.get_unchecked_mut(1) = d.get_unchecked(1).as_() * scale + scaled_zero;
-                *deq.get_unchecked_mut(2) = d.get_unchecked(2).as_() * scale + scaled_zero;
-                *deq.get_unchecked_mut(3) = d.get_unchecked(3).as_() * scale + scaled_zero;
+                *deq.get_unchecked_mut(0) = d.get_unchecked(0).reinterp_signed().as_() * scale;
+                *deq.get_unchecked_mut(1) = d.get_unchecked(1).reinterp_signed().as_() * scale;
+                *deq.get_unchecked_mut(2) = d.get_unchecked(2).reinterp_signed().as_() * scale;
+                *deq.get_unchecked_mut(3) = d.get_unchecked(3).reinterp_signed().as_() * scale;
             }
         }
         let rem = input.len() / 4 * 4;
         input[rem..]
             .iter()
             .zip(&mut output[rem..])
-            .for_each(|(d, deq)| *deq = d.as_() * scale + scaled_zero);
+            .for_each(|(d, deq)| *deq = d.reinterp_signed().as_() * scale);
     } else {
         for (d, deq) in input.chunks_exact(4).zip(output.chunks_exact_mut(4)) {
             unsafe {
-                *deq.get_unchecked_mut(0) = d.get_unchecked(0).as_() * scale;
-                *deq.get_unchecked_mut(1) = d.get_unchecked(1).as_() * scale;
-                *deq.get_unchecked_mut(2) = d.get_unchecked(2).as_() * scale;
-                *deq.get_unchecked_mut(3) = d.get_unchecked(3).as_() * scale;
+                *deq.get_unchecked_mut(0) = d.get_unchecked(0).reinterp_unsigned().as_() * scale;
+                *deq.get_unchecked_mut(1) = d.get_unchecked(1).reinterp_unsigned().as_() * scale;
+                *deq.get_unchecked_mut(2) = d.get_unchecked(2).reinterp_unsigned().as_() * scale;
+                *deq.get_unchecked_mut(3) = d.get_unchecked(3).reinterp_unsigned().as_() * scale;
             }
         }
         let rem = input.len() / 4 * 4;
         input[rem..]
             .iter()
             .zip(&mut output[rem..])
-            .for_each(|(d, deq)| *deq = d.as_() * scale);
+            .for_each(|(d, deq)| *deq = d.reinterp_unsigned().as_() * scale);
     }
 }
 
-pub fn dequantize_cpu_f64<T: AsPrimitive<f64>>(
-    quant: QuantizationF64<T>,
+pub fn dequantize_cpu_f64<T: ReinterpretSigns>(input: &[T], quant: Quantization, output: &mut [f64])
+where
+    <T as ReinterpretSigns>::Signed: num_traits::AsPrimitive<f64>,
+    <T as ReinterpretSigns>::Unsigned: num_traits::AsPrimitive<f64>,
+{
+    assert!(input.len() == output.len());
+    let zero_point = quant.zero_point as f64;
+    let scale = quant.scale as f64;
+    let signed = T::zero().checked_sub(&T::one()).is_some() || quant.signed;
+    if zero_point != 0.0 {
+        let scaled_zero = -zero_point * scale; // scale * (d - zero_point) = d * scale - zero_point * scale
+        if signed {
+            input
+                .iter()
+                .zip(output)
+                .for_each(|(d, deq)| *deq = d.reinterp_signed().as_() * scale + scaled_zero);
+        } else {
+            input
+                .iter()
+                .zip(output)
+                .for_each(|(d, deq)| *deq = d.reinterp_unsigned().as_() * scale + scaled_zero);
+        }
+    } else if signed {
+        input
+            .iter()
+            .zip(output)
+            .for_each(|(d, deq)| *deq = d.reinterp_signed().as_() * scale);
+    } else {
+        input
+            .iter()
+            .zip(output)
+            .for_each(|(d, deq)| *deq = d.reinterp_unsigned().as_() * scale);
+    }
+}
+
+pub fn dequantize_cpu_chunked_f64<T: ReinterpretSigns>(
     input: &[T],
+    quant: Quantization,
     output: &mut [f64],
-) {
+) where
+    <T as ReinterpretSigns>::Signed: num_traits::AsPrimitive<f64>,
+    <T as ReinterpretSigns>::Unsigned: num_traits::AsPrimitive<f64>,
+{
     assert!(input.len() == output.len());
-    let zero_point = quant.zero_point.as_();
-    let scale = quant.scale;
+    let zero_point = quant.zero_point as f64;
+    let scale = quant.scale as f64;
+    let signed = T::zero().checked_sub(&T::one()).is_some() || quant.signed;
     if zero_point != 0.0 {
         let scaled_zero = -zero_point * scale; // scale * (d - zero_point) = d * scale - zero_point * scale
-
-        input
-            .iter()
-            .zip(output)
-            .for_each(|(d, deq)| *deq = d.as_() * scale + scaled_zero);
-    } else {
-        input
-            .iter()
-            .zip(output)
-            .for_each(|(d, deq)| *deq = d.as_() * scale);
-    }
-}
-
-pub fn dequantize_cpu_chunked_f64<T: AsPrimitive<f64>>(
-    input: &[T],
-    quant: QuantizationF64<T>,
-    output: &mut [f64],
-) {
-    assert!(input.len() == output.len());
-    let zero_point = quant.zero_point.as_();
-    let scale = quant.scale;
-
-    if zero_point != 0.0 {
-        let scaled_zero = -zero_point * scale; // scale * (d - zero_point) = d * scale - zero_point * scale
+        if signed {
+            for (d, deq) in input.chunks_exact(4).zip(output.chunks_exact_mut(4)) {
+                unsafe {
+                    *deq.get_unchecked_mut(0) =
+                        d.get_unchecked(0).reinterp_signed().as_() * scale + scaled_zero;
+                    *deq.get_unchecked_mut(1) =
+                        d.get_unchecked(1).reinterp_signed().as_() * scale + scaled_zero;
+                    *deq.get_unchecked_mut(2) =
+                        d.get_unchecked(2).reinterp_signed().as_() * scale + scaled_zero;
+                    *deq.get_unchecked_mut(3) =
+                        d.get_unchecked(3).reinterp_signed().as_() * scale + scaled_zero;
+                }
+            }
+            let rem = input.len() / 4 * 4;
+            input[rem..]
+                .iter()
+                .zip(&mut output[rem..])
+                .for_each(|(d, deq)| *deq = d.reinterp_signed().as_() * scale + scaled_zero);
+        } else {
+            for (d, deq) in input.chunks_exact(4).zip(output.chunks_exact_mut(4)) {
+                unsafe {
+                    *deq.get_unchecked_mut(0) =
+                        d.get_unchecked(0).reinterp_unsigned().as_() * scale + scaled_zero;
+                    *deq.get_unchecked_mut(1) =
+                        d.get_unchecked(1).reinterp_unsigned().as_() * scale + scaled_zero;
+                    *deq.get_unchecked_mut(2) =
+                        d.get_unchecked(2).reinterp_unsigned().as_() * scale + scaled_zero;
+                    *deq.get_unchecked_mut(3) =
+                        d.get_unchecked(3).reinterp_unsigned().as_() * scale + scaled_zero;
+                }
+            }
+            let rem = input.len() / 4 * 4;
+            input[rem..]
+                .iter()
+                .zip(&mut output[rem..])
+                .for_each(|(d, deq)| *deq = d.reinterp_unsigned().as_() * scale + scaled_zero);
+        }
+    } else if signed {
         for (d, deq) in input.chunks_exact(4).zip(output.chunks_exact_mut(4)) {
             unsafe {
-                *deq.get_unchecked_mut(0) = d.get_unchecked(0).as_() * scale + scaled_zero;
-                *deq.get_unchecked_mut(1) = d.get_unchecked(1).as_() * scale + scaled_zero;
-                *deq.get_unchecked_mut(2) = d.get_unchecked(2).as_() * scale + scaled_zero;
-                *deq.get_unchecked_mut(3) = d.get_unchecked(3).as_() * scale + scaled_zero;
+                *deq.get_unchecked_mut(0) = d.get_unchecked(0).reinterp_signed().as_() * scale;
+                *deq.get_unchecked_mut(1) = d.get_unchecked(1).reinterp_signed().as_() * scale;
+                *deq.get_unchecked_mut(2) = d.get_unchecked(2).reinterp_signed().as_() * scale;
+                *deq.get_unchecked_mut(3) = d.get_unchecked(3).reinterp_signed().as_() * scale;
             }
         }
         let rem = input.len() / 4 * 4;
         input[rem..]
             .iter()
             .zip(&mut output[rem..])
-            .for_each(|(d, deq)| *deq = d.as_() * scale + scaled_zero);
+            .for_each(|(d, deq)| *deq = d.reinterp_signed().as_() * scale);
     } else {
         for (d, deq) in input.chunks_exact(4).zip(output.chunks_exact_mut(4)) {
             unsafe {
-                *deq.get_unchecked_mut(0) = d.get_unchecked(0).as_() * scale;
-                *deq.get_unchecked_mut(1) = d.get_unchecked(1).as_() * scale;
-                *deq.get_unchecked_mut(2) = d.get_unchecked(2).as_() * scale;
-                *deq.get_unchecked_mut(3) = d.get_unchecked(3).as_() * scale;
+                *deq.get_unchecked_mut(0) = d.get_unchecked(0).reinterp_unsigned().as_() * scale;
+                *deq.get_unchecked_mut(1) = d.get_unchecked(1).reinterp_unsigned().as_() * scale;
+                *deq.get_unchecked_mut(2) = d.get_unchecked(2).reinterp_unsigned().as_() * scale;
+                *deq.get_unchecked_mut(3) = d.get_unchecked(3).reinterp_unsigned().as_() * scale;
             }
         }
         let rem = input.len() / 4 * 4;
         input[rem..]
             .iter()
             .zip(&mut output[rem..])
-            .for_each(|(d, deq)| *deq = d.as_() * scale);
+            .for_each(|(d, deq)| *deq = d.reinterp_unsigned().as_() * scale);
     }
 }
 
@@ -541,7 +706,10 @@ mod tests {
 
     use crate::{
         modelpack::{ModelPackDetectionConfig, decode_modelpack_split, decode_modelpack_u8},
-        yolo::{decode_yolo_f32, decode_yolo_i8, decode_yolo_segdet_f32, decode_yolo_segdet_i8},
+        yolo::{
+            decode_yolo_f32, decode_yolo_i8, decode_yolo_segdet_f32, decode_yolo_segdet_i8,
+            decode_yolo_segdet_u8, decode_yolo_u8,
+        },
         *,
     };
 
@@ -555,6 +723,52 @@ mod tests {
         let quant = Quantization::new(0.0040811873, -123);
         let mut output_boxes: Vec<_> = Vec::with_capacity(50);
         decode_yolo_i8(
+            (out.view(), quant),
+            score_threshold,
+            iou_threshold,
+            &mut output_boxes,
+        );
+        println!("output_boxes {output_boxes:?}");
+        assert!(output_boxes[0].equal_within_delta(
+            &DetectBox {
+                bbox: BoundingBox {
+                    xmin: 0.5285137,
+                    ymin: 0.05305544,
+                    xmax: 0.87541467,
+                    ymax: 0.9998909,
+                },
+                score: 0.5591227,
+                label: 0
+            },
+            1e-6
+        ));
+
+        assert!(output_boxes[1].equal_within_delta(
+            &DetectBox {
+                bbox: BoundingBox {
+                    xmin: 0.130598,
+                    ymin: 0.43260583,
+                    xmax: 0.35098213,
+                    ymax: 0.9958097,
+                },
+                score: 0.33057618,
+                label: 75
+            },
+            1e-6
+        ))
+    }
+
+    #[test]
+    fn test_decoder_yolo_u8_signed_quant() {
+        let score_threshold = 0.25;
+        let iou_threshold = 0.7;
+        let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
+        let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
+        let out: Vec<_> = out.iter().map(|x| *x as u8).collect();
+        let out = ndarray::Array2::from_shape_vec((84, 8400), out).unwrap();
+        let quant = Quantization::new_with_sign(0.0040811873, -123, true);
+        let mut output_boxes: Vec<_> = Vec::with_capacity(50);
+        decode_yolo_u8(
             (out.view(), quant),
             score_threshold,
             iou_threshold,
@@ -699,10 +913,7 @@ mod tests {
                 [0.2541666626930237, 0.21481481194496155],
                 [0.23125000298023224, 0.35185185074806213],
             ],
-            quantization: Some(Quantization {
-                scale: 0.09929127991199493,
-                zero_point: 183,
-            }),
+            quantization: Some(Quantization::new(0.09929127991199493, 183)),
         };
 
         let mut output_boxes: Vec<_> = Vec::with_capacity(2);
@@ -884,6 +1095,81 @@ mod tests {
         let mut output_masks: Vec<_> = Vec::with_capacity(500);
 
         decode_yolo_segdet_i8(
+            (boxes.view(), quant_boxes),
+            (protos.view(), quant_protos),
+            score_threshold,
+            iou_threshold,
+            &mut output_boxes,
+            &mut output_masks,
+        );
+
+        let protos = dequantize_ndarray(quant_protos, protos.view());
+        let seg = dequantize_ndarray(quant_boxes, boxes.view());
+        let mut output_boxes_f32: Vec<_> = Vec::with_capacity(500);
+        let mut output_masks_f32: Vec<_> = Vec::with_capacity(500);
+        decode_yolo_segdet_f32(
+            seg.view(),
+            protos.view(),
+            score_threshold,
+            iou_threshold,
+            &mut output_boxes_f32,
+            &mut output_masks_f32,
+        );
+
+        assert_eq!(output_boxes.len(), output_boxes_f32.len());
+        assert_eq!(output_masks.len(), output_masks_f32.len());
+
+        for (b_i8, b_f32) in output_boxes.iter().zip(&output_boxes_f32) {
+            assert!(
+                b_i8.equal_within_delta(b_f32, 1e-6),
+                "{b_i8:?} is not equal to {b_f32:?}"
+            );
+        }
+
+        for (m_i8, m_f32) in output_masks.iter().zip(&output_masks_f32) {
+            assert_eq!(
+                [m_i8.xmin, m_i8.ymin, m_i8.xmax, m_i8.ymax],
+                [m_f32.xmin, m_f32.ymin, m_f32.xmax, m_f32.ymax],
+            );
+            assert_eq!(m_i8.segmentation.shape(), m_f32.segmentation.shape());
+            let mask_i8 = m_i8.segmentation.map(|x| *x as i32);
+            let mask_f32 = m_f32.segmentation.map(|x| *x as i32);
+            let diff = &mask_i8 - &mask_f32;
+            assert!(
+                !diff.iter().any(|x| x.abs() > 1),
+                "Difference between mask i8 and mask f32 is greater than 1: {:#?}",
+                diff
+            );
+            let mean_sq_err = mask_i8.mean_sq_err(&mask_f32).unwrap();
+            assert!(
+                mean_sq_err < 1e-2,
+                "Mean Square Error between masks was greater than 1%: {:.2}%",
+                mean_sq_err * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn test_decoder_masks_u8_quant_signed() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+        let boxes = include_bytes!("../../../testdata/yolov8_boxes_116x8400.bin");
+        let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
+        let boxes: Vec<_> = boxes.iter().map(|x| *x as u8).collect();
+        let boxes = ndarray::Array2::from_shape_vec((116, 8400), boxes).unwrap();
+        let quant_boxes = Quantization::new_with_sign(0.021287761628627777, 31, true);
+
+        let protos = include_bytes!("../../../testdata/yolov8_protos_160x160x32.bin");
+        let protos =
+            unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
+
+        let protos: Vec<_> = protos.iter().map(|x| *x as u8).collect();
+        let protos = ndarray::Array3::from_shape_vec((160, 160, 32), protos.to_vec()).unwrap();
+        let quant_protos = Quantization::new_with_sign(0.02491161972284317, -117, true);
+        let mut output_boxes: Vec<_> = Vec::with_capacity(500);
+        let mut output_masks: Vec<_> = Vec::with_capacity(500);
+
+        decode_yolo_segdet_u8(
             (boxes.view(), quant_boxes),
             (protos.view(), quant_protos),
             score_threshold,
