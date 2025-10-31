@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use crate::{
-    Crop, Error, Flip, GREY, ImageConverterTrait, NV12, RGB, RGBA, Rect, Result, Rotation,
+    _8BPS, Crop, Error, Flip, GREY, ImageConverterTrait, NV12, RGB, RGBA, Rect, Result, Rotation,
     TensorImage, YUYV,
 };
 use edgefirst_tensor::{TensorMapTrait, TensorTrait};
@@ -527,14 +527,17 @@ impl CPUConverter {
             (RGBA, RGBA) => Self::copy_image(src, dst),
             (RGBA, GREY) => Self::convert_rgba_to_grey(src, dst),
             (RGBA, YUYV) => Self::convert_rgba_to_yuyv(src, dst),
+            (RGBA, _8BPS) => todo!(),
             (RGB, RGB) => Self::copy_image(src, dst),
             (RGB, RGBA) => Self::convert_rgb_to_rgba(src, dst),
             (RGB, GREY) => Self::convert_rgb_to_grey(src, dst),
             (RGB, YUYV) => Self::convert_rgb_to_yuyv(src, dst),
+            (RGB, _8BPS) => todo!(),
             (GREY, RGB) => Self::convert_grey_to_rgb(src, dst),
             (GREY, RGBA) => Self::convert_grey_to_rgba(src, dst),
             (GREY, GREY) => Self::copy_image(src, dst),
             (GREY, YUYV) => Self::convert_grey_to_yuyv(src, dst),
+            (GREY, _8BPS) => todo!(),
             (s, d) => Err(Error::NotSupported(format!(
                 "Conversion from {} to {}",
                 s.display(),
@@ -880,14 +883,17 @@ impl ImageConverterTrait for CPUConverter {
             (RGBA, RGBA) => RGBA,
             (RGBA, GREY) => GREY,
             (RGBA, YUYV) => RGBA, // RGB intermediary for YUYV dest resize/convert/rotation/flip
+            (RGBA, _8BPS) => RGBA,
             (RGB, RGB) => RGB,
             (RGB, RGBA) => RGB,
             (RGB, GREY) => GREY,
             (RGB, YUYV) => RGB, // RGB intermediary for YUYV dest resize/convert/rotation/flip
+            (RGB, _8BPS) => RGB,
             (GREY, RGB) => RGB,
             (GREY, RGBA) => RGBA,
             (GREY, GREY) => GREY,
             (GREY, YUYV) => GREY,
+            (GREY, _8BPS) => GREY,
             (s, d) => {
                 return Err(Error::NotSupported(format!(
                     "Conversion from {} to {}",

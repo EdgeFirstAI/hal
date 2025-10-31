@@ -44,7 +44,8 @@ pub const RGB: FourCharCode = four_char_code!("RGB ");
 /// 8 bit grayscale, full range
 pub const GREY: FourCharCode = four_char_code!("Y800");
 
-// TODO: planar RGB is 4BPS? https://fourcc.org/8bps/
+// TODO: planar RGB is 8BPS? https://fourcc.org/8bps/
+pub const _8BPS: FourCharCode = four_char_code!("8BPS");
 
 pub struct TensorImage {
     tensor: Tensor<u8>,
@@ -60,15 +61,16 @@ impl TensorImage {
         memory: Option<TensorMemory>,
     ) -> Result<Self> {
         let channels = fourcc_channels(fourcc)?;
+        let is_planar = fourcc_planar(fourcc)?;
 
-        if fourcc == NV12 {
+        if is_planar {
             let shape = vec![channels, height, width];
             let tensor = Tensor::new(&shape, memory, None)?;
 
             return Ok(Self {
                 tensor,
                 fourcc,
-                is_planar: true,
+                is_planar,
             });
         }
 
@@ -78,11 +80,11 @@ impl TensorImage {
         Ok(Self {
             tensor,
             fourcc,
-            is_planar: false,
+            is_planar,
         })
     }
 
-    pub fn from_tensor(tensor: Tensor<u8>, fourcc: FourCharCode, is_planar: bool) -> Result<Self> {
+    pub fn from_tensor(tensor: Tensor<u8>, fourcc: FourCharCode) -> Result<Self> {
         // Validate tensor shape based on the fourcc and is_planar flag
         let shape = tensor.shape();
         if shape.len() != 3 {
@@ -92,8 +94,9 @@ impl TensorImage {
                 shape
             )));
         }
-
+        let is_planar = fourcc_planar(fourcc)?;
         let channels = if is_planar { shape[0] } else { shape[2] };
+
         if fourcc_channels(fourcc)? != channels {
             return Err(Error::InvalidShape(format!(
                 "Invalid tensor shape {:?} for format {}",
@@ -688,7 +691,23 @@ fn fourcc_channels(fourcc: FourCharCode) -> Result<usize> {
         YUYV => Ok(2), // YUYV has 2 channels (Y and UV)
         GREY => Ok(1), // Y800 has 1 channel (Y)
         NV12 => Ok(2), // NV12 has 2 channel. 2nd channel is half empty
+        _8BPS => Ok(3),
         _ => Err(Error::InvalidShape(format!(
+            "Unsupported fourcc: {}",
+            fourcc.to_string()
+        ))),
+    }
+}
+
+fn fourcc_planar(fourcc: FourCharCode) -> Result<bool> {
+    match fourcc {
+        RGBA => Ok(false), // RGBA has 4 channels (R, G, B, A)
+        RGB => Ok(false),  // RGB has 3 channels (R, G, B)
+        YUYV => Ok(false), // YUYV has 2 channels (Y and UV)
+        GREY => Ok(false), // Y800 has 1 channel (Y)
+        NV12 => Ok(true),  // Planar YUV
+        _8BPS => Ok(true), // Planar RGB
+        _ => Err(Error::NotSupported(format!(
             "Unsupported fourcc: {}",
             fourcc.to_string()
         ))),
@@ -2068,6 +2087,46 @@ mod tests {
         .unwrap();
 
         compare_images_convert_to_rgb(&dst, &target_image, 0.98, function!());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[cfg(feature = "opengl")]
+    fn test_opengl_resize_8bps() {
+        let dst_width = 640;
+        let dst_height = 640;
+        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
+
+        // let mut cpu_dst = TensorImage::new(dst_width, dst_height, _8BPS,
+        // None).unwrap(); let mut cpu_converter = CPUConverter::new().unwrap();
+        // cpu_converter
+        //     .convert(
+        //         &src,
+        //         &mut cpu_dst,
+        //         Rotation::None,
+        //         Flip::None,
+        //         Crop::no_crop(),
+        //     )
+        //     .unwrap();
+        let mut gl_dst = TensorImage::new(dst_width, dst_height, _8BPS, None).unwrap();
+        let mut gl_converter = GLConverterThreaded::new().unwrap();
+
+        gl_converter
+            .convert(
+                &src,
+                &mut gl_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+        std::fs::write(
+            "test_planar_rgb.grey",
+            gl_dst.tensor.map().unwrap().as_slice(),
+        )
+        .unwrap();
+        // compare_images(&gl_dst, &cpu_dst, 0.98, function!());
     }
 
     fn load_bytes_to_tensor(
