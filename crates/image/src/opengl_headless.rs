@@ -37,7 +37,8 @@ macro_rules! function {
 }
 
 use crate::{
-    Crop, Error, Flip, GREY, ImageConverterTrait, NV12, RGB, RGBA, Rotation, TensorImage, YUYV,
+    _8BPS, Crop, Error, Flip, GREY, ImageConverterTrait, NV12, RGB, RGBA, Rotation, TensorImage,
+    YUYV,
 };
 
 pub(crate) struct GlContext {
@@ -661,17 +662,9 @@ impl GLConverterST {
         let frame_buffer = FrameBuffer::new();
         frame_buffer.bind();
 
-        let (width, height) = if dst.is_planar() && matches!(dst.fourcc(), RGB | RGBA) {
-            let width = src.width() / 4;
-            let height = match src.fourcc() {
-                RGBA => src.height() * 4,
-                RGB => src.height() * 3,
-                fourcc => {
-                    return Err(crate::Error::NotSupported(format!(
-                        "Unsupported Planar FourCC {fourcc:?}"
-                    )));
-                }
-            };
+        let (width, height) = if matches!(dst.fourcc(), _8BPS) {
+            let width = dst.width() / 4;
+            let height = dst.height() * 3;
             (width as i32, height as i32)
         } else {
             (dst.width() as i32, dst.height() as i32)
@@ -700,11 +693,12 @@ impl GLConverterST {
                 0,
             );
             check_gl_error(function!(), line!())?;
+            log::info!("setting width, height {}x{}", width, height);
             gls::gl::Viewport(0, 0, width, height);
         }
 
         if dst.is_planar() {
-            self.convert_to_planar(src, width as usize, crop)
+            self.convert_to_planar(src, dst, crop)
         } else {
             self.convert_to(src, dst, rotation, flip, crop)
         }
@@ -719,7 +713,7 @@ impl GLConverterST {
         crop: Crop,
     ) -> crate::Result<()> {
         log::trace!("convert_dest_non_dma: rot: {rotation:?} flip: {flip:?} crop: {crop:?}");
-        debug_assert!(matches!(dst.fourcc(), RGB | RGBA | GREY));
+        debug_assert!(matches!(dst.fourcc(), RGB | RGBA | GREY | _8BPS));
         let (width, height) = if dst.is_planar() {
             let width = src.width() / 4;
             let height = match src.fourcc() {
@@ -801,7 +795,7 @@ impl GLConverterST {
         log::debug!("Set up framebuffer takes {:?}", start.elapsed());
         let start = Instant::now();
         if dst.is_planar() {
-            self.convert_to_planar(src, width as usize, crop)?;
+            self.convert_to_planar(src, dst, crop)?;
         } else {
             self.convert_to(src, dst, rotation, flip, crop)?;
         }
@@ -925,7 +919,7 @@ impl GLConverterST {
     fn convert_to_planar(
         &self,
         src: &TensorImage,
-        width: usize,
+        dst: &TensorImage,
         crop: Crop,
     ) -> Result<(), crate::Error> {
         if let Some(crop) = crop.src_rect
@@ -955,7 +949,7 @@ impl GLConverterST {
             gls::gl::ClearColor(0.0, 0.0, 0.0, 0.0);
             gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
         };
-        self.draw_camera_texture_to_rgb_planar(&self.camera_texture, &new_egl_image, width)?;
+        self.draw_camera_texture_to_rgb_planar(&self.camera_texture, &new_egl_image, dst.width())?;
         unsafe { gls::gl::Finish() };
 
         Ok(())
@@ -967,9 +961,11 @@ impl GLConverterST {
         egl_img: &EglImage,
         width: usize,
     ) -> Result<(), Error> {
+        log::info!("draw_camera_texture_to_rgb_planar");
         let texture_target = gls::gl::TEXTURE_2D;
         unsafe {
-            self.texture_program.load_uniform_1f(c"width", width as f32);
+            self.texture_program_planar
+                .load_uniform_1f(c"width", width as f32);
             gls::gl::UseProgram(self.texture_program_planar.id);
             gls::gl::BindTexture(texture_target, texture.id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
@@ -988,7 +984,6 @@ impl GLConverterST {
 
             // starts from bottom
             for i in 0..3 {
-                self.texture_program.load_uniform_1i(c"color_index", 2 - i);
                 gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
                 gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
                 let camera_vertices: [f32; 12] = [
@@ -1005,6 +1000,7 @@ impl GLConverterST {
                     -1. / 3. + i as f32 * 2. / 3.,
                     0.,
                 ];
+                log::info!("camera_vertices: {camera_vertices:?}");
                 gls::gl::BufferData(
                     gls::gl::ARRAY_BUFFER,
                     (size_of::<f32>() * camera_vertices.len()) as isize,
@@ -1015,14 +1011,17 @@ impl GLConverterST {
                 gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
                 gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
                 let texture_vertices: [f32; 8] = [0., 1., 1., 1., 1., 0., 0., 0.];
-                gls::gl::BufferData(
+
+                gls::gl::BufferSubData(
                     gls::gl::ARRAY_BUFFER,
-                    (size_of::<f32>() * texture_vertices.len()) as isize,
+                    0,
+                    (size_of::<f32>() * 8) as isize,
                     texture_vertices.as_ptr() as *const c_void,
-                    gls::gl::DYNAMIC_DRAW,
                 );
 
                 let vertices_index: [u32; 4] = [0, 1, 2, 3];
+                self.texture_program_planar
+                    .load_uniform_1i(c"color_index", 2 - i);
                 gls::gl::DrawElements(
                     gls::gl::TRIANGLE_FAN,
                     vertices_index.len() as i32,
@@ -1287,22 +1286,20 @@ impl GLConverterST {
         let width;
         let height;
         let format;
-        if src.is_planar {
+        let channels;
+        if src.is_planar() {
             if !src.width().is_multiple_of(16) {
                 return Err(Error::NotSupported(
                     "OpenGL Planar RGB EGLImage doesn't support image widths which are not multiples of 16"
                         .to_string(),
                 ));
             }
-            width = src.width() / 4;
             match src.fourcc() {
-                RGBA => {
+                _8BPS => {
                     format = DrmFourcc::Abgr8888;
-                    height = src.height() * 4;
-                }
-                RGB => {
-                    format = DrmFourcc::Abgr8888;
+                    width = src.width() / 4;
                     height = src.height() * 3;
+                    channels = 4;
                 }
                 fourcc => {
                     return Err(crate::Error::NotSupported(format!(
@@ -1320,6 +1317,7 @@ impl GLConverterST {
             width = src.width();
             height = src.height();
             format = fourcc_to_drm(src.fourcc());
+            channels = src.channels();
         }
 
         let fd = match &src.tensor {
@@ -1344,7 +1342,7 @@ impl GLConverterST {
             khronos_egl::HEIGHT as Attrib,
             height as Attrib,
             egl_ext::DMA_BUF_PLANE0_PITCH as Attrib,
-            src.row_stride() as Attrib,
+            (width * channels) as Attrib,
             egl_ext::DMA_BUF_PLANE0_OFFSET as Attrib,
             0 as Attrib,
             egl_ext::DMA_BUF_PLANE0_FD as Attrib,
