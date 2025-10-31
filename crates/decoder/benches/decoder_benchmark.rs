@@ -123,7 +123,7 @@ fn decoder_yolo_f32(bencher: divan::Bencher) {
 }
 
 #[divan::bench()]
-fn decoder_f32_dequantize(bencher: divan::Bencher) {
+fn decoder_i8_dequantize(bencher: divan::Bencher) {
     let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
     let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
     let out = out.to_vec();
@@ -146,10 +146,54 @@ fn decoder_f32_dequantize(bencher: divan::Bencher) {
 }
 
 #[divan::bench()]
-fn decoder_f32_dequantize_chunked(bencher: divan::Bencher) {
+fn decoder_i8_dequantize_chunked(bencher: divan::Bencher) {
     let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
     let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
     let out = out.to_vec();
+    // let output = ndarray::Array2::from_shape_vec((84, 8400),
+    // output.clone()).unwrap();
+    let quant = Quantization {
+        scale: 0.0040811873,
+        zero_point: -123,
+        signed: false,
+    };
+    let buf = vec![0.0; 84 * 8400];
+    bencher
+        .with_inputs(|| buf.clone())
+        .bench_local_values(|mut buf| {
+            dequantize_cpu_chunked(&out, quant, &mut buf);
+            let out = ndarray::Array2::from_shape_vec((84, 8400), buf).unwrap();
+            black_box_drop(out);
+        });
+}
+
+#[divan::bench()]
+fn decoder_i16_dequantize(bencher: divan::Bencher) {
+    let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
+    let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
+    let out: Vec<_> = out.iter().map(|x| *x as i16 * *x as i16).collect();
+    // let output = ndarray::Array2::from_shape_vec((84, 8400),
+    // output.clone()).unwrap();
+    let quant = Quantization {
+        scale: 0.0040811873,
+        zero_point: -123,
+        signed: false,
+    };
+    let buf = vec![0.0; 84 * 8400];
+    bencher
+        .with_inputs(|| buf.clone())
+        .bench_local_values(|mut buf| {
+            dequantize_cpu(&out, quant, &mut buf);
+            let out = ndarray::Array2::from_shape_vec((84, 8400), buf).unwrap();
+            black_box_drop(out);
+        });
+}
+
+#[divan::bench()]
+fn decoder_i16_dequantize_chunked(bencher: divan::Bencher) {
+    let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
+    let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
+    let out: Vec<_> = out.iter().map(|x| *x as i16).collect();
     // let output = ndarray::Array2::from_shape_vec((84, 8400),
     // output.clone()).unwrap();
     let quant = Quantization {
