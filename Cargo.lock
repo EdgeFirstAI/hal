@@ -703,6 +703,7 @@ version = "1.0.1"
 dependencies = [
  "four-char-code",
  "libloading",
+ "log",
  "nix",
 ]
 
