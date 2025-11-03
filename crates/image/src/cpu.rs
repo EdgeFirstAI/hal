@@ -276,6 +276,27 @@ impl CPUConverter {
         )?)
     }
 
+    fn convert_grey_to_8bps(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), GREY);
+        assert_eq!(dst.fourcc(), PLANAR_RGB);
+
+        let src = src.tensor().map()?;
+        let src = src.as_slice();
+
+        let mut dst_map = dst.tensor().map()?;
+        let dst_ = dst_map.as_mut_slice();
+
+        let (dst0, dst1) = dst_.split_at_mut(dst.width() * dst.height());
+        let (dst1, dst2) = dst1.split_at_mut(dst.width() * dst.height());
+
+        rayon::scope(|s| {
+            s.spawn(|_| dst0.copy_from_slice(src));
+            s.spawn(|_| dst1.copy_from_slice(src));
+            s.spawn(|_| dst2.copy_from_slice(src));
+        });
+        Ok(())
+    }
+
     fn convert_grey_to_yuyv(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), GREY);
         assert_eq!(dst.fourcc(), YUYV);
@@ -331,6 +352,28 @@ impl CPUConverter {
             yuv::YuvRange::Full,
             yuv::YuvStandardMatrix::Bt709,
         )?)
+    }
+
+    fn convert_rgba_to_8bps(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), RGBA);
+        assert_eq!(dst.fourcc(), PLANAR_RGB);
+
+        let src = src.tensor().map()?;
+        let src = src.as_slice();
+        let src = src.as_chunks::<4>().0;
+
+        let mut dst_map = dst.tensor().map()?;
+        let dst_ = dst_map.as_mut_slice();
+
+        let (dst0, dst1) = dst_.split_at_mut(dst.width() * dst.height());
+        let (dst1, dst2) = dst1.split_at_mut(dst.width() * dst.height());
+
+        rayon::scope(|s| {
+            s.spawn(|_| dst0.iter_mut().zip(src).for_each(|(d, s)| *d = s[0]));
+            s.spawn(|_| dst1.iter_mut().zip(src).for_each(|(d, s)| *d = s[1]));
+            s.spawn(|_| dst2.iter_mut().zip(src).for_each(|(d, s)| *d = s[2]));
+        });
+        Ok(())
     }
 
     fn convert_rgba_to_yuyv(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
@@ -420,6 +463,28 @@ impl CPUConverter {
             yuv::YuvRange::Full,
             yuv::YuvStandardMatrix::Bt709,
         )?)
+    }
+
+    fn convert_rgb_to_8bps(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), RGB);
+        assert_eq!(dst.fourcc(), PLANAR_RGB);
+
+        let src = src.tensor().map()?;
+        let src = src.as_slice();
+        let src = src.as_chunks::<3>().0;
+
+        let mut dst_map = dst.tensor().map()?;
+        let dst_ = dst_map.as_mut_slice();
+
+        let (dst0, dst1) = dst_.split_at_mut(dst.width() * dst.height());
+        let (dst1, dst2) = dst1.split_at_mut(dst.width() * dst.height());
+
+        rayon::scope(|s| {
+            s.spawn(|_| dst0.iter_mut().zip(src).for_each(|(d, s)| *d = s[0]));
+            s.spawn(|_| dst1.iter_mut().zip(src).for_each(|(d, s)| *d = s[1]));
+            s.spawn(|_| dst2.iter_mut().zip(src).for_each(|(d, s)| *d = s[2]));
+        });
+        Ok(())
     }
 
     fn convert_rgb_to_yuyv(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
@@ -527,17 +592,17 @@ impl CPUConverter {
             (RGBA, RGBA) => Self::copy_image(src, dst),
             (RGBA, GREY) => Self::convert_rgba_to_grey(src, dst),
             (RGBA, YUYV) => Self::convert_rgba_to_yuyv(src, dst),
-            (RGBA, PLANAR_RGB) => todo!(),
+            (RGBA, PLANAR_RGB) => Self::convert_rgba_to_8bps(src, dst),
             (RGB, RGB) => Self::copy_image(src, dst),
             (RGB, RGBA) => Self::convert_rgb_to_rgba(src, dst),
             (RGB, GREY) => Self::convert_rgb_to_grey(src, dst),
             (RGB, YUYV) => Self::convert_rgb_to_yuyv(src, dst),
-            (RGB, PLANAR_RGB) => todo!(),
+            (RGB, PLANAR_RGB) => Self::convert_rgb_to_8bps(src, dst),
             (GREY, RGB) => Self::convert_grey_to_rgb(src, dst),
             (GREY, RGBA) => Self::convert_grey_to_rgba(src, dst),
             (GREY, GREY) => Self::copy_image(src, dst),
             (GREY, YUYV) => Self::convert_grey_to_yuyv(src, dst),
-            (GREY, PLANAR_RGB) => todo!(),
+            (GREY, PLANAR_RGB) => Self::convert_grey_to_8bps(src, dst),
             (s, d) => Err(Error::NotSupported(format!(
                 "Conversion from {} to {}",
                 s.display(),
@@ -744,6 +809,7 @@ impl CPUConverter {
             RGB => Self::fill_image_outside_crop_(dst, Self::rgba_to_rgb(rgba), crop),
             GREY => Self::fill_image_outside_crop_(dst, Self::rgba_to_grey(rgba), crop),
             YUYV => Self::fill_image_outside_crop_(dst, Self::rgba_to_yuyv(rgba), crop),
+            PLANAR_RGB => Self::fill_image_outside_crop_planar(dst, Self::rgba_to_rgb(rgba), crop),
             _ => Err(Error::Internal(format!(
                 "Found unexpected destination {}",
                 dst.fourcc.display()
@@ -760,6 +826,7 @@ impl CPUConverter {
             iter::{IntoParallelRefMutIterator, ParallelIterator},
             prelude::ParallelSliceMut,
         };
+
         let mut map = dst.tensor.map()?;
         let s = map.as_mut_slice().as_chunks_mut::<N>().0;
         // calculate the top/bottom
@@ -772,16 +839,10 @@ impl CPUConverter {
         s[top_offset.0..top_offset.1]
             .par_iter_mut()
             .for_each(|x| *x = pix);
-        // for p in &mut s[top_offset.0..top_offset.1] {
-        //     *p = pix;
-        // }
 
         s[bottom_offset.0..bottom_offset.1]
             .par_iter_mut()
             .for_each(|x| *x = pix);
-        // for p in &mut s[bottom_offset.0..bottom_offset.1] {
-        //     *p = pix;
-        // }
 
         if dst.width() == crop.width {
             return Ok(());
@@ -802,14 +863,59 @@ impl CPUConverter {
                 }
             });
 
-        // let middle =
-        // s[middle_offset.0..middle_offset.1].chunks_exact_mut(dst.width());
-        // for row in middle {
-        //     for p in &mut row[0..middle_stride] {
-        //         *p = pix;
-        //     }
-        // }
+        Ok(())
+    }
 
+    fn fill_image_outside_crop_planar<const N: usize>(
+        dst: &mut TensorImage,
+        pix: [u8; N],
+        crop: Rect,
+    ) -> Result<()> {
+        use rayon::{
+            iter::{IntoParallelRefMutIterator, ParallelIterator},
+            prelude::ParallelSliceMut,
+        };
+
+        let mut map = dst.tensor.map()?;
+        let mut s_rem = map.as_mut_slice();
+        for p in pix {
+            let (s, s1) = s_rem.split_at_mut(dst.height() * dst.width());
+            s_rem = s1;
+
+            // calculate the top/bottom
+            let top_offset = (0, (crop.top * dst.width() + crop.left));
+            let bottom_offset = (
+                ((crop.top + crop.height) * dst.width() + crop.left).min(s.len()),
+                s.len(),
+            );
+
+            s[top_offset.0..top_offset.1]
+                .par_iter_mut()
+                .for_each(|x| *x = p);
+
+            s[bottom_offset.0..bottom_offset.1]
+                .par_iter_mut()
+                .for_each(|x| *x = p);
+
+            if dst.width() == crop.width {
+                continue;
+            }
+
+            // the middle part has a stride as well
+            let middle_stride = dst.width() - crop.width;
+            let middle_offset = (
+                (crop.top * dst.width() + crop.left + crop.width),
+                ((crop.top + crop.height) * dst.width() + crop.left + crop.width).min(s.len()),
+            );
+
+            s[middle_offset.0..middle_offset.1]
+                .par_chunks_exact_mut(dst.width())
+                .for_each(|row| {
+                    for x in &mut row[0..middle_stride] {
+                        *x = p;
+                    }
+                });
+        }
         Ok(())
     }
 
