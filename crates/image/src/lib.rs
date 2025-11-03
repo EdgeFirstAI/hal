@@ -2092,6 +2092,35 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    fn test_cpu_resize_8bps() {
+        let dst_width = 640;
+        let dst_height = 640;
+        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
+
+        let mut cpu_dst = TensorImage::new(dst_width, dst_height, PLANAR_RGB, None).unwrap();
+        let mut cpu_converter = CPUConverter::new().unwrap();
+
+        cpu_converter
+            .convert(
+                &src,
+                &mut cpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::new()
+                    .with_dst_rect(Some(Rect {
+                        left: 102,
+                        top: 102,
+                        width: 440,
+                        height: 440,
+                    }))
+                    .with_dst_color(Some([114, 114, 114, 114])),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
     fn test_opengl_resize_8bps() {
         let dst_width = 640;
@@ -2099,17 +2128,34 @@ mod tests {
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
         let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
-        // let mut cpu_dst = TensorImage::new(dst_width, dst_height, _8BPS,
-        // None).unwrap(); let mut cpu_converter = CPUConverter::new().unwrap();
-        // cpu_converter
-        //     .convert(
-        //         &src,
-        //         &mut cpu_dst,
-        //         Rotation::None,
-        //         Flip::None,
-        //         Crop::no_crop(),
-        //     )
-        //     .unwrap();
+        let mut cpu_dst = TensorImage::new(dst_width, dst_height, PLANAR_RGB, None).unwrap();
+        let mut cpu_converter = CPUConverter::new().unwrap();
+        cpu_converter
+            .convert(
+                &src,
+                &mut cpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+        cpu_converter
+            .convert(
+                &src,
+                &mut cpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::new()
+                    .with_dst_rect(Some(Rect {
+                        left: 102,
+                        top: 102,
+                        width: 440,
+                        height: 440,
+                    }))
+                    .with_dst_color(Some([114, 114, 114, 114])),
+            )
+            .unwrap();
+
         let mut gl_dst = TensorImage::new(dst_width, dst_height, PLANAR_RGB, None).unwrap();
         let mut gl_converter = GLConverterThreaded::new().unwrap();
 
@@ -2129,12 +2175,7 @@ mod tests {
                     .with_dst_color(Some([114, 114, 114, 114])),
             )
             .unwrap();
-        std::fs::write(
-            "test_planar_rgb.grey",
-            gl_dst.tensor.map().unwrap().as_slice(),
-        )
-        .unwrap();
-        // compare_images(&gl_dst, &cpu_dst, 0.98, function!());
+        compare_images(&gl_dst, &cpu_dst, 0.98, function!());
     }
 
     fn load_bytes_to_tensor(
@@ -2154,9 +2195,10 @@ mod tests {
         assert_eq!(img1.width(), img2.width(), "Widths differ");
         assert_eq!(img1.fourcc(), img2.fourcc(), "FourCC differ");
         assert!(
-            matches!(img1.fourcc(), RGB | RGBA | GREY),
+            matches!(img1.fourcc(), RGB | RGBA | GREY | PLANAR_RGB),
             "FourCC must be RGB or RGBA for comparison"
         );
+
         let image1 = match img1.fourcc() {
             RGB => image::RgbImage::from_vec(
                 img1.width() as u32,
@@ -2174,6 +2216,13 @@ mod tests {
             GREY => image::GrayImage::from_vec(
                 img1.width() as u32,
                 img1.height() as u32,
+                img1.tensor().map().unwrap().to_vec(),
+            )
+            .unwrap()
+            .convert(),
+            PLANAR_RGB => image::GrayImage::from_vec(
+                img1.width() as u32,
+                (img1.height() * 3) as u32,
                 img1.tensor().map().unwrap().to_vec(),
             )
             .unwrap()
@@ -2198,6 +2247,13 @@ mod tests {
             GREY => image::GrayImage::from_vec(
                 img2.width() as u32,
                 img2.height() as u32,
+                img2.tensor().map().unwrap().to_vec(),
+            )
+            .unwrap()
+            .convert(),
+            PLANAR_RGB => image::GrayImage::from_vec(
+                img2.width() as u32,
+                (img2.height() * 3) as u32,
                 img2.tensor().map().unwrap().to_vec(),
             )
             .unwrap()
