@@ -22,7 +22,7 @@ impl G2DConverter {
         let mut g2d = G2D::new("libg2d.so.2")?;
         g2d.set_bt709_colorspace()?;
 
-        log::debug!("G2DConverter created");
+        log::debug!("G2DConverter created with version {:?}", g2d.version());
         Ok(Self { g2d })
     }
 

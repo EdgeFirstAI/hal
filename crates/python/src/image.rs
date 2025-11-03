@@ -107,12 +107,14 @@ pub enum ImageDest3<'py> {
 #[pyclass(eq, eq_int)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::upper_case_acronyms)]
+#[allow(non_camel_case_types)]
 pub enum FourCC {
     YUYV,
     RGBA,
     RGB,
     NV12,
     GREY,
+    PLANAR_RGB,
 }
 
 #[pyclass(eq, eq_int)]
@@ -143,6 +145,7 @@ impl TryFrom<&str> for FourCC {
             "RGB" | "RGB " => Ok(FourCC::RGB),
             "NV12" => Ok(FourCC::RGB),
             "Y800" | "GREY" | "GRAY" => Ok(FourCC::GREY),
+            "8BPS" => Ok(FourCC::PLANAR_RGB),
             _ => Err(Error::Format(value.to_string())),
         }
     }
@@ -156,6 +159,7 @@ impl From<FourCC> for FourCharCode {
             FourCC::RGB => image::RGB,
             FourCC::NV12 => image::NV12,
             FourCC::GREY => image::GREY,
+            FourCC::PLANAR_RGB => image::PLANAR_RGB,
         }
     }
 }
