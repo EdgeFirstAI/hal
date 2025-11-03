@@ -693,7 +693,6 @@ impl GLConverterST {
                 0,
             );
             check_gl_error(function!(), line!())?;
-            log::info!("setting width, height {}x{}", width, height);
             gls::gl::Viewport(0, 0, width, height);
         }
 
@@ -1040,7 +1039,6 @@ impl GLConverterST {
         rotation_offset: usize,
         flip: Flip,
     ) -> Result<(), Error> {
-        log::info!("draw_camera_texture_to_rgb_planar");
         let texture_target = gls::gl::TEXTURE_2D;
         match flip {
             Flip::None => {}
@@ -1116,7 +1114,6 @@ impl GLConverterST {
                     dst_roi.bottom / 3.0 + y_center,
                     0., // left bottom
                 ];
-                log::info!("camera_vertices: {camera_vertices:?}");
                 gls::gl::BufferData(
                     gls::gl::ARRAY_BUFFER,
                     (size_of::<f32>() * camera_vertices.len()) as isize,

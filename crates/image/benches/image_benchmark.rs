@@ -4,8 +4,8 @@ use edgefirst_image::G2DConverter;
 #[cfg(target_os = "linux")]
 use edgefirst_image::GLConverterThreaded;
 use edgefirst_image::{
-    CPUConverter, Crop, Flip, GREY, ImageConverterTrait as _, RGB, RGBA, Rotation, TensorImage,
-    YUYV,
+    CPUConverter, Crop, Flip, GREY, ImageConverterTrait as _, PLANAR_RGB, RGB, RGBA, Rotation,
+    TensorImage, YUYV,
 };
 use edgefirst_tensor::{TensorMapTrait, TensorMemory, TensorTrait};
 use four_char_code::FourCharCode;
@@ -563,6 +563,38 @@ where
     drop(gl_dst);
 }
 
+#[cfg(feature = "opengl")]
+#[divan::bench(types = [Person, Zidane], ignore = !dma_available())]
+fn convert_opengl_rgba_to_planar<IMAGE>(bencher: divan::Bencher)
+where
+    IMAGE: TestImage,
+{
+    let name = format!("{}.jpg", IMAGE::filename());
+    let path = if Path::new("./testdata").join(&name).exists() {
+        Path::new("./testdata").join(&name)
+    } else if Path::new("../testdata").join(&name).exists() {
+        Path::new("../testdata").join(&name)
+    } else if Path::new("../../testdata").join(&name).exists() {
+        Path::new("../../testdata").join(&name)
+    } else {
+        Path::new("../../../testdata").join(&name)
+    };
+    assert!(path.exists(), "unable to locate test image at {path:?}");
+
+    let file = std::fs::read(path).unwrap();
+
+    let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
+    let mut dst = TensorImage::new(640, 640, PLANAR_RGB, None).unwrap();
+
+    let mut converter = GLConverterThreaded::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
 #[divan::bench(types = [Rotate0, Rotate90, Rotate180, Rotate270], args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
 fn rotate_cpu<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) {
     let (mut width, mut height) = params;
@@ -744,6 +776,37 @@ where
 
     let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
     let mut dst = TensorImage::new(src.width(), src.height(), RGB, None).unwrap();
+
+    let mut converter = CPUConverter::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[divan::bench(types = [Jaguar, Person, Zidane])]
+fn convert_cpu_rgba_to_planar<IMAGE>(bencher: divan::Bencher)
+where
+    IMAGE: TestImage,
+{
+    let name = format!("{}.jpg", IMAGE::filename());
+    let path = if Path::new("./testdata").join(&name).exists() {
+        Path::new("./testdata").join(&name)
+    } else if Path::new("../testdata").join(&name).exists() {
+        Path::new("../testdata").join(&name)
+    } else if Path::new("../../testdata").join(&name).exists() {
+        Path::new("../../testdata").join(&name)
+    } else {
+        Path::new("../../../testdata").join(&name)
+    };
+    assert!(path.exists(), "unable to locate test image at {path:?}");
+
+    let file = std::fs::read(path).unwrap();
+
+    let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
+    let mut dst = TensorImage::new(640, 640, PLANAR_RGB, None).unwrap();
 
     let mut converter = CPUConverter::new().unwrap();
 

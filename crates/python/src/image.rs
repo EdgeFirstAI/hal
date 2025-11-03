@@ -252,7 +252,8 @@ impl PyTensorImage {
         let _timer = FunctionTimer::new("normalize_to_numpy".to_string());
 
         let tensor = &self.0;
-        let shape = [tensor.height(), tensor.width(), tensor.channels()];
+        let shape = tensor.tensor().shape();
+        let shape = [shape[0], shape[1], shape[2]];
         let dst_shape = match &dst {
             ImageDest3::UInt8(dst) => dst.shape(),
             ImageDest3::Int8(dst) => dst.shape(),
