@@ -584,7 +584,7 @@ where
     let file = std::fs::read(path).unwrap();
 
     let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
-    let mut dst = TensorImage::new(640, 640, PLANAR_RGB, None).unwrap();
+    let mut dst = TensorImage::new(src.width(), src.height(), PLANAR_RGB, None).unwrap();
 
     let mut converter = GLConverterThreaded::new().unwrap();
 
@@ -806,7 +806,38 @@ where
     let file = std::fs::read(path).unwrap();
 
     let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
-    let mut dst = TensorImage::new(640, 640, PLANAR_RGB, None).unwrap();
+    let mut dst = TensorImage::new(src.width(), src.height(), PLANAR_RGB, None).unwrap();
+
+    let mut converter = CPUConverter::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[divan::bench(types = [Jaguar, Person, Zidane])]
+fn convert_cpu_rgb_to_planar<IMAGE>(bencher: divan::Bencher)
+where
+    IMAGE: TestImage,
+{
+    let name = format!("{}.jpg", IMAGE::filename());
+    let path = if Path::new("./testdata").join(&name).exists() {
+        Path::new("./testdata").join(&name)
+    } else if Path::new("../testdata").join(&name).exists() {
+        Path::new("../testdata").join(&name)
+    } else if Path::new("../../testdata").join(&name).exists() {
+        Path::new("../../testdata").join(&name)
+    } else {
+        Path::new("../../../testdata").join(&name)
+    };
+    assert!(path.exists(), "unable to locate test image at {path:?}");
+
+    let file = std::fs::read(path).unwrap();
+
+    let src = TensorImage::load_jpeg(&file, Some(RGB), None).unwrap();
+    let mut dst = TensorImage::new(src.width(), src.height(), PLANAR_RGB, None).unwrap();
 
     let mut converter = CPUConverter::new().unwrap();
 

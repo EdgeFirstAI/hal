@@ -7,6 +7,7 @@ use crate::{
 use edgefirst_tensor::{TensorMapTrait, TensorTrait};
 use four_char_code::FourCharCode;
 use ndarray::{ArrayView3, ArrayViewMut3, Axis};
+use rayon::iter::IndexedParallelIterator;
 
 /// CPUConverter implements the ImageConverter trait using the fallback CPU
 /// implementation for image processing.
@@ -30,6 +31,10 @@ fn full_to_limit(l: u8) -> u8 {
 
 impl CPUConverter {
     pub fn new() -> Result<Self> {
+        Self::new_bilinear()
+    }
+
+    pub fn new_bilinear() -> Result<Self> {
         let resizer = fast_image_resize::Resizer::new();
         let options = fast_image_resize::ResizeOptions::new()
             .resize_alg(fast_image_resize::ResizeAlg::Interpolation(
@@ -46,6 +51,7 @@ impl CPUConverter {
         let options = fast_image_resize::ResizeOptions::new()
             .resize_alg(fast_image_resize::ResizeAlg::Nearest)
             .use_alpha(false);
+        log::debug!("CPUConverter created");
         Ok(Self { resizer, options })
     }
 
@@ -877,45 +883,46 @@ impl CPUConverter {
         };
 
         let mut map = dst.tensor.map()?;
-        let mut s_rem = map.as_mut_slice();
-        for p in pix {
-            let (s, s1) = s_rem.split_at_mut(dst.height() * dst.width());
-            s_rem = s1;
+        // map.as_mut_slice().splitn_mut(n, pred)
+        let s_rem = map.as_mut_slice();
 
-            // calculate the top/bottom
-            let top_offset = (0, (crop.top * dst.width() + crop.left));
-            let bottom_offset = (
-                ((crop.top + crop.height) * dst.width() + crop.left).min(s.len()),
-                s.len(),
-            );
+        s_rem
+            .par_chunks_exact_mut(dst.height() * dst.width())
+            .zip(pix)
+            .for_each(|(s, p)| {
+                let top_offset = (0, (crop.top * dst.width() + crop.left));
+                let bottom_offset = (
+                    ((crop.top + crop.height) * dst.width() + crop.left).min(s.len()),
+                    s.len(),
+                );
 
-            s[top_offset.0..top_offset.1]
-                .par_iter_mut()
-                .for_each(|x| *x = p);
+                s[top_offset.0..top_offset.1]
+                    .par_iter_mut()
+                    .for_each(|x| *x = p);
 
-            s[bottom_offset.0..bottom_offset.1]
-                .par_iter_mut()
-                .for_each(|x| *x = p);
+                s[bottom_offset.0..bottom_offset.1]
+                    .par_iter_mut()
+                    .for_each(|x| *x = p);
 
-            if dst.width() == crop.width {
-                continue;
-            }
+                if dst.width() == crop.width {
+                    return;
+                }
 
-            // the middle part has a stride as well
-            let middle_stride = dst.width() - crop.width;
-            let middle_offset = (
-                (crop.top * dst.width() + crop.left + crop.width),
-                ((crop.top + crop.height) * dst.width() + crop.left + crop.width).min(s.len()),
-            );
+                // the middle part has a stride as well
+                let middle_stride = dst.width() - crop.width;
+                let middle_offset = (
+                    (crop.top * dst.width() + crop.left + crop.width),
+                    ((crop.top + crop.height) * dst.width() + crop.left + crop.width).min(s.len()),
+                );
 
-            s[middle_offset.0..middle_offset.1]
-                .par_chunks_exact_mut(dst.width())
-                .for_each(|row| {
-                    for x in &mut row[0..middle_stride] {
-                        *x = p;
-                    }
-                });
-        }
+                s[middle_offset.0..middle_offset.1]
+                    .par_chunks_exact_mut(dst.width())
+                    .for_each(|row| {
+                        for x in &mut row[0..middle_stride] {
+                            *x = p;
+                        }
+                    });
+            });
         Ok(())
     }
 
