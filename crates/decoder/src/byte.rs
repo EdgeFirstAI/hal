@@ -1,23 +1,20 @@
-use crate::{
-    BBoxTypeTrait, BoundingBoxQuantized, DetectBoxQuantized, Quantization, ReinterpretSigns,
-    arg_max,
-};
+use crate::{BBoxTypeTrait, BoundingBoxQuantized, DetectBoxQuantized, Quantization, arg_max};
 use ndarray::{
     ArrayView1, ArrayView2, Zip,
     parallel::prelude::{IntoParallelIterator, ParallelIterator as _},
 };
-use num_traits::{AsPrimitive, PrimInt};
+use num_traits::{AsPrimitive, ConstZero, PrimInt, Signed};
 
 pub fn postprocess_boxes_8bit<
     B: BBoxTypeTrait,
-    Boxes: PrimInt + Send + Sync + ReinterpretSigns<Signed = i8, Unsigned = u8>,
-    Scores: PrimInt + AsPrimitive<i16> + Send + Sync,
+    Boxes: PrimInt + AsPrimitive<i32> + Send + Sync,
+    Scores: PrimInt + AsPrimitive<f32> + Send + Sync,
 >(
     threshold: Scores,
     boxes: ArrayView2<Boxes>,
     scores: ArrayView2<Scores>,
     quant: Quantization,
-) -> Vec<DetectBoxQuantized<i16>> {
+) -> Vec<DetectBoxQuantized<i32, Scores>> {
     assert_eq!(scores.dim().0, boxes.dim().0);
     assert_eq!(boxes.dim().1, 4);
     let zp = quant.zero_point.as_();
@@ -30,14 +27,10 @@ pub fn postprocess_boxes_8bit<
                 return None;
             }
 
-            let bbox_quant = if quant.signed {
-                B::ndarray_to_xyxy_quant(bbox.map(|x| x.reinterp_signed()).view(), zp)
-            } else {
-                B::ndarray_to_xyxy_quant(bbox.map(|x| x.reinterp_unsigned()).view(), zp)
-            };
-            Some(DetectBoxQuantized::<i16> {
+            let bbox_quant = B::ndarray_to_xyxy_quant(bbox.map(|x| x.as_()).view(), zp);
+            Some(DetectBoxQuantized {
                 label,
-                score: score_.as_(),
+                score: score_,
                 bbox: BoundingBoxQuantized::from_array(&bbox_quant),
             })
         })
@@ -47,8 +40,8 @@ pub fn postprocess_boxes_8bit<
 pub fn postprocess_boxes_extra_8bit<
     'a,
     B: BBoxTypeTrait,
-    Boxes: PrimInt + Send + Sync + ReinterpretSigns<Signed = i8, Unsigned = u8>,
-    Scores: PrimInt + AsPrimitive<i16> + Send + Sync,
+    Boxes: PrimInt + AsPrimitive<i32> + Send + Sync,
+    Scores: PrimInt + AsPrimitive<f32> + Send + Sync,
     E: Send + Sync,
 >(
     threshold: Scores,
@@ -56,10 +49,10 @@ pub fn postprocess_boxes_extra_8bit<
     scores: ArrayView2<Scores>,
     extra: &'a ArrayView2<E>,
     quant_boxes: Quantization,
-) -> Vec<(DetectBoxQuantized<i16>, ArrayView1<'a, E>)> {
+) -> Vec<(DetectBoxQuantized<i32, Scores>, ArrayView1<'a, E>)> {
     assert_eq!(scores.dim().0, boxes.dim().0);
     assert_eq!(boxes.dim().1, 4);
-    let zp = quant_boxes.zero_point as i16;
+    let zp = quant_boxes.zero_point;
     Zip::from(scores.rows())
         .and(boxes.rows())
         .and(extra.rows())
@@ -70,16 +63,12 @@ pub fn postprocess_boxes_extra_8bit<
                 return None;
             }
 
-            let bbox_quant = if quant_boxes.signed {
-                B::ndarray_to_xyxy_quant(bbox.map(|x| x.reinterp_signed()).view(), zp)
-            } else {
-                B::ndarray_to_xyxy_quant(bbox.map(|x| x.reinterp_unsigned()).view(), zp)
-            };
+            let bbox_quant = B::ndarray_to_xyxy_quant(bbox.map(|x| x.as_()).view(), zp);
 
             Some((
-                DetectBoxQuantized::<i16> {
+                DetectBoxQuantized {
                     label,
-                    score: score_.as_(),
+                    score: score_,
                     bbox: BoundingBoxQuantized::from_array(&bbox_quant),
                 },
                 mask,
@@ -88,11 +77,18 @@ pub fn postprocess_boxes_extra_8bit<
         .collect()
 }
 
-pub fn nms_i16(iou: f32, mut boxes: Vec<DetectBoxQuantized<i16>>) -> Vec<DetectBoxQuantized<i16>> {
+pub fn nms_int<
+    BOX: Signed + PrimInt + AsPrimitive<DEST> + AsPrimitive<f32>,
+    SCORE: PrimInt + AsPrimitive<f32>,
+    DEST: PrimInt + 'static + AsPrimitive<f32>,
+>(
+    iou: f32,
+    mut boxes: Vec<DetectBoxQuantized<BOX, SCORE>>,
+) -> Vec<DetectBoxQuantized<BOX, SCORE>> {
     // Boxes get sorted by score in descending order so we know based on the
     // index the scoring of the boxes and can skip parts of the loop.
     boxes.sort_by(|a, b| b.score.cmp(&a.score));
-    let min_val = i16::MIN;
+    let min_val = SCORE::min_value();
     // Outer loop over all boxes.
     for i in 0..boxes.len() {
         if boxes[i].score <= min_val {
@@ -106,7 +102,7 @@ pub fn nms_i16(iou: f32, mut boxes: Vec<DetectBoxQuantized<i16>>) -> Vec<DetectB
                 // this box was suppressed by different box earlier
                 continue;
             }
-            if jaccard_i16(&boxes[j].bbox, &boxes[i].bbox, iou) {
+            if jaccard_int::<BOX, DEST>(&boxes[j].bbox, &boxes[i].bbox, iou) {
                 // suppress this box
                 boxes[j].score = min_val;
             }
@@ -117,14 +113,19 @@ pub fn nms_i16(iou: f32, mut boxes: Vec<DetectBoxQuantized<i16>>) -> Vec<DetectB
     boxes.into_iter().filter(|b| b.score > min_val).collect()
 }
 
-pub fn nms_extra_i16<E>(
+pub fn nms_extra_int<
+    BOX: ConstZero + Signed + PrimInt + AsPrimitive<DEST> + AsPrimitive<f32>,
+    SCORE: PrimInt + AsPrimitive<f32>,
+    DEST: ConstZero + PrimInt + 'static + AsPrimitive<f32>,
+    E,
+>(
     iou: f32,
-    mut boxes: Vec<(DetectBoxQuantized<i16>, E)>,
-) -> Vec<(DetectBoxQuantized<i16>, E)> {
+    mut boxes: Vec<(DetectBoxQuantized<BOX, SCORE>, E)>,
+) -> Vec<(DetectBoxQuantized<BOX, SCORE>, E)> {
     // Boxes get sorted by score in descending order so we know based on the
     // index the scoring of the boxes and can skip parts of the loop.
     boxes.sort_by(|a, b| b.0.score.cmp(&a.0.score));
-    let min_val = i16::MIN;
+    let min_val = SCORE::min_value();
     // Outer loop over all boxes.
     for i in 0..boxes.len() {
         if boxes[i].0.score <= min_val {
@@ -138,7 +139,7 @@ pub fn nms_extra_i16<E>(
                 // this box was suppressed by different box earlier
                 continue;
             }
-            if jaccard_i16(&boxes[j].0.bbox, &boxes[i].0.bbox, iou) {
+            if jaccard_int::<BOX, DEST>(&boxes[j].0.bbox, &boxes[i].0.bbox, iou) {
                 // suppress this box
                 boxes[j].0.score = min_val;
             }
@@ -150,22 +151,32 @@ pub fn nms_extra_i16<E>(
 }
 
 // Returns true if the IOU of the given boxes are greater than the iou threshold
-fn jaccard_i16(a: &BoundingBoxQuantized<i16>, b: &BoundingBoxQuantized<i16>, iou: f32) -> bool {
+fn jaccard_int<
+    BOX: Signed + PrimInt + AsPrimitive<DEST> + AsPrimitive<f32>,
+    DEST: PrimInt + 'static + AsPrimitive<f32>,
+>(
+    a: &BoundingBoxQuantized<BOX>,
+    b: &BoundingBoxQuantized<BOX>,
+    iou: f32,
+) -> bool {
     let left = a.xmin.max(b.xmin);
     let top = a.ymin.max(b.ymin);
     let right = a.xmax.min(b.xmax);
     let bottom = a.ymax.min(b.ymax);
+    let zero = BOX::zero();
+    let as_dst = num_traits::AsPrimitive::<DEST>::as_;
 
-    let intersection = (right - left).max(0) as i32 * (bottom - top).max(0) as i32;
-    let area_a = (a.xmax - a.xmin) as i32 * (a.ymax - a.ymin) as i32;
-    let area_b = (b.xmax - b.xmin) as i32 * (b.ymax - b.ymin) as i32;
+    let intersection = as_dst((right - left).max(zero)) * as_dst((bottom - top).max(zero));
+
+    let area_a = as_dst(a.xmax - a.xmin) * as_dst(a.ymax - a.ymin);
+    let area_b = as_dst(b.xmax - b.xmin) * as_dst(b.ymax - b.ymin);
 
     // need to make sure we are not dividing by zero
     let union = area_a + area_b - intersection;
-    if union <= 0 {
+    if union <= DEST::zero() {
         return 0.0 > iou;
     }
-    intersection as f32 / union as f32 > iou
+    intersection.as_() / union.as_() > iou
 }
 
 pub(crate) fn quantize_score_threshold<T: PrimInt + AsPrimitive<f32>>(

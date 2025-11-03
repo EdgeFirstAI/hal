@@ -5,10 +5,14 @@ use ndarray::{
 };
 use num_traits::{AsPrimitive, Float};
 
-pub fn postprocess_boxes_float<B: BBoxTypeTrait, T: Float + AsPrimitive<f32> + Send + Sync>(
-    threshold: T,
-    boxes: ArrayView2<T>,
-    scores: ArrayView2<T>,
+pub fn postprocess_boxes_float<
+    B: BBoxTypeTrait,
+    BOX: Float + AsPrimitive<f32> + Send + Sync,
+    SCORE: Float + AsPrimitive<f32> + Send + Sync,
+>(
+    threshold: SCORE,
+    boxes: ArrayView2<BOX>,
+    scores: ArrayView2<SCORE>,
 ) -> Vec<DetectBox> {
     assert_eq!(scores.dim().0, boxes.dim().0);
     assert_eq!(boxes.dim().1, 4);
@@ -34,14 +38,15 @@ pub fn postprocess_boxes_float<B: BBoxTypeTrait, T: Float + AsPrimitive<f32> + S
 pub fn postprocess_boxes_extra_float<
     'a,
     B: BBoxTypeTrait,
-    T: Float + AsPrimitive<f32> + Send + Sync,
+    BOX: Float + AsPrimitive<f32> + Send + Sync,
+    SCORE: Float + AsPrimitive<f32> + Send + Sync,
     E: Send + Sync,
 >(
-    threshold: T,
-    boxes: ArrayView2<T>,
-    scores: ArrayView2<T>,
-    extra: &'a ArrayView2<T>,
-) -> Vec<(DetectBox, ArrayView1<'a, T>)> {
+    threshold: SCORE,
+    boxes: ArrayView2<BOX>,
+    scores: ArrayView2<SCORE>,
+    extra: &'a ArrayView2<E>,
+) -> Vec<(DetectBox, ArrayView1<'a, E>)> {
     assert_eq!(scores.dim().0, boxes.dim().0);
     assert_eq!(boxes.dim().1, 4);
     Zip::from(scores.rows())

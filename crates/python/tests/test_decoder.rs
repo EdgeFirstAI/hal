@@ -333,7 +333,6 @@ fn test_dequantize() -> PyResult<()> {
             Quantization {
                 scale: 0.0040811873,
                 zero_point: -123,
-                signed: false,
             },
             &mut rust_dequantize,
         );

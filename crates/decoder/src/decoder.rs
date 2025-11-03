@@ -4,7 +4,7 @@ use num_traits::AsPrimitive;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DetectBox, Error, Quantization, ReinterpretSigns, Segmentation,
+    DetectBox, Error, Quantization, Segmentation,
     configs::{DecoderType, ModelType, QuantTuple},
     modelpack::{
         ModelPackDetectionConfig, decode_modelpack_f32, decode_modelpack_f64, decode_modelpack_i8,
@@ -85,10 +85,10 @@ pub mod configs {
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, PartialEq, Serialize, Deserialize, Clone, Copy)]
-    pub struct QuantTuple(pub f32, pub i32, #[serde(default)] pub bool);
-    impl From<QuantTuple> for (f32, i32, bool) {
+    pub struct QuantTuple(pub f32, pub i32);
+    impl From<QuantTuple> for (f32, i32) {
         fn from(value: QuantTuple) -> Self {
-            (value.0, value.1, value.2)
+            (value.0, value.1)
         }
     }
 
@@ -805,7 +805,7 @@ impl Decoder {
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<(), Error>
     where
-        D: AsPrimitive<f32> + ReinterpretSigns<Signed = i8, Unsigned = u8>,
+        D: AsPrimitive<f32>,
         i64: AsPrimitive<D>,
     {
         let new_outputs = Self::match_outputs_to_detect(detection, outputs)?;
@@ -1587,8 +1587,8 @@ impl Decoder {
 
         decode_yolo_f64(
             boxes_tensor,
-            self.score_threshold as f64,
-            self.iou_threshold as f64,
+            self.score_threshold,
+            self.iou_threshold,
             output_boxes,
         );
         Ok(())
@@ -1618,8 +1618,8 @@ impl Decoder {
         decode_yolo_segdet_f64(
             boxes_tensor,
             protos_tensor,
-            self.score_threshold as f64,
-            self.iou_threshold as f64,
+            self.score_threshold,
+            self.iou_threshold,
             output_boxes,
             output_masks,
         );
@@ -1650,8 +1650,8 @@ impl Decoder {
         decode_yolo_split_det_f64(
             boxes_tensor,
             scores_tensor,
-            self.score_threshold as f64,
-            self.iou_threshold as f64,
+            self.score_threshold,
+            self.iou_threshold,
             output_boxes,
         );
         Ok(())
@@ -1702,8 +1702,8 @@ impl Decoder {
             scores_tensor,
             mask_tensor,
             protos_tensor,
-            self.score_threshold as f64,
-            self.iou_threshold as f64,
+            self.score_threshold,
+            self.iou_threshold,
             output_boxes,
             output_masks,
         );

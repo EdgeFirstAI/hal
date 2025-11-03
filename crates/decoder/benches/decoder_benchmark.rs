@@ -3,8 +3,8 @@
 use divan::black_box_drop;
 use edgefirst_decoder::{
     Quantization, XYWH,
-    byte::{nms_i16, postprocess_boxes_8bit},
-    dequant_detect_box_i16, dequantize_cpu, dequantize_cpu_chunked, dequantize_ndarray,
+    byte::{nms_int, postprocess_boxes_8bit},
+    dequant_detect_box, dequantize_cpu, dequantize_cpu_chunked, dequantize_ndarray,
     float::{nms_f32, postprocess_boxes_float},
     modelpack::{ModelPackDetectionConfig, decode_modelpack_split, decode_modelpack_u8},
     yolo::{decode_yolo_f32, decode_yolo_i8, decode_yolo_segdet_f32, decode_yolo_segdet_i8},
@@ -21,7 +21,6 @@ fn decoder_yolo_quant(bencher: divan::Bencher) {
     let quant = Quantization {
         scale: 0.0040811873,
         zero_point: -123,
-        signed: false,
     };
 
     bencher.bench_local(|| {
@@ -44,7 +43,6 @@ fn decoder_quant_decode_boxes(bencher: divan::Bencher) {
     let quant = Quantization {
         scale: 0.0040811873,
         zero_point: -123,
-        signed: false,
     };
     let score_threshold = (score_threshold / quant.scale + quant.zero_point as f32) as i8;
     let boxes_tensor = out.slice(s![..4, ..,]).reversed_axes();
@@ -71,7 +69,6 @@ fn decoder_quant_nms(bencher: divan::Bencher) {
     let quant = Quantization {
         scale: 0.0040811873,
         zero_point: -123,
-        signed: false,
     };
     let mut output_boxes: Vec<_> = Vec::with_capacity(50);
     let out = ndarray::Array2::from_shape_vec((84, 8400), out.clone()).unwrap();
@@ -83,11 +80,11 @@ fn decoder_quant_nms(bencher: divan::Bencher) {
     bencher
         .with_inputs(|| boxes.clone())
         .bench_local_values(|boxes| {
-            let boxes = nms_i16(iou_threshold, boxes);
+            let boxes = nms_int::<_, _, i32>(iou_threshold, boxes);
             let len = output_boxes.capacity().min(boxes.len());
             output_boxes.clear();
             for b in boxes.iter().take(len) {
-                output_boxes.push(dequant_detect_box_i16(b, quant, quant));
+                output_boxes.push(dequant_detect_box(b, quant, quant));
             }
         });
 }
@@ -102,7 +99,6 @@ fn decoder_yolo_f32(bencher: divan::Bencher) {
     let quant = Quantization {
         scale: 0.0040811873,
         zero_point: -123,
-        signed: false,
     };
 
     bencher
@@ -132,7 +128,6 @@ fn decoder_i8_dequantize(bencher: divan::Bencher) {
     let quant = Quantization {
         scale: 0.0040811873,
         zero_point: -123,
-        signed: false,
     };
 
     let buf = vec![0.0; 84 * 8400];
@@ -155,7 +150,6 @@ fn decoder_i8_dequantize_chunked(bencher: divan::Bencher) {
     let quant = Quantization {
         scale: 0.0040811873,
         zero_point: -123,
-        signed: false,
     };
     let buf = vec![0.0; 84 * 8400];
     bencher
@@ -177,7 +171,6 @@ fn decoder_i16_dequantize(bencher: divan::Bencher) {
     let quant = Quantization {
         scale: 0.0040811873,
         zero_point: -123,
-        signed: false,
     };
     let buf = vec![0.0; 84 * 8400];
     bencher
@@ -199,7 +192,6 @@ fn decoder_i16_dequantize_chunked(bencher: divan::Bencher) {
     let quant = Quantization {
         scale: 0.0040811873,
         zero_point: -123,
-        signed: false,
     };
     let buf = vec![0.0; 84 * 8400];
     bencher
@@ -222,7 +214,6 @@ fn decoder_f32_decode_boxes(bencher: divan::Bencher) {
     let quant = Quantization {
         scale: 0.0040811873,
         zero_point: -123,
-        signed: false,
     };
     let mut buf = vec![0.0; 84 * 8400];
     dequantize_cpu_chunked(&out, quant, &mut buf);
@@ -234,7 +225,7 @@ fn decoder_f32_decode_boxes(bencher: divan::Bencher) {
             let boxes_tensor = out.slice(s![..4, ..,]).reversed_axes();
             let scores_tensor = out.slice(s![4..(80 + 4), ..,]).reversed_axes();
             let boxes =
-                postprocess_boxes_float::<XYWH, _>(score_threshold, boxes_tensor, scores_tensor);
+                postprocess_boxes_float::<XYWH, _, _>(score_threshold, boxes_tensor, scores_tensor);
             black_box_drop(boxes);
         });
 }
@@ -251,14 +242,13 @@ fn decoder_f32_nms(bencher: divan::Bencher) {
     let quant = Quantization {
         scale: 0.0040811873,
         zero_point: -123,
-        signed: false,
     };
     let mut buf = vec![0.0; 84 * 8400];
     dequantize_cpu_chunked(&out, quant, &mut buf);
     let out = ndarray::Array2::from_shape_vec((84, 8400), buf).unwrap();
     let boxes_tensor = out.slice(s![..4, ..,]).reversed_axes();
     let scores_tensor = out.slice(s![4..(80 + 4), ..,]).reversed_axes();
-    let boxes = postprocess_boxes_float::<XYWH, _>(score_threshold, boxes_tensor, scores_tensor);
+    let boxes = postprocess_boxes_float::<XYWH, _, _>(score_threshold, boxes_tensor, scores_tensor);
     bencher
         .with_inputs(|| boxes.clone())
         .bench_local_values(|boxes| {
@@ -286,13 +276,11 @@ fn decoder_modelpack_u8(bencher: divan::Bencher) {
     let quant_boxes = Quantization {
         scale: 0.004656755365431309,
         zero_point: 21,
-        signed: false,
     };
 
     let quant_scores = Quantization {
         scale: 0.0019603664986789227,
         zero_point: 0,
-        signed: false,
     };
 
     let mut output_boxes: Vec<_> = Vec::with_capacity(50);
@@ -322,7 +310,6 @@ fn decoder_modelpack_split_u8(bencher: divan::Bencher) {
         quantization: Some(Quantization {
             scale: 0.08547406643629074,
             zero_point: 174,
-            signed: false,
         }),
     };
 
@@ -337,7 +324,6 @@ fn decoder_modelpack_split_u8(bencher: divan::Bencher) {
         quantization: Some(Quantization {
             scale: 0.09929127991199493,
             zero_point: 183,
-            signed: false,
         }),
     };
     let outputs = [detect0.view(), detect1.view()];
@@ -364,7 +350,6 @@ fn decoder_masks(bencher: divan::Bencher) {
     let quant_boxes = Quantization {
         scale: 0.01948494464159012,
         zero_point: 20,
-        signed: false,
     };
 
     let protos = include_bytes!("../../../testdata/yolov8_protos_160x160x32.bin");
@@ -373,7 +358,6 @@ fn decoder_masks(bencher: divan::Bencher) {
     let quant_protos = Quantization {
         scale: 0.020889872685074806,
         zero_point: -115,
-        signed: false,
     };
 
     bencher.bench_local(|| {
@@ -404,7 +388,6 @@ fn decoder_masks_i8(bencher: divan::Bencher) {
     let quant_boxes = Quantization {
         scale: 0.01948494464159012,
         zero_point: 20,
-        signed: false,
     };
 
     let protos = include_bytes!("../../../testdata/yolov8_protos_160x160x32.bin");
@@ -413,7 +396,6 @@ fn decoder_masks_i8(bencher: divan::Bencher) {
     let quant_protos = Quantization {
         scale: 0.020889872685074806,
         zero_point: -115,
-        signed: false,
     };
 
     bencher.bench_local(|| {

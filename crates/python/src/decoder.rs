@@ -301,11 +301,11 @@ impl PyDecoder {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (boxes, quant_boxes=(1.0, 0, false), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
+    #[pyo3(signature = (boxes, quant_boxes=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
     pub fn decode_yolo<'py>(
         py: Python<'py>,
         boxes: ReadOnlyArrayGeneric2,
-        quant_boxes: (f64, i64, bool),
+        quant_boxes: (f64, i64),
         score_threshold: f64,
         iou_threshold: f64,
         max_boxes: usize,
@@ -333,8 +333,8 @@ impl PyDecoder {
             ReadOnlyArrayGeneric2::Float64(output) => {
                 edgefirst::decoder::yolo::decode_yolo_f64(
                     output.as_array(),
-                    score_threshold,
-                    iou_threshold,
+                    score_threshold as f32,
+                    iou_threshold as f32,
                     &mut output_boxes,
                 );
             }
@@ -343,13 +343,13 @@ impl PyDecoder {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (boxes, protos, quant_boxes=(1.0, 0, false), quant_protos=(1.0, 0, false), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
+    #[pyo3(signature = (boxes, protos, quant_boxes=(1.0, 0), quant_protos=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
     pub fn decode_yolo_segdet<'py>(
         py: Python<'py>,
         boxes: ReadOnlyArrayGeneric2,
         protos: ReadOnlyArrayGeneric3,
-        quant_boxes: (f64, i64, bool),
-        quant_protos: (f64, i64, bool),
+        quant_boxes: (f64, i64),
+        quant_protos: (f64, i64),
         score_threshold: f64,
         iou_threshold: f64,
         max_boxes: usize,
@@ -392,8 +392,8 @@ impl PyDecoder {
                 edgefirst::decoder::yolo::decode_yolo_segdet_f64(
                     boxes.as_array(),
                     protos.as_array(),
-                    score_threshold,
-                    iou_threshold,
+                    score_threshold as f32,
+                    iou_threshold as f32,
                     &mut output_boxes,
                     &mut output_masks,
                 );
@@ -411,13 +411,13 @@ impl PyDecoder {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (boxes, scores, quant_boxes=(1.0, 0, false), quant_scores=(1.0, 0, false), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
+    #[pyo3(signature = (boxes, scores, quant_boxes=(1.0, 0), quant_scores=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
     pub fn decode_modelpack_det<'py>(
         py: Python<'py>,
         boxes: ReadOnlyArrayGeneric2,
         scores: ReadOnlyArrayGeneric2,
-        quant_boxes: (f64, i64, bool),
-        quant_scores: (f64, i64, bool),
+        quant_boxes: (f64, i64),
+        quant_scores: (f64, i64),
         score_threshold: f64,
         iou_threshold: f64,
         max_boxes: usize,
@@ -481,7 +481,7 @@ impl PyDecoder {
         py: Python<'py>,
         boxes: ListOfReadOnlyArrayGeneric3,
         anchors: Vec<Vec<[f32; 2]>>,
-        quant: Vec<(f64, i64, bool)>,
+        quant: Vec<(f64, i64)>,
         score_threshold: f64,
         iou_threshold: f64,
         max_boxes: usize,
@@ -588,11 +588,11 @@ impl PyDecoder {
     #[pyo3(signature = (quantized, quant_boxes, dequant_into))]
     pub fn dequantize<'py>(
         quantized: ReadOnlyArrayGenericQuantized<'py>,
-        quant_boxes: (f64, i64, bool),
+        quant_boxes: (f64, i64),
         dequant_into: ArrayGenericFloat<'py>,
     ) -> PyResult<()> {
         log::trace!("enter {:?}", std::time::Instant::now());
-        let timer = FunctionTimer::new("dequant".to_string());
+        let _timer = FunctionTimer::new("dequant".to_string());
         match (quantized, dequant_into) {
             (
                 ReadOnlyArrayGenericQuantized::Int8(input),
