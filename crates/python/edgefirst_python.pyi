@@ -132,6 +132,7 @@ class FourCC(enum.Enum):
     RGB: FourCC
     NV12: FourCC
     GREY: FourCC
+    PLANAR_RGB: FourCC
 
     def __init__(self, fourcc: str) -> None:
         ...
