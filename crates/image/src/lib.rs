@@ -45,7 +45,7 @@ pub const RGB: FourCharCode = four_char_code!("RGB ");
 pub const GREY: FourCharCode = four_char_code!("Y800");
 
 // TODO: planar RGB is 8BPS? https://fourcc.org/8bps/
-pub const _8BPS: FourCharCode = four_char_code!("8BPS");
+pub const PLANAR_RGB: FourCharCode = four_char_code!("8BPS");
 
 pub struct TensorImage {
     tensor: Tensor<u8>,
@@ -639,6 +639,7 @@ impl ImageConverterTrait for ImageConverter {
         if src_shape == dst_shape
             && flip == Flip::None
             && rotation == Rotation::None
+            && dst.fourcc() != PLANAR_RGB
             && let Some(cpu) = self.cpu.as_mut()
         {
             match cpu.convert(src, dst, rotation, flip, crop) {
@@ -691,7 +692,7 @@ fn fourcc_channels(fourcc: FourCharCode) -> Result<usize> {
         YUYV => Ok(2), // YUYV has 2 channels (Y and UV)
         GREY => Ok(1), // Y800 has 1 channel (Y)
         NV12 => Ok(2), // NV12 has 2 channel. 2nd channel is half empty
-        _8BPS => Ok(3),
+        PLANAR_RGB => Ok(3),
         _ => Err(Error::InvalidShape(format!(
             "Unsupported fourcc: {}",
             fourcc.to_string()
@@ -701,12 +702,12 @@ fn fourcc_channels(fourcc: FourCharCode) -> Result<usize> {
 
 fn fourcc_planar(fourcc: FourCharCode) -> Result<bool> {
     match fourcc {
-        RGBA => Ok(false), // RGBA has 4 channels (R, G, B, A)
-        RGB => Ok(false),  // RGB has 3 channels (R, G, B)
-        YUYV => Ok(false), // YUYV has 2 channels (Y and UV)
-        GREY => Ok(false), // Y800 has 1 channel (Y)
-        NV12 => Ok(true),  // Planar YUV
-        _8BPS => Ok(true), // Planar RGB
+        RGBA => Ok(false),      // RGBA has 4 channels (R, G, B, A)
+        RGB => Ok(false),       // RGB has 3 channels (R, G, B)
+        YUYV => Ok(false),      // YUYV has 2 channels (Y and UV)
+        GREY => Ok(false),      // Y800 has 1 channel (Y)
+        NV12 => Ok(true),       // Planar YUV
+        PLANAR_RGB => Ok(true), // Planar RGB
         _ => Err(Error::NotSupported(format!(
             "Unsupported fourcc: {}",
             fourcc.to_string()
@@ -2109,7 +2110,7 @@ mod tests {
         //         Crop::no_crop(),
         //     )
         //     .unwrap();
-        let mut gl_dst = TensorImage::new(dst_width, dst_height, _8BPS, None).unwrap();
+        let mut gl_dst = TensorImage::new(dst_width, dst_height, PLANAR_RGB, None).unwrap();
         let mut gl_converter = GLConverterThreaded::new().unwrap();
 
         gl_converter
@@ -2118,7 +2119,14 @@ mod tests {
                 &mut gl_dst,
                 Rotation::None,
                 Flip::None,
-                Crop::no_crop(),
+                Crop::new()
+                    .with_dst_rect(Some(Rect {
+                        left: 102,
+                        top: 102,
+                        width: 440,
+                        height: 440,
+                    }))
+                    .with_dst_color(Some([114, 114, 114, 114])),
             )
             .unwrap();
         std::fs::write(
