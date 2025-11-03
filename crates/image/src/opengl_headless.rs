@@ -37,8 +37,8 @@ macro_rules! function {
 }
 
 use crate::{
-    _8BPS, Crop, Error, Flip, GREY, ImageConverterTrait, NV12, RGB, RGBA, Rotation, TensorImage,
-    YUYV,
+    Crop, Error, Flip, GREY, ImageConverterTrait, NV12, PLANAR_RGB, RGB, RGBA, Rotation,
+    TensorImage, YUYV,
 };
 
 pub(crate) struct GlContext {
@@ -662,7 +662,7 @@ impl GLConverterST {
         let frame_buffer = FrameBuffer::new();
         frame_buffer.bind();
 
-        let (width, height) = if matches!(dst.fourcc(), _8BPS) {
+        let (width, height) = if matches!(dst.fourcc(), PLANAR_RGB) {
             let width = dst.width() / 4;
             let height = dst.height() * 3;
             (width as i32, height as i32)
@@ -713,7 +713,7 @@ impl GLConverterST {
         crop: Crop,
     ) -> crate::Result<()> {
         log::trace!("convert_dest_non_dma: rot: {rotation:?} flip: {flip:?} crop: {crop:?}");
-        debug_assert!(matches!(dst.fourcc(), RGB | RGBA | GREY | _8BPS));
+        debug_assert!(matches!(dst.fourcc(), RGB | RGBA | GREY | PLANAR_RGB));
         let (width, height) = if dst.is_planar() {
             let width = src.width() / 4;
             let height = match src.fourcc() {
@@ -924,27 +924,27 @@ impl GLConverterST {
         flip: Flip,
         crop: Crop,
     ) -> Result<(), crate::Error> {
-        if let Some(crop) = crop.src_rect
-            && (crop.left > 0
-                || crop.top > 0
-                || crop.height < src.height()
-                || crop.width < src.width())
-        {
-            return Err(crate::Error::NotSupported(
-                "Cropping in planar RGB mode is not supported".to_string(),
-            ));
-        }
+        // if let Some(crop) = crop.src_rect
+        //     && (crop.left > 0
+        //         || crop.top > 0
+        //         || crop.height < src.height()
+        //         || crop.width < src.width())
+        // {
+        //     return Err(crate::Error::NotSupported(
+        //         "Cropping in planar RGB mode is not supported".to_string(),
+        //     ));
+        // }
 
-        if let Some(crop) = crop.dst_rect
-            && (crop.left > 0
-                || crop.top > 0
-                || crop.height < src.height()
-                || crop.width < src.width())
-        {
-            return Err(crate::Error::NotSupported(
-                "Cropping in planar RGB mode is not supported".to_string(),
-            ));
-        }
+        // if let Some(crop) = crop.dst_rect
+        //     && (crop.left > 0
+        //         || crop.top > 0
+        //         || crop.height < src.height()
+        //         || crop.width < src.width())
+        // {
+        //     return Err(crate::Error::NotSupported(
+        //         "Cropping in planar RGB mode is not supported".to_string(),
+        //     ));
+        // }
 
         // top and bottom are flipped because OpenGL uses 0,0 as bottom left
         let src_roi = if let Some(crop) = crop.src_rect {
@@ -987,15 +987,38 @@ impl GLConverterST {
             crate::Rotation::CounterClockwise90 => 3,
         };
 
-        let new_egl_image = self.create_image_from_dma2(src)?;
-        unsafe {
-            gls::gl::ClearColor(0.0, 0.0, 0.0, 0.0);
-            gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
+        let has_crop = crop.dst_rect.is_some_and(|x| {
+            x.left != 0 || x.top != 0 || x.width != dst.width() || x.height != dst.height()
+        });
+        if has_crop && let Some(dst_color) = crop.dst_color {
+            if dst_color[0] != dst_color[1] || dst_color[1] != dst_color[2] {
+                return Err(Error::NotSupported(
+                    "planar RGB currently doesn't support non grey background color".to_string(),
+                ));
+            }
+            unsafe {
+                gls::gl::ClearColor(
+                    dst_color[0] as f32 / 255.0,
+                    dst_color[0] as f32 / 255.0,
+                    dst_color[0] as f32 / 255.0,
+                    dst_color[0] as f32 / 255.0,
+                );
+                gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
+            };
+        }
+
+        let dst_width = if let Some(dst_crop) = crop.dst_rect {
+            dst_crop.width
+        } else {
+            dst.width()
         };
+
+        let new_egl_image = self.create_image_from_dma2(src)?;
+
         self.draw_camera_texture_to_rgb_planar(
             &self.camera_texture,
             &new_egl_image,
-            dst.width(),
+            dst_width,
             src_roi,
             dst_roi,
             rotation_offset,
@@ -1044,6 +1067,18 @@ impl GLConverterST {
                 gls::gl::TEXTURE_MAG_FILTER,
                 gls::gl::LINEAR as i32,
             );
+            gls::gl::TexParameteri(
+                texture_target,
+                gls::gl::TEXTURE_WRAP_S,
+                gls::gl::CLAMP_TO_EDGE as i32,
+            );
+
+            gls::gl::TexParameteri(
+                texture_target,
+                gls::gl::TEXTURE_WRAP_T,
+                gls::gl::CLAMP_TO_EDGE as i32,
+            );
+
             // TODO: This segfaults on exit despite the EVK supposedly supporting the
             // GL_EXT_texture_border_clamp extension. Adjust shader to handle it instead?
 
@@ -1392,7 +1427,7 @@ impl GLConverterST {
                 ));
             }
             match src.fourcc() {
-                _8BPS => {
+                PLANAR_RGB => {
                     format = DrmFourcc::Abgr8888;
                     width = src.width() / 4;
                     height = src.height() * 3;
@@ -1880,10 +1915,10 @@ in vec2 tc;
 out vec4 color;
 
 void main(){
-    float r = texture(tex, vec2(tc[0] - 1.0/width, tc[1]))[color_index];
-    float g = texture(tex, vec2(tc[0] + 0.0/width, tc[1]))[color_index];
-    float b = texture(tex, vec2(tc[0] + 1.0/width, tc[1]))[color_index];
-    float a = texture(tex, vec2(tc[0] + 2.0/width, tc[1]))[color_index];
+    float r = texture(tex, vec2(tc[0] - 1.5/width, tc[1]))[color_index];
+    float g = texture(tex, vec2(tc[0] - 0.5/width, tc[1]))[color_index];
+    float b = texture(tex, vec2(tc[0] + 0.5/width, tc[1]))[color_index];
+    float a = texture(tex, vec2(tc[0] + 1.5/width, tc[1]))[color_index];
     
     color = vec4(r, g, b, a);
 }
