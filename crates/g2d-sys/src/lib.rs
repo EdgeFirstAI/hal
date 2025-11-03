@@ -175,36 +175,66 @@ fn guess_version(g2d: &g2d) -> Option<Version> {
             .get::<*const *const c_char>(b"_G2D_VERSION")
             .map_or(None, |v| Some(*v));
 
-        // Seems like the char sequence is `\n\0$VERSION$6.4.3:398061:d3dac3f35d$\n\0`
-        // So we need to shift the ptr by two
-        let ptr = (*version.unwrap()).byte_offset(2);
-        let s = CStr::from_ptr(ptr).to_string_lossy().to_string();
-        // s = "$VERSION$6.4.3:398061:d3dac3f35d$\n"
-        let mut version = Version::default();
-        let s: Vec<_> = s[9..].split(":").collect();
+        if let Some(v) = version {
+            // Seems like the char sequence is `\n\0$VERSION$6.4.3:398061:d3dac3f35d$\n\0`
+            // So we need to shift the ptr by two
+            let ptr = (*v).byte_offset(2);
+            let s = CStr::from_ptr(ptr).to_string_lossy().to_string();
+            log::debug!("G2D Version string is {s}");
+            // s = "$VERSION$6.4.3:398061:d3dac3f35d$\n"
+            let mut version = G2D_2_3_0;
+            if let Some(s) = s.strip_prefix("$VERSION$") {
+                let s: Vec<_> = s.split(":").collect();
+                let v: Vec<_> = s[0].split(".").collect();
+                if let Some(s) = v.first()
+                    && let Ok(major) = s.parse()
+                {
+                    version.major = major;
+                }
+                if let Some(s) = v.get(1)
+                    && let Ok(minor) = s.parse()
+                {
+                    version.minor = minor;
+                }
+                if let Some(s) = v.get(2)
+                    && let Ok(patch) = s.parse()
+                {
+                    version.patch = patch;
+                }
+                if let Some(s) = s.get(1)
+                    && let Ok(num) = s.parse()
+                {
+                    version.num = num;
+                }
+            } else if let Some(s) = s.strip_prefix("$VERSION$") {
+                let s: Vec<_> = s.split(":").collect();
+                let v: Vec<_> = s[0].split(".").collect();
+                if let Some(s) = v.first()
+                    && let Ok(major) = s.parse()
+                {
+                    version.major = major;
+                }
+                if let Some(s) = v.get(1)
+                    && let Ok(minor) = s.parse()
+                {
+                    version.minor = minor;
+                }
+                if let Some(s) = v.get(2)
+                    && let Ok(patch) = s.parse()
+                {
+                    version.patch = patch;
+                }
+                if let Some(s) = s.get(1)
+                    && let Ok(num) = s.parse()
+                {
+                    version.num = num;
+                }
+            }
 
-        let v: Vec<_> = s[0].split(".").collect();
-        if let Some(s) = v.first()
-            && let Ok(major) = s.parse()
-        {
-            version.major = major;
+            Some(version)
+        } else {
+            None
         }
-        if let Some(s) = v.get(1)
-            && let Ok(minor) = s.parse()
-        {
-            version.minor = minor;
-        }
-        if let Some(s) = v.get(2)
-            && let Ok(patch) = s.parse()
-        {
-            version.patch = patch;
-        }
-        if let Some(s) = s.get(1)
-            && let Ok(num) = s.parse()
-        {
-            version.num = num;
-        }
-        Some(version)
     }
 }
 

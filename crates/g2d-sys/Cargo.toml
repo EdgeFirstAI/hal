@@ -9,3 +9,4 @@ edition = "2024"
 four-char-code = { workspace = true }
 libloading = { workspace = true }
 nix = { workspace = true }
+log = { workspace = true }
