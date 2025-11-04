@@ -18,6 +18,7 @@ use numpy::{PyArrayLike3, PyReadwriteArray3, PyUntypedArrayMethods};
 use pyo3::prelude::*;
 use std::{
     fmt::{self},
+    i8,
     sync::Mutex,
 };
 
@@ -247,8 +248,13 @@ impl PyTensorImage {
         Ok(())
     }
 
-    #[pyo3(signature = (dst, normalization=Normalization::DEFAULT))]
-    pub fn normalize_to_numpy(&self, dst: ImageDest3, normalization: Normalization) -> Result<()> {
+    #[pyo3(signature = (dst, normalization=Normalization::DEFAULT, zero_point=None))]
+    pub fn normalize_to_numpy(
+        &self,
+        dst: ImageDest3,
+        normalization: Normalization,
+        zero_point: Option<i64>,
+    ) -> Result<()> {
         let _timer = FunctionTimer::new("normalize_to_numpy".to_string());
 
         let tensor = &self.0;
@@ -296,6 +302,7 @@ impl PyTensorImage {
                 &mut dst,
                 [dst_shape[0], dst_shape[1], dst_shape[2]],
                 normalization,
+                zero_point,
             ),
             ImageDest3::Int8(mut dst) => normalize_to_int8(
                 &self.0,
@@ -303,6 +310,7 @@ impl PyTensorImage {
                 &mut dst,
                 [dst_shape[0], dst_shape[1], dst_shape[2]],
                 normalization,
+                zero_point,
             ),
             ImageDest3::Float16(mut dst) => normalize_to_float_16(
                 &self.0,
@@ -310,6 +318,7 @@ impl PyTensorImage {
                 &mut dst,
                 [dst_shape[0], dst_shape[1], dst_shape[2]],
                 normalization,
+                zero_point,
             ),
             ImageDest3::Float32(mut dst) => normalize_to_float_32(
                 &self.0,
@@ -317,6 +326,7 @@ impl PyTensorImage {
                 &mut dst,
                 [dst_shape[0], dst_shape[1], dst_shape[2]],
                 normalization,
+                zero_point,
             ),
             ImageDest3::Float64(mut dst) => normalize_to_float_64(
                 &self.0,
@@ -324,6 +334,7 @@ impl PyTensorImage {
                 &mut dst,
                 [dst_shape[0], dst_shape[1], dst_shape[2]],
                 normalization,
+                zero_point,
             ),
         }
     }
@@ -381,10 +392,18 @@ fn normalize_to_uint8<'py>(
     dst: &mut PyReadwriteArray3<'py, u8>,
     dst_shape: [usize; 3],
     normalization: Normalization,
+    zero_point: Option<i64>,
 ) -> Result<()> {
     if !matches!(normalization, Normalization::RAW | Normalization::DEFAULT) {
         return Err(Error::InvalidArg(
             "UInt8 destination only supports RAW normalization".to_string(),
+        ));
+    }
+    if let Some(zero_point) = zero_point
+        && zero_point != 0
+    {
+        return Err(Error::InvalidArg(
+            "RAW normalization does not support setting zero point".to_string(),
         ));
     }
     let mut dst = dst.as_array_mut();
@@ -421,6 +440,7 @@ fn normalize_to_int8<'py>(
     dst: &mut PyReadwriteArray3<'py, i8>,
     dst_shape: [usize; 3],
     normalization: Normalization,
+    zero_point: Option<i64>,
 ) -> Result<()> {
     if !matches!(
         normalization,
@@ -430,6 +450,18 @@ fn normalize_to_int8<'py>(
             "Int8 destination only supports SIGNED normalization".to_string(),
         ));
     }
+
+    let zp = if let Some(zp) = zero_point {
+        if !(0..=255).contains(&zp) {
+            return Err(Error::InvalidArg(format!(
+                "zero point out of range expected 0-255, got {zp}"
+            )));
+        }
+        zp as i16
+    } else {
+        128
+    };
+    log::info!("zero point is {zp:?}");
     let mut dst = dst.as_array_mut();
     let map = tensor.tensor().map()?;
     let data = map.as_slice();
@@ -440,18 +472,33 @@ fn normalize_to_int8<'py>(
     {
         let dst = dst.as_chunks_mut::<3>().0;
         let src = data.as_chunks::<4>().0;
+        if zp == 128 {
+            dst.par_iter_mut().zip(src).for_each(|(d, s)| {
+                d[0] = (s[0] as i16 - 128) as i8;
+                d[1] = (s[1] as i16 - 128) as i8;
+                d[2] = (s[2] as i16 - 128) as i8;
+            });
+            return Ok(());
+        }
         dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-            d[0] = (s[0] as i16 - 128) as i8;
-            d[1] = (s[1] as i16 - 128) as i8;
-            d[2] = (s[2] as i16 - 128) as i8;
+            d[0] = (s[0] as i16 - zp).clamp(-128, 127) as i8;
+            d[1] = (s[1] as i16 - zp).clamp(-128, 127) as i8;
+            d[2] = (s[2] as i16 - zp).clamp(-128, 127) as i8;
         });
         return Ok(());
     }
 
+    if zp == 128 {
+        Zip::from(dst)
+            .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
+            .into_par_iter()
+            .for_each(|(x, y)| *x = (*y as i16 - 128) as i8);
+        return Ok(());
+    }
     Zip::from(dst)
         .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
         .into_par_iter()
-        .for_each(|(x, y)| *x = (*y as i16 - 128) as i8);
+        .for_each(|(x, y)| *x = (*y as i16 - zp).clamp(-128, 127) as i8);
     Ok(())
 }
 
@@ -463,10 +510,33 @@ fn normalize_to_float_16<'py>(
     dst: &mut PyReadwriteArray3<'py, half::f16>,
     dst_shape: [usize; 3],
     normalization: Normalization,
+    zero_point: Option<i64>,
 ) -> Result<()> {
     let dst: ArrayViewMut3<half::f16> = dst.as_array_mut();
     // this is safe because half::f16 has the same representation as f16
     let mut dst: ArrayViewMut3<f16> = unsafe { std::mem::transmute(dst) };
+
+    let zp = if let Some(zp) = zero_point {
+        if !(0..=255).contains(&zp) {
+            return Err(Error::InvalidArg(format!(
+                "zero point out of range expected 0-255, got {zp}"
+            )));
+        }
+        match normalization {
+            Normalization::SIGNED | Normalization::DEFAULT => zp as f32 / 127.5,
+            Normalization::UNSIGNED | Normalization::RAW if zp != 0 => {
+                return Err(Error::InvalidArg(
+                    "RAW or UNSIGNED normalization does not support setting zero point".to_string(),
+                ));
+            }
+            _ => 0.0,
+        }
+    } else {
+        match normalization {
+            Normalization::SIGNED | Normalization::DEFAULT => 1.0,
+            Normalization::UNSIGNED | Normalization::RAW => 0.0,
+        }
+    };
 
     let map = tensor.tensor().map()?;
     let data = map.as_slice();
@@ -481,9 +551,9 @@ fn normalize_to_float_16<'py>(
         match normalization {
             Normalization::SIGNED | Normalization::DEFAULT => {
                 dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-                    d[0] = (s[0] as f32 / 127.5 - 1.0) as f16;
-                    d[1] = (s[1] as f32 / 127.5 - 1.0) as f16;
-                    d[2] = (s[2] as f32 / 127.5 - 1.0) as f16;
+                    d[0] = (s[0] as f32 / 127.5 - zp) as f16;
+                    d[1] = (s[1] as f32 / 127.5 - zp) as f16;
+                    d[2] = (s[2] as f32 / 127.5 - zp) as f16;
                 });
             }
             Normalization::UNSIGNED => {
@@ -509,7 +579,7 @@ fn normalize_to_float_16<'py>(
         Normalization::DEFAULT | Normalization::SIGNED => Zip::from(dst)
             .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
             .into_par_iter()
-            .for_each(|(x, y)| *x = (*y as f32 / 127.5 - 1.0) as f16),
+            .for_each(|(x, y)| *x = (*y as f32 / 127.5 - zp) as f16),
 
         Normalization::UNSIGNED => Zip::from(dst)
             .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
@@ -532,12 +602,36 @@ fn normalize_to_float_16<'py>(
     dst: &mut PyReadwriteArray3<'py, half::f16>,
     dst_shape: [usize; 3],
     normalization: Normalization,
+    zero_point: Option<i64>,
 ) -> Result<()> {
     use half::slice::HalfFloatSliceExt;
     let mut dst: ArrayViewMut3<half::f16> = dst.as_array_mut();
     let map = tensor.tensor().map()?;
     let data = map.as_slice();
     let ndarray = ArrayView3::from_shape(shape, data)?;
+
+    let zp = if let Some(zp) = zero_point {
+        if !(0..=255).contains(&zp) {
+            return Err(Error::InvalidArg(format!(
+                "zero point out of range expected 0-255, got {zp}"
+            )));
+        }
+        match normalization {
+            Normalization::SIGNED | Normalization::DEFAULT => zp as f32 / 255.0,
+            Normalization::UNSIGNED | Normalization::RAW if zp != 0 => {
+                return Err(Error::InvalidArg(
+                    "RAW or UNSIGNED normalization does not support setting zero point".to_string(),
+                ));
+            }
+            _ => 0.0,
+        }
+    } else {
+        match normalization {
+            Normalization::SIGNED | Normalization::DEFAULT => 1.0,
+            Normalization::UNSIGNED | Normalization::RAW => 0.0,
+        }
+    };
+
     if tensor.fourcc() == RGBA
         && dst_shape[2] == 3
         && let Some(dst) = dst.as_slice_mut()
@@ -549,9 +643,9 @@ fn normalize_to_float_16<'py>(
         match normalization {
             Normalization::SIGNED | Normalization::DEFAULT => {
                 tmp_.par_iter_mut().zip(src).for_each(|(d, s)| {
-                    d[0] = s[0] as f32 / 127.5 - 1.0;
-                    d[1] = s[1] as f32 / 127.5 - 1.0;
-                    d[2] = s[2] as f32 / 127.5 - 1.0;
+                    d[0] = s[0] as f32 / 127.5 - zp;
+                    d[1] = s[1] as f32 / 127.5 - zp;
+                    d[2] = s[2] as f32 / 127.5 - zp;
                 });
             }
             Normalization::UNSIGNED => {
@@ -583,7 +677,7 @@ fn normalize_to_float_16<'py>(
                 .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
                 .into_par_iter()
                 .for_each(|(d, s)| {
-                    *d = half::f16::from_f32(*s as f32 / 127.5 - 1.0);
+                    *d = half::f16::from_f32(*s as f32 / 127.5 - zp);
                 });
         }
         Normalization::UNSIGNED => {
@@ -614,11 +708,35 @@ fn normalize_to_float_32<'py>(
     dst: &mut PyReadwriteArray3<'py, f32>,
     dst_shape: [usize; 3],
     normalization: Normalization,
+    zero_point: Option<i64>,
 ) -> Result<()> {
     let mut dst = dst.as_array_mut();
     let map = tensor.tensor().map()?;
     let data = map.as_slice();
     let ndarray = ArrayView3::from_shape(shape, data)?;
+
+    let zp = if let Some(zp) = zero_point {
+        if !(0..=255).contains(&zp) {
+            return Err(Error::InvalidArg(format!(
+                "zero point out of range expected 0-255, got {zp}"
+            )));
+        }
+        match normalization {
+            Normalization::SIGNED | Normalization::DEFAULT => zp as f32 / 255.0,
+            Normalization::UNSIGNED | Normalization::RAW if zp != 0 => {
+                return Err(Error::InvalidArg(
+                    "RAW or UNSIGNED normalization does not support setting zero point".to_string(),
+                ));
+            }
+            _ => 0.0,
+        }
+    } else {
+        match normalization {
+            Normalization::SIGNED | Normalization::DEFAULT => 1.0,
+            Normalization::UNSIGNED | Normalization::RAW => 0.0,
+        }
+    };
+
     if tensor.fourcc() == RGBA
         && dst_shape[2] == 3
         && let Some(dst) = dst.as_slice_mut()
@@ -628,9 +746,9 @@ fn normalize_to_float_32<'py>(
         match normalization {
             Normalization::SIGNED | Normalization::DEFAULT => {
                 dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-                    d[0] = s[0] as f32 / 127.5 - 1.0;
-                    d[1] = s[1] as f32 / 127.5 - 1.0;
-                    d[2] = s[2] as f32 / 127.5 - 1.0;
+                    d[0] = s[0] as f32 / 127.5 - zp;
+                    d[1] = s[1] as f32 / 127.5 - zp;
+                    d[2] = s[2] as f32 / 127.5 - zp;
                 });
             }
             Normalization::UNSIGNED => {
@@ -654,7 +772,7 @@ fn normalize_to_float_32<'py>(
         Normalization::DEFAULT | Normalization::SIGNED => Zip::from(dst)
             .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
             .into_par_iter()
-            .for_each(|(x, y)| *x = *y as f32 / 127.5 - 1.0),
+            .for_each(|(x, y)| *x = *y as f32 / 127.5 - zp),
 
         Normalization::UNSIGNED => Zip::from(dst)
             .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
@@ -676,11 +794,35 @@ fn normalize_to_float_64<'py>(
     dst: &mut PyReadwriteArray3<'py, f64>,
     dst_shape: [usize; 3],
     normalization: Normalization,
+    zero_point: Option<i64>,
 ) -> Result<()> {
     let mut dst = dst.as_array_mut();
     let map = tensor.tensor().map()?;
     let data = map.as_slice();
     let ndarray = ArrayView3::from_shape(shape, data)?;
+
+    let zp = if let Some(zp) = zero_point {
+        if !(0..=255).contains(&zp) {
+            return Err(Error::InvalidArg(format!(
+                "zero point out of range expected 0-255, got {zp}"
+            )));
+        }
+        match normalization {
+            Normalization::SIGNED | Normalization::DEFAULT => zp as f64 / 255.0,
+            Normalization::UNSIGNED | Normalization::RAW if zp != 0 => {
+                return Err(Error::InvalidArg(
+                    "RAW or UNSIGNED normalization does not support setting zero point".to_string(),
+                ));
+            }
+            _ => 0.1,
+        }
+    } else {
+        match normalization {
+            Normalization::SIGNED | Normalization::DEFAULT => 1.0,
+            Normalization::UNSIGNED | Normalization::RAW => 0.0,
+        }
+    };
+
     if tensor.fourcc() == RGBA
         && dst_shape[2] == 3
         && let Some(dst) = dst.as_slice_mut()
@@ -690,9 +832,9 @@ fn normalize_to_float_64<'py>(
         match normalization {
             Normalization::SIGNED | Normalization::DEFAULT => {
                 dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-                    d[0] = s[0] as f64 / 127.5 - 1.0;
-                    d[1] = s[1] as f64 / 127.5 - 1.0;
-                    d[2] = s[2] as f64 / 127.5 - 1.0;
+                    d[0] = s[0] as f64 / 127.5 - zp;
+                    d[1] = s[1] as f64 / 127.5 - zp;
+                    d[2] = s[2] as f64 / 127.5 - zp;
                 });
             }
             Normalization::UNSIGNED => {
@@ -716,7 +858,7 @@ fn normalize_to_float_64<'py>(
         Normalization::DEFAULT | Normalization::SIGNED => Zip::from(dst)
             .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
             .into_par_iter()
-            .for_each(|(x, y)| *x = *y as f64 / 127.5 - 1.0),
+            .for_each(|(x, y)| *x = *y as f64 / 127.5 - zp),
 
         Normalization::UNSIGNED => Zip::from(dst)
             .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
