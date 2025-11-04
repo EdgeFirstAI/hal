@@ -108,3 +108,19 @@ fn test_grey_load() -> PyResult<()> {
         Ok(())
     })
 }
+
+#[test]
+fn test_normalize() -> PyResult<()> {
+    pyo3::append_to_inittab!(edgefirst_python_module);
+    pyo3::prepare_freethreaded_python();
+    Python::with_gil(|py| {
+        let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
+        py.run(c_str!(include_str!("image/normalize.py")), None, Some(&out))?;
+        let unique_vals: Vec<i8> = out.get_item("unique_vals").unwrap().extract()?;
+        assert_eq!(unique_vals, (-128..=127).collect::<Vec<i8>>());
+
+        let unique_vals0: Vec<i8> = out.get_item("unique_vals0").unwrap().extract()?;
+        assert_eq!(unique_vals0, (-127..=127).collect::<Vec<i8>>());
+        Ok(())
+    })
+}

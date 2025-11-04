@@ -1,13 +1,17 @@
+import numpy as np
 from edgefirst_python import TensorImage, ImageConverter, Rotation, Rect, Flip, FourCC
-rgba = TensorImage.load(
+rgba_ = TensorImage.load(
     "../../testdata/grey.jpg", FourCC.RGBA)
-rgba = rgba.to_numpy()
+rgba = np.zeros((rgba_.height, rgba_.width, 4), dtype=np.uint8)
+rgba_.normalize_to_numpy(rgba)
 
-grey = TensorImage.load(
+grey_ = TensorImage.load(
     "../../testdata/grey.jpg", FourCC.GREY)
-grey = grey.to_numpy()
+grey = np.zeros((grey_.height, grey_.width, 1), dtype=np.uint8)
+grey_.normalize_to_numpy(grey)
 
 
-default = TensorImage.load(
+default_ = TensorImage.load(
     "../../testdata/grey.jpg")
-default = default.to_numpy()
+default = np.zeros((default_.height, default_.width, 3), dtype=np.uint8)
+default_.normalize_to_numpy(default)

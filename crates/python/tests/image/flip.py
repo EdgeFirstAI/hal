@@ -1,8 +1,10 @@
 from edgefirst_python import TensorImage, ImageConverter, Flip, FourCC
+import numpy as np
 src = TensorImage.load(
     "../../testdata/zidane.jpg", FourCC.RGBA)
 dst = TensorImage(1280, 720)
 converter = ImageConverter()
 converter.convert(src, dst, flip=Flip.Horizontal)
 
-n = dst.to_numpy()
+n = np.zeros((720, 1280, 3), dtype=np.uint8)
+dst.normalize_to_numpy(n)

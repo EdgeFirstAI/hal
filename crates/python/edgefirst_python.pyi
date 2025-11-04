@@ -207,7 +207,7 @@ class TensorImage:
     def to_numpy(self) -> npt.NDArray[np.uint8]:
         ...
 
-    def normalize_to_numpy(self, dst: npt.NDArray[np.uint8] | npt.NDArray[np.int8] | npt.NDArray[np.float32] | npt.NDArray[np.float64], normalization: Normalization = Normalization.DEFAULT) -> None:
+    def normalize_to_numpy(self, dst: npt.NDArray[np.uint8] | npt.NDArray[np.int8] | npt.NDArray[np.float32] | npt.NDArray[np.float64], normalization: Normalization = Normalization.DEFAULT, zero_point: None | int = None) -> None:
         ...
 
     def copy_from_numpy(self, src: npt.NDArray[np.uint8]) -> None:
