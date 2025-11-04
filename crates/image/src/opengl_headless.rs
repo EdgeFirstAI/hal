@@ -663,7 +663,7 @@ impl GLConverterST {
         frame_buffer.bind();
 
         let (width, height) = if matches!(dst.fourcc(), PLANAR_RGB) {
-            let width = dst.width() / 4;
+            let width = dst.width();
             let height = dst.height() * 3;
             (width as i32, height as i32)
         } else {
@@ -1050,8 +1050,7 @@ impl GLConverterST {
             }
         }
         unsafe {
-            self.texture_program_planar
-                .load_uniform_1f(c"width", width as f32);
+            // self.texture_program.load_uniform_1f(c"width", width as f32);
             gls::gl::UseProgram(self.texture_program_planar.id);
             gls::gl::BindTexture(texture_target, texture.id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
@@ -1096,6 +1095,7 @@ impl GLConverterST {
             gls::egl_image_target_texture_2d_oes(texture_target, egl_img.egl_image.as_ptr());
             check_gl_error(function!(), line!())?;
             let y_centers = [-2.0 / 3.0, 0.0, 2.0 / 3.0];
+            let swizzles = [gls::gl::RED, gls::gl::GREEN, gls::gl::BLUE];
             // starts from bottom
             for (i, y_center) in y_centers.iter().enumerate() {
                 gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
@@ -1149,8 +1149,15 @@ impl GLConverterST {
                     gls::gl::DYNAMIC_DRAW,
                 );
                 let vertices_index: [u32; 4] = [0, 1, 2, 3];
-                self.texture_program_planar
-                    .load_uniform_1i(c"color_index", 2 - i as i32);
+                // self.texture_program_planar
+                //     .load_uniform_1i(c"color_index", 2 - i as i32);
+
+                gls::gl::TexParameteri(
+                    gls::gl::TEXTURE_2D,
+                    gls::gl::TEXTURE_SWIZZLE_R,
+                    swizzles[i] as i32,
+                );
+
                 gls::gl::DrawElements(
                     gls::gl::TRIANGLE_FAN,
                     vertices_index.len() as i32,
@@ -1425,10 +1432,10 @@ impl GLConverterST {
             }
             match src.fourcc() {
                 PLANAR_RGB => {
-                    format = DrmFourcc::Abgr8888;
-                    width = src.width() / 4;
+                    format = DrmFourcc::R8;
+                    width = src.width();
                     height = src.height() * 3;
-                    channels = 4;
+                    channels = 1;
                 }
                 fourcc => {
                     return Err(crate::Error::NotSupported(format!(
@@ -1912,12 +1919,7 @@ in vec2 tc;
 out vec4 color;
 
 void main(){
-    float r = texture(tex, vec2(tc[0] - 1.5/width, tc[1]))[color_index];
-    float g = texture(tex, vec2(tc[0] - 0.5/width, tc[1]))[color_index];
-    float b = texture(tex, vec2(tc[0] + 0.5/width, tc[1]))[color_index];
-    float a = texture(tex, vec2(tc[0] + 1.5/width, tc[1]))[color_index];
-    
-    color = vec4(r, g, b, a);
+    color.r = texture(tex, tc).r;
 }
 "
 }
