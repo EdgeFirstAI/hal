@@ -584,7 +584,7 @@ where
     let file = std::fs::read(path).unwrap();
 
     let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
-    let mut dst = TensorImage::new(src.width(), src.height(), PLANAR_RGB, None).unwrap();
+    let mut dst = TensorImage::new(640, 640, PLANAR_RGB, None).unwrap();
 
     let mut converter = GLConverterThreaded::new().unwrap();
 
@@ -806,7 +806,7 @@ where
     let file = std::fs::read(path).unwrap();
 
     let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
-    let mut dst = TensorImage::new(src.width(), src.height(), PLANAR_RGB, None).unwrap();
+    let mut dst = TensorImage::new(640, 640, PLANAR_RGB, None).unwrap();
 
     let mut converter = CPUConverter::new().unwrap();
 
@@ -837,7 +837,7 @@ where
     let file = std::fs::read(path).unwrap();
 
     let src = TensorImage::load_jpeg(&file, Some(RGB), None).unwrap();
-    let mut dst = TensorImage::new(src.width(), src.height(), PLANAR_RGB, None).unwrap();
+    let mut dst = TensorImage::new(640, 640, PLANAR_RGB, None).unwrap();
 
     let mut converter = CPUConverter::new().unwrap();
 
