@@ -639,7 +639,6 @@ impl ImageConverterTrait for ImageConverter {
         if src_shape == dst_shape
             && flip == Flip::None
             && rotation == Rotation::None
-            && dst.fourcc() != PLANAR_RGB
             && let Some(cpu) = self.cpu.as_mut()
         {
             match cpu.convert(src, dst, rotation, flip, crop) {
