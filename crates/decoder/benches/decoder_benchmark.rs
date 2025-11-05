@@ -3,11 +3,11 @@
 use divan::black_box_drop;
 use edgefirst_decoder::{
     Quantization, XYWH,
-    byte::{nms_int, postprocess_boxes_8bit},
+    byte::{nms_int, postprocess_boxes_quant},
     dequant_detect_box, dequantize_cpu, dequantize_cpu_chunked, dequantize_ndarray,
     float::{nms_f32, postprocess_boxes_float},
-    modelpack::{ModelPackDetectionConfig, decode_modelpack_split, decode_modelpack_u8},
-    yolo::{decode_yolo_f32, decode_yolo_i8, decode_yolo_segdet_f32, decode_yolo_segdet_i8},
+    modelpack::{ModelPackDetectionConfig, decode_modelpack_det, decode_modelpack_split},
+    yolo::{decode_yolo_det, decode_yolo_f32, decode_yolo_segdet, decode_yolo_segdet_f32},
 };
 use ndarray::s;
 
@@ -25,7 +25,7 @@ fn decoder_yolo_quant(bencher: divan::Bencher) {
 
     bencher.bench_local(|| {
         let mut output_boxes: Vec<_> = Vec::with_capacity(50);
-        decode_yolo_i8(
+        decode_yolo_det(
             (out.view(), quant),
             score_threshold,
             iou_threshold,
@@ -48,7 +48,7 @@ fn decoder_quant_decode_boxes(bencher: divan::Bencher) {
     let boxes_tensor = out.slice(s![..4, ..,]).reversed_axes();
     let scores_tensor = out.slice(s![4..(80 + 4), ..,]).reversed_axes();
     bencher.bench_local(|| {
-        let _ = postprocess_boxes_8bit::<XYWH, _, _>(
+        let _ = postprocess_boxes_quant::<XYWH, _, _>(
             score_threshold,
             boxes_tensor,
             scores_tensor,
@@ -59,8 +59,8 @@ fn decoder_quant_decode_boxes(bencher: divan::Bencher) {
 
 #[divan::bench()]
 fn decoder_quant_nms(bencher: divan::Bencher) {
-    let score_threshold = 0.25;
-    let iou_threshold = 0.70;
+    let score_threshold = 0.000;
+    let iou_threshold = 0.90;
     let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
     let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
     let out = out.to_vec();
@@ -76,11 +76,11 @@ fn decoder_quant_nms(bencher: divan::Bencher) {
     let boxes_tensor = out.slice(s![..4, ..,]).reversed_axes();
     let scores_tensor = out.slice(s![4..(80 + 4), ..,]).reversed_axes();
     let boxes =
-        postprocess_boxes_8bit::<XYWH, _, _>(score_threshold, boxes_tensor, scores_tensor, quant);
+        postprocess_boxes_quant::<XYWH, _, _>(score_threshold, boxes_tensor, scores_tensor, quant);
     bencher
         .with_inputs(|| boxes.clone())
         .bench_local_values(|boxes| {
-            let boxes = nms_int::<_, _, i32>(iou_threshold, boxes);
+            let boxes = nms_int::<_, _, i64>(iou_threshold, boxes);
             let len = output_boxes.capacity().min(boxes.len());
             output_boxes.clear();
             for b in boxes.iter().take(len) {
@@ -285,7 +285,7 @@ fn decoder_modelpack_u8(bencher: divan::Bencher) {
 
     let mut output_boxes: Vec<_> = Vec::with_capacity(50);
     bencher.bench_local(|| {
-        decode_modelpack_u8(
+        decode_modelpack_det(
             (boxes.view(), quant_boxes),
             (scores.view(), quant_scores),
             score_threshold,
@@ -361,8 +361,8 @@ fn decoder_masks(bencher: divan::Bencher) {
     };
 
     bencher.bench_local(|| {
-        let protos = dequantize_ndarray(quant_protos, protos.view());
-        let seg = dequantize_ndarray(quant_boxes, boxes.view());
+        let protos = dequantize_ndarray(protos.view(), quant_protos);
+        let seg = dequantize_ndarray(boxes.view(), quant_boxes);
         let mut output_boxes: Vec<_> = Vec::with_capacity(10);
         let mut output_masks: Vec<_> = Vec::with_capacity(10);
         decode_yolo_segdet_f32(
@@ -401,7 +401,7 @@ fn decoder_masks_i8(bencher: divan::Bencher) {
     bencher.bench_local(|| {
         let mut output_boxes: Vec<_> = Vec::with_capacity(10);
         let mut output_masks: Vec<_> = Vec::with_capacity(10);
-        decode_yolo_segdet_i8(
+        decode_yolo_segdet(
             (boxes.view(), quant_boxes),
             (protos.view(), quant_protos),
             score_threshold,

@@ -1,4 +1,4 @@
-use ndarray::{Array, ArrayViewD, s};
+use ndarray::{Array, Array3, ArrayViewD, s};
 use ndarray_stats::QuantileExt;
 use num_traits::AsPrimitive;
 use serde::{Deserialize, Serialize};
@@ -6,16 +6,16 @@ use serde::{Deserialize, Serialize};
 use crate::{
     DetectBox, Error, Quantization, Segmentation,
     configs::{DecoderType, ModelType, QuantTuple},
+    dequantize_ndarray,
     modelpack::{
-        ModelPackDetectionConfig, decode_modelpack_f32, decode_modelpack_f64, decode_modelpack_i8,
-        decode_modelpack_split, decode_modelpack_split_float, decode_modelpack_u8,
+        ModelPackDetectionConfig, decode_modelpack_det, decode_modelpack_f32, decode_modelpack_f64,
+        decode_modelpack_split, decode_modelpack_split_float,
     },
     yolo::{
-        decode_yolo_f32, decode_yolo_f64, decode_yolo_i8, decode_yolo_segdet_f32,
-        decode_yolo_segdet_f64, decode_yolo_segdet_i8, decode_yolo_segdet_u8,
-        decode_yolo_split_det_f32, decode_yolo_split_det_f64, decode_yolo_split_det_i8,
-        decode_yolo_split_det_u8, decode_yolo_split_segdet_f32, decode_yolo_split_segdet_f64,
-        decode_yolo_split_segdet_i8, decode_yolo_split_segdet_u8, decode_yolo_u8,
+        decode_yolo_det, decode_yolo_f32, decode_yolo_f64, decode_yolo_segdet,
+        decode_yolo_segdet_f32, decode_yolo_segdet_f64, decode_yolo_split_det,
+        decode_yolo_split_det_f32, decode_yolo_split_det_f64, decode_yolo_split_segdet,
+        decode_yolo_split_segdet_f32, decode_yolo_split_segdet_f64,
     },
 };
 
@@ -545,14 +545,57 @@ pub struct Decoder {
     pub score_threshold: f32,
 }
 
+#[derive(Debug)]
+pub enum ArrayViewDQuantized<'a> {
+    UInt8_(ArrayViewD<'a, u8>),
+    Int8__(ArrayViewD<'a, i8>),
+    UInt16(ArrayViewD<'a, u16>),
+    Int16_(ArrayViewD<'a, i16>),
+}
+
+impl<'a> From<ArrayViewD<'a, u8>> for ArrayViewDQuantized<'a> {
+    fn from(arr: ArrayViewD<'a, u8>) -> Self {
+        Self::UInt8_(arr)
+    }
+}
+
+impl<'a> From<ArrayViewD<'a, i8>> for ArrayViewDQuantized<'a> {
+    fn from(arr: ArrayViewD<'a, i8>) -> Self {
+        Self::Int8__(arr)
+    }
+}
+
+impl<'a> From<ArrayViewD<'a, u16>> for ArrayViewDQuantized<'a> {
+    fn from(arr: ArrayViewD<'a, u16>) -> Self {
+        Self::UInt16(arr)
+    }
+}
+
+impl<'a> From<ArrayViewD<'a, i16>> for ArrayViewDQuantized<'a> {
+    fn from(arr: ArrayViewD<'a, i16>) -> Self {
+        Self::Int16_(arr)
+    }
+}
+
+impl<'a> ArrayViewDQuantized<'a> {
+    fn shape(&self) -> &[usize] {
+        match self {
+            ArrayViewDQuantized::UInt8_(a) => a.shape(),
+            ArrayViewDQuantized::Int8__(a) => a.shape(),
+            ArrayViewDQuantized::UInt16(a) => a.shape(),
+            ArrayViewDQuantized::Int16_(a) => a.shape(),
+        }
+    }
+}
+
 impl Decoder {
     pub fn model_type(&self) -> &ModelType {
         &self.model_type
     }
 
-    pub fn decode_u8(
+    pub fn decode_quantized(
         &self,
-        outputs: &[ArrayViewD<u8>],
+        outputs: &[ArrayViewDQuantized],
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
     ) -> Result<(), Error> {
@@ -564,114 +607,53 @@ impl Decoder {
                 scores,
                 segmentation,
             } => {
-                self.decode_modelpack_det_u8(outputs, boxes, scores, output_boxes)?;
-                self.decode_modelpack_seg_u8(outputs, segmentation, output_masks)?;
+                self.decode_modelpack_det_quantized(outputs, boxes, scores, output_boxes)?;
+                self.decode_modelpack_seg_quantized(outputs, segmentation, output_masks)
             }
             ModelType::ModelPackSegDetSplit {
                 detection,
                 segmentation,
             } => {
-                self.decode_modelpack_det_split(outputs, detection, output_boxes)?;
-                self.decode_modelpack_seg_u8(outputs, segmentation, output_masks)?;
+                self.decode_modelpack_det_split_quantized(outputs, detection, output_boxes)?;
+                self.decode_modelpack_seg_quantized(outputs, segmentation, output_masks)
             }
             ModelType::ModelPackDet { boxes, scores } => {
-                self.decode_modelpack_det_u8(outputs, boxes, scores, output_boxes)?;
+                self.decode_modelpack_det_quantized(outputs, boxes, scores, output_boxes)
             }
             ModelType::ModelPackDetSplit { detection } => {
-                self.decode_modelpack_det_split(outputs, detection, output_boxes)?;
+                self.decode_modelpack_det_split_quantized(outputs, detection, output_boxes)
             }
             ModelType::ModelPackSeg { segmentation } => {
-                self.decode_modelpack_seg_u8(outputs, segmentation, output_masks)?;
+                self.decode_modelpack_seg_quantized(outputs, segmentation, output_masks)
             }
             ModelType::YoloDet { boxes } => {
-                self.decode_yolo_det_u8(outputs, boxes, output_boxes)?;
+                self.decode_yolo_det_quantized(outputs, boxes, output_boxes)
             }
-            ModelType::YoloSegDet { boxes, protos } => {
-                self.decode_yolo_segdet_u8(outputs, boxes, protos, output_boxes, output_masks)?;
-            }
+            ModelType::YoloSegDet { boxes, protos } => self.decode_yolo_segdet_quantized(
+                outputs,
+                boxes,
+                protos,
+                output_boxes,
+                output_masks,
+            ),
             ModelType::YoloSplitDet { boxes, scores } => {
-                self.decode_yolo_split_det_u8(outputs, boxes, scores, output_boxes)?;
+                self.decode_yolo_split_det_quantized(outputs, boxes, scores, output_boxes)
             }
             ModelType::YoloSplitSegDet {
                 boxes,
                 scores,
                 mask_coeff,
                 protos,
-            } => {
-                self.decode_yolo_split_segdet_u8(
-                    outputs,
-                    boxes,
-                    scores,
-                    mask_coeff,
-                    protos,
-                    output_boxes,
-                    output_masks,
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    pub fn decode_i8(
-        &self,
-        outputs: &[ArrayViewD<i8>],
-        output_boxes: &mut Vec<DetectBox>,
-        output_masks: &mut Vec<Segmentation>,
-    ) -> Result<(), Error> {
-        output_boxes.clear();
-        output_masks.clear();
-        match &self.model_type {
-            ModelType::ModelPackSegDet {
-                boxes,
-                scores,
-                segmentation,
-            } => {
-                self.decode_modelpack_det_i8(outputs, boxes, scores, output_boxes)?;
-                self.decode_modelpack_seg_i8(outputs, segmentation, output_masks)?;
-            }
-            ModelType::ModelPackSegDetSplit {
-                detection,
-                segmentation,
-            } => {
-                self.decode_modelpack_det_split(outputs, detection, output_boxes)?;
-                self.decode_modelpack_seg_i8(outputs, segmentation, output_masks)?;
-            }
-            ModelType::ModelPackDet { boxes, scores } => {
-                self.decode_modelpack_det_i8(outputs, boxes, scores, output_boxes)?;
-            }
-            ModelType::ModelPackDetSplit { detection } => {
-                self.decode_modelpack_det_split(outputs, detection, output_boxes)?;
-            }
-            ModelType::ModelPackSeg { segmentation } => {
-                self.decode_modelpack_seg_i8(outputs, segmentation, output_masks)?;
-            }
-            ModelType::YoloDet { boxes } => {
-                self.decode_yolo_det_i8(outputs, boxes, output_boxes)?;
-            }
-            ModelType::YoloSegDet { boxes, protos } => {
-                self.decode_yolo_segdet_i8(outputs, boxes, protos, output_boxes, output_masks)?;
-            }
-            ModelType::YoloSplitDet { boxes, scores } => {
-                self.decode_yolo_split_det_i8(outputs, boxes, scores, output_boxes)?;
-            }
-            ModelType::YoloSplitSegDet {
+            } => self.decode_yolo_split_segdet_quantized(
+                outputs,
                 boxes,
                 scores,
                 mask_coeff,
                 protos,
-            } => {
-                self.decode_yolo_split_segdet_i8(
-                    outputs,
-                    boxes,
-                    scores,
-                    mask_coeff,
-                    protos,
-                    output_boxes,
-                    output_masks,
-                )?;
-            }
+                output_boxes,
+                output_masks,
+            ),
         }
-        Ok(())
     }
 
     pub fn decode_f32(
@@ -798,6 +780,687 @@ impl Decoder {
         Ok(())
     }
 
+    fn decode_modelpack_det_quantized(
+        &self,
+        outputs: &[ArrayViewDQuantized],
+        boxes: &configs::Boxes,
+        scores: &configs::Scores,
+        output_boxes: &mut Vec<DetectBox>,
+    ) -> Result<(), Error> {
+        let (boxes_tensor, ind) =
+            Self::find_outputs_with_shape_quantized(&boxes.shape, outputs, &[])?;
+        let (scores_tensor, _) =
+            Self::find_outputs_with_shape_quantized(&scores.shape, outputs, &[ind])?;
+        let quant_boxes = boxes
+            .quantization
+            .map(Quantization::from)
+            .unwrap_or_default();
+        let quant_scores = scores
+            .quantization
+            .map(Quantization::from)
+            .unwrap_or_default();
+        macro_rules! yolo_split_quant {
+            ($boxes_tensor:expr, $scores_tensor:expr) => {{
+                let mut boxes_tensor = $boxes_tensor.slice(s![0, .., 0, ..]);
+                if boxes.channels_first {
+                    boxes_tensor.swap_axes(0, 1);
+                };
+
+                let mut scores_tensor = $scores_tensor.slice(s![0, .., ..]);
+                if scores.channels_first {
+                    scores_tensor.swap_axes(0, 1);
+                };
+                decode_modelpack_det(
+                    (boxes_tensor, quant_boxes),
+                    (scores_tensor, quant_scores),
+                    self.score_threshold,
+                    self.iou_threshold,
+                    output_boxes,
+                );
+            }};
+        }
+        use ArrayViewDQuantized::*;
+        match (boxes_tensor, scores_tensor) {
+            (UInt8_(b), UInt8_(s)) => yolo_split_quant!(b, s),
+            (UInt8_(b), Int8__(s)) => yolo_split_quant!(b, s),
+            (UInt8_(b), UInt16(s)) => yolo_split_quant!(b, s),
+            (UInt8_(b), Int16_(s)) => yolo_split_quant!(b, s),
+
+            (Int8__(b), UInt8_(s)) => yolo_split_quant!(b, s),
+            (Int8__(b), Int8__(s)) => yolo_split_quant!(b, s),
+            (Int8__(b), UInt16(s)) => yolo_split_quant!(b, s),
+            (Int8__(b), Int16_(s)) => yolo_split_quant!(b, s),
+
+            (UInt16(b), UInt8_(s)) => yolo_split_quant!(b, s),
+            (UInt16(b), Int8__(s)) => yolo_split_quant!(b, s),
+            (UInt16(b), UInt16(s)) => yolo_split_quant!(b, s),
+            (UInt16(b), Int16_(s)) => yolo_split_quant!(b, s),
+
+            (Int16_(b), UInt8_(s)) => yolo_split_quant!(b, s),
+            (Int16_(b), Int8__(s)) => yolo_split_quant!(b, s),
+            (Int16_(b), UInt16(s)) => yolo_split_quant!(b, s),
+            (Int16_(b), Int16_(s)) => yolo_split_quant!(b, s),
+        }
+
+        Ok(())
+    }
+
+    fn decode_modelpack_seg_quantized(
+        &self,
+        outputs: &[ArrayViewDQuantized],
+        segmentation: &configs::Segmentation,
+        output_masks: &mut Vec<Segmentation>,
+    ) -> Result<(), Error> {
+        let (seg, _) = Self::find_outputs_with_shape_quantized(&segmentation.shape, outputs, &[])?;
+
+        macro_rules! modelpack_seg {
+            ($seg:expr) => {{
+                let mut seg = $seg.slice(s![0, .., .., ..]);
+                if segmentation.channels_first {
+                    seg.swap_axes(0, 1);
+                    seg.swap_axes(1, 2);
+                }
+                seg
+            }};
+        }
+        use ArrayViewDQuantized::*;
+        let seg = match seg {
+            UInt8_(s) => {
+                let seg = modelpack_seg!(s);
+                seg.mapv(|x| x)
+            }
+            Int8__(s) => {
+                let seg = modelpack_seg!(s);
+                seg.mapv(|x| (x as i16 + 128) as u8)
+            }
+            UInt16(s) => {
+                let seg = modelpack_seg!(s);
+                seg.mapv(|x| (x >> 8) as u8)
+            }
+            Int16_(s) => {
+                let seg = modelpack_seg!(s);
+                seg.mapv(|x| ((x as i32 + 32768) >> 8) as u8)
+            }
+        };
+
+        output_masks.push(Segmentation {
+            xmin: 0.0,
+            ymin: 0.0,
+            xmax: 1.0,
+            ymax: 1.0,
+            segmentation: seg,
+        });
+        Ok(())
+    }
+
+    fn decode_modelpack_det_split_quantized(
+        &self,
+        outputs: &[ArrayViewDQuantized],
+        detection: &[configs::Detection],
+        output_boxes: &mut Vec<DetectBox>,
+    ) -> Result<(), Error> {
+        let new_detection = detection
+            .iter()
+            .map(|x| ModelPackDetectionConfig {
+                anchors: x.anchors.clone().unwrap(),
+                quantization: x.quantization.map(Quantization::from),
+            })
+            .collect::<Vec<_>>();
+        let new_outputs = Self::match_outputs_to_detect_quantized(detection, outputs)?;
+
+        macro_rules! dequant_output {
+            ($det_tensor:expr, $detection:expr) => {{
+                let mut det_tensor = $det_tensor.slice(s![0, .., .., ..]);
+                if $detection.channels_first {
+                    det_tensor.swap_axes(0, 1);
+                    det_tensor.swap_axes(1, 2);
+                }
+                if let Some(q) = $detection.quantization {
+                    dequantize_ndarray(det_tensor, q.into())
+                } else {
+                    det_tensor.map(|x| *x as f32)
+                }
+            }};
+        }
+        use ArrayViewDQuantized::*;
+        let new_outputs = new_outputs
+            .iter()
+            .zip(detection)
+            .map(|(det_tensor, detection)| match det_tensor {
+                UInt8_(d) => dequant_output!(d, detection),
+                Int8__(d) => dequant_output!(d, detection),
+                UInt16(d) => dequant_output!(d, detection),
+                Int16_(d) => dequant_output!(d, detection),
+            })
+            .collect::<Vec<_>>();
+
+        let new_outputs_view = new_outputs
+            .iter()
+            .map(|d: &Array3<f32>| d.view())
+            .collect::<Vec<_>>();
+        decode_modelpack_split_float(
+            &new_outputs_view,
+            &new_detection,
+            self.score_threshold,
+            self.iou_threshold,
+            output_boxes,
+        );
+        Ok(())
+    }
+
+    fn decode_yolo_det_quantized(
+        &self,
+        outputs: &[ArrayViewDQuantized],
+        boxes: &configs::Detection,
+        output_boxes: &mut Vec<DetectBox>,
+    ) -> Result<(), Error> {
+        let (boxes_tensor, _) =
+            Self::find_outputs_with_shape_quantized(&boxes.shape, outputs, &[])?;
+
+        macro_rules! yolo_quant {
+            ($boxes_tensor:expr) => {{
+                let quant_boxes = boxes
+                    .quantization
+                    .map(Quantization::from)
+                    .unwrap_or_default();
+
+                let mut boxes_tensor = $boxes_tensor.slice(s![0, .., ..]);
+                if boxes.channels_first {
+                    boxes_tensor.swap_axes(0, 1);
+                };
+                decode_yolo_det(
+                    (boxes_tensor, quant_boxes),
+                    self.score_threshold,
+                    self.iou_threshold,
+                    output_boxes,
+                );
+            }};
+        }
+        use ArrayViewDQuantized::*;
+        match boxes_tensor {
+            UInt8_(b) => yolo_quant!(b),
+            Int8__(b) => yolo_quant!(b),
+            UInt16(b) => yolo_quant!(b),
+            Int16_(b) => yolo_quant!(b),
+        }
+
+        Ok(())
+    }
+
+    fn decode_yolo_segdet_quantized(
+        &self,
+        outputs: &[ArrayViewDQuantized],
+        boxes: &configs::Segmentation,
+        protos: &configs::Protos,
+        output_boxes: &mut Vec<DetectBox>,
+        output_masks: &mut Vec<Segmentation>,
+    ) -> Result<(), Error> {
+        let (boxes_tensor, ind) =
+            Self::find_outputs_with_shape_quantized(&boxes.shape, outputs, &[])?;
+        let (protos_tensor, _) =
+            Self::find_outputs_with_shape_quantized(&protos.shape, outputs, &[ind])?;
+
+        let quant_boxes = boxes
+            .quantization
+            .map(Quantization::from)
+            .unwrap_or_default();
+        let quant_protos = protos
+            .quantization
+            .map(Quantization::from)
+            .unwrap_or_default();
+        macro_rules! yolo_quant {
+            ($boxes_tensor:expr, $protos_tensor:expr) => {{
+                let mut box_tensor = $boxes_tensor.slice(s![0, .., ..]);
+                if boxes.channels_first {
+                    box_tensor.swap_axes(0, 1);
+                }
+
+                let mut protos_tensor = $protos_tensor.slice(s![0, .., .., ..]);
+                if protos.channels_first {
+                    protos_tensor.swap_axes(0, 1);
+                    protos_tensor.swap_axes(1, 2);
+                }
+
+                decode_yolo_segdet(
+                    (box_tensor, quant_boxes),
+                    (protos_tensor, quant_protos),
+                    self.score_threshold,
+                    self.iou_threshold,
+                    output_boxes,
+                    output_masks,
+                );
+            }};
+        }
+        use ArrayViewDQuantized::*;
+        match (boxes_tensor, protos_tensor) {
+            (UInt8_(b), UInt8_(p)) => yolo_quant!(b, p),
+            (UInt8_(b), Int8__(p)) => yolo_quant!(b, p),
+            (UInt8_(b), UInt16(p)) => yolo_quant!(b, p),
+            (UInt8_(b), Int16_(p)) => yolo_quant!(b, p),
+            (Int8__(b), UInt8_(p)) => yolo_quant!(b, p),
+            (Int8__(b), Int8__(p)) => yolo_quant!(b, p),
+            (Int8__(b), UInt16(p)) => yolo_quant!(b, p),
+            (Int8__(b), Int16_(p)) => yolo_quant!(b, p),
+            (UInt16(b), UInt8_(p)) => yolo_quant!(b, p),
+            (UInt16(b), Int8__(p)) => yolo_quant!(b, p),
+            (UInt16(b), UInt16(p)) => yolo_quant!(b, p),
+            (UInt16(b), Int16_(p)) => yolo_quant!(b, p),
+            (Int16_(b), UInt8_(p)) => yolo_quant!(b, p),
+            (Int16_(b), Int8__(p)) => yolo_quant!(b, p),
+            (Int16_(b), UInt16(p)) => yolo_quant!(b, p),
+            (Int16_(b), Int16_(p)) => yolo_quant!(b, p),
+        }
+
+        Ok(())
+    }
+
+    fn decode_yolo_split_det_quantized(
+        &self,
+        outputs: &[ArrayViewDQuantized],
+        boxes: &configs::Boxes,
+        scores: &configs::Scores,
+        output_boxes: &mut Vec<DetectBox>,
+    ) -> Result<(), Error> {
+        let (boxes_tensor, ind) =
+            Self::find_outputs_with_shape_quantized(&boxes.shape, outputs, &[])?;
+        let (scores_tensor, _) =
+            Self::find_outputs_with_shape_quantized(&scores.shape, outputs, &[ind])?;
+        let quant_boxes = boxes
+            .quantization
+            .map(Quantization::from)
+            .unwrap_or_default();
+        let quant_scores = scores
+            .quantization
+            .map(Quantization::from)
+            .unwrap_or_default();
+        macro_rules! yolo_split_quant {
+            ($boxes_tensor:expr, $scores_tensor:expr) => {{
+                let mut boxes_tensor = $boxes_tensor.slice(s![0, .., ..]);
+                if boxes.channels_first {
+                    boxes_tensor.swap_axes(0, 1);
+                };
+
+                let mut scores_tensor = $scores_tensor.slice(s![0, .., ..]);
+                if scores.channels_first {
+                    scores_tensor.swap_axes(0, 1);
+                };
+                decode_yolo_split_det(
+                    (boxes_tensor, quant_boxes),
+                    (scores_tensor, quant_scores),
+                    self.score_threshold,
+                    self.iou_threshold,
+                    output_boxes,
+                );
+            }};
+        }
+        use ArrayViewDQuantized::*;
+        match (boxes_tensor, scores_tensor) {
+            (UInt8_(b), UInt8_(s)) => yolo_split_quant!(b, s),
+            (UInt8_(b), Int8__(s)) => yolo_split_quant!(b, s),
+            (UInt8_(b), UInt16(s)) => yolo_split_quant!(b, s),
+            (UInt8_(b), Int16_(s)) => yolo_split_quant!(b, s),
+
+            (Int8__(b), UInt8_(s)) => yolo_split_quant!(b, s),
+            (Int8__(b), Int8__(s)) => yolo_split_quant!(b, s),
+            (Int8__(b), UInt16(s)) => yolo_split_quant!(b, s),
+            (Int8__(b), Int16_(s)) => yolo_split_quant!(b, s),
+
+            (UInt16(b), UInt8_(s)) => yolo_split_quant!(b, s),
+            (UInt16(b), Int8__(s)) => yolo_split_quant!(b, s),
+            (UInt16(b), UInt16(s)) => yolo_split_quant!(b, s),
+            (UInt16(b), Int16_(s)) => yolo_split_quant!(b, s),
+
+            (Int16_(b), UInt8_(s)) => yolo_split_quant!(b, s),
+            (Int16_(b), Int8__(s)) => yolo_split_quant!(b, s),
+            (Int16_(b), UInt16(s)) => yolo_split_quant!(b, s),
+            (Int16_(b), Int16_(s)) => yolo_split_quant!(b, s),
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_yolo_split_segdet_quantized(
+        &self,
+        outputs: &[ArrayViewDQuantized],
+        boxes: &configs::Boxes,
+        scores: &configs::Scores,
+        mask_coeff: &configs::MaskCoefficients,
+        protos: &configs::Protos,
+        output_boxes: &mut Vec<DetectBox>,
+        output_masks: &mut Vec<Segmentation>,
+    ) -> Result<(), Error> {
+        let quant_boxes = boxes
+            .quantization
+            .map(Quantization::from)
+            .unwrap_or_default();
+        let quant_scores = scores
+            .quantization
+            .map(Quantization::from)
+            .unwrap_or_default();
+        let quant_masks = mask_coeff
+            .quantization
+            .map(Quantization::from)
+            .unwrap_or_default();
+        let quant_protos = protos
+            .quantization
+            .map(Quantization::from)
+            .unwrap_or_default();
+
+        macro_rules! yolo_split_segdet_quant {
+            ($boxes_tensor:expr, $scores_tensor:expr, $mask_tensor:expr, $protos_tensor:expr) => {{
+                let mut boxes_tensor = $boxes_tensor.slice(s![0, .., ..]);
+                if boxes.channels_first {
+                    boxes_tensor.swap_axes(0, 1);
+                };
+
+                let mut scores_tensor = $scores_tensor.slice(s![0, .., ..]);
+                if scores.channels_first {
+                    scores_tensor.swap_axes(0, 1);
+                };
+
+                let mut mask_tensor = $mask_tensor.slice(s![0, .., ..]);
+                if mask_coeff.channels_first {
+                    mask_tensor.swap_axes(0, 1);
+                };
+
+                let mut protos_tensor = $protos_tensor.slice(s![0, .., .., ..]);
+                if protos.channels_first {
+                    protos_tensor.swap_axes(0, 1);
+                    protos_tensor.swap_axes(1, 2);
+                }
+
+                decode_yolo_split_segdet(
+                    (boxes_tensor, quant_boxes),
+                    (scores_tensor, quant_scores),
+                    (mask_tensor, quant_masks),
+                    (protos_tensor, quant_protos),
+                    self.score_threshold,
+                    self.iou_threshold,
+                    output_boxes,
+                    output_masks,
+                );
+            }};
+        }
+
+        let mut skip = vec![];
+
+        let (boxes_tensor, ind) =
+            Self::find_outputs_with_shape_quantized(&boxes.shape, outputs, &skip)?;
+        skip.push(ind);
+
+        let (scores_tensor, ind) =
+            Self::find_outputs_with_shape_quantized(&scores.shape, outputs, &skip)?;
+        skip.push(ind);
+
+        let (mask_tensor, ind) =
+            Self::find_outputs_with_shape_quantized(&mask_coeff.shape, outputs, &skip)?;
+        skip.push(ind);
+
+        let (protos_tensor, _) =
+            Self::find_outputs_with_shape_quantized(&protos.shape, outputs, &skip)?;
+        use ArrayViewDQuantized::*;
+        match (boxes_tensor, scores_tensor, mask_tensor, protos_tensor) {
+            (UInt8_(b), UInt8_(s), UInt8_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt8_(s), UInt8_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt8_(s), UInt8_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt8_(s), UInt8_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt8_(s), Int8__(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt8_(s), Int8__(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt8_(s), Int8__(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt8_(s), Int8__(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt8_(s), UInt16(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt8_(s), UInt16(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt8_(s), UInt16(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt8_(s), UInt16(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt8_(s), Int16_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt8_(s), Int16_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt8_(s), Int16_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt8_(s), Int16_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int8__(s), UInt8_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int8__(s), UInt8_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int8__(s), UInt8_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int8__(s), UInt8_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int8__(s), Int8__(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int8__(s), Int8__(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int8__(s), Int8__(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int8__(s), Int8__(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int8__(s), UInt16(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int8__(s), UInt16(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int8__(s), UInt16(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int8__(s), UInt16(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int8__(s), Int16_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int8__(s), Int16_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int8__(s), Int16_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int8__(s), Int16_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt16(s), UInt8_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt16(s), UInt8_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt16(s), UInt8_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt16(s), UInt8_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt16(s), Int8__(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt16(s), Int8__(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt16(s), Int8__(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt16(s), Int8__(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt16(s), UInt16(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt16(s), UInt16(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt16(s), UInt16(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt16(s), UInt16(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt16(s), Int16_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt16(s), Int16_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt16(s), Int16_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), UInt16(s), Int16_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int16_(s), UInt8_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int16_(s), UInt8_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int16_(s), UInt8_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int16_(s), UInt8_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int16_(s), Int8__(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int16_(s), Int8__(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int16_(s), Int8__(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int16_(s), Int8__(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int16_(s), UInt16(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int16_(s), UInt16(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int16_(s), UInt16(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int16_(s), UInt16(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int16_(s), Int16_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int16_(s), Int16_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int16_(s), Int16_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt8_(b), Int16_(s), Int16_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt8_(s), UInt8_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt8_(s), UInt8_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt8_(s), UInt8_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt8_(s), UInt8_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt8_(s), Int8__(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt8_(s), Int8__(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt8_(s), Int8__(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt8_(s), Int8__(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt8_(s), UInt16(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt8_(s), UInt16(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt8_(s), UInt16(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt8_(s), UInt16(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt8_(s), Int16_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt8_(s), Int16_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt8_(s), Int16_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt8_(s), Int16_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int8__(s), UInt8_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int8__(s), UInt8_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int8__(s), UInt8_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int8__(s), UInt8_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int8__(s), Int8__(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int8__(s), Int8__(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int8__(s), Int8__(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int8__(s), Int8__(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int8__(s), UInt16(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int8__(s), UInt16(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int8__(s), UInt16(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int8__(s), UInt16(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int8__(s), Int16_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int8__(s), Int16_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int8__(s), Int16_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int8__(s), Int16_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt16(s), UInt8_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt16(s), UInt8_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt16(s), UInt8_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt16(s), UInt8_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt16(s), Int8__(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt16(s), Int8__(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt16(s), Int8__(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt16(s), Int8__(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt16(s), UInt16(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt16(s), UInt16(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt16(s), UInt16(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt16(s), UInt16(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt16(s), Int16_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt16(s), Int16_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt16(s), Int16_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), UInt16(s), Int16_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int16_(s), UInt8_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int16_(s), UInt8_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int16_(s), UInt8_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int16_(s), UInt8_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int16_(s), Int8__(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int16_(s), Int8__(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int16_(s), Int8__(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int16_(s), Int8__(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int16_(s), UInt16(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int16_(s), UInt16(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int16_(s), UInt16(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int16_(s), UInt16(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int16_(s), Int16_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int16_(s), Int16_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int16_(s), Int16_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int8__(b), Int16_(s), Int16_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt8_(s), UInt8_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt8_(s), UInt8_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt8_(s), UInt8_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt8_(s), UInt8_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt8_(s), Int8__(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt8_(s), Int8__(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt8_(s), Int8__(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt8_(s), Int8__(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt8_(s), UInt16(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt8_(s), UInt16(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt8_(s), UInt16(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt8_(s), UInt16(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt8_(s), Int16_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt8_(s), Int16_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt8_(s), Int16_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt8_(s), Int16_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int8__(s), UInt8_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int8__(s), UInt8_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int8__(s), UInt8_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int8__(s), UInt8_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int8__(s), Int8__(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int8__(s), Int8__(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int8__(s), Int8__(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int8__(s), Int8__(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int8__(s), UInt16(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int8__(s), UInt16(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int8__(s), UInt16(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int8__(s), UInt16(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int8__(s), Int16_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int8__(s), Int16_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int8__(s), Int16_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int8__(s), Int16_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt16(s), UInt8_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt16(s), UInt8_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt16(s), UInt8_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt16(s), UInt8_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt16(s), Int8__(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt16(s), Int8__(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt16(s), Int8__(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt16(s), Int8__(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt16(s), UInt16(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt16(s), UInt16(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt16(s), UInt16(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt16(s), UInt16(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt16(s), Int16_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt16(s), Int16_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt16(s), Int16_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), UInt16(s), Int16_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int16_(s), UInt8_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int16_(s), UInt8_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int16_(s), UInt8_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int16_(s), UInt8_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int16_(s), Int8__(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int16_(s), Int8__(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int16_(s), Int8__(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int16_(s), Int8__(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int16_(s), UInt16(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int16_(s), UInt16(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int16_(s), UInt16(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int16_(s), UInt16(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int16_(s), Int16_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int16_(s), Int16_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int16_(s), Int16_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (UInt16(b), Int16_(s), Int16_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt8_(s), UInt8_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt8_(s), UInt8_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt8_(s), UInt8_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt8_(s), UInt8_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt8_(s), Int8__(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt8_(s), Int8__(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt8_(s), Int8__(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt8_(s), Int8__(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt8_(s), UInt16(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt8_(s), UInt16(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt8_(s), UInt16(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt8_(s), UInt16(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt8_(s), Int16_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt8_(s), Int16_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt8_(s), Int16_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt8_(s), Int16_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int8__(s), UInt8_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int8__(s), UInt8_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int8__(s), UInt8_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int8__(s), UInt8_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int8__(s), Int8__(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int8__(s), Int8__(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int8__(s), Int8__(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int8__(s), Int8__(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int8__(s), UInt16(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int8__(s), UInt16(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int8__(s), UInt16(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int8__(s), UInt16(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int8__(s), Int16_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int8__(s), Int16_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int8__(s), Int16_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int8__(s), Int16_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt16(s), UInt8_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt16(s), UInt8_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt16(s), UInt8_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt16(s), UInt8_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt16(s), Int8__(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt16(s), Int8__(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt16(s), Int8__(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt16(s), Int8__(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt16(s), UInt16(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt16(s), UInt16(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt16(s), UInt16(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt16(s), UInt16(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt16(s), Int16_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt16(s), Int16_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt16(s), Int16_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), UInt16(s), Int16_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int16_(s), UInt8_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int16_(s), UInt8_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int16_(s), UInt8_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int16_(s), UInt8_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int16_(s), Int8__(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int16_(s), Int8__(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int16_(s), Int8__(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int16_(s), Int8__(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int16_(s), UInt16(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int16_(s), UInt16(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int16_(s), UInt16(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int16_(s), UInt16(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int16_(s), Int16_(m), UInt8_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int16_(s), Int16_(m), Int8__(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int16_(s), Int16_(m), UInt16(p)) => yolo_split_segdet_quant!(b, s, m, p),
+            (Int16_(b), Int16_(s), Int16_(m), Int16_(p)) => yolo_split_segdet_quant!(b, s, m, p),
+        }
+        Ok(())
+    }
+
     fn decode_modelpack_det_split<D>(
         &self,
         outputs: &[ArrayViewD<D>],
@@ -913,7 +1576,7 @@ impl Decoder {
             scores_tensor.swap_axes(0, 1);
         };
 
-        decode_modelpack_i8(
+        decode_modelpack_det(
             (boxes_tensor, quant_boxes),
             (scores_tensor, quant_scores),
             self.score_threshold,
@@ -938,7 +1601,7 @@ impl Decoder {
         if boxes.channels_first {
             boxes_tensor.swap_axes(0, 1);
         };
-        decode_yolo_i8(
+        decode_yolo_det(
             (boxes_tensor, quant_boxes),
             self.score_threshold,
             self.iou_threshold,
@@ -976,49 +1639,13 @@ impl Decoder {
             protos_tensor.swap_axes(1, 2);
         }
 
-        decode_yolo_segdet_i8(
+        decode_yolo_segdet(
             (box_tensor, quant_boxes),
             (protos_tensor, quant_protos),
             self.score_threshold,
             self.iou_threshold,
             output_boxes,
             output_masks,
-        );
-        Ok(())
-    }
-
-    fn decode_yolo_split_det_i8(
-        &self,
-        outputs: &[ArrayViewD<i8>],
-        boxes: &configs::Boxes,
-        scores: &configs::Scores,
-        output_boxes: &mut Vec<DetectBox>,
-    ) -> Result<(), Error> {
-        let quant_boxes = boxes
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-        let (boxes_tensor, ind) = Self::find_outputs_with_shape(&boxes.shape, outputs, &[])?;
-        let mut boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
-        if boxes.channels_first {
-            boxes_tensor.swap_axes(0, 1);
-        };
-
-        let quant_scores = scores
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-        let (scores_tensor, _) = Self::find_outputs_with_shape(&scores.shape, outputs, &[ind])?;
-        let mut scores_tensor = scores_tensor.slice(s![0, .., ..]);
-        if scores.channels_first {
-            scores_tensor.swap_axes(0, 1);
-        };
-        decode_yolo_split_det_i8(
-            (boxes_tensor, quant_boxes),
-            (scores_tensor, quant_scores),
-            self.score_threshold,
-            self.iou_threshold,
-            output_boxes,
         );
         Ok(())
     }
@@ -1079,7 +1706,7 @@ impl Decoder {
             protos_tensor.swap_axes(1, 2);
         }
 
-        decode_yolo_split_segdet_i8(
+        decode_yolo_split_segdet(
             (boxes_tensor, quant_boxes),
             (scores_tensor, quant_scores),
             (mask_tensor, quant_masks),
@@ -1150,7 +1777,7 @@ impl Decoder {
             scores_tensor.swap_axes(0, 1);
         };
 
-        decode_modelpack_u8(
+        decode_modelpack_det(
             (boxes_tensor, quant_boxes),
             (scores_tensor, quant_scores),
             self.score_threshold,
@@ -1175,155 +1802,11 @@ impl Decoder {
         if boxes.channels_first {
             boxes_tensor.swap_axes(0, 1);
         };
-        decode_yolo_u8(
+        decode_yolo_det(
             (boxes_tensor, quant_boxes),
             self.score_threshold,
             self.iou_threshold,
             output_boxes,
-        );
-        Ok(())
-    }
-
-    fn decode_yolo_segdet_u8(
-        &self,
-        outputs: &[ArrayViewD<u8>],
-        boxes: &configs::Segmentation,
-        protos: &configs::Protos,
-        output_boxes: &mut Vec<DetectBox>,
-        output_masks: &mut Vec<Segmentation>,
-    ) -> Result<(), Error> {
-        let quant_boxes = boxes
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-        let (boxes_tensor, ind) = Self::find_outputs_with_shape(&boxes.shape, outputs, &[])?;
-        let mut boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
-        if boxes.channels_first {
-            boxes_tensor.swap_axes(0, 1);
-        };
-
-        let quant_protos = protos
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-        let (protos_tensor, _) = Self::find_outputs_with_shape(&protos.shape, outputs, &[ind])?;
-        let mut protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-        if protos.channels_first {
-            protos_tensor.swap_axes(0, 1);
-            protos_tensor.swap_axes(1, 2);
-        };
-        decode_yolo_segdet_u8(
-            (boxes_tensor, quant_boxes),
-            (protos_tensor, quant_protos),
-            self.score_threshold,
-            self.iou_threshold,
-            output_boxes,
-            output_masks,
-        );
-        Ok(())
-    }
-
-    fn decode_yolo_split_det_u8(
-        &self,
-        outputs: &[ArrayViewD<u8>],
-        boxes: &configs::Boxes,
-        scores: &configs::Scores,
-        output_boxes: &mut Vec<DetectBox>,
-    ) -> Result<(), Error> {
-        let quant_boxes = boxes
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-        let (boxes_tensor, ind) = Self::find_outputs_with_shape(&boxes.shape, outputs, &[])?;
-        let mut boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
-        if boxes.channels_first {
-            boxes_tensor.swap_axes(0, 1);
-        };
-
-        let quant_scores = scores
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-        let (scores_tensor, _) = Self::find_outputs_with_shape(&scores.shape, outputs, &[ind])?;
-        let mut scores_tensor = scores_tensor.slice(s![0, .., ..]);
-        if scores.channels_first {
-            scores_tensor.swap_axes(0, 1);
-        };
-        decode_yolo_split_det_u8(
-            (boxes_tensor, quant_boxes),
-            (scores_tensor, quant_scores),
-            self.score_threshold,
-            self.iou_threshold,
-            output_boxes,
-        );
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn decode_yolo_split_segdet_u8(
-        &self,
-        outputs: &[ArrayViewD<u8>],
-        boxes: &configs::Boxes,
-        scores: &configs::Scores,
-        mask_coeff: &configs::MaskCoefficients,
-        protos: &configs::Protos,
-        output_boxes: &mut Vec<DetectBox>,
-        output_masks: &mut Vec<Segmentation>,
-    ) -> Result<(), Error> {
-        let mut skip = vec![];
-        let quant_boxes = boxes
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-        let (boxes_tensor, ind) = Self::find_outputs_with_shape(&boxes.shape, outputs, &skip)?;
-        let mut boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
-        if boxes.channels_first {
-            boxes_tensor.swap_axes(0, 1);
-        };
-        skip.push(ind);
-
-        let quant_scores = scores
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-        let (scores_tensor, ind) = Self::find_outputs_with_shape(&scores.shape, outputs, &skip)?;
-        let mut scores_tensor = scores_tensor.slice(s![0, .., ..]);
-        if scores.channels_first {
-            scores_tensor.swap_axes(0, 1);
-        };
-        skip.push(ind);
-
-        let quant_masks = mask_coeff
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-        let (mask_tensor, ind) = Self::find_outputs_with_shape(&mask_coeff.shape, outputs, &skip)?;
-        let mut mask_tensor = mask_tensor.slice(s![0, .., ..]);
-        if mask_coeff.channels_first {
-            mask_tensor.swap_axes(0, 1);
-        };
-        skip.push(ind);
-
-        let quant_protos = protos
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-        let (protos_tensor, _) = Self::find_outputs_with_shape(&protos.shape, outputs, &skip)?;
-        let mut protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-        if protos.channels_first {
-            protos_tensor.swap_axes(0, 1);
-            protos_tensor.swap_axes(1, 2);
-        }
-
-        decode_yolo_split_segdet_u8(
-            (boxes_tensor, quant_boxes),
-            (scores_tensor, quant_scores),
-            (mask_tensor, quant_masks),
-            (protos_tensor, quant_protos),
-            self.score_threshold,
-            self.iou_threshold,
-            output_boxes,
-            output_masks,
         );
         Ok(())
     }
@@ -1751,5 +2234,48 @@ impl Decoder {
             "Did not find output with shape {:?}",
             shape
         )))
+    }
+
+    fn find_outputs_with_shape_quantized<'a, 'b>(
+        shape: &[usize],
+        outputs: &'a [ArrayViewDQuantized<'b>],
+        skip: &[usize],
+    ) -> Result<(&'a ArrayViewDQuantized<'b>, usize), Error> {
+        for (ind, o) in outputs.iter().enumerate() {
+            if skip.contains(&ind) {
+                continue;
+            }
+            if o.shape() == shape {
+                return Ok((o, ind));
+            }
+        }
+        Err(Error::InvalidShape(format!(
+            "Did not find output with shape {:?}",
+            shape
+        )))
+    }
+
+    fn match_outputs_to_detect_quantized<'a, 'b>(
+        configs: &[configs::Detection],
+        outputs: &'a [ArrayViewDQuantized<'b>],
+    ) -> Result<Vec<&'a ArrayViewDQuantized<'b>>, Error> {
+        let mut new_output_order = Vec::new();
+        for c in configs {
+            let mut found = false;
+            for o in outputs {
+                if o.shape() == c.shape {
+                    new_output_order.push(o);
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return Err(Error::InvalidShape(format!(
+                    "Did not find output with shape {:?}",
+                    c.shape
+                )));
+            }
+        }
+        Ok(new_output_order)
     }
 }

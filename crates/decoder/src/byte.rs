@@ -5,7 +5,7 @@ use ndarray::{
 };
 use num_traits::{AsPrimitive, ConstZero, PrimInt, Signed};
 
-pub fn postprocess_boxes_8bit<
+pub fn postprocess_boxes_quant<
     B: BBoxTypeTrait,
     Boxes: PrimInt + AsPrimitive<i32> + Send + Sync,
     Scores: PrimInt + AsPrimitive<f32> + Send + Sync,
@@ -37,7 +37,7 @@ pub fn postprocess_boxes_8bit<
         .collect()
 }
 
-pub fn postprocess_boxes_extra_8bit<
+pub fn postprocess_boxes_extra_quant<
     'a,
     B: BBoxTypeTrait,
     Boxes: PrimInt + AsPrimitive<i32> + Send + Sync,

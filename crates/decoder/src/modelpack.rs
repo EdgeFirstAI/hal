@@ -3,7 +3,7 @@ use num_traits::{AsPrimitive, Float, PrimInt};
 
 use crate::{
     BBoxTypeTrait, DetectBox, Quantization, XYWH, XYXY,
-    byte::{nms_int, postprocess_boxes_8bit, quantize_score_threshold},
+    byte::{nms_int, postprocess_boxes_quant, quantize_score_threshold},
     configs::Detection,
     dequant_detect_box,
     error::Result,
@@ -24,25 +24,12 @@ impl From<&Detection> for ModelPackDetectionConfig {
     }
 }
 
-pub fn decode_modelpack_i8(
-    boxes_tensor: (ArrayView2<i8>, Quantization),
-    scores_tensor: (ArrayView2<i8>, Quantization),
-    score_threshold: f32,
-    iou_threshold: f32,
-    output_boxes: &mut Vec<DetectBox>,
-) {
-    impl_modelpack_8bit::<XYXY, _, _>(
-        boxes_tensor,
-        scores_tensor,
-        score_threshold,
-        iou_threshold,
-        output_boxes,
-    )
-}
-
-pub fn decode_modelpack_u8(
-    boxes_tensor: (ArrayView2<u8>, Quantization),
-    scores_tensor: (ArrayView2<u8>, Quantization),
+pub fn decode_modelpack_det<
+    BOX: PrimInt + AsPrimitive<f32> + AsPrimitive<i32> + Send + Sync,
+    SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
+>(
+    boxes_tensor: (ArrayView2<BOX>, Quantization),
+    scores_tensor: (ArrayView2<SCORE>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
@@ -87,6 +74,8 @@ pub fn decode_modelpack_f64(
         output_boxes,
     )
 }
+
+pub enum ArrayView3D {}
 
 pub fn decode_modelpack_split<D: AsPrimitive<f32>>(
     outputs: &[ArrayView3<D>],
@@ -135,9 +124,14 @@ pub fn impl_modelpack_8bit<
     let (scores_tensor, quant_scores) = scores;
     let boxes = {
         let score_threshold = quantize_score_threshold(score_threshold, quant_boxes);
-        postprocess_boxes_8bit::<B, _, _>(score_threshold, boxes_tensor, scores_tensor, quant_boxes)
+        postprocess_boxes_quant::<B, _, _>(
+            score_threshold,
+            boxes_tensor,
+            scores_tensor,
+            quant_boxes,
+        )
     };
-    let boxes = nms_int::<_, _, i32>(iou_threshold, boxes);
+    let boxes = nms_int::<_, _, i64>(iou_threshold, boxes);
     let len = output_boxes.capacity().min(boxes.len());
     output_boxes.clear();
     for b in boxes.into_iter().take(len) {
