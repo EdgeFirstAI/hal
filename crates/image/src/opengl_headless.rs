@@ -727,12 +727,12 @@ impl GLConverterST {
         };
 
         let format = if dst.is_planar() {
-            gls::gl::RGBA
+            gls::gl::RED
         } else {
             match dst.fourcc() {
                 RGB => gls::gl::RGB,
                 RGBA => gls::gl::RGBA,
-                GREY => gls::gl::R8, // TODO: Check if opengl version supports this
+                GREY => gls::gl::RED, // TODO: Check if opengl version supports this
                 _ => unreachable!(),
             }
         };
@@ -1017,7 +1017,6 @@ impl GLConverterST {
         self.draw_camera_texture_to_rgb_planar(
             &self.camera_texture,
             &new_egl_image,
-            dst_width,
             src_roi,
             dst_roi,
             rotation_offset,
@@ -1033,7 +1032,6 @@ impl GLConverterST {
         &self,
         texture: &Texture,
         egl_img: &EglImage,
-        width: usize,
         src_roi: RegionOfInterest,
         mut dst_roi: RegionOfInterest,
         rotation_offset: usize,
@@ -1746,6 +1744,7 @@ impl GlProgram {
         })
     }
 
+    #[allow(dead_code)]
     fn load_uniform_1f(&self, name: &CStr, value: f32) {
         unsafe {
             gls::gl::UseProgram(self.id);
@@ -1754,6 +1753,7 @@ impl GlProgram {
         }
     }
 
+    #[allow(dead_code)]
     fn load_uniform_1i(&self, name: &CStr, value: i32) {
         unsafe {
             gls::gl::UseProgram(self.id);
@@ -1910,9 +1910,6 @@ pub fn generate_planar_rgb_shader() -> &'static str {
 
 precision mediump float;
 uniform sampler2D tex;
-uniform float width;
-uniform int color_index;
-uniform float bg_color;
 in vec3 fragPos;
 in vec2 tc;
 
