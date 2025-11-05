@@ -11,24 +11,15 @@ use num_traits::{AsPrimitive, Float, PrimInt, Signed};
 use crate::{
     BBoxTypeTrait, BoundingBox, DetectBox, Quantization, Segmentation, XYWH,
     byte::{
-        nms_extra_int, nms_int, postprocess_boxes_8bit, postprocess_boxes_extra_8bit,
+        nms_extra_int, nms_int, postprocess_boxes_extra_quant, postprocess_boxes_quant,
         quantize_score_threshold,
     },
     dequant_detect_box,
     float::{nms_extra_f32, nms_f32, postprocess_boxes_extra_float, postprocess_boxes_float},
 };
 
-pub fn decode_yolo_u8(
-    output: (ArrayView2<u8>, Quantization),
-    score_threshold: f32,
-    iou_threshold: f32,
-    output_boxes: &mut Vec<DetectBox>,
-) {
-    impl_yolo_8bit::<XYWH, _>(output, score_threshold, iou_threshold, output_boxes);
-}
-
-pub fn decode_yolo_i8(
-    output: (ArrayView2<i8>, Quantization),
+pub fn decode_yolo_det<BOX: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync>(
+    output: (ArrayView2<BOX>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
@@ -54,29 +45,12 @@ pub fn decode_yolo_f64(
     impl_yolo_float::<XYWH, _>(output, score_threshold, iou_threshold, output_boxes);
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn decode_yolo_segdet_i8(
-    boxes: (ArrayView2<i8>, Quantization),
-    protos: (ArrayView3<i8>, Quantization),
-    score_threshold: f32,
-    iou_threshold: f32,
-    output_boxes: &mut Vec<DetectBox>,
-    output_masks: &mut Vec<Segmentation>,
-) {
-    impl_yolo_segdet_8bit::<XYWH, _, _>(
-        boxes,
-        protos,
-        score_threshold,
-        iou_threshold,
-        output_boxes,
-        output_masks,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn decode_yolo_segdet_u8(
-    boxes: (ArrayView2<u8>, Quantization),
-    protos: (ArrayView3<u8>, Quantization),
+pub fn decode_yolo_segdet<
+    BOX: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
+    PROTO: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
+>(
+    boxes: (ArrayView2<BOX>, Quantization),
+    protos: (ArrayView3<PROTO>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
@@ -128,24 +102,23 @@ pub fn decode_yolo_segdet_f64(
     );
 }
 
-pub fn decode_yolo_split_det_u8(
-    boxes: (ArrayView2<u8>, Quantization),
-    scores: (ArrayView2<u8>, Quantization),
+pub fn decode_yolo_split_det<
+    BOX: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
+    SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
+>(
+    boxes: (ArrayView2<BOX>, Quantization),
+    scores: (ArrayView2<SCORE>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
 ) {
-    impl_yolo_split_8bit::<XYWH, _, _>(boxes, scores, score_threshold, iou_threshold, output_boxes);
-}
-
-pub fn decode_yolo_split_det_i8(
-    boxes: (ArrayView2<i8>, Quantization),
-    scores: (ArrayView2<i8>, Quantization),
-    score_threshold: f32,
-    iou_threshold: f32,
-    output_boxes: &mut Vec<DetectBox>,
-) {
-    impl_yolo_split_8bit::<XYWH, _, _>(boxes, scores, score_threshold, iou_threshold, output_boxes);
+    impl_yolo_split_quant::<XYWH, _, _>(
+        boxes,
+        scores,
+        score_threshold,
+        iou_threshold,
+        output_boxes,
+    );
 }
 
 pub fn decode_yolo_split_det_f32(
@@ -181,34 +154,16 @@ pub fn decode_yolo_split_det_f64(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn decode_yolo_split_segdet_u8(
-    boxes: (ArrayView2<u8>, Quantization),
-    scores: (ArrayView2<u8>, Quantization),
-    mask_coeff: (ArrayView2<u8>, Quantization),
-    protos: (ArrayView3<u8>, Quantization),
-    score_threshold: f32,
-    iou_threshold: f32,
-    output_boxes: &mut Vec<DetectBox>,
-    output_masks: &mut Vec<Segmentation>,
-) {
-    impl_yolo_split_segdet_8bit::<XYWH, _, _, _, _>(
-        boxes,
-        scores,
-        mask_coeff,
-        protos,
-        score_threshold,
-        iou_threshold,
-        output_boxes,
-        output_masks,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn decode_yolo_split_segdet_i8(
-    boxes: (ArrayView2<i8>, Quantization),
-    scores: (ArrayView2<i8>, Quantization),
-    mask_coeff: (ArrayView2<i8>, Quantization),
-    protos: (ArrayView3<i8>, Quantization),
+pub fn decode_yolo_split_segdet<
+    BOX: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
+    SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
+    MASK: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
+    PROTO: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
+>(
+    boxes: (ArrayView2<BOX>, Quantization),
+    scores: (ArrayView2<SCORE>, Quantization),
+    mask_coeff: (ArrayView2<MASK>, Quantization),
+    protos: (ArrayView3<PROTO>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
@@ -286,10 +241,15 @@ pub fn impl_yolo_8bit<
 
     let boxes = {
         let score_threshold = quantize_score_threshold(score_threshold, quant_boxes);
-        postprocess_boxes_8bit::<B, _, _>(score_threshold, boxes_tensor, scores_tensor, quant_boxes)
+        postprocess_boxes_quant::<B, _, _>(
+            score_threshold,
+            boxes_tensor,
+            scores_tensor,
+            quant_boxes,
+        )
     };
 
-    let boxes = nms_int::<_, _, i32>(iou_threshold, boxes);
+    let boxes = nms_int::<_, _, i64>(iou_threshold, boxes);
     let len = output_boxes.capacity().min(boxes.len());
     output_boxes.clear();
     for b in boxes.iter().take(len) {
@@ -316,7 +276,7 @@ pub fn impl_yolo_float<B: BBoxTypeTrait, T: Float + AsPrimitive<f32> + Send + Sy
     }
 }
 
-pub fn impl_yolo_split_8bit<
+pub fn impl_yolo_split_quant<
     B: BBoxTypeTrait,
     BOX: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
     SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
@@ -335,14 +295,19 @@ pub fn impl_yolo_split_8bit<
 
     let boxes = {
         let score_threshold = quantize_score_threshold(score_threshold, quant_scores);
-        postprocess_boxes_8bit::<B, _, _>(score_threshold, boxes_tensor, scores_tensor, quant_boxes)
+        postprocess_boxes_quant::<B, _, _>(
+            score_threshold,
+            boxes_tensor,
+            scores_tensor,
+            quant_boxes,
+        )
     };
 
-    let boxes = nms_int::<_, _, i32>(iou_threshold, boxes);
+    let boxes = nms_int::<_, _, i64>(iou_threshold, boxes);
     let len = output_boxes.capacity().min(boxes.len());
     output_boxes.clear();
     for b in boxes.iter().take(len) {
-        output_boxes.push(dequant_detect_box(b, quant_boxes, quant_boxes));
+        output_boxes.push(dequant_detect_box(b, quant_boxes, quant_scores));
     }
 }
 
@@ -391,7 +356,7 @@ pub fn impl_yolo_segdet_8bit<
 
     let boxes = {
         let score_threshold = quantize_score_threshold(score_threshold, quant_boxes);
-        postprocess_boxes_extra_8bit::<B, _, _, _>(
+        postprocess_boxes_extra_quant::<B, _, _, _>(
             score_threshold,
             boxes_tensor,
             scores_tensor,
@@ -488,7 +453,7 @@ pub fn impl_yolo_split_segdet_8bit<
 
     let boxes = {
         let score_threshold = quantize_score_threshold(score_threshold, quant_boxes);
-        postprocess_boxes_extra_8bit::<B, _, _, _>(
+        postprocess_boxes_extra_quant::<B, _, _, _>(
             score_threshold,
             boxes_tensor,
             scores_tensor,

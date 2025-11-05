@@ -1,7 +1,7 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 use edgefirst::decoder::{
-    Decoder, DecoderBuilder, DetectBox, Quantization, Segmentation, dequantize_cpu,
-    modelpack::ModelPackDetectionConfig, segmentation_to_mask,
+    ArrayViewDQuantized, Decoder, DecoderBuilder, DetectBox, Quantization, Segmentation,
+    dequantize_cpu, modelpack::ModelPackDetectionConfig, segmentation_to_mask,
 };
 
 use ndarray::{Array1, Array2};
@@ -29,9 +29,17 @@ pub type PySegDetOutput<'py> = (
 );
 
 #[derive(FromPyObject)]
+pub enum ArrayQuantized<'a> {
+    UInt8(PyReadonlyArrayDyn<'a, u8>),
+    Int8(PyReadonlyArrayDyn<'a, i8>),
+    UInt16(PyReadonlyArrayDyn<'a, u16>),
+    Int16(PyReadonlyArrayDyn<'a, i16>),
+}
+
+
+#[derive(FromPyObject)]
 pub enum ListOfReadOnlyArrayGenericDyn<'py> {
-    UInt8(Vec<WithInt32Array<'py, PyArrayLikeDyn<'py, u8>>>),
-    Int8(Vec<WithInt32Array<'py, PyArrayLikeDyn<'py, i8>>>),
+    Quantized(Vec<WithInt32Array<'py, ArrayQuantized<'py>>>),
     Float16(Vec<WithInt32Array<'py, PyArrayF16_<'py>>>),
     Float32(Vec<WithInt32Array<'py, PyArrayLikeDyn<'py, f32>>>),
     Float64(Vec<WithInt32Array<'py, PyArrayLikeDyn<'py, f64>>>),
@@ -221,29 +229,30 @@ impl PyDecoder {
         let mut output_boxes = Vec::with_capacity(max_boxes);
         let mut output_masks = Vec::with_capacity(max_boxes);
         let result = match model_output {
-            ListOfReadOnlyArrayGenericDyn::UInt8(items) => {
+            ListOfReadOnlyArrayGenericDyn::Quantized(items) => {
                 let outputs = items
                     .iter()
                     .filter_map(|x| match x {
-                        WithInt32Array::Val(x) => Some(x.as_array()),
+                        WithInt32Array::Val(x) => match x {
+                            ArrayQuantized::UInt8(arr) => {
+                                Some(ArrayViewDQuantized::from(arr.as_array()))
+                            }
+                            ArrayQuantized::Int8(arr) => {
+                                Some(ArrayViewDQuantized::from(arr.as_array()))
+                            }
+                            ArrayQuantized::UInt16(arr) => {
+                                Some(ArrayViewDQuantized::from(arr.as_array()))
+                            }
+                            ArrayQuantized::Int16(arr) => {
+                                Some(ArrayViewDQuantized::from(arr.as_array()))
+                            }
+                        },
                         WithInt32Array::Int32(_) => None,
                     })
                     .collect::<Vec<_>>();
                 self_
                     .decoder
-                    .decode_u8(&outputs, &mut output_boxes, &mut output_masks)
-            }
-            ListOfReadOnlyArrayGenericDyn::Int8(items) => {
-                let outputs = items
-                    .iter()
-                    .filter_map(|x| match x {
-                        WithInt32Array::Val(x) => Some(x.as_array()),
-                        WithInt32Array::Int32(_) => None,
-                    })
-                    .collect::<Vec<_>>();
-                self_
-                    .decoder
-                    .decode_i8(&outputs, &mut output_boxes, &mut output_masks)
+                    .decode_quantized(&outputs, &mut output_boxes, &mut output_masks)
             }
             ListOfReadOnlyArrayGenericDyn::Float16(items) => {
                 let outputs = items
@@ -312,13 +321,13 @@ impl PyDecoder {
     ) -> PyResult<PyDetOutput<'py>> {
         let mut output_boxes = Vec::with_capacity(max_boxes);
         match boxes {
-            ReadOnlyArrayGeneric2::UInt8(output) => edgefirst::decoder::yolo::decode_yolo_u8(
+            ReadOnlyArrayGeneric2::UInt8(output) => edgefirst::decoder::yolo::decode_yolo_det(
                 (output.as_array(), Quantization::from(quant_boxes)),
                 score_threshold as f32,
                 iou_threshold as f32,
                 &mut output_boxes,
             ),
-            ReadOnlyArrayGeneric2::Int8(output) => edgefirst::decoder::yolo::decode_yolo_i8(
+            ReadOnlyArrayGeneric2::Int8(output) => edgefirst::decoder::yolo::decode_yolo_det(
                 (output.as_array(), Quantization::from(quant_boxes)),
                 score_threshold as f32,
                 iou_threshold as f32,
@@ -359,7 +368,7 @@ impl PyDecoder {
 
         match (boxes, protos) {
             (ReadOnlyArrayGeneric2::UInt8(boxes), ReadOnlyArrayGeneric3::UInt8(protos)) => {
-                edgefirst::decoder::yolo::decode_yolo_segdet_u8(
+                edgefirst::decoder::yolo::decode_yolo_segdet(
                     (boxes.as_array(), Quantization::from(quant_boxes)),
                     (protos.as_array(), Quantization::from(quant_protos)),
                     score_threshold as f32,
@@ -369,7 +378,7 @@ impl PyDecoder {
                 );
             }
             (ReadOnlyArrayGeneric2::Int8(boxes), ReadOnlyArrayGeneric3::Int8(protos)) => {
-                edgefirst::decoder::yolo::decode_yolo_segdet_i8(
+                edgefirst::decoder::yolo::decode_yolo_segdet(
                     (boxes.as_array(), Quantization::from(quant_boxes)),
                     (protos.as_array(), Quantization::from(quant_protos)),
                     score_threshold as f32,
@@ -427,7 +436,7 @@ impl PyDecoder {
         match (boxes, scores) {
             (ReadOnlyArrayGeneric2::UInt8(boxes), ReadOnlyArrayGeneric2::UInt8(scores)) => {
                 let (boxes, scores) = (boxes.as_array(), scores.as_array());
-                edgefirst::decoder::modelpack::decode_modelpack_u8(
+                edgefirst::decoder::modelpack::decode_modelpack_det(
                     (boxes.view(), Quantization::from(quant_boxes)),
                     (scores.view(), Quantization::from(quant_scores)),
                     score_threshold as f32,
@@ -437,7 +446,7 @@ impl PyDecoder {
             }
             (ReadOnlyArrayGeneric2::Int8(boxes), ReadOnlyArrayGeneric2::Int8(scores)) => {
                 let (boxes, scores) = (boxes.as_array(), scores.as_array());
-                edgefirst::decoder::modelpack::decode_modelpack_i8(
+                edgefirst::decoder::modelpack::decode_modelpack_det(
                     (boxes.view(), Quantization::from(quant_boxes)),
                     (scores.view(), Quantization::from(quant_scores)),
                     score_threshold as f32,

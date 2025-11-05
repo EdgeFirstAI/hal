@@ -18,7 +18,6 @@ use numpy::{PyArrayLike3, PyReadwriteArray3, PyUntypedArrayMethods};
 use pyo3::prelude::*;
 use std::{
     fmt::{self},
-    i8,
     sync::Mutex,
 };
 
@@ -461,7 +460,6 @@ fn normalize_to_int8<'py>(
     } else {
         128
     };
-    log::info!("zero point is {zp:?}");
     let mut dst = dst.as_array_mut();
     let map = tensor.tensor().map()?;
     let data = map.as_slice();
