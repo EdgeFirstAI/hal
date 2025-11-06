@@ -4,6 +4,7 @@ use ndarray::{
     parallel::prelude::{IntoParallelIterator, ParallelIterator as _},
 };
 use num_traits::{AsPrimitive, Float};
+use rayon::slice::ParallelSliceMut;
 
 pub fn postprocess_boxes_float<
     B: BBoxTypeTrait,
@@ -73,7 +74,7 @@ pub fn postprocess_boxes_index_float<
 pub fn nms_f32(iou: f32, mut boxes: Vec<DetectBox>) -> Vec<DetectBox> {
     // Boxes get sorted by score in descending order so we know based on the
     // index the scoring of the boxes and can skip parts of the loop.
-    boxes.sort_by(|a, b| b.score.total_cmp(&a.score));
+    boxes.par_sort_by(|a, b| b.score.total_cmp(&a.score));
 
     // When the iou is 1.0 or larger, no boxes will be filtered so we just return
     // immediately
@@ -83,26 +84,25 @@ pub fn nms_f32(iou: f32, mut boxes: Vec<DetectBox>) -> Vec<DetectBox> {
 
     // Outer loop over all boxes.
     for i in 0..boxes.len() {
-        if boxes[i].score <= 0.0 {
+        if boxes[i].score < 0.0 {
             // this box was merged with a different box earlier
             continue;
         }
         for j in (i + 1)..boxes.len() {
             // Inner loop over boxes with lower score (later in the list).
 
-            if boxes[j].score <= 0.0 {
+            if boxes[j].score < 0.0 {
                 // this box was suppressed by different box earlier
                 continue;
             }
             if jaccard_f32(&boxes[j].bbox, &boxes[i].bbox, iou) {
                 // max_box(boxes[j].bbox, &mut boxes[i].bbox);
-                boxes[j].score = 0.0;
+                boxes[j].score = -1.0;
             }
         }
     }
-
-    // Filter out boxes with a score of 0.0.
-    boxes.into_iter().filter(|b| b.score > 0.0).collect()
+    // Filter out suppressed boxes.
+    boxes.into_iter().filter(|b| b.score >= 0.0).collect()
 }
 
 pub fn nms_extra_f32<E: Send + Sync>(
@@ -111,7 +111,9 @@ pub fn nms_extra_f32<E: Send + Sync>(
 ) -> Vec<(DetectBox, E)> {
     // Boxes get sorted by score in descending order so we know based on the
     // index the scoring of the boxes and can skip parts of the loop.
-    boxes.sort_by(|a, b| b.0.score.total_cmp(&a.0.score));
+    // boxes.sort_by(|a, b| b.0.score.total_cmp(&a.0.score));
+    boxes.par_sort_by(|a, b| b.0.score.total_cmp(&a.0.score));
+
     // Outer loop over all boxes.
     for i in 0..boxes.len() {
         if boxes[i].0.score <= 0.0 {
@@ -148,7 +150,7 @@ fn jaccard_f32(a: &BoundingBox, b: &BoundingBox, iou: f32) -> bool {
     let area_b = (b.xmax - b.xmin) * (b.ymax - b.ymin);
 
     // need to make sure we are not dividing by zero
-    let union = (area_a + area_b - intersection).max(0.0000001);
+    let union = area_a + area_b - intersection;
 
-    intersection / union > iou
+    intersection > iou * union
 }
