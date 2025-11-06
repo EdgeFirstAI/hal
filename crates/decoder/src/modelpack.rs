@@ -43,13 +43,18 @@ pub fn decode_modelpack_det<
     )
 }
 
-pub fn decode_modelpack_f32(
-    boxes_tensor: ArrayView2<f32>,
-    scores_tensor: ArrayView2<f32>,
+pub fn decode_modelpack_float<
+    BOX: Float + AsPrimitive<f32> + Send + Sync,
+    SCORE: Float + AsPrimitive<f32> + Send + Sync,
+>(
+    boxes_tensor: ArrayView2<BOX>,
+    scores_tensor: ArrayView2<SCORE>,
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
-) {
+) where
+    f32: AsPrimitive<SCORE>,
+{
     impl_modelpack_float::<XYXY, _, _>(
         boxes_tensor,
         scores_tensor,
@@ -58,24 +63,6 @@ pub fn decode_modelpack_f32(
         output_boxes,
     )
 }
-
-pub fn decode_modelpack_f64(
-    boxes_tensor: ArrayView2<f64>,
-    scores_tensor: ArrayView2<f64>,
-    score_threshold: f64,
-    iou_threshold: f64,
-    output_boxes: &mut Vec<DetectBox>,
-) {
-    impl_modelpack_float::<XYXY, _, _>(
-        boxes_tensor,
-        scores_tensor,
-        score_threshold as f32,
-        iou_threshold as f32,
-        output_boxes,
-    )
-}
-
-pub enum ArrayView3D {}
 
 pub fn decode_modelpack_split<D: AsPrimitive<f32>>(
     outputs: &[ArrayView3<D>],

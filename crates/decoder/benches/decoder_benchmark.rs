@@ -59,7 +59,7 @@ fn decoder_quant_decode_boxes(bencher: divan::Bencher) {
 
 #[divan::bench()]
 fn decoder_quant_nms(bencher: divan::Bencher) {
-    let score_threshold = 0.000;
+    let score_threshold = 0.01;
     let iou_threshold = 0.90;
     let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
     let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
@@ -363,8 +363,8 @@ fn decoder_masks(bencher: divan::Bencher) {
     bencher.bench_local(|| {
         let protos = dequantize_ndarray(protos.view(), quant_protos);
         let seg = dequantize_ndarray(boxes.view(), quant_boxes);
-        let mut output_boxes: Vec<_> = Vec::with_capacity(10);
-        let mut output_masks: Vec<_> = Vec::with_capacity(10);
+        let mut output_boxes: Vec<_> = Vec::with_capacity(50);
+        let mut output_masks: Vec<_> = Vec::with_capacity(50);
         decode_yolo_segdet_f32(
             seg.view(),
             protos.view(),
@@ -399,8 +399,8 @@ fn decoder_masks_i8(bencher: divan::Bencher) {
     };
 
     bencher.bench_local(|| {
-        let mut output_boxes: Vec<_> = Vec::with_capacity(10);
-        let mut output_masks: Vec<_> = Vec::with_capacity(10);
+        let mut output_boxes: Vec<_> = Vec::with_capacity(50);
+        let mut output_masks: Vec<_> = Vec::with_capacity(50);
         decode_yolo_segdet(
             (boxes.view(), quant_boxes),
             (protos.view(), quant_protos),
