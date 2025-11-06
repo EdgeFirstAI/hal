@@ -44,9 +44,26 @@ use crate::{
 pub(crate) struct GlContext {
     pub(crate) support_dma: bool,
     pub(crate) surface: Option<egl::Surface>,
-    pub(crate) display: egl::Display,
+    pub(crate) display: EglDisplayType,
     pub(crate) ctx: egl::Context,
     pub(crate) egl: Rc<egl::Instance<egl::Dynamic<libloading::Library, egl::EGL1_4>>>,
+}
+
+pub(crate) enum EglDisplayType {
+    Default(egl::Display),
+
+    Gbm(egl::Display, #[allow(dead_code)] Device<Card>),
+    PlatformDisplay(egl::Display),
+}
+
+impl EglDisplayType {
+    fn as_display(&self) -> egl::Display {
+        match self {
+            EglDisplayType::Default(disp) => *disp,
+            EglDisplayType::Gbm(disp, _) => *disp,
+            EglDisplayType::PlatformDisplay(disp) => *disp,
+        }
+    }
 }
 
 impl GlContext {
@@ -54,10 +71,41 @@ impl GlContext {
         // Create an EGL API instance.
         let lib = unsafe { libloading::Library::new("libEGL.so.1") }?;
         let egl = Rc::new(unsafe { egl::DynamicInstance::<egl::EGL1_4>::load_required_from(lib)? });
-        let support_dma = Self::egl_check_support_dma(&egl).is_ok();
-        let display = Self::egl_get_display(&egl)?;
 
-        egl.initialize(display)?;
+        if let Ok(headless) = Self::try_initialize_egl(egl.clone(), Self::egl_get_default_display) {
+            return Ok(headless);
+        } else {
+            log::debug!("Didn't initialize EGL with Default Display");
+        }
+
+        if let Ok(headless) = Self::try_initialize_egl(egl.clone(), Self::egl_get_gbm_display) {
+            return Ok(headless);
+        } else {
+            log::debug!("Didn't initialize EGL with GBM Display");
+        }
+
+        if let Ok(headless) =
+            Self::try_initialize_egl(egl.clone(), Self::egl_get_platform_display_from_device)
+        {
+            return Ok(headless);
+        } else {
+            log::debug!("Didn't initialize EGL with platform display from device enumeration");
+        }
+
+        Err(Error::OpenGl(
+            "Could not initialize EGL with any known method".to_string(),
+        ))
+    }
+
+    fn try_initialize_egl(
+        egl: Rc<egl::Instance<egl::Dynamic<libloading::Library, egl::EGL1_4>>>,
+        display_fn: impl Fn(
+            &egl::Instance<egl::Dynamic<libloading::Library, egl::EGL1_4>>,
+        ) -> Result<EglDisplayType, crate::Error>,
+    ) -> Result<GlContext, crate::Error> {
+        let display = display_fn(&egl)?;
+
+        egl.initialize(display.as_display())?;
         let attributes = [
             egl::SURFACE_TYPE,
             egl::PBUFFER_BIT,
@@ -72,29 +120,31 @@ impl GlContext {
             egl::NONE,
         ];
 
-        let config = if let Some(config) = egl.choose_first_config(display, &attributes)? {
-            config
-        } else {
-            return Err(crate::Error::NotImplemented(
-                "Did not find valid OpenGL ES config".to_string(),
-            ));
-        };
+        let config =
+            if let Some(config) = egl.choose_first_config(display.as_display(), &attributes)? {
+                config
+            } else {
+                return Err(crate::Error::NotImplemented(
+                    "Did not find valid OpenGL ES config".to_string(),
+                ));
+            };
 
         debug!("config: {config:?}");
 
         let context_attributes = [egl::CONTEXT_MAJOR_VERSION, 3, egl::NONE, egl::NONE];
 
-        let ctx = egl.create_context(display, config, None, &context_attributes)?;
+        let ctx = egl.create_context(display.as_display(), config, None, &context_attributes)?;
         debug!("ctx: {ctx:?}");
 
         let surface = Some(egl.create_pbuffer_surface(
-            display,
+            display.as_display(),
             config,
             &[egl::WIDTH, 64, egl::HEIGHT, 64, egl::NONE],
         )?);
 
-        egl.make_current(display, surface, surface, Some(ctx))?;
+        egl.make_current(display.as_display(), surface, surface, Some(ctx))?;
 
+        let support_dma = Self::egl_check_support_dma(&egl).is_ok();
         let headless = GlContext {
             display,
             ctx,
@@ -105,32 +155,23 @@ impl GlContext {
         Ok(headless)
     }
 
-    fn egl_get_display(
+    fn egl_get_default_display(
         egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
-    ) -> Result<Display, crate::Error> {
+    ) -> Result<EglDisplayType, crate::Error> {
         // get the default display
         if let Some(display) = unsafe { egl.get_display(egl::DEFAULT_DISPLAY) } {
             debug!("default display: {display:?}");
-            return Ok(display);
+            return Ok(EglDisplayType::Default(display));
         }
 
-        // EVK doesn't have default display set so we use a GBM display
-        if let Ok(display) = Self::egl_get_gbm_display(egl) {
-            debug!("gbm display: {display:?}");
-            return Ok(display);
-        }
-
-        if let Ok(display) = Self::egl_get_platform_display_from_device(egl) {
-            debug!("platform display from device: {display:?}");
-            return Ok(display);
-        }
-
-        Err(Error::OpenGl("Could not obtain EGL Display".to_string()))
+        Err(Error::OpenGl(
+            "Could not obtain EGL Default Display".to_string(),
+        ))
     }
 
     fn egl_get_gbm_display(
         egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
-    ) -> Result<Display, crate::Error> {
+    ) -> Result<EglDisplayType, crate::Error> {
         // init a GBM device
         let gbm = Device::new(Card::open_global()?)?;
 
@@ -142,7 +183,56 @@ impl GlContext {
             &[egl::ATTRIB_NONE],
         )?;
 
-        Ok(display)
+        Ok(EglDisplayType::Gbm(display, gbm))
+    }
+
+    fn egl_get_platform_display_from_device(
+        egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
+    ) -> Result<EglDisplayType, crate::Error> {
+        let extensions = egl.query_string(None, egl::EXTENSIONS)?;
+        let extensions = extensions.to_string_lossy();
+        log::debug!("EGL Extensions: {}", extensions);
+
+        if !extensions.contains("EGL_EXT_device_enumeration") {
+            return Err(Error::GLVersion(
+                "EGL doesn't supported EGL_EXT_device_enumeration extension".to_string(),
+            ));
+        }
+
+        type EGLDeviceEXT = *mut c_void;
+        let devices = if let Some(ext) = egl.get_proc_address("eglQueryDevicesEXT") {
+            let func: unsafe extern "system" fn(
+                max_devices: egl::Int,
+                devices: *mut EGLDeviceEXT,
+                num_devices: *mut egl::Int,
+            ) -> *const c_char = unsafe { std::mem::transmute(ext) };
+            let mut devices = [std::ptr::null_mut(); 10];
+            let mut num_devices = 0;
+            unsafe { func(devices.len() as i32, devices.as_mut_ptr(), &mut num_devices) };
+            for i in 0..num_devices {
+                log::debug!("EGL device: {:?}", devices[i as usize]);
+            }
+            devices[0..num_devices as usize].to_vec()
+        } else {
+            return Err(Error::GLVersion(
+                "EGL doesn't supported eglQueryDevicesEXT function".to_string(),
+            ));
+        };
+
+        if !extensions.contains("EGL_EXT_platform_device") {
+            return Err(Error::GLVersion(
+                "EGL doesn't supported EGL_EXT_platform_device extension".to_string(),
+            ));
+        }
+
+        // just use the first device?
+        let disp = Self::egl_get_platform_display_with_fallback(
+            egl,
+            egl_ext::PLATFORM_DEVICE_EXT,
+            devices[0],
+            &[egl::ATTRIB_NONE],
+        )?;
+        Ok(EglDisplayType::PlatformDisplay(disp))
     }
 
     fn egl_check_support_dma(
@@ -278,64 +368,20 @@ impl GlContext {
             }))
         }
     }
-
-    fn egl_get_platform_display_from_device(
-        egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
-    ) -> Result<Display, Error> {
-        let extensions = egl.query_string(None, egl::EXTENSIONS)?;
-        let extensions = extensions.to_string_lossy();
-        log::debug!("EGL Extensions: {}", extensions);
-
-        if !extensions.contains("EGL_EXT_device_enumeration") {
-            return Err(Error::GLVersion(
-                "EGL doesn't supported EGL_EXT_device_enumeration extension".to_string(),
-            ));
-        }
-
-        type EGLDeviceEXT = *mut c_void;
-        let devices = if let Some(ext) = egl.get_proc_address("eglQueryDevicesEXT") {
-            let func: unsafe extern "system" fn(
-                max_devices: egl::Int,
-                devices: *mut EGLDeviceEXT,
-                num_devices: *mut egl::Int,
-            ) -> *const c_char = unsafe { std::mem::transmute(ext) };
-            let mut devices = [std::ptr::null_mut(); 10];
-            let mut num_devices = 0;
-            unsafe { func(devices.len() as i32, devices.as_mut_ptr(), &mut num_devices) };
-            for i in 0..num_devices {
-                log::debug!("EGL device: {:?}", devices[i as usize]);
-            }
-            devices[0..num_devices as usize].to_vec()
-        } else {
-            return Err(Error::GLVersion(
-                "EGL doesn't supported eglQueryDevicesEXT function".to_string(),
-            ));
-        };
-
-        if !extensions.contains("EGL_EXT_platform_device") {
-            return Err(Error::GLVersion(
-                "EGL doesn't supported EGL_EXT_platform_device extension".to_string(),
-            ));
-        }
-
-        // just use the first device?
-        Self::egl_get_platform_display_with_fallback(
-            egl,
-            egl_ext::PLATFORM_DEVICE_EXT,
-            devices[0],
-            &[egl::ATTRIB_NONE],
-        )
-    }
 }
 
 impl Drop for GlContext {
     fn drop(&mut self) {
-        let _ = self.egl.make_current(self.display, None, None, None);
+        let _ = self
+            .egl
+            .make_current(self.display.as_display(), None, None, None);
         if let Some(surface) = self.surface.take() {
-            let _ = self.egl.destroy_surface(self.display, surface);
+            let _ = self.egl.destroy_surface(self.display.as_display(), surface);
         }
-        let _ = self.egl.destroy_context(self.display, self.ctx);
-        let _ = self.egl.terminate(self.display);
+        let _ = self
+            .egl
+            .destroy_context(self.display.as_display(), self.ctx);
+        let _ = self.egl.terminate(self.display.as_display());
     }
 }
 
@@ -525,6 +571,7 @@ pub struct GLConverterST {
     vertex_buffer: Buffer,
     texture_buffer: Buffer,
     texture_program: GlProgram,
+    texture_program_yuv: GlProgram,
     texture_program_planar: GlProgram,
     gl_context: GlContext,
 }
@@ -596,6 +643,11 @@ impl GLConverterST {
 
         let texture_program =
             GlProgram::new(generate_vertex_shader(), generate_texture_fragment_shader())?;
+
+        let texture_program_yuv = GlProgram::new(
+            generate_vertex_shader(),
+            generate_texture_fragment_shader_yuv(),
+        )?;
         let camera_texture = Texture::new();
         let render_texture = Texture::new();
         let vertex_buffer = Buffer::new(0, 3, 100);
@@ -603,6 +655,7 @@ impl GLConverterST {
         let converter = GLConverterST {
             gl_context,
             texture_program,
+            texture_program_yuv,
             texture_program_planar,
             camera_texture,
             vertex_buffer,
@@ -1302,6 +1355,7 @@ impl GLConverterST {
         flip: Flip,
     ) -> Result<(), Error> {
         let texture_target = gls::gl::TEXTURE_2D;
+        // let texture_target = gls::gl::TEXTURE_EXTERNAL_OES;
         unsafe {
             gls::gl::UseProgram(self.texture_program.id);
             gls::gl::BindTexture(texture_target, self.camera_texture.id);
@@ -1502,7 +1556,7 @@ impl GLConverterST {
     ) -> Result<EglImage, Error> {
         let image = GlContext::egl_create_image_with_fallback(
             &self.gl_context.egl,
-            self.gl_context.display,
+            self.gl_context.display.as_display(),
             unsafe { egl::Context::from_ptr(egl::NO_CONTEXT) },
             target,
             unsafe { egl::ClientBuffer::from_ptr(null_mut()) },
@@ -1510,7 +1564,7 @@ impl GLConverterST {
         )?;
         Ok(EglImage {
             egl_image: image,
-            display: self.gl_context.display,
+            display: self.gl_context.display.as_display(),
             egl: self.gl_context.egl.clone(),
         })
     }
@@ -1781,7 +1835,7 @@ fn compile_shader_from_str(shader: u32, shader_source: &str, shader_name: &str) 
         if is_compiled == 0 {
             let mut max_length = 0;
             gls::gl::GetShaderiv(shader, gls::gl::INFO_LOG_LENGTH, &raw mut max_length);
-            let mut error_log: Vec<u8> = vec![0; max_length as usize + 1];
+            let mut error_log: Vec<u8> = vec![0; max_length as usize];
             gls::gl::GetShaderInfoLog(
                 shader,
                 max_length,
@@ -1859,7 +1913,7 @@ mod egl_ext {
 }
 
 pub fn generate_vertex_shader() -> &'static str {
-    "
+    "\
 #version 300 es
 precision mediump float;
 layout(location = 0) in vec3 pos;
@@ -1881,7 +1935,7 @@ void main() {
 }
 
 pub fn generate_texture_fragment_shader() -> &'static str {
-    "
+    "\
 #version 300 es
 
 precision mediump float;
@@ -1897,8 +1951,25 @@ void main(){
 "
 }
 
+pub fn generate_texture_fragment_shader_yuv() -> &'static str {
+    "\
+#version 300 es
+#extension GL_OES_EGL_image_external : require
+precision mediump float;
+uniform samplerExternalOES tex;
+in vec3 fragPos;
+in vec2 tc;
+
+out vec4 color;
+
+void main(){
+    color = texture2D(tex, tc);
+}
+"
+}
+
 pub fn generate_planar_rgb_shader() -> &'static str {
-    "
+    "\
 #version 300 es
 // #extension GL_OES_EGL_image_external : require
 
