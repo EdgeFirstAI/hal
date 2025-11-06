@@ -1,5 +1,5 @@
 use edgefirst::decoder::{Quantization, dequantize_cpu};
-use edgefirst_python::edgefirst_python;
+use edgefirst_hal::edgefirst_hal;
 
 use numpy::{PyArray1, PyArray2, PyArrayMethods};
 use pyo3::{
@@ -10,7 +10,7 @@ use pyo3::{
 
 #[test]
 fn test_yolo_det() -> PyResult<()> {
-    pyo3::append_to_inittab!(edgefirst_python);
+    pyo3::append_to_inittab!(edgefirst_hal);
     pyo3::prepare_freethreaded_python();
     Python::with_gil(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
@@ -69,7 +69,7 @@ fn test_yolo_det() -> PyResult<()> {
 
 #[test]
 fn test_decoder_parse_config_modelpack_split_u8() -> PyResult<()> {
-    pyo3::append_to_inittab!(edgefirst_python);
+    pyo3::append_to_inittab!(edgefirst_hal);
     pyo3::prepare_freethreaded_python();
     Python::with_gil(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
@@ -130,7 +130,7 @@ fn test_decoder_parse_config_modelpack_split_u8() -> PyResult<()> {
 
 #[test]
 fn test_decoder_parse_config_from_dict() -> PyResult<()> {
-    pyo3::append_to_inittab!(edgefirst_python);
+    pyo3::append_to_inittab!(edgefirst_hal);
     pyo3::prepare_freethreaded_python();
     Python::with_gil(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
@@ -191,7 +191,7 @@ fn test_decoder_parse_config_from_dict() -> PyResult<()> {
 
 #[test]
 fn test_modelpack_split_u8() -> PyResult<()> {
-    pyo3::append_to_inittab!(edgefirst_python);
+    pyo3::append_to_inittab!(edgefirst_hal);
     pyo3::prepare_freethreaded_python();
     Python::with_gil(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
@@ -248,7 +248,7 @@ fn test_modelpack_split_u8() -> PyResult<()> {
 
 #[test]
 fn test_filter_int32() -> PyResult<()> {
-    pyo3::append_to_inittab!(edgefirst_python);
+    pyo3::append_to_inittab!(edgefirst_hal);
     pyo3::prepare_freethreaded_python();
     Python::with_gil(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
@@ -309,7 +309,7 @@ fn test_filter_int32() -> PyResult<()> {
 
 #[test]
 fn test_dequantize() -> PyResult<()> {
-    pyo3::append_to_inittab!(edgefirst_python);
+    pyo3::append_to_inittab!(edgefirst_hal);
     pyo3::prepare_freethreaded_python();
     Python::with_gil(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
@@ -349,7 +349,7 @@ fn test_dequantize() -> PyResult<()> {
 
 #[test]
 fn test_nms_against_tensorflow() -> PyResult<()> {
-    pyo3::append_to_inittab!(edgefirst_python);
+    pyo3::append_to_inittab!(edgefirst_hal);
     pyo3::prepare_freethreaded_python();
     Python::with_gil(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
