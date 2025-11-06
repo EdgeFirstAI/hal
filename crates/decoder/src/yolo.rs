@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 
 use ndarray::{
-    Array2, Array3, ArrayView1, ArrayView2, ArrayView3,
+    Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3,
     parallel::prelude::{IntoParallelIterator, ParallelIterator},
     s,
 };
@@ -360,7 +360,7 @@ pub fn impl_yolo_segdet_8bit<
             score_threshold,
             boxes_tensor,
             scores_tensor,
-            &mask_tensor,
+            mask_tensor,
             quant_boxes,
         )
     };
@@ -425,6 +425,46 @@ pub fn impl_yolo_segdet_float<
     }
 }
 
+pub(crate) fn impl_yolo_split_segdet_8bit_get_boxes<
+    'a,
+    B: BBoxTypeTrait,
+    BOX: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
+    SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
+    MASK: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
+>(
+    boxes: (ArrayView2<BOX>, Quantization),
+    scores: (ArrayView2<SCORE>, Quantization),
+    mask_coeff: (ArrayView2<'a, MASK>, Quantization),
+    score_threshold: f32,
+    iou_threshold: f32,
+    max_boxes: usize,
+) -> Vec<(DetectBox, Array1<MASK>)> {
+    let (boxes_tensor, quant_boxes) = boxes;
+    let (scores_tensor, quant_scores) = scores;
+    let (mask_tensor, _) = mask_coeff;
+
+    let boxes_tensor = boxes_tensor.reversed_axes();
+    let scores_tensor = scores_tensor.reversed_axes();
+    let mask_tensor = mask_tensor.reversed_axes();
+
+    let boxes = {
+        let score_threshold = quantize_score_threshold(score_threshold, quant_scores);
+        postprocess_boxes_extra_quant::<B, _, _, _>(
+            score_threshold,
+            boxes_tensor,
+            scores_tensor,
+            mask_tensor,
+            quant_boxes,
+        )
+    };
+    let mut boxes = nms_extra_int::<_, _, i32, _>(iou_threshold, boxes);
+    boxes.truncate(max_boxes);
+    boxes
+        .into_iter()
+        .map(|(b, m)| (dequant_detect_box(&b, quant_boxes, quant_scores), m))
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn impl_yolo_split_segdet_8bit<
     B: BBoxTypeTrait,
@@ -442,32 +482,17 @@ pub fn impl_yolo_split_segdet_8bit<
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
 ) {
-    let (boxes_tensor, quant_boxes) = boxes;
-    let (scores_tensor, quant_scores) = scores;
-    let (mask_tensor, quant_masks) = mask_coeff;
+    let (_, quant_masks) = mask_coeff;
     let (protos, quant_protos) = protos;
+    let boxes = impl_yolo_split_segdet_8bit_get_boxes::<B, _, _, _>(
+        boxes,
+        scores,
+        mask_coeff,
+        score_threshold,
+        iou_threshold,
+        output_boxes.capacity(),
+    );
 
-    let boxes_tensor = boxes_tensor.reversed_axes();
-    let scores_tensor = scores_tensor.reversed_axes();
-    let mask_tensor = mask_tensor.reversed_axes();
-
-    let boxes = {
-        let score_threshold = quantize_score_threshold(score_threshold, quant_boxes);
-        postprocess_boxes_extra_quant::<B, _, _, _>(
-            score_threshold,
-            boxes_tensor,
-            scores_tensor,
-            &mask_tensor,
-            quant_boxes,
-        )
-    };
-
-    let mut boxes = nms_extra_int::<_, _, i32, _>(iou_threshold, boxes);
-    boxes.truncate(output_boxes.capacity());
-    let boxes = boxes
-        .into_iter()
-        .map(|(b, m)| (dequant_detect_box(&b, quant_boxes, quant_scores), m))
-        .collect();
     let boxes = decode_segdet_8bit(boxes, protos, quant_masks, quant_protos);
     output_boxes.clear();
     output_masks.clear();
@@ -569,11 +594,11 @@ fn decode_segdet_f32<
         .collect()
 }
 
-fn decode_segdet_8bit<
+pub(crate) fn decode_segdet_8bit<
     MASK: PrimInt + AsPrimitive<i32> + Send + Sync,
     PROTO: PrimInt + AsPrimitive<i32> + Send + Sync,
 >(
-    boxes: Vec<(DetectBox, ArrayView1<MASK>)>,
+    boxes: Vec<(DetectBox, Array1<MASK>)>,
     protos: ArrayView3<PROTO>,
     quant_masks: Quantization,
     quant_protos: Quantization,

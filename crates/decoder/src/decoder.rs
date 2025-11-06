@@ -2,9 +2,10 @@ use ndarray::{Array, Array3, ArrayViewD, s};
 use ndarray_stats::QuantileExt;
 use num_traits::AsPrimitive;
 use serde::{Deserialize, Serialize};
+use serde_yaml::with;
 
 use crate::{
-    DetectBox, Error, Quantization, Segmentation,
+    DetectBox, Error, Quantization, Segmentation, XYWH,
     configs::{DecoderType, ModelType, QuantTuple},
     dequantize_ndarray,
     modelpack::{
@@ -12,10 +13,11 @@ use crate::{
         decode_modelpack_split, decode_modelpack_split_float,
     },
     yolo::{
-        decode_yolo_det, decode_yolo_f32, decode_yolo_f64, decode_yolo_segdet,
+        decode_segdet_8bit, decode_yolo_det, decode_yolo_f32, decode_yolo_f64, decode_yolo_segdet,
         decode_yolo_segdet_f32, decode_yolo_segdet_f64, decode_yolo_split_det,
         decode_yolo_split_det_f32, decode_yolo_split_det_f64, decode_yolo_split_segdet,
         decode_yolo_split_segdet_f32, decode_yolo_split_segdet_f64,
+        impl_yolo_split_segdet_8bit_get_boxes,
     },
 };
 
@@ -1147,6 +1149,23 @@ impl Decoder {
             .map(Quantization::from)
             .unwrap_or_default();
 
+        let mut skip = vec![];
+
+        let (boxes_tensor, ind) =
+            Self::find_outputs_with_shape_quantized(&boxes.shape, outputs, &skip)?;
+        skip.push(ind);
+
+        let (scores_tensor, ind) =
+            Self::find_outputs_with_shape_quantized(&scores.shape, outputs, &skip)?;
+        skip.push(ind);
+
+        let (mask_tensor, ind) =
+            Self::find_outputs_with_shape_quantized(&mask_coeff.shape, outputs, &skip)?;
+        skip.push(ind);
+
+        let (protos_tensor, _) =
+            Self::find_outputs_with_shape_quantized(&protos.shape, outputs, &skip)?;
+
         macro_rules! with_quantized {
             ($x:expr, $var:ident, $body:expr) => {
                 match $x {
@@ -1170,8 +1189,55 @@ impl Decoder {
             };
         }
 
-        macro_rules! yolo_split_segdet_quant {
-            ($boxes_tensor:expr, $scores_tensor:expr, $mask_tensor:expr, $protos_tensor:expr) => {{
+        // This works but compiles really slowly (1 min+ for cargo clippy)
+        // macro_rules! yolo_split_segdet_quant {
+        //     ($boxes_tensor:expr, $scores_tensor:expr, $mask_tensor:expr,
+        // $protos_tensor:expr) => {{
+        //         let mut boxes_tensor = $boxes_tensor.slice(s![0, .., ..]);
+        //         if boxes.channels_first {
+        //             boxes_tensor.swap_axes(0, 1);
+        //         };
+
+        //         let mut scores_tensor = $scores_tensor.slice(s![0, .., ..]);
+        //         if scores.channels_first {
+        //             scores_tensor.swap_axes(0, 1);
+        //         };
+
+        //         let mut mask_tensor = $mask_tensor.slice(s![0, .., ..]);
+        //         if mask_coeff.channels_first {
+        //             mask_tensor.swap_axes(0, 1);
+        //         };
+
+        //         let mut protos_tensor = $protos_tensor.slice(s![0, .., .., ..]);
+        //         if protos.channels_first {
+        //             protos_tensor.swap_axes(0, 1);
+        //             protos_tensor.swap_axes(1, 2);
+        //         }
+
+        //         decode_yolo_split_segdet(
+        //             (boxes_tensor, quant_boxes),
+        //             (scores_tensor, quant_scores),
+        //             (mask_tensor, quant_masks),
+        //             (protos_tensor, quant_protos),
+        //             self.score_threshold,
+        //             self.iou_threshold,
+        //             output_boxes,
+        //             output_masks,
+        //         );
+        //     }};
+        // }
+        // with_quantized!(boxes_tensor, b, {
+        //     with_quantized!(scores_tensor, s, {
+        //         with_quantized!(mask_tensor, m, {
+        //             with_quantized!(protos_tensor, p, {
+        //                 yolo_split_segdet_quant!(b, s, m, p);
+        //             });
+        //         });
+        //     });
+        // });
+
+        macro_rules! yolo_split_segdet_get_boxes {
+            ($boxes_tensor:expr, $scores_tensor:expr, $mask_tensor:expr) => {{
                 let mut boxes_tensor = $boxes_tensor.slice(s![0, .., ..]);
                 if boxes.channels_first {
                     boxes_tensor.swap_axes(0, 1);
@@ -1182,89 +1248,50 @@ impl Decoder {
                     scores_tensor.swap_axes(0, 1);
                 };
 
-                let mut mask_tensor = $mask_tensor.slice(s![0, .., ..]);
-                if mask_coeff.channels_first {
-                    mask_tensor.swap_axes(0, 1);
-                };
+                impl_yolo_split_segdet_8bit_get_boxes::<XYWH, _, _, _>(
+                    (boxes_tensor, quant_boxes),
+                    (scores_tensor, quant_scores),
+                    ($mask_tensor, quant_masks),
+                    self.score_threshold,
+                    self.iou_threshold,
+                    output_boxes.capacity(),
+                )
+            }};
+        }
 
-                let mut protos_tensor = $protos_tensor.slice(s![0, .., .., ..]);
+        with_quantized!(mask_tensor, m, {
+            let mut m = m.slice(s![0, .., ..]);
+            if mask_coeff.channels_first {
+                m.swap_axes(0, 1);
+            };
+
+            let boxes = with_quantized!(boxes_tensor, b, {
+                with_quantized!(scores_tensor, s, yolo_split_segdet_get_boxes!(b, s, m))
+            });
+
+            with_quantized!(protos_tensor, p, {
+                let mut protos_tensor = p.slice(s![0, .., .., ..]);
                 if protos.channels_first {
                     protos_tensor.swap_axes(0, 1);
                     protos_tensor.swap_axes(1, 2);
                 }
 
-                decode_yolo_split_segdet(
-                    (boxes_tensor, quant_boxes),
-                    (scores_tensor, quant_scores),
-                    (mask_tensor, quant_masks),
-                    (protos_tensor, quant_protos),
-                    self.score_threshold,
-                    self.iou_threshold,
-                    output_boxes,
-                    output_masks,
-                );
-            }};
-        }
-
-        let mut skip = vec![];
-
-        let (boxes_tensor, ind) =
-            Self::find_outputs_with_shape_quantized(&boxes.shape, outputs, &skip)?;
-        skip.push(ind);
-
-        let (scores_tensor, ind) =
-            Self::find_outputs_with_shape_quantized(&scores.shape, outputs, &skip)?;
-        skip.push(ind);
-
-        let (mask_tensor, ind) =
-            Self::find_outputs_with_shape_quantized(&mask_coeff.shape, outputs, &skip)?;
-        skip.push(ind);
-
-        let (protos_tensor, _) =
-            Self::find_outputs_with_shape_quantized(&protos.shape, outputs, &skip)?;
-
-        with_quantized!(boxes_tensor, b, {
-            with_quantized!(scores_tensor, s, {
-                with_quantized!(mask_tensor, m, {
-                    with_quantized!(protos_tensor, p, {
-                        yolo_split_segdet_quant!(b, s, m, p);
+                let boxes = decode_segdet_8bit(boxes, protos_tensor, quant_masks, quant_protos);
+                output_boxes.clear();
+                output_masks.clear();
+                for (b, m) in boxes.into_iter() {
+                    output_boxes.push(b);
+                    output_masks.push(Segmentation {
+                        xmin: b.bbox.xmin,
+                        ymin: b.bbox.ymin,
+                        xmax: b.bbox.xmax,
+                        ymax: b.bbox.ymax,
+                        segmentation: m,
                     });
-                });
-            });
+                }
+            })
         });
 
-        Ok(())
-    }
-
-    fn decode_modelpack_det_split<D>(
-        &self,
-        outputs: &[ArrayViewD<D>],
-        detection: &[configs::Detection],
-        output_boxes: &mut Vec<DetectBox>,
-    ) -> Result<(), Error>
-    where
-        D: AsPrimitive<f32>,
-        i64: AsPrimitive<D>,
-    {
-        let new_outputs = Self::match_outputs_to_detect(detection, outputs)?;
-        let new_outputs = new_outputs
-            .into_iter()
-            .map(|x| x.slice(s![0, .., .., ..]))
-            .collect::<Vec<_>>();
-        let new_detection = detection
-            .iter()
-            .map(|x| ModelPackDetectionConfig {
-                anchors: x.anchors.clone().unwrap(),
-                quantization: x.quantization.map(Quantization::from),
-            })
-            .collect::<Vec<_>>();
-        decode_modelpack_split(
-            &new_outputs,
-            &new_detection,
-            self.score_threshold,
-            self.iou_threshold,
-            output_boxes,
-        );
         Ok(())
     }
 
@@ -1293,292 +1320,6 @@ impl Decoder {
         decode_modelpack_split_float(
             &new_outputs,
             &new_detection,
-            self.score_threshold,
-            self.iou_threshold,
-            output_boxes,
-        );
-        Ok(())
-    }
-
-    fn decode_modelpack_seg_i8(
-        &self,
-        outputs: &[ArrayViewD<i8>],
-        segmentation: &configs::Segmentation,
-        output_masks: &mut Vec<Segmentation>,
-    ) -> Result<(), Error> {
-        let (seg, _) = Self::find_outputs_with_shape(&segmentation.shape, outputs, &[])?;
-        let mut seg = seg.slice(s![0, .., .., ..]);
-        if segmentation.channels_first {
-            seg.swap_axes(0, 1);
-            seg.swap_axes(1, 2);
-        };
-        let seg = seg.mapv(|x| (x as i16 + 128) as u8);
-
-        output_masks.push(Segmentation {
-            xmin: 0.0,
-            ymin: 0.0,
-            xmax: 1.0,
-            ymax: 1.0,
-            segmentation: seg,
-        });
-        Ok(())
-    }
-
-    fn decode_modelpack_det_i8(
-        &self,
-        outputs: &[ArrayViewD<i8>],
-        boxes: &configs::Boxes,
-        scores: &configs::Scores,
-        output_boxes: &mut Vec<DetectBox>,
-    ) -> Result<(), Error> {
-        let quant_boxes = boxes
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-        let (boxes_tensor, ind) = Self::find_outputs_with_shape(&boxes.shape, outputs, &[])?;
-        let mut boxes_tensor = boxes_tensor.slice(s![0, .., 0, ..]);
-        if boxes.channels_first {
-            boxes_tensor.swap_axes(0, 1);
-        };
-
-        let quant_scores = scores
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-        let (scores_tensor, _) = Self::find_outputs_with_shape(&scores.shape, outputs, &[ind])?;
-        let mut scores_tensor = scores_tensor.slice(s![0, .., ..]);
-        if scores.channels_first {
-            scores_tensor.swap_axes(0, 1);
-        };
-
-        decode_modelpack_det(
-            (boxes_tensor, quant_boxes),
-            (scores_tensor, quant_scores),
-            self.score_threshold,
-            self.iou_threshold,
-            output_boxes,
-        );
-        Ok(())
-    }
-
-    fn decode_yolo_det_i8(
-        &self,
-        outputs: &[ArrayViewD<i8>],
-        boxes: &configs::Detection,
-        output_boxes: &mut Vec<DetectBox>,
-    ) -> Result<(), Error> {
-        let quant_boxes = boxes
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-        let (boxes_tensor, _) = Self::find_outputs_with_shape(&boxes.shape, outputs, &[])?;
-        let mut boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
-        if boxes.channels_first {
-            boxes_tensor.swap_axes(0, 1);
-        };
-        decode_yolo_det(
-            (boxes_tensor, quant_boxes),
-            self.score_threshold,
-            self.iou_threshold,
-            output_boxes,
-        );
-        Ok(())
-    }
-
-    fn decode_yolo_segdet_i8(
-        &self,
-        outputs: &[ArrayViewD<i8>],
-        boxes: &configs::Segmentation,
-        protos: &configs::Protos,
-        output_boxes: &mut Vec<DetectBox>,
-        output_masks: &mut Vec<Segmentation>,
-    ) -> Result<(), Error> {
-        let quant_boxes = boxes
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-        let (box_output, ind) = Self::find_outputs_with_shape(&boxes.shape, outputs, &[])?;
-        let mut box_tensor = box_output.slice(s![0, .., ..]);
-        if boxes.channels_first {
-            box_tensor.swap_axes(0, 1);
-        }
-
-        let quant_protos = protos
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-        let (protos_tensor, _) = Self::find_outputs_with_shape(&protos.shape, outputs, &[ind])?;
-        let mut protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-        if protos.channels_first {
-            protos_tensor.swap_axes(0, 1);
-            protos_tensor.swap_axes(1, 2);
-        }
-
-        decode_yolo_segdet(
-            (box_tensor, quant_boxes),
-            (protos_tensor, quant_protos),
-            self.score_threshold,
-            self.iou_threshold,
-            output_boxes,
-            output_masks,
-        );
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn decode_yolo_split_segdet_i8(
-        &self,
-        outputs: &[ArrayViewD<i8>],
-        boxes: &configs::Boxes,
-        scores: &configs::Scores,
-        mask_coeff: &configs::MaskCoefficients,
-        protos: &configs::Protos,
-        output_boxes: &mut Vec<DetectBox>,
-        output_masks: &mut Vec<Segmentation>,
-    ) -> Result<(), Error> {
-        let mut skip = vec![];
-        let quant_boxes = boxes
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-        let (boxes_tensor, ind) = Self::find_outputs_with_shape(&boxes.shape, outputs, &skip)?;
-        let mut boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
-        if boxes.channels_first {
-            boxes_tensor.swap_axes(0, 1);
-        };
-        skip.push(ind);
-
-        let quant_scores = scores
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-        let (scores_tensor, ind) = Self::find_outputs_with_shape(&scores.shape, outputs, &skip)?;
-        let mut scores_tensor = scores_tensor.slice(s![0, .., ..]);
-        if scores.channels_first {
-            scores_tensor.swap_axes(0, 1);
-        };
-        skip.push(ind);
-
-        let quant_masks = mask_coeff
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-        let (mask_tensor, ind) = Self::find_outputs_with_shape(&mask_coeff.shape, outputs, &skip)?;
-        let mut mask_tensor = mask_tensor.slice(s![0, .., ..]);
-        if mask_coeff.channels_first {
-            mask_tensor.swap_axes(0, 1);
-        };
-        skip.push(ind);
-
-        let quant_protos = protos
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-        let (protos_tensor, _) = Self::find_outputs_with_shape(&protos.shape, outputs, &skip)?;
-        let mut protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-        if protos.channels_first {
-            protos_tensor.swap_axes(0, 1);
-            protos_tensor.swap_axes(1, 2);
-        }
-
-        decode_yolo_split_segdet(
-            (boxes_tensor, quant_boxes),
-            (scores_tensor, quant_scores),
-            (mask_tensor, quant_masks),
-            (protos_tensor, quant_protos),
-            self.score_threshold,
-            self.iou_threshold,
-            output_boxes,
-            output_masks,
-        );
-        Ok(())
-    }
-
-    fn decode_modelpack_seg_u8(
-        &self,
-        outputs: &[ArrayViewD<u8>],
-        segmentation: &configs::Segmentation,
-        output_masks: &mut Vec<Segmentation>,
-    ) -> Result<(), Error> {
-        let (seg, _) = Self::find_outputs_with_shape(&segmentation.shape, outputs, &[])?;
-        let mut seg = seg.slice(s![0, .., .., ..]);
-        if segmentation.channels_first {
-            seg.swap_axes(0, 1);
-            seg.swap_axes(1, 2);
-        }
-
-        // TODO: Adjust signatures so this doesn't need to clone the entire backing
-        // array?
-        let seg = if let Some(slc) = seg.as_slice() {
-            Array::from_shape_vec(seg.raw_dim(), slc.to_vec())?
-        } else {
-            Array::from_shape_vec(seg.raw_dim(), seg.iter().cloned().collect())?
-        };
-
-        output_masks.push(Segmentation {
-            xmin: 0.0,
-            ymin: 0.0,
-            xmax: 1.0,
-            ymax: 1.0,
-            segmentation: seg,
-        });
-        Ok(())
-    }
-
-    fn decode_modelpack_det_u8(
-        &self,
-        outputs: &[ArrayViewD<u8>],
-        boxes: &configs::Boxes,
-        scores: &configs::Scores,
-        output_boxes: &mut Vec<DetectBox>,
-    ) -> Result<(), Error> {
-        let quant_boxes = boxes
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-        let (boxes_tensor, ind) = Self::find_outputs_with_shape(&boxes.shape, outputs, &[])?;
-        let mut boxes_tensor = boxes_tensor.slice(s![0, .., 0, ..]);
-        if boxes.channels_first {
-            boxes_tensor.swap_axes(0, 1);
-        };
-
-        let quant_scores = scores
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-        let (scores_tensor, _) = Self::find_outputs_with_shape(&scores.shape, outputs, &[ind])?;
-        let mut scores_tensor = scores_tensor.slice(s![0, .., ..]);
-        if scores.channels_first {
-            scores_tensor.swap_axes(0, 1);
-        };
-
-        decode_modelpack_det(
-            (boxes_tensor, quant_boxes),
-            (scores_tensor, quant_scores),
-            self.score_threshold,
-            self.iou_threshold,
-            output_boxes,
-        );
-        Ok(())
-    }
-
-    fn decode_yolo_det_u8(
-        &self,
-        outputs: &[ArrayViewD<u8>],
-        boxes: &configs::Detection,
-        output_boxes: &mut Vec<DetectBox>,
-    ) -> Result<(), Error> {
-        let quant_boxes = boxes
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-        let (boxes_tensor, _) = Self::find_outputs_with_shape(&boxes.shape, outputs, &[])?;
-        let mut boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
-        if boxes.channels_first {
-            boxes_tensor.swap_axes(0, 1);
-        };
-        decode_yolo_det(
-            (boxes_tensor, quant_boxes),
             self.score_threshold,
             self.iou_threshold,
             output_boxes,
