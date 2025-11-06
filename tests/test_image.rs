@@ -1,4 +1,4 @@
-use edgefirst_python::edgefirst_python as edgefirst_python_module;
+use edgefirst_hal::edgefirst_hal as edgefirst_hal_module;
 use numpy::{PyArray3, PyUntypedArrayMethods};
 use pyo3::{
     PyResult, Python,
@@ -8,7 +8,7 @@ use pyo3::{
 
 #[test]
 fn test_rgba_to_rgb() -> PyResult<()> {
-    pyo3::append_to_inittab!(edgefirst_python_module);
+    pyo3::append_to_inittab!(edgefirst_hal_module);
     pyo3::prepare_freethreaded_python();
     Python::with_gil(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
@@ -20,10 +20,10 @@ fn test_rgba_to_rgb() -> PyResult<()> {
         let src = out
             .get_item("src")
             .unwrap()
-            .downcast_into::<edgefirst_python::image::PyTensorImage>()?;
+            .downcast_into::<edgefirst_hal::image::PyTensorImage>()?;
         assert_eq!(
             src.borrow().format().unwrap(),
-            edgefirst_python::image::FourCC::RGBA
+            edgefirst_hal::image::FourCC::RGBA
         );
         let n = out.get_item("n").unwrap().downcast_into::<PyArray3<u8>>()?;
         assert_eq!(n.shape(), [720, 1280, 3]);
@@ -34,7 +34,7 @@ fn test_rgba_to_rgb() -> PyResult<()> {
 
 #[test]
 fn test_rgb_resize() -> PyResult<()> {
-    pyo3::append_to_inittab!(edgefirst_python_module);
+    pyo3::append_to_inittab!(edgefirst_hal_module);
     pyo3::prepare_freethreaded_python();
     Python::with_gil(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
@@ -46,10 +46,10 @@ fn test_rgb_resize() -> PyResult<()> {
         let src = out
             .get_item("src")
             .unwrap()
-            .downcast_into::<edgefirst_python::image::PyTensorImage>()?;
+            .downcast_into::<edgefirst_hal::image::PyTensorImage>()?;
         assert_eq!(
             src.borrow().format().unwrap(),
-            edgefirst_python::image::FourCC::RGB
+            edgefirst_hal::image::FourCC::RGB
         );
         assert_eq!(src.borrow().width(), 1280);
         assert_eq!(src.borrow().height(), 720);
@@ -62,7 +62,7 @@ fn test_rgb_resize() -> PyResult<()> {
 
 #[test]
 fn test_flip() -> PyResult<()> {
-    pyo3::append_to_inittab!(edgefirst_python_module);
+    pyo3::append_to_inittab!(edgefirst_hal_module);
     pyo3::prepare_freethreaded_python();
     Python::with_gil(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
@@ -70,10 +70,10 @@ fn test_flip() -> PyResult<()> {
         let src = out
             .get_item("src")
             .unwrap()
-            .downcast_into::<edgefirst_python::image::PyTensorImage>()?;
+            .downcast_into::<edgefirst_hal::image::PyTensorImage>()?;
         assert_eq!(
             src.borrow().format().unwrap(),
-            edgefirst_python::image::FourCC::RGBA
+            edgefirst_hal::image::FourCC::RGBA
         );
         let _ = out.get_item("n").unwrap().downcast_into::<PyArray3<u8>>()?;
         Ok(())
@@ -82,7 +82,7 @@ fn test_flip() -> PyResult<()> {
 
 #[test]
 fn test_grey_load() -> PyResult<()> {
-    pyo3::append_to_inittab!(edgefirst_python_module);
+    pyo3::append_to_inittab!(edgefirst_hal_module);
     pyo3::prepare_freethreaded_python();
     Python::with_gil(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
@@ -111,7 +111,7 @@ fn test_grey_load() -> PyResult<()> {
 
 #[test]
 fn test_normalize() -> PyResult<()> {
-    pyo3::append_to_inittab!(edgefirst_python_module);
+    pyo3::append_to_inittab!(edgefirst_hal_module);
     pyo3::prepare_freethreaded_python();
     Python::with_gil(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);

@@ -1,6 +1,7 @@
-#![cfg_attr(feature = "nightly-f16", feature(f16))]
+#![cfg_attr(nightly, feature(f16))]
 
 use pyo3::prelude::*;
+
 pub mod decoder;
 pub mod image;
 pub mod tensor;
@@ -26,7 +27,7 @@ impl Drop for FunctionTimer {
 }
 
 #[pymodule]
-pub mod edgefirst_python {
+pub mod edgefirst_hal {
     pub use super::*;
 
     #[pymodule_init]
@@ -34,6 +35,7 @@ pub mod edgefirst_python {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
         m.add_function(wrap_pyfunction!(version, m)?)?;
+        m.add_function(wrap_pyfunction!(build_info, m)?)?;
 
         m.add_class::<tensor::PyTensor>()?;
         m.add_class::<image::FourCC>()?;
@@ -52,5 +54,20 @@ pub mod edgefirst_python {
     #[pyfunction]
     fn version() -> String {
         env!("CARGO_PKG_VERSION").to_string()
+    }
+
+    /// Returns build configuration information including f16 implementation
+    #[pyfunction]
+    fn build_info() -> String {
+        #[cfg(nightly)]
+        let f16_impl = "native f16 (nightly, optimized)";
+        #[cfg(not(nightly))]
+        let f16_impl = "half::f16 (stable, compatible)";
+        
+        format!(
+            "edgefirst-hal v{}\nf16 implementation: {}",
+            env!("CARGO_PKG_VERSION"),
+            f16_impl
+        )
     }
 }

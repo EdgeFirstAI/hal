@@ -1,15 +1,15 @@
 
 import numpy as np
-import edgefirst_python
+import edgefirst_hal
 import tensorflow as tf
 
-output0 = np.fromfile('../../testdata/modelpack_split_17x30x18.bin',
+output0 = np.fromfile('testdata/modelpack_split_17x30x18.bin',
                       dtype=np.uint8).reshape(1, 17, 30, 18)
-output1 = np.fromfile('../../testdata/modelpack_split_9x15x18.bin',
+output1 = np.fromfile('testdata/modelpack_split_9x15x18.bin',
                       dtype=np.uint8).reshape(1, 9, 15, 18)
 
-config = open("../../testdata/modelpack_split.yaml").read()
-decoder = edgefirst_python.Decoder.new_from_yaml_str(config, 0., 1.0)
+config = open("testdata/modelpack_split.yaml").read()
+decoder = edgefirst_hal.Decoder.new_from_yaml_str(config, 0., 1.0)
 boxes, scores, classes, masks = decoder.decode([output0, output1], 100000)
 
 for iou in range(0, 100):
