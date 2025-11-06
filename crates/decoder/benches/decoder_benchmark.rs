@@ -60,7 +60,7 @@ fn decoder_quant_decode_boxes(bencher: divan::Bencher) {
 #[divan::bench()]
 fn decoder_quant_nms(bencher: divan::Bencher) {
     let score_threshold = 0.01;
-    let iou_threshold = 0.90;
+    let iou_threshold = 0.70;
     let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
     let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
     let out = out.to_vec();
@@ -232,7 +232,7 @@ fn decoder_f32_decode_boxes(bencher: divan::Bencher) {
 
 #[divan::bench()]
 fn decoder_f32_nms(bencher: divan::Bencher) {
-    let score_threshold = 0.25;
+    let score_threshold = 0.01;
     let iou_threshold = 0.70;
     let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
     let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };

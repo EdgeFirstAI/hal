@@ -4,6 +4,7 @@ use ndarray::{
     parallel::prelude::{IntoParallelIterator, ParallelIterator as _},
 };
 use num_traits::{AsPrimitive, ConstZero, PrimInt, Signed};
+use rayon::slice::ParallelSliceMut;
 
 pub fn postprocess_boxes_quant<
     B: BBoxTypeTrait,
@@ -76,8 +77,8 @@ pub fn postprocess_boxes_index<
 }
 
 pub fn nms_int<
-    BOX: Signed + PrimInt + AsPrimitive<DEST> + AsPrimitive<f32>,
-    SCORE: PrimInt + AsPrimitive<f32>,
+    BOX: Signed + PrimInt + AsPrimitive<DEST> + AsPrimitive<f32> + Send + Sync,
+    SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
     DEST: PrimInt + 'static + AsPrimitive<f32>,
 >(
     iou: f32,
@@ -85,7 +86,9 @@ pub fn nms_int<
 ) -> Vec<DetectBoxQuantized<BOX, SCORE>> {
     // Boxes get sorted by score in descending order so we know based on the
     // index the scoring of the boxes and can skip parts of the loop.
-    boxes.sort_by(|a, b| b.score.cmp(&a.score));
+
+    boxes.par_sort_by(|a, b| b.score.cmp(&a.score));
+
     let min_val = SCORE::min_value();
     // Outer loop over all boxes.
     for i in 0..boxes.len() {
@@ -100,29 +103,29 @@ pub fn nms_int<
                 // this box was suppressed by different box earlier
                 continue;
             }
+
             if jaccard_int::<BOX, DEST>(&boxes[j].bbox, &boxes[i].bbox, iou) {
                 // suppress this box
                 boxes[j].score = min_val;
             }
         }
     }
-
     // Filter out boxes that were suppressed.
     boxes.into_iter().filter(|b| b.score > min_val).collect()
 }
 
 pub fn nms_extra_int<
-    BOX: ConstZero + Signed + PrimInt + AsPrimitive<DEST> + AsPrimitive<f32>,
-    SCORE: PrimInt + AsPrimitive<f32>,
+    BOX: ConstZero + Signed + PrimInt + AsPrimitive<DEST> + AsPrimitive<f32> + Send + Sync,
+    SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
     DEST: ConstZero + PrimInt + 'static + AsPrimitive<f32>,
-    E,
+    E: Send + Sync,
 >(
     iou: f32,
     mut boxes: Vec<(DetectBoxQuantized<BOX, SCORE>, E)>,
 ) -> Vec<(DetectBoxQuantized<BOX, SCORE>, E)> {
     // Boxes get sorted by score in descending order so we know based on the
     // index the scoring of the boxes and can skip parts of the loop.
-    boxes.sort_by(|a, b| b.0.score.cmp(&a.0.score));
+    boxes.par_sort_by(|a, b| b.0.score.cmp(&a.0.score));
     let min_val = SCORE::min_value();
     // Outer loop over all boxes.
     for i in 0..boxes.len() {
@@ -169,12 +172,8 @@ fn jaccard_int<
     let area_a = as_dst(a.xmax - a.xmin) * as_dst(a.ymax - a.ymin);
     let area_b = as_dst(b.xmax - b.xmin) * as_dst(b.ymax - b.ymin);
 
-    // need to make sure we are not dividing by zero
     let union = area_a + area_b - intersection;
-    if union <= DEST::zero() {
-        return 0.0 > iou;
-    }
-    intersection.as_() / union.as_() > iou
+    intersection.as_() > iou * union.as_()
 }
 
 pub(crate) fn quantize_score_threshold<T: PrimInt + AsPrimitive<f32>>(

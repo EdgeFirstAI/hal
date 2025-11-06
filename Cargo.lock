@@ -480,6 +480,7 @@ dependencies = [
  "ndarray 0.16.1",
  "ndarray-stats",
  "num-traits",
+ "rayon",
  "serde",
  "serde_json",
  "serde_yaml",
