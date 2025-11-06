@@ -1006,12 +1006,6 @@ impl GLConverterST {
             };
         }
 
-        let dst_width = if let Some(dst_crop) = crop.dst_rect {
-            dst_crop.width
-        } else {
-            dst.width()
-        };
-
         let new_egl_image = self.create_image_from_dma2(src)?;
 
         self.draw_camera_texture_to_rgb_planar(

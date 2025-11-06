@@ -1,7 +1,7 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 use edgefirst::decoder::{
-    ArrayViewDQuantized, Decoder, DecoderBuilder, DetectBox, Quantization, Segmentation,
-    dequantize_cpu, modelpack::ModelPackDetectionConfig, segmentation_to_mask,
+    Decoder, DecoderBuilder, DetectBox, Quantization, Segmentation, dequantize_cpu,
+    modelpack::ModelPackDetectionConfig, segmentation_to_mask,
 };
 
 use ndarray::{Array1, Array2};
@@ -35,7 +35,6 @@ pub enum ArrayQuantized<'a> {
     UInt16(PyReadonlyArrayDyn<'a, u16>),
     Int16(PyReadonlyArrayDyn<'a, i16>),
 }
-
 
 #[derive(FromPyObject)]
 pub enum ListOfReadOnlyArrayGenericDyn<'py> {
@@ -234,18 +233,10 @@ impl PyDecoder {
                     .iter()
                     .filter_map(|x| match x {
                         WithInt32Array::Val(x) => match x {
-                            ArrayQuantized::UInt8(arr) => {
-                                Some(ArrayViewDQuantized::from(arr.as_array()))
-                            }
-                            ArrayQuantized::Int8(arr) => {
-                                Some(ArrayViewDQuantized::from(arr.as_array()))
-                            }
-                            ArrayQuantized::UInt16(arr) => {
-                                Some(ArrayViewDQuantized::from(arr.as_array()))
-                            }
-                            ArrayQuantized::Int16(arr) => {
-                                Some(ArrayViewDQuantized::from(arr.as_array()))
-                            }
+                            ArrayQuantized::UInt8(arr) => Some(arr.as_array().into()),
+                            ArrayQuantized::Int8(arr) => Some(arr.as_array().into()),
+                            ArrayQuantized::UInt16(arr) => Some(arr.as_array().into()),
+                            ArrayQuantized::Int16(arr) => Some(arr.as_array().into()),
                         },
                         WithInt32Array::Int32(_) => None,
                     })
@@ -427,8 +418,8 @@ impl PyDecoder {
         scores: ReadOnlyArrayGeneric2,
         quant_boxes: (f64, i64),
         quant_scores: (f64, i64),
-        score_threshold: f64,
-        iou_threshold: f64,
+        score_threshold: f32,
+        iou_threshold: f32,
         max_boxes: usize,
     ) -> PyResult<PyDetOutput<'py>> {
         let mut output_boxes = Vec::with_capacity(max_boxes);
@@ -439,8 +430,8 @@ impl PyDecoder {
                 edgefirst::decoder::modelpack::decode_modelpack_det(
                     (boxes.view(), Quantization::from(quant_boxes)),
                     (scores.view(), Quantization::from(quant_scores)),
-                    score_threshold as f32,
-                    iou_threshold as f32,
+                    score_threshold,
+                    iou_threshold,
                     &mut output_boxes,
                 );
             }
@@ -449,24 +440,24 @@ impl PyDecoder {
                 edgefirst::decoder::modelpack::decode_modelpack_det(
                     (boxes.view(), Quantization::from(quant_boxes)),
                     (scores.view(), Quantization::from(quant_scores)),
-                    score_threshold as f32,
-                    iou_threshold as f32,
+                    score_threshold,
+                    iou_threshold,
                     &mut output_boxes,
                 );
             }
             (ReadOnlyArrayGeneric2::Float32(boxes), ReadOnlyArrayGeneric2::Float32(scores)) => {
                 let (boxes, scores) = (boxes.as_array(), scores.as_array());
-                edgefirst::decoder::modelpack::decode_modelpack_f32(
+                edgefirst::decoder::modelpack::decode_modelpack_float(
                     boxes.view(),
                     scores.view(),
-                    score_threshold as f32,
-                    iou_threshold as f32,
+                    score_threshold,
+                    iou_threshold,
                     &mut output_boxes,
                 );
             }
             (ReadOnlyArrayGeneric2::Float64(boxes), ReadOnlyArrayGeneric2::Float64(scores)) => {
                 let (boxes, scores) = (boxes.as_array(), scores.as_array());
-                edgefirst::decoder::modelpack::decode_modelpack_f64(
+                edgefirst::decoder::modelpack::decode_modelpack_float(
                     boxes.view(),
                     scores.view(),
                     score_threshold,
