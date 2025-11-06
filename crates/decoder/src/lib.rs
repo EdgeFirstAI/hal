@@ -1,6 +1,6 @@
 //! EdgeFirst HAL - Decoders
 #![allow(clippy::excessive_precision)]
-use ndarray::{Array, Array2, Array3, ArrayView, ArrayView1, ArrayView3, Dimension, s};
+use ndarray::{Array, Array2, Array3, ArrayView, ArrayView1, ArrayView3, Dimension};
 use num_traits::{AsPrimitive, Float, PrimInt, Signed};
 use std::ops::{Add, Mul, Sub};
 pub mod byte;
@@ -467,7 +467,7 @@ fn arg_max<T: PartialOrd + Copy>(score: ArrayView1<T>) -> (T, usize) {
 }
 #[cfg(test)]
 mod tests {
-
+    use ndarray::s;
     use ndarray_stats::DeviationExt;
 
     use crate::{
