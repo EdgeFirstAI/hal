@@ -1,5 +1,5 @@
 import numpy as np
-from edgefirst import Tensor
+from edgefirst_hal import Tensor
 from unittest import TestCase
 
 

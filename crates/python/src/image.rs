@@ -500,8 +500,9 @@ fn normalize_to_int8<'py>(
     Ok(())
 }
 
+// High-performance native f16 implementation for nightly Rust
 #[inline(always)]
-#[cfg(feature = "nightly-f16")]
+#[cfg(nightly)]
 fn normalize_to_float_16<'py>(
     tensor: &TensorImage,
     shape: [usize; 3],
@@ -511,7 +512,8 @@ fn normalize_to_float_16<'py>(
     zero_point: Option<i64>,
 ) -> Result<()> {
     let dst: ArrayViewMut3<half::f16> = dst.as_array_mut();
-    // this is safe because half::f16 has the same representation as f16
+    // SAFETY: half::f16 has the same memory layout as native f16
+    // This allows us to use the native f16 arithmetic which is much faster
     let mut dst: ArrayViewMut3<f16> = unsafe { std::mem::transmute(dst) };
 
     let zp = if let Some(zp) = zero_point {
@@ -592,8 +594,9 @@ fn normalize_to_float_16<'py>(
     Ok(())
 }
 
+// Stable fallback using half crate (slower but works everywhere)
 #[inline(always)]
-#[cfg(not(feature = "nightly-f16"))]
+#[cfg(not(nightly))]
 fn normalize_to_float_16<'py>(
     tensor: &TensorImage,
     shape: [usize; 3],
