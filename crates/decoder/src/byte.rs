@@ -1,6 +1,6 @@
 use crate::{BBoxTypeTrait, BoundingBoxQuantized, DetectBoxQuantized, Quantization, arg_max};
 use ndarray::{
-    ArrayView1, ArrayView2, Zip,
+    Array1, ArrayView1, ArrayView2, Zip,
     parallel::prelude::{IntoParallelIterator, ParallelIterator as _},
 };
 use num_traits::{AsPrimitive, ConstZero, PrimInt, Signed};
@@ -42,14 +42,14 @@ pub fn postprocess_boxes_extra_quant<
     B: BBoxTypeTrait,
     Boxes: PrimInt + AsPrimitive<i32> + Send + Sync,
     Scores: PrimInt + AsPrimitive<f32> + Send + Sync,
-    E: Send + Sync,
+    E: Send + Sync + Copy,
 >(
     threshold: Scores,
     boxes: ArrayView2<Boxes>,
     scores: ArrayView2<Scores>,
-    extra: &'a ArrayView2<E>,
+    extra: ArrayView2<'a, E>,
     quant_boxes: Quantization,
-) -> Vec<(DetectBoxQuantized<i32, Scores>, ArrayView1<'a, E>)> {
+) -> Vec<(DetectBoxQuantized<i32, Scores>, Array1<E>)> {
     assert_eq!(scores.dim().0, boxes.dim().0);
     assert_eq!(boxes.dim().1, 4);
     let zp = quant_boxes.zero_point;
@@ -71,7 +71,7 @@ pub fn postprocess_boxes_extra_quant<
                     score: score_,
                     bbox: BoundingBoxQuantized::from_array(&bbox_quant),
                 },
-                mask,
+                mask.to_owned(),
             ))
         })
         .collect()
