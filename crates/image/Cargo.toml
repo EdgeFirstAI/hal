@@ -34,7 +34,7 @@ ndarray = { workspace = true }
 yuv = "0.8.6"
 kamadak-exif = "0.6.1"
 tokio = { version = "1.47.1", features = ["rt", "sync"] }
-rayon = "1.10.0"
+rayon = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 dma-heap = { workspace = true }

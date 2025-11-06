@@ -300,7 +300,10 @@ pub struct Segmentation {
 /// When choosing T, make sure to choose a type that is wider than the input
 /// data to prevent overflow or underflow
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct DetectBoxQuantized<BOX: Signed + PrimInt + AsPrimitive<f32>, SCORE: AsPrimitive<f32>> {
+pub struct DetectBoxQuantized<
+    BOX: Signed + PrimInt + AsPrimitive<f32>,
+    SCORE: PrimInt + AsPrimitive<f32>,
+> {
     pub bbox: BoundingBoxQuantized<BOX>,
     /// model-specific score for this detection, higher implies more
     /// confidence.
@@ -343,7 +346,10 @@ impl<T: Copy + Signed + Mul + Add + Sub + Ord + AsPrimitive<f32>> BoundingBoxQua
 /// Turns a DetectBoxQuantized into a DetectBox. The zero point is not used
 /// for quant_boxes as the DetectBoxQuantized is already be shifted to
 /// the zero points
-pub fn dequant_detect_box<BOXES: Signed + PrimInt + AsPrimitive<f32>, SCORE: AsPrimitive<f32>>(
+pub fn dequant_detect_box<
+    BOXES: Signed + PrimInt + AsPrimitive<f32>,
+    SCORE: PrimInt + AsPrimitive<f32>,
+>(
     detect: &DetectBoxQuantized<BOXES, SCORE>,
     quant_boxes: Quantization,
     quant_scores: Quantization,
