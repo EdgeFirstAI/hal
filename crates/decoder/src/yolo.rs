@@ -18,7 +18,7 @@ use crate::{
     float::{nms_extra_f32, nms_f32, postprocess_boxes_float, postprocess_boxes_index_float},
 };
 
-pub fn decode_yolo_det<BOX: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync>(
+pub fn decode_yolo_det<BOX: PrimInt + AsPrimitive<f32> + Send + Sync>(
     output: (ArrayView2<BOX>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
@@ -46,8 +46,8 @@ pub fn decode_yolo_f64(
 }
 
 pub fn decode_yolo_segdet<
-    BOX: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
-    PROTO: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
+    BOX: PrimInt + AsPrimitive<i64> + AsPrimitive<f32> + Send + Sync,
+    PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<f32> + Send + Sync,
 >(
     boxes: (ArrayView2<BOX>, Quantization),
     protos: (ArrayView3<PROTO>, Quantization),
@@ -155,10 +155,10 @@ pub fn decode_yolo_split_det_f64(
 
 #[allow(clippy::too_many_arguments)]
 pub fn decode_yolo_split_segdet<
-    BOX: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
+    BOX: PrimInt + AsPrimitive<f32> + Send + Sync,
     SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
-    MASK: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
-    PROTO: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
+    MASK: PrimInt + AsPrimitive<i64> + AsPrimitive<f32> + Send + Sync,
+    PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<f32> + Send + Sync,
 >(
     boxes: (ArrayView2<BOX>, Quantization),
     scores: (ArrayView2<SCORE>, Quantization),
@@ -227,10 +227,7 @@ pub fn decode_yolo_split_segdet_f64(
     );
 }
 
-pub fn impl_yolo_8bit<
-    B: BBoxTypeTrait,
-    T: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
->(
+pub fn impl_yolo_8bit<B: BBoxTypeTrait, T: PrimInt + AsPrimitive<f32> + Send + Sync>(
     output: (ArrayView2<T>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
@@ -249,11 +246,11 @@ pub fn impl_yolo_8bit<
         )
     };
 
-    let boxes = nms_int::<_, _, i64>(iou_threshold, boxes);
+    let boxes = nms_int(iou_threshold, boxes);
     let len = output_boxes.capacity().min(boxes.len());
     output_boxes.clear();
     for b in boxes.iter().take(len) {
-        output_boxes.push(dequant_detect_box(b, quant_boxes, quant_boxes));
+        output_boxes.push(dequant_detect_box(b, quant_boxes));
     }
 }
 
@@ -278,7 +275,7 @@ pub fn impl_yolo_float<B: BBoxTypeTrait, T: Float + AsPrimitive<f32> + Send + Sy
 
 pub fn impl_yolo_split_quant<
     B: BBoxTypeTrait,
-    BOX: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
+    BOX: PrimInt + AsPrimitive<f32> + Send + Sync,
     SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
 >(
     boxes: (ArrayView2<BOX>, Quantization),
@@ -303,11 +300,11 @@ pub fn impl_yolo_split_quant<
         )
     };
 
-    let boxes = nms_int::<_, _, i64>(iou_threshold, boxes);
+    let boxes = nms_int(iou_threshold, boxes);
     let len = output_boxes.capacity().min(boxes.len());
     output_boxes.clear();
     for b in boxes.iter().take(len) {
-        output_boxes.push(dequant_detect_box(b, quant_boxes, quant_scores));
+        output_boxes.push(dequant_detect_box(b, quant_scores));
     }
 }
 
@@ -339,8 +336,8 @@ pub fn impl_yolo_split_float<
 #[allow(clippy::too_many_arguments)]
 pub fn impl_yolo_segdet_8bit<
     B: BBoxTypeTrait,
-    BOX: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
-    PROTO: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
+    BOX: PrimInt + AsPrimitive<i64> + AsPrimitive<f32> + Send + Sync,
+    PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<f32> + Send + Sync,
 >(
     boxes: (ArrayView2<BOX>, Quantization),
     protos: (ArrayView3<PROTO>, Quantization),
@@ -409,7 +406,7 @@ pub fn impl_yolo_segdet_float<
 
 pub(crate) fn impl_yolo_split_segdet_8bit_get_boxes<
     B: BBoxTypeTrait,
-    BOX: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
+    BOX: PrimInt + AsPrimitive<f32> + Send + Sync,
     SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
 >(
     boxes: (ArrayView2<BOX>, Quantization),
@@ -433,17 +430,17 @@ pub(crate) fn impl_yolo_split_segdet_8bit_get_boxes<
             quant_boxes,
         )
     };
-    let mut boxes = nms_extra_int::<_, _, i32, _>(iou_threshold, boxes);
+    let mut boxes = nms_extra_int::<_, _>(iou_threshold, boxes);
     boxes.truncate(max_boxes);
     boxes
         .into_iter()
-        .map(|(b, i)| (dequant_detect_box(&b, quant_boxes, quant_scores), i))
+        .map(|(b, i)| (dequant_detect_box(&b, quant_scores), i))
         .collect()
 }
 
 pub(crate) fn impl_yolo_split_segdet_8bit_process_masks<
-    MASK: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
-    PROTO: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
+    MASK: PrimInt + AsPrimitive<i64> + AsPrimitive<f32> + Send + Sync,
+    PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<f32> + Send + Sync,
 >(
     boxes: Vec<(DetectBox, usize)>,
     mask_coeff: (ArrayView2<MASK>, Quantization),
@@ -474,10 +471,10 @@ pub(crate) fn impl_yolo_split_segdet_8bit_process_masks<
 #[allow(clippy::too_many_arguments)]
 pub fn impl_yolo_split_segdet_8bit<
     B: BBoxTypeTrait,
-    BOX: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
+    BOX: PrimInt + AsPrimitive<f32> + Send + Sync,
     SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
-    MASK: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
-    PROTO: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
+    MASK: PrimInt + AsPrimitive<i64> + AsPrimitive<f32> + Send + Sync,
+    PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<f32> + Send + Sync,
 >(
     boxes: (ArrayView2<BOX>, Quantization),
     scores: (ArrayView2<SCORE>, Quantization),
@@ -496,7 +493,7 @@ pub fn impl_yolo_split_segdet_8bit<
         output_boxes.capacity(),
     );
 
-    impl_yolo_split_segdet_8bit_process_masks::<_, _>(
+    impl_yolo_split_segdet_8bit_process_masks(
         boxes,
         mask_coeff,
         protos,
@@ -592,8 +589,8 @@ fn decode_segdet_f32<
 }
 
 pub(crate) fn decode_segdet_8bit<
-    MASK: PrimInt + AsPrimitive<i32> + Send + Sync,
-    PROTO: PrimInt + AsPrimitive<i32> + Send + Sync,
+    MASK: PrimInt + AsPrimitive<i64> + Send + Sync,
+    PROTO: PrimInt + AsPrimitive<i64> + Send + Sync,
 >(
     boxes: Vec<(DetectBox, usize)>,
     masks: ArrayView2<MASK>,
@@ -691,9 +688,7 @@ where
     let protos = protos.reversed_axes();
 
     let zp = quant_masks.zero_point.as_();
-    // This cannot overflow because in the dot product, we have u8 * u8 and then 32
-    // proto layers are summed together. Which means in the result of the matrix
-    // multiply, the maximum value of a single element is 256 * 256 * 32 = 2^21
+
     let mask = mask.mapv(|x| x.as_() - zp);
 
     let zp = quant_protos.zero_point.as_();

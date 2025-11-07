@@ -25,7 +25,7 @@ impl From<&Detection> for ModelPackDetectionConfig {
 }
 
 pub fn decode_modelpack_det<
-    BOX: PrimInt + AsPrimitive<f32> + AsPrimitive<i32> + Send + Sync,
+    BOX: PrimInt + AsPrimitive<f32> + Send + Sync,
     SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
 >(
     boxes_tensor: (ArrayView2<BOX>, Quantization),
@@ -98,7 +98,7 @@ pub fn decode_modelpack_split_float<D: AsPrimitive<f32>>(
 
 pub fn impl_modelpack_8bit<
     B: BBoxTypeTrait,
-    BOX: PrimInt + AsPrimitive<f32> + AsPrimitive<i32> + Send + Sync,
+    BOX: PrimInt + AsPrimitive<f32> + Send + Sync,
     SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
 >(
     boxes: (ArrayView2<BOX>, Quantization),
@@ -118,11 +118,11 @@ pub fn impl_modelpack_8bit<
             quant_boxes,
         )
     };
-    let boxes = nms_int::<_, _, i64>(iou_threshold, boxes);
+    let boxes = nms_int(iou_threshold, boxes);
     let len = output_boxes.capacity().min(boxes.len());
     output_boxes.clear();
     for b in boxes.into_iter().take(len) {
-        output_boxes.push(dequant_detect_box(&b, quant_boxes, quant_scores));
+        output_boxes.push(dequant_detect_box(&b, quant_scores));
     }
 }
 
