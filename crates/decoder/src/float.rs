@@ -95,7 +95,7 @@ pub fn nms_f32(iou: f32, mut boxes: Vec<DetectBox>) -> Vec<DetectBox> {
                 // this box was suppressed by different box earlier
                 continue;
             }
-            if jaccard_f32(&boxes[j].bbox, &boxes[i].bbox, iou) {
+            if jaccard(&boxes[j].bbox, &boxes[i].bbox, iou) {
                 // max_box(boxes[j].bbox, &mut boxes[i].bbox);
                 boxes[j].score = -1.0;
             }
@@ -127,7 +127,7 @@ pub fn nms_extra_f32<E: Send + Sync>(
                 // this box was suppressed by different box earlier
                 continue;
             }
-            if jaccard_f32(&boxes[j].0.bbox, &boxes[i].0.bbox, iou) {
+            if jaccard(&boxes[j].0.bbox, &boxes[i].0.bbox, iou) {
                 // max_box(boxes[j].bbox, &mut boxes[i].bbox);
                 boxes[j].0.score = 0.0;
             }
@@ -139,7 +139,7 @@ pub fn nms_extra_f32<E: Send + Sync>(
 }
 
 // Returns true if the IOU of the given boxes are greater than the iou threshold
-fn jaccard_f32(a: &BoundingBox, b: &BoundingBox, iou: f32) -> bool {
+pub(crate) fn jaccard(a: &BoundingBox, b: &BoundingBox, iou: f32) -> bool {
     let left = a.xmin.max(b.xmin);
     let top = a.ymin.max(b.ymin);
     let right = a.xmax.min(b.xmax);

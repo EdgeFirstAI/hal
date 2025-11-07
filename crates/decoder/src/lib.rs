@@ -20,32 +20,17 @@ use crate::{
 };
 
 pub trait BBoxTypeTrait {
-    /// Converts the bbox into XYXY quantized format. The XYXY quantized values
-    /// are scaled to the zero point and and doubled. Doubled values ensure that
-    /// no rounding is needed when converting BBox formats that typically
-    /// require dividing some of the inputs by 2.
-    ///
-    /// Generally, A should be a wider, signed, integer type than B. This
-    /// ensures no over or under flow.
-    fn to_xyxy_quant<A: PrimInt + 'static, B: AsPrimitive<A>>(input: &[B; 4], zp: A) -> [A; 4];
-
     /// Converts the bbox into XYXY float format.
     fn to_xyxy_float<A: Float + 'static, B: AsPrimitive<A>>(input: &[B; 4]) -> [A; 4];
 
-    #[inline(always)]
-    /// Converts the bbox into XYXY quantized format. The XYXY quantized values
-    /// are scaled to the zero point and and doubled. Doubled values ensure that
-    /// no rounding is needed when converting BBox formats that typically
-    /// require dividing some of the inputs by 2.
-    ///
-    /// Generally, A should be a signed integer type wider than B. This
-    /// ensures no overflow or underflow errors.
-    fn ndarray_to_xyxy_quant<A: PrimInt + 'static, B: AsPrimitive<A>>(
-        input: ArrayView1<B>,
-        zp: A,
-    ) -> [A; 4] {
-        Self::to_xyxy_quant(&[input[0], input[1], input[2], input[3]], zp)
-    }
+    /// Converts the bbox into XYXY float format.
+    fn to_xyxy_dequant<A: Float + 'static, B: AsPrimitive<A>>(
+        input: &[B; 4],
+        quant: Quantization,
+    ) -> [A; 4]
+    where
+        f32: AsPrimitive<A>,
+        i32: AsPrimitive<A>;
 
     #[inline(always)]
     /// Converts the bbox into XYXY float format.
@@ -54,31 +39,40 @@ pub trait BBoxTypeTrait {
     ) -> [A; 4] {
         Self::to_xyxy_float(&[input[0], input[1], input[2], input[3]])
     }
+
+    #[inline(always)]
+    /// Converts the bbox into XYXY float format.
+    fn ndarray_to_xyxy_dequant<A: Float + 'static, B: AsPrimitive<A>>(
+        input: ArrayView1<B>,
+        quant: Quantization,
+    ) -> [A; 4]
+    where
+        f32: AsPrimitive<A>,
+        i32: AsPrimitive<A>,
+    {
+        Self::to_xyxy_dequant(&[input[0], input[1], input[2], input[3]], quant)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct XYXY {}
 
 impl BBoxTypeTrait for XYXY {
-    fn to_xyxy_quant<A: PrimInt + 'static, B: AsPrimitive<A>>(input: &[B; 4], zp: A) -> [A; 4] {
-        input.map(|b| (b.as_() - zp) << 1)
-    }
-
     fn to_xyxy_float<A: Float + 'static, B: AsPrimitive<A>>(input: &[B; 4]) -> [A; 4] {
         input.map(|b| b.as_())
     }
 
-    #[inline(always)]
-    fn ndarray_to_xyxy_quant<A: PrimInt + 'static, B: AsPrimitive<A>>(
-        input: ArrayView1<B>,
-        zp: A,
-    ) -> [A; 4] {
-        [
-            (input[0].as_() - zp) << 1,
-            (input[1].as_() - zp) << 1,
-            (input[2].as_() - zp) << 1,
-            (input[3].as_() - zp) << 1,
-        ]
+    fn to_xyxy_dequant<A: Float + 'static, B: AsPrimitive<A>>(
+        input: &[B; 4],
+        quant: Quantization,
+    ) -> [A; 4]
+    where
+        f32: AsPrimitive<A>,
+        i32: AsPrimitive<A>,
+    {
+        let scale = quant.scale.as_();
+        let zp = quant.zero_point.as_();
+        input.map(|b| (b.as_() - zp) * scale)
     }
 
     #[inline(always)]
@@ -99,16 +93,6 @@ pub struct XYWH {}
 
 impl BBoxTypeTrait for XYWH {
     #[inline(always)]
-    fn to_xyxy_quant<A: PrimInt + 'static, B: AsPrimitive<A>>(input: &[B; 4], zp: A) -> [A; 4] {
-        [
-            ((input[0].as_() - zp) << 1) - (input[2].as_() - zp),
-            ((input[1].as_() - zp) << 1) - (input[3].as_() - zp),
-            ((input[0].as_() - zp) << 1) + (input[2].as_() - zp),
-            ((input[1].as_() - zp) << 1) + (input[3].as_() - zp),
-        ]
-    }
-
-    #[inline(always)]
     fn to_xyxy_float<A: Float + 'static, B: AsPrimitive<A>>(input: &[B; 4]) -> [A; 4] {
         let half = A::from(0.5).unwrap();
         [
@@ -120,16 +104,25 @@ impl BBoxTypeTrait for XYWH {
     }
 
     #[inline(always)]
-    fn ndarray_to_xyxy_quant<A: PrimInt + 'static, B: AsPrimitive<A>>(
-        input: ArrayView1<B>,
-        zp: A,
-    ) -> [A; 4] {
-        [
-            ((input[0].as_() - zp) << 1) - (input[2].as_() - zp),
-            ((input[1].as_() - zp) << 1) - (input[3].as_() - zp),
-            ((input[0].as_() - zp) << 1) + (input[2].as_() - zp),
-            ((input[1].as_() - zp) << 1) + (input[3].as_() - zp),
-        ]
+    fn to_xyxy_dequant<A: Float + 'static, B: AsPrimitive<A>>(
+        input: &[B; 4],
+        quant: Quantization,
+    ) -> [A; 4]
+    where
+        f32: AsPrimitive<A>,
+        i32: AsPrimitive<A>,
+    {
+        let scale = quant.scale.as_();
+        let half_scale = (quant.scale * 0.5).as_();
+        let zp = quant.zero_point.as_();
+        let [x, y, w, h] = [
+            (input[0].as_() - zp) * scale,
+            (input[1].as_() - zp) * scale,
+            (input[2].as_() - zp) * half_scale,
+            (input[3].as_() - zp) * half_scale,
+        ];
+
+        [x - w, y - h, x + w, y + h]
     }
 
     #[inline(always)]
@@ -301,10 +294,11 @@ pub struct Segmentation {
 /// data to prevent overflow or underflow
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DetectBoxQuantized<
-    BOX: Signed + PrimInt + AsPrimitive<f32>,
+    // BOX: Signed + PrimInt + AsPrimitive<f32>,
     SCORE: PrimInt + AsPrimitive<f32>,
 > {
-    pub bbox: BoundingBoxQuantized<BOX>,
+    // pub bbox: BoundingBoxQuantized<BOX>,
+    pub bbox: BoundingBox,
     /// model-specific score for this detection, higher implies more
     /// confidence.
     pub score: SCORE,
@@ -346,22 +340,13 @@ impl<T: Copy + Signed + Mul + Add + Sub + Ord + AsPrimitive<f32>> BoundingBoxQua
 /// Turns a DetectBoxQuantized into a DetectBox. The zero point is not used
 /// for quant_boxes as the DetectBoxQuantized is already be shifted to
 /// the zero points
-pub fn dequant_detect_box<
-    BOXES: Signed + PrimInt + AsPrimitive<f32>,
-    SCORE: PrimInt + AsPrimitive<f32>,
->(
-    detect: &DetectBoxQuantized<BOXES, SCORE>,
-    quant_boxes: Quantization,
+pub fn dequant_detect_box<SCORE: PrimInt + AsPrimitive<f32>>(
+    detect: &DetectBoxQuantized<SCORE>,
     quant_scores: Quantization,
 ) -> DetectBox {
     let scaled_zp = -quant_scores.scale * quant_scores.zero_point as f32;
     DetectBox {
-        bbox: BoundingBox {
-            xmin: quant_boxes.scale * detect.bbox.xmin.as_() * 0.5,
-            ymin: quant_boxes.scale * detect.bbox.ymin.as_() * 0.5,
-            xmax: quant_boxes.scale * detect.bbox.xmax.as_() * 0.5,
-            ymax: quant_boxes.scale * detect.bbox.ymax.as_() * 0.5,
-        },
+        bbox: detect.bbox,
         score: quant_scores.scale * detect.score.as_() + scaled_zp,
         label: detect.label,
     }

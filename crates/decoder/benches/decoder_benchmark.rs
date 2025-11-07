@@ -80,11 +80,11 @@ fn decoder_quant_nms(bencher: divan::Bencher) {
     bencher
         .with_inputs(|| boxes.clone())
         .bench_local_values(|boxes| {
-            let boxes = nms_int::<_, _, i64>(iou_threshold, boxes);
+            let boxes = nms_int(iou_threshold, boxes);
             let len = output_boxes.capacity().min(boxes.len());
             output_boxes.clear();
             for b in boxes.iter().take(len) {
-                output_boxes.push(dequant_detect_box(b, quant, quant));
+                output_boxes.push(dequant_detect_box(b, quant));
             }
         });
 }
