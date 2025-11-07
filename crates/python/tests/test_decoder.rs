@@ -1,3 +1,5 @@
+#![cfg(not(feature = "extension-module"))]
+
 use edgefirst::decoder::{Quantization, dequantize_cpu};
 use edgefirst_hal::edgefirst_hal;
 
@@ -8,14 +10,22 @@ use pyo3::{
     types::{IntoPyDict, PyAnyMethods, PyDict, PyList},
 };
 
+fn change_dir() -> Result<(), std::io::Error> {
+    let manifest_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../");
+    std::env::set_current_dir(manifest_dir)
+}
+
 #[test]
 fn test_yolo_det() -> PyResult<()> {
     pyo3::append_to_inittab!(edgefirst_hal);
     pyo3::prepare_freethreaded_python();
+
+    change_dir()?;
+
     Python::with_gil(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
         py.run(
-            c_str!(include_str!("decoder/yolo_det.py")),
+            c_str!(include_str!("../../../tests/decoder/test_yolo_det.py")),
             None,
             Some(&out),
         )?;
@@ -71,10 +81,13 @@ fn test_yolo_det() -> PyResult<()> {
 fn test_decoder_parse_config_modelpack_split_u8() -> PyResult<()> {
     pyo3::append_to_inittab!(edgefirst_hal);
     pyo3::prepare_freethreaded_python();
+    change_dir()?;
     Python::with_gil(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
         py.run(
-            c_str!(include_str!("decoder/modelpack_config.py")),
+            c_str!(include_str!(
+                "../../../tests/decoder/test_modelpack_config.py"
+            )),
             None,
             Some(&out),
         )?;
@@ -132,10 +145,11 @@ fn test_decoder_parse_config_modelpack_split_u8() -> PyResult<()> {
 fn test_decoder_parse_config_from_dict() -> PyResult<()> {
     pyo3::append_to_inittab!(edgefirst_hal);
     pyo3::prepare_freethreaded_python();
+    change_dir()?;
     Python::with_gil(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
         py.run(
-            c_str!(include_str!("decoder/from_dict.py")),
+            c_str!(include_str!("../../../tests/decoder/test_from_dict.py")),
             None,
             Some(&out),
         )?;
@@ -193,10 +207,13 @@ fn test_decoder_parse_config_from_dict() -> PyResult<()> {
 fn test_modelpack_split_u8() -> PyResult<()> {
     pyo3::append_to_inittab!(edgefirst_hal);
     pyo3::prepare_freethreaded_python();
+    change_dir()?;
     Python::with_gil(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
         py.run(
-            c_str!(include_str!("decoder/modelpack_split.py")),
+            c_str!(include_str!(
+                "../../../tests/decoder/test_modelpack_split.py"
+            )),
             None,
             Some(&out),
         )?;
@@ -250,10 +267,11 @@ fn test_modelpack_split_u8() -> PyResult<()> {
 fn test_filter_int32() -> PyResult<()> {
     pyo3::append_to_inittab!(edgefirst_hal);
     pyo3::prepare_freethreaded_python();
+    change_dir()?;
     Python::with_gil(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
         py.run(
-            c_str!(include_str!("decoder/filter_int32.py")),
+            c_str!(include_str!("../../../tests/decoder/test_filter_int32.py")),
             None,
             Some(&out),
         )?;
@@ -311,10 +329,11 @@ fn test_filter_int32() -> PyResult<()> {
 fn test_dequantize() -> PyResult<()> {
     pyo3::append_to_inittab!(edgefirst_hal);
     pyo3::prepare_freethreaded_python();
+    change_dir()?;
     Python::with_gil(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
         py.run(
-            c_str!(include_str!("decoder/dequantize.py")),
+            c_str!(include_str!("../../../tests/decoder/test_dequantize.py")),
             None,
             Some(&out),
         )?;
@@ -351,9 +370,14 @@ fn test_dequantize() -> PyResult<()> {
 fn test_nms_against_tensorflow() -> PyResult<()> {
     pyo3::append_to_inittab!(edgefirst_hal);
     pyo3::prepare_freethreaded_python();
+    change_dir()?;
     Python::with_gil(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
-        py.run(c_str!(include_str!("decoder/nms.py")), None, Some(&out))?;
+        py.run(
+            c_str!(include_str!("../../../tests/decoder/test_nms.py")),
+            None,
+            Some(&out),
+        )?;
 
         Ok(())
     })
