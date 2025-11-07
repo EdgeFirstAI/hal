@@ -1,3 +1,5 @@
+#![cfg(not(feature = "extension-module"))]
+
 use edgefirst_hal::edgefirst_hal as edgefirst_hal_module;
 use numpy::{PyArray3, PyUntypedArrayMethods};
 use pyo3::{
@@ -6,14 +8,20 @@ use pyo3::{
     types::{PyAnyMethods, PyDict},
 };
 
+fn change_dir() -> Result<(), std::io::Error> {
+    let manifest_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../");
+    std::env::set_current_dir(manifest_dir)
+}
+
 #[test]
 fn test_rgba_to_rgb() -> PyResult<()> {
     pyo3::append_to_inittab!(edgefirst_hal_module);
     pyo3::prepare_freethreaded_python();
+    change_dir()?;
     Python::with_gil(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
         py.run(
-            c_str!(include_str!("image/rgba_to_rgb.py")),
+            c_str!(include_str!("../../../tests/image/test_rgba_to_rgb.py")),
             None,
             Some(&out),
         )?;
@@ -36,10 +44,11 @@ fn test_rgba_to_rgb() -> PyResult<()> {
 fn test_rgb_resize() -> PyResult<()> {
     pyo3::append_to_inittab!(edgefirst_hal_module);
     pyo3::prepare_freethreaded_python();
+    change_dir()?;
     Python::with_gil(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
         py.run(
-            c_str!(include_str!("image/rgb_resize.py")),
+            c_str!(include_str!("../../../tests/image/test_rgb_resize.py")),
             None,
             Some(&out),
         )?;
@@ -64,9 +73,14 @@ fn test_rgb_resize() -> PyResult<()> {
 fn test_flip() -> PyResult<()> {
     pyo3::append_to_inittab!(edgefirst_hal_module);
     pyo3::prepare_freethreaded_python();
+    change_dir()?;
     Python::with_gil(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
-        py.run(c_str!(include_str!("image/flip.py")), None, Some(&out))?;
+        py.run(
+            c_str!(include_str!("../../../tests/image/test_flip.py")),
+            None,
+            Some(&out),
+        )?;
         let src = out
             .get_item("src")
             .unwrap()
@@ -84,9 +98,14 @@ fn test_flip() -> PyResult<()> {
 fn test_grey_load() -> PyResult<()> {
     pyo3::append_to_inittab!(edgefirst_hal_module);
     pyo3::prepare_freethreaded_python();
+    change_dir()?;
     Python::with_gil(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
-        py.run(c_str!(include_str!("image/grey_load.py")), None, Some(&out))?;
+        py.run(
+            c_str!(include_str!("../../../tests/image/test_grey_load.py")),
+            None,
+            Some(&out),
+        )?;
         let rgba = out
             .get_item("rgba")
             .unwrap()
@@ -113,9 +132,14 @@ fn test_grey_load() -> PyResult<()> {
 fn test_normalize() -> PyResult<()> {
     pyo3::append_to_inittab!(edgefirst_hal_module);
     pyo3::prepare_freethreaded_python();
+    change_dir()?;
     Python::with_gil(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
-        py.run(c_str!(include_str!("image/normalize.py")), None, Some(&out))?;
+        py.run(
+            c_str!(include_str!("../../../tests/image/test_normalize.py")),
+            None,
+            Some(&out),
+        )?;
         let unique_vals: Vec<i8> = out.get_item("unique_vals").unwrap().extract()?;
         assert_eq!(unique_vals, (-128..=127).collect::<Vec<i8>>());
 
