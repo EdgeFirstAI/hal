@@ -552,6 +552,8 @@ pub enum ArrayViewDQuantized<'a> {
     Int8(ArrayViewD<'a, i8>),
     UInt16(ArrayViewD<'a, u16>),
     Int16(ArrayViewD<'a, i16>),
+    UInt32(ArrayViewD<'a, u32>),
+    Int32(ArrayViewD<'a, i32>),
 }
 
 impl<'a> From<ArrayViewD<'a, u8>> for ArrayViewDQuantized<'a> {
@@ -585,6 +587,8 @@ impl<'a> ArrayViewDQuantized<'a> {
             ArrayViewDQuantized::Int8(a) => a.shape(),
             ArrayViewDQuantized::UInt16(a) => a.shape(),
             ArrayViewDQuantized::Int16(a) => a.shape(),
+            ArrayViewDQuantized::UInt32(a) => a.shape(),
+            ArrayViewDQuantized::Int32(a) => a.shape(),
         }
     }
 }
@@ -605,6 +609,14 @@ macro_rules! with_quantized {
                 $body
             }
             ArrayViewDQuantized::Int16(x) => {
+                let $var = x;
+                $body
+            }
+            ArrayViewDQuantized::UInt32(x) => {
+                let $var = x;
+                $body
+            }
+            ArrayViewDQuantized::Int32(x) => {
                 let $var = x;
                 $body
             }
@@ -883,6 +895,14 @@ impl Decoder {
             Int16(s) => {
                 let seg = modelpack_seg!(s);
                 seg.mapv(|x| ((x as i32 + 32768) >> 8) as u8)
+            }
+            UInt32(s) => {
+                let seg = modelpack_seg!(s);
+                seg.mapv(|x| (x >> 24) as u8)
+            }
+            Int32(s) => {
+                let seg = modelpack_seg!(s);
+                seg.mapv(|x| ((x as i64 + 2147483648) >> 24) as u8)
             }
         };
 
