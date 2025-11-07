@@ -472,7 +472,7 @@ fn arg_max<T: PartialOrd + Copy>(score: ArrayView1<T>) -> (T, usize) {
         })
 }
 #[cfg(test)]
-mod tests {
+mod decoder_tests {
     use ndarray::s;
     use ndarray_stats::DeviationExt;
 

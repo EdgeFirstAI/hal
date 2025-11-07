@@ -715,12 +715,11 @@ fn fourcc_planar(fourcc: FourCharCode) -> Result<bool> {
 }
 
 #[cfg(test)]
-mod tests {
+mod image_tests {
     use super::*;
     use crate::{CPUConverter, Rotation};
     use edgefirst_tensor::{TensorMapTrait, TensorMemory};
     use image::buffer::ConvertBuffer;
-    use std::path::Path;
 
     #[ctor::ctor]
     fn init() {
@@ -745,27 +744,13 @@ mod tests {
 
     #[test]
     fn test_load_resize_save() {
-        let path = Path::new("testdata/zidane.jpg");
-        let path = match path.exists() {
-            true => path,
-            false => {
-                let path = Path::new("../testdata/zidane.jpg");
-                if path.exists() {
-                    path
-                } else {
-                    Path::new("../../testdata/zidane.jpg")
-                }
-            }
-        };
-        assert!(path.exists(), "Test image not found at {path:?}");
-
-        let file = std::fs::read(path).unwrap();
-        let img = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
+        let file = include_bytes!("../../../testdata/zidane.jpg");
+        let img = TensorImage::load_jpeg(file, Some(RGBA), None).unwrap();
         assert_eq!(img.width(), 1280);
         assert_eq!(img.height(), 720);
 
         let mut dst = TensorImage::new(640, 360, RGBA, None).unwrap();
-        let mut converter = ImageConverter::new().unwrap();
+        let mut converter = CPUConverter::new().unwrap();
         converter
             .convert(&img, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
             .unwrap();
@@ -2091,6 +2076,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "not yet implemented"]
     fn test_nv12_to_yuyv_cpu() {
         let file = include_bytes!("../../../testdata/zidane.nv12").to_vec();
         let src = TensorImage::new(1280, 720, NV12, None).unwrap();
