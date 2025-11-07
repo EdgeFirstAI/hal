@@ -35,10 +35,10 @@ where
         let size = shape.iter().product::<usize>() * std::mem::size_of::<T>();
         let name = match name {
             Some(name) => name.to_owned(),
-            None => format!(
-                "/{}",
-                random_string::generate(16, random_string::charsets::ALPHANUMERIC)
-            ),
+            None => {
+                let uuid = uuid::Uuid::new_v4().as_simple().to_string();
+                format!("/{}", &uuid[..16])
+            },
         };
 
         let shm_fd = nix::sys::mman::shm_open(
