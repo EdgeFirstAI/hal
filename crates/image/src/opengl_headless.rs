@@ -418,7 +418,7 @@ impl Card {
     }
 
     pub fn open_global() -> Result<Self, crate::Error> {
-        let targets = ["/dev/dri/card0", "/dev/dri/card1", "/dev/dri/render128"];
+        let targets = ["/dev/dri/render128", "/dev/dri/card0", "/dev/dri/card1"];
         let e = Self::open(targets[0]);
         if let Ok(t) = e {
             return Ok(t);
@@ -524,14 +524,14 @@ impl ImageConverterTrait for GLConverterThreaded {
         crop: Crop,
     ) -> crate::Result<()> {
         crop.check_crop(src, dst)?;
-        if !GLConverterST::check_format_supported(self.support_dma, src) {
+        if !GLConverterST::check_src_format_supported(self.support_dma, src) {
             return Err(crate::Error::NotSupported(format!(
                 "Opengl doesn't support {} source texture",
                 src.fourcc().display()
             )));
         }
 
-        if !GLConverterST::check_format_supported(self.support_dma, dst) {
+        if !GLConverterST::check_dst_format_supported(self.support_dma, dst) {
             return Err(crate::Error::NotSupported(format!(
                 "Opengl doesn't support {} destination texture",
                 dst.fourcc().display()
@@ -566,7 +566,8 @@ impl Drop for GLConverterThreaded {
     }
 }
 pub struct GLConverterST {
-    camera_texture: Texture,
+    camera_eglimage_texture: Texture,
+    camera_normal_texture: Texture,
     render_texture: Texture,
     vertex_buffer: Buffer,
     texture_buffer: Buffer,
@@ -586,14 +587,14 @@ impl ImageConverterTrait for GLConverterST {
         crop: Crop,
     ) -> crate::Result<()> {
         crop.check_crop(src, dst)?;
-        if !Self::check_format_supported(self.gl_context.support_dma, src) {
+        if !Self::check_src_format_supported(self.gl_context.support_dma, src) {
             return Err(crate::Error::NotSupported(format!(
                 "Opengl doesn't support {} source texture",
                 src.fourcc().display()
             )));
         }
 
-        if !Self::check_format_supported(self.gl_context.support_dma, dst) {
+        if !Self::check_dst_format_supported(self.gl_context.support_dma, dst) {
             return Err(crate::Error::NotSupported(format!(
                 "Opengl doesn't support {} destination texture",
                 dst.fourcc().display()
@@ -648,7 +649,8 @@ impl GLConverterST {
             generate_vertex_shader(),
             generate_texture_fragment_shader_yuv(),
         )?;
-        let camera_texture = Texture::new();
+        let camera_eglimage_texture = Texture::new();
+        let camera_normal_texture = Texture::new();
         let render_texture = Texture::new();
         let vertex_buffer = Buffer::new(0, 3, 100);
         let texture_buffer = Buffer::new(1, 2, 100);
@@ -657,7 +659,8 @@ impl GLConverterST {
             texture_program,
             texture_program_yuv,
             texture_program_planar,
-            camera_texture,
+            camera_eglimage_texture,
+            camera_normal_texture,
             vertex_buffer,
             texture_buffer,
             render_texture,
@@ -668,17 +671,31 @@ impl GLConverterST {
         Ok(converter)
     }
 
-    fn check_format_supported(support_dma: bool, img: &TensorImage) -> bool {
+    fn check_src_format_supported(support_dma: bool, img: &TensorImage) -> bool {
         if support_dma && img.tensor().memory() == TensorMemory::Dma {
-            // we don't know what specifically the system supports so we can't
-            // check here
-            true
+            // generally EGLImage doesn't support RGB
+            matches!(img.fourcc(), RGBA | GREY | YUYV)
+        } else {
+            matches!(img.fourcc(), RGB | RGBA | GREY)
+        }
+    }
+
+    fn check_dst_format_supported(support_dma: bool, img: &TensorImage) -> bool {
+        if support_dma && img.tensor().memory() == TensorMemory::Dma {
+            // generally EGLImage doesn't support RGB
+            matches!(img.fourcc(), RGBA | GREY | PLANAR_RGB)
         } else {
             matches!(img.fourcc(), RGB | RGBA | GREY)
         }
     }
 
     fn gl_check_support() -> Result<(), crate::Error> {
+        if let Ok(version) = gls::get_string(gls::gl::SHADING_LANGUAGE_VERSION) {
+            log::debug!("GL Shading Language Version: {version:?}");
+        } else {
+            log::warn!("Could not get GL Shading Language Version");
+        }
+
         let extensions = unsafe {
             let str = gls::gl::GetString(gls::gl::EXTENSIONS);
             if str.is_null() {
@@ -691,7 +708,10 @@ impl GLConverterST {
                 .to_string()
         };
         log::debug!("GL Extensions: {extensions}");
-        let required_ext = ["GL_OES_EGL_image_external", "GL_OES_surfaceless_context"];
+        let required_ext = [
+            "GL_OES_EGL_image_external_essl3",
+            "GL_OES_surfaceless_context",
+        ];
         let extensions = extensions.split_ascii_whitespace().collect::<BTreeSet<_>>();
         for required in required_ext {
             if !extensions.contains(required) {
@@ -700,6 +720,7 @@ impl GLConverterST {
                 )));
             }
         }
+
         Ok(())
     }
 
@@ -724,9 +745,9 @@ impl GLConverterST {
         };
         let dest_img = self.create_image_from_dma2(dst)?;
         unsafe {
-            gls::gl::UseProgram(self.texture_program.id);
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
+            gls::gl::UseProgram(self.texture_program_yuv.id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
             gls::gl::TexParameteri(
                 gls::gl::TEXTURE_2D,
                 gls::gl::TEXTURE_MIN_FILTER,
@@ -943,7 +964,6 @@ impl GLConverterST {
             crate::Rotation::Rotate180 => 2,
             crate::Rotation::CounterClockwise90 => 3,
         };
-
         if self.gl_context.support_dma
             && let Ok(new_egl_image) = self.create_image_from_dma2(src)
         {
@@ -1062,7 +1082,6 @@ impl GLConverterST {
         let new_egl_image = self.create_image_from_dma2(src)?;
 
         self.draw_camera_texture_to_rgb_planar(
-            &self.camera_texture,
             &new_egl_image,
             src_roi,
             dst_roi,
@@ -1077,14 +1096,13 @@ impl GLConverterST {
     #[allow(clippy::too_many_arguments)]
     fn draw_camera_texture_to_rgb_planar(
         &self,
-        texture: &Texture,
         egl_img: &EglImage,
         src_roi: RegionOfInterest,
         mut dst_roi: RegionOfInterest,
         rotation_offset: usize,
         flip: Flip,
     ) -> Result<(), Error> {
-        let texture_target = gls::gl::TEXTURE_2D;
+        let texture_target = gls::gl::TEXTURE_EXTERNAL_OES;
         match flip {
             Flip::None => {}
             Flip::Vertical => {
@@ -1097,7 +1115,7 @@ impl GLConverterST {
         unsafe {
             // self.texture_program.load_uniform_1f(c"width", width as f32);
             gls::gl::UseProgram(self.texture_program_planar.id);
-            gls::gl::BindTexture(texture_target, texture.id);
+            gls::gl::BindTexture(texture_target, self.camera_eglimage_texture.id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
             gls::gl::TexParameteri(
                 texture_target,
@@ -1120,22 +1138,6 @@ impl GLConverterST {
                 gls::gl::TEXTURE_WRAP_T,
                 gls::gl::CLAMP_TO_EDGE as i32,
             );
-
-            // TODO: This segfaults on exit despite the EVK supposedly supporting the
-            // GL_EXT_texture_border_clamp extension. Adjust shader to handle it instead?
-
-            //  gls::gl::TexParameteri(
-            //     texture_target,
-            //     gls::gl::TEXTURE_WRAP_S,
-            //     gls::gl::CLAMP_TO_BORDER as i32,
-            // );
-
-            // gls::gl::TexParameteri(
-            //     texture_target,
-            //     gls::gl::TEXTURE_WRAP_T,
-            //     gls::gl::CLAMP_TO_BORDER as i32,
-            // );
-            check_gl_error(function!(), line!())?;
 
             gls::egl_image_target_texture_2d_oes(texture_target, egl_img.egl_image.as_ptr());
             check_gl_error(function!(), line!())?;
@@ -1198,7 +1200,7 @@ impl GLConverterST {
                 //     .load_uniform_1i(c"color_index", 2 - i as i32);
 
                 gls::gl::TexParameteri(
-                    gls::gl::TEXTURE_2D,
+                    texture_target,
                     gls::gl::TEXTURE_SWIZZLE_R,
                     swizzles[i] as i32,
                 );
@@ -1209,8 +1211,8 @@ impl GLConverterST {
                     gls::gl::UNSIGNED_INT,
                     vertices_index.as_ptr() as *const c_void,
                 );
-                check_gl_error(function!(), line!())?;
             }
+            check_gl_error(function!(), line!())?;
         }
         Ok(())
     }
@@ -1232,7 +1234,7 @@ impl GLConverterST {
         };
         unsafe {
             gls::gl::UseProgram(self.texture_program.id);
-            gls::gl::BindTexture(texture_target, self.camera_texture.id);
+            gls::gl::BindTexture(texture_target, self.camera_normal_texture.id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
             gls::gl::TexParameteri(
                 texture_target,
@@ -1261,8 +1263,7 @@ impl GLConverterST {
                     gls::gl::TexParameteri(gls::gl::TEXTURE_2D, swizzle, src as i32);
                 }
             }
-
-            self.camera_texture.update_texture(
+            self.camera_normal_texture.update_texture(
                 texture_target,
                 src.width(),
                 src.height(),
@@ -1303,10 +1304,8 @@ impl GLConverterST {
                 camera_vertices.as_ptr() as *const c_void,
                 gls::gl::DYNAMIC_DRAW,
             );
-
             gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
             gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
-
             let texture_vertices: [f32; 16] = [
                 src_roi.left,
                 src_roi.top,
@@ -1332,7 +1331,6 @@ impl GLConverterST {
                 (texture_vertices[(rotation_offset * 2)..]).as_ptr() as *const c_void,
                 gls::gl::DYNAMIC_DRAW,
             );
-
             let vertices_index: [u32; 4] = [0, 1, 2, 3];
             gls::gl::DrawElements(
                 gls::gl::TRIANGLE_FAN,
@@ -1340,6 +1338,7 @@ impl GLConverterST {
                 gls::gl::UNSIGNED_INT,
                 vertices_index.as_ptr() as *const c_void,
             );
+            check_gl_error(function!(), line!())?;
 
             Ok(())
         }
@@ -1354,11 +1353,11 @@ impl GLConverterST {
         rotation_offset: usize,
         flip: Flip,
     ) -> Result<(), Error> {
-        let texture_target = gls::gl::TEXTURE_2D;
-        // let texture_target = gls::gl::TEXTURE_EXTERNAL_OES;
+        // let texture_target = gls::gl::TEXTURE_2D;
+        let texture_target = gls::gl::TEXTURE_EXTERNAL_OES;
         unsafe {
-            gls::gl::UseProgram(self.texture_program.id);
-            gls::gl::BindTexture(texture_target, self.camera_texture.id);
+            gls::gl::UseProgram(self.texture_program_yuv.id);
+            gls::gl::BindTexture(texture_target, self.camera_eglimage_texture.id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
             gls::gl::TexParameteri(
                 texture_target,
@@ -1954,7 +1953,7 @@ void main(){
 pub fn generate_texture_fragment_shader_yuv() -> &'static str {
     "\
 #version 300 es
-#extension GL_OES_EGL_image_external : require
+#extension GL_OES_EGL_image_external_essl3 : require
 precision mediump float;
 uniform samplerExternalOES tex;
 in vec3 fragPos;
@@ -1963,7 +1962,7 @@ in vec2 tc;
 out vec4 color;
 
 void main(){
-    color = texture2D(tex, tc);
+    color = texture(tex, tc);
 }
 "
 }
@@ -1971,17 +1970,16 @@ void main(){
 pub fn generate_planar_rgb_shader() -> &'static str {
     "\
 #version 300 es
-// #extension GL_OES_EGL_image_external : require
-
+#extension GL_OES_EGL_image_external_essl3 : require
 precision mediump float;
-uniform sampler2D tex;
+uniform samplerExternalOES tex;
 in vec3 fragPos;
 in vec2 tc;
 
 out vec4 color;
 
 void main(){
-    color.r = texture(tex, tc).r;
+    color = texture(tex, tc);
 }
 "
 }

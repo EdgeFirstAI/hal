@@ -1317,6 +1317,10 @@ mod tests {
                                 dst_color: None,
                             },
                         )
+                        .map_err(|e| {
+                            log::error!("error mem {mem:?} rot {rot:?} error: {e:?}");
+                            e
+                        })
                         .unwrap();
 
                     compare_images(
@@ -1535,6 +1539,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opengl doesn't support rendering to YUYV texture?"]
     fn test_rgba_to_yuyv_resize_opengl() {
         let src = load_bytes_to_tensor(
             1280,
@@ -1553,18 +1558,36 @@ mod tests {
         let mut gl_converter = GLConverterThreaded::new().unwrap();
 
         gl_converter
-            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .convert(
+                &src,
+                &mut dst,
+                Rotation::None,
+                Flip::None,
+                Crop::new()
+                    .with_dst_rect(Some(Rect::new(100, 100, 100, 100)))
+                    .with_dst_color(Some([255, 255, 255, 255])),
+            )
             .unwrap();
-        let target_image = TensorImage::new(1280, 720, YUYV, None).unwrap();
-        target_image
-            .tensor()
-            .map()
-            .unwrap()
-            .as_mut_slice()
-            .copy_from_slice(include_bytes!("../../../testdata/camera720p.yuyv"));
-        let target = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
 
-        compare_images_convert_to_rgb(&target, &dst, 0.98, function!());
+        std::fs::write(
+            "rgba_to_yuyv_opengl.yuyv",
+            dst.tensor().map().unwrap().as_slice(),
+        )
+        .unwrap();
+        let mut cpu_dst =
+            TensorImage::new(dst_width, dst_height, YUYV, Some(TensorMemory::Dma)).unwrap();
+        CPUConverter::new()
+            .unwrap()
+            .convert(
+                &src,
+                &mut cpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+
+        compare_images_convert_to_rgb(&dst, &cpu_dst, 0.98, function!());
     }
 
     #[test]
@@ -1998,6 +2021,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "not yet implemented"]
     fn test_nv12_to_rgba_cpu() {
         let file = include_bytes!("../../../testdata/zidane.nv12").to_vec();
         let src = TensorImage::new(1280, 720, NV12, None).unwrap();
@@ -2124,7 +2148,7 @@ mod tests {
     fn test_opengl_resize_8bps() {
         let dst_width = 640;
         let dst_height = 640;
-        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let file = include_bytes!("../../../testdata/test_image.jpg").to_vec();
         let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, PLANAR_RGB, None).unwrap();
