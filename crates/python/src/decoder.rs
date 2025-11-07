@@ -94,7 +94,7 @@ pub enum ReadOnlyArrayGeneric3<'py> {
     Float64(PyArrayLike3<'py, f64>),
 }
 
-// #[derive(FromPyObject)]
+// #[derive(FromPy<PyAny>)]
 pub enum ReadOnlyArrayGenericQuantized<'a> {
     UInt8(PyReadonlyArrayDyn<'a, u8>),
     Int8(PyReadonlyArrayDyn<'a, i8>),

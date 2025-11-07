@@ -1,4 +1,4 @@
-#![cfg(not(feature = "extension-module"))]
+// #![cfg(not(feature = "extension-module"))]
 
 use edgefirst::decoder::{Quantization, dequantize_cpu};
 use edgefirst_hal::edgefirst_hal;
@@ -18,11 +18,11 @@ fn change_dir() -> Result<(), std::io::Error> {
 #[test]
 fn test_yolo_det() -> PyResult<()> {
     pyo3::append_to_inittab!(edgefirst_hal);
-    pyo3::prepare_freethreaded_python();
+    Python::initialize();
 
     change_dir()?;
 
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
         py.run(
             c_str!(include_str!("../../../tests/decoder/test_yolo_det.py")),
@@ -80,9 +80,9 @@ fn test_yolo_det() -> PyResult<()> {
 #[test]
 fn test_decoder_parse_config_modelpack_split_u8() -> PyResult<()> {
     pyo3::append_to_inittab!(edgefirst_hal);
-    pyo3::prepare_freethreaded_python();
+    Python::initialize();
     change_dir()?;
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
         py.run(
             c_str!(include_str!(
@@ -144,9 +144,9 @@ fn test_decoder_parse_config_modelpack_split_u8() -> PyResult<()> {
 #[test]
 fn test_decoder_parse_config_from_dict() -> PyResult<()> {
     pyo3::append_to_inittab!(edgefirst_hal);
-    pyo3::prepare_freethreaded_python();
+    Python::initialize();
     change_dir()?;
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
         py.run(
             c_str!(include_str!("../../../tests/decoder/test_from_dict.py")),
@@ -206,9 +206,9 @@ fn test_decoder_parse_config_from_dict() -> PyResult<()> {
 #[test]
 fn test_modelpack_split_u8() -> PyResult<()> {
     pyo3::append_to_inittab!(edgefirst_hal);
-    pyo3::prepare_freethreaded_python();
+    Python::initialize();
     change_dir()?;
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
         py.run(
             c_str!(include_str!(
@@ -266,9 +266,9 @@ fn test_modelpack_split_u8() -> PyResult<()> {
 #[test]
 fn test_filter_int32() -> PyResult<()> {
     pyo3::append_to_inittab!(edgefirst_hal);
-    pyo3::prepare_freethreaded_python();
+    Python::initialize();
     change_dir()?;
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
         py.run(
             c_str!(include_str!("../../../tests/decoder/test_filter_int32.py")),
@@ -328,9 +328,9 @@ fn test_filter_int32() -> PyResult<()> {
 #[test]
 fn test_dequantize() -> PyResult<()> {
     pyo3::append_to_inittab!(edgefirst_hal);
-    pyo3::prepare_freethreaded_python();
+    Python::initialize();
     change_dir()?;
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
         py.run(
             c_str!(include_str!("../../../tests/decoder/test_dequantize.py")),
@@ -369,9 +369,9 @@ fn test_dequantize() -> PyResult<()> {
 #[test]
 fn test_nms_against_tensorflow() -> PyResult<()> {
     pyo3::append_to_inittab!(edgefirst_hal);
-    pyo3::prepare_freethreaded_python();
+    Python::initialize();
     change_dir()?;
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
         py.run(
             c_str!(include_str!("../../../tests/decoder/test_nms.py")),
@@ -385,8 +385,8 @@ fn test_nms_against_tensorflow() -> PyResult<()> {
 
 #[test]
 fn test_import_numpy() -> PyResult<()> {
-    pyo3::prepare_freethreaded_python();
-    Python::with_gil(|py| {
+    Python::initialize();
+    Python::attach(|py| {
         let np = py.import("numpy")?;
         let locals = [("np", np)].into_py_dict(py)?;
 

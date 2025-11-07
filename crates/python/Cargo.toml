@@ -22,15 +22,15 @@ extension-module = ["pyo3/extension-module"]
 edgefirst = { version = "*", path = "../edgefirst" }
 env_logger = { workspace = true }
 four-char-code = { workspace = true }
-numpy = { version = "0.25.0", features = ["half"] }
-pyo3 = { version = "0.25.1" }
+numpy = { version = "0.26.0", features = ["half"] }
+pyo3 = { version = "0.26.0" }
 ndarray = { workspace = true }
-pythonize = "0.25.0"
+pythonize = "0.26.0"
 half = "2.7.1"
 log = { workspace = true }
 
 [build-dependencies]
-pyo3-build-config = { version = "0.25.1", features = ["resolve-config"] }
+pyo3-build-config = { version = "0.26.0", features = ["resolve-config"] }
 rustc_version = "0.4"
 
 [dev-dependencies]

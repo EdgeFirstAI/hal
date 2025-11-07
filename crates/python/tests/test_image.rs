@@ -1,4 +1,4 @@
-#![cfg(not(feature = "extension-module"))]
+// #![cfg(not(feature = "extension-module"))]
 
 use edgefirst_hal::edgefirst_hal as edgefirst_hal_module;
 use numpy::{PyArray3, PyUntypedArrayMethods};
@@ -16,9 +16,9 @@ fn change_dir() -> Result<(), std::io::Error> {
 #[test]
 fn test_rgba_to_rgb() -> PyResult<()> {
     pyo3::append_to_inittab!(edgefirst_hal_module);
-    pyo3::prepare_freethreaded_python();
+    Python::initialize();
     change_dir()?;
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
         py.run(
             c_str!(include_str!("../../../tests/image/test_rgba_to_rgb.py")),
@@ -43,9 +43,9 @@ fn test_rgba_to_rgb() -> PyResult<()> {
 #[test]
 fn test_rgb_resize() -> PyResult<()> {
     pyo3::append_to_inittab!(edgefirst_hal_module);
-    pyo3::prepare_freethreaded_python();
+    Python::initialize();
     change_dir()?;
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
         py.run(
             c_str!(include_str!("../../../tests/image/test_rgb_resize.py")),
@@ -72,9 +72,9 @@ fn test_rgb_resize() -> PyResult<()> {
 #[test]
 fn test_flip() -> PyResult<()> {
     pyo3::append_to_inittab!(edgefirst_hal_module);
-    pyo3::prepare_freethreaded_python();
+    Python::initialize();
     change_dir()?;
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
         py.run(
             c_str!(include_str!("../../../tests/image/test_flip.py")),
@@ -97,9 +97,9 @@ fn test_flip() -> PyResult<()> {
 #[test]
 fn test_grey_load() -> PyResult<()> {
     pyo3::append_to_inittab!(edgefirst_hal_module);
-    pyo3::prepare_freethreaded_python();
+    Python::initialize();
     change_dir()?;
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
         py.run(
             c_str!(include_str!("../../../tests/image/test_grey_load.py")),
@@ -131,9 +131,9 @@ fn test_grey_load() -> PyResult<()> {
 #[test]
 fn test_normalize() -> PyResult<()> {
     pyo3::append_to_inittab!(edgefirst_hal_module);
-    pyo3::prepare_freethreaded_python();
+    Python::initialize();
     change_dir()?;
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let out: pyo3::Bound<'_, PyDict> = PyDict::new(py);
         py.run(
             c_str!(include_str!("../../../tests/image/test_normalize.py")),

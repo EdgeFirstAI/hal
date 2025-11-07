@@ -419,7 +419,7 @@ impl PyTensorMap {
         }
     }
 
-    fn __getitem__(&self, index: usize, py: Python) -> PyResult<PyObject> {
+    fn __getitem__(&self, index: usize, py: Python) -> PyResult<Py<PyAny>> {
         if let Some(map) = &self.mapped {
             match map {
                 TensorMapT::TensorU8(m) => {
@@ -498,7 +498,7 @@ impl PyTensorMap {
         }
     }
 
-    fn __setitem__(&mut self, index: usize, value: PyObject, py: Python) -> PyResult<()> {
+    fn __setitem__(&mut self, index: usize, value: Py<PyAny>, py: Python) -> PyResult<()> {
         if let Some(map) = &mut self.mapped {
             match map {
                 TensorMapT::TensorU8(m) => {
@@ -669,11 +669,11 @@ impl PyTensorMap {
         Ok(slf)
     }
 
-    fn __exit__(&mut self, _exc_type: PyObject, _exc_value: PyObject, _traceback: PyObject) {
+    fn __exit__(&mut self, _exc_type: Py<PyAny>, _exc_value: Py<PyAny>, _traceback: Py<PyAny>) {
         self.mapped = None; // Release the mapped buffer
     }
 
-    fn view(&mut self, py: Python<'_>) -> PyResult<PyObject> {
+    fn view(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         if self.mapped.is_none() {
             return Err(PyBufferError::new_err("Buffer not mapped"));
         }
@@ -702,6 +702,6 @@ impl PyTensorMap {
             )
         };
 
-        unsafe { PyObject::from_owned_ptr_or_err(py, mem) }
+        unsafe { Py::<PyAny>::from_owned_ptr_or_err(py, mem) }
     }
 }
