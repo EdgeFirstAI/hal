@@ -27,7 +27,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 //     pub arr: PyReadonlyArrayDyn<'py, half::f16>,
 // }
 
-// impl<'py> FromPyObject<'py> for PyArrayF16_<'py> {
+// impl<'py> FromPy<PyAny><'py> for PyArrayF16_<'py> {
 //     fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
 //         if let Ok(array) = ob.downcast::<PyArrayDyn<half::f16>>() {
 //             return Ok(Self {
