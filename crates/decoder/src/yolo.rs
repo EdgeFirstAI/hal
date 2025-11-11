@@ -27,7 +27,7 @@ pub fn decode_yolo_det<BOX: PrimInt + AsPrimitive<f32> + Send + Sync>(
     impl_yolo_8bit::<XYWH, _>(output, score_threshold, iou_threshold, output_boxes);
 }
 
-pub fn decode_yolo_f32(
+pub fn decode_yolo_det_f32(
     output: ArrayView2<f32>,
     score_threshold: f32,
     iou_threshold: f32,
@@ -36,7 +36,7 @@ pub fn decode_yolo_f32(
     impl_yolo_float::<XYWH, _>(output, score_threshold, iou_threshold, output_boxes);
 }
 
-pub fn decode_yolo_f64(
+pub fn decode_yolo_det_f64(
     output: ArrayView2<f64>,
     score_threshold: f32,
     iou_threshold: f32,
@@ -46,8 +46,8 @@ pub fn decode_yolo_f64(
 }
 
 pub fn decode_yolo_segdet<
-    BOX: PrimInt + AsPrimitive<i64> + AsPrimitive<f32> + Send + Sync,
-    PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<f32> + Send + Sync,
+    BOX: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
+    PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
 >(
     boxes: (ArrayView2<BOX>, Quantization),
     protos: (ArrayView3<PROTO>, Quantization),
@@ -157,8 +157,8 @@ pub fn decode_yolo_split_det_f64(
 pub fn decode_yolo_split_segdet<
     BOX: PrimInt + AsPrimitive<f32> + Send + Sync,
     SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
-    MASK: PrimInt + AsPrimitive<i64> + AsPrimitive<f32> + Send + Sync,
-    PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<f32> + Send + Sync,
+    MASK: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
+    PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
 >(
     boxes: (ArrayView2<BOX>, Quantization),
     scores: (ArrayView2<SCORE>, Quantization),
@@ -336,8 +336,8 @@ pub fn impl_yolo_split_float<
 #[allow(clippy::too_many_arguments)]
 pub fn impl_yolo_segdet_8bit<
     B: BBoxTypeTrait,
-    BOX: PrimInt + AsPrimitive<i64> + AsPrimitive<f32> + Send + Sync,
-    PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<f32> + Send + Sync,
+    BOX: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
+    PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
 >(
     boxes: (ArrayView2<BOX>, Quantization),
     protos: (ArrayView3<PROTO>, Quantization),
@@ -439,8 +439,8 @@ pub(crate) fn impl_yolo_split_segdet_8bit_get_boxes<
 }
 
 pub(crate) fn impl_yolo_split_segdet_8bit_process_masks<
-    MASK: PrimInt + AsPrimitive<i64> + AsPrimitive<f32> + Send + Sync,
-    PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<f32> + Send + Sync,
+    MASK: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
+    PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
 >(
     boxes: Vec<(DetectBox, usize)>,
     mask_coeff: (ArrayView2<MASK>, Quantization),
@@ -473,8 +473,8 @@ pub fn impl_yolo_split_segdet_8bit<
     B: BBoxTypeTrait,
     BOX: PrimInt + AsPrimitive<f32> + Send + Sync,
     SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
-    MASK: PrimInt + AsPrimitive<i64> + AsPrimitive<f32> + Send + Sync,
-    PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<f32> + Send + Sync,
+    MASK: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
+    PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
 >(
     boxes: (ArrayView2<BOX>, Quantization),
     scores: (ArrayView2<SCORE>, Quantization),
@@ -589,8 +589,8 @@ fn decode_segdet_f32<
 }
 
 pub(crate) fn decode_segdet_8bit<
-    MASK: PrimInt + AsPrimitive<i64> + Send + Sync,
-    PROTO: PrimInt + AsPrimitive<i64> + Send + Sync,
+    MASK: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + Send + Sync,
+    PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + Send + Sync,
 >(
     boxes: Vec<(DetectBox, usize)>,
     masks: ArrayView2<MASK>,
@@ -601,16 +601,29 @@ pub(crate) fn decode_segdet_8bit<
     if boxes.is_empty() {
         return Vec::new();
     }
+    let total_bits = MASK::zero().count_zeros() + PROTO::zero().count_zeros() + 5; // 32 protos is 2^5
     boxes
-        .into_par_iter()
+        .into_iter()
         .map(|mut b| {
             let i = b.1;
             let (protos, roi) = protobox(&protos, &b.0.bbox.to_canonical());
             b.0.bbox = roi;
-            (
-                b.0,
-                make_segmentation_8bit(masks.row(i), protos.view(), quant_masks, quant_protos),
-            )
+            let seg = match total_bits {
+                0..=64 => make_segmentation_8bit::<MASK, PROTO, i64>(
+                    masks.row(i),
+                    protos.view(),
+                    quant_masks,
+                    quant_protos,
+                ),
+                65..=128 => make_segmentation_8bit::<MASK, PROTO, i128>(
+                    masks.row(i),
+                    protos.view(),
+                    quant_masks,
+                    quant_protos,
+                ),
+                _ => panic!("Unsupported bit width for segmentation computation"),
+            };
+            (b.0, seg)
         })
         .collect()
 }
@@ -680,6 +693,7 @@ fn make_segmentation_8bit<
 ) -> Array3<u8>
 where
     i32: AsPrimitive<DEST>,
+    f32: AsPrimitive<DEST>,
 {
     let shape = protos.shape();
     let mask = mask.to_shape((1, mask.len())).unwrap();
