@@ -7,7 +7,7 @@ use edgefirst_decoder::{
     dequant_detect_box, dequantize_cpu, dequantize_cpu_chunked, dequantize_ndarray,
     float::{nms_f32, postprocess_boxes_float},
     modelpack::{ModelPackDetectionConfig, decode_modelpack_det, decode_modelpack_split},
-    yolo::{decode_yolo_det, decode_yolo_f32, decode_yolo_segdet, decode_yolo_segdet_f32},
+    yolo::{decode_yolo_det, decode_yolo_det_f32, decode_yolo_segdet, decode_yolo_segdet_f32},
 };
 use ndarray::s;
 
@@ -108,7 +108,7 @@ fn decoder_yolo_f32(bencher: divan::Bencher) {
             dequantize_cpu_chunked(&out, quant, &mut buf);
             let mut output_boxes: Vec<_> = Vec::with_capacity(50);
             let out = ndarray::Array2::from_shape_vec((84, 8400), buf).unwrap();
-            decode_yolo_f32(
+            decode_yolo_det_f32(
                 out.view(),
                 score_threshold,
                 iou_threshold,

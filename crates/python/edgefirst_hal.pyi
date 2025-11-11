@@ -48,7 +48,7 @@ class Decoder:
 
     # [pyo3(signature = (boxes, quant_boxes=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
     @staticmethod
-    def decode_yolo(
+    def decode_yolo_det(
         model_output: Union[npt.NDArray[np.uint8], npt.NDArray[np.int8], npt.NDArray[np.float32], npt.NDArray[np.float64]],
         quant_boxes: Tuple[float, int] = (1.0, 0),
         score_threshold: float = 0.1,
