@@ -12,7 +12,7 @@ use crate::{
         decode_modelpack_split_float,
     },
     yolo::{
-        decode_yolo_det, decode_yolo_f32, decode_yolo_f64, decode_yolo_segdet,
+        decode_yolo_det, decode_yolo_det_f32, decode_yolo_det_f64, decode_yolo_segdet,
         decode_yolo_segdet_f32, decode_yolo_segdet_f64, decode_yolo_split_det,
         decode_yolo_split_det_f32, decode_yolo_split_det_f64, decode_yolo_split_segdet_f32,
         decode_yolo_split_segdet_f64, impl_yolo_split_segdet_8bit_get_boxes,
@@ -577,6 +577,18 @@ impl<'a> From<ArrayViewD<'a, u16>> for ArrayViewDQuantized<'a> {
 impl<'a> From<ArrayViewD<'a, i16>> for ArrayViewDQuantized<'a> {
     fn from(arr: ArrayViewD<'a, i16>) -> Self {
         Self::Int16(arr)
+    }
+}
+
+impl<'a> From<ArrayViewD<'a, u32>> for ArrayViewDQuantized<'a> {
+    fn from(arr: ArrayViewD<'a, u32>) -> Self {
+        Self::UInt32(arr)
+    }
+}
+
+impl<'a> From<ArrayViewD<'a, i32>> for ArrayViewDQuantized<'a> {
+    fn from(arr: ArrayViewD<'a, i32>) -> Self {
+        Self::Int32(arr)
     }
 }
 
@@ -1282,7 +1294,7 @@ impl Decoder {
             boxes_tensor.swap_axes(0, 1);
         };
 
-        decode_yolo_f32(
+        decode_yolo_det_f32(
             boxes_tensor,
             self.score_threshold,
             self.iou_threshold,
@@ -1472,7 +1484,7 @@ impl Decoder {
             boxes_tensor.swap_axes(0, 1);
         };
 
-        decode_yolo_f64(
+        decode_yolo_det_f64(
             boxes_tensor,
             self.score_threshold,
             self.iou_threshold,

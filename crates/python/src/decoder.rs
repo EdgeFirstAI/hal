@@ -34,11 +34,13 @@ pub enum ArrayQuantized<'a> {
     Int8(PyReadonlyArrayDyn<'a, i8>),
     UInt16(PyReadonlyArrayDyn<'a, u16>),
     Int16(PyReadonlyArrayDyn<'a, i16>),
+    UInt32(PyReadonlyArrayDyn<'a, u32>),
+    Int32(PyReadonlyArrayDyn<'a, i32>),
 }
 
 #[derive(FromPyObject)]
 pub enum ListOfReadOnlyArrayGenericDyn<'py> {
-    Quantized(Vec<WithInt32Array<'py, ArrayQuantized<'py>>>),
+    Quantized(Vec<ArrayQuantized<'py>>),
     Float16(Vec<WithInt32Array<'py, PyArrayF16_<'py>>>),
     Float32(Vec<WithInt32Array<'py, PyArrayLikeDyn<'py, f32>>>),
     Float64(Vec<WithInt32Array<'py, PyArrayLikeDyn<'py, f64>>>),
@@ -231,14 +233,13 @@ impl PyDecoder {
             ListOfReadOnlyArrayGenericDyn::Quantized(items) => {
                 let outputs = items
                     .iter()
-                    .filter_map(|x| match x {
-                        WithInt32Array::Val(x) => match x {
-                            ArrayQuantized::UInt8(arr) => Some(arr.as_array().into()),
-                            ArrayQuantized::Int8(arr) => Some(arr.as_array().into()),
-                            ArrayQuantized::UInt16(arr) => Some(arr.as_array().into()),
-                            ArrayQuantized::Int16(arr) => Some(arr.as_array().into()),
-                        },
-                        WithInt32Array::Int32(_) => None,
+                    .map(|x| match x {
+                        ArrayQuantized::UInt8(arr) => arr.as_array().into(),
+                        ArrayQuantized::Int8(arr) => arr.as_array().into(),
+                        ArrayQuantized::UInt16(arr) => arr.as_array().into(),
+                        ArrayQuantized::Int16(arr) => arr.as_array().into(),
+                        ArrayQuantized::UInt32(arr) => arr.as_array().into(),
+                        ArrayQuantized::Int32(arr) => arr.as_array().into(),
                     })
                     .collect::<Vec<_>>();
                 self_
@@ -302,7 +303,7 @@ impl PyDecoder {
 
     #[staticmethod]
     #[pyo3(signature = (boxes, quant_boxes=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
-    pub fn decode_yolo<'py>(
+    pub fn decode_yolo_det<'py>(
         py: Python<'py>,
         boxes: ReadOnlyArrayGeneric2,
         quant_boxes: (f64, i64),
@@ -324,14 +325,16 @@ impl PyDecoder {
                 iou_threshold as f32,
                 &mut output_boxes,
             ),
-            ReadOnlyArrayGeneric2::Float32(output) => edgefirst::decoder::yolo::decode_yolo_f32(
-                output.as_array(),
-                score_threshold as f32,
-                iou_threshold as f32,
-                &mut output_boxes,
-            ),
+            ReadOnlyArrayGeneric2::Float32(output) => {
+                edgefirst::decoder::yolo::decode_yolo_det_f32(
+                    output.as_array(),
+                    score_threshold as f32,
+                    iou_threshold as f32,
+                    &mut output_boxes,
+                )
+            }
             ReadOnlyArrayGeneric2::Float64(output) => {
-                edgefirst::decoder::yolo::decode_yolo_f64(
+                edgefirst::decoder::yolo::decode_yolo_det_f64(
                     output.as_array(),
                     score_threshold as f32,
                     iou_threshold as f32,
