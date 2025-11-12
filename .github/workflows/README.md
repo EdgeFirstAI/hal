@@ -318,7 +318,7 @@ The workflow uses the `pypi` environment with `id-token: write` permission for s
 
 1. **Always run locally first:**
    ```bash
-   cargo fmt --all
+   cargo +nightly fmt --all
    cargo clippy --all-targets --all-features
    cargo test --all-features
    ```
@@ -362,7 +362,7 @@ git lfs install
 git lfs pull
 
 # Test Rust
-cargo fmt --check
+cargo +nightly fmt --all
 cargo clippy --all-targets --all-features
 cargo test --all-features
 

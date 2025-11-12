@@ -99,10 +99,10 @@ git checkout -b feature/your-feature-name
 cargo test --workspace
 
 # Run Rust linting
-cargo clippy --workspace -- -D warnings
+cargo clippy --workspace
 
-# Format code
-cargo fmt --all
+# Format code (requires Rust nightly)
+cargo +nightly fmt --all
 
 # Build and test Python bindings
 maturin develop -m crates/python/Cargo.toml
@@ -155,8 +155,8 @@ We follow standard Rust conventions:
 
 **Before committing:**
 ```bash
-cargo fmt --all
-cargo clippy --workspace -- -D warnings
+cargo +nightly fmt --all
+cargo clippy --workspace
 ```
 
 ### Python Code

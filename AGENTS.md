@@ -200,11 +200,11 @@ cargo test -p edgefirst_tensor
 cargo test -p edgefirst_image
 cargo test -p edgefirst_decoder
 
-# Format code
-cargo fmt --all
+# Format code (requires Rust nightly)
+cargo +nightly fmt --all
 
 # Lint
-cargo clippy --workspace -- -D warnings
+cargo clippy --workspace
 
 # Run benchmarks
 cargo bench -p edgefirst_image
