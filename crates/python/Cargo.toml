@@ -22,12 +22,12 @@ extension-module = ["pyo3/extension-module"]
 edgefirst = { workspace = true }
 env_logger = { workspace = true }
 four-char-code = { workspace = true }
-numpy = { workspace = true }
-pyo3 = { workspace = true }
-ndarray = { workspace = true }
-pythonize = { workspace = true }
 half = { workspace = true }
 log = { workspace = true }
+ndarray = { workspace = true }
+numpy = { workspace = true }
+pyo3 = { workspace = true }
+pythonize = { workspace = true }
 
 [build-dependencies]
 pyo3-build-config = { workspace = true }

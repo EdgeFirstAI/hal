@@ -9,7 +9,6 @@ repository.workspace = true
 readme.workspace = true
 license.workspace = true
 
-
 [features]
 default = ["opengl"]
 opengl = ["dep:khronos-egl", "dep:gbm"]
@@ -18,23 +17,23 @@ g2d_test_formats = []
 [dependencies]
 ctor = { workspace = true }
 edgefirst-tensor = { workspace = true }
-env_logger = { workspace = true }
 enum_dispatch = { workspace = true }
+env_logger = { workspace = true }
 fast_image_resize = { workspace = true }
 four-char-code = { workspace = true }
 gls = { workspace = true }
 jpeg-encoder = { workspace = true }
+kamadak-exif = { workspace = true }
 khronos-egl = { workspace = true, optional = true }
+libc = { workspace = true }
 libloading = { workspace = true }
 log = { workspace = true }
+ndarray = { workspace = true }
+rayon = { workspace = true }
+tokio = { workspace = true }
+yuv = { workspace = true }
 zune-jpeg = { workspace = true }
 zune-png = { workspace = true }
-libc = { workspace = true }
-ndarray = { workspace = true }
-yuv = { workspace = true }
-kamadak-exif = { workspace = true }
-tokio = { workspace = true }
-rayon = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 dma-heap = { workspace = true }
@@ -43,8 +42,8 @@ gbm = { workspace = true, optional = true }
 
 [dev-dependencies]
 divan = { workspace = true }
-image-compare = { workspace = true }
 image = { workspace = true }
+image-compare = { workspace = true }
 
 [[bench]]
 name = "image_benchmark"

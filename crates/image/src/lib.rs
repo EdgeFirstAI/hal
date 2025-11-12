@@ -880,7 +880,9 @@ mod image_tests {
             return;
         }
         if !is_dma_available() {
-            eprintln!("SKIPPED: test_g2d_resize - DMA memory allocation not available (permission denied or no DMA-BUF support)");
+            eprintln!(
+                "SKIPPED: test_g2d_resize - DMA memory allocation not available (permission denied or no DMA-BUF support)"
+            );
             return;
         }
 
@@ -1022,7 +1024,9 @@ mod image_tests {
             return;
         }
         if !is_dma_available() {
-            eprintln!("SKIPPED: test_g2d_src_crop - DMA memory allocation not available (permission denied or no DMA-BUF support)");
+            eprintln!(
+                "SKIPPED: test_g2d_src_crop - DMA memory allocation not available (permission denied or no DMA-BUF support)"
+            );
             return;
         }
 
@@ -1084,7 +1088,9 @@ mod image_tests {
             return;
         }
         if !is_dma_available() {
-            eprintln!("SKIPPED: test_g2d_dst_crop - DMA memory allocation not available (permission denied or no DMA-BUF support)");
+            eprintln!(
+                "SKIPPED: test_g2d_dst_crop - DMA memory allocation not available (permission denied or no DMA-BUF support)"
+            );
             return;
         }
 
@@ -1136,7 +1142,9 @@ mod image_tests {
             return;
         }
         if !is_dma_available() {
-            eprintln!("SKIPPED: test_g2d_all_rgba - DMA memory allocation not available (permission denied or no DMA-BUF support)");
+            eprintln!(
+                "SKIPPED: test_g2d_all_rgba - DMA memory allocation not available (permission denied or no DMA-BUF support)"
+            );
             return;
         }
 
@@ -1299,7 +1307,9 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     fn test_opengl_all_rgba() {
         if !is_dma_available() {
-            eprintln!("SKIPPED: test_opengl_all_rgba - DMA memory allocation not available (permission denied or no DMA-BUF support)");
+            eprintln!(
+                "SKIPPED: test_opengl_all_rgba - DMA memory allocation not available (permission denied or no DMA-BUF support)"
+            );
             return;
         }
 
@@ -1497,7 +1507,9 @@ mod image_tests {
             return;
         }
         if !is_dma_available() {
-            eprintln!("SKIPPED: test_g2d_rotate - DMA memory allocation not available (permission denied or no DMA-BUF support)");
+            eprintln!(
+                "SKIPPED: test_g2d_rotate - DMA memory allocation not available (permission denied or no DMA-BUF support)"
+            );
             return;
         }
 
@@ -1641,11 +1653,15 @@ mod image_tests {
     #[test]
     fn test_rgba_to_yuyv_resize_g2d() {
         if !is_g2d_available() {
-            eprintln!("SKIPPED: test_rgba_to_yuyv_resize_g2d - G2D library (libg2d.so.2) not available");
+            eprintln!(
+                "SKIPPED: test_rgba_to_yuyv_resize_g2d - G2D library (libg2d.so.2) not available"
+            );
             return;
         }
         if !is_dma_available() {
-            eprintln!("SKIPPED: test_rgba_to_yuyv_resize_g2d - DMA memory allocation not available (permission denied or no DMA-BUF support)");
+            eprintln!(
+                "SKIPPED: test_rgba_to_yuyv_resize_g2d - DMA memory allocation not available (permission denied or no DMA-BUF support)"
+            );
             return;
         }
 
@@ -1774,7 +1790,9 @@ mod image_tests {
             return;
         }
         if !is_dma_available() {
-            eprintln!("SKIPPED: test_yuyv_to_rgba_g2d - DMA memory allocation not available (permission denied or no DMA-BUF support)");
+            eprintln!(
+                "SKIPPED: test_yuyv_to_rgba_g2d - DMA memory allocation not available (permission denied or no DMA-BUF support)"
+            );
             return;
         }
 
@@ -1810,7 +1828,9 @@ mod image_tests {
     #[cfg(feature = "opengl")]
     fn test_yuyv_to_rgba_opengl() {
         if !is_dma_available() {
-            eprintln!("SKIPPED: test_yuyv_to_rgba_opengl - DMA memory allocation not available (permission denied or no DMA-BUF support)");
+            eprintln!(
+                "SKIPPED: test_yuyv_to_rgba_opengl - DMA memory allocation not available (permission denied or no DMA-BUF support)"
+            );
             return;
         }
 
@@ -1849,7 +1869,9 @@ mod image_tests {
             return;
         }
         if !is_dma_available() {
-            eprintln!("SKIPPED: test_yuyv_to_rgb_g2d - DMA memory allocation not available (permission denied or no DMA-BUF support)");
+            eprintln!(
+                "SKIPPED: test_yuyv_to_rgb_g2d - DMA memory allocation not available (permission denied or no DMA-BUF support)"
+            );
             return;
         }
 
@@ -1895,11 +1917,15 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     fn test_yuyv_to_yuyv_resize_g2d() {
         if !is_g2d_available() {
-            eprintln!("SKIPPED: test_yuyv_to_yuyv_resize_g2d - G2D library (libg2d.so.2) not available");
+            eprintln!(
+                "SKIPPED: test_yuyv_to_yuyv_resize_g2d - G2D library (libg2d.so.2) not available"
+            );
             return;
         }
         if !is_dma_available() {
-            eprintln!("SKIPPED: test_yuyv_to_yuyv_resize_g2d - DMA memory allocation not available (permission denied or no DMA-BUF support)");
+            eprintln!(
+                "SKIPPED: test_yuyv_to_yuyv_resize_g2d - DMA memory allocation not available (permission denied or no DMA-BUF support)"
+            );
             return;
         }
 
@@ -1988,11 +2014,15 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     fn test_yuyv_to_rgba_crop_flip_g2d() {
         if !is_g2d_available() {
-            eprintln!("SKIPPED: test_yuyv_to_rgba_crop_flip_g2d - G2D library (libg2d.so.2) not available");
+            eprintln!(
+                "SKIPPED: test_yuyv_to_rgba_crop_flip_g2d - G2D library (libg2d.so.2) not available"
+            );
             return;
         }
         if !is_dma_available() {
-            eprintln!("SKIPPED: test_yuyv_to_rgba_crop_flip_g2d - DMA memory allocation not available (permission denied or no DMA-BUF support)");
+            eprintln!(
+                "SKIPPED: test_yuyv_to_rgba_crop_flip_g2d - DMA memory allocation not available (permission denied or no DMA-BUF support)"
+            );
             return;
         }
 
@@ -2060,7 +2090,9 @@ mod image_tests {
     #[cfg(feature = "opengl")]
     fn test_yuyv_to_rgba_crop_flip_opengl() {
         if !is_dma_available() {
-            eprintln!("SKIPPED: test_yuyv_to_rgba_crop_flip_opengl - DMA memory allocation not available (permission denied or no DMA-BUF support)");
+            eprintln!(
+                "SKIPPED: test_yuyv_to_rgba_crop_flip_opengl - DMA memory allocation not available (permission denied or no DMA-BUF support)"
+            );
             return;
         }
 
@@ -2250,9 +2282,12 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
     fn test_opengl_resize_8bps() {
-        // This test is skipped because OpenGL doesn't support 8BPS (PLANAR_RGB) destination textures
-        // The test would fail with: NotSupported("Opengl doesn't support 8BPS destination texture")
-        eprintln!("SKIPPED: test_opengl_resize_8bps - OpenGL doesn't support 8BPS (PLANAR_RGB) destination textures");
+        // This test is skipped because OpenGL doesn't support 8BPS (PLANAR_RGB)
+        // destination textures The test would fail with: NotSupported("Opengl
+        // doesn't support 8BPS destination texture")
+        eprintln!(
+            "SKIPPED: test_opengl_resize_8bps - OpenGL doesn't support 8BPS (PLANAR_RGB) destination textures"
+        );
         return;
 
         /* Original test code - kept for reference
