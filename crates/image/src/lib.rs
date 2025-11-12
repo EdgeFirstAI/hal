@@ -6,10 +6,7 @@
 //! acceleration when available, but also provides a CPU-based fallback for
 //! environments where hardware acceleration is not present or not suitable.
 
-#[cfg(feature = "opengl")]
-#[cfg(target_os = "linux")]
-use std::env;
-use std::time::Instant;
+use std::{env, time::Instant};
 
 use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait as _};
 use enum_dispatch::enum_dispatch;
@@ -572,7 +569,6 @@ impl ImageConverter {
         };
 
         #[cfg(target_os = "linux")]
-        #[cfg(feature = "opengl")]
         let cpu = if let Ok(x) = env::var("EDGEFIRST_DISABLE_CPU")
             && x != "0"
             && x.to_lowercase() != "false"
@@ -1205,6 +1201,7 @@ mod image_tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    #[cfg(feature = "opengl")]
     fn test_opengl_dst_crop() {
         let dst_width = 640;
         let dst_height = 640;
@@ -1248,6 +1245,7 @@ mod image_tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    #[cfg(feature = "opengl")]
     fn test_opengl_all_rgba() {
         let dst_width = 640;
         let dst_height = 640;
@@ -1524,6 +1522,8 @@ mod image_tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    #[cfg(feature = "opengl")]
     #[ignore = "opengl doesn't support rendering to YUYV texture?"]
     fn test_rgba_to_yuyv_resize_opengl() {
         let src = load_bytes_to_tensor(

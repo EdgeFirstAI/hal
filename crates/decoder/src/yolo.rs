@@ -577,6 +577,7 @@ fn decode_segdet_f32<
     if boxes.is_empty() {
         return Vec::new();
     }
+    assert!(masks.shape()[1] == protos.shape()[2]);
     boxes
         .into_par_iter()
         .map(|mut b| {
@@ -601,6 +602,8 @@ pub(crate) fn decode_segdet_8bit<
     if boxes.is_empty() {
         return Vec::new();
     }
+    assert!(masks.shape()[1] == protos.shape()[2]);
+
     let total_bits = MASK::zero().count_zeros() + PROTO::zero().count_zeros() + 5; // 32 protos is 2^5
     boxes
         .into_iter()
