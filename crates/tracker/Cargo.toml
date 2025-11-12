@@ -9,7 +9,6 @@ repository.workspace = true
 readme.workspace = true
 license.workspace = true
 
-
 [dependencies]
 enum_dispatch = { workspace = true }
 lapjv = { workspace = true }

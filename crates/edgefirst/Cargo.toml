@@ -15,6 +15,6 @@ ndarray = ["edgefirst-tensor/ndarray"]
 opengl = ["edgefirst-image/opengl"]
 
 [dependencies]
+edgefirst-decoder = { workspace = true }
 edgefirst-image = { workspace = true }
 edgefirst-tensor = { workspace = true }
-edgefirst-decoder = { workspace = true }

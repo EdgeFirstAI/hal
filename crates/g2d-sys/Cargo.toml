@@ -8,5 +8,5 @@ edition = "2024"
 [dependencies]
 four-char-code = { workspace = true }
 libloading = { workspace = true }
-nix = { workspace = true }
 log = { workspace = true }
+nix = { workspace = true }
