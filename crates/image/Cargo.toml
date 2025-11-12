@@ -17,34 +17,34 @@ g2d_test_formats = []
 
 [dependencies]
 ctor = { workspace = true }
-edgefirst-tensor = { version = "*", path = "../tensor" }
+edgefirst-tensor = { workspace = true }
 env_logger = { workspace = true }
 enum_dispatch = { workspace = true }
 fast_image_resize = { workspace = true }
 four-char-code = { workspace = true }
-gls = "0.1.6"
+gls = { workspace = true }
 jpeg-encoder = { workspace = true }
-khronos-egl = { version = "6.0.0", features = ["dynamic"], optional = true }
+khronos-egl = { workspace = true, optional = true }
 libloading = { workspace = true }
 log = { workspace = true }
 zune-jpeg = { workspace = true }
 zune-png = { workspace = true }
-libc = "0.2.174"
+libc = { workspace = true }
 ndarray = { workspace = true }
-yuv = "0.8.6"
-kamadak-exif = "0.6.1"
-tokio = { version = "1.47.1", features = ["rt", "sync"] }
+yuv = { workspace = true }
+kamadak-exif = { workspace = true }
+tokio = { workspace = true }
 rayon = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 dma-heap = { workspace = true }
-g2d-sys = { version = "*", path = "../g2d-sys" }
-gbm = { git = "https://github.com/Charlie-AuZone/gbm.rs.git", branch = "dynamic", default-features = false, optional = true, features=["dynamic", "drm-support"]}
+g2d-sys = { workspace = true }
+gbm = { workspace = true, optional = true }
 
 [dev-dependencies]
 divan = { workspace = true }
-image-compare = "0.4.2"
-image = { version = "0.25.6", default-features = false, features = ["png"]}
+image-compare = { workspace = true }
+image = { workspace = true }
 
 [[bench]]
 name = "image_benchmark"

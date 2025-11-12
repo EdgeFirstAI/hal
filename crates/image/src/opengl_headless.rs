@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
+// SPDX-License-Identifier: Apache-2.0
+
 #![cfg(target_os = "linux")]
 #![cfg(feature = "opengl")]
 use edgefirst_tensor::{TensorMemory, TensorTrait};
