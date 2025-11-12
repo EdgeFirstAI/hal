@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::{DetectionBox, TrackInfo, Tracker, kalman::ConstantVelocityXYAHModel2};
 use lapjv::{Matrix, lapjv};
 use log::{debug, trace};

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
+// SPDX-License-Identifier: Apache-2.0
+
 // #![cfg(not(feature = "extension-module"))]
 
 use edgefirst::decoder::{Quantization, dequantize_cpu};

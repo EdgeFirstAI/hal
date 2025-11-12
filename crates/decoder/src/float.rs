@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::{BBoxTypeTrait, BoundingBox, DetectBox, arg_max};
 use ndarray::{
     Array1, ArrayView2, Zip,

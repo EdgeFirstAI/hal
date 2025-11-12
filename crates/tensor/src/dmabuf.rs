@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
+// SPDX-License-Identifier: Apache-2.0
+
 #![allow(dead_code)]
 use nix::{ioctl_read, ioctl_write_ptr};
 use std::os::fd::{AsRawFd, OwnedFd};

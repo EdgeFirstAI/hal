@@ -4,33 +4,68 @@ members = ["crates/*"]
 default-members = ["crates/edgefirst", "crates/tensor", "crates/image", "crates/decoder"]
 
 [workspace.package]
-name = "edgefirst-hal"
 description = "EdgeFirst Hardware Abstraction Layer"
 authors = ["Au-Zone Technologies <support@au-zone.com>"]
 homepage = "https://edgefirst.ai"
 repository = "https://github.com/EdgeFirstAI/hal"
-license = "Proprietary"
+license = "Apache-2.0"
 version = "0.0.0"
 edition = "2024"
 
 [workspace.dependencies]
+# Internal crates
+edgefirst = { version = "0.0.0", path = "crates/edgefirst" }
+edgefirst-decoder = { version = "0.0.0", path = "crates/decoder" }
+edgefirst-image = { version = "0.0.0", path = "crates/image" }
+edgefirst-tensor = { version = "0.0.0", path = "crates/tensor" }
+edgefirst-tracker = { version = "0.0.0", path = "crates/tracker" }
+g2d-sys = { version = "1.0.1", path = "crates/g2d-sys" }
+
+# External dependencies
+approx = "0.5.1"
+argminmax = { version = "0.6.3", default-features = false }
 ctor = "0.4.2"
 divan = "0.1.21"
 dma-heap = "0.4.1"
-env_logger = "0.11.8"
 enum_dispatch = "0.3.13"
+env_logger = "0.11.8"
 fast_image_resize = { version = "5.2.0", features = ["image", "rayon"] }
+fast-math = "0.1.1"
 four-char-code = "2.3.0"
+gls = "0.1.6"
+half = "2.7.1"
+image = { version = "0.25.6", default-features = false, features = ["png"] }
+image-compare = "0.4.2"
 jpeg-encoder = { version = "0.6.1", features = ["simd"] }
+kamadak-exif = "0.6.1"
+khronos-egl = { version = "6.0.0", features = ["dynamic"] }
+lapjv = "0.2.1"
+libc = "0.2.174"
 libloading = "0.8.8"
 log = "0.4.27"
+nalgebra = "0.32.6"
 ndarray = { version = "0.16.1", features = ["rayon"] }
+ndarray-stats = "0.6.0"
 nix = { version = "0.30.1", features = ["fs", "ioctl", "mman"] }
 num-traits = "0.2.19"
+numpy = { version = "0.26.0", features = ["half"] }
+pyo3 = { version = "0.26.0" }
+pyo3-build-config = { version = "0.26.0", features = ["resolve-config"] }
+pythonize = "0.26.0"
 rayon = "1.10.0"
+rand = "0.9.2"
+rustc_version = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.143"
+serde_yaml = "0.9.34"
+tokio = { version = "1.47.1", features = ["rt", "sync"] }
 uuid = { version = "1.11.0", features = ["v4"] }
+yuv = "0.8.6"
 zune-jpeg = "0.4.21"
 zune-png = "0.4.10"
+
+# Platform-specific dependencies (Git sources need to be defined here)
+gbm = { git = "https://github.com/Charlie-AuZone/gbm.rs.git", branch = "dynamic", default-features = false, features = ["dynamic", "drm-support"] }
 
 [profile.release]
 opt-level = 3

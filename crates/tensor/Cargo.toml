@@ -27,7 +27,7 @@ nix = { workspace = true }
 
 [dev-dependencies]
 divan = { workspace = true }
-rand = "0.9.2"
+rand = { workspace = true }
 
 [[bench]]
 name = "tensor_benchmark"

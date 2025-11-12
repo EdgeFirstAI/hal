@@ -14,23 +14,23 @@ license.workspace = true
 #tracker = ["dep:edgefirst-tracker"]
 
 [dependencies]
-argminmax = { version = "0.6.3", default-features = false}
-#edgefirst-tracker = { version = "*", path = "../tracker", optional=true }
+argminmax = { workspace = true }
+#edgefirst-tracker = { workspace = true, optional = true }
 env_logger = { workspace = true }
-fast-math = "0.1.1"
+fast-math = { workspace = true }
 log = { workspace = true }
 ndarray = { workspace = true }
-ndarray-stats = "0.6.0"
-num-traits.workspace = true
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0.143"
-serde_yaml = "0.9.34"
+ndarray-stats = { workspace = true }
+num-traits = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 rayon = { workspace = true }
 
 
 [dev-dependencies]
 divan = { workspace = true }
-image = { version = "0.25.6", default-features = false, features = ["png"]}
+image = { workspace = true }
 
 
 [[bench]]
