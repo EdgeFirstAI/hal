@@ -11,10 +11,10 @@ license.workspace = true
 
 
 [dependencies]
-enum_dispatch = "0.3.13"
-lapjv = "0.2.1"
-log = { version = "0.4.28" }
-nalgebra = "0.32.6"
-ndarray = { version = "0.16.1", features = ["rayon"] }
-num-traits = "0.2.19"
-uuid = { version = "1.18.1", features = ["v4"] }
+enum_dispatch = { workspace = true }
+lapjv = { workspace = true }
+log = { workspace = true }
+nalgebra = { workspace = true }
+ndarray = { workspace = true }
+num-traits = { workspace = true }
+uuid = { workspace = true }

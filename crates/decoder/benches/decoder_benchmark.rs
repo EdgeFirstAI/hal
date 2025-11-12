@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
+// SPDX-License-Identifier: Apache-2.0
+
 #![allow(clippy::excessive_precision)]
 
 use divan::black_box_drop;
