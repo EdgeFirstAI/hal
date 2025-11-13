@@ -4,8 +4,8 @@
 #![cfg(target_os = "linux")]
 
 use crate::{
-    CPUConverter, Crop, Error, Flip, ImageConverterTrait, RGB, RGBA, Result, Rotation, TensorImage,
-    YUYV,
+    CPUConverter, Crop, Error, Flip, ImageConverterTrait, NV12, NV16, RGB, RGBA, Result, Rotation,
+    TensorImage, YUYV,
 };
 use edgefirst_tensor::Tensor;
 use g2d_sys::{G2D, G2DFormat, G2DPhysical, G2DSurface};
@@ -91,8 +91,13 @@ impl G2DConverter {
         }
 
         if let Some(crop_rect) = crop.dst_rect {
-            dst_surface.planes[0] += ((crop_rect.top * dst_surface.width as usize + crop_rect.left)
-                * dst.channels()) as u64;
+            for p in &mut dst_surface.planes {
+                if *p == 0 {
+                    continue;
+                }
+                *p += ((crop_rect.top * dst_surface.width as usize + crop_rect.left)
+                    * dst.channels()) as u64;
+            }
 
             dst_surface.right = crop_rect.width as i32;
             dst_surface.bottom = crop_rect.height as i32;
@@ -152,6 +157,7 @@ impl ImageConverterTrait for G2DConverter {
         crop: Crop,
     ) -> Result<()> {
         crop.check_crop(src, dst)?;
+        #[cfg(not(feature = "g2d_test_formats"))]
         match (src.fourcc(), dst.fourcc()) {
             (RGBA, RGBA) => {}
             (RGBA, YUYV) => {}
@@ -159,10 +165,9 @@ impl ImageConverterTrait for G2DConverter {
             (YUYV, RGBA) => {}
             (YUYV, YUYV) => {}
             (YUYV, RGB) => {}
-            // (YUYV, NV12) => {}
-            // (NV12, RGBA) => {}
-            // (NV12, YUYV) => {}
-            // (NV12, RGB) => {}
+            (NV16, RGB) => {}
+            (NV16, RGBA) => {}
+            (NV16, YUYV) => {}
             (s, d) => {
                 return Err(Error::NotSupported(format!(
                     "G2D does not support {} to {} conversion",
@@ -201,9 +206,26 @@ impl TryFrom<&TensorImage> for G2DSurface {
             }
         }
         .try_into()?;
+        let phys_addr = phys.address();
+        let planes = if img.is_planar() {
+            match img.fourcc() {
+                NV12 | NV16 => [
+                    phys_addr,
+                    phys_addr + (img.width() * img.height()) as u64,
+                    0,
+                ],
+                _ => {
+                    return Err(Error::NotSupported(
+                        "g2d only supports NV12 or NV16 planar images".to_string(),
+                    ));
+                }
+            }
+        } else {
+            [phys_addr, 0, 0]
+        };
 
         Ok(Self {
-            planes: [phys.address(), 0, 0],
+            planes,
             format: G2DFormat::try_from(img.fourcc())?.format(),
             left: 0,
             top: 0,
@@ -235,8 +257,26 @@ impl TryFrom<&mut TensorImage> for G2DSurface {
         }
         .try_into()?;
 
+        let phys_addr = phys.address();
+        let planes = if img.is_planar() {
+            match img.fourcc() {
+                NV12 | NV16 => [
+                    phys_addr,
+                    phys_addr + (img.width() * img.height()) as u64,
+                    0,
+                ],
+                _ => {
+                    return Err(Error::NotSupported(
+                        "g2d only supports NV12 or NV16 planar images".to_string(),
+                    ));
+                }
+            }
+        } else {
+            [phys_addr, 0, 0]
+        };
+
         Ok(Self {
-            planes: [phys.address(), 0, 0],
+            planes,
             format: G2DFormat::try_from(img.fourcc())?.format(),
             left: 0,
             top: 0,
@@ -258,18 +298,17 @@ impl TryFrom<&mut TensorImage> for G2DSurface {
 mod g2d_tests {
     use super::*;
     use crate::{
-        CPUConverter, Flip, G2DConverter, GREY, ImageConverterTrait, RGB, RGBA, Rect, Rotation,
+        CPUConverter, Flip, G2DConverter, ImageConverterTrait, NV16, RGB, RGBA, Rect, Rotation,
         TensorImage, YUYV,
     };
     use edgefirst_tensor::{TensorMapTrait, TensorMemory, TensorTrait};
     use four_char_code::FourCharCode;
     use image::buffer::ConvertBuffer;
-
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_formats_no_resize() {
-        for i in [RGBA, YUYV, RGB, GREY] {
-            for o in [RGBA, YUYV, RGB, GREY] {
+        for i in [YUYV, RGB, NV16, RGBA] {
+            for o in [YUYV, RGB, NV16, RGBA] {
                 let res = test_g2d_format_no_resize_(i, o);
                 if let Err(e) = res {
                     println!("{} to {} failed: {e:?}", i.display(), o.display());
@@ -326,8 +365,8 @@ mod g2d_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_formats_with_resize() {
-        for i in [RGBA, YUYV, RGB, GREY] {
-            for o in [RGBA, YUYV, RGB, GREY] {
+        for i in [YUYV, RGB, NV16, RGBA] {
+            for o in [YUYV, RGB, NV16, RGBA] {
                 let res = test_g2d_format_with_resize_(i, o);
                 if let Err(e) = res {
                     println!("{} to {} failed: {e:?}", i.display(), o.display());
@@ -341,8 +380,8 @@ mod g2d_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_formats_with_resize_dst_crop() {
-        for i in [RGBA, YUYV, RGB, GREY] {
-            for o in [RGBA, YUYV, RGB, GREY] {
+        for i in [YUYV, RGB, NV16, RGBA] {
+            for o in [YUYV, RGB, NV16, RGBA] {
                 let res = test_g2d_format_with_resize_dst_crop(i, o);
                 if let Err(e) = res {
                     println!("{} to {} failed: {e:?}", i.display(), o.display());

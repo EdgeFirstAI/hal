@@ -50,6 +50,8 @@ pub const GREY: FourCharCode = four_char_code!("Y800");
 // TODO: planar RGB is 8BPS? https://fourcc.org/8bps/
 pub const PLANAR_RGB: FourCharCode = four_char_code!("8BPS");
 
+pub const NV16: FourCharCode = four_char_code!("NV16");
+
 pub struct TensorImage {
     tensor: Tensor<u8>,
     fourcc: FourCharCode,
@@ -694,8 +696,9 @@ fn fourcc_channels(fourcc: FourCharCode) -> Result<usize> {
         YUYV => Ok(2), // YUYV has 2 channels (Y and UV)
         GREY => Ok(1), // Y800 has 1 channel (Y)
         NV12 => Ok(2), // NV12 has 2 channel. 2nd channel is half empty
+        NV16 => Ok(2), // NV16 has 2 channels
         PLANAR_RGB => Ok(3),
-        _ => Err(Error::InvalidShape(format!(
+        _ => Err(Error::NotSupported(format!(
             "Unsupported fourcc: {}",
             fourcc.to_string()
         ))),
@@ -709,6 +712,7 @@ fn fourcc_planar(fourcc: FourCharCode) -> Result<bool> {
         YUYV => Ok(false),      // YUYV has 2 channels (Y and UV)
         GREY => Ok(false),      // Y800 has 1 channel (Y)
         NV12 => Ok(true),       // Planar YUV
+        NV16 => Ok(true),       // Planar YUV
         PLANAR_RGB => Ok(true), // Planar RGB
         _ => Err(Error::NotSupported(format!(
             "Unsupported fourcc: {}",
@@ -1599,6 +1603,55 @@ mod image_tests {
     }
 
     #[test]
+    fn test_rgba_to_nv16_resize_cpu() {
+        let src = load_bytes_to_tensor(
+            1280,
+            720,
+            RGBA,
+            None,
+            include_bytes!("../../../testdata/camera720p.rgba"),
+        )
+        .unwrap();
+
+        let (dst_width, dst_height) = (640, 360);
+
+        let mut dst = TensorImage::new(dst_width, dst_height, NV16, None).unwrap();
+
+        let mut dst_through_nv16 = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
+        let mut dst_direct = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
+
+        let mut cpu_converter = CPUConverter::new().unwrap();
+
+        cpu_converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap();
+
+        cpu_converter
+            .convert(
+                &dst,
+                &mut dst_through_nv16,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+
+        cpu_converter
+            .convert(
+                &src,
+                &mut dst_direct,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+
+        compare_images(&dst_through_nv16, &dst_direct, 0.98, function!());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[cfg(feature = "opengl")]
     #[ignore = "opengl doesn't support rendering to YUYV texture?"]
     fn test_rgba_to_yuyv_resize_opengl() {
         let src = load_bytes_to_tensor(

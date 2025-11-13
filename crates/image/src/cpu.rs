@@ -4,7 +4,7 @@
 use std::time::Instant;
 
 use crate::{
-    Crop, Error, Flip, GREY, ImageConverterTrait, NV12, PLANAR_RGB, RGB, RGBA, Rect, Result,
+    Crop, Error, Flip, GREY, ImageConverterTrait, NV12, NV16, PLANAR_RGB, RGB, RGBA, Rect, Result,
     Rotation, TensorImage, YUYV,
 };
 use edgefirst_tensor::{TensorMapTrait, TensorTrait};
@@ -551,6 +551,106 @@ impl CPUConverter {
         Ok(())
     }
 
+    fn convert_nv16_to_rgb(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), NV16);
+        assert_eq!(dst.fourcc(), RGB);
+
+        let map = src.tensor.map()?;
+        let slices = map.as_slice().split_at(src.width() * src.height());
+
+        let src = yuv::YuvBiPlanarImage {
+            y_plane: slices.0,
+            y_stride: src.row_stride() as u32,
+            uv_plane: slices.1,
+            uv_stride: src.row_stride() as u32,
+            width: src.width() as u32,
+            height: src.height() as u32,
+        };
+
+        Ok(yuv::yuv_nv16_to_rgb(
+            &src,
+            dst.tensor.map()?.as_mut_slice(),
+            dst.row_stride() as u32,
+            yuv::YuvRange::Limited,
+            yuv::YuvStandardMatrix::Bt709,
+            yuv::YuvConversionMode::Balanced,
+        )?)
+    }
+
+    fn convert_rgb_to_nv16(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), RGB);
+        assert_eq!(dst.fourcc(), NV16);
+
+        let mut dst_map = dst.tensor.map()?;
+        let dst_slices = dst_map.split_at_mut(dst.width() * dst.height());
+        let mut dst = yuv::YuvBiPlanarImageMut::<u8> {
+            y_plane: yuv::BufferStoreMut::Borrowed(dst_slices.0),
+            y_stride: dst.row_stride() as u32,
+            width: dst.width() as u32,
+            height: dst.height() as u32,
+            uv_plane: yuv::BufferStoreMut::Borrowed(dst_slices.1),
+            uv_stride: dst.row_stride() as u32,
+        };
+        Ok(yuv::rgb_to_yuv_nv16(
+            &mut dst,
+            src.tensor.map()?.as_slice(),
+            src.row_stride() as u32,
+            yuv::YuvRange::Limited,
+            yuv::YuvStandardMatrix::Bt709,
+            yuv::YuvConversionMode::Balanced,
+        )?)
+    }
+
+    fn convert_nv16_to_rgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), NV16);
+        assert_eq!(dst.fourcc(), RGBA);
+
+        let map = src.tensor.map()?;
+        let slices = map.as_slice().split_at(src.width() * src.height());
+
+        let src = yuv::YuvBiPlanarImage {
+            y_plane: slices.0,
+            y_stride: src.row_stride() as u32,
+            uv_plane: slices.1,
+            uv_stride: src.row_stride() as u32,
+            width: src.width() as u32,
+            height: src.height() as u32,
+        };
+
+        Ok(yuv::yuv_nv16_to_rgba(
+            &src,
+            dst.tensor.map()?.as_mut_slice(),
+            dst.row_stride() as u32,
+            yuv::YuvRange::Limited,
+            yuv::YuvStandardMatrix::Bt709,
+            yuv::YuvConversionMode::Balanced,
+        )?)
+    }
+
+    fn convert_rgba_to_nv16(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), RGBA);
+        assert_eq!(dst.fourcc(), NV16);
+
+        let mut dst_map = dst.tensor.map()?;
+        let dst_slices = dst_map.split_at_mut(dst.width() * dst.height());
+        let mut dst = yuv::YuvBiPlanarImageMut::<u8> {
+            y_plane: yuv::BufferStoreMut::Borrowed(dst_slices.0),
+            y_stride: dst.row_stride() as u32,
+            width: dst.width() as u32,
+            height: dst.height() as u32,
+            uv_plane: yuv::BufferStoreMut::Borrowed(dst_slices.1),
+            uv_stride: dst.row_stride() as u32,
+        };
+        Ok(yuv::rgba_to_yuv_nv16(
+            &mut dst,
+            src.tensor.map()?.as_slice(),
+            src.row_stride() as u32,
+            yuv::YuvRange::Limited,
+            yuv::YuvStandardMatrix::Bt709,
+            yuv::YuvConversionMode::Balanced,
+        )?)
+    }
+
     fn copy_image(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), dst.fourcc());
         dst.tensor().map()?.copy_from_slice(&src.tensor().map()?);
@@ -580,6 +680,13 @@ impl CPUConverter {
                 | (GREY, RGBA)
                 | (GREY, GREY)
                 | (GREY, YUYV)
+                | (RGBA, PLANAR_RGB)
+                | (RGB, PLANAR_RGB)
+                | (GREY, PLANAR_RGB)
+                | (NV16, RGB)
+                | (RGB, NV16)
+                | (NV16, RGBA)
+                | (RGBA, NV16)
         )
     }
 
@@ -612,6 +719,10 @@ impl CPUConverter {
             (GREY, GREY) => Self::copy_image(src, dst),
             (GREY, YUYV) => Self::convert_grey_to_yuyv(src, dst),
             (GREY, PLANAR_RGB) => Self::convert_grey_to_8bps(src, dst),
+            (NV16, RGB) => Self::convert_nv16_to_rgb(src, dst),
+            (RGB, NV16) => Self::convert_rgb_to_nv16(src, dst),
+            (NV16, RGBA) => Self::convert_nv16_to_rgba(src, dst),
+            (RGBA, NV16) => Self::convert_rgba_to_nv16(src, dst),
             (s, d) => Err(Error::NotSupported(format!(
                 "Conversion from {} to {}",
                 s.display(),
@@ -1010,6 +1121,10 @@ impl ImageConverterTrait for CPUConverter {
             (GREY, GREY) => GREY,
             (GREY, YUYV) => GREY,
             (GREY, PLANAR_RGB) => GREY,
+            (RGB, NV16) => RGB,
+            (NV16, RGB) => RGB,
+            (RGBA, NV16) => RGBA,
+            (NV16, RGBA) => RGBA,
             (s, d) => {
                 return Err(Error::NotSupported(format!(
                     "Conversion from {} to {}",
