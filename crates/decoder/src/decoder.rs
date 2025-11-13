@@ -262,9 +262,9 @@ impl DecoderBuilder {
         self
     }
 
-    pub fn with_config_yolo_det(mut self, boxes: configs::Boxes) -> Self {
+    pub fn with_config_yolo_det(mut self, boxes: configs::Detection) -> Self {
         let config = ConfigOutputs {
-            outputs: vec![ConfigOutput::Boxes(boxes)],
+            outputs: vec![ConfigOutput::Detection(boxes)],
         };
         self.config_src.replace(ConfigSource::Config(config));
         self
@@ -637,10 +637,77 @@ macro_rules! with_quantized {
 }
 
 impl Decoder {
+    /// This function returns the parsed model type of the decoder.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use edgefirst_decoder::{DecoderBuilder, Error, configs::ModelType};
+    /// # fn main() -> Result<(), Error> {
+    /// #    let config_yaml = include_str!("../../../testdata/modelpack_split.yaml").to_string();
+    ///     let decoder = DecoderBuilder::default()
+    ///         .with_config_yaml_str(config_yaml)
+    ///         .build()?;
+    ///     assert!(matches!(
+    ///         decoder.model_type(),
+    ///         ModelType::ModelPackDetSplit { .. }
+    ///     ));
+    /// #    Ok(())
+    /// # }
+    /// ```
     pub fn model_type(&self) -> &ModelType {
         &self.model_type
     }
 
+    /// This function decodes quantized model outputs into detection boxes and
+    /// segmentation masks. The quantized outputs can be of u8, i8, u16, i16,
+    /// u32, or i32 types. Up to `output_boxes.capacity()` boxes and masks
+    /// will be decoded. The function clears the provided output vectors
+    /// before populating them with the decoded results.
+    ///
+    /// This function returns an `Error` if the the provided outputs don't
+    /// match the configuration provided by the user when building the decoder.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use edgefirst_decoder::{BoundingBox, DecoderBuilder, DetectBox, Error};
+    /// # use ndarray::Array4;
+    /// # fn main() -> Result<(), Error> {
+    /// #    let detect0 = include_bytes!("../../../testdata/modelpack_split_9x15x18.bin");
+    /// #    let detect0 = ndarray::Array4::from_shape_vec((1, 9, 15, 18), detect0.to_vec())?;
+    /// #
+    /// #    let detect1 = include_bytes!("../../../testdata/modelpack_split_17x30x18.bin");
+    /// #    let detect1 = ndarray::Array4::from_shape_vec((1, 17, 30, 18), detect1.to_vec())?;
+    /// #    let model_output = vec![
+    /// #        detect1.view().into_dyn().into(),
+    /// #        detect0.view().into_dyn().into(),
+    /// #    ];
+    /// let decoder = DecoderBuilder::default()
+    ///     .with_config_yaml_str(include_str!("../../../testdata/modelpack_split.yaml").to_string())
+    ///     .with_score_threshold(0.45)
+    ///     .with_iou_threshold(0.45)
+    ///     .build()?;
+    ///
+    /// let mut output_boxes: Vec<_> = Vec::with_capacity(10);
+    /// let mut output_masks: Vec<_> = Vec::with_capacity(10);
+    /// decoder.decode_quantized(&model_output, &mut output_boxes, &mut output_masks)?;
+    /// assert!(output_boxes[0].equal_within_delta(
+    ///     &DetectBox {
+    ///         bbox: BoundingBox {
+    ///             xmin: 0.43171933,
+    ///             ymin: 0.68243736,
+    ///             xmax: 0.5626645,
+    ///             ymax: 0.808863,
+    ///         },
+    ///         score: 0.99240804,
+    ///         label: 0
+    ///     },
+    ///     1e-6
+    /// ));
+    /// #    Ok(())
+    /// # }
+    /// ```
     pub fn decode_quantized(
         &self,
         outputs: &[ArrayViewDQuantized],
@@ -704,6 +771,60 @@ impl Decoder {
         }
     }
 
+    /// This function decodes f32 model outputs into detection boxes and
+    /// segmentation masks. Up to `output_boxes.capacity()` boxes and masks
+    /// will be decoded. The function clears the provided output vectors
+    /// before populating them with the decoded results.
+    ///
+    /// This function returns an `Error` if the the provided outputs don't
+    /// match the configuration provided by the user when building the decoder.
+    ///
+    /// Any quantization information in the configuration will be ignored.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use edgefirst_decoder::{BoundingBox, DecoderBuilder, DetectBox, Error, configs::Boxes, configs::DecoderType, configs::Detection, dequantize_cpu, Quantization};
+    /// # use ndarray::Array3;
+    /// # fn main() -> Result<(), Error> {
+    /// #   let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
+    /// #   let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
+    /// #   let mut out_dequant = vec![0.0_f32; 84 * 8400];
+    /// #   let quant = Quantization::new(0.0040811873, -123);
+    /// #   dequantize_cpu(out, quant, &mut out_dequant);
+    /// #   let model_output_f32 = Array3::from_shape_vec((1, 84, 8400), out_dequant).unwrap().into_dyn();
+    ///    let decoder = DecoderBuilder::default()
+    ///     .with_config_yolo_det(Detection {
+    ///         decoder: DecoderType::Yolov8,
+    ///         quantization: None,
+    ///         shape: vec![1, 84, 8400],
+    ///         channels_first: false,
+    ///         anchors: None,
+    ///     })
+    ///     .with_score_threshold(0.25)
+    ///     .with_iou_threshold(0.7)
+    ///     .build()?;
+    ///
+    /// let mut output_boxes: Vec<_> = Vec::with_capacity(10);
+    /// let mut output_masks: Vec<_> = Vec::with_capacity(10);
+    /// let model_output_f32 = vec![model_output_f32.view().into()];
+    /// decoder.decode_f32(&model_output_f32, &mut output_boxes, &mut output_masks)?;    
+    /// assert!(output_boxes[0].equal_within_delta(
+    ///        &DetectBox {
+    ///            bbox: BoundingBox {
+    ///                xmin: 0.5285137,
+    ///                ymin: 0.05305544,
+    ///                xmax: 0.87541467,
+    ///                ymax: 0.9998909,
+    ///            },
+    ///            score: 0.5591227,
+    ///            label: 0
+    ///        },
+    ///        1e-6
+    ///    ));
+    ///
+    /// #    Ok(())
+    /// # }
     pub fn decode_f32(
         &self,
         outputs: &[ArrayViewD<f32>],
