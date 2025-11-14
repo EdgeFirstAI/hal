@@ -8,9 +8,9 @@ use edgefirst_decoder::{
     Quantization, XYWH,
     byte::{nms_int, postprocess_boxes_quant},
     dequant_detect_box, dequantize_cpu, dequantize_cpu_chunked, dequantize_ndarray,
-    float::{nms_f32, postprocess_boxes_float},
-    modelpack::{ModelPackDetectionConfig, decode_modelpack_det, decode_modelpack_split},
-    yolo::{decode_yolo_det, decode_yolo_det_float, decode_yolo_segdet, decode_yolo_segdet_float},
+    float::{nms_float, postprocess_boxes_float},
+    modelpack::{ModelPackDetectionConfig, decode_modelpack_det, decode_modelpack_split_quant},
+    yolo::{decode_yolo_det, decode_yolo_det_float, decode_yolo_segdet_quant, decode_yolo_segdet_float},
 };
 use ndarray::s;
 
@@ -190,8 +190,6 @@ fn decoder_i16_dequantize_chunked(bencher: divan::Bencher) {
     let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
     let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
     let out: Vec<_> = out.iter().map(|x| *x as i16).collect();
-    // let output = ndarray::Array2::from_shape_vec((84, 8400),
-    // output.clone()).unwrap();
     let quant = Quantization {
         scale: 0.0040811873,
         zero_point: -123,
@@ -256,7 +254,7 @@ fn decoder_f32_nms(bencher: divan::Bencher) {
         .with_inputs(|| boxes.clone())
         .bench_local_values(|boxes| {
             let mut output_boxes: Vec<_> = Vec::with_capacity(50);
-            let boxes = nms_f32(iou_threshold, boxes);
+            let boxes = nms_float(iou_threshold, boxes);
             let len = output_boxes.capacity().min(boxes.len());
             output_boxes.clear();
             for b in boxes.into_iter().take(len) {
@@ -333,7 +331,7 @@ fn decoder_modelpack_split_u8(bencher: divan::Bencher) {
     let configs = [config0, config1];
     let mut output_boxes: Vec<_> = Vec::with_capacity(2);
     bencher.bench_local(|| {
-        decode_modelpack_split(
+        decode_modelpack_split_quant(
             &outputs,
             &configs,
             score_threshold,
@@ -404,7 +402,7 @@ fn decoder_masks_i8(bencher: divan::Bencher) {
     bencher.bench_local(|| {
         let mut output_boxes: Vec<_> = Vec::with_capacity(50);
         let mut output_masks: Vec<_> = Vec::with_capacity(50);
-        decode_yolo_segdet(
+        decode_yolo_segdet_quant(
             (boxes.view(), quant_boxes),
             (protos.view(), quant_protos),
             score_threshold,

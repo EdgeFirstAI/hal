@@ -11,6 +11,11 @@ use ndarray::{
 use num_traits::{AsPrimitive, PrimInt};
 use rayon::slice::ParallelSliceMut;
 
+/// Post processes boxes and scores tensors into quantized detection boxes,
+/// filtering out any boxes below the score threshold. The boxes tensor
+/// is converted to XYXY using the given BBoxTypeTrait. The order of the boxes
+/// is preserved.
+#[doc(hidden)]
 pub fn postprocess_boxes_quant<
     B: BBoxTypeTrait,
     Boxes: PrimInt + AsPrimitive<f32> + Send + Sync,
@@ -42,7 +47,15 @@ pub fn postprocess_boxes_quant<
         .collect()
 }
 
-pub fn postprocess_boxes_index<
+/// Post processes boxes and scores tensors into quantized detection boxes,
+/// filtering out any boxes below the score threshold. The boxes tensor
+/// is converted to XYXY using the given BBoxTypeTrait. The order of the boxes
+/// is preserved.
+///
+/// This function is very similar to `postprocess_boxes_quant` but will also
+/// return the index of the box. The boxes will be in ascending index order.
+#[doc(hidden)]
+pub fn postprocess_boxes_index_quant<
     B: BBoxTypeTrait,
     Boxes: PrimInt + AsPrimitive<f32> + Send + Sync,
     Scores: PrimInt + AsPrimitive<f32> + Send + Sync,
@@ -79,6 +92,9 @@ pub fn postprocess_boxes_index<
         .collect()
 }
 
+/// Uses NMS to filter boxes based on the score and iou. Sorts boxes by score,
+/// then greedily selects a subset of boxes in descending order of score.
+#[doc(hidden)]
 pub fn nms_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
     iou: f32,
     mut boxes: Vec<DetectBoxQuantized<SCORE>>,
@@ -113,6 +129,12 @@ pub fn nms_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
     boxes.into_iter().filter(|b| b.score > min_val).collect()
 }
 
+/// Uses NMS to filter boxes based on the score and iou. Sorts boxes by score,
+/// then greedily selects a subset of boxes in descending order of score.
+///
+/// This is same as `nms_int` but will also include extra information along
+/// with each box, such as the index
+#[doc(hidden)]
 pub fn nms_extra_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send + Sync>(
     iou: f32,
     mut boxes: Vec<(DetectBoxQuantized<SCORE>, E)>,
@@ -145,7 +167,11 @@ pub fn nms_extra_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send + 
     boxes.into_iter().filter(|b| b.0.score > min_val).collect()
 }
 
-pub(crate) fn quantize_score_threshold<T: PrimInt + AsPrimitive<f32>>(
+/// Quantizes a score from f32 to the given integer type, using the following
+/// formula `(score/quant.scale + quant.zero_point).ceil()`, then clamping to
+/// the min and max value of the given integer type
+#[doc(hidden)]
+pub fn quantize_score_threshold<T: PrimInt + AsPrimitive<f32>>(
     score: f32,
     quant: Quantization,
 ) -> T {
