@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
+// SPDX-License-Identifier: Apache-2.0
+
 use ndarray::{Array3, ArrayViewD, s};
 use ndarray_stats::QuantileExt;
 use num_traits::AsPrimitive;

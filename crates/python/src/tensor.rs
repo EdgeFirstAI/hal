@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
+// SPDX-License-Identifier: Apache-2.0
+
 use edgefirst::tensor::{self, TensorMapTrait as _, TensorTrait as _};
 use pyo3::{exceptions::PyBufferError, ffi::PyMemoryView_FromMemory, prelude::*};
 

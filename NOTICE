@@ -1,0 +1,28 @@
+# NOTICE
+
+EdgeFirst Hardware Abstraction Layer (HAL)  
+Copyright 2025 Au-Zone Technologies
+
+This product includes software developed at Au-Zone Technologies (https://au-zone.com/).
+
+## Third-Party Software
+
+See THIRD_PARTY.md in releases for complete attribution of third-party dependencies.
+
+This project uses the following major open-source components:
+
+- Rust Standard Library and toolchain
+- PyO3 - Python bindings for Rust
+- ndarray - N-dimensional array library
+- rayon - Data parallelism library
+- fast_image_resize - Image resizing library
+- zune-jpeg, zune-png - Image decoding libraries
+- dma-heap - Linux DMA heap allocator
+- four-char-code - FourCC format utilities
+
+For a complete list of dependencies with their licenses, run:
+```bash
+cargo tree --prefix none --edges normal | sort -u
+```
+
+All dependencies are compatible with the Apache License 2.0.

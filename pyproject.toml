@@ -1,6 +1,7 @@
 [project]
 name = "edgefirst"
 dynamic = ["version"]
+license = "Apache-2.0"
 
 [project.urls]
 Homepage = "https://edgefirst.studio"

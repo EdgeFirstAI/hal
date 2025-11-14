@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
+// SPDX-License-Identifier: Apache-2.0
+
 #![cfg_attr(nightly, feature(f16))]
 
 use pyo3::prelude::*;
@@ -63,7 +66,7 @@ pub mod edgefirst_hal {
         let f16_impl = "native f16 (nightly, optimized)";
         #[cfg(not(nightly))]
         let f16_impl = "half::f16 (stable, compatible)";
-        
+
         format!(
             "edgefirst-hal v{}\nf16 implementation: {}",
             env!("CARGO_PKG_VERSION"),

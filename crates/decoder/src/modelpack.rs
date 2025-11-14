@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
+// SPDX-License-Identifier: Apache-2.0
+
 use ndarray::{Array2, ArrayView2, ArrayView3};
 use num_traits::{AsPrimitive, Float, PrimInt};
 
