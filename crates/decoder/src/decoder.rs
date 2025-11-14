@@ -7,7 +7,7 @@ use num_traits::{AsPrimitive, Float};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DetectBox, Error, Quantization, Segmentation, XYWH,
+    DecoderError, DetectBox, Quantization, Segmentation, XYWH,
     configs::{DecoderType, ModelType, QuantTuple},
     dequantize_ndarray,
     modelpack::{
@@ -15,9 +15,9 @@ use crate::{
         decode_modelpack_split_float,
     },
     yolo::{
-        decode_yolo_det, decode_yolo_det_float, decode_yolo_segdet, decode_yolo_segdet_float,
-        decode_yolo_split_det, decode_yolo_split_det_f32, decode_yolo_split_segdet_float,
-        impl_yolo_split_segdet_8bit_get_boxes, impl_yolo_split_segdet_8bit_process_masks,
+        decode_yolo_det, decode_yolo_det_float, decode_yolo_segdet_float, decode_yolo_segdet_quant,
+        decode_yolo_split_det_float, decode_yolo_split_det_quant, decode_yolo_split_segdet_float,
+        impl_yolo_split_segdet_quant_get_boxes, impl_yolo_split_segdet_quant_process_masks,
     },
 };
 
@@ -245,8 +245,8 @@ impl Default for DecoderBuilder {
     ///
     /// # Examples
     /// ```rust
-    /// # use edgefirst_decoder::{DecoderBuilder, Error};
-    /// # fn main() -> Result<(), Error> {
+    /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
+    /// # fn main() -> DecoderResult<()> {
     /// #  let config_yaml = include_str!("../../../testdata/modelpack_split.yaml").to_string();
     /// let decoder = DecoderBuilder::default()
     ///     .with_config_yaml_str(config_yaml)
@@ -274,8 +274,8 @@ impl DecoderBuilder {
     ///
     /// # Examples
     /// ```rust
-    /// # use edgefirst_decoder::{DecoderBuilder, Error};
-    /// # fn main() -> Result<(), Error> {
+    /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
+    /// # fn main() -> DecoderResult<()> {
     /// #  let config_yaml = include_str!("../../../testdata/modelpack_split.yaml").to_string();
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_yaml_str(config_yaml)
@@ -296,8 +296,8 @@ impl DecoderBuilder {
     ///
     /// # Examples
     /// ```rust
-    /// # use edgefirst_decoder::{DecoderBuilder, Error};
-    /// # fn main() -> Result<(), Error> {
+    /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
+    /// # fn main() -> DecoderResult<()> {
     /// let config_yaml = include_str!("../../../testdata/modelpack_split.yaml").to_string();
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_yaml_str(config_yaml)
@@ -317,8 +317,8 @@ impl DecoderBuilder {
     ///
     /// # Examples
     /// ```rust
-    /// # use edgefirst_decoder::{DecoderBuilder, Error};
-    /// # fn main() -> Result<(), Error> {
+    /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
+    /// # fn main() -> DecoderResult<()> {
     /// let config_json = include_str!("../../../testdata/modelpack_split.json").to_string();
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_json_str(config_json)
@@ -339,8 +339,8 @@ impl DecoderBuilder {
     ///
     /// # Examples
     /// ```rust
-    /// # use edgefirst_decoder::{DecoderBuilder, Error};
-    /// # fn main() -> Result<(), Error> {
+    /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
+    /// # fn main() -> DecoderResult<()> {
     /// let config_json = include_str!("../../../testdata/modelpack_split.json");
     /// let config = serde_json::from_str(config_json)?;
     /// let decoder = DecoderBuilder::new().with_config(config).build()?;
@@ -358,8 +358,8 @@ impl DecoderBuilder {
     ///
     /// # Examples
     /// ```rust
-    /// # use edgefirst_decoder::{ DecoderBuilder, Error, configs };
-    /// # fn main() -> Result<(), Error> {
+    /// # use edgefirst_decoder::{ DecoderBuilder, DecoderResult, configs };
+    /// # fn main() -> DecoderResult<()> {
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_yolo_det(configs::Detection {
     ///         anchors: None,
@@ -386,8 +386,8 @@ impl DecoderBuilder {
     ///
     /// # Examples
     /// ```rust
-    /// # use edgefirst_decoder::{ DecoderBuilder, Error, configs };
-    /// # fn main() -> Result<(), Error> {
+    /// # use edgefirst_decoder::{ DecoderBuilder, DecoderResult, configs };
+    /// # fn main() -> DecoderResult<()> {
     /// let boxes_config = configs::Boxes {
     ///     decoder: configs::DecoderType::Yolov8,
     ///     quantization: Some(configs::QuantTuple(0.012345, 26)),
@@ -423,8 +423,8 @@ impl DecoderBuilder {
     ///
     /// # Examples
     /// ```rust
-    /// # use edgefirst_decoder::{ DecoderBuilder, Error, configs };
-    /// # fn main() -> Result<(), Error> {
+    /// # use edgefirst_decoder::{ DecoderBuilder, DecoderResult, configs };
+    /// # fn main() -> DecoderResult<()> {
     /// let seg_config = configs::Segmentation {
     ///     decoder: configs::DecoderType::Yolov8,
     ///     quantization: Some(configs::QuantTuple(0.012345, 26)),
@@ -463,8 +463,8 @@ impl DecoderBuilder {
     ///
     /// # Examples
     /// ```rust
-    /// # use edgefirst_decoder::{ DecoderBuilder, Error, configs };
-    /// # fn main() -> Result<(), Error> {
+    /// # use edgefirst_decoder::{ DecoderBuilder, DecoderResult, configs };
+    /// # fn main() -> DecoderResult<()> {
     /// let boxes_config = configs::Boxes {
     ///     decoder: configs::DecoderType::Yolov8,
     ///     quantization: Some(configs::QuantTuple(0.012345, 26)),
@@ -519,8 +519,8 @@ impl DecoderBuilder {
     ///
     /// # Examples
     /// ```rust
-    /// # use edgefirst_decoder::{ DecoderBuilder, Error, configs };
-    /// # fn main() -> Result<(), Error> {
+    /// # use edgefirst_decoder::{ DecoderBuilder, DecoderResult, configs };
+    /// # fn main() -> DecoderResult<()> {
     /// let boxes_config = configs::Boxes {
     ///     decoder: configs::DecoderType::ModelPack,
     ///     quantization: Some(configs::QuantTuple(0.012345, 26)),
@@ -556,8 +556,8 @@ impl DecoderBuilder {
     ///
     /// # Examples
     /// ```rust
-    /// # use edgefirst_decoder::{ DecoderBuilder, Error, configs };
-    /// # fn main() -> Result<(), Error> {
+    /// # use edgefirst_decoder::{ DecoderBuilder, DecoderResult, configs };
+    /// # fn main() -> DecoderResult<()> {
     /// let config0 = configs::Detection {
     ///     anchors: Some(vec![
     ///         [0.13750000298023224, 0.2074074000120163],
@@ -599,8 +599,8 @@ impl DecoderBuilder {
     ///
     /// # Examples
     /// ```rust
-    /// # use edgefirst_decoder::{ DecoderBuilder, Error, configs };
-    /// # fn main() -> Result<(), Error> {
+    /// # use edgefirst_decoder::{ DecoderBuilder, DecoderResult, configs };
+    /// # fn main() -> DecoderResult<()> {
     /// let boxes_config = configs::Boxes {
     ///     decoder: configs::DecoderType::ModelPack,
     ///     quantization: Some(configs::QuantTuple(0.012345, 26)),
@@ -647,8 +647,8 @@ impl DecoderBuilder {
     ///
     /// # Examples
     /// ```rust
-    /// # use edgefirst_decoder::{ DecoderBuilder, Error, configs };
-    /// # fn main() -> Result<(), Error> {
+    /// # use edgefirst_decoder::{ DecoderBuilder, DecoderResult, configs };
+    /// # fn main() -> DecoderResult<()> {
     /// let config0 = configs::Detection {
     ///     anchors: Some(vec![
     ///         [0.36666667461395264, 0.31481480598449707],
@@ -703,8 +703,8 @@ impl DecoderBuilder {
     ///
     /// # Examples
     /// ```rust
-    /// # use edgefirst_decoder::{ DecoderBuilder, Error, configs };
-    /// # fn main() -> Result<(), Error> {
+    /// # use edgefirst_decoder::{ DecoderBuilder, DecoderResult, configs };
+    /// # fn main() -> DecoderResult<()> {
     /// let seg_config = configs::Segmentation {
     ///     decoder: configs::DecoderType::ModelPack,
     ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
@@ -729,8 +729,8 @@ impl DecoderBuilder {
     ///
     /// # Examples
     /// ```rust
-    /// # use edgefirst_decoder::{DecoderBuilder, Error};
-    /// # fn main() -> Result<(), Error> {
+    /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
+    /// # fn main() -> DecoderResult<()> {
     /// # let config_json = include_str!("../../../testdata/modelpack_split.json").to_string();
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_json_str(config_json)
@@ -749,8 +749,8 @@ impl DecoderBuilder {
     ///
     /// # Examples
     /// ```rust
-    /// # use edgefirst_decoder::{DecoderBuilder, Error};
-    /// # fn main() -> Result<(), Error> {
+    /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
+    /// # fn main() -> DecoderResult<()> {
     /// # let config_json = include_str!("../../../testdata/modelpack_split.json").to_string();
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_json_str(config_json)
@@ -771,8 +771,8 @@ impl DecoderBuilder {
     ///
     /// # Examples
     /// ```rust
-    /// # use edgefirst_decoder::{DecoderBuilder, Error};
-    /// # fn main() -> Result<(), Error> {
+    /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
+    /// # fn main() -> DecoderResult<()> {
     /// # let config_json = include_str!("../../../testdata/modelpack_split.json").to_string();
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_json_str(config_json)
@@ -781,12 +781,12 @@ impl DecoderBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn build(self) -> Result<Decoder, Error> {
+    pub fn build(self) -> Result<Decoder, DecoderError> {
         let config = match self.config_src {
             Some(ConfigSource::Json(s)) => serde_json::from_str(&s)?,
             Some(ConfigSource::Yaml(s)) => serde_yaml::from_str(&s)?,
             Some(ConfigSource::Config(c)) => c,
-            None => return Err(Error::NoConfig),
+            None => return Err(DecoderError::NoConfig),
         };
         let model_type = Self::get_model_type(config.outputs)?;
         Ok(Decoder {
@@ -796,7 +796,7 @@ impl DecoderBuilder {
         })
     }
 
-    fn get_model_type(configs: Vec<ConfigOutput>) -> Result<ModelType, Error> {
+    fn get_model_type(configs: Vec<ConfigOutput>) -> Result<ModelType, DecoderError> {
         // yolo or modelpack
         let mut yolo = false;
         let mut modelpack = false;
@@ -807,18 +807,18 @@ impl DecoderBuilder {
             }
         }
         match (modelpack, yolo) {
-            (true, true) => Err(Error::InvalidConfig(
+            (true, true) => Err(DecoderError::InvalidConfig(
                 "Both ModelPack and Yolo outputs found in config".to_string(),
             )),
             (true, false) => Self::get_model_type_modelpack(configs),
             (false, true) => Self::get_model_type_yolo(configs),
-            (false, false) => Err(Error::InvalidConfig(
+            (false, false) => Err(DecoderError::InvalidConfig(
                 "No outputs found in config".to_string(),
             )),
         }
     }
 
-    fn get_model_type_yolo(configs: Vec<ConfigOutput>) -> Result<ModelType, Error> {
+    fn get_model_type_yolo(configs: Vec<ConfigOutput>) -> Result<ModelType, DecoderError> {
         let mut boxes = None;
         let mut seg_boxes = None;
         let mut protos = None;
@@ -832,7 +832,7 @@ impl DecoderBuilder {
                     if segmentation.shape.len() == 3 {
                         seg_boxes = Some(segmentation)
                     } else {
-                        return Err(Error::InvalidConfig(format!(
+                        return Err(DecoderError::InvalidConfig(format!(
                             "Invalid Yolo Segmentation shape {:?}",
                             segmentation.shape
                         )));
@@ -840,7 +840,7 @@ impl DecoderBuilder {
                 }
                 ConfigOutput::Protos(protos_) => protos = Some(protos_),
                 ConfigOutput::Mask(_) => {
-                    return Err(Error::InvalidConfig(
+                    return Err(DecoderError::InvalidConfig(
                         "Invalid Mask output with Yolo decoder".to_string(),
                     ));
                 }
@@ -872,13 +872,13 @@ impl DecoderBuilder {
                 Ok(ModelType::YoloSplitDet { boxes, scores })
             }
         } else {
-            Err(Error::InvalidConfig(
+            Err(DecoderError::InvalidConfig(
                 "Invalid Yolo model outputs".to_string(),
             ))
         }
     }
 
-    fn get_model_type_modelpack(configs: Vec<ConfigOutput>) -> Result<ModelType, Error> {
+    fn get_model_type_modelpack(configs: Vec<ConfigOutput>) -> Result<ModelType, DecoderError> {
         let mut split_decoders = Vec::new();
         let mut segment_ = None;
         let mut scores_ = None;
@@ -889,14 +889,14 @@ impl DecoderBuilder {
                 ConfigOutput::Segmentation(segmentation) => segment_ = Some(segmentation),
                 ConfigOutput::Mask(_) => {}
                 ConfigOutput::Protos(_) => {
-                    return Err(Error::InvalidConfig(
+                    return Err(DecoderError::InvalidConfig(
                         "ModelPack should not have protos".to_string(),
                     ));
                 }
                 ConfigOutput::Scores(scores) => scores_ = Some(scores),
                 ConfigOutput::Boxes(boxes) => boxes_ = Some(boxes),
                 ConfigOutput::MaskCoefficients(_) => {
-                    return Err(Error::InvalidConfig(
+                    return Err(DecoderError::InvalidConfig(
                         "ModelPack should not have mask coefficients".to_string(),
                     ));
                 }
@@ -929,7 +929,7 @@ impl DecoderBuilder {
         {
             Ok(ModelType::ModelPackDet { boxes, scores })
         } else {
-            Err(Error::InvalidConfig(
+            Err(DecoderError::InvalidConfig(
                 "Invalid ModelPack model outputs".to_string(),
             ))
         }
@@ -1038,8 +1038,8 @@ impl Decoder {
     /// # Examples
     ///
     /// ```rust
-    /// # use edgefirst_decoder::{DecoderBuilder, Error, configs::ModelType};
-    /// # fn main() -> Result<(), Error> {
+    /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult, configs::ModelType};
+    /// # fn main() -> DecoderResult<()> {
     /// #    let config_yaml = include_str!("../../../testdata/modelpack_split.yaml").to_string();
     ///     let decoder = DecoderBuilder::default()
     ///         .with_config_yaml_str(config_yaml)
@@ -1067,9 +1067,9 @@ impl Decoder {
     /// # Examples
     ///
     /// ```rust
-    /// # use edgefirst_decoder::{BoundingBox, DecoderBuilder, DetectBox, Error};
+    /// # use edgefirst_decoder::{BoundingBox, DecoderBuilder, DetectBox, DecoderResult};
     /// # use ndarray::Array4;
-    /// # fn main() -> Result<(), Error> {
+    /// # fn main() -> DecoderResult<()> {
     /// #    let detect0 = include_bytes!("../../../testdata/modelpack_split_9x15x18.bin");
     /// #    let detect0 = ndarray::Array4::from_shape_vec((1, 9, 15, 18), detect0.to_vec())?;
     /// #
@@ -1109,7 +1109,7 @@ impl Decoder {
         outputs: &[ArrayViewDQuantized],
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), DecoderError> {
         output_boxes.clear();
         output_masks.clear();
         match &self.model_type {
@@ -1180,9 +1180,9 @@ impl Decoder {
     /// # Examples
     ///
     /// ```rust
-    /// # use edgefirst_decoder::{BoundingBox, DecoderBuilder, DetectBox, Error, configs::Boxes, configs::DecoderType, configs::Detection, dequantize_cpu, Quantization};
+    /// # use edgefirst_decoder::{BoundingBox, DecoderBuilder, DetectBox, DecoderResult, configs::Boxes, configs::DecoderType, configs::Detection, dequantize_cpu, Quantization};
     /// # use ndarray::Array3;
-    /// # fn main() -> Result<(), Error> {
+    /// # fn main() -> DecoderResult<()> {
     /// #   let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
     /// #   let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
     /// #   let mut out_dequant = vec![0.0_f64; 84 * 8400];
@@ -1226,7 +1226,7 @@ impl Decoder {
         outputs: &[ArrayViewD<T>],
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
-    ) -> Result<(), Error>
+    ) -> Result<(), DecoderError>
     where
         T: Float + AsPrimitive<f32> + AsPrimitive<u8> + Send + Sync + 'static,
         f32: AsPrimitive<T>,
@@ -1293,7 +1293,7 @@ impl Decoder {
         boxes: &configs::Boxes,
         scores: &configs::Scores,
         output_boxes: &mut Vec<DetectBox>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), DecoderError> {
         let (boxes_tensor, ind) =
             Self::find_outputs_with_shape_quantized(&boxes.shape, outputs, &[])?;
         let (scores_tensor, _) =
@@ -1336,7 +1336,7 @@ impl Decoder {
         outputs: &[ArrayViewDQuantized],
         segmentation: &configs::Segmentation,
         output_masks: &mut Vec<Segmentation>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), DecoderError> {
         let (seg, _) = Self::find_outputs_with_shape_quantized(&segmentation.shape, outputs, &[])?;
 
         macro_rules! modelpack_seg {
@@ -1392,7 +1392,7 @@ impl Decoder {
         outputs: &[ArrayViewDQuantized],
         detection: &[configs::Detection],
         output_boxes: &mut Vec<DetectBox>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), DecoderError> {
         let new_detection = detection
             .iter()
             .map(|x| ModelPackDetectionConfig {
@@ -1444,7 +1444,7 @@ impl Decoder {
         outputs: &[ArrayViewDQuantized],
         boxes: &configs::Detection,
         output_boxes: &mut Vec<DetectBox>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), DecoderError> {
         let (boxes_tensor, _) =
             Self::find_outputs_with_shape_quantized(&boxes.shape, outputs, &[])?;
         let quant_boxes = boxes
@@ -1475,7 +1475,7 @@ impl Decoder {
         protos: &configs::Protos,
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), DecoderError> {
         let (boxes_tensor, ind) =
             Self::find_outputs_with_shape_quantized(&boxes.shape, outputs, &[])?;
         let (protos_tensor, _) =
@@ -1503,7 +1503,7 @@ impl Decoder {
                     protos_tensor.swap_axes(1, 2);
                 }
 
-                decode_yolo_segdet(
+                decode_yolo_segdet_quant(
                     (box_tensor, quant_boxes),
                     (protos_tensor, quant_protos),
                     self.score_threshold,
@@ -1523,7 +1523,7 @@ impl Decoder {
         boxes: &configs::Boxes,
         scores: &configs::Scores,
         output_boxes: &mut Vec<DetectBox>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), DecoderError> {
         let (boxes_tensor, ind) =
             Self::find_outputs_with_shape_quantized(&boxes.shape, outputs, &[])?;
         let (scores_tensor, _) =
@@ -1548,7 +1548,7 @@ impl Decoder {
                 if scores.channels_first {
                     scores_tensor.swap_axes(0, 1);
                 };
-                decode_yolo_split_det(
+                decode_yolo_split_det_quant(
                     (boxes_tensor, quant_boxes),
                     (scores_tensor, quant_scores),
                     self.score_threshold,
@@ -1571,7 +1571,7 @@ impl Decoder {
         protos: &configs::Protos,
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), DecoderError> {
         let quant_boxes = boxes
             .quantization
             .map(Quantization::from)
@@ -1618,7 +1618,7 @@ impl Decoder {
                     scores_tensor.swap_axes(0, 1);
                 };
 
-                impl_yolo_split_segdet_8bit_get_boxes::<XYWH, _, _>(
+                impl_yolo_split_segdet_quant_get_boxes::<XYWH, _, _>(
                     (boxes_tensor, quant_boxes),
                     (scores_tensor, quant_scores),
                     self.score_threshold,
@@ -1641,7 +1641,7 @@ impl Decoder {
                     protos_tensor.swap_axes(1, 2);
                 }
 
-                impl_yolo_split_segdet_8bit_process_masks::<_, _>(
+                impl_yolo_split_segdet_quant_process_masks::<_, _>(
                     boxes,
                     (mask_tensor, quant_masks),
                     (protos_tensor, quant_protos),
@@ -1659,7 +1659,7 @@ impl Decoder {
         outputs: &[ArrayViewD<D>],
         detection: &[configs::Detection],
         output_boxes: &mut Vec<DetectBox>,
-    ) -> Result<(), Error>
+    ) -> Result<(), DecoderError>
     where
         D: AsPrimitive<f32>,
     {
@@ -1690,7 +1690,7 @@ impl Decoder {
         outputs: &[ArrayViewD<T>],
         segmentation: &configs::Segmentation,
         output_masks: &mut Vec<Segmentation>,
-    ) -> Result<(), Error>
+    ) -> Result<(), DecoderError>
     where
         T: Float + AsPrimitive<f32> + AsPrimitive<u8> + Send + Sync + 'static,
         f32: AsPrimitive<T>,
@@ -1722,7 +1722,7 @@ impl Decoder {
         boxes: &configs::Boxes,
         scores: &configs::Scores,
         output_boxes: &mut Vec<DetectBox>,
-    ) -> Result<(), Error>
+    ) -> Result<(), DecoderError>
     where
         T: Float + AsPrimitive<f32> + Send + Sync + 'static,
         f32: AsPrimitive<T>,
@@ -1754,7 +1754,7 @@ impl Decoder {
         outputs: &[ArrayViewD<T>],
         boxes: &configs::Detection,
         output_boxes: &mut Vec<DetectBox>,
-    ) -> Result<(), Error>
+    ) -> Result<(), DecoderError>
     where
         T: Float + AsPrimitive<f32> + Send + Sync + 'static,
         f32: AsPrimitive<T>,
@@ -1781,7 +1781,7 @@ impl Decoder {
         protos: &configs::Protos,
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
-    ) -> Result<(), Error>
+    ) -> Result<(), DecoderError>
     where
         T: Float + AsPrimitive<f32> + Send + Sync + 'static,
         f32: AsPrimitive<T>,
@@ -1816,7 +1816,7 @@ impl Decoder {
         boxes: &configs::Boxes,
         scores: &configs::Scores,
         output_boxes: &mut Vec<DetectBox>,
-    ) -> Result<(), Error>
+    ) -> Result<(), DecoderError>
     where
         T: Float + AsPrimitive<f32> + Send + Sync + 'static,
         f32: AsPrimitive<T>,
@@ -1833,7 +1833,7 @@ impl Decoder {
             scores_tensor.swap_axes(0, 1);
         };
 
-        decode_yolo_split_det_f32(
+        decode_yolo_split_det_float(
             boxes_tensor,
             scores_tensor,
             self.score_threshold,
@@ -1853,7 +1853,7 @@ impl Decoder {
         protos: &configs::Protos,
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
-    ) -> Result<(), Error>
+    ) -> Result<(), DecoderError>
     where
         T: Float + AsPrimitive<f32> + Send + Sync + 'static,
         f32: AsPrimitive<T>,
@@ -1903,7 +1903,7 @@ impl Decoder {
     fn match_outputs_to_detect<'a, 'b, T>(
         configs: &[configs::Detection],
         outputs: &'a [ArrayViewD<'b, T>],
-    ) -> Result<Vec<&'a ArrayViewD<'b, T>>, Error> {
+    ) -> Result<Vec<&'a ArrayViewD<'b, T>>, DecoderError> {
         let mut new_output_order = Vec::new();
         for c in configs {
             let mut found = false;
@@ -1915,7 +1915,7 @@ impl Decoder {
                 }
             }
             if !found {
-                return Err(Error::InvalidShape(format!(
+                return Err(DecoderError::InvalidShape(format!(
                     "Did not find output with shape {:?}",
                     c.shape
                 )));
@@ -1928,7 +1928,7 @@ impl Decoder {
         shape: &[usize],
         outputs: &'a [ArrayViewD<'b, T>],
         skip: &[usize],
-    ) -> Result<(&'a ArrayViewD<'b, T>, usize), Error> {
+    ) -> Result<(&'a ArrayViewD<'b, T>, usize), DecoderError> {
         for (ind, o) in outputs.iter().enumerate() {
             if skip.contains(&ind) {
                 continue;
@@ -1937,7 +1937,7 @@ impl Decoder {
                 return Ok((o, ind));
             }
         }
-        Err(Error::InvalidShape(format!(
+        Err(DecoderError::InvalidShape(format!(
             "Did not find output with shape {:?}",
             shape
         )))
@@ -1947,7 +1947,7 @@ impl Decoder {
         shape: &[usize],
         outputs: &'a [ArrayViewDQuantized<'b>],
         skip: &[usize],
-    ) -> Result<(&'a ArrayViewDQuantized<'b>, usize), Error> {
+    ) -> Result<(&'a ArrayViewDQuantized<'b>, usize), DecoderError> {
         for (ind, o) in outputs.iter().enumerate() {
             if skip.contains(&ind) {
                 continue;
@@ -1956,7 +1956,7 @@ impl Decoder {
                 return Ok((o, ind));
             }
         }
-        Err(Error::InvalidShape(format!(
+        Err(DecoderError::InvalidShape(format!(
             "Did not find output with shape {:?}",
             shape
         )))
@@ -1965,7 +1965,7 @@ impl Decoder {
     fn match_outputs_to_detect_quantized<'a, 'b>(
         configs: &[configs::Detection],
         outputs: &'a [ArrayViewDQuantized<'b>],
-    ) -> Result<Vec<&'a ArrayViewDQuantized<'b>>, Error> {
+    ) -> Result<Vec<&'a ArrayViewDQuantized<'b>>, DecoderError> {
         let mut new_output_order = Vec::new();
         for c in configs {
             let mut found = false;
@@ -1977,7 +1977,7 @@ impl Decoder {
                 }
             }
             if !found {
-                return Err(Error::InvalidShape(format!(
+                return Err(DecoderError::InvalidShape(format!(
                     "Did not find output with shape {:?}",
                     c.shape
                 )));

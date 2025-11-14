@@ -2,10 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! EdgeFirst HAL - Decoders
-#![allow(clippy::excessive_precision)]
 use ndarray::{Array, Array2, Array3, ArrayView, ArrayView1, ArrayView3, Dimension};
-use num_traits::{AsPrimitive, Float, PrimInt, Signed};
-use std::ops::{Add, Mul, Sub};
+use num_traits::{AsPrimitive, Float, PrimInt};
+
 pub mod byte;
 pub mod error;
 pub mod float;
@@ -15,13 +14,14 @@ pub mod yolo;
 mod decoder;
 pub use decoder::*;
 
-pub use error::Error;
+pub use error::{DecoderError, DecoderResult};
 
 use crate::{
     decoder::configs::QuantTuple, modelpack::modelpack_segmentation_to_mask,
     yolo::yolo_segmentation_to_mask,
 };
 
+/// Trait to convert bounding box formats to XYXY float format
 pub trait BBoxTypeTrait {
     /// Converts the bbox into XYXY float format.
     fn to_xyxy_float<A: Float + 'static, B: AsPrimitive<A>>(input: &[B; 4]) -> [A; 4];
@@ -57,6 +57,7 @@ pub trait BBoxTypeTrait {
     }
 }
 
+/// Converts XYXY bounding boxes to XYXY
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct XYXY {}
 
@@ -91,6 +92,8 @@ impl BBoxTypeTrait for XYXY {
     }
 }
 
+/// Converts XYWH bounding boxes to XYXY. The XY values are the center of the
+/// box
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct XYWH {}
 
@@ -142,6 +145,7 @@ impl BBoxTypeTrait for XYWH {
     }
 }
 
+/// Describes the quantization parameters for a tensor
 #[derive(Debug, Copy, Clone)]
 pub struct Quantization {
     pub scale: f32,
@@ -149,19 +153,30 @@ pub struct Quantization {
 }
 
 impl Quantization {
+    /// Creates a new Quantization struct
+    /// # Examples
+    /// ```
+    /// # use edgefirst_decoder::Quantization;
+    /// let quant = Quantization::new(0.1, -128);
+    /// assert_eq!(quant.scale, 0.1);
+    /// assert_eq!(quant.zero_point, -128);
+    /// ```
     pub fn new(scale: f32, zero_point: i32) -> Self {
         Self { scale, zero_point }
-    }
-
-    pub fn from_array<F: AsPrimitive<i32> + AsPrimitive<f32>>(value: [F; 2]) -> Self {
-        Quantization {
-            scale: value[0].as_(),
-            zero_point: value[1].as_(),
-        }
     }
 }
 
 impl From<QuantTuple> for Quantization {
+    /// Creates a new Quantization struct from a QuantTuple
+    /// # Examples
+    /// ```
+    /// # use edgefirst_decoder::Quantization;
+    /// # use edgefirst_decoder::configs::QuantTuple;
+    /// let quant_tuple = QuantTuple(0.1_f32, -128_i32);
+    /// let quant = Quantization::from(quant_tuple);
+    /// assert_eq!(quant.scale, 0.1);
+    /// assert_eq!(quant.zero_point, -128);
+    /// ```
     fn from(quant_tuple: QuantTuple) -> Quantization {
         Quantization {
             scale: quant_tuple.0,
@@ -175,6 +190,14 @@ where
     S: AsPrimitive<f32>,
     Z: AsPrimitive<i32>,
 {
+    /// Creates a new Quantization struct from a tuple
+    /// # Examples
+    /// ```
+    /// # use edgefirst_decoder::Quantization;
+    /// let quant = Quantization::from((0.1_f64, -128_i64));
+    /// assert_eq!(quant.scale, 0.1);
+    /// assert_eq!(quant.zero_point, -128);
+    /// ```
     fn from((scale, zp): (S, Z)) -> Quantization {
         Self {
             scale: scale.as_(),
@@ -184,6 +207,7 @@ where
 }
 
 impl Default for Quantization {
+    /// Creates a default Quantization struct with scale 1.0 and zero_point 0
     fn default() -> Self {
         Self {
             scale: 1.0,
@@ -192,6 +216,7 @@ impl Default for Quantization {
     }
 }
 
+/// A detection box with f32 bbox and score
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct DetectBox {
     pub bbox: BoundingBox,
@@ -201,6 +226,7 @@ pub struct DetectBox {
     pub label: usize,
 }
 
+/// A bounding box with f32 coordinates in XYXY format
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct BoundingBox {
     /// left-most normalized coordinate of the bounding box
@@ -214,7 +240,24 @@ pub struct BoundingBox {
 }
 
 impl BoundingBox {
-    /// Transforms BoundingBox so that xmin <= xmax and ymin <= ymax
+    /// Creates a new BoundingBox
+    pub fn new(xmin: f32, ymin: f32, xmax: f32, ymax: f32) -> Self {
+        Self {
+            xmin,
+            ymin,
+            xmax,
+            ymax,
+        }
+    }
+
+    /// Transforms BoundingBox so that `xmin <= xmax` and `ymin <= ymax`
+    ///
+    /// ```
+    /// # use edgefirst_decoder::BoundingBox;
+    /// let bbox = BoundingBox::new(0.8, 0.6, 0.4, 0.2);
+    /// let canonical_bbox = bbox.to_canonical();
+    /// assert_eq!(canonical_bbox, BoundingBox::new(0.4, 0.2, 0.8, 0.6));
+    /// ```
     pub fn to_canonical(&self) -> Self {
         let xmin = self.xmin.min(self.xmax);
         let xmax = self.xmin.max(self.xmax);
@@ -230,12 +273,16 @@ impl BoundingBox {
 }
 
 impl From<BoundingBox> for [f32; 4] {
+    /// Converts a BoundingBox into an array of 4 f32 values in xmin, ymin,
+    /// xmax, ymax order
     fn from(b: BoundingBox) -> Self {
         [b.xmin, b.ymin, b.xmax, b.ymax]
     }
 }
 
 impl From<[f32; 4]> for BoundingBox {
+    // Converts an array of 4 f32 values in xmin, ymin, xmax, ymax order into a
+    // BoundingBox
     fn from(arr: [f32; 4]) -> Self {
         BoundingBox {
             xmin: arr[0],
@@ -247,10 +294,10 @@ impl From<[f32; 4]> for BoundingBox {
 }
 
 impl DetectBox {
-    /// Check if one detect box is equal to another detect box, within the given
-    /// delta
-    pub fn equal_within_delta(&self, rhs: &DetectBox, delta: f32) -> bool {
-        let eq_delta = |a: f32, b: f32| (a - b).abs() <= delta;
+    /// Returns true if one detect box is equal to another detect box, within
+    /// the given `eps`
+    pub fn equal_within_delta(&self, rhs: &DetectBox, eps: f32) -> bool {
+        let eq_delta = |a: f32, b: f32| (a - b).abs() <= eps;
         self.label == rhs.label
             && eq_delta(self.score, rhs.score)
             && eq_delta(self.bbox.xmin, rhs.bbox.xmin)
@@ -260,20 +307,8 @@ impl DetectBox {
     }
 }
 
-// impl edgefirst_tracker::DetectionBox for DetectBox {
-//     fn bbox(&self) -> [f32; 4] {
-//         self.bbox.into()
-//     }
-
-//     fn score(&self) -> f32 {
-//         self.score
-//     }
-
-//     fn label(&self) -> usize {
-//         self.label
-//     }
-// }
-
+/// A segmentation result with a segmentation mask, and a normalized bounding
+/// box representing the area that the segmentation mask covers
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Segmentation {
     /// left-most normalized coordinate of the segmentation box
@@ -289,12 +324,7 @@ pub struct Segmentation {
     pub segmentation: Array3<u8>,
 }
 
-/// A quantized bounding box used to process boxes faster. The coordinates are
-/// 2x the actual coordinates to prevent needing to round for XYWH boxes. The
-/// coordinates should be shifted to the zero point already.
-///
-/// When choosing T, make sure to choose a type that is wider than the input
-/// data to prevent overflow or underflow
+/// A detection box with a f32 bbox and quantized score
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DetectBoxQuantized<
     // BOX: Signed + PrimInt + AsPrimitive<f32>,
@@ -309,40 +339,7 @@ pub struct DetectBoxQuantized<
     pub label: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct BoundingBoxQuantized<T: Copy + Signed + Mul + Add + Sub + Ord + AsPrimitive<f32>> {
-    /// 2x left-most coordinate of the bounding box. Should already be shifted
-    /// to zero point
-    pub xmin: T,
-    /// 2x top-most coordinate of the bounding box. Should already be shifted to
-    /// zero point
-    pub ymin: T,
-    /// 2x right-most coordinate of the bounding box. Should already be shifted
-    /// to zero point
-    pub xmax: T,
-    /// 2x bottom-most coordinate of the bounding box. Should already be shifted
-    /// to zero point
-    pub ymax: T,
-}
-
-impl<T: Copy + Signed + Mul + Add + Sub + Ord + AsPrimitive<f32>> BoundingBoxQuantized<T> {
-    pub fn to_array(&self) -> [T; 4] {
-        [self.xmin, self.ymin, self.xmax, self.ymax]
-    }
-
-    pub fn from_array(arr: &[T; 4]) -> Self {
-        Self {
-            xmin: arr[0],
-            ymin: arr[1],
-            xmax: arr[2],
-            ymax: arr[3],
-        }
-    }
-}
-
-/// Turns a DetectBoxQuantized into a DetectBox. The zero point is not used
-/// for quant_boxes as the DetectBoxQuantized is already be shifted to
-/// the zero points
+/// Turns a DetectBoxQuantized into a DetectBox by dequantizing the score
 pub fn dequant_detect_box<SCORE: PrimInt + AsPrimitive<f32>>(
     detect: &DetectBoxQuantized<SCORE>,
     quant_scores: Quantization,
@@ -355,6 +352,8 @@ pub fn dequant_detect_box<SCORE: PrimInt + AsPrimitive<f32>>(
     }
 }
 
+/// Dequantizes an ndarray from quantized values to f32 values using the given
+/// quantization parameters
 pub fn dequantize_ndarray<T: AsPrimitive<F>, D: Dimension, F: Float + 'static>(
     input: ArrayView<T, D>,
     quant: Quantization,
@@ -373,6 +372,18 @@ where
     }
 }
 
+/// Dequantizes a slice from quantized values to float values using the given
+/// quantization parameters
+///
+/// # Examples
+/// ```
+/// # use edgefirst_decoder::{dequantize_cpu, Quantization};
+/// let quant = Quantization::new(0.1, -128);
+/// let input: Vec<i8> = vec![0, 127, -128, 64];
+/// let mut output: Vec<f32> = vec![0.0; input.len()];
+/// dequantize_cpu(&input, quant, &mut output);
+/// assert_eq!(output, vec![12.8, 25.5, 0.0, 19.2]);
+/// ```
 pub fn dequantize_cpu<T: AsPrimitive<F>, F: Float + 'static>(
     input: &[T],
     quant: Quantization,
@@ -398,6 +409,19 @@ pub fn dequantize_cpu<T: AsPrimitive<F>, F: Float + 'static>(
     }
 }
 
+/// Dequantizes a slice from quantized values to float values using the given
+/// quantization parameters, using chunked processing. This is around 5% faster
+/// than `dequantize_cpu` for large slices.
+///
+/// # Examples
+/// ```
+/// # use edgefirst_decoder::{dequantize_cpu_chunked, Quantization};
+/// let quant = Quantization::new(0.1, -128);
+/// let input: Vec<i8> = vec![0, 127, -128, 64];
+/// let mut output: Vec<f32> = vec![0.0; input.len()];
+/// dequantize_cpu_chunked(&input, quant, &mut output);
+/// assert_eq!(output, vec![12.8, 25.5, 0.0, 19.2]);
+/// ```
 pub fn dequantize_cpu_chunked<T: AsPrimitive<F>, F: Float + 'static>(
     input: &[T],
     quant: Quantization,
@@ -409,39 +433,38 @@ pub fn dequantize_cpu_chunked<T: AsPrimitive<F>, F: Float + 'static>(
     assert!(input.len() == output.len());
     let zero_point = quant.zero_point.as_();
     let scale = quant.scale.as_();
+
+    let input = input.as_chunks::<4>();
+    let output = output.as_chunks_mut::<4>();
+
     if zero_point != F::zero() {
         let scaled_zero = -zero_point * scale; // scale * (d - zero_point) = d * scale - zero_point * scale
 
-        for (d, deq) in input.chunks_exact(4).zip(output.chunks_exact_mut(4)) {
-            unsafe {
-                *deq.get_unchecked_mut(0) = d.get_unchecked(0).as_() * scale + scaled_zero;
-                *deq.get_unchecked_mut(1) = d.get_unchecked(1).as_() * scale + scaled_zero;
-                *deq.get_unchecked_mut(2) = d.get_unchecked(2).as_() * scale + scaled_zero;
-                *deq.get_unchecked_mut(3) = d.get_unchecked(3).as_() * scale + scaled_zero;
-            }
-        }
-        let rem = input.len() / 4 * 4;
-        input[rem..]
+        input
+            .0
             .iter()
-            .zip(&mut output[rem..])
+            .zip(output.0)
+            .for_each(|(d, deq)| *deq = d.map(|d| d.as_() * scale + scaled_zero));
+        input
+            .1
+            .iter()
+            .zip(output.1)
             .for_each(|(d, deq)| *deq = d.as_() * scale + scaled_zero);
     } else {
-        for (d, deq) in input.chunks_exact(4).zip(output.chunks_exact_mut(4)) {
-            unsafe {
-                *deq.get_unchecked_mut(0) = d.get_unchecked(0).as_() * scale;
-                *deq.get_unchecked_mut(1) = d.get_unchecked(1).as_() * scale;
-                *deq.get_unchecked_mut(2) = d.get_unchecked(2).as_() * scale;
-                *deq.get_unchecked_mut(3) = d.get_unchecked(3).as_() * scale;
-            }
-        }
-        let rem = input.len() / 4 * 4;
-        input[rem..]
+        input
+            .0
             .iter()
-            .zip(&mut output[rem..])
+            .zip(output.0)
+            .for_each(|(d, deq)| *deq = d.map(|d| d.as_() * scale));
+        input
+            .1
+            .iter()
+            .zip(output.1)
             .for_each(|(d, deq)| *deq = d.as_() * scale);
     }
 }
 
+/// Converts a segmentation tensor into a 2D mask
 pub fn segmentation_to_mask(segmentation: ArrayView3<u8>) -> Array2<u8> {
     assert!(segmentation.shape()[2] > 0);
     if segmentation.shape()[2] == 1 {
@@ -451,6 +474,7 @@ pub fn segmentation_to_mask(segmentation: ArrayView3<u8>) -> Array2<u8> {
     }
 }
 
+/// Returns the maximum value and its index from a 1D array
 fn arg_max<T: PartialOrd + Copy>(score: ArrayView1<T>) -> (T, usize) {
     score
         .iter()
@@ -461,13 +485,15 @@ fn arg_max<T: PartialOrd + Copy>(score: ArrayView1<T>) -> (T, usize) {
 }
 #[cfg(test)]
 mod decoder_tests {
+    #![allow(clippy::excessive_precision)]
     use ndarray::s;
     use ndarray_stats::DeviationExt;
 
     use crate::{
-        modelpack::{ModelPackDetectionConfig, decode_modelpack_det, decode_modelpack_split},
+        modelpack::{ModelPackDetectionConfig, decode_modelpack_det, decode_modelpack_split_quant},
         yolo::{
-            decode_yolo_det, decode_yolo_det_float, decode_yolo_segdet, decode_yolo_segdet_float,
+            decode_yolo_det, decode_yolo_det_float, decode_yolo_segdet_float,
+            decode_yolo_segdet_quant,
         },
         *,
     };
@@ -627,7 +653,7 @@ mod decoder_tests {
         };
 
         let mut output_boxes: Vec<_> = Vec::with_capacity(2);
-        decode_modelpack_split(
+        decode_modelpack_split_quant(
             &[detect0.view(), detect1.view()],
             &[config0, config1],
             score_threshold,
@@ -803,7 +829,7 @@ mod decoder_tests {
         let mut output_boxes: Vec<_> = Vec::with_capacity(500);
         let mut output_masks: Vec<_> = Vec::with_capacity(500);
 
-        decode_yolo_segdet(
+        decode_yolo_segdet_quant(
             (boxes.view(), quant_boxes),
             (protos.view(), quant_protos),
             score_threshold,
