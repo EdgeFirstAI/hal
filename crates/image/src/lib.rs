@@ -828,18 +828,31 @@ mod image_tests {
         compare_images(&converter_dst, &cpu_dst, 0.98, function!());
     }
 
+    static G2D_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // Helper function to check if G2D library is available
     fn is_g2d_available() -> bool {
-        G2DConverter::new().is_ok()
+        #[cfg(target_os = "linux")]
+        {
+            *G2D_AVAILABLE.get_or_init(|| G2DConverter::new().is_ok())
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
     }
 
     static DMA_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // Helper function to check if DMA memory allocation is available
     fn is_dma_available() -> bool {
-        if cfg!(target_os = "linux") {
+        #[cfg(target_os = "linux")]
+        {
             *DMA_AVAILABLE
                 .get_or_init(|| Tensor::<u8>::new(&[64], Some(TensorMemory::Dma), None).is_ok())
-        } else {
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
             false
         }
     }
@@ -847,9 +860,13 @@ mod image_tests {
     static GL_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // Helper function to check if OpenGL is available
     fn is_opengl_available() -> bool {
-        if cfg!(all(target_os = "linux", feature = "opengl")) {
+        #[cfg(all(target_os = "linux", feature = "opengl"))]
+        {
             *GL_AVAILABLE.get_or_init(|| GLConverterThreaded::new().is_ok())
-        } else {
+        }
+
+        #[cfg(not(all(target_os = "linux", feature = "opengl")))]
+        {
             false
         }
     }
@@ -1000,6 +1017,7 @@ mod image_tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
     fn test_opengl_grey() {
         if !is_opengl_available() {
@@ -1695,6 +1713,7 @@ mod image_tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_rgba_to_yuyv_resize_g2d() {
         if !is_g2d_available() {
             eprintln!(
