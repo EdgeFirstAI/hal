@@ -466,7 +466,9 @@ mod decoder_tests {
 
     use crate::{
         modelpack::{ModelPackDetectionConfig, decode_modelpack_det, decode_modelpack_split},
-        yolo::{decode_yolo_det, decode_yolo_det_f32, decode_yolo_segdet, decode_yolo_segdet_f32},
+        yolo::{
+            decode_yolo_det, decode_yolo_det_float, decode_yolo_segdet, decode_yolo_segdet_float,
+        },
         *,
     };
 
@@ -527,7 +529,7 @@ mod decoder_tests {
         let out = ndarray::Array2::from_shape_vec((84, 8400), out_dequant).unwrap();
 
         let mut output_boxes: Vec<_> = Vec::with_capacity(50);
-        decode_yolo_det_f32(
+        decode_yolo_det_float(
             out.view(),
             score_threshold,
             iou_threshold,
@@ -721,11 +723,11 @@ mod decoder_tests {
             unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
         let protos = ndarray::Array3::from_shape_vec((160, 160, 32), protos.to_vec()).unwrap();
         let quant_protos = Quantization::new(0.02491161972284317, -117);
-        let protos = dequantize_ndarray(protos.view(), quant_protos);
-        let seg = dequantize_ndarray(boxes.view(), quant_boxes);
+        let protos = dequantize_ndarray::<_, _, f32>(protos.view(), quant_protos);
+        let seg = dequantize_ndarray::<_, _, f32>(boxes.view(), quant_boxes);
         let mut output_boxes: Vec<_> = Vec::with_capacity(10);
         let mut output_masks: Vec<_> = Vec::with_capacity(10);
-        decode_yolo_segdet_f32(
+        decode_yolo_segdet_float(
             seg.view(),
             protos.view(),
             score_threshold,
@@ -810,11 +812,11 @@ mod decoder_tests {
             &mut output_masks,
         );
 
-        let protos = dequantize_ndarray(protos.view(), quant_protos);
-        let seg = dequantize_ndarray(boxes.view(), quant_boxes);
+        let protos = dequantize_ndarray::<_, _, f32>(protos.view(), quant_protos);
+        let seg = dequantize_ndarray::<_, _, f32>(boxes.view(), quant_boxes);
         let mut output_boxes_f32: Vec<_> = Vec::with_capacity(500);
         let mut output_masks_f32: Vec<_> = Vec::with_capacity(500);
-        decode_yolo_segdet_f32(
+        decode_yolo_segdet_float(
             seg.view(),
             protos.view(),
             score_threshold,
@@ -922,11 +924,11 @@ mod decoder_tests {
             )
             .unwrap();
 
-        let protos = dequantize_ndarray(protos.view(), quant_protos);
-        let seg = dequantize_ndarray(boxes.view(), quant_boxes);
+        let protos = dequantize_ndarray::<_, _, f32>(protos.view(), quant_protos);
+        let seg = dequantize_ndarray::<_, _, f32>(boxes.view(), quant_boxes);
         let mut output_boxes_f32: Vec<_> = Vec::with_capacity(500);
         let mut output_masks_f32: Vec<_> = Vec::with_capacity(500);
-        decode_yolo_segdet_f32(
+        decode_yolo_segdet_float(
             seg.slice(s![0, .., ..]),
             protos.slice(s![0, .., .., ..]),
             score_threshold,
@@ -1035,11 +1037,11 @@ mod decoder_tests {
             )
             .unwrap();
 
-        let protos = dequantize_ndarray(protos.view(), quant_protos);
-        let seg = dequantize_ndarray(boxes.view(), quant_boxes);
+        let protos = dequantize_ndarray::<_, _, f32>(protos.view(), quant_protos);
+        let seg = dequantize_ndarray::<_, _, f32>(boxes.view(), quant_boxes);
         let mut output_boxes_f32: Vec<_> = Vec::with_capacity(500);
         let mut output_masks_f32: Vec<Segmentation> = Vec::with_capacity(500);
-        decode_yolo_segdet_f32(
+        decode_yolo_segdet_float(
             seg.slice(s![0, .., ..]),
             protos.slice(s![0, .., .., ..]),
             score_threshold,

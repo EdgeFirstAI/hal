@@ -30,21 +30,15 @@ pub fn decode_yolo_det<BOX: PrimInt + AsPrimitive<f32> + Send + Sync>(
     impl_yolo_8bit::<XYWH, _>(output, score_threshold, iou_threshold, output_boxes);
 }
 
-pub fn decode_yolo_det_f32(
-    output: ArrayView2<f32>,
+pub fn decode_yolo_det_float<T>(
+    output: ArrayView2<T>,
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
-) {
-    impl_yolo_float::<XYWH, _>(output, score_threshold, iou_threshold, output_boxes);
-}
-
-pub fn decode_yolo_det_f64(
-    output: ArrayView2<f64>,
-    score_threshold: f32,
-    iou_threshold: f32,
-    output_boxes: &mut Vec<DetectBox>,
-) {
+) where
+    T: Float + AsPrimitive<f32> + Send + Sync + 'static,
+    f32: AsPrimitive<T>,
+{
     impl_yolo_float::<XYWH, _>(output, score_threshold, iou_threshold, output_boxes);
 }
 
@@ -69,32 +63,17 @@ pub fn decode_yolo_segdet<
     );
 }
 
-pub fn decode_yolo_segdet_f32(
-    boxes: ArrayView2<f32>,
-    protos: ArrayView3<f32>,
+pub fn decode_yolo_segdet_float<T>(
+    boxes: ArrayView2<T>,
+    protos: ArrayView3<T>,
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
-) {
-    impl_yolo_segdet_float::<XYWH, _, _>(
-        boxes,
-        protos,
-        score_threshold,
-        iou_threshold,
-        output_boxes,
-        output_masks,
-    );
-}
-
-pub fn decode_yolo_segdet_f64(
-    boxes: ArrayView2<f64>,
-    protos: ArrayView3<f64>,
-    score_threshold: f32,
-    iou_threshold: f32,
-    output_boxes: &mut Vec<DetectBox>,
-    output_masks: &mut Vec<Segmentation>,
-) {
+) where
+    T: Float + AsPrimitive<f32> + Send + Sync + 'static,
+    f32: AsPrimitive<T>,
+{
     impl_yolo_segdet_float::<XYWH, _, _>(
         boxes,
         protos,
@@ -124,29 +103,16 @@ pub fn decode_yolo_split_det<
     );
 }
 
-pub fn decode_yolo_split_det_f32(
-    boxes: ArrayView2<f32>,
-    scores: ArrayView2<f32>,
+pub fn decode_yolo_split_det_f32<T>(
+    boxes: ArrayView2<T>,
+    scores: ArrayView2<T>,
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
-) {
-    impl_yolo_split_float::<XYWH, _, _>(
-        boxes,
-        scores,
-        score_threshold,
-        iou_threshold,
-        output_boxes,
-    );
-}
-
-pub fn decode_yolo_split_det_f64(
-    boxes: ArrayView2<f64>,
-    scores: ArrayView2<f64>,
-    score_threshold: f32,
-    iou_threshold: f32,
-    output_boxes: &mut Vec<DetectBox>,
-) {
+) where
+    T: Float + AsPrimitive<f32> + Send + Sync + 'static,
+    f32: AsPrimitive<T>,
+{
     impl_yolo_split_float::<XYWH, _, _>(
         boxes,
         scores,
@@ -185,39 +151,19 @@ pub fn decode_yolo_split_segdet<
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn decode_yolo_split_segdet_f32(
-    boxes: ArrayView2<f32>,
-    scores: ArrayView2<f32>,
-    mask_coeff: ArrayView2<f32>,
-    protos: ArrayView3<f32>,
+pub fn decode_yolo_split_segdet_float<T>(
+    boxes: ArrayView2<T>,
+    scores: ArrayView2<T>,
+    mask_coeff: ArrayView2<T>,
+    protos: ArrayView3<T>,
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
-) {
-    impl_yolo_split_segdet_float::<XYWH, _, _, _, _>(
-        boxes,
-        scores,
-        mask_coeff,
-        protos,
-        score_threshold,
-        iou_threshold,
-        output_boxes,
-        output_masks,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn decode_yolo_split_segdet_f64(
-    boxes: ArrayView2<f64>,
-    scores: ArrayView2<f64>,
-    mask_coeff: ArrayView2<f64>,
-    protos: ArrayView3<f64>,
-    score_threshold: f32,
-    iou_threshold: f32,
-    output_boxes: &mut Vec<DetectBox>,
-    output_masks: &mut Vec<Segmentation>,
-) {
+) where
+    T: Float + AsPrimitive<f32> + Send + Sync + 'static,
+    f32: AsPrimitive<T>,
+{
     impl_yolo_split_segdet_float::<XYWH, _, _, _, _>(
         boxes,
         scores,

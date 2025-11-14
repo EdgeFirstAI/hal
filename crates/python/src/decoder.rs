@@ -268,7 +268,7 @@ impl PyDecoder {
                     .collect::<Vec<_>>();
                 self_
                     .decoder
-                    .decode_f32(&output_views, &mut output_boxes, &mut output_masks)
+                    .decode_float(&output_views, &mut output_boxes, &mut output_masks)
             }
             ListOfReadOnlyArrayGenericDyn::Float32(items) => {
                 let outputs = items
@@ -280,7 +280,7 @@ impl PyDecoder {
                     .collect::<Vec<_>>();
                 self_
                     .decoder
-                    .decode_f32(&outputs, &mut output_boxes, &mut output_masks)
+                    .decode_float(&outputs, &mut output_boxes, &mut output_masks)
             }
             ListOfReadOnlyArrayGenericDyn::Float64(items) => {
                 let outputs = items
@@ -292,7 +292,7 @@ impl PyDecoder {
                     .collect::<Vec<_>>();
                 self_
                     .decoder
-                    .decode_f64(&outputs, &mut output_boxes, &mut output_masks)
+                    .decode_float(&outputs, &mut output_boxes, &mut output_masks)
             }
         };
         if let Err(e) = result {
@@ -329,7 +329,7 @@ impl PyDecoder {
                 &mut output_boxes,
             ),
             ReadOnlyArrayGeneric2::Float32(output) => {
-                edgefirst::decoder::yolo::decode_yolo_det_f32(
+                edgefirst::decoder::yolo::decode_yolo_det_float(
                     output.as_array(),
                     score_threshold as f32,
                     iou_threshold as f32,
@@ -337,7 +337,7 @@ impl PyDecoder {
                 )
             }
             ReadOnlyArrayGeneric2::Float64(output) => {
-                edgefirst::decoder::yolo::decode_yolo_det_f64(
+                edgefirst::decoder::yolo::decode_yolo_det_float(
                     output.as_array(),
                     score_threshold as f32,
                     iou_threshold as f32,
@@ -385,7 +385,7 @@ impl PyDecoder {
                 );
             }
             (ReadOnlyArrayGeneric2::Float32(boxes), ReadOnlyArrayGeneric3::Float32(protos)) => {
-                edgefirst::decoder::yolo::decode_yolo_segdet_f32(
+                edgefirst::decoder::yolo::decode_yolo_segdet_float(
                     boxes.as_array(),
                     protos.as_array(),
                     score_threshold as f32,
@@ -395,7 +395,7 @@ impl PyDecoder {
                 );
             }
             (ReadOnlyArrayGeneric2::Float64(boxes), ReadOnlyArrayGeneric3::Float64(protos)) => {
-                edgefirst::decoder::yolo::decode_yolo_segdet_f64(
+                edgefirst::decoder::yolo::decode_yolo_segdet_float(
                     boxes.as_array(),
                     protos.as_array(),
                     score_threshold as f32,
