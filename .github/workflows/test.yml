@@ -44,7 +44,7 @@ jobs:
         run: cargo clippy --all-targets --all-features
       
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@6cc14f7f2f4b3129aff07a8b071d2d4f2733465d # cargo-llvm-cov
+        run: cargo install cargo-llvm-cov
       
       - name: Install Python dependencies
         run: pip install maturin[patchelf] slipcover unittest-xml-reporting
@@ -126,10 +126,13 @@ jobs:
       - name: Build Python wheel
         run: maturin build -m crates/python/Cargo.toml --release
       
+      - name: Install Python Test dependencies
+        run: pip install crates/python/[test]
+
       - name: Install Python package
-        run: pip install target/wheels/*.whl
-      
+        run: pip install target/wheels/*.whl --force-reinstall --no-deps
+
+
+
       - name: Run Python tests
         run: python -m unittest discover -s tests -p "test*.py"      
-      - name: Run Python tests
-        run: python -m unittest discover -s tests -p "test*.py"
