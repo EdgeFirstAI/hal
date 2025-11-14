@@ -1,0 +1,135 @@
+name: Test
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: Test & Coverage
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          lfs: true
+      
+      - name: Checkout LFS objects
+        run: git lfs checkout
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@0f44b27771c32bda9f458f75a1e241b09791b331 # stable
+        with:
+          toolchain: stable
+          components: clippy, llvm-tools-preview
+      
+      - name: Set up Python 3.11
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.11'
+      
+      - name: Cache Cargo build
+        uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+        with:
+          cache-on-failure: true
+      
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features
+      
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@6cc14f7f2f4b3129aff07a8b071d2d4f2733465d # cargo-llvm-cov
+      
+      - name: Install Python dependencies
+        run: pip install maturin[patchelf] slipcover unittest-xml-reporting
+      
+      - name: Clean coverage data
+        run: cargo llvm-cov clean
+      
+      - name: Build Rust library with coverage
+        run: cargo llvm-cov --no-report --all-features --locked
+      
+      - name: Build Python bindings with coverage
+        run: |
+          source <(cargo llvm-cov show-env --export-prefix)
+          maturin develop -m crates/python/Cargo.toml
+      
+      - name: Run Python tests with coverage
+        run: |
+          source <(cargo llvm-cov show-env --export-prefix)
+          python -m slipcover --xml --out coverage.xml -m xmlrunner discover -s tests -p "test*.py" -o target/python
+      
+      - name: Generate Rust coverage report
+        run: cargo llvm-cov report --lcov --output-path lcov.info
+      
+      - name: Display coverage summary
+        run: |
+          echo "=== Rust Coverage ==="
+          cargo llvm-cov report
+          echo ""
+          echo "=== Python Coverage ==="
+          if [ -f coverage.xml ]; then
+            python3 -c "import xml.etree.ElementTree as ET; tree = ET.parse('coverage.xml'); root = tree.getroot(); print(f\"Python Coverage: {float(root.attrib.get('line-rate', 0))*100:.2f}% ({root.attrib.get('lines-covered', 0)}/{root.attrib.get('lines-valid', 0)} lines)\")"
+          else
+            echo "No Python coverage data available"
+          fi
+      
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: coverage-reports
+          path: |
+            lcov.info
+            coverage.xml
+
+  test-python-versions:
+    name: Test Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.8', '3.12']
+    
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          lfs: true
+      
+      - name: Checkout LFS objects
+        run: git lfs checkout
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@0f44b27771c32bda9f458f75a1e241b09791b331 # stable
+        with: 
+          toolchain: stable
+      
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      
+      - name: Cache Cargo build
+        uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+        with:
+          cache-on-failure: true
+          shared-key: python-${{ matrix.python-version }}
+      
+      - name: Install maturin
+        run: pip install maturin[patchelf]
+      
+      - name: Build Python wheel
+        run: maturin build -m crates/python/Cargo.toml --release
+      
+      - name: Install Python package
+        run: pip install target/wheels/*.whl
+      
+      - name: Run Python tests
+        run: python -m unittest discover -s tests -p "test*.py"      
+      - name: Run Python tests
+        run: python -m unittest discover -s tests -p "test*.py"

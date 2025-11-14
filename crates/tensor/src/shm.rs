@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::{
     TensorMap, TensorMapTrait, TensorMemory, TensorTrait,
     error::{Error, Result},
@@ -38,7 +41,7 @@ where
             None => {
                 let uuid = uuid::Uuid::new_v4().as_simple().to_string();
                 format!("/{}", &uuid[..16])
-            },
+            }
         };
 
         let shm_fd = nix::sys::mman::shm_open(
