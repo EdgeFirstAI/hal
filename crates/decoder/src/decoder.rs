@@ -237,6 +237,25 @@ enum ConfigSource {
 }
 
 impl Default for DecoderBuilder {
+    /// Creates a default DecoderBuilder with no configuration and 0.5 score
+    /// threshold and 0.5 OU threshold.
+    ///
+    /// A valid confguration must be provided before building the Decoder.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{DecoderBuilder, Error};
+    /// # fn main() -> Result<(), Error> {
+    /// #  let config_yaml = include_str!("../../../testdata/modelpack_split.yaml").to_string();
+    /// let decoder = DecoderBuilder::default()
+    ///     .with_config_yaml_str(config_yaml)
+    ///     .build()?;
+    /// assert_eq!(decoder.score_threshold, 0.5);
+    /// assert_eq!(decoder.iou_threshold, 0.5);
+    ///
+    /// # Ok(())
+    /// # }
+    /// ```
     fn default() -> Self {
         Self {
             config_src: None,
@@ -247,21 +266,112 @@ impl Default for DecoderBuilder {
 }
 
 impl DecoderBuilder {
+    /// Creates a default DecoderBuilder with no configuration and 0.5 score
+    /// threshold and 0.5 OU threshold.
+    ///
+    /// A valid confguration must be provided before building the Decoder.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{DecoderBuilder, Error};
+    /// # fn main() -> Result<(), Error> {
+    /// #  let config_yaml = include_str!("../../../testdata/modelpack_split.yaml").to_string();
+    /// let decoder = DecoderBuilder::new()
+    ///     .with_config_yaml_str(config_yaml)
+    ///     .build()?;
+    /// assert_eq!(decoder.score_threshold, 0.5);
+    /// assert_eq!(decoder.iou_threshold, 0.5);
+    ///
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Loads a model configuration in YAML format. Does not check if the string
+    /// is a correct configuration file. Use `DecoderBuilder.build()` to
+    /// deserialize the YAML and parse the model configuration.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{DecoderBuilder, Error};
+    /// # fn main() -> Result<(), Error> {
+    /// let config_yaml = include_str!("../../../testdata/modelpack_split.yaml").to_string();
+    /// let decoder = DecoderBuilder::new()
+    ///     .with_config_yaml_str(config_yaml)
+    ///     .build()?;
+    ///
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn with_config_yaml_str(mut self, yaml_str: String) -> Self {
         self.config_src.replace(ConfigSource::Yaml(yaml_str));
         self
     }
 
+    /// Loads a model configuration in JSON format. Does not check if the string
+    /// is a correct configuration file. Use `DecoderBuilder.build()` to
+    /// deserialize the JSON and parse the model configuration.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{DecoderBuilder, Error};
+    /// # fn main() -> Result<(), Error> {
+    /// let config_json = include_str!("../../../testdata/modelpack_split.json").to_string();
+    /// let decoder = DecoderBuilder::new()
+    ///     .with_config_json_str(config_json)
+    ///     .build()?;
+    ///
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn with_config_json_str(mut self, json_str: String) -> Self {
         self.config_src.replace(ConfigSource::Json(json_str));
         self
     }
 
+    /// Loads a model configuration. Does not check if the configuration is
+    /// correct. Intended to be used when the user needs control over the
+    /// deserialize of the configuration information. Use
+    /// `DecoderBuilder.build()` to parse the model configuration.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{DecoderBuilder, Error};
+    /// # fn main() -> Result<(), Error> {
+    /// let config_json = include_str!("../../../testdata/modelpack_split.json");
+    /// let config = serde_json::from_str(config_json)?;
+    /// let decoder = DecoderBuilder::new().with_config(config).build()?;
+    ///
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn with_config(mut self, config: ConfigOutputs) -> Self {
         self.config_src.replace(ConfigSource::Config(config));
         self
     }
 
+    /// Loads a YOLO detection model configuration.  Use
+    /// `DecoderBuilder.build()` to parse the model configuration.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{ DecoderBuilder, Error, configs };
+    /// # fn main() -> Result<(), Error> {
+    /// let decoder = DecoderBuilder::new()
+    ///     .with_config_yolo_det(configs::Detection {
+    ///         anchors: None,
+    ///         decoder: configs::DecoderType::Yolov8,
+    ///         quantization: Some(configs::QuantTuple(0.012345, 26)),
+    ///         shape: vec![1, 84, 8400],
+    ///         channels_first: false,
+    ///     })
+    ///     .build()?;
+    ///
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn with_config_yolo_det(mut self, boxes: configs::Detection) -> Self {
         let config = ConfigOutputs {
             outputs: vec![ConfigOutput::Detection(boxes)],
@@ -270,6 +380,31 @@ impl DecoderBuilder {
         self
     }
 
+    /// Loads a YOLO split detection model configuration.  Use
+    /// `DecoderBuilder.build()` to parse the model configuration.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{ DecoderBuilder, Error, configs };
+    /// # fn main() -> Result<(), Error> {
+    /// let boxes_config = configs::Boxes {
+    ///     decoder: configs::DecoderType::Yolov8,
+    ///     quantization: Some(configs::QuantTuple(0.012345, 26)),
+    ///     shape: vec![1, 4, 8400],
+    ///     channels_first: false,
+    /// };
+    /// let scores_config = configs::Scores {
+    ///     decoder: configs::DecoderType::Yolov8,
+    ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
+    ///     shape: vec![1, 80, 8400],
+    ///     channels_first: false,
+    /// };
+    /// let decoder = DecoderBuilder::new()
+    ///     .with_config_yolo_split_det(boxes_config, scores_config)
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn with_config_yolo_split_det(
         mut self,
         boxes: configs::Boxes,
@@ -282,6 +417,31 @@ impl DecoderBuilder {
         self
     }
 
+    /// Loads a YOLO segmentation model configuration.  Use
+    /// `DecoderBuilder.build()` to parse the model configuration.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{ DecoderBuilder, Error, configs };
+    /// # fn main() -> Result<(), Error> {
+    /// let seg_config = configs::Segmentation {
+    ///     decoder: configs::DecoderType::Yolov8,
+    ///     quantization: Some(configs::QuantTuple(0.012345, 26)),
+    ///     shape: vec![1, 116, 8400],
+    ///     channels_first: false,
+    /// };
+    /// let protos_config = configs::Protos {
+    ///     decoder: configs::DecoderType::Yolov8,
+    ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
+    ///     shape: vec![1, 160, 160, 32],
+    ///     channels_first: false,
+    /// };
+    /// let decoder = DecoderBuilder::new()
+    ///     .with_config_yolo_segdet(seg_config, protos_config)
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn with_config_yolo_segdet(
         mut self,
         boxes: configs::Segmentation,
@@ -297,6 +457,43 @@ impl DecoderBuilder {
         self
     }
 
+    /// Loads a YOLO split segmentation model configuration.  Use
+    /// `DecoderBuilder.build()` to parse the model configuration.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{ DecoderBuilder, Error, configs };
+    /// # fn main() -> Result<(), Error> {
+    /// let boxes_config = configs::Boxes {
+    ///     decoder: configs::DecoderType::Yolov8,
+    ///     quantization: Some(configs::QuantTuple(0.012345, 26)),
+    ///     shape: vec![1, 4, 8400],
+    ///     channels_first: false,
+    /// };
+    /// let scores_config = configs::Scores {
+    ///     decoder: configs::DecoderType::Yolov8,
+    ///     quantization: Some(configs::QuantTuple(0.012345, 14)),
+    ///     shape: vec![1, 80, 8400],
+    ///     channels_first: false,
+    /// };
+    /// let mask_config = configs::MaskCoefficients {
+    ///     decoder: configs::DecoderType::Yolov8,
+    ///     quantization: Some(configs::QuantTuple(0.0064123, 125)),
+    ///     shape: vec![1, 32, 8400],
+    ///     channels_first: false,
+    /// };
+    /// let protos_config = configs::Protos {
+    ///     decoder: configs::DecoderType::Yolov8,
+    ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
+    ///     shape: vec![1, 160, 160, 32],
+    ///     channels_first: false,
+    /// };
+    /// let decoder = DecoderBuilder::new()
+    ///     .with_config_yolo_split_segdet(boxes_config, scores_config, mask_config, protos_config)
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn with_config_yolo_split_segdet(
         mut self,
         boxes: configs::Boxes,
@@ -316,6 +513,31 @@ impl DecoderBuilder {
         self
     }
 
+    /// Loads a ModelPack detection model configuration.  Use
+    /// `DecoderBuilder.build()` to parse the model configuration.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{ DecoderBuilder, Error, configs };
+    /// # fn main() -> Result<(), Error> {
+    /// let boxes_config = configs::Boxes {
+    ///     decoder: configs::DecoderType::ModelPack,
+    ///     quantization: Some(configs::QuantTuple(0.012345, 26)),
+    ///     shape: vec![1, 8400, 1, 4],
+    ///     channels_first: false,
+    /// };
+    /// let scores_config = configs::Scores {
+    ///     decoder: configs::DecoderType::ModelPack,
+    ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
+    ///     shape: vec![1, 8400, 3],
+    ///     channels_first: false,
+    /// };
+    /// let decoder = DecoderBuilder::new()
+    ///     .with_config_modelpack_det(boxes_config, scores_config)
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn with_config_modelpack_det(
         mut self,
         boxes: configs::Boxes,
@@ -328,6 +550,42 @@ impl DecoderBuilder {
         self
     }
 
+    /// Loads a ModelPack split detection model configuration. Use
+    /// `DecoderBuilder.build()` to parse the model configuration.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{ DecoderBuilder, Error, configs };
+    /// # fn main() -> Result<(), Error> {
+    /// let config0 = configs::Detection {
+    ///     anchors: Some(vec![
+    ///         [0.13750000298023224, 0.2074074000120163],
+    ///         [0.2541666626930237, 0.21481481194496155],
+    ///         [0.23125000298023224, 0.35185185074806213],
+    ///     ]),
+    ///     decoder: configs::DecoderType::ModelPack,
+    ///     quantization: Some(configs::QuantTuple(0.012345, 26)),
+    ///     shape: vec![1, 8400, 1, 4],
+    ///     channels_first: false,
+    /// };
+    /// let config1 = configs::Detection {
+    ///     anchors: Some(vec![
+    ///         [0.36666667461395264, 0.31481480598449707],
+    ///         [0.38749998807907104, 0.4740740656852722],
+    ///         [0.5333333611488342, 0.644444465637207],
+    ///     ]),
+    ///     decoder: configs::DecoderType::ModelPack,
+    ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
+    ///     shape: vec![1, 8400, 3],
+    ///     channels_first: false,
+    /// };
+    ///
+    /// let decoder = DecoderBuilder::new()
+    ///     .with_config_modelpack_det_split(vec![config0, config1])
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn with_config_modelpack_det_split(mut self, boxes: Vec<configs::Detection>) -> Self {
         let outputs = boxes.into_iter().map(ConfigOutput::Detection).collect();
         let config = ConfigOutputs { outputs };
@@ -335,6 +593,37 @@ impl DecoderBuilder {
         self
     }
 
+    /// Loads a ModelPack segmentation detection model configuration. Use
+    /// `DecoderBuilder.build()` to parse the model configuration.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{ DecoderBuilder, Error, configs };
+    /// # fn main() -> Result<(), Error> {
+    /// let boxes_config = configs::Boxes {
+    ///     decoder: configs::DecoderType::ModelPack,
+    ///     quantization: Some(configs::QuantTuple(0.012345, 26)),
+    ///     shape: vec![1, 8400, 1, 4],
+    ///     channels_first: false,
+    /// };
+    /// let scores_config = configs::Scores {
+    ///     decoder: configs::DecoderType::ModelPack,
+    ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
+    ///     shape: vec![1, 8400, 3],
+    ///     channels_first: false,
+    /// };
+    /// let seg_config = configs::Segmentation {
+    ///     decoder: configs::DecoderType::ModelPack,
+    ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
+    ///     shape: vec![1, 640, 640, 3],
+    ///     channels_first: false,
+    /// };
+    /// let decoder = DecoderBuilder::new()
+    ///     .with_config_modelpack_segdet(boxes_config, scores_config, seg_config)
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn with_config_modelpack_segdet(
         mut self,
         boxes: configs::Boxes,
@@ -352,6 +641,47 @@ impl DecoderBuilder {
         self
     }
 
+    /// Loads a ModelPack segmentation split detection model configuration. Use
+    /// `DecoderBuilder.build()` to parse the model configuration.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{ DecoderBuilder, Error, configs };
+    /// # fn main() -> Result<(), Error> {
+    /// let config0 = configs::Detection {
+    ///     anchors: Some(vec![
+    ///         [0.36666667461395264, 0.31481480598449707],
+    ///         [0.38749998807907104, 0.4740740656852722],
+    ///         [0.5333333611488342, 0.644444465637207],
+    ///     ]),
+    ///     decoder: configs::DecoderType::ModelPack,
+    ///     quantization: Some(configs::QuantTuple(0.08547406643629074, 174)),
+    ///     shape: vec![1, 9, 15, 18],
+    ///     channels_first: false,
+    /// };
+    /// let config1 = configs::Detection {
+    ///     anchors: Some(vec![
+    ///         [0.13750000298023224, 0.2074074000120163],
+    ///         [0.2541666626930237, 0.21481481194496155],
+    ///         [0.23125000298023224, 0.35185185074806213],
+    ///     ]),
+    ///     decoder: configs::DecoderType::ModelPack,
+    ///     quantization: Some(configs::QuantTuple(0.09929127991199493, 183)),
+    ///     shape: vec![1, 17, 30, 18],
+    ///     channels_first: false,
+    /// };
+    /// let seg_config = configs::Segmentation {
+    ///     decoder: configs::DecoderType::ModelPack,
+    ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
+    ///     shape: vec![1, 640, 640, 3],
+    ///     channels_first: false,
+    /// };
+    /// let decoder = DecoderBuilder::new()
+    ///     .with_config_modelpack_segdet_split(vec![config0, config1], seg_config)
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn with_config_modelpack_segdet_split(
         mut self,
         boxes: Vec<configs::Detection>,
@@ -367,6 +697,25 @@ impl DecoderBuilder {
         self
     }
 
+    /// Loads a ModelPack segmentation model configuration. Use
+    /// `DecoderBuilder.build()` to parse the model configuration.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{ DecoderBuilder, Error, configs };
+    /// # fn main() -> Result<(), Error> {
+    /// let seg_config = configs::Segmentation {
+    ///     decoder: configs::DecoderType::ModelPack,
+    ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
+    ///     shape: vec![1, 640, 640, 3],
+    ///     channels_first: false,
+    /// };
+    /// let decoder = DecoderBuilder::new()
+    ///     .with_config_modelpack_seg(seg_config)
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn with_config_modelpack_seg(mut self, segmentation: configs::Segmentation) -> Self {
         let config = ConfigOutputs {
             outputs: vec![ConfigOutput::Segmentation(segmentation)],
@@ -375,16 +724,62 @@ impl DecoderBuilder {
         self
     }
 
+    /// Sets the scores threshold of the decoder
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{DecoderBuilder, Error};
+    /// # fn main() -> Result<(), Error> {
+    /// # let config_json = include_str!("../../../testdata/modelpack_split.json").to_string();
+    /// let decoder = DecoderBuilder::new()
+    ///     .with_config_json_str(config_json)
+    ///     .with_score_threshold(0.654)
+    ///     .build()?;
+    /// assert_eq!(decoder.score_threshold, 0.654);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn with_score_threshold(mut self, score_threshold: f32) -> Self {
         self.score_threshold = score_threshold;
         self
     }
 
+    /// Sets the IOU threshold of the decoder
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{DecoderBuilder, Error};
+    /// # fn main() -> Result<(), Error> {
+    /// # let config_json = include_str!("../../../testdata/modelpack_split.json").to_string();
+    /// let decoder = DecoderBuilder::new()
+    ///     .with_config_json_str(config_json)
+    ///     .with_iou_threshold(0.654)
+    ///     .build()?;
+    /// assert_eq!(decoder.iou_threshold, 0.654);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn with_iou_threshold(mut self, iou_threshold: f32) -> Self {
         self.iou_threshold = iou_threshold;
         self
     }
 
+    /// Builds the decoder with the given settings. If the config is a JSON or
+    /// YAML string, this will deserialize the JSON or YAML and then parse the
+    /// configuration information.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{DecoderBuilder, Error};
+    /// # fn main() -> Result<(), Error> {
+    /// # let config_json = include_str!("../../../testdata/modelpack_split.json").to_string();
+    /// let decoder = DecoderBuilder::new()
+    ///     .with_config_json_str(config_json)
+    ///     .with_score_threshold(0.654)
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn build(self) -> Result<Decoder, Error> {
         let config = match self.config_src {
             Some(ConfigSource::Json(s)) => serde_json::from_str(&s)?,
@@ -593,7 +988,7 @@ impl<'a> From<ArrayViewD<'a, i32>> for ArrayViewDQuantized<'a> {
 }
 
 impl<'a> ArrayViewDQuantized<'a> {
-    fn shape(&self) -> &[usize] {
+    pub fn shape(&self) -> &[usize] {
         match self {
             ArrayViewDQuantized::UInt8(a) => a.shape(),
             ArrayViewDQuantized::Int8(a) => a.shape(),
