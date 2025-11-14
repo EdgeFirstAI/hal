@@ -9,7 +9,7 @@
 //! acceleration when available, but also provides a CPU-based fallback for
 //! environments where hardware acceleration is not present or not suitable.
 
-use std::{env, time::Instant};
+use std::time::Instant;
 
 use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait as _};
 use enum_dispatch::enum_dispatch;
@@ -537,7 +537,7 @@ unsafe impl Sync for ImageConverter {}
 impl ImageConverter {
     pub fn new() -> Result<Self> {
         #[cfg(target_os = "linux")]
-        let g2d = if let Ok(x) = env::var("EDGEFIRST_DISABLE_G2D")
+        let g2d = if let Ok(x) = std::env::var("EDGEFIRST_DISABLE_G2D")
             && x != "0"
             && x.to_lowercase() != "false"
         {
@@ -555,7 +555,7 @@ impl ImageConverter {
 
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
-        let opengl = if let Ok(x) = env::var("EDGEFIRST_DISABLE_GL")
+        let opengl = if let Ok(x) = std::env::var("EDGEFIRST_DISABLE_GL")
             && x != "0"
             && x.to_lowercase() != "false"
         {
@@ -571,8 +571,7 @@ impl ImageConverter {
             }
         };
 
-        #[cfg(target_os = "linux")]
-        let cpu = if let Ok(x) = env::var("EDGEFIRST_DISABLE_CPU")
+        let cpu = if let Ok(x) = std::env::var("EDGEFIRST_DISABLE_CPU")
             && x != "0"
             && x.to_lowercase() != "false"
         {
@@ -834,9 +833,25 @@ mod image_tests {
         G2DConverter::new().is_ok()
     }
 
+    static DMA_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // Helper function to check if DMA memory allocation is available
     fn is_dma_available() -> bool {
-        TensorImage::new(64, 64, RGBA, Some(TensorMemory::Dma)).is_ok()
+        if cfg!(target_os = "linux") {
+            *DMA_AVAILABLE
+                .get_or_init(|| Tensor::<u8>::new(&[64], Some(TensorMemory::Dma), None).is_ok())
+        } else {
+            false
+        }
+    }
+
+    static GL_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Helper function to check if OpenGL is available
+    fn is_opengl_available() -> bool {
+        if cfg!(all(target_os = "linux", feature = "opengl")) {
+            *GL_AVAILABLE.get_or_init(|| GLConverterThreaded::new().is_ok())
+        } else {
+            false
+        }
     }
 
     #[test]
@@ -919,6 +934,11 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
     fn test_opengl_resize() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
         let dst_width = 640;
         let dst_height = 360;
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
@@ -959,6 +979,11 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
     fn test_opengl_10_threads() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
         let handles: Vec<_> = (0..10)
             .map(|i| {
                 std::thread::Builder::new()
@@ -977,6 +1002,11 @@ mod image_tests {
     #[test]
     #[cfg(feature = "opengl")]
     fn test_opengl_grey() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
         let img = TensorImage::load_jpeg(
             include_bytes!("../../../testdata/grey.jpg"),
             Some(GREY),
@@ -1205,6 +1235,11 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
     fn test_opengl_src_crop() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
         let dst_width = 640;
         let dst_height = 360;
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
@@ -1260,6 +1295,11 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
     fn test_opengl_dst_crop() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
         let dst_width = 640;
         let dst_height = 640;
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
@@ -1304,10 +1344,8 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
     fn test_opengl_all_rgba() {
-        if !is_dma_available() {
-            eprintln!(
-                "SKIPPED: test_opengl_all_rgba - DMA memory allocation not available (permission denied or no DMA-BUF support)"
-            );
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
             return;
         }
 
@@ -1319,13 +1357,12 @@ mod image_tests {
 
         let mut gl_converter = GLConverterThreaded::new().unwrap();
 
-        for mem in [
-            None,
-            Some(TensorMemory::Dma),
-            Some(TensorMemory::Mem),
-            Some(TensorMemory::Shm),
-        ] {
-            let src = TensorImage::load_jpeg(&file, Some(RGBA), mem).unwrap();
+        let mut mem = vec![None, Some(TensorMemory::Mem), Some(TensorMemory::Shm)];
+        if is_dma_available() {
+            mem.push(Some(TensorMemory::Dma));
+        }
+        for m in mem {
+            let src = TensorImage::load_jpeg(&file, Some(RGBA), m).unwrap();
 
             for rot in [
                 Rotation::None,
@@ -1334,8 +1371,8 @@ mod image_tests {
                 Rotation::CounterClockwise90,
             ] {
                 for flip in [Flip::None, Flip::Horizontal, Flip::Vertical] {
-                    let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, mem).unwrap();
-                    let mut gl_dst = TensorImage::new(dst_width, dst_height, RGBA, mem).unwrap();
+                    let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, m).unwrap();
+                    let mut gl_dst = TensorImage::new(dst_width, dst_height, RGBA, m).unwrap();
                     cpu_dst.tensor.map().unwrap().as_mut_slice().fill(114);
                     gl_dst.tensor.map().unwrap().as_mut_slice().fill(114);
                     cpu_converter
@@ -1365,7 +1402,7 @@ mod image_tests {
                             },
                         )
                         .map_err(|e| {
-                            log::error!("error mem {mem:?} rot {rot:?} error: {e:?}");
+                            log::error!("error mem {m:?} rot {rot:?} error: {e:?}");
                             e
                         })
                         .unwrap();
@@ -1436,9 +1473,15 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
     fn test_opengl_rotate() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
         let size = (1280, 720);
         let mut mem = vec![None, Some(TensorMemory::Shm), Some(TensorMemory::Mem)];
-        if dma_available() {
+
+        if is_dma_available() {
             mem.push(Some(TensorMemory::Dma));
         }
         for m in mem {
@@ -1450,18 +1493,6 @@ mod image_tests {
                 test_opengl_rotate_(size, rot, m);
             }
         }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn dma_available() -> bool {
-        #[cfg(target_os = "linux")]
-        {
-            dma_heap::Heap::new(dma_heap::HeapKind::Cma)
-                .or_else(|_| dma_heap::Heap::new(dma_heap::HeapKind::System))
-                .is_ok()
-        }
-        #[cfg(not(target_os = "linux"))]
-        false
     }
 
     #[cfg(target_os = "linux")]
@@ -1599,8 +1630,21 @@ mod image_tests {
     #[test]
     #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
-    #[ignore = "opengl doesn't support rendering to YUYV texture?"]
+    #[ignore = "opengl doesn't support rendering to YUYV texture"]
     fn test_rgba_to_yuyv_resize_opengl() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        if !is_dma_available() {
+            eprintln!(
+                "SKIPPED: {} - DMA memory allocation not available (permission denied or no DMA-BUF support)",
+                function!()
+            );
+            return;
+        }
+
         let src = load_bytes_to_tensor(
             1280,
             720,
@@ -1827,9 +1871,14 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
     fn test_yuyv_to_rgba_opengl() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
         if !is_dma_available() {
             eprintln!(
-                "SKIPPED: test_yuyv_to_rgba_opengl - DMA memory allocation not available (permission denied or no DMA-BUF support)"
+                "SKIPPED: {} - DMA memory allocation not available (permission denied or no DMA-BUF support)",
+                function!()
             );
             return;
         }
@@ -2089,9 +2138,15 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
     fn test_yuyv_to_rgba_crop_flip_opengl() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
         if !is_dma_available() {
             eprintln!(
-                "SKIPPED: test_yuyv_to_rgba_crop_flip_opengl - DMA memory allocation not available (permission denied or no DMA-BUF support)"
+                "SKIPPED: {} - DMA memory allocation not available (permission denied or no DMA-BUF support)",
+                function!()
             );
             return;
         }
@@ -2250,8 +2305,7 @@ mod image_tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
-    fn test_cpu_resize_8bps() {
+    fn test_cpu_resize_planar_rgb() {
         let dst_width = 640;
         let dst_height = 640;
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
@@ -2281,16 +2335,20 @@ mod image_tests {
     #[test]
     #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
-    fn test_opengl_resize_8bps() {
-        // This test is skipped because OpenGL doesn't support 8BPS (PLANAR_RGB)
-        // destination textures The test would fail with: NotSupported("Opengl
-        // doesn't support 8BPS destination texture")
-        eprintln!(
-            "SKIPPED: test_opengl_resize_8bps - OpenGL doesn't support 8BPS (PLANAR_RGB) destination textures"
-        );
-        return;
+    fn test_opengl_resize_planar_rgb() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
 
-        /* Original test code - kept for reference
+        if !is_dma_available() {
+            eprintln!(
+                "SKIPPED: {} - DMA memory allocation not available (permission denied or no DMA-BUF support)",
+                function!()
+            );
+            return;
+        }
+
         let dst_width = 640;
         let dst_height = 640;
         let file = include_bytes!("../../../testdata/test_image.jpg").to_vec();
@@ -2344,7 +2402,6 @@ mod image_tests {
             )
             .unwrap();
         compare_images(&gl_dst, &cpu_dst, 0.98, function!());
-        */
     }
 
     fn load_bytes_to_tensor(
