@@ -9,6 +9,9 @@ use ndarray::{
 use num_traits::{AsPrimitive, Float};
 use rayon::slice::ParallelSliceMut;
 
+/// Post processes boxes and scores tensors into detection boxes, filtering out
+/// any boxes below the score threshold. The boxes tensor is converted to XYXY
+/// using the given BBoxTypeTrait. The order of the boxes is preserved.
 pub fn postprocess_boxes_float<
     B: BBoxTypeTrait,
     BOX: Float + AsPrimitive<f32> + Send + Sync,
@@ -39,6 +42,12 @@ pub fn postprocess_boxes_float<
         .collect()
 }
 
+/// Post processes boxes and scores tensors into detection boxes, filtering out
+/// any boxes below the score threshold. The boxes tensor is converted to XYXY
+/// using the given BBoxTypeTrait. The order of the boxes is preserved.
+///
+/// This function is very similar to `postprocess_boxes_float` but will also
+/// return the index of the box. The boxes will be in ascending index order.
 pub fn postprocess_boxes_index_float<
     B: BBoxTypeTrait,
     BOX: Float + AsPrimitive<f32> + Send + Sync,
@@ -74,7 +83,9 @@ pub fn postprocess_boxes_index_float<
         .collect()
 }
 
-pub fn nms_f32(iou: f32, mut boxes: Vec<DetectBox>) -> Vec<DetectBox> {
+/// Uses NMS to filter boxes based on the score and iou. Sorts boxes by score,
+/// then greedily selects a subset of boxes in descending order of score.
+pub fn nms_float(iou: f32, mut boxes: Vec<DetectBox>) -> Vec<DetectBox> {
     // Boxes get sorted by score in descending order so we know based on the
     // index the scoring of the boxes and can skip parts of the loop.
     boxes.par_sort_by(|a, b| b.score.total_cmp(&a.score));
@@ -108,7 +119,12 @@ pub fn nms_f32(iou: f32, mut boxes: Vec<DetectBox>) -> Vec<DetectBox> {
     boxes.into_iter().filter(|b| b.score >= 0.0).collect()
 }
 
-pub fn nms_extra_f32<E: Send + Sync>(
+/// Uses NMS to filter boxes based on the score and iou. Sorts boxes by score,
+/// then greedily selects a subset of boxes in descending order of score.
+///
+/// This is same as `nms_float` but will also include extra information along
+/// with each box, such as the index
+pub fn nms_extra_float<E: Send + Sync>(
     iou: f32,
     mut boxes: Vec<(DetectBox, E)>,
 ) -> Vec<(DetectBox, E)> {
@@ -141,8 +157,9 @@ pub fn nms_extra_f32<E: Send + Sync>(
     boxes.into_iter().filter(|b| b.0.score > 0.0).collect()
 }
 
-// Returns true if the IOU of the given boxes are greater than the iou threshold
-pub(crate) fn jaccard(a: &BoundingBox, b: &BoundingBox, iou: f32) -> bool {
+/// Returns true if the IOU of the given bounding boxes is greater than the iou
+/// threshold
+pub fn jaccard(a: &BoundingBox, b: &BoundingBox, iou: f32) -> bool {
     let left = a.xmin.max(b.xmin);
     let top = a.ymin.max(b.ymin);
     let right = a.xmax.min(b.xmax);

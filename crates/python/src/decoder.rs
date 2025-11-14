@@ -365,7 +365,7 @@ impl PyDecoder {
 
         match (boxes, protos) {
             (ReadOnlyArrayGeneric2::UInt8(boxes), ReadOnlyArrayGeneric3::UInt8(protos)) => {
-                edgefirst::decoder::yolo::decode_yolo_segdet(
+                edgefirst::decoder::yolo::decode_yolo_segdet_quant(
                     (boxes.as_array(), Quantization::from(quant_boxes)),
                     (protos.as_array(), Quantization::from(quant_protos)),
                     score_threshold as f32,
@@ -375,7 +375,7 @@ impl PyDecoder {
                 );
             }
             (ReadOnlyArrayGeneric2::Int8(boxes), ReadOnlyArrayGeneric3::Int8(protos)) => {
-                edgefirst::decoder::yolo::decode_yolo_segdet(
+                edgefirst::decoder::yolo::decode_yolo_segdet_quant(
                     (boxes.as_array(), Quantization::from(quant_boxes)),
                     (protos.as_array(), Quantization::from(quant_protos)),
                     score_threshold as f32,
@@ -514,7 +514,7 @@ impl PyDecoder {
                     })
                     .collect::<Vec<_>>();
 
-                edgefirst::decoder::modelpack::decode_modelpack_split(
+                edgefirst::decoder::modelpack::decode_modelpack_split_quant(
                     &outputs,
                     &configs,
                     score_threshold as f32,
@@ -540,7 +540,7 @@ impl PyDecoder {
                     })
                     .collect::<Vec<_>>();
 
-                edgefirst::decoder::modelpack::decode_modelpack_split(
+                edgefirst::decoder::modelpack::decode_modelpack_split_quant(
                     &outputs,
                     &configs,
                     score_threshold as f32,
