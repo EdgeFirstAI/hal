@@ -2,6 +2,13 @@
 name = "edgefirst_hal"
 dynamic = ["version", "summary", "description", "description_content_type", "keywords", "home_page", "author", "author_email", "license", "project_url"]
 
+
+[project.optional-dependencies]
+test = [
+    "tensorflow",
+    "pyyaml",
+]
+
 dependencies = [
   "numpy",
 ]
