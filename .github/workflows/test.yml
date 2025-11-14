@@ -58,7 +58,7 @@ jobs:
       - name: Build Python bindings with coverage
         run: |
           source <(cargo llvm-cov show-env --export-prefix)
-          maturin develop -m crates/python/Cargo.toml
+          pip install crates/python/[test]
       
       - name: Run Python tests with coverage
         run: |
@@ -123,11 +123,11 @@ jobs:
       - name: Install maturin
         run: pip install maturin[patchelf]
       
-      - name: Build Python wheel
-        run: maturin build -m crates/python/Cargo.toml --release
-      
       - name: Install Python Test dependencies
         run: pip install crates/python/[test]
+
+      - name: Build Python wheel
+        run: maturin build -m crates/python/Cargo.toml --release
 
       - name: Install Python package
         run: pip install target/wheels/*manylinux*.whl --force-reinstall --no-deps
