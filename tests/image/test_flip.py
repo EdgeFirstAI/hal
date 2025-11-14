@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
+# SPDX-License-Identifier: Apache-2.0
+
 from edgefirst_hal import TensorImage, ImageConverter, Flip, FourCC
 import numpy as np
 src = TensorImage.load(

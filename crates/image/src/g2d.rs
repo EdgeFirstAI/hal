@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
+// SPDX-License-Identifier: Apache-2.0
+
 #![cfg(target_os = "linux")]
 
 use crate::{
@@ -419,6 +422,7 @@ mod g2d_tests {
                 height: 100,
                 width: 200,
             }),
+            dst_color: None,
         };
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
         let src = TensorImage::load_jpeg(&file, Some(RGB), None)?;

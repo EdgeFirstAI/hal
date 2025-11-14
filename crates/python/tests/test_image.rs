@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
+// SPDX-License-Identifier: Apache-2.0
+
 // #![cfg(not(feature = "extension-module"))]
 
 use edgefirst_hal::edgefirst_hal as edgefirst_hal_module;

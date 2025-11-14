@@ -19,19 +19,19 @@ python-abi311 = ["pyo3/abi3-py311"]
 extension-module = ["pyo3/extension-module"]
 
 [dependencies]
-edgefirst = { version = "*", path = "../edgefirst" }
+edgefirst = { workspace = true }
 env_logger = { workspace = true }
 four-char-code = { workspace = true }
-numpy = { version = "0.26.0", features = ["half"] }
-pyo3 = { version = "0.26.0" }
-ndarray = { workspace = true }
-pythonize = "0.26.0"
-half = "2.7.1"
+half = { workspace = true }
 log = { workspace = true }
+ndarray = { workspace = true }
+numpy = { workspace = true }
+pyo3 = { workspace = true }
+pythonize = { workspace = true }
 
 [build-dependencies]
-pyo3-build-config = { version = "0.26.0", features = ["resolve-config"] }
-rustc_version = "0.4"
+pyo3-build-config = { workspace = true }
+rustc_version = { workspace = true }
 
 [dev-dependencies]
-approx = "0.5.1"
+approx = { workspace = true }
