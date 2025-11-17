@@ -95,7 +95,7 @@ impl TryFrom<G2DFormat> for FourCharCode {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct G2DPhysical(c_ulong);
 
 impl G2DPhysical {
@@ -242,7 +242,7 @@ fn guess_version(g2d: &g2d) -> Option<Version> {
 }
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct G2DSurface {
     pub format: g2d_format,
     pub planes: [::std::os::raw::c_ulong; 3usize],
@@ -285,7 +285,7 @@ impl Default for G2DSurface {
 }
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct G2DSurfaceLegacy {
     pub format: g2d_format,
     pub planes: [::std::os::raw::c_int; 3usize],
@@ -351,6 +351,7 @@ impl From<&G2DSurface> for G2DSurfaceLegacy {
     }
 }
 
+#[derive(Debug)]
 pub struct G2D {
     pub lib: Rc<g2d>,
     pub handle: *mut c_void,

@@ -178,6 +178,7 @@ impl TryFrom<&str> for TensorMemory {
     }
 }
 
+#[derive(Debug)]
 pub enum Tensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
