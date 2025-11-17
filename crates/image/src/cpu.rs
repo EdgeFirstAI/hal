@@ -14,6 +14,7 @@ use rayon::iter::IndexedParallelIterator;
 
 /// CPUConverter implements the ImageConverter trait using the fallback CPU
 /// implementation for image processing.
+#[derive(Debug, Clone)]
 pub struct CPUConverter {
     resizer: fast_image_resize::Resizer,
     options: fast_image_resize::ResizeOptions,

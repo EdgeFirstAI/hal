@@ -390,7 +390,7 @@ impl Drop for GlContext {
 
 #[derive(Debug)]
 /// A simple wrapper for a device node.
-pub struct Card(std::fs::File);
+pub(crate) struct Card(std::fs::File);
 
 /// Implementing `AsFd` is a prerequisite to implementing the traits found
 /// in this crate. Here, we are just calling `as_fd()` on the inner File.
@@ -456,6 +456,7 @@ type GLConverterMessage = (
 /// separate rendering thread, as OpenGL contexts are not thread-safe. This can
 /// be safely sent between threads. The `convert()` call sends the conversion
 /// request to the rendering thread and waits for the result.
+#[derive(Debug)]
 pub struct GLConverterThreaded {
     handle: Option<JoinHandle<()>>,
     sender: Option<Sender<GLConverterMessage>>,

@@ -15,6 +15,7 @@ use crate::{
 
 /// Configuration for ModelPack split detection decoder. The quantization is
 /// ignored when decoding float models.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelPackDetectionConfig {
     pub anchors: Vec<[f32; 2]>,
     pub quantization: Option<Quantization>,
