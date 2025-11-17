@@ -47,6 +47,7 @@ pub const GREY: FourCharCode = four_char_code!("Y800");
 // TODO: planar RGB is 8BPS? https://fourcc.org/8bps/
 pub const PLANAR_RGB: FourCharCode = four_char_code!("8BPS");
 
+/// An image represented as a tensor with associated format information.
 pub struct TensorImage {
     tensor: Tensor<u8>,
     fourcc: FourCharCode,
@@ -54,6 +55,20 @@ pub struct TensorImage {
 }
 
 impl TensorImage {
+    /// Creates a new `TensorImage` with the specified width, height, format,
+    /// and memory type.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use edgefirst_image::{RGB, TensorImage};
+    /// use edgefirst_tensor::TensorMemory;
+    ///
+    /// let img = TensorImage::new(640, 480, RGB, Some(TensorMemory::Mem))?;
+    /// assert_eq!(img.width(), 640);
+    /// assert_eq!(img.height(), 480);
+    /// assert_eq!(img.fourcc(), RGB);
+    /// assert!(!img.is_planar());
+    /// ```
     pub fn new(
         width: usize,
         height: usize,
@@ -84,6 +99,21 @@ impl TensorImage {
         })
     }
 
+    /// Creates a new `TensorImage` from an existing tensor and specified
+    /// format.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use edgefirst_image::{RGB, TensorImage};
+    /// use edgefirst_tensor::Tensor;
+    ///  # fn main() -> Result<(), edgefirst_image::Error> {
+    /// let tensor = Tensor::new(&[720, 1280, 3], None, None)?;
+    /// let img = TensorImage::from_tensor(tensor, RGB)?;
+    /// assert_eq!(img.width(), 1280);
+    /// assert_eq!(img.height(), 720);
+    /// assert_eq!(img.fourcc(), RGB);
+    /// # Ok(())
+    /// # }
     pub fn from_tensor(tensor: Tensor<u8>, fourcc: FourCharCode) -> Result<Self> {
         // Validate tensor shape based on the fourcc and is_planar flag
         let shape = tensor.shape();
@@ -112,6 +142,23 @@ impl TensorImage {
         })
     }
 
+    /// Loads an image from the given byte slice, attempting to decode it as
+    /// JPEG or PNG format. Exif orientation is supported. The default format is
+    /// RGB.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use edgefirst_image::{RGB, TensorImage};
+    /// use edgefirst_tensor::TensorMemory;
+    /// # fn main() -> Result<(), edgefirst_image::Error> {
+    /// let jpeg_bytes = include_bytes!("../../../testdata/zidane.jpg");
+    /// let img = TensorImage::load(jpeg_bytes, Some(RGB), Some(TensorMemory::Mem))?;
+    /// assert_eq!(img.width(), 1280);
+    /// assert_eq!(img.height(), 720);
+    /// assert_eq!(img.fourcc(), RGB);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn load(
         image: &[u8],
         format: Option<FourCharCode>,
@@ -129,6 +176,22 @@ impl TensorImage {
         ))
     }
 
+    /// Loads a JPEG image from the given byte slice. Supports EXIF orientation.
+    /// The default format is RGB.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use edgefirst_image::{RGB, TensorImage};
+    /// use edgefirst_tensor::TensorMemory;
+    /// # fn main() -> Result<(), edgefirst_image::Error> {
+    /// let jpeg_bytes = include_bytes!("../../../testdata/zidane.jpg");
+    /// let img = TensorImage::load_jpeg(jpeg_bytes, Some(RGB), Some(TensorMemory::Mem))?;
+    /// assert_eq!(img.width(), 1280);
+    /// assert_eq!(img.height(), 720);
+    /// assert_eq!(img.fourcc(), RGB);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn load_jpeg(
         image: &[u8],
         format: Option<FourCharCode>,
@@ -226,6 +289,22 @@ impl TensorImage {
         rotate_flip_to_tensor_image(&tmp, rotation, flip, memory)
     }
 
+    /// Loads a PNG image from the given byte slice. Supports EXIF orientation.
+    /// The default format is RGB.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use edgefirst_image::{RGB, TensorImage};
+    /// use edgefirst_tensor::TensorMemory;
+    /// # fn main() -> Result<(), edgefirst_image::Error> {
+    /// let png_bytes = include_bytes!("../../../testdata/zidane.png");
+    /// let img = TensorImage::load_png(png_bytes, Some(RGB), Some(TensorMemory::Mem))?;
+    /// assert_eq!(img.width(), 1280);
+    /// assert_eq!(img.height(), 720);
+    /// assert_eq!(img.fourcc(), RGB);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn load_png(
         image: &[u8],
         format: Option<FourCharCode>,
@@ -299,6 +378,20 @@ impl TensorImage {
         }
     }
 
+    /// Saves the image as a JPEG file at the specified path with the given
+    /// quality. Only RGB and RGBA formats are supported.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use edgefirst_image::{RGB, TensorImage};
+    /// use edgefirst_tensor::Tensor;
+    ///  # fn main() -> Result<(), edgefirst_image::Error> {
+    /// let tensor = Tensor::new(&[720, 1280, 3], None, None)?;
+    /// let img = TensorImage::from_tensor(tensor, RGB)?;
+    /// let save_path = "/tmp/output.jpg";
+    /// img.save_jpeg(save_path, 90)?;
+    /// # Ok(())
+    /// # }
     pub fn save_jpeg(&self, path: &str, quality: u8) -> Result<()> {
         if self.is_planar {
             return Err(Error::NotImplemented(
@@ -329,18 +422,63 @@ impl TensorImage {
         Ok(())
     }
 
+    /// Returns a reference to the underlying tensor.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use edgefirst_image::{RGB, TensorImage};
+    /// use edgefirst_tensor::{Tensor, TensorTrait};
+    ///  # fn main() -> Result<(), edgefirst_image::Error> {
+    /// let tensor = Tensor::new(&[720, 1280, 3], None, Some("Tensor"))?;
+    /// let img = TensorImage::from_tensor(tensor, RGB)?;
+    /// let underlying_tensor = img.tensor();
+    /// assert_eq!(underlying_tensor.name(), "Tensor");
+    /// # Ok(())
+    /// # }
     pub fn tensor(&self) -> &Tensor<u8> {
         &self.tensor
     }
 
+    /// Returns the FourCC code representing the image format.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use edgefirst_image::{RGB, TensorImage};
+    /// use edgefirst_tensor::{Tensor, TensorTrait};
+    ///  # fn main() -> Result<(), edgefirst_image::Error> {
+    /// let tensor = Tensor::new(&[720, 1280, 3], None, Some("Tensor"))?;
+    /// let img = TensorImage::from_tensor(tensor, RGB)?;
+    /// assert_eq!(img.fourcc(), RGB);
+    /// # Ok(())
+    /// # }
     pub fn fourcc(&self) -> FourCharCode {
         self.fourcc
     }
 
+    /// # Examples
+    /// ```rust
+    /// use edgefirst_image::{RGB, TensorImage};
+    /// use edgefirst_tensor::{Tensor, TensorTrait};
+    ///  # fn main() -> Result<(), edgefirst_image::Error> {
+    /// let tensor = Tensor::new(&[720, 1280, 3], None, Some("Tensor"))?;
+    /// let img = TensorImage::from_tensor(tensor, RGB)?;
+    /// assert!(!img.is_planar());
+    /// # Ok(())
+    /// # }
     pub fn is_planar(&self) -> bool {
         self.is_planar
     }
 
+    /// # Examples
+    /// ```rust
+    /// use edgefirst_image::{RGB, TensorImage};
+    /// use edgefirst_tensor::{Tensor, TensorTrait};
+    ///  # fn main() -> Result<(), edgefirst_image::Error> {
+    /// let tensor = Tensor::new(&[720, 1280, 3], None, Some("Tensor"))?;
+    /// let img = TensorImage::from_tensor(tensor, RGB)?;
+    /// assert_eq!(img.width(), 1280);
+    /// # Ok(())
+    /// # }
     pub fn width(&self) -> usize {
         match self.is_planar {
             true => self.tensor.shape()[2],
@@ -348,6 +486,16 @@ impl TensorImage {
         }
     }
 
+    /// # Examples
+    /// ```rust
+    /// use edgefirst_image::{RGB, TensorImage};
+    /// use edgefirst_tensor::{Tensor, TensorTrait};
+    ///  # fn main() -> Result<(), edgefirst_image::Error> {
+    /// let tensor = Tensor::new(&[720, 1280, 3], None, Some("Tensor"))?;
+    /// let img = TensorImage::from_tensor(tensor, RGB)?;
+    /// assert_eq!(img.height(), 720);
+    /// # Ok(())
+    /// # }
     pub fn height(&self) -> usize {
         match self.is_planar {
             true => self.tensor.shape()[1],
@@ -355,6 +503,16 @@ impl TensorImage {
         }
     }
 
+    /// # Examples
+    /// ```rust
+    /// use edgefirst_image::{RGB, TensorImage};
+    /// use edgefirst_tensor::{Tensor, TensorTrait};
+    ///  # fn main() -> Result<(), edgefirst_image::Error> {
+    /// let tensor = Tensor::new(&[720, 1280, 3], None, Some("Tensor"))?;
+    /// let img = TensorImage::from_tensor(tensor, RGB)?;
+    /// assert_eq!(img.channels(), 3);
+    /// # Ok(())
+    /// # }
     pub fn channels(&self) -> usize {
         match self.is_planar {
             true => self.tensor.shape()[0],
@@ -362,6 +520,16 @@ impl TensorImage {
         }
     }
 
+    /// # Examples
+    /// ```rust
+    /// use edgefirst_image::{RGB, TensorImage};
+    /// use edgefirst_tensor::{Tensor, TensorTrait};
+    ///  # fn main() -> Result<(), edgefirst_image::Error> {
+    /// let tensor = Tensor::new(&[720, 1280, 3], None, Some("Tensor"))?;
+    /// let img = TensorImage::from_tensor(tensor, RGB)?;
+    /// assert_eq!(img.row_stride(), 1280*3);
+    /// # Ok(())
+    /// # }
     pub fn row_stride(&self) -> usize {
         match self.is_planar {
             true => self.width(),
@@ -402,6 +570,8 @@ pub enum Rotation {
     CounterClockwise90 = 3,
 }
 impl Rotation {
+    /// Creates a Rotation enum from an angle in degrees. The angle must be a
+    /// multiple of 90.
     pub fn from_degrees_clockwise(angle: usize) -> Rotation {
         match angle.rem_euclid(90) {
             0 => Rotation::None,
@@ -427,29 +597,36 @@ pub struct Crop {
     pub dst_color: Option<[u8; 4]>,
 }
 impl Crop {
+    // Creates a new Crop with default values (no cropping).
     pub fn new() -> Self {
         Crop::default()
     }
 
+    // Sets the source rectangle for cropping.
     pub fn with_src_rect(mut self, src_rect: Option<Rect>) -> Self {
         self.src_rect = src_rect;
         self
     }
 
+    // Sets the destination rectangle for cropping.
     pub fn with_dst_rect(mut self, dst_rect: Option<Rect>) -> Self {
         self.dst_rect = dst_rect;
         self
     }
 
+    // Sets the destination color for areas outside the cropped region.
     pub fn with_dst_color(mut self, dst_color: Option<[u8; 4]>) -> Self {
         self.dst_color = dst_color;
         self
     }
 
+    // Creates a new Crop with no cropping.
     pub fn no_crop() -> Self {
         Crop::default()
     }
 
+    // Checks if the crop rectangles are valid for the given source and
+    // destination images.
     pub fn check_crop(&self, src: &TensorImage, dst: &TensorImage) -> Result<(), Error> {
         let src = self.src_rect.is_none_or(|x| x.check_rect(src));
         let dst = self.dst_rect.is_none_or(|x| x.check_rect(dst));
@@ -480,6 +657,7 @@ pub struct Rect {
 }
 
 impl Rect {
+    // Creates a new Rect with the specified left, top, width, and height.
     pub fn new(left: usize, top: usize, width: usize, height: usize) -> Self {
         Self {
             left,
@@ -489,6 +667,7 @@ impl Rect {
         }
     }
 
+    // Checks if the rectangle is valid for the given image.
     pub fn check_rect(&self, image: &TensorImage) -> bool {
         self.left + self.width <= image.width() && self.top + self.height <= image.height()
     }
@@ -521,13 +700,23 @@ pub trait ImageConverterTrait {
     ) -> Result<()>;
 }
 
+/// Image converter that uses available hardware acceleration or CPU as a
+/// fallback.
 pub struct ImageConverter {
+    /// CPU-based image converter as a fallback. This is only None if the
+    /// EDGEFIRST_DISABLE_CPU environment variable is set.
     pub cpu: Option<CPUConverter>,
 
     #[cfg(target_os = "linux")]
+    /// G2D-based image converter for Linux systems. This is only available if
+    /// the EDGEFIRST_DISABLE_G2D environment variable is not set and libg2d.so
+    /// is available.
     pub g2d: Option<G2DConverter>,
     #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
+    /// OpenGL-based image converter for Linux systems. This is only available
+    /// if the EDGEFIRST_DISABLE_GL environment variable is not set and OpenGL
+    /// ES is available.
     pub opengl: Option<GLConverterThreaded>,
 }
 
@@ -535,6 +724,9 @@ unsafe impl Send for ImageConverter {}
 unsafe impl Sync for ImageConverter {}
 
 impl ImageConverter {
+    /// Creates a new `ImageConverter` instance, initializing available
+    /// hardware converters based on the system capabilities and environment
+    /// variables.
     pub fn new() -> Result<Self> {
         #[cfg(target_os = "linux")]
         let g2d = if let Ok(x) = std::env::var("EDGEFIRST_DISABLE_G2D")
@@ -598,6 +790,11 @@ impl ImageConverter {
 }
 
 impl ImageConverterTrait for ImageConverter {
+    /// Converts the source image to the destination image format and size. The
+    /// image is cropped first, then flipped, then rotated
+    ///
+    /// Prefer hardware accelerators when available, falling back to CPU if
+    /// necessary.
     fn convert(
         &mut self,
         src: &TensorImage,
