@@ -18,6 +18,7 @@ use std::{
 };
 
 /// A tensor backed by DMA (Direct Memory Access) memory.
+#[derive(Debug)]
 pub struct DmaTensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
@@ -156,6 +157,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub struct DmaMap<T>
 where
     T: Num + Clone + fmt::Debug,
@@ -225,6 +227,7 @@ where
     }
 }
 
+#[derive(Debug)]
 struct DmaPtr(NonNull<c_void>);
 impl Deref for DmaPtr {
     type Target = NonNull<c_void>;

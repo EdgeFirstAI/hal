@@ -13,6 +13,7 @@ use std::{os::fd::AsRawFd, time::Instant};
 
 /// G2DConverter implements the ImageConverter trait using the NXP G2D
 /// library for hardware-accelerated image processing on i.MX platforms.
+#[derive(Debug)]
 pub struct G2DConverter {
     g2d: G2D,
 }
@@ -21,6 +22,7 @@ unsafe impl Send for G2DConverter {}
 unsafe impl Sync for G2DConverter {}
 
 impl G2DConverter {
+    /// Creates a new G2DConverter instance.
     pub fn new() -> Result<Self> {
         let mut g2d = G2D::new("libg2d.so.2")?;
         g2d.set_bt709_colorspace()?;
@@ -29,6 +31,8 @@ impl G2DConverter {
         Ok(Self { g2d })
     }
 
+    /// Returns the G2D library version as defined by G2D_VERSION in the shared
+    /// library.
     pub fn version(&self) -> g2d_sys::Version {
         self.g2d.version()
     }

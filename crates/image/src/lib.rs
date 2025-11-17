@@ -48,6 +48,7 @@ pub const GREY: FourCharCode = four_char_code!("Y800");
 pub const PLANAR_RGB: FourCharCode = four_char_code!("8BPS");
 
 /// An image represented as a tensor with associated format information.
+#[derive(Debug)]
 pub struct TensorImage {
     tensor: Tensor<u8>,
     fourcc: FourCharCode,
@@ -62,12 +63,14 @@ impl TensorImage {
     /// ```rust
     /// use edgefirst_image::{RGB, TensorImage};
     /// use edgefirst_tensor::TensorMemory;
-    ///
+    /// # fn main() -> Result<(), edgefirst_image::Error> {
     /// let img = TensorImage::new(640, 480, RGB, Some(TensorMemory::Mem))?;
     /// assert_eq!(img.width(), 640);
     /// assert_eq!(img.height(), 480);
     /// assert_eq!(img.fourcc(), RGB);
     /// assert!(!img.is_planar());
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn new(
         width: usize,
@@ -702,6 +705,7 @@ pub trait ImageConverterTrait {
 
 /// Image converter that uses available hardware acceleration or CPU as a
 /// fallback.
+#[derive(Debug)]
 pub struct ImageConverter {
     /// CPU-based image converter as a fallback. This is only None if the
     /// EDGEFIRST_DISABLE_CPU environment variable is set.

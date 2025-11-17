@@ -167,6 +167,7 @@ pub mod configs {
         Yolov8,
     }
 
+    #[derive(Debug, Clone, PartialEq)]
     pub enum ModelType {
         ModelPackSegDet {
             boxes: Boxes,
@@ -225,12 +226,14 @@ pub mod configs {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct DecoderBuilder {
     config_src: Option<ConfigSource>,
     iou_threshold: f32,
     score_threshold: f32,
 }
 
+#[derive(Debug, Clone, PartialEq)]
 enum ConfigSource {
     Yaml(String),
     Json(String),
@@ -936,6 +939,7 @@ impl DecoderBuilder {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct Decoder {
     model_type: ModelType,
     pub iou_threshold: f32,

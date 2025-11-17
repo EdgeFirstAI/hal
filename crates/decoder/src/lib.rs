@@ -146,7 +146,7 @@ impl BBoxTypeTrait for XYWH {
 }
 
 /// Describes the quantization parameters for a tensor
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Quantization {
     pub scale: f32,
     pub zero_point: i32,
