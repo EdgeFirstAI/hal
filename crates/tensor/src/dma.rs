@@ -17,6 +17,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+/// A tensor backed by DMA (Direct Memory Access) memory.
 pub struct DmaTensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
