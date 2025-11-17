@@ -451,6 +451,11 @@ type GLConverterMessage = (
     Crop,
     tokio::sync::oneshot::Sender<Result<(), Error>>,
 );
+
+/// OpenGL multi-threaded image converter. The actual conversion is done in a
+/// separate rendering thread, as OpenGL contexts are not thread-safe. This can
+/// be safely sent between threads. The `convert()` call sends the conversion
+/// request to the rendering thread and waits for the result.
 pub struct GLConverterThreaded {
     handle: Option<JoinHandle<()>>,
     sender: Option<Sender<GLConverterMessage>>,
@@ -460,19 +465,20 @@ pub struct GLConverterThreaded {
 unsafe impl Send for GLConverterThreaded {}
 unsafe impl Sync for GLConverterThreaded {}
 
-pub struct SendablePtr<T: Send> {
+struct SendablePtr<T: Send> {
     ptr: *const T,
 }
 
 unsafe impl<T> Send for SendablePtr<T> where T: Send {}
 
-pub struct SendablePtrMut<T: Send> {
+struct SendablePtrMut<T: Send> {
     ptr: *mut T,
 }
 
 unsafe impl<T> Send for SendablePtrMut<T> where T: Send {}
 
 impl GLConverterThreaded {
+    /// Creates a new OpenGL multi-threaded image converter.
     pub fn new() -> Result<Self, Error> {
         let (send, mut recv) = tokio::sync::mpsc::channel::<GLConverterMessage>(1);
 
@@ -517,6 +523,7 @@ impl GLConverterThreaded {
         })
     }
 }
+
 impl ImageConverterTrait for GLConverterThreaded {
     fn convert(
         &mut self,
@@ -568,6 +575,8 @@ impl Drop for GLConverterThreaded {
         let _ = self.handle.take().unwrap().join();
     }
 }
+
+/// OpenGL single-threaded image converter.
 pub struct GLConverterST {
     camera_eglimage_texture: Texture,
     camera_normal_texture: Texture,
@@ -1590,7 +1599,7 @@ impl Drop for EglImage {
     }
 }
 
-pub struct Texture {
+struct Texture {
     id: u32,
     target: gls::gl::types::GLenum,
     width: usize,
@@ -1605,7 +1614,7 @@ impl Default for Texture {
 }
 
 impl Texture {
-    pub fn new() -> Self {
+    fn new() -> Self {
         let mut id = 0;
         unsafe { gls::gl::GenTextures(1, &raw mut id) };
         Self {
@@ -1617,7 +1626,7 @@ impl Texture {
         }
     }
 
-    pub fn update_texture(
+    fn update_texture(
         &mut self,
         target: gls::gl::types::GLenum,
         width: usize,
@@ -1671,13 +1680,13 @@ impl Drop for Texture {
     }
 }
 
-pub struct Buffer {
+struct Buffer {
     id: u32,
     buffer_index: u32,
 }
 
 impl Buffer {
-    pub fn new(buffer_index: u32, size_per_point: usize, max_points: usize) -> Buffer {
+    fn new(buffer_index: u32, size_per_point: usize, max_points: usize) -> Buffer {
         let mut id = 0;
         unsafe {
             gls::gl::EnableVertexAttribArray(buffer_index);
@@ -1709,12 +1718,12 @@ impl Drop for Buffer {
     }
 }
 
-pub struct FrameBuffer {
+struct FrameBuffer {
     id: u32,
 }
 
 impl FrameBuffer {
-    pub fn new() -> FrameBuffer {
+    fn new() -> FrameBuffer {
         let mut id = 0;
         unsafe {
             gls::gl::GenFramebuffers(1, &raw mut id);
@@ -1723,11 +1732,11 @@ impl FrameBuffer {
         FrameBuffer { id }
     }
 
-    pub fn bind(&self) {
+    fn bind(&self) {
         unsafe { gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, self.id) };
     }
 
-    pub fn unbind(&self) {
+    fn unbind(&self) {
         unsafe { gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0) };
     }
 }
@@ -1748,7 +1757,7 @@ pub struct GlProgram {
 }
 
 impl GlProgram {
-    pub fn new(vertex_shader: &str, fragment_shader: &str) -> Result<Self, crate::Error> {
+    fn new(vertex_shader: &str, fragment_shader: &str) -> Result<Self, crate::Error> {
         let id = unsafe { gls::gl::CreateProgram() };
         let vertex_id = unsafe { gls::gl::CreateShader(gls::gl::VERTEX_SHADER) };
         if compile_shader_from_str(vertex_id, vertex_shader, "shader_vert").is_err() {
@@ -1883,38 +1892,38 @@ fn fourcc_to_drm(fourcc: FourCharCode) -> DrmFourcc {
 
 mod egl_ext {
     #![allow(dead_code)]
-    pub const LINUX_DMA_BUF: u32 = 0x3270;
-    pub const LINUX_DRM_FOURCC: u32 = 0x3271;
-    pub const DMA_BUF_PLANE0_FD: u32 = 0x3272;
-    pub const DMA_BUF_PLANE0_OFFSET: u32 = 0x3273;
-    pub const DMA_BUF_PLANE0_PITCH: u32 = 0x3274;
-    pub const DMA_BUF_PLANE1_FD: u32 = 0x3275;
-    pub const DMA_BUF_PLANE1_OFFSET: u32 = 0x3276;
-    pub const DMA_BUF_PLANE1_PITCH: u32 = 0x3277;
-    pub const DMA_BUF_PLANE2_FD: u32 = 0x3278;
-    pub const DMA_BUF_PLANE2_OFFSET: u32 = 0x3279;
-    pub const DMA_BUF_PLANE2_PITCH: u32 = 0x327A;
-    pub const YUV_COLOR_SPACE_HINT: u32 = 0x327B;
-    pub const SAMPLE_RANGE_HINT: u32 = 0x327C;
-    pub const YUV_CHROMA_HORIZONTAL_SITING_HINT: u32 = 0x327D;
-    pub const YUV_CHROMA_VERTICAL_SITING_HINT: u32 = 0x327E;
+    pub(crate) const LINUX_DMA_BUF: u32 = 0x3270;
+    pub(crate) const LINUX_DRM_FOURCC: u32 = 0x3271;
+    pub(crate) const DMA_BUF_PLANE0_FD: u32 = 0x3272;
+    pub(crate) const DMA_BUF_PLANE0_OFFSET: u32 = 0x3273;
+    pub(crate) const DMA_BUF_PLANE0_PITCH: u32 = 0x3274;
+    pub(crate) const DMA_BUF_PLANE1_FD: u32 = 0x3275;
+    pub(crate) const DMA_BUF_PLANE1_OFFSET: u32 = 0x3276;
+    pub(crate) const DMA_BUF_PLANE1_PITCH: u32 = 0x3277;
+    pub(crate) const DMA_BUF_PLANE2_FD: u32 = 0x3278;
+    pub(crate) const DMA_BUF_PLANE2_OFFSET: u32 = 0x3279;
+    pub(crate) const DMA_BUF_PLANE2_PITCH: u32 = 0x327A;
+    pub(crate) const YUV_COLOR_SPACE_HINT: u32 = 0x327B;
+    pub(crate) const SAMPLE_RANGE_HINT: u32 = 0x327C;
+    pub(crate) const YUV_CHROMA_HORIZONTAL_SITING_HINT: u32 = 0x327D;
+    pub(crate) const YUV_CHROMA_VERTICAL_SITING_HINT: u32 = 0x327E;
 
-    pub const ITU_REC601: u32 = 0x327F;
-    pub const ITU_REC709: u32 = 0x3280;
-    pub const ITU_REC2020: u32 = 0x3281;
+    pub(crate) const ITU_REC601: u32 = 0x327F;
+    pub(crate) const ITU_REC709: u32 = 0x3280;
+    pub(crate) const ITU_REC2020: u32 = 0x3281;
 
-    pub const YUV_FULL_RANGE: u32 = 0x3282;
-    pub const YUV_NARROW_RANGE: u32 = 0x3283;
+    pub(crate) const YUV_FULL_RANGE: u32 = 0x3282;
+    pub(crate) const YUV_NARROW_RANGE: u32 = 0x3283;
 
-    pub const YUV_CHROMA_SITING_0: u32 = 0x3284;
-    pub const YUV_CHROMA_SITING_0_5: u32 = 0x3285;
+    pub(crate) const YUV_CHROMA_SITING_0: u32 = 0x3284;
+    pub(crate) const YUV_CHROMA_SITING_0_5: u32 = 0x3285;
 
-    pub const PLATFORM_GBM_KHR: u32 = 0x31D7;
+    pub(crate) const PLATFORM_GBM_KHR: u32 = 0x31D7;
 
-    pub const PLATFORM_DEVICE_EXT: u32 = 0x313F;
+    pub(crate) const PLATFORM_DEVICE_EXT: u32 = 0x313F;
 }
 
-pub fn generate_vertex_shader() -> &'static str {
+fn generate_vertex_shader() -> &'static str {
     "\
 #version 300 es
 precision mediump float;
@@ -1936,7 +1945,7 @@ void main() {
 "
 }
 
-pub fn generate_texture_fragment_shader() -> &'static str {
+fn generate_texture_fragment_shader() -> &'static str {
     "\
 #version 300 es
 
@@ -1953,7 +1962,7 @@ void main(){
 "
 }
 
-pub fn generate_texture_fragment_shader_yuv() -> &'static str {
+fn generate_texture_fragment_shader_yuv() -> &'static str {
     "\
 #version 300 es
 #extension GL_OES_EGL_image_external_essl3 : require
@@ -1970,7 +1979,7 @@ void main(){
 "
 }
 
-pub fn generate_planar_rgb_shader() -> &'static str {
+fn generate_planar_rgb_shader() -> &'static str {
     "\
 #version 300 es
 #extension GL_OES_EGL_image_external_essl3 : require
