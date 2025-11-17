@@ -9,9 +9,9 @@ use edgefirst::decoder::{
 
 use ndarray::{Array1, Array2};
 use numpy::{
-    IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayDyn, PyArrayLike2, PyArrayLike3,
-    PyArrayLikeDyn, PyArrayMethods, PyReadonlyArray3, PyReadonlyArrayDyn, PyReadwriteArrayDyn,
-    PyUntypedArray, ToPyArray,
+    IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayDyn, PyArrayLikeDyn, PyArrayMethods,
+    PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArrayDyn, PyReadwriteArrayDyn, PyUntypedArray,
+    ToPyArray,
 };
 use pyo3::{
     Bound, FromPyObject, PyAny, PyRef, PyResult, Python, pyclass, pymethods, types::PyAnyMethods,
@@ -77,26 +77,26 @@ where
 
 #[derive(FromPyObject)]
 pub enum ListOfReadOnlyArrayGeneric3<'py> {
-    UInt8(Vec<PyArrayLike3<'py, u8>>),
-    Int8(Vec<PyArrayLike3<'py, i8>>),
-    Float32(Vec<PyArrayLike3<'py, f32>>),
-    Float64(Vec<PyArrayLike3<'py, f64>>),
+    UInt8(Vec<PyReadonlyArray3<'py, u8>>),
+    Int8(Vec<PyReadonlyArray3<'py, i8>>),
+    Float32(Vec<PyReadonlyArray3<'py, f32>>),
+    Float64(Vec<PyReadonlyArray3<'py, f64>>),
 }
 
 #[derive(FromPyObject)]
 pub enum ReadOnlyArrayGeneric2<'py> {
-    UInt8(PyArrayLike2<'py, u8>),
-    Int8(PyArrayLike2<'py, i8>),
-    Float32(PyArrayLike2<'py, f32>),
-    Float64(PyArrayLike2<'py, f64>),
+    UInt8(PyReadonlyArray2<'py, u8>),
+    Int8(PyReadonlyArray2<'py, i8>),
+    Float32(PyReadonlyArray2<'py, f32>),
+    Float64(PyReadonlyArray2<'py, f64>),
 }
 
 #[derive(FromPyObject)]
 pub enum ReadOnlyArrayGeneric3<'py> {
-    UInt8(PyArrayLike3<'py, u8>),
-    Int8(PyArrayLike3<'py, i8>),
-    Float32(PyArrayLike3<'py, f32>),
-    Float64(PyArrayLike3<'py, f64>),
+    UInt8(PyReadonlyArray3<'py, u8>),
+    Int8(PyReadonlyArray3<'py, i8>),
+    Float32(PyReadonlyArray3<'py, f32>),
+    Float64(PyReadonlyArray3<'py, f64>),
 }
 
 // #[derive(FromPy<PyAny>)]
