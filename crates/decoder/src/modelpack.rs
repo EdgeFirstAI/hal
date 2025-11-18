@@ -30,8 +30,16 @@ impl From<&Detection> for ModelPackDetectionConfig {
     }
 }
 
-/// Decodes ModelPack detection outputs from quantized tensors. The boxes
-/// are expected to be in XYXY format.
+/// Decodes ModelPack detection outputs from quantized tensors.
+///
+/// The boxes are expected to be in XYXY format.
+///
+/// Expected shapes of inputs:
+/// - boxes: (num_boxes, 4)
+/// - scores: (num_boxes, num_classes)
+///
+/// # Panics
+/// Panics if shapes don't match the expected dimensions.
 pub fn decode_modelpack_det<
     BOX: PrimInt + AsPrimitive<f32> + Send + Sync,
     SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
@@ -53,6 +61,13 @@ pub fn decode_modelpack_det<
 
 /// Decodes ModelPack detection outputs from float tensors. The boxes
 /// are expected to be in XYXY format.
+///
+/// Expected shapes of inputs:
+/// - boxes: (num_boxes, 4)
+/// - scores: (num_boxes, num_classes)
+///
+/// # Panics
+/// Panics if shapes don't match the expected dimensions.
 pub fn decode_modelpack_float<
     BOX: Float + AsPrimitive<f32> + Send + Sync,
     SCORE: Float + AsPrimitive<f32> + Send + Sync,
@@ -76,6 +91,14 @@ pub fn decode_modelpack_float<
 
 /// Decodes ModelPack split detection outputs from quantized tensors. The boxes
 /// are expected to be in XYWH format.
+///
+/// The `configs` must correspond to the `outputs` in order.
+///
+/// Expected shapes of inputs:
+/// - outputs: (width, height, num_anchors * (5 + num_classes))
+///
+/// # Panics
+/// Panics if shapes don't match the expected dimensions.
 pub fn decode_modelpack_split_quant<D: AsPrimitive<f32>>(
     outputs: &[ArrayView3<D>],
     configs: &[ModelPackDetectionConfig],
@@ -94,6 +117,14 @@ pub fn decode_modelpack_split_quant<D: AsPrimitive<f32>>(
 
 /// Decodes ModelPack split detection outputs from float tensors. The boxes
 /// are expected to be in XYWH format.
+///
+/// The `configs` must correspond to the `outputs` in order.
+///
+/// Expected shapes of inputs:
+/// - outputs: (width, height, num_anchors * (5 + num_classes))
+///
+/// # Panics
+/// Panics if shapes don't match the expected dimensions.
 pub fn decode_modelpack_split_float<D: AsPrimitive<f32>>(
     outputs: &[ArrayView3<D>],
     configs: &[ModelPackDetectionConfig],
@@ -110,6 +141,13 @@ pub fn decode_modelpack_split_float<D: AsPrimitive<f32>>(
     );
 }
 /// Implementation of ModelPack detection decoding for quantized tensors.
+///
+/// Expected shapes of inputs:
+/// - boxes: (num_boxes, 4)
+/// - scores: (num_boxes, num_classes)
+///
+/// # Panics
+/// Panics if shapes don't match the expected dimensions.
 #[doc(hidden)]
 pub fn impl_modelpack_quant<
     B: BBoxTypeTrait,
@@ -142,6 +180,13 @@ pub fn impl_modelpack_quant<
 }
 
 /// Implementation of ModelPack detection decoding for float tensors.
+///
+/// Expected shapes of inputs:
+/// - boxes: (num_boxes, 4)
+/// - scores: (num_boxes, num_classes)
+///
+/// # Panics
+/// Panics if shapes don't match the expected dimensions.
 #[doc(hidden)]
 pub fn impl_modelpack_float<
     B: BBoxTypeTrait,
@@ -167,6 +212,13 @@ pub fn impl_modelpack_float<
 }
 
 /// Implementation of ModelPack split detection decoding for quantized tensors.
+///
+/// Expected shapes of inputs:
+/// - boxes: (num_boxes, 4)
+/// - scores: (num_boxes, num_classes)
+///
+/// # Panics
+/// Panics if shapes don't match the expected dimensions.
 #[doc(hidden)]
 pub fn impl_modelpack_split_quant<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
     outputs: &[ArrayView3<D>],
@@ -191,6 +243,14 @@ pub fn impl_modelpack_split_quant<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
 }
 
 /// Implementation of ModelPack split detection decoding for float tensors.
+///
+/// The `configs` must correspond to the `outputs` in order.
+///
+/// Expected shapes of inputs:
+/// - outputs: (width, height, num_anchors * (5 + num_classes))
+///
+/// # Panics
+/// Panics if shapes don't match the expected dimensions.
 #[doc(hidden)]
 pub fn impl_modelpack_split_float<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
     outputs: &[ArrayView3<D>],
@@ -382,6 +442,13 @@ fn fast_sigmoid_impl(f: f32) -> f32 {
 }
 
 /// Converts ModelPack segmentation into a 2D mask.
+/// The input segmentation is expected to have shape (H, W, num_classes).
+///
+/// The output mask will have shape (H, W), with values `0..num_classes` based
+/// on the argmax across the channels.
+///
+/// # Panics
+/// Panics if the input tensor does not have more than one channel.
 pub fn modelpack_segmentation_to_mask(segmentation: ArrayView3<u8>) -> Array2<u8> {
     use argminmax::ArgMinMax;
     assert!(
