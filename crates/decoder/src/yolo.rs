@@ -24,6 +24,9 @@ use crate::{
 /// Decodes YOLO detection outputs from quantized tensors into detection boxes.
 ///
 /// Boxes are expected to be in XYWH format.
+///
+/// Expected shapes of inputs:
+/// - output: (4 + num_classes, num_boxes)
 pub fn decode_yolo_det<BOX: PrimInt + AsPrimitive<f32> + Send + Sync>(
     output: (ArrayView2<BOX>, Quantization),
     score_threshold: f32,
@@ -36,6 +39,9 @@ pub fn decode_yolo_det<BOX: PrimInt + AsPrimitive<f32> + Send + Sync>(
 /// Decodes YOLO detection outputs from float tensors into detection boxes.
 ///
 /// Boxes are expected to be in XYWH format.
+///
+/// Expected shapes of inputs:
+/// - output: (4 + num_classes, num_boxes)
 pub fn decode_yolo_det_float<T>(
     output: ArrayView2<T>,
     score_threshold: f32,
@@ -52,6 +58,13 @@ pub fn decode_yolo_det_float<T>(
 /// detection boxes and segmentation masks.
 ///
 /// Boxes are expected to be in XYWH format.
+///
+/// Expected shapes of inputs:
+/// - boxes: (4 + num_classes + num_protos, num_boxes)
+/// - protos: (proto_height, proto_width, num_protos)
+///
+/// # Panics
+/// Panics if shapes don't match the expected dimensions.
 pub fn decode_yolo_segdet_quant<
     BOX: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
     PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
@@ -77,6 +90,13 @@ pub fn decode_yolo_segdet_quant<
 /// detection boxes and segmentation masks.
 ///
 /// Boxes are expected to be in XYWH format.
+///
+/// Expected shapes of inputs:
+/// - boxes: (4 + num_classes + num_protos, num_boxes)
+/// - protos: (proto_height, proto_width, num_protos)
+///
+/// # Panics
+/// Panics if shapes don't match the expected dimensions.
 pub fn decode_yolo_segdet_float<T>(
     boxes: ArrayView2<T>,
     protos: ArrayView3<T>,
@@ -102,6 +122,13 @@ pub fn decode_yolo_segdet_float<T>(
 /// boxes.
 ///
 /// Boxes are expected to be in XYWH format.
+///
+/// Expected shapes of inputs:
+/// - boxes: (4, num_boxes)
+/// - scores: (num_classes, num_boxes)
+///
+/// # Panics
+/// Panics if shapes don't match the expected dimensions.
 pub fn decode_yolo_split_det_quant<
     BOX: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
     SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
@@ -125,6 +152,13 @@ pub fn decode_yolo_split_det_quant<
 /// boxes.
 ///
 /// Boxes are expected to be in XYWH format.
+///
+/// Expected shapes of inputs:
+/// - boxes: (4, num_boxes)
+/// - scores: (num_classes, num_boxes)
+///
+/// # Panics
+/// Panics if shapes don't match the expected dimensions.
 pub fn decode_yolo_split_det_float<T>(
     boxes: ArrayView2<T>,
     scores: ArrayView2<T>,
@@ -148,6 +182,15 @@ pub fn decode_yolo_split_det_float<T>(
 /// into detection boxes and segmentation masks.
 ///
 /// Boxes are expected to be in XYWH format.
+///
+/// Expected shapes of inputs:
+/// - boxes_tensor: (4, num_boxes)
+/// - scores_tensor: (num_classes, num_boxes)
+/// - mask_tensor: (num_protos, num_boxes)
+/// - protos: (proto_height, proto_width, num_protos)
+///
+/// # Panics
+/// Panics if shapes don't match the expected dimensions.
 #[allow(clippy::too_many_arguments)]
 pub fn decode_yolo_split_segdet<
     BOX: PrimInt + AsPrimitive<f32> + Send + Sync,
@@ -180,6 +223,15 @@ pub fn decode_yolo_split_segdet<
 /// into detection boxes and segmentation masks.
 ///
 /// Boxes are expected to be in XYWH format.
+///
+/// Expected shapes of inputs:
+/// - boxes_tensor: (4, num_boxes)
+/// - scores_tensor: (num_classes, num_boxes)
+/// - mask_tensor: (num_protos, num_boxes)
+/// - protos: (proto_height, proto_width, num_protos)
+///
+/// # Panics
+/// Panics if shapes don't match the expected dimensions.
 #[allow(clippy::too_many_arguments)]
 pub fn decode_yolo_split_segdet_float<T>(
     boxes: ArrayView2<T>,
@@ -207,6 +259,9 @@ pub fn decode_yolo_split_segdet_float<T>(
 }
 
 /// Internal implementation of YOLO decoding for quantized tensors.
+///
+/// Expected shapes of inputs:
+/// - output: (4 + num_classes, num_boxes)
 pub fn impl_yolo_quant<B: BBoxTypeTrait, T: PrimInt + AsPrimitive<f32> + Send + Sync>(
     output: (ArrayView2<T>, Quantization),
     score_threshold: f32,
@@ -235,6 +290,9 @@ pub fn impl_yolo_quant<B: BBoxTypeTrait, T: PrimInt + AsPrimitive<f32> + Send + 
 }
 
 /// Internal implementation of YOLO decoding for float tensors.
+///
+/// Expected shapes of inputs:
+/// - output: (4 + num_classes, num_boxes)
 pub fn impl_yolo_float<B: BBoxTypeTrait, T: Float + AsPrimitive<f32> + Send + Sync>(
     output: ArrayView2<T>,
     score_threshold: f32,
@@ -256,6 +314,13 @@ pub fn impl_yolo_float<B: BBoxTypeTrait, T: Float + AsPrimitive<f32> + Send + Sy
 
 /// Internal implementation of YOLO split detection decoding for quantized
 /// tensors.
+///
+/// Expected shapes of inputs:
+/// - boxes: (4, num_boxes)
+/// - scores: (num_classes, num_boxes)
+///
+/// # Panics
+/// Panics if shapes don't match the expected dimensions.
 pub fn impl_yolo_split_quant<
     B: BBoxTypeTrait,
     BOX: PrimInt + AsPrimitive<f32> + Send + Sync,
@@ -292,6 +357,13 @@ pub fn impl_yolo_split_quant<
 }
 
 /// Internal implementation of YOLO split detection decoding for float tensors.
+///
+/// Expected shapes of inputs:
+/// - boxes: (4, num_boxes)
+/// - scores: (num_classes, num_boxes)
+///
+/// # Panics
+/// Panics if shapes don't match the expected dimensions.
 pub fn impl_yolo_split_float<
     B: BBoxTypeTrait,
     BOX: Float + AsPrimitive<f32> + Send + Sync,
@@ -319,6 +391,13 @@ pub fn impl_yolo_split_float<
 
 /// Internal implementation of YOLO detection segmentation decoding for
 /// quantized tensors.
+///
+/// Expected shapes of inputs:
+/// - boxes: (4 + num_classes + num_protos, num_boxes)
+/// - protos: (proto_height, proto_width, num_protos)
+///
+/// # Panics
+/// Panics if shapes don't match the expected dimensions.
 pub fn impl_yolo_segdet_quant<
     B: BBoxTypeTrait,
     BOX: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
@@ -353,6 +432,13 @@ pub fn impl_yolo_segdet_quant<
 
 /// Internal implementation of YOLO detection segmentation decoding for
 /// float tensors.
+///
+/// Expected shapes of inputs:
+/// - boxes: (4 + num_classes + num_protos, num_boxes)
+/// - protos: (proto_height, proto_width, num_protos)
+///
+/// # Panics
+/// Panics if shapes don't match the expected dimensions.
 pub fn impl_yolo_segdet_float<
     B: BBoxTypeTrait,
     BOX: Float + AsPrimitive<f32> + Send + Sync,
@@ -458,6 +544,15 @@ pub(crate) fn impl_yolo_split_segdet_quant_process_masks<
 #[allow(clippy::too_many_arguments)]
 /// Internal implementation of YOLO split detection segmentation decoding for
 /// quantized tensors.
+///
+/// Expected shapes of inputs:
+/// - boxes_tensor: (4, num_boxes)
+/// - scores_tensor: (num_classes, num_boxes)
+/// - mask_tensor: (num_protos, num_boxes)
+/// - protos: (proto_height, proto_width, num_protos)
+///
+/// # Panics
+/// Panics if shapes don't match the expected dimensions.
 pub fn impl_yolo_split_segdet_quant<
     B: BBoxTypeTrait,
     BOX: PrimInt + AsPrimitive<f32> + Send + Sync,
@@ -494,6 +589,15 @@ pub fn impl_yolo_split_segdet_quant<
 #[allow(clippy::too_many_arguments)]
 /// Internal implementation of YOLO split detection segmentation decoding for
 /// float tensors.
+///
+/// Expected shapes of inputs:
+/// - boxes_tensor: (4, num_boxes)
+/// - scores_tensor: (num_classes, num_boxes)
+/// - mask_tensor: (num_protos, num_boxes)
+/// - protos: (proto_height, proto_width, num_protos)
+///
+/// # Panics
+/// Panics if shapes don't match the expected dimensions.
 pub fn impl_yolo_split_segdet_float<
     B: BBoxTypeTrait,
     BOX: Float + AsPrimitive<f32> + Send + Sync,
@@ -715,6 +819,14 @@ where
 }
 
 /// Converts Yolo Instance Segmentation into a 2D mask.
+///
+/// The input segmentation is expected to have shape (H, W, 1).
+///
+/// The output mask will have shape (H, W), with values 0 or 1 based on the
+/// threshold.
+///
+/// # Panics
+/// Panics if the input segmentation does not have shape (H, W, 1).
 pub fn yolo_segmentation_to_mask(segmentation: ArrayView3<u8>, threshold: u8) -> Array2<u8> {
     assert_eq!(
         segmentation.shape()[2],

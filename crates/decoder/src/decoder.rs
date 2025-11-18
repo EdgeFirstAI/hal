@@ -856,8 +856,10 @@ impl DecoderBuilder {
         if let Some(boxes) = seg_boxes
             && let Some(protos) = protos
         {
+            Self::verify_yolo_seg_det(&boxes, &protos)?;
             Ok(ModelType::YoloSegDet { boxes, protos })
         } else if let Some(boxes) = boxes {
+            Self::verify_yolo_det(&boxes)?;
             Ok(ModelType::YoloDet { boxes })
         } else if let Some(boxes) = split_boxes
             && let Some(scores) = split_scores
@@ -865,6 +867,7 @@ impl DecoderBuilder {
             if let Some(mask_coeff) = split_mask_coeff
                 && let Some(protos) = protos
             {
+                Self::verify_yolo_split_segdet(&boxes, &scores, &mask_coeff, &protos)?;
                 Ok(ModelType::YoloSplitSegDet {
                     boxes,
                     scores,
@@ -872,6 +875,7 @@ impl DecoderBuilder {
                     protos,
                 })
             } else {
+                Self::verify_yolo_split_det(&boxes, &scores)?;
                 Ok(ModelType::YoloSplitDet { boxes, scores })
             }
         } else {
@@ -879,6 +883,191 @@ impl DecoderBuilder {
                 "Invalid Yolo model outputs".to_string(),
             ))
         }
+    }
+
+    fn verify_yolo_det(boxes: &configs::Detection) -> Result<(), DecoderError> {
+        if boxes.shape.len() != 3 {
+            return Err(DecoderError::InvalidConfig(format!(
+                "Invalid Yolo Detection shape {:?}",
+                boxes.shape
+            )));
+        }
+        Ok(())
+    }
+
+    fn verify_yolo_seg_det(
+        segmentation: &configs::Segmentation,
+        protos: &configs::Protos,
+    ) -> Result<(), DecoderError> {
+        if segmentation.shape.len() != 3 {
+            return Err(DecoderError::InvalidConfig(format!(
+                "Invalid Yolo Segmentation shape {:?}",
+                segmentation.shape
+            )));
+        }
+        if protos.shape.len() != 4 {
+            return Err(DecoderError::InvalidConfig(format!(
+                "Invalid Yolo Protos shape {:?}",
+                protos.shape
+            )));
+        }
+
+        let seg_channels = if segmentation.channels_first {
+            segmentation.shape[2]
+        } else {
+            segmentation.shape[1]
+        };
+        let protos_channels = if protos.channels_first {
+            protos.shape[1]
+        } else {
+            protos.shape[3]
+        };
+
+        if protos_channels + 4 >= seg_channels {
+            return Err(DecoderError::InvalidConfig(format!(
+                "Yolo Protos channels {} incompatible with Segmentation channels {}",
+                protos_channels, seg_channels
+            )));
+        }
+        Ok(())
+    }
+
+    fn verify_yolo_split_det(
+        boxes: &configs::Boxes,
+        scores: &configs::Scores,
+    ) -> Result<(), DecoderError> {
+        if boxes.shape.len() != 3 {
+            return Err(DecoderError::InvalidConfig(format!(
+                "Invalid Yolo Split Boxes shape {:?}",
+                boxes.shape
+            )));
+        }
+        if scores.shape.len() != 3 {
+            return Err(DecoderError::InvalidConfig(format!(
+                "Invalid Yolo Split Scores shape {:?}",
+                scores.shape
+            )));
+        }
+
+        let boxes_dim = if boxes.channels_first {
+            boxes.shape[2]
+        } else {
+            boxes.shape[1]
+        };
+
+        if boxes_dim != 4 {
+            return Err(DecoderError::InvalidConfig(format!(
+                "Invalid Yolo Split Boxes dimension {}, expected 4",
+                boxes_dim
+            )));
+        }
+
+        let boxes_num = if boxes.channels_first {
+            boxes.shape[1]
+        } else {
+            boxes.shape[2]
+        };
+        let scores_num = if scores.channels_first {
+            scores.shape[1]
+        } else {
+            scores.shape[2]
+        };
+
+        if boxes_num != scores_num {
+            return Err(DecoderError::InvalidConfig(format!(
+                "Yolo Split Detection Boxes num {} incompatible with Scores num {}",
+                boxes_num, scores_num
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn verify_yolo_split_segdet(
+        boxes: &configs::Boxes,
+        scores: &configs::Scores,
+        mask_coeff: &configs::MaskCoefficients,
+        protos: &configs::Protos,
+    ) -> Result<(), DecoderError> {
+        if boxes.shape.len() != 3 {
+            return Err(DecoderError::InvalidConfig(format!(
+                "Invalid Yolo Split Boxes shape {:?}",
+                boxes.shape
+            )));
+        }
+        if scores.shape.len() != 3 {
+            return Err(DecoderError::InvalidConfig(format!(
+                "Invalid Yolo Split Scores shape {:?}",
+                scores.shape
+            )));
+        }
+
+        if mask_coeff.shape.len() != 3 {
+            return Err(DecoderError::InvalidConfig(format!(
+                "Invalid Yolo Split Mask Coefficients shape {:?}",
+                mask_coeff.shape
+            )));
+        }
+
+        if protos.shape.len() != 4 {
+            return Err(DecoderError::InvalidConfig(format!(
+                "Invalid Yolo Protos shape {:?}",
+                mask_coeff.shape
+            )));
+        }
+
+        let boxes_num = if boxes.channels_first {
+            boxes.shape[1]
+        } else {
+            boxes.shape[2]
+        };
+
+        let scores_num = if scores.channels_first {
+            scores.shape[1]
+        } else {
+            scores.shape[2]
+        };
+
+        let mask_num = if mask_coeff.channels_first {
+            mask_coeff.shape[1]
+        } else {
+            mask_coeff.shape[2]
+        };
+
+        let mask_channels = if mask_coeff.channels_first {
+            mask_coeff.shape[2]
+        } else {
+            mask_coeff.shape[1]
+        };
+
+        let proto_channels = if protos.channels_first {
+            protos.shape[1]
+        } else {
+            protos.shape[3]
+        };
+
+        if boxes_num != scores_num {
+            return Err(DecoderError::InvalidConfig(format!(
+                "Yolo Split Detection Boxes num {} incompatible with Scores num {}",
+                boxes_num, scores_num
+            )));
+        }
+
+        if boxes_num != mask_num {
+            return Err(DecoderError::InvalidConfig(format!(
+                "Yolo Split Detection Boxes num {} incompatible with Mask Coefficients num {}",
+                boxes_num, mask_num
+            )));
+        }
+
+        if proto_channels != mask_channels {
+            return Err(DecoderError::InvalidConfig(format!(
+                "Yolo Protos channels {} incompatible with Mask Coefficients channels {}",
+                proto_channels, mask_channels
+            )));
+        }
+
+        Ok(())
     }
 
     fn get_model_type_modelpack(configs: Vec<ConfigOutput>) -> Result<ModelType, DecoderError> {
@@ -1065,7 +1254,7 @@ impl Decoder {
     /// will be decoded. The function clears the provided output vectors
     /// before populating them with the decoded results.
     ///
-    /// This function returns an `Error` if the the provided outputs don't
+    /// This function returns a `DecoderError` if the the provided outputs don't
     /// match the configuration provided by the user when building the decoder.
     ///
     /// # Examples
