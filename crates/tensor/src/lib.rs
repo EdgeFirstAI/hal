@@ -1,6 +1,30 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
+/*!
+EdgeFirst HAL - Tensor Module
+
+The `edgefirst_tensor` crate provides a unified interface for managing multi-dimensional arrays (tensors)
+with support for different memory types, including Direct Memory Access (DMA), POSIX Shared Memory (Shm),
+and system memory. The crate defines traits and structures for creating, reshaping, and mapping tensors into memory.
+
+## Examples
+```rust
+use edgefirst_tensor::{Error, Tensor, TensorMemory, TensorTrait};
+# fn main() -> Result<(), Error> {
+let tensor = Tensor::<f32>::new(&[2, 3, 4], Some(TensorMemory::Mem), Some("test_tensor"))?;
+assert_eq!(tensor.memory(), TensorMemory::Mem);
+assert_eq!(tensor.name(), "test_tensor");
+#    Ok(())
+# }
+```
+## Overview
+The main structures and traits provided by the `edgefirst_tensor` crate is the `TensorTrait` and `TensorMapTrait` traits,
+which define the behavior of Tensors and their memory mappings, respectively.
+The `Tensor` enum encapsulates different tensor implementations based on the memory type, while the `TensorMap` enum
+provides access to the underlying data.
+```
+ */
 #[cfg(target_os = "linux")]
 mod dma;
 #[cfg(target_os = "linux")]

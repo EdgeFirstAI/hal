@@ -31,7 +31,7 @@ impl G2DConverter {
         Ok(Self { g2d })
     }
 
-    /// Returns the G2D library version as defined by G2D_VERSION in the shared
+    /// Returns the G2D library version as defined by _G2D_VERSION in the shared
     /// library.
     pub fn version(&self) -> g2d_sys::Version {
         self.g2d.version()
@@ -196,11 +196,10 @@ impl TryFrom<&TensorImage> for G2DSurface {
 
     fn try_from(img: &TensorImage) -> Result<Self, Self::Error> {
         let phys: G2DPhysical = match img.tensor() {
-            Tensor::Shm(t) => t.as_raw_fd(),
             Tensor::Dma(t) => t.as_raw_fd(),
             _ => {
                 return Err(Error::NotImplemented(
-                    "g2d only supports Shm or Dma memory".to_string(),
+                    "g2d only supports Dma memory".to_string(),
                 ));
             }
         }
@@ -229,11 +228,10 @@ impl TryFrom<&mut TensorImage> for G2DSurface {
 
     fn try_from(img: &mut TensorImage) -> Result<Self, Self::Error> {
         let phys: G2DPhysical = match img.tensor() {
-            Tensor::Shm(t) => t.as_raw_fd(),
             Tensor::Dma(t) => t.as_raw_fd(),
             _ => {
                 return Err(Error::NotImplemented(
-                    "g2d only supports Shm or Dma memory".to_string(),
+                    "g2d only supports Dma memory".to_string(),
                 ));
             }
         }
