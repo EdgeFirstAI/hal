@@ -569,7 +569,7 @@ impl DecoderBuilder {
     ///     ]),
     ///     decoder: configs::DecoderType::ModelPack,
     ///     quantization: Some(configs::QuantTuple(0.012345, 26)),
-    ///     shape: vec![1, 8400, 1, 4],
+    ///     shape: vec![1, 17, 30, 18],
     ///     channels_first: false,
     /// };
     /// let config1 = configs::Detection {
@@ -580,7 +580,7 @@ impl DecoderBuilder {
     ///     ]),
     ///     decoder: configs::DecoderType::ModelPack,
     ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
-    ///     shape: vec![1, 8400, 3],
+    ///     shape: vec![1, 9, 15, 18],
     ///     channels_first: false,
     /// };
     ///
@@ -677,7 +677,7 @@ impl DecoderBuilder {
     /// let seg_config = configs::Segmentation {
     ///     decoder: configs::DecoderType::ModelPack,
     ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
-    ///     shape: vec![1, 640, 640, 3],
+    ///     shape: vec![1, 640, 640, 1],
     ///     channels_first: false,
     /// };
     /// let decoder = DecoderBuilder::new()
@@ -1097,6 +1097,8 @@ impl DecoderBuilder {
 
         if let Some(segmentation) = segment_ {
             if !split_decoders.is_empty() {
+                let classes = Self::verify_modelpack_split_det(&split_decoders)?;
+                Self::verify_modelpack_seg(&segmentation, Some(classes))?;
                 Ok(ModelType::ModelPackSegDetSplit {
                     detection: split_decoders,
                     segmentation,
@@ -1104,27 +1106,193 @@ impl DecoderBuilder {
             } else if let Some(scores) = scores_
                 && let Some(boxes) = boxes_
             {
+                let classes = Self::verify_modelpack_det(&boxes, &scores)?;
+                Self::verify_modelpack_seg(&segmentation, Some(classes))?;
                 Ok(ModelType::ModelPackSegDet {
                     boxes,
                     scores,
                     segmentation,
                 })
             } else {
+                Self::verify_modelpack_seg(&segmentation, None)?;
                 Ok(ModelType::ModelPackSeg { segmentation })
             }
         } else if !split_decoders.is_empty() {
+            Self::verify_modelpack_split_det(&split_decoders)?;
             Ok(ModelType::ModelPackDetSplit {
                 detection: split_decoders,
             })
         } else if let Some(scores) = scores_
             && let Some(boxes) = boxes_
         {
+            Self::verify_modelpack_det(&boxes, &scores)?;
             Ok(ModelType::ModelPackDet { boxes, scores })
         } else {
             Err(DecoderError::InvalidConfig(
                 "Invalid ModelPack model outputs".to_string(),
             ))
         }
+    }
+
+    fn verify_modelpack_det(
+        boxes: &configs::Boxes,
+        scores: &configs::Scores,
+    ) -> Result<usize, DecoderError> {
+        if boxes.shape.len() != 4 {
+            return Err(DecoderError::InvalidConfig(format!(
+                "Invalid ModelPack Boxes shape {:?}",
+                boxes.shape
+            )));
+        }
+        if scores.shape.len() != 3 {
+            return Err(DecoderError::InvalidConfig(format!(
+                "Invalid ModelPack Scores shape {:?}",
+                scores.shape
+            )));
+        }
+
+        if boxes.shape[2] != 1 {
+            return Err(DecoderError::InvalidConfig(format!(
+                "Invalid ModelPack Boxes dimension 2: {}, expected 1",
+                boxes.shape[2]
+            )));
+        }
+
+        let boxes_dim = if boxes.channels_first {
+            boxes.shape[1]
+        } else {
+            boxes.shape[3]
+        };
+
+        if boxes_dim != 4 {
+            return Err(DecoderError::InvalidConfig(format!(
+                "Invalid ModelPack Boxes dimension {}, expected 4",
+                boxes_dim
+            )));
+        }
+
+        let boxes_num = if boxes.channels_first {
+            boxes.shape[3]
+        } else {
+            boxes.shape[1]
+        };
+        let scores_num = if scores.channels_first {
+            scores.shape[2]
+        } else {
+            scores.shape[1]
+        };
+
+        if boxes_num != scores_num {
+            return Err(DecoderError::InvalidConfig(format!(
+                "ModelPack Detection Boxes num {} incompatible with Scores num {}",
+                boxes_num, scores_num
+            )));
+        }
+
+        let num_classes = if scores.channels_first {
+            scores.shape[1]
+        } else {
+            scores.shape[2]
+        };
+
+        Ok(num_classes)
+    }
+
+    fn verify_modelpack_split_det(boxes: &[configs::Detection]) -> Result<usize, DecoderError> {
+        let mut num_classes = None;
+        if boxes.is_empty() {
+            return Err(DecoderError::InvalidConfig(
+                "ModelPack Split Detection has no configurations".to_string(),
+            ));
+        }
+        for b in boxes {
+            if b.anchors.is_none() {
+                return Err(DecoderError::InvalidConfig(
+                    "ModelPack Split Detection missing anchors".to_string(),
+                ));
+            }
+
+            let num_anchors = b.anchors.as_ref().unwrap().len();
+            if num_anchors == 0 {
+                return Err(DecoderError::InvalidConfig(
+                    "ModelPack Split Detection has zero anchors".to_string(),
+                ));
+            }
+
+            if b.shape.len() != 4 {
+                return Err(DecoderError::InvalidConfig(format!(
+                    "Invalid ModelPack Split Detection shape {:?}",
+                    b.shape
+                )));
+            };
+
+            let boxes_channels = if b.channels_first {
+                b.shape[1]
+            } else {
+                b.shape[3]
+            };
+
+            if boxes_channels <= num_anchors * 5 {
+                return Err(DecoderError::InvalidConfig(format!(
+                    "Invalid ModelPack Split Detection shape {:?}: channels {} not greater than number of anchors * 5 = {}",
+                    b.shape,
+                    boxes_channels,
+                    num_anchors * 5,
+                )));
+            };
+
+            if !boxes_channels.is_multiple_of(num_anchors) {
+                return Err(DecoderError::InvalidConfig(format!(
+                    "Invalid ModelPack Split Detection shape {:?}: channels {} not a multiple of number of anchors {}",
+                    b.shape, boxes_channels, num_anchors
+                )));
+            };
+
+            match num_classes {
+                Some(n) => {
+                    let this_n = (boxes_channels / num_anchors) - 5;
+                    if n != this_n {
+                        return Err(DecoderError::InvalidConfig(format!(
+                            "ModelPack Split Detection inconsistent number of classes: previous {}, current {}",
+                            n, this_n
+                        )));
+                    }
+                }
+                None => {
+                    num_classes = Some((boxes_channels / num_anchors) - 5);
+                }
+            }
+        }
+
+        Ok(num_classes.unwrap_or(0))
+    }
+
+    fn verify_modelpack_seg(
+        segmentation: &configs::Segmentation,
+        classes: Option<usize>,
+    ) -> Result<(), DecoderError> {
+        if segmentation.shape.len() != 4 {
+            return Err(DecoderError::InvalidConfig(format!(
+                "Invalid ModelPack Segmentation shape {:?}",
+                segmentation.shape
+            )));
+        }
+
+        if let Some(classes) = classes {
+            let seg_channels = if segmentation.channels_first {
+                segmentation.shape[1]
+            } else {
+                segmentation.shape[3]
+            };
+
+            if seg_channels != classes {
+                return Err(DecoderError::InvalidConfig(format!(
+                    "ModelPack Segmentation channels {} incompatible with number of classes {}",
+                    seg_channels, classes
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
