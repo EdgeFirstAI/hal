@@ -10,7 +10,9 @@ use edgefirst_decoder::{
     dequant_detect_box, dequantize_cpu, dequantize_cpu_chunked, dequantize_ndarray,
     float::{nms_float, postprocess_boxes_float},
     modelpack::{ModelPackDetectionConfig, decode_modelpack_det, decode_modelpack_split_quant},
-    yolo::{decode_yolo_det, decode_yolo_det_float, decode_yolo_segdet_quant, decode_yolo_segdet_float},
+    yolo::{
+        decode_yolo_det, decode_yolo_det_float, decode_yolo_segdet_float, decode_yolo_segdet_quant,
+    },
 };
 use ndarray::s;
 

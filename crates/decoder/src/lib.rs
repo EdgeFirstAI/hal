@@ -1,7 +1,70 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! EdgeFirst HAL - Decoders
+/*!
+## EdgeFirst HAL - Decoders
+This crate provides decoding utilities for YOLOobject detection and segmentation models, and ModelPack detection and segmentation models.
+It supports both floating-point and quantized model outputs, allowing for efficient processing on edge devices. The crate includes functions
+for efficient post-processing model outputs into usable detection boxes and segmentation masks, as well as utilities for dequantizing model outputs..
+
+For general usage, use the `Decoder` struct which provides functions for decoding various model outputs based on the model configuration.
+If you already know the model type and output formats, you can use the lower-level functions directly from the `yolo` and `modelpack` modules.
+
+
+### Quick Example
+```rust
+# use edgefirst_decoder::{ DecoderBuilder, DecoderResult, configs };
+# fn main() -> DecoderResult<()> {
+// Create a decoder for a YOLOv8 model with quantized int8 output with 0.25 score threshold and 0.7 IOU threshold
+let decoder = DecoderBuilder::new()
+    .with_config_yolo_det(configs::Detection {
+        anchors: None,
+        decoder: configs::DecoderType::Yolov8,
+        quantization: Some(configs::QuantTuple(0.012345, 26)),
+        shape: vec![1, 84, 8400],
+        channels_first: false,
+    })
+    .with_score_threshold(0.25)
+    .with_iou_threshold(0.7)
+    .build()?;
+
+// Get the model output from the model. Here we load it from a test data file for demonstration purposes.
+let model_output: Vec<i8> = include_bytes!("../../../testdata/yolov8s_80_classes.bin")
+    .iter()
+    .map(|b| *b as i8)
+    .collect();
+let model_output_array = ndarray::Array3::from_shape_vec((1, 84, 8400), model_output)?;
+
+// THe capacity is used to determine the maximum number of detections to decode.
+let mut output_boxes: Vec<_> = Vec::with_capacity(10);
+let mut output_masks: Vec<_> = Vec::with_capacity(10);
+
+// Decode the quantized model output into detection boxes and segmentation masks
+// Because this model is a detection-only model, the `output_masks` vector will remain empty.
+decoder.decode_quantized(&[model_output_array.view().into_dyn().into()], &mut output_boxes, &mut output_masks)?;
+# Ok(())
+# }
+```
+
+# Overview
+
+The primary components of this crate are:
+- `Decoder`/`DecoderBuilder` struct: Provides high-level functions to decode model outputs based on the model configuration.
+- `yolo` module: Contains functions specific to decoding YOLO model outputs.
+- `modelpack` module: Contains functions specific to decoding ModelPack model outputs.
+
+The `Decoder` supports both floating-point and quantized model outputs, allowing for efficient processing on edge devices.
+It also supports mixed integer types for quantized outputs, such as when one output tensor is int8 and another is uint8.
+When decoding quantized outputs, the appropriate quantization parameters must be provided for each output tensor.
+If the integer types used in the model output is not supported by the decoder, the user can manually dequantize the model outputs using
+the `dequantize` functions provided in this crate, and then use the floating-point decoding functions. However, it is recommended
+to not dequantize the model outputs manually before passing them to the decoder, as the quantized decoder functions are optimized for performance.
+
+The `yolo` and `modelpack` modules provide lower-level functions for decoding model outputs directly,
+which can be used if the model type and output formats are known in advance.
+
+
+*/
 use ndarray::{Array, Array2, Array3, ArrayView, ArrayView1, ArrayView3, Dimension};
 use num_traits::{AsPrimitive, Float, PrimInt};
 
@@ -240,7 +303,7 @@ pub struct BoundingBox {
 }
 
 impl BoundingBox {
-    /// Creates a new BoundingBox
+    /// Creates a new BoundingBox from the given coordinates
     pub fn new(xmin: f32, ymin: f32, xmax: f32, ymax: f32) -> Self {
         Self {
             xmin,
@@ -296,6 +359,32 @@ impl From<[f32; 4]> for BoundingBox {
 impl DetectBox {
     /// Returns true if one detect box is equal to another detect box, within
     /// the given `eps`
+    ///
+    /// # Examples
+    /// ```
+    /// # use edgefirst_decoder::DetectBox;
+    /// let box1 = DetectBox {
+    ///     bbox: edgefirst_decoder::BoundingBox {
+    ///         xmin: 0.1,
+    ///         ymin: 0.2,
+    ///         xmax: 0.3,
+    ///         ymax: 0.4,
+    ///     },
+    ///     score: 0.5,
+    ///     label: 1,
+    /// };
+    /// let box2 = DetectBox {
+    ///     bbox: edgefirst_decoder::BoundingBox {
+    ///         xmin: 0.101,
+    ///         ymin: 0.199,
+    ///         xmax: 0.301,
+    ///         ymax: 0.399,
+    ///     },
+    ///     score: 0.510,
+    ///     label: 1,
+    /// };
+    /// assert!(box1.equal_within_delta(&box2, 0.011));
+    /// ```
     pub fn equal_within_delta(&self, rhs: &DetectBox, eps: f32) -> bool {
         let eq_delta = |a: f32, b: f32| (a - b).abs() <= eps;
         self.label == rhs.label
@@ -324,6 +413,34 @@ pub struct Segmentation {
     pub segmentation: Array3<u8>,
 }
 
+/// Turns a DetectBoxQuantized into a DetectBox by dequantizing the score.
+///
+///  # Examples
+/// ```
+/// # use edgefirst_decoder::{BoundingBox, DetectBoxQuantized, Quantization, dequant_detect_box};
+/// let quant = Quantization::new(0.1, -128);
+/// let bbox = BoundingBox::new(0.1, 0.2, 0.3, 0.4);
+/// let detect_quant = DetectBoxQuantized {
+///     bbox,
+///     score: 100_i8,
+///     label: 1,
+/// };
+/// let detect = dequant_detect_box(&detect_quant, quant);
+/// assert_eq!(detect.score, 0.1 * 100.0 + 12.8);
+/// assert_eq!(detect.label, 1);
+/// assert_eq!(detect.bbox, bbox);
+/// ```
+pub fn dequant_detect_box<SCORE: PrimInt + AsPrimitive<f32>>(
+    detect: &DetectBoxQuantized<SCORE>,
+    quant_scores: Quantization,
+) -> DetectBox {
+    let scaled_zp = -quant_scores.scale * quant_scores.zero_point as f32;
+    DetectBox {
+        bbox: detect.bbox,
+        score: quant_scores.scale * detect.score.as_() + scaled_zp,
+        label: detect.label,
+    }
+}
 /// A detection box with a f32 bbox and quantized score
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DetectBoxQuantized<
@@ -339,21 +456,18 @@ pub struct DetectBoxQuantized<
     pub label: usize,
 }
 
-/// Turns a DetectBoxQuantized into a DetectBox by dequantizing the score
-pub fn dequant_detect_box<SCORE: PrimInt + AsPrimitive<f32>>(
-    detect: &DetectBoxQuantized<SCORE>,
-    quant_scores: Quantization,
-) -> DetectBox {
-    let scaled_zp = -quant_scores.scale * quant_scores.zero_point as f32;
-    DetectBox {
-        bbox: detect.bbox,
-        score: quant_scores.scale * detect.score.as_() + scaled_zp,
-        label: detect.label,
-    }
-}
-
 /// Dequantizes an ndarray from quantized values to f32 values using the given
 /// quantization parameters
+///
+/// # Examples
+/// ```
+/// # use edgefirst_decoder::{dequantize_ndarray, Quantization};
+/// let quant = Quantization::new(0.1, -128);
+/// let input: Vec<i8> = vec![0, 127, -128, 64];
+/// let input_array = ndarray::Array1::from(input);
+/// let output_array: ndarray::Array1<f32> = dequantize_ndarray(input_array.view(), quant);
+/// assert_eq!(output_array, ndarray::array![12.8, 25.5, 0.0, 19.2]);
+/// ```
 pub fn dequantize_ndarray<T: AsPrimitive<F>, D: Dimension, F: Float + 'static>(
     input: ArrayView<T, D>,
     quant: Quantization,
@@ -465,6 +579,16 @@ pub fn dequantize_cpu_chunked<T: AsPrimitive<F>, F: Float + 'static>(
 }
 
 /// Converts a segmentation tensor into a 2D mask
+/// If the last dimension of the segmentation tensor is 1, values equal or
+/// above 128 are considered objects. Otherwise the object is the argmax index
+/// # Examples
+/// ```
+/// # use edgefirst_decoder::segmentation_to_mask;
+/// let segmentation =
+///     ndarray::Array3::<u8>::from_shape_vec((2, 2, 1), vec![0, 255, 128, 127]).unwrap();
+/// let mask = segmentation_to_mask(segmentation.view());
+/// assert_eq!(mask, ndarray::array![[0, 1], [1, 0]]);
+/// ```
 pub fn segmentation_to_mask(segmentation: ArrayView3<u8>) -> Array2<u8> {
     assert!(segmentation.shape()[2] > 0);
     if segmentation.shape()[2] == 1 {

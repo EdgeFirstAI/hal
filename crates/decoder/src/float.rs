@@ -159,6 +159,16 @@ pub fn nms_extra_float<E: Send + Sync>(
 
 /// Returns true if the IOU of the given bounding boxes is greater than the iou
 /// threshold
+///
+/// # Example
+/// ```
+/// # use edgefirst_decoder::{BoundingBox, float::jaccard};
+/// let a = BoundingBox::new(0.0, 0.0, 0.2, 0.2);
+/// let b = BoundingBox::new(0.1, 0.1, 0.3, 0.3);
+/// let iou_threshold = 0.1;
+/// let result = jaccard(&a, &b, iou_threshold);
+/// assert!(result);
+/// ```
 pub fn jaccard(a: &BoundingBox, b: &BoundingBox, iou: f32) -> bool {
     let left = a.xmin.max(b.xmin);
     let top = a.ymin.max(b.ymin);
