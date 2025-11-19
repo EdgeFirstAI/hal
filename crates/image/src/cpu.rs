@@ -33,12 +33,20 @@ fn full_to_limit(l: u8) -> u8 {
     ((l as u16 * (240 - 16)) / 255 + 16) as u8
 }
 
+impl Default for CPUConverter {
+    fn default() -> Self {
+        Self::new_bilinear()
+    }
+}
+
 impl CPUConverter {
-    pub fn new() -> Result<Self> {
+    /// Creates a new CPUConverter with bilinear resizing.
+    pub fn new() -> Self {
         Self::new_bilinear()
     }
 
-    pub fn new_bilinear() -> Result<Self> {
+    /// Creates a new CPUConverter with bilinear resizing.
+    fn new_bilinear() -> Self {
         let resizer = fast_image_resize::Resizer::new();
         let options = fast_image_resize::ResizeOptions::new()
             .resize_alg(fast_image_resize::ResizeAlg::Interpolation(
@@ -47,16 +55,17 @@ impl CPUConverter {
             .use_alpha(false);
 
         log::debug!("CPUConverter created");
-        Ok(Self { resizer, options })
+        Self { resizer, options }
     }
 
-    pub fn new_nearest() -> Result<Self> {
+    /// Creates a new CPUConverter with nearest neighbor resizing.
+    pub fn new_nearest() -> Self {
         let resizer = fast_image_resize::Resizer::new();
         let options = fast_image_resize::ResizeOptions::new()
             .resize_alg(fast_image_resize::ResizeAlg::Nearest)
             .use_alpha(false);
         log::debug!("CPUConverter created");
-        Ok(Self { resizer, options })
+        Self { resizer, options }
     }
 
     pub(crate) fn flip_rotate_ndarray(

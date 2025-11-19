@@ -22,6 +22,17 @@ use crate::{
 };
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
+/// Used to represent the outputs in the model configuration.
+/// # Examples
+/// ```rust
+/// # use edgefirst_decoder::{DecoderBuilder, DecoderResult, ConfigOutputs};
+/// # fn main() -> DecoderResult<()> {
+/// let config_json = include_str!("../../../testdata/modelpack_split.json");
+/// let config: ConfigOutputs = serde_json::from_str(config_json)?;
+/// let decoder = DecoderBuilder::new().with_config(config).build()?;
+///
+/// # Ok(())
+/// # }
 pub struct ConfigOutputs {
     pub outputs: Vec<ConfigOutput>,
 }
@@ -46,6 +57,21 @@ pub enum ConfigOutput {
 }
 
 impl ConfigOutput {
+    /// Returns the shape of the output.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{configs, ConfigOutput};
+    /// let detection_config = configs::Detection {
+    ///     anchors: None,
+    ///     decoder: configs::DecoderType::Yolov8,
+    ///     quantization: None,
+    ///     shape: vec![1, 84, 8400],
+    ///     channels_first: false,
+    /// };
+    /// let output = ConfigOutput::Detection(detection_config);
+    /// assert_eq!(output.shape(), &[1, 84, 8400]);
+    /// ```
     pub fn shape(&self) -> &[usize] {
         match self {
             ConfigOutput::Detection(detection) => &detection.shape,
@@ -58,6 +84,21 @@ impl ConfigOutput {
         }
     }
 
+    /// Returns the decoder type of the output.
+    ///    
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{configs, ConfigOutput};
+    /// let detection_config = configs::Detection {
+    ///     anchors: None,
+    ///     decoder: configs::DecoderType::Yolov8,
+    ///     quantization: None,
+    ///     shape: vec![1, 84, 8400],
+    ///     channels_first: false,
+    /// };
+    /// let output = ConfigOutput::Detection(detection_config);
+    /// assert_eq!(output.decoder(), &configs::DecoderType::Yolov8);
+    /// ```
     pub fn decoder(&self) -> &configs::DecoderType {
         match self {
             ConfigOutput::Detection(detection) => &detection.decoder,
@@ -70,6 +111,21 @@ impl ConfigOutput {
         }
     }
 
+    /// Returns the quantization of the output.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{configs, ConfigOutput};
+    /// let detection_config = configs::Detection {
+    ///    anchors: None,
+    ///   decoder: configs::DecoderType::Yolov8,
+    ///   quantization: Some(configs::QuantTuple(0.012345, 26)),
+    ///  shape: vec![1, 84, 8400],
+    ///   channels_first: false,
+    /// };
+    /// let output = ConfigOutput::Detection(detection_config);
+    /// assert_eq!(output.quantization(),
+    /// Some(configs::QuantTuple(0.012345,26))); ```  
     pub fn quantization(&self) -> Option<QuantTuple> {
         match self {
             ConfigOutput::Detection(detection) => detection.quantization,
@@ -1350,6 +1406,19 @@ impl<'a> From<ArrayViewD<'a, i32>> for ArrayViewDQuantized<'a> {
 }
 
 impl<'a> ArrayViewDQuantized<'a> {
+    /// Returns the shape of the underlying array.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::ArrayViewDQuantized;
+    /// # use ndarray::Array2;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let arr = Array2::from_shape_vec((2, 3), vec![1u8, 2, 3, 4, 5, 6])?;
+    /// let view = ArrayViewDQuantized::from(arr.view().into_dyn());
+    /// assert_eq!(view.shape(), &[2, 3]);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn shape(&self) -> &[usize] {
         match self {
             ArrayViewDQuantized::UInt8(a) => a.shape(),
