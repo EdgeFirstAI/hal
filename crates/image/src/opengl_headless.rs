@@ -15,7 +15,7 @@ use std::{
     collections::BTreeSet,
     ffi::{CStr, CString, c_char, c_void},
     os::fd::AsRawFd,
-    ptr::{null, null_mut},
+    ptr::{NonNull, null, null_mut},
     rc::Rc,
     str::FromStr,
     thread::JoinHandle,
@@ -289,7 +289,9 @@ impl GlContext {
             if disp != egl::NO_DISPLAY {
                 Ok(unsafe { Display::from_ptr(disp) })
             } else {
-                Err(egl.get_error().unwrap().into())
+                Err(egl.get_error().map(|e| e.into()).unwrap_or(Error::Internal(
+                    "EGL failed but no error was reported".to_owned(),
+                )))
             }
         } else {
             Err(Error::EGLLoad(egl::LoadError::InvalidVersion {
@@ -336,7 +338,9 @@ impl GlContext {
             if image != egl::NO_IMAGE {
                 Ok(unsafe { egl::Image::from_ptr(image) })
             } else {
-                Err(egl.get_error().unwrap().into())
+                Err(egl.get_error().map(|e| e.into()).unwrap_or(Error::Internal(
+                    "EGL failed but no error was reported".to_owned(),
+                )))
             }
         } else {
             Err(Error::EGLLoad(egl::LoadError::InvalidVersion {
@@ -362,7 +366,9 @@ impl GlContext {
             if res == egl::TRUE {
                 Ok(())
             } else {
-                Err(egl.get_error().unwrap().into())
+                Err(egl.get_error().map(|e| e.into()).unwrap_or(Error::Internal(
+                    "EGL failed but no error was reported".to_owned(),
+                )))
             }
         } else {
             Err(Error::EGLLoad(egl::LoadError::InvalidVersion {
@@ -445,7 +451,7 @@ struct RegionOfInterest {
 
 type GLConverterMessage = (
     SendablePtr<TensorImage>,
-    SendablePtrMut<TensorImage>,
+    SendablePtr<TensorImage>,
     Rotation,
     Flip,
     Crop,
@@ -458,7 +464,10 @@ type GLConverterMessage = (
 /// request to the rendering thread and waits for the result.
 #[derive(Debug)]
 pub struct GLConverterThreaded {
+    // This is only None when the converter is being dropped.
     handle: Option<JoinHandle<()>>,
+
+    // This is only None when the converter is being dropped.
     sender: Option<Sender<GLConverterMessage>>,
     support_dma: bool,
 }
@@ -467,16 +476,10 @@ unsafe impl Send for GLConverterThreaded {}
 unsafe impl Sync for GLConverterThreaded {}
 
 struct SendablePtr<T: Send> {
-    ptr: *const T,
+    ptr: NonNull<T>,
 }
 
 unsafe impl<T> Send for SendablePtr<T> where T: Send {}
-
-struct SendablePtrMut<T: Send> {
-    ptr: *mut T,
-}
-
-unsafe impl<T> Send for SendablePtrMut<T> where T: Send {}
 
 impl GLConverterThreaded {
     /// Creates a new OpenGL multi-threaded image converter.
@@ -494,11 +497,11 @@ impl GLConverterThreaded {
                 }
             };
             let _ = create_ctx_send.send(Ok(gl_converter.gl_context.support_dma));
-            while let Some((src, dst, rotation, flip, crop, resp)) = recv.blocking_recv() {
+            while let Some((src, mut dst, rotation, flip, crop, resp)) = recv.blocking_recv() {
                 // SAFETY: This is safe because the convert() function waits for the resp to be
                 // sent before dropping the borrow for src and dst
-                let src = unsafe { src.ptr.as_ref().unwrap() };
-                let dst = unsafe { dst.ptr.as_mut().unwrap() };
+                let src = unsafe { src.ptr.as_ref() };
+                let dst = unsafe { dst.ptr.as_mut() };
                 let res = gl_converter.convert(src, dst, rotation, flip, crop);
                 let _ = resp.send(res);
             }
@@ -554,10 +557,8 @@ impl ImageConverterTrait for GLConverterThreaded {
             .as_ref()
             .unwrap()
             .blocking_send((
-                SendablePtr {
-                    ptr: src as *const _,
-                },
-                SendablePtrMut { ptr: dst as *mut _ },
+                SendablePtr { ptr: src.into() },
+                SendablePtr { ptr: dst.into() },
                 rotation,
                 flip,
                 crop,
@@ -573,7 +574,7 @@ impl ImageConverterTrait for GLConverterThreaded {
 impl Drop for GLConverterThreaded {
     fn drop(&mut self) {
         drop(self.sender.take());
-        let _ = self.handle.take().unwrap().join();
+        let _ = self.handle.take().and_then(|h| h.join().ok());
     }
 }
 

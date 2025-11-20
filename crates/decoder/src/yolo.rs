@@ -32,7 +32,9 @@ pub fn decode_yolo_det<BOX: PrimInt + AsPrimitive<f32> + Send + Sync>(
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
-) {
+) where
+    f32: AsPrimitive<BOX>,
+{
     impl_yolo_quant::<XYWH, _>(output, score_threshold, iou_threshold, output_boxes);
 }
 
@@ -75,7 +77,9 @@ pub fn decode_yolo_segdet_quant<
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
-) {
+) where
+    f32: AsPrimitive<BOX>,
+{
     impl_yolo_segdet_quant::<XYWH, _, _>(
         boxes,
         protos,
@@ -138,7 +142,9 @@ pub fn decode_yolo_split_det_quant<
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
-) {
+) where
+    f32: AsPrimitive<SCORE>,
+{
     impl_yolo_split_quant::<XYWH, _, _>(
         boxes,
         scores,
@@ -206,7 +212,9 @@ pub fn decode_yolo_split_segdet<
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
-) {
+) where
+    f32: AsPrimitive<SCORE>,
+{
     impl_yolo_split_segdet_quant::<XYWH, _, _, _, _>(
         boxes,
         scores,
@@ -267,7 +275,9 @@ pub fn impl_yolo_quant<B: BBoxTypeTrait, T: PrimInt + AsPrimitive<f32> + Send + 
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
-) {
+) where
+    f32: AsPrimitive<T>,
+{
     let (boxes, quant_boxes) = output;
     let (boxes_tensor, scores_tensor) = postprocess_yolo(&boxes);
 
@@ -331,7 +341,9 @@ pub fn impl_yolo_split_quant<
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
-) {
+) where
+    f32: AsPrimitive<SCORE>,
+{
     let (boxes_tensor, quant_boxes) = boxes;
     let (scores_tensor, quant_scores) = scores;
 
@@ -409,7 +421,9 @@ pub fn impl_yolo_segdet_quant<
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
-) {
+) where
+    f32: AsPrimitive<BOX>,
+{
     let (boxes, quant_boxes) = boxes;
     let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&boxes);
 
@@ -487,7 +501,10 @@ pub(crate) fn impl_yolo_split_segdet_quant_get_boxes<
     score_threshold: f32,
     iou_threshold: f32,
     max_boxes: usize,
-) -> Vec<(DetectBox, usize)> {
+) -> Vec<(DetectBox, usize)>
+where
+    f32: AsPrimitive<SCORE>,
+{
     let (boxes_tensor, quant_boxes) = boxes;
     let (scores_tensor, quant_scores) = scores;
 
@@ -568,7 +585,9 @@ pub fn impl_yolo_split_segdet_quant<
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
-) {
+) where
+    f32: AsPrimitive<SCORE>,
+{
     let boxes = impl_yolo_split_segdet_quant_get_boxes::<B, _, _>(
         boxes,
         scores,
@@ -761,11 +780,15 @@ fn make_segmentation<
     protos: ArrayView3<PROTO>,
 ) -> Array3<u8> {
     let shape = protos.shape();
+
+    // Safe to unwrap since the shapes will always be compatible
     let mask = mask.to_shape((1, mask.len())).unwrap();
     let protos = protos.to_shape([shape[0] * shape[1], shape[2]]).unwrap();
     let protos = protos.reversed_axes();
     let mask = mask.map(|x| x.as_());
     let protos = protos.map(|x| x.as_());
+
+    // Safe to unwrap since the shapes will always be compatible
     let mask = mask
         .dot(&protos)
         .into_shape_with_order((shape[0], shape[1], 1))
@@ -794,6 +817,8 @@ where
     f32: AsPrimitive<DEST>,
 {
     let shape = protos.shape();
+
+    // Safe to unwrap since the shapes will always be compatible
     let mask = mask.to_shape((1, mask.len())).unwrap();
 
     let protos = protos.to_shape([shape[0] * shape[1], shape[2]]).unwrap();
@@ -806,6 +831,7 @@ where
     let zp = quant_protos.zero_point.as_();
     let protos = protos.mapv(|x| x.as_() - zp);
 
+    // Safe to unwrap since the shapes will always be compatible
     let segmentation = mask
         .dot(&protos)
         .into_shape_with_order((shape[0], shape[1], 1))

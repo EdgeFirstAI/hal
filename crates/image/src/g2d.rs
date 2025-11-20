@@ -293,7 +293,7 @@ mod g2d_tests {
 
         let mut src2 = TensorImage::new(1280, 720, g2d_in_fmt, Some(TensorMemory::Dma))?;
 
-        let mut cpu_converter = CPUConverter::new()?;
+        let mut cpu_converter = CPUConverter::new();
 
         cpu_converter.convert(&src, &mut src2, Rotation::None, Flip::None, Crop::no_crop())?;
 
@@ -364,7 +364,7 @@ mod g2d_tests {
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
         let src = TensorImage::load_jpeg(&file, Some(RGB), None)?;
 
-        let mut cpu_converter = CPUConverter::new()?;
+        let mut cpu_converter = CPUConverter::new();
 
         let mut reference = TensorImage::new(dst_width, dst_height, RGB, Some(TensorMemory::Dma))?;
         cpu_converter.convert(
@@ -429,7 +429,7 @@ mod g2d_tests {
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
         let src = TensorImage::load_jpeg(&file, Some(RGB), None)?;
 
-        let mut cpu_converter = CPUConverter::new()?;
+        let mut cpu_converter = CPUConverter::new();
 
         let mut reference = TensorImage::new(dst_width, dst_height, RGB, Some(TensorMemory::Dma))?;
         reference.tensor.map().unwrap().as_mut_slice().fill(128);
