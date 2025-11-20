@@ -17,7 +17,7 @@ use std::{
     ptr::NonNull,
     sync::{Arc, Mutex},
 };
-
+#[derive(Debug)]
 pub struct ShmTensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
@@ -155,6 +155,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub struct ShmMap<T>
 where
     T: Num + Clone + fmt::Debug,
@@ -184,6 +185,7 @@ where
     }
 }
 
+#[derive(Debug)]
 struct ShmPtr(NonNull<c_void>);
 impl Deref for ShmPtr {
     type Target = NonNull<c_void>;

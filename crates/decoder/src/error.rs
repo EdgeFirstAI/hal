@@ -3,49 +3,58 @@
 
 use core::fmt;
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub type DecoderResult<T, E = DecoderError> = std::result::Result<T, E>;
 
 #[derive(Debug)]
-pub enum Error {
+pub enum DecoderError {
+    /// An I/O error occurred
     Io(std::io::Error),
-    NotImplemented(String),
+    /// An internal error occurred
+    Internal(String),
+    /// An operation was requested that is not supported
     NotSupported(String),
+    /// An invalid tensor shape was given
     InvalidShape(String),
+    /// An error occurred while parsing YAML
     Yaml(serde_yaml::Error),
+    /// An error occurred while parsing YAML
     Json(serde_json::Error),
+    /// Attmpted to use build a decoder without configuration
     NoConfig,
+    /// The provide decoder configuration was invalid
     InvalidConfig(String),
+    /// An error occurred with ndarray shape operations
     NDArrayShape(ndarray::ShapeError),
 }
 
-impl fmt::Display for Error {
+impl fmt::Display for DecoderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{self:?}")
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for DecoderError {}
 
-impl From<std::io::Error> for Error {
+impl From<std::io::Error> for DecoderError {
     fn from(err: std::io::Error) -> Self {
-        Error::Io(err)
+        DecoderError::Io(err)
     }
 }
 
-impl From<serde_yaml::Error> for Error {
+impl From<serde_yaml::Error> for DecoderError {
     fn from(err: serde_yaml::Error) -> Self {
-        Error::Yaml(err)
+        DecoderError::Yaml(err)
     }
 }
 
-impl From<serde_json::Error> for Error {
+impl From<serde_json::Error> for DecoderError {
     fn from(err: serde_json::Error) -> Self {
-        Error::Json(err)
+        DecoderError::Json(err)
     }
 }
 
-impl From<ndarray::ShapeError> for Error {
+impl From<ndarray::ShapeError> for DecoderError {
     fn from(err: ndarray::ShapeError) -> Self {
-        Error::NDArrayShape(err)
+        DecoderError::NDArrayShape(err)
     }
 }
