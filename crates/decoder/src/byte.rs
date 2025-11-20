@@ -170,15 +170,26 @@ pub fn nms_extra_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send + 
 /// Quantizes a score from f32 to the given integer type, using the following
 /// formula `(score/quant.scale + quant.zero_point).ceil()`, then clamping to
 /// the min and max value of the given integer type
+///
+/// # Examples
+/// ```rust
+/// use edgefirst_decoder::{Quantization, byte::quantize_score_threshold};
+/// let quant = Quantization {
+///     scale: 0.1,
+///     zero_point: 128,
+/// };
+/// let q: u8 = quantize_score_threshold::<u8>(0.5, quant);
+/// assert_eq!(q, 128 + 5);
+/// ```
 #[doc(hidden)]
-pub fn quantize_score_threshold<T: PrimInt + AsPrimitive<f32>>(
-    score: f32,
-    quant: Quantization,
-) -> T {
+pub fn quantize_score_threshold<T: PrimInt + AsPrimitive<f32>>(score: f32, quant: Quantization) -> T
+where
+    f32: AsPrimitive<T>,
+{
     if quant.scale == 0.0 {
         return T::max_value();
     }
     let v = (score / quant.scale + quant.zero_point as f32).ceil();
     let v = v.clamp(T::min_value().as_(), T::max_value().as_());
-    T::from(v).unwrap()
+    v.as_()
 }
