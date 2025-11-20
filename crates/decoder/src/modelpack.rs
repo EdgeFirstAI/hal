@@ -5,11 +5,10 @@ use ndarray::{Array2, ArrayView2, ArrayView3};
 use num_traits::{AsPrimitive, Float, PrimInt};
 
 use crate::{
-    BBoxTypeTrait, DetectBox, Quantization, XYWH, XYXY,
+    BBoxTypeTrait, DecoderError, DetectBox, Quantization, XYWH, XYXY,
     byte::{nms_int, postprocess_boxes_quant, quantize_score_threshold},
     configs::Detection,
     dequant_detect_box,
-    error::DecoderResult,
     float::{nms_float, postprocess_boxes_float},
 };
 
@@ -21,12 +20,16 @@ pub struct ModelPackDetectionConfig {
     pub quantization: Option<Quantization>,
 }
 
-impl From<&Detection> for ModelPackDetectionConfig {
-    fn from(value: &Detection) -> Self {
-        Self {
-            anchors: value.anchors.clone().unwrap(),
+impl TryFrom<&Detection> for ModelPackDetectionConfig {
+    type Error = DecoderError;
+
+    fn try_from(value: &Detection) -> Result<Self, DecoderError> {
+        Ok(Self {
+            anchors: value.anchors.clone().ok_or_else(|| {
+                DecoderError::InvalidConfig("ModelPack Split Detection missing anchors".to_string())
+            })?,
             quantization: value.quantization.map(Quantization::from),
-        }
+        })
     }
 }
 
@@ -49,7 +52,9 @@ pub fn decode_modelpack_det<
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
-) {
+) where
+    f32: AsPrimitive<SCORE>,
+{
     impl_modelpack_quant::<XYXY, _, _>(
         boxes_tensor,
         scores_tensor,
@@ -112,7 +117,7 @@ pub fn decode_modelpack_split_quant<D: AsPrimitive<f32>>(
         score_threshold,
         iou_threshold,
         output_boxes,
-    );
+    )
 }
 
 /// Decodes ModelPack split detection outputs from float tensors. The boxes
@@ -159,7 +164,9 @@ pub fn impl_modelpack_quant<
     score_threshold: f32,
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
-) {
+) where
+    f32: AsPrimitive<SCORE>,
+{
     let (boxes_tensor, quant_boxes) = boxes;
     let (scores_tensor, quant_scores) = scores;
     let boxes = {
@@ -227,8 +234,7 @@ pub fn impl_modelpack_split_quant<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
 ) {
-    let (boxes_tensor, scores_tensor) =
-        postprocess_modelpack_split_quant(outputs, configs).unwrap();
+    let (boxes_tensor, scores_tensor) = postprocess_modelpack_split_quant(outputs, configs);
     let boxes = postprocess_boxes_float::<B, _, _>(
         score_threshold,
         boxes_tensor.view(),
@@ -259,8 +265,7 @@ pub fn impl_modelpack_split_float<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
     iou_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
 ) {
-    let (boxes_tensor, scores_tensor) =
-        postprocess_modelpack_split_float(outputs, configs).unwrap();
+    let (boxes_tensor, scores_tensor) = postprocess_modelpack_split_float(outputs, configs);
     let boxes = postprocess_boxes_float::<B, _, _>(
         score_threshold,
         boxes_tensor.view(),
@@ -281,13 +286,17 @@ pub fn impl_modelpack_split_float<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
 pub fn postprocess_modelpack_split_quant<T: AsPrimitive<f32>>(
     outputs: &[ArrayView3<T>],
     config: &[ModelPackDetectionConfig],
-) -> DecoderResult<(Array2<f32>, Array2<f32>)> {
+) -> (Array2<f32>, Array2<f32>) {
     let mut total_capacity = 0;
     let mut nc = 0;
     for (p, detail) in outputs.iter().zip(config) {
         let shape = p.shape();
         let na = detail.anchors.len();
-        nc = *shape.last().unwrap() / na - 5;
+        nc = *shape
+            .last()
+            .expect("Shape must have at least one dimension")
+            / na
+            - 5;
         total_capacity += shape[0] * shape[1] * na;
     }
     let mut bboxes = Vec::with_capacity(total_capacity * 4);
@@ -308,7 +317,12 @@ pub fn postprocess_modelpack_split_quant<T: AsPrimitive<f32>>(
         } else {
             p.mapv(|x| fast_sigmoid_impl(x.as_()))
         };
-        let p = p_sigmoid.as_slice().unwrap();
+        let p_sigmoid = p_sigmoid.as_standard_layout();
+
+        // Safe to unwrap since we ensured standard layout above
+        let p = p_sigmoid
+            .as_slice()
+            .expect("Sigmoids are not in standard layout");
         let height = shape[0];
         let width = shape[1];
 
@@ -350,9 +364,16 @@ pub fn postprocess_modelpack_split_quant<T: AsPrimitive<f32>>(
             }
         }
     }
-    let bboxes = Array2::from_shape_vec((bboxes.len() / 4, 4), bboxes).unwrap();
-    let bscores = Array2::from_shape_vec((bscores.len() / nc, nc), bscores).unwrap();
-    Ok((bboxes, bscores))
+    // Safe to unwrap since we ensured lengths will match above
+
+    debug_assert_eq!(bboxes.len() % 4, 0);
+    debug_assert_eq!(bscores.len() % nc, 0);
+
+    let bboxes = Array2::from_shape_vec((bboxes.len() / 4, 4), bboxes)
+        .expect("Failed to create bboxes array");
+    let bscores = Array2::from_shape_vec((bscores.len() / nc, nc), bscores)
+        .expect("Failed to create bscores array");
+    (bboxes, bscores)
 }
 
 /// Post processes ModelPack split detection into detection boxes,
@@ -362,13 +383,17 @@ pub fn postprocess_modelpack_split_quant<T: AsPrimitive<f32>>(
 pub fn postprocess_modelpack_split_float<T: AsPrimitive<f32>>(
     outputs: &[ArrayView3<T>],
     config: &[ModelPackDetectionConfig],
-) -> DecoderResult<(Array2<f32>, Array2<f32>)> {
+) -> (Array2<f32>, Array2<f32>) {
     let mut total_capacity = 0;
     let mut nc = 0;
     for (p, detail) in outputs.iter().zip(config) {
         let shape = p.shape();
         let na = detail.anchors.len();
-        nc = *shape.last().unwrap() / na - 5;
+        nc = *shape
+            .last()
+            .expect("Shape must have at least one dimension")
+            / na
+            - 5;
         total_capacity += shape[0] * shape[1] * na;
     }
     let mut bboxes = Vec::with_capacity(total_capacity * 4);
@@ -384,7 +409,12 @@ pub fn postprocess_modelpack_split_float<T: AsPrimitive<f32>>(
             "Shape product doesn't match tensor length"
         );
         let p_sigmoid = p.mapv(|x| fast_sigmoid_impl(x.as_()));
-        let p = p_sigmoid.as_slice().unwrap();
+        let p_sigmoid = p_sigmoid.as_standard_layout();
+
+        // Safe to unwrap since we ensured standard layout above
+        let p = p_sigmoid
+            .as_slice()
+            .expect("Sigmoids are not in standard layout");
         let height = shape[0];
         let width = shape[1];
 
@@ -426,9 +456,16 @@ pub fn postprocess_modelpack_split_float<T: AsPrimitive<f32>>(
             }
         }
     }
-    let bboxes = Array2::from_shape_vec((bboxes.len() / 4, 4), bboxes).unwrap();
-    let bscores = Array2::from_shape_vec((bscores.len() / nc, nc), bscores).unwrap();
-    Ok((bboxes, bscores))
+    // Safe to unwrap since we ensured lengths will match above
+
+    debug_assert_eq!(bboxes.len() % 4, 0);
+    debug_assert_eq!(bscores.len() % nc, 0);
+
+    let bboxes = Array2::from_shape_vec((bboxes.len() / 4, 4), bboxes)
+        .expect("Failed to create bboxes array");
+    let bscores = Array2::from_shape_vec((bscores.len() / nc, nc), bscores)
+        .expect("Failed to create bscores array");
+    (bboxes, bscores)
 }
 
 #[inline(always)]
@@ -459,11 +496,14 @@ pub fn modelpack_segmentation_to_mask(segmentation: ArrayView3<u8>) -> Array2<u8
     let width = segmentation.shape()[1];
     let channels = segmentation.shape()[2];
     let segmentation = segmentation.as_standard_layout();
-    let seg = segmentation.as_slice().unwrap();
+    // Safe to unwrap since we ensured standard layout above
+    let seg = segmentation
+        .as_slice()
+        .expect("Segmentation is not in standard layout");
     let argmax = seg
         .chunks_exact(channels)
         .map(|x| x.argmax() as u8)
         .collect::<Vec<_>>();
 
-    Array2::from_shape_vec((height, width), argmax).unwrap()
+    Array2::from_shape_vec((height, width), argmax).expect("Failed to create mask array")
 }

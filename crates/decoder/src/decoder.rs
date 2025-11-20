@@ -1262,13 +1262,12 @@ impl DecoderBuilder {
             ));
         }
         for b in boxes {
-            if b.anchors.is_none() {
+            let Some(num_anchors) = b.anchors.as_ref().map(|a| a.len()) else {
                 return Err(DecoderError::InvalidConfig(
                     "ModelPack Split Detection missing anchors".to_string(),
                 ));
-            }
+            };
 
-            let num_anchors = b.anchors.as_ref().unwrap().len();
             if num_anchors == 0 {
                 return Err(DecoderError::InvalidConfig(
                     "ModelPack Split Detection has zero anchors".to_string(),
@@ -1618,7 +1617,7 @@ impl Decoder {
     /// #   let mut out_dequant = vec![0.0_f64; 84 * 8400];
     /// #   let quant = Quantization::new(0.0040811873, -123);
     /// #   dequantize_cpu(out, quant, &mut out_dequant);
-    /// #   let model_output_f64 = Array3::from_shape_vec((1, 84, 8400), out_dequant).unwrap().into_dyn();
+    /// #   let model_output_f64 = Array3::from_shape_vec((1, 84, 8400), out_dequant)?.into_dyn();
     ///    let decoder = DecoderBuilder::default()
     ///     .with_config_yolo_det(Detection {
     ///         decoder: DecoderType::Yolov8,
@@ -1825,11 +1824,16 @@ impl Decoder {
     ) -> Result<(), DecoderError> {
         let new_detection = detection
             .iter()
-            .map(|x| ModelPackDetectionConfig {
-                anchors: x.anchors.clone().unwrap(),
-                quantization: x.quantization.map(Quantization::from),
+            .map(|x| match &x.anchors {
+                None => Err(DecoderError::InvalidConfig(
+                    "ModelPack Split Detection missing anchors".to_string(),
+                )),
+                Some(a) => Ok(ModelPackDetectionConfig {
+                    anchors: a.clone(),
+                    quantization: None,
+                }),
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         let new_outputs = Self::match_outputs_to_detect_quantized(detection, outputs)?;
 
         macro_rules! dequant_output {
@@ -2093,18 +2097,25 @@ impl Decoder {
     where
         D: AsPrimitive<f32>,
     {
+        let new_detection = detection
+            .iter()
+            .map(|x| match &x.anchors {
+                None => Err(DecoderError::InvalidConfig(
+                    "ModelPack Split Detection missing anchors".to_string(),
+                )),
+                Some(a) => Ok(ModelPackDetectionConfig {
+                    anchors: a.clone(),
+                    quantization: None,
+                }),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
         let new_outputs = Self::match_outputs_to_detect(detection, outputs)?;
         let new_outputs = new_outputs
             .into_iter()
             .map(|x| x.slice(s![0, .., .., ..]))
             .collect::<Vec<_>>();
-        let new_detection = detection
-            .iter()
-            .map(|x| ModelPackDetectionConfig {
-                anchors: x.anchors.clone().unwrap(),
-                quantization: None,
-            })
-            .collect::<Vec<_>>();
+
         decode_modelpack_split_float(
             &new_outputs,
             &new_detection,

@@ -163,7 +163,7 @@ pub struct XYWH {}
 impl BBoxTypeTrait for XYWH {
     #[inline(always)]
     fn to_xyxy_float<A: Float + 'static, B: AsPrimitive<A>>(input: &[B; 4]) -> [A; 4] {
-        let half = A::from(0.5).unwrap();
+        let half = A::one() / (A::one() + A::one());
         [
             (input[0].as_()) - (input[2].as_() * half),
             (input[1].as_()) - (input[3].as_() * half),
@@ -198,7 +198,7 @@ impl BBoxTypeTrait for XYWH {
     fn ndarray_to_xyxy_float<A: Float + 'static, B: AsPrimitive<A>>(
         input: ArrayView1<B>,
     ) -> [A; 4] {
-        let half = A::from(0.5).unwrap();
+        let half = A::one() / (A::one() + A::one());
         [
             (input[0].as_()) - (input[2].as_() * half),
             (input[1].as_()) - (input[3].as_() * half),
