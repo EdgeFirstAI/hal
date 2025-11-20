@@ -13,6 +13,7 @@ use std::{os::fd::AsRawFd, time::Instant};
 
 /// G2DConverter implements the ImageConverter trait using the NXP G2D
 /// library for hardware-accelerated image processing on i.MX platforms.
+#[derive(Debug)]
 pub struct G2DConverter {
     g2d: G2D,
 }
@@ -21,6 +22,7 @@ unsafe impl Send for G2DConverter {}
 unsafe impl Sync for G2DConverter {}
 
 impl G2DConverter {
+    /// Creates a new G2DConverter instance.
     pub fn new() -> Result<Self> {
         let mut g2d = G2D::new("libg2d.so.2")?;
         g2d.set_bt709_colorspace()?;
@@ -29,6 +31,8 @@ impl G2DConverter {
         Ok(Self { g2d })
     }
 
+    /// Returns the G2D library version as defined by _G2D_VERSION in the shared
+    /// library.
     pub fn version(&self) -> g2d_sys::Version {
         self.g2d.version()
     }
@@ -192,11 +196,10 @@ impl TryFrom<&TensorImage> for G2DSurface {
 
     fn try_from(img: &TensorImage) -> Result<Self, Self::Error> {
         let phys: G2DPhysical = match img.tensor() {
-            Tensor::Shm(t) => t.as_raw_fd(),
             Tensor::Dma(t) => t.as_raw_fd(),
             _ => {
                 return Err(Error::NotImplemented(
-                    "g2d only supports Shm or Dma memory".to_string(),
+                    "g2d only supports Dma memory".to_string(),
                 ));
             }
         }
@@ -225,11 +228,10 @@ impl TryFrom<&mut TensorImage> for G2DSurface {
 
     fn try_from(img: &mut TensorImage) -> Result<Self, Self::Error> {
         let phys: G2DPhysical = match img.tensor() {
-            Tensor::Shm(t) => t.as_raw_fd(),
             Tensor::Dma(t) => t.as_raw_fd(),
             _ => {
                 return Err(Error::NotImplemented(
-                    "g2d only supports Shm or Dma memory".to_string(),
+                    "g2d only supports Dma memory".to_string(),
                 ));
             }
         }
@@ -291,7 +293,7 @@ mod g2d_tests {
 
         let mut src2 = TensorImage::new(1280, 720, g2d_in_fmt, Some(TensorMemory::Dma))?;
 
-        let mut cpu_converter = CPUConverter::new()?;
+        let mut cpu_converter = CPUConverter::new();
 
         cpu_converter.convert(&src, &mut src2, Rotation::None, Flip::None, Crop::no_crop())?;
 
@@ -362,7 +364,7 @@ mod g2d_tests {
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
         let src = TensorImage::load_jpeg(&file, Some(RGB), None)?;
 
-        let mut cpu_converter = CPUConverter::new()?;
+        let mut cpu_converter = CPUConverter::new();
 
         let mut reference = TensorImage::new(dst_width, dst_height, RGB, Some(TensorMemory::Dma))?;
         cpu_converter.convert(
@@ -427,7 +429,7 @@ mod g2d_tests {
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
         let src = TensorImage::load_jpeg(&file, Some(RGB), None)?;
 
-        let mut cpu_converter = CPUConverter::new()?;
+        let mut cpu_converter = CPUConverter::new();
 
         let mut reference = TensorImage::new(dst_width, dst_height, RGB, Some(TensorMemory::Dma))?;
         reference.tensor.map().unwrap().as_mut_slice().fill(128);

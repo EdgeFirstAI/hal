@@ -221,7 +221,7 @@ where
     let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Mem)).unwrap();
     let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Mem)).unwrap();
 
-    let mut converter = CPUConverter::new().unwrap();
+    let mut converter = CPUConverter::new();
 
     bencher.bench_local(|| {
         converter
@@ -259,7 +259,7 @@ where
     let mut grey = TensorImage::new(160, 160, GREY, None).unwrap();
     let mut dst = TensorImage::new(width, height, GREY, None).unwrap();
 
-    let mut converter = CPUConverter::new().unwrap();
+    let mut converter = CPUConverter::new();
 
     converter
         .convert(&src, &mut grey, Rotation::None, Flip::None, Crop::no_crop())
@@ -384,7 +384,7 @@ where
     let mut tmp = TensorImage::new(width, height, RGBA, Some(TensorMemory::Mem)).unwrap();
 
     let mut gl_converter = edgefirst_image::GLConverterThreaded::new().unwrap();
-    let mut cpu_converter = edgefirst_image::CPUConverter::new().unwrap();
+    let mut cpu_converter = edgefirst_image::CPUConverter::new();
 
     cpu_converter
         .convert(&jpeg, &mut src, Rotation::None, Flip::None, Crop::no_crop())
@@ -440,7 +440,7 @@ where
     let mut tmp = TensorImage::new(width, height, RGB, Some(TensorMemory::Mem)).unwrap();
 
     let mut gl_converter = edgefirst_image::GLConverterThreaded::new().unwrap();
-    let mut cpu_converter = edgefirst_image::CPUConverter::new().unwrap();
+    let mut cpu_converter = edgefirst_image::CPUConverter::new();
 
     cpu_converter
         .convert(&jpeg, &mut src, Rotation::None, Flip::None, Crop::no_crop())
@@ -611,7 +611,7 @@ fn rotate_cpu<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) 
     let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
     let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
 
-    let mut converter = CPUConverter::new().unwrap();
+    let mut converter = CPUConverter::new();
 
     bencher.bench_local(|| {
         converter
@@ -683,7 +683,7 @@ fn convert_cpu_yuyv_to_rgba(bencher: divan::Bencher, params: (usize, usize)) {
     let (width, height) = params;
     let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
 
-    let mut converter = CPUConverter::new().unwrap();
+    let mut converter = CPUConverter::new();
 
     bencher.bench_local(|| {
         converter
@@ -705,7 +705,7 @@ fn convert_cpu_yuyv_to_rgb(bencher: divan::Bencher, params: (usize, usize)) {
     let (width, height) = params;
     let mut dst = TensorImage::new(width, height, RGB, None).unwrap();
 
-    let mut converter = CPUConverter::new().unwrap();
+    let mut converter = CPUConverter::new();
 
     bencher.bench_local(|| {
         converter
@@ -727,7 +727,7 @@ fn convert_cpu_yuyv_to_yuyv(bencher: divan::Bencher, params: (usize, usize)) {
     let (width, height) = params;
     let mut dst = TensorImage::new(width, height, YUYV, None).unwrap();
 
-    let mut converter = CPUConverter::new().unwrap();
+    let mut converter = CPUConverter::new();
 
     bencher.bench_local(|| {
         converter
@@ -749,7 +749,7 @@ fn convert_cpu_rgba_to_yuyv(bencher: divan::Bencher, params: (usize, usize)) {
     let (width, height) = params;
     let mut dst = TensorImage::new(width, height, YUYV, None).unwrap();
 
-    let mut converter = CPUConverter::new().unwrap();
+    let mut converter = CPUConverter::new();
 
     bencher.bench_local(|| {
         converter
@@ -780,7 +780,7 @@ where
     let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
     let mut dst = TensorImage::new(src.width(), src.height(), RGB, None).unwrap();
 
-    let mut converter = CPUConverter::new().unwrap();
+    let mut converter = CPUConverter::new();
 
     bencher.bench_local(|| {
         converter
@@ -811,7 +811,7 @@ where
     let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
     let mut dst = TensorImage::new(640, 640, PLANAR_RGB, None).unwrap();
 
-    let mut converter = CPUConverter::new().unwrap();
+    let mut converter = CPUConverter::new();
 
     bencher.bench_local(|| {
         converter
@@ -842,7 +842,7 @@ where
     let src = TensorImage::load_jpeg(&file, Some(RGB), None).unwrap();
     let mut dst = TensorImage::new(640, 640, PLANAR_RGB, None).unwrap();
 
-    let mut converter = CPUConverter::new().unwrap();
+    let mut converter = CPUConverter::new();
 
     bencher.bench_local(|| {
         converter

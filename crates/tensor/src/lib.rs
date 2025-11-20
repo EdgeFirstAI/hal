@@ -1,6 +1,30 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
+/*!
+EdgeFirst HAL - Tensor Module
+
+The `edgefirst_tensor` crate provides a unified interface for managing multi-dimensional arrays (tensors)
+with support for different memory types, including Direct Memory Access (DMA), POSIX Shared Memory (Shm),
+and system memory. The crate defines traits and structures for creating, reshaping, and mapping tensors into memory.
+
+## Examples
+```rust
+use edgefirst_tensor::{Error, Tensor, TensorMemory, TensorTrait};
+# fn main() -> Result<(), Error> {
+let tensor = Tensor::<f32>::new(&[2, 3, 4], Some(TensorMemory::Mem), Some("test_tensor"))?;
+assert_eq!(tensor.memory(), TensorMemory::Mem);
+assert_eq!(tensor.name(), "test_tensor");
+#    Ok(())
+# }
+```
+## Overview
+The main structures and traits provided by the `edgefirst_tensor` crate is the `TensorTrait` and `TensorMapTrait` traits,
+which define the behavior of Tensors and their memory mappings, respectively.
+The `Tensor` enum encapsulates different tensor implementations based on the memory type, while the `TensorMap` enum
+provides access to the underlying data.
+```
+ */
 #[cfg(target_os = "linux")]
 mod dma;
 #[cfg(target_os = "linux")]
@@ -32,38 +56,53 @@ pub trait TensorTrait<T>: Send + Sync
 where
     T: Num + Clone + fmt::Debug,
 {
+    /// Create a new tensor with the given shape and optional name. If no name
+    /// is given, a random name will be generated.
     fn new(shape: &[usize], name: Option<&str>) -> Result<Self>
     where
         Self: Sized;
 
     #[cfg(target_os = "linux")]
+    /// Create a new tensor using the given file descriptor, shape, and optional
+    /// name. If no name is given, a random name will be generated.
     fn from_fd(fd: std::os::fd::OwnedFd, shape: &[usize], name: Option<&str>) -> Result<Self>
     where
         Self: Sized;
 
     #[cfg(target_os = "linux")]
+    /// Clone the file descriptor associated with this tensor.
     fn clone_fd(&self) -> Result<std::os::fd::OwnedFd>;
 
+    /// Get the memory type of this tensor.
     fn memory(&self) -> TensorMemory;
 
+    /// Get the name of this tensor.
     fn name(&self) -> String;
 
+    /// Get the number of elements in this tensor.
     fn len(&self) -> usize {
         self.shape().iter().product()
     }
 
+    /// Check if the tensor is empty.
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Get the size in bytes of this tensor.
     fn size(&self) -> usize {
         self.len() * std::mem::size_of::<T>()
     }
 
+    /// Get the shape of this tensor.
     fn shape(&self) -> &[usize];
 
+    /// Reshape this tensor to the given shape. The total number of elements
+    /// must remain the same.
     fn reshape(&mut self, shape: &[usize]) -> Result<()>;
 
+    /// Map the tensor into memory and return a TensorMap for accessing the
+    /// data.
     fn map(&self) -> Result<TensorMap<T>>;
 }
 
@@ -71,27 +110,35 @@ pub trait TensorMapTrait<T>
 where
     T: Num + Clone + fmt::Debug,
 {
+    /// Get the shape of this tensor map.
     fn shape(&self) -> &[usize];
 
+    /// Unmap the tensor from memory.
     fn unmap(&mut self);
 
+    /// Get the number of elements in this tensor map.
     fn len(&self) -> usize {
         self.shape().iter().product()
     }
 
+    /// Check if the tensor map is empty.
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Get the size in bytes of this tensor map.
     fn size(&self) -> usize {
         self.len() * std::mem::size_of::<T>()
     }
 
+    /// Get a slice to the data in this tensor map.
     fn as_slice(&self) -> &[T];
 
+    /// Get a mutable slice to the data in this tensor map.
     fn as_mut_slice(&mut self) -> &mut [T];
 
     #[cfg(feature = "ndarray")]
+    /// Get an ndarray ArrayView of the tensor data.
     fn view(&'_ self) -> Result<ndarray::ArrayView<'_, T, ndarray::Dim<ndarray::IxDynImpl>>> {
         Ok(ndarray::ArrayView::from_shape(
             self.shape(),
@@ -100,6 +147,7 @@ where
     }
 
     #[cfg(feature = "ndarray")]
+    /// Get an ndarray ArrayViewMut of the tensor data.
     fn view_mut(
         &'_ mut self,
     ) -> Result<ndarray::ArrayViewMut<'_, T, ndarray::Dim<ndarray::IxDynImpl>>> {
@@ -114,9 +162,16 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TensorMemory {
     #[cfg(target_os = "linux")]
+    /// Direct Memory Access (DMA) allocation allocation. Incurs additional
+    /// overhead for memory reading/writing with the CPU.  Allows for
+    /// hardware acceleration when suppported.
     Dma,
     #[cfg(target_os = "linux")]
+    /// POSIX Shared Memory allocation. Suitable for inter-process
+    /// communication, but not suitable for hardware acceleration.
     Shm,
+
+    /// Regular system memory allocation
     Mem,
 }
 
@@ -147,6 +202,7 @@ impl TryFrom<&str> for TensorMemory {
     }
 }
 
+#[derive(Debug)]
 pub enum Tensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
@@ -162,6 +218,29 @@ impl<T> Tensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
 {
+    /// Create a new tensor with the given shape, memory type, and optional
+    /// name. If no name is given, a random name will be generated. If no
+    /// memory type is given, the best available memory type will be chosen
+    /// based on the platform and environment variables.
+    ///
+    /// On Linux platforms, the order of preference is: Dma -> Shm -> Mem.
+    /// On non-Linux platforms, only Mem is available.
+    ///
+    /// # Environment Variables
+    /// - `EDGEFIRST_TENSOR_FORCE_MEM`: If set to a non-zero and non-false
+    ///   value, forces the use of regular system memory allocation
+    ///   (`TensorMemory::Mem`) regardless of platform capabilities.
+    ///
+    /// # Example
+    /// ```rust
+    /// use edgefirst_tensor::{Error, Tensor, TensorMemory, TensorTrait};
+    /// # fn main() -> Result<(), Error> {
+    /// let tensor = Tensor::<f32>::new(&[2, 3, 4], Some(TensorMemory::Mem), Some("test_tensor"))?;
+    /// assert_eq!(tensor.memory(), TensorMemory::Mem);
+    /// assert_eq!(tensor.name(), "test_tensor");
+    /// #    Ok(())
+    /// # }
+    /// ```
     pub fn new(shape: &[usize], memory: Option<TensorMemory>, name: Option<&str>) -> Result<Self> {
         match memory {
             #[cfg(target_os = "linux")]
@@ -200,6 +279,11 @@ where
     }
 
     #[cfg(target_os = "linux")]
+    /// Create a new tensor using the given file descriptor, shape, and optional
+    /// name. If no name is given, a random name will be generated.
+    ///
+    /// Inspects the file descriptor to determine the appropriate tensor type
+    /// (Dma or Shm) based on the device major and minor numbers.
     fn from_fd(fd: OwnedFd, shape: &[usize], name: Option<&str>) -> Result<Self> {
         use nix::sys::stat::fstat;
 

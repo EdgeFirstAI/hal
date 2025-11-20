@@ -56,10 +56,13 @@ impl From<libloading::Error> for Error {
 pub struct G2DFormat(g2d_format);
 
 impl G2DFormat {
+    /// Try to create a G2DFormat from a FourCharCode
+    /// Supported formats are RGB, RGBA, YUYV, NV12
     pub fn try_from(fourcc: FourCharCode) -> Result<Self> {
         fourcc.try_into()
     }
 
+    /// Get the underlying g2d_format
     pub fn format(&self) -> g2d_format {
         self.0
     }
@@ -83,11 +86,14 @@ impl TryFrom<FourCharCode> for G2DFormat {
 impl TryFrom<G2DFormat> for FourCharCode {
     type Error = Error;
 
+    /// Try to convert a G2DFormat to a FourCharCode
+    /// Supported formats are RGB, RGBA, YUYV, NV12
     fn try_from(format: G2DFormat) -> Result<Self, Self::Error> {
         match format.0 {
             g2d_format_G2D_RGB888 => Ok(RGB),
             g2d_format_G2D_RGBA8888 => Ok(RGBA),
             g2d_format_G2D_YUYV => Ok(YUYV),
+            g2d_format_G2D_NV12 => Ok(NV12),
             _ => Err(Error::InvalidFormat(format!(
                 "Unsupported G2D format: {format:?}"
             ))),
@@ -95,7 +101,7 @@ impl TryFrom<G2DFormat> for FourCharCode {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct G2DPhysical(c_ulong);
 
 impl G2DPhysical {
@@ -143,6 +149,7 @@ impl From<u64> for G2DPhysical {
 
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Default, Copy)]
+/// G2D library version as reported by _G2D_VERSION symbol
 pub struct Version {
     pub major: i64,
     pub minor: i64,
@@ -242,7 +249,7 @@ fn guess_version(g2d: &g2d) -> Option<Version> {
 }
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct G2DSurface {
     pub format: g2d_format,
     pub planes: [::std::os::raw::c_ulong; 3usize],
@@ -285,7 +292,7 @@ impl Default for G2DSurface {
 }
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct G2DSurfaceLegacy {
     pub format: g2d_format,
     pub planes: [::std::os::raw::c_int; 3usize],
@@ -351,6 +358,7 @@ impl From<&G2DSurface> for G2DSurfaceLegacy {
     }
 }
 
+#[derive(Debug)]
 pub struct G2D {
     pub lib: Rc<g2d>,
     pub handle: *mut c_void,
