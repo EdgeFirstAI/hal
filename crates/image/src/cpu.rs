@@ -4,10 +4,10 @@
 use std::time::Instant;
 
 use crate::{
-    Crop, Error, Flip, GREY, ImageConverterTrait, NV12, PLANAR_RGB, RGB, RGBA, Rect, Result,
-    Rotation, TensorImage, YUYV,
+    Crop, Error, Flip, GREY, ImageConverterTrait, NV12, PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, Rect,
+    Result, Rotation, TensorImage, YUYV,
 };
-use edgefirst_tensor::{TensorMapTrait, TensorTrait};
+use edgefirst_tensor::{TensorMapTrait, TensorMemory, TensorTrait};
 use four_char_code::FourCharCode;
 use ndarray::{ArrayView3, ArrayViewMut3, Axis};
 use rayon::iter::IndexedParallelIterator;
@@ -238,6 +238,22 @@ impl CPUConverter {
         )?)
     }
 
+    fn convert_yuyv_to_8bps(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), YUYV);
+        assert_eq!(dst.fourcc(), PLANAR_RGB);
+        let mut tmp = TensorImage::new(src.width(), src.height(), RGB, Some(TensorMemory::Mem))?;
+        Self::convert_yuyv_to_rgb(src, &mut tmp)?;
+        Self::convert_rgb_to_8bps(&tmp, dst)
+    }
+
+    fn convert_yuyv_to_prgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), YUYV);
+        assert_eq!(dst.fourcc(), PLANAR_RGBA);
+        let mut tmp = TensorImage::new(src.width(), src.height(), RGB, Some(TensorMemory::Mem))?;
+        Self::convert_yuyv_to_rgb(src, &mut tmp)?;
+        Self::convert_rgb_to_prgba(&tmp, dst)
+    }
+
     fn convert_yuyv_to_grey(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), YUYV);
         assert_eq!(dst.fourcc(), GREY);
@@ -312,6 +328,28 @@ impl CPUConverter {
             s.spawn(|_| dst0.copy_from_slice(src));
             s.spawn(|_| dst1.copy_from_slice(src));
             s.spawn(|_| dst2.copy_from_slice(src));
+        });
+        Ok(())
+    }
+
+    fn convert_grey_to_prgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), GREY);
+        assert_eq!(dst.fourcc(), PLANAR_RGB);
+
+        let src = src.tensor().map()?;
+        let src = src.as_slice();
+
+        let mut dst_map = dst.tensor().map()?;
+        let dst_ = dst_map.as_mut_slice();
+
+        let (dst0, dst1) = dst_.split_at_mut(dst.width() * dst.height());
+        let (dst1, dst2) = dst1.split_at_mut(dst.width() * dst.height());
+        let (dst2, dst3) = dst2.split_at_mut(dst.width() * dst.height());
+        rayon::scope(|s| {
+            s.spawn(|_| dst0.copy_from_slice(src));
+            s.spawn(|_| dst1.copy_from_slice(src));
+            s.spawn(|_| dst2.copy_from_slice(src));
+            s.spawn(|_| dst3.fill(255));
         });
         Ok(())
     }
@@ -391,6 +429,30 @@ impl CPUConverter {
             s.spawn(|_| dst0.iter_mut().zip(src).for_each(|(d, s)| *d = s[0]));
             s.spawn(|_| dst1.iter_mut().zip(src).for_each(|(d, s)| *d = s[1]));
             s.spawn(|_| dst2.iter_mut().zip(src).for_each(|(d, s)| *d = s[2]));
+        });
+        Ok(())
+    }
+
+    fn convert_rgba_to_prgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), RGBA);
+        assert_eq!(dst.fourcc(), PLANAR_RGBA);
+
+        let src = src.tensor().map()?;
+        let src = src.as_slice();
+        let src = src.as_chunks::<4>().0;
+
+        let mut dst_map = dst.tensor().map()?;
+        let dst_ = dst_map.as_mut_slice();
+
+        let (dst0, dst1) = dst_.split_at_mut(dst.width() * dst.height());
+        let (dst1, dst2) = dst1.split_at_mut(dst.width() * dst.height());
+        let (dst2, dst3) = dst2.split_at_mut(dst.width() * dst.height());
+
+        rayon::scope(|s| {
+            s.spawn(|_| dst0.iter_mut().zip(src).for_each(|(d, s)| *d = s[0]));
+            s.spawn(|_| dst1.iter_mut().zip(src).for_each(|(d, s)| *d = s[1]));
+            s.spawn(|_| dst2.iter_mut().zip(src).for_each(|(d, s)| *d = s[2]));
+            s.spawn(|_| dst3.iter_mut().zip(src).for_each(|(d, s)| *d = s[3]));
         });
         Ok(())
     }
@@ -506,6 +568,30 @@ impl CPUConverter {
         Ok(())
     }
 
+    fn convert_rgb_to_prgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), RGB);
+        assert_eq!(dst.fourcc(), PLANAR_RGBA);
+
+        let src = src.tensor().map()?;
+        let src = src.as_slice();
+        let src = src.as_chunks::<3>().0;
+
+        let mut dst_map = dst.tensor().map()?;
+        let dst_ = dst_map.as_mut_slice();
+
+        let (dst0, dst1) = dst_.split_at_mut(dst.width() * dst.height());
+        let (dst1, dst2) = dst1.split_at_mut(dst.width() * dst.height());
+        let (dst2, dst3) = dst2.split_at_mut(dst.width() * dst.height());
+
+        rayon::scope(|s| {
+            s.spawn(|_| dst0.iter_mut().zip(src).for_each(|(d, s)| *d = s[0]));
+            s.spawn(|_| dst1.iter_mut().zip(src).for_each(|(d, s)| *d = s[1]));
+            s.spawn(|_| dst2.iter_mut().zip(src).for_each(|(d, s)| *d = s[2]));
+            s.spawn(|_| dst3.fill(255));
+        });
+        Ok(())
+    }
+
     fn convert_rgb_to_yuyv(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), RGB);
         assert_eq!(dst.fourcc(), YUYV);
@@ -578,18 +664,26 @@ impl CPUConverter {
                 | (YUYV, RGBA)
                 | (YUYV, GREY)
                 | (YUYV, YUYV)
+                | (YUYV, PLANAR_RGB)
+                | (YUYV, PLANAR_RGBA)
                 | (RGBA, RGB)
                 | (RGBA, RGBA)
                 | (RGBA, GREY)
                 | (RGBA, YUYV)
+                | (RGBA, PLANAR_RGB)
+                | (RGBA, PLANAR_RGBA)
                 | (RGB, RGB)
                 | (RGB, RGBA)
                 | (RGB, GREY)
                 | (RGB, YUYV)
+                | (RGB, PLANAR_RGB)
+                | (RGB, PLANAR_RGBA)
                 | (GREY, RGB)
                 | (GREY, RGBA)
                 | (GREY, GREY)
                 | (GREY, YUYV)
+                | (GREY, PLANAR_RGB)
+                | (GREY, PLANAR_RGBA)
         )
     }
 
@@ -607,21 +701,26 @@ impl CPUConverter {
             (YUYV, RGBA) => Self::convert_yuyv_to_rgba(src, dst),
             (YUYV, GREY) => Self::convert_yuyv_to_grey(src, dst),
             (YUYV, YUYV) => Self::copy_image(src, dst),
+            (YUYV, PLANAR_RGB) => Self::convert_yuyv_to_8bps(src, dst),
+            (YUYV, PLANAR_RGBA) => Self::convert_yuyv_to_prgba(src, dst),
             (RGBA, RGB) => Self::convert_rgba_to_rgb(src, dst),
             (RGBA, RGBA) => Self::copy_image(src, dst),
             (RGBA, GREY) => Self::convert_rgba_to_grey(src, dst),
             (RGBA, YUYV) => Self::convert_rgba_to_yuyv(src, dst),
             (RGBA, PLANAR_RGB) => Self::convert_rgba_to_8bps(src, dst),
+            (RGBA, PLANAR_RGBA) => Self::convert_rgba_to_prgba(src, dst),
             (RGB, RGB) => Self::copy_image(src, dst),
             (RGB, RGBA) => Self::convert_rgb_to_rgba(src, dst),
             (RGB, GREY) => Self::convert_rgb_to_grey(src, dst),
             (RGB, YUYV) => Self::convert_rgb_to_yuyv(src, dst),
             (RGB, PLANAR_RGB) => Self::convert_rgb_to_8bps(src, dst),
+            (RGB, PLANAR_RGBA) => Self::convert_rgb_to_prgba(src, dst),
             (GREY, RGB) => Self::convert_grey_to_rgb(src, dst),
             (GREY, RGBA) => Self::convert_grey_to_rgba(src, dst),
             (GREY, GREY) => Self::copy_image(src, dst),
             (GREY, YUYV) => Self::convert_grey_to_yuyv(src, dst),
             (GREY, PLANAR_RGB) => Self::convert_grey_to_8bps(src, dst),
+            (GREY, PLANAR_RGBA) => Self::convert_grey_to_prgba(src, dst),
             (s, d) => Err(Error::NotSupported(format!(
                 "Conversion from {} to {}",
                 s.display(),
@@ -829,6 +928,7 @@ impl CPUConverter {
             GREY => Self::fill_image_outside_crop_(dst, Self::rgba_to_grey(rgba), crop),
             YUYV => Self::fill_image_outside_crop_(dst, Self::rgba_to_yuyv(rgba), crop),
             PLANAR_RGB => Self::fill_image_outside_crop_planar(dst, Self::rgba_to_rgb(rgba), crop),
+            PLANAR_RGBA => Self::fill_image_outside_crop_planar(dst, rgba, crop),
             _ => Err(Error::Internal(format!(
                 "Found unexpected destination {}",
                 dst.fourcc.display()
@@ -1005,21 +1105,26 @@ impl ImageConverterTrait for CPUConverter {
             (YUYV, RGBA) => RGBA,
             (YUYV, GREY) => GREY,
             (YUYV, YUYV) => RGB, // RGB intermediary for YUYV dest resize/convert/rotation/flip
+            (YUYV, PLANAR_RGB) => RGB,
+            (YUYV, PLANAR_RGBA) => RGB,
             (RGBA, RGB) => RGB,
             (RGBA, RGBA) => RGBA,
             (RGBA, GREY) => GREY,
             (RGBA, YUYV) => RGBA, // RGB intermediary for YUYV dest resize/convert/rotation/flip
             (RGBA, PLANAR_RGB) => RGBA,
+            (RGBA, PLANAR_RGBA) => RGBA,
             (RGB, RGB) => RGB,
             (RGB, RGBA) => RGB,
             (RGB, GREY) => GREY,
             (RGB, YUYV) => RGB, // RGB intermediary for YUYV dest resize/convert/rotation/flip
             (RGB, PLANAR_RGB) => RGB,
+            (RGB, PLANAR_RGBA) => RGB,
             (GREY, RGB) => RGB,
             (GREY, RGBA) => RGBA,
             (GREY, GREY) => GREY,
             (GREY, YUYV) => GREY,
             (GREY, PLANAR_RGB) => GREY,
+            (GREY, PLANAR_RGBA) => GREY,
             (s, d) => {
                 return Err(Error::NotSupported(format!(
                     "Conversion from {} to {}",
