@@ -1037,7 +1037,7 @@ impl GLConverterST {
             PLANAR_RGBA => true,
             _ => {
                 return Err(crate::Error::NotSupported(
-                    "Destination format is not PLANAR_RGB".to_string(),
+                    "Destination format must be PLANAR_RGB or PLANAR_RGBA".to_string(),
                 ));
             }
         };
@@ -1140,9 +1140,9 @@ impl GLConverterST {
             let width = (((dst_roi.right - dst_roi.left) / 2.0) * width as f32).round() as i32;
             let height = (((dst_roi.top - dst_roi.bottom) / 2.0) * height as f32 / split as f32)
                 .round() as i32;
-            for i in 0..split {
+            for (i, c) in color.iter().enumerate().take(split) {
                 gls::gl::Scissor(x, y + i as i32 * height, width, height);
-                gls::gl::ClearColor(color[split], color[split], color[split], 1.0);
+                gls::gl::ClearColor(*c, *c, *c, 1.0);
                 gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
             }
             gls::gl::Disable(gls::gl::SCISSOR_TEST);
