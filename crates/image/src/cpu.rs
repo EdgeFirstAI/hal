@@ -344,7 +344,7 @@ impl CPUConverter {
 
     fn convert_grey_to_prgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), GREY);
-        assert_eq!(dst.fourcc(), PLANAR_RGB);
+        assert_eq!(dst.fourcc(), PLANAR_RGBA);
 
         let src = src.tensor().map()?;
         let src = src.as_slice();
@@ -887,7 +887,7 @@ impl CPUConverter {
 
     fn convert_prgba_to_rgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), PLANAR_RGBA);
-        assert_eq!(dst.fourcc(), RGB);
+        assert_eq!(dst.fourcc(), RGBA);
 
         let src_map = src.tensor().map()?;
         let src_ = src_map.as_slice();
@@ -927,18 +927,21 @@ impl CPUConverter {
                 | (YUYV, YUYV)
                 | (YUYV, PLANAR_RGB)
                 | (YUYV, PLANAR_RGBA)
+                | (YUYV, NV16)
                 | (RGBA, RGB)
                 | (RGBA, RGBA)
                 | (RGBA, GREY)
                 | (RGBA, YUYV)
                 | (RGBA, PLANAR_RGB)
                 | (RGBA, PLANAR_RGBA)
+                | (RGBA, NV16)
                 | (RGB, RGB)
                 | (RGB, RGBA)
                 | (RGB, GREY)
                 | (RGB, YUYV)
                 | (RGB, PLANAR_RGB)
                 | (RGB, PLANAR_RGBA)
+                | (RGB, NV16)
                 | (GREY, RGB)
                 | (GREY, RGBA)
                 | (GREY, GREY)
@@ -1409,7 +1412,7 @@ impl ImageConverterTrait for CPUConverter {
             (YUYV, RGBA) => RGBA,
             (YUYV, GREY) => GREY,
             (YUYV, YUYV) => RGBA, // RGBA intermediary for YUYV dest resize/convert/rotation/flip
-            (YUYV, PLANAR_RGB) => RGBA,
+            (YUYV, PLANAR_RGB) => RGB,
             (YUYV, PLANAR_RGBA) => RGBA,
             (YUYV, NV16) => RGBA,
             (RGBA, RGB) => RGBA,
