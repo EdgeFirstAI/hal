@@ -56,7 +56,7 @@ and hardware acceleration. However, this will increase the performance of the CP
 use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait as _};
 use enum_dispatch::enum_dispatch;
 use four_char_code::{FourCharCode, four_char_code};
-use std::time::Instant;
+use std::{fmt::Display, time::Instant};
 use zune_jpeg::{
     JpegDecoder,
     zune_core::{colorspace::ColorSpace, options::DecoderOptions},
@@ -80,6 +80,8 @@ mod opengl_headless;
 pub const YUYV: FourCharCode = four_char_code!("YUYV");
 /// 8 bit planar YUV420, limited range
 pub const NV12: FourCharCode = four_char_code!("NV12");
+/// 8 bit planar YUV422, limited range
+pub const NV16: FourCharCode = four_char_code!("NV16");
 /// 8 bit RGBA
 pub const RGBA: FourCharCode = four_char_code!("RGBA");
 /// 8 bit RGB
@@ -942,9 +944,10 @@ fn fourcc_channels(fourcc: FourCharCode) -> Result<usize> {
         YUYV => Ok(2), // YUYV has 2 channels (Y and UV)
         GREY => Ok(1), // Y800 has 1 channel (Y)
         NV12 => Ok(2), // NV12 has 2 channel. 2nd channel is half empty
+        NV16 => Ok(2), // NV16 has 2 channel. 2nd channel is full size
         PLANAR_RGB => Ok(3),
         PLANAR_RGBA => Ok(4),
-        _ => Err(Error::InvalidShape(format!(
+        _ => Err(Error::NotSupported(format!(
             "Unsupported fourcc: {}",
             fourcc.to_string()
         ))),
@@ -958,12 +961,33 @@ fn fourcc_planar(fourcc: FourCharCode) -> Result<bool> {
         YUYV => Ok(false),       // YUYV has 2 channels (Y and UV)
         GREY => Ok(false),       // Y800 has 1 channel (Y)
         NV12 => Ok(true),        // Planar YUV
+        NV16 => Ok(true),        // Planar YUV
         PLANAR_RGB => Ok(true),  // Planar RGB
         PLANAR_RGBA => Ok(true), // Planar RGBA
         _ => Err(Error::NotSupported(format!(
             "Unsupported fourcc: {}",
             fourcc.to_string()
         ))),
+    }
+}
+
+pub(crate) struct FunctionTimer<T: Display> {
+    name: T,
+    start: std::time::Instant,
+}
+
+impl<T: Display> FunctionTimer<T> {
+    pub fn new(name: T) -> Self {
+        Self {
+            name,
+            start: std::time::Instant::now(),
+        }
+    }
+}
+
+impl<T: Display> Drop for FunctionTimer<T> {
+    fn drop(&mut self) {
+        log::trace!("{} elapsed: {:?}", self.name, self.start.elapsed())
     }
 }
 
@@ -2739,6 +2763,52 @@ mod image_tests {
             )
             .unwrap();
         compare_images(&gl_dst, &cpu_dst, 0.98, function!());
+    }
+
+    #[test]
+    fn test_cpu_resize_nv16() {
+        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
+
+        let mut cpu_nv16_dst = TensorImage::new(640, 640, NV16, None).unwrap();
+        let mut cpu_rgb_dst = TensorImage::new(640, 640, RGB, None).unwrap();
+        let mut cpu_converter = CPUConverter::new();
+
+        cpu_converter
+            .convert(
+                &src,
+                &mut cpu_nv16_dst,
+                Rotation::None,
+                Flip::None,
+                // Crop::no_crop(),
+                Crop::new()
+                    .with_dst_rect(Some(Rect {
+                        left: 20,
+                        top: 140,
+                        width: 600,
+                        height: 360,
+                    }))
+                    .with_dst_color(Some([255, 128, 0, 255])),
+            )
+            .unwrap();
+
+        cpu_converter
+            .convert(
+                &src,
+                &mut cpu_rgb_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::new()
+                    .with_dst_rect(Some(Rect {
+                        left: 20,
+                        top: 140,
+                        width: 600,
+                        height: 360,
+                    }))
+                    .with_dst_color(Some([255, 128, 0, 255])),
+            )
+            .unwrap();
+        compare_images_convert_to_rgb(&cpu_nv16_dst, &cpu_rgb_dst, 0.99, function!());
     }
 
     fn load_bytes_to_tensor(
