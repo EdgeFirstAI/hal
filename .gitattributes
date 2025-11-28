@@ -19,5 +19,6 @@ testdata/zidane_rotated_exif.jpg filter=lfs diff=lfs merge=lfs -text
 testdata/zidane.nv12 filter=lfs diff=lfs merge=lfs -text
 testdata/test_image.jpg filter=lfs diff=lfs merge=lfs -text
 testdata/zidane.png filter=lfs diff=lfs merge=lfs -text
+testdata/camera720p.nv16 filter=lfs diff=lfs merge=lfs -text
 testdata/camera1080p.* filter=lfs diff=lfs merge=lfs -text
 testdata/camera4k.* filter=lfs diff=lfs merge=lfs -text
