@@ -8,7 +8,9 @@ use crate::{
 use edgefirst_tensor::{TensorMapTrait, TensorMemory, TensorTrait};
 use four_char_code::FourCharCode;
 use ndarray::{ArrayView3, ArrayViewMut3, Axis};
-use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{
+    IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
+};
 
 /// CPUConverter implements the ImageConverter trait using the fallback CPU
 /// implementation for image processing.
@@ -169,79 +171,6 @@ impl CPUConverter {
         )?)
     }
 
-    fn convert_nv16_to_rgb(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
-        assert_eq!(src.fourcc(), NV16);
-        assert_eq!(dst.fourcc(), RGB);
-        let map = src.tensor.map()?;
-        let y_stride = src.width() as u32;
-        let uv_stride = src.width() as u32;
-        let slices = map.as_slice().split_at(y_stride as usize * src.height());
-
-        let src = yuv::YuvBiPlanarImage {
-            y_plane: slices.0,
-            y_stride,
-            uv_plane: slices.1,
-            uv_stride,
-            width: src.width() as u32,
-            height: src.height() as u32,
-        };
-
-        Ok(yuv::yuv_nv16_to_rgb(
-            &src,
-            dst.tensor.map()?.as_mut_slice(),
-            dst.row_stride() as u32,
-            yuv::YuvRange::Limited,
-            yuv::YuvStandardMatrix::Bt709,
-            yuv::YuvConversionMode::Balanced,
-        )?)
-    }
-
-    fn convert_nv16_to_rgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
-        assert_eq!(src.fourcc(), NV16);
-        assert_eq!(dst.fourcc(), RGBA);
-        let map = src.tensor.map()?;
-        let y_stride = src.width() as u32;
-        let uv_stride = src.width() as u32;
-        let slices = map.as_slice().split_at(y_stride as usize * src.height());
-
-        let src = yuv::YuvBiPlanarImage {
-            y_plane: slices.0,
-            y_stride,
-            uv_plane: slices.1,
-            uv_stride,
-            width: src.width() as u32,
-            height: src.height() as u32,
-        };
-
-        Ok(yuv::yuv_nv16_to_rgba(
-            &src,
-            dst.tensor.map()?.as_mut_slice(),
-            dst.row_stride() as u32,
-            yuv::YuvRange::Limited,
-            yuv::YuvStandardMatrix::Bt709,
-            yuv::YuvConversionMode::Balanced,
-        )?)
-    }
-
-    fn convert_yuyv_to_rgb(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
-        assert_eq!(src.fourcc(), YUYV);
-        assert_eq!(dst.fourcc(), RGB);
-        let src = yuv::YuvPackedImage::<u8> {
-            yuy: &src.tensor.map()?,
-            yuy_stride: src.row_stride() as u32, // we assume packed yuyv
-            width: src.width() as u32,
-            height: src.height() as u32,
-        };
-
-        Ok(yuv::yuyv422_to_rgb(
-            &src,
-            dst.tensor.map()?.as_mut_slice(),
-            dst.width() as u32 * 3,
-            yuv::YuvRange::Limited,
-            yuv::YuvStandardMatrix::Bt709,
-        )?)
-    }
-
     fn convert_nv12_to_grey(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), NV12);
         assert_eq!(dst.fourcc(), GREY);
@@ -265,10 +194,23 @@ impl CPUConverter {
         Ok(())
     }
 
-    fn convert_nv12_to_yuyv(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
-        assert_eq!(src.fourcc(), NV12);
-        assert_eq!(dst.fourcc(), YUYV);
-        Err(Error::NotImplemented("NV12 to YUYV".to_string()))
+    fn convert_yuyv_to_rgb(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), YUYV);
+        assert_eq!(dst.fourcc(), RGB);
+        let src = yuv::YuvPackedImage::<u8> {
+            yuy: &src.tensor.map()?,
+            yuy_stride: src.row_stride() as u32, // we assume packed yuyv
+            width: src.width() as u32,
+            height: src.height() as u32,
+        };
+
+        Ok(yuv::yuyv422_to_rgb(
+            &src,
+            dst.tensor.map()?.as_mut_slice(),
+            dst.width() as u32 * 3,
+            yuv::YuvRange::Limited,
+            yuv::YuvStandardMatrix::Bt709,
+        )?)
     }
 
     fn convert_yuyv_to_rgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
@@ -812,13 +754,171 @@ impl CPUConverter {
         Ok(())
     }
 
+    fn convert_nv16_to_rgb(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), NV16);
+        assert_eq!(dst.fourcc(), RGB);
+        let map = src.tensor.map()?;
+        let y_stride = src.width() as u32;
+        let uv_stride = src.width() as u32;
+        let slices = map.as_slice().split_at(y_stride as usize * src.height());
+
+        let src = yuv::YuvBiPlanarImage {
+            y_plane: slices.0,
+            y_stride,
+            uv_plane: slices.1,
+            uv_stride,
+            width: src.width() as u32,
+            height: src.height() as u32,
+        };
+
+        Ok(yuv::yuv_nv16_to_rgb(
+            &src,
+            dst.tensor.map()?.as_mut_slice(),
+            dst.row_stride() as u32,
+            yuv::YuvRange::Limited,
+            yuv::YuvStandardMatrix::Bt709,
+            yuv::YuvConversionMode::Balanced,
+        )?)
+    }
+
+    fn convert_nv16_to_rgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), NV16);
+        assert_eq!(dst.fourcc(), RGBA);
+        let map = src.tensor.map()?;
+        let y_stride = src.width() as u32;
+        let uv_stride = src.width() as u32;
+        let slices = map.as_slice().split_at(y_stride as usize * src.height());
+
+        let src = yuv::YuvBiPlanarImage {
+            y_plane: slices.0,
+            y_stride,
+            uv_plane: slices.1,
+            uv_stride,
+            width: src.width() as u32,
+            height: src.height() as u32,
+        };
+
+        Ok(yuv::yuv_nv16_to_rgba(
+            &src,
+            dst.tensor.map()?.as_mut_slice(),
+            dst.row_stride() as u32,
+            yuv::YuvRange::Limited,
+            yuv::YuvStandardMatrix::Bt709,
+            yuv::YuvConversionMode::Balanced,
+        )?)
+    }
+
+    fn convert_8bps_to_rgb(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), PLANAR_RGB);
+        assert_eq!(dst.fourcc(), RGB);
+
+        let src_map = src.tensor().map()?;
+        let src_ = src_map.as_slice();
+
+        let (src0, src1) = src_.split_at(src.width() * src.height());
+        let (src1, src2) = src1.split_at(src.width() * src.height());
+
+        let mut dst_map = dst.tensor().map()?;
+        let dst_ = dst_map.as_mut_slice();
+
+        src0.par_iter()
+            .zip_eq(src1)
+            .zip_eq(src2)
+            .zip_eq(dst_.as_chunks_mut::<3>().0.par_iter_mut())
+            .for_each(|(((s0, s1), s2), d)| {
+                d[0] = *s0;
+                d[1] = *s1;
+                d[2] = *s2;
+            });
+        Ok(())
+    }
+
+    fn convert_8bps_to_rgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), PLANAR_RGB);
+        assert_eq!(dst.fourcc(), RGBA);
+
+        let src_map = src.tensor().map()?;
+        let src_ = src_map.as_slice();
+
+        let (src0, src1) = src_.split_at(src.width() * src.height());
+        let (src1, src2) = src1.split_at(src.width() * src.height());
+
+        let mut dst_map = dst.tensor().map()?;
+        let dst_ = dst_map.as_mut_slice();
+
+        src0.par_iter()
+            .zip_eq(src1)
+            .zip_eq(src2)
+            .zip_eq(dst_.as_chunks_mut::<4>().0.par_iter_mut())
+            .for_each(|(((s0, s1), s2), d)| {
+                d[0] = *s0;
+                d[1] = *s1;
+                d[2] = *s2;
+                d[3] = 255;
+            });
+        Ok(())
+    }
+
+    fn convert_prgba_to_rgb(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), PLANAR_RGBA);
+        assert_eq!(dst.fourcc(), RGB);
+
+        let src_map = src.tensor().map()?;
+        let src_ = src_map.as_slice();
+
+        let (src0, src1) = src_.split_at(src.width() * src.height());
+        let (src1, src2) = src1.split_at(src.width() * src.height());
+        let (src2, _src3) = src2.split_at(src.width() * src.height());
+
+        let mut dst_map = dst.tensor().map()?;
+        let dst_ = dst_map.as_mut_slice();
+
+        src0.par_iter()
+            .zip_eq(src1)
+            .zip_eq(src2)
+            .zip_eq(dst_.as_chunks_mut::<3>().0.par_iter_mut())
+            .for_each(|(((s0, s1), s2), d)| {
+                d[0] = *s0;
+                d[1] = *s1;
+                d[2] = *s2;
+            });
+        Ok(())
+    }
+
+    fn convert_prgba_to_rgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), PLANAR_RGBA);
+        assert_eq!(dst.fourcc(), RGB);
+
+        let src_map = src.tensor().map()?;
+        let src_ = src_map.as_slice();
+
+        let (src0, src1) = src_.split_at(src.width() * src.height());
+        let (src1, src2) = src1.split_at(src.width() * src.height());
+        let (src2, src3) = src2.split_at(src.width() * src.height());
+
+        let mut dst_map = dst.tensor().map()?;
+        let dst_ = dst_map.as_mut_slice();
+
+        src0.par_iter()
+            .zip_eq(src1)
+            .zip_eq(src2)
+            .zip_eq(src3)
+            .zip_eq(dst_.as_chunks_mut::<4>().0.par_iter_mut())
+            .for_each(|((((s0, s1), s2), s3), d)| {
+                d[0] = *s0;
+                d[1] = *s1;
+                d[2] = *s2;
+                d[3] = *s3;
+            });
+        Ok(())
+    }
+
     pub(crate) fn support_conversion(src: FourCharCode, dst: FourCharCode) -> bool {
         matches!(
             (src, dst),
             (NV12, RGB)
                 | (NV12, RGBA)
                 | (NV12, GREY)
-                | (NV12, YUYV)
                 | (NV16, RGB)
                 | (NV16, RGBA)
                 | (YUYV, RGB)
@@ -863,9 +963,6 @@ impl CPUConverter {
             (NV12, RGB) => Self::convert_nv12_to_rgb(src, dst),
             (NV12, RGBA) => Self::convert_nv12_to_rgba(src, dst),
             (NV12, GREY) => Self::convert_nv12_to_grey(src, dst),
-            (NV12, YUYV) => Self::convert_nv12_to_yuyv(src, dst),
-            (NV16, RGB) => Self::convert_nv16_to_rgb(src, dst),
-            (NV16, RGBA) => Self::convert_nv16_to_rgba(src, dst),
             (YUYV, RGB) => Self::convert_yuyv_to_rgb(src, dst),
             (YUYV, RGBA) => Self::convert_yuyv_to_rgba(src, dst),
             (YUYV, GREY) => Self::convert_yuyv_to_grey(src, dst),
@@ -894,6 +991,14 @@ impl CPUConverter {
             (GREY, PLANAR_RGB) => Self::convert_grey_to_8bps(src, dst),
             (GREY, PLANAR_RGBA) => Self::convert_grey_to_prgba(src, dst),
             (GREY, NV16) => Self::convert_grey_to_nv16(src, dst),
+
+            // the following converts are added for use in testing
+            (NV16, RGB) => Self::convert_nv16_to_rgb(src, dst),
+            (NV16, RGBA) => Self::convert_nv16_to_rgba(src, dst),
+            (PLANAR_RGB, RGB) => Self::convert_8bps_to_rgb(src, dst),
+            (PLANAR_RGB, RGBA) => Self::convert_8bps_to_rgba(src, dst),
+            (PLANAR_RGBA, RGB) => Self::convert_prgba_to_rgb(src, dst),
+            (PLANAR_RGBA, RGBA) => Self::convert_prgba_to_rgba(src, dst),
             (s, d) => Err(Error::NotSupported(format!(
                 "Conversion from {} to {}",
                 s.display(),
@@ -1297,8 +1402,9 @@ impl ImageConverterTrait for CPUConverter {
             (NV12, RGBA) => RGBA,
             (NV12, GREY) => GREY,
             (NV12, YUYV) => RGBA, // RGBA intermediary for YUYV dest resize/convert/rotation/flip
-            (NV16, RGB) => RGB,
-            (NV16, RGBA) => RGBA,
+            (NV12, NV16) => RGBA, // RGBA intermediary for YUYV dest resize/convert/rotation/flip
+            (NV12, PLANAR_RGB) => RGB,
+            (NV12, PLANAR_RGBA) => RGBA,
             (YUYV, RGB) => RGB,
             (YUYV, RGBA) => RGBA,
             (YUYV, GREY) => GREY,
@@ -1435,5 +1541,273 @@ impl ImageConverterTrait for CPUConverter {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cpu_tests {
+    use super::*;
+    use crate::{CPUConverter, Rotation};
+    use edgefirst_tensor::{TensorMapTrait, TensorMemory};
+
+    macro_rules! function {
+        () => {{
+            fn f() {}
+            fn type_name_of<T>(_: T) -> &'static str {
+                std::any::type_name::<T>()
+            }
+            let name = type_name_of(f);
+
+            // Find and cut the rest of the path
+            match &name[..name.len() - 3].rfind(':') {
+                Some(pos) => &name[pos + 1..name.len() - 3],
+                None => &name[..name.len() - 3],
+            }
+        }};
+    }
+
+    fn compare_images_convert_to_rgb(
+        img1: &TensorImage,
+        img2: &TensorImage,
+        threshold: f64,
+        name: &str,
+    ) {
+        assert_eq!(img1.height(), img2.height(), "Heights differ");
+        assert_eq!(img1.width(), img2.width(), "Widths differ");
+
+        let mut img_rgb1 =
+            TensorImage::new(img1.width(), img1.height(), RGB, Some(TensorMemory::Mem)).unwrap();
+        let mut img_rgb2 =
+            TensorImage::new(img1.width(), img1.height(), RGB, Some(TensorMemory::Mem)).unwrap();
+        CPUConverter::convert_format(img1, &mut img_rgb1).unwrap();
+        CPUConverter::convert_format(img2, &mut img_rgb2).unwrap();
+
+        let image1 = image::RgbImage::from_vec(
+            img_rgb1.width() as u32,
+            img_rgb1.height() as u32,
+            img_rgb1.tensor().map().unwrap().to_vec(),
+        )
+        .unwrap();
+
+        let image2 = image::RgbImage::from_vec(
+            img_rgb2.width() as u32,
+            img_rgb2.height() as u32,
+            img_rgb2.tensor().map().unwrap().to_vec(),
+        )
+        .unwrap();
+
+        let similarity = image_compare::rgb_similarity_structure(
+            &image_compare::Algorithm::RootMeanSquared,
+            &image1,
+            &image2,
+        )
+        .expect("Image Comparison failed");
+        if similarity.score < threshold {
+            // image1.save(format!("{name}_1.png"));
+            // image2.save(format!("{name}_2.png"));
+            similarity
+                .image
+                .to_color_map()
+                .save(format!("{name}.png"))
+                .unwrap();
+            panic!(
+                "{name}: converted image and target image have similarity score too low: {} < {}",
+                similarity.score, threshold
+            )
+        }
+    }
+
+    fn load_bytes_to_tensor(
+        width: usize,
+        height: usize,
+        fourcc: FourCharCode,
+        memory: Option<TensorMemory>,
+        bytes: &[u8],
+    ) -> Result<TensorImage, Error> {
+        let src = TensorImage::new(width, height, fourcc, memory)?;
+        src.tensor().map()?.as_mut_slice()[0..bytes.len()].copy_from_slice(bytes);
+        Ok(src)
+    }
+
+    macro_rules! generate_conversion_tests {
+        (
+        $src_fmt:ident,  $src_file:expr, $dst_fmt:ident, $dst_file:expr
+    ) => {{
+            // Load source
+            let src = load_bytes_to_tensor(
+                1280,
+                720,
+                $src_fmt,
+                None,
+                include_bytes!(concat!("../../../testdata/", $src_file)),
+            )?;
+
+            // Load destination reference
+            let dst = load_bytes_to_tensor(
+                1280,
+                720,
+                $dst_fmt,
+                None,
+                include_bytes!(concat!("../../../testdata/", $dst_file)),
+            )?;
+
+            let mut converter = CPUConverter::new();
+
+            let mut converted = TensorImage::new(
+                src.width(),
+                src.height(),
+                dst.fourcc(),
+                Some(TensorMemory::Mem),
+            )?;
+
+            converter.convert(
+                &src,
+                &mut converted,
+                Rotation::None,
+                Flip::None,
+                Crop::default(),
+            )?;
+
+            compare_images_convert_to_rgb(&dst, &converted, 0.99, function!());
+
+            Ok(())
+        }};
+    }
+
+    // let mut dsts = [yuyv, rgb, rgba, grey, nv16, planar_rgb, planar_rgba];
+
+    #[test]
+    fn test_cpu_yuyv_to_yuyv() -> Result<()> {
+        generate_conversion_tests!(YUYV, "camera720p.yuyv", YUYV, "camera720p.yuyv")
+    }
+
+    #[test]
+    fn test_cpu_yuyv_to_rgb() -> Result<()> {
+        generate_conversion_tests!(YUYV, "camera720p.yuyv", RGB, "camera720p.rgb")
+    }
+
+    #[test]
+    fn test_cpu_yuyv_to_rgba() -> Result<()> {
+        generate_conversion_tests!(YUYV, "camera720p.yuyv", RGBA, "camera720p.rgba")
+    }
+
+    #[test]
+    fn test_cpu_yuyv_to_grey() -> Result<()> {
+        generate_conversion_tests!(YUYV, "camera720p.yuyv", GREY, "camera720p.y800")
+    }
+
+    #[test]
+    fn test_cpu_yuyv_to_nv16() -> Result<()> {
+        generate_conversion_tests!(YUYV, "camera720p.yuyv", NV16, "camera720p.nv16")
+    }
+
+    #[test]
+    fn test_cpu_yuyv_to_planar_rgb() -> Result<()> {
+        generate_conversion_tests!(YUYV, "camera720p.yuyv", PLANAR_RGB, "camera720p.8bps")
+    }
+
+    #[test]
+    fn test_cpu_yuyv_to_planar_rgba() -> Result<()> {
+        generate_conversion_tests!(YUYV, "camera720p.yuyv", PLANAR_RGBA, "camera720p.8bpa")
+    }
+
+    #[test]
+    fn test_cpu_rgb_to_yuyv() -> Result<()> {
+        generate_conversion_tests!(RGB, "camera720p.rgb", YUYV, "camera720p.yuyv")
+    }
+
+    #[test]
+    fn test_cpu_rgb_to_rgb() -> Result<()> {
+        generate_conversion_tests!(RGB, "camera720p.rgb", RGB, "camera720p.rgb")
+    }
+
+    #[test]
+    fn test_cpu_rgb_to_rgba() -> Result<()> {
+        generate_conversion_tests!(RGB, "camera720p.rgb", RGBA, "camera720p.rgba")
+    }
+
+    #[test]
+    fn test_cpu_rgb_to_grey() -> Result<()> {
+        generate_conversion_tests!(RGB, "camera720p.rgb", GREY, "camera720p.y800")
+    }
+
+    #[test]
+    fn test_cpu_rgb_to_nv16() -> Result<()> {
+        generate_conversion_tests!(RGB, "camera720p.rgb", NV16, "camera720p.nv16")
+    }
+
+    #[test]
+    fn test_cpu_rgb_to_planar_rgb() -> Result<()> {
+        generate_conversion_tests!(RGB, "camera720p.rgb", PLANAR_RGB, "camera720p.8bps")
+    }
+
+    #[test]
+    fn test_cpu_rgb_to_planar_rgba() -> Result<()> {
+        generate_conversion_tests!(RGB, "camera720p.rgb", PLANAR_RGBA, "camera720p.8bpa")
+    }
+
+    #[test]
+    fn test_cpu_rgba_to_yuyv() -> Result<()> {
+        generate_conversion_tests!(RGBA, "camera720p.rgba", YUYV, "camera720p.yuyv")
+    }
+
+    #[test]
+    fn test_cpu_rgba_to_rgb() -> Result<()> {
+        generate_conversion_tests!(RGBA, "camera720p.rgba", RGB, "camera720p.rgb")
+    }
+
+    #[test]
+    fn test_cpu_rgba_to_rgba() -> Result<()> {
+        generate_conversion_tests!(RGBA, "camera720p.rgba", RGBA, "camera720p.rgba")
+    }
+
+    #[test]
+    fn test_cpu_rgba_to_grey() -> Result<()> {
+        generate_conversion_tests!(RGBA, "camera720p.rgba", GREY, "camera720p.y800")
+    }
+
+    #[test]
+    fn test_cpu_rgba_to_nv16() -> Result<()> {
+        generate_conversion_tests!(RGBA, "camera720p.rgba", NV16, "camera720p.nv16")
+    }
+
+    #[test]
+    fn test_cpu_rgba_to_planar_rgb() -> Result<()> {
+        generate_conversion_tests!(RGBA, "camera720p.rgba", PLANAR_RGB, "camera720p.8bps")
+    }
+
+    #[test]
+    fn test_cpu_rgba_to_planar_rgba() -> Result<()> {
+        generate_conversion_tests!(RGBA, "camera720p.rgba", PLANAR_RGBA, "camera720p.8bpa")
+    }
+
+    #[test]
+    fn test_cpu_nv12_to_rgb() -> Result<()> {
+        generate_conversion_tests!(NV12, "camera720p.nv12", RGB, "camera720p.rgb")
+    }
+
+    #[test]
+    fn test_cpu_nv12_to_rgba() -> Result<()> {
+        generate_conversion_tests!(NV12, "camera720p.nv12", RGBA, "camera720p.rgba")
+    }
+
+    #[test]
+    fn test_cpu_nv12_to_grey() -> Result<()> {
+        generate_conversion_tests!(NV12, "camera720p.nv12", GREY, "camera720p.y800")
+    }
+
+    #[test]
+    fn test_cpu_nv12_to_nv16() -> Result<()> {
+        generate_conversion_tests!(NV12, "camera720p.nv12", NV16, "camera720p.nv16")
+    }
+
+    #[test]
+    fn test_cpu_nv12_to_planar_rgb() -> Result<()> {
+        generate_conversion_tests!(NV12, "camera720p.nv12", PLANAR_RGB, "camera720p.8bps")
+    }
+
+    #[test]
+    fn test_cpu_nv12_to_planar_rgba() -> Result<()> {
+        generate_conversion_tests!(NV12, "camera720p.nv12", PLANAR_RGBA, "camera720p.8bpa")
     }
 }
