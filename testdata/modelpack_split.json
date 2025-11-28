@@ -1,0 +1,83 @@
+{
+    "outputs": [
+        {
+            "anchors": [
+                [
+                    0.36666667461395264,
+                    0.31481480598449707
+                ],
+                [
+                    0.38749998807907104,
+                    0.4740740656852722
+                ],
+                [
+                    0.5333333611488342,
+                    0.644444465637207
+                ]
+            ],
+            "decode": true,
+            "decoder": "modelpack",
+            "dtype": "uint8",
+            "index": 88,
+            "name": "PartitionedCall:1",
+            "output_index": 0,
+            "quantization": [
+                0.08547406643629074,
+                174
+            ],
+            "shape": [
+                1,
+                9,
+                15,
+                18
+            ],
+            "type": "detection"
+        },
+        {
+            "anchors": [
+                [
+                    0.13750000298023224,
+                    0.2074074000120163
+                ],
+                [
+                    0.2541666626930237,
+                    0.21481481194496155
+                ],
+                [
+                    0.23125000298023224,
+                    0.35185185074806213
+                ]
+            ],
+            "decode": true,
+            "decoder": "modelpack",
+            "dtype": "uint8",
+            "index": 89,
+            "name": "PartitionedCall:0",
+            "output_index": 1,
+            "quantization": [
+                0.09929127991199493,
+                183
+            ],
+            "shape": [
+                1,
+                17,
+                30,
+                18
+            ],
+            "type": "detection"
+        }
+    ],
+    "trainer": {
+        "batch_size": 16,
+        "checkpoint_path": "/work/trainer/artifacts",
+        "epochs": 50,
+        "weights": "coco"
+    },
+    "validation": {
+        "normalization": "unsigned",
+        "preprocessing": "resize",
+        "skip_validation_steps": 1,
+        "validation_iou": 0.1,
+        "validation_threshold": 0.025
+    }
+}
