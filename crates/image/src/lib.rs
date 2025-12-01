@@ -1136,7 +1136,12 @@ mod image_tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[cfg(feature = "opengl")]
     static GL_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+    #[cfg(target_os = "linux")]
+    #[cfg(feature = "opengl")]
     // Helper function to check if OpenGL is available
     fn is_opengl_available() -> bool {
         #[cfg(all(target_os = "linux", feature = "opengl"))]
@@ -2507,7 +2512,6 @@ mod image_tests {
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn test_nv12_to_rgba_cpu() {
         let file = include_bytes!("../../../testdata/zidane.nv12").to_vec();
         let src = TensorImage::new(1280, 720, NV12, None).unwrap();
@@ -2577,7 +2581,6 @@ mod image_tests {
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn test_nv12_to_yuyv_cpu() {
         let file = include_bytes!("../../../testdata/zidane.nv12").to_vec();
         let src = TensorImage::new(1280, 720, NV12, None).unwrap();
