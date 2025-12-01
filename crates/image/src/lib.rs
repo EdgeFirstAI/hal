@@ -53,6 +53,8 @@ Additionally the TensorMemory used by default allocations can be controlled usin
 uses system memory. This will disable the use of specialized memory regions for tensors
 and hardware acceleration. However, this will increase the performance of the CPU converter.
 */
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait as _};
 use enum_dispatch::enum_dispatch;
 use four_char_code::{FourCharCode, four_char_code};
@@ -199,14 +201,14 @@ impl TensorImage {
     ///
     /// # Examples
     /// ```rust
-    /// use edgefirst_image::{RGB, TensorImage};
+    /// use edgefirst_image::{RGBA, TensorImage};
     /// use edgefirst_tensor::TensorMemory;
     /// # fn main() -> Result<(), edgefirst_image::Error> {
-    /// let jpeg_bytes = include_bytes!("../../../testdata/zidane.jpg");
-    /// let img = TensorImage::load(jpeg_bytes, Some(RGB), Some(TensorMemory::Mem))?;
+    /// let jpeg_bytes = include_bytes!("../../../testdata/zidane.png");
+    /// let img = TensorImage::load(jpeg_bytes, Some(RGBA), Some(TensorMemory::Mem))?;
     /// assert_eq!(img.width(), 1280);
     /// assert_eq!(img.height(), 720);
-    /// assert_eq!(img.fourcc(), RGB);
+    /// assert_eq!(img.fourcc(), RGBA);
     /// # Ok(())
     /// # }
     /// ```
@@ -1022,6 +1024,7 @@ impl<T: Display> Drop for FunctionTimer<T> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod image_tests {
     use super::*;
     use crate::{CPUConverter, Rotation};
