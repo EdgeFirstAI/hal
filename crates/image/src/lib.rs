@@ -623,8 +623,38 @@ pub enum Rotation {
 impl Rotation {
     /// Creates a Rotation enum from an angle in degrees. The angle must be a
     /// multiple of 90.
+    ///
+    /// # Panics
+    /// Panics if the angle is not a multiple of 90.
+    ///
+    /// ```rust
+    /// # use edgefirst_image::Rotation;
+    /// # let rotation = Rotation::from_degrees_clockwise(0);
+    /// # assert_eq!(rotation, Rotation::None);
+    /// ```
+    /// ```rust
+    /// # use edgefirst_image::Rotation;
+    /// # let rotation = Rotation::from_degrees_clockwise(90);
+    /// # assert_eq!(rotation, Rotation::Clockwise90);
+    /// ```
+    /// ```rust
+    /// # use edgefirst_image::Rotation;
+    /// # let rotation = Rotation::from_degrees_clockwise(180);
+    /// # assert_eq!(rotation, Rotation::Rotate180);
+    /// ```
+    /// ```rust
+    /// use edgefirst_image::Rotation;
+    /// let rotation = Rotation::from_degrees_clockwise(270);
+    /// assert_eq!(rotation, Rotation::CounterClockwise90);
+    /// ```
+    ///
+    ///   ```rust
+    /// use edgefirst_image::Rotation;
+    /// let rotation = Rotation::from_degrees_clockwise(270);
+    /// assert_eq!(rotation, Rotation::CounterClockwise90);
+    /// ```
     pub fn from_degrees_clockwise(angle: usize) -> Rotation {
-        match angle.rem_euclid(90) {
+        match angle.rem_euclid(360) {
             0 => Rotation::None,
             90 => Rotation::Clockwise90,
             180 => Rotation::Rotate180,
@@ -1017,6 +1047,43 @@ mod image_tests {
                 None => &name[..name.len() - 3],
             }
         }};
+    }
+
+    #[test]
+    fn test_invalid_crop() {
+        let src = TensorImage::new(100, 100, RGB, None).unwrap();
+        let dst = TensorImage::new(100, 100, RGB, None).unwrap();
+
+        let crop = Crop::new()
+            .with_src_rect(Some(Rect::new(50, 50, 60, 60)))
+            .with_dst_rect(Some(Rect::new(0, 0, 150, 150)));
+
+        let result = crop.check_crop(&src, &dst);
+        assert!(matches!(
+            result,
+            Err(Error::CropInvalid(e)) if e.starts_with("Dest and Src crop invalid")
+        ));
+
+        let crop = crop.with_src_rect(Some(Rect::new(0, 0, 10, 10)));
+        let result = crop.check_crop(&src, &dst);
+        assert!(matches!(
+            result,
+            Err(Error::CropInvalid(e)) if e.starts_with("Dest crop invalid")
+        ));
+
+        let crop = crop
+            .with_src_rect(Some(Rect::new(50, 50, 60, 60)))
+            .with_dst_rect(Some(Rect::new(0, 0, 50, 50)));
+        let result = crop.check_crop(&src, &dst);
+        assert!(matches!(
+            result,
+            Err(Error::CropInvalid(e)) if e.starts_with("Src crop invalid")
+        ));
+
+        let crop = crop.with_src_rect(Some(Rect::new(50, 50, 50, 50)));
+
+        let result = crop.check_crop(&src, &dst);
+        assert!(result.is_ok());
     }
 
     #[test]

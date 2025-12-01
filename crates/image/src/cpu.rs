@@ -2219,16 +2219,7 @@ mod cpu_tests {
             &mut converted,
             Rotation::None,
             Flip::None,
-            Crop {
-                src_rect: Some(Rect {
-                    left: 0,
-                    top: 0,
-                    width: 1,
-                    height: 1,
-                }),
-                dst_rect: None,
-                dst_color: None,
-            },
+            Crop::new().with_src_rect(Some(Rect::new(0, 0, 1, 1))),
         )?;
 
         assert_eq!(
@@ -2253,11 +2244,7 @@ mod cpu_tests {
             &mut converted,
             Rotation::None,
             Flip::None,
-            Crop {
-                src_rect: None,
-                dst_rect: Some(Rect::new(0, 0, 2, 1)),
-                dst_color: None,
-            },
+            Crop::new().with_dst_rect(Some(Rect::new(0, 0, 2, 1))),
         )?;
 
         assert_eq!(

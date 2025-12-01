@@ -2459,9 +2459,9 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "yuv"
-version = "0.8.8"
+version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30078f3e5790a2127f89c57c4ccb46d060205bf2c4c267f77cd08fb5c02c6d79"
+checksum = "28f1bad143caadcfcaec93039dc9c40a30fc86f23d9e7cc03764a39fe51d9d43"
 dependencies = [
  "num-traits",
 ]
