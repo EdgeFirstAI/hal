@@ -1,0 +1,22 @@
+# cargo-nextest configuration
+# Reference: https://nexte.st/book/configuration.html
+
+[profile.default]
+# JUnit XML output for CI test reporting
+junit.path = "target/nextest/default/test-results.xml"
+junit.store-success-output = true
+junit.store-failure-output = true
+
+# Fail fast on first test failure (can be overridden with --no-fail-fast)
+fail-fast = true
+
+# Retry flaky tests once before marking as failed
+retries = 1
+
+[profile.ci]
+# CI profile with more retries and no fail-fast
+fail-fast = false
+retries = 2
+junit.path = "target/nextest/ci/test-results.xml"
+junit.store-success-output = true
+junit.store-failure-output = true

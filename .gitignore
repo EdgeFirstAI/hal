@@ -12,3 +12,14 @@ cobertura.xml
 coverage.xml
 .DS_Store
 *.jpg
+
+*sbom.json
+*.cdx.json
+
+# Ignore Local Notes
+/AUDIT.md
+/STATUS.md
+/TODO.md
+
+/SPS/
+/WP1/
