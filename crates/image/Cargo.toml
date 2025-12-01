@@ -48,3 +48,6 @@ image-compare = { workspace = true }
 [[bench]]
 name = "image_benchmark"
 harness = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }

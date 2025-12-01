@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 use crate::{
     Crop, Error, Flip, FunctionTimer, GREY, ImageConverterTrait, NV12, NV16, PLANAR_RGB,
     PLANAR_RGBA, RGB, RGBA, Rect, Result, Rotation, TensorImage, YUYV,
@@ -1579,7 +1581,9 @@ impl ImageConverterTrait for CPUConverter {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod cpu_tests {
+
     use super::*;
     use crate::{CPUConverter, Rotation};
     use edgefirst_tensor::{TensorMapTrait, TensorMemory};
