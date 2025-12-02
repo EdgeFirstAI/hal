@@ -51,23 +51,15 @@ env:
 
 jobs:
   # ===========================================================================
-  # Build and Test on GitHub-hosted runners (x86_64 and aarch64)
+  # Build and Test on x86_64 (GitHub-hosted runner with Docker)
   # ===========================================================================
-  build-and-test:
-    name: Build & Test (${{ matrix.platform.name }})
-    runs-on: ${{ matrix.platform.runner }}
+  build-and-test-x86:
+    name: Build & Test (x86_64)
+    runs-on: ubuntu-22.04
     permissions:
       contents: read
       checks: write
       pull-requests: write
-    strategy:
-      matrix:
-        platform:
-          - name: x86_64
-            runner: ubuntu-22.04
-          - name: aarch64
-            runner: ubuntu-22.04-arm-private
-      fail-fast: false
 
     steps:
       - name: Checkout code
@@ -130,7 +122,7 @@ jobs:
           set -o pipefail
           /usr/bin/time -v cargo llvm-cov nextest --cargo-profile profiling --all-features --workspace \
             --exclude edgefirst_hal --lcov --output-path target/coverage_rust.lcov \
-            2>&1 | tee target/test-metrics-rust-${{ matrix.platform.name }}.txt
+            2>&1 | tee target/test-metrics-rust-x86_64.txt
 
       - name: Run Python tests with coverage
         run: |
@@ -138,10 +130,123 @@ jobs:
           source <(cargo llvm-cov show-env --export-prefix)
           /usr/bin/time -v venv/bin/python -m slipcover --xml --out target/coverage_python.xml \
             -m pytest tests/ -v --tb=short --junitxml=target/pytest_results.xml \
-            2>&1 | tee target/test-metrics-python-${{ matrix.platform.name }}.txt
+            2>&1 | tee target/test-metrics-python-x86_64.txt
 
-      - name: Build instrumented test binaries for hardware (aarch64 only)
-        if: matrix.platform.name == 'aarch64'
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        if: always()
+        with:
+          name: coverage-x86_64
+          path: |
+            target/coverage_rust.lcov
+            target/coverage_python.xml
+          retention-days: 30
+
+      - name: Upload test results
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        if: always()
+        with:
+          name: test-results-x86_64
+          path: |
+            target/pytest_results.xml
+            target/nextest/default/test-results.xml
+            target/test-metrics-*-x86_64.txt
+          retention-days: 30
+
+      - name: Publish test results
+        uses: EnricoMi/publish-unit-test-result-action@6e8f8c55b476f977d1c58cfbd7e337cbf86d917f  # v2
+        if: always()
+        with:
+          files: |
+            target/pytest_results.xml
+            target/nextest/default/test-results.xml
+          check_name: Test Results (x86_64)
+          comment_mode: always
+          ignore_runs: true
+
+  # ===========================================================================
+  # Build and Test on aarch64 (Self-hosted runner WITHOUT Docker)
+  # ===========================================================================
+  build-and-test-arm:
+    name: Build & Test (aarch64)
+    runs-on: ubuntu-22.04-arm-private
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Checkout LFS objects
+        run: git lfs checkout
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up Python virtual environment
+        run: |
+          python3 -m venv venv
+          echo "${{ github.workspace }}/venv/bin" >> $GITHUB_PATH
+          venv/bin/pip install --upgrade pip setuptools wheel
+          venv/bin/pip install maturin[patchelf] slipcover pytest pytest-timeout
+          venv/bin/pip install tensorflow pyyaml numpy
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
+        with:
+          toolchain: stable
+          components: llvm-tools-preview, clippy, rustfmt
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db  # v2
+        with:
+          shared-key: rust-aarch64
+          cache-on-failure: true
+
+      - name: Install cargo tools
+        uses: taiki-e/install-action@92e6dd1c202153a204d471a3c509bf1e03dcfa44  # v2
+        with:
+          tool: cargo-llvm-cov@0.6.16,cargo-nextest
+
+      - name: Check Rust formatting
+        run: cargo +nightly fmt --all -- --check 2>/dev/null || cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Build with coverage instrumentation
+        run: |
+          source <(cargo llvm-cov show-env --export-prefix)
+          cargo build --profile profiling --all-features --workspace
+
+      - name: Build Python bindings
+        run: |
+          source <(cargo llvm-cov show-env --export-prefix)
+          venv/bin/pip install crates/python/[test]
+
+      - name: Run Rust tests with coverage
+        run: |
+          set -o pipefail
+          /usr/bin/time -v cargo llvm-cov nextest --cargo-profile profiling --all-features --workspace \
+            --exclude edgefirst_hal --lcov --output-path target/coverage_rust.lcov \
+            2>&1 | tee target/test-metrics-rust-aarch64.txt
+
+      - name: Run Python tests with coverage
+        run: |
+          set -o pipefail
+          source <(cargo llvm-cov show-env --export-prefix)
+          /usr/bin/time -v venv/bin/python -m slipcover --xml --out target/coverage_python.xml \
+            -m pytest tests/ -v --tb=short --junitxml=target/pytest_results.xml \
+            2>&1 | tee target/test-metrics-python-aarch64.txt
+
+      - name: Build instrumented test binaries for hardware
         run: |
           source <(cargo llvm-cov show-env --export-prefix)
           cargo nextest run --workspace --all-features --no-run --cargo-profile profiling
@@ -159,7 +264,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         if: always()
         with:
-          name: coverage-${{ matrix.platform.name }}
+          name: coverage-aarch64
           path: |
             target/coverage_rust.lcov
             target/coverage_python.xml
@@ -169,16 +274,16 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         if: always()
         with:
-          name: test-results-${{ matrix.platform.name }}
+          name: test-results-aarch64
           path: |
             target/pytest_results.xml
             target/nextest/default/test-results.xml
-            target/test-metrics-*-${{ matrix.platform.name }}.txt
+            target/test-metrics-*-aarch64.txt
           retention-days: 30
 
-      - name: Upload hardware test artifacts (aarch64 only)
+      - name: Upload hardware test artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
-        if: matrix.platform.name == 'aarch64'
+        if: always()
         with:
           name: build-aarch64
           path: |
@@ -188,26 +293,12 @@ jobs:
             target/llvm-cov-target/
           retention-days: 7
 
-      # Note: Self-hosted ARM runner doesn't have Docker, so we skip test publishing
-      # on aarch64 and rely on artifact uploads. Test results are published by the
-      # SonarCloud job summary instead.
-      - name: Publish test results (x86_64 only)
-        uses: EnricoMi/publish-unit-test-result-action@6e8f8c55b476f977d1c58cfbd7e337cbf86d917f  # v2
-        if: always() && matrix.platform.name == 'x86_64'
-        with:
-          files: |
-            target/pytest_results.xml
-            target/nextest/default/test-results.xml
-          check_name: Test Results (${{ matrix.platform.name }})
-          comment_mode: always
-          ignore_runs: true
-
   # ===========================================================================
   # Hardware Testing + Benchmarks on NXP i.MX8M Plus
   # ===========================================================================
   hardware-test:
     name: Hardware Test (imx8mp)
-    needs: build-and-test
+    needs: build-and-test-arm
     runs-on: nxp-imx8mp-latest
     permissions:
       contents: read
@@ -364,7 +455,7 @@ jobs:
   # ===========================================================================
   process-hardware-coverage:
     name: Process Hardware Coverage
-    needs: [build-and-test, hardware-test]
+    needs: [build-and-test-arm, hardware-test]
     runs-on: ubuntu-22.04-arm-private
     permissions:
       contents: read
@@ -443,7 +534,7 @@ jobs:
   # ===========================================================================
   sonarcloud:
     name: SonarCloud Analysis
-    needs: [build-and-test, hardware-test, process-hardware-coverage]
+    needs: [build-and-test-x86, build-and-test-arm, hardware-test, process-hardware-coverage]
     runs-on: ubuntu-22.04
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     permissions:
