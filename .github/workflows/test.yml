@@ -17,6 +17,7 @@
 # - taiki-e/install-action@92e6dd1c202153a204d471a3c509bf1e03dcfa44 (v2)
 # - SonarSource/sonarqube-scan-action@689fb39b34b9aa95ebc5f8f119343ddd51542402 (v4)
 # - EnricoMi/publish-unit-test-result-action@6e8f8c55b476f977d1c58cfbd7e337cbf86d917f (v2)
+# - EnricoMi/publish-unit-test-result-action/linux@6e8f8c55b476f977d1c58cfbd7e337cbf86d917f (v2, composite for non-Docker runners)
 #
 # Runner Notes:
 # - ubuntu-22.04: Standard GitHub-hosted runner (x86_64)
@@ -187,9 +188,21 @@ jobs:
             target/llvm-cov-target/
           retention-days: 7
 
-      - name: Publish test results
+      # Use composite action for aarch64 (no Docker), Docker action for x86_64
+      - name: Publish test results (x86_64)
         uses: EnricoMi/publish-unit-test-result-action@6e8f8c55b476f977d1c58cfbd7e337cbf86d917f  # v2
-        if: always()
+        if: always() && matrix.platform.name == 'x86_64'
+        with:
+          files: |
+            target/pytest_results.xml
+            target/nextest/default/test-results.xml
+          check_name: Test Results (${{ matrix.platform.name }})
+          comment_mode: always
+          ignore_runs: true
+
+      - name: Publish test results (aarch64)
+        uses: EnricoMi/publish-unit-test-result-action/linux@6e8f8c55b476f977d1c58cfbd7e337cbf86d917f  # v2
+        if: always() && matrix.platform.name == 'aarch64'
         with:
           files: |
             target/pytest_results.xml
@@ -337,7 +350,7 @@ jobs:
           retention-days: 90
 
       - name: Publish test results
-        uses: EnricoMi/publish-unit-test-result-action@6e8f8c55b476f977d1c58cfbd7e337cbf86d917f  # v2
+        uses: EnricoMi/publish-unit-test-result-action/linux@6e8f8c55b476f977d1c58cfbd7e337cbf86d917f  # v2 (composite, no Docker)
         if: always()
         with:
           files: |
@@ -535,13 +548,20 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db  # v2
         with:
-          shared-key: python-${{ matrix.python-version }}
+          # Unique key per Python version to avoid glibc contamination
+          shared-key: python-compat-${{ matrix.python-version }}
           cache-on-failure: true
+
+      - name: Clean stale build artifacts
+        run: |
+          # Remove any cached build scripts that may have glibc incompatibilities
+          rm -rf target/release/build/ target/debug/build/ 2>/dev/null || true
 
       - name: Build and test
         run: |
-          pip install maturin[patchelf]
+          pip install maturin[patchelf,zig]
           pip install crates/python/[test]
-          maturin build -m crates/python/Cargo.toml --release
+          # Use zig linker for manylinux2014 compatibility (portable glibc)
+          maturin build -m crates/python/Cargo.toml --release --zig --compatibility manylinux2014
           pip install target/wheels/*.whl --force-reinstall --no-deps
           python -m pytest tests/ -v --tb=short
