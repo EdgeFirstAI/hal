@@ -8,15 +8,15 @@
 #   - Benchmarks on target hardware
 #
 # Action Versions (hash-pinned per SPS v2.1):
-# - actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 (v4.2.2)
-# - actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b (v5.3.0)
-# - actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 (v4.4.3)
-# - actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 (v4.1.8)
-# - dtolnay/rust-toolchain@7b1c307e0dcbda6122208f10795a713336a9b35a (stable)
+# - actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 (v4)
+# - actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 (v5)
+# - actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 (v4)
+# - actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 (v4)
+# - dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b (stable)
 # - Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db (v2)
-# - taiki-e/install-action@735e5133943fea5c139b98a00d160e1702de3b08 (v2.49.1)
-# - SonarSource/sonarqube-scan-action@e44258b109568baa0df60ed515909fc6c72cba92 (v6)
-# - EnricoMi/publish-unit-test-result-action@170bf24d20d201b842d7a52403b73ed297e6645b (v2.18.0)
+# - taiki-e/install-action@92e6dd1c202153a204d471a3c509bf1e03dcfa44 (v2)
+# - SonarSource/sonarqube-scan-action@689fb39b34b9aa95ebc5f8f119343ddd51542402 (v4)
+# - EnricoMi/publish-unit-test-result-action@6e8f8c55b476f977d1c58cfbd7e337cbf86d917f (v2)
 #
 # Runner Notes:
 # - ubuntu-22.04: Standard GitHub-hosted runner (x86_64)
@@ -70,7 +70,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           fetch-depth: 0
           lfs: true
@@ -79,7 +79,7 @@ jobs:
         run: git lfs checkout
 
       - name: Set up Python
-        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
@@ -92,7 +92,7 @@ jobs:
           venv/bin/pip install tensorflow pyyaml numpy
 
       - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@7b1c307e0dcbda6122208f10795a713336a9b35a  # stable
+        uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
         with:
           toolchain: stable
           components: llvm-tools-preview, clippy, rustfmt
@@ -104,7 +104,7 @@ jobs:
           cache-on-failure: true
 
       - name: Install cargo tools
-        uses: taiki-e/install-action@735e5133943fea5c139b98a00d160e1702de3b08  # v2.49.1
+        uses: taiki-e/install-action@92e6dd1c202153a204d471a3c509bf1e03dcfa44  # v2
         with:
           tool: cargo-llvm-cov@0.6.16,cargo-nextest
 
@@ -155,7 +155,7 @@ jobs:
           ls -la target/tests/ || echo "No test binaries found"
 
       - name: Upload coverage artifacts
-        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882  # v4.4.3
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         if: always()
         with:
           name: coverage-${{ matrix.platform.name }}
@@ -165,7 +165,7 @@ jobs:
           retention-days: 30
 
       - name: Upload test results
-        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882  # v4.4.3
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         if: always()
         with:
           name: test-results-${{ matrix.platform.name }}
@@ -176,7 +176,7 @@ jobs:
           retention-days: 30
 
       - name: Upload hardware test artifacts (aarch64 only)
-        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882  # v4.4.3
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         if: matrix.platform.name == 'aarch64'
         with:
           name: build-aarch64
@@ -188,7 +188,7 @@ jobs:
           retention-days: 7
 
       - name: Publish test results
-        uses: EnricoMi/publish-unit-test-result-action@170bf24d20d201b842d7a52403b73ed297e6645b  # v2.18.0
+        uses: EnricoMi/publish-unit-test-result-action@6e8f8c55b476f977d1c58cfbd7e337cbf86d917f  # v2
         if: always()
         with:
           files: |
@@ -217,7 +217,7 @@ jobs:
           find . -name "*.gcda" -o -name "*.profraw" -delete 2>/dev/null || true
 
       - name: Checkout code
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           lfs: true
 
@@ -225,7 +225,7 @@ jobs:
         run: git lfs checkout
 
       - name: Download aarch64 build artifacts
-        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16  # v4.1.8
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: build-aarch64
           path: build/
@@ -308,7 +308,7 @@ jobs:
         run: python3 scripts/generate_junit_xml.py build/rust-test-results build/rust_hardware_results.xml
 
       - name: Upload coverage artifacts
-        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882  # v4.4.3
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         if: always()
         with:
           name: coverage-imx8mp
@@ -318,7 +318,7 @@ jobs:
           retention-days: 30
 
       - name: Upload test results
-        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882  # v4.4.3
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         if: always()
         with:
           name: test-results-imx8mp
@@ -329,7 +329,7 @@ jobs:
           retention-days: 30
 
       - name: Upload benchmark results
-        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882  # v4.4.3
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         if: always() && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
         with:
           name: benchmark-results
@@ -337,7 +337,7 @@ jobs:
           retention-days: 90
 
       - name: Publish test results
-        uses: EnricoMi/publish-unit-test-result-action@170bf24d20d201b842d7a52403b73ed297e6645b  # v2.18.0
+        uses: EnricoMi/publish-unit-test-result-action@6e8f8c55b476f977d1c58cfbd7e337cbf86d917f  # v2
         if: always()
         with:
           files: |
@@ -363,22 +363,22 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
       - name: Download build artifacts (contains llvm-cov-target)
-        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16  # v4.1.8
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: build-aarch64
           path: build/
 
       - name: Download imx8mp coverage (contains profraw files)
-        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16  # v4.1.8
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: coverage-imx8mp
           path: coverage-imx8mp/
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@7b1c307e0dcbda6122208f10795a713336a9b35a  # stable
+        uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
         with:
           toolchain: stable
           components: llvm-tools-preview
@@ -422,7 +422,7 @@ jobs:
           echo "Generated coverage_rust_imx8mp.lcov: $(wc -l < output/coverage_rust_imx8mp.lcov) lines"
 
       - name: Upload processed coverage
-        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882  # v4.4.3
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: coverage-imx8mp-processed
           path: |
@@ -444,12 +444,12 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           fetch-depth: 0
 
       - name: Download all coverage artifacts
-        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16  # v4.1.8
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           pattern: coverage-*
           path: coverage/
@@ -473,7 +473,7 @@ jobs:
           echo "PYTHON_COVERAGE_PATHS=$PYTHON_REPORTS" >> $GITHUB_ENV
 
       - name: Run SonarCloud scan
-        uses: SonarSource/sonarqube-scan-action@e44258b109568baa0df60ed515909fc6c72cba92  # v6
+        uses: SonarSource/sonarqube-scan-action@689fb39b34b9aa95ebc5f8f119343ddd51542402  # v4
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -515,7 +515,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           lfs: true
 
@@ -523,12 +523,12 @@ jobs:
         run: git lfs checkout
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@7b1c307e0dcbda6122208f10795a713336a9b35a  # stable
+        uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
         with:
           toolchain: stable
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: ${{ matrix.python-version }}
 
