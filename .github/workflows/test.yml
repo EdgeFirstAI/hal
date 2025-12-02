@@ -200,6 +200,12 @@ jobs:
           comment_mode: always
           ignore_runs: true
 
+      - name: Install Python venv for test publisher (aarch64)
+        if: always() && matrix.platform.name == 'aarch64'
+        run: |
+          # ARM runners have minimal Python - install venv/pip for the test publisher
+          sudo apt-get update && sudo apt-get install -y python3-venv python3-pip
+
       - name: Publish test results (aarch64)
         uses: EnricoMi/publish-unit-test-result-action/linux@6e8f8c55b476f977d1c58cfbd7e337cbf86d917f  # v2
         if: always() && matrix.platform.name == 'aarch64'
@@ -349,16 +355,19 @@ jobs:
           path: benchmark-results/
           retention-days: 90
 
-      - name: Publish test results
-        uses: EnricoMi/publish-unit-test-result-action/linux@6e8f8c55b476f977d1c58cfbd7e337cbf86d917f  # v2 (composite, no Docker)
+      # Note: imx8mp is an embedded device without Docker/full Python tooling
+      # Test results are uploaded as artifacts; skip the publish action here
+      - name: Test results summary (imx8mp)
         if: always()
-        with:
-          files: |
-            build/pytest_results.xml
-            build/rust_hardware_results.xml
-          check_name: Test Results (imx8mp)
-          comment_mode: always
-          ignore_runs: true
+        run: |
+          echo "## Hardware Test Results (imx8mp)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f build/pytest_results.xml ]; then
+            echo "Python tests completed - see artifacts for details" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -f build/rust_hardware_results.xml ]; then
+            echo "Rust tests completed - see artifacts for details" >> $GITHUB_STEP_SUMMARY
+          fi
 
       - name: Generate benchmark summary
         if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
