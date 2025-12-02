@@ -13,7 +13,7 @@
 # - actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 (v4.4.3)
 # - actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 (v4.1.8)
 # - dtolnay/rust-toolchain@7b1c307e0dcbda6122208f10795a713336a9b35a (stable)
-# - Swatinem/rust-cache@82a92a5b8b938b84d92384cb7f96219435c6f0e0 (v2.7.7)
+# - Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db (v2)
 # - taiki-e/install-action@735e5133943fea5c139b98a00d160e1702de3b08 (v2.49.1)
 # - SonarSource/sonarqube-scan-action@e44258b109568baa0df60ed515909fc6c72cba92 (v6)
 # - EnricoMi/publish-unit-test-result-action@170bf24d20d201b842d7a52403b73ed297e6645b (v2.18.0)
@@ -98,7 +98,7 @@ jobs:
           components: llvm-tools-preview, clippy, rustfmt
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@82a92a5b8b938b84d92384cb7f96219435c6f0e0  # v2.7.7
+        uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db  # v2
         with:
           shared-key: rust-${{ matrix.platform.name }}
           cache-on-failure: true
@@ -533,7 +533,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Cache Rust build
-        uses: Swatinem/rust-cache@82a92a5b8b938b84d92384cb7f96219435c6f0e0  # v2.7.7
+        uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db  # v2
         with:
           shared-key: python-${{ matrix.python-version }}
           cache-on-failure: true
