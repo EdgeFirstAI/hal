@@ -1,77 +1,21 @@
-# EdgeFirst Hardware Abstraction Layer
+# EdgeFirst Hardware Abstraction Layer - Architecture
 
-[![Build Status](https://github.com/EdgeFirstAI/hal/workflows/CI/badge.svg)](https://github.com/EdgeFirstAI/hal/actions)
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Crates.io](https://img.shields.io/crates/v/edgefirst.svg)](https://crates.io/crates/edgefirst)
-[![PyPI](https://img.shields.io/pypi/v/edgefirst-hal.svg)](https://pypi.org/project/edgefirst-hal/)
+**Version:** 2.0  
+**Last Updated:** November 20, 2025  
+**Status:** Production
+**Audience:** Developers contributing to EdgeFirst HAL or integrating it into applications
+
+---
+
+## Overview
 
 The EdgeFirst Hardware Abstraction Layer (HAL) is a Rust-based system that provides hardware-accelerated abstractions for computer vision and machine learning tasks on embedded Linux platforms. The HAL consists of multiple specialized crates that work together to provide high-performance image processing, tensor operations, model inference decoding, and object tracking.
-
-## Features
-
-- ✨ **Zero-Copy Memory Management** - DMA-heap optimized tensors with automatic fallback
-- 🚀 **Hardware-Accelerated Image Processing** - G2D, OpenGL, and optimized CPU paths
-- 🎯 **YOLO Decoder** - YOLOv5/v8/v11 detection and segmentation support
-- 🔌 **Python Bindings** - PyO3-based API with numpy integration
-- ⚡ **Multi-Object Tracking** - ByteTrack algorithm with Kalman filtering
-- 🔧 **Cross-Platform** - Linux (i.MX optimized), macOS, Windows support
-- 📊 **Mixed Precision** - Support for quantized and float models
-- 🏭 **Production Ready** - The EdgeFirst suite of components for production AI deployments at the edge.
-- 🖥️ **Hardware Optimized** - Accelerated on NXP i.MX platforms with NPU/GPU support
-
-## Quick Start
-
-### Installation
-
-#### Python
-```bash
-pip install edgefirst-hal
-```
-
-#### Rust
-```toml
-[dependencies]
-edgefirst = "0.1.0"
-```
-
-### Basic Usage
-
-#### Python
-```python
-import edgefirst_hal as ef
-
-# Load and process image
-img = ef.TensorImage.load("image.jpg", ef.FourCC.RGB)
-converter = ef.ImageConverter()
-output = ef.TensorImage(640, 640)
-converter.convert(img, output)
-
-# Decode YOLO outputs
-decoder = ef.Decoder(config, 0.5, 0.45)
-boxes, scores, classes = decoder.decode([output0, output1])
-```
-
-#### Rust
-```rust
-use edgefirst::image::{TensorImage, ImageConverter};
-use edgefirst::decoder::Decoder;
-
-// Load and process image
-let input = TensorImage::load("image.jpg", Some(RGB), None)?;
-let mut converter = ImageConverter::new()?;
-let mut output = TensorImage::new(640, 640, RGB, None)?;
-converter.convert(&input, &mut output, Default::default())?;
-
-// Decode model outputs
-let decoder = Decoder::new(config, 0.5, 0.45)?;
-let (boxes, scores, classes) = decoder.decode_detection(&outputs)?;
-```
 
 ## System Architecture
 
 ```mermaid
 graph TB
-    subgraph "EdgeFirst HAL Ecosystem"
+    subgraph "EdgeFirst HAL"
         Python["Python Bindings (edgefirst-hal)<br/>PyO3-based Python API exposing core functionality"]
         Main["Main HAL Crate (edgefirst)<br/>Re-exports tensor, image, decoder"]
         
@@ -211,15 +155,26 @@ Planar RGB (FourCC: 8BPS) stores color channels in separate planes rather than i
 flowchart TD
     Input[Input Image<br/>JPEG/PNG bytes or raw pixels]
     TI[TensorImage<br/>Tensor&lt;u8&gt; + FourCC format]
-    Conv[ImageConverter::convert<br/>1. Check if G2D can handle<br/>2. Fallback to CPU if needed<br/>3. Apply transforms]
+    Conv{ImageConverter::convert<br/>Backend selection}
+    G2D[G2D Acceleration<br/>NXP i.MX only]
+    GL[OpenGL Acceleration<br/>GPU accelerated]
+    CPU[CPU Fallback<br/>fast_image_resize]
     Output[Output Image<br/>TensorImage or numpy array]
     
     Input --> TI
     TI --> Conv
-    Conv --> Output
+    Conv -->|Supported on i.MX| G2D
+    Conv -->|Linux with GPU| GL
+    Conv -->|Always available| CPU
+    G2D --> Output
+    GL --> Output
+    CPU --> Output
     
     style TI fill:#e1f5ff
     style Conv fill:#fff4e1
+    style G2D fill:#90ee90
+    style GL fill:#87ceeb
+    style CPU fill:#ffeb9c
     style Output fill:#e8f5e9
 ```
 
@@ -378,12 +333,9 @@ flowchart LR
 - IOCTL interface for DMA buffer operations
 - Version detection and capability queries
 
-## Advanced Examples
+## Common API Usage Patterns
 
-<details>
-<summary><b>Rust Examples</b></summary>
-
-### Image Conversion
+### Pattern 1: Basic Image Conversion
 
 ```rust
 use edgefirst::image::{TensorImage, ImageConverter, RGBA, RGB};
@@ -402,7 +354,7 @@ let mut output = TensorImage::new(640, 640, RGB, Some(TensorMemory::Dma))?;
 converter.convert(&input, &mut output, Default::default())?;
 ```
 
-### Detection Decoding
+### Pattern 2: Detection Decoding
 
 ```rust
 use edgefirst::decoder::Decoder;
@@ -419,7 +371,19 @@ let outputs = vec![boxes_tensor, scores_tensor];
 let (bboxes, scores, classes) = decoder.decode_detection(&outputs)?;
 ```
 
-### Multi-Frame Tracking
+**Python Example**:
+```python
+import edgefirst_hal
+import numpy as np
+
+# Create decoder from config dict or YAML
+decoder = edgefirst_hal.Decoder(config_dict, 0.5, 0.45)
+
+# Decode outputs (automatically handles quantization)
+boxes, scores, classes = decoder.decode([output0, output1])
+```
+
+### Pattern 3: Multi-Frame Tracking
 
 ```rust
 use edgefirst::tracker::{ByteTrack, Tracker, DetectionBox};
@@ -436,7 +400,7 @@ for frame in video_frames {
 }
 ```
 
-### Zero-Copy Tensor Sharing
+### Pattern 4: Zero-Copy Tensor Sharing
 
 ```rust
 use edgefirst::tensor::{Tensor, TensorTrait};
@@ -452,12 +416,7 @@ let fd = tensor.clone_fd()?;
 let shared_tensor = Tensor::<u8>::from_fd(fd, &[1920, 1080, 3], None)?;
 ```
 
-</details>
-
-<details>
-<summary><b>Python Examples</b></summary>
-
-### Image Processing
+### Pattern 5: Python API Usage
 
 ```python
 import edgefirst_hal as ef
@@ -479,21 +438,6 @@ converter.convert(tensor_img, output)
 output_array = np.zeros((640, 640, 3), dtype=np.uint8)
 output.normalize_to_numpy(output_array)
 ```
-
-### Object Detection
-
-```python
-import edgefirst_hal
-import numpy as np
-
-# Create decoder from config dict or YAML
-decoder = edgefirst_hal.Decoder(config_dict, 0.5, 0.45)
-
-# Decode outputs (automatically handles quantization)
-boxes, scores, classes = decoder.decode([output0, output1])
-```
-
-</details>
 
 ## Design Patterns
 
@@ -535,19 +479,35 @@ Python wrapper types use a `Py` prefix (e.g., `PyTensor`, `PyTensorImage`) to cl
 
 ### Memory Allocation Strategy
 
-1. **DMA Heap**: Fastest for hardware accelerators, zero-copy to GPU/NPU
-2. **Shared Memory**: Fast for IPC, works across processes
-3. **Heap Memory**: Fallback for compatibility, still performant with SIMD
+The choice of memory type significantly impacts performance depending on the workload:
+
+1. **Heap Memory** (`MemTensor<T>`): Fastest for pure CPU algorithms (image resizing, filtering, format conversion). Standard heap allocation has minimal overhead and is optimized by the OS. Recommended when no hardware acceleration is required.
+
+2. **DMA Memory** (`DmaTensor<T>`): Introduces CPU-level overhead for allocation and memory mapping, but provides substantial benefits when interfacing with hardware accelerators:
+   - Zero-copy access from G2D (NXP i.MX graphics processor)
+   - Zero-copy access from OpenGL/GPU
+   - Zero-copy access from V4L2 video capture and codec engines
+   - Hardware DMA operations benefit from DMA-capable memory alignment and page locking
+   - Best for workloads that combine CPU processing with hardware acceleration
+
+3. **Shared Memory** (`ShmTensor<T>`): Slowest option with CPU overhead from POSIX shared memory operations. Does not support hardware DMA operations. Use only for cross-process buffer sharing when dma-buf is unavailable due to insufficient permissions, non-Linux platforms, or when persistent memory that survives process termination is required.
+
+**Memory Selection Guidance**:
+- Pure CPU workloads (algorithms only): Use `MemTensor` (Heap)
+- Hardware-accelerated operations (G2D, OpenGL, V4L2, codec): Use `DmaTensor`
+- Cross-process buffer sharing: Use `ShmTensor` (when dma memory cannot be used)
 
 ### Image Processing Strategy
 
-1. **G2D**: ~10-50x faster than CPU for format conversion and resize on i.MX
-2. **OpenGL**: GPU-accelerated, good for complex pipelines
-3. **CPU (SIMD)**: Fallback with Rayon parallelization
+The HAL supports multiple image processing backends that are selected automatically based on hardware availability:
+- **G2D**: NXP i.MX graphics processor acceleration
+- **OpenGL**: GPU-accelerated image processing
+- **CPU**: Fallback using vectorized operations and parallelization with Rayon
 
 ### Decoder Optimization
 
-- Quantized integer math where possible
+Decoder implementations use:
+- Quantized integer math where applicable
 - Vectorized operations via ndarray
 - Parallel processing with Rayon
 - Early termination in NMS loops
@@ -579,63 +539,6 @@ Consistent error handling throughout:
 | G2D Acceleration | ✅ | ❌ | ❌ | ❌ |
 | OpenGL Acceleration | ✅ (optional) | ✅ (optional) | ❌ | ❌ |
 | CPU Fallback | ✅ | ✅ | ✅ | ✅ |
-
-## Build System
-
-- **Workspace**: Cargo workspace with 7 crates
-- **Build Scripts**: Custom build.rs for PyO3 configuration
-- **Features**: Conditional compilation for hardware features
-- **Profiles**: Release, profiling, and debug profiles
-
-### Building Python Bindings
-
-The Python bindings are built using `maturin`, which is the standard build tool for PyO3-based Python packages:
-
-```bash
-# Development build (editable install)
-maturin develop -m crates/python/Cargo.toml
-
-# Production build
-maturin build -m crates/python/Cargo.toml --release
-
-# Install from wheel
-pip install target/wheels/edgefirst_hal-*.whl
-```
-
-**Note**: `maturin` is the recommended and standard way to build PyO3 Python extensions. It handles the complex linking requirements between Python and Rust automatically.
-
-## Testing
-
-The HAL includes comprehensive test coverage across Rust and Python:
-
-### Rust Tests
-```bash
-# Run all Rust tests
-cargo test --workspace
-
-# Run tests for specific crate
-cargo test -p edgefirst_image
-cargo test -p edgefirst_decoder
-cargo test -p edgefirst_tensor
-```
-
-### Python Tests
-Python tests are located in the `tests/` directory and use the unittest framework:
-
-```bash
-# First, build the Python bindings
-maturin develop -m crates/python/Cargo.toml
-
-# Run all Python tests
-python -m pytest tests/
-
-# Run specific test modules
-python -m pytest tests/image/
-python -m pytest tests/decoder/
-python -m pytest tests/test_tensor.py
-```
-
-**Note**: Python tests require the Python bindings to be built via `maturin develop` first, as they test the PyO3 interface.
 
 ## Dependencies
 
@@ -681,68 +584,58 @@ graph TD
     style Tracker fill:#e8f5e9
 ```
 
-## Future Considerations
+## Source Code Organization
 
-1. **Model HAL**: Planned abstraction for inference engines (ONNX, TFLite, Kinara)
-2. **VPI Integration**: Support for NVIDIA Vision Programming Interface
-3. **Additional Trackers**: SORT, Deep SORT implementations
-4. **Async I/O**: Non-blocking image loading and processing
-5. **GPU Compute**: Vulkan/CUDA backends for custom operations
+### Repository Structure
+```
+hal/
+├── .github/
+│   └── workflows/          # CI/CD automation
+│       ├── test.yml        # Rust + Python testing
+│       ├── release.yml     # PyPI publishing
+│       └── nightly.yml     # Nightly builds
+├── crates/
+│   ├── edgefirst/          # Top-level re-export crate
+│   ├── tensor/             # Zero-copy tensor abstraction
+│   ├── image/              # Image processing HAL
+│   ├── decoder/            # Model output decoding
+│   ├── tracker/            # Object tracking
+│   ├── g2d-sys/            # NXP G2D FFI
+│   └── python/             # PyO3 Python bindings
+├── tests/                  # Python integration tests
+├── testdata/               # Test data (Git LFS)
+├── README.md               # Project overview
+├── ARCHITECTURE.md         # This document
+├── CONTRIBUTING.md         # Contribution guidelines
+├── SECURITY.md             # Security policy
+├── CODE_OF_CONDUCT.md      # Community standards
+├── CHANGELOG.md            # Release history
+├── LICENSE                 # Apache-2.0 license
+└── NOTICE                  # Third-party attributions
+```
 
-## Support
+### Crate Dependency Graph
+```
+python (edgefirst-hal) → edgefirst → tensor, image, decoder, tracker
+image → tensor, g2d-sys
+decoder → (standalone)
+tracker → (standalone)
+```
 
-### Community Resources
-
-- 📚 [Documentation](docs/) - Comprehensive guides and tutorials
-- 💬 [GitHub Discussions](https://github.com/EdgeFirstAI/hal/discussions) - Ask questions and share ideas
-- 🐛 [Issue Tracker](https://github.com/EdgeFirstAI/hal/issues) - Report bugs and request features
-
-### EdgeFirst Ecosystem
-
-This project is part of the EdgeFirst Perception stack:
-
-- **[EdgeFirst Studio](https://edgefirst.studio?utm_source=github&utm_medium=readme&utm_campaign=hal)** - Complete MLOps Platform
-  - Deploy and manage edge AI models at scale
-  - Real-time performance monitoring and analytics
-  - Model optimization for edge devices
-  - Free tier available for development
-
-- **[EdgeFirst Hardware Platforms](https://au-zone.com/hardware?utm_source=github&utm_medium=readme&utm_campaign=hal)** - Optimized Platforms
-  - NPU/GPU acceleration support on NXP i.MX platforms
-  - Reference designs available
-  - Custom hardware development services
-
-### Professional Services
-
-Au-Zone Technologies offers comprehensive support for production deployments:
-
-- **Training & Workshops** - Get your team up to speed quickly with expert-led sessions
-- **Custom Development** - Extend HAL capabilities for your specific use case
-- **Integration Services** - Seamless integration with your existing systems and workflows
-- **Enterprise Support** - SLAs, priority fixes, and dedicated engineering support
-- **Hardware Platforms** - Reference designs, customization, and production services
-
-📧 Contact: support@au-zone.com | 🌐 Learn more: [au-zone.com](https://au-zone.com?utm_source=github&utm_medium=readme&utm_campaign=hal)
+---
 
 ## Contributing
 
-We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for:
+- Development environment setup
+- Build instructions
+- Testing guidelines
+- Code style standards
+- Pull request process
 
-This project follows our [Code of Conduct](CODE_OF_CONDUCT.md).
+## Support
 
-## Security
-
-For security vulnerabilities, please see [SECURITY.md](SECURITY.md) or email support@au-zone.com with subject "Security Vulnerability".
-
-## Documentation
-
-- [User Guide](docs/) - Comprehensive usage documentation
-- [API Reference](docs/api/) - Detailed API documentation
-- [Examples](examples/) - Sample code and tutorials
-- [CHANGELOG.md](CHANGELOG.md) - Version history and release notes
-
-## License
-
-Apache License 2.0 - see [LICENSE](LICENSE) for details.
-
-Copyright 2025 Au-Zone Technologies
+For questions, issues, or contributions:
+- **Documentation**: https://doc.edgefirst.ai
+- **GitHub Issues**: https://github.com/EdgeFirstAI/hal/issues
+- **Email**: support@au-zone.com

@@ -1,18 +1,69 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
 [project]
 name = "edgefirst_hal"
-dynamic = ["version", "summary", "description", "description_content_type", "keywords", "home_page", "author", "author_email", "license", "project_url"]
-
+version = "0.1.0"
+description = "Hardware Abstraction Layer for edge AI with zero-copy tensors, image processing, and YOLO decoding"
+readme = "../../README.md"
+requires-python = ">=3.8"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Au-Zone Technologies", email = "support@au-zone.com"}
+]
+maintainers = [
+    {name = "Au-Zone Technologies", email = "support@au-zone.com"}
+]
+keywords = [
+    "edge-ai",
+    "computer-vision",
+    "machine-learning",
+    "yolo",
+    "tensor",
+    "image-processing",
+    "dma",
+    "zero-copy",
+    "embedded",
+    "nxp-imx"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "numpy",
+]
 
 [project.optional-dependencies]
 test = [
     "tensorflow",
     "pyyaml",
+    "pytest",
 ]
 
-dependencies = [
-  "numpy",
-]
+[project.urls]
+Homepage = "https://edgefirst.ai"
+Documentation = "https://github.com/EdgeFirstAI/hal#readme"
+Repository = "https://github.com/EdgeFirstAI/hal.git"
+Issues = "https://github.com/EdgeFirstAI/hal/issues"
+Changelog = "https://github.com/EdgeFirstAI/hal/blob/main/CHANGELOG.md"
 
-[build-system]
-requires = ["maturin>=1.0,<2.0"]
-build-backend = "maturin"
+[tool.maturin]
+module-name = "edgefirst_hal"
+features = ["extension-module"]
