@@ -2,10 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import numpy as np
-from edgefirst_hal import TensorImage, ImageConverter,  FourCC, Normalization
+from edgefirst_hal import TensorImage, ImageConverter, FourCC, Normalization
 
-src = TensorImage.load(
-    "testdata/zidane.jpg", FourCC.RGBA)
+src = TensorImage.load("testdata/zidane.jpg", FourCC.RGBA)
 dst = TensorImage(640, 640, fourcc=FourCC.RGBA)
 converter = ImageConverter()
 converter.convert(src, dst)

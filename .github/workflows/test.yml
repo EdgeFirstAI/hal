@@ -1,3 +1,40 @@
+# GitHub Actions workflow for testing and code quality
+#
+# This workflow implements the Au-Zone SPS v2.3 testing patterns:
+#   - Multi-platform testing (x86_64, aarch64, on-target)
+#   - Three-phase on-target testing pattern (build -> test -> process)
+#   - Full coverage collection (Rust + Python)
+#   - SonarCloud static analysis and coverage aggregation
+#   - Benchmarks on target hardware
+#
+# Action Versions (hash-pinned per SPS v2.1):
+# - actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 (v4)
+# - actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 (v5)
+# - actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 (v4)
+# - actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 (v4)
+# - dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b (stable)
+# - Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db (v2)
+# - taiki-e/install-action@92e6dd1c202153a204d471a3c509bf1e03dcfa44 (v2)
+# - SonarSource/sonarqube-scan-action@689fb39b34b9aa95ebc5f8f119343ddd51542402 (v4)
+# - EnricoMi/publish-unit-test-result-action@6e8f8c55b476f977d1c58cfbd7e337cbf86d917f (v2)
+# - EnricoMi/publish-unit-test-result-action/linux@6e8f8c55b476f977d1c58cfbd7e337cbf86d917f (v2, composite for non-Docker runners)
+#
+# Runner Notes:
+# - ubuntu-22.04: Standard GitHub-hosted runner (x86_64)
+# - ubuntu-22.04-arm-private: GitHub Private ARM64 runner (for private repos)
+# - nxp-imx8mp-latest: NXP i.MX 8M Plus EVK - test-only runner (NO toolchain)
+#
+# Build Strategy:
+# - x86_64 and aarch64 builds happen on GitHub-hosted/managed runners
+# - imx8mp runner downloads aarch64 artifacts and runs tests only
+# - Coverage processing happens on ubuntu-22.04-arm-private (same toolchain as build)
+#
+# Coverage Strategy:
+# - Each platform runs tests independently and generates coverage
+# - Coverage artifacts are uploaded from all platforms
+# - Dedicated process job converts hardware coverage (gcda/profraw) to reports
+# - SonarCloud job downloads and aggregates all coverage reports
+
 name: Test
 
 on:
@@ -10,129 +47,530 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  PYTHON_VERSION: '3.11'
 
 jobs:
-  test:
-    name: Test & Coverage
-    runs-on: ubuntu-latest
-    
+  # ===========================================================================
+  # Build and Test on GitHub-hosted runners (x86_64 and aarch64)
+  # ===========================================================================
+  build-and-test:
+    name: Build & Test (${{ matrix.platform.name }})
+    runs-on: ${{ matrix.platform.runner }}
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+    strategy:
+      matrix:
+        platform:
+          - name: x86_64
+            runner: ubuntu-22.04
+          - name: aarch64
+            runner: ubuntu-22.04-arm-private
+      fail-fast: false
+
     steps:
-      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
+          fetch-depth: 0
           lfs: true
-      
+
       - name: Checkout LFS objects
         run: git lfs checkout
-      
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@0f44b27771c32bda9f458f75a1e241b09791b331 # stable
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up Python virtual environment
+        run: |
+          python3 -m venv venv
+          echo "${{ github.workspace }}/venv/bin" >> $GITHUB_PATH
+          venv/bin/pip install --upgrade pip setuptools wheel
+          venv/bin/pip install maturin[patchelf] slipcover pytest pytest-timeout
+          venv/bin/pip install tensorflow pyyaml numpy
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
         with:
           toolchain: stable
-          components: clippy, llvm-tools-preview
-      
-      - name: Set up Python 3.11
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+          components: llvm-tools-preview, clippy, rustfmt
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db  # v2
         with:
-          python-version: '3.11'
-      
-      - name: Cache Cargo build
-        uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
-        with:
+          shared-key: rust-${{ matrix.platform.name }}
           cache-on-failure: true
-      
-      - name: Run clippy
-        run: cargo clippy --all-targets --all-features
-      
-      - name: Install cargo-llvm-cov
-        run: cargo install cargo-llvm-cov
-      
-      - name: Install Python dependencies
-        run: pip install maturin[patchelf] slipcover unittest-xml-reporting
-      
-      - name: Clean coverage data
-        run: cargo llvm-cov clean
-      
-      - name: Build Rust library with coverage
-        run: cargo llvm-cov --no-report --all-features --locked
-      
-      - name: Build Python bindings with coverage
+
+      - name: Install cargo tools
+        uses: taiki-e/install-action@92e6dd1c202153a204d471a3c509bf1e03dcfa44  # v2
+        with:
+          tool: cargo-llvm-cov@0.6.16,cargo-nextest
+
+      - name: Check Rust formatting
+        run: cargo +nightly fmt --all -- --check 2>/dev/null || cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Build with coverage instrumentation
         run: |
           source <(cargo llvm-cov show-env --export-prefix)
-          pip install crates/python/[test]
-      
+          cargo build --profile profiling --all-features --workspace
+
+      - name: Build Python bindings
+        run: |
+          source <(cargo llvm-cov show-env --export-prefix)
+          venv/bin/pip install crates/python/[test]
+
+      - name: Run Rust tests with coverage
+        run: |
+          set -o pipefail
+          /usr/bin/time -v cargo llvm-cov nextest --cargo-profile profiling --all-features --workspace \
+            --exclude edgefirst_hal --lcov --output-path target/coverage_rust.lcov \
+            2>&1 | tee target/test-metrics-rust-${{ matrix.platform.name }}.txt
+
       - name: Run Python tests with coverage
         run: |
+          set -o pipefail
           source <(cargo llvm-cov show-env --export-prefix)
-          python -m slipcover --xml --out coverage.xml -m xmlrunner discover -s tests -p "test*.py" -o target/python
-      
-      - name: Generate Rust coverage report
-        run: cargo llvm-cov report --lcov --output-path lcov.info
-      
-      - name: Display coverage summary
+          /usr/bin/time -v venv/bin/python -m slipcover --xml --out target/coverage_python.xml \
+            -m pytest tests/ -v --tb=short --junitxml=target/pytest_results.xml \
+            2>&1 | tee target/test-metrics-python-${{ matrix.platform.name }}.txt
+
+      - name: Build instrumented test binaries for hardware (aarch64 only)
+        if: matrix.platform.name == 'aarch64'
         run: |
-          echo "=== Rust Coverage ==="
-          cargo llvm-cov report
-          echo ""
-          echo "=== Python Coverage ==="
-          if [ -f coverage.xml ]; then
-            python3 -c "import xml.etree.ElementTree as ET; tree = ET.parse('coverage.xml'); root = tree.getroot(); print(f\"Python Coverage: {float(root.attrib.get('line-rate', 0))*100:.2f}% ({root.attrib.get('lines-covered', 0)}/{root.attrib.get('lines-valid', 0)} lines)\")"
-          else
-            echo "No Python coverage data available"
-          fi
-      
-      - name: Upload coverage reports
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+          source <(cargo llvm-cov show-env --export-prefix)
+          cargo nextest run --workspace --all-features --no-run --cargo-profile profiling
+          mkdir -p target/tests
+          find target/llvm-cov-target/profiling/deps/ -maxdepth 1 -type f -executable \
+            ! -name "*.d" ! -name "*.rlib" ! -name "*.rmeta" \
+            -exec cp {} target/tests/ \; 2>/dev/null || true
+          find target/profiling/deps/ -maxdepth 1 -type f -executable \
+            ! -name "*.d" ! -name "*.rlib" ! -name "*.rmeta" \
+            -exec cp {} target/tests/ \; 2>/dev/null || true
+          echo "Instrumented test binaries:"
+          ls -la target/tests/ || echo "No test binaries found"
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         if: always()
         with:
-          name: coverage-reports
+          name: coverage-${{ matrix.platform.name }}
           path: |
-            lcov.info
-            coverage.xml
+            target/coverage_rust.lcov
+            target/coverage_python.xml
+          retention-days: 30
 
+      - name: Upload test results
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        if: always()
+        with:
+          name: test-results-${{ matrix.platform.name }}
+          path: |
+            target/pytest_results.xml
+            target/nextest/default/test-results.xml
+            target/test-metrics-*-${{ matrix.platform.name }}.txt
+          retention-days: 30
+
+      - name: Upload hardware test artifacts (aarch64 only)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        if: matrix.platform.name == 'aarch64'
+        with:
+          name: build-aarch64
+          path: |
+            target/profiling/*.so*
+            target/profiling/deps/*.so*
+            target/tests/
+            target/llvm-cov-target/
+          retention-days: 7
+
+      # Use composite action for aarch64 (no Docker), Docker action for x86_64
+      - name: Publish test results (x86_64)
+        uses: EnricoMi/publish-unit-test-result-action@6e8f8c55b476f977d1c58cfbd7e337cbf86d917f  # v2
+        if: always() && matrix.platform.name == 'x86_64'
+        with:
+          files: |
+            target/pytest_results.xml
+            target/nextest/default/test-results.xml
+          check_name: Test Results (${{ matrix.platform.name }})
+          comment_mode: always
+          ignore_runs: true
+
+      - name: Install Python venv for test publisher (aarch64)
+        if: always() && matrix.platform.name == 'aarch64'
+        run: |
+          # ARM runners have minimal Python - install venv/pip for the test publisher
+          sudo apt-get update && sudo apt-get install -y python3-venv python3-pip
+
+      - name: Publish test results (aarch64)
+        uses: EnricoMi/publish-unit-test-result-action/linux@6e8f8c55b476f977d1c58cfbd7e337cbf86d917f  # v2
+        if: always() && matrix.platform.name == 'aarch64'
+        with:
+          files: |
+            target/pytest_results.xml
+            target/nextest/default/test-results.xml
+          check_name: Test Results (${{ matrix.platform.name }})
+          comment_mode: always
+          ignore_runs: true
+
+  # ===========================================================================
+  # Hardware Testing + Benchmarks on NXP i.MX8M Plus
+  # ===========================================================================
+  hardware-test:
+    name: Hardware Test (imx8mp)
+    needs: build-and-test
+    runs-on: nxp-imx8mp-latest
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+
+    steps:
+      - name: Clean workspace
+        run: |
+          rm -rf build/ venv/ target/ rust-tests/ benchmark-results/ 2>/dev/null || true
+          find . -name "*.gcda" -o -name "*.profraw" -delete 2>/dev/null || true
+
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          lfs: true
+
+      - name: Checkout LFS objects
+        run: git lfs checkout
+
+      - name: Download aarch64 build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: build-aarch64
+          path: build/
+
+      - name: Set up Python virtual environment
+        run: |
+          python3 -m venv venv
+          echo "${{ github.workspace }}/venv/bin" >> $GITHUB_PATH
+          venv/bin/pip install --upgrade pip setuptools wheel
+          venv/bin/pip install slipcover pytest pytest-timeout tensorflow pyyaml numpy
+          venv/bin/pip install crates/python/[test] || echo "Using pre-installed package"
+
+      - name: Debug environment info
+        run: |
+          echo "=== System Info ===" && uname -a
+          echo "=== DMA heap ===" && ls -la /dev/dma_heap/ 2>/dev/null || echo "Not found"
+          echo "=== G2D ===" && ls -la /dev/galcore 2>/dev/null || echo "Not found"
+          echo "=== Test binaries ===" && ls -la build/target/tests/ 2>/dev/null || echo "Not found"
+
+      - name: Run Python tests with coverage
+        env:
+          LLVM_PROFILE_FILE: ${{ github.workspace }}/build/profraw/%p-%m.profraw
+        run: |
+          set -o pipefail
+          mkdir -p build/profraw
+          export LD_LIBRARY_PATH=$(pwd)/build/target/profiling:$LD_LIBRARY_PATH
+          /usr/bin/time -v venv/bin/python -m slipcover --xml --out build/coverage_python.xml \
+            -m pytest tests/ -v --tb=short --junitxml=build/pytest_results.xml \
+            2>&1 | tee build/test-metrics-python-imx8mp.txt
+
+      - name: Run pre-built Rust tests
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/build/target/profiling:$LD_LIBRARY_PATH
+          LLVM_PROFILE_FILE: ${{ github.workspace }}/build/profraw/rust-%p-%m.profraw
+        run: |
+          set -o pipefail
+          mkdir -p build/rust-test-results build/profraw
+          chmod +x build/target/tests/* 2>/dev/null || true
+          TEST_FAILED=0
+          for test_bin in build/target/tests/*; do
+            if [ -x "$test_bin" ] && [ -f "$test_bin" ]; then
+              test_name=$(basename "$test_bin")
+              echo "=== Running $test_name ==="
+              if ! /usr/bin/time -v "$test_bin" --include-ignored --test-threads=1 2>&1 | tee "build/rust-test-results/${test_name}.txt"; then
+                echo "FAILED: $test_name"
+                TEST_FAILED=1
+              fi
+            fi
+          done
+          [ $TEST_FAILED -eq 0 ] || exit 1
+
+      - name: Run benchmarks (main branch only)
+        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+        run: |
+          mkdir -p benchmark-results
+          echo "=== System Info ===" > benchmark-results/system-info.txt
+          uname -a >> benchmark-results/system-info.txt
+          cat /proc/cpuinfo | head -30 >> benchmark-results/system-info.txt
+          free -h >> benchmark-results/system-info.txt
+          export LD_LIBRARY_PATH=$(pwd)/build/target/profiling:$LD_LIBRARY_PATH
+          if [ -f "benchmarks/benchmark.py" ]; then
+            venv/bin/python benchmarks/benchmark.py --json benchmark-results/benchmark.json
+          else
+            venv/bin/python -c "
+          import time, json, numpy as np
+          results = {'benchmarks': {}}
+          start = time.perf_counter()
+          for _ in range(100):
+              img = np.random.randint(0, 255, (1080, 1920, 3), dtype=np.uint8)
+          elapsed = time.perf_counter() - start
+          results['benchmarks']['numpy_random_1080p'] = {'mean': elapsed/100*1000, 'unit': 'ms'}
+          with open('benchmark-results/benchmark.json', 'w') as f:
+              json.dump(results, f, indent=2)
+          print('Basic benchmark completed')
+          "
+          fi
+
+      - name: Generate JUnit XML from Rust results
+        if: always()
+        run: python3 scripts/generate_junit_xml.py build/rust-test-results build/rust_hardware_results.xml
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        if: always()
+        with:
+          name: coverage-imx8mp
+          path: |
+            build/coverage_python.xml
+            build/profraw/
+          retention-days: 30
+
+      - name: Upload test results
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        if: always()
+        with:
+          name: test-results-imx8mp
+          path: |
+            build/pytest_results.xml
+            build/rust_hardware_results.xml
+            build/test-metrics-*-imx8mp.txt
+          retention-days: 30
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        if: always() && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
+        with:
+          name: benchmark-results
+          path: benchmark-results/
+          retention-days: 90
+
+      # Note: imx8mp is an embedded device without Docker/full Python tooling
+      # Test results are uploaded as artifacts; skip the publish action here
+      - name: Test results summary (imx8mp)
+        if: always()
+        run: |
+          echo "## Hardware Test Results (imx8mp)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f build/pytest_results.xml ]; then
+            echo "Python tests completed - see artifacts for details" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -f build/rust_hardware_results.xml ]; then
+            echo "Rust tests completed - see artifacts for details" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Generate benchmark summary
+        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+        run: python3 scripts/benchmark_summary.py benchmark-results/benchmark.json >> $GITHUB_STEP_SUMMARY
+
+  # ===========================================================================
+  # Process Hardware Coverage (profraw -> LCOV)
+  # ===========================================================================
+  process-hardware-coverage:
+    name: Process Hardware Coverage
+    needs: [build-and-test, hardware-test]
+    runs-on: ubuntu-22.04-arm-private
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Download build artifacts (contains llvm-cov-target)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: build-aarch64
+          path: build/
+
+      - name: Download imx8mp coverage (contains profraw files)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: coverage-imx8mp
+          path: coverage-imx8mp/
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+
+      - name: Process Rust profraw files
+        run: |
+          PROFRAW_COUNT=$(find coverage-imx8mp/ -name "*.profraw" 2>/dev/null | wc -l)
+          echo "Found $PROFRAW_COUNT profraw files"
+
+          if [ "$PROFRAW_COUNT" -eq 0 ]; then
+            echo "No profraw files, creating empty coverage"
+            mkdir -p output && echo "" > output/coverage_rust_imx8mp.lcov
+            exit 0
+          fi
+
+          TOOLCHAIN_ROOT=$(rustc --print sysroot)
+          LLVM_PROFDATA=$(find "$TOOLCHAIN_ROOT" -name "llvm-profdata" -type f | head -1)
+          LLVM_COV=$(find "$TOOLCHAIN_ROOT" -name "llvm-cov" -type f | head -1)
+
+          mkdir -p output
+          "$LLVM_PROFDATA" merge -sparse $(find coverage-imx8mp/ -name "*.profraw") -o output/imx8mp.profdata
+
+          OBJECT_FILES=""
+          for obj in $(find build/target/llvm-cov-target -type f ! -name "*.d" ! -name "*.rlib" ! -name "*.rmeta" 2>/dev/null); do
+            if file "$obj" 2>/dev/null | grep -q "ELF"; then
+              [ -z "$OBJECT_FILES" ] && OBJECT_FILES="$obj" || OBJECT_FILES="$OBJECT_FILES --object=$obj"
+            fi
+          done
+
+          if [ -z "$OBJECT_FILES" ]; then
+            echo "No ELF binaries found, creating empty coverage"
+            echo "" > output/coverage_rust_imx8mp.lcov
+            exit 0
+          fi
+
+          "$LLVM_COV" export --format=lcov --instr-profile=output/imx8mp.profdata \
+            --ignore-filename-regex='/.cargo/registry|/rustc/' \
+            --path-equivalence="/home/runner/work/hal/hal","${{ github.workspace }}" \
+            $OBJECT_FILES > output/coverage_rust_imx8mp.lcov 2>/dev/null || echo "" > output/coverage_rust_imx8mp.lcov
+
+          echo "Generated coverage_rust_imx8mp.lcov: $(wc -l < output/coverage_rust_imx8mp.lcov) lines"
+
+      - name: Upload processed coverage
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: coverage-imx8mp-processed
+          path: |
+            output/coverage_rust_imx8mp.lcov
+            coverage-imx8mp/build/coverage_python.xml
+          retention-days: 30
+
+  # ===========================================================================
+  # SonarCloud Analysis
+  # ===========================================================================
+  sonarcloud:
+    name: SonarCloud Analysis
+    needs: [build-and-test, hardware-test, process-hardware-coverage]
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      pull-requests: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all coverage artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          pattern: coverage-*
+          path: coverage/
+
+      - name: Organize coverage files
+        run: |
+          echo "=== Downloaded coverage artifacts ==="
+          find coverage/ -type f
+
+          echo "=== Fixing Python coverage paths ==="
+          for xml in $(find coverage/ -name "coverage_python.xml" -type f); do
+            python3 scripts/fix_coverage_paths.py "$xml" tests
+          done
+
+          RUST_REPORTS=$(find coverage/ -name "*.lcov" | tr '\n' ',' | sed 's/,$//')
+          PYTHON_REPORTS=$(find coverage/ -name "coverage_python.xml" | tr '\n' ',' | sed 's/,$//')
+
+          echo "Rust: $RUST_REPORTS"
+          echo "Python: $PYTHON_REPORTS"
+          echo "RUST_COVERAGE_PATHS=$RUST_REPORTS" >> $GITHUB_ENV
+          echo "PYTHON_COVERAGE_PATHS=$PYTHON_REPORTS" >> $GITHUB_ENV
+
+      - name: Run SonarCloud scan
+        uses: SonarSource/sonarqube-scan-action@689fb39b34b9aa95ebc5f8f119343ddd51542402  # v4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.rust.lcov.reportPaths=${{ env.RUST_COVERAGE_PATHS }}
+            -Dsonar.python.coverage.reportPaths=${{ env.PYTHON_COVERAGE_PATHS }}
+
+      - name: Generate summary
+        if: always()
+        run: |
+          {
+            echo "# HAL Test & Coverage Summary"
+            echo ""
+            echo "## Test Platforms"
+            echo "| Platform | Architecture | Tests |"
+            echo "|----------|--------------|-------|"
+            echo "| Ubuntu 22.04 | x86_64 | Rust, Python |"
+            echo "| Ubuntu 22.04 | aarch64 | Rust, Python |"
+            echo "| NXP i.MX8M Plus | aarch64 | Rust, Python (DMA, G2D) |"
+            echo ""
+            python3 scripts/coverage_summary.py --github-actions
+            echo ""
+            echo "## SonarCloud"
+            echo "- [Dashboard](https://sonarcloud.io/summary/overall?id=EdgeFirstAI_hal&branch=${{ github.ref_name }})"
+          } >> $GITHUB_STEP_SUMMARY
+
+  # ===========================================================================
+  # Python Version Compatibility (main branch only)
+  # ===========================================================================
   test-python-versions:
     name: Test Python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
     strategy:
       matrix:
         python-version: ['3.8', '3.12']
-    
+      fail-fast: false
+
     steps:
-      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           lfs: true
-      
+
       - name: Checkout LFS objects
         run: git lfs checkout
-      
+
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@0f44b27771c32bda9f458f75a1e241b09791b331 # stable
-        with: 
+        uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
+        with:
           toolchain: stable
-      
+
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: ${{ matrix.python-version }}
-      
-      - name: Cache Cargo build
-        uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db  # v2
         with:
+          # Unique key per Python version to avoid glibc contamination
+          shared-key: python-compat-${{ matrix.python-version }}
           cache-on-failure: true
-          shared-key: python-${{ matrix.python-version }}
-      
-      - name: Install maturin
-        run: pip install maturin[patchelf]
-      
-      - name: Install Python Test dependencies
-        run: pip install crates/python/[test]
 
-      - name: Build Python wheel
-        run: maturin build -m crates/python/Cargo.toml --release
+      - name: Clean stale build artifacts
+        run: |
+          # Remove any cached build scripts that may have glibc incompatibilities
+          rm -rf target/release/build/ target/debug/build/ 2>/dev/null || true
 
-      - name: Install Python package
-        run: pip install target/wheels/*manylinux*.whl --force-reinstall --no-deps
-
-
-
-      - name: Run Python tests
-        run: python -m unittest discover -s tests -p "test*.py"      
+      - name: Build and test
+        run: |
+          pip install maturin[patchelf,zig]
+          pip install crates/python/[test]
+          # Use zig linker for manylinux2014 compatibility (portable glibc)
+          maturin build -m crates/python/Cargo.toml --release --zig --compatibility manylinux2014
+          pip install target/wheels/*.whl --force-reinstall --no-deps
+          python -m pytest tests/ -v --tb=short

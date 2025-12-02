@@ -3,8 +3,8 @@
 
 from edgefirst_hal import TensorImage, ImageConverter, Flip, FourCC
 import numpy as np
-src = TensorImage.load(
-    "testdata/zidane.jpg", FourCC.RGBA)
+
+src = TensorImage.load("testdata/zidane.jpg", FourCC.RGBA)
 dst = TensorImage(1280, 720)
 converter = ImageConverter()
 converter.convert(src, dst, flip=Flip.Horizontal)
