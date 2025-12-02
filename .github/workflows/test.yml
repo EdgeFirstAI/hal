@@ -188,27 +188,12 @@ jobs:
             target/llvm-cov-target/
           retention-days: 7
 
-      # Use composite action for aarch64 (no Docker), Docker action for x86_64
-      - name: Publish test results (x86_64)
+      # Note: Self-hosted ARM runner doesn't have Docker, so we skip test publishing
+      # on aarch64 and rely on artifact uploads. Test results are published by the
+      # SonarCloud job summary instead.
+      - name: Publish test results (x86_64 only)
         uses: EnricoMi/publish-unit-test-result-action@6e8f8c55b476f977d1c58cfbd7e337cbf86d917f  # v2
         if: always() && matrix.platform.name == 'x86_64'
-        with:
-          files: |
-            target/pytest_results.xml
-            target/nextest/default/test-results.xml
-          check_name: Test Results (${{ matrix.platform.name }})
-          comment_mode: always
-          ignore_runs: true
-
-      - name: Install Python venv for test publisher (aarch64)
-        if: always() && matrix.platform.name == 'aarch64'
-        run: |
-          # ARM runners have minimal Python - install venv/pip for the test publisher
-          sudo apt-get update && sudo apt-get install -y python3-venv python3-pip
-
-      - name: Publish test results (aarch64)
-        uses: EnricoMi/publish-unit-test-result-action/linux@6e8f8c55b476f977d1c58cfbd7e337cbf86d917f  # v2
-        if: always() && matrix.platform.name == 'aarch64'
         with:
           files: |
             target/pytest_results.xml
