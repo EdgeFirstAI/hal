@@ -247,7 +247,7 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: build-aarch64
-          path: build/
+          path: .  # Download to workspace root to preserve directory structure
 
       - name: Set up Python virtual environment
         run: |
@@ -262,7 +262,8 @@ jobs:
           echo "=== System Info ===" && uname -a
           echo "=== DMA heap ===" && ls -la /dev/dma_heap/ 2>/dev/null || echo "Not found"
           echo "=== G2D ===" && ls -la /dev/galcore 2>/dev/null || echo "Not found"
-          echo "=== Test binaries ===" && ls -la build/target/tests/ 2>/dev/null || echo "Not found"
+          echo "=== Downloaded artifacts ===" && find . -name "*.so*" -o -name "profiling" -type d 2>/dev/null || echo "Not found"
+          echo "=== Test binaries ===" && ls -la target/tests/ 2>/dev/null || echo "Not found"
 
       - name: Run Python tests with coverage
         env:
@@ -270,21 +271,21 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p build/profraw
-          export LD_LIBRARY_PATH=$(pwd)/build/target/profiling:$LD_LIBRARY_PATH
+          export LD_LIBRARY_PATH=$(pwd)/target/profiling:$LD_LIBRARY_PATH
           /usr/bin/time -v venv/bin/python -m slipcover --xml --out build/coverage_python.xml \
             -m pytest tests/ -v --tb=short --junitxml=build/pytest_results.xml \
             2>&1 | tee build/test-metrics-python-imx8mp.txt
 
       - name: Run pre-built Rust tests
         env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/build/target/profiling:$LD_LIBRARY_PATH
+          LD_LIBRARY_PATH: ${{ github.workspace }}/target/profiling:$LD_LIBRARY_PATH
           LLVM_PROFILE_FILE: ${{ github.workspace }}/build/profraw/rust-%p-%m.profraw
         run: |
           set -o pipefail
           mkdir -p build/rust-test-results build/profraw
-          chmod +x build/target/tests/* 2>/dev/null || true
+          chmod +x target/tests/* 2>/dev/null || true
           TEST_FAILED=0
-          for test_bin in build/target/tests/*; do
+          for test_bin in target/tests/*; do
             if [ -x "$test_bin" ] && [ -f "$test_bin" ]; then
               test_name=$(basename "$test_bin")
               echo "=== Running $test_name ==="
@@ -304,7 +305,7 @@ jobs:
           uname -a >> benchmark-results/system-info.txt
           cat /proc/cpuinfo | head -30 >> benchmark-results/system-info.txt
           free -h >> benchmark-results/system-info.txt
-          export LD_LIBRARY_PATH=$(pwd)/build/target/profiling:$LD_LIBRARY_PATH
+          export LD_LIBRARY_PATH=$(pwd)/target/profiling:$LD_LIBRARY_PATH
           if [ -f "benchmarks/benchmark.py" ]; then
             venv/bin/python benchmarks/benchmark.py --json benchmark-results/benchmark.json
           else
@@ -391,7 +392,7 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: build-aarch64
-          path: build/
+          path: .  # Download to workspace root to preserve directory structure
 
       - name: Download imx8mp coverage (contains profraw files)
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
@@ -424,7 +425,7 @@ jobs:
           "$LLVM_PROFDATA" merge -sparse $(find coverage-imx8mp/ -name "*.profraw") -o output/imx8mp.profdata
 
           OBJECT_FILES=""
-          for obj in $(find build/target/llvm-cov-target -type f ! -name "*.d" ! -name "*.rlib" ! -name "*.rmeta" 2>/dev/null); do
+          for obj in $(find target/llvm-cov-target -type f ! -name "*.d" ! -name "*.rlib" ! -name "*.rmeta" 2>/dev/null); do
             if file "$obj" 2>/dev/null | grep -q "ELF"; then
               [ -z "$OBJECT_FILES" ] && OBJECT_FILES="$obj" || OBJECT_FILES="$OBJECT_FILES --object=$obj"
             fi
