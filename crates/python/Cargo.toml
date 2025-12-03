@@ -14,7 +14,7 @@ publish = false  # Python bindings only - distributed via PyPI, not crates.io
 crate-type = ["cdylib"]
 
 [features]
-default = ["python-abi311"]
+default = []
 python-abi38 = ["pyo3/abi3-py38"]
 python-abi311 = ["pyo3/abi3-py311"]
 
