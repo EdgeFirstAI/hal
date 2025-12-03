@@ -703,7 +703,7 @@ jobs:
       - name: Build and test
         run: |
           pip install maturin[patchelf,zig]
-          pip install crates/python/[test]
+          pip install tensorflow pyyaml numpy pytest pytest-timeout
           # Use zig linker for manylinux2014 compatibility (portable glibc)
           # Select ABI feature based on Python version:
           # - Python 3.8-3.10: use abi3-py38 (works up to 3.10)
@@ -714,5 +714,5 @@ jobs:
             FEATURES="--features python-abi311"
           fi
           maturin build -m crates/python/Cargo.toml --release --zig --compatibility manylinux2014 $FEATURES
-          pip install target/wheels/*.whl --force-reinstall --no-deps
+          pip install target/wheels/*-abi3-*.whl
           python -m pytest tests/ -v --tb=short
