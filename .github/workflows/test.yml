@@ -110,11 +110,17 @@ jobs:
           venv/bin/pip install maturin[patchelf] slipcover pytest pytest-timeout
           venv/bin/pip install tensorflow pyyaml numpy
 
-      - name: Set up Rust toolchain
+      - name: Set up Rust stable toolchain
         uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
         with:
           toolchain: stable
           components: llvm-tools-preview, clippy, rustfmt
+
+      - name: Set up Rust nightly toolchain (for Python builds)
+        uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # nightly
+        with:
+          toolchain: nightly
+          components: llvm-tools-preview, rustfmt
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db  # v2
@@ -138,16 +144,16 @@ jobs:
           source <(cargo llvm-cov show-env --export-prefix)
           cargo build --profile profiling --all-features --workspace
 
-      - name: Build Python bindings
+      - name: Build Python bindings with nightly
         run: |
           source <(cargo llvm-cov show-env --export-prefix)
-          venv/bin/pip install crates/python/[test]
+          RUSTUP_TOOLCHAIN=nightly venv/bin/pip install crates/python/[test]
 
       - name: Run Rust tests with coverage
         run: |
           set -o pipefail
           /usr/bin/time -v cargo llvm-cov nextest --cargo-profile profiling --all-features --workspace \
-            --exclude edgefirst_hal --lcov --output-path target/coverage_rust.lcov \
+            --lcov --output-path target/coverage_rust.lcov \
             2>&1 | tee target/test-metrics-rust-x86_64.txt
 
       - name: Run Python tests with coverage
@@ -236,11 +242,17 @@ jobs:
           venv/bin/pip install maturin[patchelf] slipcover pytest pytest-timeout
           venv/bin/pip install tensorflow pyyaml numpy
 
-      - name: Set up Rust toolchain
+      - name: Set up Rust stable toolchain
         uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
         with:
           toolchain: stable
           components: llvm-tools-preview, clippy, rustfmt
+
+      - name: Set up Rust nightly toolchain (for Python builds)
+        uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # nightly
+        with:
+          toolchain: nightly
+          components: llvm-tools-preview, rustfmt
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db  # v2
@@ -264,16 +276,16 @@ jobs:
           source <(cargo llvm-cov show-env --export-prefix)
           cargo build --profile profiling --all-features --workspace
 
-      - name: Build Python bindings
+      - name: Build Python bindings with nightly
         run: |
           source <(cargo llvm-cov show-env --export-prefix)
-          venv/bin/pip install crates/python/[test]
+          RUSTUP_TOOLCHAIN=nightly venv/bin/pip install crates/python/[test]
 
       - name: Run Rust tests with coverage
         run: |
           set -o pipefail
           /usr/bin/time -v cargo llvm-cov nextest --cargo-profile profiling --all-features --workspace \
-            --exclude edgefirst_hal --lcov --output-path target/coverage_rust.lcov \
+            --lcov --output-path target/coverage_rust.lcov \
             2>&1 | tee target/test-metrics-rust-aarch64.txt
 
       - name: Run Python tests with coverage
