@@ -663,7 +663,7 @@ jobs:
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
     strategy:
       matrix:
-        python-version: ['3.8', '3.12']
+        python-version: ['3.8', '3.11']
       fail-fast: false
 
     steps:
@@ -705,6 +705,14 @@ jobs:
           pip install maturin[patchelf,zig]
           pip install crates/python/[test]
           # Use zig linker for manylinux2014 compatibility (portable glibc)
-          maturin build -m crates/python/Cargo.toml --release --zig --compatibility manylinux2014
+          # Select ABI feature based on Python version:
+          # - Python 3.8-3.10: use abi3-py38 (works up to 3.10)
+          # - Python 3.11+: use abi3-py311 (has zero-copy improvements)
+          if [[ "${{ matrix.python-version }}" == "3.8" ]]; then
+            FEATURES="--features python-abi38"
+          else
+            FEATURES="--features python-abi311"
+          fi
+          maturin build -m crates/python/Cargo.toml --release --zig --compatibility manylinux2014 $FEATURES
           pip install target/wheels/*.whl --force-reinstall --no-deps
           python -m pytest tests/ -v --tb=short
