@@ -51,11 +51,34 @@ env:
 
 jobs:
   # ===========================================================================
+  # Checkout LFS files (on ubuntu-22.04 which has git-lfs)
+  # ===========================================================================
+  checkout-lfs:
+    name: Checkout LFS Files
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code with LFS
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          lfs: true
+
+      - name: Checkout LFS objects
+        run: git lfs checkout
+
+      - name: Upload testdata as artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: testdata-lfs
+          path: testdata/
+          retention-days: 1
+
+  # ===========================================================================
   # Build and Test on x86_64 (GitHub-hosted runner with Docker)
   # ===========================================================================
   build-and-test-x86:
     name: Build & Test (x86_64)
     runs-on: ubuntu-22.04
+    needs: checkout-lfs
     permissions:
       contents: read
       checks: write
@@ -66,10 +89,13 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           fetch-depth: 0
-          lfs: true
+          lfs: false  # LFS files downloaded separately
 
-      - name: Checkout LFS objects
-        run: git lfs checkout
+      - name: Download LFS testdata
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: testdata-lfs
+          path: testdata/
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
@@ -170,6 +196,7 @@ jobs:
   build-and-test-arm:
     name: Build & Test (aarch64)
     runs-on: ubuntu-22.04-arm-private
+    needs: checkout-lfs
     permissions:
       contents: read
       checks: write
@@ -180,10 +207,13 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           fetch-depth: 0
-          lfs: true
+          lfs: false  # LFS files downloaded separately
 
-      - name: Checkout LFS objects
-        run: git lfs checkout
+      - name: Download LFS testdata
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: testdata-lfs
+          path: testdata/
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
@@ -298,7 +328,7 @@ jobs:
   # ===========================================================================
   hardware-test:
     name: Hardware Test (imx8mp)
-    needs: build-and-test-arm
+    needs: [checkout-lfs, build-and-test-arm]
     runs-on: nxp-imx8mp-latest
     permissions:
       contents: read
@@ -308,16 +338,19 @@ jobs:
     steps:
       - name: Clean workspace
         run: |
-          rm -rf build/ venv/ target/ rust-tests/ benchmark-results/ 2>/dev/null || true
+          rm -rf build/ venv/ target/ rust-tests/ benchmark-results/ testdata/ 2>/dev/null || true
           find . -name "*.gcda" -o -name "*.profraw" -delete 2>/dev/null || true
 
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
-          lfs: true
+          lfs: false  # LFS files downloaded separately
 
-      - name: Checkout LFS objects
-        run: git lfs checkout
+      - name: Download LFS testdata
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: testdata-lfs
+          path: testdata/
 
       - name: Download aarch64 build artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
@@ -606,6 +639,7 @@ jobs:
   test-python-versions:
     name: Test Python ${{ matrix.python-version }}
     runs-on: ubuntu-22.04
+    needs: checkout-lfs
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
     strategy:
       matrix:
@@ -616,10 +650,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
-          lfs: true
+          lfs: false  # LFS files downloaded separately
 
-      - name: Checkout LFS objects
-        run: git lfs checkout
+      - name: Download LFS testdata
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: testdata-lfs
+          path: testdata/
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
