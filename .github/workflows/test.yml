@@ -302,10 +302,10 @@ jobs:
           cargo nextest run --workspace --all-features --no-run --cargo-profile profiling
           mkdir -p hardware-test-binaries
           find target/llvm-cov-target/profiling/deps/ -maxdepth 1 -type f -executable \
-            ! -name "*.d" ! -name "*.rlib" ! -name "*.rmeta" \
+            ! -name "*.d" ! -name "*.rlib" ! -name "*.rmeta" ! -name "*.so" \
             -exec cp {} hardware-test-binaries/ \; 2>/dev/null || true
           find target/profiling/deps/ -maxdepth 1 -type f -executable \
-            ! -name "*.d" ! -name "*.rlib" ! -name "*.rmeta" \
+            ! -name "*.d" ! -name "*.rlib" ! -name "*.rmeta" ! -name "*.so" \
             -exec cp {} hardware-test-binaries/ \; 2>/dev/null || true
           echo "Instrumented test binaries:"
           ls -la hardware-test-binaries/ || echo "No test binaries found"
@@ -416,6 +416,10 @@ jobs:
           TEST_FAILED=0
           for test_bin in hardware-test-binaries/*; do
             if [ -x "$test_bin" ] && [ -f "$test_bin" ]; then
+              # Skip .so files (proc-macro shared libraries)
+              if [[ "$test_bin" == *.so ]]; then
+                continue
+              fi
               test_name=$(basename "$test_bin")
               echo "=== Running $test_name ==="
               if ! "$test_bin" --test-threads=1 2>&1 | tee "build/rust-test-results/${test_name}.txt"; then
