@@ -300,15 +300,15 @@ jobs:
         run: |
           source <(cargo llvm-cov show-env --export-prefix)
           cargo nextest run --workspace --all-features --no-run --cargo-profile profiling
-          mkdir -p target/tests
+          mkdir -p hardware-test-binaries
           find target/llvm-cov-target/profiling/deps/ -maxdepth 1 -type f -executable \
             ! -name "*.d" ! -name "*.rlib" ! -name "*.rmeta" \
-            -exec cp {} target/tests/ \; 2>/dev/null || true
+            -exec cp {} hardware-test-binaries/ \; 2>/dev/null || true
           find target/profiling/deps/ -maxdepth 1 -type f -executable \
             ! -name "*.d" ! -name "*.rlib" ! -name "*.rmeta" \
-            -exec cp {} target/tests/ \; 2>/dev/null || true
+            -exec cp {} hardware-test-binaries/ \; 2>/dev/null || true
           echo "Instrumented test binaries:"
-          ls -la target/tests/ || echo "No test binaries found"
+          ls -la hardware-test-binaries/ || echo "No test binaries found"
 
       - name: Upload coverage artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
@@ -339,7 +339,7 @@ jobs:
           path: |
             target/profiling/*.so*
             target/profiling/deps/*.so*
-            target/tests/
+            hardware-test-binaries/
             target/llvm-cov-target/
           retention-days: 7
 
@@ -392,7 +392,7 @@ jobs:
           echo "=== DMA heap ===" && ls -la /dev/dma_heap/ 2>/dev/null || echo "Not found"
           echo "=== G2D ===" && ls -la /dev/galcore 2>/dev/null || echo "Not found"
           echo "=== Downloaded artifacts ===" && find . -name "*.so*" -o -name "profiling" -type d 2>/dev/null || echo "Not found"
-          echo "=== Test binaries ===" && ls -la target/tests/ 2>/dev/null || echo "Not found"
+          echo "=== Test binaries ===" && ls -la hardware-test-binaries/ 2>/dev/null || echo "Not found"
 
       - name: Run Python tests with coverage
         env:
@@ -412,9 +412,9 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p build/rust-test-results build/profraw
-          chmod +x target/tests/* 2>/dev/null || true
+          chmod +x hardware-test-binaries/* 2>/dev/null || true
           TEST_FAILED=0
-          for test_bin in target/tests/*; do
+          for test_bin in hardware-test-binaries/*; do
             if [ -x "$test_bin" ] && [ -f "$test_bin" ]; then
               test_name=$(basename "$test_bin")
               echo "=== Running $test_name ==="
@@ -633,6 +633,7 @@ jobs:
           args: >-
             "-Dsonar.rust.lcov.reportPaths=${{ env.RUST_COVERAGE_PATHS }}"
             "-Dsonar.python.coverage.reportPaths=${{ env.PYTHON_COVERAGE_PATHS }}"
+            "-Dsonar.verbose=true"
 
       - name: Generate summary
         if: always()
