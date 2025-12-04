@@ -13,11 +13,11 @@
 # - actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 (v4)
 # - actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 (v4)
 # - dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b (stable)
-# - Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db (v2)
-# - taiki-e/install-action@92e6dd1c202153a204d471a3c509bf1e03dcfa44 (v2)
-# - SonarSource/sonarqube-scan-action@689fb39b34b9aa95ebc5f8f119343ddd51542402 (v4)
-# - EnricoMi/publish-unit-test-result-action@6e8f8c55b476f977d1c58cfbd7e337cbf86d917f (v2)
-# - EnricoMi/publish-unit-test-result-action/linux@6e8f8c55b476f977d1c58cfbd7e337cbf86d917f (v2, composite for non-Docker runners)
+# - Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 (v2.8.2)
+# - taiki-e/install-action@493d7f216ecab2af0602481ce809ab2c72836fa1 (v2.62.62)
+# - SonarSource/sonarqube-scan-action@fd88b7d7ccbaefd23d8f36f73b59db7a3d246602 (v6.0.0)
+# - EnricoMi/publish-unit-test-result-action@34d7c956a59aed1bfebf31df77b8de55db9bbaaf (v2.21.0)
+# - EnricoMi/publish-unit-test-result-action/linux@34d7c956a59aed1bfebf31df77b8de55db9bbaaf (v2.21.0, composite for non-Docker runners)
 #
 # Runner Notes:
 # - ubuntu-22.04: Standard GitHub-hosted runner (x86_64)
@@ -123,13 +123,13 @@ jobs:
           components: llvm-tools-preview, rustfmt, clippy
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db  # v2
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5  # v2.8.2
         with:
           shared-key: rust-${{ matrix.platform.name }}
           cache-on-failure: true
 
       - name: Install cargo tools
-        uses: taiki-e/install-action@92e6dd1c202153a204d471a3c509bf1e03dcfa44  # v2
+        uses: taiki-e/install-action@493d7f216ecab2af0602481ce809ab2c72836fa1  # v2.62.62
         with:
           tool: cargo-llvm-cov@0.6.16,cargo-nextest
 
@@ -186,7 +186,7 @@ jobs:
           retention-days: 30
 
       - name: Publish test results
-        uses: EnricoMi/publish-unit-test-result-action@6e8f8c55b476f977d1c58cfbd7e337cbf86d917f  # v2
+        uses: EnricoMi/publish-unit-test-result-action@34d7c956a59aed1bfebf31df77b8de55db9bbaaf  # v2.21.0
         if: always()
         with:
           files: |
@@ -255,13 +255,13 @@ jobs:
           components: llvm-tools-preview, rustfmt, clippy
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db  # v2
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5  # v2.8.2
         with:
           shared-key: rust-aarch64
           cache-on-failure: true
 
       - name: Install cargo tools
-        uses: taiki-e/install-action@92e6dd1c202153a204d471a3c509bf1e03dcfa44  # v2
+        uses: taiki-e/install-action@493d7f216ecab2af0602481ce809ab2c72836fa1  # v2.62.62
         with:
           tool: cargo-llvm-cov@0.6.16,cargo-nextest
 
@@ -625,14 +625,14 @@ jobs:
           echo "PYTHON_COVERAGE_PATHS=$PYTHON_REPORTS" >> $GITHUB_ENV
 
       - name: Run SonarCloud scan
-        uses: SonarSource/sonarqube-scan-action@689fb39b34b9aa95ebc5f8f119343ddd51542402  # v4
+        uses: SonarSource/sonarqube-scan-action@fd88b7d7ccbaefd23d8f36f73b59db7a3d246602  # v6.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         with:
-          args: >
-            -Dsonar.rust.lcov.reportPaths=${{ env.RUST_COVERAGE_PATHS }}
-            -Dsonar.python.coverage.reportPaths=${{ env.PYTHON_COVERAGE_PATHS }}
+          args: >-
+            "-Dsonar.rust.lcov.reportPaths=${{ env.RUST_COVERAGE_PATHS }}"
+            "-Dsonar.python.coverage.reportPaths=${{ env.PYTHON_COVERAGE_PATHS }}"
 
       - name: Generate summary
         if: always()
@@ -689,7 +689,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Cache Rust build
-        uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db  # v2
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5  # v2.8.2
         with:
           # Unique key per Python version to avoid glibc contamination
           shared-key: python-compat-${{ matrix.python-version }}
