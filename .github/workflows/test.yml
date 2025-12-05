@@ -153,7 +153,7 @@ jobs:
           source <(cargo llvm-cov show-env --export-prefix)
           RUSTUP_TOOLCHAIN=nightly venv/bin/maturin develop \
             --manifest-path crates/python/Cargo.toml \
-            --cargo-extra-args="--profile=profiling"
+            -- --profile=profiling
 
       - name: Run Rust tests with coverage
         run: |
@@ -287,7 +287,7 @@ jobs:
           source <(cargo llvm-cov show-env --export-prefix)
           RUSTUP_TOOLCHAIN=nightly venv/bin/maturin develop \
             --manifest-path crates/python/Cargo.toml \
-            --cargo-extra-args="--profile=profiling"
+            -- --profile=profiling
 
       - name: Run Rust tests with coverage
         run: |
@@ -395,7 +395,7 @@ jobs:
           # Install Python bindings from pre-built .so file
           venv/bin/pip install --no-build-isolation --no-deps --force-reinstall target/profiling/*.so 2>/dev/null || echo "No .so file found, will build with maturin"
           if [ ! -f venv/lib/python*/site-packages/edgefirst_hal.*.so ]; then
-            venv/bin/maturin develop --manifest-path crates/python/Cargo.toml --cargo-extra-args="--profile=profiling"
+            venv/bin/maturin develop --manifest-path crates/python/Cargo.toml -- --profile=profiling
           fi
 
       - name: Debug environment info
