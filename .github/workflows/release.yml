@@ -42,9 +42,14 @@ jobs:
           python-version: '3.11'
       
       - name: Install maturin
-        run: pip install maturin[patchelf]
+        run: pip install maturin[patchelf,zig]
       
-      - name: Build wheels
+      - name: Build wheels (Linux with manylinux2014)
+        if: runner.os == 'Linux'
+        run: maturin build --release -m crates/python/Cargo.toml --sdist --zig --compatibility manylinux2014
+
+      - name: Build wheels (Windows/macOS)
+        if: runner.os != 'Linux'
         run: maturin build --release -m crates/python/Cargo.toml --sdist
       
       - name: Upload wheels
