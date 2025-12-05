@@ -151,9 +151,11 @@ jobs:
       - name: Build Python bindings with maturin
         run: |
           source <(cargo llvm-cov show-env --export-prefix)
-          RUSTUP_TOOLCHAIN=nightly venv/bin/maturin develop \
+          RUSTUP_TOOLCHAIN=nightly venv/bin/maturin build \
             --manifest-path crates/python/Cargo.toml \
+            --out target/wheels \
             -- --profile=profiling
+          venv/bin/pip install target/wheels/*.whl
 
       - name: Run Rust tests with coverage
         run: |
@@ -285,9 +287,11 @@ jobs:
       - name: Build Python bindings with maturin
         run: |
           source <(cargo llvm-cov show-env --export-prefix)
-          RUSTUP_TOOLCHAIN=nightly venv/bin/maturin develop \
+          RUSTUP_TOOLCHAIN=nightly venv/bin/maturin build \
             --manifest-path crates/python/Cargo.toml \
+            --out target/wheels \
             -- --profile=profiling
+          venv/bin/pip install target/wheels/*.whl
 
       - name: Run Rust tests with coverage
         run: |
@@ -347,6 +351,7 @@ jobs:
           path: |
             target/profiling/*.so*
             target/profiling/deps/*.so*
+            target/wheels/*.whl
             hardware-test-binaries/
             target/llvm-cov-target/
           retention-days: 7
@@ -391,12 +396,9 @@ jobs:
           python3 -m venv venv
           echo "${{ github.workspace }}/venv/bin" >> $GITHUB_PATH
           venv/bin/pip install --upgrade pip setuptools wheel
-          venv/bin/pip install maturin slipcover pytest pytest-timeout tensorflow pyyaml numpy
-          # Install Python bindings from pre-built .so file
-          venv/bin/pip install --no-build-isolation --no-deps --force-reinstall target/profiling/*.so 2>/dev/null || echo "No .so file found, will build with maturin"
-          if [ ! -f venv/lib/python*/site-packages/edgefirst_hal.*.so ]; then
-            venv/bin/maturin develop --manifest-path crates/python/Cargo.toml -- --profile=profiling
-          fi
+          venv/bin/pip install slipcover pytest pytest-timeout tensorflow pyyaml numpy
+          # Install Python bindings from pre-built wheel (built with profiling profile on aarch64)
+          venv/bin/pip install target/wheels/*.whl
 
       - name: Debug environment info
         run: |
