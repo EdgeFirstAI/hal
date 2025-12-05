@@ -77,6 +77,30 @@ jobs:
           retention-days: 1
 
   # ===========================================================================
+  # Doc Tests (run once on x86_64, in parallel with other tests)
+  # ===========================================================================
+  doc-tests:
+    name: Doc Tests
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Set up Rust stable toolchain
+        uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5  # v2.8.2
+        with:
+          shared-key: rust-x86_64-doc
+          cache-on-failure: true
+
+      - name: Run doc tests
+        run: cargo test --doc --workspace --all-features
+
+  # ===========================================================================
   # Build and Test on x86_64 (GitHub-hosted runner with Docker)
   # ===========================================================================
   build-and-test-x86:
@@ -155,7 +179,8 @@ jobs:
           venv/bin/maturin build \
             --manifest-path crates/python/Cargo.toml \
             --out target/wheels \
-            --profile profiling
+            --profile profiling \
+            --features python-abi311
           venv/bin/pip install target/wheels/*.whl
 
       - name: Run Rust tests with coverage
@@ -294,7 +319,8 @@ jobs:
           venv/bin/maturin build \
             --manifest-path crates/python/Cargo.toml \
             --out target/wheels \
-            --profile profiling
+            --profile profiling \
+            --features python-abi311
           venv/bin/pip install target/wheels/*.whl
 
       - name: Run Rust tests with coverage
@@ -609,7 +635,7 @@ jobs:
   # ===========================================================================
   sonarcloud:
     name: SonarCloud Analysis
-    needs: [build-and-test-x86, build-and-test-arm, hardware-test, process-hardware-coverage]
+    needs: [doc-tests, build-and-test-x86, build-and-test-arm, hardware-test, process-hardware-coverage]
     runs-on: ubuntu-22.04
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     permissions:
