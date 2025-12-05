@@ -151,7 +151,8 @@ jobs:
       - name: Build Python bindings with maturin
         run: |
           source <(cargo llvm-cov show-env --export-prefix)
-          RUSTUP_TOOLCHAIN=nightly venv/bin/maturin build \
+          cargo llvm-cov clean --workspace
+          venv/bin/maturin build \
             --manifest-path crates/python/Cargo.toml \
             --out target/wheels \
             --profile profiling
@@ -286,13 +287,14 @@ jobs:
 
       - name: Build Python bindings with maturin
         run: |
+          # Build with coverage instrumentation for PyO3 Rust code coverage
+          # No need for zig/manylinux2014 here - target glibc (2.41) is newer than Ubuntu 22.04 (2.35)
           source <(cargo llvm-cov show-env --export-prefix)
-          RUSTUP_TOOLCHAIN=nightly venv/bin/maturin build \
+          cargo llvm-cov clean --workspace
+          venv/bin/maturin build \
             --manifest-path crates/python/Cargo.toml \
             --out target/wheels \
-            --profile profiling \
-            --zig \
-            --compatibility manylinux2014
+            --profile profiling
           venv/bin/pip install target/wheels/*.whl
 
       - name: Run Rust tests with coverage
