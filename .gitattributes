@@ -26,5 +26,6 @@ testdata/camera720p.rgb filter=lfs diff=lfs merge=lfs -text
 testdata/camera720p.y800 filter=lfs diff=lfs merge=lfs -text
 testdata/camera720p.nv12 filter=lfs diff=lfs merge=lfs -text
 testdata/zidane_rotated_exif_180.png filter=lfs diff=lfs merge=lfs -text
+testdata/modelpack_seg_2x160x160.bin filter=lfs diff=lfs merge=lfs -text
 testdata/camera1080p.* filter=lfs diff=lfs merge=lfs -text
 testdata/camera4k.* filter=lfs diff=lfs merge=lfs -text
