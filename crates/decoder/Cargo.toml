@@ -34,3 +34,6 @@ image = { workspace = true }
 [[bench]]
 name = "decoder_benchmark"
 harness = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }
