@@ -247,7 +247,7 @@ jobs:
           python3 -m venv venv
           echo "${{ github.workspace }}/venv/bin" >> $GITHUB_PATH
           venv/bin/pip install --upgrade pip setuptools wheel
-          venv/bin/pip install maturin[patchelf] slipcover pytest pytest-timeout
+          venv/bin/pip install maturin[patchelf,zig] slipcover pytest pytest-timeout
           venv/bin/pip install tensorflow pyyaml numpy
 
       - name: Set up Rust stable toolchain
@@ -290,7 +290,9 @@ jobs:
           RUSTUP_TOOLCHAIN=nightly venv/bin/maturin build \
             --manifest-path crates/python/Cargo.toml \
             --out target/wheels \
-            --profile profiling
+            --profile profiling \
+            --zig \
+            --compatibility manylinux2014
           venv/bin/pip install target/wheels/*.whl
 
       - name: Run Rust tests with coverage
