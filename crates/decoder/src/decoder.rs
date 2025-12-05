@@ -893,16 +893,7 @@ impl DecoderBuilder {
         for c in configs {
             match c {
                 ConfigOutput::Detection(detection) => boxes = Some(detection),
-                ConfigOutput::Segmentation(segmentation) => {
-                    if segmentation.shape.len() == 3 {
-                        seg_boxes = Some(segmentation)
-                    } else {
-                        return Err(DecoderError::InvalidConfig(format!(
-                            "Invalid Yolo Segmentation shape {:?}",
-                            segmentation.shape
-                        )));
-                    }
-                }
+                ConfigOutput::Segmentation(segmentation) => seg_boxes = Some(segmentation),
                 ConfigOutput::Protos(protos_) => protos = Some(protos_),
                 ConfigOutput::Mask(_) => {
                     return Err(DecoderError::InvalidConfig(
