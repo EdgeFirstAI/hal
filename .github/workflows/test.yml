@@ -154,7 +154,7 @@ jobs:
           RUSTUP_TOOLCHAIN=nightly venv/bin/maturin build \
             --manifest-path crates/python/Cargo.toml \
             --out target/wheels \
-            -- --profile=profiling
+            --profile profiling
           venv/bin/pip install target/wheels/*.whl
 
       - name: Run Rust tests with coverage
@@ -290,7 +290,7 @@ jobs:
           RUSTUP_TOOLCHAIN=nightly venv/bin/maturin build \
             --manifest-path crates/python/Cargo.toml \
             --out target/wheels \
-            -- --profile=profiling
+            --profile profiling
           venv/bin/pip install target/wheels/*.whl
 
       - name: Run Rust tests with coverage
