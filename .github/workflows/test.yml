@@ -196,6 +196,7 @@ jobs:
         run: |
           set -o pipefail
           cargo llvm-cov nextest --cargo-profile profiling --all-features --workspace \
+            --ignore-filename-regex '(\.cargo|/rustc/|/target/)' \
             --lcov --output-path target/coverage_rust.lcov \
             2>&1 | tee target/test-metrics-rust-x86_64.txt
 
@@ -336,6 +337,7 @@ jobs:
         run: |
           set -o pipefail
           cargo llvm-cov nextest --cargo-profile profiling --all-features --workspace \
+            --ignore-filename-regex '(\.cargo|/rustc/|/target/)' \
             --lcov --output-path target/coverage_rust.lcov \
             2>&1 | tee target/test-metrics-rust-aarch64.txt
 
