@@ -176,15 +176,19 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      - name: Build with coverage instrumentation
+      - name: Clean coverage artifacts and set up instrumentation
         run: |
-          source <(cargo llvm-cov show-env --export-prefix)
-          cargo build --profile profiling --all-features --workspace
-
-      - name: Build Python bindings with maturin
-        run: |
-          source <(cargo llvm-cov show-env --export-prefix)
+          # Clean previous coverage data to ensure fresh collection
           cargo llvm-cov clean --workspace
+          # Export coverage environment for subsequent steps
+          cargo llvm-cov show-env --export-prefix > /tmp/coverage-env.sh
+          cat /tmp/coverage-env.sh
+
+      - name: Build Python bindings with coverage instrumentation
+        run: |
+          # Source the coverage environment variables so maturin uses instrumented build
+          source /tmp/coverage-env.sh
+          # Build wheel with coverage instrumentation via RUSTFLAGS
           venv/bin/maturin build \
             --manifest-path crates/python/Cargo.toml \
             --out target/wheels \
@@ -203,8 +207,9 @@ jobs:
       - name: Run Python tests with coverage
         run: |
           set -o pipefail
+          # Source coverage env so Python tests generate profraw for PyO3 bindings
+          source /tmp/coverage-env.sh
           # Python tests exercise PyO3 bindings - profraw files generated from instrumented wheel
-          source <(cargo llvm-cov show-env --export-prefix)
           venv/bin/python -m slipcover --xml --out target/coverage_python.xml \
             -m pytest tests/ -v --tb=short --junitxml=target/pytest_results.xml \
             2>&1 | tee target/test-metrics-python-x86_64.txt
@@ -215,7 +220,13 @@ jobs:
           cargo llvm-cov report --profile profiling \
             --ignore-filename-regex '(\.cargo|/rustc/|/target/)' \
             --lcov --output-path target/coverage_rust.lcov
-          echo "Coverage report generated with $(grep -c '^SF:' target/coverage_rust.lcov) source files"
+          echo "=== Coverage summary ==="
+          echo "Source files in coverage: $(grep -c '^SF:' target/coverage_rust.lcov)"
+          echo "PyO3 files with coverage:"
+          grep '^SF:.*crates/python' target/coverage_rust.lcov || echo "  (none found)"
+          echo "=== Sample coverage data for crates/python ==="
+          # Show hit counts for PyO3 files to verify they're being exercised
+          awk '/^SF:.*crates\/python/{found=1; file=$0} found && /^DA:/{print file": "$0} found && /^end_of_record/{found=0}' target/coverage_rust.lcov | head -20
 
       - name: Upload coverage artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
@@ -324,17 +335,20 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      - name: Build with coverage instrumentation
+      - name: Clean coverage artifacts and set up instrumentation
         run: |
-          source <(cargo llvm-cov show-env --export-prefix)
-          cargo build --profile profiling --all-features --workspace
-
-      - name: Build Python bindings with maturin
-        run: |
-          # Build with coverage instrumentation for PyO3 Rust code coverage
-          # No need for zig/manylinux2014 here - target glibc (2.41) is newer than Ubuntu 22.04 (2.35)
-          source <(cargo llvm-cov show-env --export-prefix)
+          # Clean previous coverage data to ensure fresh collection
           cargo llvm-cov clean --workspace
+          # Export coverage environment for subsequent steps
+          cargo llvm-cov show-env --export-prefix > /tmp/coverage-env.sh
+          cat /tmp/coverage-env.sh
+
+      - name: Build Python bindings with coverage instrumentation
+        run: |
+          # Source the coverage environment variables so maturin uses instrumented build
+          source /tmp/coverage-env.sh
+          # Build wheel with coverage instrumentation via RUSTFLAGS
+          # No need for zig/manylinux2014 here - target glibc (2.41) is newer than Ubuntu 22.04 (2.35)
           venv/bin/maturin build \
             --manifest-path crates/python/Cargo.toml \
             --out target/wheels \
@@ -353,8 +367,9 @@ jobs:
       - name: Run Python tests with coverage
         run: |
           set -o pipefail
+          # Source coverage env so Python tests generate profraw for PyO3 bindings
+          source /tmp/coverage-env.sh
           # Python tests exercise PyO3 bindings - profraw files generated from instrumented wheel
-          source <(cargo llvm-cov show-env --export-prefix)
           venv/bin/python -m slipcover --xml --out target/coverage_python.xml \
             -m pytest tests/ -v --tb=short --junitxml=target/pytest_results.xml \
             2>&1 | tee target/test-metrics-python-aarch64.txt
@@ -365,11 +380,17 @@ jobs:
           cargo llvm-cov report --profile profiling \
             --ignore-filename-regex '(\.cargo|/rustc/|/target/)' \
             --lcov --output-path target/coverage_rust.lcov
-          echo "Coverage report generated with $(grep -c '^SF:' target/coverage_rust.lcov) source files"
+          echo "=== Coverage summary ==="
+          echo "Source files in coverage: $(grep -c '^SF:' target/coverage_rust.lcov)"
+          echo "PyO3 files with coverage:"
+          grep '^SF:.*crates/python' target/coverage_rust.lcov || echo "  (none found)"
+          echo "=== Sample coverage data for crates/python ==="
+          # Show hit counts for PyO3 files to verify they're being exercised
+          awk '/^SF:.*crates\/python/{found=1; file=$0} found && /^DA:/{print file": "$0} found && /^end_of_record/{found=0}' target/coverage_rust.lcov | head -20
 
       - name: Build instrumented test binaries for hardware
         run: |
-          source <(cargo llvm-cov show-env --export-prefix)
+          source /tmp/coverage-env.sh
           cargo nextest run --workspace --all-features --no-run --cargo-profile profiling
           mkdir -p hardware-test-binaries
           find target/llvm-cov-target/profiling/deps/ -maxdepth 1 -type f -executable \
