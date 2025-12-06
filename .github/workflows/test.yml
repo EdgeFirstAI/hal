@@ -195,18 +195,27 @@ jobs:
       - name: Run Rust tests with coverage
         run: |
           set -o pipefail
+          # Run tests but don't generate report yet - we'll combine with Python test coverage
           cargo llvm-cov nextest --cargo-profile profiling --all-features --workspace \
-            --ignore-filename-regex '(\.cargo|/rustc/|/target/)' \
-            --lcov --output-path target/coverage_rust.lcov \
+            --no-report \
             2>&1 | tee target/test-metrics-rust-x86_64.txt
 
       - name: Run Python tests with coverage
         run: |
           set -o pipefail
+          # Python tests exercise PyO3 bindings - profraw files generated from instrumented wheel
           source <(cargo llvm-cov show-env --export-prefix)
           venv/bin/python -m slipcover --xml --out target/coverage_python.xml \
             -m pytest tests/ -v --tb=short --junitxml=target/pytest_results.xml \
             2>&1 | tee target/test-metrics-python-x86_64.txt
+
+      - name: Generate combined Rust coverage report
+        run: |
+          # Generate LCOV report combining Rust tests + Python tests (PyO3 bindings coverage)
+          cargo llvm-cov report --profile profiling \
+            --ignore-filename-regex '(\.cargo|/rustc/|/target/)' \
+            --lcov --output-path target/coverage_rust.lcov
+          echo "Coverage report generated with $(grep -c '^SF:' target/coverage_rust.lcov) source files"
 
       - name: Upload coverage artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
@@ -336,18 +345,27 @@ jobs:
       - name: Run Rust tests with coverage
         run: |
           set -o pipefail
+          # Run tests but don't generate report yet - we'll combine with Python test coverage
           cargo llvm-cov nextest --cargo-profile profiling --all-features --workspace \
-            --ignore-filename-regex '(\.cargo|/rustc/|/target/)' \
-            --lcov --output-path target/coverage_rust.lcov \
+            --no-report \
             2>&1 | tee target/test-metrics-rust-aarch64.txt
 
       - name: Run Python tests with coverage
         run: |
           set -o pipefail
+          # Python tests exercise PyO3 bindings - profraw files generated from instrumented wheel
           source <(cargo llvm-cov show-env --export-prefix)
           venv/bin/python -m slipcover --xml --out target/coverage_python.xml \
             -m pytest tests/ -v --tb=short --junitxml=target/pytest_results.xml \
             2>&1 | tee target/test-metrics-python-aarch64.txt
+
+      - name: Generate combined Rust coverage report
+        run: |
+          # Generate LCOV report combining Rust tests + Python tests (PyO3 bindings coverage)
+          cargo llvm-cov report --profile profiling \
+            --ignore-filename-regex '(\.cargo|/rustc/|/target/)' \
+            --lcov --output-path target/coverage_rust.lcov
+          echo "Coverage report generated with $(grep -c '^SF:' target/coverage_rust.lcov) source files"
 
       - name: Build instrumented test binaries for hardware
         run: |
