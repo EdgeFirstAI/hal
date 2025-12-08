@@ -180,15 +180,23 @@ jobs:
         run: |
           # Clean previous coverage data to ensure fresh collection
           cargo llvm-cov clean --workspace
-          # Export coverage environment for subsequent steps
-          cargo llvm-cov show-env --export-prefix > /tmp/coverage-env.sh
+          # Export coverage environment for subsequent steps (filter out info/warning lines)
+          cargo llvm-cov show-env --export-prefix 2>&1 | grep '^export ' > /tmp/coverage-env.sh
+          # Tell maturin to use the same target directory as cargo-llvm-cov
+          echo 'export CARGO_TARGET_DIR="$CARGO_LLVM_COV_TARGET_DIR/llvm-cov-target"' >> /tmp/coverage-env.sh
+          # Override LLVM_PROFILE_FILE to write to llvm-cov-target where cargo llvm-cov report looks
+          echo 'export LLVM_PROFILE_FILE="$CARGO_LLVM_COV_TARGET_DIR/llvm-cov-target/hal-%p-%16m.profraw"' >> /tmp/coverage-env.sh
+          echo "Coverage environment:"
           cat /tmp/coverage-env.sh
 
       - name: Build Python bindings with coverage instrumentation
         run: |
           # Source the coverage environment variables so maturin uses instrumented build
           source /tmp/coverage-env.sh
+          echo "Building with CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
+          echo "RUSTFLAGS=$RUSTFLAGS"
           # Build wheel with coverage instrumentation via RUSTFLAGS
+          # Use CARGO_TARGET_DIR to ensure maturin uses the same target as cargo-llvm-cov
           venv/bin/maturin build \
             --manifest-path crates/python/Cargo.toml \
             --out target/wheels \
@@ -339,14 +347,21 @@ jobs:
         run: |
           # Clean previous coverage data to ensure fresh collection
           cargo llvm-cov clean --workspace
-          # Export coverage environment for subsequent steps
-          cargo llvm-cov show-env --export-prefix > /tmp/coverage-env.sh
+          # Export coverage environment for subsequent steps (filter out info/warning lines)
+          cargo llvm-cov show-env --export-prefix 2>&1 | grep '^export ' > /tmp/coverage-env.sh
+          # Tell maturin to use the same target directory as cargo-llvm-cov
+          echo 'export CARGO_TARGET_DIR="$CARGO_LLVM_COV_TARGET_DIR/llvm-cov-target"' >> /tmp/coverage-env.sh
+          # Override LLVM_PROFILE_FILE to write to llvm-cov-target where cargo llvm-cov report looks
+          echo 'export LLVM_PROFILE_FILE="$CARGO_LLVM_COV_TARGET_DIR/llvm-cov-target/hal-%p-%16m.profraw"' >> /tmp/coverage-env.sh
+          echo "Coverage environment:"
           cat /tmp/coverage-env.sh
 
       - name: Build Python bindings with coverage instrumentation
         run: |
           # Source the coverage environment variables so maturin uses instrumented build
           source /tmp/coverage-env.sh
+          echo "Building with CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
+          echo "RUSTFLAGS=$RUSTFLAGS"
           # Build wheel with coverage instrumentation via RUSTFLAGS
           # No need for zig/manylinux2014 here - target glibc (2.41) is newer than Ubuntu 22.04 (2.35)
           venv/bin/maturin build \
