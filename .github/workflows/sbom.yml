@@ -1,27 +1,40 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright © 2025 Au-Zone Technologies. All Rights Reserved.
+#
+# SBOM Generation & License Compliance Workflow
+#
+# Generates Software Bill of Materials (SBOM) and validates license compliance.
+# Uses cargo-cyclonedx for Rust dependencies and scancode-toolkit for source files.
+#
+# Action Versions (hash-pinned for security per Au-Zone SPS v2.1):
+# - actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 (v4)
+# - actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 (v5)
+# - actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 (v4)
+# - actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 (v4)
+# - dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b (stable)
+# - softprops/action-gh-release@5be0e66d93ac7ed76da52eca8bb058f665c3a5fe (v2.4.2)
 
 name: SBOM Generation & License Compliance
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [main, develop]
   pull_request:
-    branches: [ main, develop ]
+    branches: [main, develop]
   release:
     types: [published]
 
 jobs:
   sbom-compliance:
     name: Generate SBOM & Check License Compliance
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
       - name: Set up Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
         with:
           toolchain: stable
 
@@ -29,7 +42,7 @@ jobs:
         run: cargo install cargo-cyclonedx
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: '3.11'
 
@@ -54,7 +67,7 @@ jobs:
         run: cyclonedx validate --input-file sbom.json
 
       - name: Upload SBOM Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: sbom-${{ github.sha }}
           path: |
@@ -72,17 +85,17 @@ jobs:
   release-sbom:
     name: Attach SBOM to Release
     if: github.event_name == 'release'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     needs: sbom-compliance
 
     steps:
       - name: Download SBOM Artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: sbom-${{ github.sha }}
 
       - name: Attach SBOM to Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@5be0e66d93ac7ed76da52eca8bb058f665c3a5fe  # v2.4.2
         with:
           files: |
             sbom.json
