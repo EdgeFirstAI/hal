@@ -1071,10 +1071,10 @@ impl CPUConverter {
 
         let options = if let Some(crop) = crop.src_rect {
             self.options.crop(
-                crop.left as f64 / src.width() as f64,
-                crop.top as f64 / src.height() as f64,
-                crop.width as f64 / src.width() as f64,
-                crop.height as f64 / src.height() as f64,
+                crop.left as f64,
+                crop.top as f64,
+                crop.width as f64,
+                crop.height as f64,
             )
         } else {
             self.options
@@ -2210,7 +2210,7 @@ mod cpu_tests {
     #[test]
     fn test_cpu_src_crop() -> Result<()> {
         // Load source
-        let src = load_bytes_to_tensor(2, 2, GREY, None, &[1, 2, 3, 4])?;
+        let src = load_bytes_to_tensor(2, 2, GREY, None, &[10, 20, 30, 40])?;
 
         let mut converter = CPUConverter::default();
 
@@ -2221,12 +2221,14 @@ mod cpu_tests {
             &mut converted,
             Rotation::None,
             Flip::None,
-            Crop::new().with_src_rect(Some(Rect::new(0, 0, 1, 1))),
+            Crop::new().with_src_rect(Some(Rect::new(0, 0, 1, 2))),
         )?;
 
         assert_eq!(
             converted.tensor().map()?.as_slice(),
-            &[1, 1, 1, 255, 1, 1, 1, 255, 1, 1, 1, 255, 1, 1, 1, 255]
+            &[
+                10, 10, 10, 255, 13, 13, 13, 255, 30, 30, 30, 255, 33, 33, 33, 255
+            ]
         );
         Ok(())
     }
