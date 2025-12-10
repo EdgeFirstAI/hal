@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Python Bindings** (`edgefirst-hal` on PyPI):
   - PyO3-based Python API with numpy integration
   - `TensorImage` for image loading and manipulation
-  - `ImageConverter` for format conversion and resizing
+  - `ImageProcessor` for format conversion and resizing
   - `Decoder` for YOLO model output post-processing
   - Support for Python 3.8, 3.9, 3.10, 3.11, 3.12
 - **Image Processing Features**:

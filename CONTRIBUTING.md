@@ -268,11 +268,11 @@ cargo bench -p edgefirst_tensor
 /// # Examples
 ///
 /// ```rust
-/// use edgefirst::image::{TensorImage, ImageConverter};
+/// use edgefirst::image::{TensorImage, ImageProcessor};
 ///
 /// let src = TensorImage::load("input.jpg", None, None)?;
 /// let mut dst = TensorImage::new(640, 640, RGB, None)?;
-/// let converter = ImageConverter::new()?;
+/// let converter = ImageProcessor::new()?;
 /// converter.convert(&src, &mut dst, Default::default())?;
 /// ```
 ///

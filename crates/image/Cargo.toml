@@ -10,8 +10,9 @@ readme.workspace = true
 license.workspace = true
 
 [features]
-default = ["opengl"]
+default = ["opengl", "decoder"]
 opengl = ["dep:khronos-egl", "dep:gbm"]
+decoder = ["dep:edgefirst-decoder", "dep:ndarray-stats"]
 g2d_test_formats = []
 
 [dependencies]
@@ -34,6 +35,8 @@ tokio = { workspace = true }
 yuv = { workspace = true }
 zune-jpeg = { workspace = true }
 zune-png = { workspace = true }
+edgefirst-decoder = { workspace = true, optional = true }
+ndarray-stats = { workspace = true, optional = true}
 
 [target.'cfg(target_os = "linux")'.dependencies]
 dma-heap = { workspace = true }
