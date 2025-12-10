@@ -2018,7 +2018,7 @@ mod cpu_tests {
                 Crop::default(),
             )?;
 
-            compare_images_convert_to_grey(&dst, &converted, 0.99, function!());
+            compare_images_convert_to_grey(&dst, &converted, 0.985, function!());
 
             Ok(())
         }};

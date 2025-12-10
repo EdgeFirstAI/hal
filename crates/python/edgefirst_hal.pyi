@@ -230,11 +230,17 @@ class FourCC(enum.Enum):
     NV12: FourCC
     """NV12 format (YUV 4:2:0)"""
 
+    NV16: FourCC
+    """NV16 format (YUV 4:2:2)"""
+
     GREY: FourCC
     """Greyscale format"""
 
     PLANAR_RGB: FourCC
     """Planar RGB format (Red plane, Green plane, Blue plane)"""
+
+    PLANAR_RGBA: FourCC
+    """Planar RGBA format (Red plane, Green plane, Blue plane, Alpha plane)"""
 
     def __init__(self, fourcc: str) -> None: ...
 
