@@ -235,9 +235,44 @@ cargo test test_name
 # Python tests (requires maturin develop first)
 python -m pytest tests/ -v
 
-# With coverage
-cargo tarpaulin --workspace
+# With coverage (Rust)
+cargo install cargo-llvm-cov
+cargo llvm-cov --workspace --lcov --output-path lcov.info
+
+# With coverage (Python, after building with instrumentation)
+pip install slipcover
+python -m slipcover -m pytest tests/
 ```
+
+## CI/CD Workflows
+
+The project uses GitHub Actions for continuous integration. Workflows are in `.github/workflows/`.
+
+### Test Workflow (`test.yml`)
+
+Runs on every push and PR to `main` or `develop`:
+
+- **Formatting check**: `cargo +nightly fmt --all -- --check`
+- **Linting**: `cargo clippy --workspace`
+- **Multi-platform testing**: x86_64, aarch64, NXP i.MX8M Plus hardware
+- **Coverage collection**: Rust (cargo-llvm-cov) + Python (slipcover)
+- **SonarCloud analysis**: Static analysis and coverage aggregation
+
+### Release Workflow (`release.yml`)
+
+Triggered by version tags (`X.Y.Z` or `X.Y.ZrcN`):
+
+- Builds Python wheels for Linux, Windows, and macOS
+- Publishes to PyPI (stable releases only)
+- Creates GitHub Release with changelog
+
+### SBOM Workflow (`sbom.yml`)
+
+Runs on push/PR and releases:
+
+- Generates Software Bill of Materials (CycloneDX format)
+- Validates license compliance
+- Attaches SBOM to releases
 
 ## Benchmarking
 

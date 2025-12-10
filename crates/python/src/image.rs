@@ -120,8 +120,10 @@ pub enum FourCC {
     RGBA,
     RGB,
     NV12,
+    NV16,
     GREY,
     PLANAR_RGB,
+    PLANAR_RGBA,
 }
 
 #[pyclass(eq, eq_int)]
@@ -165,8 +167,10 @@ impl From<FourCC> for FourCharCode {
             FourCC::RGBA => image::RGBA,
             FourCC::RGB => image::RGB,
             FourCC::NV12 => image::NV12,
+            FourCC::NV16 => image::NV16,
             FourCC::GREY => image::GREY,
             FourCC::PLANAR_RGB => image::PLANAR_RGB,
+            FourCC::PLANAR_RGBA => image::PLANAR_RGBA,
         }
     }
 }

@@ -1,0 +1,6 @@
+{
+    "sonarlint.connectedMode.project": {
+        "connectionId": "edgefirstai",
+        "projectKey": "EdgeFirstAI_hal"
+    }
+}
