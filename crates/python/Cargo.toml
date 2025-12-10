@@ -8,15 +8,15 @@ homepage.workspace = true
 repository.workspace = true
 readme.workspace = true
 license.workspace = true
+publish = false  # Python bindings only - distributed via PyPI, not crates.io
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib"]
 
 [features]
-default = ["extension-module"]
+default = []
 python-abi38 = ["pyo3/abi3-py38"]
 python-abi311 = ["pyo3/abi3-py311"]
-extension-module = ["pyo3/extension-module"]
 
 [dependencies]
 edgefirst = { workspace = true }
@@ -26,11 +26,11 @@ half = { workspace = true }
 log = { workspace = true }
 ndarray = { workspace = true }
 numpy = { workspace = true }
-pyo3 = { workspace = true }
+pyo3 = { workspace = true, features = ["extension-module"] }
 pythonize = { workspace = true }
 
 [build-dependencies]
-pyo3-build-config = { workspace = true }
+pyo3-build-config = { workspace = true, features = ["resolve-config"] }
 rustc_version = { workspace = true }
 
 [dev-dependencies]

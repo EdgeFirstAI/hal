@@ -53,9 +53,10 @@ def parse_rust_lcov(lcov_paths: str) -> dict:
                     line = line.strip()
                     if line.startswith('SF:'):
                         path = line[3:]
-                        # Normalize path to crates/...
+                        # Only include files from crates/ directory
+                        # (skip .cargo, target, rustc, etc.)
                         match = re.search(r'crates/[^/]+/.*', path)
-                        current_file = match.group(0) if match else path
+                        current_file = match.group(0) if match else None
                     elif line.startswith('DA:') and current_file:
                         parts = line[3:].split(',')
                         if len(parts) >= 2:
