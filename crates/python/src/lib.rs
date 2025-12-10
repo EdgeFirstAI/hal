@@ -46,7 +46,7 @@ pub mod edgefirst_hal {
         m.add_class::<image::PyRect>()?;
         m.add_class::<image::PyRotation>()?;
         m.add_class::<image::PyFlip>()?;
-        m.add_class::<image::PyImageConverter>()?;
+        m.add_class::<image::PyImageProcessor>()?;
         m.add_class::<image::PyTensorImage>()?;
         m.add_class::<image::PyTensorMemory>()?;
         m.add_class::<decoder::PyDecoder>()?;
