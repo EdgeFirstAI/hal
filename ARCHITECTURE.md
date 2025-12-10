@@ -113,7 +113,7 @@ flowchart TD
 **Architecture**:
 ```mermaid
 classDiagram
-    class ImageConverterTrait {
+    class ImageProcessorTrait {
         <<trait>>
         +convert(src, dst, options)
     }
@@ -130,9 +130,9 @@ classDiagram
         fast_image_resize fallback
     }
     
-    ImageConverterTrait <|.. G2DConverter
-    ImageConverterTrait <|.. GLConverterThreaded
-    ImageConverterTrait <|.. CPUConverter
+    ImageProcessorTrait <|.. G2DConverter
+    ImageProcessorTrait <|.. GLConverterThreaded
+    ImageProcessorTrait <|.. CPUConverter
 ```
 
 **Supported Operations**:
@@ -155,7 +155,7 @@ Planar RGB (FourCC: 8BPS) stores color channels in separate planes rather than i
 flowchart TD
     Input[Input Image<br/>JPEG/PNG bytes or raw pixels]
     TI[TensorImage<br/>Tensor&lt;u8&gt; + FourCC format]
-    Conv{ImageConverter::convert<br/>Backend selection}
+    Conv{ImageProcessor::convert<br/>Backend selection}
     G2D[G2D Acceleration<br/>NXP i.MX only]
     GL[OpenGL Acceleration<br/>GPU accelerated]
     CPU[CPU Fallback<br/>fast_image_resize]
@@ -301,7 +301,7 @@ flowchart TD
 **Exposed Classes**:
 - `PyTensor`: Generic tensor with numpy buffer protocol
 - `PyTensorImage`: Image container with format metadata
-- `PyImageConverter`: Image processing operations
+- `PyImageProcessor`: Image processing operations
 - `PyDecoder`: Model output decoding
 - `FourCC`, `Normalization`, `PyRect`, `PyRotation`, `PyFlip`: Configuration enums
 
@@ -338,14 +338,14 @@ flowchart LR
 ### Pattern 1: Basic Image Conversion
 
 ```rust
-use edgefirst::image::{TensorImage, ImageConverter, RGBA, RGB};
+use edgefirst::image::{TensorImage, ImageProcessor, RGBA, RGB};
 use edgefirst::tensor::TensorMemory;
 
 // Load image from JPEG
 let input = TensorImage::load("testdata/zidane.jpg", Some(RGB), None)?;
 
 // Create converter (auto-selects G2D or CPU)
-let mut converter = ImageConverter::new()?;
+let mut converter = ImageProcessor::new()?;
 
 // Create output buffer
 let mut output = TensorImage::new(640, 640, RGB, Some(TensorMemory::Dma))?;
@@ -426,7 +426,7 @@ import numpy as np
 tensor_img = ef.TensorImage.load("testdata/zidane.jpg", ef.FourCC.RGB)
 
 # Create converter
-converter = ef.ImageConverter()
+converter = ef.ImageProcessor()
 
 # Create output image
 output = ef.TensorImage(640, 640)
@@ -445,7 +445,7 @@ output.normalize_to_numpy(output_array)
 
 The HAL uses Rust traits extensively to provide polymorphic behavior:
 - `TensorTrait<T>`: Common interface for all tensor types
-- `ImageConverterTrait`: Common interface for all image converters
+- `ImageProcessorTrait`: Common interface for all image converters
 - `DetectionBox`: Trait for objects with bounding boxes
 
 ### 2. Enum Dispatch
@@ -517,7 +517,7 @@ Decoder implementations use:
 All major types implement `Send + Sync`:
 - `Tensor<T>`: Safe to share across threads
 - `TensorImage`: Thread-safe
-- `ImageConverter`: Thread-local (create per thread)
+- `ImageProcessor`: Thread-local (create per thread)
 - `Decoder`: Thread-safe for read operations
 
 ## Error Handling

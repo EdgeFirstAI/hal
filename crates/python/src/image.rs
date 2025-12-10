@@ -6,18 +6,22 @@ use crate::{
     tensor::{PyTensorMap, TensorMapT},
 };
 use edgefirst::{
-    image::{self, Crop, Flip, ImageConverterTrait, RGBA, Rect, Rotation, TensorImage},
+    decoder::{BoundingBox, DetectBox, Segmentation},
+    image::{self, Crop, Flip, ImageProcessorTrait, RGBA, Rect, Rotation, TensorImage},
     tensor::{self, TensorMapTrait, TensorMemory, TensorTrait},
 };
 use four_char_code::FourCharCode;
 
 use ndarray::{
-    ArrayView3, ArrayViewMut3, Zip,
+    ArrayView1, ArrayView2, ArrayView3, ArrayViewMut3, Zip,
     parallel::prelude::{
         IndexedParallelIterator, IntoParallelIterator, IntoParallelRefMutIterator, ParallelIterator,
     },
 };
-use numpy::{PyArrayLike3, PyReadwriteArray3, PyUntypedArrayMethods};
+use numpy::{
+    PyArrayLike3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, PyReadwriteArray3,
+    PyUntypedArrayMethods,
+};
 use pyo3::prelude::*;
 use std::{
     fmt::{self},
@@ -877,18 +881,18 @@ fn normalize_to_float_64<'py>(
     Ok(())
 }
 
-#[pyclass(name = "ImageConverter")]
-pub struct PyImageConverter(Mutex<image::ImageConverter>);
+#[pyclass(name = "ImageProcessor")]
+pub struct PyImageProcessor(Mutex<image::ImageProcessor>);
 
-unsafe impl Send for PyImageConverter {}
-unsafe impl Sync for PyImageConverter {}
+unsafe impl Send for PyImageProcessor {}
+unsafe impl Sync for PyImageProcessor {}
 
 #[pymethods]
-impl PyImageConverter {
+impl PyImageProcessor {
     #[new]
     pub fn new() -> Result<Self> {
-        let converter = image::ImageConverter::new()?;
-        Ok(PyImageConverter(Mutex::new(converter)))
+        let converter = image::ImageProcessor::new()?;
+        Ok(PyImageProcessor(Mutex::new(converter)))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -916,6 +920,83 @@ impl PyImageConverter {
                 },
             )?
         };
+        Ok(())
+    }
+
+    #[pyo3(signature = (dst, bbox, scores, classes, seg=vec![]))]
+    pub fn render_to_image(
+        &mut self,
+        dst: &mut PyTensorImage,
+        bbox: PyReadonlyArray2<f32>,
+        scores: PyReadonlyArray1<f32>,
+        classes: PyReadonlyArray1<usize>,
+        seg: Vec<PyReadonlyArray3<u8>>,
+    ) -> Result<()> {
+        if bbox.shape()[1] != 4 {
+            return Err(Error::InvalidArg("bbox shape must be (N, 4)".to_string()));
+        }
+        if bbox.shape()[0] != scores.shape()[0] || bbox.shape()[0] != classes.shape()[0] {
+            return Err(Error::InvalidArg(
+                "bbox, scores, classes must have the same length".to_string(),
+            ));
+        }
+        let bbox: ArrayView2<f32> = bbox.as_array();
+        let scores: ArrayView1<f32> = scores.as_array();
+        let classes: ArrayView1<usize> = classes.as_array();
+        let detect = Zip::from(bbox.rows())
+            .and(scores)
+            .and(classes)
+            .into_par_iter()
+            .map(|(b, s, c)| DetectBox {
+                bbox: BoundingBox::new(b[0], b[1], b[2], b[3]),
+                score: *s,
+                label: *c,
+            })
+            .collect::<Vec<_>>();
+
+        let mut is_instance = false;
+        for s in &seg {
+            if s.shape()[2] == 1 {
+                is_instance = true;
+                break;
+            }
+        }
+
+        if !is_instance && !seg.is_empty() && seg.len() <= detect.len() {
+            return Err(Error::InvalidArg(
+                "instance segmentation masks length must be less than or equal to detections length"
+                    .to_string(),
+            ));
+        }
+
+        let seg = seg
+            .into_iter()
+            .enumerate()
+            .map(|(ind, s)| {
+                let arr: ArrayView3<u8> = s.as_array();
+                let (xmin, ymin, xmax, ymax) = if arr.shape()[2] == 1 {
+                    (
+                        detect[ind].bbox.xmin,
+                        detect[ind].bbox.ymin,
+                        detect[ind].bbox.xmax,
+                        detect[ind].bbox.ymax,
+                    )
+                } else {
+                    (0.0, 0.0, 1.0, 1.0)
+                };
+                Segmentation {
+                    xmin,
+                    ymin,
+                    xmax,
+                    ymax,
+                    segmentation: arr.to_owned(),
+                }
+            })
+            .collect::<Vec<_>>();
+        if let Ok(mut l) = self.0.lock() {
+            l.render_to_image(&mut dst.0, &detect, &seg)?
+        };
+        // Ok(PyTensorImage(dst_image))
         Ok(())
     }
 }

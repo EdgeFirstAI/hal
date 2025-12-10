@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    Crop, Error, Flip, FunctionTimer, GREY, ImageConverterTrait, NV12, NV16, PLANAR_RGB,
+    Crop, Error, Flip, FunctionTimer, GREY, ImageProcessorTrait, NV12, NV16, PLANAR_RGB,
     PLANAR_RGBA, RGB, RGBA, Rect, Result, Rotation, TensorImage, YUYV,
 };
+#[cfg(feature = "decoder")]
+use edgefirst_decoder::{DetectBox, Segmentation};
 use edgefirst_tensor::{TensorMapTrait, TensorTrait};
 use four_char_code::FourCharCode;
 use ndarray::{ArrayView3, ArrayViewMut3, Axis};
@@ -13,16 +15,16 @@ use rayon::iter::{
 };
 use std::ops::Shr;
 
-/// CPUConverter implements the ImageConverter trait using the fallback CPU
+/// CPUConverter implements the ImageProcessor trait using the fallback CPU
 /// implementation for image processing.
 #[derive(Debug, Clone)]
-pub struct CPUConverter {
+pub struct CPUProcessor {
     resizer: fast_image_resize::Resizer,
     options: fast_image_resize::ResizeOptions,
 }
 
-unsafe impl Send for CPUConverter {}
-unsafe impl Sync for CPUConverter {}
+unsafe impl Send for CPUProcessor {}
+unsafe impl Sync for CPUProcessor {}
 
 #[inline(always)]
 fn limit_to_full(l: u8) -> u8 {
@@ -34,13 +36,13 @@ fn full_to_limit(l: u8) -> u8 {
     ((l as u16 * (240 - 16) + 255 / 2) / 255 + 16) as u8
 }
 
-impl Default for CPUConverter {
+impl Default for CPUProcessor {
     fn default() -> Self {
         Self::new_bilinear()
     }
 }
 
-impl CPUConverter {
+impl CPUProcessor {
     /// Creates a new CPUConverter with bilinear resizing.
     pub fn new() -> Self {
         Self::new_bilinear()
@@ -977,7 +979,7 @@ impl CPUConverter {
     pub(crate) fn convert_format(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         // shapes should be equal
         let _timer = FunctionTimer::new(format!(
-            "ImageConverter::convert_format {} to {}",
+            "ImageProcessor::convert_format {} to {}",
             src.fourcc().display(),
             dst.fourcc().display()
         ));
@@ -1045,7 +1047,7 @@ impl CPUConverter {
         crop: Crop,
     ) -> Result<()> {
         let _timer = FunctionTimer::new(format!(
-            "ImageConverter::resize_flip_rotate {}x{} to {}x{} {}",
+            "ImageProcessor::resize_flip_rotate {}x{} to {}x{} {}",
             src.width(),
             src.height(),
             dst.width(),
@@ -1419,9 +1421,199 @@ impl CPUConverter {
 
         [y, u, y, v]
     }
+
+    #[cfg(feature = "decoder")]
+    fn render_modelpack_segmentation(
+        &mut self,
+        dst: &TensorImage,
+        dst_slice: &mut [u8],
+        segmentation: &Segmentation,
+    ) -> Result<()> {
+        use ndarray_stats::QuantileExt;
+
+        let seg = &segmentation.segmentation;
+        let [seg_height, seg_width, _seg_classes] = *seg.shape() else {
+            unreachable!("Array3 did not have [usize;3] as shape");
+        };
+        let start_y = (dst.height() as f32 * segmentation.ymin).round();
+        let end_y = (dst.height() as f32 * segmentation.ymax).round();
+        let start_x = (dst.width() as f32 * segmentation.xmin).round();
+        let end_x = (dst.width() as f32 * segmentation.xmax).round();
+
+        let scale_x = (seg_width as f32 - 1.0) / ((end_x - start_x) - 1.0);
+        let scale_y = (seg_height as f32 - 1.0) / ((end_y - start_y) - 1.0);
+
+        let start_x_u = (start_x as usize).min(dst.width());
+        let start_y_u = (start_y as usize).min(dst.height());
+        let end_x_u = (end_x as usize).min(dst.width());
+        let end_y_u = (end_y as usize).min(dst.height());
+
+        let argmax = seg.map_axis(Axis(2), |r| r.argmax().unwrap());
+        let get_value_at_nearest = |x: f32, y: f32| -> usize {
+            let x = x.round() as usize;
+            let y = y.round() as usize;
+            argmax
+                .get([y.min(seg_height - 1), x.min(seg_width - 1)])
+                .copied()
+                .unwrap_or(0)
+        };
+
+        for y in start_y_u..end_y_u {
+            for x in start_x_u..end_x_u {
+                use crate::DEFAULT_SEGMENTATION_COLORS_U8;
+
+                let seg_x = (x as f32 - start_x) * scale_x;
+                let seg_y = (y as f32 - start_y) * scale_y;
+                let label = get_value_at_nearest(seg_x, seg_y);
+
+                if label == 0 {
+                    continue;
+                }
+
+                let alpha = 179;
+                let color = if label < DEFAULT_SEGMENTATION_COLORS_U8.len() {
+                    DEFAULT_SEGMENTATION_COLORS_U8[label]
+                } else {
+                    [0, 0, 0, 179]
+                };
+
+                let dst_index = (y * dst.row_stride()) + (x * dst.channels());
+                for c in 0..3 {
+                    dst_slice[dst_index + c] = ((color[c] as u16 * alpha
+                        + dst_slice[dst_index + c] as u16 * (255 - alpha))
+                        / 255) as u8;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "decoder")]
+    fn render_yolo_segmentation(
+        &mut self,
+        dst: &TensorImage,
+        dst_slice: &mut [u8],
+        segmentation: &Segmentation,
+        class: usize,
+    ) -> Result<()> {
+        use crate::DEFAULT_SEGMENTATION_COLORS_U8;
+
+        let class = (class + 1).min(DEFAULT_SEGMENTATION_COLORS_U8.len() - 1);
+
+        let seg = &segmentation.segmentation;
+        let [seg_height, seg_width, classes] = *seg.shape() else {
+            unreachable!("Array3 did not have [usize;3] as shape");
+        };
+        debug_assert_eq!(classes, 1);
+
+        let start_y = (dst.height() as f32 * segmentation.ymin).round();
+        let end_y = (dst.height() as f32 * segmentation.ymax).round();
+        let start_x = (dst.width() as f32 * segmentation.xmin).round();
+        let end_x = (dst.width() as f32 * segmentation.xmax).round();
+
+        let scale_x = (seg_width as f32 - 1.0) / ((end_x - start_x) - 1.0);
+        let scale_y = (seg_height as f32 - 1.0) / ((end_y - start_y) - 1.0);
+
+        let start_x_u = (start_x as usize).min(dst.width());
+        let start_y_u = (start_y as usize).min(dst.height());
+        let end_x_u = (end_x as usize).min(dst.width());
+        let end_y_u = (end_y as usize).min(dst.height());
+
+        for y in start_y_u..end_y_u {
+            for x in start_x_u..end_x_u {
+                let seg_x = ((x as f32 - start_x) * scale_x) as usize;
+                let seg_y = ((y as f32 - start_y) * scale_y) as usize;
+                let val = *seg.get([seg_y, seg_x, 0]).unwrap_or(&0);
+
+                if val < 127 {
+                    continue;
+                }
+
+                let alpha = 179;
+                let color = DEFAULT_SEGMENTATION_COLORS_U8[class];
+
+                let dst_index = (y * dst.row_stride()) + (x * dst.channels());
+                for c in 0..3 {
+                    dst_slice[dst_index + c] = ((color[c] as u16 * alpha
+                        + dst_slice[dst_index + c] as u16 * (255 - alpha))
+                        / 255) as u8;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "decoder")]
+    fn render_box(
+        &mut self,
+        dst: &TensorImage,
+        dst_slice: &mut [u8],
+        detect: &[DetectBox],
+    ) -> Result<()> {
+        use crate::DEFAULT_SEGMENTATION_COLORS_U8;
+        const LINE_THICKNESS: usize = 3;
+        for d in detect {
+            use edgefirst_decoder::BoundingBox;
+
+            let label = (d.label + 1).min(DEFAULT_SEGMENTATION_COLORS_U8.len() - 1);
+            let [r, g, b, _] = DEFAULT_SEGMENTATION_COLORS_U8[label];
+            let bbox = d.bbox.to_canonical();
+            let bbox = BoundingBox {
+                xmin: bbox.xmin.clamp(0.0, 1.0),
+                ymin: bbox.ymin.clamp(0.0, 1.0),
+                xmax: bbox.xmax.clamp(0.0, 1.0),
+                ymax: bbox.ymax.clamp(0.0, 1.0),
+            };
+            let inner = [
+                ((dst.width()) as f32 * bbox.xmin).round() as usize,
+                ((dst.height()) as f32 * bbox.ymin).round() as usize,
+                ((dst.width()) as f32 * bbox.xmax).round() as usize,
+                ((dst.height()) as f32 * bbox.ymax).round() as usize,
+            ];
+
+            let outer = [
+                inner[0].saturating_sub(LINE_THICKNESS),
+                inner[1].saturating_sub(LINE_THICKNESS),
+                (inner[2] + LINE_THICKNESS).min(dst.width()),
+                (inner[3] + LINE_THICKNESS).min(dst.height()),
+            ];
+
+            // top line
+            for y in outer[1] + 1..=inner[1] {
+                for x in outer[0] + 1..outer[2] {
+                    let index = (y * dst.row_stride()) + (x * dst.channels());
+                    dst_slice[index..(index + 3)].copy_from_slice(&[r, g, b]);
+                }
+            }
+
+            // left and right lines
+            for y in inner[1]..inner[3] {
+                for x in outer[0] + 1..=inner[0] {
+                    let index = (y * dst.row_stride()) + (x * dst.channels());
+                    dst_slice[index..(index + 3)].copy_from_slice(&[r, g, b]);
+                }
+
+                for x in inner[2]..outer[2] {
+                    let index = (y * dst.row_stride()) + (x * dst.channels());
+                    dst_slice[index..(index + 3)].copy_from_slice(&[r, g, b]);
+                }
+            }
+
+            // bottom line
+            for y in inner[3]..outer[3] {
+                for x in outer[0] + 1..outer[2] {
+                    let index = (y * dst.row_stride()) + (x * dst.channels());
+                    dst_slice[index..(index + 3)].copy_from_slice(&[r, g, b]);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
-impl ImageConverterTrait for CPUConverter {
+impl ImageProcessorTrait for CPUProcessor {
     fn convert(
         &mut self,
         src: &TensorImage,
@@ -1576,6 +1768,43 @@ impl ImageConverterTrait for CPUConverter {
 
         Ok(())
     }
+
+    #[cfg(feature = "decoder")]
+    fn render_to_image(
+        &mut self,
+        dst: &mut TensorImage,
+        detect: &[DetectBox],
+        segmentation: &[Segmentation],
+    ) -> Result<()> {
+        if !matches!(dst.fourcc(), RGBA | RGB) {
+            return Err(crate::Error::NotSupported(
+                "CPU image rendering only supports RGBA or RGB images".to_string(),
+            ));
+        }
+
+        let _timer = FunctionTimer::new("CPUProcessor::render_to_image");
+
+        let mut map = dst.tensor.map()?;
+        let dst_slice = map.as_mut_slice();
+
+        self.render_box(dst, dst_slice, detect)?;
+
+        if segmentation.is_empty() {
+            return Ok(());
+        }
+
+        let is_modelpack = segmentation[0].segmentation.shape()[2] > 1;
+
+        if is_modelpack {
+            self.render_modelpack_segmentation(dst, dst_slice, &segmentation[0])?;
+        } else {
+            for (seg, detect) in segmentation.iter().zip(detect) {
+                self.render_yolo_segmentation(dst, dst_slice, seg, detect.label)?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1583,7 +1812,7 @@ impl ImageConverterTrait for CPUConverter {
 mod cpu_tests {
 
     use super::*;
-    use crate::{CPUConverter, Rotation};
+    use crate::{CPUProcessor, Rotation};
     use edgefirst_tensor::{TensorMapTrait, TensorMemory};
     use g2d_sys::RGBA;
     use image::buffer::ConvertBuffer;
@@ -1615,8 +1844,8 @@ mod cpu_tests {
 
         let mut img_rgb1 = TensorImage::new(img1.width(), img1.height(), RGBA, None).unwrap();
         let mut img_rgb2 = TensorImage::new(img1.width(), img1.height(), RGBA, None).unwrap();
-        CPUConverter::convert_format(img1, &mut img_rgb1).unwrap();
-        CPUConverter::convert_format(img2, &mut img_rgb2).unwrap();
+        CPUProcessor::convert_format(img1, &mut img_rgb1).unwrap();
+        CPUProcessor::convert_format(img2, &mut img_rgb2).unwrap();
 
         let image1 = image::RgbaImage::from_vec(
             img_rgb1.width() as u32,
@@ -1664,8 +1893,8 @@ mod cpu_tests {
 
         let mut img_rgb1 = TensorImage::new(img1.width(), img1.height(), RGB, None).unwrap();
         let mut img_rgb2 = TensorImage::new(img1.width(), img1.height(), RGB, None).unwrap();
-        CPUConverter::convert_format(img1, &mut img_rgb1).unwrap();
-        CPUConverter::convert_format(img2, &mut img_rgb2).unwrap();
+        CPUProcessor::convert_format(img1, &mut img_rgb1).unwrap();
+        CPUProcessor::convert_format(img2, &mut img_rgb2).unwrap();
 
         let image1 = image::RgbImage::from_vec(
             img_rgb1.width() as u32,
@@ -1737,7 +1966,7 @@ mod cpu_tests {
                 include_bytes!(concat!("../../../testdata/", $dst_file)),
             )?;
 
-            let mut converter = CPUConverter::default();
+            let mut converter = CPUProcessor::default();
 
             let mut converted = TensorImage::new(src.width(), src.height(), dst.fourcc(), None)?;
 
@@ -1777,7 +2006,7 @@ mod cpu_tests {
                 include_bytes!(concat!("../../../testdata/", $dst_file)),
             )?;
 
-            let mut converter = CPUConverter::default();
+            let mut converter = CPUProcessor::default();
 
             let mut converted = TensorImage::new(src.width(), src.height(), dst.fourcc(), None)?;
 
@@ -1982,7 +2211,7 @@ mod cpu_tests {
         // Load source
         let src = load_bytes_to_tensor(2, 1, RGB, None, &[0, 0, 0, 255, 255, 255])?;
 
-        let mut converter = CPUConverter::new_nearest();
+        let mut converter = CPUProcessor::new_nearest();
 
         let mut converted = TensorImage::new(4, 1, RGB, None)?;
 
@@ -2013,7 +2242,7 @@ mod cpu_tests {
             &[0, 0, 0, 255, 1, 1, 1, 255, 2, 2, 2, 255, 3, 3, 3, 255],
         )?;
 
-        let mut converter = CPUConverter::default();
+        let mut converter = CPUProcessor::default();
 
         let mut converted = TensorImage::new(4, 4, RGBA, None)?;
 
@@ -2054,7 +2283,7 @@ mod cpu_tests {
             &[0, 0, 0, 255, 1, 1, 1, 255, 2, 2, 2, 255, 3, 3, 3, 255],
         )?;
 
-        let mut converter = CPUConverter::default();
+        let mut converter = CPUProcessor::default();
 
         let mut converted = TensorImage::new(4, 4, RGBA, None)?;
 
@@ -2095,7 +2324,7 @@ mod cpu_tests {
             &[0, 0, 0, 255, 1, 1, 1, 255, 2, 2, 2, 255, 3, 3, 3, 255],
         )?;
 
-        let mut converter = CPUConverter::default();
+        let mut converter = CPUProcessor::default();
 
         let mut converted = TensorImage::new(4, 4, RGBA, None)?;
 
@@ -2136,7 +2365,7 @@ mod cpu_tests {
             &[0, 0, 0, 255, 1, 1, 1, 255, 2, 2, 2, 255, 3, 3, 3, 255],
         )?;
 
-        let mut converter = CPUConverter::default();
+        let mut converter = CPUProcessor::default();
 
         let mut converted = TensorImage::new(4, 4, RGBA, None)?;
 
@@ -2177,7 +2406,7 @@ mod cpu_tests {
             &[0, 0, 0, 255, 1, 1, 1, 255, 2, 2, 2, 255, 3, 3, 3, 255],
         )?;
 
-        let mut converter = CPUConverter::default();
+        let mut converter = CPUProcessor::default();
 
         let mut converted = TensorImage::new(4, 4, RGBA, None)?;
 
@@ -2212,7 +2441,7 @@ mod cpu_tests {
         // Load source
         let src = load_bytes_to_tensor(2, 2, GREY, None, &[10, 20, 30, 40])?;
 
-        let mut converter = CPUConverter::default();
+        let mut converter = CPUProcessor::default();
 
         let mut converted = TensorImage::new(2, 2, RGBA, None)?;
 
@@ -2238,7 +2467,7 @@ mod cpu_tests {
         // Load source
         let src = load_bytes_to_tensor(2, 2, GREY, None, &[2, 4, 6, 8])?;
 
-        let mut converter = CPUConverter::default();
+        let mut converter = CPUProcessor::default();
 
         let mut converted =
             load_bytes_to_tensor(2, 2, YUYV, None, &[200, 128, 200, 128, 200, 128, 200, 128])?;
@@ -2263,7 +2492,7 @@ mod cpu_tests {
         // Load source
         let src = load_bytes_to_tensor(1, 1, RGBA, None, &[3, 3, 3, 255])?;
 
-        let mut converter = CPUConverter::default();
+        let mut converter = CPUProcessor::default();
 
         let mut converted = TensorImage::new(2, 2, RGBA, None)?;
 
@@ -2296,7 +2525,7 @@ mod cpu_tests {
         // Load source
         let src = load_bytes_to_tensor(2, 1, RGBA, None, &[3, 3, 3, 255, 3, 3, 3, 255])?;
 
-        let mut converter = CPUConverter::default();
+        let mut converter = CPUProcessor::default();
 
         let mut converted = TensorImage::new(2, 3, YUYV, None)?;
 
@@ -2329,7 +2558,7 @@ mod cpu_tests {
         // Load source
         let src = load_bytes_to_tensor(2, 1, RGBA, None, &[3, 3, 3, 255, 3, 3, 3, 255])?;
 
-        let mut converter = CPUConverter::default();
+        let mut converter = CPUProcessor::default();
 
         let mut converted = TensorImage::new(2, 3, GREY, None)?;
 
@@ -2355,5 +2584,82 @@ mod cpu_tests {
             &[200, 200, 3, 3, 200, 200]
         );
         Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "decoder")]
+    fn test_segmentation() {
+        use edgefirst_decoder::Segmentation;
+        use ndarray::Array3;
+
+        let mut image = TensorImage::load(
+            include_bytes!("../../../testdata/giraffe.jpg"),
+            Some(RGBA),
+            None,
+        )
+        .unwrap();
+
+        let mut segmentation = Array3::from_shape_vec(
+            (2, 160, 160),
+            include_bytes!("../../../testdata/modelpack_seg_2x160x160.bin").to_vec(),
+        )
+        .unwrap();
+        segmentation.swap_axes(0, 1);
+        segmentation.swap_axes(1, 2);
+        let segmentation = segmentation.as_standard_layout().to_owned();
+
+        let seg = Segmentation {
+            segmentation,
+            xmin: 0.0,
+            ymin: 0.0,
+            xmax: 1.0,
+            ymax: 1.0,
+        };
+
+        let mut renderer = CPUProcessor::new();
+        renderer.render_to_image(&mut image, &[], &[seg]).unwrap();
+
+        image.save_jpeg("test_segmentation.jpg", 80).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "decoder")]
+    fn test_segmentation_yolo() {
+        use edgefirst_decoder::Segmentation;
+        use ndarray::Array3;
+
+        let mut image = TensorImage::load(
+            include_bytes!("../../../testdata/giraffe.jpg"),
+            Some(RGBA),
+            None,
+        )
+        .unwrap();
+
+        let segmentation = Array3::from_shape_vec(
+            (76, 55, 1),
+            include_bytes!("../../../testdata/yolov8_seg_crop_76x55.bin").to_vec(),
+        )
+        .unwrap();
+
+        let detect = DetectBox {
+            bbox: [0.59375, 0.25, 0.9375, 0.725].into(),
+            score: 0.99,
+            label: 0,
+        };
+
+        let seg = Segmentation {
+            segmentation,
+            xmin: 0.59375,
+            ymin: 0.25,
+            xmax: 0.9375,
+            ymax: 0.725,
+        };
+
+        let mut renderer = CPUProcessor::new();
+        renderer
+            .render_to_image(&mut image, &[detect], &[seg])
+            .unwrap();
+
+        image.save_jpeg("test_segmentation_yolo.jpg", 80).unwrap();
     }
 }

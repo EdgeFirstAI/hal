@@ -289,12 +289,12 @@ This is a Cargo workspace with multiple crates:
 ### 2. Naming Conventions
 
 **Rust Types:**
-- Core types: `Tensor<T>`, `TensorImage`, `ImageConverter`, `Decoder`
-- Trait names: `TensorTrait<T>`, `ImageConverterTrait`
+- Core types: `Tensor<T>`, `TensorImage`, `ImageProcessor`, `Decoder`
+- Trait names: `TensorTrait<T>`, `ImageProcessorTrait`
 - Enum variants: PascalCase (e.g., `DmaTensor`, `ShmTensor`, `MemTensor`)
 
 **Python Wrapper Types:**
-- Use `Py` prefix: `PyTensor`, `PyTensorImage`, `PyImageConverter`
+- Use `Py` prefix: `PyTensor`, `PyTensorImage`, `PyImageProcessor`
 - This distinguishes Python-facing types from internal Rust types
 - Located in `crates/python/src/`
 
@@ -342,7 +342,7 @@ Image processing uses a fallback chain:
 
 ```rust
 // Preference: G2D → OpenGL → CPU
-impl ImageConverterTrait for ImageConverter {
+impl ImageProcessorTrait for ImageProcessor {
     fn convert(&mut self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         if let Some(g2d) = &mut self.g2d {
             // Try G2D hardware acceleration
