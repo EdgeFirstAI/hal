@@ -966,7 +966,7 @@ impl PyImageProcessor {
             }
         }
 
-        if !is_instance && !seg.is_empty() && seg.len() <= detect.len() {
+        if is_instance && !seg.is_empty() && seg.len() > detect.len() {
             return Err(Error::InvalidArg(
                 "instance segmentation masks length must be less than or equal to detections length"
                     .to_string(),
