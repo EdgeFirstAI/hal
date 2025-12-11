@@ -64,7 +64,7 @@ impl ConfigOutput {
     /// # use edgefirst_decoder::{configs, ConfigOutput};
     /// let detection_config = configs::Detection {
     ///     anchors: None,
-    ///     decoder: configs::DecoderType::Yolov8,
+    ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: None,
     ///     shape: vec![1, 84, 8400],
     ///     channels_first: false,
@@ -91,13 +91,13 @@ impl ConfigOutput {
     /// # use edgefirst_decoder::{configs, ConfigOutput};
     /// let detection_config = configs::Detection {
     ///     anchors: None,
-    ///     decoder: configs::DecoderType::Yolov8,
+    ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: None,
     ///     shape: vec![1, 84, 8400],
     ///     channels_first: false,
     /// };
     /// let output = ConfigOutput::Detection(detection_config);
-    /// assert_eq!(output.decoder(), &configs::DecoderType::Yolov8);
+    /// assert_eq!(output.decoder(), &configs::DecoderType::Ultralytics);
     /// ```
     pub fn decoder(&self) -> &configs::DecoderType {
         match self {
@@ -118,7 +118,7 @@ impl ConfigOutput {
     /// # use edgefirst_decoder::{configs, ConfigOutput};
     /// let detection_config = configs::Detection {
     ///    anchors: None,
-    ///   decoder: configs::DecoderType::Yolov8,
+    ///   decoder: configs::DecoderType::Ultralytics,
     ///   quantization: Some(configs::QuantTuple(0.012345, 26)),
     ///  shape: vec![1, 84, 8400],
     ///   channels_first: false,
@@ -225,8 +225,8 @@ pub mod configs {
     pub enum DecoderType {
         #[serde(rename = "modelpack")]
         ModelPack,
-        #[serde(rename = "yolov8")]
-        Yolov8,
+        #[serde(rename = "ultralytics")]
+        Ultralytics,
     }
 
     #[derive(Debug, Clone, PartialEq)]
@@ -428,7 +428,7 @@ impl DecoderBuilder {
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_yolo_det(configs::Detection {
     ///         anchors: None,
-    ///         decoder: configs::DecoderType::Yolov8,
+    ///         decoder: configs::DecoderType::Ultralytics,
     ///         quantization: Some(configs::QuantTuple(0.012345, 26)),
     ///         shape: vec![1, 84, 8400],
     ///         channels_first: false,
@@ -454,13 +454,13 @@ impl DecoderBuilder {
     /// # use edgefirst_decoder::{ DecoderBuilder, DecoderResult, configs };
     /// # fn main() -> DecoderResult<()> {
     /// let boxes_config = configs::Boxes {
-    ///     decoder: configs::DecoderType::Yolov8,
+    ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: Some(configs::QuantTuple(0.012345, 26)),
     ///     shape: vec![1, 4, 8400],
     ///     channels_first: false,
     /// };
     /// let scores_config = configs::Scores {
-    ///     decoder: configs::DecoderType::Yolov8,
+    ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
     ///     shape: vec![1, 80, 8400],
     ///     channels_first: false,
@@ -491,13 +491,13 @@ impl DecoderBuilder {
     /// # use edgefirst_decoder::{ DecoderBuilder, DecoderResult, configs };
     /// # fn main() -> DecoderResult<()> {
     /// let seg_config = configs::Segmentation {
-    ///     decoder: configs::DecoderType::Yolov8,
+    ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: Some(configs::QuantTuple(0.012345, 26)),
     ///     shape: vec![1, 116, 8400],
     ///     channels_first: false,
     /// };
     /// let protos_config = configs::Protos {
-    ///     decoder: configs::DecoderType::Yolov8,
+    ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
     ///     shape: vec![1, 160, 160, 32],
     ///     channels_first: false,
@@ -531,25 +531,25 @@ impl DecoderBuilder {
     /// # use edgefirst_decoder::{ DecoderBuilder, DecoderResult, configs };
     /// # fn main() -> DecoderResult<()> {
     /// let boxes_config = configs::Boxes {
-    ///     decoder: configs::DecoderType::Yolov8,
+    ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: Some(configs::QuantTuple(0.012345, 26)),
     ///     shape: vec![1, 4, 8400],
     ///     channels_first: false,
     /// };
     /// let scores_config = configs::Scores {
-    ///     decoder: configs::DecoderType::Yolov8,
+    ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: Some(configs::QuantTuple(0.012345, 14)),
     ///     shape: vec![1, 80, 8400],
     ///     channels_first: false,
     /// };
     /// let mask_config = configs::MaskCoefficients {
-    ///     decoder: configs::DecoderType::Yolov8,
+    ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: Some(configs::QuantTuple(0.0064123, 125)),
     ///     shape: vec![1, 32, 8400],
     ///     channels_first: false,
     /// };
     /// let protos_config = configs::Protos {
-    ///     decoder: configs::DecoderType::Yolov8,
+    ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
     ///     shape: vec![1, 160, 160, 32],
     ///     channels_first: false,
@@ -868,7 +868,7 @@ impl DecoderBuilder {
         for c in &configs {
             match c.decoder() {
                 DecoderType::ModelPack => modelpack = true,
-                DecoderType::Yolov8 => yolo = true,
+                DecoderType::Ultralytics => yolo = true,
             }
         }
         match (modelpack, yolo) {
@@ -1630,7 +1630,7 @@ impl Decoder {
     /// #   let model_output_f64 = Array3::from_shape_vec((1, 84, 8400), out_dequant)?.into_dyn();
     ///    let decoder = DecoderBuilder::default()
     ///     .with_config_yolo_det(Detection {
-    ///         decoder: DecoderType::Yolov8,
+    ///         decoder: DecoderType::Ultralytics,
     ///         quantization: None,
     ///         shape: vec![1, 84, 8400],
     ///         channels_first: false,
@@ -2458,7 +2458,7 @@ mod decoder_builder_tests {
         let result = DecoderBuilder::new()
             .with_config_modelpack_det(
                 configs::Boxes {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 4, 8400],
                     channels_first: false,
                     quantization: None,
@@ -2482,13 +2482,13 @@ mod decoder_builder_tests {
         let result = DecoderBuilder::new()
             .with_config_yolo_segdet(
                 configs::Segmentation {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 85, 8400, 1], // Invalid shape
                     channels_first: false,
                     quantization: None,
                 },
                 configs::Protos {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 32, 160, 160],
                     channels_first: true,
                     quantization: None,
@@ -2508,7 +2508,7 @@ mod decoder_builder_tests {
                 outputs: vec![ConfigOutput::Mask(configs::Mask {
                     channels_first: false,
                     shape: vec![1, 160, 160, 1],
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     quantization: None,
                 })],
             })
@@ -2526,7 +2526,7 @@ mod decoder_builder_tests {
                 outputs: vec![ConfigOutput::Segmentation(configs::Segmentation {
                     channels_first: false,
                     shape: vec![1, 84, 8400],
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     quantization: None,
                 })],
             })
@@ -2541,7 +2541,7 @@ mod decoder_builder_tests {
         let result = DecoderBuilder::new()
             .with_config_yolo_det(configs::Detection {
                 anchors: None,
-                decoder: DecoderType::Yolov8,
+                decoder: DecoderType::Ultralytics,
                 quantization: None,
                 shape: vec![1, 84, 8400, 1], // Invalid shape
                 channels_first: false,
@@ -2557,13 +2557,13 @@ mod decoder_builder_tests {
         let result = DecoderBuilder::new()
             .with_config_yolo_segdet(
                 configs::Segmentation {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 85, 8400, 1], // Invalid shape
                     channels_first: false,
                     quantization: None,
                 },
                 configs::Protos {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 32, 160, 160],
                     channels_first: true,
                     quantization: None,
@@ -2577,13 +2577,13 @@ mod decoder_builder_tests {
         let result = DecoderBuilder::new()
             .with_config_yolo_segdet(
                 configs::Segmentation {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 85, 8400],
                     channels_first: false,
                     quantization: None,
                 },
                 configs::Protos {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 32, 160, 160, 1], // Invalid shape
                     channels_first: true,
                     quantization: None,
@@ -2597,13 +2597,13 @@ mod decoder_builder_tests {
         let result = DecoderBuilder::new()
             .with_config_yolo_segdet(
                 configs::Segmentation {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 36], // too few classes
                     channels_first: true,
                     quantization: None,
                 },
                 configs::Protos {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 32, 160, 160],
                     channels_first: true,
                     quantization: None,
@@ -2620,13 +2620,13 @@ mod decoder_builder_tests {
         let result = DecoderBuilder::new()
             .with_config_yolo_split_det(
                 configs::Boxes {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 4, 8400, 1], // Invalid shape
                     channels_first: false,
                     quantization: None,
                 },
                 configs::Scores {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 80, 8400],
                     channels_first: false,
                     quantization: None,
@@ -2640,13 +2640,13 @@ mod decoder_builder_tests {
         let result = DecoderBuilder::new()
             .with_config_yolo_split_det(
                 configs::Boxes {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 4, 8400],
                     channels_first: false,
                     quantization: None,
                 },
                 configs::Scores {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 80, 8400, 1], // Invalid shape
                     channels_first: false,
                     quantization: None,
@@ -2660,13 +2660,13 @@ mod decoder_builder_tests {
         let result = DecoderBuilder::new()
             .with_config_yolo_split_det(
                 configs::Boxes {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 4],
                     channels_first: true,
                     quantization: None,
                 },
                 configs::Scores {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400 + 1, 80], // Invalid number of boxes
                     channels_first: true,
                     quantization: None,
@@ -2680,13 +2680,13 @@ mod decoder_builder_tests {
         let result = DecoderBuilder::new()
             .with_config_yolo_split_det(
                 configs::Boxes {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 5, 8400], // Invalid boxes dimensions
                     channels_first: false,
                     quantization: None,
                 },
                 configs::Scores {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 80, 8400],
                     channels_first: false,
                     quantization: None,
@@ -2703,25 +2703,25 @@ mod decoder_builder_tests {
         let result = DecoderBuilder::new()
             .with_config_yolo_split_segdet(
                 configs::Boxes {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 4, 1],
                     channels_first: true,
                     quantization: None,
                 },
                 configs::Scores {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 80],
                     channels_first: true,
                     quantization: None,
                 },
                 configs::MaskCoefficients {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 32],
                     channels_first: true,
                     quantization: None,
                 },
                 configs::Protos {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 32, 160, 160],
                     channels_first: true,
                     quantization: None,
@@ -2735,25 +2735,25 @@ mod decoder_builder_tests {
         let result = DecoderBuilder::new()
             .with_config_yolo_split_segdet(
                 configs::Boxes {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 4],
                     channels_first: true,
                     quantization: None,
                 },
                 configs::Scores {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 80, 1],
                     channels_first: true,
                     quantization: None,
                 },
                 configs::MaskCoefficients {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 32],
                     channels_first: true,
                     quantization: None,
                 },
                 configs::Protos {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 32, 160, 160],
                     channels_first: true,
                     quantization: None,
@@ -2767,25 +2767,25 @@ mod decoder_builder_tests {
         let result = DecoderBuilder::new()
             .with_config_yolo_split_segdet(
                 configs::Boxes {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 4],
                     channels_first: true,
                     quantization: None,
                 },
                 configs::Scores {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 80],
                     channels_first: true,
                     quantization: None,
                 },
                 configs::MaskCoefficients {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 32, 1],
                     channels_first: true,
                     quantization: None,
                 },
                 configs::Protos {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 32, 160, 160],
                     channels_first: true,
                     quantization: None,
@@ -2799,25 +2799,25 @@ mod decoder_builder_tests {
         let result = DecoderBuilder::new()
             .with_config_yolo_split_segdet(
                 configs::Boxes {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 4],
                     channels_first: true,
                     quantization: None,
                 },
                 configs::Scores {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 80],
                     channels_first: true,
                     quantization: None,
                 },
                 configs::MaskCoefficients {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 32],
                     channels_first: true,
                     quantization: None,
                 },
                 configs::Protos {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 32, 160, 160, 1],
                     channels_first: true,
                     quantization: None,
@@ -2831,25 +2831,25 @@ mod decoder_builder_tests {
         let result = DecoderBuilder::new()
             .with_config_yolo_split_segdet(
                 configs::Boxes {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 4],
                     channels_first: true,
                     quantization: None,
                 },
                 configs::Scores {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8401, 80],
                     channels_first: true,
                     quantization: None,
                 },
                 configs::MaskCoefficients {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 32],
                     channels_first: true,
                     quantization: None,
                 },
                 configs::Protos {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 32, 160, 160],
                     channels_first: true,
                     quantization: None,
@@ -2863,25 +2863,25 @@ mod decoder_builder_tests {
         let result = DecoderBuilder::new()
             .with_config_yolo_split_segdet(
                 configs::Boxes {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 4],
                     channels_first: true,
                     quantization: None,
                 },
                 configs::Scores {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 80],
                     channels_first: true,
                     quantization: None,
                 },
                 configs::MaskCoefficients {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8401, 32],
                     channels_first: true,
                     quantization: None,
                 },
                 configs::Protos {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 32, 160, 160],
                     channels_first: true,
                     quantization: None,
@@ -2894,25 +2894,25 @@ mod decoder_builder_tests {
         let result = DecoderBuilder::new()
             .with_config_yolo_split_segdet(
                 configs::Boxes {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 4],
                     channels_first: true,
                     quantization: None,
                 },
                 configs::Scores {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 80],
                     channels_first: true,
                     quantization: None,
                 },
                 configs::MaskCoefficients {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 32],
                     channels_first: true,
                     quantization: None,
                 },
                 configs::Protos {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 31, 160, 160],
                     channels_first: true,
                     quantization: None,

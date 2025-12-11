@@ -19,7 +19,7 @@ If you already know the model type and output formats, you can use the lower-lev
 let decoder = DecoderBuilder::new()
     .with_config_yolo_det(configs::Detection {
         anchors: None,
-        decoder: configs::DecoderType::Yolov8,
+        decoder: configs::DecoderType::Ultralytics,
         quantization: Some(configs::QuantTuple(0.012345, 26)),
         shape: vec![1, 84, 8400],
         channels_first: false,
@@ -1275,7 +1275,7 @@ mod decoder_tests {
 
         let decoder = DecoderBuilder::default()
             .with_config_yolo_det(configs::Detection {
-                decoder: DecoderType::Yolov8,
+                decoder: DecoderType::Ultralytics,
                 shape: vec![1, 84, 8400],
                 anchors: None,
                 quantization: Some(quant),
@@ -1439,13 +1439,13 @@ mod decoder_tests {
         let decoder = DecoderBuilder::default()
             .with_config_yolo_segdet(
                 configs::Segmentation {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     quantization: Some(quant_boxes),
                     shape: vec![1, 116, 8400],
                     channels_first: false,
                 },
                 Protos {
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     quantization: Some(quant_protos),
                     shape: vec![1, 160, 160, 32],
                     channels_first: false,
@@ -1535,13 +1535,13 @@ mod decoder_tests {
             .with_config_yolo_split_det(
                 configs::Boxes {
                     channels_first: false,
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     quantization: Some(QuantTuple(quant_boxes.scale, quant_boxes.zero_point)),
                     shape: vec![1, 4, 8400],
                 },
                 configs::Scores {
                     channels_first: false,
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     quantization: Some(QuantTuple(quant_boxes.scale, quant_boxes.zero_point)),
                     shape: vec![1, 80, 8400],
                 },
@@ -1613,25 +1613,25 @@ mod decoder_tests {
             .with_config_yolo_split_segdet(
                 configs::Boxes {
                     channels_first: false,
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     quantization: Some(QuantTuple(quant_boxes.scale, quant_boxes.zero_point)),
                     shape: vec![1, 4, 8400],
                 },
                 configs::Scores {
                     channels_first: false,
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     quantization: Some(QuantTuple(quant_boxes.scale, quant_boxes.zero_point)),
                     shape: vec![1, 80, 8400],
                 },
                 configs::MaskCoefficients {
                     channels_first: false,
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     quantization: Some(QuantTuple(quant_boxes.scale, quant_boxes.zero_point)),
                     shape: vec![1, 32, 8400],
                 },
                 configs::Protos {
                     channels_first: false,
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     quantization: Some(QuantTuple(quant_protos.scale, quant_protos.zero_point)),
                     shape: vec![1, 160, 160, 32],
                 },
@@ -1718,25 +1718,25 @@ mod decoder_tests {
             .with_config_yolo_split_segdet(
                 configs::Boxes {
                     channels_first: false,
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     quantization: Some(QuantTuple(quant_boxes.scale, quant_boxes.zero_point)),
                     shape: vec![1, 4, 8400],
                 },
                 configs::Scores {
                     channels_first: false,
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     quantization: Some(QuantTuple(quant_boxes.scale, quant_boxes.zero_point)),
                     shape: vec![1, 80, 8400],
                 },
                 configs::MaskCoefficients {
                     channels_first: false,
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     quantization: Some(QuantTuple(quant_boxes.scale, quant_boxes.zero_point)),
                     shape: vec![1, 32, 8400],
                 },
                 configs::Protos {
                     channels_first: false,
-                    decoder: configs::DecoderType::Yolov8,
+                    decoder: configs::DecoderType::Ultralytics,
                     quantization: Some(QuantTuple(quant_protos.scale, quant_protos.zero_point)),
                     shape: vec![1, 160, 160, 32],
                 },
