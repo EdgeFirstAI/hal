@@ -201,6 +201,14 @@ impl ImageProcessorTrait for G2DProcessor {
             "G2D does not support rendering detection or segmentation overlays".to_string(),
         ))
     }
+
+    #[cfg(feature = "decoder")]
+    fn set_class_colors(&mut self, _: &[[u8; 4]]) -> Result<()> {
+        Err(Error::NotImplemented(
+            "G2D does not support setting colors for rendering detection or segmentation overlays"
+                .to_string(),
+        ))
+    }
 }
 
 impl TryFrom<&TensorImage> for G2DSurface {

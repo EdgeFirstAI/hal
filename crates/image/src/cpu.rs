@@ -21,6 +21,8 @@ use std::ops::Shr;
 pub struct CPUProcessor {
     resizer: fast_image_resize::Resizer,
     options: fast_image_resize::ResizeOptions,
+    #[cfg(feature = "decoder")]
+    colors: [[u8; 4]; 21],
 }
 
 unsafe impl Send for CPUProcessor {}
@@ -58,7 +60,12 @@ impl CPUProcessor {
             .use_alpha(false);
 
         log::debug!("CPUConverter created");
-        Self { resizer, options }
+        Self {
+            resizer,
+            options,
+            #[cfg(feature = "decoder")]
+            colors: crate::DEFAULT_COLORS_U8,
+        }
     }
 
     /// Creates a new CPUConverter with nearest neighbor resizing.
@@ -68,7 +75,12 @@ impl CPUProcessor {
             .resize_alg(fast_image_resize::ResizeAlg::Nearest)
             .use_alpha(false);
         log::debug!("CPUConverter created");
-        Self { resizer, options }
+        Self {
+            resizer,
+            options,
+            #[cfg(feature = "decoder")]
+            colors: crate::DEFAULT_COLORS_U8,
+        }
     }
 
     pub(crate) fn flip_rotate_ndarray(
@@ -1460,8 +1472,6 @@ impl CPUProcessor {
 
         for y in start_y_u..end_y_u {
             for x in start_x_u..end_x_u {
-                use crate::DEFAULT_SEGMENTATION_COLORS_U8;
-
                 let seg_x = (x as f32 - start_x) * scale_x;
                 let seg_y = (y as f32 - start_y) * scale_y;
                 let label = get_value_at_nearest(seg_x, seg_y);
@@ -1470,12 +1480,9 @@ impl CPUProcessor {
                     continue;
                 }
 
-                let alpha = 179;
-                let color = if label < DEFAULT_SEGMENTATION_COLORS_U8.len() {
-                    DEFAULT_SEGMENTATION_COLORS_U8[label]
-                } else {
-                    [0, 0, 0, 179]
-                };
+                let color = self.colors[(label - 1) % (self.colors.len() - 1) + 1];
+
+                let alpha = color[3] as u16;
 
                 let dst_index = (y * dst.row_stride()) + (x * dst.channels());
                 for c in 0..3 {
@@ -1497,9 +1504,7 @@ impl CPUProcessor {
         segmentation: &Segmentation,
         class: usize,
     ) -> Result<()> {
-        use crate::DEFAULT_SEGMENTATION_COLORS_U8;
-
-        let class = (class + 1).min(DEFAULT_SEGMENTATION_COLORS_U8.len() - 1);
+        let class = class + 1;
 
         let seg = &segmentation.segmentation;
         let [seg_height, seg_width, classes] = *seg.shape() else {
@@ -1530,8 +1535,9 @@ impl CPUProcessor {
                     continue;
                 }
 
-                let alpha = 179;
-                let color = DEFAULT_SEGMENTATION_COLORS_U8[class];
+                let color = self.colors[(class - 1) % (self.colors.len() - 1) + 1];
+
+                let alpha = color[3] as u16;
 
                 let dst_index = (y * dst.row_stride()) + (x * dst.channels());
                 for c in 0..3 {
@@ -1552,13 +1558,12 @@ impl CPUProcessor {
         dst_slice: &mut [u8],
         detect: &[DetectBox],
     ) -> Result<()> {
-        use crate::DEFAULT_SEGMENTATION_COLORS_U8;
         const LINE_THICKNESS: usize = 3;
         for d in detect {
             use edgefirst_decoder::BoundingBox;
 
-            let label = (d.label + 1).min(DEFAULT_SEGMENTATION_COLORS_U8.len() - 1);
-            let [r, g, b, _] = DEFAULT_SEGMENTATION_COLORS_U8[label];
+            let label = d.label + 1;
+            let [r, g, b, _] = self.colors[(label - 1) % (self.colors.len() - 1) + 1];
             let bbox = d.bbox.to_canonical();
             let bbox = BoundingBox {
                 xmin: bbox.xmin.clamp(0.0, 1.0),
@@ -1803,6 +1808,15 @@ impl ImageProcessorTrait for CPUProcessor {
             }
         }
 
+        Ok(())
+    }
+
+    #[cfg(feature = "decoder")]
+    fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<()> {
+        // the first color is reserved for background
+        for (c, new_c) in self.colors[1..].iter_mut().zip(colors.iter()) {
+            *c = *new_c;
+        }
         Ok(())
     }
 }
@@ -2644,7 +2658,7 @@ mod cpu_tests {
         let detect = DetectBox {
             bbox: [0.59375, 0.25, 0.9375, 0.725].into(),
             score: 0.99,
-            label: 0,
+            label: 22,
         };
 
         let seg = Segmentation {

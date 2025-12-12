@@ -471,8 +471,15 @@ class ImageProcessor:
     ) -> None:
         """
         Render detection and segmentation results onto the destination image.
-        The `bbox`, `scores`, and `classes` parameters should correspond to the outputs of a detection model.
+        The `bbox`, `scores`, and `classes` parameters should correspond to the decoded outputs of a detection model.
         The optional `seg` parameter can be used to provide segmentation masks to render.
+        """
+        ...
+
+    def set_class_colors(self, colors: List[List[int]]) -> None:
+        """
+        Sets the colors used for rendering boxes and masks. The first 20 colors
+        will be set. Each color should be a list of 4 values (0-255 inclusive) representing RGBA.
         """
         ...
 

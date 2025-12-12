@@ -771,6 +771,11 @@ pub trait ImageProcessorTrait {
         detect: &[DetectBox],
         segmentation: &[Segmentation],
     ) -> Result<()>;
+
+    #[cfg(feature = "decoder")]
+    /// Sets the colors used for rendering segmentation masks. Up to 17 colors
+    /// can be set.
+    fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<()>;
 }
 
 /// Image converter that uses available hardware acceleration or CPU as a
@@ -1002,6 +1007,42 @@ impl ImageProcessorTrait for ImageProcessor {
         }
         Err(Error::NoConverter)
     }
+
+    #[cfg(feature = "decoder")]
+    fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<()> {
+        let start = Instant::now();
+
+        // skip G2D as it doesn't support rendering to image
+
+        #[cfg(target_os = "linux")]
+        #[cfg(feature = "opengl")]
+        if let Some(opengl) = self.opengl.as_mut() {
+            log::trace!("image started with opengl in {:?}", start.elapsed());
+            match opengl.set_class_colors(colors) {
+                Ok(_) => {
+                    log::trace!("colors set with opengl in {:?}", start.elapsed());
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::trace!("colors didn't set with opengl: {e:?}")
+                }
+            }
+        }
+        log::trace!("image started with cpu in {:?}", start.elapsed());
+        if let Some(cpu) = self.cpu.as_mut() {
+            match cpu.set_class_colors(colors) {
+                Ok(_) => {
+                    log::trace!("colors set with cpu in {:?}", start.elapsed());
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::trace!("colors didn't set with cpu: {e:?}");
+                    return Err(e);
+                }
+            }
+        }
+        Err(Error::NoConverter)
+    }
 }
 
 fn fourcc_channels(fourcc: FourCharCode) -> Result<usize> {
@@ -1059,7 +1100,7 @@ impl<T: Display> Drop for FunctionTimer<T> {
 }
 
 #[cfg(feature = "decoder")]
-const DEFAULT_SEGMENTATION_COLORS: [[f32; 4]; 18] = [
+const DEFAULT_COLORS: [[f32; 4]; 21] = [
     [0.0, 0.0, 0.0, 0.0],
     [0., 1., 0., 0.7],
     [1., 0.5568628, 0., 0.7],
@@ -1075,32 +1116,31 @@ const DEFAULT_SEGMENTATION_COLORS: [[f32; 4]; 18] = [
     [0.0, 0.2706, 1.0, 0.7],
     [0.0, 0.0, 0.0, 0.7],
     [0.0, 0.5, 0.0, 0.7],
+    [1.0, 0.0, 0.0, 0.7],
+    [0.0, 0.0, 1.0, 0.7],
+    [1.0, 0.5, 0.5, 0.7],
     [0.1333, 0.5451, 0.1333, 0.7],
     [0.1176, 0.4118, 0.8235, 0.7],
     [1., 1., 1., 0.7],
 ];
 
 #[cfg(feature = "decoder")]
-const DEFAULT_SEGMENTATION_COLORS_U8: [[u8; 4]; 18] = [
-    [0, 0, 0, 0],
-    [0, 255, 0, 179],
-    [255, 142, 0, 179],
-    [66, 39, 34, 179],
-    [204, 195, 199, 179],
-    [80, 195, 199, 179],
-    [36, 79, 31, 179],
-    [255, 244, 131, 179],
-    [90, 82, 0, 179],
-    [108, 159, 166, 179],
-    [130, 130, 186, 179],
-    [2, 48, 75, 179],
-    [0, 69, 255, 179],
-    [0, 0, 0, 179],
-    [0, 128, 0, 179],
-    [34, 139, 34, 179],
-    [30, 105, 210, 179],
-    [255, 255, 255, 179],
-];
+const fn denorm<const M: usize, const N: usize>(a: [[f32; M]; N]) -> [[u8; M]; N] {
+    let mut result = [[0; M]; N];
+    let mut i = 0;
+    while i < N {
+        let mut j = 0;
+        while j < M {
+            result[i][j] = (a[i][j] * 255.0).round() as u8;
+            j += 1;
+        }
+        i += 1;
+    }
+    result
+}
+
+#[cfg(feature = "decoder")]
+const DEFAULT_COLORS_U8: [[u8; 4]; 21] = denorm(DEFAULT_COLORS);
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
