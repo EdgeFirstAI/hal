@@ -44,7 +44,7 @@ macro_rules! function {
 }
 
 #[cfg(feature = "decoder")]
-use crate::DEFAULT_SEGMENTATION_COLORS;
+use crate::DEFAULT_COLORS;
 use crate::{
     Crop, Error, Flip, GREY, ImageProcessorTrait, NV12, PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, Rect,
     Rotation, TensorImage, YUYV,
@@ -457,13 +457,17 @@ struct RegionOfInterest {
     bottom: f32,
 }
 
-enum GLConverterMessage {
+enum GLProcessorMessage {
     ImageConvert(
         SendablePtr<TensorImage>,
         SendablePtr<TensorImage>,
         Rotation,
         Flip,
         Crop,
+        tokio::sync::oneshot::Sender<Result<(), Error>>,
+    ),
+    SetColors(
+        Vec<[u8; 4]>,
         tokio::sync::oneshot::Sender<Result<(), Error>>,
     ),
     ImageRender(
@@ -484,7 +488,7 @@ pub struct GLProcessorThreaded {
     handle: Option<JoinHandle<()>>,
 
     // This is only None when the converter is being dropped.
-    sender: Option<Sender<GLConverterMessage>>,
+    sender: Option<Sender<GLProcessorMessage>>,
     support_dma: bool,
 }
 
@@ -501,7 +505,7 @@ unsafe impl<T> Send for SendablePtr<T> where T: Send {}
 impl GLProcessorThreaded {
     /// Creates a new OpenGL multi-threaded image converter.
     pub fn new() -> Result<Self, Error> {
-        let (send, mut recv) = tokio::sync::mpsc::channel::<GLConverterMessage>(1);
+        let (send, mut recv) = tokio::sync::mpsc::channel::<GLProcessorMessage>(1);
 
         let (create_ctx_send, create_ctx_recv) = tokio::sync::oneshot::channel();
 
@@ -516,7 +520,7 @@ impl GLProcessorThreaded {
             let _ = create_ctx_send.send(Ok(gl_converter.gl_context.support_dma));
             while let Some(msg) = recv.blocking_recv() {
                 match msg {
-                    GLConverterMessage::ImageConvert(src, mut dst, rotation, flip, crop, resp) => {
+                    GLProcessorMessage::ImageConvert(src, mut dst, rotation, flip, crop, resp) => {
                         // SAFETY: This is safe because the convert() function waits for the resp to
                         // be sent before dropping the borrow for src and dst
                         let src = unsafe { src.ptr.as_ref() };
@@ -524,7 +528,7 @@ impl GLProcessorThreaded {
                         let res = gl_converter.convert(src, dst, rotation, flip, crop);
                         let _ = resp.send(res);
                     }
-                    GLConverterMessage::ImageRender(mut dst, det, seg, resp) => {
+                    GLProcessorMessage::ImageRender(mut dst, det, seg, resp) => {
                         // SAFETY: This is safe because the render_to_image() function waits for the
                         // resp to be sent before dropping the borrow for dst, detect, and
                         // segmentation
@@ -532,6 +536,10 @@ impl GLProcessorThreaded {
                         let det = unsafe { std::slice::from_raw_parts(det.ptr.as_ptr(), det.len) };
                         let seg = unsafe { std::slice::from_raw_parts(seg.ptr.as_ptr(), seg.len) };
                         let res = gl_converter.render_to_image(dst, det, seg);
+                        let _ = resp.send(res);
+                    }
+                    GLProcessorMessage::SetColors(colors, resp) => {
+                        let res = gl_converter.set_class_colors(&colors);
                         let _ = resp.send(res);
                     }
                 }
@@ -587,7 +595,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
         self.sender
             .as_ref()
             .unwrap()
-            .blocking_send(GLConverterMessage::ImageConvert(
+            .blocking_send(GLProcessorMessage::ImageConvert(
                 SendablePtr {
                     ptr: src.into(),
                     len: 1,
@@ -618,7 +626,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
         self.sender
             .as_ref()
             .unwrap()
-            .blocking_send(GLConverterMessage::ImageRender(
+            .blocking_send(GLProcessorMessage::ImageRender(
                 SendablePtr {
                     ptr: dst.into(),
                     len: 1,
@@ -633,6 +641,19 @@ impl ImageProcessorTrait for GLProcessorThreaded {
                 },
                 err_send,
             ))
+            .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
+        err_recv.blocking_recv().map_err(|_| {
+            Error::Internal("GL converter error messaging closed without update".to_string())
+        })?
+    }
+
+    #[cfg(feature = "decoder")]
+    fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<(), crate::Error> {
+        let (err_send, err_recv) = tokio::sync::oneshot::channel();
+        self.sender
+            .as_ref()
+            .unwrap()
+            .blocking_send(GLProcessorMessage::SetColors(colors.to_vec(), err_send))
             .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
         err_recv.blocking_recv().map_err(|_| {
             Error::Internal("GL converter error messaging closed without update".to_string())
@@ -842,6 +863,36 @@ impl ImageProcessorTrait for GLProcessorST {
         log::debug!("Segmentation rendered to image");
         Ok(())
     }
+
+    #[cfg(feature = "decoder")]
+    fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> crate::Result<()> {
+        if colors.is_empty() {
+            return Ok(());
+        }
+        let mut colors_f32 = vec![[0.0; 4]]; // first color is always transparent
+        colors_f32.extend(
+            colors
+                .iter()
+                .map(|c| {
+                    [
+                        c[0] as f32 / 255.0,
+                        c[1] as f32 / 255.0,
+                        c[2] as f32 / 255.0,
+                        c[3] as f32 / 255.0,
+                    ]
+                })
+                .take(17),
+        );
+
+        self.segmentation_program
+            .load_uniform_4fv(c"colors", &colors_f32)?;
+        self.instanced_segmentation_program
+            .load_uniform_4fv(c"colors", &colors_f32)?;
+        self.color_program
+            .load_uniform_4fv(c"colors", &colors_f32)?;
+
+        Ok(())
+    }
 }
 
 impl GLProcessorST {
@@ -877,19 +928,19 @@ impl GLProcessorST {
         let segmentation_program =
             GlProgram::new(generate_vertex_shader(), generate_segmentation_shader())?;
         #[cfg(feature = "decoder")]
-        segmentation_program.load_uniform_4fv(c"colors", &DEFAULT_SEGMENTATION_COLORS)?;
+        segmentation_program.load_uniform_4fv(c"colors", &DEFAULT_COLORS)?;
         #[cfg(feature = "decoder")]
         let instanced_segmentation_program = GlProgram::new(
             generate_vertex_shader(),
             generate_instanced_segmentation_shader(),
         )?;
         #[cfg(feature = "decoder")]
-        instanced_segmentation_program.load_uniform_4fv(c"colors", &DEFAULT_SEGMENTATION_COLORS)?;
+        instanced_segmentation_program.load_uniform_4fv(c"colors", &DEFAULT_COLORS)?;
 
         #[cfg(feature = "decoder")]
         let color_program = GlProgram::new(generate_vertex_shader(), generate_color_shader())?;
         #[cfg(feature = "decoder")]
-        color_program.load_uniform_4fv(c"colors", &DEFAULT_SEGMENTATION_COLORS)?;
+        color_program.load_uniform_4fv(c"colors", &DEFAULT_COLORS)?;
 
         let camera_eglimage_texture = Texture::new();
         let camera_normal_texture = Texture::new();
@@ -2643,7 +2694,7 @@ precision mediump float;
 precision mediump sampler2DArray;
 
 uniform sampler2DArray tex;
-uniform vec4 colors[18];
+uniform vec4 colors[21];
 
 in vec3 fragPos;
 in vec2 tc;
@@ -2680,7 +2731,10 @@ void main() {
         max_all = max_;
         max_ind = i*4 + max_ind_;
     }
-    max_ind = min(max_ind, 18-1); // clamp to available colors
+    if (max_ind == 0) {
+        discard;
+    }
+    max_ind = (max_ind - 1) % 20 + 1; // adjust for background class at 0
     color = colors[max_ind];
 }
 "
@@ -2691,7 +2745,7 @@ fn generate_instanced_segmentation_shader() -> &'static str {
 #version 300 es
 precision mediump float;
 uniform sampler2D mask0;
-uniform vec4 colors[18];
+uniform vec4 colors[21];
 uniform int class_index;
 in vec3 fragPos;
 in vec2 tc;
@@ -2701,7 +2755,11 @@ out vec4 color;
 void main() {
     float r0 = texture(mask0, tc).r;
     int arg = int(r0>=0.5);
-    color = colors[arg*class_index];
+    if (arg == 0) {
+        discard;
+    }
+    arg = (arg*class_index - 1) % 20 + 1; // adjust for background class at 0
+    color = colors[arg];
 }
 "
 }
@@ -2710,12 +2768,16 @@ fn generate_color_shader() -> &'static str {
     "\
 #version 300 es
 precision mediump float;
-uniform vec4 colors[18];
+uniform vec4 colors[21];
 uniform int class_index;
 
 out vec4 color;
 void main() {
-    color = colors[class_index];
+    if (class_index == 0) {
+        discard;
+    }
+    int index = (class_index - 1) % 20 + 1; // adjust for background class at 0
+    color = colors[index];
 }
 "
 }
@@ -2818,7 +2880,7 @@ mod gl_tests {
         let detect = DetectBox {
             bbox: [0.59375, 0.25, 0.9375, 0.725].into(),
             score: 0.99,
-            label: 0,
+            label: 22,
         };
 
         let seg = Segmentation {
@@ -2830,6 +2892,9 @@ mod gl_tests {
         };
 
         let mut renderer = GLProcessorThreaded::new().unwrap();
+        renderer
+            .set_class_colors(&[[255, 255, 0, 233], [128, 128, 0, 20]])
+            .unwrap();
         renderer
             .render_to_image(&mut image, &[detect], &[seg])
             .unwrap();
