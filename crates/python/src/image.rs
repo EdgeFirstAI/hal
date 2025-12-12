@@ -1003,6 +1003,13 @@ impl PyImageProcessor {
         // Ok(PyTensorImage(dst_image))
         Ok(())
     }
+
+    pub fn set_class_colors(&mut self, colors: Vec<[u8; 4]>) -> Result<()> {
+        if let Ok(mut l) = self.0.lock() {
+            l.set_class_colors(&colors)?
+        };
+        Ok(())
+    }
 }
 
 #[pyclass(name = "Rotation", eq, eq_int)]
