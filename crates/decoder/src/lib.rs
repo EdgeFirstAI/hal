@@ -1438,11 +1438,12 @@ mod decoder_tests {
 
         let decoder = DecoderBuilder::default()
             .with_config_yolo_segdet(
-                configs::Segmentation {
+                configs::Detection {
                     decoder: configs::DecoderType::Ultralytics,
                     quantization: Some(quant_boxes),
                     shape: vec![1, 116, 8400],
                     channels_first: false,
+                    anchors: None,
                 },
                 Protos {
                     decoder: configs::DecoderType::Ultralytics,
