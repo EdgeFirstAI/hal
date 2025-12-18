@@ -805,20 +805,18 @@ impl ImageProcessorTrait for GLProcessorST {
         if colors.is_empty() {
             return Ok(());
         }
-        let mut colors_f32 = vec![[0.0; 4]]; // first color is always transparent
-        colors_f32.extend(
-            colors
-                .iter()
-                .map(|c| {
-                    [
-                        c[0] as f32 / 255.0,
-                        c[1] as f32 / 255.0,
-                        c[2] as f32 / 255.0,
-                        c[3] as f32 / 255.0,
-                    ]
-                })
-                .take(20),
-        );
+        let colors_f32 = colors
+            .iter()
+            .map(|c| {
+                [
+                    c[0] as f32 / 255.0,
+                    c[1] as f32 / 255.0,
+                    c[2] as f32 / 255.0,
+                    c[3] as f32 / 255.0,
+                ]
+            })
+            .take(20)
+            .collect::<Vec<[f32; 4]>>();
 
         self.segmentation_program
             .load_uniform_4fv(c"colors", &colors_f32)?;
@@ -1918,6 +1916,9 @@ impl GLProcessorST {
 
         let format = gls::gl::RGBA;
         let texture_target = gls::gl::TEXTURE_2D_ARRAY;
+        self.segmentation_program
+            .load_uniform_1i(c"background_index", shape[2] as i32 - 1)?;
+
         gls::use_program(self.segmentation_program.id);
 
         gls::bind_texture(texture_target, self.segmentation_texture.id);
@@ -2037,7 +2038,7 @@ impl GLProcessorST {
         let texture_target = gls::gl::TEXTURE_2D;
         gls::use_program(self.instanced_segmentation_program.id);
         self.instanced_segmentation_program
-            .load_uniform_1i(c"class_index", class as i32 + 1)?;
+            .load_uniform_1i(c"class_index", class as i32)?;
         gls::bind_texture(texture_target, self.segmentation_texture.id);
         gls::active_texture(gls::gl::TEXTURE0);
         gls::tex_parameteri(
@@ -2209,7 +2210,7 @@ impl GLProcessorST {
             let thickness = 3.0;
             for d in detect {
                 self.color_program
-                    .load_uniform_1i(c"class_index", d.label as i32 + 1)?;
+                    .load_uniform_1i(c"class_index", d.label as i32)?;
                 gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
                 gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
                 let bbox: [f32; 4] = d.bbox.into();
@@ -2693,7 +2694,8 @@ precision mediump float;
 precision mediump sampler2DArray;
 
 uniform sampler2DArray tex;
-uniform vec4 colors[21];
+uniform vec4 colors[20];
+uniform int background_index;
 
 in vec3 fragPos;
 in vec2 tc;
@@ -2730,10 +2732,10 @@ void main() {
         max_all = max_;
         max_ind = i*4 + max_ind_;
     }
-    if (max_ind == 0) {
+    if (max_ind == background_index) {
         discard;
     }
-    max_ind = (max_ind - 1) % 20 + 1; // adjust for background class at 0
+    max_ind = max_ind % 20;
     color = colors[max_ind];
 }
 "
@@ -2744,7 +2746,7 @@ fn generate_instanced_segmentation_shader() -> &'static str {
 #version 300 es
 precision mediump float;
 uniform sampler2D mask0;
-uniform vec4 colors[21];
+uniform vec4 colors[20];
 uniform int class_index;
 in vec3 fragPos;
 in vec2 tc;
@@ -2757,8 +2759,7 @@ void main() {
     if (arg == 0) {
         discard;
     }
-    arg = (arg*class_index - 1) % 20 + 1; // adjust for background class at 0
-    color = colors[arg];
+    color = colors[class_index % 20];
 }
 "
 }
@@ -2767,15 +2768,12 @@ fn generate_color_shader() -> &'static str {
     "\
 #version 300 es
 precision mediump float;
-uniform vec4 colors[21];
+uniform vec4 colors[20];
 uniform int class_index;
 
 out vec4 color;
 void main() {
-    if (class_index == 0) {
-        discard;
-    }
-    int index = (class_index - 1) % 20 + 1; // adjust for background class at 0
+    int index = class_index % 20;
     color = colors[index];
 }
 "
@@ -2879,7 +2877,7 @@ mod gl_tests {
         let detect = DetectBox {
             bbox: [0.59375, 0.25, 0.9375, 0.725].into(),
             score: 0.99,
-            label: 22,
+            label: 0,
         };
 
         let seg = Segmentation {
@@ -2916,9 +2914,12 @@ mod gl_tests {
         let detect = DetectBox {
             bbox: [0.59375, 0.25, 0.9375, 0.725].into(),
             score: 0.99,
-            label: 22,
+            label: 0,
         };
         let mut renderer = GLProcessorThreaded::new().unwrap();
+        renderer
+            .set_class_colors(&[[255, 255, 0, 233], [128, 128, 0, 20]])
+            .unwrap();
         renderer
             .render_to_image(&mut image, &[detect], &[])
             .unwrap();
