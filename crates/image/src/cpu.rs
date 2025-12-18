@@ -22,7 +22,7 @@ pub struct CPUProcessor {
     resizer: fast_image_resize::Resizer,
     options: fast_image_resize::ResizeOptions,
     #[cfg(feature = "decoder")]
-    colors: [[u8; 4]; 21],
+    colors: [[u8; 4]; 20],
 }
 
 unsafe impl Send for CPUProcessor {}
@@ -1444,8 +1444,8 @@ impl CPUProcessor {
         use ndarray_stats::QuantileExt;
 
         let seg = &segmentation.segmentation;
-        let [seg_height, seg_width, _seg_classes] = *seg.shape() else {
-            unreachable!("Array3 did not have [usize;3] as shape");
+        let [seg_height, seg_width, seg_classes] = *seg.shape() else {
+            unreachable!("Array3 did not have [usize; 3] as shape");
         };
         let start_y = (dst.height() as f32 * segmentation.ymin).round();
         let end_y = (dst.height() as f32 * segmentation.ymax).round();
@@ -1476,11 +1476,11 @@ impl CPUProcessor {
                 let seg_y = (y as f32 - start_y) * scale_y;
                 let label = get_value_at_nearest(seg_x, seg_y);
 
-                if label == 0 {
+                if label == seg_classes - 1 {
                     continue;
                 }
 
-                let color = self.colors[(label - 1) % (self.colors.len() - 1) + 1];
+                let color = self.colors[label % self.colors.len()];
 
                 let alpha = color[3] as u16;
 
@@ -1504,8 +1504,6 @@ impl CPUProcessor {
         segmentation: &Segmentation,
         class: usize,
     ) -> Result<()> {
-        let class = class + 1;
-
         let seg = &segmentation.segmentation;
         let [seg_height, seg_width, classes] = *seg.shape() else {
             unreachable!("Array3 did not have [usize;3] as shape");
@@ -1535,7 +1533,7 @@ impl CPUProcessor {
                     continue;
                 }
 
-                let color = self.colors[(class - 1) % (self.colors.len() - 1) + 1];
+                let color = self.colors[class % self.colors.len()];
 
                 let alpha = color[3] as u16;
 
@@ -1562,8 +1560,8 @@ impl CPUProcessor {
         for d in detect {
             use edgefirst_decoder::BoundingBox;
 
-            let label = d.label + 1;
-            let [r, g, b, _] = self.colors[(label - 1) % (self.colors.len() - 1) + 1];
+            let label = d.label;
+            let [r, g, b, _] = self.colors[label % self.colors.len()];
             let bbox = d.bbox.to_canonical();
             let bbox = BoundingBox {
                 xmin: bbox.xmin.clamp(0.0, 1.0),

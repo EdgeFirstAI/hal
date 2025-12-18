@@ -1100,8 +1100,7 @@ impl<T: Display> Drop for FunctionTimer<T> {
 }
 
 #[cfg(feature = "decoder")]
-const DEFAULT_COLORS: [[f32; 4]; 21] = [
-    [0.0, 0.0, 0.0, 0.0],
+const DEFAULT_COLORS: [[f32; 4]; 20] = [
     [0., 1., 0., 0.7],
     [1., 0.5568628, 0., 0.7],
     [0.25882353, 0.15294118, 0.13333333, 0.7],
@@ -1140,7 +1139,7 @@ const fn denorm<const M: usize, const N: usize>(a: [[f32; M]; N]) -> [[u8; M]; N
 }
 
 #[cfg(feature = "decoder")]
-const DEFAULT_COLORS_U8: [[u8; 4]; 21] = denorm(DEFAULT_COLORS);
+const DEFAULT_COLORS_U8: [[u8; 4]; 20] = denorm(DEFAULT_COLORS);
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
