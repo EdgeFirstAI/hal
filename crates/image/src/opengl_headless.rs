@@ -748,10 +748,6 @@ impl ImageProcessorTrait for GLProcessorST {
             ));
         }
 
-        if segmentation.is_empty() {
-            return Ok(());
-        }
-
         let (_render_buffer, is_dma) = match dst.tensor.memory() {
             edgefirst_tensor::TensorMemory::Dma => {
                 if let Ok(render_buffer) = self.setup_renderbuffer_dma(dst) {
@@ -775,66 +771,9 @@ impl ImageProcessorTrait for GLProcessorST {
             ), // Add dest rect to make sure dst is rendered fully
         };
 
-        // top and bottom are flipped because OpenGL uses 0,0 as bottom left
-        let cvt_screen_coord = |normalized| normalized * 2.0 - 1.0;
-
         self.render_box(dst, detect)?;
+        self.render_segmentation(detect, segmentation)?;
 
-        gls::enable(gls::gl::BLEND);
-        gls::blend_func(gls::gl::SRC_ALPHA, gls::gl::ONE_MINUS_SRC_ALPHA);
-
-        if segmentation.is_empty() {
-            return Ok(());
-        }
-
-        let is_modelpack = segmentation[0].segmentation.shape()[2] > 1;
-
-        if is_modelpack {
-            let seg = &segmentation[0];
-            let dst_roi = RegionOfInterest {
-                left: cvt_screen_coord(seg.xmin),
-                top: cvt_screen_coord(seg.ymax),
-                right: cvt_screen_coord(seg.xmax),
-                bottom: cvt_screen_coord(seg.ymin),
-            };
-            let segment = seg.segmentation.as_standard_layout();
-            let slice = segment.as_slice().ok_or(Error::Internal(
-                "Cannot get slice of segmentation".to_owned(),
-            ))?;
-
-            self.render_modelpack_segmentation(
-                dst_roi,
-                slice,
-                [
-                    seg.segmentation.shape()[0],
-                    seg.segmentation.shape()[1],
-                    seg.segmentation.shape()[2],
-                ],
-            )?;
-        } else {
-            for (seg, det) in segmentation.iter().zip(detect) {
-                let dst_roi = RegionOfInterest {
-                    left: cvt_screen_coord(seg.xmin),
-                    top: cvt_screen_coord(seg.ymax),
-                    right: cvt_screen_coord(seg.xmax),
-                    bottom: cvt_screen_coord(seg.ymin),
-                };
-
-                let segment = seg.segmentation.as_standard_layout();
-                let slice = segment.as_slice().ok_or(Error::Internal(
-                    "Cannot get slice of segmentation".to_owned(),
-                ))?;
-
-                self.render_yolo_segmentation(
-                    dst_roi,
-                    slice,
-                    [seg.segmentation.shape()[0], seg.segmentation.shape()[1]],
-                    det.label,
-                )?;
-            }
-        }
-
-        gls::disable(gls::gl::BLEND);
         gls::finish();
         if !is_dma {
             let mut dst_map = dst.tensor().map()?;
@@ -857,10 +796,7 @@ impl ImageProcessorTrait for GLProcessorST {
                 );
             }
         }
-        // Err(crate::Error::NotImplemented(
-        //     "Segmentation rendering is not implemented".to_string(),
-        // ))
-        log::debug!("Segmentation rendered to image");
+
         Ok(())
     }
 
@@ -881,7 +817,7 @@ impl ImageProcessorTrait for GLProcessorST {
                         c[3] as f32 / 255.0,
                     ]
                 })
-                .take(17),
+                .take(20),
         );
 
         self.segmentation_program
@@ -2203,6 +2139,69 @@ impl GLProcessorST {
         Ok(())
     }
 
+    fn render_segmentation(
+        &mut self,
+        detect: &[DetectBox],
+        segmentation: &[Segmentation],
+    ) -> crate::Result<()> {
+        if segmentation.is_empty() {
+            return Ok(());
+        }
+        gls::enable(gls::gl::BLEND);
+        gls::blend_func(gls::gl::SRC_ALPHA, gls::gl::ONE_MINUS_SRC_ALPHA);
+
+        let is_modelpack = segmentation[0].segmentation.shape()[2] > 1;
+        // top and bottom are flipped because OpenGL uses 0,0 as bottom left
+        let cvt_screen_coord = |normalized| normalized * 2.0 - 1.0;
+        if is_modelpack {
+            let seg = &segmentation[0];
+            let dst_roi = RegionOfInterest {
+                left: cvt_screen_coord(seg.xmin),
+                top: cvt_screen_coord(seg.ymax),
+                right: cvt_screen_coord(seg.xmax),
+                bottom: cvt_screen_coord(seg.ymin),
+            };
+            let segment = seg.segmentation.as_standard_layout();
+            let slice = segment.as_slice().ok_or(Error::Internal(
+                "Cannot get slice of segmentation".to_owned(),
+            ))?;
+
+            self.render_modelpack_segmentation(
+                dst_roi,
+                slice,
+                [
+                    seg.segmentation.shape()[0],
+                    seg.segmentation.shape()[1],
+                    seg.segmentation.shape()[2],
+                ],
+            )?;
+        } else {
+            for (seg, det) in segmentation.iter().zip(detect) {
+                let dst_roi = RegionOfInterest {
+                    left: cvt_screen_coord(seg.xmin),
+                    top: cvt_screen_coord(seg.ymax),
+                    right: cvt_screen_coord(seg.xmax),
+                    bottom: cvt_screen_coord(seg.ymin),
+                };
+
+                let segment = seg.segmentation.as_standard_layout();
+                let slice = segment.as_slice().ok_or(Error::Internal(
+                    "Cannot get slice of segmentation".to_owned(),
+                ))?;
+
+                self.render_yolo_segmentation(
+                    dst_roi,
+                    slice,
+                    [seg.segmentation.shape()[0], seg.segmentation.shape()[1]],
+                    det.label,
+                )?;
+            }
+        }
+
+        gls::disable(gls::gl::BLEND);
+        Ok(())
+    }
+
     fn render_box(&mut self, dst: &TensorImage, detect: &[DetectBox]) -> Result<(), Error> {
         unsafe {
             gls::gl::UseProgram(self.color_program.id);
@@ -2900,5 +2899,30 @@ mod gl_tests {
             .unwrap();
 
         image.save_jpeg("test_segmentation_yolo.jpg", 80).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "decoder")]
+    fn test_boxes() {
+        use edgefirst_decoder::DetectBox;
+
+        let mut image = TensorImage::load(
+            include_bytes!("../../../testdata/giraffe.jpg"),
+            Some(RGBA),
+            None,
+        )
+        .unwrap();
+
+        let detect = DetectBox {
+            bbox: [0.59375, 0.25, 0.9375, 0.725].into(),
+            score: 0.99,
+            label: 22,
+        };
+        let mut renderer = GLProcessorThreaded::new().unwrap();
+        renderer
+            .render_to_image(&mut image, &[detect], &[])
+            .unwrap();
+
+        image.save_jpeg("test_boxes.jpg", 80).unwrap();
     }
 }
