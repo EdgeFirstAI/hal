@@ -673,7 +673,7 @@ impl DecoderBuilder {
     /// let scores_config = configs::Scores {
     ///     decoder: configs::DecoderType::ModelPack,
     ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
-    ///     shape: vec![1, 8400, 3],
+    ///     shape: vec![1, 8400, 2],
     ///     channels_first: false,
     /// };
     /// let seg_config = configs::Segmentation {
@@ -720,7 +720,7 @@ impl DecoderBuilder {
     ///     ]),
     ///     decoder: configs::DecoderType::ModelPack,
     ///     quantization: Some(configs::QuantTuple(0.08547406643629074, 174)),
-    ///     shape: vec![1, 9, 15, 21],
+    ///     shape: vec![1, 9, 15, 18],
     ///     channels_first: false,
     /// };
     /// let config1 = configs::Detection {
@@ -731,7 +731,7 @@ impl DecoderBuilder {
     ///     ]),
     ///     decoder: configs::DecoderType::ModelPack,
     ///     quantization: Some(configs::QuantTuple(0.09929127991199493, 183)),
-    ///     shape: vec![1, 17, 30, 21],
+    ///     shape: vec![1, 17, 30, 18],
     ///     channels_first: false,
     /// };
     /// let seg_config = configs::Segmentation {
@@ -1333,7 +1333,7 @@ impl DecoderBuilder {
                 segmentation.shape[3]
             };
 
-            if seg_channels != classes {
+            if seg_channels != classes + 1 {
                 return Err(DecoderError::InvalidConfig(format!(
                     "ModelPack Segmentation channels {} incompatible with number of classes {}",
                     seg_channels, classes
