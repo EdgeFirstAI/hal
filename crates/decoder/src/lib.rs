@@ -650,7 +650,7 @@ mod decoder_tests {
         },
         *,
     };
-    use ndarray::{Array4, Axis, array, s};
+    use ndarray::{Array4, array, s};
     use ndarray_stats::DeviationExt;
 
     fn compare_outputs(
