@@ -514,7 +514,7 @@ mod modelpack_tests {
     #![allow(clippy::excessive_precision)]
     use ndarray::Array3;
 
-    use crate::configs::DecoderType;
+    use crate::configs::{DecoderType, DimName};
 
     use super::*;
     #[test]
@@ -524,7 +524,12 @@ mod modelpack_tests {
             quantization: Some((0.1, 128).into()),
             decoder: DecoderType::ModelPack,
             shape: vec![1, 9, 17, 18],
-            channels_first: false,
+            dshape: vec![
+                (DimName::Batch, 1),
+                (DimName::Height, 9),
+                (DimName::Width, 17),
+                (DimName::NumAnchorsXFeatures, 18),
+            ],
         };
         let config = ModelPackDetectionConfig::try_from(&det).unwrap();
         assert_eq!(
@@ -540,7 +545,12 @@ mod modelpack_tests {
             quantization: Some((0.1, 128).into()),
             decoder: DecoderType::ModelPack,
             shape: vec![1, 9, 17, 18],
-            channels_first: false,
+            dshape: vec![
+                (DimName::Batch, 1),
+                (DimName::Height, 9),
+                (DimName::Width, 17),
+                (DimName::NumAnchorsXFeatures, 18),
+            ],
         };
         let result = ModelPackDetectionConfig::try_from(&det);
         assert!(
