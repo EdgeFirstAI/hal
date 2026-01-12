@@ -307,6 +307,20 @@ pub struct DetectBox {
     pub label: usize,
 }
 
+impl edgefirst_tracker::DetectionBox for DetectBox {
+    fn bbox(&self) -> [f32; 4] {
+        self.bbox.into()
+    }
+
+    fn score(&self) -> f32 {
+        self.score
+    }
+
+    fn label(&self) -> usize {
+        self.label
+    }
+}
+
 /// A bounding box with f32 coordinates in XYXY format
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct BoundingBox {
@@ -650,6 +664,7 @@ mod decoder_tests {
         },
         *,
     };
+    use edgefirst_tracker::bytetrack::ByteTrackBuilder;
     use ndarray::{Array4, array, s};
     use ndarray_stats::DeviationExt;
 
@@ -772,7 +787,6 @@ mod decoder_tests {
 
         let mut output_boxes1 = Vec::with_capacity(50);
         let mut output_masks1 = Vec::with_capacity(50);
-
         decoder
             .decode_quantized(
                 &[boxes.view().into(), scores.view().into()],
@@ -783,7 +797,6 @@ mod decoder_tests {
 
         let mut output_boxes_float = Vec::with_capacity(50);
         let mut output_masks_float = Vec::with_capacity(50);
-
         let boxes = dequantize_ndarray(boxes.view(), quant_boxes);
         let scores = dequantize_ndarray(scores.view(), quant_scores);
 
@@ -1611,7 +1624,6 @@ mod decoder_tests {
 
         let mut output_boxes: Vec<_> = Vec::with_capacity(500);
         let mut output_masks: Vec<_> = Vec::with_capacity(500);
-
         decoder
             .decode_quantized(
                 &[
@@ -1634,7 +1646,6 @@ mod decoder_tests {
 
         let mut output_boxes1: Vec<_> = Vec::with_capacity(500);
         let mut output_masks1: Vec<_> = Vec::with_capacity(500);
-
         decoder
             .decode_float(
                 &[
@@ -1718,7 +1729,6 @@ mod decoder_tests {
 
         let mut output_boxes: Vec<_> = Vec::with_capacity(500);
         let mut output_masks: Vec<_> = Vec::with_capacity(500);
-
         decoder
             .decode_quantized(
                 &[
@@ -1840,7 +1850,6 @@ mod decoder_tests {
 
         let mut output_boxes: Vec<_> = Vec::with_capacity(500);
         let mut output_masks: Vec<_> = Vec::with_capacity(500);
-
         decoder
             .decode_quantized(
                 &[
@@ -1876,17 +1885,121 @@ mod decoder_tests {
         );
     }
 
-    // #[test]
-    // fn test_decoder_missing_output() {
-    //     let score_threshold = 0.25;
-    //     let iou_threshold = 0.7;
-    //     let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
-    //     let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8,
-    // out.len()) };     let out = ndarray::Array2::from_shape_vec((84, 8400),
-    // out.to_vec()).unwrap();     let quant = Quantization::new(0.0040811873,
-    // -123);     let mut output_boxes: Vec<_> = Vec::with_capacity(50);
+    #[test]
+    fn test_tracker_error() {
+        let score_threshold = 0.15;
+        let iou_threshold = 0.7;
+        let quant = (0.0040811873, -123);
+        let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
+        let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
+        let out = Array3::from_shape_vec((1, 84, 8400), out.to_vec()).unwrap();
+        let out_float = dequantize_ndarray::<_, _, f32>(out.view(), quant.into());
+        let mut decoder = DecoderBuilder::default()
+            .with_config_yolo_det(configs::Detection {
+                decoder: DecoderType::Ultralytics,
+                shape: vec![1, 84, 8400],
+                anchors: None,
+                quantization: Some(quant.into()),
+                dshape: vec![
+                    (DimName::Batch, 1),
+                    (DimName::NumFeatures, 84),
+                    (DimName::NumBoxes, 8400),
+                ],
+            })
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .build()
+            .unwrap();
 
-    // }
+        let mut output_boxes: Vec<_> = Vec::with_capacity(50);
+        let mut output_masks: Vec<_> = Vec::with_capacity(50);
+        let mut output_tracks: Vec<_> = Vec::with_capacity(50);
+        let result = decoder.decode_quantized_tracked(
+            &[out.view().into()],
+            &mut output_boxes,
+            &mut output_masks,
+            &mut output_tracks,
+            0,
+        );
+        assert!(matches!(result, Err(DecoderError::NoTracker)));
+
+        let result = decoder.decode_float_tracked(
+            &[out_float.view().into_dyn()],
+            &mut output_boxes,
+            &mut output_masks,
+            &mut output_tracks,
+            0,
+        );
+        assert!(matches!(result, Err(DecoderError::NoTracker)));
+    }
+
+    #[test]
+    fn test_build_tracker() {
+        let score_threshold = 0.15;
+        let iou_threshold = 0.7;
+        let quant = (0.0040811873, -123);
+        let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
+        let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
+        let out = Array3::from_shape_vec((1, 84, 8400), out.to_vec()).unwrap();
+
+        let mut decoder = DecoderBuilder::default()
+            .with_config_yolo_det(configs::Detection {
+                decoder: DecoderType::Ultralytics,
+                shape: vec![1, 84, 8400],
+                anchors: None,
+                quantization: Some(quant.into()),
+                dshape: vec![
+                    (DimName::Batch, 1),
+                    (DimName::NumFeatures, 84),
+                    (DimName::NumBoxes, 8400),
+                ],
+            })
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .with_tracker(ByteTrackBuilder::default().track_high_conf(0.5).build())
+            .build()
+            .unwrap();
+
+        let mut output_boxes: Vec<_> = Vec::with_capacity(50);
+        let mut output_masks: Vec<_> = Vec::with_capacity(50);
+        let mut output_tracks: Vec<_> = Vec::with_capacity(50);
+        decoder
+            .decode_quantized_tracked(
+                &[out.view().into()],
+                &mut output_boxes,
+                &mut output_masks,
+                &mut output_tracks,
+                0,
+            )
+            .unwrap();
+
+        println!("Tracked boxes: {:?}", output_tracks);
+
+        assert!(!output_tracks.is_empty());
+        assert_eq!(output_boxes.len(), 1);
+        assert_eq!(output_tracks.len(), 1);
+        assert_eq!(output_masks.len(), 0);
+        assert!(output_boxes[0].equal_within_delta(&output_tracks[0].last_box, 1e-6));
+
+        let last_track = output_tracks[0];
+
+        // Decode again
+        decoder
+            .decode_quantized_tracked(
+                &[out.view().into()],
+                &mut output_boxes,
+                &mut output_masks,
+                &mut output_tracks,
+                10000,
+            )
+            .unwrap();
+        assert!(!output_tracks.is_empty());
+        assert_eq!(output_boxes.len(), 1);
+        assert_eq!(output_tracks.len(), 1);
+        assert_eq!(output_masks.len(), 0);
+        assert!(output_boxes[0].equal_within_delta(&output_tracks[0].last_box, 1e-6));
+        assert_eq!(output_tracks[0].uuid, last_track.uuid);
+    }
 
     #[test]
     fn test_ndarray_to_xyxy_float() {

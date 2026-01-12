@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
+use edgefirst_tracker::Tracker;
 use ndarray::{Array3, ArrayView, ArrayViewD, Dimension, s};
 use ndarray_stats::QuantileExt;
 use num_traits::{AsPrimitive, Float};
@@ -15,9 +16,10 @@ use crate::{
         decode_modelpack_split_float,
     },
     yolo::{
-        decode_yolo_det, decode_yolo_det_float, decode_yolo_segdet_float, decode_yolo_segdet_quant,
-        decode_yolo_split_det_float, decode_yolo_split_det_quant, decode_yolo_split_segdet_float,
-        impl_yolo_split_segdet_quant_get_boxes, impl_yolo_split_segdet_quant_process_masks,
+        decode_yolo_det, decode_yolo_det_float, decode_yolo_split_det_float,
+        decode_yolo_split_det_quant, impl_yolo_segdet_get_boxes,
+        impl_yolo_split_segdet_process_masks, impl_yolo_split_segdet_quant_get_boxes,
+        impl_yolo_split_segdet_quant_process_masks, postprocess_yolo_seg,
     },
 };
 
@@ -36,6 +38,41 @@ use crate::{
 pub struct ConfigOutputs {
     pub outputs: Vec<ConfigOutput>,
 }
+
+#[derive(Debug, Clone, Copy)]
+/// Track information returned by the decoder when tracking is enabled.
+pub struct TrackInfo {
+    pub uuid: edgefirst_tracker::Uuid,
+    pub tracked_location: [f32; 4],
+    pub count: i32,
+    pub created: u64,
+    pub last_updated: u64,
+
+    /// The last raw box associated with the track. This is before any smoothing
+    /// introduced by the tracker
+    pub last_box: DetectBox,
+    // We do not give the last_box_index as it has no meaning for the user
+    // pub last_box_index: usize,
+}
+
+impl From<edgefirst_tracker::TrackInfo<DetectBox>> for TrackInfo {
+    fn from(value: edgefirst_tracker::TrackInfo<DetectBox>) -> Self {
+        Self {
+            uuid: value.uuid,
+            tracked_location: value.tracked_location,
+            count: value.count,
+            created: value.created,
+            last_updated: value.last_updated,
+            last_box: value.last_box,
+        }
+    }
+}
+
+type TrackerSettings<'a> = (
+    &'a mut Box<dyn Tracker<DetectBox>>,
+    &'a mut Vec<TrackInfo>,
+    u64,
+);
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 #[serde(tag = "type")]
@@ -489,11 +526,12 @@ pub mod configs {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 pub struct DecoderBuilder {
     config_src: Option<ConfigSource>,
     iou_threshold: f32,
     score_threshold: f32,
+    tracker: Option<Box<dyn Tracker<DetectBox>>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -528,6 +566,7 @@ impl Default for DecoderBuilder {
             config_src: None,
             iou_threshold: 0.5,
             score_threshold: 0.5,
+            tracker: None,
         }
     }
 }
@@ -1029,6 +1068,30 @@ impl DecoderBuilder {
         self
     }
 
+    /// Sets a tracker for the decoder to use with the
+    /// `decode_quantized_tracked()` and `decode_float_tracked()` functions
+    ///
+    /// The tracker will not be used for the standard `decode_quantized()` and
+    /// `decode_float()` functions.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
+    /// # fn main() -> DecoderResult<()> {
+    /// # let config_json = include_str!("../../../testdata/modelpack_split.json").to_string();
+    /// let decoder = DecoderBuilder::new()
+    ///     .with_config_json_str(config_json)
+    ///     .with_tracker(edgefirst_tracker::ByteTrackBuilder::new().build())
+    ///     .build()?;
+    /// assert_eq!(decoder.iou_threshold, 0.5);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_tracker<T: Tracker<DetectBox> + 'static>(mut self, tracker: T) -> Self {
+        self.tracker = Some(Box::new(tracker));
+        self
+    }
+
     /// Builds the decoder with the given settings. If the config is a JSON or
     /// YAML string, this will deserialize the JSON or YAML and then parse the
     /// configuration information.
@@ -1057,6 +1120,7 @@ impl DecoderBuilder {
             model_type,
             iou_threshold: self.iou_threshold,
             score_threshold: self.score_threshold,
+            tracker: self.tracker,
         })
     }
 
@@ -1706,11 +1770,12 @@ impl DecoderBuilder {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 pub struct Decoder {
     model_type: ModelType,
     pub iou_threshold: f32,
     pub score_threshold: f32,
+    tracker: Option<Box<dyn Tracker<DetectBox>>>,
 }
 
 #[derive(Debug)]
@@ -1912,6 +1977,7 @@ impl Decoder {
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
     ) -> Result<(), DecoderError> {
+        let tracking = None;
         output_boxes.clear();
         output_masks.clear();
         match &self.model_type {
@@ -1920,44 +1986,88 @@ impl Decoder {
                 scores,
                 segmentation,
             } => {
-                self.decode_modelpack_det_quantized(outputs, boxes, scores, output_boxes)?;
-                self.decode_modelpack_seg_quantized(outputs, segmentation, output_masks)
+                Self::decode_modelpack_det_quantized(
+                    self.score_threshold,
+                    self.iou_threshold,
+                    outputs,
+                    boxes,
+                    scores,
+                    output_boxes,
+                    tracking,
+                )?;
+                Self::decode_modelpack_seg_quantized(outputs, segmentation, output_masks)
             }
             ModelType::ModelPackSegDetSplit {
                 detection,
                 segmentation,
             } => {
-                self.decode_modelpack_det_split_quantized(outputs, detection, output_boxes)?;
-                self.decode_modelpack_seg_quantized(outputs, segmentation, output_masks)
+                Self::decode_modelpack_det_split_quantized(
+                    self.score_threshold,
+                    self.iou_threshold,
+                    outputs,
+                    detection,
+                    output_boxes,
+                    tracking,
+                )?;
+                Self::decode_modelpack_seg_quantized(outputs, segmentation, output_masks)
             }
-            ModelType::ModelPackDet { boxes, scores } => {
-                self.decode_modelpack_det_quantized(outputs, boxes, scores, output_boxes)
-            }
+            ModelType::ModelPackDet { boxes, scores } => Self::decode_modelpack_det_quantized(
+                self.score_threshold,
+                self.iou_threshold,
+                outputs,
+                boxes,
+                scores,
+                output_boxes,
+                tracking,
+            ),
             ModelType::ModelPackDetSplit { detection } => {
-                self.decode_modelpack_det_split_quantized(outputs, detection, output_boxes)
+                Self::decode_modelpack_det_split_quantized(
+                    self.score_threshold,
+                    self.iou_threshold,
+                    outputs,
+                    detection,
+                    output_boxes,
+                    tracking,
+                )
             }
             ModelType::ModelPackSeg { segmentation } => {
-                self.decode_modelpack_seg_quantized(outputs, segmentation, output_masks)
+                Self::decode_modelpack_seg_quantized(outputs, segmentation, output_masks)
             }
-            ModelType::YoloDet { boxes } => {
-                self.decode_yolo_det_quantized(outputs, boxes, output_boxes)
-            }
-            ModelType::YoloSegDet { boxes, protos } => self.decode_yolo_segdet_quantized(
+            ModelType::YoloDet { boxes } => Self::decode_yolo_det_quantized(
+                self.score_threshold,
+                self.iou_threshold,
+                outputs,
+                boxes,
+                output_boxes,
+                tracking,
+            ),
+            ModelType::YoloSegDet { boxes, protos } => Self::decode_yolo_segdet_quantized(
+                self.score_threshold,
+                self.iou_threshold,
                 outputs,
                 boxes,
                 protos,
                 output_boxes,
                 output_masks,
+                tracking,
             ),
-            ModelType::YoloSplitDet { boxes, scores } => {
-                self.decode_yolo_split_det_quantized(outputs, boxes, scores, output_boxes)
-            }
+            ModelType::YoloSplitDet { boxes, scores } => Self::decode_yolo_split_det_quantized(
+                self.score_threshold,
+                self.iou_threshold,
+                outputs,
+                boxes,
+                scores,
+                output_boxes,
+                tracking,
+            ),
             ModelType::YoloSplitSegDet {
                 boxes,
                 scores,
                 mask_coeff,
                 protos,
-            } => self.decode_yolo_split_segdet_quantized(
+            } => Self::decode_yolo_split_segdet_quantized(
+                self.score_threshold,
+                self.iou_threshold,
                 outputs,
                 boxes,
                 scores,
@@ -1965,6 +2075,7 @@ impl Decoder {
                 protos,
                 output_boxes,
                 output_masks,
+                tracking,
             ),
         }
     }
@@ -2033,6 +2144,7 @@ impl Decoder {
         T: Float + AsPrimitive<f32> + AsPrimitive<u8> + Send + Sync + 'static,
         f32: AsPrimitive<T>,
     {
+        let output_tracks = None;
         output_boxes.clear();
         output_masks.clear();
         match &self.model_type {
@@ -2041,33 +2153,87 @@ impl Decoder {
                 scores,
                 segmentation,
             } => {
-                self.decode_modelpack_det_float(outputs, boxes, scores, output_boxes)?;
-                self.decode_modelpack_seg_float(outputs, segmentation, output_masks)?;
+                Self::decode_modelpack_det_float(
+                    self.score_threshold,
+                    self.iou_threshold,
+                    outputs,
+                    boxes,
+                    scores,
+                    output_boxes,
+                    output_tracks,
+                )?;
+                Self::decode_modelpack_seg_float(outputs, segmentation, output_masks)?;
             }
             ModelType::ModelPackSegDetSplit {
                 detection,
                 segmentation,
             } => {
-                self.decode_modelpack_det_split_float(outputs, detection, output_boxes)?;
-                self.decode_modelpack_seg_float(outputs, segmentation, output_masks)?;
+                Self::decode_modelpack_det_split_float(
+                    self.score_threshold,
+                    self.iou_threshold,
+                    outputs,
+                    detection,
+                    output_boxes,
+                    output_tracks,
+                )?;
+                Self::decode_modelpack_seg_float(outputs, segmentation, output_masks)?;
             }
             ModelType::ModelPackDet { boxes, scores } => {
-                self.decode_modelpack_det_float(outputs, boxes, scores, output_boxes)?;
+                Self::decode_modelpack_det_float(
+                    self.score_threshold,
+                    self.iou_threshold,
+                    outputs,
+                    boxes,
+                    scores,
+                    output_boxes,
+                    output_tracks,
+                )?;
             }
             ModelType::ModelPackDetSplit { detection } => {
-                self.decode_modelpack_det_split_float(outputs, detection, output_boxes)?;
+                Self::decode_modelpack_det_split_float(
+                    self.score_threshold,
+                    self.iou_threshold,
+                    outputs,
+                    detection,
+                    output_boxes,
+                    output_tracks,
+                )?;
             }
             ModelType::ModelPackSeg { segmentation } => {
-                self.decode_modelpack_seg_float(outputs, segmentation, output_masks)?;
+                Self::decode_modelpack_seg_float(outputs, segmentation, output_masks)?;
             }
             ModelType::YoloDet { boxes } => {
-                self.decode_yolo_det_float(outputs, boxes, output_boxes)?;
+                Self::decode_yolo_det_float(
+                    self.score_threshold,
+                    self.iou_threshold,
+                    outputs,
+                    boxes,
+                    output_boxes,
+                    output_tracks,
+                )?;
             }
             ModelType::YoloSegDet { boxes, protos } => {
-                self.decode_yolo_segdet_float(outputs, boxes, protos, output_boxes, output_masks)?;
+                Self::decode_yolo_segdet_float(
+                    self.score_threshold,
+                    self.iou_threshold,
+                    outputs,
+                    boxes,
+                    protos,
+                    output_boxes,
+                    output_masks,
+                    output_tracks,
+                )?;
             }
             ModelType::YoloSplitDet { boxes, scores } => {
-                self.decode_yolo_split_det_float(outputs, boxes, scores, output_boxes)?;
+                Self::decode_yolo_split_det_float(
+                    self.score_threshold,
+                    self.iou_threshold,
+                    outputs,
+                    boxes,
+                    scores,
+                    output_boxes,
+                    output_tracks,
+                )?;
             }
             ModelType::YoloSplitSegDet {
                 boxes,
@@ -2075,7 +2241,9 @@ impl Decoder {
                 mask_coeff,
                 protos,
             } => {
-                self.decode_yolo_split_segdet_float(
+                Self::decode_yolo_split_segdet_float(
+                    self.score_threshold,
+                    self.iou_threshold,
                     outputs,
                     boxes,
                     scores,
@@ -2083,6 +2251,355 @@ impl Decoder {
                     protos,
                     output_boxes,
                     output_masks,
+                    output_tracks,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// This function decodes quantized model outputs into detection boxes and
+    /// segmentation masks. The quantized outputs can be of u8, i8, u16, i16,
+    /// u32, or i32 types. Up to `output_boxes.capacity()` boxes and masks
+    /// will be decoded. The function clears the provided output vectors
+    /// before populating them with the decoded results.
+    ///
+    /// This function returns a `DecoderError` if the the provided outputs don't
+    /// match the configuration provided by the user when building the decoder.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use edgefirst_decoder::{BoundingBox, DecoderBuilder, DetectBox, DecoderResult};
+    /// # use ndarray::Array4;
+    /// # fn main() -> DecoderResult<()> {
+    /// #    let detect0 = include_bytes!("../../../testdata/modelpack_split_9x15x18.bin");
+    /// #    let detect0 = ndarray::Array4::from_shape_vec((1, 9, 15, 18), detect0.to_vec())?;
+    /// #
+    /// #    let detect1 = include_bytes!("../../../testdata/modelpack_split_17x30x18.bin");
+    /// #    let detect1 = ndarray::Array4::from_shape_vec((1, 17, 30, 18), detect1.to_vec())?;
+    /// #    let model_output = vec![
+    /// #        detect1.view().into_dyn().into(),
+    /// #        detect0.view().into_dyn().into(),
+    /// #    ];
+    /// let decoder = DecoderBuilder::default()
+    ///     .with_config_yaml_str(include_str!("../../../testdata/modelpack_split.yaml").to_string())
+    ///     .with_score_threshold(0.45)
+    ///     .with_iou_threshold(0.45)
+    ///     .build()?;
+    ///
+    /// let mut output_boxes: Vec<_> = Vec::with_capacity(10);
+    /// let mut output_masks: Vec<_> = Vec::with_capacity(10);
+    /// decoder.decode_quantized(&model_output, &mut output_boxes, &mut output_masks)?;
+    /// assert!(output_boxes[0].equal_within_delta(
+    ///     &DetectBox {
+    ///         bbox: BoundingBox {
+    ///             xmin: 0.43171933,
+    ///             ymin: 0.68243736,
+    ///             xmax: 0.5626645,
+    ///             ymax: 0.808863,
+    ///         },
+    ///         score: 0.99240804,
+    ///         label: 0
+    ///     },
+    ///     1e-6
+    /// ));
+    /// #    Ok(())
+    /// # }
+    /// ```
+    pub fn decode_quantized_tracked(
+        &mut self,
+        outputs: &[ArrayViewDQuantized],
+        output_boxes: &mut Vec<DetectBox>,
+        output_masks: &mut Vec<Segmentation>,
+        output_tracks: &mut Vec<TrackInfo>,
+        timestamp: u64,
+    ) -> Result<(), DecoderError> {
+        let tracking = if let Some(tracker) = self.tracker.as_mut() {
+            Some((tracker, output_tracks, timestamp))
+        } else {
+            return Err(DecoderError::NoTracker);
+        };
+        output_boxes.clear();
+        output_masks.clear();
+        match &self.model_type {
+            ModelType::ModelPackSegDet {
+                boxes,
+                scores,
+                segmentation,
+            } => {
+                Self::decode_modelpack_det_quantized(
+                    self.score_threshold,
+                    self.iou_threshold,
+                    outputs,
+                    boxes,
+                    scores,
+                    output_boxes,
+                    tracking,
+                )?;
+                Self::decode_modelpack_seg_quantized(outputs, segmentation, output_masks)
+            }
+            ModelType::ModelPackSegDetSplit {
+                detection,
+                segmentation,
+            } => {
+                Self::decode_modelpack_det_split_quantized(
+                    self.score_threshold,
+                    self.iou_threshold,
+                    outputs,
+                    detection,
+                    output_boxes,
+                    tracking,
+                )?;
+                Self::decode_modelpack_seg_quantized(outputs, segmentation, output_masks)
+            }
+            ModelType::ModelPackDet { boxes, scores } => Self::decode_modelpack_det_quantized(
+                self.score_threshold,
+                self.iou_threshold,
+                outputs,
+                boxes,
+                scores,
+                output_boxes,
+                tracking,
+            ),
+            ModelType::ModelPackDetSplit { detection } => {
+                Self::decode_modelpack_det_split_quantized(
+                    self.score_threshold,
+                    self.iou_threshold,
+                    outputs,
+                    detection,
+                    output_boxes,
+                    tracking,
+                )
+            }
+            ModelType::ModelPackSeg { segmentation } => {
+                Self::decode_modelpack_seg_quantized(outputs, segmentation, output_masks)
+            }
+            ModelType::YoloDet { boxes } => Self::decode_yolo_det_quantized(
+                self.score_threshold,
+                self.iou_threshold,
+                outputs,
+                boxes,
+                output_boxes,
+                tracking,
+            ),
+            ModelType::YoloSegDet { boxes, protos } => Self::decode_yolo_segdet_quantized(
+                self.score_threshold,
+                self.iou_threshold,
+                outputs,
+                boxes,
+                protos,
+                output_boxes,
+                output_masks,
+                tracking,
+            ),
+            ModelType::YoloSplitDet { boxes, scores } => Self::decode_yolo_split_det_quantized(
+                self.score_threshold,
+                self.iou_threshold,
+                outputs,
+                boxes,
+                scores,
+                output_boxes,
+                tracking,
+            ),
+            ModelType::YoloSplitSegDet {
+                boxes,
+                scores,
+                mask_coeff,
+                protos,
+            } => Self::decode_yolo_split_segdet_quantized(
+                self.score_threshold,
+                self.iou_threshold,
+                outputs,
+                boxes,
+                scores,
+                mask_coeff,
+                protos,
+                output_boxes,
+                output_masks,
+                tracking,
+            ),
+        }
+    }
+
+    /// This function decodes floating point model outputs into detection boxes
+    /// and segmentation masks. Up to `output_boxes.capacity()` boxes and
+    /// masks will be decoded. The function clears the provided output
+    /// vectors before populating them with the decoded results.
+    ///
+    /// This function returns an `Error` if the the provided outputs don't
+    /// match the configuration provided by the user when building the decoder.
+    ///
+    /// Any quantization information in the configuration will be ignored.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use edgefirst_decoder::{BoundingBox, DecoderBuilder, DetectBox, DecoderResult, configs, configs::DecoderType, dequantize_cpu, Quantization};
+    /// # use ndarray::Array3;
+    /// # fn main() -> DecoderResult<()> {
+    /// #   let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
+    /// #   let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
+    /// #   let mut out_dequant = vec![0.0_f64; 84 * 8400];
+    /// #   let quant = Quantization::new(0.0040811873, -123);
+    /// #   dequantize_cpu(out, quant, &mut out_dequant);
+    /// #   let model_output_f64 = Array3::from_shape_vec((1, 84, 8400), out_dequant)?.into_dyn();
+    ///    let decoder = DecoderBuilder::default()
+    ///     .with_config_yolo_det(configs::Detection {
+    ///         decoder: DecoderType::Ultralytics,
+    ///         quantization: None,
+    ///         shape: vec![1, 84, 8400],
+    ///         anchors: None,
+    ///         dshape: Vec::new(),
+    ///     })
+    ///     .with_score_threshold(0.25)
+    ///     .with_iou_threshold(0.7)
+    ///     .build()?;
+    ///
+    /// let mut output_boxes: Vec<_> = Vec::with_capacity(10);
+    /// let mut output_masks: Vec<_> = Vec::with_capacity(10);
+    /// let model_output_f64 = vec![model_output_f64.view().into()];
+    /// decoder.decode_float(&model_output_f64, &mut output_boxes, &mut output_masks)?;    
+    /// assert!(output_boxes[0].equal_within_delta(
+    ///        &DetectBox {
+    ///            bbox: BoundingBox {
+    ///                xmin: 0.5285137,
+    ///                ymin: 0.05305544,
+    ///                xmax: 0.87541467,
+    ///                ymax: 0.9998909,
+    ///            },
+    ///            score: 0.5591227,
+    ///            label: 0
+    ///        },
+    ///        1e-6
+    ///    ));
+    ///
+    /// #    Ok(())
+    /// # }
+    pub fn decode_float_tracked<T>(
+        &mut self,
+        outputs: &[ArrayViewD<T>],
+        output_boxes: &mut Vec<DetectBox>,
+        output_masks: &mut Vec<Segmentation>,
+        output_tracks: &mut Vec<TrackInfo>,
+        timestamp: u64,
+    ) -> Result<(), DecoderError>
+    where
+        T: Float + AsPrimitive<f32> + AsPrimitive<u8> + Send + Sync + 'static,
+        f32: AsPrimitive<T>,
+    {
+        let tracking = if let Some(tracker) = self.tracker.as_mut() {
+            Some((tracker, output_tracks, timestamp))
+        } else {
+            return Err(DecoderError::NoTracker);
+        };
+        output_boxes.clear();
+        output_masks.clear();
+        match &self.model_type {
+            ModelType::ModelPackSegDet {
+                boxes,
+                scores,
+                segmentation,
+            } => {
+                Self::decode_modelpack_det_float(
+                    self.score_threshold,
+                    self.iou_threshold,
+                    outputs,
+                    boxes,
+                    scores,
+                    output_boxes,
+                    tracking,
+                )?;
+                Self::decode_modelpack_seg_float(outputs, segmentation, output_masks)?;
+            }
+            ModelType::ModelPackSegDetSplit {
+                detection,
+                segmentation,
+            } => {
+                Self::decode_modelpack_det_split_float(
+                    self.score_threshold,
+                    self.iou_threshold,
+                    outputs,
+                    detection,
+                    output_boxes,
+                    tracking,
+                )?;
+                Self::decode_modelpack_seg_float(outputs, segmentation, output_masks)?;
+            }
+            ModelType::ModelPackDet { boxes, scores } => {
+                Self::decode_modelpack_det_float(
+                    self.score_threshold,
+                    self.iou_threshold,
+                    outputs,
+                    boxes,
+                    scores,
+                    output_boxes,
+                    tracking,
+                )?;
+            }
+            ModelType::ModelPackDetSplit { detection } => {
+                Self::decode_modelpack_det_split_float(
+                    self.score_threshold,
+                    self.iou_threshold,
+                    outputs,
+                    detection,
+                    output_boxes,
+                    tracking,
+                )?;
+            }
+            ModelType::ModelPackSeg { segmentation } => {
+                Self::decode_modelpack_seg_float(outputs, segmentation, output_masks)?;
+            }
+            ModelType::YoloDet { boxes } => {
+                Self::decode_yolo_det_float(
+                    self.score_threshold,
+                    self.iou_threshold,
+                    outputs,
+                    boxes,
+                    output_boxes,
+                    tracking,
+                )?;
+            }
+            ModelType::YoloSegDet { boxes, protos } => {
+                Self::decode_yolo_segdet_float(
+                    self.score_threshold,
+                    self.iou_threshold,
+                    outputs,
+                    boxes,
+                    protos,
+                    output_boxes,
+                    output_masks,
+                    tracking,
+                )?;
+            }
+            ModelType::YoloSplitDet { boxes, scores } => {
+                Self::decode_yolo_split_det_float(
+                    self.score_threshold,
+                    self.iou_threshold,
+                    outputs,
+                    boxes,
+                    scores,
+                    output_boxes,
+                    tracking,
+                )?;
+            }
+            ModelType::YoloSplitSegDet {
+                boxes,
+                scores,
+                mask_coeff,
+                protos,
+            } => {
+                Self::decode_yolo_split_segdet_float(
+                    self.score_threshold,
+                    self.iou_threshold,
+                    outputs,
+                    boxes,
+                    scores,
+                    mask_coeff,
+                    protos,
+                    output_boxes,
+                    output_masks,
+                    tracking,
                 )?;
             }
         }
@@ -2090,11 +2607,13 @@ impl Decoder {
     }
 
     fn decode_modelpack_det_quantized(
-        &self,
+        score_threshold: f32,
+        iou_threshold: f32,
         outputs: &[ArrayViewDQuantized],
         boxes: &configs::Boxes,
         scores: &configs::Scores,
         output_boxes: &mut Vec<DetectBox>,
+        tracking: Option<TrackerSettings>,
     ) -> Result<(), DecoderError> {
         let (boxes_tensor, ind) =
             Self::find_outputs_with_shape_quantized(&boxes.shape, outputs, &[])?;
@@ -2119,18 +2638,20 @@ impl Decoder {
                 decode_modelpack_det(
                     (boxes_tensor, quant_boxes),
                     (scores_tensor, quant_scores),
-                    self.score_threshold,
-                    self.iou_threshold,
+                    score_threshold,
+                    iou_threshold,
                     output_boxes,
                 );
             });
         });
 
+        if let Some((tracker, track_infos, timestamp)) = tracking {
+            Self::update_tracker(tracker.as_mut(), output_boxes, track_infos, timestamp);
+        }
         Ok(())
     }
 
     fn decode_modelpack_seg_quantized(
-        &self,
         outputs: &[ArrayViewDQuantized],
         segmentation: &configs::Segmentation,
         output_masks: &mut Vec<Segmentation>,
@@ -2177,10 +2698,12 @@ impl Decoder {
     }
 
     fn decode_modelpack_det_split_quantized(
-        &self,
+        score_threshold: f32,
+        iou_threshold: f32,
         outputs: &[ArrayViewDQuantized],
         detection: &[configs::Detection],
         output_boxes: &mut Vec<DetectBox>,
+        tracking: Option<TrackerSettings>,
     ) -> Result<(), DecoderError> {
         let new_detection = detection
             .iter()
@@ -2223,18 +2746,23 @@ impl Decoder {
         decode_modelpack_split_float(
             &new_outputs_view,
             &new_detection,
-            self.score_threshold,
-            self.iou_threshold,
+            score_threshold,
+            iou_threshold,
             output_boxes,
         );
+        if let Some((tracker, track_infos, timestamp)) = tracking {
+            Self::update_tracker(tracker.as_mut(), output_boxes, track_infos, timestamp);
+        }
         Ok(())
     }
 
     fn decode_yolo_det_quantized(
-        &self,
+        score_threshold: f32,
+        iou_threshold: f32,
         outputs: &[ArrayViewDQuantized],
         boxes: &configs::Detection,
         output_boxes: &mut Vec<DetectBox>,
+        tracking: Option<TrackerSettings>,
     ) -> Result<(), DecoderError> {
         let (boxes_tensor, _) =
             Self::find_outputs_with_shape_quantized(&boxes.shape, outputs, &[])?;
@@ -2248,22 +2776,28 @@ impl Decoder {
             let boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
             decode_yolo_det(
                 (boxes_tensor, quant_boxes),
-                self.score_threshold,
-                self.iou_threshold,
+                score_threshold,
+                iou_threshold,
                 output_boxes,
             );
         });
 
+        if let Some((tracker, track_infos, timestamp)) = tracking {
+            Self::update_tracker(tracker.as_mut(), output_boxes, track_infos, timestamp);
+        }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn decode_yolo_segdet_quantized(
-        &self,
+        score_threshold: f32,
+        iou_threshold: f32,
         outputs: &[ArrayViewDQuantized],
         boxes: &configs::Detection,
         protos: &configs::Protos,
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
+        tracking: Option<TrackerSettings>,
     ) -> Result<(), DecoderError> {
         let (boxes_tensor, ind) =
             Self::find_outputs_with_shape_quantized(&boxes.shape, outputs, &[])?;
@@ -2279,33 +2813,69 @@ impl Decoder {
             .map(Quantization::from)
             .unwrap_or_default();
 
-        with_quantized!(boxes_tensor, b, {
-            with_quantized!(protos_tensor, p, {
-                let box_tensor = Self::swap_axes_if_needed(b, boxes.into());
-                let box_tensor = box_tensor.slice(s![0, .., ..]);
+        // with_quantized!(boxes_tensor, b, {
+        //     with_quantized!(protos_tensor, p, {
+        //         let box_tensor = Self::swap_axes_if_needed(b, boxes.into());
+        //         let box_tensor = box_tensor.slice(s![0, .., ..]);
 
+        //         let protos_tensor = Self::swap_axes_if_needed(p, protos.into());
+        //         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
+        //         decode_yolo_segdet_quant(
+        //             (box_tensor, quant_boxes),
+        //             (protos_tensor, quant_protos),
+        //             score_threshold,
+        //             iou_threshold,
+        //             output_boxes,
+        //             output_masks,
+        //         );
+        //     });
+        // });
+
+        with_quantized!(boxes_tensor, b, {
+            let box_tensor = Self::swap_axes_if_needed(b, boxes.into());
+            let box_tensor = box_tensor.slice(s![0, .., ..]);
+
+            let (boxes_tensor, scores_tensor, masks_tensor) = postprocess_yolo_seg(&box_tensor);
+
+            let boxes = impl_yolo_split_segdet_quant_get_boxes::<XYWH, _, _>(
+                (boxes_tensor, quant_boxes),
+                (scores_tensor, quant_boxes),
+                score_threshold,
+                iou_threshold,
+                output_boxes.capacity(),
+            );
+
+            let (boxes, old_boxes) = if let Some((tracker, track_infos, timestamp)) = tracking {
+                Self::update_tracker_yolo_segdet(tracker.as_mut(), boxes, track_infos, timestamp)
+            } else {
+                (boxes, Vec::new())
+            };
+
+            with_quantized!(protos_tensor, p, {
                 let protos_tensor = Self::swap_axes_if_needed(p, protos.into());
                 let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-                decode_yolo_segdet_quant(
-                    (box_tensor, quant_boxes),
+                impl_yolo_split_segdet_quant_process_masks::<_, _>(
+                    boxes,
+                    (masks_tensor, quant_boxes),
                     (protos_tensor, quant_protos),
-                    self.score_threshold,
-                    self.iou_threshold,
                     output_boxes,
                     output_masks,
-                );
+                )
             });
+            output_boxes.extend(old_boxes);
         });
 
         Ok(())
     }
 
     fn decode_yolo_split_det_quantized(
-        &self,
+        score_threshold: f32,
+        iou_threshold: f32,
         outputs: &[ArrayViewDQuantized],
         boxes: &configs::Boxes,
         scores: &configs::Scores,
         output_boxes: &mut Vec<DetectBox>,
+        tracking: Option<TrackerSettings>,
     ) -> Result<(), DecoderError> {
         let (boxes_tensor, ind) =
             Self::find_outputs_with_shape_quantized(&boxes.shape, outputs, &[])?;
@@ -2330,19 +2900,22 @@ impl Decoder {
                 decode_yolo_split_det_quant(
                     (boxes_tensor, quant_boxes),
                     (scores_tensor, quant_scores),
-                    self.score_threshold,
-                    self.iou_threshold,
+                    score_threshold,
+                    iou_threshold,
                     output_boxes,
                 );
             });
         });
-
+        if let Some((tracker, track_infos, timestamp)) = tracking {
+            Self::update_tracker(tracker.as_mut(), output_boxes, track_infos, timestamp);
+        }
         Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
     fn decode_yolo_split_segdet_quantized(
-        &self,
+        score_threshold: f32,
+        iou_threshold: f32,
         outputs: &[ArrayViewDQuantized],
         boxes: &configs::Boxes,
         scores: &configs::Scores,
@@ -2350,6 +2923,7 @@ impl Decoder {
         protos: &configs::Protos,
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
+        tracking: Option<TrackerSettings>,
     ) -> Result<(), DecoderError> {
         let quant_boxes = boxes
             .quantization
@@ -2378,7 +2952,7 @@ impl Decoder {
             Self::find_outputs_with_shape_quantized(&scores.shape, outputs, &skip)?;
         skip.push(ind);
 
-        let (mask_tensor, ind) =
+        let (masks_tensor, ind) =
             Self::find_outputs_with_shape_quantized(&mask_coeff.shape, outputs, &skip)?;
         skip.push(ind);
 
@@ -2393,25 +2967,31 @@ impl Decoder {
                 let scores_tensor = Self::swap_axes_if_needed(s, scores.into());
                 let scores_tensor = scores_tensor.slice(s![0, .., ..]);
                 impl_yolo_split_segdet_quant_get_boxes::<XYWH, _, _>(
-                    (boxes_tensor, quant_boxes),
-                    (scores_tensor, quant_scores),
-                    self.score_threshold,
-                    self.iou_threshold,
+                    (boxes_tensor.reversed_axes(), quant_boxes),
+                    (scores_tensor.reversed_axes(), quant_scores),
+                    score_threshold,
+                    iou_threshold,
                     output_boxes.capacity(),
                 )
             })
         });
 
-        with_quantized!(mask_tensor, m, {
+        let (boxes, old_boxes) = if let Some((tracker, track_infos, timestamp)) = tracking {
+            Self::update_tracker_yolo_segdet(tracker.as_mut(), boxes, track_infos, timestamp)
+        } else {
+            (boxes, Vec::new())
+        };
+
+        with_quantized!(masks_tensor, m, {
             with_quantized!(protos_tensor, p, {
-                let mask_tensor = Self::swap_axes_if_needed(m, mask_coeff.into());
-                let mask_tensor = mask_tensor.slice(s![0, .., ..]);
+                let masks_tensor = Self::swap_axes_if_needed(m, mask_coeff.into());
+                let masks_tensor = masks_tensor.slice(s![0, .., ..]);
 
                 let protos_tensor = Self::swap_axes_if_needed(p, protos.into());
                 let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
                 impl_yolo_split_segdet_quant_process_masks::<_, _>(
                     boxes,
-                    (mask_tensor, quant_masks),
+                    (masks_tensor.reversed_axes(), quant_masks),
                     (protos_tensor, quant_protos),
                     output_boxes,
                     output_masks,
@@ -2419,14 +2999,18 @@ impl Decoder {
             })
         });
 
+        output_boxes.extend(old_boxes);
+
         Ok(())
     }
 
     fn decode_modelpack_det_split_float<D>(
-        &self,
+        score_threshold: f32,
+        iou_threshold: f32,
         outputs: &[ArrayViewD<D>],
         detection: &[configs::Detection],
         output_boxes: &mut Vec<DetectBox>,
+        tracking: Option<TrackerSettings>,
     ) -> Result<(), DecoderError>
     where
         D: AsPrimitive<f32>,
@@ -2453,15 +3037,17 @@ impl Decoder {
         decode_modelpack_split_float(
             &new_outputs,
             &new_detection,
-            self.score_threshold,
-            self.iou_threshold,
+            score_threshold,
+            iou_threshold,
             output_boxes,
         );
+        if let Some((tracker, track_infos, timestamp)) = tracking {
+            Self::update_tracker(tracker.as_mut(), output_boxes, track_infos, timestamp);
+        }
         Ok(())
     }
 
     fn decode_modelpack_seg_float<T>(
-        &self,
         outputs: &[ArrayViewD<T>],
         segmentation: &configs::Segmentation,
         output_masks: &mut Vec<Segmentation>,
@@ -2489,11 +3075,13 @@ impl Decoder {
     }
 
     fn decode_modelpack_det_float<T>(
-        &self,
+        score_threshold: f32,
+        iou_threshold: f32,
         outputs: &[ArrayViewD<T>],
         boxes: &configs::Boxes,
         scores: &configs::Scores,
         output_boxes: &mut Vec<DetectBox>,
+        tracking: Option<TrackerSettings>,
     ) -> Result<(), DecoderError>
     where
         T: Float + AsPrimitive<f32> + Send + Sync + 'static,
@@ -2511,18 +3099,23 @@ impl Decoder {
         decode_modelpack_float(
             boxes_tensor,
             scores_tensor,
-            self.score_threshold,
-            self.iou_threshold,
+            score_threshold,
+            iou_threshold,
             output_boxes,
         );
+        if let Some((tracker, track_infos, timestamp)) = tracking {
+            Self::update_tracker(tracker.as_mut(), output_boxes, track_infos, timestamp);
+        }
         Ok(())
     }
 
     fn decode_yolo_det_float<T>(
-        &self,
+        score_threshold: f32,
+        iou_threshold: f32,
         outputs: &[ArrayViewD<T>],
         boxes: &configs::Detection,
         output_boxes: &mut Vec<DetectBox>,
+        tracking: Option<TrackerSettings>,
     ) -> Result<(), DecoderError>
     where
         T: Float + AsPrimitive<f32> + Send + Sync + 'static,
@@ -2532,22 +3125,23 @@ impl Decoder {
 
         let boxes_tensor = Self::swap_axes_if_needed(boxes_tensor, boxes.into());
         let boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
-        decode_yolo_det_float(
-            boxes_tensor,
-            self.score_threshold,
-            self.iou_threshold,
-            output_boxes,
-        );
+        decode_yolo_det_float(boxes_tensor, score_threshold, iou_threshold, output_boxes);
+        if let Some((tracker, track_infos, timestamp)) = tracking {
+            Self::update_tracker(tracker.as_mut(), output_boxes, track_infos, timestamp);
+        }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn decode_yolo_segdet_float<T>(
-        &self,
+        score_threshold: f32,
+        iou_threshold: f32,
         outputs: &[ArrayViewD<T>],
         boxes: &configs::Detection,
         protos: &configs::Protos,
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
+        tracking: Option<TrackerSettings>,
     ) -> Result<(), DecoderError>
     where
         T: Float + AsPrimitive<f32> + Send + Sync + 'static,
@@ -2562,23 +3156,43 @@ impl Decoder {
 
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-        decode_yolo_segdet_float(
+
+        let (boxes_tensor, scores_tensor, masks_tensor) = postprocess_yolo_seg(&boxes_tensor);
+
+        let boxes = impl_yolo_segdet_get_boxes::<XYWH, _, _>(
             boxes_tensor,
+            scores_tensor,
+            score_threshold,
+            iou_threshold,
+            output_boxes.capacity(),
+        );
+
+        let (boxes, old_boxes) = if let Some((tracker, track_infos, timestamp)) = tracking {
+            Self::update_tracker_yolo_segdet(tracker.as_mut(), boxes, track_infos, timestamp)
+        } else {
+            (boxes, Vec::new())
+        };
+
+        impl_yolo_split_segdet_process_masks(
+            boxes,
+            masks_tensor,
             protos_tensor,
-            self.score_threshold,
-            self.iou_threshold,
             output_boxes,
             output_masks,
         );
+        output_boxes.extend(old_boxes);
+
         Ok(())
     }
 
     fn decode_yolo_split_det_float<T>(
-        &self,
+        score_threshold: f32,
+        iou_threshold: f32,
         outputs: &[ArrayViewD<T>],
         boxes: &configs::Boxes,
         scores: &configs::Scores,
         output_boxes: &mut Vec<DetectBox>,
+        tracking: Option<TrackerSettings>,
     ) -> Result<(), DecoderError>
     where
         T: Float + AsPrimitive<f32> + Send + Sync + 'static,
@@ -2596,16 +3210,21 @@ impl Decoder {
         decode_yolo_split_det_float(
             boxes_tensor,
             scores_tensor,
-            self.score_threshold,
-            self.iou_threshold,
+            score_threshold,
+            iou_threshold,
             output_boxes,
         );
+
+        if let Some((tracker, track_infos, timestamp)) = tracking {
+            Self::update_tracker(tracker.as_mut(), output_boxes, track_infos, timestamp);
+        }
         Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
     fn decode_yolo_split_segdet_float<T>(
-        &self,
+        score_threshold: f32,
+        iou_threshold: f32,
         outputs: &[ArrayViewD<T>],
         boxes: &configs::Boxes,
         scores: &configs::Scores,
@@ -2613,6 +3232,7 @@ impl Decoder {
         protos: &configs::Protos,
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
+        tracking: Option<TrackerSettings>,
     ) -> Result<(), DecoderError>
     where
         T: Float + AsPrimitive<f32> + Send + Sync + 'static,
@@ -2631,25 +3251,98 @@ impl Decoder {
         let scores_tensor = scores_tensor.slice(s![0, .., ..]);
         skip.push(ind);
 
-        let (mask_tensor, ind) = Self::find_outputs_with_shape(&mask_coeff.shape, outputs, &skip)?;
-        let mask_tensor = Self::swap_axes_if_needed(mask_tensor, mask_coeff.into());
-        let mask_tensor = mask_tensor.slice(s![0, .., ..]);
+        let (masks_tensor, ind) = Self::find_outputs_with_shape(&mask_coeff.shape, outputs, &skip)?;
+        let masks_tensor = Self::swap_axes_if_needed(masks_tensor, mask_coeff.into());
+        let masks_tensor = masks_tensor.slice(s![0, .., ..]);
         skip.push(ind);
 
         let (protos_tensor, _) = Self::find_outputs_with_shape(&protos.shape, outputs, &skip)?;
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-        decode_yolo_split_segdet_float(
-            boxes_tensor,
-            scores_tensor,
-            mask_tensor,
+
+        let boxes = impl_yolo_segdet_get_boxes::<XYWH, _, _>(
+            boxes_tensor.reversed_axes(),
+            scores_tensor.reversed_axes(),
+            score_threshold,
+            iou_threshold,
+            output_boxes.capacity(),
+        );
+
+        let (boxes, old_boxes) = if let Some((tracker, track_infos, timestamp)) = tracking {
+            Self::update_tracker_yolo_segdet(tracker.as_mut(), boxes, track_infos, timestamp)
+        } else {
+            (boxes, Vec::new())
+        };
+
+        impl_yolo_split_segdet_process_masks(
+            boxes,
+            masks_tensor.reversed_axes(),
             protos_tensor,
-            self.score_threshold,
-            self.iou_threshold,
             output_boxes,
             output_masks,
         );
+        output_boxes.extend(old_boxes);
+
         Ok(())
+    }
+
+    fn update_tracker_yolo_segdet(
+        tracker: &mut dyn edgefirst_tracker::Tracker<DetectBox>,
+        boxes: Vec<(DetectBox, usize)>,
+        track_infos: &mut Vec<TrackInfo>,
+        timestamp: u64,
+    ) -> (Vec<(DetectBox, usize)>, Vec<DetectBox>) {
+        let mut old_boxes = Vec::new();
+
+        // custom tracking since we can only use live boxes for masks. We
+        // can still output "old" boxes but they will not have masks.
+        // let live_tracks = tracker.update(output_boxes, timestamp);
+        let (new_boxes, boxes_indices): (Vec<_>, Vec<_>) = boxes.into_iter().unzip();
+        tracker.update(&new_boxes, timestamp);
+        let mut tracks = tracker.get_active_tracks();
+
+        // sort in descending order of last updated
+        tracks.sort_by_key(|t| u64::MAX - t.last_updated);
+
+        let mut boxes = Vec::new();
+        for i in &tracks {
+            let mut b = i.last_box;
+            b.bbox = i.tracked_location.into();
+            if i.last_updated == timestamp {
+                boxes.push((b, boxes_indices[i.last_box_index]));
+            } else {
+                old_boxes.push(b);
+            }
+        }
+        track_infos.clear();
+        track_infos.extend(tracks.into_iter().map(|t| {
+            let t: TrackInfo = t.into();
+            t
+        }));
+        (boxes, old_boxes)
+    }
+
+    fn update_tracker(
+        tracker: &mut dyn edgefirst_tracker::Tracker<DetectBox>,
+        output_boxes: &mut Vec<DetectBox>,
+        output_tracks: &mut Vec<TrackInfo>,
+        timestamp: u64,
+    ) {
+        tracker.update(output_boxes, timestamp);
+        let tracks = tracker.get_active_tracks();
+        let (new_tracks, new_boxes): (Vec<_>, Vec<_>) = tracks
+            .into_iter()
+            .map(|t| {
+                let mut box_ = t.last_box;
+                box_.bbox = t.tracked_location.into();
+                let t: TrackInfo = t.into();
+                (t, box_)
+            })
+            .unzip();
+        output_boxes.clear();
+        output_boxes.extend(new_boxes);
+        output_tracks.clear();
+        output_tracks.extend(new_tracks);
     }
 
     fn match_outputs_to_detect<'a, 'b, T>(
@@ -4333,6 +5026,7 @@ mod decoder_builder_tests {
 
         let mut output_boxes: Vec<_> = Vec::with_capacity(50);
         let mut output_masks: Vec<_> = Vec::with_capacity(50);
+
         let result =
             decoder.decode_quantized(&[out.view().into()], &mut output_boxes, &mut output_masks);
 

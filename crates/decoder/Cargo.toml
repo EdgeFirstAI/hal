@@ -15,7 +15,7 @@ license.workspace = true
 
 [dependencies]
 argminmax = { workspace = true }
-#edgefirst-tracker = { workspace = true, optional = true }
+edgefirst-tracker = { workspace = true }
 env_logger = { workspace = true }
 fast-math = { workspace = true }
 log = { workspace = true }

@@ -23,6 +23,8 @@ pub enum DecoderError {
     InvalidConfig(String),
     /// An error occurred with ndarray shape operations
     NDArrayShape(ndarray::ShapeError),
+    /// A tracked operation was requested but no tracker was configured
+    NoTracker,
 }
 
 impl fmt::Display for DecoderError {

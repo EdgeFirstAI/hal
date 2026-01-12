@@ -7,29 +7,120 @@ use log::{debug, trace};
 use nalgebra::{Dyn, OMatrix, U4};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ByteTrackBuilder {
+    track_extra_lifespan: u64,
+    track_high_conf: f32,
+    track_iou: f32,
+    track_update: f32,
+}
+
+impl Default for ByteTrackBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ByteTrackBuilder {
+    /// Creates a new ByteTrackBuilder with default parameters.
+    /// These defaults are:
+    /// - track_extra_lifespan: 500_000_000 (0.5 seconds)
+    /// - track_high_conf: 0.7
+    /// - track_iou: 0.25
+    /// - track_update: 0.25
+    /// # Examples
+    /// ```rust
+    /// use edgefirst_tracker::bytetrack::ByteTrackBuilder;
+    /// let tracker = ByteTrackBuilder::new().build();
+    /// assert_eq!(tracker.track_high_conf, 0.7);
+    /// assert_eq!(tracker.track_iou, 0.25);
+    /// assert_eq!(tracker.track_update, 0.25);
+    /// assert_eq!(tracker.track_extra_lifespan_ns, 500_000_000);
+    /// ```
+    pub fn new() -> Self {
+        Self {
+            track_extra_lifespan: 500_000_000,
+            track_high_conf: 0.7,
+            track_iou: 0.25,
+            track_update: 0.25,
+        }
+    }
+
+    /// Sets the extra lifespan for tracks in nanoseconds.
+    pub fn track_extra_lifespan(mut self, lifespan: u64) -> Self {
+        self.track_extra_lifespan = lifespan;
+        self
+    }
+
+    /// Sets the high confidence threshold for tracking.
+    pub fn track_high_conf(mut self, conf: f32) -> Self {
+        self.track_high_conf = conf;
+        self
+    }
+
+    /// Sets the IOU threshold for tracking.
+    pub fn track_iou(mut self, iou: f32) -> Self {
+        self.track_iou = iou;
+        self
+    }
+
+    /// Sets the update rate for the Kalman filter.
+    pub fn track_update(mut self, update: f32) -> Self {
+        self.track_update = update;
+        self
+    }
+
+    /// Builds the ByteTrack tracker with the specified parameters.
+    /// # Examples
+    /// ```rust
+    /// use edgefirst_tracker::bytetrack::ByteTrackBuilder;
+    /// let tracker = ByteTrackBuilder::new()
+    ///     .track_high_conf(0.8)
+    ///     .track_iou(0.3)
+    ///     .track_update(0.2)
+    ///     .track_extra_lifespan(1_000_000_000)
+    ///     .build();
+    /// assert_eq!(tracker.track_high_conf, 0.8);
+    /// assert_eq!(tracker.track_iou, 0.3);
+    /// assert_eq!(tracker.track_update, 0.2);
+    /// assert_eq!(tracker.track_extra_lifespan_ns, 1_000_000_000);
+    /// ```
+    pub fn build<T: DetectionBox>(self) -> ByteTrack<T> {
+        ByteTrack {
+            track_extra_lifespan: self.track_extra_lifespan,
+            track_high_conf: self.track_high_conf,
+            track_iou: self.track_iou,
+            track_update: self.track_update,
+            tracklets: Vec::new(),
+            frame_count: 0,
+        }
+    }
+}
+
 #[allow(dead_code)]
-#[derive(Default)]
-pub struct ByteTrack {
+#[derive(Default, Debug, Clone)]
+pub struct ByteTrack<T: DetectionBox> {
     pub track_extra_lifespan: u64,
     pub track_high_conf: f32,
     pub track_iou: f32,
     pub track_update: f32,
-
-    pub tracklets: Vec<Tracklet>,
+    pub tracklets: Vec<Tracklet<T>>,
     pub frame_count: i32,
 }
 
 #[derive(Debug, Clone)]
-pub struct Tracklet {
+pub struct Tracklet<T: DetectionBox> {
     pub id: Uuid,
     pub filter: ConstantVelocityXYAHModel2<f32>,
     pub count: i32,
     pub created: u64,
     pub last_updated: u64,
+    pub last_box: T,
+    last_box_index: usize,
 }
 
-impl Tracklet {
-    fn update<T: DetectionBox>(&mut self, detect_box: &T, ts: u64) {
+impl<T: DetectionBox> Tracklet<T> {
+    fn update(&mut self, detect_box: &T, ts: u64) {
         self.count += 1;
         self.last_updated = ts;
         self.filter.update(&vaalbox_to_xyah(&detect_box.bbox()));
@@ -79,7 +170,7 @@ fn iou(box1: &[f32], box2: &[f32]) -> f32 {
 }
 
 fn box_cost<T: DetectionBox>(
-    track: &Tracklet,
+    track: &Tracklet<T>,
     new_box: &T,
     distance: f32,
     score_threshold: f32,
@@ -101,19 +192,8 @@ fn box_cost<T: DetectionBox>(
     (1.5 - new_box.score()) + (1.5 - iou)
 }
 
-impl ByteTrack {
-    pub fn new() -> ByteTrack {
-        ByteTrack {
-            track_extra_lifespan: 500_000_000,
-            track_high_conf: 0.7,
-            track_iou: 0.25,
-            track_update: 0.25,
-            tracklets: Vec::new(),
-            frame_count: 0,
-        }
-    }
-
-    fn compute_costs<T: DetectionBox>(
+impl<T: DetectionBox> ByteTrack<T> {
+    fn compute_costs(
         &mut self,
         boxes: &[T],
         score_threshold: f32,
@@ -152,11 +232,11 @@ impl ByteTrack {
     }
 }
 
-impl<T> Tracker<T> for ByteTrack
+impl<T> Tracker<T> for ByteTrack<T>
 where
     T: DetectionBox,
 {
-    fn update(&mut self, boxes: &[T], timestamp: u64) -> Vec<Option<TrackInfo>> {
+    fn update(&mut self, boxes: &[T], timestamp: u64) -> Vec<Option<TrackInfo<T>>> {
         self.frame_count += 1;
         let high_conf_ind = boxes
             .iter()
@@ -205,6 +285,8 @@ where
                         created: self.tracklets[x].created,
                         tracked_location: self.tracklets[x].get_predicted_location(),
                         last_updated: timestamp,
+                        last_box: boxes[i].clone(),
+                        last_box_index: i,
                     });
                     assert!(!tracked[x]);
                     tracked[x] = true;
@@ -232,6 +314,8 @@ where
                         created: self.tracklets[x].created,
                         tracked_location: self.tracklets[x].get_predicted_location(),
                         last_updated: timestamp,
+                        last_box: boxes[i].clone(),
+                        last_box_index: i,
                     });
                     trace!(
                         "Cost: {} Box: {:#?} UUID: {} Mean: {}",
@@ -270,6 +354,8 @@ where
                     last_updated: timestamp,
                     count: 1,
                     created: timestamp,
+                    last_box: boxes[i].clone(),
+                    last_box_index: i,
                 };
                 matched_info[i] = Some(TrackInfo {
                     uuid: new_tracklet.id,
@@ -277,6 +363,8 @@ where
                     created: new_tracklet.created,
                     tracked_location: new_tracklet.get_predicted_location(),
                     last_updated: timestamp,
+                    last_box: boxes[i].clone(),
+                    last_box_index: i,
                 });
                 self.tracklets.push(new_tracklet);
             }
@@ -284,7 +372,7 @@ where
         matched_info
     }
 
-    fn get_active_tracks(&self) -> Vec<TrackInfo> {
+    fn get_active_tracks(&self) -> Vec<TrackInfo<T>> {
         self.tracklets
             .iter()
             .map(|t| TrackInfo {
@@ -293,6 +381,8 @@ where
                 count: t.count,
                 created: t.created,
                 last_updated: t.last_updated,
+                last_box: t.last_box.clone(),
+                last_box_index: t.last_box_index,
             })
             .collect()
     }

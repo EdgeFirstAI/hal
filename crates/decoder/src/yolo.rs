@@ -428,8 +428,8 @@ pub fn impl_yolo_segdet_quant<
     let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&boxes);
 
     let boxes = impl_yolo_split_segdet_quant_get_boxes::<B, _, _>(
-        (boxes_tensor.reversed_axes(), quant_boxes),
-        (scores_tensor.reversed_axes(), quant_boxes),
+        (boxes_tensor, quant_boxes),
+        (scores_tensor, quant_boxes),
         score_threshold,
         iou_threshold,
         output_boxes.capacity(),
@@ -437,7 +437,7 @@ pub fn impl_yolo_segdet_quant<
 
     impl_yolo_split_segdet_quant_process_masks::<_, _>(
         boxes,
-        (mask_tensor.reversed_axes(), quant_boxes),
+        (mask_tensor, quant_boxes),
         protos,
         output_boxes,
         output_masks,
@@ -468,15 +468,53 @@ pub fn impl_yolo_segdet_float<
     f32: AsPrimitive<BOX>,
 {
     let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&boxes);
+    let boxes = impl_yolo_segdet_get_boxes::<B, _, _>(
+        boxes_tensor,
+        scores_tensor,
+        score_threshold,
+        iou_threshold,
+        output_boxes.capacity(),
+    );
+    impl_yolo_split_segdet_process_masks(boxes, mask_tensor, protos, output_boxes, output_masks);
+}
 
+pub(crate) fn impl_yolo_segdet_get_boxes<
+    B: BBoxTypeTrait,
+    BOX: Float + AsPrimitive<f32> + Send + Sync,
+    SCORE: Float + AsPrimitive<f32> + Send + Sync,
+>(
+    boxes_tensor: ArrayView2<BOX>,
+    scores_tensor: ArrayView2<SCORE>,
+    score_threshold: f32,
+    iou_threshold: f32,
+    max_boxes: usize,
+) -> Vec<(DetectBox, usize)>
+where
+    f32: AsPrimitive<SCORE>,
+{
+    println!("1 boxes_tensor shape: {:?}", boxes_tensor.shape());
+    println!("scores_tensor shape: {:?}", scores_tensor.shape());
     let boxes = postprocess_boxes_index_float::<B, _, _>(
         score_threshold.as_(),
         boxes_tensor,
         scores_tensor,
     );
     let mut boxes = nms_extra_float(iou_threshold, boxes);
-    boxes.truncate(output_boxes.capacity());
-    let boxes = decode_segdet_f32(boxes, mask_tensor, protos);
+    boxes.truncate(max_boxes);
+    boxes
+}
+
+pub(crate) fn impl_yolo_split_segdet_process_masks<
+    MASK: Float + AsPrimitive<f32> + Send + Sync,
+    PROTO: Float + AsPrimitive<f32> + Send + Sync,
+>(
+    boxes: Vec<(DetectBox, usize)>,
+    masks_tensor: ArrayView2<MASK>,
+    protos_tensor: ArrayView3<PROTO>,
+    output_boxes: &mut Vec<DetectBox>,
+    output_masks: &mut Vec<Segmentation>,
+) {
+    let boxes = decode_segdet(boxes, masks_tensor, protos_tensor);
     output_boxes.clear();
     output_masks.clear();
     for (b, m) in boxes.into_iter() {
@@ -491,6 +529,8 @@ pub fn impl_yolo_segdet_float<
     }
 }
 
+/// boxes tensor should be of shape (num_boxes, 4)
+/// scores tensor should be of shape (num_boxes, num_classes)
 pub(crate) fn impl_yolo_split_segdet_quant_get_boxes<
     B: BBoxTypeTrait,
     BOX: PrimInt + AsPrimitive<f32> + Send + Sync,
@@ -507,10 +547,8 @@ where
 {
     let (boxes_tensor, quant_boxes) = boxes;
     let (scores_tensor, quant_scores) = scores;
-
-    let boxes_tensor = boxes_tensor.reversed_axes();
-    let scores_tensor = scores_tensor.reversed_axes();
-
+    println!("2 boxes_tensor shape: {:?}", boxes_tensor.shape());
+    println!("scores_tensor shape: {:?}", scores_tensor.shape());
     let boxes = {
         let score_threshold = quantize_score_threshold(score_threshold, quant_scores);
         postprocess_boxes_index_quant::<B, _, _>(
@@ -528,6 +566,8 @@ where
         .collect()
 }
 
+/// mask_coeff should be of shape (num_boxes, num_protos)
+/// protos should be of shape (proto_height, proto_width, num_protos)
 pub(crate) fn impl_yolo_split_segdet_quant_process_masks<
     MASK: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
     PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
@@ -540,8 +580,6 @@ pub(crate) fn impl_yolo_split_segdet_quant_process_masks<
 ) {
     let (masks, quant_masks) = mask_coeff;
     let (protos, quant_protos) = protos;
-
-    let masks = masks.reversed_axes();
 
     let boxes = decode_segdet_quant(boxes, masks, protos, quant_masks, quant_protos);
     output_boxes.clear();
@@ -646,7 +684,7 @@ pub fn impl_yolo_split_segdet_float<
     );
     let mut boxes = nms_extra_float(iou_threshold, boxes);
     boxes.truncate(output_boxes.capacity());
-    let boxes = decode_segdet_f32(boxes, mask_tensor, protos);
+    let boxes = decode_segdet(boxes, mask_tensor, protos);
     output_boxes.clear();
     output_masks.clear();
     for (b, m) in boxes.into_iter() {
@@ -669,7 +707,7 @@ fn postprocess_yolo<'a, T>(
     (boxes_tensor, scores_tensor)
 }
 
-fn postprocess_yolo_seg<'a, T>(
+pub(crate) fn postprocess_yolo_seg<'a, T>(
     output: &'a ArrayView2<'_, T>,
 ) -> (ArrayView2<'a, T>, ArrayView2<'a, T>, ArrayView2<'a, T>) {
     assert!(output.shape()[0] > 32 + 4, "Output shape is too short");
@@ -680,25 +718,25 @@ fn postprocess_yolo_seg<'a, T>(
     (boxes_tensor, scores_tensor, mask_tensor)
 }
 
-fn decode_segdet_f32<
+fn decode_segdet<
     MASK: Float + AsPrimitive<f32> + Send + Sync,
     PROTO: Float + AsPrimitive<f32> + Send + Sync,
 >(
     boxes: Vec<(DetectBox, usize)>,
-    masks: ArrayView2<MASK>,
-    protos: ArrayView3<PROTO>,
+    masks_tensor: ArrayView2<MASK>,
+    protos_tensor: ArrayView3<PROTO>,
 ) -> Vec<(DetectBox, Array3<u8>)> {
     if boxes.is_empty() {
         return Vec::new();
     }
-    assert!(masks.shape()[1] == protos.shape()[2]);
+    assert!(masks_tensor.shape()[1] == protos_tensor.shape()[2]);
     boxes
         .into_par_iter()
         .map(|mut b| {
             let ind = b.1;
-            let (protos, roi) = protobox(&protos, &b.0.bbox);
+            let (protos, roi) = protobox(&protos_tensor, &b.0.bbox);
             b.0.bbox = roi;
-            (b.0, make_segmentation(masks.row(ind), protos.view()))
+            (b.0, make_segmentation(masks_tensor.row(ind), protos.view()))
         })
         .collect()
 }
