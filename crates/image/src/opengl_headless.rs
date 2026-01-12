@@ -2780,6 +2780,7 @@ void main() {
 }
 
 #[cfg(test)]
+#[cfg(feature = "opengl")]
 mod gl_tests {
     use super::*;
     use crate::{RGBA, TensorImage};
@@ -2789,6 +2790,11 @@ mod gl_tests {
     #[cfg(feature = "decoder")]
     fn test_segmentation() {
         use edgefirst_decoder::Segmentation;
+
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
 
         let mut image = TensorImage::load(
             include_bytes!("../../../testdata/giraffe.jpg"),
@@ -2825,6 +2831,11 @@ mod gl_tests {
     fn test_segmentation_mem() {
         use edgefirst_decoder::Segmentation;
 
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
         let mut image = TensorImage::load(
             include_bytes!("../../../testdata/giraffe.jpg"),
             Some(RGBA),
@@ -2860,6 +2871,11 @@ mod gl_tests {
     fn test_segmentation_yolo() {
         use edgefirst_decoder::Segmentation;
         use ndarray::Array3;
+
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
 
         let mut image = TensorImage::load(
             include_bytes!("../../../testdata/giraffe.jpg"),
@@ -2904,6 +2920,11 @@ mod gl_tests {
     fn test_boxes() {
         use edgefirst_decoder::DetectBox;
 
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
         let mut image = TensorImage::load(
             include_bytes!("../../../testdata/giraffe.jpg"),
             Some(RGBA),
@@ -2925,5 +2946,19 @@ mod gl_tests {
             .unwrap();
 
         image.save_jpeg("test_boxes.jpg", 80).unwrap();
+    }
+
+    static GL_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Helper function to check if OpenGL is available
+    fn is_opengl_available() -> bool {
+        #[cfg(all(target_os = "linux", feature = "opengl"))]
+        {
+            *GL_AVAILABLE.get_or_init(|| GLProcessorThreaded::new().is_ok())
+        }
+
+        #[cfg(not(all(target_os = "linux", feature = "opengl")))]
+        {
+            false
+        }
     }
 }
