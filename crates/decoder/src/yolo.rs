@@ -492,8 +492,6 @@ pub(crate) fn impl_yolo_segdet_get_boxes<
 where
     f32: AsPrimitive<SCORE>,
 {
-    println!("1 boxes_tensor shape: {:?}", boxes_tensor.shape());
-    println!("scores_tensor shape: {:?}", scores_tensor.shape());
     let boxes = postprocess_boxes_index_float::<B, _, _>(
         score_threshold.as_(),
         boxes_tensor,
@@ -547,8 +545,6 @@ where
 {
     let (boxes_tensor, quant_boxes) = boxes;
     let (scores_tensor, quant_scores) = scores;
-    println!("2 boxes_tensor shape: {:?}", boxes_tensor.shape());
-    println!("scores_tensor shape: {:?}", scores_tensor.shape());
     let boxes = {
         let score_threshold = quantize_score_threshold(score_threshold, quant_scores);
         postprocess_boxes_index_quant::<B, _, _>(

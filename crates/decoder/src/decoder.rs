@@ -1243,8 +1243,6 @@ impl DecoderBuilder {
         Self::verify_dshapes(&protos.dshape, &protos.shape, "Protos")?;
 
         let protos_count = Self::get_protos_count(&protos.dshape).unwrap_or(protos.shape[3]);
-        println!("Protos count: {}", protos_count);
-        println!("Detection dshape: {:?}", detection.dshape);
         let classes = if !detection.dshape.is_empty() {
             Self::get_class_count(&detection.dshape, Some(protos_count), None)?
         } else {
