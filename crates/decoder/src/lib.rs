@@ -664,7 +664,6 @@ mod decoder_tests {
         },
         *,
     };
-    use edgefirst_tracker::bytetrack::ByteTrackBuilder;
     use ndarray::{Array4, array, s};
     use ndarray_stats::DeviationExt;
 
@@ -1886,6 +1885,30 @@ mod decoder_tests {
     }
 
     #[test]
+    fn test_ndarray_to_xyxy_float() {
+        let arr = array![10.0_f32, 20.0, 20.0, 20.0];
+        let xyxy: [f32; 4] = XYWH::ndarray_to_xyxy_float(arr.view());
+        assert_eq!(xyxy, [0.0_f32, 10.0, 20.0, 30.0]);
+
+        let arr = array![10.0_f32, 20.0, 20.0, 20.0];
+        let xyxy: [f32; 4] = XYXY::ndarray_to_xyxy_float(arr.view());
+        assert_eq!(xyxy, [10.0_f32, 20.0, 20.0, 20.0]);
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod decoder_tracked_tests {
+    #![allow(clippy::excessive_precision)]
+    use super::*;
+    use crate::{
+        DecoderBuilder,
+        configs::{DecoderType, DimName, Protos},
+    };
+    use edgefirst_tracker::ByteTrackBuilder;
+    use ndarray::{Array3, s};
+
+    #[test]
     fn test_tracker_error() {
         let score_threshold = 0.15;
         let iou_threshold = 0.7;
@@ -1934,14 +1957,14 @@ mod decoder_tests {
     }
 
     #[test]
-    fn test_build_tracker() {
+    fn test_tracker_yolo_det() {
         let score_threshold = 0.15;
         let iou_threshold = 0.7;
         let quant = (0.0040811873, -123);
         let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
         let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
         let out = Array3::from_shape_vec((1, 84, 8400), out.to_vec()).unwrap();
-
+        let out_float = dequantize_ndarray::<_, _, f32>(out.view(), quant.into());
         let mut decoder = DecoderBuilder::default()
             .with_config_yolo_det(configs::Detection {
                 decoder: DecoderType::Ultralytics,
@@ -1964,16 +1987,14 @@ mod decoder_tests {
         let mut output_masks: Vec<_> = Vec::with_capacity(50);
         let mut output_tracks: Vec<_> = Vec::with_capacity(50);
         decoder
-            .decode_quantized_tracked(
-                &[out.view().into()],
+            .decode_float_tracked(
+                &[out_float.view().into_dyn()],
                 &mut output_boxes,
                 &mut output_masks,
                 &mut output_tracks,
                 0,
             )
             .unwrap();
-
-        println!("Tracked boxes: {:?}", output_tracks);
 
         assert!(!output_tracks.is_empty());
         assert_eq!(output_boxes.len(), 1);
@@ -2002,13 +2023,785 @@ mod decoder_tests {
     }
 
     #[test]
-    fn test_ndarray_to_xyxy_float() {
-        let arr = array![10.0_f32, 20.0, 20.0, 20.0];
-        let xyxy: [f32; 4] = XYWH::ndarray_to_xyxy_float(arr.view());
-        assert_eq!(xyxy, [0.0_f32, 10.0, 20.0, 30.0]);
+    fn test_tracker_yolo_segdet() {
+        let score_threshold = 0.3;
+        let iou_threshold = 0.45;
+        let boxes = include_bytes!("../../../testdata/yolov8_boxes_116x8400.bin");
+        let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
+        let boxes = ndarray::Array3::from_shape_vec((1, 116, 8400), boxes.to_vec()).unwrap();
+        let quant_boxes = (0.021287761628627777, 31).into();
 
-        let arr = array![10.0_f32, 20.0, 20.0, 20.0];
-        let xyxy: [f32; 4] = XYXY::ndarray_to_xyxy_float(arr.view());
-        assert_eq!(xyxy, [10.0_f32, 20.0, 20.0, 20.0]);
+        let protos = include_bytes!("../../../testdata/yolov8_protos_160x160x32.bin");
+        let protos =
+            unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
+        let protos = ndarray::Array4::from_shape_vec((1, 160, 160, 32), protos.to_vec()).unwrap();
+        let quant_protos = (0.02491161972284317, -117).into();
+
+        let mut decoder = DecoderBuilder::default()
+            .with_config_yolo_segdet(
+                configs::Detection {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: Some(quant_boxes),
+                    shape: vec![1, 116, 8400],
+                    anchors: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumFeatures, 116),
+                        (DimName::NumBoxes, 8400),
+                    ],
+                },
+                Protos {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: Some(quant_protos),
+                    shape: vec![1, 160, 160, 32],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::Height, 160),
+                        (DimName::Width, 160),
+                        (DimName::NumProtos, 32),
+                    ],
+                },
+            )
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .with_tracker(ByteTrackBuilder::new().track_high_conf(0.5).build())
+            .build()
+            .unwrap();
+
+        let quant_boxes = quant_boxes.into();
+        let quant_protos = quant_protos.into();
+
+        let mut output_boxes1: Vec<_> = Vec::with_capacity(500);
+        let mut output_masks1: Vec<_> = Vec::with_capacity(500);
+        let mut output_tracks1: Vec<_> = Vec::with_capacity(500);
+
+        decoder
+            .decode_quantized_tracked(
+                &[boxes.view().into(), protos.view().into()],
+                &mut output_boxes1,
+                &mut output_masks1,
+                &mut output_tracks1,
+                1000,
+            )
+            .unwrap();
+
+        let protos = dequantize_ndarray::<_, _, f32>(protos.view(), quant_protos);
+        let boxes = dequantize_ndarray::<_, _, f32>(boxes.view(), quant_boxes);
+
+        let mut output_boxes2: Vec<_> = Vec::with_capacity(500);
+        let mut output_masks2: Vec<_> = Vec::with_capacity(500);
+        let mut output_tracks2: Vec<_> = Vec::with_capacity(500);
+
+        decoder
+            .decode_float_tracked(
+                &[boxes.view().into_dyn(), protos.view().into_dyn()],
+                &mut output_boxes2,
+                &mut output_masks2,
+                &mut output_tracks2,
+                1000,
+            )
+            .unwrap();
+
+        assert_eq!(output_boxes1.len(), output_boxes2.len());
+        assert_eq!(output_masks1.len(), output_masks2.len());
+        assert_eq!(output_tracks1.len(), output_tracks2.len());
+
+        assert_eq!(output_boxes1, output_boxes2);
+        for (m1, m2) in output_masks1.iter().zip(output_masks2.iter()) {
+            assert_eq!(m1.xmin, m2.xmin);
+            assert_eq!(m1.ymin, m2.ymin);
+            assert_eq!(m1.xmax, m2.xmax);
+            assert_eq!(m1.ymax, m2.ymax);
+
+            let m1 = segmentation_to_mask(m1.segmentation.view());
+            let m2 = segmentation_to_mask(m2.segmentation.view());
+            assert_eq!(m1, m2);
+        }
+        for (t1, t2) in output_tracks1.iter().zip(output_tracks2.iter()) {
+            assert_eq!(t1.uuid, t2.uuid);
+        }
+    }
+
+    #[test]
+    fn test_tracker_yolo_split_det() {
+        let score_threshold = 0.15;
+        let iou_threshold = 0.7;
+        let quant = (0.0040811873, -123);
+        let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
+        let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
+        let out = Array3::from_shape_vec((1, 84, 8400), out.to_vec()).unwrap();
+        let out_float = dequantize_ndarray::<_, _, f32>(out.view(), quant.into());
+        let mut decoder = DecoderBuilder::default()
+            .with_config_yolo_split_det(
+                configs::Boxes {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: Some(quant.into()),
+                    shape: vec![1, 4, 8400],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumFeatures, 4),
+                        (DimName::NumBoxes, 8400),
+                    ],
+                },
+                configs::Scores {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: Some(quant.into()),
+                    shape: vec![1, 80, 8400],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumClasses, 80),
+                        (DimName::NumBoxes, 8400),
+                    ],
+                },
+            )
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .with_tracker(ByteTrackBuilder::default().track_high_conf(0.5).build())
+            .build()
+            .unwrap();
+
+        let mut output_boxes: Vec<_> = Vec::with_capacity(50);
+        let mut output_masks: Vec<_> = Vec::with_capacity(50);
+        let mut output_tracks: Vec<_> = Vec::with_capacity(50);
+        decoder
+            .decode_float_tracked(
+                &[
+                    out_float.slice(s![.., ..4, ..]).view().into_dyn(),
+                    out_float.slice(s![.., 4.., ..]).view().into_dyn(),
+                ],
+                &mut output_boxes,
+                &mut output_masks,
+                &mut output_tracks,
+                0,
+            )
+            .unwrap();
+
+        assert!(!output_tracks.is_empty());
+        assert_eq!(output_boxes.len(), 1);
+        assert_eq!(output_tracks.len(), 1);
+        assert_eq!(output_masks.len(), 0);
+        assert!(output_boxes[0].equal_within_delta(&output_tracks[0].last_box, 1e-6));
+
+        let last_track = output_tracks[0];
+
+        // Decode again
+        decoder
+            .decode_quantized_tracked(
+                &[
+                    out.slice(s![.., ..4, ..]).view().into(),
+                    out.slice(s![.., 4.., ..]).view().into(),
+                ],
+                &mut output_boxes,
+                &mut output_masks,
+                &mut output_tracks,
+                10000,
+            )
+            .unwrap();
+        assert!(!output_tracks.is_empty());
+        assert_eq!(output_boxes.len(), 1);
+        assert_eq!(output_tracks.len(), 1);
+        assert_eq!(output_masks.len(), 0);
+        assert!(output_boxes[0].equal_within_delta(&output_tracks[0].last_box, 1e-6));
+        assert_eq!(output_tracks[0].uuid, last_track.uuid);
+    }
+
+    #[test]
+    fn test_tracker_yolo_split_segdet() {
+        let score_threshold = 0.3;
+        let iou_threshold = 0.45;
+        let boxes = include_bytes!("../../../testdata/yolov8_boxes_116x8400.bin");
+        let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
+        let boxes = ndarray::Array3::from_shape_vec((1, 116, 8400), boxes.to_vec()).unwrap();
+        let quant_boxes = (0.021287761628627777, 31);
+        let boxes_float = dequantize_ndarray::<_, _, f32>(boxes.view(), quant_boxes.into());
+
+        let protos = include_bytes!("../../../testdata/yolov8_protos_160x160x32.bin");
+        let protos =
+            unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
+        let protos = ndarray::Array4::from_shape_vec((1, 160, 160, 32), protos.to_vec()).unwrap();
+        let quant_protos = (0.02491161972284317, -117);
+        let protos_float = dequantize_ndarray::<_, _, f32>(protos.view(), quant_protos.into());
+
+        let mut decoder = DecoderBuilder::default()
+            .with_config_yolo_split_segdet(
+                configs::Boxes {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: Some(quant_boxes.into()),
+                    shape: vec![1, 4, 8400],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumFeatures, 4),
+                        (DimName::NumBoxes, 8400),
+                    ],
+                },
+                configs::Scores {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: Some(quant_boxes.into()),
+                    shape: vec![1, 80, 8400],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumClasses, 80),
+                        (DimName::NumBoxes, 8400),
+                    ],
+                },
+                configs::MaskCoefficients {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: Some(quant_boxes.into()),
+                    shape: vec![1, 32, 8400],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumProtos, 32),
+                        (DimName::NumBoxes, 8400),
+                    ],
+                },
+                configs::Protos {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: Some(quant_protos.into()),
+                    shape: vec![1, 160, 160, 32],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::Height, 160),
+                        (DimName::Width, 160),
+                        (DimName::NumProtos, 32),
+                    ],
+                },
+            )
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .with_tracker(ByteTrackBuilder::default().track_high_conf(0.5).build())
+            .build()
+            .unwrap();
+
+        let mut output_boxes1: Vec<_> = Vec::with_capacity(500);
+        let mut output_masks1: Vec<_> = Vec::with_capacity(500);
+        let mut output_tracks1: Vec<_> = Vec::with_capacity(500);
+        decoder
+            .decode_float_tracked(
+                &[
+                    boxes_float.slice(s![.., ..4, ..]).view().into_dyn(),
+                    boxes_float.slice(s![.., 4..84, ..]).view().into_dyn(),
+                    boxes_float.slice(s![.., 84.., ..]).view().into_dyn(),
+                    protos_float.view().into_dyn(),
+                ],
+                &mut output_boxes1,
+                &mut output_masks1,
+                &mut output_tracks1,
+                0,
+            )
+            .unwrap();
+
+        let mut output_boxes2: Vec<_> = Vec::with_capacity(500);
+        let mut output_masks2: Vec<_> = Vec::with_capacity(500);
+        let mut output_tracks2: Vec<_> = Vec::with_capacity(500);
+        // Decode again
+        decoder
+            .decode_quantized_tracked(
+                &[
+                    boxes.slice(s![.., ..4, ..]).view().into(),
+                    boxes.slice(s![.., 4..84, ..]).view().into(),
+                    boxes.slice(s![.., 84.., ..]).view().into(),
+                    protos.view().into(),
+                ],
+                &mut output_boxes2,
+                &mut output_masks2,
+                &mut output_tracks2,
+                10000,
+            )
+            .unwrap();
+
+        assert_eq!(output_boxes1, output_boxes2);
+        for (m1, m2) in output_masks1.iter().zip(output_masks2.iter()) {
+            assert_eq!(m1.xmin, m2.xmin);
+            assert_eq!(m1.ymin, m2.ymin);
+            assert_eq!(m1.xmax, m2.xmax);
+            assert_eq!(m1.ymax, m2.ymax);
+
+            let m1 = segmentation_to_mask(m1.segmentation.view());
+            let m2 = segmentation_to_mask(m2.segmentation.view());
+            assert_eq!(m1, m2);
+        }
+        for (t1, t2) in output_tracks1.iter().zip(output_tracks2.iter()) {
+            assert_eq!(t1.uuid, t2.uuid);
+        }
+    }
+
+    #[test]
+    fn test_tracker_modelpack_det() {
+        let score_threshold = 0.2;
+        let iou_threshold = 0.45;
+
+        let boxes = include_bytes!("../../../testdata/modelpack_boxes_1935x1x4.bin");
+        let boxes = ndarray::Array4::from_shape_vec((1, 1935, 1, 4), boxes.to_vec()).unwrap();
+
+        let scores = include_bytes!("../../../testdata/modelpack_scores_1935x1.bin");
+        let scores = ndarray::Array3::from_shape_vec((1, 1935, 1), scores.to_vec()).unwrap();
+
+        let quant_boxes = (0.004656755365431309, 21);
+        let quant_scores = (0.0019603664986789227, 0);
+
+        let boxes_float = dequantize_ndarray::<_, _, f32>(boxes.view(), quant_boxes.into());
+        let scores_float = dequantize_ndarray::<_, _, f32>(scores.view(), quant_scores.into());
+
+        let mut decoder = DecoderBuilder::default()
+            .with_config_modelpack_det(
+                configs::Boxes {
+                    decoder: DecoderType::ModelPack,
+                    quantization: Some(quant_boxes.into()),
+                    shape: vec![1, 1935, 1, 4],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 1935),
+                        (DimName::Padding, 1),
+                        (DimName::NumFeatures, 4),
+                    ],
+                },
+                configs::Scores {
+                    decoder: DecoderType::ModelPack,
+                    quantization: Some(quant_scores.into()),
+                    shape: vec![1, 1935, 1],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 1935),
+                        (DimName::NumClasses, 1),
+                    ],
+                },
+            )
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .with_tracker(ByteTrackBuilder::default().track_high_conf(0.4).build())
+            .build()
+            .unwrap();
+
+        let mut output_boxes: Vec<_> = Vec::with_capacity(50);
+        let mut output_masks: Vec<_> = Vec::with_capacity(50);
+        let mut output_tracks: Vec<_> = Vec::with_capacity(50);
+        decoder
+            .decode_float_tracked(
+                &[
+                    boxes_float.view().into_dyn(),
+                    scores_float.view().into_dyn(),
+                ],
+                &mut output_boxes,
+                &mut output_masks,
+                &mut output_tracks,
+                0,
+            )
+            .unwrap();
+
+        assert!(!output_tracks.is_empty());
+        assert_eq!(output_boxes.len(), 1);
+        assert_eq!(output_tracks.len(), 1);
+        assert_eq!(output_masks.len(), 0);
+        assert!(output_boxes[0].equal_within_delta(&output_tracks[0].last_box, 1e-6));
+
+        let last_track = output_tracks[0];
+
+        // Decode again
+        decoder
+            .decode_quantized_tracked(
+                &[boxes.view().into(), scores.view().into()],
+                &mut output_boxes,
+                &mut output_masks,
+                &mut output_tracks,
+                10000,
+            )
+            .unwrap();
+        assert!(!output_tracks.is_empty());
+        assert_eq!(output_boxes.len(), 1);
+        assert_eq!(output_tracks.len(), 1);
+        assert_eq!(output_masks.len(), 0);
+        assert!(output_boxes[0].equal_within_delta(&output_tracks[0].last_box, 1e-6));
+        assert_eq!(output_tracks[0].uuid, last_track.uuid);
+    }
+
+    #[test]
+    fn test_tracker_modelpack_det_split() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+        let detect0 = include_bytes!("../../../testdata/modelpack_split_9x15x18.bin");
+        let detect0 = ndarray::Array4::from_shape_vec((1, 9, 15, 18), detect0.to_vec()).unwrap();
+        let quant0 = (0.08547406643629074, 174);
+        let detect0_float = dequantize_ndarray::<_, _, f32>(detect0.view(), quant0.into());
+
+        let detect1 = include_bytes!("../../../testdata/modelpack_split_17x30x18.bin");
+        let detect1 = ndarray::Array4::from_shape_vec((1, 17, 30, 18), detect1.to_vec()).unwrap();
+        let quant1 = (0.09929127991199493, 183);
+        let detect1_float = dequantize_ndarray::<_, _, f32>(detect1.view(), quant1.into());
+
+        let anchors0 = vec![
+            [0.36666667461395264, 0.31481480598449707],
+            [0.38749998807907104, 0.4740740656852722],
+            [0.5333333611488342, 0.644444465637207],
+        ];
+        let anchors1 = vec![
+            [0.13750000298023224, 0.2074074000120163],
+            [0.2541666626930237, 0.21481481194496155],
+            [0.23125000298023224, 0.35185185074806213],
+        ];
+
+        let detect_config0 = configs::Detection {
+            decoder: DecoderType::ModelPack,
+            shape: vec![1, 9, 15, 18],
+            anchors: Some(anchors0),
+            quantization: Some(quant0.into()),
+            dshape: vec![
+                (DimName::Batch, 1),
+                (DimName::Height, 9),
+                (DimName::Width, 15),
+                (DimName::NumAnchorsXFeatures, 18),
+            ],
+        };
+
+        let detect_config1 = configs::Detection {
+            decoder: DecoderType::ModelPack,
+            shape: vec![1, 17, 30, 18],
+            anchors: Some(anchors1),
+            quantization: Some(quant1.into()),
+            dshape: vec![
+                (DimName::Batch, 1),
+                (DimName::Height, 17),
+                (DimName::Width, 30),
+                (DimName::NumAnchorsXFeatures, 18),
+            ],
+        };
+
+        let mut decoder = DecoderBuilder::default()
+            .with_config_modelpack_det_split(vec![detect_config0, detect_config1])
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .with_tracker(ByteTrackBuilder::default().track_high_conf(0.4).build())
+            .build()
+            .unwrap();
+
+        let mut output_boxes: Vec<_> = Vec::with_capacity(50);
+        let mut output_masks: Vec<_> = Vec::with_capacity(50);
+        let mut output_tracks: Vec<_> = Vec::with_capacity(50);
+        decoder
+            .decode_float_tracked(
+                &[
+                    detect0_float.view().into_dyn(),
+                    detect1_float.view().into_dyn(),
+                ],
+                &mut output_boxes,
+                &mut output_masks,
+                &mut output_tracks,
+                0,
+            )
+            .unwrap();
+
+        assert!(!output_tracks.is_empty());
+        assert_eq!(output_boxes.len(), 1);
+        assert_eq!(output_tracks.len(), 1);
+        assert_eq!(output_masks.len(), 0);
+        assert!(output_boxes[0].equal_within_delta(&output_tracks[0].last_box, 1e-6));
+
+        let last_track = output_tracks[0];
+
+        // Decode again
+        decoder
+            .decode_quantized_tracked(
+                &[detect0.view().into(), detect1.view().into()],
+                &mut output_boxes,
+                &mut output_masks,
+                &mut output_tracks,
+                10000,
+            )
+            .unwrap();
+        assert!(!output_tracks.is_empty());
+        assert_eq!(output_boxes.len(), 1);
+        assert_eq!(output_tracks.len(), 1);
+        assert_eq!(output_masks.len(), 0);
+        assert!(output_boxes[0].equal_within_delta(&output_tracks[0].last_box, 1e-6));
+        assert_eq!(output_tracks[0].uuid, last_track.uuid);
+    }
+
+    #[test]
+    fn test_modelpack_segdet() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+
+        let boxes = include_bytes!("../../../testdata/modelpack_boxes_1935x1x4.bin");
+        let boxes = ndarray::Array4::from_shape_vec((1, 1935, 1, 4), boxes.to_vec()).unwrap();
+        let quant_boxes = (0.004656755365431309, 21);
+        let boxes_float = dequantize_ndarray::<_, _, f32>(boxes.view(), quant_boxes.into());
+
+        let scores = include_bytes!("../../../testdata/modelpack_scores_1935x1.bin");
+        let scores = ndarray::Array3::from_shape_vec((1, 1935, 1), scores.to_vec()).unwrap();
+        let quant_scores = (0.0019603664986789227, 0);
+        let scores_float = dequantize_ndarray::<_, _, f32>(scores.view(), quant_scores.into());
+
+        let seg = include_bytes!("../../../testdata/modelpack_seg_2x160x160.bin");
+        let seg = ndarray::Array4::from_shape_vec((1, 2, 160, 160), seg.to_vec()).unwrap();
+        let quant_seg = (1.0 / 255.0, 0);
+        let seg_float = dequantize_ndarray::<_, _, f32>(seg.view(), quant_seg.into());
+
+        let mut decoder = DecoderBuilder::default()
+            .with_config_modelpack_segdet(
+                configs::Boxes {
+                    decoder: DecoderType::ModelPack,
+                    quantization: Some(quant_boxes.into()),
+                    shape: vec![1, 1935, 1, 4],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 1935),
+                        (DimName::Padding, 1),
+                        (DimName::NumFeatures, 4),
+                    ],
+                },
+                configs::Scores {
+                    decoder: DecoderType::ModelPack,
+                    quantization: Some(quant_scores.into()),
+                    shape: vec![1, 1935, 1],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 1935),
+                        (DimName::NumClasses, 1),
+                    ],
+                },
+                configs::Segmentation {
+                    decoder: DecoderType::ModelPack,
+                    quantization: Some(quant_seg.into()),
+                    shape: vec![1, 2, 160, 160],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumClasses, 2),
+                        (DimName::Height, 160),
+                        (DimName::Width, 160),
+                    ],
+                },
+            )
+            .with_iou_threshold(iou_threshold)
+            .with_score_threshold(score_threshold)
+            .with_tracker(ByteTrackBuilder::default().track_high_conf(0.4).build())
+            .build()
+            .unwrap();
+
+        let mut output_boxes: Vec<_> = Vec::with_capacity(50);
+        let mut output_masks: Vec<_> = Vec::with_capacity(50);
+        let mut output_tracks: Vec<_> = Vec::with_capacity(50);
+        decoder
+            .decode_float_tracked(
+                &[
+                    boxes_float.view().into_dyn(),
+                    scores_float.view().into_dyn(),
+                    seg_float.view().into_dyn(),
+                ],
+                &mut output_boxes,
+                &mut output_masks,
+                &mut output_tracks,
+                0,
+            )
+            .unwrap();
+
+        assert!(!output_tracks.is_empty());
+        assert_eq!(output_boxes.len(), 1);
+        assert_eq!(output_tracks.len(), 1);
+        assert_eq!(output_masks.len(), 1);
+        assert!(output_boxes[0].equal_within_delta(&output_tracks[0].last_box, 1e-6));
+
+        let last_track = output_tracks[0];
+
+        // Decode again
+        decoder
+            .decode_quantized_tracked(
+                &[boxes.view().into(), scores.view().into(), seg.view().into()],
+                &mut output_boxes,
+                &mut output_masks,
+                &mut output_tracks,
+                10000,
+            )
+            .unwrap();
+        assert!(!output_tracks.is_empty());
+        assert_eq!(output_boxes.len(), 1);
+        assert_eq!(output_tracks.len(), 1);
+        assert_eq!(output_masks.len(), 1);
+        assert!(output_boxes[0].equal_within_delta(&output_tracks[0].last_box, 1e-6));
+        assert_eq!(output_tracks[0].uuid, last_track.uuid);
+    }
+
+    #[test]
+    fn test_tracker_modelpack_segdet_split() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+        let detect0 = include_bytes!("../../../testdata/modelpack_split_9x15x18.bin");
+        let detect0 = ndarray::Array4::from_shape_vec((1, 9, 15, 18), detect0.to_vec()).unwrap();
+        let quant0 = (0.08547406643629074, 174);
+        let detect0_float = dequantize_ndarray::<_, _, f32>(detect0.view(), quant0.into());
+
+        let detect1 = include_bytes!("../../../testdata/modelpack_split_17x30x18.bin");
+        let detect1 = ndarray::Array4::from_shape_vec((1, 17, 30, 18), detect1.to_vec()).unwrap();
+        let quant1 = (0.09929127991199493, 183);
+        let detect1_float = dequantize_ndarray::<_, _, f32>(detect1.view(), quant1.into());
+
+        let seg = include_bytes!("../../../testdata/modelpack_seg_2x160x160.bin");
+        let seg = ndarray::Array4::from_shape_vec((1, 2, 160, 160), seg.to_vec()).unwrap();
+        let quant_seg = (1.0 / 255.0, 0);
+        let seg_float = dequantize_ndarray::<_, _, f32>(seg.view(), quant_seg.into());
+
+        let anchors0 = vec![
+            [0.36666667461395264, 0.31481480598449707],
+            [0.38749998807907104, 0.4740740656852722],
+            [0.5333333611488342, 0.644444465637207],
+        ];
+        let anchors1 = vec![
+            [0.13750000298023224, 0.2074074000120163],
+            [0.2541666626930237, 0.21481481194496155],
+            [0.23125000298023224, 0.35185185074806213],
+        ];
+
+        let detect_config0 = configs::Detection {
+            decoder: DecoderType::ModelPack,
+            shape: vec![1, 9, 15, 18],
+            anchors: Some(anchors0),
+            quantization: Some(quant0.into()),
+            dshape: vec![
+                (DimName::Batch, 1),
+                (DimName::Height, 9),
+                (DimName::Width, 15),
+                (DimName::NumAnchorsXFeatures, 18),
+            ],
+        };
+
+        let detect_config1 = configs::Detection {
+            decoder: DecoderType::ModelPack,
+            shape: vec![1, 17, 30, 18],
+            anchors: Some(anchors1),
+            quantization: Some(quant1.into()),
+            dshape: vec![
+                (DimName::Batch, 1),
+                (DimName::Height, 17),
+                (DimName::Width, 30),
+                (DimName::NumAnchorsXFeatures, 18),
+            ],
+        };
+
+        let mut decoder = DecoderBuilder::default()
+            .with_config_modelpack_segdet_split(
+                vec![detect_config0, detect_config1],
+                configs::Segmentation {
+                    decoder: DecoderType::ModelPack,
+                    quantization: Some(quant_seg.into()),
+                    shape: vec![1, 2, 160, 160],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumClasses, 2),
+                        (DimName::Height, 160),
+                        (DimName::Width, 160),
+                    ],
+                },
+            )
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .with_tracker(ByteTrackBuilder::default().track_high_conf(0.4).build())
+            .build()
+            .unwrap();
+
+        let mut output_boxes: Vec<_> = Vec::with_capacity(50);
+        let mut output_masks: Vec<_> = Vec::with_capacity(50);
+        let mut output_tracks: Vec<_> = Vec::with_capacity(50);
+        decoder
+            .decode_float_tracked(
+                &[
+                    detect0_float.view().into_dyn(),
+                    detect1_float.view().into_dyn(),
+                    seg_float.view().into_dyn(),
+                ],
+                &mut output_boxes,
+                &mut output_masks,
+                &mut output_tracks,
+                0,
+            )
+            .unwrap();
+
+        assert!(!output_tracks.is_empty());
+        assert_eq!(output_boxes.len(), 1);
+        assert_eq!(output_tracks.len(), 1);
+        assert_eq!(output_masks.len(), 1);
+        assert!(output_boxes[0].equal_within_delta(&output_tracks[0].last_box, 1e-6));
+
+        let last_track = output_tracks[0];
+
+        // Decode again
+        decoder
+            .decode_quantized_tracked(
+                &[
+                    detect0.view().into(),
+                    detect1.view().into(),
+                    seg.view().into(),
+                ],
+                &mut output_boxes,
+                &mut output_masks,
+                &mut output_tracks,
+                10000,
+            )
+            .unwrap();
+        assert!(!output_tracks.is_empty());
+        assert_eq!(output_boxes.len(), 1);
+        assert_eq!(output_tracks.len(), 1);
+        assert_eq!(output_masks.len(), 1);
+        assert!(output_boxes[0].equal_within_delta(&output_tracks[0].last_box, 1e-6));
+        assert_eq!(output_tracks[0].uuid, last_track.uuid);
+    }
+
+    #[test]
+    fn test_tracker_modelpack_seg() {
+        let out = include_bytes!("../../../testdata/modelpack_seg_2x160x160.bin");
+        let out = ndarray::Array4::from_shape_vec((1, 2, 160, 160), out.to_vec()).unwrap();
+        let quant = (1.0 / 255.0, 0);
+        let out_float = dequantize_ndarray::<_, _, f32>(out.view(), quant.into());
+
+        let mut decoder = DecoderBuilder::default()
+            .with_config_modelpack_seg(configs::Segmentation {
+                decoder: DecoderType::ModelPack,
+                quantization: Some(quant.into()),
+                shape: vec![1, 2, 160, 160],
+                dshape: vec![
+                    (DimName::Batch, 1),
+                    (DimName::NumClasses, 2),
+                    (DimName::Height, 160),
+                    (DimName::Width, 160),
+                ],
+            })
+            .with_tracker(ByteTrackBuilder::default().track_high_conf(0.4).build())
+            .build()
+            .unwrap();
+        let mut output_boxes: Vec<_> = Vec::with_capacity(10);
+        let mut output_masks: Vec<_> = Vec::with_capacity(10);
+        let mut output_tracks: Vec<_> = Vec::with_capacity(10);
+        decoder
+            .decode_quantized_tracked(
+                &[out.view().into()],
+                &mut output_boxes,
+                &mut output_masks,
+                &mut output_tracks,
+                100,
+            )
+            .unwrap();
+        assert_eq!(output_boxes.len(), 0);
+        assert_eq!(output_tracks.len(), 0);
+        assert_eq!(output_masks.len(), 1);
+        let mask = output_masks[0].clone();
+        decoder
+            .decode_float_tracked(
+                &[out_float.view().into_dyn()],
+                &mut output_boxes,
+                &mut output_masks,
+                &mut output_tracks,
+                1000,
+            )
+            .unwrap();
+        assert_eq!(output_boxes.len(), 0);
+        assert_eq!(output_tracks.len(), 0);
+        assert_eq!(output_masks.len(), 1);
+
+        // not expected for float decoder to have same values as quantized decoder, as
+        // float decoder ensures the data fills 0-255, quantized decoder uses whatever
+        // the model output. Thus the float output is the same as the quantized output
+        // but scaled differently. However, it is expected that the mask after argmax
+        // will be the same.
+        let mask0 = segmentation_to_mask(mask.segmentation.view());
+        let mask1 = segmentation_to_mask(output_masks[0].segmentation.view());
+
+        assert_eq!(mask0, mask1);
     }
 }
