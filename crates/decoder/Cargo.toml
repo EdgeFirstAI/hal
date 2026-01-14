@@ -30,6 +30,7 @@ serde_yaml = { workspace = true }
 [dev-dependencies]
 divan = { workspace = true }
 image = { workspace = true }
+rand = { workspace = true }
 
 [[bench]]
 name = "decoder_benchmark"

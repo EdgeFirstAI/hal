@@ -2048,6 +2048,7 @@ mod decoder_tracked_tests {
     };
     use edgefirst_tracker::ByteTrackBuilder;
     use ndarray::{Array3, arr1, s};
+    use rand::Rng;
 
     #[test]
     fn test_tracker_error() {
@@ -2948,6 +2949,7 @@ mod decoder_tracked_tests {
 
     #[test]
     fn test_tracking() {
+        let mut rng = rand::rng();
         let mut decoder = DecoderBuilder::default()
             .with_config_yolo_det(configs::Detection {
                 decoder: DecoderType::Ultralytics,
@@ -2991,15 +2993,17 @@ mod decoder_tracked_tests {
             },
             1e-6
         ));
-
-        for i in 0..60 {
-            tensor.slice_mut(s![0, .., 0]).assign(&arr1(&[
-                0.1 + i as f32 * 0.01,
-                0.1 + i as f32 * 0.01,
+        let bbox: [_; 4] = boxes[0].bbox.into();
+        println!("{:?}, {:?}", bbox, bbox);
+        for i in 1..60 {
+            let xywhs = [
+                0.1 + i as f32 * 0.01 + rng.random_range(-0.02..0.02),
+                0.1 + i as f32 * 0.01 + rng.random_range(-0.02..0.02),
                 0.2,
                 0.2,
                 0.9,
-            ]));
+            ];
+            tensor.slice_mut(s![0, .., 0]).assign(&arr1(&xywhs));
             decoder
                 .decode_float_tracked(
                     &[tensor.view().into_dyn()],
@@ -3013,6 +3017,14 @@ mod decoder_tracked_tests {
             assert_eq!(boxes.len(), 1);
             assert_eq!(tracks.len(), 1);
             assert_eq!(tracks[0].uuid, first_uuid);
+            let bbox: [_; 4] = boxes[0].bbox.into();
+            let raw = [
+                xywhs[0] - xywhs[2] / 2.0,
+                xywhs[1] - xywhs[3] / 2.0,
+                xywhs[0] + xywhs[2] / 2.0,
+                xywhs[1] + xywhs[3] / 2.0,
+            ];
+            println!("{:?}, {:?}", bbox, raw);
         }
         tensor
             .slice_mut(s![0, .., 0])
@@ -3036,7 +3048,7 @@ mod decoder_tracked_tests {
             label: 0,
         };
         assert!(
-            boxes[0].equal_within_delta(&expected, 0.005),
+            boxes[0].equal_within_delta(&expected, 0.01),
             "box {:?} did not match {:?}",
             boxes[0],
             expected
