@@ -230,6 +230,43 @@ where
     });
 }
 
+#[divan::bench(types = [Jaguar, Person, Zidane], args = [(640, 360), (960, 540), (512, 512), (1280, 720), (1920, 1080)])]
+fn resize_cpu_rgb_to_rgb<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
+where
+    IMAGE: TestImage,
+{
+    use edgefirst_image::CPUProcessor;
+
+    let (width, height) = size;
+    let name = format!("{}.jpg", IMAGE::filename());
+    let path = Path::new("testdata").join(&name);
+    let path = match path.exists() {
+        true => path,
+        false => {
+            let path = Path::new("../testdata").join(&name);
+            if path.exists() {
+                path
+            } else {
+                Path::new("../../testdata").join(&name)
+            }
+        }
+    };
+
+    assert!(path.exists(), "unable to locate test image at {path:?}");
+
+    let file = std::fs::read(path).unwrap();
+    let src = TensorImage::load_jpeg(&file, Some(RGB), Some(TensorMemory::Mem)).unwrap();
+    let mut dst = TensorImage::new(width, height, RGB, Some(TensorMemory::Mem)).unwrap();
+
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
 #[divan::bench(types = [Jaguar, Person, Zidane], args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
 fn resize_cpu_grayscale_upscale<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
 where
@@ -338,6 +375,49 @@ where
 
     let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Mem)).unwrap();
     let mut gl_dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Mem)).unwrap();
+    let mut gl_converter = edgefirst_image::GLProcessorThreaded::new().unwrap();
+    bencher.bench_local(|| {
+        gl_converter
+            .convert(
+                &src,
+                &mut gl_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap()
+    });
+    drop(gl_dst);
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[divan::bench(types = [Person, Zidane], args = [(640, 360), (960, 540), (512, 512), (1280, 720), (1920, 1080)])]
+fn resize_opengl_mem_rgb_to_rgb<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
+where
+    IMAGE: TestImage,
+{
+    let (width, height) = size;
+    let name = format!("{}.jpg", IMAGE::filename());
+    let path = Path::new("testdata").join(&name);
+    let path = match path.exists() {
+        true => path,
+        false => {
+            let path = Path::new("../testdata").join(&name);
+            if path.exists() {
+                path
+            } else {
+                Path::new("../../testdata").join(&name)
+            }
+        }
+    };
+
+    assert!(path.exists(), "unable to locate test image at {path:?}");
+
+    let file = std::fs::read(path).unwrap();
+
+    let src = TensorImage::load_jpeg(&file, Some(RGB), Some(TensorMemory::Mem)).unwrap();
+    let mut gl_dst = TensorImage::new(width, height, RGB, Some(TensorMemory::Mem)).unwrap();
     let mut gl_converter = edgefirst_image::GLProcessorThreaded::new().unwrap();
     bencher.bench_local(|| {
         gl_converter
