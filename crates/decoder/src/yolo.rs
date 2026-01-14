@@ -545,6 +545,7 @@ where
 {
     let (boxes_tensor, quant_boxes) = boxes;
     let (scores_tensor, quant_scores) = scores;
+
     let boxes = {
         let score_threshold = quantize_score_threshold(score_threshold, quant_scores);
         postprocess_boxes_index_quant::<B, _, _>(
@@ -622,6 +623,10 @@ pub fn impl_yolo_split_segdet_quant<
 ) where
     f32: AsPrimitive<SCORE>,
 {
+    let boxes = (boxes.0.reversed_axes(), boxes.1);
+    let scores = (scores.0.reversed_axes(), scores.1);
+    let mask_coeff = (mask_coeff.0.reversed_axes(), mask_coeff.1);
+
     let boxes = impl_yolo_split_segdet_quant_get_boxes::<B, _, _>(
         boxes,
         scores,
