@@ -726,7 +726,7 @@ mod decoder_tests {
                         (DimName::Batch, 1),
                         (DimName::NumBoxes, 1935),
                         (DimName::Padding, 1),
-                        (DimName::NumFeatures, 4),
+                        (DimName::BoxCoords, 4),
                     ],
                 },
                 configs::Scores {
@@ -1053,7 +1053,7 @@ mod decoder_tests {
                         (DimName::Batch, 1),
                         (DimName::NumBoxes, 1935),
                         (DimName::Padding, 1),
-                        (DimName::NumFeatures, 4),
+                        (DimName::BoxCoords, 4),
                     ],
                 },
                 configs::Scores {
@@ -1589,7 +1589,7 @@ mod decoder_tests {
                     shape: vec![1, 4, 8400],
                     dshape: vec![
                         (DimName::Batch, 1),
-                        (DimName::NumFeatures, 4),
+                        (DimName::BoxCoords, 4),
                         (DimName::NumBoxes, 8400),
                     ],
                 },
@@ -1675,7 +1675,7 @@ mod decoder_tests {
                     shape: vec![1, 4, 8400],
                     dshape: vec![
                         (DimName::Batch, 1),
-                        (DimName::NumFeatures, 4),
+                        (DimName::BoxCoords, 4),
                         (DimName::NumBoxes, 8400),
                     ],
                 },
@@ -1797,7 +1797,7 @@ mod decoder_tests {
                     shape: vec![1, 4, 8400],
                     dshape: vec![
                         (DimName::Batch, 1),
-                        (DimName::NumFeatures, 4),
+                        (DimName::BoxCoords, 4),
                         (DimName::NumBoxes, 8400),
                     ],
                 },
