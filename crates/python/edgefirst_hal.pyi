@@ -1,6 +1,6 @@
 import numpy as np
 import numpy.typing as npt
-from typing import Union, Tuple, List
+from typing import Union, Tuple, List, Optional
 import enum
 
 """EdgeFirst HAL Python bindings."""
@@ -20,6 +20,7 @@ SegDetOutput = Tuple[
     npt.NDArray[np.uintp],
     List[npt.NDArray[np.uint8]],
 ]
+
 """
 Segmentation and Detection output type alias.
 A tuple containing:
@@ -29,11 +30,29 @@ A tuple containing:
 - masks: A list of NumPy arrays, each of shape (H, W, ...) containing detected segmentation mask.
 """
 
+SegDetOutputTracked = Tuple[
+    npt.NDArray[np.float32],
+    npt.NDArray[np.float32],
+    npt.NDArray[np.uintp],
+    List[npt.NDArray[np.uint8]],
+    List[Optional[TrackInfo]]
+]
+
+"""
+Segmentation and Detection output type alias.
+A tuple containing:
+- boxes: A NumPy array of shape (N, 4) containing the bounding boxes in (x1, y1, x2, y2) format.
+- scores: A NumPy array of shape (N,) containing the confidence scores for each bounding box.
+- class_ids: A NumPy array of shape (N,) containing the class IDs for each bounding box.
+- masks: A list of NumPy arrays, each of shape (H, W, ...) containing detected segmentation mask.
+- tracks: A list of TrackInfo objects or None, each corresponding to a detected object.
+"""
+
 
 class Decoder:
     # [pyo3(signature = (config, score_threshold=0.1, iou_threshold=0.7))]
     def __init__(
-        self, config: dict, score_threshold: float = 0.1, iou_threshold: float = 0.7
+        self, config: dict, score_threshold: float = 0.1, iou_threshold: float = 0.7, tracker: Optional[ByteTrack] = None
     ) -> None:
         """
         Create a new Decoder instance from a dictionary configuration describing the model outputs.
@@ -43,7 +62,7 @@ class Decoder:
     # [pyo3(signature = (json_str, score_threshold=0.1, iou_threshold=0.7))]
     @staticmethod
     def new_from_json_str(
-        json_str: str, score_threshold: float = 0.1, iou_threshold: float = 0.7
+        json_str: str, score_threshold: float = 0.1, iou_threshold: float = 0.7, tracker: Optional[ByteTrack] = None
     ) -> Decoder:
         """
         Create a new Decoder instance from a JSON configuration string describing the model outputs.
@@ -53,7 +72,7 @@ class Decoder:
     # [pyo3(signature = (yaml_str, score_threshold=0.1, iou_threshold=0.7))]
     @staticmethod
     def new_from_yaml_str(
-        yaml_str: str, score_threshold: float = 0.1, iou_threshold=0.7
+        yaml_str: str, score_threshold: float = 0.1, iou_threshold=0.7, tracker: Optional[ByteTrack] = None
     ) -> Decoder:
         """
         Create a new Decoder instance from a YAML configuration string describing the model outputs.
@@ -71,6 +90,22 @@ class Decoder:
 
         The accepted floating point types are `np.float16`, `np.float32` and `np.float64`. All outputs must be
         the same floating point type.
+        """
+        ...
+
+    # [pyo3(signature = (model_output, max_boxes=100))]
+    def decode_tracked(self, model_output: List[np.ndarray], timestamp_ns: int, max_boxes=100) -> SegDetOutputTracked:
+        """
+        Decode model outputs into detection and segmentation results. When giving quantized
+        tensors as input, the quantization parameters must be specified in the Decoder configuration.
+
+        The accepted integer types are `np.uint8`, `np.int8`, `np.uint16`, `np.int16`, `np.uint32`, and `np.int32`.
+        Integer types can be mixed and matched across the different model outputs.
+
+        The accepted floating point types are `np.float16`, `np.float32` and `np.float64`. All outputs must be
+        the same floating point type.
+
+        Requires a ByteTrack tracker to be provided when creating the Decoder.
         """
         ...
 
@@ -215,6 +250,73 @@ class Decoder:
 
     @iou_threshold.setter
     def iou_threshold(self, value: float): ...
+
+
+class TrackInfo:
+    def __init__(self,
+                 uuid: str,
+                 tracked_location: List[float],
+                 count: int,
+                 created: int,
+                 last_updated: int,
+                 last_box: Tuple[List[float], float, int]) -> None:
+        """Information about a single tracked object."""
+        ...
+
+    @property
+    def uuid(self) -> str:
+        """The unique identifier for the tracked object."""
+        ...
+
+    @property
+    def tracked_location(self) -> npt.NDArray[np.float32]:
+        """The current bounding box of the tracked object in (x1, y1, x2, y2) format."""
+        ...
+
+    @property
+    def count(self) -> int:
+        """The number of consecutive frames the object has been tracked for."""
+        ...
+
+    @property
+    def created(self) -> int:
+        """The timestamp (in nanoseconds) when the track was created."""
+        ...
+
+    @property
+    def last_updated(self) -> int:
+        """The timestamp (in nanoseconds) when the track was last updated."""
+        ...
+
+    @property
+    def last_box(self) -> Tuple[npt.NDArray[np.float32], float, int]:
+        """The last bounding box, score, and class ID of the tracked object."""
+        ...
+
+
+class ByteTrack:
+    def __init__(self, high_conf=0.7, iou=0.25, update=0.25, lifespan_ns=500_000_000) -> None:
+        """Create a new ByteTrack tracker."""
+        ...
+
+    def update(
+        self,
+        boxes: npt.NDArray[np.float32],
+        scores: npt.NDArray[np.float32],
+        labels: npt.NDArray[np.uintp],
+        timestamp_ns: int,
+    ) -> List[Optional[TrackInfo]]:
+        """
+        Update the tracker with new detections for the current timestamp.
+        Returns a list of tracks corresponding to the input after the update.
+        """
+        ...
+
+    def get_active_tracks(self) -> List[TrackInfo]:
+        """
+        Get the list of currently active tracks.
+        """
+        ...
 
 
 class FourCC(enum.Enum):

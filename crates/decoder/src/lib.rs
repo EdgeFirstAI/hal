@@ -2041,6 +2041,12 @@ mod decoder_tests {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod decoder_tracked_tests {
     #![allow(clippy::excessive_precision)]
+    use std::{
+        cell::RefCell,
+        rc::Rc,
+        sync::{Arc, Mutex},
+    };
+
     use super::*;
     use crate::{
         DecoderBuilder,
@@ -2050,6 +2056,29 @@ mod decoder_tracked_tests {
     use ndarray::{Array3, arr1, s};
     use rand::Rng;
 
+    #[test]
+    fn test_tracker_build() {
+        let tracker = ByteTrackBuilder::default().track_high_conf(0.5).build();
+        let rc_tracker = Rc::new(RefCell::new(tracker.clone()));
+        let arc_tracker = Arc::new(Mutex::new(tracker.clone()));
+        let _ = DecoderBuilder::default()
+            .with_config_yolo_det(configs::Detection {
+                decoder: DecoderType::Ultralytics,
+                shape: vec![1, 84, 8400],
+                anchors: None,
+                quantization: None,
+                dshape: vec![
+                    (DimName::Batch, 1),
+                    (DimName::NumFeatures, 84),
+                    (DimName::NumBoxes, 8400),
+                ],
+            })
+            .with_tracker(tracker)
+            .with_tracker(rc_tracker)
+            .with_tracker(arc_tracker)
+            .build()
+            .unwrap();
+    }
     #[test]
     fn test_tracker_error() {
         let score_threshold = 0.15;
@@ -2607,11 +2636,12 @@ mod decoder_tracked_tests {
             ],
         };
 
+        let t = ByteTrackBuilder::default().track_high_conf(0.4).build();
         let mut decoder = DecoderBuilder::default()
             .with_config_modelpack_det_split(vec![detect_config0, detect_config1])
             .with_score_threshold(score_threshold)
             .with_iou_threshold(iou_threshold)
-            .with_tracker(ByteTrackBuilder::default().track_high_conf(0.4).build())
+            .with_tracker(t)
             .build()
             .unwrap();
 

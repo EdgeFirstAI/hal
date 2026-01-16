@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-use edgefirst_tracker::Tracker;
+use std::fmt::Debug;
+
+use edgefirst_tracker::{AsTracker, TrackInfo};
 use ndarray::{Array3, ArrayView, ArrayViewD, Dimension, s};
 use ndarray_stats::QuantileExt;
 use num_traits::{AsPrimitive, Float};
@@ -39,38 +41,9 @@ pub struct ConfigOutputs {
     pub outputs: Vec<ConfigOutput>,
 }
 
-#[derive(Debug, Clone, Copy)]
-/// Track information returned by the decoder when tracking is enabled.
-pub struct TrackInfo {
-    pub uuid: edgefirst_tracker::Uuid,
-    pub tracked_location: [f32; 4],
-    pub count: i32,
-    pub created: u64,
-    pub last_updated: u64,
-
-    /// The last raw box associated with the track. This is before any smoothing
-    /// introduced by the tracker
-    pub last_box: DetectBox,
-    // We do not give the last_box_index as it has no meaning for the user
-    // pub last_box_index: usize,
-}
-
-impl From<edgefirst_tracker::TrackInfo<DetectBox>> for TrackInfo {
-    fn from(value: edgefirst_tracker::TrackInfo<DetectBox>) -> Self {
-        Self {
-            uuid: value.uuid,
-            tracked_location: value.tracked_location,
-            count: value.count,
-            created: value.created,
-            last_updated: value.last_updated,
-            last_box: value.last_box,
-        }
-    }
-}
-
 type TrackerSettings<'a> = (
-    &'a mut Box<dyn Tracker<DetectBox>>,
-    &'a mut Vec<TrackInfo>,
+    &'a mut Box<dyn AsTracker<DetectBox>>,
+    &'a mut Vec<TrackInfo<DetectBox>>,
     u64,
 );
 
@@ -526,12 +499,11 @@ pub mod configs {
     }
 }
 
-#[derive(Debug)]
 pub struct DecoderBuilder {
     config_src: Option<ConfigSource>,
     iou_threshold: f32,
     score_threshold: f32,
-    tracker: Option<Box<dyn Tracker<DetectBox>>>,
+    tracker: Option<Box<dyn AsTracker<DetectBox>>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1087,7 +1059,7 @@ impl DecoderBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn with_tracker<T: Tracker<DetectBox> + 'static>(mut self, tracker: T) -> Self {
+    pub fn with_tracker<T: AsTracker<DetectBox> + 'static>(mut self, tracker: T) -> Self {
         self.tracker = Some(Box::new(tracker));
         self
     }
@@ -1768,12 +1740,29 @@ impl DecoderBuilder {
     }
 }
 
-#[derive(Debug)]
 pub struct Decoder {
     model_type: ModelType,
     pub iou_threshold: f32,
     pub score_threshold: f32,
-    tracker: Option<Box<dyn Tracker<DetectBox>>>,
+    tracker: Option<Box<dyn AsTracker<DetectBox>>>,
+}
+
+impl Debug for Decoder {
+    fn fmt(
+        &self,
+        formatter: &mut std::fmt::Formatter<'_>,
+    ) -> std::result::Result<(), std::fmt::Error> {
+        formatter
+            .debug_struct("Decoder")
+            .field("model_type", &self.model_type)
+            .field("iou_threshold", &self.iou_threshold)
+            .field("score_threshold", &self.score_threshold)
+            // .field(
+            //     "tracker",
+            //     &self.tracker.as_ref().map(|x| format!("{:?}", x.update())),
+            // )
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -2310,7 +2299,7 @@ impl Decoder {
         outputs: &[ArrayViewDQuantized],
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
-        output_tracks: &mut Vec<TrackInfo>,
+        output_tracks: &mut Vec<TrackInfo<DetectBox>>,
         timestamp: u64,
     ) -> Result<(), DecoderError> {
         let tracking = if let Some(tracker) = self.tracker.as_mut() {
@@ -2479,7 +2468,7 @@ impl Decoder {
         outputs: &[ArrayViewD<T>],
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
-        output_tracks: &mut Vec<TrackInfo>,
+        output_tracks: &mut Vec<TrackInfo<DetectBox>>,
         timestamp: u64,
     ) -> Result<(), DecoderError>
     where
@@ -2644,7 +2633,8 @@ impl Decoder {
         });
 
         if let Some((tracker, track_infos, timestamp)) = tracking {
-            Self::update_tracker(tracker.as_mut(), output_boxes, track_infos, timestamp);
+            let tracker = tracker.as_tracker_mut();
+            Self::update_tracker(tracker, output_boxes, track_infos, timestamp);
         }
         Ok(())
     }
@@ -2749,7 +2739,8 @@ impl Decoder {
             output_boxes,
         );
         if let Some((tracker, track_infos, timestamp)) = tracking {
-            Self::update_tracker(tracker.as_mut(), output_boxes, track_infos, timestamp);
+            let tracker = tracker.as_tracker_mut();
+            Self::update_tracker(tracker, output_boxes, track_infos, timestamp);
         }
         Ok(())
     }
@@ -2781,7 +2772,8 @@ impl Decoder {
         });
 
         if let Some((tracker, track_infos, timestamp)) = tracking {
-            Self::update_tracker(tracker.as_mut(), output_boxes, track_infos, timestamp);
+            let tracker = tracker.as_tracker_mut();
+            Self::update_tracker(tracker, output_boxes, track_infos, timestamp);
         }
         Ok(())
     }
@@ -2844,7 +2836,8 @@ impl Decoder {
             );
 
             let (boxes, old_boxes) = if let Some((tracker, track_infos, timestamp)) = tracking {
-                Self::update_tracker_yolo_segdet(tracker.as_mut(), boxes, track_infos, timestamp)
+                let tracker = tracker.as_tracker_mut();
+                Self::update_tracker_yolo_segdet(tracker, boxes, track_infos, timestamp)
             } else {
                 (boxes, Vec::new())
             };
@@ -2905,7 +2898,8 @@ impl Decoder {
             });
         });
         if let Some((tracker, track_infos, timestamp)) = tracking {
-            Self::update_tracker(tracker.as_mut(), output_boxes, track_infos, timestamp);
+            let tracker = tracker.as_tracker_mut();
+            Self::update_tracker(tracker, output_boxes, track_infos, timestamp);
         }
         Ok(())
     }
@@ -2975,7 +2969,8 @@ impl Decoder {
         });
 
         let (boxes, old_boxes) = if let Some((tracker, track_infos, timestamp)) = tracking {
-            Self::update_tracker_yolo_segdet(tracker.as_mut(), boxes, track_infos, timestamp)
+            let tracker = tracker.as_tracker_mut();
+            Self::update_tracker_yolo_segdet(tracker, boxes, track_infos, timestamp)
         } else {
             (boxes, Vec::new())
         };
@@ -3040,7 +3035,8 @@ impl Decoder {
             output_boxes,
         );
         if let Some((tracker, track_infos, timestamp)) = tracking {
-            Self::update_tracker(tracker.as_mut(), output_boxes, track_infos, timestamp);
+            let tracker = tracker.as_tracker_mut();
+            Self::update_tracker(tracker, output_boxes, track_infos, timestamp);
         }
         Ok(())
     }
@@ -3102,7 +3098,8 @@ impl Decoder {
             output_boxes,
         );
         if let Some((tracker, track_infos, timestamp)) = tracking {
-            Self::update_tracker(tracker.as_mut(), output_boxes, track_infos, timestamp);
+            let tracker = tracker.as_tracker_mut();
+            Self::update_tracker(tracker, output_boxes, track_infos, timestamp);
         }
         Ok(())
     }
@@ -3125,7 +3122,8 @@ impl Decoder {
         let boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
         decode_yolo_det_float(boxes_tensor, score_threshold, iou_threshold, output_boxes);
         if let Some((tracker, track_infos, timestamp)) = tracking {
-            Self::update_tracker(tracker.as_mut(), output_boxes, track_infos, timestamp);
+            let tracker = tracker.as_tracker_mut();
+            Self::update_tracker(tracker, output_boxes, track_infos, timestamp);
         }
         Ok(())
     }
@@ -3166,7 +3164,8 @@ impl Decoder {
         );
 
         let (boxes, old_boxes) = if let Some((tracker, track_infos, timestamp)) = tracking {
-            Self::update_tracker_yolo_segdet(tracker.as_mut(), boxes, track_infos, timestamp)
+            let tracker = tracker.as_tracker_mut();
+            Self::update_tracker_yolo_segdet(tracker, boxes, track_infos, timestamp)
         } else {
             (boxes, Vec::new())
         };
@@ -3214,7 +3213,8 @@ impl Decoder {
         );
 
         if let Some((tracker, track_infos, timestamp)) = tracking {
-            Self::update_tracker(tracker.as_mut(), output_boxes, track_infos, timestamp);
+            let tracker = tracker.as_tracker_mut();
+            Self::update_tracker(tracker, output_boxes, track_infos, timestamp);
         }
         Ok(())
     }
@@ -3267,7 +3267,8 @@ impl Decoder {
         );
 
         let (boxes, old_boxes) = if let Some((tracker, track_infos, timestamp)) = tracking {
-            Self::update_tracker_yolo_segdet(tracker.as_mut(), boxes, track_infos, timestamp)
+            let tracker = tracker.as_tracker_mut();
+            Self::update_tracker_yolo_segdet(tracker, boxes, track_infos, timestamp)
         } else {
             (boxes, Vec::new())
         };
@@ -3287,53 +3288,63 @@ impl Decoder {
     fn update_tracker_yolo_segdet(
         tracker: &mut dyn edgefirst_tracker::Tracker<DetectBox>,
         boxes: Vec<(DetectBox, usize)>,
-        track_infos: &mut Vec<TrackInfo>,
+        track_infos: &mut Vec<TrackInfo<DetectBox>>,
         timestamp: u64,
     ) -> (Vec<(DetectBox, usize)>, Vec<DetectBox>) {
-        let mut old_boxes = Vec::new();
-
         // custom tracking since we can only use live boxes for masks. We
         // can still output "old" boxes but they will not have masks.
         // let live_tracks = tracker.update(output_boxes, timestamp);
         let (new_boxes, boxes_indices): (Vec<_>, Vec<_>) = boxes.into_iter().unzip();
-        tracker.update(&new_boxes, timestamp);
-        let mut tracks = tracker.get_active_tracks();
+        let live_tracks = tracker.update(&new_boxes, timestamp);
+        let old_tracks = tracker
+            .get_active_tracks()
+            .into_iter()
+            .filter(|x| x.last_updated != timestamp)
+            .collect::<Vec<_>>();
 
-        // sort in descending order of last updated
-        tracks.sort_by_key(|t| u64::MAX - t.last_updated);
+        let live_boxes = live_tracks
+            .iter()
+            .zip(new_boxes)
+            .zip(boxes_indices)
+            .filter_map(|((t, mut b), ind)| {
+                if let Some(t) = t {
+                    b.bbox = t.tracked_location.into();
+                    Some((b, ind))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
 
-        let mut boxes = Vec::new();
-        for i in &tracks {
-            let mut b = i.last_box;
-            b.bbox = i.tracked_location.into();
-            if i.last_updated == timestamp {
-                boxes.push((b, boxes_indices[i.last_box_index]));
-            } else {
-                old_boxes.push(b);
-            }
-        }
+        let old_boxes = old_tracks
+            .iter()
+            .map(|t| {
+                let mut b = t.last_box;
+                b.bbox = t.tracked_location.into();
+                b
+            })
+            .collect::<Vec<_>>();
+
         track_infos.clear();
-        track_infos.extend(tracks.into_iter().map(|t| {
-            let t: TrackInfo = t.into();
-            t
-        }));
-        (boxes, old_boxes)
+        track_infos.extend(live_tracks.into_iter().flatten());
+        track_infos.extend(old_tracks);
+        (live_boxes, old_boxes)
     }
 
     fn update_tracker(
         tracker: &mut dyn edgefirst_tracker::Tracker<DetectBox>,
         output_boxes: &mut Vec<DetectBox>,
-        output_tracks: &mut Vec<TrackInfo>,
+        output_tracks: &mut Vec<TrackInfo<DetectBox>>,
         timestamp: u64,
     ) {
         tracker.update(output_boxes, timestamp);
         let tracks = tracker.get_active_tracks();
+
         let (new_tracks, new_boxes): (Vec<_>, Vec<_>) = tracks
             .into_iter()
             .map(|t| {
                 let mut box_ = t.last_box;
                 box_.bbox = t.tracked_location.into();
-                let t: TrackInfo = t.into();
                 (t, box_)
             })
             .unzip();

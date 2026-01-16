@@ -24,10 +24,10 @@ impl Default for ByteTrackBuilder {
 impl ByteTrackBuilder {
     /// Creates a new ByteTrackBuilder with default parameters.
     /// These defaults are:
-    /// - track_extra_lifespan: 500_000_000 (0.5 seconds)
     /// - track_high_conf: 0.7
     /// - track_iou: 0.25
     /// - track_update: 0.25
+    /// - track_extra_lifespan: 500_000_000 (0.5 seconds)
     /// # Examples
     /// ```rust
     /// use edgefirst_tracker::bytetrack::ByteTrackBuilder;
@@ -39,10 +39,10 @@ impl ByteTrackBuilder {
     /// ```
     pub fn new() -> Self {
         Self {
-            track_extra_lifespan: 500_000_000,
             track_high_conf: 0.7,
             track_iou: 0.25,
             track_update: 0.25,
+            track_extra_lifespan: 500_000_000,
         }
     }
 
@@ -116,7 +116,6 @@ pub struct Tracklet<T: DetectionBox> {
     pub created: u64,
     pub last_updated: u64,
     pub last_box: T,
-    last_box_index: usize,
 }
 
 impl<T: DetectionBox> Tracklet<T> {
@@ -286,7 +285,6 @@ where
                         tracked_location: self.tracklets[x].get_predicted_location(),
                         last_updated: timestamp,
                         last_box: boxes[i].clone(),
-                        last_box_index: i,
                     });
                     assert!(!tracked[x]);
                     tracked[x] = true;
@@ -315,7 +313,6 @@ where
                         tracked_location: self.tracklets[x].get_predicted_location(),
                         last_updated: timestamp,
                         last_box: boxes[i].clone(),
-                        last_box_index: i,
                     });
                     trace!(
                         "Cost: {} Box: {:#?} UUID: {} Mean: {}",
@@ -355,7 +352,6 @@ where
                     count: 1,
                     created: timestamp,
                     last_box: boxes[i].clone(),
-                    last_box_index: i,
                 };
                 matched_info[i] = Some(TrackInfo {
                     uuid: new_tracklet.id,
@@ -364,7 +360,6 @@ where
                     tracked_location: new_tracklet.get_predicted_location(),
                     last_updated: timestamp,
                     last_box: boxes[i].clone(),
-                    last_box_index: i,
                 });
                 self.tracklets.push(new_tracklet);
             }
@@ -382,7 +377,6 @@ where
                 created: t.created,
                 last_updated: t.last_updated,
                 last_box: t.last_box.clone(),
-                last_box_index: t.last_box_index,
             })
             .collect()
     }

@@ -14,10 +14,14 @@ use numpy::{
     ToPyArray,
 };
 use pyo3::{
-    Bound, FromPyObject, PyAny, PyRef, PyResult, Python, pyclass, pymethods, types::PyAnyMethods,
+    Bound, FromPyObject, PyAny, PyRef, PyRefMut, PyResult, Python, pyclass, pymethods,
+    types::PyAnyMethods,
 };
 
-use crate::FunctionTimer;
+use crate::{
+    FunctionTimer,
+    tracker::{PyByteTrack, PyTrackInfo},
+};
 pub type PyDetOutput<'py> = (
     Bound<'py, PyArray2<f32>>,
     Bound<'py, PyArray1<f32>>,
@@ -29,6 +33,14 @@ pub type PySegDetOutput<'py> = (
     Bound<'py, PyArray1<f32>>,
     Bound<'py, PyArray1<usize>>,
     Vec<Bound<'py, PyArray3<u8>>>,
+);
+
+pub type PySegDetOutputTracked<'py> = (
+    Bound<'py, PyArray2<f32>>,
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<usize>>,
+    Vec<Bound<'py, PyArray3<u8>>>,
+    Vec<PyTrackInfo>,
 );
 
 #[derive(FromPyObject)]
@@ -174,14 +186,25 @@ macro_rules! dequantize {
 #[pymethods]
 impl PyDecoder {
     #[new]
-    #[pyo3(signature = (config, score_threshold=0.1, iou_threshold=0.7))]
-    pub fn new(config: Bound<PyAny>, score_threshold: f32, iou_threshold: f32) -> PyResult<Self> {
+    #[pyo3(signature = (config, score_threshold=0.1, iou_threshold=0.7, tracker = None))]
+    pub fn new(
+        config: Bound<PyAny>,
+        score_threshold: f32,
+        iou_threshold: f32,
+        tracker: Option<&PyByteTrack>,
+    ) -> PyResult<Self> {
         let config = pythonize::depythonize(&config)?;
-        let decoder = DecoderBuilder::default()
+        let mut decoder_builder = DecoderBuilder::default()
             .with_score_threshold(score_threshold)
             .with_iou_threshold(iou_threshold)
-            .with_config(config)
-            .build();
+            .with_config(config);
+
+        if let Some(tracker) = tracker {
+            decoder_builder = decoder_builder.with_tracker(tracker.tracker.clone());
+        }
+
+        let decoder = decoder_builder.build();
+
         match decoder {
             Ok(decoder) => Ok(Self { decoder }),
             Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}"))),
@@ -189,17 +212,22 @@ impl PyDecoder {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (json_str, score_threshold=0.1, iou_threshold=0.7))]
+    #[pyo3(signature = (json_str, score_threshold=0.1, iou_threshold=0.7, tracker = None))]
     pub fn new_from_json_str(
         json_str: &str,
         score_threshold: f32,
         iou_threshold: f32,
+        tracker: Option<&PyByteTrack>,
     ) -> PyResult<Self> {
-        let decoder = DecoderBuilder::default()
+        let mut decoder_builder = DecoderBuilder::default()
             .with_score_threshold(score_threshold)
             .with_iou_threshold(iou_threshold)
-            .with_config_json_str(json_str.to_string())
-            .build();
+            .with_config_json_str(json_str.to_string());
+        if let Some(tracker) = tracker {
+            decoder_builder = decoder_builder.with_tracker(tracker.tracker.clone());
+        }
+        let decoder = decoder_builder.build();
+
         match decoder {
             Ok(decoder) => Ok(Self { decoder }),
             Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}"))),
@@ -207,17 +235,21 @@ impl PyDecoder {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (yaml_str, score_threshold=0.1, iou_threshold=0.7))]
+    #[pyo3(signature = (yaml_str, score_threshold=0.1, iou_threshold=0.7, tracker = None))]
     pub fn new_from_yaml_str(
         yaml_str: &str,
         score_threshold: f32,
         iou_threshold: f32,
+        tracker: Option<&PyByteTrack>,
     ) -> PyResult<Self> {
-        let decoder = DecoderBuilder::default()
+        let mut decoder_builder = DecoderBuilder::default()
             .with_score_threshold(score_threshold)
             .with_iou_threshold(iou_threshold)
-            .with_config_yaml_str(yaml_str.to_string())
-            .build();
+            .with_config_yaml_str(yaml_str.to_string());
+        if let Some(tracker) = tracker {
+            decoder_builder = decoder_builder.with_tracker(tracker.tracker.clone());
+        }
+        let decoder = decoder_builder.build();
         match decoder {
             Ok(decoder) => Ok(Self { decoder }),
             Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}"))),
@@ -302,6 +334,105 @@ impl PyDecoder {
         let (boxes, scores, classes) = convert_detect_box(py, &output_boxes);
         let masks = convert_seg_mask(py, &output_masks);
         Ok((boxes, scores, classes, masks))
+    }
+
+    #[pyo3(signature = (model_output, timestamp_ns, max_boxes=100))]
+    pub fn decode_tracked<'py>(
+        mut self_: PyRefMut<'py, Self>,
+        model_output: ListOfReadOnlyArrayGenericDyn,
+        timestamp_ns: u64,
+        max_boxes: usize,
+    ) -> PyResult<PySegDetOutputTracked<'py>> {
+        let mut output_boxes = Vec::with_capacity(max_boxes);
+        let mut output_masks = Vec::with_capacity(max_boxes);
+        let mut output_tracks = Vec::with_capacity(max_boxes);
+        let result = match model_output {
+            ListOfReadOnlyArrayGenericDyn::Quantized(items) => {
+                let outputs = items
+                    .iter()
+                    .map(|x| match x {
+                        ArrayQuantized::UInt8(arr) => arr.as_array().into(),
+                        ArrayQuantized::Int8(arr) => arr.as_array().into(),
+                        ArrayQuantized::UInt16(arr) => arr.as_array().into(),
+                        ArrayQuantized::Int16(arr) => arr.as_array().into(),
+                        ArrayQuantized::UInt32(arr) => arr.as_array().into(),
+                        ArrayQuantized::Int32(arr) => arr.as_array().into(),
+                    })
+                    .collect::<Vec<_>>();
+                self_.decoder.decode_quantized_tracked(
+                    &outputs,
+                    &mut output_boxes,
+                    &mut output_masks,
+                    &mut output_tracks,
+                    timestamp_ns,
+                )
+            }
+            ListOfReadOnlyArrayGenericDyn::Float16(items) => {
+                let outputs = items
+                    .iter()
+                    .filter_map(|x| match x {
+                        WithInt32Array::Val(x) => Some(x.arr.as_array()),
+                        WithInt32Array::Int32(_) => None,
+                    })
+                    .collect::<Vec<_>>();
+
+                let outputs = outputs
+                    .iter()
+                    .map(|arr| arr.map(|x| x.to_f32()))
+                    .collect::<Vec<_>>();
+                let output_views = outputs
+                    .iter()
+                    .map(|output| output.view())
+                    .collect::<Vec<_>>();
+                self_.decoder.decode_float_tracked(
+                    &output_views,
+                    &mut output_boxes,
+                    &mut output_masks,
+                    &mut output_tracks,
+                    timestamp_ns,
+                )
+            }
+            ListOfReadOnlyArrayGenericDyn::Float32(items) => {
+                let outputs = items
+                    .iter()
+                    .filter_map(|x| match x {
+                        WithInt32Array::Val(x) => Some(x.as_array()),
+                        WithInt32Array::Int32(_) => None,
+                    })
+                    .collect::<Vec<_>>();
+                self_.decoder.decode_float_tracked(
+                    &outputs,
+                    &mut output_boxes,
+                    &mut output_masks,
+                    &mut output_tracks,
+                    timestamp_ns,
+                )
+            }
+            ListOfReadOnlyArrayGenericDyn::Float64(items) => {
+                let outputs = items
+                    .iter()
+                    .filter_map(|x| match x {
+                        WithInt32Array::Val(x) => Some(x.as_array()),
+                        WithInt32Array::Int32(_) => None,
+                    })
+                    .collect::<Vec<_>>();
+                self_.decoder.decode_float_tracked(
+                    &outputs,
+                    &mut output_boxes,
+                    &mut output_masks,
+                    &mut output_tracks,
+                    timestamp_ns,
+                )
+            }
+        };
+        if let Err(e) = result {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")));
+        }
+        let py = self_.py();
+        let (boxes, scores, classes) = convert_detect_box(py, &output_boxes);
+        let masks = convert_seg_mask(py, &output_masks);
+        let output_tracks = output_tracks.into_iter().map(|t| t.into()).collect();
+        Ok((boxes, scores, classes, masks, output_tracks))
     }
 
     #[staticmethod]

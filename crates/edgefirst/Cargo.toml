@@ -18,3 +18,4 @@ opengl = ["edgefirst-image/opengl"]
 edgefirst-decoder = { workspace = true }
 edgefirst-image = { workspace = true }
 edgefirst-tensor = { workspace = true }
+edgefirst-tracker = { workspace = true }

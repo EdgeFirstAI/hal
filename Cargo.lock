@@ -482,6 +482,7 @@ dependencies = [
  "edgefirst-decoder",
  "edgefirst-image",
  "edgefirst-tensor",
+ "edgefirst-tracker",
 ]
 
 [[package]]
