@@ -1024,6 +1024,100 @@ mod decoder_tests {
 
         assert_eq!(mask0, mask1);
     }
+    #[test]
+    fn test_modelpack_seg_quant() {
+        let out = include_bytes!("../../../testdata/modelpack_seg_2x160x160.bin");
+        let out_u8 = ndarray::Array4::from_shape_vec((1, 2, 160, 160), out.to_vec()).unwrap();
+        let out_i8 = out_u8.mapv(|x| (x as i16 - 128) as i8);
+        let out_u16 = out_u8.mapv(|x| (x as u16) << 8);
+        let out_i16 = out_u8.mapv(|x| (((x as i32) << 8) - 32768) as i16);
+        let out_u32 = out_u8.mapv(|x| (x as u32) << 24);
+        let out_i32 = out_u8.mapv(|x| (((x as i64) << 24) - 2147483648) as i32);
+
+        let quant = (1.0 / 255.0, 0).into();
+
+        let decoder = DecoderBuilder::default()
+            .with_config_modelpack_seg(configs::Segmentation {
+                decoder: DecoderType::ModelPack,
+                quantization: Some(quant),
+                shape: vec![1, 2, 160, 160],
+                dshape: vec![
+                    (DimName::Batch, 1),
+                    (DimName::NumClasses, 2),
+                    (DimName::Height, 160),
+                    (DimName::Width, 160),
+                ],
+            })
+            .build()
+            .unwrap();
+        let mut output_boxes: Vec<_> = Vec::with_capacity(10);
+        let mut output_masks_u8: Vec<_> = Vec::with_capacity(10);
+        decoder
+            .decode_quantized(
+                &[out_u8.view().into()],
+                &mut output_boxes,
+                &mut output_masks_u8,
+            )
+            .unwrap();
+
+        let mut output_masks_i8: Vec<_> = Vec::with_capacity(10);
+        decoder
+            .decode_quantized(
+                &[out_i8.view().into()],
+                &mut output_boxes,
+                &mut output_masks_i8,
+            )
+            .unwrap();
+
+        let mut output_masks_u16: Vec<_> = Vec::with_capacity(10);
+        decoder
+            .decode_quantized(
+                &[out_u16.view().into()],
+                &mut output_boxes,
+                &mut output_masks_u16,
+            )
+            .unwrap();
+
+        let mut output_masks_i16: Vec<_> = Vec::with_capacity(10);
+        decoder
+            .decode_quantized(
+                &[out_i16.view().into()],
+                &mut output_boxes,
+                &mut output_masks_i16,
+            )
+            .unwrap();
+
+        let mut output_masks_u32: Vec<_> = Vec::with_capacity(10);
+        decoder
+            .decode_quantized(
+                &[out_u32.view().into()],
+                &mut output_boxes,
+                &mut output_masks_u32,
+            )
+            .unwrap();
+
+        let mut output_masks_i32: Vec<_> = Vec::with_capacity(10);
+        decoder
+            .decode_quantized(
+                &[out_i32.view().into()],
+                &mut output_boxes,
+                &mut output_masks_i32,
+            )
+            .unwrap();
+
+        compare_outputs((&[], &output_boxes), (&[], &[]));
+        let mask_u8 = segmentation_to_mask(output_masks_u8[0].segmentation.view());
+        let mask_i8 = segmentation_to_mask(output_masks_i8[0].segmentation.view());
+        let mask_u16 = segmentation_to_mask(output_masks_u16[0].segmentation.view());
+        let mask_i16 = segmentation_to_mask(output_masks_i16[0].segmentation.view());
+        let mask_u32 = segmentation_to_mask(output_masks_u32[0].segmentation.view());
+        let mask_i32 = segmentation_to_mask(output_masks_i32[0].segmentation.view());
+        assert_eq!(mask_u8, mask_i8);
+        assert_eq!(mask_u8, mask_u16);
+        assert_eq!(mask_u8, mask_i16);
+        assert_eq!(mask_u8, mask_u32);
+        assert_eq!(mask_u8, mask_i32);
+    }
 
     #[test]
     fn test_modelpack_segdet() {
