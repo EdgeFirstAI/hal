@@ -2820,6 +2820,110 @@ impl Decoder {
         )))
     }
 
+    fn get_order_fn(config: ConfigOutputRef) -> fn(DimName) -> usize {
+        let decoder_type = config.decoder();
+        match (config, decoder_type) {
+            (ConfigOutputRef::Detection(_), DecoderType::ModelPack) => {
+                // This is split detection, need to swap axes to batch, height, width,
+                // num_anchors_x_features,
+                // s.dshape.iter().map().collect::<Vec<_>>()
+                |x| match x {
+                    DimName::Batch => 0,
+                    DimName::Height => 1,
+                    DimName::Width => 2,
+                    DimName::NumAnchorsXFeatures => 3,
+                    _ => 1000, // this should be unreachable
+                }
+            }
+            (ConfigOutputRef::Detection(_), DecoderType::Ultralytics) => {
+                // This is Ultralytics detection, need to swap axes to batch, num_features,
+                // height, width
+                // s.dshape.iter().map().collect::<Vec<_>>()
+                |x| match x {
+                    DimName::Batch => 0,
+                    DimName::NumFeatures => 1,
+                    DimName::NumBoxes => 2,
+                    _ => 1000, // this should be unreachable
+                }
+            }
+            (ConfigOutputRef::Boxes(_), DecoderType::ModelPack) => {
+                // s.dshape.iter().map().collect::<Vec<_>>()
+                |x| match x {
+                    DimName::Batch => 0,
+                    DimName::NumBoxes => 1,
+                    DimName::Padding => 2,
+                    DimName::BoxCoords => 3,
+                    _ => 1000, // this should be unreachable
+                }
+            }
+            (ConfigOutputRef::Boxes(_), DecoderType::Ultralytics) => {
+                // s.dshape.iter().map().collect::<Vec<_>>()
+                |x| match x {
+                    DimName::Batch => 0,
+                    DimName::BoxCoords => 1,
+                    DimName::NumBoxes => 2,
+                    _ => 1000, // this should be unreachable
+                }
+            }
+            (ConfigOutputRef::Scores(_), DecoderType::ModelPack) => {
+                // s.dshape.iter().map().collect::<Vec<_>>()
+                |x| match x {
+                    DimName::Batch => 0,
+                    DimName::NumBoxes => 1,
+                    DimName::NumClasses => 2,
+                    _ => 1000, // this should be unreachable
+                }
+            }
+            (ConfigOutputRef::Scores(_), DecoderType::Ultralytics) => {
+                // s.dshape.iter().map().collect::<Vec<_>>()
+                |x| match x {
+                    DimName::Batch => 0,
+                    DimName::NumClasses => 1,
+                    DimName::NumBoxes => 2,
+                    _ => 1000, // this should be unreachable
+                }
+            }
+            (ConfigOutputRef::Segmentation(_), _) => {
+                // s.dshape.iter().map().collect::<Vec<_>>()
+                |x| match x {
+                    DimName::Batch => 0,
+                    DimName::Height => 1,
+                    DimName::Width => 2,
+                    DimName::NumClasses => 3,
+                    _ => 1000, // this should be unreachable
+                }
+            }
+            (ConfigOutputRef::Mask(_), _) => {
+                // s.dshape.iter().map().collect::<Vec<_>>()
+                |x| match x {
+                    DimName::Batch => 0,
+                    DimName::Height => 1,
+                    DimName::Width => 2,
+                    _ => 1000, // this should be unreachable
+                }
+            }
+            (ConfigOutputRef::Protos(_), _) => {
+                // s.dshape.iter().map().collect::<Vec<_>>()
+                |x| match x {
+                    DimName::Batch => 0,
+                    DimName::Height => 1,
+                    DimName::Width => 2,
+                    DimName::NumProtos => 3,
+                    _ => 1000, // this should be unreachable
+                }
+            }
+            (ConfigOutputRef::MaskCoefficients(_), _) => {
+                // s.dshape.iter().map().collect::<Vec<_>>()
+                |x| match x {
+                    DimName::Batch => 0,
+                    DimName::NumProtos => 1,
+                    DimName::NumBoxes => 2,
+                    _ => 1000, // this should be unreachable
+                }
+            }
+        }
+    }
+
     fn swap_axes_if_needed<'a, T, D: Dimension>(
         array: &ArrayView<'a, T, D>,
         config: ConfigOutputRef,
@@ -2828,128 +2932,12 @@ impl Decoder {
         if config.dshape().is_empty() {
             return array;
         }
-        let decoder_type = config.decoder();
-        let mut current_order = match (config, decoder_type) {
-            (ConfigOutputRef::Detection(s), DecoderType::ModelPack) => {
-                // This is split detection, need to swap axes to batch, height, width,
-                // num_anchors_x_features,
-                s.dshape
-                    .iter()
-                    .map(|x| match x.0 {
-                        DimName::Batch => 0,
-                        DimName::Height => 1,
-                        DimName::Width => 2,
-                        DimName::NumAnchorsXFeatures => 3,
-                        _ => 1000, // this should be unreachable
-                    })
-                    .collect::<Vec<_>>()
-            }
-            (ConfigOutputRef::Detection(s), DecoderType::Ultralytics) => {
-                // This is Ultralytics detection, need to swap axes to batch, num_features,
-                // height, width
-                s.dshape
-                    .iter()
-                    .map(|x| match x.0 {
-                        DimName::Batch => 0,
-                        DimName::NumFeatures => 1,
-                        DimName::NumBoxes => 2,
-                        _ => 1000, // this should be unreachable
-                    })
-                    .collect::<Vec<_>>()
-            }
-            (ConfigOutputRef::Boxes(s), DecoderType::ModelPack) => {
-                s.dshape
-                    .iter()
-                    .map(|x| match x.0 {
-                        DimName::Batch => 0,
-                        DimName::NumBoxes => 1,
-                        DimName::Padding => 2,
-                        DimName::BoxCoords => 3,
-                        _ => 1000, // this should be unreachable
-                    })
-                    .collect::<Vec<_>>()
-            }
-            (ConfigOutputRef::Boxes(s), DecoderType::Ultralytics) => {
-                s.dshape
-                    .iter()
-                    .map(|x| match x.0 {
-                        DimName::Batch => 0,
-                        DimName::BoxCoords => 1,
-                        DimName::NumBoxes => 2,
-                        _ => 1000, // this should be unreachable
-                    })
-                    .collect::<Vec<_>>()
-            }
-            (ConfigOutputRef::Scores(s), DecoderType::ModelPack) => {
-                s.dshape
-                    .iter()
-                    .map(|x| match x.0 {
-                        DimName::Batch => 0,
-                        DimName::NumBoxes => 1,
-                        DimName::NumClasses => 2,
-                        _ => 1000, // this should be unreachable
-                    })
-                    .collect::<Vec<_>>()
-            }
-            (ConfigOutputRef::Scores(s), DecoderType::Ultralytics) => {
-                s.dshape
-                    .iter()
-                    .map(|x| match x.0 {
-                        DimName::Batch => 0,
-                        DimName::NumClasses => 1,
-                        DimName::NumBoxes => 2,
-                        _ => 1000, // this should be unreachable
-                    })
-                    .collect::<Vec<_>>()
-            }
-            (ConfigOutputRef::Segmentation(s), _) => {
-                s.dshape
-                    .iter()
-                    .map(|x| match x.0 {
-                        DimName::Batch => 0,
-                        DimName::Height => 1,
-                        DimName::Width => 2,
-                        DimName::NumClasses => 3,
-                        _ => 1000, // this should be unreachable
-                    })
-                    .collect::<Vec<_>>()
-            }
-            (ConfigOutputRef::Mask(s), _) => {
-                s.dshape
-                    .iter()
-                    .map(|x| match x.0 {
-                        DimName::Batch => 0,
-                        DimName::Height => 1,
-                        DimName::Width => 2,
-                        _ => 1000, // this should be unreachable
-                    })
-                    .collect::<Vec<_>>()
-            }
-            (ConfigOutputRef::Protos(s), _) => {
-                s.dshape
-                    .iter()
-                    .map(|x| match x.0 {
-                        DimName::Batch => 0,
-                        DimName::Height => 1,
-                        DimName::Width => 2,
-                        DimName::NumProtos => 3,
-
-                        _ => 1000, // this should be unreachable
-                    })
-                    .collect::<Vec<_>>()
-            }
-            (ConfigOutputRef::MaskCoefficients(s), _) => {
-                s.dshape
-                    .iter()
-                    .map(|x| match x.0 {
-                        DimName::Batch => 0,
-                        DimName::NumProtos => 1,
-                        DimName::NumBoxes => 2,
-                        _ => 1000, // this should be unreachable
-                    })
-                    .collect::<Vec<_>>()
-            }
-        };
+        let order_fn: fn(DimName) -> usize = Self::get_order_fn(config.clone());
+        let mut current_order: Vec<usize> = config
+            .dshape()
+            .iter()
+            .map(|x| order_fn(x.0))
+            .collect::<Vec<_>>();
 
         assert_eq!(array.shape().len(), current_order.len());
         // do simple bubble sort as swap_axes is inexpensive and the
