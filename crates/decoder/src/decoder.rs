@@ -69,6 +69,32 @@ pub enum ConfigOutputRef<'a> {
     MaskCoefficients(&'a configs::MaskCoefficients),
 }
 
+impl<'a> ConfigOutputRef<'a> {
+    fn decoder(&self) -> configs::DecoderType {
+        match self {
+            ConfigOutputRef::Detection(v) => v.decoder,
+            ConfigOutputRef::Mask(v) => v.decoder,
+            ConfigOutputRef::Segmentation(v) => v.decoder,
+            ConfigOutputRef::Protos(v) => v.decoder,
+            ConfigOutputRef::Scores(v) => v.decoder,
+            ConfigOutputRef::Boxes(v) => v.decoder,
+            ConfigOutputRef::MaskCoefficients(v) => v.decoder,
+        }
+    }
+
+    fn dshape(&self) -> &[(DimName, usize)] {
+        match self {
+            ConfigOutputRef::Detection(v) => &v.dshape,
+            ConfigOutputRef::Mask(v) => &v.dshape,
+            ConfigOutputRef::Segmentation(v) => &v.dshape,
+            ConfigOutputRef::Protos(v) => &v.dshape,
+            ConfigOutputRef::Scores(v) => &v.dshape,
+            ConfigOutputRef::Boxes(v) => &v.dshape,
+            ConfigOutputRef::MaskCoefficients(v) => &v.dshape,
+        }
+    }
+}
+
 impl<'a> From<&'a configs::Detection> for ConfigOutputRef<'a> {
     /// Converts from references of config structs to ConfigOutputRef
     /// # Examples
@@ -427,7 +453,7 @@ pub mod configs {
         }
     }
 
-    #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
+    #[derive(Debug, PartialEq, Serialize, Deserialize, Clone, Copy, Hash, Eq)]
     pub enum DecoderType {
         #[serde(rename = "modelpack")]
         ModelPack,
@@ -2799,96 +2825,84 @@ impl Decoder {
         config: ConfigOutputRef,
     ) -> ArrayView<'a, T, D> {
         let mut array = array.clone();
-        let mut current_order = match config {
-            ConfigOutputRef::Detection(s) => {
-                if s.dshape.is_empty() {
-                    return array;
-                }
-                // This is split detection, need to swap axes to batch, height,
-                // width, num_anchors_x_features,
-                match s.decoder {
-                    DecoderType::ModelPack => s
-                        .dshape
-                        .iter()
-                        .map(|x| match x.0 {
-                            DimName::Batch => 0,
-                            DimName::Height => 1,
-                            DimName::Width => 2,
-                            DimName::NumAnchorsXFeatures => 3,
-                            _ => 1000, // this should be unreachable
-                        })
-                        .collect::<Vec<_>>(),
-                    DecoderType::Ultralytics => s
-                        .dshape
-                        .iter()
-                        .map(|x| match x.0 {
-                            DimName::Batch => 0,
-                            DimName::NumFeatures => 1,
-                            DimName::NumBoxes => 2,
-                            _ => 1000, // this should be unreachable
-                        })
-                        .collect::<Vec<_>>(),
-                }
+        if config.dshape().is_empty() {
+            return array;
+        }
+        let decoder_type = config.decoder();
+        let mut current_order = match (config, decoder_type) {
+            (ConfigOutputRef::Detection(s), DecoderType::ModelPack) => {
+                // This is split detection, need to swap axes to batch, height, width,
+                // num_anchors_x_features,
+                s.dshape
+                    .iter()
+                    .map(|x| match x.0 {
+                        DimName::Batch => 0,
+                        DimName::Height => 1,
+                        DimName::Width => 2,
+                        DimName::NumAnchorsXFeatures => 3,
+                        _ => 1000, // this should be unreachable
+                    })
+                    .collect::<Vec<_>>()
             }
-            ConfigOutputRef::Boxes(s) => {
-                if s.dshape.is_empty() {
-                    return array;
-                }
-                match s.decoder {
-                    DecoderType::ModelPack => s
-                        .dshape
-                        .iter()
-                        .map(|x| match x.0 {
-                            DimName::Batch => 0,
-                            DimName::NumBoxes => 1,
-                            DimName::Padding => 2,
-                            DimName::BoxCoords => 3,
-                            _ => 1000, // this should be unreachable
-                        })
-                        .collect::<Vec<_>>(),
-                    DecoderType::Ultralytics => s
-                        .dshape
-                        .iter()
-                        .map(|x| match x.0 {
-                            DimName::Batch => 0,
-                            DimName::BoxCoords => 1,
-                            DimName::NumBoxes => 2,
-                            _ => 1000, // this should be unreachable
-                        })
-                        .collect::<Vec<_>>(),
-                }
+            (ConfigOutputRef::Detection(s), DecoderType::Ultralytics) => {
+                // This is Ultralytics detection, need to swap axes to batch, num_features,
+                // height, width
+                s.dshape
+                    .iter()
+                    .map(|x| match x.0 {
+                        DimName::Batch => 0,
+                        DimName::NumFeatures => 1,
+                        DimName::NumBoxes => 2,
+                        _ => 1000, // this should be unreachable
+                    })
+                    .collect::<Vec<_>>()
             }
-            ConfigOutputRef::Scores(s) => {
-                if s.dshape.is_empty() {
-                    return array;
-                }
-                match s.decoder {
-                    DecoderType::ModelPack => s
-                        .dshape
-                        .iter()
-                        .map(|x| match x.0 {
-                            DimName::Batch => 0,
-                            DimName::NumBoxes => 1,
-                            DimName::NumClasses => 2,
-                            _ => 1000, // this should be unreachable
-                        })
-                        .collect::<Vec<_>>(),
-                    DecoderType::Ultralytics => s
-                        .dshape
-                        .iter()
-                        .map(|x| match x.0 {
-                            DimName::Batch => 0,
-                            DimName::NumClasses => 1,
-                            DimName::NumBoxes => 2,
-                            _ => 1000, // this should be unreachable
-                        })
-                        .collect::<Vec<_>>(),
-                }
+            (ConfigOutputRef::Boxes(s), DecoderType::ModelPack) => {
+                s.dshape
+                    .iter()
+                    .map(|x| match x.0 {
+                        DimName::Batch => 0,
+                        DimName::NumBoxes => 1,
+                        DimName::Padding => 2,
+                        DimName::BoxCoords => 3,
+                        _ => 1000, // this should be unreachable
+                    })
+                    .collect::<Vec<_>>()
             }
-            ConfigOutputRef::Segmentation(s) => {
-                if s.dshape.is_empty() {
-                    return array;
-                }
+            (ConfigOutputRef::Boxes(s), DecoderType::Ultralytics) => {
+                s.dshape
+                    .iter()
+                    .map(|x| match x.0 {
+                        DimName::Batch => 0,
+                        DimName::BoxCoords => 1,
+                        DimName::NumBoxes => 2,
+                        _ => 1000, // this should be unreachable
+                    })
+                    .collect::<Vec<_>>()
+            }
+            (ConfigOutputRef::Scores(s), DecoderType::ModelPack) => {
+                s.dshape
+                    .iter()
+                    .map(|x| match x.0 {
+                        DimName::Batch => 0,
+                        DimName::NumBoxes => 1,
+                        DimName::NumClasses => 2,
+                        _ => 1000, // this should be unreachable
+                    })
+                    .collect::<Vec<_>>()
+            }
+            (ConfigOutputRef::Scores(s), DecoderType::Ultralytics) => {
+                s.dshape
+                    .iter()
+                    .map(|x| match x.0 {
+                        DimName::Batch => 0,
+                        DimName::NumClasses => 1,
+                        DimName::NumBoxes => 2,
+                        _ => 1000, // this should be unreachable
+                    })
+                    .collect::<Vec<_>>()
+            }
+            (ConfigOutputRef::Segmentation(s), _) => {
                 s.dshape
                     .iter()
                     .map(|x| match x.0 {
@@ -2900,25 +2914,18 @@ impl Decoder {
                     })
                     .collect::<Vec<_>>()
             }
-            ConfigOutputRef::Mask(s) => {
-                if s.dshape.is_empty() {
-                    return array;
-                }
+            (ConfigOutputRef::Mask(s), _) => {
                 s.dshape
                     .iter()
                     .map(|x| match x.0 {
                         DimName::Batch => 0,
                         DimName::Height => 1,
                         DimName::Width => 2,
-                        DimName::NumClasses => 3,
                         _ => 1000, // this should be unreachable
                     })
                     .collect::<Vec<_>>()
             }
-            ConfigOutputRef::Protos(s) => {
-                if s.dshape.is_empty() {
-                    return array;
-                }
+            (ConfigOutputRef::Protos(s), _) => {
                 s.dshape
                     .iter()
                     .map(|x| match x.0 {
@@ -2931,10 +2938,7 @@ impl Decoder {
                     })
                     .collect::<Vec<_>>()
             }
-            ConfigOutputRef::MaskCoefficients(s) => {
-                if s.dshape.is_empty() {
-                    return array;
-                }
+            (ConfigOutputRef::MaskCoefficients(s), _) => {
                 s.dshape
                     .iter()
                     .map(|x| match x.0 {
