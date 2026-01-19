@@ -25,7 +25,6 @@ use std::{
     thread::JoinHandle,
     time::Instant,
 };
-use tokio::sync::mpsc::Sender;
 
 macro_rules! function {
     () => {{
@@ -464,17 +463,14 @@ enum GLProcessorMessage {
         Rotation,
         Flip,
         Crop,
-        tokio::sync::oneshot::Sender<Result<(), Error>>,
+        std::sync::mpsc::SyncSender<Result<(), Error>>,
     ),
-    SetColors(
-        Vec<[u8; 4]>,
-        tokio::sync::oneshot::Sender<Result<(), Error>>,
-    ),
+    SetColors(Vec<[u8; 4]>, std::sync::mpsc::SyncSender<Result<(), Error>>),
     ImageRender(
         SendablePtr<TensorImage>,
         SendablePtr<DetectBox>,
         SendablePtr<Segmentation>,
-        tokio::sync::oneshot::Sender<Result<(), Error>>,
+        std::sync::mpsc::SyncSender<Result<(), Error>>,
     ),
 }
 
@@ -488,7 +484,7 @@ pub struct GLProcessorThreaded {
     handle: Option<JoinHandle<()>>,
 
     // This is only None when the converter is being dropped.
-    sender: Option<Sender<GLProcessorMessage>>,
+    sender: Option<std::sync::mpsc::SyncSender<GLProcessorMessage>>,
     support_dma: bool,
 }
 
@@ -505,9 +501,9 @@ unsafe impl<T> Send for SendablePtr<T> where T: Send {}
 impl GLProcessorThreaded {
     /// Creates a new OpenGL multi-threaded image converter.
     pub fn new() -> Result<Self, Error> {
-        let (send, mut recv) = tokio::sync::mpsc::channel::<GLProcessorMessage>(1);
+        let (send, recv) = std::sync::mpsc::sync_channel::<GLProcessorMessage>(1);
 
-        let (create_ctx_send, create_ctx_recv) = tokio::sync::oneshot::channel();
+        let (create_ctx_send, create_ctx_recv) = std::sync::mpsc::sync_channel(1);
 
         let func = move || {
             let mut gl_converter = match GLProcessorST::new() {
@@ -518,7 +514,7 @@ impl GLProcessorThreaded {
                 }
             };
             let _ = create_ctx_send.send(Ok(gl_converter.gl_context.support_dma));
-            while let Some(msg) = recv.blocking_recv() {
+            while let Ok(msg) = recv.recv() {
                 match msg {
                     GLProcessorMessage::ImageConvert(src, mut dst, rotation, flip, crop, resp) => {
                         // SAFETY: This is safe because the convert() function waits for the resp to
@@ -546,10 +542,9 @@ impl GLProcessorThreaded {
             }
         };
 
-        // let handle = tokio::task::spawn(func());
         let handle = std::thread::spawn(func);
 
-        let support_dma = match create_ctx_recv.blocking_recv() {
+        let support_dma = match create_ctx_recv.recv() {
             Ok(Err(e)) => return Err(e),
             Err(_) => {
                 return Err(Error::Internal(
@@ -591,11 +586,11 @@ impl ImageProcessorTrait for GLProcessorThreaded {
             )));
         }
 
-        let (err_send, err_recv) = tokio::sync::oneshot::channel();
+        let (err_send, err_recv) = std::sync::mpsc::sync_channel(1);
         self.sender
             .as_ref()
             .unwrap()
-            .blocking_send(GLProcessorMessage::ImageConvert(
+            .send(GLProcessorMessage::ImageConvert(
                 SendablePtr {
                     ptr: src.into(),
                     len: 1,
@@ -610,7 +605,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
                 err_send,
             ))
             .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
-        err_recv.blocking_recv().map_err(|_| {
+        err_recv.recv().map_err(|_| {
             Error::Internal("GL converter error messaging closed without update".to_string())
         })?
     }
@@ -622,11 +617,11 @@ impl ImageProcessorTrait for GLProcessorThreaded {
         detect: &[crate::DetectBox],
         segmentation: &[crate::Segmentation],
     ) -> crate::Result<()> {
-        let (err_send, err_recv) = tokio::sync::oneshot::channel();
+        let (err_send, err_recv) = std::sync::mpsc::sync_channel(1);
         self.sender
             .as_ref()
             .unwrap()
-            .blocking_send(GLProcessorMessage::ImageRender(
+            .send(GLProcessorMessage::ImageRender(
                 SendablePtr {
                     ptr: dst.into(),
                     len: 1,
@@ -642,20 +637,20 @@ impl ImageProcessorTrait for GLProcessorThreaded {
                 err_send,
             ))
             .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
-        err_recv.blocking_recv().map_err(|_| {
+        err_recv.recv().map_err(|_| {
             Error::Internal("GL converter error messaging closed without update".to_string())
         })?
     }
 
     #[cfg(feature = "decoder")]
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<(), crate::Error> {
-        let (err_send, err_recv) = tokio::sync::oneshot::channel();
+        let (err_send, err_recv) = std::sync::mpsc::sync_channel(1);
         self.sender
             .as_ref()
             .unwrap()
-            .blocking_send(GLProcessorMessage::SetColors(colors.to_vec(), err_send))
+            .send(GLProcessorMessage::SetColors(colors.to_vec(), err_send))
             .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
-        err_recv.blocking_recv().map_err(|_| {
+        err_recv.recv().map_err(|_| {
             Error::Internal("GL converter error messaging closed without update".to_string())
         })?
     }
