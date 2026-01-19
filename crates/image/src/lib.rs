@@ -59,7 +59,7 @@ and hardware acceleration. However, this will increase the performance of the CP
 use edgefirst_decoder::{DetectBox, Segmentation};
 use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait as _};
 use enum_dispatch::enum_dispatch;
-use four_char_code::{FourCharCode, four_char_code};
+
 use std::{fmt::Display, time::Instant};
 use zune_jpeg::{
     JpegDecoder,
@@ -69,6 +69,7 @@ use zune_png::PngDecoder;
 
 pub use cpu::CPUProcessor;
 pub use error::{Error, Result};
+pub use four_char_code::{FourCharCode, four_char_code};
 #[cfg(target_os = "linux")]
 pub use g2d::G2DProcessor;
 #[cfg(target_os = "linux")]
