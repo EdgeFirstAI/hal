@@ -650,7 +650,7 @@ mod decoder_tests {
         },
         *,
     };
-    use ndarray::{Array4, Axis, array, s};
+    use ndarray::{Array4, array, s};
     use ndarray_stats::DeviationExt;
 
     fn compare_outputs(
@@ -1010,10 +1010,7 @@ mod decoder_tests {
         let boxes = Array4::from_shape_vec((1, 1935, 1, 4), boxes.to_vec()).unwrap();
 
         let scores = include_bytes!("../../../testdata/modelpack_scores_1935x1.bin");
-        let mut scores = Array3::from_shape_vec((1, 1935, 1), scores.to_vec()).unwrap();
-        scores
-            .append(Axis(2), Array3::from_elem((1, 1935, 1), 0).view())
-            .unwrap();
+        let scores = Array3::from_shape_vec((1, 1935, 1), scores.to_vec()).unwrap();
 
         let seg = include_bytes!("../../../testdata/modelpack_seg_2x160x160.bin");
         let seg = Array4::from_shape_vec((1, 2, 160, 160), seg.to_vec()).unwrap();
@@ -1033,7 +1030,7 @@ mod decoder_tests {
                 configs::Scores {
                     decoder: DecoderType::ModelPack,
                     quantization: Some(quant_scores),
-                    shape: vec![1, 1935, 2],
+                    shape: vec![1, 1935, 1],
                     channels_first: false,
                 },
                 configs::Segmentation {
@@ -1109,30 +1106,16 @@ mod decoder_tests {
     #[test]
     fn test_modelpack_segdet_split() {
         let score_threshold = 0.8;
-        let iou_threshold = 0.8;
+        let iou_threshold = 0.5;
 
         let seg = include_bytes!("../../../testdata/modelpack_seg_2x160x160.bin");
         let seg = ndarray::Array4::from_shape_vec((1, 2, 160, 160), seg.to_vec()).unwrap();
 
         let detect0 = include_bytes!("../../../testdata/modelpack_split_9x15x18.bin");
-        let mut detect0 =
-            ndarray::Array4::from_shape_vec((1, 9, 15, 18), detect0.to_vec()).unwrap();
-        detect0
-            .append(
-                Axis(3),
-                ndarray::Array4::<u8>::from_elem((1, 9, 15, 3), 0).view(),
-            )
-            .unwrap();
+        let detect0 = ndarray::Array4::from_shape_vec((1, 9, 15, 18), detect0.to_vec()).unwrap();
 
         let detect1 = include_bytes!("../../../testdata/modelpack_split_17x30x18.bin");
-        let mut detect1 =
-            ndarray::Array4::from_shape_vec((1, 17, 30, 18), detect1.to_vec()).unwrap();
-        detect1
-            .append(
-                Axis(3),
-                ndarray::Array4::<u8>::from_elem((1, 17, 30, 3), 0).view(),
-            )
-            .unwrap();
+        let detect1 = ndarray::Array4::from_shape_vec((1, 17, 30, 18), detect1.to_vec()).unwrap();
 
         let quant0 = (0.08547406643629074, 174).into();
         let quant1 = (0.09929127991199493, 183).into();
@@ -1154,14 +1137,14 @@ mod decoder_tests {
                 vec![
                     configs::Detection {
                         decoder: DecoderType::ModelPack,
-                        shape: vec![1, 17, 30, 21],
+                        shape: vec![1, 17, 30, 18],
                         anchors: Some(anchors1),
                         quantization: Some(quant1),
                         channels_first: false,
                     },
                     configs::Detection {
                         decoder: DecoderType::ModelPack,
-                        shape: vec![1, 9, 15, 21],
+                        shape: vec![1, 9, 15, 18],
                         anchors: Some(anchors0),
                         quantization: Some(quant0),
                         channels_first: false,
@@ -1204,13 +1187,13 @@ mod decoder_tests {
         }];
         let correct_boxes = [DetectBox {
             bbox: BoundingBox {
-                xmin: 0.4270329,
+                xmin: 0.43171933,
                 ymin: 0.68243736,
-                xmax: 0.55797803,
+                xmax: 0.5626645,
                 ymax: 0.808863,
             },
-            score: 0.89478815,
-            label: 1,
+            score: 0.99240804,
+            label: 0,
         }];
         println!("Output Boxes: {:?}", output_boxes);
         compare_outputs((&correct_boxes, &output_boxes), (&mask, &output_masks));
@@ -1438,11 +1421,12 @@ mod decoder_tests {
 
         let decoder = DecoderBuilder::default()
             .with_config_yolo_segdet(
-                configs::Segmentation {
+                configs::Detection {
                     decoder: configs::DecoderType::Ultralytics,
                     quantization: Some(quant_boxes),
                     shape: vec![1, 116, 8400],
                     channels_first: false,
+                    anchors: None,
                 },
                 Protos {
                     decoder: configs::DecoderType::Ultralytics,
