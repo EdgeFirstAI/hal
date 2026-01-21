@@ -13,6 +13,7 @@ use crate::{
     DecoderError, DetectBox, Quantization, Segmentation, XYWH,
     configs::{DecoderType, DimName, ModelType, QuantTuple},
     dequantize_ndarray,
+    float::nms_float,
     modelpack::{
         ModelPackDetectionConfig, decode_modelpack_det, decode_modelpack_float,
         decode_modelpack_split_float,
@@ -478,6 +479,7 @@ pub mod configs {
             mask_coeff: MaskCoefficients,
             protos: Protos,
         },
+        Custom {},
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -511,6 +513,7 @@ enum ConfigSource {
     Yaml(String),
     Json(String),
     Config(ConfigOutputs),
+    Custom,
 }
 
 impl Default for DecoderBuilder {
@@ -1000,6 +1003,26 @@ impl DecoderBuilder {
         self
     }
 
+    /// Sets the decoder to use a custom decoding method. This is intended for
+    /// advanced users who want to implement their own decoding logic. They must
+    /// call `decoder.decode_custom()` with boxes that have already been
+    /// decoded into `DetectBox`.
+    ////
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
+    /// # fn main() -> DecoderResult<()> {
+    /// # let config_json = include_str!("../../../testdata/modelpack_split.json").to_string();
+    /// let decoder = DecoderBuilder::new()
+    ///     .with_config_custom()
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    pub fn with_config_custom(mut self) -> Self {
+        self.config_src.replace(ConfigSource::Custom);
+        self
+    }
+
     /// Sets the scores threshold of the decoder
     ///
     /// # Examples
@@ -1085,6 +1108,16 @@ impl DecoderBuilder {
             Some(ConfigSource::Json(s)) => serde_json::from_str(&s)?,
             Some(ConfigSource::Yaml(s)) => serde_yaml::from_str(&s)?,
             Some(ConfigSource::Config(c)) => c,
+            Some(ConfigSource::Custom) => {
+                // custom models skip model type validation because the user will provide their
+                // own box decoding
+                return Ok(Decoder {
+                    model_type: ModelType::Custom {},
+                    iou_threshold: self.iou_threshold,
+                    score_threshold: self.score_threshold,
+                    tracker: self.tracker,
+                });
+            }
             None => return Err(DecoderError::NoConfig),
         };
         let model_type = Self::get_model_type(config.outputs)?;
@@ -2064,6 +2097,10 @@ impl Decoder {
                 output_masks,
                 tracking,
             ),
+            ModelType::Custom {} => Err(DecoderError::NotSupported(
+                "Custom models must provide post processed boxes to decoder.decode_custom() function"
+                    .to_string(),
+            )),
         }
     }
 
@@ -2149,7 +2186,7 @@ impl Decoder {
                     output_boxes,
                     output_tracks,
                 )?;
-                Self::decode_modelpack_seg_float(outputs, segmentation, output_masks)?;
+                Self::decode_modelpack_seg_float(outputs, segmentation, output_masks)
             }
             ModelType::ModelPackSegDetSplit {
                 detection,
@@ -2163,85 +2200,90 @@ impl Decoder {
                     output_boxes,
                     output_tracks,
                 )?;
-                Self::decode_modelpack_seg_float(outputs, segmentation, output_masks)?;
+                Self::decode_modelpack_seg_float(outputs, segmentation, output_masks)
             }
-            ModelType::ModelPackDet { boxes, scores } => {
-                Self::decode_modelpack_det_float(
-                    self.score_threshold,
-                    self.iou_threshold,
-                    outputs,
-                    boxes,
-                    scores,
-                    output_boxes,
-                    output_tracks,
-                )?;
-            }
-            ModelType::ModelPackDetSplit { detection } => {
-                Self::decode_modelpack_det_split_float(
-                    self.score_threshold,
-                    self.iou_threshold,
-                    outputs,
-                    detection,
-                    output_boxes,
-                    output_tracks,
-                )?;
-            }
+            ModelType::ModelPackDet { boxes, scores } => Self::decode_modelpack_det_float(
+                self.score_threshold,
+                self.iou_threshold,
+                outputs,
+                boxes,
+                scores,
+                output_boxes,
+                output_tracks,
+            ),
+            ModelType::ModelPackDetSplit { detection } => Self::decode_modelpack_det_split_float(
+                self.score_threshold,
+                self.iou_threshold,
+                outputs,
+                detection,
+                output_boxes,
+                output_tracks,
+            ),
             ModelType::ModelPackSeg { segmentation } => {
-                Self::decode_modelpack_seg_float(outputs, segmentation, output_masks)?;
+                Self::decode_modelpack_seg_float(outputs, segmentation, output_masks)
             }
-            ModelType::YoloDet { boxes } => {
-                Self::decode_yolo_det_float(
-                    self.score_threshold,
-                    self.iou_threshold,
-                    outputs,
-                    boxes,
-                    output_boxes,
-                    output_tracks,
-                )?;
-            }
-            ModelType::YoloSegDet { boxes, protos } => {
-                Self::decode_yolo_segdet_float(
-                    self.score_threshold,
-                    self.iou_threshold,
-                    outputs,
-                    boxes,
-                    protos,
-                    output_boxes,
-                    output_masks,
-                    output_tracks,
-                )?;
-            }
-            ModelType::YoloSplitDet { boxes, scores } => {
-                Self::decode_yolo_split_det_float(
-                    self.score_threshold,
-                    self.iou_threshold,
-                    outputs,
-                    boxes,
-                    scores,
-                    output_boxes,
-                    output_tracks,
-                )?;
-            }
+            ModelType::YoloDet { boxes } => Self::decode_yolo_det_float(
+                self.score_threshold,
+                self.iou_threshold,
+                outputs,
+                boxes,
+                output_boxes,
+                output_tracks,
+            ),
+            ModelType::YoloSegDet { boxes, protos } => Self::decode_yolo_segdet_float(
+                self.score_threshold,
+                self.iou_threshold,
+                outputs,
+                boxes,
+                protos,
+                output_boxes,
+                output_masks,
+                output_tracks,
+            ),
+            ModelType::YoloSplitDet { boxes, scores } => Self::decode_yolo_split_det_float(
+                self.score_threshold,
+                self.iou_threshold,
+                outputs,
+                boxes,
+                scores,
+                output_boxes,
+                output_tracks,
+            ),
             ModelType::YoloSplitSegDet {
                 boxes,
                 scores,
                 mask_coeff,
                 protos,
-            } => {
-                Self::decode_yolo_split_segdet_float(
-                    self.score_threshold,
-                    self.iou_threshold,
-                    outputs,
-                    boxes,
-                    scores,
-                    mask_coeff,
-                    protos,
-                    output_boxes,
-                    output_masks,
-                    output_tracks,
-                )?;
-            }
+            } => Self::decode_yolo_split_segdet_float(
+                self.score_threshold,
+                self.iou_threshold,
+                outputs,
+                boxes,
+                scores,
+                mask_coeff,
+                protos,
+                output_boxes,
+                output_masks,
+                output_tracks,
+            ),
+            ModelType::Custom {} => Err(DecoderError::NotSupported(
+                "Custom models must provide post processed boxes to decoder.decode_custom() function"
+                    .to_string(),
+            )),
         }
+    }
+
+    /// This function performs NMS on the provided detection boxes
+    /// # Examples
+    pub fn decode_custom(
+        &self,
+        postprocessed_boxes: Vec<DetectBox>,
+        output_boxes: &mut Vec<DetectBox>,
+    ) -> Result<(), DecoderError> {
+        let max_boxes = output_boxes.capacity();
+        let boxes = nms_float(self.iou_threshold, postprocessed_boxes);
+        output_boxes.clear();
+        output_boxes.extend(boxes.into_iter().take(max_boxes));
         Ok(())
     }
 
@@ -2406,6 +2448,10 @@ impl Decoder {
                 output_masks,
                 tracking,
             ),
+            ModelType::Custom {} => Err(DecoderError::NotSupported(
+                "Custom models must provide post processed boxes to decoder.decode_custom_tracked() function"
+                    .to_string(),
+            )),
         }
     }
 
@@ -2497,7 +2543,7 @@ impl Decoder {
                     output_boxes,
                     tracking,
                 )?;
-                Self::decode_modelpack_seg_float(outputs, segmentation, output_masks)?;
+                Self::decode_modelpack_seg_float(outputs, segmentation, output_masks)
             }
             ModelType::ModelPackSegDetSplit {
                 detection,
@@ -2511,85 +2557,103 @@ impl Decoder {
                     output_boxes,
                     tracking,
                 )?;
-                Self::decode_modelpack_seg_float(outputs, segmentation, output_masks)?;
+                Self::decode_modelpack_seg_float(outputs, segmentation, output_masks)
             }
-            ModelType::ModelPackDet { boxes, scores } => {
-                Self::decode_modelpack_det_float(
-                    self.score_threshold,
-                    self.iou_threshold,
-                    outputs,
-                    boxes,
-                    scores,
-                    output_boxes,
-                    tracking,
-                )?;
-            }
-            ModelType::ModelPackDetSplit { detection } => {
-                Self::decode_modelpack_det_split_float(
-                    self.score_threshold,
-                    self.iou_threshold,
-                    outputs,
-                    detection,
-                    output_boxes,
-                    tracking,
-                )?;
-            }
+            ModelType::ModelPackDet { boxes, scores } => Self::decode_modelpack_det_float(
+                self.score_threshold,
+                self.iou_threshold,
+                outputs,
+                boxes,
+                scores,
+                output_boxes,
+                tracking,
+            ),
+            ModelType::ModelPackDetSplit { detection } => Self::decode_modelpack_det_split_float(
+                self.score_threshold,
+                self.iou_threshold,
+                outputs,
+                detection,
+                output_boxes,
+                tracking,
+            ),
             ModelType::ModelPackSeg { segmentation } => {
-                Self::decode_modelpack_seg_float(outputs, segmentation, output_masks)?;
+                Self::decode_modelpack_seg_float(outputs, segmentation, output_masks)
             }
-            ModelType::YoloDet { boxes } => {
-                Self::decode_yolo_det_float(
-                    self.score_threshold,
-                    self.iou_threshold,
-                    outputs,
-                    boxes,
-                    output_boxes,
-                    tracking,
-                )?;
-            }
-            ModelType::YoloSegDet { boxes, protos } => {
-                Self::decode_yolo_segdet_float(
-                    self.score_threshold,
-                    self.iou_threshold,
-                    outputs,
-                    boxes,
-                    protos,
-                    output_boxes,
-                    output_masks,
-                    tracking,
-                )?;
-            }
-            ModelType::YoloSplitDet { boxes, scores } => {
-                Self::decode_yolo_split_det_float(
-                    self.score_threshold,
-                    self.iou_threshold,
-                    outputs,
-                    boxes,
-                    scores,
-                    output_boxes,
-                    tracking,
-                )?;
-            }
+            ModelType::YoloDet { boxes } => Self::decode_yolo_det_float(
+                self.score_threshold,
+                self.iou_threshold,
+                outputs,
+                boxes,
+                output_boxes,
+                tracking,
+            ),
+            ModelType::YoloSegDet { boxes, protos } => Self::decode_yolo_segdet_float(
+                self.score_threshold,
+                self.iou_threshold,
+                outputs,
+                boxes,
+                protos,
+                output_boxes,
+                output_masks,
+                tracking,
+            ),
+            ModelType::YoloSplitDet { boxes, scores } => Self::decode_yolo_split_det_float(
+                self.score_threshold,
+                self.iou_threshold,
+                outputs,
+                boxes,
+                scores,
+                output_boxes,
+                tracking,
+            ),
             ModelType::YoloSplitSegDet {
                 boxes,
                 scores,
                 mask_coeff,
                 protos,
-            } => {
-                Self::decode_yolo_split_segdet_float(
-                    self.score_threshold,
-                    self.iou_threshold,
-                    outputs,
-                    boxes,
-                    scores,
-                    mask_coeff,
-                    protos,
-                    output_boxes,
-                    output_masks,
-                    tracking,
-                )?;
-            }
+            } => Self::decode_yolo_split_segdet_float(
+                self.score_threshold,
+                self.iou_threshold,
+                outputs,
+                boxes,
+                scores,
+                mask_coeff,
+                protos,
+                output_boxes,
+                output_masks,
+                tracking,
+            ),
+            ModelType::Custom {} => Err(DecoderError::NotSupported(
+                "Custom models must provide post processed boxes to decoder.decode_custom_tracked() function"
+                    .to_string(),
+            )),
         }
+    }
+
+    pub fn decode_custom_tracked(
+        &mut self,
+        postprocessed_boxes: Vec<DetectBox>,
+        output_boxes: &mut Vec<DetectBox>,
+        output_tracks: &mut Vec<TrackInfo<DetectBox>>,
+        timestamp: u64,
+    ) -> Result<(), DecoderError> {
+        let tracker = match self.tracker.as_mut() {
+            Some(t) => t,
+            None => return Err(DecoderError::NoTracker),
+        };
+
+        let max_boxes = output_boxes.capacity();
+        let boxes = nms_float(self.iou_threshold, postprocessed_boxes);
+        output_boxes.clear();
+        output_boxes.extend(boxes.into_iter().take(max_boxes));
+
+        Self::update_tracker(
+            tracker.as_tracker_mut(),
+            output_boxes,
+            output_tracks,
+            timestamp,
+        );
+
         Ok(())
     }
 
@@ -2802,24 +2866,6 @@ impl Decoder {
             .quantization
             .map(Quantization::from)
             .unwrap_or_default();
-
-        // with_quantized!(boxes_tensor, b, {
-        //     with_quantized!(protos_tensor, p, {
-        //         let box_tensor = Self::swap_axes_if_needed(b, boxes.into());
-        //         let box_tensor = box_tensor.slice(s![0, .., ..]);
-
-        //         let protos_tensor = Self::swap_axes_if_needed(p, protos.into());
-        //         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-        //         decode_yolo_segdet_quant(
-        //             (box_tensor, quant_boxes),
-        //             (protos_tensor, quant_protos),
-        //             score_threshold,
-        //             iou_threshold,
-        //             output_boxes,
-        //             output_masks,
-        //         );
-        //     });
-        // });
 
         with_quantized!(boxes_tensor, b, {
             let box_tensor = Self::swap_axes_if_needed(b, boxes.into());

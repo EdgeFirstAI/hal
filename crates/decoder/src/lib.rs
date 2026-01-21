@@ -78,6 +78,7 @@ pub mod yolo;
 
 mod decoder;
 pub use decoder::*;
+pub use edgefirst_tracker::TrackInfo;
 
 pub use error::{DecoderError, DecoderResult};
 
@@ -2023,6 +2024,56 @@ mod decoder_tests {
             (&output_boxes, &output_boxes_f32),
             (&output_masks, &output_masks_f32),
         );
+    }
+
+    #[test]
+    fn test_custom_decoder() {
+        let decoder = DecoderBuilder::default()
+            .with_iou_threshold(0.2)
+            .with_config_custom()
+            .build()
+            .unwrap();
+
+        let postprocessed_boxes = vec![
+            DetectBox {
+                bbox: BoundingBox {
+                    xmin: 0.1,
+                    ymin: 0.1,
+                    xmax: 0.4,
+                    ymax: 0.4,
+                },
+                score: 0.9,
+                label: 0,
+            },
+            DetectBox {
+                bbox: BoundingBox {
+                    xmin: 0.2,
+                    ymin: 0.2,
+                    xmax: 0.5,
+                    ymax: 0.5,
+                },
+                score: 0.8,
+                label: 0,
+            },
+        ];
+        let mut output_boxes: Vec<DetectBox> = Vec::with_capacity(10);
+        decoder
+            .decode_custom(postprocessed_boxes, &mut output_boxes)
+            .unwrap();
+        assert_eq!(output_boxes.len(), 1);
+        assert!(output_boxes[0].equal_within_delta(
+            &DetectBox {
+                bbox: BoundingBox {
+                    xmin: 0.1,
+                    ymin: 0.1,
+                    xmax: 0.4,
+                    ymax: 0.4,
+                },
+                score: 0.9,
+                label: 0,
+            },
+            1e-6
+        ));
     }
 
     #[test]
