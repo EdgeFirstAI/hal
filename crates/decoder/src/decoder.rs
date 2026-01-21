@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-use ndarray::{Array3, ArrayViewD, s};
+use ndarray::{Array3, ArrayView, ArrayViewD, Dimension, s};
 use ndarray_stats::QuantileExt;
 use num_traits::{AsPrimitive, Float};
 use serde::{Deserialize, Serialize};
@@ -64,7 +64,7 @@ impl ConfigOutput {
     /// # use edgefirst_decoder::{configs, ConfigOutput};
     /// let detection_config = configs::Detection {
     ///     anchors: None,
-    ///     decoder: configs::DecoderType::Yolov8,
+    ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: None,
     ///     shape: vec![1, 84, 8400],
     ///     channels_first: false,
@@ -91,13 +91,13 @@ impl ConfigOutput {
     /// # use edgefirst_decoder::{configs, ConfigOutput};
     /// let detection_config = configs::Detection {
     ///     anchors: None,
-    ///     decoder: configs::DecoderType::Yolov8,
+    ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: None,
     ///     shape: vec![1, 84, 8400],
     ///     channels_first: false,
     /// };
     /// let output = ConfigOutput::Detection(detection_config);
-    /// assert_eq!(output.decoder(), &configs::DecoderType::Yolov8);
+    /// assert_eq!(output.decoder(), &configs::DecoderType::Ultralytics);
     /// ```
     pub fn decoder(&self) -> &configs::DecoderType {
         match self {
@@ -118,7 +118,7 @@ impl ConfigOutput {
     /// # use edgefirst_decoder::{configs, ConfigOutput};
     /// let detection_config = configs::Detection {
     ///    anchors: None,
-    ///   decoder: configs::DecoderType::Yolov8,
+    ///   decoder: configs::DecoderType::Ultralytics,
     ///   quantization: Some(configs::QuantTuple(0.012345, 26)),
     ///  shape: vec![1, 84, 8400],
     ///   channels_first: false,
@@ -147,6 +147,12 @@ pub mod configs {
     impl From<QuantTuple> for (f32, i32) {
         fn from(value: QuantTuple) -> Self {
             (value.0, value.1)
+        }
+    }
+
+    impl From<(f32, i32)> for QuantTuple {
+        fn from(value: (f32, i32)) -> Self {
+            QuantTuple(value.0, value.1)
         }
     }
 
@@ -219,8 +225,8 @@ pub mod configs {
     pub enum DecoderType {
         #[serde(rename = "modelpack")]
         ModelPack,
-        #[serde(rename = "yolov8")]
-        Yolov8,
+        #[serde(rename = "ultralytics")]
+        Ultralytics,
     }
 
     #[derive(Debug, Clone, PartialEq)]
@@ -248,7 +254,7 @@ pub mod configs {
             boxes: Detection,
         },
         YoloSegDet {
-            boxes: Segmentation,
+            boxes: Detection,
             protos: Protos,
         },
         YoloSplitDet {
@@ -422,7 +428,7 @@ impl DecoderBuilder {
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_yolo_det(configs::Detection {
     ///         anchors: None,
-    ///         decoder: configs::DecoderType::Yolov8,
+    ///         decoder: configs::DecoderType::Ultralytics,
     ///         quantization: Some(configs::QuantTuple(0.012345, 26)),
     ///         shape: vec![1, 84, 8400],
     ///         channels_first: false,
@@ -448,13 +454,13 @@ impl DecoderBuilder {
     /// # use edgefirst_decoder::{ DecoderBuilder, DecoderResult, configs };
     /// # fn main() -> DecoderResult<()> {
     /// let boxes_config = configs::Boxes {
-    ///     decoder: configs::DecoderType::Yolov8,
+    ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: Some(configs::QuantTuple(0.012345, 26)),
     ///     shape: vec![1, 4, 8400],
     ///     channels_first: false,
     /// };
     /// let scores_config = configs::Scores {
-    ///     decoder: configs::DecoderType::Yolov8,
+    ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
     ///     shape: vec![1, 80, 8400],
     ///     channels_first: false,
@@ -484,14 +490,15 @@ impl DecoderBuilder {
     /// ```rust
     /// # use edgefirst_decoder::{ DecoderBuilder, DecoderResult, configs };
     /// # fn main() -> DecoderResult<()> {
-    /// let seg_config = configs::Segmentation {
-    ///     decoder: configs::DecoderType::Yolov8,
+    /// let seg_config = configs::Detection {
+    ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: Some(configs::QuantTuple(0.012345, 26)),
     ///     shape: vec![1, 116, 8400],
     ///     channels_first: false,
+    ///     anchors: None,
     /// };
     /// let protos_config = configs::Protos {
-    ///     decoder: configs::DecoderType::Yolov8,
+    ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
     ///     shape: vec![1, 160, 160, 32],
     ///     channels_first: false,
@@ -504,14 +511,11 @@ impl DecoderBuilder {
     /// ```
     pub fn with_config_yolo_segdet(
         mut self,
-        boxes: configs::Segmentation,
+        boxes: configs::Detection,
         protos: configs::Protos,
     ) -> Self {
         let config = ConfigOutputs {
-            outputs: vec![
-                ConfigOutput::Segmentation(boxes),
-                ConfigOutput::Protos(protos),
-            ],
+            outputs: vec![ConfigOutput::Detection(boxes), ConfigOutput::Protos(protos)],
         };
         self.config_src.replace(ConfigSource::Config(config));
         self
@@ -525,25 +529,25 @@ impl DecoderBuilder {
     /// # use edgefirst_decoder::{ DecoderBuilder, DecoderResult, configs };
     /// # fn main() -> DecoderResult<()> {
     /// let boxes_config = configs::Boxes {
-    ///     decoder: configs::DecoderType::Yolov8,
+    ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: Some(configs::QuantTuple(0.012345, 26)),
     ///     shape: vec![1, 4, 8400],
     ///     channels_first: false,
     /// };
     /// let scores_config = configs::Scores {
-    ///     decoder: configs::DecoderType::Yolov8,
+    ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: Some(configs::QuantTuple(0.012345, 14)),
     ///     shape: vec![1, 80, 8400],
     ///     channels_first: false,
     /// };
     /// let mask_config = configs::MaskCoefficients {
-    ///     decoder: configs::DecoderType::Yolov8,
+    ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: Some(configs::QuantTuple(0.0064123, 125)),
     ///     shape: vec![1, 32, 8400],
     ///     channels_first: false,
     /// };
     /// let protos_config = configs::Protos {
-    ///     decoder: configs::DecoderType::Yolov8,
+    ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
     ///     shape: vec![1, 160, 160, 32],
     ///     channels_first: false,
@@ -669,7 +673,7 @@ impl DecoderBuilder {
     /// let scores_config = configs::Scores {
     ///     decoder: configs::DecoderType::ModelPack,
     ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
-    ///     shape: vec![1, 8400, 3],
+    ///     shape: vec![1, 8400, 2],
     ///     channels_first: false,
     /// };
     /// let seg_config = configs::Segmentation {
@@ -733,7 +737,7 @@ impl DecoderBuilder {
     /// let seg_config = configs::Segmentation {
     ///     decoder: configs::DecoderType::ModelPack,
     ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
-    ///     shape: vec![1, 640, 640, 1],
+    ///     shape: vec![1, 640, 640, 2],
     ///     channels_first: false,
     /// };
     /// let decoder = DecoderBuilder::new()
@@ -862,7 +866,7 @@ impl DecoderBuilder {
         for c in &configs {
             match c.decoder() {
                 DecoderType::ModelPack => modelpack = true,
-                DecoderType::Yolov8 => yolo = true,
+                DecoderType::Ultralytics => yolo = true,
             }
         }
         match (modelpack, yolo) {
@@ -879,7 +883,6 @@ impl DecoderBuilder {
 
     fn get_model_type_yolo(configs: Vec<ConfigOutput>) -> Result<ModelType, DecoderError> {
         let mut boxes = None;
-        let mut seg_boxes = None;
         let mut protos = None;
         let mut split_boxes = None;
         let mut split_scores = None;
@@ -887,15 +890,10 @@ impl DecoderBuilder {
         for c in configs {
             match c {
                 ConfigOutput::Detection(detection) => boxes = Some(detection),
-                ConfigOutput::Segmentation(segmentation) => {
-                    if segmentation.shape.len() == 3 {
-                        seg_boxes = Some(segmentation)
-                    } else {
-                        return Err(DecoderError::InvalidConfig(format!(
-                            "Invalid Yolo Segmentation shape {:?}",
-                            segmentation.shape
-                        )));
-                    }
+                ConfigOutput::Segmentation(_) => {
+                    return Err(DecoderError::InvalidConfig(
+                        "Invalid Segmentation output with Yolo decoder".to_string(),
+                    ));
                 }
                 ConfigOutput::Protos(protos_) => protos = Some(protos_),
                 ConfigOutput::Mask(_) => {
@@ -909,14 +907,14 @@ impl DecoderBuilder {
             }
         }
 
-        if let Some(boxes) = seg_boxes
-            && let Some(protos) = protos
-        {
-            Self::verify_yolo_seg_det(&boxes, &protos)?;
-            Ok(ModelType::YoloSegDet { boxes, protos })
-        } else if let Some(boxes) = boxes {
-            Self::verify_yolo_det(&boxes)?;
-            Ok(ModelType::YoloDet { boxes })
+        if let Some(boxes) = boxes {
+            if let Some(protos) = protos {
+                Self::verify_yolo_seg_det(&boxes, &protos)?;
+                Ok(ModelType::YoloSegDet { boxes, protos })
+            } else {
+                Self::verify_yolo_det(&boxes)?;
+                Ok(ModelType::YoloDet { boxes })
+            }
         } else if let Some(boxes) = split_boxes
             && let Some(scores) = split_scores
         {
@@ -952,13 +950,13 @@ impl DecoderBuilder {
     }
 
     fn verify_yolo_seg_det(
-        segmentation: &configs::Segmentation,
+        detection: &configs::Detection,
         protos: &configs::Protos,
     ) -> Result<(), DecoderError> {
-        if segmentation.shape.len() != 3 {
+        if detection.shape.len() != 3 {
             return Err(DecoderError::InvalidConfig(format!(
-                "Invalid Yolo Segmentation shape {:?}",
-                segmentation.shape
+                "Invalid Yolo Detection shape {:?}",
+                detection.shape
             )));
         }
         if protos.shape.len() != 4 {
@@ -968,10 +966,10 @@ impl DecoderBuilder {
             )));
         }
 
-        let seg_channels = if segmentation.channels_first {
-            segmentation.shape[2]
+        let seg_channels = if detection.channels_first {
+            detection.shape[2]
         } else {
-            segmentation.shape[1]
+            detection.shape[1]
         };
         let protos_channels = if protos.channels_first {
             protos.shape[1]
@@ -981,7 +979,7 @@ impl DecoderBuilder {
 
         if protos_channels + 4 >= seg_channels {
             return Err(DecoderError::InvalidConfig(format!(
-                "Yolo Protos channels {} incompatible with Segmentation channels {}",
+                "Yolo Protos channels {} incompatible with Detection channels {}",
                 protos_channels, seg_channels
             )));
         }
@@ -1256,11 +1254,6 @@ impl DecoderBuilder {
 
     fn verify_modelpack_split_det(boxes: &[configs::Detection]) -> Result<usize, DecoderError> {
         let mut num_classes = None;
-        if boxes.is_empty() {
-            return Err(DecoderError::InvalidConfig(
-                "ModelPack Split Detection has no configurations".to_string(),
-            ));
-        }
         for b in boxes {
             let Some(num_anchors) = b.anchors.as_ref().map(|a| a.len()) else {
                 return Err(DecoderError::InvalidConfig(
@@ -1340,7 +1333,7 @@ impl DecoderBuilder {
                 segmentation.shape[3]
             };
 
-            if seg_channels != classes {
+            if seg_channels != classes + 1 {
                 return Err(DecoderError::InvalidConfig(format!(
                     "ModelPack Segmentation channels {} incompatible with number of classes {}",
                     seg_channels, classes
@@ -1368,39 +1361,57 @@ pub enum ArrayViewDQuantized<'a> {
     Int32(ArrayViewD<'a, i32>),
 }
 
-impl<'a> From<ArrayViewD<'a, u8>> for ArrayViewDQuantized<'a> {
-    fn from(arr: ArrayViewD<'a, u8>) -> Self {
-        Self::UInt8(arr)
+impl<'a, D> From<ArrayView<'a, u8, D>> for ArrayViewDQuantized<'a>
+where
+    D: Dimension,
+{
+    fn from(arr: ArrayView<'a, u8, D>) -> Self {
+        Self::UInt8(arr.into_dyn())
     }
 }
 
-impl<'a> From<ArrayViewD<'a, i8>> for ArrayViewDQuantized<'a> {
-    fn from(arr: ArrayViewD<'a, i8>) -> Self {
-        Self::Int8(arr)
+impl<'a, D> From<ArrayView<'a, i8, D>> for ArrayViewDQuantized<'a>
+where
+    D: Dimension,
+{
+    fn from(arr: ArrayView<'a, i8, D>) -> Self {
+        Self::Int8(arr.into_dyn())
     }
 }
 
-impl<'a> From<ArrayViewD<'a, u16>> for ArrayViewDQuantized<'a> {
-    fn from(arr: ArrayViewD<'a, u16>) -> Self {
-        Self::UInt16(arr)
+impl<'a, D> From<ArrayView<'a, u16, D>> for ArrayViewDQuantized<'a>
+where
+    D: Dimension,
+{
+    fn from(arr: ArrayView<'a, u16, D>) -> Self {
+        Self::UInt16(arr.into_dyn())
     }
 }
 
-impl<'a> From<ArrayViewD<'a, i16>> for ArrayViewDQuantized<'a> {
-    fn from(arr: ArrayViewD<'a, i16>) -> Self {
-        Self::Int16(arr)
+impl<'a, D> From<ArrayView<'a, i16, D>> for ArrayViewDQuantized<'a>
+where
+    D: Dimension,
+{
+    fn from(arr: ArrayView<'a, i16, D>) -> Self {
+        Self::Int16(arr.into_dyn())
     }
 }
 
-impl<'a> From<ArrayViewD<'a, u32>> for ArrayViewDQuantized<'a> {
-    fn from(arr: ArrayViewD<'a, u32>) -> Self {
-        Self::UInt32(arr)
+impl<'a, D> From<ArrayView<'a, u32, D>> for ArrayViewDQuantized<'a>
+where
+    D: Dimension,
+{
+    fn from(arr: ArrayView<'a, u32, D>) -> Self {
+        Self::UInt32(arr.into_dyn())
     }
 }
 
-impl<'a> From<ArrayViewD<'a, i32>> for ArrayViewDQuantized<'a> {
-    fn from(arr: ArrayViewD<'a, i32>) -> Self {
-        Self::Int32(arr)
+impl<'a, D> From<ArrayView<'a, i32, D>> for ArrayViewDQuantized<'a>
+where
+    D: Dimension,
+{
+    fn from(arr: ArrayView<'a, i32, D>) -> Self {
+        Self::Int32(arr.into_dyn())
     }
 }
 
@@ -1620,7 +1631,7 @@ impl Decoder {
     /// #   let model_output_f64 = Array3::from_shape_vec((1, 84, 8400), out_dequant)?.into_dyn();
     ///    let decoder = DecoderBuilder::default()
     ///     .with_config_yolo_det(Detection {
-    ///         decoder: DecoderType::Yolov8,
+    ///         decoder: DecoderType::Ultralytics,
     ///         quantization: None,
     ///         shape: vec![1, 84, 8400],
     ///         channels_first: false,
@@ -1739,14 +1750,10 @@ impl Decoder {
         with_quantized!(boxes_tensor, b, {
             with_quantized!(scores_tensor, s, {
                 let mut boxes_tensor = b.slice(s![0, .., 0, ..]);
-                if boxes.channels_first {
-                    boxes_tensor.swap_axes(0, 1);
-                };
+                Self::swap_axes_if_needed(&mut boxes_tensor, boxes.channels_first);
 
                 let mut scores_tensor = s.slice(s![0, .., ..]);
-                if scores.channels_first {
-                    scores_tensor.swap_axes(0, 1);
-                };
+                Self::swap_axes_if_needed(&mut scores_tensor, scores.channels_first);
                 decode_modelpack_det(
                     (boxes_tensor, quant_boxes),
                     (scores_tensor, quant_scores),
@@ -1771,10 +1778,7 @@ impl Decoder {
         macro_rules! modelpack_seg {
             ($seg:expr) => {{
                 let mut seg = $seg.slice(s![0, .., .., ..]);
-                if segmentation.channels_first {
-                    seg.swap_axes(0, 1);
-                    seg.swap_axes(1, 2);
-                }
+                Self::swap_axes_if_needed(&mut seg, segmentation.channels_first);
                 seg
             }};
         }
@@ -1839,10 +1843,7 @@ impl Decoder {
         macro_rules! dequant_output {
             ($det_tensor:expr, $detection:expr) => {{
                 let mut det_tensor = $det_tensor.slice(s![0, .., .., ..]);
-                if $detection.channels_first {
-                    det_tensor.swap_axes(0, 1);
-                    det_tensor.swap_axes(1, 2);
-                }
+                Self::swap_axes_if_needed(&mut det_tensor, $detection.channels_first);
                 if let Some(q) = $detection.quantization {
                     dequantize_ndarray(det_tensor, q.into())
                 } else {
@@ -1891,6 +1892,7 @@ impl Decoder {
             if boxes.channels_first {
                 boxes_tensor.swap_axes(0, 1);
             };
+            Self::swap_axes_if_needed(&mut boxes_tensor, boxes.channels_first);
             decode_yolo_det(
                 (boxes_tensor, quant_boxes),
                 self.score_threshold,
@@ -1905,7 +1907,7 @@ impl Decoder {
     fn decode_yolo_segdet_quantized(
         &self,
         outputs: &[ArrayViewDQuantized],
-        boxes: &configs::Segmentation,
+        boxes: &configs::Detection,
         protos: &configs::Protos,
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
@@ -1927,15 +1929,10 @@ impl Decoder {
         with_quantized!(boxes_tensor, b, {
             with_quantized!(protos_tensor, p, {
                 let mut box_tensor = b.slice(s![0, .., ..]);
-                if boxes.channels_first {
-                    box_tensor.swap_axes(0, 1);
-                }
+                Self::swap_axes_if_needed(&mut box_tensor, boxes.channels_first);
 
                 let mut protos_tensor = p.slice(s![0, .., .., ..]);
-                if protos.channels_first {
-                    protos_tensor.swap_axes(0, 1);
-                    protos_tensor.swap_axes(1, 2);
-                }
+                Self::swap_axes_if_needed(&mut protos_tensor, protos.channels_first);
 
                 decode_yolo_segdet_quant(
                     (box_tensor, quant_boxes),
@@ -1974,14 +1971,10 @@ impl Decoder {
         with_quantized!(boxes_tensor, b, {
             with_quantized!(scores_tensor, s, {
                 let mut boxes_tensor = b.slice(s![0, .., ..]);
-                if boxes.channels_first {
-                    boxes_tensor.swap_axes(0, 1);
-                };
+                Self::swap_axes_if_needed(&mut boxes_tensor, boxes.channels_first);
 
                 let mut scores_tensor = s.slice(s![0, .., ..]);
-                if scores.channels_first {
-                    scores_tensor.swap_axes(0, 1);
-                };
+                Self::swap_axes_if_needed(&mut scores_tensor, scores.channels_first);
                 decode_yolo_split_det_quant(
                     (boxes_tensor, quant_boxes),
                     (scores_tensor, quant_scores),
@@ -2043,15 +2036,10 @@ impl Decoder {
         let boxes = with_quantized!(boxes_tensor, b, {
             with_quantized!(scores_tensor, s, {
                 let mut boxes_tensor = b.slice(s![0, .., ..]);
-                if boxes.channels_first {
-                    boxes_tensor.swap_axes(0, 1);
-                };
+                Self::swap_axes_if_needed(&mut boxes_tensor, boxes.channels_first);
 
                 let mut scores_tensor = s.slice(s![0, .., ..]);
-                if scores.channels_first {
-                    scores_tensor.swap_axes(0, 1);
-                };
-
+                Self::swap_axes_if_needed(&mut scores_tensor, scores.channels_first);
                 impl_yolo_split_segdet_quant_get_boxes::<XYWH, _, _>(
                     (boxes_tensor, quant_boxes),
                     (scores_tensor, quant_scores),
@@ -2065,15 +2053,10 @@ impl Decoder {
         with_quantized!(mask_tensor, m, {
             with_quantized!(protos_tensor, p, {
                 let mut mask_tensor = m.slice(s![0, .., ..]);
-                if mask_coeff.channels_first {
-                    mask_tensor.swap_axes(0, 1);
-                };
+                Self::swap_axes_if_needed(&mut mask_tensor, mask_coeff.channels_first);
 
                 let mut protos_tensor = p.slice(s![0, .., .., ..]);
-                if protos.channels_first {
-                    protos_tensor.swap_axes(0, 1);
-                    protos_tensor.swap_axes(1, 2);
-                }
+                Self::swap_axes_if_needed(&mut protos_tensor, protos.channels_first);
 
                 impl_yolo_split_segdet_quant_process_masks::<_, _>(
                     boxes,
@@ -2138,10 +2121,7 @@ impl Decoder {
     {
         let (seg, _) = Self::find_outputs_with_shape(&segmentation.shape, outputs, &[])?;
         let mut seg = seg.slice(s![0, .., .., ..]);
-        if segmentation.channels_first {
-            seg.swap_axes(0, 1);
-            seg.swap_axes(1, 2);
-        };
+        Self::swap_axes_if_needed(&mut seg, segmentation.channels_first);
 
         let u8_max = 255.0_f32.as_();
         let max = *seg.max().unwrap_or(&u8_max);
@@ -2170,15 +2150,11 @@ impl Decoder {
     {
         let (boxes_tensor, ind) = Self::find_outputs_with_shape(&boxes.shape, outputs, &[])?;
         let mut boxes_tensor = boxes_tensor.slice(s![0, .., 0, ..]);
-        if boxes.channels_first {
-            boxes_tensor.swap_axes(0, 1);
-        };
+        Self::swap_axes_if_needed(&mut boxes_tensor, boxes.channels_first);
 
         let (scores_tensor, _) = Self::find_outputs_with_shape(&scores.shape, outputs, &[ind])?;
         let mut scores_tensor = scores_tensor.slice(s![0, .., ..]);
-        if scores.channels_first {
-            scores_tensor.swap_axes(0, 1);
-        };
+        Self::swap_axes_if_needed(&mut scores_tensor, scores.channels_first);
 
         decode_modelpack_float(
             boxes_tensor,
@@ -2202,9 +2178,7 @@ impl Decoder {
     {
         let (boxes_tensor, _) = Self::find_outputs_with_shape(&boxes.shape, outputs, &[])?;
         let mut boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
-        if boxes.channels_first {
-            boxes_tensor.swap_axes(0, 1);
-        };
+        Self::swap_axes_if_needed(&mut boxes_tensor, boxes.channels_first);
 
         decode_yolo_det_float(
             boxes_tensor,
@@ -2218,7 +2192,7 @@ impl Decoder {
     fn decode_yolo_segdet_float<T>(
         &self,
         outputs: &[ArrayViewD<T>],
-        boxes: &configs::Segmentation,
+        boxes: &configs::Detection,
         protos: &configs::Protos,
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
@@ -2229,16 +2203,11 @@ impl Decoder {
     {
         let (boxes_tensor, ind) = Self::find_outputs_with_shape(&boxes.shape, outputs, &[])?;
         let mut boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
-        if boxes.channels_first {
-            boxes_tensor.swap_axes(0, 1);
-        };
+        Self::swap_axes_if_needed(&mut boxes_tensor, boxes.channels_first);
 
         let (protos_tensor, _) = Self::find_outputs_with_shape(&protos.shape, outputs, &[ind])?;
         let mut protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-        if protos.channels_first {
-            protos_tensor.swap_axes(0, 1);
-            protos_tensor.swap_axes(1, 2);
-        };
+        Self::swap_axes_if_needed(&mut protos_tensor, protos.channels_first);
 
         decode_yolo_segdet_float(
             boxes_tensor,
@@ -2264,15 +2233,11 @@ impl Decoder {
     {
         let (boxes_tensor, ind) = Self::find_outputs_with_shape(&boxes.shape, outputs, &[])?;
         let mut boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
-        if boxes.channels_first {
-            boxes_tensor.swap_axes(0, 1);
-        };
+        Self::swap_axes_if_needed(&mut boxes_tensor, boxes.channels_first);
 
         let (scores_tensor, _) = Self::find_outputs_with_shape(&scores.shape, outputs, &[ind])?;
         let mut scores_tensor = scores_tensor.slice(s![0, .., ..]);
-        if scores.channels_first {
-            scores_tensor.swap_axes(0, 1);
-        };
+        Self::swap_axes_if_needed(&mut scores_tensor, scores.channels_first);
 
         decode_yolo_split_det_float(
             boxes_tensor,
@@ -2302,31 +2267,22 @@ impl Decoder {
         let mut skip = vec![];
         let (boxes_tensor, ind) = Self::find_outputs_with_shape(&boxes.shape, outputs, &skip)?;
         let mut boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
-        if boxes.channels_first {
-            boxes_tensor.swap_axes(0, 1);
-        };
+        Self::swap_axes_if_needed(&mut boxes_tensor, boxes.channels_first);
         skip.push(ind);
 
         let (scores_tensor, ind) = Self::find_outputs_with_shape(&scores.shape, outputs, &skip)?;
         let mut scores_tensor = scores_tensor.slice(s![0, .., ..]);
-        if scores.channels_first {
-            scores_tensor.swap_axes(0, 1);
-        };
+        Self::swap_axes_if_needed(&mut scores_tensor, scores.channels_first);
         skip.push(ind);
 
         let (mask_tensor, ind) = Self::find_outputs_with_shape(&mask_coeff.shape, outputs, &skip)?;
         let mut mask_tensor = mask_tensor.slice(s![0, .., ..]);
-        if mask_coeff.channels_first {
-            mask_tensor.swap_axes(0, 1);
-        };
+        Self::swap_axes_if_needed(&mut mask_tensor, mask_coeff.channels_first);
         skip.push(ind);
 
         let (protos_tensor, _) = Self::find_outputs_with_shape(&protos.shape, outputs, &skip)?;
         let mut protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-        if protos.channels_first {
-            protos_tensor.swap_axes(0, 1);
-            protos_tensor.swap_axes(1, 2);
-        }
+        Self::swap_axes_if_needed(&mut protos_tensor, protos.channels_first);
 
         decode_yolo_split_segdet_float(
             boxes_tensor,
@@ -2403,6 +2359,19 @@ impl Decoder {
         )))
     }
 
+    fn swap_axes_if_needed<T, D: Dimension>(array: &mut ArrayView<T, D>, channels_first: bool) {
+        if channels_first {
+            match array.ndim() {
+                2 => array.swap_axes(0, 1),
+                3 => {
+                    array.swap_axes(0, 1);
+                    array.swap_axes(1, 2);
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn match_outputs_to_detect_quantized<'a, 'b>(
         configs: &[configs::Detection],
         outputs: &'a [ArrayViewDQuantized<'b>],
@@ -2425,5 +2394,906 @@ impl Decoder {
             }
         }
         Ok(new_output_order)
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod decoder_builder_tests {
+    use super::*;
+
+    #[test]
+    fn test_decoder_builder_no_config() {
+        use crate::DecoderBuilder;
+        let result = DecoderBuilder::default().build();
+        assert!(matches!(result, Err(DecoderError::NoConfig)));
+    }
+
+    #[test]
+    fn test_decoder_builder_empty_config() {
+        use crate::DecoderBuilder;
+        let result = DecoderBuilder::default()
+            .with_config(ConfigOutputs { outputs: vec![] })
+            .build();
+        assert!(
+            matches!(result, Err(DecoderError::InvalidConfig(s)) if s == "No outputs found in config")
+        );
+    }
+
+    #[test]
+    fn test_malformed_config_yaml() {
+        let malformed_yaml = "
+        model_type: yolov8_det
+        outputs:
+          - shape: [1, 84, 8400]
+            channels_first: false
+        "
+        .to_owned();
+        let result = DecoderBuilder::new()
+            .with_config_yaml_str(malformed_yaml)
+            .build();
+        assert!(matches!(result, Err(DecoderError::Yaml(_))));
+    }
+
+    #[test]
+    fn test_malformed_config_json() {
+        let malformed_yaml = "
+        {
+            \"model_type\": \"yolov8_det\",
+            \"outputs\": [
+                {
+                    \"shape\": [1, 84, 8400]
+                    \"channels_first\": false
+                }
+            ]
+        }"
+        .to_owned();
+        let result = DecoderBuilder::new()
+            .with_config_json_str(malformed_yaml)
+            .build();
+        assert!(matches!(result, Err(DecoderError::Json(_))));
+    }
+
+    #[test]
+    fn test_modelpack_and_yolo_config_error() {
+        let result = DecoderBuilder::new()
+            .with_config_modelpack_det(
+                configs::Boxes {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 4, 8400],
+                    channels_first: false,
+                    quantization: None,
+                },
+                configs::Scores {
+                    decoder: configs::DecoderType::ModelPack,
+                    shape: vec![1, 80, 8400],
+                    channels_first: false,
+                    quantization: None,
+                },
+            )
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s == "Both ModelPack and Yolo outputs found in config"
+        ));
+    }
+
+    #[test]
+    fn test_yolo_invalid_seg_shape() {
+        let result = DecoderBuilder::new()
+            .with_config_yolo_segdet(
+                configs::Detection {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 85, 8400, 1], // Invalid shape
+                    channels_first: false,
+                    quantization: None,
+                    anchors: None,
+                },
+                configs::Protos {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 32, 160, 160],
+                    channels_first: true,
+                    quantization: None,
+                },
+            )
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("Invalid Yolo Detection shape")
+        ));
+    }
+
+    #[test]
+    fn test_yolo_invalid_mask() {
+        let result = DecoderBuilder::new()
+            .with_config(ConfigOutputs {
+                outputs: vec![ConfigOutput::Mask(configs::Mask {
+                    channels_first: false,
+                    shape: vec![1, 160, 160, 1],
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: None,
+                })],
+            })
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("Invalid Mask output with Yolo decoder")
+        ));
+    }
+
+    #[test]
+    fn test_yolo_invalid_outputs() {
+        let result = DecoderBuilder::new()
+            .with_config(ConfigOutputs {
+                outputs: vec![ConfigOutput::Segmentation(configs::Segmentation {
+                    channels_first: false,
+                    shape: vec![1, 84, 8400],
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: None,
+                })],
+            })
+            .build();
+
+        assert!(
+            matches!(result, Err(DecoderError::InvalidConfig(s)) if s == "Invalid Segmentation output with Yolo decoder")
+        );
+    }
+
+    #[test]
+    fn test_yolo_invalid_det() {
+        let result = DecoderBuilder::new()
+            .with_config_yolo_det(configs::Detection {
+                anchors: None,
+                decoder: DecoderType::Ultralytics,
+                quantization: None,
+                shape: vec![1, 84, 8400, 1], // Invalid shape
+                channels_first: false,
+            })
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("Invalid Yolo Detection shape")));
+    }
+
+    #[test]
+    fn test_yolo_invalid_segdet() {
+        let result = DecoderBuilder::new()
+            .with_config_yolo_segdet(
+                configs::Detection {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 85, 8400, 1], // Invalid shape
+                    channels_first: false,
+                    quantization: None,
+                    anchors: None,
+                },
+                configs::Protos {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 32, 160, 160],
+                    channels_first: true,
+                    quantization: None,
+                },
+            )
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("Invalid Yolo Detection shape")));
+
+        let result = DecoderBuilder::new()
+            .with_config_yolo_segdet(
+                configs::Detection {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 85, 8400],
+                    channels_first: false,
+                    quantization: None,
+                    anchors: None,
+                },
+                configs::Protos {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 32, 160, 160, 1], // Invalid shape
+                    channels_first: true,
+                    quantization: None,
+                },
+            )
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("Invalid Yolo Protos shape")));
+
+        let result = DecoderBuilder::new()
+            .with_config_yolo_segdet(
+                configs::Detection {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 8400, 36], // too few classes
+                    channels_first: true,
+                    quantization: None,
+                    anchors: None,
+                },
+                configs::Protos {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 32, 160, 160],
+                    channels_first: true,
+                    quantization: None,
+                },
+            )
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s == "Yolo Protos channels 32 incompatible with Detection channels 36"));
+    }
+
+    #[test]
+    fn test_yolo_invalid_split_det() {
+        let result = DecoderBuilder::new()
+            .with_config_yolo_split_det(
+                configs::Boxes {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 4, 8400, 1], // Invalid shape
+                    channels_first: false,
+                    quantization: None,
+                },
+                configs::Scores {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 80, 8400],
+                    channels_first: false,
+                    quantization: None,
+                },
+            )
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("Invalid Yolo Split Boxes shape")));
+
+        let result = DecoderBuilder::new()
+            .with_config_yolo_split_det(
+                configs::Boxes {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 4, 8400],
+                    channels_first: false,
+                    quantization: None,
+                },
+                configs::Scores {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 80, 8400, 1], // Invalid shape
+                    channels_first: false,
+                    quantization: None,
+                },
+            )
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("Invalid Yolo Split Scores shape")));
+
+        let result = DecoderBuilder::new()
+            .with_config_yolo_split_det(
+                configs::Boxes {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 8400, 4],
+                    channels_first: true,
+                    quantization: None,
+                },
+                configs::Scores {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 8400 + 1, 80], // Invalid number of boxes
+                    channels_first: true,
+                    quantization: None,
+                },
+            )
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("Yolo Split Detection Boxes num 8400 incompatible with Scores num 8401")));
+
+        let result = DecoderBuilder::new()
+            .with_config_yolo_split_det(
+                configs::Boxes {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 5, 8400], // Invalid boxes dimensions
+                    channels_first: false,
+                    quantization: None,
+                },
+                configs::Scores {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 80, 8400],
+                    channels_first: false,
+                    quantization: None,
+                },
+            )
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("Invalid Yolo Split Boxes dimension 5, expected 4")));
+    }
+
+    #[test]
+    fn test_yolo_invalid_split_segdet() {
+        let result = DecoderBuilder::new()
+            .with_config_yolo_split_segdet(
+                configs::Boxes {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 8400, 4, 1],
+                    channels_first: true,
+                    quantization: None,
+                },
+                configs::Scores {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 8400, 80],
+                    channels_first: true,
+                    quantization: None,
+                },
+                configs::MaskCoefficients {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 8400, 32],
+                    channels_first: true,
+                    quantization: None,
+                },
+                configs::Protos {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 32, 160, 160],
+                    channels_first: true,
+                    quantization: None,
+                },
+            )
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("Invalid Yolo Split Boxes shape")));
+
+        let result = DecoderBuilder::new()
+            .with_config_yolo_split_segdet(
+                configs::Boxes {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 8400, 4],
+                    channels_first: true,
+                    quantization: None,
+                },
+                configs::Scores {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 8400, 80, 1],
+                    channels_first: true,
+                    quantization: None,
+                },
+                configs::MaskCoefficients {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 8400, 32],
+                    channels_first: true,
+                    quantization: None,
+                },
+                configs::Protos {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 32, 160, 160],
+                    channels_first: true,
+                    quantization: None,
+                },
+            )
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("Invalid Yolo Split Scores shape")));
+
+        let result = DecoderBuilder::new()
+            .with_config_yolo_split_segdet(
+                configs::Boxes {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 8400, 4],
+                    channels_first: true,
+                    quantization: None,
+                },
+                configs::Scores {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 8400, 80],
+                    channels_first: true,
+                    quantization: None,
+                },
+                configs::MaskCoefficients {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 8400, 32, 1],
+                    channels_first: true,
+                    quantization: None,
+                },
+                configs::Protos {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 32, 160, 160],
+                    channels_first: true,
+                    quantization: None,
+                },
+            )
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("Invalid Yolo Split Mask Coefficients shape")));
+
+        let result = DecoderBuilder::new()
+            .with_config_yolo_split_segdet(
+                configs::Boxes {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 8400, 4],
+                    channels_first: true,
+                    quantization: None,
+                },
+                configs::Scores {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 8400, 80],
+                    channels_first: true,
+                    quantization: None,
+                },
+                configs::MaskCoefficients {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 8400, 32],
+                    channels_first: true,
+                    quantization: None,
+                },
+                configs::Protos {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 32, 160, 160, 1],
+                    channels_first: true,
+                    quantization: None,
+                },
+            )
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("Invalid Yolo Protos shape")));
+
+        let result = DecoderBuilder::new()
+            .with_config_yolo_split_segdet(
+                configs::Boxes {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 8400, 4],
+                    channels_first: true,
+                    quantization: None,
+                },
+                configs::Scores {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 8401, 80],
+                    channels_first: true,
+                    quantization: None,
+                },
+                configs::MaskCoefficients {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 8400, 32],
+                    channels_first: true,
+                    quantization: None,
+                },
+                configs::Protos {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 32, 160, 160],
+                    channels_first: true,
+                    quantization: None,
+                },
+            )
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("Yolo Split Detection Boxes num 8400 incompatible with Scores num 8401")));
+
+        let result = DecoderBuilder::new()
+            .with_config_yolo_split_segdet(
+                configs::Boxes {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 8400, 4],
+                    channels_first: true,
+                    quantization: None,
+                },
+                configs::Scores {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 8400, 80],
+                    channels_first: true,
+                    quantization: None,
+                },
+                configs::MaskCoefficients {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 8401, 32],
+                    channels_first: true,
+                    quantization: None,
+                },
+                configs::Protos {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 32, 160, 160],
+                    channels_first: true,
+                    quantization: None,
+                },
+            )
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(ref s)) if s.starts_with("Yolo Split Detection Boxes num 8400 incompatible with Mask Coefficients num 8401")));
+        let result = DecoderBuilder::new()
+            .with_config_yolo_split_segdet(
+                configs::Boxes {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 8400, 4],
+                    channels_first: true,
+                    quantization: None,
+                },
+                configs::Scores {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 8400, 80],
+                    channels_first: true,
+                    quantization: None,
+                },
+                configs::MaskCoefficients {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 8400, 32],
+                    channels_first: true,
+                    quantization: None,
+                },
+                configs::Protos {
+                    decoder: configs::DecoderType::Ultralytics,
+                    shape: vec![1, 31, 160, 160],
+                    channels_first: true,
+                    quantization: None,
+                },
+            )
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(ref s)) if s.starts_with( "Yolo Protos channels 31 incompatible with Mask Coefficients channels 32")));
+    }
+
+    #[test]
+    fn test_modelpack_invalid_config() {
+        let result = DecoderBuilder::new()
+            .with_config(ConfigOutputs {
+                outputs: vec![
+                    ConfigOutput::Boxes(configs::Boxes {
+                        decoder: configs::DecoderType::ModelPack,
+                        shape: vec![1, 8400, 1, 4],
+                        channels_first: false,
+                        quantization: None,
+                    }),
+                    ConfigOutput::Scores(configs::Scores {
+                        decoder: configs::DecoderType::ModelPack,
+                        shape: vec![1, 8400, 3],
+                        channels_first: false,
+                        quantization: None,
+                    }),
+                    ConfigOutput::Protos(configs::Protos {
+                        decoder: configs::DecoderType::ModelPack,
+                        shape: vec![1, 8400, 3],
+                        channels_first: false,
+                        quantization: None,
+                    }),
+                ],
+            })
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s == "ModelPack should not have protos"));
+
+        let result = DecoderBuilder::new()
+            .with_config(ConfigOutputs {
+                outputs: vec![
+                    ConfigOutput::Boxes(configs::Boxes {
+                        decoder: configs::DecoderType::ModelPack,
+                        shape: vec![1, 8400, 1, 4],
+                        channels_first: false,
+                        quantization: None,
+                    }),
+                    ConfigOutput::Scores(configs::Scores {
+                        decoder: configs::DecoderType::ModelPack,
+                        shape: vec![1, 8400, 3],
+                        channels_first: false,
+                        quantization: None,
+                    }),
+                    ConfigOutput::MaskCoefficients(configs::MaskCoefficients {
+                        decoder: configs::DecoderType::ModelPack,
+                        shape: vec![1, 8400, 3],
+                        channels_first: false,
+                        quantization: None,
+                    }),
+                ],
+            })
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s == "ModelPack should not have mask coefficients"));
+
+        let result = DecoderBuilder::new()
+            .with_config(ConfigOutputs {
+                outputs: vec![ConfigOutput::Boxes(configs::Boxes {
+                    decoder: configs::DecoderType::ModelPack,
+                    shape: vec![1, 8400, 1, 4],
+                    channels_first: false,
+                    quantization: None,
+                })],
+            })
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s == "Invalid ModelPack model outputs"));
+    }
+
+    #[test]
+    fn test_modelpack_invalid_det() {
+        let result = DecoderBuilder::new()
+            .with_config_modelpack_det(
+                configs::Boxes {
+                    decoder: DecoderType::ModelPack,
+                    quantization: None,
+                    shape: vec![1, 4, 8400],
+                    channels_first: true,
+                },
+                configs::Scores {
+                    decoder: DecoderType::ModelPack,
+                    quantization: None,
+                    shape: vec![1, 80, 8400],
+                    channels_first: true,
+                },
+            )
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("Invalid ModelPack Boxes shape")));
+
+        let result = DecoderBuilder::new()
+            .with_config_modelpack_det(
+                configs::Boxes {
+                    decoder: DecoderType::ModelPack,
+                    quantization: None,
+                    shape: vec![1, 4, 1, 8400],
+                    channels_first: true,
+                },
+                configs::Scores {
+                    decoder: DecoderType::ModelPack,
+                    quantization: None,
+                    shape: vec![1, 80, 8400, 1],
+                    channels_first: true,
+                },
+            )
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("Invalid ModelPack Scores shape")));
+
+        let result = DecoderBuilder::new()
+            .with_config_modelpack_det(
+                configs::Boxes {
+                    decoder: DecoderType::ModelPack,
+                    quantization: None,
+                    shape: vec![1, 4, 2, 8400],
+                    channels_first: true,
+                },
+                configs::Scores {
+                    decoder: DecoderType::ModelPack,
+                    quantization: None,
+                    shape: vec![1, 80, 8400],
+                    channels_first: true,
+                },
+            )
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s == "Invalid ModelPack Boxes dimension 2: 2, expected 1"));
+
+        let result = DecoderBuilder::new()
+            .with_config_modelpack_det(
+                configs::Boxes {
+                    decoder: DecoderType::ModelPack,
+                    quantization: None,
+                    shape: vec![1, 5, 1, 8400],
+                    channels_first: true,
+                },
+                configs::Scores {
+                    decoder: DecoderType::ModelPack,
+                    quantization: None,
+                    shape: vec![1, 80, 8400],
+                    channels_first: true,
+                },
+            )
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s == "Invalid ModelPack Boxes dimension 5, expected 4"));
+
+        let result = DecoderBuilder::new()
+            .with_config_modelpack_det(
+                configs::Boxes {
+                    decoder: DecoderType::ModelPack,
+                    quantization: None,
+                    shape: vec![1, 4, 1, 8400],
+                    channels_first: true,
+                },
+                configs::Scores {
+                    decoder: DecoderType::ModelPack,
+                    quantization: None,
+                    shape: vec![1, 80, 8401],
+                    channels_first: true,
+                },
+            )
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s == "ModelPack Detection Boxes num 8400 incompatible with Scores num 8401"));
+    }
+
+    #[test]
+    fn test_modelpack_invalid_det_split() {
+        let result = DecoderBuilder::default()
+            .with_config_modelpack_det_split(vec![
+                configs::Detection {
+                    decoder: DecoderType::ModelPack,
+                    shape: vec![1, 17, 30, 18],
+                    anchors: None,
+                    quantization: None,
+                    channels_first: false,
+                },
+                configs::Detection {
+                    decoder: DecoderType::ModelPack,
+                    shape: vec![1, 9, 15, 18],
+                    anchors: None,
+                    quantization: None,
+                    channels_first: false,
+                },
+            ])
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s == "ModelPack Split Detection missing anchors"));
+
+        let result = DecoderBuilder::default()
+            .with_config_modelpack_det_split(vec![configs::Detection {
+                decoder: DecoderType::ModelPack,
+                shape: vec![1, 17, 30, 18],
+                anchors: Some(vec![]),
+                quantization: None,
+                channels_first: false,
+            }])
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s == "ModelPack Split Detection has zero anchors"));
+
+        let result = DecoderBuilder::default()
+            .with_config_modelpack_det_split(vec![configs::Detection {
+                decoder: DecoderType::ModelPack,
+                shape: vec![1, 17, 30, 18, 1],
+                anchors: Some(vec![
+                    [0.3666666, 0.3148148],
+                    [0.3874999, 0.474074],
+                    [0.5333333, 0.644444],
+                ]),
+                quantization: None,
+                channels_first: false,
+            }])
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("Invalid ModelPack Split Detection shape")));
+
+        let result = DecoderBuilder::default()
+            .with_config_modelpack_det_split(vec![configs::Detection {
+                decoder: DecoderType::ModelPack,
+                shape: vec![1, 15, 17, 30],
+                anchors: Some(vec![
+                    [0.3666666, 0.3148148],
+                    [0.3874999, 0.474074],
+                    [0.5333333, 0.644444],
+                ]),
+                quantization: None,
+                channels_first: true,
+            }])
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s.contains("not greater than number of anchors * 5 =")));
+
+        let result = DecoderBuilder::default()
+            .with_config_modelpack_det_split(vec![configs::Detection {
+                decoder: DecoderType::ModelPack,
+                shape: vec![1, 16, 17, 30],
+                anchors: Some(vec![
+                    [0.3666666, 0.3148148],
+                    [0.3874999, 0.474074],
+                    [0.5333333, 0.644444],
+                ]),
+                quantization: None,
+                channels_first: true,
+            }])
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s.contains("not a multiple of number of anchors")));
+
+        let result = DecoderBuilder::default()
+            .with_config_modelpack_det_split(vec![
+                configs::Detection {
+                    decoder: DecoderType::ModelPack,
+                    shape: vec![1, 17, 30, 18],
+                    anchors: Some(vec![
+                        [0.3666666, 0.3148148],
+                        [0.3874999, 0.474074],
+                        [0.5333333, 0.644444],
+                    ]),
+                    quantization: None,
+                    channels_first: false,
+                },
+                configs::Detection {
+                    decoder: DecoderType::ModelPack,
+                    shape: vec![1, 17, 30, 21],
+                    anchors: Some(vec![
+                        [0.3666666, 0.3148148],
+                        [0.3874999, 0.474074],
+                        [0.5333333, 0.644444],
+                    ]),
+                    quantization: None,
+                    channels_first: false,
+                },
+            ])
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("ModelPack Split Detection inconsistent number of classes:")));
+    }
+
+    #[test]
+    fn test_modelpack_invalid_seg() {
+        let result = DecoderBuilder::new()
+            .with_config_modelpack_seg(configs::Segmentation {
+                decoder: DecoderType::ModelPack,
+                quantization: None,
+                shape: vec![1, 160, 106, 3, 1],
+                channels_first: false,
+            })
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("Invalid ModelPack Segmentation shape")));
+    }
+
+    #[test]
+    fn test_modelpack_invalid_segdet() {
+        let result = DecoderBuilder::new()
+            .with_config_modelpack_segdet(
+                configs::Boxes {
+                    decoder: DecoderType::ModelPack,
+                    quantization: None,
+                    shape: vec![1, 4, 1, 8400],
+                    channels_first: true,
+                },
+                configs::Scores {
+                    decoder: DecoderType::ModelPack,
+                    quantization: None,
+                    shape: vec![1, 4, 8400],
+                    channels_first: true,
+                },
+                configs::Segmentation {
+                    decoder: DecoderType::ModelPack,
+                    quantization: None,
+                    shape: vec![1, 160, 106, 3],
+                    channels_first: false,
+                },
+            )
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s.contains("incompatible with number of classes")));
+    }
+
+    #[test]
+    fn test_modelpack_invalid_segdet_split() {
+        let result = DecoderBuilder::new()
+            .with_config_modelpack_segdet_split(
+                vec![configs::Detection {
+                    decoder: DecoderType::ModelPack,
+                    shape: vec![1, 17, 30, 18],
+                    anchors: Some(vec![
+                        [0.3666666, 0.3148148],
+                        [0.3874999, 0.474074],
+                        [0.5333333, 0.644444],
+                    ]),
+                    quantization: None,
+                    channels_first: false,
+                }],
+                configs::Segmentation {
+                    decoder: DecoderType::ModelPack,
+                    quantization: None,
+                    shape: vec![1, 160, 106, 3],
+                    channels_first: false,
+                },
+            )
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s.contains("incompatible with number of classes")));
     }
 }
