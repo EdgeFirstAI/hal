@@ -7,8 +7,8 @@ use edgefirst_image::G2DConverter;
 #[cfg(target_os = "linux")]
 use edgefirst_image::GLConverterThreaded;
 use edgefirst_image::{
-    CPUConverter, Crop, Flip, GREY, ImageConverterTrait as _, PLANAR_RGB, RGB, RGBA, Rotation,
-    TensorImage, YUYV,
+    CPUConverter, Crop, Flip, GREY, ImageConverterTrait as _, NV16, PLANAR_RGB, RGB, RGBA,
+    Rotation, TensorImage, YUYV,
 };
 use edgefirst_tensor::{TensorMapTrait, TensorMemory, TensorTrait};
 use four_char_code::FourCharCode;
@@ -758,27 +758,18 @@ fn convert_cpu_rgba_to_yuyv(bencher: divan::Bencher, params: (usize, usize)) {
     });
 }
 
-#[divan::bench(types = [Jaguar, Person, Zidane])]
-fn convert_cpu_rgba_to_rgb<IMAGE>(bencher: divan::Bencher)
-where
-    IMAGE: TestImage,
-{
-    let name = format!("{}.jpg", IMAGE::filename());
-    let path = if Path::new("./testdata").join(&name).exists() {
-        Path::new("./testdata").join(&name)
-    } else if Path::new("../testdata").join(&name).exists() {
-        Path::new("../testdata").join(&name)
-    } else if Path::new("../../testdata").join(&name).exists() {
-        Path::new("../../testdata").join(&name)
-    } else {
-        Path::new("../../../testdata").join(&name)
-    };
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn resize_cpu_rgba_to_planar_rgb(bencher: divan::Bencher, params: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera720p.rgba").to_vec();
+    let src = TensorImage::new(1280, 720, RGBA, None).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
 
-    let file = std::fs::read(path).unwrap();
-
-    let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
-    let mut dst = TensorImage::new(src.width(), src.height(), RGB, None).unwrap();
+    let (width, height) = params;
+    let mut dst = TensorImage::new(width, height, PLANAR_RGB, None).unwrap();
 
     let mut converter = CPUConverter::new();
 
@@ -789,27 +780,18 @@ where
     });
 }
 
-#[divan::bench(types = [Jaguar, Person, Zidane])]
-fn convert_cpu_rgba_to_planar<IMAGE>(bencher: divan::Bencher)
-where
-    IMAGE: TestImage,
-{
-    let name = format!("{}.jpg", IMAGE::filename());
-    let path = if Path::new("./testdata").join(&name).exists() {
-        Path::new("./testdata").join(&name)
-    } else if Path::new("../testdata").join(&name).exists() {
-        Path::new("../testdata").join(&name)
-    } else if Path::new("../../testdata").join(&name).exists() {
-        Path::new("../../testdata").join(&name)
-    } else {
-        Path::new("../../../testdata").join(&name)
-    };
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn resize_cpu_rgba_to_nv16(bencher: divan::Bencher, params: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera720p.rgba").to_vec();
+    let src = TensorImage::new(1280, 720, RGBA, None).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
 
-    let file = std::fs::read(path).unwrap();
-
-    let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
-    let mut dst = TensorImage::new(640, 640, PLANAR_RGB, None).unwrap();
+    let (width, height) = params;
+    let mut dst = TensorImage::new(width, height, NV16, None).unwrap();
 
     let mut converter = CPUConverter::new();
 
@@ -820,27 +802,40 @@ where
     });
 }
 
-#[divan::bench(types = [Jaguar, Person, Zidane])]
-fn convert_cpu_rgb_to_planar<IMAGE>(bencher: divan::Bencher)
-where
-    IMAGE: TestImage,
-{
-    let name = format!("{}.jpg", IMAGE::filename());
-    let path = if Path::new("./testdata").join(&name).exists() {
-        Path::new("./testdata").join(&name)
-    } else if Path::new("../testdata").join(&name).exists() {
-        Path::new("../testdata").join(&name)
-    } else if Path::new("../../testdata").join(&name).exists() {
-        Path::new("../../testdata").join(&name)
-    } else {
-        Path::new("../../../testdata").join(&name)
-    };
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn resize_cpu_rgba_to_rgb(bencher: divan::Bencher, params: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera720p.rgba").to_vec();
+    let src = TensorImage::new(1280, 720, RGBA, None).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
 
-    let file = std::fs::read(path).unwrap();
+    let (width, height) = params;
+    let mut dst = TensorImage::new(width, height, RGB, None).unwrap();
 
-    let src = TensorImage::load_jpeg(&file, Some(RGB), None).unwrap();
-    let mut dst = TensorImage::new(640, 640, PLANAR_RGB, None).unwrap();
+    let mut converter = CPUConverter::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn resize_cpu_rgba_to_rgba(bencher: divan::Bencher, params: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera720p.rgba").to_vec();
+    let src = TensorImage::new(1280, 720, RGBA, None).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = params;
+    let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
 
     let mut converter = CPUConverter::new();
 
