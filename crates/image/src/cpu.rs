@@ -1811,8 +1811,7 @@ impl ImageProcessorTrait for CPUProcessor {
 
     #[cfg(feature = "decoder")]
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<()> {
-        // the first color is reserved for background
-        for (c, new_c) in self.colors[1..].iter_mut().zip(colors.iter()) {
+        for (c, new_c) in self.colors.iter_mut().zip(colors.iter()) {
             *c = *new_c;
         }
         Ok(())
@@ -2656,7 +2655,7 @@ mod cpu_tests {
         let detect = DetectBox {
             bbox: [0.59375, 0.25, 0.9375, 0.725].into(),
             score: 0.99,
-            label: 22,
+            label: 1,
         };
 
         let seg = Segmentation {
@@ -2669,9 +2668,18 @@ mod cpu_tests {
 
         let mut renderer = CPUProcessor::new();
         renderer
+            .set_class_colors(&[[255, 255, 0, 233], [128, 128, 255, 100]])
+            .unwrap();
+        assert_eq!(renderer.colors[1], [128, 128, 255, 100]);
+        renderer
             .render_to_image(&mut image, &[detect], &[seg])
             .unwrap();
-
-        image.save_jpeg("test_segmentation_yolo.jpg", 80).unwrap();
+        let expected = TensorImage::load(
+            include_bytes!("../../../testdata/output_render_cpu.jpg"),
+            Some(RGBA),
+            None,
+        )
+        .unwrap();
+        compare_images_convert_to_rgb(&image, &expected, 0.99, function!());
     }
 }
