@@ -40,8 +40,8 @@ macro_rules! function {
 }
 
 use crate::{
-    Crop, Error, Flip, GREY, ImageConverterTrait, NV12, PLANAR_RGB, RGB, RGBA, Rotation,
-    TensorImage, YUYV,
+    Crop, Error, Flip, GREY, ImageConverterTrait, NV12, PLANAR_RGB, PLANAR_RGBA, RGB, RGBA,
+    Rotation, TensorImage, YUYV,
 };
 
 pub(crate) struct GlContext {
@@ -441,7 +441,7 @@ impl Card {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct RegionOfInterest {
     left: f32,
     top: f32,
@@ -1032,6 +1032,16 @@ impl GLConverterST {
         //     ));
         // }
 
+        let alpha = match dst.fourcc() {
+            PLANAR_RGB => false,
+            PLANAR_RGBA => true,
+            _ => {
+                return Err(crate::Error::NotSupported(
+                    "Destination format must be PLANAR_RGB or PLANAR_RGBA".to_string(),
+                ));
+            }
+        };
+
         // top and bottom are flipped because OpenGL uses 0,0 as bottom left
         let src_roi = if let Some(crop) = crop.src_rect {
             RegionOfInterest {
@@ -1077,20 +1087,18 @@ impl GLConverterST {
             x.left != 0 || x.top != 0 || x.width != dst.width() || x.height != dst.height()
         });
         if has_crop && let Some(dst_color) = crop.dst_color {
-            if dst_color[0] != dst_color[1] || dst_color[1] != dst_color[2] {
-                return Err(Error::NotSupported(
-                    "planar RGB currently doesn't support non grey background color".to_string(),
-                ));
-            }
-            unsafe {
-                gls::gl::ClearColor(
+            self.clear_rect_planar(
+                dst.width(),
+                dst.height(),
+                dst_roi,
+                [
                     dst_color[0] as f32 / 255.0,
-                    dst_color[0] as f32 / 255.0,
-                    dst_color[0] as f32 / 255.0,
-                    dst_color[0] as f32 / 255.0,
-                );
-                gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
-            };
+                    dst_color[1] as f32 / 255.0,
+                    dst_color[2] as f32 / 255.0,
+                    dst_color[3] as f32 / 255.0,
+                ],
+                alpha,
+            )?;
         }
 
         let new_egl_image = self.create_image_from_dma2(src)?;
@@ -1101,9 +1109,44 @@ impl GLConverterST {
             dst_roi,
             rotation_offset,
             flip,
+            alpha,
         )?;
         unsafe { gls::gl::Finish() };
 
+        Ok(())
+    }
+
+    fn clear_rect_planar(
+        &self,
+        width: usize,
+        height: usize,
+        dst_roi: RegionOfInterest,
+        color: [f32; 4],
+        alpha: bool,
+    ) -> Result<(), Error> {
+        if !alpha && color[0] == color[1] && color[1] == color[2] {
+            unsafe {
+                gls::gl::ClearColor(color[0], color[0], color[0], 1.0);
+                gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
+            };
+        }
+
+        let split = if alpha { 4 } else { 3 };
+
+        unsafe {
+            gls::gl::Enable(gls::gl::SCISSOR_TEST);
+            let x = (((dst_roi.left + 1.0) / 2.0) * width as f32).round() as i32;
+            let y = (((dst_roi.bottom + 1.0) / 2.0) * height as f32).round() as i32;
+            let width = (((dst_roi.right - dst_roi.left) / 2.0) * width as f32).round() as i32;
+            let height = (((dst_roi.top - dst_roi.bottom) / 2.0) * height as f32 / split as f32)
+                .round() as i32;
+            for (i, c) in color.iter().enumerate().take(split) {
+                gls::gl::Scissor(x, y + i as i32 * height, width, height);
+                gls::gl::ClearColor(*c, *c, *c, 1.0);
+                gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
+            }
+            gls::gl::Disable(gls::gl::SCISSOR_TEST);
+        }
         Ok(())
     }
 
@@ -1115,6 +1158,7 @@ impl GLConverterST {
         mut dst_roi: RegionOfInterest,
         rotation_offset: usize,
         flip: Flip,
+        alpha: bool,
     ) -> Result<(), Error> {
         let texture_target = gls::gl::TEXTURE_EXTERNAL_OES;
         match flip {
@@ -1155,8 +1199,12 @@ impl GLConverterST {
 
             gls::egl_image_target_texture_2d_oes(texture_target, egl_img.egl_image.as_ptr());
             check_gl_error(function!(), line!())?;
-            let y_centers = [-2.0 / 3.0, 0.0, 2.0 / 3.0];
-            let swizzles = [gls::gl::RED, gls::gl::GREEN, gls::gl::BLUE];
+            let y_centers = if alpha {
+                vec![-3.0 / 4.0, -1.0 / 4.0, 1.0 / 4.0, 3.0 / 4.0]
+            } else {
+                vec![-2.0 / 3.0, 0.0, 2.0 / 3.0]
+            };
+            let swizzles = [gls::gl::RED, gls::gl::GREEN, gls::gl::BLUE, gls::gl::ALPHA];
             // starts from bottom
             for (i, y_center) in y_centers.iter().enumerate() {
                 gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);

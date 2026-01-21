@@ -7,8 +7,6 @@ pub type DecoderResult<T, E = DecoderError> = std::result::Result<T, E>;
 
 #[derive(Debug)]
 pub enum DecoderError {
-    /// An I/O error occurred
-    Io(std::io::Error),
     /// An internal error occurred
     Internal(String),
     /// An operation was requested that is not supported
@@ -28,18 +26,23 @@ pub enum DecoderError {
 }
 
 impl fmt::Display for DecoderError {
+    /// Formats the error for display
+    /// # Arguments
+    /// * `f` - The formatter to write to
+    /// # Returns
+    /// A result indicating success or failure
+    /// # Examples
+    /// ```rust
+    /// use edgefirst_decoder::DecoderError;
+    /// let err = DecoderError::InvalidConfig("The config was invalid".to_string());
+    /// println!("{}", err);
+    /// ```
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{self:?}")
     }
 }
 
 impl std::error::Error for DecoderError {}
-
-impl From<std::io::Error> for DecoderError {
-    fn from(err: std::io::Error) -> Self {
-        DecoderError::Io(err)
-    }
-}
 
 impl From<serde_yaml::Error> for DecoderError {
     fn from(err: serde_yaml::Error) -> Self {

@@ -507,3 +507,89 @@ pub fn modelpack_segmentation_to_mask(segmentation: ArrayView3<u8>) -> Array2<u8
 
     Array2::from_shape_vec((height, width), argmax).expect("Failed to create mask array")
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod modelpack_tests {
+    #![allow(clippy::excessive_precision)]
+    use ndarray::Array3;
+
+    use crate::configs::DecoderType;
+
+    use super::*;
+    #[test]
+    fn test_detection_config() {
+        let det = Detection {
+            anchors: Some(vec![[0.1, 0.13], [0.16, 0.30], [0.33, 0.23]]),
+            quantization: Some((0.1, 128).into()),
+            decoder: DecoderType::ModelPack,
+            shape: vec![1, 9, 17, 18],
+            channels_first: false,
+        };
+        let config = ModelPackDetectionConfig::try_from(&det).unwrap();
+        assert_eq!(
+            config,
+            ModelPackDetectionConfig {
+                anchors: vec![[0.1, 0.13], [0.16, 0.30], [0.33, 0.23]],
+                quantization: Some(Quantization::new(0.1, 128)),
+            }
+        );
+
+        let det = Detection {
+            anchors: None,
+            quantization: Some((0.1, 128).into()),
+            decoder: DecoderType::ModelPack,
+            shape: vec![1, 9, 17, 18],
+            channels_first: false,
+        };
+        let result = ModelPackDetectionConfig::try_from(&det);
+        assert!(
+            matches!(result, Err(DecoderError::InvalidConfig(s)) if s == "ModelPack Split Detection missing anchors")
+        );
+    }
+
+    #[test]
+    fn test_fast_sigmoid() {
+        fn full_sigmoid(x: f32) -> f32 {
+            1.0 / (1.0 + (-x).exp())
+        }
+        for i in -2550..=2550 {
+            let x = i as f32 * 0.1;
+            let fast = fast_sigmoid_impl(x);
+            let full = full_sigmoid(x);
+            let diff = (fast - full).abs();
+            assert!(
+                diff < 0.0005,
+                "Fast sigmoid differs from full sigmoid by {} at input {}",
+                diff,
+                x
+            );
+        }
+    }
+
+    #[test]
+    fn test_modelpack_segmentation_to_mask() {
+        let seg = Array3::from_shape_vec(
+            (2, 2, 3),
+            vec![
+                0u8, 10, 5, // pixel (0,0)
+                20, 15, 25, // pixel (0,1)
+                30, 5, 10, // pixel (1,0)
+                0, 0, 0, // pixel (1,1)
+            ],
+        )
+        .unwrap();
+        let mask = modelpack_segmentation_to_mask(seg.view());
+        let expected_mask = Array2::from_shape_vec((2, 2), vec![1u8, 2, 0, 0]).unwrap();
+        assert_eq!(mask, expected_mask);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "Model Instance Segmentation should have shape (H, W, x) where x > 1"
+    )]
+    fn test_modelpack_segmentation_to_mask_invalid() {
+        let seg = Array3::from_shape_vec((2, 2, 1), vec![0u8, 10, 20, 30]).unwrap();
+        let _ = modelpack_segmentation_to_mask(seg.view());
+    }
+}

@@ -53,10 +53,12 @@ Additionally the TensorMemory used by default allocations can be controlled usin
 uses system memory. This will disable the use of specialized memory regions for tensors
 and hardware acceleration. However, this will increase the performance of the CPU converter.
 */
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait as _};
 use enum_dispatch::enum_dispatch;
 use four_char_code::{FourCharCode, four_char_code};
-use std::time::Instant;
+use std::{fmt::Display, time::Instant};
 use zune_jpeg::{
     JpegDecoder,
     zune_core::{colorspace::ColorSpace, options::DecoderOptions},
@@ -80,6 +82,8 @@ mod opengl_headless;
 pub const YUYV: FourCharCode = four_char_code!("YUYV");
 /// 8 bit planar YUV420, limited range
 pub const NV12: FourCharCode = four_char_code!("NV12");
+/// 8 bit planar YUV422, limited range
+pub const NV16: FourCharCode = four_char_code!("NV16");
 /// 8 bit RGBA
 pub const RGBA: FourCharCode = four_char_code!("RGBA");
 /// 8 bit RGB
@@ -89,6 +93,9 @@ pub const GREY: FourCharCode = four_char_code!("Y800");
 
 // TODO: planar RGB is 8BPS? https://fourcc.org/8bps/
 pub const PLANAR_RGB: FourCharCode = four_char_code!("8BPS");
+
+// TODO: What fourcc code is planar RGBA?
+pub const PLANAR_RGBA: FourCharCode = four_char_code!("8BPA");
 
 /// An image represented as a tensor with associated format information.
 #[derive(Debug)]
@@ -194,14 +201,14 @@ impl TensorImage {
     ///
     /// # Examples
     /// ```rust
-    /// use edgefirst_image::{RGB, TensorImage};
+    /// use edgefirst_image::{RGBA, TensorImage};
     /// use edgefirst_tensor::TensorMemory;
     /// # fn main() -> Result<(), edgefirst_image::Error> {
-    /// let jpeg_bytes = include_bytes!("../../../testdata/zidane.jpg");
-    /// let img = TensorImage::load(jpeg_bytes, Some(RGB), Some(TensorMemory::Mem))?;
+    /// let jpeg_bytes = include_bytes!("../../../testdata/zidane.png");
+    /// let img = TensorImage::load(jpeg_bytes, Some(RGBA), Some(TensorMemory::Mem))?;
     /// assert_eq!(img.width(), 1280);
     /// assert_eq!(img.height(), 720);
-    /// assert_eq!(img.fourcc(), RGB);
+    /// assert_eq!(img.fourcc(), RGBA);
     /// # Ok(())
     /// # }
     /// ```
@@ -618,8 +625,18 @@ pub enum Rotation {
 impl Rotation {
     /// Creates a Rotation enum from an angle in degrees. The angle must be a
     /// multiple of 90.
+    ///
+    /// # Panics
+    /// Panics if the angle is not a multiple of 90.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_image::Rotation;
+    /// let rotation = Rotation::from_degrees_clockwise(270);
+    /// assert_eq!(rotation, Rotation::CounterClockwise90);
+    /// ```
     pub fn from_degrees_clockwise(angle: usize) -> Rotation {
-        match angle.rem_euclid(90) {
+        match angle.rem_euclid(360) {
             0 => Rotation::None,
             90 => Rotation::Clockwise90,
             180 => Rotation::Rotate180,
@@ -939,8 +956,10 @@ fn fourcc_channels(fourcc: FourCharCode) -> Result<usize> {
         YUYV => Ok(2), // YUYV has 2 channels (Y and UV)
         GREY => Ok(1), // Y800 has 1 channel (Y)
         NV12 => Ok(2), // NV12 has 2 channel. 2nd channel is half empty
+        NV16 => Ok(2), // NV16 has 2 channel. 2nd channel is full size
         PLANAR_RGB => Ok(3),
-        _ => Err(Error::InvalidShape(format!(
+        PLANAR_RGBA => Ok(4),
+        _ => Err(Error::NotSupported(format!(
             "Unsupported fourcc: {}",
             fourcc.to_string()
         ))),
@@ -949,12 +968,14 @@ fn fourcc_channels(fourcc: FourCharCode) -> Result<usize> {
 
 fn fourcc_planar(fourcc: FourCharCode) -> Result<bool> {
     match fourcc {
-        RGBA => Ok(false),      // RGBA has 4 channels (R, G, B, A)
-        RGB => Ok(false),       // RGB has 3 channels (R, G, B)
-        YUYV => Ok(false),      // YUYV has 2 channels (Y and UV)
-        GREY => Ok(false),      // Y800 has 1 channel (Y)
-        NV12 => Ok(true),       // Planar YUV
-        PLANAR_RGB => Ok(true), // Planar RGB
+        RGBA => Ok(false),       // RGBA has 4 channels (R, G, B, A)
+        RGB => Ok(false),        // RGB has 3 channels (R, G, B)
+        YUYV => Ok(false),       // YUYV has 2 channels (Y and UV)
+        GREY => Ok(false),       // Y800 has 1 channel (Y)
+        NV12 => Ok(true),        // Planar YUV
+        NV16 => Ok(true),        // Planar YUV
+        PLANAR_RGB => Ok(true),  // Planar RGB
+        PLANAR_RGBA => Ok(true), // Planar RGBA
         _ => Err(Error::NotSupported(format!(
             "Unsupported fourcc: {}",
             fourcc.to_string()
@@ -962,7 +983,28 @@ fn fourcc_planar(fourcc: FourCharCode) -> Result<bool> {
     }
 }
 
+pub(crate) struct FunctionTimer<T: Display> {
+    name: T,
+    start: std::time::Instant,
+}
+
+impl<T: Display> FunctionTimer<T> {
+    pub fn new(name: T) -> Self {
+        Self {
+            name,
+            start: std::time::Instant::now(),
+        }
+    }
+}
+
+impl<T: Display> Drop for FunctionTimer<T> {
+    fn drop(&mut self) {
+        log::trace!("{} elapsed: {:?}", self.name, self.start.elapsed())
+    }
+}
+
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod image_tests {
     use super::*;
     use crate::{CPUConverter, Rotation};
@@ -991,6 +1033,82 @@ mod image_tests {
     }
 
     #[test]
+    fn test_invalid_crop() {
+        let src = TensorImage::new(100, 100, RGB, None).unwrap();
+        let dst = TensorImage::new(100, 100, RGB, None).unwrap();
+
+        let crop = Crop::new()
+            .with_src_rect(Some(Rect::new(50, 50, 60, 60)))
+            .with_dst_rect(Some(Rect::new(0, 0, 150, 150)));
+
+        let result = crop.check_crop(&src, &dst);
+        assert!(matches!(
+            result,
+            Err(Error::CropInvalid(e)) if e.starts_with("Dest and Src crop invalid")
+        ));
+
+        let crop = crop.with_src_rect(Some(Rect::new(0, 0, 10, 10)));
+        let result = crop.check_crop(&src, &dst);
+        assert!(matches!(
+            result,
+            Err(Error::CropInvalid(e)) if e.starts_with("Dest crop invalid")
+        ));
+
+        let crop = crop
+            .with_src_rect(Some(Rect::new(50, 50, 60, 60)))
+            .with_dst_rect(Some(Rect::new(0, 0, 50, 50)));
+        let result = crop.check_crop(&src, &dst);
+        assert!(matches!(
+            result,
+            Err(Error::CropInvalid(e)) if e.starts_with("Src crop invalid")
+        ));
+
+        let crop = crop.with_src_rect(Some(Rect::new(50, 50, 50, 50)));
+
+        let result = crop.check_crop(&src, &dst);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_invalid_tensor() -> Result<(), Error> {
+        let tensor = Tensor::new(&[720, 1280, 4, 1], None, None)?;
+        let result = TensorImage::from_tensor(tensor, RGB);
+        assert!(matches!(
+            result,
+            Err(Error::InvalidShape(e)) if e.starts_with("Tensor shape must have 3 dimensions, got")
+        ));
+
+        let tensor = Tensor::new(&[720, 1280, 4], None, None)?;
+        let result = TensorImage::from_tensor(tensor, RGB);
+        assert!(matches!(
+            result,
+            Err(Error::InvalidShape(e)) if e.starts_with("Invalid tensor shape")
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_invalid_image_file() -> Result<(), Error> {
+        let result = TensorImage::load(&[123; 5000], None, None);
+        assert!(matches!(
+            result,
+            Err(Error::NotSupported(e)) if e == "Could not decode as jpeg or png"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_invalid_jpeg_fourcc() -> Result<(), Error> {
+        let result = TensorImage::load(&[123; 5000], Some(YUYV), None);
+        assert!(matches!(
+            result,
+            Err(Error::NotSupported(e)) if e == "Could not decode as jpeg or png"));
+
+        Ok(())
+    }
+
+    #[test]
     fn test_load_resize_save() {
         let file = include_bytes!("../../../testdata/zidane.jpg");
         let img = TensorImage::load_jpeg(file, Some(RGBA), None).unwrap();
@@ -1012,6 +1130,168 @@ mod image_tests {
         assert_eq!(img.width(), 640);
         assert_eq!(img.height(), 360);
         assert_eq!(img.fourcc(), RGB);
+    }
+
+    #[test]
+    fn test_from_tensor_planar() -> Result<(), Error> {
+        let tensor = Tensor::new(&[3, 720, 1280], None, None)?;
+        tensor
+            .map()?
+            .copy_from_slice(include_bytes!("../../../testdata/camera720p.8bps"));
+        let planar = TensorImage::from_tensor(tensor, PLANAR_RGB)?;
+
+        let rbga = load_bytes_to_tensor(
+            1280,
+            720,
+            RGBA,
+            None,
+            include_bytes!("../../../testdata/camera720p.rgba"),
+        )?;
+        compare_images_convert_to_rgb(&planar, &rbga, 0.98, function!());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_from_tensor_invalid_fourcc() {
+        let tensor = Tensor::new(&[3, 720, 1280], None, None).unwrap();
+        let result = TensorImage::from_tensor(tensor, four_char_code!("TEST"));
+        matches!(result, Err(Error::NotSupported(e)) if e.starts_with("Unsupported fourcc : TEST"));
+    }
+
+    #[test]
+    #[should_panic(expected = "Failed to save planar RGB image")]
+    fn test_save_planar() {
+        let planar_img = load_bytes_to_tensor(
+            1280,
+            720,
+            PLANAR_RGB,
+            None,
+            include_bytes!("../../../testdata/camera720p.8bps"),
+        )
+        .unwrap();
+
+        let save_path = "/tmp/planar_rgb.jpg";
+        planar_img
+            .save_jpeg(save_path, 90)
+            .expect("Failed to save planar RGB image");
+    }
+
+    #[test]
+    #[should_panic(expected = "Failed to save YUYV image")]
+    fn test_save_yuyv() {
+        let planar_img = load_bytes_to_tensor(
+            1280,
+            720,
+            YUYV,
+            None,
+            include_bytes!("../../../testdata/camera720p.yuyv"),
+        )
+        .unwrap();
+
+        let save_path = "/tmp/yuyv.jpg";
+        planar_img
+            .save_jpeg(save_path, 90)
+            .expect("Failed to save YUYV image");
+    }
+
+    #[test]
+    fn test_rotation_angle() {
+        assert_eq!(Rotation::from_degrees_clockwise(0), Rotation::None);
+        assert_eq!(Rotation::from_degrees_clockwise(90), Rotation::Clockwise90);
+        assert_eq!(Rotation::from_degrees_clockwise(180), Rotation::Rotate180);
+        assert_eq!(
+            Rotation::from_degrees_clockwise(270),
+            Rotation::CounterClockwise90
+        );
+        assert_eq!(Rotation::from_degrees_clockwise(360), Rotation::None);
+        assert_eq!(Rotation::from_degrees_clockwise(450), Rotation::Clockwise90);
+        assert_eq!(Rotation::from_degrees_clockwise(540), Rotation::Rotate180);
+        assert_eq!(
+            Rotation::from_degrees_clockwise(630),
+            Rotation::CounterClockwise90
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "rotation angle is not a multiple of 90")]
+    fn test_rotation_angle_panic() {
+        Rotation::from_degrees_clockwise(361);
+    }
+
+    #[test]
+    fn test_disable_env_var() -> Result<(), Error> {
+        let original = std::env::var("EDGEFIRST_DISABLE_G2D").ok();
+        unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", "1") };
+        let converter = ImageConverter::new()?;
+        match original {
+            Some(s) => unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", s) },
+            None => unsafe { std::env::remove_var("EDGEFIRST_DISABLE_G2D") },
+        }
+        assert!(converter.g2d.is_none());
+
+        #[cfg(target_os = "linux")]
+        #[cfg(feature = "opengl")]
+        {
+            let original = std::env::var("EDGEFIRST_DISABLE_GL").ok();
+            unsafe { std::env::set_var("EDGEFIRST_DISABLE_GL", "1") };
+            let converter = ImageConverter::new()?;
+            match original {
+                Some(s) => unsafe { std::env::set_var("EDGEFIRST_DISABLE_GL", s) },
+                None => unsafe { std::env::remove_var("EDGEFIRST_DISABLE_GL") },
+            }
+            assert!(converter.opengl.is_none());
+        }
+
+        let original = std::env::var("EDGEFIRST_DISABLE_CPU").ok();
+        unsafe { std::env::set_var("EDGEFIRST_DISABLE_CPU", "1") };
+        let converter = ImageConverter::new()?;
+        match original {
+            Some(s) => unsafe { std::env::set_var("EDGEFIRST_DISABLE_CPU", s) },
+            None => unsafe { std::env::remove_var("EDGEFIRST_DISABLE_CPU") },
+        }
+        assert!(converter.cpu.is_none());
+
+        let original_cpu = std::env::var("EDGEFIRST_DISABLE_CPU").ok();
+        unsafe { std::env::set_var("EDGEFIRST_DISABLE_CPU", "1") };
+        let original_gl = std::env::var("EDGEFIRST_DISABLE_GL").ok();
+        unsafe { std::env::set_var("EDGEFIRST_DISABLE_GL", "1") };
+        let original_g2d = std::env::var("EDGEFIRST_DISABLE_G2D").ok();
+        unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", "1") };
+        let mut converter = ImageConverter::new()?;
+
+        let src = TensorImage::new(1280, 720, RGBA, None)?;
+        let mut dst = TensorImage::new(640, 360, RGBA, None)?;
+        let result = converter.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop());
+        assert!(matches!(result, Err(Error::NoConverter)));
+
+        match original_cpu {
+            Some(s) => unsafe { std::env::set_var("EDGEFIRST_DISABLE_CPU", s) },
+            None => unsafe { std::env::remove_var("EDGEFIRST_DISABLE_CPU") },
+        }
+        match original_gl {
+            Some(s) => unsafe { std::env::set_var("EDGEFIRST_DISABLE_GL", s) },
+            None => unsafe { std::env::remove_var("EDGEFIRST_DISABLE_GL") },
+        }
+        match original_g2d {
+            Some(s) => unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", s) },
+            None => unsafe { std::env::remove_var("EDGEFIRST_DISABLE_G2D") },
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_unsupported_conversion() {
+        let src = TensorImage::new(1280, 720, NV12, None).unwrap();
+        let mut dst = TensorImage::new(640, 360, NV12, None).unwrap();
+        let mut converter = ImageConverter::new().unwrap();
+        let result = converter.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop());
+        log::debug!("result: {:?}", result);
+        assert!(matches!(
+            result,
+            Err(Error::NotSupported(e)) if e.starts_with("Conversion from NV12 to NV12")
+        ));
     }
 
     #[test]
@@ -1078,6 +1358,38 @@ mod image_tests {
         compare_images(&converter_dst, &cpu_dst, 0.98, function!());
     }
 
+    #[test]
+    fn test_crop_skip() {
+        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
+
+        let mut converter_dst = TensorImage::new(1280, 720, RGBA, None).unwrap();
+        let mut converter = ImageConverter::new().unwrap();
+        let crop = Crop::new()
+            .with_src_rect(Some(Rect::new(0, 0, 640, 640)))
+            .with_dst_rect(Some(Rect::new(0, 0, 640, 640)));
+        converter
+            .convert(&src, &mut converter_dst, Rotation::None, Flip::None, crop)
+            .unwrap();
+
+        let mut cpu_dst = TensorImage::new(1280, 720, RGBA, None).unwrap();
+        let mut cpu_converter = CPUConverter::new();
+        cpu_converter
+            .convert(&src, &mut cpu_dst, Rotation::None, Flip::None, crop)
+            .unwrap();
+
+        compare_images(&converter_dst, &cpu_dst, 0.99999, function!());
+    }
+
+    #[test]
+    fn test_invalid_fourcc() {
+        let result = TensorImage::new(1280, 720, four_char_code!("TEST"), None);
+        assert!(matches!(
+            result,
+            Err(Error::NotSupported(e)) if e == "Unsupported fourcc: TEST"
+        ));
+    }
+
     static G2D_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // Helper function to check if G2D library is available
     fn is_g2d_available() -> bool {
@@ -1107,7 +1419,12 @@ mod image_tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[cfg(feature = "opengl")]
     static GL_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+    #[cfg(target_os = "linux")]
+    #[cfg(feature = "opengl")]
     // Helper function to check if OpenGL is available
     fn is_opengl_available() -> bool {
         #[cfg(all(target_os = "linux", feature = "opengl"))]
@@ -1122,7 +1439,7 @@ mod image_tests {
     }
 
     #[test]
-    fn test_load_with_exif() {
+    fn test_load_jpeg_with_exif() {
         let file = include_bytes!("../../../testdata/zidane_rotated_exif.jpg").to_vec();
         let loaded = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
@@ -1142,6 +1459,33 @@ mod image_tests {
                 &cpu_src,
                 &mut cpu_dst,
                 Rotation::Clockwise90,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+
+        compare_images(&loaded, &cpu_dst, 0.98, function!());
+    }
+
+    #[test]
+    fn test_load_png_with_exif() {
+        let file = include_bytes!("../../../testdata/zidane_rotated_exif_180.png").to_vec();
+        let loaded = TensorImage::load_png(&file, Some(RGBA), None).unwrap();
+
+        assert_eq!(loaded.height(), 720);
+        assert_eq!(loaded.width(), 1280);
+
+        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let cpu_src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
+
+        let mut cpu_dst = TensorImage::new(1280, 720, RGBA, None).unwrap();
+        let mut cpu_converter = CPUConverter::new();
+
+        cpu_converter
+            .convert(
+                &cpu_src,
+                &mut cpu_dst,
+                Rotation::Rotate180,
                 Flip::None,
                 Crop::no_crop(),
             )
@@ -2478,7 +2822,6 @@ mod image_tests {
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn test_nv12_to_rgba_cpu() {
         let file = include_bytes!("../../../testdata/zidane.nv12").to_vec();
         let src = TensorImage::new(1280, 720, NV12, None).unwrap();
@@ -2548,7 +2891,6 @@ mod image_tests {
     }
 
     #[test]
-    #[ignore = "not yet implemented"]
     fn test_nv12_to_yuyv_cpu() {
         let file = include_bytes!("../../../testdata/zidane.nv12").to_vec();
         let src = TensorImage::new(1280, 720, NV12, None).unwrap();
@@ -2573,12 +2915,21 @@ mod image_tests {
 
     #[test]
     fn test_cpu_resize_planar_rgb() {
-        let dst_width = 640;
-        let dst_height = 640;
-        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
-        let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
+        let src = TensorImage::new(4, 4, RGBA, None).unwrap();
+        #[rustfmt::skip]
+        let src_image = [
+                    255, 0, 0, 255,     0, 255, 0, 255,     0, 0, 255, 255,     255, 255, 0, 255,
+                    255, 0, 0, 0,       0, 0, 0, 255,       255,  0, 255, 0,    255, 0, 255, 255,
+                    0, 0, 255, 0,       0, 255, 255, 255,   255, 255, 0, 0,     0, 0, 0, 255,
+                    255, 0, 0, 0,       0, 0, 0, 255,       255,  0, 255, 0,    255, 0, 255, 255,
+        ];
+        src.tensor()
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(&src_image);
 
-        let mut cpu_dst = TensorImage::new(dst_width, dst_height, PLANAR_RGB, None).unwrap();
+        let mut cpu_dst = TensorImage::new(5, 5, PLANAR_RGB, None).unwrap();
         let mut cpu_converter = CPUConverter::new();
 
         cpu_converter
@@ -2589,14 +2940,70 @@ mod image_tests {
                 Flip::None,
                 Crop::new()
                     .with_dst_rect(Some(Rect {
-                        left: 102,
-                        top: 102,
-                        width: 440,
-                        height: 440,
+                        left: 1,
+                        top: 1,
+                        width: 4,
+                        height: 4,
                     }))
-                    .with_dst_color(Some([114, 114, 114, 114])),
+                    .with_dst_color(Some([114, 114, 114, 255])),
             )
             .unwrap();
+
+        #[rustfmt::skip]
+        let expected_dst = [
+            114, 114, 114, 114, 114,    114, 255, 0, 0, 255,    114, 255, 0, 255, 255,      114, 0, 0, 255, 0,        114, 255, 0, 255, 255,
+            114, 114, 114, 114, 114,    114, 0, 255, 0, 255,    114, 0, 0, 0, 0,            114, 0, 255, 255, 0,      114, 0, 0, 0, 0,
+            114, 114, 114, 114, 114,    114, 0, 0, 255, 0,      114, 0, 0, 255, 255,        114, 255, 255, 0, 0,      114, 0, 0, 255, 255,
+        ];
+
+        assert_eq!(cpu_dst.tensor().map().unwrap().as_slice(), &expected_dst);
+    }
+
+    #[test]
+    fn test_cpu_resize_planar_rgba() {
+        let src = TensorImage::new(4, 4, RGBA, None).unwrap();
+        #[rustfmt::skip]
+        let src_image = [
+                    255, 0, 0, 255,     0, 255, 0, 255,     0, 0, 255, 255,     255, 255, 0, 255,
+                    255, 0, 0, 0,       0, 0, 0, 255,       255,  0, 255, 0,    255, 0, 255, 255,
+                    0, 0, 255, 0,       0, 255, 255, 255,   255, 255, 0, 0,     0, 0, 0, 255,
+                    255, 0, 0, 0,       0, 0, 0, 255,       255,  0, 255, 0,    255, 0, 255, 255,
+        ];
+        src.tensor()
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(&src_image);
+
+        let mut cpu_dst = TensorImage::new(5, 5, PLANAR_RGBA, None).unwrap();
+        let mut cpu_converter = CPUConverter::new();
+
+        cpu_converter
+            .convert(
+                &src,
+                &mut cpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::new()
+                    .with_dst_rect(Some(Rect {
+                        left: 1,
+                        top: 1,
+                        width: 4,
+                        height: 4,
+                    }))
+                    .with_dst_color(Some([114, 114, 114, 255])),
+            )
+            .unwrap();
+
+        #[rustfmt::skip]
+        let expected_dst = [
+            114, 114, 114, 114, 114,    114, 255, 0, 0, 255,        114, 255, 0, 255, 255,      114, 0, 0, 255, 0,        114, 255, 0, 255, 255,
+            114, 114, 114, 114, 114,    114, 0, 255, 0, 255,        114, 0, 0, 0, 0,            114, 0, 255, 255, 0,      114, 0, 0, 0, 0,
+            114, 114, 114, 114, 114,    114, 0, 0, 255, 0,          114, 0, 0, 255, 255,        114, 255, 255, 0, 0,      114, 0, 0, 255, 255,
+            255, 255, 255, 255, 255,    255, 255, 255, 255, 255,    255, 0, 255, 0, 255,        255, 0, 255, 0, 255,      255, 0, 255, 0, 255,
+        ];
+
+        assert_eq!(cpu_dst.tensor().map().unwrap().as_slice(), &expected_dst);
     }
 
     #[test]
@@ -2669,6 +3076,52 @@ mod image_tests {
             )
             .unwrap();
         compare_images(&gl_dst, &cpu_dst, 0.98, function!());
+    }
+
+    #[test]
+    fn test_cpu_resize_nv16() {
+        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
+
+        let mut cpu_nv16_dst = TensorImage::new(640, 640, NV16, None).unwrap();
+        let mut cpu_rgb_dst = TensorImage::new(640, 640, RGB, None).unwrap();
+        let mut cpu_converter = CPUConverter::new();
+
+        cpu_converter
+            .convert(
+                &src,
+                &mut cpu_nv16_dst,
+                Rotation::None,
+                Flip::None,
+                // Crop::no_crop(),
+                Crop::new()
+                    .with_dst_rect(Some(Rect {
+                        left: 20,
+                        top: 140,
+                        width: 600,
+                        height: 360,
+                    }))
+                    .with_dst_color(Some([255, 128, 0, 255])),
+            )
+            .unwrap();
+
+        cpu_converter
+            .convert(
+                &src,
+                &mut cpu_rgb_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::new()
+                    .with_dst_rect(Some(Rect {
+                        left: 20,
+                        top: 140,
+                        width: 600,
+                        height: 360,
+                    }))
+                    .with_dst_color(Some([255, 128, 0, 255])),
+            )
+            .unwrap();
+        compare_images_convert_to_rgb(&cpu_nv16_dst, &cpu_rgb_dst, 0.99, function!());
     }
 
     fn load_bytes_to_tensor(
