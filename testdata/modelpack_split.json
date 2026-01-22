@@ -31,7 +31,13 @@
         15,
         18
       ],
-      "type": "detection"
+      "type": "detection",
+      "dshape": [
+        ["batch", 1],
+        ["height", 9],
+        ["width", 15],
+        ["num_anchors_x_features", 18]
+      ]
     },
     {
       "anchors": [
@@ -64,7 +70,13 @@
         30,
         18
       ],
-      "type": "detection"
+      "type": "detection",
+      "dshape": [
+        ["batch", 1],
+        ["height", 17],
+        ["width", 30],
+        ["num_anchors_x_features", 18]
+      ]
     }
   ],
   "trainer": {
