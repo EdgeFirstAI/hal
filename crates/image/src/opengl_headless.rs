@@ -3,13 +3,17 @@
 
 #![cfg(target_os = "linux")]
 #![cfg(feature = "opengl")]
+
+use edgefirst_decoder::DetectBox;
+#[cfg(feature = "decoder")]
+use edgefirst_decoder::Segmentation;
 use edgefirst_tensor::{TensorMemory, TensorTrait};
 use four_char_code::FourCharCode;
 use gbm::{
     AsRaw, Device,
     drm::{Device as DrmDevice, buffer::DrmFourcc, control::Device as DrmControlDevice},
 };
-use khronos_egl::{self as egl, Attrib, Display, EGL1_4};
+use khronos_egl::{self as egl, Attrib, Display, Dynamic, EGL1_4, Instance};
 use log::{debug, error};
 use std::{
     collections::BTreeSet,
@@ -18,6 +22,7 @@ use std::{
     ptr::{NonNull, null, null_mut},
     rc::Rc,
     str::FromStr,
+    sync::OnceLock,
     thread::JoinHandle,
     time::Instant,
 };
@@ -39,22 +44,35 @@ macro_rules! function {
     }};
 }
 
+#[cfg(feature = "decoder")]
+use crate::DEFAULT_COLORS;
 use crate::{
-    Crop, Error, Flip, GREY, ImageConverterTrait, NV12, PLANAR_RGB, PLANAR_RGBA, RGB, RGBA,
+    Crop, Error, Flip, GREY, ImageProcessorTrait, NV12, PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, Rect,
     Rotation, TensorImage, YUYV,
 };
 
+static EGL_LIB: OnceLock<libloading::Library> = OnceLock::new();
+
+fn get_egl_lib() -> Result<&'static libloading::Library, crate::Error> {
+    if let Some(egl) = EGL_LIB.get() {
+        Ok(egl)
+    } else {
+        let egl = unsafe { libloading::Library::new("libEGL.so.1")? };
+        Ok(EGL_LIB.get_or_init(|| egl))
+    }
+}
+
+type Egl = Instance<Dynamic<&'static libloading::Library, EGL1_4>>;
 pub(crate) struct GlContext {
     pub(crate) support_dma: bool,
     pub(crate) surface: Option<egl::Surface>,
     pub(crate) display: EglDisplayType,
     pub(crate) ctx: egl::Context,
-    pub(crate) egl: Rc<egl::Instance<egl::Dynamic<libloading::Library, egl::EGL1_4>>>,
+    pub(crate) egl: Rc<Egl>,
 }
 
 pub(crate) enum EglDisplayType {
     Default(egl::Display),
-
     Gbm(egl::Display, #[allow(dead_code)] Device<Card>),
     PlatformDisplay(egl::Display),
 }
@@ -72,8 +90,8 @@ impl EglDisplayType {
 impl GlContext {
     pub(crate) fn new() -> Result<GlContext, crate::Error> {
         // Create an EGL API instance.
-        let lib = unsafe { libloading::Library::new("libEGL.so.1") }?;
-        let egl = Rc::new(unsafe { egl::DynamicInstance::<egl::EGL1_4>::load_required_from(lib)? });
+        let egl: Rc<Egl> =
+            Rc::new(unsafe { Instance::<Dynamic<_, EGL1_4>>::load_required_from(get_egl_lib()?)? });
 
         if let Ok(headless) = Self::try_initialize_egl(egl.clone(), Self::egl_get_default_display) {
             return Ok(headless);
@@ -101,13 +119,11 @@ impl GlContext {
     }
 
     fn try_initialize_egl(
-        egl: Rc<egl::Instance<egl::Dynamic<libloading::Library, egl::EGL1_4>>>,
-        display_fn: impl Fn(
-            &egl::Instance<egl::Dynamic<libloading::Library, egl::EGL1_4>>,
-        ) -> Result<EglDisplayType, crate::Error>,
+        egl: Rc<Egl>,
+        display_fn: impl Fn(&Egl) -> Result<EglDisplayType, crate::Error>,
     ) -> Result<GlContext, crate::Error> {
         let display = display_fn(&egl)?;
-
+        log::debug!("egl initialize with display: {:x?}", display.as_display());
         egl.initialize(display.as_display())?;
         let attributes = [
             egl::SURFACE_TYPE,
@@ -119,6 +135,8 @@ impl GlContext {
             egl::GREEN_SIZE,
             8,
             egl::BLUE_SIZE,
+            8,
+            egl::ALPHA_SIZE,
             8,
             egl::NONE,
         ];
@@ -134,16 +152,17 @@ impl GlContext {
 
         debug!("config: {config:?}");
 
-        let context_attributes = [egl::CONTEXT_MAJOR_VERSION, 3, egl::NONE, egl::NONE];
-
-        let ctx = egl.create_context(display.as_display(), config, None, &context_attributes)?;
-        debug!("ctx: {ctx:?}");
-
         let surface = Some(egl.create_pbuffer_surface(
             display.as_display(),
             config,
             &[egl::WIDTH, 64, egl::HEIGHT, 64, egl::NONE],
         )?);
+
+        egl.bind_api(egl::OPENGL_ES_API)?;
+        let context_attributes = [egl::CONTEXT_MAJOR_VERSION, 3, egl::NONE, egl::NONE];
+
+        let ctx = egl.create_context(display.as_display(), config, None, &context_attributes)?;
+        debug!("ctx: {ctx:?}");
 
         egl.make_current(display.as_display(), surface, surface, Some(ctx))?;
 
@@ -158,9 +177,7 @@ impl GlContext {
         Ok(headless)
     }
 
-    fn egl_get_default_display(
-        egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
-    ) -> Result<EglDisplayType, crate::Error> {
+    fn egl_get_default_display(egl: &Egl) -> Result<EglDisplayType, crate::Error> {
         // get the default display
         if let Some(display) = unsafe { egl.get_display(egl::DEFAULT_DISPLAY) } {
             debug!("default display: {display:?}");
@@ -172,9 +189,7 @@ impl GlContext {
         ))
     }
 
-    fn egl_get_gbm_display(
-        egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
-    ) -> Result<EglDisplayType, crate::Error> {
+    fn egl_get_gbm_display(egl: &Egl) -> Result<EglDisplayType, crate::Error> {
         // init a GBM device
         let gbm = Device::new(Card::open_global()?)?;
 
@@ -189,9 +204,7 @@ impl GlContext {
         Ok(EglDisplayType::Gbm(display, gbm))
     }
 
-    fn egl_get_platform_display_from_device(
-        egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
-    ) -> Result<EglDisplayType, crate::Error> {
+    fn egl_get_platform_display_from_device(egl: &Egl) -> Result<EglDisplayType, crate::Error> {
         let extensions = egl.query_string(None, egl::EXTENSIONS)?;
         let extensions = extensions.to_string_lossy();
         log::debug!("EGL Extensions: {}", extensions);
@@ -238,9 +251,7 @@ impl GlContext {
         Ok(EglDisplayType::PlatformDisplay(disp))
     }
 
-    fn egl_check_support_dma(
-        egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
-    ) -> Result<(), crate::Error> {
+    fn egl_check_support_dma(egl: &Egl) -> Result<(), crate::Error> {
         let extensions = egl.query_string(None, egl::EXTENSIONS)?;
         let extensions = extensions.to_string_lossy();
         log::debug!("EGL Extensions: {}", extensions);
@@ -271,7 +282,7 @@ impl GlContext {
     }
 
     fn egl_get_platform_display_with_fallback(
-        egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
+        egl: &Egl,
         platform: egl::Enum,
         native_display: *mut c_void,
         attrib_list: &[Attrib],
@@ -302,7 +313,7 @@ impl GlContext {
     }
 
     fn egl_create_image_with_fallback(
-        egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
+        egl: &Egl,
         display: Display,
         ctx: egl::Context,
         target: egl::Enum,
@@ -351,7 +362,7 @@ impl GlContext {
     }
 
     fn egl_destory_image_with_fallback(
-        egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
+        egl: &Egl,
         display: Display,
         image: egl::Image,
     ) -> Result<(), Error> {
@@ -384,12 +395,15 @@ impl Drop for GlContext {
         let _ = self
             .egl
             .make_current(self.display.as_display(), None, None, None);
-        if let Some(surface) = self.surface.take() {
-            let _ = self.egl.destroy_surface(self.display.as_display(), surface);
-        }
+
         let _ = self
             .egl
             .destroy_context(self.display.as_display(), self.ctx);
+
+        if let Some(surface) = self.surface.take() {
+            let _ = self.egl.destroy_surface(self.display.as_display(), surface);
+        }
+
         let _ = self.egl.terminate(self.display.as_display());
     }
 }
@@ -449,47 +463,60 @@ struct RegionOfInterest {
     bottom: f32,
 }
 
-type GLConverterMessage = (
-    SendablePtr<TensorImage>,
-    SendablePtr<TensorImage>,
-    Rotation,
-    Flip,
-    Crop,
-    tokio::sync::oneshot::Sender<Result<(), Error>>,
-);
+enum GLProcessorMessage {
+    ImageConvert(
+        SendablePtr<TensorImage>,
+        SendablePtr<TensorImage>,
+        Rotation,
+        Flip,
+        Crop,
+        tokio::sync::oneshot::Sender<Result<(), Error>>,
+    ),
+    SetColors(
+        Vec<[u8; 4]>,
+        tokio::sync::oneshot::Sender<Result<(), Error>>,
+    ),
+    ImageRender(
+        SendablePtr<TensorImage>,
+        SendablePtr<DetectBox>,
+        SendablePtr<Segmentation>,
+        tokio::sync::oneshot::Sender<Result<(), Error>>,
+    ),
+}
 
 /// OpenGL multi-threaded image converter. The actual conversion is done in a
 /// separate rendering thread, as OpenGL contexts are not thread-safe. This can
 /// be safely sent between threads. The `convert()` call sends the conversion
 /// request to the rendering thread and waits for the result.
 #[derive(Debug)]
-pub struct GLConverterThreaded {
+pub struct GLProcessorThreaded {
     // This is only None when the converter is being dropped.
     handle: Option<JoinHandle<()>>,
 
     // This is only None when the converter is being dropped.
-    sender: Option<Sender<GLConverterMessage>>,
+    sender: Option<Sender<GLProcessorMessage>>,
     support_dma: bool,
 }
 
-unsafe impl Send for GLConverterThreaded {}
-unsafe impl Sync for GLConverterThreaded {}
+unsafe impl Send for GLProcessorThreaded {}
+unsafe impl Sync for GLProcessorThreaded {}
 
 struct SendablePtr<T: Send> {
     ptr: NonNull<T>,
+    len: usize,
 }
 
 unsafe impl<T> Send for SendablePtr<T> where T: Send {}
 
-impl GLConverterThreaded {
+impl GLProcessorThreaded {
     /// Creates a new OpenGL multi-threaded image converter.
     pub fn new() -> Result<Self, Error> {
-        let (send, mut recv) = tokio::sync::mpsc::channel::<GLConverterMessage>(1);
+        let (send, mut recv) = tokio::sync::mpsc::channel::<GLProcessorMessage>(1);
 
         let (create_ctx_send, create_ctx_recv) = tokio::sync::oneshot::channel();
 
         let func = move || {
-            let mut gl_converter = match GLConverterST::new() {
+            let mut gl_converter = match GLProcessorST::new() {
                 Ok(gl) => gl,
                 Err(e) => {
                     let _ = create_ctx_send.send(Err(e));
@@ -497,13 +524,31 @@ impl GLConverterThreaded {
                 }
             };
             let _ = create_ctx_send.send(Ok(gl_converter.gl_context.support_dma));
-            while let Some((src, mut dst, rotation, flip, crop, resp)) = recv.blocking_recv() {
-                // SAFETY: This is safe because the convert() function waits for the resp to be
-                // sent before dropping the borrow for src and dst
-                let src = unsafe { src.ptr.as_ref() };
-                let dst = unsafe { dst.ptr.as_mut() };
-                let res = gl_converter.convert(src, dst, rotation, flip, crop);
-                let _ = resp.send(res);
+            while let Some(msg) = recv.blocking_recv() {
+                match msg {
+                    GLProcessorMessage::ImageConvert(src, mut dst, rotation, flip, crop, resp) => {
+                        // SAFETY: This is safe because the convert() function waits for the resp to
+                        // be sent before dropping the borrow for src and dst
+                        let src = unsafe { src.ptr.as_ref() };
+                        let dst = unsafe { dst.ptr.as_mut() };
+                        let res = gl_converter.convert(src, dst, rotation, flip, crop);
+                        let _ = resp.send(res);
+                    }
+                    GLProcessorMessage::ImageRender(mut dst, det, seg, resp) => {
+                        // SAFETY: This is safe because the render_to_image() function waits for the
+                        // resp to be sent before dropping the borrow for dst, detect, and
+                        // segmentation
+                        let dst = unsafe { dst.ptr.as_mut() };
+                        let det = unsafe { std::slice::from_raw_parts(det.ptr.as_ptr(), det.len) };
+                        let seg = unsafe { std::slice::from_raw_parts(seg.ptr.as_ptr(), seg.len) };
+                        let res = gl_converter.render_to_image(dst, det, seg);
+                        let _ = resp.send(res);
+                    }
+                    GLProcessorMessage::SetColors(colors, resp) => {
+                        let res = gl_converter.set_class_colors(&colors);
+                        let _ = resp.send(res);
+                    }
+                }
             }
         };
 
@@ -528,7 +573,7 @@ impl GLConverterThreaded {
     }
 }
 
-impl ImageConverterTrait for GLConverterThreaded {
+impl ImageProcessorTrait for GLProcessorThreaded {
     fn convert(
         &mut self,
         src: &TensorImage,
@@ -538,14 +583,14 @@ impl ImageConverterTrait for GLConverterThreaded {
         crop: Crop,
     ) -> crate::Result<()> {
         crop.check_crop(src, dst)?;
-        if !GLConverterST::check_src_format_supported(self.support_dma, src) {
+        if !GLProcessorST::check_src_format_supported(self.support_dma, src) {
             return Err(crate::Error::NotSupported(format!(
                 "Opengl doesn't support {} source texture",
                 src.fourcc().display()
             )));
         }
 
-        if !GLConverterST::check_dst_format_supported(self.support_dma, dst) {
+        if !GLProcessorST::check_dst_format_supported(self.support_dma, dst) {
             return Err(crate::Error::NotSupported(format!(
                 "Opengl doesn't support {} destination texture",
                 dst.fourcc().display()
@@ -556,9 +601,15 @@ impl ImageConverterTrait for GLConverterThreaded {
         self.sender
             .as_ref()
             .unwrap()
-            .blocking_send((
-                SendablePtr { ptr: src.into() },
-                SendablePtr { ptr: dst.into() },
+            .blocking_send(GLProcessorMessage::ImageConvert(
+                SendablePtr {
+                    ptr: src.into(),
+                    len: 1,
+                },
+                SendablePtr {
+                    ptr: dst.into(),
+                    len: 1,
+                },
                 rotation,
                 flip,
                 crop,
@@ -569,9 +620,54 @@ impl ImageConverterTrait for GLConverterThreaded {
             Error::Internal("GL converter error messaging closed without update".to_string())
         })?
     }
+
+    #[cfg(feature = "decoder")]
+    fn render_to_image(
+        &mut self,
+        dst: &mut TensorImage,
+        detect: &[crate::DetectBox],
+        segmentation: &[crate::Segmentation],
+    ) -> crate::Result<()> {
+        let (err_send, err_recv) = tokio::sync::oneshot::channel();
+        self.sender
+            .as_ref()
+            .unwrap()
+            .blocking_send(GLProcessorMessage::ImageRender(
+                SendablePtr {
+                    ptr: dst.into(),
+                    len: 1,
+                },
+                SendablePtr {
+                    ptr: NonNull::new(detect.as_ptr() as *mut DetectBox).unwrap(),
+                    len: detect.len(),
+                },
+                SendablePtr {
+                    ptr: NonNull::new(segmentation.as_ptr() as *mut Segmentation).unwrap(),
+                    len: segmentation.len(),
+                },
+                err_send,
+            ))
+            .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
+        err_recv.blocking_recv().map_err(|_| {
+            Error::Internal("GL converter error messaging closed without update".to_string())
+        })?
+    }
+
+    #[cfg(feature = "decoder")]
+    fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<(), crate::Error> {
+        let (err_send, err_recv) = tokio::sync::oneshot::channel();
+        self.sender
+            .as_ref()
+            .unwrap()
+            .blocking_send(GLProcessorMessage::SetColors(colors.to_vec(), err_send))
+            .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
+        err_recv.blocking_recv().map_err(|_| {
+            Error::Internal("GL converter error messaging closed without update".to_string())
+        })?
+    }
 }
 
-impl Drop for GLConverterThreaded {
+impl Drop for GLProcessorThreaded {
     fn drop(&mut self) {
         drop(self.sender.take());
         let _ = self.handle.take().and_then(|h| h.join().ok());
@@ -579,10 +675,18 @@ impl Drop for GLConverterThreaded {
 }
 
 /// OpenGL single-threaded image converter.
-pub struct GLConverterST {
+pub struct GLProcessorST {
     camera_eglimage_texture: Texture,
     camera_normal_texture: Texture,
     render_texture: Texture,
+    #[cfg(feature = "decoder")]
+    segmentation_texture: Texture,
+    #[cfg(feature = "decoder")]
+    segmentation_program: GlProgram,
+    #[cfg(feature = "decoder")]
+    instanced_segmentation_program: GlProgram,
+    #[cfg(feature = "decoder")]
+    color_program: GlProgram,
     vertex_buffer: Buffer,
     texture_buffer: Buffer,
     texture_program: GlProgram,
@@ -591,7 +695,7 @@ pub struct GLConverterST {
     gl_context: GlContext,
 }
 
-impl ImageConverterTrait for GLConverterST {
+impl ImageProcessorTrait for GLProcessorST {
     fn convert(
         &mut self,
         src: &TensorImage,
@@ -633,10 +737,106 @@ impl ImageConverterTrait for GLConverterST {
         log::debug!("convert_dest_non_dma takes {:?}", start.elapsed());
         res
     }
+
+    #[cfg(feature = "decoder")]
+    fn render_to_image(
+        &mut self,
+        dst: &mut TensorImage,
+        detect: &[DetectBox],
+        segmentation: &[Segmentation],
+    ) -> Result<(), crate::Error> {
+        use crate::FunctionTimer;
+
+        let _timer = FunctionTimer::new("GLProcessorST::render_to_image");
+        if !matches!(dst.fourcc(), RGBA | RGB) {
+            return Err(crate::Error::NotSupported(
+                "Opengl image rendering only supports RGBA or RGB images".to_string(),
+            ));
+        }
+
+        let (_render_buffer, is_dma) = match dst.tensor.memory() {
+            edgefirst_tensor::TensorMemory::Dma => {
+                if let Ok(render_buffer) = self.setup_renderbuffer_dma(dst) {
+                    (render_buffer, true)
+                } else {
+                    (
+                        self.setup_renderbuffer_non_dma(
+                            dst,
+                            Crop::new().with_dst_rect(Some(Rect::new(0, 0, 0, 0))),
+                        )?,
+                        false,
+                    )
+                }
+            }
+            _ => (
+                self.setup_renderbuffer_non_dma(
+                    dst,
+                    Crop::new().with_dst_rect(Some(Rect::new(0, 0, 0, 0))),
+                )?,
+                false,
+            ), // Add dest rect to make sure dst is rendered fully
+        };
+
+        self.render_box(dst, detect)?;
+        self.render_segmentation(detect, segmentation)?;
+
+        gls::finish();
+        if !is_dma {
+            let mut dst_map = dst.tensor().map()?;
+            let format = match dst.fourcc() {
+                RGB => gls::gl::RGB,
+                RGBA => gls::gl::RGBA,
+                _ => unreachable!(),
+            };
+            unsafe {
+                gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
+                gls::gl::ReadnPixels(
+                    0,
+                    0,
+                    dst.width() as i32,
+                    dst.height() as i32,
+                    format,
+                    gls::gl::UNSIGNED_BYTE,
+                    dst.tensor.len() as i32,
+                    dst_map.as_mut_ptr() as *mut c_void,
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "decoder")]
+    fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> crate::Result<()> {
+        if colors.is_empty() {
+            return Ok(());
+        }
+        let colors_f32 = colors
+            .iter()
+            .map(|c| {
+                [
+                    c[0] as f32 / 255.0,
+                    c[1] as f32 / 255.0,
+                    c[2] as f32 / 255.0,
+                    c[3] as f32 / 255.0,
+                ]
+            })
+            .take(20)
+            .collect::<Vec<[f32; 4]>>();
+
+        self.segmentation_program
+            .load_uniform_4fv(c"colors", &colors_f32)?;
+        self.instanced_segmentation_program
+            .load_uniform_4fv(c"colors", &colors_f32)?;
+        self.color_program
+            .load_uniform_4fv(c"colors", &colors_f32)?;
+
+        Ok(())
+    }
 }
 
-impl GLConverterST {
-    pub fn new() -> Result<GLConverterST, crate::Error> {
+impl GLProcessorST {
+    pub fn new() -> Result<GLProcessorST, crate::Error> {
         let gl_context = GlContext::new()?;
         gls::load_with(|s| {
             gl_context
@@ -663,21 +863,50 @@ impl GLConverterST {
             generate_vertex_shader(),
             generate_texture_fragment_shader_yuv(),
         )?;
+
+        #[cfg(feature = "decoder")]
+        let segmentation_program =
+            GlProgram::new(generate_vertex_shader(), generate_segmentation_shader())?;
+        #[cfg(feature = "decoder")]
+        segmentation_program.load_uniform_4fv(c"colors", &DEFAULT_COLORS)?;
+        #[cfg(feature = "decoder")]
+        let instanced_segmentation_program = GlProgram::new(
+            generate_vertex_shader(),
+            generate_instanced_segmentation_shader(),
+        )?;
+        #[cfg(feature = "decoder")]
+        instanced_segmentation_program.load_uniform_4fv(c"colors", &DEFAULT_COLORS)?;
+
+        #[cfg(feature = "decoder")]
+        let color_program = GlProgram::new(generate_vertex_shader(), generate_color_shader())?;
+        #[cfg(feature = "decoder")]
+        color_program.load_uniform_4fv(c"colors", &DEFAULT_COLORS)?;
+
         let camera_eglimage_texture = Texture::new();
         let camera_normal_texture = Texture::new();
         let render_texture = Texture::new();
+        let segmentation_texture = Texture::new();
         let vertex_buffer = Buffer::new(0, 3, 100);
         let texture_buffer = Buffer::new(1, 2, 100);
-        let converter = GLConverterST {
+
+        let converter = GLProcessorST {
             gl_context,
             texture_program,
             texture_program_yuv,
             texture_program_planar,
             camera_eglimage_texture,
             camera_normal_texture,
+            #[cfg(feature = "decoder")]
+            segmentation_texture,
             vertex_buffer,
             texture_buffer,
             render_texture,
+            #[cfg(feature = "decoder")]
+            segmentation_program,
+            #[cfg(feature = "decoder")]
+            instanced_segmentation_program,
+            #[cfg(feature = "decoder")]
+            color_program,
         };
         check_gl_error(function!(), line!())?;
 
@@ -738,15 +967,7 @@ impl GLConverterST {
         Ok(())
     }
 
-    fn convert_dest_dma(
-        &mut self,
-        dst: &mut TensorImage,
-        src: &TensorImage,
-        rotation: crate::Rotation,
-        flip: Flip,
-        crop: Crop,
-    ) -> crate::Result<()> {
-        assert!(self.gl_context.support_dma);
+    fn setup_renderbuffer_dma(&mut self, dst: &TensorImage) -> crate::Result<FrameBuffer> {
         let frame_buffer = FrameBuffer::new();
         frame_buffer.bind();
 
@@ -783,15 +1004,10 @@ impl GLConverterST {
             check_gl_error(function!(), line!())?;
             gls::gl::Viewport(0, 0, width, height);
         }
-
-        if dst.is_planar() {
-            self.convert_to_planar(src, dst, rotation, flip, crop)
-        } else {
-            self.convert_to(src, dst, rotation, flip, crop)
-        }
+        Ok(frame_buffer)
     }
 
-    fn convert_dest_non_dma(
+    fn convert_dest_dma(
         &mut self,
         dst: &mut TensorImage,
         src: &TensorImage,
@@ -799,14 +1015,27 @@ impl GLConverterST {
         flip: Flip,
         crop: Crop,
     ) -> crate::Result<()> {
-        log::trace!("convert_dest_non_dma: rot: {rotation:?} flip: {flip:?} crop: {crop:?}");
+        assert!(self.gl_context.support_dma);
+        let _framebuffer = self.setup_renderbuffer_dma(dst)?;
+        if dst.is_planar() {
+            self.convert_to_planar(src, dst, rotation, flip, crop)
+        } else {
+            self.convert_to(src, dst, rotation, flip, crop)
+        }
+    }
+
+    fn setup_renderbuffer_non_dma(
+        &mut self,
+        dst: &TensorImage,
+        crop: Crop,
+    ) -> crate::Result<FrameBuffer> {
         debug_assert!(matches!(dst.fourcc(), RGB | RGBA | GREY | PLANAR_RGB));
         let (width, height) = if dst.is_planar() {
-            let width = src.width() / 4;
-            let height = match src.fourcc() {
-                RGBA => src.height() * 4,
-                RGB => src.height() * 3,
-                GREY => src.height(),
+            let width = dst.width() / 4;
+            let height = match dst.fourcc() {
+                RGBA => dst.height() * 4,
+                RGB => dst.height() * 3,
+                GREY => dst.height(),
                 _ => unreachable!(),
             };
             (width as i32, height as i32)
@@ -820,7 +1049,7 @@ impl GLConverterST {
             match dst.fourcc() {
                 RGB => gls::gl::RGB,
                 RGBA => gls::gl::RGBA,
-                GREY => gls::gl::RED, // TODO: Check if opengl version supports this
+                GREY => gls::gl::RED,
                 _ => unreachable!(),
             }
         };
@@ -880,6 +1109,18 @@ impl GLConverterST {
             gls::gl::Viewport(0, 0, width, height);
         }
         log::debug!("Set up framebuffer takes {:?}", start.elapsed());
+        Ok(frame_buffer)
+    }
+
+    fn convert_dest_non_dma(
+        &mut self,
+        dst: &mut TensorImage,
+        src: &TensorImage,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> crate::Result<()> {
+        let _framebuffer = self.setup_renderbuffer_non_dma(dst, crop)?;
         let start = Instant::now();
         if dst.is_planar() {
             self.convert_to_planar(src, dst, rotation, flip, crop)?;
@@ -1488,6 +1729,7 @@ impl GLConverterST {
 
             gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
             gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
+
             let texture_vertices: [f32; 16] = [
                 src_roi.left,
                 src_roi.top,
@@ -1629,10 +1871,410 @@ impl GLConverterST {
             egl: self.gl_context.egl.clone(),
         })
     }
+
+    // Reshapes the segmentation to be compatible with RGBA texture array rendering.
+    fn reshape_segmentation_to_rgba(&self, segmentation: &[u8], shape: [usize; 3]) -> Vec<u8> {
+        let [height, width, classes] = shape;
+
+        let n_layer_stride = height * width * 4;
+        let n_row_stride = width * 4;
+        let n_col_stride = 4;
+        let row_stride = width * classes;
+        let col_stride = classes;
+
+        let mut new_segmentation = vec![0u8; n_layer_stride * classes.div_ceil(4)];
+
+        for i in 0..height {
+            for j in 0..width {
+                for k in 0..classes.div_ceil(4) * 4 {
+                    if k >= classes {
+                        new_segmentation[n_layer_stride * (k / 4)
+                            + i * n_row_stride
+                            + j * n_col_stride
+                            + k % 4] = 0;
+                    } else {
+                        new_segmentation[n_layer_stride * (k / 4)
+                            + i * n_row_stride
+                            + j * n_col_stride
+                            + k % 4] = segmentation[i * row_stride + j * col_stride + k];
+                    }
+                }
+            }
+        }
+
+        new_segmentation
+    }
+
+    #[cfg(feature = "decoder")]
+    fn render_modelpack_segmentation(
+        &mut self,
+        dst_roi: RegionOfInterest,
+        segmentation: &[u8],
+        shape: [usize; 3],
+    ) -> Result<(), crate::Error> {
+        log::debug!("start render_segmentation_to_image");
+
+        // TODO: Implement specialization for 2 classes and 4 classes which shouldn't
+        // need rearranging the data
+        let new_segmentation = self.reshape_segmentation_to_rgba(segmentation, shape);
+
+        let [height, width, classes] = shape;
+
+        let format = gls::gl::RGBA;
+        let texture_target = gls::gl::TEXTURE_2D_ARRAY;
+        self.segmentation_program
+            .load_uniform_1i(c"background_index", shape[2] as i32 - 1)?;
+
+        gls::use_program(self.segmentation_program.id);
+
+        gls::bind_texture(texture_target, self.segmentation_texture.id);
+        gls::active_texture(gls::gl::TEXTURE0);
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_MIN_FILTER,
+            gls::gl::LINEAR as i32,
+        );
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_MAG_FILTER,
+            gls::gl::LINEAR as i32,
+        );
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_WRAP_S,
+            gls::gl::CLAMP_TO_EDGE as i32,
+        );
+
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_WRAP_T,
+            gls::gl::CLAMP_TO_EDGE as i32,
+        );
+
+        gls::tex_image3d(
+            texture_target,
+            0,
+            format as i32,
+            width as i32,
+            height as i32,
+            classes.div_ceil(4) as i32,
+            0,
+            format,
+            gls::gl::UNSIGNED_BYTE,
+            Some(&new_segmentation),
+        );
+
+        let src_roi = RegionOfInterest {
+            left: 0.,
+            top: 1.,
+            right: 1.,
+            bottom: 0.,
+        };
+
+        unsafe {
+            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
+            gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
+
+            let camera_vertices: [f32; 12] = [
+                dst_roi.left,
+                dst_roi.top,
+                0., // left top
+                dst_roi.right,
+                dst_roi.top,
+                0., // right top
+                dst_roi.right,
+                dst_roi.bottom,
+                0., // right bottom
+                dst_roi.left,
+                dst_roi.bottom,
+                0., // left bottom
+            ];
+            gls::gl::BufferSubData(
+                gls::gl::ARRAY_BUFFER,
+                0,
+                (size_of::<f32>() * camera_vertices.len()) as isize,
+                camera_vertices.as_ptr() as *const c_void,
+            );
+
+            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
+            gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
+
+            let texture_vertices: [f32; 8] = [
+                src_roi.left,
+                src_roi.top,
+                src_roi.right,
+                src_roi.top,
+                src_roi.right,
+                src_roi.bottom,
+                src_roi.left,
+                src_roi.bottom,
+            ];
+            gls::gl::BufferSubData(
+                gls::gl::ARRAY_BUFFER,
+                0,
+                (size_of::<f32>() * 8) as isize,
+                (texture_vertices[0..]).as_ptr() as *const c_void,
+            );
+
+            let vertices_index: [u32; 4] = [0, 1, 2, 3];
+            gls::gl::DrawElements(
+                gls::gl::TRIANGLE_FAN,
+                vertices_index.len() as i32,
+                gls::gl::UNSIGNED_INT,
+                vertices_index.as_ptr() as *const c_void,
+            );
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "decoder")]
+    fn render_yolo_segmentation(
+        &mut self,
+        dst_roi: RegionOfInterest,
+        segmentation: &[u8],
+        shape: [usize; 2],
+        class: usize,
+    ) -> Result<(), crate::Error> {
+        log::debug!("start render_yolo_segmentation");
+
+        let [height, width] = shape;
+
+        let format = gls::gl::RED;
+        let texture_target = gls::gl::TEXTURE_2D;
+        gls::use_program(self.instanced_segmentation_program.id);
+        self.instanced_segmentation_program
+            .load_uniform_1i(c"class_index", class as i32)?;
+        gls::bind_texture(texture_target, self.segmentation_texture.id);
+        gls::active_texture(gls::gl::TEXTURE0);
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_MIN_FILTER,
+            gls::gl::LINEAR as i32,
+        );
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_MAG_FILTER,
+            gls::gl::LINEAR as i32,
+        );
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_WRAP_S,
+            gls::gl::CLAMP_TO_EDGE as i32,
+        );
+
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_WRAP_T,
+            gls::gl::CLAMP_TO_EDGE as i32,
+        );
+
+        gls::tex_image2d(
+            texture_target,
+            0,
+            format as i32,
+            width as i32,
+            height as i32,
+            0,
+            format,
+            gls::gl::UNSIGNED_BYTE,
+            Some(segmentation),
+        );
+
+        let src_roi = RegionOfInterest {
+            left: 0.,
+            top: 1.,
+            right: 1.,
+            bottom: 0.,
+        };
+
+        unsafe {
+            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
+            gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
+
+            let camera_vertices: [f32; 12] = [
+                dst_roi.left,
+                dst_roi.top,
+                0., // left top
+                dst_roi.right,
+                dst_roi.top,
+                0., // right top
+                dst_roi.right,
+                dst_roi.bottom,
+                0., // right bottom
+                dst_roi.left,
+                dst_roi.bottom,
+                0., // left bottom
+            ];
+            gls::gl::BufferSubData(
+                gls::gl::ARRAY_BUFFER,
+                0,
+                (size_of::<f32>() * camera_vertices.len()) as isize,
+                camera_vertices.as_ptr() as *const c_void,
+            );
+
+            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
+            gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
+
+            let texture_vertices: [f32; 8] = [
+                src_roi.left,
+                src_roi.top,
+                src_roi.right,
+                src_roi.top,
+                src_roi.right,
+                src_roi.bottom,
+                src_roi.left,
+                src_roi.bottom,
+            ];
+            gls::gl::BufferSubData(
+                gls::gl::ARRAY_BUFFER,
+                0,
+                (size_of::<f32>() * 8) as isize,
+                (texture_vertices).as_ptr() as *const c_void,
+            );
+
+            let vertices_index: [u32; 4] = [0, 1, 2, 3];
+            gls::gl::DrawElements(
+                gls::gl::TRIANGLE_FAN,
+                vertices_index.len() as i32,
+                gls::gl::UNSIGNED_INT,
+                vertices_index.as_ptr() as *const c_void,
+            );
+            gls::gl::Finish();
+        }
+
+        Ok(())
+    }
+
+    fn render_segmentation(
+        &mut self,
+        detect: &[DetectBox],
+        segmentation: &[Segmentation],
+    ) -> crate::Result<()> {
+        if segmentation.is_empty() {
+            return Ok(());
+        }
+        gls::enable(gls::gl::BLEND);
+        gls::blend_func(gls::gl::SRC_ALPHA, gls::gl::ONE_MINUS_SRC_ALPHA);
+
+        let is_modelpack = segmentation[0].segmentation.shape()[2] > 1;
+        // top and bottom are flipped because OpenGL uses 0,0 as bottom left
+        let cvt_screen_coord = |normalized| normalized * 2.0 - 1.0;
+        if is_modelpack {
+            let seg = &segmentation[0];
+            let dst_roi = RegionOfInterest {
+                left: cvt_screen_coord(seg.xmin),
+                top: cvt_screen_coord(seg.ymax),
+                right: cvt_screen_coord(seg.xmax),
+                bottom: cvt_screen_coord(seg.ymin),
+            };
+            let segment = seg.segmentation.as_standard_layout();
+            let slice = segment.as_slice().ok_or(Error::Internal(
+                "Cannot get slice of segmentation".to_owned(),
+            ))?;
+
+            self.render_modelpack_segmentation(
+                dst_roi,
+                slice,
+                [
+                    seg.segmentation.shape()[0],
+                    seg.segmentation.shape()[1],
+                    seg.segmentation.shape()[2],
+                ],
+            )?;
+        } else {
+            for (seg, det) in segmentation.iter().zip(detect) {
+                let dst_roi = RegionOfInterest {
+                    left: cvt_screen_coord(seg.xmin),
+                    top: cvt_screen_coord(seg.ymax),
+                    right: cvt_screen_coord(seg.xmax),
+                    bottom: cvt_screen_coord(seg.ymin),
+                };
+
+                let segment = seg.segmentation.as_standard_layout();
+                let slice = segment.as_slice().ok_or(Error::Internal(
+                    "Cannot get slice of segmentation".to_owned(),
+                ))?;
+
+                self.render_yolo_segmentation(
+                    dst_roi,
+                    slice,
+                    [seg.segmentation.shape()[0], seg.segmentation.shape()[1]],
+                    det.label,
+                )?;
+            }
+        }
+
+        gls::disable(gls::gl::BLEND);
+        Ok(())
+    }
+
+    fn render_box(&mut self, dst: &TensorImage, detect: &[DetectBox]) -> Result<(), Error> {
+        unsafe {
+            gls::gl::UseProgram(self.color_program.id);
+            let rescale = |x: f32| x * 2.0 - 1.0;
+            let thickness = 3.0;
+            for d in detect {
+                self.color_program
+                    .load_uniform_1i(c"class_index", d.label as i32)?;
+                gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
+                gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
+                let bbox: [f32; 4] = d.bbox.into();
+                let outer_box = [
+                    bbox[0] - thickness / dst.width() as f32,
+                    bbox[1] - thickness / dst.height() as f32,
+                    bbox[2] + thickness / dst.width() as f32,
+                    bbox[3] + thickness / dst.height() as f32,
+                ];
+                let camera_vertices: [f32; 24] = [
+                    rescale(bbox[0]),
+                    rescale(bbox[3]),
+                    0., // bottom left
+                    rescale(bbox[2]),
+                    rescale(bbox[3]),
+                    0., // bottom right
+                    rescale(bbox[2]),
+                    rescale(bbox[1]),
+                    0., // top right
+                    rescale(bbox[0]),
+                    rescale(bbox[1]),
+                    0., // top left
+                    rescale(outer_box[0]),
+                    rescale(outer_box[3]),
+                    0., // bottom left
+                    rescale(outer_box[2]),
+                    rescale(outer_box[3]),
+                    0., // bottom right
+                    rescale(outer_box[2]),
+                    rescale(outer_box[1]),
+                    0., // top right
+                    rescale(outer_box[0]),
+                    rescale(outer_box[1]),
+                    0., // top left
+                ];
+                gls::gl::BufferData(
+                    gls::gl::ARRAY_BUFFER,
+                    (size_of::<f32>() * camera_vertices.len()) as isize,
+                    camera_vertices.as_ptr() as *const c_void,
+                    gls::gl::DYNAMIC_DRAW,
+                );
+
+                let vertices_index: [u32; 10] = [0, 1, 5, 2, 6, 3, 7, 0, 4, 5];
+                gls::gl::DrawElements(
+                    gls::gl::TRIANGLE_STRIP,
+                    vertices_index.len() as i32,
+                    gls::gl::UNSIGNED_INT,
+                    vertices_index.as_ptr() as *const c_void,
+                );
+            }
+        }
+        check_gl_error(function!(), line!())?;
+        Ok(())
+    }
 }
 struct EglImage {
     egl_image: egl::Image,
-    egl: Rc<egl::Instance<egl::Dynamic<libloading::Library, egl::EGL1_4>>>,
+    egl: Rc<Egl>,
     display: egl::Display,
 }
 
@@ -1811,6 +2453,7 @@ impl GlProgram {
         let id = unsafe { gls::gl::CreateProgram() };
         let vertex_id = unsafe { gls::gl::CreateShader(gls::gl::VERTEX_SHADER) };
         if compile_shader_from_str(vertex_id, vertex_shader, "shader_vert").is_err() {
+            log::debug!("Vertex shader source:\n{}", vertex_shader);
             return Err(crate::Error::OpenGl(format!(
                 "Shader compile error: {vertex_shader}"
             )));
@@ -1821,6 +2464,7 @@ impl GlProgram {
 
         let fragment_id = unsafe { gls::gl::CreateShader(gls::gl::FRAGMENT_SHADER) };
         if compile_shader_from_str(fragment_id, fragment_shader, "shader_frag").is_err() {
+            log::debug!("Fragment shader source:\n{}", fragment_shader);
             return Err(crate::Error::OpenGl(format!(
                 "Shader compile error: {fragment_shader}"
             )));
@@ -1832,20 +2476,6 @@ impl GlProgram {
             gls::gl::UseProgram(id);
         }
 
-        let pv = [
-            1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
-        ];
-        let m = [
-            1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
-        ];
-
-        unsafe {
-            let pv_location = gls::gl::GetUniformLocation(id, c"PV".as_ptr());
-            gls::gl::UniformMatrix4fv(pv_location, 1, 0, pv.as_ptr());
-
-            let m_location = gls::gl::GetUniformLocation(id, c"M".as_ptr());
-            gls::gl::UniformMatrix4fv(m_location, 1, 0, m.as_ptr());
-        }
         Ok(Self {
             id,
             vertex_id,
@@ -1854,21 +2484,39 @@ impl GlProgram {
     }
 
     #[allow(dead_code)]
-    fn load_uniform_1f(&self, name: &CStr, value: f32) {
+    fn load_uniform_1f(&self, name: &CStr, value: f32) -> Result<(), crate::Error> {
         unsafe {
             gls::gl::UseProgram(self.id);
             let location = gls::gl::GetUniformLocation(self.id, name.as_ptr());
             gls::gl::Uniform1f(location, value);
         }
+        Ok(())
     }
 
     #[allow(dead_code)]
-    fn load_uniform_1i(&self, name: &CStr, value: i32) {
+    fn load_uniform_1i(&self, name: &CStr, value: i32) -> Result<(), crate::Error> {
         unsafe {
             gls::gl::UseProgram(self.id);
             let location = gls::gl::GetUniformLocation(self.id, name.as_ptr());
             gls::gl::Uniform1i(location, value);
         }
+        Ok(())
+    }
+
+    fn load_uniform_4fv(&self, name: &CStr, value: &[[f32; 4]]) -> Result<(), crate::Error> {
+        unsafe {
+            gls::gl::UseProgram(self.id);
+            let location = gls::gl::GetUniformLocation(self.id, name.as_ptr());
+            if location == -1 {
+                return Err(crate::Error::OpenGl(format!(
+                    "Could not find uniform location for '{}'",
+                    name.to_string_lossy().into_owned()
+                )));
+            }
+            gls::gl::Uniform4fv(location, value.len() as i32, value.as_flattened().as_ptr());
+        }
+        check_gl_error(function!(), line!())?;
+        Ok(())
     }
 }
 
@@ -1980,9 +2628,6 @@ precision mediump float;
 layout(location = 0) in vec3 pos;
 layout(location = 1) in vec2 texCoord;
 
-uniform mat4 M;
-uniform mat4 PV;
-
 out vec3 fragPos;
 out vec2 tc;
 
@@ -2044,4 +2689,282 @@ void main(){
     color = texture(tex, tc);
 }
 "
+}
+
+/// this shader requires a reshape of the segmentation output tensor to (H, W,
+/// C/4, 4)
+fn generate_segmentation_shader() -> &'static str {
+    "\
+#version 300 es
+precision mediump float;
+precision mediump sampler2DArray;
+
+uniform sampler2DArray tex;
+uniform vec4 colors[20];
+uniform int background_index;
+
+in vec3 fragPos;
+in vec2 tc;
+in vec4 fragColor;
+
+out vec4 color;
+
+float max_arg(const in vec4 args, out int argmax) {
+    if (args[0] >= args[1] && args[0] >= args[2] && args[0] >= args[3]) {
+        argmax = 0;
+        return args[0];
+    }
+    if (args[1] >= args[0] && args[1] >= args[2] && args[1] >= args[3]) {
+        argmax = 1;
+        return args[1];
+    }
+    if (args[2] >= args[0] && args[2] >= args[1] && args[2] >= args[3]) {
+        argmax = 2;
+        return args[2];
+    }
+    argmax = 3;
+    return args[3];
+}
+
+void main() {
+    mediump int layers = textureSize(tex, 0).z;
+    float max_all = -4.0;
+    int max_ind = 0;
+    for (int i = 0; i < layers; i++) {
+        vec4 d = texture(tex, vec3(tc, i));
+        int max_ind_ = 0;
+        float max_ = max_arg(d, max_ind_);
+        if (max_ <= max_all) { continue; }
+        max_all = max_;
+        max_ind = i*4 + max_ind_;
+    }
+    if (max_ind == background_index) {
+        discard;
+    }
+    max_ind = max_ind % 20;
+    color = colors[max_ind];
+}
+"
+}
+
+fn generate_instanced_segmentation_shader() -> &'static str {
+    "\
+#version 300 es
+precision mediump float;
+uniform sampler2D mask0;
+uniform vec4 colors[20];
+uniform int class_index;
+in vec3 fragPos;
+in vec2 tc;
+in vec4 fragColor;
+
+out vec4 color;
+void main() {
+    float r0 = texture(mask0, tc).r;
+    int arg = int(r0>=0.5);
+    if (arg == 0) {
+        discard;
+    }
+    color = colors[class_index % 20];
+}
+"
+}
+
+fn generate_color_shader() -> &'static str {
+    "\
+#version 300 es
+precision mediump float;
+uniform vec4 colors[20];
+uniform int class_index;
+
+out vec4 color;
+void main() {
+    int index = class_index % 20;
+    color = colors[index];
+}
+"
+}
+
+#[cfg(test)]
+#[cfg(feature = "opengl")]
+mod gl_tests {
+    use super::*;
+    use crate::{RGBA, TensorImage};
+    use ndarray::Array3;
+
+    #[test]
+    #[cfg(feature = "decoder")]
+    fn test_segmentation() {
+        use edgefirst_decoder::Segmentation;
+
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        let mut image = TensorImage::load(
+            include_bytes!("../../../testdata/giraffe.jpg"),
+            Some(RGBA),
+            None,
+        )
+        .unwrap();
+
+        let mut segmentation = Array3::from_shape_vec(
+            (2, 160, 160),
+            include_bytes!("../../../testdata/modelpack_seg_2x160x160.bin").to_vec(),
+        )
+        .unwrap();
+        segmentation.swap_axes(0, 1);
+        segmentation.swap_axes(1, 2);
+        let segmentation = segmentation.as_standard_layout().to_owned();
+
+        let seg = Segmentation {
+            segmentation,
+            xmin: 0.0,
+            ymin: 0.0,
+            xmax: 1.0,
+            ymax: 1.0,
+        };
+
+        let mut renderer = GLProcessorThreaded::new().unwrap();
+        renderer.render_to_image(&mut image, &[], &[seg]).unwrap();
+
+        image.save_jpeg("test_segmentation.jpg", 80).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "decoder")]
+    fn test_segmentation_mem() {
+        use edgefirst_decoder::Segmentation;
+
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        let mut image = TensorImage::load(
+            include_bytes!("../../../testdata/giraffe.jpg"),
+            Some(RGBA),
+            Some(edgefirst_tensor::TensorMemory::Mem),
+        )
+        .unwrap();
+
+        let mut segmentation = Array3::from_shape_vec(
+            (2, 160, 160),
+            include_bytes!("../../../testdata/modelpack_seg_2x160x160.bin").to_vec(),
+        )
+        .unwrap();
+        segmentation.swap_axes(0, 1);
+        segmentation.swap_axes(1, 2);
+        let segmentation = segmentation.as_standard_layout().to_owned();
+
+        let seg = Segmentation {
+            segmentation,
+            xmin: 0.0,
+            ymin: 0.0,
+            xmax: 1.0,
+            ymax: 1.0,
+        };
+
+        let mut renderer = GLProcessorThreaded::new().unwrap();
+        renderer.render_to_image(&mut image, &[], &[seg]).unwrap();
+
+        image.save_jpeg("test_segmentation_mem.jpg", 80).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "decoder")]
+    fn test_segmentation_yolo() {
+        use edgefirst_decoder::Segmentation;
+        use ndarray::Array3;
+
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        let mut image = TensorImage::load(
+            include_bytes!("../../../testdata/giraffe.jpg"),
+            Some(RGBA),
+            None,
+        )
+        .unwrap();
+
+        let segmentation = Array3::from_shape_vec(
+            (76, 55, 1),
+            include_bytes!("../../../testdata/yolov8_seg_crop_76x55.bin").to_vec(),
+        )
+        .unwrap();
+
+        let detect = DetectBox {
+            bbox: [0.59375, 0.25, 0.9375, 0.725].into(),
+            score: 0.99,
+            label: 0,
+        };
+
+        let seg = Segmentation {
+            segmentation,
+            xmin: 0.59375,
+            ymin: 0.25,
+            xmax: 0.9375,
+            ymax: 0.725,
+        };
+
+        let mut renderer = GLProcessorThreaded::new().unwrap();
+        renderer
+            .set_class_colors(&[[255, 255, 0, 233], [128, 128, 0, 20]])
+            .unwrap();
+        renderer
+            .render_to_image(&mut image, &[detect], &[seg])
+            .unwrap();
+
+        image.save_jpeg("test_segmentation_yolo.jpg", 80).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "decoder")]
+    fn test_boxes() {
+        use edgefirst_decoder::DetectBox;
+
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        let mut image = TensorImage::load(
+            include_bytes!("../../../testdata/giraffe.jpg"),
+            Some(RGBA),
+            None,
+        )
+        .unwrap();
+
+        let detect = DetectBox {
+            bbox: [0.59375, 0.25, 0.9375, 0.725].into(),
+            score: 0.99,
+            label: 0,
+        };
+        let mut renderer = GLProcessorThreaded::new().unwrap();
+        renderer
+            .set_class_colors(&[[255, 255, 0, 233], [128, 128, 0, 20]])
+            .unwrap();
+        renderer
+            .render_to_image(&mut image, &[detect], &[])
+            .unwrap();
+
+        image.save_jpeg("test_boxes.jpg", 80).unwrap();
+    }
+
+    static GL_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Helper function to check if OpenGL is available
+    fn is_opengl_available() -> bool {
+        #[cfg(all(target_os = "linux", feature = "opengl"))]
+        {
+            *GL_AVAILABLE.get_or_init(|| GLProcessorThreaded::new().is_ok())
+        }
+
+        #[cfg(not(all(target_os = "linux", feature = "opengl")))]
+        {
+            false
+        }
+    }
 }
