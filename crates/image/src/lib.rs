@@ -19,17 +19,17 @@ The main features of the `edgefirst_image` crate include:
 
 The crate defines a `TensorImage` struct that represents an image as a
 tensor, along with its format information. It also provides an
-`ImageConverter` struct that manages the conversion process, selecting
+`ImageProcessor` struct that manages the conversion process, selecting
 the appropriate conversion method based on the available hardware.
 
 ## Examples
 
 ```rust
-# use edgefirst_image::{ImageConverter, TensorImage, RGBA, RGB, Rotation, Flip, Crop, ImageConverterTrait};
+# use edgefirst_image::{ImageProcessor, TensorImage, RGBA, RGB, Rotation, Flip, Crop, ImageProcessorTrait};
 # fn main() -> Result<(), edgefirst_image::Error> {
 let image = include_bytes!("../../../testdata/zidane.jpg");
 let img = TensorImage::load(image, Some(RGBA), None)?;
-let mut converter = ImageConverter::new()?;
+let mut converter = ImageProcessor::new()?;
 let mut dst = TensorImage::new(640, 480, RGB, None)?;
 converter.convert(&img, &mut dst, Rotation::None, Flip::None, Crop::default())?;
 # Ok(())
@@ -37,7 +37,7 @@ converter.convert(&img, &mut dst, Rotation::None, Flip::None, Crop::default())?;
 ```
 
 ## Environment Variables
-The behavior of the `edgefirst_image::ImageConverter` struct can be influenced by the
+The behavior of the `edgefirst_image::ImageProcessor` struct can be influenced by the
 following environment variables:
 - `EDGEFIRST_DISABLE_GL`: If set to `1`, disables the use of OpenGL for image
   conversion, forcing the use of CPU or other available hardware methods.
@@ -46,7 +46,7 @@ following environment variables:
 - `EDGEFIRST_DISABLE_CPU`: If set to `1`, disables the use of CPU for image
   conversion, forcing the use of hardware acceleration methods. If no hardware
   acceleration methods are available, an error will be returned when attempting
-  to create an `ImageConverter`.
+  to create an `ImageProcessor`.
 
 Additionally the TensorMemory used by default allocations can be controlled using the
 `EDGEFIRST_TENSOR_FORCE_MEM` environment variable. If set to `1`, default tensor memory
@@ -55,6 +55,8 @@ and hardware acceleration. However, this will increase the performance of the CP
 */
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+#[cfg(feature = "decoder")]
+use edgefirst_decoder::{DetectBox, Segmentation};
 use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait as _};
 use enum_dispatch::enum_dispatch;
 use four_char_code::{FourCharCode, four_char_code};
@@ -65,13 +67,13 @@ use zune_jpeg::{
 };
 use zune_png::PngDecoder;
 
-pub use cpu::CPUConverter;
+pub use cpu::CPUProcessor;
 pub use error::{Error, Result};
 #[cfg(target_os = "linux")]
-pub use g2d::G2DConverter;
+pub use g2d::G2DProcessor;
 #[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
-pub use opengl_headless::GLConverterThreaded;
+pub use opengl_headless::GLProcessorThreaded;
 
 mod cpu;
 mod error;
@@ -310,7 +312,7 @@ impl TensorImage {
 
                 decoder.decode_into(&mut tmp.tensor.map()?)?;
 
-                CPUConverter::convert_format(&tmp, &mut img)?;
+                CPUProcessor::convert_format(&tmp, &mut img)?;
                 return Ok(img);
             }
             decoder.decode_into(&mut img.tensor.map()?)?;
@@ -334,7 +336,7 @@ impl TensorImage {
 
             decoder.decode_into(&mut tmp2.tensor.map()?)?;
 
-            CPUConverter::convert_format(&tmp2, &mut tmp)?;
+            CPUProcessor::convert_format(&tmp2, &mut tmp)?;
         } else {
             decoder.decode_into(&mut tmp.tensor.map()?)?;
         }
@@ -610,7 +612,7 @@ fn rotate_flip_to_tensor_image(
 
     let mut dst_map = dst.tensor.map()?;
 
-    CPUConverter::flip_rotate_ndarray(&src_map, &mut dst_map, &dst, rotation, flip)?;
+    CPUProcessor::flip_rotate_ndarray(&src_map, &mut dst_map, &dst, rotation, flip)?;
 
     Ok(dst)
 }
@@ -736,8 +738,8 @@ impl Rect {
     }
 }
 
-#[enum_dispatch(ImageConverter)]
-pub trait ImageConverterTrait {
+#[enum_dispatch(ImageProcessor)]
+pub trait ImageProcessorTrait {
     /// Converts the source image to the destination image format and size. The
     /// image is cropped first, then flipped, then rotated
     ///
@@ -761,44 +763,57 @@ pub trait ImageConverterTrait {
         flip: Flip,
         crop: Crop,
     ) -> Result<()>;
+
+    #[cfg(feature = "decoder")]
+    fn render_to_image(
+        &mut self,
+        dst: &mut TensorImage,
+        detect: &[DetectBox],
+        segmentation: &[Segmentation],
+    ) -> Result<()>;
+
+    #[cfg(feature = "decoder")]
+    /// Sets the colors used for rendering segmentation masks. Up to 17 colors
+    /// can be set.
+    fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<()>;
 }
 
 /// Image converter that uses available hardware acceleration or CPU as a
 /// fallback.
 #[derive(Debug)]
-pub struct ImageConverter {
+pub struct ImageProcessor {
     /// CPU-based image converter as a fallback. This is only None if the
     /// EDGEFIRST_DISABLE_CPU environment variable is set.
-    pub cpu: Option<CPUConverter>,
+    pub cpu: Option<CPUProcessor>,
 
     #[cfg(target_os = "linux")]
     /// G2D-based image converter for Linux systems. This is only available if
     /// the EDGEFIRST_DISABLE_G2D environment variable is not set and libg2d.so
     /// is available.
-    pub g2d: Option<G2DConverter>,
+    pub g2d: Option<G2DProcessor>,
     #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
     /// OpenGL-based image converter for Linux systems. This is only available
     /// if the EDGEFIRST_DISABLE_GL environment variable is not set and OpenGL
     /// ES is available.
-    pub opengl: Option<GLConverterThreaded>,
+    pub opengl: Option<GLProcessorThreaded>,
 }
 
-unsafe impl Send for ImageConverter {}
-unsafe impl Sync for ImageConverter {}
+unsafe impl Send for ImageProcessor {}
+unsafe impl Sync for ImageProcessor {}
 
-impl ImageConverter {
-    /// Creates a new `ImageConverter` instance, initializing available
+impl ImageProcessor {
+    /// Creates a new `ImageProcessor` instance, initializing available
     /// hardware converters based on the system capabilities and environment
     /// variables.
     ///
     /// # Examples
     /// ```rust
-    /// # use edgefirst_image::{ImageConverter, TensorImage, RGBA, RGB, Rotation, Flip, Crop, ImageConverterTrait};
+    /// # use edgefirst_image::{ImageProcessor, TensorImage, RGBA, RGB, Rotation, Flip, Crop, ImageProcessorTrait};
     /// # fn main() -> Result<(), edgefirst_image::Error> {
     /// let image = include_bytes!("../../../testdata/zidane.jpg");
     /// let img = TensorImage::load(image, Some(RGBA), None)?;
-    /// let mut converter = ImageConverter::new()?;
+    /// let mut converter = ImageProcessor::new()?;
     /// let mut dst = TensorImage::new(640, 480, RGB, None)?;
     /// converter.convert(&img, &mut dst, Rotation::None, Flip::None, Crop::default())?;
     /// # Ok(())
@@ -812,7 +827,7 @@ impl ImageConverter {
             log::debug!("EDGEFIRST_DISABLE_G2D = {x}");
             None
         } else {
-            match G2DConverter::new() {
+            match G2DProcessor::new() {
                 Ok(g2d_converter) => Some(g2d_converter),
                 Err(err) => {
                     log::warn!("Failed to initialize G2D converter: {err:?}");
@@ -830,7 +845,7 @@ impl ImageConverter {
             log::debug!("EDGEFIRST_DISABLE_GL = {x}");
             None
         } else {
-            match GLConverterThreaded::new() {
+            match GLProcessorThreaded::new() {
                 Ok(gl_converter) => Some(gl_converter),
                 Err(err) => {
                     log::warn!("Failed to initialize GL converter: {err:?}");
@@ -846,7 +861,7 @@ impl ImageConverter {
             log::debug!("EDGEFIRST_DISABLE_CPU = {x}");
             None
         } else {
-            Some(CPUConverter::new())
+            Some(CPUProcessor::new())
         };
         Ok(Self {
             cpu,
@@ -859,7 +874,7 @@ impl ImageConverter {
     }
 }
 
-impl ImageConverterTrait for ImageConverter {
+impl ImageProcessorTrait for ImageProcessor {
     /// Converts the source image to the destination image format and size. The
     /// image is cropped first, then flipped, then rotated
     ///
@@ -947,6 +962,87 @@ impl ImageConverterTrait for ImageConverter {
         }
         Err(Error::NoConverter)
     }
+
+    #[cfg(feature = "decoder")]
+    fn render_to_image(
+        &mut self,
+        dst: &mut TensorImage,
+        detect: &[DetectBox],
+        segmentation: &[Segmentation],
+    ) -> Result<()> {
+        let start = Instant::now();
+
+        if detect.is_empty() && segmentation.is_empty() {
+            return Ok(());
+        }
+
+        // skip G2D as it doesn't support rendering to image
+
+        #[cfg(target_os = "linux")]
+        #[cfg(feature = "opengl")]
+        if let Some(opengl) = self.opengl.as_mut() {
+            log::trace!("image started with opengl in {:?}", start.elapsed());
+            match opengl.render_to_image(dst, detect, segmentation) {
+                Ok(_) => {
+                    log::trace!("image rendered with opengl in {:?}", start.elapsed());
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::trace!("image didn't render with opengl: {e:?}")
+                }
+            }
+        }
+        log::trace!("image started with cpu in {:?}", start.elapsed());
+        if let Some(cpu) = self.cpu.as_mut() {
+            match cpu.render_to_image(dst, detect, segmentation) {
+                Ok(_) => {
+                    log::trace!("image render with cpu in {:?}", start.elapsed());
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::trace!("image didn't render with cpu: {e:?}");
+                    return Err(e);
+                }
+            }
+        }
+        Err(Error::NoConverter)
+    }
+
+    #[cfg(feature = "decoder")]
+    fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<()> {
+        let start = Instant::now();
+
+        // skip G2D as it doesn't support rendering to image
+
+        #[cfg(target_os = "linux")]
+        #[cfg(feature = "opengl")]
+        if let Some(opengl) = self.opengl.as_mut() {
+            log::trace!("image started with opengl in {:?}", start.elapsed());
+            match opengl.set_class_colors(colors) {
+                Ok(_) => {
+                    log::trace!("colors set with opengl in {:?}", start.elapsed());
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::trace!("colors didn't set with opengl: {e:?}")
+                }
+            }
+        }
+        log::trace!("image started with cpu in {:?}", start.elapsed());
+        if let Some(cpu) = self.cpu.as_mut() {
+            match cpu.set_class_colors(colors) {
+                Ok(_) => {
+                    log::trace!("colors set with cpu in {:?}", start.elapsed());
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::trace!("colors didn't set with cpu: {e:?}");
+                    return Err(e);
+                }
+            }
+        }
+        Err(Error::NoConverter)
+    }
 }
 
 fn fourcc_channels(fourcc: FourCharCode) -> Result<usize> {
@@ -1003,11 +1099,53 @@ impl<T: Display> Drop for FunctionTimer<T> {
     }
 }
 
+#[cfg(feature = "decoder")]
+const DEFAULT_COLORS: [[f32; 4]; 20] = [
+    [0., 1., 0., 0.7],
+    [1., 0.5568628, 0., 0.7],
+    [0.25882353, 0.15294118, 0.13333333, 0.7],
+    [0.8, 0.7647059, 0.78039216, 0.7],
+    [0.3137255, 0.3137255, 0.3137255, 0.7],
+    [0.1411765, 0.3098039, 0.1215686, 0.7],
+    [1., 0.95686275, 0.5137255, 0.7],
+    [0.3529412, 0.32156863, 0., 0.7],
+    [0.4235294, 0.6235294, 0.6509804, 0.7],
+    [0.5098039, 0.5098039, 0.7294118, 0.7],
+    [0.00784314, 0.18823529, 0.29411765, 0.7],
+    [0.0, 0.2706, 1.0, 0.7],
+    [0.0, 0.0, 0.0, 0.7],
+    [0.0, 0.5, 0.0, 0.7],
+    [1.0, 0.0, 0.0, 0.7],
+    [0.0, 0.0, 1.0, 0.7],
+    [1.0, 0.5, 0.5, 0.7],
+    [0.1333, 0.5451, 0.1333, 0.7],
+    [0.1176, 0.4118, 0.8235, 0.7],
+    [1., 1., 1., 0.7],
+];
+
+#[cfg(feature = "decoder")]
+const fn denorm<const M: usize, const N: usize>(a: [[f32; M]; N]) -> [[u8; M]; N] {
+    let mut result = [[0; M]; N];
+    let mut i = 0;
+    while i < N {
+        let mut j = 0;
+        while j < M {
+            result[i][j] = (a[i][j] * 255.0).round() as u8;
+            j += 1;
+        }
+        i += 1;
+    }
+    result
+}
+
+#[cfg(feature = "decoder")]
+const DEFAULT_COLORS_U8: [[u8; 4]; 20] = denorm(DEFAULT_COLORS);
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod image_tests {
     use super::*;
-    use crate::{CPUConverter, Rotation};
+    use crate::{CPUProcessor, Rotation};
     use edgefirst_tensor::{TensorMapTrait, TensorMemory};
     use image::buffer::ConvertBuffer;
 
@@ -1116,7 +1254,7 @@ mod image_tests {
         assert_eq!(img.height(), 720);
 
         let mut dst = TensorImage::new(640, 360, RGBA, None).unwrap();
-        let mut converter = CPUConverter::new();
+        let mut converter = CPUProcessor::new();
         converter
             .convert(&img, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
             .unwrap();
@@ -1223,7 +1361,7 @@ mod image_tests {
     fn test_disable_env_var() -> Result<(), Error> {
         let original = std::env::var("EDGEFIRST_DISABLE_G2D").ok();
         unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", "1") };
-        let converter = ImageConverter::new()?;
+        let converter = ImageProcessor::new()?;
         match original {
             Some(s) => unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", s) },
             None => unsafe { std::env::remove_var("EDGEFIRST_DISABLE_G2D") },
@@ -1235,7 +1373,7 @@ mod image_tests {
         {
             let original = std::env::var("EDGEFIRST_DISABLE_GL").ok();
             unsafe { std::env::set_var("EDGEFIRST_DISABLE_GL", "1") };
-            let converter = ImageConverter::new()?;
+            let converter = ImageProcessor::new()?;
             match original {
                 Some(s) => unsafe { std::env::set_var("EDGEFIRST_DISABLE_GL", s) },
                 None => unsafe { std::env::remove_var("EDGEFIRST_DISABLE_GL") },
@@ -1245,7 +1383,7 @@ mod image_tests {
 
         let original = std::env::var("EDGEFIRST_DISABLE_CPU").ok();
         unsafe { std::env::set_var("EDGEFIRST_DISABLE_CPU", "1") };
-        let converter = ImageConverter::new()?;
+        let converter = ImageProcessor::new()?;
         match original {
             Some(s) => unsafe { std::env::set_var("EDGEFIRST_DISABLE_CPU", s) },
             None => unsafe { std::env::remove_var("EDGEFIRST_DISABLE_CPU") },
@@ -1258,7 +1396,7 @@ mod image_tests {
         unsafe { std::env::set_var("EDGEFIRST_DISABLE_GL", "1") };
         let original_g2d = std::env::var("EDGEFIRST_DISABLE_G2D").ok();
         unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", "1") };
-        let mut converter = ImageConverter::new()?;
+        let mut converter = ImageProcessor::new()?;
 
         let src = TensorImage::new(1280, 720, RGBA, None)?;
         let mut dst = TensorImage::new(640, 360, RGBA, None)?;
@@ -1285,7 +1423,7 @@ mod image_tests {
     fn test_unsupported_conversion() {
         let src = TensorImage::new(1280, 720, NV12, None).unwrap();
         let mut dst = TensorImage::new(640, 360, NV12, None).unwrap();
-        let mut converter = ImageConverter::new().unwrap();
+        let mut converter = ImageProcessor::new().unwrap();
         let result = converter.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop());
         log::debug!("result: {:?}", result);
         assert!(matches!(
@@ -1332,7 +1470,7 @@ mod image_tests {
         let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         let mut converter_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
-        let mut converter = ImageConverter::new().unwrap();
+        let mut converter = ImageProcessor::new().unwrap();
         converter
             .convert(
                 &src,
@@ -1344,7 +1482,7 @@ mod image_tests {
             .unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
         cpu_converter
             .convert(
                 &src,
@@ -1364,7 +1502,7 @@ mod image_tests {
         let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         let mut converter_dst = TensorImage::new(1280, 720, RGBA, None).unwrap();
-        let mut converter = ImageConverter::new().unwrap();
+        let mut converter = ImageProcessor::new().unwrap();
         let crop = Crop::new()
             .with_src_rect(Some(Rect::new(0, 0, 640, 640)))
             .with_dst_rect(Some(Rect::new(0, 0, 640, 640)));
@@ -1373,7 +1511,7 @@ mod image_tests {
             .unwrap();
 
         let mut cpu_dst = TensorImage::new(1280, 720, RGBA, None).unwrap();
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
         cpu_converter
             .convert(&src, &mut cpu_dst, Rotation::None, Flip::None, crop)
             .unwrap();
@@ -1395,7 +1533,7 @@ mod image_tests {
     fn is_g2d_available() -> bool {
         #[cfg(target_os = "linux")]
         {
-            *G2D_AVAILABLE.get_or_init(|| G2DConverter::new().is_ok())
+            *G2D_AVAILABLE.get_or_init(|| G2DProcessor::new().is_ok())
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -1429,7 +1567,7 @@ mod image_tests {
     fn is_opengl_available() -> bool {
         #[cfg(all(target_os = "linux", feature = "opengl"))]
         {
-            *GL_AVAILABLE.get_or_init(|| GLConverterThreaded::new().is_ok())
+            *GL_AVAILABLE.get_or_init(|| GLProcessorThreaded::new().is_ok())
         }
 
         #[cfg(not(all(target_os = "linux", feature = "opengl")))]
@@ -1452,7 +1590,7 @@ mod image_tests {
         let (dst_width, dst_height) = (cpu_src.height(), cpu_src.width());
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
 
         cpu_converter
             .convert(
@@ -1479,7 +1617,7 @@ mod image_tests {
         let cpu_src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         let mut cpu_dst = TensorImage::new(1280, 720, RGBA, None).unwrap();
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
 
         cpu_converter
             .convert(
@@ -1515,7 +1653,7 @@ mod image_tests {
 
         let mut g2d_dst =
             TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
-        let mut g2d_converter = G2DConverter::new().unwrap();
+        let mut g2d_converter = G2DProcessor::new().unwrap();
         g2d_converter
             .convert(
                 &src,
@@ -1527,7 +1665,7 @@ mod image_tests {
             .unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
         cpu_converter
             .convert(
                 &src,
@@ -1556,7 +1694,7 @@ mod image_tests {
         let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
         cpu_converter
             .convert(
                 &src,
@@ -1567,7 +1705,7 @@ mod image_tests {
             )
             .unwrap();
         let mut gl_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
-        let mut gl_converter = GLConverterThreaded::new().unwrap();
+        let mut gl_converter = GLProcessorThreaded::new().unwrap();
 
         for _ in 0..5 {
             gl_converter
@@ -1629,7 +1767,7 @@ mod image_tests {
         let mut gl_dst = TensorImage::new(640, 640, GREY, None).unwrap();
         let mut cpu_dst = TensorImage::new(640, 640, GREY, None).unwrap();
 
-        let mut converter = CPUConverter::new();
+        let mut converter = CPUProcessor::new();
 
         converter
             .convert(
@@ -1641,7 +1779,7 @@ mod image_tests {
             )
             .unwrap();
 
-        let mut gl = GLConverterThreaded::new().unwrap();
+        let mut gl = GLProcessorThreaded::new().unwrap();
         gl.convert(
             &img,
             &mut gl_dst,
@@ -1674,7 +1812,7 @@ mod image_tests {
         let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
         cpu_converter
             .convert(
                 &src,
@@ -1695,7 +1833,7 @@ mod image_tests {
             .unwrap();
 
         let mut g2d_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
-        let mut g2d_converter = G2DConverter::new().unwrap();
+        let mut g2d_converter = G2DProcessor::new().unwrap();
         g2d_converter
             .convert(
                 &src,
@@ -1738,7 +1876,7 @@ mod image_tests {
         let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
         cpu_converter
             .convert(
                 &src,
@@ -1754,7 +1892,7 @@ mod image_tests {
             .unwrap();
 
         let mut g2d_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
-        let mut g2d_converter = G2DConverter::new().unwrap();
+        let mut g2d_converter = G2DProcessor::new().unwrap();
         g2d_converter
             .convert(
                 &src,
@@ -1792,9 +1930,9 @@ mod image_tests {
         let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
         let mut g2d_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
-        let mut g2d_converter = G2DConverter::new().unwrap();
+        let mut g2d_converter = G2DProcessor::new().unwrap();
 
         for rot in [
             Rotation::None,
@@ -1858,7 +1996,7 @@ mod image_tests {
         let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
         cpu_converter
             .convert(
                 &src,
@@ -1879,7 +2017,7 @@ mod image_tests {
             .unwrap();
 
         let mut gl_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
-        let mut gl_converter = GLConverterThreaded::new().unwrap();
+        let mut gl_converter = GLProcessorThreaded::new().unwrap();
 
         gl_converter
             .convert(
@@ -1918,7 +2056,7 @@ mod image_tests {
         let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
         cpu_converter
             .convert(
                 &src,
@@ -1934,7 +2072,7 @@ mod image_tests {
             .unwrap();
 
         let mut gl_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
-        let mut gl_converter = GLConverterThreaded::new().unwrap();
+        let mut gl_converter = GLProcessorThreaded::new().unwrap();
         gl_converter
             .convert(
                 &src,
@@ -1965,9 +2103,9 @@ mod image_tests {
         let dst_height = 640;
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
 
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
 
-        let mut gl_converter = GLConverterThreaded::new().unwrap();
+        let mut gl_converter = GLProcessorThreaded::new().unwrap();
 
         let mut mem = vec![None, Some(TensorMemory::Mem), Some(TensorMemory::Shm)];
         if is_dma_available() {
@@ -2058,7 +2196,7 @@ mod image_tests {
         };
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
 
         // After rotating 4 times, the image should be the same as the original
 
@@ -2123,14 +2261,14 @@ mod image_tests {
         let src = TensorImage::load_jpeg(&file, Some(RGBA), tensor_memory).unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
 
         cpu_converter
             .convert(&src, &mut cpu_dst, rot, Flip::None, Crop::no_crop())
             .unwrap();
 
         let mut gl_dst = TensorImage::new(dst_width, dst_height, RGBA, tensor_memory).unwrap();
-        let mut gl_converter = GLConverterThreaded::new().unwrap();
+        let mut gl_converter = GLProcessorThreaded::new().unwrap();
 
         for _ in 0..5 {
             gl_converter
@@ -2175,7 +2313,7 @@ mod image_tests {
         let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
 
         cpu_converter
             .convert(&src, &mut cpu_dst, rot, Flip::None, Crop::no_crop())
@@ -2183,7 +2321,7 @@ mod image_tests {
 
         let mut g2d_dst =
             TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
-        let mut g2d_converter = G2DConverter::new().unwrap();
+        let mut g2d_converter = G2DProcessor::new().unwrap();
 
         g2d_converter
             .convert(&src, &mut g2d_dst, rot, Flip::None, Crop::no_crop())
@@ -2210,7 +2348,7 @@ mod image_tests {
         let mut dst_through_yuyv = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
         let mut dst_direct = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
 
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
 
         cpu_converter
             .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
@@ -2271,7 +2409,7 @@ mod image_tests {
         let mut dst =
             TensorImage::new(dst_width, dst_height, YUYV, Some(TensorMemory::Dma)).unwrap();
 
-        let mut gl_converter = GLConverterThreaded::new().unwrap();
+        let mut gl_converter = GLProcessorThreaded::new().unwrap();
 
         gl_converter
             .convert(
@@ -2292,7 +2430,7 @@ mod image_tests {
         .unwrap();
         let mut cpu_dst =
             TensorImage::new(dst_width, dst_height, YUYV, Some(TensorMemory::Dma)).unwrap();
-        CPUConverter::new()
+        CPUProcessor::new()
             .convert(
                 &src,
                 &mut cpu_dst,
@@ -2338,7 +2476,7 @@ mod image_tests {
         let mut g2d_dst =
             TensorImage::new(dst_width, dst_height, YUYV, Some(TensorMemory::Dma)).unwrap();
 
-        let mut g2d_converter = G2DConverter::new().unwrap();
+        let mut g2d_converter = G2DProcessor::new().unwrap();
 
         g2d_dst.tensor.map().unwrap().as_mut_slice().fill(128);
         g2d_converter
@@ -2356,7 +2494,7 @@ mod image_tests {
             .unwrap();
 
         cpu_dst.tensor.map().unwrap().as_mut_slice().fill(128);
-        CPUConverter::new()
+        CPUProcessor::new()
             .convert(
                 &src,
                 &mut cpu_dst,
@@ -2384,7 +2522,7 @@ mod image_tests {
             .copy_from_slice(&file);
 
         let mut dst = TensorImage::new(1280, 720, RGBA, None).unwrap();
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
 
         cpu_converter
             .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
@@ -2412,7 +2550,7 @@ mod image_tests {
             .copy_from_slice(&file);
 
         let mut dst = TensorImage::new(1280, 720, RGB, None).unwrap();
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
 
         cpu_converter
             .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
@@ -2461,7 +2599,7 @@ mod image_tests {
         .unwrap();
 
         let mut dst = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma)).unwrap();
-        let mut g2d_converter = G2DConverter::new().unwrap();
+        let mut g2d_converter = G2DProcessor::new().unwrap();
 
         g2d_converter
             .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
@@ -2504,7 +2642,7 @@ mod image_tests {
         .unwrap();
 
         let mut dst = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma)).unwrap();
-        let mut gl_converter = GLConverterThreaded::new().unwrap();
+        let mut gl_converter = GLProcessorThreaded::new().unwrap();
 
         gl_converter
             .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
@@ -2545,7 +2683,7 @@ mod image_tests {
         .unwrap();
 
         let mut g2d_dst = TensorImage::new(1280, 720, RGB, Some(TensorMemory::Dma)).unwrap();
-        let mut g2d_converter = G2DConverter::new().unwrap();
+        let mut g2d_converter = G2DProcessor::new().unwrap();
 
         g2d_converter
             .convert(
@@ -2558,7 +2696,7 @@ mod image_tests {
             .unwrap();
 
         let mut cpu_dst = TensorImage::new(1280, 720, RGB, None).unwrap();
-        let mut cpu_converter: CPUConverter = CPUConverter::new();
+        let mut cpu_converter: CPUProcessor = CPUProcessor::new();
 
         cpu_converter
             .convert(
@@ -2599,7 +2737,7 @@ mod image_tests {
         .unwrap();
 
         let mut g2d_dst = TensorImage::new(600, 400, YUYV, Some(TensorMemory::Dma)).unwrap();
-        let mut g2d_converter = G2DConverter::new().unwrap();
+        let mut g2d_converter = G2DProcessor::new().unwrap();
 
         g2d_converter
             .convert(
@@ -2612,7 +2750,7 @@ mod image_tests {
             .unwrap();
 
         let mut cpu_dst = TensorImage::new(600, 400, YUYV, None).unwrap();
-        let mut cpu_converter: CPUConverter = CPUConverter::new();
+        let mut cpu_converter: CPUProcessor = CPUProcessor::new();
 
         cpu_converter
             .convert(
@@ -2642,7 +2780,7 @@ mod image_tests {
         let (dst_width, dst_height) = (960, 540);
 
         let mut dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
 
         cpu_converter
             .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
@@ -2699,7 +2837,7 @@ mod image_tests {
 
         let mut dst_g2d =
             TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
-        let mut g2d_converter = G2DConverter::new().unwrap();
+        let mut g2d_converter = G2DProcessor::new().unwrap();
 
         g2d_converter
             .convert(
@@ -2722,7 +2860,7 @@ mod image_tests {
 
         let mut dst_cpu =
             TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
 
         cpu_converter
             .convert(
@@ -2775,7 +2913,7 @@ mod image_tests {
 
         let mut dst_gl =
             TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
-        let mut gl_converter = GLConverterThreaded::new().unwrap();
+        let mut gl_converter = GLProcessorThreaded::new().unwrap();
 
         gl_converter
             .convert(
@@ -2798,7 +2936,7 @@ mod image_tests {
 
         let mut dst_cpu =
             TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
 
         cpu_converter
             .convert(
@@ -2828,7 +2966,7 @@ mod image_tests {
         src.tensor().map().unwrap().as_mut_slice()[0..(1280 * 720 * 3 / 2)].copy_from_slice(&file);
 
         let mut dst = TensorImage::new(1280, 720, RGBA, None).unwrap();
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
 
         cpu_converter
             .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
@@ -2851,7 +2989,7 @@ mod image_tests {
         src.tensor().map().unwrap().as_mut_slice()[0..(1280 * 720 * 3 / 2)].copy_from_slice(&file);
 
         let mut dst = TensorImage::new(1280, 720, RGB, None).unwrap();
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
 
         cpu_converter
             .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
@@ -2874,7 +3012,7 @@ mod image_tests {
         src.tensor().map().unwrap().as_mut_slice()[0..(1280 * 720 * 3 / 2)].copy_from_slice(&file);
 
         let mut dst = TensorImage::new(1280, 720, GREY, None).unwrap();
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
 
         cpu_converter
             .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
@@ -2897,7 +3035,7 @@ mod image_tests {
         src.tensor().map().unwrap().as_mut_slice()[0..(1280 * 720 * 3 / 2)].copy_from_slice(&file);
 
         let mut dst = TensorImage::new(1280, 720, YUYV, None).unwrap();
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
 
         cpu_converter
             .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
@@ -2930,7 +3068,7 @@ mod image_tests {
             .copy_from_slice(&src_image);
 
         let mut cpu_dst = TensorImage::new(5, 5, PLANAR_RGB, None).unwrap();
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
 
         cpu_converter
             .convert(
@@ -2976,7 +3114,7 @@ mod image_tests {
             .copy_from_slice(&src_image);
 
         let mut cpu_dst = TensorImage::new(5, 5, PLANAR_RGBA, None).unwrap();
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
 
         cpu_converter
             .convert(
@@ -3029,7 +3167,7 @@ mod image_tests {
         let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, PLANAR_RGB, None).unwrap();
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
         cpu_converter
             .convert(
                 &src,
@@ -3057,7 +3195,7 @@ mod image_tests {
             .unwrap();
 
         let mut gl_dst = TensorImage::new(dst_width, dst_height, PLANAR_RGB, None).unwrap();
-        let mut gl_converter = GLConverterThreaded::new().unwrap();
+        let mut gl_converter = GLProcessorThreaded::new().unwrap();
 
         gl_converter
             .convert(
@@ -3085,7 +3223,7 @@ mod image_tests {
 
         let mut cpu_nv16_dst = TensorImage::new(640, 640, NV16, None).unwrap();
         let mut cpu_rgb_dst = TensorImage::new(640, 640, RGB, None).unwrap();
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
 
         cpu_converter
             .convert(
@@ -3241,8 +3379,8 @@ mod image_tests {
             TensorImage::new(img1.width(), img1.height(), RGB, Some(TensorMemory::Mem)).unwrap();
         let mut img_rgb2 =
             TensorImage::new(img1.width(), img1.height(), RGB, Some(TensorMemory::Mem)).unwrap();
-        CPUConverter::convert_format(img1, &mut img_rgb1).unwrap();
-        CPUConverter::convert_format(img2, &mut img_rgb2).unwrap();
+        CPUProcessor::convert_format(img1, &mut img_rgb1).unwrap();
+        CPUProcessor::convert_format(img2, &mut img_rgb2).unwrap();
 
         let image1 = image::RgbImage::from_vec(
             img_rgb1.width() as u32,

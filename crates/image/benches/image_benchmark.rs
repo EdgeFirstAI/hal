@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #[cfg(target_os = "linux")]
-use edgefirst_image::G2DConverter;
+use edgefirst_image::G2DProcessor;
 #[cfg(feature = "opengl")]
 #[cfg(target_os = "linux")]
-use edgefirst_image::GLConverterThreaded;
+use edgefirst_image::GLProcessorThreaded;
 use edgefirst_image::{
-    CPUConverter, Crop, Flip, GREY, ImageConverterTrait as _, NV16, PLANAR_RGB, RGB, RGBA,
+    CPUProcessor, Crop, Flip, GREY, ImageProcessorTrait as _, NV16, PLANAR_RGB, RGB, RGBA,
     Rotation, TensorImage, YUYV,
 };
 use edgefirst_tensor::{TensorMapTrait, TensorMemory, TensorTrait};
@@ -198,7 +198,7 @@ fn resize_cpu<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
 where
     IMAGE: TestImage,
 {
-    use edgefirst_image::CPUConverter;
+    use edgefirst_image::CPUProcessor;
 
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
@@ -221,7 +221,44 @@ where
     let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Mem)).unwrap();
     let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Mem)).unwrap();
 
-    let mut converter = CPUConverter::new();
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[divan::bench(types = [Jaguar, Person, Zidane], args = [(640, 360), (960, 540), (512, 512), (1280, 720), (1920, 1080)])]
+fn resize_cpu_rgb_to_rgb<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
+where
+    IMAGE: TestImage,
+{
+    use edgefirst_image::CPUProcessor;
+
+    let (width, height) = size;
+    let name = format!("{}.jpg", IMAGE::filename());
+    let path = Path::new("testdata").join(&name);
+    let path = match path.exists() {
+        true => path,
+        false => {
+            let path = Path::new("../testdata").join(&name);
+            if path.exists() {
+                path
+            } else {
+                Path::new("../../testdata").join(&name)
+            }
+        }
+    };
+
+    assert!(path.exists(), "unable to locate test image at {path:?}");
+
+    let file = std::fs::read(path).unwrap();
+    let src = TensorImage::load_jpeg(&file, Some(RGB), Some(TensorMemory::Mem)).unwrap();
+    let mut dst = TensorImage::new(width, height, RGB, Some(TensorMemory::Mem)).unwrap();
+
+    let mut converter = CPUProcessor::new();
 
     bencher.bench_local(|| {
         converter
@@ -235,7 +272,7 @@ fn resize_cpu_grayscale_upscale<IMAGE>(bencher: divan::Bencher, size: (usize, us
 where
     IMAGE: TestImage,
 {
-    use edgefirst_image::CPUConverter;
+    use edgefirst_image::CPUProcessor;
 
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
@@ -259,7 +296,7 @@ where
     let mut grey = TensorImage::new(160, 160, GREY, None).unwrap();
     let mut dst = TensorImage::new(width, height, GREY, None).unwrap();
 
-    let mut converter = CPUConverter::new();
+    let mut converter = CPUProcessor::new();
 
     converter
         .convert(&src, &mut grey, Rotation::None, Flip::None, Crop::no_crop())
@@ -278,7 +315,7 @@ fn resize_g2d<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
 where
     IMAGE: TestImage,
 {
-    use edgefirst_image::G2DConverter;
+    use edgefirst_image::G2DProcessor;
 
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
@@ -301,7 +338,7 @@ where
     let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
     let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
 
-    let mut converter = G2DConverter::new().unwrap();
+    let mut converter = G2DProcessor::new().unwrap();
 
     bencher.bench_local(|| {
         converter
@@ -338,7 +375,50 @@ where
 
     let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Mem)).unwrap();
     let mut gl_dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Mem)).unwrap();
-    let mut gl_converter = edgefirst_image::GLConverterThreaded::new().unwrap();
+    let mut gl_converter = edgefirst_image::GLProcessorThreaded::new().unwrap();
+    bencher.bench_local(|| {
+        gl_converter
+            .convert(
+                &src,
+                &mut gl_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap()
+    });
+    drop(gl_dst);
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[divan::bench(types = [Person, Zidane], args = [(640, 360), (960, 540), (512, 512), (1280, 720), (1920, 1080)])]
+fn resize_opengl_mem_rgb_to_rgb<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
+where
+    IMAGE: TestImage,
+{
+    let (width, height) = size;
+    let name = format!("{}.jpg", IMAGE::filename());
+    let path = Path::new("testdata").join(&name);
+    let path = match path.exists() {
+        true => path,
+        false => {
+            let path = Path::new("../testdata").join(&name);
+            if path.exists() {
+                path
+            } else {
+                Path::new("../../testdata").join(&name)
+            }
+        }
+    };
+
+    assert!(path.exists(), "unable to locate test image at {path:?}");
+
+    let file = std::fs::read(path).unwrap();
+
+    let src = TensorImage::load_jpeg(&file, Some(RGB), Some(TensorMemory::Mem)).unwrap();
+    let mut gl_dst = TensorImage::new(width, height, RGB, Some(TensorMemory::Mem)).unwrap();
+    let mut gl_converter = edgefirst_image::GLProcessorThreaded::new().unwrap();
     bencher.bench_local(|| {
         gl_converter
             .convert(
@@ -383,8 +463,8 @@ where
     let mut src = TensorImage::new(width, height, YUYV, Some(TensorMemory::Mem)).unwrap();
     let mut tmp = TensorImage::new(width, height, RGBA, Some(TensorMemory::Mem)).unwrap();
 
-    let mut gl_converter = edgefirst_image::GLConverterThreaded::new().unwrap();
-    let mut cpu_converter = edgefirst_image::CPUConverter::new();
+    let mut gl_converter = edgefirst_image::GLProcessorThreaded::new().unwrap();
+    let mut cpu_converter = edgefirst_image::CPUProcessor::new();
 
     cpu_converter
         .convert(&jpeg, &mut src, Rotation::None, Flip::None, Crop::no_crop())
@@ -439,8 +519,8 @@ where
     let mut src = TensorImage::new(width, height, YUYV, Some(TensorMemory::Mem)).unwrap();
     let mut tmp = TensorImage::new(width, height, RGB, Some(TensorMemory::Mem)).unwrap();
 
-    let mut gl_converter = edgefirst_image::GLConverterThreaded::new().unwrap();
-    let mut cpu_converter = edgefirst_image::CPUConverter::new();
+    let mut gl_converter = edgefirst_image::GLProcessorThreaded::new().unwrap();
+    let mut cpu_converter = edgefirst_image::CPUProcessor::new();
 
     cpu_converter
         .convert(&jpeg, &mut src, Rotation::None, Flip::None, Crop::no_crop())
@@ -493,7 +573,7 @@ where
 
     let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
     let mut gl_dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
-    let mut gl_converter = edgefirst_image::GLConverterThreaded::new().unwrap();
+    let mut gl_converter = edgefirst_image::GLProcessorThreaded::new().unwrap();
 
     bencher.bench_local(|| {
         gl_converter
@@ -537,7 +617,7 @@ where
 
     let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
     let mut gl_dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
-    let mut gl_converter = edgefirst_image::GLConverterThreaded::new().unwrap();
+    let mut gl_converter = edgefirst_image::GLProcessorThreaded::new().unwrap();
 
     let scale = (width as f32 / src.width() as f32).min(height as f32 / src.height() as f32);
     let new_width = ((src.width() as f32 * scale).round()) as usize;
@@ -589,7 +669,7 @@ where
     let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
     let mut dst = TensorImage::new(640, 640, PLANAR_RGB, None).unwrap();
 
-    let mut converter = GLConverterThreaded::new().unwrap();
+    let mut converter = GLProcessorThreaded::new().unwrap();
 
     bencher.bench_local(|| {
         converter
@@ -611,7 +691,7 @@ fn rotate_cpu<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) 
     let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
     let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
 
-    let mut converter = CPUConverter::new();
+    let mut converter = CPUProcessor::new();
 
     bencher.bench_local(|| {
         converter
@@ -636,7 +716,7 @@ fn rotate_opengl<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize
     let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
     let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
 
-    let mut converter = GLConverterThreaded::new().unwrap();
+    let mut converter = GLProcessorThreaded::new().unwrap();
 
     bencher.bench_local(|| {
         converter
@@ -661,7 +741,7 @@ fn rotate_g2d<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) 
     let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
     let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
 
-    let mut converter = G2DConverter::new().unwrap();
+    let mut converter = G2DProcessor::new().unwrap();
 
     bencher.bench_local(|| {
         converter
@@ -683,7 +763,7 @@ fn convert_cpu_yuyv_to_rgba(bencher: divan::Bencher, params: (usize, usize)) {
     let (width, height) = params;
     let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
 
-    let mut converter = CPUConverter::new();
+    let mut converter = CPUProcessor::new();
 
     bencher.bench_local(|| {
         converter
@@ -705,7 +785,7 @@ fn convert_cpu_yuyv_to_rgb(bencher: divan::Bencher, params: (usize, usize)) {
     let (width, height) = params;
     let mut dst = TensorImage::new(width, height, RGB, None).unwrap();
 
-    let mut converter = CPUConverter::new();
+    let mut converter = CPUProcessor::new();
 
     bencher.bench_local(|| {
         converter
@@ -727,7 +807,7 @@ fn convert_cpu_yuyv_to_yuyv(bencher: divan::Bencher, params: (usize, usize)) {
     let (width, height) = params;
     let mut dst = TensorImage::new(width, height, YUYV, None).unwrap();
 
-    let mut converter = CPUConverter::new();
+    let mut converter = CPUProcessor::new();
 
     bencher.bench_local(|| {
         converter
@@ -749,7 +829,7 @@ fn convert_cpu_rgba_to_yuyv(bencher: divan::Bencher, params: (usize, usize)) {
     let (width, height) = params;
     let mut dst = TensorImage::new(width, height, YUYV, None).unwrap();
 
-    let mut converter = CPUConverter::new();
+    let mut converter = CPUProcessor::new();
 
     bencher.bench_local(|| {
         converter
@@ -771,7 +851,7 @@ fn resize_cpu_rgba_to_planar_rgb(bencher: divan::Bencher, params: (usize, usize)
     let (width, height) = params;
     let mut dst = TensorImage::new(width, height, PLANAR_RGB, None).unwrap();
 
-    let mut converter = CPUConverter::new();
+    let mut converter = CPUProcessor::new();
 
     bencher.bench_local(|| {
         converter
@@ -793,7 +873,7 @@ fn resize_cpu_rgba_to_nv16(bencher: divan::Bencher, params: (usize, usize)) {
     let (width, height) = params;
     let mut dst = TensorImage::new(width, height, NV16, None).unwrap();
 
-    let mut converter = CPUConverter::new();
+    let mut converter = CPUProcessor::new();
 
     bencher.bench_local(|| {
         converter
@@ -815,7 +895,7 @@ fn resize_cpu_rgba_to_rgb(bencher: divan::Bencher, params: (usize, usize)) {
     let (width, height) = params;
     let mut dst = TensorImage::new(width, height, RGB, None).unwrap();
 
-    let mut converter = CPUConverter::new();
+    let mut converter = CPUProcessor::new();
 
     bencher.bench_local(|| {
         converter
@@ -837,7 +917,7 @@ fn resize_cpu_rgba_to_rgba(bencher: divan::Bencher, params: (usize, usize)) {
     let (width, height) = params;
     let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
 
-    let mut converter = CPUConverter::new();
+    let mut converter = CPUProcessor::new();
 
     bencher.bench_local(|| {
         converter
@@ -860,7 +940,7 @@ fn convert_g2d_yuyv_to_rgba(bencher: divan::Bencher, params: (usize, usize)) {
     let (width, height) = params;
     let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
 
-    let mut converter = G2DConverter::new().unwrap();
+    let mut converter = G2DProcessor::new().unwrap();
 
     bencher.bench_local(|| {
         converter
@@ -883,7 +963,7 @@ fn convert_g2d_yuyv_to_rgb(bencher: divan::Bencher, params: (usize, usize)) {
     let (width, height) = params;
     let mut dst = TensorImage::new(width, height, RGB, Some(TensorMemory::Dma)).unwrap();
 
-    let mut converter = G2DConverter::new().unwrap();
+    let mut converter = G2DProcessor::new().unwrap();
 
     bencher.bench_local(|| {
         converter
@@ -906,7 +986,7 @@ fn convert_g2d_yuyv_to_yuyv(bencher: divan::Bencher, params: (usize, usize)) {
     let (width, height) = params;
     let mut dst = TensorImage::new(width, height, YUYV, Some(TensorMemory::Dma)).unwrap();
 
-    let mut converter = G2DConverter::new().unwrap();
+    let mut converter = G2DProcessor::new().unwrap();
 
     bencher.bench_local(|| {
         converter
@@ -930,7 +1010,7 @@ fn convert_opengl_yuyv_to_rgba(bencher: divan::Bencher, params: (usize, usize)) 
     let (width, height) = params;
     let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
 
-    let mut converter = GLConverterThreaded::new().unwrap();
+    let mut converter = GLProcessorThreaded::new().unwrap();
 
     bencher.bench_local(|| {
         converter
@@ -955,7 +1035,7 @@ fn convert_opengl_yuyv_to_yuyv(bencher: divan::Bencher, params: (usize, usize)) 
     let (width, height) = params;
     let mut dst = TensorImage::new(width, height, YUYV, None).unwrap();
 
-    let mut converter = GLConverterThreaded::new().unwrap();
+    let mut converter = GLProcessorThreaded::new().unwrap();
 
     bencher.bench_local(|| {
         converter
@@ -992,7 +1072,7 @@ where
 
     let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
     let mut g2d_dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
-    let mut g2d_converter = edgefirst_image::G2DConverter::new().unwrap();
+    let mut g2d_converter = edgefirst_image::G2DProcessor::new().unwrap();
 
     let scale = (width as f32 / src.width() as f32).min(height as f32 / src.height() as f32);
     let new_width = ((src.width() as f32 * scale).round()) as usize;

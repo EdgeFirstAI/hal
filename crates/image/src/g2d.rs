@@ -4,24 +4,24 @@
 #![cfg(target_os = "linux")]
 
 use crate::{
-    CPUConverter, Crop, Error, Flip, ImageConverterTrait, RGB, RGBA, Result, Rotation, TensorImage,
+    CPUProcessor, Crop, Error, Flip, ImageProcessorTrait, RGB, RGBA, Result, Rotation, TensorImage,
     YUYV,
 };
 use edgefirst_tensor::Tensor;
 use g2d_sys::{G2D, G2DFormat, G2DPhysical, G2DSurface};
 use std::{os::fd::AsRawFd, time::Instant};
 
-/// G2DConverter implements the ImageConverter trait using the NXP G2D
+/// G2DConverter implements the ImageProcessor trait using the NXP G2D
 /// library for hardware-accelerated image processing on i.MX platforms.
 #[derive(Debug)]
-pub struct G2DConverter {
+pub struct G2DProcessor {
     g2d: G2D,
 }
 
-unsafe impl Send for G2DConverter {}
-unsafe impl Sync for G2DConverter {}
+unsafe impl Send for G2DProcessor {}
+unsafe impl Sync for G2DProcessor {}
 
-impl G2DConverter {
+impl G2DProcessor {
     /// Creates a new G2DConverter instance.
     pub fn new() -> Result<Self> {
         let mut g2d = G2D::new("libg2d.so.2")?;
@@ -124,7 +124,7 @@ impl G2DConverter {
             && let Some(dst_rect) = crop.dst_rect
         {
             let start = Instant::now();
-            CPUConverter::fill_image_outside_crop(dst, dst_color, dst_rect)?;
+            CPUProcessor::fill_image_outside_crop(dst, dst_color, dst_rect)?;
             log::trace!("clear takes {:?}", start.elapsed());
         }
 
@@ -132,7 +132,7 @@ impl G2DConverter {
     }
 }
 
-impl ImageConverterTrait for G2DConverter {
+impl ImageProcessorTrait for G2DProcessor {
     /// Converts the source image to the destination image using G2D.
     ///
     /// # Arguments
@@ -188,6 +188,26 @@ impl ImageConverterTrait for G2DConverter {
         // crop".to_string(),     ));
         // }
         self.convert_(src, dst, rotation, flip, crop)
+    }
+
+    #[cfg(feature = "decoder")]
+    fn render_to_image(
+        &mut self,
+        _dst: &mut TensorImage,
+        _detect: &[crate::DetectBox],
+        _segmentation: &[crate::Segmentation],
+    ) -> Result<()> {
+        Err(Error::NotImplemented(
+            "G2D does not support rendering detection or segmentation overlays".to_string(),
+        ))
+    }
+
+    #[cfg(feature = "decoder")]
+    fn set_class_colors(&mut self, _: &[[u8; 4]]) -> Result<()> {
+        Err(Error::NotImplemented(
+            "G2D does not support setting colors for rendering detection or segmentation overlays"
+                .to_string(),
+        ))
     }
 }
 
@@ -260,7 +280,7 @@ impl TryFrom<&mut TensorImage> for G2DSurface {
 mod g2d_tests {
     use super::*;
     use crate::{
-        CPUConverter, Flip, G2DConverter, GREY, ImageConverterTrait, RGB, RGBA, Rect, Rotation,
+        CPUProcessor, Flip, G2DProcessor, GREY, ImageProcessorTrait, RGB, RGBA, Rect, Rotation,
         TensorImage, YUYV,
     };
     use edgefirst_tensor::{TensorMapTrait, TensorMemory, TensorTrait};
@@ -293,13 +313,13 @@ mod g2d_tests {
 
         let mut src2 = TensorImage::new(1280, 720, g2d_in_fmt, Some(TensorMemory::Dma))?;
 
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
 
         cpu_converter.convert(&src, &mut src2, Rotation::None, Flip::None, Crop::no_crop())?;
 
         let mut g2d_dst =
             TensorImage::new(dst_width, dst_height, g2d_out_fmt, Some(TensorMemory::Dma))?;
-        let mut g2d_converter = G2DConverter::new()?;
+        let mut g2d_converter = G2DProcessor::new()?;
         g2d_converter.convert_(
             &src2,
             &mut g2d_dst,
@@ -364,7 +384,7 @@ mod g2d_tests {
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
         let src = TensorImage::load_jpeg(&file, Some(RGB), None)?;
 
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
 
         let mut reference = TensorImage::new(dst_width, dst_height, RGB, Some(TensorMemory::Dma))?;
         cpu_converter.convert(
@@ -380,7 +400,7 @@ mod g2d_tests {
 
         let mut g2d_dst =
             TensorImage::new(dst_width, dst_height, g2d_out_fmt, Some(TensorMemory::Dma))?;
-        let mut g2d_converter = G2DConverter::new()?;
+        let mut g2d_converter = G2DProcessor::new()?;
         g2d_converter.convert_(
             &src2,
             &mut g2d_dst,
@@ -429,7 +449,7 @@ mod g2d_tests {
         let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
         let src = TensorImage::load_jpeg(&file, Some(RGB), None)?;
 
-        let mut cpu_converter = CPUConverter::new();
+        let mut cpu_converter = CPUProcessor::new();
 
         let mut reference = TensorImage::new(dst_width, dst_height, RGB, Some(TensorMemory::Dma))?;
         reference.tensor.map().unwrap().as_mut_slice().fill(128);
@@ -441,7 +461,7 @@ mod g2d_tests {
         let mut g2d_dst =
             TensorImage::new(dst_width, dst_height, g2d_out_fmt, Some(TensorMemory::Dma))?;
         g2d_dst.tensor.map().unwrap().as_mut_slice().fill(128);
-        let mut g2d_converter = G2DConverter::new()?;
+        let mut g2d_converter = G2DProcessor::new()?;
         g2d_converter.convert_(&src2, &mut g2d_dst, Rotation::None, Flip::None, crop)?;
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGB, None)?;
