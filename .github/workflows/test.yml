@@ -409,17 +409,25 @@ jobs:
             target/test-metrics-*-aarch64.txt
           retention-days: 30
 
-      - name: Upload hardware test artifacts
+      - name: Upload hardware test artifacts (binaries + wheels only)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         if: always()
         with:
-          name: build-aarch64
+          name: hardware-test-binaries
           path: |
             target/profiling/*.so*
             target/profiling/deps/*.so*
             target/wheels/*.whl
             hardware-test-binaries/
-            target/llvm-cov-target/
+          retention-days: 7
+
+      - name: Upload coverage instrumented binaries (for profraw processing)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        if: always()
+        with:
+          name: coverage-binaries-aarch64
+          path: |
+            target/llvm-cov-target/profiling/deps/*
           retention-days: 7
 
   # ===========================================================================
@@ -451,10 +459,10 @@ jobs:
           name: testdata-lfs
           path: testdata/
 
-      - name: Download aarch64 build artifacts
+      - name: Download aarch64 test artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
-          name: build-aarch64
+          name: hardware-test-binaries
           path: .  # Download to workspace root to preserve directory structure
 
       - name: Set up Python virtual environment
@@ -601,11 +609,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
-      - name: Download build artifacts (contains llvm-cov-target)
+      - name: Download coverage instrumented binaries
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
-          name: build-aarch64
-          path: .  # Download to workspace root to preserve directory structure
+          name: coverage-binaries-aarch64
+          path: target/llvm-cov-target/profiling/deps/
 
       - name: Download imx8mp coverage (contains profraw files)
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
