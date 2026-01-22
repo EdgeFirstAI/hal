@@ -1702,7 +1702,7 @@ impl DecoderBuilder {
                             detection.shape[1],
                             4 + protos.unwrap_or(0),
                         )));
-                    };
+                    }
                     Ok(detection.shape[1] - 4 - protos.unwrap_or(0))
                 }
                 DecoderType::ModelPack => {
@@ -1718,14 +1718,14 @@ impl DecoderBuilder {
                             anchors_x_features,
                             num_anchors * 5,
                         )));
-                    };
+                    }
 
                     if !anchors_x_features.is_multiple_of(num_anchors) {
                         return Err(DecoderError::InvalidConfig(format!(
                             "Invalid ModelPack Split Detection shape: anchors_x_features {} not a multiple of number of anchors {}",
                             anchors_x_features, num_anchors
                         )));
-                    };
+                    }
                     Ok(anchors_x_features / num_anchors - 5)
                 }
             },
@@ -1768,7 +1768,7 @@ impl DecoderBuilder {
                         *dim_size,
                         protos + 4,
                     )));
-                };
+                }
                 return Ok(*dim_size - 4 - protos);
             }
         }
@@ -1785,14 +1785,14 @@ impl DecoderBuilder {
                             anchors_x_features,
                             num_anchors * 5,
                         )));
-                    };
+                    }
 
                     if !anchors_x_features.is_multiple_of(num_anchors) {
                         return Err(DecoderError::InvalidConfig(format!(
                             "Invalid ModelPack Split Detection shape: anchors_x_features {} not a multiple of number of anchors {}",
                             anchors_x_features, num_anchors
                         )));
-                    };
+                    }
                     return Ok((anchors_x_features / num_anchors) - 5);
                 }
             }
@@ -2820,107 +2820,131 @@ impl Decoder {
         )))
     }
 
+    /// This is split detection, need to swap axes to batch, height, width,
+    /// num_anchors_x_features,
+    fn modelpack_det_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::NumBoxes => 1,
+            DimName::Padding => 2,
+            DimName::BoxCoords => 3,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
+    // This is Ultralytics detection, need to swap axes to batch, num_features,
+    // height, width
+    fn yolo_det_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::NumFeatures => 1,
+            DimName::NumBoxes => 2,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
+    // This is modelpack boxes, need to swap axes to batch, num_boxes, padding,
+    // box_coords
+    fn modelpack_boxes_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::NumBoxes => 1,
+            DimName::Padding => 2,
+            DimName::BoxCoords => 3,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
+    /// This is Ultralytics boxes, need to swap axes to batch, box_coords,
+    /// num_boxes
+    fn yolo_boxes_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::BoxCoords => 1,
+            DimName::NumBoxes => 2,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
+    /// This is modelpack scores, need to swap axes to batch, num_boxes,
+    /// num_classes
+    fn modelpack_scores_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::NumBoxes => 1,
+            DimName::NumClasses => 2,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
+    fn yolo_scores_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::NumClasses => 1,
+            DimName::NumBoxes => 2,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
+    /// This is modelpack segmentation, need to swap axes to batch, height,
+    /// width, num_classes
+    fn modelpack_segmentation_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::Height => 1,
+            DimName::Width => 2,
+            DimName::NumClasses => 3,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
+    /// This is modelpack masks, need to swap axes to batch, height,
+    /// width
+    fn modelpack_mask_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::Height => 1,
+            DimName::Width => 2,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
+    /// This is yolo protos, need to swap axes to batch, height, width,
+    /// num_protos
+    fn yolo_protos_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::Height => 1,
+            DimName::Width => 2,
+            DimName::NumProtos => 3,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
+    /// This is yolo mask coefficients, need to swap axes to batch, num_protos,
+    /// num_boxes
+    fn yolo_maskcoefficients_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::NumProtos => 1,
+            DimName::NumBoxes => 2,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
     fn get_order_fn(config: ConfigOutputRef) -> fn(DimName) -> usize {
         let decoder_type = config.decoder();
         match (config, decoder_type) {
-            (ConfigOutputRef::Detection(_), DecoderType::ModelPack) => {
-                // This is split detection, need to swap axes to batch, height, width,
-                // num_anchors_x_features,
-                // s.dshape.iter().map().collect::<Vec<_>>()
-                |x| match x {
-                    DimName::Batch => 0,
-                    DimName::Height => 1,
-                    DimName::Width => 2,
-                    DimName::NumAnchorsXFeatures => 3,
-                    _ => 1000, // this should be unreachable
-                }
-            }
-            (ConfigOutputRef::Detection(_), DecoderType::Ultralytics) => {
-                // This is Ultralytics detection, need to swap axes to batch, num_features,
-                // height, width
-                // s.dshape.iter().map().collect::<Vec<_>>()
-                |x| match x {
-                    DimName::Batch => 0,
-                    DimName::NumFeatures => 1,
-                    DimName::NumBoxes => 2,
-                    _ => 1000, // this should be unreachable
-                }
-            }
-            (ConfigOutputRef::Boxes(_), DecoderType::ModelPack) => {
-                // s.dshape.iter().map().collect::<Vec<_>>()
-                |x| match x {
-                    DimName::Batch => 0,
-                    DimName::NumBoxes => 1,
-                    DimName::Padding => 2,
-                    DimName::BoxCoords => 3,
-                    _ => 1000, // this should be unreachable
-                }
-            }
-            (ConfigOutputRef::Boxes(_), DecoderType::Ultralytics) => {
-                // s.dshape.iter().map().collect::<Vec<_>>()
-                |x| match x {
-                    DimName::Batch => 0,
-                    DimName::BoxCoords => 1,
-                    DimName::NumBoxes => 2,
-                    _ => 1000, // this should be unreachable
-                }
-            }
-            (ConfigOutputRef::Scores(_), DecoderType::ModelPack) => {
-                // s.dshape.iter().map().collect::<Vec<_>>()
-                |x| match x {
-                    DimName::Batch => 0,
-                    DimName::NumBoxes => 1,
-                    DimName::NumClasses => 2,
-                    _ => 1000, // this should be unreachable
-                }
-            }
-            (ConfigOutputRef::Scores(_), DecoderType::Ultralytics) => {
-                // s.dshape.iter().map().collect::<Vec<_>>()
-                |x| match x {
-                    DimName::Batch => 0,
-                    DimName::NumClasses => 1,
-                    DimName::NumBoxes => 2,
-                    _ => 1000, // this should be unreachable
-                }
-            }
-            (ConfigOutputRef::Segmentation(_), _) => {
-                // s.dshape.iter().map().collect::<Vec<_>>()
-                |x| match x {
-                    DimName::Batch => 0,
-                    DimName::Height => 1,
-                    DimName::Width => 2,
-                    DimName::NumClasses => 3,
-                    _ => 1000, // this should be unreachable
-                }
-            }
-            (ConfigOutputRef::Mask(_), _) => {
-                // s.dshape.iter().map().collect::<Vec<_>>()
-                |x| match x {
-                    DimName::Batch => 0,
-                    DimName::Height => 1,
-                    DimName::Width => 2,
-                    _ => 1000, // this should be unreachable
-                }
-            }
-            (ConfigOutputRef::Protos(_), _) => {
-                // s.dshape.iter().map().collect::<Vec<_>>()
-                |x| match x {
-                    DimName::Batch => 0,
-                    DimName::Height => 1,
-                    DimName::Width => 2,
-                    DimName::NumProtos => 3,
-                    _ => 1000, // this should be unreachable
-                }
-            }
-            (ConfigOutputRef::MaskCoefficients(_), _) => {
-                // s.dshape.iter().map().collect::<Vec<_>>()
-                |x| match x {
-                    DimName::Batch => 0,
-                    DimName::NumProtos => 1,
-                    DimName::NumBoxes => 2,
-                    _ => 1000, // this should be unreachable
-                }
-            }
+            (ConfigOutputRef::Detection(_), DecoderType::ModelPack) => Self::modelpack_det_order,
+            (ConfigOutputRef::Detection(_), DecoderType::Ultralytics) => Self::yolo_det_order,
+            (ConfigOutputRef::Boxes(_), DecoderType::ModelPack) => Self::modelpack_boxes_order,
+            (ConfigOutputRef::Boxes(_), DecoderType::Ultralytics) => Self::yolo_boxes_order,
+            (ConfigOutputRef::Scores(_), DecoderType::ModelPack) => Self::modelpack_scores_order,
+            (ConfigOutputRef::Scores(_), DecoderType::Ultralytics) => Self::yolo_scores_order,
+            (ConfigOutputRef::Segmentation(_), _) => Self::modelpack_segmentation_order,
+            (ConfigOutputRef::Mask(_), _) => Self::modelpack_mask_order,
+            (ConfigOutputRef::Protos(_), _) => Self::yolo_protos_order,
+            (ConfigOutputRef::MaskCoefficients(_), _) => Self::yolo_maskcoefficients_order,
         }
     }
 
