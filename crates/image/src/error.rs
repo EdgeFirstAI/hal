@@ -132,6 +132,14 @@ impl From<gbm::FrontBufferError> for Error {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+impl From<gls::Error> for Error {
+    fn from(err: gls::Error) -> Self {
+        Error::OpenGl(err.to_string())
+    }
+}
+
 impl From<ndarray::ShapeError> for Error {
     fn from(err: ndarray::ShapeError) -> Self {
         Error::Internal(format!("{err}"))

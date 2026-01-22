@@ -29,6 +29,7 @@ A tuple containing:
 - masks: A list of NumPy arrays, each of shape (H, W, ...) containing detected segmentation mask.
 """
 
+
 class Decoder:
     # [pyo3(signature = (config, score_threshold=0.1, iou_threshold=0.7))]
     def __init__(
@@ -74,6 +75,7 @@ class Decoder:
         ...
 
     # [pyo3(signature = (boxes, quant_boxes=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
+
     @staticmethod
     def decode_yolo_det(
         model_output: Union[
@@ -148,7 +150,8 @@ class Decoder:
     @staticmethod
     def decode_modelpack_det_split(
         boxes: List[
-            Union[npt.NDArray[np.uint8], npt.NDArray[np.int8], npt.NDArray[np.float32]]
+            Union[npt.NDArray[np.uint8],
+                  npt.NDArray[np.int8], npt.NDArray[np.float32]]
         ],
         anchors: List[List[List[float]]],
         quant: List[Tuple[float, int]] = [],
@@ -201,6 +204,7 @@ class Decoder:
 
     @score_threshold.setter
     def score_threshold(self, value: float): ...
+
     @property
     def iou_threshold(self) -> float:
         """
@@ -211,6 +215,7 @@ class Decoder:
 
     @iou_threshold.setter
     def iou_threshold(self, value: float): ...
+
 
 class FourCC(enum.Enum):
     YUYV: FourCC
@@ -238,6 +243,7 @@ class FourCC(enum.Enum):
     """Planar RGBA format (Red plane, Green plane, Blue plane, Alpha plane)"""
 
     def __init__(self, fourcc: str) -> None: ...
+
 
 class Normalization(enum.Enum):
     DEFAULT: Normalization
@@ -282,6 +288,7 @@ class Normalization(enum.Enum):
     | `np.float64` | value             |
     """
 
+
 class TensorMap:
     def unmap(self) -> None: ...
     def view(self) -> object: ...
@@ -293,6 +300,7 @@ class TensorMap:
     def __releasebuffer__(self, view) -> None: ...
     def __enter__(self) -> TensorMap: ...
     def __exit__(self) -> None: ...
+
 
 class TensorMemory(enum.Enum):
     import sys
@@ -311,6 +319,7 @@ class TensorMemory(enum.Enum):
         """
     MEM: TensorMemory
     """Regular system memory allocation"""
+
 
 class TensorImage:
     # [pyo3(signature = (width, height, fourcc = FourCC::RGB))]
@@ -403,6 +412,7 @@ class TensorImage:
         """If the image format is planar."""
         ...
 
+
 class Flip(enum.Enum):
     NoFlip: Flip
     """No flip"""
@@ -410,6 +420,7 @@ class Flip(enum.Enum):
     """Flip the image horizontally"""
     Vertical: Flip
     """Flip the image vertically"""
+
 
 class Rotation(enum.Enum):
     Rotate0: Rotation
@@ -429,6 +440,7 @@ class Rotation(enum.Enum):
         """Get the Rotation enum variant corresponding to the specified angle in degrees clockwise. Valid angles are 0, 90, 180, and 270."""
         ...
 
+
 class Rect:
     """A crop rectangle defined by its top-left corner (left, top) and its dimensions (width, height)."""
 
@@ -442,12 +454,37 @@ class Rect:
     @property
     def height(self) -> int: ...
 
-class ImageConverter:
+
+class ImageProcessor:
     """Convert images between different formats, with optional rotation, flipping, and cropping."""
 
     def __init__(self) -> None: ...
 
+    # [pyo3(signature = (dst, bbox, scores, classes, seg=vec![]))]
+    def render_to_image(
+            self,
+            dst: TensorImage,
+            bbox: npt.NDArray[np.float32],
+            scores: npt.NDArray[np.float32],
+            classes: npt.NDArray[np.uintp],
+            seg: List[npt.NDArray[np.uint8]] = [],
+    ) -> None:
+        """
+        Render detection and segmentation results onto the destination image.
+        The `bbox`, `scores`, and `classes` parameters should correspond to the decoded outputs of a detection model.
+        The optional `seg` parameter can be used to provide segmentation masks to render.
+        """
+        ...
+
+    def set_class_colors(self, colors: List[List[int]]) -> None:
+        """
+        Sets the colors used for rendering boxes and masks. The first 20 colors
+        will be set. Each color should be a list of 4 values (0-255 inclusive) representing RGBA.
+        """
+        ...
+
     # [pyo3(signature = (src, dst, rotation = PyRotation::Rotate0, flip = PyFlip::NoFlip, src_crop = None, dst_crop = None, dst_color = None))]
+
     def convert(
         self,
         src: TensorImage,
