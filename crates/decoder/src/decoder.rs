@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashSet;
+
 use ndarray::{Array3, ArrayView, ArrayViewD, Dimension, s};
 use ndarray_stats::QuantileExt;
 use num_traits::{AsPrimitive, Float};
@@ -8,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     DecoderError, DetectBox, Quantization, Segmentation, XYWH,
-    configs::{DecoderType, ModelType, QuantTuple},
+    configs::{DecoderType, DimName, ModelType, QuantTuple},
     dequantize_ndarray,
     modelpack::{
         ModelPackDetectionConfig, decode_modelpack_det, decode_modelpack_float,
@@ -56,6 +58,170 @@ pub enum ConfigOutput {
     MaskCoefficients(configs::MaskCoefficients),
 }
 
+#[derive(Debug, PartialEq, Clone)]
+pub enum ConfigOutputRef<'a> {
+    Detection(&'a configs::Detection),
+    Mask(&'a configs::Mask),
+    Segmentation(&'a configs::Segmentation),
+    Protos(&'a configs::Protos),
+    Scores(&'a configs::Scores),
+    Boxes(&'a configs::Boxes),
+    MaskCoefficients(&'a configs::MaskCoefficients),
+}
+
+impl<'a> ConfigOutputRef<'a> {
+    fn decoder(&self) -> configs::DecoderType {
+        match self {
+            ConfigOutputRef::Detection(v) => v.decoder,
+            ConfigOutputRef::Mask(v) => v.decoder,
+            ConfigOutputRef::Segmentation(v) => v.decoder,
+            ConfigOutputRef::Protos(v) => v.decoder,
+            ConfigOutputRef::Scores(v) => v.decoder,
+            ConfigOutputRef::Boxes(v) => v.decoder,
+            ConfigOutputRef::MaskCoefficients(v) => v.decoder,
+        }
+    }
+
+    fn dshape(&self) -> &[(DimName, usize)] {
+        match self {
+            ConfigOutputRef::Detection(v) => &v.dshape,
+            ConfigOutputRef::Mask(v) => &v.dshape,
+            ConfigOutputRef::Segmentation(v) => &v.dshape,
+            ConfigOutputRef::Protos(v) => &v.dshape,
+            ConfigOutputRef::Scores(v) => &v.dshape,
+            ConfigOutputRef::Boxes(v) => &v.dshape,
+            ConfigOutputRef::MaskCoefficients(v) => &v.dshape,
+        }
+    }
+}
+
+impl<'a> From<&'a configs::Detection> for ConfigOutputRef<'a> {
+    /// Converts from references of config structs to ConfigOutputRef
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{configs, ConfigOutputRef};
+    /// let detection_config = configs::Detection {
+    ///     anchors: None,
+    ///     decoder: configs::DecoderType::Ultralytics,
+    ///     quantization: None,
+    ///     shape: vec![1, 84, 8400],
+    ///     dshape: Vec::new(),
+    /// };
+    /// let output: ConfigOutputRef = (&detection_config).into();
+    /// ```
+    fn from(v: &'a configs::Detection) -> ConfigOutputRef<'a> {
+        ConfigOutputRef::Detection(v)
+    }
+}
+
+impl<'a> From<&'a configs::Mask> for ConfigOutputRef<'a> {
+    /// Converts from references of config structs to ConfigOutputRef
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{configs, ConfigOutputRef};
+    /// let mask = configs::Mask {
+    ///     decoder: configs::DecoderType::ModelPack,
+    ///     quantization: None,
+    ///     shape: vec![1, 160, 160, 1],
+    ///     dshape: Vec::new(),
+    /// };
+    /// let output: ConfigOutputRef = (&mask).into();
+    /// ```
+    fn from(v: &'a configs::Mask) -> ConfigOutputRef<'a> {
+        ConfigOutputRef::Mask(v)
+    }
+}
+
+impl<'a> From<&'a configs::Segmentation> for ConfigOutputRef<'a> {
+    /// Converts from references of config structs to ConfigOutputRef
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{configs, ConfigOutputRef};
+    /// let seg = configs::Segmentation {
+    ///     decoder: configs::DecoderType::ModelPack,
+    ///     quantization: None,
+    ///     shape: vec![1, 160, 160, 3],
+    ///     dshape: Vec::new(),
+    /// };
+    /// let output: ConfigOutputRef = (&seg).into();
+    /// ```
+    fn from(v: &'a configs::Segmentation) -> ConfigOutputRef<'a> {
+        ConfigOutputRef::Segmentation(v)
+    }
+}
+
+impl<'a> From<&'a configs::Protos> for ConfigOutputRef<'a> {
+    /// Converts from references of config structs to ConfigOutputRef
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{configs, ConfigOutputRef};
+    /// let protos = configs::Protos {
+    ///     decoder: configs::DecoderType::Ultralytics,
+    ///     quantization: None,
+    ///     shape: vec![1, 160, 160, 32],
+    ///     dshape: Vec::new(),
+    /// };
+    /// let output: ConfigOutputRef = (&protos).into();
+    /// ```
+    fn from(v: &'a configs::Protos) -> ConfigOutputRef<'a> {
+        ConfigOutputRef::Protos(v)
+    }
+}
+
+impl<'a> From<&'a configs::Scores> for ConfigOutputRef<'a> {
+    /// Converts from references of config structs to ConfigOutputRef
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{configs, ConfigOutputRef};
+    /// let scores = configs::Scores {
+    ///     decoder: configs::DecoderType::Ultralytics,
+    ///     quantization: None,
+    ///     shape: vec![1, 40, 8400],
+    ///     dshape: Vec::new(),
+    /// };
+    /// let output: ConfigOutputRef = (&scores).into();
+    /// ```
+    fn from(v: &'a configs::Scores) -> ConfigOutputRef<'a> {
+        ConfigOutputRef::Scores(v)
+    }
+}
+
+impl<'a> From<&'a configs::Boxes> for ConfigOutputRef<'a> {
+    /// Converts from references of config structs to ConfigOutputRef
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{configs, ConfigOutputRef};
+    /// let boxes = configs::Boxes {
+    ///     decoder: configs::DecoderType::Ultralytics,
+    ///     quantization: None,
+    ///     shape: vec![1, 4, 8400],
+    ///     dshape: Vec::new(),
+    /// };
+    /// let output: ConfigOutputRef = (&boxes).into();
+    /// ```
+    fn from(v: &'a configs::Boxes) -> ConfigOutputRef<'a> {
+        ConfigOutputRef::Boxes(v)
+    }
+}
+
+impl<'a> From<&'a configs::MaskCoefficients> for ConfigOutputRef<'a> {
+    /// Converts from references of config structs to ConfigOutputRef
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{configs, ConfigOutputRef};
+    /// let mask_coefficients = configs::MaskCoefficients {
+    ///     decoder: configs::DecoderType::Ultralytics,
+    ///     quantization: None,
+    ///     shape: vec![1, 32, 8400],
+    ///     dshape: Vec::new(),
+    /// };
+    /// let output: ConfigOutputRef = (&mask_coefficients).into();
+    /// ```
+    fn from(v: &'a configs::MaskCoefficients) -> ConfigOutputRef<'a> {
+        ConfigOutputRef::MaskCoefficients(v)
+    }
+}
+
 impl ConfigOutput {
     /// Returns the shape of the output.
     ///
@@ -67,7 +233,7 @@ impl ConfigOutput {
     ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: None,
     ///     shape: vec![1, 84, 8400],
-    ///     channels_first: false,
+    ///     dshape: Vec::new(),
     /// };
     /// let output = ConfigOutput::Detection(detection_config);
     /// assert_eq!(output.shape(), &[1, 84, 8400]);
@@ -94,7 +260,7 @@ impl ConfigOutput {
     ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: None,
     ///     shape: vec![1, 84, 8400],
-    ///     channels_first: false,
+    ///     dshape: Vec::new(),
     /// };
     /// let output = ConfigOutput::Detection(detection_config);
     /// assert_eq!(output.decoder(), &configs::DecoderType::Ultralytics);
@@ -117,11 +283,11 @@ impl ConfigOutput {
     /// ```rust
     /// # use edgefirst_decoder::{configs, ConfigOutput};
     /// let detection_config = configs::Detection {
-    ///    anchors: None,
+    ///   anchors: None,
     ///   decoder: configs::DecoderType::Ultralytics,
     ///   quantization: Some(configs::QuantTuple(0.012345, 26)),
-    ///  shape: vec![1, 84, 8400],
-    ///   channels_first: false,
+    ///   shape: vec![1, 84, 8400],
+    ///   dshape: Vec::new(),
     /// };
     /// let output = ConfigOutput::Detection(detection_config);
     /// assert_eq!(output.quantization(),
@@ -140,6 +306,8 @@ impl ConfigOutput {
 }
 
 pub mod configs {
+    use std::fmt::Display;
+
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, PartialEq, Serialize, Deserialize, Clone, Copy)]
@@ -161,8 +329,10 @@ pub mod configs {
         pub decoder: DecoderType,
         pub quantization: Option<QuantTuple>,
         pub shape: Vec<usize>,
+        // #[serde(default)]
+        // pub channels_first: bool,
         #[serde(default)]
-        pub channels_first: bool,
+        pub dshape: Vec<(DimName, usize)>,
     }
 
     #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
@@ -171,8 +341,10 @@ pub mod configs {
         #[serde(flatten)]
         pub quantization: Option<QuantTuple>,
         pub shape: Vec<usize>,
+        // #[serde(default)]
+        // pub channels_first: bool,
         #[serde(default)]
-        pub channels_first: bool,
+        pub dshape: Vec<(DimName, usize)>,
     }
 
     #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
@@ -180,8 +352,10 @@ pub mod configs {
         pub decoder: DecoderType,
         pub quantization: Option<QuantTuple>,
         pub shape: Vec<usize>,
+        // #[serde(default)]
+        // pub channels_first: bool,
         #[serde(default)]
-        pub channels_first: bool,
+        pub dshape: Vec<(DimName, usize)>,
     }
 
     #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
@@ -189,8 +363,10 @@ pub mod configs {
         pub decoder: DecoderType,
         pub quantization: Option<QuantTuple>,
         pub shape: Vec<usize>,
+        // #[serde(default)]
+        // pub channels_first: bool,
         #[serde(default)]
-        pub channels_first: bool,
+        pub dshape: Vec<(DimName, usize)>,
     }
 
     #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
@@ -199,8 +375,10 @@ pub mod configs {
         pub decoder: DecoderType,
         pub quantization: Option<QuantTuple>,
         pub shape: Vec<usize>,
+        // #[serde(default)]
+        // pub channels_first: bool,
         #[serde(default)]
-        pub channels_first: bool,
+        pub dshape: Vec<(DimName, usize)>,
     }
 
     #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
@@ -208,8 +386,10 @@ pub mod configs {
         pub decoder: DecoderType,
         pub quantization: Option<QuantTuple>,
         pub shape: Vec<usize>,
+        // #[serde(default)]
+        // pub channels_first: bool,
         #[serde(default)]
-        pub channels_first: bool,
+        pub dshape: Vec<(DimName, usize)>,
     }
 
     #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
@@ -217,11 +397,63 @@ pub mod configs {
         pub decoder: DecoderType,
         pub quantization: Option<QuantTuple>,
         pub shape: Vec<usize>,
+        // #[serde(default)]
+        // pub channels_first: bool,
         #[serde(default)]
-        pub channels_first: bool,
+        pub dshape: Vec<(DimName, usize)>,
     }
 
-    #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
+    #[derive(Debug, PartialEq, Serialize, Deserialize, Clone, Copy, Hash, Eq)]
+    pub enum DimName {
+        #[serde(rename = "batch")]
+        Batch,
+        #[serde(rename = "height")]
+        Height,
+        #[serde(rename = "width")]
+        Width,
+        #[serde(rename = "num_classes")]
+        NumClasses,
+        #[serde(rename = "num_features")]
+        NumFeatures,
+        #[serde(rename = "num_boxes")]
+        NumBoxes,
+        #[serde(rename = "num_protos")]
+        NumProtos,
+        #[serde(rename = "num_anchors_x_features")]
+        NumAnchorsXFeatures,
+        #[serde(rename = "padding")]
+        Padding,
+        #[serde(rename = "box_coords")]
+        BoxCoords,
+    }
+
+    impl Display for DimName {
+        /// Formats the DimName for display
+        /// # Examples
+        /// ```rust
+        /// # use edgefirst_decoder::configs::DimName;
+        /// let dim = DimName::Height;
+        /// assert_eq!(format!("{}", dim), "height");
+        /// # let s = format!("{} {} {} {} {} {} {} {} {} {}", DimName::Batch, DimName::Height, DimName::Width, DimName::NumClasses, DimName::NumFeatures, DimName::NumBoxes, DimName::NumProtos, DimName::NumAnchorsXFeatures, DimName::Padding, DimName::BoxCoords);
+        /// # assert_eq!(s, "batch height width num_classes num_features num_boxes num_protos num_anchors_x_features padding box_coords");
+        /// ```
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                DimName::Batch => write!(f, "batch"),
+                DimName::Height => write!(f, "height"),
+                DimName::Width => write!(f, "width"),
+                DimName::NumClasses => write!(f, "num_classes"),
+                DimName::NumFeatures => write!(f, "num_features"),
+                DimName::NumBoxes => write!(f, "num_boxes"),
+                DimName::NumProtos => write!(f, "num_protos"),
+                DimName::NumAnchorsXFeatures => write!(f, "num_anchors_x_features"),
+                DimName::Padding => write!(f, "padding"),
+                DimName::BoxCoords => write!(f, "box_coords"),
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize, Clone, Copy, Hash, Eq)]
     pub enum DecoderType {
         #[serde(rename = "modelpack")]
         ModelPack,
@@ -431,7 +663,7 @@ impl DecoderBuilder {
     ///         decoder: configs::DecoderType::Ultralytics,
     ///         quantization: Some(configs::QuantTuple(0.012345, 26)),
     ///         shape: vec![1, 84, 8400],
-    ///         channels_first: false,
+    ///         dshape: Vec::new(),
     ///     })
     ///     .build()?;
     ///
@@ -457,13 +689,13 @@ impl DecoderBuilder {
     ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: Some(configs::QuantTuple(0.012345, 26)),
     ///     shape: vec![1, 4, 8400],
-    ///     channels_first: false,
+    ///     dshape: Vec::new(),
     /// };
     /// let scores_config = configs::Scores {
     ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
     ///     shape: vec![1, 80, 8400],
-    ///     channels_first: false,
+    ///     dshape: Vec::new(),
     /// };
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_yolo_split_det(boxes_config, scores_config)
@@ -494,14 +726,14 @@ impl DecoderBuilder {
     ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: Some(configs::QuantTuple(0.012345, 26)),
     ///     shape: vec![1, 116, 8400],
-    ///     channels_first: false,
     ///     anchors: None,
+    ///     dshape: Vec::new(),
     /// };
     /// let protos_config = configs::Protos {
     ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
     ///     shape: vec![1, 160, 160, 32],
-    ///     channels_first: false,
+    ///     dshape: Vec::new(),
     /// };
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_yolo_segdet(seg_config, protos_config)
@@ -532,25 +764,25 @@ impl DecoderBuilder {
     ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: Some(configs::QuantTuple(0.012345, 26)),
     ///     shape: vec![1, 4, 8400],
-    ///     channels_first: false,
+    ///     dshape: Vec::new(),
     /// };
     /// let scores_config = configs::Scores {
     ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: Some(configs::QuantTuple(0.012345, 14)),
     ///     shape: vec![1, 80, 8400],
-    ///     channels_first: false,
+    ///     dshape: Vec::new(),
     /// };
     /// let mask_config = configs::MaskCoefficients {
     ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: Some(configs::QuantTuple(0.0064123, 125)),
     ///     shape: vec![1, 32, 8400],
-    ///     channels_first: false,
+    ///     dshape: Vec::new(),
     /// };
     /// let protos_config = configs::Protos {
     ///     decoder: configs::DecoderType::Ultralytics,
     ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
     ///     shape: vec![1, 160, 160, 32],
-    ///     channels_first: false,
+    ///     dshape: Vec::new(),
     /// };
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_yolo_split_segdet(boxes_config, scores_config, mask_config, protos_config)
@@ -588,13 +820,13 @@ impl DecoderBuilder {
     ///     decoder: configs::DecoderType::ModelPack,
     ///     quantization: Some(configs::QuantTuple(0.012345, 26)),
     ///     shape: vec![1, 8400, 1, 4],
-    ///     channels_first: false,
+    ///     dshape: Vec::new(),
     /// };
     /// let scores_config = configs::Scores {
     ///     decoder: configs::DecoderType::ModelPack,
     ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
     ///     shape: vec![1, 8400, 3],
-    ///     channels_first: false,
+    ///     dshape: Vec::new(),
     /// };
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_modelpack_det(boxes_config, scores_config)
@@ -630,7 +862,7 @@ impl DecoderBuilder {
     ///     decoder: configs::DecoderType::ModelPack,
     ///     quantization: Some(configs::QuantTuple(0.012345, 26)),
     ///     shape: vec![1, 17, 30, 18],
-    ///     channels_first: false,
+    ///     dshape: Vec::new(),
     /// };
     /// let config1 = configs::Detection {
     ///     anchors: Some(vec![
@@ -641,7 +873,7 @@ impl DecoderBuilder {
     ///     decoder: configs::DecoderType::ModelPack,
     ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
     ///     shape: vec![1, 9, 15, 18],
-    ///     channels_first: false,
+    ///     dshape: Vec::new(),
     /// };
     ///
     /// let decoder = DecoderBuilder::new()
@@ -668,19 +900,19 @@ impl DecoderBuilder {
     ///     decoder: configs::DecoderType::ModelPack,
     ///     quantization: Some(configs::QuantTuple(0.012345, 26)),
     ///     shape: vec![1, 8400, 1, 4],
-    ///     channels_first: false,
+    ///     dshape: Vec::new(),
     /// };
     /// let scores_config = configs::Scores {
     ///     decoder: configs::DecoderType::ModelPack,
     ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
     ///     shape: vec![1, 8400, 2],
-    ///     channels_first: false,
+    ///     dshape: Vec::new(),
     /// };
     /// let seg_config = configs::Segmentation {
     ///     decoder: configs::DecoderType::ModelPack,
     ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
     ///     shape: vec![1, 640, 640, 3],
-    ///     channels_first: false,
+    ///     dshape: Vec::new(),
     /// };
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_modelpack_segdet(boxes_config, scores_config, seg_config)
@@ -721,7 +953,7 @@ impl DecoderBuilder {
     ///     decoder: configs::DecoderType::ModelPack,
     ///     quantization: Some(configs::QuantTuple(0.08547406643629074, 174)),
     ///     shape: vec![1, 9, 15, 18],
-    ///     channels_first: false,
+    ///     dshape: Vec::new(),
     /// };
     /// let config1 = configs::Detection {
     ///     anchors: Some(vec![
@@ -732,13 +964,13 @@ impl DecoderBuilder {
     ///     decoder: configs::DecoderType::ModelPack,
     ///     quantization: Some(configs::QuantTuple(0.09929127991199493, 183)),
     ///     shape: vec![1, 17, 30, 18],
-    ///     channels_first: false,
+    ///     dshape: Vec::new(),
     /// };
     /// let seg_config = configs::Segmentation {
     ///     decoder: configs::DecoderType::ModelPack,
     ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
     ///     shape: vec![1, 640, 640, 2],
-    ///     channels_first: false,
+    ///     dshape: Vec::new(),
     /// };
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_modelpack_segdet_split(vec![config0, config1], seg_config)
@@ -772,7 +1004,7 @@ impl DecoderBuilder {
     ///     decoder: configs::DecoderType::ModelPack,
     ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
     ///     shape: vec![1, 640, 640, 3],
-    ///     channels_first: false,
+    ///     dshape: Vec::new(),
     /// };
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_modelpack_seg(seg_config)
@@ -939,13 +1171,26 @@ impl DecoderBuilder {
         }
     }
 
-    fn verify_yolo_det(boxes: &configs::Detection) -> Result<(), DecoderError> {
-        if boxes.shape.len() != 3 {
+    fn verify_yolo_det(detect: &configs::Detection) -> Result<(), DecoderError> {
+        if detect.shape.len() != 3 {
             return Err(DecoderError::InvalidConfig(format!(
                 "Invalid Yolo Detection shape {:?}",
-                boxes.shape
+                detect.shape
             )));
         }
+
+        Self::verify_dshapes(
+            &detect.dshape,
+            &detect.shape,
+            "Detection",
+            &[DimName::Batch, DimName::NumFeatures, DimName::NumBoxes],
+        )?;
+        if !detect.dshape.is_empty() {
+            Self::get_class_count(&detect.dshape, None, None)?;
+        } else {
+            Self::get_class_count_no_dshape(detect.into(), None)?;
+        }
+
         Ok(())
     }
 
@@ -966,23 +1211,39 @@ impl DecoderBuilder {
             )));
         }
 
-        let seg_channels = if detection.channels_first {
-            detection.shape[2]
+        Self::verify_dshapes(
+            &detection.dshape,
+            &detection.shape,
+            "Detection",
+            &[DimName::Batch, DimName::NumFeatures, DimName::NumBoxes],
+        )?;
+        Self::verify_dshapes(
+            &protos.dshape,
+            &protos.shape,
+            "Protos",
+            &[
+                DimName::Batch,
+                DimName::Height,
+                DimName::Width,
+                DimName::NumProtos,
+            ],
+        )?;
+
+        let protos_count = Self::get_protos_count(&protos.dshape).unwrap_or(protos.shape[3]);
+        println!("Protos count: {}", protos_count);
+        println!("Detection dshape: {:?}", detection.dshape);
+        let classes = if !detection.dshape.is_empty() {
+            Self::get_class_count(&detection.dshape, Some(protos_count), None)?
         } else {
-            detection.shape[1]
-        };
-        let protos_channels = if protos.channels_first {
-            protos.shape[1]
-        } else {
-            protos.shape[3]
+            Self::get_class_count_no_dshape(detection.into(), Some(protos_count))?
         };
 
-        if protos_channels + 4 >= seg_channels {
-            return Err(DecoderError::InvalidConfig(format!(
-                "Yolo Protos channels {} incompatible with Detection channels {}",
-                protos_channels, seg_channels
-            )));
+        if classes == 0 {
+            return Err(DecoderError::InvalidConfig(
+                "Yolo Segmentation Detection has zero classes".to_string(),
+            ));
         }
+
         Ok(())
     }
 
@@ -1003,29 +1264,21 @@ impl DecoderBuilder {
             )));
         }
 
-        let boxes_dim = if boxes.channels_first {
-            boxes.shape[2]
-        } else {
-            boxes.shape[1]
-        };
+        Self::verify_dshapes(
+            &boxes.dshape,
+            &boxes.shape,
+            "Boxes",
+            &[DimName::Batch, DimName::BoxCoords, DimName::NumBoxes],
+        )?;
+        Self::verify_dshapes(
+            &scores.dshape,
+            &scores.shape,
+            "Scores",
+            &[DimName::Batch, DimName::NumClasses, DimName::NumBoxes],
+        )?;
 
-        if boxes_dim != 4 {
-            return Err(DecoderError::InvalidConfig(format!(
-                "Invalid Yolo Split Boxes dimension {}, expected 4",
-                boxes_dim
-            )));
-        }
-
-        let boxes_num = if boxes.channels_first {
-            boxes.shape[1]
-        } else {
-            boxes.shape[2]
-        };
-        let scores_num = if scores.channels_first {
-            scores.shape[1]
-        } else {
-            scores.shape[2]
-        };
+        let boxes_num = Self::get_box_count(&boxes.dshape).unwrap_or(boxes.shape[2]);
+        let scores_num = Self::get_box_count(&scores.dshape).unwrap_or(scores.shape[2]);
 
         if boxes_num != scores_num {
             return Err(DecoderError::InvalidConfig(format!(
@@ -1070,32 +1323,51 @@ impl DecoderBuilder {
             )));
         }
 
-        let boxes_num = if boxes.channels_first {
-            boxes.shape[1]
-        } else {
-            boxes.shape[2]
-        };
+        Self::verify_dshapes(
+            &boxes.dshape,
+            &boxes.shape,
+            "Boxes",
+            &[DimName::Batch, DimName::BoxCoords, DimName::NumBoxes],
+        )?;
+        Self::verify_dshapes(
+            &scores.dshape,
+            &scores.shape,
+            "Scores",
+            &[DimName::Batch, DimName::NumClasses, DimName::NumBoxes],
+        )?;
+        Self::verify_dshapes(
+            &mask_coeff.dshape,
+            &mask_coeff.shape,
+            "Mask Coefficients",
+            &[DimName::Batch, DimName::NumProtos, DimName::NumBoxes],
+        )?;
+        Self::verify_dshapes(
+            &protos.dshape,
+            &protos.shape,
+            "Protos",
+            &[
+                DimName::Batch,
+                DimName::Height,
+                DimName::Width,
+                DimName::NumProtos,
+            ],
+        )?;
 
-        let scores_num = if scores.channels_first {
-            scores.shape[1]
-        } else {
-            scores.shape[2]
-        };
+        let boxes_num = Self::get_box_count(&boxes.dshape).unwrap_or(boxes.shape[2]);
+        let scores_num = Self::get_box_count(&scores.dshape).unwrap_or(scores.shape[2]);
+        let mask_num = Self::get_box_count(&mask_coeff.dshape).unwrap_or(mask_coeff.shape[2]);
 
-        let mask_num = if mask_coeff.channels_first {
+        let mask_channels = if !mask_coeff.dshape.is_empty() {
+            Self::get_protos_count(&mask_coeff.dshape).ok_or_else(|| {
+                DecoderError::InvalidConfig("Could not find num_protos in config".to_string())
+            })?
+        } else {
             mask_coeff.shape[1]
-        } else {
-            mask_coeff.shape[2]
         };
-
-        let mask_channels = if mask_coeff.channels_first {
-            mask_coeff.shape[2]
-        } else {
-            mask_coeff.shape[1]
-        };
-
-        let proto_channels = if protos.channels_first {
-            protos.shape[1]
+        let proto_channels = if !protos.dshape.is_empty() {
+            Self::get_protos_count(&protos.dshape).ok_or_else(|| {
+                DecoderError::InvalidConfig("Could not find num_protos in config".to_string())
+            })?
         } else {
             protos.shape[3]
         };
@@ -1205,36 +1477,26 @@ impl DecoderBuilder {
             )));
         }
 
-        if boxes.shape[2] != 1 {
-            return Err(DecoderError::InvalidConfig(format!(
-                "Invalid ModelPack Boxes dimension 2: {}, expected 1",
-                boxes.shape[2]
-            )));
-        }
+        Self::verify_dshapes(
+            &boxes.dshape,
+            &boxes.shape,
+            "Boxes",
+            &[
+                DimName::Batch,
+                DimName::NumBoxes,
+                DimName::Padding,
+                DimName::BoxCoords,
+            ],
+        )?;
+        Self::verify_dshapes(
+            &scores.dshape,
+            &scores.shape,
+            "Scores",
+            &[DimName::Batch, DimName::NumBoxes, DimName::NumClasses],
+        )?;
 
-        let boxes_dim = if boxes.channels_first {
-            boxes.shape[1]
-        } else {
-            boxes.shape[3]
-        };
-
-        if boxes_dim != 4 {
-            return Err(DecoderError::InvalidConfig(format!(
-                "Invalid ModelPack Boxes dimension {}, expected 4",
-                boxes_dim
-            )));
-        }
-
-        let boxes_num = if boxes.channels_first {
-            boxes.shape[3]
-        } else {
-            boxes.shape[1]
-        };
-        let scores_num = if scores.channels_first {
-            scores.shape[2]
-        } else {
-            scores.shape[1]
-        };
+        let boxes_num = Self::get_box_count(&boxes.dshape).unwrap_or(boxes.shape[1]);
+        let scores_num = Self::get_box_count(&scores.dshape).unwrap_or(scores.shape[1]);
 
         if boxes_num != scores_num {
             return Err(DecoderError::InvalidConfig(format!(
@@ -1243,10 +1505,10 @@ impl DecoderBuilder {
             )));
         }
 
-        let num_classes = if scores.channels_first {
-            scores.shape[1]
+        let num_classes = if !scores.dshape.is_empty() {
+            Self::get_class_count(&scores.dshape, None, None)?
         } else {
-            scores.shape[2]
+            Self::get_class_count_no_dshape(scores.into(), None)?
         };
 
         Ok(num_classes)
@@ -1274,40 +1536,34 @@ impl DecoderBuilder {
                 )));
             };
 
-            let boxes_channels = if b.channels_first {
-                b.shape[1]
+            Self::verify_dshapes(
+                &b.dshape,
+                &b.shape,
+                "Split Detection",
+                &[
+                    DimName::Batch,
+                    DimName::Height,
+                    DimName::Width,
+                    DimName::NumAnchorsXFeatures,
+                ],
+            )?;
+            let classes = if !b.dshape.is_empty() {
+                Self::get_class_count(&b.dshape, None, Some(num_anchors))?
             } else {
-                b.shape[3]
-            };
-
-            if boxes_channels <= num_anchors * 5 {
-                return Err(DecoderError::InvalidConfig(format!(
-                    "Invalid ModelPack Split Detection shape {:?}: channels {} not greater than number of anchors * 5 = {}",
-                    b.shape,
-                    boxes_channels,
-                    num_anchors * 5,
-                )));
-            };
-
-            if !boxes_channels.is_multiple_of(num_anchors) {
-                return Err(DecoderError::InvalidConfig(format!(
-                    "Invalid ModelPack Split Detection shape {:?}: channels {} not a multiple of number of anchors {}",
-                    b.shape, boxes_channels, num_anchors
-                )));
+                Self::get_class_count_no_dshape(b.into(), None)?
             };
 
             match num_classes {
                 Some(n) => {
-                    let this_n = (boxes_channels / num_anchors) - 5;
-                    if n != this_n {
+                    if n != classes {
                         return Err(DecoderError::InvalidConfig(format!(
                             "ModelPack Split Detection inconsistent number of classes: previous {}, current {}",
-                            n, this_n
+                            n, classes
                         )));
                     }
                 }
                 None => {
-                    num_classes = Some((boxes_channels / num_anchors) - 5);
+                    num_classes = Some(classes);
                 }
             }
         }
@@ -1325,22 +1581,234 @@ impl DecoderBuilder {
                 segmentation.shape
             )));
         }
+        Self::verify_dshapes(
+            &segmentation.dshape,
+            &segmentation.shape,
+            "Segmentation",
+            &[
+                DimName::Batch,
+                DimName::Height,
+                DimName::Width,
+                DimName::NumClasses,
+            ],
+        )?;
 
         if let Some(classes) = classes {
-            let seg_channels = if segmentation.channels_first {
-                segmentation.shape[1]
+            let seg_classes = if !segmentation.dshape.is_empty() {
+                Self::get_class_count(&segmentation.dshape, None, None)?
             } else {
-                segmentation.shape[3]
+                Self::get_class_count_no_dshape(segmentation.into(), None)?
             };
 
-            if seg_channels != classes + 1 {
+            if seg_classes != classes + 1 {
                 return Err(DecoderError::InvalidConfig(format!(
                     "ModelPack Segmentation channels {} incompatible with number of classes {}",
-                    seg_channels, classes
+                    seg_classes, classes
                 )));
             }
         }
         Ok(())
+    }
+
+    // verifies that dshapes match the given shape
+    fn verify_dshapes(
+        dshape: &[(DimName, usize)],
+        shape: &[usize],
+        name: &str,
+        dims: &[DimName],
+    ) -> Result<(), DecoderError> {
+        for s in shape {
+            if *s == 0 {
+                return Err(DecoderError::InvalidConfig(format!(
+                    "{} shape has zero dimension",
+                    name
+                )));
+            }
+        }
+
+        if shape.len() != dims.len() {
+            return Err(DecoderError::InvalidConfig(format!(
+                "{} shape length {} does not match expected dims length {}",
+                name,
+                shape.len(),
+                dims.len()
+            )));
+        }
+
+        if dshape.is_empty() {
+            return Ok(());
+        }
+        // check the dshape lengths match the shape lengths
+        if dshape.len() != shape.len() {
+            return Err(DecoderError::InvalidConfig(format!(
+                "{} dshape length does not match shape length",
+                name
+            )));
+        }
+
+        // check the dshape values match the shape values
+        for ((dim_name, dim_size), shape_size) in dshape.iter().zip(shape) {
+            if dim_size != shape_size {
+                return Err(DecoderError::InvalidConfig(format!(
+                    "{} dshape dimension {} size {} does not match shape size {}",
+                    name, dim_name, dim_size, shape_size
+                )));
+            }
+            if *dim_name == DimName::Padding && *dim_size != 1 {
+                return Err(DecoderError::InvalidConfig(
+                    "Padding dimension size must be 1".to_string(),
+                ));
+            }
+
+            if *dim_name == DimName::BoxCoords && *dim_size != 4 {
+                return Err(DecoderError::InvalidConfig(
+                    "BoxCoords dimension size must be 4".to_string(),
+                ));
+            }
+        }
+
+        let dims_present = HashSet::<DimName>::from_iter(dshape.iter().map(|(name, _)| *name));
+        for dim in dims {
+            if !dims_present.contains(dim) {
+                return Err(DecoderError::InvalidConfig(format!(
+                    "{} dshape missing required dimension {:?}",
+                    name, dim
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn get_box_count(dshape: &[(DimName, usize)]) -> Option<usize> {
+        for (dim_name, dim_size) in dshape {
+            if *dim_name == DimName::NumBoxes {
+                return Some(*dim_size);
+            }
+        }
+        None
+    }
+
+    fn get_class_count_no_dshape(
+        config: ConfigOutputRef,
+        protos: Option<usize>,
+    ) -> Result<usize, DecoderError> {
+        match config {
+            ConfigOutputRef::Detection(detection) => match detection.decoder {
+                DecoderType::Ultralytics => {
+                    if detection.shape[1] <= 4 + protos.unwrap_or(0) {
+                        return Err(DecoderError::InvalidConfig(format!(
+                            "Invalid shape: Yolo num_features {} must be greater than {}",
+                            detection.shape[1],
+                            4 + protos.unwrap_or(0),
+                        )));
+                    }
+                    Ok(detection.shape[1] - 4 - protos.unwrap_or(0))
+                }
+                DecoderType::ModelPack => {
+                    let Some(num_anchors) = detection.anchors.as_ref().map(|a| a.len()) else {
+                        return Err(DecoderError::Internal(
+                            "ModelPack Detection missing anchors".to_string(),
+                        ));
+                    };
+                    let anchors_x_features = detection.shape[3];
+                    if anchors_x_features <= num_anchors * 5 {
+                        return Err(DecoderError::InvalidConfig(format!(
+                            "Invalid ModelPack Split Detection shape: anchors_x_features {} not greater than number of anchors * 5 = {}",
+                            anchors_x_features,
+                            num_anchors * 5,
+                        )));
+                    }
+
+                    if !anchors_x_features.is_multiple_of(num_anchors) {
+                        return Err(DecoderError::InvalidConfig(format!(
+                            "Invalid ModelPack Split Detection shape: anchors_x_features {} not a multiple of number of anchors {}",
+                            anchors_x_features, num_anchors
+                        )));
+                    }
+                    Ok(anchors_x_features / num_anchors - 5)
+                }
+            },
+
+            ConfigOutputRef::Scores(scores) => match scores.decoder {
+                DecoderType::Ultralytics => Ok(scores.shape[1]),
+                DecoderType::ModelPack => Ok(scores.shape[2]),
+            },
+            ConfigOutputRef::Segmentation(seg) => Ok(seg.shape[3]),
+            _ => Err(DecoderError::Internal(
+                "Attempted to get class count from unsupported config output".to_owned(),
+            )),
+        }
+    }
+
+    // get the class count from dshape or calculate from num_features
+    fn get_class_count(
+        dshape: &[(DimName, usize)],
+        protos: Option<usize>,
+        anchors: Option<usize>,
+    ) -> Result<usize, DecoderError> {
+        if dshape.is_empty() {
+            return Ok(0);
+        }
+        // if it has num_classes in dshape, return it
+        for (dim_name, dim_size) in dshape {
+            if *dim_name == DimName::NumClasses {
+                return Ok(*dim_size);
+            }
+        }
+
+        // number of classes can be calculated from num_features - 4 for yolo.  If the
+        // model has protos, we also subtract the number of protos.
+        for (dim_name, dim_size) in dshape {
+            if *dim_name == DimName::NumFeatures {
+                let protos = protos.unwrap_or(0);
+                if protos + 4 >= *dim_size {
+                    return Err(DecoderError::InvalidConfig(format!(
+                        "Invalid shape: Yolo num_features {} must be greater than {}",
+                        *dim_size,
+                        protos + 4,
+                    )));
+                }
+                return Ok(*dim_size - 4 - protos);
+            }
+        }
+
+        // number of classes can be calculated from number of anchors for modelpack
+        // split detection
+        if let Some(num_anchors) = anchors {
+            for (dim_name, dim_size) in dshape {
+                if *dim_name == DimName::NumAnchorsXFeatures {
+                    let anchors_x_features = *dim_size;
+                    if anchors_x_features <= num_anchors * 5 {
+                        return Err(DecoderError::InvalidConfig(format!(
+                            "Invalid ModelPack Split Detection shape: anchors_x_features {} not greater than number of anchors * 5 = {}",
+                            anchors_x_features,
+                            num_anchors * 5,
+                        )));
+                    }
+
+                    if !anchors_x_features.is_multiple_of(num_anchors) {
+                        return Err(DecoderError::InvalidConfig(format!(
+                            "Invalid ModelPack Split Detection shape: anchors_x_features {} not a multiple of number of anchors {}",
+                            anchors_x_features, num_anchors
+                        )));
+                    }
+                    return Ok((anchors_x_features / num_anchors) - 5);
+                }
+            }
+        }
+        Err(DecoderError::InvalidConfig(
+            "Cannot determine number of classes from dshape".to_owned(),
+        ))
+    }
+
+    fn get_protos_count(dshape: &[(DimName, usize)]) -> Option<usize> {
+        for (dim_name, dim_size) in dshape {
+            if *dim_name == DimName::NumProtos {
+                return Some(*dim_size);
+            }
+        }
+        None
     }
 }
 
@@ -1620,7 +2088,7 @@ impl Decoder {
     /// # Examples
     ///
     /// ```rust
-    /// # use edgefirst_decoder::{BoundingBox, DecoderBuilder, DetectBox, DecoderResult, configs::Boxes, configs::DecoderType, configs::Detection, dequantize_cpu, Quantization};
+    /// # use edgefirst_decoder::{BoundingBox, DecoderBuilder, DetectBox, DecoderResult, configs, configs::DecoderType, dequantize_cpu, Quantization};
     /// # use ndarray::Array3;
     /// # fn main() -> DecoderResult<()> {
     /// #   let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
@@ -1630,12 +2098,12 @@ impl Decoder {
     /// #   dequantize_cpu(out, quant, &mut out_dequant);
     /// #   let model_output_f64 = Array3::from_shape_vec((1, 84, 8400), out_dequant)?.into_dyn();
     ///    let decoder = DecoderBuilder::default()
-    ///     .with_config_yolo_det(Detection {
+    ///     .with_config_yolo_det(configs::Detection {
     ///         decoder: DecoderType::Ultralytics,
     ///         quantization: None,
     ///         shape: vec![1, 84, 8400],
-    ///         channels_first: false,
     ///         anchors: None,
+    ///         dshape: Vec::new(),
     ///     })
     ///     .with_score_threshold(0.25)
     ///     .with_iou_threshold(0.7)
@@ -1749,11 +2217,11 @@ impl Decoder {
 
         with_quantized!(boxes_tensor, b, {
             with_quantized!(scores_tensor, s, {
-                let mut boxes_tensor = b.slice(s![0, .., 0, ..]);
-                Self::swap_axes_if_needed(&mut boxes_tensor, boxes.channels_first);
+                let boxes_tensor = Self::swap_axes_if_needed(b, boxes.into());
+                let boxes_tensor = boxes_tensor.slice(s![0, .., 0, ..]);
 
-                let mut scores_tensor = s.slice(s![0, .., ..]);
-                Self::swap_axes_if_needed(&mut scores_tensor, scores.channels_first);
+                let scores_tensor = Self::swap_axes_if_needed(s, scores.into());
+                let scores_tensor = scores_tensor.slice(s![0, .., ..]);
                 decode_modelpack_det(
                     (boxes_tensor, quant_boxes),
                     (scores_tensor, quant_scores),
@@ -1776,37 +2244,31 @@ impl Decoder {
         let (seg, _) = Self::find_outputs_with_shape_quantized(&segmentation.shape, outputs, &[])?;
 
         macro_rules! modelpack_seg {
-            ($seg:expr) => {{
-                let mut seg = $seg.slice(s![0, .., .., ..]);
-                Self::swap_axes_if_needed(&mut seg, segmentation.channels_first);
-                seg
+            ($seg:expr, $body:expr) => {{
+                let seg = Self::swap_axes_if_needed($seg, segmentation.into());
+                let seg = seg.slice(s![0, .., .., ..]);
+                seg.mapv($body)
             }};
         }
         use ArrayViewDQuantized::*;
         let seg = match seg {
             UInt8(s) => {
-                let seg = modelpack_seg!(s);
-                seg.mapv(|x| x)
+                modelpack_seg!(s, |x| x)
             }
             Int8(s) => {
-                let seg = modelpack_seg!(s);
-                seg.mapv(|x| (x as i16 + 128) as u8)
+                modelpack_seg!(s, |x| (x as i16 + 128) as u8)
             }
             UInt16(s) => {
-                let seg = modelpack_seg!(s);
-                seg.mapv(|x| (x >> 8) as u8)
+                modelpack_seg!(s, |x| (x >> 8) as u8)
             }
             Int16(s) => {
-                let seg = modelpack_seg!(s);
-                seg.mapv(|x| ((x as i32 + 32768) >> 8) as u8)
+                modelpack_seg!(s, |x| ((x as i32 + 32768) >> 8) as u8)
             }
             UInt32(s) => {
-                let seg = modelpack_seg!(s);
-                seg.mapv(|x| (x >> 24) as u8)
+                modelpack_seg!(s, |x| (x >> 24) as u8)
             }
             Int32(s) => {
-                let seg = modelpack_seg!(s);
-                seg.mapv(|x| ((x as i64 + 2147483648) >> 24) as u8)
+                modelpack_seg!(s, |x| ((x as i64 + 2147483648) >> 24) as u8)
             }
         };
 
@@ -1842,8 +2304,8 @@ impl Decoder {
 
         macro_rules! dequant_output {
             ($det_tensor:expr, $detection:expr) => {{
-                let mut det_tensor = $det_tensor.slice(s![0, .., .., ..]);
-                Self::swap_axes_if_needed(&mut det_tensor, $detection.channels_first);
+                let det_tensor = Self::swap_axes_if_needed($det_tensor, $detection.into());
+                let det_tensor = det_tensor.slice(s![0, .., .., ..]);
                 if let Some(q) = $detection.quantization {
                     dequantize_ndarray(det_tensor, q.into())
                 } else {
@@ -1888,11 +2350,8 @@ impl Decoder {
             .unwrap_or_default();
 
         with_quantized!(boxes_tensor, b, {
-            let mut boxes_tensor = b.slice(s![0, .., ..]);
-            if boxes.channels_first {
-                boxes_tensor.swap_axes(0, 1);
-            };
-            Self::swap_axes_if_needed(&mut boxes_tensor, boxes.channels_first);
+            let boxes_tensor = Self::swap_axes_if_needed(b, boxes.into());
+            let boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
             decode_yolo_det(
                 (boxes_tensor, quant_boxes),
                 self.score_threshold,
@@ -1928,12 +2387,11 @@ impl Decoder {
 
         with_quantized!(boxes_tensor, b, {
             with_quantized!(protos_tensor, p, {
-                let mut box_tensor = b.slice(s![0, .., ..]);
-                Self::swap_axes_if_needed(&mut box_tensor, boxes.channels_first);
+                let box_tensor = Self::swap_axes_if_needed(b, boxes.into());
+                let box_tensor = box_tensor.slice(s![0, .., ..]);
 
-                let mut protos_tensor = p.slice(s![0, .., .., ..]);
-                Self::swap_axes_if_needed(&mut protos_tensor, protos.channels_first);
-
+                let protos_tensor = Self::swap_axes_if_needed(p, protos.into());
+                let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
                 decode_yolo_segdet_quant(
                     (box_tensor, quant_boxes),
                     (protos_tensor, quant_protos),
@@ -1970,11 +2428,11 @@ impl Decoder {
 
         with_quantized!(boxes_tensor, b, {
             with_quantized!(scores_tensor, s, {
-                let mut boxes_tensor = b.slice(s![0, .., ..]);
-                Self::swap_axes_if_needed(&mut boxes_tensor, boxes.channels_first);
+                let boxes_tensor = Self::swap_axes_if_needed(b, boxes.into());
+                let boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
 
-                let mut scores_tensor = s.slice(s![0, .., ..]);
-                Self::swap_axes_if_needed(&mut scores_tensor, scores.channels_first);
+                let scores_tensor = Self::swap_axes_if_needed(s, scores.into());
+                let scores_tensor = scores_tensor.slice(s![0, .., ..]);
                 decode_yolo_split_det_quant(
                     (boxes_tensor, quant_boxes),
                     (scores_tensor, quant_scores),
@@ -2035,11 +2493,11 @@ impl Decoder {
 
         let boxes = with_quantized!(boxes_tensor, b, {
             with_quantized!(scores_tensor, s, {
-                let mut boxes_tensor = b.slice(s![0, .., ..]);
-                Self::swap_axes_if_needed(&mut boxes_tensor, boxes.channels_first);
+                let boxes_tensor = Self::swap_axes_if_needed(b, boxes.into());
+                let boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
 
-                let mut scores_tensor = s.slice(s![0, .., ..]);
-                Self::swap_axes_if_needed(&mut scores_tensor, scores.channels_first);
+                let scores_tensor = Self::swap_axes_if_needed(s, scores.into());
+                let scores_tensor = scores_tensor.slice(s![0, .., ..]);
                 impl_yolo_split_segdet_quant_get_boxes::<XYWH, _, _>(
                     (boxes_tensor, quant_boxes),
                     (scores_tensor, quant_scores),
@@ -2052,12 +2510,11 @@ impl Decoder {
 
         with_quantized!(mask_tensor, m, {
             with_quantized!(protos_tensor, p, {
-                let mut mask_tensor = m.slice(s![0, .., ..]);
-                Self::swap_axes_if_needed(&mut mask_tensor, mask_coeff.channels_first);
+                let mask_tensor = Self::swap_axes_if_needed(m, mask_coeff.into());
+                let mask_tensor = mask_tensor.slice(s![0, .., ..]);
 
-                let mut protos_tensor = p.slice(s![0, .., .., ..]);
-                Self::swap_axes_if_needed(&mut protos_tensor, protos.channels_first);
-
+                let protos_tensor = Self::swap_axes_if_needed(p, protos.into());
+                let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
                 impl_yolo_split_segdet_quant_process_masks::<_, _>(
                     boxes,
                     (mask_tensor, quant_masks),
@@ -2120,9 +2577,9 @@ impl Decoder {
         f32: AsPrimitive<T>,
     {
         let (seg, _) = Self::find_outputs_with_shape(&segmentation.shape, outputs, &[])?;
-        let mut seg = seg.slice(s![0, .., .., ..]);
-        Self::swap_axes_if_needed(&mut seg, segmentation.channels_first);
 
+        let seg = Self::swap_axes_if_needed(seg, segmentation.into());
+        let seg = seg.slice(s![0, .., .., ..]);
         let u8_max = 255.0_f32.as_();
         let max = *seg.max().unwrap_or(&u8_max);
         let min = *seg.min().unwrap_or(&0.0_f32.as_());
@@ -2149,12 +2606,13 @@ impl Decoder {
         f32: AsPrimitive<T>,
     {
         let (boxes_tensor, ind) = Self::find_outputs_with_shape(&boxes.shape, outputs, &[])?;
-        let mut boxes_tensor = boxes_tensor.slice(s![0, .., 0, ..]);
-        Self::swap_axes_if_needed(&mut boxes_tensor, boxes.channels_first);
+
+        let boxes_tensor = Self::swap_axes_if_needed(boxes_tensor, boxes.into());
+        let boxes_tensor = boxes_tensor.slice(s![0, .., 0, ..]);
 
         let (scores_tensor, _) = Self::find_outputs_with_shape(&scores.shape, outputs, &[ind])?;
-        let mut scores_tensor = scores_tensor.slice(s![0, .., ..]);
-        Self::swap_axes_if_needed(&mut scores_tensor, scores.channels_first);
+        let scores_tensor = Self::swap_axes_if_needed(scores_tensor, scores.into());
+        let scores_tensor = scores_tensor.slice(s![0, .., ..]);
 
         decode_modelpack_float(
             boxes_tensor,
@@ -2177,9 +2635,9 @@ impl Decoder {
         f32: AsPrimitive<T>,
     {
         let (boxes_tensor, _) = Self::find_outputs_with_shape(&boxes.shape, outputs, &[])?;
-        let mut boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
-        Self::swap_axes_if_needed(&mut boxes_tensor, boxes.channels_first);
 
+        let boxes_tensor = Self::swap_axes_if_needed(boxes_tensor, boxes.into());
+        let boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
         decode_yolo_det_float(
             boxes_tensor,
             self.score_threshold,
@@ -2202,13 +2660,14 @@ impl Decoder {
         f32: AsPrimitive<T>,
     {
         let (boxes_tensor, ind) = Self::find_outputs_with_shape(&boxes.shape, outputs, &[])?;
-        let mut boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
-        Self::swap_axes_if_needed(&mut boxes_tensor, boxes.channels_first);
+
+        let boxes_tensor = Self::swap_axes_if_needed(boxes_tensor, boxes.into());
+        let boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
 
         let (protos_tensor, _) = Self::find_outputs_with_shape(&protos.shape, outputs, &[ind])?;
-        let mut protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-        Self::swap_axes_if_needed(&mut protos_tensor, protos.channels_first);
 
+        let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos.into());
+        let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
         decode_yolo_segdet_float(
             boxes_tensor,
             protos_tensor,
@@ -2232,12 +2691,13 @@ impl Decoder {
         f32: AsPrimitive<T>,
     {
         let (boxes_tensor, ind) = Self::find_outputs_with_shape(&boxes.shape, outputs, &[])?;
-        let mut boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
-        Self::swap_axes_if_needed(&mut boxes_tensor, boxes.channels_first);
+        let boxes_tensor = Self::swap_axes_if_needed(boxes_tensor, boxes.into());
+        let boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
 
         let (scores_tensor, _) = Self::find_outputs_with_shape(&scores.shape, outputs, &[ind])?;
-        let mut scores_tensor = scores_tensor.slice(s![0, .., ..]);
-        Self::swap_axes_if_needed(&mut scores_tensor, scores.channels_first);
+
+        let scores_tensor = Self::swap_axes_if_needed(scores_tensor, scores.into());
+        let scores_tensor = scores_tensor.slice(s![0, .., ..]);
 
         decode_yolo_split_det_float(
             boxes_tensor,
@@ -2266,24 +2726,25 @@ impl Decoder {
     {
         let mut skip = vec![];
         let (boxes_tensor, ind) = Self::find_outputs_with_shape(&boxes.shape, outputs, &skip)?;
-        let mut boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
-        Self::swap_axes_if_needed(&mut boxes_tensor, boxes.channels_first);
+
+        let boxes_tensor = Self::swap_axes_if_needed(boxes_tensor, boxes.into());
+        let boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
         skip.push(ind);
 
         let (scores_tensor, ind) = Self::find_outputs_with_shape(&scores.shape, outputs, &skip)?;
-        let mut scores_tensor = scores_tensor.slice(s![0, .., ..]);
-        Self::swap_axes_if_needed(&mut scores_tensor, scores.channels_first);
+
+        let scores_tensor = Self::swap_axes_if_needed(scores_tensor, scores.into());
+        let scores_tensor = scores_tensor.slice(s![0, .., ..]);
         skip.push(ind);
 
         let (mask_tensor, ind) = Self::find_outputs_with_shape(&mask_coeff.shape, outputs, &skip)?;
-        let mut mask_tensor = mask_tensor.slice(s![0, .., ..]);
-        Self::swap_axes_if_needed(&mut mask_tensor, mask_coeff.channels_first);
+        let mask_tensor = Self::swap_axes_if_needed(mask_tensor, mask_coeff.into());
+        let mask_tensor = mask_tensor.slice(s![0, .., ..]);
         skip.push(ind);
 
         let (protos_tensor, _) = Self::find_outputs_with_shape(&protos.shape, outputs, &skip)?;
-        let mut protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-        Self::swap_axes_if_needed(&mut protos_tensor, protos.channels_first);
-
+        let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos.into());
+        let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
         decode_yolo_split_segdet_float(
             boxes_tensor,
             scores_tensor,
@@ -2359,17 +2820,166 @@ impl Decoder {
         )))
     }
 
-    fn swap_axes_if_needed<T, D: Dimension>(array: &mut ArrayView<T, D>, channels_first: bool) {
-        if channels_first {
-            match array.ndim() {
-                2 => array.swap_axes(0, 1),
-                3 => {
-                    array.swap_axes(0, 1);
-                    array.swap_axes(1, 2);
+    /// This is split detection, need to swap axes to batch, height, width,
+    /// num_anchors_x_features,
+    fn modelpack_det_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::NumBoxes => 1,
+            DimName::Padding => 2,
+            DimName::BoxCoords => 3,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
+    // This is Ultralytics detection, need to swap axes to batch, num_features,
+    // height, width
+    fn yolo_det_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::NumFeatures => 1,
+            DimName::NumBoxes => 2,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
+    // This is modelpack boxes, need to swap axes to batch, num_boxes, padding,
+    // box_coords
+    fn modelpack_boxes_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::NumBoxes => 1,
+            DimName::Padding => 2,
+            DimName::BoxCoords => 3,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
+    /// This is Ultralytics boxes, need to swap axes to batch, box_coords,
+    /// num_boxes
+    fn yolo_boxes_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::BoxCoords => 1,
+            DimName::NumBoxes => 2,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
+    /// This is modelpack scores, need to swap axes to batch, num_boxes,
+    /// num_classes
+    fn modelpack_scores_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::NumBoxes => 1,
+            DimName::NumClasses => 2,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
+    fn yolo_scores_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::NumClasses => 1,
+            DimName::NumBoxes => 2,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
+    /// This is modelpack segmentation, need to swap axes to batch, height,
+    /// width, num_classes
+    fn modelpack_segmentation_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::Height => 1,
+            DimName::Width => 2,
+            DimName::NumClasses => 3,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
+    /// This is modelpack masks, need to swap axes to batch, height,
+    /// width
+    fn modelpack_mask_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::Height => 1,
+            DimName::Width => 2,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
+    /// This is yolo protos, need to swap axes to batch, height, width,
+    /// num_protos
+    fn yolo_protos_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::Height => 1,
+            DimName::Width => 2,
+            DimName::NumProtos => 3,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
+    /// This is yolo mask coefficients, need to swap axes to batch, num_protos,
+    /// num_boxes
+    fn yolo_maskcoefficients_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::NumProtos => 1,
+            DimName::NumBoxes => 2,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
+    fn get_order_fn(config: ConfigOutputRef) -> fn(DimName) -> usize {
+        let decoder_type = config.decoder();
+        match (config, decoder_type) {
+            (ConfigOutputRef::Detection(_), DecoderType::ModelPack) => Self::modelpack_det_order,
+            (ConfigOutputRef::Detection(_), DecoderType::Ultralytics) => Self::yolo_det_order,
+            (ConfigOutputRef::Boxes(_), DecoderType::ModelPack) => Self::modelpack_boxes_order,
+            (ConfigOutputRef::Boxes(_), DecoderType::Ultralytics) => Self::yolo_boxes_order,
+            (ConfigOutputRef::Scores(_), DecoderType::ModelPack) => Self::modelpack_scores_order,
+            (ConfigOutputRef::Scores(_), DecoderType::Ultralytics) => Self::yolo_scores_order,
+            (ConfigOutputRef::Segmentation(_), _) => Self::modelpack_segmentation_order,
+            (ConfigOutputRef::Mask(_), _) => Self::modelpack_mask_order,
+            (ConfigOutputRef::Protos(_), _) => Self::yolo_protos_order,
+            (ConfigOutputRef::MaskCoefficients(_), _) => Self::yolo_maskcoefficients_order,
+        }
+    }
+
+    fn swap_axes_if_needed<'a, T, D: Dimension>(
+        array: &ArrayView<'a, T, D>,
+        config: ConfigOutputRef,
+    ) -> ArrayView<'a, T, D> {
+        let mut array = array.clone();
+        if config.dshape().is_empty() {
+            return array;
+        }
+        let order_fn: fn(DimName) -> usize = Self::get_order_fn(config.clone());
+        let mut current_order: Vec<usize> = config
+            .dshape()
+            .iter()
+            .map(|x| order_fn(x.0))
+            .collect::<Vec<_>>();
+
+        assert_eq!(array.shape().len(), current_order.len());
+        // do simple bubble sort as swap_axes is inexpensive and the
+        // number of dimensions is small
+        for i in 0..current_order.len() {
+            let mut swapped = false;
+            for j in 0..current_order.len() - 1 - i {
+                if current_order[j] > current_order[j + 1] {
+                    array.swap_axes(j, j + 1);
+                    current_order.swap(j, j + 1);
+                    swapped = true;
                 }
-                _ => {}
+            }
+            if !swapped {
+                break;
             }
         }
+        array
     }
 
     fn match_outputs_to_detect_quantized<'a, 'b>(
@@ -2426,7 +3036,6 @@ mod decoder_builder_tests {
         model_type: yolov8_det
         outputs:
           - shape: [1, 84, 8400]
-            channels_first: false
         "
         .to_owned();
         let result = DecoderBuilder::new()
@@ -2443,7 +3052,6 @@ mod decoder_builder_tests {
             \"outputs\": [
                 {
                     \"shape\": [1, 84, 8400]
-                    \"channels_first\": false
                 }
             ]
         }"
@@ -2461,14 +3069,22 @@ mod decoder_builder_tests {
                 configs::Boxes {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 4, 8400],
-                    channels_first: false,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::BoxCoords, 4),
+                        (DimName::NumBoxes, 8400),
+                    ],
                 },
                 configs::Scores {
                     decoder: configs::DecoderType::ModelPack,
                     shape: vec![1, 80, 8400],
-                    channels_first: false,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumClasses, 80),
+                        (DimName::NumBoxes, 8400),
+                    ],
                 },
             )
             .build();
@@ -2485,15 +3101,25 @@ mod decoder_builder_tests {
                 configs::Detection {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 85, 8400, 1], // Invalid shape
-                    channels_first: false,
                     quantization: None,
                     anchors: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumFeatures, 85),
+                        (DimName::NumBoxes, 8400),
+                        (DimName::Batch, 1),
+                    ],
                 },
                 configs::Protos {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 32, 160, 160],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumProtos, 32),
+                        (DimName::Height, 160),
+                        (DimName::Width, 160),
+                    ],
                 },
             )
             .build();
@@ -2508,10 +3134,15 @@ mod decoder_builder_tests {
         let result = DecoderBuilder::new()
             .with_config(ConfigOutputs {
                 outputs: vec![ConfigOutput::Mask(configs::Mask {
-                    channels_first: false,
                     shape: vec![1, 160, 160, 1],
                     decoder: configs::DecoderType::Ultralytics,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::Height, 160),
+                        (DimName::Width, 160),
+                        (DimName::NumFeatures, 1),
+                    ],
                 })],
             })
             .build();
@@ -2526,10 +3157,14 @@ mod decoder_builder_tests {
         let result = DecoderBuilder::new()
             .with_config(ConfigOutputs {
                 outputs: vec![ConfigOutput::Segmentation(configs::Segmentation {
-                    channels_first: false,
                     shape: vec![1, 84, 8400],
                     decoder: configs::DecoderType::Ultralytics,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumFeatures, 84),
+                        (DimName::NumBoxes, 8400),
+                    ],
                 })],
             })
             .build();
@@ -2547,12 +3182,47 @@ mod decoder_builder_tests {
                 decoder: DecoderType::Ultralytics,
                 quantization: None,
                 shape: vec![1, 84, 8400, 1], // Invalid shape
-                channels_first: false,
+                dshape: vec![
+                    (DimName::Batch, 1),
+                    (DimName::NumFeatures, 84),
+                    (DimName::NumBoxes, 8400),
+                    (DimName::Batch, 1),
+                ],
             })
             .build();
 
         assert!(matches!(
             result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("Invalid Yolo Detection shape")));
+
+        let result = DecoderBuilder::new()
+            .with_config_yolo_det(configs::Detection {
+                anchors: None,
+                decoder: DecoderType::Ultralytics,
+                quantization: None,
+                shape: vec![1, 8400, 3], // Invalid shape
+                dshape: vec![
+                    (DimName::Batch, 1),
+                    (DimName::NumBoxes, 8400),
+                    (DimName::NumFeatures, 3),
+                ],
+            })
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("Invalid shape: Yolo num_features 3 must be greater than 4")));
+
+        let result = DecoderBuilder::new()
+            .with_config_yolo_det(configs::Detection {
+                anchors: None,
+                decoder: DecoderType::Ultralytics,
+                quantization: None,
+                shape: vec![1, 3, 8400], // Invalid shape
+                dshape: Vec::new(),
+            })
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("Invalid shape: Yolo num_features 3 must be greater than 4")));
     }
 
     #[test]
@@ -2562,15 +3232,25 @@ mod decoder_builder_tests {
                 configs::Detection {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 85, 8400, 1], // Invalid shape
-                    channels_first: false,
                     quantization: None,
                     anchors: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumFeatures, 85),
+                        (DimName::NumBoxes, 8400),
+                        (DimName::Batch, 1),
+                    ],
                 },
                 configs::Protos {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 32, 160, 160],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumProtos, 32),
+                        (DimName::Height, 160),
+                        (DimName::Width, 160),
+                    ],
                 },
             )
             .build();
@@ -2583,14 +3263,24 @@ mod decoder_builder_tests {
                 configs::Detection {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 85, 8400],
-                    channels_first: false,
                     quantization: None,
                     anchors: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumFeatures, 85),
+                        (DimName::NumBoxes, 8400),
+                    ],
                 },
                 configs::Protos {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 32, 160, 160, 1], // Invalid shape
-                    channels_first: true,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumProtos, 32),
+                        (DimName::Height, 160),
+                        (DimName::Width, 160),
+                        (DimName::Batch, 1),
+                    ],
                     quantization: None,
                 },
             )
@@ -2604,21 +3294,30 @@ mod decoder_builder_tests {
                 configs::Detection {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 36], // too few classes
-                    channels_first: true,
                     quantization: None,
                     anchors: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 8400),
+                        (DimName::NumFeatures, 36),
+                    ],
                 },
                 configs::Protos {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 32, 160, 160],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumProtos, 32),
+                        (DimName::Height, 160),
+                        (DimName::Width, 160),
+                    ],
                 },
             )
             .build();
-
+        println!("{:?}", result);
         assert!(matches!(
-            result, Err(DecoderError::InvalidConfig(s)) if s == "Yolo Protos channels 32 incompatible with Detection channels 36"));
+            result, Err(DecoderError::InvalidConfig(s)) if s == "Invalid shape: Yolo num_features 36 must be greater than 36"));
     }
 
     #[test]
@@ -2628,14 +3327,23 @@ mod decoder_builder_tests {
                 configs::Boxes {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 4, 8400, 1], // Invalid shape
-                    channels_first: false,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::BoxCoords, 4),
+                        (DimName::NumBoxes, 8400),
+                        (DimName::Batch, 1),
+                    ],
                 },
                 configs::Scores {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 80, 8400],
-                    channels_first: false,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumClasses, 80),
+                        (DimName::NumBoxes, 8400),
+                    ],
                 },
             )
             .build();
@@ -2648,14 +3356,23 @@ mod decoder_builder_tests {
                 configs::Boxes {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 4, 8400],
-                    channels_first: false,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::BoxCoords, 4),
+                        (DimName::NumBoxes, 8400),
+                    ],
                 },
                 configs::Scores {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 80, 8400, 1], // Invalid shape
-                    channels_first: false,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumClasses, 80),
+                        (DimName::NumBoxes, 8400),
+                        (DimName::Batch, 1),
+                    ],
                 },
             )
             .build();
@@ -2668,14 +3385,22 @@ mod decoder_builder_tests {
                 configs::Boxes {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 4],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 8400),
+                        (DimName::BoxCoords, 4),
+                    ],
                 },
                 configs::Scores {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400 + 1, 80], // Invalid number of boxes
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 8401),
+                        (DimName::NumClasses, 80),
+                    ],
                 },
             )
             .build();
@@ -2688,20 +3413,27 @@ mod decoder_builder_tests {
                 configs::Boxes {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 5, 8400], // Invalid boxes dimensions
-                    channels_first: false,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::BoxCoords, 5),
+                        (DimName::NumBoxes, 8400),
+                    ],
                 },
                 configs::Scores {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 80, 8400],
-                    channels_first: false,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumClasses, 80),
+                        (DimName::NumBoxes, 8400),
+                    ],
                 },
             )
             .build();
-
         assert!(matches!(
-            result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("Invalid Yolo Split Boxes dimension 5, expected 4")));
+            result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("BoxCoords dimension size must be 4")));
     }
 
     #[test]
@@ -2711,26 +3443,45 @@ mod decoder_builder_tests {
                 configs::Boxes {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 4, 1],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 8400),
+                        (DimName::BoxCoords, 4),
+                        (DimName::Batch, 1),
+                    ],
                 },
                 configs::Scores {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 80],
-                    channels_first: true,
+
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 8400),
+                        (DimName::NumClasses, 80),
+                    ],
                 },
                 configs::MaskCoefficients {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 32],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 8400),
+                        (DimName::NumProtos, 32),
+                    ],
                 },
                 configs::Protos {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 32, 160, 160],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumProtos, 32),
+                        (DimName::Height, 160),
+                        (DimName::Width, 160),
+                    ],
                 },
             )
             .build();
@@ -2743,26 +3494,44 @@ mod decoder_builder_tests {
                 configs::Boxes {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 4],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 8400),
+                        (DimName::BoxCoords, 4),
+                    ],
                 },
                 configs::Scores {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 80, 1],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 8400),
+                        (DimName::NumClasses, 80),
+                        (DimName::Batch, 1),
+                    ],
                 },
                 configs::MaskCoefficients {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 32],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 8400),
+                        (DimName::NumProtos, 32),
+                    ],
                 },
                 configs::Protos {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 32, 160, 160],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumProtos, 32),
+                        (DimName::Height, 160),
+                        (DimName::Width, 160),
+                    ],
                 },
             )
             .build();
@@ -2775,26 +3544,44 @@ mod decoder_builder_tests {
                 configs::Boxes {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 4],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 8400),
+                        (DimName::BoxCoords, 4),
+                    ],
                 },
                 configs::Scores {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 80],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 8400),
+                        (DimName::NumClasses, 80),
+                    ],
                 },
                 configs::MaskCoefficients {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 32, 1],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 8400),
+                        (DimName::NumProtos, 32),
+                        (DimName::Batch, 1),
+                    ],
                 },
                 configs::Protos {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 32, 160, 160],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumProtos, 32),
+                        (DimName::Height, 160),
+                        (DimName::Width, 160),
+                    ],
                 },
             )
             .build();
@@ -2807,26 +3594,44 @@ mod decoder_builder_tests {
                 configs::Boxes {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 4],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 8400),
+                        (DimName::BoxCoords, 4),
+                    ],
                 },
                 configs::Scores {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 80],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 8400),
+                        (DimName::NumClasses, 80),
+                    ],
                 },
                 configs::MaskCoefficients {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 32],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 8400),
+                        (DimName::NumProtos, 32),
+                    ],
                 },
                 configs::Protos {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 32, 160, 160, 1],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumProtos, 32),
+                        (DimName::Height, 160),
+                        (DimName::Width, 160),
+                        (DimName::Batch, 1),
+                    ],
                 },
             )
             .build();
@@ -2839,26 +3644,43 @@ mod decoder_builder_tests {
                 configs::Boxes {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 4],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 8400),
+                        (DimName::BoxCoords, 4),
+                    ],
                 },
                 configs::Scores {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8401, 80],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 8401),
+                        (DimName::NumClasses, 80),
+                    ],
                 },
                 configs::MaskCoefficients {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 32],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 8400),
+                        (DimName::NumProtos, 32),
+                    ],
                 },
                 configs::Protos {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 32, 160, 160],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumProtos, 32),
+                        (DimName::Height, 160),
+                        (DimName::Width, 160),
+                    ],
                 },
             )
             .build();
@@ -2871,26 +3693,44 @@ mod decoder_builder_tests {
                 configs::Boxes {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 4],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 8400),
+                        (DimName::BoxCoords, 4),
+                    ],
                 },
                 configs::Scores {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 80],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 8400),
+                        (DimName::NumClasses, 80),
+                    ],
                 },
                 configs::MaskCoefficients {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8401, 32],
-                    channels_first: true,
+
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 8401),
+                        (DimName::NumProtos, 32),
+                    ],
                 },
                 configs::Protos {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 32, 160, 160],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumProtos, 32),
+                        (DimName::Height, 160),
+                        (DimName::Width, 160),
+                    ],
                 },
             )
             .build();
@@ -2902,30 +3742,47 @@ mod decoder_builder_tests {
                 configs::Boxes {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 4],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 8400),
+                        (DimName::BoxCoords, 4),
+                    ],
                 },
                 configs::Scores {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 80],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 8400),
+                        (DimName::NumClasses, 80),
+                    ],
                 },
                 configs::MaskCoefficients {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 8400, 32],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 8400),
+                        (DimName::NumProtos, 32),
+                    ],
                 },
                 configs::Protos {
                     decoder: configs::DecoderType::Ultralytics,
                     shape: vec![1, 31, 160, 160],
-                    channels_first: true,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumProtos, 31),
+                        (DimName::Height, 160),
+                        (DimName::Width, 160),
+                    ],
                 },
             )
             .build();
-
+        println!("{:?}", result);
         assert!(matches!(
             result, Err(DecoderError::InvalidConfig(ref s)) if s.starts_with( "Yolo Protos channels 31 incompatible with Mask Coefficients channels 32")));
     }
@@ -2938,20 +3795,33 @@ mod decoder_builder_tests {
                     ConfigOutput::Boxes(configs::Boxes {
                         decoder: configs::DecoderType::ModelPack,
                         shape: vec![1, 8400, 1, 4],
-                        channels_first: false,
                         quantization: None,
+                        dshape: vec![
+                            (DimName::Batch, 1),
+                            (DimName::NumBoxes, 8400),
+                            (DimName::Padding, 1),
+                            (DimName::BoxCoords, 4),
+                        ],
                     }),
                     ConfigOutput::Scores(configs::Scores {
                         decoder: configs::DecoderType::ModelPack,
                         shape: vec![1, 8400, 3],
-                        channels_first: false,
                         quantization: None,
+                        dshape: vec![
+                            (DimName::Batch, 1),
+                            (DimName::NumBoxes, 8400),
+                            (DimName::NumClasses, 3),
+                        ],
                     }),
                     ConfigOutput::Protos(configs::Protos {
                         decoder: configs::DecoderType::ModelPack,
                         shape: vec![1, 8400, 3],
-                        channels_first: false,
                         quantization: None,
+                        dshape: vec![
+                            (DimName::Batch, 1),
+                            (DimName::NumBoxes, 8400),
+                            (DimName::NumFeatures, 3),
+                        ],
                     }),
                 ],
             })
@@ -2966,20 +3836,33 @@ mod decoder_builder_tests {
                     ConfigOutput::Boxes(configs::Boxes {
                         decoder: configs::DecoderType::ModelPack,
                         shape: vec![1, 8400, 1, 4],
-                        channels_first: false,
                         quantization: None,
+                        dshape: vec![
+                            (DimName::Batch, 1),
+                            (DimName::NumBoxes, 8400),
+                            (DimName::Padding, 1),
+                            (DimName::BoxCoords, 4),
+                        ],
                     }),
                     ConfigOutput::Scores(configs::Scores {
                         decoder: configs::DecoderType::ModelPack,
                         shape: vec![1, 8400, 3],
-                        channels_first: false,
                         quantization: None,
+                        dshape: vec![
+                            (DimName::Batch, 1),
+                            (DimName::NumBoxes, 8400),
+                            (DimName::NumClasses, 3),
+                        ],
                     }),
                     ConfigOutput::MaskCoefficients(configs::MaskCoefficients {
                         decoder: configs::DecoderType::ModelPack,
                         shape: vec![1, 8400, 3],
-                        channels_first: false,
                         quantization: None,
+                        dshape: vec![
+                            (DimName::Batch, 1),
+                            (DimName::NumBoxes, 8400),
+                            (DimName::NumProtos, 3),
+                        ],
                     }),
                 ],
             })
@@ -2993,8 +3876,13 @@ mod decoder_builder_tests {
                 outputs: vec![ConfigOutput::Boxes(configs::Boxes {
                     decoder: configs::DecoderType::ModelPack,
                     shape: vec![1, 8400, 1, 4],
-                    channels_first: false,
                     quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 8400),
+                        (DimName::Padding, 1),
+                        (DimName::BoxCoords, 4),
+                    ],
                 })],
             })
             .build();
@@ -3011,13 +3899,21 @@ mod decoder_builder_tests {
                     decoder: DecoderType::ModelPack,
                     quantization: None,
                     shape: vec![1, 4, 8400],
-                    channels_first: true,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::BoxCoords, 4),
+                        (DimName::NumBoxes, 8400),
+                    ],
                 },
                 configs::Scores {
                     decoder: DecoderType::ModelPack,
                     quantization: None,
                     shape: vec![1, 80, 8400],
-                    channels_first: true,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumClasses, 80),
+                        (DimName::NumBoxes, 8400),
+                    ],
                 },
             )
             .build();
@@ -3031,13 +3927,23 @@ mod decoder_builder_tests {
                     decoder: DecoderType::ModelPack,
                     quantization: None,
                     shape: vec![1, 4, 1, 8400],
-                    channels_first: true,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::BoxCoords, 4),
+                        (DimName::Padding, 1),
+                        (DimName::NumBoxes, 8400),
+                    ],
                 },
                 configs::Scores {
                     decoder: DecoderType::ModelPack,
                     quantization: None,
                     shape: vec![1, 80, 8400, 1],
-                    channels_first: true,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumClasses, 80),
+                        (DimName::NumBoxes, 8400),
+                        (DimName::Padding, 1),
+                    ],
                 },
             )
             .build();
@@ -3051,19 +3957,27 @@ mod decoder_builder_tests {
                     decoder: DecoderType::ModelPack,
                     quantization: None,
                     shape: vec![1, 4, 2, 8400],
-                    channels_first: true,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::BoxCoords, 4),
+                        (DimName::Padding, 2),
+                        (DimName::NumBoxes, 8400),
+                    ],
                 },
                 configs::Scores {
                     decoder: DecoderType::ModelPack,
                     quantization: None,
                     shape: vec![1, 80, 8400],
-                    channels_first: true,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumClasses, 80),
+                        (DimName::NumBoxes, 8400),
+                    ],
                 },
             )
             .build();
-
         assert!(matches!(
-            result, Err(DecoderError::InvalidConfig(s)) if s == "Invalid ModelPack Boxes dimension 2: 2, expected 1"));
+            result, Err(DecoderError::InvalidConfig(s)) if s == "Padding dimension size must be 1"));
 
         let result = DecoderBuilder::new()
             .with_config_modelpack_det(
@@ -3071,19 +3985,28 @@ mod decoder_builder_tests {
                     decoder: DecoderType::ModelPack,
                     quantization: None,
                     shape: vec![1, 5, 1, 8400],
-                    channels_first: true,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::BoxCoords, 5),
+                        (DimName::Padding, 1),
+                        (DimName::NumBoxes, 8400),
+                    ],
                 },
                 configs::Scores {
                     decoder: DecoderType::ModelPack,
                     quantization: None,
                     shape: vec![1, 80, 8400],
-                    channels_first: true,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumClasses, 80),
+                        (DimName::NumBoxes, 8400),
+                    ],
                 },
             )
             .build();
 
         assert!(matches!(
-            result, Err(DecoderError::InvalidConfig(s)) if s == "Invalid ModelPack Boxes dimension 5, expected 4"));
+            result, Err(DecoderError::InvalidConfig(s)) if s == "BoxCoords dimension size must be 4"));
 
         let result = DecoderBuilder::new()
             .with_config_modelpack_det(
@@ -3091,13 +4014,22 @@ mod decoder_builder_tests {
                     decoder: DecoderType::ModelPack,
                     quantization: None,
                     shape: vec![1, 4, 1, 8400],
-                    channels_first: true,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::BoxCoords, 4),
+                        (DimName::Padding, 1),
+                        (DimName::NumBoxes, 8400),
+                    ],
                 },
                 configs::Scores {
                     decoder: DecoderType::ModelPack,
                     quantization: None,
                     shape: vec![1, 80, 8401],
-                    channels_first: true,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumClasses, 80),
+                        (DimName::NumBoxes, 8401),
+                    ],
                 },
             )
             .build();
@@ -3115,14 +4047,24 @@ mod decoder_builder_tests {
                     shape: vec![1, 17, 30, 18],
                     anchors: None,
                     quantization: None,
-                    channels_first: false,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::Height, 17),
+                        (DimName::Width, 30),
+                        (DimName::NumAnchorsXFeatures, 18),
+                    ],
                 },
                 configs::Detection {
                     decoder: DecoderType::ModelPack,
                     shape: vec![1, 9, 15, 18],
                     anchors: None,
                     quantization: None,
-                    channels_first: false,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::Height, 9),
+                        (DimName::Width, 15),
+                        (DimName::NumAnchorsXFeatures, 18),
+                    ],
                 },
             ])
             .build();
@@ -3134,9 +4076,27 @@ mod decoder_builder_tests {
             .with_config_modelpack_det_split(vec![configs::Detection {
                 decoder: DecoderType::ModelPack,
                 shape: vec![1, 17, 30, 18],
+                anchors: None,
+                quantization: None,
+                dshape: Vec::new(),
+            }])
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s == "ModelPack Split Detection missing anchors"));
+
+        let result = DecoderBuilder::default()
+            .with_config_modelpack_det_split(vec![configs::Detection {
+                decoder: DecoderType::ModelPack,
+                shape: vec![1, 17, 30, 18],
                 anchors: Some(vec![]),
                 quantization: None,
-                channels_first: false,
+                dshape: vec![
+                    (DimName::Batch, 1),
+                    (DimName::Height, 17),
+                    (DimName::Width, 30),
+                    (DimName::NumAnchorsXFeatures, 18),
+                ],
             }])
             .build();
 
@@ -3153,7 +4113,13 @@ mod decoder_builder_tests {
                     [0.5333333, 0.644444],
                 ]),
                 quantization: None,
-                channels_first: false,
+                dshape: vec![
+                    (DimName::Batch, 1),
+                    (DimName::Height, 17),
+                    (DimName::Width, 30),
+                    (DimName::NumAnchorsXFeatures, 18),
+                    (DimName::Padding, 1),
+                ],
             }])
             .build();
 
@@ -3170,7 +4136,29 @@ mod decoder_builder_tests {
                     [0.5333333, 0.644444],
                 ]),
                 quantization: None,
-                channels_first: true,
+                dshape: vec![
+                    (DimName::Batch, 1),
+                    (DimName::NumAnchorsXFeatures, 15),
+                    (DimName::Height, 17),
+                    (DimName::Width, 30),
+                ],
+            }])
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s.contains("not greater than number of anchors * 5 =")));
+
+        let result = DecoderBuilder::default()
+            .with_config_modelpack_det_split(vec![configs::Detection {
+                decoder: DecoderType::ModelPack,
+                shape: vec![1, 17, 30, 15],
+                anchors: Some(vec![
+                    [0.3666666, 0.3148148],
+                    [0.3874999, 0.474074],
+                    [0.5333333, 0.644444],
+                ]),
+                quantization: None,
+                dshape: Vec::new(),
             }])
             .build();
 
@@ -3187,12 +4175,55 @@ mod decoder_builder_tests {
                     [0.5333333, 0.644444],
                 ]),
                 quantization: None,
-                channels_first: true,
+                dshape: vec![
+                    (DimName::Batch, 1),
+                    (DimName::NumAnchorsXFeatures, 16),
+                    (DimName::Height, 17),
+                    (DimName::Width, 30),
+                ],
             }])
             .build();
 
         assert!(matches!(
             result, Err(DecoderError::InvalidConfig(s)) if s.contains("not a multiple of number of anchors")));
+
+        let result = DecoderBuilder::default()
+            .with_config_modelpack_det_split(vec![configs::Detection {
+                decoder: DecoderType::ModelPack,
+                shape: vec![1, 17, 30, 16],
+                anchors: Some(vec![
+                    [0.3666666, 0.3148148],
+                    [0.3874999, 0.474074],
+                    [0.5333333, 0.644444],
+                ]),
+                quantization: None,
+                dshape: Vec::new(),
+            }])
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s.contains("not a multiple of number of anchors")));
+
+        let result = DecoderBuilder::default()
+            .with_config_modelpack_det_split(vec![configs::Detection {
+                decoder: DecoderType::ModelPack,
+                shape: vec![1, 18, 17, 30],
+                anchors: Some(vec![
+                    [0.3666666, 0.3148148],
+                    [0.3874999, 0.474074],
+                    [0.5333333, 0.644444],
+                ]),
+                quantization: None,
+                dshape: vec![
+                    (DimName::Batch, 1),
+                    (DimName::NumProtos, 18),
+                    (DimName::Height, 17),
+                    (DimName::Width, 30),
+                ],
+            }])
+            .build();
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s.contains("Split Detection dshape missing required dimension NumAnchorsXFeature")));
 
         let result = DecoderBuilder::default()
             .with_config_modelpack_det_split(vec![
@@ -3205,7 +4236,12 @@ mod decoder_builder_tests {
                         [0.5333333, 0.644444],
                     ]),
                     quantization: None,
-                    channels_first: false,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::Height, 17),
+                        (DimName::Width, 30),
+                        (DimName::NumAnchorsXFeatures, 18),
+                    ],
                 },
                 configs::Detection {
                     decoder: DecoderType::ModelPack,
@@ -3216,7 +4252,42 @@ mod decoder_builder_tests {
                         [0.5333333, 0.644444],
                     ]),
                     quantization: None,
-                    channels_first: false,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::Height, 17),
+                        (DimName::Width, 30),
+                        (DimName::NumAnchorsXFeatures, 21),
+                    ],
+                },
+            ])
+            .build();
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("ModelPack Split Detection inconsistent number of classes:")));
+
+        let result = DecoderBuilder::default()
+            .with_config_modelpack_det_split(vec![
+                configs::Detection {
+                    decoder: DecoderType::ModelPack,
+                    shape: vec![1, 17, 30, 18],
+                    anchors: Some(vec![
+                        [0.3666666, 0.3148148],
+                        [0.3874999, 0.474074],
+                        [0.5333333, 0.644444],
+                    ]),
+                    quantization: None,
+                    dshape: vec![],
+                },
+                configs::Detection {
+                    decoder: DecoderType::ModelPack,
+                    shape: vec![1, 17, 30, 21],
+                    anchors: Some(vec![
+                        [0.3666666, 0.3148148],
+                        [0.3874999, 0.474074],
+                        [0.5333333, 0.644444],
+                    ]),
+                    quantization: None,
+                    dshape: vec![],
                 },
             ])
             .build();
@@ -3232,7 +4303,13 @@ mod decoder_builder_tests {
                 decoder: DecoderType::ModelPack,
                 quantization: None,
                 shape: vec![1, 160, 106, 3, 1],
-                channels_first: false,
+                dshape: vec![
+                    (DimName::Batch, 1),
+                    (DimName::Height, 160),
+                    (DimName::Width, 106),
+                    (DimName::NumClasses, 3),
+                    (DimName::Padding, 1),
+                ],
             })
             .build();
 
@@ -3248,19 +4325,33 @@ mod decoder_builder_tests {
                     decoder: DecoderType::ModelPack,
                     quantization: None,
                     shape: vec![1, 4, 1, 8400],
-                    channels_first: true,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::BoxCoords, 4),
+                        (DimName::Padding, 1),
+                        (DimName::NumBoxes, 8400),
+                    ],
                 },
                 configs::Scores {
                     decoder: DecoderType::ModelPack,
                     quantization: None,
                     shape: vec![1, 4, 8400],
-                    channels_first: true,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumClasses, 4),
+                        (DimName::NumBoxes, 8400),
+                    ],
                 },
                 configs::Segmentation {
                     decoder: DecoderType::ModelPack,
                     quantization: None,
                     shape: vec![1, 160, 106, 3],
-                    channels_first: false,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::Height, 160),
+                        (DimName::Width, 106),
+                        (DimName::NumClasses, 3),
+                    ],
                 },
             )
             .build();
@@ -3282,18 +4373,181 @@ mod decoder_builder_tests {
                         [0.5333333, 0.644444],
                     ]),
                     quantization: None,
-                    channels_first: false,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::Height, 17),
+                        (DimName::Width, 30),
+                        (DimName::NumAnchorsXFeatures, 18),
+                    ],
                 }],
                 configs::Segmentation {
                     decoder: DecoderType::ModelPack,
                     quantization: None,
                     shape: vec![1, 160, 106, 3],
-                    channels_first: false,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::Height, 160),
+                        (DimName::Width, 106),
+                        (DimName::NumClasses, 3),
+                    ],
                 },
             )
             .build();
 
         assert!(matches!(
             result, Err(DecoderError::InvalidConfig(s)) if s.contains("incompatible with number of classes")));
+    }
+
+    #[test]
+    fn test_decode_bad_shapes() {
+        let score_threshold = 0.25;
+        let iou_threshold = 0.7;
+        let quant = (0.0040811873, -123);
+        let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
+        let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
+        let out = Array3::from_shape_vec((1, 84, 8400), out.to_vec()).unwrap();
+        let out_float: Array3<f32> = dequantize_ndarray(out.view(), quant.into());
+
+        let decoder = DecoderBuilder::default()
+            .with_config_yolo_det(configs::Detection {
+                decoder: DecoderType::Ultralytics,
+                shape: vec![1, 85, 8400],
+                anchors: None,
+                quantization: Some(quant.into()),
+                dshape: vec![
+                    (DimName::Batch, 1),
+                    (DimName::NumFeatures, 85),
+                    (DimName::NumBoxes, 8400),
+                ],
+            })
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .build()
+            .unwrap();
+
+        let mut output_boxes: Vec<_> = Vec::with_capacity(50);
+        let mut output_masks: Vec<_> = Vec::with_capacity(50);
+        let result =
+            decoder.decode_quantized(&[out.view().into()], &mut output_boxes, &mut output_masks);
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidShape(s)) if s == "Did not find output with shape [1, 85, 8400]"));
+
+        let result = decoder.decode_float(
+            &[out_float.view().into_dyn()],
+            &mut output_boxes,
+            &mut output_masks,
+        );
+
+        assert!(matches!(
+            result, Err(DecoderError::InvalidShape(s)) if s == "Did not find output with shape [1, 85, 8400]"));
+    }
+
+    #[test]
+    fn test_config_outputs() {
+        let outputs = [
+            ConfigOutput::Detection(configs::Detection {
+                decoder: configs::DecoderType::Ultralytics,
+                anchors: None,
+                shape: vec![1, 8400, 85],
+                quantization: Some(QuantTuple(0.123, 0)),
+                dshape: vec![
+                    (DimName::Batch, 1),
+                    (DimName::NumBoxes, 8400),
+                    (DimName::NumFeatures, 85),
+                ],
+            }),
+            ConfigOutput::Mask(configs::Mask {
+                decoder: configs::DecoderType::Ultralytics,
+                shape: vec![1, 160, 160, 1],
+                quantization: Some(QuantTuple(0.223, 0)),
+                dshape: vec![
+                    (DimName::Batch, 1),
+                    (DimName::Height, 160),
+                    (DimName::Width, 160),
+                    (DimName::NumFeatures, 1),
+                ],
+            }),
+            ConfigOutput::Segmentation(configs::Segmentation {
+                decoder: configs::DecoderType::Ultralytics,
+                shape: vec![1, 160, 160, 80],
+                quantization: Some(QuantTuple(0.323, 0)),
+                dshape: vec![
+                    (DimName::Batch, 1),
+                    (DimName::Height, 160),
+                    (DimName::Width, 160),
+                    (DimName::NumClasses, 80),
+                ],
+            }),
+            ConfigOutput::Scores(configs::Scores {
+                decoder: configs::DecoderType::Ultralytics,
+                shape: vec![1, 8400, 80],
+                quantization: Some(QuantTuple(0.423, 0)),
+                dshape: vec![
+                    (DimName::Batch, 1),
+                    (DimName::NumBoxes, 8400),
+                    (DimName::NumClasses, 80),
+                ],
+            }),
+            ConfigOutput::Boxes(configs::Boxes {
+                decoder: configs::DecoderType::Ultralytics,
+                shape: vec![1, 8400, 4],
+                quantization: Some(QuantTuple(0.523, 0)),
+                dshape: vec![
+                    (DimName::Batch, 1),
+                    (DimName::NumBoxes, 8400),
+                    (DimName::BoxCoords, 4),
+                ],
+            }),
+            ConfigOutput::Protos(configs::Protos {
+                decoder: configs::DecoderType::Ultralytics,
+                shape: vec![1, 32, 160, 160],
+                quantization: Some(QuantTuple(0.623, 0)),
+                dshape: vec![
+                    (DimName::Batch, 1),
+                    (DimName::NumProtos, 32),
+                    (DimName::Height, 160),
+                    (DimName::Width, 160),
+                ],
+            }),
+            ConfigOutput::MaskCoefficients(configs::MaskCoefficients {
+                decoder: configs::DecoderType::Ultralytics,
+                shape: vec![1, 8400, 32],
+                quantization: Some(QuantTuple(0.723, 0)),
+                dshape: vec![
+                    (DimName::Batch, 1),
+                    (DimName::NumBoxes, 8400),
+                    (DimName::NumProtos, 32),
+                ],
+            }),
+        ];
+
+        let shapes = outputs.clone().map(|x| x.shape().to_vec());
+        assert_eq!(
+            shapes,
+            [
+                vec![1, 8400, 85],
+                vec![1, 160, 160, 1],
+                vec![1, 160, 160, 80],
+                vec![1, 8400, 80],
+                vec![1, 8400, 4],
+                vec![1, 32, 160, 160],
+                vec![1, 8400, 32],
+            ]
+        );
+
+        let quants: [Option<(f32, i32)>; 7] = outputs.map(|x| x.quantization().map(|q| q.into()));
+        assert_eq!(
+            quants,
+            [
+                Some((0.123, 0)),
+                Some((0.223, 0)),
+                Some((0.323, 0)),
+                Some((0.423, 0)),
+                Some((0.523, 0)),
+                Some((0.623, 0)),
+                Some((0.723, 0)),
+            ]
+        );
     }
 }
