@@ -4,6 +4,8 @@
 use std::fmt::Debug;
 
 use edgefirst_tracker::{AsTracker, TrackInfo};
+use std::collections::HashSet;
+
 use ndarray::{Array3, ArrayView, ArrayViewD, Dimension, s};
 use ndarray_stats::QuantileExt;
 use num_traits::{AsPrimitive, Float};
@@ -76,6 +78,32 @@ pub enum ConfigOutputRef<'a> {
     Scores(&'a configs::Scores),
     Boxes(&'a configs::Boxes),
     MaskCoefficients(&'a configs::MaskCoefficients),
+}
+
+impl<'a> ConfigOutputRef<'a> {
+    fn decoder(&self) -> configs::DecoderType {
+        match self {
+            ConfigOutputRef::Detection(v) => v.decoder,
+            ConfigOutputRef::Mask(v) => v.decoder,
+            ConfigOutputRef::Segmentation(v) => v.decoder,
+            ConfigOutputRef::Protos(v) => v.decoder,
+            ConfigOutputRef::Scores(v) => v.decoder,
+            ConfigOutputRef::Boxes(v) => v.decoder,
+            ConfigOutputRef::MaskCoefficients(v) => v.decoder,
+        }
+    }
+
+    fn dshape(&self) -> &[(DimName, usize)] {
+        match self {
+            ConfigOutputRef::Detection(v) => &v.dshape,
+            ConfigOutputRef::Mask(v) => &v.dshape,
+            ConfigOutputRef::Segmentation(v) => &v.dshape,
+            ConfigOutputRef::Protos(v) => &v.dshape,
+            ConfigOutputRef::Scores(v) => &v.dshape,
+            ConfigOutputRef::Boxes(v) => &v.dshape,
+            ConfigOutputRef::MaskCoefficients(v) => &v.dshape,
+        }
+    }
 }
 
 impl<'a> From<&'a configs::Detection> for ConfigOutputRef<'a> {
@@ -386,7 +414,7 @@ pub mod configs {
         pub dshape: Vec<(DimName, usize)>,
     }
 
-    #[derive(Debug, PartialEq, Serialize, Deserialize, Clone, Copy)]
+    #[derive(Debug, PartialEq, Serialize, Deserialize, Clone, Copy, Hash, Eq)]
     pub enum DimName {
         #[serde(rename = "batch")]
         Batch,
@@ -406,6 +434,8 @@ pub mod configs {
         NumAnchorsXFeatures,
         #[serde(rename = "padding")]
         Padding,
+        #[serde(rename = "box_coords")]
+        BoxCoords,
     }
 
     impl Display for DimName {
@@ -415,8 +445,8 @@ pub mod configs {
         /// # use edgefirst_decoder::configs::DimName;
         /// let dim = DimName::Height;
         /// assert_eq!(format!("{}", dim), "height");
-        /// # let s = format!("{} {} {} {} {} {} {} {} {}", DimName::Batch, DimName::Height, DimName::Width, DimName::NumClasses, DimName::NumFeatures, DimName::NumBoxes, DimName::NumProtos, DimName::NumAnchorsXFeatures, DimName::Padding);
-        /// # assert_eq!(s, "batch height width num_classes num_features num_boxes num_protos num_anchors_x_features padding");
+        /// # let s = format!("{} {} {} {} {} {} {} {} {} {}", DimName::Batch, DimName::Height, DimName::Width, DimName::NumClasses, DimName::NumFeatures, DimName::NumBoxes, DimName::NumProtos, DimName::NumAnchorsXFeatures, DimName::Padding, DimName::BoxCoords);
+        /// # assert_eq!(s, "batch height width num_classes num_features num_boxes num_protos num_anchors_x_features padding box_coords");
         /// ```
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
@@ -429,11 +459,12 @@ pub mod configs {
                 DimName::NumProtos => write!(f, "num_protos"),
                 DimName::NumAnchorsXFeatures => write!(f, "num_anchors_x_features"),
                 DimName::Padding => write!(f, "padding"),
+                DimName::BoxCoords => write!(f, "box_coords"),
             }
         }
     }
 
-    #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
+    #[derive(Debug, PartialEq, Serialize, Deserialize, Clone, Copy, Hash, Eq)]
     pub enum DecoderType {
         #[serde(rename = "modelpack")]
         ModelPack,
@@ -1217,7 +1248,12 @@ impl DecoderBuilder {
             )));
         }
 
-        Self::verify_dshapes(&detect.dshape, &detect.shape, "Detection")?;
+        Self::verify_dshapes(
+            &detect.dshape,
+            &detect.shape,
+            "Detection",
+            &[DimName::Batch, DimName::NumFeatures, DimName::NumBoxes],
+        )?;
         if !detect.dshape.is_empty() {
             Self::get_class_count(&detect.dshape, None, None)?;
         } else {
@@ -1244,8 +1280,23 @@ impl DecoderBuilder {
             )));
         }
 
-        Self::verify_dshapes(&detection.dshape, &detection.shape, "Detection")?;
-        Self::verify_dshapes(&protos.dshape, &protos.shape, "Protos")?;
+        Self::verify_dshapes(
+            &detection.dshape,
+            &detection.shape,
+            "Detection",
+            &[DimName::Batch, DimName::NumFeatures, DimName::NumBoxes],
+        )?;
+        Self::verify_dshapes(
+            &protos.dshape,
+            &protos.shape,
+            "Protos",
+            &[
+                DimName::Batch,
+                DimName::Height,
+                DimName::Width,
+                DimName::NumProtos,
+            ],
+        )?;
 
         let protos_count = Self::get_protos_count(&protos.dshape).unwrap_or(protos.shape[3]);
         let classes = if !detection.dshape.is_empty() {
@@ -1280,32 +1331,19 @@ impl DecoderBuilder {
             )));
         }
 
-        Self::verify_dshapes(&boxes.dshape, &boxes.shape, "Boxes")?;
-        Self::verify_dshapes(&scores.dshape, &scores.shape, "Scores")?;
+        Self::verify_dshapes(
+            &boxes.dshape,
+            &boxes.shape,
+            "Boxes",
+            &[DimName::Batch, DimName::BoxCoords, DimName::NumBoxes],
+        )?;
+        Self::verify_dshapes(
+            &scores.dshape,
+            &scores.shape,
+            "Scores",
+            &[DimName::Batch, DimName::NumClasses, DimName::NumBoxes],
+        )?;
 
-        let boxes_dim = if boxes.dshape.is_empty() {
-            boxes.shape[1]
-        } else {
-            boxes
-                .dshape
-                .iter()
-                .filter_map(|(name, dim)| {
-                    if *name == DimName::NumFeatures {
-                        Some(*dim)
-                    } else {
-                        None
-                    }
-                })
-                .next()
-                .unwrap_or(boxes.shape[1])
-        };
-
-        if boxes_dim != 4 {
-            return Err(DecoderError::InvalidConfig(format!(
-                "Invalid Yolo Split Boxes dimension {}, expected 4",
-                boxes_dim
-            )));
-        }
         let boxes_num = Self::get_box_count(&boxes.dshape).unwrap_or(boxes.shape[2]);
         let scores_num = Self::get_box_count(&scores.dshape).unwrap_or(scores.shape[2]);
 
@@ -1352,10 +1390,35 @@ impl DecoderBuilder {
             )));
         }
 
-        Self::verify_dshapes(&boxes.dshape, &boxes.shape, "Boxes")?;
-        Self::verify_dshapes(&scores.dshape, &scores.shape, "Scores")?;
-        Self::verify_dshapes(&mask_coeff.dshape, &mask_coeff.shape, "Mask Coefficients")?;
-        Self::verify_dshapes(&protos.dshape, &protos.shape, "Protos")?;
+        Self::verify_dshapes(
+            &boxes.dshape,
+            &boxes.shape,
+            "Boxes",
+            &[DimName::Batch, DimName::BoxCoords, DimName::NumBoxes],
+        )?;
+        Self::verify_dshapes(
+            &scores.dshape,
+            &scores.shape,
+            "Scores",
+            &[DimName::Batch, DimName::NumClasses, DimName::NumBoxes],
+        )?;
+        Self::verify_dshapes(
+            &mask_coeff.dshape,
+            &mask_coeff.shape,
+            "Mask Coefficients",
+            &[DimName::Batch, DimName::NumProtos, DimName::NumBoxes],
+        )?;
+        Self::verify_dshapes(
+            &protos.dshape,
+            &protos.shape,
+            "Protos",
+            &[
+                DimName::Batch,
+                DimName::Height,
+                DimName::Width,
+                DimName::NumProtos,
+            ],
+        )?;
 
         let boxes_num = Self::get_box_count(&boxes.dshape).unwrap_or(boxes.shape[2]);
         let scores_num = Self::get_box_count(&scores.dshape).unwrap_or(scores.shape[2]);
@@ -1481,17 +1544,23 @@ impl DecoderBuilder {
             )));
         }
 
-        Self::verify_dshapes(&boxes.dshape, &boxes.shape, "Boxes")?;
-        Self::verify_dshapes(&scores.dshape, &scores.shape, "Scores")?;
-
-        let boxes_dim = Self::get_features_count(&boxes.dshape).unwrap_or(boxes.shape[3]);
-
-        if boxes_dim != 4 {
-            return Err(DecoderError::InvalidConfig(format!(
-                "Invalid ModelPack Boxes dimension {}, expected 4",
-                boxes_dim
-            )));
-        }
+        Self::verify_dshapes(
+            &boxes.dshape,
+            &boxes.shape,
+            "Boxes",
+            &[
+                DimName::Batch,
+                DimName::NumBoxes,
+                DimName::Padding,
+                DimName::BoxCoords,
+            ],
+        )?;
+        Self::verify_dshapes(
+            &scores.dshape,
+            &scores.shape,
+            "Scores",
+            &[DimName::Batch, DimName::NumBoxes, DimName::NumClasses],
+        )?;
 
         let boxes_num = Self::get_box_count(&boxes.dshape).unwrap_or(boxes.shape[1]);
         let scores_num = Self::get_box_count(&scores.dshape).unwrap_or(scores.shape[1]);
@@ -1534,7 +1603,17 @@ impl DecoderBuilder {
                 )));
             };
 
-            Self::verify_dshapes(&b.dshape, &b.shape, "Split Detection")?;
+            Self::verify_dshapes(
+                &b.dshape,
+                &b.shape,
+                "Split Detection",
+                &[
+                    DimName::Batch,
+                    DimName::Height,
+                    DimName::Width,
+                    DimName::NumAnchorsXFeatures,
+                ],
+            )?;
             let classes = if !b.dshape.is_empty() {
                 Self::get_class_count(&b.dshape, None, Some(num_anchors))?
             } else {
@@ -1569,7 +1648,17 @@ impl DecoderBuilder {
                 segmentation.shape
             )));
         }
-        Self::verify_dshapes(&segmentation.dshape, &segmentation.shape, "Segmentation")?;
+        Self::verify_dshapes(
+            &segmentation.dshape,
+            &segmentation.shape,
+            "Segmentation",
+            &[
+                DimName::Batch,
+                DimName::Height,
+                DimName::Width,
+                DimName::NumClasses,
+            ],
+        )?;
 
         if let Some(classes) = classes {
             let seg_classes = if !segmentation.dshape.is_empty() {
@@ -1593,6 +1682,7 @@ impl DecoderBuilder {
         dshape: &[(DimName, usize)],
         shape: &[usize],
         name: &str,
+        dims: &[DimName],
     ) -> Result<(), DecoderError> {
         for s in shape {
             if *s == 0 {
@@ -1601,6 +1691,15 @@ impl DecoderBuilder {
                     name
                 )));
             }
+        }
+
+        if shape.len() != dims.len() {
+            return Err(DecoderError::InvalidConfig(format!(
+                "{} shape length {} does not match expected dims length {}",
+                name,
+                shape.len(),
+                dims.len()
+            )));
         }
 
         if dshape.is_empty() {
@@ -1626,6 +1725,22 @@ impl DecoderBuilder {
                 return Err(DecoderError::InvalidConfig(
                     "Padding dimension size must be 1".to_string(),
                 ));
+            }
+
+            if *dim_name == DimName::BoxCoords && *dim_size != 4 {
+                return Err(DecoderError::InvalidConfig(
+                    "BoxCoords dimension size must be 4".to_string(),
+                ));
+            }
+        }
+
+        let dims_present = HashSet::<DimName>::from_iter(dshape.iter().map(|(name, _)| *name));
+        for dim in dims {
+            if !dims_present.contains(dim) {
+                return Err(DecoderError::InvalidConfig(format!(
+                    "{} dshape missing required dimension {:?}",
+                    name, dim
+                )));
             }
         }
 
@@ -1654,7 +1769,7 @@ impl DecoderBuilder {
                             detection.shape[1],
                             4 + protos.unwrap_or(0),
                         )));
-                    };
+                    }
                     Ok(detection.shape[1] - 4 - protos.unwrap_or(0))
                 }
                 DecoderType::ModelPack => {
@@ -1670,14 +1785,14 @@ impl DecoderBuilder {
                             anchors_x_features,
                             num_anchors * 5,
                         )));
-                    };
+                    }
 
                     if !anchors_x_features.is_multiple_of(num_anchors) {
                         return Err(DecoderError::InvalidConfig(format!(
                             "Invalid ModelPack Split Detection shape: anchors_x_features {} not a multiple of number of anchors {}",
                             anchors_x_features, num_anchors
                         )));
-                    };
+                    }
                     Ok(anchors_x_features / num_anchors - 5)
                 }
             },
@@ -1720,7 +1835,7 @@ impl DecoderBuilder {
                         *dim_size,
                         protos + 4,
                     )));
-                };
+                }
                 return Ok(*dim_size - 4 - protos);
             }
         }
@@ -1737,14 +1852,14 @@ impl DecoderBuilder {
                             anchors_x_features,
                             num_anchors * 5,
                         )));
-                    };
+                    }
 
                     if !anchors_x_features.is_multiple_of(num_anchors) {
                         return Err(DecoderError::InvalidConfig(format!(
                             "Invalid ModelPack Split Detection shape: anchors_x_features {} not a multiple of number of anchors {}",
                             anchors_x_features, num_anchors
                         )));
-                    };
+                    }
                     return Ok((anchors_x_features / num_anchors) - 5);
                 }
             }
@@ -1757,15 +1872,6 @@ impl DecoderBuilder {
     fn get_protos_count(dshape: &[(DimName, usize)]) -> Option<usize> {
         for (dim_name, dim_size) in dshape {
             if *dim_name == DimName::NumProtos {
-                return Some(*dim_size);
-            }
-        }
-        None
-    }
-
-    fn get_features_count(dshape: &[(DimName, usize)]) -> Option<usize> {
-        for (dim_name, dim_size) in dshape {
-            if *dim_name == DimName::NumFeatures {
                 return Some(*dim_size);
             }
         }
@@ -3462,158 +3568,148 @@ impl Decoder {
         )))
     }
 
+    /// This is split detection, need to swap axes to batch, height, width,
+    /// num_anchors_x_features,
+    fn modelpack_det_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::NumBoxes => 1,
+            DimName::Padding => 2,
+            DimName::BoxCoords => 3,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
+    // This is Ultralytics detection, need to swap axes to batch, num_features,
+    // height, width
+    fn yolo_det_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::NumFeatures => 1,
+            DimName::NumBoxes => 2,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
+    // This is modelpack boxes, need to swap axes to batch, num_boxes, padding,
+    // box_coords
+    fn modelpack_boxes_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::NumBoxes => 1,
+            DimName::Padding => 2,
+            DimName::BoxCoords => 3,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
+    /// This is Ultralytics boxes, need to swap axes to batch, box_coords,
+    /// num_boxes
+    fn yolo_boxes_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::BoxCoords => 1,
+            DimName::NumBoxes => 2,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
+    /// This is modelpack scores, need to swap axes to batch, num_boxes,
+    /// num_classes
+    fn modelpack_scores_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::NumBoxes => 1,
+            DimName::NumClasses => 2,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
+    fn yolo_scores_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::NumClasses => 1,
+            DimName::NumBoxes => 2,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
+    /// This is modelpack segmentation, need to swap axes to batch, height,
+    /// width, num_classes
+    fn modelpack_segmentation_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::Height => 1,
+            DimName::Width => 2,
+            DimName::NumClasses => 3,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
+    /// This is modelpack masks, need to swap axes to batch, height,
+    /// width
+    fn modelpack_mask_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::Height => 1,
+            DimName::Width => 2,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
+    /// This is yolo protos, need to swap axes to batch, height, width,
+    /// num_protos
+    fn yolo_protos_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::Height => 1,
+            DimName::Width => 2,
+            DimName::NumProtos => 3,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
+    /// This is yolo mask coefficients, need to swap axes to batch, num_protos,
+    /// num_boxes
+    fn yolo_maskcoefficients_order(x: DimName) -> usize {
+        match x {
+            DimName::Batch => 0,
+            DimName::NumProtos => 1,
+            DimName::NumBoxes => 2,
+            _ => 1000, // this should be unreachable
+        }
+    }
+
+    fn get_order_fn(config: ConfigOutputRef) -> fn(DimName) -> usize {
+        let decoder_type = config.decoder();
+        match (config, decoder_type) {
+            (ConfigOutputRef::Detection(_), DecoderType::ModelPack) => Self::modelpack_det_order,
+            (ConfigOutputRef::Detection(_), DecoderType::Ultralytics) => Self::yolo_det_order,
+            (ConfigOutputRef::Boxes(_), DecoderType::ModelPack) => Self::modelpack_boxes_order,
+            (ConfigOutputRef::Boxes(_), DecoderType::Ultralytics) => Self::yolo_boxes_order,
+            (ConfigOutputRef::Scores(_), DecoderType::ModelPack) => Self::modelpack_scores_order,
+            (ConfigOutputRef::Scores(_), DecoderType::Ultralytics) => Self::yolo_scores_order,
+            (ConfigOutputRef::Segmentation(_), _) => Self::modelpack_segmentation_order,
+            (ConfigOutputRef::Mask(_), _) => Self::modelpack_mask_order,
+            (ConfigOutputRef::Protos(_), _) => Self::yolo_protos_order,
+            (ConfigOutputRef::MaskCoefficients(_), _) => Self::yolo_maskcoefficients_order,
+        }
+    }
+
     fn swap_axes_if_needed<'a, T, D: Dimension>(
         array: &ArrayView<'a, T, D>,
         config: ConfigOutputRef,
     ) -> ArrayView<'a, T, D> {
         let mut array = array.clone();
-        let mut current_order = match config {
-            ConfigOutputRef::Detection(s) => {
-                if s.dshape.is_empty() {
-                    return array;
-                }
-                // This is split detection, need to swap axes to batch, height,
-                // width, num_anchors_x_features,
-                match s.decoder {
-                    DecoderType::ModelPack => s
-                        .dshape
-                        .iter()
-                        .map(|x| match x.0 {
-                            DimName::Batch => 0,
-                            DimName::Height => 1,
-                            DimName::Width => 2,
-                            DimName::NumAnchorsXFeatures => 3,
-                            _ => 1000, // this should be unreachable
-                        })
-                        .collect::<Vec<_>>(),
-                    DecoderType::Ultralytics => s
-                        .dshape
-                        .iter()
-                        .map(|x| match x.0 {
-                            DimName::Batch => 0,
-                            DimName::NumFeatures => 1,
-                            DimName::NumBoxes => 2,
-                            _ => 1000, // this should be unreachable
-                        })
-                        .collect::<Vec<_>>(),
-                }
-            }
-            ConfigOutputRef::Boxes(s) => {
-                if s.dshape.is_empty() {
-                    return array;
-                }
-                match s.decoder {
-                    DecoderType::ModelPack => s
-                        .dshape
-                        .iter()
-                        .map(|x| match x.0 {
-                            DimName::Batch => 0,
-                            DimName::NumBoxes => 1,
-                            DimName::Padding => 2,
-                            DimName::NumFeatures => 3, // TODO: what is the 4 going to  be called?
-                            _ => 1000,                 // this should be unreachable
-                        })
-                        .collect::<Vec<_>>(),
-                    DecoderType::Ultralytics => s
-                        .dshape
-                        .iter()
-                        .map(|x| match x.0 {
-                            DimName::Batch => 0,
-                            DimName::NumFeatures => 1, // TODO: what is the 4 going to be called?
-                            DimName::NumBoxes => 2,
-                            _ => 1000, // this should be unreachable
-                        })
-                        .collect::<Vec<_>>(),
-                }
-            }
-            ConfigOutputRef::Scores(s) => {
-                if s.dshape.is_empty() {
-                    return array;
-                }
-                match s.decoder {
-                    DecoderType::ModelPack => s
-                        .dshape
-                        .iter()
-                        .map(|x| match x.0 {
-                            DimName::Batch => 0,
-                            DimName::NumBoxes => 1,
-                            DimName::NumClasses => 2,
-                            _ => 1000, // this should be unreachable
-                        })
-                        .collect::<Vec<_>>(),
-                    DecoderType::Ultralytics => s
-                        .dshape
-                        .iter()
-                        .map(|x| match x.0 {
-                            DimName::Batch => 0,
-                            DimName::NumClasses => 1,
-                            DimName::NumBoxes => 2,
-                            _ => 1000, // this should be unreachable
-                        })
-                        .collect::<Vec<_>>(),
-                }
-            }
-            ConfigOutputRef::Segmentation(s) => {
-                if s.dshape.is_empty() {
-                    return array;
-                }
-                s.dshape
-                    .iter()
-                    .map(|x| match x.0 {
-                        DimName::Batch => 0,
-                        DimName::Height => 1,
-                        DimName::Width => 2,
-                        DimName::NumClasses => 3,
-                        _ => 1000, // this should be unreachable
-                    })
-                    .collect::<Vec<_>>()
-            }
-            ConfigOutputRef::Mask(s) => {
-                if s.dshape.is_empty() {
-                    return array;
-                }
-                s.dshape
-                    .iter()
-                    .map(|x| match x.0 {
-                        DimName::Batch => 0,
-                        DimName::Height => 1,
-                        DimName::Width => 2,
-                        DimName::NumClasses => 3,
-                        _ => 1000, // this should be unreachable
-                    })
-                    .collect::<Vec<_>>()
-            }
-            ConfigOutputRef::Protos(s) => {
-                if s.dshape.is_empty() {
-                    return array;
-                }
-                s.dshape
-                    .iter()
-                    .map(|x| match x.0 {
-                        DimName::Batch => 0,
-                        DimName::Height => 1,
-                        DimName::Width => 2,
-                        DimName::NumProtos => 3,
-
-                        _ => 1000, // this should be unreachable
-                    })
-                    .collect::<Vec<_>>()
-            }
-            ConfigOutputRef::MaskCoefficients(s) => {
-                if s.dshape.is_empty() {
-                    return array;
-                }
-                s.dshape
-                    .iter()
-                    .map(|x| match x.0 {
-                        DimName::Batch => 0,
-                        DimName::NumProtos => 1,
-                        DimName::NumBoxes => 2,
-                        _ => 1000, // this should be unreachable
-                    })
-                    .collect::<Vec<_>>()
-            }
-        };
+        if config.dshape().is_empty() {
+            return array;
+        }
+        let order_fn: fn(DimName) -> usize = Self::get_order_fn(config.clone());
+        let mut current_order: Vec<usize> = config
+            .dshape()
+            .iter()
+            .map(|x| order_fn(x.0))
+            .collect::<Vec<_>>();
 
         assert_eq!(array.shape().len(), current_order.len());
         // do simple bubble sort as swap_axes is inexpensive and the
@@ -3724,7 +3820,7 @@ mod decoder_builder_tests {
                     quantization: None,
                     dshape: vec![
                         (DimName::Batch, 1),
-                        (DimName::NumFeatures, 4),
+                        (DimName::BoxCoords, 4),
                         (DimName::NumBoxes, 8400),
                     ],
                 },
@@ -3982,7 +4078,7 @@ mod decoder_builder_tests {
                     quantization: None,
                     dshape: vec![
                         (DimName::Batch, 1),
-                        (DimName::NumFeatures, 4),
+                        (DimName::BoxCoords, 4),
                         (DimName::NumBoxes, 8400),
                         (DimName::Batch, 1),
                     ],
@@ -4011,7 +4107,7 @@ mod decoder_builder_tests {
                     quantization: None,
                     dshape: vec![
                         (DimName::Batch, 1),
-                        (DimName::NumFeatures, 4),
+                        (DimName::BoxCoords, 4),
                         (DimName::NumBoxes, 8400),
                     ],
                 },
@@ -4041,7 +4137,7 @@ mod decoder_builder_tests {
                     dshape: vec![
                         (DimName::Batch, 1),
                         (DimName::NumBoxes, 8400),
-                        (DimName::NumFeatures, 4),
+                        (DimName::BoxCoords, 4),
                     ],
                 },
                 configs::Scores {
@@ -4068,7 +4164,7 @@ mod decoder_builder_tests {
                     quantization: None,
                     dshape: vec![
                         (DimName::Batch, 1),
-                        (DimName::NumFeatures, 5),
+                        (DimName::BoxCoords, 5),
                         (DimName::NumBoxes, 8400),
                     ],
                 },
@@ -4084,9 +4180,8 @@ mod decoder_builder_tests {
                 },
             )
             .build();
-
         assert!(matches!(
-            result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("Invalid Yolo Split Boxes dimension 5, expected 4")));
+            result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("BoxCoords dimension size must be 4")));
     }
 
     #[test]
@@ -4100,7 +4195,7 @@ mod decoder_builder_tests {
                     dshape: vec![
                         (DimName::Batch, 1),
                         (DimName::NumBoxes, 8400),
-                        (DimName::NumFeatures, 4),
+                        (DimName::BoxCoords, 4),
                         (DimName::Batch, 1),
                     ],
                 },
@@ -4151,7 +4246,7 @@ mod decoder_builder_tests {
                     dshape: vec![
                         (DimName::Batch, 1),
                         (DimName::NumBoxes, 8400),
-                        (DimName::NumFeatures, 4),
+                        (DimName::BoxCoords, 4),
                     ],
                 },
                 configs::Scores {
@@ -4201,7 +4296,7 @@ mod decoder_builder_tests {
                     dshape: vec![
                         (DimName::Batch, 1),
                         (DimName::NumBoxes, 8400),
-                        (DimName::NumFeatures, 4),
+                        (DimName::BoxCoords, 4),
                     ],
                 },
                 configs::Scores {
@@ -4251,7 +4346,7 @@ mod decoder_builder_tests {
                     dshape: vec![
                         (DimName::Batch, 1),
                         (DimName::NumBoxes, 8400),
-                        (DimName::NumFeatures, 4),
+                        (DimName::BoxCoords, 4),
                     ],
                 },
                 configs::Scores {
@@ -4301,7 +4396,7 @@ mod decoder_builder_tests {
                     dshape: vec![
                         (DimName::Batch, 1),
                         (DimName::NumBoxes, 8400),
-                        (DimName::NumFeatures, 4),
+                        (DimName::BoxCoords, 4),
                     ],
                 },
                 configs::Scores {
@@ -4350,7 +4445,7 @@ mod decoder_builder_tests {
                     dshape: vec![
                         (DimName::Batch, 1),
                         (DimName::NumBoxes, 8400),
-                        (DimName::NumFeatures, 4),
+                        (DimName::BoxCoords, 4),
                     ],
                 },
                 configs::Scores {
@@ -4399,7 +4494,7 @@ mod decoder_builder_tests {
                     dshape: vec![
                         (DimName::Batch, 1),
                         (DimName::NumBoxes, 8400),
-                        (DimName::NumFeatures, 4),
+                        (DimName::BoxCoords, 4),
                     ],
                 },
                 configs::Scores {
@@ -4453,7 +4548,7 @@ mod decoder_builder_tests {
                             (DimName::Batch, 1),
                             (DimName::NumBoxes, 8400),
                             (DimName::Padding, 1),
-                            (DimName::NumFeatures, 4),
+                            (DimName::BoxCoords, 4),
                         ],
                     }),
                     ConfigOutput::Scores(configs::Scores {
@@ -4494,7 +4589,7 @@ mod decoder_builder_tests {
                             (DimName::Batch, 1),
                             (DimName::NumBoxes, 8400),
                             (DimName::Padding, 1),
-                            (DimName::NumFeatures, 4),
+                            (DimName::BoxCoords, 4),
                         ],
                     }),
                     ConfigOutput::Scores(configs::Scores {
@@ -4534,7 +4629,7 @@ mod decoder_builder_tests {
                         (DimName::Batch, 1),
                         (DimName::NumBoxes, 8400),
                         (DimName::Padding, 1),
-                        (DimName::NumFeatures, 4),
+                        (DimName::BoxCoords, 4),
                     ],
                 })],
             })
@@ -4554,7 +4649,7 @@ mod decoder_builder_tests {
                     shape: vec![1, 4, 8400],
                     dshape: vec![
                         (DimName::Batch, 1),
-                        (DimName::NumFeatures, 4),
+                        (DimName::BoxCoords, 4),
                         (DimName::NumBoxes, 8400),
                     ],
                 },
@@ -4582,7 +4677,7 @@ mod decoder_builder_tests {
                     shape: vec![1, 4, 1, 8400],
                     dshape: vec![
                         (DimName::Batch, 1),
-                        (DimName::NumFeatures, 4),
+                        (DimName::BoxCoords, 4),
                         (DimName::Padding, 1),
                         (DimName::NumBoxes, 8400),
                     ],
@@ -4612,7 +4707,7 @@ mod decoder_builder_tests {
                     shape: vec![1, 4, 2, 8400],
                     dshape: vec![
                         (DimName::Batch, 1),
-                        (DimName::NumFeatures, 4),
+                        (DimName::BoxCoords, 4),
                         (DimName::Padding, 2),
                         (DimName::NumBoxes, 8400),
                     ],
@@ -4640,7 +4735,7 @@ mod decoder_builder_tests {
                     shape: vec![1, 5, 1, 8400],
                     dshape: vec![
                         (DimName::Batch, 1),
-                        (DimName::NumFeatures, 5),
+                        (DimName::BoxCoords, 5),
                         (DimName::Padding, 1),
                         (DimName::NumBoxes, 8400),
                     ],
@@ -4659,7 +4754,7 @@ mod decoder_builder_tests {
             .build();
 
         assert!(matches!(
-            result, Err(DecoderError::InvalidConfig(s)) if s == "Invalid ModelPack Boxes dimension 5, expected 4"));
+            result, Err(DecoderError::InvalidConfig(s)) if s == "BoxCoords dimension size must be 4"));
 
         let result = DecoderBuilder::new()
             .with_config_modelpack_det(
@@ -4669,7 +4764,7 @@ mod decoder_builder_tests {
                     shape: vec![1, 4, 1, 8400],
                     dshape: vec![
                         (DimName::Batch, 1),
-                        (DimName::NumFeatures, 4),
+                        (DimName::BoxCoords, 4),
                         (DimName::Padding, 1),
                         (DimName::NumBoxes, 8400),
                     ],
@@ -4875,9 +4970,8 @@ mod decoder_builder_tests {
                 ],
             }])
             .build();
-        println!("{:?}", result);
         assert!(matches!(
-            result, Err(DecoderError::InvalidConfig(s)) if s.contains("Cannot determine number of classes from dshape")));
+            result, Err(DecoderError::InvalidConfig(s)) if s.contains("Split Detection dshape missing required dimension NumAnchorsXFeature")));
 
         let result = DecoderBuilder::default()
             .with_config_modelpack_det_split(vec![
@@ -4981,7 +5075,7 @@ mod decoder_builder_tests {
                     shape: vec![1, 4, 1, 8400],
                     dshape: vec![
                         (DimName::Batch, 1),
-                        (DimName::NumFeatures, 4),
+                        (DimName::BoxCoords, 4),
                         (DimName::Padding, 1),
                         (DimName::NumBoxes, 8400),
                     ],
@@ -5151,7 +5245,7 @@ mod decoder_builder_tests {
                 dshape: vec![
                     (DimName::Batch, 1),
                     (DimName::NumBoxes, 8400),
-                    (DimName::NumFeatures, 4),
+                    (DimName::BoxCoords, 4),
                 ],
             }),
             ConfigOutput::Protos(configs::Protos {

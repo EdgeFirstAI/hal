@@ -13,7 +13,7 @@ use gbm::{
     AsRaw, Device,
     drm::{Device as DrmDevice, buffer::DrmFourcc, control::Device as DrmControlDevice},
 };
-use khronos_egl::{self as egl, Attrib, Display, EGL1_4};
+use khronos_egl::{self as egl, Attrib, Display, Dynamic, EGL1_4, Instance};
 use log::{debug, error};
 use std::{
     collections::BTreeSet,
@@ -22,6 +22,7 @@ use std::{
     ptr::{NonNull, null, null_mut},
     rc::Rc,
     str::FromStr,
+    sync::OnceLock,
     thread::JoinHandle,
     time::Instant,
 };
@@ -49,17 +50,28 @@ use crate::{
     Rotation, TensorImage, YUYV,
 };
 
+static EGL_LIB: OnceLock<libloading::Library> = OnceLock::new();
+
+fn get_egl_lib() -> Result<&'static libloading::Library, crate::Error> {
+    if let Some(egl) = EGL_LIB.get() {
+        Ok(egl)
+    } else {
+        let egl = unsafe { libloading::Library::new("libEGL.so.1")? };
+        Ok(EGL_LIB.get_or_init(|| egl))
+    }
+}
+
+type Egl = Instance<Dynamic<&'static libloading::Library, EGL1_4>>;
 pub(crate) struct GlContext {
     pub(crate) support_dma: bool,
     pub(crate) surface: Option<egl::Surface>,
     pub(crate) display: EglDisplayType,
     pub(crate) ctx: egl::Context,
-    pub(crate) egl: Rc<egl::Instance<egl::Dynamic<libloading::Library, egl::EGL1_4>>>,
+    pub(crate) egl: Rc<Egl>,
 }
 
 pub(crate) enum EglDisplayType {
     Default(egl::Display),
-
     Gbm(egl::Display, #[allow(dead_code)] Device<Card>),
     PlatformDisplay(egl::Display),
 }
@@ -77,8 +89,8 @@ impl EglDisplayType {
 impl GlContext {
     pub(crate) fn new() -> Result<GlContext, crate::Error> {
         // Create an EGL API instance.
-        let lib = unsafe { libloading::Library::new("libEGL.so.1") }?;
-        let egl = Rc::new(unsafe { egl::DynamicInstance::<egl::EGL1_4>::load_required_from(lib)? });
+        let egl: Rc<Egl> =
+            Rc::new(unsafe { Instance::<Dynamic<_, EGL1_4>>::load_required_from(get_egl_lib()?)? });
 
         if let Ok(headless) = Self::try_initialize_egl(egl.clone(), Self::egl_get_default_display) {
             return Ok(headless);
@@ -106,13 +118,11 @@ impl GlContext {
     }
 
     fn try_initialize_egl(
-        egl: Rc<egl::Instance<egl::Dynamic<libloading::Library, egl::EGL1_4>>>,
-        display_fn: impl Fn(
-            &egl::Instance<egl::Dynamic<libloading::Library, egl::EGL1_4>>,
-        ) -> Result<EglDisplayType, crate::Error>,
+        egl: Rc<Egl>,
+        display_fn: impl Fn(&Egl) -> Result<EglDisplayType, crate::Error>,
     ) -> Result<GlContext, crate::Error> {
         let display = display_fn(&egl)?;
-
+        log::debug!("egl initialize with display: {:x?}", display.as_display());
         egl.initialize(display.as_display())?;
         let attributes = [
             egl::SURFACE_TYPE,
@@ -141,16 +151,17 @@ impl GlContext {
 
         debug!("config: {config:?}");
 
-        let context_attributes = [egl::CONTEXT_MAJOR_VERSION, 3, egl::NONE, egl::NONE];
-
-        let ctx = egl.create_context(display.as_display(), config, None, &context_attributes)?;
-        debug!("ctx: {ctx:?}");
-
         let surface = Some(egl.create_pbuffer_surface(
             display.as_display(),
             config,
             &[egl::WIDTH, 64, egl::HEIGHT, 64, egl::NONE],
         )?);
+
+        egl.bind_api(egl::OPENGL_ES_API)?;
+        let context_attributes = [egl::CONTEXT_MAJOR_VERSION, 3, egl::NONE, egl::NONE];
+
+        let ctx = egl.create_context(display.as_display(), config, None, &context_attributes)?;
+        debug!("ctx: {ctx:?}");
 
         egl.make_current(display.as_display(), surface, surface, Some(ctx))?;
 
@@ -165,9 +176,7 @@ impl GlContext {
         Ok(headless)
     }
 
-    fn egl_get_default_display(
-        egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
-    ) -> Result<EglDisplayType, crate::Error> {
+    fn egl_get_default_display(egl: &Egl) -> Result<EglDisplayType, crate::Error> {
         // get the default display
         if let Some(display) = unsafe { egl.get_display(egl::DEFAULT_DISPLAY) } {
             debug!("default display: {display:?}");
@@ -179,9 +188,7 @@ impl GlContext {
         ))
     }
 
-    fn egl_get_gbm_display(
-        egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
-    ) -> Result<EglDisplayType, crate::Error> {
+    fn egl_get_gbm_display(egl: &Egl) -> Result<EglDisplayType, crate::Error> {
         // init a GBM device
         let gbm = Device::new(Card::open_global()?)?;
 
@@ -196,9 +203,7 @@ impl GlContext {
         Ok(EglDisplayType::Gbm(display, gbm))
     }
 
-    fn egl_get_platform_display_from_device(
-        egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
-    ) -> Result<EglDisplayType, crate::Error> {
+    fn egl_get_platform_display_from_device(egl: &Egl) -> Result<EglDisplayType, crate::Error> {
         let extensions = egl.query_string(None, egl::EXTENSIONS)?;
         let extensions = extensions.to_string_lossy();
         log::debug!("EGL Extensions: {}", extensions);
@@ -245,9 +250,7 @@ impl GlContext {
         Ok(EglDisplayType::PlatformDisplay(disp))
     }
 
-    fn egl_check_support_dma(
-        egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
-    ) -> Result<(), crate::Error> {
+    fn egl_check_support_dma(egl: &Egl) -> Result<(), crate::Error> {
         let extensions = egl.query_string(None, egl::EXTENSIONS)?;
         let extensions = extensions.to_string_lossy();
         log::debug!("EGL Extensions: {}", extensions);
@@ -278,7 +281,7 @@ impl GlContext {
     }
 
     fn egl_get_platform_display_with_fallback(
-        egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
+        egl: &Egl,
         platform: egl::Enum,
         native_display: *mut c_void,
         attrib_list: &[Attrib],
@@ -309,7 +312,7 @@ impl GlContext {
     }
 
     fn egl_create_image_with_fallback(
-        egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
+        egl: &Egl,
         display: Display,
         ctx: egl::Context,
         target: egl::Enum,
@@ -358,7 +361,7 @@ impl GlContext {
     }
 
     fn egl_destory_image_with_fallback(
-        egl: &egl::Instance<egl::Dynamic<libloading::Library, EGL1_4>>,
+        egl: &Egl,
         display: Display,
         image: egl::Image,
     ) -> Result<(), Error> {
@@ -391,12 +394,15 @@ impl Drop for GlContext {
         let _ = self
             .egl
             .make_current(self.display.as_display(), None, None, None);
-        if let Some(surface) = self.surface.take() {
-            let _ = self.egl.destroy_surface(self.display.as_display(), surface);
-        }
+
         let _ = self
             .egl
             .destroy_context(self.display.as_display(), self.ctx);
+
+        if let Some(surface) = self.surface.take() {
+            let _ = self.egl.destroy_surface(self.display.as_display(), surface);
+        }
+
         let _ = self.egl.terminate(self.display.as_display());
     }
 }
@@ -2263,7 +2269,7 @@ impl GLProcessorST {
 }
 struct EglImage {
     egl_image: egl::Image,
-    egl: Rc<egl::Instance<egl::Dynamic<libloading::Library, egl::EGL1_4>>>,
+    egl: Rc<Egl>,
     display: egl::Display,
 }
 
