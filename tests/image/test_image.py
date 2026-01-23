@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
+# SPDX-License-Identifier: Apache-2.0
+
 from edgefirst_hal import TensorImage, ImageProcessor, Flip, FourCC, Normalization, Rotation, Rect
 import numpy as np
 from PIL import Image
@@ -112,7 +115,6 @@ def test_rgba_to_rgb():
     converter = ImageProcessor()
     converter.convert(src, dst, Rotation.Rotate0,
                       Flip.NoFlip, Rect(0, 0, 1280, 720))
-    n = np.zeros((720, 1280, 3), dtype=np.uint8)
 
     with dst.map() as m:
         n = np.array(m.view()).reshape((dst.height, dst.width, 3))
@@ -122,4 +124,4 @@ def test_rgba_to_rgb():
 
 def test_enum_cmp():
     dst = TensorImage(640, 640, fourcc=FourCC.RGBA)
-    formats_equal = dst.format == FourCC.RGBA
+    assert dst.format == FourCC.RGBA

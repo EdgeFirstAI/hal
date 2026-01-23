@@ -1,4 +1,5 @@
-
+# SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
+# SPDX-License-Identifier: Apache-2.0
 
 import edgefirst_hal
 import numpy as np
@@ -27,7 +28,9 @@ def test_from_json():
         1, 9, 15, 18
     )
 
-    config = open("testdata/modelpack_split.json").read()
+    with open("testdata/modelpack_split.json") as f:
+        config = f.read()
+
     decoder = edgefirst_hal.Decoder.new_from_json_str(config, 0.45, 0.45)
     boxes, scores, classes, masks = decoder.decode([output0, output1])
     assert np.allclose(boxes, [[0.43171933, 0.68243736, 0.5626645, 0.808863]])
@@ -43,8 +46,9 @@ def test_from_yaml():
     output1 = np.fromfile("testdata/modelpack_split_9x15x18.bin", dtype=np.uint8).reshape(
         1, 9, 15, 18
     )
+    with open("testdata/modelpack_split.yaml") as f:
+        config = f.read()
 
-    config = open("testdata/modelpack_split.yaml").read()
     decoder = edgefirst_hal.Decoder.new_from_yaml_str(config, 0.45, 0.45)
     boxes, scores, classes, masks = decoder.decode([output0, output1])
     assert np.allclose(boxes, [[0.43171933, 0.68243736, 0.5626645, 0.808863]])
@@ -63,7 +67,9 @@ def test_from_dict_json():
         1, 9, 15, 18
     )
 
-    config = open("testdata/modelpack_split.json").read()
+    with open("testdata/modelpack_split.json") as f:
+        config = f.read()
+
     config = json.loads(config)
     decoder = edgefirst_hal.Decoder(config, 0.45, 0.45)
     boxes, scores, classes, masks = decoder.decode([output0, output1])
@@ -83,7 +89,9 @@ def test_from_dict_yaml():
         1, 9, 15, 18
     )
 
-    config = open("testdata/modelpack_split.yaml").read()
+    with open("testdata/modelpack_split.yaml") as f:
+        config = f.read()
+
     config = yaml.safe_load(config)
     decoder = edgefirst_hal.Decoder(config, 0.45, 0.45)
     boxes, scores, classes, masks = decoder.decode([output0, output1])
@@ -132,7 +140,10 @@ def test_filter_int32():
     )
     # this int32 array should be ignored by the decoder
     int32_arr = np.zeros((100, 100), np.int32)
-    config = open("testdata/modelpack_split.yaml").read()
+
+    with open("testdata/modelpack_split.yaml") as f:
+        config = f.read()
+
     decoder = edgefirst_hal.Decoder.new_from_yaml_str(config, 0.45, 0.45)
     boxes, scores, classes, masks = decoder.decode(
         [output0, output1, int32_arr])
@@ -153,7 +164,9 @@ def test_nms():
         1, 9, 15, 18
     )
 
-    config = open("testdata/modelpack_split.yaml").read()
+    with open("testdata/modelpack_split.yaml") as f:
+        config = f.read()
+
     decoder = edgefirst_hal.Decoder.new_from_yaml_str(config, 0.0, 1.0)
     boxes, scores, classes, masks = decoder.decode([output0, output1], 100000)
 
