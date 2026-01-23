@@ -2,16 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use edgefirst::tensor::{self, TensorMapTrait as _, TensorTrait as _};
-use pyo3::{exceptions::PyBufferError, ffi::PyMemoryView_FromMemory, prelude::*};
-
 #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
 use pyo3::ffi::Py_buffer;
+use pyo3::{exceptions::PyBufferError, ffi::PyMemoryView_FromMemory, prelude::*};
 
 #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
 use std::ffi::{CString, c_int, c_void};
 #[cfg(target_os = "linux")]
 use std::os::fd::RawFd;
-use std::{fmt, os::raw::c_char};
+use std::{
+    fmt::{self, Display},
+    os::{
+        fd::{IntoRawFd, OwnedFd},
+        raw::c_char,
+    },
+};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -54,6 +59,18 @@ impl From<Error> for PyErr {
     }
 }
 
+#[pyclass(name = "TensorMemory", eq, eq_int)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(clippy::upper_case_acronyms)]
+pub enum PyTensorMemory {
+    #[cfg(target_os = "linux")]
+    DMA,
+    #[cfg(target_os = "linux")]
+    SHM,
+    MEM,
+}
+
+#[derive(Debug)]
 pub enum TensorT {
     TensorU8(tensor::Tensor<u8>),
     TensorI8(tensor::Tensor<i8>),
@@ -65,6 +82,12 @@ pub enum TensorT {
     TensorI64(tensor::Tensor<i64>),
     TensorF32(tensor::Tensor<f32>),
     TensorF64(tensor::Tensor<f64>),
+}
+
+impl Display for TensorT {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_fmt(format_args!("{:?}", self))
+    }
 }
 
 impl TensorT {
@@ -172,6 +195,22 @@ impl TensorT {
             TensorT::TensorF64(t) => t.map().map(TensorMapT::TensorF64),
         }
     }
+
+    #[cfg(target_os = "linux")]
+    pub fn clone_fd(&self) -> tensor::Result<OwnedFd> {
+        match self {
+            TensorT::TensorU8(t) => t.clone_fd(),
+            TensorT::TensorI8(t) => t.clone_fd(),
+            TensorT::TensorU16(t) => t.clone_fd(),
+            TensorT::TensorI16(t) => t.clone_fd(),
+            TensorT::TensorU32(t) => t.clone_fd(),
+            TensorT::TensorI32(t) => t.clone_fd(),
+            TensorT::TensorU64(t) => t.clone_fd(),
+            TensorT::TensorI64(t) => t.clone_fd(),
+            TensorT::TensorF32(t) => t.clone_fd(),
+            TensorT::TensorF64(t) => t.clone_fd(),
+        }
+    }
 }
 
 pub enum TensorMapT {
@@ -250,40 +289,38 @@ impl TensorMapT {
     }
 }
 
-#[pyclass(name = "Tensor")]
+#[pyclass(name = "Tensor", str)]
 pub struct PyTensor(TensorT);
+
+impl Display for PyTensor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_fmt(format_args!("{:?}", self.0))
+    }
+}
 
 #[pymethods]
 impl PyTensor {
     #[new]
-    #[pyo3(signature = (shape, dtype = "float32", memory = None, name = None))]
+    #[pyo3(signature = (shape, dtype = "float32", mem = None, name = None))]
     fn __init__(
         shape: Vec<usize>,
         dtype: &str,
-        memory: Option<&str>,
+        mem: Option<PyTensorMemory>,
         name: Option<&str>,
     ) -> Result<Self> {
-        let memory = match memory {
-            #[cfg(target_os = "linux")]
-            Some("dma") => Some(tensor::TensorMemory::Dma),
-            #[cfg(target_os = "linux")]
-            Some("shm") => Some(tensor::TensorMemory::Shm),
-            Some("mem") => Some(tensor::TensorMemory::Mem),
-            Some(inv) => return Err(Error::UnsupportedMemoryType(inv.to_string())),
-            None => None,
-        };
+        let mem = mem.map(|x| x.into());
 
         let tensor = match dtype {
-            "uint8" => TensorT::TensorU8(tensor::Tensor::new(&shape, memory, name)?),
-            "int8" => TensorT::TensorI8(tensor::Tensor::new(&shape, memory, name)?),
-            "uint16" => TensorT::TensorU16(tensor::Tensor::new(&shape, memory, name)?),
-            "int16" => TensorT::TensorI16(tensor::Tensor::new(&shape, memory, name)?),
-            "uint32" => TensorT::TensorU32(tensor::Tensor::new(&shape, memory, name)?),
-            "int32" => TensorT::TensorI32(tensor::Tensor::new(&shape, memory, name)?),
-            "uint64" => TensorT::TensorU64(tensor::Tensor::new(&shape, memory, name)?),
-            "int64" => TensorT::TensorI64(tensor::Tensor::new(&shape, memory, name)?),
-            "float32" => TensorT::TensorF32(tensor::Tensor::new(&shape, memory, name)?),
-            "float64" => TensorT::TensorF64(tensor::Tensor::new(&shape, memory, name)?),
+            "uint8" => TensorT::TensorU8(tensor::Tensor::new(&shape, mem, name)?),
+            "int8" => TensorT::TensorI8(tensor::Tensor::new(&shape, mem, name)?),
+            "uint16" => TensorT::TensorU16(tensor::Tensor::new(&shape, mem, name)?),
+            "int16" => TensorT::TensorI16(tensor::Tensor::new(&shape, mem, name)?),
+            "uint32" => TensorT::TensorU32(tensor::Tensor::new(&shape, mem, name)?),
+            "int32" => TensorT::TensorI32(tensor::Tensor::new(&shape, mem, name)?),
+            "uint64" => TensorT::TensorU64(tensor::Tensor::new(&shape, mem, name)?),
+            "int64" => TensorT::TensorI64(tensor::Tensor::new(&shape, mem, name)?),
+            "float32" => TensorT::TensorF32(tensor::Tensor::new(&shape, mem, name)?),
+            "float64" => TensorT::TensorF64(tensor::Tensor::new(&shape, mem, name)?),
             _ => return Err(Error::UnsupportedDataType(dtype.to_string())),
         };
 
@@ -294,10 +331,9 @@ impl PyTensor {
     #[staticmethod]
     #[pyo3(signature = (fd, shape, dtype = "float32", name = None))]
     fn from_fd(fd: RawFd, shape: Vec<usize>, dtype: &str, name: Option<&str>) -> Result<Self> {
-        use std::os::fd::BorrowedFd;
+        use std::os::fd::FromRawFd;
 
-        let fd = unsafe { BorrowedFd::borrow_raw(fd) };
-        let fd = fd.try_clone_to_owned()?;
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
 
         let tensor = match dtype {
             "uint8" => TensorT::TensorU8(tensor::Tensor::from_fd(fd, &shape, name).unwrap()),
@@ -327,14 +363,8 @@ impl PyTensor {
     }
 
     #[getter]
-    fn memory(&self) -> String {
-        match self.0.memory() {
-            #[cfg(target_os = "linux")]
-            tensor::TensorMemory::Shm => "shm".to_string(),
-            #[cfg(target_os = "linux")]
-            tensor::TensorMemory::Dma => "dma".to_string(),
-            tensor::TensorMemory::Mem => "mem".to_string(),
-        }
+    fn memory(&self) -> PyTensorMemory {
+        self.0.memory().into()
     }
 
     #[getter]
@@ -345,6 +375,13 @@ impl PyTensor {
     #[getter]
     fn shape(&self) -> &[usize] {
         self.0.shape()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[getter]
+    fn fd(&self) -> Result<RawFd> {
+        let owned = self.0.clone_fd()?;
+        Ok(owned.into_raw_fd())
     }
 
     fn reshape(&mut self, shape: Vec<usize>) -> Result<()> {

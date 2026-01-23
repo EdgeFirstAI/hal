@@ -218,6 +218,143 @@ class Decoder:
     def iou_threshold(self, value: float): ...
 
 
+class TensorMemory(enum.Enum):
+    if sys.platform == "linux":
+        DMA: TensorMemory
+        """
+        Direct Memory Access (DMA) allocation. Incurs additional overhead for memory reading/writing with the CPU. 
+        Allows for hardware acceleration when suppported
+        """
+
+        SHM: TensorMemory
+        """
+        POSIX Shared Memory allocation. Suitable for inter-process
+        communication, but not suitable for hardware acceleration.
+        """
+    MEM: TensorMemory
+    """Regular system memory allocation"""
+
+
+class Tensor:
+
+    if sys.platform == 'linux':
+        # [pyo3(signature = (shape, dtype = "float32", memory = None, name = None))]
+        def __init__(
+            self,
+            shape: list[int],
+            dtype: Literal["int8", "uint8", "int16", "uint16",
+                           "int32", "uint32", "int64", "uint64",
+                           "float32", "float64"] = "float32",
+            mem: None | TensorMemory = None,
+            name: None | str = None
+        ) -> None: ...
+        """
+        Create a new tensor with the given shape, memory type, and optional
+        name. If no name is given, a random name will be generated. If no
+        memory type is given, the best available memory type will be chosen
+        based on the platform and environment variables.
+            
+        On Linux platforms, the order of preference is: Dma -> Shm -> Mem.
+        On non-Linux platforms, only Mem is available.
+        
+        # Environment Variables
+        - `EDGEFIRST_TENSOR_FORCE_MEM`: If set to a non-zero and non-false
+        value, forces the use of regular system memory allocation
+        (`mem`) regardless of platform capabilities.
+        """
+
+        # [pyo3(signature = (fd, shape, dtype = "float32", name = None))]
+        @staticmethod
+        def from_fd(
+            fd: int,
+            shape: list[int],
+            dtype: Literal["int8", "uint8", "int16", "uint16",
+                           "int32", "uint32", "int64", "uint64",
+                           "float32", "float64"] = "float32",
+            name: None | str = None
+        ) -> Tensor: ...
+        """
+        Create a new tensor using the given file descriptor, shape, and optional
+        name. If no name is given, a random name will be generated.
+
+        Inspects the file descriptor to determine the appropriate tensor type
+        (Dma or Shm) based on the device major and minor numbers.
+
+        This will take ownership of the file descriptor, and the file descriptor will 
+        be closed when the tensor is dropped.
+        """
+
+        @property
+        def fd(self) -> int: ...
+        """Gets a duplicate of the file descriptor associated with the tensor's memory. The caller will be responsible for closing the file descriptor."""
+
+    else:
+        def __init__(
+            self,
+            shape: list[int],
+            dtype: Literal["int8", "uint8", "int16", "uint16",
+                           "int32", "uint32", "int64", "uint64",
+                           "float32", "float64"] = "float32",
+            mem: None | TensorMemory = None,
+            name: None | str = None
+        ) -> None: ...
+        """
+        Create a new tensor with the given shape, memory type, and optional
+        name. If no name is given, a random name will be generated. If no
+        memory type is given, the best available memory type will be chosen
+        based on the platform and environment variables.
+
+        On Linux platforms, the order of preference is: Dma -> Shm -> Mem.
+        On non-Linux platforms, only Mem is available.
+
+        # Environment Variables
+        - `EDGEFIRST_TENSOR_FORCE_MEM`: If set to a non-zero and non-false
+        value, forces the use of regular system memory allocation
+        (`dma`) regardless of platform capabilities.
+        """
+
+    @property
+    def dtype(self) -> Literal["int8", "uint8", "int16", "uint16",
+                               "int32", "uint32", "int64", "uint64",
+                               "float32", "float64"]: ...
+    """The data type of the tensor."""
+
+    @property
+    def size(self) -> int: ...
+    """The size of the tensor in bytes."""
+
+    @property
+    def memory(self) -> TensorMemory: ...
+    """The memory type of the tensor."""
+
+    @property
+    def name(self) -> str: ...
+    """The name of the tensor."""
+
+    @property
+    def shape(self) -> list[int]: ...
+    """The shape of the tensor."""
+
+    def reshape(self, shape: list[int]) -> None: ...
+    """Reshape the tensor to the given shape. The total number of elements must remain the same."""
+
+    def map(self) -> TensorMap: ...
+    """Returns a mapped view of the tensor data for direct access."""
+
+
+class TensorMap(Buffer):
+    def unmap(self) -> None: ...
+    def view(self) -> memoryview: ...
+    def __repr__(self) -> str: ...
+    def __len__(self) -> int: ...
+    def __getitem__(self, index: int) -> object: ...
+    def __setitem__(self, index: int, value: object) -> None: ...
+    def __getbuffer__(self, view, _flags) -> None: ...
+    def __releasebuffer__(self, view) -> None: ...
+    def __enter__(self) -> TensorMap: ...
+    def __exit__(self, _exc_type, _exc_value, _traceback) -> None: ...
+
+
 class FourCC(enum.Enum):
     YUYV: FourCC
     """YUYV format (YUV 4:2:2)"""
@@ -288,135 +425,6 @@ class Normalization(enum.Enum):
     | `np.float32` | value             |
     | `np.float64` | value             |
     """
-
-
-class Tensor:
-
-    if sys.platform == 'linux':
-        # [pyo3(signature = (shape, dtype = "float32", memory = None, name = None))]
-        def __init__(
-            self,
-            shape: list[int],
-            dtype: Literal["int8", "uint8", "int16", "uint16",
-                           "int32", "uint32", "int64", "uint64",
-                           "float32", "float64"] = "float32",
-            memory: None | Literal["dma", "shm", "mem"] = None,
-            name: None | str = None
-        ) -> None: ...
-        """
-        Create a new tensor with the given shape, memory type, and optional
-        name. If no name is given, a random name will be generated. If no
-        memory type is given, the best available memory type will be chosen
-        based on the platform and environment variables.
-            
-        On Linux platforms, the order of preference is: Dma -> Shm -> Mem.
-        On non-Linux platforms, only Mem is available.
-        
-        # Environment Variables
-        - `EDGEFIRST_TENSOR_FORCE_MEM`: If set to a non-zero and non-false
-        value, forces the use of regular system memory allocation
-        (`mem`) regardless of platform capabilities.
-        """
-
-        # [pyo3(signature = (fd, shape, dtype = "float32", name = None))]
-        @staticmethod
-        def from_fd(
-            fd: int,
-            shape: list[int],
-            dtype: Literal["int8", "uint8", "int16", "uint16",
-                           "int32", "uint32", "int64", "uint64",
-                           "float32", "float64"] = "float32",
-            name: None | str = None
-        ) -> int: ...
-        """
-        Create a new tensor using the given file descriptor, shape, and optional
-        name. If no name is given, a random name will be generated.
-
-        Inspects the file descriptor to determine the appropriate tensor type
-        (Dma or Shm) based on the device major and minor numbers.
-        """
-    else:
-        def __init__(
-            self,
-            shape: list[int],
-            dtype: Literal["int8", "uint8", "int16", "uint16",
-                           "int32", "uint32", "int64", "uint64",
-                           "float32", "float64"] = "float32",
-            memory: None | Literal["mem"] = None,
-            name: None | str = None
-        ) -> None: ...
-        """
-        Create a new tensor with the given shape, memory type, and optional
-        name. If no name is given, a random name will be generated. If no
-        memory type is given, the best available memory type will be chosen
-        based on the platform and environment variables.
-
-        On Linux platforms, the order of preference is: Dma -> Shm -> Mem.
-        On non-Linux platforms, only Mem is available.
-
-        # Environment Variables
-        - `EDGEFIRST_TENSOR_FORCE_MEM`: If set to a non-zero and non-false
-        value, forces the use of regular system memory allocation
-        (`dma`) regardless of platform capabilities.
-        """
-
-    @property
-    def dtype(self) -> str: ...
-    """The data type of the tensor."""
-
-    @property
-    def size(self) -> int: ...
-    """The size of the tensor in bytes."""
-
-    @property
-    def memory(self) -> str: ...
-    """The memory type of the tensor. Will be one of `dma`, `shm`, or `mem`."""
-
-    @property
-    def name(self) -> str: ...
-    """The name of the tensor."""
-
-    @property
-    def shape(self) -> list[int]: ...
-    """The shape of the tensor."""
-
-    def reshape(self, shape: list[int]) -> None: ...
-    """Reshape the tensor to the given shape. The total number of elements must remain the same."""
-
-    def map(self) -> TensorMap: ...
-    """Returns a mapped view of the tensor data for direct access."""
-
-
-class TensorMap:
-    def unmap(self) -> None: ...
-    def view(self) -> object: ...
-    def __repr__(self) -> str: ...
-    def __len__(self) -> int: ...
-    def __getitem__(self) -> object: ...
-    def __setitem__(self, index: int, value: object) -> None: ...
-    def __getbuffer__(self, view, _flags) -> None: ...
-    def __releasebuffer__(self, view) -> None: ...
-    def __enter__(self) -> TensorMap: ...
-    def __exit__(self, _exc_type, _exc_value, _traceback) -> None: ...
-
-
-class TensorMemory(enum.Enum):
-    import sys
-
-    if sys.platform == "linux":
-        DMA: TensorMemory
-        """
-        Direct Memory Access (DMA) allocation. Incurs additional overhead for memory reading/writing with the CPU. 
-        Allows for hardware acceleration when suppported
-        """
-
-        SHM: TensorMemory
-        """
-        POSIX Shared Memory allocation. Suitable for inter-process
-        communication, but not suitable for hardware acceleration.
-        """
-    MEM: TensorMemory
-    """Regular system memory allocation"""
 
 
 class TensorImage:

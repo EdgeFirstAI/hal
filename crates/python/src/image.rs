@@ -3,7 +3,7 @@
 
 use crate::{
     FunctionTimer,
-    tensor::{PyTensorMap, TensorMapT},
+    tensor::{PyTensorMap, PyTensorMemory, TensorMapT},
 };
 use edgefirst::{
     decoder::{BoundingBox, DetectBox, Segmentation},
@@ -183,17 +183,6 @@ impl TryFrom<FourCharCode> for FourCC {
     }
 }
 
-#[pyclass(name = "TensorMemory", eq, eq_int)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(clippy::upper_case_acronyms)]
-pub enum PyTensorMemory {
-    #[cfg(target_os = "linux")]
-    DMA,
-    #[cfg(target_os = "linux")]
-    SHM,
-    MEM,
-}
-
 impl From<PyTensorMemory> for TensorMemory {
     fn from(value: PyTensorMemory) -> Self {
         match value {
@@ -202,6 +191,18 @@ impl From<PyTensorMemory> for TensorMemory {
             #[cfg(target_os = "linux")]
             PyTensorMemory::SHM => TensorMemory::Shm,
             PyTensorMemory::MEM => TensorMemory::Mem,
+        }
+    }
+}
+
+impl From<TensorMemory> for PyTensorMemory {
+    fn from(value: TensorMemory) -> Self {
+        match value {
+            #[cfg(target_os = "linux")]
+            TensorMemory::Dma => PyTensorMemory::DMA,
+            #[cfg(target_os = "linux")]
+            TensorMemory::Shm => PyTensorMemory::SHM,
+            TensorMemory::Mem => PyTensorMemory::MEM,
         }
     }
 }
