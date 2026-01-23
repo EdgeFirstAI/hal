@@ -53,7 +53,7 @@ impl From<std::io::Error> for Error {
 
 impl From<Error> for PyErr {
     fn from(err: Error) -> PyErr {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("{err:?}"))
+        pyo3::exceptions::PyRuntimeError::new_err(err.to_string())
     }
 }
 

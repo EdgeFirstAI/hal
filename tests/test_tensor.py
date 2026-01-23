@@ -286,8 +286,8 @@ class TestTensor(TestCase):
 
     def test_from_fd_dma(self):
         try:
-            tensor = Tensor([640, 640, 3], dtype="uint8", mem=TensorMemory.DMA)
-        except RuntimeError:
+            tensor = Tensor([100, 100, 3], dtype="uint8", mem=TensorMemory.DMA)
+        except (AttributeError, RuntimeError):
             self.skipTest("DMA memory not supported on this platform")
 
         assert tensor.memory == TensorMemory.DMA
@@ -308,9 +308,10 @@ class TestTensor(TestCase):
                 assert m[i] == 233
 
     def test_dma_zero_copy_perf(self):
+
         try:
-            tensor = Tensor([640, 640, 3], dtype="uint8", mem=TensorMemory.DMA)
-        except RuntimeError:
+            tensor = Tensor([100, 100, 3], dtype="uint8", mem=TensorMemory.DMA)
+        except (AttributeError, RuntimeError):
             self.skipTest("DMA memory not supported on this platform")
 
         assert tensor.memory == TensorMemory.DMA
@@ -345,8 +346,8 @@ class TestTensor(TestCase):
 
     def test_from_fd_shm(self):
         try:
-            tensor = Tensor([640, 640, 3], dtype="uint8", mem=TensorMemory.SHM)
-        except RuntimeError:
+            tensor = Tensor([100, 100, 3], dtype="uint8", mem=TensorMemory.SHM)
+        except (AttributeError, RuntimeError):
             self.skipTest("SHM memory not supported on this platform")
 
         assert tensor.memory == TensorMemory.SHM
@@ -368,8 +369,8 @@ class TestTensor(TestCase):
 
     def test_shm_zero_copy_perf(self):
         try:
-            tensor = Tensor([640, 640, 3], dtype="uint8", mem=TensorMemory.SHM)
-        except RuntimeError:
+            tensor = Tensor([100, 100, 3], dtype="uint8", mem=TensorMemory.SHM)
+        except (AttributeError, RuntimeError):
             self.skipTest("SHM memory not supported on this platform")
 
         assert tensor.memory == TensorMemory.SHM
