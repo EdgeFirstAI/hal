@@ -91,7 +91,6 @@ def test_render():
                               )
     expected_gl = load_image("testdata/output_render_gl.jpg", "RGBA")
     expected_cpu = load_image("testdata/output_render_cpu.jpg", "RGBA")
-    dst.save_jpeg("output_render.jpeg", 95)
     with dst.map() as m:
         img = np.array(m.view()).reshape((dst.height, dst.width, 4))
         assert calculate_similarity_rms_u8(
