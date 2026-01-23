@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-use edgefirst::tensor::{self, TensorMapTrait as _, TensorTrait as _};
+use edgefirst::tensor::{self, TensorMapTrait, TensorMemory, TensorTrait};
 #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
 use pyo3::ffi::Py_buffer;
 use pyo3::{exceptions::PyBufferError, ffi::PyMemoryView_FromMemory, prelude::*};
@@ -68,6 +68,30 @@ pub enum PyTensorMemory {
     #[cfg(target_os = "linux")]
     SHM,
     MEM,
+}
+
+impl From<PyTensorMemory> for TensorMemory {
+    fn from(value: PyTensorMemory) -> Self {
+        match value {
+            #[cfg(target_os = "linux")]
+            PyTensorMemory::DMA => TensorMemory::Dma,
+            #[cfg(target_os = "linux")]
+            PyTensorMemory::SHM => TensorMemory::Shm,
+            PyTensorMemory::MEM => TensorMemory::Mem,
+        }
+    }
+}
+
+impl From<TensorMemory> for PyTensorMemory {
+    fn from(value: TensorMemory) -> Self {
+        match value {
+            #[cfg(target_os = "linux")]
+            TensorMemory::Dma => PyTensorMemory::DMA,
+            #[cfg(target_os = "linux")]
+            TensorMemory::Shm => PyTensorMemory::SHM,
+            TensorMemory::Mem => PyTensorMemory::MEM,
+        }
+    }
 }
 
 #[derive(Debug)]
