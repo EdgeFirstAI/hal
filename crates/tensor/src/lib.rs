@@ -162,7 +162,7 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TensorMemory {
     #[cfg(target_os = "linux")]
-    /// Direct Memory Access (DMA) allocation allocation. Incurs additional
+    /// Direct Memory Access (DMA) allocation. Incurs additional
     /// overhead for memory reading/writing with the CPU.  Allows for
     /// hardware acceleration when supported.
     Dma,
