@@ -242,8 +242,8 @@ class Tensor:
         memory type is given, the best available memory type will be chosen
         based on the platform and environment variables.
             
-        On Linux platforms, the order of preference is: Dma -> Shm -> Mem.
-        On non-Linux platforms, only Mem is available.
+        On Linux platforms, the order of preference is: DMA -> SHM -> MEM.
+        On non-Linux platforms, only MEM is available.
         
         # Environment Variables
         - `EDGEFIRST_TENSOR_FORCE_MEM`: If set to a non-zero and non-false
@@ -265,7 +265,7 @@ class Tensor:
         name. If no name is given, a random name will be generated.
 
         Inspects the file descriptor to determine the appropriate tensor type
-        (Dma or Shm) based on the device major and minor numbers.
+        (DMA or SHM) based on the device major and minor numbers.
 
         This will take ownership of the file descriptor, and the file descriptor will 
         be closed when the tensor is dropped.
@@ -291,8 +291,8 @@ class Tensor:
         memory type is given, the best available memory type will be chosen
         based on the platform and environment variables.
 
-        On Linux platforms, the order of preference is: Dma -> Shm -> Mem.
-        On non-Linux platforms, only Mem is available.
+        On Linux platforms, the order of preference is: DMA -> SHM -> MEM.
+        On non-Linux platforms, only MEM is available.
 
         # Environment Variables
         - `EDGEFIRST_TENSOR_FORCE_MEM`: If set to a non-zero and non-false
