@@ -8,7 +8,7 @@ use crate::{
 use edgefirst::{
     decoder::{BoundingBox, DetectBox, Segmentation},
     image::{self, Crop, Flip, ImageProcessorTrait, RGBA, Rect, Rotation, TensorImage},
-    tensor::{self, TensorMapTrait, TensorMemory, TensorTrait},
+    tensor::{self, TensorMapTrait, TensorTrait},
 };
 use four_char_code::FourCharCode;
 
@@ -180,30 +180,6 @@ impl TryFrom<FourCharCode> for FourCC {
 
     fn try_from(value: FourCharCode) -> Result<Self, Self::Error> {
         Self::try_from(value.to_string().to_uppercase().as_str())
-    }
-}
-
-impl From<PyTensorMemory> for TensorMemory {
-    fn from(value: PyTensorMemory) -> Self {
-        match value {
-            #[cfg(target_os = "linux")]
-            PyTensorMemory::DMA => TensorMemory::Dma,
-            #[cfg(target_os = "linux")]
-            PyTensorMemory::SHM => TensorMemory::Shm,
-            PyTensorMemory::MEM => TensorMemory::Mem,
-        }
-    }
-}
-
-impl From<TensorMemory> for PyTensorMemory {
-    fn from(value: TensorMemory) -> Self {
-        match value {
-            #[cfg(target_os = "linux")]
-            TensorMemory::Dma => PyTensorMemory::DMA,
-            #[cfg(target_os = "linux")]
-            TensorMemory::Shm => PyTensorMemory::SHM,
-            TensorMemory::Mem => PyTensorMemory::MEM,
-        }
     }
 }
 
