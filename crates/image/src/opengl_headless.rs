@@ -777,6 +777,14 @@ impl ImageProcessorTrait for GLProcessorST {
             ), // Add dest rect to make sure dst is rendered fully
         };
 
+        gls::enable(gls::gl::BLEND);
+        gls::blend_func_separate(
+            gls::gl::SRC_ALPHA,
+            gls::gl::ONE_MINUS_SRC_ALPHA,
+            gls::gl::ZERO,
+            gls::gl::ONE,
+        );
+
         self.render_box(dst, detect)?;
         self.render_segmentation(detect, segmentation)?;
 
@@ -811,7 +819,7 @@ impl ImageProcessorTrait for GLProcessorST {
         if colors.is_empty() {
             return Ok(());
         }
-        let colors_f32 = colors
+        let mut colors_f32 = colors
             .iter()
             .map(|c| {
                 [
@@ -828,6 +836,10 @@ impl ImageProcessorTrait for GLProcessorST {
             .load_uniform_4fv(c"colors", &colors_f32)?;
         self.instanced_segmentation_program
             .load_uniform_4fv(c"colors", &colors_f32)?;
+
+        colors_f32.iter_mut().for_each(|c| {
+            c[3] = 1.0; // set alpha to 1.0 for color rendering
+        });
         self.color_program
             .load_uniform_4fv(c"colors", &colors_f32)?;
 
@@ -2154,8 +2166,6 @@ impl GLProcessorST {
         if segmentation.is_empty() {
             return Ok(());
         }
-        gls::enable(gls::gl::BLEND);
-        gls::blend_func(gls::gl::SRC_ALPHA, gls::gl::ONE_MINUS_SRC_ALPHA);
 
         let is_modelpack = segmentation[0].segmentation.shape()[2] > 1;
         // top and bottom are flipped because OpenGL uses 0,0 as bottom left
@@ -2790,6 +2800,7 @@ void main() {
 mod gl_tests {
     use super::*;
     use crate::{RGBA, TensorImage};
+    use image::buffer::ConvertBuffer;
     use ndarray::Array3;
 
     #[test]
@@ -2828,8 +2839,6 @@ mod gl_tests {
 
         let mut renderer = GLProcessorThreaded::new().unwrap();
         renderer.render_to_image(&mut image, &[], &[seg]).unwrap();
-
-        image.save_jpeg("test_segmentation.jpg", 80).unwrap();
     }
 
     #[test]
@@ -2868,8 +2877,6 @@ mod gl_tests {
 
         let mut renderer = GLProcessorThreaded::new().unwrap();
         renderer.render_to_image(&mut image, &[], &[seg]).unwrap();
-
-        image.save_jpeg("test_segmentation_mem.jpg", 80).unwrap();
     }
 
     #[test]
@@ -2899,7 +2906,7 @@ mod gl_tests {
         let detect = DetectBox {
             bbox: [0.59375, 0.25, 0.9375, 0.725].into(),
             score: 0.99,
-            label: 0,
+            label: 1,
         };
 
         let seg = Segmentation {
@@ -2912,13 +2919,20 @@ mod gl_tests {
 
         let mut renderer = GLProcessorThreaded::new().unwrap();
         renderer
-            .set_class_colors(&[[255, 255, 0, 233], [128, 128, 0, 20]])
+            .set_class_colors(&[[255, 255, 0, 233], [128, 128, 255, 100]])
             .unwrap();
         renderer
             .render_to_image(&mut image, &[detect], &[seg])
             .unwrap();
 
-        image.save_jpeg("test_segmentation_yolo.jpg", 80).unwrap();
+        let expected = TensorImage::load(
+            include_bytes!("../../../testdata/output_render_gl.jpg"),
+            Some(RGBA),
+            None,
+        )
+        .unwrap();
+
+        compare_images(&image, &expected, 0.99, function!());
     }
 
     #[test]
@@ -2945,13 +2959,11 @@ mod gl_tests {
         };
         let mut renderer = GLProcessorThreaded::new().unwrap();
         renderer
-            .set_class_colors(&[[255, 255, 0, 233], [128, 128, 0, 20]])
+            .set_class_colors(&[[255, 255, 0, 233], [128, 128, 255, 100]])
             .unwrap();
         renderer
             .render_to_image(&mut image, &[detect], &[])
             .unwrap();
-
-        image.save_jpeg("test_boxes.jpg", 80).unwrap();
     }
 
     static GL_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2965,6 +2977,98 @@ mod gl_tests {
         #[cfg(not(all(target_os = "linux", feature = "opengl")))]
         {
             false
+        }
+    }
+
+    fn compare_images(img1: &TensorImage, img2: &TensorImage, threshold: f64, name: &str) {
+        assert_eq!(img1.height(), img2.height(), "Heights differ");
+        assert_eq!(img1.width(), img2.width(), "Widths differ");
+        assert_eq!(img1.fourcc(), img2.fourcc(), "FourCC differ");
+        assert!(
+            matches!(img1.fourcc(), RGB | RGBA | GREY | PLANAR_RGB),
+            "FourCC must be RGB or RGBA for comparison"
+        );
+
+        let image1 = match img1.fourcc() {
+            RGB => image::RgbImage::from_vec(
+                img1.width() as u32,
+                img1.height() as u32,
+                img1.tensor().map().unwrap().to_vec(),
+            )
+            .unwrap(),
+            RGBA => image::RgbaImage::from_vec(
+                img1.width() as u32,
+                img1.height() as u32,
+                img1.tensor().map().unwrap().to_vec(),
+            )
+            .unwrap()
+            .convert(),
+            GREY => image::GrayImage::from_vec(
+                img1.width() as u32,
+                img1.height() as u32,
+                img1.tensor().map().unwrap().to_vec(),
+            )
+            .unwrap()
+            .convert(),
+            PLANAR_RGB => image::GrayImage::from_vec(
+                img1.width() as u32,
+                (img1.height() * 3) as u32,
+                img1.tensor().map().unwrap().to_vec(),
+            )
+            .unwrap()
+            .convert(),
+            _ => return,
+        };
+
+        let image2 = match img2.fourcc() {
+            RGB => image::RgbImage::from_vec(
+                img2.width() as u32,
+                img2.height() as u32,
+                img2.tensor().map().unwrap().to_vec(),
+            )
+            .unwrap(),
+            RGBA => image::RgbaImage::from_vec(
+                img2.width() as u32,
+                img2.height() as u32,
+                img2.tensor().map().unwrap().to_vec(),
+            )
+            .unwrap()
+            .convert(),
+            GREY => image::GrayImage::from_vec(
+                img2.width() as u32,
+                img2.height() as u32,
+                img2.tensor().map().unwrap().to_vec(),
+            )
+            .unwrap()
+            .convert(),
+            PLANAR_RGB => image::GrayImage::from_vec(
+                img2.width() as u32,
+                (img2.height() * 3) as u32,
+                img2.tensor().map().unwrap().to_vec(),
+            )
+            .unwrap()
+            .convert(),
+            _ => return,
+        };
+
+        let similarity = image_compare::rgb_similarity_structure(
+            &image_compare::Algorithm::RootMeanSquared,
+            &image1,
+            &image2,
+        )
+        .expect("Image Comparison failed");
+        if similarity.score < threshold {
+            // image1.save(format!("{name}_1.png"));
+            // image2.save(format!("{name}_2.png"));
+            similarity
+                .image
+                .to_color_map()
+                .save(format!("{name}.png"))
+                .unwrap();
+            panic!(
+                "{name}: converted image and target image have similarity score too low: {} < {}",
+                similarity.score, threshold
+            )
         }
     }
 }
