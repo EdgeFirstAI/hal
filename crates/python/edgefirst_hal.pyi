@@ -32,7 +32,6 @@ A tuple containing:
 
 
 class Decoder:
-    # [pyo3(signature = (config, score_threshold=0.1, iou_threshold=0.7))]
     def __init__(
         self, config: dict, score_threshold: float = 0.1, iou_threshold: float = 0.7
     ) -> None:
@@ -41,7 +40,6 @@ class Decoder:
         """
         ...
 
-    # [pyo3(signature = (json_str, score_threshold=0.1, iou_threshold=0.7))]
     @staticmethod
     def new_from_json_str(
         json_str: str, score_threshold: float = 0.1, iou_threshold: float = 0.7
@@ -51,7 +49,6 @@ class Decoder:
         """
         ...
 
-    # [pyo3(signature = (yaml_str, score_threshold=0.1, iou_threshold=0.7))]
     @staticmethod
     def new_from_yaml_str(
         yaml_str: str, score_threshold: float = 0.1, iou_threshold=0.7
@@ -61,7 +58,6 @@ class Decoder:
         """
         ...
 
-    # [pyo3(signature = (model_output, max_boxes=100))]
     def decode(self, model_output: List[np.ndarray], max_boxes=100) -> SegDetOutput:
         """
         Decode model outputs into detection and segmentation results. When giving quantized
@@ -74,8 +70,6 @@ class Decoder:
         the same floating point type.
         """
         ...
-
-    # [pyo3(signature = (boxes, quant_boxes=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
 
     @staticmethod
     def decode_yolo_det(
@@ -99,7 +93,6 @@ class Decoder:
         """
         ...
 
-    # [pyo3(signature = (boxes, protos, quant_boxes=(1.0, 0), quant_protos=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
     @staticmethod
     def decode_yolo_segdet(
         boxes: Union[
@@ -123,7 +116,6 @@ class Decoder:
         """
         ...
 
-    # [pyo3(signature = (boxes, scores, quant_boxes=(1.0, 0), quant_scores=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
     @staticmethod
     def decode_modelpack_det(
         boxes: Union[
@@ -147,7 +139,6 @@ class Decoder:
         """
         ...
 
-    # [pyo3(signature = (boxes, anchors, quant=Vec::new(), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
     @staticmethod
     def decode_modelpack_det_split(
         boxes: List[
@@ -169,7 +160,6 @@ class Decoder:
         """
         ...
 
-    # [pyo3(signature = (quantized, quant_boxes, dequant_into))]
     @staticmethod
     def dequantize(
         quantized: Union[
@@ -189,7 +179,6 @@ class Decoder:
         """
         ...
 
-    # [pyo3(signature = (segmentation))]
     @staticmethod
     def segmentation_to_mask(segmentation: npt.NDArray[np.uint8]) -> None:
         """Converts a 3D segmentation tensor into a 2D mask."""
@@ -238,7 +227,6 @@ class TensorMemory(enum.Enum):
 class Tensor:
 
     if sys.platform == 'linux':
-        # [pyo3(signature = (shape, dtype = "float32", memory = None, name = None))]
         def __init__(
             self,
             shape: list[int],
@@ -263,7 +251,6 @@ class Tensor:
         (`TensorMemory.MEM`) regardless of platform capabilities.
         """
 
-        # [pyo3(signature = (fd, shape, dtype = "float32", name = None))]
         @staticmethod
         def from_fd(
             fd: int,
@@ -428,7 +415,6 @@ class Normalization(enum.Enum):
 
 
 class TensorImage:
-    # [pyo3(signature = (width, height, fourcc = FourCC::RGB))]
     def __init__(
         self,
         width: int,
@@ -442,7 +428,6 @@ class TensorImage:
         """
         ...
 
-    # [pyo3(signature = (data, fourcc = None))]
     @staticmethod
     def load_from_bytes(
         data: bytes,
@@ -456,7 +441,6 @@ class TensorImage:
         """
         ...
 
-    # [pyo3(signature = (filename, fourcc = None))]
     @staticmethod
     def load(
         filename: str,
@@ -469,7 +453,6 @@ class TensorImage:
         """
         ...
 
-    # [pyo3(signature = (filename, quality=80))]
     def save_jpeg(self, filename: str, quality: int = 80) -> None:
         """Save the image as a JPEG file to disk with the specified quality (1-100). The image must be RGB or RGBA format."""
         ...
@@ -566,7 +549,6 @@ class ImageProcessor:
 
     def __init__(self) -> None: ...
 
-    # [pyo3(signature = (dst, bbox, scores, classes, seg=vec![]))]
     def render_to_image(
             self,
             dst: TensorImage,
@@ -588,8 +570,6 @@ class ImageProcessor:
         will be set. Each color should be a list of 4 values (0-255 inclusive) representing RGBA.
         """
         ...
-
-    # [pyo3(signature = (src, dst, rotation = PyRotation::Rotate0, flip = PyFlip::NoFlip, src_crop = None, dst_crop = None, dst_color = None))]
 
     def convert(
         self,
