@@ -1570,10 +1570,10 @@ impl CPUProcessor {
                 ymax: bbox.ymax.clamp(0.0, 1.0),
             };
             let inner = [
-                ((dst.width()) as f32 * bbox.xmin).round() as usize,
-                ((dst.height()) as f32 * bbox.ymin).round() as usize,
-                ((dst.width()) as f32 * bbox.xmax).round() as usize,
-                ((dst.height()) as f32 * bbox.ymax).round() as usize,
+                ((dst.width() - 1) as f32 * bbox.xmin - 0.5).round() as usize,
+                ((dst.height() - 1) as f32 * bbox.ymin - 0.5).round() as usize,
+                ((dst.width() - 1) as f32 * bbox.xmax + 0.5).round() as usize,
+                ((dst.height() - 1) as f32 * bbox.ymax + 0.5).round() as usize,
             ];
 
             let outer = [
