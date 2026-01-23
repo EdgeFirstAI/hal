@@ -9,6 +9,8 @@ use pyo3::ffi::Py_buffer;
 
 #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
 use std::ffi::{CString, c_int, c_void};
+#[cfg(target_os = "linux")]
+use std::os::fd::RawFd;
 use std::{fmt, os::raw::c_char};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -19,6 +21,7 @@ pub enum Error {
     UnsupportedMemoryType(String),
     UnsupportedDataType(String),
     TensorMap(String),
+    Io(std::io::Error),
 }
 
 impl fmt::Display for Error {
@@ -28,6 +31,7 @@ impl fmt::Display for Error {
             Error::UnsupportedMemoryType(msg) => write!(f, "Invalid memory type: {msg}"),
             Error::UnsupportedDataType(msg) => write!(f, "Invalid data type: {msg}"),
             Error::TensorMap(msg) => write!(f, "Tensor map error: {msg}"),
+            Error::Io(e) => write!(f, "IO error: {e:?}"),
         }
     }
 }
@@ -35,6 +39,12 @@ impl fmt::Display for Error {
 impl From<tensor::Error> for Error {
     fn from(err: tensor::Error) -> Self {
         Error::Tensor(err)
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        Error::Io(err)
     }
 }
 
@@ -258,6 +268,7 @@ impl PyTensor {
             Some("dma") => Some(tensor::TensorMemory::Dma),
             #[cfg(target_os = "linux")]
             Some("shm") => Some(tensor::TensorMemory::Shm),
+            Some("mem") => Some(tensor::TensorMemory::Mem),
             Some(inv) => return Err(Error::UnsupportedMemoryType(inv.to_string())),
             None => None,
         };
@@ -274,6 +285,32 @@ impl PyTensor {
             "float32" => TensorT::TensorF32(tensor::Tensor::new(&shape, memory, name)?),
             "float64" => TensorT::TensorF64(tensor::Tensor::new(&shape, memory, name)?),
             _ => return Err(Error::UnsupportedDataType(dtype.to_string())),
+        };
+
+        Ok(PyTensor(tensor))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[staticmethod]
+    #[pyo3(signature = (fd, shape, dtype = "float32", name = None))]
+    fn from_fd(fd: RawFd, shape: Vec<usize>, dtype: &str, name: Option<&str>) -> Result<Self> {
+        use std::os::fd::BorrowedFd;
+
+        let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+        let fd = fd.try_clone_to_owned()?;
+
+        let tensor = match dtype {
+            "uint8" => TensorT::TensorU8(tensor::Tensor::from_fd(fd, &shape, name).unwrap()),
+            "int8" => TensorT::TensorI8(tensor::Tensor::from_fd(fd, &shape, name).unwrap()),
+            "uint16" => TensorT::TensorU16(tensor::Tensor::from_fd(fd, &shape, name).unwrap()),
+            "int16" => TensorT::TensorI16(tensor::Tensor::from_fd(fd, &shape, name).unwrap()),
+            "uint32" => TensorT::TensorU32(tensor::Tensor::from_fd(fd, &shape, name).unwrap()),
+            "int32" => TensorT::TensorI32(tensor::Tensor::from_fd(fd, &shape, name).unwrap()),
+            "uint64" => TensorT::TensorU64(tensor::Tensor::from_fd(fd, &shape, name).unwrap()),
+            "int64" => TensorT::TensorI64(tensor::Tensor::from_fd(fd, &shape, name).unwrap()),
+            "float32" => TensorT::TensorF32(tensor::Tensor::from_fd(fd, &shape, name).unwrap()),
+            "float64" => TensorT::TensorF64(tensor::Tensor::from_fd(fd, &shape, name).unwrap()),
+            _ => panic!("Unsupported data type: {}", dtype),
         };
 
         Ok(PyTensor(tensor))
