@@ -9,13 +9,11 @@ use pyo3::{exceptions::PyBufferError, ffi::PyMemoryView_FromMemory, prelude::*};
 #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
 use std::ffi::{CString, c_int, c_void};
 #[cfg(target_os = "linux")]
-use std::os::fd::RawFd;
+use std::os::fd::{IntoRawFd, OwnedFd, RawFd};
+
 use std::{
     fmt::{self, Display},
-    os::{
-        fd::{IntoRawFd, OwnedFd},
-        raw::c_char,
-    },
+    os::raw::c_char,
 };
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -360,17 +358,17 @@ impl PyTensor {
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
 
         let tensor = match dtype {
-            "uint8" => TensorT::TensorU8(tensor::Tensor::from_fd(fd, &shape, name).unwrap()),
-            "int8" => TensorT::TensorI8(tensor::Tensor::from_fd(fd, &shape, name).unwrap()),
-            "uint16" => TensorT::TensorU16(tensor::Tensor::from_fd(fd, &shape, name).unwrap()),
-            "int16" => TensorT::TensorI16(tensor::Tensor::from_fd(fd, &shape, name).unwrap()),
-            "uint32" => TensorT::TensorU32(tensor::Tensor::from_fd(fd, &shape, name).unwrap()),
-            "int32" => TensorT::TensorI32(tensor::Tensor::from_fd(fd, &shape, name).unwrap()),
-            "uint64" => TensorT::TensorU64(tensor::Tensor::from_fd(fd, &shape, name).unwrap()),
-            "int64" => TensorT::TensorI64(tensor::Tensor::from_fd(fd, &shape, name).unwrap()),
-            "float32" => TensorT::TensorF32(tensor::Tensor::from_fd(fd, &shape, name).unwrap()),
-            "float64" => TensorT::TensorF64(tensor::Tensor::from_fd(fd, &shape, name).unwrap()),
-            _ => panic!("Unsupported data type: {}", dtype),
+            "uint8" => TensorT::TensorU8(tensor::Tensor::from_fd(fd, &shape, name)?),
+            "int8" => TensorT::TensorI8(tensor::Tensor::from_fd(fd, &shape, name)?),
+            "uint16" => TensorT::TensorU16(tensor::Tensor::from_fd(fd, &shape, name)?),
+            "int16" => TensorT::TensorI16(tensor::Tensor::from_fd(fd, &shape, name)?),
+            "uint32" => TensorT::TensorU32(tensor::Tensor::from_fd(fd, &shape, name)?),
+            "int32" => TensorT::TensorI32(tensor::Tensor::from_fd(fd, &shape, name)?),
+            "uint64" => TensorT::TensorU64(tensor::Tensor::from_fd(fd, &shape, name)?),
+            "int64" => TensorT::TensorI64(tensor::Tensor::from_fd(fd, &shape, name)?),
+            "float32" => TensorT::TensorF32(tensor::Tensor::from_fd(fd, &shape, name)?),
+            "float64" => TensorT::TensorF64(tensor::Tensor::from_fd(fd, &shape, name)?),
+            _ => return Err(Error::UnsupportedDataType(dtype.to_string())),
         };
 
         Ok(PyTensor(tensor))

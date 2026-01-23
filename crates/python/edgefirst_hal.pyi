@@ -223,7 +223,7 @@ class TensorMemory(enum.Enum):
         DMA: TensorMemory
         """
         Direct Memory Access (DMA) allocation. Incurs additional overhead for memory reading/writing with the CPU. 
-        Allows for hardware acceleration when suppported
+        Allows for hardware acceleration when supported
         """
 
         SHM: TensorMemory
@@ -260,7 +260,7 @@ class Tensor:
         # Environment Variables
         - `EDGEFIRST_TENSOR_FORCE_MEM`: If set to a non-zero and non-false
         value, forces the use of regular system memory allocation
-        (`mem`) regardless of platform capabilities.
+        (`TensorMemory.MEM`) regardless of platform capabilities.
         """
 
         # [pyo3(signature = (fd, shape, dtype = "float32", name = None))]
@@ -310,7 +310,7 @@ class Tensor:
         # Environment Variables
         - `EDGEFIRST_TENSOR_FORCE_MEM`: If set to a non-zero and non-false
         value, forces the use of regular system memory allocation
-        (`dma`) regardless of platform capabilities.
+        (`TensorMemory.MEM`) regardless of platform capabilities.
         """
 
     @property
@@ -342,7 +342,7 @@ class Tensor:
     """Returns a mapped view of the tensor data for direct access."""
 
 
-class TensorMap(Buffer):
+class TensorMap:
     def unmap(self) -> None: ...
     def view(self) -> memoryview: ...
     def __repr__(self) -> str: ...
