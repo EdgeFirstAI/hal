@@ -4,7 +4,6 @@
 import numpy as np
 from edgefirst_hal import Tensor, TensorMemory
 from unittest import TestCase
-import pytest
 
 
 class TestTensor(TestCase):
@@ -298,6 +297,7 @@ class TestTensor(TestCase):
         assert tensor_fd.size == tensor.size
         assert tensor_fd.shape == tensor.shape
         assert tensor_fd.dtype == tensor.dtype
+        assert tensor_fd.memory == tensor.memory
 
         with tensor.map() as m:
             for i in range(tensor.size):
@@ -316,13 +316,14 @@ class TestTensor(TestCase):
         assert tensor.memory == TensorMemory.DMA
 
         import time
-        start = time.time()
+        start = time.perf_counter()
         tensor_fd = Tensor.from_fd(tensor.fd, tensor.shape, tensor.dtype)
-        elapsed = time.time() - start
+        elapsed = time.perf_counter() - start
 
         assert tensor_fd.size == tensor.size
         assert tensor_fd.shape == tensor.shape
         assert tensor_fd.dtype == tensor.dtype
+        assert tensor_fd.memory == tensor.memory
 
         with tensor.map() as m:
             for i in range(tensor.size):
@@ -334,11 +335,11 @@ class TestTensor(TestCase):
 
         tensor_copy = Tensor(
             tensor.shape, dtype=tensor.dtype, mem=tensor.memory)
-        start = time.time()
+        start = time.perf_counter()
         with tensor.map() as src, tensor_copy.map() as dst:
             for i in range(tensor.size):
                 dst[i] = src[i]
-        elapsed_copy = time.time() - start
+        elapsed_copy = time.perf_counter() - start
 
         assert elapsed < elapsed_copy
 
@@ -374,13 +375,14 @@ class TestTensor(TestCase):
         assert tensor.memory == TensorMemory.SHM
 
         import time
-        start = time.time()
+        start = time.perf_counter()
         tensor_fd = Tensor.from_fd(tensor.fd, tensor.shape, tensor.dtype)
-        elapsed = time.time() - start
+        elapsed = time.perf_counter() - start
 
         assert tensor_fd.size == tensor.size
         assert tensor_fd.shape == tensor.shape
         assert tensor_fd.dtype == tensor.dtype
+        assert tensor_fd.memory == tensor.memory
 
         with tensor.map() as m:
             for i in range(tensor.size):
@@ -392,10 +394,10 @@ class TestTensor(TestCase):
 
         tensor_copy = Tensor(
             tensor.shape, dtype=tensor.dtype, mem=tensor.memory)
-        start = time.time()
+        start = time.perf_counter()
         with tensor.map() as src, tensor_copy.map() as dst:
             for i in range(tensor.size):
                 dst[i] = src[i]
-        elapsed_copy = time.time() - start
+        elapsed_copy = time.perf_counter() - start
 
         assert elapsed < elapsed_copy
