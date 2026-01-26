@@ -28,6 +28,7 @@ nix = { workspace = true }
 [dev-dependencies]
 divan = { workspace = true }
 rand = { workspace = true }
+procfs = { workspace = true }
 
 [[bench]]
 name = "tensor_benchmark"
