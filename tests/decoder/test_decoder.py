@@ -231,3 +231,74 @@ def test_yolo_det():
     assert np.allclose(scores, [0.5591227, 0.33057618])
     assert np.allclose(classes, [0, 75])
     assert len(masks) == 0
+
+
+def test_context_switch():
+    """Test running multiple decoders concurrently"""
+    import threading
+
+    def yolo_det():
+        config = {
+            "outputs": [
+                {
+                    "decoder": "ultralytics",
+                    "quantization": [0.0040811873, -123],
+                    "shape": [1, 84, 8400],
+                    "type": "detection",
+                    "dshape": [
+                        ["batch", 1],
+                        ["num_features", 84],
+                        ["num_boxes", 8400],
+                    ]
+                },
+            ],
+        }
+        decoder = edgefirst_hal.Decoder(config, 0.25, 0.7)
+        output = np.fromfile("testdata/yolov8s_80_classes.bin", dtype=np.int8).reshape(1, 84, 8400)
+
+        for _ in range(100):
+            boxes, scores, classes, masks = decoder.decode([output])
+
+            assert np.allclose(boxes[0], [0.5285137, 0.05305544, 0.87541467, 0.9998909], atol=1e-6)
+            assert np.allclose(scores[0], 0.5591227, atol=1e-6)
+            assert classes[0] == 0
+
+            assert np.allclose(boxes[1], [0.130598, 0.43260583, 0.35098213, 0.9958097], atol=1e-6)
+            assert np.allclose(scores[1], 0.33057618, atol=1e-6)
+            assert classes[1] == 75
+
+            assert len(masks) == 0
+
+    def modelpack_det_split():
+        output0 = np.fromfile("testdata/modelpack_split_17x30x18.bin", dtype=np.uint8).reshape(1, 17, 30, 18)
+        output1 = np.fromfile("testdata/modelpack_split_9x15x18.bin", dtype=np.uint8).reshape(1, 9, 15, 18)
+
+        with open("testdata/modelpack_split.json") as f:
+            config = f.read()
+
+        decoder = edgefirst_hal.Decoder.new_from_json_str(config, 0.8, 0.5)
+
+        for _ in range(100):
+            boxes, scores, classes, masks = decoder.decode([output0, output1])
+
+            assert np.allclose(boxes, [[0.43171933, 0.68243736, 0.5626645, 0.808863]], atol=1e-6)
+            assert np.allclose(scores, [0.99240804], atol=1e-6)
+            assert np.allclose(classes, [0])
+            assert len(masks) == 0
+
+    threads = [
+        threading.Thread(target=yolo_det),
+        threading.Thread(target=modelpack_det_split),
+        threading.Thread(target=yolo_det),
+        threading.Thread(target=modelpack_det_split),
+        threading.Thread(target=yolo_det),
+        threading.Thread(target=modelpack_det_split),
+        threading.Thread(target=yolo_det),
+        threading.Thread(target=modelpack_det_split),
+    ]
+
+    for thread in threads:
+        thread.start()
+
+    for thread in threads:
+        thread.join()
