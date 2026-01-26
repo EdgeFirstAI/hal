@@ -4,6 +4,8 @@
 import numpy as np
 from edgefirst_hal import Tensor, TensorMemory
 from unittest import TestCase
+import os
+import pytest
 
 
 class TestTensor(TestCase):
@@ -402,3 +404,117 @@ class TestTensor(TestCase):
         elapsed_copy = time.perf_counter() - start
 
         assert elapsed < elapsed_copy
+
+    def test_dma_no_fd_leaks(self):
+        """Test that DMA tensors don't leak file descriptors"""
+        psutil = pytest.importorskip("psutil")
+
+        proc = psutil.Process(os.getpid())
+
+        try:
+            start_fds = proc.num_fds()
+        except AttributeError:
+            self.skipTest("num_fds not supported on this platform")
+
+        try:
+            # Test if DMA is available
+            test_tensor = Tensor([64], dtype="uint8", mem=TensorMemory.DMA)
+            del test_tensor
+        except (AttributeError, RuntimeError):
+            self.skipTest("DMA memory not supported on this platform")
+
+        for _ in range(100):
+            tensor = Tensor([100, 100], dtype="uint8", mem=TensorMemory.DMA)
+            with tensor.map() as m:
+                m[0] = 3
+            del tensor
+
+        end_fds = proc.num_fds()
+        self.assertEqual(
+            start_fds, end_fds,
+            f"File descriptor leak detected: {start_fds} -> {end_fds}"
+        )
+
+    def test_shm_no_fd_leaks(self):
+        """Test that SHM tensors don't leak file descriptors"""
+        psutil = pytest.importorskip("psutil")
+        proc = psutil.Process(os.getpid())
+
+        try:
+            start_fds = proc.num_fds()
+        except AttributeError:
+            self.skipTest("num_fds not supported on this platform")
+
+        try:
+            # Test if SHM is available
+            test_tensor = Tensor([64], dtype="uint8", mem=TensorMemory.SHM)
+            del test_tensor
+        except (AttributeError, RuntimeError):
+            self.skipTest("SHM memory not supported on this platform")
+
+        for _ in range(100):
+            tensor = Tensor([100, 100], dtype="uint8", mem=TensorMemory.SHM)
+            with tensor.map() as m:
+                m[0] = 3
+            del tensor
+
+        end_fds = proc.num_fds()
+        self.assertEqual(
+            start_fds, end_fds,
+            f"File descriptor leak detected: {start_fds} -> {end_fds}"
+        )
+
+    def test_dma_fd_leak_with_from_fd(self):
+        """Test that creating tensors from FDs doesn't leak descriptors"""
+        psutil = pytest.importorskip("psutil")
+        proc = psutil.Process(os.getpid())
+
+        try:
+            start_fds = proc.num_fds()
+        except AttributeError:
+            self.skipTest("num_fds not supported on this platform")
+
+        try:
+            original = Tensor([100, 100, 3], dtype="uint8", mem=TensorMemory.DMA)
+        except (AttributeError, RuntimeError):
+            self.skipTest("DMA memory not supported on this platform")
+
+        for _ in range(100):
+            tensor_fd = Tensor.from_fd(original.fd, original.shape, original.dtype)
+            with tensor_fd.map() as m:
+                m[0] = 3
+            del tensor_fd
+        del original
+
+        end_fds = proc.num_fds()
+        self.assertEqual(
+            start_fds, end_fds,
+            f"File descriptor leak detected: {start_fds} -> {end_fds}"
+        )
+
+    def test_shm_fd_leak_with_from_fd(self):
+        """Test that creating tensors from SHM FDs doesn't leak descriptors"""
+        psutil = pytest.importorskip("psutil")
+        proc = psutil.Process(os.getpid())
+        try:
+            start_fds = proc.num_fds()
+        except AttributeError:
+            self.skipTest("num_fds not supported on this platform")
+
+        try:
+            original = Tensor([100, 100, 3], dtype="uint8", mem=TensorMemory.SHM)
+        except (AttributeError, RuntimeError):
+            self.skipTest("SHM memory not supported on this platform")
+
+        for _ in range(100):
+            tensor_fd = Tensor.from_fd(original.fd, original.shape, original.dtype)
+            with tensor_fd.map() as m:
+                m[0] = 3
+            del tensor_fd
+        del original
+
+        end_fds = proc.num_fds()
+        self.assertEqual(
+            start_fds, end_fds,
+            f"File descriptor leak detected: {start_fds} -> {end_fds}"
+        )
