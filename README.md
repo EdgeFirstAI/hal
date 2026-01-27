@@ -620,7 +620,7 @@ cargo test -p edgefirst_tensor
 ```
 
 ### Python Tests
-Python tests are located in the `tests/` directory and use the unittest framework:
+Python tests are located in the `tests/` directory and use the pytest framework:
 
 ```bash
 # First, build the Python bindings
@@ -633,6 +633,11 @@ python -m pytest tests/
 python -m pytest tests/image/
 python -m pytest tests/decoder/
 python -m pytest tests/test_tensor.py
+```
+
+Python tests require the Pillow library for the image tests, which can be installed using:
+```bash
+python -m pip install pillow
 ```
 
 **Note**: Python tests require the Python bindings to be built via `maturin develop` first, as they test the PyO3 interface.
