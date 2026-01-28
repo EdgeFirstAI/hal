@@ -23,6 +23,7 @@ let decoder = DecoderBuilder::new()
         quantization: Some(configs::QuantTuple(0.012345, 26)),
         shape: vec![1, 84, 8400],
         dshape: Vec::new(),
+        normalized: Some(true),
     })
     .with_score_threshold(0.25)
     .with_iou_threshold(0.7)
@@ -80,6 +81,7 @@ mod decoder;
 pub use decoder::*;
 
 pub use error::{DecoderError, DecoderResult};
+pub use configs::Nms;
 
 use crate::{
     decoder::configs::QuantTuple, modelpack::modelpack_segmentation_to_mask,
@@ -728,6 +730,7 @@ mod decoder_tests {
                         (DimName::Padding, 1),
                         (DimName::BoxCoords, 4),
                     ],
+                    normalized: Some(true),
                 },
                 configs::Scores {
                     decoder: DecoderType::ModelPack,
@@ -836,6 +839,7 @@ mod decoder_tests {
                 (DimName::Width, 15),
                 (DimName::NumAnchorsXFeatures, 18),
             ],
+            normalized: Some(true),
         };
 
         let detect_config1 = configs::Detection {
@@ -849,6 +853,7 @@ mod decoder_tests {
                 (DimName::Width, 30),
                 (DimName::NumAnchorsXFeatures, 18),
             ],
+            normalized: Some(true),
         };
 
         let config0 = (&detect_config0).try_into().unwrap();
@@ -1149,6 +1154,7 @@ mod decoder_tests {
                         (DimName::Padding, 1),
                         (DimName::BoxCoords, 4),
                     ],
+                    normalized: Some(true),
                 },
                 configs::Scores {
                     decoder: DecoderType::ModelPack,
@@ -1278,6 +1284,7 @@ mod decoder_tests {
                             (DimName::Width, 30),
                             (DimName::NumAnchorsXFeatures, 18),
                         ],
+                        normalized: Some(true),
                     },
                     configs::Detection {
                         decoder: DecoderType::ModelPack,
@@ -1290,6 +1297,7 @@ mod decoder_tests {
                             (DimName::Width, 15),
                             (DimName::NumAnchorsXFeatures, 18),
                         ],
+                        normalized: Some(true),
                     },
                 ],
                 configs::Segmentation {
@@ -1414,6 +1422,7 @@ mod decoder_tests {
                     (DimName::NumFeatures, 84),
                     (DimName::NumBoxes, 8400),
                 ],
+                normalized: Some(true),
             })
             .with_score_threshold(score_threshold)
             .with_iou_threshold(iou_threshold)
@@ -1425,6 +1434,7 @@ mod decoder_tests {
             (out.slice(s![0, .., ..]), quant.into()),
             score_threshold,
             iou_threshold,
+            Some(configs::Nms::ClassAgnostic),
             &mut output_boxes,
         );
         assert!(output_boxes[0].equal_within_delta(
@@ -1499,6 +1509,7 @@ mod decoder_tests {
             protos.view(),
             score_threshold,
             iou_threshold,
+            Some(configs::Nms::ClassAgnostic),
             &mut output_boxes,
             &mut output_masks,
         );
@@ -1582,6 +1593,7 @@ mod decoder_tests {
                         (DimName::NumFeatures, 116),
                         (DimName::NumBoxes, 8400),
                     ],
+                    normalized: Some(true),
                 },
                 Protos {
                     decoder: configs::DecoderType::Ultralytics,
@@ -1608,6 +1620,7 @@ mod decoder_tests {
             (protos.slice(s![0, .., .., ..]), quant_protos),
             score_threshold,
             iou_threshold,
+            Some(configs::Nms::ClassAgnostic),
             &mut output_boxes,
             &mut output_masks,
         );
@@ -1633,6 +1646,7 @@ mod decoder_tests {
             protos.slice(s![0, .., .., ..]),
             score_threshold,
             iou_threshold,
+            Some(configs::Nms::ClassAgnostic),
             &mut output_boxes_f32,
             &mut output_masks_f32,
         );
@@ -1686,6 +1700,7 @@ mod decoder_tests {
                         (DimName::BoxCoords, 4),
                         (DimName::NumBoxes, 8400),
                     ],
+                    normalized: Some(true),
                 },
                 configs::Scores {
                     decoder: configs::DecoderType::Ultralytics,
@@ -1723,6 +1738,7 @@ mod decoder_tests {
             seg.slice(s![0, ..84, ..]),
             score_threshold,
             iou_threshold,
+            Some(configs::Nms::ClassAgnostic),
             &mut output_boxes_f32,
         );
 
@@ -1772,6 +1788,7 @@ mod decoder_tests {
                         (DimName::BoxCoords, 4),
                         (DimName::NumBoxes, 8400),
                     ],
+                    normalized: Some(true),
                 },
                 configs::Scores {
                     decoder: configs::DecoderType::Ultralytics,
@@ -1835,6 +1852,7 @@ mod decoder_tests {
             protos.slice(s![0, .., .., ..]),
             score_threshold,
             iou_threshold,
+            Some(configs::Nms::ClassAgnostic),
             &mut output_boxes_f32,
             &mut output_masks_f32,
         );
@@ -1894,6 +1912,7 @@ mod decoder_tests {
                         (DimName::BoxCoords, 4),
                         (DimName::NumBoxes, 8400),
                     ],
+                    normalized: Some(true),
                 },
                 configs::Scores {
                     decoder: configs::DecoderType::Ultralytics,
@@ -1957,6 +1976,7 @@ mod decoder_tests {
             protos.slice(s![0, .., .., ..]),
             score_threshold,
             iou_threshold,
+            Some(configs::Nms::ClassAgnostic),
             &mut output_boxes_f32,
             &mut output_masks_f32,
         );
@@ -1991,5 +2011,236 @@ mod decoder_tests {
         let arr = array![10.0_f32, 20.0, 20.0, 20.0];
         let xyxy: [f32; 4] = XYXY::ndarray_to_xyxy_float(arr.view());
         assert_eq!(xyxy, [10.0_f32, 20.0, 20.0, 20.0]);
+    }
+
+    #[test]
+    fn test_class_aware_nms_float() {
+        use crate::float::nms_class_aware_float;
+
+        // Create two overlapping boxes with different classes
+        let boxes = vec![
+            DetectBox {
+                bbox: BoundingBox {
+                    xmin: 0.0,
+                    ymin: 0.0,
+                    xmax: 0.5,
+                    ymax: 0.5,
+                },
+                score: 0.9,
+                label: 0, // class 0
+            },
+            DetectBox {
+                bbox: BoundingBox {
+                    xmin: 0.1,
+                    ymin: 0.1,
+                    xmax: 0.6,
+                    ymax: 0.6,
+                },
+                score: 0.8,
+                label: 1, // class 1 - different class
+            },
+        ];
+
+        // Class-aware NMS should keep both boxes (different classes, IoU ~0.47 > threshold 0.3)
+        let result = nms_class_aware_float(0.3, boxes.clone());
+        assert_eq!(result.len(), 2, "Class-aware NMS should keep both boxes with different classes");
+
+        // Now test with same class - should suppress one
+        let same_class_boxes = vec![
+            DetectBox {
+                bbox: BoundingBox {
+                    xmin: 0.0,
+                    ymin: 0.0,
+                    xmax: 0.5,
+                    ymax: 0.5,
+                },
+                score: 0.9,
+                label: 0,
+            },
+            DetectBox {
+                bbox: BoundingBox {
+                    xmin: 0.1,
+                    ymin: 0.1,
+                    xmax: 0.6,
+                    ymax: 0.6,
+                },
+                score: 0.8,
+                label: 0, // same class
+            },
+        ];
+
+        let result = nms_class_aware_float(0.3, same_class_boxes);
+        assert_eq!(result.len(), 1, "Class-aware NMS should suppress overlapping box with same class");
+        assert_eq!(result[0].label, 0);
+        assert!((result[0].score - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_class_agnostic_vs_aware_nms() {
+        use crate::float::{nms_class_aware_float, nms_float};
+
+        // Two overlapping boxes with different classes
+        let boxes = vec![
+            DetectBox {
+                bbox: BoundingBox {
+                    xmin: 0.0,
+                    ymin: 0.0,
+                    xmax: 0.5,
+                    ymax: 0.5,
+                },
+                score: 0.9,
+                label: 0,
+            },
+            DetectBox {
+                bbox: BoundingBox {
+                    xmin: 0.1,
+                    ymin: 0.1,
+                    xmax: 0.6,
+                    ymax: 0.6,
+                },
+                score: 0.8,
+                label: 1,
+            },
+        ];
+
+        // Class-agnostic should suppress one (IoU ~0.47 > threshold 0.3)
+        let agnostic_result = nms_float(0.3, boxes.clone());
+        assert_eq!(agnostic_result.len(), 1, "Class-agnostic NMS should suppress overlapping boxes");
+
+        // Class-aware should keep both (different classes)
+        let aware_result = nms_class_aware_float(0.3, boxes);
+        assert_eq!(aware_result.len(), 2, "Class-aware NMS should keep boxes with different classes");
+    }
+
+    #[test]
+    fn test_class_aware_nms_int() {
+        use crate::byte::nms_class_aware_int;
+
+        // Create two overlapping boxes with different classes
+        let boxes = vec![
+            DetectBoxQuantized {
+                bbox: BoundingBox {
+                    xmin: 0.0,
+                    ymin: 0.0,
+                    xmax: 0.5,
+                    ymax: 0.5,
+                },
+                score: 200_u8,
+                label: 0,
+            },
+            DetectBoxQuantized {
+                bbox: BoundingBox {
+                    xmin: 0.1,
+                    ymin: 0.1,
+                    xmax: 0.6,
+                    ymax: 0.6,
+                },
+                score: 180_u8,
+                label: 1, // different class
+            },
+        ];
+
+        // Should keep both (different classes)
+        let result = nms_class_aware_int(0.5, boxes);
+        assert_eq!(result.len(), 2, "Class-aware NMS (int) should keep boxes with different classes");
+    }
+
+    #[test]
+    fn test_nms_enum_default() {
+        // Test that Nms enum has the correct default
+        let default_nms: configs::Nms = Default::default();
+        assert_eq!(default_nms, configs::Nms::ClassAgnostic);
+    }
+
+    #[test]
+    fn test_decoder_nms_mode() {
+        // Test that decoder properly stores NMS mode
+        let decoder = DecoderBuilder::default()
+            .with_config_yolo_det(configs::Detection {
+                anchors: None,
+                decoder: DecoderType::Ultralytics,
+                quantization: None,
+                shape: vec![1, 84, 8400],
+                dshape: Vec::new(),
+                normalized: Some(true),
+            })
+            .with_nms(Some(configs::Nms::ClassAware))
+            .build()
+            .unwrap();
+
+        assert_eq!(decoder.nms, Some(configs::Nms::ClassAware));
+    }
+
+    #[test]
+    fn test_decoder_nms_bypass() {
+        // Test that decoder can be configured with nms=None (bypass)
+        let decoder = DecoderBuilder::default()
+            .with_config_yolo_det(configs::Detection {
+                anchors: None,
+                decoder: DecoderType::Ultralytics,
+                quantization: None,
+                shape: vec![1, 84, 8400],
+                dshape: Vec::new(),
+                normalized: Some(true),
+            })
+            .with_nms(None)
+            .build()
+            .unwrap();
+
+        assert_eq!(decoder.nms, None);
+    }
+
+    #[test]
+    fn test_decoder_normalized_boxes_true() {
+        // Test that normalized_boxes returns Some(true) when explicitly set
+        let decoder = DecoderBuilder::default()
+            .with_config_yolo_det(configs::Detection {
+                anchors: None,
+                decoder: DecoderType::Ultralytics,
+                quantization: None,
+                shape: vec![1, 84, 8400],
+                dshape: Vec::new(),
+                normalized: Some(true),
+            })
+            .build()
+            .unwrap();
+
+        assert_eq!(decoder.normalized_boxes(), Some(true));
+    }
+
+    #[test]
+    fn test_decoder_normalized_boxes_false() {
+        // Test that normalized_boxes returns Some(false) when config specifies unnormalized
+        let decoder = DecoderBuilder::default()
+            .with_config_yolo_det(configs::Detection {
+                anchors: None,
+                decoder: DecoderType::Ultralytics,
+                quantization: None,
+                shape: vec![1, 84, 8400],
+                dshape: Vec::new(),
+                normalized: Some(false),
+            })
+            .build()
+            .unwrap();
+
+        assert_eq!(decoder.normalized_boxes(), Some(false));
+    }
+
+    #[test]
+    fn test_decoder_normalized_boxes_unknown() {
+        // Test that normalized_boxes returns None when not specified in config
+        let decoder = DecoderBuilder::default()
+            .with_config_yolo_det(configs::Detection {
+                anchors: None,
+                decoder: DecoderType::Ultralytics,
+                quantization: None,
+                shape: vec![1, 84, 8400],
+                dshape: Vec::new(),
+                normalized: None,
+            })
+            .build()
+            .unwrap();
+
+        assert_eq!(decoder.normalized_boxes(), None);
     }
 }

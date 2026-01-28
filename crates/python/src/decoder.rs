@@ -3,9 +3,42 @@
 
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 use edgefirst::decoder::{
-    Decoder, DecoderBuilder, DetectBox, Quantization, Segmentation, dequantize_cpu,
+    Decoder, DecoderBuilder, DetectBox, Quantization, Segmentation, configs::Nms, dequantize_cpu,
     modelpack::ModelPackDetectionConfig, segmentation_to_mask,
 };
+
+/// NMS (Non-Maximum Suppression) mode for filtering overlapping detections.
+///
+/// - `ClassAgnostic` — suppress overlapping boxes regardless of class label (default)
+/// - `ClassAware` — only suppress boxes that share the same class label AND overlap
+///
+/// Pass `None` to bypass NMS entirely (for end-to-end models with embedded NMS).
+#[pyo3::pyclass(name = "Nms", eq, eq_int)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PyNms {
+    /// Suppress overlapping boxes regardless of class label (default)
+    ClassAgnostic = 0,
+    /// Only suppress boxes with the same class label that overlap
+    ClassAware = 1,
+}
+
+impl From<PyNms> for Nms {
+    fn from(py: PyNms) -> Self {
+        match py {
+            PyNms::ClassAgnostic => Nms::ClassAgnostic,
+            PyNms::ClassAware => Nms::ClassAware,
+        }
+    }
+}
+
+impl From<Nms> for PyNms {
+    fn from(nms: Nms) -> Self {
+        match nms {
+            Nms::ClassAgnostic => PyNms::ClassAgnostic,
+            Nms::ClassAware => PyNms::ClassAware,
+        }
+    }
+}
 
 use ndarray::{Array1, Array2};
 use numpy::{
@@ -173,13 +206,27 @@ macro_rules! dequantize {
 
 #[pymethods]
 impl PyDecoder {
+    /// Create a new Decoder from a configuration dictionary.
+    ///
+    /// Args:
+    ///     config: Model output configuration dictionary
+    ///     score_threshold: Score threshold for filtering detections (default: 0.1)
+    ///     iou_threshold: IoU threshold for NMS (default: 0.7)
+    ///     nms: NMS mode - Nms.ClassAgnostic (default), Nms.ClassAware, or None to bypass NMS
     #[new]
-    #[pyo3(signature = (config, score_threshold=0.1, iou_threshold=0.7))]
-    pub fn new(config: Bound<PyAny>, score_threshold: f32, iou_threshold: f32) -> PyResult<Self> {
+    #[pyo3(signature = (config, score_threshold=0.1, iou_threshold=0.7, nms=PyNms::ClassAgnostic))]
+    pub fn new(
+        config: Bound<PyAny>,
+        score_threshold: f32,
+        iou_threshold: f32,
+        nms: Option<PyNms>,
+    ) -> PyResult<Self> {
         let config = pythonize::depythonize(&config)?;
+        let nms: Option<Nms> = nms.map(|py_nms| py_nms.into());
         let decoder = DecoderBuilder::default()
             .with_score_threshold(score_threshold)
             .with_iou_threshold(iou_threshold)
+            .with_nms(nms)
             .with_config(config)
             .build();
         match decoder {
@@ -189,15 +236,18 @@ impl PyDecoder {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (json_str, score_threshold=0.1, iou_threshold=0.7))]
+    #[pyo3(signature = (json_str, score_threshold=0.1, iou_threshold=0.7, nms=PyNms::ClassAgnostic))]
     pub fn new_from_json_str(
         json_str: &str,
         score_threshold: f32,
         iou_threshold: f32,
+        nms: Option<PyNms>,
     ) -> PyResult<Self> {
+        let nms: Option<Nms> = nms.map(|py_nms| py_nms.into());
         let decoder = DecoderBuilder::default()
             .with_score_threshold(score_threshold)
             .with_iou_threshold(iou_threshold)
+            .with_nms(nms)
             .with_config_json_str(json_str.to_string())
             .build();
         match decoder {
@@ -207,15 +257,18 @@ impl PyDecoder {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (yaml_str, score_threshold=0.1, iou_threshold=0.7))]
+    #[pyo3(signature = (yaml_str, score_threshold=0.1, iou_threshold=0.7, nms=PyNms::ClassAgnostic))]
     pub fn new_from_yaml_str(
         yaml_str: &str,
         score_threshold: f32,
         iou_threshold: f32,
+        nms: Option<PyNms>,
     ) -> PyResult<Self> {
+        let nms: Option<Nms> = nms.map(|py_nms| py_nms.into());
         let decoder = DecoderBuilder::default()
             .with_score_threshold(score_threshold)
             .with_iou_threshold(iou_threshold)
+            .with_nms(nms)
             .with_config_yaml_str(yaml_str.to_string())
             .build();
         match decoder {
@@ -305,27 +358,31 @@ impl PyDecoder {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (boxes, quant_boxes=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
+    #[pyo3(signature = (boxes, quant_boxes=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, nms=PyNms::ClassAgnostic, max_boxes=100))]
     pub fn decode_yolo_det<'py>(
         py: Python<'py>,
         boxes: ReadOnlyArrayGeneric2,
         quant_boxes: (f64, i64),
         score_threshold: f64,
         iou_threshold: f64,
+        nms: Option<PyNms>,
         max_boxes: usize,
     ) -> PyResult<PyDetOutput<'py>> {
         let mut output_boxes = Vec::with_capacity(max_boxes);
+        let nms: Option<Nms> = nms.map(|py_nms| py_nms.into());
         match boxes {
             ReadOnlyArrayGeneric2::UInt8(output) => edgefirst::decoder::yolo::decode_yolo_det(
                 (output.as_array(), Quantization::from(quant_boxes)),
                 score_threshold as f32,
                 iou_threshold as f32,
+                nms,
                 &mut output_boxes,
             ),
             ReadOnlyArrayGeneric2::Int8(output) => edgefirst::decoder::yolo::decode_yolo_det(
                 (output.as_array(), Quantization::from(quant_boxes)),
                 score_threshold as f32,
                 iou_threshold as f32,
+                nms,
                 &mut output_boxes,
             ),
             ReadOnlyArrayGeneric2::Float32(output) => {
@@ -333,6 +390,7 @@ impl PyDecoder {
                     output.as_array(),
                     score_threshold as f32,
                     iou_threshold as f32,
+                    nms,
                     &mut output_boxes,
                 )
             }
@@ -341,6 +399,7 @@ impl PyDecoder {
                     output.as_array(),
                     score_threshold as f32,
                     iou_threshold as f32,
+                    nms,
                     &mut output_boxes,
                 );
             }
@@ -349,7 +408,7 @@ impl PyDecoder {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (boxes, protos, quant_boxes=(1.0, 0), quant_protos=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
+    #[pyo3(signature = (boxes, protos, quant_boxes=(1.0, 0), quant_protos=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, nms=PyNms::ClassAgnostic, max_boxes=100))]
     pub fn decode_yolo_segdet<'py>(
         py: Python<'py>,
         boxes: ReadOnlyArrayGeneric2,
@@ -358,10 +417,12 @@ impl PyDecoder {
         quant_protos: (f64, i64),
         score_threshold: f64,
         iou_threshold: f64,
+        nms: Option<PyNms>,
         max_boxes: usize,
     ) -> PyResult<PySegDetOutput<'py>> {
         let mut output_boxes = Vec::with_capacity(max_boxes);
         let mut output_masks = Vec::with_capacity(max_boxes);
+        let nms: Option<Nms> = nms.map(|py_nms| py_nms.into());
 
         match (boxes, protos) {
             (ReadOnlyArrayGeneric2::UInt8(boxes), ReadOnlyArrayGeneric3::UInt8(protos)) => {
@@ -370,6 +431,7 @@ impl PyDecoder {
                     (protos.as_array(), Quantization::from(quant_protos)),
                     score_threshold as f32,
                     iou_threshold as f32,
+                    nms,
                     &mut output_boxes,
                     &mut output_masks,
                 );
@@ -380,6 +442,7 @@ impl PyDecoder {
                     (protos.as_array(), Quantization::from(quant_protos)),
                     score_threshold as f32,
                     iou_threshold as f32,
+                    nms,
                     &mut output_boxes,
                     &mut output_masks,
                 );
@@ -390,6 +453,7 @@ impl PyDecoder {
                     protos.as_array(),
                     score_threshold as f32,
                     iou_threshold as f32,
+                    nms,
                     &mut output_boxes,
                     &mut output_masks,
                 );
@@ -400,6 +464,7 @@ impl PyDecoder {
                     protos.as_array(),
                     score_threshold as f32,
                     iou_threshold as f32,
+                    nms,
                     &mut output_boxes,
                     &mut output_masks,
                 );
@@ -681,6 +746,25 @@ impl PyDecoder {
     fn set_iou_threshold(&mut self, value: f32) -> PyResult<()> {
         self.decoder.iou_threshold = value;
         Ok(())
+    }
+
+    /// Get the NMS mode.
+    /// Returns Nms.ClassAgnostic, Nms.ClassAware, or None if NMS is bypassed.
+    #[getter(nms)]
+    fn get_nms(&self) -> Option<PyNms> {
+        self.decoder.nms.map(|nms| nms.into())
+    }
+
+    /// Returns the box coordinate format if known from the model config.
+    ///
+    /// - `True`: Boxes are in normalized [0,1] coordinates
+    /// - `False`: Boxes are in pixel coordinates relative to model input
+    /// - `None`: Unknown, caller must infer (e.g., check if any coordinate > 1.0)
+    ///
+    /// This is determined by the model config's `normalized` field, not the NMS mode.
+    #[getter(normalized_boxes)]
+    fn get_normalized_boxes(&self) -> Option<bool> {
+        self.decoder.normalized_boxes()
     }
 }
 

@@ -12,14 +12,66 @@ use ndarray_stats::QuantileExt;
 use num_traits::{AsPrimitive, Float, PrimInt, Signed};
 
 use crate::{
-    BBoxTypeTrait, BoundingBox, DetectBox, Quantization, Segmentation, XYWH,
+    BBoxTypeTrait, BoundingBox, DetectBox, DetectBoxQuantized, Quantization, Segmentation, XYWH,
     byte::{
-        nms_extra_int, nms_int, postprocess_boxes_index_quant, postprocess_boxes_quant,
-        quantize_score_threshold,
+        nms_class_aware_int, nms_extra_class_aware_int, nms_extra_int, nms_int,
+        postprocess_boxes_index_quant, postprocess_boxes_quant, quantize_score_threshold,
     },
+    configs::Nms,
     dequant_detect_box,
-    float::{nms_extra_float, nms_float, postprocess_boxes_float, postprocess_boxes_index_float},
+    float::{
+        nms_class_aware_float, nms_extra_class_aware_float, nms_extra_float, nms_float,
+        postprocess_boxes_float, postprocess_boxes_index_float,
+    },
 };
+
+/// Dispatches to the appropriate NMS function based on mode for float boxes.
+fn dispatch_nms_float(nms: Option<Nms>, iou: f32, boxes: Vec<DetectBox>) -> Vec<DetectBox> {
+    match nms {
+        Some(Nms::ClassAgnostic) => nms_float(iou, boxes),
+        Some(Nms::ClassAware) => nms_class_aware_float(iou, boxes),
+        None => boxes, // bypass NMS
+    }
+}
+
+/// Dispatches to the appropriate NMS function based on mode for float boxes with extra data.
+fn dispatch_nms_extra_float<E: Send + Sync>(
+    nms: Option<Nms>,
+    iou: f32,
+    boxes: Vec<(DetectBox, E)>,
+) -> Vec<(DetectBox, E)> {
+    match nms {
+        Some(Nms::ClassAgnostic) => nms_extra_float(iou, boxes),
+        Some(Nms::ClassAware) => nms_extra_class_aware_float(iou, boxes),
+        None => boxes, // bypass NMS
+    }
+}
+
+/// Dispatches to the appropriate NMS function based on mode for quantized boxes.
+fn dispatch_nms_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
+    nms: Option<Nms>,
+    iou: f32,
+    boxes: Vec<DetectBoxQuantized<SCORE>>,
+) -> Vec<DetectBoxQuantized<SCORE>> {
+    match nms {
+        Some(Nms::ClassAgnostic) => nms_int(iou, boxes),
+        Some(Nms::ClassAware) => nms_class_aware_int(iou, boxes),
+        None => boxes, // bypass NMS
+    }
+}
+
+/// Dispatches to the appropriate NMS function based on mode for quantized boxes with extra data.
+fn dispatch_nms_extra_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send + Sync>(
+    nms: Option<Nms>,
+    iou: f32,
+    boxes: Vec<(DetectBoxQuantized<SCORE>, E)>,
+) -> Vec<(DetectBoxQuantized<SCORE>, E)> {
+    match nms {
+        Some(Nms::ClassAgnostic) => nms_extra_int(iou, boxes),
+        Some(Nms::ClassAware) => nms_extra_class_aware_int(iou, boxes),
+        None => boxes, // bypass NMS
+    }
+}
 
 /// Decodes YOLO detection outputs from quantized tensors into detection boxes.
 ///
@@ -31,11 +83,12 @@ pub fn decode_yolo_det<BOX: PrimInt + AsPrimitive<f32> + Send + Sync>(
     output: (ArrayView2<BOX>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
+    nms: Option<Nms>,
     output_boxes: &mut Vec<DetectBox>,
 ) where
     f32: AsPrimitive<BOX>,
 {
-    impl_yolo_quant::<XYWH, _>(output, score_threshold, iou_threshold, output_boxes);
+    impl_yolo_quant::<XYWH, _>(output, score_threshold, iou_threshold, nms, output_boxes);
 }
 
 /// Decodes YOLO detection outputs from float tensors into detection boxes.
@@ -48,12 +101,13 @@ pub fn decode_yolo_det_float<T>(
     output: ArrayView2<T>,
     score_threshold: f32,
     iou_threshold: f32,
+    nms: Option<Nms>,
     output_boxes: &mut Vec<DetectBox>,
 ) where
     T: Float + AsPrimitive<f32> + Send + Sync + 'static,
     f32: AsPrimitive<T>,
 {
-    impl_yolo_float::<XYWH, _>(output, score_threshold, iou_threshold, output_boxes);
+    impl_yolo_float::<XYWH, _>(output, score_threshold, iou_threshold, nms, output_boxes);
 }
 
 /// Decodes YOLO detection and segmentation outputs from quantized tensors into
@@ -75,6 +129,7 @@ pub fn decode_yolo_segdet_quant<
     protos: (ArrayView3<PROTO>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
+    nms: Option<Nms>,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
 ) where
@@ -85,6 +140,7 @@ pub fn decode_yolo_segdet_quant<
         protos,
         score_threshold,
         iou_threshold,
+        nms,
         output_boxes,
         output_masks,
     );
@@ -106,6 +162,7 @@ pub fn decode_yolo_segdet_float<T>(
     protos: ArrayView3<T>,
     score_threshold: f32,
     iou_threshold: f32,
+    nms: Option<Nms>,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
 ) where
@@ -117,6 +174,7 @@ pub fn decode_yolo_segdet_float<T>(
         protos,
         score_threshold,
         iou_threshold,
+        nms,
         output_boxes,
         output_masks,
     );
@@ -141,6 +199,7 @@ pub fn decode_yolo_split_det_quant<
     scores: (ArrayView2<SCORE>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
+    nms: Option<Nms>,
     output_boxes: &mut Vec<DetectBox>,
 ) where
     f32: AsPrimitive<SCORE>,
@@ -150,6 +209,7 @@ pub fn decode_yolo_split_det_quant<
         scores,
         score_threshold,
         iou_threshold,
+        nms,
         output_boxes,
     );
 }
@@ -170,6 +230,7 @@ pub fn decode_yolo_split_det_float<T>(
     scores: ArrayView2<T>,
     score_threshold: f32,
     iou_threshold: f32,
+    nms: Option<Nms>,
     output_boxes: &mut Vec<DetectBox>,
 ) where
     T: Float + AsPrimitive<f32> + Send + Sync + 'static,
@@ -180,6 +241,7 @@ pub fn decode_yolo_split_det_float<T>(
         scores,
         score_threshold,
         iou_threshold,
+        nms,
         output_boxes,
     );
 }
@@ -210,6 +272,7 @@ pub fn decode_yolo_split_segdet<
     protos: (ArrayView3<PROTO>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
+    nms: Option<Nms>,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
 ) where
@@ -222,6 +285,7 @@ pub fn decode_yolo_split_segdet<
         protos,
         score_threshold,
         iou_threshold,
+        nms,
         output_boxes,
         output_masks,
     );
@@ -248,6 +312,7 @@ pub fn decode_yolo_split_segdet_float<T>(
     protos: ArrayView3<T>,
     score_threshold: f32,
     iou_threshold: f32,
+    nms: Option<Nms>,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
 ) where
@@ -261,9 +326,172 @@ pub fn decode_yolo_split_segdet_float<T>(
         protos,
         score_threshold,
         iou_threshold,
+        nms,
         output_boxes,
         output_masks,
     );
+}
+
+/// Decodes end-to-end YOLO detection outputs (post-NMS from model).
+///
+/// Input shape: (N, 6+) where columns are [x1, y1, x2, y2, conf, class, ...]
+/// Boxes are output directly without NMS (model already applied NMS).
+///
+/// Coordinates may be normalized [0,1] or pixel values depending on model config.
+/// The caller should check `decoder.normalized_boxes()` to determine which.
+pub fn decode_yolo_end_to_end_det_float<T>(
+    output: ArrayView2<T>,
+    score_threshold: f32,
+    output_boxes: &mut Vec<DetectBox>,
+) where
+    T: Float + AsPrimitive<f32> + Send + Sync + 'static,
+{
+    let num_cols = output.ncols();
+    if num_cols < 6 {
+        // Invalid shape, need at least [x1, y1, x2, y2, conf, class]
+        return;
+    }
+
+    output_boxes.clear();
+    for row in output.rows() {
+        let conf: f32 = row[4].as_();
+        if conf < score_threshold {
+            continue;
+        }
+        if output_boxes.len() >= output_boxes.capacity() {
+            break;
+        }
+        output_boxes.push(crate::DetectBox {
+            bbox: crate::BoundingBox {
+                xmin: row[0].as_(),
+                ymin: row[1].as_(),
+                xmax: row[2].as_(),
+                ymax: row[3].as_(),
+            },
+            score: conf,
+            label: row[5].as_() as usize,
+        });
+    }
+    // No NMS — model output is already post-NMS
+}
+
+/// Decodes end-to-end YOLO detection + segmentation outputs (post-NMS from model).
+///
+/// Input shapes:
+/// - detection: (N, 6 + num_protos) where columns are
+///   [x1, y1, x2, y2, conf, class, mask_coeff_0, ..., mask_coeff_31]
+/// - protos: (proto_height, proto_width, num_protos)
+///
+/// Boxes are output directly without NMS (model already applied NMS).
+/// Coordinates may be normalized [0,1] or pixel values depending on model config.
+pub fn decode_yolo_end_to_end_segdet_float<T>(
+    output: ArrayView2<T>,
+    protos: ArrayView3<T>,
+    score_threshold: f32,
+    output_boxes: &mut Vec<DetectBox>,
+    output_masks: &mut Vec<crate::Segmentation>,
+) where
+    T: Float + AsPrimitive<f32> + Send + Sync + 'static,
+{
+    let num_protos = protos.dim().2;
+    let min_cols = 6 + num_protos;
+    let num_cols = output.ncols();
+    if num_cols < min_cols {
+        // Invalid shape
+        return;
+    }
+
+    output_boxes.clear();
+    output_masks.clear();
+
+    // Collect boxes with mask coefficients
+    let mut boxes_with_masks: Vec<(crate::DetectBox, Vec<f32>)> = Vec::new();
+
+    for row in output.rows() {
+        let conf: f32 = row[4].as_();
+        if conf < score_threshold {
+            continue;
+        }
+        if boxes_with_masks.len() >= output_boxes.capacity() {
+            break;
+        }
+
+        let bbox = crate::BoundingBox {
+            xmin: row[0].as_(),
+            ymin: row[1].as_(),
+            xmax: row[2].as_(),
+            ymax: row[3].as_(),
+        };
+
+        let detect_box = crate::DetectBox {
+            bbox,
+            score: conf,
+            label: row[5].as_() as usize,
+        };
+
+        // Extract mask coefficients
+        let mask_coeffs: Vec<f32> = (6..6 + num_protos).map(|i| row[i].as_()).collect();
+
+        boxes_with_masks.push((detect_box, mask_coeffs));
+    }
+
+    // Generate segmentation masks
+    for (detect_box, mask_coeffs) in boxes_with_masks {
+        let mask_arr = ndarray::Array1::from_vec(mask_coeffs);
+        let (protos_crop, roi) = protobox(&protos, &detect_box.bbox);
+
+        let seg = make_segmentation_from_coeffs(mask_arr.view(), protos_crop.view());
+
+        let final_box = crate::DetectBox {
+            bbox: roi,
+            score: detect_box.score,
+            label: detect_box.label,
+        };
+
+        output_boxes.push(final_box);
+        output_masks.push(crate::Segmentation {
+            xmin: roi.xmin,
+            ymin: roi.ymin,
+            xmax: roi.xmax,
+            ymax: roi.ymax,
+            segmentation: seg,
+        });
+    }
+    // No NMS — model output is already post-NMS
+}
+
+/// Helper to compute segmentation mask from coefficients and protos.
+fn make_segmentation_from_coeffs<T>(
+    mask_coeffs: ArrayView1<f32>,
+    protos: ArrayView3<T>,
+) -> Array3<u8>
+where
+    T: Float + AsPrimitive<f32> + Send + Sync,
+{
+    let shape = protos.shape();
+    let mask = mask_coeffs.to_shape((1, mask_coeffs.len())).unwrap();
+    let protos_2d = protos
+        .to_shape([shape[0] * shape[1], shape[2]])
+        .unwrap();
+    let protos_2d = protos_2d.reversed_axes();
+    let protos_f32 = protos_2d.map(|x| x.as_());
+
+    let result = mask
+        .dot(&protos_f32)
+        .into_shape_with_order((shape[0], shape[1], 1))
+        .unwrap();
+
+    let min = *result.min().unwrap_or(&0.0);
+    let max = *result.max().unwrap_or(&1.0);
+    let max = max.max(-min);
+    let min_val = -max;
+    let range = max - min_val;
+    // Guard against division by zero for uniform masks
+    if range == 0.0 {
+        return result.map(|_| 128u8);
+    }
+    let u8_max = 256.0;
+    result.map(|x| ((*x - min_val) / range * u8_max) as u8)
 }
 
 /// Internal implementation of YOLO decoding for quantized tensors.
@@ -274,6 +502,7 @@ pub fn impl_yolo_quant<B: BBoxTypeTrait, T: PrimInt + AsPrimitive<f32> + Send + 
     output: (ArrayView2<T>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
+    nms: Option<Nms>,
     output_boxes: &mut Vec<DetectBox>,
 ) where
     f32: AsPrimitive<T>,
@@ -291,7 +520,7 @@ pub fn impl_yolo_quant<B: BBoxTypeTrait, T: PrimInt + AsPrimitive<f32> + Send + 
         )
     };
 
-    let boxes = nms_int(iou_threshold, boxes);
+    let boxes = dispatch_nms_int(nms, iou_threshold, boxes);
     let len = output_boxes.capacity().min(boxes.len());
     output_boxes.clear();
     for b in boxes.iter().take(len) {
@@ -307,6 +536,7 @@ pub fn impl_yolo_float<B: BBoxTypeTrait, T: Float + AsPrimitive<f32> + Send + Sy
     output: ArrayView2<T>,
     score_threshold: f32,
     iou_threshold: f32,
+    nms: Option<Nms>,
     output_boxes: &mut Vec<DetectBox>,
 ) where
     f32: AsPrimitive<T>,
@@ -314,7 +544,7 @@ pub fn impl_yolo_float<B: BBoxTypeTrait, T: Float + AsPrimitive<f32> + Send + Sy
     let (boxes_tensor, scores_tensor) = postprocess_yolo(&output);
     let boxes =
         postprocess_boxes_float::<B, _, _>(score_threshold.as_(), boxes_tensor, scores_tensor);
-    let boxes = nms_float(iou_threshold, boxes);
+    let boxes = dispatch_nms_float(nms, iou_threshold, boxes);
     let len = output_boxes.capacity().min(boxes.len());
     output_boxes.clear();
     for b in boxes.into_iter().take(len) {
@@ -340,6 +570,7 @@ pub fn impl_yolo_split_quant<
     scores: (ArrayView2<SCORE>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
+    nms: Option<Nms>,
     output_boxes: &mut Vec<DetectBox>,
 ) where
     f32: AsPrimitive<SCORE>,
@@ -360,7 +591,7 @@ pub fn impl_yolo_split_quant<
         )
     };
 
-    let boxes = nms_int(iou_threshold, boxes);
+    let boxes = dispatch_nms_int(nms, iou_threshold, boxes);
     let len = output_boxes.capacity().min(boxes.len());
     output_boxes.clear();
     for b in boxes.iter().take(len) {
@@ -385,6 +616,7 @@ pub fn impl_yolo_split_float<
     scores_tensor: ArrayView2<SCORE>,
     score_threshold: f32,
     iou_threshold: f32,
+    nms: Option<Nms>,
     output_boxes: &mut Vec<DetectBox>,
 ) where
     f32: AsPrimitive<SCORE>,
@@ -393,7 +625,7 @@ pub fn impl_yolo_split_float<
     let scores_tensor = scores_tensor.reversed_axes();
     let boxes =
         postprocess_boxes_float::<B, _, _>(score_threshold.as_(), boxes_tensor, scores_tensor);
-    let boxes = nms_float(iou_threshold, boxes);
+    let boxes = dispatch_nms_float(nms, iou_threshold, boxes);
     let len = output_boxes.capacity().min(boxes.len());
     output_boxes.clear();
     for b in boxes.into_iter().take(len) {
@@ -419,6 +651,7 @@ pub fn impl_yolo_segdet_quant<
     protos: (ArrayView3<PROTO>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
+    nms: Option<Nms>,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
 ) where
@@ -432,6 +665,7 @@ pub fn impl_yolo_segdet_quant<
         (scores_tensor.reversed_axes(), quant_boxes),
         score_threshold,
         iou_threshold,
+        nms,
         output_boxes.capacity(),
     );
 
@@ -462,6 +696,7 @@ pub fn impl_yolo_segdet_float<
     protos: ArrayView3<PROTO>,
     score_threshold: f32,
     iou_threshold: f32,
+    nms: Option<Nms>,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
 ) where
@@ -474,7 +709,7 @@ pub fn impl_yolo_segdet_float<
         boxes_tensor,
         scores_tensor,
     );
-    let mut boxes = nms_extra_float(iou_threshold, boxes);
+    let mut boxes = dispatch_nms_extra_float(nms, iou_threshold, boxes);
     boxes.truncate(output_boxes.capacity());
     let boxes = decode_segdet_f32(boxes, mask_tensor, protos);
     output_boxes.clear();
@@ -500,6 +735,7 @@ pub(crate) fn impl_yolo_split_segdet_quant_get_boxes<
     scores: (ArrayView2<SCORE>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
+    nms: Option<Nms>,
     max_boxes: usize,
 ) -> Vec<(DetectBox, usize)>
 where
@@ -520,7 +756,7 @@ where
             quant_boxes,
         )
     };
-    let mut boxes = nms_extra_int::<_, _>(iou_threshold, boxes);
+    let mut boxes = dispatch_nms_extra_int(nms, iou_threshold, boxes);
     boxes.truncate(max_boxes);
     boxes
         .into_iter()
@@ -583,6 +819,7 @@ pub fn impl_yolo_split_segdet_quant<
     protos: (ArrayView3<PROTO>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
+    nms: Option<Nms>,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
 ) where
@@ -593,6 +830,7 @@ pub fn impl_yolo_split_segdet_quant<
         scores,
         score_threshold,
         iou_threshold,
+        nms,
         output_boxes.capacity(),
     );
 
@@ -630,6 +868,7 @@ pub fn impl_yolo_split_segdet_float<
     protos: ArrayView3<PROTO>,
     score_threshold: f32,
     iou_threshold: f32,
+    nms: Option<Nms>,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
 ) where
@@ -644,7 +883,7 @@ pub fn impl_yolo_split_segdet_float<
         boxes_tensor,
         scores_tensor,
     );
-    let mut boxes = nms_extra_float(iou_threshold, boxes);
+    let mut boxes = dispatch_nms_extra_float(nms, iou_threshold, boxes);
     boxes.truncate(output_boxes.capacity());
     let boxes = decode_segdet_f32(boxes, mask_tensor, protos);
     output_boxes.clear();

@@ -106,6 +106,7 @@ impl<'a> From<&'a configs::Detection> for ConfigOutputRef<'a> {
     ///     quantization: None,
     ///     shape: vec![1, 84, 8400],
     ///     dshape: Vec::new(),
+    ///     normalized: Some(true),
     /// };
     /// let output: ConfigOutputRef = (&detection_config).into();
     /// ```
@@ -196,6 +197,7 @@ impl<'a> From<&'a configs::Boxes> for ConfigOutputRef<'a> {
     ///     quantization: None,
     ///     shape: vec![1, 4, 8400],
     ///     dshape: Vec::new(),
+    ///     normalized: Some(true),
     /// };
     /// let output: ConfigOutputRef = (&boxes).into();
     /// ```
@@ -234,6 +236,7 @@ impl ConfigOutput {
     ///     quantization: None,
     ///     shape: vec![1, 84, 8400],
     ///     dshape: Vec::new(),
+    ///     normalized: Some(true),
     /// };
     /// let output = ConfigOutput::Detection(detection_config);
     /// assert_eq!(output.shape(), &[1, 84, 8400]);
@@ -261,6 +264,7 @@ impl ConfigOutput {
     ///     quantization: None,
     ///     shape: vec![1, 84, 8400],
     ///     dshape: Vec::new(),
+    ///     normalized: Some(true),
     /// };
     /// let output = ConfigOutput::Detection(detection_config);
     /// assert_eq!(output.decoder(), &configs::DecoderType::Ultralytics);
@@ -288,10 +292,11 @@ impl ConfigOutput {
     ///   quantization: Some(configs::QuantTuple(0.012345, 26)),
     ///   shape: vec![1, 84, 8400],
     ///   dshape: Vec::new(),
+    ///   normalized: Some(true),
     /// };
     /// let output = ConfigOutput::Detection(detection_config);
     /// assert_eq!(output.quantization(),
-    /// Some(configs::QuantTuple(0.012345,26))); ```  
+    /// Some(configs::QuantTuple(0.012345,26))); ```
     pub fn quantization(&self) -> Option<QuantTuple> {
         match self {
             ConfigOutput::Detection(detection) => detection.quantization,
@@ -379,6 +384,12 @@ pub mod configs {
         // pub channels_first: bool,
         #[serde(default)]
         pub dshape: Vec<(DimName, usize)>,
+        /// Whether box coordinates are normalized to [0,1] range.
+        /// - `Some(true)`: Coordinates in [0,1] range relative to model input
+        /// - `Some(false)`: Pixel coordinates relative to model input (letterboxed)
+        /// - `None`: Unknown, caller must infer (e.g., check if any coordinate > 1.0)
+        #[serde(default)]
+        pub normalized: Option<bool>,
     }
 
     #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
@@ -401,6 +412,12 @@ pub mod configs {
         // pub channels_first: bool,
         #[serde(default)]
         pub dshape: Vec<(DimName, usize)>,
+        /// Whether box coordinates are normalized to [0,1] range.
+        /// - `Some(true)`: Coordinates in [0,1] range relative to model input
+        /// - `Some(false)`: Pixel coordinates relative to model input (letterboxed)
+        /// - `None`: Unknown, caller must infer (e.g., check if any coordinate > 1.0)
+        #[serde(default)]
+        pub normalized: Option<bool>,
     }
 
     #[derive(Debug, PartialEq, Serialize, Deserialize, Clone, Copy, Hash, Eq)]
@@ -461,6 +478,24 @@ pub mod configs {
         Ultralytics,
     }
 
+    /// NMS (Non-Maximum Suppression) mode for filtering overlapping detections.
+    ///
+    /// This enum is used with `Option<Nms>`:
+    /// - `Some(Nms::ClassAgnostic)` — class-agnostic NMS (default): suppress overlapping boxes
+    ///   regardless of class label
+    /// - `Some(Nms::ClassAware)` — class-aware NMS: only suppress boxes that share the same
+    ///   class label AND overlap above the IoU threshold
+    /// - `None` — bypass NMS entirely (for end-to-end models with embedded NMS)
+    #[derive(Debug, PartialEq, Serialize, Deserialize, Clone, Copy, Hash, Eq, Default)]
+    #[serde(rename_all = "snake_case")]
+    pub enum Nms {
+        /// Suppress overlapping boxes regardless of class label (default HAL behavior)
+        #[default]
+        ClassAgnostic,
+        /// Only suppress boxes with the same class label that overlap
+        ClassAware,
+    }
+
     #[derive(Debug, Clone, PartialEq)]
     pub enum ModelType {
         ModelPackSegDet {
@@ -499,6 +534,15 @@ pub mod configs {
             mask_coeff: MaskCoefficients,
             protos: Protos,
         },
+        /// End-to-end YOLO detection (post-NMS output from model)
+        /// Input shape: (1, N, 6+) where columns are [x1, y1, x2, y2, conf, class, ...]
+        YoloEndToEndDet,
+        /// End-to-end YOLO detection + segmentation (post-NMS output from model)
+        /// Input shape: (1, N, 6 + num_protos) where columns are
+        /// [x1, y1, x2, y2, conf, class, mask_coeff_0, ..., mask_coeff_31]
+        YoloEndToEndSegDet {
+            protos: Protos,
+        },
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -525,6 +569,8 @@ pub struct DecoderBuilder {
     config_src: Option<ConfigSource>,
     iou_threshold: f32,
     score_threshold: f32,
+    /// NMS mode: Some(mode) applies NMS, None bypasses NMS (for end-to-end models)
+    nms: Option<configs::Nms>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -559,6 +605,7 @@ impl Default for DecoderBuilder {
             config_src: None,
             iou_threshold: 0.5,
             score_threshold: 0.5,
+            nms: Some(configs::Nms::ClassAgnostic),
         }
     }
 }
@@ -664,6 +711,7 @@ impl DecoderBuilder {
     ///         quantization: Some(configs::QuantTuple(0.012345, 26)),
     ///         shape: vec![1, 84, 8400],
     ///         dshape: Vec::new(),
+    ///         normalized: Some(true),
     ///     })
     ///     .build()?;
     ///
@@ -690,6 +738,7 @@ impl DecoderBuilder {
     ///     quantization: Some(configs::QuantTuple(0.012345, 26)),
     ///     shape: vec![1, 4, 8400],
     ///     dshape: Vec::new(),
+    ///     normalized: Some(true),
     /// };
     /// let scores_config = configs::Scores {
     ///     decoder: configs::DecoderType::Ultralytics,
@@ -728,6 +777,7 @@ impl DecoderBuilder {
     ///     shape: vec![1, 116, 8400],
     ///     anchors: None,
     ///     dshape: Vec::new(),
+    ///     normalized: Some(true),
     /// };
     /// let protos_config = configs::Protos {
     ///     decoder: configs::DecoderType::Ultralytics,
@@ -765,6 +815,7 @@ impl DecoderBuilder {
     ///     quantization: Some(configs::QuantTuple(0.012345, 26)),
     ///     shape: vec![1, 4, 8400],
     ///     dshape: Vec::new(),
+    ///     normalized: Some(true),
     /// };
     /// let scores_config = configs::Scores {
     ///     decoder: configs::DecoderType::Ultralytics,
@@ -821,6 +872,7 @@ impl DecoderBuilder {
     ///     quantization: Some(configs::QuantTuple(0.012345, 26)),
     ///     shape: vec![1, 8400, 1, 4],
     ///     dshape: Vec::new(),
+    ///     normalized: Some(true),
     /// };
     /// let scores_config = configs::Scores {
     ///     decoder: configs::DecoderType::ModelPack,
@@ -863,6 +915,7 @@ impl DecoderBuilder {
     ///     quantization: Some(configs::QuantTuple(0.012345, 26)),
     ///     shape: vec![1, 17, 30, 18],
     ///     dshape: Vec::new(),
+    ///     normalized: Some(true),
     /// };
     /// let config1 = configs::Detection {
     ///     anchors: Some(vec![
@@ -874,6 +927,7 @@ impl DecoderBuilder {
     ///     quantization: Some(configs::QuantTuple(0.0064123, -31)),
     ///     shape: vec![1, 9, 15, 18],
     ///     dshape: Vec::new(),
+    ///     normalized: Some(true),
     /// };
     ///
     /// let decoder = DecoderBuilder::new()
@@ -901,6 +955,7 @@ impl DecoderBuilder {
     ///     quantization: Some(configs::QuantTuple(0.012345, 26)),
     ///     shape: vec![1, 8400, 1, 4],
     ///     dshape: Vec::new(),
+    ///     normalized: Some(true),
     /// };
     /// let scores_config = configs::Scores {
     ///     decoder: configs::DecoderType::ModelPack,
@@ -954,6 +1009,7 @@ impl DecoderBuilder {
     ///     quantization: Some(configs::QuantTuple(0.08547406643629074, 174)),
     ///     shape: vec![1, 9, 15, 18],
     ///     dshape: Vec::new(),
+    ///     normalized: Some(true),
     /// };
     /// let config1 = configs::Detection {
     ///     anchors: Some(vec![
@@ -965,6 +1021,7 @@ impl DecoderBuilder {
     ///     quantization: Some(configs::QuantTuple(0.09929127991199493, 183)),
     ///     shape: vec![1, 17, 30, 18],
     ///     dshape: Vec::new(),
+    ///     normalized: Some(true),
     /// };
     /// let seg_config = configs::Segmentation {
     ///     decoder: configs::DecoderType::ModelPack,
@@ -1060,6 +1117,32 @@ impl DecoderBuilder {
         self
     }
 
+    /// Sets the NMS mode for the decoder.
+    ///
+    /// - `Some(Nms::ClassAgnostic)` — class-agnostic NMS (default): suppress overlapping
+    ///   boxes regardless of class label
+    /// - `Some(Nms::ClassAware)` — class-aware NMS: only suppress boxes that share the
+    ///   same class label AND overlap above the IoU threshold
+    /// - `None` — bypass NMS entirely (for end-to-end models with embedded NMS)
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult, configs::Nms};
+    /// # fn main() -> DecoderResult<()> {
+    /// # let config_json = include_str!("../../../testdata/modelpack_split.json").to_string();
+    /// let decoder = DecoderBuilder::new()
+    ///     .with_config_json_str(config_json)
+    ///     .with_nms(Some(Nms::ClassAware))
+    ///     .build()?;
+    /// assert_eq!(decoder.nms, Some(Nms::ClassAware));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_nms(mut self, nms: Option<configs::Nms>) -> Self {
+        self.nms = nms;
+        self
+    }
+
     /// Builds the decoder with the given settings. If the config is a JSON or
     /// YAML string, this will deserialize the JSON or YAML and then parse the
     /// configuration information.
@@ -1083,15 +1166,39 @@ impl DecoderBuilder {
             Some(ConfigSource::Config(c)) => c,
             None => return Err(DecoderError::NoConfig),
         };
-        let model_type = Self::get_model_type(config.outputs)?;
+
+        // Extract normalized flag from config outputs
+        let normalized = Self::get_normalized(&config.outputs);
+
+        let model_type = Self::get_model_type(config.outputs, self.nms)?;
         Ok(Decoder {
             model_type,
             iou_threshold: self.iou_threshold,
             score_threshold: self.score_threshold,
+            nms: self.nms,
+            normalized,
         })
     }
 
-    fn get_model_type(configs: Vec<ConfigOutput>) -> Result<ModelType, DecoderError> {
+    /// Extracts the normalized flag from config outputs.
+    /// - `Some(true)`: Boxes are in normalized [0,1] coordinates
+    /// - `Some(false)`: Boxes are in pixel coordinates
+    /// - `None`: Unknown (not specified in config), caller must infer
+    fn get_normalized(outputs: &[ConfigOutput]) -> Option<bool> {
+        for output in outputs {
+            match output {
+                ConfigOutput::Detection(det) => return det.normalized,
+                ConfigOutput::Boxes(boxes) => return boxes.normalized,
+                _ => {}
+            }
+        }
+        None // not specified
+    }
+
+    fn get_model_type(
+        configs: Vec<ConfigOutput>,
+        nms: Option<configs::Nms>,
+    ) -> Result<ModelType, DecoderError> {
         // yolo or modelpack
         let mut yolo = false;
         let mut modelpack = false;
@@ -1106,14 +1213,17 @@ impl DecoderBuilder {
                 "Both ModelPack and Yolo outputs found in config".to_string(),
             )),
             (true, false) => Self::get_model_type_modelpack(configs),
-            (false, true) => Self::get_model_type_yolo(configs),
+            (false, true) => Self::get_model_type_yolo(configs, nms),
             (false, false) => Err(DecoderError::InvalidConfig(
                 "No outputs found in config".to_string(),
             )),
         }
     }
 
-    fn get_model_type_yolo(configs: Vec<ConfigOutput>) -> Result<ModelType, DecoderError> {
+    fn get_model_type_yolo(
+        configs: Vec<ConfigOutput>,
+        nms: Option<configs::Nms>,
+    ) -> Result<ModelType, DecoderError> {
         let mut boxes = None;
         let mut protos = None;
         let mut split_boxes = None;
@@ -1136,6 +1246,16 @@ impl DecoderBuilder {
                 ConfigOutput::Scores(scores) => split_scores = Some(scores),
                 ConfigOutput::Boxes(boxes) => split_boxes = Some(boxes),
                 ConfigOutput::MaskCoefficients(mask_coeff) => split_mask_coeff = Some(mask_coeff),
+            }
+        }
+
+        // When NMS is bypassed (nms=None), use end-to-end model types
+        if nms.is_none() {
+            // End-to-end models: detection output contains post-NMS boxes
+            if let Some(protos) = protos {
+                return Ok(ModelType::YoloEndToEndSegDet { protos });
+            } else {
+                return Ok(ModelType::YoloEndToEndDet);
             }
         }
 
@@ -1230,8 +1350,8 @@ impl DecoderBuilder {
         )?;
 
         let protos_count = Self::get_protos_count(&protos.dshape).unwrap_or(protos.shape[3]);
-        println!("Protos count: {}", protos_count);
-        println!("Detection dshape: {:?}", detection.dshape);
+        log::debug!("Protos count: {}", protos_count);
+        log::debug!("Detection dshape: {:?}", detection.dshape);
         let classes = if !detection.dshape.is_empty() {
             Self::get_class_count(&detection.dshape, Some(protos_count), None)?
         } else {
@@ -1817,6 +1937,13 @@ pub struct Decoder {
     model_type: ModelType,
     pub iou_threshold: f32,
     pub score_threshold: f32,
+    /// NMS mode: Some(mode) applies NMS, None bypasses NMS (for end-to-end models)
+    pub nms: Option<configs::Nms>,
+    /// Whether decoded boxes are in normalized [0,1] coordinates.
+    /// - `Some(true)`: Coordinates in [0,1] range
+    /// - `Some(false)`: Pixel coordinates
+    /// - `None`: Unknown, caller must infer (e.g., check if any coordinate > 1.0)
+    normalized: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -1963,6 +2090,34 @@ impl Decoder {
         &self.model_type
     }
 
+    /// Returns the box coordinate format if known from the model config.
+    ///
+    /// - `Some(true)`: Boxes are in normalized [0,1] coordinates
+    /// - `Some(false)`: Boxes are in pixel coordinates relative to model input
+    /// - `None`: Unknown, caller must infer (e.g., check if any coordinate > 1.0)
+    ///
+    /// This is determined by the model config's `normalized` field, not the NMS mode.
+    /// When coordinates are in pixels or unknown, the caller may need to normalize
+    /// using the model input dimensions.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
+    /// # fn main() -> DecoderResult<()> {
+    /// #    let config_yaml = include_str!("../../../testdata/modelpack_split.yaml").to_string();
+    ///     let decoder = DecoderBuilder::default()
+    ///         .with_config_yaml_str(config_yaml)
+    ///         .build()?;
+    ///     // Config doesn't specify normalized, so it's None
+    ///     assert!(decoder.normalized_boxes().is_none());
+    /// #    Ok(())
+    /// # }
+    /// ```
+    pub fn normalized_boxes(&self) -> Option<bool> {
+        self.normalized
+    }
+
     /// This function decodes quantized model outputs into detection boxes and
     /// segmentation masks. The quantized outputs can be of u8, i8, u16, i16,
     /// u32, or i32 types. Up to `output_boxes.capacity()` boxes and masks
@@ -2072,6 +2227,11 @@ impl Decoder {
                 output_boxes,
                 output_masks,
             ),
+            ModelType::YoloEndToEndDet | ModelType::YoloEndToEndSegDet { .. } => {
+                Err(DecoderError::InvalidConfig(
+                    "End-to-end models require float decode, not quantized".to_string(),
+                ))
+            }
         }
     }
 
@@ -2104,6 +2264,7 @@ impl Decoder {
     ///         shape: vec![1, 84, 8400],
     ///         anchors: None,
     ///         dshape: Vec::new(),
+    ///         normalized: Some(true),
     ///     })
     ///     .with_score_threshold(0.25)
     ///     .with_iou_threshold(0.7)
@@ -2186,6 +2347,17 @@ impl Decoder {
                     boxes,
                     scores,
                     mask_coeff,
+                    protos,
+                    output_boxes,
+                    output_masks,
+                )?;
+            }
+            ModelType::YoloEndToEndDet => {
+                self.decode_yolo_end_to_end_det_float(outputs, output_boxes)?;
+            }
+            ModelType::YoloEndToEndSegDet { protos } => {
+                self.decode_yolo_end_to_end_segdet_float(
+                    outputs,
                     protos,
                     output_boxes,
                     output_masks,
@@ -2356,6 +2528,7 @@ impl Decoder {
                 (boxes_tensor, quant_boxes),
                 self.score_threshold,
                 self.iou_threshold,
+                self.nms,
                 output_boxes,
             );
         });
@@ -2397,6 +2570,7 @@ impl Decoder {
                     (protos_tensor, quant_protos),
                     self.score_threshold,
                     self.iou_threshold,
+                    self.nms,
                     output_boxes,
                     output_masks,
                 );
@@ -2438,6 +2612,7 @@ impl Decoder {
                     (scores_tensor, quant_scores),
                     self.score_threshold,
                     self.iou_threshold,
+                    self.nms,
                     output_boxes,
                 );
             });
@@ -2503,6 +2678,7 @@ impl Decoder {
                     (scores_tensor, quant_scores),
                     self.score_threshold,
                     self.iou_threshold,
+                    self.nms,
                     output_boxes.capacity(),
                 )
             })
@@ -2642,6 +2818,7 @@ impl Decoder {
             boxes_tensor,
             self.score_threshold,
             self.iou_threshold,
+            self.nms,
             output_boxes,
         );
         Ok(())
@@ -2673,6 +2850,7 @@ impl Decoder {
             protos_tensor,
             self.score_threshold,
             self.iou_threshold,
+            self.nms,
             output_boxes,
             output_masks,
         );
@@ -2704,6 +2882,7 @@ impl Decoder {
             scores_tensor,
             self.score_threshold,
             self.iou_threshold,
+            self.nms,
             output_boxes,
         );
         Ok(())
@@ -2752,6 +2931,104 @@ impl Decoder {
             protos_tensor,
             self.score_threshold,
             self.iou_threshold,
+            self.nms,
+            output_boxes,
+            output_masks,
+        );
+        Ok(())
+    }
+
+    /// Decodes end-to-end YOLO detection outputs (post-NMS from model).
+    ///
+    /// Input shape: (1, N, 6+) where columns are [x1, y1, x2, y2, conf, class, ...]
+    /// Boxes are output directly from model (may be normalized or pixel coords
+    /// depending on config).
+    fn decode_yolo_end_to_end_det_float<T>(
+        &self,
+        outputs: &[ArrayViewD<T>],
+        output_boxes: &mut Vec<DetectBox>,
+    ) -> Result<(), DecoderError>
+    where
+        T: Float + AsPrimitive<f32> + Send + Sync + 'static,
+    {
+        if outputs.is_empty() {
+            return Err(DecoderError::InvalidShape(
+                "End-to-end detection requires at least one output".to_string(),
+            ));
+        }
+
+        let output = &outputs[0];
+        let shape = output.shape();
+
+        // Expect shape (1, N, 6+) or (N, 6+)
+        let output_2d = if shape.len() == 3 {
+            output.slice(s![0, .., ..])
+        } else if shape.len() == 2 {
+            output.slice(s![.., ..])
+        } else {
+            return Err(DecoderError::InvalidShape(format!(
+                "End-to-end detection expects shape (1, N, 6+) or (N, 6+), got {:?}",
+                shape
+            )));
+        };
+
+        crate::yolo::decode_yolo_end_to_end_det_float(
+            output_2d,
+            self.score_threshold,
+            output_boxes,
+        );
+        Ok(())
+    }
+
+    /// Decodes end-to-end YOLO detection + segmentation outputs (post-NMS from model).
+    ///
+    /// Input shapes:
+    /// - detection: (1, N, 6 + num_protos) where columns are
+    ///   [x1, y1, x2, y2, conf, class, mask_coeff_0, ..., mask_coeff_31]
+    /// - protos: (1, proto_height, proto_width, num_protos)
+    fn decode_yolo_end_to_end_segdet_float<T>(
+        &self,
+        outputs: &[ArrayViewD<T>],
+        protos_config: &configs::Protos,
+        output_boxes: &mut Vec<DetectBox>,
+        output_masks: &mut Vec<Segmentation>,
+    ) -> Result<(), DecoderError>
+    where
+        T: Float + AsPrimitive<f32> + Send + Sync + 'static,
+    {
+        if outputs.len() < 2 {
+            return Err(DecoderError::InvalidShape(
+                "End-to-end segdet requires detection and protos outputs".to_string(),
+            ));
+        }
+
+        // Find detection output (not matching protos shape)
+        let (protos_tensor, protos_ind) =
+            Self::find_outputs_with_shape(&protos_config.shape, outputs, &[])?;
+        let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos_config.into());
+        let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
+
+        // Detection is the other output
+        let det_ind = if protos_ind == 0 { 1 } else { 0 };
+        let output = &outputs[det_ind];
+        let shape = output.shape();
+
+        // Expect shape (1, N, 6+num_protos) or (N, 6+num_protos)
+        let output_2d = if shape.len() == 3 {
+            output.slice(s![0, .., ..])
+        } else if shape.len() == 2 {
+            output.slice(s![.., ..])
+        } else {
+            return Err(DecoderError::InvalidShape(format!(
+                "End-to-end segdet detection expects shape (1, N, 6+) or (N, 6+), got {:?}",
+                shape
+            )));
+        };
+
+        crate::yolo::decode_yolo_end_to_end_segdet_float(
+            output_2d,
+            protos_tensor,
+            self.score_threshold,
             output_boxes,
             output_masks,
         );
@@ -3075,6 +3352,7 @@ mod decoder_builder_tests {
                         (DimName::BoxCoords, 4),
                         (DimName::NumBoxes, 8400),
                     ],
+                    normalized: Some(true),
                 },
                 configs::Scores {
                     decoder: configs::DecoderType::ModelPack,
@@ -3109,6 +3387,7 @@ mod decoder_builder_tests {
                         (DimName::NumBoxes, 8400),
                         (DimName::Batch, 1),
                     ],
+                    normalized: Some(true),
                 },
                 configs::Protos {
                     decoder: configs::DecoderType::Ultralytics,
@@ -3188,6 +3467,7 @@ mod decoder_builder_tests {
                     (DimName::NumBoxes, 8400),
                     (DimName::Batch, 1),
                 ],
+                normalized: Some(true),
             })
             .build();
 
@@ -3205,6 +3485,7 @@ mod decoder_builder_tests {
                     (DimName::NumBoxes, 8400),
                     (DimName::NumFeatures, 3),
                 ],
+                normalized: Some(true),
             })
             .build();
 
@@ -3218,6 +3499,7 @@ mod decoder_builder_tests {
                 quantization: None,
                 shape: vec![1, 3, 8400], // Invalid shape
                 dshape: Vec::new(),
+                normalized: Some(true),
             })
             .build();
 
@@ -3240,6 +3522,7 @@ mod decoder_builder_tests {
                         (DimName::NumBoxes, 8400),
                         (DimName::Batch, 1),
                     ],
+                    normalized: Some(true),
                 },
                 configs::Protos {
                     decoder: configs::DecoderType::Ultralytics,
@@ -3270,6 +3553,7 @@ mod decoder_builder_tests {
                         (DimName::NumFeatures, 85),
                         (DimName::NumBoxes, 8400),
                     ],
+                    normalized: Some(true),
                 },
                 configs::Protos {
                     decoder: configs::DecoderType::Ultralytics,
@@ -3301,6 +3585,7 @@ mod decoder_builder_tests {
                         (DimName::NumBoxes, 8400),
                         (DimName::NumFeatures, 36),
                     ],
+                    normalized: Some(true),
                 },
                 configs::Protos {
                     decoder: configs::DecoderType::Ultralytics,
@@ -3334,6 +3619,7 @@ mod decoder_builder_tests {
                         (DimName::NumBoxes, 8400),
                         (DimName::Batch, 1),
                     ],
+                    normalized: Some(true),
                 },
                 configs::Scores {
                     decoder: configs::DecoderType::Ultralytics,
@@ -3362,6 +3648,7 @@ mod decoder_builder_tests {
                         (DimName::BoxCoords, 4),
                         (DimName::NumBoxes, 8400),
                     ],
+                    normalized: Some(true),
                 },
                 configs::Scores {
                     decoder: configs::DecoderType::Ultralytics,
@@ -3391,6 +3678,7 @@ mod decoder_builder_tests {
                         (DimName::NumBoxes, 8400),
                         (DimName::BoxCoords, 4),
                     ],
+                    normalized: Some(true),
                 },
                 configs::Scores {
                     decoder: configs::DecoderType::Ultralytics,
@@ -3419,6 +3707,7 @@ mod decoder_builder_tests {
                         (DimName::BoxCoords, 5),
                         (DimName::NumBoxes, 8400),
                     ],
+                    normalized: Some(true),
                 },
                 configs::Scores {
                     decoder: configs::DecoderType::Ultralytics,
@@ -3450,6 +3739,7 @@ mod decoder_builder_tests {
                         (DimName::BoxCoords, 4),
                         (DimName::Batch, 1),
                     ],
+                    normalized: Some(true),
                 },
                 configs::Scores {
                     decoder: configs::DecoderType::Ultralytics,
@@ -3500,6 +3790,7 @@ mod decoder_builder_tests {
                         (DimName::NumBoxes, 8400),
                         (DimName::BoxCoords, 4),
                     ],
+                    normalized: Some(true),
                 },
                 configs::Scores {
                     decoder: configs::DecoderType::Ultralytics,
@@ -3550,6 +3841,7 @@ mod decoder_builder_tests {
                         (DimName::NumBoxes, 8400),
                         (DimName::BoxCoords, 4),
                     ],
+                    normalized: Some(true),
                 },
                 configs::Scores {
                     decoder: configs::DecoderType::Ultralytics,
@@ -3600,6 +3892,7 @@ mod decoder_builder_tests {
                         (DimName::NumBoxes, 8400),
                         (DimName::BoxCoords, 4),
                     ],
+                    normalized: Some(true),
                 },
                 configs::Scores {
                     decoder: configs::DecoderType::Ultralytics,
@@ -3650,6 +3943,7 @@ mod decoder_builder_tests {
                         (DimName::NumBoxes, 8400),
                         (DimName::BoxCoords, 4),
                     ],
+                    normalized: Some(true),
                 },
                 configs::Scores {
                     decoder: configs::DecoderType::Ultralytics,
@@ -3699,6 +3993,7 @@ mod decoder_builder_tests {
                         (DimName::NumBoxes, 8400),
                         (DimName::BoxCoords, 4),
                     ],
+                    normalized: Some(true),
                 },
                 configs::Scores {
                     decoder: configs::DecoderType::Ultralytics,
@@ -3748,6 +4043,7 @@ mod decoder_builder_tests {
                         (DimName::NumBoxes, 8400),
                         (DimName::BoxCoords, 4),
                     ],
+                    normalized: Some(true),
                 },
                 configs::Scores {
                     decoder: configs::DecoderType::Ultralytics,
@@ -3802,6 +4098,7 @@ mod decoder_builder_tests {
                             (DimName::Padding, 1),
                             (DimName::BoxCoords, 4),
                         ],
+                        normalized: Some(true),
                     }),
                     ConfigOutput::Scores(configs::Scores {
                         decoder: configs::DecoderType::ModelPack,
@@ -3843,6 +4140,7 @@ mod decoder_builder_tests {
                             (DimName::Padding, 1),
                             (DimName::BoxCoords, 4),
                         ],
+                        normalized: Some(true),
                     }),
                     ConfigOutput::Scores(configs::Scores {
                         decoder: configs::DecoderType::ModelPack,
@@ -3883,6 +4181,7 @@ mod decoder_builder_tests {
                         (DimName::Padding, 1),
                         (DimName::BoxCoords, 4),
                     ],
+                    normalized: Some(true),
                 })],
             })
             .build();
@@ -3904,6 +4203,7 @@ mod decoder_builder_tests {
                         (DimName::BoxCoords, 4),
                         (DimName::NumBoxes, 8400),
                     ],
+                    normalized: Some(true),
                 },
                 configs::Scores {
                     decoder: DecoderType::ModelPack,
@@ -3933,6 +4233,7 @@ mod decoder_builder_tests {
                         (DimName::Padding, 1),
                         (DimName::NumBoxes, 8400),
                     ],
+                    normalized: Some(true),
                 },
                 configs::Scores {
                     decoder: DecoderType::ModelPack,
@@ -3963,6 +4264,7 @@ mod decoder_builder_tests {
                         (DimName::Padding, 2),
                         (DimName::NumBoxes, 8400),
                     ],
+                    normalized: Some(true),
                 },
                 configs::Scores {
                     decoder: DecoderType::ModelPack,
@@ -3991,6 +4293,7 @@ mod decoder_builder_tests {
                         (DimName::Padding, 1),
                         (DimName::NumBoxes, 8400),
                     ],
+                    normalized: Some(true),
                 },
                 configs::Scores {
                     decoder: DecoderType::ModelPack,
@@ -4020,6 +4323,7 @@ mod decoder_builder_tests {
                         (DimName::Padding, 1),
                         (DimName::NumBoxes, 8400),
                     ],
+                    normalized: Some(true),
                 },
                 configs::Scores {
                     decoder: DecoderType::ModelPack,
@@ -4053,6 +4357,7 @@ mod decoder_builder_tests {
                         (DimName::Width, 30),
                         (DimName::NumAnchorsXFeatures, 18),
                     ],
+                    normalized: Some(true),
                 },
                 configs::Detection {
                     decoder: DecoderType::ModelPack,
@@ -4065,6 +4370,7 @@ mod decoder_builder_tests {
                         (DimName::Width, 15),
                         (DimName::NumAnchorsXFeatures, 18),
                     ],
+                    normalized: Some(true),
                 },
             ])
             .build();
@@ -4079,6 +4385,7 @@ mod decoder_builder_tests {
                 anchors: None,
                 quantization: None,
                 dshape: Vec::new(),
+                normalized: Some(true),
             }])
             .build();
 
@@ -4097,6 +4404,7 @@ mod decoder_builder_tests {
                     (DimName::Width, 30),
                     (DimName::NumAnchorsXFeatures, 18),
                 ],
+                normalized: Some(true),
             }])
             .build();
 
@@ -4120,6 +4428,7 @@ mod decoder_builder_tests {
                     (DimName::NumAnchorsXFeatures, 18),
                     (DimName::Padding, 1),
                 ],
+                normalized: Some(true),
             }])
             .build();
 
@@ -4142,6 +4451,7 @@ mod decoder_builder_tests {
                     (DimName::Height, 17),
                     (DimName::Width, 30),
                 ],
+                normalized: Some(true),
             }])
             .build();
 
@@ -4159,6 +4469,7 @@ mod decoder_builder_tests {
                 ]),
                 quantization: None,
                 dshape: Vec::new(),
+                normalized: Some(true),
             }])
             .build();
 
@@ -4181,6 +4492,7 @@ mod decoder_builder_tests {
                     (DimName::Height, 17),
                     (DimName::Width, 30),
                 ],
+                normalized: Some(true),
             }])
             .build();
 
@@ -4198,6 +4510,7 @@ mod decoder_builder_tests {
                 ]),
                 quantization: None,
                 dshape: Vec::new(),
+                normalized: Some(true),
             }])
             .build();
 
@@ -4220,6 +4533,7 @@ mod decoder_builder_tests {
                     (DimName::Height, 17),
                     (DimName::Width, 30),
                 ],
+                normalized: Some(true),
             }])
             .build();
         assert!(matches!(
@@ -4242,6 +4556,7 @@ mod decoder_builder_tests {
                         (DimName::Width, 30),
                         (DimName::NumAnchorsXFeatures, 18),
                     ],
+                    normalized: Some(true),
                 },
                 configs::Detection {
                     decoder: DecoderType::ModelPack,
@@ -4258,6 +4573,7 @@ mod decoder_builder_tests {
                         (DimName::Width, 30),
                         (DimName::NumAnchorsXFeatures, 21),
                     ],
+                    normalized: Some(true),
                 },
             ])
             .build();
@@ -4277,6 +4593,7 @@ mod decoder_builder_tests {
                     ]),
                     quantization: None,
                     dshape: vec![],
+                    normalized: Some(true),
                 },
                 configs::Detection {
                     decoder: DecoderType::ModelPack,
@@ -4288,6 +4605,7 @@ mod decoder_builder_tests {
                     ]),
                     quantization: None,
                     dshape: vec![],
+                    normalized: Some(true),
                 },
             ])
             .build();
@@ -4331,6 +4649,7 @@ mod decoder_builder_tests {
                         (DimName::Padding, 1),
                         (DimName::NumBoxes, 8400),
                     ],
+                    normalized: Some(true),
                 },
                 configs::Scores {
                     decoder: DecoderType::ModelPack,
@@ -4379,6 +4698,7 @@ mod decoder_builder_tests {
                         (DimName::Width, 30),
                         (DimName::NumAnchorsXFeatures, 18),
                     ],
+                    normalized: Some(true),
                 }],
                 configs::Segmentation {
                     decoder: DecoderType::ModelPack,
@@ -4419,6 +4739,7 @@ mod decoder_builder_tests {
                     (DimName::NumFeatures, 85),
                     (DimName::NumBoxes, 8400),
                 ],
+                normalized: Some(true),
             })
             .with_score_threshold(score_threshold)
             .with_iou_threshold(iou_threshold)
@@ -4456,6 +4777,7 @@ mod decoder_builder_tests {
                     (DimName::NumBoxes, 8400),
                     (DimName::NumFeatures, 85),
                 ],
+                normalized: Some(true),
             }),
             ConfigOutput::Mask(configs::Mask {
                 decoder: configs::DecoderType::Ultralytics,
@@ -4498,6 +4820,7 @@ mod decoder_builder_tests {
                     (DimName::NumBoxes, 8400),
                     (DimName::BoxCoords, 4),
                 ],
+                normalized: Some(true),
             }),
             ConfigOutput::Protos(configs::Protos {
                 decoder: configs::DecoderType::Ultralytics,
