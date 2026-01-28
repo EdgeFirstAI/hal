@@ -9,10 +9,13 @@ use edgefirst::decoder::{
 
 /// NMS (Non-Maximum Suppression) mode for filtering overlapping detections.
 ///
-/// - `ClassAgnostic` — suppress overlapping boxes regardless of class label (default)
-/// - `ClassAware` — only suppress boxes that share the same class label AND overlap
+/// - `ClassAgnostic` — suppress overlapping boxes regardless of class label
+///   (default)
+/// - `ClassAware` — only suppress boxes that share the same class label AND
+///   overlap
 ///
-/// Pass `None` to bypass NMS entirely (for end-to-end models with embedded NMS).
+/// Pass `None` to bypass NMS entirely (for end-to-end models with embedded
+/// NMS).
 #[pyo3::pyclass(name = "Nms", eq, eq_int)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PyNms {
@@ -210,9 +213,10 @@ impl PyDecoder {
     ///
     /// Args:
     ///     config: Model output configuration dictionary
-    ///     score_threshold: Score threshold for filtering detections (default: 0.1)
-    ///     iou_threshold: IoU threshold for NMS (default: 0.7)
-    ///     nms: NMS mode - Nms.ClassAgnostic (default), Nms.ClassAware, or None to bypass NMS
+    ///     score_threshold: Score threshold for filtering detections (default:
+    /// 0.1)     iou_threshold: IoU threshold for NMS (default: 0.7)
+    ///     nms: NMS mode - Nms.ClassAgnostic (default), Nms.ClassAware, or None
+    /// to bypass NMS
     #[new]
     #[pyo3(signature = (config, score_threshold=0.1, iou_threshold=0.7, nms=PyNms::ClassAgnostic))]
     pub fn new(
@@ -759,9 +763,11 @@ impl PyDecoder {
     ///
     /// - `True`: Boxes are in normalized [0,1] coordinates
     /// - `False`: Boxes are in pixel coordinates relative to model input
-    /// - `None`: Unknown, caller must infer (e.g., check if any coordinate > 1.0)
+    /// - `None`: Unknown, caller must infer (e.g., check if any coordinate >
+    ///   1.0)
     ///
-    /// This is determined by the model config's `normalized` field, not the NMS mode.
+    /// This is determined by the model config's `normalized` field, not the NMS
+    /// mode.
     #[getter(normalized_boxes)]
     fn get_normalized_boxes(&self) -> Option<bool> {
         self.decoder.normalized_boxes()
