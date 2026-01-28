@@ -82,6 +82,7 @@ pub use decoder::*;
 
 pub use error::{DecoderError, DecoderResult};
 pub use configs::Nms;
+pub use configs::DecoderVersion;
 
 use crate::{
     decoder::configs::QuantTuple, modelpack::modelpack_segmentation_to_mask,
