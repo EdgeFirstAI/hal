@@ -13,6 +13,7 @@ use num_traits::{AsPrimitive, Float, PrimInt, Signed};
 
 use crate::{
     BBoxTypeTrait, BoundingBox, DetectBox, DetectBoxQuantized, Quantization, Segmentation, XYWH,
+    XYXY,
     byte::{
         nms_class_aware_int, nms_extra_class_aware_int, nms_extra_int, nms_int,
         postprocess_boxes_index_quant, postprocess_boxes_quant, quantize_score_threshold,
@@ -34,7 +35,8 @@ fn dispatch_nms_float(nms: Option<Nms>, iou: f32, boxes: Vec<DetectBox>) -> Vec<
     }
 }
 
-/// Dispatches to the appropriate NMS function based on mode for float boxes with extra data.
+/// Dispatches to the appropriate NMS function based on mode for float boxes
+/// with extra data.
 fn dispatch_nms_extra_float<E: Send + Sync>(
     nms: Option<Nms>,
     iou: f32,
@@ -47,7 +49,8 @@ fn dispatch_nms_extra_float<E: Send + Sync>(
     }
 }
 
-/// Dispatches to the appropriate NMS function based on mode for quantized boxes.
+/// Dispatches to the appropriate NMS function based on mode for quantized
+/// boxes.
 fn dispatch_nms_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
     nms: Option<Nms>,
     iou: f32,
@@ -60,7 +63,8 @@ fn dispatch_nms_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
     }
 }
 
-/// Dispatches to the appropriate NMS function based on mode for quantized boxes with extra data.
+/// Dispatches to the appropriate NMS function based on mode for quantized boxes
+/// with extra data.
 fn dispatch_nms_extra_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send + Sync>(
     nms: Option<Nms>,
     iou: f32,
@@ -334,56 +338,45 @@ pub fn decode_yolo_split_segdet_float<T>(
 
 /// Decodes end-to-end YOLO detection outputs (post-NMS from model).
 ///
-/// Input shape: (N, 6+) where columns are [x1, y1, x2, y2, conf, class, ...]
+/// Input shape: (6, N),  where columns are [x1, y1, x2, y2, conf, class, ...]
 /// Boxes are output directly without NMS (model already applied NMS).
 ///
-/// Coordinates may be normalized [0,1] or pixel values depending on model config.
-/// The caller should check `decoder.normalized_boxes()` to determine which.
+/// Coordinates may be normalized [0,1] or pixel values depending on model
+/// config. The caller should check `decoder.normalized_boxes()` to determine
+/// which.
 pub fn decode_yolo_end_to_end_det_float<T>(
     output: ArrayView2<T>,
     score_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
 ) where
     T: Float + AsPrimitive<f32> + Send + Sync + 'static,
+    f32: AsPrimitive<T>,
 {
-    let num_cols = output.ncols();
-    if num_cols < 6 {
-        // Invalid shape, need at least [x1, y1, x2, y2, conf, class]
-        return;
-    }
-
+    let boxes = output.slice(s![0..4, ..]);
+    let scores = output.slice(s![4..5, ..]);
+    let classes = output.slice(s![5, ..]);
+    let mut boxes =
+        postprocess_boxes_index_float::<XYXY, _, _>(score_threshold.as_(), boxes, scores);
+    boxes.truncate(output_boxes.capacity());
     output_boxes.clear();
-    for row in output.rows() {
-        let conf: f32 = row[4].as_();
-        if conf < score_threshold {
-            continue;
-        }
-        if output_boxes.len() >= output_boxes.capacity() {
-            break;
-        }
-        output_boxes.push(crate::DetectBox {
-            bbox: crate::BoundingBox {
-                xmin: row[0].as_(),
-                ymin: row[1].as_(),
-                xmax: row[2].as_(),
-                ymax: row[3].as_(),
-            },
-            score: conf,
-            label: row[5].as_() as usize,
-        });
+    for (mut b, i) in boxes.into_iter() {
+        b.label = classes[i].as_() as usize;
+        output_boxes.push(b);
     }
     // No NMS — model output is already post-NMS
 }
 
-/// Decodes end-to-end YOLO detection + segmentation outputs (post-NMS from model).
+/// Decodes end-to-end YOLO detection + segmentation outputs (post-NMS from
+/// model).
 ///
 /// Input shapes:
-/// - detection: (N, 6 + num_protos) where columns are
-///   [x1, y1, x2, y2, conf, class, mask_coeff_0, ..., mask_coeff_31]
+/// - detection: (6 + num_protos, N) where rows are [x1, y1, x2, y2, conf,
+///   class, mask_coeff_0, ..., mask_coeff_31]
 /// - protos: (proto_height, proto_width, num_protos)
 ///
 /// Boxes are output directly without NMS (model already applied NMS).
-/// Coordinates may be normalized [0,1] or pixel values depending on model config.
+/// Coordinates may be normalized [0,1] or pixel values depending on model
+/// config.
 pub fn decode_yolo_end_to_end_segdet_float<T>(
     output: ArrayView2<T>,
     protos: ArrayView3<T>,
@@ -392,108 +385,37 @@ pub fn decode_yolo_end_to_end_segdet_float<T>(
     output_masks: &mut Vec<crate::Segmentation>,
 ) where
     T: Float + AsPrimitive<f32> + Send + Sync + 'static,
+    f32: AsPrimitive<T>,
 {
-    let num_protos = protos.dim().2;
-    let min_cols = 6 + num_protos;
-    let num_cols = output.ncols();
-    if num_cols < min_cols {
-        // Invalid shape
-        return;
+    let boxes = output.slice(s![0..4, ..]);
+    let scores = output.slice(s![4..5, ..]);
+    let classes = output.slice(s![5, ..]);
+    let mask_coeff = output.slice(s![6.., ..]);
+    let mut boxes =
+        postprocess_boxes_index_float::<XYXY, _, _>(score_threshold.as_(), boxes, scores);
+    boxes.truncate(output_boxes.capacity());
+
+    for (b, ind) in &mut boxes {
+        b.label = classes[*ind].as_() as usize;
     }
+
+    // No NMS — model output is already post-NMS
+
+    let boxes = decode_segdet_f32(boxes, mask_coeff, protos);
 
     output_boxes.clear();
     output_masks.clear();
-
-    // Collect boxes with mask coefficients
-    let mut boxes_with_masks: Vec<(crate::DetectBox, Vec<f32>)> = Vec::new();
-
-    for row in output.rows() {
-        let conf: f32 = row[4].as_();
-        if conf < score_threshold {
-            continue;
-        }
-        if boxes_with_masks.len() >= output_boxes.capacity() {
-            break;
-        }
-
-        let bbox = crate::BoundingBox {
-            xmin: row[0].as_(),
-            ymin: row[1].as_(),
-            xmax: row[2].as_(),
-            ymax: row[3].as_(),
-        };
-
-        let detect_box = crate::DetectBox {
-            bbox,
-            score: conf,
-            label: row[5].as_() as usize,
-        };
-
-        // Extract mask coefficients
-        let mask_coeffs: Vec<f32> = (6..6 + num_protos).map(|i| row[i].as_()).collect();
-
-        boxes_with_masks.push((detect_box, mask_coeffs));
-    }
-
-    // Generate segmentation masks
-    for (detect_box, mask_coeffs) in boxes_with_masks {
-        let mask_arr = ndarray::Array1::from_vec(mask_coeffs);
-        let (protos_crop, roi) = protobox(&protos, &detect_box.bbox);
-
-        let seg = make_segmentation_from_coeffs(mask_arr.view(), protos_crop.view());
-
-        let final_box = crate::DetectBox {
-            bbox: roi,
-            score: detect_box.score,
-            label: detect_box.label,
-        };
-
-        output_boxes.push(final_box);
-        output_masks.push(crate::Segmentation {
-            xmin: roi.xmin,
-            ymin: roi.ymin,
-            xmax: roi.xmax,
-            ymax: roi.ymax,
-            segmentation: seg,
+    for (b, m) in boxes.into_iter() {
+        output_boxes.push(b);
+        output_masks.push(Segmentation {
+            xmin: b.bbox.xmin,
+            ymin: b.bbox.ymin,
+            xmax: b.bbox.xmax,
+            ymax: b.bbox.ymax,
+            segmentation: m,
         });
     }
-    // No NMS — model output is already post-NMS
 }
-
-/// Helper to compute segmentation mask from coefficients and protos.
-fn make_segmentation_from_coeffs<T>(
-    mask_coeffs: ArrayView1<f32>,
-    protos: ArrayView3<T>,
-) -> Array3<u8>
-where
-    T: Float + AsPrimitive<f32> + Send + Sync,
-{
-    let shape = protos.shape();
-    let mask = mask_coeffs.to_shape((1, mask_coeffs.len())).unwrap();
-    let protos_2d = protos
-        .to_shape([shape[0] * shape[1], shape[2]])
-        .unwrap();
-    let protos_2d = protos_2d.reversed_axes();
-    let protos_f32 = protos_2d.map(|x| x.as_());
-
-    let result = mask
-        .dot(&protos_f32)
-        .into_shape_with_order((shape[0], shape[1], 1))
-        .unwrap();
-
-    let min = *result.min().unwrap_or(&0.0);
-    let max = *result.max().unwrap_or(&1.0);
-    let max = max.max(-min);
-    let min_val = -max;
-    let range = max - min_val;
-    // Guard against division by zero for uniform masks
-    if range == 0.0 {
-        return result.map(|_| 128u8);
-    }
-    let u8_max = 256.0;
-    result.map(|x| ((*x - min_val) / range * u8_max) as u8)
-}
-
 /// Internal implementation of YOLO decoding for quantized tensors.
 ///
 /// Expected shapes of inputs:

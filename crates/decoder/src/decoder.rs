@@ -38,15 +38,20 @@ use crate::{
 pub struct ConfigOutputs {
     #[serde(default)]
     pub outputs: Vec<ConfigOutput>,
-    /// NMS mode from config file. When present, overrides the builder's NMS setting.
-    /// - `Some(Nms::ClassAgnostic)` — class-agnostic NMS: suppress overlapping boxes regardless of class
-    /// - `Some(Nms::ClassAware)` — class-aware NMS: only suppress boxes with the same class
+    /// NMS mode from config file. When present, overrides the builder's NMS
+    /// setting.
+    /// - `Some(Nms::ClassAgnostic)` — class-agnostic NMS: suppress overlapping
+    ///   boxes regardless of class
+    /// - `Some(Nms::ClassAware)` — class-aware NMS: only suppress boxes with
+    ///   the same class
     /// - `None` — use builder default or skip NMS (user handles it externally)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nms: Option<configs::Nms>,
-    /// Decoder version for Ultralytics models. Determines the decoding strategy.
+    /// Decoder version for Ultralytics models. Determines the decoding
+    /// strategy.
     /// - `Some(Yolo26)` — end-to-end model with embedded NMS
-    /// - `Some(Yolov5/Yolov8/Yolo11)` — traditional models requiring external NMS
+    /// - `Some(Yolov5/Yolov8/Yolo11)` — traditional models requiring external
+    ///   NMS
     /// - `None` — infer from other settings (legacy behavior)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decoder_version: Option<configs::DecoderVersion>,
@@ -497,12 +502,15 @@ pub mod configs {
 
     /// Decoder version for Ultralytics models.
     ///
-    /// Specifies the YOLO architecture version, which determines the decoding strategy:
-    /// - `Yolov5`, `Yolov8`, `Yolo11`: Traditional models requiring external NMS
-    /// - `Yolo26`: End-to-end models with NMS embedded in the model architecture
+    /// Specifies the YOLO architecture version, which determines the decoding
+    /// strategy:
+    /// - `Yolov5`, `Yolov8`, `Yolo11`: Traditional models requiring external
+    ///   NMS
+    /// - `Yolo26`: End-to-end models with NMS embedded in the model
+    ///   architecture
     ///
-    /// When `decoder_version` is set to `Yolo26`, the decoder uses end-to-end model types
-    /// regardless of the `nms` setting.
+    /// When `decoder_version` is set to `Yolo26`, the decoder uses end-to-end
+    /// model types regardless of the `nms` setting.
     #[derive(Debug, PartialEq, Serialize, Deserialize, Clone, Copy, Hash, Eq)]
     #[serde(rename_all = "lowercase")]
     pub enum DecoderVersion {
@@ -515,13 +523,15 @@ pub mod configs {
         /// YOLO11 - anchor-free DFL decoder, requires external NMS
         #[serde(rename = "yolo11")]
         Yolo11,
-        /// YOLO26 - end-to-end model with embedded NMS (one-to-one matching heads)
+        /// YOLO26 - end-to-end model with embedded NMS (one-to-one matching
+        /// heads)
         #[serde(rename = "yolo26")]
         Yolo26,
     }
 
     impl DecoderVersion {
-        /// Returns true if this version uses end-to-end inference (embedded NMS).
+        /// Returns true if this version uses end-to-end inference (embedded
+        /// NMS).
         pub fn is_end_to_end(&self) -> bool {
             matches!(self, DecoderVersion::Yolo26)
         }
@@ -587,11 +597,14 @@ pub mod configs {
         /// End-to-end YOLO detection (post-NMS output from model)
         /// Input shape: (1, N, 6+) where columns are [x1, y1, x2, y2, conf,
         /// class, ...]
-        YoloEndToEndDet,
+        YoloEndToEndDet {
+            boxes: Detection,
+        },
         /// End-to-end YOLO detection + segmentation (post-NMS output from
         /// model) Input shape: (1, N, 6 + num_protos) where columns are
         /// [x1, y1, x2, y2, conf, class, mask_coeff_0, ..., mask_coeff_31]
         YoloEndToEndSegDet {
+            boxes: Detection,
             protos: Protos,
         },
     }
@@ -1239,8 +1252,7 @@ impl DecoderBuilder {
         // Use NMS from config if present, otherwise use builder's NMS setting
         let nms = config.nms.or(self.nms);
 
-        let model_type =
-            Self::get_model_type(config.outputs, nms, config.decoder_version)?;
+        let model_type = Self::get_model_type(config.outputs, nms, config.decoder_version)?;
         Ok(Decoder {
             model_type,
             iou_threshold: self.iou_threshold,
@@ -1293,7 +1305,7 @@ impl DecoderBuilder {
 
     fn get_model_type_yolo(
         configs: Vec<ConfigOutput>,
-        _nms: Option<configs::Nms>,
+        nms: Option<configs::Nms>,
         decoder_version: Option<configs::DecoderVersion>,
     ) -> Result<ModelType, DecoderError> {
         let mut boxes = None;
@@ -1326,14 +1338,19 @@ impl DecoderBuilder {
         // 2. decoder_version is not set AND nms is None (legacy fallback behavior)
         let is_end_to_end = decoder_version
             .map(|v| v.is_end_to_end())
-            .unwrap_or(false);
+            .unwrap_or(nms.is_none());
 
         if is_end_to_end {
-            // End-to-end models: detection output contains post-NMS boxes
-            if let Some(protos) = protos {
-                return Ok(ModelType::YoloEndToEndSegDet { protos });
+            if let Some(boxes) = boxes {
+                if let Some(protos) = protos {
+                    return Ok(ModelType::YoloEndToEndSegDet { boxes, protos });
+                } else {
+                    return Ok(ModelType::YoloEndToEndDet { boxes });
+                }
             } else {
-                return Ok(ModelType::YoloEndToEndDet);
+                return Err(DecoderError::InvalidConfig(
+                    "Invalid Yolo end-to-end model outputs".to_string(),
+                ));
             }
         }
 
@@ -2308,7 +2325,7 @@ impl Decoder {
                 output_boxes,
                 output_masks,
             ),
-            ModelType::YoloEndToEndDet | ModelType::YoloEndToEndSegDet { .. } => {
+            ModelType::YoloEndToEndDet { .. } | ModelType::YoloEndToEndSegDet { .. } => {
                 Err(DecoderError::InvalidConfig(
                     "End-to-end models require float decode, not quantized".to_string(),
                 ))
@@ -2433,12 +2450,13 @@ impl Decoder {
                     output_masks,
                 )?;
             }
-            ModelType::YoloEndToEndDet => {
-                self.decode_yolo_end_to_end_det_float(outputs, output_boxes)?;
+            ModelType::YoloEndToEndDet { boxes } => {
+                self.decode_yolo_end_to_end_det_float(outputs, boxes, output_boxes)?;
             }
-            ModelType::YoloEndToEndSegDet { protos } => {
+            ModelType::YoloEndToEndSegDet { boxes, protos } => {
                 self.decode_yolo_end_to_end_segdet_float(
                     outputs,
+                    boxes,
                     protos,
                     output_boxes,
                     output_masks,
@@ -3027,34 +3045,19 @@ impl Decoder {
     fn decode_yolo_end_to_end_det_float<T>(
         &self,
         outputs: &[ArrayViewD<T>],
+        boxes_config: &configs::Detection,
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<(), DecoderError>
     where
         T: Float + AsPrimitive<f32> + Send + Sync + 'static,
+        f32: AsPrimitive<T>,
     {
-        if outputs.is_empty() {
-            return Err(DecoderError::InvalidShape(
-                "End-to-end detection requires at least one output".to_string(),
-            ));
-        }
-
-        let output = &outputs[0];
-        let shape = output.shape();
-
-        // Expect shape (1, N, 6+) or (N, 6+)
-        let output_2d = if shape.len() == 3 {
-            output.slice(s![0, .., ..])
-        } else if shape.len() == 2 {
-            output.slice(s![.., ..])
-        } else {
-            return Err(DecoderError::InvalidShape(format!(
-                "End-to-end detection expects shape (1, N, 6+) or (N, 6+), got {:?}",
-                shape
-            )));
-        };
+        let (det_tensor, _) = Self::find_outputs_with_shape(&boxes_config.shape, outputs, &[])?;
+        let det_tensor = Self::swap_axes_if_needed(det_tensor, boxes_config.into());
+        let det_tensor = det_tensor.slice(s![0, .., ..]);
 
         crate::yolo::decode_yolo_end_to_end_det_float(
-            output_2d,
+            det_tensor,
             self.score_threshold,
             output_boxes,
         );
@@ -3071,12 +3074,14 @@ impl Decoder {
     fn decode_yolo_end_to_end_segdet_float<T>(
         &self,
         outputs: &[ArrayViewD<T>],
+        boxes_config: &configs::Detection,
         protos_config: &configs::Protos,
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
     ) -> Result<(), DecoderError>
     where
         T: Float + AsPrimitive<f32> + Send + Sync + 'static,
+        f32: AsPrimitive<T>,
     {
         if outputs.len() < 2 {
             return Err(DecoderError::InvalidShape(
@@ -3084,31 +3089,18 @@ impl Decoder {
             ));
         }
 
-        // Find detection output (not matching protos shape)
-        let (protos_tensor, protos_ind) =
-            Self::find_outputs_with_shape(&protos_config.shape, outputs, &[])?;
+        let (det_tensor, det_ind) =
+            Self::find_outputs_with_shape(&boxes_config.shape, outputs, &[])?;
+        let det_tensor = Self::swap_axes_if_needed(det_tensor, boxes_config.into());
+        let det_tensor = det_tensor.slice(s![0, .., ..]);
+
+        let (protos_tensor, _) =
+            Self::find_outputs_with_shape(&protos_config.shape, outputs, &[det_ind])?;
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos_config.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
 
-        // Detection is the other output
-        let det_ind = if protos_ind == 0 { 1 } else { 0 };
-        let output = &outputs[det_ind];
-        let shape = output.shape();
-
-        // Expect shape (1, N, 6+num_protos) or (N, 6+num_protos)
-        let output_2d = if shape.len() == 3 {
-            output.slice(s![0, .., ..])
-        } else if shape.len() == 2 {
-            output.slice(s![.., ..])
-        } else {
-            return Err(DecoderError::InvalidShape(format!(
-                "End-to-end segdet detection expects shape (1, N, 6+) or (N, 6+), got {:?}",
-                shape
-            )));
-        };
-
         crate::yolo::decode_yolo_end_to_end_segdet_float(
-            output_2d,
+            det_tensor,
             protos_tensor,
             self.score_threshold,
             output_boxes,
@@ -5077,7 +5069,10 @@ decoder_version: yolo26
             .with_config_yaml_str(yaml.to_string())
             .build()
             .unwrap();
-        assert!(matches!(decoder.model_type, ModelType::YoloEndToEndDet));
+        assert!(matches!(
+            decoder.model_type,
+            ModelType::YoloEndToEndDet { .. }
+        ));
 
         // Even with NMS set, yolo26 should use end-to-end
         let yaml_with_nms = r#"
@@ -5096,7 +5091,10 @@ nms: class_agnostic
             .with_config_yaml_str(yaml_with_nms.to_string())
             .build()
             .unwrap();
-        assert!(matches!(decoder.model_type, ModelType::YoloEndToEndDet));
+        assert!(matches!(
+            decoder.model_type,
+            ModelType::YoloEndToEndDet { .. }
+        ));
     }
 
     #[test]
@@ -5145,7 +5143,7 @@ decoder_version: {}
 
             if version == "yolo26" {
                 assert!(
-                    matches!(decoder.model_type, ModelType::YoloEndToEndDet),
+                    matches!(decoder.model_type, ModelType::YoloEndToEndDet { .. }),
                     "Expected end-to-end for {}",
                     version
                 );
@@ -5175,7 +5173,10 @@ decoder_version: {}
             .with_config_json_str(json.to_string())
             .build()
             .unwrap();
-        assert!(matches!(decoder.model_type, ModelType::YoloEndToEndDet));
+        assert!(matches!(
+            decoder.model_type,
+            ModelType::YoloEndToEndDet { .. }
+        ));
     }
 
     #[test]
