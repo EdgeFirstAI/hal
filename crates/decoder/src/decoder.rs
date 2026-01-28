@@ -9,7 +9,7 @@ use num_traits::{AsPrimitive, Float};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DecoderError, DetectBox, Quantization, Segmentation, XYWH,
+    DecoderError, DecoderVersion, DetectBox, Quantization, Segmentation, XYWH,
     configs::{DecoderType, DimName, ModelType, QuantTuple},
     dequantize_ndarray,
     modelpack::{
@@ -770,22 +770,30 @@ impl DecoderBuilder {
     /// # use edgefirst_decoder::{ DecoderBuilder, DecoderResult, configs };
     /// # fn main() -> DecoderResult<()> {
     /// let decoder = DecoderBuilder::new()
-    ///     .with_config_yolo_det(configs::Detection {
-    ///         anchors: None,
-    ///         decoder: configs::DecoderType::Ultralytics,
-    ///         quantization: Some(configs::QuantTuple(0.012345, 26)),
-    ///         shape: vec![1, 84, 8400],
-    ///         dshape: Vec::new(),
-    ///         normalized: Some(true),
-    ///     })
+    ///     .with_config_yolo_det(
+    ///         configs::Detection {
+    ///             anchors: None,
+    ///             decoder: configs::DecoderType::Ultralytics,
+    ///             quantization: Some(configs::QuantTuple(0.012345, 26)),
+    ///             shape: vec![1, 84, 8400],
+    ///             dshape: Vec::new(),
+    ///             normalized: Some(true),
+    ///         },
+    ///         None,
+    ///     )
     ///     .build()?;
     ///
     /// # Ok(())
     /// # }
     /// ```
-    pub fn with_config_yolo_det(mut self, boxes: configs::Detection) -> Self {
+    pub fn with_config_yolo_det(
+        mut self,
+        boxes: configs::Detection,
+        version: Option<DecoderVersion>,
+    ) -> Self {
         let config = ConfigOutputs {
             outputs: vec![ConfigOutput::Detection(boxes)],
+            decoder_version: version,
             ..Default::default()
         };
         self.config_src.replace(ConfigSource::Config(config));
@@ -853,7 +861,11 @@ impl DecoderBuilder {
     ///     dshape: Vec::new(),
     /// };
     /// let decoder = DecoderBuilder::new()
-    ///     .with_config_yolo_segdet(seg_config, protos_config)
+    ///     .with_config_yolo_segdet(
+    ///         seg_config,
+    ///         protos_config,
+    ///         Some(configs::DecoderVersion::Yolov8),
+    ///     )
     ///     .build()?;
     /// # Ok(())
     /// # }
@@ -862,9 +874,11 @@ impl DecoderBuilder {
         mut self,
         boxes: configs::Detection,
         protos: configs::Protos,
+        version: Option<DecoderVersion>,
     ) -> Self {
         let config = ConfigOutputs {
             outputs: vec![ConfigOutput::Detection(boxes), ConfigOutput::Protos(protos)],
+            decoder_version: version,
             ..Default::default()
         };
         self.config_src.replace(ConfigSource::Config(config));
@@ -1251,8 +1265,8 @@ impl DecoderBuilder {
 
         // Use NMS from config if present, otherwise use builder's NMS setting
         let nms = config.nms.or(self.nms);
+        let model_type = Self::get_model_type(config)?;
 
-        let model_type = Self::get_model_type(config.outputs, nms, config.decoder_version)?;
         Ok(Decoder {
             model_type,
             iou_threshold: self.iou_threshold,
@@ -1277,15 +1291,11 @@ impl DecoderBuilder {
         None // not specified
     }
 
-    fn get_model_type(
-        configs: Vec<ConfigOutput>,
-        nms: Option<configs::Nms>,
-        decoder_version: Option<configs::DecoderVersion>,
-    ) -> Result<ModelType, DecoderError> {
+    fn get_model_type(configs: ConfigOutputs) -> Result<ModelType, DecoderError> {
         // yolo or modelpack
         let mut yolo = false;
         let mut modelpack = false;
-        for c in &configs {
+        for c in &configs.outputs {
             match c.decoder() {
                 DecoderType::ModelPack => modelpack = true,
                 DecoderType::Ultralytics => yolo = true,
@@ -1296,24 +1306,20 @@ impl DecoderBuilder {
                 "Both ModelPack and Yolo outputs found in config".to_string(),
             )),
             (true, false) => Self::get_model_type_modelpack(configs),
-            (false, true) => Self::get_model_type_yolo(configs, nms, decoder_version),
+            (false, true) => Self::get_model_type_yolo(configs),
             (false, false) => Err(DecoderError::InvalidConfig(
                 "No outputs found in config".to_string(),
             )),
         }
     }
 
-    fn get_model_type_yolo(
-        configs: Vec<ConfigOutput>,
-        nms: Option<configs::Nms>,
-        decoder_version: Option<configs::DecoderVersion>,
-    ) -> Result<ModelType, DecoderError> {
+    fn get_model_type_yolo(configs: ConfigOutputs) -> Result<ModelType, DecoderError> {
         let mut boxes = None;
         let mut protos = None;
         let mut split_boxes = None;
         let mut split_scores = None;
         let mut split_mask_coeff = None;
-        for c in configs {
+        for c in configs.outputs {
             match c {
                 ConfigOutput::Detection(detection) => boxes = Some(detection),
                 ConfigOutput::Segmentation(_) => {
@@ -1335,16 +1341,25 @@ impl DecoderBuilder {
 
         // Use end-to-end model types when:
         // 1. decoder_version is explicitly set to Yolo26 (definitive), OR
-        // 2. decoder_version is not set AND nms is None (legacy fallback behavior)
-        let is_end_to_end = decoder_version
+        //    decoder_version is not set but the dshapes are (batch, num_boxes,
+        //    num_features)
+        let is_end_to_end_dshape = boxes.as_ref().is_some_and(|b| {
+            let dims = b.dshape.iter().map(|(d, _)| *d).collect::<Vec<_>>();
+            dims == vec![DimName::Batch, DimName::NumBoxes, DimName::NumFeatures]
+        });
+
+        let is_end_to_end = configs
+            .decoder_version
             .map(|v| v.is_end_to_end())
-            .unwrap_or(nms.is_none());
+            .unwrap_or(is_end_to_end_dshape);
 
         if is_end_to_end {
             if let Some(boxes) = boxes {
                 if let Some(protos) = protos {
+                    Self::verify_yolo_seg_det_26(&boxes, &protos)?;
                     return Ok(ModelType::YoloEndToEndSegDet { boxes, protos });
                 } else {
+                    Self::verify_yolo_det_26(&boxes)?;
                     return Ok(ModelType::YoloEndToEndDet { boxes });
                 }
             } else {
@@ -1409,6 +1424,30 @@ impl DecoderBuilder {
         Ok(())
     }
 
+    fn verify_yolo_det_26(detect: &configs::Detection) -> Result<(), DecoderError> {
+        if detect.shape.len() != 3 {
+            return Err(DecoderError::InvalidConfig(format!(
+                "Invalid Yolo Detection shape {:?}",
+                detect.shape
+            )));
+        }
+
+        Self::verify_dshapes(
+            &detect.dshape,
+            &detect.shape,
+            "Detection",
+            &[DimName::Batch, DimName::NumFeatures, DimName::NumBoxes],
+        )?;
+
+        if !detect.shape.contains(&6) {
+            return Err(DecoderError::InvalidConfig(
+                "Yolo26 Detection must have 6 features".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
     fn verify_yolo_seg_det(
         detection: &configs::Detection,
         protos: &configs::Protos,
@@ -1457,6 +1496,55 @@ impl DecoderBuilder {
             return Err(DecoderError::InvalidConfig(
                 "Yolo Segmentation Detection has zero classes".to_string(),
             ));
+        }
+
+        Ok(())
+    }
+
+    fn verify_yolo_seg_det_26(
+        detection: &configs::Detection,
+        protos: &configs::Protos,
+    ) -> Result<(), DecoderError> {
+        if detection.shape.len() != 3 {
+            return Err(DecoderError::InvalidConfig(format!(
+                "Invalid Yolo Detection shape {:?}",
+                detection.shape
+            )));
+        }
+        if protos.shape.len() != 4 {
+            return Err(DecoderError::InvalidConfig(format!(
+                "Invalid Yolo Protos shape {:?}",
+                protos.shape
+            )));
+        }
+
+        Self::verify_dshapes(
+            &detection.dshape,
+            &detection.shape,
+            "Detection",
+            &[DimName::Batch, DimName::NumFeatures, DimName::NumBoxes],
+        )?;
+        Self::verify_dshapes(
+            &protos.dshape,
+            &protos.shape,
+            "Protos",
+            &[
+                DimName::Batch,
+                DimName::Height,
+                DimName::Width,
+                DimName::NumProtos,
+            ],
+        )?;
+
+        let protos_count = Self::get_protos_count(&protos.dshape).unwrap_or(protos.shape[3]);
+        log::debug!("Protos count: {}", protos_count);
+        log::debug!("Detection dshape: {:?}", detection.dshape);
+
+        if !detection.shape.contains(&(6 + protos_count)) {
+            return Err(DecoderError::InvalidConfig(format!(
+                "Yolo26 Segmentation Detection must have num_features be 6 + num_protos = {}",
+                6 + protos_count
+            )));
         }
 
         Ok(())
@@ -1611,12 +1699,12 @@ impl DecoderBuilder {
         Ok(())
     }
 
-    fn get_model_type_modelpack(configs: Vec<ConfigOutput>) -> Result<ModelType, DecoderError> {
+    fn get_model_type_modelpack(configs: ConfigOutputs) -> Result<ModelType, DecoderError> {
         let mut split_decoders = Vec::new();
         let mut segment_ = None;
         let mut scores_ = None;
         let mut boxes_ = None;
-        for c in configs {
+        for c in configs.outputs {
             match c {
                 ConfigOutput::Detection(detection) => split_decoders.push(detection),
                 ConfigOutput::Segmentation(segmentation) => segment_ = Some(segmentation),
@@ -2346,7 +2434,7 @@ impl Decoder {
     /// # Examples
     ///
     /// ```rust
-    /// # use edgefirst_decoder::{BoundingBox, DecoderBuilder, DetectBox, DecoderResult, configs, configs::DecoderType, dequantize_cpu, Quantization};
+    /// # use edgefirst_decoder::{BoundingBox, DecoderBuilder, DetectBox, DecoderResult, configs, configs::{DecoderType, DecoderVersion}, dequantize_cpu, Quantization};
     /// # use ndarray::Array3;
     /// # fn main() -> DecoderResult<()> {
     /// #   let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
@@ -2363,7 +2451,8 @@ impl Decoder {
     ///         anchors: None,
     ///         dshape: Vec::new(),
     ///         normalized: Some(true),
-    ///     })
+    ///     },
+    ///     Some(DecoderVersion::Yolo11))
     ///     .with_score_threshold(0.25)
     ///     .with_iou_threshold(0.7)
     ///     .build()?;
@@ -3477,6 +3566,7 @@ mod decoder_builder_tests {
                         (DimName::Width, 160),
                     ],
                 },
+                Some(DecoderVersion::Yolo11),
             )
             .build();
 
@@ -3535,51 +3625,64 @@ mod decoder_builder_tests {
     #[test]
     fn test_yolo_invalid_det() {
         let result = DecoderBuilder::new()
-            .with_config_yolo_det(configs::Detection {
-                anchors: None,
-                decoder: DecoderType::Ultralytics,
-                quantization: None,
-                shape: vec![1, 84, 8400, 1], // Invalid shape
-                dshape: vec![
-                    (DimName::Batch, 1),
-                    (DimName::NumFeatures, 84),
-                    (DimName::NumBoxes, 8400),
-                    (DimName::Batch, 1),
-                ],
-                normalized: Some(true),
-            })
+            .with_config_yolo_det(
+                configs::Detection {
+                    anchors: None,
+                    decoder: DecoderType::Ultralytics,
+                    quantization: None,
+                    shape: vec![1, 84, 8400, 1], // Invalid shape
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumFeatures, 84),
+                        (DimName::NumBoxes, 8400),
+                        (DimName::Batch, 1),
+                    ],
+                    normalized: Some(true),
+                },
+                Some(DecoderVersion::Yolo11),
+            )
             .build();
 
         assert!(matches!(
             result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("Invalid Yolo Detection shape")));
 
         let result = DecoderBuilder::new()
-            .with_config_yolo_det(configs::Detection {
-                anchors: None,
-                decoder: DecoderType::Ultralytics,
-                quantization: None,
-                shape: vec![1, 8400, 3], // Invalid shape
-                dshape: vec![
-                    (DimName::Batch, 1),
-                    (DimName::NumBoxes, 8400),
-                    (DimName::NumFeatures, 3),
-                ],
-                normalized: Some(true),
-            })
+            .with_config_yolo_det(
+                configs::Detection {
+                    anchors: None,
+                    decoder: DecoderType::Ultralytics,
+                    quantization: None,
+                    shape: vec![1, 8400, 3], // Invalid shape
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, 8400),
+                        (DimName::NumFeatures, 3),
+                    ],
+                    normalized: Some(true),
+                },
+                Some(DecoderVersion::Yolo11),
+            )
             .build();
 
-        assert!(matches!(
-            result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("Invalid shape: Yolo num_features 3 must be greater than 4")));
+        assert!(
+            matches!(
+            &result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("Invalid shape: Yolo num_features 3 must be greater than 4")),
+            "{}",
+            result.unwrap_err()
+        );
 
         let result = DecoderBuilder::new()
-            .with_config_yolo_det(configs::Detection {
-                anchors: None,
-                decoder: DecoderType::Ultralytics,
-                quantization: None,
-                shape: vec![1, 3, 8400], // Invalid shape
-                dshape: Vec::new(),
-                normalized: Some(true),
-            })
+            .with_config_yolo_det(
+                configs::Detection {
+                    anchors: None,
+                    decoder: DecoderType::Ultralytics,
+                    quantization: None,
+                    shape: vec![1, 3, 8400], // Invalid shape
+                    dshape: Vec::new(),
+                    normalized: Some(true),
+                },
+                Some(DecoderVersion::Yolo11),
+            )
             .build();
 
         assert!(matches!(
@@ -3614,6 +3717,7 @@ mod decoder_builder_tests {
                         (DimName::Width, 160),
                     ],
                 },
+                Some(DecoderVersion::Yolo11),
             )
             .build();
 
@@ -3646,6 +3750,7 @@ mod decoder_builder_tests {
                     ],
                     quantization: None,
                 },
+                Some(DecoderVersion::Yolo11),
             )
             .build();
 
@@ -3677,6 +3782,7 @@ mod decoder_builder_tests {
                         (DimName::Width, 160),
                     ],
                 },
+                Some(DecoderVersion::Yolo11),
             )
             .build();
         println!("{:?}", result);
@@ -4811,18 +4917,21 @@ mod decoder_builder_tests {
         let out_float: Array3<f32> = dequantize_ndarray(out.view(), quant.into());
 
         let decoder = DecoderBuilder::default()
-            .with_config_yolo_det(configs::Detection {
-                decoder: DecoderType::Ultralytics,
-                shape: vec![1, 85, 8400],
-                anchors: None,
-                quantization: Some(quant.into()),
-                dshape: vec![
-                    (DimName::Batch, 1),
-                    (DimName::NumFeatures, 85),
-                    (DimName::NumBoxes, 8400),
-                ],
-                normalized: Some(true),
-            })
+            .with_config_yolo_det(
+                configs::Detection {
+                    decoder: DecoderType::Ultralytics,
+                    shape: vec![1, 85, 8400],
+                    anchors: None,
+                    quantization: Some(quant.into()),
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumFeatures, 85),
+                        (DimName::NumBoxes, 8400),
+                    ],
+                    normalized: Some(true),
+                },
+                Some(DecoderVersion::Yolo11),
+            )
             .with_score_threshold(score_threshold)
             .with_iou_threshold(iou_threshold)
             .build()
@@ -5058,10 +5167,10 @@ outputs:
 outputs:
   - decoder: ultralytics
     type: detection
-    shape: [1, 84, 8400]
+    shape: [1, 6, 8400]
     dshape:
       - [batch, 1]
-      - [num_features, 84]
+      - [num_features, 6]
       - [num_boxes, 8400]
 decoder_version: yolo26
 "#;
@@ -5079,10 +5188,10 @@ decoder_version: yolo26
 outputs:
   - decoder: ultralytics
     type: detection
-    shape: [1, 84, 8400]
+    shape: [1, 6, 8400]
     dshape:
       - [batch, 1]
-      - [num_features, 84]
+      - [num_features, 6]
       - [num_boxes, 8400]
 decoder_version: yolo26
 nms: class_agnostic
@@ -5121,7 +5230,7 @@ decoder_version: yolov8
     #[test]
     fn test_decoder_version_all_versions() {
         // Test all supported decoder versions parse correctly
-        for version in ["yolov5", "yolov8", "yolo11", "yolo26"] {
+        for version in ["yolov5", "yolov8", "yolo11"] {
             let yaml = format!(
                 r#"
 outputs:
@@ -5141,20 +5250,35 @@ decoder_version: {}
                 .build()
                 .unwrap();
 
-            if version == "yolo26" {
-                assert!(
-                    matches!(decoder.model_type, ModelType::YoloEndToEndDet { .. }),
-                    "Expected end-to-end for {}",
-                    version
-                );
-            } else {
-                assert!(
-                    matches!(decoder.model_type, ModelType::YoloDet { .. }),
-                    "Expected traditional for {}",
-                    version
-                );
-            }
+            assert!(
+                matches!(decoder.model_type, ModelType::YoloDet { .. }),
+                "Expected traditional for {}",
+                version
+            );
         }
+
+        let yaml = r#"
+outputs:
+  - decoder: ultralytics
+    type: detection
+    shape: [1, 6, 8400]
+    dshape:
+      - [batch, 1]
+      - [num_features, 6]
+      - [num_boxes, 8400]
+decoder_version: yolo26
+"#
+        .to_string();
+
+        let decoder = DecoderBuilder::new()
+            .with_config_yaml_str(yaml)
+            .build()
+            .unwrap();
+
+        assert!(
+            matches!(decoder.model_type, ModelType::YoloEndToEndDet { .. }),
+            "Expected end to end for yolo26",
+        );
     }
 
     #[test]
@@ -5164,8 +5288,8 @@ decoder_version: {}
             "outputs": [{
                 "decoder": "ultralytics",
                 "type": "detection",
-                "shape": [1, 84, 8400],
-                "dshape": [["batch", 1], ["num_features", 84], ["num_boxes", 8400]]
+                "shape": [1, 6, 8400],
+                "dshape": [["batch", 1], ["num_features", 6], ["num_boxes", 8400]]
             }],
             "decoder_version": "yolo26"
         }"#;
@@ -5220,6 +5344,103 @@ outputs:
             .unwrap();
         // Should still be traditional YoloDet, not end-to-end
         assert!(matches!(decoder.model_type, ModelType::YoloDet { .. }));
+    }
+
+    #[test]
+    fn test_decoder_heuristic_end_to_end_detection() {
+        // models with (batch, num_boxes, num_features) output shape are treated
+        // as end-to-end detection
+        let yaml = r#"
+outputs:
+  - decoder: ultralytics
+    type: detection
+    shape: [1, 300, 6]
+    dshape:
+      - [batch, 1]
+      - [num_boxes, 300]
+      - [num_features, 6]
+ 
+"#;
+        let decoder = DecoderBuilder::new()
+            .with_config_yaml_str(yaml.to_string())
+            .build()
+            .unwrap();
+        // Should still be traditional YoloDet, not end-to-end
+        assert!(matches!(
+            decoder.model_type,
+            ModelType::YoloEndToEndDet { .. }
+        ));
+
+        let yaml = r#"
+outputs:
+  - decoder: ultralytics
+    type: detection
+    shape: [1, 300, 38]
+    dshape:
+      - [batch, 1]
+      - [num_boxes, 300]
+      - [num_features, 38]
+  - decoder: ultralytics
+    type: protos
+    shape: [1, 160, 160, 32]
+    dshape:
+      - [batch, 1]
+      - [height, 160]
+      - [width, 160]
+      - [num_protos, 32]
+"#;
+        let decoder = DecoderBuilder::new()
+            .with_config_yaml_str(yaml.to_string())
+            .build()
+            .unwrap();
+        // Should still be traditional YoloDet, not end-to-end
+        assert!(matches!(
+            decoder.model_type,
+            ModelType::YoloEndToEndSegDet { .. }
+        ));
+
+        let yaml = r#"
+outputs:
+  - decoder: ultralytics
+    type: detection
+    shape: [1, 6, 300]
+    dshape:
+      - [batch, 1]
+      - [num_features, 6]
+      - [num_boxes, 300] 
+"#;
+        let decoder = DecoderBuilder::new()
+            .with_config_yaml_str(yaml.to_string())
+            .build()
+            .unwrap();
+        // Should still be traditional YoloDet, not end-to-end
+        assert!(matches!(decoder.model_type, ModelType::YoloDet { .. }));
+
+        let yaml = r#"
+outputs:
+  - decoder: ultralytics
+    type: detection
+    shape: [1, 38, 300]
+    dshape:
+      - [batch, 1]
+      - [num_features, 38]
+      - [num_boxes, 300]
+
+  - decoder: ultralytics
+    type: protos
+    shape: [1, 160, 160, 32]
+    dshape:
+      - [batch, 1]
+      - [height, 160]
+      - [width, 160]
+      - [num_protos, 32]
+"#;
+        let decoder = DecoderBuilder::new()
+            .with_config_yaml_str(yaml.to_string())
+            .build()
+            .unwrap();
+        // Should still be traditional YoloDet, not end-to-end
+        assert!(matches!(decoder.model_type, ModelType::YoloSegDet { .. }));
     }
 
     #[test]
