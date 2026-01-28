@@ -635,8 +635,9 @@ python -m pytest tests/decoder/
 python -m pytest tests/test_tensor.py
 ```
 
-Python tests require the Pillow library for the image tests, which can be installed using:
+Python tests require the `pytest-benchmark` plugin for benchmarks, and the Pillow library for the image tests, these can be installed using:
 ```bash
+python -m pip install pytest-benchmark
 python -m pip install pillow
 ```
 
