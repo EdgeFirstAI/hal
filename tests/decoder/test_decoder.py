@@ -355,13 +355,12 @@ def test_yolo_det_int8_numpy_decode_tf_nms(benchmark):
 
         # Get max class score and class index for each box
         max_scores = np.max(class_scores, axis=0)  # [8400]
-        class_ids = np.argmax(class_scores, axis=0)  # [8400]
 
         # Filter by score threshold
         score_mask = max_scores >= score_t
         filtered_boxes = box_data[:, score_mask]  # [4, N]
         filtered_scores = max_scores[score_mask]  # [N]
-        filtered_classes = class_ids[score_mask]  # [N]
+        filtered_classes = np.argmax(class_scores[:, score_mask], axis=0)  # [N]
 
         # Convert from center format to corner format
         cx, cy, w, h = filtered_boxes[0], filtered_boxes[1], filtered_boxes[2], filtered_boxes[3]
@@ -393,6 +392,96 @@ def test_yolo_det_int8_numpy_decode_tf_nms(benchmark):
     assert np.allclose(scores, [0.5591227, 0.33057618])
     assert np.allclose(classes, [0, 75])
     assert len(masks) == 0
+
+
+@pytest.mark.benchmark(group="yolo_det", warmup_iterations=3)
+def test_yolo_det_int8_cv2(benchmark):
+    output = np.fromfile("testdata/yolov8s_80_classes.bin", dtype=np.int8).reshape(1, 84, 8400)
+    import cv2
+    iou_t = 0.7
+    score_t = 0.25
+
+    def run_decode(output):
+        # Dequantize
+        scale, zero_point = 0.0040811873, -123
+        dequantized = (output.astype(np.float32) - zero_point) * scale
+
+        # Extract box coordinates and class scores
+        box_data = dequantized[0, :4, :]  # [4, 8400]
+        class_scores = dequantized[0, 4:, :]  # [80, 8400]
+
+        # Get max class score and class index for each box
+        max_scores = np.max(class_scores, axis=0)  # [8400]
+
+        # Filter by score threshold
+        score_mask = max_scores >= score_t
+        filtered_boxes = box_data[:, score_mask]  # [4, N]
+        filtered_scores = max_scores[score_mask]  # [N]
+        filtered_classes = np.argmax(class_scores[:, score_mask], axis=0)  # [N]
+
+        # Convert from center format to corner format
+        cx, cy, w, h = filtered_boxes[0], filtered_boxes[1], filtered_boxes[2], filtered_boxes[3]
+        x1 = cx - w / 2
+        y1 = cy - h / 2
+        x2 = cx + w / 2
+        y2 = cy + h / 2
+        boxes = np.stack([x1, y1, x2, y2], axis=1)  # [N, 4]
+
+        keep_indices = cv2.dnn.NMSBoxes(boxes, filtered_scores, score_t, iou_t)
+
+        boxes = boxes[keep_indices]
+        scores = filtered_scores[keep_indices]
+        classes = filtered_classes[keep_indices]
+
+        return boxes, scores, classes, []
+
+    boxes, scores, classes, masks = benchmark(run_decode, output)
+
+    # assert np.allclose(boxes, [[0.5285137, 0.05305544, 0.87541467, 0.9998909], [
+    #                    0.130598, 0.43260583, 0.35098213, 0.9958097]])
+    # assert np.allclose(scores, [0.5591227, 0.33057618])
+    # assert np.allclose(classes, [0, 75])
+    # assert len(masks) == 0
+
+
+@pytest.mark.benchmark(group="yolo_det", warmup_iterations=3)
+def test_yolo_det_int8_no_nms(benchmark):
+    output = np.fromfile("testdata/yolov8s_80_classes.bin", dtype=np.int8).reshape(1, 84, 8400)
+    score_t = 0.25
+
+    def run_decode(output):
+        # Dequantize
+        scale, zero_point = 0.0040811873, -123
+        dequantized = (output.astype(np.float32) - zero_point) * scale
+
+        # Extract box coordinates and class scores
+        box_data = dequantized[0, :4, :]  # [4, 8400]
+        class_scores = dequantized[0, 4:, :]  # [80, 8400]
+
+        # Get max class score and class index for each box
+        max_scores = np.max(class_scores, axis=0)  # [8400]
+
+        # Filter by score threshold
+        score_mask = max_scores >= score_t
+        filtered_boxes = box_data[:, score_mask]  # [4, N]
+        filtered_scores = max_scores[score_mask]  # [N]
+        filtered_classes = np.argmax(class_scores[:, score_mask], axis=0)  # [N]
+
+        # Convert from center format to corner format
+        # Convert from center format to corner format using matrix multiplication
+        # filtered_boxes is [4, N], we need [N, 4] for output
+        # Transform: [cx, cy, w, h] -> [x1, y1, x2, y2] where x1=cx-w/2, y1=cy-h/2, x2=cx+w/2, y2=cy+h/2
+        transform = np.array([
+            [1, 0, -0.5, 0],    # x1 = cx - w/2
+            [0, 1, 0, -0.5],    # y1 = cy - h/2
+            [1, 0, 0.5, 0],     # x2 = cx + w/2
+            [0, 1, 0, 0.5]      # y2 = cy + h/2
+        ])
+        boxes = (transform @ filtered_boxes).T  # [4, N] -> [N, 4]
+
+        return boxes, filtered_scores, filtered_classes, []
+
+    benchmark(run_decode, output)
 
 
 def numpy_nms(
@@ -489,13 +578,12 @@ def test_yolo_det_int8_numpy(benchmark):
 
         # Get max class score and class index for each box
         max_scores = np.max(class_scores, axis=0)  # [8400]
-        class_ids = np.argmax(class_scores, axis=0)  # [8400]
 
         # Filter by score threshold
         score_mask = max_scores >= score_t
         filtered_boxes = box_data[:, score_mask]  # [4, N]
         filtered_scores = max_scores[score_mask]  # [N]
-        filtered_classes = class_ids[score_mask]  # [N]
+        filtered_classes = np.argmax(class_scores[:, score_mask], axis=0)  # [N]
 
         # Convert from center format to corner format
         cx, cy, w, h = filtered_boxes[0], filtered_boxes[1], filtered_boxes[2], filtered_boxes[3]
