@@ -182,7 +182,8 @@ pub fn nms_extra_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send + 
     boxes.into_iter().filter(|b| b.0.score > min_val).collect()
 }
 
-/// Class-aware NMS for quantized boxes: only suppress boxes with the same label.
+/// Class-aware NMS for quantized boxes: only suppress boxes with the same
+/// label.
 ///
 /// Sorts boxes by score, then greedily selects a subset of boxes in descending
 /// order of score. Unlike class-agnostic NMS, boxes are only suppressed if they
@@ -219,13 +220,17 @@ pub fn nms_class_aware_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
     boxes.into_iter().filter(|b| b.score > min_val).collect()
 }
 
-/// Class-aware NMS for quantized boxes with extra data: only suppress boxes with the same label.
+/// Class-aware NMS for quantized boxes with extra data: only suppress boxes
+/// with the same label.
 ///
-/// This is same as `nms_class_aware_int` but will also include extra information
-/// along with each box, such as the index.
+/// This is same as `nms_class_aware_int` but will also include extra
+/// information along with each box, such as the index.
 #[doc(hidden)]
 #[must_use]
-pub fn nms_extra_class_aware_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send + Sync>(
+pub fn nms_extra_class_aware_int<
+    SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
+    E: Send + Sync,
+>(
     iou: f32,
     mut boxes: Vec<(DetectBoxQuantized<SCORE>, E)>,
 ) -> Vec<(DetectBoxQuantized<SCORE>, E)> {
