@@ -41,9 +41,15 @@ pub struct ConfigOutputs {
     /// NMS mode from config file. When present, overrides the builder's NMS setting.
     /// - `Some(Nms::ClassAgnostic)` — class-agnostic NMS: suppress overlapping boxes regardless of class
     /// - `Some(Nms::ClassAware)` — class-aware NMS: only suppress boxes with the same class
-    /// - `None` — use builder default or bypass NMS (for end-to-end models)
+    /// - `None` — use builder default or skip NMS (user handles it externally)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nms: Option<configs::Nms>,
+    /// Decoder version for Ultralytics models. Determines the decoding strategy.
+    /// - `Some(Yolo26)` — end-to-end model with embedded NMS
+    /// - `Some(Yolov5/Yolov8/Yolo11)` — traditional models requiring external NMS
+    /// - `None` — infer from other settings (legacy behavior)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoder_version: Option<configs::DecoderVersion>,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
@@ -483,6 +489,38 @@ pub mod configs {
         ModelPack,
         #[serde(rename = "ultralytics")]
         Ultralytics,
+    }
+
+    /// Decoder version for Ultralytics models.
+    ///
+    /// Specifies the YOLO architecture version, which determines the decoding strategy:
+    /// - `Yolov5`, `Yolov8`, `Yolo11`: Traditional models requiring external NMS
+    /// - `Yolo26`: End-to-end models with NMS embedded in the model architecture
+    ///
+    /// When `decoder_version` is set to `Yolo26`, the decoder uses end-to-end model types
+    /// regardless of the `nms` setting.
+    #[derive(Debug, PartialEq, Serialize, Deserialize, Clone, Copy, Hash, Eq)]
+    #[serde(rename_all = "lowercase")]
+    pub enum DecoderVersion {
+        /// YOLOv5 - anchor-free DFL decoder, requires external NMS
+        #[serde(rename = "yolov5")]
+        Yolov5,
+        /// YOLOv8 - anchor-free DFL decoder, requires external NMS
+        #[serde(rename = "yolov8")]
+        Yolov8,
+        /// YOLO11 - anchor-free DFL decoder, requires external NMS
+        #[serde(rename = "yolo11")]
+        Yolo11,
+        /// YOLO26 - end-to-end model with embedded NMS (one-to-one matching heads)
+        #[serde(rename = "yolo26")]
+        Yolo26,
+    }
+
+    impl DecoderVersion {
+        /// Returns true if this version uses end-to-end inference (embedded NMS).
+        pub fn is_end_to_end(&self) -> bool {
+            matches!(self, DecoderVersion::Yolo26)
+        }
     }
 
     /// NMS (Non-Maximum Suppression) mode for filtering overlapping detections.
@@ -1193,7 +1231,8 @@ impl DecoderBuilder {
         // Use NMS from config if present, otherwise use builder's NMS setting
         let nms = config.nms.or(self.nms);
 
-        let model_type = Self::get_model_type(config.outputs, nms)?;
+        let model_type =
+            Self::get_model_type(config.outputs, nms, config.decoder_version)?;
         Ok(Decoder {
             model_type,
             iou_threshold: self.iou_threshold,
@@ -1221,6 +1260,7 @@ impl DecoderBuilder {
     fn get_model_type(
         configs: Vec<ConfigOutput>,
         nms: Option<configs::Nms>,
+        decoder_version: Option<configs::DecoderVersion>,
     ) -> Result<ModelType, DecoderError> {
         // yolo or modelpack
         let mut yolo = false;
@@ -1236,7 +1276,7 @@ impl DecoderBuilder {
                 "Both ModelPack and Yolo outputs found in config".to_string(),
             )),
             (true, false) => Self::get_model_type_modelpack(configs),
-            (false, true) => Self::get_model_type_yolo(configs, nms),
+            (false, true) => Self::get_model_type_yolo(configs, nms, decoder_version),
             (false, false) => Err(DecoderError::InvalidConfig(
                 "No outputs found in config".to_string(),
             )),
@@ -1245,7 +1285,8 @@ impl DecoderBuilder {
 
     fn get_model_type_yolo(
         configs: Vec<ConfigOutput>,
-        nms: Option<configs::Nms>,
+        _nms: Option<configs::Nms>,
+        decoder_version: Option<configs::DecoderVersion>,
     ) -> Result<ModelType, DecoderError> {
         let mut boxes = None;
         let mut protos = None;
@@ -1272,8 +1313,14 @@ impl DecoderBuilder {
             }
         }
 
-        // When NMS is bypassed (nms=None), use end-to-end model types
-        if nms.is_none() {
+        // Use end-to-end model types when:
+        // 1. decoder_version is explicitly set to Yolo26 (definitive), OR
+        // 2. decoder_version is not set AND nms is None (legacy fallback behavior)
+        let is_end_to_end = decoder_version
+            .map(|v| v.is_end_to_end())
+            .unwrap_or(false);
+
+        if is_end_to_end {
             // End-to-end models: detection output contains post-NMS boxes
             if let Some(protos) = protos {
                 return Ok(ModelType::YoloEndToEndSegDet { protos });
@@ -4998,5 +5045,175 @@ outputs:
             .build()
             .unwrap();
         assert_eq!(decoder.nms, None);
+    }
+
+    #[test]
+    fn test_decoder_version_yolo26_end_to_end() {
+        // Test that decoder_version: yolo26 creates end-to-end model type
+        let yaml = r#"
+outputs:
+  - decoder: ultralytics
+    type: detection
+    shape: [1, 84, 8400]
+    dshape:
+      - [batch, 1]
+      - [num_features, 84]
+      - [num_boxes, 8400]
+decoder_version: yolo26
+"#;
+        let decoder = DecoderBuilder::new()
+            .with_config_yaml_str(yaml.to_string())
+            .build()
+            .unwrap();
+        assert!(matches!(decoder.model_type, ModelType::YoloEndToEndDet));
+
+        // Even with NMS set, yolo26 should use end-to-end
+        let yaml_with_nms = r#"
+outputs:
+  - decoder: ultralytics
+    type: detection
+    shape: [1, 84, 8400]
+    dshape:
+      - [batch, 1]
+      - [num_features, 84]
+      - [num_boxes, 8400]
+decoder_version: yolo26
+nms: class_agnostic
+"#;
+        let decoder = DecoderBuilder::new()
+            .with_config_yaml_str(yaml_with_nms.to_string())
+            .build()
+            .unwrap();
+        assert!(matches!(decoder.model_type, ModelType::YoloEndToEndDet));
+    }
+
+    #[test]
+    fn test_decoder_version_yolov8_traditional() {
+        // Test that decoder_version: yolov8 creates traditional model type
+        let yaml = r#"
+outputs:
+  - decoder: ultralytics
+    type: detection
+    shape: [1, 84, 8400]
+    dshape:
+      - [batch, 1]
+      - [num_features, 84]
+      - [num_boxes, 8400]
+decoder_version: yolov8
+"#;
+        let decoder = DecoderBuilder::new()
+            .with_config_yaml_str(yaml.to_string())
+            .build()
+            .unwrap();
+        assert!(matches!(decoder.model_type, ModelType::YoloDet { .. }));
+    }
+
+    #[test]
+    fn test_decoder_version_all_versions() {
+        // Test all supported decoder versions parse correctly
+        for version in ["yolov5", "yolov8", "yolo11", "yolo26"] {
+            let yaml = format!(
+                r#"
+outputs:
+  - decoder: ultralytics
+    type: detection
+    shape: [1, 84, 8400]
+    dshape:
+      - [batch, 1]
+      - [num_features, 84]
+      - [num_boxes, 8400]
+decoder_version: {}
+"#,
+                version
+            );
+            let decoder = DecoderBuilder::new()
+                .with_config_yaml_str(yaml)
+                .build()
+                .unwrap();
+
+            if version == "yolo26" {
+                assert!(
+                    matches!(decoder.model_type, ModelType::YoloEndToEndDet),
+                    "Expected end-to-end for {}",
+                    version
+                );
+            } else {
+                assert!(
+                    matches!(decoder.model_type, ModelType::YoloDet { .. }),
+                    "Expected traditional for {}",
+                    version
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_decoder_version_json() {
+        // Test parsing decoder_version from JSON config
+        let json = r#"{
+            "outputs": [{
+                "decoder": "ultralytics",
+                "type": "detection",
+                "shape": [1, 84, 8400],
+                "dshape": [["batch", 1], ["num_features", 84], ["num_boxes", 8400]]
+            }],
+            "decoder_version": "yolo26"
+        }"#;
+        let decoder = DecoderBuilder::new()
+            .with_config_json_str(json.to_string())
+            .build()
+            .unwrap();
+        assert!(matches!(decoder.model_type, ModelType::YoloEndToEndDet));
+    }
+
+    #[test]
+    fn test_decoder_version_none_uses_traditional() {
+        // Without decoder_version, traditional model type is used
+        let yaml = r#"
+outputs:
+  - decoder: ultralytics
+    type: detection
+    shape: [1, 84, 8400]
+    dshape:
+      - [batch, 1]
+      - [num_features, 84]
+      - [num_boxes, 8400]
+"#;
+        let decoder = DecoderBuilder::new()
+            .with_config_yaml_str(yaml.to_string())
+            .build()
+            .unwrap();
+        assert!(matches!(decoder.model_type, ModelType::YoloDet { .. }));
+    }
+
+    #[test]
+    fn test_decoder_version_none_with_nms_none_still_traditional() {
+        // Without decoder_version, nms: None now means user handles NMS, not end-to-end
+        // This is a behavior change from the previous implementation
+        let yaml = r#"
+outputs:
+  - decoder: ultralytics
+    type: detection
+    shape: [1, 84, 8400]
+    dshape:
+      - [batch, 1]
+      - [num_features, 84]
+      - [num_boxes, 8400]
+"#;
+        let decoder = DecoderBuilder::new()
+            .with_config_yaml_str(yaml.to_string())
+            .with_nms(None) // User wants to handle NMS themselves
+            .build()
+            .unwrap();
+        // Should still be traditional YoloDet, not end-to-end
+        assert!(matches!(decoder.model_type, ModelType::YoloDet { .. }));
+    }
+
+    #[test]
+    fn test_decoder_version_is_end_to_end() {
+        assert!(!configs::DecoderVersion::Yolov5.is_end_to_end());
+        assert!(!configs::DecoderVersion::Yolov8.is_end_to_end());
+        assert!(!configs::DecoderVersion::Yolo11.is_end_to_end());
+        assert!(configs::DecoderVersion::Yolo26.is_end_to_end());
     }
 }
