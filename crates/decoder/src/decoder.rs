@@ -23,7 +23,6 @@ use crate::{
     },
 };
 
-#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 /// Used to represent the outputs in the model configuration.
 /// # Examples
 /// ```rust
@@ -35,8 +34,16 @@ use crate::{
 ///
 /// # Ok(())
 /// # }
+#[derive(Debug, PartialEq, Serialize, Deserialize, Clone, Default)]
 pub struct ConfigOutputs {
+    #[serde(default)]
     pub outputs: Vec<ConfigOutput>,
+    /// NMS mode from config file. When present, overrides the builder's NMS setting.
+    /// - `Some(Nms::ClassAgnostic)` — class-agnostic NMS: suppress overlapping boxes regardless of class
+    /// - `Some(Nms::ClassAware)` — class-aware NMS: only suppress boxes with the same class
+    /// - `None` — use builder default or bypass NMS (for end-to-end models)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nms: Option<configs::Nms>,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
@@ -721,6 +728,7 @@ impl DecoderBuilder {
     pub fn with_config_yolo_det(mut self, boxes: configs::Detection) -> Self {
         let config = ConfigOutputs {
             outputs: vec![ConfigOutput::Detection(boxes)],
+            ..Default::default()
         };
         self.config_src.replace(ConfigSource::Config(config));
         self
@@ -759,6 +767,7 @@ impl DecoderBuilder {
     ) -> Self {
         let config = ConfigOutputs {
             outputs: vec![ConfigOutput::Boxes(boxes), ConfigOutput::Scores(scores)],
+            ..Default::default()
         };
         self.config_src.replace(ConfigSource::Config(config));
         self
@@ -798,6 +807,7 @@ impl DecoderBuilder {
     ) -> Self {
         let config = ConfigOutputs {
             outputs: vec![ConfigOutput::Detection(boxes), ConfigOutput::Protos(protos)],
+            ..Default::default()
         };
         self.config_src.replace(ConfigSource::Config(config));
         self
@@ -855,6 +865,7 @@ impl DecoderBuilder {
                 ConfigOutput::MaskCoefficients(mask_coefficients),
                 ConfigOutput::Protos(protos),
             ],
+            ..Default::default()
         };
         self.config_src.replace(ConfigSource::Config(config));
         self
@@ -893,6 +904,7 @@ impl DecoderBuilder {
     ) -> Self {
         let config = ConfigOutputs {
             outputs: vec![ConfigOutput::Boxes(boxes), ConfigOutput::Scores(scores)],
+            ..Default::default()
         };
         self.config_src.replace(ConfigSource::Config(config));
         self
@@ -938,7 +950,10 @@ impl DecoderBuilder {
     /// ```
     pub fn with_config_modelpack_det_split(mut self, boxes: Vec<configs::Detection>) -> Self {
         let outputs = boxes.into_iter().map(ConfigOutput::Detection).collect();
-        let config = ConfigOutputs { outputs };
+        let config = ConfigOutputs {
+            outputs,
+            ..Default::default()
+        };
         self.config_src.replace(ConfigSource::Config(config));
         self
     }
@@ -987,6 +1002,7 @@ impl DecoderBuilder {
                 ConfigOutput::Scores(scores),
                 ConfigOutput::Segmentation(segmentation),
             ],
+            ..Default::default()
         };
         self.config_src.replace(ConfigSource::Config(config));
         self
@@ -1045,7 +1061,10 @@ impl DecoderBuilder {
             .map(ConfigOutput::Detection)
             .collect::<Vec<_>>();
         outputs.push(ConfigOutput::Segmentation(segmentation));
-        let config = ConfigOutputs { outputs };
+        let config = ConfigOutputs {
+            outputs,
+            ..Default::default()
+        };
         self.config_src.replace(ConfigSource::Config(config));
         self
     }
@@ -1072,6 +1091,7 @@ impl DecoderBuilder {
     pub fn with_config_modelpack_seg(mut self, segmentation: configs::Segmentation) -> Self {
         let config = ConfigOutputs {
             outputs: vec![ConfigOutput::Segmentation(segmentation)],
+            ..Default::default()
         };
         self.config_src.replace(ConfigSource::Config(config));
         self
@@ -1170,12 +1190,15 @@ impl DecoderBuilder {
         // Extract normalized flag from config outputs
         let normalized = Self::get_normalized(&config.outputs);
 
-        let model_type = Self::get_model_type(config.outputs, self.nms)?;
+        // Use NMS from config if present, otherwise use builder's NMS setting
+        let nms = config.nms.or(self.nms);
+
+        let model_type = Self::get_model_type(config.outputs, nms)?;
         Ok(Decoder {
             model_type,
             iou_threshold: self.iou_threshold,
             score_threshold: self.score_threshold,
-            nms: self.nms,
+            nms,
             normalized,
         })
     }
@@ -3300,7 +3323,10 @@ mod decoder_builder_tests {
     fn test_decoder_builder_empty_config() {
         use crate::DecoderBuilder;
         let result = DecoderBuilder::default()
-            .with_config(ConfigOutputs { outputs: vec![] })
+            .with_config(ConfigOutputs {
+                outputs: vec![],
+                ..Default::default()
+            })
             .build();
         assert!(
             matches!(result, Err(DecoderError::InvalidConfig(s)) if s == "No outputs found in config")
@@ -3423,6 +3449,7 @@ mod decoder_builder_tests {
                         (DimName::NumFeatures, 1),
                     ],
                 })],
+                ..Default::default()
             })
             .build();
 
@@ -3445,6 +3472,7 @@ mod decoder_builder_tests {
                         (DimName::NumBoxes, 8400),
                     ],
                 })],
+                ..Default::default()
             })
             .build();
 
@@ -4121,6 +4149,7 @@ mod decoder_builder_tests {
                         ],
                     }),
                 ],
+                ..Default::default()
             })
             .build();
 
@@ -4163,6 +4192,7 @@ mod decoder_builder_tests {
                         ],
                     }),
                 ],
+                ..Default::default()
             })
             .build();
 
@@ -4183,6 +4213,7 @@ mod decoder_builder_tests {
                     ],
                     normalized: Some(true),
                 })],
+                ..Default::default()
             })
             .build();
 
@@ -4872,5 +4903,100 @@ mod decoder_builder_tests {
                 Some((0.723, 0)),
             ]
         );
+    }
+
+    #[test]
+    fn test_nms_from_config_yaml() {
+        // Test parsing NMS from YAML config
+        let yaml_class_agnostic = r#"
+outputs:
+  - decoder: ultralytics
+    type: detection
+    shape: [1, 84, 8400]
+    dshape:
+      - [batch, 1]
+      - [num_features, 84]
+      - [num_boxes, 8400]
+nms: class_agnostic
+"#;
+        let decoder = DecoderBuilder::new()
+            .with_config_yaml_str(yaml_class_agnostic.to_string())
+            .build()
+            .unwrap();
+        assert_eq!(decoder.nms, Some(configs::Nms::ClassAgnostic));
+
+        let yaml_class_aware = r#"
+outputs:
+  - decoder: ultralytics
+    type: detection
+    shape: [1, 84, 8400]
+    dshape:
+      - [batch, 1]
+      - [num_features, 84]
+      - [num_boxes, 8400]
+nms: class_aware
+"#;
+        let decoder = DecoderBuilder::new()
+            .with_config_yaml_str(yaml_class_aware.to_string())
+            .build()
+            .unwrap();
+        assert_eq!(decoder.nms, Some(configs::Nms::ClassAware));
+
+        // Test that config NMS overrides builder NMS
+        let decoder = DecoderBuilder::new()
+            .with_config_yaml_str(yaml_class_aware.to_string())
+            .with_nms(Some(configs::Nms::ClassAgnostic)) // Builder sets agnostic
+            .build()
+            .unwrap();
+        // Config should override builder
+        assert_eq!(decoder.nms, Some(configs::Nms::ClassAware));
+    }
+
+    #[test]
+    fn test_nms_from_config_json() {
+        // Test parsing NMS from JSON config
+        let json_class_aware = r#"{
+            "outputs": [{
+                "decoder": "ultralytics",
+                "type": "detection",
+                "shape": [1, 84, 8400],
+                "dshape": [["batch", 1], ["num_features", 84], ["num_boxes", 8400]]
+            }],
+            "nms": "class_aware"
+        }"#;
+        let decoder = DecoderBuilder::new()
+            .with_config_json_str(json_class_aware.to_string())
+            .build()
+            .unwrap();
+        assert_eq!(decoder.nms, Some(configs::Nms::ClassAware));
+    }
+
+    #[test]
+    fn test_nms_missing_from_config_uses_builder_default() {
+        // Test that missing NMS in config uses builder default
+        let yaml_no_nms = r#"
+outputs:
+  - decoder: ultralytics
+    type: detection
+    shape: [1, 84, 8400]
+    dshape:
+      - [batch, 1]
+      - [num_features, 84]
+      - [num_boxes, 8400]
+"#;
+        let decoder = DecoderBuilder::new()
+            .with_config_yaml_str(yaml_no_nms.to_string())
+            .build()
+            .unwrap();
+        // Default builder NMS is ClassAgnostic
+        assert_eq!(decoder.nms, Some(configs::Nms::ClassAgnostic));
+
+        // Test with explicit builder NMS
+        let decoder = DecoderBuilder::new()
+            .with_config_yaml_str(yaml_no_nms.to_string())
+            .with_nms(None) // Explicitly set to None (bypass NMS)
+            .build()
+            .unwrap();
+        assert_eq!(decoder.nms, None);
     }
 }
