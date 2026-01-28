@@ -174,8 +174,16 @@ pub fn nms_extra_float<E: Send + Sync>(
 /// ```
 /// # use edgefirst_decoder::{BoundingBox, DetectBox, float::nms_class_aware_float};
 /// let boxes = vec![
-///     DetectBox { bbox: BoundingBox::new(0.0, 0.0, 0.5, 0.5), score: 0.9, label: 0 },
-///     DetectBox { bbox: BoundingBox::new(0.1, 0.1, 0.6, 0.6), score: 0.8, label: 1 },  // different class
+///     DetectBox {
+///         bbox: BoundingBox::new(0.0, 0.0, 0.5, 0.5),
+///         score: 0.9,
+///         label: 0,
+///     },
+///     DetectBox {
+///         bbox: BoundingBox::new(0.1, 0.1, 0.6, 0.6),
+///         score: 0.8,
+///         label: 1,
+///     }, // different class
 /// ];
 /// // Both boxes survive because they have different labels
 /// let result = nms_class_aware_float(0.3, boxes);
@@ -208,8 +216,8 @@ pub fn nms_class_aware_float(iou: f32, mut boxes: Vec<DetectBox>) -> Vec<DetectB
 
 /// Class-aware NMS with extra data: only suppress boxes with the same label.
 ///
-/// This is same as `nms_class_aware_float` but will also include extra information
-/// along with each box, such as the index.
+/// This is same as `nms_class_aware_float` but will also include extra
+/// information along with each box, such as the index.
 #[must_use]
 pub fn nms_extra_class_aware_float<E: Send + Sync>(
     iou: f32,
