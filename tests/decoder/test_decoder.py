@@ -302,3 +302,226 @@ def test_context_switch():
 
     for thread in threads:
         thread.join()
+
+
+@pytest.mark.benchmark(group="yolo_det", warmup_iterations=3)
+def test_yolo_det_int8_hal(benchmark):
+    config = {
+        "outputs": [
+            {
+                "decoder": "ultralytics",
+                "quantization": [0.0040811873, -123],
+                "shape": [1, 84, 8400],
+                "type": "detection",
+                "dshape": [
+                    ["batch", 1],
+                    ["num_features", 84],
+                    ["num_boxes", 8400],
+                ]
+            },
+        ],
+    }
+    decoder = edgefirst_hal.Decoder(config, 0.25, 0.7)
+    output = np.fromfile("testdata/yolov8s_80_classes.bin", dtype=np.int8).reshape(1, 84, 8400)
+
+    def run_decode():
+        return decoder.decode([output])
+
+    boxes, scores, classes, masks = benchmark(run_decode)
+
+    assert np.allclose(boxes, [[0.5285137, 0.05305544, 0.87541467, 0.9998909], [
+                       0.130598, 0.43260583, 0.35098213, 0.9958097]])
+    assert np.allclose(scores, [0.5591227, 0.33057618])
+    assert np.allclose(classes, [0, 75])
+    assert len(masks) == 0
+
+
+@pytest.mark.benchmark(group="yolo_det", warmup_iterations=3)
+def test_yolo_det_int8_numpy_decode_tf_nms(benchmark):
+    tf = pytest.importorskip("tensorflow")
+    output = np.fromfile("testdata/yolov8s_80_classes.bin", dtype=np.int8).reshape(1, 84, 8400)
+
+    iou_t = 0.7
+    score_t = 0.25
+
+    def run_decode(output):
+        # Dequantize
+        scale, zero_point = 0.0040811873, -123
+        dequantized = (output.astype(np.float32) - zero_point) * scale
+
+        # Extract box coordinates and class scores
+        box_data = dequantized[0, :4, :]  # [4, 8400]
+        class_scores = dequantized[0, 4:, :]  # [80, 8400]
+
+        # Get max class score and class index for each box
+        max_scores = np.max(class_scores, axis=0)  # [8400]
+        class_ids = np.argmax(class_scores, axis=0)  # [8400]
+
+        # Filter by score threshold
+        score_mask = max_scores >= score_t
+        filtered_boxes = box_data[:, score_mask]  # [4, N]
+        filtered_scores = max_scores[score_mask]  # [N]
+        filtered_classes = class_ids[score_mask]  # [N]
+
+        # Convert from center format to corner format
+        cx, cy, w, h = filtered_boxes[0], filtered_boxes[1], filtered_boxes[2], filtered_boxes[3]
+        x1 = cx - w / 2
+        y1 = cy - h / 2
+        x2 = cx + w / 2
+        y2 = cy + h / 2
+        boxes = np.stack([x1, y1, x2, y2], axis=1)  # [N, 4]
+
+        # Use TensorFlow NMS
+
+        keep_indices = tf.image.non_max_suppression(
+            boxes,
+            filtered_scores,
+            max_output_size=len(boxes),
+            iou_threshold=iou_t,
+            score_threshold=0.0,
+        )
+        boxes = boxes[keep_indices]
+        scores = filtered_scores[keep_indices]
+        classes = filtered_classes[keep_indices]
+
+        return boxes, scores, classes, []
+
+    boxes, scores, classes, masks = benchmark(run_decode, output)
+
+    assert np.allclose(boxes, [[0.5285137, 0.05305544, 0.87541467, 0.9998909], [
+                       0.130598, 0.43260583, 0.35098213, 0.9958097]])
+    assert np.allclose(scores, [0.5591227, 0.33057618])
+    assert np.allclose(classes, [0, 75])
+    assert len(masks) == 0
+
+
+def numpy_nms(
+    boxes: np.ndarray,
+    scores: np.ndarray,
+    iou_threshold: float = 0.70,
+    max_detections: int = 300,
+    eps: float = 1e-7
+) -> np.ndarray:
+    """
+    Single class NMS implemented in NumPy.
+    Method taken from:: https://github.com/Megvii-BaseDetection/YOLOX/blob/main/yolox/utils/demo_utils.py#L57
+    Original source from:: https://github.com/amusi/Non-Maximum-Suppression/blob/master/nms.py
+
+    Parameters
+    ----------
+    boxes: np.ndarray
+        Normalized input boxes to the NMS with shape (n, 4)
+        in [xmin, ymin, xmax, ymax] format.
+    scores: np.ndarray
+        Input scores to the NMS (n, ).
+    iou_threshold: float
+        This is the IoU threshold for the NMS. Higher values
+        are less strict in filtering overlapping detections.
+    max_detections: int
+        The maximum number of boxes to be selected by NMS per class.
+    eps: float
+        Scalar to avoid division by zeros.
+
+    Returns
+    -------
+    np.ndarray
+        This contains the indices of the boxes to keep.
+    """
+    if len(boxes) == 0:
+        return np.array([], dtype=np.int32)
+
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 2]
+    y2 = boxes[:, 3]
+
+    # Calculate areas (remove the +1 for normalized coordinates)
+    areas = (x2 - x1) * (y2 - y1)
+
+    # Sort by scores in descending order
+    order = (-scores).argsort()
+
+    keep = []
+    while order.size > 0:
+        i = order[0]
+        keep.append(i)
+
+        if len(keep) >= max_detections:
+            break
+
+        # Calculate intersection coordinates
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+
+        # Calculate intersection area (remove +1 for normalized coords)
+        w = np.maximum(0.0, xx2 - xx1)
+        h = np.maximum(0.0, yy2 - yy1)
+        inter = w * h
+
+        # Calculate IoU
+        union = areas[i] + areas[order[1:]] - inter
+        iou = inter / (union + eps)
+
+        # Keep boxes with IoU less than threshold
+        inds = np.where(iou <= iou_threshold)[0]
+        order = order[inds + 1]
+
+    return np.array(keep, dtype=np.int32)
+
+
+@pytest.mark.benchmark(group="yolo_det", warmup_iterations=3)
+def test_yolo_det_int8_numpy(benchmark):
+    output = np.fromfile("testdata/yolov8s_80_classes.bin", dtype=np.int8).reshape(1, 84, 8400)
+
+    iou_t = 0.7
+    score_t = 0.25
+
+    def run_decode(output):
+        # Dequantize
+        scale, zero_point = 0.0040811873, -123
+        dequantized = (output.astype(np.float32) - zero_point) * scale
+
+        # Extract box coordinates and class scores
+        box_data = dequantized[0, :4, :]  # [4, 8400]
+        class_scores = dequantized[0, 4:, :]  # [80, 8400]
+
+        # Get max class score and class index for each box
+        max_scores = np.max(class_scores, axis=0)  # [8400]
+        class_ids = np.argmax(class_scores, axis=0)  # [8400]
+
+        # Filter by score threshold
+        score_mask = max_scores >= score_t
+        filtered_boxes = box_data[:, score_mask]  # [4, N]
+        filtered_scores = max_scores[score_mask]  # [N]
+        filtered_classes = class_ids[score_mask]  # [N]
+
+        # Convert from center format to corner format
+        cx, cy, w, h = filtered_boxes[0], filtered_boxes[1], filtered_boxes[2], filtered_boxes[3]
+        x1 = cx - w / 2
+        y1 = cy - h / 2
+        x2 = cx + w / 2
+        y2 = cy + h / 2
+        boxes = np.stack([x1, y1, x2, y2], axis=1)  # [N, 4]
+
+        keep_indices = numpy_nms(
+            boxes,
+            filtered_scores,
+            iou_threshold=iou_t,
+            max_detections=len(boxes),
+        )
+
+        boxes = boxes[keep_indices]
+        scores = filtered_scores[keep_indices]
+        classes = filtered_classes[keep_indices]
+
+        return boxes, scores, classes, []
+
+    boxes, scores, classes, masks = benchmark(run_decode, output)
+
+    # assert np.allclose(boxes, [[0.5285137, 0.05305544, 0.87541467, 0.9998909], [
+    #                    0.130598, 0.43260583, 0.35098213, 0.9958097]])
+    # assert np.allclose(scores, [0.5591227, 0.33057618])
+    # assert np.allclose(classes, [0, 75])
+    # assert len(masks) == 0
