@@ -95,6 +95,7 @@ pub fn postprocess_boxes_index_quant<
 /// Uses NMS to filter boxes based on the score and iou. Sorts boxes by score,
 /// then greedily selects a subset of boxes in descending order of score.
 #[doc(hidden)]
+#[must_use]
 pub fn nms_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
     iou: f32,
     mut boxes: Vec<DetectBoxQuantized<SCORE>>,
@@ -103,6 +104,12 @@ pub fn nms_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
     // index the scoring of the boxes and can skip parts of the loop.
 
     boxes.par_sort_by(|a, b| b.score.cmp(&a.score));
+
+    // When the iou is 1.0 or larger, no boxes will be filtered so we just return
+    // immediately
+    if iou >= 1.0 {
+        return boxes;
+    }
 
     let min_val = SCORE::min_value();
     // Outer loop over all boxes.
@@ -135,6 +142,7 @@ pub fn nms_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
 /// This is same as `nms_int` but will also include extra information along
 /// with each box, such as the index
 #[doc(hidden)]
+#[must_use]
 pub fn nms_extra_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send + Sync>(
     iou: f32,
     mut boxes: Vec<(DetectBoxQuantized<SCORE>, E)>,
@@ -142,6 +150,13 @@ pub fn nms_extra_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send + 
     // Boxes get sorted by score in descending order so we know based on the
     // index the scoring of the boxes and can skip parts of the loop.
     boxes.par_sort_by(|a, b| b.0.score.cmp(&a.0.score));
+
+    // When the iou is 1.0 or larger, no boxes will be filtered so we just return
+    // immediately
+    if iou >= 1.0 {
+        return boxes;
+    }
+
     let min_val = SCORE::min_value();
     // Outer loop over all boxes.
     for i in 0..boxes.len() {
@@ -164,6 +179,81 @@ pub fn nms_extra_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send + 
     }
 
     // Filter out boxes that were suppressed.
+    boxes.into_iter().filter(|b| b.0.score > min_val).collect()
+}
+
+/// Class-aware NMS for quantized boxes: only suppress boxes with the same label.
+///
+/// Sorts boxes by score, then greedily selects a subset of boxes in descending
+/// order of score. Unlike class-agnostic NMS, boxes are only suppressed if they
+/// have the same class label AND overlap above the IoU threshold.
+#[doc(hidden)]
+#[must_use]
+pub fn nms_class_aware_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
+    iou: f32,
+    mut boxes: Vec<DetectBoxQuantized<SCORE>>,
+) -> Vec<DetectBoxQuantized<SCORE>> {
+    boxes.par_sort_by(|a, b| b.score.cmp(&a.score));
+
+    // When the iou is 1.0 or larger, no boxes will be filtered so we just return
+    // immediately
+    if iou >= 1.0 {
+        return boxes;
+    }
+
+    let min_val = SCORE::min_value();
+    for i in 0..boxes.len() {
+        if boxes[i].score <= min_val {
+            continue;
+        }
+        for j in (i + 1)..boxes.len() {
+            if boxes[j].score <= min_val {
+                continue;
+            }
+            // Only suppress if same class AND overlapping
+            if boxes[j].label == boxes[i].label && jaccard(&boxes[j].bbox, &boxes[i].bbox, iou) {
+                boxes[j].score = min_val;
+            }
+        }
+    }
+    boxes.into_iter().filter(|b| b.score > min_val).collect()
+}
+
+/// Class-aware NMS for quantized boxes with extra data: only suppress boxes with the same label.
+///
+/// This is same as `nms_class_aware_int` but will also include extra information
+/// along with each box, such as the index.
+#[doc(hidden)]
+#[must_use]
+pub fn nms_extra_class_aware_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send + Sync>(
+    iou: f32,
+    mut boxes: Vec<(DetectBoxQuantized<SCORE>, E)>,
+) -> Vec<(DetectBoxQuantized<SCORE>, E)> {
+    boxes.par_sort_by(|a, b| b.0.score.cmp(&a.0.score));
+
+    // When the iou is 1.0 or larger, no boxes will be filtered so we just return
+    // immediately
+    if iou >= 1.0 {
+        return boxes;
+    }
+
+    let min_val = SCORE::min_value();
+    for i in 0..boxes.len() {
+        if boxes[i].0.score <= min_val {
+            continue;
+        }
+        for j in (i + 1)..boxes.len() {
+            if boxes[j].0.score <= min_val {
+                continue;
+            }
+            // Only suppress if same class AND overlapping
+            if boxes[j].0.label == boxes[i].0.label
+                && jaccard(&boxes[j].0.bbox, &boxes[i].0.bbox, iou)
+            {
+                boxes[j].0.score = min_val;
+            }
+        }
+    }
     boxes.into_iter().filter(|b| b.0.score > min_val).collect()
 }
 

@@ -85,6 +85,7 @@ pub fn postprocess_boxes_index_float<
 
 /// Uses NMS to filter boxes based on the score and iou. Sorts boxes by score,
 /// then greedily selects a subset of boxes in descending order of score.
+#[must_use]
 pub fn nms_float(iou: f32, mut boxes: Vec<DetectBox>) -> Vec<DetectBox> {
     // Boxes get sorted by score in descending order so we know based on the
     // index the scoring of the boxes and can skip parts of the loop.
@@ -124,14 +125,20 @@ pub fn nms_float(iou: f32, mut boxes: Vec<DetectBox>) -> Vec<DetectBox> {
 ///
 /// This is same as `nms_float` but will also include extra information along
 /// with each box, such as the index
+#[must_use]
 pub fn nms_extra_float<E: Send + Sync>(
     iou: f32,
     mut boxes: Vec<(DetectBox, E)>,
 ) -> Vec<(DetectBox, E)> {
     // Boxes get sorted by score in descending order so we know based on the
     // index the scoring of the boxes and can skip parts of the loop.
-    // boxes.sort_by(|a, b| b.0.score.total_cmp(&a.0.score));
     boxes.par_sort_by(|a, b| b.0.score.total_cmp(&a.0.score));
+
+    // When the iou is 1.0 or larger, no boxes will be filtered so we just return
+    // immediately
+    if iou >= 1.0 {
+        return boxes;
+    }
 
     // Outer loop over all boxes.
     for i in 0..boxes.len() {
@@ -154,6 +161,84 @@ pub fn nms_extra_float<E: Send + Sync>(
     }
 
     // Filter out boxes with a score of 0.0.
+    boxes.into_iter().filter(|b| b.0.score > 0.0).collect()
+}
+
+/// Class-aware NMS: only suppress boxes with the same label.
+///
+/// Sorts boxes by score, then greedily selects a subset of boxes in descending
+/// order of score. Unlike class-agnostic NMS, boxes are only suppressed if they
+/// have the same class label AND overlap above the IoU threshold.
+///
+/// # Example
+/// ```
+/// # use edgefirst_decoder::{BoundingBox, DetectBox, float::nms_class_aware_float};
+/// let boxes = vec![
+///     DetectBox { bbox: BoundingBox::new(0.0, 0.0, 0.5, 0.5), score: 0.9, label: 0 },
+///     DetectBox { bbox: BoundingBox::new(0.1, 0.1, 0.6, 0.6), score: 0.8, label: 1 },  // different class
+/// ];
+/// // Both boxes survive because they have different labels
+/// let result = nms_class_aware_float(0.3, boxes);
+/// assert_eq!(result.len(), 2);
+/// ```
+#[must_use]
+pub fn nms_class_aware_float(iou: f32, mut boxes: Vec<DetectBox>) -> Vec<DetectBox> {
+    boxes.par_sort_by(|a, b| b.score.total_cmp(&a.score));
+
+    if iou >= 1.0 {
+        return boxes;
+    }
+
+    for i in 0..boxes.len() {
+        if boxes[i].score < 0.0 {
+            continue;
+        }
+        for j in (i + 1)..boxes.len() {
+            if boxes[j].score < 0.0 {
+                continue;
+            }
+            // Only suppress if same class AND overlapping
+            if boxes[j].label == boxes[i].label && jaccard(&boxes[j].bbox, &boxes[i].bbox, iou) {
+                boxes[j].score = -1.0;
+            }
+        }
+    }
+    boxes.into_iter().filter(|b| b.score >= 0.0).collect()
+}
+
+/// Class-aware NMS with extra data: only suppress boxes with the same label.
+///
+/// This is same as `nms_class_aware_float` but will also include extra information
+/// along with each box, such as the index.
+#[must_use]
+pub fn nms_extra_class_aware_float<E: Send + Sync>(
+    iou: f32,
+    mut boxes: Vec<(DetectBox, E)>,
+) -> Vec<(DetectBox, E)> {
+    boxes.par_sort_by(|a, b| b.0.score.total_cmp(&a.0.score));
+
+    // When the iou is 1.0 or larger, no boxes will be filtered so we just return
+    // immediately
+    if iou >= 1.0 {
+        return boxes;
+    }
+
+    for i in 0..boxes.len() {
+        if boxes[i].0.score <= 0.0 {
+            continue;
+        }
+        for j in (i + 1)..boxes.len() {
+            if boxes[j].0.score <= 0.0 {
+                continue;
+            }
+            // Only suppress if same class AND overlapping
+            if boxes[j].0.label == boxes[i].0.label
+                && jaccard(&boxes[j].0.bbox, &boxes[i].0.bbox, iou)
+            {
+                boxes[j].0.score = 0.0;
+            }
+        }
+    }
     boxes.into_iter().filter(|b| b.0.score > 0.0).collect()
 }
 
