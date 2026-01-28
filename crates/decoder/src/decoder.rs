@@ -399,8 +399,10 @@ pub mod configs {
         pub dshape: Vec<(DimName, usize)>,
         /// Whether box coordinates are normalized to [0,1] range.
         /// - `Some(true)`: Coordinates in [0,1] range relative to model input
-        /// - `Some(false)`: Pixel coordinates relative to model input (letterboxed)
-        /// - `None`: Unknown, caller must infer (e.g., check if any coordinate > 1.0)
+        /// - `Some(false)`: Pixel coordinates relative to model input
+        ///   (letterboxed)
+        /// - `None`: Unknown, caller must infer (e.g., check if any coordinate
+        ///   > 1.0)
         #[serde(default)]
         pub normalized: Option<bool>,
     }
@@ -427,8 +429,10 @@ pub mod configs {
         pub dshape: Vec<(DimName, usize)>,
         /// Whether box coordinates are normalized to [0,1] range.
         /// - `Some(true)`: Coordinates in [0,1] range relative to model input
-        /// - `Some(false)`: Pixel coordinates relative to model input (letterboxed)
-        /// - `None`: Unknown, caller must infer (e.g., check if any coordinate > 1.0)
+        /// - `Some(false)`: Pixel coordinates relative to model input
+        ///   (letterboxed)
+        /// - `None`: Unknown, caller must infer (e.g., check if any coordinate
+        ///   > 1.0)
         #[serde(default)]
         pub normalized: Option<bool>,
     }
@@ -526,15 +530,16 @@ pub mod configs {
     /// NMS (Non-Maximum Suppression) mode for filtering overlapping detections.
     ///
     /// This enum is used with `Option<Nms>`:
-    /// - `Some(Nms::ClassAgnostic)` — class-agnostic NMS (default): suppress overlapping boxes
-    ///   regardless of class label
-    /// - `Some(Nms::ClassAware)` — class-aware NMS: only suppress boxes that share the same
-    ///   class label AND overlap above the IoU threshold
+    /// - `Some(Nms::ClassAgnostic)` — class-agnostic NMS (default): suppress
+    ///   overlapping boxes regardless of class label
+    /// - `Some(Nms::ClassAware)` — class-aware NMS: only suppress boxes that
+    ///   share the same class label AND overlap above the IoU threshold
     /// - `None` — bypass NMS entirely (for end-to-end models with embedded NMS)
     #[derive(Debug, PartialEq, Serialize, Deserialize, Clone, Copy, Hash, Eq, Default)]
     #[serde(rename_all = "snake_case")]
     pub enum Nms {
-        /// Suppress overlapping boxes regardless of class label (default HAL behavior)
+        /// Suppress overlapping boxes regardless of class label (default HAL
+        /// behavior)
         #[default]
         ClassAgnostic,
         /// Only suppress boxes with the same class label that overlap
@@ -580,10 +585,11 @@ pub mod configs {
             protos: Protos,
         },
         /// End-to-end YOLO detection (post-NMS output from model)
-        /// Input shape: (1, N, 6+) where columns are [x1, y1, x2, y2, conf, class, ...]
+        /// Input shape: (1, N, 6+) where columns are [x1, y1, x2, y2, conf,
+        /// class, ...]
         YoloEndToEndDet,
-        /// End-to-end YOLO detection + segmentation (post-NMS output from model)
-        /// Input shape: (1, N, 6 + num_protos) where columns are
+        /// End-to-end YOLO detection + segmentation (post-NMS output from
+        /// model) Input shape: (1, N, 6 + num_protos) where columns are
         /// [x1, y1, x2, y2, conf, class, mask_coeff_0, ..., mask_coeff_31]
         YoloEndToEndSegDet {
             protos: Protos,
@@ -614,7 +620,8 @@ pub struct DecoderBuilder {
     config_src: Option<ConfigSource>,
     iou_threshold: f32,
     score_threshold: f32,
-    /// NMS mode: Some(mode) applies NMS, None bypasses NMS (for end-to-end models)
+    /// NMS mode: Some(mode) applies NMS, None bypasses NMS (for end-to-end
+    /// models)
     nms: Option<configs::Nms>,
 }
 
@@ -1155,7 +1162,8 @@ impl DecoderBuilder {
         self
     }
 
-    /// Sets the IOU threshold of the decoder
+    /// Sets the IOU threshold of the decoder. Has no effect when NMS is set to
+    /// `None`
     ///
     /// # Examples
     /// ```rust
@@ -1177,10 +1185,10 @@ impl DecoderBuilder {
 
     /// Sets the NMS mode for the decoder.
     ///
-    /// - `Some(Nms::ClassAgnostic)` — class-agnostic NMS (default): suppress overlapping
-    ///   boxes regardless of class label
-    /// - `Some(Nms::ClassAware)` — class-aware NMS: only suppress boxes that share the
-    ///   same class label AND overlap above the IoU threshold
+    /// - `Some(Nms::ClassAgnostic)` — class-agnostic NMS (default): suppress
+    ///   overlapping boxes regardless of class label
+    /// - `Some(Nms::ClassAware)` — class-aware NMS: only suppress boxes that
+    ///   share the same class label AND overlap above the IoU threshold
     /// - `None` — bypass NMS entirely (for end-to-end models with embedded NMS)
     ///
     /// # Examples
@@ -2007,12 +2015,14 @@ pub struct Decoder {
     model_type: ModelType,
     pub iou_threshold: f32,
     pub score_threshold: f32,
-    /// NMS mode: Some(mode) applies NMS, None bypasses NMS (for end-to-end models)
+    /// NMS mode: Some(mode) applies NMS, None bypasses NMS (for end-to-end
+    /// models)
     pub nms: Option<configs::Nms>,
     /// Whether decoded boxes are in normalized [0,1] coordinates.
     /// - `Some(true)`: Coordinates in [0,1] range
     /// - `Some(false)`: Pixel coordinates
-    /// - `None`: Unknown, caller must infer (e.g., check if any coordinate > 1.0)
+    /// - `None`: Unknown, caller must infer (e.g., check if any coordinate >
+    ///   1.0)
     normalized: Option<bool>,
 }
 
@@ -2164,11 +2174,12 @@ impl Decoder {
     ///
     /// - `Some(true)`: Boxes are in normalized [0,1] coordinates
     /// - `Some(false)`: Boxes are in pixel coordinates relative to model input
-    /// - `None`: Unknown, caller must infer (e.g., check if any coordinate > 1.0)
+    /// - `None`: Unknown, caller must infer (e.g., check if any coordinate >
+    ///   1.0)
     ///
-    /// This is determined by the model config's `normalized` field, not the NMS mode.
-    /// When coordinates are in pixels or unknown, the caller may need to normalize
-    /// using the model input dimensions.
+    /// This is determined by the model config's `normalized` field, not the NMS
+    /// mode. When coordinates are in pixels or unknown, the caller may need
+    /// to normalize using the model input dimensions.
     ///
     /// # Examples
     ///
@@ -3010,9 +3021,9 @@ impl Decoder {
 
     /// Decodes end-to-end YOLO detection outputs (post-NMS from model).
     ///
-    /// Input shape: (1, N, 6+) where columns are [x1, y1, x2, y2, conf, class, ...]
-    /// Boxes are output directly from model (may be normalized or pixel coords
-    /// depending on config).
+    /// Input shape: (1, N, 6+) where columns are [x1, y1, x2, y2, conf, class,
+    /// ...] Boxes are output directly from model (may be normalized or
+    /// pixel coords depending on config).
     fn decode_yolo_end_to_end_det_float<T>(
         &self,
         outputs: &[ArrayViewD<T>],
@@ -3050,11 +3061,12 @@ impl Decoder {
         Ok(())
     }
 
-    /// Decodes end-to-end YOLO detection + segmentation outputs (post-NMS from model).
+    /// Decodes end-to-end YOLO detection + segmentation outputs (post-NMS from
+    /// model).
     ///
     /// Input shapes:
-    /// - detection: (1, N, 6 + num_protos) where columns are
-    ///   [x1, y1, x2, y2, conf, class, mask_coeff_0, ..., mask_coeff_31]
+    /// - detection: (1, N, 6 + num_protos) where columns are [x1, y1, x2, y2,
+    ///   conf, class, mask_coeff_0, ..., mask_coeff_31]
     /// - protos: (1, proto_height, proto_width, num_protos)
     fn decode_yolo_end_to_end_segdet_float<T>(
         &self,
