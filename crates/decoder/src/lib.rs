@@ -13,7 +13,7 @@ If you already know the model type and output formats, you can use the lower-lev
 
 ### Quick Example
 ```rust
-# use edgefirst_decoder::{ DecoderBuilder, DecoderResult, configs };
+# use edgefirst_decoder::{ DecoderBuilder, DecoderResult, configs::{self, DecoderVersion} };
 # fn main() -> DecoderResult<()> {
 // Create a decoder for a YOLOv8 model with quantized int8 output with 0.25 score threshold and 0.7 IOU threshold
 let decoder = DecoderBuilder::new()
@@ -24,7 +24,8 @@ let decoder = DecoderBuilder::new()
         shape: vec![1, 84, 8400],
         dshape: Vec::new(),
         normalized: Some(true),
-    })
+    },
+    Some(DecoderVersion::Yolov8))
     .with_score_threshold(0.25)
     .with_iou_threshold(0.7)
     .build()?;
@@ -80,9 +81,8 @@ pub mod yolo;
 mod decoder;
 pub use decoder::*;
 
+pub use configs::{DecoderVersion, Nms};
 pub use error::{DecoderError, DecoderResult};
-pub use configs::Nms;
-pub use configs::DecoderVersion;
 
 use crate::{
     decoder::configs::QuantTuple, modelpack::modelpack_segmentation_to_mask,
@@ -1413,18 +1413,21 @@ mod decoder_tests {
         let quant = (0.0040811873, -123).into();
 
         let decoder = DecoderBuilder::default()
-            .with_config_yolo_det(configs::Detection {
-                decoder: DecoderType::Ultralytics,
-                shape: vec![1, 84, 8400],
-                anchors: None,
-                quantization: Some(quant),
-                dshape: vec![
-                    (DimName::Batch, 1),
-                    (DimName::NumFeatures, 84),
-                    (DimName::NumBoxes, 8400),
-                ],
-                normalized: Some(true),
-            })
+            .with_config_yolo_det(
+                configs::Detection {
+                    decoder: DecoderType::Ultralytics,
+                    shape: vec![1, 84, 8400],
+                    anchors: None,
+                    quantization: Some(quant),
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumFeatures, 84),
+                        (DimName::NumBoxes, 8400),
+                    ],
+                    normalized: Some(true),
+                },
+                Some(DecoderVersion::Yolo11),
+            )
             .with_score_threshold(score_threshold)
             .with_iou_threshold(iou_threshold)
             .build()
@@ -1607,6 +1610,7 @@ mod decoder_tests {
                         (DimName::NumProtos, 32),
                     ],
                 },
+                Some(DecoderVersion::Yolo11),
             )
             .with_score_threshold(score_threshold)
             .with_iou_threshold(iou_threshold)
@@ -2042,9 +2046,14 @@ mod decoder_tests {
             },
         ];
 
-        // Class-aware NMS should keep both boxes (different classes, IoU ~0.47 > threshold 0.3)
+        // Class-aware NMS should keep both boxes (different classes, IoU ~0.47 >
+        // threshold 0.3)
         let result = nms_class_aware_float(0.3, boxes.clone());
-        assert_eq!(result.len(), 2, "Class-aware NMS should keep both boxes with different classes");
+        assert_eq!(
+            result.len(),
+            2,
+            "Class-aware NMS should keep both boxes with different classes"
+        );
 
         // Now test with same class - should suppress one
         let same_class_boxes = vec![
@@ -2071,7 +2080,11 @@ mod decoder_tests {
         ];
 
         let result = nms_class_aware_float(0.3, same_class_boxes);
-        assert_eq!(result.len(), 1, "Class-aware NMS should suppress overlapping box with same class");
+        assert_eq!(
+            result.len(),
+            1,
+            "Class-aware NMS should suppress overlapping box with same class"
+        );
         assert_eq!(result[0].label, 0);
         assert!((result[0].score - 0.9).abs() < 1e-6);
     }
@@ -2106,11 +2119,19 @@ mod decoder_tests {
 
         // Class-agnostic should suppress one (IoU ~0.47 > threshold 0.3)
         let agnostic_result = nms_float(0.3, boxes.clone());
-        assert_eq!(agnostic_result.len(), 1, "Class-agnostic NMS should suppress overlapping boxes");
+        assert_eq!(
+            agnostic_result.len(),
+            1,
+            "Class-agnostic NMS should suppress overlapping boxes"
+        );
 
         // Class-aware should keep both (different classes)
         let aware_result = nms_class_aware_float(0.3, boxes);
-        assert_eq!(aware_result.len(), 2, "Class-aware NMS should keep boxes with different classes");
+        assert_eq!(
+            aware_result.len(),
+            2,
+            "Class-aware NMS should keep boxes with different classes"
+        );
     }
 
     #[test]
@@ -2143,7 +2164,11 @@ mod decoder_tests {
 
         // Should keep both (different classes)
         let result = nms_class_aware_int(0.5, boxes);
-        assert_eq!(result.len(), 2, "Class-aware NMS (int) should keep boxes with different classes");
+        assert_eq!(
+            result.len(),
+            2,
+            "Class-aware NMS (int) should keep boxes with different classes"
+        );
     }
 
     #[test]
@@ -2157,14 +2182,17 @@ mod decoder_tests {
     fn test_decoder_nms_mode() {
         // Test that decoder properly stores NMS mode
         let decoder = DecoderBuilder::default()
-            .with_config_yolo_det(configs::Detection {
-                anchors: None,
-                decoder: DecoderType::Ultralytics,
-                quantization: None,
-                shape: vec![1, 84, 8400],
-                dshape: Vec::new(),
-                normalized: Some(true),
-            })
+            .with_config_yolo_det(
+                configs::Detection {
+                    anchors: None,
+                    decoder: DecoderType::Ultralytics,
+                    quantization: None,
+                    shape: vec![1, 84, 8400],
+                    dshape: Vec::new(),
+                    normalized: Some(true),
+                },
+                None,
+            )
             .with_nms(Some(configs::Nms::ClassAware))
             .build()
             .unwrap();
@@ -2176,14 +2204,17 @@ mod decoder_tests {
     fn test_decoder_nms_bypass() {
         // Test that decoder can be configured with nms=None (bypass)
         let decoder = DecoderBuilder::default()
-            .with_config_yolo_det(configs::Detection {
-                anchors: None,
-                decoder: DecoderType::Ultralytics,
-                quantization: None,
-                shape: vec![1, 84, 8400],
-                dshape: Vec::new(),
-                normalized: Some(true),
-            })
+            .with_config_yolo_det(
+                configs::Detection {
+                    anchors: None,
+                    decoder: DecoderType::Ultralytics,
+                    quantization: None,
+                    shape: vec![1, 84, 8400],
+                    dshape: Vec::new(),
+                    normalized: Some(true),
+                },
+                None,
+            )
             .with_nms(None)
             .build()
             .unwrap();
@@ -2195,14 +2226,17 @@ mod decoder_tests {
     fn test_decoder_normalized_boxes_true() {
         // Test that normalized_boxes returns Some(true) when explicitly set
         let decoder = DecoderBuilder::default()
-            .with_config_yolo_det(configs::Detection {
-                anchors: None,
-                decoder: DecoderType::Ultralytics,
-                quantization: None,
-                shape: vec![1, 84, 8400],
-                dshape: Vec::new(),
-                normalized: Some(true),
-            })
+            .with_config_yolo_det(
+                configs::Detection {
+                    anchors: None,
+                    decoder: DecoderType::Ultralytics,
+                    quantization: None,
+                    shape: vec![1, 84, 8400],
+                    dshape: Vec::new(),
+                    normalized: Some(true),
+                },
+                None,
+            )
             .build()
             .unwrap();
 
@@ -2211,16 +2245,20 @@ mod decoder_tests {
 
     #[test]
     fn test_decoder_normalized_boxes_false() {
-        // Test that normalized_boxes returns Some(false) when config specifies unnormalized
+        // Test that normalized_boxes returns Some(false) when config specifies
+        // unnormalized
         let decoder = DecoderBuilder::default()
-            .with_config_yolo_det(configs::Detection {
-                anchors: None,
-                decoder: DecoderType::Ultralytics,
-                quantization: None,
-                shape: vec![1, 84, 8400],
-                dshape: Vec::new(),
-                normalized: Some(false),
-            })
+            .with_config_yolo_det(
+                configs::Detection {
+                    anchors: None,
+                    decoder: DecoderType::Ultralytics,
+                    quantization: None,
+                    shape: vec![1, 84, 8400],
+                    dshape: Vec::new(),
+                    normalized: Some(false),
+                },
+                None,
+            )
             .build()
             .unwrap();
 
@@ -2231,14 +2269,17 @@ mod decoder_tests {
     fn test_decoder_normalized_boxes_unknown() {
         // Test that normalized_boxes returns None when not specified in config
         let decoder = DecoderBuilder::default()
-            .with_config_yolo_det(configs::Detection {
-                anchors: None,
-                decoder: DecoderType::Ultralytics,
-                quantization: None,
-                shape: vec![1, 84, 8400],
-                dshape: Vec::new(),
-                normalized: None,
-            })
+            .with_config_yolo_det(
+                configs::Detection {
+                    anchors: None,
+                    decoder: DecoderType::Ultralytics,
+                    quantization: None,
+                    shape: vec![1, 84, 8400],
+                    dshape: Vec::new(),
+                    normalized: None,
+                },
+                Some(DecoderVersion::Yolo11),
+            )
             .build()
             .unwrap();
 
