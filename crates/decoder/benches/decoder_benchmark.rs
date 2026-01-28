@@ -5,7 +5,7 @@
 
 use divan::black_box_drop;
 use edgefirst_decoder::{
-    Quantization, XYWH,
+    Nms, Quantization, XYWH,
     byte::{nms_int, postprocess_boxes_quant},
     dequant_detect_box, dequantize_cpu, dequantize_cpu_chunked, dequantize_ndarray,
     float::{nms_float, postprocess_boxes_float},
@@ -34,6 +34,7 @@ fn decoder_yolo_quant(bencher: divan::Bencher) {
             (out.view(), quant),
             score_threshold,
             iou_threshold,
+            Some(Nms::ClassAgnostic),
             &mut output_boxes,
         );
     });
@@ -117,6 +118,7 @@ fn decoder_yolo_f32(bencher: divan::Bencher) {
                 out.view(),
                 score_threshold,
                 iou_threshold,
+                Some(Nms::ClassAgnostic),
                 &mut output_boxes,
             );
             black_box_drop(output_boxes);
@@ -373,6 +375,7 @@ fn decoder_masks(bencher: divan::Bencher) {
             protos.view(),
             score_threshold,
             iou_threshold,
+            Some(Nms::ClassAgnostic),
             &mut output_boxes,
             &mut output_masks,
         );
@@ -409,6 +412,7 @@ fn decoder_masks_i8(bencher: divan::Bencher) {
             (protos.view(), quant_protos),
             score_threshold,
             iou_threshold,
+            Some(Nms::ClassAgnostic),
             &mut output_boxes,
             &mut output_masks,
         );
