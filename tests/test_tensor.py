@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import numpy as np
-from edgefirst_hal import Tensor
+from edgefirst_hal import Tensor, TensorMemory
 from unittest import TestCase
 
 
@@ -283,3 +283,122 @@ class TestTensor(TestCase):
                 self.assertEqual(n[0, 0, 0, 0, 0], 10.0)
                 self.assertEqual(n[0, 0, 0, 0, 1], -9000000000000000000.0)
         self.assertRaises(BufferError, lambda: m[0])
+
+    def test_from_fd_dma(self):
+        try:
+            tensor = Tensor([100, 100, 3], dtype="uint8", mem=TensorMemory.DMA)
+        except (AttributeError, RuntimeError):
+            self.skipTest("DMA memory not supported on this platform")
+
+        assert tensor.memory == TensorMemory.DMA
+
+        tensor_fd = Tensor.from_fd(tensor.fd, tensor.shape, tensor.dtype)
+
+        assert tensor_fd.size == tensor.size
+        assert tensor_fd.shape == tensor.shape
+        assert tensor_fd.dtype == tensor.dtype
+        assert tensor_fd.memory == tensor.memory
+
+        with tensor.map() as m:
+            for i in range(tensor.size):
+                m[i] = 233
+
+        with tensor_fd.map() as m:
+            for i in range(tensor_fd.size):
+                assert m[i] == 233
+
+    def test_dma_zero_copy_perf(self):
+
+        try:
+            tensor = Tensor([100, 100, 3], dtype="uint8", mem=TensorMemory.DMA)
+        except (AttributeError, RuntimeError):
+            self.skipTest("DMA memory not supported on this platform")
+
+        assert tensor.memory == TensorMemory.DMA
+
+        import time
+        start = time.perf_counter()
+        tensor_fd = Tensor.from_fd(tensor.fd, tensor.shape, tensor.dtype)
+        elapsed = time.perf_counter() - start
+
+        assert tensor_fd.size == tensor.size
+        assert tensor_fd.shape == tensor.shape
+        assert tensor_fd.dtype == tensor.dtype
+        assert tensor_fd.memory == tensor.memory
+
+        with tensor.map() as m:
+            for i in range(tensor.size):
+                m[i] = 233
+
+        with tensor_fd.map() as m:
+            for i in range(tensor_fd.size):
+                assert m[i] == 233
+
+        tensor_copy = Tensor(
+            tensor.shape, dtype=tensor.dtype, mem=tensor.memory)
+        start = time.perf_counter()
+        with tensor.map() as src, tensor_copy.map() as dst:
+            for i in range(tensor.size):
+                dst[i] = src[i]
+        elapsed_copy = time.perf_counter() - start
+
+        assert elapsed < elapsed_copy
+
+    def test_from_fd_shm(self):
+        try:
+            tensor = Tensor([100, 100, 3], dtype="uint8", mem=TensorMemory.SHM)
+        except (AttributeError, RuntimeError):
+            self.skipTest("SHM memory not supported on this platform")
+
+        assert tensor.memory == TensorMemory.SHM
+
+        tensor_fd = Tensor.from_fd(tensor.fd, tensor.shape, tensor.dtype)
+
+        assert tensor_fd.size == tensor.size
+        assert tensor_fd.shape == tensor.shape
+        assert tensor_fd.dtype == tensor.dtype
+        assert tensor_fd.memory == tensor.memory
+
+        with tensor.map() as m:
+            for i in range(tensor.size):
+                m[i] = 233
+
+        with tensor_fd.map() as m:
+            for i in range(tensor_fd.size):
+                assert m[i] == 233
+
+    def test_shm_zero_copy_perf(self):
+        try:
+            tensor = Tensor([100, 100, 3], dtype="uint8", mem=TensorMemory.SHM)
+        except (AttributeError, RuntimeError):
+            self.skipTest("SHM memory not supported on this platform")
+
+        assert tensor.memory == TensorMemory.SHM
+
+        import time
+        start = time.perf_counter()
+        tensor_fd = Tensor.from_fd(tensor.fd, tensor.shape, tensor.dtype)
+        elapsed = time.perf_counter() - start
+
+        assert tensor_fd.size == tensor.size
+        assert tensor_fd.shape == tensor.shape
+        assert tensor_fd.dtype == tensor.dtype
+        assert tensor_fd.memory == tensor.memory
+
+        with tensor.map() as m:
+            for i in range(tensor.size):
+                m[i] = 233
+
+        with tensor_fd.map() as m:
+            for i in range(tensor_fd.size):
+                assert m[i] == 233
+
+        tensor_copy = Tensor(
+            tensor.shape, dtype=tensor.dtype, mem=tensor.memory)
+        start = time.perf_counter()
+        with tensor.map() as src, tensor_copy.map() as dst:
+            for i in range(tensor.size):
+                dst[i] = src[i]
+        elapsed_copy = time.perf_counter() - start
+
+        assert elapsed < elapsed_copy
