@@ -1,14 +1,14 @@
 # SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 # SPDX-License-Identifier: Apache-2.0
 
+import pytest
+import os
+import math
+
 from edgefirst_hal import TensorImage, ImageProcessor, Flip, FourCC, Rotation
 import numpy as np
-from PIL import Image
-import math
-import os
 
-import pytest
-
+Image = pytest.importorskip("PIL.Image")
 dst_size = (512, 512)
 
 
@@ -21,10 +21,10 @@ def load_image(image, format="RGBA", resize=None, rotate=None):
         im = im.transpose(rotate)
     return np.array(im)
 
+
 # PIL image rotation is counter clockwise
-
-
 def load_bytes_to_image(bytes, format, size, resize=None, rotate=None):
+
     im = Image.frombytes(format, size, bytes)
     if resize is not None:
         im = im.resize(resize)
@@ -47,24 +47,30 @@ def calculate_similarity_rms_u8(imageA, imageB) -> float:
     return 1.0-rms
 
 
-gl = os.environ.get("EDGEFIRST_DISABLE_GL", "0")
-g2d = os.environ.get("EDGEFIRST_DISABLE_G2D", "0")
-cpu = os.environ.get("EDGEFIRST_DISABLE_CPU", "0")
+original_env = os.environ.copy()
+try:
+    gl = os.environ.get("EDGEFIRST_DISABLE_GL", "0")
+    g2d = os.environ.get("EDGEFIRST_DISABLE_G2D", "0")
+    cpu = os.environ.get("EDGEFIRST_DISABLE_CPU", "0")
 
-os.environ["EDGEFIRST_DISABLE_GL"] = "1"
-os.environ["EDGEFIRST_DISABLE_G2D"] = "1"
-os.environ["EDGEFIRST_DISABLE_CPU"] = cpu
-cpu_processor = ImageProcessor()
+    os.environ["EDGEFIRST_DISABLE_GL"] = "1"
+    os.environ["EDGEFIRST_DISABLE_G2D"] = "1"
+    os.environ["EDGEFIRST_DISABLE_CPU"] = cpu
+    cpu_processor = ImageProcessor()
 
-os.environ["EDGEFIRST_DISABLE_GL"] = gl
-os.environ["EDGEFIRST_DISABLE_G2D"] = "1"
-os.environ["EDGEFIRST_DISABLE_CPU"] = "1"
-gl_processor = ImageProcessor()
+    os.environ["EDGEFIRST_DISABLE_GL"] = gl
+    os.environ["EDGEFIRST_DISABLE_G2D"] = "1"
+    os.environ["EDGEFIRST_DISABLE_CPU"] = "1"
+    gl_processor = ImageProcessor()
 
-os.environ["EDGEFIRST_DISABLE_GL"] = "1"
-os.environ["EDGEFIRST_DISABLE_CPU"] = "1"
-os.environ["EDGEFIRST_DISABLE_G2D"] = g2d
-g2d_processor = ImageProcessor()
+    os.environ["EDGEFIRST_DISABLE_GL"] = "1"
+    os.environ["EDGEFIRST_DISABLE_CPU"] = "1"
+    os.environ["EDGEFIRST_DISABLE_G2D"] = g2d
+    g2d_processor = ImageProcessor()
+
+finally:
+    os.environ.clear()
+    os.environ.update(original_env)
 
 
 @pytest.mark.benchmark(group="rgba_to_rgba", warmup_iterations=3)
@@ -80,36 +86,6 @@ def test_resize_cpu_rgba_to_rgba(benchmark):
         arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst.height, dst.width, 4))
         expected = load_image("testdata/zidane.jpg", "RGBA", resize=dst_size)
         assert calculate_similarity_rms_u8(arr_dst, expected) > 0.98
-
-# Removed due to issues with setting CPU affinity correctly
-# @pytest.mark.benchmark(group="rgba_to_rgba", warmup_iterations=3)
-# def test_resize_cv2_rgba_to_rgba_single_core(benchmark):
-#     """Benchmark CV2 RGBA to RGBA resize, limited to a single core"""
-#     if sys.platform != "linux":
-#         pytest.skip("CPU affinity setting is only supported on Linux")
-#     aff = os.sched_getaffinity(0)
-#     os.sched_setaffinity(0, {0})
-#     cv2 = pytest.importorskip("cv2")
-
-#     def resize(arr, size, dst):
-#         cv2.resize(arr, size, dst=dst)
-#         _ = dst[0, 0]
-#     src = TensorImage.load("testdata/zidane.jpg", FourCC.RGBA)
-#     dst_cv2 = TensorImage(*dst_size, FourCC.RGBA)
-#     dst = TensorImage(*dst_size, FourCC.RGBA)
-
-#     with src.map() as m, dst_cv2.map() as d:
-#         arr = np.frombuffer(m.view(), dtype=np.uint8).reshape((src.height, src.width, 4))
-#         d = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst_cv2.height, dst_cv2.width, 4))
-#         benchmark(resize, arr, dst_size, dst=d)
-
-#     cpu_processor.convert(src, dst, Rotation.Rotate0, Flip.NoFlip)
-
-#     with dst.map() as d, dst_cv2.map() as d_cv2:
-#         arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst.height, dst.width, 4))
-#         arr_cv2 = np.frombuffer(d_cv2.view(), dtype=np.uint8).reshape((dst_cv2.height, dst_cv2.width, 4))
-#         assert calculate_similarity_rms_u8(arr_dst, arr_cv2) > 0.98
-#     os.sched_setaffinity(0, aff)
 
 
 @pytest.mark.benchmark(group="rgba_to_rgba", warmup_iterations=3)
@@ -141,9 +117,6 @@ def test_resize_cv2_rgba_to_rgba(benchmark):
 @pytest.mark.benchmark(group="rgba_to_rgba", warmup_iterations=3)
 def test_resize_gl_rgba_to_rgba(benchmark):
     """Benchmark GL RGBA to RGBA resize."""
-    with open("testdata/camera720p.rgba", "rb") as f:
-        data = f.read()
-
     src = TensorImage.load("testdata/zidane.jpg", FourCC.RGBA)
     dst = TensorImage(*dst_size, FourCC.RGBA)
 
@@ -163,8 +136,6 @@ def test_resize_gl_rgba_to_rgba(benchmark):
 @pytest.mark.benchmark(group="rgba_to_rgba", warmup_iterations=3)
 def test_resize_g2d_rgba_to_rgba(benchmark):
     """Benchmark G2D RGBA to RGBA resize."""
-    with open("testdata/camera720p.rgba", "rb") as f:
-        data = f.read()
 
     src = TensorImage.load("testdata/zidane.jpg", FourCC.RGBA)
     dst = TensorImage(*dst_size, FourCC.RGBA)

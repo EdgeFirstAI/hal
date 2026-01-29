@@ -396,8 +396,9 @@ def test_yolo_det_int8_numpy_decode_tf_nms(benchmark):
 
 @pytest.mark.benchmark(group="yolo_det", warmup_iterations=3)
 def test_yolo_det_int8_cv2(benchmark):
+    cv2 = pytest.importorskip("cv2")
+
     output = np.fromfile("testdata/yolov8s_80_classes.bin", dtype=np.int8).reshape(1, 84, 8400)
-    import cv2
     iou_t = 0.7
     score_t = 0.25
 
@@ -437,11 +438,11 @@ def test_yolo_det_int8_cv2(benchmark):
 
     boxes, scores, classes, masks = benchmark(run_decode, output)
 
-    # assert np.allclose(boxes, [[0.5285137, 0.05305544, 0.87541467, 0.9998909], [
-    #                    0.130598, 0.43260583, 0.35098213, 0.9958097]])
-    # assert np.allclose(scores, [0.5591227, 0.33057618])
-    # assert np.allclose(classes, [0, 75])
-    # assert len(masks) == 0
+    assert np.allclose(boxes, [[0.5285137, 0.05305544, 0.87541467, 0.9998909], [
+                       0.130598, 0.43260583, 0.35098213, 0.9958097]])
+    assert np.allclose(scores, [0.5591227, 0.33057618])
+    assert np.allclose(classes, [0, 75])
+    assert len(masks) == 0
 
 
 @pytest.mark.benchmark(group="yolo_det", warmup_iterations=3)
@@ -468,16 +469,12 @@ def test_yolo_det_int8_no_nms(benchmark):
         filtered_classes = np.argmax(class_scores[:, score_mask], axis=0)  # [N]
 
         # Convert from center format to corner format
-        # Convert from center format to corner format using matrix multiplication
-        # filtered_boxes is [4, N], we need [N, 4] for output
-        # Transform: [cx, cy, w, h] -> [x1, y1, x2, y2] where x1=cx-w/2, y1=cy-h/2, x2=cx+w/2, y2=cy+h/2
-        transform = np.array([
-            [1, 0, -0.5, 0],    # x1 = cx - w/2
-            [0, 1, 0, -0.5],    # y1 = cy - h/2
-            [1, 0, 0.5, 0],     # x2 = cx + w/2
-            [0, 1, 0, 0.5]      # y2 = cy + h/2
-        ])
-        boxes = (transform @ filtered_boxes).T  # [4, N] -> [N, 4]
+        cx, cy, w, h = filtered_boxes[0], filtered_boxes[1], filtered_boxes[2], filtered_boxes[3]
+        x1 = cx - w / 2
+        y1 = cy - h / 2
+        x2 = cx + w / 2
+        y2 = cy + h / 2
+        boxes = np.stack([x1, y1, x2, y2], axis=1)  # [N, 4]
 
         return boxes, filtered_scores, filtered_classes, []
 
@@ -608,8 +605,8 @@ def test_yolo_det_int8_numpy(benchmark):
 
     boxes, scores, classes, masks = benchmark(run_decode, output)
 
-    # assert np.allclose(boxes, [[0.5285137, 0.05305544, 0.87541467, 0.9998909], [
-    #                    0.130598, 0.43260583, 0.35098213, 0.9958097]])
-    # assert np.allclose(scores, [0.5591227, 0.33057618])
-    # assert np.allclose(classes, [0, 75])
-    # assert len(masks) == 0
+    assert np.allclose(boxes, [[0.5285137, 0.05305544, 0.87541467, 0.9998909], [
+                       0.130598, 0.43260583, 0.35098213, 0.9958097]])
+    assert np.allclose(scores, [0.5591227, 0.33057618])
+    assert np.allclose(classes, [0, 75])
+    assert len(masks) == 0
