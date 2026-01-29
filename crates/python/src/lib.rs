@@ -41,6 +41,7 @@ pub mod edgefirst_hal {
         m.add_function(wrap_pyfunction!(build_info, m)?)?;
 
         m.add_class::<tensor::PyTensor>()?;
+        m.add_class::<tensor::PyTensorMemory>()?;
         m.add_class::<image::FourCC>()?;
         m.add_class::<image::Normalization>()?;
         m.add_class::<image::PyRect>()?;
@@ -48,7 +49,6 @@ pub mod edgefirst_hal {
         m.add_class::<image::PyFlip>()?;
         m.add_class::<image::PyImageProcessor>()?;
         m.add_class::<image::PyTensorImage>()?;
-        m.add_class::<image::PyTensorMemory>()?;
         m.add_class::<decoder::PyDecoder>()?;
         m.add_class::<decoder::PyNms>()?;
 

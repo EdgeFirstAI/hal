@@ -1,7 +1,8 @@
 import numpy as np
 import numpy.typing as npt
-from typing import Union, Tuple, List
+from typing import Literal, Union, Tuple, List
 import enum
+import sys
 
 """EdgeFirst HAL Python bindings."""
 DetectionOutput = Tuple[
@@ -31,7 +32,6 @@ A tuple containing:
 
 
 class Decoder:
-    # [pyo3(signature = (config, score_threshold=0.1, iou_threshold=0.7))]
     def __init__(
         self, config: dict, score_threshold: float = 0.1, iou_threshold: float = 0.7
     ) -> None:
@@ -40,7 +40,6 @@ class Decoder:
         """
         ...
 
-    # [pyo3(signature = (json_str, score_threshold=0.1, iou_threshold=0.7))]
     @staticmethod
     def new_from_json_str(
         json_str: str, score_threshold: float = 0.1, iou_threshold: float = 0.7
@@ -50,7 +49,6 @@ class Decoder:
         """
         ...
 
-    # [pyo3(signature = (yaml_str, score_threshold=0.1, iou_threshold=0.7))]
     @staticmethod
     def new_from_yaml_str(
         yaml_str: str, score_threshold: float = 0.1, iou_threshold=0.7
@@ -60,7 +58,6 @@ class Decoder:
         """
         ...
 
-    # [pyo3(signature = (model_output, max_boxes=100))]
     def decode(self, model_output: List[np.ndarray], max_boxes=100) -> SegDetOutput:
         """
         Decode model outputs into detection and segmentation results. When giving quantized
@@ -73,8 +70,6 @@ class Decoder:
         the same floating point type.
         """
         ...
-
-    # [pyo3(signature = (boxes, quant_boxes=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
 
     @staticmethod
     def decode_yolo_det(
@@ -98,7 +93,6 @@ class Decoder:
         """
         ...
 
-    # [pyo3(signature = (boxes, protos, quant_boxes=(1.0, 0), quant_protos=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
     @staticmethod
     def decode_yolo_segdet(
         boxes: Union[
@@ -122,7 +116,6 @@ class Decoder:
         """
         ...
 
-    # [pyo3(signature = (boxes, scores, quant_boxes=(1.0, 0), quant_scores=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
     @staticmethod
     def decode_modelpack_det(
         boxes: Union[
@@ -146,7 +139,6 @@ class Decoder:
         """
         ...
 
-    # [pyo3(signature = (boxes, anchors, quant=Vec::new(), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
     @staticmethod
     def decode_modelpack_det_split(
         boxes: List[
@@ -168,7 +160,6 @@ class Decoder:
         """
         ...
 
-    # [pyo3(signature = (quantized, quant_boxes, dequant_into))]
     @staticmethod
     def dequantize(
         quantized: Union[
@@ -188,7 +179,6 @@ class Decoder:
         """
         ...
 
-    # [pyo3(signature = (segmentation))]
     @staticmethod
     def segmentation_to_mask(segmentation: npt.NDArray[np.uint8]) -> None:
         """Converts a 3D segmentation tensor into a 2D mask."""
@@ -215,6 +205,141 @@ class Decoder:
 
     @iou_threshold.setter
     def iou_threshold(self, value: float): ...
+
+
+class TensorMemory(enum.Enum):
+    if sys.platform == "linux":
+        DMA: TensorMemory
+        """
+        Direct Memory Access (DMA) allocation. Incurs additional overhead for memory reading/writing with the CPU. 
+        Allows for hardware acceleration when supported
+        """
+
+        SHM: TensorMemory
+        """
+        POSIX Shared Memory allocation. Suitable for inter-process
+        communication, but not suitable for hardware acceleration.
+        """
+    MEM: TensorMemory
+    """Regular system memory allocation"""
+
+
+class Tensor:
+
+    if sys.platform == 'linux':
+        def __init__(
+            self,
+            shape: list[int],
+            dtype: Literal["int8", "uint8", "int16", "uint16",
+                           "int32", "uint32", "int64", "uint64",
+                           "float32", "float64"] = "float32",
+            mem: None | TensorMemory = None,
+            name: None | str = None
+        ) -> None: ...
+        """
+        Create a new tensor with the given shape, memory type, and optional
+        name. If no name is given, a random name will be generated. If no
+        memory type is given, the best available memory type will be chosen
+        based on the platform and environment variables.
+            
+        On Linux platforms, the order of preference is: DMA -> SHM -> MEM.
+        On non-Linux platforms, only MEM is available.
+        
+        # Environment Variables
+        - `EDGEFIRST_TENSOR_FORCE_MEM`: If set to a non-zero and non-false
+        value, forces the use of regular system memory allocation
+        (`TensorMemory.MEM`) regardless of platform capabilities.
+        """
+
+        @staticmethod
+        def from_fd(
+            fd: int,
+            shape: list[int],
+            dtype: Literal["int8", "uint8", "int16", "uint16",
+                           "int32", "uint32", "int64", "uint64",
+                           "float32", "float64"] = "float32",
+            name: None | str = None
+        ) -> Tensor: ...
+        """
+        Create a new tensor using the given file descriptor, shape, and optional
+        name. If no name is given, a random name will be generated.
+
+        Inspects the file descriptor to determine the appropriate tensor type
+        (DMA or SHM) based on the device major and minor numbers.
+
+        This will take ownership of the file descriptor, and the file descriptor will 
+        be closed when the tensor is dropped.
+        """
+
+        @property
+        def fd(self) -> int: ...
+        """Gets a duplicate of the file descriptor associated with the tensor's memory. The caller will be responsible for closing the file descriptor."""
+
+    else:
+        def __init__(
+            self,
+            shape: list[int],
+            dtype: Literal["int8", "uint8", "int16", "uint16",
+                           "int32", "uint32", "int64", "uint64",
+                           "float32", "float64"] = "float32",
+            mem: None | TensorMemory = None,
+            name: None | str = None
+        ) -> None: ...
+        """
+        Create a new tensor with the given shape, memory type, and optional
+        name. If no name is given, a random name will be generated. If no
+        memory type is given, the best available memory type will be chosen
+        based on the platform and environment variables.
+
+        On Linux platforms, the order of preference is: DMA -> SHM -> MEM.
+        On non-Linux platforms, only MEM is available.
+
+        # Environment Variables
+        - `EDGEFIRST_TENSOR_FORCE_MEM`: If set to a non-zero and non-false
+        value, forces the use of regular system memory allocation
+        (`TensorMemory.MEM`) regardless of platform capabilities.
+        """
+
+    @property
+    def dtype(self) -> Literal["int8", "uint8", "int16", "uint16",
+                               "int32", "uint32", "int64", "uint64",
+                               "float32", "float64"]: ...
+    """The data type of the tensor."""
+
+    @property
+    def size(self) -> int: ...
+    """The size of the tensor in bytes."""
+
+    @property
+    def memory(self) -> TensorMemory: ...
+    """The memory type of the tensor."""
+
+    @property
+    def name(self) -> str: ...
+    """The name of the tensor."""
+
+    @property
+    def shape(self) -> list[int]: ...
+    """The shape of the tensor."""
+
+    def reshape(self, shape: list[int]) -> None: ...
+    """Reshape the tensor to the given shape. The total number of elements must remain the same."""
+
+    def map(self) -> TensorMap: ...
+    """Returns a mapped view of the tensor data for direct access."""
+
+
+class TensorMap:
+    def unmap(self) -> None: ...
+    def view(self) -> memoryview: ...
+    def __repr__(self) -> str: ...
+    def __len__(self) -> int: ...
+    def __getitem__(self, index: int) -> object: ...
+    def __setitem__(self, index: int, value: object) -> None: ...
+    def __getbuffer__(self, view, _flags) -> None: ...
+    def __releasebuffer__(self, view) -> None: ...
+    def __enter__(self) -> TensorMap: ...
+    def __exit__(self, _exc_type, _exc_value, _traceback) -> None: ...
 
 
 class FourCC(enum.Enum):
@@ -289,40 +414,7 @@ class Normalization(enum.Enum):
     """
 
 
-class TensorMap:
-    def unmap(self) -> None: ...
-    def view(self) -> object: ...
-    def __repr__(self) -> str: ...
-    def __len__(self) -> int: ...
-    def __getitem__(self) -> object: ...
-    def __setitem__(self, index: int, value: object) -> None: ...
-    def __getbuffer__(self, view, _flags) -> None: ...
-    def __releasebuffer__(self, view) -> None: ...
-    def __enter__(self) -> TensorMap: ...
-    def __exit__(self, _exc_type, _exc_value, _traceback) -> None: ...
-
-
-class TensorMemory(enum.Enum):
-    import sys
-
-    if sys.platform == "linux":
-        DMA: TensorMemory
-        """
-        Direct Memory Access (DMA) allocation. Incurs additional overhead for memory reading/writing with the CPU. 
-        Allows for hardware acceleration when suppported
-        """
-
-        SHM: TensorMemory
-        """
-        POSIX Shared Memory allocation. Suitable for inter-process
-        communication, but not suitable for hardware acceleration.
-        """
-    MEM: TensorMemory
-    """Regular system memory allocation"""
-
-
 class TensorImage:
-    # [pyo3(signature = (width, height, fourcc = FourCC::RGB))]
     def __init__(
         self,
         width: int,
@@ -336,7 +428,6 @@ class TensorImage:
         """
         ...
 
-    # [pyo3(signature = (data, fourcc = None))]
     @staticmethod
     def load_from_bytes(
         data: bytes,
@@ -350,7 +441,6 @@ class TensorImage:
         """
         ...
 
-    # [pyo3(signature = (filename, fourcc = None))]
     @staticmethod
     def load(
         filename: str,
@@ -363,7 +453,6 @@ class TensorImage:
         """
         ...
 
-    # [pyo3(signature = (filename, quality=80))]
     def save_jpeg(self, filename: str, quality: int = 80) -> None:
         """Save the image as a JPEG file to disk with the specified quality (1-100). The image must be RGB or RGBA format."""
         ...
@@ -460,7 +549,6 @@ class ImageProcessor:
 
     def __init__(self) -> None: ...
 
-    # [pyo3(signature = (dst, bbox, scores, classes, seg=vec![]))]
     def render_to_image(
             self,
             dst: TensorImage,
@@ -482,8 +570,6 @@ class ImageProcessor:
         will be set. Each color should be a list of 4 values (0-255 inclusive) representing RGBA.
         """
         ...
-
-    # [pyo3(signature = (src, dst, rotation = PyRotation::Rotate0, flip = PyFlip::NoFlip, src_crop = None, dst_crop = None, dst_color = None))]
 
     def convert(
         self,

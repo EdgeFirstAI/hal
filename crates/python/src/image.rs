@@ -3,12 +3,12 @@
 
 use crate::{
     FunctionTimer,
-    tensor::{PyTensorMap, TensorMapT},
+    tensor::{PyTensorMap, PyTensorMemory, TensorMapT},
 };
 use edgefirst::{
     decoder::{BoundingBox, DetectBox, Segmentation},
     image::{self, Crop, Flip, ImageProcessorTrait, RGBA, Rect, Rotation, TensorImage},
-    tensor::{self, TensorMapTrait, TensorMemory, TensorTrait},
+    tensor::{self, TensorMapTrait, TensorTrait},
 };
 use four_char_code::FourCharCode;
 
@@ -180,29 +180,6 @@ impl TryFrom<FourCharCode> for FourCC {
 
     fn try_from(value: FourCharCode) -> Result<Self, Self::Error> {
         Self::try_from(value.to_string().to_uppercase().as_str())
-    }
-}
-
-#[pyclass(name = "TensorMemory", eq, eq_int)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(clippy::upper_case_acronyms)]
-pub enum PyTensorMemory {
-    #[cfg(target_os = "linux")]
-    DMA,
-    #[cfg(target_os = "linux")]
-    SHM,
-    MEM,
-}
-
-impl From<PyTensorMemory> for TensorMemory {
-    fn from(value: PyTensorMemory) -> Self {
-        match value {
-            #[cfg(target_os = "linux")]
-            PyTensorMemory::DMA => TensorMemory::Dma,
-            #[cfg(target_os = "linux")]
-            PyTensorMemory::SHM => TensorMemory::Shm,
-            PyTensorMemory::MEM => TensorMemory::Mem,
-        }
     }
 }
 
