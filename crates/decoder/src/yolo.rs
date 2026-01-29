@@ -337,21 +337,19 @@ pub fn decode_yolo_split_segdet_float<T>(
 }
 
 /// Decodes end-to-end YOLO detection outputs (post-NMS from model).
+/// Expects an array of shape `(6, N)`, where the first dimension (rows)
+/// corresponds to the 6 per-detection features
+/// `[x1, y1, x2, y2, conf, class]` and the second dimension (columns)
+/// indexes the `N` detections.
+/// Boxes are output directly without NMS (the model already applied NMS).
 ///
-/// Input shape: (6, N),  where columns are [x1, y1, x2, y2, conf, class, ...]
-/// Boxes are output directly without NMS (model already applied NMS).
-///
-/// Coordinates may be normalized [0,1] or pixel values depending on model
-/// config. The caller should check `decoder.normalized_boxes()` to determine
-/// which.
-/// Decodes end-to-end YOLO detection outputs (post-NMS from model).
-///
-/// Input shape: (6, N) where rows are [x1, y1, x2, y2, conf, class]
-/// Boxes are output directly without NMS (model already applied NMS).
+/// Coordinates may be normalized `[0, 1]` or absolute pixel values depending
+/// on the model configuration. The caller should check
+/// `decoder.normalized_boxes()` to determine which.
 ///
 /// # Errors
 ///
-/// Returns `DecoderError::InvalidShape` if output has fewer than 6 rows.
+/// Returns `DecoderError::InvalidShape` if `output` has fewer than 6 rows.
 pub fn decode_yolo_end_to_end_det_float<T>(
     output: ArrayView2<T>,
     score_threshold: f32,
