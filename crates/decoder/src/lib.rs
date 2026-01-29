@@ -2027,7 +2027,8 @@ mod decoder_tests {
                         (DimName::NumFeatures, 84),
                         (DimName::NumBoxes, 8400),
                     ],
-                })
+                    normalized: None,
+                }, None)
                 .with_score_threshold(score_threshold)
                 .with_iou_threshold(iou_threshold)
                 .build()
@@ -2137,6 +2138,7 @@ mod decoder_tests {
                                 (DimName::Width, 30),
                                 (DimName::NumAnchorsXFeatures, 18),
                             ],
+                            normalized: None,
                         },
                         configs::Detection {
                             decoder: DecoderType::ModelPack,
@@ -2149,6 +2151,7 @@ mod decoder_tests {
                                 (DimName::Width, 15),
                                 (DimName::NumAnchorsXFeatures, 18),
                             ],
+                            normalized: None,
                         },
                     ],
                     configs::Segmentation {
