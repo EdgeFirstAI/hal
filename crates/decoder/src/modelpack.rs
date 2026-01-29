@@ -530,6 +530,7 @@ mod modelpack_tests {
                 (DimName::Width, 17),
                 (DimName::NumAnchorsXFeatures, 18),
             ],
+            normalized: Some(true),
         };
         let config = ModelPackDetectionConfig::try_from(&det).unwrap();
         assert_eq!(
@@ -551,6 +552,7 @@ mod modelpack_tests {
                 (DimName::Width, 17),
                 (DimName::NumAnchorsXFeatures, 18),
             ],
+            normalized: Some(true),
         };
         let result = ModelPackDetectionConfig::try_from(&det);
         assert!(
