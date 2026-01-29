@@ -3149,7 +3149,7 @@ impl Decoder {
             det_tensor,
             self.score_threshold,
             output_boxes,
-        );
+        )?;
         Ok(())
     }
 
@@ -3194,7 +3194,7 @@ impl Decoder {
             self.score_threshold,
             output_boxes,
             output_masks,
-        );
+        )?;
         Ok(())
     }
 
