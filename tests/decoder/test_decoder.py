@@ -485,8 +485,6 @@ def numpy_nms(
     boxes: np.ndarray,
     scores: np.ndarray,
     iou_threshold: float = 0.70,
-    max_detections: int = 300,
-    eps: float = 1e-7
 ) -> np.ndarray:
     """
     Single class NMS implemented in NumPy.
@@ -503,10 +501,6 @@ def numpy_nms(
     iou_threshold: float
         This is the IoU threshold for the NMS. Higher values
         are less strict in filtering overlapping detections.
-    max_detections: int
-        The maximum number of boxes to be selected by NMS per class.
-    eps: float
-        Scalar to avoid division by zeros.
 
     Returns
     -------
@@ -525,15 +519,12 @@ def numpy_nms(
     areas = (x2 - x1) * (y2 - y1)
 
     # Sort by scores in descending order
-    order = (-scores).argsort()
+    order = (-scores).argsort(stable=True)
 
     keep = []
     while order.size > 0:
         i = order[0]
         keep.append(i)
-
-        if len(keep) >= max_detections:
-            break
 
         # Calculate intersection coordinates
         xx1 = np.maximum(x1[i], x1[order[1:]])
@@ -548,10 +539,10 @@ def numpy_nms(
 
         # Calculate IoU
         union = areas[i] + areas[order[1:]] - inter
-        iou = inter / (union + eps)
+        iou = np.where(union > 0, inter / union, 0.0)
 
         # Keep boxes with IoU less than threshold
-        inds = np.where(iou <= iou_threshold)[0]
+        inds = np.where(iou < iou_threshold)[0]
         order = order[inds + 1]
 
     return np.array(keep, dtype=np.int32)
@@ -590,12 +581,7 @@ def test_yolo_det_int8_numpy(benchmark):
         y2 = cy + h / 2
         boxes = np.stack([x1, y1, x2, y2], axis=1)  # [N, 4]
 
-        keep_indices = numpy_nms(
-            boxes,
-            filtered_scores,
-            iou_threshold=iou_t,
-            max_detections=len(boxes),
-        )
+        keep_indices = numpy_nms(boxes, filtered_scores, iou_t)
 
         boxes = boxes[keep_indices]
         scores = filtered_scores[keep_indices]
