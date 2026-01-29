@@ -1,10 +1,20 @@
 import numpy as np
 import numpy.typing as npt
-from typing import Literal, Union, Tuple, List
+from typing import Literal, Optional, Union, Tuple, List
 import enum
 import sys
 
 """EdgeFirst HAL Python bindings."""
+
+
+class Nms(enum.Enum):
+    """Non-Maximum Suppression mode for object detection.
+    
+    ClassAgnostic: Suppresses all boxes based on IoU regardless of class.
+    ClassAware: Only suppresses boxes of the same class.
+    """
+    ClassAgnostic: Nms
+    ClassAware: Nms
 DetectionOutput = Tuple[
     npt.NDArray[np.float32], npt.NDArray[np.float32], npt.NDArray[np.uintp]
 ]
@@ -33,28 +43,49 @@ A tuple containing:
 
 class Decoder:
     def __init__(
-        self, config: dict, score_threshold: float = 0.1, iou_threshold: float = 0.7
+        self, config: dict, score_threshold: float = 0.1, iou_threshold: float = 0.7,
+        nms: Optional[Nms] = Nms.ClassAgnostic
     ) -> None:
         """
         Create a new Decoder instance from a dictionary configuration describing the model outputs.
+        
+        Args:
+            config: Model output configuration dictionary.
+            score_threshold: Minimum confidence score for detections.
+            iou_threshold: IoU threshold for non-maximum suppression.
+            nms: NMS mode - Nms.ClassAgnostic (default), Nms.ClassAware, or None to bypass NMS.
         """
         ...
 
     @staticmethod
     def new_from_json_str(
-        json_str: str, score_threshold: float = 0.1, iou_threshold: float = 0.7
+        json_str: str, score_threshold: float = 0.1, iou_threshold: float = 0.7,
+        nms: Optional[Nms] = Nms.ClassAgnostic
     ) -> Decoder:
         """
         Create a new Decoder instance from a JSON configuration string describing the model outputs.
+        
+        Args:
+            json_str: JSON configuration string.
+            score_threshold: Minimum confidence score for detections.
+            iou_threshold: IoU threshold for non-maximum suppression.
+            nms: NMS mode - Nms.ClassAgnostic (default), Nms.ClassAware, or None to bypass NMS.
         """
         ...
 
     @staticmethod
     def new_from_yaml_str(
-        yaml_str: str, score_threshold: float = 0.1, iou_threshold=0.7
+        yaml_str: str, score_threshold: float = 0.1, iou_threshold: float = 0.7,
+        nms: Optional[Nms] = Nms.ClassAgnostic
     ) -> Decoder:
         """
         Create a new Decoder instance from a YAML configuration string describing the model outputs.
+        
+        Args:
+            yaml_str: YAML configuration string.
+            score_threshold: Minimum confidence score for detections.
+            iou_threshold: IoU threshold for non-maximum suppression.
+            nms: NMS mode - Nms.ClassAgnostic (default), Nms.ClassAware, or None to bypass NMS.
         """
         ...
 
@@ -82,6 +113,7 @@ class Decoder:
         quant_boxes: Tuple[float, int] = (1.0, 0),
         score_threshold: float = 0.1,
         iou_threshold: float = 0.7,
+        nms: Optional[Nms] = Nms.ClassAgnostic,
         max_boxes: int = 100,
     ) -> DetectionOutput:
         """
@@ -90,6 +122,14 @@ class Decoder:
 
         The accepted types are `np.uint8`, `np.int8`, `np.float32` and `np.float64`. All outputs must be
         the same type.
+        
+        Args:
+            model_output: YOLO model output tensor.
+            quant_boxes: Quantization parameters (scale, zero_point) for boxes.
+            score_threshold: Minimum confidence score for detections.
+            iou_threshold: IoU threshold for non-maximum suppression.
+            nms: NMS mode - Nms.ClassAgnostic (default), Nms.ClassAware, or None to bypass NMS.
+            max_boxes: Maximum number of boxes to return.
         """
         ...
 
@@ -105,6 +145,7 @@ class Decoder:
         quant_protos: Tuple[float, int] = (1.0, 0),
         score_threshold: float = 0.1,
         iou_threshold: float = 0.7,
+        nms: Optional[Nms] = Nms.ClassAgnostic,
         max_boxes: int = 100,
     ) -> SegDetOutput:
         """
@@ -113,6 +154,16 @@ class Decoder:
 
         The accepted types are `np.uint8`, `np.int8`, `np.float32` and `np.float64`. All outputs must be
         the same type.
+        
+        Args:
+            boxes: YOLO box output tensor.
+            protos: YOLO proto output tensor.
+            quant_boxes: Quantization parameters (scale, zero_point) for boxes.
+            quant_protos: Quantization parameters (scale, zero_point) for protos.
+            score_threshold: Minimum confidence score for detections.
+            iou_threshold: IoU threshold for non-maximum suppression.
+            nms: NMS mode - Nms.ClassAgnostic (default), Nms.ClassAware, or None to bypass NMS.
+            max_boxes: Maximum number of boxes to return.
         """
         ...
 
@@ -180,8 +231,13 @@ class Decoder:
         ...
 
     @staticmethod
-    def segmentation_to_mask(segmentation: npt.NDArray[np.uint8]) -> None:
-        """Converts a 3D segmentation tensor into a 2D mask."""
+    def segmentation_to_mask(segmentation: npt.NDArray[np.uint8]) -> npt.NDArray[np.uint8]:
+        """
+        Converts a 3D segmentation tensor into a 2D mask.
+        
+        Raises:
+            ValueError: If the segmentation tensor has an invalid shape.
+        """
         ...
 
     @property
@@ -205,6 +261,22 @@ class Decoder:
 
     @iou_threshold.setter
     def iou_threshold(self, value: float): ...
+
+    @property
+    def nms(self) -> Optional[Nms]:
+        """
+        NMS mode used when decoding detections with the `decode` method.
+        Returns Nms.ClassAgnostic, Nms.ClassAware, or None if NMS is bypassed.
+        """
+        ...
+
+    @property
+    def normalized_boxes(self) -> Optional[bool]:
+        """
+        Whether decoded bounding boxes are normalized to [0, 1] range.
+        Returns True if normalized, False if pixel coordinates, or None if unknown.
+        """
+        ...
 
 
 class TensorMemory(enum.Enum):
