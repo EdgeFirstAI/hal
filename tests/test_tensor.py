@@ -5,6 +5,7 @@ import numpy as np
 from edgefirst_hal import Tensor, TensorMemory
 import os
 import pytest
+import gc
 
 
 def test_int8():
@@ -348,30 +349,35 @@ def test_dma_zero_copy_perf():
     assert tensor.memory == TensorMemory.DMA
 
     import time
-    start = time.perf_counter()
-    tensor_fd = Tensor.from_fd(tensor.fd, tensor.shape, tensor.dtype)
-    elapsed = time.perf_counter() - start
 
-    assert tensor_fd.size == tensor.size
-    assert tensor_fd.shape == tensor.shape
-    assert tensor_fd.dtype == tensor.dtype
-    assert tensor_fd.memory == tensor.memory
+    elapsed = 0
+    elapsed_copy = 0
 
-    with tensor.map() as m:
-        for i in range(tensor.size):
-            m[i] = 233
+    for _ in range(10):  # Run multiple times to get a better measurement
+        start = time.perf_counter()
+        tensor_fd = Tensor.from_fd(tensor.fd, tensor.shape, tensor.dtype)
+        elapsed += time.perf_counter() - start
 
-    with tensor_fd.map() as m:
-        for i in range(tensor_fd.size):
-            assert m[i] == 233
+        assert tensor_fd.size == tensor.size
+        assert tensor_fd.shape == tensor.shape
+        assert tensor_fd.dtype == tensor.dtype
+        assert tensor_fd.memory == tensor.memory
 
-    tensor_copy = Tensor(
-        tensor.shape, dtype=tensor.dtype, mem=tensor.memory)
-    start = time.perf_counter()
-    with tensor.map() as src, tensor_copy.map() as dst:
-        for i in range(tensor.size):
-            dst[i] = src[i]
-    elapsed_copy = time.perf_counter() - start
+        with tensor.map() as m:
+            for i in range(tensor.size):
+                m[i] = 233
+
+        with tensor_fd.map() as m:
+            for i in range(tensor_fd.size):
+                assert m[i] == 233
+
+        tensor_copy = Tensor(
+            tensor.shape, dtype=tensor.dtype, mem=tensor.memory)
+        start = time.perf_counter()
+        with tensor.map() as src, tensor_copy.map() as dst:
+            for i in range(tensor.size):
+                dst[i] = src[i]
+        elapsed_copy += time.perf_counter() - start
 
     assert elapsed < elapsed_copy
 
@@ -409,30 +415,34 @@ def test_shm_zero_copy_perf():
     assert tensor.memory == TensorMemory.SHM
 
     import time
-    start = time.perf_counter()
-    tensor_fd = Tensor.from_fd(tensor.fd, tensor.shape, tensor.dtype)
-    elapsed = time.perf_counter() - start
+    elapsed = 0
+    elapsed_copy = 0
 
-    assert tensor_fd.size == tensor.size
-    assert tensor_fd.shape == tensor.shape
-    assert tensor_fd.dtype == tensor.dtype
-    assert tensor_fd.memory == tensor.memory
+    for _ in range(10):  # Run multiple times to get a better measurement
+        start = time.perf_counter()
+        tensor_fd = Tensor.from_fd(tensor.fd, tensor.shape, tensor.dtype)
+        elapsed += time.perf_counter() - start
 
-    with tensor.map() as m:
-        for i in range(tensor.size):
-            m[i] = 233
+        assert tensor_fd.size == tensor.size
+        assert tensor_fd.shape == tensor.shape
+        assert tensor_fd.dtype == tensor.dtype
+        assert tensor_fd.memory == tensor.memory
 
-    with tensor_fd.map() as m:
-        for i in range(tensor_fd.size):
-            assert m[i] == 233
+        with tensor.map() as m:
+            for i in range(tensor.size):
+                m[i] = 233
 
-    tensor_copy = Tensor(
-        tensor.shape, dtype=tensor.dtype, mem=tensor.memory)
-    start = time.perf_counter()
-    with tensor.map() as src, tensor_copy.map() as dst:
-        for i in range(tensor.size):
-            dst[i] = src[i]
-    elapsed_copy = time.perf_counter() - start
+        with tensor_fd.map() as m:
+            for i in range(tensor_fd.size):
+                assert m[i] == 233
+
+        tensor_copy = Tensor(
+            tensor.shape, dtype=tensor.dtype, mem=tensor.memory)
+        start = time.perf_counter()
+        with tensor.map() as src, tensor_copy.map() as dst:
+            for i in range(tensor.size):
+                dst[i] = src[i]
+        elapsed_copy += time.perf_counter() - start
 
     assert elapsed < elapsed_copy
 
@@ -460,7 +470,7 @@ def test_dma_no_fd_leaks():
         with tensor.map() as m:
             m[0] = 3
         del tensor
-
+    gc.collect()
     end_fds = proc.num_fds()
     assert start_fds == end_fds, f"File descriptor leak detected: {start_fds} -> {end_fds}"
 
@@ -487,7 +497,7 @@ def test_shm_no_fd_leaks():
         with tensor.map() as m:
             m[0] = 3
         del tensor
-
+    gc.collect()
     end_fds = proc.num_fds()
     assert start_fds == end_fds, f"File descriptor leak detected: {start_fds} -> {end_fds}"
 
@@ -513,7 +523,7 @@ def test_dma_fd_leak_with_from_fd():
             m[0] = 3
         del tensor_fd
     del original
-
+    gc.collect()
     end_fds = proc.num_fds()
     assert start_fds == end_fds, f"File descriptor leak detected: {start_fds} -> {end_fds}"
 
@@ -538,6 +548,6 @@ def test_shm_fd_leak_with_from_fd():
             m[0] = 3
         del tensor_fd
     del original
-
+    gc.collect()
     end_fds = proc.num_fds()
     assert start_fds == end_fds, f"File descriptor leak detected: {start_fds} -> {end_fds}"
