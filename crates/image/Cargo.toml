@@ -13,6 +13,7 @@ license.workspace = true
 default = ["opengl", "decoder"]
 opengl = ["dep:khronos-egl", "dep:gbm"]
 decoder = ["dep:edgefirst-decoder", "dep:ndarray-stats"]
+opencv = ["dep:opencv"]
 g2d_test_formats = []
 
 [dependencies]
@@ -30,6 +31,7 @@ libc = { workspace = true }
 libloading = { workspace = true }
 log = { workspace = true }
 ndarray = { workspace = true }
+opencv = { workspace = true, optional = true }
 rayon = { workspace = true }
 tokio = { workspace = true }
 yuv = { workspace = true }
@@ -44,12 +46,17 @@ g2d-sys = { workspace = true }
 gbm = { workspace = true, optional = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 divan = { workspace = true }
 image = { workspace = true }
 image-compare = { workspace = true }
 
 [[bench]]
 name = "image_benchmark"
+harness = false
+
+[[bench]]
+name = "pipeline_benchmark"
 harness = false
 
 [lints.rust]
