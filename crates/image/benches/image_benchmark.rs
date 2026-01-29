@@ -1020,30 +1020,12 @@ fn convert_opengl_yuyv_to_rgba(bencher: divan::Bencher, params: (usize, usize)) 
     drop(dst);
 }
 
-#[cfg(target_os = "linux")]
-#[cfg(feature = "opengl")]
-#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
-fn convert_opengl_yuyv_to_yuyv(bencher: divan::Bencher, params: (usize, usize)) {
-    let file = include_bytes!("../../../testdata/camera720p.yuyv").to_vec();
-    let src = TensorImage::new(1280, 720, YUYV, Some(TensorMemory::Dma)).unwrap();
-    src.tensor()
-        .map()
-        .unwrap()
-        .as_mut_slice()
-        .copy_from_slice(&file);
-
-    let (width, height) = params;
-    let mut dst = TensorImage::new(width, height, YUYV, None).unwrap();
-
-    let mut converter = GLProcessorThreaded::new().unwrap();
-
-    bencher.bench_local(|| {
-        converter
-            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-            .unwrap()
-    });
-    drop(dst);
-}
+// NOTE: OpenGL YUYV→YUYV is not supported - OpenGL cannot render to YUYV textures.
+// A future implementation could render to RGBA and encode YUYV in the shader.
+// #[cfg(target_os = "linux")]
+// #[cfg(feature = "opengl")]
+// #[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+// fn convert_opengl_yuyv_to_yuyv(bencher: divan::Bencher, params: (usize, usize)) { ... }
 
 #[cfg(target_os = "linux")]
 #[divan::bench(types = [Person, Zidane], args = [(640, 640), (960, 960), (1280, 1280), (1920, 1920)], ignore = !dma_available())]
@@ -1099,6 +1081,847 @@ where
             .unwrap()
     });
     drop(g2d_dst);
+}
+
+// =============================================================================
+// High-Resolution Benchmarks (1080p and 4K sources)
+// For EDGEAI-773 Vision Pipeline Optimizations
+// =============================================================================
+
+// Source resolutions for hi-res benchmarks
+const SRC_1080P: (usize, usize) = (1920, 1080);
+const SRC_4K: (usize, usize) = (3840, 2160);
+
+// Helper to load 1080p YUYV test data
+fn load_yuyv_1080p() -> TensorImage {
+    let file = include_bytes!("../../../testdata/camera1080p.yuyv").to_vec();
+    let src = TensorImage::new(SRC_1080P.0, SRC_1080P.1, YUYV, None).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+    src
+}
+
+// Helper to load 4K YUYV test data
+fn load_yuyv_4k() -> TensorImage {
+    let file = include_bytes!("../../../testdata/camera4k.yuyv").to_vec();
+    let src = TensorImage::new(SRC_4K.0, SRC_4K.1, YUYV, None).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+    src
+}
+
+// Helper to load 1080p RGBA test data
+fn load_rgba_1080p() -> TensorImage {
+    let file = include_bytes!("../../../testdata/camera1080p.rgba").to_vec();
+    let src = TensorImage::new(SRC_1080P.0, SRC_1080P.1, RGBA, None).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+    src
+}
+
+// Helper to load 4K RGBA test data
+fn load_rgba_4k() -> TensorImage {
+    let file = include_bytes!("../../../testdata/camera4k.rgba").to_vec();
+    let src = TensorImage::new(SRC_4K.0, SRC_4K.1, RGBA, None).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+    src
+}
+
+// Helper to load 1080p RGB test data (converted from RGBA)
+fn load_rgb_1080p() -> TensorImage {
+    let rgba = load_rgba_1080p();
+    let mut rgb = TensorImage::new(SRC_1080P.0, SRC_1080P.1, RGB, None).unwrap();
+    let mut cpu = CPUProcessor::new();
+    cpu.convert(&rgba, &mut rgb, Rotation::None, Flip::None, Crop::no_crop())
+        .unwrap();
+    rgb
+}
+
+// Helper to load 4K RGB test data (converted from RGBA)
+fn load_rgb_4k() -> TensorImage {
+    let rgba = load_rgba_4k();
+    let mut rgb = TensorImage::new(SRC_4K.0, SRC_4K.1, RGB, None).unwrap();
+    let mut cpu = CPUProcessor::new();
+    cpu.convert(&rgba, &mut rgb, Rotation::None, Flip::None, Crop::no_crop())
+        .unwrap();
+    rgb
+}
+
+// -----------------------------------------------------------------------------
+// CPU Benchmarks - 1080p Source
+// -----------------------------------------------------------------------------
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn hires_cpu_1080p_yuyv_to_yuyv(bencher: divan::Bencher, size: (usize, usize)) {
+    let src = load_yuyv_1080p();
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, YUYV, None).unwrap();
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn hires_cpu_1080p_yuyv_to_rgba(bencher: divan::Bencher, size: (usize, usize)) {
+    let src = load_yuyv_1080p();
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn hires_cpu_1080p_yuyv_to_rgb(bencher: divan::Bencher, size: (usize, usize)) {
+    let src = load_yuyv_1080p();
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGB, None).unwrap();
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn hires_cpu_1080p_rgba_to_rgba(bencher: divan::Bencher, size: (usize, usize)) {
+    let src = load_rgba_1080p();
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn hires_cpu_1080p_rgba_to_rgb(bencher: divan::Bencher, size: (usize, usize)) {
+    let src = load_rgba_1080p();
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGB, None).unwrap();
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn hires_cpu_1080p_rgb_to_rgb(bencher: divan::Bencher, size: (usize, usize)) {
+    let src = load_rgb_1080p();
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGB, None).unwrap();
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn hires_cpu_1080p_rgb_to_rgba(bencher: divan::Bencher, size: (usize, usize)) {
+    let src = load_rgb_1080p();
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+// -----------------------------------------------------------------------------
+// CPU Benchmarks - 4K Source
+// -----------------------------------------------------------------------------
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)])]
+fn hires_cpu_4k_yuyv_to_yuyv(bencher: divan::Bencher, size: (usize, usize)) {
+    let src = load_yuyv_4k();
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, YUYV, None).unwrap();
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)])]
+fn hires_cpu_4k_yuyv_to_rgba(bencher: divan::Bencher, size: (usize, usize)) {
+    let src = load_yuyv_4k();
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)])]
+fn hires_cpu_4k_yuyv_to_rgb(bencher: divan::Bencher, size: (usize, usize)) {
+    let src = load_yuyv_4k();
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGB, None).unwrap();
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)])]
+fn hires_cpu_4k_rgba_to_rgba(bencher: divan::Bencher, size: (usize, usize)) {
+    let src = load_rgba_4k();
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)])]
+fn hires_cpu_4k_rgba_to_rgb(bencher: divan::Bencher, size: (usize, usize)) {
+    let src = load_rgba_4k();
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGB, None).unwrap();
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)])]
+fn hires_cpu_4k_rgb_to_rgb(bencher: divan::Bencher, size: (usize, usize)) {
+    let src = load_rgb_4k();
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGB, None).unwrap();
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)])]
+fn hires_cpu_4k_rgb_to_rgba(bencher: divan::Bencher, size: (usize, usize)) {
+    let src = load_rgb_4k();
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+// -----------------------------------------------------------------------------
+// G2D Benchmarks - 1080p Source (requires DMA)
+// -----------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+fn hires_g2d_1080p_yuyv_to_yuyv(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera1080p.yuyv").to_vec();
+    let src = TensorImage::new(SRC_1080P.0, SRC_1080P.1, YUYV, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, YUYV, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = G2DProcessor::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+fn hires_g2d_1080p_yuyv_to_rgba(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera1080p.yuyv").to_vec();
+    let src = TensorImage::new(SRC_1080P.0, SRC_1080P.1, YUYV, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = G2DProcessor::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+fn hires_g2d_1080p_yuyv_to_rgb(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera1080p.yuyv").to_vec();
+    let src = TensorImage::new(SRC_1080P.0, SRC_1080P.1, YUYV, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGB, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = G2DProcessor::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+fn hires_g2d_1080p_rgba_to_rgba(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera1080p.rgba").to_vec();
+    let src = TensorImage::new(SRC_1080P.0, SRC_1080P.1, RGBA, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = G2DProcessor::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+fn hires_g2d_1080p_rgba_to_rgb(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera1080p.rgba").to_vec();
+    let src = TensorImage::new(SRC_1080P.0, SRC_1080P.1, RGBA, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGB, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = G2DProcessor::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+fn hires_g2d_1080p_rgba_to_yuyv(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera1080p.rgba").to_vec();
+    let src = TensorImage::new(SRC_1080P.0, SRC_1080P.1, RGBA, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, YUYV, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = G2DProcessor::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+// -----------------------------------------------------------------------------
+// G2D Benchmarks - 4K Source (requires DMA)
+// -----------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)], ignore = !dma_available())]
+fn hires_g2d_4k_yuyv_to_yuyv(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera4k.yuyv").to_vec();
+    let src = TensorImage::new(SRC_4K.0, SRC_4K.1, YUYV, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, YUYV, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = G2DProcessor::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)], ignore = !dma_available())]
+fn hires_g2d_4k_yuyv_to_rgba(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera4k.yuyv").to_vec();
+    let src = TensorImage::new(SRC_4K.0, SRC_4K.1, YUYV, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = G2DProcessor::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)], ignore = !dma_available())]
+fn hires_g2d_4k_yuyv_to_rgb(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera4k.yuyv").to_vec();
+    let src = TensorImage::new(SRC_4K.0, SRC_4K.1, YUYV, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGB, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = G2DProcessor::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)], ignore = !dma_available())]
+fn hires_g2d_4k_rgba_to_rgba(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera4k.rgba").to_vec();
+    let src = TensorImage::new(SRC_4K.0, SRC_4K.1, RGBA, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = G2DProcessor::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)], ignore = !dma_available())]
+fn hires_g2d_4k_rgba_to_rgb(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera4k.rgba").to_vec();
+    let src = TensorImage::new(SRC_4K.0, SRC_4K.1, RGBA, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGB, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = G2DProcessor::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)], ignore = !dma_available())]
+fn hires_g2d_4k_rgba_to_yuyv(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera4k.rgba").to_vec();
+    let src = TensorImage::new(SRC_4K.0, SRC_4K.1, RGBA, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, YUYV, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = G2DProcessor::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+// -----------------------------------------------------------------------------
+// OpenGL Benchmarks - 1080p Source (DMA for YUYV input)
+// -----------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+fn hires_opengl_1080p_yuyv_to_rgba(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera1080p.yuyv").to_vec();
+    let src = TensorImage::new(SRC_1080P.0, SRC_1080P.1, YUYV, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = GLProcessorThreaded::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+    drop(dst);
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+fn hires_opengl_1080p_rgba_to_rgba_dma(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera1080p.rgba").to_vec();
+    let src = TensorImage::new(SRC_1080P.0, SRC_1080P.1, RGBA, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = GLProcessorThreaded::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+    drop(dst);
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn hires_opengl_1080p_rgba_to_rgba_mem(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera1080p.rgba").to_vec();
+    let src = TensorImage::new(SRC_1080P.0, SRC_1080P.1, RGBA, Some(TensorMemory::Mem)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Mem)).unwrap();
+    let mut converter = GLProcessorThreaded::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+    drop(dst);
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn hires_opengl_1080p_rgba_to_rgb_mem(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera1080p.rgba").to_vec();
+    let src = TensorImage::new(SRC_1080P.0, SRC_1080P.1, RGBA, Some(TensorMemory::Mem)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGB, Some(TensorMemory::Mem)).unwrap();
+    let mut converter = GLProcessorThreaded::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+    drop(dst);
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn hires_opengl_1080p_rgb_to_rgb_mem(bencher: divan::Bencher, size: (usize, usize)) {
+    let rgba = load_rgba_1080p();
+    let mut src = TensorImage::new(SRC_1080P.0, SRC_1080P.1, RGB, Some(TensorMemory::Mem)).unwrap();
+    let mut cpu = CPUProcessor::new();
+    cpu.convert(&rgba, &mut src, Rotation::None, Flip::None, Crop::no_crop())
+        .unwrap();
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGB, Some(TensorMemory::Mem)).unwrap();
+    let mut converter = GLProcessorThreaded::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+    drop(dst);
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn hires_opengl_1080p_rgb_to_rgba_mem(bencher: divan::Bencher, size: (usize, usize)) {
+    let rgba = load_rgba_1080p();
+    let mut src = TensorImage::new(SRC_1080P.0, SRC_1080P.1, RGB, Some(TensorMemory::Mem)).unwrap();
+    let mut cpu = CPUProcessor::new();
+    cpu.convert(&rgba, &mut src, Rotation::None, Flip::None, Crop::no_crop())
+        .unwrap();
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Mem)).unwrap();
+    let mut converter = GLProcessorThreaded::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+    drop(dst);
+}
+
+// -----------------------------------------------------------------------------
+// OpenGL Benchmarks - 4K Source (DMA for YUYV input)
+// -----------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)], ignore = !dma_available())]
+fn hires_opengl_4k_yuyv_to_rgba(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera4k.yuyv").to_vec();
+    let src = TensorImage::new(SRC_4K.0, SRC_4K.1, YUYV, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = GLProcessorThreaded::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+    drop(dst);
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)], ignore = !dma_available())]
+fn hires_opengl_4k_rgba_to_rgba_dma(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera4k.rgba").to_vec();
+    let src = TensorImage::new(SRC_4K.0, SRC_4K.1, RGBA, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = GLProcessorThreaded::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+    drop(dst);
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)])]
+fn hires_opengl_4k_rgba_to_rgba_mem(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera4k.rgba").to_vec();
+    let src = TensorImage::new(SRC_4K.0, SRC_4K.1, RGBA, Some(TensorMemory::Mem)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Mem)).unwrap();
+    let mut converter = GLProcessorThreaded::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+    drop(dst);
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)])]
+fn hires_opengl_4k_rgba_to_rgb_mem(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera4k.rgba").to_vec();
+    let src = TensorImage::new(SRC_4K.0, SRC_4K.1, RGBA, Some(TensorMemory::Mem)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGB, Some(TensorMemory::Mem)).unwrap();
+    let mut converter = GLProcessorThreaded::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+    drop(dst);
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)])]
+fn hires_opengl_4k_rgb_to_rgb_mem(bencher: divan::Bencher, size: (usize, usize)) {
+    let rgba = load_rgba_4k();
+    let mut src = TensorImage::new(SRC_4K.0, SRC_4K.1, RGB, Some(TensorMemory::Mem)).unwrap();
+    let mut cpu = CPUProcessor::new();
+    cpu.convert(&rgba, &mut src, Rotation::None, Flip::None, Crop::no_crop())
+        .unwrap();
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGB, Some(TensorMemory::Mem)).unwrap();
+    let mut converter = GLProcessorThreaded::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+    drop(dst);
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)])]
+fn hires_opengl_4k_rgb_to_rgba_mem(bencher: divan::Bencher, size: (usize, usize)) {
+    let rgba = load_rgba_4k();
+    let mut src = TensorImage::new(SRC_4K.0, SRC_4K.1, RGB, Some(TensorMemory::Mem)).unwrap();
+    let mut cpu = CPUProcessor::new();
+    cpu.convert(&rgba, &mut src, Rotation::None, Flip::None, Crop::no_crop())
+        .unwrap();
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Mem)).unwrap();
+    let mut converter = GLProcessorThreaded::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+    drop(dst);
 }
 
 #[cfg(target_os = "linux")]
