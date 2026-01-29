@@ -180,8 +180,13 @@ class Decoder:
         ...
 
     @staticmethod
-    def segmentation_to_mask(segmentation: npt.NDArray[np.uint8]) -> None:
-        """Converts a 3D segmentation tensor into a 2D mask."""
+    def segmentation_to_mask(segmentation: npt.NDArray[np.uint8]) -> npt.NDArray[np.uint8]:
+        """
+        Converts a 3D segmentation tensor into a 2D mask.
+        
+        Raises:
+            ValueError: If the segmentation tensor has an invalid shape.
+        """
         ...
 
     @property

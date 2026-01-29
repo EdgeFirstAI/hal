@@ -344,16 +344,34 @@ pub fn decode_yolo_split_segdet_float<T>(
 /// Coordinates may be normalized [0,1] or pixel values depending on model
 /// config. The caller should check `decoder.normalized_boxes()` to determine
 /// which.
+/// Decodes end-to-end YOLO detection outputs (post-NMS from model).
+///
+/// Input shape: (6, N) where rows are [x1, y1, x2, y2, conf, class]
+/// Boxes are output directly without NMS (model already applied NMS).
+///
+/// # Errors
+///
+/// Returns `DecoderError::InvalidShape` if output has fewer than 6 rows.
 pub fn decode_yolo_end_to_end_det_float<T>(
     output: ArrayView2<T>,
     score_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
-) where
+) -> Result<(), crate::DecoderError>
+where
     T: Float + AsPrimitive<f32> + Send + Sync + 'static,
     f32: AsPrimitive<T>,
 {
-    let boxes = output.slice(s![0..4, ..]);
-    let scores = output.slice(s![4..5, ..]);
+    // Validate input shape: need at least 6 rows (x1, y1, x2, y2, conf, class)
+    if output.shape()[0] < 6 {
+        return Err(crate::DecoderError::InvalidShape(format!(
+            "End-to-end detection output requires at least 6 rows, got {}",
+            output.shape()[0]
+        )));
+    }
+
+    // Input shape: (6, N) -> transpose to (N, 4) for boxes and (N, 1) for scores
+    let boxes = output.slice(s![0..4, ..]).reversed_axes();
+    let scores = output.slice(s![4..5, ..]).reversed_axes();
     let classes = output.slice(s![5, ..]);
     let mut boxes =
         postprocess_boxes_index_float::<XYXY, _, _>(score_threshold.as_(), boxes, scores);
@@ -364,6 +382,7 @@ pub fn decode_yolo_end_to_end_det_float<T>(
         output_boxes.push(b);
     }
     // No NMS — model output is already post-NMS
+    Ok(())
 }
 
 /// Decodes end-to-end YOLO detection + segmentation outputs (post-NMS from
@@ -377,20 +396,45 @@ pub fn decode_yolo_end_to_end_det_float<T>(
 /// Boxes are output directly without NMS (model already applied NMS).
 /// Coordinates may be normalized [0,1] or pixel values depending on model
 /// config.
+///
+/// # Errors
+///
+/// Returns `DecoderError::InvalidShape` if:
+/// - output has fewer than 7 rows (6 base + at least 1 mask coefficient)
+/// - protos shape doesn't match mask coefficients count
 pub fn decode_yolo_end_to_end_segdet_float<T>(
     output: ArrayView2<T>,
     protos: ArrayView3<T>,
     score_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<crate::Segmentation>,
-) where
+) -> Result<(), crate::DecoderError>
+where
     T: Float + AsPrimitive<f32> + Send + Sync + 'static,
     f32: AsPrimitive<T>,
 {
-    let boxes = output.slice(s![0..4, ..]);
-    let scores = output.slice(s![4..5, ..]);
+    // Validate input shape: need at least 7 rows (6 base + at least 1 mask coeff)
+    if output.shape()[0] < 7 {
+        return Err(crate::DecoderError::InvalidShape(format!(
+            "End-to-end segdet output requires at least 7 rows, got {}",
+            output.shape()[0]
+        )));
+    }
+
+    let num_mask_coeffs = output.shape()[0] - 6;
+    let num_protos = protos.shape()[2];
+    if num_mask_coeffs != num_protos {
+        return Err(crate::DecoderError::InvalidShape(format!(
+            "Mask coefficients count ({}) doesn't match protos count ({})",
+            num_mask_coeffs, num_protos
+        )));
+    }
+
+    // Input shape: (6+num_protos, N) -> transpose for postprocessing
+    let boxes = output.slice(s![0..4, ..]).reversed_axes();
+    let scores = output.slice(s![4..5, ..]).reversed_axes();
     let classes = output.slice(s![5, ..]);
-    let mask_coeff = output.slice(s![6.., ..]);
+    let mask_coeff = output.slice(s![6.., ..]).reversed_axes();
     let mut boxes =
         postprocess_boxes_index_float::<XYXY, _, _>(score_threshold.as_(), boxes, scores);
     boxes.truncate(output_boxes.capacity());
@@ -415,6 +459,7 @@ pub fn decode_yolo_end_to_end_segdet_float<T>(
             segmentation: m,
         });
     }
+    Ok(())
 }
 /// Internal implementation of YOLO decoding for quantized tensors.
 ///
@@ -1012,15 +1057,421 @@ where
 /// The output mask will have shape (H, W), with values 0 or 1 based on the
 /// threshold.
 ///
-/// # Panics
-/// Panics if the input segmentation does not have shape (H, W, 1).
-pub fn yolo_segmentation_to_mask(segmentation: ArrayView3<u8>, threshold: u8) -> Array2<u8> {
-    assert_eq!(
-        segmentation.shape()[2],
-        1,
-        "Yolo Instance Segmentation should have shape (H, W, 1)"
-    );
-    segmentation
+/// # Errors
+///
+/// Returns `DecoderError::InvalidShape` if the input segmentation does not
+/// have shape (H, W, 1).
+pub fn yolo_segmentation_to_mask(
+    segmentation: ArrayView3<u8>,
+    threshold: u8,
+) -> Result<Array2<u8>, crate::DecoderError> {
+    if segmentation.shape()[2] != 1 {
+        return Err(crate::DecoderError::InvalidShape(format!(
+            "Yolo Instance Segmentation should have shape (H, W, 1), got (H, W, {})",
+            segmentation.shape()[2]
+        )));
+    }
+    Ok(segmentation
         .slice(s![.., .., 0])
-        .map(|x| if *x >= threshold { 1 } else { 0 })
+        .map(|x| if *x >= threshold { 1 } else { 0 }))
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+    use ndarray::Array2;
+
+    // ========================================================================
+    // Tests for decode_yolo_end_to_end_det_float
+    // ========================================================================
+
+    #[test]
+    fn test_end_to_end_det_basic_filtering() {
+        // Create synthetic end-to-end detection output: (6, N) where rows are
+        // [x1, y1, x2, y2, conf, class]
+        // 3 detections: one above threshold, two below
+        let data: Vec<f32> = vec![
+            // Detection 0: high score (0.9)
+            0.1, 0.2, 0.3, // x1 values
+            0.1, 0.2, 0.3, // y1 values
+            0.5, 0.6, 0.7, // x2 values
+            0.5, 0.6, 0.7, // y2 values
+            0.9, 0.1, 0.2, // confidence scores
+            0.0, 1.0, 2.0, // class indices
+        ];
+        let output = Array2::from_shape_vec((6, 3), data).unwrap();
+
+        let mut boxes = Vec::with_capacity(10);
+        decode_yolo_end_to_end_det_float(output.view(), 0.5, &mut boxes).unwrap();
+
+        // Only 1 detection should pass threshold of 0.5
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].label, 0);
+        assert!((boxes[0].score - 0.9).abs() < 0.01);
+        assert!((boxes[0].bbox.xmin - 0.1).abs() < 0.01);
+        assert!((boxes[0].bbox.ymin - 0.1).abs() < 0.01);
+        assert!((boxes[0].bbox.xmax - 0.5).abs() < 0.01);
+        assert!((boxes[0].bbox.ymax - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_end_to_end_det_all_pass_threshold() {
+        // All detections above threshold
+        let data: Vec<f32> = vec![
+            10.0, 20.0, // x1
+            10.0, 20.0, // y1
+            50.0, 60.0, // x2
+            50.0, 60.0, // y2
+            0.8, 0.7, // conf (both above 0.5)
+            1.0, 2.0, // class
+        ];
+        let output = Array2::from_shape_vec((6, 2), data).unwrap();
+
+        let mut boxes = Vec::with_capacity(10);
+        decode_yolo_end_to_end_det_float(output.view(), 0.5, &mut boxes).unwrap();
+
+        assert_eq!(boxes.len(), 2);
+        assert_eq!(boxes[0].label, 1);
+        assert_eq!(boxes[1].label, 2);
+    }
+
+    #[test]
+    fn test_end_to_end_det_none_pass_threshold() {
+        // All detections below threshold
+        let data: Vec<f32> = vec![
+            10.0, 20.0, // x1
+            10.0, 20.0, // y1
+            50.0, 60.0, // x2
+            50.0, 60.0, // y2
+            0.1, 0.2, // conf (both below 0.5)
+            1.0, 2.0, // class
+        ];
+        let output = Array2::from_shape_vec((6, 2), data).unwrap();
+
+        let mut boxes = Vec::with_capacity(10);
+        decode_yolo_end_to_end_det_float(output.view(), 0.5, &mut boxes).unwrap();
+
+        assert_eq!(boxes.len(), 0);
+    }
+
+    #[test]
+    fn test_end_to_end_det_capacity_limit() {
+        // Test that output is truncated to capacity
+        let data: Vec<f32> = vec![
+            0.1, 0.2, 0.3, 0.4, 0.5, // x1
+            0.1, 0.2, 0.3, 0.4, 0.5, // y1
+            0.5, 0.6, 0.7, 0.8, 0.9, // x2
+            0.5, 0.6, 0.7, 0.8, 0.9, // y2
+            0.9, 0.9, 0.9, 0.9, 0.9, // conf (all pass)
+            0.0, 1.0, 2.0, 3.0, 4.0, // class
+        ];
+        let output = Array2::from_shape_vec((6, 5), data).unwrap();
+
+        let mut boxes = Vec::with_capacity(2); // Only allow 2 boxes
+        decode_yolo_end_to_end_det_float(output.view(), 0.5, &mut boxes).unwrap();
+
+        assert_eq!(boxes.len(), 2);
+    }
+
+    #[test]
+    fn test_end_to_end_det_empty_output() {
+        // Test with zero detections
+        let output = Array2::<f32>::zeros((6, 0));
+
+        let mut boxes = Vec::with_capacity(10);
+        decode_yolo_end_to_end_det_float(output.view(), 0.5, &mut boxes).unwrap();
+
+        assert_eq!(boxes.len(), 0);
+    }
+
+    #[test]
+    fn test_end_to_end_det_pixel_coordinates() {
+        // Test with pixel coordinates (non-normalized)
+        let data: Vec<f32> = vec![
+            100.0, // x1
+            200.0, // y1
+            300.0, // x2
+            400.0, // y2
+            0.95,  // conf
+            5.0,   // class
+        ];
+        let output = Array2::from_shape_vec((6, 1), data).unwrap();
+
+        let mut boxes = Vec::with_capacity(10);
+        decode_yolo_end_to_end_det_float(output.view(), 0.5, &mut boxes).unwrap();
+
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].label, 5);
+        assert!((boxes[0].bbox.xmin - 100.0).abs() < 0.01);
+        assert!((boxes[0].bbox.ymin - 200.0).abs() < 0.01);
+        assert!((boxes[0].bbox.xmax - 300.0).abs() < 0.01);
+        assert!((boxes[0].bbox.ymax - 400.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_end_to_end_det_invalid_shape() {
+        // Test with too few rows (needs at least 6)
+        let output = Array2::<f32>::zeros((5, 3));
+
+        let mut boxes = Vec::with_capacity(10);
+        let result = decode_yolo_end_to_end_det_float(output.view(), 0.5, &mut boxes);
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(crate::DecoderError::InvalidShape(s)) if s.contains("at least 6 rows")
+        ));
+    }
+
+    // ========================================================================
+    // Tests for decode_yolo_end_to_end_segdet_float
+    // ========================================================================
+
+    #[test]
+    fn test_end_to_end_segdet_basic() {
+        // Create synthetic segdet output: (6 + num_protos, N)
+        // Detection format: [x1, y1, x2, y2, conf, class, mask_coeff_0..31]
+        let num_protos = 32;
+        let num_detections = 2;
+        let num_features = 6 + num_protos;
+
+        // Build detection tensor
+        let mut data = vec![0.0f32; num_features * num_detections];
+        // Detection 0: passes threshold
+        data[0] = 0.1; // x1[0]
+        data[1] = 0.5; // x1[1]
+        data[num_detections] = 0.1; // y1[0]
+        data[num_detections + 1] = 0.5; // y1[1]
+        data[2 * num_detections] = 0.4; // x2[0]
+        data[2 * num_detections + 1] = 0.9; // x2[1]
+        data[3 * num_detections] = 0.4; // y2[0]
+        data[3 * num_detections + 1] = 0.9; // y2[1]
+        data[4 * num_detections] = 0.9; // conf[0] - passes
+        data[4 * num_detections + 1] = 0.3; // conf[1] - fails
+        data[5 * num_detections] = 1.0; // class[0]
+        data[5 * num_detections + 1] = 2.0; // class[1]
+        // Fill mask coefficients with small values
+        for i in 6..num_features {
+            data[i * num_detections] = 0.1;
+            data[i * num_detections + 1] = 0.1;
+        }
+
+        let output = Array2::from_shape_vec((num_features, num_detections), data).unwrap();
+
+        // Create protos tensor: (proto_height, proto_width, num_protos)
+        let protos = Array3::<f32>::zeros((16, 16, num_protos));
+
+        let mut boxes = Vec::with_capacity(10);
+        let mut masks = Vec::with_capacity(10);
+        decode_yolo_end_to_end_segdet_float(
+            output.view(),
+            protos.view(),
+            0.5,
+            &mut boxes,
+            &mut masks,
+        )
+        .unwrap();
+
+        // Only detection 0 should pass
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(masks.len(), 1);
+        assert_eq!(boxes[0].label, 1);
+        assert!((boxes[0].score - 0.9).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_end_to_end_segdet_mask_coordinates() {
+        // Test that mask coordinates match box coordinates
+        let num_protos = 32;
+        let num_features = 6 + num_protos;
+
+        let mut data = vec![0.0f32; num_features];
+        data[0] = 0.2; // x1
+        data[1] = 0.2; // y1
+        data[2] = 0.8; // x2
+        data[3] = 0.8; // y2
+        data[4] = 0.95; // conf
+        data[5] = 3.0; // class
+
+        let output = Array2::from_shape_vec((num_features, 1), data).unwrap();
+        let protos = Array3::<f32>::zeros((16, 16, num_protos));
+
+        let mut boxes = Vec::with_capacity(10);
+        let mut masks = Vec::with_capacity(10);
+        decode_yolo_end_to_end_segdet_float(
+            output.view(),
+            protos.view(),
+            0.5,
+            &mut boxes,
+            &mut masks,
+        )
+        .unwrap();
+
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(masks.len(), 1);
+
+        // Verify mask coordinates match box coordinates
+        assert!((masks[0].xmin - boxes[0].bbox.xmin).abs() < 0.01);
+        assert!((masks[0].ymin - boxes[0].bbox.ymin).abs() < 0.01);
+        assert!((masks[0].xmax - boxes[0].bbox.xmax).abs() < 0.01);
+        assert!((masks[0].ymax - boxes[0].bbox.ymax).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_end_to_end_segdet_empty_output() {
+        let num_protos = 32;
+        let output = Array2::<f32>::zeros((6 + num_protos, 0));
+        let protos = Array3::<f32>::zeros((16, 16, num_protos));
+
+        let mut boxes = Vec::with_capacity(10);
+        let mut masks = Vec::with_capacity(10);
+        decode_yolo_end_to_end_segdet_float(
+            output.view(),
+            protos.view(),
+            0.5,
+            &mut boxes,
+            &mut masks,
+        )
+        .unwrap();
+
+        assert_eq!(boxes.len(), 0);
+        assert_eq!(masks.len(), 0);
+    }
+
+    #[test]
+    fn test_end_to_end_segdet_capacity_limit() {
+        let num_protos = 32;
+        let num_detections = 5;
+        let num_features = 6 + num_protos;
+
+        let mut data = vec![0.0f32; num_features * num_detections];
+        // All detections pass threshold
+        for i in 0..num_detections {
+            data[i] = 0.1 * (i as f32); // x1
+            data[num_detections + i] = 0.1 * (i as f32); // y1
+            data[2 * num_detections + i] = 0.1 * (i as f32) + 0.2; // x2
+            data[3 * num_detections + i] = 0.1 * (i as f32) + 0.2; // y2
+            data[4 * num_detections + i] = 0.9; // conf
+            data[5 * num_detections + i] = i as f32; // class
+        }
+
+        let output = Array2::from_shape_vec((num_features, num_detections), data).unwrap();
+        let protos = Array3::<f32>::zeros((16, 16, num_protos));
+
+        let mut boxes = Vec::with_capacity(2); // Limit to 2
+        let mut masks = Vec::with_capacity(2);
+        decode_yolo_end_to_end_segdet_float(
+            output.view(),
+            protos.view(),
+            0.5,
+            &mut boxes,
+            &mut masks,
+        )
+        .unwrap();
+
+        assert_eq!(boxes.len(), 2);
+        assert_eq!(masks.len(), 2);
+    }
+
+    #[test]
+    fn test_end_to_end_segdet_invalid_shape_too_few_rows() {
+        // Test with too few rows (needs at least 7: 6 base + 1 mask coeff)
+        let output = Array2::<f32>::zeros((6, 3));
+        let protos = Array3::<f32>::zeros((16, 16, 32));
+
+        let mut boxes = Vec::with_capacity(10);
+        let mut masks = Vec::with_capacity(10);
+        let result = decode_yolo_end_to_end_segdet_float(
+            output.view(),
+            protos.view(),
+            0.5,
+            &mut boxes,
+            &mut masks,
+        );
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(crate::DecoderError::InvalidShape(s)) if s.contains("at least 7 rows")
+        ));
+    }
+
+    #[test]
+    fn test_end_to_end_segdet_invalid_shape_protos_mismatch() {
+        // Test with mismatched mask coefficients and protos count
+        let num_protos = 32;
+        let output = Array2::<f32>::zeros((6 + 16, 3)); // 16 mask coeffs
+        let protos = Array3::<f32>::zeros((16, 16, num_protos)); // 32 protos
+
+        let mut boxes = Vec::with_capacity(10);
+        let mut masks = Vec::with_capacity(10);
+        let result = decode_yolo_end_to_end_segdet_float(
+            output.view(),
+            protos.view(),
+            0.5,
+            &mut boxes,
+            &mut masks,
+        );
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(crate::DecoderError::InvalidShape(s)) if s.contains("doesn't match protos count")
+        ));
+    }
+
+    // ========================================================================
+    // Tests for yolo_segmentation_to_mask
+    // ========================================================================
+
+    #[test]
+    fn test_segmentation_to_mask_basic() {
+        // Create a 4x4x1 segmentation with values above and below threshold
+        let data: Vec<u8> = vec![
+            100, 200, 50, 150, // row 0
+            10, 255, 128, 64, // row 1
+            0, 127, 128, 255, // row 2
+            64, 64, 192, 192, // row 3
+        ];
+        let segmentation = Array3::from_shape_vec((4, 4, 1), data).unwrap();
+
+        let mask = yolo_segmentation_to_mask(segmentation.view(), 128).unwrap();
+
+        // Values >= 128 should be 1, others 0
+        assert_eq!(mask[[0, 0]], 0); // 100 < 128
+        assert_eq!(mask[[0, 1]], 1); // 200 >= 128
+        assert_eq!(mask[[0, 2]], 0); // 50 < 128
+        assert_eq!(mask[[0, 3]], 1); // 150 >= 128
+        assert_eq!(mask[[1, 1]], 1); // 255 >= 128
+        assert_eq!(mask[[1, 2]], 1); // 128 >= 128
+        assert_eq!(mask[[2, 0]], 0); // 0 < 128
+        assert_eq!(mask[[2, 1]], 0); // 127 < 128
+    }
+
+    #[test]
+    fn test_segmentation_to_mask_all_above() {
+        let segmentation = Array3::from_elem((4, 4, 1), 255u8);
+        let mask = yolo_segmentation_to_mask(segmentation.view(), 128).unwrap();
+        assert!(mask.iter().all(|&x| x == 1));
+    }
+
+    #[test]
+    fn test_segmentation_to_mask_all_below() {
+        let segmentation = Array3::from_elem((4, 4, 1), 64u8);
+        let mask = yolo_segmentation_to_mask(segmentation.view(), 128).unwrap();
+        assert!(mask.iter().all(|&x| x == 0));
+    }
+
+    #[test]
+    fn test_segmentation_to_mask_invalid_shape() {
+        let segmentation = Array3::from_elem((4, 4, 3), 128u8);
+        let result = yolo_segmentation_to_mask(segmentation.view(), 128);
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(crate::DecoderError::InvalidShape(s)) if s.contains("(H, W, 1)")
+        ));
+    }
 }

@@ -614,20 +614,30 @@ pub fn dequantize_cpu_chunked<T: AsPrimitive<F>, F: Float + 'static>(
 /// Converts a segmentation tensor into a 2D mask
 /// If the last dimension of the segmentation tensor is 1, values equal or
 /// above 128 are considered objects. Otherwise the object is the argmax index
+///
+/// # Errors
+///
+/// Returns `DecoderError::InvalidShape` if the segmentation tensor has an
+/// invalid shape.
+///
 /// # Examples
 /// ```
 /// # use edgefirst_decoder::segmentation_to_mask;
 /// let segmentation =
 ///     ndarray::Array3::<u8>::from_shape_vec((2, 2, 1), vec![0, 255, 128, 127]).unwrap();
-/// let mask = segmentation_to_mask(segmentation.view());
+/// let mask = segmentation_to_mask(segmentation.view()).unwrap();
 /// assert_eq!(mask, ndarray::array![[0, 1], [1, 0]]);
 /// ```
-pub fn segmentation_to_mask(segmentation: ArrayView3<u8>) -> Array2<u8> {
-    assert!(segmentation.shape()[2] > 0);
+pub fn segmentation_to_mask(segmentation: ArrayView3<u8>) -> Result<Array2<u8>, DecoderError> {
+    if segmentation.shape()[2] == 0 {
+        return Err(DecoderError::InvalidShape(
+            "Segmentation tensor must have non-zero depth".to_string(),
+        ));
+    }
     if segmentation.shape()[2] == 1 {
         yolo_segmentation_to_mask(segmentation, 128)
     } else {
-        modelpack_segmentation_to_mask(segmentation)
+        Ok(modelpack_segmentation_to_mask(segmentation))
     }
 }
 
@@ -1025,8 +1035,8 @@ mod decoder_tests {
         // but scaled differently. However, it is expected that the mask after argmax
         // will be the same.
         compare_outputs((&[], &output_boxes), (&[], &[]));
-        let mask0 = segmentation_to_mask(mask[0].segmentation.view());
-        let mask1 = segmentation_to_mask(output_masks[0].segmentation.view());
+        let mask0 = segmentation_to_mask(mask[0].segmentation.view()).unwrap();
+        let mask1 = segmentation_to_mask(output_masks[0].segmentation.view()).unwrap();
 
         assert_eq!(mask0, mask1);
     }
@@ -1112,12 +1122,12 @@ mod decoder_tests {
             .unwrap();
 
         compare_outputs((&[], &output_boxes), (&[], &[]));
-        let mask_u8 = segmentation_to_mask(output_masks_u8[0].segmentation.view());
-        let mask_i8 = segmentation_to_mask(output_masks_i8[0].segmentation.view());
-        let mask_u16 = segmentation_to_mask(output_masks_u16[0].segmentation.view());
-        let mask_i16 = segmentation_to_mask(output_masks_i16[0].segmentation.view());
-        let mask_u32 = segmentation_to_mask(output_masks_u32[0].segmentation.view());
-        let mask_i32 = segmentation_to_mask(output_masks_i32[0].segmentation.view());
+        let mask_u8 = segmentation_to_mask(output_masks_u8[0].segmentation.view()).unwrap();
+        let mask_i8 = segmentation_to_mask(output_masks_i8[0].segmentation.view()).unwrap();
+        let mask_u16 = segmentation_to_mask(output_masks_u16[0].segmentation.view()).unwrap();
+        let mask_i16 = segmentation_to_mask(output_masks_i16[0].segmentation.view()).unwrap();
+        let mask_u32 = segmentation_to_mask(output_masks_u32[0].segmentation.view()).unwrap();
+        let mask_i32 = segmentation_to_mask(output_masks_i32[0].segmentation.view()).unwrap();
         assert_eq!(mask_u8, mask_i8);
         assert_eq!(mask_u8, mask_u16);
         assert_eq!(mask_u8, mask_i16);
@@ -1236,8 +1246,8 @@ mod decoder_tests {
         // output is the same as the quantized output but scaled differently.
         // However, it is expected that the mask after argmax will be the same.
         compare_outputs((&correct_boxes, &output_boxes), (&[], &[]));
-        let mask0 = segmentation_to_mask(mask[0].segmentation.view());
-        let mask1 = segmentation_to_mask(output_masks[0].segmentation.view());
+        let mask0 = segmentation_to_mask(mask[0].segmentation.view()).unwrap();
+        let mask1 = segmentation_to_mask(output_masks[0].segmentation.view()).unwrap();
 
         assert_eq!(mask0, mask1);
     }
@@ -1375,8 +1385,8 @@ mod decoder_tests {
         // output is the same as the quantized output but scaled differently.
         // However, it is expected that the mask after argmax will be the same.
         compare_outputs((&correct_boxes, &output_boxes), (&[], &[]));
-        let mask0 = segmentation_to_mask(mask[0].segmentation.view());
-        let mask1 = segmentation_to_mask(output_masks[0].segmentation.view());
+        let mask0 = segmentation_to_mask(mask[0].segmentation.view()).unwrap();
+        let mask1 = segmentation_to_mask(output_masks[0].segmentation.view()).unwrap();
 
         assert_eq!(mask0, mask1);
     }
@@ -1564,7 +1574,7 @@ mod decoder_tests {
 
         assert_eq!(
             cropped_mask,
-            segmentation_to_mask(output_masks[1].segmentation.view())
+            segmentation_to_mask(output_masks[1].segmentation.view()).unwrap()
         );
     }
 
