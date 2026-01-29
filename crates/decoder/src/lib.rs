@@ -2017,18 +2017,21 @@ mod decoder_tests {
             let quant = (0.0040811873, -123).into();
 
             let decoder = DecoderBuilder::default()
-                .with_config_yolo_det(configs::Detection {
-                    decoder: DecoderType::Ultralytics,
-                    shape: vec![1, 84, 8400],
-                    anchors: None,
-                    quantization: Some(quant),
-                    dshape: vec![
-                        (DimName::Batch, 1),
-                        (DimName::NumFeatures, 84),
-                        (DimName::NumBoxes, 8400),
-                    ],
-                    normalized: None,
-                }, None)
+                .with_config_yolo_det(
+                    configs::Detection {
+                        decoder: DecoderType::Ultralytics,
+                        shape: vec![1, 84, 8400],
+                        anchors: None,
+                        quantization: Some(quant),
+                        dshape: vec![
+                            (DimName::Batch, 1),
+                            (DimName::NumFeatures, 84),
+                            (DimName::NumBoxes, 8400),
+                        ],
+                        normalized: None,
+                    },
+                    None,
+                )
                 .with_score_threshold(score_threshold)
                 .with_iou_threshold(iou_threshold)
                 .build()
