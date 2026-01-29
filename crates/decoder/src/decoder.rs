@@ -5342,7 +5342,8 @@ outputs:
             .with_nms(None) // User wants to handle NMS themselves
             .build()
             .unwrap();
-        // Should still be traditional YoloDet, not end-to-end
+        // nms=None with 84 features (80 classes) -> traditional YoloDet (user handles
+        // NMS)
         assert!(matches!(decoder.model_type, ModelType::YoloDet { .. }));
     }
 
@@ -5365,7 +5366,7 @@ outputs:
             .with_config_yaml_str(yaml.to_string())
             .build()
             .unwrap();
-        // Should still be traditional YoloDet, not end-to-end
+        // 6 features with (batch, N, features) layout -> end-to-end detection
         assert!(matches!(
             decoder.model_type,
             ModelType::YoloEndToEndDet { .. }
@@ -5393,7 +5394,7 @@ outputs:
             .with_config_yaml_str(yaml.to_string())
             .build()
             .unwrap();
-        // Should still be traditional YoloDet, not end-to-end
+        // 7 features with protos -> end-to-end segmentation detection
         assert!(matches!(
             decoder.model_type,
             ModelType::YoloEndToEndSegDet { .. }
@@ -5413,7 +5414,8 @@ outputs:
             .with_config_yaml_str(yaml.to_string())
             .build()
             .unwrap();
-        // Should still be traditional YoloDet, not end-to-end
+        // 6 features -> traditional YOLO detection (needs num_classes > 0 for
+        // end-to-end)
         assert!(matches!(decoder.model_type, ModelType::YoloDet { .. }));
 
         let yaml = r#"
@@ -5439,7 +5441,7 @@ outputs:
             .with_config_yaml_str(yaml.to_string())
             .build()
             .unwrap();
-        // Should still be traditional YoloDet, not end-to-end
+        // 38 features (4+2+32) with protos -> traditional YOLO segmentation detection
         assert!(matches!(decoder.model_type, ModelType::YoloSegDet { .. }));
     }
 
