@@ -726,8 +726,10 @@ impl PyDecoder {
     #[pyo3(signature = (segmentation))]
     pub fn segmentation_to_mask<'py>(
         segmentation: PyReadonlyArray3<'py, u8>,
-    ) -> Bound<'py, PyArray2<u8>> {
-        segmentation_to_mask(segmentation.as_array()).to_pyarray(segmentation.py())
+    ) -> PyResult<Bound<'py, PyArray2<u8>>> {
+        let result = segmentation_to_mask(segmentation.as_array())
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(result.to_pyarray(segmentation.py()))
     }
 
     #[getter(score_threshold)]
