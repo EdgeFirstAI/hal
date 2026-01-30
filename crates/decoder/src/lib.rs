@@ -2005,17 +2005,208 @@ mod decoder_tests {
         );
     }
 
-    // #[test]
-    // fn test_decoder_missing_output() {
-    //     let score_threshold = 0.25;
-    //     let iou_threshold = 0.7;
-    //     let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
-    //     let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8,
-    // out.len()) };     let out = ndarray::Array2::from_shape_vec((84, 8400),
-    // out.to_vec()).unwrap();     let quant = Quantization::new(0.0040811873,
-    // -123);     let mut output_boxes: Vec<_> = Vec::with_capacity(50);
+    /// test running multiple decoders concurrently
+    #[test]
+    fn test_context_switch() {
+        let yolo_det = || {
+            let score_threshold = 0.25;
+            let iou_threshold = 0.7;
+            let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
+            let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
+            let out = Array3::from_shape_vec((1, 84, 8400), out.to_vec()).unwrap();
+            let quant = (0.0040811873, -123).into();
 
-    // }
+            let decoder = DecoderBuilder::default()
+                .with_config_yolo_det(
+                    configs::Detection {
+                        decoder: DecoderType::Ultralytics,
+                        shape: vec![1, 84, 8400],
+                        anchors: None,
+                        quantization: Some(quant),
+                        dshape: vec![
+                            (DimName::Batch, 1),
+                            (DimName::NumFeatures, 84),
+                            (DimName::NumBoxes, 8400),
+                        ],
+                        normalized: None,
+                    },
+                    None,
+                )
+                .with_score_threshold(score_threshold)
+                .with_iou_threshold(iou_threshold)
+                .build()
+                .unwrap();
+
+            let mut output_boxes: Vec<_> = Vec::with_capacity(50);
+            let mut output_masks: Vec<_> = Vec::with_capacity(50);
+
+            for _ in 0..100 {
+                decoder
+                    .decode_quantized(&[out.view().into()], &mut output_boxes, &mut output_masks)
+                    .unwrap();
+
+                assert!(output_boxes[0].equal_within_delta(
+                    &DetectBox {
+                        bbox: BoundingBox {
+                            xmin: 0.5285137,
+                            ymin: 0.05305544,
+                            xmax: 0.87541467,
+                            ymax: 0.9998909,
+                        },
+                        score: 0.5591227,
+                        label: 0
+                    },
+                    1e-6
+                ));
+
+                assert!(output_boxes[1].equal_within_delta(
+                    &DetectBox {
+                        bbox: BoundingBox {
+                            xmin: 0.130598,
+                            ymin: 0.43260583,
+                            xmax: 0.35098213,
+                            ymax: 0.9958097,
+                        },
+                        score: 0.33057618,
+                        label: 75
+                    },
+                    1e-6
+                ));
+                assert!(output_masks.is_empty());
+            }
+        };
+
+        let modelpack_det_split = || {
+            let score_threshold = 0.8;
+            let iou_threshold = 0.5;
+
+            let seg = include_bytes!("../../../testdata/modelpack_seg_2x160x160.bin");
+            let seg = ndarray::Array4::from_shape_vec((1, 2, 160, 160), seg.to_vec()).unwrap();
+
+            let detect0 = include_bytes!("../../../testdata/modelpack_split_9x15x18.bin");
+            let detect0 =
+                ndarray::Array4::from_shape_vec((1, 9, 15, 18), detect0.to_vec()).unwrap();
+
+            let detect1 = include_bytes!("../../../testdata/modelpack_split_17x30x18.bin");
+            let detect1 =
+                ndarray::Array4::from_shape_vec((1, 17, 30, 18), detect1.to_vec()).unwrap();
+
+            let mut mask = seg.slice(s![0, .., .., ..]);
+            mask.swap_axes(0, 1);
+            mask.swap_axes(1, 2);
+            let mask = [Segmentation {
+                xmin: 0.0,
+                ymin: 0.0,
+                xmax: 1.0,
+                ymax: 1.0,
+                segmentation: mask.into_owned(),
+            }];
+            let correct_boxes = [DetectBox {
+                bbox: BoundingBox {
+                    xmin: 0.43171933,
+                    ymin: 0.68243736,
+                    xmax: 0.5626645,
+                    ymax: 0.808863,
+                },
+                score: 0.99240804,
+                label: 0,
+            }];
+
+            let quant0 = (0.08547406643629074, 174).into();
+            let quant1 = (0.09929127991199493, 183).into();
+            let quant_seg = (1.0 / 255.0, 0).into();
+
+            let anchors0 = vec![
+                [0.36666667461395264, 0.31481480598449707],
+                [0.38749998807907104, 0.4740740656852722],
+                [0.5333333611488342, 0.644444465637207],
+            ];
+            let anchors1 = vec![
+                [0.13750000298023224, 0.2074074000120163],
+                [0.2541666626930237, 0.21481481194496155],
+                [0.23125000298023224, 0.35185185074806213],
+            ];
+
+            let decoder = DecoderBuilder::default()
+                .with_config_modelpack_segdet_split(
+                    vec![
+                        configs::Detection {
+                            decoder: DecoderType::ModelPack,
+                            shape: vec![1, 17, 30, 18],
+                            anchors: Some(anchors1),
+                            quantization: Some(quant1),
+                            dshape: vec![
+                                (DimName::Batch, 1),
+                                (DimName::Height, 17),
+                                (DimName::Width, 30),
+                                (DimName::NumAnchorsXFeatures, 18),
+                            ],
+                            normalized: None,
+                        },
+                        configs::Detection {
+                            decoder: DecoderType::ModelPack,
+                            shape: vec![1, 9, 15, 18],
+                            anchors: Some(anchors0),
+                            quantization: Some(quant0),
+                            dshape: vec![
+                                (DimName::Batch, 1),
+                                (DimName::Height, 9),
+                                (DimName::Width, 15),
+                                (DimName::NumAnchorsXFeatures, 18),
+                            ],
+                            normalized: None,
+                        },
+                    ],
+                    configs::Segmentation {
+                        decoder: DecoderType::ModelPack,
+                        quantization: Some(quant_seg),
+                        shape: vec![1, 2, 160, 160],
+                        dshape: vec![
+                            (DimName::Batch, 1),
+                            (DimName::NumClasses, 2),
+                            (DimName::Height, 160),
+                            (DimName::Width, 160),
+                        ],
+                    },
+                )
+                .with_score_threshold(score_threshold)
+                .with_iou_threshold(iou_threshold)
+                .build()
+                .unwrap();
+            let mut output_boxes: Vec<_> = Vec::with_capacity(10);
+            let mut output_masks: Vec<_> = Vec::with_capacity(10);
+
+            for _ in 0..100 {
+                decoder
+                    .decode_quantized(
+                        &[
+                            detect0.view().into(),
+                            detect1.view().into(),
+                            seg.view().into(),
+                        ],
+                        &mut output_boxes,
+                        &mut output_masks,
+                    )
+                    .unwrap();
+
+                compare_outputs((&correct_boxes, &output_boxes), (&mask, &output_masks));
+            }
+        };
+
+        let handles = vec![
+            std::thread::spawn(yolo_det),
+            std::thread::spawn(modelpack_det_split),
+            std::thread::spawn(yolo_det),
+            std::thread::spawn(modelpack_det_split),
+            std::thread::spawn(yolo_det),
+            std::thread::spawn(modelpack_det_split),
+            std::thread::spawn(yolo_det),
+            std::thread::spawn(modelpack_det_split),
+        ];
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
 
     #[test]
     fn test_ndarray_to_xyxy_float() {

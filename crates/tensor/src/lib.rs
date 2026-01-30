@@ -462,7 +462,7 @@ where
 mod tests {
     #[cfg(target_os = "linux")]
     use nix::unistd::{AccessFlags, access};
-    use std::io::Write as _;
+    use std::{io::Write as _, sync::RwLock};
 
     use super::*;
 
@@ -471,9 +471,26 @@ mod tests {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     }
 
+    macro_rules! function {
+        () => {{
+            fn f() {}
+            fn type_name_of<T>(_: T) -> &'static str {
+                std::any::type_name::<T>()
+            }
+            let name = type_name_of(f);
+
+            // Find and cut the rest of the path
+            match &name[..name.len() - 3].rfind(':') {
+                Some(pos) => &name[pos + 1..name.len() - 3],
+                None => &name[..name.len() - 3],
+            }
+        }};
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn test_tensor() {
+        let _lock = FD_LOCK.read().unwrap();
         let shape = vec![1];
         let tensor = DmaTensor::<f32>::new(&shape, Some("dma_tensor"));
         let dma_enabled = tensor.is_ok();
@@ -496,6 +513,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_dma_tensor() {
+        let _lock = FD_LOCK.read().unwrap();
         match access(
             "/dev/dma_heap/linux,cma",
             AccessFlags::R_OK | AccessFlags::W_OK,
@@ -593,6 +611,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_shm_tensor() {
+        let _lock = FD_LOCK.read().unwrap();
         let shape = vec![2, 3, 4];
         let tensor =
             ShmTensor::<f32>::new(&shape, Some("test_tensor")).expect("Failed to create tensor");
@@ -708,9 +727,160 @@ mod tests {
         }
     }
 
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_dma_no_fd_leaks() {
+        let _lock = FD_LOCK.write().unwrap();
+        if !is_dma_available() {
+            log::warn!(
+                "SKIPPED: {} - DMA memory allocation not available (permission denied or no DMA-BUF support)",
+                function!()
+            );
+            return;
+        }
+
+        let proc = procfs::process::Process::myself()
+            .expect("Failed to get current process using /proc/self");
+
+        let start_open_fds = proc
+            .fd_count()
+            .expect("Failed to get open file descriptor count");
+
+        for _ in 0..100 {
+            let tensor = Tensor::<u8>::new(&[100, 100], Some(TensorMemory::Dma), None)
+                .expect("Failed to create tensor");
+            let mut map = tensor.map().unwrap();
+            map.as_mut_slice().fill(233);
+        }
+
+        let end_open_fds = proc
+            .fd_count()
+            .expect("Failed to get open file descriptor count");
+
+        assert_eq!(
+            start_open_fds, end_open_fds,
+            "File descriptor leak detected: {} -> {}",
+            start_open_fds, end_open_fds
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_dma_from_fd_no_fd_leaks() {
+        let _lock = FD_LOCK.write().unwrap();
+        if !is_dma_available() {
+            log::warn!(
+                "SKIPPED: {} - DMA memory allocation not available (permission denied or no DMA-BUF support)",
+                function!()
+            );
+            return;
+        }
+
+        let proc = procfs::process::Process::myself()
+            .expect("Failed to get current process using /proc/self");
+
+        let start_open_fds = proc
+            .fd_count()
+            .expect("Failed to get open file descriptor count");
+
+        let orig = Tensor::<u8>::new(&[100, 100], Some(TensorMemory::Dma), None).unwrap();
+
+        for _ in 0..100 {
+            let tensor =
+                Tensor::<u8>::from_fd(orig.clone_fd().unwrap(), orig.shape(), None).unwrap();
+            let mut map = tensor.map().unwrap();
+            map.as_mut_slice().fill(233);
+        }
+        drop(orig);
+
+        let end_open_fds = proc.fd_count().unwrap();
+
+        assert_eq!(
+            start_open_fds, end_open_fds,
+            "File descriptor leak detected: {} -> {}",
+            start_open_fds, end_open_fds
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_shm_no_fd_leaks() {
+        let _lock = FD_LOCK.write().unwrap();
+        if !is_shm_available() {
+            log::warn!(
+                "SKIPPED: {} - SHM memory allocation not available (permission denied or no SHM support)",
+                function!()
+            );
+            return;
+        }
+
+        let proc = procfs::process::Process::myself()
+            .expect("Failed to get current process using /proc/self");
+
+        let start_open_fds = proc
+            .fd_count()
+            .expect("Failed to get open file descriptor count");
+
+        for _ in 0..100 {
+            let tensor = Tensor::<u8>::new(&[100, 100], Some(TensorMemory::Shm), None)
+                .expect("Failed to create tensor");
+            let mut map = tensor.map().unwrap();
+            map.as_mut_slice().fill(233);
+        }
+
+        let end_open_fds = proc
+            .fd_count()
+            .expect("Failed to get open file descriptor count");
+
+        assert_eq!(
+            start_open_fds, end_open_fds,
+            "File descriptor leak detected: {} -> {}",
+            start_open_fds, end_open_fds
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_shm_from_fd_no_fd_leaks() {
+        let _lock = FD_LOCK.write().unwrap();
+        if !is_shm_available() {
+            log::warn!(
+                "SKIPPED: {} - SHM memory allocation not available (permission denied or no SHM support)",
+                function!()
+            );
+            return;
+        }
+
+        let proc = procfs::process::Process::myself()
+            .expect("Failed to get current process using /proc/self");
+
+        let start_open_fds = proc
+            .fd_count()
+            .expect("Failed to get open file descriptor count");
+
+        let orig = Tensor::<u8>::new(&[100, 100], Some(TensorMemory::Shm), None).unwrap();
+
+        for _ in 0..100 {
+            let tensor =
+                Tensor::<u8>::from_fd(orig.clone_fd().unwrap(), orig.shape(), None).unwrap();
+            let mut map = tensor.map().unwrap();
+            map.as_mut_slice().fill(233);
+        }
+        drop(orig);
+
+        let end_open_fds = proc.fd_count().unwrap();
+
+        assert_eq!(
+            start_open_fds, end_open_fds,
+            "File descriptor leak detected: {} -> {}",
+            start_open_fds, end_open_fds
+        );
+    }
+
     #[cfg(feature = "ndarray")]
     #[test]
     fn test_ndarray() {
+        let _lock = FD_LOCK.read().unwrap();
         let shape = vec![2, 3, 4];
         let tensor = Tensor::<f32>::new(&shape, None, None).expect("Failed to create tensor");
 
@@ -727,5 +897,40 @@ mod tests {
         view_mut[[0, 0, 0]] = 42.0;
         assert_eq!(view_mut[[0, 0, 0]], 42.0);
         assert_eq!(tensor_map[0], 42.0, "Value at index 0 should be 42");
+    }
+
+    // Any test that cares about the fd count must grab it exclusively.
+    // Any tests which modifies the fd count by opening or closing fds must grab it
+    // shared.
+    pub static FD_LOCK: RwLock<()> = RwLock::new(());
+
+    static DMA_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Helper function to check if DMA memory allocation is available
+    fn is_dma_available() -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            *DMA_AVAILABLE
+                .get_or_init(|| Tensor::<u8>::new(&[64], Some(TensorMemory::Dma), None).is_ok())
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    static SHM_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Helper function to check if DMA memory allocation is available
+    fn is_shm_available() -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            *SHM_AVAILABLE
+                .get_or_init(|| Tensor::<u8>::new(&[64], Some(TensorMemory::Shm), None).is_ok())
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
     }
 }
