@@ -447,6 +447,20 @@ def test_shm_zero_copy_perf():
     assert elapsed < elapsed_copy
 
 
+def tensor_fd_func(mem_type: TensorMemory):
+    try:
+        original = Tensor([100, 100, 3], dtype="uint8", mem=mem_type)
+        del original
+    except (AttributeError, RuntimeError):
+        pytest.skip(f"{mem_type} memory not supported on this platform")
+
+    for _ in range(100):
+        tensor = Tensor([100, 100], dtype="uint8", mem=mem_type)
+        with tensor.map() as m:
+            m[0] = 3
+        del tensor
+
+
 def test_dma_no_fd_leaks():
     """Test that DMA tensors don't leak file descriptors"""
     psutil = pytest.importorskip("psutil")
@@ -457,18 +471,8 @@ def test_dma_no_fd_leaks():
     except AttributeError:
         pytest.skip("num_fds not supported on this platform")
 
-    try:
-        # Test if DMA is available
-        test_tensor = Tensor([64], dtype="uint8", mem=TensorMemory.DMA)
-        del test_tensor
-    except (AttributeError, RuntimeError):
-        pytest.skip("DMA memory not supported on this platform")
+    tensor_fd_func(TensorMemory.DMA)
 
-    for _ in range(100):
-        tensor = Tensor([100, 100], dtype="uint8", mem=TensorMemory.DMA)
-        with tensor.map() as m:
-            m[0] = 3
-        del tensor
     gc.collect()
     end_fds = proc.num_fds()
     assert start_fds == end_fds, f"File descriptor leak detected: {start_fds} -> {end_fds}"
@@ -484,21 +488,25 @@ def test_shm_no_fd_leaks():
     except AttributeError:
         pytest.skip("num_fds not supported on this platform")
 
-    try:
-        # Test if SHM is available
-        test_tensor = Tensor([64], dtype="uint8", mem=TensorMemory.SHM)
-        del test_tensor
-    except (AttributeError, RuntimeError):
-        pytest.skip("SHM memory not supported on this platform")
+    tensor_fd_func(TensorMemory.SHM)
 
-    for _ in range(100):
-        tensor = Tensor([100, 100], dtype="uint8", mem=TensorMemory.SHM)
-        with tensor.map() as m:
-            m[0] = 3
-        del tensor
     gc.collect()
     end_fds = proc.num_fds()
     assert start_fds == end_fds, f"File descriptor leak detected: {start_fds} -> {end_fds}"
+
+
+def tensor_from_fd_func(mem_type: TensorMemory):
+    try:
+        original = Tensor([100, 100, 3], dtype="uint8", mem=mem_type)
+    except (AttributeError, RuntimeError):
+        pytest.skip(f"{mem_type} memory not supported on this platform")
+
+    for _ in range(100):
+        tensor_fd = Tensor.from_fd(original.fd, original.shape, original.dtype)
+        with tensor_fd.map() as m:
+            m[0] = 3
+        del tensor_fd
+    del original
 
 
 def test_dma_fd_leak_with_from_fd():
@@ -511,17 +519,7 @@ def test_dma_fd_leak_with_from_fd():
     except AttributeError:
         pytest.skip("num_fds not supported on this platform")
 
-    try:
-        original = Tensor([100, 100, 3], dtype="uint8", mem=TensorMemory.DMA)
-    except (AttributeError, RuntimeError):
-        pytest.skip("DMA memory not supported on this platform")
-
-    for _ in range(100):
-        tensor_fd = Tensor.from_fd(original.fd, original.shape, original.dtype)
-        with tensor_fd.map() as m:
-            m[0] = 3
-        del tensor_fd
-    del original
+    tensor_from_fd_func(TensorMemory.DMA)
     gc.collect()
     end_fds = proc.num_fds()
     assert start_fds == end_fds, f"File descriptor leak detected: {start_fds} -> {end_fds}"
@@ -537,17 +535,8 @@ def test_shm_fd_leak_with_from_fd():
     except AttributeError:
         pytest.skip("num_fds not supported on this platform")
 
-    try:
-        original = Tensor([100, 100, 3], dtype="uint8", mem=TensorMemory.SHM)
-    except (AttributeError, RuntimeError):
-        pytest.skip("SHM memory not supported on this platform")
+    tensor_from_fd_func(TensorMemory.SHM)
 
-    for _ in range(100):
-        tensor_fd = Tensor.from_fd(original.fd, original.shape, original.dtype)
-        with tensor_fd.map() as m:
-            m[0] = 3
-        del tensor_fd
-    del original
     gc.collect()
     end_fds = proc.num_fds()
     assert start_fds == end_fds, f"File descriptor leak detected: {start_fds} -> {end_fds}"
