@@ -3,7 +3,8 @@
 
 use crate::{
     Crop, Error, Flip, FunctionTimer, GREY, ImageProcessorTrait, NV12, NV16, PLANAR_RGB,
-    PLANAR_RGBA, RGB, RGBA, Rect, Result, Rotation, TensorImage, YUYV,
+    PLANAR_RGBA, RGB, RGBA, Rect, Result, Rotation, TensorImage, TensorImageDst, TensorImageRef,
+    YUYV,
 };
 #[cfg(feature = "decoder")]
 use edgefirst_decoder::{DetectBox, Segmentation};
@@ -1046,6 +1047,99 @@ impl CPUProcessor {
         }
     }
 
+    /// Generic RGB to PLANAR_RGB conversion that works with any TensorImageDst.
+    fn convert_rgb_to_planar_rgb_generic<D: TensorImageDst>(
+        src: &TensorImage,
+        dst: &mut D,
+    ) -> Result<()> {
+        assert_eq!(src.fourcc(), RGB);
+        assert_eq!(dst.fourcc(), PLANAR_RGB);
+
+        let src = src.tensor().map()?;
+        let src = src.as_slice();
+        let src = src.as_chunks::<3>().0;
+
+        let mut dst_map = dst.tensor_mut().map()?;
+        let dst_ = dst_map.as_mut_slice();
+
+        let (dst0, dst1) = dst_.split_at_mut(dst.width() * dst.height());
+        let (dst1, dst2) = dst1.split_at_mut(dst.width() * dst.height());
+
+        src.par_iter()
+            .zip_eq(dst0)
+            .zip_eq(dst1)
+            .zip_eq(dst2)
+            .for_each(|(((s, d0), d1), d2)| {
+                *d0 = s[0];
+                *d1 = s[1];
+                *d2 = s[2];
+            });
+        Ok(())
+    }
+
+    /// Generic RGBA to PLANAR_RGB conversion that works with any TensorImageDst.
+    fn convert_rgba_to_planar_rgb_generic<D: TensorImageDst>(
+        src: &TensorImage,
+        dst: &mut D,
+    ) -> Result<()> {
+        assert_eq!(src.fourcc(), RGBA);
+        assert_eq!(dst.fourcc(), PLANAR_RGB);
+
+        let src = src.tensor().map()?;
+        let src = src.as_slice();
+        let src = src.as_chunks::<4>().0;
+
+        let mut dst_map = dst.tensor_mut().map()?;
+        let dst_ = dst_map.as_mut_slice();
+
+        let (dst0, dst1) = dst_.split_at_mut(dst.width() * dst.height());
+        let (dst1, dst2) = dst1.split_at_mut(dst.width() * dst.height());
+
+        src.par_iter()
+            .zip_eq(dst0)
+            .zip_eq(dst1)
+            .zip_eq(dst2)
+            .for_each(|(((s, d0), d1), d2)| {
+                *d0 = s[0];
+                *d1 = s[1];
+                *d2 = s[2];
+            });
+        Ok(())
+    }
+
+    /// Generic copy for same-format images that works with any TensorImageDst.
+    fn copy_image_generic<D: TensorImageDst>(src: &TensorImage, dst: &mut D) -> Result<()> {
+        assert_eq!(src.fourcc(), dst.fourcc());
+        dst.tensor_mut().map()?.copy_from_slice(&src.tensor().map()?);
+        Ok(())
+    }
+
+    /// Format conversion that writes to a generic TensorImageDst.
+    /// Supports common zero-copy preprocessing cases.
+    pub(crate) fn convert_format_generic<D: TensorImageDst>(
+        src: &TensorImage,
+        dst: &mut D,
+    ) -> Result<()> {
+        let _timer = FunctionTimer::new(format!(
+            "ImageProcessor::convert_format_generic {} to {}",
+            src.fourcc().display(),
+            dst.fourcc().display()
+        ));
+        assert_eq!(src.height(), dst.height());
+        assert_eq!(src.width(), dst.width());
+
+        match (src.fourcc(), dst.fourcc()) {
+            (RGB, PLANAR_RGB) => Self::convert_rgb_to_planar_rgb_generic(src, dst),
+            (RGBA, PLANAR_RGB) => Self::convert_rgba_to_planar_rgb_generic(src, dst),
+            (f1, f2) if f1 == f2 => Self::copy_image_generic(src, dst),
+            (s, d) => Err(Error::NotSupported(format!(
+                "Generic conversion from {} to {} not supported",
+                s.display(),
+                d.display()
+            ))),
+        }
+    }
+
     /// The src and dest img should be in RGB/RGBA/grey format for correct
     /// output. If the format is not 1, 3, or 4 bits per pixel, and error will
     /// be returned. The src and dest img must have the same fourcc,
@@ -1246,6 +1340,39 @@ impl CPUProcessor {
         let dst_fourcc = dst.fourcc();
         let mut dst_map = dst.tensor().map()?;
         let dst = (dst_map.as_mut_slice(), dst.width(), dst.height());
+        match dst_fourcc {
+            RGBA => Self::fill_image_outside_crop_(dst, rgba, crop),
+            RGB => Self::fill_image_outside_crop_(dst, Self::rgba_to_rgb(rgba), crop),
+            GREY => Self::fill_image_outside_crop_(dst, Self::rgba_to_grey(rgba), crop),
+            YUYV => Self::fill_image_outside_crop_(
+                (dst.0, dst.1 / 2, dst.2),
+                Self::rgba_to_yuyv(rgba),
+                Rect::new(crop.left / 2, crop.top, crop.width.div_ceil(2), crop.height),
+            ),
+            PLANAR_RGB => Self::fill_image_outside_crop_planar(dst, Self::rgba_to_rgb(rgba), crop),
+            PLANAR_RGBA => Self::fill_image_outside_crop_planar(dst, rgba, crop),
+            NV16 => {
+                let yuyv = Self::rgba_to_yuyv(rgba);
+                Self::fill_image_outside_crop_yuv_semiplanar(dst, yuyv[0], [yuyv[1], yuyv[3]], crop)
+            }
+            _ => Err(Error::Internal(format!(
+                "Found unexpected destination {}",
+                dst_fourcc.display()
+            ))),
+        }
+    }
+
+    /// Generic fill for TensorImageDst types.
+    pub(crate) fn fill_image_outside_crop_generic<D: TensorImageDst>(
+        dst: &mut D,
+        rgba: [u8; 4],
+        crop: Rect,
+    ) -> Result<()> {
+        let dst_fourcc = dst.fourcc();
+        let dst_width = dst.width();
+        let dst_height = dst.height();
+        let mut dst_map = dst.tensor_mut().map()?;
+        let dst = (dst_map.as_mut_slice(), dst_width, dst_height);
         match dst_fourcc {
             RGBA => Self::fill_image_outside_crop_(dst, rgba, crop),
             RGB => Self::fill_image_outside_crop_(dst, Self::rgba_to_rgb(rgba), crop),
@@ -1767,6 +1894,133 @@ impl ImageProcessorTrait for CPUProcessor {
             && let Some(dst_color) = crop.dst_color
         {
             Self::fill_image_outside_crop(dst, dst_color, dst_rect)?;
+        }
+
+        Ok(())
+    }
+
+    fn convert_ref(
+        &mut self,
+        src: &TensorImage,
+        dst: &mut TensorImageRef<'_>,
+        rotation: Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> Result<()> {
+        crop.check_crop_ref(src, dst)?;
+
+        // Determine intermediate format needed for conversion
+        let intermediate = match (src.fourcc(), dst.fourcc()) {
+            (NV12, RGB) => RGB,
+            (NV12, RGBA) => RGBA,
+            (NV12, GREY) => GREY,
+            (NV12, PLANAR_RGB) => RGB,
+            (NV12, PLANAR_RGBA) => RGBA,
+            (YUYV, RGB) => RGB,
+            (YUYV, RGBA) => RGBA,
+            (YUYV, GREY) => GREY,
+            (YUYV, PLANAR_RGB) => RGB,
+            (YUYV, PLANAR_RGBA) => RGBA,
+            (RGBA, RGB) => RGBA,
+            (RGBA, RGBA) => RGBA,
+            (RGBA, GREY) => GREY,
+            (RGBA, PLANAR_RGB) => RGBA,
+            (RGBA, PLANAR_RGBA) => RGBA,
+            (RGB, RGB) => RGB,
+            (RGB, RGBA) => RGB,
+            (RGB, GREY) => GREY,
+            (RGB, PLANAR_RGB) => RGB,
+            (RGB, PLANAR_RGBA) => RGB,
+            (GREY, RGB) => RGB,
+            (GREY, RGBA) => RGBA,
+            (GREY, GREY) => GREY,
+            (GREY, PLANAR_RGB) => GREY,
+            (GREY, PLANAR_RGBA) => GREY,
+            (s, d) => {
+                return Err(Error::NotSupported(format!(
+                    "Conversion from {} to {}",
+                    s.display(),
+                    d.display()
+                )));
+            }
+        };
+
+        let need_resize_flip_rotation = rotation != Rotation::None
+            || flip != Flip::None
+            || src.width() != dst.width()
+            || src.height() != dst.height()
+            || crop.src_rect.is_some_and(|crop| {
+                crop != Rect {
+                    left: 0,
+                    top: 0,
+                    width: src.width(),
+                    height: src.height(),
+                }
+            })
+            || crop.dst_rect.is_some_and(|crop| {
+                crop != Rect {
+                    left: 0,
+                    top: 0,
+                    width: dst.width(),
+                    height: dst.height(),
+                }
+            });
+
+        // Simple case: no resize/flip/rotation needed
+        if !need_resize_flip_rotation {
+            // Try direct generic conversion (zero-copy path)
+            if let Ok(()) = Self::convert_format_generic(src, dst) {
+                return Ok(());
+            }
+        }
+
+        // Complex case: need intermediate buffers
+        // First, convert source to intermediate format if needed
+        let mut tmp_buffer;
+        let tmp: &TensorImage;
+        if intermediate != src.fourcc() {
+            tmp_buffer = TensorImage::new(
+                src.width(),
+                src.height(),
+                intermediate,
+                Some(edgefirst_tensor::TensorMemory::Mem),
+            )?;
+            Self::convert_format(src, &mut tmp_buffer)?;
+            tmp = &tmp_buffer;
+        } else {
+            tmp = src;
+        }
+
+        // Process resize/flip/rotation if needed
+        if need_resize_flip_rotation {
+            // Create intermediate buffer for resize output
+            let mut tmp2 = TensorImage::new(
+                dst.width(),
+                dst.height(),
+                tmp.fourcc(),
+                Some(edgefirst_tensor::TensorMemory::Mem),
+            )?;
+            self.resize_flip_rotate(tmp, &mut tmp2, rotation, flip, crop)?;
+
+            // Final conversion to destination (zero-copy into dst)
+            Self::convert_format_generic(&tmp2, dst)?;
+        } else {
+            // Direct conversion (already checked above, but handle edge cases)
+            Self::convert_format_generic(tmp, dst)?;
+        }
+
+        // Handle destination crop fill if needed
+        if let Some(dst_rect) = crop.dst_rect
+            && dst_rect
+                != (Rect {
+                    left: 0,
+                    top: 0,
+                    width: dst.width(),
+                    height: dst.height(),
+                })
+            && let Some(dst_color) = crop.dst_color
+        {
+            Self::fill_image_outside_crop_generic(dst, dst_color, dst_rect)?;
         }
 
         Ok(())
