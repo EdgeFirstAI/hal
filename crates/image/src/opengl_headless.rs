@@ -2870,6 +2870,11 @@ void main() {
 mod gl_tests {
     use super::*;
     use crate::{RGBA, TensorImage};
+    #[cfg(feature = "dma_test_formats")]
+    use crate::{NV12, YUYV};
+    use edgefirst_tensor::TensorTrait;
+    #[cfg(feature = "dma_test_formats")]
+    use edgefirst_tensor::{TensorMapTrait, TensorMemory};
     use image::buffer::ConvertBuffer;
     use ndarray::Array3;
 
@@ -3140,5 +3145,108 @@ mod gl_tests {
                 similarity.score, threshold
             )
         }
+    }
+
+    // =========================================================================
+    // NV12 Reference Validation Tests
+    // These tests compare OpenGL NV12 conversions against ffmpeg-generated references
+    // =========================================================================
+
+    #[cfg(feature = "dma_test_formats")]
+    fn load_raw_image(
+        width: usize,
+        height: usize,
+        fourcc: FourCharCode,
+        memory: Option<TensorMemory>,
+        bytes: &[u8],
+    ) -> Result<TensorImage, crate::Error> {
+        let img = TensorImage::new(width, height, fourcc, memory)?;
+        let mut map = img.tensor().map()?;
+        map.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
+        Ok(img)
+    }
+
+    /// Test OpenGL NV12→RGBA conversion against ffmpeg reference
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_opengl_nv12_to_rgba_reference() {
+        // Load NV12 source with DMA
+        let src = load_raw_image(
+            1280,
+            720,
+            NV12,
+            Some(TensorMemory::Dma),
+            include_bytes!("../../../testdata/camera720p.nv12"),
+        )
+        .unwrap();
+
+        // Load RGBA reference (ffmpeg-generated)
+        let reference = load_raw_image(
+            1280,
+            720,
+            RGBA,
+            None,
+            include_bytes!("../../../testdata/camera720p.rgba"),
+        )
+        .unwrap();
+
+        // Convert using OpenGL
+        let mut dst = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma)).unwrap();
+        let mut gl = GLProcessorThreaded::new().unwrap();
+        gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap();
+
+        // Copy to CPU for comparison
+        let cpu_dst = TensorImage::new(1280, 720, RGBA, None).unwrap();
+        cpu_dst
+            .tensor()
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(&dst.tensor().map().unwrap().as_slice());
+
+        compare_images(&reference, &cpu_dst, 0.98, "opengl_nv12_to_rgba_reference");
+    }
+
+    /// Test OpenGL YUYV→RGBA conversion against ffmpeg reference
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_opengl_yuyv_to_rgba_reference() {
+        // Load YUYV source with DMA
+        let src = load_raw_image(
+            1280,
+            720,
+            YUYV,
+            Some(TensorMemory::Dma),
+            include_bytes!("../../../testdata/camera720p.yuyv"),
+        )
+        .unwrap();
+
+        // Load RGBA reference (ffmpeg-generated)
+        let reference = load_raw_image(
+            1280,
+            720,
+            RGBA,
+            None,
+            include_bytes!("../../../testdata/camera720p.rgba"),
+        )
+        .unwrap();
+
+        // Convert using OpenGL
+        let mut dst = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma)).unwrap();
+        let mut gl = GLProcessorThreaded::new().unwrap();
+        gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap();
+
+        // Copy to CPU for comparison
+        let cpu_dst = TensorImage::new(1280, 720, RGBA, None).unwrap();
+        cpu_dst
+            .tensor()
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(&dst.tensor().map().unwrap().as_slice());
+
+        compare_images(&reference, &cpu_dst, 0.98, "opengl_yuyv_to_rgba_reference");
     }
 }
