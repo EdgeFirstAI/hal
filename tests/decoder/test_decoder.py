@@ -519,7 +519,7 @@ def numpy_nms(
     areas = (x2 - x1) * (y2 - y1)
 
     # Sort by scores in descending order
-    order = (-scores).argsort(stable=True)
+    order = (-scores).argsort(kind="stable")
 
     keep = []
     while order.size > 0:
