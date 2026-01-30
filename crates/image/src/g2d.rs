@@ -607,4 +607,174 @@ mod g2d_tests {
         }
         Ok(())
     }
+
+    // =========================================================================
+    // NV12 Reference Validation Tests
+    // These tests compare G2D NV12 conversions against ffmpeg-generated references
+    // =========================================================================
+
+    fn load_raw_image(
+        width: usize,
+        height: usize,
+        fourcc: FourCharCode,
+        memory: Option<TensorMemory>,
+        bytes: &[u8],
+    ) -> Result<TensorImage, crate::Error> {
+        let img = TensorImage::new(width, height, fourcc, memory)?;
+        let mut map = img.tensor().map()?;
+        map.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
+        Ok(img)
+    }
+
+    /// Test G2D NV12→RGBA conversion against ffmpeg reference
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_g2d_nv12_to_rgba_reference() -> Result<(), crate::Error> {
+        // Load NV12 source
+        let src = load_raw_image(
+            1280,
+            720,
+            NV12,
+            Some(TensorMemory::Dma),
+            include_bytes!("../../../testdata/camera720p.nv12"),
+        )?;
+
+        // Load RGBA reference (ffmpeg-generated)
+        let reference = load_raw_image(
+            1280,
+            720,
+            RGBA,
+            None,
+            include_bytes!("../../../testdata/camera720p.rgba"),
+        )?;
+
+        // Convert using G2D
+        let mut dst = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma))?;
+        let mut g2d = G2DProcessor::new()?;
+        g2d.convert_(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())?;
+
+        // Copy to CPU for comparison
+        let cpu_dst = TensorImage::new(1280, 720, RGBA, None)?;
+        cpu_dst
+            .tensor()
+            .map()?
+            .as_mut_slice()
+            .copy_from_slice(&dst.tensor().map()?.as_slice());
+
+        compare_images(&reference, &cpu_dst, 0.98, "g2d_nv12_to_rgba_reference")
+    }
+
+    /// Test G2D NV12→RGB conversion against ffmpeg reference
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_g2d_nv12_to_rgb_reference() -> Result<(), crate::Error> {
+        // Load NV12 source
+        let src = load_raw_image(
+            1280,
+            720,
+            NV12,
+            Some(TensorMemory::Dma),
+            include_bytes!("../../../testdata/camera720p.nv12"),
+        )?;
+
+        // Load RGB reference (ffmpeg-generated)
+        let reference = load_raw_image(
+            1280,
+            720,
+            RGB,
+            None,
+            include_bytes!("../../../testdata/camera720p.rgb"),
+        )?;
+
+        // Convert using G2D
+        let mut dst = TensorImage::new(1280, 720, RGB, Some(TensorMemory::Dma))?;
+        let mut g2d = G2DProcessor::new()?;
+        g2d.convert_(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())?;
+
+        // Copy to CPU for comparison
+        let cpu_dst = TensorImage::new(1280, 720, RGB, None)?;
+        cpu_dst
+            .tensor()
+            .map()?
+            .as_mut_slice()
+            .copy_from_slice(&dst.tensor().map()?.as_slice());
+
+        compare_images(&reference, &cpu_dst, 0.98, "g2d_nv12_to_rgb_reference")
+    }
+
+    /// Test G2D YUYV→RGBA conversion against ffmpeg reference
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_g2d_yuyv_to_rgba_reference() -> Result<(), crate::Error> {
+        // Load YUYV source
+        let src = load_raw_image(
+            1280,
+            720,
+            YUYV,
+            Some(TensorMemory::Dma),
+            include_bytes!("../../../testdata/camera720p.yuyv"),
+        )?;
+
+        // Load RGBA reference (ffmpeg-generated)
+        let reference = load_raw_image(
+            1280,
+            720,
+            RGBA,
+            None,
+            include_bytes!("../../../testdata/camera720p.rgba"),
+        )?;
+
+        // Convert using G2D
+        let mut dst = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma))?;
+        let mut g2d = G2DProcessor::new()?;
+        g2d.convert_(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())?;
+
+        // Copy to CPU for comparison
+        let cpu_dst = TensorImage::new(1280, 720, RGBA, None)?;
+        cpu_dst
+            .tensor()
+            .map()?
+            .as_mut_slice()
+            .copy_from_slice(&dst.tensor().map()?.as_slice());
+
+        compare_images(&reference, &cpu_dst, 0.98, "g2d_yuyv_to_rgba_reference")
+    }
+
+    /// Test G2D YUYV→RGB conversion against ffmpeg reference
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_g2d_yuyv_to_rgb_reference() -> Result<(), crate::Error> {
+        // Load YUYV source
+        let src = load_raw_image(
+            1280,
+            720,
+            YUYV,
+            Some(TensorMemory::Dma),
+            include_bytes!("../../../testdata/camera720p.yuyv"),
+        )?;
+
+        // Load RGB reference (ffmpeg-generated)
+        let reference = load_raw_image(
+            1280,
+            720,
+            RGB,
+            None,
+            include_bytes!("../../../testdata/camera720p.rgb"),
+        )?;
+
+        // Convert using G2D
+        let mut dst = TensorImage::new(1280, 720, RGB, Some(TensorMemory::Dma))?;
+        let mut g2d = G2DProcessor::new()?;
+        g2d.convert_(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())?;
+
+        // Copy to CPU for comparison
+        let cpu_dst = TensorImage::new(1280, 720, RGB, None)?;
+        cpu_dst
+            .tensor()
+            .map()?
+            .as_mut_slice()
+            .copy_from_slice(&dst.tensor().map()?.as_slice());
+
+        compare_images(&reference, &cpu_dst, 0.98, "g2d_yuyv_to_rgb_reference")
+    }
 }

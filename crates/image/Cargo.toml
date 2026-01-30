@@ -15,6 +15,7 @@ opengl = ["dep:khronos-egl", "dep:gbm"]
 decoder = ["dep:edgefirst-decoder", "dep:ndarray-stats"]
 opencv = ["dep:opencv"]
 g2d_test_formats = []
+dma_test_formats = []
 
 [dependencies]
 ctor = { workspace = true }
