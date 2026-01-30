@@ -184,7 +184,7 @@ fn load_image_types<T>(bencher: divan::Bencher)
 where
     T: FourCC,
 {
-    let file = include_bytes!("../../../testdata/person.jpg");
+    let file = include_bytes!("../../../testdata/zidane.jpg");
     bencher.bench_local(|| {
         let im = TensorImage::load_jpeg(file, Some(T::val()), Some(TensorMemory::Mem))
             .expect("Failed to load image");
@@ -193,7 +193,7 @@ where
     });
 }
 
-#[divan::bench(types = [Jaguar, Person, Zidane], args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+#[divan::bench(types = [Jaguar, Person, Zidane], args = [(640, 360), (960, 540), (512, 512), (1280, 720), (1920, 1080)])]
 fn resize_cpu<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
 where
     IMAGE: TestImage,
@@ -267,7 +267,7 @@ where
     });
 }
 
-#[divan::bench(types = [Jaguar, Person, Zidane], args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+#[divan::bench(types = [Jaguar, Person, Zidane], args = [(640, 360), (960, 540), (512, 512),(1280, 720), (1920, 1080)])]
 fn resize_cpu_grayscale_upscale<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
 where
     IMAGE: TestImage,
@@ -310,7 +310,7 @@ where
 }
 
 #[cfg(target_os = "linux")]
-#[divan::bench(types = [Jaguar, Person, Zidane], args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+#[divan::bench(types = [Jaguar, Person, Zidane], args = [(640, 360), (960, 540), (512, 512),(1280, 720), (1920, 1080)], ignore = !dma_available())]
 fn resize_g2d<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
 where
     IMAGE: TestImage,
@@ -349,7 +349,7 @@ where
 
 #[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
-#[divan::bench(types = [Person, Zidane], args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+#[divan::bench(types = [Person, Zidane], args = [(640, 360), (960, 540), (512, 512), (1280, 720), (1920, 1080)], ignore = !gl_available())]
 fn resize_opengl_mem<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
 where
     IMAGE: TestImage,
@@ -392,7 +392,7 @@ where
 
 #[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
-#[divan::bench(types = [Person, Zidane], args = [(640, 360), (960, 540), (512, 512), (1280, 720), (1920, 1080)])]
+#[divan::bench(types = [Person, Zidane], args = [(640, 360), (960, 540), (512, 512), (1280, 720), (1920, 1080)], ignore = !gl_available())]
 fn resize_opengl_mem_rgb_to_rgb<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
 where
     IMAGE: TestImage,
@@ -435,7 +435,7 @@ where
 
 #[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
-#[divan::bench(types = [Person, Zidane], args = [(640, 480), (960, 540), (1280, 720), (1920, 1080)])]
+#[divan::bench(types = [Person, Zidane], args = [(640, 480), (960, 540), (512, 512), (1280, 720), (1920, 1080)], ignore = !gl_available())]
 fn resize_opengl_mem_yuyv_to_640x640_rgba<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
 where
     IMAGE: TestImage,
@@ -491,7 +491,7 @@ where
 
 #[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
-#[divan::bench(types = [Person, Zidane], args = [(640, 480), (960, 540), (1280, 720), (1920, 1080)])]
+#[divan::bench(types = [Person, Zidane], args = [(640, 480), (960, 540), (512, 512), (1280, 720), (1920, 1080)], ignore = !gl_available())]
 fn resize_opengl_mem_yuyv_to_640x640_rgb<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
 where
     IMAGE: TestImage,
@@ -547,7 +547,7 @@ where
 
 #[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
-#[divan::bench(types = [Person, Zidane], args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+#[divan::bench(types = [Person, Zidane], args = [(640, 360), (960, 540), (512, 512), (1280, 720), (1920, 1080)], ignore = !gl_available() || !dma_available())]
 fn resize_opengl_dma<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
 where
     IMAGE: TestImage,
@@ -591,7 +591,7 @@ where
 
 #[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
-#[divan::bench(types = [Person, Zidane], args = [(640, 640), (960, 960), (1280, 1280), (1920, 1920)], ignore = !dma_available())]
+#[divan::bench(types = [Person, Zidane], args = [(640, 640), (960, 960), (512, 512),(1280, 1280), (1920, 1920)], ignore = !gl_available() || !dma_available())]
 fn resize_opengl_dma_letterbox<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
 where
     IMAGE: TestImage,
@@ -647,7 +647,7 @@ where
 }
 
 #[cfg(feature = "opengl")]
-#[divan::bench(types = [Person, Zidane], ignore = !dma_available())]
+#[divan::bench(types = [Person, Zidane], ignore = !gl_available() || !dma_available())]
 fn convert_opengl_rgba_to_planar<IMAGE>(bencher: divan::Bencher)
 where
     IMAGE: TestImage,
@@ -667,7 +667,7 @@ where
     let file = std::fs::read(path).unwrap();
 
     let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
-    let mut dst = TensorImage::new(640, 640, PLANAR_RGB, None).unwrap();
+    let mut dst = TensorImage::new(512, 512, PLANAR_RGB, None).unwrap();
 
     let mut converter = GLProcessorThreaded::new().unwrap();
 
@@ -678,7 +678,7 @@ where
     });
 }
 
-#[divan::bench(types = [Rotate0, Rotate90, Rotate180, Rotate270], args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+#[divan::bench(types = [Rotate0, Rotate90, Rotate180, Rotate270], args = [(640, 360), (960, 540), (512, 512),(1280, 720), (1920, 1080)])]
 fn rotate_cpu<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) {
     let (mut width, mut height) = params;
     let rot = R::value();
@@ -702,7 +702,7 @@ fn rotate_cpu<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) 
 
 #[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
-#[divan::bench(types = [Rotate90, Rotate180, Rotate270], args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+#[divan::bench(types = [Rotate90, Rotate180, Rotate270], args = [(640, 360), (960, 540), (512, 512), (1280, 720), (1920, 1080)], ignore = !gl_available() || !dma_available())]
 fn rotate_opengl<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) {
     let (mut width, mut height) = params;
     let rot = R::value();
@@ -727,7 +727,7 @@ fn rotate_opengl<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize
 }
 
 #[cfg(target_os = "linux")]
-#[divan::bench(types = [Rotate90, Rotate180, Rotate270], args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+#[divan::bench(types = [Rotate90, Rotate180, Rotate270], args = [(640, 360), (960, 540), (512, 512), (1280, 720), (1920, 1080)], ignore = !dma_available())]
 fn rotate_g2d<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) {
     let (mut width, mut height) = params;
     let rot = R::value();
@@ -750,7 +750,7 @@ fn rotate_g2d<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize)) 
     });
 }
 
-#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+#[divan::bench(args = [(640, 360), (960, 540), (512, 512), (1280, 720), (1920, 1080)])]
 fn convert_cpu_yuyv_to_rgba(bencher: divan::Bencher, params: (usize, usize)) {
     let file = include_bytes!("../../../testdata/camera720p.yuyv").to_vec();
     let src = TensorImage::new(1280, 720, YUYV, None).unwrap();
@@ -772,7 +772,7 @@ fn convert_cpu_yuyv_to_rgba(bencher: divan::Bencher, params: (usize, usize)) {
     });
 }
 
-#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+#[divan::bench(args = [(640, 360), (960, 540), (512, 512),(1280, 720), (1920, 1080)])]
 fn convert_cpu_yuyv_to_rgb(bencher: divan::Bencher, params: (usize, usize)) {
     let file = include_bytes!("../../../testdata/camera720p.yuyv").to_vec();
     let src = TensorImage::new(1280, 720, YUYV, None).unwrap();
@@ -794,7 +794,7 @@ fn convert_cpu_yuyv_to_rgb(bencher: divan::Bencher, params: (usize, usize)) {
     });
 }
 
-#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+#[divan::bench(args = [(640, 360), (960, 540), (512, 512),(1280, 720), (1920, 1080)])]
 fn convert_cpu_yuyv_to_yuyv(bencher: divan::Bencher, params: (usize, usize)) {
     let file = include_bytes!("../../../testdata/camera720p.yuyv").to_vec();
     let src = TensorImage::new(1280, 720, YUYV, None).unwrap();
@@ -816,7 +816,7 @@ fn convert_cpu_yuyv_to_yuyv(bencher: divan::Bencher, params: (usize, usize)) {
     });
 }
 
-#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+#[divan::bench(args = [(640, 360), (960, 540), (512, 512), (1280, 720), (1920, 1080)])]
 fn convert_cpu_rgba_to_yuyv(bencher: divan::Bencher, params: (usize, usize)) {
     let file = include_bytes!("../../../testdata/camera720p.rgba").to_vec();
     let src = TensorImage::new(1280, 720, RGBA, None).unwrap();
@@ -838,7 +838,7 @@ fn convert_cpu_rgba_to_yuyv(bencher: divan::Bencher, params: (usize, usize)) {
     });
 }
 
-#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+#[divan::bench(args = [(640, 360), (960, 540), (512, 512), (1280, 720), (1920, 1080)])]
 fn resize_cpu_rgba_to_planar_rgb(bencher: divan::Bencher, params: (usize, usize)) {
     let file = include_bytes!("../../../testdata/camera720p.rgba").to_vec();
     let src = TensorImage::new(1280, 720, RGBA, None).unwrap();
@@ -860,7 +860,7 @@ fn resize_cpu_rgba_to_planar_rgb(bencher: divan::Bencher, params: (usize, usize)
     });
 }
 
-#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+#[divan::bench(args = [(640, 360), (960, 540), (512, 512),(1280, 720), (1920, 1080)])]
 fn resize_cpu_rgba_to_nv16(bencher: divan::Bencher, params: (usize, usize)) {
     let file = include_bytes!("../../../testdata/camera720p.rgba").to_vec();
     let src = TensorImage::new(1280, 720, RGBA, None).unwrap();
@@ -882,7 +882,7 @@ fn resize_cpu_rgba_to_nv16(bencher: divan::Bencher, params: (usize, usize)) {
     });
 }
 
-#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+#[divan::bench(args = [(640, 360), (960, 540), (512, 512), (1280, 720), (1920, 1080)])]
 fn resize_cpu_rgba_to_rgb(bencher: divan::Bencher, params: (usize, usize)) {
     let file = include_bytes!("../../../testdata/camera720p.rgba").to_vec();
     let src = TensorImage::new(1280, 720, RGBA, None).unwrap();
@@ -904,7 +904,7 @@ fn resize_cpu_rgba_to_rgb(bencher: divan::Bencher, params: (usize, usize)) {
     });
 }
 
-#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+#[divan::bench(args = [(640, 360), (960, 540), (512, 512), (1280, 720), (1920, 1080)])]
 fn resize_cpu_rgba_to_rgba(bencher: divan::Bencher, params: (usize, usize)) {
     let file = include_bytes!("../../../testdata/camera720p.rgba").to_vec();
     let src = TensorImage::new(1280, 720, RGBA, None).unwrap();
@@ -927,7 +927,7 @@ fn resize_cpu_rgba_to_rgba(bencher: divan::Bencher, params: (usize, usize)) {
 }
 
 #[cfg(target_os = "linux")]
-#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+#[divan::bench(args = [(640, 360), (960, 540), (512, 512), (1280, 720), (1920, 1080)], ignore = !g2d_available() || !dma_available())]
 fn convert_g2d_yuyv_to_rgba(bencher: divan::Bencher, params: (usize, usize)) {
     let file = include_bytes!("../../../testdata/camera720p.yuyv").to_vec();
     let src = TensorImage::new(1280, 720, YUYV, None).unwrap();
@@ -950,7 +950,7 @@ fn convert_g2d_yuyv_to_rgba(bencher: divan::Bencher, params: (usize, usize)) {
 }
 
 #[cfg(target_os = "linux")]
-#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+#[divan::bench(args = [(640, 360), (960, 540), (512, 512), (1280, 720), (1920, 1080)], ignore = !g2d_available() || !dma_available())]
 fn convert_g2d_yuyv_to_rgb(bencher: divan::Bencher, params: (usize, usize)) {
     let file = include_bytes!("../../../testdata/camera720p.yuyv").to_vec();
     let src = TensorImage::new(1280, 720, YUYV, None).unwrap();
@@ -973,7 +973,7 @@ fn convert_g2d_yuyv_to_rgb(bencher: divan::Bencher, params: (usize, usize)) {
 }
 
 #[cfg(target_os = "linux")]
-#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+#[divan::bench(args = [(640, 360), (960, 540), (512, 512), (1280, 720), (1920, 1080)], ignore = !dma_available())]
 fn convert_g2d_yuyv_to_yuyv(bencher: divan::Bencher, params: (usize, usize)) {
     let file = include_bytes!("../../../testdata/camera720p.yuyv").to_vec();
     let src = TensorImage::new(1280, 720, YUYV, None).unwrap();
@@ -996,8 +996,54 @@ fn convert_g2d_yuyv_to_yuyv(bencher: divan::Bencher, params: (usize, usize)) {
 }
 
 #[cfg(target_os = "linux")]
+#[divan::bench(args = [(640, 360), (960, 540), (512, 512), (1280, 720), (1920, 1080)], ignore = !g2d_available() || !dma_available())]
+fn resize_g2d_rgba_to_rgb(bencher: divan::Bencher, params: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera720p.rgba").to_vec();
+    let src = TensorImage::new(1280, 720, RGBA, None).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = params;
+    let mut dst = TensorImage::new(width, height, RGB, None).unwrap();
+
+    let mut converter = G2DProcessor::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[divan::bench(args = [(640, 360), (960, 540), (512, 512), (1280, 720), (1920, 1080)], ignore = !g2d_available() || !dma_available())]
+fn resize_g2d_rgba_to_rgba(bencher: divan::Bencher, params: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera720p.rgba").to_vec();
+    let src = TensorImage::new(1280, 720, RGBA, None).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = params;
+    let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
+
+    let mut converter = G2DProcessor::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
-#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+#[divan::bench(args = [(640, 360), (960, 540), (512, 512), (1280, 720), (1920, 1080)], ignore = !gl_available() || !dma_available())]
 fn convert_opengl_yuyv_to_rgba(bencher: divan::Bencher, params: (usize, usize)) {
     let file = include_bytes!("../../../testdata/camera720p.yuyv").to_vec();
     let src = TensorImage::new(1280, 720, YUYV, Some(TensorMemory::Dma)).unwrap();
@@ -1029,7 +1075,31 @@ fn convert_opengl_yuyv_to_rgba(bencher: divan::Bencher, params: (usize, usize)) 
 // divan::Bencher, params: (usize, usize)) { ... }
 
 #[cfg(target_os = "linux")]
-#[divan::bench(types = [Person, Zidane], args = [(640, 640), (960, 960), (1280, 1280), (1920, 1920)], ignore = !dma_available())]
+#[cfg(feature = "opengl")]
+#[divan::bench(args = [(640, 360), (960, 540), (512, 512), (1280, 720), (1920, 1080)], ignore = !gl_available() || !dma_available())]
+fn resize_opengl_rgba_to_rgba(bencher: divan::Bencher, params: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera720p.rgba").to_vec();
+    let src = TensorImage::new(1280, 720, RGBA, None).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = params;
+    let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
+
+    let mut converter = GLProcessorThreaded::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[divan::bench(types = [Person, Zidane], args = [(640, 640), (960, 960), (512, 512), (1280, 1280), (1920, 1920)], ignore = !dma_available())]
 fn resize_g2d_letterbox<IMAGE>(bencher: divan::Bencher, size: (usize, usize))
 where
     IMAGE: TestImage,
@@ -1932,6 +2002,27 @@ fn dma_available() -> bool {
         dma_heap::Heap::new(dma_heap::HeapKind::Cma)
             .or_else(|_| dma_heap::Heap::new(dma_heap::HeapKind::System))
             .is_ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn g2d_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        edgefirst_image::G2DProcessor::new().is_ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    false
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+fn gl_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        edgefirst_image::GLProcessorThreaded::new().is_ok()
     }
     #[cfg(not(target_os = "linux"))]
     false
