@@ -154,8 +154,8 @@ jobs:
           python3 -m venv venv
           echo "${{ github.workspace }}/venv/bin" >> $GITHUB_PATH
           venv/bin/pip install --upgrade pip setuptools wheel
-          venv/bin/pip install maturin[patchelf] slipcover pytest pytest-timeout
-          venv/bin/pip install tensorflow pyyaml numpy
+          venv/bin/pip install maturin[patchelf] slipcover pytest pytest-timeout pytest-benchmark
+          venv/bin/pip install tensorflow pyyaml numpy pillow opencv-python-headless psutil
 
       - name: Set up Rust stable toolchain
         uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
@@ -306,8 +306,8 @@ jobs:
           python3 -m venv venv
           echo "${{ github.workspace }}/venv/bin" >> $GITHUB_PATH
           venv/bin/pip install --upgrade pip setuptools wheel
-          venv/bin/pip install maturin[patchelf,zig] slipcover pytest pytest-timeout
-          venv/bin/pip install tensorflow pyyaml numpy
+          venv/bin/pip install maturin[patchelf,zig] slipcover pytest pytest-timeout pytest-benchmark
+          venv/bin/pip install tensorflow pyyaml numpy pillow opencv-python-headless psutil
 
       - name: Set up Rust stable toolchain
         uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
@@ -480,7 +480,7 @@ jobs:
           python3 -m venv venv
           echo "${{ github.workspace }}/venv/bin" >> $GITHUB_PATH
           venv/bin/pip install --upgrade pip setuptools wheel
-          venv/bin/pip install slipcover pytest pytest-timeout tensorflow pyyaml numpy
+          venv/bin/pip install slipcover pytest pytest-timeout pytest-benchmark tensorflow pyyaml numpy pillow opencv-python-headless psutil
           # Install Python bindings from pre-built wheel (built with profiling profile on aarch64)
           venv/bin/pip install target/wheels/*.whl
 
