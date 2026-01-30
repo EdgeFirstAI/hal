@@ -226,7 +226,8 @@ impl TryFrom<&TensorImage> for G2DSurface {
         .try_into()?;
 
         // NV12 is a two-plane format: Y plane followed by interleaved UV plane
-        // planes[0] = Y plane start, planes[1] = UV plane start (Y size = width * height)
+        // planes[0] = Y plane start, planes[1] = UV plane start (Y size = width *
+        // height)
         let base_addr = phys.address();
         let planes = if img.fourcc() == NV12 {
             let uv_offset = (img.width() * img.height()) as u64;
