@@ -7,9 +7,15 @@
 //! - Primary: Camera (YUYV) → Model (RGBA/RGB) with letterbox
 //! - Secondary: Format conversion (no resize)
 //!
-//! ## Run benchmarks
+//! ## Run benchmarks (host)
 //! ```bash
 //! cargo bench -p edgefirst-image --bench pipeline_benchmark
+//! ```
+//!
+//! ## Run benchmarks (on-target, cross-compiled)
+//! ```bash
+//! # The --bench flag is required for Criterion to run actual measurements
+//! ./pipeline_benchmark --bench
 //! ```
 //!
 //! ## View HTML report
@@ -18,6 +24,7 @@
 use criterion::{
     black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
 };
+use std::sync::OnceLock;
 
 use edgefirst_image::{CPUProcessor, Crop, Flip, ImageProcessorTrait, Rect, Rotation, TensorImage};
 use edgefirst_image::{NV12, RGB, RGBA, YUYV};
@@ -34,6 +41,12 @@ use opencv::{
     imgproc,
     prelude::*,
 };
+
+// =============================================================================
+// Hardware Availability Cache
+// =============================================================================
+
+static G2D_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
 // =============================================================================
 // Test Data
@@ -80,7 +93,7 @@ fn dma_available() -> bool { false }
 
 #[cfg(target_os = "linux")]
 fn g2d_available() -> bool {
-    dma_available() && G2DProcessor::new().is_ok()
+    *G2D_AVAILABLE.get_or_init(|| dma_available() && G2DProcessor::new().is_ok())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -88,7 +101,9 @@ fn g2d_available() -> bool { false }
 
 #[cfg(all(target_os = "linux", feature = "opengl"))]
 fn opengl_available() -> bool {
-    GLProcessorThreaded::new().is_ok()
+    // Note: We check availability here in the parent process, but actual OpenGL
+    // resources are created inside bench closures to survive Criterion's fork.
+    dma_available() && GLProcessorThreaded::new().is_ok()
 }
 
 #[cfg(not(all(target_os = "linux", feature = "opengl")))]
@@ -166,17 +181,31 @@ fn bench_letterbox(c: &mut Criterion) {
     let mut group = c.benchmark_group("letterbox");
     group.sample_size(100);
 
+    // Check hardware availability once at start (not per-iteration)
+    #[cfg(target_os = "linux")]
+    let has_g2d = g2d_available();
+    #[cfg(not(target_os = "linux"))]
+    let has_g2d = false;
+
+    #[cfg(all(target_os = "linux", feature = "opengl"))]
+    let has_opengl = opengl_available();
+    #[cfg(not(all(target_os = "linux", feature = "opengl")))]
+    let has_opengl = false;
+
     // Configurations: most valuable for YOLO model preprocessing
     let configs = vec![
         // 1080p camera → YOLO standard (640x640)
         BenchConfig { in_w: 1920, in_h: 1080, out_w: 640, out_h: 640, in_fmt: YUYV, out_fmt: RGBA },
         BenchConfig { in_w: 1920, in_h: 1080, out_w: 640, out_h: 640, in_fmt: YUYV, out_fmt: RGB },
+        BenchConfig { in_w: 1920, in_h: 1080, out_w: 640, out_h: 640, in_fmt: NV12, out_fmt: RGBA },
         // 4K camera → YOLO standard (640x640)
         BenchConfig { in_w: 3840, in_h: 2160, out_w: 640, out_h: 640, in_fmt: YUYV, out_fmt: RGBA },
         BenchConfig { in_w: 3840, in_h: 2160, out_w: 640, out_h: 640, in_fmt: YUYV, out_fmt: RGB },
+        BenchConfig { in_w: 3840, in_h: 2160, out_w: 640, out_h: 640, in_fmt: NV12, out_fmt: RGBA },
         // 4K camera → YOLO hi-res (1280x1280)
         BenchConfig { in_w: 3840, in_h: 2160, out_w: 1280, out_h: 1280, in_fmt: YUYV, out_fmt: RGBA },
         BenchConfig { in_w: 3840, in_h: 2160, out_w: 1280, out_h: 1280, in_fmt: YUYV, out_fmt: RGB },
+        BenchConfig { in_w: 3840, in_h: 2160, out_w: 1280, out_h: 1280, in_fmt: NV12, out_fmt: RGBA },
     ];
 
     for config in &configs {
@@ -207,9 +236,9 @@ fn bench_letterbox(c: &mut Criterion) {
             );
         }
 
-        // HAL G2D (only for YUYV input)
+        // HAL G2D (for YUYV and NV12 input)
         #[cfg(target_os = "linux")]
-        if g2d_available() && config.in_fmt == YUYV {
+        if has_g2d && (config.in_fmt == YUYV || config.in_fmt == NV12) {
             let Ok(src) = TensorImage::new(config.in_w, config.in_h, config.in_fmt, Some(TensorMemory::Dma)) else {
                 eprintln!("G2D: DMA allocation failed for {}x{} - skipping", config.in_w, config.in_h);
                 continue;
@@ -238,32 +267,30 @@ fn bench_letterbox(c: &mut Criterion) {
             );
         }
 
-        // HAL OpenGL (only for RGBA output)
+        // HAL OpenGL (for YUYV/NV12 → RGBA output)
+        // Resources created inside closure to survive Criterion's subprocess fork
         #[cfg(all(target_os = "linux", feature = "opengl"))]
-        if opengl_available() && config.in_fmt == YUYV && config.out_fmt == RGBA {
-            let Ok(src) = TensorImage::new(config.in_w, config.in_h, config.in_fmt, Some(TensorMemory::Dma)) else {
-                eprintln!("OpenGL: DMA allocation failed for {}x{} - skipping", config.in_w, config.in_h);
-                continue;
-            };
-            let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
-            src.tensor().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
-            let Ok(mut dst) = TensorImage::new(config.out_w, config.out_h, config.out_fmt, Some(TensorMemory::Dma)) else {
-                continue;
-            };
-            let mut proc = GLProcessorThreaded::new().unwrap();
-
-            let (left, top, new_w, new_h) = calculate_letterbox(config.in_w, config.in_h, config.out_w, config.out_h);
-            let crop = Crop::new()
-                .with_dst_rect(Some(Rect::new(left, top, new_w, new_h)))
-                .with_dst_color(Some([114, 114, 114, 255]));
-
-            // Warmup for OpenGL shader compilation
-            let _ = proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop);
-
+        if has_opengl && (config.in_fmt == YUYV || config.in_fmt == NV12) && config.out_fmt == RGBA {
+            let config = config.clone();
             group.bench_with_input(
                 BenchmarkId::new("opengl", &config.id()),
                 &config,
-                |b, _| {
+                |b, config| {
+                    // Create resources in the child subprocess after fork
+                    let src = TensorImage::new(config.in_w, config.in_h, config.in_fmt, Some(TensorMemory::Dma)).unwrap();
+                    let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
+                    src.tensor().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
+                    let mut dst = TensorImage::new(config.out_w, config.out_h, config.out_fmt, Some(TensorMemory::Dma)).unwrap();
+                    let mut proc = GLProcessorThreaded::new().unwrap();
+
+                    let (left, top, new_w, new_h) = calculate_letterbox(config.in_w, config.in_h, config.out_w, config.out_h);
+                    let crop = Crop::new()
+                        .with_dst_rect(Some(Rect::new(left, top, new_w, new_h)))
+                        .with_dst_color(Some([114, 114, 114, 255]));
+
+                    // Warmup for OpenGL shader compilation (not measured)
+                    let _ = proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop);
+
                     b.iter(|| {
                         proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop).unwrap();
                         black_box(&dst);
@@ -352,6 +379,17 @@ fn bench_convert(c: &mut Criterion) {
     let mut group = c.benchmark_group("convert");
     group.sample_size(100);
 
+    // Check hardware availability once at start
+    #[cfg(target_os = "linux")]
+    let has_g2d = g2d_available();
+    #[cfg(not(target_os = "linux"))]
+    let has_g2d = false;
+
+    #[cfg(all(target_os = "linux", feature = "opengl"))]
+    let has_opengl = opengl_available();
+    #[cfg(not(all(target_os = "linux", feature = "opengl")))]
+    let has_opengl = false;
+
     // Configurations: format conversion at camera resolution
     let configs = vec![
         // 1080p conversions
@@ -391,9 +429,9 @@ fn bench_convert(c: &mut Criterion) {
             );
         }
 
-        // HAL G2D (only for YUYV input)
+        // HAL G2D (for YUYV and NV12 input)
         #[cfg(target_os = "linux")]
-        if g2d_available() && config.in_fmt == YUYV {
+        if has_g2d && (config.in_fmt == YUYV || config.in_fmt == NV12) {
             let Ok(src) = TensorImage::new(config.in_w, config.in_h, config.in_fmt, Some(TensorMemory::Dma)) else {
                 continue;
             };
@@ -416,26 +454,24 @@ fn bench_convert(c: &mut Criterion) {
             );
         }
 
-        // HAL OpenGL (only for YUYV→RGBA)
+        // HAL OpenGL (for YUYV→RGBA and NV12→RGBA)
+        // Resources created inside closure to survive Criterion's subprocess fork
         #[cfg(all(target_os = "linux", feature = "opengl"))]
-        if opengl_available() && config.in_fmt == YUYV && config.out_fmt == RGBA {
-            let Ok(src) = TensorImage::new(config.in_w, config.in_h, config.in_fmt, Some(TensorMemory::Dma)) else {
-                continue;
-            };
-            let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
-            src.tensor().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
-            let Ok(mut dst) = TensorImage::new(config.out_w, config.out_h, config.out_fmt, Some(TensorMemory::Dma)) else {
-                continue;
-            };
-            let mut proc = GLProcessorThreaded::new().unwrap();
-
-            // Warmup for OpenGL
-            let _ = proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop());
-
+        if has_opengl && (config.in_fmt == YUYV || config.in_fmt == NV12) && config.out_fmt == RGBA {
+            let config = config.clone();
             group.bench_with_input(
                 BenchmarkId::new("opengl", &config.id()),
                 &config,
-                |b, _| {
+                |b, config| {
+                    let src = TensorImage::new(config.in_w, config.in_h, config.in_fmt, Some(TensorMemory::Dma)).unwrap();
+                    let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
+                    src.tensor().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
+                    let mut dst = TensorImage::new(config.out_w, config.out_h, config.out_fmt, Some(TensorMemory::Dma)).unwrap();
+                    let mut proc = GLProcessorThreaded::new().unwrap();
+
+                    // Warmup (not measured)
+                    let _ = proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop());
+
                     b.iter(|| {
                         proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop()).unwrap();
                         black_box(&dst);
@@ -501,6 +537,17 @@ fn bench_resize(c: &mut Criterion) {
     let mut group = c.benchmark_group("resize");
     group.sample_size(100);
 
+    // Check hardware availability once at start
+    #[cfg(target_os = "linux")]
+    let has_g2d = g2d_available();
+    #[cfg(not(target_os = "linux"))]
+    let has_g2d = false;
+
+    #[cfg(all(target_os = "linux", feature = "opengl"))]
+    let has_opengl = opengl_available();
+    #[cfg(not(all(target_os = "linux", feature = "opengl")))]
+    let has_opengl = false;
+
     // Configurations: 16:9 → 16:9 downscale
     let configs = vec![
         // 4K → 1080p (common display scaling)
@@ -537,7 +584,7 @@ fn bench_resize(c: &mut Criterion) {
 
         // HAL G2D
         #[cfg(target_os = "linux")]
-        if g2d_available() && config.in_fmt == YUYV {
+        if has_g2d && config.in_fmt == YUYV {
             let Ok(src) = TensorImage::new(config.in_w, config.in_h, config.in_fmt, Some(TensorMemory::Dma)) else {
                 continue;
             };
@@ -561,23 +608,23 @@ fn bench_resize(c: &mut Criterion) {
         }
 
         // HAL OpenGL
+        // Resources created inside closure to survive Criterion's subprocess fork
         #[cfg(all(target_os = "linux", feature = "opengl"))]
-        if opengl_available() && config.in_fmt == YUYV && config.out_fmt == RGBA {
-            let Ok(src) = TensorImage::new(config.in_w, config.in_h, config.in_fmt, Some(TensorMemory::Dma)) else {
-                continue;
-            };
-            let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
-            src.tensor().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
-            let Ok(mut dst) = TensorImage::new(config.out_w, config.out_h, config.out_fmt, Some(TensorMemory::Dma)) else {
-                continue;
-            };
-            let mut proc = GLProcessorThreaded::new().unwrap();
-            let _ = proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop());
-
+        if has_opengl && config.in_fmt == YUYV && config.out_fmt == RGBA {
+            let config = config.clone();
             group.bench_with_input(
                 BenchmarkId::new("opengl", &config.id()),
                 &config,
-                |b, _| {
+                |b, config| {
+                    let src = TensorImage::new(config.in_w, config.in_h, config.in_fmt, Some(TensorMemory::Dma)).unwrap();
+                    let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
+                    src.tensor().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
+                    let mut dst = TensorImage::new(config.out_w, config.out_h, config.out_fmt, Some(TensorMemory::Dma)).unwrap();
+                    let mut proc = GLProcessorThreaded::new().unwrap();
+
+                    // Warmup (not measured)
+                    let _ = proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop());
+
                     b.iter(|| {
                         proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop()).unwrap();
                         black_box(&dst);
