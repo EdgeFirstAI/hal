@@ -1020,12 +1020,13 @@ fn convert_opengl_yuyv_to_rgba(bencher: divan::Bencher, params: (usize, usize)) 
     drop(dst);
 }
 
-// NOTE: OpenGL YUYV→YUYV is not supported - OpenGL cannot render to YUYV textures.
-// A future implementation could render to RGBA and encode YUYV in the shader.
-// #[cfg(target_os = "linux")]
+// NOTE: OpenGL YUYV→YUYV is not supported - OpenGL cannot render to YUYV
+// textures. A future implementation could render to RGBA and encode YUYV in the
+// shader. #[cfg(target_os = "linux")]
 // #[cfg(feature = "opengl")]
-// #[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
-// fn convert_opengl_yuyv_to_yuyv(bencher: divan::Bencher, params: (usize, usize)) { ... }
+// #[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)],
+// ignore = !dma_available())] fn convert_opengl_yuyv_to_yuyv(bencher:
+// divan::Bencher, params: (usize, usize)) { ... }
 
 #[cfg(target_os = "linux")]
 #[divan::bench(types = [Person, Zidane], args = [(640, 640), (960, 960), (1280, 1280), (1920, 1920)], ignore = !dma_available())]

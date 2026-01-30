@@ -591,7 +591,8 @@ impl TensorImage {
     /// # Ok(())
     /// # }
     pub fn channels(&self) -> usize {
-        // NV12 uses 2D shape [H*3/2, W], conceptually has 2 components (Y + interleaved UV)
+        // NV12 uses 2D shape [H*3/2, W], conceptually has 2 components (Y + interleaved
+        // UV)
         if self.fourcc == NV12 {
             return 2;
         }
@@ -708,16 +709,18 @@ impl<'a> TensorImageRef<'a> {
     /// Creates a `TensorImageRef` from a borrowed tensor reference.
     ///
     /// The tensor shape must match the expected format:
-    /// - For planar formats (e.g., PLANAR_RGB): shape is `[channels, height, width]`
-    /// - For interleaved formats (e.g., RGB, RGBA): shape is `[height, width, channels]`
+    /// - For planar formats (e.g., PLANAR_RGB): shape is `[channels, height,
+    ///   width]`
+    /// - For interleaved formats (e.g., RGB, RGBA): shape is `[height, width,
+    ///   channels]`
     ///
     /// # Arguments
     /// * `tensor` - A mutable reference to the tensor to wrap
     /// * `fourcc` - The pixel format of the image
     ///
     /// # Returns
-    /// A `Result` containing the `TensorImageRef` or an error if the tensor shape
-    /// doesn't match the expected format.
+    /// A `Result` containing the `TensorImageRef` or an error if the tensor
+    /// shape doesn't match the expected format.
     pub fn from_borrowed_tensor(tensor: &'a mut Tensor<u8>, fourcc: FourCharCode) -> Result<Self> {
         let shape = tensor.shape();
         if shape.len() != 3 {
@@ -948,11 +951,7 @@ impl Crop {
 
     // Checks if the crop rectangles are valid for the given source and
     // destination images (using TensorImageRef for destination).
-    pub fn check_crop_ref(
-        &self,
-        src: &TensorImage,
-        dst: &TensorImageRef<'_>,
-    ) -> Result<(), Error> {
+    pub fn check_crop_ref(&self, src: &TensorImage, dst: &TensorImageRef<'_>) -> Result<(), Error> {
         let src = self.src_rect.is_none_or(|x| x.check_rect(src));
         let dst = self.dst_rect.is_none_or(|x| x.check_rect_dst(dst));
         match (src, dst) {

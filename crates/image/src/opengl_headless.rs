@@ -1259,16 +1259,14 @@ impl GLProcessorST {
         };
         if self.gl_context.support_dma {
             match self.create_image_from_dma2(src) {
-                Ok(new_egl_image) => {
-                    self.draw_camera_texture_eglimage(
-                        src,
-                        &new_egl_image,
-                        src_roi,
-                        dst_roi,
-                        rotation_offset,
-                        flip,
-                    )?
-                }
+                Ok(new_egl_image) => self.draw_camera_texture_eglimage(
+                    src,
+                    &new_egl_image,
+                    src_roi,
+                    dst_roi,
+                    rotation_offset,
+                    flip,
+                )?,
                 Err(e) => {
                     log::warn!("EGL image creation failed for {:?}: {:?}", src.fourcc(), e);
                     let start = Instant::now();
@@ -2869,9 +2867,9 @@ void main() {
 #[cfg(feature = "opengl")]
 mod gl_tests {
     use super::*;
-    use crate::{RGBA, TensorImage};
     #[cfg(feature = "dma_test_formats")]
     use crate::{NV12, YUYV};
+    use crate::{RGBA, TensorImage};
     use edgefirst_tensor::TensorTrait;
     #[cfg(feature = "dma_test_formats")]
     use edgefirst_tensor::{TensorMapTrait, TensorMemory};
@@ -3149,7 +3147,8 @@ mod gl_tests {
 
     // =========================================================================
     // NV12 Reference Validation Tests
-    // These tests compare OpenGL NV12 conversions against ffmpeg-generated references
+    // These tests compare OpenGL NV12 conversions against ffmpeg-generated
+    // references
     // =========================================================================
 
     #[cfg(feature = "dma_test_formats")]

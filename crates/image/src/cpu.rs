@@ -1077,7 +1077,8 @@ impl CPUProcessor {
         Ok(())
     }
 
-    /// Generic RGBA to PLANAR_RGB conversion that works with any TensorImageDst.
+    /// Generic RGBA to PLANAR_RGB conversion that works with any
+    /// TensorImageDst.
     fn convert_rgba_to_planar_rgb_generic<D: TensorImageDst>(
         src: &TensorImage,
         dst: &mut D,
@@ -1110,7 +1111,9 @@ impl CPUProcessor {
     /// Generic copy for same-format images that works with any TensorImageDst.
     fn copy_image_generic<D: TensorImageDst>(src: &TensorImage, dst: &mut D) -> Result<()> {
         assert_eq!(src.fourcc(), dst.fourcc());
-        dst.tensor_mut().map()?.copy_from_slice(&src.tensor().map()?);
+        dst.tensor_mut()
+            .map()?
+            .copy_from_slice(&src.tensor().map()?);
         Ok(())
     }
 
