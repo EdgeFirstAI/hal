@@ -133,6 +133,20 @@ impl TensorImage {
         let channels = fourcc_channels(fourcc)?;
         let is_planar = fourcc_planar(fourcc)?;
 
+        // NV12 is semi-planar with Y plane (W×H) + UV plane (W×H/2)
+        // Total bytes = W × H × 1.5. Use shape [H*3/2, W] to encode this.
+        // Width = shape[1], Height = shape[0] * 2 / 3
+        if fourcc == NV12 {
+            let shape = vec![height * 3 / 2, width];
+            let tensor = Tensor::new(&shape, memory, None)?;
+
+            return Ok(Self {
+                tensor,
+                fourcc,
+                is_planar,
+            });
+        }
+
         if is_planar {
             let shape = vec![channels, height, width];
             let tensor = Tensor::new(&shape, memory, None)?;
@@ -535,6 +549,10 @@ impl TensorImage {
     /// # Ok(())
     /// # }
     pub fn width(&self) -> usize {
+        // NV12 uses shape [H*3/2, W]
+        if self.fourcc == NV12 {
+            return self.tensor.shape()[1];
+        }
         match self.is_planar {
             true => self.tensor.shape()[2],
             false => self.tensor.shape()[1],
@@ -552,6 +570,10 @@ impl TensorImage {
     /// # Ok(())
     /// # }
     pub fn height(&self) -> usize {
+        // NV12 uses shape [H*3/2, W], so height = shape[0] * 2 / 3
+        if self.fourcc == NV12 {
+            return self.tensor.shape()[0] * 2 / 3;
+        }
         match self.is_planar {
             true => self.tensor.shape()[1],
             false => self.tensor.shape()[0],
@@ -569,6 +591,10 @@ impl TensorImage {
     /// # Ok(())
     /// # }
     pub fn channels(&self) -> usize {
+        // NV12 uses 2D shape [H*3/2, W], conceptually has 2 components (Y + interleaved UV)
+        if self.fourcc == NV12 {
+            return 2;
+        }
         match self.is_planar {
             true => self.tensor.shape()[0],
             false => self.tensor.shape()[2],
@@ -590,6 +616,214 @@ impl TensorImage {
             true => self.width(),
             false => self.width() * self.channels(),
         }
+    }
+}
+
+/// Trait for types that can be used as destination images for conversion.
+///
+/// This trait abstracts over the difference between owned (`TensorImage`) and
+/// borrowed (`TensorImageRef`) image buffers, enabling the same conversion code
+/// to work with both.
+pub trait TensorImageDst {
+    /// Returns a reference to the underlying tensor.
+    fn tensor(&self) -> &Tensor<u8>;
+    /// Returns a mutable reference to the underlying tensor.
+    fn tensor_mut(&mut self) -> &mut Tensor<u8>;
+    /// Returns the FourCC code representing the image format.
+    fn fourcc(&self) -> FourCharCode;
+    /// Returns whether the image is in planar format.
+    fn is_planar(&self) -> bool;
+    /// Returns the width of the image in pixels.
+    fn width(&self) -> usize;
+    /// Returns the height of the image in pixels.
+    fn height(&self) -> usize;
+    /// Returns the number of channels in the image.
+    fn channels(&self) -> usize;
+    /// Returns the row stride in bytes.
+    fn row_stride(&self) -> usize;
+}
+
+impl TensorImageDst for TensorImage {
+    fn tensor(&self) -> &Tensor<u8> {
+        &self.tensor
+    }
+
+    fn tensor_mut(&mut self) -> &mut Tensor<u8> {
+        &mut self.tensor
+    }
+
+    fn fourcc(&self) -> FourCharCode {
+        self.fourcc
+    }
+
+    fn is_planar(&self) -> bool {
+        self.is_planar
+    }
+
+    fn width(&self) -> usize {
+        TensorImage::width(self)
+    }
+
+    fn height(&self) -> usize {
+        TensorImage::height(self)
+    }
+
+    fn channels(&self) -> usize {
+        TensorImage::channels(self)
+    }
+
+    fn row_stride(&self) -> usize {
+        TensorImage::row_stride(self)
+    }
+}
+
+/// A borrowed view of an image tensor for zero-copy preprocessing.
+///
+/// `TensorImageRef` wraps a borrowed `&mut Tensor<u8>` instead of owning it,
+/// enabling zero-copy operations where the HAL writes directly into an external
+/// tensor (e.g., a model's pre-allocated input buffer).
+///
+/// # Examples
+/// ```rust,ignore
+/// // Create a borrowed tensor image wrapping the model's input tensor
+/// let mut dst = TensorImageRef::from_borrowed_tensor(
+///     model.input_tensor(0),
+///     PLANAR_RGB,
+/// )?;
+///
+/// // Preprocess directly into the model's input buffer
+/// processor.convert(&src_image, &mut dst, Rotation::None, Flip::None, Crop::default())?;
+///
+/// // Run inference - no copy needed!
+/// model.run()?;
+/// ```
+#[derive(Debug)]
+pub struct TensorImageRef<'a> {
+    pub(crate) tensor: &'a mut Tensor<u8>,
+    fourcc: FourCharCode,
+    is_planar: bool,
+}
+
+impl<'a> TensorImageRef<'a> {
+    /// Creates a `TensorImageRef` from a borrowed tensor reference.
+    ///
+    /// The tensor shape must match the expected format:
+    /// - For planar formats (e.g., PLANAR_RGB): shape is `[channels, height, width]`
+    /// - For interleaved formats (e.g., RGB, RGBA): shape is `[height, width, channels]`
+    ///
+    /// # Arguments
+    /// * `tensor` - A mutable reference to the tensor to wrap
+    /// * `fourcc` - The pixel format of the image
+    ///
+    /// # Returns
+    /// A `Result` containing the `TensorImageRef` or an error if the tensor shape
+    /// doesn't match the expected format.
+    pub fn from_borrowed_tensor(tensor: &'a mut Tensor<u8>, fourcc: FourCharCode) -> Result<Self> {
+        let shape = tensor.shape();
+        if shape.len() != 3 {
+            return Err(Error::InvalidShape(format!(
+                "Tensor shape must have 3 dimensions, got {}: {:?}",
+                shape.len(),
+                shape
+            )));
+        }
+        let is_planar = fourcc_planar(fourcc)?;
+        let channels = if is_planar { shape[0] } else { shape[2] };
+
+        if fourcc_channels(fourcc)? != channels {
+            return Err(Error::InvalidShape(format!(
+                "Invalid tensor shape {:?} for format {}",
+                shape,
+                fourcc.to_string()
+            )));
+        }
+
+        Ok(Self {
+            tensor,
+            fourcc,
+            is_planar,
+        })
+    }
+
+    /// Returns a reference to the underlying tensor.
+    pub fn tensor(&self) -> &Tensor<u8> {
+        self.tensor
+    }
+
+    /// Returns the FourCC code representing the image format.
+    pub fn fourcc(&self) -> FourCharCode {
+        self.fourcc
+    }
+
+    /// Returns whether the image is in planar format.
+    pub fn is_planar(&self) -> bool {
+        self.is_planar
+    }
+
+    /// Returns the width of the image in pixels.
+    pub fn width(&self) -> usize {
+        match self.is_planar {
+            true => self.tensor.shape()[2],
+            false => self.tensor.shape()[1],
+        }
+    }
+
+    /// Returns the height of the image in pixels.
+    pub fn height(&self) -> usize {
+        match self.is_planar {
+            true => self.tensor.shape()[1],
+            false => self.tensor.shape()[0],
+        }
+    }
+
+    /// Returns the number of channels in the image.
+    pub fn channels(&self) -> usize {
+        match self.is_planar {
+            true => self.tensor.shape()[0],
+            false => self.tensor.shape()[2],
+        }
+    }
+
+    /// Returns the row stride in bytes.
+    pub fn row_stride(&self) -> usize {
+        match self.is_planar {
+            true => self.width(),
+            false => self.width() * self.channels(),
+        }
+    }
+}
+
+impl TensorImageDst for TensorImageRef<'_> {
+    fn tensor(&self) -> &Tensor<u8> {
+        self.tensor
+    }
+
+    fn tensor_mut(&mut self) -> &mut Tensor<u8> {
+        self.tensor
+    }
+
+    fn fourcc(&self) -> FourCharCode {
+        self.fourcc
+    }
+
+    fn is_planar(&self) -> bool {
+        self.is_planar
+    }
+
+    fn width(&self) -> usize {
+        TensorImageRef::width(self)
+    }
+
+    fn height(&self) -> usize {
+        TensorImageRef::height(self)
+    }
+
+    fn channels(&self) -> usize {
+        TensorImageRef::channels(self)
+    }
+
+    fn row_stride(&self) -> usize {
+        TensorImageRef::row_stride(self)
     }
 }
 
@@ -711,6 +945,32 @@ impl Crop {
             ))),
         }
     }
+
+    // Checks if the crop rectangles are valid for the given source and
+    // destination images (using TensorImageRef for destination).
+    pub fn check_crop_ref(
+        &self,
+        src: &TensorImage,
+        dst: &TensorImageRef<'_>,
+    ) -> Result<(), Error> {
+        let src = self.src_rect.is_none_or(|x| x.check_rect(src));
+        let dst = self.dst_rect.is_none_or(|x| x.check_rect_dst(dst));
+        match (src, dst) {
+            (true, true) => Ok(()),
+            (true, false) => Err(Error::CropInvalid(format!(
+                "Dest crop invalid: {:?}",
+                self.dst_rect
+            ))),
+            (false, true) => Err(Error::CropInvalid(format!(
+                "Src crop invalid: {:?}",
+                self.src_rect
+            ))),
+            (false, false) => Err(Error::CropInvalid(format!(
+                "Dest and Src crop invalid: {:?} {:?}",
+                self.dst_rect, self.src_rect
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -736,6 +996,11 @@ impl Rect {
     pub fn check_rect(&self, image: &TensorImage) -> bool {
         self.left + self.width <= image.width() && self.top + self.height <= image.height()
     }
+
+    // Checks if the rectangle is valid for the given destination image.
+    pub fn check_rect_dst<D: TensorImageDst>(&self, image: &D) -> bool {
+        self.left + self.width <= image.width() && self.top + self.height <= image.height()
+    }
 }
 
 #[enum_dispatch(ImageProcessor)]
@@ -759,6 +1024,34 @@ pub trait ImageProcessorTrait {
         &mut self,
         src: &TensorImage,
         dst: &mut TensorImage,
+        rotation: Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> Result<()>;
+
+    /// Converts the source image to a borrowed destination tensor for zero-copy
+    /// preprocessing.
+    ///
+    /// This variant accepts a `TensorImageRef` as the destination, enabling
+    /// direct writes into external buffers (e.g., model input tensors) without
+    /// intermediate copies.
+    ///
+    /// # Arguments
+    ///
+    /// * `src` - The source image to convert from.
+    /// * `dst` - A borrowed tensor image wrapping the destination buffer.
+    /// * `rotation` - The rotation to apply to the destination image.
+    /// * `flip` - Flips the image
+    /// * `crop` - An optional rectangle specifying the area to crop from the
+    ///   source image
+    ///
+    /// # Returns
+    ///
+    /// A `Result` indicating success or failure of the conversion.
+    fn convert_ref(
+        &mut self,
+        src: &TensorImage,
+        dst: &mut TensorImageRef<'_>,
         rotation: Rotation,
         flip: Flip,
         crop: Crop,
@@ -960,6 +1253,36 @@ impl ImageProcessorTrait for ImageProcessor {
                 }
             }
         }
+        Err(Error::NoConverter)
+    }
+
+    fn convert_ref(
+        &mut self,
+        src: &TensorImage,
+        dst: &mut TensorImageRef<'_>,
+        rotation: Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> Result<()> {
+        let start = Instant::now();
+
+        // For TensorImageRef, we prefer CPU since hardware accelerators typically
+        // don't support PLANAR_RGB output which is the common model input format.
+        // The CPU path uses the generic conversion functions that work with any
+        // TensorImageDst implementation.
+        if let Some(cpu) = self.cpu.as_mut() {
+            match cpu.convert_ref(src, dst, rotation, flip, crop) {
+                Ok(_) => {
+                    log::trace!("image converted with cpu (ref) in {:?}", start.elapsed());
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::trace!("image didn't convert with cpu (ref): {e:?}");
+                    return Err(e);
+                }
+            }
+        }
+
         Err(Error::NoConverter)
     }
 
