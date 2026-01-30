@@ -450,9 +450,8 @@ def test_shm_zero_copy_perf():
 def test_dma_no_fd_leaks():
     """Test that DMA tensors don't leak file descriptors"""
     psutil = pytest.importorskip("psutil")
-
     proc = psutil.Process(os.getpid())
-
+    gc.collect()
     try:
         start_fds = proc.num_fds()
     except AttributeError:
@@ -479,7 +478,7 @@ def test_shm_no_fd_leaks():
     """Test that SHM tensors don't leak file descriptors"""
     psutil = pytest.importorskip("psutil")
     proc = psutil.Process(os.getpid())
-
+    gc.collect()
     try:
         start_fds = proc.num_fds()
     except AttributeError:
@@ -506,7 +505,7 @@ def test_dma_fd_leak_with_from_fd():
     """Test that creating tensors from FDs doesn't leak descriptors"""
     psutil = pytest.importorskip("psutil")
     proc = psutil.Process(os.getpid())
-
+    gc.collect()
     try:
         start_fds = proc.num_fds()
     except AttributeError:
@@ -532,6 +531,7 @@ def test_shm_fd_leak_with_from_fd():
     """Test that creating tensors from SHM FDs doesn't leak descriptors"""
     psutil = pytest.importorskip("psutil")
     proc = psutil.Process(os.getpid())
+    gc.collect()
     try:
         start_fds = proc.num_fds()
     except AttributeError:
