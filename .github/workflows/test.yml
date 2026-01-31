@@ -87,13 +87,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
-          lfs: false  # LFS files downloaded separately
-
-      - name: Download LFS testdata
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
-        with:
-          name: testdata-lfs
-          path: testdata/
+          lfs: true  # Doc tests use include_str!/include_bytes! which need LFS at compile time
 
       - name: Install OpenCV build dependencies
         run: |
