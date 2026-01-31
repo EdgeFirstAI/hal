@@ -3202,7 +3202,7 @@ mod gl_tests {
             .map()
             .unwrap()
             .as_mut_slice()
-            .copy_from_slice(&dst.tensor().map().unwrap().as_slice());
+            .copy_from_slice(dst.tensor().map().unwrap().as_slice());
 
         compare_images(&reference, &cpu_dst, 0.98, "opengl_nv12_to_rgba_reference");
     }
@@ -3244,7 +3244,7 @@ mod gl_tests {
             .map()
             .unwrap()
             .as_mut_slice()
-            .copy_from_slice(&dst.tensor().map().unwrap().as_slice());
+            .copy_from_slice(dst.tensor().map().unwrap().as_slice());
 
         compare_images(&reference, &cpu_dst, 0.98, "opengl_yuyv_to_rgba_reference");
     }

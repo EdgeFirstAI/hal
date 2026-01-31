@@ -660,7 +660,7 @@ mod g2d_tests {
             .tensor()
             .map()?
             .as_mut_slice()
-            .copy_from_slice(&dst.tensor().map()?.as_slice());
+            .copy_from_slice(dst.tensor().map()?.as_slice());
 
         compare_images(&reference, &cpu_dst, 0.98, "g2d_nv12_to_rgba_reference")
     }
@@ -698,7 +698,7 @@ mod g2d_tests {
             .tensor()
             .map()?
             .as_mut_slice()
-            .copy_from_slice(&dst.tensor().map()?.as_slice());
+            .copy_from_slice(dst.tensor().map()?.as_slice());
 
         compare_images(&reference, &cpu_dst, 0.98, "g2d_nv12_to_rgb_reference")
     }
@@ -736,7 +736,7 @@ mod g2d_tests {
             .tensor()
             .map()?
             .as_mut_slice()
-            .copy_from_slice(&dst.tensor().map()?.as_slice());
+            .copy_from_slice(dst.tensor().map()?.as_slice());
 
         compare_images(&reference, &cpu_dst, 0.98, "g2d_yuyv_to_rgba_reference")
     }
@@ -774,7 +774,7 @@ mod g2d_tests {
             .tensor()
             .map()?
             .as_mut_slice()
-            .copy_from_slice(&dst.tensor().map()?.as_slice());
+            .copy_from_slice(dst.tensor().map()?.as_slice());
 
         compare_images(&reference, &cpu_dst, 0.98, "g2d_yuyv_to_rgb_reference")
     }

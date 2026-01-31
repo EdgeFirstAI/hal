@@ -315,7 +315,7 @@ fn bench_letterbox(c: &mut Criterion) {
                 .with_dst_rect(Some(Rect::new(left, top, new_w, new_h)))
                 .with_dst_color(Some([114, 114, 114, 255]));
 
-            group.bench_with_input(BenchmarkId::new("cpu", &config.id()), &config, |b, _| {
+            group.bench_with_input(BenchmarkId::new("cpu", config.id()), &config, |b, _| {
                 b.iter(|| {
                     proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop)
                         .unwrap();
@@ -357,7 +357,7 @@ fn bench_letterbox(c: &mut Criterion) {
                 .with_dst_rect(Some(Rect::new(left, top, new_w, new_h)))
                 .with_dst_color(Some([114, 114, 114, 255]));
 
-            group.bench_with_input(BenchmarkId::new("g2d", &config.id()), &config, |b, _| {
+            group.bench_with_input(BenchmarkId::new("g2d", config.id()), &config, |b, _| {
                 b.iter(|| {
                     proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop)
                         .unwrap();
@@ -373,7 +373,7 @@ fn bench_letterbox(c: &mut Criterion) {
         {
             let config = config.clone();
             group.bench_with_input(
-                BenchmarkId::new("opengl", &config.id()),
+                BenchmarkId::new("opengl", config.id()),
                 &config,
                 |b, config| {
                     // Create resources in the child subprocess after fork
@@ -430,7 +430,7 @@ fn bench_letterbox(c: &mut Criterion) {
                     config.in_w as i32,
                     cv_type,
                     data.as_ptr() as *mut std::ffi::c_void,
-                    (config.in_w * channels) as usize,
+                    config.in_w * channels,
                 )
                 .unwrap()
             };
@@ -448,7 +448,7 @@ fn bench_letterbox(c: &mut Criterion) {
                     config.out_w as i32,
                     out_cv_type,
                     dst_data.as_mut_ptr() as *mut std::ffi::c_void,
-                    (config.out_w * out_channels) as usize,
+                    config.out_w * out_channels,
                 )
                 .unwrap()
             };
@@ -470,7 +470,7 @@ fn bench_letterbox(c: &mut Criterion) {
 
             // Single-threaded OpenCV benchmark
             group.bench_with_input(
-                BenchmarkId::new("opencv-1cpu", &config.id()),
+                BenchmarkId::new("opencv-1cpu", config.id()),
                 &config,
                 |b, _| {
                     set_num_threads(1).unwrap();
@@ -515,7 +515,7 @@ fn bench_letterbox(c: &mut Criterion) {
 
             // Multi-threaded OpenCV benchmark (auto thread count)
             group.bench_with_input(
-                BenchmarkId::new("opencv-multi", &config.id()),
+                BenchmarkId::new("opencv-multi", config.id()),
                 &config,
                 |b, _| {
                     set_num_threads(0).unwrap(); // 0 = auto (use all available cores)
@@ -681,7 +681,7 @@ fn bench_convert(c: &mut Criterion) {
                 TensorImage::new(config.out_w, config.out_h, config.out_fmt, None).unwrap();
             let mut proc = CPUProcessor::new();
 
-            group.bench_with_input(BenchmarkId::new("cpu", &config.id()), &config, |b, _| {
+            group.bench_with_input(BenchmarkId::new("cpu", config.id()), &config, |b, _| {
                 b.iter(|| {
                     proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
                         .unwrap();
@@ -713,7 +713,7 @@ fn bench_convert(c: &mut Criterion) {
             };
             let mut proc = G2DProcessor::new().unwrap();
 
-            group.bench_with_input(BenchmarkId::new("g2d", &config.id()), &config, |b, _| {
+            group.bench_with_input(BenchmarkId::new("g2d", config.id()), &config, |b, _| {
                 b.iter(|| {
                     proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
                         .unwrap();
@@ -729,7 +729,7 @@ fn bench_convert(c: &mut Criterion) {
         {
             let config = config.clone();
             group.bench_with_input(
-                BenchmarkId::new("opengl", &config.id()),
+                BenchmarkId::new("opengl", config.id()),
                 &config,
                 |b, config| {
                     let src = TensorImage::new(
@@ -779,7 +779,7 @@ fn bench_convert(c: &mut Criterion) {
                     config.in_w as i32,
                     cv_type,
                     data.as_ptr() as *mut std::ffi::c_void,
-                    (config.in_w * channels) as usize,
+                    config.in_w * channels,
                 )
                 .unwrap()
             };
@@ -797,7 +797,7 @@ fn bench_convert(c: &mut Criterion) {
                     config.out_w as i32,
                     out_cv_type,
                     dst_data.as_mut_ptr() as *mut std::ffi::c_void,
-                    (config.out_w * out_channels) as usize,
+                    config.out_w * out_channels,
                 )
                 .unwrap()
             };
@@ -811,7 +811,7 @@ fn bench_convert(c: &mut Criterion) {
 
             // Single-threaded OpenCV benchmark
             group.bench_with_input(
-                BenchmarkId::new("opencv-1cpu", &config.id()),
+                BenchmarkId::new("opencv-1cpu", config.id()),
                 &config,
                 |b, _| {
                     set_num_threads(1).unwrap();
@@ -824,7 +824,7 @@ fn bench_convert(c: &mut Criterion) {
 
             // Multi-threaded OpenCV benchmark
             group.bench_with_input(
-                BenchmarkId::new("opencv-multi", &config.id()),
+                BenchmarkId::new("opencv-multi", config.id()),
                 &config,
                 |b, _| {
                     set_num_threads(0).unwrap();
@@ -911,7 +911,7 @@ fn bench_resize(c: &mut Criterion) {
                 TensorImage::new(config.out_w, config.out_h, config.out_fmt, None).unwrap();
             let mut proc = CPUProcessor::new();
 
-            group.bench_with_input(BenchmarkId::new("cpu", &config.id()), &config, |b, _| {
+            group.bench_with_input(BenchmarkId::new("cpu", config.id()), &config, |b, _| {
                 b.iter(|| {
                     proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
                         .unwrap();
@@ -943,7 +943,7 @@ fn bench_resize(c: &mut Criterion) {
             };
             let mut proc = G2DProcessor::new().unwrap();
 
-            group.bench_with_input(BenchmarkId::new("g2d", &config.id()), &config, |b, _| {
+            group.bench_with_input(BenchmarkId::new("g2d", config.id()), &config, |b, _| {
                 b.iter(|| {
                     proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
                         .unwrap();
@@ -958,7 +958,7 @@ fn bench_resize(c: &mut Criterion) {
         if has_opengl && config.in_fmt == YUYV && config.out_fmt == RGBA {
             let config = config.clone();
             group.bench_with_input(
-                BenchmarkId::new("opengl", &config.id()),
+                BenchmarkId::new("opengl", config.id()),
                 &config,
                 |b, config| {
                     let src = TensorImage::new(
@@ -1002,7 +1002,7 @@ fn bench_resize(c: &mut Criterion) {
                     config.in_w as i32,
                     CV_8UC2,
                     data.as_ptr() as *mut std::ffi::c_void,
-                    (config.in_w * 2) as usize,
+                    config.in_w * 2,
                 )
                 .unwrap()
             };
@@ -1020,7 +1020,7 @@ fn bench_resize(c: &mut Criterion) {
                     config.out_w as i32,
                     out_cv_type,
                     dst_data.as_mut_ptr() as *mut std::ffi::c_void,
-                    (config.out_w * out_channels) as usize,
+                    config.out_w * out_channels,
                 )
                 .unwrap()
             };
@@ -1036,7 +1036,7 @@ fn bench_resize(c: &mut Criterion) {
 
             // Single-threaded OpenCV benchmark
             group.bench_with_input(
-                BenchmarkId::new("opencv-1cpu", &config.id()),
+                BenchmarkId::new("opencv-1cpu", config.id()),
                 &config,
                 |b, _| {
                     set_num_threads(1).unwrap();
@@ -1059,7 +1059,7 @@ fn bench_resize(c: &mut Criterion) {
 
             // Multi-threaded OpenCV benchmark
             group.bench_with_input(
-                BenchmarkId::new("opencv-multi", &config.id()),
+                BenchmarkId::new("opencv-multi", config.id()),
                 &config,
                 |b, _| {
                     set_num_threads(0).unwrap();
