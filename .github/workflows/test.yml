@@ -178,7 +178,8 @@ jobs:
         run: cargo +nightly fmt --all -- --check 2>/dev/null || cargo fmt --all -- --check
 
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        # Use default,opencv features; exclude g2d_test_formats,dma_test_formats (on-target only)
+        run: cargo clippy --workspace --all-targets --features default,opencv -- -D warnings
 
       - name: Set up coverage instrumentation
         run: .github/scripts/setup-coverage-env.sh
@@ -197,7 +198,8 @@ jobs:
         run: |
           set -o pipefail
           # Run tests but don't generate report yet - we'll combine with Python test coverage
-          cargo llvm-cov nextest --cargo-profile profiling --all-features --workspace \
+          # Use default,opencv features; exclude g2d_test_formats,dma_test_formats (on-target only)
+          cargo llvm-cov nextest --cargo-profile profiling --features default,opencv --workspace \
             --no-report \
             2>&1 | tee target/test-metrics-rust-x86_64.txt
 
@@ -330,7 +332,8 @@ jobs:
         run: cargo +nightly fmt --all -- --check 2>/dev/null || cargo fmt --all -- --check
 
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        # Use default,opencv features; exclude g2d_test_formats,dma_test_formats (on-target only)
+        run: cargo clippy --workspace --all-targets --features default,opencv -- -D warnings
 
       - name: Set up coverage instrumentation
         run: .github/scripts/setup-coverage-env.sh
@@ -350,7 +353,8 @@ jobs:
         run: |
           set -o pipefail
           # Run tests but don't generate report yet - we'll combine with Python test coverage
-          cargo llvm-cov nextest --cargo-profile profiling --all-features --workspace \
+          # Use default,opencv features; exclude g2d_test_formats,dma_test_formats (on-target only)
+          cargo llvm-cov nextest --cargo-profile profiling --features default,opencv --workspace \
             --no-report \
             2>&1 | tee target/test-metrics-rust-aarch64.txt
 
