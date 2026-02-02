@@ -11,5 +11,6 @@ testdata/*.nv21 filter=lfs diff=lfs merge=lfs -text
 testdata/*.y800 filter=lfs diff=lfs merge=lfs -text
 testdata/*.8bpa filter=lfs diff=lfs merge=lfs -text
 testdata/*.8bps filter=lfs diff=lfs merge=lfs -text
+testdata/*.yaml filter=lfs diff=lfs merge=lfs -text
 testdata/camera1080p.* filter=lfs diff=lfs merge=lfs -text
 testdata/camera4k.* filter=lfs diff=lfs merge=lfs -text
