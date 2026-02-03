@@ -153,6 +153,7 @@ impl ByteTrack {
 
     /// Process assignments from linear assignment and update tracking state.
     /// Returns true if any matches were made.
+    #[allow(clippy::too_many_arguments)]
     fn process_assignments<T: DetectionBox>(
         &mut self,
         assignments: &[usize],
