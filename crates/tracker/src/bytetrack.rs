@@ -317,7 +317,13 @@ where
         self.remove_expired_tracklets(timestamp);
 
         // Create new tracklets from unmatched high-confidence boxes
-        self.create_new_tracklets(boxes, &high_conf_ind, &matched, &mut matched_info, timestamp);
+        self.create_new_tracklets(
+            boxes,
+            &high_conf_ind,
+            &matched,
+            &mut matched_info,
+            timestamp,
+        );
 
         matched_info
     }
