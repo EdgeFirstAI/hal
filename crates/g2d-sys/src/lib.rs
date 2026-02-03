@@ -194,51 +194,12 @@ fn guess_version(g2d: &g2d) -> Option<Version> {
             // s = "$VERSION$6.4.3:398061:d3dac3f35d$\n"
             let mut version = G2D_2_3_0;
             if let Some(s) = s.strip_prefix("$VERSION$") {
-                let s: Vec<_> = s.split(":").collect();
-                let v: Vec<_> = s[0].split(".").collect();
-                if let Some(s) = v.first()
-                    && let Ok(major) = s.parse()
-                {
-                    version.major = major;
-                }
-                if let Some(s) = v.get(1)
-                    && let Ok(minor) = s.parse()
-                {
-                    version.minor = minor;
-                }
-                if let Some(s) = v.get(2)
-                    && let Ok(patch) = s.parse()
-                {
-                    version.patch = patch;
-                }
-                if let Some(s) = s.get(1)
-                    && let Ok(num) = s.parse()
-                {
-                    version.num = num;
-                }
-            } else if let Some(s) = s.strip_prefix("$VERSION$") {
-                let s: Vec<_> = s.split(":").collect();
-                let v: Vec<_> = s[0].split(".").collect();
-                if let Some(s) = v.first()
-                    && let Ok(major) = s.parse()
-                {
-                    version.major = major;
-                }
-                if let Some(s) = v.get(1)
-                    && let Ok(minor) = s.parse()
-                {
-                    version.minor = minor;
-                }
-                if let Some(s) = v.get(2)
-                    && let Ok(patch) = s.parse()
-                {
-                    version.patch = patch;
-                }
-                if let Some(s) = s.get(1)
-                    && let Ok(num) = s.parse()
-                {
-                    version.num = num;
-                }
+                let parts: Vec<_> = s.split(':').collect();
+                let v: Vec<_> = parts[0].split('.').collect();
+                version.major = v.first().and_then(|s| s.parse().ok()).unwrap_or(version.major);
+                version.minor = v.get(1).and_then(|s| s.parse().ok()).unwrap_or(version.minor);
+                version.patch = v.get(2).and_then(|s| s.parse().ok()).unwrap_or(version.patch);
+                version.num = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(version.num);
             }
 
             Some(version)
