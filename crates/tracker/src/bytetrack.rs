@@ -150,104 +150,61 @@ impl ByteTrack {
             }
         })
     }
-}
 
-impl<T> Tracker<T> for ByteTrack
-where
-    T: DetectionBox,
-{
-    fn update(&mut self, boxes: &[T], timestamp: u64) -> Vec<Option<TrackInfo>> {
-        self.frame_count += 1;
-        let high_conf_ind = boxes
-            .iter()
-            .enumerate()
-            .filter_map(|(x, b)| {
-                if b.score() >= self.track_high_conf {
-                    Some(x)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<usize>>();
-        let mut matched = vec![false; boxes.len()];
-        let mut tracked = vec![false; self.tracklets.len()];
-        let mut matched_info = vec![None; boxes.len()];
-        if !self.tracklets.is_empty() {
-            for track in &mut self.tracklets {
-                track.filter.predict();
+    /// Process assignments from linear assignment and update tracking state.
+    /// Returns true if any matches were made.
+    fn process_assignments<T: DetectionBox>(
+        &mut self,
+        assignments: &[usize],
+        boxes: &[T],
+        costs: &Matrix<f32>,
+        matched: &mut [bool],
+        tracked: &mut [bool],
+        matched_info: &mut [Option<TrackInfo>],
+        timestamp: u64,
+        skip_already_matched: bool,
+    ) {
+        for (i, &x) in assignments.iter().enumerate() {
+            if i >= boxes.len() || x >= self.tracklets.len() {
+                continue;
             }
-            let costs = self.compute_costs(
-                boxes,
-                self.track_high_conf,
-                self.track_iou,
-                &matched,
-                &tracked,
-            );
-            // With m boxes and n tracks, we compute a m x n array of costs for
-            // association cost is based on distance computed by the Kalman Filter
-            // Then we use lapjv (linear assignment) to minimize the cost of
-            // matching tracks to boxes
-            // The linear assignment will still assign some tracks to out of threshold
-            // scores/filtered tracks/filtered boxes But it will try to minimize
-            // the number of "invalid" assignments, since those are just very high costs
-            let ans = lapjv(&costs).unwrap();
-            for i in 0..ans.0.len() {
-                let x = ans.0[i];
-                if i < boxes.len() && x < self.tracklets.len() {
-                    // We need to filter out those "invalid" assignments
-                    if costs[(i, ans.0[i])] >= INVALID_MATCH {
-                        continue;
-                    }
-                    matched[i] = true;
-                    matched_info[i] = Some(TrackInfo {
-                        uuid: self.tracklets[x].id,
-                        count: self.tracklets[x].count,
-                        created: self.tracklets[x].created,
-                        tracked_location: self.tracklets[x].get_predicted_location(),
-                        last_updated: timestamp,
-                    });
-                    assert!(!tracked[x]);
-                    tracked[x] = true;
-                    self.tracklets[x].update(&boxes[i], timestamp);
-                }
+
+            // Filter out invalid assignments
+            if costs[(i, x)] >= INVALID_MATCH {
+                continue;
             }
+
+            // For second pass, skip already matched boxes/tracklets
+            if skip_already_matched && (matched[i] || tracked[x]) {
+                continue;
+            }
+
+            if skip_already_matched {
+                trace!(
+                    "Cost: {} Box: {:#?} UUID: {} Mean: {}",
+                    costs[(i, x)],
+                    boxes[i],
+                    self.tracklets[x].id,
+                    self.tracklets[x].filter.mean
+                );
+            }
+
+            matched[i] = true;
+            matched_info[i] = Some(TrackInfo {
+                uuid: self.tracklets[x].id,
+                count: self.tracklets[x].count,
+                created: self.tracklets[x].created,
+                tracked_location: self.tracklets[x].get_predicted_location(),
+                last_updated: timestamp,
+            });
+            assert!(!tracked[x]);
+            tracked[x] = true;
+            self.tracklets[x].update(&boxes[i], timestamp);
         }
+    }
 
-        // try to match unmatched tracklets to low score detections as well
-        if !self.tracklets.is_empty() {
-            let costs = self.compute_costs(boxes, 0.0, self.track_iou, &matched, &tracked);
-            let ans = lapjv(&costs).unwrap();
-            for i in 0..ans.0.len() {
-                let x = ans.0[i];
-                if i < boxes.len() && x < self.tracklets.len() {
-                    // matched tracks
-                    // We need to filter out those "invalid" assignments
-                    if matched[i] || tracked[x] || (costs[(i, x)] >= INVALID_MATCH) {
-                        continue;
-                    }
-                    matched[i] = true;
-                    matched_info[i] = Some(TrackInfo {
-                        uuid: self.tracklets[x].id,
-                        count: self.tracklets[x].count,
-                        created: self.tracklets[x].created,
-                        tracked_location: self.tracklets[x].get_predicted_location(),
-                        last_updated: timestamp,
-                    });
-                    trace!(
-                        "Cost: {} Box: {:#?} UUID: {} Mean: {}",
-                        costs[(i, x)],
-                        boxes[i],
-                        self.tracklets[x].id,
-                        self.tracklets[x].filter.mean
-                    );
-                    assert!(!tracked[x]);
-                    tracked[x] = true;
-                    self.tracklets[x].update(&boxes[i], timestamp);
-                }
-            }
-        }
-
-        // move tracklets that don't have lifespan to the removed tracklets
+    /// Remove expired tracklets based on timestamp.
+    fn remove_expired_tracklets(&mut self, timestamp: u64) {
         // must iterate from the back
         for i in (0..self.tracklets.len()).rev() {
             let expiry = self.tracklets[i].last_updated + self.track_extra_lifespan;
@@ -256,31 +213,112 @@ where
                 let _ = self.tracklets.swap_remove(i);
             }
         }
+    }
 
-        // unmatched high score boxes are then used to make new tracks
-        for i in high_conf_ind {
-            if !matched[i] {
-                let id = Uuid::new_v4();
-                let new_tracklet = Tracklet {
-                    id,
-                    filter: ConstantVelocityXYAHModel2::new(
-                        &vaalbox_to_xyah(&boxes[i].bbox()),
-                        self.track_update,
-                    ),
-                    last_updated: timestamp,
-                    count: 1,
-                    created: timestamp,
-                };
-                matched_info[i] = Some(TrackInfo {
-                    uuid: new_tracklet.id,
-                    count: new_tracklet.count,
-                    created: new_tracklet.created,
-                    tracked_location: new_tracklet.get_predicted_location(),
-                    last_updated: timestamp,
-                });
-                self.tracklets.push(new_tracklet);
+    /// Create new tracklets from unmatched high-confidence boxes.
+    fn create_new_tracklets<T: DetectionBox>(
+        &mut self,
+        boxes: &[T],
+        high_conf_indices: &[usize],
+        matched: &[bool],
+        matched_info: &mut [Option<TrackInfo>],
+        timestamp: u64,
+    ) {
+        for &i in high_conf_indices {
+            if matched[i] {
+                continue;
             }
+
+            let id = Uuid::new_v4();
+            let new_tracklet = Tracklet {
+                id,
+                filter: ConstantVelocityXYAHModel2::new(
+                    &vaalbox_to_xyah(&boxes[i].bbox()),
+                    self.track_update,
+                ),
+                last_updated: timestamp,
+                count: 1,
+                created: timestamp,
+            };
+            matched_info[i] = Some(TrackInfo {
+                uuid: new_tracklet.id,
+                count: new_tracklet.count,
+                created: new_tracklet.created,
+                tracked_location: new_tracklet.get_predicted_location(),
+                last_updated: timestamp,
+            });
+            self.tracklets.push(new_tracklet);
         }
+    }
+}
+
+impl<T> Tracker<T> for ByteTrack
+where
+    T: DetectionBox,
+{
+    fn update(&mut self, boxes: &[T], timestamp: u64) -> Vec<Option<TrackInfo>> {
+        self.frame_count += 1;
+
+        // Identify high-confidence detections
+        let high_conf_ind: Vec<usize> = boxes
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.score() >= self.track_high_conf)
+            .map(|(x, _)| x)
+            .collect();
+
+        let mut matched = vec![false; boxes.len()];
+        let mut tracked = vec![false; self.tracklets.len()];
+        let mut matched_info = vec![None; boxes.len()];
+
+        // First pass: match high-confidence detections
+        if !self.tracklets.is_empty() {
+            for track in &mut self.tracklets {
+                track.filter.predict();
+            }
+
+            let costs = self.compute_costs(
+                boxes,
+                self.track_high_conf,
+                self.track_iou,
+                &matched,
+                &tracked,
+            );
+            let ans = lapjv(&costs).unwrap();
+            self.process_assignments(
+                &ans.0,
+                boxes,
+                &costs,
+                &mut matched,
+                &mut tracked,
+                &mut matched_info,
+                timestamp,
+                false,
+            );
+        }
+
+        // Second pass: match remaining tracklets to low-confidence detections
+        if !self.tracklets.is_empty() {
+            let costs = self.compute_costs(boxes, 0.0, self.track_iou, &matched, &tracked);
+            let ans = lapjv(&costs).unwrap();
+            self.process_assignments(
+                &ans.0,
+                boxes,
+                &costs,
+                &mut matched,
+                &mut tracked,
+                &mut matched_info,
+                timestamp,
+                true,
+            );
+        }
+
+        // Remove expired tracklets
+        self.remove_expired_tracklets(timestamp);
+
+        // Create new tracklets from unmatched high-confidence boxes
+        self.create_new_tracklets(boxes, &high_conf_ind, &matched, &mut matched_info, timestamp);
+
         matched_info
     }
 
