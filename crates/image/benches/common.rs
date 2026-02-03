@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Shared utilities for image processing benchmarks.
+#![allow(dead_code)]
 
 use edgefirst_image::{NV12, RGB, RGBA, TensorImage, YUYV};
 use edgefirst_tensor::TensorMemory;
