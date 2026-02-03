@@ -21,8 +21,10 @@
 //! ## View HTML report
 //! Open `target/criterion/report/index.html` after running benchmarks.
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use std::sync::OnceLock;
+mod common;
+
+use common::{BenchConfig, calculate_letterbox, g2d_available, get_test_data, opengl_available};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 
 #[cfg(target_os = "linux")]
 use edgefirst_image::G2DProcessor;
@@ -33,7 +35,6 @@ use edgefirst_image::{
     YUYV,
 };
 use edgefirst_tensor::{TensorMapTrait, TensorMemory, TensorTrait};
-use four_char_code::FourCharCode;
 
 #[cfg(feature = "opencv")]
 use opencv::{
@@ -41,162 +42,6 @@ use opencv::{
     imgproc,
     prelude::*,
 };
-
-// =============================================================================
-// Hardware Availability Cache
-// =============================================================================
-
-static G2D_AVAILABLE: OnceLock<bool> = OnceLock::new();
-
-// =============================================================================
-// Test Data
-// =============================================================================
-
-const CAMERA_1080P_YUYV: &[u8] = include_bytes!("../../../testdata/camera1080p.yuyv");
-const CAMERA_1080P_NV12: &[u8] = include_bytes!("../../../testdata/camera1080p.nv12");
-const CAMERA_1080P_RGB: &[u8] = include_bytes!("../../../testdata/camera1080p.rgb");
-const CAMERA_4K_YUYV: &[u8] = include_bytes!("../../../testdata/camera4k.yuyv");
-const CAMERA_4K_NV12: &[u8] = include_bytes!("../../../testdata/camera4k.nv12");
-const CAMERA_4K_RGB: &[u8] = include_bytes!("../../../testdata/camera4k.rgb");
-
-fn get_test_data(width: usize, height: usize, format: FourCharCode) -> &'static [u8] {
-    match (width, height, format) {
-        (1920, 1080, f) if f == YUYV => CAMERA_1080P_YUYV,
-        (1920, 1080, f) if f == NV12 => CAMERA_1080P_NV12,
-        (1920, 1080, f) if f == RGB => CAMERA_1080P_RGB,
-        (3840, 2160, f) if f == YUYV => CAMERA_4K_YUYV,
-        (3840, 2160, f) if f == NV12 => CAMERA_4K_NV12,
-        (3840, 2160, f) if f == RGB => CAMERA_4K_RGB,
-        _ => panic!("No test data for {}x{} {:?}", width, height, format),
-    }
-}
-
-fn format_name(f: FourCharCode) -> &'static str {
-    if f == YUYV {
-        "YUYV"
-    } else if f == NV12 {
-        "NV12"
-    } else if f == RGB {
-        "RGB"
-    } else if f == RGBA {
-        "RGBA"
-    } else {
-        "???"
-    }
-}
-
-// =============================================================================
-// Hardware Detection
-// =============================================================================
-
-#[cfg(target_os = "linux")]
-fn dma_available() -> bool {
-    TensorImage::new(64, 64, RGBA, Some(TensorMemory::Dma)).is_ok()
-}
-
-#[cfg(not(target_os = "linux"))]
-fn dma_available() -> bool {
-    false
-}
-
-#[cfg(target_os = "linux")]
-fn g2d_available() -> bool {
-    *G2D_AVAILABLE.get_or_init(|| dma_available() && G2DProcessor::new().is_ok())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn g2d_available() -> bool {
-    false
-}
-
-#[cfg(all(target_os = "linux", feature = "opengl"))]
-fn opengl_available() -> bool {
-    // Note: We check availability here in the parent process, but actual OpenGL
-    // resources are created inside bench closures to survive Criterion's fork.
-    dma_available() && GLProcessorThreaded::new().is_ok()
-}
-
-#[cfg(not(all(target_os = "linux", feature = "opengl")))]
-fn opengl_available() -> bool {
-    false
-}
-
-// =============================================================================
-// Letterbox Calculation
-// =============================================================================
-
-fn calculate_letterbox(
-    src_w: usize,
-    src_h: usize,
-    dst_w: usize,
-    dst_h: usize,
-) -> (usize, usize, usize, usize) {
-    let src_aspect = src_w as f64 / src_h as f64;
-    let dst_aspect = dst_w as f64 / dst_h as f64;
-
-    let (new_w, new_h) = if src_aspect > dst_aspect {
-        let new_h = (dst_w as f64 / src_aspect).round() as usize;
-        (dst_w, new_h)
-    } else {
-        let new_w = (dst_h as f64 * src_aspect).round() as usize;
-        (new_w, dst_h)
-    };
-
-    let left = (dst_w - new_w) / 2;
-    let top = (dst_h - new_h) / 2;
-
-    (left, top, new_w, new_h)
-}
-
-// =============================================================================
-// Benchmark Configuration
-// =============================================================================
-
-#[derive(Clone)]
-struct BenchConfig {
-    in_w: usize,
-    in_h: usize,
-    out_w: usize,
-    out_h: usize,
-    in_fmt: FourCharCode,
-    out_fmt: FourCharCode,
-}
-
-impl BenchConfig {
-    fn id(&self) -> String {
-        if self.in_w == self.out_w && self.in_h == self.out_h {
-            format!(
-                "{}x{}/{}->{}",
-                self.in_w,
-                self.in_h,
-                format_name(self.in_fmt),
-                format_name(self.out_fmt)
-            )
-        } else {
-            format!(
-                "{}x{}/{}->{}x{}/{}",
-                self.in_w,
-                self.in_h,
-                format_name(self.in_fmt),
-                self.out_w,
-                self.out_h,
-                format_name(self.out_fmt)
-            )
-        }
-    }
-
-    fn throughput(&self) -> Throughput {
-        // Throughput in bytes (input size)
-        let bytes = match self.in_fmt {
-            f if f == YUYV => self.in_w * self.in_h * 2,
-            f if f == NV12 => self.in_w * self.in_h * 3 / 2,
-            f if f == RGB => self.in_w * self.in_h * 3,
-            f if f == RGBA => self.in_w * self.in_h * 4,
-            _ => self.in_w * self.in_h,
-        };
-        Throughput::Bytes(bytes as u64)
-    }
-}
 
 // =============================================================================
 // Primary Benchmarks: Camera → Model (letterbox)
