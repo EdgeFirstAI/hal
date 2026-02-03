@@ -196,10 +196,22 @@ fn guess_version(g2d: &g2d) -> Option<Version> {
             if let Some(s) = s.strip_prefix("$VERSION$") {
                 let parts: Vec<_> = s.split(':').collect();
                 let v: Vec<_> = parts[0].split('.').collect();
-                version.major = v.first().and_then(|s| s.parse().ok()).unwrap_or(version.major);
-                version.minor = v.get(1).and_then(|s| s.parse().ok()).unwrap_or(version.minor);
-                version.patch = v.get(2).and_then(|s| s.parse().ok()).unwrap_or(version.patch);
-                version.num = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(version.num);
+                version.major = v
+                    .first()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(version.major);
+                version.minor = v
+                    .get(1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(version.minor);
+                version.patch = v
+                    .get(2)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(version.patch);
+                version.num = parts
+                    .get(1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(version.num);
             }
 
             Some(version)
