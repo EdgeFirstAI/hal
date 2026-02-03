@@ -1,10 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
+mod common;
+
+use common::{dma_available, find_testdata_path, g2d_available};
+
 #[cfg(target_os = "linux")]
 use edgefirst_image::G2DProcessor;
-#[cfg(feature = "opengl")]
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "opengl", target_os = "linux"))]
 use edgefirst_image::GLProcessorThreaded;
 use edgefirst_image::{
     CPUProcessor, Crop, Flip, GREY, ImageProcessorTrait as _, NV16, PLANAR_RGB, RGB, RGBA,
@@ -12,7 +15,6 @@ use edgefirst_image::{
 };
 use edgefirst_tensor::{TensorMapTrait, TensorMemory, TensorTrait};
 use four_char_code::FourCharCode;
-use std::path::Path;
 
 trait TestImage {
     fn filename() -> &'static str;
@@ -99,20 +101,7 @@ where
     IMAGE: TestImage,
 {
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = Path::new("testdata").join(&name);
-    let path = match path.exists() {
-        true => path,
-        false => {
-            let path = Path::new("../testdata").join(&name);
-            if path.exists() {
-                path
-            } else {
-                Path::new("../../testdata").join(&name)
-            }
-        }
-    };
-
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     bencher.bench_local(|| {
         let file = std::fs::read(&path).unwrap();
@@ -128,20 +117,7 @@ where
     IMAGE: TestImage,
 {
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = Path::new("testdata").join(&name);
-    let path = match path.exists() {
-        true => path,
-        false => {
-            let path = Path::new("../testdata").join(&name);
-            if path.exists() {
-                path
-            } else {
-                Path::new("../../testdata").join(&name)
-            }
-        }
-    };
-
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     bencher.bench_local(|| {
         let file = std::fs::read(&path).unwrap();
@@ -157,20 +133,7 @@ where
     IMAGE: TestImage,
 {
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = Path::new("testdata").join(&name);
-    let path = match path.exists() {
-        true => path,
-        false => {
-            let path = Path::new("../testdata").join(&name);
-            if path.exists() {
-                path
-            } else {
-                Path::new("../../testdata").join(&name)
-            }
-        }
-    };
-
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     bencher.bench_local(|| {
         let file = std::fs::read(&path).unwrap();
@@ -202,20 +165,7 @@ where
 
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = Path::new("testdata").join(&name);
-    let path = match path.exists() {
-        true => path,
-        false => {
-            let path = Path::new("../testdata").join(&name);
-            if path.exists() {
-                path
-            } else {
-                Path::new("../../testdata").join(&name)
-            }
-        }
-    };
-
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     let file = std::fs::read(path).unwrap();
     let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Mem)).unwrap();
@@ -239,20 +189,7 @@ where
 
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = Path::new("testdata").join(&name);
-    let path = match path.exists() {
-        true => path,
-        false => {
-            let path = Path::new("../testdata").join(&name);
-            if path.exists() {
-                path
-            } else {
-                Path::new("../../testdata").join(&name)
-            }
-        }
-    };
-
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     let file = std::fs::read(path).unwrap();
     let src = TensorImage::load_jpeg(&file, Some(RGB), Some(TensorMemory::Mem)).unwrap();
@@ -276,20 +213,7 @@ where
 
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = Path::new("testdata").join(&name);
-    let path = match path.exists() {
-        true => path,
-        false => {
-            let path = Path::new("../testdata").join(&name);
-            if path.exists() {
-                path
-            } else {
-                Path::new("../../testdata").join(&name)
-            }
-        }
-    };
-
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     let file = std::fs::read(path).unwrap();
     let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
@@ -319,20 +243,7 @@ where
 
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = Path::new("testdata").join(&name);
-    let path = match path.exists() {
-        true => path,
-        false => {
-            let path = Path::new("../testdata").join(&name);
-            if path.exists() {
-                path
-            } else {
-                Path::new("../../testdata").join(&name)
-            }
-        }
-    };
-
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     let file = std::fs::read(path).unwrap();
     let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
@@ -356,20 +267,7 @@ where
 {
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = Path::new("testdata").join(&name);
-    let path = match path.exists() {
-        true => path,
-        false => {
-            let path = Path::new("../testdata").join(&name);
-            if path.exists() {
-                path
-            } else {
-                Path::new("../../testdata").join(&name)
-            }
-        }
-    };
-
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     let file = std::fs::read(path).unwrap();
 
@@ -399,20 +297,7 @@ where
 {
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = Path::new("testdata").join(&name);
-    let path = match path.exists() {
-        true => path,
-        false => {
-            let path = Path::new("../testdata").join(&name);
-            if path.exists() {
-                path
-            } else {
-                Path::new("../../testdata").join(&name)
-            }
-        }
-    };
-
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     let file = std::fs::read(path).unwrap();
 
@@ -442,20 +327,7 @@ where
 {
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = Path::new("testdata").join(&name);
-    let path = match path.exists() {
-        true => path,
-        false => {
-            let path = Path::new("../testdata").join(&name);
-            if path.exists() {
-                path
-            } else {
-                Path::new("../../testdata").join(&name)
-            }
-        }
-    };
-
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     let file = std::fs::read(path).unwrap();
 
@@ -498,20 +370,7 @@ where
 {
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = Path::new("testdata").join(&name);
-    let path = match path.exists() {
-        true => path,
-        false => {
-            let path = Path::new("../testdata").join(&name);
-            if path.exists() {
-                path
-            } else {
-                Path::new("../../testdata").join(&name)
-            }
-        }
-    };
-
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     let file = std::fs::read(path).unwrap();
 
@@ -554,20 +413,7 @@ where
 {
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = Path::new("testdata").join(&name);
-    let path = match path.exists() {
-        true => path,
-        false => {
-            let path = Path::new("../testdata").join(&name);
-            if path.exists() {
-                path
-            } else {
-                Path::new("../../testdata").join(&name)
-            }
-        }
-    };
-
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     let file = std::fs::read(path).unwrap();
 
@@ -598,20 +444,7 @@ where
 {
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = Path::new("testdata").join(&name);
-    let path = match path.exists() {
-        true => path,
-        false => {
-            let path = Path::new("../testdata").join(&name);
-            if path.exists() {
-                path
-            } else {
-                Path::new("../../testdata").join(&name)
-            }
-        }
-    };
-
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     let file = std::fs::read(path).unwrap();
 
@@ -653,16 +486,7 @@ where
     IMAGE: TestImage,
 {
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = if Path::new("./testdata").join(&name).exists() {
-        Path::new("./testdata").join(&name)
-    } else if Path::new("../testdata").join(&name).exists() {
-        Path::new("../testdata").join(&name)
-    } else if Path::new("../../testdata").join(&name).exists() {
-        Path::new("../../testdata").join(&name)
-    } else {
-        Path::new("../../../testdata").join(&name)
-    };
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     let file = std::fs::read(path).unwrap();
 
@@ -1106,20 +930,7 @@ where
 {
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = Path::new("testdata").join(&name);
-    let path = match path.exists() {
-        true => path,
-        false => {
-            let path = Path::new("../testdata").join(&name);
-            if path.exists() {
-                path
-            } else {
-                Path::new("../../testdata").join(&name)
-            }
-        }
-    };
-
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     let file = std::fs::read(path).unwrap();
 
@@ -1995,37 +1806,9 @@ fn hires_opengl_4k_rgb_to_rgba_mem(bencher: divan::Bencher, size: (usize, usize)
     drop(dst);
 }
 
-#[cfg(target_os = "linux")]
-fn dma_available() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        dma_heap::Heap::new(dma_heap::HeapKind::Cma)
-            .or_else(|_| dma_heap::Heap::new(dma_heap::HeapKind::System))
-            .is_ok()
-    }
-    #[cfg(not(target_os = "linux"))]
-    false
-}
-
-#[cfg(target_os = "linux")]
-fn g2d_available() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        edgefirst_image::G2DProcessor::new().is_ok()
-    }
-    #[cfg(not(target_os = "linux"))]
-    false
-}
-
-#[cfg(target_os = "linux")]
-#[cfg(feature = "opengl")]
+#[cfg(all(target_os = "linux", feature = "opengl"))]
 fn gl_available() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        edgefirst_image::GLProcessorThreaded::new().is_ok()
-    }
-    #[cfg(not(target_os = "linux"))]
-    false
+    common::opengl_available()
 }
 
 fn main() {
