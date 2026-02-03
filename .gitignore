@@ -16,6 +16,8 @@ coverage.xml
 *sbom.json
 *.cdx.json
 
+env.sh
+
 # Ignore Local Notes
 /AUDIT.md
 /STATUS.md
