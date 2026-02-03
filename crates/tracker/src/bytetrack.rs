@@ -345,18 +345,207 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::{ByteTrack, iou, vaalbox_to_xyah, xyah_to_vaalbox};
+    use crate::{DetectionBox, Tracker};
 
-    use super::{vaalbox_to_xyah, xyah_to_vaalbox};
+    /// Mock detection for testing
+    #[derive(Debug, Clone)]
+    struct MockDetection {
+        bbox: [f32; 4],
+        score: f32,
+        label: usize,
+    }
+
+    impl MockDetection {
+        fn new(x1: f32, y1: f32, x2: f32, y2: f32, score: f32) -> Self {
+            Self {
+                bbox: [x1, y1, x2, y2],
+                score,
+                label: 0,
+            }
+        }
+    }
+
+    impl DetectionBox for MockDetection {
+        fn bbox(&self) -> [f32; 4] {
+            self.bbox
+        }
+
+        fn score(&self) -> f32 {
+            self.score
+        }
+
+        fn label(&self) -> usize {
+            self.label
+        }
+    }
 
     #[test]
-    fn filter() {
+    fn test_vaalbox_xyah_roundtrip() {
         let box1 = [0.0134, 0.02135, 0.12438, 0.691];
         let xyah = vaalbox_to_xyah(&box1);
-
         let box2 = xyah_to_vaalbox(&xyah);
-        assert!((box1[2] - box2[2]).abs() < f32::EPSILON);
-        assert!((box1[3] - box2[3]).abs() < f32::EPSILON);
+
         assert!((box1[0] - box2[0]).abs() < f32::EPSILON);
         assert!((box1[1] - box2[1]).abs() < f32::EPSILON);
+        assert!((box1[2] - box2[2]).abs() < f32::EPSILON);
+        assert!((box1[3] - box2[3]).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_iou_identical_boxes() {
+        let box1 = [0.1, 0.1, 0.5, 0.5];
+        let box2 = [0.1, 0.1, 0.5, 0.5];
+        let result = iou(&box1, &box2);
+        assert!(
+            (result - 1.0).abs() < 0.001,
+            "IOU of identical boxes should be 1.0"
+        );
+    }
+
+    #[test]
+    fn test_iou_no_overlap() {
+        let box1 = [0.0, 0.0, 0.2, 0.2];
+        let box2 = [0.5, 0.5, 0.7, 0.7];
+        let result = iou(&box1, &box2);
+        assert!(result < 0.001, "IOU of non-overlapping boxes should be ~0");
+    }
+
+    #[test]
+    fn test_iou_partial_overlap() {
+        let box1 = [0.0, 0.0, 0.5, 0.5];
+        let box2 = [0.25, 0.25, 0.75, 0.75];
+        let result = iou(&box1, &box2);
+        // Intersection: 0.25*0.25 = 0.0625, Union: 0.25+0.25-0.0625 = 0.4375
+        assert!(result > 0.1 && result < 0.2, "IOU should be ~0.14");
+    }
+
+    #[test]
+    fn test_bytetrack_new() {
+        let tracker = ByteTrack::new();
+        assert_eq!(tracker.frame_count, 0);
+        assert!(tracker.tracklets.is_empty());
+        assert_eq!(tracker.track_high_conf, 0.7);
+        assert_eq!(tracker.track_iou, 0.25);
+    }
+
+    #[test]
+    fn test_bytetrack_single_detection_creates_tracklet() {
+        let mut tracker = ByteTrack::new();
+        let detections = vec![MockDetection::new(0.1, 0.1, 0.3, 0.3, 0.9)];
+
+        let results = tracker.update(&detections, 1000);
+
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].is_some(),
+            "High-confidence detection should create tracklet"
+        );
+        assert_eq!(tracker.tracklets.len(), 1);
+        assert_eq!(tracker.frame_count, 1);
+    }
+
+    #[test]
+    fn test_bytetrack_low_confidence_no_tracklet() {
+        let mut tracker = ByteTrack::new();
+        // Score below track_high_conf (0.7)
+        let detections = vec![MockDetection::new(0.1, 0.1, 0.3, 0.3, 0.5)];
+
+        let results = tracker.update(&detections, 1000);
+
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].is_none(),
+            "Low-confidence detection should not create tracklet"
+        );
+        assert!(tracker.tracklets.is_empty());
+    }
+
+    #[test]
+    fn test_bytetrack_tracking_across_frames() {
+        let mut tracker = ByteTrack::new();
+
+        // Frame 1: Create tracklet with a larger box that's easier to track
+        let det1 = vec![MockDetection::new(0.2, 0.2, 0.4, 0.4, 0.9)];
+        let res1 = tracker.update(&det1, 1000);
+        assert!(res1[0].is_some());
+        let uuid1 = res1[0].unwrap().uuid;
+        assert_eq!(tracker.tracklets.len(), 1);
+        // After creation, tracklet count is 1
+        assert_eq!(tracker.tracklets[0].count, 1);
+
+        // Frame 2: Same location - should match existing tracklet
+        let det2 = vec![MockDetection::new(0.2, 0.2, 0.4, 0.4, 0.9)];
+        let res2 = tracker.update(&det2, 2000);
+        assert!(res2[0].is_some());
+        let info2 = res2[0].unwrap();
+
+        // Verify tracklet was matched, not a new one created
+        assert_eq!(tracker.tracklets.len(), 1, "Should still have one tracklet");
+        assert_eq!(info2.uuid, uuid1, "Should match same tracklet");
+        // After second update, the internal tracklet count should be 2
+        assert_eq!(tracker.tracklets[0].count, 2, "Internal count should be 2");
+    }
+
+    #[test]
+    fn test_bytetrack_multiple_detections() {
+        let mut tracker = ByteTrack::new();
+
+        let detections = vec![
+            MockDetection::new(0.1, 0.1, 0.2, 0.2, 0.9),
+            MockDetection::new(0.5, 0.5, 0.6, 0.6, 0.85),
+            MockDetection::new(0.8, 0.8, 0.9, 0.9, 0.95),
+        ];
+
+        let results = tracker.update(&detections, 1000);
+
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| r.is_some()));
+        assert_eq!(tracker.tracklets.len(), 3);
+    }
+
+    #[test]
+    fn test_bytetrack_tracklet_expiry() {
+        let mut tracker = ByteTrack::new();
+        tracker.track_extra_lifespan = 1000; // 1 second
+
+        // Create tracklet
+        let det1 = vec![MockDetection::new(0.1, 0.1, 0.3, 0.3, 0.9)];
+        tracker.update(&det1, 1000);
+        assert_eq!(tracker.tracklets.len(), 1);
+
+        // Update with no detections after lifespan expires
+        let empty: Vec<MockDetection> = vec![];
+        tracker.update(&empty, 3000); // 2 seconds later
+
+        assert!(tracker.tracklets.is_empty(), "Tracklet should have expired");
+    }
+
+    #[test]
+    fn test_bytetrack_get_active_tracks() {
+        let mut tracker = ByteTrack::new();
+
+        let detections = vec![
+            MockDetection::new(0.1, 0.1, 0.2, 0.2, 0.9),
+            MockDetection::new(0.5, 0.5, 0.6, 0.6, 0.85),
+        ];
+        tracker.update(&detections, 1000);
+
+        let active = <ByteTrack as Tracker<MockDetection>>::get_active_tracks(&tracker);
+        assert_eq!(active.len(), 2);
+        assert!(active.iter().all(|t| t.count == 1));
+        assert!(active.iter().all(|t| t.created == 1000));
+    }
+
+    #[test]
+    fn test_bytetrack_empty_detections() {
+        let mut tracker = ByteTrack::new();
+        let empty: Vec<MockDetection> = vec![];
+
+        let results = tracker.update(&empty, 1000);
+
+        assert!(results.is_empty());
+        assert!(tracker.tracklets.is_empty());
+        assert_eq!(tracker.frame_count, 1);
     }
 }
