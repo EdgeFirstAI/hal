@@ -3738,4 +3738,106 @@ mod image_tests {
             )
         }
     }
+
+    // =========================================================================
+    // NV12 Format Tests
+    // =========================================================================
+
+    #[test]
+    fn test_nv12_tensor_image_creation() {
+        let width = 640;
+        let height = 480;
+        let img = TensorImage::new(width, height, NV12, None).unwrap();
+
+        assert_eq!(img.width(), width);
+        assert_eq!(img.height(), height);
+        assert_eq!(img.fourcc(), NV12);
+        // NV12 uses shape [H*3/2, W] to store Y plane + UV plane
+        assert_eq!(img.tensor().shape(), &[height * 3 / 2, width]);
+    }
+
+    #[test]
+    fn test_nv12_channels() {
+        let img = TensorImage::new(640, 480, NV12, None).unwrap();
+        // NV12 reports 2 channels (Y + interleaved UV)
+        assert_eq!(img.channels(), 2);
+    }
+
+    // =========================================================================
+    // TensorImageRef Tests
+    // =========================================================================
+
+    #[test]
+    fn test_tensor_image_ref_from_planar_tensor() {
+        // Create a planar RGB tensor [3, 480, 640]
+        let mut tensor = Tensor::<u8>::new(&[3, 480, 640], None, None).unwrap();
+
+        let img_ref = TensorImageRef::from_borrowed_tensor(&mut tensor, PLANAR_RGB).unwrap();
+
+        assert_eq!(img_ref.width(), 640);
+        assert_eq!(img_ref.height(), 480);
+        assert_eq!(img_ref.channels(), 3);
+        assert_eq!(img_ref.fourcc(), PLANAR_RGB);
+        assert!(img_ref.is_planar());
+    }
+
+    #[test]
+    fn test_tensor_image_ref_from_interleaved_tensor() {
+        // Create an interleaved RGBA tensor [480, 640, 4]
+        let mut tensor = Tensor::<u8>::new(&[480, 640, 4], None, None).unwrap();
+
+        let img_ref = TensorImageRef::from_borrowed_tensor(&mut tensor, RGBA).unwrap();
+
+        assert_eq!(img_ref.width(), 640);
+        assert_eq!(img_ref.height(), 480);
+        assert_eq!(img_ref.channels(), 4);
+        assert_eq!(img_ref.fourcc(), RGBA);
+        assert!(!img_ref.is_planar());
+    }
+
+    #[test]
+    fn test_tensor_image_ref_invalid_shape() {
+        // 2D tensor should fail
+        let mut tensor = Tensor::<u8>::new(&[480, 640], None, None).unwrap();
+        let result = TensorImageRef::from_borrowed_tensor(&mut tensor, RGB);
+        assert!(matches!(result, Err(Error::InvalidShape(_))));
+    }
+
+    #[test]
+    fn test_tensor_image_ref_wrong_channels() {
+        // RGBA expects 4 channels but tensor has 3
+        let mut tensor = Tensor::<u8>::new(&[480, 640, 3], None, None).unwrap();
+        let result = TensorImageRef::from_borrowed_tensor(&mut tensor, RGBA);
+        assert!(matches!(result, Err(Error::InvalidShape(_))));
+    }
+
+    #[test]
+    fn test_tensor_image_dst_trait_tensor_image() {
+        let img = TensorImage::new(640, 480, RGB, None).unwrap();
+
+        // Test TensorImageDst trait implementation
+        fn check_dst<T: TensorImageDst>(dst: &T) {
+            assert_eq!(dst.width(), 640);
+            assert_eq!(dst.height(), 480);
+            assert_eq!(dst.channels(), 3);
+            assert!(!dst.is_planar());
+        }
+
+        check_dst(&img);
+    }
+
+    #[test]
+    fn test_tensor_image_dst_trait_tensor_image_ref() {
+        let mut tensor = Tensor::<u8>::new(&[3, 480, 640], None, None).unwrap();
+        let img_ref = TensorImageRef::from_borrowed_tensor(&mut tensor, PLANAR_RGB).unwrap();
+
+        fn check_dst<T: TensorImageDst>(dst: &T) {
+            assert_eq!(dst.width(), 640);
+            assert_eq!(dst.height(), 480);
+            assert_eq!(dst.channels(), 3);
+            assert!(dst.is_planar());
+        }
+
+        check_dst(&img_ref);
+    }
 }
