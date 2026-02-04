@@ -47,8 +47,8 @@ macro_rules! function {
 #[cfg(feature = "decoder")]
 use crate::DEFAULT_COLORS;
 use crate::{
-    Crop, Error, Flip, GREY, ImageProcessorTrait, NV12, PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, Rect,
-    Rotation, TensorImage, YUYV,
+    CPUProcessor, Crop, Error, Flip, GREY, ImageProcessorTrait, NV12, PLANAR_RGB, PLANAR_RGBA, RGB,
+    RGBA, Rect, Rotation, TensorImage, TensorImageRef, YUYV,
 };
 
 static EGL_LIB: OnceLock<libloading::Library> = OnceLock::new();
@@ -621,6 +621,19 @@ impl ImageProcessorTrait for GLProcessorThreaded {
         })?
     }
 
+    fn convert_ref(
+        &mut self,
+        src: &TensorImage,
+        dst: &mut TensorImageRef<'_>,
+        rotation: Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> crate::Result<()> {
+        // OpenGL doesn't support PLANAR_RGB output, delegate to CPU
+        let mut cpu = CPUProcessor::new();
+        cpu.convert_ref(src, dst, rotation, flip, crop)
+    }
+
     #[cfg(feature = "decoder")]
     fn render_to_image(
         &mut self,
@@ -736,6 +749,19 @@ impl ImageProcessorTrait for GLProcessorST {
         let res = self.convert_dest_non_dma(dst, src, rotation, flip, crop);
         log::debug!("convert_dest_non_dma takes {:?}", start.elapsed());
         res
+    }
+
+    fn convert_ref(
+        &mut self,
+        src: &TensorImage,
+        dst: &mut TensorImageRef<'_>,
+        rotation: Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> crate::Result<()> {
+        // OpenGL doesn't support PLANAR_RGB output, delegate to CPU
+        let mut cpu = CPUProcessor::new();
+        cpu.convert_ref(src, dst, rotation, flip, crop)
     }
 
     #[cfg(feature = "decoder")]
@@ -928,8 +954,8 @@ impl GLProcessorST {
 
     fn check_src_format_supported(support_dma: bool, img: &TensorImage) -> bool {
         if support_dma && img.tensor().memory() == TensorMemory::Dma {
-            // generally EGLImage doesn't support RGB
-            matches!(img.fourcc(), RGBA | GREY | YUYV)
+            // EGLImage supports RGBA, GREY, YUYV, and NV12 for DMA buffers
+            matches!(img.fourcc(), RGBA | GREY | YUYV | NV12)
         } else {
             matches!(img.fourcc(), RGB | RGBA | GREY)
         }
@@ -1231,17 +1257,23 @@ impl GLProcessorST {
             crate::Rotation::Rotate180 => 2,
             crate::Rotation::CounterClockwise90 => 3,
         };
-        if self.gl_context.support_dma
-            && let Ok(new_egl_image) = self.create_image_from_dma2(src)
-        {
-            self.draw_camera_texture_eglimage(
-                src,
-                &new_egl_image,
-                src_roi,
-                dst_roi,
-                rotation_offset,
-                flip,
-            )?
+        if self.gl_context.support_dma {
+            match self.create_image_from_dma2(src) {
+                Ok(new_egl_image) => self.draw_camera_texture_eglimage(
+                    src,
+                    &new_egl_image,
+                    src_roi,
+                    dst_roi,
+                    rotation_offset,
+                    flip,
+                )?,
+                Err(e) => {
+                    log::warn!("EGL image creation failed for {:?}: {:?}", src.fourcc(), e);
+                    let start = Instant::now();
+                    self.draw_src_texture(src, src_roi, dst_roi, rotation_offset, flip)?;
+                    log::debug!("draw_src_texture takes {:?}", start.elapsed());
+                }
+            }
         } else {
             let start = Instant::now();
             self.draw_src_texture(src, src_roi, dst_roi, rotation_offset, flip)?;
@@ -1784,7 +1816,20 @@ impl GLProcessorST {
         let height;
         let format;
         let channels;
-        if src.is_planar() {
+
+        // NV12 is semi-planar but handled specially via EGL multi-plane import
+        if src.fourcc() == NV12 {
+            if !src.width().is_multiple_of(4) {
+                return Err(Error::NotSupported(
+                    "OpenGL EGLImage doesn't support image widths which are not multiples of 4"
+                        .to_string(),
+                ));
+            }
+            width = src.width();
+            height = src.height();
+            format = fourcc_to_drm(NV12);
+            channels = 1; // Y plane pitch is 1 byte per pixel
+        } else if src.is_planar() {
             if !src.width().is_multiple_of(16) {
                 return Err(Error::NotSupported(
                     "OpenGL Planar RGB EGLImage doesn't support image widths which are not multiples of 16"
@@ -1831,6 +1876,14 @@ impl GLProcessorST {
             }
         };
 
+        // For NV12, plane0 pitch is width (Y is 1 byte/pixel)
+        // For other formats, pitch is width * channels
+        let plane0_pitch = if src.fourcc() == NV12 {
+            width
+        } else {
+            width * channels
+        };
+
         let mut egl_img_attr = vec![
             egl_ext::LINUX_DRM_FOURCC as Attrib,
             format as Attrib,
@@ -1839,7 +1892,7 @@ impl GLProcessorST {
             khronos_egl::HEIGHT as Attrib,
             height as Attrib,
             egl_ext::DMA_BUF_PLANE0_PITCH as Attrib,
-            (width * channels) as Attrib,
+            plane0_pitch as Attrib,
             egl_ext::DMA_BUF_PLANE0_OFFSET as Attrib,
             0 as Attrib,
             egl_ext::DMA_BUF_PLANE0_FD as Attrib,
@@ -1847,6 +1900,20 @@ impl GLProcessorST {
             egl::IMAGE_PRESERVED as Attrib,
             egl::TRUE as Attrib,
         ];
+
+        // NV12 requires a second plane for UV data
+        if src.fourcc() == NV12 {
+            let uv_offset = width * height; // Y plane size
+            egl_img_attr.append(&mut vec![
+                egl_ext::DMA_BUF_PLANE1_FD as Attrib,
+                fd as Attrib,
+                egl_ext::DMA_BUF_PLANE1_OFFSET as Attrib,
+                uv_offset as Attrib,
+                egl_ext::DMA_BUF_PLANE1_PITCH as Attrib,
+                width as Attrib, // UV plane has same width as Y plane
+            ]);
+        }
+
         if matches!(src.fourcc(), YUYV | NV12) {
             egl_img_attr.append(&mut vec![
                 egl_ext::YUV_COLOR_SPACE_HINT as Attrib,
@@ -2594,6 +2661,7 @@ fn fourcc_to_drm(fourcc: FourCharCode) -> DrmFourcc {
         YUYV => DrmFourcc::Yuyv,
         RGB => DrmFourcc::Bgr888,
         GREY => DrmFourcc::R8,
+        NV12 => DrmFourcc::Nv12,
         _ => todo!(),
     }
 }
@@ -2799,7 +2867,12 @@ void main() {
 #[cfg(feature = "opengl")]
 mod gl_tests {
     use super::*;
+    #[cfg(feature = "dma_test_formats")]
+    use crate::{NV12, YUYV};
     use crate::{RGBA, TensorImage};
+    use edgefirst_tensor::TensorTrait;
+    #[cfg(feature = "dma_test_formats")]
+    use edgefirst_tensor::{TensorMapTrait, TensorMemory};
     use image::buffer::ConvertBuffer;
     use ndarray::Array3;
 
@@ -3070,5 +3143,109 @@ mod gl_tests {
                 similarity.score, threshold
             )
         }
+    }
+
+    // =========================================================================
+    // NV12 Reference Validation Tests
+    // These tests compare OpenGL NV12 conversions against ffmpeg-generated
+    // references
+    // =========================================================================
+
+    #[cfg(feature = "dma_test_formats")]
+    fn load_raw_image(
+        width: usize,
+        height: usize,
+        fourcc: FourCharCode,
+        memory: Option<TensorMemory>,
+        bytes: &[u8],
+    ) -> Result<TensorImage, crate::Error> {
+        let img = TensorImage::new(width, height, fourcc, memory)?;
+        let mut map = img.tensor().map()?;
+        map.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
+        Ok(img)
+    }
+
+    /// Test OpenGL NV12→RGBA conversion against ffmpeg reference
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_opengl_nv12_to_rgba_reference() {
+        // Load NV12 source with DMA
+        let src = load_raw_image(
+            1280,
+            720,
+            NV12,
+            Some(TensorMemory::Dma),
+            include_bytes!("../../../testdata/camera720p.nv12"),
+        )
+        .unwrap();
+
+        // Load RGBA reference (ffmpeg-generated)
+        let reference = load_raw_image(
+            1280,
+            720,
+            RGBA,
+            None,
+            include_bytes!("../../../testdata/camera720p.rgba"),
+        )
+        .unwrap();
+
+        // Convert using OpenGL
+        let mut dst = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma)).unwrap();
+        let mut gl = GLProcessorThreaded::new().unwrap();
+        gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap();
+
+        // Copy to CPU for comparison
+        let cpu_dst = TensorImage::new(1280, 720, RGBA, None).unwrap();
+        cpu_dst
+            .tensor()
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(dst.tensor().map().unwrap().as_slice());
+
+        compare_images(&reference, &cpu_dst, 0.98, "opengl_nv12_to_rgba_reference");
+    }
+
+    /// Test OpenGL YUYV→RGBA conversion against ffmpeg reference
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_opengl_yuyv_to_rgba_reference() {
+        // Load YUYV source with DMA
+        let src = load_raw_image(
+            1280,
+            720,
+            YUYV,
+            Some(TensorMemory::Dma),
+            include_bytes!("../../../testdata/camera720p.yuyv"),
+        )
+        .unwrap();
+
+        // Load RGBA reference (ffmpeg-generated)
+        let reference = load_raw_image(
+            1280,
+            720,
+            RGBA,
+            None,
+            include_bytes!("../../../testdata/camera720p.rgba"),
+        )
+        .unwrap();
+
+        // Convert using OpenGL
+        let mut dst = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma)).unwrap();
+        let mut gl = GLProcessorThreaded::new().unwrap();
+        gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap();
+
+        // Copy to CPU for comparison
+        let cpu_dst = TensorImage::new(1280, 720, RGBA, None).unwrap();
+        cpu_dst
+            .tensor()
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(dst.tensor().map().unwrap().as_slice());
+
+        compare_images(&reference, &cpu_dst, 0.98, "opengl_yuyv_to_rgba_reference");
     }
 }

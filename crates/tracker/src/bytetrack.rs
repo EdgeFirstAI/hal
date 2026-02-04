@@ -150,104 +150,62 @@ impl ByteTrack {
             }
         })
     }
-}
 
-impl<T> Tracker<T> for ByteTrack
-where
-    T: DetectionBox,
-{
-    fn update(&mut self, boxes: &[T], timestamp: u64) -> Vec<Option<TrackInfo>> {
-        self.frame_count += 1;
-        let high_conf_ind = boxes
-            .iter()
-            .enumerate()
-            .filter_map(|(x, b)| {
-                if b.score() >= self.track_high_conf {
-                    Some(x)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<usize>>();
-        let mut matched = vec![false; boxes.len()];
-        let mut tracked = vec![false; self.tracklets.len()];
-        let mut matched_info = vec![None; boxes.len()];
-        if !self.tracklets.is_empty() {
-            for track in &mut self.tracklets {
-                track.filter.predict();
+    /// Process assignments from linear assignment and update tracking state.
+    /// Returns true if any matches were made.
+    #[allow(clippy::too_many_arguments)]
+    fn process_assignments<T: DetectionBox>(
+        &mut self,
+        assignments: &[usize],
+        boxes: &[T],
+        costs: &Matrix<f32>,
+        matched: &mut [bool],
+        tracked: &mut [bool],
+        matched_info: &mut [Option<TrackInfo>],
+        timestamp: u64,
+        skip_already_matched: bool,
+    ) {
+        for (i, &x) in assignments.iter().enumerate() {
+            if i >= boxes.len() || x >= self.tracklets.len() {
+                continue;
             }
-            let costs = self.compute_costs(
-                boxes,
-                self.track_high_conf,
-                self.track_iou,
-                &matched,
-                &tracked,
-            );
-            // With m boxes and n tracks, we compute a m x n array of costs for
-            // association cost is based on distance computed by the Kalman Filter
-            // Then we use lapjv (linear assignment) to minimize the cost of
-            // matching tracks to boxes
-            // The linear assignment will still assign some tracks to out of threshold
-            // scores/filtered tracks/filtered boxes But it will try to minimize
-            // the number of "invalid" assignments, since those are just very high costs
-            let ans = lapjv(&costs).unwrap();
-            for i in 0..ans.0.len() {
-                let x = ans.0[i];
-                if i < boxes.len() && x < self.tracklets.len() {
-                    // We need to filter out those "invalid" assignments
-                    if costs[(i, ans.0[i])] >= INVALID_MATCH {
-                        continue;
-                    }
-                    matched[i] = true;
-                    matched_info[i] = Some(TrackInfo {
-                        uuid: self.tracklets[x].id,
-                        count: self.tracklets[x].count,
-                        created: self.tracklets[x].created,
-                        tracked_location: self.tracklets[x].get_predicted_location(),
-                        last_updated: timestamp,
-                    });
-                    assert!(!tracked[x]);
-                    tracked[x] = true;
-                    self.tracklets[x].update(&boxes[i], timestamp);
-                }
+
+            // Filter out invalid assignments
+            if costs[(i, x)] >= INVALID_MATCH {
+                continue;
             }
+
+            // For second pass, skip already matched boxes/tracklets
+            if skip_already_matched && (matched[i] || tracked[x]) {
+                continue;
+            }
+
+            if skip_already_matched {
+                trace!(
+                    "Cost: {} Box: {:#?} UUID: {} Mean: {}",
+                    costs[(i, x)],
+                    boxes[i],
+                    self.tracklets[x].id,
+                    self.tracklets[x].filter.mean
+                );
+            }
+
+            matched[i] = true;
+            matched_info[i] = Some(TrackInfo {
+                uuid: self.tracklets[x].id,
+                count: self.tracklets[x].count,
+                created: self.tracklets[x].created,
+                tracked_location: self.tracklets[x].get_predicted_location(),
+                last_updated: timestamp,
+            });
+            assert!(!tracked[x]);
+            tracked[x] = true;
+            self.tracklets[x].update(&boxes[i], timestamp);
         }
+    }
 
-        // try to match unmatched tracklets to low score detections as well
-        if !self.tracklets.is_empty() {
-            let costs = self.compute_costs(boxes, 0.0, self.track_iou, &matched, &tracked);
-            let ans = lapjv(&costs).unwrap();
-            for i in 0..ans.0.len() {
-                let x = ans.0[i];
-                if i < boxes.len() && x < self.tracklets.len() {
-                    // matched tracks
-                    // We need to filter out those "invalid" assignments
-                    if matched[i] || tracked[x] || (costs[(i, x)] >= INVALID_MATCH) {
-                        continue;
-                    }
-                    matched[i] = true;
-                    matched_info[i] = Some(TrackInfo {
-                        uuid: self.tracklets[x].id,
-                        count: self.tracklets[x].count,
-                        created: self.tracklets[x].created,
-                        tracked_location: self.tracklets[x].get_predicted_location(),
-                        last_updated: timestamp,
-                    });
-                    trace!(
-                        "Cost: {} Box: {:#?} UUID: {} Mean: {}",
-                        costs[(i, x)],
-                        boxes[i],
-                        self.tracklets[x].id,
-                        self.tracklets[x].filter.mean
-                    );
-                    assert!(!tracked[x]);
-                    tracked[x] = true;
-                    self.tracklets[x].update(&boxes[i], timestamp);
-                }
-            }
-        }
-
-        // move tracklets that don't have lifespan to the removed tracklets
+    /// Remove expired tracklets based on timestamp.
+    fn remove_expired_tracklets(&mut self, timestamp: u64) {
         // must iterate from the back
         for i in (0..self.tracklets.len()).rev() {
             let expiry = self.tracklets[i].last_updated + self.track_extra_lifespan;
@@ -256,31 +214,118 @@ where
                 let _ = self.tracklets.swap_remove(i);
             }
         }
+    }
 
-        // unmatched high score boxes are then used to make new tracks
-        for i in high_conf_ind {
-            if !matched[i] {
-                let id = Uuid::new_v4();
-                let new_tracklet = Tracklet {
-                    id,
-                    filter: ConstantVelocityXYAHModel2::new(
-                        &vaalbox_to_xyah(&boxes[i].bbox()),
-                        self.track_update,
-                    ),
-                    last_updated: timestamp,
-                    count: 1,
-                    created: timestamp,
-                };
-                matched_info[i] = Some(TrackInfo {
-                    uuid: new_tracklet.id,
-                    count: new_tracklet.count,
-                    created: new_tracklet.created,
-                    tracked_location: new_tracklet.get_predicted_location(),
-                    last_updated: timestamp,
-                });
-                self.tracklets.push(new_tracklet);
+    /// Create new tracklets from unmatched high-confidence boxes.
+    fn create_new_tracklets<T: DetectionBox>(
+        &mut self,
+        boxes: &[T],
+        high_conf_indices: &[usize],
+        matched: &[bool],
+        matched_info: &mut [Option<TrackInfo>],
+        timestamp: u64,
+    ) {
+        for &i in high_conf_indices {
+            if matched[i] {
+                continue;
             }
+
+            let id = Uuid::new_v4();
+            let new_tracklet = Tracklet {
+                id,
+                filter: ConstantVelocityXYAHModel2::new(
+                    &vaalbox_to_xyah(&boxes[i].bbox()),
+                    self.track_update,
+                ),
+                last_updated: timestamp,
+                count: 1,
+                created: timestamp,
+            };
+            matched_info[i] = Some(TrackInfo {
+                uuid: new_tracklet.id,
+                count: new_tracklet.count,
+                created: new_tracklet.created,
+                tracked_location: new_tracklet.get_predicted_location(),
+                last_updated: timestamp,
+            });
+            self.tracklets.push(new_tracklet);
         }
+    }
+}
+
+impl<T> Tracker<T> for ByteTrack
+where
+    T: DetectionBox,
+{
+    fn update(&mut self, boxes: &[T], timestamp: u64) -> Vec<Option<TrackInfo>> {
+        self.frame_count += 1;
+
+        // Identify high-confidence detections
+        let high_conf_ind: Vec<usize> = boxes
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.score() >= self.track_high_conf)
+            .map(|(x, _)| x)
+            .collect();
+
+        let mut matched = vec![false; boxes.len()];
+        let mut tracked = vec![false; self.tracklets.len()];
+        let mut matched_info = vec![None; boxes.len()];
+
+        // First pass: match high-confidence detections
+        if !self.tracklets.is_empty() {
+            for track in &mut self.tracklets {
+                track.filter.predict();
+            }
+
+            let costs = self.compute_costs(
+                boxes,
+                self.track_high_conf,
+                self.track_iou,
+                &matched,
+                &tracked,
+            );
+            let ans = lapjv(&costs).unwrap();
+            self.process_assignments(
+                &ans.0,
+                boxes,
+                &costs,
+                &mut matched,
+                &mut tracked,
+                &mut matched_info,
+                timestamp,
+                false,
+            );
+        }
+
+        // Second pass: match remaining tracklets to low-confidence detections
+        if !self.tracklets.is_empty() {
+            let costs = self.compute_costs(boxes, 0.0, self.track_iou, &matched, &tracked);
+            let ans = lapjv(&costs).unwrap();
+            self.process_assignments(
+                &ans.0,
+                boxes,
+                &costs,
+                &mut matched,
+                &mut tracked,
+                &mut matched_info,
+                timestamp,
+                true,
+            );
+        }
+
+        // Remove expired tracklets
+        self.remove_expired_tracklets(timestamp);
+
+        // Create new tracklets from unmatched high-confidence boxes
+        self.create_new_tracklets(
+            boxes,
+            &high_conf_ind,
+            &matched,
+            &mut matched_info,
+            timestamp,
+        );
+
         matched_info
     }
 
@@ -300,18 +345,207 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::{ByteTrack, iou, vaalbox_to_xyah, xyah_to_vaalbox};
+    use crate::{DetectionBox, Tracker};
 
-    use super::{vaalbox_to_xyah, xyah_to_vaalbox};
+    /// Mock detection for testing
+    #[derive(Debug, Clone)]
+    struct MockDetection {
+        bbox: [f32; 4],
+        score: f32,
+        label: usize,
+    }
+
+    impl MockDetection {
+        fn new(x1: f32, y1: f32, x2: f32, y2: f32, score: f32) -> Self {
+            Self {
+                bbox: [x1, y1, x2, y2],
+                score,
+                label: 0,
+            }
+        }
+    }
+
+    impl DetectionBox for MockDetection {
+        fn bbox(&self) -> [f32; 4] {
+            self.bbox
+        }
+
+        fn score(&self) -> f32 {
+            self.score
+        }
+
+        fn label(&self) -> usize {
+            self.label
+        }
+    }
 
     #[test]
-    fn filter() {
+    fn test_vaalbox_xyah_roundtrip() {
         let box1 = [0.0134, 0.02135, 0.12438, 0.691];
         let xyah = vaalbox_to_xyah(&box1);
-
         let box2 = xyah_to_vaalbox(&xyah);
-        assert!((box1[2] - box2[2]).abs() < f32::EPSILON);
-        assert!((box1[3] - box2[3]).abs() < f32::EPSILON);
+
         assert!((box1[0] - box2[0]).abs() < f32::EPSILON);
         assert!((box1[1] - box2[1]).abs() < f32::EPSILON);
+        assert!((box1[2] - box2[2]).abs() < f32::EPSILON);
+        assert!((box1[3] - box2[3]).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_iou_identical_boxes() {
+        let box1 = [0.1, 0.1, 0.5, 0.5];
+        let box2 = [0.1, 0.1, 0.5, 0.5];
+        let result = iou(&box1, &box2);
+        assert!(
+            (result - 1.0).abs() < 0.001,
+            "IOU of identical boxes should be 1.0"
+        );
+    }
+
+    #[test]
+    fn test_iou_no_overlap() {
+        let box1 = [0.0, 0.0, 0.2, 0.2];
+        let box2 = [0.5, 0.5, 0.7, 0.7];
+        let result = iou(&box1, &box2);
+        assert!(result < 0.001, "IOU of non-overlapping boxes should be ~0");
+    }
+
+    #[test]
+    fn test_iou_partial_overlap() {
+        let box1 = [0.0, 0.0, 0.5, 0.5];
+        let box2 = [0.25, 0.25, 0.75, 0.75];
+        let result = iou(&box1, &box2);
+        // Intersection: 0.25*0.25 = 0.0625, Union: 0.25+0.25-0.0625 = 0.4375
+        assert!(result > 0.1 && result < 0.2, "IOU should be ~0.14");
+    }
+
+    #[test]
+    fn test_bytetrack_new() {
+        let tracker = ByteTrack::new();
+        assert_eq!(tracker.frame_count, 0);
+        assert!(tracker.tracklets.is_empty());
+        assert_eq!(tracker.track_high_conf, 0.7);
+        assert_eq!(tracker.track_iou, 0.25);
+    }
+
+    #[test]
+    fn test_bytetrack_single_detection_creates_tracklet() {
+        let mut tracker = ByteTrack::new();
+        let detections = vec![MockDetection::new(0.1, 0.1, 0.3, 0.3, 0.9)];
+
+        let results = tracker.update(&detections, 1000);
+
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].is_some(),
+            "High-confidence detection should create tracklet"
+        );
+        assert_eq!(tracker.tracklets.len(), 1);
+        assert_eq!(tracker.frame_count, 1);
+    }
+
+    #[test]
+    fn test_bytetrack_low_confidence_no_tracklet() {
+        let mut tracker = ByteTrack::new();
+        // Score below track_high_conf (0.7)
+        let detections = vec![MockDetection::new(0.1, 0.1, 0.3, 0.3, 0.5)];
+
+        let results = tracker.update(&detections, 1000);
+
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].is_none(),
+            "Low-confidence detection should not create tracklet"
+        );
+        assert!(tracker.tracklets.is_empty());
+    }
+
+    #[test]
+    fn test_bytetrack_tracking_across_frames() {
+        let mut tracker = ByteTrack::new();
+
+        // Frame 1: Create tracklet with a larger box that's easier to track
+        let det1 = vec![MockDetection::new(0.2, 0.2, 0.4, 0.4, 0.9)];
+        let res1 = tracker.update(&det1, 1000);
+        assert!(res1[0].is_some());
+        let uuid1 = res1[0].unwrap().uuid;
+        assert_eq!(tracker.tracklets.len(), 1);
+        // After creation, tracklet count is 1
+        assert_eq!(tracker.tracklets[0].count, 1);
+
+        // Frame 2: Same location - should match existing tracklet
+        let det2 = vec![MockDetection::new(0.2, 0.2, 0.4, 0.4, 0.9)];
+        let res2 = tracker.update(&det2, 2000);
+        assert!(res2[0].is_some());
+        let info2 = res2[0].unwrap();
+
+        // Verify tracklet was matched, not a new one created
+        assert_eq!(tracker.tracklets.len(), 1, "Should still have one tracklet");
+        assert_eq!(info2.uuid, uuid1, "Should match same tracklet");
+        // After second update, the internal tracklet count should be 2
+        assert_eq!(tracker.tracklets[0].count, 2, "Internal count should be 2");
+    }
+
+    #[test]
+    fn test_bytetrack_multiple_detections() {
+        let mut tracker = ByteTrack::new();
+
+        let detections = vec![
+            MockDetection::new(0.1, 0.1, 0.2, 0.2, 0.9),
+            MockDetection::new(0.5, 0.5, 0.6, 0.6, 0.85),
+            MockDetection::new(0.8, 0.8, 0.9, 0.9, 0.95),
+        ];
+
+        let results = tracker.update(&detections, 1000);
+
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| r.is_some()));
+        assert_eq!(tracker.tracklets.len(), 3);
+    }
+
+    #[test]
+    fn test_bytetrack_tracklet_expiry() {
+        let mut tracker = ByteTrack::new();
+        tracker.track_extra_lifespan = 1000; // 1 second
+
+        // Create tracklet
+        let det1 = vec![MockDetection::new(0.1, 0.1, 0.3, 0.3, 0.9)];
+        tracker.update(&det1, 1000);
+        assert_eq!(tracker.tracklets.len(), 1);
+
+        // Update with no detections after lifespan expires
+        let empty: Vec<MockDetection> = vec![];
+        tracker.update(&empty, 3000); // 2 seconds later
+
+        assert!(tracker.tracklets.is_empty(), "Tracklet should have expired");
+    }
+
+    #[test]
+    fn test_bytetrack_get_active_tracks() {
+        let mut tracker = ByteTrack::new();
+
+        let detections = vec![
+            MockDetection::new(0.1, 0.1, 0.2, 0.2, 0.9),
+            MockDetection::new(0.5, 0.5, 0.6, 0.6, 0.85),
+        ];
+        tracker.update(&detections, 1000);
+
+        let active = <ByteTrack as Tracker<MockDetection>>::get_active_tracks(&tracker);
+        assert_eq!(active.len(), 2);
+        assert!(active.iter().all(|t| t.count == 1));
+        assert!(active.iter().all(|t| t.created == 1000));
+    }
+
+    #[test]
+    fn test_bytetrack_empty_detections() {
+        let mut tracker = ByteTrack::new();
+        let empty: Vec<MockDetection> = vec![];
+
+        let results = tracker.update(&empty, 1000);
+
+        assert!(results.is_empty());
+        assert!(tracker.tracklets.is_empty());
+        assert_eq!(tracker.frame_count, 1);
     }
 }

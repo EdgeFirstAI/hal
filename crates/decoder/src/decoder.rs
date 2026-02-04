@@ -1837,7 +1837,7 @@ impl DecoderBuilder {
                     "Invalid ModelPack Split Detection shape {:?}",
                     b.shape
                 )));
-            };
+            }
 
             Self::verify_dshapes(
                 &b.dshape,
