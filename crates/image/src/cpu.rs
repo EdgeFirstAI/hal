@@ -3086,7 +3086,8 @@ mod cpu_tests {
         // Top-left corner should be green
         assert_eq!(&data[0..3], &[0, 255, 0]);
 
-        // Center pixel (1,1): row=1, col=1, width=4, bytes=3 -> offset = (1*4 + 1) * 3 = 15
+        // Center pixel (1,1): row=1, col=1, width=4, bytes=3 -> offset = (1*4 + 1) * 3
+        // = 15
         let center_offset = 15;
         assert_eq!(&data[center_offset..center_offset + 3], &[0, 0, 0]);
     }
