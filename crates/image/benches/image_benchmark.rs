@@ -1,10 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
+mod common;
+
+use common::{dma_available, find_testdata_path, g2d_available};
+
 #[cfg(target_os = "linux")]
 use edgefirst_image::G2DProcessor;
-#[cfg(feature = "opengl")]
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "opengl", target_os = "linux"))]
 use edgefirst_image::GLProcessorThreaded;
 use edgefirst_image::{
     CPUProcessor, Crop, Flip, GREY, ImageProcessorTrait as _, NV16, PLANAR_RGB, RGB, RGBA,
@@ -12,7 +15,6 @@ use edgefirst_image::{
 };
 use edgefirst_tensor::{TensorMapTrait, TensorMemory, TensorTrait};
 use four_char_code::FourCharCode;
-use std::path::Path;
 
 trait TestImage {
     fn filename() -> &'static str;
@@ -99,20 +101,7 @@ where
     IMAGE: TestImage,
 {
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = Path::new("testdata").join(&name);
-    let path = match path.exists() {
-        true => path,
-        false => {
-            let path = Path::new("../testdata").join(&name);
-            if path.exists() {
-                path
-            } else {
-                Path::new("../../testdata").join(&name)
-            }
-        }
-    };
-
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     bencher.bench_local(|| {
         let file = std::fs::read(&path).unwrap();
@@ -128,20 +117,7 @@ where
     IMAGE: TestImage,
 {
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = Path::new("testdata").join(&name);
-    let path = match path.exists() {
-        true => path,
-        false => {
-            let path = Path::new("../testdata").join(&name);
-            if path.exists() {
-                path
-            } else {
-                Path::new("../../testdata").join(&name)
-            }
-        }
-    };
-
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     bencher.bench_local(|| {
         let file = std::fs::read(&path).unwrap();
@@ -157,20 +133,7 @@ where
     IMAGE: TestImage,
 {
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = Path::new("testdata").join(&name);
-    let path = match path.exists() {
-        true => path,
-        false => {
-            let path = Path::new("../testdata").join(&name);
-            if path.exists() {
-                path
-            } else {
-                Path::new("../../testdata").join(&name)
-            }
-        }
-    };
-
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     bencher.bench_local(|| {
         let file = std::fs::read(&path).unwrap();
@@ -202,20 +165,7 @@ where
 
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = Path::new("testdata").join(&name);
-    let path = match path.exists() {
-        true => path,
-        false => {
-            let path = Path::new("../testdata").join(&name);
-            if path.exists() {
-                path
-            } else {
-                Path::new("../../testdata").join(&name)
-            }
-        }
-    };
-
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     let file = std::fs::read(path).unwrap();
     let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Mem)).unwrap();
@@ -239,20 +189,7 @@ where
 
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = Path::new("testdata").join(&name);
-    let path = match path.exists() {
-        true => path,
-        false => {
-            let path = Path::new("../testdata").join(&name);
-            if path.exists() {
-                path
-            } else {
-                Path::new("../../testdata").join(&name)
-            }
-        }
-    };
-
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     let file = std::fs::read(path).unwrap();
     let src = TensorImage::load_jpeg(&file, Some(RGB), Some(TensorMemory::Mem)).unwrap();
@@ -276,20 +213,7 @@ where
 
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = Path::new("testdata").join(&name);
-    let path = match path.exists() {
-        true => path,
-        false => {
-            let path = Path::new("../testdata").join(&name);
-            if path.exists() {
-                path
-            } else {
-                Path::new("../../testdata").join(&name)
-            }
-        }
-    };
-
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     let file = std::fs::read(path).unwrap();
     let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
@@ -319,20 +243,7 @@ where
 
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = Path::new("testdata").join(&name);
-    let path = match path.exists() {
-        true => path,
-        false => {
-            let path = Path::new("../testdata").join(&name);
-            if path.exists() {
-                path
-            } else {
-                Path::new("../../testdata").join(&name)
-            }
-        }
-    };
-
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     let file = std::fs::read(path).unwrap();
     let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
@@ -356,20 +267,7 @@ where
 {
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = Path::new("testdata").join(&name);
-    let path = match path.exists() {
-        true => path,
-        false => {
-            let path = Path::new("../testdata").join(&name);
-            if path.exists() {
-                path
-            } else {
-                Path::new("../../testdata").join(&name)
-            }
-        }
-    };
-
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     let file = std::fs::read(path).unwrap();
 
@@ -399,20 +297,7 @@ where
 {
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = Path::new("testdata").join(&name);
-    let path = match path.exists() {
-        true => path,
-        false => {
-            let path = Path::new("../testdata").join(&name);
-            if path.exists() {
-                path
-            } else {
-                Path::new("../../testdata").join(&name)
-            }
-        }
-    };
-
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     let file = std::fs::read(path).unwrap();
 
@@ -442,20 +327,7 @@ where
 {
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = Path::new("testdata").join(&name);
-    let path = match path.exists() {
-        true => path,
-        false => {
-            let path = Path::new("../testdata").join(&name);
-            if path.exists() {
-                path
-            } else {
-                Path::new("../../testdata").join(&name)
-            }
-        }
-    };
-
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     let file = std::fs::read(path).unwrap();
 
@@ -498,20 +370,7 @@ where
 {
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = Path::new("testdata").join(&name);
-    let path = match path.exists() {
-        true => path,
-        false => {
-            let path = Path::new("../testdata").join(&name);
-            if path.exists() {
-                path
-            } else {
-                Path::new("../../testdata").join(&name)
-            }
-        }
-    };
-
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     let file = std::fs::read(path).unwrap();
 
@@ -554,20 +413,7 @@ where
 {
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = Path::new("testdata").join(&name);
-    let path = match path.exists() {
-        true => path,
-        false => {
-            let path = Path::new("../testdata").join(&name);
-            if path.exists() {
-                path
-            } else {
-                Path::new("../../testdata").join(&name)
-            }
-        }
-    };
-
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     let file = std::fs::read(path).unwrap();
 
@@ -598,20 +444,7 @@ where
 {
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = Path::new("testdata").join(&name);
-    let path = match path.exists() {
-        true => path,
-        false => {
-            let path = Path::new("../testdata").join(&name);
-            if path.exists() {
-                path
-            } else {
-                Path::new("../../testdata").join(&name)
-            }
-        }
-    };
-
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     let file = std::fs::read(path).unwrap();
 
@@ -653,16 +486,7 @@ where
     IMAGE: TestImage,
 {
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = if Path::new("./testdata").join(&name).exists() {
-        Path::new("./testdata").join(&name)
-    } else if Path::new("../testdata").join(&name).exists() {
-        Path::new("../testdata").join(&name)
-    } else if Path::new("../../testdata").join(&name).exists() {
-        Path::new("../../testdata").join(&name)
-    } else {
-        Path::new("../../../testdata").join(&name)
-    };
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     let file = std::fs::read(path).unwrap();
 
@@ -1066,6 +890,14 @@ fn convert_opengl_yuyv_to_rgba(bencher: divan::Bencher, params: (usize, usize)) 
     drop(dst);
 }
 
+// NOTE: OpenGL YUYV→YUYV is not supported - OpenGL cannot render to YUYV
+// textures. A future implementation could render to RGBA and encode YUYV in the
+// shader. #[cfg(target_os = "linux")]
+// #[cfg(feature = "opengl")]
+// #[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)],
+// ignore = !dma_available())] fn convert_opengl_yuyv_to_yuyv(bencher:
+// divan::Bencher, params: (usize, usize)) { ... }
+
 #[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
 #[divan::bench(args = [(640, 360), (960, 540), (512, 512), (1280, 720), (1920, 1080)], ignore = !gl_available() || !dma_available())]
@@ -1098,20 +930,7 @@ where
 {
     let (width, height) = size;
     let name = format!("{}.jpg", IMAGE::filename());
-    let path = Path::new("testdata").join(&name);
-    let path = match path.exists() {
-        true => path,
-        false => {
-            let path = Path::new("../testdata").join(&name);
-            if path.exists() {
-                path
-            } else {
-                Path::new("../../testdata").join(&name)
-            }
-        }
-    };
-
-    assert!(path.exists(), "unable to locate test image at {path:?}");
+    let path = find_testdata_path(&name);
 
     let file = std::fs::read(path).unwrap();
 
@@ -1146,37 +965,850 @@ where
     drop(g2d_dst);
 }
 
+// =============================================================================
+// High-Resolution Benchmarks (1080p and 4K sources)
+// For EDGEAI-773 Vision Pipeline Optimizations
+// =============================================================================
+
+// Source resolutions for hi-res benchmarks
+const SRC_1080P: (usize, usize) = (1920, 1080);
+const SRC_4K: (usize, usize) = (3840, 2160);
+
+// Helper to load 1080p YUYV test data
+fn load_yuyv_1080p() -> TensorImage {
+    let file = include_bytes!("../../../testdata/camera1080p.yuyv").to_vec();
+    let src = TensorImage::new(SRC_1080P.0, SRC_1080P.1, YUYV, None).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+    src
+}
+
+// Helper to load 4K YUYV test data
+fn load_yuyv_4k() -> TensorImage {
+    let file = include_bytes!("../../../testdata/camera4k.yuyv").to_vec();
+    let src = TensorImage::new(SRC_4K.0, SRC_4K.1, YUYV, None).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+    src
+}
+
+// Helper to load 1080p RGBA test data
+fn load_rgba_1080p() -> TensorImage {
+    let file = include_bytes!("../../../testdata/camera1080p.rgba").to_vec();
+    let src = TensorImage::new(SRC_1080P.0, SRC_1080P.1, RGBA, None).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+    src
+}
+
+// Helper to load 4K RGBA test data
+fn load_rgba_4k() -> TensorImage {
+    let file = include_bytes!("../../../testdata/camera4k.rgba").to_vec();
+    let src = TensorImage::new(SRC_4K.0, SRC_4K.1, RGBA, None).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+    src
+}
+
+// Helper to load 1080p RGB test data (converted from RGBA)
+fn load_rgb_1080p() -> TensorImage {
+    let rgba = load_rgba_1080p();
+    let mut rgb = TensorImage::new(SRC_1080P.0, SRC_1080P.1, RGB, None).unwrap();
+    let mut cpu = CPUProcessor::new();
+    cpu.convert(&rgba, &mut rgb, Rotation::None, Flip::None, Crop::no_crop())
+        .unwrap();
+    rgb
+}
+
+// Helper to load 4K RGB test data (converted from RGBA)
+fn load_rgb_4k() -> TensorImage {
+    let rgba = load_rgba_4k();
+    let mut rgb = TensorImage::new(SRC_4K.0, SRC_4K.1, RGB, None).unwrap();
+    let mut cpu = CPUProcessor::new();
+    cpu.convert(&rgba, &mut rgb, Rotation::None, Flip::None, Crop::no_crop())
+        .unwrap();
+    rgb
+}
+
+// -----------------------------------------------------------------------------
+// CPU Benchmarks - 1080p Source
+// -----------------------------------------------------------------------------
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn hires_cpu_1080p_yuyv_to_yuyv(bencher: divan::Bencher, size: (usize, usize)) {
+    let src = load_yuyv_1080p();
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, YUYV, None).unwrap();
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn hires_cpu_1080p_yuyv_to_rgba(bencher: divan::Bencher, size: (usize, usize)) {
+    let src = load_yuyv_1080p();
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn hires_cpu_1080p_yuyv_to_rgb(bencher: divan::Bencher, size: (usize, usize)) {
+    let src = load_yuyv_1080p();
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGB, None).unwrap();
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn hires_cpu_1080p_rgba_to_rgba(bencher: divan::Bencher, size: (usize, usize)) {
+    let src = load_rgba_1080p();
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn hires_cpu_1080p_rgba_to_rgb(bencher: divan::Bencher, size: (usize, usize)) {
+    let src = load_rgba_1080p();
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGB, None).unwrap();
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn hires_cpu_1080p_rgb_to_rgb(bencher: divan::Bencher, size: (usize, usize)) {
+    let src = load_rgb_1080p();
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGB, None).unwrap();
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn hires_cpu_1080p_rgb_to_rgba(bencher: divan::Bencher, size: (usize, usize)) {
+    let src = load_rgb_1080p();
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+// -----------------------------------------------------------------------------
+// CPU Benchmarks - 4K Source
+// -----------------------------------------------------------------------------
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)])]
+fn hires_cpu_4k_yuyv_to_yuyv(bencher: divan::Bencher, size: (usize, usize)) {
+    let src = load_yuyv_4k();
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, YUYV, None).unwrap();
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)])]
+fn hires_cpu_4k_yuyv_to_rgba(bencher: divan::Bencher, size: (usize, usize)) {
+    let src = load_yuyv_4k();
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)])]
+fn hires_cpu_4k_yuyv_to_rgb(bencher: divan::Bencher, size: (usize, usize)) {
+    let src = load_yuyv_4k();
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGB, None).unwrap();
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)])]
+fn hires_cpu_4k_rgba_to_rgba(bencher: divan::Bencher, size: (usize, usize)) {
+    let src = load_rgba_4k();
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)])]
+fn hires_cpu_4k_rgba_to_rgb(bencher: divan::Bencher, size: (usize, usize)) {
+    let src = load_rgba_4k();
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGB, None).unwrap();
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)])]
+fn hires_cpu_4k_rgb_to_rgb(bencher: divan::Bencher, size: (usize, usize)) {
+    let src = load_rgb_4k();
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGB, None).unwrap();
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)])]
+fn hires_cpu_4k_rgb_to_rgba(bencher: divan::Bencher, size: (usize, usize)) {
+    let src = load_rgb_4k();
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
+    let mut converter = CPUProcessor::new();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+// -----------------------------------------------------------------------------
+// G2D Benchmarks - 1080p Source (requires DMA)
+// -----------------------------------------------------------------------------
+
 #[cfg(target_os = "linux")]
-fn dma_available() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        dma_heap::Heap::new(dma_heap::HeapKind::Cma)
-            .or_else(|_| dma_heap::Heap::new(dma_heap::HeapKind::System))
-            .is_ok()
-    }
-    #[cfg(not(target_os = "linux"))]
-    false
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+fn hires_g2d_1080p_yuyv_to_yuyv(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera1080p.yuyv").to_vec();
+    let src = TensorImage::new(SRC_1080P.0, SRC_1080P.1, YUYV, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, YUYV, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = G2DProcessor::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
 }
 
 #[cfg(target_os = "linux")]
-fn g2d_available() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        edgefirst_image::G2DProcessor::new().is_ok()
-    }
-    #[cfg(not(target_os = "linux"))]
-    false
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+fn hires_g2d_1080p_yuyv_to_rgba(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera1080p.yuyv").to_vec();
+    let src = TensorImage::new(SRC_1080P.0, SRC_1080P.1, YUYV, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = G2DProcessor::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+fn hires_g2d_1080p_yuyv_to_rgb(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera1080p.yuyv").to_vec();
+    let src = TensorImage::new(SRC_1080P.0, SRC_1080P.1, YUYV, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGB, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = G2DProcessor::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+fn hires_g2d_1080p_rgba_to_rgba(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera1080p.rgba").to_vec();
+    let src = TensorImage::new(SRC_1080P.0, SRC_1080P.1, RGBA, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = G2DProcessor::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+fn hires_g2d_1080p_rgba_to_rgb(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera1080p.rgba").to_vec();
+    let src = TensorImage::new(SRC_1080P.0, SRC_1080P.1, RGBA, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGB, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = G2DProcessor::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+fn hires_g2d_1080p_rgba_to_yuyv(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera1080p.rgba").to_vec();
+    let src = TensorImage::new(SRC_1080P.0, SRC_1080P.1, RGBA, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, YUYV, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = G2DProcessor::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+// -----------------------------------------------------------------------------
+// G2D Benchmarks - 4K Source (requires DMA)
+// -----------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)], ignore = !dma_available())]
+fn hires_g2d_4k_yuyv_to_yuyv(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera4k.yuyv").to_vec();
+    let src = TensorImage::new(SRC_4K.0, SRC_4K.1, YUYV, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, YUYV, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = G2DProcessor::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)], ignore = !dma_available())]
+fn hires_g2d_4k_yuyv_to_rgba(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera4k.yuyv").to_vec();
+    let src = TensorImage::new(SRC_4K.0, SRC_4K.1, YUYV, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = G2DProcessor::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)], ignore = !dma_available())]
+fn hires_g2d_4k_yuyv_to_rgb(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera4k.yuyv").to_vec();
+    let src = TensorImage::new(SRC_4K.0, SRC_4K.1, YUYV, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGB, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = G2DProcessor::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)], ignore = !dma_available())]
+fn hires_g2d_4k_rgba_to_rgba(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera4k.rgba").to_vec();
+    let src = TensorImage::new(SRC_4K.0, SRC_4K.1, RGBA, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = G2DProcessor::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)], ignore = !dma_available())]
+fn hires_g2d_4k_rgba_to_rgb(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera4k.rgba").to_vec();
+    let src = TensorImage::new(SRC_4K.0, SRC_4K.1, RGBA, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGB, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = G2DProcessor::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)], ignore = !dma_available())]
+fn hires_g2d_4k_rgba_to_yuyv(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera4k.rgba").to_vec();
+    let src = TensorImage::new(SRC_4K.0, SRC_4K.1, RGBA, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, YUYV, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = G2DProcessor::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+}
+
+// -----------------------------------------------------------------------------
+// OpenGL Benchmarks - 1080p Source (DMA for YUYV input)
+// -----------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+fn hires_opengl_1080p_yuyv_to_rgba(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera1080p.yuyv").to_vec();
+    let src = TensorImage::new(SRC_1080P.0, SRC_1080P.1, YUYV, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = GLProcessorThreaded::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+    drop(dst);
 }
 
 #[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)], ignore = !dma_available())]
+fn hires_opengl_1080p_rgba_to_rgba_dma(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera1080p.rgba").to_vec();
+    let src = TensorImage::new(SRC_1080P.0, SRC_1080P.1, RGBA, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = GLProcessorThreaded::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+    drop(dst);
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn hires_opengl_1080p_rgba_to_rgba_mem(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera1080p.rgba").to_vec();
+    let src = TensorImage::new(SRC_1080P.0, SRC_1080P.1, RGBA, Some(TensorMemory::Mem)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Mem)).unwrap();
+    let mut converter = GLProcessorThreaded::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+    drop(dst);
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn hires_opengl_1080p_rgba_to_rgb_mem(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera1080p.rgba").to_vec();
+    let src = TensorImage::new(SRC_1080P.0, SRC_1080P.1, RGBA, Some(TensorMemory::Mem)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGB, Some(TensorMemory::Mem)).unwrap();
+    let mut converter = GLProcessorThreaded::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+    drop(dst);
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn hires_opengl_1080p_rgb_to_rgb_mem(bencher: divan::Bencher, size: (usize, usize)) {
+    let rgba = load_rgba_1080p();
+    let mut src = TensorImage::new(SRC_1080P.0, SRC_1080P.1, RGB, Some(TensorMemory::Mem)).unwrap();
+    let mut cpu = CPUProcessor::new();
+    cpu.convert(&rgba, &mut src, Rotation::None, Flip::None, Crop::no_crop())
+        .unwrap();
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGB, Some(TensorMemory::Mem)).unwrap();
+    let mut converter = GLProcessorThreaded::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+    drop(dst);
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080)])]
+fn hires_opengl_1080p_rgb_to_rgba_mem(bencher: divan::Bencher, size: (usize, usize)) {
+    let rgba = load_rgba_1080p();
+    let mut src = TensorImage::new(SRC_1080P.0, SRC_1080P.1, RGB, Some(TensorMemory::Mem)).unwrap();
+    let mut cpu = CPUProcessor::new();
+    cpu.convert(&rgba, &mut src, Rotation::None, Flip::None, Crop::no_crop())
+        .unwrap();
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Mem)).unwrap();
+    let mut converter = GLProcessorThreaded::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+    drop(dst);
+}
+
+// -----------------------------------------------------------------------------
+// OpenGL Benchmarks - 4K Source (DMA for YUYV input)
+// -----------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)], ignore = !dma_available())]
+fn hires_opengl_4k_yuyv_to_rgba(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera4k.yuyv").to_vec();
+    let src = TensorImage::new(SRC_4K.0, SRC_4K.1, YUYV, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = GLProcessorThreaded::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+    drop(dst);
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)], ignore = !dma_available())]
+fn hires_opengl_4k_rgba_to_rgba_dma(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera4k.rgba").to_vec();
+    let src = TensorImage::new(SRC_4K.0, SRC_4K.1, RGBA, Some(TensorMemory::Dma)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
+    let mut converter = GLProcessorThreaded::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+    drop(dst);
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)])]
+fn hires_opengl_4k_rgba_to_rgba_mem(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera4k.rgba").to_vec();
+    let src = TensorImage::new(SRC_4K.0, SRC_4K.1, RGBA, Some(TensorMemory::Mem)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Mem)).unwrap();
+    let mut converter = GLProcessorThreaded::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+    drop(dst);
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)])]
+fn hires_opengl_4k_rgba_to_rgb_mem(bencher: divan::Bencher, size: (usize, usize)) {
+    let file = include_bytes!("../../../testdata/camera4k.rgba").to_vec();
+    let src = TensorImage::new(SRC_4K.0, SRC_4K.1, RGBA, Some(TensorMemory::Mem)).unwrap();
+    src.tensor()
+        .map()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(&file);
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGB, Some(TensorMemory::Mem)).unwrap();
+    let mut converter = GLProcessorThreaded::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+    drop(dst);
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)])]
+fn hires_opengl_4k_rgb_to_rgb_mem(bencher: divan::Bencher, size: (usize, usize)) {
+    let rgba = load_rgba_4k();
+    let mut src = TensorImage::new(SRC_4K.0, SRC_4K.1, RGB, Some(TensorMemory::Mem)).unwrap();
+    let mut cpu = CPUProcessor::new();
+    cpu.convert(&rgba, &mut src, Rotation::None, Flip::None, Crop::no_crop())
+        .unwrap();
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGB, Some(TensorMemory::Mem)).unwrap();
+    let mut converter = GLProcessorThreaded::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+    drop(dst);
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[divan::bench(args = [(640, 360), (960, 540), (1280, 720), (1920, 1080), (3840, 2160)])]
+fn hires_opengl_4k_rgb_to_rgba_mem(bencher: divan::Bencher, size: (usize, usize)) {
+    let rgba = load_rgba_4k();
+    let mut src = TensorImage::new(SRC_4K.0, SRC_4K.1, RGB, Some(TensorMemory::Mem)).unwrap();
+    let mut cpu = CPUProcessor::new();
+    cpu.convert(&rgba, &mut src, Rotation::None, Flip::None, Crop::no_crop())
+        .unwrap();
+
+    let (width, height) = size;
+    let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Mem)).unwrap();
+    let mut converter = GLProcessorThreaded::new().unwrap();
+
+    bencher.bench_local(|| {
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap()
+    });
+    drop(dst);
+}
+
+#[cfg(all(target_os = "linux", feature = "opengl"))]
 fn gl_available() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        edgefirst_image::GLProcessorThreaded::new().is_ok()
-    }
-    #[cfg(not(target_os = "linux"))]
-    false
+    common::opengl_available()
 }
 
 fn main() {

@@ -16,6 +16,8 @@ coverage.xml
 *sbom.json
 *.cdx.json
 
+env.sh
+
 # Ignore Local Notes
 /AUDIT.md
 /STATUS.md
@@ -23,3 +25,4 @@ coverage.xml
 
 /SPS/
 /WP1/
+*.profraw

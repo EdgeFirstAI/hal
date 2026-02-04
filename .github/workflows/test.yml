@@ -87,13 +87,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
-          lfs: false  # LFS files downloaded separately
+          lfs: true  # Doc tests use include_str!/include_bytes! which need LFS at compile time
 
-      - name: Download LFS testdata
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
-        with:
-          name: testdata-lfs
-          path: testdata/
+      - name: Install OpenCV build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev libopencv-dev
 
       - name: Set up Rust stable toolchain
         uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
@@ -133,6 +132,11 @@ jobs:
         with:
           name: testdata-lfs
           path: testdata/
+
+      - name: Install OpenCV build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev libopencv-dev
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
@@ -174,7 +178,8 @@ jobs:
         run: cargo +nightly fmt --all -- --check 2>/dev/null || cargo fmt --all -- --check
 
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        # Use default,opencv features; exclude g2d_test_formats,dma_test_formats (on-target only)
+        run: cargo clippy --workspace --all-targets --features default,opencv -- -D warnings
 
       - name: Set up coverage instrumentation
         run: .github/scripts/setup-coverage-env.sh
@@ -193,7 +198,8 @@ jobs:
         run: |
           set -o pipefail
           # Run tests but don't generate report yet - we'll combine with Python test coverage
-          cargo llvm-cov nextest --cargo-profile profiling --all-features --workspace \
+          # Use default,opencv features; exclude g2d_test_formats,dma_test_formats (on-target only)
+          cargo llvm-cov nextest --cargo-profile profiling --features default,opencv --workspace \
             --no-report \
             2>&1 | tee target/test-metrics-rust-x86_64.txt
 
@@ -281,7 +287,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential python3-dev
+          sudo apt-get install -y build-essential python3-dev clang libclang-dev libopencv-dev
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
@@ -326,7 +332,8 @@ jobs:
         run: cargo +nightly fmt --all -- --check 2>/dev/null || cargo fmt --all -- --check
 
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        # Use default,opencv features; exclude g2d_test_formats,dma_test_formats (on-target only)
+        run: cargo clippy --workspace --all-targets --features default,opencv -- -D warnings
 
       - name: Set up coverage instrumentation
         run: .github/scripts/setup-coverage-env.sh
@@ -346,7 +353,8 @@ jobs:
         run: |
           set -o pipefail
           # Run tests but don't generate report yet - we'll combine with Python test coverage
-          cargo llvm-cov nextest --cargo-profile profiling --all-features --workspace \
+          # Use default,opencv features; exclude g2d_test_formats,dma_test_formats (on-target only)
+          cargo llvm-cov nextest --cargo-profile profiling --features default,opencv --workspace \
             --no-report \
             2>&1 | tee target/test-metrics-rust-aarch64.txt
 

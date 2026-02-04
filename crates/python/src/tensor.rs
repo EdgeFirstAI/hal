@@ -309,6 +309,45 @@ impl TensorMapT {
             TensorMapT::TensorF64(_) => std::mem::size_of::<f64>(),
         }
     }
+
+    /// Get value at index and convert to Python object
+    pub fn get_value_at(&self, index: usize, py: Python) -> PyResult<Py<PyAny>> {
+        if index >= self.size() {
+            return Err(PyBufferError::new_err("Index out of bounds"));
+        }
+        match self {
+            TensorMapT::TensorU8(m) => Ok(m.as_ref()[index].into_pyobject(py)?.into()),
+            TensorMapT::TensorI8(m) => Ok(m.as_ref()[index].into_pyobject(py)?.into()),
+            TensorMapT::TensorU16(m) => Ok(m.as_ref()[index].into_pyobject(py)?.into()),
+            TensorMapT::TensorI16(m) => Ok(m.as_ref()[index].into_pyobject(py)?.into()),
+            TensorMapT::TensorU32(m) => Ok(m.as_ref()[index].into_pyobject(py)?.into()),
+            TensorMapT::TensorI32(m) => Ok(m.as_ref()[index].into_pyobject(py)?.into()),
+            TensorMapT::TensorU64(m) => Ok(m.as_ref()[index].into_pyobject(py)?.into()),
+            TensorMapT::TensorI64(m) => Ok(m.as_ref()[index].into_pyobject(py)?.into()),
+            TensorMapT::TensorF32(m) => Ok(m.as_ref()[index].into_pyobject(py)?.into()),
+            TensorMapT::TensorF64(m) => Ok(m.as_ref()[index].into_pyobject(py)?.into()),
+        }
+    }
+
+    /// Set value at index from Python object
+    pub fn set_value_at(&mut self, index: usize, value: Py<PyAny>, py: Python) -> PyResult<()> {
+        if index >= self.size() {
+            return Err(PyBufferError::new_err("Index out of bounds"));
+        }
+        match self {
+            TensorMapT::TensorU8(m) => m.as_mut()[index] = value.extract::<u8>(py)?,
+            TensorMapT::TensorI8(m) => m.as_mut()[index] = value.extract::<i8>(py)?,
+            TensorMapT::TensorU16(m) => m.as_mut()[index] = value.extract::<u16>(py)?,
+            TensorMapT::TensorI16(m) => m.as_mut()[index] = value.extract::<i16>(py)?,
+            TensorMapT::TensorU32(m) => m.as_mut()[index] = value.extract::<u32>(py)?,
+            TensorMapT::TensorI32(m) => m.as_mut()[index] = value.extract::<i32>(py)?,
+            TensorMapT::TensorU64(m) => m.as_mut()[index] = value.extract::<u64>(py)?,
+            TensorMapT::TensorI64(m) => m.as_mut()[index] = value.extract::<i64>(py)?,
+            TensorMapT::TensorF32(m) => m.as_mut()[index] = value.extract::<f32>(py)?,
+            TensorMapT::TensorF64(m) => m.as_mut()[index] = value.extract::<f64>(py)?,
+        }
+        Ok(())
+    }
 }
 
 #[pyclass(name = "Tensor", str)]
@@ -520,78 +559,7 @@ impl PyTensorMap {
 
     fn __getitem__(&self, index: usize, py: Python) -> PyResult<Py<PyAny>> {
         if let Some(map) = &self.mapped {
-            match map {
-                TensorMapT::TensorU8(m) => {
-                    if index < m.size() {
-                        Ok(m.as_ref()[index].into_pyobject(py)?.into())
-                    } else {
-                        Err(PyBufferError::new_err("Index out of bounds"))
-                    }
-                }
-                TensorMapT::TensorI8(m) => {
-                    if index < m.size() {
-                        Ok(m.as_ref()[index].into_pyobject(py)?.into())
-                    } else {
-                        Err(PyBufferError::new_err("Index out of bounds"))
-                    }
-                }
-                TensorMapT::TensorU16(m) => {
-                    if index < m.size() {
-                        Ok(m.as_ref()[index].into_pyobject(py)?.into())
-                    } else {
-                        Err(PyBufferError::new_err("Index out of bounds"))
-                    }
-                }
-                TensorMapT::TensorI16(m) => {
-                    if index < m.size() {
-                        Ok(m.as_ref()[index].into_pyobject(py)?.into())
-                    } else {
-                        Err(PyBufferError::new_err("Index out of bounds"))
-                    }
-                }
-                TensorMapT::TensorU32(m) => {
-                    if index < m.size() {
-                        Ok(m.as_ref()[index].into_pyobject(py)?.into())
-                    } else {
-                        Err(PyBufferError::new_err("Index out of bounds"))
-                    }
-                }
-                TensorMapT::TensorI32(m) => {
-                    if index < m.size() {
-                        Ok(m.as_ref()[index].into_pyobject(py)?.into())
-                    } else {
-                        Err(PyBufferError::new_err("Index out of bounds"))
-                    }
-                }
-                TensorMapT::TensorU64(m) => {
-                    if index < m.size() {
-                        Ok(m.as_ref()[index].into_pyobject(py)?.into())
-                    } else {
-                        Err(PyBufferError::new_err("Index out of bounds"))
-                    }
-                }
-                TensorMapT::TensorI64(m) => {
-                    if index < m.size() {
-                        Ok(m.as_ref()[index].into_pyobject(py)?.into())
-                    } else {
-                        Err(PyBufferError::new_err("Index out of bounds"))
-                    }
-                }
-                TensorMapT::TensorF32(m) => {
-                    if index < m.size() {
-                        Ok(m.as_ref()[index].into_pyobject(py)?.into())
-                    } else {
-                        Err(PyBufferError::new_err("Index out of bounds"))
-                    }
-                }
-                TensorMapT::TensorF64(m) => {
-                    if index < m.size() {
-                        Ok(m.as_ref()[index].into_pyobject(py)?.into())
-                    } else {
-                        Err(PyBufferError::new_err("Index out of bounds"))
-                    }
-                }
-            }
+            map.get_value_at(index, py)
         } else {
             Err(PyBufferError::new_err("Buffer not mapped"))
         }
@@ -599,88 +567,7 @@ impl PyTensorMap {
 
     fn __setitem__(&mut self, index: usize, value: Py<PyAny>, py: Python) -> PyResult<()> {
         if let Some(map) = &mut self.mapped {
-            match map {
-                TensorMapT::TensorU8(m) => {
-                    if index < m.size() {
-                        m.as_mut()[index] = value.extract::<u8>(py)?;
-                        Ok(())
-                    } else {
-                        Err(PyBufferError::new_err("Index out of bounds"))
-                    }
-                }
-                TensorMapT::TensorI8(m) => {
-                    if index < m.size() {
-                        m.as_mut()[index] = value.extract::<i8>(py)?;
-                        Ok(())
-                    } else {
-                        Err(PyBufferError::new_err("Index out of bounds"))
-                    }
-                }
-                TensorMapT::TensorU16(m) => {
-                    if index < m.size() {
-                        m.as_mut()[index] = value.extract::<u16>(py)?;
-                        Ok(())
-                    } else {
-                        Err(PyBufferError::new_err("Index out of bounds"))
-                    }
-                }
-                TensorMapT::TensorI16(m) => {
-                    if index < m.size() {
-                        m.as_mut()[index] = value.extract::<i16>(py)?;
-                        Ok(())
-                    } else {
-                        Err(PyBufferError::new_err("Index out of bounds"))
-                    }
-                }
-                TensorMapT::TensorU32(m) => {
-                    if index < m.size() {
-                        m.as_mut()[index] = value.extract::<u32>(py)?;
-                        Ok(())
-                    } else {
-                        Err(PyBufferError::new_err("Index out of bounds"))
-                    }
-                }
-                TensorMapT::TensorI32(m) => {
-                    if index < m.size() {
-                        m.as_mut()[index] = value.extract::<i32>(py)?;
-                        Ok(())
-                    } else {
-                        Err(PyBufferError::new_err("Index out of bounds"))
-                    }
-                }
-                TensorMapT::TensorU64(m) => {
-                    if index < m.size() {
-                        m.as_mut()[index] = value.extract::<u64>(py)?;
-                        Ok(())
-                    } else {
-                        Err(PyBufferError::new_err("Index out of bounds"))
-                    }
-                }
-                TensorMapT::TensorI64(m) => {
-                    if index < m.size() {
-                        m.as_mut()[index] = value.extract::<i64>(py)?;
-                        Ok(())
-                    } else {
-                        Err(PyBufferError::new_err("Index out of bounds"))
-                    }
-                }
-                TensorMapT::TensorF32(m) => {
-                    if index < m.size() {
-                        m.as_mut()[index] = value.extract::<f32>(py)?;
-                        Ok(())
-                    } else {
-                        Err(PyBufferError::new_err("Index out of bounds"))
-                    }
-                }
-                TensorMapT::TensorF64(m) => {
-                    if index < m.size() {
-                        m.as_mut()[index] = value.extract::<f64>(py)?;
-                        Ok(())
-                    } else {
-                        Err(PyBufferError::new_err("Index out of bounds"))
-                    }
-                }
-            }
+            map.set_value_at(index, value, py)
         } else {
             Err(PyBufferError::new_err("Buffer not mapped"))
         }
