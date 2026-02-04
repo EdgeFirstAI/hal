@@ -3065,7 +3065,8 @@ mod cpu_tests {
         assert_eq!(&data[0..4], &[255, 0, 0, 255]);
 
         // Center pixel (1,1) should still be zero (inside crop)
-        let center_offset = (1 * 4 + 1) * 4; // row 1, col 1, 4 bytes per pixel
+        // row=1, col=1, width=4, bytes_per_pixel=4 -> offset = (1*4 + 1) * 4 = 20
+        let center_offset = 20;
         assert_eq!(&data[center_offset..center_offset + 4], &[0, 0, 0, 0]);
     }
 
@@ -3085,8 +3086,8 @@ mod cpu_tests {
         // Top-left corner should be green
         assert_eq!(&data[0..3], &[0, 255, 0]);
 
-        // Center should be unchanged
-        let center_offset = (1 * 4 + 1) * 3;
+        // Center pixel (1,1): row=1, col=1, width=4, bytes=3 -> offset = (1*4 + 1) * 3 = 15
+        let center_offset = 15;
         assert_eq!(&data[center_offset..center_offset + 3], &[0, 0, 0]);
     }
 
@@ -3109,8 +3110,8 @@ mod cpu_tests {
         assert_eq!(data[16], 64); // G plane, pixel 0
         assert_eq!(data[32], 32); // B plane, pixel 0
 
-        // Center pixel (1,1) should be unchanged (inside crop)
-        let center_idx = 1 * 4 + 1; // row 1, col 1 = index 5
+        // Center pixel (1,1): row=1, col=1, width=4 -> index = 1*4 + 1 = 5
+        let center_idx = 5;
         assert_eq!(data[center_idx], 0); // R
         assert_eq!(data[16 + center_idx], 0); // G
         assert_eq!(data[32 + center_idx], 0); // B
