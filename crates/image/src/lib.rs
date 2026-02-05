@@ -1681,14 +1681,17 @@ mod image_tests {
 
     #[test]
     fn test_disable_env_var() -> Result<(), Error> {
-        let original = std::env::var("EDGEFIRST_DISABLE_G2D").ok();
-        unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", "1") };
-        let converter = ImageProcessor::new()?;
-        match original {
-            Some(s) => unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", s) },
-            None => unsafe { std::env::remove_var("EDGEFIRST_DISABLE_G2D") },
+        #[cfg(target_os = "linux")]
+        {
+            let original = std::env::var("EDGEFIRST_DISABLE_G2D").ok();
+            unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", "1") };
+            let converter = ImageProcessor::new()?;
+            match original {
+                Some(s) => unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", s) },
+                None => unsafe { std::env::remove_var("EDGEFIRST_DISABLE_G2D") },
+            }
+            assert!(converter.g2d.is_none());
         }
-        assert!(converter.g2d.is_none());
 
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
@@ -1850,33 +1853,23 @@ mod image_tests {
         ));
     }
 
+    // Helper function to check if G2D library is available (Linux/i.MX8 only)
+    #[cfg(target_os = "linux")]
     static G2D_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // Helper function to check if G2D library is available
-    fn is_g2d_available() -> bool {
-        #[cfg(target_os = "linux")]
-        {
-            *G2D_AVAILABLE.get_or_init(|| G2DProcessor::new().is_ok())
-        }
 
-        #[cfg(not(target_os = "linux"))]
-        {
-            false
-        }
+    #[cfg(target_os = "linux")]
+    fn is_g2d_available() -> bool {
+        *G2D_AVAILABLE.get_or_init(|| G2DProcessor::new().is_ok())
     }
 
+    #[cfg(target_os = "linux")]
     static DMA_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // Helper function to check if DMA memory allocation is available
-    fn is_dma_available() -> bool {
-        #[cfg(target_os = "linux")]
-        {
-            *DMA_AVAILABLE
-                .get_or_init(|| Tensor::<u8>::new(&[64], Some(TensorMemory::Dma), None).is_ok())
-        }
 
-        #[cfg(not(target_os = "linux"))]
-        {
-            false
-        }
+    // Helper function to check if DMA memory allocation is available
+    #[cfg(target_os = "linux")]
+    fn is_dma_available() -> bool {
+        *DMA_AVAILABLE
+            .get_or_init(|| Tensor::<u8>::new(&[64], Some(TensorMemory::Dma), None).is_ok())
     }
 
     #[cfg(target_os = "linux")]
