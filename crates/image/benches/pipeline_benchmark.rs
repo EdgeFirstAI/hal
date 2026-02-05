@@ -23,11 +23,11 @@
 
 mod common;
 
-use common::{calculate_letterbox, get_test_data, BenchConfig};
 #[cfg(target_os = "linux")]
 use common::g2d_available;
 #[cfg(all(target_os = "linux", feature = "opengl"))]
 use common::opengl_available;
+use common::{calculate_letterbox, get_test_data, BenchConfig};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
 #[cfg(target_os = "linux")]
@@ -38,9 +38,9 @@ use edgefirst_image::{
     CPUProcessor, Crop, Flip, ImageProcessorTrait, Rect, Rotation, TensorImage, NV12, RGB, RGBA,
     YUYV,
 };
-use edgefirst_tensor::{TensorMapTrait, TensorTrait};
 #[cfg(target_os = "linux")]
 use edgefirst_tensor::TensorMemory;
+use edgefirst_tensor::{TensorMapTrait, TensorTrait};
 
 #[cfg(feature = "opencv")]
 use opencv::{
