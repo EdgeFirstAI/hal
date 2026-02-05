@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
-use edgefirst::decoder::{
+use edgefirst_hal::decoder::{
     Decoder, DecoderBuilder, DetectBox, Quantization, Segmentation, configs::Nms, dequantize_cpu,
     modelpack::ModelPackDetectionConfig, segmentation_to_mask,
 };
@@ -375,14 +375,14 @@ impl PyDecoder {
         let mut output_boxes = Vec::with_capacity(max_boxes);
         let nms: Option<Nms> = nms.map(|py_nms| py_nms.into());
         match boxes {
-            ReadOnlyArrayGeneric2::UInt8(output) => edgefirst::decoder::yolo::decode_yolo_det(
+            ReadOnlyArrayGeneric2::UInt8(output) => edgefirst_hal::decoder::yolo::decode_yolo_det(
                 (output.as_array(), Quantization::from(quant_boxes)),
                 score_threshold as f32,
                 iou_threshold as f32,
                 nms,
                 &mut output_boxes,
             ),
-            ReadOnlyArrayGeneric2::Int8(output) => edgefirst::decoder::yolo::decode_yolo_det(
+            ReadOnlyArrayGeneric2::Int8(output) => edgefirst_hal::decoder::yolo::decode_yolo_det(
                 (output.as_array(), Quantization::from(quant_boxes)),
                 score_threshold as f32,
                 iou_threshold as f32,
@@ -390,7 +390,7 @@ impl PyDecoder {
                 &mut output_boxes,
             ),
             ReadOnlyArrayGeneric2::Float32(output) => {
-                edgefirst::decoder::yolo::decode_yolo_det_float(
+                edgefirst_hal::decoder::yolo::decode_yolo_det_float(
                     output.as_array(),
                     score_threshold as f32,
                     iou_threshold as f32,
@@ -399,7 +399,7 @@ impl PyDecoder {
                 )
             }
             ReadOnlyArrayGeneric2::Float64(output) => {
-                edgefirst::decoder::yolo::decode_yolo_det_float(
+                edgefirst_hal::decoder::yolo::decode_yolo_det_float(
                     output.as_array(),
                     score_threshold as f32,
                     iou_threshold as f32,
@@ -430,7 +430,7 @@ impl PyDecoder {
 
         match (boxes, protos) {
             (ReadOnlyArrayGeneric2::UInt8(boxes), ReadOnlyArrayGeneric3::UInt8(protos)) => {
-                edgefirst::decoder::yolo::decode_yolo_segdet_quant(
+                edgefirst_hal::decoder::yolo::decode_yolo_segdet_quant(
                     (boxes.as_array(), Quantization::from(quant_boxes)),
                     (protos.as_array(), Quantization::from(quant_protos)),
                     score_threshold as f32,
@@ -441,7 +441,7 @@ impl PyDecoder {
                 );
             }
             (ReadOnlyArrayGeneric2::Int8(boxes), ReadOnlyArrayGeneric3::Int8(protos)) => {
-                edgefirst::decoder::yolo::decode_yolo_segdet_quant(
+                edgefirst_hal::decoder::yolo::decode_yolo_segdet_quant(
                     (boxes.as_array(), Quantization::from(quant_boxes)),
                     (protos.as_array(), Quantization::from(quant_protos)),
                     score_threshold as f32,
@@ -452,7 +452,7 @@ impl PyDecoder {
                 );
             }
             (ReadOnlyArrayGeneric2::Float32(boxes), ReadOnlyArrayGeneric3::Float32(protos)) => {
-                edgefirst::decoder::yolo::decode_yolo_segdet_float(
+                edgefirst_hal::decoder::yolo::decode_yolo_segdet_float(
                     boxes.as_array(),
                     protos.as_array(),
                     score_threshold as f32,
@@ -463,7 +463,7 @@ impl PyDecoder {
                 );
             }
             (ReadOnlyArrayGeneric2::Float64(boxes), ReadOnlyArrayGeneric3::Float64(protos)) => {
-                edgefirst::decoder::yolo::decode_yolo_segdet_float(
+                edgefirst_hal::decoder::yolo::decode_yolo_segdet_float(
                     boxes.as_array(),
                     protos.as_array(),
                     score_threshold as f32,
@@ -502,7 +502,7 @@ impl PyDecoder {
         match (boxes, scores) {
             (ReadOnlyArrayGeneric2::UInt8(boxes), ReadOnlyArrayGeneric2::UInt8(scores)) => {
                 let (boxes, scores) = (boxes.as_array(), scores.as_array());
-                edgefirst::decoder::modelpack::decode_modelpack_det(
+                edgefirst_hal::decoder::modelpack::decode_modelpack_det(
                     (boxes.view(), Quantization::from(quant_boxes)),
                     (scores.view(), Quantization::from(quant_scores)),
                     score_threshold,
@@ -512,7 +512,7 @@ impl PyDecoder {
             }
             (ReadOnlyArrayGeneric2::Int8(boxes), ReadOnlyArrayGeneric2::Int8(scores)) => {
                 let (boxes, scores) = (boxes.as_array(), scores.as_array());
-                edgefirst::decoder::modelpack::decode_modelpack_det(
+                edgefirst_hal::decoder::modelpack::decode_modelpack_det(
                     (boxes.view(), Quantization::from(quant_boxes)),
                     (scores.view(), Quantization::from(quant_scores)),
                     score_threshold,
@@ -522,7 +522,7 @@ impl PyDecoder {
             }
             (ReadOnlyArrayGeneric2::Float32(boxes), ReadOnlyArrayGeneric2::Float32(scores)) => {
                 let (boxes, scores) = (boxes.as_array(), scores.as_array());
-                edgefirst::decoder::modelpack::decode_modelpack_float(
+                edgefirst_hal::decoder::modelpack::decode_modelpack_float(
                     boxes.view(),
                     scores.view(),
                     score_threshold,
@@ -532,7 +532,7 @@ impl PyDecoder {
             }
             (ReadOnlyArrayGeneric2::Float64(boxes), ReadOnlyArrayGeneric2::Float64(scores)) => {
                 let (boxes, scores) = (boxes.as_array(), scores.as_array());
-                edgefirst::decoder::modelpack::decode_modelpack_float(
+                edgefirst_hal::decoder::modelpack::decode_modelpack_float(
                     boxes.view(),
                     scores.view(),
                     score_threshold,
@@ -583,7 +583,7 @@ impl PyDecoder {
                     })
                     .collect::<Vec<_>>();
 
-                edgefirst::decoder::modelpack::decode_modelpack_split_quant(
+                edgefirst_hal::decoder::modelpack::decode_modelpack_split_quant(
                     &outputs,
                     &configs,
                     score_threshold as f32,
@@ -609,7 +609,7 @@ impl PyDecoder {
                     })
                     .collect::<Vec<_>>();
 
-                edgefirst::decoder::modelpack::decode_modelpack_split_quant(
+                edgefirst_hal::decoder::modelpack::decode_modelpack_split_quant(
                     &outputs,
                     &configs,
                     score_threshold as f32,
@@ -628,7 +628,7 @@ impl PyDecoder {
                     })
                     .collect::<Vec<_>>();
 
-                edgefirst::decoder::modelpack::decode_modelpack_split_float(
+                edgefirst_hal::decoder::modelpack::decode_modelpack_split_float(
                     &outputs,
                     &configs,
                     score_threshold as f32,
@@ -646,7 +646,7 @@ impl PyDecoder {
                     })
                     .collect::<Vec<_>>();
 
-                edgefirst::decoder::modelpack::decode_modelpack_split_float(
+                edgefirst_hal::decoder::modelpack::decode_modelpack_split_float(
                     &outputs,
                     &configs,
                     score_threshold as f32,

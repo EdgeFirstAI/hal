@@ -1377,12 +1377,8 @@ impl DecoderBuilder {
                 Self::verify_yolo_det(&boxes)?;
                 Ok(ModelType::YoloDet { boxes })
             }
-        } else if let Some(boxes) = split_boxes
-            && let Some(scores) = split_scores
-        {
-            if let Some(mask_coeff) = split_mask_coeff
-                && let Some(protos) = protos
-            {
+        } else if let (Some(boxes), Some(scores)) = (split_boxes, split_scores) {
+            if let (Some(mask_coeff), Some(protos)) = (split_mask_coeff, protos) {
                 Self::verify_yolo_split_segdet(&boxes, &scores, &mask_coeff, &protos)?;
                 Ok(ModelType::YoloSplitSegDet {
                     boxes,
@@ -1732,9 +1728,7 @@ impl DecoderBuilder {
                     detection: split_decoders,
                     segmentation,
                 })
-            } else if let Some(scores) = scores_
-                && let Some(boxes) = boxes_
-            {
+            } else if let (Some(scores), Some(boxes)) = (scores_, boxes_) {
                 let classes = Self::verify_modelpack_det(&boxes, &scores)?;
                 Self::verify_modelpack_seg(&segmentation, Some(classes))?;
                 Ok(ModelType::ModelPackSegDet {
@@ -1751,9 +1745,7 @@ impl DecoderBuilder {
             Ok(ModelType::ModelPackDetSplit {
                 detection: split_decoders,
             })
-        } else if let Some(scores) = scores_
-            && let Some(boxes) = boxes_
-        {
+        } else if let (Some(scores), Some(boxes)) = (scores_, boxes_) {
             Self::verify_modelpack_det(&boxes, &scores)?;
             Ok(ModelType::ModelPackDet { boxes, scores })
         } else {

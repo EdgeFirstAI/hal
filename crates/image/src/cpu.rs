@@ -1886,17 +1886,16 @@ impl ImageProcessorTrait for CPUProcessor {
             self.resize_flip_rotate(tmp, &mut tmp2, rotation, flip, crop)?;
             Self::convert_format(&tmp2, dst)?;
         }
-        if let Some(dst_rect) = crop.dst_rect
-            && dst_rect
-                != (Rect {
-                    left: 0,
-                    top: 0,
-                    width: dst.width(),
-                    height: dst.height(),
-                })
-            && let Some(dst_color) = crop.dst_color
-        {
-            Self::fill_image_outside_crop(dst, dst_color, dst_rect)?;
+        if let (Some(dst_rect), Some(dst_color)) = (crop.dst_rect, crop.dst_color) {
+            let full_rect = Rect {
+                left: 0,
+                top: 0,
+                width: dst.width(),
+                height: dst.height(),
+            };
+            if dst_rect != full_rect {
+                Self::fill_image_outside_crop(dst, dst_color, dst_rect)?;
+            }
         }
 
         Ok(())
@@ -2013,17 +2012,16 @@ impl ImageProcessorTrait for CPUProcessor {
         }
 
         // Handle destination crop fill if needed
-        if let Some(dst_rect) = crop.dst_rect
-            && dst_rect
-                != (Rect {
-                    left: 0,
-                    top: 0,
-                    width: dst.width(),
-                    height: dst.height(),
-                })
-            && let Some(dst_color) = crop.dst_color
-        {
-            Self::fill_image_outside_crop_generic(dst, dst_color, dst_rect)?;
+        if let (Some(dst_rect), Some(dst_color)) = (crop.dst_rect, crop.dst_color) {
+            let full_rect = Rect {
+                left: 0,
+                top: 0,
+                width: dst.width(),
+                height: dst.height(),
+            };
+            if dst_rect != full_rect {
+                Self::fill_image_outside_crop_generic(dst, dst_color, dst_rect)?;
+            }
         }
 
         Ok(())
@@ -2080,9 +2078,8 @@ impl ImageProcessorTrait for CPUProcessor {
 mod cpu_tests {
 
     use super::*;
-    use crate::{CPUProcessor, Rotation, TensorImageRef};
+    use crate::{CPUProcessor, RGBA, Rotation, TensorImageRef};
     use edgefirst_tensor::{Tensor, TensorMapTrait, TensorMemory};
-    use g2d_sys::RGBA;
     use image::buffer::ConvertBuffer;
 
     macro_rules! function {
