@@ -23,7 +23,11 @@
 
 mod common;
 
-use common::{calculate_letterbox, g2d_available, get_test_data, opengl_available, BenchConfig};
+use common::{calculate_letterbox, get_test_data, BenchConfig};
+#[cfg(target_os = "linux")]
+use common::g2d_available;
+#[cfg(all(target_os = "linux", feature = "opengl"))]
+use common::opengl_available;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
 #[cfg(target_os = "linux")]
@@ -34,7 +38,9 @@ use edgefirst_image::{
     CPUProcessor, Crop, Flip, ImageProcessorTrait, Rect, Rotation, TensorImage, NV12, RGB, RGBA,
     YUYV,
 };
-use edgefirst_tensor::{TensorMapTrait, TensorMemory, TensorTrait};
+use edgefirst_tensor::{TensorMapTrait, TensorTrait};
+#[cfg(target_os = "linux")]
+use edgefirst_tensor::TensorMemory;
 
 #[cfg(feature = "opencv")]
 use opencv::{
@@ -48,6 +54,7 @@ use opencv::{
 // =============================================================================
 
 /// Primary use case: Camera YUYV → Model RGBA with letterbox
+#[allow(unused_variables)] // has_g2d/has_opengl used conditionally on Linux
 fn bench_letterbox(c: &mut Criterion) {
     let mut group = c.benchmark_group("letterbox");
     group.sample_size(100);
@@ -413,6 +420,7 @@ fn bench_letterbox(c: &mut Criterion) {
 // =============================================================================
 
 /// Format conversion without resize (for ISP output scenarios)
+#[allow(unused_variables)] // has_g2d/has_opengl used conditionally on Linux
 fn bench_convert(c: &mut Criterion) {
     let mut group = c.benchmark_group("convert");
     group.sample_size(100);
@@ -690,6 +698,7 @@ fn bench_convert(c: &mut Criterion) {
 // =============================================================================
 
 /// Downscale with same aspect ratio (16:9 → 16:9)
+#[allow(unused_variables)] // has_g2d/has_opengl used conditionally on Linux
 fn bench_resize(c: &mut Criterion) {
     let mut group = c.benchmark_group("resize");
     group.sample_size(100);
