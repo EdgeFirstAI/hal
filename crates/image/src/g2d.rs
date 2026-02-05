@@ -70,7 +70,7 @@ impl G2DProcessor {
 
         // need to clear before assigning the crop
         let needs_clear = crop.dst_color.is_some()
-            && crop.dst_rect.map_or(false, |dst_rect| {
+            && crop.dst_rect.is_some_and(|dst_rect| {
                 dst_rect.left != 0
                     || dst_rect.top != 0
                     || dst_rect.width != dst.width()
