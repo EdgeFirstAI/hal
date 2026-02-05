@@ -1466,7 +1466,9 @@ const DEFAULT_COLORS_U8: [[u8; 4]; 20] = denorm(DEFAULT_COLORS);
 mod image_tests {
     use super::*;
     use crate::{CPUProcessor, Rotation};
-    use edgefirst_tensor::{is_dma_available, TensorMapTrait, TensorMemory};
+    #[cfg(target_os = "linux")]
+    use edgefirst_tensor::is_dma_available;
+    use edgefirst_tensor::{TensorMapTrait, TensorMemory};
     use image::buffer::ConvertBuffer;
 
     #[ctor::ctor]
