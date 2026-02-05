@@ -4,7 +4,7 @@
 //! Shared utilities for image processing benchmarks.
 #![allow(dead_code)]
 
-use edgefirst_image::{NV12, RGB, RGBA, TensorImage, YUYV};
+use edgefirst_image::{TensorImage, NV12, RGB, RGBA, YUYV};
 use edgefirst_tensor::TensorMemory;
 use four_char_code::FourCharCode;
 use std::{path::Path, sync::OnceLock};

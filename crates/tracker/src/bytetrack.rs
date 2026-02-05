@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{DetectionBox, TrackInfo, Tracker, kalman::ConstantVelocityXYAHModel2};
-use lapjv::{Matrix, lapjv};
+use crate::{kalman::ConstantVelocityXYAHModel2, DetectionBox, TrackInfo, Tracker};
+use lapjv::{lapjv, Matrix};
 use log::{debug, trace};
 use nalgebra::{Dyn, OMatrix, U4};
 use uuid::Uuid;
@@ -345,7 +345,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{ByteTrack, iou, vaalbox_to_xyah, xyah_to_vaalbox};
+    use super::{iou, vaalbox_to_xyah, xyah_to_vaalbox, ByteTrack};
     use crate::{DetectionBox, Tracker};
 
     /// Mock detection for testing
