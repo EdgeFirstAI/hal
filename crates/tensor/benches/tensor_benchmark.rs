@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-use edgefirst_tensor::{is_dma_available, Tensor, TensorMemory, TensorTrait as _};
+#[cfg(target_os = "linux")]
+use edgefirst_tensor::is_dma_available;
+use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait as _};
 use num_traits::Num;
 
 #[divan::bench(types = [u8, f64], args = [[1, 360, 640, 4], [1, 720, 1280, 4], [1, 1080, 1920, 4], [1, 2160, 3840, 4]])]
