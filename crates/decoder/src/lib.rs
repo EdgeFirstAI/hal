@@ -647,7 +647,11 @@ fn arg_max<T: PartialOrd + Copy>(score: ArrayView1<T>) -> (T, usize) {
         .iter()
         .enumerate()
         .fold((score[0], 0), |(max, arg_max), (ind, s)| {
-            if max > *s { (max, arg_max) } else { (*s, ind) }
+            if max > *s {
+                (max, arg_max)
+            } else {
+                (*s, ind)
+            }
         })
 }
 #[cfg(test)]
@@ -663,7 +667,7 @@ mod decoder_tests {
         },
         *,
     };
-    use ndarray::{Array4, array, s};
+    use ndarray::{array, s, Array4};
     use ndarray_stats::DeviationExt;
 
     fn compare_outputs(

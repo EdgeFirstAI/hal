@@ -5,14 +5,14 @@
 
 use divan::black_box_drop;
 use edgefirst_decoder::{
-    Nms, Quantization, XYWH,
     byte::{nms_int, postprocess_boxes_quant},
     dequant_detect_box, dequantize_cpu, dequantize_cpu_chunked, dequantize_ndarray,
     float::{nms_float, postprocess_boxes_float},
-    modelpack::{ModelPackDetectionConfig, decode_modelpack_det, decode_modelpack_split_quant},
+    modelpack::{decode_modelpack_det, decode_modelpack_split_quant, ModelPackDetectionConfig},
     yolo::{
         decode_yolo_det, decode_yolo_det_float, decode_yolo_segdet_float, decode_yolo_segdet_quant,
     },
+    Nms, Quantization, XYWH,
 };
 use ndarray::s;
 

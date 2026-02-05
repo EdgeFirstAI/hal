@@ -10,8 +10,8 @@ use edgefirst_image::G2DProcessor;
 #[cfg(all(feature = "opengl", target_os = "linux"))]
 use edgefirst_image::GLProcessorThreaded;
 use edgefirst_image::{
-    CPUProcessor, Crop, Flip, GREY, ImageProcessorTrait as _, NV16, PLANAR_RGB, RGB, RGBA,
-    Rotation, TensorImage, YUYV,
+    CPUProcessor, Crop, Flip, ImageProcessorTrait as _, Rotation, TensorImage, GREY, NV16,
+    PLANAR_RGB, RGB, RGBA, YUYV,
 };
 use edgefirst_tensor::{TensorMapTrait, TensorMemory, TensorTrait};
 use four_char_code::FourCharCode;

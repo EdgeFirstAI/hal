@@ -34,9 +34,9 @@ mod mem;
 #[cfg(unix)]
 mod shm;
 
-pub use crate::mem::{MemMap, MemTensor};
 #[cfg(target_os = "linux")]
 pub use crate::dma::{DmaMap, DmaTensor};
+pub use crate::mem::{MemMap, MemTensor};
 #[cfg(unix)]
 pub use crate::shm::{ShmMap, ShmTensor};
 pub use error::{Error, Result};
@@ -488,7 +488,7 @@ where
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "linux")]
-    use nix::unistd::{AccessFlags, access};
+    use nix::unistd::{access, AccessFlags};
     #[cfg(target_os = "linux")]
     use std::io::Write as _;
     use std::sync::RwLock;

@@ -3,8 +3,8 @@
 
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 use edgefirst_hal::decoder::{
-    Decoder, DecoderBuilder, DetectBox, Quantization, Segmentation, configs::Nms, dequantize_cpu,
-    modelpack::ModelPackDetectionConfig, segmentation_to_mask,
+    configs::Nms, dequantize_cpu, modelpack::ModelPackDetectionConfig, segmentation_to_mask,
+    Decoder, DecoderBuilder, DetectBox, Quantization, Segmentation,
 };
 
 /// NMS (Non-Maximum Suppression) mode for filtering overlapping detections.
@@ -50,7 +50,7 @@ use numpy::{
     ToPyArray,
 };
 use pyo3::{
-    Bound, FromPyObject, PyAny, PyRef, PyResult, Python, pyclass, pymethods, types::PyAnyMethods,
+    pyclass, pymethods, types::PyAnyMethods, Bound, FromPyObject, PyAny, PyRef, PyResult, Python,
 };
 
 use crate::FunctionTimer;

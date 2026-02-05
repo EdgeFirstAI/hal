@@ -2,21 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    FunctionTimer,
     tensor::{PyTensorMap, PyTensorMemory, TensorMapT},
+    FunctionTimer,
 };
 use edgefirst_hal::{
     decoder::{BoundingBox, DetectBox, Segmentation},
-    image::{self, Crop, Flip, ImageProcessorTrait, RGBA, Rect, Rotation, TensorImage},
+    image::{self, Crop, Flip, ImageProcessorTrait, Rect, Rotation, TensorImage, RGBA},
     tensor::{self, TensorMapTrait, TensorTrait},
 };
 use four_char_code::FourCharCode;
 
 use ndarray::{
-    ArrayView1, ArrayView2, ArrayView3, ArrayViewMut3, Zip,
     parallel::prelude::{
         IndexedParallelIterator, IntoParallelIterator, IntoParallelRefMutIterator, ParallelIterator,
     },
+    ArrayView1, ArrayView2, ArrayView3, ArrayViewMut3, Zip,
 };
 use numpy::{
     PyArrayLike3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, PyReadwriteArray3,
@@ -50,7 +50,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug)]
 pub enum Error {
     Image(image::Error),
-    Tensor(edgefirst::tensor::Error),
+    Tensor(tensor::Error),
     NdArrayShape(ndarray::ShapeError),
     Io(std::io::Error),
     Format(String),
@@ -386,9 +386,7 @@ fn normalize_to_uint8<'py>(
             "UInt8 destination only supports RAW normalization".to_string(),
         ));
     }
-    if let Some(zero_point) = zero_point
-        && zero_point != 0
-    {
+    if zero_point.is_some_and(|zp| zp != 0) {
         return Err(Error::InvalidArg(
             "RAW normalization does not support setting zero point".to_string(),
         ));
@@ -398,19 +396,18 @@ fn normalize_to_uint8<'py>(
     let data = map.as_slice();
     let ndarray = ArrayView3::from_shape(shape, data)?;
 
-    if tensor.fourcc() == RGBA
-        && dst_shape[2] == 3
-        && let Some(dst) = dst.as_slice_mut()
-    {
-        let dst = dst.as_chunks_mut::<3>().0;
-        let src = data.as_chunks::<4>().0;
-        dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-            d[0] = s[0];
-            d[1] = s[1];
-            d[2] = s[2];
-        });
+    if tensor.fourcc() == RGBA && dst_shape[2] == 3 {
+        if let Some(dst) = dst.as_slice_mut() {
+            let dst = dst.as_chunks_mut::<3>().0;
+            let src = data.as_chunks::<4>().0;
+            dst.par_iter_mut().zip(src).for_each(|(d, s)| {
+                d[0] = s[0];
+                d[1] = s[1];
+                d[2] = s[2];
+            });
 
-        return Ok(());
+            return Ok(());
+        }
     }
 
     Zip::from(dst)
@@ -452,26 +449,25 @@ fn normalize_to_int8<'py>(
     let map = tensor.tensor().map()?;
     let data = map.as_slice();
     let ndarray = ArrayView3::from_shape(shape, data)?;
-    if tensor.fourcc() == RGBA
-        && dst_shape[2] == 3
-        && let Some(dst) = dst.as_slice_mut()
-    {
-        let dst = dst.as_chunks_mut::<3>().0;
-        let src = data.as_chunks::<4>().0;
-        if zp == 128 {
+    if tensor.fourcc() == RGBA && dst_shape[2] == 3 {
+        if let Some(dst) = dst.as_slice_mut() {
+            let dst = dst.as_chunks_mut::<3>().0;
+            let src = data.as_chunks::<4>().0;
+            if zp == 128 {
+                dst.par_iter_mut().zip(src).for_each(|(d, s)| {
+                    d[0] = (s[0] as i16 - 128) as i8;
+                    d[1] = (s[1] as i16 - 128) as i8;
+                    d[2] = (s[2] as i16 - 128) as i8;
+                });
+                return Ok(());
+            }
             dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-                d[0] = (s[0] as i16 - 128) as i8;
-                d[1] = (s[1] as i16 - 128) as i8;
-                d[2] = (s[2] as i16 - 128) as i8;
+                d[0] = (s[0] as i16 - zp).clamp(-128, 127) as i8;
+                d[1] = (s[1] as i16 - zp).clamp(-128, 127) as i8;
+                d[2] = (s[2] as i16 - zp).clamp(-128, 127) as i8;
             });
             return Ok(());
         }
-        dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-            d[0] = (s[0] as i16 - zp).clamp(-128, 127) as i8;
-            d[1] = (s[1] as i16 - zp).clamp(-128, 127) as i8;
-            d[2] = (s[2] as i16 - zp).clamp(-128, 127) as i8;
-        });
-        return Ok(());
     }
 
     if zp == 128 {
@@ -529,38 +525,37 @@ fn normalize_to_float_16<'py>(
     let map = tensor.tensor().map()?;
     let data = map.as_slice();
     let ndarray = ArrayView3::from_shape(shape, data)?;
-    if tensor.fourcc() == RGBA
-        && dst_shape[2] == 3
-        && let Some(dst) = dst.as_slice_mut()
-    {
-        let dst = dst.as_chunks_mut::<3>().0;
-        let src = data.as_chunks::<4>().0;
+    if tensor.fourcc() == RGBA && dst_shape[2] == 3 {
+        if let Some(dst) = dst.as_slice_mut() {
+            let dst = dst.as_chunks_mut::<3>().0;
+            let src = data.as_chunks::<4>().0;
 
-        match normalization {
-            Normalization::SIGNED | Normalization::DEFAULT => {
-                dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-                    d[0] = (s[0] as f32 / 127.5 - zp) as f16;
-                    d[1] = (s[1] as f32 / 127.5 - zp) as f16;
-                    d[2] = (s[2] as f32 / 127.5 - zp) as f16;
-                });
+            match normalization {
+                Normalization::SIGNED | Normalization::DEFAULT => {
+                    dst.par_iter_mut().zip(src).for_each(|(d, s)| {
+                        d[0] = (s[0] as f32 / 127.5 - zp) as f16;
+                        d[1] = (s[1] as f32 / 127.5 - zp) as f16;
+                        d[2] = (s[2] as f32 / 127.5 - zp) as f16;
+                    });
+                }
+                Normalization::UNSIGNED => {
+                    dst.par_iter_mut().zip(src).for_each(|(d, s)| {
+                        d[0] = (s[0] as f32 / 255.0) as f16;
+                        d[1] = (s[1] as f32 / 255.0) as f16;
+                        d[2] = (s[2] as f32 / 255.0) as f16;
+                    });
+                }
+                Normalization::RAW => {
+                    dst.par_iter_mut().zip(src).for_each(|(d, s)| {
+                        d[0] = (s[0] as f32) as f16;
+                        d[1] = (s[1] as f32) as f16;
+                        d[2] = (s[2] as f32) as f16;
+                    });
+                }
             }
-            Normalization::UNSIGNED => {
-                dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-                    d[0] = (s[0] as f32 / 255.0) as f16;
-                    d[1] = (s[1] as f32 / 255.0) as f16;
-                    d[2] = (s[2] as f32 / 255.0) as f16;
-                });
-            }
-            Normalization::RAW => {
-                dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-                    d[0] = (s[0] as f32) as f16;
-                    d[1] = (s[1] as f32) as f16;
-                    d[2] = (s[2] as f32) as f16;
-                });
-            }
+
+            return Ok(());
         }
-
-        return Ok(());
     }
 
     match normalization {
@@ -621,44 +616,43 @@ fn normalize_to_float_16<'py>(
         }
     };
 
-    if tensor.fourcc() == RGBA
-        && dst_shape[2] == 3
-        && let Some(dst) = dst.as_slice_mut()
-    {
-        let mut tmp = vec![0.0; dst.len()];
-        let tmp_ = tmp.as_chunks_mut::<3>().0;
-        let src = data.as_chunks::<4>().0;
+    if tensor.fourcc() == RGBA && dst_shape[2] == 3 {
+        if let Some(dst) = dst.as_slice_mut() {
+            let mut tmp = vec![0.0; dst.len()];
+            let tmp_ = tmp.as_chunks_mut::<3>().0;
+            let src = data.as_chunks::<4>().0;
 
-        match normalization {
-            Normalization::SIGNED | Normalization::DEFAULT => {
-                tmp_.par_iter_mut().zip(src).for_each(|(d, s)| {
-                    d[0] = s[0] as f32 / 127.5 - zp;
-                    d[1] = s[1] as f32 / 127.5 - zp;
-                    d[2] = s[2] as f32 / 127.5 - zp;
-                });
+            match normalization {
+                Normalization::SIGNED | Normalization::DEFAULT => {
+                    tmp_.par_iter_mut().zip(src).for_each(|(d, s)| {
+                        d[0] = s[0] as f32 / 127.5 - zp;
+                        d[1] = s[1] as f32 / 127.5 - zp;
+                        d[2] = s[2] as f32 / 127.5 - zp;
+                    });
+                }
+                Normalization::UNSIGNED => {
+                    tmp_.par_iter_mut().zip(src).for_each(|(d, s)| {
+                        d[0] = s[0] as f32 / 255.0;
+                        d[1] = s[1] as f32 / 255.0;
+                        d[2] = s[2] as f32 / 255.0;
+                    });
+                }
+                Normalization::RAW => {
+                    tmp_.par_iter_mut().zip(src).for_each(|(d, s)| {
+                        d[0] = s[0] as f32;
+                        d[1] = s[1] as f32;
+                        d[2] = s[2] as f32;
+                    });
+                }
             }
-            Normalization::UNSIGNED => {
-                tmp_.par_iter_mut().zip(src).for_each(|(d, s)| {
-                    d[0] = s[0] as f32 / 255.0;
-                    d[1] = s[1] as f32 / 255.0;
-                    d[2] = s[2] as f32 / 255.0;
-                });
-            }
-            Normalization::RAW => {
-                tmp_.par_iter_mut().zip(src).for_each(|(d, s)| {
-                    d[0] = s[0] as f32;
-                    d[1] = s[1] as f32;
-                    d[2] = s[2] as f32;
-                });
-            }
+            // split into chunks of 256
+            let dst = dst.as_chunks_mut::<256>();
+            let tmp_ = tmp.as_chunks_mut::<256>();
+            dst.0.par_iter_mut().zip(tmp_.0).for_each(|(d, s)| {
+                d.convert_from_f32_slice(s);
+            });
+            dst.1.convert_from_f32_slice(tmp_.1);
         }
-        // split into chunks of 256
-        let dst = dst.as_chunks_mut::<256>();
-        let tmp_ = tmp.as_chunks_mut::<256>();
-        dst.0.par_iter_mut().zip(tmp_.0).for_each(|(d, s)| {
-            d.convert_from_f32_slice(s);
-        });
-        dst.1.convert_from_f32_slice(tmp_.1);
     }
     match normalization {
         Normalization::SIGNED | Normalization::DEFAULT => {
@@ -726,36 +720,35 @@ fn normalize_to_float_32<'py>(
         }
     };
 
-    if tensor.fourcc() == RGBA
-        && dst_shape[2] == 3
-        && let Some(dst) = dst.as_slice_mut()
-    {
-        let dst = dst.as_chunks_mut::<3>().0;
-        let src = data.as_chunks::<4>().0;
-        match normalization {
-            Normalization::SIGNED | Normalization::DEFAULT => {
-                dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-                    d[0] = s[0] as f32 / 127.5 - zp;
-                    d[1] = s[1] as f32 / 127.5 - zp;
-                    d[2] = s[2] as f32 / 127.5 - zp;
-                });
+    if tensor.fourcc() == RGBA && dst_shape[2] == 3 {
+        if let Some(dst) = dst.as_slice_mut() {
+            let dst = dst.as_chunks_mut::<3>().0;
+            let src = data.as_chunks::<4>().0;
+            match normalization {
+                Normalization::SIGNED | Normalization::DEFAULT => {
+                    dst.par_iter_mut().zip(src).for_each(|(d, s)| {
+                        d[0] = s[0] as f32 / 127.5 - zp;
+                        d[1] = s[1] as f32 / 127.5 - zp;
+                        d[2] = s[2] as f32 / 127.5 - zp;
+                    });
+                }
+                Normalization::UNSIGNED => {
+                    dst.par_iter_mut().zip(src).for_each(|(d, s)| {
+                        d[0] = s[0] as f32 / 255.0;
+                        d[1] = s[1] as f32 / 255.0;
+                        d[2] = s[2] as f32 / 255.0;
+                    });
+                }
+                Normalization::RAW => {
+                    dst.par_iter_mut().zip(src).for_each(|(d, s)| {
+                        d[0] = s[0] as f32;
+                        d[1] = s[1] as f32;
+                        d[2] = s[2] as f32;
+                    });
+                }
             }
-            Normalization::UNSIGNED => {
-                dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-                    d[0] = s[0] as f32 / 255.0;
-                    d[1] = s[1] as f32 / 255.0;
-                    d[2] = s[2] as f32 / 255.0;
-                });
-            }
-            Normalization::RAW => {
-                dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-                    d[0] = s[0] as f32;
-                    d[1] = s[1] as f32;
-                    d[2] = s[2] as f32;
-                });
-            }
+            return Ok(());
         }
-        return Ok(());
     }
     match normalization {
         Normalization::DEFAULT | Normalization::SIGNED => Zip::from(dst)
@@ -812,36 +805,35 @@ fn normalize_to_float_64<'py>(
         }
     };
 
-    if tensor.fourcc() == RGBA
-        && dst_shape[2] == 3
-        && let Some(dst) = dst.as_slice_mut()
-    {
-        let dst = dst.as_chunks_mut::<3>().0;
-        let src = data.as_chunks::<4>().0;
-        match normalization {
-            Normalization::SIGNED | Normalization::DEFAULT => {
-                dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-                    d[0] = s[0] as f64 / 127.5 - zp;
-                    d[1] = s[1] as f64 / 127.5 - zp;
-                    d[2] = s[2] as f64 / 127.5 - zp;
-                });
+    if tensor.fourcc() == RGBA && dst_shape[2] == 3 {
+        if let Some(dst) = dst.as_slice_mut() {
+            let dst = dst.as_chunks_mut::<3>().0;
+            let src = data.as_chunks::<4>().0;
+            match normalization {
+                Normalization::SIGNED | Normalization::DEFAULT => {
+                    dst.par_iter_mut().zip(src).for_each(|(d, s)| {
+                        d[0] = s[0] as f64 / 127.5 - zp;
+                        d[1] = s[1] as f64 / 127.5 - zp;
+                        d[2] = s[2] as f64 / 127.5 - zp;
+                    });
+                }
+                Normalization::UNSIGNED => {
+                    dst.par_iter_mut().zip(src).for_each(|(d, s)| {
+                        d[0] = s[0] as f64 / 255.0;
+                        d[1] = s[1] as f64 / 255.0;
+                        d[2] = s[2] as f64 / 255.0;
+                    });
+                }
+                Normalization::RAW => {
+                    dst.par_iter_mut().zip(src).for_each(|(d, s)| {
+                        d[0] = s[0] as f64;
+                        d[1] = s[1] as f64;
+                        d[2] = s[2] as f64;
+                    });
+                }
             }
-            Normalization::UNSIGNED => {
-                dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-                    d[0] = s[0] as f64 / 255.0;
-                    d[1] = s[1] as f64 / 255.0;
-                    d[2] = s[2] as f64 / 255.0;
-                });
-            }
-            Normalization::RAW => {
-                dst.par_iter_mut().zip(src).for_each(|(d, s)| {
-                    d[0] = s[0] as f64;
-                    d[1] = s[1] as f64;
-                    d[2] = s[2] as f64;
-                });
-            }
+            return Ok(());
         }
-        return Ok(());
     }
     match normalization {
         Normalization::DEFAULT | Normalization::SIGNED => Zip::from(dst)

@@ -554,7 +554,7 @@ All public APIs must include:
 /// # Examples
 ///
 /// ```rust
-/// use edgefirst::tensor::Tensor;
+/// use edgefirst_hal::tensor::Tensor;
 ///
 /// let tensor = Tensor::<u8>::new(&[640, 480, 3], None)?;
 /// ```
