@@ -62,6 +62,6 @@ The bindings use dynamic loading via `libloading`. The library is loaded from:
 
 ## License
 
-Licensed under the MIT License. See [LICENSE](LICENSE) for details.
+Licensed under the MIT License.
 
 The G2D API header (`g2d.h`) is provided by NXP under their license terms.
