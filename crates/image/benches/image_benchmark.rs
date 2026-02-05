@@ -479,6 +479,7 @@ where
     drop(gl_dst);
 }
 
+#[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
 #[divan::bench(types = [Person, Zidane], ignore = !gl_available() || !dma_available())]
 fn convert_opengl_rgba_to_planar<IMAGE>(bencher: divan::Bencher)
@@ -1809,6 +1810,11 @@ fn hires_opengl_4k_rgb_to_rgba_mem(bencher: divan::Bencher, size: (usize, usize)
 #[cfg(all(target_os = "linux", feature = "opengl"))]
 fn gl_available() -> bool {
     common::opengl_available()
+}
+
+#[cfg(not(all(target_os = "linux", feature = "opengl")))]
+fn gl_available() -> bool {
+    false
 }
 
 fn main() {
