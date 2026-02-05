@@ -53,8 +53,8 @@ boxes, scores, classes = decoder.decode([output0, output1])
 
 #### Rust
 ```rust
-use edgefirst::image::{TensorImage, ImageProcessor};
-use edgefirst::decoder::Decoder;
+use edgefirst_hal::image::{TensorImage, ImageProcessor};
+use edgefirst_hal::decoder::Decoder;
 
 // Load and process image
 let input = TensorImage::load("image.jpg", Some(RGB), None)?;
@@ -386,8 +386,8 @@ flowchart LR
 ### Image Conversion
 
 ```rust
-use edgefirst::image::{TensorImage, ImageProcessor, RGBA, RGB};
-use edgefirst::tensor::TensorMemory;
+use edgefirst_hal::image::{TensorImage, ImageProcessor, RGBA, RGB};
+use edgefirst_hal::tensor::TensorMemory;
 
 // Load image from JPEG
 let input = TensorImage::load("testdata/zidane.jpg", Some(RGB), None)?;
@@ -405,7 +405,7 @@ converter.convert(&input, &mut output, Default::default())?;
 ### Detection Decoding
 
 ```rust
-use edgefirst::decoder::Decoder;
+use edgefirst_hal::decoder::Decoder;
 use std::collections::HashMap;
 
 // Build decoder from configuration dictionary/JSON
@@ -422,7 +422,7 @@ let (bboxes, scores, classes) = decoder.decode_detection(&outputs)?;
 ### Multi-Frame Tracking
 
 ```rust
-use edgefirst::tracker::{ByteTrack, Tracker, DetectionBox};
+use edgefirst_hal::tracker::{ByteTrack, Tracker, DetectionBox};
 
 let mut tracker = ByteTrack::default();
 
@@ -439,7 +439,7 @@ for frame in video_frames {
 ### Zero-Copy Tensor Sharing
 
 ```rust
-use edgefirst::tensor::{Tensor, TensorTrait};
+use edgefirst_hal::tensor::{Tensor, TensorTrait};
 
 // Create tensor in process A
 let tensor = Tensor::<u8>::new(&[1920, 1080, 3], None, Some("frame1"))?;

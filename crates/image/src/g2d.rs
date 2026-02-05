@@ -4,11 +4,11 @@
 #![cfg(target_os = "linux")]
 
 use crate::{
-    CPUProcessor, Crop, Error, Flip, ImageProcessorTrait, NV12, RGB, RGBA, Result, Rotation,
-    TensorImage, TensorImageRef, YUYV,
+    CPUProcessor, Crop, Error, Flip, ImageProcessorTrait, Result, Rotation, TensorImage,
+    TensorImageRef, NV12, RGB, RGBA, YUYV,
 };
 use edgefirst_tensor::Tensor;
-use g2d_sys::{G2D, G2DFormat, G2DPhysical, G2DSurface};
+use g2d_sys::{G2DFormat, G2DPhysical, G2DSurface, G2D};
 use std::{os::fd::AsRawFd, time::Instant};
 
 /// G2DConverter implements the ImageProcessor trait using the NXP G2D
@@ -293,8 +293,8 @@ impl TryFrom<&mut TensorImage> for G2DSurface {
 mod g2d_tests {
     use super::*;
     use crate::{
-        CPUProcessor, Flip, G2DProcessor, GREY, ImageProcessorTrait, NV12, RGB, RGBA, Rect,
-        Rotation, TensorImage, YUYV,
+        CPUProcessor, Flip, G2DProcessor, ImageProcessorTrait, Rect, Rotation, TensorImage, GREY,
+        NV12, RGB, RGBA, YUYV,
     };
     use edgefirst_tensor::{TensorMapTrait, TensorMemory, TensorTrait};
     use four_char_code::FourCharCode;

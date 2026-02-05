@@ -4,16 +4,13 @@
 use std::fmt::Debug;
 
 use ndarray::{
-    Array2, Array3, ArrayView1, ArrayView2, ArrayView3,
     parallel::prelude::{IntoParallelIterator, ParallelIterator},
-    s,
+    s, Array2, Array3, ArrayView1, ArrayView2, ArrayView3,
 };
 use ndarray_stats::QuantileExt;
 use num_traits::{AsPrimitive, Float, PrimInt, Signed};
 
 use crate::{
-    BBoxTypeTrait, BoundingBox, DetectBox, DetectBoxQuantized, Quantization, Segmentation, XYWH,
-    XYXY,
     byte::{
         nms_class_aware_int, nms_extra_class_aware_int, nms_extra_int, nms_int,
         postprocess_boxes_index_quant, postprocess_boxes_quant, quantize_score_threshold,
@@ -24,6 +21,8 @@ use crate::{
         nms_class_aware_float, nms_extra_class_aware_float, nms_extra_float, nms_float,
         postprocess_boxes_float, postprocess_boxes_index_float,
     },
+    BBoxTypeTrait, BoundingBox, DetectBox, DetectBoxQuantized, Quantization, Segmentation, XYWH,
+    XYXY,
 };
 
 /// Dispatches to the appropriate NMS function based on mode for float boxes.
@@ -1249,7 +1248,7 @@ mod tests {
         data[4 * num_detections + 1] = 0.3; // conf[1] - fails
         data[5 * num_detections] = 1.0; // class[0]
         data[5 * num_detections + 1] = 2.0; // class[1]
-        // Fill mask coefficients with small values
+                                            // Fill mask coefficients with small values
         for i in 6..num_features {
             data[i * num_detections] = 0.1;
             data[i * num_detections + 1] = 0.1;

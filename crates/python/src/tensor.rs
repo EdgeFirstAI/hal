@@ -7,7 +7,7 @@ use pyo3::ffi::Py_buffer;
 use pyo3::{exceptions::PyBufferError, ffi::PyMemoryView_FromMemory, prelude::*};
 
 #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
-use std::ffi::{CString, c_int, c_void};
+use std::ffi::{c_int, c_void, CString};
 #[cfg(unix)]
 use std::os::fd::{IntoRawFd, OwnedFd, RawFd};
 

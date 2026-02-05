@@ -10,16 +10,16 @@ use edgefirst_decoder::Segmentation;
 use edgefirst_tensor::{TensorMemory, TensorTrait};
 use four_char_code::FourCharCode;
 use gbm::{
+    drm::{buffer::DrmFourcc, control::Device as DrmControlDevice, Device as DrmDevice},
     AsRaw, Device,
-    drm::{Device as DrmDevice, buffer::DrmFourcc, control::Device as DrmControlDevice},
 };
-use khronos_egl::{self as egl, Attrib, Display, Dynamic, EGL1_4, Instance};
+use khronos_egl::{self as egl, Attrib, Display, Dynamic, Instance, EGL1_4};
 use log::{debug, error};
 use std::{
     collections::BTreeSet,
-    ffi::{CStr, CString, c_char, c_void},
+    ffi::{c_char, c_void, CStr, CString},
     os::fd::AsRawFd,
-    ptr::{NonNull, null, null_mut},
+    ptr::{null, null_mut, NonNull},
     rc::Rc,
     str::FromStr,
     sync::OnceLock,
@@ -47,8 +47,8 @@ macro_rules! function {
 #[cfg(feature = "decoder")]
 use crate::DEFAULT_COLORS;
 use crate::{
-    CPUProcessor, Crop, Error, Flip, GREY, ImageProcessorTrait, NV12, PLANAR_RGB, PLANAR_RGBA, RGB,
-    RGBA, Rect, Rotation, TensorImage, TensorImageRef, YUYV,
+    CPUProcessor, Crop, Error, Flip, ImageProcessorTrait, Rect, Rotation, TensorImage,
+    TensorImageRef, GREY, NV12, PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, YUYV,
 };
 
 static EGL_LIB: OnceLock<libloading::Library> = OnceLock::new();
@@ -2871,9 +2871,9 @@ void main() {
 #[cfg(feature = "opengl")]
 mod gl_tests {
     use super::*;
+    use crate::{TensorImage, RGBA};
     #[cfg(feature = "dma_test_formats")]
     use crate::{NV12, YUYV};
-    use crate::{RGBA, TensorImage};
     use edgefirst_tensor::TensorTrait;
     #[cfg(feature = "dma_test_formats")]
     use edgefirst_tensor::{TensorMapTrait, TensorMemory};
