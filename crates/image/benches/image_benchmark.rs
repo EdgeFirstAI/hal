@@ -3,7 +3,9 @@
 
 mod common;
 
-use common::{dma_available, find_testdata_path, g2d_available};
+use common::find_testdata_path;
+#[cfg(target_os = "linux")]
+use common::{dma_available, g2d_available};
 
 #[cfg(target_os = "linux")]
 use edgefirst_image::G2DProcessor;
@@ -1810,11 +1812,6 @@ fn hires_opengl_4k_rgb_to_rgba_mem(bencher: divan::Bencher, size: (usize, usize)
 #[cfg(all(target_os = "linux", feature = "opengl"))]
 fn gl_available() -> bool {
     common::opengl_available()
-}
-
-#[cfg(not(all(target_os = "linux", feature = "opengl")))]
-fn gl_available() -> bool {
-    false
 }
 
 fn main() {
