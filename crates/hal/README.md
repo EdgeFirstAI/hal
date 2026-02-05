@@ -21,7 +21,7 @@ This is the umbrella crate that re-exports the core EdgeFirst HAL components:
 
 ## Quick Start
 
-```rust
+```rust,ignore
 use edgefirst_hal::{tensor, image, decoder};
 
 // Create a tensor with automatic memory selection
@@ -50,7 +50,7 @@ let decoder = decoder::DecoderBuilder::new()
 
 ## License
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+Licensed under the Apache License, Version 2.0. See [LICENSE](https://github.com/EdgeFirstAI/hal/blob/main/LICENSE) for details.
 
 ## Links
 

@@ -23,7 +23,7 @@ This crate provides object tracking algorithms for associating detections across
 
 ## Quick Start
 
-```rust
+```rust,ignore
 use edgefirst_tracker::{Tracker, TrackInfo, DetectionBox};
 use edgefirst_tracker::bytetrack::ByteTracker;
 
@@ -84,4 +84,4 @@ impl DetectionBox for MyDetection {
 
 ## License
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+Licensed under the Apache License, Version 2.0. See [LICENSE](https://github.com/EdgeFirstAI/hal/blob/main/LICENSE) for details.
