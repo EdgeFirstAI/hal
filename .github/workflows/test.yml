@@ -203,6 +203,15 @@ jobs:
             --no-report \
             2>&1 | tee target/test-metrics-rust-x86_64.txt
 
+      - name: Build C API library
+        run: cargo build --release -p edgefirst-hal-capi
+
+      - name: Run C API tests
+        run: |
+          set -o pipefail
+          cd crates/capi/tests
+          make test 2>&1 | tee ../../../target/test-metrics-capi-x86_64.txt
+
       - name: Run Python tests with coverage
         run: |
           set -o pipefail
@@ -245,7 +254,9 @@ jobs:
           path: |
             target/pytest_results.xml
             target/nextest/default/test-results.xml
-            target/test-metrics-*-x86_64.txt
+            target/test-metrics-rust-x86_64.txt
+            target/test-metrics-capi-x86_64.txt
+            target/test-metrics-python-x86_64.txt
           retention-days: 30
 
       - name: Publish test results
@@ -358,6 +369,15 @@ jobs:
             --no-report \
             2>&1 | tee target/test-metrics-rust-aarch64.txt
 
+      - name: Build C API library
+        run: cargo build --release -p edgefirst-hal-capi
+
+      - name: Run C API tests
+        run: |
+          set -o pipefail
+          cd crates/capi/tests
+          make test 2>&1 | tee ../../../target/test-metrics-capi-aarch64.txt
+
       - name: Run Python tests with coverage
         run: |
           set -o pipefail
@@ -414,8 +434,26 @@ jobs:
           path: |
             target/pytest_results.xml
             target/nextest/default/test-results.xml
-            target/test-metrics-*-aarch64.txt
+            target/test-metrics-rust-aarch64.txt
+            target/test-metrics-capi-aarch64.txt
+            target/test-metrics-python-aarch64.txt
           retention-days: 30
+
+      - name: Build C API test binaries for hardware
+        run: |
+          # Build C API library (release)
+          cargo build --release -p edgefirst-hal-capi
+          # Build C tests
+          cd crates/capi/tests
+          make all
+          cd ../../..
+          # Copy C API artifacts for hardware testing
+          mkdir -p hardware-capi-tests
+          cp target/release/libedgefirst_hal.so hardware-capi-tests/
+          cp target/release/libedgefirst_hal.a hardware-capi-tests/ 2>/dev/null || true
+          cp crates/capi/tests/build/test_all hardware-capi-tests/
+          echo "C API test artifacts:"
+          ls -la hardware-capi-tests/
 
       - name: Upload hardware test artifacts (binaries + wheels only)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
@@ -427,6 +465,7 @@ jobs:
             target/profiling/deps/*.so*
             target/wheels/*.whl
             hardware-test-binaries/
+            hardware-capi-tests/
           retention-days: 7
 
       - name: Upload coverage instrumented binaries (for profraw processing)
@@ -526,6 +565,18 @@ jobs:
           done
           [ $TEST_FAILED -eq 0 ] || exit 1
 
+      - name: Run C API tests
+        run: |
+          set -o pipefail
+          if [ -d "hardware-capi-tests" ] && [ -f "hardware-capi-tests/test_all" ]; then
+            echo "=== Running C API tests on hardware ==="
+            chmod +x hardware-capi-tests/test_all
+            export LD_LIBRARY_PATH=$(pwd)/hardware-capi-tests:$LD_LIBRARY_PATH
+            hardware-capi-tests/test_all 2>&1 | tee build/test-metrics-capi-imx8mp.txt
+          else
+            echo "C API test binary not found, skipping"
+          fi
+
       - name: Run benchmarks (main branch only)
         if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
         run: |
@@ -574,7 +625,8 @@ jobs:
           path: |
             build/pytest_results.xml
             build/rust_hardware_results.xml
-            build/test-metrics-*-imx8mp.txt
+            build/test-metrics-python-imx8mp.txt
+            build/test-metrics-capi-imx8mp.txt
           retention-days: 30
 
       - name: Upload benchmark results
@@ -593,10 +645,13 @@ jobs:
           echo "## Hardware Test Results (imx8mp)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           if [ -f build/pytest_results.xml ]; then
-            echo "Python tests completed - see artifacts for details" >> $GITHUB_STEP_SUMMARY
+            echo "- Python tests completed - see artifacts for details" >> $GITHUB_STEP_SUMMARY
           fi
           if [ -f build/rust_hardware_results.xml ]; then
-            echo "Rust tests completed - see artifacts for details" >> $GITHUB_STEP_SUMMARY
+            echo "- Rust tests completed - see artifacts for details" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -f build/test-metrics-capi-imx8mp.txt ]; then
+            echo "- C API tests completed - see artifacts for details" >> $GITHUB_STEP_SUMMARY
           fi
 
       - name: Generate benchmark summary
@@ -744,9 +799,9 @@ jobs:
             echo "## Test Platforms"
             echo "| Platform | Architecture | Tests |"
             echo "|----------|--------------|-------|"
-            echo "| Ubuntu 22.04 | x86_64 | Rust, Python |"
-            echo "| Ubuntu 22.04 | aarch64 | Rust, Python |"
-            echo "| NXP i.MX8M Plus | aarch64 | Rust, Python (DMA, G2D) |"
+            echo "| Ubuntu 22.04 | x86_64 | Rust, Python, C API |"
+            echo "| Ubuntu 22.04 | aarch64 | Rust, Python, C API |"
+            echo "| NXP i.MX8M Plus | aarch64 | Rust, Python, C API (DMA, G2D) |"
             echo ""
             python3 scripts/coverage_summary.py --github-actions
             echo ""
