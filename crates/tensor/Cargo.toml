@@ -23,11 +23,15 @@ uuid = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 dma-heap = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
 
 [dev-dependencies]
 divan = { workspace = true }
 rand = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
 procfs = { workspace = true }
 
 [[bench]]

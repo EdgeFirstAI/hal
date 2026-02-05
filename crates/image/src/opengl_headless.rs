@@ -1205,16 +1205,18 @@ impl GLProcessorST {
         let has_crop = crop.dst_rect.is_some_and(|x| {
             x.left != 0 || x.top != 0 || x.width != dst.width() || x.height != dst.height()
         });
-        if has_crop && let Some(dst_color) = crop.dst_color {
-            unsafe {
-                gls::gl::ClearColor(
-                    dst_color[0] as f32 / 255.0,
-                    dst_color[1] as f32 / 255.0,
-                    dst_color[2] as f32 / 255.0,
-                    dst_color[3] as f32 / 255.0,
-                );
-                gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
-            };
+        if has_crop {
+            if let Some(dst_color) = crop.dst_color {
+                unsafe {
+                    gls::gl::ClearColor(
+                        dst_color[0] as f32 / 255.0,
+                        dst_color[1] as f32 / 255.0,
+                        dst_color[2] as f32 / 255.0,
+                        dst_color[3] as f32 / 255.0,
+                    );
+                    gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
+                };
+            }
         }
 
         // top and bottom are flipped because OpenGL uses 0,0 as bottom left
@@ -1371,19 +1373,21 @@ impl GLProcessorST {
         let has_crop = crop.dst_rect.is_some_and(|x| {
             x.left != 0 || x.top != 0 || x.width != dst.width() || x.height != dst.height()
         });
-        if has_crop && let Some(dst_color) = crop.dst_color {
-            self.clear_rect_planar(
-                dst.width(),
-                dst.height(),
-                dst_roi,
-                [
-                    dst_color[0] as f32 / 255.0,
-                    dst_color[1] as f32 / 255.0,
-                    dst_color[2] as f32 / 255.0,
-                    dst_color[3] as f32 / 255.0,
-                ],
-                alpha,
-            )?;
+        if has_crop {
+            if let Some(dst_color) = crop.dst_color {
+                self.clear_rect_planar(
+                    dst.width(),
+                    dst.height(),
+                    dst_roi,
+                    [
+                        dst_color[0] as f32 / 255.0,
+                        dst_color[1] as f32 / 255.0,
+                        dst_color[2] as f32 / 255.0,
+                        dst_color[3] as f32 / 255.0,
+                    ],
+                    alpha,
+                )?;
+            }
         }
 
         let new_egl_image = self.create_image_from_dma2(src)?;
