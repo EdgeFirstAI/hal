@@ -3,11 +3,14 @@ name = "edgefirst-hal"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-description.workspace = true
+description = "EdgeFirst Hardware Abstraction Layer for edge AI inference pipelines"
 homepage.workspace = true
 repository.workspace = true
-readme.workspace = true
+readme = "README.md"
 license.workspace = true
+keywords = ["edge-ai", "machine-learning", "tensor", "image-processing", "embedded"]
+categories = ["computer-vision", "multimedia::images", "science::ml", "embedded"]
+documentation = "https://docs.rs/edgefirst-hal"
 
 [features]
 default = ["ndarray", "opengl"]
