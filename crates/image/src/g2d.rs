@@ -69,29 +69,24 @@ impl G2DProcessor {
         }
 
         // need to clear before assigning the crop
-        let needs_clear = if let Some(dst_rect) = crop.dst_rect
-            && (dst_rect.left != 0
-                || dst_rect.top != 0
-                || dst_rect.width != dst.width()
-                || dst_rect.height != dst.height())
-            && crop.dst_color.is_some()
-        {
-            true
-        } else {
-            false
-        };
+        let needs_clear = crop.dst_color.is_some()
+            && crop.dst_rect.map_or(false, |dst_rect| {
+                dst_rect.left != 0
+                    || dst_rect.top != 0
+                    || dst_rect.width != dst.width()
+                    || dst_rect.height != dst.height()
+            });
 
         let mut cleared = false;
-        if needs_clear
-            && dst.fourcc != RGB
-            && let Some(dst_rect) = crop.dst_rect
-            && dst_rect.width * dst_rect.height < dst.width() * dst.height() / 2
-            && let Some(dst_color) = crop.dst_color
-        {
-            let start = Instant::now();
-            self.g2d.clear(&mut dst_surface, dst_color)?;
-            log::trace!("clear takes {:?}", start.elapsed());
-            cleared = true;
+        if needs_clear && dst.fourcc != RGB {
+            if let (Some(dst_rect), Some(dst_color)) = (crop.dst_rect, crop.dst_color) {
+                if dst_rect.width * dst_rect.height < dst.width() * dst.height() / 2 {
+                    let start = Instant::now();
+                    self.g2d.clear(&mut dst_surface, dst_color)?;
+                    log::trace!("clear takes {:?}", start.elapsed());
+                    cleared = true;
+                }
+            }
         }
 
         if let Some(crop_rect) = crop.dst_rect {
@@ -118,14 +113,12 @@ impl G2DProcessor {
         log::trace!("Blitting from {src_surface:?} to {dst_surface:?}");
         self.g2d.blit(&src_surface, &dst_surface)?;
 
-        if needs_clear
-            && !cleared
-            && let Some(dst_color) = crop.dst_color
-            && let Some(dst_rect) = crop.dst_rect
-        {
-            let start = Instant::now();
-            CPUProcessor::fill_image_outside_crop(dst, dst_color, dst_rect)?;
-            log::trace!("clear takes {:?}", start.elapsed());
+        if needs_clear && !cleared {
+            if let (Some(dst_color), Some(dst_rect)) = (crop.dst_color, crop.dst_rect) {
+                let start = Instant::now();
+                CPUProcessor::fill_image_outside_crop(dst, dst_color, dst_rect)?;
+                log::trace!("clear takes {:?}", start.elapsed());
+            }
         }
 
         Ok(())

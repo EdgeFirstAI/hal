@@ -5,7 +5,7 @@ use crate::{
     FunctionTimer,
     tensor::{PyTensorMap, PyTensorMemory, TensorMapT},
 };
-use edgefirst::{
+use edgefirst_hal::{
     decoder::{BoundingBox, DetectBox, Segmentation},
     image::{self, Crop, Flip, ImageProcessorTrait, RGBA, Rect, Rotation, TensorImage},
     tensor::{self, TensorMapTrait, TensorTrait},

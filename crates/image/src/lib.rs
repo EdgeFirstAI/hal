@@ -1112,11 +1112,11 @@ impl ImageProcessor {
     /// # }
     pub fn new() -> Result<Self> {
         #[cfg(target_os = "linux")]
-        let g2d = if let Ok(x) = std::env::var("EDGEFIRST_DISABLE_G2D")
-            && x != "0"
-            && x.to_lowercase() != "false"
+        let g2d = if std::env::var("EDGEFIRST_DISABLE_G2D")
+            .map(|x| x != "0" && x.to_lowercase() != "false")
+            .unwrap_or(false)
         {
-            log::debug!("EDGEFIRST_DISABLE_G2D = {x}");
+            log::debug!("EDGEFIRST_DISABLE_G2D is set");
             None
         } else {
             match G2DProcessor::new() {
@@ -1130,11 +1130,11 @@ impl ImageProcessor {
 
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
-        let opengl = if let Ok(x) = std::env::var("EDGEFIRST_DISABLE_GL")
-            && x != "0"
-            && x.to_lowercase() != "false"
+        let opengl = if std::env::var("EDGEFIRST_DISABLE_GL")
+            .map(|x| x != "0" && x.to_lowercase() != "false")
+            .unwrap_or(false)
         {
-            log::debug!("EDGEFIRST_DISABLE_GL = {x}");
+            log::debug!("EDGEFIRST_DISABLE_GL is set");
             None
         } else {
             match GLProcessorThreaded::new() {
@@ -1146,11 +1146,11 @@ impl ImageProcessor {
             }
         };
 
-        let cpu = if let Ok(x) = std::env::var("EDGEFIRST_DISABLE_CPU")
-            && x != "0"
-            && x.to_lowercase() != "false"
+        let cpu = if std::env::var("EDGEFIRST_DISABLE_CPU")
+            .map(|x| x != "0" && x.to_lowercase() != "false")
+            .unwrap_or(false)
         {
-            log::debug!("EDGEFIRST_DISABLE_CPU = {x}");
+            log::debug!("EDGEFIRST_DISABLE_CPU is set");
             None
         } else {
             Some(CPUProcessor::new())
@@ -1208,19 +1208,17 @@ impl ImageProcessorTrait for ImageProcessor {
         };
 
         // TODO: Check if still use CPU when rotation or flip is enabled
-        if src_shape == dst_shape
-            && flip == Flip::None
-            && rotation == Rotation::None
-            && let Some(cpu) = self.cpu.as_mut()
-        {
-            match cpu.convert(src, dst, rotation, flip, crop) {
-                Ok(_) => {
-                    log::trace!("image converted with cpu in {:?}", start.elapsed());
-                    return Ok(());
-                }
-                Err(e) => {
-                    log::trace!("image didn't convert with cpu: {e:?}");
-                    return Err(e);
+        if src_shape == dst_shape && flip == Flip::None && rotation == Rotation::None {
+            if let Some(cpu) = self.cpu.as_mut() {
+                match cpu.convert(src, dst, rotation, flip, crop) {
+                    Ok(_) => {
+                        log::trace!("image converted with cpu in {:?}", start.elapsed());
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        log::trace!("image didn't convert with cpu: {e:?}");
+                        return Err(e);
+                    }
                 }
             }
         }
