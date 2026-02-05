@@ -485,6 +485,57 @@ where
     }
 }
 
+// ============================================================================
+// Platform availability helpers
+// ============================================================================
+
+/// Check if DMA memory allocation is available on this system.
+///
+/// Returns `true` only on Linux systems with DMA-BUF heap access (typically
+/// requires running as root or membership in a video/render group).
+/// Always returns `false` on non-Linux platforms (macOS, Windows, etc.).
+///
+/// This function caches its result after the first call for efficiency.
+#[cfg(target_os = "linux")]
+static DMA_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Check if DMA memory allocation is available on this system.
+#[cfg(target_os = "linux")]
+pub fn is_dma_available() -> bool {
+    *DMA_AVAILABLE.get_or_init(|| Tensor::<u8>::new(&[64], Some(TensorMemory::Dma), None).is_ok())
+}
+
+/// Check if DMA memory allocation is available on this system.
+///
+/// Always returns `false` on non-Linux platforms since DMA-BUF is Linux-specific.
+#[cfg(not(target_os = "linux"))]
+pub fn is_dma_available() -> bool {
+    false
+}
+
+/// Check if POSIX shared memory allocation is available on this system.
+///
+/// Returns `true` on Unix systems (Linux, macOS, BSD) where POSIX shared memory
+/// is supported. Always returns `false` on non-Unix platforms (Windows).
+///
+/// This function caches its result after the first call for efficiency.
+#[cfg(unix)]
+static SHM_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Check if POSIX shared memory allocation is available on this system.
+#[cfg(unix)]
+pub fn is_shm_available() -> bool {
+    *SHM_AVAILABLE.get_or_init(|| Tensor::<u8>::new(&[64], Some(TensorMemory::Shm), None).is_ok())
+}
+
+/// Check if POSIX shared memory allocation is available on this system.
+///
+/// Always returns `false` on non-Unix platforms since POSIX SHM is Unix-specific.
+#[cfg(not(unix))]
+pub fn is_shm_available() -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "linux")]
@@ -948,24 +999,15 @@ mod tests {
     // shared.
     pub static FD_LOCK: RwLock<()> = RwLock::new(());
 
-    // Helper function to check if DMA memory allocation is available (Linux only)
-    #[cfg(target_os = "linux")]
-    static DMA_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
-    #[cfg(target_os = "linux")]
-    fn is_dma_available() -> bool {
-        *DMA_AVAILABLE
-            .get_or_init(|| Tensor::<u8>::new(&[64], Some(TensorMemory::Dma), None).is_ok())
-    }
-
-    // Helper function to check if SHM memory allocation is available
-    #[cfg(unix)]
-    static SHM_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
-    #[cfg(unix)]
-    fn is_shm_available() -> bool {
-        *SHM_AVAILABLE
-            .get_or_init(|| Tensor::<u8>::new(&[64], Some(TensorMemory::Shm), None).is_ok())
+    /// Test that DMA is NOT available on non-Linux platforms.
+    /// This verifies the cross-platform behavior of is_dma_available().
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn test_dma_not_available_on_non_linux() {
+        assert!(
+            !is_dma_available(),
+            "DMA memory allocation should NOT be available on non-Linux platforms"
+        );
     }
 
     /// Test that SHM memory allocation is available and usable on Unix systems.

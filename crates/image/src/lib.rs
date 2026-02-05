@@ -1466,7 +1466,7 @@ const DEFAULT_COLORS_U8: [[u8; 4]; 20] = denorm(DEFAULT_COLORS);
 mod image_tests {
     use super::*;
     use crate::{CPUProcessor, Rotation};
-    use edgefirst_tensor::{TensorMapTrait, TensorMemory};
+    use edgefirst_tensor::{is_dma_available, TensorMapTrait, TensorMemory};
     use image::buffer::ConvertBuffer;
 
     #[ctor::ctor]
@@ -1858,16 +1858,6 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     fn is_g2d_available() -> bool {
         *G2D_AVAILABLE.get_or_init(|| G2DProcessor::new().is_ok())
-    }
-
-    #[cfg(target_os = "linux")]
-    static DMA_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
-    // Helper function to check if DMA memory allocation is available
-    #[cfg(target_os = "linux")]
-    fn is_dma_available() -> bool {
-        *DMA_AVAILABLE
-            .get_or_init(|| Tensor::<u8>::new(&[64], Some(TensorMemory::Dma), None).is_ok())
     }
 
     #[cfg(target_os = "linux")]
