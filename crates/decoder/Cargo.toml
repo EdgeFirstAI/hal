@@ -3,11 +3,14 @@ name = "edgefirst-decoder"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-description.workspace = true
+description = "ML model output decoding for YOLO and ModelPack object detection and segmentation"
 homepage.workspace = true
 repository.workspace = true
-readme.workspace = true
+readme = "README.md"
 license.workspace = true
+keywords = ["yolo", "object-detection", "segmentation", "nms", "edge-ai"]
+categories = ["computer-vision", "science::ml", "algorithms"]
+documentation = "https://docs.rs/edgefirst-decoder"
 
 [features]
 #default = ["tracker"]

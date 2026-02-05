@@ -3,11 +3,14 @@ name = "edgefirst-tensor"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-description.workspace = true
+description = "Zero-copy tensor memory management with DMA, shared memory, and heap backends"
 homepage.workspace = true
 repository.workspace = true
-readme.workspace = true
+readme = "README.md"
 license.workspace = true
+keywords = ["tensor", "dma", "shared-memory", "zero-copy", "edge-ai"]
+categories = ["data-structures", "memory-management", "embedded", "science::ml"]
+documentation = "https://docs.rs/edgefirst-tensor"
 
 [features]
 default = ["ndarray"]
