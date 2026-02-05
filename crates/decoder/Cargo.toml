@@ -9,7 +9,7 @@ repository.workspace = true
 readme = "README.md"
 license.workspace = true
 keywords = ["yolo", "object-detection", "segmentation", "nms", "edge-ai"]
-categories = ["computer-vision", "science::ml", "algorithms"]
+categories = ["multimedia::images", "science::ml", "algorithms"]
 documentation = "https://docs.rs/edgefirst-decoder"
 
 [features]
