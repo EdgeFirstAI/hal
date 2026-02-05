@@ -9,7 +9,7 @@ repository.workspace = true
 readme = "README.md"
 license.workspace = true
 keywords = ["image-processing", "computer-vision", "gpu", "edge-ai", "nv12"]
-categories = ["computer-vision", "multimedia::images", "multimedia::video", "embedded"]
+categories = ["multimedia::images", "multimedia::video", "embedded"]
 documentation = "https://docs.rs/edgefirst-image"
 
 [features]

@@ -24,7 +24,7 @@ This crate provides efficient post-processing for YOLO and ModelPack model outpu
 
 ## Quick Start
 
-```rust
+```rust,ignore
 use edgefirst_decoder::{DecoderBuilder, DetectBox, Segmentation};
 
 // Build decoder from model config
@@ -55,7 +55,7 @@ for det in &detections {
 
 For known model types, use the direct decoding functions:
 
-```rust
+```rust,ignore
 use edgefirst_decoder::yolo::decode_yolo_det;
 use edgefirst_decoder::Quantization;
 
@@ -90,4 +90,4 @@ Decoders can be configured via JSON/YAML matching the model's output specificati
 
 ## License
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+Licensed under the Apache License, Version 2.0. See [LICENSE](https://github.com/EdgeFirstAI/hal/blob/main/LICENSE) for details.
