@@ -31,18 +31,17 @@ mod dma;
 mod dmabuf;
 mod error;
 mod mem;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 mod shm;
 
 pub use crate::mem::{MemMap, MemTensor};
 #[cfg(target_os = "linux")]
-pub use crate::{
-    dma::{DmaMap, DmaTensor},
-    shm::{ShmMap, ShmTensor},
-};
+pub use crate::dma::{DmaMap, DmaTensor};
+#[cfg(unix)]
+pub use crate::shm::{ShmMap, ShmTensor};
 pub use error::{Error, Result};
 use num_traits::Num;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
 use std::{
     fmt,
@@ -62,14 +61,17 @@ where
     where
         Self: Sized;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     /// Create a new tensor using the given file descriptor, shape, and optional
     /// name. If no name is given, a random name will be generated.
+    ///
+    /// On Linux: Inspects the fd to determine DMA vs SHM based on device major/minor.
+    /// On other Unix (macOS): Always creates SHM tensor.
     fn from_fd(fd: std::os::fd::OwnedFd, shape: &[usize], name: Option<&str>) -> Result<Self>
     where
         Self: Sized;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     /// Clone the file descriptor associated with this tensor.
     fn clone_fd(&self) -> Result<std::os::fd::OwnedFd>;
 
@@ -166,7 +168,7 @@ pub enum TensorMemory {
     /// overhead for memory reading/writing with the CPU.  Allows for
     /// hardware acceleration when supported.
     Dma,
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     /// POSIX Shared Memory allocation. Suitable for inter-process
     /// communication, but not suitable for hardware acceleration.
     Shm,
@@ -180,7 +182,7 @@ impl From<TensorMemory> for String {
         match memory {
             #[cfg(target_os = "linux")]
             TensorMemory::Dma => "dma".to_owned(),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             TensorMemory::Shm => "shm".to_owned(),
             TensorMemory::Mem => "mem".to_owned(),
         }
@@ -194,7 +196,7 @@ impl TryFrom<&str> for TensorMemory {
         match s {
             #[cfg(target_os = "linux")]
             "dma" => Ok(TensorMemory::Dma),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             "shm" => Ok(TensorMemory::Shm),
             "mem" => Ok(TensorMemory::Mem),
             _ => Err(Error::InvalidMemoryType(s.to_owned())),
@@ -209,7 +211,7 @@ where
 {
     #[cfg(target_os = "linux")]
     Dma(DmaTensor<T>),
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     Shm(ShmTensor<T>),
     Mem(MemTensor<T>),
 }
@@ -224,7 +226,8 @@ where
     /// based on the platform and environment variables.
     ///
     /// On Linux platforms, the order of preference is: Dma -> Shm -> Mem.
-    /// On non-Linux platforms, only Mem is available.
+    /// On other Unix platforms (macOS), the order is: Shm -> Mem.
+    /// On non-Unix platforms, only Mem is available.
     ///
     /// # Environment Variables
     /// - `EDGEFIRST_TENSOR_FORCE_MEM`: If set to a non-zero and non-false
@@ -245,7 +248,7 @@ where
         match memory {
             #[cfg(target_os = "linux")]
             Some(TensorMemory::Dma) => DmaTensor::<T>::new(shape, name).map(Tensor::Dma),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             Some(TensorMemory::Shm) => ShmTensor::<T>::new(shape, name).map(Tensor::Shm),
             Some(TensorMemory::Mem) => MemTensor::<T>::new(shape, name).map(Tensor::Mem),
             None => {
@@ -255,15 +258,29 @@ where
                     MemTensor::<T>::new(shape, name).map(Tensor::Mem)
                 } else {
                     #[cfg(target_os = "linux")]
-                    match DmaTensor::<T>::new(shape, name) {
-                        Ok(tensor) => Ok(Tensor::Dma(tensor)),
-                        Err(_) => match ShmTensor::<T>::new(shape, name).map(Tensor::Shm) {
-                            Ok(tensor) => Ok(tensor),
-                            Err(_) => MemTensor::<T>::new(shape, name).map(Tensor::Mem),
-                        },
+                    {
+                        // Linux: Try DMA -> SHM -> Mem
+                        match DmaTensor::<T>::new(shape, name) {
+                            Ok(tensor) => Ok(Tensor::Dma(tensor)),
+                            Err(_) => match ShmTensor::<T>::new(shape, name).map(Tensor::Shm) {
+                                Ok(tensor) => Ok(tensor),
+                                Err(_) => MemTensor::<T>::new(shape, name).map(Tensor::Mem),
+                            },
+                        }
                     }
-                    #[cfg(not(target_os = "linux"))]
-                    MemTensor::<T>::new(shape, name).map(Tensor::Mem)
+                    #[cfg(all(unix, not(target_os = "linux")))]
+                    {
+                        // macOS/BSD: Try SHM -> Mem (no DMA)
+                        match ShmTensor::<T>::new(shape, name) {
+                            Ok(tensor) => Ok(Tensor::Shm(tensor)),
+                            Err(_) => MemTensor::<T>::new(shape, name).map(Tensor::Mem),
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        // Windows/other: Mem only
+                        MemTensor::<T>::new(shape, name).map(Tensor::Mem)
+                    }
                 }
             }
         }
@@ -278,41 +295,51 @@ where
         Self::new(shape, None, name)
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     /// Create a new tensor using the given file descriptor, shape, and optional
     /// name. If no name is given, a random name will be generated.
     ///
-    /// Inspects the file descriptor to determine the appropriate tensor type
+    /// On Linux: Inspects the file descriptor to determine the appropriate tensor type
     /// (Dma or Shm) based on the device major and minor numbers.
+    /// On other Unix (macOS): Always creates SHM tensor.
     fn from_fd(fd: OwnedFd, shape: &[usize], name: Option<&str>) -> Result<Self> {
-        use nix::sys::stat::fstat;
+        #[cfg(target_os = "linux")]
+        {
+            use nix::sys::stat::fstat;
 
-        let stat = fstat(&fd)?;
-        let major = major(stat.st_dev);
-        let minor = minor(stat.st_dev);
+            let stat = fstat(&fd)?;
+            let major = major(stat.st_dev);
+            let minor = minor(stat.st_dev);
 
-        log::debug!("Creating tensor from fd: major={major}, minor={minor}");
+            log::debug!("Creating tensor from fd: major={major}, minor={minor}");
 
-        if major != 0 {
-            // Dma and Shm tensors are expected to have major number 0
-            return Err(Error::UnknownDeviceType(major, minor));
+            if major != 0 {
+                // Dma and Shm tensors are expected to have major number 0
+                return Err(Error::UnknownDeviceType(major, minor));
+            }
+
+            match minor {
+                9 | 10 => {
+                    // minor number 9 & 10 indicates DMA memory
+                    DmaTensor::<T>::from_fd(fd, shape, name).map(Tensor::Dma)
+                }
+                _ => {
+                    // other minor numbers are assumed to be shared memory
+                    ShmTensor::<T>::from_fd(fd, shape, name).map(Tensor::Shm)
+                }
+            }
         }
-
-        match minor {
-            9 | 10 => {
-                // minor number 9 & 10 indicates DMA memory
-                DmaTensor::<T>::from_fd(fd, shape, name).map(Tensor::Dma)
-            }
-            _ => {
-                // other minor numbers are assumed to be shared memory
-                ShmTensor::<T>::from_fd(fd, shape, name).map(Tensor::Shm)
-            }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            // On macOS/BSD, always use SHM (no DMA support)
+            ShmTensor::<T>::from_fd(fd, shape, name).map(Tensor::Shm)
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn clone_fd(&self) -> Result<OwnedFd> {
         match self {
+            #[cfg(target_os = "linux")]
             Tensor::Dma(t) => t.clone_fd(),
             Tensor::Shm(t) => t.clone_fd(),
             Tensor::Mem(t) => t.clone_fd(),
@@ -323,7 +350,7 @@ where
         match self {
             #[cfg(target_os = "linux")]
             Tensor::Dma(_) => TensorMemory::Dma,
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             Tensor::Shm(_) => TensorMemory::Shm,
             Tensor::Mem(_) => TensorMemory::Mem,
         }
@@ -333,7 +360,7 @@ where
         match self {
             #[cfg(target_os = "linux")]
             Tensor::Dma(t) => t.name(),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             Tensor::Shm(t) => t.name(),
             Tensor::Mem(t) => t.name(),
         }
@@ -343,7 +370,7 @@ where
         match self {
             #[cfg(target_os = "linux")]
             Tensor::Dma(t) => t.shape(),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             Tensor::Shm(t) => t.shape(),
             Tensor::Mem(t) => t.shape(),
         }
@@ -353,7 +380,7 @@ where
         match self {
             #[cfg(target_os = "linux")]
             Tensor::Dma(t) => t.reshape(shape),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             Tensor::Shm(t) => t.reshape(shape),
             Tensor::Mem(t) => t.reshape(shape),
         }
@@ -363,7 +390,7 @@ where
         match self {
             #[cfg(target_os = "linux")]
             Tensor::Dma(t) => t.map(),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             Tensor::Shm(t) => t.map(),
             Tensor::Mem(t) => t.map(),
         }
@@ -376,7 +403,7 @@ where
 {
     #[cfg(target_os = "linux")]
     Dma(DmaMap<T>),
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     Shm(ShmMap<T>),
     Mem(MemMap<T>),
 }
@@ -389,7 +416,7 @@ where
         match self {
             #[cfg(target_os = "linux")]
             TensorMap::Dma(map) => map.shape(),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             TensorMap::Shm(map) => map.shape(),
             TensorMap::Mem(map) => map.shape(),
         }
@@ -399,7 +426,7 @@ where
         match self {
             #[cfg(target_os = "linux")]
             TensorMap::Dma(map) => map.unmap(),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             TensorMap::Shm(map) => map.unmap(),
             TensorMap::Mem(map) => map.unmap(),
         }
@@ -409,7 +436,7 @@ where
         match self {
             #[cfg(target_os = "linux")]
             TensorMap::Dma(map) => map.as_slice(),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             TensorMap::Shm(map) => map.as_slice(),
             TensorMap::Mem(map) => map.as_slice(),
         }
@@ -419,7 +446,7 @@ where
         match self {
             #[cfg(target_os = "linux")]
             TensorMap::Dma(map) => map.as_mut_slice(),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             TensorMap::Shm(map) => map.as_mut_slice(),
             TensorMap::Mem(map) => map.as_mut_slice(),
         }
@@ -436,7 +463,7 @@ where
         match self {
             #[cfg(target_os = "linux")]
             TensorMap::Dma(map) => map.deref(),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             TensorMap::Shm(map) => map.deref(),
             TensorMap::Mem(map) => map.deref(),
         }
@@ -451,7 +478,7 @@ where
         match self {
             #[cfg(target_os = "linux")]
             TensorMap::Dma(map) => map.deref_mut(),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             TensorMap::Shm(map) => map.deref_mut(),
             TensorMap::Mem(map) => map.deref_mut(),
         }
@@ -462,7 +489,9 @@ where
 mod tests {
     #[cfg(target_os = "linux")]
     use nix::unistd::{AccessFlags, access};
-    use std::{io::Write as _, sync::RwLock};
+    #[cfg(target_os = "linux")]
+    use std::io::Write as _;
+    use std::sync::RwLock;
 
     use super::*;
 
@@ -471,6 +500,8 @@ mod tests {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     }
 
+    /// Macro to get the current function name for logging in tests.
+    #[cfg(target_os = "linux")]
     macro_rules! function {
         () => {{
             fn f() {}
@@ -503,7 +534,20 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn test_tensor() {
+        let shape = vec![1];
+        let tensor = Tensor::<f32>::new(&shape, None, None).expect("Failed to create tensor");
+        // On macOS/BSD, auto-detection tries SHM first, falls back to Mem
+        assert!(
+            tensor.memory() == TensorMemory::Shm || tensor.memory() == TensorMemory::Mem,
+            "Expected SHM or Mem on macOS, got {:?}",
+            tensor.memory()
+        );
+    }
+
+    #[test]
+    #[cfg(not(unix))]
     fn test_tensor() {
         let shape = vec![1];
         let tensor = Tensor::<f32>::new(&shape, None, None).expect("Failed to create tensor");
@@ -609,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn test_shm_tensor() {
         let _lock = FD_LOCK.read().unwrap();
         let shape = vec![2, 3, 4];
@@ -904,33 +948,48 @@ mod tests {
     // shared.
     pub static FD_LOCK: RwLock<()> = RwLock::new(());
 
+    // Helper function to check if DMA memory allocation is available (Linux only)
+    #[cfg(target_os = "linux")]
     static DMA_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // Helper function to check if DMA memory allocation is available
-    fn is_dma_available() -> bool {
-        #[cfg(target_os = "linux")]
-        {
-            *DMA_AVAILABLE
-                .get_or_init(|| Tensor::<u8>::new(&[64], Some(TensorMemory::Dma), None).is_ok())
-        }
 
-        #[cfg(not(target_os = "linux"))]
-        {
-            false
-        }
+    #[cfg(target_os = "linux")]
+    fn is_dma_available() -> bool {
+        *DMA_AVAILABLE
+            .get_or_init(|| Tensor::<u8>::new(&[64], Some(TensorMemory::Dma), None).is_ok())
     }
 
+    // Helper function to check if SHM memory allocation is available
+    #[cfg(unix)]
     static SHM_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // Helper function to check if DMA memory allocation is available
-    fn is_shm_available() -> bool {
-        #[cfg(target_os = "linux")]
-        {
-            *SHM_AVAILABLE
-                .get_or_init(|| Tensor::<u8>::new(&[64], Some(TensorMemory::Shm), None).is_ok())
-        }
 
-        #[cfg(not(target_os = "linux"))]
-        {
-            false
-        }
+    #[cfg(unix)]
+    fn is_shm_available() -> bool {
+        *SHM_AVAILABLE
+            .get_or_init(|| Tensor::<u8>::new(&[64], Some(TensorMemory::Shm), None).is_ok())
+    }
+
+    /// Test that SHM memory allocation is available and usable on Unix systems.
+    /// This is a basic functional test; Linux has additional FD leak tests using procfs.
+    #[test]
+    #[cfg(unix)]
+    fn test_shm_available_and_usable() {
+        assert!(
+            is_shm_available(),
+            "SHM memory allocation should be available on Unix systems"
+        );
+
+        // Create a tensor with SHM backing
+        let tensor = Tensor::<u8>::new(&[100, 100], Some(TensorMemory::Shm), None)
+            .expect("Failed to create SHM tensor");
+
+        // Verify we can map and write to it
+        let mut map = tensor.map().expect("Failed to map SHM tensor");
+        map.as_mut_slice().fill(0xAB);
+
+        // Verify the data was written correctly
+        assert!(
+            map.as_slice().iter().all(|&b| b == 0xAB),
+            "SHM tensor data should be writable and readable"
+        );
     }
 }
