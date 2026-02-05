@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    Crop, Error, Flip, FunctionTimer, GREY, ImageProcessorTrait, NV12, NV16, PLANAR_RGB,
-    PLANAR_RGBA, RGB, RGBA, Rect, Result, Rotation, TensorImage, TensorImageDst, TensorImageRef,
-    YUYV,
+    Crop, Error, Flip, FunctionTimer, ImageProcessorTrait, Rect, Result, Rotation, TensorImage,
+    TensorImageDst, TensorImageRef, GREY, NV12, NV16, PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, YUYV,
 };
 #[cfg(feature = "decoder")]
 use edgefirst_decoder::{DetectBox, Segmentation};
@@ -2078,7 +2077,7 @@ impl ImageProcessorTrait for CPUProcessor {
 mod cpu_tests {
 
     use super::*;
-    use crate::{CPUProcessor, RGBA, Rotation, TensorImageRef};
+    use crate::{CPUProcessor, Rotation, TensorImageRef, RGBA};
     use edgefirst_tensor::{Tensor, TensorMapTrait, TensorMemory};
     use image::buffer::ConvertBuffer;
 
@@ -2720,9 +2719,7 @@ mod cpu_tests {
 
         assert_eq!(
             converted.tensor().map()?.as_slice(),
-            &[
-                10, 10, 10, 255, 13, 13, 13, 255, 30, 30, 30, 255, 33, 33, 33, 255
-            ]
+            &[10, 10, 10, 255, 13, 13, 13, 255, 30, 30, 30, 255, 33, 33, 33, 255]
         );
         Ok(())
     }

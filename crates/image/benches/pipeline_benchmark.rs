@@ -23,22 +23,22 @@
 
 mod common;
 
-use common::{BenchConfig, calculate_letterbox, g2d_available, get_test_data, opengl_available};
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use common::{calculate_letterbox, g2d_available, get_test_data, opengl_available, BenchConfig};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
 #[cfg(target_os = "linux")]
 use edgefirst_image::G2DProcessor;
 #[cfg(all(target_os = "linux", feature = "opengl"))]
 use edgefirst_image::GLProcessorThreaded;
 use edgefirst_image::{
-    CPUProcessor, Crop, Flip, ImageProcessorTrait, NV12, RGB, RGBA, Rect, Rotation, TensorImage,
+    CPUProcessor, Crop, Flip, ImageProcessorTrait, Rect, Rotation, TensorImage, NV12, RGB, RGBA,
     YUYV,
 };
 use edgefirst_tensor::{TensorMapTrait, TensorMemory, TensorTrait};
 
 #[cfg(feature = "opencv")]
 use opencv::{
-    core::{CV_8UC2, CV_8UC3, CV_8UC4, Mat, Scalar, Size, set_num_threads},
+    core::{set_num_threads, Mat, Scalar, Size, CV_8UC2, CV_8UC3, CV_8UC4},
     imgproc,
     prelude::*,
 };

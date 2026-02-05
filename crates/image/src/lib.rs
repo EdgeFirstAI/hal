@@ -59,11 +59,11 @@ and hardware acceleration. However, this will increase the performance of the CP
 use edgefirst_decoder::{DetectBox, Segmentation};
 use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait as _};
 use enum_dispatch::enum_dispatch;
-use four_char_code::{FourCharCode, four_char_code};
+use four_char_code::{four_char_code, FourCharCode};
 use std::{fmt::Display, time::Instant};
 use zune_jpeg::{
-    JpegDecoder,
     zune_core::{colorspace::ColorSpace, options::DecoderOptions},
+    JpegDecoder,
 };
 use zune_png::PngDecoder;
 
