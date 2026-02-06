@@ -697,6 +697,7 @@ impl<T> Pipe for T {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CString;
 
     #[test]
     fn test_tensor_create_and_free() {
@@ -722,6 +723,98 @@ mod tests {
             assert_eq!(*shape_ptr, 2);
             assert_eq!(*shape_ptr.add(1), 3);
             assert_eq!(*shape_ptr.add(2), 4);
+
+            hal_tensor_free(tensor);
+        }
+    }
+
+    #[test]
+    fn test_tensor_all_dtypes() {
+        unsafe {
+            let shape: [size_t; 2] = [4, 4];
+            let dtypes = [
+                (HalDtype::U8, 1),
+                (HalDtype::I8, 1),
+                (HalDtype::U16, 2),
+                (HalDtype::I16, 2),
+                (HalDtype::U32, 4),
+                (HalDtype::I32, 4),
+                (HalDtype::U64, 8),
+                (HalDtype::I64, 8),
+                (HalDtype::F32, 4),
+                (HalDtype::F64, 8),
+            ];
+
+            for (dtype, expected_size) in dtypes {
+                let tensor = hal_tensor_new(
+                    dtype,
+                    shape.as_ptr(),
+                    shape.len(),
+                    HalTensorMemory::Mem,
+                    std::ptr::null(),
+                );
+                assert!(
+                    !tensor.is_null(),
+                    "Failed to create tensor with dtype {:?}",
+                    dtype
+                );
+
+                assert_eq!(hal_tensor_dtype(tensor), dtype);
+                assert_eq!(hal_tensor_dtype_size(tensor), expected_size);
+                assert_eq!(hal_tensor_len(tensor), 16);
+                assert_eq!(hal_tensor_size(tensor), 16 * expected_size);
+
+                hal_tensor_free(tensor);
+            }
+        }
+    }
+
+    #[test]
+    fn test_tensor_with_name() {
+        unsafe {
+            let shape: [size_t; 2] = [4, 4];
+            let name = CString::new("test_tensor").unwrap();
+            let tensor = hal_tensor_new(
+                HalDtype::F32,
+                shape.as_ptr(),
+                shape.len(),
+                HalTensorMemory::Mem,
+                name.as_ptr(),
+            );
+            assert!(!tensor.is_null());
+
+            let returned_name = hal_tensor_name(tensor);
+            assert!(!returned_name.is_null());
+
+            let name_str = std::ffi::CStr::from_ptr(returned_name).to_str().unwrap();
+            assert_eq!(name_str, "test_tensor");
+
+            // Free the returned name
+            libc::free(returned_name as *mut libc::c_void);
+            hal_tensor_free(tensor);
+        }
+    }
+
+    #[test]
+    fn test_tensor_memory_type() {
+        unsafe {
+            let shape: [size_t; 2] = [4, 4];
+            let tensor = hal_tensor_new(
+                HalDtype::F32,
+                shape.as_ptr(),
+                shape.len(),
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert!(!tensor.is_null());
+
+            assert_eq!(hal_tensor_memory_type(tensor), HalTensorMemory::Mem);
+
+            // NULL tensor returns Mem
+            assert_eq!(
+                hal_tensor_memory_type(std::ptr::null()),
+                HalTensorMemory::Mem
+            );
 
             hal_tensor_free(tensor);
         }
@@ -758,6 +851,74 @@ mod tests {
     }
 
     #[test]
+    fn test_tensor_map_const_data() {
+        unsafe {
+            let shape: [size_t; 2] = [5, 5];
+            let tensor = hal_tensor_new(
+                HalDtype::U8,
+                shape.as_ptr(),
+                shape.len(),
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert!(!tensor.is_null());
+
+            let map = hal_tensor_map_create(tensor);
+            assert!(!map.is_null());
+
+            // Test const data access
+            let data_const = hal_tensor_map_data_const(map);
+            assert!(!data_const.is_null());
+
+            // NULL map returns NULL
+            assert!(hal_tensor_map_data_const(std::ptr::null()).is_null());
+            assert!(hal_tensor_map_data(std::ptr::null_mut()).is_null());
+
+            hal_tensor_map_unmap(map);
+            hal_tensor_free(tensor);
+        }
+    }
+
+    #[test]
+    fn test_tensor_map_shape() {
+        unsafe {
+            let shape: [size_t; 3] = [2, 3, 4];
+            let tensor = hal_tensor_new(
+                HalDtype::I32,
+                shape.as_ptr(),
+                shape.len(),
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert!(!tensor.is_null());
+
+            let map = hal_tensor_map_create(tensor);
+            assert!(!map.is_null());
+
+            let mut ndim: size_t = 0;
+            let map_shape = hal_tensor_map_shape(map, &mut ndim);
+            assert!(!map_shape.is_null());
+            assert_eq!(ndim, 3);
+            assert_eq!(*map_shape, 2);
+            assert_eq!(*map_shape.add(1), 3);
+            assert_eq!(*map_shape.add(2), 4);
+
+            // Test with NULL out_ndim
+            let map_shape2 = hal_tensor_map_shape(map, std::ptr::null_mut());
+            assert!(!map_shape2.is_null());
+
+            // NULL map returns NULL and sets ndim to 0
+            let mut ndim2: size_t = 99;
+            let null_shape = hal_tensor_map_shape(std::ptr::null(), &mut ndim2);
+            assert!(null_shape.is_null());
+            assert_eq!(ndim2, 0);
+
+            hal_tensor_map_unmap(map);
+            hal_tensor_free(tensor);
+        }
+    }
+
+    #[test]
     fn test_tensor_reshape() {
         unsafe {
             let shape: [size_t; 2] = [6, 4];
@@ -784,13 +945,174 @@ mod tests {
     }
 
     #[test]
+    fn test_tensor_reshape_errors() {
+        unsafe {
+            let shape: [size_t; 2] = [6, 4];
+            let tensor = hal_tensor_new(
+                HalDtype::U8,
+                shape.as_ptr(),
+                shape.len(),
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert!(!tensor.is_null());
+
+            // Wrong element count
+            let bad_shape: [size_t; 2] = [5, 5]; // 25 != 24
+            let result = hal_tensor_reshape(tensor, bad_shape.as_ptr(), bad_shape.len());
+            assert_eq!(result, -1);
+
+            // ndim > 8
+            let big_shape: [size_t; 9] = [1; 9];
+            let result = hal_tensor_reshape(tensor, big_shape.as_ptr(), 9);
+            assert_eq!(result, -1);
+
+            // ndim = 0
+            let result = hal_tensor_reshape(tensor, shape.as_ptr(), 0);
+            assert_eq!(result, -1);
+
+            // NULL shape
+            let result = hal_tensor_reshape(tensor, std::ptr::null(), 2);
+            assert_eq!(result, -1);
+
+            // NULL tensor
+            let result = hal_tensor_reshape(std::ptr::null_mut(), shape.as_ptr(), 2);
+            assert_eq!(result, -1);
+
+            hal_tensor_free(tensor);
+        }
+    }
+
+    #[test]
+    fn test_tensor_new_errors() {
+        unsafe {
+            let shape: [size_t; 2] = [4, 4];
+
+            // NULL shape
+            let tensor = hal_tensor_new(
+                HalDtype::F32,
+                std::ptr::null(),
+                2,
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert!(tensor.is_null());
+
+            // ndim = 0
+            let tensor = hal_tensor_new(
+                HalDtype::F32,
+                shape.as_ptr(),
+                0,
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert!(tensor.is_null());
+
+            // ndim > 8
+            let big_shape: [size_t; 9] = [2; 9];
+            let tensor = hal_tensor_new(
+                HalDtype::F32,
+                big_shape.as_ptr(),
+                9,
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert!(tensor.is_null());
+        }
+    }
+
+    #[test]
+    fn test_tensor_shape_null_ndim() {
+        unsafe {
+            let shape: [size_t; 2] = [4, 4];
+            let tensor = hal_tensor_new(
+                HalDtype::F32,
+                shape.as_ptr(),
+                shape.len(),
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert!(!tensor.is_null());
+
+            // Shape with NULL out_ndim should still work
+            let shape_ptr = hal_tensor_shape(tensor, std::ptr::null_mut());
+            assert!(!shape_ptr.is_null());
+            assert_eq!(*shape_ptr, 4);
+
+            hal_tensor_free(tensor);
+        }
+    }
+
+    #[test]
     fn test_null_handling() {
         unsafe {
             // These should not crash
             assert_eq!(hal_tensor_dtype(std::ptr::null()), HalDtype::U8);
+            assert_eq!(hal_tensor_dtype_size(std::ptr::null()), 0);
             assert_eq!(hal_tensor_len(std::ptr::null()), 0);
+            assert_eq!(hal_tensor_size(std::ptr::null()), 0);
+            assert!(hal_tensor_name(std::ptr::null()).is_null());
+
+            let mut ndim: size_t = 99;
+            assert!(hal_tensor_shape(std::ptr::null(), &mut ndim).is_null());
+            assert_eq!(ndim, 0);
+
+            assert!(hal_tensor_map_create(std::ptr::null()).is_null());
+            assert_eq!(hal_tensor_map_len(std::ptr::null()), 0);
+            assert_eq!(hal_tensor_map_size(std::ptr::null()), 0);
+
             hal_tensor_free(std::ptr::null_mut());
             hal_tensor_map_unmap(std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn test_dtype_size() {
+        assert_eq!(HalDtype::U8.size(), 1);
+        assert_eq!(HalDtype::I8.size(), 1);
+        assert_eq!(HalDtype::U16.size(), 2);
+        assert_eq!(HalDtype::I16.size(), 2);
+        assert_eq!(HalDtype::U32.size(), 4);
+        assert_eq!(HalDtype::I32.size(), 4);
+        assert_eq!(HalDtype::U64.size(), 8);
+        assert_eq!(HalDtype::I64.size(), 8);
+        assert_eq!(HalDtype::F32.size(), 4);
+        assert_eq!(HalDtype::F64.size(), 8);
+    }
+
+    #[test]
+    fn test_hal_tensor_memory_conversion() {
+        // Test From<HalTensorMemory> for Option<TensorMemory>
+        let mem: Option<TensorMemory> = HalTensorMemory::Mem.into();
+        assert!(matches!(mem, Some(TensorMemory::Mem)));
+
+        // Test From<TensorMemory> for HalTensorMemory
+        let hal_mem: HalTensorMemory = TensorMemory::Mem.into();
+        assert_eq!(hal_mem, HalTensorMemory::Mem);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_tensor_clone_fd_mem_tensor() {
+        unsafe {
+            let shape: [size_t; 2] = [4, 4];
+            let tensor = hal_tensor_new(
+                HalDtype::F32,
+                shape.as_ptr(),
+                shape.len(),
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert!(!tensor.is_null());
+
+            // MEM tensors don't support fd, should return -1
+            let fd = hal_tensor_clone_fd(tensor);
+            assert_eq!(fd, -1);
+
+            // NULL tensor should return -1
+            assert_eq!(hal_tensor_clone_fd(std::ptr::null()), -1);
+
+            hal_tensor_free(tensor);
         }
     }
 }

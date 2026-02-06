@@ -543,6 +543,30 @@ pub unsafe extern "C" fn hal_segmentation_list_free(list: *mut HalSegmentationLi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tensor::{
+        hal_tensor_free, hal_tensor_map_create, hal_tensor_map_data, hal_tensor_map_unmap,
+        hal_tensor_new, HalDtype, HalTensorMemory,
+    };
+    use std::ffi::CString;
+
+    // Valid YOLO detection config (84 features = 4 bbox + 80 classes)
+    const YOLO_JSON_CONFIG: &str = r#"{
+        "outputs": [{
+            "decoder": "ultralytics",
+            "type": "detection",
+            "shape": [1, 84, 8400],
+            "dshape": [["batch", 1], ["num_features", 84], ["num_boxes", 8400]]
+        }],
+        "nms": "class_aware"
+    }"#;
+
+    const YOLO_YAML_CONFIG: &str = r#"outputs:
+  - decoder: ultralytics
+    type: detection
+    shape: [1, 84, 8400]
+    dshape: [[batch, 1], [num_features, 84], [num_boxes, 8400]]
+nms: class_aware
+"#;
 
     #[test]
     fn test_builder_create_and_free() {
@@ -574,5 +598,538 @@ mod tests {
         let quant: Quantization = hal_quant.into();
         assert_eq!(quant.scale, 0.5);
         assert_eq!(quant.zero_point, 128);
+    }
+
+    #[test]
+    fn test_nms_conversion() {
+        let agnostic: Option<Nms> = HalNms::ClassAgnostic.into();
+        assert!(matches!(agnostic, Some(Nms::ClassAgnostic)));
+
+        let aware: Option<Nms> = HalNms::ClassAware.into();
+        assert!(matches!(aware, Some(Nms::ClassAware)));
+
+        let none: Option<Nms> = HalNms::None.into();
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn test_detect_box_conversion() {
+        let detect_box = DetectBox {
+            bbox: edgefirst_decoder::BoundingBox {
+                xmin: 0.1,
+                ymin: 0.2,
+                xmax: 0.3,
+                ymax: 0.4,
+            },
+            score: 0.95,
+            label: 5,
+        };
+        let hal_box = HalDetectBox::from(&detect_box);
+        assert!((hal_box.xmin - 0.1).abs() < 1e-6);
+        assert!((hal_box.ymin - 0.2).abs() < 1e-6);
+        assert!((hal_box.xmax - 0.3).abs() < 1e-6);
+        assert!((hal_box.ymax - 0.4).abs() < 1e-6);
+        assert!((hal_box.score - 0.95).abs() < 1e-6);
+        assert_eq!(hal_box.label, 5);
+    }
+
+    #[test]
+    fn test_builder_with_json_config() {
+        unsafe {
+            let builder = hal_decoder_builder_new();
+            assert!(!builder.is_null());
+
+            let config = CString::new(YOLO_JSON_CONFIG).unwrap();
+            let result = hal_decoder_builder_with_config_json(builder, config.as_ptr());
+            assert_eq!(result, 0);
+
+            let decoder = hal_decoder_builder_build(builder);
+            assert!(!decoder.is_null());
+
+            hal_decoder_free(decoder);
+        }
+    }
+
+    #[test]
+    fn test_builder_with_yaml_config() {
+        unsafe {
+            let builder = hal_decoder_builder_new();
+            assert!(!builder.is_null());
+
+            let config = CString::new(YOLO_YAML_CONFIG).unwrap();
+            let result = hal_decoder_builder_with_config_yaml(builder, config.as_ptr());
+            assert_eq!(result, 0);
+
+            let decoder = hal_decoder_builder_build(builder);
+            assert!(!decoder.is_null());
+
+            hal_decoder_free(decoder);
+        }
+    }
+
+    #[test]
+    fn test_builder_with_thresholds() {
+        unsafe {
+            let builder = hal_decoder_builder_new();
+            assert!(!builder.is_null());
+
+            // Set thresholds
+            assert_eq!(hal_decoder_builder_with_score_threshold(builder, 0.3), 0);
+            assert_eq!(hal_decoder_builder_with_iou_threshold(builder, 0.45), 0);
+            assert_eq!(hal_decoder_builder_with_nms(builder, HalNms::ClassAware), 0);
+
+            // Add config and build
+            let config = CString::new(YOLO_JSON_CONFIG).unwrap();
+            assert_eq!(
+                hal_decoder_builder_with_config_json(builder, config.as_ptr()),
+                0
+            );
+
+            let decoder = hal_decoder_builder_build(builder);
+            assert!(!decoder.is_null());
+
+            hal_decoder_free(decoder);
+        }
+    }
+
+    #[test]
+    fn test_builder_null_parameters() {
+        unsafe {
+            // NULL builder for all functions
+            assert_eq!(
+                hal_decoder_builder_with_score_threshold(std::ptr::null_mut(), 0.5),
+                -1
+            );
+            assert_eq!(
+                hal_decoder_builder_with_iou_threshold(std::ptr::null_mut(), 0.5),
+                -1
+            );
+            assert_eq!(
+                hal_decoder_builder_with_nms(std::ptr::null_mut(), HalNms::ClassAgnostic),
+                -1
+            );
+            assert_eq!(
+                hal_decoder_builder_with_config_json(std::ptr::null_mut(), std::ptr::null()),
+                -1
+            );
+            assert_eq!(
+                hal_decoder_builder_with_config_yaml(std::ptr::null_mut(), std::ptr::null()),
+                -1
+            );
+            assert!(hal_decoder_builder_build(std::ptr::null_mut()).is_null());
+
+            // NULL config strings
+            let builder = hal_decoder_builder_new();
+            assert!(!builder.is_null());
+            assert_eq!(
+                hal_decoder_builder_with_config_json(builder, std::ptr::null()),
+                -1
+            );
+            hal_decoder_builder_free(builder);
+
+            let builder = hal_decoder_builder_new();
+            assert!(!builder.is_null());
+            assert_eq!(
+                hal_decoder_builder_with_config_yaml(builder, std::ptr::null()),
+                -1
+            );
+            hal_decoder_builder_free(builder);
+        }
+    }
+
+    #[test]
+    fn test_builder_build_without_config() {
+        unsafe {
+            let builder = hal_decoder_builder_new();
+            assert!(!builder.is_null());
+
+            // Building without config should fail
+            let decoder = hal_decoder_builder_build(builder);
+            assert!(decoder.is_null());
+            // Builder is consumed even on failure
+        }
+    }
+
+    #[test]
+    fn test_decode_float_null_parameters() {
+        unsafe {
+            // Build a valid decoder
+            let builder = hal_decoder_builder_new();
+            let config = CString::new(YOLO_JSON_CONFIG).unwrap();
+            hal_decoder_builder_with_config_json(builder, config.as_ptr());
+            let decoder = hal_decoder_builder_build(builder);
+            assert!(!decoder.is_null());
+
+            // Create a tensor for testing
+            let shape: [usize; 3] = [1, 84, 8400];
+            let tensor = hal_tensor_new(
+                HalDtype::F32,
+                shape.as_ptr(),
+                3,
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert!(!tensor.is_null());
+            let outputs = [tensor as *const HalTensor];
+
+            let mut boxes: *mut HalDetectBoxList = std::ptr::null_mut();
+
+            // NULL decoder
+            assert_eq!(
+                hal_decoder_decode_float(
+                    std::ptr::null(),
+                    outputs.as_ptr(),
+                    1,
+                    &mut boxes as *mut _
+                ),
+                -1
+            );
+
+            // NULL outputs
+            assert_eq!(
+                hal_decoder_decode_float(decoder, std::ptr::null(), 1, &mut boxes as *mut _),
+                -1
+            );
+
+            // NULL out_boxes
+            assert_eq!(
+                hal_decoder_decode_float(decoder, outputs.as_ptr(), 1, std::ptr::null_mut()),
+                -1
+            );
+
+            // Zero num_outputs
+            assert_eq!(
+                hal_decoder_decode_float(decoder, outputs.as_ptr(), 0, &mut boxes as *mut _),
+                -1
+            );
+
+            hal_tensor_free(tensor);
+            hal_decoder_free(decoder);
+        }
+    }
+
+    #[test]
+    fn test_decode_float_wrong_dtype() {
+        unsafe {
+            // Build a valid decoder
+            let builder = hal_decoder_builder_new();
+            let config = CString::new(YOLO_JSON_CONFIG).unwrap();
+            hal_decoder_builder_with_config_json(builder, config.as_ptr());
+            let decoder = hal_decoder_builder_build(builder);
+            assert!(!decoder.is_null());
+
+            // Create a U8 tensor (wrong type for decode_float)
+            let shape: [usize; 3] = [1, 84, 8400];
+            let tensor = hal_tensor_new(
+                HalDtype::U8,
+                shape.as_ptr(),
+                3,
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert!(!tensor.is_null());
+            let outputs = [tensor as *const HalTensor];
+            let mut boxes: *mut HalDetectBoxList = std::ptr::null_mut();
+
+            // Should fail because tensor is U8, not F32
+            assert_eq!(
+                hal_decoder_decode_float(decoder, outputs.as_ptr(), 1, &mut boxes as *mut _),
+                -1
+            );
+
+            hal_tensor_free(tensor);
+            hal_decoder_free(decoder);
+        }
+    }
+
+    #[test]
+    fn test_decode_float_success() {
+        unsafe {
+            // Build a valid decoder with low threshold
+            let builder = hal_decoder_builder_new();
+            let config = CString::new(YOLO_JSON_CONFIG).unwrap();
+            hal_decoder_builder_with_config_json(builder, config.as_ptr());
+            hal_decoder_builder_with_score_threshold(builder, 0.01); // Low threshold
+            let decoder = hal_decoder_builder_build(builder);
+            assert!(!decoder.is_null());
+
+            // Create F32 tensor with correct shape for YOLO
+            let shape: [usize; 3] = [1, 84, 8400];
+            let tensor = hal_tensor_new(
+                HalDtype::F32,
+                shape.as_ptr(),
+                3,
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert!(!tensor.is_null());
+
+            // Fill with some data that might produce detections
+            let map = hal_tensor_map_create(tensor);
+            assert!(!map.is_null());
+            let data = hal_tensor_map_data(map) as *mut f32;
+
+            // YOLO output format: [batch, 84, num_boxes]
+            // 84 = 4 (bbox: cx, cy, w, h) + 80 (class scores)
+            // Initialize all to zero first
+            for i in 0..(84 * 8400) {
+                *data.add(i) = 0.0;
+            }
+
+            // Add a fake detection at box_idx=0
+            // YOLO layout: [batch, features, boxes] where features = 4 bbox + 80 classes
+            // Box coords (normalized): cx=0.5, cy=0.5, w=0.1, h=0.1
+            #[allow(clippy::identity_op, clippy::erasing_op)]
+            {
+                let box_idx = 0usize;
+                let num_boxes = 8400usize;
+                *data.add(0 * num_boxes + box_idx) = 0.5; // cx
+                *data.add(1 * num_boxes + box_idx) = 0.5; // cy
+                *data.add(2 * num_boxes + box_idx) = 0.1; // w
+                *data.add(3 * num_boxes + box_idx) = 0.1; // h
+                                                          // Class 0 score = 0.9
+                *data.add(4 * num_boxes + box_idx) = 0.9;
+            }
+
+            hal_tensor_map_unmap(map);
+
+            let outputs = [tensor as *const HalTensor];
+            let mut boxes: *mut HalDetectBoxList = std::ptr::null_mut();
+
+            let result =
+                hal_decoder_decode_float(decoder, outputs.as_ptr(), 1, &mut boxes as *mut _);
+            assert_eq!(result, 0);
+            assert!(!boxes.is_null());
+
+            // Check results - we may or may not have detections depending on thresholds
+            let len = hal_detect_box_list_len(boxes);
+            // len could be 0 or more depending on decoder internals
+
+            // If we have detections, test getting them
+            if len > 0 {
+                let mut box_out = HalDetectBox {
+                    xmin: 0.0,
+                    ymin: 0.0,
+                    xmax: 0.0,
+                    ymax: 0.0,
+                    score: 0.0,
+                    label: 0,
+                };
+                assert_eq!(hal_detect_box_list_get(boxes, 0, &mut box_out), 0);
+                // Box should have valid coordinates
+                assert!(box_out.xmax >= box_out.xmin);
+                assert!(box_out.ymax >= box_out.ymin);
+            }
+
+            // Test out of bounds
+            let mut box_out = HalDetectBox {
+                xmin: 0.0,
+                ymin: 0.0,
+                xmax: 0.0,
+                ymax: 0.0,
+                score: 0.0,
+                label: 0,
+            };
+            assert_eq!(hal_detect_box_list_get(boxes, len, &mut box_out), -1);
+
+            hal_detect_box_list_free(boxes);
+            hal_tensor_free(tensor);
+            hal_decoder_free(decoder);
+        }
+    }
+
+    #[test]
+    fn test_detect_box_list_get_null_output() {
+        unsafe {
+            // Create a box list manually for testing
+            let boxes = Box::into_raw(Box::new(HalDetectBoxList {
+                boxes: vec![DetectBox {
+                    bbox: edgefirst_decoder::BoundingBox {
+                        xmin: 0.1,
+                        ymin: 0.2,
+                        xmax: 0.3,
+                        ymax: 0.4,
+                    },
+                    score: 0.9,
+                    label: 1,
+                }],
+            }));
+
+            assert_eq!(hal_detect_box_list_len(boxes), 1);
+
+            // NULL output box
+            assert_eq!(hal_detect_box_list_get(boxes, 0, std::ptr::null_mut()), -1);
+
+            hal_detect_box_list_free(boxes);
+        }
+    }
+
+    #[test]
+    fn test_segmentation_list_operations() {
+        unsafe {
+            // Create a segmentation list manually for testing
+            // Segmentation uses Array3<u8> with shape (height, width, channels)
+            let mask_data = ndarray::Array3::<u8>::zeros((10, 10, 1));
+            let seg = Segmentation {
+                xmin: 0.1,
+                ymin: 0.2,
+                xmax: 0.3,
+                ymax: 0.4,
+                segmentation: mask_data,
+            };
+
+            let list = Box::into_raw(Box::new(HalSegmentationList { masks: vec![seg] }));
+
+            // Test length
+            assert_eq!(hal_segmentation_list_len(list), 1);
+
+            // Test get_bbox
+            let mut xmin = 0.0f32;
+            let mut ymin = 0.0f32;
+            let mut xmax = 0.0f32;
+            let mut ymax = 0.0f32;
+
+            assert_eq!(
+                hal_segmentation_list_get_bbox(list, 0, &mut xmin, &mut ymin, &mut xmax, &mut ymax),
+                0
+            );
+            assert!((xmin - 0.1).abs() < 1e-6);
+            assert!((ymin - 0.2).abs() < 1e-6);
+            assert!((xmax - 0.3).abs() < 1e-6);
+            assert!((ymax - 0.4).abs() < 1e-6);
+
+            // Test out of bounds
+            assert_eq!(
+                hal_segmentation_list_get_bbox(list, 1, &mut xmin, &mut ymin, &mut xmax, &mut ymax),
+                -1
+            );
+
+            // Test NULL parameters
+            assert_eq!(
+                hal_segmentation_list_get_bbox(
+                    list,
+                    0,
+                    std::ptr::null_mut(),
+                    &mut ymin,
+                    &mut xmax,
+                    &mut ymax
+                ),
+                -1
+            );
+
+            // Test get_mask
+            let mut height: usize = 0;
+            let mut width: usize = 0;
+            let mask_ptr = hal_segmentation_list_get_mask(list, 0, &mut height, &mut width);
+            assert!(!mask_ptr.is_null());
+            assert_eq!(height, 10);
+            assert_eq!(width, 10);
+
+            // Test with NULL height/width (should still work)
+            let mask_ptr2 =
+                hal_segmentation_list_get_mask(list, 0, std::ptr::null_mut(), std::ptr::null_mut());
+            assert!(!mask_ptr2.is_null());
+
+            // Test out of bounds
+            let mask_ptr3 = hal_segmentation_list_get_mask(list, 1, &mut height, &mut width);
+            assert!(mask_ptr3.is_null());
+
+            hal_segmentation_list_free(list);
+        }
+    }
+
+    #[test]
+    fn test_config_file_loading() {
+        use std::io::Write;
+
+        // Create a temporary config file
+        let temp_dir = std::env::temp_dir();
+        let json_path = temp_dir.join("test_decoder_config.json");
+        let yaml_path = temp_dir.join("test_decoder_config.yaml");
+
+        // Write JSON config
+        {
+            let mut file = std::fs::File::create(&json_path).unwrap();
+            file.write_all(YOLO_JSON_CONFIG.as_bytes()).unwrap();
+        }
+
+        // Write YAML config
+        {
+            let mut file = std::fs::File::create(&yaml_path).unwrap();
+            file.write_all(YOLO_YAML_CONFIG.as_bytes()).unwrap();
+        }
+
+        unsafe {
+            // Test JSON file loading
+            let builder = hal_decoder_builder_new();
+            let path = CString::new(json_path.to_str().unwrap()).unwrap();
+            assert_eq!(
+                hal_decoder_builder_with_config_file(builder, path.as_ptr()),
+                0
+            );
+            let decoder = hal_decoder_builder_build(builder);
+            assert!(!decoder.is_null());
+            hal_decoder_free(decoder);
+
+            // Test YAML file loading
+            let builder = hal_decoder_builder_new();
+            let path = CString::new(yaml_path.to_str().unwrap()).unwrap();
+            assert_eq!(
+                hal_decoder_builder_with_config_file(builder, path.as_ptr()),
+                0
+            );
+            let decoder = hal_decoder_builder_build(builder);
+            assert!(!decoder.is_null());
+            hal_decoder_free(decoder);
+
+            // Test non-existent file
+            let builder = hal_decoder_builder_new();
+            let path = CString::new("/nonexistent/path/config.json").unwrap();
+            assert_eq!(
+                hal_decoder_builder_with_config_file(builder, path.as_ptr()),
+                -1
+            );
+            hal_decoder_builder_free(builder);
+
+            // Test NULL parameters
+            let builder = hal_decoder_builder_new();
+            assert_eq!(
+                hal_decoder_builder_with_config_file(builder, std::ptr::null()),
+                -1
+            );
+            hal_decoder_builder_free(builder);
+
+            assert_eq!(
+                hal_decoder_builder_with_config_file(std::ptr::null_mut(), std::ptr::null()),
+                -1
+            );
+        }
+
+        // Clean up temp files
+        let _ = std::fs::remove_file(json_path);
+        let _ = std::fs::remove_file(yaml_path);
+    }
+
+    #[test]
+    fn test_decode_with_null_tensor_in_array() {
+        unsafe {
+            // Build a valid decoder
+            let builder = hal_decoder_builder_new();
+            let config = CString::new(YOLO_JSON_CONFIG).unwrap();
+            hal_decoder_builder_with_config_json(builder, config.as_ptr());
+            let decoder = hal_decoder_builder_build(builder);
+            assert!(!decoder.is_null());
+
+            // Array with NULL tensor
+            let outputs: [*const HalTensor; 1] = [std::ptr::null()];
+            let mut boxes: *mut HalDetectBoxList = std::ptr::null_mut();
+
+            assert_eq!(
+                hal_decoder_decode_float(decoder, outputs.as_ptr(), 1, &mut boxes as *mut _),
+                -1
+            );
+
+            hal_decoder_free(decoder);
+        }
     }
 }

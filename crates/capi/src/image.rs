@@ -616,6 +616,7 @@ pub unsafe extern "C" fn hal_image_processor_free(processor: *mut HalImageProces
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CString;
 
     #[test]
     fn test_image_create_and_free() {
@@ -628,6 +629,62 @@ mod tests {
             assert_eq!(hal_tensor_image_fourcc(image), HalFourcc::Rgb);
 
             hal_tensor_image_free(image);
+        }
+    }
+
+    #[test]
+    fn test_image_all_fourcc_formats() {
+        unsafe {
+            let formats = [
+                HalFourcc::Rgb,
+                HalFourcc::Rgba,
+                HalFourcc::Grey,
+                HalFourcc::Nv12,
+                HalFourcc::Nv16,
+                HalFourcc::Yuyv,
+                HalFourcc::PlanarRgb,
+                HalFourcc::PlanarRgba,
+            ];
+
+            for fourcc in formats {
+                // Use dimensions that work for all formats (divisible by 2 for YUV)
+                let image = hal_tensor_image_new(320, 240, fourcc, HalTensorMemory::Mem);
+                assert!(
+                    !image.is_null(),
+                    "Failed to create image with fourcc {:?}",
+                    fourcc
+                );
+
+                assert_eq!(hal_tensor_image_width(image), 320);
+                assert_eq!(hal_tensor_image_height(image), 240);
+                assert_eq!(hal_tensor_image_fourcc(image), fourcc);
+
+                hal_tensor_image_free(image);
+            }
+        }
+    }
+
+    #[test]
+    fn test_image_tensor() {
+        unsafe {
+            let image = hal_tensor_image_new(100, 100, HalFourcc::Rgb, HalTensorMemory::Mem);
+            assert!(!image.is_null());
+
+            let tensor = hal_tensor_image_tensor(image);
+            assert!(!tensor.is_null());
+
+            // NULL image returns NULL
+            assert!(hal_tensor_image_tensor(std::ptr::null()).is_null());
+
+            hal_tensor_image_free(image);
+        }
+    }
+
+    #[test]
+    fn test_image_fourcc_null() {
+        unsafe {
+            // NULL image returns Rgb default
+            assert_eq!(hal_tensor_image_fourcc(std::ptr::null()), HalFourcc::Rgb);
         }
     }
 
@@ -656,11 +713,221 @@ mod tests {
     }
 
     #[test]
+    fn test_crop_dst_rect() {
+        unsafe {
+            let rect = hal_rect_new(50, 60, 200, 300);
+            let mut crop = hal_crop_new();
+
+            hal_crop_set_dst_rect(&mut crop, &rect);
+            assert!(crop.has_dst_rect);
+            assert_eq!(crop.dst_rect.left, 50);
+            assert_eq!(crop.dst_rect.top, 60);
+            assert_eq!(crop.dst_rect.width, 200);
+            assert_eq!(crop.dst_rect.height, 300);
+        }
+    }
+
+    #[test]
+    fn test_crop_set_null_rect() {
+        unsafe {
+            let mut crop = hal_crop_new();
+
+            // Setting NULL rect should be no-op
+            hal_crop_set_src_rect(&mut crop, std::ptr::null());
+            assert!(!crop.has_src_rect);
+
+            hal_crop_set_dst_rect(&mut crop, std::ptr::null());
+            assert!(!crop.has_dst_rect);
+        }
+    }
+
+    #[test]
+    fn test_crop_conversion_to_rust() {
+        let mut crop = hal_crop_new();
+        let rect = hal_rect_new(10, 20, 100, 200);
+
+        unsafe {
+            hal_crop_set_src_rect(&mut crop, &rect);
+            hal_crop_set_dst_rect(&mut crop, &rect);
+            hal_crop_set_dst_color(&mut crop, 255, 0, 0, 255);
+        }
+
+        // Convert to Rust Crop and check
+        let rust_crop: Crop = crop.into();
+        assert!(rust_crop.src_rect.is_some());
+        assert!(rust_crop.dst_rect.is_some());
+        assert!(rust_crop.dst_color.is_some());
+    }
+
+    #[test]
+    fn test_rotation_conversion() {
+        let none: Rotation = HalRotation::None.into();
+        assert!(matches!(none, Rotation::None));
+
+        let rot90: Rotation = HalRotation::Rotate90.into();
+        assert!(matches!(rot90, Rotation::Clockwise90));
+
+        let rot180: Rotation = HalRotation::Rotate180.into();
+        assert!(matches!(rot180, Rotation::Rotate180));
+
+        let rot270: Rotation = HalRotation::Rotate270.into();
+        assert!(matches!(rot270, Rotation::CounterClockwise90));
+    }
+
+    #[test]
+    fn test_flip_conversion() {
+        let none: Flip = HalFlip::None.into();
+        assert!(matches!(none, Flip::None));
+
+        let horizontal: Flip = HalFlip::Horizontal.into();
+        assert!(matches!(horizontal, Flip::Horizontal));
+
+        let vertical: Flip = HalFlip::Vertical.into();
+        assert!(matches!(vertical, Flip::Vertical));
+    }
+
+    #[test]
     fn test_processor_create_and_free() {
         unsafe {
             let processor = hal_image_processor_new();
             // Processor may be NULL if no backend is available
             hal_image_processor_free(processor);
+        }
+    }
+
+    #[test]
+    fn test_processor_convert_null_params() {
+        unsafe {
+            let processor = hal_image_processor_new();
+            if processor.is_null() {
+                // No processor available, skip test
+                return;
+            }
+
+            let src = hal_tensor_image_new(100, 100, HalFourcc::Rgb, HalTensorMemory::Mem);
+            let dst = hal_tensor_image_new(100, 100, HalFourcc::Rgb, HalTensorMemory::Mem);
+            assert!(!src.is_null());
+            assert!(!dst.is_null());
+
+            // NULL processor
+            assert_eq!(
+                hal_image_processor_convert(
+                    std::ptr::null_mut(),
+                    src,
+                    dst,
+                    HalRotation::None,
+                    HalFlip::None,
+                    std::ptr::null()
+                ),
+                -1
+            );
+
+            // NULL src
+            assert_eq!(
+                hal_image_processor_convert(
+                    processor,
+                    std::ptr::null(),
+                    dst,
+                    HalRotation::None,
+                    HalFlip::None,
+                    std::ptr::null()
+                ),
+                -1
+            );
+
+            // NULL dst
+            assert_eq!(
+                hal_image_processor_convert(
+                    processor,
+                    src,
+                    std::ptr::null_mut(),
+                    HalRotation::None,
+                    HalFlip::None,
+                    std::ptr::null()
+                ),
+                -1
+            );
+
+            hal_tensor_image_free(src);
+            hal_tensor_image_free(dst);
+            hal_image_processor_free(processor);
+        }
+    }
+
+    #[test]
+    fn test_image_load_null_data() {
+        unsafe {
+            let image =
+                hal_tensor_image_load(std::ptr::null(), 100, HalFourcc::Rgb, HalTensorMemory::Mem);
+            assert!(image.is_null());
+        }
+    }
+
+    #[test]
+    fn test_image_load_zero_length() {
+        unsafe {
+            let data = [0u8; 10];
+            let image =
+                hal_tensor_image_load(data.as_ptr(), 0, HalFourcc::Rgb, HalTensorMemory::Mem);
+            assert!(image.is_null());
+        }
+    }
+
+    #[test]
+    fn test_image_load_file_null_path() {
+        unsafe {
+            let image =
+                hal_tensor_image_load_file(std::ptr::null(), HalFourcc::Rgb, HalTensorMemory::Mem);
+            assert!(image.is_null());
+        }
+    }
+
+    #[test]
+    fn test_image_load_file_nonexistent() {
+        unsafe {
+            let path = CString::new("/nonexistent/path/image.jpg").unwrap();
+            let image =
+                hal_tensor_image_load_file(path.as_ptr(), HalFourcc::Rgb, HalTensorMemory::Mem);
+            assert!(image.is_null());
+        }
+    }
+
+    #[test]
+    fn test_image_save_jpeg_null_params() {
+        unsafe {
+            let image = hal_tensor_image_new(100, 100, HalFourcc::Rgb, HalTensorMemory::Mem);
+            assert!(!image.is_null());
+
+            let path = CString::new("/tmp/test.jpg").unwrap();
+
+            // NULL image
+            assert_eq!(
+                hal_tensor_image_save_jpeg(std::ptr::null(), path.as_ptr(), 80),
+                -1
+            );
+
+            // NULL path
+            assert_eq!(hal_tensor_image_save_jpeg(image, std::ptr::null(), 80), -1);
+
+            hal_tensor_image_free(image);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_image_clone_fd_mem_image() {
+        unsafe {
+            let image = hal_tensor_image_new(100, 100, HalFourcc::Rgb, HalTensorMemory::Mem);
+            assert!(!image.is_null());
+
+            // MEM images don't support fd, should return -1
+            let fd = hal_tensor_image_clone_fd(image);
+            assert_eq!(fd, -1);
+
+            // NULL image should return -1
+            assert_eq!(hal_tensor_image_clone_fd(std::ptr::null()), -1);
+
+            hal_tensor_image_free(image);
         }
     }
 
@@ -671,6 +938,27 @@ mod tests {
             assert_eq!(hal_tensor_image_height(std::ptr::null()), 0);
             hal_tensor_image_free(std::ptr::null_mut());
             hal_image_processor_free(std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn test_fourcc_to_from_fourcc() {
+        // Test all fourcc conversions roundtrip
+        let formats = [
+            HalFourcc::Yuyv,
+            HalFourcc::Nv12,
+            HalFourcc::Nv16,
+            HalFourcc::Rgba,
+            HalFourcc::Rgb,
+            HalFourcc::Grey,
+            HalFourcc::PlanarRgb,
+            HalFourcc::PlanarRgba,
+        ];
+
+        for format in formats {
+            let fourcc = format.to_fourcc();
+            let back = HalFourcc::from_fourcc(fourcc);
+            assert_eq!(back, Some(format), "Roundtrip failed for {:?}", format);
         }
     }
 }
