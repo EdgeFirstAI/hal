@@ -5,7 +5,7 @@
 //!
 //! This module provides errno-based error reporting following POSIX conventions.
 
-use errno::{Errno, set_errno};
+use errno::{set_errno, Errno};
 
 /// Set errno and return -1 for functions returning int
 #[inline]
