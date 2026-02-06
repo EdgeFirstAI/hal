@@ -516,7 +516,7 @@ jobs:
           mkdir -p hardware-capi-tests
           cp target/release/libedgefirst_hal.so hardware-capi-tests/
           cp target/release/libedgefirst_hal.a hardware-capi-tests/ 2>/dev/null || true
-          cp crates/capi/tests/build/test_all hardware-capi-tests/
+          cp crates/capi/build/test_all hardware-capi-tests/
           echo "C API test artifacts:"
           ls -la hardware-capi-tests/
 
