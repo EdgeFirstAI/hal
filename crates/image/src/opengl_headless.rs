@@ -51,13 +51,18 @@ use crate::{
     TensorImageRef, GREY, NV12, PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, YUYV,
 };
 
-static EGL_LIB: OnceLock<libloading::Library> = OnceLock::new();
+/// EGL library handle. Intentionally leaked (never dlclose'd) to avoid SIGBUS
+/// on process exit: GPU drivers may keep internal state that outlives explicit
+/// EGL cleanup, and dlclose can unmap memory still referenced by the driver.
+static EGL_LIB: OnceLock<&'static libloading::Library> = OnceLock::new();
 
 fn get_egl_lib() -> Result<&'static libloading::Library, crate::Error> {
     if let Some(egl) = EGL_LIB.get() {
         Ok(egl)
     } else {
         let egl = unsafe { libloading::Library::new("libEGL.so.1")? };
+        // Leak the library to prevent dlclose on process exit
+        let egl: &'static libloading::Library = Box::leak(Box::new(egl));
         Ok(EGL_LIB.get_or_init(|| egl))
     }
 }
@@ -1259,7 +1264,7 @@ impl GLProcessorST {
             crate::Rotation::Rotate180 => 2,
             crate::Rotation::CounterClockwise90 => 3,
         };
-        if self.gl_context.support_dma {
+        if self.gl_context.support_dma && src.tensor().memory() == TensorMemory::Dma {
             match self.create_image_from_dma2(src) {
                 Ok(new_egl_image) => self.draw_camera_texture_eglimage(
                     src,
