@@ -12,7 +12,7 @@ use crate::{check_null, check_null_ret_null, try_or_null};
 use edgefirst_tensor::{Tensor, TensorMap, TensorMapTrait, TensorMemory, TensorTrait};
 use libc::{c_char, c_int, size_t};
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 
 /// Data type of tensor elements.
@@ -284,9 +284,9 @@ pub unsafe extern "C" fn hal_tensor_new(
 /// @par Errors (errno):
 /// - EINVAL: Invalid argument (NULL shape, ndim is 0, invalid fd)
 /// - ENOMEM: Memory allocation failed
-/// - ENOTSUP: Not supported on this platform (non-Linux)
+/// - ENOTSUP: Not supported on this platform (non-Unix)
 #[no_mangle]
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub unsafe extern "C" fn hal_tensor_from_fd(
     dtype: HalDtype,
     fd: c_int,
@@ -359,9 +359,9 @@ pub unsafe extern "C" fn hal_tensor_from_fd(
     Box::into_raw(Box::new(tensor))
 }
 
-/// Create a new tensor from an existing file descriptor (stub for non-Linux).
+/// Create a new tensor from an existing file descriptor (stub for non-Unix).
 #[no_mangle]
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 pub unsafe extern "C" fn hal_tensor_from_fd(
     _dtype: HalDtype,
     _fd: c_int,
@@ -497,10 +497,10 @@ pub unsafe extern "C" fn hal_tensor_size(tensor: *const HalTensor) -> size_t {
 /// @return New file descriptor on success, -1 on error
 /// @par Errors (errno):
 /// - EINVAL: NULL tensor
-/// - ENOTSUP: Tensor memory type doesn't support file descriptors, or non-Linux
+/// - ENOTSUP: Tensor memory type doesn't support file descriptors, or non-Unix
 /// - EIO: Failed to clone file descriptor
 #[no_mangle]
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub unsafe extern "C" fn hal_tensor_clone_fd(tensor: *const HalTensor) -> c_int {
     check_null!(tensor);
     let result = dispatch_tensor!(unsafe { &*tensor }, |t| t.clone_fd());
@@ -510,9 +510,9 @@ pub unsafe extern "C" fn hal_tensor_clone_fd(tensor: *const HalTensor) -> c_int 
     }
 }
 
-/// Clone file descriptor stub for non-Linux platforms.
+/// Clone file descriptor stub for non-Unix platforms.
 #[no_mangle]
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 pub unsafe extern "C" fn hal_tensor_clone_fd(_tensor: *const HalTensor) -> c_int {
     set_error(libc::ENOTSUP)
 }
