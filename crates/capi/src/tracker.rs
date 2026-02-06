@@ -307,7 +307,7 @@ mod tests {
     fn test_uuid_to_string() {
         unsafe {
             let uuid = [0u8; 16];
-            let mut buffer = [0i8; 37];
+            let mut buffer = [0 as libc::c_char; 37];
             let result = hal_uuid_to_string(&uuid, buffer.as_mut_ptr(), 37);
             assert_eq!(result, 0);
             // UUID of all zeros should be "00000000-0000-0000-0000-000000000000"
