@@ -16,7 +16,7 @@ crate-type = ["staticlib", "cdylib"]
 name = "edgefirst_hal"
 
 [dependencies]
-edgefirst = { workspace = true }
+edgefirst-hal = { workspace = true }
 edgefirst-tensor = { workspace = true }
 edgefirst-image = { workspace = true }
 edgefirst-decoder = { workspace = true }

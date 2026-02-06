@@ -91,7 +91,7 @@ impl From<TensorMemory> for HalTensorMemory {
             TensorMemory::Mem => HalTensorMemory::Mem,
             #[cfg(target_os = "linux")]
             TensorMemory::Dma => HalTensorMemory::Dma,
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             TensorMemory::Shm => HalTensorMemory::Shm,
         }
     }
