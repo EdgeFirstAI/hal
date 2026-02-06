@@ -756,7 +756,7 @@ enum hal_fourcc hal_tensor_image_fourcc(const struct hal_tensor_image *image);
 int hal_tensor_image_clone_fd(const struct hal_tensor_image *image);
 
 /**
- * Clone file descriptor stub for non-Linux platforms.
+ * Clone file descriptor stub for non-Unix platforms.
  */
 int hal_tensor_image_clone_fd(const struct hal_tensor_image *image);
 
@@ -847,7 +847,7 @@ struct hal_tensor *hal_tensor_new(enum hal_dtype dtype,
  * @par Errors (errno):
  * - EINVAL: Invalid argument (NULL shape, ndim is 0, invalid fd)
  * - ENOMEM: Memory allocation failed
- * - ENOTSUP: Not supported on this platform (non-Linux)
+ * - ENOTSUP: Not supported on this platform (non-Unix)
  */
 struct hal_tensor *hal_tensor_from_fd(enum hal_dtype dtype,
                                       int fd,
@@ -856,7 +856,7 @@ struct hal_tensor *hal_tensor_from_fd(enum hal_dtype dtype,
                                       const char *name);
 
 /**
- * Create a new tensor from an existing file descriptor (stub for non-Linux).
+ * Create a new tensor from an existing file descriptor (stub for non-Unix).
  */
 struct hal_tensor *hal_tensor_from_fd(enum hal_dtype dtype,
                                       int fd,
@@ -943,13 +943,13 @@ size_t hal_tensor_size(const struct hal_tensor *tensor);
  * @return New file descriptor on success, -1 on error
  * @par Errors (errno):
  * - EINVAL: NULL tensor
- * - ENOTSUP: Tensor memory type doesn't support file descriptors, or non-Linux
+ * - ENOTSUP: Tensor memory type doesn't support file descriptors, or non-Unix
  * - EIO: Failed to clone file descriptor
  */
 int hal_tensor_clone_fd(const struct hal_tensor *tensor);
 
 /**
- * Clone file descriptor stub for non-Linux platforms.
+ * Clone file descriptor stub for non-Unix platforms.
  */
 int hal_tensor_clone_fd(const struct hal_tensor *tensor);
 

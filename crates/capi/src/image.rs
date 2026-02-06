@@ -13,7 +13,9 @@ use edgefirst_image::{
     Crop, Flip, ImageProcessor, ImageProcessorTrait, Rect, Rotation, TensorImage, GREY, NV12, NV16,
     PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, YUYV,
 };
-use edgefirst_tensor::{TensorMemory, TensorTrait};
+use edgefirst_tensor::TensorMemory;
+#[cfg(unix)]
+use edgefirst_tensor::TensorTrait;
 use libc::{c_char, c_int, c_void, size_t};
 use std::ffi::CStr;
 
@@ -506,7 +508,7 @@ pub unsafe extern "C" fn hal_tensor_image_fourcc(image: *const HalTensorImage) -
 /// - ENOTSUP: Image memory type doesn't support file descriptors
 /// - EIO: Failed to clone file descriptor
 #[no_mangle]
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub unsafe extern "C" fn hal_tensor_image_clone_fd(image: *const HalTensorImage) -> c_int {
     use std::os::fd::IntoRawFd;
 
@@ -517,9 +519,9 @@ pub unsafe extern "C" fn hal_tensor_image_clone_fd(image: *const HalTensorImage)
     }
 }
 
-/// Clone file descriptor stub for non-Linux platforms.
+/// Clone file descriptor stub for non-Unix platforms.
 #[no_mangle]
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 pub unsafe extern "C" fn hal_tensor_image_clone_fd(_image: *const HalTensorImage) -> c_int {
     set_error(libc::ENOTSUP)
 }
