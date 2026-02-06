@@ -148,7 +148,10 @@ pub unsafe extern "C" fn hal_bytetrack_update(
     check_null_ret_null!(tracker, detections);
 
     let boxes = &(*detections).boxes;
-    let wrappers: Vec<DetectBoxWrapper> = boxes.iter().map(|b| DetectBoxWrapper { inner: b }).collect();
+    let wrappers: Vec<DetectBoxWrapper> = boxes
+        .iter()
+        .map(|b| DetectBoxWrapper { inner: b })
+        .collect();
 
     let results = (*tracker).inner.update(&wrappers, timestamp);
 

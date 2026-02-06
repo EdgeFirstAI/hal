@@ -10,8 +10,8 @@ use crate::error::{set_error, set_error_null};
 use crate::tensor::HalTensorMemory;
 use crate::{check_null, check_null_ret_null, try_or_errno, try_or_null};
 use edgefirst_image::{
-    Crop, Flip, ImageProcessor, ImageProcessorTrait, Rect, Rotation, TensorImage, GREY, NV12,
-    NV16, PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, YUYV,
+    Crop, Flip, ImageProcessor, ImageProcessorTrait, Rect, Rotation, TensorImage, GREY, NV12, NV16,
+    PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, YUYV,
 };
 use edgefirst_tensor::{TensorMemory, TensorTrait};
 use libc::{c_char, c_int, c_void, size_t};
@@ -218,7 +218,12 @@ pub struct HalImageProcessor {
 /// @param height Height of the rectangle
 /// @return New rectangle structure
 #[no_mangle]
-pub extern "C" fn hal_rect_new(left: size_t, top: size_t, width: size_t, height: size_t) -> HalRect {
+pub extern "C" fn hal_rect_new(
+    left: size_t,
+    top: size_t,
+    width: size_t,
+    height: size_t,
+) -> HalRect {
     HalRect {
         left,
         top,
@@ -281,13 +286,7 @@ pub unsafe extern "C" fn hal_crop_set_dst_rect(crop: *mut HalCrop, rect: *const 
 /// @param b Blue component (0-255)
 /// @param a Alpha component (0-255)
 #[no_mangle]
-pub unsafe extern "C" fn hal_crop_set_dst_color(
-    crop: *mut HalCrop,
-    r: u8,
-    g: u8,
-    b: u8,
-    a: u8,
-) {
+pub unsafe extern "C" fn hal_crop_set_dst_color(crop: *mut HalCrop, r: u8, g: u8, b: u8, a: u8) {
     if crop.is_null() {
         return;
     }
@@ -493,8 +492,7 @@ pub unsafe extern "C" fn hal_tensor_image_fourcc(image: *const HalTensorImage) -
     if image.is_null() {
         return HalFourcc::Rgb;
     }
-    HalFourcc::from_fourcc(unsafe { &(*image) }.inner.fourcc())
-        .unwrap_or(HalFourcc::Rgb)
+    HalFourcc::from_fourcc(unsafe { &(*image) }.inner.fourcc()).unwrap_or(HalFourcc::Rgb)
 }
 
 /// Clone the file descriptor associated with a tensor image (Linux only).
@@ -534,9 +532,7 @@ pub unsafe extern "C" fn hal_tensor_image_clone_fd(_image: *const HalTensorImage
 /// @param image Tensor image handle
 /// @return Pointer to the underlying tensor data info, or NULL if image is NULL
 #[no_mangle]
-pub unsafe extern "C" fn hal_tensor_image_tensor(
-    image: *const HalTensorImage,
-) -> *const c_void {
+pub unsafe extern "C" fn hal_tensor_image_tensor(image: *const HalTensorImage) -> *const c_void {
     if image.is_null() {
         return std::ptr::null();
     }
@@ -622,12 +618,7 @@ mod tests {
     #[test]
     fn test_image_create_and_free() {
         unsafe {
-            let image = hal_tensor_image_new(
-                640,
-                480,
-                HalFourcc::Rgb,
-                HalTensorMemory::Mem,
-            );
+            let image = hal_tensor_image_new(640, 480, HalFourcc::Rgb, HalTensorMemory::Mem);
             assert!(!image.is_null());
 
             assert_eq!(hal_tensor_image_width(image), 640);
