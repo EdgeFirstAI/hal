@@ -391,13 +391,11 @@ pub unsafe extern "C" fn hal_decoder_new(params: *const HalDecoderParams) -> *mu
         let content = match std::fs::read_to_string(path_str) {
             Ok(c) => c,
             Err(e) => {
-                errno::set_errno(errno::Errno(
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        libc::ENOENT
-                    } else {
-                        libc::EIO
-                    },
-                ));
+                errno::set_errno(errno::Errno(if e.kind() == std::io::ErrorKind::NotFound {
+                    libc::ENOENT
+                } else {
+                    libc::EIO
+                }));
                 return std::ptr::null_mut();
             }
         };
