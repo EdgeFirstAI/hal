@@ -48,18 +48,33 @@ extern "C" {
 
 /**
  * NMS (Non-Maximum Suppression) mode.
+ *
+ * Controls how overlapping detection boxes are suppressed after decoding.
+ *
+ * | Mode | Value | Behavior |
+ * |------|-------|----------|
+ * | HAL_NMS_CLASS_AGNOSTIC | 0 | Suppress overlapping boxes regardless of class |
+ * | HAL_NMS_CLASS_AWARE | 1 | Only suppress boxes with the same class label |
+ * | HAL_NMS_NONE | 2 | Disable NMS (for end-to-end models with embedded NMS) |
+ *
+ * Most YOLO models use HAL_NMS_CLASS_AGNOSTIC. Use HAL_NMS_NONE for
+ * end-to-end models (e.g. `decoder_version: yolo26` in EdgeFirst metadata)
+ * that perform NMS internally.
  */
 typedef enum hal_nms {
   /**
-   * Class-agnostic NMS: suppress overlapping boxes regardless of class
+   * Class-agnostic NMS: suppress overlapping boxes regardless of class.
+   * This is the most common mode for YOLO detection models.
    */
   HAL_NMS_CLASS_AGNOSTIC = 0,
   /**
-   * Class-aware NMS: only suppress boxes with the same class
+   * Class-aware NMS: only suppress boxes with the same class label.
+   * Use when different classes may legitimately overlap (e.g. person + car).
    */
   HAL_NMS_CLASS_AWARE = 1,
   /**
-   * No NMS (for end-to-end models with embedded NMS)
+   * No NMS: skip post-processing suppression entirely.
+   * Use for end-to-end models that include NMS in the model graph.
    */
   HAL_NMS_NONE = 2,
 } hal_nms;
@@ -223,11 +238,6 @@ typedef struct hal_bytetrack hal_bytetrack;
 typedef struct hal_decoder hal_decoder;
 
 /**
- * Opaque decoder builder type.
- */
-typedef struct hal_decoder_builder hal_decoder_builder;
-
-/**
  * List of detection boxes.
  */
 typedef struct hal_detect_box_list hal_detect_box_list;
@@ -269,6 +279,161 @@ typedef struct hal_tensor_map hal_tensor_map;
  * List of track info results.
  */
 typedef struct hal_track_info_list hal_track_info_list;
+
+/**
+ * Decoder construction parameters.
+ *
+ * Configures how ML model outputs are decoded into detection boxes and
+ * segmentation masks. Obtain defaults with `hal_decoder_params_default()`,
+ * set the desired fields, then pass to `hal_decoder_new()`.
+ *
+ * @section dp_config Configuration Source (exactly one required)
+ *
+ * Exactly one of `config_json`, `config_yaml`, or `config_file` must be
+ * non-NULL. These are mutually exclusive; setting more than one causes
+ * `hal_decoder_new()` to fail with EINVAL. The configuration describes the
+ * model output layout so the decoder knows how to interpret raw tensors.
+ *
+ * @section dp_thresholds Threshold Tuning
+ *
+ * `score_threshold` and `iou_threshold` control post-processing filtering:
+ * - **score_threshold** (default 0.5): detections with confidence below this
+ *   value are discarded. Lower values yield more detections (higher recall),
+ *   higher values yield fewer but more confident detections (higher precision).
+ * - **iou_threshold** (default 0.5): during NMS, box pairs with
+ *   Intersection-over-Union above this value are candidates for suppression.
+ *   Lower values suppress more aggressively.
+ *
+ * @section dp_usage Basic Usage
+ * @code{.c}
+ * // Minimal: create a decoder from an inline JSON config
+ * struct hal_decoder_params params = hal_decoder_params_default();
+ * params.config_json = "{\"outputs\":[{\"decoder\":\"ultralytics\","
+ *                       "\"type\":\"detection\",\"shape\":[1,84,8400],"
+ *                       "\"dshape\":[[\"batch\",1],[\"num_features\",84],"
+ *                       "[\"num_boxes\",8400]]}],\"nms\":\"class_aware\"}";
+ * params.score_threshold = 0.25f;
+ * struct hal_decoder* decoder = hal_decoder_new(&params);
+ * @endcode
+ *
+ * @section dp_file Loading from a File
+ * @code{.c}
+ * // Load decoder config from an edgefirst.json or edgefirst.yaml file
+ * struct hal_decoder_params params = hal_decoder_params_default();
+ * params.config_file = "/path/to/edgefirst.json";
+ * params.score_threshold = 0.3f;
+ * params.iou_threshold  = 0.45f;
+ * params.nms = HAL_NMS_CLASS_AWARE;
+ * struct hal_decoder* decoder = hal_decoder_new(&params);
+ * @endcode
+ *
+ * @section dp_metadata EdgeFirst Model Metadata
+ *
+ * EdgeFirst models ship with an `edgefirst.json` (or `edgefirst.yaml`)
+ * metadata file that fully describes the model's output layout, decoder
+ * type, and recommended post-processing settings. Pass this file directly
+ * via `config_file` to auto-configure the decoder:
+ *
+ * @code{.c}
+ * // Auto-configure from EdgeFirst model metadata.
+ * // The metadata file contains the outputs array, decoder type
+ * // (ultralytics / modelpack), shapes, and NMS settings.
+ * //
+ * // Example edgefirst.yaml:
+ * //   outputs:
+ * //     - decoder: ultralytics
+ * //       type: detection
+ * //       shape: [1, 84, 8400]
+ * //       dshape: [[batch, 1], [num_features, 84], [num_boxes, 8400]]
+ * //   nms: class_agnostic
+ * //   validation:
+ * //     iou: 0.7
+ * //     score: 0.001
+ * //
+ * struct hal_decoder_params params = hal_decoder_params_default();
+ * params.config_file = "/models/yolov8n/edgefirst.yaml";
+ *
+ * // Optionally override the metadata's recommended thresholds
+ * // for your application's precision/recall needs:
+ * params.score_threshold = 0.4f;
+ *
+ * struct hal_decoder* decoder = hal_decoder_new(&params);
+ * if (!decoder) {
+ *     fprintf(stderr, "decoder init failed: %s\n", strerror(errno));
+ * }
+ * @endcode
+ *
+ * @see hal_decoder_params_default, hal_decoder_new, hal_nms
+ */
+typedef struct hal_decoder_params {
+  /**
+   * JSON configuration string (NUL-terminated).
+   *
+   * Mutually exclusive with `config_yaml` and `config_file`.
+   * The string is copied internally; the caller may free the buffer
+   * after `hal_decoder_new()` returns.
+   *
+   * This should contain the EdgeFirst model metadata JSON, or at minimum
+   * the `outputs` array describing the model's output tensors. Example:
+   * @code{.c}
+   * params.config_json = "{\"outputs\":[{\"decoder\":\"ultralytics\","
+   *                       "\"type\":\"detection\",\"shape\":[1,84,8400],"
+   *                       "\"dshape\":[[\"batch\",1],[\"num_features\",84],"
+   *                       "[\"num_boxes\",8400]]}]}";
+   * @endcode
+   */
+  const char *config_json;
+  /**
+   * YAML configuration string (NUL-terminated).
+   *
+   * Mutually exclusive with `config_json` and `config_file`.
+   * The string is copied internally; the caller may free the buffer
+   * after `hal_decoder_new()` returns.
+   */
+  const char *config_yaml;
+  /**
+   * Path to a configuration file (NUL-terminated).
+   *
+   * Mutually exclusive with `config_json` and `config_yaml`.
+   * The file is read and the path string copied during `hal_decoder_new()`;
+   * both may be freed after the call returns.
+   *
+   * The format is auto-detected: files ending in `.json` or starting with
+   * `{` are parsed as JSON; everything else is parsed as YAML. This makes
+   * it straightforward to point at an EdgeFirst model's `edgefirst.json`
+   * or `edgefirst.yaml` metadata file.
+   */
+  const char *config_file;
+  /**
+   * Score threshold for filtering detections (default: 0.5).
+   *
+   * Detections with confidence scores below this value are discarded
+   * before NMS. Range: 0.0 to 1.0.
+   *
+   * Typical values:
+   * - 0.001 -- 0.01: evaluation / mAP benchmarking (keep nearly all boxes)
+   * - 0.25  -- 0.5:  general-purpose inference
+   * - 0.5   -- 0.8:  high-confidence-only applications
+   */
+  float score_threshold;
+  /**
+   * IOU (Intersection-over-Union) threshold for NMS (default: 0.5).
+   *
+   * During NMS, if two boxes overlap with IOU above this threshold the
+   * lower-scoring box is suppressed. Range: 0.0 to 1.0.
+   *
+   * Typical values:
+   * - 0.45 -- 0.5: standard object detection
+   * - 0.6  -- 0.7: when objects frequently overlap (e.g. dense crowds)
+   */
+  float iou_threshold;
+  /**
+   * NMS (Non-Maximum Suppression) mode (default: HAL_NMS_CLASS_AGNOSTIC).
+   *
+   * @see hal_nms for available modes and when to use each one.
+   */
+  enum hal_nms nms;
+} hal_decoder_params;
 
 /**
  * Detection box result.
@@ -381,114 +546,77 @@ typedef struct hal_track_info {
 } hal_track_info;
 
 /**
- * Create a new decoder builder.
+ * Create default decoder parameters.
  *
- * The builder starts with default values:
- * - Score threshold: 0.5
- * - IOU threshold: 0.5
- * - NMS: Class-agnostic
+ * Returns a `hal_decoder_params` struct initialized with safe defaults:
  *
- * A configuration must be set before building the decoder.
+ * | Field | Default |
+ * |-------|---------|
+ * | config_json | NULL |
+ * | config_yaml | NULL |
+ * | config_file | NULL |
+ * | score_threshold | 0.5 |
+ * | iou_threshold | 0.5 |
+ * | nms | HAL_NMS_CLASS_AGNOSTIC |
  *
- * @return New decoder builder handle on success, NULL on error
- * @par Errors (errno):
- * - ENOMEM: Memory allocation failed
+ * The caller must set exactly one configuration source (`config_json`,
+ * `config_yaml`, or `config_file`) before passing to `hal_decoder_new()`.
+ * All other fields may be left at their defaults or overridden.
+ *
+ * @return Default decoder parameters (by value)
+ *
+ * @par Example
+ * @code{.c}
+ * struct hal_decoder_params params = hal_decoder_params_default();
+ * params.config_file = "edgefirst.yaml";
+ * params.score_threshold = 0.3f;
+ * struct hal_decoder* decoder = hal_decoder_new(&params);
+ * @endcode
  */
-struct hal_decoder_builder *hal_decoder_builder_new(void);
+struct hal_decoder_params hal_decoder_params_default(void);
 
 /**
- * Set decoder configuration from a file (JSON or YAML).
+ * Create a new decoder from parameters.
  *
- * @param builder Decoder builder handle
- * @param path Path to configuration file
- * @return 0 on success, -1 on error
+ * Validates the parameters and constructs a decoder ready for use with
+ * `hal_decoder_decode_float()`. Exactly one of `params->config_json`,
+ * `params->config_yaml`, or `params->config_file` must be non-NULL.
+ *
+ * All strings are copied internally; the caller may free their buffers
+ * immediately after this call returns.
+ *
+ * @param params Pointer to decoder parameters (must not be NULL)
+ * @return New decoder handle on success, NULL on error (errno set)
+ *
  * @par Errors (errno):
- * - EINVAL: Invalid argument (NULL builder/path)
- * - ENOENT: File not found
- * - EBADMSG: Failed to parse configuration file
+ * - EINVAL: NULL params, no config source set, or multiple config sources set
+ * - ENOENT: Config file path does not exist
+ * - EIO: Config file could not be read
+ * - EBADMSG: Configuration is syntactically valid but semantically invalid
+ *   (e.g. missing required `outputs` array, unknown decoder type)
+ *
+ * @par Example
+ * @code{.c}
+ * struct hal_decoder_params params = hal_decoder_params_default();
+ * params.config_file = "/models/yolov8n/edgefirst.yaml";
+ * params.score_threshold = 0.25f;
+ * params.iou_threshold  = 0.45f;
+ * params.nms = HAL_NMS_CLASS_AWARE;
+ *
+ * struct hal_decoder* decoder = hal_decoder_new(&params);
+ * if (!decoder) {
+ *     fprintf(stderr, "decoder: %s\n", strerror(errno));
+ *     return -1;
+ * }
+ *
+ * // ... use decoder with hal_decoder_decode_float() ...
+ *
+ * hal_decoder_free(decoder);
+ * @endcode
+ *
+ * @see hal_decoder_params_default, hal_decoder_free, hal_decoder_decode_float
  */
-int hal_decoder_builder_with_config_file(struct hal_decoder_builder *builder, const char *path);
-
-/**
- * Set decoder configuration from a JSON string.
- *
- * @param builder Decoder builder handle
- * @param json_str JSON configuration string
- * @return 0 on success, -1 on error
- * @par Errors (errno):
- * - EINVAL: Invalid argument (NULL builder/json_str)
- * - EBADMSG: Invalid JSON format
- */
-int hal_decoder_builder_with_config_json(struct hal_decoder_builder *builder, const char *json_str);
-
-/**
- * Set decoder configuration from a YAML string.
- *
- * @param builder Decoder builder handle
- * @param yaml_str YAML configuration string
- * @return 0 on success, -1 on error
- * @par Errors (errno):
- * - EINVAL: Invalid argument (NULL builder/yaml_str)
- * - EBADMSG: Invalid YAML format
- */
-int hal_decoder_builder_with_config_yaml(struct hal_decoder_builder *builder, const char *yaml_str);
-
-/**
- * Set the score threshold for filtering detections.
- *
- * Detections with scores below this threshold are discarded.
- *
- * @param builder Decoder builder handle
- * @param threshold Score threshold (0.0 to 1.0)
- * @return 0 on success, -1 on error
- * @par Errors (errno):
- * - EINVAL: Invalid argument (NULL builder)
- */
-int hal_decoder_builder_with_score_threshold(struct hal_decoder_builder *builder, float threshold);
-
-/**
- * Set the IOU threshold for NMS.
- *
- * Detection pairs with IOU above this threshold are candidates for suppression.
- *
- * @param builder Decoder builder handle
- * @param threshold IOU threshold (0.0 to 1.0)
- * @return 0 on success, -1 on error
- * @par Errors (errno):
- * - EINVAL: Invalid argument (NULL builder)
- */
-int hal_decoder_builder_with_iou_threshold(struct hal_decoder_builder *builder, float threshold);
-
-/**
- * Set the NMS (Non-Maximum Suppression) mode.
- *
- * @param builder Decoder builder handle
- * @param nms NMS mode (HAL_NMS_*)
- * @return 0 on success, -1 on error
- * @par Errors (errno):
- * - EINVAL: Invalid argument (NULL builder)
- */
-int hal_decoder_builder_with_nms(struct hal_decoder_builder *builder, enum hal_nms nms);
-
-/**
- * Build the decoder from the builder configuration.
- *
- * Consumes the builder - it cannot be used after this call.
- *
- * @param builder Decoder builder handle (consumed)
- * @return New decoder handle on success, NULL on error
- * @par Errors (errno):
- * - EINVAL: Invalid argument (NULL builder) or no configuration set
- * - EBADMSG: Invalid configuration
- */
-struct hal_decoder *hal_decoder_builder_build(struct hal_decoder_builder *builder);
-
-/**
- * Free a decoder builder.
- *
- * @param builder Decoder builder handle to free (can be NULL, no-op)
- */
-void hal_decoder_builder_free(struct hal_decoder_builder *builder);
+struct hal_decoder *hal_decoder_new(const struct hal_decoder_params *params);
 
 /**
  * Decode model outputs into detection boxes.
