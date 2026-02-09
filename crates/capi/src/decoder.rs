@@ -65,14 +65,29 @@ impl From<&DetectBox> for HalDetectBox {
 }
 
 /// NMS (Non-Maximum Suppression) mode.
+///
+/// Controls how overlapping detection boxes are suppressed after decoding.
+///
+/// | Mode | Value | Behavior |
+/// |------|-------|----------|
+/// | HAL_NMS_CLASS_AGNOSTIC | 0 | Suppress overlapping boxes regardless of class |
+/// | HAL_NMS_CLASS_AWARE | 1 | Only suppress boxes with the same class label |
+/// | HAL_NMS_NONE | 2 | Disable NMS (for end-to-end models with embedded NMS) |
+///
+/// Most YOLO models use HAL_NMS_CLASS_AGNOSTIC. Use HAL_NMS_NONE for
+/// end-to-end models (e.g. `decoder_version: yolo26` in EdgeFirst metadata)
+/// that perform NMS internally.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HalNms {
-    /// Class-agnostic NMS: suppress overlapping boxes regardless of class
+    /// Class-agnostic NMS: suppress overlapping boxes regardless of class.
+    /// This is the most common mode for YOLO detection models.
     ClassAgnostic = 0,
-    /// Class-aware NMS: only suppress boxes with the same class
+    /// Class-aware NMS: only suppress boxes with the same class label.
+    /// Use when different classes may legitimately overlap (e.g. person + car).
     ClassAware = 1,
-    /// No NMS (for end-to-end models with embedded NMS)
+    /// No NMS: skip post-processing suppression entirely.
+    /// Use for end-to-end models that include NMS in the model graph.
     None = 2,
 }
 
@@ -86,9 +101,146 @@ impl From<HalNms> for Option<Nms> {
     }
 }
 
-/// Opaque decoder builder type.
-pub struct HalDecoderBuilder {
-    inner: DecoderBuilder,
+/// Decoder construction parameters.
+///
+/// Configures how ML model outputs are decoded into detection boxes and
+/// segmentation masks. Obtain defaults with `hal_decoder_params_default()`,
+/// set the desired fields, then pass to `hal_decoder_new()`.
+///
+/// @section dp_config Configuration Source (exactly one required)
+///
+/// Exactly one of `config_json`, `config_yaml`, or `config_file` must be
+/// non-NULL. These are mutually exclusive; setting more than one causes
+/// `hal_decoder_new()` to fail with EINVAL. The configuration describes the
+/// model output layout so the decoder knows how to interpret raw tensors.
+///
+/// @section dp_thresholds Threshold Tuning
+///
+/// `score_threshold` and `iou_threshold` control post-processing filtering:
+/// - **score_threshold** (default 0.5): detections with confidence below this
+///   value are discarded. Lower values yield more detections (higher recall),
+///   higher values yield fewer but more confident detections (higher precision).
+/// - **iou_threshold** (default 0.5): during NMS, box pairs with
+///   Intersection-over-Union above this value are candidates for suppression.
+///   Lower values suppress more aggressively.
+///
+/// @section dp_usage Basic Usage
+/// @code{.c}
+/// // Minimal: create a decoder from an inline JSON config
+/// struct hal_decoder_params params = hal_decoder_params_default();
+/// params.config_json = "{\"outputs\":[{\"decoder\":\"ultralytics\","
+///                       "\"type\":\"detection\",\"shape\":[1,84,8400],"
+///                       "\"dshape\":[[\"batch\",1],[\"num_features\",84],"
+///                       "[\"num_boxes\",8400]]}],\"nms\":\"class_aware\"}";
+/// params.score_threshold = 0.25f;
+/// struct hal_decoder* decoder = hal_decoder_new(&params);
+/// @endcode
+///
+/// @section dp_file Loading from a File
+/// @code{.c}
+/// // Load decoder config from an edgefirst.json or edgefirst.yaml file
+/// struct hal_decoder_params params = hal_decoder_params_default();
+/// params.config_file = "/path/to/edgefirst.json";
+/// params.score_threshold = 0.3f;
+/// params.iou_threshold  = 0.45f;
+/// params.nms = HAL_NMS_CLASS_AWARE;
+/// struct hal_decoder* decoder = hal_decoder_new(&params);
+/// @endcode
+///
+/// @section dp_metadata EdgeFirst Model Metadata
+///
+/// EdgeFirst models ship with an `edgefirst.json` (or `edgefirst.yaml`)
+/// metadata file that fully describes the model's output layout, decoder
+/// type, and recommended post-processing settings. Pass this file directly
+/// via `config_file` to auto-configure the decoder:
+///
+/// @code{.c}
+/// // Auto-configure from EdgeFirst model metadata.
+/// // The metadata file contains the outputs array, decoder type
+/// // (ultralytics / modelpack), shapes, and NMS settings.
+/// //
+/// // Example edgefirst.yaml:
+/// //   outputs:
+/// //     - decoder: ultralytics
+/// //       type: detection
+/// //       shape: [1, 84, 8400]
+/// //       dshape: [[batch, 1], [num_features, 84], [num_boxes, 8400]]
+/// //   nms: class_agnostic
+/// //   validation:
+/// //     iou: 0.7
+/// //     score: 0.001
+/// //
+/// struct hal_decoder_params params = hal_decoder_params_default();
+/// params.config_file = "/models/yolov8n/edgefirst.yaml";
+///
+/// // Optionally override the metadata's recommended thresholds
+/// // for your application's precision/recall needs:
+/// params.score_threshold = 0.4f;
+///
+/// struct hal_decoder* decoder = hal_decoder_new(&params);
+/// if (!decoder) {
+///     fprintf(stderr, "decoder init failed: %s\n", strerror(errno));
+/// }
+/// @endcode
+///
+/// @see hal_decoder_params_default, hal_decoder_new, hal_nms
+#[repr(C)]
+pub struct HalDecoderParams {
+    /// JSON configuration string (NUL-terminated).
+    ///
+    /// Mutually exclusive with `config_yaml` and `config_file`.
+    /// The string is copied internally; the caller may free the buffer
+    /// after `hal_decoder_new()` returns.
+    ///
+    /// This should contain the EdgeFirst model metadata JSON, or at minimum
+    /// the `outputs` array describing the model's output tensors. Example:
+    /// @code{.c}
+    /// params.config_json = "{\"outputs\":[{\"decoder\":\"ultralytics\","
+    ///                       "\"type\":\"detection\",\"shape\":[1,84,8400],"
+    ///                       "\"dshape\":[[\"batch\",1],[\"num_features\",84],"
+    ///                       "[\"num_boxes\",8400]]}]}";
+    /// @endcode
+    pub config_json: *const c_char,
+    /// YAML configuration string (NUL-terminated).
+    ///
+    /// Mutually exclusive with `config_json` and `config_file`.
+    /// The string is copied internally; the caller may free the buffer
+    /// after `hal_decoder_new()` returns.
+    pub config_yaml: *const c_char,
+    /// Path to a configuration file (NUL-terminated).
+    ///
+    /// Mutually exclusive with `config_json` and `config_yaml`.
+    /// The file is read and the path string copied during `hal_decoder_new()`;
+    /// both may be freed after the call returns.
+    ///
+    /// The format is auto-detected: files ending in `.json` or starting with
+    /// `{` are parsed as JSON; everything else is parsed as YAML. This makes
+    /// it straightforward to point at an EdgeFirst model's `edgefirst.json`
+    /// or `edgefirst.yaml` metadata file.
+    pub config_file: *const c_char,
+    /// Score threshold for filtering detections (default: 0.5).
+    ///
+    /// Detections with confidence scores below this value are discarded
+    /// before NMS. Range: 0.0 to 1.0.
+    ///
+    /// Typical values:
+    /// - 0.001 -- 0.01: evaluation / mAP benchmarking (keep nearly all boxes)
+    /// - 0.25  -- 0.5:  general-purpose inference
+    /// - 0.5   -- 0.8:  high-confidence-only applications
+    pub score_threshold: f32,
+    /// IOU (Intersection-over-Union) threshold for NMS (default: 0.5).
+    ///
+    /// During NMS, if two boxes overlap with IOU above this threshold the
+    /// lower-scoring box is suppressed. Range: 0.0 to 1.0.
+    ///
+    /// Typical values:
+    /// - 0.45 -- 0.5: standard object detection
+    /// - 0.6  -- 0.7: when objects frequently overlap (e.g. dense crowds)
+    pub iou_threshold: f32,
+    /// NMS (Non-Maximum Suppression) mode (default: HAL_NMS_CLASS_AGNOSTIC).
+    ///
+    /// @see hal_nms for available modes and when to use each one.
+    pub nms: HalNms,
 }
 
 /// Opaque decoder type.
@@ -107,204 +259,159 @@ pub struct HalSegmentationList {
 }
 
 // ============================================================================
-// Decoder Builder Functions
+// Decoder Params Functions
 // ============================================================================
 
-/// Create a new decoder builder.
+/// Create default decoder parameters.
 ///
-/// The builder starts with default values:
-/// - Score threshold: 0.5
-/// - IOU threshold: 0.5
-/// - NMS: Class-agnostic
+/// Returns a `hal_decoder_params` struct initialized with safe defaults:
 ///
-/// A configuration must be set before building the decoder.
+/// | Field | Default |
+/// |-------|---------|
+/// | config_json | NULL |
+/// | config_yaml | NULL |
+/// | config_file | NULL |
+/// | score_threshold | 0.5 |
+/// | iou_threshold | 0.5 |
+/// | nms | HAL_NMS_CLASS_AGNOSTIC |
 ///
-/// @return New decoder builder handle on success, NULL on error
-/// @par Errors (errno):
-/// - ENOMEM: Memory allocation failed
+/// The caller must set exactly one configuration source (`config_json`,
+/// `config_yaml`, or `config_file`) before passing to `hal_decoder_new()`.
+/// All other fields may be left at their defaults or overridden.
+///
+/// @return Default decoder parameters (by value)
+///
+/// @par Example
+/// @code{.c}
+/// struct hal_decoder_params params = hal_decoder_params_default();
+/// params.config_file = "edgefirst.yaml";
+/// params.score_threshold = 0.3f;
+/// struct hal_decoder* decoder = hal_decoder_new(&params);
+/// @endcode
 #[no_mangle]
-pub extern "C" fn hal_decoder_builder_new() -> *mut HalDecoderBuilder {
-    Box::into_raw(Box::new(HalDecoderBuilder {
-        inner: DecoderBuilder::new(),
-    }))
+pub extern "C" fn hal_decoder_params_default() -> HalDecoderParams {
+    HalDecoderParams {
+        config_json: std::ptr::null(),
+        config_yaml: std::ptr::null(),
+        config_file: std::ptr::null(),
+        score_threshold: 0.5,
+        iou_threshold: 0.5,
+        nms: HalNms::ClassAgnostic,
+    }
 }
 
-/// Set decoder configuration from a file (JSON or YAML).
+/// Create a new decoder from parameters.
 ///
-/// @param builder Decoder builder handle
-/// @param path Path to configuration file
-/// @return 0 on success, -1 on error
+/// Validates the parameters and constructs a decoder ready for use with
+/// `hal_decoder_decode_float()`. Exactly one of `params->config_json`,
+/// `params->config_yaml`, or `params->config_file` must be non-NULL.
+///
+/// All strings are copied internally; the caller may free their buffers
+/// immediately after this call returns.
+///
+/// @param params Pointer to decoder parameters (must not be NULL)
+/// @return New decoder handle on success, NULL on error (errno set)
+///
 /// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL builder/path)
-/// - ENOENT: File not found
-/// - EBADMSG: Failed to parse configuration file
+/// - EINVAL: NULL params, no config source set, or multiple config sources set
+/// - ENOENT: Config file path does not exist
+/// - EIO: Config file could not be read
+/// - EBADMSG: Configuration is syntactically valid but semantically invalid
+///   (e.g. missing required `outputs` array, unknown decoder type)
+///
+/// @par Example
+/// @code{.c}
+/// struct hal_decoder_params params = hal_decoder_params_default();
+/// params.config_file = "/models/yolov8n/edgefirst.yaml";
+/// params.score_threshold = 0.25f;
+/// params.iou_threshold  = 0.45f;
+/// params.nms = HAL_NMS_CLASS_AWARE;
+///
+/// struct hal_decoder* decoder = hal_decoder_new(&params);
+/// if (!decoder) {
+///     fprintf(stderr, "decoder: %s\n", strerror(errno));
+///     return -1;
+/// }
+///
+/// // ... use decoder with hal_decoder_decode_float() ...
+///
+/// hal_decoder_free(decoder);
+/// @endcode
+///
+/// @see hal_decoder_params_default, hal_decoder_free, hal_decoder_decode_float
 #[no_mangle]
-pub unsafe extern "C" fn hal_decoder_builder_with_config_file(
-    builder: *mut HalDecoderBuilder,
-    path: *const c_char,
-) -> c_int {
-    check_null!(builder, path);
+pub unsafe extern "C" fn hal_decoder_new(params: *const HalDecoderParams) -> *mut HalDecoder {
+    check_null_ret_null!(params);
 
-    let path_str = match CStr::from_ptr(path).to_str() {
-        Ok(s) => s,
-        Err(_) => return set_error(libc::EINVAL),
-    };
+    let p = &*params;
 
-    let content = match std::fs::read_to_string(path_str) {
-        Ok(c) => c,
-        Err(e) => {
-            return set_error(if e.kind() == std::io::ErrorKind::NotFound {
-                libc::ENOENT
-            } else {
-                libc::EIO
-            })
-        }
-    };
+    let has_json = !p.config_json.is_null();
+    let has_yaml = !p.config_yaml.is_null();
+    let has_file = !p.config_file.is_null();
 
-    // Try to detect format by extension or content
-    let is_json = path_str.ends_with(".json") || content.trim_start().starts_with('{');
+    // Exactly one config source must be set
+    let config_count = has_json as u8 + has_yaml as u8 + has_file as u8;
+    if config_count != 1 {
+        errno::set_errno(errno::Errno(libc::EINVAL));
+        return std::ptr::null_mut();
+    }
 
-    if is_json {
-        (*builder).inner = std::mem::take(&mut (*builder).inner).with_config_json_str(content);
+    let mut builder = DecoderBuilder::new()
+        .with_score_threshold(p.score_threshold)
+        .with_iou_threshold(p.iou_threshold)
+        .with_nms(p.nms.into());
+
+    if has_json {
+        let json = match CStr::from_ptr(p.config_json).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                errno::set_errno(errno::Errno(libc::EINVAL));
+                return std::ptr::null_mut();
+            }
+        };
+        builder = builder.with_config_json_str(json);
+    } else if has_yaml {
+        let yaml = match CStr::from_ptr(p.config_yaml).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                errno::set_errno(errno::Errno(libc::EINVAL));
+                return std::ptr::null_mut();
+            }
+        };
+        builder = builder.with_config_yaml_str(yaml);
     } else {
-        (*builder).inner = std::mem::take(&mut (*builder).inner).with_config_yaml_str(content);
+        let path_str = match CStr::from_ptr(p.config_file).to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                errno::set_errno(errno::Errno(libc::EINVAL));
+                return std::ptr::null_mut();
+            }
+        };
+
+        let content = match std::fs::read_to_string(path_str) {
+            Ok(c) => c,
+            Err(e) => {
+                errno::set_errno(errno::Errno(
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        libc::ENOENT
+                    } else {
+                        libc::EIO
+                    },
+                ));
+                return std::ptr::null_mut();
+            }
+        };
+
+        let is_json = path_str.ends_with(".json") || content.trim_start().starts_with('{');
+        if is_json {
+            builder = builder.with_config_json_str(content);
+        } else {
+            builder = builder.with_config_yaml_str(content);
+        }
     }
 
-    0
-}
-
-/// Set decoder configuration from a JSON string.
-///
-/// @param builder Decoder builder handle
-/// @param json_str JSON configuration string
-/// @return 0 on success, -1 on error
-/// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL builder/json_str)
-/// - EBADMSG: Invalid JSON format
-#[no_mangle]
-pub unsafe extern "C" fn hal_decoder_builder_with_config_json(
-    builder: *mut HalDecoderBuilder,
-    json_str: *const c_char,
-) -> c_int {
-    check_null!(builder, json_str);
-
-    let json = match CStr::from_ptr(json_str).to_str() {
-        Ok(s) => s.to_string(),
-        Err(_) => return set_error(libc::EINVAL),
-    };
-
-    (*builder).inner = std::mem::take(&mut (*builder).inner).with_config_json_str(json);
-    0
-}
-
-/// Set decoder configuration from a YAML string.
-///
-/// @param builder Decoder builder handle
-/// @param yaml_str YAML configuration string
-/// @return 0 on success, -1 on error
-/// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL builder/yaml_str)
-/// - EBADMSG: Invalid YAML format
-#[no_mangle]
-pub unsafe extern "C" fn hal_decoder_builder_with_config_yaml(
-    builder: *mut HalDecoderBuilder,
-    yaml_str: *const c_char,
-) -> c_int {
-    check_null!(builder, yaml_str);
-
-    let yaml = match CStr::from_ptr(yaml_str).to_str() {
-        Ok(s) => s.to_string(),
-        Err(_) => return set_error(libc::EINVAL),
-    };
-
-    (*builder).inner = std::mem::take(&mut (*builder).inner).with_config_yaml_str(yaml);
-    0
-}
-
-/// Set the score threshold for filtering detections.
-///
-/// Detections with scores below this threshold are discarded.
-///
-/// @param builder Decoder builder handle
-/// @param threshold Score threshold (0.0 to 1.0)
-/// @return 0 on success, -1 on error
-/// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL builder)
-#[no_mangle]
-pub unsafe extern "C" fn hal_decoder_builder_with_score_threshold(
-    builder: *mut HalDecoderBuilder,
-    threshold: f32,
-) -> c_int {
-    check_null!(builder);
-    (*builder).inner = std::mem::take(&mut (*builder).inner).with_score_threshold(threshold);
-    0
-}
-
-/// Set the IOU threshold for NMS.
-///
-/// Detection pairs with IOU above this threshold are candidates for suppression.
-///
-/// @param builder Decoder builder handle
-/// @param threshold IOU threshold (0.0 to 1.0)
-/// @return 0 on success, -1 on error
-/// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL builder)
-#[no_mangle]
-pub unsafe extern "C" fn hal_decoder_builder_with_iou_threshold(
-    builder: *mut HalDecoderBuilder,
-    threshold: f32,
-) -> c_int {
-    check_null!(builder);
-    (*builder).inner = std::mem::take(&mut (*builder).inner).with_iou_threshold(threshold);
-    0
-}
-
-/// Set the NMS (Non-Maximum Suppression) mode.
-///
-/// @param builder Decoder builder handle
-/// @param nms NMS mode (HAL_NMS_*)
-/// @return 0 on success, -1 on error
-/// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL builder)
-#[no_mangle]
-pub unsafe extern "C" fn hal_decoder_builder_with_nms(
-    builder: *mut HalDecoderBuilder,
-    nms: HalNms,
-) -> c_int {
-    check_null!(builder);
-    (*builder).inner = std::mem::take(&mut (*builder).inner).with_nms(nms.into());
-    0
-}
-
-/// Build the decoder from the builder configuration.
-///
-/// Consumes the builder - it cannot be used after this call.
-///
-/// @param builder Decoder builder handle (consumed)
-/// @return New decoder handle on success, NULL on error
-/// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL builder) or no configuration set
-/// - EBADMSG: Invalid configuration
-#[no_mangle]
-pub unsafe extern "C" fn hal_decoder_builder_build(
-    builder: *mut HalDecoderBuilder,
-) -> *mut HalDecoder {
-    check_null_ret_null!(builder);
-
-    let boxed = Box::from_raw(builder);
-    let decoder = try_or_null!(boxed.inner.build(), libc::EBADMSG);
-
+    let decoder = try_or_null!(builder.build(), libc::EBADMSG);
     Box::into_raw(Box::new(HalDecoder { inner: decoder }))
-}
-
-/// Free a decoder builder.
-///
-/// @param builder Decoder builder handle to free (can be NULL, no-op)
-#[no_mangle]
-pub unsafe extern "C" fn hal_decoder_builder_free(builder: *mut HalDecoderBuilder) {
-    if !builder.is_null() {
-        drop(Box::from_raw(builder));
-    }
 }
 
 // ============================================================================
@@ -568,13 +675,23 @@ mod tests {
 nms: class_aware
 "#;
 
+    /// Helper: create a decoder from JSON config with optional overrides.
+    unsafe fn make_decoder_json(json: &str) -> *mut HalDecoder {
+        let config = CString::new(json).unwrap();
+        let mut params = hal_decoder_params_default();
+        params.config_json = config.as_ptr();
+        hal_decoder_new(&params)
+    }
+
     #[test]
-    fn test_builder_create_and_free() {
-        unsafe {
-            let builder = hal_decoder_builder_new();
-            assert!(!builder.is_null());
-            hal_decoder_builder_free(builder);
-        }
+    fn test_params_default() {
+        let params = hal_decoder_params_default();
+        assert!(params.config_json.is_null());
+        assert!(params.config_yaml.is_null());
+        assert!(params.config_file.is_null());
+        assert!((params.score_threshold - 0.5).abs() < f32::EPSILON);
+        assert!((params.iou_threshold - 0.5).abs() < f32::EPSILON);
+        assert_eq!(params.nms, HalNms::ClassAgnostic);
     }
 
     #[test]
@@ -585,7 +702,6 @@ nms: class_aware
             hal_detect_box_list_free(std::ptr::null_mut());
             hal_segmentation_list_free(std::ptr::null_mut());
             hal_decoder_free(std::ptr::null_mut());
-            hal_decoder_builder_free(std::ptr::null_mut());
         }
     }
 
@@ -634,133 +750,85 @@ nms: class_aware
     }
 
     #[test]
-    fn test_builder_with_json_config() {
+    fn test_decoder_new_with_json() {
         unsafe {
-            let builder = hal_decoder_builder_new();
-            assert!(!builder.is_null());
-
             let config = CString::new(YOLO_JSON_CONFIG).unwrap();
-            let result = hal_decoder_builder_with_config_json(builder, config.as_ptr());
-            assert_eq!(result, 0);
+            let mut params = hal_decoder_params_default();
+            params.config_json = config.as_ptr();
 
-            let decoder = hal_decoder_builder_build(builder);
+            let decoder = hal_decoder_new(&params);
             assert!(!decoder.is_null());
-
             hal_decoder_free(decoder);
         }
     }
 
     #[test]
-    fn test_builder_with_yaml_config() {
+    fn test_decoder_new_with_yaml() {
         unsafe {
-            let builder = hal_decoder_builder_new();
-            assert!(!builder.is_null());
-
             let config = CString::new(YOLO_YAML_CONFIG).unwrap();
-            let result = hal_decoder_builder_with_config_yaml(builder, config.as_ptr());
-            assert_eq!(result, 0);
+            let mut params = hal_decoder_params_default();
+            params.config_yaml = config.as_ptr();
 
-            let decoder = hal_decoder_builder_build(builder);
+            let decoder = hal_decoder_new(&params);
             assert!(!decoder.is_null());
-
             hal_decoder_free(decoder);
         }
     }
 
     #[test]
-    fn test_builder_with_thresholds() {
+    fn test_decoder_new_with_thresholds() {
         unsafe {
-            let builder = hal_decoder_builder_new();
-            assert!(!builder.is_null());
-
-            // Set thresholds
-            assert_eq!(hal_decoder_builder_with_score_threshold(builder, 0.3), 0);
-            assert_eq!(hal_decoder_builder_with_iou_threshold(builder, 0.45), 0);
-            assert_eq!(hal_decoder_builder_with_nms(builder, HalNms::ClassAware), 0);
-
-            // Add config and build
             let config = CString::new(YOLO_JSON_CONFIG).unwrap();
-            assert_eq!(
-                hal_decoder_builder_with_config_json(builder, config.as_ptr()),
-                0
-            );
+            let mut params = hal_decoder_params_default();
+            params.config_json = config.as_ptr();
+            params.score_threshold = 0.3;
+            params.iou_threshold = 0.45;
+            params.nms = HalNms::ClassAware;
 
-            let decoder = hal_decoder_builder_build(builder);
+            let decoder = hal_decoder_new(&params);
             assert!(!decoder.is_null());
-
             hal_decoder_free(decoder);
         }
     }
 
     #[test]
-    fn test_builder_null_parameters() {
+    fn test_decoder_new_null_params() {
         unsafe {
-            // NULL builder for all functions
-            assert_eq!(
-                hal_decoder_builder_with_score_threshold(std::ptr::null_mut(), 0.5),
-                -1
-            );
-            assert_eq!(
-                hal_decoder_builder_with_iou_threshold(std::ptr::null_mut(), 0.5),
-                -1
-            );
-            assert_eq!(
-                hal_decoder_builder_with_nms(std::ptr::null_mut(), HalNms::ClassAgnostic),
-                -1
-            );
-            assert_eq!(
-                hal_decoder_builder_with_config_json(std::ptr::null_mut(), std::ptr::null()),
-                -1
-            );
-            assert_eq!(
-                hal_decoder_builder_with_config_yaml(std::ptr::null_mut(), std::ptr::null()),
-                -1
-            );
-            assert!(hal_decoder_builder_build(std::ptr::null_mut()).is_null());
-
-            // NULL config strings
-            let builder = hal_decoder_builder_new();
-            assert!(!builder.is_null());
-            assert_eq!(
-                hal_decoder_builder_with_config_json(builder, std::ptr::null()),
-                -1
-            );
-            hal_decoder_builder_free(builder);
-
-            let builder = hal_decoder_builder_new();
-            assert!(!builder.is_null());
-            assert_eq!(
-                hal_decoder_builder_with_config_yaml(builder, std::ptr::null()),
-                -1
-            );
-            hal_decoder_builder_free(builder);
+            assert!(hal_decoder_new(std::ptr::null()).is_null());
         }
     }
 
     #[test]
-    fn test_builder_build_without_config() {
+    fn test_decoder_new_no_config() {
         unsafe {
-            let builder = hal_decoder_builder_new();
-            assert!(!builder.is_null());
-
-            // Building without config should fail
-            let decoder = hal_decoder_builder_build(builder);
+            // All config pointers NULL → EINVAL
+            let params = hal_decoder_params_default();
+            let decoder = hal_decoder_new(&params);
             assert!(decoder.is_null());
-            // Builder is consumed even on failure
+        }
+    }
+
+    #[test]
+    fn test_decoder_new_multiple_configs() {
+        unsafe {
+            let json = CString::new(YOLO_JSON_CONFIG).unwrap();
+            let yaml = CString::new(YOLO_YAML_CONFIG).unwrap();
+
+            let mut params = hal_decoder_params_default();
+            params.config_json = json.as_ptr();
+            params.config_yaml = yaml.as_ptr();
+
+            let decoder = hal_decoder_new(&params);
+            assert!(decoder.is_null());
         }
     }
 
     #[test]
     fn test_decode_float_null_parameters() {
         unsafe {
-            // Build a valid decoder
-            let builder = hal_decoder_builder_new();
-            let config = CString::new(YOLO_JSON_CONFIG).unwrap();
-            hal_decoder_builder_with_config_json(builder, config.as_ptr());
-            let decoder = hal_decoder_builder_build(builder);
+            let decoder = make_decoder_json(YOLO_JSON_CONFIG);
             assert!(!decoder.is_null());
 
-            // Create a tensor for testing
             let shape: [usize; 3] = [1, 84, 8400];
             let tensor = hal_tensor_new(
                 HalDtype::F32,
@@ -811,14 +879,9 @@ nms: class_aware
     #[test]
     fn test_decode_float_wrong_dtype() {
         unsafe {
-            // Build a valid decoder
-            let builder = hal_decoder_builder_new();
-            let config = CString::new(YOLO_JSON_CONFIG).unwrap();
-            hal_decoder_builder_with_config_json(builder, config.as_ptr());
-            let decoder = hal_decoder_builder_build(builder);
+            let decoder = make_decoder_json(YOLO_JSON_CONFIG);
             assert!(!decoder.is_null());
 
-            // Create a U8 tensor (wrong type for decode_float)
             let shape: [usize; 3] = [1, 84, 8400];
             let tensor = hal_tensor_new(
                 HalDtype::U8,
@@ -831,7 +894,6 @@ nms: class_aware
             let outputs = [tensor as *const HalTensor];
             let mut boxes: *mut HalDetectBoxList = std::ptr::null_mut();
 
-            // Should fail because tensor is U8, not F32
             assert_eq!(
                 hal_decoder_decode_float(decoder, outputs.as_ptr(), 1, &mut boxes as *mut _),
                 -1
@@ -845,15 +907,13 @@ nms: class_aware
     #[test]
     fn test_decode_float_success() {
         unsafe {
-            // Build a valid decoder with low threshold
-            let builder = hal_decoder_builder_new();
             let config = CString::new(YOLO_JSON_CONFIG).unwrap();
-            hal_decoder_builder_with_config_json(builder, config.as_ptr());
-            hal_decoder_builder_with_score_threshold(builder, 0.01); // Low threshold
-            let decoder = hal_decoder_builder_build(builder);
+            let mut params = hal_decoder_params_default();
+            params.config_json = config.as_ptr();
+            params.score_threshold = 0.01;
+            let decoder = hal_decoder_new(&params);
             assert!(!decoder.is_null());
 
-            // Create F32 tensor with correct shape for YOLO
             let shape: [usize; 3] = [1, 84, 8400];
             let tensor = hal_tensor_new(
                 HalDtype::F32,
@@ -864,21 +924,14 @@ nms: class_aware
             );
             assert!(!tensor.is_null());
 
-            // Fill with some data that might produce detections
             let map = hal_tensor_map_create(tensor);
             assert!(!map.is_null());
             let data = hal_tensor_map_data(map) as *mut f32;
 
-            // YOLO output format: [batch, 84, num_boxes]
-            // 84 = 4 (bbox: cx, cy, w, h) + 80 (class scores)
-            // Initialize all to zero first
             for i in 0..(84 * 8400) {
                 *data.add(i) = 0.0;
             }
 
-            // Add a fake detection at box_idx=0
-            // YOLO layout: [batch, features, boxes] where features = 4 bbox + 80 classes
-            // Box coords (normalized): cx=0.5, cy=0.5, w=0.1, h=0.1
             #[allow(clippy::identity_op, clippy::erasing_op)]
             {
                 let box_idx = 0usize;
@@ -887,8 +940,7 @@ nms: class_aware
                 *data.add(1 * num_boxes + box_idx) = 0.5; // cy
                 *data.add(2 * num_boxes + box_idx) = 0.1; // w
                 *data.add(3 * num_boxes + box_idx) = 0.1; // h
-                                                          // Class 0 score = 0.9
-                *data.add(4 * num_boxes + box_idx) = 0.9;
+                *data.add(4 * num_boxes + box_idx) = 0.9; // class 0 score
             }
 
             hal_tensor_map_unmap(map);
@@ -901,11 +953,8 @@ nms: class_aware
             assert_eq!(result, 0);
             assert!(!boxes.is_null());
 
-            // Check results - we may or may not have detections depending on thresholds
             let len = hal_detect_box_list_len(boxes);
-            // len could be 0 or more depending on decoder internals
 
-            // If we have detections, test getting them
             if len > 0 {
                 let mut box_out = HalDetectBox {
                     xmin: 0.0,
@@ -916,12 +965,10 @@ nms: class_aware
                     label: 0,
                 };
                 assert_eq!(hal_detect_box_list_get(boxes, 0, &mut box_out), 0);
-                // Box should have valid coordinates
                 assert!(box_out.xmax >= box_out.xmin);
                 assert!(box_out.ymax >= box_out.ymin);
             }
 
-            // Test out of bounds
             let mut box_out = HalDetectBox {
                 xmin: 0.0,
                 ymin: 0.0,
@@ -941,7 +988,6 @@ nms: class_aware
     #[test]
     fn test_detect_box_list_get_null_output() {
         unsafe {
-            // Create a box list manually for testing
             let boxes = Box::into_raw(Box::new(HalDetectBoxList {
                 boxes: vec![DetectBox {
                     bbox: edgefirst_decoder::BoundingBox {
@@ -956,8 +1002,6 @@ nms: class_aware
             }));
 
             assert_eq!(hal_detect_box_list_len(boxes), 1);
-
-            // NULL output box
             assert_eq!(hal_detect_box_list_get(boxes, 0, std::ptr::null_mut()), -1);
 
             hal_detect_box_list_free(boxes);
@@ -967,8 +1011,6 @@ nms: class_aware
     #[test]
     fn test_segmentation_list_operations() {
         unsafe {
-            // Create a segmentation list manually for testing
-            // Segmentation uses Array3<u8> with shape (height, width, channels)
             let mask_data = ndarray::Array3::<u8>::zeros((10, 10, 1));
             let seg = Segmentation {
                 xmin: 0.1,
@@ -980,10 +1022,8 @@ nms: class_aware
 
             let list = Box::into_raw(Box::new(HalSegmentationList { masks: vec![seg] }));
 
-            // Test length
             assert_eq!(hal_segmentation_list_len(list), 1);
 
-            // Test get_bbox
             let mut xmin = 0.0f32;
             let mut ymin = 0.0f32;
             let mut xmax = 0.0f32;
@@ -998,13 +1038,11 @@ nms: class_aware
             assert!((xmax - 0.3).abs() < 1e-6);
             assert!((ymax - 0.4).abs() < 1e-6);
 
-            // Test out of bounds
             assert_eq!(
                 hal_segmentation_list_get_bbox(list, 1, &mut xmin, &mut ymin, &mut xmax, &mut ymax),
                 -1
             );
 
-            // Test NULL parameters
             assert_eq!(
                 hal_segmentation_list_get_bbox(
                     list,
@@ -1017,7 +1055,6 @@ nms: class_aware
                 -1
             );
 
-            // Test get_mask
             let mut height: usize = 0;
             let mut width: usize = 0;
             let mask_ptr = hal_segmentation_list_get_mask(list, 0, &mut height, &mut width);
@@ -1025,12 +1062,10 @@ nms: class_aware
             assert_eq!(height, 10);
             assert_eq!(width, 10);
 
-            // Test with NULL height/width (should still work)
             let mask_ptr2 =
                 hal_segmentation_list_get_mask(list, 0, std::ptr::null_mut(), std::ptr::null_mut());
             assert!(!mask_ptr2.is_null());
 
-            // Test out of bounds
             let mask_ptr3 = hal_segmentation_list_get_mask(list, 1, &mut height, &mut width);
             assert!(mask_ptr3.is_null());
 
@@ -1042,18 +1077,14 @@ nms: class_aware
     fn test_config_file_loading() {
         use std::io::Write;
 
-        // Create a temporary config file
         let temp_dir = std::env::temp_dir();
         let json_path = temp_dir.join("test_decoder_config.json");
         let yaml_path = temp_dir.join("test_decoder_config.yaml");
 
-        // Write JSON config
         {
             let mut file = std::fs::File::create(&json_path).unwrap();
             file.write_all(YOLO_JSON_CONFIG.as_bytes()).unwrap();
         }
-
-        // Write YAML config
         {
             let mut file = std::fs::File::create(&yaml_path).unwrap();
             file.write_all(YOLO_YAML_CONFIG.as_bytes()).unwrap();
@@ -1061,51 +1092,29 @@ nms: class_aware
 
         unsafe {
             // Test JSON file loading
-            let builder = hal_decoder_builder_new();
             let path = CString::new(json_path.to_str().unwrap()).unwrap();
-            assert_eq!(
-                hal_decoder_builder_with_config_file(builder, path.as_ptr()),
-                0
-            );
-            let decoder = hal_decoder_builder_build(builder);
+            let mut params = hal_decoder_params_default();
+            params.config_file = path.as_ptr();
+            let decoder = hal_decoder_new(&params);
             assert!(!decoder.is_null());
             hal_decoder_free(decoder);
 
             // Test YAML file loading
-            let builder = hal_decoder_builder_new();
             let path = CString::new(yaml_path.to_str().unwrap()).unwrap();
-            assert_eq!(
-                hal_decoder_builder_with_config_file(builder, path.as_ptr()),
-                0
-            );
-            let decoder = hal_decoder_builder_build(builder);
+            let mut params = hal_decoder_params_default();
+            params.config_file = path.as_ptr();
+            let decoder = hal_decoder_new(&params);
             assert!(!decoder.is_null());
             hal_decoder_free(decoder);
 
             // Test non-existent file
-            let builder = hal_decoder_builder_new();
             let path = CString::new("/nonexistent/path/config.json").unwrap();
-            assert_eq!(
-                hal_decoder_builder_with_config_file(builder, path.as_ptr()),
-                -1
-            );
-            hal_decoder_builder_free(builder);
-
-            // Test NULL parameters
-            let builder = hal_decoder_builder_new();
-            assert_eq!(
-                hal_decoder_builder_with_config_file(builder, std::ptr::null()),
-                -1
-            );
-            hal_decoder_builder_free(builder);
-
-            assert_eq!(
-                hal_decoder_builder_with_config_file(std::ptr::null_mut(), std::ptr::null()),
-                -1
-            );
+            let mut params = hal_decoder_params_default();
+            params.config_file = path.as_ptr();
+            let decoder = hal_decoder_new(&params);
+            assert!(decoder.is_null());
         }
 
-        // Clean up temp files
         let _ = std::fs::remove_file(json_path);
         let _ = std::fs::remove_file(yaml_path);
     }
@@ -1113,14 +1122,9 @@ nms: class_aware
     #[test]
     fn test_decode_with_null_tensor_in_array() {
         unsafe {
-            // Build a valid decoder
-            let builder = hal_decoder_builder_new();
-            let config = CString::new(YOLO_JSON_CONFIG).unwrap();
-            hal_decoder_builder_with_config_json(builder, config.as_ptr());
-            let decoder = hal_decoder_builder_build(builder);
+            let decoder = make_decoder_json(YOLO_JSON_CONFIG);
             assert!(!decoder.is_null());
 
-            // Array with NULL tensor
             let outputs: [*const HalTensor; 1] = [std::ptr::null()];
             let mut boxes: *mut HalDetectBoxList = std::ptr::null_mut();
 

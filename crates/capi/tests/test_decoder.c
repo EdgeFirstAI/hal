@@ -5,80 +5,9 @@
 
 #include "test_common.h"
 
-// =============================================================================
-// Decoder Builder Tests
-// =============================================================================
-
-static void test_decoder_builder_new(void) {
-    TEST("decoder_builder_new");
-
-    struct hal_decoder_builder* builder = hal_decoder_builder_new();
-    ASSERT_NOT_NULL(builder);
-
-    hal_decoder_builder_free(builder);
-    TEST_PASS();
-}
-
-static void test_decoder_builder_null_handling(void) {
-    TEST("decoder_builder_null_handling");
-
-    // Free NULL should be no-op
-    hal_decoder_builder_free(NULL);
-
-    TEST_PASS();
-}
-
-static void test_decoder_builder_with_thresholds(void) {
-    TEST("decoder_builder_with_thresholds");
-
-    struct hal_decoder_builder* builder = hal_decoder_builder_new();
-    ASSERT_NOT_NULL(builder);
-
-    // Set score threshold
-    int result = hal_decoder_builder_with_score_threshold(builder, 0.3f);
-    ASSERT_EQ(0, result);
-
-    // Set IOU threshold
-    result = hal_decoder_builder_with_iou_threshold(builder, 0.45f);
-    ASSERT_EQ(0, result);
-
-    // Set NMS mode
-    result = hal_decoder_builder_with_nms(builder, HAL_NMS_CLASS_AWARE);
-    ASSERT_EQ(0, result);
-
-    hal_decoder_builder_free(builder);
-    TEST_PASS();
-}
-
-static void test_decoder_builder_with_thresholds_null(void) {
-    TEST("decoder_builder_with_thresholds_null");
-
-    errno = 0;
-    int result = hal_decoder_builder_with_score_threshold(NULL, 0.5f);
-    ASSERT_EQ(-1, result);
-    ASSERT_ERRNO(EINVAL);
-
-    errno = 0;
-    result = hal_decoder_builder_with_iou_threshold(NULL, 0.5f);
-    ASSERT_EQ(-1, result);
-    ASSERT_ERRNO(EINVAL);
-
-    errno = 0;
-    result = hal_decoder_builder_with_nms(NULL, HAL_NMS_CLASS_AGNOSTIC);
-    ASSERT_EQ(-1, result);
-    ASSERT_ERRNO(EINVAL);
-
-    TEST_PASS();
-}
-
-static void test_decoder_builder_with_config_json(void) {
-    TEST("decoder_builder_with_config_json");
-
-    struct hal_decoder_builder* builder = hal_decoder_builder_new();
-    ASSERT_NOT_NULL(builder);
-
-    // Valid YOLO detection config
-    const char* json = "{"
+// Valid YOLO detection config (84 features = 4 bbox + 80 classes)
+static const char* YOLO_JSON_CONFIG =
+    "{"
         "\"outputs\": [{"
             "\"decoder\": \"ultralytics\","
             "\"type\": \"detection\","
@@ -88,109 +17,109 @@ static void test_decoder_builder_with_config_json(void) {
         "\"nms\": \"class_aware\""
     "}";
 
-    int result = hal_decoder_builder_with_config_json(builder, json);
-    ASSERT_EQ(0, result);
+static const char* YOLO_YAML_CONFIG =
+    "outputs:\n"
+    "  - decoder: ultralytics\n"
+    "    type: detection\n"
+    "    shape: [1, 84, 8400]\n"
+    "    dshape: [[batch, 1], [num_features, 84], [num_boxes, 8400]]\n"
+    "nms: class_aware\n";
 
-    hal_decoder_builder_free(builder);
-    TEST_PASS();
-}
+// =============================================================================
+// Decoder Params Tests
+// =============================================================================
 
-static void test_decoder_builder_with_config_yaml(void) {
-    TEST("decoder_builder_with_config_yaml");
+static void test_decoder_params_default(void) {
+    TEST("decoder_params_default");
 
-    struct hal_decoder_builder* builder = hal_decoder_builder_new();
-    ASSERT_NOT_NULL(builder);
-
-    // Valid YOLO detection config in YAML
-    const char* yaml =
-        "outputs:\n"
-        "  - decoder: ultralytics\n"
-        "    type: detection\n"
-        "    shape: [1, 84, 8400]\n"
-        "    dshape: [[batch, 1], [num_features, 84], [num_boxes, 8400]]\n"
-        "nms: class_aware\n";
-
-    int result = hal_decoder_builder_with_config_yaml(builder, yaml);
-    ASSERT_EQ(0, result);
-
-    hal_decoder_builder_free(builder);
-    TEST_PASS();
-}
-
-static void test_decoder_builder_with_config_null(void) {
-    TEST("decoder_builder_with_config_null");
-
-    struct hal_decoder_builder* builder = hal_decoder_builder_new();
-    ASSERT_NOT_NULL(builder);
-
-    // NULL JSON string
-    errno = 0;
-    int result = hal_decoder_builder_with_config_json(builder, NULL);
-    ASSERT_EQ(-1, result);
-    ASSERT_ERRNO(EINVAL);
-
-    // NULL YAML string
-    errno = 0;
-    result = hal_decoder_builder_with_config_yaml(builder, NULL);
-    ASSERT_EQ(-1, result);
-    ASSERT_ERRNO(EINVAL);
-
-    // NULL builder
-    errno = 0;
-    result = hal_decoder_builder_with_config_json(NULL, "{}");
-    ASSERT_EQ(-1, result);
-    ASSERT_ERRNO(EINVAL);
-
-    hal_decoder_builder_free(builder);
-    TEST_PASS();
-}
-
-static void test_decoder_builder_build_without_config(void) {
-    TEST("decoder_builder_build_without_config");
-
-    struct hal_decoder_builder* builder = hal_decoder_builder_new();
-    ASSERT_NOT_NULL(builder);
-
-    // Building without config should fail
-    errno = 0;
-    struct hal_decoder* decoder = hal_decoder_builder_build(builder);
-    ASSERT_NULL(decoder);
-    // errno should be EBADMSG
-
-    // Builder is consumed even on failure, no need to free
+    struct hal_decoder_params params = hal_decoder_params_default();
+    ASSERT_NULL(params.config_json);
+    ASSERT_NULL(params.config_yaml);
+    ASSERT_NULL(params.config_file);
+    ASSERT_FLOAT_EQ(0.5f, params.score_threshold, 0.001f);
+    ASSERT_FLOAT_EQ(0.5f, params.iou_threshold, 0.001f);
+    ASSERT_EQ(HAL_NMS_CLASS_AGNOSTIC, params.nms);
 
     TEST_PASS();
 }
 
-static void test_decoder_builder_build_with_config(void) {
-    TEST("decoder_builder_build_with_config");
+static void test_decoder_new_with_json(void) {
+    TEST("decoder_new_with_json");
 
-    struct hal_decoder_builder* builder = hal_decoder_builder_new();
-    ASSERT_NOT_NULL(builder);
+    struct hal_decoder_params params = hal_decoder_params_default();
+    params.config_json = YOLO_JSON_CONFIG;
 
-    // Valid YOLO detection config
-    const char* json = "{"
-        "\"outputs\": [{"
-            "\"decoder\": \"ultralytics\","
-            "\"type\": \"detection\","
-            "\"shape\": [1, 84, 8400],"
-            "\"dshape\": [[\"batch\", 1], [\"num_features\", 84], [\"num_boxes\", 8400]]"
-        "}],"
-        "\"nms\": \"class_aware\""
-    "}";
-
-    int result = hal_decoder_builder_with_config_json(builder, json);
-    ASSERT_EQ(0, result);
-
-    result = hal_decoder_builder_with_score_threshold(builder, 0.25f);
-    ASSERT_EQ(0, result);
-
-    struct hal_decoder* decoder = hal_decoder_builder_build(builder);
+    struct hal_decoder* decoder = hal_decoder_new(&params);
     ASSERT_NOT_NULL(decoder);
 
     hal_decoder_free(decoder);
+    TEST_PASS();
+}
 
-    // Builder is consumed by build, no need to free
+static void test_decoder_new_with_yaml(void) {
+    TEST("decoder_new_with_yaml");
+
+    struct hal_decoder_params params = hal_decoder_params_default();
+    params.config_yaml = YOLO_YAML_CONFIG;
+
+    struct hal_decoder* decoder = hal_decoder_new(&params);
+    ASSERT_NOT_NULL(decoder);
+
+    hal_decoder_free(decoder);
+    TEST_PASS();
+}
+
+static void test_decoder_new_with_thresholds(void) {
+    TEST("decoder_new_with_thresholds");
+
+    struct hal_decoder_params params = hal_decoder_params_default();
+    params.config_json = YOLO_JSON_CONFIG;
+    params.score_threshold = 0.25f;
+    params.iou_threshold = 0.45f;
+    params.nms = HAL_NMS_CLASS_AWARE;
+
+    struct hal_decoder* decoder = hal_decoder_new(&params);
+    ASSERT_NOT_NULL(decoder);
+
+    hal_decoder_free(decoder);
+    TEST_PASS();
+}
+
+static void test_decoder_new_null_params(void) {
+    TEST("decoder_new_null_params");
+
+    errno = 0;
+    struct hal_decoder* decoder = hal_decoder_new(NULL);
+    ASSERT_NULL(decoder);
+    ASSERT_ERRNO(EINVAL);
+
+    TEST_PASS();
+}
+
+static void test_decoder_new_no_config(void) {
+    TEST("decoder_new_no_config");
+
+    struct hal_decoder_params params = hal_decoder_params_default();
+
+    errno = 0;
+    struct hal_decoder* decoder = hal_decoder_new(&params);
+    ASSERT_NULL(decoder);
+    ASSERT_ERRNO(EINVAL);
+
+    TEST_PASS();
+}
+
+static void test_decoder_new_multiple_configs(void) {
+    TEST("decoder_new_multiple_configs");
+
+    struct hal_decoder_params params = hal_decoder_params_default();
+    params.config_json = YOLO_JSON_CONFIG;
+    params.config_yaml = YOLO_YAML_CONFIG;
+
+    errno = 0;
+    struct hal_decoder* decoder = hal_decoder_new(&params);
+    ASSERT_NULL(decoder);
+    ASSERT_ERRNO(EINVAL);
 
     TEST_PASS();
 }
@@ -284,31 +213,17 @@ static void test_decoder_decode_invalid_params(void) {
     TEST("decoder_decode_invalid_params");
 
     // Build a decoder with valid Ultralytics YOLO config
-    struct hal_decoder_builder* builder = hal_decoder_builder_new();
-    ASSERT_NOT_NULL(builder);
+    struct hal_decoder_params params = hal_decoder_params_default();
+    params.config_json = YOLO_JSON_CONFIG;
 
-    // Valid YOLO detection config (84 features = 4 bbox + 80 classes)
-    const char* json = "{"
-        "\"outputs\": [{"
-            "\"decoder\": \"ultralytics\","
-            "\"type\": \"detection\","
-            "\"shape\": [1, 84, 8400],"
-            "\"dshape\": [[\"batch\", 1], [\"num_features\", 84], [\"num_boxes\", 8400]]"
-        "}],"
-        "\"nms\": \"class_aware\""
-    "}";
-
-    int result = hal_decoder_builder_with_config_json(builder, json);
-    ASSERT_EQ(0, result);
-
-    struct hal_decoder* decoder = hal_decoder_builder_build(builder);
+    struct hal_decoder* decoder = hal_decoder_new(&params);
     ASSERT_NOT_NULL(decoder);
 
     struct hal_detect_box_list* boxes = NULL;
 
     // NULL outputs
     errno = 0;
-    result = hal_decoder_decode_float(decoder, NULL, 1, &boxes);
+    int result = hal_decoder_decode_float(decoder, NULL, 1, &boxes);
     ASSERT_EQ(-1, result);
     ASSERT_ERRNO(EINVAL);
 
@@ -341,16 +256,14 @@ static void test_decoder_decode_invalid_params(void) {
 void run_decoder_tests(void) {
     TEST_SUITE("Decoder");
 
-    // Builder tests
-    test_decoder_builder_new();
-    test_decoder_builder_null_handling();
-    test_decoder_builder_with_thresholds();
-    test_decoder_builder_with_thresholds_null();
-    test_decoder_builder_with_config_json();
-    test_decoder_builder_with_config_yaml();
-    test_decoder_builder_with_config_null();
-    test_decoder_builder_build_without_config();
-    test_decoder_builder_build_with_config();
+    // Params tests
+    test_decoder_params_default();
+    test_decoder_new_with_json();
+    test_decoder_new_with_yaml();
+    test_decoder_new_with_thresholds();
+    test_decoder_new_null_params();
+    test_decoder_new_no_config();
+    test_decoder_new_multiple_configs();
 
     // Detection box list tests
     test_detect_box_list_null_handling();
