@@ -39,8 +39,7 @@ fast_image_resize = { version = "5.2.0", features = ["image", "rayon"] }
 four-char-code = "2.3.0"
 g2d-sys = { version = "1.0.1", path = "crates/g2d-sys" }
 
-# Platform-specific dependencies (Git sources need to be defined here)
-gbm = { git = "https://github.com/EdgeFirstAI/gbm.rs.git", branch = "dynamic", default-features = false, features = ["dynamic", "drm-support"] }
+gbm = { package = "edgefirst-gbm", version = "0.18.1", default-features = false, features = ["dynamic", "drm-support"] }
 gls = "0.1.6"
 half = "2.7.1"
 image = { version = "0.25.6", default-features = false, features = ["png"] }
