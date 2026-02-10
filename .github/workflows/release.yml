@@ -17,8 +17,8 @@ name: Release
 on:
   push:
     tags:
-      - '[0-9]+.[0-9]+.[0-9]+'
-      - '[0-9]+.[0-9]+.[0-9]+rc[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+rc[0-9]+'
   workflow_dispatch:
     inputs:
       tag:
@@ -119,7 +119,7 @@ jobs:
       - name: Extract changelog
         id: changelog
         run: |
-          VERSION=${GITHUB_REF#refs/tags/}
+          VERSION=${GITHUB_REF#refs/tags/v}
           awk "/## \[$VERSION\]/,/^## \[/{if (/^## \[/ && !found) {found=1; next} if (/^## \[/ && found) exit; if (found) print}" CHANGELOG.md > RELEASE_NOTES.md || echo "Release $VERSION" > RELEASE_NOTES.md
 
       - name: Create Release
