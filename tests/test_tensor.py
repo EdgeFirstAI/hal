@@ -371,8 +371,7 @@ def test_dma_zero_copy_perf():
             for i in range(tensor_fd.size):
                 assert m[i] == 233
 
-        tensor_copy = Tensor(
-            tensor.shape, dtype=tensor.dtype, mem=tensor.memory)
+        tensor_copy = Tensor(tensor.shape, dtype=tensor.dtype, mem=tensor.memory)
         start = time.perf_counter()
         with tensor.map() as src, tensor_copy.map() as dst:
             for i in range(tensor.size):
@@ -415,6 +414,7 @@ def test_shm_zero_copy_perf():
     assert tensor.memory == TensorMemory.SHM
 
     import time
+
     elapsed = 0
     elapsed_copy = 0
 
@@ -436,8 +436,7 @@ def test_shm_zero_copy_perf():
             for i in range(tensor_fd.size):
                 assert m[i] == 233
 
-        tensor_copy = Tensor(
-            tensor.shape, dtype=tensor.dtype, mem=tensor.memory)
+        tensor_copy = Tensor(tensor.shape, dtype=tensor.dtype, mem=tensor.memory)
         start = time.perf_counter()
         with tensor.map() as src, tensor_copy.map() as dst:
             for i in range(tensor.size):
@@ -475,7 +474,9 @@ def test_dma_no_fd_leaks():
 
     gc.collect()
     end_fds = proc.num_fds()
-    assert start_fds == end_fds, f"File descriptor leak detected: {start_fds} -> {end_fds}"
+    assert start_fds == end_fds, (
+        f"File descriptor leak detected: {start_fds} -> {end_fds}"
+    )
 
 
 def test_shm_no_fd_leaks():
@@ -492,7 +493,9 @@ def test_shm_no_fd_leaks():
 
     gc.collect()
     end_fds = proc.num_fds()
-    assert start_fds == end_fds, f"File descriptor leak detected: {start_fds} -> {end_fds}"
+    assert start_fds == end_fds, (
+        f"File descriptor leak detected: {start_fds} -> {end_fds}"
+    )
 
 
 def tensor_from_fd_func(mem_type: TensorMemory):
@@ -522,7 +525,9 @@ def test_dma_fd_leak_with_from_fd():
     tensor_from_fd_func(TensorMemory.DMA)
     gc.collect()
     end_fds = proc.num_fds()
-    assert start_fds == end_fds, f"File descriptor leak detected: {start_fds} -> {end_fds}"
+    assert start_fds == end_fds, (
+        f"File descriptor leak detected: {start_fds} -> {end_fds}"
+    )
 
 
 def test_shm_fd_leak_with_from_fd():
@@ -539,4 +544,6 @@ def test_shm_fd_leak_with_from_fd():
 
     gc.collect()
     end_fds = proc.num_fds()
-    assert start_fds == end_fds, f"File descriptor leak detected: {start_fds} -> {end_fds}"
+    assert start_fds == end_fds, (
+        f"File descriptor leak detected: {start_fds} -> {end_fds}"
+    )

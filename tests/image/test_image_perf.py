@@ -24,7 +24,6 @@ def load_image(image, format="RGBA", resize=None, rotate=None):
 
 # PIL image rotation is counter clockwise
 def load_bytes_to_image(bytes, format, size, resize=None, rotate=None):
-
     im = Image.frombytes(format, size, bytes)
     if resize is not None:
         im = im.resize(resize)
@@ -38,13 +37,13 @@ def calculate_similarity_rms_u8(imageA, imageB) -> float:
     imgA = np.asarray(imageA)
     imgB = np.asarray(imageB)
 
-    imgA = imgA.astype("float")/255.0
-    imgB = imgB.astype("float")/255.0
+    imgA = imgA.astype("float") / 255.0
+    imgB = imgB.astype("float") / 255.0
 
     squared_diff = (imgA - imgB) ** 2
 
     rms = math.sqrt(float(np.mean(squared_diff)))
-    return 1.0-rms
+    return 1.0 - rms
 
 
 original_env = os.environ.copy()
@@ -83,7 +82,9 @@ def test_resize_cpu_rgba_to_rgba(benchmark):
     benchmark(cpu_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
 
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst.height, dst.width, 4))
+        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape(
+            (dst.height, dst.width, 4)
+        )
         expected = load_image("testdata/zidane.jpg", "RGBA", resize=dst_size)
         assert calculate_similarity_rms_u8(arr_dst, expected) > 0.98
 
@@ -102,15 +103,23 @@ def test_resize_cv2_rgba_to_rgba(benchmark):
         _ = dst[0, 0]
 
     with src.map() as m, dst_cv2.map() as d:
-        arr = np.frombuffer(m.view(), dtype=np.uint8).reshape((src.height, src.width, 4))
-        d = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst_cv2.height, dst_cv2.width, 4))
+        arr = np.frombuffer(m.view(), dtype=np.uint8).reshape(
+            (src.height, src.width, 4)
+        )
+        d = np.frombuffer(d.view(), dtype=np.uint8).reshape(
+            (dst_cv2.height, dst_cv2.width, 4)
+        )
         benchmark(resize, arr, dst_size, dst=d)
 
     cpu_processor.convert(src, dst, Rotation.Rotate0, Flip.NoFlip)
 
     with dst.map() as d, dst_cv2.map() as d_cv2:
-        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst.height, dst.width, 4))
-        arr_cv2 = np.frombuffer(d_cv2.view(), dtype=np.uint8).reshape((dst_cv2.height, dst_cv2.width, 4))
+        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape(
+            (dst.height, dst.width, 4)
+        )
+        arr_cv2 = np.frombuffer(d_cv2.view(), dtype=np.uint8).reshape(
+            (dst_cv2.height, dst_cv2.width, 4)
+        )
         assert calculate_similarity_rms_u8(arr_dst, arr_cv2) > 0.98
 
 
@@ -128,7 +137,9 @@ def test_resize_gl_rgba_to_rgba(benchmark):
     benchmark(gl_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
 
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst.height, dst.width, 4))
+        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape(
+            (dst.height, dst.width, 4)
+        )
         expected = load_image("testdata/zidane.jpg", "RGBA", resize=dst_size)
         assert calculate_similarity_rms_u8(arr_dst, expected) > 0.98
 
@@ -148,7 +159,9 @@ def test_resize_g2d_rgba_to_rgba(benchmark):
     benchmark(g2d_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
 
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst.height, dst.width, 4))
+        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape(
+            (dst.height, dst.width, 4)
+        )
         expected = load_image("testdata/zidane.jpg", "RGBA", resize=dst_size)
         assert calculate_similarity_rms_u8(arr_dst, expected) > 0.98
 
@@ -162,7 +175,9 @@ def test_resize_cpu_rgba_to_rgb(benchmark):
 
     benchmark(cpu_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst.height, dst.width, 3))
+        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape(
+            (dst.height, dst.width, 3)
+        )
         expected = load_image("testdata/zidane.jpg", "RGB", resize=dst_size)
         assert calculate_similarity_rms_u8(arr_dst, expected) > 0.98
 
@@ -184,15 +199,23 @@ def test_resize_cv2_rgba_to_rgb(benchmark):
         _ = dst[0, 0]
 
     with src.map() as m, dst_cv2.map() as d:
-        arr = np.frombuffer(m.view(), dtype=np.uint8).reshape((src.height, src.width, 4))
-        d = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst_cv2.height, dst_cv2.width, 3))
+        arr = np.frombuffer(m.view(), dtype=np.uint8).reshape(
+            (src.height, src.width, 4)
+        )
+        d = np.frombuffer(d.view(), dtype=np.uint8).reshape(
+            (dst_cv2.height, dst_cv2.width, 3)
+        )
         benchmark(resize, arr, dst_size, dst=d)
 
     cpu_processor.convert(src, dst, Rotation.Rotate0, Flip.NoFlip)
 
     with dst.map() as d, dst_cv2.map() as d_cv2:
-        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst.height, dst.width, 3))
-        arr_cv2 = np.frombuffer(d_cv2.view(), dtype=np.uint8).reshape((dst_cv2.height, dst_cv2.width, 3))
+        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape(
+            (dst.height, dst.width, 3)
+        )
+        arr_cv2 = np.frombuffer(d_cv2.view(), dtype=np.uint8).reshape(
+            (dst_cv2.height, dst_cv2.width, 3)
+        )
         assert calculate_similarity_rms_u8(arr_dst, arr_cv2) > 0.98
 
 
@@ -209,7 +232,9 @@ def test_resize_g2d_rgba_to_rgb(benchmark):
 
     benchmark(g2d_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst.height, dst.width, 3))
+        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape(
+            (dst.height, dst.width, 3)
+        )
         expected = load_image("testdata/zidane.jpg", "RGB", resize=dst_size)
         assert calculate_similarity_rms_u8(arr_dst, expected) > 0.98
 
@@ -232,7 +257,9 @@ def test_resize_cpu_yuyv_to_rgba(benchmark):
 
     benchmark(cpu_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst.height, dst.width, 4))
+        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape(
+            (dst.height, dst.width, 4)
+        )
         expected = load_bytes_to_image(expected_bytes, "RGBA", (1280, 720), dst_size)
         assert calculate_similarity_rms_u8(arr_dst, expected) > 0.98
 
@@ -261,15 +288,23 @@ def test_resize_cv2_yuyv_to_rgba(benchmark):
         _ = dst[0, 0]
 
     with src.map() as m, dst_cv2.map() as d:
-        arr = np.frombuffer(m.view(), dtype=np.uint8).reshape((src.height, src.width, 2))
-        d = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst_cv2.height, dst_cv2.width, 4))
+        arr = np.frombuffer(m.view(), dtype=np.uint8).reshape(
+            (src.height, src.width, 2)
+        )
+        d = np.frombuffer(d.view(), dtype=np.uint8).reshape(
+            (dst_cv2.height, dst_cv2.width, 4)
+        )
         benchmark(resize, arr, dst_size, dst=d)
 
     cpu_processor.convert(src, dst, Rotation.Rotate0, Flip.NoFlip)
 
     with dst.map() as d, dst_cv2.map() as d_cv2:
-        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst.height, dst.width, 4))
-        arr_cv2 = np.frombuffer(d_cv2.view(), dtype=np.uint8).reshape((dst_cv2.height, dst_cv2.width, 4))
+        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape(
+            (dst.height, dst.width, 4)
+        )
+        arr_cv2 = np.frombuffer(d_cv2.view(), dtype=np.uint8).reshape(
+            (dst_cv2.height, dst_cv2.width, 4)
+        )
         assert calculate_similarity_rms_u8(arr_dst, arr_cv2) > 0.98
 
 
@@ -296,7 +331,9 @@ def test_resize_gl_yuyv_to_rgba(benchmark):
 
     benchmark(gl_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst.height, dst.width, 4))
+        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape(
+            (dst.height, dst.width, 4)
+        )
         expected = load_bytes_to_image(expected_bytes, "RGBA", (1280, 720), dst_size)
         assert calculate_similarity_rms_u8(arr_dst, expected) > 0.98
 
@@ -324,7 +361,9 @@ def test_resize_g2d_yuyv_to_rgba(benchmark):
 
     benchmark(g2d_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst.height, dst.width, 4))
+        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape(
+            (dst.height, dst.width, 4)
+        )
         expected = load_bytes_to_image(expected_bytes, "RGBA", (1280, 720), dst_size)
         assert calculate_similarity_rms_u8(arr_dst, expected) > 0.98
 
@@ -347,7 +386,9 @@ def test_resize_cpu_yuyv_to_rgb(benchmark):
 
     benchmark(cpu_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst.height, dst.width, 3))
+        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape(
+            (dst.height, dst.width, 3)
+        )
         expected = load_bytes_to_image(expected_bytes, "RGB", (1280, 720), dst_size)
         assert calculate_similarity_rms_u8(arr_dst, expected) > 0.98
 
@@ -376,15 +417,23 @@ def test_resize_cv2_yuyv_to_rgb(benchmark):
         _ = dst[0, 0]
 
     with src.map() as m, dst_cv2.map() as d:
-        arr = np.frombuffer(m.view(), dtype=np.uint8).reshape((src.height, src.width, 2))
-        d = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst_cv2.height, dst_cv2.width, 3))
+        arr = np.frombuffer(m.view(), dtype=np.uint8).reshape(
+            (src.height, src.width, 2)
+        )
+        d = np.frombuffer(d.view(), dtype=np.uint8).reshape(
+            (dst_cv2.height, dst_cv2.width, 3)
+        )
         benchmark(resize, arr, dst_size, dst=d)
 
     cpu_processor.convert(src, dst, Rotation.Rotate0, Flip.NoFlip)
 
     with dst.map() as d, dst_cv2.map() as d_cv2:
-        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst.height, dst.width, 3))
-        arr_cv2 = np.frombuffer(d_cv2.view(), dtype=np.uint8).reshape((dst_cv2.height, dst_cv2.width, 3))
+        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape(
+            (dst.height, dst.width, 3)
+        )
+        arr_cv2 = np.frombuffer(d_cv2.view(), dtype=np.uint8).reshape(
+            (dst_cv2.height, dst_cv2.width, 3)
+        )
         assert calculate_similarity_rms_u8(arr_dst, arr_cv2) > 0.98
 
 
@@ -411,7 +460,9 @@ def test_resize_g2d_yuyv_to_rgb(benchmark):
 
     benchmark(g2d_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst.height, dst.width, 3))
+        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape(
+            (dst.height, dst.width, 3)
+        )
         expected = load_bytes_to_image(expected_bytes, "RGB", (1280, 720), dst_size)
         assert calculate_similarity_rms_u8(arr_dst, expected) > 0.98
 
@@ -441,9 +492,16 @@ def test_cpu_rotate_90(benchmark):
     dst = TensorImage(src.height, src.width, FourCC.RGBA)
 
     benchmark(cpu_processor.convert, src, dst, Rotation.Clockwise90, Flip.NoFlip)
-    expected = load_image("testdata/zidane.jpg", "RGBA", resize=(src.width, src.height), rotate=Image.ROTATE_270)
+    expected = load_image(
+        "testdata/zidane.jpg",
+        "RGBA",
+        resize=(src.width, src.height),
+        rotate=Image.ROTATE_270,
+    )
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst.height, dst.width, 4))
+        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape(
+            (dst.height, dst.width, 4)
+        )
         assert calculate_similarity_rms_u8(arr_dst, expected) > 0.98
 
 
@@ -456,17 +514,28 @@ def test_cv2_rotate_90(benchmark):
     dst = TensorImage(src.height, src.width, FourCC.RGBA)
 
     with src.map() as m, dst.map() as d:
-        arr_src = np.frombuffer(m.view(), dtype=np.uint8).reshape((src.height, src.width, 4))
-        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst.height, dst.width, 4))
+        arr_src = np.frombuffer(m.view(), dtype=np.uint8).reshape(
+            (src.height, src.width, 4)
+        )
+        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape(
+            (dst.height, dst.width, 4)
+        )
 
         def rotate_90(arr_src, arr_dst):
             cv2.rotate(arr_src, cv2.ROTATE_90_CLOCKWISE, dst=arr_dst)
             _ = arr_dst[0, 0]
 
         benchmark(rotate_90, arr_src, arr_dst)
-    expected = load_image("testdata/zidane.jpg", "RGBA", resize=(src.width, src.height), rotate=Image.ROTATE_270)
+    expected = load_image(
+        "testdata/zidane.jpg",
+        "RGBA",
+        resize=(src.width, src.height),
+        rotate=Image.ROTATE_270,
+    )
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst.height, dst.width, 4))
+        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape(
+            (dst.height, dst.width, 4)
+        )
         assert calculate_similarity_rms_u8(arr_dst, expected) > 0.98
 
 
@@ -485,9 +554,16 @@ def test_gl_rotate_90(benchmark):
         pytest.skip("OpenGL not available")
 
     benchmark(gl_processor.convert, src, dst, Rotation.Clockwise90, Flip.NoFlip)
-    expected = load_image("testdata/zidane.jpg", "RGBA", resize=(src.width, src.height), rotate=Image.ROTATE_270)
+    expected = load_image(
+        "testdata/zidane.jpg",
+        "RGBA",
+        resize=(src.width, src.height),
+        rotate=Image.ROTATE_270,
+    )
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst.height, dst.width, 4))
+        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape(
+            (dst.height, dst.width, 4)
+        )
         assert calculate_similarity_rms_u8(arr_dst, expected) > 0.98
 
 
@@ -506,9 +582,16 @@ def test_g2d_rotate_90(benchmark):
         pytest.skip("G2D not available")
 
     benchmark(g2d_processor.convert, src, dst, Rotation.Clockwise90, Flip.NoFlip)
-    expected = load_image("testdata/zidane.jpg", "RGBA", resize=(src.width, src.height), rotate=Image.ROTATE_270)
+    expected = load_image(
+        "testdata/zidane.jpg",
+        "RGBA",
+        resize=(src.width, src.height),
+        rotate=Image.ROTATE_270,
+    )
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst.height, dst.width, 4))
+        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape(
+            (dst.height, dst.width, 4)
+        )
         assert calculate_similarity_rms_u8(arr_dst, expected) > 0.98
 
 
@@ -523,9 +606,16 @@ def test_cpu_rotate_180(benchmark):
 
     benchmark(cpu_processor.convert, src, dst, Rotation.Rotate180, Flip.NoFlip)
 
-    expected = load_image("testdata/zidane.jpg", "RGBA", resize=(src.width, src.height), rotate=Image.ROTATE_180)
+    expected = load_image(
+        "testdata/zidane.jpg",
+        "RGBA",
+        resize=(src.width, src.height),
+        rotate=Image.ROTATE_180,
+    )
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst.height, dst.width, 4))
+        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape(
+            (dst.height, dst.width, 4)
+        )
         assert calculate_similarity_rms_u8(arr_dst, expected) > 0.98
 
 
@@ -538,17 +628,28 @@ def test_cv2_rotate_180(benchmark):
     dst = TensorImage(src.width, src.height, FourCC.RGBA)
 
     with src.map() as m, dst.map() as d:
-        arr_src = np.frombuffer(m.view(), dtype=np.uint8).reshape((src.height, src.width, 4))
-        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst.height, dst.width, 4))
+        arr_src = np.frombuffer(m.view(), dtype=np.uint8).reshape(
+            (src.height, src.width, 4)
+        )
+        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape(
+            (dst.height, dst.width, 4)
+        )
 
         def rotate_180(arr_src, arr_dst):
             cv2.rotate(arr_src, cv2.ROTATE_180, dst=arr_dst)
             _ = arr_dst[0, 0]
 
         benchmark(rotate_180, arr_src, arr_dst)
-    expected = load_image("testdata/zidane.jpg", "RGBA", resize=(src.width, src.height), rotate=Image.ROTATE_180)
+    expected = load_image(
+        "testdata/zidane.jpg",
+        "RGBA",
+        resize=(src.width, src.height),
+        rotate=Image.ROTATE_180,
+    )
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst.height, dst.width, 4))
+        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape(
+            (dst.height, dst.width, 4)
+        )
         assert calculate_similarity_rms_u8(arr_dst, expected) > 0.98
 
 
@@ -567,9 +668,16 @@ def test_gl_rotate_180(benchmark):
         pytest.skip("OpenGL not available")
 
     benchmark(gl_processor.convert, src, dst, Rotation.Rotate180, Flip.NoFlip)
-    expected = load_image("testdata/zidane.jpg", "RGBA", resize=(src.width, src.height), rotate=Image.ROTATE_180)
+    expected = load_image(
+        "testdata/zidane.jpg",
+        "RGBA",
+        resize=(src.width, src.height),
+        rotate=Image.ROTATE_180,
+    )
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst.height, dst.width, 4))
+        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape(
+            (dst.height, dst.width, 4)
+        )
         assert calculate_similarity_rms_u8(arr_dst, expected) > 0.98
 
 
@@ -586,7 +694,14 @@ def test_g2d_rotate_180(benchmark):
         pytest.skip("OpenGL not available")
 
     benchmark(g2d_processor.convert, src, dst, Rotation.Rotate180, Flip.NoFlip)
-    expected = load_image("testdata/zidane.jpg", "RGBA", resize=(src.width, src.height), rotate=Image.ROTATE_180)
+    expected = load_image(
+        "testdata/zidane.jpg",
+        "RGBA",
+        resize=(src.width, src.height),
+        rotate=Image.ROTATE_180,
+    )
     with dst.map() as d:
-        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape((dst.height, dst.width, 4))
+        arr_dst = np.frombuffer(d.view(), dtype=np.uint8).reshape(
+            (dst.height, dst.width, 4)
+        )
         assert calculate_similarity_rms_u8(arr_dst, expected) > 0.98

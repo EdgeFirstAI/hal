@@ -6,15 +6,16 @@ import sys
 
 """EdgeFirst HAL Python bindings."""
 
-
 class Nms(enum.Enum):
     """Non-Maximum Suppression mode for object detection.
-    
+
     ClassAgnostic: Suppresses all boxes based on IoU regardless of class.
     ClassAware: Only suppresses boxes of the same class.
     """
+
     ClassAgnostic: Nms
     ClassAware: Nms
+
 DetectionOutput = Tuple[
     npt.NDArray[np.float32], npt.NDArray[np.float32], npt.NDArray[np.uintp]
 ]
@@ -40,15 +41,17 @@ A tuple containing:
 - masks: A list of NumPy arrays, each of shape (H, W, ...) containing detected segmentation mask.
 """
 
-
 class Decoder:
     def __init__(
-        self, config: dict, score_threshold: float = 0.1, iou_threshold: float = 0.7,
-        nms: Optional[Nms] = Nms.ClassAgnostic
+        self,
+        config: dict,
+        score_threshold: float = 0.1,
+        iou_threshold: float = 0.7,
+        nms: Optional[Nms] = Nms.ClassAgnostic,
     ) -> None:
         """
         Create a new Decoder instance from a dictionary configuration describing the model outputs.
-        
+
         Args:
             config: Model output configuration dictionary.
             score_threshold: Minimum confidence score for detections.
@@ -59,12 +62,14 @@ class Decoder:
 
     @staticmethod
     def new_from_json_str(
-        json_str: str, score_threshold: float = 0.1, iou_threshold: float = 0.7,
-        nms: Optional[Nms] = Nms.ClassAgnostic
+        json_str: str,
+        score_threshold: float = 0.1,
+        iou_threshold: float = 0.7,
+        nms: Optional[Nms] = Nms.ClassAgnostic,
     ) -> Decoder:
         """
         Create a new Decoder instance from a JSON configuration string describing the model outputs.
-        
+
         Args:
             json_str: JSON configuration string.
             score_threshold: Minimum confidence score for detections.
@@ -75,12 +80,14 @@ class Decoder:
 
     @staticmethod
     def new_from_yaml_str(
-        yaml_str: str, score_threshold: float = 0.1, iou_threshold: float = 0.7,
-        nms: Optional[Nms] = Nms.ClassAgnostic
+        yaml_str: str,
+        score_threshold: float = 0.1,
+        iou_threshold: float = 0.7,
+        nms: Optional[Nms] = Nms.ClassAgnostic,
     ) -> Decoder:
         """
         Create a new Decoder instance from a YAML configuration string describing the model outputs.
-        
+
         Args:
             yaml_str: YAML configuration string.
             score_threshold: Minimum confidence score for detections.
@@ -122,7 +129,7 @@ class Decoder:
 
         The accepted types are `np.uint8`, `np.int8`, `np.float32` and `np.float64`. All outputs must be
         the same type.
-        
+
         Args:
             model_output: YOLO model output tensor.
             quant_boxes: Quantization parameters (scale, zero_point) for boxes.
@@ -154,7 +161,7 @@ class Decoder:
 
         The accepted types are `np.uint8`, `np.int8`, `np.float32` and `np.float64`. All outputs must be
         the same type.
-        
+
         Args:
             boxes: YOLO box output tensor.
             protos: YOLO proto output tensor.
@@ -193,8 +200,7 @@ class Decoder:
     @staticmethod
     def decode_modelpack_det_split(
         boxes: List[
-            Union[npt.NDArray[np.uint8],
-                  npt.NDArray[np.int8], npt.NDArray[np.float32]]
+            Union[npt.NDArray[np.uint8], npt.NDArray[np.int8], npt.NDArray[np.float32]]
         ],
         anchors: List[List[List[float]]],
         quant: List[Tuple[float, int]] = [],
@@ -231,10 +237,12 @@ class Decoder:
         ...
 
     @staticmethod
-    def segmentation_to_mask(segmentation: npt.NDArray[np.uint8]) -> npt.NDArray[np.uint8]:
+    def segmentation_to_mask(
+        segmentation: npt.NDArray[np.uint8],
+    ) -> npt.NDArray[np.uint8]:
         """
         Converts a 3D segmentation tensor into a 2D mask.
-        
+
         Raises:
             ValueError: If the segmentation tensor has an invalid shape.
         """
@@ -250,7 +258,6 @@ class Decoder:
 
     @score_threshold.setter
     def score_threshold(self, value: float): ...
-
     @property
     def iou_threshold(self) -> float:
         """
@@ -261,7 +268,6 @@ class Decoder:
 
     @iou_threshold.setter
     def iou_threshold(self, value: float): ...
-
     @property
     def nms(self) -> Optional[Nms]:
         """
@@ -277,7 +283,6 @@ class Decoder:
         Returns True if normalized, False if pixel coordinates, or None if unknown.
         """
         ...
-
 
 class TensorMemory(enum.Enum):
     if sys.platform == "linux":
@@ -295,18 +300,25 @@ class TensorMemory(enum.Enum):
     MEM: TensorMemory
     """Regular system memory allocation"""
 
-
 class Tensor:
-
-    if sys.platform == 'linux':
+    if sys.platform == "linux":
         def __init__(
             self,
             shape: list[int],
-            dtype: Literal["int8", "uint8", "int16", "uint16",
-                           "int32", "uint32", "int64", "uint64",
-                           "float32", "float64"] = "float32",
+            dtype: Literal[
+                "int8",
+                "uint8",
+                "int16",
+                "uint16",
+                "int32",
+                "uint32",
+                "int64",
+                "uint64",
+                "float32",
+                "float64",
+            ] = "float32",
             mem: None | TensorMemory = None,
-            name: None | str = None
+            name: None | str = None,
         ) -> None: ...
         """
         Create a new tensor with the given shape, memory type, and optional
@@ -327,10 +339,19 @@ class Tensor:
         def from_fd(
             fd: int,
             shape: list[int],
-            dtype: Literal["int8", "uint8", "int16", "uint16",
-                           "int32", "uint32", "int64", "uint64",
-                           "float32", "float64"] = "float32",
-            name: None | str = None
+            dtype: Literal[
+                "int8",
+                "uint8",
+                "int16",
+                "uint16",
+                "int32",
+                "uint32",
+                "int64",
+                "uint64",
+                "float32",
+                "float64",
+            ] = "float32",
+            name: None | str = None,
         ) -> Tensor: ...
         """
         Create a new tensor using the given file descriptor, shape, and optional
@@ -351,11 +372,20 @@ class Tensor:
         def __init__(
             self,
             shape: list[int],
-            dtype: Literal["int8", "uint8", "int16", "uint16",
-                           "int32", "uint32", "int64", "uint64",
-                           "float32", "float64"] = "float32",
+            dtype: Literal[
+                "int8",
+                "uint8",
+                "int16",
+                "uint16",
+                "int32",
+                "uint32",
+                "int64",
+                "uint64",
+                "float32",
+                "float64",
+            ] = "float32",
             mem: None | TensorMemory = None,
-            name: None | str = None
+            name: None | str = None,
         ) -> None: ...
         """
         Create a new tensor with the given shape, memory type, and optional
@@ -373,9 +403,20 @@ class Tensor:
         """
 
     @property
-    def dtype(self) -> Literal["int8", "uint8", "int16", "uint16",
-                               "int32", "uint32", "int64", "uint64",
-                               "float32", "float64"]: ...
+    def dtype(
+        self,
+    ) -> Literal[
+        "int8",
+        "uint8",
+        "int16",
+        "uint16",
+        "int32",
+        "uint32",
+        "int64",
+        "uint64",
+        "float32",
+        "float64",
+    ]: ...
     """The data type of the tensor."""
 
     @property
@@ -400,7 +441,6 @@ class Tensor:
     def map(self) -> TensorMap: ...
     """Returns a mapped view of the tensor data for direct access."""
 
-
 class TensorMap:
     def unmap(self) -> None: ...
     def view(self) -> memoryview: ...
@@ -412,7 +452,6 @@ class TensorMap:
     def __releasebuffer__(self, view) -> None: ...
     def __enter__(self) -> TensorMap: ...
     def __exit__(self, _exc_type, _exc_value, _traceback) -> None: ...
-
 
 class FourCC(enum.Enum):
     YUYV: FourCC
@@ -440,7 +479,6 @@ class FourCC(enum.Enum):
     """Planar RGBA format (Red plane, Green plane, Blue plane, Alpha plane)"""
 
     def __init__(self, fourcc: str) -> None: ...
-
 
 class Normalization(enum.Enum):
     DEFAULT: Normalization
@@ -484,7 +522,6 @@ class Normalization(enum.Enum):
     | `np.float32` | value             |
     | `np.float64` | value             |
     """
-
 
 class TensorImage:
     def __init__(
@@ -573,7 +610,6 @@ class TensorImage:
         """If the image format is planar."""
         ...
 
-
 class Flip(enum.Enum):
     NoFlip: Flip
     """No flip"""
@@ -581,7 +617,6 @@ class Flip(enum.Enum):
     """Flip the image horizontally"""
     Vertical: Flip
     """Flip the image vertically"""
-
 
 class Rotation(enum.Enum):
     Rotate0: Rotation
@@ -601,7 +636,6 @@ class Rotation(enum.Enum):
         """Get the Rotation enum variant corresponding to the specified angle in degrees clockwise. Valid angles are 0, 90, 180, and 270."""
         ...
 
-
 class Rect:
     """A crop rectangle defined by its top-left corner (left, top) and its dimensions (width, height)."""
 
@@ -615,19 +649,17 @@ class Rect:
     @property
     def height(self) -> int: ...
 
-
 class ImageProcessor:
     """Convert images between different formats, with optional rotation, flipping, and cropping."""
 
     def __init__(self) -> None: ...
-
     def render_to_image(
-            self,
-            dst: TensorImage,
-            bbox: npt.NDArray[np.float32],
-            scores: npt.NDArray[np.float32],
-            classes: npt.NDArray[np.uintp],
-            seg: List[npt.NDArray[np.uint8]] = [],
+        self,
+        dst: TensorImage,
+        bbox: npt.NDArray[np.float32],
+        scores: npt.NDArray[np.float32],
+        classes: npt.NDArray[np.uintp],
+        seg: List[npt.NDArray[np.uint8]] = [],
     ) -> None:
         """
         Render detection and segmentation results onto the destination image.

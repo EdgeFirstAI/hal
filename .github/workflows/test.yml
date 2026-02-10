@@ -330,6 +330,15 @@ jobs:
           set -o pipefail
           cargo nextest run --workspace 2>&1 | tee target/test-metrics-rust-macos.txt
 
+      - name: Build C API library
+        run: cargo build --release -p edgefirst-hal-capi
+
+      - name: Run C API tests
+        run: |
+          set -o pipefail
+          cd crates/capi/tests
+          make test 2>&1 | tee ../../../target/test-metrics-capi-macos.txt
+
       - name: Upload test results
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         if: always()
@@ -951,7 +960,7 @@ jobs:
   # ===========================================================================
   sonarcloud:
     name: SonarCloud Analysis
-    needs: [doc-tests, build-and-test-x86, test-arm, hardware-test, process-hardware-coverage]
+    needs: [doc-tests, build-and-test-x86, build-and-test-macos, test-arm, hardware-test, process-hardware-coverage]
     runs-on: ubuntu-22.04
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     permissions:
@@ -1010,7 +1019,7 @@ jobs:
             echo "|----------|--------------|-------|"
             echo "| Ubuntu 22.04 | x86_64 | Rust, Python, C API |"
             echo "| Ubuntu 22.04 | aarch64 | Rust, Python, C API |"
-            echo "| macOS | Apple Silicon | Rust |"
+            echo "| macOS | Apple Silicon | Rust, C API |"
             echo "| NXP i.MX8M Plus | aarch64 | Rust, Python, C API (DMA, G2D) |"
             echo ""
             python3 scripts/coverage_summary.py --github-actions

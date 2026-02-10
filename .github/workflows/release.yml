@@ -73,6 +73,66 @@ jobs:
           name: wheels-${{ matrix.os }}
           path: target/wheels/*
 
+  build-capi:
+    name: Build C API (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-linux
+            runner: ubuntu-latest
+            lib_shared: libedgefirst_hal.so
+          - target: aarch64-linux
+            runner: ubuntu-22.04-arm
+            lib_shared: libedgefirst_hal.so
+          - target: aarch64-macos
+            runner: macos-latest
+            lib_shared: libedgefirst_hal.dylib
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          lfs: true
+
+      - name: Checkout LFS objects
+        run: git lfs checkout
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
+        with:
+          toolchain: stable
+
+      - name: Build C API library
+        run: cargo build --release -p edgefirst-hal-capi
+
+      - name: Package C API
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          PKG_NAME="edgefirst-hal-capi-${VERSION}-${{ matrix.target }}"
+          mkdir -p "${PKG_NAME}/include/edgefirst" "${PKG_NAME}/lib"
+
+          # Copy documentation and license files
+          cp crates/capi/README.md "${PKG_NAME}/"
+          cp LICENSE "${PKG_NAME}/"
+          cp NOTICE "${PKG_NAME}/"
+
+          # Copy header
+          cp crates/capi/include/edgefirst/hal.h "${PKG_NAME}/include/edgefirst/"
+
+          # Copy libraries
+          cp "target/release/${{ matrix.lib_shared }}" "${PKG_NAME}/lib/" 2>/dev/null || true
+          cp target/release/libedgefirst_hal.a "${PKG_NAME}/lib/"
+
+          tar czf "${PKG_NAME}.tar.gz" "${PKG_NAME}"
+          echo "PKG_NAME=${PKG_NAME}" >> "$GITHUB_ENV"
+
+      - name: Upload C API artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: capi-${{ matrix.target }}
+          path: ${{ env.PKG_NAME }}.tar.gz
+
   publish-pypi:
     name: Publish to PyPI
     runs-on: ubuntu-22.04
@@ -100,7 +160,7 @@ jobs:
   create-release:
     name: Create GitHub Release
     runs-on: ubuntu-22.04
-    needs: [build-wheels]
+    needs: [build-wheels, build-capi]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
@@ -113,6 +173,13 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download C API artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          pattern: capi-*
           path: dist
           merge-multiple: true
 
