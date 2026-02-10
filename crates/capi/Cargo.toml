@@ -10,6 +10,7 @@ authors.workspace = true
 homepage.workspace = true
 repository.workspace = true
 license.workspace = true
+publish = false  # C library - distributed via GitHub Releases, not crates.io
 
 [lib]
 crate-type = ["staticlib", "cdylib"]

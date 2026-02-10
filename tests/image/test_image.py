@@ -1,7 +1,15 @@
 # SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 # SPDX-License-Identifier: Apache-2.0
 
-from edgefirst_hal import TensorImage, ImageProcessor, Flip, FourCC, Normalization, Rotation, Rect
+from edgefirst_hal import (
+    TensorImage,
+    ImageProcessor,
+    Flip,
+    FourCC,
+    Normalization,
+    Rotation,
+    Rect,
+)
 import numpy as np
 from PIL import Image
 import math
@@ -18,13 +26,13 @@ def calculate_similarity_rms_u8(imageA, imageB) -> float:
     imgA = np.asarray(imageA)
     imgB = np.asarray(imageB)
 
-    imgA = imgA.astype("float")/255.0
-    imgB = imgB.astype("float")/255.0
+    imgA = imgA.astype("float") / 255.0
+    imgB = imgB.astype("float") / 255.0
 
     squared_diff = (imgA - imgB) ** 2
 
     rms = math.sqrt(float(np.mean(squared_diff)))
-    return 1.0-rms
+    return 1.0 - rms
 
 
 def test_flip():
@@ -70,31 +78,33 @@ def test_normalize():
     unique_vals = np.unique(n)
     assert (unique_vals == np.array(range(-128, 128))).all()
 
-    dst.normalize_to_numpy(
-        n, normalization=Normalization.SIGNED, zero_point=127)
+    dst.normalize_to_numpy(n, normalization=Normalization.SIGNED, zero_point=127)
     unique_vals0 = np.unique(n)
     assert (unique_vals0 == np.array(range(-127, 128))).all()
 
 
 def test_render():
     dst = TensorImage.load("testdata/giraffe.jpg", FourCC.RGBA)
-    seg = np.fromfile('testdata/yolov8_seg_crop_76x55.bin',
-                      dtype=np.uint8).reshape((76, 55, 1))
+    seg = np.fromfile("testdata/yolov8_seg_crop_76x55.bin", dtype=np.uint8).reshape(
+        (76, 55, 1)
+    )
     converter = ImageProcessor()
     converter.set_class_colors([[255, 255, 0, 233], [128, 128, 255, 100]])
-    converter.render_to_image(dst,
-                              bbox=np.array(
-                                  [[0.59375, 0.25, 0.9375, 0.725]], dtype=np.float32),
-                              scores=np.array([0.9], dtype=np.float32),
-                              classes=np.array([1], dtype=np.uintp),
-                              seg=[seg]
-                              )
+    converter.render_to_image(
+        dst,
+        bbox=np.array([[0.59375, 0.25, 0.9375, 0.725]], dtype=np.float32),
+        scores=np.array([0.9], dtype=np.float32),
+        classes=np.array([1], dtype=np.uintp),
+        seg=[seg],
+    )
     expected_gl = load_image("testdata/output_render_gl.jpg", "RGBA")
     expected_cpu = load_image("testdata/output_render_cpu.jpg", "RGBA")
     with dst.map() as m:
         img = np.array(m.view()).reshape((dst.height, dst.width, 4))
-        assert calculate_similarity_rms_u8(
-            img, expected_gl) > 0.99 or calculate_similarity_rms_u8(img, expected_cpu) > 0.99
+        assert (
+            calculate_similarity_rms_u8(img, expected_gl) > 0.99
+            or calculate_similarity_rms_u8(img, expected_cpu) > 0.99
+        )
 
 
 def test_rgb_resize():
@@ -112,8 +122,7 @@ def test_rgba_to_rgb():
     src = TensorImage.load("testdata/zidane.jpg", FourCC.RGBA)
     dst = TensorImage(1280, 720, FourCC.RGB)
     converter = ImageProcessor()
-    converter.convert(src, dst, Rotation.Rotate0,
-                      Flip.NoFlip, Rect(0, 0, 1280, 720))
+    converter.convert(src, dst, Rotation.Rotate0, Flip.NoFlip, Rect(0, 0, 1280, 720))
 
     with dst.map() as m:
         n = np.array(m.view()).reshape((dst.height, dst.width, 3))

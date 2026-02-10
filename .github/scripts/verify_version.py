@@ -29,6 +29,11 @@ WORKSPACE_CRATES = [
     "edgefirst-tracker",
 ]
 
+# Workspace leaf crates (not referenced as dependencies by other crates)
+WORKSPACE_LEAF_CRATES = [
+    "edgefirst-hal-capi",
+]
+
 # Python package name (uses underscore)
 PYTHON_PACKAGE = "edgefirst_hal"
 
@@ -94,7 +99,7 @@ def check_cargo_lock(version: str) -> list[str]:
     errors = []
     content = read_file("Cargo.lock")
 
-    all_crates = WORKSPACE_CRATES + [PYTHON_PACKAGE]
+    all_crates = WORKSPACE_CRATES + WORKSPACE_LEAF_CRATES + [PYTHON_PACKAGE]
     for crate in all_crates:
         # Match [[package]] entries: name = "crate-name" followed by version = "X.Y.Z"
         pattern = rf'\[\[package\]\]\s*\nname = "{re.escape(crate)}"\nversion = "([^"]+)"'
@@ -178,7 +183,7 @@ def check_notice(version: str) -> list[str]:
     lines = content.splitlines()
 
     # Check internal crate versions
-    for crate in WORKSPACE_CRATES:
+    for crate in WORKSPACE_CRATES + WORKSPACE_LEAF_CRATES:
         # Look for entries like "  * edgefirst-decoder 0.5.0 (Apache-2.0)"
         crate_entries = [l for l in lines if f"* {crate} " in l]
         if not crate_entries:
@@ -209,7 +214,7 @@ def check_notice(version: str) -> list[str]:
                 )
 
     # Check for stale "unknown" version entries for internal crates
-    all_internal = WORKSPACE_CRATES + [PYTHON_PACKAGE]
+    all_internal = WORKSPACE_CRATES + WORKSPACE_LEAF_CRATES + [PYTHON_PACKAGE]
     for crate in all_internal:
         unknown_entries = [l for l in lines if f"* {crate} unknown" in l]
         if unknown_entries:
