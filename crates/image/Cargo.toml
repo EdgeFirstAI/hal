@@ -3,11 +3,14 @@ name = "edgefirst-image"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-description.workspace = true
+description = "High-performance image processing with hardware acceleration for edge AI"
 homepage.workspace = true
 repository.workspace = true
-readme.workspace = true
+readme = "README.md"
 license.workspace = true
+keywords = ["image-processing", "computer-vision", "gpu", "edge-ai", "nv12"]
+categories = ["multimedia::images", "multimedia::video", "embedded"]
+documentation = "https://docs.rs/edgefirst-image"
 
 [features]
 default = ["opengl", "decoder"]

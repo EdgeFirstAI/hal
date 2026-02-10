@@ -1,6 +1,8 @@
-imports_granularity = 'Crate'
-reorder_impl_items = true
+# Rust formatting configuration (stable rustfmt only)
+# See: https://rust-lang.github.io/rustfmt/
+
+# Use field init shorthand: `{ x }` instead of `{ x: x }`
 use_field_init_shorthand = true
-format_code_in_doc_comments = true
-wrap_comments = true
-edition = "2024"
+
+# Format edition (must match Cargo.toml workspace edition)
+edition = "2021"

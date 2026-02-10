@@ -3,15 +3,17 @@
 
 mod common;
 
-use common::{dma_available, find_testdata_path, g2d_available};
+use common::find_testdata_path;
+#[cfg(target_os = "linux")]
+use common::{dma_available, g2d_available};
 
 #[cfg(target_os = "linux")]
 use edgefirst_image::G2DProcessor;
 #[cfg(all(feature = "opengl", target_os = "linux"))]
 use edgefirst_image::GLProcessorThreaded;
 use edgefirst_image::{
-    CPUProcessor, Crop, Flip, GREY, ImageProcessorTrait as _, NV16, PLANAR_RGB, RGB, RGBA,
-    Rotation, TensorImage, YUYV,
+    CPUProcessor, Crop, Flip, ImageProcessorTrait as _, Rotation, TensorImage, GREY, NV16,
+    PLANAR_RGB, RGB, RGBA, YUYV,
 };
 use edgefirst_tensor::{TensorMapTrait, TensorMemory, TensorTrait};
 use four_char_code::FourCharCode;
@@ -479,6 +481,7 @@ where
     drop(gl_dst);
 }
 
+#[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
 #[divan::bench(types = [Person, Zidane], ignore = !gl_available() || !dma_available())]
 fn convert_opengl_rgba_to_planar<IMAGE>(bencher: divan::Bencher)

@@ -4,13 +4,14 @@
 //! Shared utilities for image processing benchmarks.
 #![allow(dead_code)]
 
-use edgefirst_image::{NV12, RGB, RGBA, TensorImage, YUYV};
-use edgefirst_tensor::TensorMemory;
+use edgefirst_image::{NV12, RGB, RGBA, YUYV};
 use four_char_code::FourCharCode;
 use std::{path::Path, sync::OnceLock};
 
 #[cfg(target_os = "linux")]
-use edgefirst_image::G2DProcessor;
+use edgefirst_image::{G2DProcessor, TensorImage};
+#[cfg(target_os = "linux")]
+use edgefirst_tensor::TensorMemory;
 
 // =============================================================================
 // Hardware Availability Cache

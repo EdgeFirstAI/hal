@@ -5,11 +5,11 @@ use ndarray::{Array2, ArrayView2, ArrayView3};
 use num_traits::{AsPrimitive, Float, PrimInt};
 
 use crate::{
-    BBoxTypeTrait, DecoderError, DetectBox, Quantization, XYWH, XYXY,
     byte::{nms_int, postprocess_boxes_quant, quantize_score_threshold},
     configs::Detection,
     dequant_detect_box,
     float::{nms_float, postprocess_boxes_float},
+    BBoxTypeTrait, DecoderError, DetectBox, Quantization, XYWH, XYXY,
 };
 
 /// Configuration for ModelPack split detection decoder. The quantization is

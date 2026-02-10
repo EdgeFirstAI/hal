@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{BBoxTypeTrait, BoundingBox, DetectBox, arg_max};
+use crate::{arg_max, BBoxTypeTrait, BoundingBox, DetectBox};
 use ndarray::{
-    Array1, ArrayView2, Zip,
     parallel::prelude::{IntoParallelIterator, ParallelIterator as _},
+    Array1, ArrayView2, Zip,
 };
 use num_traits::{AsPrimitive, Float};
 use rayon::slice::ParallelSliceMut;

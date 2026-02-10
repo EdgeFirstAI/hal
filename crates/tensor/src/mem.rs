@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    TensorMap, TensorMapTrait, TensorMemory, TensorTrait,
     error::{Error, Result},
+    TensorMap, TensorMapTrait, TensorMemory, TensorTrait,
 };
 use log::trace;
 use num_traits::Num;
@@ -50,14 +50,14 @@ where
         })
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn from_fd(_fd: std::os::fd::OwnedFd, _shape: &[usize], _name: Option<&str>) -> Result<Self> {
         Err(Error::NotImplemented(
             "MemTensor does not support from_fd".to_owned(),
         ))
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn clone_fd(&self) -> Result<std::os::fd::OwnedFd> {
         Err(Error::NotImplemented(
             "MemTensor does not support clone_fd".to_owned(),

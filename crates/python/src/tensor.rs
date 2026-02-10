@@ -1,14 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-use edgefirst::tensor::{self, TensorMapTrait, TensorMemory, TensorTrait};
+use edgefirst_hal::tensor::{self, TensorMapTrait, TensorMemory, TensorTrait};
 #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
 use pyo3::ffi::Py_buffer;
 use pyo3::{exceptions::PyBufferError, ffi::PyMemoryView_FromMemory, prelude::*};
 
 #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
-use std::ffi::{CString, c_int, c_void};
-#[cfg(target_os = "linux")]
+use std::ffi::{c_int, c_void, CString};
+#[cfg(unix)]
 use std::os::fd::{IntoRawFd, OwnedFd, RawFd};
 
 use std::{
@@ -63,7 +63,7 @@ impl From<Error> for PyErr {
 pub enum PyTensorMemory {
     #[cfg(target_os = "linux")]
     DMA,
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     SHM,
     MEM,
 }
@@ -73,7 +73,7 @@ impl From<PyTensorMemory> for TensorMemory {
         match value {
             #[cfg(target_os = "linux")]
             PyTensorMemory::DMA => TensorMemory::Dma,
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             PyTensorMemory::SHM => TensorMemory::Shm,
             PyTensorMemory::MEM => TensorMemory::Mem,
         }
@@ -85,7 +85,7 @@ impl From<TensorMemory> for PyTensorMemory {
         match value {
             #[cfg(target_os = "linux")]
             TensorMemory::Dma => PyTensorMemory::DMA,
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             TensorMemory::Shm => PyTensorMemory::SHM,
             TensorMemory::Mem => PyTensorMemory::MEM,
         }
@@ -218,7 +218,7 @@ impl TensorT {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     pub fn clone_fd(&self) -> tensor::Result<OwnedFd> {
         match self {
             TensorT::TensorU8(t) => t.clone_fd(),
@@ -388,7 +388,7 @@ impl PyTensor {
         Ok(PyTensor(tensor))
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[staticmethod]
     #[pyo3(signature = (fd, shape, dtype = "float32", name = None))]
     fn from_fd(fd: RawFd, shape: Vec<usize>, dtype: &str, name: Option<&str>) -> Result<Self> {
@@ -438,7 +438,7 @@ impl PyTensor {
         self.0.shape()
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[getter]
     fn fd(&self) -> Result<RawFd> {
         let owned = self.0.clone_fd()?;

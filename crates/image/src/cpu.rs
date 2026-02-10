@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    Crop, Error, Flip, FunctionTimer, GREY, ImageProcessorTrait, NV12, NV16, PLANAR_RGB,
-    PLANAR_RGBA, RGB, RGBA, Rect, Result, Rotation, TensorImage, TensorImageDst, TensorImageRef,
-    YUYV,
+    Crop, Error, Flip, FunctionTimer, ImageProcessorTrait, Rect, Result, Rotation, TensorImage,
+    TensorImageDst, TensorImageRef, GREY, NV12, NV16, PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, YUYV,
 };
 #[cfg(feature = "decoder")]
 use edgefirst_decoder::{DetectBox, Segmentation};
@@ -1886,17 +1885,16 @@ impl ImageProcessorTrait for CPUProcessor {
             self.resize_flip_rotate(tmp, &mut tmp2, rotation, flip, crop)?;
             Self::convert_format(&tmp2, dst)?;
         }
-        if let Some(dst_rect) = crop.dst_rect
-            && dst_rect
-                != (Rect {
-                    left: 0,
-                    top: 0,
-                    width: dst.width(),
-                    height: dst.height(),
-                })
-            && let Some(dst_color) = crop.dst_color
-        {
-            Self::fill_image_outside_crop(dst, dst_color, dst_rect)?;
+        if let (Some(dst_rect), Some(dst_color)) = (crop.dst_rect, crop.dst_color) {
+            let full_rect = Rect {
+                left: 0,
+                top: 0,
+                width: dst.width(),
+                height: dst.height(),
+            };
+            if dst_rect != full_rect {
+                Self::fill_image_outside_crop(dst, dst_color, dst_rect)?;
+            }
         }
 
         Ok(())
@@ -2013,17 +2011,16 @@ impl ImageProcessorTrait for CPUProcessor {
         }
 
         // Handle destination crop fill if needed
-        if let Some(dst_rect) = crop.dst_rect
-            && dst_rect
-                != (Rect {
-                    left: 0,
-                    top: 0,
-                    width: dst.width(),
-                    height: dst.height(),
-                })
-            && let Some(dst_color) = crop.dst_color
-        {
-            Self::fill_image_outside_crop_generic(dst, dst_color, dst_rect)?;
+        if let (Some(dst_rect), Some(dst_color)) = (crop.dst_rect, crop.dst_color) {
+            let full_rect = Rect {
+                left: 0,
+                top: 0,
+                width: dst.width(),
+                height: dst.height(),
+            };
+            if dst_rect != full_rect {
+                Self::fill_image_outside_crop_generic(dst, dst_color, dst_rect)?;
+            }
         }
 
         Ok(())
@@ -2080,9 +2077,8 @@ impl ImageProcessorTrait for CPUProcessor {
 mod cpu_tests {
 
     use super::*;
-    use crate::{CPUProcessor, Rotation, TensorImageRef};
+    use crate::{CPUProcessor, Rotation, TensorImageRef, RGBA};
     use edgefirst_tensor::{Tensor, TensorMapTrait, TensorMemory};
-    use g2d_sys::RGBA;
     use image::buffer::ConvertBuffer;
 
     macro_rules! function {
@@ -2723,9 +2719,7 @@ mod cpu_tests {
 
         assert_eq!(
             converted.tensor().map()?.as_slice(),
-            &[
-                10, 10, 10, 255, 13, 13, 13, 255, 30, 30, 30, 255, 33, 33, 33, 255
-            ]
+            &[10, 10, 10, 255, 13, 13, 13, 255, 30, 30, 30, 255, 33, 33, 33, 255]
         );
         Ok(())
     }
