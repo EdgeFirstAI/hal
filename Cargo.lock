@@ -624,7 +624,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "edgefirst-decoder"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "argminmax",
  "divan",
@@ -642,8 +642,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgefirst-gbm"
+version = "0.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f0b69de3318098ed618db4873804c38fdacf664e708cb7ab8ab0e163c9afaeb"
+dependencies = [
+ "bitflags",
+ "drm",
+ "drm-fourcc",
+ "edgefirst-gbm-sys",
+ "libc",
+]
+
+[[package]]
+name = "edgefirst-gbm-sys"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3a366fa17f342ee47f2b57e27a28939c009b7a52d5b6312a615c377ebc65c17"
+dependencies = [
+ "libc",
+ "libloading",
+]
+
+[[package]]
 name = "edgefirst-hal"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "edgefirst-decoder",
  "edgefirst-image",
@@ -652,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-hal-capi"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "cbindgen",
  "edgefirst-decoder",
@@ -672,20 +695,20 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-image"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "criterion",
  "ctor",
  "divan",
  "dma-heap",
  "edgefirst-decoder",
+ "edgefirst-gbm",
  "edgefirst-tensor",
  "enum_dispatch",
  "env_logger",
  "fast_image_resize",
  "four-char-code",
  "g2d-sys",
- "gbm",
  "gls",
  "image",
  "image-compare",
@@ -707,7 +730,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tensor"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "ctor",
  "divan",
@@ -724,7 +747,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tracker"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "enum_dispatch",
  "lapjv",
@@ -737,7 +760,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst_hal"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "approx",
  "edgefirst-hal",
@@ -914,27 +937,6 @@ dependencies = [
  "libloading",
  "log",
  "nix",
-]
-
-[[package]]
-name = "gbm"
-version = "0.18.0"
-source = "git+https://github.com/EdgeFirstAI/gbm.rs.git?branch=dynamic#0aa9b74ad8bf1df67a910f1b320bfe495f9fe59c"
-dependencies = [
- "bitflags",
- "drm",
- "drm-fourcc",
- "gbm-sys",
- "libc",
-]
-
-[[package]]
-name = "gbm-sys"
-version = "0.4.0"
-source = "git+https://github.com/EdgeFirstAI/gbm.rs.git?branch=dynamic#0aa9b74ad8bf1df67a910f1b320bfe495f9fe59c"
-dependencies = [
- "libc",
- "libloading",
 ]
 
 [[package]]
@@ -2501,9 +2503,9 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "0.9.11+spec-1.1.0"
+version = "0.9.12+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3afc9a848309fe1aaffaed6e1546a7a14de1f935dc9d89d32afd9a44bab7c46"
+checksum = "cf92845e79fc2e2def6a5d828f0801e29a2f8acc037becc5ab08595c7d5e9863"
 dependencies = [
  "indexmap",
  "serde_core",
@@ -2525,9 +2527,9 @@ dependencies = [
 
 [[package]]
 name = "toml_parser"
-version = "1.0.6+spec-1.1.0"
+version = "1.0.7+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3198b4b0a8e11f09dd03e133c0280504d0801269e9afa46362ffde1cbeebf44"
+checksum = "247eaa3197818b831697600aadf81514e577e0cba5eab10f7e064e78ae154df1"
 dependencies = [
  "winnow",
 ]

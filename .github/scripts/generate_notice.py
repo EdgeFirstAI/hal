@@ -60,8 +60,8 @@ def generate_notice(sbom_path: str) -> str:
 
     components = sbom.get("components", [])
 
-    # Extract components requiring attribution
-    attribution_components: List[tuple[str, str, Set[str]]] = []
+    # Extract components requiring attribution, deduplicating by (name, version)
+    seen: Dict[tuple[str, str], Set[str]] = {}
 
     for component in components:
         name = component.get("name", "unknown")
@@ -69,10 +69,22 @@ def generate_notice(sbom_path: str) -> str:
         licenses = extract_license_from_component(component)
 
         if licenses and requires_attribution(licenses):
-            attribution_components.append((name, version, licenses))
+            key = (name, version)
+            if key in seen:
+                seen[key].update(licenses)
+            else:
+                seen[key] = set(licenses)
 
-    # Sort by name
-    attribution_components.sort(key=lambda x: x[0].lower())
+    # Prefer versioned entries over "unknown" — if we have both, drop "unknown"
+    versioned_names = {name for (name, ver) in seen if ver != "unknown"}
+    attribution_components: List[tuple[str, str, Set[str]]] = [
+        (name, version, lics)
+        for (name, version), lics in seen.items()
+        if version != "unknown" or name not in versioned_names
+    ]
+
+    # Sort by name, then version
+    attribution_components.sort(key=lambda x: (x[0].lower(), x[1]))
 
     # Generate NOTICE content
     notice = []
