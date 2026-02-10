@@ -59,11 +59,11 @@ and hardware acceleration. However, this will increase the performance of the CP
 use edgefirst_decoder::{DetectBox, Segmentation};
 use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait as _};
 use enum_dispatch::enum_dispatch;
-use four_char_code::{FourCharCode, four_char_code};
+use four_char_code::{four_char_code, FourCharCode};
 use std::{fmt::Display, time::Instant};
 use zune_jpeg::{
-    JpegDecoder,
     zune_core::{colorspace::ColorSpace, options::DecoderOptions},
+    JpegDecoder,
 };
 use zune_png::PngDecoder;
 
@@ -1112,11 +1112,11 @@ impl ImageProcessor {
     /// # }
     pub fn new() -> Result<Self> {
         #[cfg(target_os = "linux")]
-        let g2d = if let Ok(x) = std::env::var("EDGEFIRST_DISABLE_G2D")
-            && x != "0"
-            && x.to_lowercase() != "false"
+        let g2d = if std::env::var("EDGEFIRST_DISABLE_G2D")
+            .map(|x| x != "0" && x.to_lowercase() != "false")
+            .unwrap_or(false)
         {
-            log::debug!("EDGEFIRST_DISABLE_G2D = {x}");
+            log::debug!("EDGEFIRST_DISABLE_G2D is set");
             None
         } else {
             match G2DProcessor::new() {
@@ -1130,11 +1130,11 @@ impl ImageProcessor {
 
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
-        let opengl = if let Ok(x) = std::env::var("EDGEFIRST_DISABLE_GL")
-            && x != "0"
-            && x.to_lowercase() != "false"
+        let opengl = if std::env::var("EDGEFIRST_DISABLE_GL")
+            .map(|x| x != "0" && x.to_lowercase() != "false")
+            .unwrap_or(false)
         {
-            log::debug!("EDGEFIRST_DISABLE_GL = {x}");
+            log::debug!("EDGEFIRST_DISABLE_GL is set");
             None
         } else {
             match GLProcessorThreaded::new() {
@@ -1146,11 +1146,11 @@ impl ImageProcessor {
             }
         };
 
-        let cpu = if let Ok(x) = std::env::var("EDGEFIRST_DISABLE_CPU")
-            && x != "0"
-            && x.to_lowercase() != "false"
+        let cpu = if std::env::var("EDGEFIRST_DISABLE_CPU")
+            .map(|x| x != "0" && x.to_lowercase() != "false")
+            .unwrap_or(false)
         {
-            log::debug!("EDGEFIRST_DISABLE_CPU = {x}");
+            log::debug!("EDGEFIRST_DISABLE_CPU is set");
             None
         } else {
             Some(CPUProcessor::new())
@@ -1208,19 +1208,17 @@ impl ImageProcessorTrait for ImageProcessor {
         };
 
         // TODO: Check if still use CPU when rotation or flip is enabled
-        if src_shape == dst_shape
-            && flip == Flip::None
-            && rotation == Rotation::None
-            && let Some(cpu) = self.cpu.as_mut()
-        {
-            match cpu.convert(src, dst, rotation, flip, crop) {
-                Ok(_) => {
-                    log::trace!("image converted with cpu in {:?}", start.elapsed());
-                    return Ok(());
-                }
-                Err(e) => {
-                    log::trace!("image didn't convert with cpu: {e:?}");
-                    return Err(e);
+        if src_shape == dst_shape && flip == Flip::None && rotation == Rotation::None {
+            if let Some(cpu) = self.cpu.as_mut() {
+                match cpu.convert(src, dst, rotation, flip, crop) {
+                    Ok(_) => {
+                        log::trace!("image converted with cpu in {:?}", start.elapsed());
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        log::trace!("image didn't convert with cpu: {e:?}");
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -1468,6 +1466,8 @@ const DEFAULT_COLORS_U8: [[u8; 4]; 20] = denorm(DEFAULT_COLORS);
 mod image_tests {
     use super::*;
     use crate::{CPUProcessor, Rotation};
+    #[cfg(target_os = "linux")]
+    use edgefirst_tensor::is_dma_available;
     use edgefirst_tensor::{TensorMapTrait, TensorMemory};
     use image::buffer::ConvertBuffer;
 
@@ -1681,14 +1681,17 @@ mod image_tests {
 
     #[test]
     fn test_disable_env_var() -> Result<(), Error> {
-        let original = std::env::var("EDGEFIRST_DISABLE_G2D").ok();
-        unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", "1") };
-        let converter = ImageProcessor::new()?;
-        match original {
-            Some(s) => unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", s) },
-            None => unsafe { std::env::remove_var("EDGEFIRST_DISABLE_G2D") },
+        #[cfg(target_os = "linux")]
+        {
+            let original = std::env::var("EDGEFIRST_DISABLE_G2D").ok();
+            unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", "1") };
+            let converter = ImageProcessor::new()?;
+            match original {
+                Some(s) => unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", s) },
+                None => unsafe { std::env::remove_var("EDGEFIRST_DISABLE_G2D") },
+            }
+            assert!(converter.g2d.is_none());
         }
-        assert!(converter.g2d.is_none());
 
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
@@ -1850,33 +1853,13 @@ mod image_tests {
         ));
     }
 
+    // Helper function to check if G2D library is available (Linux/i.MX8 only)
+    #[cfg(target_os = "linux")]
     static G2D_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // Helper function to check if G2D library is available
+
+    #[cfg(target_os = "linux")]
     fn is_g2d_available() -> bool {
-        #[cfg(target_os = "linux")]
-        {
-            *G2D_AVAILABLE.get_or_init(|| G2DProcessor::new().is_ok())
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            false
-        }
-    }
-
-    static DMA_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // Helper function to check if DMA memory allocation is available
-    fn is_dma_available() -> bool {
-        #[cfg(target_os = "linux")]
-        {
-            *DMA_AVAILABLE
-                .get_or_init(|| Tensor::<u8>::new(&[64], Some(TensorMemory::Dma), None).is_ok())
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            false
-        }
+        *G2D_AVAILABLE.get_or_init(|| G2DProcessor::new().is_ok())
     }
 
     #[cfg(target_os = "linux")]

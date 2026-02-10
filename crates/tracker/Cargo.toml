@@ -3,11 +3,14 @@ name = "edgefirst-tracker"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-description.workspace = true
+description = "Multi-object tracking with ByteTrack for edge AI video analytics"
 homepage.workspace = true
 repository.workspace = true
-readme.workspace = true
+readme = "README.md"
 license.workspace = true
+keywords = ["tracking", "bytetrack", "object-tracking", "kalman-filter", "edge-ai"]
+categories = ["multimedia::images", "science::ml", "algorithms"]
+documentation = "https://docs.rs/edgefirst-tracker"
 
 [dependencies]
 enum_dispatch = { workspace = true }

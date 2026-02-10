@@ -19,7 +19,7 @@ python-abi38 = ["pyo3/abi3-py38"]
 python-abi311 = ["pyo3/abi3-py311"]
 
 [dependencies]
-edgefirst = { workspace = true }
+edgefirst-hal = { workspace = true }
 env_logger = { workspace = true }
 four-char-code = { workspace = true }
 half = { workspace = true }

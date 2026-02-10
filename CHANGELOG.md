@@ -7,41 +7,107 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.0] - 2025-11-29
+## [0.5.0] - 2026-02-09
+
+First published release of EdgeFirst HAL to [crates.io](https://crates.io) and [PyPI](https://pypi.org).
+
+### Core Crates
+
+- **`edgefirst-hal`** - Main HAL crate re-exporting tensor, image, and decoder functionality
+- **`edgefirst-tensor`** - Zero-copy tensor memory management with DMA-heap, shared memory,
+  and heap allocation backends
+- **`edgefirst-image`** - High-performance image processing with hardware-accelerated conversion
+  and resizing (G2D, OpenGL ES, CPU fallback)
+- **`edgefirst-decoder`** - ML model output decoder for YOLO (v5/v8/v11/v26) and ModelPack
+  object detection and instance segmentation with NMS
+- **`edgefirst-tracker`** - ByteTrack multi-object tracking with Kalman filtering
+- **`g2d-sys`** - Low-level FFI bindings for NXP i.MX G2D 2D graphics acceleration
 
 ### Added
-- Initial open source release under Apache-2.0 license
-- **Core Crates**:
-  - `edgefirst` - Main HAL crate re-exporting tensor, image, and decoder functionality
-  - `edgefirst-tensor` - Zero-copy memory buffers with DMA-heap, shared memory, and heap allocation support
-  - `edgefirst-image` - Hardware-accelerated image conversion and resizing (G2D, OpenGL, CPU fallback)
-  - `edgefirst-decoder` - YOLO (v5/v8/v11) detection and segmentation decoder with NMS
-  - `edgefirst-tracker` - ByteTrack multi-object tracking with Kalman filtering
-  - `g2d-sys` - FFI bindings for NXP i.MX G2D hardware acceleration
+
+- **Tensor Memory Management** (`edgefirst-tensor`):
+  - Zero-copy memory buffers with DMA-heap, shared memory, and heap backends
+  - `TensorImage` for loading JPEG/PNG images into tensor-backed memory
+  - DMA buffer synchronization controls and file descriptor management
+  - `is_dma_available()` public API for runtime capability detection
+  - ndarray integration (optional, enabled by default)
+  - Cross-platform support: Linux DMA/SHM, macOS/Windows heap fallback
+
+- **Image Processing** (`edgefirst-image`):
+  - Format conversion: YUYV, NV12, NV16, RGB, RGBA, GREY, Planar RGB/RGBA (8BPS)
+  - Hardware-accelerated resize via NXP G2D and OpenGL ES 3.0
+  - CPU fallback converter for all platforms
+  - Source and destination crop with letterboxing and fill color
+  - Rotation (0/90/180/270) and horizontal/vertical flip
+  - EXIF-aware automatic image orientation
+  - Normalization modes: signed (-1..1), unsigned (0..1), raw, with f16 support
+  - Multi-threaded normalization with rayon
+  - Automatic converter selection: tries all available backends (G2D, OpenGL, CPU)
+  - OpenGL renders to texture with dedicated thread for stability
+  - GBM dynamic loading via `edgefirst-gbm` for EGL surface management
+  - Segmentation mask and bounding box overlay rendering (OpenGL, G2D, CPU)
+
+- **Model Decoder** (`edgefirst-decoder`):
+  - YOLO v5/v8/v11 object detection decoding with class-aware and class-agnostic NMS
+  - YOLO v26 detection support with architecture version disambiguation
+  - YOLO instance segmentation with quantized mask decoding (f32, i8, i32)
+  - ModelPack detection and segmentation decoding
+  - Split decoder for models with separate box and class outputs
+  - End-to-end model support (models with built-in NMS)
+  - Configuration via YAML/JSON files and EdgeFirst Model Metadata format
+  - Configurable score threshold, IoU threshold, and NMS mode
+  - Dequantization support for int8/uint8/int32 quantized model outputs
+  - Generic decode API with automatic model type and architecture detection
+
+- **Multi-Object Tracker** (`edgefirst-tracker`):
+  - ByteTrack algorithm with Kalman filtering
+  - Configurable track birth/death thresholds
+  - IoU-based association with LAPJV assignment
+
 - **Python Bindings** (`edgefirst-hal` on PyPI):
-  - PyO3-based Python API with numpy integration
-  - `TensorImage` for image loading and manipulation
-  - `ImageProcessor` for format conversion and resizing
-  - `Decoder` for YOLO model output post-processing
-  - Support for Python 3.8, 3.9, 3.10, 3.11, 3.12
-- **Image Processing Features**:
-  - Format conversion: YUYV, NV12, RGB, RGBA, GREY, Planar RGB (8BPS)
-  - Resize with various interpolation methods
-  - Rotation (0°, 90°, 180°, 270°) and flip operations
-  - Normalization modes: signed, unsigned, raw
+  - PyO3-based Python API with numpy and f16 integration
+  - `TensorImage` for image loading, format query, and tensor memory control
+  - `ImageProcessor` for format conversion, resize, crop, and normalization
+  - `Decoder` for YOLO/ModelPack model output post-processing
+  - Config creation from Python dictionaries via pythonize
+  - `PyArrayLike` inputs (accepts both numpy arrays and Python lists)
+  - File descriptor management (`from_fd`, `fd` property)
+  - Destination crop and fill color controls
+  - Python type stubs (`.pyi`) for IDE autocompletion
+  - Support for Python 3.8+ (ABI3) and 3.11+ (ABI3-311)
+
+- **NXP G2D Bindings** (`g2d-sys`):
+  - FFI bindings for NXP i.MX G2D hardware 2D acceleration
+  - Dynamic loading via `libloading` for runtime availability detection
+  - Version-aware API support (legacy and modern G2D, imx95)
+
 - **Platform Support**:
-  - Linux with i.MX hardware acceleration (G2D, OpenGL)
-  - Linux generic with CPU fallback
-  - macOS and Windows with heap memory tensors
+  - Linux x86_64 and aarch64 with full hardware acceleration
+  - macOS (Apple Silicon and x86_64) with CPU-only processing
+  - Windows with heap memory tensors and CPU processing
+  - NXP i.MX8/i.MX9 with G2D and OpenGL ES hardware acceleration
+
 - **CI/CD Infrastructure**:
   - GitHub Actions workflows for testing, coverage, and releases
-  - Multi-platform wheel builds (Linux, macOS, Windows)
+  - Multi-platform CI: x86_64, aarch64, macOS ARM
+  - On-target hardware testing with NXP i.MX boards
+  - Multi-platform Python wheel builds (Linux manylinux2014, macOS, Windows)
   - PyPI trusted publishing with OIDC
   - SBOM generation and license compliance checking
-- Comprehensive documentation with architecture diagrams
-- Apache-2.0 license with NOTICE file for third-party attributions
+  - Comprehensive Criterion and Divan benchmark suites
+  - Shared benchmark module with common test utilities
+
+- **Publishing**:
+  - All workspace crates published to crates.io
+  - `edgefirst-gbm` / `edgefirst-gbm-sys` published as standalone crates for GBM
+    dynamic loading support (fork of Smithay/gbm.rs)
+  - Comprehensive crate documentation with README, keywords, and categories
+  - API documentation with doc-tests for all public interfaces
 
 ### Notes
-- SonarCloud and codecov integrations intentionally not implemented per project requirements
-- No CLI binaries are built (edgefirst-hal is a library-only project)
-- `test_opengl_resize_8bps` test marked as `#[ignore]` pending testdata file
+
+- Python bindings are distributed via PyPI only (`publish = false` for the Python crate)
+- `g2d-sys` maintains its own version (1.0.1) independent of the workspace
+- `edgefirst-gbm` 0.18.1 and `edgefirst-gbm-sys` 0.4.1 are published separately
+  from the [EdgeFirstAI/gbm.rs](https://github.com/EdgeFirstAI/gbm.rs) repository
+- Apache-2.0 license with NOTICE file for third-party attributions

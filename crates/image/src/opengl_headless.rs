@@ -10,16 +10,16 @@ use edgefirst_decoder::Segmentation;
 use edgefirst_tensor::{TensorMemory, TensorTrait};
 use four_char_code::FourCharCode;
 use gbm::{
+    drm::{buffer::DrmFourcc, control::Device as DrmControlDevice, Device as DrmDevice},
     AsRaw, Device,
-    drm::{Device as DrmDevice, buffer::DrmFourcc, control::Device as DrmControlDevice},
 };
-use khronos_egl::{self as egl, Attrib, Display, Dynamic, EGL1_4, Instance};
+use khronos_egl::{self as egl, Attrib, Display, Dynamic, Instance, EGL1_4};
 use log::{debug, error};
 use std::{
     collections::BTreeSet,
-    ffi::{CStr, CString, c_char, c_void},
+    ffi::{c_char, c_void, CStr, CString},
     os::fd::AsRawFd,
-    ptr::{NonNull, null, null_mut},
+    ptr::{null, null_mut, NonNull},
     rc::Rc,
     str::FromStr,
     sync::OnceLock,
@@ -47,8 +47,8 @@ macro_rules! function {
 #[cfg(feature = "decoder")]
 use crate::DEFAULT_COLORS;
 use crate::{
-    CPUProcessor, Crop, Error, Flip, GREY, ImageProcessorTrait, NV12, PLANAR_RGB, PLANAR_RGBA, RGB,
-    RGBA, Rect, Rotation, TensorImage, TensorImageRef, YUYV,
+    CPUProcessor, Crop, Error, Flip, ImageProcessorTrait, Rect, Rotation, TensorImage,
+    TensorImageRef, GREY, NV12, PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, YUYV,
 };
 
 static EGL_LIB: OnceLock<libloading::Library> = OnceLock::new();
@@ -1205,16 +1205,18 @@ impl GLProcessorST {
         let has_crop = crop.dst_rect.is_some_and(|x| {
             x.left != 0 || x.top != 0 || x.width != dst.width() || x.height != dst.height()
         });
-        if has_crop && let Some(dst_color) = crop.dst_color {
-            unsafe {
-                gls::gl::ClearColor(
-                    dst_color[0] as f32 / 255.0,
-                    dst_color[1] as f32 / 255.0,
-                    dst_color[2] as f32 / 255.0,
-                    dst_color[3] as f32 / 255.0,
-                );
-                gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
-            };
+        if has_crop {
+            if let Some(dst_color) = crop.dst_color {
+                unsafe {
+                    gls::gl::ClearColor(
+                        dst_color[0] as f32 / 255.0,
+                        dst_color[1] as f32 / 255.0,
+                        dst_color[2] as f32 / 255.0,
+                        dst_color[3] as f32 / 255.0,
+                    );
+                    gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
+                };
+            }
         }
 
         // top and bottom are flipped because OpenGL uses 0,0 as bottom left
@@ -1371,19 +1373,21 @@ impl GLProcessorST {
         let has_crop = crop.dst_rect.is_some_and(|x| {
             x.left != 0 || x.top != 0 || x.width != dst.width() || x.height != dst.height()
         });
-        if has_crop && let Some(dst_color) = crop.dst_color {
-            self.clear_rect_planar(
-                dst.width(),
-                dst.height(),
-                dst_roi,
-                [
-                    dst_color[0] as f32 / 255.0,
-                    dst_color[1] as f32 / 255.0,
-                    dst_color[2] as f32 / 255.0,
-                    dst_color[3] as f32 / 255.0,
-                ],
-                alpha,
-            )?;
+        if has_crop {
+            if let Some(dst_color) = crop.dst_color {
+                self.clear_rect_planar(
+                    dst.width(),
+                    dst.height(),
+                    dst_roi,
+                    [
+                        dst_color[0] as f32 / 255.0,
+                        dst_color[1] as f32 / 255.0,
+                        dst_color[2] as f32 / 255.0,
+                        dst_color[3] as f32 / 255.0,
+                    ],
+                    alpha,
+                )?;
+            }
         }
 
         let new_egl_image = self.create_image_from_dma2(src)?;
@@ -2867,9 +2871,9 @@ void main() {
 #[cfg(feature = "opengl")]
 mod gl_tests {
     use super::*;
+    use crate::{TensorImage, RGBA};
     #[cfg(feature = "dma_test_formats")]
     use crate::{NV12, YUYV};
-    use crate::{RGBA, TensorImage};
     use edgefirst_tensor::TensorTrait;
     #[cfg(feature = "dma_test_formats")]
     use edgefirst_tensor::{TensorMapTrait, TensorMemory};

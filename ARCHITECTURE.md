@@ -338,8 +338,8 @@ flowchart LR
 ### Pattern 1: Basic Image Conversion
 
 ```rust
-use edgefirst::image::{TensorImage, ImageProcessor, RGBA, RGB};
-use edgefirst::tensor::TensorMemory;
+use edgefirst_hal::image::{TensorImage, ImageProcessor, RGBA, RGB};
+use edgefirst_hal::tensor::TensorMemory;
 
 // Load image from JPEG
 let input = TensorImage::load("testdata/zidane.jpg", Some(RGB), None)?;
@@ -357,7 +357,7 @@ converter.convert(&input, &mut output, Default::default())?;
 ### Pattern 2: Detection Decoding
 
 ```rust
-use edgefirst::decoder::Decoder;
+use edgefirst_hal::decoder::Decoder;
 use std::collections::HashMap;
 
 // Build decoder from configuration dictionary/JSON
@@ -386,7 +386,7 @@ boxes, scores, classes = decoder.decode([output0, output1])
 ### Pattern 3: Multi-Frame Tracking
 
 ```rust
-use edgefirst::tracker::{ByteTrack, Tracker, DetectionBox};
+use edgefirst_hal::tracker::{ByteTrack, Tracker, DetectionBox};
 
 let mut tracker = ByteTrack::default();
 
@@ -403,7 +403,7 @@ for frame in video_frames {
 ### Pattern 4: Zero-Copy Tensor Sharing
 
 ```rust
-use edgefirst::tensor::{Tensor, TensorTrait};
+use edgefirst_hal::tensor::{Tensor, TensorTrait};
 
 // Create tensor in process A
 let tensor = Tensor::<u8>::new(&[1920, 1080, 3], None, Some("frame1"))?;

@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use nalgebra::{
-    DVector, DefaultAllocator, Dyn, OMatrix, RealField, SVector, U1, U8, allocator::Allocator,
-    convert, dimension::U4,
+    allocator::Allocator, convert, dimension::U4, DVector, DefaultAllocator, Dyn, OMatrix,
+    RealField, SVector, U1, U8,
 };
 
 #[derive(Debug, Clone)]

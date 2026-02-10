@@ -9,10 +9,10 @@
 
 include!("./ffi.rs");
 
-use four_char_code::{FourCharCode, four_char_code};
+use four_char_code::{four_char_code, FourCharCode};
 use nix::ioctl_write_ptr;
 use std::{
-    ffi::{CStr, c_char},
+    ffi::{c_char, CStr},
     fmt::Display,
     os::{
         fd::RawFd,

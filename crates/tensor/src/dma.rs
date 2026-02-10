@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    TensorMap, TensorMapTrait, TensorMemory, TensorTrait,
     error::{Error, Result},
+    TensorMap, TensorMapTrait, TensorMemory, TensorTrait,
 };
 use log::{trace, warn};
 use num_traits::Num;

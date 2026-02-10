@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    BBoxTypeTrait, BoundingBox, DetectBoxQuantized, Quantization, arg_max, float::jaccard,
+    arg_max, float::jaccard, BBoxTypeTrait, BoundingBox, DetectBoxQuantized, Quantization,
 };
 use ndarray::{
-    Array1, ArrayView2, Zip,
     parallel::prelude::{IntoParallelIterator, ParallelIterator as _},
+    Array1, ArrayView2, Zip,
 };
 use num_traits::{AsPrimitive, PrimInt};
 use rayon::slice::ParallelSliceMut;

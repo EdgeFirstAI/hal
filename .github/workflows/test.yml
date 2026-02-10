@@ -25,13 +25,14 @@
 #
 # Runner Notes:
 # - ubuntu-22.04: Standard GitHub-hosted runner (x86_64)
-# - ubuntu-22.04-arm-private: GitHub Private ARM64 runner (for private repos)
+# - ubuntu-22.04-arm: GitHub ARM64 runner (public repos)
+# - macos-latest: GitHub macOS runner (Apple Silicon)
 # - nxp-imx8mp-latest: NXP i.MX 8M Plus EVK - test-only runner (NO toolchain)
 #
 # Build Strategy:
 # - x86_64 and aarch64 builds happen on GitHub-hosted/managed runners
 # - imx8mp runner downloads aarch64 artifacts and runs tests only
-# - Coverage processing happens on ubuntu-22.04-arm-private (same toolchain as build)
+# - Coverage processing happens on ubuntu-22.04-arm (same toolchain as build)
 #
 # Coverage Strategy:
 # - Each platform runs tests independently and generates coverage
@@ -175,7 +176,7 @@ jobs:
           tool: cargo-llvm-cov@0.6.16,cargo-nextest
 
       - name: Check Rust formatting
-        run: cargo +nightly fmt --all -- --check 2>/dev/null || cargo fmt --all -- --check
+        run: cargo fmt --all -- --check
 
       - name: Run Clippy
         # Use default,opencv features; exclude g2d_test_formats,dma_test_formats (on-target only)
@@ -260,11 +261,75 @@ jobs:
           ignore_runs: true
 
   # ===========================================================================
+  # Build and Test on macOS (Apple Silicon)
+  # ===========================================================================
+  build-and-test-macos:
+    name: Build & Test (macOS)
+    runs-on: macos-latest
+    needs: checkout-lfs
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          fetch-depth: 0
+          lfs: false  # LFS files downloaded separately
+
+      - name: Download LFS testdata
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: testdata-lfs
+          path: testdata/
+
+      - name: Set up Rust stable toolchain
+        uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5  # v2.8.2
+        with:
+          shared-key: rust-macos
+          cache-on-failure: true
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@493d7f216ecab2af0602481ce809ab2c72836fa1  # v2.62.62
+        with:
+          tool: cargo-nextest
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        # Use default features only (no OpenCV, no Linux-specific hardware features)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run Rust tests
+        run: |
+          set -o pipefail
+          cargo nextest run --workspace 2>&1 | tee target/test-metrics-rust-macos.txt
+
+      - name: Upload test results
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        if: always()
+        with:
+          name: test-results-macos
+          path: |
+            target/nextest/default/test-results.xml
+            target/test-metrics-*-macos.txt
+          retention-days: 30
+
+  # ===========================================================================
   # Build and Test on aarch64 (Self-hosted runner WITHOUT Docker)
   # ===========================================================================
   build-and-test-arm:
     name: Build & Test (aarch64)
-    runs-on: ubuntu-22.04-arm-private
+    runs-on: ubuntu-22.04-arm
     needs: checkout-lfs
     permissions:
       contents: read
@@ -329,7 +394,7 @@ jobs:
           tool: cargo-llvm-cov@0.6.16,cargo-nextest
 
       - name: Check Rust formatting
-        run: cargo +nightly fmt --all -- --check 2>/dev/null || cargo fmt --all -- --check
+        run: cargo fmt --all -- --check
 
       - name: Run Clippy
         # Use default,opencv features; exclude g2d_test_formats,dma_test_formats (on-target only)
@@ -609,7 +674,7 @@ jobs:
   process-hardware-coverage:
     name: Process Hardware Coverage
     needs: [build-and-test-arm, hardware-test]
-    runs-on: ubuntu-22.04-arm-private
+    runs-on: ubuntu-22.04-arm
     permissions:
       contents: read
 
@@ -746,6 +811,7 @@ jobs:
             echo "|----------|--------------|-------|"
             echo "| Ubuntu 22.04 | x86_64 | Rust, Python |"
             echo "| Ubuntu 22.04 | aarch64 | Rust, Python |"
+            echo "| macOS | Apple Silicon | Rust |"
             echo "| NXP i.MX8M Plus | aarch64 | Rust, Python (DMA, G2D) |"
             echo ""
             python3 scripts/coverage_summary.py --github-actions
