@@ -14,7 +14,7 @@ authors = ["Au-Zone Technologies <support@au-zone.com>"]
 homepage = "https://edgefirst.ai"
 repository = "https://github.com/EdgeFirstAI/hal"
 license = "Apache-2.0"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2021"
 
 [workspace.dependencies]
@@ -29,11 +29,11 @@ ctor = "0.4.2"
 divan = "0.1.21"
 dma-heap = "0.4.1"
 # Internal crates
-edgefirst-hal = { version = "0.1.0", path = "crates/hal" }
-edgefirst-decoder = { version = "0.1.0", path = "crates/decoder" }
-edgefirst-image = { version = "0.1.0", path = "crates/image" }
-edgefirst-tensor = { version = "0.1.0", path = "crates/tensor" }
-edgefirst-tracker = { version = "0.1.0", path = "crates/tracker" }
+edgefirst-hal = { version = "0.5.0", path = "crates/hal" }
+edgefirst-decoder = { version = "0.5.0", path = "crates/decoder" }
+edgefirst-image = { version = "0.5.0", path = "crates/image" }
+edgefirst-tensor = { version = "0.5.0", path = "crates/tensor" }
+edgefirst-tracker = { version = "0.5.0", path = "crates/tracker" }
 enum_dispatch = "0.3.13"
 env_logger = "0.11.8"
 fast-math = "0.1.1"
@@ -41,8 +41,7 @@ fast_image_resize = { version = "5.2.0", features = ["image", "rayon"] }
 four-char-code = "2.3.0"
 g2d-sys = { version = "1.0.1", path = "crates/g2d-sys" }
 
-# Platform-specific dependencies (Git sources need to be defined here)
-gbm = { git = "https://github.com/EdgeFirstAI/gbm.rs.git", branch = "dynamic", default-features = false, features = ["dynamic", "drm-support"] }
+gbm = { package = "edgefirst-gbm", version = "0.18.1", default-features = false, features = ["dynamic", "drm-support"] }
 gls = "0.1.6"
 half = "2.7.1"
 image = { version = "0.25.6", default-features = false, features = ["png"] }
