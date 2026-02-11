@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "edgefirst-hal-capi"
+description = "C API for EdgeFirst Hardware Abstraction Layer"
+version.workspace = true
+edition = "2021"
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false  # C library - distributed via GitHub Releases, not crates.io
+
+[lib]
+crate-type = ["staticlib", "cdylib"]
+name = "edgefirst_hal"
+
+[dependencies]
+edgefirst-hal = { workspace = true }
+edgefirst-tensor = { workspace = true }
+edgefirst-image = { workspace = true }
+edgefirst-decoder = { workspace = true }
+edgefirst-tracker = { workspace = true }
+errno = "0.3"
+libc = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+half = { workspace = true }
+uuid = { workspace = true }
+ndarray = { workspace = true }
+four-char-code = { workspace = true }
+
+[build-dependencies]
+cbindgen = "0.29"

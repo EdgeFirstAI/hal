@@ -18,15 +18,17 @@ LICENSE_OVERRIDES = {
     "dma-heap@0.4.1": "MIT",  # Confirmed from upstream: https://github.com/mripard/dma-heap/
     # Internal crates - all Apache-2.0 (workspace.package.license)
     # Versioned entries (from cargo-cyclonedx)
-    "edgefirst@0.1.0": "Apache-2.0",
-    "edgefirst-decoder@0.1.0": "Apache-2.0",
-    "edgefirst-image@0.1.0": "Apache-2.0",
-    "edgefirst-tensor@0.1.0": "Apache-2.0",
-    "edgefirst-tracker@0.1.0": "Apache-2.0",
-    "edgefirst_hal@0.1.0": "Apache-2.0",
+    "edgefirst-hal@0.5.0": "Apache-2.0",
+    "edgefirst-hal-capi@0.5.0": "Apache-2.0",
+    "edgefirst-decoder@0.5.0": "Apache-2.0",
+    "edgefirst-image@0.5.0": "Apache-2.0",
+    "edgefirst-tensor@0.5.0": "Apache-2.0",
+    "edgefirst-tracker@0.5.0": "Apache-2.0",
+    "edgefirst_hal@0.5.0": "Apache-2.0",  # Python package name
     "g2d-sys@1.0.1": "Apache-2.0",
     # Unversioned entries (from scancode source scan)
-    "edgefirst@unknown": "Apache-2.0",
+    "edgefirst-hal@unknown": "Apache-2.0",
+    "edgefirst-hal-capi@unknown": "Apache-2.0",
     "edgefirst-decoder@unknown": "Apache-2.0",
     "edgefirst-image@unknown": "Apache-2.0",
     "edgefirst-tensor@unknown": "Apache-2.0",
