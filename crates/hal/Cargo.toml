@@ -9,7 +9,7 @@ repository.workspace = true
 readme = "README.md"
 license.workspace = true
 keywords = ["edge-ai", "machine-learning", "tensor", "image-processing", "embedded"]
-categories = ["multimedia::images", "science::ml", "embedded"]
+categories = ["multimedia::images", "science", "embedded"]
 documentation = "https://docs.rs/edgefirst-hal"
 
 [features]
