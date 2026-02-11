@@ -9,7 +9,7 @@ repository.workspace = true
 readme = "README.md"
 license.workspace = true
 keywords = ["tracking", "bytetrack", "object-tracking", "kalman-filter", "edge-ai"]
-categories = ["multimedia::images", "science::ml", "algorithms"]
+categories = ["multimedia::images", "science", "algorithms"]
 documentation = "https://docs.rs/edgefirst-tracker"
 
 [dependencies]
