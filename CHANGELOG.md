@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-02-11
+
+### Changed
+
+- GitHub release workflow improvements for trusted publishing
+
 ## [0.5.0] - 2026-02-09
 
 First published release of EdgeFirst HAL to [crates.io](https://crates.io) and [PyPI](https://pypi.org).
