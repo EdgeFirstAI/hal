@@ -1339,8 +1339,12 @@ mod tests {
     #[test]
     fn test_image_load_jpeg_null() {
         unsafe {
-            let image =
-                hal_tensor_image_load_jpeg(std::ptr::null(), 100, HalFourcc::Rgb, HalTensorMemory::Mem);
+            let image = hal_tensor_image_load_jpeg(
+                std::ptr::null(),
+                100,
+                HalFourcc::Rgb,
+                HalTensorMemory::Mem,
+            );
             assert!(image.is_null());
 
             let data = [0u8; 10];
@@ -1353,8 +1357,12 @@ mod tests {
     #[test]
     fn test_image_load_png_null() {
         unsafe {
-            let image =
-                hal_tensor_image_load_png(std::ptr::null(), 100, HalFourcc::Rgb, HalTensorMemory::Mem);
+            let image = hal_tensor_image_load_png(
+                std::ptr::null(),
+                100,
+                HalFourcc::Rgb,
+                HalTensorMemory::Mem,
+            );
             assert!(image.is_null());
 
             let data = [0u8; 10];

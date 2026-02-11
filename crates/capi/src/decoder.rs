@@ -495,12 +495,9 @@ pub unsafe extern "C" fn hal_decoder_decode(
     } else {
         // Quantized decode path: map each tensor to ArrayViewDQuantized
         // We need to keep the maps alive while building views
-        if let Err(rc) = decode_quantized_inner(
-            &(*decoder).inner,
-            outputs_slice,
-            &mut boxes,
-            &mut masks,
-        ) {
+        if let Err(rc) =
+            decode_quantized_inner(&(*decoder).inner, outputs_slice, &mut boxes, &mut masks)
+        {
             return rc;
         }
     }
@@ -650,12 +647,10 @@ unsafe fn decode_quantized_inner(
         views.push(view);
     }
 
-    decoder
-        .decode_quantized(&views, boxes, masks)
-        .map_err(|_| {
-            set_error(libc::EIO);
-            -1
-        })
+    decoder.decode_quantized(&views, boxes, masks).map_err(|_| {
+        set_error(libc::EIO);
+        -1
+    })
 }
 
 /// Get the model type string from a decoder.
@@ -798,10 +793,7 @@ pub unsafe extern "C" fn hal_segmentation_to_mask(
     }
 
     let seg = &unsafe { &*list }.masks[index];
-    let mask_2d = try_or_null!(
-        segmentation_to_mask(seg.segmentation.view()),
-        libc::EINVAL
-    );
+    let mask_2d = try_or_null!(segmentation_to_mask(seg.segmentation.view()), libc::EINVAL);
 
     let shape = mask_2d.shape();
     let h = shape[0];
@@ -814,7 +806,8 @@ pub unsafe extern "C" fn hal_segmentation_to_mask(
     };
 
     let mut map = try_or_null!(tensor.map(), libc::EIO);
-    map.as_mut_slice().copy_from_slice(mask_2d.as_slice().unwrap());
+    map.as_mut_slice()
+        .copy_from_slice(mask_2d.as_slice().unwrap());
     map.unmap();
 
     Box::into_raw(Box::new(HalTensor::U8(tensor)))
@@ -1185,19 +1178,37 @@ nms: class_aware
 
             // NULL outputs
             assert_eq!(
-                hal_decoder_decode(decoder, std::ptr::null(), 1, &mut boxes as *mut _, std::ptr::null_mut()),
+                hal_decoder_decode(
+                    decoder,
+                    std::ptr::null(),
+                    1,
+                    &mut boxes as *mut _,
+                    std::ptr::null_mut()
+                ),
                 -1
             );
 
             // NULL out_boxes
             assert_eq!(
-                hal_decoder_decode(decoder, outputs.as_ptr(), 1, std::ptr::null_mut(), std::ptr::null_mut()),
+                hal_decoder_decode(
+                    decoder,
+                    outputs.as_ptr(),
+                    1,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut()
+                ),
                 -1
             );
 
             // Zero num_outputs
             assert_eq!(
-                hal_decoder_decode(decoder, outputs.as_ptr(), 0, &mut boxes as *mut _, std::ptr::null_mut()),
+                hal_decoder_decode(
+                    decoder,
+                    outputs.as_ptr(),
+                    0,
+                    &mut boxes as *mut _,
+                    std::ptr::null_mut()
+                ),
                 -1
             );
 
@@ -1251,8 +1262,13 @@ nms: class_aware
             let mut boxes: *mut HalDetectBoxList = std::ptr::null_mut();
             let mut segs: *mut HalSegmentationList = std::ptr::null_mut();
 
-            let result =
-                hal_decoder_decode(decoder, outputs.as_ptr(), 1, &mut boxes as *mut _, &mut segs as *mut _);
+            let result = hal_decoder_decode(
+                decoder,
+                outputs.as_ptr(),
+                1,
+                &mut boxes as *mut _,
+                &mut segs as *mut _,
+            );
             assert_eq!(result, 0);
             assert!(!boxes.is_null());
             assert!(!segs.is_null());
@@ -1377,16 +1393,10 @@ nms: class_aware
             hal_tensor_map_unmap(map);
 
             // NULL input
-            assert_eq!(
-                hal_dequantize(std::ptr::null(), quant, output),
-                -1
-            );
+            assert_eq!(hal_dequantize(std::ptr::null(), quant, output), -1);
 
             // NULL output
-            assert_eq!(
-                hal_dequantize(input, quant, std::ptr::null_mut()),
-                -1
-            );
+            assert_eq!(hal_dequantize(input, quant, std::ptr::null_mut()), -1);
 
             hal_tensor_free(input);
             hal_tensor_free(output);
@@ -1634,7 +1644,13 @@ nms: class_aware
             let mut boxes: *mut HalDetectBoxList = std::ptr::null_mut();
 
             assert_eq!(
-                hal_decoder_decode(decoder, outputs.as_ptr(), 1, &mut boxes as *mut _, std::ptr::null_mut()),
+                hal_decoder_decode(
+                    decoder,
+                    outputs.as_ptr(),
+                    1,
+                    &mut boxes as *mut _,
+                    std::ptr::null_mut()
+                ),
                 -1
             );
 
