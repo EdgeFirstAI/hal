@@ -9,7 +9,7 @@ repository.workspace = true
 readme = "README.md"
 license.workspace = true
 keywords = ["tensor", "dma", "shared-memory", "zero-copy", "edge-ai"]
-categories = ["data-structures", "memory-management", "embedded", "science::ml"]
+categories = ["data-structures", "memory-management", "embedded", "science"]
 documentation = "https://docs.rs/edgefirst-tensor"
 
 [features]
