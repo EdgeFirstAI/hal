@@ -16,6 +16,7 @@ repository = "https://github.com/EdgeFirstAI/hal"
 license = "Apache-2.0"
 version = "0.5.0"
 edition = "2021"
+readme = "README.md"
 
 [workspace.dependencies]
 
