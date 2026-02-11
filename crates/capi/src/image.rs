@@ -6,16 +6,15 @@
 //! This module provides image conversion and manipulation functions with
 //! support for hardware acceleration (G2D, OpenGL) when available.
 
+use crate::decoder::{HalDetectBoxList, HalSegmentationList};
 use crate::error::{set_error, set_error_null};
-use crate::tensor::HalTensorMemory;
+use crate::tensor::{HalTensor, HalTensorMemory};
 use crate::{check_null, check_null_ret_null, try_or_errno, try_or_null};
 use edgefirst_image::{
-    Crop, Flip, ImageProcessor, ImageProcessorTrait, Rect, Rotation, TensorImage, GREY, NV12, NV16,
-    PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, YUYV,
+    Crop, Flip, ImageProcessor, ImageProcessorTrait, Rect, Rotation, TensorImage, TensorImageRef,
+    GREY, NV12, NV16, PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, YUYV,
 };
-use edgefirst_tensor::TensorMemory;
-#[cfg(unix)]
-use edgefirst_tensor::TensorTrait;
+use edgefirst_tensor::{TensorMemory, TensorTrait};
 use libc::{c_char, c_int, c_void, size_t};
 use std::ffi::CStr;
 
@@ -412,6 +411,108 @@ pub unsafe extern "C" fn hal_tensor_image_load_file(
     Box::into_raw(Box::new(HalTensorImage { inner: image }))
 }
 
+/// Create a tensor image from an existing u8 tensor.
+///
+/// Takes ownership of the tensor. The tensor must be u8 dtype with a 3D shape
+/// matching the specified pixel format.
+///
+/// @param tensor u8 tensor to take ownership of (must not be used after this call)
+/// @param fourcc Pixel format describing the tensor layout
+/// @return New tensor image handle on success, NULL on error
+/// @par Errors (errno):
+/// - EINVAL: NULL tensor, tensor is not u8 dtype, or shape is invalid for format
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_image_from_tensor(
+    tensor: *mut HalTensor,
+    fourcc: HalFourcc,
+) -> *mut HalTensorImage {
+    check_null_ret_null!(tensor);
+
+    // Take ownership of the tensor
+    let boxed = unsafe { Box::from_raw(tensor) };
+
+    // Must be u8 dtype
+    let u8_tensor = match *boxed {
+        HalTensor::U8(t) => t,
+        _ => return set_error_null(libc::EINVAL),
+    };
+
+    let image = try_or_null!(
+        TensorImage::from_tensor(u8_tensor, fourcc.to_fourcc()),
+        libc::EINVAL
+    );
+
+    Box::into_raw(Box::new(HalTensorImage { inner: image }))
+}
+
+/// Load a JPEG image from memory.
+///
+/// @param data Pointer to JPEG data
+/// @param len Length of JPEG data in bytes
+/// @param fourcc Output pixel format (HAL_FOURCC_RGB, HAL_FOURCC_RGBA, or HAL_FOURCC_GREY)
+/// @param memory Memory allocation type
+/// @return New tensor image handle on success, NULL on error
+/// @par Errors (errno):
+/// - EINVAL: Invalid argument (NULL data, zero length)
+/// - EBADMSG: Failed to decode JPEG
+/// - ENOMEM: Memory allocation failed
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_image_load_jpeg(
+    data: *const u8,
+    len: size_t,
+    fourcc: HalFourcc,
+    memory: HalTensorMemory,
+) -> *mut HalTensorImage {
+    check_null_ret_null!(data);
+    if len == 0 {
+        return set_error_null(libc::EINVAL);
+    }
+
+    let data_slice = unsafe { std::slice::from_raw_parts(data, len) };
+    let mem_opt: Option<TensorMemory> = memory.into();
+
+    let image = try_or_null!(
+        TensorImage::load_jpeg(data_slice, Some(fourcc.to_fourcc()), mem_opt),
+        libc::EBADMSG
+    );
+
+    Box::into_raw(Box::new(HalTensorImage { inner: image }))
+}
+
+/// Load a PNG image from memory.
+///
+/// @param data Pointer to PNG data
+/// @param len Length of PNG data in bytes
+/// @param fourcc Output pixel format (HAL_FOURCC_RGB, HAL_FOURCC_RGBA, or HAL_FOURCC_GREY)
+/// @param memory Memory allocation type
+/// @return New tensor image handle on success, NULL on error
+/// @par Errors (errno):
+/// - EINVAL: Invalid argument (NULL data, zero length)
+/// - EBADMSG: Failed to decode PNG
+/// - ENOMEM: Memory allocation failed
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_image_load_png(
+    data: *const u8,
+    len: size_t,
+    fourcc: HalFourcc,
+    memory: HalTensorMemory,
+) -> *mut HalTensorImage {
+    check_null_ret_null!(data);
+    if len == 0 {
+        return set_error_null(libc::EINVAL);
+    }
+
+    let data_slice = unsafe { std::slice::from_raw_parts(data, len) };
+    let mem_opt: Option<TensorMemory> = memory.into();
+
+    let image = try_or_null!(
+        TensorImage::load_png(data_slice, Some(fourcc.to_fourcc()), mem_opt),
+        libc::EBADMSG
+    );
+
+    Box::into_raw(Box::new(HalTensorImage { inner: image }))
+}
+
 /// Save a tensor image as JPEG.
 ///
 /// @param image Tensor image to save
@@ -495,6 +596,52 @@ pub unsafe extern "C" fn hal_tensor_image_fourcc(image: *const HalTensorImage) -
         return HalFourcc::Rgb;
     }
     HalFourcc::from_fourcc(unsafe { &(*image) }.inner.fourcc()).unwrap_or(HalFourcc::Rgb)
+}
+
+/// Check if a tensor image uses a planar pixel format.
+///
+/// Planar formats store each color channel in a separate plane (e.g., NV12,
+/// NV16, PLANAR_RGB, PLANAR_RGBA), while interleaved formats store channels
+/// together per pixel (e.g., RGB, RGBA, YUYV).
+///
+/// @param image Tensor image handle
+/// @return true if the image uses a planar format, false if interleaved or NULL
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_image_is_planar(image: *const HalTensorImage) -> bool {
+    if image.is_null() {
+        return false;
+    }
+    unsafe { &(*image) }.inner.is_planar()
+}
+
+/// Get the number of channels in a tensor image.
+///
+/// Returns the number of color channels (e.g., 3 for RGB, 4 for RGBA,
+/// 1 for GREY, 2 for NV12).
+///
+/// @param image Tensor image handle
+/// @return Number of channels, or 0 if image is NULL
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_image_channels(image: *const HalTensorImage) -> size_t {
+    if image.is_null() {
+        return 0;
+    }
+    unsafe { &(*image) }.inner.channels()
+}
+
+/// Get the row stride of a tensor image in bytes.
+///
+/// For planar formats this is equal to the width. For interleaved formats
+/// this is width * channels.
+///
+/// @param image Tensor image handle
+/// @return Row stride in bytes, or 0 if image is NULL
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_image_row_stride(image: *const HalTensorImage) -> size_t {
+    if image.is_null() {
+        return 0;
+    }
+    unsafe { &(*image) }.inner.row_stride()
 }
 
 /// Clone the file descriptor associated with a tensor image (Linux only).
@@ -598,6 +745,146 @@ pub unsafe extern "C" fn hal_image_processor_convert(
             flip.into(),
             crop_config,
         ),
+        libc::EIO
+    );
+    0
+}
+
+/// Convert an image into a borrowed tensor reference.
+///
+/// This enables zero-copy preprocessing directly into a model's pre-allocated
+/// input buffer. The destination tensor must be u8 dtype with a 3D shape
+/// matching the specified output format.
+///
+/// @param processor Image processor handle
+/// @param src Source image
+/// @param dst_tensor Destination u8 tensor (not consumed, must remain valid)
+/// @param dst_fourcc Output pixel format for the destination
+/// @param rotation Rotation to apply
+/// @param flip Flip to apply
+/// @param crop Crop configuration (can be NULL for no crop)
+/// @return 0 on success, -1 on error
+/// @par Errors (errno):
+/// - EINVAL: Invalid argument (NULL processor/src/dst_tensor, wrong dtype, invalid shape)
+/// - EIO: Conversion failed
+#[no_mangle]
+pub unsafe extern "C" fn hal_image_processor_convert_ref(
+    processor: *mut HalImageProcessor,
+    src: *const HalTensorImage,
+    dst_tensor: *mut HalTensor,
+    dst_fourcc: HalFourcc,
+    rotation: HalRotation,
+    flip: HalFlip,
+    crop: *const HalCrop,
+) -> c_int {
+    check_null!(processor, src, dst_tensor);
+
+    // Get a mutable reference to the u8 tensor
+    let tensor_ref = match unsafe { &mut *dst_tensor } {
+        HalTensor::U8(t) => t,
+        _ => return set_error(libc::EINVAL),
+    };
+
+    let mut dst_ref = try_or_errno!(
+        TensorImageRef::from_borrowed_tensor(tensor_ref, dst_fourcc.to_fourcc()),
+        libc::EINVAL
+    );
+
+    let crop_config = if crop.is_null() {
+        Crop::default()
+    } else {
+        unsafe { *crop }.into()
+    };
+
+    try_or_errno!(
+        unsafe { &mut (*processor) }.inner.convert_ref(
+            &unsafe { &(*src) }.inner,
+            &mut dst_ref,
+            rotation.into(),
+            flip.into(),
+            crop_config,
+        ),
+        libc::EIO
+    );
+    0
+}
+
+/// Render detection boxes and segmentation masks onto an image.
+///
+/// Draws bounding boxes (with labels) and segmentation overlays on the
+/// destination image. Uses hardware acceleration (OpenGL) when available,
+/// falling back to CPU rendering.
+///
+/// @param processor Image processor handle
+/// @param dst Destination image to render onto
+/// @param detections Detection box list (can be NULL for segmentation-only)
+/// @param segmentations Segmentation list (can be NULL for detection-only)
+/// @return 0 on success, -1 on error
+/// @par Errors (errno):
+/// - EINVAL: Invalid argument (NULL processor or dst)
+/// - EIO: Rendering failed
+#[no_mangle]
+pub unsafe extern "C" fn hal_image_processor_render_to_image(
+    processor: *mut HalImageProcessor,
+    dst: *mut HalTensorImage,
+    detections: *const HalDetectBoxList,
+    segmentations: *const HalSegmentationList,
+) -> c_int {
+    check_null!(processor, dst);
+
+    let detect_slice = if detections.is_null() {
+        &[]
+    } else {
+        unsafe { &(*detections).boxes }.as_slice()
+    };
+
+    let seg_slice = if segmentations.is_null() {
+        &[]
+    } else {
+        unsafe { &(*segmentations).masks }.as_slice()
+    };
+
+    try_or_errno!(
+        unsafe { &mut (*processor) }.inner.render_to_image(
+            &mut unsafe { &mut (*dst) }.inner,
+            detect_slice,
+            seg_slice,
+        ),
+        libc::EIO
+    );
+    0
+}
+
+/// Set class colors for segmentation rendering.
+///
+/// Colors are used when rendering segmentation masks via
+/// hal_image_processor_render_to_image(). Each color is an RGBA tuple.
+///
+/// @param processor Image processor handle
+/// @param colors Pointer to array of RGBA color tuples ([u8; 4] per color)
+/// @param num_colors Number of colors in the array
+/// @return 0 on success, -1 on error
+/// @par Errors (errno):
+/// - EINVAL: Invalid argument (NULL processor or colors)
+/// - EIO: Failed to set colors
+#[no_mangle]
+pub unsafe extern "C" fn hal_image_processor_set_class_colors(
+    processor: *mut HalImageProcessor,
+    colors: *const [u8; 4],
+    num_colors: size_t,
+) -> c_int {
+    check_null!(processor, colors);
+
+    if num_colors == 0 {
+        return set_error(libc::EINVAL);
+    }
+
+    let colors_slice = unsafe { std::slice::from_raw_parts(colors, num_colors) };
+
+    try_or_errno!(
+        unsafe { &mut (*processor) }
+            .inner
+            .set_class_colors(colors_slice),
         libc::EIO
     );
     0
@@ -938,6 +1225,282 @@ mod tests {
             assert_eq!(hal_tensor_image_height(std::ptr::null()), 0);
             hal_tensor_image_free(std::ptr::null_mut());
             hal_image_processor_free(std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn test_image_is_planar() {
+        unsafe {
+            let rgb = hal_tensor_image_new(100, 100, HalFourcc::Rgb, HalTensorMemory::Mem);
+            assert!(!rgb.is_null());
+            assert!(!hal_tensor_image_is_planar(rgb));
+            hal_tensor_image_free(rgb);
+
+            let nv12 = hal_tensor_image_new(100, 100, HalFourcc::Nv12, HalTensorMemory::Mem);
+            assert!(!nv12.is_null());
+            assert!(hal_tensor_image_is_planar(nv12));
+            hal_tensor_image_free(nv12);
+
+            let planar = hal_tensor_image_new(100, 100, HalFourcc::PlanarRgb, HalTensorMemory::Mem);
+            assert!(!planar.is_null());
+            assert!(hal_tensor_image_is_planar(planar));
+            hal_tensor_image_free(planar);
+
+            // NULL image returns false
+            assert!(!hal_tensor_image_is_planar(std::ptr::null()));
+        }
+    }
+
+    #[test]
+    fn test_image_channels() {
+        unsafe {
+            let rgb = hal_tensor_image_new(100, 100, HalFourcc::Rgb, HalTensorMemory::Mem);
+            assert!(!rgb.is_null());
+            assert_eq!(hal_tensor_image_channels(rgb), 3);
+            hal_tensor_image_free(rgb);
+
+            let rgba = hal_tensor_image_new(100, 100, HalFourcc::Rgba, HalTensorMemory::Mem);
+            assert!(!rgba.is_null());
+            assert_eq!(hal_tensor_image_channels(rgba), 4);
+            hal_tensor_image_free(rgba);
+
+            let grey = hal_tensor_image_new(100, 100, HalFourcc::Grey, HalTensorMemory::Mem);
+            assert!(!grey.is_null());
+            assert_eq!(hal_tensor_image_channels(grey), 1);
+            hal_tensor_image_free(grey);
+
+            // NULL image returns 0
+            assert_eq!(hal_tensor_image_channels(std::ptr::null()), 0);
+        }
+    }
+
+    #[test]
+    fn test_image_row_stride() {
+        unsafe {
+            let rgb = hal_tensor_image_new(100, 100, HalFourcc::Rgb, HalTensorMemory::Mem);
+            assert!(!rgb.is_null());
+            assert_eq!(hal_tensor_image_row_stride(rgb), 300); // 100 * 3
+            hal_tensor_image_free(rgb);
+
+            let planar = hal_tensor_image_new(100, 100, HalFourcc::PlanarRgb, HalTensorMemory::Mem);
+            assert!(!planar.is_null());
+            assert_eq!(hal_tensor_image_row_stride(planar), 100); // planar: width
+            hal_tensor_image_free(planar);
+
+            // NULL image returns 0
+            assert_eq!(hal_tensor_image_row_stride(std::ptr::null()), 0);
+        }
+    }
+
+    #[test]
+    fn test_image_from_tensor() {
+        use crate::tensor::{hal_tensor_new, HalDtype};
+
+        unsafe {
+            // Create a u8 tensor with shape [100, 100, 3] for RGB
+            let shape: [size_t; 3] = [100, 100, 3];
+            let tensor = hal_tensor_new(
+                HalDtype::U8,
+                shape.as_ptr(),
+                3,
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert!(!tensor.is_null());
+
+            let image = hal_tensor_image_from_tensor(tensor, HalFourcc::Rgb);
+            assert!(!image.is_null());
+            assert_eq!(hal_tensor_image_width(image), 100);
+            assert_eq!(hal_tensor_image_height(image), 100);
+            assert_eq!(hal_tensor_image_fourcc(image), HalFourcc::Rgb);
+            hal_tensor_image_free(image);
+            // tensor is consumed, do NOT free it
+
+            // f32 tensor should fail
+            let shape_f32: [size_t; 3] = [100, 100, 3];
+            let tensor_f32 = hal_tensor_new(
+                HalDtype::F32,
+                shape_f32.as_ptr(),
+                3,
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert!(!tensor_f32.is_null());
+            let image_f32 = hal_tensor_image_from_tensor(tensor_f32, HalFourcc::Rgb);
+            assert!(image_f32.is_null());
+            // tensor_f32 was consumed by the function (even on failure, Box::from_raw took it)
+
+            // NULL tensor should fail
+            let image_null = hal_tensor_image_from_tensor(std::ptr::null_mut(), HalFourcc::Rgb);
+            assert!(image_null.is_null());
+        }
+    }
+
+    #[test]
+    fn test_image_load_jpeg_null() {
+        unsafe {
+            let image =
+                hal_tensor_image_load_jpeg(std::ptr::null(), 100, HalFourcc::Rgb, HalTensorMemory::Mem);
+            assert!(image.is_null());
+
+            let data = [0u8; 10];
+            let image =
+                hal_tensor_image_load_jpeg(data.as_ptr(), 0, HalFourcc::Rgb, HalTensorMemory::Mem);
+            assert!(image.is_null());
+        }
+    }
+
+    #[test]
+    fn test_image_load_png_null() {
+        unsafe {
+            let image =
+                hal_tensor_image_load_png(std::ptr::null(), 100, HalFourcc::Rgb, HalTensorMemory::Mem);
+            assert!(image.is_null());
+
+            let data = [0u8; 10];
+            let image =
+                hal_tensor_image_load_png(data.as_ptr(), 0, HalFourcc::Rgb, HalTensorMemory::Mem);
+            assert!(image.is_null());
+        }
+    }
+
+    #[test]
+    fn test_image_processor_convert_ref_null_params() {
+        use crate::tensor::{hal_tensor_free, hal_tensor_new, HalDtype};
+
+        unsafe {
+            let processor = hal_image_processor_new();
+            if processor.is_null() {
+                return;
+            }
+
+            let src = hal_tensor_image_new(100, 100, HalFourcc::Rgb, HalTensorMemory::Mem);
+            assert!(!src.is_null());
+
+            let shape: [size_t; 3] = [3, 100, 100];
+            let dst_tensor = hal_tensor_new(
+                HalDtype::U8,
+                shape.as_ptr(),
+                3,
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert!(!dst_tensor.is_null());
+
+            // NULL processor
+            assert_eq!(
+                hal_image_processor_convert_ref(
+                    std::ptr::null_mut(),
+                    src,
+                    dst_tensor,
+                    HalFourcc::PlanarRgb,
+                    HalRotation::None,
+                    HalFlip::None,
+                    std::ptr::null()
+                ),
+                -1
+            );
+
+            // NULL src
+            assert_eq!(
+                hal_image_processor_convert_ref(
+                    processor,
+                    std::ptr::null(),
+                    dst_tensor,
+                    HalFourcc::PlanarRgb,
+                    HalRotation::None,
+                    HalFlip::None,
+                    std::ptr::null()
+                ),
+                -1
+            );
+
+            // NULL dst_tensor
+            assert_eq!(
+                hal_image_processor_convert_ref(
+                    processor,
+                    src,
+                    std::ptr::null_mut(),
+                    HalFourcc::PlanarRgb,
+                    HalRotation::None,
+                    HalFlip::None,
+                    std::ptr::null()
+                ),
+                -1
+            );
+
+            hal_tensor_free(dst_tensor);
+            hal_tensor_image_free(src);
+            hal_image_processor_free(processor);
+        }
+    }
+
+    #[test]
+    fn test_image_processor_render_to_image_null_params() {
+        unsafe {
+            let processor = hal_image_processor_new();
+            if processor.is_null() {
+                return;
+            }
+
+            let dst = hal_tensor_image_new(100, 100, HalFourcc::Rgb, HalTensorMemory::Mem);
+            assert!(!dst.is_null());
+
+            // NULL processor
+            assert_eq!(
+                hal_image_processor_render_to_image(
+                    std::ptr::null_mut(),
+                    dst,
+                    std::ptr::null(),
+                    std::ptr::null()
+                ),
+                -1
+            );
+
+            // NULL dst
+            assert_eq!(
+                hal_image_processor_render_to_image(
+                    processor,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null()
+                ),
+                -1
+            );
+
+            hal_tensor_image_free(dst);
+            hal_image_processor_free(processor);
+        }
+    }
+
+    #[test]
+    fn test_image_processor_set_class_colors_null() {
+        unsafe {
+            let processor = hal_image_processor_new();
+            if processor.is_null() {
+                return;
+            }
+
+            // NULL colors
+            assert_eq!(
+                hal_image_processor_set_class_colors(processor, std::ptr::null(), 3),
+                -1
+            );
+
+            // Zero count
+            let colors: [[u8; 4]; 3] = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
+            assert_eq!(
+                hal_image_processor_set_class_colors(processor, colors.as_ptr(), 0),
+                -1
+            );
+
+            // NULL processor
+            assert_eq!(
+                hal_image_processor_set_class_colors(std::ptr::null_mut(), colors.as_ptr(), 3),
+                -1
+            );
+
+            hal_image_processor_free(processor);
         }
     }
 

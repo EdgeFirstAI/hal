@@ -201,7 +201,7 @@ static void test_decoder_null_handling(void) {
     struct hal_detect_box_list* boxes = NULL;
 
     errno = 0;
-    int result = hal_decoder_decode_float(NULL, outputs, 1, &boxes);
+    int result = hal_decoder_decode(NULL, outputs, 1, &boxes, NULL);
     ASSERT_EQ(-1, result);
     ASSERT_ERRNO(EINVAL);
 
@@ -223,7 +223,7 @@ static void test_decoder_decode_invalid_params(void) {
 
     // NULL outputs
     errno = 0;
-    int result = hal_decoder_decode_float(decoder, NULL, 1, &boxes);
+    int result = hal_decoder_decode(decoder, NULL, 1, &boxes, NULL);
     ASSERT_EQ(-1, result);
     ASSERT_ERRNO(EINVAL);
 
@@ -234,18 +234,111 @@ static void test_decoder_decode_invalid_params(void) {
     const struct hal_tensor* outputs[] = {tensor};
 
     errno = 0;
-    result = hal_decoder_decode_float(decoder, outputs, 1, NULL);
+    result = hal_decoder_decode(decoder, outputs, 1, NULL, NULL);
     ASSERT_EQ(-1, result);
     ASSERT_ERRNO(EINVAL);
 
     // Zero outputs
     errno = 0;
-    result = hal_decoder_decode_float(decoder, outputs, 0, &boxes);
+    result = hal_decoder_decode(decoder, outputs, 0, &boxes, NULL);
     ASSERT_EQ(-1, result);
     ASSERT_ERRNO(EINVAL);
 
     hal_tensor_free(tensor);
     hal_decoder_free(decoder);
+    TEST_PASS();
+}
+
+// =============================================================================
+// Decoder Introspection Tests
+// =============================================================================
+
+static void test_decoder_model_type(void) {
+    TEST("decoder_model_type");
+
+    struct hal_decoder_params params = hal_decoder_params_default();
+    params.config_json = YOLO_JSON_CONFIG;
+
+    struct hal_decoder* decoder = hal_decoder_new(&params);
+    ASSERT_NOT_NULL(decoder);
+
+    char* model_type = hal_decoder_model_type(decoder);
+    ASSERT_NOT_NULL(model_type);
+    // Should be a non-empty string
+    ASSERT_TRUE(strlen(model_type) > 0);
+    free(model_type);
+
+    // NULL decoder
+    ASSERT_NULL(hal_decoder_model_type(NULL));
+
+    hal_decoder_free(decoder);
+    TEST_PASS();
+}
+
+static void test_decoder_normalized_boxes(void) {
+    TEST("decoder_normalized_boxes");
+
+    struct hal_decoder_params params = hal_decoder_params_default();
+    params.config_json = YOLO_JSON_CONFIG;
+
+    struct hal_decoder* decoder = hal_decoder_new(&params);
+    ASSERT_NOT_NULL(decoder);
+
+    int result = hal_decoder_normalized_boxes(decoder);
+    // Result is 1, 0, or -1 (unknown)
+    ASSERT_TRUE(result >= -1 && result <= 1);
+
+    // NULL decoder returns -1
+    ASSERT_EQ(-1, hal_decoder_normalized_boxes(NULL));
+
+    hal_decoder_free(decoder);
+    TEST_PASS();
+}
+
+// =============================================================================
+// Dequantize Tests
+// =============================================================================
+
+static void test_dequantize_null_params(void) {
+    TEST("dequantize_null_params");
+
+    size_t shape[] = {2, 3};
+    struct hal_quantization quant = { .scale = 1.0f, .zero_point = 0 };
+
+    struct hal_tensor* output = hal_tensor_new(HAL_DTYPE_F32, shape, 2, HAL_TENSOR_MEMORY_MEM, NULL);
+    ASSERT_NOT_NULL(output);
+
+    // NULL input
+    errno = 0;
+    ASSERT_EQ(-1, hal_dequantize(NULL, quant, output));
+    ASSERT_ERRNO(EINVAL);
+
+    // NULL output
+    struct hal_tensor* input = hal_tensor_new(HAL_DTYPE_U8, shape, 2, HAL_TENSOR_MEMORY_MEM, NULL);
+    ASSERT_NOT_NULL(input);
+
+    errno = 0;
+    ASSERT_EQ(-1, hal_dequantize(input, quant, NULL));
+    ASSERT_ERRNO(EINVAL);
+
+    hal_tensor_free(input);
+    hal_tensor_free(output);
+    TEST_PASS();
+}
+
+// =============================================================================
+// Segmentation to Mask Tests
+// =============================================================================
+
+static void test_segmentation_to_mask_null(void) {
+    TEST("segmentation_to_mask_null");
+
+    // NULL list
+    errno = 0;
+    struct hal_tensor* mask = hal_segmentation_to_mask(NULL, 0);
+    ASSERT_NULL(mask);
+    ASSERT_ERRNO(EINVAL);
+
     TEST_PASS();
 }
 
@@ -275,6 +368,16 @@ void run_decoder_tests(void) {
     // Decoder tests
     test_decoder_null_handling();
     test_decoder_decode_invalid_params();
+
+    // Decoder introspection tests
+    test_decoder_model_type();
+    test_decoder_normalized_boxes();
+
+    // Dequantize tests
+    test_dequantize_null_params();
+
+    // Segmentation to mask tests
+    test_segmentation_to_mask_null();
 }
 
 #ifdef TEST_DECODER_STANDALONE

@@ -6,13 +6,14 @@
 //! This module provides functions for decoding YOLO and ModelPack model outputs
 //! into detection boxes and segmentation masks.
 
-use crate::error::set_error;
+use crate::error::{set_error, set_error_null, str_to_c_string};
 use crate::tensor::HalTensor;
 use crate::{check_null, check_null_ret_null, try_or_errno, try_or_null};
 use edgefirst_decoder::{
-    configs::Nms, Decoder, DecoderBuilder, DetectBox, Quantization, Segmentation,
+    configs::Nms, dequantize_cpu_chunked, segmentation_to_mask, ArrayViewDQuantized, Decoder,
+    DecoderBuilder, DetectBox, Quantization, Segmentation,
 };
-use edgefirst_tensor::{TensorMapTrait, TensorTrait};
+use edgefirst_tensor::{Tensor, TensorMapTrait, TensorMemory, TensorTrait};
 use libc::{c_char, c_int, size_t};
 use ndarray::ArrayViewD;
 use std::ffi::CStr;
@@ -255,7 +256,7 @@ pub struct HalDetectBoxList {
 
 /// List of segmentation results.
 pub struct HalSegmentationList {
-    masks: Vec<Segmentation>,
+    pub(crate) masks: Vec<Segmentation>,
 }
 
 // ============================================================================
@@ -303,7 +304,7 @@ pub extern "C" fn hal_decoder_params_default() -> HalDecoderParams {
 /// Create a new decoder from parameters.
 ///
 /// Validates the parameters and constructs a decoder ready for use with
-/// `hal_decoder_decode_float()`. Exactly one of `params->config_json`,
+/// `hal_decoder_decode()`. Exactly one of `params->config_json`,
 /// `params->config_yaml`, or `params->config_file` must be non-NULL.
 ///
 /// All strings are copied internally; the caller may free their buffers
@@ -333,12 +334,12 @@ pub extern "C" fn hal_decoder_params_default() -> HalDecoderParams {
 ///     return -1;
 /// }
 ///
-/// // ... use decoder with hal_decoder_decode_float() ...
+/// // ... use decoder with hal_decoder_decode() ...
 ///
 /// hal_decoder_free(decoder);
 /// @endcode
 ///
-/// @see hal_decoder_params_default, hal_decoder_free, hal_decoder_decode_float
+/// @see hal_decoder_params_default, hal_decoder_free, hal_decoder_decode
 #[no_mangle]
 pub unsafe extern "C" fn hal_decoder_new(params: *const HalDecoderParams) -> *mut HalDecoder {
     check_null_ret_null!(params);
@@ -416,24 +417,30 @@ pub unsafe extern "C" fn hal_decoder_new(params: *const HalDecoderParams) -> *mu
 // Decoder Functions
 // ============================================================================
 
-/// Decode model outputs into detection boxes.
+/// Decode model outputs into detection boxes and segmentation masks.
 ///
-/// This is a simplified API for detection-only models with float outputs.
+/// Automatically selects the decoding path based on tensor dtype:
+/// - f32 tensors → `decode_float` path
+/// - Integer tensors (u8, i8, u16, i16, u32, i32) → `decode_quantized` path
+///
+/// All output tensors must be the same general category (all float or all integer).
 ///
 /// @param decoder Decoder handle
 /// @param outputs Array of output tensor pointers
 /// @param num_outputs Number of output tensors
 /// @param out_boxes Output parameter for detection box list (caller must free)
+/// @param out_segmentations Output parameter for segmentation list (can be NULL; caller must free if non-NULL)
 /// @return 0 on success, -1 on error
 /// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL decoder/outputs/out_boxes)
+/// - EINVAL: Invalid argument (NULL decoder/outputs/out_boxes, mixed dtypes)
 /// - EIO: Decoding failed
 #[no_mangle]
-pub unsafe extern "C" fn hal_decoder_decode_float(
+pub unsafe extern "C" fn hal_decoder_decode(
     decoder: *const HalDecoder,
     outputs: *const *const HalTensor,
     num_outputs: size_t,
     out_boxes: *mut *mut HalDetectBoxList,
+    out_segmentations: *mut *mut HalSegmentationList,
 ) -> c_int {
     check_null!(decoder, outputs, out_boxes);
 
@@ -443,50 +450,374 @@ pub unsafe extern "C" fn hal_decoder_decode_float(
 
     let outputs_slice = std::slice::from_raw_parts(outputs, num_outputs);
 
-    // First, collect all tensor maps to keep them alive
-    let mut maps = Vec::with_capacity(num_outputs);
-    for &tensor_ptr in outputs_slice {
-        if tensor_ptr.is_null() {
-            return set_error(libc::EINVAL);
-        }
-
-        let tensor = &*tensor_ptr;
-
-        // Only handle f32 tensors for this API
-        match tensor {
-            HalTensor::F32(t) => {
-                let map = try_or_errno!(t.map(), libc::EIO);
-                maps.push(map);
-            }
-            _ => return set_error(libc::EINVAL),
-        }
+    // Check the first tensor to determine the decode path
+    if outputs_slice[0].is_null() {
+        return set_error(libc::EINVAL);
     }
+    let is_float = matches!(unsafe { &*outputs_slice[0] }, HalTensor::F32(_));
 
-    // Now build views from the maps (maps remain alive)
-    let mut views: Vec<ArrayViewD<'_, f32>> = Vec::with_capacity(num_outputs);
-    for map in &maps {
-        let shape = map.shape().to_vec();
-        let slice = map.as_slice();
-        let view = try_or_errno!(
-            ArrayViewD::from_shape(shape.as_slice(), slice),
-            libc::EINVAL
-        );
-        views.push(view);
-    }
-
-    // Decode
     let mut boxes: Vec<DetectBox> = Vec::with_capacity(100);
     let mut masks: Vec<Segmentation> = Vec::new();
 
-    try_or_errno!(
-        (*decoder)
-            .inner
-            .decode_float(&views, &mut boxes, &mut masks),
-        libc::EIO
-    );
+    if is_float {
+        // Float decode path: collect f32 tensor maps
+        let mut maps = Vec::with_capacity(num_outputs);
+        for &tensor_ptr in outputs_slice {
+            if tensor_ptr.is_null() {
+                return set_error(libc::EINVAL);
+            }
+            match unsafe { &*tensor_ptr } {
+                HalTensor::F32(t) => {
+                    let map = try_or_errno!(t.map(), libc::EIO);
+                    maps.push(map);
+                }
+                _ => return set_error(libc::EINVAL), // Mixed dtypes
+            }
+        }
+
+        let mut views: Vec<ArrayViewD<'_, f32>> = Vec::with_capacity(num_outputs);
+        for map in &maps {
+            let shape = map.shape().to_vec();
+            let slice = map.as_slice();
+            let view = try_or_errno!(
+                ArrayViewD::from_shape(shape.as_slice(), slice),
+                libc::EINVAL
+            );
+            views.push(view);
+        }
+
+        try_or_errno!(
+            (*decoder)
+                .inner
+                .decode_float(&views, &mut boxes, &mut masks),
+            libc::EIO
+        );
+    } else {
+        // Quantized decode path: map each tensor to ArrayViewDQuantized
+        // We need to keep the maps alive while building views
+        if let Err(rc) = decode_quantized_inner(
+            &(*decoder).inner,
+            outputs_slice,
+            &mut boxes,
+            &mut masks,
+        ) {
+            return rc;
+        }
+    }
 
     *out_boxes = Box::into_raw(Box::new(HalDetectBoxList { boxes }));
+
+    if !out_segmentations.is_null() {
+        *out_segmentations = Box::into_raw(Box::new(HalSegmentationList { masks }));
+    }
+
     0
+}
+
+/// Inner helper for quantized decode to manage lifetimes.
+///
+/// Returns Ok(()) on success or Err(-1) with errno set.
+unsafe fn decode_quantized_inner(
+    decoder: &Decoder,
+    outputs_slice: &[*const HalTensor],
+    boxes: &mut Vec<DetectBox>,
+    masks: &mut Vec<Segmentation>,
+) -> Result<(), c_int> {
+    // We use enum dispatch to collect maps of appropriate types
+    // Each tensor could be u8, i8, u16, i16, u32, or i32
+    enum TypedMap {
+        U8(edgefirst_tensor::TensorMap<u8>),
+        I8(edgefirst_tensor::TensorMap<i8>),
+        U16(edgefirst_tensor::TensorMap<u16>),
+        I16(edgefirst_tensor::TensorMap<i16>),
+        U32(edgefirst_tensor::TensorMap<u32>),
+        I32(edgefirst_tensor::TensorMap<i32>),
+    }
+
+    let num_outputs = outputs_slice.len();
+    let mut typed_maps: Vec<TypedMap> = Vec::with_capacity(num_outputs);
+
+    for &tensor_ptr in outputs_slice {
+        if tensor_ptr.is_null() {
+            set_error(libc::EINVAL);
+            return Err(-1);
+        }
+        let map = match unsafe { &*tensor_ptr } {
+            HalTensor::U8(t) => match t.map() {
+                Ok(m) => TypedMap::U8(m),
+                Err(_) => {
+                    set_error(libc::EIO);
+                    return Err(-1);
+                }
+            },
+            HalTensor::I8(t) => match t.map() {
+                Ok(m) => TypedMap::I8(m),
+                Err(_) => {
+                    set_error(libc::EIO);
+                    return Err(-1);
+                }
+            },
+            HalTensor::U16(t) => match t.map() {
+                Ok(m) => TypedMap::U16(m),
+                Err(_) => {
+                    set_error(libc::EIO);
+                    return Err(-1);
+                }
+            },
+            HalTensor::I16(t) => match t.map() {
+                Ok(m) => TypedMap::I16(m),
+                Err(_) => {
+                    set_error(libc::EIO);
+                    return Err(-1);
+                }
+            },
+            HalTensor::U32(t) => match t.map() {
+                Ok(m) => TypedMap::U32(m),
+                Err(_) => {
+                    set_error(libc::EIO);
+                    return Err(-1);
+                }
+            },
+            HalTensor::I32(t) => match t.map() {
+                Ok(m) => TypedMap::I32(m),
+                Err(_) => {
+                    set_error(libc::EIO);
+                    return Err(-1);
+                }
+            },
+            _ => {
+                // f32/f64/u64/i64 not supported in quantized path
+                set_error(libc::EINVAL);
+                return Err(-1);
+            }
+        };
+        typed_maps.push(map);
+    }
+
+    // Build ArrayViewDQuantized from the maps
+    let mut views: Vec<ArrayViewDQuantized<'_>> = Vec::with_capacity(num_outputs);
+    for typed_map in &typed_maps {
+        let view = match typed_map {
+            TypedMap::U8(m) => {
+                let shape = m.shape().to_vec();
+                let v = ArrayViewD::from_shape(shape.as_slice(), m.as_slice()).map_err(|_| {
+                    set_error(libc::EINVAL);
+                    -1
+                })?;
+                ArrayViewDQuantized::from(v)
+            }
+            TypedMap::I8(m) => {
+                let shape = m.shape().to_vec();
+                let v = ArrayViewD::from_shape(shape.as_slice(), m.as_slice()).map_err(|_| {
+                    set_error(libc::EINVAL);
+                    -1
+                })?;
+                ArrayViewDQuantized::from(v)
+            }
+            TypedMap::U16(m) => {
+                let shape = m.shape().to_vec();
+                let v = ArrayViewD::from_shape(shape.as_slice(), m.as_slice()).map_err(|_| {
+                    set_error(libc::EINVAL);
+                    -1
+                })?;
+                ArrayViewDQuantized::from(v)
+            }
+            TypedMap::I16(m) => {
+                let shape = m.shape().to_vec();
+                let v = ArrayViewD::from_shape(shape.as_slice(), m.as_slice()).map_err(|_| {
+                    set_error(libc::EINVAL);
+                    -1
+                })?;
+                ArrayViewDQuantized::from(v)
+            }
+            TypedMap::U32(m) => {
+                let shape = m.shape().to_vec();
+                let v = ArrayViewD::from_shape(shape.as_slice(), m.as_slice()).map_err(|_| {
+                    set_error(libc::EINVAL);
+                    -1
+                })?;
+                ArrayViewDQuantized::from(v)
+            }
+            TypedMap::I32(m) => {
+                let shape = m.shape().to_vec();
+                let v = ArrayViewD::from_shape(shape.as_slice(), m.as_slice()).map_err(|_| {
+                    set_error(libc::EINVAL);
+                    -1
+                })?;
+                ArrayViewDQuantized::from(v)
+            }
+        };
+        views.push(view);
+    }
+
+    decoder
+        .decode_quantized(&views, boxes, masks)
+        .map_err(|_| {
+            set_error(libc::EIO);
+            -1
+        })
+}
+
+/// Get the model type string from a decoder.
+///
+/// Returns a human-readable string identifying the model type (e.g., "yolo_det",
+/// "modelpack_segdet"). The returned string is owned by the caller and must be
+/// freed with free().
+///
+/// @param decoder Decoder handle
+/// @return Newly allocated C string with model type, or NULL on error
+/// @par Errors (errno):
+/// - EINVAL: NULL decoder
+#[no_mangle]
+pub unsafe extern "C" fn hal_decoder_model_type(decoder: *const HalDecoder) -> *mut c_char {
+    if decoder.is_null() {
+        return set_error_null(libc::EINVAL);
+    }
+
+    let model_type = unsafe { &(*decoder) }.inner.model_type();
+    let type_str = format!("{:?}", model_type);
+
+    // Convert the Debug representation to a snake_case identifier
+    let name = type_str
+        .split_once('{')
+        .or_else(|| type_str.split_once(' '))
+        .map(|(name, _)| name.trim())
+        .unwrap_or(&type_str);
+
+    // Convert CamelCase to snake_case
+    let mut snake = String::new();
+    for (i, ch) in name.chars().enumerate() {
+        if ch.is_uppercase() && i > 0 {
+            snake.push('_');
+        }
+        snake.push(ch.to_lowercase().next().unwrap_or(ch));
+    }
+
+    str_to_c_string(&snake)
+}
+
+/// Get whether the decoder produces normalized box coordinates.
+///
+/// @param decoder Decoder handle
+/// @return 1 if boxes are in normalized [0,1] coordinates,
+///         0 if boxes are in pixel coordinates,
+///        -1 if unknown or decoder is NULL
+#[no_mangle]
+pub unsafe extern "C" fn hal_decoder_normalized_boxes(decoder: *const HalDecoder) -> c_int {
+    if decoder.is_null() {
+        return -1;
+    }
+
+    match unsafe { &(*decoder) }.inner.normalized_boxes() {
+        Some(true) => 1,
+        Some(false) => 0,
+        None => -1,
+    }
+}
+
+/// Dequantize an integer tensor into a float tensor.
+///
+/// Converts quantized integer data to float using: output = (input - zero_point) * scale.
+/// The input tensor must be an integer dtype (u8, i8, u16, i16, u32, i32).
+/// The output tensor must be f32 dtype and have the same total number of elements.
+///
+/// @param input Input integer tensor (not consumed)
+/// @param quant Quantization parameters (scale and zero_point)
+/// @param output Output f32 tensor (must be pre-allocated with same element count)
+/// @return 0 on success, -1 on error
+/// @par Errors (errno):
+/// - EINVAL: NULL input/output, input is not integer, output is not f32, size mismatch
+/// - EIO: Failed to map tensors
+#[no_mangle]
+pub unsafe extern "C" fn hal_dequantize(
+    input: *const HalTensor,
+    quant: HalQuantization,
+    output: *mut HalTensor,
+) -> c_int {
+    check_null!(input, output);
+
+    let quant_rust: Quantization = quant.into();
+
+    // Output must be f32
+    let output_tensor = match unsafe { &mut *output } {
+        HalTensor::F32(t) => t,
+        _ => return set_error(libc::EINVAL),
+    };
+    let mut out_map = try_or_errno!(output_tensor.map(), libc::EIO);
+
+    macro_rules! dequantize_typed {
+        ($t:expr) => {{
+            let in_map = try_or_errno!($t.map(), libc::EIO);
+            let in_slice = in_map.as_slice();
+            let out_slice = out_map.as_mut_slice();
+            if in_slice.len() != out_slice.len() {
+                return set_error(libc::EINVAL);
+            }
+            dequantize_cpu_chunked(in_slice, quant_rust, out_slice);
+        }};
+    }
+
+    match unsafe { &*input } {
+        HalTensor::U8(t) => dequantize_typed!(t),
+        HalTensor::I8(t) => dequantize_typed!(t),
+        HalTensor::U16(t) => dequantize_typed!(t),
+        HalTensor::I16(t) => dequantize_typed!(t),
+        HalTensor::U32(t) => dequantize_typed!(t),
+        HalTensor::I32(t) => dequantize_typed!(t),
+        _ => return set_error(libc::EINVAL), // f32/f64/u64/i64 not supported
+    }
+
+    out_map.unmap();
+    0
+}
+
+/// Convert a 3D segmentation mask into a 2D binary mask tensor.
+///
+/// Takes a segmentation from a segmentation list by index and converts it
+/// to a 2D binary mask (height x width) as a new u8 tensor.
+/// If the segmentation has depth=1, values >= 128 become 1, < 128 become 0.
+/// If depth > 1, argmax across the depth dimension is used.
+///
+/// @param list Segmentation list handle
+/// @param index Index of the segmentation (0-based)
+/// @return New u8 tensor with shape [height, width], or NULL on error
+/// @par Errors (errno):
+/// - EINVAL: NULL list, index out of bounds, or invalid segmentation shape
+/// - ENOMEM: Memory allocation failed
+#[no_mangle]
+pub unsafe extern "C" fn hal_segmentation_to_mask(
+    list: *const HalSegmentationList,
+    index: size_t,
+) -> *mut HalTensor {
+    if list.is_null() {
+        return set_error_null(libc::EINVAL);
+    }
+
+    if index >= unsafe { &*list }.masks.len() {
+        return set_error_null(libc::EINVAL);
+    }
+
+    let seg = &unsafe { &*list }.masks[index];
+    let mask_2d = try_or_null!(
+        segmentation_to_mask(seg.segmentation.view()),
+        libc::EINVAL
+    );
+
+    let shape = mask_2d.shape();
+    let h = shape[0];
+    let w = shape[1];
+
+    // Create a new u8 tensor and copy the mask data into it
+    let tensor = match Tensor::<u8>::new(&[h, w], Some(TensorMemory::Mem), None) {
+        Ok(t) => t,
+        Err(_) => return set_error_null(libc::ENOMEM),
+    };
+
+    let mut map = try_or_null!(tensor.map(), libc::EIO);
+    map.as_mut_slice().copy_from_slice(mask_2d.as_slice().unwrap());
+    map.unmap();
+
+    Box::into_raw(Box::new(HalTensor::U8(tensor)))
 }
 
 /// Free a decoder.
@@ -822,7 +1153,7 @@ nms: class_aware
     }
 
     #[test]
-    fn test_decode_float_null_parameters() {
+    fn test_decode_null_parameters() {
         unsafe {
             let decoder = make_decoder_json(YOLO_JSON_CONFIG);
             assert!(!decoder.is_null());
@@ -842,58 +1173,31 @@ nms: class_aware
 
             // NULL decoder
             assert_eq!(
-                hal_decoder_decode_float(
+                hal_decoder_decode(
                     std::ptr::null(),
                     outputs.as_ptr(),
                     1,
-                    &mut boxes as *mut _
+                    &mut boxes as *mut _,
+                    std::ptr::null_mut(),
                 ),
                 -1
             );
 
             // NULL outputs
             assert_eq!(
-                hal_decoder_decode_float(decoder, std::ptr::null(), 1, &mut boxes as *mut _),
+                hal_decoder_decode(decoder, std::ptr::null(), 1, &mut boxes as *mut _, std::ptr::null_mut()),
                 -1
             );
 
             // NULL out_boxes
             assert_eq!(
-                hal_decoder_decode_float(decoder, outputs.as_ptr(), 1, std::ptr::null_mut()),
+                hal_decoder_decode(decoder, outputs.as_ptr(), 1, std::ptr::null_mut(), std::ptr::null_mut()),
                 -1
             );
 
             // Zero num_outputs
             assert_eq!(
-                hal_decoder_decode_float(decoder, outputs.as_ptr(), 0, &mut boxes as *mut _),
-                -1
-            );
-
-            hal_tensor_free(tensor);
-            hal_decoder_free(decoder);
-        }
-    }
-
-    #[test]
-    fn test_decode_float_wrong_dtype() {
-        unsafe {
-            let decoder = make_decoder_json(YOLO_JSON_CONFIG);
-            assert!(!decoder.is_null());
-
-            let shape: [usize; 3] = [1, 84, 8400];
-            let tensor = hal_tensor_new(
-                HalDtype::U8,
-                shape.as_ptr(),
-                3,
-                HalTensorMemory::Mem,
-                std::ptr::null(),
-            );
-            assert!(!tensor.is_null());
-            let outputs = [tensor as *const HalTensor];
-            let mut boxes: *mut HalDetectBoxList = std::ptr::null_mut();
-
-            assert_eq!(
-                hal_decoder_decode_float(decoder, outputs.as_ptr(), 1, &mut boxes as *mut _),
+                hal_decoder_decode(decoder, outputs.as_ptr(), 0, &mut boxes as *mut _, std::ptr::null_mut()),
                 -1
             );
 
@@ -945,11 +1249,13 @@ nms: class_aware
 
             let outputs = [tensor as *const HalTensor];
             let mut boxes: *mut HalDetectBoxList = std::ptr::null_mut();
+            let mut segs: *mut HalSegmentationList = std::ptr::null_mut();
 
             let result =
-                hal_decoder_decode_float(decoder, outputs.as_ptr(), 1, &mut boxes as *mut _);
+                hal_decoder_decode(decoder, outputs.as_ptr(), 1, &mut boxes as *mut _, &mut segs as *mut _);
             assert_eq!(result, 0);
             assert!(!boxes.is_null());
+            assert!(!segs.is_null());
 
             let len = hal_detect_box_list_len(boxes);
 
@@ -978,8 +1284,209 @@ nms: class_aware
             assert_eq!(hal_detect_box_list_get(boxes, len, &mut box_out), -1);
 
             hal_detect_box_list_free(boxes);
+            hal_segmentation_list_free(segs);
             hal_tensor_free(tensor);
             hal_decoder_free(decoder);
+        }
+    }
+
+    #[test]
+    fn test_decoder_model_type() {
+        unsafe {
+            let decoder = make_decoder_json(YOLO_JSON_CONFIG);
+            assert!(!decoder.is_null());
+
+            let model_type = hal_decoder_model_type(decoder);
+            assert!(!model_type.is_null());
+
+            let type_str = std::ffi::CStr::from_ptr(model_type).to_str().unwrap();
+            assert!(!type_str.is_empty());
+
+            libc::free(model_type as *mut libc::c_void);
+
+            // NULL decoder
+            assert!(hal_decoder_model_type(std::ptr::null()).is_null());
+
+            hal_decoder_free(decoder);
+        }
+    }
+
+    #[test]
+    fn test_decoder_normalized_boxes() {
+        unsafe {
+            let decoder = make_decoder_json(YOLO_JSON_CONFIG);
+            assert!(!decoder.is_null());
+
+            // YOLO config without explicit normalized field returns -1 (unknown)
+            let result = hal_decoder_normalized_boxes(decoder);
+            assert!(result == -1 || result == 0 || result == 1);
+
+            // NULL decoder returns -1
+            assert_eq!(hal_decoder_normalized_boxes(std::ptr::null()), -1);
+
+            hal_decoder_free(decoder);
+        }
+    }
+
+    #[test]
+    fn test_dequantize() {
+        unsafe {
+            // Create u8 input tensor
+            let shape: [usize; 2] = [2, 3];
+            let input = hal_tensor_new(
+                HalDtype::U8,
+                shape.as_ptr(),
+                2,
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert!(!input.is_null());
+
+            // Fill with values
+            let map = hal_tensor_map_create(input);
+            assert!(!map.is_null());
+            let data = hal_tensor_map_data(map) as *mut u8;
+            for i in 0..6 {
+                *data.add(i) = (i as u8) + 128;
+            }
+            hal_tensor_map_unmap(map);
+
+            // Create f32 output tensor
+            let output = hal_tensor_new(
+                HalDtype::F32,
+                shape.as_ptr(),
+                2,
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert!(!output.is_null());
+
+            let quant = HalQuantization {
+                scale: 0.5,
+                zero_point: 128,
+            };
+            let result = hal_dequantize(input, quant, output);
+            assert_eq!(result, 0);
+
+            // Verify: output[0] = (128 - 128) * 0.5 = 0.0
+            let map = hal_tensor_map_create(output);
+            let out_data = hal_tensor_map_data(map) as *const f32;
+            assert!((*out_data - 0.0).abs() < 1e-6);
+            // output[1] = (129 - 128) * 0.5 = 0.5
+            assert!((*out_data.add(1) - 0.5).abs() < 1e-6);
+            hal_tensor_map_unmap(map);
+
+            // NULL input
+            assert_eq!(
+                hal_dequantize(std::ptr::null(), quant, output),
+                -1
+            );
+
+            // NULL output
+            assert_eq!(
+                hal_dequantize(input, quant, std::ptr::null_mut()),
+                -1
+            );
+
+            hal_tensor_free(input);
+            hal_tensor_free(output);
+        }
+    }
+
+    #[test]
+    fn test_dequantize_wrong_dtypes() {
+        unsafe {
+            let shape: [usize; 2] = [2, 3];
+            let quant = HalQuantization {
+                scale: 1.0,
+                zero_point: 0,
+            };
+
+            // f32 input should fail
+            let f32_input = hal_tensor_new(
+                HalDtype::F32,
+                shape.as_ptr(),
+                2,
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            let f32_output = hal_tensor_new(
+                HalDtype::F32,
+                shape.as_ptr(),
+                2,
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert_eq!(hal_dequantize(f32_input, quant, f32_output), -1);
+
+            // u8 input, u8 output (output must be f32)
+            let u8_input = hal_tensor_new(
+                HalDtype::U8,
+                shape.as_ptr(),
+                2,
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            let u8_output = hal_tensor_new(
+                HalDtype::U8,
+                shape.as_ptr(),
+                2,
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert_eq!(hal_dequantize(u8_input, quant, u8_output), -1);
+
+            hal_tensor_free(f32_input);
+            hal_tensor_free(f32_output);
+            hal_tensor_free(u8_input);
+            hal_tensor_free(u8_output);
+        }
+    }
+
+    #[test]
+    fn test_segmentation_to_mask() {
+        unsafe {
+            // Create a segmentation list with a simple mask
+            let mut mask_data = ndarray::Array3::<u8>::zeros((10, 10, 1));
+            // Set some pixels above threshold
+            mask_data[[0, 0, 0]] = 200;
+            mask_data[[1, 1, 0]] = 255;
+            mask_data[[2, 2, 0]] = 50; // below threshold
+
+            let seg = Segmentation {
+                xmin: 0.1,
+                ymin: 0.2,
+                xmax: 0.3,
+                ymax: 0.4,
+                segmentation: mask_data,
+            };
+
+            let list = Box::into_raw(Box::new(HalSegmentationList { masks: vec![seg] }));
+
+            let mask_tensor = hal_segmentation_to_mask(list, 0);
+            assert!(!mask_tensor.is_null());
+
+            // Check shape is 2D [10, 10]
+            let mut ndim: size_t = 0;
+            let shape_ptr = crate::tensor::hal_tensor_shape(mask_tensor, &mut ndim);
+            assert_eq!(ndim, 2);
+            assert_eq!(*shape_ptr, 10);
+            assert_eq!(*shape_ptr.add(1), 10);
+
+            // Check dtype is u8
+            assert_eq!(crate::tensor::hal_tensor_dtype(mask_tensor), HalDtype::U8);
+
+            crate::tensor::hal_tensor_free(mask_tensor);
+
+            // Out-of-bounds index
+            let null_mask = hal_segmentation_to_mask(list, 1);
+            assert!(null_mask.is_null());
+
+            // NULL list
+            let null_mask = hal_segmentation_to_mask(std::ptr::null(), 0);
+            assert!(null_mask.is_null());
+
+            hal_segmentation_list_free(list);
         }
     }
 
@@ -1127,7 +1634,7 @@ nms: class_aware
             let mut boxes: *mut HalDetectBoxList = std::ptr::null_mut();
 
             assert_eq!(
-                hal_decoder_decode_float(decoder, outputs.as_ptr(), 1, &mut boxes as *mut _),
+                hal_decoder_decode(decoder, outputs.as_ptr(), 1, &mut boxes as *mut _, std::ptr::null_mut()),
                 -1
             );
 

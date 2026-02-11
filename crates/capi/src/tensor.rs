@@ -183,6 +183,33 @@ macro_rules! dispatch_map {
 }
 
 // ============================================================================
+// Memory Availability Functions
+// ============================================================================
+
+/// Check if DMA (Direct Memory Access) buffer allocation is available.
+///
+/// DMA buffers enable zero-copy data sharing between CPU and hardware
+/// accelerators. This is only available on Linux systems with DMA-BUF heap
+/// support.
+///
+/// @return true if DMA allocation is available, false otherwise
+#[no_mangle]
+pub extern "C" fn hal_is_dma_available() -> bool {
+    edgefirst_tensor::is_dma_available()
+}
+
+/// Check if POSIX shared memory allocation is available.
+///
+/// Shared memory enables zero-copy IPC between processes. This is available
+/// on Unix systems (Linux, macOS, BSD).
+///
+/// @return true if shared memory allocation is available, false otherwise
+#[no_mangle]
+pub extern "C" fn hal_is_shm_available() -> bool {
+    edgefirst_tensor::is_shm_available()
+}
+
+// ============================================================================
 // Tensor Lifecycle Functions
 // ============================================================================
 
@@ -1089,6 +1116,18 @@ mod tests {
         // Test From<TensorMemory> for HalTensorMemory
         let hal_mem: HalTensorMemory = TensorMemory::Mem.into();
         assert_eq!(hal_mem, HalTensorMemory::Mem);
+    }
+
+    #[test]
+    fn test_is_dma_available() {
+        // Just ensure it doesn't crash and returns a bool
+        let _available = hal_is_dma_available();
+    }
+
+    #[test]
+    fn test_is_shm_available() {
+        // Just ensure it doesn't crash and returns a bool
+        let _available = hal_is_shm_available();
     }
 
     #[cfg(unix)]
