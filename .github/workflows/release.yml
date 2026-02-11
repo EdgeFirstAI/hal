@@ -56,8 +56,13 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install maturin
+      - name: Install maturin (Linux)
+        if: runner.os == 'Linux'
         run: pip install maturin[patchelf,zig]
+
+      - name: Install maturin (Windows/macOS)
+        if: runner.os != 'Linux'
+        run: pip install maturin
 
       - name: Build wheels (Linux with manylinux2014)
         if: runner.os == 'Linux'
