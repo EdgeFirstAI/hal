@@ -436,6 +436,20 @@ typedef struct hal_decoder_params {
 } hal_decoder_params;
 
 /**
+ * Quantization parameters for dequantizing tensor data.
+ */
+typedef struct hal_quantization {
+  /**
+   * Scale factor for dequantization
+   */
+  float scale;
+  /**
+   * Zero point for dequantization
+   */
+  int32_t zero_point;
+} hal_quantization;
+
+/**
  * Detection box result.
  */
 typedef struct hal_detect_box {
@@ -579,7 +593,7 @@ struct hal_decoder_params hal_decoder_params_default(void);
  * Create a new decoder from parameters.
  *
  * Validates the parameters and constructs a decoder ready for use with
- * `hal_decoder_decode_float()`. Exactly one of `params->config_json`,
+ * `hal_decoder_decode()`. Exactly one of `params->config_json`,
  * `params->config_yaml`, or `params->config_file` must be non-NULL.
  *
  * All strings are copied internally; the caller may free their buffers
@@ -609,33 +623,99 @@ struct hal_decoder_params hal_decoder_params_default(void);
  *     return -1;
  * }
  *
- * // ... use decoder with hal_decoder_decode_float() ...
+ * // ... use decoder with hal_decoder_decode() ...
  *
  * hal_decoder_free(decoder);
  * @endcode
  *
- * @see hal_decoder_params_default, hal_decoder_free, hal_decoder_decode_float
+ * @see hal_decoder_params_default, hal_decoder_free, hal_decoder_decode
  */
 struct hal_decoder *hal_decoder_new(const struct hal_decoder_params *params);
 
 /**
- * Decode model outputs into detection boxes.
+ * Decode model outputs into detection boxes and segmentation masks.
  *
- * This is a simplified API for detection-only models with float outputs.
+ * Automatically selects the decoding path based on tensor dtype:
+ * - f32 tensors → `decode_float` path
+ * - Integer tensors (u8, i8, u16, i16, u32, i32) → `decode_quantized` path
+ *
+ * All output tensors must be the same general category (all float or all integer).
  *
  * @param decoder Decoder handle
  * @param outputs Array of output tensor pointers
  * @param num_outputs Number of output tensors
  * @param out_boxes Output parameter for detection box list (caller must free)
+ * @param out_segmentations Output parameter for segmentation list (can be NULL; caller must free if non-NULL)
  * @return 0 on success, -1 on error
  * @par Errors (errno):
- * - EINVAL: Invalid argument (NULL decoder/outputs/out_boxes)
+ * - EINVAL: Invalid argument (NULL decoder/outputs/out_boxes, mixed dtypes)
  * - EIO: Decoding failed
  */
-int hal_decoder_decode_float(const struct hal_decoder *decoder,
-                             const struct hal_tensor *const *outputs,
-                             size_t num_outputs,
-                             struct hal_detect_box_list **out_boxes);
+int hal_decoder_decode(const struct hal_decoder *decoder,
+                       const struct hal_tensor *const *outputs,
+                       size_t num_outputs,
+                       struct hal_detect_box_list **out_boxes,
+                       struct hal_segmentation_list **out_segmentations);
+
+/**
+ * Get the model type string from a decoder.
+ *
+ * Returns a human-readable string identifying the model type (e.g., "yolo_det",
+ * "modelpack_segdet"). The returned string is owned by the caller and must be
+ * freed with free().
+ *
+ * @param decoder Decoder handle
+ * @return Newly allocated C string with model type, or NULL on error
+ * @par Errors (errno):
+ * - EINVAL: NULL decoder
+ */
+char *hal_decoder_model_type(const struct hal_decoder *decoder);
+
+/**
+ * Get whether the decoder produces normalized box coordinates.
+ *
+ * @param decoder Decoder handle
+ * @return 1 if boxes are in normalized [0,1] coordinates,
+ *         0 if boxes are in pixel coordinates,
+ *        -1 if unknown or decoder is NULL
+ */
+int hal_decoder_normalized_boxes(const struct hal_decoder *decoder);
+
+/**
+ * Dequantize an integer tensor into a float tensor.
+ *
+ * Converts quantized integer data to float using: output = (input - zero_point) * scale.
+ * The input tensor must be an integer dtype (u8, i8, u16, i16, u32, i32).
+ * The output tensor must be f32 dtype and have the same total number of elements.
+ *
+ * @param input Input integer tensor (not consumed)
+ * @param quant Quantization parameters (scale and zero_point)
+ * @param output Output f32 tensor (must be pre-allocated with same element count)
+ * @return 0 on success, -1 on error
+ * @par Errors (errno):
+ * - EINVAL: NULL input/output, input is not integer, output is not f32, size mismatch
+ * - EIO: Failed to map tensors
+ */
+int hal_dequantize(const struct hal_tensor *input,
+                   struct hal_quantization quant,
+                   struct hal_tensor *output);
+
+/**
+ * Convert a 3D segmentation mask into a 2D binary mask tensor.
+ *
+ * Takes a segmentation from a segmentation list by index and converts it
+ * to a 2D binary mask (height x width) as a new u8 tensor.
+ * If the segmentation has depth=1, values >= 128 become 1, < 128 become 0.
+ * If depth > 1, argmax across the depth dimension is used.
+ *
+ * @param list Segmentation list handle
+ * @param index Index of the segmentation (0-based)
+ * @return New u8 tensor with shape [height, width], or NULL on error
+ * @par Errors (errno):
+ * - EINVAL: NULL list, index out of bounds, or invalid segmentation shape
+ * - ENOMEM: Memory allocation failed
+ */
+struct hal_tensor *hal_segmentation_to_mask(const struct hal_segmentation_list *list, size_t index);
 
 /**
  * Free a decoder.
@@ -826,6 +906,57 @@ struct hal_tensor_image *hal_tensor_image_load_file(const char *path,
                                                     enum hal_tensor_memory memory);
 
 /**
+ * Create a tensor image from an existing u8 tensor.
+ *
+ * Takes ownership of the tensor. The tensor must be u8 dtype with a 3D shape
+ * matching the specified pixel format.
+ *
+ * @param tensor u8 tensor to take ownership of (must not be used after this call)
+ * @param fourcc Pixel format describing the tensor layout
+ * @return New tensor image handle on success, NULL on error
+ * @par Errors (errno):
+ * - EINVAL: NULL tensor, tensor is not u8 dtype, or shape is invalid for format
+ */
+struct hal_tensor_image *hal_tensor_image_from_tensor(struct hal_tensor *tensor,
+                                                      enum hal_fourcc fourcc);
+
+/**
+ * Load a JPEG image from memory.
+ *
+ * @param data Pointer to JPEG data
+ * @param len Length of JPEG data in bytes
+ * @param fourcc Output pixel format (HAL_FOURCC_RGB, HAL_FOURCC_RGBA, or HAL_FOURCC_GREY)
+ * @param memory Memory allocation type
+ * @return New tensor image handle on success, NULL on error
+ * @par Errors (errno):
+ * - EINVAL: Invalid argument (NULL data, zero length)
+ * - EBADMSG: Failed to decode JPEG
+ * - ENOMEM: Memory allocation failed
+ */
+struct hal_tensor_image *hal_tensor_image_load_jpeg(const uint8_t *data,
+                                                    size_t len,
+                                                    enum hal_fourcc fourcc,
+                                                    enum hal_tensor_memory memory);
+
+/**
+ * Load a PNG image from memory.
+ *
+ * @param data Pointer to PNG data
+ * @param len Length of PNG data in bytes
+ * @param fourcc Output pixel format (HAL_FOURCC_RGB, HAL_FOURCC_RGBA, or HAL_FOURCC_GREY)
+ * @param memory Memory allocation type
+ * @return New tensor image handle on success, NULL on error
+ * @par Errors (errno):
+ * - EINVAL: Invalid argument (NULL data, zero length)
+ * - EBADMSG: Failed to decode PNG
+ * - ENOMEM: Memory allocation failed
+ */
+struct hal_tensor_image *hal_tensor_image_load_png(const uint8_t *data,
+                                                   size_t len,
+                                                   enum hal_fourcc fourcc,
+                                                   enum hal_tensor_memory memory);
+
+/**
  * Save a tensor image as JPEG.
  *
  * @param image Tensor image to save
@@ -868,6 +999,40 @@ size_t hal_tensor_image_height(const struct hal_tensor_image *image);
  * @return Pixel format, or HAL_FOURCC_RGB if image is NULL
  */
 enum hal_fourcc hal_tensor_image_fourcc(const struct hal_tensor_image *image);
+
+/**
+ * Check if a tensor image uses a planar pixel format.
+ *
+ * Planar formats store each color channel in a separate plane (e.g., NV12,
+ * NV16, PLANAR_RGB, PLANAR_RGBA), while interleaved formats store channels
+ * together per pixel (e.g., RGB, RGBA, YUYV).
+ *
+ * @param image Tensor image handle
+ * @return true if the image uses a planar format, false if interleaved or NULL
+ */
+bool hal_tensor_image_is_planar(const struct hal_tensor_image *image);
+
+/**
+ * Get the number of channels in a tensor image.
+ *
+ * Returns the number of color channels (e.g., 3 for RGB, 4 for RGBA,
+ * 1 for GREY, 2 for NV12).
+ *
+ * @param image Tensor image handle
+ * @return Number of channels, or 0 if image is NULL
+ */
+size_t hal_tensor_image_channels(const struct hal_tensor_image *image);
+
+/**
+ * Get the row stride of a tensor image in bytes.
+ *
+ * For planar formats this is equal to the width. For interleaved formats
+ * this is width * channels.
+ *
+ * @param image Tensor image handle
+ * @return Row stride in bytes, or 0 if image is NULL
+ */
+size_t hal_tensor_image_row_stride(const struct hal_tensor_image *image);
 
 /**
  * Clone the file descriptor associated with a tensor image (Linux only).
@@ -935,11 +1100,98 @@ int hal_image_processor_convert(struct hal_image_processor *processor,
                                 const struct hal_crop *crop);
 
 /**
+ * Convert an image into a borrowed tensor reference.
+ *
+ * This enables zero-copy preprocessing directly into a model's pre-allocated
+ * input buffer. The destination tensor must be u8 dtype with a 3D shape
+ * matching the specified output format.
+ *
+ * @param processor Image processor handle
+ * @param src Source image
+ * @param dst_tensor Destination u8 tensor (not consumed, must remain valid)
+ * @param dst_fourcc Output pixel format for the destination
+ * @param rotation Rotation to apply
+ * @param flip Flip to apply
+ * @param crop Crop configuration (can be NULL for no crop)
+ * @return 0 on success, -1 on error
+ * @par Errors (errno):
+ * - EINVAL: Invalid argument (NULL processor/src/dst_tensor, wrong dtype, invalid shape)
+ * - EIO: Conversion failed
+ */
+int hal_image_processor_convert_ref(struct hal_image_processor *processor,
+                                    const struct hal_tensor_image *src,
+                                    struct hal_tensor *dst_tensor,
+                                    enum hal_fourcc dst_fourcc,
+                                    enum hal_rotation rotation,
+                                    enum hal_flip flip,
+                                    const struct hal_crop *crop);
+
+/**
+ * Render detection boxes and segmentation masks onto an image.
+ *
+ * Draws bounding boxes (with labels) and segmentation overlays on the
+ * destination image. Uses hardware acceleration (OpenGL) when available,
+ * falling back to CPU rendering.
+ *
+ * @param processor Image processor handle
+ * @param dst Destination image to render onto
+ * @param detections Detection box list (can be NULL for segmentation-only)
+ * @param segmentations Segmentation list (can be NULL for detection-only)
+ * @return 0 on success, -1 on error
+ * @par Errors (errno):
+ * - EINVAL: Invalid argument (NULL processor or dst)
+ * - EIO: Rendering failed
+ */
+int hal_image_processor_render_to_image(struct hal_image_processor *processor,
+                                        struct hal_tensor_image *dst,
+                                        const struct hal_detect_box_list *detections,
+                                        const struct hal_segmentation_list *segmentations);
+
+/**
+ * Set class colors for segmentation rendering.
+ *
+ * Colors are used when rendering segmentation masks via
+ * hal_image_processor_render_to_image(). Each color is an RGBA tuple.
+ *
+ * @param processor Image processor handle
+ * @param colors Pointer to array of RGBA color tuples ([u8; 4] per color)
+ * @param num_colors Number of colors in the array
+ * @return 0 on success, -1 on error
+ * @par Errors (errno):
+ * - EINVAL: Invalid argument (NULL processor or colors)
+ * - EIO: Failed to set colors
+ */
+int hal_image_processor_set_class_colors(struct hal_image_processor *processor,
+                                         const uint8_t (*colors)[4],
+                                         size_t num_colors);
+
+/**
  * Free an image processor.
  *
  * @param processor Image processor handle to free (can be NULL, no-op)
  */
 void hal_image_processor_free(struct hal_image_processor *processor);
+
+/**
+ * Check if DMA (Direct Memory Access) buffer allocation is available.
+ *
+ * DMA buffers enable zero-copy data sharing between CPU and hardware
+ * accelerators. This is only available on Linux systems with DMA-BUF heap
+ * support.
+ *
+ * @return true if DMA allocation is available, false otherwise
+ */
+bool hal_is_dma_available(void);
+
+/**
+ * Check if POSIX shared memory allocation is available.
+ *
+ * Shared memory enables zero-copy IPC between processes. This is available
+ * on Unix systems (Linux, macOS, BSD).
+ *
+ * @return true if shared memory allocation is available, false otherwise
+ */
+bool hal_is_shm_available(void);
 
 /**
  * Create a new tensor with the given data type, shape, and memory type.
