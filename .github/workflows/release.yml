@@ -1,7 +1,7 @@
 # Release Workflow
 #
-# Builds Python wheels for multiple platforms and publishes to PyPI on tagged releases.
-# Supports both stable releases (X.Y.Z) and release candidates (X.Y.ZrcN).
+# Builds Python wheels for multiple platforms and publishes to PyPI and crates.io
+# on tagged releases. Supports both stable releases (X.Y.Z) and release candidates (X.Y.ZrcN).
 #
 # Action Versions (hash-pinned for security per Au-Zone SPS v2.1):
 # - actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 (v4)
@@ -11,6 +11,12 @@
 # - dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b (stable)
 # - pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e (release/v1)
 # - softprops/action-gh-release@5be0e66d93ac7ed76da52eca8bb058f665c3a5fe (v2.4.2)
+#
+# Trusted Publisher Configuration:
+# - PyPI: https://pypi.org/manage/project/edgefirst-hal/settings/publishing/
+#   Owner: EdgeFirstAI, Repository: hal, Workflow: release.yml, Environment: pypi
+# - crates.io: https://crates.io/settings/tokens
+#   Owner: EdgeFirstAI, Repository: hal, Workflow: release.yml, Environment: crates-io
 
 name: Release
 
@@ -101,6 +107,29 @@ jobs:
         uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e  # release/v1
         with:
           skip-existing: true
+
+  publish-crates:
+    name: Publish to crates.io
+    runs-on: ubuntu-22.04
+    needs: [build-wheels]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/edgefirst-hal
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
+        with:
+          toolchain: stable
+
+      - name: Publish crates to crates.io
+        run: cargo publish --workspace --no-verify
 
   create-release:
     name: Create GitHub Release
