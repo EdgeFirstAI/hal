@@ -2,7 +2,7 @@
 #
 # This workflow implements the Au-Zone SPS v2.3 testing patterns:
 #   - Multi-platform coverage testing (x86_64, aarch64, on-target hardware)
-#   - Three-phase on-target testing pattern (build -> test -> process)
+#   - Parallel aarch64 testing: build-arm → test-arm + hardware-test in parallel
 #   - Full coverage collection (Rust + Python) with profiling builds
 #   - SonarCloud static analysis and coverage aggregation
 #   - Hardware benchmarks on target (imx8mp)
@@ -11,6 +11,10 @@
 #   - Cargo profile: profiling (inherits release, optimized with debug symbols)
 #   - Python bindings: Built with maturin develop using profiling profile
 #   - Coverage: cargo-llvm-cov for Rust, slipcover for Python
+#
+# aarch64 Pipeline:
+#   build-arm (compile + lint) → test-arm (runner tests) ──────────────┐
+#                               → hardware-test (on-target tests) ─────┤→ process-hardware-coverage → sonarcloud
 #
 # Action Versions (hash-pinned per SPS v2.1):
 # - actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 (v4)
@@ -31,6 +35,7 @@
 #
 # Build Strategy:
 # - x86_64 and aarch64 builds happen on GitHub-hosted/managed runners
+# - aarch64 build artifacts are shared between runner tests and hardware tests
 # - imx8mp runner downloads aarch64 artifacts and runs tests only
 # - Coverage processing happens on ubuntu-22.04-arm (same toolchain as build)
 #
@@ -204,6 +209,15 @@ jobs:
             --no-report \
             2>&1 | tee target/test-metrics-rust-x86_64.txt
 
+      - name: Build C API library
+        run: cargo build --release -p edgefirst-hal-capi
+
+      - name: Run C API tests
+        run: |
+          set -o pipefail
+          cd crates/capi/tests
+          make test 2>&1 | tee ../../../target/test-metrics-capi-x86_64.txt
+
       - name: Run Python tests with coverage
         run: |
           set -o pipefail
@@ -246,7 +260,9 @@ jobs:
           path: |
             target/pytest_results.xml
             target/nextest/default/test-results.xml
-            target/test-metrics-*-x86_64.txt
+            target/test-metrics-rust-x86_64.txt
+            target/test-metrics-capi-x86_64.txt
+            target/test-metrics-python-x86_64.txt
           retention-days: 30
 
       - name: Publish test results
@@ -314,6 +330,15 @@ jobs:
           set -o pipefail
           cargo nextest run --workspace 2>&1 | tee target/test-metrics-rust-macos.txt
 
+      - name: Build C API library
+        run: cargo build --release -p edgefirst-hal-capi
+
+      - name: Run C API tests
+        run: |
+          set -o pipefail
+          cd crates/capi/tests
+          make test 2>&1 | tee ../../../target/test-metrics-capi-macos.txt
+
       - name: Upload test results
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         if: always()
@@ -325,16 +350,12 @@ jobs:
           retention-days: 30
 
   # ===========================================================================
-  # Build and Test on aarch64 (Self-hosted runner WITHOUT Docker)
+  # Build on aarch64 (compile + lint, upload artifacts for test-arm & hardware-test)
   # ===========================================================================
-  build-and-test-arm:
-    name: Build & Test (aarch64)
+  build-arm:
+    name: Build (aarch64)
     runs-on: ubuntu-22.04-arm
     needs: checkout-lfs
-    permissions:
-      contents: read
-      checks: write
-      pull-requests: write
 
     steps:
       - name: Checkout code
@@ -367,8 +388,7 @@ jobs:
           python3 -m venv venv
           echo "${{ github.workspace }}/venv/bin" >> $GITHUB_PATH
           venv/bin/pip install --upgrade pip setuptools wheel
-          venv/bin/pip install maturin[patchelf,zig] slipcover pytest pytest-timeout pytest-benchmark
-          venv/bin/pip install tensorflow pyyaml numpy pillow opencv-python-headless psutil
+          venv/bin/pip install maturin[patchelf,zig]
 
       - name: Set up Rust stable toolchain
         uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
@@ -412,42 +432,19 @@ jobs:
             --out target/wheels \
             --profile profiling \
             --features python-abi311
-          venv/bin/pip install target/wheels/*.whl
 
-      - name: Run Rust tests with coverage
+      - name: Build runner test binaries (no-run)
         run: |
-          set -o pipefail
-          # Run tests but don't generate report yet - we'll combine with Python test coverage
-          # Use default,opencv features; exclude g2d_test_formats,dma_test_formats (on-target only)
-          cargo llvm-cov nextest --cargo-profile profiling --features default,opencv --workspace \
-            --no-report \
-            2>&1 | tee target/test-metrics-rust-aarch64.txt
-
-      - name: Run Python tests with coverage
-        run: |
-          set -o pipefail
-          # Source coverage env so Python tests generate profraw for PyO3 bindings
           source /tmp/coverage-env.sh
-          # Python tests exercise PyO3 bindings - profraw files generated from instrumented wheel
-          venv/bin/python -m slipcover --xml --out target/coverage_python.xml \
-            -m pytest tests/ -v --tb=short --junitxml=target/pytest_results.xml \
-            2>&1 | tee target/test-metrics-python-aarch64.txt
+          cargo nextest run --no-run --cargo-profile profiling --features default,opencv --workspace
+          mkdir -p runner-test-binaries
+          find target/llvm-cov-target/profiling/deps/ -maxdepth 1 -type f -executable \
+            ! -name "*.d" ! -name "*.rlib" ! -name "*.rmeta" ! -name "*.so" \
+            -exec cp {} runner-test-binaries/ \; 2>/dev/null || true
+          echo "Runner test binaries:"
+          ls -la runner-test-binaries/ || echo "No test binaries found"
 
-      - name: Generate combined Rust coverage report
-        run: |
-          # Generate LCOV report combining Rust tests + Python tests (PyO3 bindings coverage)
-          cargo llvm-cov report --profile profiling \
-            --ignore-filename-regex '(\.cargo|/rustc/|/target/)' \
-            --lcov --output-path target/coverage_rust.lcov
-          echo "=== Coverage summary ==="
-          echo "Source files in coverage: $(grep -c '^SF:' target/coverage_rust.lcov)"
-          echo "PyO3 files with coverage:"
-          grep '^SF:.*crates/python' target/coverage_rust.lcov || echo "  (none found)"
-          echo "=== Sample coverage data for crates/python ==="
-          # Show hit counts for PyO3 files to verify they're being exercised
-          awk '/^SF:.*crates\/python/{found=1; file=$0} found && /^DA:/{print file": "$0} found && /^end_of_record/{found=0}' target/coverage_rust.lcov | head -20
-
-      - name: Build instrumented test binaries for hardware
+      - name: Build hardware test binaries (all-features, no-run)
         run: |
           source /tmp/coverage-env.sh
           cargo nextest run --workspace --all-features --no-run --cargo-profile profiling
@@ -460,6 +457,210 @@ jobs:
             -exec cp {} hardware-test-binaries/ \; 2>/dev/null || true
           echo "Instrumented test binaries:"
           ls -la hardware-test-binaries/ || echo "No test binaries found"
+
+      - name: Build C API library
+        run: cargo build --release -p edgefirst-hal-capi
+
+      - name: Build C API tests
+        run: |
+          cd crates/capi/tests
+          make all
+          cd ../../..
+          # Copy C API artifacts for testing
+          mkdir -p hardware-capi-tests
+          cp target/release/libedgefirst_hal.so hardware-capi-tests/
+          cp target/release/libedgefirst_hal.a hardware-capi-tests/ 2>/dev/null || true
+          cp crates/capi/build/test_all hardware-capi-tests/
+          echo "C API test artifacts:"
+          ls -la hardware-capi-tests/
+
+      - name: Upload runner test artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: runner-test-artifacts
+          path: |
+            runner-test-binaries/
+            target/wheels/*.whl
+            hardware-capi-tests/
+            target/release/libedgefirst_hal.so
+          retention-days: 7
+
+      - name: Upload hardware test artifacts (binaries + wheels only)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: hardware-test-binaries
+          path: |
+            target/profiling/*.so*
+            target/profiling/deps/*.so*
+            target/wheels/*.whl
+            hardware-test-binaries/
+            hardware-capi-tests/
+          retention-days: 7
+
+      - name: Upload coverage instrumented binaries (for profraw processing)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: coverage-binaries-aarch64
+          path: |
+            target/llvm-cov-target/profiling/deps/*
+          retention-days: 7
+
+  # ===========================================================================
+  # Test on aarch64 runner (uses pre-built artifacts from build-arm)
+  # ===========================================================================
+  test-arm:
+    name: Test (aarch64)
+    runs-on: ubuntu-22.04-arm
+    needs: [checkout-lfs, build-arm]
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          fetch-depth: 0
+          lfs: false  # LFS files downloaded separately
+
+      - name: Download LFS testdata
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: testdata-lfs
+          path: testdata/
+
+      - name: Download runner test artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: runner-test-artifacts
+          path: .  # Download to workspace root to preserve directory structure
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up Python virtual environment
+        run: |
+          python3 -m venv venv
+          echo "${{ github.workspace }}/venv/bin" >> $GITHUB_PATH
+          venv/bin/pip install --upgrade pip setuptools wheel
+          venv/bin/pip install slipcover pytest pytest-timeout pytest-benchmark
+          venv/bin/pip install tensorflow pyyaml numpy pillow opencv-python-headless psutil
+          # Install Python bindings from pre-built wheel
+          venv/bin/pip install target/wheels/*.whl
+
+      - name: Set up Rust stable toolchain
+        uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+
+      - name: Run pre-built Rust tests
+        env:
+          LLVM_PROFILE_FILE: ${{ github.workspace }}/build/profraw/rust-%p-%m.profraw
+        run: |
+          set -o pipefail
+          mkdir -p build/profraw build/rust-test-results
+          chmod +x runner-test-binaries/* 2>/dev/null || true
+          TEST_FAILED=0
+          for test_bin in runner-test-binaries/*; do
+            if [ -x "$test_bin" ] && [ -f "$test_bin" ]; then
+              # Skip .so files (proc-macro shared libraries)
+              if [[ "$test_bin" == *.so ]]; then
+                continue
+              fi
+              test_name=$(basename "$test_bin")
+              echo "=== Running $test_name ==="
+              if ! "$test_bin" --test-threads=1 2>&1 | tee "build/rust-test-results/${test_name}.txt"; then
+                echo "FAILED: $test_name"
+                TEST_FAILED=1
+              fi
+            fi
+          done
+          [ $TEST_FAILED -eq 0 ] || exit 1
+
+      - name: Run C API tests
+        run: |
+          set -o pipefail
+          if [ -d "hardware-capi-tests" ] && [ -f "hardware-capi-tests/test_all" ]; then
+            echo "=== Running C API tests ==="
+            chmod +x hardware-capi-tests/test_all
+            export LD_LIBRARY_PATH=$(pwd)/hardware-capi-tests:$LD_LIBRARY_PATH
+            hardware-capi-tests/test_all 2>&1 | tee build/test-metrics-capi-aarch64.txt
+          else
+            echo "C API test binary not found, skipping"
+          fi
+
+      - name: Run Python tests with coverage
+        env:
+          LLVM_PROFILE_FILE: ${{ github.workspace }}/build/profraw/py-%p-%m.profraw
+        run: |
+          set -o pipefail
+          mkdir -p build/profraw
+          venv/bin/python -m slipcover --xml --out target/coverage_python.xml \
+            -m pytest tests/ -v --tb=short --junitxml=target/pytest_results.xml \
+            2>&1 | tee build/test-metrics-python-aarch64.txt
+
+      - name: Generate JUnit XML from Rust results
+        if: always()
+        run: python3 scripts/generate_junit_xml.py build/rust-test-results build/rust_runner_results.xml
+
+      - name: Process Rust coverage
+        if: always()
+        run: |
+          TOOLCHAIN_ROOT=$(rustc --print sysroot)
+          LLVM_PROFDATA=$(find "$TOOLCHAIN_ROOT" -name "llvm-profdata" -type f | head -1)
+          LLVM_COV=$(find "$TOOLCHAIN_ROOT" -name "llvm-cov" -type f | head -1)
+
+          PROFRAW_COUNT=$(find build/profraw/ -name "*.profraw" 2>/dev/null | wc -l)
+          echo "Found $PROFRAW_COUNT profraw files"
+
+          if [ "$PROFRAW_COUNT" -eq 0 ]; then
+            echo "No profraw files, creating empty coverage"
+            mkdir -p target
+            echo "" > target/coverage_rust.lcov
+            exit 0
+          fi
+
+          # Merge profraw files
+          "$LLVM_PROFDATA" merge -sparse build/profraw/*.profraw -o build/merged.profdata
+
+          # Collect object files (test binaries + Python .so)
+          FIRST_OBJ=""
+          OBJECT_ARGS=""
+          for obj in runner-test-binaries/*; do
+            if [ -f "$obj" ] && file "$obj" | grep -q "ELF"; then
+              if [ -z "$FIRST_OBJ" ]; then
+                FIRST_OBJ="$obj"
+              else
+                OBJECT_ARGS="$OBJECT_ARGS --object=$obj"
+              fi
+            fi
+          done
+          # Include Python .so for PyO3 coverage
+          PY_SO=$(find venv/ -name "edgefirst_hal*.so" -type f | head -1)
+          if [ -n "$PY_SO" ]; then
+            OBJECT_ARGS="$OBJECT_ARGS --object=$PY_SO"
+          fi
+
+          if [ -z "$FIRST_OBJ" ]; then
+            echo "No ELF binaries found, creating empty coverage"
+            mkdir -p target
+            echo "" > target/coverage_rust.lcov
+            exit 0
+          fi
+
+          mkdir -p target
+          "$LLVM_COV" export --format=lcov --instr-profile=build/merged.profdata \
+            --ignore-filename-regex='(\.cargo|/rustc/|/target/)' \
+            $FIRST_OBJ $OBJECT_ARGS > target/coverage_rust.lcov 2>/dev/null || echo "" > target/coverage_rust.lcov
+
+          echo "=== Coverage summary ==="
+          echo "Source files in coverage: $(grep -c '^SF:' target/coverage_rust.lcov || echo 0)"
+          echo "PyO3 files with coverage:"
+          grep '^SF:.*crates/python' target/coverage_rust.lcov || echo "  (none found)"
 
       - name: Upload coverage artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
@@ -478,37 +679,28 @@ jobs:
           name: test-results-aarch64
           path: |
             target/pytest_results.xml
-            target/nextest/default/test-results.xml
-            target/test-metrics-*-aarch64.txt
+            build/rust_runner_results.xml
+            build/test-metrics-python-aarch64.txt
+            build/test-metrics-capi-aarch64.txt
           retention-days: 30
 
-      - name: Upload hardware test artifacts (binaries + wheels only)
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+      - name: Publish test results
+        uses: EnricoMi/publish-unit-test-result-action@34d7c956a59aed1bfebf31df77b8de55db9bbaaf  # v2.21.0
         if: always()
         with:
-          name: hardware-test-binaries
-          path: |
-            target/profiling/*.so*
-            target/profiling/deps/*.so*
-            target/wheels/*.whl
-            hardware-test-binaries/
-          retention-days: 7
-
-      - name: Upload coverage instrumented binaries (for profraw processing)
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
-        if: always()
-        with:
-          name: coverage-binaries-aarch64
-          path: |
-            target/llvm-cov-target/profiling/deps/*
-          retention-days: 7
+          files: |
+            target/pytest_results.xml
+            build/rust_runner_results.xml
+          check_name: Test Results (aarch64)
+          comment_mode: always
+          ignore_runs: true
 
   # ===========================================================================
   # Hardware Testing + Benchmarks on NXP i.MX8M Plus
   # ===========================================================================
   hardware-test:
     name: Hardware Test (imx8mp)
-    needs: [checkout-lfs, build-and-test-arm]
+    needs: [checkout-lfs, build-arm]
     runs-on: nxp-imx8mp-latest
     permissions:
       contents: read
@@ -543,7 +735,7 @@ jobs:
           python3 -m venv venv
           echo "${{ github.workspace }}/venv/bin" >> $GITHUB_PATH
           venv/bin/pip install --upgrade pip setuptools wheel
-          venv/bin/pip install slipcover pytest pytest-timeout pytest-benchmark tensorflow pyyaml numpy pillow opencv-python-headless psutil
+          venv/bin/pip install slipcover pytest pytest-timeout pytest-benchmark numpy pillow psutil
           # Install Python bindings from pre-built wheel (built with profiling profile on aarch64)
           venv/bin/pip install target/wheels/*.whl
 
@@ -590,6 +782,18 @@ jobs:
             fi
           done
           [ $TEST_FAILED -eq 0 ] || exit 1
+
+      - name: Run C API tests
+        run: |
+          set -o pipefail
+          if [ -d "hardware-capi-tests" ] && [ -f "hardware-capi-tests/test_all" ]; then
+            echo "=== Running C API tests on hardware ==="
+            chmod +x hardware-capi-tests/test_all
+            export LD_LIBRARY_PATH=$(pwd)/hardware-capi-tests:$LD_LIBRARY_PATH
+            hardware-capi-tests/test_all 2>&1 | tee build/test-metrics-capi-imx8mp.txt
+          else
+            echo "C API test binary not found, skipping"
+          fi
 
       - name: Run benchmarks (main branch only)
         if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
@@ -639,7 +843,8 @@ jobs:
           path: |
             build/pytest_results.xml
             build/rust_hardware_results.xml
-            build/test-metrics-*-imx8mp.txt
+            build/test-metrics-python-imx8mp.txt
+            build/test-metrics-capi-imx8mp.txt
           retention-days: 30
 
       - name: Upload benchmark results
@@ -658,10 +863,13 @@ jobs:
           echo "## Hardware Test Results (imx8mp)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           if [ -f build/pytest_results.xml ]; then
-            echo "Python tests completed - see artifacts for details" >> $GITHUB_STEP_SUMMARY
+            echo "- Python tests completed - see artifacts for details" >> $GITHUB_STEP_SUMMARY
           fi
           if [ -f build/rust_hardware_results.xml ]; then
-            echo "Rust tests completed - see artifacts for details" >> $GITHUB_STEP_SUMMARY
+            echo "- Rust tests completed - see artifacts for details" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -f build/test-metrics-capi-imx8mp.txt ]; then
+            echo "- C API tests completed - see artifacts for details" >> $GITHUB_STEP_SUMMARY
           fi
 
       - name: Generate benchmark summary
@@ -673,7 +881,7 @@ jobs:
   # ===========================================================================
   process-hardware-coverage:
     name: Process Hardware Coverage
-    needs: [build-and-test-arm, hardware-test]
+    needs: [build-arm, hardware-test]
     runs-on: ubuntu-22.04-arm
     permissions:
       contents: read
@@ -752,7 +960,7 @@ jobs:
   # ===========================================================================
   sonarcloud:
     name: SonarCloud Analysis
-    needs: [doc-tests, build-and-test-x86, build-and-test-arm, hardware-test, process-hardware-coverage]
+    needs: [doc-tests, build-and-test-x86, build-and-test-macos, test-arm, hardware-test, process-hardware-coverage]
     runs-on: ubuntu-22.04
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     permissions:
@@ -809,10 +1017,10 @@ jobs:
             echo "## Test Platforms"
             echo "| Platform | Architecture | Tests |"
             echo "|----------|--------------|-------|"
-            echo "| Ubuntu 22.04 | x86_64 | Rust, Python |"
-            echo "| Ubuntu 22.04 | aarch64 | Rust, Python |"
-            echo "| macOS | Apple Silicon | Rust |"
-            echo "| NXP i.MX8M Plus | aarch64 | Rust, Python (DMA, G2D) |"
+            echo "| Ubuntu 22.04 | x86_64 | Rust, Python, C API |"
+            echo "| Ubuntu 22.04 | aarch64 | Rust, Python, C API |"
+            echo "| macOS | Apple Silicon | Rust, C API |"
+            echo "| NXP i.MX8M Plus | aarch64 | Rust, Python, C API (DMA, G2D) |"
             echo ""
             python3 scripts/coverage_summary.py --github-actions
             echo ""
