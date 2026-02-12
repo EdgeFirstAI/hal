@@ -605,7 +605,7 @@ jobs:
 
       - name: Generate JUnit XML from Rust results
         if: always()
-        run: python3 scripts/generate_junit_xml.py build/rust-test-results build/rust_runner_results.xml
+        run: python3 .github/scripts/generate_junit_xml.py build/rust-test-results build/rust_runner_results.xml
 
       - name: Process Rust coverage
         if: always()
@@ -823,7 +823,7 @@ jobs:
 
       - name: Generate JUnit XML from Rust results
         if: always()
-        run: python3 scripts/generate_junit_xml.py build/rust-test-results build/rust_hardware_results.xml
+        run: python3 .github/scripts/generate_junit_xml.py build/rust-test-results build/rust_hardware_results.xml
 
       - name: Upload coverage artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
@@ -874,7 +874,7 @@ jobs:
 
       - name: Generate benchmark summary
         if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
-        run: python3 scripts/benchmark_summary.py benchmark-results/benchmark.json >> $GITHUB_STEP_SUMMARY
+        run: python3 .github/scripts/benchmark_summary.py benchmark-results/benchmark.json >> $GITHUB_STEP_SUMMARY
 
   # ===========================================================================
   # Process Hardware Coverage (profraw -> LCOV)
@@ -986,7 +986,7 @@ jobs:
 
           echo "=== Fixing Python coverage paths ==="
           for xml in $(find coverage/ -name "coverage_python.xml" -type f); do
-            python3 scripts/fix_coverage_paths.py "$xml" tests
+            python3 .github/scripts/fix_coverage_paths.py "$xml" tests
           done
 
           RUST_REPORTS=$(find coverage/ -name "*.lcov" | tr '\n' ',' | sed 's/,$//')
@@ -1022,7 +1022,7 @@ jobs:
             echo "| macOS | Apple Silicon | Rust, C API |"
             echo "| NXP i.MX8M Plus | aarch64 | Rust, Python, C API (DMA, G2D) |"
             echo ""
-            python3 scripts/coverage_summary.py --github-actions
+            python3 .github/scripts/coverage_summary.py --github-actions
             echo ""
             echo "## SonarCloud"
             echo "- [Dashboard](https://sonarcloud.io/summary/overall?id=EdgeFirstAI_hal&branch=${{ github.ref_name }})"
