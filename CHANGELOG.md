@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-02-12
+
+### Changed
+
+- Consolidate all scripts to `.github/scripts/` for CI/CD automation
+- Migrate `AGENTS.md` to `.github/copilot-instructions.md` (GitHub Copilot standard location)
+- Add detailed release process documentation with version verification steps
+- Update commit message guidelines: JIRA keys not required for housekeeping tasks
+
 ## [0.5.1] - 2026-02-11
 
 ### Changed
