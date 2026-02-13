@@ -548,27 +548,28 @@ class TensorImage:
         """
         ...
 
-    @staticmethod
-    def from_fd(
-        fd: int,
-        shape: list[int],
-        fourcc: FourCC,
-    ) -> TensorImage:
-        """
-        Load an image from a file descriptor, inspecting the file descriptor to determine
-        the appropriate tensor type (DMA or SHM) based on the device major and minor numbers.
+    if sys.platform == "linux":
+        @staticmethod
+        def from_fd(
+            fd: int,
+            shape: list[int],
+            fourcc: FourCC,
+        ) -> TensorImage:
+            """
+            Load an image from a file descriptor, inspecting the file descriptor to determine
+            the appropriate tensor type (DMA or SHM) based on the device major and minor numbers.
 
-        The `shape` parameter is used to specify the dimensions of the image tensor, 
-        which should correspond to the image data associated with the file descriptor. 
-        The expected shape is typically (height, width, channels) for packed formats 
-        or (channels, height, width) for planar formats.
+            The `shape` parameter is used to specify the dimensions of the image tensor, 
+            which should correspond to the image data associated with the file descriptor. 
+            The expected shape is typically (height, width, channels) for packed formats 
+            or (channels, height, width) for planar formats.
 
-        The `fourcc` parameter is used to specify the pixel format of the image data.
+            The `fourcc` parameter is used to specify the pixel format of the image data.
 
-        This will take ownership of the file descriptor, and the file descriptor will 
-        be closed when the tensor is dropped.
-        """
-        ...
+            This will take ownership of the file descriptor, and the file descriptor will 
+            be closed when the tensor is dropped.
+            """
+            ...
 
     @staticmethod
     def load_from_bytes(
