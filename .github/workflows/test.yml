@@ -196,7 +196,7 @@ jobs:
             --manifest-path crates/python/Cargo.toml \
             --out target/wheels \
             --profile profiling \
-            --features python-abi311
+            --features abi3-py311
           venv/bin/pip install target/wheels/*.whl
 
       - name: Run Rust tests with coverage
@@ -430,7 +430,7 @@ jobs:
             --manifest-path crates/python/Cargo.toml \
             --out target/wheels \
             --profile profiling \
-            --features python-abi311
+            --features abi3-py311
 
       - name: Build runner test binaries (no-run)
         run: |
