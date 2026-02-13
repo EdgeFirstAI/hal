@@ -1334,11 +1334,8 @@ impl CPUProcessor {
         }
     }
 
-    pub(crate) fn fill_image_outside_crop(
-        dst: &mut TensorImage,
-        rgba: [u8; 4],
-        crop: Rect,
-    ) -> Result<()> {
+    /// Fills the area outside a crop rectangle with the specified color.
+    pub fn fill_image_outside_crop(dst: &mut TensorImage, rgba: [u8; 4], crop: Rect) -> Result<()> {
         let dst_fourcc = dst.fourcc();
         let mut dst_map = dst.tensor().map()?;
         let dst = (dst_map.as_mut_slice(), dst.width(), dst.height());

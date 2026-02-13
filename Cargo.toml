@@ -40,7 +40,7 @@ env_logger = "0.11.8"
 fast-math = "0.1.1"
 fast_image_resize = { version = "5.2.0", features = ["image", "rayon"] }
 four-char-code = "2.3.0"
-g2d-sys = { version = "1.0.1", path = "crates/g2d-sys" }
+g2d-sys = "1.2.0"
 
 gbm = { package = "edgefirst-gbm", version = "0.18.1", default-features = false, features = ["dynamic", "drm-support"] }
 gls = "0.1.6"

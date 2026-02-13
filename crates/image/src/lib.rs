@@ -892,16 +892,26 @@ pub enum Flip {
     Horizontal = 2,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Crop {
     pub src_rect: Option<Rect>,
     pub dst_rect: Option<Rect>,
     pub dst_color: Option<[u8; 4]>,
 }
+
+impl Default for Crop {
+    fn default() -> Self {
+        Crop::new()
+    }
+}
 impl Crop {
     // Creates a new Crop with default values (no cropping).
     pub fn new() -> Self {
-        Crop::default()
+        Crop {
+            src_rect: None,
+            dst_rect: None,
+            dst_color: None,
+        }
     }
 
     // Sets the source rectangle for cropping.
@@ -924,7 +934,7 @@ impl Crop {
 
     // Creates a new Crop with no cropping.
     pub fn no_crop() -> Self {
-        Crop::default()
+        Crop::new()
     }
 
     // Checks if the crop rectangles are valid for the given source and

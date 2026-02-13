@@ -18,6 +18,10 @@ use std::{
 };
 
 /// A tensor backed by DMA (Direct Memory Access) memory.
+///
+/// On Linux, a DRM PRIME attachment is created to enable proper CPU cache
+/// coherency via `DMA_BUF_IOCTL_SYNC`. Without this attachment, sync ioctls
+/// are no-ops on cached CMA heaps.
 #[derive(Debug)]
 pub struct DmaTensor<T>
 where
@@ -27,6 +31,8 @@ where
     pub fd: OwnedFd,
     pub shape: Vec<usize>,
     pub _marker: std::marker::PhantomData<T>,
+    #[cfg(target_os = "linux")]
+    _drm_attachment: Option<crate::dmabuf::DrmAttachment>,
 }
 
 unsafe impl<T> Send for DmaTensor<T> where T: Num + Clone + fmt::Debug + Send + Sync {}
@@ -59,11 +65,14 @@ where
         let stat = fstat(&dma_fd)?;
         debug!("DMA memory stat: {stat:?}");
 
+        let drm_attachment = crate::dmabuf::DrmAttachment::new(&dma_fd);
+
         Ok(DmaTensor::<T> {
             name: name.to_owned(),
             fd: dma_fd,
             shape: shape.to_vec(),
             _marker: std::marker::PhantomData,
+            _drm_attachment: drm_attachment,
         })
     }
 
@@ -84,11 +93,16 @@ where
             return Err(Error::InvalidSize(0));
         }
 
+        #[cfg(target_os = "linux")]
+        let drm_attachment = crate::dmabuf::DrmAttachment::new(&fd);
+
         Ok(DmaTensor {
             name: name.unwrap_or("").to_owned(),
             fd,
             shape: shape.to_vec(),
             _marker: std::marker::PhantomData,
+            #[cfg(target_os = "linux")]
+            _drm_attachment: drm_attachment,
         })
     }
 
@@ -148,11 +162,15 @@ where
 {
     pub fn try_clone(&self) -> Result<Self> {
         let fd = self.clone_fd()?;
+        #[cfg(target_os = "linux")]
+        let drm_attachment = crate::dmabuf::DrmAttachment::new(&fd);
         Ok(Self {
             name: self.name.clone(),
             fd,
             shape: self.shape.clone(),
             _marker: std::marker::PhantomData,
+            #[cfg(target_os = "linux")]
+            _drm_attachment: drm_attachment,
         })
     }
 }

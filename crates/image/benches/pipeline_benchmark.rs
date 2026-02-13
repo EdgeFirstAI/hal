@@ -939,5 +939,100 @@ fn bench_resize(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_letterbox, bench_convert, bench_resize);
+// =============================================================================
+// Letterbox Pipeline Benchmarks: Realistic camera→model with clear+resize
+// =============================================================================
+
+/// Realistic letterbox pipeline: 1920×1080 → 640×640 with aspect ratio bars.
+///
+/// Compares full pipelines:
+/// - **CPU**: mmap dst → fill border strips → CPU resize+convert
+/// - **G2D**: g2d_clear → g2d_blit → single g2d_finish
+///
+/// Tests both YUYV and RGBA inputs with top/bottom (landscape→square) bars.
+/// The 1920×1080 → 640×640 letterbox produces ~44% clear area (140px bars
+/// top and bottom).
+#[allow(unused_variables)]
+fn bench_letterbox_pipeline(c: &mut Criterion) {
+    let mut group = c.benchmark_group("letterbox_pipeline");
+    group.sample_size(100);
+
+    #[cfg(target_os = "linux")]
+    let has_g2d = g2d_available();
+    #[cfg(not(target_os = "linux"))]
+    let has_g2d = false;
+
+    let src_w: usize = 1920;
+    let src_h: usize = 1080;
+    let dst_w: usize = 640;
+    let dst_h: usize = 640;
+
+    // Aspect-ratio preserving fit: 1920×1080 → 640×360 centered in 640×640
+    let scale = f64::min(dst_w as f64 / src_w as f64, dst_h as f64 / src_h as f64);
+    let content_w = (src_w as f64 * scale) as usize;
+    let content_h = (src_h as f64 * scale) as usize;
+    let pad_left = (dst_w - content_w) / 2;
+    let pad_top = (dst_h - content_h) / 2;
+    let dst_rect = Rect::new(pad_left, pad_top, content_w, content_h);
+    let color: [u8; 4] = [114, 114, 114, 255];
+
+    let src_formats: &[(&str, four_char_code::FourCharCode)] = &[("YUYV", YUYV), ("RGBA", RGBA)];
+
+    for &(fmt_name, src_fmt) in src_formats {
+        // CPU pipeline: fill borders + CPU resize/convert
+        {
+            let src = TensorImage::new(src_w, src_h, src_fmt, None).unwrap();
+            src.tensor().map().unwrap().as_mut_slice().fill(128);
+            let mut dst = TensorImage::new(dst_w, dst_h, RGBA, None).unwrap();
+            let crop = Crop::new()
+                .with_dst_rect(Some(dst_rect))
+                .with_dst_color(Some(color));
+            let mut cpu = CPUProcessor::new();
+
+            group.bench_function(BenchmarkId::new("cpu", fmt_name), |b| {
+                b.iter(|| {
+                    cpu.convert(&src, &mut dst, Rotation::None, Flip::None, crop)
+                        .unwrap();
+                    black_box(&dst);
+                });
+            });
+        }
+
+        // G2D pipeline: g2d_clear + g2d_blit + finish (single GPU sync)
+        #[cfg(target_os = "linux")]
+        if has_g2d {
+            let Ok(src) = TensorImage::new(src_w, src_h, src_fmt, Some(TensorMemory::Dma)) else {
+                eprintln!("G2D: DMA alloc failed for {src_w}×{src_h} {fmt_name}");
+                continue;
+            };
+            src.tensor().map().unwrap().as_mut_slice().fill(128);
+            let Ok(mut dst) = TensorImage::new(dst_w, dst_h, RGBA, Some(TensorMemory::Dma)) else {
+                eprintln!("G2D: DMA alloc failed for {dst_w}×{dst_h} RGBA");
+                continue;
+            };
+            let crop = Crop::new()
+                .with_dst_rect(Some(dst_rect))
+                .with_dst_color(Some(color));
+            let mut proc = G2DProcessor::new().unwrap();
+
+            group.bench_function(BenchmarkId::new("g2d", fmt_name), |b| {
+                b.iter(|| {
+                    proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop)
+                        .unwrap();
+                    black_box(&dst);
+                });
+            });
+        }
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_letterbox,
+    bench_convert,
+    bench_resize,
+    bench_letterbox_pipeline
+);
 criterion_main!(benches);

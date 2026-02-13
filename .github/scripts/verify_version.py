@@ -38,9 +38,7 @@ WORKSPACE_LEAF_CRATES = [
 PYTHON_PACKAGE = "edgefirst_hal"
 
 # Crates with independent versions (not checked against workspace version)
-INDEPENDENT_CRATES = {
-    "g2d-sys": None,  # version checked for presence only, not value
-}
+INDEPENDENT_CRATES = {}
 
 
 def read_file(path: str) -> str:
