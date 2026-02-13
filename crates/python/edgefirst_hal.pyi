@@ -6,6 +6,7 @@ import sys
 
 """EdgeFirst HAL Python bindings."""
 
+
 class Nms(enum.Enum):
     """Non-Maximum Suppression mode for object detection.
 
@@ -15,6 +16,7 @@ class Nms(enum.Enum):
 
     ClassAgnostic: Nms
     ClassAware: Nms
+
 
 DetectionOutput = Tuple[
     npt.NDArray[np.float32], npt.NDArray[np.float32], npt.NDArray[np.uintp]
@@ -40,6 +42,7 @@ A tuple containing:
 - class_ids: A NumPy array of shape (N,) containing the class IDs for each bounding box.
 - masks: A list of NumPy arrays, each of shape (H, W, ...) containing detected segmentation mask.
 """
+
 
 class Decoder:
     def __init__(
@@ -258,6 +261,7 @@ class Decoder:
 
     @score_threshold.setter
     def score_threshold(self, value: float): ...
+
     @property
     def iou_threshold(self) -> float:
         """
@@ -268,6 +272,7 @@ class Decoder:
 
     @iou_threshold.setter
     def iou_threshold(self, value: float): ...
+
     @property
     def nms(self) -> Optional[Nms]:
         """
@@ -284,6 +289,7 @@ class Decoder:
         """
         ...
 
+
 class TensorMemory(enum.Enum):
     if sys.platform == "linux":
         DMA: TensorMemory
@@ -299,6 +305,7 @@ class TensorMemory(enum.Enum):
         """
     MEM: TensorMemory
     """Regular system memory allocation"""
+
 
 class Tensor:
     if sys.platform == "linux":
@@ -441,6 +448,7 @@ class Tensor:
     def map(self) -> TensorMap: ...
     """Returns a mapped view of the tensor data for direct access."""
 
+
 class TensorMap:
     def unmap(self) -> None: ...
     def view(self) -> memoryview: ...
@@ -452,6 +460,7 @@ class TensorMap:
     def __releasebuffer__(self, view) -> None: ...
     def __enter__(self) -> TensorMap: ...
     def __exit__(self, _exc_type, _exc_value, _traceback) -> None: ...
+
 
 class FourCC(enum.Enum):
     YUYV: FourCC
@@ -479,6 +488,7 @@ class FourCC(enum.Enum):
     """Planar RGBA format (Red plane, Green plane, Blue plane, Alpha plane)"""
 
     def __init__(self, fourcc: str) -> None: ...
+
 
 class Normalization(enum.Enum):
     DEFAULT: Normalization
@@ -523,6 +533,7 @@ class Normalization(enum.Enum):
     | `np.float64` | value             |
     """
 
+
 class TensorImage:
     def __init__(
         self,
@@ -534,6 +545,28 @@ class TensorImage:
         """
         Create a new TensorImage with the specified width, height, and pixel format.
         The optional `mem` parameter can be used to specify the type of memory allocation for the image.
+        """
+        ...
+
+    @staticmethod
+    def from_fd(
+        fd: int,
+        shape: list[int],
+        fourcc: FourCC,
+    ) -> TensorImage:
+        """
+        Load an image from a file descriptor, inspecting the file descriptor to determine
+        the appropriate tensor type (DMA or SHM) based on the device major and minor numbers.
+
+        The `shape` parameter is used to specify the dimensions of the image tensor, 
+        which should correspond to the image data associated with the file descriptor. 
+        The expected shape is typically (height, width, channels) for packed formats 
+        or (channels, height, width) for planar formats.
+
+        The `fourcc` parameter is used to specify the pixel format of the image data.
+
+        This will take ownership of the file descriptor, and the file descriptor will 
+        be closed when the tensor is dropped.
         """
         ...
 
@@ -610,6 +643,7 @@ class TensorImage:
         """If the image format is planar."""
         ...
 
+
 class Flip(enum.Enum):
     NoFlip: Flip
     """No flip"""
@@ -617,6 +651,7 @@ class Flip(enum.Enum):
     """Flip the image horizontally"""
     Vertical: Flip
     """Flip the image vertically"""
+
 
 class Rotation(enum.Enum):
     Rotate0: Rotation
@@ -636,6 +671,7 @@ class Rotation(enum.Enum):
         """Get the Rotation enum variant corresponding to the specified angle in degrees clockwise. Valid angles are 0, 90, 180, and 270."""
         ...
 
+
 class Rect:
     """A crop rectangle defined by its top-left corner (left, top) and its dimensions (width, height)."""
 
@@ -649,10 +685,12 @@ class Rect:
     @property
     def height(self) -> int: ...
 
+
 class ImageProcessor:
     """Convert images between different formats, with optional rotation, flipping, and cropping."""
 
     def __init__(self) -> None: ...
+
     def render_to_image(
         self,
         dst: TensorImage,
