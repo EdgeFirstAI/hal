@@ -14,7 +14,7 @@ authors = ["Au-Zone Technologies <support@au-zone.com>"]
 homepage = "https://edgefirst.ai"
 repository = "https://github.com/EdgeFirstAI/hal"
 license = "Apache-2.0"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 readme = "README.md"
 
@@ -30,11 +30,11 @@ ctor = "0.4.2"
 divan = "0.1.21"
 dma-heap = "0.4.1"
 # Internal crates
-edgefirst-hal = { version = "0.6.1", path = "crates/hal" }
-edgefirst-decoder = { version = "0.6.1", path = "crates/decoder" }
-edgefirst-image = { version = "0.6.1", path = "crates/image" }
-edgefirst-tensor = { version = "0.6.1", path = "crates/tensor" }
-edgefirst-tracker = { version = "0.6.1", path = "crates/tracker" }
+edgefirst-hal = { version = "0.6.2", path = "crates/hal" }
+edgefirst-decoder = { version = "0.6.2", path = "crates/decoder" }
+edgefirst-image = { version = "0.6.2", path = "crates/image" }
+edgefirst-tensor = { version = "0.6.2", path = "crates/tensor" }
+edgefirst-tracker = { version = "0.6.2", path = "crates/tracker" }
 enum_dispatch = "0.3.13"
 env_logger = "0.11.8"
 fast-math = "0.1.1"
