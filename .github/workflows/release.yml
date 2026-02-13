@@ -83,7 +83,7 @@ jobs:
         run: pip install ${{ matrix.maturin-deps }}
 
       - name: Build wheels
-        run: maturin build --release -m crates/python/Cargo.toml ${{ matrix.maturin-args }}
+        run: maturin build --release -m crates/python/Cargo.toml --features abi3-py311 ${{ matrix.maturin-args }}
 
       - name: Upload wheels
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
