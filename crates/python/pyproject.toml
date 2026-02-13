@@ -2,7 +2,7 @@
 name = "edgefirst_hal"
 version = "0.6.1"
 description = "Hardware Abstraction Layer for edge AI with zero-copy tensors, image processing, and YOLO decoding"
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
 authors = [
     {name = "Au-Zone Technologies", email = "support@au-zone.com"}
@@ -31,9 +31,6 @@ classifiers = [
     "Operating System :: MacOS",
     "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",

@@ -393,6 +393,12 @@ impl PyTensor {
     #[pyo3(signature = (fd, shape, dtype = "float32", name = None))]
     fn from_fd(fd: RawFd, shape: Vec<usize>, dtype: &str, name: Option<&str>) -> Result<Self> {
         use std::os::fd::FromRawFd;
+        if fd < 0 {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Invalid file descriptor",
+            )));
+        }
 
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
 
