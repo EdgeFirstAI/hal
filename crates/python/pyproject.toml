@@ -1,6 +1,6 @@
 [project]
 name = "edgefirst_hal"
-version = "0.6.0"
+version = "0.6.1"
 description = "Hardware Abstraction Layer for edge AI with zero-copy tensors, image processing, and YOLO decoding"
 requires-python = ">=3.8"
 license = {text = "Apache-2.0"}
