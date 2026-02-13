@@ -562,7 +562,8 @@ class TensorImage:
             The `shape` parameter is used to specify the dimensions of the image tensor, 
             which should correspond to the image data associated with the file descriptor. 
             The expected shape is typically (height, width, channels) for packed formats 
-            or (channels, height, width) for planar formats.
+            or (channels, height, width) for planar formats. NV12 has a special expected 
+            shape of (height * 3 / 2, width) due to its semi-planar format.
 
             The `fourcc` parameter is used to specify the pixel format of the image data.
 
