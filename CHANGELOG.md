@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Linux aarch64 (ARM64) Python wheels built natively on `ubuntu-22.04-arm`
   with `manylinux2014` compatibility, published to PyPI and GitHub Releases
 
+### Fixed
+
+- Enable PyO3 stable ABI (`abi3-py311`) so wheels are recognized as compatible
+  binary distributions by pip on Python 3.11+ instead of falling back to
+  source builds
+
 ## [0.6.0] - 2026-02-13
 
 ### Changed
