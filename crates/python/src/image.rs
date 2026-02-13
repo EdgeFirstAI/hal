@@ -23,6 +23,8 @@ use numpy::{
     PyUntypedArrayMethods,
 };
 use pyo3::prelude::*;
+#[cfg(target_os = "linux")]
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::{
     fmt::{self},
     sync::Mutex,
@@ -199,6 +201,16 @@ impl PyTensorImage {
         let fourcc: FourCharCode = fourcc.into();
         let mem = mem.map(|x| x.into());
         let tensor_image = image::TensorImage::new(width, height, fourcc, mem)?;
+        Ok(PyTensorImage(tensor_image))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[staticmethod]
+    #[pyo3(signature = (fd, shape, fourcc))]
+    pub fn from_fd(fd: RawFd, shape: Vec<usize>, fourcc: FourCC) -> Result<Self> {
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let tensor = tensor::Tensor::from_fd(fd, &shape, None)?;
+        let tensor_image = image::TensorImage::from_tensor(tensor, fourcc.into())?;
         Ok(PyTensorImage(tensor_image))
     }
 
