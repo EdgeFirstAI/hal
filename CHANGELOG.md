@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-02-13
+
+### Added
+
+- `TensorImage.from_fd()` Python method to create tensor images from
+  file descriptors (Linux only), enabling zero-copy DMA-buf sharing
+  with external processes
+- Linux aarch64 (ARM64) Python wheels built natively on `ubuntu-22.04-arm`
+  with `manylinux2014` compatibility, published to PyPI and GitHub Releases
+
+### Changed
+
+- PyO3 stable ABI is now opt-in via `abi3-py311` and `abi3-py38` Cargo
+  features instead of being the default; CI workflows pass
+  `--features abi3-py311` to build portable wheels for Python 3.11+
+  while local development builds target the exact installed Python version
+
 ## [0.6.1] - 2026-02-13
 
 ### Added

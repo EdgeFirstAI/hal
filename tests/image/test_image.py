@@ -16,7 +16,6 @@ import numpy as np
 from PIL import Image
 import math
 import os
-import sys
 import pytest
 
 
@@ -154,7 +153,9 @@ def test_from_fd_dma():
     try:
         img = TensorImage.from_fd(fd, [720, 1280, 4], FourCC.RGBA)
         with img.map() as m:
-            data = np.frombuffer(m.view(), dtype=np.uint8).reshape((img.height, img.width, 4))
+            data = np.frombuffer(m.view(), dtype=np.uint8).reshape(
+                (img.height, img.width, 4)
+            )
             assert (data == 233).all()
     except Exception:
         os.close(fd)
@@ -174,7 +175,9 @@ def test_from_fd_shm():
     try:
         img = TensorImage.from_fd(fd, [720, 1280, 4], FourCC.RGBA)
         with img.map() as m:
-            data = np.frombuffer(m.view(), dtype=np.uint8).reshape((img.height, img.width, 4))
+            data = np.frombuffer(m.view(), dtype=np.uint8).reshape(
+                (img.height, img.width, 4)
+            )
             assert (data == 233).all()
     except Exception:
         os.close(fd)
