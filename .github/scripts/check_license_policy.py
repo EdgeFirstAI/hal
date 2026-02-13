@@ -25,7 +25,7 @@ LICENSE_OVERRIDES = {
     "edgefirst-tensor@0.5.0": "Apache-2.0",
     "edgefirst-tracker@0.5.0": "Apache-2.0",
     "edgefirst_hal@0.5.0": "Apache-2.0",  # Python package name
-    "g2d-sys@1.0.1": "Apache-2.0",
+    "g2d-sys@1.2.0": "Apache-2.0",
     # Unversioned entries (from scancode source scan)
     "edgefirst-hal@unknown": "Apache-2.0",
     "edgefirst-hal-capi@unknown": "Apache-2.0",

@@ -1,0 +1,660 @@
+# Benchmark workflow for EdgeFirst HAL
+#
+# Runs Rust and Python benchmarks on NXP i.MX 8M Plus target hardware.
+# Triggered manually via GitHub Actions UI (workflow_dispatch).
+#
+# Pipeline:
+#   build-benchmarks (aarch64) → run-benchmarks (imx8mp) → process-results (charts + summary)
+#
+# Action Versions (hash-pinned per SPS v2.1):
+# - actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 (v4)
+# - actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 (v5)
+# - actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 (v4)
+# - actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 (v4)
+# - dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b (stable)
+# - Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 (v2.8.2)
+
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ==========================================================================
+  # Phase 1: Build Benchmark Binaries on ARM Runner
+  # ==========================================================================
+  build-benchmarks:
+    name: Build Benchmarks (aarch64)
+    runs-on: ubuntu-22.04-arm
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          lfs: true
+
+      - name: Checkout LFS objects
+        run: git lfs checkout
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential python3-dev clang libclang-dev libopencv-dev
+
+      - name: Set up Rust stable toolchain
+        uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5  # v2.8.2
+        with:
+          shared-key: rust-aarch64-bench
+          cache-on-failure: true
+
+      - name: Build benchmark binaries
+        run: |
+          cargo bench --workspace --all-features --no-run 2>&1
+          mkdir -p benchmark-binaries
+          for name in decoder_benchmark image_benchmark pipeline_benchmark tensor_benchmark; do
+            find target/release/deps -maxdepth 1 -type f -executable -name "${name}-*" \
+              ! -name '*.so' ! -name '*.d' ! -name '*.rlib' -print0 | \
+              xargs -0 -I{} sh -c 'cp "$1" benchmark-binaries/ && echo "Copied: $(basename "$1")"' sh '{}'
+          done
+          ls -la benchmark-binaries/
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: '3.11'
+
+      - name: Build Python wheel
+        run: |
+          python3 -m venv venv
+          venv/bin/pip install --upgrade pip setuptools wheel maturin[patchelf]
+          echo "PYO3_PYTHON=$(which python3)" >> $GITHUB_ENV
+          venv/bin/maturin build \
+            --manifest-path crates/python/Cargo.toml \
+            --out target/wheels \
+            --release
+
+      - name: Upload benchmark binaries
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: benchmark-binaries-aarch64
+          path: benchmark-binaries/
+          retention-days: 7
+
+      - name: Upload Python wheel
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: benchmark-wheel-aarch64
+          path: target/wheels/*.whl
+          retention-days: 7
+
+      - name: Upload testdata
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: benchmark-testdata
+          path: testdata/
+          retention-days: 7
+
+  # ==========================================================================
+  # Phase 2: Run Rust Benchmarks on Target Hardware (NXP i.MX 8M Plus)
+  # ==========================================================================
+  run-rust-benchmarks:
+    name: Rust Benchmarks (i.MX 8M Plus)
+    needs: build-benchmarks
+    runs-on: nxp-imx8mp-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Clean workspace
+        run: rm -rf benchmark-binaries/ benchmark-results/ testdata/ 2>/dev/null || true
+
+      - name: Download benchmark binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: benchmark-binaries-aarch64
+          path: benchmark-binaries/
+
+      - name: Download testdata
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: benchmark-testdata
+          path: testdata/
+
+      - name: Make binaries executable
+        run: chmod +x benchmark-binaries/*
+
+      - name: Run benchmarks
+        run: |
+          mkdir -p benchmark-results
+
+          echo "=== System Info ==="
+          uname -a
+          cat /proc/cpuinfo | head -30
+          free -h
+          echo "=== DMA heap ===" && ls -la /dev/dma_heap/ 2>/dev/null || echo "Not found"
+          echo "=== G2D ===" && ls -la /dev/galcore 2>/dev/null || echo "Not found"
+
+          export EDGEFIRST_TESTDATA=$(pwd)/testdata
+
+          for bench in benchmark-binaries/*; do
+            if [ -f "$bench" ] && [ -x "$bench" ]; then
+              name=$(basename "$bench")
+              echo ""
+              echo "=== Running $name ==="
+              "$bench" --bench --save-baseline github-ci 2>&1 | tee "benchmark-results/${name}.txt"
+            fi
+          done
+
+          # Package Criterion JSON data
+          if [ -d "target/criterion" ]; then
+            echo "Packaging Criterion JSON data..."
+            tar -czf benchmark-results/criterion-data.tar.gz -C target criterion
+          fi
+
+      - name: Upload Rust benchmark results
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: rust-benchmark-results
+          path: benchmark-results/
+          retention-days: 30
+
+  # ==========================================================================
+  # Phase 3: Run Python Benchmarks on Target Hardware (NXP i.MX 8M Plus)
+  # ==========================================================================
+  run-python-benchmarks:
+    name: Python Benchmarks (i.MX 8M Plus)
+    needs: build-benchmarks
+    runs-on: nxp-imx8mp-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          lfs: false
+
+      - name: Download Python wheel
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: benchmark-wheel-aarch64
+          path: wheels/
+
+      - name: Download testdata
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: benchmark-testdata
+          path: testdata/
+
+      - name: Set up Python environment
+        run: |
+          python3 -m venv venv
+          venv/bin/pip install --upgrade pip
+          venv/bin/pip install pytest pytest-benchmark numpy pillow psutil
+          venv/bin/pip install wheels/*.whl
+
+      - name: Run Python benchmarks
+        run: |
+          source venv/bin/activate
+          mkdir -p python-benchmark-results
+
+          echo "=== Running Python benchmarks on $(hostname) ==="
+          uname -a
+          python3 --version
+
+          export EDGEFIRST_TESTDATA=$(pwd)/testdata
+
+          # Run pytest-benchmark if benchmark files exist
+          if find tests/ -name "bench_*.py" -o -name "*_bench.py" | grep -q .; then
+            pytest tests/ -k "bench" \
+              --benchmark-only \
+              --benchmark-json=python-benchmark-results/benchmark.json \
+              --benchmark-columns=min,max,mean,stddev \
+              --benchmark-disable-gc \
+              -v 2>&1 | tee python-benchmark-results/benchmark.txt
+          else
+            echo "No Python benchmark files found" | tee python-benchmark-results/benchmark.txt
+          fi
+
+          # Run standalone benchmark script if it exists
+          if [ -f "benchmarks/benchmark.py" ]; then
+            python benchmarks/benchmark.py --json python-benchmark-results/standalone.json \
+              2>&1 | tee -a python-benchmark-results/benchmark.txt
+          fi
+
+      - name: Upload Python benchmark results
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: python-benchmark-results
+          path: python-benchmark-results/
+          retention-days: 30
+
+  # ==========================================================================
+  # Phase 4: Process Results and Generate Charts
+  # ==========================================================================
+  process-results:
+    name: Process Results & Charts
+    needs: [run-rust-benchmarks, run-python-benchmarks]
+    runs-on: ubuntu-22.04-arm
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Download Rust benchmark results
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: rust-benchmark-results
+          path: rust-benchmark-results/
+
+      - name: Download Python benchmark results
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: python-benchmark-results
+          path: python-benchmark-results/
+
+      - name: Parse and format benchmark results
+        run: |
+          # Combine raw text output
+          echo "=== Rust Benchmarks ===" > benchmark-output.txt
+          cat rust-benchmark-results/*.txt >> benchmark-output.txt 2>/dev/null || echo "No Rust benchmarks" >> benchmark-output.txt
+          echo "" >> benchmark-output.txt
+          echo "=== Python Benchmarks ===" >> benchmark-output.txt
+          cat python-benchmark-results/benchmark.txt >> benchmark-output.txt 2>/dev/null || echo "No Python benchmarks" >> benchmark-output.txt
+
+          # Extract Criterion JSON data
+          if [ -f rust-benchmark-results/criterion-data.tar.gz ]; then
+            echo "Extracting Criterion JSON data..."
+            tar -xzf rust-benchmark-results/criterion-data.tar.gz
+          fi
+
+          # Parse all benchmark data into a unified JSON
+          python3 << 'PARSE_SCRIPT'
+          import json
+          import os
+          import glob
+          import re
+
+          rust_benchmarks = []
+          python_benchmarks = []
+
+          # ── Parse Criterion JSON files for Rust benchmarks ──
+          criterion_dir = 'criterion'
+          if os.path.isdir(criterion_dir):
+              print("Using Criterion JSON data for Rust benchmarks")
+              for bench_json in glob.glob(f'{criterion_dir}/**/new/benchmark.json', recursive=True):
+                  estimates_json = os.path.join(os.path.dirname(bench_json), 'estimates.json')
+                  if not os.path.exists(estimates_json):
+                      continue
+                  try:
+                      with open(bench_json) as f:
+                          bench_data = json.load(f)
+                      with open(estimates_json) as f:
+                          estimates = json.load(f)
+
+                      full_id = bench_data.get('full_id', '')
+                      if not full_id:
+                          continue
+
+                      # Use slope if available (more accurate), else median
+                      time_data = estimates.get('slope') or estimates.get('median', {})
+                      point_estimate = time_data.get('point_estimate')
+                      if point_estimate is None:
+                          continue
+
+                      ns = float(point_estimate)
+
+                      # Format time string
+                      if ns >= 1e9:
+                          time_str = f"{ns/1e9:.4f} s"
+                      elif ns >= 1e6:
+                          time_str = f"{ns/1e6:.4f} ms"
+                      elif ns >= 1e3:
+                          time_str = f"{ns/1e3:.4f} us"
+                      else:
+                          time_str = f"{ns:.4f} ns"
+
+                      # Calculate throughput
+                      thrpt_str = 'N/A'
+                      throughput = bench_data.get('throughput', {})
+                      if throughput:
+                          bytes_per_iter = throughput.get('Bytes')
+                          if bytes_per_iter and ns > 0:
+                              bps = bytes_per_iter * 1e9 / ns
+                              if bps >= 1024**3:
+                                  thrpt_str = f"{bps/1024**3:.2f} GiB/s"
+                              elif bps >= 1024**2:
+                                  thrpt_str = f"{bps/1024**2:.2f} MiB/s"
+                              else:
+                                  thrpt_str = f"{bps/1024:.2f} KiB/s"
+
+                      rust_benchmarks.append({
+                          'name': full_id,
+                          'time': time_str,
+                          'time_ns': ns,
+                          'throughput': thrpt_str,
+                      })
+                  except Exception as e:
+                      print(f"Warning: Failed to parse {bench_json}: {e}")
+
+          # ── Fallback: parse Criterion text output ──
+          if not rust_benchmarks:
+              print("No Criterion JSON found, parsing text output")
+              for txt_file in glob.glob('rust-benchmark-results/*.txt'):
+                  with open(txt_file) as f:
+                      for line in f:
+                          # Match: "benchmark_name  time:   [1.234 ms 1.345 ms 1.456 ms]"
+                          m = re.match(r'^(\S+)\s+time:\s+\[[\d.]+ \w+ ([\d.]+) (\w+)', line.strip())
+                          if m:
+                              name, val, unit = m.group(1), float(m.group(2)), m.group(3)
+                              mult = {'ns': 1, 'us': 1e3, 'ms': 1e6, 's': 1e9}
+                              ns = val * mult.get(unit, 1)
+                              rust_benchmarks.append({
+                                  'name': name,
+                                  'time': f"{val:.4f} {unit}",
+                                  'time_ns': ns,
+                                  'throughput': 'N/A',
+                              })
+
+          # ── Parse Python benchmark JSON ──
+          for py_json in ['python-benchmark-results/benchmark.json', 'python-benchmark-results/standalone.json']:
+              if not os.path.exists(py_json):
+                  continue
+              try:
+                  with open(py_json) as f:
+                      py_data = json.load(f)
+                  for bench in py_data.get('benchmarks', []):
+                      name = bench.get('name', '')
+                      stats = bench.get('stats', {})
+                      mean_s = stats.get('mean', 0)
+                      ns = mean_s * 1e9
+                      if ns >= 1e6:
+                          time_str = f"{ns/1e6:.4f} ms"
+                      elif ns >= 1e3:
+                          time_str = f"{ns/1e3:.4f} us"
+                      else:
+                          time_str = f"{ns:.4f} ns"
+                      python_benchmarks.append({
+                          'name': name,
+                          'time': time_str,
+                          'time_ns': ns,
+                          'throughput': 'N/A',
+                      })
+              except Exception as e:
+                  print(f"Warning: Failed to parse {py_json}: {e}")
+
+          with open('benchmarks.json', 'w') as f:
+              json.dump({'rust': rust_benchmarks, 'python': python_benchmarks}, f, indent=2)
+
+          print(f"Parsed {len(rust_benchmarks)} Rust benchmarks, {len(python_benchmarks)} Python benchmarks")
+          PARSE_SCRIPT
+
+      - name: Generate benchmark summary with charts
+        run: |
+          python3 << 'GENERATE_SCRIPT'
+          import json
+          import re
+          import urllib.parse
+
+          with open('benchmarks.json') as f:
+              data = json.load(f)
+
+          rust_benchmarks = data.get('rust', [])
+          python_benchmarks = data.get('python', [])
+
+          def parse_time_to_us(time_str):
+              """Convert time string to microseconds."""
+              m = re.match(r'([\d.]+)\s*(\w+)', time_str)
+              if not m:
+                  return None
+              val, unit = float(m.group(1)), m.group(2)
+              mult = {'ns': 0.001, 'us': 1, 'ms': 1000, 's': 1000000}
+              return val * mult.get(unit, 1)
+
+          def format_time(us):
+              """Format microseconds to human-readable string."""
+              if us >= 1000:
+                  return f"{us/1000:.2f} ms"
+              elif us >= 1:
+                  return f"{us:.2f} us"
+              else:
+                  return f"{us*1000:.2f} ns"
+
+          def quickchart_url(config, width=700, height=None):
+              """Generate QuickChart URL from Chart.js config."""
+              chart_json = json.dumps(config, separators=(',', ':'))
+              h = height or max(250, len(config['data']['labels']) * 45 + 80)
+              return f"https://quickchart.io/chart?c={urllib.parse.quote(chart_json)}&w={width}&h={h}"
+
+          # ── Categorize Rust benchmarks by group ──
+          # Group by the first path component (e.g., "letterbox/cpu/..." → "letterbox")
+          groups = {}
+          for b in rust_benchmarks:
+              parts = b['name'].split('/')
+              group = parts[0] if parts else 'other'
+              if group not in groups:
+                  groups[group] = []
+              groups[group].append(b)
+
+          with open('benchmark-summary.md', 'w') as f:
+              f.write("## 📊 EdgeFirst HAL Benchmark Results\n\n")
+              f.write("**Target Hardware:** NXP i.MX 8M Plus (Cortex-A53 @ 1.8 GHz, 4 cores)\n")
+              f.write("**Architecture:** aarch64 · **OS:** Linux\n")
+              total = len(rust_benchmarks) + len(python_benchmarks)
+              f.write(f"**Total Benchmarks:** {total} (Rust: {len(rust_benchmarks)}, Python: {len(python_benchmarks)})\n\n")
+
+              if rust_benchmarks:
+                  f.write("---\n\n")
+                  f.write("## 🦀 Rust Benchmarks\n\n")
+
+              for group_name, benchmarks in sorted(groups.items()):
+                  f.write(f"### {group_name}\n\n")
+
+                  # ── Table ──
+                  f.write("| Benchmark | Time | Throughput |\n")
+                  f.write("|-----------|------|------------|\n")
+
+                  chart_labels = []
+                  chart_times = []
+
+                  for b in sorted(benchmarks, key=lambda x: x.get('time_ns', 0)):
+                      # Strip the group prefix for display
+                      display_name = '/'.join(b['name'].split('/')[1:]) or b['name']
+                      f.write(f"| {display_name} | {b['time']} | {b['throughput']} |\n")
+
+                      us = parse_time_to_us(b['time'])
+                      if us is not None:
+                          chart_labels.append(display_name)
+                          chart_times.append(round(us, 2))
+
+                  f.write("\n")
+
+                  # ── Chart ──
+                  if chart_labels:
+                      # Determine best unit for axis
+                      max_val = max(chart_times) if chart_times else 0
+                      if max_val >= 1000:
+                          axis_unit = "ms"
+                          chart_values = [round(t / 1000, 3) for t in chart_times]
+                      else:
+                          axis_unit = "us"
+                          chart_values = chart_times
+
+                      # Group by processor type for comparison charts
+                      # Try to detect comparison groups (e.g., cpu vs g2d vs opengl)
+                      processors = {}
+                      for label, val in zip(chart_labels, chart_values):
+                          parts = label.split('/')
+                          if len(parts) >= 2:
+                              proc = parts[0]  # e.g., "cpu", "g2d", "opengl"
+                              variant = '/'.join(parts[1:])
+                          else:
+                              proc = 'default'
+                              variant = label
+                          if proc not in processors:
+                              processors[proc] = {}
+                          processors[proc][variant] = val
+
+                      if len(processors) > 1:
+                          # Comparison chart: group by processor
+                          all_variants = sorted(set(v for p in processors.values() for v in p))
+
+                          colors = [
+                              ("rgba(54, 162, 235, 0.8)", "rgba(54, 162, 235, 1)"),    # blue
+                              ("rgba(255, 99, 132, 0.8)", "rgba(255, 99, 132, 1)"),    # red
+                              ("rgba(75, 192, 192, 0.8)", "rgba(75, 192, 192, 1)"),    # teal
+                              ("rgba(255, 206, 86, 0.8)", "rgba(255, 206, 86, 1)"),    # yellow
+                              ("rgba(153, 102, 255, 0.8)", "rgba(153, 102, 255, 1)"),  # purple
+                          ]
+
+                          datasets = []
+                          for i, (proc_name, proc_data) in enumerate(sorted(processors.items())):
+                              bg, border = colors[i % len(colors)]
+                              datasets.append({
+                                  "label": proc_name,
+                                  "data": [proc_data.get(v, 0) for v in all_variants],
+                                  "backgroundColor": bg,
+                                  "borderColor": border,
+                                  "borderWidth": 1,
+                              })
+
+                          chart_config = {
+                              "type": "horizontalBar",
+                              "data": {
+                                  "labels": all_variants,
+                                  "datasets": datasets,
+                              },
+                              "options": {
+                                  "title": {"display": True, "text": f"{group_name} Latency Comparison ({axis_unit})"},
+                                  "scales": {
+                                      "xAxes": [{"ticks": {"beginAtZero": True},
+                                                  "scaleLabel": {"display": True, "labelString": f"Time ({axis_unit})"}}],
+                                  },
+                                  "plugins": {
+                                      "datalabels": {
+                                          "display": True,
+                                          "anchor": "end",
+                                          "align": "end",
+                                          "font": {"size": 10},
+                                      },
+                                  },
+                              },
+                          }
+                      else:
+                          # Single-series chart
+                          chart_config = {
+                              "type": "horizontalBar",
+                              "data": {
+                                  "labels": chart_labels,
+                                  "datasets": [{
+                                      "label": f"Time ({axis_unit})",
+                                      "data": chart_values,
+                                      "backgroundColor": "rgba(54, 162, 235, 0.8)",
+                                      "borderColor": "rgba(54, 162, 235, 1)",
+                                      "borderWidth": 1,
+                                  }],
+                              },
+                              "options": {
+                                  "title": {"display": True, "text": f"{group_name} Latency ({axis_unit})"},
+                                  "scales": {
+                                      "xAxes": [{"ticks": {"beginAtZero": True},
+                                                  "scaleLabel": {"display": True, "labelString": f"Time ({axis_unit})"}}],
+                                  },
+                                  "plugins": {
+                                      "datalabels": {
+                                          "display": True,
+                                          "anchor": "end",
+                                          "align": "end",
+                                          "font": {"size": 10},
+                                      },
+                                  },
+                              },
+                          }
+
+                      f.write(f"![{group_name} Chart]({quickchart_url(chart_config)})\n\n")
+
+              # ── Python benchmarks ──
+              if python_benchmarks:
+                  f.write("---\n\n")
+                  f.write("## 🐍 Python Benchmarks\n\n")
+                  f.write("| Benchmark | Time |\n")
+                  f.write("|-----------|------|\n")
+                  for b in sorted(python_benchmarks, key=lambda x: x.get('time_ns', 0)):
+                      f.write(f"| {b['name']} | {b['time']} |\n")
+                  f.write("\n")
+
+                  # Python chart
+                  py_labels = []
+                  py_values = []
+                  for b in sorted(python_benchmarks, key=lambda x: x.get('time_ns', 0)):
+                      us = parse_time_to_us(b['time'])
+                      if us is not None:
+                          py_labels.append(b['name'])
+                          py_values.append(round(us / 1000, 3) if us >= 1000 else round(us, 2))
+
+                  if py_labels:
+                      py_unit = "ms" if any(parse_time_to_us(b['time']) >= 1000 for b in python_benchmarks if parse_time_to_us(b['time'])) else "us"
+                      chart_config = {
+                          "type": "horizontalBar",
+                          "data": {
+                              "labels": py_labels,
+                              "datasets": [{
+                                  "label": f"Time ({py_unit})",
+                                  "data": py_values,
+                                  "backgroundColor": "rgba(75, 192, 192, 0.8)",
+                                  "borderColor": "rgba(75, 192, 192, 1)",
+                                  "borderWidth": 1,
+                              }],
+                          },
+                          "options": {
+                              "title": {"display": True, "text": f"Python Benchmark Latency ({py_unit})"},
+                              "scales": {
+                                  "xAxes": [{"ticks": {"beginAtZero": True},
+                                              "scaleLabel": {"display": True, "labelString": f"Time ({py_unit})"}}],
+                              },
+                              "plugins": {
+                                  "datalabels": {"display": True, "anchor": "end", "align": "end", "font": {"size": 10}},
+                              },
+                          },
+                      }
+                      f.write(f"![Python Benchmarks Chart]({quickchart_url(chart_config)})\n\n")
+
+              # ── Summary ──
+              f.write("---\n\n")
+              f.write("## Summary\n\n")
+              f.write(f"- **Rust benchmarks:** {len(rust_benchmarks)}\n")
+              f.write(f"- **Python benchmarks:** {len(python_benchmarks)}\n")
+              f.write(f"- **Total:** {total}\n")
+
+          print("Generated benchmark-summary.md")
+          GENERATE_SCRIPT
+
+      - name: Write job summary
+        run: |
+          cat benchmark-summary.md >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "<details>" >> $GITHUB_STEP_SUMMARY
+          echo "<summary>📋 Full Benchmark Output</summary>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat benchmark-output.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "</details>" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload processed results
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: benchmark-results
+          path: |
+            benchmark-output.txt
+            benchmark-summary.md
+            benchmarks.json
+          retention-days: 90

@@ -5,7 +5,6 @@
 #   - Parallel aarch64 testing: build-arm → test-arm + hardware-test in parallel
 #   - Full coverage collection (Rust + Python) with profiling builds
 #   - SonarCloud static analysis and coverage aggregation
-#   - Hardware benchmarks on target (imx8mp)
 #
 # Build Configuration:
 #   - Cargo profile: profiling (inherits release, optimized with debug symbols)
@@ -696,7 +695,7 @@ jobs:
           ignore_runs: true
 
   # ===========================================================================
-  # Hardware Testing + Benchmarks on NXP i.MX8M Plus
+  # Hardware Testing on NXP i.MX8M Plus
   # ===========================================================================
   hardware-test:
     name: Hardware Test (imx8mp)
@@ -710,7 +709,7 @@ jobs:
     steps:
       - name: Clean workspace
         run: |
-          rm -rf build/ venv/ target/ rust-tests/ benchmark-results/ testdata/ 2>/dev/null || true
+          rm -rf build/ venv/ target/ rust-tests/ testdata/ 2>/dev/null || true
           find . -name "*.gcda" -o -name "*.profraw" -delete 2>/dev/null || true
 
       - name: Checkout code
@@ -735,7 +734,7 @@ jobs:
           python3 -m venv venv
           echo "${{ github.workspace }}/venv/bin" >> $GITHUB_PATH
           venv/bin/pip install --upgrade pip setuptools wheel
-          venv/bin/pip install slipcover pytest pytest-timeout pytest-benchmark numpy pillow psutil
+          venv/bin/pip install slipcover pytest pytest-timeout numpy pillow psutil
           # Install Python bindings from pre-built wheel (built with profiling profile on aarch64)
           venv/bin/pip install target/wheels/*.whl
 
@@ -795,32 +794,6 @@ jobs:
             echo "C API test binary not found, skipping"
           fi
 
-      - name: Run benchmarks (main branch only)
-        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
-        run: |
-          mkdir -p benchmark-results
-          echo "=== System Info ===" > benchmark-results/system-info.txt
-          uname -a >> benchmark-results/system-info.txt
-          cat /proc/cpuinfo | head -30 >> benchmark-results/system-info.txt
-          free -h >> benchmark-results/system-info.txt
-          export LD_LIBRARY_PATH=$(pwd)/target/profiling:$LD_LIBRARY_PATH
-          if [ -f "benchmarks/benchmark.py" ]; then
-            venv/bin/python benchmarks/benchmark.py --json benchmark-results/benchmark.json
-          else
-            venv/bin/python -c "
-          import time, json, numpy as np
-          results = {'benchmarks': {}}
-          start = time.perf_counter()
-          for _ in range(100):
-              img = np.random.randint(0, 255, (1080, 1920, 3), dtype=np.uint8)
-          elapsed = time.perf_counter() - start
-          results['benchmarks']['numpy_random_1080p'] = {'mean': elapsed/100*1000, 'unit': 'ms'}
-          with open('benchmark-results/benchmark.json', 'w') as f:
-              json.dump(results, f, indent=2)
-          print('Basic benchmark completed')
-          "
-          fi
-
       - name: Generate JUnit XML from Rust results
         if: always()
         run: python3 .github/scripts/generate_junit_xml.py build/rust-test-results build/rust_hardware_results.xml
@@ -847,16 +820,6 @@ jobs:
             build/test-metrics-capi-imx8mp.txt
           retention-days: 30
 
-      - name: Upload benchmark results
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
-        if: always() && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
-        with:
-          name: benchmark-results
-          path: benchmark-results/
-          retention-days: 90
-
-      # Note: imx8mp is an embedded device without Docker/full Python tooling
-      # Test results are uploaded as artifacts; skip the publish action here
       - name: Test results summary (imx8mp)
         if: always()
         run: |
@@ -872,9 +835,6 @@ jobs:
             echo "- C API tests completed - see artifacts for details" >> $GITHUB_STEP_SUMMARY
           fi
 
-      - name: Generate benchmark summary
-        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
-        run: python3 .github/scripts/benchmark_summary.py benchmark-results/benchmark.json >> $GITHUB_STEP_SUMMARY
 
   # ===========================================================================
   # Process Hardware Coverage (profraw -> LCOV)

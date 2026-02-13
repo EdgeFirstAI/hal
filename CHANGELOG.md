@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Migrate `g2d-sys` from local crate to published `g2d-sys 1.2.0` from crates.io
+  (now maintained at [github.com/EdgeFirstAI/g2d-rs](https://github.com/EdgeFirstAI/g2d-rs))
+- G2D `convert_` now calls `g2d.finish()` once after queuing all operations
+  (clear + blit), reducing GPU synchronization barriers from 2 to 1 per frame
+- Letterbox clear is now controlled by the caller via `dst_color: Option<[u8; 4]>`:
+  `Some(color)` clears with the specified color before blit, `None` skips the clear
+  (preserving whatever is in the destination buffer, enabling custom backgrounds)
+
+### Removed
+
+- `TensorImage::cleared_state` field — clear caching removed; the caller is
+  responsible for deciding when to clear (e.g. skip clear for same-aspect-ratio
+  streams by passing `dst_color: None`)
+- `Crop::dst_clear_cache` field and `with_dst_clear_cache()` builder method —
+  replaced by the caller simply choosing `Some` or `None` for `dst_color`
+- `< 50%` area threshold for g2d_clear — always use hardware clear for supported
+  formats (2-byte and 4-byte pixel formats); CPU fallback only for RGB888
+
+### Fixed
+
+- Implement DRM PRIME attachment for DMA-buf cache coherency — `DMA_BUF_IOCTL_SYNC`
+  was previously a no-op on cached CMA heaps because no `dma_buf_attach` existed.
+  Each `DmaTensor` now creates a persistent DRM attachment via
+  `DRM_IOCTL_PRIME_FD_TO_HANDLE` to enable proper cache invalidation and flushing
+- G2D letterbox now always uses hardware `g2d_clear` with custom colors for
+  supported formats; 3-byte formats (RGB888) retain CPU fallback since G2D
+  hardware does not support them
+
+### Added
+
+- `DrmAttachment` struct in `edgefirst-tensor` for persistent DRM PRIME imports
+- Realistic letterbox pipeline benchmarks (`bench_letterbox_pipeline`) comparing
+  CPU vs G2D for 1920×1080 YUYV/RGBA → 640×640 RGBA letterbox with aspect bars
+- Make `CPUProcessor::fill_image_outside_crop` public for benchmark access
+
 ## [0.5.2] - 2026-02-12
 
 ### Changed

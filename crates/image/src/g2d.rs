@@ -68,7 +68,11 @@ impl G2DProcessor {
             src_surface.bottom = (crop_rect.top + crop_rect.height) as i32;
         }
 
-        // need to clear before assigning the crop
+        // Clear the destination with the letterbox color before blitting the
+        // image into the sub-region.
+        //
+        // g2d_clear does not support 3-byte-per-pixel formats (RGB888, BGR888).
+        // For those formats, fall back to CPU fill after the blit.
         let needs_clear = crop.dst_color.is_some()
             && crop.dst_rect.is_some_and(|dst_rect| {
                 dst_rect.left != 0
@@ -77,15 +81,11 @@ impl G2DProcessor {
                     || dst_rect.height != dst.height()
             });
 
-        let mut cleared = false;
         if needs_clear && dst.fourcc != RGB {
-            if let (Some(dst_rect), Some(dst_color)) = (crop.dst_rect, crop.dst_color) {
-                if dst_rect.width * dst_rect.height < dst.width() * dst.height() / 2 {
-                    let start = Instant::now();
-                    self.g2d.clear(&mut dst_surface, dst_color)?;
-                    log::trace!("clear takes {:?}", start.elapsed());
-                    cleared = true;
-                }
+            if let Some(dst_color) = crop.dst_color {
+                let start = Instant::now();
+                self.g2d.clear(&mut dst_surface, dst_color)?;
+                log::trace!("g2d clear takes {:?}", start.elapsed());
             }
         }
 
@@ -97,27 +97,18 @@ impl G2DProcessor {
             dst_surface.bottom = crop_rect.height as i32;
             dst_surface.width = crop_rect.width as i32;
             dst_surface.height = crop_rect.height as i32;
-
-            // right: img.width() as i32,
-            // bottom: img.height() as i32,
-            // stride: img.width() as i32,
-            // width: img.width() as i32,
-            // height: img.height() as i32,
-
-            // dst_surface.left = crop_rect.left as i32;
-            // dst_surface.top = crop_rect.top as i32;
-            // dst_surface.right = (crop_rect.left + crop_rect.width) as i32;
-            // dst_surface.bottom = (crop_rect.top + crop_rect.height) as i32;
         }
 
         log::trace!("Blitting from {src_surface:?} to {dst_surface:?}");
         self.g2d.blit(&src_surface, &dst_surface)?;
+        self.g2d.finish()?;
 
-        if needs_clear && !cleared {
+        // CPU fallback for RGB888 (unsupported by g2d_clear)
+        if needs_clear && dst.fourcc == RGB {
             if let (Some(dst_color), Some(dst_rect)) = (crop.dst_color, crop.dst_rect) {
                 let start = Instant::now();
                 CPUProcessor::fill_image_outside_crop(dst, dst_color, dst_rect)?;
-                log::trace!("clear takes {:?}", start.elapsed());
+                log::trace!("cpu fill takes {:?}", start.elapsed());
             }
         }
 
