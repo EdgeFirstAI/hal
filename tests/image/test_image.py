@@ -9,10 +9,15 @@ from edgefirst_hal import (
     Normalization,
     Rotation,
     Rect,
+    Tensor,
+    TensorMemory,
 )
 import numpy as np
 from PIL import Image
 import math
+import os
+import sys
+import pytest
 
 
 def load_image(image, format="RGBA", resize=None):
@@ -133,3 +138,43 @@ def test_rgba_to_rgb():
 def test_enum_cmp():
     dst = TensorImage(640, 640, fourcc=FourCC.RGBA)
     assert dst.format == FourCC.RGBA
+
+
+def test_from_fd_dma():
+    try:
+        tensor = Tensor([100, 100, 3], dtype="uint8", mem=TensorMemory.DMA)
+    except (AttributeError, RuntimeError):
+        pytest.skip("DMA memory not supported on this platform")
+
+    tensor = Tensor([720, 1280, 4], dtype="uint8", mem=TensorMemory.DMA)
+    with tensor.map() as m:
+        np.frombuffer(m.view(), dtype=np.uint8).fill(233)
+
+    fd = tensor.fd
+    try:
+        img = TensorImage.from_fd(fd, [720, 1280, 4], FourCC.RGBA)
+        with img.map() as m:
+            data = np.frombuffer(m.view(), dtype=np.uint8).reshape((img.height, img.width, 4))
+            assert (data == 233).all()
+    except Exception:
+        os.close(fd)
+
+
+def test_from_fd_shm():
+    try:
+        tensor = Tensor([100, 100, 3], dtype="uint8", mem=TensorMemory.SHM)
+    except (AttributeError, RuntimeError):
+        pytest.skip("SHM memory not supported on this platform")
+
+    tensor = Tensor([720, 1280, 4], dtype="uint8", mem=TensorMemory.SHM)
+    with tensor.map() as m:
+        np.frombuffer(m.view(), dtype=np.uint8).fill(233)
+
+    fd = tensor.fd
+    try:
+        img = TensorImage.from_fd(fd, [720, 1280, 4], FourCC.RGBA)
+        with img.map() as m:
+            data = np.frombuffer(m.view(), dtype=np.uint8).reshape((img.height, img.width, 4))
+            assert (data == 233).all()
+    except Exception:
+        os.close(fd)
