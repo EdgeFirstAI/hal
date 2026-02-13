@@ -734,7 +734,7 @@ jobs:
           python3 -m venv venv
           echo "${{ github.workspace }}/venv/bin" >> $GITHUB_PATH
           venv/bin/pip install --upgrade pip setuptools wheel
-          venv/bin/pip install slipcover pytest pytest-timeout numpy pillow psutil
+          venv/bin/pip install slipcover pytest pytest-timeout pytest-benchmark numpy pillow psutil
           # Install Python bindings from pre-built wheel (built with profiling profile on aarch64)
           venv/bin/pip install target/wheels/*.whl
 
