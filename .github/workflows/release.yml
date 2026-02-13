@@ -38,11 +38,27 @@ env:
 
 jobs:
   build-wheels:
-    name: Build wheels on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    name: Build wheels (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - name: x86_64-linux
+            runner: ubuntu-latest
+            maturin-args: --sdist --zig --compatibility manylinux2014
+            maturin-deps: maturin[patchelf,zig]
+          - name: aarch64-linux
+            runner: ubuntu-22.04-arm
+            maturin-args: --zig --compatibility manylinux2014
+            maturin-deps: maturin[patchelf,zig]
+          - name: windows
+            runner: windows-latest
+            maturin-args: --sdist
+            maturin-deps: maturin
+          - name: macos
+            runner: macos-latest
+            maturin-args: --sdist
+            maturin-deps: maturin
 
     steps:
       - name: Checkout code
@@ -63,26 +79,16 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install maturin (Linux)
-        if: runner.os == 'Linux'
-        run: pip install maturin[patchelf,zig]
+      - name: Install maturin
+        run: pip install ${{ matrix.maturin-deps }}
 
-      - name: Install maturin (Windows/macOS)
-        if: runner.os != 'Linux'
-        run: pip install maturin
-
-      - name: Build wheels (Linux with manylinux2014)
-        if: runner.os == 'Linux'
-        run: maturin build --release -m crates/python/Cargo.toml --sdist --zig --compatibility manylinux2014
-
-      - name: Build wheels (Windows/macOS)
-        if: runner.os != 'Linux'
-        run: maturin build --release -m crates/python/Cargo.toml --sdist
+      - name: Build wheels
+        run: maturin build --release -m crates/python/Cargo.toml ${{ matrix.maturin-args }}
 
       - name: Upload wheels
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: wheels-${{ matrix.os }}
+          name: wheels-${{ matrix.name }}
           path: target/wheels/*
 
   build-capi:
