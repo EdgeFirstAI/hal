@@ -19,6 +19,13 @@ fn main() {
         .expect("Unable to generate C bindings")
         .write_to_file(output_dir.join("hal.h"));
 
+    // Set SONAME for shared library versioning on Linux
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "linux" {
+        let major = env::var("CARGO_PKG_VERSION_MAJOR").unwrap();
+        println!("cargo:rustc-cdylib-link-arg=-Wl,-soname,libedgefirst_hal.so.{major}");
+    }
+
     // Tell cargo to re-run if source files change
     println!("cargo:rerun-if-changed=src/");
     println!("cargo:rerun-if-changed=cbindgen.toml");

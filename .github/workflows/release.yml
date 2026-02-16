@@ -127,8 +127,11 @@ jobs:
       - name: Package C API
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
+          MAJOR=$(echo "$VERSION" | cut -d. -f1)
+          MINOR=$(echo "$VERSION" | cut -d. -f2)
+          PATCH=$(echo "$VERSION" | cut -d. -f3)
           PKG_NAME="edgefirst-hal-capi-${VERSION}-${{ matrix.target }}"
-          mkdir -p "${PKG_NAME}/include/edgefirst" "${PKG_NAME}/lib"
+          mkdir -p "${PKG_NAME}/include/edgefirst" "${PKG_NAME}/lib" "${PKG_NAME}/lib/pkgconfig"
 
           # Copy documentation and license files
           cp crates/capi/README.md "${PKG_NAME}/"
@@ -138,9 +141,23 @@ jobs:
           # Copy header
           cp crates/capi/include/edgefirst/hal.h "${PKG_NAME}/include/edgefirst/"
 
-          # Copy libraries
-          cp "target/release/${{ matrix.lib_shared }}" "${PKG_NAME}/lib/" 2>/dev/null || true
+          # Copy shared library with versioned name and symlinks (GNU/Linux convention)
+          if [ -f "target/release/${{ matrix.lib_shared }}" ]; then
+            if [[ "${{ matrix.target }}" == *-linux ]]; then
+              cp "target/release/${{ matrix.lib_shared }}" "${PKG_NAME}/lib/libedgefirst_hal.so.${MAJOR}.${MINOR}.${PATCH}"
+              ln -s "libedgefirst_hal.so.${MAJOR}.${MINOR}.${PATCH}" "${PKG_NAME}/lib/libedgefirst_hal.so.${MAJOR}.${MINOR}"
+              ln -s "libedgefirst_hal.so.${MAJOR}.${MINOR}.${PATCH}" "${PKG_NAME}/lib/libedgefirst_hal.so.${MAJOR}"
+              ln -s "libedgefirst_hal.so.${MAJOR}.${MINOR}.${PATCH}" "${PKG_NAME}/lib/libedgefirst_hal.so"
+            else
+              cp "target/release/${{ matrix.lib_shared }}" "${PKG_NAME}/lib/"
+            fi
+          fi
+
+          # Copy static library
           cp target/release/libedgefirst_hal.a "${PKG_NAME}/lib/"
+
+          # Generate pkg-config file
+          sed "s/@VERSION@/${VERSION}/" crates/capi/edgefirst-hal.pc.in > "${PKG_NAME}/lib/pkgconfig/edgefirst-hal.pc"
 
           tar czf "${PKG_NAME}.tar.gz" "${PKG_NAME}"
           echo "PKG_NAME=${PKG_NAME}" >> "$GITHUB_ENV"
