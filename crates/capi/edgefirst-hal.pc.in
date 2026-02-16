@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
+# SPDX-License-Identifier: Apache-2.0
+
+prefix=/usr
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: edgefirst-hal
+Description: EdgeFirst HAL image processing library
+Version: @VERSION@
+Libs: -L${libdir} -ledgefirst_hal
+Cflags: -I${includedir}
