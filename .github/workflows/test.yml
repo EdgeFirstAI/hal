@@ -209,7 +209,9 @@ jobs:
             2>&1 | tee target/test-metrics-rust-x86_64.txt
 
       - name: Build C API library
-        run: cargo build --release -p edgefirst-hal-capi
+        run: |
+          cargo build --release -p edgefirst-hal-capi
+          ln -sf libedgefirst_hal.so target/release/libedgefirst_hal.so.0
 
       - name: Run C API tests
         run: |
@@ -458,7 +460,9 @@ jobs:
           ls -la hardware-test-binaries/ || echo "No test binaries found"
 
       - name: Build C API library
-        run: cargo build --release -p edgefirst-hal-capi
+        run: |
+          cargo build --release -p edgefirst-hal-capi
+          ln -sf libedgefirst_hal.so target/release/libedgefirst_hal.so.0
 
       - name: Build C API tests
         run: |
@@ -468,6 +472,7 @@ jobs:
           # Copy C API artifacts for testing
           mkdir -p hardware-capi-tests
           cp target/release/libedgefirst_hal.so hardware-capi-tests/
+          cp target/release/libedgefirst_hal.so.0 hardware-capi-tests/
           cp target/release/libedgefirst_hal.a hardware-capi-tests/ 2>/dev/null || true
           cp crates/capi/build/test_all hardware-capi-tests/
           echo "C API test artifacts:"
@@ -482,6 +487,7 @@ jobs:
             target/wheels/*.whl
             hardware-capi-tests/
             target/release/libedgefirst_hal.so
+            target/release/libedgefirst_hal.so.0
           retention-days: 7
 
       - name: Upload hardware test artifacts (binaries + wheels only)
