@@ -18,6 +18,7 @@ use log::{debug, error};
 use std::{
     collections::BTreeSet,
     ffi::{c_char, c_void, CStr, CString},
+    mem::ManuallyDrop,
     os::fd::AsRawFd,
     ptr::{null, null_mut, NonNull},
     rc::Rc,
@@ -73,7 +74,11 @@ pub(crate) struct GlContext {
     pub(crate) surface: Option<egl::Surface>,
     pub(crate) display: EglDisplayType,
     pub(crate) ctx: egl::Context,
-    pub(crate) egl: Rc<Egl>,
+    /// Wrapped in ManuallyDrop because the khronos-egl Dynamic instance's
+    /// Drop calls eglReleaseThread() which can panic during process shutdown
+    /// if the EGL library has been partially unloaded. We drop it explicitly
+    /// inside catch_unwind in GlContext::drop.
+    pub(crate) egl: ManuallyDrop<Rc<Egl>>,
 }
 
 pub(crate) enum EglDisplayType {
@@ -178,7 +183,7 @@ impl GlContext {
         let headless = GlContext {
             display,
             ctx,
-            egl,
+            egl: ManuallyDrop::new(egl),
             surface,
             support_dma,
         };
@@ -400,19 +405,39 @@ impl GlContext {
 
 impl Drop for GlContext {
     fn drop(&mut self) {
-        let _ = self
-            .egl
-            .make_current(self.display.as_display(), None, None, None);
+        // During process shutdown (e.g. Python interpreter exit), the EGL/GL
+        // shared libraries may already be partially unloaded, causing panics
+        // or heap corruption when calling cleanup functions. We suppress
+        // panic output and catch panics to prevent propagation.
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = self
+                .egl
+                .make_current(self.display.as_display(), None, None, None);
 
-        let _ = self
-            .egl
-            .destroy_context(self.display.as_display(), self.ctx);
+            let _ = self
+                .egl
+                .destroy_context(self.display.as_display(), self.ctx);
 
-        if let Some(surface) = self.surface.take() {
-            let _ = self.egl.destroy_surface(self.display.as_display(), surface);
-        }
+            if let Some(surface) = self.surface.take() {
+                let _ = self.egl.destroy_surface(self.display.as_display(), surface);
+            }
 
-        let _ = self.egl.terminate(self.display.as_display());
+            // Note: eglTerminate is intentionally omitted. The context and
+            // surface are already destroyed above, and calling terminate after
+            // individual resource destruction can cause double-free issues on
+            // some EGL drivers (observed as heap corruption on ARM targets
+            // during process shutdown).
+        }));
+        std::panic::set_hook(prev_hook);
+
+        // The Rc<Egl> (ManuallyDrop) is intentionally NOT dropped. The
+        // khronos-egl Dynamic instance's Drop calls eglReleaseThread() which
+        // panics if the EGL library has been unloaded (local/x86_64) or
+        // causes heap corruption by calling into invalid memory (ARM). Since
+        // EGL display connections are process-scoped singletons, leaking the
+        // Rc is harmless — the OS reclaims all resources on process exit.
     }
 }
 
@@ -1964,7 +1989,7 @@ impl GLProcessorST {
         Ok(EglImage {
             egl_image: image,
             display: self.gl_context.display.as_display(),
-            egl: self.gl_context.egl.clone(),
+            egl: Rc::clone(&self.gl_context.egl),
         })
     }
 
@@ -2378,10 +2403,13 @@ impl Drop for EglImage {
             return;
         }
 
-        let e = GlContext::egl_destory_image_with_fallback(&self.egl, self.display, self.egl_image);
-        if let Err(e) = e {
-            error!("Could not destroy EGL image: {e:?}");
-        }
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let e =
+                GlContext::egl_destory_image_with_fallback(&self.egl, self.display, self.egl_image);
+            if let Err(e) = e {
+                error!("Could not destroy EGL image: {e:?}");
+            }
+        }));
     }
 }
 
@@ -2462,7 +2490,9 @@ impl Texture {
 
 impl Drop for Texture {
     fn drop(&mut self) {
-        unsafe { gls::gl::DeleteTextures(1, &raw mut self.id) };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            gls::gl::DeleteTextures(1, &raw mut self.id)
+        }));
     }
 }
 
@@ -2500,7 +2530,9 @@ impl Buffer {
 
 impl Drop for Buffer {
     fn drop(&mut self) {
-        unsafe { gls::gl::DeleteBuffers(1, &raw mut self.id) };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            gls::gl::DeleteBuffers(1, &raw mut self.id)
+        }));
     }
 }
 
@@ -2529,10 +2561,12 @@ impl FrameBuffer {
 
 impl Drop for FrameBuffer {
     fn drop(&mut self) {
-        self.unbind();
-        unsafe {
-            gls::gl::DeleteFramebuffers(1, &raw mut self.id);
-        }
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.unbind();
+            unsafe {
+                gls::gl::DeleteFramebuffers(1, &raw mut self.id);
+            }
+        }));
     }
 }
 
@@ -2616,11 +2650,11 @@ impl GlProgram {
 
 impl Drop for GlProgram {
     fn drop(&mut self) {
-        unsafe {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             gls::gl::DeleteProgram(self.id);
             gls::gl::DeleteShader(self.fragment_id);
             gls::gl::DeleteShader(self.vertex_id);
-        }
+        }));
     }
 }
 
