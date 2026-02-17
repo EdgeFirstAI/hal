@@ -1,7 +1,7 @@
 # EdgeFirst Hardware Abstraction Layer - Architecture
 
-**Version:** 2.0  
-**Last Updated:** November 20, 2025  
+**Version:** 2.1
+**Last Updated:** February 17, 2026
 **Status:** Production
 **Audience:** Developers contributing to EdgeFirst HAL or integrating it into applications
 
@@ -474,6 +474,102 @@ Raw FFI bindings are wrapped in safe Rust types that enforce correct usage at co
 ### 7. Python Wrapper Naming Convention
 
 Python wrapper types use a `Py` prefix (e.g., `PyTensor`, `PyTensorImage`) to clearly distinguish them from their Rust counterparts (`Tensor`, `TensorImage`). This convention makes it explicit which types are Python-facing and which are internal Rust types.
+
+## EGL/GL Resource Cleanup at Process Shutdown
+
+### Problem
+
+The OpenGL headless renderer (`crates/image/src/opengl_headless.rs`) uses EGL and
+OpenGL ES via dynamically loaded shared libraries (`libEGL.so.1`, `libGLESv2.so`).
+When the process exits — particularly from a Python interpreter running PyO3
+extensions — EGL resource cleanup can crash with heap corruption, segfaults, or
+panics. This is a well-documented, industry-wide problem with no clean solution.
+
+The crash occurs due to a fundamental conflict between four systems during
+process shutdown:
+
+1. **Python finalization order is non-deterministic.** During `Py_FinalizeEx()`,
+   Python destroys modules and objects in random order. A PyO3 `#[pyclass]`
+   wrapping `GlContext` may have its Rust `Drop` invoked after dependent state
+   has already been torn down.
+
+2. **Linux `atexit` handler ordering is unreliable.** The glibc `__cxa_finalize`
+   mechanism interacts with `dlclose` in ways that produce non-deterministic
+   ordering between atexit handlers registered by different shared libraries.
+   A known glibc bug ([glibc #21032](https://sourceware.org/bugzilla/show_bug.cgi?id=21032))
+   prevents proper cleanup of TLS destructors from unloaded libraries.
+
+3. **Mesa's `_eglAtExit` use-after-free.** Mesa registers an atexit handler
+   that frees per-thread EGL state (`_EGLThreadInfo`). If our `Drop` calls
+   `eglReleaseThread()` after this handler has already run, it dereferences
+   freed memory ([Ubuntu Bug #1946621](https://bugs.launchpad.net/ubuntu/+source/mesa/+bug/1946621)).
+
+4. **Vendor EGL driver bugs.** NXP Vivante drivers cause a double-free in
+   `gcoOS_FreeMemo` when both `eglDestroyContext` and `eglTerminate` are called.
+   Similar bugs exist in Qualcomm Adreno and NVIDIA drivers.
+
+### Solution
+
+The implementation uses a defense-in-depth strategy with four layers, each
+addressing a different failure mode:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Layer 1: Box::leak — EGL library handle                 │
+│   Prevents dlclose from unmapping shared library code   │
+├─────────────────────────────────────────────────────────┤
+│ Layer 2: ManuallyDrop<Rc<Egl>> — EGL instance           │
+│   Prevents khronos-egl Drop from calling                │
+│   eglReleaseThread() into freed Mesa state              │
+├─────────────────────────────────────────────────────────┤
+│ Layer 3: catch_unwind — EGL cleanup calls               │
+│   Catches panics from eglDestroyContext/eglMakeCurrent  │
+│   if function pointers are invalidated                  │
+├─────────────────────────────────────────────────────────┤
+│ Layer 4: Omit eglTerminate                              │
+│   Avoids double-free on Vivante/ARM drivers             │
+└─────────────────────────────────────────────────────────┘
+```
+
+The `GlContext::drop` implementation performs explicit EGL resource cleanup
+(destroy context, destroy surface) inside `catch_unwind`, then intentionally
+skips dropping the `Rc<Egl>` wrapper. The EGL library handle is leaked via
+`Box::leak` at load time so it is never `dlclose`'d. The OS reclaims all
+resources when the process exits.
+
+### Industry Precedent
+
+This approach is consistent with how other major graphics projects handle the
+same problem:
+
+- **Chromium/ANGLE** skips full EGL teardown on GPU process exit, treating
+  cleanup as more dangerous than no cleanup during shutdown.
+
+- **wgpu** (the Rust WebGPU implementation used by Firefox) wraps its
+  `glow::Context` in `ManuallyDrop` and loads EGL with `RTLD_NODELETE` to
+  prevent library unloading. The `khronos-egl` crate itself adopted
+  `RTLD_NOW | RTLD_NODELETE` on Linux after
+  [khronos-egl #14](https://github.com/timothee-haudebourg/khronos-egl/issues/14),
+  referencing the same glibc root cause.
+
+- **Smithay** (Wayland compositor toolkit) supports skipping `eglTerminate`
+  via a feature flag for the same class of driver bugs.
+
+### Limitations
+
+`catch_unwind` catches Rust panics but cannot catch fatal signals (`SIGABRT`,
+`SIGSEGV`, `SIGBUS`) that originate from heap corruption inside the C driver.
+The `Box::leak` and `ManuallyDrop` layers mitigate this by avoiding the code
+paths that trigger corruption in the first place.
+
+### References
+
+- Mesa atexit use-after-free: [Ubuntu Bug #1946621](https://bugs.launchpad.net/ubuntu/+source/mesa/+bug/1946621)
+- glibc TLS destructor bug: [glibc #21032](https://sourceware.org/bugzilla/show_bug.cgi?id=21032)
+- khronos-egl RTLD_NODELETE fix: [khronos-egl #14](https://github.com/timothee-haudebourg/khronos-egl/issues/14)
+- wgpu SIGSEGV on library unload: [wgpu #246](https://github.com/gfx-rs/wgpu/issues/246)
+- PyO3 Drop after finalization: [PyO3 #4632](https://github.com/PyO3/pyo3/issues/4632)
+- Python finalization order: [CPython docs — Py_FinalizeEx](https://docs.python.org/3/c-api/init.html)
 
 ## Performance Considerations
 
