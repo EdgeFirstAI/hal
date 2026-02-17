@@ -287,7 +287,7 @@ mod g2d_tests {
         CPUProcessor, Flip, G2DProcessor, ImageProcessorTrait, Rect, Rotation, TensorImage, GREY,
         NV12, RGB, RGBA, YUYV,
     };
-    use edgefirst_tensor::{TensorMapTrait, TensorMemory, TensorTrait};
+    use edgefirst_tensor::{is_dma_available, TensorMapTrait, TensorMemory, TensorTrait};
     use four_char_code::FourCharCode;
     use image::buffer::ConvertBuffer;
 
@@ -615,6 +615,9 @@ mod g2d_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_nv12_to_rgba_reference() -> Result<(), crate::Error> {
+        if !is_dma_available() {
+            return Ok(());
+        }
         // Load NV12 source
         let src = load_raw_image(
             1280,
@@ -653,6 +656,9 @@ mod g2d_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_nv12_to_rgb_reference() -> Result<(), crate::Error> {
+        if !is_dma_available() {
+            return Ok(());
+        }
         // Load NV12 source
         let src = load_raw_image(
             1280,
@@ -691,6 +697,9 @@ mod g2d_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_yuyv_to_rgba_reference() -> Result<(), crate::Error> {
+        if !is_dma_available() {
+            return Ok(());
+        }
         // Load YUYV source
         let src = load_raw_image(
             1280,
@@ -729,6 +738,9 @@ mod g2d_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_yuyv_to_rgb_reference() -> Result<(), crate::Error> {
+        if !is_dma_available() {
+            return Ok(());
+        }
         // Load YUYV source
         let src = load_raw_image(
             1280,

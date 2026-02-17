@@ -413,9 +413,31 @@ The Python crate (`edgefirst_hal`) must be excluded from zigbuild cross-compilat
 because PyO3 requires `PYO3_CROSS_PYTHON_VERSION` or a target Python installation.
 Python wheels are built separately via `maturin` in CI.
 
+### Pre-Commit Verification (MANDATORY)
+
+**Before every commit, you MUST run the full verification suite and confirm
+all steps pass. Never commit with failing checks.**
+
+```bash
+make format lint check test sbom
+```
+
+This runs, in order:
+1. **format** — `cargo +nightly fmt --all` and `ruff format`
+2. **lint** — `cargo clippy -- -D warnings` and `ruff check`
+3. **check** — `cargo check --all-features --workspace`
+4. **test** — Rust tests with coverage (`cargo llvm-cov nextest`) and Python tests
+5. **sbom** — SBOM generation and license policy validation
+
+If any step fails, fix the issue before committing. Do not skip or ignore
+failures. This mirrors what CI/CD runs and prevents broken pipelines.
+
 ### Build and Test Commands
 
 ```bash
+# MANDATORY before committing (see above)
+make format lint check test sbom
+
 # Build all crates (native, for local development)
 cargo build --workspace
 

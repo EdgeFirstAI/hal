@@ -8,6 +8,8 @@ import math
 from edgefirst_hal import TensorImage, ImageProcessor, Flip, FourCC, Rotation
 import numpy as np
 
+pytestmark = pytest.mark.benchmark
+
 Image = pytest.importorskip("PIL.Image")
 dst_size = (512, 512)
 

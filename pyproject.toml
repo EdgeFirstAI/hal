@@ -13,3 +13,10 @@ build-backend = "maturin"
 
 [tool.maturin]
 all-features = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "benchmark: marks tests as benchmarks (deselect with '-m \"not benchmark\"')",
+]
+addopts = "-m 'not benchmark'"
