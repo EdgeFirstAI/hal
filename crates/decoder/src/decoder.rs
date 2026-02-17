@@ -329,9 +329,44 @@ impl ConfigOutput {
 }
 
 pub mod configs {
+    use std::collections::HashMap;
     use std::fmt::Display;
 
     use serde::{Deserialize, Serialize};
+
+    /// Deserialize dshape from either array-of-tuples or array-of-single-key-dicts.
+    ///
+    /// The metadata spec produces `[{"batch": 1}, {"num_features": 84}]` (dict format),
+    /// while serde's default `Vec<(A, B)>` expects `[["batch", 1]]` (tuple format).
+    /// This deserializer accepts both.
+    pub fn deserialize_dshape<'de, D>(deserializer: D) -> Result<Vec<(DimName, usize)>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum DShapeItem {
+            Tuple(DimName, usize),
+            Map(HashMap<DimName, usize>),
+        }
+
+        let items: Vec<DShapeItem> = Vec::deserialize(deserializer)?;
+        items
+            .into_iter()
+            .map(|item| match item {
+                DShapeItem::Tuple(name, size) => Ok((name, size)),
+                DShapeItem::Map(map) => {
+                    if map.len() != 1 {
+                        return Err(serde::de::Error::custom(
+                            "dshape map entry must have exactly one key",
+                        ));
+                    }
+                    let (name, size) = map.into_iter().next().unwrap();
+                    Ok((name, size))
+                }
+            })
+            .collect()
+    }
 
     #[derive(Debug, PartialEq, Serialize, Deserialize, Clone, Copy)]
     pub struct QuantTuple(pub f32, pub i32);
@@ -354,7 +389,7 @@ pub mod configs {
         pub shape: Vec<usize>,
         // #[serde(default)]
         // pub channels_first: bool,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_dshape")]
         pub dshape: Vec<(DimName, usize)>,
     }
 
@@ -365,7 +400,7 @@ pub mod configs {
         pub shape: Vec<usize>,
         // #[serde(default)]
         // pub channels_first: bool,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_dshape")]
         pub dshape: Vec<(DimName, usize)>,
     }
 
@@ -376,7 +411,7 @@ pub mod configs {
         pub shape: Vec<usize>,
         // #[serde(default)]
         // pub channels_first: bool,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_dshape")]
         pub dshape: Vec<(DimName, usize)>,
     }
 
@@ -387,7 +422,7 @@ pub mod configs {
         pub shape: Vec<usize>,
         // #[serde(default)]
         // pub channels_first: bool,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_dshape")]
         pub dshape: Vec<(DimName, usize)>,
     }
 
@@ -399,7 +434,7 @@ pub mod configs {
         pub shape: Vec<usize>,
         // #[serde(default)]
         // pub channels_first: bool,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_dshape")]
         pub dshape: Vec<(DimName, usize)>,
         /// Whether box coordinates are normalized to [0,1] range.
         /// - `Some(true)`: Coordinates in [0,1] range relative to model input
@@ -418,7 +453,7 @@ pub mod configs {
         pub shape: Vec<usize>,
         // #[serde(default)]
         // pub channels_first: bool,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_dshape")]
         pub dshape: Vec<(DimName, usize)>,
     }
 
@@ -429,7 +464,7 @@ pub mod configs {
         pub shape: Vec<usize>,
         // #[serde(default)]
         // pub channels_first: bool,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_dshape")]
         pub dshape: Vec<(DimName, usize)>,
         /// Whether box coordinates are normalized to [0,1] range.
         /// - `Some(true)`: Coordinates in [0,1] range relative to model input
@@ -5442,5 +5477,71 @@ outputs:
         assert!(!configs::DecoderVersion::Yolov8.is_end_to_end());
         assert!(!configs::DecoderVersion::Yolo11.is_end_to_end());
         assert!(configs::DecoderVersion::Yolo26.is_end_to_end());
+    }
+
+    #[test]
+    fn test_dshape_dict_format() {
+        // Spec produces array-of-single-key-dicts: [{"batch": 1}, {"num_features": 84}]
+        let json = r#"{
+            "decoder": "ultralytics",
+            "shape": [1, 84, 8400],
+            "dshape": [{"batch": 1}, {"num_features": 84}, {"num_boxes": 8400}]
+        }"#;
+        let det: configs::Detection = serde_json::from_str(json).unwrap();
+        assert_eq!(det.dshape.len(), 3);
+        assert_eq!(det.dshape[0], (configs::DimName::Batch, 1));
+        assert_eq!(det.dshape[1], (configs::DimName::NumFeatures, 84));
+        assert_eq!(det.dshape[2], (configs::DimName::NumBoxes, 8400));
+    }
+
+    #[test]
+    fn test_dshape_tuple_format() {
+        // Serde native tuple format: [["batch", 1], ["num_features", 84]]
+        let json = r#"{
+            "decoder": "ultralytics",
+            "shape": [1, 84, 8400],
+            "dshape": [["batch", 1], ["num_features", 84], ["num_boxes", 8400]]
+        }"#;
+        let det: configs::Detection = serde_json::from_str(json).unwrap();
+        assert_eq!(det.dshape.len(), 3);
+        assert_eq!(det.dshape[0], (configs::DimName::Batch, 1));
+        assert_eq!(det.dshape[1], (configs::DimName::NumFeatures, 84));
+        assert_eq!(det.dshape[2], (configs::DimName::NumBoxes, 8400));
+    }
+
+    #[test]
+    fn test_dshape_empty_default() {
+        // When dshape is omitted entirely, default to empty vec
+        let json = r#"{
+            "decoder": "ultralytics",
+            "shape": [1, 84, 8400]
+        }"#;
+        let det: configs::Detection = serde_json::from_str(json).unwrap();
+        assert!(det.dshape.is_empty());
+    }
+
+    #[test]
+    fn test_dshape_dict_format_protos() {
+        let json = r#"{
+            "decoder": "ultralytics",
+            "shape": [1, 32, 160, 160],
+            "dshape": [{"batch": 1}, {"num_protos": 32}, {"height": 160}, {"width": 160}]
+        }"#;
+        let protos: configs::Protos = serde_json::from_str(json).unwrap();
+        assert_eq!(protos.dshape.len(), 4);
+        assert_eq!(protos.dshape[0], (configs::DimName::Batch, 1));
+        assert_eq!(protos.dshape[1], (configs::DimName::NumProtos, 32));
+    }
+
+    #[test]
+    fn test_dshape_dict_format_boxes() {
+        let json = r#"{
+            "decoder": "ultralytics",
+            "shape": [1, 8400, 4],
+            "dshape": [{"batch": 1}, {"num_boxes": 8400}, {"box_coords": 4}]
+        }"#;
+        let boxes: configs::Boxes = serde_json::from_str(json).unwrap();
+        assert_eq!(boxes.dshape.len(), 3);
+        assert_eq!(boxes.dshape[2], (configs::DimName::BoxCoords, 4));
     }
 }
