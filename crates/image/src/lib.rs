@@ -171,7 +171,29 @@ impl TensorImage {
     /// Creates a new `TensorImage` from an existing tensor and specified
     /// format.
     ///
+    /// The required tensor shape depends on the pixel format:
+    ///
+    /// | Format | Shape | Description |
+    /// |--------|-------|-------------|
+    /// | `RGB`  | `[H, W, 3]` | 3-channel interleaved |
+    /// | `RGBA` | `[H, W, 4]` | 4-channel interleaved |
+    /// | `GREY` | `[H, W, 1]` | Single-channel grayscale |
+    /// | `YUYV` | `[H, W, 2]` | YUV 4:2:2 interleaved |
+    /// | `PLANAR_RGB`  | `[3, H, W]` | Channels-first (3 planes) |
+    /// | `PLANAR_RGBA` | `[4, H, W]` | Channels-first (4 planes) |
+    /// | `NV12` | `[H*3/2, W]` | Semi-planar YUV 4:2:0 (2D) |
+    /// | `NV16` | `[H*2, W]`   | Semi-planar YUV 4:2:2 (2D) |
+    ///
+    /// Most formats use a 3D tensor where the channel dimension matches
+    /// the format's channel count. The semi-planar formats NV12 and NV16
+    /// are special: the Y and UV planes have different heights, so the
+    /// data cannot be described as `[H, W, C]`. Instead the contiguous
+    /// memory is represented as a 2D tensor whose first dimension encodes
+    /// the total byte height (Y rows + UV rows).
+    ///
     /// # Examples
+    ///
+    /// RGB (3D interleaved):
     /// ```rust
     /// use edgefirst_image::{RGB, TensorImage};
     /// use edgefirst_tensor::Tensor;
@@ -183,9 +205,56 @@ impl TensorImage {
     /// assert_eq!(img.fourcc(), RGB);
     /// # Ok(())
     /// # }
+    /// ```
+    ///
+    /// GREY (3D with 1 channel):
+    /// ```rust
+    /// use edgefirst_image::{GREY, TensorImage};
+    /// use edgefirst_tensor::Tensor;
+    ///  # fn main() -> Result<(), edgefirst_image::Error> {
+    /// let tensor = Tensor::new(&[480, 640, 1], None, None)?;
+    /// let img = TensorImage::from_tensor(tensor, GREY)?;
+    /// assert_eq!(img.width(), 640);
+    /// assert_eq!(img.height(), 480);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// NV12 (2D semi-planar, height*3/2 rows):
+    /// ```rust
+    /// use edgefirst_image::{NV12, TensorImage};
+    /// use edgefirst_tensor::Tensor;
+    ///  # fn main() -> Result<(), edgefirst_image::Error> {
+    /// // 1080p NV12: 1080 Y rows + 540 UV rows = 1620 total rows
+    /// let tensor = Tensor::new(&[1620, 1920], None, None)?;
+    /// let img = TensorImage::from_tensor(tensor, NV12)?;
+    /// assert_eq!(img.width(), 1920);
+    /// assert_eq!(img.height(), 1080);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn from_tensor(tensor: Tensor<u8>, fourcc: FourCharCode) -> Result<Self> {
-        // Validate tensor shape based on the fourcc and is_planar flag
         let shape = tensor.shape();
+        let is_planar = fourcc_planar(fourcc)?;
+
+        // NV12/NV16 use 2D shape [H*3/2, W] or [H*2, W] respectively
+        if fourcc == NV12 || fourcc == NV16 {
+            if shape.len() != 2 {
+                return Err(Error::InvalidShape(format!(
+                    "Semi-planar format {} requires 2D tensor, got {}: {:?}",
+                    fourcc.to_string(),
+                    shape.len(),
+                    shape
+                )));
+            }
+            return Ok(Self {
+                tensor,
+                fourcc,
+                is_planar,
+            });
+        }
+
+        // All other formats use 3D shape
         if shape.len() != 3 {
             return Err(Error::InvalidShape(format!(
                 "Tensor shape must have 3 dimensions, got {}: {:?}",
@@ -193,7 +262,6 @@ impl TensorImage {
                 shape
             )));
         }
-        let is_planar = fourcc_planar(fourcc)?;
         let channels = if is_planar { shape[0] } else { shape[2] };
 
         if fourcc_channels(fourcc)? != channels {

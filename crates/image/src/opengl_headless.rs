@@ -98,12 +98,9 @@ impl GlContext {
         let egl: Rc<Egl> =
             Rc::new(unsafe { Instance::<Dynamic<_, EGL1_4>>::load_required_from(get_egl_lib()?)? });
 
-        if let Ok(headless) = Self::try_initialize_egl(egl.clone(), Self::egl_get_default_display) {
-            return Ok(headless);
-        } else {
-            log::debug!("Didn't initialize EGL with Default Display");
-        }
-
+        // Try headless-friendly EGL methods first (GBM/DRM, device enumeration)
+        // before the default display, which may block if a compositor (Wayland)
+        // is expected but not running.
         if let Ok(headless) = Self::try_initialize_egl(egl.clone(), Self::egl_get_gbm_display) {
             return Ok(headless);
         } else {
@@ -116,6 +113,12 @@ impl GlContext {
             return Ok(headless);
         } else {
             log::debug!("Didn't initialize EGL with platform display from device enumeration");
+        }
+
+        if let Ok(headless) = Self::try_initialize_egl(egl.clone(), Self::egl_get_default_display) {
+            return Ok(headless);
+        } else {
+            log::debug!("Didn't initialize EGL with Default Display");
         }
 
         Err(Error::OpenGl(
@@ -446,7 +449,7 @@ impl Card {
     }
 
     pub fn open_global() -> Result<Self, crate::Error> {
-        let targets = ["/dev/dri/render128", "/dev/dri/card0", "/dev/dri/card1"];
+        let targets = ["/dev/dri/renderD128", "/dev/dri/card0", "/dev/dri/card1"];
         let e = Self::open(targets[0]);
         if let Ok(t) = e {
             return Ok(t);
@@ -1586,7 +1589,12 @@ impl GLProcessorST {
             RGB => gls::gl::RGB,
             RGBA => gls::gl::RGBA,
             GREY => gls::gl::RED,
-            _ => unreachable!(),
+            _ => {
+                return Err(Error::NotSupported(format!(
+                    "draw_src_texture does not support {:?} (use DMA-BUF path for YUV)",
+                    src.fourcc()
+                )));
+            }
         };
         unsafe {
             gls::gl::UseProgram(self.texture_program.id);

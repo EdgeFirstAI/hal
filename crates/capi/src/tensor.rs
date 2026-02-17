@@ -128,6 +128,21 @@ impl HalTensor {
             HalTensor::F64(_) => HalDtype::F64,
         }
     }
+
+    pub fn ndim(&self) -> usize {
+        match self {
+            HalTensor::U8(t) => t.shape().len(),
+            HalTensor::I8(t) => t.shape().len(),
+            HalTensor::U16(t) => t.shape().len(),
+            HalTensor::I16(t) => t.shape().len(),
+            HalTensor::U32(t) => t.shape().len(),
+            HalTensor::I32(t) => t.shape().len(),
+            HalTensor::U64(t) => t.shape().len(),
+            HalTensor::I64(t) => t.shape().len(),
+            HalTensor::F32(t) => t.shape().len(),
+            HalTensor::F64(t) => t.shape().len(),
+        }
+    }
 }
 
 /// Macro to dispatch a method call to all tensor variants

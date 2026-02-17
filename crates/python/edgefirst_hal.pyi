@@ -548,13 +548,28 @@ class TensorImage:
             Load an image from a file descriptor, inspecting the file descriptor to determine
             the appropriate tensor type (DMA or SHM) based on the device major and minor numbers.
 
-            The `shape` parameter is used to specify the dimensions of the image tensor,
-            which should correspond to the image data associated with the file descriptor.
-            The expected shape is typically (height, width, channels) for packed formats
-            or (channels, height, width) for planar formats. NV12 has a special expected
-            shape of (height * 3 / 2, width) due to its semi-planar format.
+            The ``shape`` must match the pixel format. Most formats use a 3D shape
+            ``[height, width, channels]`` (interleaved) or ``[channels, height, width]``
+            (planar). The semi-planar formats NV12 and NV16 use a 2D shape because
+            their Y and UV planes have different heights:
 
-            The `fourcc` parameter is used to specify the pixel format of the image data.
+            ===============  ==================  ====================================
+            Format           Shape               Description
+            ===============  ==================  ====================================
+            FourCC.RGB       [H, W, 3]           3-channel interleaved
+            FourCC.RGBA      [H, W, 4]           4-channel interleaved
+            FourCC.GREY      [H, W, 1]           Single-channel grayscale
+            FourCC.YUYV      [H, W, 2]           YUV 4:2:2 interleaved
+            FourCC.PLANAR_RGB   [3, H, W]        Channels-first (3 planes)
+            FourCC.PLANAR_RGBA  [4, H, W]        Channels-first (4 planes)
+            FourCC.NV12      [H * 3 // 2, W]     Semi-planar YUV 4:2:0 (2D)
+            FourCC.NV16      [H * 2, W]          Semi-planar YUV 4:2:2 (2D)
+            ===============  ==================  ====================================
+
+            For example, a 1080p NV12 frame has 1080 Y rows plus 540 UV rows,
+            giving shape ``[1620, 1920]``.
+
+            The ``fourcc`` parameter specifies the pixel format of the image data.
 
             This will take ownership of the file descriptor, and the file descriptor will
             be closed when the tensor is dropped.

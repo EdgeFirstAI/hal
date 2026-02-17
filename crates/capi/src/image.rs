@@ -8,7 +8,7 @@
 
 use crate::decoder::{HalDetectBoxList, HalSegmentationList};
 use crate::error::{set_error, set_error_null};
-use crate::tensor::{HalTensor, HalTensorMemory};
+use crate::tensor::{HalTensor, HalTensorMap, HalTensorMemory};
 use crate::{check_null, check_null_ret_null, try_or_errno, try_or_null};
 use edgefirst_image::{
     Crop, Flip, ImageProcessor, ImageProcessorTrait, Rect, Rotation, TensorImage, TensorImageRef,
@@ -413,10 +413,26 @@ pub unsafe extern "C" fn hal_tensor_image_load_file(
 
 /// Create a tensor image from an existing u8 tensor.
 ///
-/// Takes ownership of the tensor. The tensor must be u8 dtype with a 3D shape
-/// matching the specified pixel format.
+/// Takes ownership of the tensor **only on success**. On failure the tensor
+/// remains valid and the caller retains ownership (and must still free it).
 ///
-/// @param tensor u8 tensor to take ownership of (must not be used after this call)
+/// The tensor must be u8 dtype with a shape that matches the pixel format.
+/// Most formats use a 3D tensor `[H, W, channels]` (or `[channels, H, W]`
+/// for planar formats). The semi-planar formats NV12 and NV16 require a 2D
+/// tensor because their Y and UV planes have different heights:
+///
+/// | Format | Shape | Description |
+/// |--------|-------|-------------|
+/// | HAL_FOURCC_RGB  | [H, W, 3] | 3-channel interleaved |
+/// | HAL_FOURCC_RGBA | [H, W, 4] | 4-channel interleaved |
+/// | HAL_FOURCC_GREY | [H, W, 1] | Single-channel grayscale |
+/// | HAL_FOURCC_YUYV | [H, W, 2] | YUV 4:2:2 interleaved |
+/// | HAL_FOURCC_PLANAR_RGB  | [3, H, W] | Channels-first (3 planes) |
+/// | HAL_FOURCC_PLANAR_RGBA | [4, H, W] | Channels-first (4 planes) |
+/// | HAL_FOURCC_NV12 | [H*3/2, W] | Semi-planar YUV 4:2:0 (2D) |
+/// | HAL_FOURCC_NV16 | [H*2, W]   | Semi-planar YUV 4:2:2 (2D) |
+///
+/// @param tensor u8 tensor (ownership transferred only on success)
 /// @param fourcc Pixel format describing the tensor layout
 /// @return New tensor image handle on success, NULL on error
 /// @par Errors (errno):
@@ -428,17 +444,28 @@ pub unsafe extern "C" fn hal_tensor_image_from_tensor(
 ) -> *mut HalTensorImage {
     check_null_ret_null!(tensor);
 
-    // Take ownership of the tensor
-    let boxed = unsafe { Box::from_raw(tensor) };
+    // Peek at the tensor without consuming it — validate before taking ownership
+    let hal_tensor = unsafe { &*tensor };
+    if !matches!(hal_tensor, HalTensor::U8(_)) {
+        return set_error_null(libc::EINVAL);
+    }
 
-    // Must be u8 dtype
+    let fc = fourcc.to_fourcc();
+    let is_semi_planar = fc == NV12 || fc == NV16;
+    let expected_ndim = if is_semi_planar { 2 } else { 3 };
+    if hal_tensor.ndim() != expected_ndim {
+        return set_error_null(libc::EINVAL);
+    }
+
+    // Validation passed — now take ownership (safe: we validated above)
+    let boxed = unsafe { Box::from_raw(tensor) };
     let u8_tensor = match *boxed {
         HalTensor::U8(t) => t,
-        _ => return set_error_null(libc::EINVAL),
+        _ => unreachable!(), // validated above
     };
 
     let image = try_or_null!(
-        TensorImage::from_tensor(u8_tensor, fourcc.to_fourcc()),
+        TensorImage::from_tensor(u8_tensor, fc),
         libc::EINVAL
     );
 
@@ -686,6 +713,28 @@ pub unsafe extern "C" fn hal_tensor_image_tensor(image: *const HalTensorImage) -
         return std::ptr::null();
     }
     unsafe { &(*image) }.inner.tensor() as *const _ as *const c_void
+}
+
+/// Map a tensor image's underlying tensor for CPU access.
+///
+/// This function maps the image's tensor memory for CPU read/write operations.
+/// For DMA-backed images, this includes automatic cache synchronization.
+/// The returned map must be unmapped with hal_tensor_map_unmap() when done.
+///
+/// @param image Tensor image handle
+/// @return Tensor map handle on success, NULL on error
+/// @par Errors (errno):
+/// - EINVAL: NULL image
+/// - EIO: Failed to map tensor memory
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_image_map_create(
+    image: *const HalTensorImage,
+) -> *mut HalTensorMap {
+    check_null_ret_null!(image);
+
+    let tensor = unsafe { &(*image) }.inner.tensor();
+    let map = try_or_null!(tensor.map(), libc::EIO);
+    Box::into_raw(Box::new(HalTensorMap::U8(map)))
 }
 
 // ============================================================================
@@ -1509,6 +1558,59 @@ mod tests {
             );
 
             hal_image_processor_free(processor);
+        }
+    }
+
+    #[test]
+    fn test_image_map_create_null() {
+        unsafe {
+            let map = hal_tensor_image_map_create(std::ptr::null());
+            assert!(map.is_null());
+        }
+    }
+
+    #[test]
+    fn test_image_map_create_rgb() {
+        use crate::tensor::{hal_tensor_map_data_const, hal_tensor_map_size, hal_tensor_map_unmap};
+
+        unsafe {
+            let image = hal_tensor_image_new(100, 50, HalFourcc::Rgb, HalTensorMemory::Mem);
+            assert!(!image.is_null());
+
+            let map = hal_tensor_image_map_create(image);
+            assert!(!map.is_null());
+
+            // RGB: 100 * 50 * 3 = 15000 bytes
+            assert_eq!(hal_tensor_map_size(map), 15000);
+
+            let data = hal_tensor_map_data_const(map);
+            assert!(!data.is_null());
+
+            hal_tensor_map_unmap(map);
+            hal_tensor_image_free(image);
+        }
+    }
+
+    #[test]
+    fn test_image_map_create_planar_rgb() {
+        use crate::tensor::{hal_tensor_map_data_const, hal_tensor_map_size, hal_tensor_map_unmap};
+
+        unsafe {
+            let image =
+                hal_tensor_image_new(64, 64, HalFourcc::PlanarRgb, HalTensorMemory::Mem);
+            assert!(!image.is_null());
+
+            let map = hal_tensor_image_map_create(image);
+            assert!(!map.is_null());
+
+            // PLANAR_RGB: 3 * 64 * 64 = 12288 bytes
+            assert_eq!(hal_tensor_map_size(map), 12288);
+
+            let data = hal_tensor_map_data_const(map);
+            assert!(!data.is_null());
+
+            hal_tensor_map_unmap(map);
+            hal_tensor_image_free(image);
         }
     }
 

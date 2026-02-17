@@ -333,9 +333,9 @@ crates/
 ├── image/      # Hardware-accelerated image processing
 ├── decoder/    # YOLO and model output decoding
 ├── tracker/    # Object tracking algorithms
-├── python/     # PyO3 Python bindings
-├── g2d-sys/    # FFI bindings for NXP G2D
-└── edgefirst/  # Top-level re-export crate
+├── hal/        # Top-level re-export crate
+├── capi/       # C API bindings (cbindgen)
+└── python/     # PyO3 Python bindings
 ```
 
 ### Naming Conventions
@@ -390,14 +390,40 @@ impl ImageProcessorTrait for ImageProcessor {
 }
 ```
 
+### Cross-Compilation with zigbuild
+
+**Always cross-compile for aarch64 using `cargo-zigbuild` during development.**
+The project targets ARM64 embedded Linux (NXP i.MX 8M Plus). Do not use a
+`.cargo/config.toml` with Yocto SDK linker settings — zigbuild provides its own
+linker and sysroot via Zig.
+
+```bash
+# Build all crates for aarch64
+cargo-zigbuild zigbuild --target aarch64-unknown-linux-gnu --release --workspace
+
+# Cross-compile unit tests (without running them)
+cargo-zigbuild test --target aarch64-unknown-linux-gnu --release --no-run \
+    --workspace --exclude edgefirst_hal
+
+# Run tests on target hardware (after scp to the device)
+ssh <target> 'cd /tmp/hal-tests && ./edgefirst_image-<hash> --test-threads=1'
+```
+
+The Python crate (`edgefirst_hal`) must be excluded from zigbuild cross-compilation
+because PyO3 requires `PYO3_CROSS_PYTHON_VERSION` or a target Python installation.
+Python wheels are built separately via `maturin` in CI.
+
 ### Build and Test Commands
 
 ```bash
-# Build all crates
+# Build all crates (native, for local development)
 cargo build --workspace
 
-# Test all Rust code
+# Test all Rust code (native)
 cargo test --workspace
+
+# Cross-compile for aarch64 (preferred for development)
+cargo-zigbuild zigbuild --target aarch64-unknown-linux-gnu --release --workspace
 
 # Build Python bindings
 maturin develop -m crates/python/Cargo.toml

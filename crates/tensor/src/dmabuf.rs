@@ -3,7 +3,8 @@
 
 #![allow(dead_code)]
 use nix::{ioctl_read, ioctl_write_ptr};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::sync::OnceLock;
 
 const DMA_BUF_BASE: u8 = b'b';
 const DMA_BUF_IOCTL_SYNC: u8 = 0;
@@ -115,6 +116,38 @@ const DRM_IOCTL_GEM_CLOSE: libc::c_ulong = (1 << 30) // _IOW
     | ((DRM_IOCTL_BASE as libc::c_ulong) << 8)
     | 0x09;
 
+/// Shared DRM render node fd — opened once, reused for all PRIME imports.
+///
+/// Opening `/dev/dri/renderD128` per tensor can deadlock on Vivante DRM drivers
+/// when v4l2 decoders (VPU) are concurrently using DMA-BUFs. A single shared fd
+/// avoids the contention by routing all PRIME imports through one DRM file instance.
+static SHARED_DRM_FD: OnceLock<Option<OwnedFd>> = OnceLock::new();
+
+fn shared_drm_fd() -> Option<BorrowedFd<'static>> {
+    SHARED_DRM_FD
+        .get_or_init(|| {
+            let path = b"/dev/dri/renderD128\0";
+            let raw_fd = unsafe {
+                libc::open(
+                    path.as_ptr() as *const libc::c_char,
+                    libc::O_RDWR | libc::O_CLOEXEC,
+                )
+            };
+            if raw_fd < 0 {
+                log::debug!(
+                    "DrmAttachment: /dev/dri/renderD128 not available: {}",
+                    std::io::Error::last_os_error()
+                );
+                None
+            } else {
+                log::debug!("DrmAttachment: opened shared /dev/dri/renderD128");
+                Some(unsafe { OwnedFd::from_raw_fd(raw_fd) })
+            }
+        })
+        .as_ref()
+        .map(|fd| unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) })
+}
+
 /// Holds a DRM GEM handle that keeps a persistent `dma_buf_attach` alive.
 ///
 /// When the DMA-buf fd is imported through the GPU DRM driver via
@@ -122,10 +155,12 @@ const DRM_IOCTL_GEM_CLOSE: libc::c_ulong = (1 << 30) // _IOW
 /// `dma_buf_attach()`. This attachment is required for `DMA_BUF_IOCTL_SYNC`
 /// to perform actual cache maintenance on cached CMA heaps.
 ///
+/// Uses a shared DRM render node fd to avoid deadlocks with concurrent
+/// V4L2/VPU DMA-BUF usage on Vivante-based SoCs.
+///
 /// The attachment is released when the GEM handle is closed on drop.
 #[derive(Debug)]
 pub(crate) struct DrmAttachment {
-    drm_fd: OwnedFd,
     gem_handle: u32,
 }
 
@@ -134,21 +169,7 @@ impl DrmAttachment {
     /// `dma_buf_attach`. Returns `None` if `/dev/dri/renderD128` is not
     /// available (e.g. on non-GPU systems or in containers).
     pub(crate) fn new(dma_buf_fd: &OwnedFd) -> Option<Self> {
-        let path = b"/dev/dri/renderD128\0";
-        let raw_fd = unsafe {
-            libc::open(
-                path.as_ptr() as *const libc::c_char,
-                libc::O_RDWR | libc::O_CLOEXEC,
-            )
-        };
-        if raw_fd < 0 {
-            log::debug!(
-                "DrmAttachment: /dev/dri/renderD128 not available: {}",
-                std::io::Error::last_os_error()
-            );
-            return None;
-        }
-        let drm_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let drm_fd = shared_drm_fd()?;
 
         let mut prime = DrmPrimeHandle {
             handle: 0,
@@ -169,7 +190,6 @@ impl DrmAttachment {
         log::trace!("DrmAttachment: imported as GEM handle {}", prime.handle);
 
         Some(Self {
-            drm_fd,
             gem_handle: prime.handle,
         })
     }
@@ -177,10 +197,12 @@ impl DrmAttachment {
 
 impl Drop for DrmAttachment {
     fn drop(&mut self) {
-        let close = DrmGemClose {
-            handle: self.gem_handle,
-            pad: 0,
-        };
-        unsafe { libc::ioctl(self.drm_fd.as_raw_fd(), DRM_IOCTL_GEM_CLOSE, &close) };
+        if let Some(drm_fd) = shared_drm_fd() {
+            let close = DrmGemClose {
+                handle: self.gem_handle,
+                pad: 0,
+            };
+            unsafe { libc::ioctl(drm_fd.as_raw_fd(), DRM_IOCTL_GEM_CLOSE, &close) };
+        }
     }
 }
