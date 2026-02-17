@@ -2889,7 +2889,7 @@ mod gl_tests {
     use crate::{NV12, YUYV};
     use edgefirst_tensor::TensorTrait;
     #[cfg(feature = "dma_test_formats")]
-    use edgefirst_tensor::{TensorMapTrait, TensorMemory};
+    use edgefirst_tensor::{is_dma_available, TensorMapTrait, TensorMemory};
     use image::buffer::ConvertBuffer;
     use ndarray::Array3;
 
@@ -3186,6 +3186,9 @@ mod gl_tests {
     #[test]
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn test_opengl_nv12_to_rgba_reference() {
+        if !is_dma_available() {
+            return;
+        }
         // Load NV12 source with DMA
         let src = load_raw_image(
             1280,
@@ -3228,6 +3231,9 @@ mod gl_tests {
     #[test]
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn test_opengl_yuyv_to_rgba_reference() {
+        if !is_dma_available() {
+            return;
+        }
         // Load YUYV source with DMA
         let src = load_raw_image(
             1280,

@@ -464,10 +464,7 @@ pub unsafe extern "C" fn hal_tensor_image_from_tensor(
         _ => unreachable!(), // validated above
     };
 
-    let image = try_or_null!(
-        TensorImage::from_tensor(u8_tensor, fc),
-        libc::EINVAL
-    );
+    let image = try_or_null!(TensorImage::from_tensor(u8_tensor, fc), libc::EINVAL);
 
     Box::into_raw(Box::new(HalTensorImage { inner: image }))
 }
@@ -1596,8 +1593,7 @@ mod tests {
         use crate::tensor::{hal_tensor_map_data_const, hal_tensor_map_size, hal_tensor_map_unmap};
 
         unsafe {
-            let image =
-                hal_tensor_image_new(64, 64, HalFourcc::PlanarRgb, HalTensorMemory::Mem);
+            let image = hal_tensor_image_new(64, 64, HalFourcc::PlanarRgb, HalTensorMemory::Mem);
             assert!(!image.is_null());
 
             let map = hal_tensor_image_map_create(image);

@@ -46,6 +46,9 @@ dependencies = [
     "numpy",
 ]
 
+[project.optional-dependencies]
+test = ["pytest", "psutil"]
+
 [project.urls]
 Homepage = "https://edgefirst.ai"
 Documentation = "https://github.com/EdgeFirstAI/hal#readme"

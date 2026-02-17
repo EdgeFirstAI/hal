@@ -182,15 +182,15 @@ test-python:
 	@if [ -f "venv/bin/slipcover" ]; then \
 		. venv/bin/activate && \
 			python -m slipcover --xml --out target/python-coverage.xml \
-				-m unittest discover -s $(TEST_DIR) -p "test*.py"; \
+				-m pytest $(TEST_DIR); \
 	elif command -v slipcover >/dev/null 2>&1; then \
 		python -m slipcover --xml --out target/python-coverage.xml \
-			-m unittest discover -s $(TEST_DIR) -p "test*.py"; \
+			-m pytest $(TEST_DIR); \
 	elif [ -f "venv/bin/activate" ]; then \
 		. venv/bin/activate && \
-			python -m unittest discover -s $(TEST_DIR) -p "test*.py"; \
+			python -m pytest $(TEST_DIR); \
 	else \
-		python -m unittest discover -s $(TEST_DIR) -p "test*.py"; \
+		python -m pytest $(TEST_DIR); \
 	fi
 	@echo "✓ Python tests passed"
 
