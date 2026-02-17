@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-02-17
+
+### Added
+
+- NV12/NV16 2D tensor support: `TensorImage::from_tensor()` now accepts 2D
+  tensors with shapes [H*3/2, W] for NV12 and [H*2, W] for NV16, with
+  shape validation and format-specific documentation
+- C API: `hal_tensor_image_from_tensor()` with dtype/ndim validation,
+  `hal_tensor_image_map_create()`, and `HalTensor::ndim()` helper
+- C API: pkg-config (`edgefirst-hal.pc`) and SOVERSION support with standard
+  GNU/Linux versioned shared library symlinks in release archives
+- Shared DRM render node file descriptor (via `OnceLock`) across all DMA-buf
+  PRIME imports, avoiding deadlocks on Vivante with concurrent V4L2/VPU usage
+- EGL/GL shutdown cleanup architecture documentation in ARCHITECTURE.md with
+  root cause analysis and industry cross-references
+
+### Fixed
+
+- EGL/GL cleanup crashes during process shutdown: defense-in-depth strategy
+  using `Box::leak` (prevent `dlclose`), `ManuallyDrop` (skip
+  `eglReleaseThread`), `catch_unwind` (catch panics from invalidated function
+  pointers), and omitted `eglTerminate` (avoid Vivante double-free)
+- OpenGL EGL initialization: reorder GBM/DRM probe before default display to
+  avoid blocking when Wayland compositor is not running
+- Test suite: DMA permission guards for rootless CI, Python test runner
+  migration to pytest, pre-commit hook enforcement
+- C API test failures after SOVERSION change
+- Decoder: remove incorrect `#[serde(flatten)]` on `Protos.quantization`
+
 ## [0.6.2] - 2026-02-13
 
 ### Added
