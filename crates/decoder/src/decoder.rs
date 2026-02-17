@@ -361,7 +361,6 @@ pub mod configs {
     #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
     pub struct Protos {
         pub decoder: DecoderType,
-        #[serde(flatten)]
         pub quantization: Option<QuantTuple>,
         pub shape: Vec<usize>,
         // #[serde(default)]

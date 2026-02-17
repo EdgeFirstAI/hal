@@ -908,10 +908,26 @@ struct hal_tensor_image *hal_tensor_image_load_file(const char *path,
 /**
  * Create a tensor image from an existing u8 tensor.
  *
- * Takes ownership of the tensor. The tensor must be u8 dtype with a 3D shape
- * matching the specified pixel format.
+ * Takes ownership of the tensor **only on success**. On failure the tensor
+ * remains valid and the caller retains ownership (and must still free it).
  *
- * @param tensor u8 tensor to take ownership of (must not be used after this call)
+ * The tensor must be u8 dtype with a shape that matches the pixel format.
+ * Most formats use a 3D tensor `[H, W, channels]` (or `[channels, H, W]`
+ * for planar formats). The semi-planar formats NV12 and NV16 require a 2D
+ * tensor because their Y and UV planes have different heights:
+ *
+ * | Format | Shape | Description |
+ * |--------|-------|-------------|
+ * | HAL_FOURCC_RGB  | [H, W, 3] | 3-channel interleaved |
+ * | HAL_FOURCC_RGBA | [H, W, 4] | 4-channel interleaved |
+ * | HAL_FOURCC_GREY | [H, W, 1] | Single-channel grayscale |
+ * | HAL_FOURCC_YUYV | [H, W, 2] | YUV 4:2:2 interleaved |
+ * | HAL_FOURCC_PLANAR_RGB  | [3, H, W] | Channels-first (3 planes) |
+ * | HAL_FOURCC_PLANAR_RGBA | [4, H, W] | Channels-first (4 planes) |
+ * | HAL_FOURCC_NV12 | [H*3/2, W] | Semi-planar YUV 4:2:0 (2D) |
+ * | HAL_FOURCC_NV16 | [H*2, W]   | Semi-planar YUV 4:2:2 (2D) |
+ *
+ * @param tensor u8 tensor (ownership transferred only on success)
  * @param fourcc Pixel format describing the tensor layout
  * @return New tensor image handle on success, NULL on error
  * @par Errors (errno):
@@ -1063,6 +1079,21 @@ int hal_tensor_image_clone_fd(const struct hal_tensor_image *image);
  * @return Pointer to the underlying tensor data info, or NULL if image is NULL
  */
 const void *hal_tensor_image_tensor(const struct hal_tensor_image *image);
+
+/**
+ * Map a tensor image's underlying tensor for CPU access.
+ *
+ * This function maps the image's tensor memory for CPU read/write operations.
+ * For DMA-backed images, this includes automatic cache synchronization.
+ * The returned map must be unmapped with hal_tensor_map_unmap() when done.
+ *
+ * @param image Tensor image handle
+ * @return Tensor map handle on success, NULL on error
+ * @par Errors (errno):
+ * - EINVAL: NULL image
+ * - EIO: Failed to map tensor memory
+ */
+struct hal_tensor_map *hal_tensor_image_map_create(const struct hal_tensor_image *image);
 
 /**
  * Create a new image processor.
