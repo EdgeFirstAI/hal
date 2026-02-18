@@ -530,7 +530,7 @@ pub mod configs {
     pub enum DecoderType {
         #[serde(rename = "modelpack")]
         ModelPack,
-        #[serde(rename = "ultralytics")]
+        #[serde(rename = "ultralytics", alias = "yolov8")]
         Ultralytics,
     }
 
