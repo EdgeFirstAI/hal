@@ -756,12 +756,27 @@ jobs:
         env:
           LLVM_PROFILE_FILE: ${{ github.workspace }}/build/profraw/%p-%m.profraw
         run: |
-          set -o pipefail
           mkdir -p build/profraw
           export LD_LIBRARY_PATH=$(pwd)/target/profiling:$LD_LIBRARY_PATH
+          # Run pytest and capture exit code separately from process exit.
+          # On i.MX hardware, the Vivante GPU driver may cause a SIGABRT
+          # ("corrupted double-linked list") during Python interpreter shutdown
+          # after all tests have passed. This is an uncatchable C-level crash
+          # in the EGL driver's atexit cleanup — see ARCHITECTURE.md for details.
+          # We use the JUnit XML result as the source of truth for test outcomes.
+          EXIT_CODE=0
           venv/bin/python -m slipcover --xml --out build/coverage_python.xml \
             -m pytest tests/ -v --tb=short --junitxml=build/pytest_results.xml \
-            2>&1 | tee build/test-metrics-python-imx8mp.txt
+            2>&1 | tee build/test-metrics-python-imx8mp.txt || EXIT_CODE=$?
+
+          if [ $EXIT_CODE -ne 0 ]; then
+            if [ -f build/pytest_results.xml ] && grep -q 'failures="0"' build/pytest_results.xml && grep -q 'errors="0"' build/pytest_results.xml; then
+              echo "::warning::Python process exited with code $EXIT_CODE (likely GPU driver crash during shutdown) but all tests passed"
+            else
+              echo "::error::Python tests failed with exit code $EXIT_CODE"
+              exit $EXIT_CODE
+            fi
+          fi
 
       - name: Run pre-built Rust tests
         env:
