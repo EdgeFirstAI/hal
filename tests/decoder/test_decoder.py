@@ -318,6 +318,214 @@ def test_context_switch():
         thread.join()
 
 
+def test_new_from_outputs_yolov8():
+    """Test Decoder.new_from_outputs with a single detection output (YOLOv8 style)."""
+    output = edgefirst_hal.Output.detection(shape=[1, 84, 8400]).with_quantization(
+        scale=0.0040811873, zero_point=-123
+    )
+    decoder = edgefirst_hal.Decoder.new_from_outputs(
+        outputs=[output],
+        score_threshold=0.2,
+        iou_threshold=0.7,
+    )
+    model_output = np.fromfile(
+        "testdata/yolov8s_80_classes.bin", dtype=np.int8
+    ).reshape(1, 84, 8400)
+    boxes, scores, classes, masks = decoder.decode([model_output])
+
+    assert np.allclose(
+        boxes,
+        [
+            [0.5285137, 0.05305544, 0.87541467, 0.9998909],
+            [0.130598, 0.43260583, 0.35098213, 0.9958097],
+        ],
+    )
+    assert np.allclose(scores, [0.5591227, 0.33057618])
+    assert np.allclose(classes, [0, 75])
+    assert len(masks) == 0
+
+
+def test_new_from_outputs_yolov8_split():
+    """Test Decoder.new_from_outputs with split boxes + scores outputs."""
+    boxes_output = edgefirst_hal.Output.boxes(
+        dshape=[
+            (edgefirst_hal.DimName.Batch, 1),
+            (edgefirst_hal.DimName.BoxCoords, 4),
+            (edgefirst_hal.DimName.NumBoxes, 8400),
+        ]
+    )
+    scores_output = edgefirst_hal.Output.scores(
+        dshape=[
+            (edgefirst_hal.DimName.Batch, 1),
+            (edgefirst_hal.DimName.NumClasses, 80),
+            (edgefirst_hal.DimName.NumBoxes, 8400),
+        ]
+    )
+    decoder = edgefirst_hal.Decoder.new_from_outputs(
+        outputs=[boxes_output, scores_output],
+        score_threshold=0.2,
+        iou_threshold=0.7,
+    )
+    # Generate split tensors from the combined detection data
+    raw = np.fromfile("testdata/yolov8s_80_classes.bin", dtype=np.int8).reshape(
+        1, 84, 8400
+    )
+    dequantized = (raw.astype(np.float32) - (-123.0)) * 0.0040811873
+    boxes_tensor = dequantized[:, :4, :]
+    scores_tensor = dequantized[:, 4:, :]
+
+    boxes, scores, classes, masks = decoder.decode([boxes_tensor, scores_tensor])
+    assert len(boxes) > 0
+    assert len(scores) > 0
+    assert len(masks) == 0
+
+
+def test_output_with_quantization():
+    """Test that with_quantization setter works correctly."""
+    output = edgefirst_hal.Output.detection(shape=[1, 84, 8400]).with_quantization(
+        scale=0.0040811873, zero_point=-123
+    )
+    decoder = edgefirst_hal.Decoder.new_from_outputs(
+        outputs=[output],
+        score_threshold=0.2,
+        iou_threshold=0.7,
+    )
+    model_output = np.fromfile(
+        "testdata/yolov8s_80_classes.bin", dtype=np.int8
+    ).reshape(1, 84, 8400)
+    boxes, scores, classes, masks = decoder.decode([model_output])
+    # Should produce the same results as the dict-based config
+    assert np.allclose(
+        boxes,
+        [
+            [0.5285137, 0.05305544, 0.87541467, 0.9998909],
+            [0.130598, 0.43260583, 0.35098213, 0.9958097],
+        ],
+    )
+
+
+def test_output_with_dshape():
+    """Test Output creation with named dimensions (dshape)."""
+    output = edgefirst_hal.Output.detection(
+        dshape=[
+            (edgefirst_hal.DimName.Batch, 1),
+            (edgefirst_hal.DimName.NumFeatures, 84),
+            (edgefirst_hal.DimName.NumBoxes, 8400),
+        ]
+    ).with_quantization(scale=0.0040811873, zero_point=-123)
+
+    decoder = edgefirst_hal.Decoder.new_from_outputs(
+        outputs=[output],
+        score_threshold=0.2,
+        iou_threshold=0.7,
+    )
+    model_output = np.fromfile(
+        "testdata/yolov8s_80_classes.bin", dtype=np.int8
+    ).reshape(1, 84, 8400)
+    boxes, scores, classes, masks = decoder.decode([model_output])
+
+    assert np.allclose(
+        boxes,
+        [
+            [0.5285137, 0.05305544, 0.87541467, 0.9998909],
+            [0.130598, 0.43260583, 0.35098213, 0.9958097],
+        ],
+    )
+
+
+def test_output_shape_or_dshape_required():
+    """Test that providing neither shape nor dshape raises an error."""
+    with pytest.raises(ValueError, match="Either 'shape' or 'dshape' must be provided"):
+        edgefirst_hal.Output.detection()
+
+
+def test_output_shape_and_dshape_exclusive():
+    """Test that providing both shape and dshape raises an error."""
+    with pytest.raises(
+        ValueError, match="Provide either 'shape' or 'dshape', not both"
+    ):
+        edgefirst_hal.Output.detection(
+            shape=[1, 84, 8400],
+            dshape=[
+                (edgefirst_hal.DimName.Batch, 1),
+                (edgefirst_hal.DimName.NumFeatures, 84),
+                (edgefirst_hal.DimName.NumBoxes, 8400),
+            ],
+        )
+
+
+def test_decoder_version():
+    """Test that DecoderVersion enum variants are accessible."""
+    assert edgefirst_hal.DecoderVersion.Yolov5 is not None
+    assert edgefirst_hal.DecoderVersion.Yolov8 is not None
+    assert edgefirst_hal.DecoderVersion.Yolo11 is not None
+    assert edgefirst_hal.DecoderVersion.Yolo26 is not None
+
+
+def test_output_chaining():
+    """Test that Output setter methods can be chained."""
+    output = (
+        edgefirst_hal.Output.detection(shape=[1, 84, 8400])
+        .with_quantization(scale=0.004, zero_point=-123)
+        .with_normalized(True)
+    )
+    decoder = edgefirst_hal.Decoder.new_from_outputs(
+        outputs=[output],
+        score_threshold=0.25,
+        iou_threshold=0.7,
+    )
+    assert decoder.normalized_boxes is True
+
+
+def test_with_anchors_on_non_detection_raises():
+    """Test that with_anchors() raises ValueError on non-detection outputs."""
+    with pytest.raises(ValueError, match="with_anchors.*only valid for detection"):
+        edgefirst_hal.Output.boxes(shape=[1, 4, 8400]).with_anchors([(0.5, 0.5)])
+
+
+def test_with_normalized_on_unsupported_raises():
+    """Test that with_normalized() raises ValueError on unsupported output types."""
+    with pytest.raises(
+        ValueError, match="with_normalized.*only valid for detection or boxes"
+    ):
+        edgefirst_hal.Output.scores(shape=[1, 80, 8400]).with_normalized(True)
+
+
+def test_factory_methods_protos():
+    """Test that Output.protos() and mask_coefficients() factory methods work."""
+    # 80 classes + 4 box coords + 32 mask coefficients = 116 num_features
+    # protos: [batch, num_protos, height, width]
+    detection = edgefirst_hal.Output.detection(
+        dshape=[
+            (edgefirst_hal.DimName.Batch, 1),
+            (edgefirst_hal.DimName.NumFeatures, 116),
+            (edgefirst_hal.DimName.NumBoxes, 8400),
+        ]
+    )
+    protos = edgefirst_hal.Output.protos(
+        dshape=[
+            (edgefirst_hal.DimName.Batch, 1),
+            (edgefirst_hal.DimName.NumProtos, 32),
+            (edgefirst_hal.DimName.Height, 160),
+            (edgefirst_hal.DimName.Width, 160),
+        ]
+    )
+    decoder = edgefirst_hal.Decoder.new_from_outputs(
+        outputs=[detection, protos],
+        score_threshold=0.25,
+    )
+    assert decoder is not None
+
+
+def test_factory_methods_modelpack():
+    """Test that DecoderType.ModelPack can be passed to factory methods."""
+    output = edgefirst_hal.Output.detection(
+        shape=[1, 17, 30, 18],
+        decoder=edgefirst_hal.DecoderType.ModelPack,
+    )
+    assert output is not None
+
+
 @pytest.mark.benchmark(group="yolo_det", warmup_iterations=3)
 def test_yolo_det_int8_hal(benchmark):
     config = {

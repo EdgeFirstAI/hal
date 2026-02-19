@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::too_many_arguments, clippy::type_complexity)]
 use edgefirst_hal::decoder::{
-    configs::Nms, dequantize_cpu, modelpack::ModelPackDetectionConfig, segmentation_to_mask,
-    Decoder, DecoderBuilder, DetectBox, Quantization, Segmentation,
+    configs, configs::Nms, dequantize_cpu, modelpack::ModelPackDetectionConfig,
+    segmentation_to_mask, ConfigOutput, Decoder, DecoderBuilder, DetectBox, Quantization,
+    Segmentation,
 };
 
 /// NMS (Non-Maximum Suppression) mode for filtering overlapping detections.
@@ -39,6 +39,367 @@ impl From<Nms> for PyNms {
         match nms {
             Nms::ClassAgnostic => PyNms::ClassAgnostic,
             Nms::ClassAware => PyNms::ClassAware,
+        }
+    }
+}
+
+/// Decoder type — selects the post-processing algorithm family.
+#[pyo3::pyclass(name = "DecoderType", eq, eq_int)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PyDecoderType {
+    /// Ultralytics YOLO models (YOLOv5, YOLOv8, YOLO11, YOLO26)
+    Ultralytics = 0,
+    /// ModelPack models
+    ModelPack = 1,
+}
+
+impl From<PyDecoderType> for configs::DecoderType {
+    fn from(py: PyDecoderType) -> Self {
+        match py {
+            PyDecoderType::Ultralytics => configs::DecoderType::Ultralytics,
+            PyDecoderType::ModelPack => configs::DecoderType::ModelPack,
+        }
+    }
+}
+
+impl From<configs::DecoderType> for PyDecoderType {
+    fn from(dt: configs::DecoderType) -> Self {
+        match dt {
+            configs::DecoderType::Ultralytics => PyDecoderType::Ultralytics,
+            configs::DecoderType::ModelPack => PyDecoderType::ModelPack,
+        }
+    }
+}
+
+/// Decoder version for Ultralytics models.
+///
+/// Specifies the YOLO architecture version, which determines the decoding
+/// strategy:
+/// - `Yolov5`, `Yolov8`, `Yolo11`: Traditional models requiring external NMS
+/// - `Yolo26`: End-to-end models with NMS embedded in the model architecture
+#[pyo3::pyclass(name = "DecoderVersion", eq, eq_int)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PyDecoderVersion {
+    /// YOLOv5 - anchor-based decoder, requires external NMS
+    Yolov5 = 0,
+    /// YOLOv8 - anchor-free DFL decoder, requires external NMS
+    Yolov8 = 1,
+    /// YOLO11 - anchor-free DFL decoder, requires external NMS
+    Yolo11 = 2,
+    /// YOLO26 - end-to-end model with embedded NMS
+    Yolo26 = 3,
+}
+
+impl From<PyDecoderVersion> for configs::DecoderVersion {
+    fn from(py: PyDecoderVersion) -> Self {
+        match py {
+            PyDecoderVersion::Yolov5 => configs::DecoderVersion::Yolov5,
+            PyDecoderVersion::Yolov8 => configs::DecoderVersion::Yolov8,
+            PyDecoderVersion::Yolo11 => configs::DecoderVersion::Yolo11,
+            PyDecoderVersion::Yolo26 => configs::DecoderVersion::Yolo26,
+        }
+    }
+}
+
+impl From<configs::DecoderVersion> for PyDecoderVersion {
+    fn from(dv: configs::DecoderVersion) -> Self {
+        match dv {
+            configs::DecoderVersion::Yolov5 => PyDecoderVersion::Yolov5,
+            configs::DecoderVersion::Yolov8 => PyDecoderVersion::Yolov8,
+            configs::DecoderVersion::Yolo11 => PyDecoderVersion::Yolo11,
+            configs::DecoderVersion::Yolo26 => PyDecoderVersion::Yolo26,
+        }
+    }
+}
+
+/// Named dimension for model output tensors.
+///
+/// Used with `dshape` to give semantic meaning to each dimension,
+/// enabling the decoder to validate and interpret the tensor layout.
+#[pyo3::pyclass(name = "DimName", eq, eq_int)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PyDimName {
+    /// Batch dimension (typically 1)
+    Batch = 0,
+    /// Spatial height
+    Height = 1,
+    /// Spatial width
+    Width = 2,
+    /// Number of object classes
+    NumClasses = 3,
+    /// Number of features per box (e.g. 4 coords + N classes)
+    NumFeatures = 4,
+    /// Number of candidate boxes / anchors
+    NumBoxes = 5,
+    /// Number of segmentation prototype channels
+    NumProtos = 6,
+    /// Product of anchors and features (ModelPack split format)
+    NumAnchorsXFeatures = 7,
+    /// Padding dimension
+    Padding = 8,
+    /// Box coordinate dimension (typically 4)
+    BoxCoords = 9,
+}
+
+impl From<PyDimName> for configs::DimName {
+    fn from(py: PyDimName) -> Self {
+        match py {
+            PyDimName::Batch => configs::DimName::Batch,
+            PyDimName::Height => configs::DimName::Height,
+            PyDimName::Width => configs::DimName::Width,
+            PyDimName::NumClasses => configs::DimName::NumClasses,
+            PyDimName::NumFeatures => configs::DimName::NumFeatures,
+            PyDimName::NumBoxes => configs::DimName::NumBoxes,
+            PyDimName::NumProtos => configs::DimName::NumProtos,
+            PyDimName::NumAnchorsXFeatures => configs::DimName::NumAnchorsXFeatures,
+            PyDimName::Padding => configs::DimName::Padding,
+            PyDimName::BoxCoords => configs::DimName::BoxCoords,
+        }
+    }
+}
+
+impl From<configs::DimName> for PyDimName {
+    fn from(dn: configs::DimName) -> Self {
+        match dn {
+            configs::DimName::Batch => PyDimName::Batch,
+            configs::DimName::Height => PyDimName::Height,
+            configs::DimName::Width => PyDimName::Width,
+            configs::DimName::NumClasses => PyDimName::NumClasses,
+            configs::DimName::NumFeatures => PyDimName::NumFeatures,
+            configs::DimName::NumBoxes => PyDimName::NumBoxes,
+            configs::DimName::NumProtos => PyDimName::NumProtos,
+            configs::DimName::NumAnchorsXFeatures => PyDimName::NumAnchorsXFeatures,
+            configs::DimName::Padding => PyDimName::Padding,
+            configs::DimName::BoxCoords => PyDimName::BoxCoords,
+        }
+    }
+}
+
+/// A model output configuration for programmatic decoder setup.
+///
+/// Use the static factory methods (`detection`, `boxes`, `scores`, etc.) to
+/// create outputs, then pass them to `Decoder.new_from_outputs()`.
+///
+/// Shape can be specified as either:
+/// - `shape`: anonymous integer dimensions (e.g. `[1, 25200, 85]`)
+/// - `dshape`: named dimensions (e.g. `[(DimName.Batch, 1), ...]`)
+///
+/// Provide one or the other, not both. If `dshape` is provided, `shape` is
+/// derived automatically.
+#[pyclass(name = "Output")]
+#[derive(Debug, Clone)]
+pub struct PyOutput {
+    inner: ConfigOutput,
+}
+
+type ShapeDshape = (Vec<usize>, Vec<(configs::DimName, usize)>);
+
+/// Helper: parse shape/dshape parameters and return (shape, dshape).
+fn parse_shape_dshape(
+    shape: Option<Vec<usize>>,
+    dshape: Option<Vec<(PyDimName, usize)>>,
+) -> PyResult<ShapeDshape> {
+    match (shape, dshape) {
+        (Some(_), Some(_)) => Err(pyo3::exceptions::PyValueError::new_err(
+            "Provide either 'shape' or 'dshape', not both",
+        )),
+        (None, None) => Err(pyo3::exceptions::PyValueError::new_err(
+            "Either 'shape' or 'dshape' must be provided",
+        )),
+        (Some(s), None) => Ok((s, Vec::new())),
+        (None, Some(ds)) => {
+            let dshape = ds
+                .iter()
+                .map(|(name, size)| ((*name).into(), *size))
+                .collect();
+            // shape left empty; DecoderBuilder::add_output() -> normalize_output()
+            // will derive it from dshape.
+            Ok((Vec::new(), dshape))
+        }
+    }
+}
+
+#[pymethods]
+impl PyOutput {
+    /// Create a detection output (combined boxes + scores in one tensor).
+    #[staticmethod]
+    #[pyo3(signature = (shape=None, dshape=None, decoder=PyDecoderType::Ultralytics))]
+    fn detection(
+        shape: Option<Vec<usize>>,
+        dshape: Option<Vec<(PyDimName, usize)>>,
+        decoder: PyDecoderType,
+    ) -> PyResult<Self> {
+        let (shape, dshape) = parse_shape_dshape(shape, dshape)?;
+        Ok(Self {
+            inner: ConfigOutput::Detection(configs::Detection {
+                decoder: decoder.into(),
+                shape,
+                dshape,
+                ..Default::default()
+            }),
+        })
+    }
+
+    /// Create a boxes-only output (split detection format).
+    #[staticmethod]
+    #[pyo3(signature = (shape=None, dshape=None, decoder=PyDecoderType::Ultralytics))]
+    fn boxes(
+        shape: Option<Vec<usize>>,
+        dshape: Option<Vec<(PyDimName, usize)>>,
+        decoder: PyDecoderType,
+    ) -> PyResult<Self> {
+        let (shape, dshape) = parse_shape_dshape(shape, dshape)?;
+        Ok(Self {
+            inner: ConfigOutput::Boxes(configs::Boxes {
+                decoder: decoder.into(),
+                shape,
+                dshape,
+                ..Default::default()
+            }),
+        })
+    }
+
+    /// Create a scores-only output (split detection format).
+    #[staticmethod]
+    #[pyo3(signature = (shape=None, dshape=None, decoder=PyDecoderType::Ultralytics))]
+    fn scores(
+        shape: Option<Vec<usize>>,
+        dshape: Option<Vec<(PyDimName, usize)>>,
+        decoder: PyDecoderType,
+    ) -> PyResult<Self> {
+        let (shape, dshape) = parse_shape_dshape(shape, dshape)?;
+        Ok(Self {
+            inner: ConfigOutput::Scores(configs::Scores {
+                decoder: decoder.into(),
+                shape,
+                dshape,
+                ..Default::default()
+            }),
+        })
+    }
+
+    /// Create a protos output (segmentation prototype tensor).
+    #[staticmethod]
+    #[pyo3(signature = (shape=None, dshape=None, decoder=PyDecoderType::Ultralytics))]
+    fn protos(
+        shape: Option<Vec<usize>>,
+        dshape: Option<Vec<(PyDimName, usize)>>,
+        decoder: PyDecoderType,
+    ) -> PyResult<Self> {
+        let (shape, dshape) = parse_shape_dshape(shape, dshape)?;
+        Ok(Self {
+            inner: ConfigOutput::Protos(configs::Protos {
+                decoder: decoder.into(),
+                shape,
+                dshape,
+                ..Default::default()
+            }),
+        })
+    }
+
+    /// Create a segmentation output.
+    #[staticmethod]
+    #[pyo3(signature = (shape=None, dshape=None, decoder=PyDecoderType::Ultralytics))]
+    fn segmentation(
+        shape: Option<Vec<usize>>,
+        dshape: Option<Vec<(PyDimName, usize)>>,
+        decoder: PyDecoderType,
+    ) -> PyResult<Self> {
+        let (shape, dshape) = parse_shape_dshape(shape, dshape)?;
+        Ok(Self {
+            inner: ConfigOutput::Segmentation(configs::Segmentation {
+                decoder: decoder.into(),
+                shape,
+                dshape,
+                ..Default::default()
+            }),
+        })
+    }
+
+    /// Create a mask coefficients output.
+    #[staticmethod]
+    #[pyo3(signature = (shape=None, dshape=None, decoder=PyDecoderType::Ultralytics))]
+    fn mask_coefficients(
+        shape: Option<Vec<usize>>,
+        dshape: Option<Vec<(PyDimName, usize)>>,
+        decoder: PyDecoderType,
+    ) -> PyResult<Self> {
+        let (shape, dshape) = parse_shape_dshape(shape, dshape)?;
+        Ok(Self {
+            inner: ConfigOutput::MaskCoefficients(configs::MaskCoefficients {
+                decoder: decoder.into(),
+                shape,
+                dshape,
+                ..Default::default()
+            }),
+        })
+    }
+
+    /// Create a mask output.
+    #[staticmethod]
+    #[pyo3(signature = (shape=None, dshape=None, decoder=PyDecoderType::Ultralytics))]
+    fn mask(
+        shape: Option<Vec<usize>>,
+        dshape: Option<Vec<(PyDimName, usize)>>,
+        decoder: PyDecoderType,
+    ) -> PyResult<Self> {
+        let (shape, dshape) = parse_shape_dshape(shape, dshape)?;
+        Ok(Self {
+            inner: ConfigOutput::Mask(configs::Mask {
+                decoder: decoder.into(),
+                shape,
+                dshape,
+                ..Default::default()
+            }),
+        })
+    }
+
+    /// Set quantization parameters for this output. Returns self for chaining.
+    #[pyo3(signature = (scale, zero_point))]
+    fn with_quantization(self_: Bound<'_, Self>, scale: f32, zero_point: i32) -> Bound<'_, Self> {
+        let quant = Some(configs::QuantTuple(scale, zero_point));
+        match &mut self_.borrow_mut().inner {
+            ConfigOutput::Detection(c) => c.quantization = quant,
+            ConfigOutput::Boxes(c) => c.quantization = quant,
+            ConfigOutput::Scores(c) => c.quantization = quant,
+            ConfigOutput::Protos(c) => c.quantization = quant,
+            ConfigOutput::Segmentation(c) => c.quantization = quant,
+            ConfigOutput::MaskCoefficients(c) => c.quantization = quant,
+            ConfigOutput::Mask(c) => c.quantization = quant,
+        }
+        self_
+    }
+
+    /// Set anchors for this output (detection outputs only). Returns self for chaining.
+    #[pyo3(signature = (anchors))]
+    fn with_anchors(self_: Bound<'_, Self>, anchors: Vec<[f32; 2]>) -> PyResult<Bound<'_, Self>> {
+        match &mut self_.borrow_mut().inner {
+            ConfigOutput::Detection(c) => {
+                c.anchors = Some(anchors);
+                Ok(self_)
+            }
+            _ => Err(pyo3::exceptions::PyValueError::new_err(
+                "with_anchors() is only valid for detection outputs",
+            )),
+        }
+    }
+
+    /// Set the normalized flag for this output (detection/boxes outputs only).
+    /// Returns self for chaining.
+    #[pyo3(signature = (normalized))]
+    fn with_normalized(self_: Bound<'_, Self>, normalized: bool) -> PyResult<Bound<'_, Self>> {
+        match &mut self_.borrow_mut().inner {
+            ConfigOutput::Detection(c) => {
+                c.normalized = Some(normalized);
+                Ok(self_)
+            }
+            ConfigOutput::Boxes(c) => {
+                c.normalized = Some(normalized);
+                Ok(self_)
+            }
+            _ => Err(pyo3::exceptions::PyValueError::new_err(
+                "with_normalized() is only valid for detection or boxes outputs",
+            )),
         }
     }
 }
@@ -239,6 +600,45 @@ impl PyDecoder {
         }
     }
 
+    /// Create a new Decoder from a list of Output objects.
+    ///
+    /// The default thresholds (0.25 / 0.45) are tuned for typical YOLO models.
+    /// The dict/JSON/YAML constructors use lower defaults (0.1 / 0.7) for
+    /// backward compatibility.
+    ///
+    /// Args:
+    ///     outputs: List of Output objects describing the model outputs.
+    ///     score_threshold: Score threshold for filtering detections (default:
+    /// 0.25)     iou_threshold: IoU threshold for NMS (default: 0.45)
+    ///     nms: NMS mode - Nms.ClassAgnostic (default), Nms.ClassAware, or None
+    /// to bypass NMS     decoder_version: Optional decoder version for
+    /// Ultralytics models
+    #[staticmethod]
+    #[pyo3(signature = (outputs, score_threshold=0.25, iou_threshold=0.45, nms=PyNms::ClassAgnostic, decoder_version=None))]
+    pub fn new_from_outputs(
+        outputs: Vec<PyRef<PyOutput>>,
+        score_threshold: f32,
+        iou_threshold: f32,
+        nms: Option<PyNms>,
+        decoder_version: Option<PyDecoderVersion>,
+    ) -> PyResult<Self> {
+        let nms: Option<Nms> = nms.map(|py_nms| py_nms.into());
+        let mut builder = DecoderBuilder::default()
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .with_nms(nms);
+        for output in outputs {
+            builder = builder.add_output(output.inner.clone());
+        }
+        if let Some(version) = decoder_version {
+            builder = builder.with_decoder_version(version.into());
+        }
+        match builder.build() {
+            Ok(decoder) => Ok(Self { decoder }),
+            Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}"))),
+        }
+    }
+
     #[staticmethod]
     #[pyo3(signature = (json_str, score_threshold=0.1, iou_threshold=0.7, nms=PyNms::ClassAgnostic))]
     pub fn new_from_json_str(
@@ -411,6 +811,7 @@ impl PyDecoder {
         Ok(convert_detect_box(py, &output_boxes))
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[staticmethod]
     #[pyo3(signature = (boxes, protos, quant_boxes=(1.0, 0), quant_protos=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, nms=PyNms::ClassAgnostic, max_boxes=100))]
     pub fn decode_yolo_segdet<'py>(
@@ -485,6 +886,7 @@ impl PyDecoder {
         Ok((boxes, scores, classes, masks))
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[staticmethod]
     #[pyo3(signature = (boxes, scores, quant_boxes=(1.0, 0), quant_scores=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, max_boxes=100))]
     pub fn decode_modelpack_det<'py>(

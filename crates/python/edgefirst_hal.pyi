@@ -41,6 +41,240 @@ A tuple containing:
 - masks: A list of NumPy arrays, each of shape (H, W, ...) containing detected segmentation mask.
 """
 
+class DecoderType(enum.Enum):
+    """Decoder type — selects the post-processing algorithm family.
+
+    - ``Ultralytics``: Ultralytics YOLO models (YOLOv5, YOLOv8, YOLO11, YOLO26)
+    - ``ModelPack``: ModelPack models
+    """
+
+    Ultralytics: DecoderType
+    ModelPack: DecoderType
+
+class DecoderVersion(enum.Enum):
+    """Decoder version for Ultralytics models.
+
+    Specifies the YOLO architecture version, which determines the decoding strategy:
+
+    - ``Yolov5``, ``Yolov8``, ``Yolo11``: Traditional models requiring external NMS.
+    - ``Yolo26``: End-to-end models with NMS embedded in the model architecture.
+      When set, the decoder uses end-to-end model types regardless of the ``nms`` setting.
+    """
+
+    Yolov5: DecoderVersion
+    """YOLOv5 - anchor-based decoder, requires external NMS."""
+    Yolov8: DecoderVersion
+    """YOLOv8 - anchor-free DFL decoder, requires external NMS."""
+    Yolo11: DecoderVersion
+    """YOLO11 - anchor-free DFL decoder, requires external NMS."""
+    Yolo26: DecoderVersion
+    """YOLO26 - end-to-end model with embedded NMS (one-to-one matching heads)."""
+
+class DimName(enum.Enum):
+    """Named dimension for model output tensors.
+
+    Used with ``dshape`` to give semantic meaning to each dimension,
+    enabling the decoder to validate and interpret the tensor layout.
+    """
+
+    Batch: DimName
+    """Batch dimension (typically 1)."""
+    Height: DimName
+    """Spatial height."""
+    Width: DimName
+    """Spatial width."""
+    NumClasses: DimName
+    """Number of object classes."""
+    NumFeatures: DimName
+    """Number of features per box (e.g. 4 box coords + N class scores)."""
+    NumBoxes: DimName
+    """Number of candidate boxes / anchors."""
+    NumProtos: DimName
+    """Number of segmentation prototype channels."""
+    NumAnchorsXFeatures: DimName
+    """Product of anchors and features (ModelPack split format)."""
+    Padding: DimName
+    """Padding dimension."""
+    BoxCoords: DimName
+    """Box coordinate dimension (typically 4)."""
+
+class Output:
+    """A model output configuration for programmatic decoder setup.
+
+    Use the static factory methods (``detection``, ``boxes``, ``scores``, etc.)
+    to create outputs, then pass them to ``Decoder.new_from_outputs()``.
+
+    **Shape specification** — provide one of:
+
+    - ``shape``: anonymous integer dimensions, e.g. ``[1, 25200, 85]``
+    - ``dshape``: named dimensions, e.g. ``[(DimName.Batch, 1), (DimName.NumFeatures, 85), ...]``
+
+    If ``dshape`` is provided, ``shape`` is derived automatically.
+
+    Example::
+
+        # Anonymous shape:
+        Output.detection(shape=[1, 25200, 85])
+
+        # Named shape (preferred):
+        Output.detection(dshape=[(DimName.Batch, 1),
+                                 (DimName.NumFeatures, 85),
+                                 (DimName.NumBoxes, 25200)])
+
+        # With quantization and chaining:
+        Output.detection(shape=[1, 84, 8400]).with_quantization(scale=0.004, zero_point=-123)
+    """
+
+    @staticmethod
+    def detection(
+        shape: Optional[List[int]] = None,
+        dshape: Optional[List[Tuple[DimName, int]]] = None,
+        decoder: DecoderType = DecoderType.Ultralytics,
+    ) -> Output:
+        """Create a detection output (combined boxes + scores in one tensor).
+
+        Expected ``DimName`` values: ``Batch``, ``NumFeatures``, ``NumBoxes``.
+
+        Args:
+            shape: Anonymous integer dimensions (mutually exclusive with dshape).
+            dshape: Named dimensions (mutually exclusive with shape).
+            decoder: Decoder type (default: Ultralytics).
+        """
+        ...
+
+    @staticmethod
+    def boxes(
+        shape: Optional[List[int]] = None,
+        dshape: Optional[List[Tuple[DimName, int]]] = None,
+        decoder: DecoderType = DecoderType.Ultralytics,
+    ) -> Output:
+        """Create a boxes-only output (split detection format).
+
+        Expected ``DimName`` values: ``Batch``, ``BoxCoords``, ``NumBoxes``.
+
+        Args:
+            shape: Anonymous integer dimensions (mutually exclusive with dshape).
+            dshape: Named dimensions (mutually exclusive with shape).
+            decoder: Decoder type (default: Ultralytics).
+        """
+        ...
+
+    @staticmethod
+    def scores(
+        shape: Optional[List[int]] = None,
+        dshape: Optional[List[Tuple[DimName, int]]] = None,
+        decoder: DecoderType = DecoderType.Ultralytics,
+    ) -> Output:
+        """Create a scores-only output (split detection format).
+
+        Expected ``DimName`` values: ``Batch``, ``NumClasses``, ``NumBoxes``.
+
+        Args:
+            shape: Anonymous integer dimensions (mutually exclusive with dshape).
+            dshape: Named dimensions (mutually exclusive with shape).
+            decoder: Decoder type (default: Ultralytics).
+        """
+        ...
+
+    @staticmethod
+    def protos(
+        shape: Optional[List[int]] = None,
+        dshape: Optional[List[Tuple[DimName, int]]] = None,
+        decoder: DecoderType = DecoderType.Ultralytics,
+    ) -> Output:
+        """Create a protos output (segmentation prototype tensor).
+
+        Expected ``DimName`` values: ``Batch``, ``NumProtos``, ``Height``, ``Width``.
+
+        Args:
+            shape: Anonymous integer dimensions (mutually exclusive with dshape).
+            dshape: Named dimensions (mutually exclusive with shape).
+            decoder: Decoder type (default: Ultralytics).
+        """
+        ...
+
+    @staticmethod
+    def segmentation(
+        shape: Optional[List[int]] = None,
+        dshape: Optional[List[Tuple[DimName, int]]] = None,
+        decoder: DecoderType = DecoderType.Ultralytics,
+    ) -> Output:
+        """Create a segmentation output.
+
+        Args:
+            shape: Anonymous integer dimensions (mutually exclusive with dshape).
+            dshape: Named dimensions (mutually exclusive with shape).
+            decoder: Decoder type (default: Ultralytics).
+        """
+        ...
+
+    @staticmethod
+    def mask_coefficients(
+        shape: Optional[List[int]] = None,
+        dshape: Optional[List[Tuple[DimName, int]]] = None,
+        decoder: DecoderType = DecoderType.Ultralytics,
+    ) -> Output:
+        """Create a mask coefficients output.
+
+        Args:
+            shape: Anonymous integer dimensions (mutually exclusive with dshape).
+            dshape: Named dimensions (mutually exclusive with shape).
+            decoder: Decoder type (default: Ultralytics).
+        """
+        ...
+
+    @staticmethod
+    def mask(
+        shape: Optional[List[int]] = None,
+        dshape: Optional[List[Tuple[DimName, int]]] = None,
+        decoder: DecoderType = DecoderType.Ultralytics,
+    ) -> Output:
+        """Create a mask output.
+
+        Args:
+            shape: Anonymous integer dimensions (mutually exclusive with dshape).
+            dshape: Named dimensions (mutually exclusive with shape).
+            decoder: Decoder type (default: Ultralytics).
+        """
+        ...
+
+    def with_quantization(self, scale: float, zero_point: int) -> Output:
+        """Set quantization parameters for this output.
+
+        Returns self for method chaining.
+
+        Args:
+            scale: Quantization scale factor.
+            zero_point: Quantization zero point.
+        """
+        ...
+
+    def with_anchors(self, anchors: List[Tuple[float, float]]) -> Output:
+        """Set anchors for this output (detection outputs only).
+
+        Returns self for method chaining.
+
+        Args:
+            anchors: List of (width, height) anchor pairs.
+
+        Raises:
+            ValueError: If called on a non-detection output.
+        """
+        ...
+
+    def with_normalized(self, normalized: bool) -> Output:
+        """Set the normalized flag for this output (detection/boxes outputs only).
+
+        Returns self for method chaining.
+
+        Args:
+            normalized: True if box coordinates are in [0,1] range.
+
+        Raises:
+            ValueError: If called on an unsupported output type.
+        """
+        ...
+
 class Decoder:
     def __init__(
         self,
@@ -93,6 +327,44 @@ class Decoder:
             score_threshold: Minimum confidence score for detections.
             iou_threshold: IoU threshold for non-maximum suppression.
             nms: NMS mode - Nms.ClassAgnostic (default), Nms.ClassAware, or None to bypass NMS.
+        """
+        ...
+
+    @staticmethod
+    def new_from_outputs(
+        outputs: List[Output],
+        score_threshold: float = 0.25,
+        iou_threshold: float = 0.45,
+        nms: Optional[Nms] = Nms.ClassAgnostic,
+        decoder_version: Optional[DecoderVersion] = None,
+    ) -> Decoder:
+        """Create a new Decoder from a list of Output objects.
+
+        This provides a Pythonic way to configure the decoder programmatically
+        without JSON/YAML configuration strings or dictionaries.
+
+        The default thresholds (0.25 / 0.45) are tuned for typical YOLO models.
+        The dict/JSON/YAML constructors use lower defaults (0.1 / 0.7) for
+        backward compatibility.
+
+        Example::
+
+            decoder = Decoder.new_from_outputs(
+                outputs=[
+                    Output.detection(shape=[1, 84, 8400])
+                        .with_quantization(scale=0.004, zero_point=-123)
+                ],
+                score_threshold=0.25,
+                iou_threshold=0.45,
+            )
+
+        Args:
+            outputs: List of Output objects describing the model outputs.
+            score_threshold: Minimum confidence score for detections.
+            iou_threshold: IoU threshold for non-maximum suppression.
+            nms: NMS mode - Nms.ClassAgnostic (default), Nms.ClassAware, or None to bypass NMS.
+            decoder_version: Optional decoder version for Ultralytics models.
+                Set to DecoderVersion.Yolo26 for end-to-end models.
         """
         ...
 
