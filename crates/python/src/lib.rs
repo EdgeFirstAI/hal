@@ -51,6 +51,10 @@ pub mod edgefirst_hal {
         m.add_class::<image::PyTensorImage>()?;
         m.add_class::<decoder::PyDecoder>()?;
         m.add_class::<decoder::PyNms>()?;
+        m.add_class::<decoder::PyDecoderType>()?;
+        m.add_class::<decoder::PyDecoderVersion>()?;
+        m.add_class::<decoder::PyDimName>()?;
+        m.add_class::<decoder::PyOutput>()?;
 
         Ok(())
     }
