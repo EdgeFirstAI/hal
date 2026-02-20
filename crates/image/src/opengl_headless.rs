@@ -52,6 +52,59 @@ use crate::{
     TensorImageRef, GREY, NV12, PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, YUYV,
 };
 
+/// Identifies the type of EGL display used for headless OpenGL ES rendering.
+///
+/// The HAL probes displays in priority order: GBM first (direct GPU access),
+/// then platform device enumeration, then the default display. Use
+/// [`probe_egl_displays`] to discover which are available and
+/// [`ImageProcessorConfig::egl_display`](crate::ImageProcessorConfig::egl_display)
+/// to override the auto-detection.
+///
+/// # Display Types
+///
+/// - **`Gbm`** — Opens a DRM render node (e.g. `/dev/dri/renderD128`) and
+///   creates a GBM (Generic Buffer Manager) device, then calls
+///   `eglGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, gbm_device)`. This is a
+///   direct GPU path through the DRM/KMS subsystem — no compositor required.
+///   Preferred for headless edge AI workloads. On some drivers (e.g. Vivante
+///   on i.MX8), this path may trigger heap corruption during process shutdown.
+///
+/// - **`PlatformDevice`** — Uses the `EGL_EXT_device_enumeration` extension
+///   to query available EGL devices via `eglQueryDevicesEXT`, then selects the
+///   first device with `eglGetPlatformDisplay(EGL_EXT_platform_device, ...)`.
+///   Also headless and compositor-free. Common on NVIDIA GPUs.
+///
+/// - **`Default`** — Calls `eglGetDisplay(EGL_DEFAULT_DISPLAY)`, letting the
+///   EGL implementation choose the display. On Wayland systems this connects
+///   to the compositor; on X11 it connects to the X server. May block on
+///   headless systems where a compositor is expected but not running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EglDisplayKind {
+    Gbm,
+    PlatformDevice,
+    Default,
+}
+
+impl std::fmt::Display for EglDisplayKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EglDisplayKind::Gbm => write!(f, "GBM"),
+            EglDisplayKind::PlatformDevice => write!(f, "PlatformDevice"),
+            EglDisplayKind::Default => write!(f, "Default"),
+        }
+    }
+}
+
+/// A validated, available EGL display discovered by [`probe_egl_displays`].
+#[derive(Debug, Clone)]
+pub struct EglDisplayInfo {
+    /// The type of EGL display.
+    pub kind: EglDisplayKind,
+    /// Human-readable description for logging/diagnostics
+    /// (e.g. "GBM via /dev/dri/renderD128").
+    pub description: String,
+}
+
 /// EGL library handle. Intentionally leaked (never dlclose'd) to avoid SIGBUS
 /// on process exit: GPU drivers may keep internal state that outlives explicit
 /// EGL cleanup, and dlclose can unmap memory still referenced by the driver.
@@ -69,6 +122,96 @@ fn get_egl_lib() -> Result<&'static libloading::Library, crate::Error> {
 }
 
 type Egl = Instance<Dynamic<&'static libloading::Library, EGL1_4>>;
+
+/// Check whether an EGL display supports GLES3 RGBA8 PBuffer rendering.
+///
+/// Returns `true` if `eglChooseConfig` finds at least one matching config.
+fn probe_config_check(egl: &Egl, display: egl::Display) -> bool {
+    let attributes = [
+        egl::SURFACE_TYPE,
+        egl::PBUFFER_BIT,
+        egl::RENDERABLE_TYPE,
+        egl::OPENGL_ES3_BIT,
+        egl::RED_SIZE,
+        8,
+        egl::GREEN_SIZE,
+        8,
+        egl::BLUE_SIZE,
+        8,
+        egl::ALPHA_SIZE,
+        8,
+        egl::NONE,
+    ];
+    egl.choose_first_config(display, &attributes)
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+/// Probe for available EGL displays supporting headless OpenGL ES 3.0.
+///
+/// Returns validated displays in priority order (GBM, PlatformDevice,
+/// Default). Each display is validated with `eglInitialize` +
+/// `eglChooseConfig` using the same GLES3 RGBA8 PBuffer attributes used by
+/// the image processor. Probed state is cleaned up with `eglTerminate` — no
+/// EGL resources are left alive.
+///
+/// An empty list means OpenGL is not available on this system.
+///
+/// # Errors
+///
+/// Returns an error only if `libEGL.so.1` cannot be loaded. Individual
+/// display probe failures are silently skipped.
+pub fn probe_egl_displays() -> Result<Vec<EglDisplayInfo>, Error> {
+    let egl: Egl = unsafe { Instance::<Dynamic<_, EGL1_4>>::load_required_from(get_egl_lib()?)? };
+
+    let mut results = Vec::new();
+
+    // GBM
+    if let Ok(display_type) = GlContext::egl_get_gbm_display(&egl) {
+        let display = display_type.as_display();
+        if egl.initialize(display).is_ok() {
+            if probe_config_check(&egl, display) {
+                results.push(EglDisplayInfo {
+                    kind: EglDisplayKind::Gbm,
+                    description: "GBM via /dev/dri/renderD128".to_string(),
+                });
+            }
+            let _ = egl.terminate(display);
+        }
+    }
+
+    // PlatformDevice
+    if let Ok(display_type) = GlContext::egl_get_platform_display_from_device(&egl) {
+        let display = display_type.as_display();
+        if egl.initialize(display).is_ok() {
+            if probe_config_check(&egl, display) {
+                results.push(EglDisplayInfo {
+                    kind: EglDisplayKind::PlatformDevice,
+                    description: "EGL platform device via EGL_EXT_device_enumeration".to_string(),
+                });
+            }
+            let _ = egl.terminate(display);
+        }
+    }
+
+    // Default
+    if let Ok(display_type) = GlContext::egl_get_default_display(&egl) {
+        let display = display_type.as_display();
+        if egl.initialize(display).is_ok() {
+            if probe_config_check(&egl, display) {
+                results.push(EglDisplayInfo {
+                    kind: EglDisplayKind::Default,
+                    description: "EGL default display".to_string(),
+                });
+            }
+            let _ = egl.terminate(display);
+        }
+    }
+
+    Ok(results)
+}
+
 pub(crate) struct GlContext {
     pub(crate) support_dma: bool,
     pub(crate) surface: Option<egl::Surface>,
@@ -98,10 +241,23 @@ impl EglDisplayType {
 }
 
 impl GlContext {
-    pub(crate) fn new() -> Result<GlContext, crate::Error> {
+    pub(crate) fn new(kind: Option<EglDisplayKind>) -> Result<GlContext, crate::Error> {
         // Create an EGL API instance.
         let egl: Rc<Egl> =
             Rc::new(unsafe { Instance::<Dynamic<_, EGL1_4>>::load_required_from(get_egl_lib()?)? });
+
+        if let Some(kind) = kind {
+            // Specific display type requested — try only that one.
+            let display_fn = match kind {
+                EglDisplayKind::Gbm => Self::egl_get_gbm_display as fn(&Egl) -> _,
+                EglDisplayKind::PlatformDevice => Self::egl_get_platform_display_from_device,
+                EglDisplayKind::Default => Self::egl_get_default_display,
+            };
+            return Self::try_initialize_egl(egl, display_fn).map_err(|e| {
+                log::debug!("Failed to initialize EGL with {kind} display: {e:?}");
+                e
+            });
+        }
 
         // Try headless-friendly EGL methods first (GBM/DRM, device enumeration)
         // before the default display, which may block if a compositor (Wayland)
@@ -543,13 +699,13 @@ unsafe impl<T> Send for SendablePtr<T> where T: Send {}
 
 impl GLProcessorThreaded {
     /// Creates a new OpenGL multi-threaded image converter.
-    pub fn new() -> Result<Self, Error> {
+    pub fn new(kind: Option<EglDisplayKind>) -> Result<Self, Error> {
         let (send, mut recv) = tokio::sync::mpsc::channel::<GLProcessorMessage>(1);
 
         let (create_ctx_send, create_ctx_recv) = tokio::sync::oneshot::channel();
 
         let func = move || {
-            let mut gl_converter = match GLProcessorST::new() {
+            let mut gl_converter = match GLProcessorST::new(kind) {
                 Ok(gl) => gl,
                 Err(e) => {
                     let _ = create_ctx_send.send(Err(e));
@@ -907,8 +1063,8 @@ impl ImageProcessorTrait for GLProcessorST {
 }
 
 impl GLProcessorST {
-    pub fn new() -> Result<GLProcessorST, crate::Error> {
-        let gl_context = GlContext::new()?;
+    pub fn new(kind: Option<EglDisplayKind>) -> Result<GLProcessorST, crate::Error> {
+        let gl_context = GlContext::new(kind)?;
         gls::load_with(|s| {
             gl_context
                 .egl
@@ -2961,7 +3117,7 @@ mod gl_tests {
             ymax: 1.0,
         };
 
-        let mut renderer = GLProcessorThreaded::new().unwrap();
+        let mut renderer = GLProcessorThreaded::new(None).unwrap();
         renderer.render_to_image(&mut image, &[], &[seg]).unwrap();
     }
 
@@ -2999,7 +3155,7 @@ mod gl_tests {
             ymax: 1.0,
         };
 
-        let mut renderer = GLProcessorThreaded::new().unwrap();
+        let mut renderer = GLProcessorThreaded::new(None).unwrap();
         renderer.render_to_image(&mut image, &[], &[seg]).unwrap();
     }
 
@@ -3041,7 +3197,7 @@ mod gl_tests {
             ymax: 0.725,
         };
 
-        let mut renderer = GLProcessorThreaded::new().unwrap();
+        let mut renderer = GLProcessorThreaded::new(None).unwrap();
         renderer
             .set_class_colors(&[[255, 255, 0, 233], [128, 128, 255, 100]])
             .unwrap();
@@ -3081,7 +3237,7 @@ mod gl_tests {
             score: 0.99,
             label: 0,
         };
-        let mut renderer = GLProcessorThreaded::new().unwrap();
+        let mut renderer = GLProcessorThreaded::new(None).unwrap();
         renderer
             .set_class_colors(&[[255, 255, 0, 233], [128, 128, 255, 100]])
             .unwrap();
@@ -3095,7 +3251,7 @@ mod gl_tests {
     fn is_opengl_available() -> bool {
         #[cfg(all(target_os = "linux", feature = "opengl"))]
         {
-            *GL_AVAILABLE.get_or_init(|| GLProcessorThreaded::new().is_ok())
+            *GL_AVAILABLE.get_or_init(|| GLProcessorThreaded::new(None).is_ok())
         }
 
         #[cfg(not(all(target_os = "linux", feature = "opengl")))]
@@ -3245,7 +3401,7 @@ mod gl_tests {
 
         // Convert using OpenGL
         let mut dst = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma)).unwrap();
-        let mut gl = GLProcessorThreaded::new().unwrap();
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
         gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
             .unwrap();
 
@@ -3290,7 +3446,7 @@ mod gl_tests {
 
         // Convert using OpenGL
         let mut dst = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma)).unwrap();
-        let mut gl = GLProcessorThreaded::new().unwrap();
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
         gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
             .unwrap();
 
@@ -3304,5 +3460,154 @@ mod gl_tests {
             .copy_from_slice(dst.tensor().map().unwrap().as_slice());
 
         compare_images(&reference, &cpu_dst, 0.98, "opengl_yuyv_to_rgba_reference");
+    }
+
+    // =========================================================================
+    // EGL Display Probe & Override Tests
+    // =========================================================================
+
+    /// Validate that probe_egl_displays() discovers available display types
+    /// and returns them in priority order (GBM first).
+    ///
+    /// On headless i.MX hardware, GBM and PlatformDevice are typically
+    /// available. Default requires a running compositor (Wayland/X11) and
+    /// may not be present on headless targets.
+    #[test]
+    fn test_probe_egl_displays() {
+        let displays = probe_egl_displays().expect("probe_egl_displays should not error");
+
+        if displays.is_empty() {
+            eprintln!("SKIPPED: {} - No EGL displays available", function!());
+            return;
+        }
+
+        let kinds: Vec<_> = displays.iter().map(|d| d.kind).collect();
+        eprintln!("Probed EGL displays: {kinds:?}");
+        for d in &displays {
+            eprintln!("  {:?}: {}", d.kind, d.description);
+        }
+
+        // GBM should always be available on hardware with /dev/dri/renderD128
+        assert!(
+            kinds.contains(&EglDisplayKind::Gbm),
+            "Expected GBM display, got: {kinds:?}"
+        );
+
+        // At least two display types should be available on i.MX targets
+        assert!(
+            displays.len() >= 2,
+            "Expected at least 2 display types, got {}: {kinds:?}",
+            displays.len()
+        );
+
+        // Verify ordering: GBM should come first (priority order)
+        assert_eq!(
+            displays[0].kind,
+            EglDisplayKind::Gbm,
+            "First display should be GBM (priority order)"
+        );
+
+        // Log which optional types are available
+        if !kinds.contains(&EglDisplayKind::PlatformDevice) {
+            eprintln!("Note: PlatformDevice not available on this system");
+        }
+        if !kinds.contains(&EglDisplayKind::Default) {
+            eprintln!("Note: Default display not available (no compositor running)");
+        }
+    }
+
+    /// Validate that explicitly selecting each available display kind via
+    /// GLProcessorThreaded::new(Some(kind)) succeeds and produces a working
+    /// converter.
+    #[test]
+    fn test_override_each_display_kind() {
+        let displays = probe_egl_displays().expect("probe_egl_displays should not error");
+
+        if displays.is_empty() {
+            eprintln!("SKIPPED: {} - No EGL displays available", function!());
+            return;
+        }
+
+        for display in &displays {
+            eprintln!(
+                "Testing override: {:?} ({})",
+                display.kind, display.description
+            );
+            let mut gl = GLProcessorThreaded::new(Some(display.kind)).unwrap_or_else(|e| {
+                panic!(
+                    "GLProcessorThreaded::new(Some({:?})) failed: {e:?}",
+                    display.kind
+                )
+            });
+
+            // Smoke test: do a simple RGBA → RGBA conversion to verify the
+            // GL context is fully functional.
+            let src = TensorImage::load(
+                include_bytes!("../../../testdata/zidane.jpg"),
+                Some(RGBA),
+                None,
+            )
+            .unwrap();
+            let mut dst = TensorImage::new(320, 240, RGBA, None).unwrap();
+            gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+                .unwrap_or_else(|e| {
+                    panic!("convert() with {:?} display failed: {e:?}", display.kind)
+                });
+            eprintln!("  {:?} display: convert OK", display.kind);
+        }
+    }
+
+    /// Validate that requesting a display kind that doesn't exist on the
+    /// system returns an error rather than falling back silently.
+    #[test]
+    fn test_override_unavailable_display_errors() {
+        let displays = probe_egl_displays().expect("probe_egl_displays should not error");
+        let available_kinds: Vec<_> = displays.iter().map(|d| d.kind).collect();
+
+        // Find a kind that is NOT available; if all three are available,
+        // this test has nothing to verify — skip it.
+        let unavailable = [
+            EglDisplayKind::PlatformDevice,
+            EglDisplayKind::Gbm,
+            EglDisplayKind::Default,
+        ]
+        .into_iter()
+        .find(|k| !available_kinds.contains(k));
+
+        if let Some(kind) = unavailable {
+            eprintln!("Testing override with unavailable kind: {kind:?}");
+            let result = GLProcessorThreaded::new(Some(kind));
+            assert!(
+                result.is_err(),
+                "Expected error for unavailable display kind {kind:?}, got Ok"
+            );
+            eprintln!("  Correctly returned error: {:?}", result.unwrap_err());
+        } else {
+            eprintln!(
+                "SKIPPED: {} - All three display kinds are available",
+                function!()
+            );
+        }
+    }
+
+    /// Validate that auto-detection (None) still works — this is the existing
+    /// default behaviour and must not regress.
+    #[test]
+    fn test_auto_detect_display() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        let mut gl = GLProcessorThreaded::new(None).expect("auto-detect should succeed");
+        let src = TensorImage::load(
+            include_bytes!("../../../testdata/zidane.jpg"),
+            Some(RGBA),
+            None,
+        )
+        .unwrap();
+        let mut dst = TensorImage::new(320, 240, RGBA, None).unwrap();
+        gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .expect("auto-detect convert should succeed");
     }
 }

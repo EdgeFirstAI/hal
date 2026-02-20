@@ -74,6 +74,9 @@ pub use g2d::G2DProcessor;
 #[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
 pub use opengl_headless::GLProcessorThreaded;
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+pub use opengl_headless::{probe_egl_displays, EglDisplayInfo, EglDisplayKind};
 
 mod cpu;
 mod error;
@@ -1148,6 +1151,25 @@ pub trait ImageProcessorTrait {
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<()>;
 }
 
+/// Configuration for [`ImageProcessor`] construction.
+///
+/// Use with [`ImageProcessor::with_config`] to override the default EGL
+/// display auto-detection. The default configuration (all fields `None`)
+/// preserves the existing auto-detection behaviour.
+#[derive(Debug, Clone, Default)]
+pub struct ImageProcessorConfig {
+    /// Force OpenGL to use this EGL display type instead of auto-detecting.
+    ///
+    /// When `None`, the processor probes displays in priority order: GBM,
+    /// PlatformDevice, Default. Use [`probe_egl_displays`] to discover
+    /// which displays are available on the current system.
+    ///
+    /// Ignored when `EDGEFIRST_DISABLE_GL=1` is set.
+    #[cfg(target_os = "linux")]
+    #[cfg(feature = "opengl")]
+    pub egl_display: Option<EglDisplayKind>,
+}
+
 /// Image converter that uses available hardware acceleration or CPU as a
 /// fallback.
 #[derive(Debug)]
@@ -1189,6 +1211,15 @@ impl ImageProcessor {
     /// # Ok(())
     /// # }
     pub fn new() -> Result<Self> {
+        Self::with_config(ImageProcessorConfig::default())
+    }
+
+    /// Creates a new `ImageProcessor` with the given configuration.
+    ///
+    /// This allows overriding the EGL display type used for OpenGL
+    /// acceleration. The `EDGEFIRST_DISABLE_GL=1` environment variable
+    /// still takes precedence over any override.
+    pub fn with_config(config: ImageProcessorConfig) -> Result<Self> {
         #[cfg(target_os = "linux")]
         let g2d = if std::env::var("EDGEFIRST_DISABLE_G2D")
             .map(|x| x != "0" && x.to_lowercase() != "false")
@@ -1215,7 +1246,7 @@ impl ImageProcessor {
             log::debug!("EDGEFIRST_DISABLE_GL is set");
             None
         } else {
-            match GLProcessorThreaded::new() {
+            match GLProcessorThreaded::new(config.egl_display) {
                 Ok(gl_converter) => Some(gl_converter),
                 Err(err) => {
                     log::warn!("Failed to initialize GL converter: {err:?}");
@@ -1950,7 +1981,7 @@ mod image_tests {
     fn is_opengl_available() -> bool {
         #[cfg(all(target_os = "linux", feature = "opengl"))]
         {
-            *GL_AVAILABLE.get_or_init(|| GLProcessorThreaded::new().is_ok())
+            *GL_AVAILABLE.get_or_init(|| GLProcessorThreaded::new(None).is_ok())
         }
 
         #[cfg(not(all(target_os = "linux", feature = "opengl")))]
@@ -2088,7 +2119,7 @@ mod image_tests {
             )
             .unwrap();
         let mut gl_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
-        let mut gl_converter = GLProcessorThreaded::new().unwrap();
+        let mut gl_converter = GLProcessorThreaded::new(None).unwrap();
 
         for _ in 0..5 {
             gl_converter
@@ -2162,7 +2193,7 @@ mod image_tests {
             )
             .unwrap();
 
-        let mut gl = GLProcessorThreaded::new().unwrap();
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
         gl.convert(
             &img,
             &mut gl_dst,
@@ -2400,7 +2431,7 @@ mod image_tests {
             .unwrap();
 
         let mut gl_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
-        let mut gl_converter = GLProcessorThreaded::new().unwrap();
+        let mut gl_converter = GLProcessorThreaded::new(None).unwrap();
 
         gl_converter
             .convert(
@@ -2455,7 +2486,7 @@ mod image_tests {
             .unwrap();
 
         let mut gl_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
-        let mut gl_converter = GLProcessorThreaded::new().unwrap();
+        let mut gl_converter = GLProcessorThreaded::new(None).unwrap();
         gl_converter
             .convert(
                 &src,
@@ -2488,7 +2519,7 @@ mod image_tests {
 
         let mut cpu_converter = CPUProcessor::new();
 
-        let mut gl_converter = GLProcessorThreaded::new().unwrap();
+        let mut gl_converter = GLProcessorThreaded::new(None).unwrap();
 
         let mut mem = vec![None, Some(TensorMemory::Mem), Some(TensorMemory::Shm)];
         if is_dma_available() {
@@ -2651,7 +2682,7 @@ mod image_tests {
             .unwrap();
 
         let mut gl_dst = TensorImage::new(dst_width, dst_height, RGBA, tensor_memory).unwrap();
-        let mut gl_converter = GLProcessorThreaded::new().unwrap();
+        let mut gl_converter = GLProcessorThreaded::new(None).unwrap();
 
         for _ in 0..5 {
             gl_converter
@@ -2792,7 +2823,7 @@ mod image_tests {
         let mut dst =
             TensorImage::new(dst_width, dst_height, YUYV, Some(TensorMemory::Dma)).unwrap();
 
-        let mut gl_converter = GLProcessorThreaded::new().unwrap();
+        let mut gl_converter = GLProcessorThreaded::new(None).unwrap();
 
         gl_converter
             .convert(
@@ -3025,7 +3056,7 @@ mod image_tests {
         .unwrap();
 
         let mut dst = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma)).unwrap();
-        let mut gl_converter = GLProcessorThreaded::new().unwrap();
+        let mut gl_converter = GLProcessorThreaded::new(None).unwrap();
 
         gl_converter
             .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
@@ -3296,7 +3327,7 @@ mod image_tests {
 
         let mut dst_gl =
             TensorImage::new(dst_width, dst_height, RGBA, Some(TensorMemory::Dma)).unwrap();
-        let mut gl_converter = GLProcessorThreaded::new().unwrap();
+        let mut gl_converter = GLProcessorThreaded::new(None).unwrap();
 
         gl_converter
             .convert(
@@ -3578,7 +3609,7 @@ mod image_tests {
             .unwrap();
 
         let mut gl_dst = TensorImage::new(dst_width, dst_height, PLANAR_RGB, None).unwrap();
-        let mut gl_converter = GLProcessorThreaded::new().unwrap();
+        let mut gl_converter = GLProcessorThreaded::new(None).unwrap();
 
         gl_converter
             .convert(

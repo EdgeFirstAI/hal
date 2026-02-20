@@ -245,7 +245,7 @@ fn bench_letterbox(c: &mut Criterion) {
                         Some(TensorMemory::Dma),
                     )
                     .unwrap();
-                    let mut proc = GLProcessorThreaded::new().unwrap();
+                    let mut proc = GLProcessorThreaded::new(None).unwrap();
 
                     let (left, top, new_w, new_h) =
                         calculate_letterbox(config.in_w, config.in_h, config.out_w, config.out_h);
@@ -601,7 +601,7 @@ fn bench_convert(c: &mut Criterion) {
                         Some(TensorMemory::Dma),
                     )
                     .unwrap();
-                    let mut proc = GLProcessorThreaded::new().unwrap();
+                    let mut proc = GLProcessorThreaded::new(None).unwrap();
 
                     // Warmup (not measured)
                     let _ =
@@ -831,7 +831,7 @@ fn bench_resize(c: &mut Criterion) {
                         Some(TensorMemory::Dma),
                     )
                     .unwrap();
-                    let mut proc = GLProcessorThreaded::new().unwrap();
+                    let mut proc = GLProcessorThreaded::new(None).unwrap();
 
                     // Warmup (not measured)
                     let _ =
