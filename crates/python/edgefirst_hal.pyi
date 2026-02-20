@@ -688,10 +688,60 @@ class Rect:
     @property
     def height(self) -> int: ...
 
+class EglDisplayKind:
+    """Identifies the type of EGL display used for headless OpenGL ES rendering.
+
+    Display types:
+        Gbm: Direct GPU access via DRM render node (/dev/dri/renderD128).
+            No compositor required. Preferred for headless edge AI.
+        PlatformDevice: EGL device enumeration via EGL_EXT_device_enumeration.
+            Also headless/compositor-free. Common on NVIDIA GPUs.
+        Default: Uses eglGetDisplay(EGL_DEFAULT_DISPLAY). Connects to
+            Wayland compositor or X server if available. May block on
+            headless systems.
+    """
+
+    Gbm: EglDisplayKind
+    PlatformDevice: EglDisplayKind
+    Default: EglDisplayKind
+
+class EglDisplayInfo:
+    """A validated, available EGL display discovered by probe_egl_displays()."""
+
+    @property
+    def kind(self) -> EglDisplayKind:
+        """The type of EGL display."""
+        ...
+
+    @property
+    def description(self) -> str:
+        """Human-readable description for logging/diagnostics."""
+        ...
+
+def probe_egl_displays() -> list[EglDisplayInfo]:
+    """Probe for available EGL displays supporting headless OpenGL ES 3.0.
+
+    Returns displays in priority order (GBM, PlatformDevice, Default).
+    Each display is validated with eglInitialize + eglChooseConfig.
+    An empty list means OpenGL is not available on this system.
+
+    Raises:
+        RuntimeError: If libEGL.so.1 cannot be loaded.
+    """
+    ...
+
 class ImageProcessor:
     """Convert images between different formats, with optional rotation, flipping, and cropping."""
 
-    def __init__(self) -> None: ...
+    def __init__(self, egl_display: EglDisplayKind | None = None) -> None:
+        """Create an ImageProcessor with optional EGL display override.
+
+        Args:
+            egl_display: Force OpenGL to use this display type instead of
+                auto-detecting. Use probe_egl_displays() to discover
+                available displays. Ignored if EDGEFIRST_DISABLE_GL=1.
+        """
+        ...
     def render_to_image(
         self,
         dst: TensorImage,
