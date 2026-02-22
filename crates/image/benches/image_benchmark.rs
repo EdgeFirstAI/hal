@@ -275,7 +275,7 @@ where
 
     let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Mem)).unwrap();
     let mut gl_dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Mem)).unwrap();
-    let mut gl_converter = edgefirst_image::GLProcessorThreaded::new().unwrap();
+    let mut gl_converter = edgefirst_image::GLProcessorThreaded::new(None).unwrap();
     bencher.bench_local(|| {
         gl_converter
             .convert(
@@ -305,7 +305,7 @@ where
 
     let src = TensorImage::load_jpeg(&file, Some(RGB), Some(TensorMemory::Mem)).unwrap();
     let mut gl_dst = TensorImage::new(width, height, RGB, Some(TensorMemory::Mem)).unwrap();
-    let mut gl_converter = edgefirst_image::GLProcessorThreaded::new().unwrap();
+    let mut gl_converter = edgefirst_image::GLProcessorThreaded::new(None).unwrap();
     bencher.bench_local(|| {
         gl_converter
             .convert(
@@ -337,7 +337,7 @@ where
     let mut src = TensorImage::new(width, height, YUYV, Some(TensorMemory::Mem)).unwrap();
     let mut tmp = TensorImage::new(width, height, RGBA, Some(TensorMemory::Mem)).unwrap();
 
-    let mut gl_converter = edgefirst_image::GLProcessorThreaded::new().unwrap();
+    let mut gl_converter = edgefirst_image::GLProcessorThreaded::new(None).unwrap();
     let mut cpu_converter = edgefirst_image::CPUProcessor::new();
 
     cpu_converter
@@ -380,7 +380,7 @@ where
     let mut src = TensorImage::new(width, height, YUYV, Some(TensorMemory::Mem)).unwrap();
     let mut tmp = TensorImage::new(width, height, RGB, Some(TensorMemory::Mem)).unwrap();
 
-    let mut gl_converter = edgefirst_image::GLProcessorThreaded::new().unwrap();
+    let mut gl_converter = edgefirst_image::GLProcessorThreaded::new(None).unwrap();
     let mut cpu_converter = edgefirst_image::CPUProcessor::new();
 
     cpu_converter
@@ -421,7 +421,7 @@ where
 
     let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
     let mut gl_dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
-    let mut gl_converter = edgefirst_image::GLProcessorThreaded::new().unwrap();
+    let mut gl_converter = edgefirst_image::GLProcessorThreaded::new(None).unwrap();
 
     bencher.bench_local(|| {
         gl_converter
@@ -452,7 +452,7 @@ where
 
     let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
     let mut gl_dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
-    let mut gl_converter = edgefirst_image::GLProcessorThreaded::new().unwrap();
+    let mut gl_converter = edgefirst_image::GLProcessorThreaded::new(None).unwrap();
 
     let scale = (width as f32 / src.width() as f32).min(height as f32 / src.height() as f32);
     let new_width = ((src.width() as f32 * scale).round()) as usize;
@@ -496,7 +496,7 @@ where
     let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
     let mut dst = TensorImage::new(512, 512, PLANAR_RGB, None).unwrap();
 
-    let mut converter = GLProcessorThreaded::new().unwrap();
+    let mut converter = GLProcessorThreaded::new(None).unwrap();
 
     bencher.bench_local(|| {
         converter
@@ -543,7 +543,7 @@ fn rotate_opengl<R: TestRotation>(bencher: divan::Bencher, params: (usize, usize
     let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
     let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
 
-    let mut converter = GLProcessorThreaded::new().unwrap();
+    let mut converter = GLProcessorThreaded::new(None).unwrap();
 
     bencher.bench_local(|| {
         converter
@@ -883,7 +883,7 @@ fn convert_opengl_yuyv_to_rgba(bencher: divan::Bencher, params: (usize, usize)) 
     let (width, height) = params;
     let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
 
-    let mut converter = GLProcessorThreaded::new().unwrap();
+    let mut converter = GLProcessorThreaded::new(None).unwrap();
 
     bencher.bench_local(|| {
         converter
@@ -916,7 +916,7 @@ fn resize_opengl_rgba_to_rgba(bencher: divan::Bencher, params: (usize, usize)) {
     let (width, height) = params;
     let mut dst = TensorImage::new(width, height, RGBA, None).unwrap();
 
-    let mut converter = GLProcessorThreaded::new().unwrap();
+    let mut converter = GLProcessorThreaded::new(None).unwrap();
 
     bencher.bench_local(|| {
         converter
@@ -1539,7 +1539,7 @@ fn hires_opengl_1080p_yuyv_to_rgba(bencher: divan::Bencher, size: (usize, usize)
 
     let (width, height) = size;
     let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
-    let mut converter = GLProcessorThreaded::new().unwrap();
+    let mut converter = GLProcessorThreaded::new(None).unwrap();
 
     bencher.bench_local(|| {
         converter
@@ -1563,7 +1563,7 @@ fn hires_opengl_1080p_rgba_to_rgba_dma(bencher: divan::Bencher, size: (usize, us
 
     let (width, height) = size;
     let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
-    let mut converter = GLProcessorThreaded::new().unwrap();
+    let mut converter = GLProcessorThreaded::new(None).unwrap();
 
     bencher.bench_local(|| {
         converter
@@ -1587,7 +1587,7 @@ fn hires_opengl_1080p_rgba_to_rgba_mem(bencher: divan::Bencher, size: (usize, us
 
     let (width, height) = size;
     let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Mem)).unwrap();
-    let mut converter = GLProcessorThreaded::new().unwrap();
+    let mut converter = GLProcessorThreaded::new(None).unwrap();
 
     bencher.bench_local(|| {
         converter
@@ -1611,7 +1611,7 @@ fn hires_opengl_1080p_rgba_to_rgb_mem(bencher: divan::Bencher, size: (usize, usi
 
     let (width, height) = size;
     let mut dst = TensorImage::new(width, height, RGB, Some(TensorMemory::Mem)).unwrap();
-    let mut converter = GLProcessorThreaded::new().unwrap();
+    let mut converter = GLProcessorThreaded::new(None).unwrap();
 
     bencher.bench_local(|| {
         converter
@@ -1633,7 +1633,7 @@ fn hires_opengl_1080p_rgb_to_rgb_mem(bencher: divan::Bencher, size: (usize, usiz
 
     let (width, height) = size;
     let mut dst = TensorImage::new(width, height, RGB, Some(TensorMemory::Mem)).unwrap();
-    let mut converter = GLProcessorThreaded::new().unwrap();
+    let mut converter = GLProcessorThreaded::new(None).unwrap();
 
     bencher.bench_local(|| {
         converter
@@ -1655,7 +1655,7 @@ fn hires_opengl_1080p_rgb_to_rgba_mem(bencher: divan::Bencher, size: (usize, usi
 
     let (width, height) = size;
     let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Mem)).unwrap();
-    let mut converter = GLProcessorThreaded::new().unwrap();
+    let mut converter = GLProcessorThreaded::new(None).unwrap();
 
     bencher.bench_local(|| {
         converter
@@ -1683,7 +1683,7 @@ fn hires_opengl_4k_yuyv_to_rgba(bencher: divan::Bencher, size: (usize, usize)) {
 
     let (width, height) = size;
     let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
-    let mut converter = GLProcessorThreaded::new().unwrap();
+    let mut converter = GLProcessorThreaded::new(None).unwrap();
 
     bencher.bench_local(|| {
         converter
@@ -1707,7 +1707,7 @@ fn hires_opengl_4k_rgba_to_rgba_dma(bencher: divan::Bencher, size: (usize, usize
 
     let (width, height) = size;
     let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Dma)).unwrap();
-    let mut converter = GLProcessorThreaded::new().unwrap();
+    let mut converter = GLProcessorThreaded::new(None).unwrap();
 
     bencher.bench_local(|| {
         converter
@@ -1731,7 +1731,7 @@ fn hires_opengl_4k_rgba_to_rgba_mem(bencher: divan::Bencher, size: (usize, usize
 
     let (width, height) = size;
     let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Mem)).unwrap();
-    let mut converter = GLProcessorThreaded::new().unwrap();
+    let mut converter = GLProcessorThreaded::new(None).unwrap();
 
     bencher.bench_local(|| {
         converter
@@ -1755,7 +1755,7 @@ fn hires_opengl_4k_rgba_to_rgb_mem(bencher: divan::Bencher, size: (usize, usize)
 
     let (width, height) = size;
     let mut dst = TensorImage::new(width, height, RGB, Some(TensorMemory::Mem)).unwrap();
-    let mut converter = GLProcessorThreaded::new().unwrap();
+    let mut converter = GLProcessorThreaded::new(None).unwrap();
 
     bencher.bench_local(|| {
         converter
@@ -1777,7 +1777,7 @@ fn hires_opengl_4k_rgb_to_rgb_mem(bencher: divan::Bencher, size: (usize, usize))
 
     let (width, height) = size;
     let mut dst = TensorImage::new(width, height, RGB, Some(TensorMemory::Mem)).unwrap();
-    let mut converter = GLProcessorThreaded::new().unwrap();
+    let mut converter = GLProcessorThreaded::new(None).unwrap();
 
     bencher.bench_local(|| {
         converter
@@ -1799,7 +1799,7 @@ fn hires_opengl_4k_rgb_to_rgba_mem(bencher: divan::Bencher, size: (usize, usize)
 
     let (width, height) = size;
     let mut dst = TensorImage::new(width, height, RGBA, Some(TensorMemory::Mem)).unwrap();
-    let mut converter = GLProcessorThreaded::new().unwrap();
+    let mut converter = GLProcessorThreaded::new(None).unwrap();
 
     bencher.bench_local(|| {
         converter
