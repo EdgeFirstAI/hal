@@ -51,7 +51,7 @@ pub fn g2d_available() -> bool {
 #[cfg(all(target_os = "linux", feature = "opengl"))]
 pub fn opengl_available() -> bool {
     use edgefirst_image::GLProcessorThreaded;
-    *OPENGL_AVAILABLE.get_or_init(|| dma_available() && GLProcessorThreaded::new().is_ok())
+    *OPENGL_AVAILABLE.get_or_init(|| dma_available() && GLProcessorThreaded::new(None).is_ok())
 }
 
 #[cfg(not(all(target_os = "linux", feature = "opengl")))]

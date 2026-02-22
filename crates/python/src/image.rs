@@ -7,7 +7,10 @@ use crate::{
 };
 use edgefirst_hal::{
     decoder::{BoundingBox, DetectBox, Segmentation},
-    image::{self, Crop, Flip, ImageProcessorTrait, Rect, Rotation, TensorImage, RGBA},
+    image::{
+        self, Crop, Flip, ImageProcessorConfig, ImageProcessorTrait, Rect, Rotation, TensorImage,
+        RGBA,
+    },
     tensor::{self, TensorMapTrait, TensorTrait},
 };
 use four_char_code::FourCharCode;
@@ -866,6 +869,76 @@ fn normalize_to_float_64<'py>(
     Ok(())
 }
 
+/// Identifies the type of EGL display used for headless OpenGL ES rendering.
+#[pyclass(name = "EglDisplayKind", eq, eq_int)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PyEglDisplayKind {
+    Gbm,
+    PlatformDevice,
+    Default,
+}
+
+#[cfg(target_os = "linux")]
+impl From<PyEglDisplayKind> for image::EglDisplayKind {
+    fn from(val: PyEglDisplayKind) -> Self {
+        match val {
+            PyEglDisplayKind::Gbm => image::EglDisplayKind::Gbm,
+            PyEglDisplayKind::PlatformDevice => image::EglDisplayKind::PlatformDevice,
+            PyEglDisplayKind::Default => image::EglDisplayKind::Default,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl From<image::EglDisplayKind> for PyEglDisplayKind {
+    fn from(val: image::EglDisplayKind) -> Self {
+        match val {
+            image::EglDisplayKind::Gbm => PyEglDisplayKind::Gbm,
+            image::EglDisplayKind::PlatformDevice => PyEglDisplayKind::PlatformDevice,
+            image::EglDisplayKind::Default => PyEglDisplayKind::Default,
+        }
+    }
+}
+
+/// A validated, available EGL display discovered by probe_egl_displays().
+#[cfg(target_os = "linux")]
+#[pyclass(name = "EglDisplayInfo")]
+pub struct PyEglDisplayInfo {
+    info: image::EglDisplayInfo,
+}
+
+#[cfg(target_os = "linux")]
+#[pymethods]
+impl PyEglDisplayInfo {
+    #[getter]
+    fn kind(&self) -> PyEglDisplayKind {
+        self.info.kind.into()
+    }
+
+    #[getter]
+    fn description(&self) -> &str {
+        &self.info.description
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "EglDisplayInfo(kind={}, description='{}')",
+            self.info.kind, self.info.description
+        )
+    }
+}
+
+/// Probe for available EGL displays supporting headless OpenGL ES 3.0.
+#[cfg(target_os = "linux")]
+#[pyfunction]
+pub fn probe_egl_displays() -> Result<Vec<PyEglDisplayInfo>> {
+    let displays = image::probe_egl_displays()?;
+    Ok(displays
+        .into_iter()
+        .map(|info| PyEglDisplayInfo { info })
+        .collect())
+}
+
 #[pyclass(name = "ImageProcessor")]
 pub struct PyImageProcessor(Mutex<image::ImageProcessor>);
 
@@ -875,11 +948,18 @@ unsafe impl Sync for PyImageProcessor {}
 #[pymethods]
 impl PyImageProcessor {
     #[new]
-    pub fn new() -> Result<Self> {
-        let converter = image::ImageProcessor::new()?;
+    #[pyo3(signature = (egl_display=None))]
+    pub fn new(egl_display: Option<PyEglDisplayKind>) -> Result<Self> {
+        let mut _config = ImageProcessorConfig::default();
+        #[cfg(target_os = "linux")]
+        {
+            _config.egl_display = egl_display.map(|k| k.into());
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = egl_display;
+        let converter = image::ImageProcessor::with_config(_config)?;
         Ok(PyImageProcessor(Mutex::new(converter)))
     }
-
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (src, dst, rotation = PyRotation::Rotate0, flip = PyFlip::NoFlip, src_crop = None, dst_crop = None, dst_color = None))]
     pub fn convert(
