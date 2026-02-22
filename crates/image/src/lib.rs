@@ -135,9 +135,21 @@ impl TensorImage {
 
         // NV12 is semi-planar with Y plane (W×H) + UV plane (W×H/2)
         // Total bytes = W × H × 1.5. Use shape [H*3/2, W] to encode this.
-        // Width = shape[1], Height = shape[0] * 2 / 3
         if fourcc == NV12 {
             let shape = vec![height * 3 / 2, width];
+            let tensor = Tensor::new(&shape, memory, None)?;
+
+            return Ok(Self {
+                tensor,
+                fourcc,
+                is_planar,
+            });
+        }
+
+        // NV16 is semi-planar with Y plane (W×H) + UV plane (W×H)
+        // Total bytes = W × H × 2. Use shape [H*2, W] to encode this.
+        if fourcc == NV16 {
+            let shape = vec![height * 2, width];
             let tensor = Tensor::new(&shape, memory, None)?;
 
             return Ok(Self {
@@ -617,8 +629,8 @@ impl TensorImage {
     /// # Ok(())
     /// # }
     pub fn width(&self) -> usize {
-        // NV12 uses shape [H*3/2, W]
-        if self.fourcc == NV12 {
+        // NV12/NV16 use 2D shape [H*k, W]
+        if self.fourcc == NV12 || self.fourcc == NV16 {
             return self.tensor.shape()[1];
         }
         match self.is_planar {
@@ -642,6 +654,10 @@ impl TensorImage {
         if self.fourcc == NV12 {
             return self.tensor.shape()[0] * 2 / 3;
         }
+        // NV16 uses shape [H*2, W], so height = shape[0] / 2
+        if self.fourcc == NV16 {
+            return self.tensor.shape()[0] / 2;
+        }
         match self.is_planar {
             true => self.tensor.shape()[1],
             false => self.tensor.shape()[0],
@@ -659,9 +675,8 @@ impl TensorImage {
     /// # Ok(())
     /// # }
     pub fn channels(&self) -> usize {
-        // NV12 uses 2D shape [H*3/2, W], conceptually has 2 components (Y + interleaved
-        // UV)
-        if self.fourcc == NV12 {
+        // NV12/NV16 use 2D shape, conceptually have 2 components (Y + interleaved UV)
+        if self.fourcc == NV12 || self.fourcc == NV16 {
             return 2;
         }
         match self.is_planar {
