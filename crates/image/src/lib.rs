@@ -806,6 +806,26 @@ impl<'a> TensorImageRef<'a> {
     /// shape doesn't match the expected format.
     pub fn from_borrowed_tensor(tensor: &'a mut Tensor<u8>, fourcc: FourCharCode) -> Result<Self> {
         let shape = tensor.shape();
+        let is_planar = fourcc_planar(fourcc)?;
+
+        // NV12/NV16 use 2D shape [H*3/2, W] or [H*2, W] respectively
+        if fourcc == NV12 || fourcc == NV16 {
+            if shape.len() != 2 {
+                return Err(Error::InvalidShape(format!(
+                    "Semi-planar format {} requires 2D tensor, got {}: {:?}",
+                    fourcc.to_string(),
+                    shape.len(),
+                    shape
+                )));
+            }
+            return Ok(Self {
+                tensor,
+                fourcc,
+                is_planar,
+            });
+        }
+
+        // All other formats use 3D shape
         if shape.len() != 3 {
             return Err(Error::InvalidShape(format!(
                 "Tensor shape must have 3 dimensions, got {}: {:?}",
@@ -813,7 +833,6 @@ impl<'a> TensorImageRef<'a> {
                 shape
             )));
         }
-        let is_planar = fourcc_planar(fourcc)?;
         let channels = if is_planar { shape[0] } else { shape[2] };
 
         if fourcc_channels(fourcc)? != channels {
