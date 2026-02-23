@@ -14,17 +14,18 @@ import argparse
 import json
 import os
 import statistics
-import sys
 import time
 import zipfile
 import io
 
 import numpy as np
 
-import edgefirst_hal
 from edgefirst_hal import (
-    Decoder, ImageProcessor, TensorImage, FourCC,
-    probe_egl_displays, EglDisplayKind,
+    Decoder,
+    ImageProcessor,
+    TensorImage,
+    FourCC,
+    probe_egl_displays,
 )
 
 # Default model path (yolov8n-seg INT8 TFLite from the test matrix)
@@ -35,10 +36,10 @@ DEFAULT_MODEL = os.path.expanduser(
 
 # Model output shapes and quantization params for synthetic fallback
 SYNTHETIC_OUTPUTS = [
-    {"shape": (1, 80, 8400), "dtype": np.int8},    # scores
-    {"shape": (1, 160, 160, 32), "dtype": np.int8}, # protos
-    {"shape": (1, 4, 8400), "dtype": np.int8},      # boxes
-    {"shape": (1, 32, 8400), "dtype": np.int8},     # mask_coefficients
+    {"shape": (1, 80, 8400), "dtype": np.int8},  # scores
+    {"shape": (1, 160, 160, 32), "dtype": np.int8},  # protos
+    {"shape": (1, 4, 8400), "dtype": np.int8},  # boxes
+    {"shape": (1, 32, 8400), "dtype": np.int8},  # mask_coefficients
 ]
 
 
@@ -77,8 +78,9 @@ def get_model_outputs(tflite_path):
     # Feed random uint8 input
     input_details = interp.get_input_details()
     input_shape = input_details[0]["shape"]
-    input_data = np.random.randint(0, 255, size=input_shape,
-                                   dtype=input_details[0]["dtype"])
+    input_data = np.random.randint(
+        0, 255, size=input_shape, dtype=input_details[0]["dtype"]
+    )
     interp.set_tensor(input_details[0]["index"], input_data)
     interp.invoke()
 
@@ -104,8 +106,9 @@ def bench_old_path(decoder, processor, dst, outputs, n_iter):
     for _ in range(n_iter):
         t0 = time.perf_counter()
         boxes, scores, classes, masks = decoder.decode(outputs)
-        processor.render_to_image(dst, bbox=boxes, scores=scores,
-                                  classes=classes, seg=masks)
+        processor.render_to_image(
+            dst, bbox=boxes, scores=scores, classes=classes, seg=masks
+        )
         elapsed = time.perf_counter() - t0
         times.append(elapsed * 1000)  # ms
         n_dets = len(boxes)
@@ -118,24 +121,24 @@ def bench_fused_path(decoder, processor, dst, outputs, n_iter):
     n_dets = 0
     for _ in range(n_iter):
         t0 = time.perf_counter()
-        boxes, scores, classes = decoder.decode_and_render(
-            outputs, processor, dst)
+        boxes, scores, classes = decoder.decode_and_render(outputs, processor, dst)
         elapsed = time.perf_counter() - t0
         times.append(elapsed * 1000)  # ms
         n_dets = len(boxes)
     return times, n_dets
 
 
-def bench_mask_path(decoder, processor, outputs, n_iter,
-                    output_width=640, output_height=640):
+def bench_mask_path(
+    decoder, processor, outputs, n_iter, output_width=640, output_height=640
+):
     """Benchmark: decode_and_render_masks() (GPU mask readback path)."""
     times = []
     n_dets = 0
     for _ in range(n_iter):
         t0 = time.perf_counter()
         boxes, scores, classes, masks = decoder.decode_and_render_masks(
-            outputs, processor, output_width=output_width,
-            output_height=output_height)
+            outputs, processor, output_width=output_width, output_height=output_height
+        )
         elapsed = time.perf_counter() - t0
         times.append(elapsed * 1000)  # ms
         n_dets = len(boxes)
@@ -154,24 +157,43 @@ def report(name, times):
     p95 = sorted(times)[int(len(times) * 0.95)]
     mn = min(times)
     mx = max(times)
-    print(f"  {name:<30s}  mean={mean:7.2f}ms  median={median:7.2f}ms  "
-          f"p95={p95:7.2f}ms  min={mn:7.2f}ms  max={mx:7.2f}ms")
+    print(
+        f"  {name:<30s}  mean={mean:7.2f}ms  median={median:7.2f}ms  "
+        f"p95={p95:7.2f}ms  min={mn:7.2f}ms  max={mx:7.2f}ms"
+    )
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--model", default=DEFAULT_MODEL,
-                        help="Path to yolov8n-seg INT8 TFLite model")
-    parser.add_argument("--iterations", "-n", type=int, default=200,
-                        help="Number of timed iterations (default: 200)")
-    parser.add_argument("--warmup", type=int, default=10,
-                        help="Number of warmup iterations (default: 10)")
-    parser.add_argument("--synthetic", action="store_true",
-                        help="Force synthetic outputs (skip TFLite inference)")
-    parser.add_argument("--interpolation", choices=["all", "bilinear", "nearest", "twopass"],
-                        default=None,
-                        help="Test specific int8 interpolation mode(s) for fused path")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--model", default=DEFAULT_MODEL, help="Path to yolov8n-seg INT8 TFLite model"
+    )
+    parser.add_argument(
+        "--iterations",
+        "-n",
+        type=int,
+        default=200,
+        help="Number of timed iterations (default: 200)",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=10,
+        help="Number of warmup iterations (default: 10)",
+    )
+    parser.add_argument(
+        "--synthetic",
+        action="store_true",
+        help="Force synthetic outputs (skip TFLite inference)",
+    )
+    parser.add_argument(
+        "--interpolation",
+        choices=["all", "bilinear", "nearest", "twopass"],
+        default=None,
+        help="Test specific int8 interpolation mode(s) for fused path",
+    )
     args = parser.parse_args()
 
     # --- GPU / EGL display diagnostics ---
@@ -212,20 +234,36 @@ def main():
         # Hardcoded fallback metadata for yolov8n-seg
         metadata = {
             "outputs": [
-                {"type": "scores", "decoder": "ultralytics",
-                 "shape": [1, 80, 8400], "decode": True,
-                 "score_format": "per_class",
-                 "quantization": [0.00390625, -128]},
-                {"type": "protos", "decoder": "ultralytics",
-                 "shape": [1, 160, 160, 32], "decode": True,
-                 "quantization": [0.030935298651456833, -119]},
-                {"type": "boxes", "decoder": "ultralytics",
-                 "shape": [1, 4, 8400], "decode": True,
-                 "normalized": True,
-                 "quantization": [0.0040979208424687386, -125]},
-                {"type": "mask_coefficients", "decoder": "ultralytics",
-                 "shape": [1, 32, 8400], "decode": True,
-                 "quantization": [0.025969834998250008, 30]},
+                {
+                    "type": "scores",
+                    "decoder": "ultralytics",
+                    "shape": [1, 80, 8400],
+                    "decode": True,
+                    "score_format": "per_class",
+                    "quantization": [0.00390625, -128],
+                },
+                {
+                    "type": "protos",
+                    "decoder": "ultralytics",
+                    "shape": [1, 160, 160, 32],
+                    "decode": True,
+                    "quantization": [0.030935298651456833, -119],
+                },
+                {
+                    "type": "boxes",
+                    "decoder": "ultralytics",
+                    "shape": [1, 4, 8400],
+                    "decode": True,
+                    "normalized": True,
+                    "quantization": [0.0040979208424687386, -125],
+                },
+                {
+                    "type": "mask_coefficients",
+                    "decoder": "ultralytics",
+                    "shape": [1, 32, 8400],
+                    "decode": True,
+                    "quantization": [0.025969834998250008, 30],
+                },
             ]
         }
 
@@ -261,7 +299,8 @@ def main():
 
         # --- Benchmark 2-step path ---
         old_times, old_dets = bench_old_path(
-            decoder, processor, dst, outputs, args.iterations)
+            decoder, processor, dst, outputs, args.iterations
+        )
 
         print(f"\n  score_threshold={thresh} ({old_dets} detections):")
         print(f"  {'─' * 95}")
@@ -274,7 +313,8 @@ def main():
                 # Warmup for this mode
                 bench_fused_path(decoder, processor, dst, outputs, args.warmup)
                 fused_times, fused_dets = bench_fused_path(
-                    decoder, processor, dst, outputs, args.iterations)
+                    decoder, processor, dst, outputs, args.iterations
+                )
                 report(f"fused [int8 {mode}]", fused_times)
                 speedup = statistics.mean(old_times) / statistics.mean(fused_times)
                 saved = statistics.mean(old_times) - statistics.mean(fused_times)
@@ -282,7 +322,8 @@ def main():
         else:
             # No interpolation API — benchmark single fused path
             fused_times, fused_dets = bench_fused_path(
-                decoder, processor, dst, outputs, args.iterations)
+                decoder, processor, dst, outputs, args.iterations
+            )
             report("decode_and_render() [fused]", fused_times)
             speedup = statistics.mean(old_times) / statistics.mean(fused_times)
             saved = statistics.mean(old_times) - statistics.mean(fused_times)
@@ -290,7 +331,8 @@ def main():
 
         # --- Benchmark mask readback path ---
         mask_times, mask_dets = bench_mask_path(
-            decoder, processor, outputs, args.iterations)
+            decoder, processor, outputs, args.iterations
+        )
         report("decode_and_render_masks()", mask_times)
         mask_speedup = statistics.mean(old_times) / statistics.mean(mask_times)
         mask_saved = statistics.mean(old_times) - statistics.mean(mask_times)

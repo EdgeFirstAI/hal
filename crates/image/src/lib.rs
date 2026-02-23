@@ -76,11 +76,11 @@ pub use g2d::G2DProcessor;
 pub use opengl_headless::GLProcessorThreaded;
 #[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
-pub use opengl_headless::{probe_egl_displays, EglDisplayInfo, EglDisplayKind};
-#[cfg(target_os = "linux")]
-#[cfg(feature = "opengl")]
 #[cfg(feature = "decoder")]
 pub use opengl_headless::Int8InterpolationMode;
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+pub use opengl_headless::{probe_egl_displays, EglDisplayInfo, EglDisplayKind};
 
 /// Result of rendering a single per-instance grayscale mask.
 ///
@@ -1557,7 +1557,10 @@ impl ImageProcessorTrait for ImageProcessor {
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
         if let Some(opengl) = self.opengl.as_mut() {
-            log::trace!("render_from_protos started with opengl in {:?}", start.elapsed());
+            log::trace!(
+                "render_from_protos started with opengl in {:?}",
+                start.elapsed()
+            );
             match opengl.render_from_protos(dst, detect, proto_data) {
                 Ok(_) => {
                     log::trace!("render_from_protos with opengl in {:?}", start.elapsed());
@@ -1568,7 +1571,10 @@ impl ImageProcessorTrait for ImageProcessor {
                 }
             }
         }
-        log::trace!("render_from_protos started with cpu in {:?}", start.elapsed());
+        log::trace!(
+            "render_from_protos started with cpu in {:?}",
+            start.elapsed()
+        );
         if let Some(cpu) = self.cpu.as_mut() {
             match cpu.render_from_protos(dst, detect, proto_data) {
                 Ok(_) => {
@@ -1641,7 +1647,12 @@ impl ImageProcessorTrait for ImageProcessor {
             let has_opengl = self.opengl.is_some();
             if has_opengl {
                 let opengl = self.opengl.as_mut().unwrap();
-                match opengl.render_masks_from_protos(detect, proto_data, output_width, output_height) {
+                match opengl.render_masks_from_protos(
+                    detect,
+                    proto_data,
+                    output_width,
+                    output_height,
+                ) {
                     Ok(r) => return Ok(r),
                     Err(e) => {
                         log::trace!("render_masks_from_protos didn't work with opengl: {e:?}");
@@ -1654,12 +1665,7 @@ impl ImageProcessorTrait for ImageProcessor {
             }
         }
         if let Some(cpu) = self.cpu.as_mut() {
-            return cpu.render_masks_from_protos(
-                detect,
-                proto_data,
-                output_width,
-                output_height,
-            );
+            return cpu.render_masks_from_protos(detect, proto_data, output_width, output_height);
         }
         Err(Error::NoConverter)
     }

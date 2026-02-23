@@ -993,7 +993,13 @@ pub fn impl_yolo_split_segdet_float<
 pub fn impl_yolo_segdet_quant_proto<
     B: BBoxTypeTrait,
     BOX: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
-    PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + AsPrimitive<i8> + Send + Sync,
+    PROTO: PrimInt
+        + AsPrimitive<i64>
+        + AsPrimitive<i128>
+        + AsPrimitive<f32>
+        + AsPrimitive<i8>
+        + Send
+        + Sync,
 >(
     boxes: (ArrayView2<BOX>, Quantization),
     protos: (ArrayView3<PROTO>, Quantization),
@@ -1020,7 +1026,14 @@ where
     );
 
     let mask_tensor = mask_tensor.reversed_axes();
-    extract_proto_data_quant(det_indices, mask_tensor, quant_boxes, protos_arr, quant_protos, output_boxes)
+    extract_proto_data_quant(
+        det_indices,
+        mask_tensor,
+        quant_boxes,
+        protos_arr,
+        quant_protos,
+        output_boxes,
+    )
 }
 
 /// Proto-extraction variant of `impl_yolo_segdet_float`.
@@ -1089,7 +1102,14 @@ where
     let masks = masks.reversed_axes();
     let (protos_arr, quant_protos) = protos;
 
-    extract_proto_data_quant(det_indices, masks, quant_masks, protos_arr, quant_protos, output_boxes)
+    extract_proto_data_quant(
+        det_indices,
+        masks,
+        quant_masks,
+        protos_arr,
+        quant_protos,
+        output_boxes,
+    )
 }
 
 /// Proto-extraction variant of `impl_yolo_split_segdet_float`.
@@ -1168,7 +1188,12 @@ where
         b.label = classes[*ind].as_() as usize;
     }
 
-    Ok(extract_proto_data_float(det_indices, mask_coeff, protos, output_boxes))
+    Ok(extract_proto_data_float(
+        det_indices,
+        mask_coeff,
+        protos,
+        output_boxes,
+    ))
 }
 
 /// Proto-extraction variant of `decode_yolo_split_end_to_end_segdet_float`.
@@ -1218,7 +1243,12 @@ where
         ));
     }
 
-    Ok(extract_proto_data_float(qualifying, mask_coeff, protos, output_boxes))
+    Ok(extract_proto_data_float(
+        qualifying,
+        mask_coeff,
+        protos,
+        output_boxes,
+    ))
 }
 
 /// Helper: extract ProtoData from float mask coefficients + protos.

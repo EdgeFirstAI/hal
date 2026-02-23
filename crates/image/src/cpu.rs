@@ -2241,7 +2241,6 @@ fn bilinear_dot(
     acc
 }
 
-
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod cpu_tests {
