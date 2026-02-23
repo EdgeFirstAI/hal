@@ -2688,15 +2688,14 @@ impl Decoder {
             ModelType::YoloEndToEndDet { boxes } => {
                 self.decode_yolo_end_to_end_det_quantized(outputs, boxes, output_boxes)
             }
-            ModelType::YoloEndToEndSegDet { boxes, protos } => {
-                self.decode_yolo_end_to_end_segdet_quantized(
+            ModelType::YoloEndToEndSegDet { boxes, protos } => self
+                .decode_yolo_end_to_end_segdet_quantized(
                     outputs,
                     boxes,
                     protos,
                     output_boxes,
                     output_masks,
-                )
-            }
+                ),
             ModelType::YoloSplitEndToEndDet {
                 boxes,
                 scores,
@@ -2917,9 +2916,8 @@ impl Decoder {
             | ModelType::YoloSplitEndToEndDet { .. } => Ok(None),
 
             ModelType::YoloSegDet { boxes, protos } => {
-                let proto = self.decode_yolo_segdet_quantized_proto(
-                    outputs, boxes, protos, output_boxes,
-                )?;
+                let proto =
+                    self.decode_yolo_segdet_quantized_proto(outputs, boxes, protos, output_boxes)?;
                 Ok(Some(proto))
             }
             ModelType::YoloSplitSegDet {
@@ -2929,13 +2927,21 @@ impl Decoder {
                 protos,
             } => {
                 let proto = self.decode_yolo_split_segdet_quantized_proto(
-                    outputs, boxes, scores, mask_coeff, protos, output_boxes,
+                    outputs,
+                    boxes,
+                    scores,
+                    mask_coeff,
+                    protos,
+                    output_boxes,
                 )?;
                 Ok(Some(proto))
             }
             ModelType::YoloEndToEndSegDet { boxes, protos } => {
                 let proto = self.decode_yolo_end_to_end_segdet_quantized_proto(
-                    outputs, boxes, protos, output_boxes,
+                    outputs,
+                    boxes,
+                    protos,
+                    output_boxes,
                 )?;
                 Ok(Some(proto))
             }
@@ -2947,7 +2953,13 @@ impl Decoder {
                 protos,
             } => {
                 let proto = self.decode_yolo_split_end_to_end_segdet_quantized_proto(
-                    outputs, boxes, scores, classes, mask_coeff, protos, output_boxes,
+                    outputs,
+                    boxes,
+                    scores,
+                    classes,
+                    mask_coeff,
+                    protos,
+                    output_boxes,
                 )?;
                 Ok(Some(proto))
             }
@@ -2993,13 +3005,21 @@ impl Decoder {
                 protos,
             } => {
                 let proto = self.decode_yolo_split_segdet_float_proto(
-                    outputs, boxes, scores, mask_coeff, protos, output_boxes,
+                    outputs,
+                    boxes,
+                    scores,
+                    mask_coeff,
+                    protos,
+                    output_boxes,
                 )?;
                 Ok(Some(proto))
             }
             ModelType::YoloEndToEndSegDet { boxes, protos } => {
                 let proto = self.decode_yolo_end_to_end_segdet_float_proto(
-                    outputs, boxes, protos, output_boxes,
+                    outputs,
+                    boxes,
+                    protos,
+                    output_boxes,
                 )?;
                 Ok(Some(proto))
             }
@@ -3011,7 +3031,13 @@ impl Decoder {
                 protos,
             } => {
                 let proto = self.decode_yolo_split_end_to_end_segdet_float_proto(
-                    outputs, boxes, scores, classes, mask_coeff, protos, output_boxes,
+                    outputs,
+                    boxes,
+                    scores,
+                    classes,
+                    mask_coeff,
+                    protos,
+                    output_boxes,
                 )?;
                 Ok(Some(proto))
             }
@@ -3936,11 +3962,26 @@ impl Decoder {
         let (protos_tensor, _) =
             Self::find_outputs_with_shape_quantized(&protos_config.shape, outputs, &skip)?;
 
-        let quant_boxes = boxes_config.quantization.map(Quantization::from).unwrap_or_default();
-        let quant_scores = scores_config.quantization.map(Quantization::from).unwrap_or_default();
-        let quant_classes = classes_config.quantization.map(Quantization::from).unwrap_or_default();
-        let quant_masks = mask_coeff_config.quantization.map(Quantization::from).unwrap_or_default();
-        let quant_protos = protos_config.quantization.map(Quantization::from).unwrap_or_default();
+        let quant_boxes = boxes_config
+            .quantization
+            .map(Quantization::from)
+            .unwrap_or_default();
+        let quant_scores = scores_config
+            .quantization
+            .map(Quantization::from)
+            .unwrap_or_default();
+        let quant_classes = classes_config
+            .quantization
+            .map(Quantization::from)
+            .unwrap_or_default();
+        let quant_masks = mask_coeff_config
+            .quantization
+            .map(Quantization::from)
+            .unwrap_or_default();
+        let quant_protos = protos_config
+            .quantization
+            .map(Quantization::from)
+            .unwrap_or_default();
 
         // Dequantize each tensor independently to avoid monomorphization explosion.
         // Nesting 5 with_quantized! calls would produce 6^5 = 7776 instantiations.
@@ -4173,7 +4214,13 @@ impl Decoder {
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
 
-        Ok(crate::yolo::impl_yolo_split_segdet_float_proto::<XYWH, _, _, _, _>(
+        Ok(crate::yolo::impl_yolo_split_segdet_float_proto::<
+            XYWH,
+            _,
+            _,
+            _,
+            _,
+        >(
             boxes_tensor,
             scores_tensor,
             mask_tensor,
@@ -4351,11 +4398,26 @@ impl Decoder {
         let (protos_tensor, _) =
             Self::find_outputs_with_shape_quantized(&protos_config.shape, outputs, &skip)?;
 
-        let quant_boxes = boxes_config.quantization.map(Quantization::from).unwrap_or_default();
-        let quant_scores = scores_config.quantization.map(Quantization::from).unwrap_or_default();
-        let quant_classes = classes_config.quantization.map(Quantization::from).unwrap_or_default();
-        let quant_masks = mask_coeff_config.quantization.map(Quantization::from).unwrap_or_default();
-        let quant_protos = protos_config.quantization.map(Quantization::from).unwrap_or_default();
+        let quant_boxes = boxes_config
+            .quantization
+            .map(Quantization::from)
+            .unwrap_or_default();
+        let quant_scores = scores_config
+            .quantization
+            .map(Quantization::from)
+            .unwrap_or_default();
+        let quant_classes = classes_config
+            .quantization
+            .map(Quantization::from)
+            .unwrap_or_default();
+        let quant_masks = mask_coeff_config
+            .quantization
+            .map(Quantization::from)
+            .unwrap_or_default();
+        let quant_protos = protos_config
+            .quantization
+            .map(Quantization::from)
+            .unwrap_or_default();
 
         macro_rules! dequant_3d {
             ($tensor:expr, $config:expr, $quant:expr) => {{

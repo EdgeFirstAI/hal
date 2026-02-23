@@ -29,9 +29,11 @@ import io
 
 import numpy as np
 
-import edgefirst_hal
 from edgefirst_hal import (
-    Decoder, ImageProcessor, TensorImage, FourCC,
+    Decoder,
+    ImageProcessor,
+    TensorImage,
+    FourCC,
     probe_egl_displays,
 )
 
@@ -73,16 +75,27 @@ def get_model_outputs(tflite_path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("path", choices=["fused", "2step", "masks"],
-                        help="Which path to profile")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "path", choices=["fused", "2step", "masks"], help="Which path to profile"
+    )
     parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--iterations", "-n", type=int, default=5000,
-                        help="Iterations in hot loop (default: 5000)")
+    parser.add_argument(
+        "--iterations",
+        "-n",
+        type=int,
+        default=5000,
+        help="Iterations in hot loop (default: 5000)",
+    )
     parser.add_argument("--warmup", type=int, default=50)
-    parser.add_argument("--threshold", type=float, default=0.01,
-                        help="Score threshold (lower = more detections)")
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.01,
+        help="Score threshold (lower = more detections)",
+    )
     args = parser.parse_args()
 
     # --- Setup (outside profiled region) ---
@@ -109,12 +122,12 @@ def main():
             decoder.decode_and_render_masks(outputs, processor)
         else:
             boxes, scores, classes, masks = decoder.decode(outputs)
-            processor.render_to_image(dst, bbox=boxes, scores=scores,
-                                      classes=classes, seg=masks)
+            processor.render_to_image(
+                dst, bbox=boxes, scores=scores, classes=classes, seg=masks
+            )
 
     # --- Hot loop (this is what perf will sample) ---
-    print(f"Profiling {args.path} for {args.iterations} iterations...",
-          file=sys.stderr)
+    print(f"Profiling {args.path} for {args.iterations} iterations...", file=sys.stderr)
     t0 = time.perf_counter()
 
     if args.path == "fused":
@@ -126,13 +139,16 @@ def main():
     else:
         for _ in range(args.iterations):
             boxes, scores, classes, masks = decoder.decode(outputs)
-            processor.render_to_image(dst, bbox=boxes, scores=scores,
-                                      classes=classes, seg=masks)
+            processor.render_to_image(
+                dst, bbox=boxes, scores=scores, classes=classes, seg=masks
+            )
 
     elapsed = time.perf_counter() - t0
     per_iter = elapsed / args.iterations * 1000
-    print(f"Done: {elapsed:.2f}s total, {per_iter:.3f}ms/iter "
-          f"({args.iterations} iters)", file=sys.stderr)
+    print(
+        f"Done: {elapsed:.2f}s total, {per_iter:.3f}ms/iter ({args.iterations} iters)",
+        file=sys.stderr,
+    )
 
 
 if __name__ == "__main__":

@@ -1085,8 +1085,8 @@ impl PyImageProcessor {
             "twopass" => image::Int8InterpolationMode::TwoPass,
             _ => {
                 return Err(Error::InvalidArg(format!(
-                    "Unknown interpolation mode '{mode}'. Expected 'nearest', 'bilinear', or 'twopass'"
-                )))
+                "Unknown interpolation mode '{mode}'. Expected 'nearest', 'bilinear', or 'twopass'"
+            )))
             }
         };
         if let Ok(mut l) = self.0.lock() {

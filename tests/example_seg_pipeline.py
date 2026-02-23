@@ -31,7 +31,6 @@ import io
 import json
 import os
 import statistics
-import sys
 import time
 import zipfile
 
@@ -54,43 +53,110 @@ OUTPUT_DIR = os.path.join(HAL_ROOT, "testdata")
 
 # COCO class names (80 classes)
 COCO_NAMES = [
-    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
-    "truck", "boat", "traffic light", "fire hydrant", "stop sign",
-    "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
-    "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella",
-    "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard",
-    "sports ball", "kite", "baseball bat", "baseball glove", "skateboard",
-    "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork",
-    "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
-    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
-    "couch", "potted plant", "bed", "dining table", "toilet", "tv",
-    "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave",
-    "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase",
-    "scissors", "teddy bear", "hair drier", "toothbrush",
+    "person",
+    "bicycle",
+    "car",
+    "motorcycle",
+    "airplane",
+    "bus",
+    "train",
+    "truck",
+    "boat",
+    "traffic light",
+    "fire hydrant",
+    "stop sign",
+    "parking meter",
+    "bench",
+    "bird",
+    "cat",
+    "dog",
+    "horse",
+    "sheep",
+    "cow",
+    "elephant",
+    "bear",
+    "zebra",
+    "giraffe",
+    "backpack",
+    "umbrella",
+    "handbag",
+    "tie",
+    "suitcase",
+    "frisbee",
+    "skis",
+    "snowboard",
+    "sports ball",
+    "kite",
+    "baseball bat",
+    "baseball glove",
+    "skateboard",
+    "surfboard",
+    "tennis racket",
+    "bottle",
+    "wine glass",
+    "cup",
+    "fork",
+    "knife",
+    "spoon",
+    "bowl",
+    "banana",
+    "apple",
+    "sandwich",
+    "orange",
+    "broccoli",
+    "carrot",
+    "hot dog",
+    "pizza",
+    "donut",
+    "cake",
+    "chair",
+    "couch",
+    "potted plant",
+    "bed",
+    "dining table",
+    "toilet",
+    "tv",
+    "laptop",
+    "mouse",
+    "remote",
+    "keyboard",
+    "cell phone",
+    "microwave",
+    "oven",
+    "toaster",
+    "sink",
+    "refrigerator",
+    "book",
+    "clock",
+    "vase",
+    "scissors",
+    "teddy bear",
+    "hair drier",
+    "toothbrush",
 ]
 
 # 20 distinct instance colors (BGR for OpenCV, A=128 for semi-transparency)
 INSTANCE_COLORS_BGR = [
-    (56, 56, 255),    # red
+    (56, 56, 255),  # red
     (151, 157, 255),  # pink
-    (31, 112, 255),   # orange
-    (29, 178, 255),   # yellow
-    (49, 210, 207),   # lime
-    (10, 249, 72),    # green
-    (23, 204, 146),   # teal
-    (134, 219, 61),   # cyan
-    (52, 147, 26),    # forest
-    (187, 212, 0),    # turquoise
-    (168, 153, 44),   # blue-grey
-    (255, 194, 0),    # sky
-    (147, 69, 52),    # navy
+    (31, 112, 255),  # orange
+    (29, 178, 255),  # yellow
+    (49, 210, 207),  # lime
+    (10, 249, 72),  # green
+    (23, 204, 146),  # teal
+    (134, 219, 61),  # cyan
+    (52, 147, 26),  # forest
+    (187, 212, 0),  # turquoise
+    (168, 153, 44),  # blue-grey
+    (255, 194, 0),  # sky
+    (147, 69, 52),  # navy
     (255, 115, 100),  # lavender
-    (236, 24, 0),     # royal
-    (255, 56, 132),   # purple
-    (133, 0, 82),     # wine
-    (255, 56, 203),   # magenta
+    (236, 24, 0),  # royal
+    (255, 56, 132),  # purple
+    (133, 0, 82),  # wine
+    (255, 56, 203),  # magenta
     (200, 149, 255),  # rose
-    (199, 55, 255),   # hot pink
+    (199, 55, 255),  # hot pink
 ]
 
 
@@ -141,12 +207,22 @@ def report(name, times):
     median = statistics.median(times)
     p95 = sorted(times)[int(len(times) * 0.95)]
     mn, mx = min(times), max(times)
-    print(f"  {name:<35s}  mean={mean:7.2f}ms  median={median:7.2f}ms  "
-          f"p95={p95:7.2f}ms  min={mn:7.2f}ms  max={mx:7.2f}ms")
+    print(
+        f"  {name:<35s}  mean={mean:7.2f}ms  median={median:7.2f}ms  "
+        f"p95={p95:7.2f}ms  min={mn:7.2f}ms  max={mx:7.2f}ms"
+    )
 
 
-def render_masks_on_image(image_bgr, boxes, scores, classes, masks,
-                          mask_format="full", target_size=640, alpha=0.5):
+def render_masks_on_image(
+    image_bgr,
+    boxes,
+    scores,
+    classes,
+    masks,
+    mask_format="full",
+    target_size=640,
+    alpha=0.5,
+):
     """Render colored per-instance masks onto a BGR image.
 
     Args:
@@ -179,8 +255,8 @@ def render_masks_on_image(image_bgr, boxes, scores, classes, masks,
         # Get binary mask in bbox region
         if mask_format == "full" and i < len(masks):
             mask_full = cv2.resize(
-                masks[i], (target_size, target_size),
-                interpolation=cv2.INTER_LINEAR)
+                masks[i], (target_size, target_size), interpolation=cv2.INTER_LINEAR
+            )
             mask_bin = (mask_full[y1:y2, x1:x2] > 0.5).astype(np.float32)
         elif mask_format == "cropped" and i < len(masks):
             m = masks[i]
@@ -188,8 +264,8 @@ def render_masks_on_image(image_bgr, boxes, scores, classes, masks,
                 m = m[:, :, 0]
             # Resize bbox-cropped mask to bbox pixel size
             mask_resized = cv2.resize(
-                m.astype(np.float32), (bw, bh),
-                interpolation=cv2.INTER_LINEAR)
+                m.astype(np.float32), (bw, bh), interpolation=cv2.INTER_LINEAR
+            )
             mask_bin = (mask_resized > 127.5).astype(np.float32)
         else:
             continue
@@ -207,12 +283,23 @@ def render_masks_on_image(image_bgr, boxes, scores, classes, masks,
 
         # Draw box and label
         cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 2)
-        name = COCO_NAMES[int(classes[i])] if int(classes[i]) < len(COCO_NAMES) else str(int(classes[i]))
+        name = (
+            COCO_NAMES[int(classes[i])]
+            if int(classes[i]) < len(COCO_NAMES)
+            else str(int(classes[i]))
+        )
         label = f"{name} {scores[i]:.2f}"
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
         cv2.rectangle(canvas, (x1, y1 - th - 6), (x1 + tw, y1), color, -1)
-        cv2.putText(canvas, label, (x1, y1 - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(
+            canvas,
+            label,
+            (x1, y1 - 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            1,
+        )
 
     return canvas
 
@@ -228,7 +315,7 @@ def opencv_letterbox(image, new_shape=640, color=114):
     resized = cv2.resize(image, (nw, nh), interpolation=cv2.INTER_LINEAR)
     canvas = np.full((new_shape, new_shape, 3), color, dtype=np.uint8)
     pad_x, pad_y = (new_shape - nw) // 2, (new_shape - nh) // 2
-    canvas[pad_y:pad_y + nh, pad_x:pad_x + nw] = resized
+    canvas[pad_y : pad_y + nh, pad_x : pad_x + nw] = resized
     return canvas, scale, pad_x, pad_y
 
 
@@ -271,10 +358,10 @@ def opencv_decode_seg(outputs, metadata, score_thresh=0.25, iou_thresh=0.45):
             return (arr.astype(np.float32) - zp) * s
         return arr.astype(np.float32)
 
-    scores_raw = deq(*out_map["scores"])[0].T       # (8400, 80)
-    boxes_raw = deq(*out_map["boxes"])[0].T          # (8400, 4) xcycwh
-    mc_raw = deq(*out_map["mask_coefficients"])[0].T # (8400, 32)
-    protos_raw = deq(*out_map["protos"])              # (1, 160, 160, 32)
+    scores_raw = deq(*out_map["scores"])[0].T  # (8400, 80)
+    boxes_raw = deq(*out_map["boxes"])[0].T  # (8400, 4) xcycwh
+    mc_raw = deq(*out_map["mask_coefficients"])[0].T  # (8400, 32)
+    protos_raw = deq(*out_map["protos"])  # (1, 160, 160, 32)
 
     # xcycwh → xyxy (normalized [0,1])
     cx, cy, w, h = boxes_raw[:, 0], boxes_raw[:, 1], boxes_raw[:, 2], boxes_raw[:, 3]
@@ -333,8 +420,7 @@ def run_opencv_pipeline(image_path, metadata, interp, save_path=None):
     timings["decode"] = (time.perf_counter() - t0) * 1000
 
     t0 = time.perf_counter()
-    bgr = render_masks_on_image(lb, boxes, scores, classes, masks,
-                                mask_format="full")
+    bgr = render_masks_on_image(lb, boxes, scores, classes, masks, mask_format="full")
     timings["render"] = (time.perf_counter() - t0) * 1000
 
     timings["total"] = sum(timings.values())
@@ -349,8 +435,7 @@ def run_opencv_pipeline(image_path, metadata, interp, save_path=None):
 # ---------------------------------------------------------------------------
 # HAL pipeline
 # ---------------------------------------------------------------------------
-def run_hal_pipeline(image_path, metadata, interp, processor,
-                     save_path=None):
+def run_hal_pipeline(image_path, metadata, interp, processor, save_path=None):
     """Full HAL pipeline: load → letterbox → infer → decode → render.
 
     Uses HAL for load + letterbox + decode, Python for mask rendering
@@ -376,7 +461,8 @@ def run_hal_pipeline(image_path, metadata, interp, processor,
 
     dst_rgb = TensorImage(640, 640, FourCC.RGB)
     processor.convert(
-        src, dst_rgb,
+        src,
+        dst_rgb,
         dst_crop=Rect(px, py, nw, nh),
         dst_color=[114, 114, 114, 255],
     )
@@ -403,8 +489,9 @@ def run_hal_pipeline(image_path, metadata, interp, processor,
     dst_rgb.normalize_to_numpy(rgb_np)
     bgr_np = cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR)
 
-    bgr = render_masks_on_image(bgr_np, boxes, scores, classes, masks,
-                                mask_format="cropped")
+    bgr = render_masks_on_image(
+        bgr_np, boxes, scores, classes, masks, mask_format="cropped"
+    )
     timings["render"] = (time.perf_counter() - t0) * 1000
 
     timings["total"] = sum(timings.values())
@@ -434,9 +521,9 @@ def run_hal_pipeline_bench(image_path, metadata, interp, processor):
     nw, nh = int(src.width * scale), int(src.height * scale)
     px, py = (640 - nw) // 2, (640 - nh) // 2
     dst_rgb = TensorImage(640, 640, FourCC.RGB)
-    processor.convert(src, dst_rgb,
-                      dst_crop=Rect(px, py, nw, nh),
-                      dst_color=[114, 114, 114, 255])
+    processor.convert(
+        src, dst_rgb, dst_crop=Rect(px, py, nw, nh), dst_color=[114, 114, 114, 255]
+    )
     input_data = np.zeros((1, 640, 640, 3), dtype=np.uint8)
     dst_rgb.normalize_to_numpy(input_data[0])
     timings["letterbox"] = (time.perf_counter() - t0) * 1000
@@ -461,24 +548,32 @@ def run_hal_pipeline_bench(image_path, metadata, interp, processor):
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--image", default=DEFAULT_IMAGE,
-                        help="Input image path")
-    parser.add_argument("--model", default=DEFAULT_MODEL,
-                        help="YOLOv8n-seg INT8 TFLite model")
-    parser.add_argument("--bench", action="store_true",
-                        help="Run benchmark mode (multiple iterations)")
-    parser.add_argument("-n", "--iterations", type=int, default=50,
-                        help="Benchmark iterations (default: 50)")
-    parser.add_argument("--warmup", type=int, default=5,
-                        help="Warmup iterations (default: 5)")
-    parser.add_argument("--hal-only", action="store_true",
-                        help="Only run HAL pipeline")
-    parser.add_argument("--opencv-only", action="store_true",
-                        help="Only run OpenCV pipeline")
-    parser.add_argument("--output-dir", default=OUTPUT_DIR,
-                        help="Directory for output images")
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--image", default=DEFAULT_IMAGE, help="Input image path")
+    parser.add_argument(
+        "--model", default=DEFAULT_MODEL, help="YOLOv8n-seg INT8 TFLite model"
+    )
+    parser.add_argument(
+        "--bench", action="store_true", help="Run benchmark mode (multiple iterations)"
+    )
+    parser.add_argument(
+        "-n",
+        "--iterations",
+        type=int,
+        default=50,
+        help="Benchmark iterations (default: 50)",
+    )
+    parser.add_argument(
+        "--warmup", type=int, default=5, help="Warmup iterations (default: 5)"
+    )
+    parser.add_argument("--hal-only", action="store_true", help="Only run HAL pipeline")
+    parser.add_argument(
+        "--opencv-only", action="store_true", help="Only run OpenCV pipeline"
+    )
+    parser.add_argument(
+        "--output-dir", default=OUTPUT_DIR, help="Directory for output images"
+    )
     args = parser.parse_args()
 
     run_hal = not args.opencv_only
@@ -494,6 +589,7 @@ def main():
     hal_processor = None
     if run_hal:
         from edgefirst_hal import ImageProcessor, probe_egl_displays
+
         displays = probe_egl_displays()
         gpu = displays[0].kind if displays else None
         print(f"EGL displays: {[str(d.kind) for d in displays]}")
@@ -504,13 +600,17 @@ def main():
         def print_detections(boxes, scores, classes, timings):
             print(f"  Detections: {len(boxes)}")
             for i in range(len(boxes)):
-                name = (COCO_NAMES[int(classes[i])]
-                        if int(classes[i]) < len(COCO_NAMES)
-                        else str(int(classes[i])))
-                print(f"    {name}: {scores[i]:.3f}  "
-                      f"box=[{boxes[i, 0]:.3f}, {boxes[i, 1]:.3f}, "
-                      f"{boxes[i, 2]:.3f}, {boxes[i, 3]:.3f}]")
-            print(f"  Timings:")
+                name = (
+                    COCO_NAMES[int(classes[i])]
+                    if int(classes[i]) < len(COCO_NAMES)
+                    else str(int(classes[i]))
+                )
+                print(
+                    f"    {name}: {scores[i]:.3f}  "
+                    f"box=[{boxes[i, 0]:.3f}, {boxes[i, 1]:.3f}, "
+                    f"{boxes[i, 2]:.3f}, {boxes[i, 3]:.3f}]"
+                )
+            print("  Timings:")
             for stage, ms in timings.items():
                 print(f"    {stage:<20s} {ms:7.2f}ms")
 
@@ -518,20 +618,21 @@ def main():
             print("\n--- OpenCV Pipeline ---")
             out = os.path.join(args.output_dir, "output_opencv_seg.png")
             _, boxes, scores, classes, t = run_opencv_pipeline(
-                args.image, metadata, interp, save_path=out)
+                args.image, metadata, interp, save_path=out
+            )
             print_detections(boxes, scores, classes, t)
 
         if run_hal:
             print("\n--- HAL Pipeline ---")
             out = os.path.join(args.output_dir, "output_hal_seg.png")
             _, boxes, scores, classes, t = run_hal_pipeline(
-                args.image, metadata, interp, hal_processor, save_path=out)
+                args.image, metadata, interp, hal_processor, save_path=out
+            )
             print_detections(boxes, scores, classes, t)
 
     else:
         # --- Benchmark mode ---
-        print(f"\nBenchmark: {args.iterations} iterations "
-              f"(warmup: {args.warmup})")
+        print(f"\nBenchmark: {args.iterations} iterations (warmup: {args.warmup})")
         print(f"{'=' * 100}")
 
         if run_opencv:
@@ -540,8 +641,7 @@ def main():
                 run_opencv_pipeline(args.image, metadata, interp)
             all_t = {}
             for _ in range(args.iterations):
-                _, _, _, _, t = run_opencv_pipeline(
-                    args.image, metadata, interp)
+                _, _, _, _, t = run_opencv_pipeline(args.image, metadata, interp)
                 for k, v in t.items():
                     all_t.setdefault(k, []).append(v)
             for stage, times in all_t.items():
@@ -555,7 +655,8 @@ def main():
             all_t = {}
             for _ in range(args.iterations):
                 _, _, _, _, t = run_hal_pipeline(
-                    args.image, metadata, interp, hal_processor)
+                    args.image, metadata, interp, hal_processor
+                )
                 for k, v in t.items():
                     all_t.setdefault(k, []).append(v)
             for stage, times in all_t.items():
@@ -564,12 +665,10 @@ def main():
             # Benchmark HAL fused decode_and_render (OpenGL)
             print("\n--- HAL Pipeline (fused OpenGL decode+render) ---")
             for _ in range(args.warmup):
-                run_hal_pipeline_bench(
-                    args.image, metadata, interp, hal_processor)
+                run_hal_pipeline_bench(args.image, metadata, interp, hal_processor)
             all_t = {}
             for _ in range(args.iterations):
-                t = run_hal_pipeline_bench(
-                    args.image, metadata, interp, hal_processor)
+                t = run_hal_pipeline_bench(args.image, metadata, interp, hal_processor)
                 for k, v in t.items():
                     all_t.setdefault(k, []).append(v)
             for stage, times in all_t.items():

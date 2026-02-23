@@ -782,8 +782,7 @@ impl GLProcessorThreaded {
                         output_height,
                         resp,
                     ) => {
-                        let det =
-                            unsafe { std::slice::from_raw_parts(det.ptr.as_ptr(), det.len) };
+                        let det = unsafe { std::slice::from_raw_parts(det.ptr.as_ptr(), det.len) };
                         let res = gl_converter.render_masks_from_protos(
                             det,
                             &proto_data,
@@ -1330,7 +1329,13 @@ impl ImageProcessorTrait for GLProcessorST {
         output_width: usize,
         output_height: usize,
     ) -> crate::Result<Vec<MaskResult>> {
-        GLProcessorST::render_masks_from_protos(self, detect, &proto_data, output_width, output_height)
+        GLProcessorST::render_masks_from_protos(
+            self,
+            detect,
+            &proto_data,
+            output_width,
+            output_height,
+        )
     }
 
     #[cfg(feature = "decoder")]
@@ -1474,10 +1479,8 @@ impl GLProcessorST {
             generate_proto_mask_shader_int8_bilinear(),
         )?;
         #[cfg(feature = "decoder")]
-        let proto_mask_f32_program = GlProgram::new(
-            generate_vertex_shader(),
-            generate_proto_mask_shader_f32(),
-        )?;
+        let proto_mask_f32_program =
+            GlProgram::new(generate_vertex_shader(), generate_proto_mask_shader_f32())?;
 
         let camera_eglimage_texture = Texture::new();
         let camera_normal_texture = Texture::new();
@@ -1716,8 +1719,7 @@ impl GLProcessorST {
                 );
 
                 let proto_scale = quantization.scale;
-                let proto_scaled_zp =
-                    -(quantization.zero_point as f32) * quantization.scale;
+                let proto_scaled_zp = -(quantization.zero_point as f32) * quantization.scale;
 
                 let program = match self.int8_interpolation_mode {
                     Int8InterpolationMode::Nearest => &self.proto_mask_int8_nearest_program,
@@ -1784,7 +1786,7 @@ impl GLProcessorST {
                 )
             }
         }
-        .and_then(|results| {
+        .inspect(|_| {
             // Restore previous FBO + viewport
             unsafe {
                 gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, saved_fbo);
@@ -1795,7 +1797,6 @@ impl GLProcessorST {
                     saved_viewport[3],
                 );
             }
-            Ok(results)
         })
     }
 
@@ -1875,9 +1876,7 @@ impl GLProcessorST {
                 gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
                 gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
                 let verts: [f32; 12] = [
-                    dst_left, dst_top, 0.0,
-                    dst_right, dst_top, 0.0,
-                    dst_right, dst_bottom, 0.0,
+                    dst_left, dst_top, 0.0, dst_right, dst_top, 0.0, dst_right, dst_bottom, 0.0,
                     dst_left, dst_bottom, 0.0,
                 ];
                 gls::gl::BufferSubData(
@@ -1890,10 +1889,8 @@ impl GLProcessorST {
                 gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
                 gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
                 let tc: [f32; 8] = [
-                    src_left, src_top,
-                    src_right, src_top,
-                    src_right, src_bottom,
-                    src_left, src_bottom,
+                    src_left, src_top, src_right, src_top, src_right, src_bottom, src_left,
+                    src_bottom,
                 ];
                 gls::gl::BufferSubData(
                     gls::gl::ARRAY_BUFFER,
@@ -3251,8 +3248,7 @@ impl GLProcessorST {
                     };
                     let layer = k / 4;
                     let channel = k % 4;
-                    buf[layer * layer_stride + y * width * 4 + x * 4 + channel] =
-                        val.to_bits();
+                    buf[layer * layer_stride + y * width * 4 + x * 4 + channel] = val.to_bits();
                 }
             }
         }

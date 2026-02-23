@@ -934,11 +934,9 @@ impl PyDecoder {
                                 WithInt32Array::Int32(_) => None,
                             })
                             .collect::<Vec<_>>();
-                        self_.decoder.decode_float(
-                            &outputs,
-                            &mut output_boxes,
-                            &mut output_masks,
-                        )
+                        self_
+                            .decoder
+                            .decode_float(&outputs, &mut output_boxes, &mut output_masks)
                     }
                     ListOfReadOnlyArrayGenericDyn::Float64(items) => {
                         let outputs = items
@@ -948,11 +946,9 @@ impl PyDecoder {
                                 WithInt32Array::Int32(_) => None,
                             })
                             .collect::<Vec<_>>();
-                        self_.decoder.decode_float(
-                            &outputs,
-                            &mut output_boxes,
-                            &mut output_masks,
-                        )
+                        self_
+                            .decoder
+                            .decode_float(&outputs, &mut output_boxes, &mut output_masks)
                     }
                 };
                 if let Err(e) = result {
@@ -1081,8 +1077,7 @@ impl PyDecoder {
                 mask_results
                     .into_iter()
                     .map(|mr| {
-                        let arr =
-                            ndarray::Array2::from_shape_vec((mr.h, mr.w), mr.pixels).unwrap();
+                        let arr = ndarray::Array2::from_shape_vec((mr.h, mr.w), mr.pixels).unwrap();
                         // Convert Array2<u8> to Array3<u8> with shape (H, W, 1)
                         let arr = arr.insert_axis(ndarray::Axis(2));
                         arr.to_pyarray(py)
