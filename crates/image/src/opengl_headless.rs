@@ -3356,11 +3356,18 @@ impl GLProcessorST {
                 bottom: cvt_screen_coord(det.bbox.ymin),
             };
 
+            // Proto texture coords: tex row 0 = image top (data uploaded in
+            // row-major order where y=0 is top of image, and GL treats the
+            // first row of pixel data as the bottom of the texture — but
+            // texelFetch(y=0) returns that bottom row, which is our image top).
+            // So tc.y=0 → image top, tc.y=1 → image bottom.
+            // At NDC top (higher Y = image bottom = ymax), we want tc.y = ymax.
+            // At NDC bottom (lower Y = image top = ymin), we want tc.y = ymin.
             let src_roi = RegionOfInterest {
                 left: det.bbox.xmin,
-                top: 1.0 - det.bbox.ymin,
+                top: det.bbox.ymax,
                 right: det.bbox.xmax,
-                bottom: 1.0 - det.bbox.ymax,
+                bottom: det.bbox.ymin,
             };
 
             unsafe {
