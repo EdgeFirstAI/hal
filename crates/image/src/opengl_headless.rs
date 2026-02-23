@@ -6,7 +6,7 @@
 
 use edgefirst_decoder::DetectBox;
 #[cfg(feature = "decoder")]
-use edgefirst_decoder::Segmentation;
+use edgefirst_decoder::{ProtoData, ProtoTensor, Segmentation};
 use edgefirst_tensor::{TensorMemory, TensorTrait};
 use four_char_code::FourCharCode;
 use gbm::{
@@ -51,6 +51,9 @@ use crate::{
     CPUProcessor, Crop, Error, Flip, ImageProcessorTrait, Rect, Rotation, TensorImage,
     TensorImageRef, GREY, NV12, PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, YUYV,
 };
+
+#[cfg(feature = "decoder")]
+use crate::MaskResult;
 
 /// Identifies the type of EGL display used for headless OpenGL ES rendering.
 ///
@@ -671,6 +674,26 @@ enum GLProcessorMessage {
         SendablePtr<Segmentation>,
         tokio::sync::oneshot::Sender<Result<(), Error>>,
     ),
+    #[cfg(feature = "decoder")]
+    ImageRenderProtos(
+        SendablePtr<TensorImage>,
+        SendablePtr<DetectBox>,
+        Box<ProtoData>,
+        tokio::sync::oneshot::Sender<Result<(), Error>>,
+    ),
+    #[cfg(feature = "decoder")]
+    SetInt8Interpolation(
+        Int8InterpolationMode,
+        tokio::sync::oneshot::Sender<Result<(), Error>>,
+    ),
+    #[cfg(feature = "decoder")]
+    RenderMasksFromProtos(
+        SendablePtr<DetectBox>,
+        Box<ProtoData>,
+        usize,
+        usize,
+        tokio::sync::oneshot::Sender<Result<Vec<MaskResult>, Error>>,
+    ),
 }
 
 /// OpenGL multi-threaded image converter. The actual conversion is done in a
@@ -733,8 +756,40 @@ impl GLProcessorThreaded {
                         let res = gl_converter.render_to_image(dst, det, seg);
                         let _ = resp.send(res);
                     }
+                    #[cfg(feature = "decoder")]
+                    GLProcessorMessage::ImageRenderProtos(mut dst, det, proto_data, resp) => {
+                        // SAFETY: Same safety invariant as ImageRender — caller
+                        // blocks on resp before dropping borrows.
+                        let dst = unsafe { dst.ptr.as_mut() };
+                        let det = unsafe { std::slice::from_raw_parts(det.ptr.as_ptr(), det.len) };
+                        let res = gl_converter.render_from_protos(dst, det, &proto_data);
+                        let _ = resp.send(res);
+                    }
                     GLProcessorMessage::SetColors(colors, resp) => {
                         let res = gl_converter.set_class_colors(&colors);
+                        let _ = resp.send(res);
+                    }
+                    #[cfg(feature = "decoder")]
+                    GLProcessorMessage::SetInt8Interpolation(mode, resp) => {
+                        gl_converter.set_int8_interpolation_mode(mode);
+                        let _ = resp.send(Ok(()));
+                    }
+                    #[cfg(feature = "decoder")]
+                    GLProcessorMessage::RenderMasksFromProtos(
+                        det,
+                        proto_data,
+                        output_width,
+                        output_height,
+                        resp,
+                    ) => {
+                        let det =
+                            unsafe { std::slice::from_raw_parts(det.ptr.as_ptr(), det.len) };
+                        let res = gl_converter.render_masks_from_protos(
+                            det,
+                            &proto_data,
+                            output_width,
+                            output_height,
+                        );
                         let _ = resp.send(res);
                     }
                 }
@@ -856,6 +911,53 @@ impl ImageProcessorTrait for GLProcessorThreaded {
     }
 
     #[cfg(feature = "decoder")]
+    fn render_from_protos(
+        &mut self,
+        dst: &mut TensorImage,
+        detect: &[DetectBox],
+        proto_data: &ProtoData,
+    ) -> crate::Result<()> {
+        let (err_send, err_recv) = tokio::sync::oneshot::channel();
+        self.sender
+            .as_ref()
+            .unwrap()
+            .blocking_send(GLProcessorMessage::ImageRenderProtos(
+                SendablePtr {
+                    ptr: NonNull::new(dst as *mut TensorImage).unwrap(),
+                    len: 1,
+                },
+                SendablePtr {
+                    ptr: NonNull::new(detect.as_ptr() as *mut DetectBox).unwrap(),
+                    len: detect.len(),
+                },
+                Box::new(proto_data.clone()),
+                err_send,
+            ))
+            .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
+        err_recv.blocking_recv().map_err(|_| {
+            Error::Internal("GL converter error messaging closed without update".to_string())
+        })?
+    }
+
+    #[cfg(feature = "decoder")]
+    fn render_masks_from_protos(
+        &mut self,
+        detect: &[DetectBox],
+        proto_data: ProtoData,
+        output_width: usize,
+        output_height: usize,
+    ) -> crate::Result<Vec<MaskResult>> {
+        // Delegate to the non-trait method on GLProcessorThreaded
+        GLProcessorThreaded::render_masks_from_protos(
+            self,
+            detect,
+            proto_data,
+            output_width,
+            output_height,
+        )
+    }
+
+    #[cfg(feature = "decoder")]
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<(), crate::Error> {
         let (err_send, err_recv) = tokio::sync::oneshot::channel();
         self.sender
@@ -869,11 +971,71 @@ impl ImageProcessorTrait for GLProcessorThreaded {
     }
 }
 
+impl GLProcessorThreaded {
+    /// Sets the interpolation mode for int8 proto textures.
+    #[cfg(feature = "decoder")]
+    pub fn set_int8_interpolation_mode(
+        &mut self,
+        mode: Int8InterpolationMode,
+    ) -> Result<(), crate::Error> {
+        let (err_send, err_recv) = tokio::sync::oneshot::channel();
+        self.sender
+            .as_ref()
+            .unwrap()
+            .blocking_send(GLProcessorMessage::SetInt8Interpolation(mode, err_send))
+            .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
+        err_recv.blocking_recv().map_err(|_| {
+            Error::Internal("GL converter error messaging closed without update".to_string())
+        })?
+    }
+
+    /// Render per-instance grayscale masks at full output resolution via the GL thread.
+    #[cfg(feature = "decoder")]
+    pub fn render_masks_from_protos(
+        &mut self,
+        detect: &[DetectBox],
+        proto_data: ProtoData,
+        output_width: usize,
+        output_height: usize,
+    ) -> Result<Vec<MaskResult>, crate::Error> {
+        let (resp_send, resp_recv) = tokio::sync::oneshot::channel();
+        self.sender
+            .as_ref()
+            .unwrap()
+            .blocking_send(GLProcessorMessage::RenderMasksFromProtos(
+                SendablePtr {
+                    ptr: NonNull::new(detect.as_ptr() as *mut DetectBox).unwrap(),
+                    len: detect.len(),
+                },
+                Box::new(proto_data),
+                output_width,
+                output_height,
+                resp_send,
+            ))
+            .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
+        resp_recv.blocking_recv().map_err(|_| {
+            Error::Internal("GL converter error messaging closed without update".to_string())
+        })?
+    }
+}
+
 impl Drop for GLProcessorThreaded {
     fn drop(&mut self) {
         drop(self.sender.take());
         let _ = self.handle.take().and_then(|h| h.join().ok());
     }
+}
+
+/// Interpolation mode for int8 proto textures (GL_R8I cannot use GL_LINEAR).
+#[cfg(feature = "decoder")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Int8InterpolationMode {
+    /// texelFetch at nearest texel — simplest, fastest GPU execution.
+    Nearest,
+    /// texelFetch × 4 neighbors with shader-computed bilinear weights (default).
+    Bilinear,
+    /// Two-pass: dequant int8→f16 FBO, then existing f16 shader with GL_LINEAR.
+    TwoPass,
 }
 
 /// OpenGL single-threaded image converter.
@@ -888,13 +1050,68 @@ pub struct GLProcessorST {
     #[cfg(feature = "decoder")]
     instanced_segmentation_program: GlProgram,
     #[cfg(feature = "decoder")]
+    proto_texture: Texture,
+    #[cfg(feature = "decoder")]
+    proto_segmentation_program: GlProgram,
+    #[cfg(feature = "decoder")]
+    proto_segmentation_int8_nearest_program: GlProgram,
+    #[cfg(feature = "decoder")]
+    proto_segmentation_int8_bilinear_program: GlProgram,
+    #[cfg(feature = "decoder")]
+    proto_dequant_int8_program: GlProgram,
+    #[cfg(feature = "decoder")]
+    proto_segmentation_f32_program: GlProgram,
+    #[cfg(feature = "decoder")]
     color_program: GlProgram,
+    #[cfg(feature = "decoder")]
+    /// Whether GL_OES_texture_float_linear is available (allows GL_LINEAR on R32F textures).
+    has_float_linear: bool,
+    #[cfg(feature = "decoder")]
+    /// Interpolation mode for int8 proto textures.
+    int8_interpolation_mode: Int8InterpolationMode,
+    #[cfg(feature = "decoder")]
+    /// Intermediate FBO texture for two-pass int8 dequant path.
+    proto_dequant_texture: Texture,
+    #[cfg(feature = "decoder")]
+    proto_mask_int8_bilinear_program: GlProgram,
+    #[cfg(feature = "decoder")]
+    proto_mask_int8_nearest_program: GlProgram,
+    #[cfg(feature = "decoder")]
+    proto_mask_f32_program: GlProgram,
+    #[cfg(feature = "decoder")]
+    /// Dedicated FBO for mask rendering (render_masks_from_protos).
+    mask_fbo: u32,
+    #[cfg(feature = "decoder")]
+    /// R8 texture attached to mask_fbo.
+    mask_fbo_texture: u32,
+    #[cfg(feature = "decoder")]
+    /// Current allocated width of mask FBO texture.
+    mask_fbo_width: usize,
+    #[cfg(feature = "decoder")]
+    /// Current allocated height of mask FBO texture.
+    mask_fbo_height: usize,
     vertex_buffer: Buffer,
     texture_buffer: Buffer,
     texture_program: GlProgram,
     texture_program_yuv: GlProgram,
     texture_program_planar: GlProgram,
     gl_context: GlContext,
+}
+
+impl Drop for GLProcessorST {
+    fn drop(&mut self) {
+        unsafe {
+            #[cfg(feature = "decoder")]
+            {
+                if self.mask_fbo != 0 {
+                    gls::gl::DeleteFramebuffers(1, &self.mask_fbo);
+                }
+                if self.mask_fbo_texture != 0 {
+                    gls::gl::DeleteTextures(1, &self.mask_fbo_texture);
+                }
+            }
+        }
+    }
 }
 
 impl ImageProcessorTrait for GLProcessorST {
@@ -1030,6 +1247,93 @@ impl ImageProcessorTrait for GLProcessorST {
     }
 
     #[cfg(feature = "decoder")]
+    fn render_from_protos(
+        &mut self,
+        dst: &mut TensorImage,
+        detect: &[DetectBox],
+        proto_data: &ProtoData,
+    ) -> crate::Result<()> {
+        use crate::FunctionTimer;
+
+        let _timer = FunctionTimer::new("GLProcessorST::render_from_protos");
+        if !matches!(dst.fourcc(), RGBA | RGB) {
+            return Err(crate::Error::NotSupported(
+                "Opengl image rendering only supports RGBA or RGB images".to_string(),
+            ));
+        }
+
+        let (_render_buffer, is_dma) = match dst.tensor.memory() {
+            edgefirst_tensor::TensorMemory::Dma => {
+                if let Ok(render_buffer) = self.setup_renderbuffer_dma(dst) {
+                    (render_buffer, true)
+                } else {
+                    (
+                        self.setup_renderbuffer_non_dma(
+                            dst,
+                            Crop::new().with_dst_rect(Some(Rect::new(0, 0, 0, 0))),
+                        )?,
+                        false,
+                    )
+                }
+            }
+            _ => (
+                self.setup_renderbuffer_non_dma(
+                    dst,
+                    Crop::new().with_dst_rect(Some(Rect::new(0, 0, 0, 0))),
+                )?,
+                false,
+            ),
+        };
+
+        gls::enable(gls::gl::BLEND);
+        gls::blend_func_separate(
+            gls::gl::SRC_ALPHA,
+            gls::gl::ONE_MINUS_SRC_ALPHA,
+            gls::gl::ZERO,
+            gls::gl::ONE,
+        );
+
+        self.render_box(dst, detect)?;
+        self.render_proto_segmentation(detect, proto_data)?;
+
+        gls::finish();
+        if !is_dma {
+            let mut dst_map = dst.tensor().map()?;
+            let format = match dst.fourcc() {
+                RGB => gls::gl::RGB,
+                RGBA => gls::gl::RGBA,
+                _ => unreachable!(),
+            };
+            unsafe {
+                gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
+                gls::gl::ReadnPixels(
+                    0,
+                    0,
+                    dst.width() as i32,
+                    dst.height() as i32,
+                    format,
+                    gls::gl::UNSIGNED_BYTE,
+                    dst.tensor.len() as i32,
+                    dst_map.as_mut_ptr() as *mut c_void,
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "decoder")]
+    fn render_masks_from_protos(
+        &mut self,
+        detect: &[DetectBox],
+        proto_data: ProtoData,
+        output_width: usize,
+        output_height: usize,
+    ) -> crate::Result<Vec<MaskResult>> {
+        GLProcessorST::render_masks_from_protos(self, detect, &proto_data, output_width, output_height)
+    }
+
+    #[cfg(feature = "decoder")]
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> crate::Result<()> {
         if colors.is_empty() {
             return Ok(());
@@ -1050,6 +1354,14 @@ impl ImageProcessorTrait for GLProcessorST {
         self.segmentation_program
             .load_uniform_4fv(c"colors", &colors_f32)?;
         self.instanced_segmentation_program
+            .load_uniform_4fv(c"colors", &colors_f32)?;
+        self.proto_segmentation_program
+            .load_uniform_4fv(c"colors", &colors_f32)?;
+        self.proto_segmentation_int8_nearest_program
+            .load_uniform_4fv(c"colors", &colors_f32)?;
+        self.proto_segmentation_int8_bilinear_program
+            .load_uniform_4fv(c"colors", &colors_f32)?;
+        self.proto_segmentation_f32_program
             .load_uniform_4fv(c"colors", &colors_f32)?;
 
         colors_f32.iter_mut().for_each(|c| {
@@ -1072,7 +1384,7 @@ impl GLProcessorST {
                 .map_or(std::ptr::null(), |p| p as *const _)
         });
 
-        Self::gl_check_support()?;
+        let has_float_linear = Self::gl_check_support()?;
 
         // Uploads and downloads are all packed with no alignment requirements
         unsafe {
@@ -1104,15 +1416,77 @@ impl GLProcessorST {
         #[cfg(feature = "decoder")]
         instanced_segmentation_program.load_uniform_4fv(c"colors", &DEFAULT_COLORS)?;
 
+        // Existing f16 proto shader (RGBA16F, 4 protos per layer)
+        #[cfg(feature = "decoder")]
+        let proto_segmentation_program = GlProgram::new(
+            generate_vertex_shader(),
+            generate_proto_segmentation_shader(),
+        )?;
+        #[cfg(feature = "decoder")]
+        proto_segmentation_program.load_uniform_4fv(c"colors", &DEFAULT_COLORS)?;
+
+        // Int8 proto shaders (R8I, 1 proto per layer, 32 layers)
+        #[cfg(feature = "decoder")]
+        let proto_segmentation_int8_nearest_program = GlProgram::new(
+            generate_vertex_shader(),
+            generate_proto_segmentation_shader_int8_nearest(),
+        )?;
+        #[cfg(feature = "decoder")]
+        proto_segmentation_int8_nearest_program.load_uniform_4fv(c"colors", &DEFAULT_COLORS)?;
+
+        #[cfg(feature = "decoder")]
+        let proto_segmentation_int8_bilinear_program = GlProgram::new(
+            generate_vertex_shader(),
+            generate_proto_segmentation_shader_int8_bilinear(),
+        )?;
+        #[cfg(feature = "decoder")]
+        proto_segmentation_int8_bilinear_program.load_uniform_4fv(c"colors", &DEFAULT_COLORS)?;
+
+        #[cfg(feature = "decoder")]
+        let proto_dequant_int8_program = GlProgram::new(
+            generate_vertex_shader(),
+            generate_proto_dequant_shader_int8(),
+        )?;
+
+        // F32 proto shader (R32F, 1 proto per layer, 32 layers)
+        #[cfg(feature = "decoder")]
+        let proto_segmentation_f32_program = GlProgram::new(
+            generate_vertex_shader(),
+            generate_proto_segmentation_shader_f32(),
+        )?;
+        #[cfg(feature = "decoder")]
+        proto_segmentation_f32_program.load_uniform_4fv(c"colors", &DEFAULT_COLORS)?;
+
         #[cfg(feature = "decoder")]
         let color_program = GlProgram::new(generate_vertex_shader(), generate_color_shader())?;
         #[cfg(feature = "decoder")]
         color_program.load_uniform_4fv(c"colors", &DEFAULT_COLORS)?;
 
+        // Grayscale mask shaders (no color/discard, sigmoid → RED channel)
+        #[cfg(feature = "decoder")]
+        let proto_mask_int8_nearest_program = GlProgram::new(
+            generate_vertex_shader(),
+            generate_proto_mask_shader_int8_nearest(),
+        )?;
+        #[cfg(feature = "decoder")]
+        let proto_mask_int8_bilinear_program = GlProgram::new(
+            generate_vertex_shader(),
+            generate_proto_mask_shader_int8_bilinear(),
+        )?;
+        #[cfg(feature = "decoder")]
+        let proto_mask_f32_program = GlProgram::new(
+            generate_vertex_shader(),
+            generate_proto_mask_shader_f32(),
+        )?;
+
         let camera_eglimage_texture = Texture::new();
         let camera_normal_texture = Texture::new();
         let render_texture = Texture::new();
         let segmentation_texture = Texture::new();
+        #[cfg(feature = "decoder")]
+        let proto_texture = Texture::new();
+        #[cfg(feature = "decoder")]
+        let proto_dequant_texture = Texture::new();
         let vertex_buffer = Buffer::new(0, 3, 100);
         let texture_buffer = Buffer::new(1, 2, 100);
 
@@ -1125,6 +1499,36 @@ impl GLProcessorST {
             camera_normal_texture,
             #[cfg(feature = "decoder")]
             segmentation_texture,
+            #[cfg(feature = "decoder")]
+            proto_texture,
+            #[cfg(feature = "decoder")]
+            proto_segmentation_int8_nearest_program,
+            #[cfg(feature = "decoder")]
+            proto_segmentation_int8_bilinear_program,
+            #[cfg(feature = "decoder")]
+            proto_dequant_int8_program,
+            #[cfg(feature = "decoder")]
+            proto_segmentation_f32_program,
+            #[cfg(feature = "decoder")]
+            has_float_linear,
+            #[cfg(feature = "decoder")]
+            int8_interpolation_mode: Int8InterpolationMode::Bilinear,
+            #[cfg(feature = "decoder")]
+            proto_dequant_texture,
+            #[cfg(feature = "decoder")]
+            proto_mask_int8_bilinear_program,
+            #[cfg(feature = "decoder")]
+            proto_mask_int8_nearest_program,
+            #[cfg(feature = "decoder")]
+            proto_mask_f32_program,
+            #[cfg(feature = "decoder")]
+            mask_fbo: 0,
+            #[cfg(feature = "decoder")]
+            mask_fbo_texture: 0,
+            #[cfg(feature = "decoder")]
+            mask_fbo_width: 0,
+            #[cfg(feature = "decoder")]
+            mask_fbo_height: 0,
             vertex_buffer,
             texture_buffer,
             render_texture,
@@ -1133,12 +1537,409 @@ impl GLProcessorST {
             #[cfg(feature = "decoder")]
             instanced_segmentation_program,
             #[cfg(feature = "decoder")]
+            proto_segmentation_program,
+            #[cfg(feature = "decoder")]
             color_program,
         };
         check_gl_error(function!(), line!())?;
 
         log::debug!("GLConverter created");
         Ok(converter)
+    }
+
+    /// Sets the interpolation mode for int8 proto textures.
+    #[cfg(feature = "decoder")]
+    pub fn set_int8_interpolation_mode(&mut self, mode: Int8InterpolationMode) {
+        self.int8_interpolation_mode = mode;
+        log::debug!("Int8 interpolation mode set to {:?}", mode);
+    }
+
+    /// Ensures the mask FBO + R8 texture are allocated at the given dimensions.
+    /// Creates or resizes the FBO and texture as needed.
+    #[cfg(feature = "decoder")]
+    fn ensure_mask_fbo(&mut self, width: usize, height: usize) -> crate::Result<()> {
+        if self.mask_fbo_width == width && self.mask_fbo_height == height && self.mask_fbo != 0 {
+            return Ok(());
+        }
+
+        // Create FBO if needed
+        if self.mask_fbo == 0 {
+            unsafe {
+                gls::gl::GenFramebuffers(1, &mut self.mask_fbo);
+            }
+        }
+        // Create texture if needed
+        if self.mask_fbo_texture == 0 {
+            unsafe {
+                gls::gl::GenTextures(1, &mut self.mask_fbo_texture);
+            }
+        }
+
+        // Allocate R8 texture
+        unsafe {
+            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.mask_fbo_texture);
+            gls::gl::TexImage2D(
+                gls::gl::TEXTURE_2D,
+                0,
+                gls::gl::R8 as i32,
+                width as i32,
+                height as i32,
+                0,
+                gls::gl::RED,
+                gls::gl::UNSIGNED_BYTE,
+                std::ptr::null(),
+            );
+            gls::gl::TexParameteri(
+                gls::gl::TEXTURE_2D,
+                gls::gl::TEXTURE_MIN_FILTER,
+                gls::gl::NEAREST as i32,
+            );
+            gls::gl::TexParameteri(
+                gls::gl::TEXTURE_2D,
+                gls::gl::TEXTURE_MAG_FILTER,
+                gls::gl::NEAREST as i32,
+            );
+        }
+
+        // Attach to FBO
+        unsafe {
+            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, self.mask_fbo);
+            gls::gl::FramebufferTexture2D(
+                gls::gl::FRAMEBUFFER,
+                gls::gl::COLOR_ATTACHMENT0,
+                gls::gl::TEXTURE_2D,
+                self.mask_fbo_texture,
+                0,
+            );
+            let status = gls::gl::CheckFramebufferStatus(gls::gl::FRAMEBUFFER);
+            if status != gls::gl::FRAMEBUFFER_COMPLETE {
+                return Err(crate::Error::OpenGl(format!(
+                    "Mask FBO incomplete: status=0x{status:X}"
+                )));
+            }
+            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
+        }
+
+        self.mask_fbo_width = width;
+        self.mask_fbo_height = height;
+        log::debug!("Mask FBO allocated at {width}x{height}");
+        Ok(())
+    }
+
+    /// Render per-instance grayscale masks at full output resolution.
+    ///
+    /// For each detection, renders a quad to a dedicated R8 FBO using a
+    /// grayscale mask shader (sigmoid → RED channel, no threshold/discard).
+    /// Reads back only the bounding-box region via `glReadPixels`.
+    ///
+    /// Returns a `Vec` of `(x, y, w, h, Vec<u8>)` tuples — one per detection.
+    #[cfg(feature = "decoder")]
+    pub fn render_masks_from_protos(
+        &mut self,
+        detect: &[DetectBox],
+        proto_data: &ProtoData,
+        output_width: usize,
+        output_height: usize,
+    ) -> crate::Result<Vec<MaskResult>> {
+        use crate::FunctionTimer;
+
+        let _timer = FunctionTimer::new("GLProcessorST::render_masks_from_protos");
+
+        if detect.is_empty() || proto_data.mask_coefficients.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let (height, width, num_protos) = proto_data.protos.dim();
+        let texture_target = gls::gl::TEXTURE_2D_ARRAY;
+
+        // Save current FBO and viewport
+        let (saved_fbo, saved_viewport) = unsafe {
+            let mut fbo: i32 = 0;
+            gls::gl::GetIntegerv(gls::gl::FRAMEBUFFER_BINDING, &mut fbo);
+            let mut vp = [0i32; 4];
+            gls::gl::GetIntegerv(gls::gl::VIEWPORT, vp.as_mut_ptr());
+            (fbo as u32, vp)
+        };
+
+        // Ensure mask FBO is allocated at the right size
+        self.ensure_mask_fbo(output_width, output_height)?;
+
+        // Upload proto texture array and select the appropriate shader
+        gls::active_texture(gls::gl::TEXTURE0);
+        gls::bind_texture(texture_target, self.proto_texture.id);
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_MIN_FILTER,
+            gls::gl::NEAREST as i32,
+        );
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_MAG_FILTER,
+            gls::gl::NEAREST as i32,
+        );
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_WRAP_S,
+            gls::gl::CLAMP_TO_EDGE as i32,
+        );
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_WRAP_T,
+            gls::gl::CLAMP_TO_EDGE as i32,
+        );
+
+        match &proto_data.protos {
+            ProtoTensor::Quantized {
+                protos,
+                quantization,
+            } => {
+                // Repack to layer-first layout (same as render_proto_segmentation_int8)
+                let mut tex_data = vec![0i8; height * width * num_protos];
+                for k in 0..num_protos {
+                    for y in 0..height {
+                        for x in 0..width {
+                            tex_data[k * height * width + y * width + x] = protos[[y, x, k]];
+                        }
+                    }
+                }
+                gls::tex_image3d(
+                    texture_target,
+                    0,
+                    gls::gl::R8I as i32,
+                    width as i32,
+                    height as i32,
+                    num_protos as i32,
+                    0,
+                    gls::gl::RED_INTEGER,
+                    gls::gl::BYTE,
+                    Some(&tex_data),
+                );
+
+                let proto_scale = quantization.scale;
+                let proto_scaled_zp =
+                    -(quantization.zero_point as f32) * quantization.scale;
+
+                let program = match self.int8_interpolation_mode {
+                    Int8InterpolationMode::Nearest => &self.proto_mask_int8_nearest_program,
+                    _ => &self.proto_mask_int8_bilinear_program,
+                };
+                gls::use_program(program.id);
+                program.load_uniform_1i(c"num_protos", num_protos as i32)?;
+                program.load_uniform_1f(c"proto_scale", proto_scale)?;
+                program.load_uniform_1f(c"proto_scaled_zp", proto_scaled_zp)?;
+
+                self.render_mask_quads(
+                    program,
+                    detect,
+                    &proto_data.mask_coefficients,
+                    output_width,
+                    output_height,
+                )
+            }
+            ProtoTensor::Float(protos_f32) => {
+                // Repack to layer-first layout
+                let mut tex_data = vec![0.0f32; height * width * num_protos];
+                for k in 0..num_protos {
+                    for y in 0..height {
+                        for x in 0..width {
+                            tex_data[k * height * width + y * width + x] = protos_f32[[y, x, k]];
+                        }
+                    }
+                }
+                gls::tex_image3d(
+                    texture_target,
+                    0,
+                    gls::gl::R32F as i32,
+                    width as i32,
+                    height as i32,
+                    num_protos as i32,
+                    0,
+                    gls::gl::RED,
+                    gls::gl::FLOAT,
+                    Some(&tex_data),
+                );
+                if self.has_float_linear {
+                    gls::tex_parameteri(
+                        texture_target,
+                        gls::gl::TEXTURE_MIN_FILTER,
+                        gls::gl::LINEAR as i32,
+                    );
+                    gls::tex_parameteri(
+                        texture_target,
+                        gls::gl::TEXTURE_MAG_FILTER,
+                        gls::gl::LINEAR as i32,
+                    );
+                }
+
+                let program = &self.proto_mask_f32_program;
+                gls::use_program(program.id);
+                program.load_uniform_1i(c"num_protos", num_protos as i32)?;
+
+                self.render_mask_quads(
+                    program,
+                    detect,
+                    &proto_data.mask_coefficients,
+                    output_width,
+                    output_height,
+                )
+            }
+        }
+        .and_then(|results| {
+            // Restore previous FBO + viewport
+            unsafe {
+                gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, saved_fbo);
+                gls::gl::Viewport(
+                    saved_viewport[0],
+                    saved_viewport[1],
+                    saved_viewport[2],
+                    saved_viewport[3],
+                );
+            }
+            Ok(results)
+        })
+    }
+
+    /// Render per-detection quads to the mask FBO and read back bbox regions.
+    ///
+    /// For each detection: clear FBO, set coefficients, render quad, read back
+    /// the bounding-box region as R8 pixels.
+    #[cfg(feature = "decoder")]
+    fn render_mask_quads(
+        &self,
+        program: &GlProgram,
+        detect: &[DetectBox],
+        mask_coefficients: &[Vec<f32>],
+        output_width: usize,
+        output_height: usize,
+    ) -> crate::Result<Vec<MaskResult>> {
+        let mut results = Vec::with_capacity(detect.len());
+
+        if let Some(first_coeff) = mask_coefficients.first() {
+            if first_coeff.len() > 32 {
+                log::warn!(
+                    "render_mask_quads: {} mask coefficients exceeds shader \
+                     limit of 32 — coefficients will be truncated",
+                    first_coeff.len()
+                );
+            }
+        }
+
+        // Bind mask FBO and set viewport
+        unsafe {
+            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, self.mask_fbo);
+            gls::gl::Viewport(0, 0, output_width as i32, output_height as i32);
+            gls::gl::Disable(gls::gl::BLEND);
+        }
+
+        for (det, coeff) in detect.iter().zip(mask_coefficients.iter()) {
+            // Clear to black (0)
+            unsafe {
+                gls::gl::ClearColor(0.0, 0.0, 0.0, 0.0);
+                gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
+            }
+
+            // Set mask coefficients
+            let mut packed_coeff = [[0.0f32; 4]; 8];
+            for (i, val) in coeff.iter().enumerate().take(32) {
+                packed_coeff[i / 4][i % 4] = *val;
+            }
+            program.load_uniform_4fv(c"mask_coeff", &packed_coeff)?;
+
+            // Compute bbox pixel coordinates, clamped to FBO bounds.
+            let ow = output_width as i32;
+            let oh = output_height as i32;
+            let bbox_x = (det.bbox.xmin * output_width as f32).round() as i32;
+            let bbox_y = (det.bbox.ymin * output_height as f32).round() as i32;
+            let bbox_x2 = (det.bbox.xmax * output_width as f32).round() as i32;
+            let bbox_y2 = (det.bbox.ymax * output_height as f32).round() as i32;
+            let bbox_x = bbox_x.max(0).min(ow);
+            let bbox_y = bbox_y.max(0).min(oh);
+            let bbox_x2 = bbox_x2.max(bbox_x).min(ow);
+            let bbox_y2 = bbox_y2.max(bbox_y).min(oh);
+            let bbox_w = (bbox_x2 - bbox_x).max(1);
+            let bbox_h = (bbox_y2 - bbox_y).max(1);
+
+            // Compute NDC coordinates for the quad
+            let cvt = |normalized: f32| normalized * 2.0 - 1.0;
+            let dst_left = cvt(det.bbox.xmin);
+            let dst_right = cvt(det.bbox.xmax);
+            let dst_top = cvt(det.bbox.ymax);
+            let dst_bottom = cvt(det.bbox.ymin);
+
+            let src_left = det.bbox.xmin;
+            let src_right = det.bbox.xmax;
+            let src_top = 1.0 - det.bbox.ymin;
+            let src_bottom = 1.0 - det.bbox.ymax;
+
+            unsafe {
+                gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
+                gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
+                let verts: [f32; 12] = [
+                    dst_left, dst_top, 0.0,
+                    dst_right, dst_top, 0.0,
+                    dst_right, dst_bottom, 0.0,
+                    dst_left, dst_bottom, 0.0,
+                ];
+                gls::gl::BufferSubData(
+                    gls::gl::ARRAY_BUFFER,
+                    0,
+                    (size_of::<f32>() * 12) as isize,
+                    verts.as_ptr() as *const c_void,
+                );
+
+                gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
+                gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
+                let tc: [f32; 8] = [
+                    src_left, src_top,
+                    src_right, src_top,
+                    src_right, src_bottom,
+                    src_left, src_bottom,
+                ];
+                gls::gl::BufferSubData(
+                    gls::gl::ARRAY_BUFFER,
+                    0,
+                    (size_of::<f32>() * 8) as isize,
+                    tc.as_ptr() as *const c_void,
+                );
+
+                let idx: [u32; 4] = [0, 1, 2, 3];
+                gls::gl::DrawElements(
+                    gls::gl::TRIANGLE_FAN,
+                    4,
+                    gls::gl::UNSIGNED_INT,
+                    idx.as_ptr() as *const c_void,
+                );
+            }
+
+            // Read back the bbox region only
+            let pixel_count = (bbox_w * bbox_h) as usize;
+            let mut pixels = vec![0u8; pixel_count];
+
+            unsafe {
+                gls::gl::Finish();
+                gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
+                gls::gl::ReadnPixels(
+                    bbox_x,
+                    bbox_y,
+                    bbox_w,
+                    bbox_h,
+                    gls::gl::RED,
+                    gls::gl::UNSIGNED_BYTE,
+                    pixel_count as i32,
+                    pixels.as_mut_ptr() as *mut c_void,
+                );
+            }
+
+            results.push(MaskResult {
+                x: bbox_x as usize,
+                y: bbox_y as usize,
+                w: bbox_w as usize,
+                h: bbox_h as usize,
+                pixels,
+            });
+        }
+
+        Ok(results)
     }
 
     fn check_src_format_supported(support_dma: bool, img: &TensorImage) -> bool {
@@ -1159,7 +1960,9 @@ impl GLProcessorST {
         }
     }
 
-    fn gl_check_support() -> Result<(), crate::Error> {
+    /// Checks required GL extensions and returns whether optional capabilities
+    /// are available. Returns `has_float_linear` (GL_OES_texture_float_linear).
+    fn gl_check_support() -> Result<bool, crate::Error> {
         if let Ok(version) = gls::get_string(gls::gl::SHADING_LANGUAGE_VERSION) {
             log::debug!("GL Shading Language Version: {version:?}");
         } else {
@@ -1191,7 +1994,10 @@ impl GLProcessorST {
             }
         }
 
-        Ok(())
+        let has_float_linear = extensions.contains("GL_OES_texture_float_linear");
+        log::debug!("GL_OES_texture_float_linear: {has_float_linear}");
+
+        Ok(has_float_linear)
     }
 
     fn setup_renderbuffer_dma(&mut self, dst: &TensorImage) -> crate::Result<FrameBuffer> {
@@ -2423,6 +3229,568 @@ impl GLProcessorST {
         Ok(())
     }
 
+    /// Repack proto tensor `(H, W, num_protos)` as f32 into RGBA f16 layers
+    /// suitable for upload to a GL_TEXTURE_2D_ARRAY with GL_RGBA16F.
+    ///
+    /// Returns `(repacked_bytes, num_layers)` where each layer is H*W*4 half-floats.
+    #[cfg(feature = "decoder")]
+    fn repack_protos_to_rgba_f16(protos: &ndarray::Array3<f32>) -> (Vec<u8>, usize) {
+        let (height, width, num_protos) = protos.dim();
+        let num_layers = num_protos.div_ceil(4);
+        // Each layer is H*W*4 half-floats, each half-float is 2 bytes
+        let layer_stride = height * width * 4;
+        let mut buf = vec![0u16; layer_stride * num_layers];
+
+        for y in 0..height {
+            for x in 0..width {
+                for k in 0..num_layers * 4 {
+                    let val = if k < num_protos {
+                        half::f16::from_f32(protos[[y, x, k]])
+                    } else {
+                        half::f16::ZERO
+                    };
+                    let layer = k / 4;
+                    let channel = k % 4;
+                    buf[layer * layer_stride + y * width * 4 + x * 4 + channel] =
+                        val.to_bits();
+                }
+            }
+        }
+
+        // Reinterpret u16 buffer as bytes
+        let byte_buf = unsafe {
+            std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 2).to_vec()
+        };
+        (byte_buf, num_layers)
+    }
+
+    /// Render YOLO proto segmentation masks using the fused GPU pipeline.
+    ///
+    /// Dispatches to the appropriate shader based on `ProtoTensor` variant:
+    /// - `Quantized`: uploads raw int8 as `GL_R8I`, dequantizes in shader
+    /// - `Float`: uploads as `GL_R32F` with hardware bilinear (if available),
+    ///   or falls back to f16 repack path
+    #[cfg(feature = "decoder")]
+    fn render_proto_segmentation(
+        &mut self,
+        detect: &[DetectBox],
+        proto_data: &ProtoData,
+    ) -> crate::Result<()> {
+        if detect.is_empty() || proto_data.mask_coefficients.is_empty() {
+            return Ok(());
+        }
+
+        let (height, width, num_protos) = proto_data.protos.dim();
+        let texture_target = gls::gl::TEXTURE_2D_ARRAY;
+
+        match &proto_data.protos {
+            ProtoTensor::Quantized {
+                protos,
+                quantization,
+            } => {
+                self.render_proto_segmentation_int8(
+                    detect,
+                    &proto_data.mask_coefficients,
+                    protos,
+                    quantization,
+                    height,
+                    width,
+                    num_protos,
+                    texture_target,
+                )?;
+            }
+            ProtoTensor::Float(protos_f32) => {
+                if self.has_float_linear {
+                    self.render_proto_segmentation_f32(
+                        detect,
+                        &proto_data.mask_coefficients,
+                        protos_f32,
+                        height,
+                        width,
+                        num_protos,
+                        texture_target,
+                    )?;
+                } else {
+                    // Fallback: repack to RGBA16F and use existing f16 shader
+                    self.render_proto_segmentation_f16(
+                        detect,
+                        &proto_data.mask_coefficients,
+                        protos_f32,
+                        height,
+                        width,
+                        num_protos,
+                        texture_target,
+                    )?;
+                }
+            }
+        }
+
+        unsafe { gls::gl::Finish() };
+        Ok(())
+    }
+
+    /// Render detection quads using the active program. Shared by all proto
+    /// shader paths.
+    #[cfg(feature = "decoder")]
+    fn render_proto_detection_quads(
+        &self,
+        program: &GlProgram,
+        detect: &[DetectBox],
+        mask_coefficients: &[Vec<f32>],
+    ) -> crate::Result<()> {
+        let cvt_screen_coord = |normalized: f32| normalized * 2.0 - 1.0;
+
+        for (det, coeff) in detect.iter().zip(mask_coefficients.iter()) {
+            let mut packed_coeff = [[0.0f32; 4]; 8];
+            for (i, val) in coeff.iter().enumerate().take(32) {
+                packed_coeff[i / 4][i % 4] = *val;
+            }
+
+            program.load_uniform_4fv(c"mask_coeff", &packed_coeff)?;
+            program.load_uniform_1i(c"class_index", det.label as i32)?;
+
+            let dst_roi = RegionOfInterest {
+                left: cvt_screen_coord(det.bbox.xmin),
+                top: cvt_screen_coord(det.bbox.ymax),
+                right: cvt_screen_coord(det.bbox.xmax),
+                bottom: cvt_screen_coord(det.bbox.ymin),
+            };
+
+            let src_roi = RegionOfInterest {
+                left: det.bbox.xmin,
+                top: 1.0 - det.bbox.ymin,
+                right: det.bbox.xmax,
+                bottom: 1.0 - det.bbox.ymax,
+            };
+
+            unsafe {
+                gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
+                gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
+
+                let camera_vertices: [f32; 12] = [
+                    dst_roi.left,
+                    dst_roi.top,
+                    0.,
+                    dst_roi.right,
+                    dst_roi.top,
+                    0.,
+                    dst_roi.right,
+                    dst_roi.bottom,
+                    0.,
+                    dst_roi.left,
+                    dst_roi.bottom,
+                    0.,
+                ];
+                gls::gl::BufferSubData(
+                    gls::gl::ARRAY_BUFFER,
+                    0,
+                    (size_of::<f32>() * camera_vertices.len()) as isize,
+                    camera_vertices.as_ptr() as *const c_void,
+                );
+
+                gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
+                gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
+
+                let texture_vertices: [f32; 8] = [
+                    src_roi.left,
+                    src_roi.top,
+                    src_roi.right,
+                    src_roi.top,
+                    src_roi.right,
+                    src_roi.bottom,
+                    src_roi.left,
+                    src_roi.bottom,
+                ];
+                gls::gl::BufferSubData(
+                    gls::gl::ARRAY_BUFFER,
+                    0,
+                    (size_of::<f32>() * 8) as isize,
+                    texture_vertices.as_ptr() as *const c_void,
+                );
+
+                let vertices_index: [u32; 4] = [0, 1, 2, 3];
+                gls::gl::DrawElements(
+                    gls::gl::TRIANGLE_FAN,
+                    vertices_index.len() as i32,
+                    gls::gl::UNSIGNED_INT,
+                    vertices_index.as_ptr() as *const c_void,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Int8 proto path: upload raw i8 protos as `GL_R8I`, dispatch by
+    /// interpolation mode.
+    #[cfg(feature = "decoder")]
+    #[allow(clippy::too_many_arguments)]
+    fn render_proto_segmentation_int8(
+        &mut self,
+        detect: &[DetectBox],
+        mask_coefficients: &[Vec<f32>],
+        protos: &ndarray::Array3<i8>,
+        quantization: &edgefirst_decoder::Quantization,
+        height: usize,
+        width: usize,
+        num_protos: usize,
+        texture_target: u32,
+    ) -> crate::Result<()> {
+        // Upload raw int8 protos as R8I texture array (1 proto per layer)
+        gls::bind_texture(texture_target, self.proto_texture.id);
+        gls::active_texture(gls::gl::TEXTURE0);
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_MIN_FILTER,
+            gls::gl::NEAREST as i32,
+        );
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_MAG_FILTER,
+            gls::gl::NEAREST as i32,
+        );
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_WRAP_S,
+            gls::gl::CLAMP_TO_EDGE as i32,
+        );
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_WRAP_T,
+            gls::gl::CLAMP_TO_EDGE as i32,
+        );
+
+        // Protos are (H, W, num_protos) in row-major. We need to repack to
+        // layer-first layout: layer k = all (H, W) texels for proto k.
+        let mut tex_data = vec![0i8; height * width * num_protos];
+        for k in 0..num_protos {
+            for y in 0..height {
+                for x in 0..width {
+                    tex_data[k * height * width + y * width + x] = protos[[y, x, k]];
+                }
+            }
+        }
+
+        gls::tex_image3d(
+            texture_target,
+            0,
+            gls::gl::R8I as i32,
+            width as i32,
+            height as i32,
+            num_protos as i32,
+            0,
+            gls::gl::RED_INTEGER,
+            gls::gl::BYTE,
+            Some(&tex_data),
+        );
+
+        let proto_scale = quantization.scale;
+        let proto_scaled_zp = -(quantization.zero_point as f32) * quantization.scale;
+
+        match self.int8_interpolation_mode {
+            Int8InterpolationMode::Nearest => {
+                let program = &self.proto_segmentation_int8_nearest_program;
+                gls::use_program(program.id);
+                program.load_uniform_1i(c"num_protos", num_protos as i32)?;
+                program.load_uniform_1f(c"proto_scale", proto_scale)?;
+                program.load_uniform_1f(c"proto_scaled_zp", proto_scaled_zp)?;
+                self.render_proto_detection_quads(program, detect, mask_coefficients)?;
+            }
+            Int8InterpolationMode::Bilinear => {
+                let program = &self.proto_segmentation_int8_bilinear_program;
+                gls::use_program(program.id);
+                program.load_uniform_1i(c"num_protos", num_protos as i32)?;
+                program.load_uniform_1f(c"proto_scale", proto_scale)?;
+                program.load_uniform_1f(c"proto_scaled_zp", proto_scaled_zp)?;
+                self.render_proto_detection_quads(program, detect, mask_coefficients)?;
+            }
+            Int8InterpolationMode::TwoPass => {
+                self.render_proto_int8_two_pass(
+                    detect,
+                    mask_coefficients,
+                    quantization,
+                    height,
+                    width,
+                    num_protos,
+                    texture_target,
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Two-pass int8 path: dequant int8→RGBA16F FBO, then render with
+    /// existing f16 shader using GL_LINEAR.
+    #[cfg(feature = "decoder")]
+    #[allow(clippy::too_many_arguments)]
+    fn render_proto_int8_two_pass(
+        &self,
+        detect: &[DetectBox],
+        mask_coefficients: &[Vec<f32>],
+        quantization: &edgefirst_decoder::Quantization,
+        height: usize,
+        width: usize,
+        num_protos: usize,
+        texture_target: u32,
+    ) -> crate::Result<()> {
+        let num_layers = num_protos.div_ceil(4);
+
+        // Save the caller's FBO and viewport so we can restore after dequant.
+        let (saved_fbo, saved_viewport) = unsafe {
+            let mut fbo: i32 = 0;
+            gls::gl::GetIntegerv(gls::gl::FRAMEBUFFER_BINDING, &mut fbo);
+            let mut vp = [0i32; 4];
+            gls::gl::GetIntegerv(gls::gl::VIEWPORT, vp.as_mut_ptr());
+            (fbo as u32, vp)
+        };
+
+        // Pass 1: Dequantize int8 → RGBA16F texture via framebuffer
+        let dequant_fbo = FrameBuffer::new();
+        gls::bind_texture(texture_target, self.proto_dequant_texture.id);
+        gls::tex_image3d::<u8>(
+            texture_target,
+            0,
+            gls::gl::RGBA16F as i32,
+            width as i32,
+            height as i32,
+            num_layers as i32,
+            0,
+            gls::gl::RGBA,
+            gls::gl::HALF_FLOAT,
+            None,
+        );
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_MIN_FILTER,
+            gls::gl::LINEAR as i32,
+        );
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_MAG_FILTER,
+            gls::gl::LINEAR as i32,
+        );
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_WRAP_S,
+            gls::gl::CLAMP_TO_EDGE as i32,
+        );
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_WRAP_T,
+            gls::gl::CLAMP_TO_EDGE as i32,
+        );
+
+        let proto_scale = quantization.scale;
+        let proto_scaled_zp = -(quantization.zero_point as f32) * quantization.scale;
+
+        let dequant_program = &self.proto_dequant_int8_program;
+        gls::use_program(dequant_program.id);
+        dequant_program.load_uniform_1f(c"proto_scale", proto_scale)?;
+        dequant_program.load_uniform_1f(c"proto_scaled_zp", proto_scaled_zp)?;
+
+        // Bind the int8 proto texture to TEXTURE0 for the dequant shader
+        gls::active_texture(gls::gl::TEXTURE0);
+        gls::bind_texture(texture_target, self.proto_texture.id);
+
+        // Render each RGBA16F layer (4 protos per layer)
+        for layer in 0..num_layers {
+            dequant_fbo.bind();
+            unsafe {
+                gls::gl::FramebufferTextureLayer(
+                    gls::gl::FRAMEBUFFER,
+                    gls::gl::COLOR_ATTACHMENT0,
+                    self.proto_dequant_texture.id,
+                    0,
+                    layer as i32,
+                );
+                gls::gl::Viewport(0, 0, width as i32, height as i32);
+            }
+            dequant_program.load_uniform_1i(c"base_layer", (layer * 4) as i32)?;
+
+            // Full-screen quad
+            unsafe {
+                gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
+                gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
+                let verts: [f32; 12] = [
+                    -1.0, -1.0, 0.0, 1.0, -1.0, 0.0, 1.0, 1.0, 0.0, -1.0, 1.0, 0.0,
+                ];
+                gls::gl::BufferSubData(
+                    gls::gl::ARRAY_BUFFER,
+                    0,
+                    (size_of::<f32>() * 12) as isize,
+                    verts.as_ptr() as *const c_void,
+                );
+                gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
+                gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
+                let tc: [f32; 8] = [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0];
+                gls::gl::BufferSubData(
+                    gls::gl::ARRAY_BUFFER,
+                    0,
+                    (size_of::<f32>() * 8) as isize,
+                    tc.as_ptr() as *const c_void,
+                );
+                let idx: [u32; 4] = [0, 1, 2, 3];
+                gls::gl::DrawElements(
+                    gls::gl::TRIANGLE_FAN,
+                    4,
+                    gls::gl::UNSIGNED_INT,
+                    idx.as_ptr() as *const c_void,
+                );
+            }
+        }
+
+        // Drop the dequant FBO (its Drop unbinds to 0) and restore the caller's.
+        drop(dequant_fbo);
+        unsafe {
+            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, saved_fbo);
+            gls::gl::Viewport(
+                saved_viewport[0],
+                saved_viewport[1],
+                saved_viewport[2],
+                saved_viewport[3],
+            );
+        }
+
+        // Pass 2: render with existing f16 shader reading from dequant texture
+        let program = &self.proto_segmentation_program;
+        gls::use_program(program.id);
+        gls::active_texture(gls::gl::TEXTURE0);
+        gls::bind_texture(texture_target, self.proto_dequant_texture.id);
+        program.load_uniform_1i(c"num_layers", num_layers as i32)?;
+        self.render_proto_detection_quads(program, detect, mask_coefficients)?;
+
+        Ok(())
+    }
+
+    /// F32 proto path: upload as `GL_R32F` with `GL_LINEAR` filtering.
+    #[cfg(feature = "decoder")]
+    #[allow(clippy::too_many_arguments)]
+    fn render_proto_segmentation_f32(
+        &self,
+        detect: &[DetectBox],
+        mask_coefficients: &[Vec<f32>],
+        protos_f32: &ndarray::Array3<f32>,
+        height: usize,
+        width: usize,
+        num_protos: usize,
+        texture_target: u32,
+    ) -> crate::Result<()> {
+        let program = &self.proto_segmentation_f32_program;
+        gls::use_program(program.id);
+        gls::bind_texture(texture_target, self.proto_texture.id);
+        gls::active_texture(gls::gl::TEXTURE0);
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_MIN_FILTER,
+            gls::gl::LINEAR as i32,
+        );
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_MAG_FILTER,
+            gls::gl::LINEAR as i32,
+        );
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_WRAP_S,
+            gls::gl::CLAMP_TO_EDGE as i32,
+        );
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_WRAP_T,
+            gls::gl::CLAMP_TO_EDGE as i32,
+        );
+
+        // Repack protos to layer-first layout: (num_protos, H, W)
+        let mut tex_data = vec![0.0f32; height * width * num_protos];
+        for k in 0..num_protos {
+            for y in 0..height {
+                for x in 0..width {
+                    tex_data[k * height * width + y * width + x] = protos_f32[[y, x, k]];
+                }
+            }
+        }
+
+        gls::tex_image3d(
+            texture_target,
+            0,
+            gls::gl::R32F as i32,
+            width as i32,
+            height as i32,
+            num_protos as i32,
+            0,
+            gls::gl::RED,
+            gls::gl::FLOAT,
+            Some(&tex_data),
+        );
+
+        program.load_uniform_1i(c"num_protos", num_protos as i32)?;
+        self.render_proto_detection_quads(program, detect, mask_coefficients)?;
+
+        Ok(())
+    }
+
+    /// F16 fallback path: repack f32 protos to RGBA16F and use existing
+    /// f16 shader with GL_LINEAR. Used when GL_OES_texture_float_linear
+    /// is not available.
+    #[cfg(feature = "decoder")]
+    #[allow(clippy::too_many_arguments)]
+    fn render_proto_segmentation_f16(
+        &self,
+        detect: &[DetectBox],
+        mask_coefficients: &[Vec<f32>],
+        protos_f32: &ndarray::Array3<f32>,
+        height: usize,
+        width: usize,
+        num_protos: usize,
+        texture_target: u32,
+    ) -> crate::Result<()> {
+        let num_layers = num_protos.div_ceil(4);
+        let (tex_data, _) = Self::repack_protos_to_rgba_f16(protos_f32);
+
+        let program = &self.proto_segmentation_program;
+        gls::use_program(program.id);
+        gls::bind_texture(texture_target, self.proto_texture.id);
+        gls::active_texture(gls::gl::TEXTURE0);
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_MIN_FILTER,
+            gls::gl::LINEAR as i32,
+        );
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_MAG_FILTER,
+            gls::gl::LINEAR as i32,
+        );
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_WRAP_S,
+            gls::gl::CLAMP_TO_EDGE as i32,
+        );
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_WRAP_T,
+            gls::gl::CLAMP_TO_EDGE as i32,
+        );
+
+        gls::tex_image3d(
+            texture_target,
+            0,
+            gls::gl::RGBA16F as i32,
+            width as i32,
+            height as i32,
+            num_layers as i32,
+            0,
+            gls::gl::RGBA,
+            gls::gl::HALF_FLOAT,
+            Some(&tex_data),
+        );
+
+        program.load_uniform_1i(c"num_layers", num_layers as i32)?;
+        self.render_proto_detection_quads(program, detect, mask_coefficients)?;
+
+        Ok(())
+    }
+
     fn render_segmentation(
         &mut self,
         detect: &[DetectBox],
@@ -3051,6 +4419,331 @@ void main() {
         discard;
     }
     color = colors[class_index % 20];
+}
+"
+}
+
+#[cfg(feature = "decoder")]
+fn generate_proto_segmentation_shader() -> &'static str {
+    "\
+#version 300 es
+precision highp float;
+precision highp sampler2DArray;
+
+uniform sampler2DArray proto_tex;  // ceil(num_protos/4) layers, RGBA = 4 channels per layer
+uniform vec4 mask_coeff[8];        // 32 coefficients packed as 8 vec4s
+uniform vec4 colors[20];
+uniform int class_index;
+uniform int num_layers;
+
+in vec2 tc;
+out vec4 color;
+
+void main() {
+    float acc = 0.0;
+    for (int i = 0; i < num_layers; i++) {
+        // texture() returns bilinearly interpolated proto values (GL_LINEAR)
+        acc += dot(mask_coeff[i], texture(proto_tex, vec3(tc, float(i))));
+    }
+    float mask = 1.0 / (1.0 + exp(-acc));  // sigmoid
+    if (mask < 0.5) discard;
+    color = colors[class_index % 20];
+}
+"
+}
+
+/// Int8 proto shader — nearest-neighbor only.
+///
+/// Uses `texelFetch()` at the nearest texel. No interpolation. Simplest and
+/// fastest GPU execution but may show staircase artifacts at mask edges.
+///
+/// Layout: `GL_R8I` texture with 1 proto per layer (32 layers).
+/// Mask coefficients packed as `vec4[8]`, indexed `mask_coeff[k/4][k%4]`.
+#[cfg(feature = "decoder")]
+fn generate_proto_segmentation_shader_int8_nearest() -> &'static str {
+    "\
+#version 300 es
+precision highp float;
+precision highp int;
+precision highp isampler2DArray;
+
+uniform isampler2DArray proto_tex;  // 32 layers, R channel = 1 proto per layer
+uniform vec4 mask_coeff[8];         // 32 coefficients packed as 8 vec4s
+uniform vec4 colors[20];
+uniform int class_index;
+uniform int num_protos;
+uniform float proto_scale;
+uniform float proto_scaled_zp;      // -zero_point * scale
+
+in vec2 tc;
+out vec4 color;
+
+void main() {
+    ivec3 tex_size = textureSize(proto_tex, 0);
+    int ix = clamp(int(tc.x * float(tex_size.x)), 0, tex_size.x - 1);
+    int iy = clamp(int(tc.y * float(tex_size.y)), 0, tex_size.y - 1);
+
+    float acc = 0.0;
+    for (int k = 0; k < num_protos; k++) {
+        float raw = float(texelFetch(proto_tex, ivec3(ix, iy, k), 0).r);
+        float val = raw * proto_scale + proto_scaled_zp;
+        acc += mask_coeff[k / 4][k % 4] * val;
+    }
+    float mask = 1.0 / (1.0 + exp(-acc));
+    if (mask < 0.5) discard;
+    color = colors[class_index % 20];
+}
+"
+}
+
+/// Int8 proto shader — shader-based bilinear interpolation (recommended).
+///
+/// Uses `texelFetch()` to fetch 4 neighboring texels per fragment, dequantizes
+/// each, and computes bilinear weights from `fract(tc * textureSize)`.
+///
+/// Layout: `GL_R8I` texture with 1 proto per layer (32 layers).
+#[cfg(feature = "decoder")]
+fn generate_proto_segmentation_shader_int8_bilinear() -> &'static str {
+    "\
+#version 300 es
+precision highp float;
+precision highp int;
+precision highp isampler2DArray;
+
+uniform isampler2DArray proto_tex;  // 32 layers, R channel = 1 proto per layer
+uniform vec4 mask_coeff[8];         // 32 coefficients packed as 8 vec4s
+uniform vec4 colors[20];
+uniform int class_index;
+uniform int num_protos;
+uniform float proto_scale;
+uniform float proto_scaled_zp;      // -zero_point * scale
+
+in vec2 tc;
+out vec4 color;
+
+void main() {
+    ivec3 tex_size = textureSize(proto_tex, 0);
+    // Compute continuous position (matching GL_LINEAR convention: center at +0.5)
+    vec2 pos = tc * vec2(tex_size.xy) - 0.5;
+    vec2 f = fract(pos);
+    ivec2 p0 = ivec2(floor(pos));
+    ivec2 p1 = p0 + 1;
+    // Clamp to texture bounds
+    p0 = clamp(p0, ivec2(0), tex_size.xy - 1);
+    p1 = clamp(p1, ivec2(0), tex_size.xy - 1);
+
+    float w00 = (1.0 - f.x) * (1.0 - f.y);
+    float w10 = f.x * (1.0 - f.y);
+    float w01 = (1.0 - f.x) * f.y;
+    float w11 = f.x * f.y;
+
+    float acc = 0.0;
+    for (int k = 0; k < num_protos; k++) {
+        float r00 = float(texelFetch(proto_tex, ivec3(p0.x, p0.y, k), 0).r);
+        float r10 = float(texelFetch(proto_tex, ivec3(p1.x, p0.y, k), 0).r);
+        float r01 = float(texelFetch(proto_tex, ivec3(p0.x, p1.y, k), 0).r);
+        float r11 = float(texelFetch(proto_tex, ivec3(p1.x, p1.y, k), 0).r);
+        float interp = r00 * w00 + r10 * w10 + r01 * w01 + r11 * w11;
+        float val = interp * proto_scale + proto_scaled_zp;
+        acc += mask_coeff[k / 4][k % 4] * val;
+    }
+    float mask = 1.0 / (1.0 + exp(-acc));
+    if (mask < 0.5) discard;
+    color = colors[class_index % 20];
+}
+"
+}
+
+/// Int8 dequantization pass shader (two-pass Option C, pass 1).
+///
+/// Reads `GL_R8I` texel, dequantizes, and writes float to `GL_RGBA16F` render
+/// target. This shader processes 4 protos at a time (packing into RGBA).
+/// After this pass, the existing f16 shader reads the dequantized texture with
+/// `GL_LINEAR`.
+#[cfg(feature = "decoder")]
+fn generate_proto_dequant_shader_int8() -> &'static str {
+    "\
+#version 300 es
+precision highp float;
+precision highp int;
+precision highp isampler2DArray;
+
+uniform isampler2DArray proto_tex;  // 32 layers of R8I (1 proto per layer)
+uniform float proto_scale;
+uniform float proto_scaled_zp;      // -zero_point * scale
+uniform int base_layer;             // first proto index for this output layer (0, 4, 8, ...)
+
+in vec2 tc;
+out vec4 color;
+
+void main() {
+    ivec3 tex_size = textureSize(proto_tex, 0);
+    int ix = clamp(int(tc.x * float(tex_size.x)), 0, tex_size.x - 1);
+    int iy = clamp(int(tc.y * float(tex_size.y)), 0, tex_size.y - 1);
+
+    vec4 result;
+    for (int c = 0; c < 4; c++) {
+        int layer = base_layer + c;
+        float raw = float(texelFetch(proto_tex, ivec3(ix, iy, layer), 0).r);
+        result[c] = raw * proto_scale + proto_scaled_zp;
+    }
+    color = result;
+}
+"
+}
+
+/// F32 proto shader — direct R32F texture with hardware bilinear filtering.
+///
+/// Same structure as int8 bilinear shader but uses `texture()` for hardware
+/// interpolation (requires `GL_OES_texture_float_linear`). No dequantization.
+///
+/// Layout: `GL_R32F` texture with 1 proto per layer (32 layers).
+#[cfg(feature = "decoder")]
+fn generate_proto_segmentation_shader_f32() -> &'static str {
+    "\
+#version 300 es
+precision highp float;
+precision highp sampler2DArray;
+
+uniform sampler2DArray proto_tex;  // 32 layers, R channel = 1 proto per layer
+uniform vec4 mask_coeff[8];        // 32 coefficients packed as 8 vec4s
+uniform vec4 colors[20];
+uniform int class_index;
+uniform int num_protos;
+
+in vec2 tc;
+out vec4 color;
+
+void main() {
+    float acc = 0.0;
+    for (int k = 0; k < num_protos; k++) {
+        // texture() returns bilinearly interpolated proto value (GL_LINEAR on R32F)
+        float val = texture(proto_tex, vec3(tc, float(k))).r;
+        acc += mask_coeff[k / 4][k % 4] * val;
+    }
+    float mask = 1.0 / (1.0 + exp(-acc));
+    if (mask < 0.5) discard;
+    color = colors[class_index % 20];
+}
+"
+}
+
+/// Grayscale mask shader — int8, nearest-neighbor.
+///
+/// Same accumulation as the colored variant but outputs `sigmoid(acc)` to the
+/// RED channel without thresholding or discarding.  Used by
+/// `render_masks_from_protos()` for per-instance mask readback.
+#[cfg(feature = "decoder")]
+fn generate_proto_mask_shader_int8_nearest() -> &'static str {
+    "\
+#version 300 es
+precision highp float;
+precision highp int;
+precision highp isampler2DArray;
+
+uniform isampler2DArray proto_tex;
+uniform vec4 mask_coeff[8];
+uniform int num_protos;
+uniform float proto_scale;
+uniform float proto_scaled_zp;
+
+in vec2 tc;
+out vec4 color;
+
+void main() {
+    ivec3 tex_size = textureSize(proto_tex, 0);
+    int ix = clamp(int(tc.x * float(tex_size.x)), 0, tex_size.x - 1);
+    int iy = clamp(int(tc.y * float(tex_size.y)), 0, tex_size.y - 1);
+
+    float acc = 0.0;
+    for (int k = 0; k < num_protos; k++) {
+        float raw = float(texelFetch(proto_tex, ivec3(ix, iy, k), 0).r);
+        float val = raw * proto_scale + proto_scaled_zp;
+        acc += mask_coeff[k / 4][k % 4] * val;
+    }
+    float mask = 1.0 / (1.0 + exp(-acc));
+    color = vec4(mask, 0.0, 0.0, 1.0);
+}
+"
+}
+
+/// Grayscale mask shader — int8, shader-based bilinear interpolation.
+///
+/// Same accumulation as the colored bilinear variant but outputs
+/// `sigmoid(acc)` to the RED channel without thresholding or discarding.
+#[cfg(feature = "decoder")]
+fn generate_proto_mask_shader_int8_bilinear() -> &'static str {
+    "\
+#version 300 es
+precision highp float;
+precision highp int;
+precision highp isampler2DArray;
+
+uniform isampler2DArray proto_tex;
+uniform vec4 mask_coeff[8];
+uniform int num_protos;
+uniform float proto_scale;
+uniform float proto_scaled_zp;
+
+in vec2 tc;
+out vec4 color;
+
+void main() {
+    ivec3 tex_size = textureSize(proto_tex, 0);
+    vec2 pos = tc * vec2(tex_size.xy) - 0.5;
+    vec2 f = fract(pos);
+    ivec2 p0 = ivec2(floor(pos));
+    ivec2 p1 = p0 + 1;
+    p0 = clamp(p0, ivec2(0), tex_size.xy - 1);
+    p1 = clamp(p1, ivec2(0), tex_size.xy - 1);
+
+    float w00 = (1.0 - f.x) * (1.0 - f.y);
+    float w10 = f.x * (1.0 - f.y);
+    float w01 = (1.0 - f.x) * f.y;
+    float w11 = f.x * f.y;
+
+    float acc = 0.0;
+    for (int k = 0; k < num_protos; k++) {
+        float r00 = float(texelFetch(proto_tex, ivec3(p0.x, p0.y, k), 0).r);
+        float r10 = float(texelFetch(proto_tex, ivec3(p1.x, p0.y, k), 0).r);
+        float r01 = float(texelFetch(proto_tex, ivec3(p0.x, p1.y, k), 0).r);
+        float r11 = float(texelFetch(proto_tex, ivec3(p1.x, p1.y, k), 0).r);
+        float interp = r00 * w00 + r10 * w10 + r01 * w01 + r11 * w11;
+        float val = interp * proto_scale + proto_scaled_zp;
+        acc += mask_coeff[k / 4][k % 4] * val;
+    }
+    float mask = 1.0 / (1.0 + exp(-acc));
+    color = vec4(mask, 0.0, 0.0, 1.0);
+}
+"
+}
+
+/// Grayscale mask shader — f32 protos with hardware bilinear filtering.
+///
+/// Same accumulation as the colored f32 variant but outputs `sigmoid(acc)` to
+/// the RED channel without thresholding or discarding.
+#[cfg(feature = "decoder")]
+fn generate_proto_mask_shader_f32() -> &'static str {
+    "\
+#version 300 es
+precision highp float;
+precision highp sampler2DArray;
+
+uniform sampler2DArray proto_tex;
+uniform vec4 mask_coeff[8];
+uniform int num_protos;
+
+in vec2 tc;
+out vec4 color;
+
+void main() {
+    float acc = 0.0;
+    for (int k = 0; k < num_protos; k++) {
+        float val = texture(proto_tex, vec3(tc, float(k))).r;
+        acc += mask_coeff[k / 4][k % 4] * val;
+    }
+    float mask = 1.0 / (1.0 + exp(-acc));
+    color = vec4(mask, 0.0, 0.0, 1.0);
 }
 "
 }

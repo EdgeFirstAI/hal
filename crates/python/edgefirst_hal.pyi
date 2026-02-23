@@ -381,6 +381,61 @@ class Decoder:
         """
         ...
 
+    def decode_and_render(
+        self,
+        model_output: List[np.ndarray],
+        processor: ImageProcessor,
+        dst: TensorImage,
+        max_boxes: int = 100,
+    ) -> DetectionOutput:
+        """
+        Decode model outputs and render results directly onto the destination
+        image in a single call. Masks never leave Rust, eliminating the
+        Python round-trip overhead of ``decode()`` + ``render_to_image()``.
+
+        For segmentation models, prototype data is passed directly to the
+        renderer without materializing intermediate mask arrays in Python.
+        For detection-only models, this falls back to the standard rendering
+        path.
+
+        Returns ``(boxes, scores, classes)`` — no mask arrays are returned.
+
+        Args:
+            model_output: List of model output tensors (same types as ``decode``).
+            processor: ImageProcessor instance for rendering.
+            dst: Destination TensorImage to render onto.
+            max_boxes: Maximum number of detections to return (default: 100).
+        """
+        ...
+
+    def decode_and_render_masks(
+        self,
+        model_output: List[np.ndarray],
+        processor: ImageProcessor,
+        output_width: int = 640,
+        output_height: int = 640,
+        max_boxes: int = 100,
+    ) -> SegDetOutput:
+        """
+        Decode model outputs and render per-instance grayscale masks at full
+        output resolution in a single fused call.
+
+        For segmentation models, prototype data is rendered on the GPU at the
+        specified output resolution using ``sigmoid(mask_coeff @ protos)``
+        without thresholding. Each mask covers only its bounding-box region,
+        returned as a uint8 array shaped ``(H, W, 1)`` with values 0–255.
+
+        For detection-only models, returns an empty mask list.
+
+        Args:
+            model_output: List of model output tensors (same types as ``decode``).
+            processor: ImageProcessor instance for GPU mask rendering.
+            output_width: Width of the full output resolution (default: 640).
+            output_height: Height of the full output resolution (default: 640).
+            max_boxes: Maximum number of detections to return (default: 100).
+        """
+        ...
+
     @staticmethod
     def decode_yolo_det(
         model_output: Union[

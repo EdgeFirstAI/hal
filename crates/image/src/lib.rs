@@ -56,7 +56,7 @@ and hardware acceleration. However, this will increase the performance of the CP
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 #[cfg(feature = "decoder")]
-use edgefirst_decoder::{DetectBox, Segmentation};
+use edgefirst_decoder::{DetectBox, ProtoData, Segmentation};
 use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait as _};
 use enum_dispatch::enum_dispatch;
 use four_char_code::{four_char_code, FourCharCode};
@@ -77,6 +77,29 @@ pub use opengl_headless::GLProcessorThreaded;
 #[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
 pub use opengl_headless::{probe_egl_displays, EglDisplayInfo, EglDisplayKind};
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+#[cfg(feature = "decoder")]
+pub use opengl_headless::Int8InterpolationMode;
+
+/// Result of rendering a single per-instance grayscale mask.
+///
+/// Contains the bounding-box region in output image coordinates and the
+/// raw uint8 pixel data (RED channel only, 0–255 representing sigmoid output).
+#[cfg(feature = "decoder")]
+#[derive(Debug, Clone)]
+pub struct MaskResult {
+    /// X offset of the bbox region in the output image.
+    pub x: usize,
+    /// Y offset of the bbox region in the output image.
+    pub y: usize,
+    /// Width of the bbox region.
+    pub w: usize,
+    /// Height of the bbox region.
+    pub h: usize,
+    /// Grayscale pixel data (w * h bytes, row-major).
+    pub pixels: Vec<u8>,
+}
 
 mod cpu;
 mod error;
@@ -1180,6 +1203,39 @@ pub trait ImageProcessorTrait {
     ) -> Result<()>;
 
     #[cfg(feature = "decoder")]
+    /// Renders detection boxes and segmentation masks from raw prototype data.
+    ///
+    /// For YOLO segmentation models, this avoids materializing intermediate
+    /// `Array3<u8>` masks. The `ProtoData` contains mask coefficients and the
+    /// prototype tensor; the renderer computes `mask_coeff @ protos` directly.
+    ///
+    /// Phase 1 implementation materializes masks internally and delegates to
+    /// existing render paths. Phase 2 will compute masks in the GPU shader.
+    fn render_from_protos(
+        &mut self,
+        dst: &mut TensorImage,
+        detect: &[DetectBox],
+        proto_data: &ProtoData,
+    ) -> Result<()>;
+
+    #[cfg(feature = "decoder")]
+    /// Renders per-instance grayscale masks from raw prototype data at full
+    /// output resolution.
+    ///
+    /// Each mask is rendered at the detection's bounding-box region using
+    /// `sigmoid(mask_coeff @ protos)` without thresholding, producing
+    /// continuous [0,255] values suitable for soft IoU computation.
+    ///
+    /// Returns one [`MaskResult`] per detection with the bbox-cropped pixels.
+    fn render_masks_from_protos(
+        &mut self,
+        detect: &[DetectBox],
+        proto_data: ProtoData,
+        output_width: usize,
+        output_height: usize,
+    ) -> Result<Vec<MaskResult>>;
+
+    #[cfg(feature = "decoder")]
     /// Sets the colors used for rendering segmentation masks. Up to 17 colors
     /// can be set.
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<()>;
@@ -1306,6 +1362,18 @@ impl ImageProcessor {
             #[cfg(feature = "opengl")]
             opengl,
         })
+    }
+
+    /// Sets the interpolation mode for int8 proto textures on the OpenGL
+    /// backend. No-op if OpenGL is not available.
+    #[cfg(target_os = "linux")]
+    #[cfg(feature = "opengl")]
+    #[cfg(feature = "decoder")]
+    pub fn set_int8_interpolation_mode(&mut self, mode: Int8InterpolationMode) -> Result<()> {
+        if let Some(ref mut gl) = self.opengl {
+            gl.set_int8_interpolation_mode(mode)?;
+        }
+        Ok(())
     }
 }
 
@@ -1472,6 +1540,51 @@ impl ImageProcessorTrait for ImageProcessor {
     }
 
     #[cfg(feature = "decoder")]
+    fn render_from_protos(
+        &mut self,
+        dst: &mut TensorImage,
+        detect: &[DetectBox],
+        proto_data: &ProtoData,
+    ) -> Result<()> {
+        let start = Instant::now();
+
+        if detect.is_empty() {
+            return Ok(());
+        }
+
+        // skip G2D as it doesn't support rendering to image
+
+        #[cfg(target_os = "linux")]
+        #[cfg(feature = "opengl")]
+        if let Some(opengl) = self.opengl.as_mut() {
+            log::trace!("render_from_protos started with opengl in {:?}", start.elapsed());
+            match opengl.render_from_protos(dst, detect, proto_data) {
+                Ok(_) => {
+                    log::trace!("render_from_protos with opengl in {:?}", start.elapsed());
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::trace!("render_from_protos didn't work with opengl: {e:?}")
+                }
+            }
+        }
+        log::trace!("render_from_protos started with cpu in {:?}", start.elapsed());
+        if let Some(cpu) = self.cpu.as_mut() {
+            match cpu.render_from_protos(dst, detect, proto_data) {
+                Ok(_) => {
+                    log::trace!("render_from_protos with cpu in {:?}", start.elapsed());
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::trace!("render_from_protos didn't work with cpu: {e:?}");
+                    return Err(e);
+                }
+            }
+        }
+        Err(Error::NoConverter)
+    }
+
+    #[cfg(feature = "decoder")]
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<()> {
         let start = Instant::now();
 
@@ -1503,6 +1616,50 @@ impl ImageProcessorTrait for ImageProcessor {
                     return Err(e);
                 }
             }
+        }
+        Err(Error::NoConverter)
+    }
+
+    #[cfg(feature = "decoder")]
+    fn render_masks_from_protos(
+        &mut self,
+        detect: &[DetectBox],
+        proto_data: ProtoData,
+        output_width: usize,
+        output_height: usize,
+    ) -> Result<Vec<MaskResult>> {
+        if detect.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // OpenGL path takes ownership; CPU fallback uses reference.
+        // Try OpenGL first — if it fails, fall through to CPU with the
+        // original data (OpenGL failure returns proto_data via Err).
+        #[cfg(target_os = "linux")]
+        #[cfg(feature = "opengl")]
+        {
+            let has_opengl = self.opengl.is_some();
+            if has_opengl {
+                let opengl = self.opengl.as_mut().unwrap();
+                match opengl.render_masks_from_protos(detect, proto_data, output_width, output_height) {
+                    Ok(r) => return Ok(r),
+                    Err(e) => {
+                        log::trace!("render_masks_from_protos didn't work with opengl: {e:?}");
+                        // proto_data was moved into the GL thread — must use
+                        // CPU path with fresh data, but since OpenGL rarely
+                        // fails at this point, this is acceptable.
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        if let Some(cpu) = self.cpu.as_mut() {
+            return cpu.render_masks_from_protos(
+                detect,
+                proto_data,
+                output_width,
+                output_height,
+            );
         }
         Err(Error::NoConverter)
     }

@@ -6,7 +6,7 @@ use crate::{
     TensorImageDst, TensorImageRef, GREY, NV12, NV16, PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, YUYV,
 };
 #[cfg(feature = "decoder")]
-use edgefirst_decoder::{DetectBox, Segmentation};
+use edgefirst_decoder::{DetectBox, ProtoData, Segmentation};
 use edgefirst_tensor::{TensorMapTrait, TensorTrait};
 use four_char_code::FourCharCode;
 use ndarray::{ArrayView3, ArrayViewMut3, Axis};
@@ -2061,6 +2061,138 @@ impl ImageProcessorTrait for CPUProcessor {
     }
 
     #[cfg(feature = "decoder")]
+    fn render_from_protos(
+        &mut self,
+        dst: &mut TensorImage,
+        detect: &[DetectBox],
+        proto_data: &ProtoData,
+    ) -> Result<()> {
+        if !matches!(dst.fourcc(), RGBA | RGB) {
+            return Err(crate::Error::NotSupported(
+                "CPU image rendering only supports RGBA or RGB images".to_string(),
+            ));
+        }
+
+        let _timer = FunctionTimer::new("CPUProcessor::render_from_protos");
+
+        let mut map = dst.tensor.map()?;
+        let dst_slice = map.as_mut_slice();
+
+        self.render_box(dst, dst_slice, detect)?;
+
+        if detect.is_empty() || proto_data.mask_coefficients.is_empty() {
+            return Ok(());
+        }
+
+        let protos_cow = proto_data.protos.as_f32();
+        let protos = protos_cow.as_ref();
+        let proto_h = protos.shape()[0];
+        let proto_w = protos.shape()[1];
+        let num_protos = protos.shape()[2];
+        let dst_w = dst.width();
+        let dst_h = dst.height();
+        let row_stride = dst.row_stride();
+        let channels = dst.channels();
+
+        for (det, coeff) in detect.iter().zip(proto_data.mask_coefficients.iter()) {
+            let color = self.colors[det.label % self.colors.len()];
+            let alpha = color[3] as u16;
+
+            // Pixel bounds of the detection in dst image space
+            let start_x = (dst_w as f32 * det.bbox.xmin).round() as usize;
+            let start_y = (dst_h as f32 * det.bbox.ymin).round() as usize;
+            let end_x = ((dst_w as f32 * det.bbox.xmax).round() as usize).min(dst_w);
+            let end_y = ((dst_h as f32 * det.bbox.ymax).round() as usize).min(dst_h);
+
+            for y in start_y..end_y {
+                for x in start_x..end_x {
+                    // Map pixel (x, y) to proto space
+                    let px = (x as f32 / dst_w as f32) * proto_w as f32 - 0.5;
+                    let py = (y as f32 / dst_h as f32) * proto_h as f32 - 0.5;
+
+                    // Bilinear interpolation + dot product
+                    let acc = bilinear_dot(protos, coeff, num_protos, px, py, proto_w, proto_h);
+
+                    // Sigmoid threshold
+                    let mask = 1.0 / (1.0 + (-acc).exp());
+                    if mask < 0.5 {
+                        continue;
+                    }
+
+                    // Alpha blend
+                    let dst_index = y * row_stride + x * channels;
+                    for c in 0..3 {
+                        dst_slice[dst_index + c] = ((color[c] as u16 * alpha
+                            + dst_slice[dst_index + c] as u16 * (255 - alpha))
+                            / 255) as u8;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "decoder")]
+    fn render_masks_from_protos(
+        &mut self,
+        detect: &[crate::DetectBox],
+        proto_data: crate::ProtoData,
+        output_width: usize,
+        output_height: usize,
+    ) -> Result<Vec<crate::MaskResult>> {
+        use crate::FunctionTimer;
+
+        let _timer = FunctionTimer::new("CPUProcessor::render_masks_from_protos");
+
+        if detect.is_empty() || proto_data.mask_coefficients.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let protos_cow = proto_data.protos.as_f32();
+        let protos = protos_cow.as_ref();
+        let proto_h = protos.shape()[0];
+        let proto_w = protos.shape()[1];
+        let num_protos = protos.shape()[2];
+
+        let mut results = Vec::with_capacity(detect.len());
+
+        for (det, coeff) in detect.iter().zip(proto_data.mask_coefficients.iter()) {
+            let start_x = (output_width as f32 * det.bbox.xmin).round() as usize;
+            let start_y = (output_height as f32 * det.bbox.ymin).round() as usize;
+            let end_x = ((output_width as f32 * det.bbox.xmax).round() as usize).min(output_width);
+            let end_y =
+                ((output_height as f32 * det.bbox.ymax).round() as usize).min(output_height);
+            let bbox_w = end_x.saturating_sub(start_x).max(1);
+            let bbox_h = end_y.saturating_sub(start_y).max(1);
+
+            let mut pixels = vec![0u8; bbox_w * bbox_h];
+
+            for row in 0..bbox_h {
+                let y = start_y + row;
+                for col in 0..bbox_w {
+                    let x = start_x + col;
+                    let px = (x as f32 / output_width as f32) * proto_w as f32 - 0.5;
+                    let py = (y as f32 / output_height as f32) * proto_h as f32 - 0.5;
+                    let acc = bilinear_dot(protos, coeff, num_protos, px, py, proto_w, proto_h);
+                    let mask = 1.0 / (1.0 + (-acc).exp());
+                    pixels[row * bbox_w + col] = (mask * 255.0).round() as u8;
+                }
+            }
+
+            results.push(crate::MaskResult {
+                x: start_x,
+                y: start_y,
+                w: bbox_w,
+                h: bbox_h,
+                pixels,
+            });
+        }
+
+        Ok(results)
+    }
+
+    #[cfg(feature = "decoder")]
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<()> {
         for (c, new_c) in self.colors.iter_mut().zip(colors.iter()) {
             *c = *new_c;
@@ -2068,6 +2200,47 @@ impl ImageProcessorTrait for CPUProcessor {
         Ok(())
     }
 }
+
+/// Bilinear interpolation of proto values at `(px, py)` combined with dot
+/// product against `coeff`. Returns the scalar accumulator before sigmoid.
+///
+/// Samples the four nearest proto texels, weights by bilinear coefficients,
+/// and simultaneously computes the dot product with the mask coefficients.
+#[cfg(feature = "decoder")]
+#[inline]
+fn bilinear_dot(
+    protos: &ndarray::Array3<f32>,
+    coeff: &[f32],
+    num_protos: usize,
+    px: f32,
+    py: f32,
+    proto_w: usize,
+    proto_h: usize,
+) -> f32 {
+    let x0 = (px.floor() as isize).clamp(0, proto_w as isize - 1) as usize;
+    let y0 = (py.floor() as isize).clamp(0, proto_h as isize - 1) as usize;
+    let x1 = (x0 + 1).min(proto_w - 1);
+    let y1 = (y0 + 1).min(proto_h - 1);
+
+    let fx = px - px.floor();
+    let fy = py - py.floor();
+
+    let w00 = (1.0 - fx) * (1.0 - fy);
+    let w10 = fx * (1.0 - fy);
+    let w01 = (1.0 - fx) * fy;
+    let w11 = fx * fy;
+
+    let mut acc = 0.0f32;
+    for p in 0..num_protos {
+        let val = w00 * protos[[y0, x0, p]]
+            + w10 * protos[[y0, x1, p]]
+            + w01 * protos[[y1, x0, p]]
+            + w11 * protos[[y1, x1, p]];
+        acc += coeff[p] * val;
+    }
+    acc
+}
+
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]

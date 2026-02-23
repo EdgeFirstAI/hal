@@ -10,8 +10,8 @@ use crate::error::{set_error, set_error_null, str_to_c_string};
 use crate::tensor::HalTensor;
 use crate::{check_null, check_null_ret_null, try_or_errno, try_or_null};
 use edgefirst_decoder::{
-    configs::Nms, dequantize_cpu_chunked, segmentation_to_mask, ArrayViewDQuantized, Decoder,
-    DecoderBuilder, DetectBox, Quantization, Segmentation,
+    configs, configs::Nms, dequantize_cpu_chunked, segmentation_to_mask, ArrayViewDQuantized,
+    ConfigOutput, Decoder, DecoderBuilder, DetectBox, Quantization, Segmentation,
 };
 use edgefirst_tensor::{Tensor, TensorMapTrait, TensorMemory, TensorTrait};
 use libc::{c_char, c_int, size_t};
@@ -102,146 +102,190 @@ impl From<HalNms> for Option<Nms> {
     }
 }
 
-/// Decoder construction parameters.
+/// Output type for model tensor outputs.
+///
+/// Identifies the role of a model output tensor in the decoder pipeline.
+///
+/// @see hal_decoder_params_add_output
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HalOutputType {
+    /// Combined detection output (e.g. YOLO fused [batch, features, boxes])
+    Detection = 0,
+    /// Split boxes output [batch, coords, boxes]
+    Boxes = 1,
+    /// Split scores output [batch, classes, boxes]
+    Scores = 2,
+    /// Prototype masks for instance segmentation [batch, protos, H, W]
+    Protos = 3,
+    /// Segmentation mask output
+    Segmentation = 4,
+    /// Mask coefficients for instance segmentation
+    MaskCoefficients = 5,
+    /// Raw mask output
+    Mask = 6,
+    /// Class indices for end-to-end split models [batch, N, 1]
+    Classes = 7,
+}
+
+/// Decoder framework type.
+///
+/// Identifies the model framework that produced the output tensors.
+///
+/// @see hal_decoder_params_add_output
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HalDecoderType {
+    /// Ultralytics YOLO models (YOLOv5, YOLOv8, YOLO11, YOLO26)
+    Ultralytics = 0,
+    /// Au-Zone ModelPack models
+    ModelPack = 1,
+}
+
+impl From<HalDecoderType> for configs::DecoderType {
+    fn from(dt: HalDecoderType) -> Self {
+        match dt {
+            HalDecoderType::Ultralytics => configs::DecoderType::Ultralytics,
+            HalDecoderType::ModelPack => configs::DecoderType::ModelPack,
+        }
+    }
+}
+
+/// Decoder version for Ultralytics models.
+///
+/// Determines the YOLO architecture version and decoding strategy.
+///
+/// @see hal_decoder_params_set_decoder_version
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HalDecoderVersion {
+    /// YOLOv5 - anchor-based decoder, requires external NMS
+    Yolov5 = 0,
+    /// YOLOv8 - anchor-free DFL decoder, requires external NMS
+    Yolov8 = 1,
+    /// YOLO11 - anchor-free DFL decoder, requires external NMS
+    Yolo11 = 2,
+    /// YOLO26 - end-to-end model with embedded NMS
+    Yolo26 = 3,
+}
+
+impl From<HalDecoderVersion> for configs::DecoderVersion {
+    fn from(v: HalDecoderVersion) -> Self {
+        match v {
+            HalDecoderVersion::Yolov5 => configs::DecoderVersion::Yolov5,
+            HalDecoderVersion::Yolov8 => configs::DecoderVersion::Yolov8,
+            HalDecoderVersion::Yolo11 => configs::DecoderVersion::Yolo11,
+            HalDecoderVersion::Yolo26 => configs::DecoderVersion::Yolo26,
+        }
+    }
+}
+
+/// Named dimension for tensor shapes.
+///
+/// Assigns a semantic name to each dimension in a tensor shape, allowing the
+/// decoder to handle different tensor layouts (NCHW vs NHWC, etc.).
+///
+/// Pass an array of these alongside shape values in
+/// `hal_decoder_params_add_output()`, or pass NULL for unnamed shapes.
+///
+/// @see hal_decoder_params_add_output
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HalDimName {
+    /// Batch dimension
+    Batch = 0,
+    /// Height spatial dimension
+    Height = 1,
+    /// Width spatial dimension
+    Width = 2,
+    /// Number of object classes
+    NumClasses = 3,
+    /// Number of features (e.g. 4 box coords + num_classes + mask_coeffs)
+    NumFeatures = 4,
+    /// Number of detection boxes / proposals
+    NumBoxes = 5,
+    /// Number of prototype masks
+    NumProtos = 6,
+    /// Number of anchors multiplied by features (ModelPack split)
+    NumAnchorsXFeatures = 7,
+    /// Padding dimension
+    Padding = 8,
+    /// Box coordinate dimension (typically 4)
+    BoxCoords = 9,
+}
+
+impl From<HalDimName> for configs::DimName {
+    fn from(d: HalDimName) -> Self {
+        match d {
+            HalDimName::Batch => configs::DimName::Batch,
+            HalDimName::Height => configs::DimName::Height,
+            HalDimName::Width => configs::DimName::Width,
+            HalDimName::NumClasses => configs::DimName::NumClasses,
+            HalDimName::NumFeatures => configs::DimName::NumFeatures,
+            HalDimName::NumBoxes => configs::DimName::NumBoxes,
+            HalDimName::NumProtos => configs::DimName::NumProtos,
+            HalDimName::NumAnchorsXFeatures => configs::DimName::NumAnchorsXFeatures,
+            HalDimName::Padding => configs::DimName::Padding,
+            HalDimName::BoxCoords => configs::DimName::BoxCoords,
+        }
+    }
+}
+
+/// Opaque decoder construction parameters.
 ///
 /// Configures how ML model outputs are decoded into detection boxes and
-/// segmentation masks. Obtain defaults with `hal_decoder_params_default()`,
-/// set the desired fields, then pass to `hal_decoder_new()`.
+/// segmentation masks. Create with `hal_decoder_params_new()`, configure
+/// with setter functions, then pass to `hal_decoder_new()`.
 ///
-/// @section dp_config Configuration Source (exactly one required)
+/// Configuration can be provided in two ways (mutually exclusive):
+/// 1. From a file or string: `hal_decoder_params_set_config_file()`,
+///    `hal_decoder_params_set_config_json()`, or
+///    `hal_decoder_params_set_config_yaml()`
+/// 2. Programmatically: `hal_decoder_params_add_output()` to define each
+///    model output tensor
 ///
-/// Exactly one of `config_json`, `config_yaml`, or `config_file` must be
-/// non-NULL. These are mutually exclusive; setting more than one causes
-/// `hal_decoder_new()` to fail with EINVAL. The configuration describes the
-/// model output layout so the decoder knows how to interpret raw tensors.
-///
-/// @section dp_thresholds Threshold Tuning
-///
-/// `score_threshold` and `iou_threshold` control post-processing filtering:
-/// - **score_threshold** (default 0.5): detections with confidence below this
-///   value are discarded. Lower values yield more detections (higher recall),
-///   higher values yield fewer but more confident detections (higher precision).
-/// - **iou_threshold** (default 0.5): during NMS, box pairs with
-///   Intersection-over-Union above this value are candidates for suppression.
-///   Lower values suppress more aggressively.
-///
-/// @section dp_usage Basic Usage
+/// @section dp_programmatic Programmatic Configuration
 /// @code{.c}
-/// // Minimal: create a decoder from an inline JSON config
-/// struct hal_decoder_params params = hal_decoder_params_default();
-/// params.config_json = "{\"outputs\":[{\"decoder\":\"ultralytics\","
-///                       "\"type\":\"detection\",\"shape\":[1,84,8400],"
-///                       "\"dshape\":[[\"batch\",1],[\"num_features\",84],"
-///                       "[\"num_boxes\",8400]]}],\"nms\":\"class_aware\"}";
-/// params.score_threshold = 0.25f;
-/// struct hal_decoder* decoder = hal_decoder_new(&params);
+/// hal_decoder_params *params = hal_decoder_params_new();
+///
+/// size_t scores_shape[] = {1, 80, 8400};
+/// enum hal_dim_name scores_dims[] = {HAL_DIM_BATCH, HAL_DIM_NUM_CLASSES,
+///                                     HAL_DIM_NUM_BOXES};
+/// int s = hal_decoder_params_add_output(params, HAL_OUTPUT_SCORES,
+///             HAL_DECODER_ULTRALYTICS, scores_shape, scores_dims, 3);
+/// hal_decoder_params_output_set_quantization(params, s, 0.003906f, 0);
+///
+/// size_t boxes_shape[] = {1, 4, 8400};
+/// enum hal_dim_name boxes_dims[] = {HAL_DIM_BATCH, HAL_DIM_BOX_COORDS,
+///                                    HAL_DIM_NUM_BOXES};
+/// int b = hal_decoder_params_add_output(params, HAL_OUTPUT_BOXES,
+///             HAL_DECODER_ULTRALYTICS, boxes_shape, boxes_dims, 3);
+/// hal_decoder_params_output_set_quantization(params, b, 0.019824f, 0);
+///
+/// hal_decoder_params_set_nms(params, HAL_NMS_CLASS_AGNOSTIC);
+/// hal_decoder *decoder = hal_decoder_new(params);
+/// hal_decoder_params_free(params);
 /// @endcode
 ///
-/// @section dp_file Loading from a File
+/// @section dp_file File-based Configuration
 /// @code{.c}
-/// // Load decoder config from an edgefirst.json or edgefirst.yaml file
-/// struct hal_decoder_params params = hal_decoder_params_default();
-/// params.config_file = "/path/to/edgefirst.json";
-/// params.score_threshold = 0.3f;
-/// params.iou_threshold  = 0.45f;
-/// params.nms = HAL_NMS_CLASS_AWARE;
-/// struct hal_decoder* decoder = hal_decoder_new(&params);
+/// hal_decoder_params *params = hal_decoder_params_new();
+/// hal_decoder_params_set_config_file(params, "/models/yolov8n/edgefirst.yaml");
+/// hal_decoder_params_set_score_threshold(params, 0.25f);
+/// hal_decoder *decoder = hal_decoder_new(params);
+/// hal_decoder_params_free(params);
 /// @endcode
 ///
-/// @section dp_metadata EdgeFirst Model Metadata
-///
-/// EdgeFirst models ship with an `edgefirst.json` (or `edgefirst.yaml`)
-/// metadata file that fully describes the model's output layout, decoder
-/// type, and recommended post-processing settings. Pass this file directly
-/// via `config_file` to auto-configure the decoder:
-///
-/// @code{.c}
-/// // Auto-configure from EdgeFirst model metadata.
-/// // The metadata file contains the outputs array, decoder type
-/// // (ultralytics / modelpack), shapes, and NMS settings.
-/// //
-/// // Example edgefirst.yaml:
-/// //   outputs:
-/// //     - decoder: ultralytics
-/// //       type: detection
-/// //       shape: [1, 84, 8400]
-/// //       dshape: [[batch, 1], [num_features, 84], [num_boxes, 8400]]
-/// //   nms: class_agnostic
-/// //   validation:
-/// //     iou: 0.7
-/// //     score: 0.001
-/// //
-/// struct hal_decoder_params params = hal_decoder_params_default();
-/// params.config_file = "/models/yolov8n/edgefirst.yaml";
-///
-/// // Optionally override the metadata's recommended thresholds
-/// // for your application's precision/recall needs:
-/// params.score_threshold = 0.4f;
-///
-/// struct hal_decoder* decoder = hal_decoder_new(&params);
-/// if (!decoder) {
-///     fprintf(stderr, "decoder init failed: %s\n", strerror(errno));
-/// }
-/// @endcode
-///
-/// @see hal_decoder_params_default, hal_decoder_new, hal_nms
-#[repr(C)]
+/// @see hal_decoder_params_new, hal_decoder_params_free, hal_decoder_new
 pub struct HalDecoderParams {
-    /// JSON configuration string (NUL-terminated).
-    ///
-    /// Mutually exclusive with `config_yaml` and `config_file`.
-    /// The string is copied internally; the caller may free the buffer
-    /// after `hal_decoder_new()` returns.
-    ///
-    /// This should contain the EdgeFirst model metadata JSON, or at minimum
-    /// the `outputs` array describing the model's output tensors. Example:
-    /// @code{.c}
-    /// params.config_json = "{\"outputs\":[{\"decoder\":\"ultralytics\","
-    ///                       "\"type\":\"detection\",\"shape\":[1,84,8400],"
-    ///                       "\"dshape\":[[\"batch\",1],[\"num_features\",84],"
-    ///                       "[\"num_boxes\",8400]]}]}";
-    /// @endcode
-    pub config_json: *const c_char,
-    /// YAML configuration string (NUL-terminated).
-    ///
-    /// Mutually exclusive with `config_json` and `config_file`.
-    /// The string is copied internally; the caller may free the buffer
-    /// after `hal_decoder_new()` returns.
-    pub config_yaml: *const c_char,
-    /// Path to a configuration file (NUL-terminated).
-    ///
-    /// Mutually exclusive with `config_json` and `config_yaml`.
-    /// The file is read and the path string copied during `hal_decoder_new()`;
-    /// both may be freed after the call returns.
-    ///
-    /// The format is auto-detected: files ending in `.json` or starting with
-    /// `{` are parsed as JSON; everything else is parsed as YAML. This makes
-    /// it straightforward to point at an EdgeFirst model's `edgefirst.json`
-    /// or `edgefirst.yaml` metadata file.
-    pub config_file: *const c_char,
-    /// Score threshold for filtering detections (default: 0.5).
-    ///
-    /// Detections with confidence scores below this value are discarded
-    /// before NMS. Range: 0.0 to 1.0.
-    ///
-    /// Typical values:
-    /// - 0.001 -- 0.01: evaluation / mAP benchmarking (keep nearly all boxes)
-    /// - 0.25  -- 0.5:  general-purpose inference
-    /// - 0.5   -- 0.8:  high-confidence-only applications
-    pub score_threshold: f32,
-    /// IOU (Intersection-over-Union) threshold for NMS (default: 0.5).
-    ///
-    /// During NMS, if two boxes overlap with IOU above this threshold the
-    /// lower-scoring box is suppressed. Range: 0.0 to 1.0.
-    ///
-    /// Typical values:
-    /// - 0.45 -- 0.5: standard object detection
-    /// - 0.6  -- 0.7: when objects frequently overlap (e.g. dense crowds)
-    pub iou_threshold: f32,
-    /// NMS (Non-Maximum Suppression) mode (default: HAL_NMS_CLASS_AGNOSTIC).
-    ///
-    /// @see hal_nms for available modes and when to use each one.
-    pub nms: HalNms,
+    outputs: Vec<ConfigOutput>,
+    config_json: Option<String>,
+    config_yaml: Option<String>,
+    config_file: Option<String>,
+    score_threshold: f32,
+    iou_threshold: f32,
+    nms: Option<configs::Nms>,
+    decoder_version: Option<configs::DecoderVersion>,
 }
 
 /// Opaque decoder type.
@@ -263,58 +307,441 @@ pub struct HalSegmentationList {
 // Decoder Params Functions
 // ============================================================================
 
-/// Create default decoder parameters.
+/// Create new decoder parameters.
 ///
-/// Returns a `hal_decoder_params` struct initialized with safe defaults:
+/// Returns an opaque handle initialized with safe defaults:
 ///
-/// | Field | Default |
-/// |-------|---------|
-/// | config_json | NULL |
-/// | config_yaml | NULL |
-/// | config_file | NULL |
+/// | Setting | Default |
+/// |---------|---------|
 /// | score_threshold | 0.5 |
 /// | iou_threshold | 0.5 |
 /// | nms | HAL_NMS_CLASS_AGNOSTIC |
 ///
-/// The caller must set exactly one configuration source (`config_json`,
-/// `config_yaml`, or `config_file`) before passing to `hal_decoder_new()`.
-/// All other fields may be left at their defaults or overridden.
+/// The caller must configure outputs (via `hal_decoder_params_add_output()`,
+/// `hal_decoder_params_set_config_file()`, `hal_decoder_params_set_config_json()`,
+/// or `hal_decoder_params_set_config_yaml()`) before passing to
+/// `hal_decoder_new()`. Free with `hal_decoder_params_free()` after use.
 ///
-/// @return Default decoder parameters (by value)
+/// @return New params handle, or NULL on allocation failure
 ///
 /// @par Example
 /// @code{.c}
-/// struct hal_decoder_params params = hal_decoder_params_default();
-/// params.config_file = "edgefirst.yaml";
-/// params.score_threshold = 0.3f;
-/// struct hal_decoder* decoder = hal_decoder_new(&params);
+/// hal_decoder_params *params = hal_decoder_params_new();
+/// hal_decoder_params_set_config_file(params, "edgefirst.yaml");
+/// hal_decoder_params_set_score_threshold(params, 0.3f);
+/// hal_decoder *decoder = hal_decoder_new(params);
+/// hal_decoder_params_free(params);
 /// @endcode
+///
+/// @see hal_decoder_params_free, hal_decoder_new
 #[no_mangle]
-pub extern "C" fn hal_decoder_params_default() -> HalDecoderParams {
-    HalDecoderParams {
-        config_json: std::ptr::null(),
-        config_yaml: std::ptr::null(),
-        config_file: std::ptr::null(),
+pub extern "C" fn hal_decoder_params_new() -> *mut HalDecoderParams {
+    Box::into_raw(Box::new(HalDecoderParams {
+        outputs: Vec::new(),
+        config_json: None,
+        config_yaml: None,
+        config_file: None,
         score_threshold: 0.5,
         iou_threshold: 0.5,
-        nms: HalNms::ClassAgnostic,
+        nms: Some(configs::Nms::ClassAgnostic),
+        decoder_version: None,
+    }))
+}
+
+/// Free decoder parameters.
+///
+/// @param params Params handle to free (can be NULL, no-op)
+///
+/// @see hal_decoder_params_new
+#[no_mangle]
+pub unsafe extern "C" fn hal_decoder_params_free(params: *mut HalDecoderParams) {
+    if !params.is_null() {
+        drop(Box::from_raw(params));
     }
+}
+
+/// Set decoder configuration from a JSON string.
+///
+/// @param params Params handle
+/// @param json   JSON string (null-terminated)
+/// @param len    String length in bytes (excluding null terminator),
+///               or 0 to use strlen
+/// @return 0 on success, -1 on error (errno = EINVAL)
+///
+/// @see hal_decoder_params_set_config_yaml, hal_decoder_params_set_config_file
+#[no_mangle]
+pub unsafe extern "C" fn hal_decoder_params_set_config_json(
+    params: *mut HalDecoderParams,
+    json: *const c_char,
+    len: size_t,
+) -> c_int {
+    check_null!(params, json);
+    let s = if len == 0 {
+        match CStr::from_ptr(json).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return set_error(libc::EINVAL),
+        }
+    } else {
+        let bytes = std::slice::from_raw_parts(json as *const u8, len);
+        match std::str::from_utf8(bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => return set_error(libc::EINVAL),
+        }
+    };
+    (*params).config_json = Some(s);
+    0
+}
+
+/// Set decoder configuration from a YAML string.
+///
+/// @param params Params handle
+/// @param yaml   YAML string (null-terminated)
+/// @param len    String length in bytes (excluding null terminator),
+///               or 0 to use strlen
+/// @return 0 on success, -1 on error (errno = EINVAL)
+///
+/// @see hal_decoder_params_set_config_json, hal_decoder_params_set_config_file
+#[no_mangle]
+pub unsafe extern "C" fn hal_decoder_params_set_config_yaml(
+    params: *mut HalDecoderParams,
+    yaml: *const c_char,
+    len: size_t,
+) -> c_int {
+    check_null!(params, yaml);
+    let s = if len == 0 {
+        match CStr::from_ptr(yaml).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return set_error(libc::EINVAL),
+        }
+    } else {
+        let bytes = std::slice::from_raw_parts(yaml as *const u8, len);
+        match std::str::from_utf8(bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => return set_error(libc::EINVAL),
+        }
+    };
+    (*params).config_yaml = Some(s);
+    0
+}
+
+/// Set decoder configuration from a file path.
+///
+/// The file is read when `hal_decoder_new()` is called, not immediately.
+/// JSON and YAML are auto-detected from the file extension and content.
+///
+/// @param params Params handle
+/// @param path   File path (null-terminated)
+/// @return 0 on success, -1 on error (errno = EINVAL)
+///
+/// @see hal_decoder_params_set_config_json, hal_decoder_params_set_config_yaml
+#[no_mangle]
+pub unsafe extern "C" fn hal_decoder_params_set_config_file(
+    params: *mut HalDecoderParams,
+    path: *const c_char,
+) -> c_int {
+    check_null!(params, path);
+    let s = match CStr::from_ptr(path).to_str() {
+        Ok(s) => s.to_string(),
+        Err(_) => return set_error(libc::EINVAL),
+    };
+    (*params).config_file = Some(s);
+    0
+}
+
+/// Add a model output tensor to the decoder configuration.
+///
+/// Builds the output configuration programmatically. Each call adds one
+/// output tensor description. The decoder resolves the model type
+/// automatically from the combination of outputs.
+///
+/// @param params  Params handle
+/// @param type_   Output tensor role (scores, boxes, detection, etc.)
+/// @param decoder Framework that produced the model (ultralytics, modelpack)
+/// @param shape   Array of dimension sizes (length = ndim)
+/// @param dims    Array of dimension names (length = ndim), or NULL for
+///                unnamed dimensions. When non-NULL, named dimensions
+///                (dshape) are stored and shape is derived from them.
+/// @param ndim    Number of dimensions
+/// @return Output index (>= 0) on success, -1 on error (errno = EINVAL)
+///
+/// @par Example
+/// @code{.c}
+/// size_t shape[] = {1, 80, 8400};
+/// enum hal_dim_name dims[] = {HAL_DIM_BATCH, HAL_DIM_NUM_CLASSES,
+///                              HAL_DIM_NUM_BOXES};
+/// int idx = hal_decoder_params_add_output(params, HAL_OUTPUT_SCORES,
+///               HAL_DECODER_ULTRALYTICS, shape, dims, 3);
+/// @endcode
+///
+/// @see hal_decoder_params_output_set_quantization
+#[no_mangle]
+pub unsafe extern "C" fn hal_decoder_params_add_output(
+    params: *mut HalDecoderParams,
+    type_: HalOutputType,
+    decoder: HalDecoderType,
+    shape: *const size_t,
+    dims: *const HalDimName,
+    ndim: size_t,
+) -> c_int {
+    if params.is_null() || shape.is_null() || ndim == 0 {
+        errno::set_errno(errno::Errno(libc::EINVAL));
+        return -1;
+    }
+
+    let shape_slice = std::slice::from_raw_parts(shape, ndim);
+    let shape_vec: Vec<usize> = shape_slice.to_vec();
+    let decoder_type: configs::DecoderType = decoder.into();
+
+    let dshape: Vec<(configs::DimName, usize)> = if !dims.is_null() {
+        let dims_slice = std::slice::from_raw_parts(dims, ndim);
+        dims_slice
+            .iter()
+            .zip(shape_slice.iter())
+            .map(|(d, s)| ((*d).into(), *s))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // If dshape is non-empty, shape will be derived from it by normalize_output.
+    // If dshape is empty, use the provided shape directly.
+    let output = match type_ {
+        HalOutputType::Detection => ConfigOutput::Detection(configs::Detection {
+            decoder: decoder_type,
+            shape: shape_vec,
+            dshape,
+            ..Default::default()
+        }),
+        HalOutputType::Boxes => ConfigOutput::Boxes(configs::Boxes {
+            decoder: decoder_type,
+            shape: shape_vec,
+            dshape,
+            ..Default::default()
+        }),
+        HalOutputType::Scores => ConfigOutput::Scores(configs::Scores {
+            decoder: decoder_type,
+            shape: shape_vec,
+            dshape,
+            ..Default::default()
+        }),
+        HalOutputType::Protos => ConfigOutput::Protos(configs::Protos {
+            decoder: decoder_type,
+            shape: shape_vec,
+            dshape,
+            ..Default::default()
+        }),
+        HalOutputType::Segmentation => ConfigOutput::Segmentation(configs::Segmentation {
+            decoder: decoder_type,
+            shape: shape_vec,
+            dshape,
+            ..Default::default()
+        }),
+        HalOutputType::MaskCoefficients => {
+            ConfigOutput::MaskCoefficients(configs::MaskCoefficients {
+                decoder: decoder_type,
+                shape: shape_vec,
+                dshape,
+                ..Default::default()
+            })
+        }
+        HalOutputType::Mask => ConfigOutput::Mask(configs::Mask {
+            decoder: decoder_type,
+            shape: shape_vec,
+            dshape,
+            ..Default::default()
+        }),
+        HalOutputType::Classes => ConfigOutput::Classes(configs::Classes {
+            decoder: decoder_type,
+            shape: shape_vec,
+            dshape,
+            ..Default::default()
+        }),
+    };
+
+    let p = &mut *params;
+    p.outputs.push(output);
+    (p.outputs.len() - 1) as c_int
+}
+
+/// Set quantization parameters on an output by index.
+///
+/// @param params     Params handle
+/// @param index      Output index (returned by `hal_decoder_params_add_output`)
+/// @param scale      Quantization scale
+/// @param zero_point Quantization zero point
+/// @return 0 on success, -1 on error (errno = EINVAL)
+///
+/// @see hal_decoder_params_add_output
+#[no_mangle]
+pub unsafe extern "C" fn hal_decoder_params_output_set_quantization(
+    params: *mut HalDecoderParams,
+    index: c_int,
+    scale: f32,
+    zero_point: c_int,
+) -> c_int {
+    check_null!(params);
+    let p = &mut *params;
+    let idx = index as usize;
+    if idx >= p.outputs.len() {
+        return set_error(libc::EINVAL);
+    }
+    let quant = Some(configs::QuantTuple(scale, zero_point));
+    match &mut p.outputs[idx] {
+        ConfigOutput::Detection(c) => c.quantization = quant,
+        ConfigOutput::Boxes(c) => c.quantization = quant,
+        ConfigOutput::Scores(c) => c.quantization = quant,
+        ConfigOutput::Protos(c) => c.quantization = quant,
+        ConfigOutput::Segmentation(c) => c.quantization = quant,
+        ConfigOutput::MaskCoefficients(c) => c.quantization = quant,
+        ConfigOutput::Mask(c) => c.quantization = quant,
+        ConfigOutput::Classes(c) => c.quantization = quant,
+    }
+    0
+}
+
+/// Set anchor boxes on a detection output by index.
+///
+/// Only valid for `HAL_OUTPUT_DETECTION` outputs.
+///
+/// @param params      Params handle
+/// @param index       Output index (returned by `hal_decoder_params_add_output`)
+/// @param anchors     Array of [width, height] anchor pairs
+/// @param num_anchors Number of anchor pairs
+/// @return 0 on success, -1 on error (errno = EINVAL)
+///
+/// @see hal_decoder_params_add_output
+#[no_mangle]
+pub unsafe extern "C" fn hal_decoder_params_output_set_anchors(
+    params: *mut HalDecoderParams,
+    index: c_int,
+    anchors: *const [f32; 2],
+    num_anchors: size_t,
+) -> c_int {
+    check_null!(params, anchors);
+    let p = &mut *params;
+    let idx = index as usize;
+    if idx >= p.outputs.len() {
+        return set_error(libc::EINVAL);
+    }
+    let anchors_vec: Vec<[f32; 2]> = std::slice::from_raw_parts(anchors, num_anchors).to_vec();
+    match &mut p.outputs[idx] {
+        ConfigOutput::Detection(c) => c.anchors = Some(anchors_vec),
+        _ => return set_error(libc::EINVAL),
+    }
+    0
+}
+
+/// Set the normalized flag on a detection or boxes output by index.
+///
+/// Only valid for `HAL_OUTPUT_DETECTION` and `HAL_OUTPUT_BOXES` outputs.
+///
+/// @param params     Params handle
+/// @param index      Output index (returned by `hal_decoder_params_add_output`)
+/// @param normalized Non-zero for normalized [0,1] coordinates, 0 for pixel
+/// @return 0 on success, -1 on error (errno = EINVAL)
+///
+/// @see hal_decoder_params_add_output
+#[no_mangle]
+pub unsafe extern "C" fn hal_decoder_params_output_set_normalized(
+    params: *mut HalDecoderParams,
+    index: c_int,
+    normalized: c_int,
+) -> c_int {
+    check_null!(params);
+    let p = &mut *params;
+    let idx = index as usize;
+    if idx >= p.outputs.len() {
+        return set_error(libc::EINVAL);
+    }
+    let norm = Some(normalized != 0);
+    match &mut p.outputs[idx] {
+        ConfigOutput::Detection(c) => c.normalized = norm,
+        ConfigOutput::Boxes(c) => c.normalized = norm,
+        _ => return set_error(libc::EINVAL),
+    }
+    0
+}
+
+/// Set the score threshold.
+///
+/// Detections with confidence below this threshold are discarded.
+///
+/// @param params Params handle
+/// @param threshold Score threshold (default: 0.5)
+/// @return 0 on success, -1 on error (errno = EINVAL)
+#[no_mangle]
+pub unsafe extern "C" fn hal_decoder_params_set_score_threshold(
+    params: *mut HalDecoderParams,
+    threshold: f32,
+) -> c_int {
+    check_null!(params);
+    (*params).score_threshold = threshold;
+    0
+}
+
+/// Set the IoU (Intersection over Union) threshold for NMS.
+///
+/// @param params Params handle
+/// @param threshold IoU threshold (default: 0.5)
+/// @return 0 on success, -1 on error (errno = EINVAL)
+#[no_mangle]
+pub unsafe extern "C" fn hal_decoder_params_set_iou_threshold(
+    params: *mut HalDecoderParams,
+    threshold: f32,
+) -> c_int {
+    check_null!(params);
+    (*params).iou_threshold = threshold;
+    0
+}
+
+/// Set the NMS (Non-Maximum Suppression) mode.
+///
+/// @param params Params handle
+/// @param nms NMS mode
+/// @return 0 on success, -1 on error (errno = EINVAL)
+///
+/// @see HalNms
+#[no_mangle]
+pub unsafe extern "C" fn hal_decoder_params_set_nms(
+    params: *mut HalDecoderParams,
+    nms: HalNms,
+) -> c_int {
+    check_null!(params);
+    (*params).nms = nms.into();
+    0
+}
+
+/// Set the decoder version for Ultralytics models.
+///
+/// Determines the YOLO architecture version and decoding strategy.
+///
+/// @param params  Params handle
+/// @param version Decoder version
+/// @return 0 on success, -1 on error (errno = EINVAL)
+///
+/// @see HalDecoderVersion
+#[no_mangle]
+pub unsafe extern "C" fn hal_decoder_params_set_decoder_version(
+    params: *mut HalDecoderParams,
+    version: HalDecoderVersion,
+) -> c_int {
+    check_null!(params);
+    (*params).decoder_version = Some(version.into());
+    0
 }
 
 /// Create a new decoder from parameters.
 ///
 /// Validates the parameters and constructs a decoder ready for use with
-/// `hal_decoder_decode()`. Exactly one of `params->config_json`,
-/// `params->config_yaml`, or `params->config_file` must be non-NULL.
+/// `hal_decoder_decode()`. Configuration must be provided either via
+/// `hal_decoder_params_add_output()` (programmatic) or via one of the
+/// config file/string setters (mutually exclusive).
 ///
-/// All strings are copied internally; the caller may free their buffers
-/// immediately after this call returns.
-///
-/// @param params Pointer to decoder parameters (must not be NULL)
+/// @param params Params handle (must not be NULL)
 /// @return New decoder handle on success, NULL on error (errno set)
 ///
 /// @par Errors (errno):
-/// - EINVAL: NULL params, no config source set, or multiple config sources set
+/// - EINVAL: NULL params or no configuration provided
 /// - ENOENT: Config file path does not exist
 /// - EIO: Config file could not be read
 /// - EBADMSG: Configuration is syntactically valid but semantically invalid
@@ -322,36 +749,39 @@ pub extern "C" fn hal_decoder_params_default() -> HalDecoderParams {
 ///
 /// @par Example
 /// @code{.c}
-/// struct hal_decoder_params params = hal_decoder_params_default();
-/// params.config_file = "/models/yolov8n/edgefirst.yaml";
-/// params.score_threshold = 0.25f;
-/// params.iou_threshold  = 0.45f;
-/// params.nms = HAL_NMS_CLASS_AWARE;
+/// hal_decoder_params *params = hal_decoder_params_new();
+/// hal_decoder_params_set_config_file(params, "/models/yolov8n/edgefirst.yaml");
+/// hal_decoder_params_set_score_threshold(params, 0.25f);
+/// hal_decoder_params_set_iou_threshold(params, 0.45f);
+/// hal_decoder_params_set_nms(params, HAL_NMS_CLASS_AWARE);
 ///
-/// struct hal_decoder* decoder = hal_decoder_new(&params);
+/// hal_decoder *decoder = hal_decoder_new(params);
 /// if (!decoder) {
 ///     fprintf(stderr, "decoder: %s\n", strerror(errno));
+///     hal_decoder_params_free(params);
 ///     return -1;
 /// }
 ///
 /// // ... use decoder with hal_decoder_decode() ...
 ///
+/// hal_decoder_params_free(params);
 /// hal_decoder_free(decoder);
 /// @endcode
 ///
-/// @see hal_decoder_params_default, hal_decoder_free, hal_decoder_decode
+/// @see hal_decoder_params_new, hal_decoder_params_free, hal_decoder_free
 #[no_mangle]
 pub unsafe extern "C" fn hal_decoder_new(params: *const HalDecoderParams) -> *mut HalDecoder {
     check_null_ret_null!(params);
 
     let p = &*params;
 
-    let has_json = !p.config_json.is_null();
-    let has_yaml = !p.config_yaml.is_null();
-    let has_file = !p.config_file.is_null();
+    let has_outputs = !p.outputs.is_empty();
+    let has_json = p.config_json.is_some();
+    let has_yaml = p.config_yaml.is_some();
+    let has_file = p.config_file.is_some();
 
-    // Exactly one config source must be set
-    let config_count = has_json as u8 + has_yaml as u8 + has_file as u8;
+    // Must have exactly one config source
+    let config_count = has_outputs as u8 + has_json as u8 + has_yaml as u8 + has_file as u8;
     if config_count != 1 {
         errno::set_errno(errno::Errno(libc::EINVAL));
         return std::ptr::null_mut();
@@ -360,34 +790,21 @@ pub unsafe extern "C" fn hal_decoder_new(params: *const HalDecoderParams) -> *mu
     let mut builder = DecoderBuilder::new()
         .with_score_threshold(p.score_threshold)
         .with_iou_threshold(p.iou_threshold)
-        .with_nms(p.nms.into());
+        .with_nms(p.nms);
 
-    if has_json {
-        let json = match CStr::from_ptr(p.config_json).to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => {
-                errno::set_errno(errno::Errno(libc::EINVAL));
-                return std::ptr::null_mut();
-            }
-        };
-        builder = builder.with_config_json_str(json);
+    if has_outputs {
+        for output in &p.outputs {
+            builder = builder.add_output(output.clone());
+        }
+        if let Some(version) = p.decoder_version {
+            builder = builder.with_decoder_version(version);
+        }
+    } else if has_json {
+        builder = builder.with_config_json_str(p.config_json.clone().unwrap());
     } else if has_yaml {
-        let yaml = match CStr::from_ptr(p.config_yaml).to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => {
-                errno::set_errno(errno::Errno(libc::EINVAL));
-                return std::ptr::null_mut();
-            }
-        };
-        builder = builder.with_config_yaml_str(yaml);
+        builder = builder.with_config_yaml_str(p.config_yaml.clone().unwrap());
     } else {
-        let path_str = match CStr::from_ptr(p.config_file).to_str() {
-            Ok(s) => s,
-            Err(_) => {
-                errno::set_errno(errno::Errno(libc::EINVAL));
-                return std::ptr::null_mut();
-            }
-        };
+        let path_str = p.config_file.as_ref().unwrap();
 
         let content = match std::fs::read_to_string(path_str) {
             Ok(c) => c,
@@ -997,23 +1414,28 @@ mod tests {
 nms: class_aware
 "#;
 
-    /// Helper: create a decoder from JSON config with optional overrides.
+    /// Helper: create a decoder from JSON config.
     unsafe fn make_decoder_json(json: &str) -> *mut HalDecoder {
         let config = CString::new(json).unwrap();
-        let mut params = hal_decoder_params_default();
-        params.config_json = config.as_ptr();
-        hal_decoder_new(&params)
+        let params = hal_decoder_params_new();
+        hal_decoder_params_set_config_json(params, config.as_ptr(), 0);
+        let decoder = hal_decoder_new(params);
+        hal_decoder_params_free(params);
+        decoder
     }
 
     #[test]
-    fn test_params_default() {
-        let params = hal_decoder_params_default();
-        assert!(params.config_json.is_null());
-        assert!(params.config_yaml.is_null());
-        assert!(params.config_file.is_null());
-        assert!((params.score_threshold - 0.5).abs() < f32::EPSILON);
-        assert!((params.iou_threshold - 0.5).abs() < f32::EPSILON);
-        assert_eq!(params.nms, HalNms::ClassAgnostic);
+    fn test_params_new_free() {
+        unsafe {
+            let params = hal_decoder_params_new();
+            assert!(!params.is_null());
+            // No config set → decoder should fail
+            let decoder = hal_decoder_new(params);
+            assert!(decoder.is_null());
+            hal_decoder_params_free(params);
+            // NULL free is safe
+            hal_decoder_params_free(std::ptr::null_mut());
+        }
     }
 
     #[test]
@@ -1075,11 +1497,12 @@ nms: class_aware
     fn test_decoder_new_with_json() {
         unsafe {
             let config = CString::new(YOLO_JSON_CONFIG).unwrap();
-            let mut params = hal_decoder_params_default();
-            params.config_json = config.as_ptr();
+            let params = hal_decoder_params_new();
+            hal_decoder_params_set_config_json(params, config.as_ptr(), 0);
 
-            let decoder = hal_decoder_new(&params);
+            let decoder = hal_decoder_new(params);
             assert!(!decoder.is_null());
+            hal_decoder_params_free(params);
             hal_decoder_free(decoder);
         }
     }
@@ -1088,11 +1511,12 @@ nms: class_aware
     fn test_decoder_new_with_yaml() {
         unsafe {
             let config = CString::new(YOLO_YAML_CONFIG).unwrap();
-            let mut params = hal_decoder_params_default();
-            params.config_yaml = config.as_ptr();
+            let params = hal_decoder_params_new();
+            hal_decoder_params_set_config_yaml(params, config.as_ptr(), 0);
 
-            let decoder = hal_decoder_new(&params);
+            let decoder = hal_decoder_new(params);
             assert!(!decoder.is_null());
+            hal_decoder_params_free(params);
             hal_decoder_free(decoder);
         }
     }
@@ -1101,14 +1525,15 @@ nms: class_aware
     fn test_decoder_new_with_thresholds() {
         unsafe {
             let config = CString::new(YOLO_JSON_CONFIG).unwrap();
-            let mut params = hal_decoder_params_default();
-            params.config_json = config.as_ptr();
-            params.score_threshold = 0.3;
-            params.iou_threshold = 0.45;
-            params.nms = HalNms::ClassAware;
+            let params = hal_decoder_params_new();
+            hal_decoder_params_set_config_json(params, config.as_ptr(), 0);
+            hal_decoder_params_set_score_threshold(params, 0.3);
+            hal_decoder_params_set_iou_threshold(params, 0.45);
+            hal_decoder_params_set_nms(params, HalNms::ClassAware);
 
-            let decoder = hal_decoder_new(&params);
+            let decoder = hal_decoder_new(params);
             assert!(!decoder.is_null());
+            hal_decoder_params_free(params);
             hal_decoder_free(decoder);
         }
     }
@@ -1123,10 +1548,10 @@ nms: class_aware
     #[test]
     fn test_decoder_new_no_config() {
         unsafe {
-            // All config pointers NULL → EINVAL
-            let params = hal_decoder_params_default();
-            let decoder = hal_decoder_new(&params);
+            let params = hal_decoder_params_new();
+            let decoder = hal_decoder_new(params);
             assert!(decoder.is_null());
+            hal_decoder_params_free(params);
         }
     }
 
@@ -1136,12 +1561,344 @@ nms: class_aware
             let json = CString::new(YOLO_JSON_CONFIG).unwrap();
             let yaml = CString::new(YOLO_YAML_CONFIG).unwrap();
 
-            let mut params = hal_decoder_params_default();
-            params.config_json = json.as_ptr();
-            params.config_yaml = yaml.as_ptr();
+            let params = hal_decoder_params_new();
+            hal_decoder_params_set_config_json(params, json.as_ptr(), 0);
+            hal_decoder_params_set_config_yaml(params, yaml.as_ptr(), 0);
 
-            let decoder = hal_decoder_new(&params);
+            let decoder = hal_decoder_new(params);
             assert!(decoder.is_null());
+            hal_decoder_params_free(params);
+        }
+    }
+
+    #[test]
+    fn test_add_output_programmatic() {
+        unsafe {
+            let params = hal_decoder_params_new();
+
+            // Add a detection output with named dimensions
+            let shape: [usize; 3] = [1, 84, 8400];
+            let dims: [HalDimName; 3] = [
+                HalDimName::Batch,
+                HalDimName::NumFeatures,
+                HalDimName::NumBoxes,
+            ];
+            let idx = hal_decoder_params_add_output(
+                params,
+                HalOutputType::Detection,
+                HalDecoderType::Ultralytics,
+                shape.as_ptr(),
+                dims.as_ptr(),
+                3,
+            );
+            assert_eq!(idx, 0);
+
+            hal_decoder_params_set_nms(params, HalNms::ClassAware);
+
+            let decoder = hal_decoder_new(params);
+            assert!(!decoder.is_null());
+            hal_decoder_params_free(params);
+            hal_decoder_free(decoder);
+        }
+    }
+
+    #[test]
+    fn test_add_output_split_det() {
+        unsafe {
+            let params = hal_decoder_params_new();
+
+            // Add scores output
+            let scores_shape: [usize; 3] = [1, 80, 8400];
+            let scores_dims: [HalDimName; 3] = [
+                HalDimName::Batch,
+                HalDimName::NumClasses,
+                HalDimName::NumBoxes,
+            ];
+            let s = hal_decoder_params_add_output(
+                params,
+                HalOutputType::Scores,
+                HalDecoderType::Ultralytics,
+                scores_shape.as_ptr(),
+                scores_dims.as_ptr(),
+                3,
+            );
+            assert_eq!(s, 0);
+
+            // Add boxes output
+            let boxes_shape: [usize; 3] = [1, 4, 8400];
+            let boxes_dims: [HalDimName; 3] = [
+                HalDimName::Batch,
+                HalDimName::BoxCoords,
+                HalDimName::NumBoxes,
+            ];
+            let b = hal_decoder_params_add_output(
+                params,
+                HalOutputType::Boxes,
+                HalDecoderType::Ultralytics,
+                boxes_shape.as_ptr(),
+                boxes_dims.as_ptr(),
+                3,
+            );
+            assert_eq!(b, 1);
+
+            hal_decoder_params_set_nms(params, HalNms::ClassAgnostic);
+
+            let decoder = hal_decoder_new(params);
+            assert!(!decoder.is_null());
+            hal_decoder_params_free(params);
+            hal_decoder_free(decoder);
+        }
+    }
+
+    #[test]
+    fn test_add_output_no_dims() {
+        unsafe {
+            let params = hal_decoder_params_new();
+
+            // Add output without named dimensions (dims = NULL)
+            let shape: [usize; 3] = [1, 84, 8400];
+            let idx = hal_decoder_params_add_output(
+                params,
+                HalOutputType::Detection,
+                HalDecoderType::Ultralytics,
+                shape.as_ptr(),
+                std::ptr::null(),
+                3,
+            );
+            assert_eq!(idx, 0);
+
+            hal_decoder_params_set_nms(params, HalNms::ClassAware);
+
+            let decoder = hal_decoder_new(params);
+            assert!(!decoder.is_null());
+            hal_decoder_params_free(params);
+            hal_decoder_free(decoder);
+        }
+    }
+
+    #[test]
+    fn test_add_output_null_params() {
+        unsafe {
+            let shape: [usize; 3] = [1, 84, 8400];
+            assert_eq!(
+                hal_decoder_params_add_output(
+                    std::ptr::null_mut(),
+                    HalOutputType::Detection,
+                    HalDecoderType::Ultralytics,
+                    shape.as_ptr(),
+                    std::ptr::null(),
+                    3,
+                ),
+                -1
+            );
+        }
+    }
+
+    #[test]
+    fn test_output_set_quantization() {
+        unsafe {
+            let params = hal_decoder_params_new();
+
+            let shape: [usize; 3] = [1, 80, 8400];
+            let idx = hal_decoder_params_add_output(
+                params,
+                HalOutputType::Scores,
+                HalDecoderType::Ultralytics,
+                shape.as_ptr(),
+                std::ptr::null(),
+                3,
+            );
+            assert_eq!(idx, 0);
+
+            assert_eq!(
+                hal_decoder_params_output_set_quantization(params, 0, 0.003906, 0),
+                0
+            );
+
+            // Out of bounds
+            assert_eq!(
+                hal_decoder_params_output_set_quantization(params, 1, 0.5, 0),
+                -1
+            );
+
+            hal_decoder_params_free(params);
+        }
+    }
+
+    #[test]
+    fn test_output_set_anchors() {
+        unsafe {
+            let params = hal_decoder_params_new();
+
+            let shape: [usize; 4] = [1, 9, 15, 18];
+            let idx = hal_decoder_params_add_output(
+                params,
+                HalOutputType::Detection,
+                HalDecoderType::ModelPack,
+                shape.as_ptr(),
+                std::ptr::null(),
+                4,
+            );
+            assert_eq!(idx, 0);
+
+            let anchors: [[f32; 2]; 3] = [[0.367, 0.315], [0.388, 0.474], [0.533, 0.644]];
+            assert_eq!(
+                hal_decoder_params_output_set_anchors(params, 0, anchors.as_ptr(), 3),
+                0
+            );
+
+            // Add a non-detection output and try to set anchors (should fail)
+            let scores_shape: [usize; 3] = [1, 80, 8400];
+            let s_idx = hal_decoder_params_add_output(
+                params,
+                HalOutputType::Scores,
+                HalDecoderType::Ultralytics,
+                scores_shape.as_ptr(),
+                std::ptr::null(),
+                3,
+            );
+            assert_eq!(
+                hal_decoder_params_output_set_anchors(params, s_idx, anchors.as_ptr(), 3),
+                -1
+            );
+
+            hal_decoder_params_free(params);
+        }
+    }
+
+    #[test]
+    fn test_output_set_normalized() {
+        unsafe {
+            let params = hal_decoder_params_new();
+
+            // Detection output: normalized is valid
+            let shape: [usize; 3] = [1, 84, 8400];
+            let det_idx = hal_decoder_params_add_output(
+                params,
+                HalOutputType::Detection,
+                HalDecoderType::Ultralytics,
+                shape.as_ptr(),
+                std::ptr::null(),
+                3,
+            );
+            assert_eq!(
+                hal_decoder_params_output_set_normalized(params, det_idx, 1),
+                0
+            );
+
+            // Boxes output: normalized is valid
+            let boxes_shape: [usize; 3] = [1, 4, 8400];
+            let box_idx = hal_decoder_params_add_output(
+                params,
+                HalOutputType::Boxes,
+                HalDecoderType::Ultralytics,
+                boxes_shape.as_ptr(),
+                std::ptr::null(),
+                3,
+            );
+            assert_eq!(
+                hal_decoder_params_output_set_normalized(params, box_idx, 0),
+                0
+            );
+
+            // Scores output: normalized is invalid
+            let scores_shape: [usize; 3] = [1, 80, 8400];
+            let sc_idx = hal_decoder_params_add_output(
+                params,
+                HalOutputType::Scores,
+                HalDecoderType::Ultralytics,
+                scores_shape.as_ptr(),
+                std::ptr::null(),
+                3,
+            );
+            assert_eq!(
+                hal_decoder_params_output_set_normalized(params, sc_idx, 1),
+                -1
+            );
+
+            hal_decoder_params_free(params);
+        }
+    }
+
+    #[test]
+    fn test_set_decoder_version() {
+        unsafe {
+            let params = hal_decoder_params_new();
+
+            // Add a YOLO26 end-to-end detection output
+            let shape: [usize; 3] = [1, 100, 6];
+            let dims: [HalDimName; 3] = [
+                HalDimName::Batch,
+                HalDimName::NumBoxes,
+                HalDimName::NumFeatures,
+            ];
+            hal_decoder_params_add_output(
+                params,
+                HalOutputType::Detection,
+                HalDecoderType::Ultralytics,
+                shape.as_ptr(),
+                dims.as_ptr(),
+                3,
+            );
+
+            assert_eq!(
+                hal_decoder_params_set_decoder_version(params, HalDecoderVersion::Yolo26),
+                0
+            );
+
+            let decoder = hal_decoder_new(params);
+            assert!(!decoder.is_null());
+            hal_decoder_params_free(params);
+            hal_decoder_free(decoder);
+        }
+    }
+
+    #[test]
+    fn test_params_setter_null_safety() {
+        unsafe {
+            // All setters should return -1 for NULL params
+            assert_eq!(
+                hal_decoder_params_set_config_json(
+                    std::ptr::null_mut(),
+                    b"{}".as_ptr() as *const c_char,
+                    2
+                ),
+                -1
+            );
+            assert_eq!(
+                hal_decoder_params_set_config_yaml(
+                    std::ptr::null_mut(),
+                    b"".as_ptr() as *const c_char,
+                    0
+                ),
+                -1
+            );
+            assert_eq!(
+                hal_decoder_params_set_config_file(
+                    std::ptr::null_mut(),
+                    b"path\0".as_ptr() as *const c_char
+                ),
+                -1
+            );
+            assert_eq!(
+                hal_decoder_params_set_score_threshold(std::ptr::null_mut(), 0.5),
+                -1
+            );
+            assert_eq!(
+                hal_decoder_params_set_iou_threshold(std::ptr::null_mut(), 0.5),
+                -1
+            );
+            assert_eq!(
+                hal_decoder_params_set_nms(std::ptr::null_mut(), HalNms::ClassAgnostic),
+                -1
+            );
+            assert_eq!(
+                hal_decoder_params_set_decoder_version(
+                    std::ptr::null_mut(),
+                    HalDecoderVersion::Yolov8
+                ),
+                -1
+            );
         }
     }
 
@@ -1221,10 +1978,11 @@ nms: class_aware
     fn test_decode_float_success() {
         unsafe {
             let config = CString::new(YOLO_JSON_CONFIG).unwrap();
-            let mut params = hal_decoder_params_default();
-            params.config_json = config.as_ptr();
-            params.score_threshold = 0.01;
-            let decoder = hal_decoder_new(&params);
+            let params = hal_decoder_params_new();
+            hal_decoder_params_set_config_json(params, config.as_ptr(), 0);
+            hal_decoder_params_set_score_threshold(params, 0.01);
+            let decoder = hal_decoder_new(params);
+            hal_decoder_params_free(params);
             assert!(!decoder.is_null());
 
             let shape: [usize; 3] = [1, 84, 8400];
@@ -1608,26 +2366,29 @@ nms: class_aware
         unsafe {
             // Test JSON file loading
             let path = CString::new(json_path.to_str().unwrap()).unwrap();
-            let mut params = hal_decoder_params_default();
-            params.config_file = path.as_ptr();
-            let decoder = hal_decoder_new(&params);
+            let params = hal_decoder_params_new();
+            hal_decoder_params_set_config_file(params, path.as_ptr());
+            let decoder = hal_decoder_new(params);
             assert!(!decoder.is_null());
+            hal_decoder_params_free(params);
             hal_decoder_free(decoder);
 
             // Test YAML file loading
             let path = CString::new(yaml_path.to_str().unwrap()).unwrap();
-            let mut params = hal_decoder_params_default();
-            params.config_file = path.as_ptr();
-            let decoder = hal_decoder_new(&params);
+            let params = hal_decoder_params_new();
+            hal_decoder_params_set_config_file(params, path.as_ptr());
+            let decoder = hal_decoder_new(params);
             assert!(!decoder.is_null());
+            hal_decoder_params_free(params);
             hal_decoder_free(decoder);
 
             // Test non-existent file
             let path = CString::new("/nonexistent/path/config.json").unwrap();
-            let mut params = hal_decoder_params_default();
-            params.config_file = path.as_ptr();
-            let decoder = hal_decoder_new(&params);
+            let params = hal_decoder_params_new();
+            hal_decoder_params_set_config_file(params, path.as_ptr());
+            let decoder = hal_decoder_new(params);
             assert!(decoder.is_null());
+            hal_decoder_params_free(params);
         }
 
         let _ = std::fs::remove_file(json_path);

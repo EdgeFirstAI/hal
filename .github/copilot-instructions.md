@@ -423,7 +423,7 @@ make format lint check test sbom
 ```
 
 This runs, in order:
-1. **format** — `cargo +nightly fmt --all` and `ruff format`
+1. **format** — `cargo fmt --all` and `ruff format`
 2. **lint** — `cargo clippy -- -D warnings` and `ruff check`
 3. **check** — `cargo check --all-features --workspace`
 4. **test** — Rust tests with coverage (`cargo llvm-cov nextest`) and Python tests
@@ -454,7 +454,7 @@ maturin develop -m crates/python/Cargo.toml
 python -m pytest tests/
 
 # Format code
-cargo +nightly fmt --all
+cargo fmt --all
 
 # Lint
 cargo clippy --workspace
