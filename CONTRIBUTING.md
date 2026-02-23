@@ -101,8 +101,8 @@ cargo test --workspace
 # Run Rust linting
 cargo clippy --workspace
 
-# Format code (requires Rust nightly)
-cargo +nightly fmt --all
+# Format code
+cargo fmt --all
 
 # Build and test Python bindings
 maturin develop -m crates/python/Cargo.toml
@@ -155,7 +155,7 @@ We follow standard Rust conventions:
 
 **Before committing:**
 ```bash
-cargo +nightly fmt --all
+cargo fmt --all
 cargo clippy --workspace
 ```
 
@@ -252,7 +252,7 @@ The project uses GitHub Actions for continuous integration. Workflows are in `.g
 
 Runs on every push and PR to `main` or `develop`:
 
-- **Formatting check**: `cargo +nightly fmt --all -- --check`
+- **Formatting check**: `cargo fmt --all -- --check`
 - **Linting**: `cargo clippy --workspace`
 - **Multi-platform testing**: x86_64, aarch64, NXP i.MX8M Plus hardware
 - **Coverage collection**: Rust (cargo-llvm-cov) + Python (slipcover)

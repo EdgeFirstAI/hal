@@ -47,6 +47,120 @@ extern "C" {
 #include "stdbool.h"
 
 /**
+ * Output type for model tensor outputs.
+ *
+ * Identifies the role of a model output tensor in the decoder pipeline.
+ *
+ * @see hal_decoder_params_add_output
+ */
+typedef enum HalOutputType {
+  /**
+   * Combined detection output (e.g. YOLO fused [batch, features, boxes])
+   */
+  HAL_OUTPUT_TYPE_DETECTION = 0,
+  /**
+   * Split boxes output [batch, coords, boxes]
+   */
+  HAL_OUTPUT_TYPE_BOXES = 1,
+  /**
+   * Split scores output [batch, classes, boxes]
+   */
+  HAL_OUTPUT_TYPE_SCORES = 2,
+  /**
+   * Prototype masks for instance segmentation [batch, protos, H, W]
+   */
+  HAL_OUTPUT_TYPE_PROTOS = 3,
+  /**
+   * Segmentation mask output
+   */
+  HAL_OUTPUT_TYPE_SEGMENTATION = 4,
+  /**
+   * Mask coefficients for instance segmentation
+   */
+  HAL_OUTPUT_TYPE_MASK_COEFFICIENTS = 5,
+  /**
+   * Raw mask output
+   */
+  HAL_OUTPUT_TYPE_MASK = 6,
+  /**
+   * Class indices for end-to-end split models [batch, N, 1]
+   */
+  HAL_OUTPUT_TYPE_CLASSES = 7,
+} HalOutputType;
+
+/**
+ * Decoder framework type.
+ *
+ * Identifies the model framework that produced the output tensors.
+ *
+ * @see hal_decoder_params_add_output
+ */
+typedef enum HalDecoderType {
+  /**
+   * Ultralytics YOLO models (YOLOv5, YOLOv8, YOLO11, YOLO26)
+   */
+  HAL_DECODER_TYPE_ULTRALYTICS = 0,
+  /**
+   * Au-Zone ModelPack models
+   */
+  HAL_DECODER_TYPE_MODEL_PACK = 1,
+} HalDecoderType;
+
+/**
+ * Named dimension for tensor shapes.
+ *
+ * Assigns a semantic name to each dimension in a tensor shape, allowing the
+ * decoder to handle different tensor layouts (NCHW vs NHWC, etc.).
+ *
+ * Pass an array of these alongside shape values in
+ * `hal_decoder_params_add_output()`, or pass NULL for unnamed shapes.
+ *
+ * @see hal_decoder_params_add_output
+ */
+typedef enum HalDimName {
+  /**
+   * Batch dimension
+   */
+  HAL_DIM_NAME_BATCH = 0,
+  /**
+   * Height spatial dimension
+   */
+  HAL_DIM_NAME_HEIGHT = 1,
+  /**
+   * Width spatial dimension
+   */
+  HAL_DIM_NAME_WIDTH = 2,
+  /**
+   * Number of object classes
+   */
+  HAL_DIM_NAME_NUM_CLASSES = 3,
+  /**
+   * Number of features (e.g. 4 box coords + num_classes + mask_coeffs)
+   */
+  HAL_DIM_NAME_NUM_FEATURES = 4,
+  /**
+   * Number of detection boxes / proposals
+   */
+  HAL_DIM_NAME_NUM_BOXES = 5,
+  /**
+   * Number of prototype masks
+   */
+  HAL_DIM_NAME_NUM_PROTOS = 6,
+  /**
+   * Number of anchors multiplied by features (ModelPack split)
+   */
+  HAL_DIM_NAME_NUM_ANCHORS_X_FEATURES = 7,
+  /**
+   * Padding dimension
+   */
+  HAL_DIM_NAME_PADDING = 8,
+  /**
+   * Box coordinate dimension (typically 4)
+   */
+  HAL_DIM_NAME_BOX_COORDS = 9,
+} HalDimName;
+
+/**
  * NMS (Non-Maximum Suppression) mode.
  *
  * Controls how overlapping detection boxes are suppressed after decoding.
@@ -78,6 +192,32 @@ typedef enum hal_nms {
    */
   HAL_NMS_NONE = 2,
 } hal_nms;
+
+/**
+ * Decoder version for Ultralytics models.
+ *
+ * Determines the YOLO architecture version and decoding strategy.
+ *
+ * @see hal_decoder_params_set_decoder_version
+ */
+typedef enum HalDecoderVersion {
+  /**
+   * YOLOv5 - anchor-based decoder, requires external NMS
+   */
+  HAL_DECODER_VERSION_YOLOV5 = 0,
+  /**
+   * YOLOv8 - anchor-free DFL decoder, requires external NMS
+   */
+  HAL_DECODER_VERSION_YOLOV8 = 1,
+  /**
+   * YOLO11 - anchor-free DFL decoder, requires external NMS
+   */
+  HAL_DECODER_VERSION_YOLO11 = 2,
+  /**
+   * YOLO26 - end-to-end model with embedded NMS
+   */
+  HAL_DECODER_VERSION_YOLO26 = 3,
+} HalDecoderVersion;
 
 /**
  * Image pixel format (FourCC codes).
@@ -238,6 +378,56 @@ typedef struct hal_bytetrack hal_bytetrack;
 typedef struct hal_decoder hal_decoder;
 
 /**
+ * Opaque decoder construction parameters.
+ *
+ * Configures how ML model outputs are decoded into detection boxes and
+ * segmentation masks. Create with `hal_decoder_params_new()`, configure
+ * with setter functions, then pass to `hal_decoder_new()`.
+ *
+ * Configuration can be provided in two ways (mutually exclusive):
+ * 1. From a file or string: `hal_decoder_params_set_config_file()`,
+ *    `hal_decoder_params_set_config_json()`, or
+ *    `hal_decoder_params_set_config_yaml()`
+ * 2. Programmatically: `hal_decoder_params_add_output()` to define each
+ *    model output tensor
+ *
+ * @section dp_programmatic Programmatic Configuration
+ * @code{.c}
+ * hal_decoder_params *params = hal_decoder_params_new();
+ *
+ * size_t scores_shape[] = {1, 80, 8400};
+ * enum hal_dim_name scores_dims[] = {HAL_DIM_BATCH, HAL_DIM_NUM_CLASSES,
+ *                                     HAL_DIM_NUM_BOXES};
+ * int s = hal_decoder_params_add_output(params, HAL_OUTPUT_SCORES,
+ *             HAL_DECODER_ULTRALYTICS, scores_shape, scores_dims, 3);
+ * hal_decoder_params_output_set_quantization(params, s, 0.003906f, 0);
+ *
+ * size_t boxes_shape[] = {1, 4, 8400};
+ * enum hal_dim_name boxes_dims[] = {HAL_DIM_BATCH, HAL_DIM_BOX_COORDS,
+ *                                    HAL_DIM_NUM_BOXES};
+ * int b = hal_decoder_params_add_output(params, HAL_OUTPUT_BOXES,
+ *             HAL_DECODER_ULTRALYTICS, boxes_shape, boxes_dims, 3);
+ * hal_decoder_params_output_set_quantization(params, b, 0.019824f, 0);
+ *
+ * hal_decoder_params_set_nms(params, HAL_NMS_CLASS_AGNOSTIC);
+ * hal_decoder *decoder = hal_decoder_new(params);
+ * hal_decoder_params_free(params);
+ * @endcode
+ *
+ * @section dp_file File-based Configuration
+ * @code{.c}
+ * hal_decoder_params *params = hal_decoder_params_new();
+ * hal_decoder_params_set_config_file(params, "/models/yolov8n/edgefirst.yaml");
+ * hal_decoder_params_set_score_threshold(params, 0.25f);
+ * hal_decoder *decoder = hal_decoder_new(params);
+ * hal_decoder_params_free(params);
+ * @endcode
+ *
+ * @see hal_decoder_params_new, hal_decoder_params_free, hal_decoder_new
+ */
+typedef struct hal_decoder_params hal_decoder_params;
+
+/**
  * List of detection boxes.
  */
 typedef struct hal_detect_box_list hal_detect_box_list;
@@ -279,161 +469,6 @@ typedef struct hal_tensor_map hal_tensor_map;
  * List of track info results.
  */
 typedef struct hal_track_info_list hal_track_info_list;
-
-/**
- * Decoder construction parameters.
- *
- * Configures how ML model outputs are decoded into detection boxes and
- * segmentation masks. Obtain defaults with `hal_decoder_params_default()`,
- * set the desired fields, then pass to `hal_decoder_new()`.
- *
- * @section dp_config Configuration Source (exactly one required)
- *
- * Exactly one of `config_json`, `config_yaml`, or `config_file` must be
- * non-NULL. These are mutually exclusive; setting more than one causes
- * `hal_decoder_new()` to fail with EINVAL. The configuration describes the
- * model output layout so the decoder knows how to interpret raw tensors.
- *
- * @section dp_thresholds Threshold Tuning
- *
- * `score_threshold` and `iou_threshold` control post-processing filtering:
- * - **score_threshold** (default 0.5): detections with confidence below this
- *   value are discarded. Lower values yield more detections (higher recall),
- *   higher values yield fewer but more confident detections (higher precision).
- * - **iou_threshold** (default 0.5): during NMS, box pairs with
- *   Intersection-over-Union above this value are candidates for suppression.
- *   Lower values suppress more aggressively.
- *
- * @section dp_usage Basic Usage
- * @code{.c}
- * // Minimal: create a decoder from an inline JSON config
- * struct hal_decoder_params params = hal_decoder_params_default();
- * params.config_json = "{\"outputs\":[{\"decoder\":\"ultralytics\","
- *                       "\"type\":\"detection\",\"shape\":[1,84,8400],"
- *                       "\"dshape\":[[\"batch\",1],[\"num_features\",84],"
- *                       "[\"num_boxes\",8400]]}],\"nms\":\"class_aware\"}";
- * params.score_threshold = 0.25f;
- * struct hal_decoder* decoder = hal_decoder_new(&params);
- * @endcode
- *
- * @section dp_file Loading from a File
- * @code{.c}
- * // Load decoder config from an edgefirst.json or edgefirst.yaml file
- * struct hal_decoder_params params = hal_decoder_params_default();
- * params.config_file = "/path/to/edgefirst.json";
- * params.score_threshold = 0.3f;
- * params.iou_threshold  = 0.45f;
- * params.nms = HAL_NMS_CLASS_AWARE;
- * struct hal_decoder* decoder = hal_decoder_new(&params);
- * @endcode
- *
- * @section dp_metadata EdgeFirst Model Metadata
- *
- * EdgeFirst models ship with an `edgefirst.json` (or `edgefirst.yaml`)
- * metadata file that fully describes the model's output layout, decoder
- * type, and recommended post-processing settings. Pass this file directly
- * via `config_file` to auto-configure the decoder:
- *
- * @code{.c}
- * // Auto-configure from EdgeFirst model metadata.
- * // The metadata file contains the outputs array, decoder type
- * // (ultralytics / modelpack), shapes, and NMS settings.
- * //
- * // Example edgefirst.yaml:
- * //   outputs:
- * //     - decoder: ultralytics
- * //       type: detection
- * //       shape: [1, 84, 8400]
- * //       dshape: [[batch, 1], [num_features, 84], [num_boxes, 8400]]
- * //   nms: class_agnostic
- * //   validation:
- * //     iou: 0.7
- * //     score: 0.001
- * //
- * struct hal_decoder_params params = hal_decoder_params_default();
- * params.config_file = "/models/yolov8n/edgefirst.yaml";
- *
- * // Optionally override the metadata's recommended thresholds
- * // for your application's precision/recall needs:
- * params.score_threshold = 0.4f;
- *
- * struct hal_decoder* decoder = hal_decoder_new(&params);
- * if (!decoder) {
- *     fprintf(stderr, "decoder init failed: %s\n", strerror(errno));
- * }
- * @endcode
- *
- * @see hal_decoder_params_default, hal_decoder_new, hal_nms
- */
-typedef struct hal_decoder_params {
-  /**
-   * JSON configuration string (NUL-terminated).
-   *
-   * Mutually exclusive with `config_yaml` and `config_file`.
-   * The string is copied internally; the caller may free the buffer
-   * after `hal_decoder_new()` returns.
-   *
-   * This should contain the EdgeFirst model metadata JSON, or at minimum
-   * the `outputs` array describing the model's output tensors. Example:
-   * @code{.c}
-   * params.config_json = "{\"outputs\":[{\"decoder\":\"ultralytics\","
-   *                       "\"type\":\"detection\",\"shape\":[1,84,8400],"
-   *                       "\"dshape\":[[\"batch\",1],[\"num_features\",84],"
-   *                       "[\"num_boxes\",8400]]}]}";
-   * @endcode
-   */
-  const char *config_json;
-  /**
-   * YAML configuration string (NUL-terminated).
-   *
-   * Mutually exclusive with `config_json` and `config_file`.
-   * The string is copied internally; the caller may free the buffer
-   * after `hal_decoder_new()` returns.
-   */
-  const char *config_yaml;
-  /**
-   * Path to a configuration file (NUL-terminated).
-   *
-   * Mutually exclusive with `config_json` and `config_yaml`.
-   * The file is read and the path string copied during `hal_decoder_new()`;
-   * both may be freed after the call returns.
-   *
-   * The format is auto-detected: files ending in `.json` or starting with
-   * `{` are parsed as JSON; everything else is parsed as YAML. This makes
-   * it straightforward to point at an EdgeFirst model's `edgefirst.json`
-   * or `edgefirst.yaml` metadata file.
-   */
-  const char *config_file;
-  /**
-   * Score threshold for filtering detections (default: 0.5).
-   *
-   * Detections with confidence scores below this value are discarded
-   * before NMS. Range: 0.0 to 1.0.
-   *
-   * Typical values:
-   * - 0.001 -- 0.01: evaluation / mAP benchmarking (keep nearly all boxes)
-   * - 0.25  -- 0.5:  general-purpose inference
-   * - 0.5   -- 0.8:  high-confidence-only applications
-   */
-  float score_threshold;
-  /**
-   * IOU (Intersection-over-Union) threshold for NMS (default: 0.5).
-   *
-   * During NMS, if two boxes overlap with IOU above this threshold the
-   * lower-scoring box is suppressed. Range: 0.0 to 1.0.
-   *
-   * Typical values:
-   * - 0.45 -- 0.5: standard object detection
-   * - 0.6  -- 0.7: when objects frequently overlap (e.g. dense crowds)
-   */
-  float iou_threshold;
-  /**
-   * NMS (Non-Maximum Suppression) mode (default: HAL_NMS_CLASS_AGNOSTIC).
-   *
-   * @see hal_nms for available modes and when to use each one.
-   */
-  enum hal_nms nms;
-} hal_decoder_params;
 
 /**
  * Quantization parameters for dequantizing tensor data.
@@ -560,50 +595,232 @@ typedef struct hal_track_info {
 } hal_track_info;
 
 /**
- * Create default decoder parameters.
+ * Create new decoder parameters.
  *
- * Returns a `hal_decoder_params` struct initialized with safe defaults:
+ * Returns an opaque handle initialized with safe defaults:
  *
- * | Field | Default |
- * |-------|---------|
- * | config_json | NULL |
- * | config_yaml | NULL |
- * | config_file | NULL |
+ * | Setting | Default |
+ * |---------|---------|
  * | score_threshold | 0.5 |
  * | iou_threshold | 0.5 |
  * | nms | HAL_NMS_CLASS_AGNOSTIC |
  *
- * The caller must set exactly one configuration source (`config_json`,
- * `config_yaml`, or `config_file`) before passing to `hal_decoder_new()`.
- * All other fields may be left at their defaults or overridden.
+ * The caller must configure outputs (via `hal_decoder_params_add_output()`,
+ * `hal_decoder_params_set_config_file()`, `hal_decoder_params_set_config_json()`,
+ * or `hal_decoder_params_set_config_yaml()`) before passing to
+ * `hal_decoder_new()`. Free with `hal_decoder_params_free()` after use.
  *
- * @return Default decoder parameters (by value)
+ * @return New params handle, or NULL on allocation failure
  *
  * @par Example
  * @code{.c}
- * struct hal_decoder_params params = hal_decoder_params_default();
- * params.config_file = "edgefirst.yaml";
- * params.score_threshold = 0.3f;
- * struct hal_decoder* decoder = hal_decoder_new(&params);
+ * hal_decoder_params *params = hal_decoder_params_new();
+ * hal_decoder_params_set_config_file(params, "edgefirst.yaml");
+ * hal_decoder_params_set_score_threshold(params, 0.3f);
+ * hal_decoder *decoder = hal_decoder_new(params);
+ * hal_decoder_params_free(params);
  * @endcode
+ *
+ * @see hal_decoder_params_free, hal_decoder_new
  */
-struct hal_decoder_params hal_decoder_params_default(void);
+struct hal_decoder_params *hal_decoder_params_new(void);
+
+/**
+ * Free decoder parameters.
+ *
+ * @param params Params handle to free (can be NULL, no-op)
+ *
+ * @see hal_decoder_params_new
+ */
+void hal_decoder_params_free(struct hal_decoder_params *params);
+
+/**
+ * Set decoder configuration from a JSON string.
+ *
+ * @param params Params handle
+ * @param json   JSON string (null-terminated)
+ * @param len    String length in bytes (excluding null terminator),
+ *               or 0 to use strlen
+ * @return 0 on success, -1 on error (errno = EINVAL)
+ *
+ * @see hal_decoder_params_set_config_yaml, hal_decoder_params_set_config_file
+ */
+int hal_decoder_params_set_config_json(struct hal_decoder_params *params,
+                                       const char *json,
+                                       size_t len);
+
+/**
+ * Set decoder configuration from a YAML string.
+ *
+ * @param params Params handle
+ * @param yaml   YAML string (null-terminated)
+ * @param len    String length in bytes (excluding null terminator),
+ *               or 0 to use strlen
+ * @return 0 on success, -1 on error (errno = EINVAL)
+ *
+ * @see hal_decoder_params_set_config_json, hal_decoder_params_set_config_file
+ */
+int hal_decoder_params_set_config_yaml(struct hal_decoder_params *params,
+                                       const char *yaml,
+                                       size_t len);
+
+/**
+ * Set decoder configuration from a file path.
+ *
+ * The file is read when `hal_decoder_new()` is called, not immediately.
+ * JSON and YAML are auto-detected from the file extension and content.
+ *
+ * @param params Params handle
+ * @param path   File path (null-terminated)
+ * @return 0 on success, -1 on error (errno = EINVAL)
+ *
+ * @see hal_decoder_params_set_config_json, hal_decoder_params_set_config_yaml
+ */
+int hal_decoder_params_set_config_file(struct hal_decoder_params *params, const char *path);
+
+/**
+ * Add a model output tensor to the decoder configuration.
+ *
+ * Builds the output configuration programmatically. Each call adds one
+ * output tensor description. The decoder resolves the model type
+ * automatically from the combination of outputs.
+ *
+ * @param params  Params handle
+ * @param type_   Output tensor role (scores, boxes, detection, etc.)
+ * @param decoder Framework that produced the model (ultralytics, modelpack)
+ * @param shape   Array of dimension sizes (length = ndim)
+ * @param dims    Array of dimension names (length = ndim), or NULL for
+ *                unnamed dimensions. When non-NULL, named dimensions
+ *                (dshape) are stored and shape is derived from them.
+ * @param ndim    Number of dimensions
+ * @return Output index (>= 0) on success, -1 on error (errno = EINVAL)
+ *
+ * @par Example
+ * @code{.c}
+ * size_t shape[] = {1, 80, 8400};
+ * enum hal_dim_name dims[] = {HAL_DIM_BATCH, HAL_DIM_NUM_CLASSES,
+ *                              HAL_DIM_NUM_BOXES};
+ * int idx = hal_decoder_params_add_output(params, HAL_OUTPUT_SCORES,
+ *               HAL_DECODER_ULTRALYTICS, shape, dims, 3);
+ * @endcode
+ *
+ * @see hal_decoder_params_output_set_quantization
+ */
+int hal_decoder_params_add_output(struct hal_decoder_params *params,
+                                  enum HalOutputType type,
+                                  enum HalDecoderType decoder,
+                                  const size_t *shape,
+                                  const enum HalDimName *dims,
+                                  size_t ndim);
+
+/**
+ * Set quantization parameters on an output by index.
+ *
+ * @param params     Params handle
+ * @param index      Output index (returned by `hal_decoder_params_add_output`)
+ * @param scale      Quantization scale
+ * @param zero_point Quantization zero point
+ * @return 0 on success, -1 on error (errno = EINVAL)
+ *
+ * @see hal_decoder_params_add_output
+ */
+int hal_decoder_params_output_set_quantization(struct hal_decoder_params *params,
+                                               int index,
+                                               float scale,
+                                               int zero_point);
+
+/**
+ * Set anchor boxes on a detection output by index.
+ *
+ * Only valid for `HAL_OUTPUT_DETECTION` outputs.
+ *
+ * @param params      Params handle
+ * @param index       Output index (returned by `hal_decoder_params_add_output`)
+ * @param anchors     Array of [width, height] anchor pairs
+ * @param num_anchors Number of anchor pairs
+ * @return 0 on success, -1 on error (errno = EINVAL)
+ *
+ * @see hal_decoder_params_add_output
+ */
+int hal_decoder_params_output_set_anchors(struct hal_decoder_params *params,
+                                          int index,
+                                          const float (*anchors)[2],
+                                          size_t num_anchors);
+
+/**
+ * Set the normalized flag on a detection or boxes output by index.
+ *
+ * Only valid for `HAL_OUTPUT_DETECTION` and `HAL_OUTPUT_BOXES` outputs.
+ *
+ * @param params     Params handle
+ * @param index      Output index (returned by `hal_decoder_params_add_output`)
+ * @param normalized Non-zero for normalized [0,1] coordinates, 0 for pixel
+ * @return 0 on success, -1 on error (errno = EINVAL)
+ *
+ * @see hal_decoder_params_add_output
+ */
+int hal_decoder_params_output_set_normalized(struct hal_decoder_params *params,
+                                             int index,
+                                             int normalized);
+
+/**
+ * Set the score threshold.
+ *
+ * Detections with confidence below this threshold are discarded.
+ *
+ * @param params Params handle
+ * @param threshold Score threshold (default: 0.5)
+ * @return 0 on success, -1 on error (errno = EINVAL)
+ */
+int hal_decoder_params_set_score_threshold(struct hal_decoder_params *params, float threshold);
+
+/**
+ * Set the IoU (Intersection over Union) threshold for NMS.
+ *
+ * @param params Params handle
+ * @param threshold IoU threshold (default: 0.5)
+ * @return 0 on success, -1 on error (errno = EINVAL)
+ */
+int hal_decoder_params_set_iou_threshold(struct hal_decoder_params *params, float threshold);
+
+/**
+ * Set the NMS (Non-Maximum Suppression) mode.
+ *
+ * @param params Params handle
+ * @param nms NMS mode
+ * @return 0 on success, -1 on error (errno = EINVAL)
+ *
+ * @see HalNms
+ */
+int hal_decoder_params_set_nms(struct hal_decoder_params *params, enum hal_nms nms);
+
+/**
+ * Set the decoder version for Ultralytics models.
+ *
+ * Determines the YOLO architecture version and decoding strategy.
+ *
+ * @param params  Params handle
+ * @param version Decoder version
+ * @return 0 on success, -1 on error (errno = EINVAL)
+ *
+ * @see HalDecoderVersion
+ */
+int hal_decoder_params_set_decoder_version(struct hal_decoder_params *params,
+                                           enum HalDecoderVersion version);
 
 /**
  * Create a new decoder from parameters.
  *
  * Validates the parameters and constructs a decoder ready for use with
- * `hal_decoder_decode()`. Exactly one of `params->config_json`,
- * `params->config_yaml`, or `params->config_file` must be non-NULL.
+ * `hal_decoder_decode()`. Configuration must be provided either via
+ * `hal_decoder_params_add_output()` (programmatic) or via one of the
+ * config file/string setters (mutually exclusive).
  *
- * All strings are copied internally; the caller may free their buffers
- * immediately after this call returns.
- *
- * @param params Pointer to decoder parameters (must not be NULL)
+ * @param params Params handle (must not be NULL)
  * @return New decoder handle on success, NULL on error (errno set)
  *
  * @par Errors (errno):
- * - EINVAL: NULL params, no config source set, or multiple config sources set
+ * - EINVAL: NULL params or no configuration provided
  * - ENOENT: Config file path does not exist
  * - EIO: Config file could not be read
  * - EBADMSG: Configuration is syntactically valid but semantically invalid
@@ -611,24 +828,26 @@ struct hal_decoder_params hal_decoder_params_default(void);
  *
  * @par Example
  * @code{.c}
- * struct hal_decoder_params params = hal_decoder_params_default();
- * params.config_file = "/models/yolov8n/edgefirst.yaml";
- * params.score_threshold = 0.25f;
- * params.iou_threshold  = 0.45f;
- * params.nms = HAL_NMS_CLASS_AWARE;
+ * hal_decoder_params *params = hal_decoder_params_new();
+ * hal_decoder_params_set_config_file(params, "/models/yolov8n/edgefirst.yaml");
+ * hal_decoder_params_set_score_threshold(params, 0.25f);
+ * hal_decoder_params_set_iou_threshold(params, 0.45f);
+ * hal_decoder_params_set_nms(params, HAL_NMS_CLASS_AWARE);
  *
- * struct hal_decoder* decoder = hal_decoder_new(&params);
+ * hal_decoder *decoder = hal_decoder_new(params);
  * if (!decoder) {
  *     fprintf(stderr, "decoder: %s\n", strerror(errno));
+ *     hal_decoder_params_free(params);
  *     return -1;
  * }
  *
  * // ... use decoder with hal_decoder_decode() ...
  *
+ * hal_decoder_params_free(params);
  * hal_decoder_free(decoder);
  * @endcode
  *
- * @see hal_decoder_params_default, hal_decoder_free, hal_decoder_decode
+ * @see hal_decoder_params_new, hal_decoder_params_free, hal_decoder_free
  */
 struct hal_decoder *hal_decoder_new(const struct hal_decoder_params *params);
 

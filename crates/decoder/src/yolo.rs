@@ -21,8 +21,8 @@ use crate::{
         nms_class_aware_float, nms_extra_class_aware_float, nms_extra_float, nms_float,
         postprocess_boxes_float, postprocess_boxes_index_float,
     },
-    BBoxTypeTrait, BoundingBox, DetectBox, DetectBoxQuantized, Quantization, Segmentation, XYWH,
-    XYXY,
+    BBoxTypeTrait, BoundingBox, DetectBox, DetectBoxQuantized, ProtoData, ProtoTensor,
+    Quantization, Segmentation, XYWH, XYXY,
 };
 
 /// Dispatches to the appropriate NMS function based on mode for float boxes.
@@ -458,6 +458,126 @@ where
     }
     Ok(())
 }
+
+/// Decodes split end-to-end YOLO detection outputs (post-NMS from model).
+///
+/// Input shapes (after batch dim removed):
+/// - boxes: (N, 4) — xyxy pixel coordinates
+/// - scores: (N, 1) — confidence of the top class
+/// - classes: (N, 1) — class index of the top class
+///
+/// Boxes are output directly without NMS (model already applied NMS).
+pub fn decode_yolo_split_end_to_end_det_float<T: Float + AsPrimitive<f32>>(
+    boxes: ArrayView2<T>,
+    scores: ArrayView2<T>,
+    classes: ArrayView2<T>,
+    score_threshold: f32,
+    output_boxes: &mut Vec<DetectBox>,
+) -> Result<(), crate::DecoderError> {
+    let n = boxes.shape()[0];
+    if boxes.shape()[1] != 4 {
+        return Err(crate::DecoderError::InvalidShape(format!(
+            "Split end-to-end boxes must have 4 columns, got {}",
+            boxes.shape()[1]
+        )));
+    }
+    output_boxes.clear();
+    for i in 0..n {
+        let score: f32 = scores[[i, 0]].as_();
+        if score < score_threshold {
+            continue;
+        }
+        if output_boxes.len() >= output_boxes.capacity() {
+            break;
+        }
+        output_boxes.push(DetectBox {
+            bbox: BoundingBox {
+                xmin: boxes[[i, 0]].as_(),
+                ymin: boxes[[i, 1]].as_(),
+                xmax: boxes[[i, 2]].as_(),
+                ymax: boxes[[i, 3]].as_(),
+            },
+            score,
+            label: classes[[i, 0]].as_() as usize,
+        });
+    }
+    Ok(())
+}
+
+/// Decodes split end-to-end YOLO detection + segmentation outputs.
+///
+/// Input shapes (after batch dim removed):
+/// - boxes: (N, 4) — xyxy pixel coordinates
+/// - scores: (N, 1) — confidence
+/// - classes: (N, 1) — class index
+/// - mask_coeff: (N, num_protos) — mask coefficients per detection
+/// - protos: (proto_h, proto_w, num_protos) — prototype masks
+#[allow(clippy::too_many_arguments)]
+pub fn decode_yolo_split_end_to_end_segdet_float<T>(
+    boxes: ArrayView2<T>,
+    scores: ArrayView2<T>,
+    classes: ArrayView2<T>,
+    mask_coeff: ArrayView2<T>,
+    protos: ArrayView3<T>,
+    score_threshold: f32,
+    output_boxes: &mut Vec<DetectBox>,
+    output_masks: &mut Vec<crate::Segmentation>,
+) -> Result<(), crate::DecoderError>
+where
+    T: Float + AsPrimitive<f32> + Send + Sync + 'static,
+    f32: AsPrimitive<T>,
+{
+    let n = boxes.shape()[0];
+    if boxes.shape()[1] != 4 {
+        return Err(crate::DecoderError::InvalidShape(format!(
+            "Split end-to-end boxes must have 4 columns, got {}",
+            boxes.shape()[1]
+        )));
+    }
+
+    // Collect qualifying detections with their indices
+    let mut qualifying: Vec<(DetectBox, usize)> = Vec::with_capacity(output_boxes.capacity());
+    for i in 0..n {
+        let score: f32 = scores[[i, 0]].as_();
+        if score < score_threshold {
+            continue;
+        }
+        if qualifying.len() >= output_boxes.capacity() {
+            break;
+        }
+        qualifying.push((
+            DetectBox {
+                bbox: BoundingBox {
+                    xmin: boxes[[i, 0]].as_(),
+                    ymin: boxes[[i, 1]].as_(),
+                    xmax: boxes[[i, 2]].as_(),
+                    ymax: boxes[[i, 3]].as_(),
+                },
+                score,
+                label: classes[[i, 0]].as_() as usize,
+            },
+            i,
+        ));
+    }
+
+    // Process masks using existing infrastructure
+    let result = decode_segdet_f32(qualifying, mask_coeff, protos);
+
+    output_boxes.clear();
+    output_masks.clear();
+    for (b, m) in result.into_iter() {
+        output_masks.push(crate::Segmentation {
+            xmin: b.bbox.xmin,
+            ymin: b.bbox.ymin,
+            xmax: b.bbox.xmax,
+            ymax: b.bbox.ymax,
+            segmentation: m,
+        });
+        output_boxes.push(b);
+    }
+    Ok(())
+}
+
 /// Internal implementation of YOLO decoding for quantized tensors.
 ///
 /// Expected shapes of inputs:
@@ -861,6 +981,308 @@ pub fn impl_yolo_split_segdet_float<
             ymax: b.bbox.ymax,
             segmentation: m,
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Proto-extraction variants: return ProtoData instead of materialized masks
+// ---------------------------------------------------------------------------
+
+/// Proto-extraction variant of `impl_yolo_segdet_quant`.
+/// Runs NMS but returns raw `ProtoData` instead of materialized masks.
+pub fn impl_yolo_segdet_quant_proto<
+    B: BBoxTypeTrait,
+    BOX: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
+    PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + AsPrimitive<i8> + Send + Sync,
+>(
+    boxes: (ArrayView2<BOX>, Quantization),
+    protos: (ArrayView3<PROTO>, Quantization),
+    score_threshold: f32,
+    iou_threshold: f32,
+    nms: Option<Nms>,
+    output_boxes: &mut Vec<DetectBox>,
+) -> ProtoData
+where
+    f32: AsPrimitive<BOX>,
+{
+    let (boxes_arr, quant_boxes) = boxes;
+    let (protos_arr, quant_protos) = protos;
+
+    let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&boxes_arr);
+
+    let det_indices = impl_yolo_split_segdet_quant_get_boxes::<B, _, _>(
+        (boxes_tensor.reversed_axes(), quant_boxes),
+        (scores_tensor.reversed_axes(), quant_boxes),
+        score_threshold,
+        iou_threshold,
+        nms,
+        output_boxes.capacity(),
+    );
+
+    let mask_tensor = mask_tensor.reversed_axes();
+    extract_proto_data_quant(det_indices, mask_tensor, quant_boxes, protos_arr, quant_protos, output_boxes)
+}
+
+/// Proto-extraction variant of `impl_yolo_segdet_float`.
+/// Runs NMS but returns raw `ProtoData` instead of materialized masks.
+pub fn impl_yolo_segdet_float_proto<
+    B: BBoxTypeTrait,
+    BOX: Float + AsPrimitive<f32> + Send + Sync,
+    PROTO: Float + AsPrimitive<f32> + Send + Sync,
+>(
+    boxes: ArrayView2<BOX>,
+    protos: ArrayView3<PROTO>,
+    score_threshold: f32,
+    iou_threshold: f32,
+    nms: Option<Nms>,
+    output_boxes: &mut Vec<DetectBox>,
+) -> ProtoData
+where
+    f32: AsPrimitive<BOX>,
+{
+    let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&boxes);
+
+    let det_indices = postprocess_boxes_index_float::<B, _, _>(
+        score_threshold.as_(),
+        boxes_tensor,
+        scores_tensor,
+    );
+    let mut det_indices = dispatch_nms_extra_float(nms, iou_threshold, det_indices);
+    det_indices.truncate(output_boxes.capacity());
+
+    let mask_tensor = mask_tensor.reversed_axes();
+    extract_proto_data_float(det_indices, mask_tensor, protos, output_boxes)
+}
+
+/// Proto-extraction variant of `impl_yolo_split_segdet_quant`.
+/// Runs NMS but returns raw `ProtoData` instead of materialized masks.
+#[allow(clippy::too_many_arguments)]
+pub fn impl_yolo_split_segdet_quant_proto<
+    B: BBoxTypeTrait,
+    BOX: PrimInt + AsPrimitive<f32> + Send + Sync,
+    SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
+    MASK: PrimInt + AsPrimitive<f32> + Send + Sync,
+    PROTO: PrimInt + AsPrimitive<f32> + AsPrimitive<i8> + Send + Sync,
+>(
+    boxes: (ArrayView2<BOX>, Quantization),
+    scores: (ArrayView2<SCORE>, Quantization),
+    mask_coeff: (ArrayView2<MASK>, Quantization),
+    protos: (ArrayView3<PROTO>, Quantization),
+    score_threshold: f32,
+    iou_threshold: f32,
+    nms: Option<Nms>,
+    output_boxes: &mut Vec<DetectBox>,
+) -> ProtoData
+where
+    f32: AsPrimitive<SCORE>,
+{
+    let det_indices = impl_yolo_split_segdet_quant_get_boxes::<B, _, _>(
+        boxes,
+        scores,
+        score_threshold,
+        iou_threshold,
+        nms,
+        output_boxes.capacity(),
+    );
+
+    let (masks, quant_masks) = mask_coeff;
+    let masks = masks.reversed_axes();
+    let (protos_arr, quant_protos) = protos;
+
+    extract_proto_data_quant(det_indices, masks, quant_masks, protos_arr, quant_protos, output_boxes)
+}
+
+/// Proto-extraction variant of `impl_yolo_split_segdet_float`.
+/// Runs NMS but returns raw `ProtoData` instead of materialized masks.
+#[allow(clippy::too_many_arguments)]
+pub fn impl_yolo_split_segdet_float_proto<
+    B: BBoxTypeTrait,
+    BOX: Float + AsPrimitive<f32> + Send + Sync,
+    SCORE: Float + AsPrimitive<f32> + Send + Sync,
+    MASK: Float + AsPrimitive<f32> + Send + Sync,
+    PROTO: Float + AsPrimitive<f32> + Send + Sync,
+>(
+    boxes_tensor: ArrayView2<BOX>,
+    scores_tensor: ArrayView2<SCORE>,
+    mask_tensor: ArrayView2<MASK>,
+    protos: ArrayView3<PROTO>,
+    score_threshold: f32,
+    iou_threshold: f32,
+    nms: Option<Nms>,
+    output_boxes: &mut Vec<DetectBox>,
+) -> ProtoData
+where
+    f32: AsPrimitive<SCORE>,
+{
+    let boxes_tensor = boxes_tensor.reversed_axes();
+    let scores_tensor = scores_tensor.reversed_axes();
+    let mask_tensor = mask_tensor.reversed_axes();
+
+    let det_indices = postprocess_boxes_index_float::<B, _, _>(
+        score_threshold.as_(),
+        boxes_tensor,
+        scores_tensor,
+    );
+    let mut det_indices = dispatch_nms_extra_float(nms, iou_threshold, det_indices);
+    det_indices.truncate(output_boxes.capacity());
+
+    extract_proto_data_float(det_indices, mask_tensor, protos, output_boxes)
+}
+
+/// Proto-extraction variant of `decode_yolo_end_to_end_segdet_float`.
+pub fn decode_yolo_end_to_end_segdet_float_proto<T>(
+    output: ArrayView2<T>,
+    protos: ArrayView3<T>,
+    score_threshold: f32,
+    output_boxes: &mut Vec<DetectBox>,
+) -> Result<ProtoData, crate::DecoderError>
+where
+    T: Float + AsPrimitive<f32> + Send + Sync + 'static,
+    f32: AsPrimitive<T>,
+{
+    if output.shape()[0] < 7 {
+        return Err(crate::DecoderError::InvalidShape(format!(
+            "End-to-end segdet output requires at least 7 rows, got {}",
+            output.shape()[0]
+        )));
+    }
+
+    let num_mask_coeffs = output.shape()[0] - 6;
+    let num_protos = protos.shape()[2];
+    if num_mask_coeffs != num_protos {
+        return Err(crate::DecoderError::InvalidShape(format!(
+            "Mask coefficients count ({}) doesn't match protos count ({})",
+            num_mask_coeffs, num_protos
+        )));
+    }
+
+    let boxes = output.slice(s![0..4, ..]).reversed_axes();
+    let scores = output.slice(s![4..5, ..]).reversed_axes();
+    let classes = output.slice(s![5, ..]);
+    let mask_coeff = output.slice(s![6.., ..]).reversed_axes();
+    let mut det_indices =
+        postprocess_boxes_index_float::<XYXY, _, _>(score_threshold.as_(), boxes, scores);
+    det_indices.truncate(output_boxes.capacity());
+
+    for (b, ind) in &mut det_indices {
+        b.label = classes[*ind].as_() as usize;
+    }
+
+    Ok(extract_proto_data_float(det_indices, mask_coeff, protos, output_boxes))
+}
+
+/// Proto-extraction variant of `decode_yolo_split_end_to_end_segdet_float`.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_yolo_split_end_to_end_segdet_float_proto<T>(
+    boxes: ArrayView2<T>,
+    scores: ArrayView2<T>,
+    classes: ArrayView2<T>,
+    mask_coeff: ArrayView2<T>,
+    protos: ArrayView3<T>,
+    score_threshold: f32,
+    output_boxes: &mut Vec<DetectBox>,
+) -> Result<ProtoData, crate::DecoderError>
+where
+    T: Float + AsPrimitive<f32> + Send + Sync + 'static,
+    f32: AsPrimitive<T>,
+{
+    let n = boxes.shape()[0];
+    if boxes.shape()[1] != 4 {
+        return Err(crate::DecoderError::InvalidShape(format!(
+            "Split end-to-end boxes must have 4 columns, got {}",
+            boxes.shape()[1]
+        )));
+    }
+
+    let mut qualifying: Vec<(DetectBox, usize)> = Vec::with_capacity(output_boxes.capacity());
+    for i in 0..n {
+        let score: f32 = scores[[i, 0]].as_();
+        if score < score_threshold {
+            continue;
+        }
+        if qualifying.len() >= output_boxes.capacity() {
+            break;
+        }
+        qualifying.push((
+            DetectBox {
+                bbox: BoundingBox {
+                    xmin: boxes[[i, 0]].as_(),
+                    ymin: boxes[[i, 1]].as_(),
+                    xmax: boxes[[i, 2]].as_(),
+                    ymax: boxes[[i, 3]].as_(),
+                },
+                score,
+                label: classes[[i, 0]].as_() as usize,
+            },
+            i,
+        ));
+    }
+
+    Ok(extract_proto_data_float(qualifying, mask_coeff, protos, output_boxes))
+}
+
+/// Helper: extract ProtoData from float mask coefficients + protos.
+fn extract_proto_data_float<
+    MASK: Float + AsPrimitive<f32> + Send + Sync,
+    PROTO: Float + AsPrimitive<f32> + Send + Sync,
+>(
+    det_indices: Vec<(DetectBox, usize)>,
+    mask_tensor: ArrayView2<MASK>,
+    protos: ArrayView3<PROTO>,
+    output_boxes: &mut Vec<DetectBox>,
+) -> ProtoData {
+    let mut mask_coefficients = Vec::with_capacity(det_indices.len());
+    output_boxes.clear();
+    for (det, idx) in det_indices {
+        output_boxes.push(det);
+        let row = mask_tensor.row(idx);
+        mask_coefficients.push(row.iter().map(|v| v.as_()).collect());
+    }
+    let protos_f32 = protos.map(|v| v.as_());
+    ProtoData {
+        mask_coefficients,
+        protos: ProtoTensor::Float(protos_f32),
+    }
+}
+
+/// Helper: extract ProtoData from quantized mask coefficients + protos.
+///
+/// Dequantizes mask coefficients to f32 (small — per-detection) but keeps
+/// protos in raw int8 form wrapped in `ProtoTensor::Quantized` so the GPU
+/// shader can dequantize per-texel without CPU overhead.
+fn extract_proto_data_quant<
+    MASK: PrimInt + AsPrimitive<f32> + Send + Sync,
+    PROTO: PrimInt + AsPrimitive<f32> + AsPrimitive<i8> + Send + Sync,
+>(
+    det_indices: Vec<(DetectBox, usize)>,
+    mask_tensor: ArrayView2<MASK>,
+    quant_masks: Quantization,
+    protos: ArrayView3<PROTO>,
+    quant_protos: Quantization,
+    output_boxes: &mut Vec<DetectBox>,
+) -> ProtoData {
+    let mut mask_coefficients = Vec::with_capacity(det_indices.len());
+    output_boxes.clear();
+    for (det, idx) in det_indices {
+        output_boxes.push(det);
+        let row = mask_tensor.row(idx);
+        mask_coefficients.push(
+            row.iter()
+                .map(|v| (v.as_() - quant_masks.zero_point as f32) * quant_masks.scale)
+                .collect(),
+        );
+    }
+    // Keep protos in raw int8 — GPU shader will dequantize per-texel.
+    let protos_i8 = protos.map(|v| {
+        let v_i8: i8 = v.as_();
+        v_i8
+    });
+    ProtoData {
+        mask_coefficients,
+        protos: ProtoTensor::Quantized {
+            protos: protos_i8,
+            quantization: quant_protos,
+        },
     }
 }
 

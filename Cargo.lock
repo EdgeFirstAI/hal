@@ -710,6 +710,7 @@ dependencies = [
  "four-char-code",
  "g2d-sys",
  "gls",
+ "half",
  "image",
  "image-compare",
  "jpeg-encoder",

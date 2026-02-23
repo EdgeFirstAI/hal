@@ -446,6 +446,68 @@ pub struct Segmentation {
     pub segmentation: Array3<u8>,
 }
 
+/// Prototype tensor variants for fused decode+render pipelines.
+///
+/// Carries either raw quantized data (to skip CPU dequantization and let the
+/// GPU shader dequantize) or dequantized f32 data (from float models or legacy
+/// paths).
+#[derive(Debug, Clone)]
+pub enum ProtoTensor {
+    /// Raw int8 protos with quantization parameters — skip CPU dequantization.
+    /// The GPU fragment shader will dequantize per-texel using the scale and
+    /// zero_point.
+    Quantized {
+        protos: Array3<i8>,
+        quantization: Quantization,
+    },
+    /// Dequantized f32 protos (from float models or legacy path).
+    Float(Array3<f32>),
+}
+
+impl ProtoTensor {
+    /// Returns `true` if this is the quantized variant.
+    pub fn is_quantized(&self) -> bool {
+        matches!(self, ProtoTensor::Quantized { .. })
+    }
+
+    /// Returns the spatial dimensions `(height, width, num_protos)`.
+    pub fn dim(&self) -> (usize, usize, usize) {
+        match self {
+            ProtoTensor::Quantized { protos, .. } => protos.dim(),
+            ProtoTensor::Float(arr) => arr.dim(),
+        }
+    }
+
+    /// Returns dequantized f32 protos. For the `Float` variant this is a
+    /// no-copy reference; for `Quantized` it allocates and dequantizes.
+    pub fn as_f32(&self) -> std::borrow::Cow<'_, Array3<f32>> {
+        match self {
+            ProtoTensor::Float(arr) => std::borrow::Cow::Borrowed(arr),
+            ProtoTensor::Quantized {
+                protos,
+                quantization,
+            } => {
+                let scale = quantization.scale;
+                let zp = quantization.zero_point as f32;
+                std::borrow::Cow::Owned(protos.map(|&v| (v as f32 - zp) * scale))
+            }
+        }
+    }
+}
+
+/// Raw prototype data for fused decode+render pipelines.
+///
+/// Holds post-NMS intermediate state before mask materialization, allowing the
+/// renderer to compute `mask_coeff @ protos` directly (e.g. in a GPU fragment
+/// shader) without materializing intermediate `Array3<u8>` masks.
+#[derive(Debug, Clone)]
+pub struct ProtoData {
+    /// Mask coefficients per detection (each `Vec<f32>` has length `num_protos`).
+    pub mask_coefficients: Vec<Vec<f32>>,
+    /// Prototype tensor, shape `(proto_h, proto_w, num_protos)`.
+    pub protos: ProtoTensor,
+}
+
 /// Turns a DetectBoxQuantized into a DetectBox by dequantizing the score.
 ///
 ///  # Examples

@@ -68,8 +68,8 @@ format: format-rust format-python
 
 .PHONY: format-rust
 format-rust:
-	@echo "Formatting Rust code with nightly..."
-	@cargo +nightly fmt --all 2>/dev/null || cargo fmt --all
+	@echo "Formatting Rust code..."
+	@cargo fmt --all
 	@echo "✓ Rust formatting complete"
 
 .PHONY: format-python

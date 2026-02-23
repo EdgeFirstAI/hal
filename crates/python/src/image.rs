@@ -189,7 +189,7 @@ impl TryFrom<FourCharCode> for FourCC {
 }
 
 #[pyclass(name = "TensorImage")]
-pub struct PyTensorImage(image::TensorImage);
+pub struct PyTensorImage(pub(crate) image::TensorImage);
 
 #[pymethods]
 impl PyTensorImage {
@@ -940,7 +940,7 @@ pub fn probe_egl_displays() -> Result<Vec<PyEglDisplayInfo>> {
 }
 
 #[pyclass(name = "ImageProcessor")]
-pub struct PyImageProcessor(Mutex<image::ImageProcessor>);
+pub struct PyImageProcessor(pub(crate) Mutex<image::ImageProcessor>);
 
 unsafe impl Send for PyImageProcessor {}
 unsafe impl Sync for PyImageProcessor {}
@@ -1068,6 +1068,29 @@ impl PyImageProcessor {
     pub fn set_class_colors(&mut self, colors: Vec<[u8; 4]>) -> Result<()> {
         if let Ok(mut l) = self.0.lock() {
             l.set_class_colors(&colors)?
+        };
+        Ok(())
+    }
+
+    /// Sets the interpolation mode for int8 proto textures.
+    ///
+    /// Accepts "nearest", "bilinear", or "twopass". Default is "bilinear".
+    /// Only affects rendering of quantized (int8) proto segmentation masks.
+    #[cfg(target_os = "linux")]
+    #[pyo3(signature = (mode))]
+    pub fn set_int8_interpolation(&mut self, mode: &str) -> Result<()> {
+        let mode = match mode {
+            "nearest" => image::Int8InterpolationMode::Nearest,
+            "bilinear" => image::Int8InterpolationMode::Bilinear,
+            "twopass" => image::Int8InterpolationMode::TwoPass,
+            _ => {
+                return Err(Error::InvalidArg(format!(
+                    "Unknown interpolation mode '{mode}'. Expected 'nearest', 'bilinear', or 'twopass'"
+                )))
+            }
+        };
+        if let Ok(mut l) = self.0.lock() {
+            l.set_int8_interpolation_mode(mode)?
         };
         Ok(())
     }
