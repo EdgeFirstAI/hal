@@ -29,59 +29,66 @@ static const char* YOLO_YAML_CONFIG =
 // Decoder Params Tests
 // =============================================================================
 
-static void test_decoder_params_default(void) {
-    TEST("decoder_params_default");
+static void test_decoder_params_new(void) {
+    TEST("decoder_params_new");
 
-    struct hal_decoder_params params = hal_decoder_params_default();
-    ASSERT_NULL(params.config_json);
-    ASSERT_NULL(params.config_yaml);
-    ASSERT_NULL(params.config_file);
-    ASSERT_FLOAT_EQ(0.5f, params.score_threshold, 0.001f);
-    ASSERT_FLOAT_EQ(0.5f, params.iou_threshold, 0.001f);
-    ASSERT_EQ(HAL_NMS_CLASS_AGNOSTIC, params.nms);
+    struct hal_decoder_params* params = hal_decoder_params_new();
+    ASSERT_NOT_NULL(params);
 
+    hal_decoder_params_free(params);
     TEST_PASS();
 }
 
 static void test_decoder_new_with_json(void) {
     TEST("decoder_new_with_json");
 
-    struct hal_decoder_params params = hal_decoder_params_default();
-    params.config_json = YOLO_JSON_CONFIG;
+    struct hal_decoder_params* params = hal_decoder_params_new();
+    ASSERT_NOT_NULL(params);
 
-    struct hal_decoder* decoder = hal_decoder_new(&params);
+    int rc = hal_decoder_params_set_config_json(params, YOLO_JSON_CONFIG, 0);
+    ASSERT_EQ(0, rc);
+
+    struct hal_decoder* decoder = hal_decoder_new(params);
     ASSERT_NOT_NULL(decoder);
 
     hal_decoder_free(decoder);
+    hal_decoder_params_free(params);
     TEST_PASS();
 }
 
 static void test_decoder_new_with_yaml(void) {
     TEST("decoder_new_with_yaml");
 
-    struct hal_decoder_params params = hal_decoder_params_default();
-    params.config_yaml = YOLO_YAML_CONFIG;
+    struct hal_decoder_params* params = hal_decoder_params_new();
+    ASSERT_NOT_NULL(params);
 
-    struct hal_decoder* decoder = hal_decoder_new(&params);
+    int rc = hal_decoder_params_set_config_yaml(params, YOLO_YAML_CONFIG, 0);
+    ASSERT_EQ(0, rc);
+
+    struct hal_decoder* decoder = hal_decoder_new(params);
     ASSERT_NOT_NULL(decoder);
 
     hal_decoder_free(decoder);
+    hal_decoder_params_free(params);
     TEST_PASS();
 }
 
 static void test_decoder_new_with_thresholds(void) {
     TEST("decoder_new_with_thresholds");
 
-    struct hal_decoder_params params = hal_decoder_params_default();
-    params.config_json = YOLO_JSON_CONFIG;
-    params.score_threshold = 0.25f;
-    params.iou_threshold = 0.45f;
-    params.nms = HAL_NMS_CLASS_AWARE;
+    struct hal_decoder_params* params = hal_decoder_params_new();
+    ASSERT_NOT_NULL(params);
 
-    struct hal_decoder* decoder = hal_decoder_new(&params);
+    hal_decoder_params_set_config_json(params, YOLO_JSON_CONFIG, 0);
+    hal_decoder_params_set_score_threshold(params, 0.25f);
+    hal_decoder_params_set_iou_threshold(params, 0.45f);
+    hal_decoder_params_set_nms(params, HAL_NMS_CLASS_AWARE);
+
+    struct hal_decoder* decoder = hal_decoder_new(params);
     ASSERT_NOT_NULL(decoder);
 
     hal_decoder_free(decoder);
+    hal_decoder_params_free(params);
     TEST_PASS();
 }
 
@@ -99,27 +106,44 @@ static void test_decoder_new_null_params(void) {
 static void test_decoder_new_no_config(void) {
     TEST("decoder_new_no_config");
 
-    struct hal_decoder_params params = hal_decoder_params_default();
+    struct hal_decoder_params* params = hal_decoder_params_new();
+    ASSERT_NOT_NULL(params);
 
     errno = 0;
-    struct hal_decoder* decoder = hal_decoder_new(&params);
+    struct hal_decoder* decoder = hal_decoder_new(params);
     ASSERT_NULL(decoder);
     ASSERT_ERRNO(EINVAL);
 
+    hal_decoder_params_free(params);
     TEST_PASS();
 }
 
-static void test_decoder_new_multiple_configs(void) {
-    TEST("decoder_new_multiple_configs");
+static void test_decoder_params_null_handling(void) {
+    TEST("decoder_params_null_handling");
 
-    struct hal_decoder_params params = hal_decoder_params_default();
-    params.config_json = YOLO_JSON_CONFIG;
-    params.config_yaml = YOLO_YAML_CONFIG;
+    // All setter functions should return -1 with EINVAL on NULL params
+    errno = 0;
+    ASSERT_EQ(-1, hal_decoder_params_set_config_json(NULL, "{}", 0));
+    ASSERT_ERRNO(EINVAL);
 
     errno = 0;
-    struct hal_decoder* decoder = hal_decoder_new(&params);
-    ASSERT_NULL(decoder);
+    ASSERT_EQ(-1, hal_decoder_params_set_config_yaml(NULL, "---", 0));
     ASSERT_ERRNO(EINVAL);
+
+    errno = 0;
+    ASSERT_EQ(-1, hal_decoder_params_set_config_file(NULL, "test.yaml"));
+    ASSERT_ERRNO(EINVAL);
+
+    errno = 0;
+    ASSERT_EQ(-1, hal_decoder_params_set_score_threshold(NULL, 0.5f));
+    ASSERT_ERRNO(EINVAL);
+
+    errno = 0;
+    ASSERT_EQ(-1, hal_decoder_params_set_iou_threshold(NULL, 0.5f));
+    ASSERT_ERRNO(EINVAL);
+
+    // Free NULL should be no-op
+    hal_decoder_params_free(NULL);
 
     TEST_PASS();
 }
@@ -213,11 +237,13 @@ static void test_decoder_decode_invalid_params(void) {
     TEST("decoder_decode_invalid_params");
 
     // Build a decoder with valid Ultralytics YOLO config
-    struct hal_decoder_params params = hal_decoder_params_default();
-    params.config_json = YOLO_JSON_CONFIG;
+    struct hal_decoder_params* params = hal_decoder_params_new();
+    ASSERT_NOT_NULL(params);
+    hal_decoder_params_set_config_json(params, YOLO_JSON_CONFIG, 0);
 
-    struct hal_decoder* decoder = hal_decoder_new(&params);
+    struct hal_decoder* decoder = hal_decoder_new(params);
     ASSERT_NOT_NULL(decoder);
+    hal_decoder_params_free(params);
 
     struct hal_detect_box_list* boxes = NULL;
 
@@ -256,11 +282,13 @@ static void test_decoder_decode_invalid_params(void) {
 static void test_decoder_model_type(void) {
     TEST("decoder_model_type");
 
-    struct hal_decoder_params params = hal_decoder_params_default();
-    params.config_json = YOLO_JSON_CONFIG;
+    struct hal_decoder_params* params = hal_decoder_params_new();
+    ASSERT_NOT_NULL(params);
+    hal_decoder_params_set_config_json(params, YOLO_JSON_CONFIG, 0);
 
-    struct hal_decoder* decoder = hal_decoder_new(&params);
+    struct hal_decoder* decoder = hal_decoder_new(params);
     ASSERT_NOT_NULL(decoder);
+    hal_decoder_params_free(params);
 
     char* model_type = hal_decoder_model_type(decoder);
     ASSERT_NOT_NULL(model_type);
@@ -278,11 +306,13 @@ static void test_decoder_model_type(void) {
 static void test_decoder_normalized_boxes(void) {
     TEST("decoder_normalized_boxes");
 
-    struct hal_decoder_params params = hal_decoder_params_default();
-    params.config_json = YOLO_JSON_CONFIG;
+    struct hal_decoder_params* params = hal_decoder_params_new();
+    ASSERT_NOT_NULL(params);
+    hal_decoder_params_set_config_json(params, YOLO_JSON_CONFIG, 0);
 
-    struct hal_decoder* decoder = hal_decoder_new(&params);
+    struct hal_decoder* decoder = hal_decoder_new(params);
     ASSERT_NOT_NULL(decoder);
+    hal_decoder_params_free(params);
 
     int result = hal_decoder_normalized_boxes(decoder);
     // Result is 1, 0, or -1 (unknown)
@@ -350,13 +380,13 @@ void run_decoder_tests(void) {
     TEST_SUITE("Decoder");
 
     // Params tests
-    test_decoder_params_default();
+    test_decoder_params_new();
     test_decoder_new_with_json();
     test_decoder_new_with_yaml();
     test_decoder_new_with_thresholds();
     test_decoder_new_null_params();
     test_decoder_new_no_config();
-    test_decoder_new_multiple_configs();
+    test_decoder_params_null_handling();
 
     // Detection box list tests
     test_detect_box_list_null_handling();
