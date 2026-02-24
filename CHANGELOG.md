@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-02-24
+
+### Added
+
+- GPU per-instance segmentation mask rendering: `decode_and_render_masks()` Python
+  binding and `render_masks_from_protos()` on `ImageProcessorTrait` with GL, CPU,
+  and G2D (stub) backends — renders sigmoid(mask_coeff @ protos) in fragment shaders,
+  eliminating CPU mask computation and per-mask GL resize roundtrips
+- EGL display probe and override API: `probe_egl_displays()`, `EglDisplayKind` enum,
+  `EglDisplayInfo` struct, and `ImageProcessor::with_config()` constructor in Rust;
+  `EglDisplayKind`, `EglDisplayInfo`, `probe_egl_displays()`, and
+  `ImageProcessor(egl_display=...)` in Python — enables selecting or avoiding specific
+  EGL display types on problematic hardware (e.g. Vivante GBM on i.MX8)
+- Python API for programmatic decoder configuration (EDGEAI-774): `DecoderType`,
+  `DecoderVersion`, `DimName` enums, `Output` class with factory methods
+  (`detection`, `boxes`, `scores`, `protos`, `segmentation`, `mask_coefficients`,
+  `mask`), and `Decoder.new_from_outputs()` constructor
+- Decoder builder API with programmatic output configuration and C API refactoring
+  to opaque `hal_decoder_params` pattern with setter functions
+- `yolov8` serde alias for `DecoderType::Ultralytics` so old model metadata
+  with `decoder: yolov8` deserializes without migration
+- Dict-format `dshape` deserialization in decoder configs: accepts both
+  array-of-single-key-dicts (`[{"batch": 1}, ...]`) and array-of-tuples formats
+- Segmentation pipeline comparison script (`example_seg_pipeline.py`): end-to-end
+  OpenCV vs HAL decode vs HAL fused benchmark for YOLOv8-seg INT8 TFLite
+
+### Fixed
+
+- NV16 handling in `TensorImage::new()`, `width()`, `height()`, `channels()`:
+  constructor created wrong 3D shape instead of 2D `[H*2, W]`, and accessors
+  only special-cased NV12, causing index-out-of-bounds panics
+- NV12/NV16 in `TensorImageRef::from_borrowed_tensor`: expected all formats to
+  have 3D tensor shapes, causing index-out-of-bounds panic for semi-planar
+  formats via the borrowed reference path (`hal_image_processor_convert_ref`)
+
 ## [0.7.0] - 2026-02-17
 
 ### Added
