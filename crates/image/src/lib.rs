@@ -1309,6 +1309,7 @@ impl ImageProcessor {
     /// This allows overriding the EGL display type used for OpenGL
     /// acceleration. The `EDGEFIRST_DISABLE_GL=1` environment variable
     /// still takes precedence over any override.
+    #[allow(unused_variables)]
     pub fn with_config(config: ImageProcessorConfig) -> Result<Self> {
         #[cfg(target_os = "linux")]
         let g2d = if std::env::var("EDGEFIRST_DISABLE_G2D")

@@ -382,7 +382,7 @@ pub unsafe extern "C" fn hal_decoder_params_set_config_json(
             Err(_) => return set_error(libc::EINVAL),
         }
     } else {
-        let bytes = std::slice::from_raw_parts(json as *const u8, len);
+        let bytes = std::slice::from_raw_parts(json.cast::<u8>(), len);
         match std::str::from_utf8(bytes) {
             Ok(s) => s.to_string(),
             Err(_) => return set_error(libc::EINVAL),
@@ -414,7 +414,7 @@ pub unsafe extern "C" fn hal_decoder_params_set_config_yaml(
             Err(_) => return set_error(libc::EINVAL),
         }
     } else {
-        let bytes = std::slice::from_raw_parts(yaml as *const u8, len);
+        let bytes = std::slice::from_raw_parts(yaml.cast::<u8>(), len);
         match std::str::from_utf8(bytes) {
             Ok(s) => s.to_string(),
             Err(_) => return set_error(libc::EINVAL),
@@ -1874,10 +1874,7 @@ nms: class_aware
                 -1
             );
             assert_eq!(
-                hal_decoder_params_set_config_file(
-                    std::ptr::null_mut(),
-                    b"path\0".as_ptr() as *const c_char
-                ),
+                hal_decoder_params_set_config_file(std::ptr::null_mut(), c"path".as_ptr()),
                 -1
             );
             assert_eq!(
