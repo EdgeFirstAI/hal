@@ -1280,7 +1280,7 @@ fn extract_proto_data_float<
 /// Dequantizes mask coefficients to f32 (small — per-detection) but keeps
 /// protos in raw int8 form wrapped in `ProtoTensor::Quantized` so the GPU
 /// shader can dequantize per-texel without CPU overhead.
-fn extract_proto_data_quant<
+pub(crate) fn extract_proto_data_quant<
     MASK: PrimInt + AsPrimitive<f32> + Send + Sync,
     PROTO: PrimInt + AsPrimitive<f32> + AsPrimitive<i8> + Send + Sync,
 >(

@@ -2493,6 +2493,12 @@ impl<'a> ArrayViewDQuantized<'a> {
     }
 }
 
+/// WARNING: Do NOT nest `with_quantized!` calls. Each level multiplies
+/// monomorphized code paths by 6 (one per integer variant), so nesting
+/// N levels deep produces 6^N instantiations.
+///
+/// Instead, dequantize each tensor sequentially with `dequant_3d!`/`dequant_4d!`
+/// (6*N paths) or split into independent phases that each nest at most 2 levels.
 macro_rules! with_quantized {
     ($x:expr, $var:ident, $body:expr) => {
         match $x {
@@ -3742,31 +3748,43 @@ impl Decoder {
             .map(Quantization::from)
             .unwrap_or_default();
 
-        with_quantized!(det_tensor, d, {
-            with_quantized!(protos_tensor, p, {
-                let d = Self::swap_axes_if_needed(d, boxes_config.into());
-                let d = d.slice(s![0, .., ..]);
-                let dequant_d = d.map(|v| {
-                    let val: f32 = v.as_();
-                    (val - quant_det.zero_point as f32) * quant_det.scale
-                });
+        // Dequantize each tensor independently to avoid monomorphization explosion.
+        // Nesting 2 with_quantized! calls produces 6^2 = 36 instantiations; sequential is 6*2 = 12.
+        macro_rules! dequant_3d {
+            ($tensor:expr, $config:expr, $quant:expr) => {{
+                with_quantized!($tensor, t, {
+                    let t = Self::swap_axes_if_needed(t, $config.into());
+                    let t = t.slice(s![0, .., ..]);
+                    t.map(|v| {
+                        let val: f32 = v.as_();
+                        (val - $quant.zero_point as f32) * $quant.scale
+                    })
+                })
+            }};
+        }
+        macro_rules! dequant_4d {
+            ($tensor:expr, $config:expr, $quant:expr) => {{
+                with_quantized!($tensor, t, {
+                    let t = Self::swap_axes_if_needed(t, $config.into());
+                    let t = t.slice(s![0, .., .., ..]);
+                    t.map(|v| {
+                        let val: f32 = v.as_();
+                        (val - $quant.zero_point as f32) * $quant.scale
+                    })
+                })
+            }};
+        }
 
-                let p = Self::swap_axes_if_needed(p, protos_config.into());
-                let p = p.slice(s![0, .., .., ..]);
-                let dequant_p = p.map(|v| {
-                    let val: f32 = v.as_();
-                    (val - quant_protos.zero_point as f32) * quant_protos.scale
-                });
+        let dequant_d = dequant_3d!(det_tensor, boxes_config, quant_det);
+        let dequant_p = dequant_4d!(protos_tensor, protos_config, quant_protos);
 
-                crate::yolo::decode_yolo_end_to_end_segdet_float(
-                    dequant_d.view(),
-                    dequant_p.view(),
-                    self.score_threshold,
-                    output_boxes,
-                    output_masks,
-                )?;
-            });
-        });
+        crate::yolo::decode_yolo_end_to_end_segdet_float(
+            dequant_d.view(),
+            dequant_p.view(),
+            self.score_threshold,
+            output_boxes,
+            output_masks,
+        )?;
         Ok(())
     }
 
@@ -4147,7 +4165,8 @@ impl Decoder {
         let (protos_tensor, _) =
             Self::find_outputs_with_shape_quantized(&protos.shape, outputs, &skip)?;
 
-        let proto = with_quantized!(boxes_tensor, b, {
+        // Phase 1: boxes + scores (2-level nesting, 36 paths).
+        let det_indices = with_quantized!(boxes_tensor, b, {
             with_quantized!(scores_tensor, s, {
                 let boxes_tensor = Self::swap_axes_if_needed(b, boxes.into());
                 let boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
@@ -4155,26 +4174,35 @@ impl Decoder {
                 let scores_tensor = Self::swap_axes_if_needed(s, scores.into());
                 let scores_tensor = scores_tensor.slice(s![0, .., ..]);
 
-                with_quantized!(mask_tensor, m, {
-                    with_quantized!(protos_tensor, p, {
-                        let mask_tensor = Self::swap_axes_if_needed(m, mask_coeff.into());
-                        let mask_tensor = mask_tensor.slice(s![0, .., ..]);
+                impl_yolo_split_segdet_quant_get_boxes::<XYWH, _, _>(
+                    (boxes_tensor, quant_boxes),
+                    (scores_tensor, quant_scores),
+                    self.score_threshold,
+                    self.iou_threshold,
+                    self.nms,
+                    output_boxes.capacity(),
+                )
+            })
+        });
 
-                        let protos_tensor = Self::swap_axes_if_needed(p, protos.into());
-                        let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
+        // Phase 2: masks + protos (2-level nesting, 36 paths).
+        let proto = with_quantized!(mask_tensor, m, {
+            with_quantized!(protos_tensor, p, {
+                let mask_tensor = Self::swap_axes_if_needed(m, mask_coeff.into());
+                let mask_tensor = mask_tensor.slice(s![0, .., ..]);
+                let mask_tensor = mask_tensor.reversed_axes();
 
-                        crate::yolo::impl_yolo_split_segdet_quant_proto::<XYWH, _, _, _, _>(
-                            (boxes_tensor, quant_boxes),
-                            (scores_tensor, quant_scores),
-                            (mask_tensor, quant_masks),
-                            (protos_tensor, quant_protos),
-                            self.score_threshold,
-                            self.iou_threshold,
-                            self.nms,
-                            output_boxes,
-                        )
-                    })
-                })
+                let protos_tensor = Self::swap_axes_if_needed(p, protos.into());
+                let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
+
+                crate::yolo::extract_proto_data_quant(
+                    det_indices,
+                    mask_tensor,
+                    quant_masks,
+                    protos_tensor,
+                    quant_protos,
+                    output_boxes,
+                )
             })
         });
         Ok(proto)
@@ -4288,30 +4316,42 @@ impl Decoder {
             .map(Quantization::from)
             .unwrap_or_default();
 
-        let proto = with_quantized!(det_tensor, d, {
-            with_quantized!(protos_tensor, p, {
-                let d = Self::swap_axes_if_needed(d, boxes_config.into());
-                let d = d.slice(s![0, .., ..]);
-                let dequant_d = d.map(|v| {
-                    let val: f32 = v.as_();
-                    (val - quant_det.zero_point as f32) * quant_det.scale
-                });
+        // Dequantize each tensor independently to avoid monomorphization explosion.
+        // Nesting 2 with_quantized! calls produces 6^2 = 36 instantiations; sequential is 6*2 = 12.
+        macro_rules! dequant_3d {
+            ($tensor:expr, $config:expr, $quant:expr) => {{
+                with_quantized!($tensor, t, {
+                    let t = Self::swap_axes_if_needed(t, $config.into());
+                    let t = t.slice(s![0, .., ..]);
+                    t.map(|v| {
+                        let val: f32 = v.as_();
+                        (val - $quant.zero_point as f32) * $quant.scale
+                    })
+                })
+            }};
+        }
+        macro_rules! dequant_4d {
+            ($tensor:expr, $config:expr, $quant:expr) => {{
+                with_quantized!($tensor, t, {
+                    let t = Self::swap_axes_if_needed(t, $config.into());
+                    let t = t.slice(s![0, .., .., ..]);
+                    t.map(|v| {
+                        let val: f32 = v.as_();
+                        (val - $quant.zero_point as f32) * $quant.scale
+                    })
+                })
+            }};
+        }
 
-                let p = Self::swap_axes_if_needed(p, protos_config.into());
-                let p = p.slice(s![0, .., .., ..]);
-                let dequant_p = p.map(|v| {
-                    let val: f32 = v.as_();
-                    (val - quant_protos.zero_point as f32) * quant_protos.scale
-                });
+        let dequant_d = dequant_3d!(det_tensor, boxes_config, quant_det);
+        let dequant_p = dequant_4d!(protos_tensor, protos_config, quant_protos);
 
-                crate::yolo::decode_yolo_end_to_end_segdet_float_proto(
-                    dequant_d.view(),
-                    dequant_p.view(),
-                    self.score_threshold,
-                    output_boxes,
-                )
-            })
-        })?;
+        let proto = crate::yolo::decode_yolo_end_to_end_segdet_float_proto(
+            dequant_d.view(),
+            dequant_p.view(),
+            self.score_threshold,
+            output_boxes,
+        )?;
         Ok(proto)
     }
 

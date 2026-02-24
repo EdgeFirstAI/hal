@@ -511,6 +511,7 @@ When adding features:
 4. **Don't forget Python type stubs** - Update `.pyi` when adding Python APIs
 5. **Don't skip tests** - Add both Rust and Python tests for new features
 6. **Don't forget documentation** - Public APIs need doc comments
+7. **Don't nest `with_quantized!` macros** - Each nesting level multiplies monomorphized paths by 6 (6^N explosion). Dequantize tensors sequentially with `dequant_3d!`/`dequant_4d!` helpers, or split into independent phases that each nest at most 2 levels
 
 ---
 
