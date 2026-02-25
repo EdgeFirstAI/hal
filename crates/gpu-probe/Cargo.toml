@@ -1,0 +1,24 @@
+[package]
+name = "gpu-probe"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Low-level GPU platform exploration and benchmarking tool"
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+edgefirst-tensor = { workspace = true }
+gbm = { workspace = true }
+gls = { workspace = true }
+khronos-egl = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+nix = { workspace = true }
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+four-char-code = { workspace = true }
+libloading = { workspace = true }

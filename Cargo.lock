@@ -1112,6 +1112,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpu-probe"
+version = "0.8.0"
+dependencies = [
+ "edgefirst-gbm",
+ "edgefirst-tensor",
+ "env_logger",
+ "four-char-code",
+ "gls",
+ "khronos-egl",
+ "libc",
+ "libloading",
+ "log",
+ "nix 0.30.1",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
