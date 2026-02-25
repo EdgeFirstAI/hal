@@ -10,6 +10,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+edgefirst-bench = { workspace = true }
 edgefirst-tensor = { workspace = true }
 gbm = { workspace = true }
 gls = { workspace = true }
