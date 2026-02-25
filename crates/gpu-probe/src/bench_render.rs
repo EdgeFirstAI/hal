@@ -111,12 +111,7 @@ pub(crate) fn compile_program(vert: &CString, frag: &CString) -> Result<u32, Str
             let mut len: i32 = 0;
             gls::gl::GetProgramiv(program, gls::gl::INFO_LOG_LENGTH, &mut len);
             let mut log = vec![0u8; len.max(1) as usize];
-            gls::gl::GetProgramInfoLog(
-                program,
-                len,
-                std::ptr::null_mut(),
-                log.as_mut_ptr().cast(),
-            );
+            gls::gl::GetProgramInfoLog(program, len, std::ptr::null_mut(), log.as_mut_ptr().cast());
             gls::gl::DetachShader(program, vs);
             gls::gl::DetachShader(program, fs);
             gls::gl::DeleteShader(vs);
