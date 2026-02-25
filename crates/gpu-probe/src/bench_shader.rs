@@ -108,10 +108,11 @@ pub fn run(_ctx: &GpuContext) -> Vec<BenchResult> {
         let frag_cstr =
             CString::new(frag_src).expect("fragment shader source contains interior null byte");
 
-        // Verify the shader pair compiles at least once before benchmarking.
-        // The YUV external shader requires GL_OES_EGL_image_external_essl3
-        // which may not be available on all drivers.
-        let compiles = unsafe {
+        // Verify the shader pair compiles and links at least once before
+        // benchmarking. The YUV external shader requires
+        // GL_OES_EGL_image_external_essl3 which may not be available on all
+        // drivers.
+        let links = unsafe {
             let vs = gls::gl::CreateShader(gls::gl::VERTEX_SHADER);
             let vs_ptr = vert_cstr.as_ptr();
             gls::gl::ShaderSource(vs, 1, &raw const vs_ptr, null());
@@ -126,15 +127,30 @@ pub fn run(_ctx: &GpuContext) -> Vec<BenchResult> {
             let mut fs_ok: i32 = 0;
             gls::gl::GetShaderiv(fs, gls::gl::COMPILE_STATUS, &mut fs_ok);
 
+            let link_ok = if vs_ok != 0 && fs_ok != 0 {
+                let program = gls::gl::CreateProgram();
+                gls::gl::AttachShader(program, vs);
+                gls::gl::AttachShader(program, fs);
+                gls::gl::LinkProgram(program);
+                let mut ok: i32 = 0;
+                gls::gl::GetProgramiv(program, gls::gl::LINK_STATUS, &mut ok);
+                gls::gl::DetachShader(program, vs);
+                gls::gl::DetachShader(program, fs);
+                gls::gl::DeleteProgram(program);
+                ok != 0
+            } else {
+                false
+            };
+
             gls::gl::DeleteShader(vs);
             gls::gl::DeleteShader(fs);
 
-            vs_ok != 0 && fs_ok != 0
+            link_ok
         };
 
-        if !compiles {
+        if !links {
             println!(
-                "  SKIP shader_compile_link/{label}: shader compilation failed on this driver"
+                "  SKIP shader_compile_link/{label}: shader compile/link failed on this driver"
             );
             continue;
         }

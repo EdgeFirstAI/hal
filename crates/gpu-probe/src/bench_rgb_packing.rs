@@ -179,10 +179,13 @@ fn compile_packing_program(frag_src: &str) -> Option<(u32, i32, i32, i32)> {
     let vert = CString::new(bench_render::VERTEX_SRC)
         .expect("vertex shader source contains interior null byte");
     let frag = CString::new(frag_src).expect("fragment shader source contains interior null byte");
-    let program = bench_render::compile_program(&vert, &frag);
-    if program == 0 {
-        return None;
-    }
+    let program = match bench_render::compile_program(&vert, &frag) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("  shader compile failed: {e}");
+            return None;
+        }
+    };
     unsafe {
         let tex_loc = gls::gl::GetUniformLocation(program, CString::new("tex").unwrap().as_ptr());
         let sw_loc = gls::gl::GetUniformLocation(program, CString::new("src_w").unwrap().as_ptr());

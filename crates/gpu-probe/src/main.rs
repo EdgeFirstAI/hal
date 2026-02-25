@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-mod bench;
+use edgefirst_bench as bench;
 mod bench_dma;
 mod bench_egl_image;
 mod bench_fbo;
@@ -22,6 +22,7 @@ fn main() {
 
     let probe_only = std::env::args().any(|a| a == "--probe-only");
     let bench_only = std::env::args().any(|a| a == "--bench-only");
+    let skip_pipeline = std::env::args().any(|a| a == "--skip-pipeline");
 
     println!("gpu-probe: Low-level GPU platform exploration tool");
     println!("  arch: {}", std::env::consts::ARCH);
@@ -50,14 +51,42 @@ fn main() {
     // Benchmarks
     if !probe_only {
         bench_dma::run();
-        bench_egl_image::run(&ctx);
+
+        let has_egl_image = ctx.has_egl_create_image_khr();
+
+        if has_egl_image {
+            bench_egl_image::run(&ctx);
+        } else {
+            println!("== Benchmark: EGL Image == SKIP (EGL_EXT_image_dma_buf_import not available)");
+            println!();
+        }
+
         bench_fbo::run(&ctx);
         bench_texture::run(&ctx);
         bench_shader::run(&ctx);
-        bench_render::run(&ctx);
-        bench_pipeline::run_verify(&ctx);
-        bench_pipeline::run(&ctx);
-        bench_rgb_packing::run_verify(&ctx);
-        bench_rgb_packing::run(&ctx);
+
+        if has_egl_image {
+            bench_render::run(&ctx);
+        } else {
+            println!("== Benchmark: Full Render Pipeline == SKIP (EGL_EXT_image_dma_buf_import not available)");
+            println!();
+        }
+
+        if has_egl_image && !skip_pipeline {
+            bench_pipeline::run_verify(&ctx);
+            bench_pipeline::run(&ctx);
+            bench_rgb_packing::run_verify(&ctx);
+            bench_rgb_packing::run(&ctx);
+        } else if !has_egl_image {
+            println!("== Verification: DMA-buf Pipeline == SKIP (EGL_EXT_image_dma_buf_import not available)");
+            println!();
+            println!("== Benchmark: DMA-buf Pipeline == SKIP (EGL_EXT_image_dma_buf_import not available)");
+            println!();
+        } else {
+            println!("== Verification: DMA-buf Pipeline == SKIP (--skip-pipeline)");
+            println!();
+            println!("== Benchmark: DMA-buf Pipeline == SKIP (--skip-pipeline)");
+            println!();
+        }
     }
 }

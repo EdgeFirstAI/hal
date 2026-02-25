@@ -185,7 +185,7 @@ impl GpuContext {
         egl.bind_api(egl::OPENGL_ES_API)
             .map_err(|e| format!("eglBindAPI failed: {e}"))?;
 
-        let context_attributes = [egl::CONTEXT_MAJOR_VERSION, 3, egl::NONE, egl::NONE];
+        let context_attributes = [egl::CONTEXT_MAJOR_VERSION, 3, egl::NONE];
         let ctx = egl
             .create_context(display, config, None, &context_attributes)
             .map_err(|e| format!("eglCreateContext failed: {e}"))?;
@@ -298,7 +298,10 @@ impl GpuContext {
             .query_string(Some(self.display), egl::EXTENSIONS)
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        if !exts.contains("EGL_EXT_image_dma_buf_import") {
+        let has_ext = exts
+            .split_ascii_whitespace()
+            .any(|e| e == "EGL_EXT_image_dma_buf_import");
+        if !has_ext {
             return false;
         }
         self.egl.get_proc_address("eglCreateImageKHR").is_some()
