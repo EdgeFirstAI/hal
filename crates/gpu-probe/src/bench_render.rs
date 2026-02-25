@@ -74,7 +74,7 @@ pub(crate) fn compile_program(vert: &CString, frag: &CString) -> Result<u32, Str
             let mut len: i32 = 0;
             gls::gl::GetShaderiv(vs, gls::gl::INFO_LOG_LENGTH, &mut len);
             let mut log = vec![0u8; len.max(1) as usize];
-            gls::gl::GetShaderInfoLog(vs, len, std::ptr::null_mut(), log.as_mut_ptr() as *mut i8);
+            gls::gl::GetShaderInfoLog(vs, len, std::ptr::null_mut(), log.as_mut_ptr().cast());
             gls::gl::DeleteShader(vs);
             gls::gl::DeleteProgram(program);
             let msg = String::from_utf8_lossy(&log).into_owned();
@@ -93,7 +93,7 @@ pub(crate) fn compile_program(vert: &CString, frag: &CString) -> Result<u32, Str
             let mut len: i32 = 0;
             gls::gl::GetShaderiv(fs, gls::gl::INFO_LOG_LENGTH, &mut len);
             let mut log = vec![0u8; len.max(1) as usize];
-            gls::gl::GetShaderInfoLog(fs, len, std::ptr::null_mut(), log.as_mut_ptr() as *mut i8);
+            gls::gl::GetShaderInfoLog(fs, len, std::ptr::null_mut(), log.as_mut_ptr().cast());
             gls::gl::DetachShader(program, vs);
             gls::gl::DeleteShader(vs);
             gls::gl::DeleteShader(fs);
@@ -115,7 +115,7 @@ pub(crate) fn compile_program(vert: &CString, frag: &CString) -> Result<u32, Str
                 program,
                 len,
                 std::ptr::null_mut(),
-                log.as_mut_ptr() as *mut i8,
+                log.as_mut_ptr().cast(),
             );
             gls::gl::DetachShader(program, vs);
             gls::gl::DetachShader(program, fs);
