@@ -35,7 +35,9 @@ fn fill_solid(tensor: &Tensor<u8>, pixel: [u8; 4]) {
 /// Produces non-uniform pixel data that exercises the bilinear filter during
 /// resize.
 fn fill_gradient(tensor: &Tensor<u8>, width: u32, height: u32) {
-    let mut map = tensor.map().expect("failed to map tensor for fill_gradient");
+    let mut map = tensor
+        .map()
+        .expect("failed to map tensor for fill_gradient");
     let slice = map.as_mut_slice();
     for y in 0..height {
         for x in 0..width {
@@ -51,7 +53,9 @@ fn fill_gradient(tensor: &Tensor<u8>, width: u32, height: u32) {
 /// Verify every pixel in a DMA tensor matches `expected` within per-channel
 /// `tolerance`. Prints the first mismatch on failure and returns false.
 fn verify_pixels(tensor: &Tensor<u8>, expected: [u8; 4], tolerance: u8) -> bool {
-    let map = tensor.map().expect("failed to map tensor for verify_pixels");
+    let map = tensor
+        .map()
+        .expect("failed to map tensor for verify_pixels");
     let slice = map.as_slice();
     for (i, chunk) in slice.chunks_exact(4).enumerate() {
         for c in 0..4 {
@@ -75,7 +79,9 @@ fn verify_pixels(tensor: &Tensor<u8>, expected: [u8; 4], tolerance: u8) -> bool 
 /// we check that the center pixel is non-zero and that at least two different
 /// pixel values exist.
 fn verify_not_zero(tensor: &Tensor<u8>) -> bool {
-    let map = tensor.map().expect("failed to map tensor for verify_not_zero");
+    let map = tensor
+        .map()
+        .expect("failed to map tensor for verify_not_zero");
     let slice = map.as_slice();
 
     if slice.len() < 4 {
@@ -199,10 +205,10 @@ fn run_full_pipeline(
 pub fn run_verify(ctx: &GpuContext) {
     println!("== Verification: DMA-buf Pipeline ==");
 
-    let vert_cstr =
-        CString::new(bench_render::VERTEX_SRC).expect("vertex shader source contains interior null byte");
-    let frag_cstr =
-        CString::new(bench_render::FRAGMENT_SRC).expect("fragment shader source contains interior null byte");
+    let vert_cstr = CString::new(bench_render::VERTEX_SRC)
+        .expect("vertex shader source contains interior null byte");
+    let frag_cstr = CString::new(bench_render::FRAGMENT_SRC)
+        .expect("fragment shader source contains interior null byte");
     let program = bench_render::compile_program(&vert_cstr, &frag_cstr);
     if program == 0 {
         println!("  SKIP: shader program compilation failed");
@@ -330,10 +336,10 @@ pub fn run(ctx: &GpuContext) -> Vec<BenchResult> {
 
     let mut results = Vec::new();
 
-    let vert_cstr =
-        CString::new(bench_render::VERTEX_SRC).expect("vertex shader source contains interior null byte");
-    let frag_cstr =
-        CString::new(bench_render::FRAGMENT_SRC).expect("fragment shader source contains interior null byte");
+    let vert_cstr = CString::new(bench_render::VERTEX_SRC)
+        .expect("vertex shader source contains interior null byte");
+    let frag_cstr = CString::new(bench_render::FRAGMENT_SRC)
+        .expect("fragment shader source contains interior null byte");
     let program = bench_render::compile_program(&vert_cstr, &frag_cstr);
     if program == 0 {
         println!("  SKIP: shader program compilation failed");
@@ -432,12 +438,7 @@ pub fn run(ctx: &GpuContext) -> Vec<BenchResult> {
                     gls::gl::Uniform1i(tex_uniform, 0);
 
                     gls::gl::BindVertexArray(vao);
-                    gls::gl::DrawElements(
-                        gls::gl::TRIANGLES,
-                        6,
-                        gls::gl::UNSIGNED_INT,
-                        null(),
-                    );
+                    gls::gl::DrawElements(gls::gl::TRIANGLES, 6, gls::gl::UNSIGNED_INT, null());
                     gls::gl::Finish();
 
                     gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
@@ -593,12 +594,7 @@ pub fn run(ctx: &GpuContext) -> Vec<BenchResult> {
                     gls::gl::Uniform1i(tex_uniform, 0);
 
                     gls::gl::BindVertexArray(vao);
-                    gls::gl::DrawElements(
-                        gls::gl::TRIANGLES,
-                        6,
-                        gls::gl::UNSIGNED_INT,
-                        null(),
-                    );
+                    gls::gl::DrawElements(gls::gl::TRIANGLES, 6, gls::gl::UNSIGNED_INT, null());
                     gls::gl::Finish();
                 }
 
@@ -680,12 +676,7 @@ pub fn run(ctx: &GpuContext) -> Vec<BenchResult> {
                     gls::gl::Uniform1i(tex_uniform, 0);
 
                     gls::gl::BindVertexArray(vao);
-                    gls::gl::DrawElements(
-                        gls::gl::TRIANGLES,
-                        6,
-                        gls::gl::UNSIGNED_INT,
-                        null(),
-                    );
+                    gls::gl::DrawElements(gls::gl::TRIANGLES, 6, gls::gl::UNSIGNED_INT, null());
                     gls::gl::Finish();
                 }
 
@@ -765,12 +756,7 @@ pub fn run(ctx: &GpuContext) -> Vec<BenchResult> {
                     gls::gl::Uniform1i(tex_uniform, 0);
 
                     gls::gl::BindVertexArray(vao);
-                    gls::gl::DrawElements(
-                        gls::gl::TRIANGLES,
-                        6,
-                        gls::gl::UNSIGNED_INT,
-                        null(),
-                    );
+                    gls::gl::DrawElements(gls::gl::TRIANGLES, 6, gls::gl::UNSIGNED_INT, null());
                     gls::gl::Finish();
                 }
 
@@ -846,12 +832,7 @@ pub fn run(ctx: &GpuContext) -> Vec<BenchResult> {
                     gls::gl::Uniform1i(tex_uniform, 0);
 
                     gls::gl::BindVertexArray(vao);
-                    gls::gl::DrawElements(
-                        gls::gl::TRIANGLES,
-                        6,
-                        gls::gl::UNSIGNED_INT,
-                        null(),
-                    );
+                    gls::gl::DrawElements(gls::gl::TRIANGLES, 6, gls::gl::UNSIGNED_INT, null());
                     gls::gl::Finish();
 
                     gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
