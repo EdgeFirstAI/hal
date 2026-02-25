@@ -18,8 +18,4 @@ khronos-egl = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 nix = { workspace = true }
-libc = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-four-char-code = { workspace = true }
 libloading = { workspace = true }
