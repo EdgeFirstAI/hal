@@ -7,10 +7,13 @@ mod bench_egl_image;
 mod bench_fbo;
 mod bench_pipeline;
 mod bench_render;
+mod bench_rgb_packing;
 mod bench_shader;
 mod bench_texture;
 mod egl_context;
 mod probe;
+mod probe_int_textures;
+mod probe_min_sizes;
 
 use egl_context::GpuContext;
 
@@ -40,6 +43,8 @@ fn main() {
     // Capability probe
     if !bench_only {
         probe::run_probes(&ctx);
+        probe_int_textures::run(&ctx);
+        probe_min_sizes::run(&ctx);
     }
 
     // Benchmarks
@@ -52,5 +57,7 @@ fn main() {
         bench_render::run(&ctx);
         bench_pipeline::run_verify(&ctx);
         bench_pipeline::run(&ctx);
+        bench_rgb_packing::run_verify(&ctx);
+        bench_rgb_packing::run(&ctx);
     }
 }
