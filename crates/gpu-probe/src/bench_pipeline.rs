@@ -209,12 +209,14 @@ pub fn run_verify(ctx: &GpuContext) {
         .expect("vertex shader source contains interior null byte");
     let frag_cstr = CString::new(bench_render::FRAGMENT_SRC)
         .expect("fragment shader source contains interior null byte");
-    let program = bench_render::compile_program(&vert_cstr, &frag_cstr);
-    if program == 0 {
-        println!("  SKIP: shader program compilation failed");
-        println!();
-        return;
-    }
+    let program = match bench_render::compile_program(&vert_cstr, &frag_cstr) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("  SKIP: shader program compilation failed: {e}");
+            println!();
+            return;
+        }
+    };
 
     let tex_uniform = unsafe {
         let name = CString::new("tex").unwrap();
@@ -340,12 +342,14 @@ pub fn run(ctx: &GpuContext) -> Vec<BenchResult> {
         .expect("vertex shader source contains interior null byte");
     let frag_cstr = CString::new(bench_render::FRAGMENT_SRC)
         .expect("fragment shader source contains interior null byte");
-    let program = bench_render::compile_program(&vert_cstr, &frag_cstr);
-    if program == 0 {
-        println!("  SKIP: shader program compilation failed");
-        println!();
-        return results;
-    }
+    let program = match bench_render::compile_program(&vert_cstr, &frag_cstr) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("  SKIP: shader program compilation failed: {e}");
+            println!();
+            return results;
+        }
+    };
 
     let tex_uniform = unsafe {
         let name = CString::new("tex").unwrap();
