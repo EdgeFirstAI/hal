@@ -119,11 +119,7 @@ pub fn run(ctx: &GpuContext) {
     ];
     for &(w, h, label) in r8_configs {
         let ok = try_egl_image(ctx, r8_fourcc, 1, w, h);
-        println!(
-            "    {:<42} {}",
-            label,
-            if ok { "ok" } else { "FAIL" }
-        );
+        println!("    {:<42} {}", label, if ok { "ok" } else { "FAIL" });
     }
 
     // Test RGBA at the non-square output dimensions used by packing strategies
@@ -144,11 +140,7 @@ pub fn run(ctx: &GpuContext) {
     ];
     for &(w, h, label) in rgba_configs {
         let ok = try_egl_image(ctx, rgba_fourcc, 4, w, h);
-        println!(
-            "    {:<42} {}",
-            label,
-            if ok { "ok" } else { "FAIL" }
-        );
+        println!("    {:<42} {}", label, if ok { "ok" } else { "FAIL" });
     }
 
     println!();

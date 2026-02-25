@@ -275,10 +275,7 @@ fn test_xor_render(w: i32, h: i32) {
                 px[0], px[1], px[2], px[3]
             );
 
-            let ok = px[0] == 0x80
-                && px[1] == 0xC0
-                && px[2] == 0x00
-                && px[3] == 0x7F;
+            let ok = px[0] == 0x80 && px[1] == 0xC0 && px[2] == 0x00 && px[3] == 0x7F;
             println!("      Verify:        {}", if ok { "PASS" } else { "FAIL" });
 
             if ok {
