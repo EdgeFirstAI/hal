@@ -56,24 +56,75 @@ pub(crate) fn rgba_fourcc() -> u32 {
 }
 
 /// Compile a shader program from vertex + fragment source strings.
-/// Returns the program ID.
-pub(crate) fn compile_program(vert: &CString, frag: &CString) -> u32 {
+///
+/// Returns `Ok(program_id)` on success. On failure, deletes all intermediate
+/// GL objects and returns `Err` with the relevant info log.
+pub(crate) fn compile_program(vert: &CString, frag: &CString) -> Result<u32, String> {
     unsafe {
         let program = gls::gl::CreateProgram();
 
+        // --- Vertex shader ---
         let vs = gls::gl::CreateShader(gls::gl::VERTEX_SHADER);
         let vs_ptr = vert.as_ptr();
         gls::gl::ShaderSource(vs, 1, &raw const vs_ptr, null());
         gls::gl::CompileShader(vs);
+        let mut vs_ok: i32 = 0;
+        gls::gl::GetShaderiv(vs, gls::gl::COMPILE_STATUS, &mut vs_ok);
+        if vs_ok == 0 {
+            let mut len: i32 = 0;
+            gls::gl::GetShaderiv(vs, gls::gl::INFO_LOG_LENGTH, &mut len);
+            let mut log = vec![0u8; len.max(1) as usize];
+            gls::gl::GetShaderInfoLog(vs, len, std::ptr::null_mut(), log.as_mut_ptr() as *mut i8);
+            gls::gl::DeleteShader(vs);
+            gls::gl::DeleteProgram(program);
+            let msg = String::from_utf8_lossy(&log).into_owned();
+            return Err(format!("vertex shader compile failed: {msg}"));
+        }
         gls::gl::AttachShader(program, vs);
 
+        // --- Fragment shader ---
         let fs = gls::gl::CreateShader(gls::gl::FRAGMENT_SHADER);
         let fs_ptr = frag.as_ptr();
         gls::gl::ShaderSource(fs, 1, &raw const fs_ptr, null());
         gls::gl::CompileShader(fs);
+        let mut fs_ok: i32 = 0;
+        gls::gl::GetShaderiv(fs, gls::gl::COMPILE_STATUS, &mut fs_ok);
+        if fs_ok == 0 {
+            let mut len: i32 = 0;
+            gls::gl::GetShaderiv(fs, gls::gl::INFO_LOG_LENGTH, &mut len);
+            let mut log = vec![0u8; len.max(1) as usize];
+            gls::gl::GetShaderInfoLog(fs, len, std::ptr::null_mut(), log.as_mut_ptr() as *mut i8);
+            gls::gl::DetachShader(program, vs);
+            gls::gl::DeleteShader(vs);
+            gls::gl::DeleteShader(fs);
+            gls::gl::DeleteProgram(program);
+            let msg = String::from_utf8_lossy(&log).into_owned();
+            return Err(format!("fragment shader compile failed: {msg}"));
+        }
         gls::gl::AttachShader(program, fs);
 
+        // --- Link ---
         gls::gl::LinkProgram(program);
+        let mut link_ok: i32 = 0;
+        gls::gl::GetProgramiv(program, gls::gl::LINK_STATUS, &mut link_ok);
+        if link_ok == 0 {
+            let mut len: i32 = 0;
+            gls::gl::GetProgramiv(program, gls::gl::INFO_LOG_LENGTH, &mut len);
+            let mut log = vec![0u8; len.max(1) as usize];
+            gls::gl::GetProgramInfoLog(
+                program,
+                len,
+                std::ptr::null_mut(),
+                log.as_mut_ptr() as *mut i8,
+            );
+            gls::gl::DetachShader(program, vs);
+            gls::gl::DetachShader(program, fs);
+            gls::gl::DeleteShader(vs);
+            gls::gl::DeleteShader(fs);
+            gls::gl::DeleteProgram(program);
+            let msg = String::from_utf8_lossy(&log).into_owned();
+            return Err(format!("program link failed: {msg}"));
+        }
 
         // Detach shaders so they can be deleted while program remains
         gls::gl::DetachShader(program, vs);
@@ -81,7 +132,7 @@ pub(crate) fn compile_program(vert: &CString, frag: &CString) -> u32 {
         gls::gl::DeleteShader(vs);
         gls::gl::DeleteShader(fs);
 
-        program
+        Ok(program)
     }
 }
 
@@ -151,12 +202,14 @@ pub fn run(ctx: &GpuContext) -> Vec<BenchResult> {
     let frag_cstr =
         CString::new(FRAGMENT_SRC).expect("fragment shader source contains interior null byte");
 
-    let program = compile_program(&vert_cstr, &frag_cstr);
-    if program == 0 {
-        println!("  SKIP: shader program compilation failed");
-        println!();
-        return results;
-    }
+    let program = match compile_program(&vert_cstr, &frag_cstr) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("  SKIP: shader program compilation failed: {e}");
+            println!();
+            return results;
+        }
+    };
 
     // Get uniform location for the texture sampler
     let tex_uniform = unsafe {
