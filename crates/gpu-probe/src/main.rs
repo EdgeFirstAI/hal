@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-mod bench;
+use edgefirst_bench as bench;
 mod bench_dma;
 mod bench_egl_image;
 mod bench_fbo;
