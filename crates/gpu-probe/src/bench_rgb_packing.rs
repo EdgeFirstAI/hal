@@ -347,10 +347,7 @@ pub fn run_verify(ctx: &GpuContext) {
 
     let (vao, vbo, ebo) = bench_render::create_quad_vao();
 
-    let configs: &[(u32, u32, &str)] = &[
-        (640, 640, "1080p_to_640"),
-        (320, 320, "1080p_to_320"),
-    ];
+    let configs: &[(u32, u32, &str)] = &[(640, 640, "1080p_to_640"), (320, 320, "1080p_to_320")];
 
     for &(dst_w, dst_h, label) in configs {
         // Source: dst_w x dst_h RGBA — the packing shaders operate on the
@@ -412,14 +409,7 @@ pub fn run_verify(ctx: &GpuContext) {
     println!();
 }
 
-fn verify_packed_r8(
-    ctx: &GpuContext,
-    src_tex: u32,
-    src_w: u32,
-    src_h: u32,
-    vao: u32,
-    label: &str,
-) {
+fn verify_packed_r8(ctx: &GpuContext, src_tex: u32, src_w: u32, src_h: u32, vao: u32, label: &str) {
     let name = format!("rgb_verify/packed_r8/{label}");
 
     let (program, tex_loc, sw_loc, sh_loc) = match compile_packing_program(FRAG_PACKED_R8) {

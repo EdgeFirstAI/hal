@@ -57,7 +57,9 @@ fn main() {
         if has_egl_image {
             bench_egl_image::run(&ctx);
         } else {
-            println!("== Benchmark: EGL Image == SKIP (EGL_EXT_image_dma_buf_import not available)");
+            println!(
+                "== Benchmark: EGL Image == SKIP (EGL_EXT_image_dma_buf_import not available)"
+            );
             println!();
         }
 
