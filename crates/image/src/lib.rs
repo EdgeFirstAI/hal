@@ -1754,6 +1754,7 @@ pub(crate) fn fourcc_uint8_equivalent(fourcc: FourCharCode) -> FourCharCode {
 }
 
 /// Returns `true` if the format is packed RGB (3 bytes per pixel, interleaved).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn fourcc_is_packed_rgb(fourcc: FourCharCode) -> bool {
     matches!(fourcc, RGB | RGB_INT8)
 }
