@@ -2,16 +2,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Shared utilities for image processing benchmarks.
-#![allow(dead_code)]
+#![allow(dead_code, unused_imports)]
 
-use edgefirst_image::{NV12, RGB, RGBA, YUYV};
+use edgefirst_image::{NV12, PLANAR_RGB, PLANAR_RGB_INT8, RGB, RGBA, RGB_INT8, YUYV};
 use four_char_code::FourCharCode;
-use std::{path::Path, sync::OnceLock};
+use std::path::Path;
+use std::sync::OnceLock;
 
 #[cfg(target_os = "linux")]
 use edgefirst_image::{G2DProcessor, TensorImage};
 #[cfg(target_os = "linux")]
 use edgefirst_tensor::TensorMemory;
+
+// Re-export the benchmark harness from the shared crate.
+pub use edgefirst_bench::{run_bench, BenchResult};
 
 // =============================================================================
 // Hardware Availability Cache
@@ -90,8 +94,14 @@ pub fn format_name(f: FourCharCode) -> &'static str {
         "NV12"
     } else if f == RGB {
         "RGB"
+    } else if f == RGB_INT8 {
+        "RGBi"
     } else if f == RGBA {
         "RGBA"
+    } else if f == PLANAR_RGB {
+        "8BPS"
+    } else if f == PLANAR_RGB_INT8 {
+        "8BPi"
     } else {
         "???"
     }
@@ -129,10 +139,8 @@ pub fn calculate_letterbox(
 }
 
 // =============================================================================
-// Benchmark Configuration (for Criterion benchmarks)
+// Benchmark Configuration
 // =============================================================================
-
-use criterion::Throughput;
 
 /// Configuration for a single benchmark case.
 #[derive(Clone)]
@@ -188,21 +196,23 @@ impl BenchConfig {
         }
     }
 
-    /// Calculate throughput based on input size.
-    pub fn throughput(&self) -> Throughput {
+    /// Calculate throughput in bytes based on input size.
+    pub fn throughput(&self) -> u64 {
         let bytes = match self.in_fmt {
             f if f == YUYV => self.in_w * self.in_h * 2,
             f if f == NV12 => self.in_w * self.in_h * 3 / 2,
-            f if f == RGB => self.in_w * self.in_h * 3,
+            f if f == RGB || f == RGB_INT8 || f == PLANAR_RGB || f == PLANAR_RGB_INT8 => {
+                self.in_w * self.in_h * 3
+            }
             f if f == RGBA => self.in_w * self.in_h * 4,
             _ => self.in_w * self.in_h,
         };
-        Throughput::Bytes(bytes as u64)
+        bytes as u64
     }
 }
 
 // =============================================================================
-// Embedded Test Data (for Criterion benchmarks)
+// Embedded Test Data
 // =============================================================================
 
 pub const CAMERA_1080P_YUYV: &[u8] = include_bytes!("../../../testdata/camera1080p.yuyv");

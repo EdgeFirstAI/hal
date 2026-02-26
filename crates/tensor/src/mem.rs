@@ -22,6 +22,7 @@ where
     pub name: String,
     pub shape: Vec<usize>,
     pub data: Vec<T>,
+    identity: crate::BufferIdentity,
 }
 
 unsafe impl<T> Send for MemTensor<T> where T: Num + Clone + fmt::Debug + Send + Sync {}
@@ -47,6 +48,7 @@ where
             name,
             shape: shape.to_vec(),
             data,
+            identity: crate::BufferIdentity::new(),
         })
     }
 
@@ -103,6 +105,10 @@ where
             shape: self.shape.clone(),
             _marker: std::marker::PhantomData,
         }))
+    }
+
+    fn buffer_identity(&self) -> &crate::BufferIdentity {
+        &self.identity
     }
 }
 
