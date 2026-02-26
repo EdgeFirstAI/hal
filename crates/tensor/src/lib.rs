@@ -46,12 +46,18 @@ use std::os::fd::OwnedFd;
 use std::{
     fmt,
     ops::{Deref, DerefMut},
-    sync::{Arc, Weak},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Weak,
+    },
 };
+
+/// Monotonic counter for buffer identity IDs.
+static NEXT_BUFFER_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Unique identity for a tensor's underlying buffer.
 ///
-/// Created fresh on every buffer allocation or import. The `id` is a random
+/// Created fresh on every buffer allocation or import. The `id` is a monotonic
 /// u64 used as a cache key. The `guard` is an `Arc<()>` whose weak references
 /// allow downstream caches to detect when the buffer has been dropped.
 #[derive(Debug, Clone)]
@@ -64,7 +70,7 @@ impl BufferIdentity {
     /// Create a new unique buffer identity.
     pub fn new() -> Self {
         Self {
-            id: rand::random(),
+            id: NEXT_BUFFER_ID.fetch_add(1, Ordering::Relaxed),
             guard: Arc::new(()),
         }
     }
