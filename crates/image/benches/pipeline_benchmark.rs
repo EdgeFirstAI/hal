@@ -32,6 +32,7 @@ use edgefirst_image::{NV12, PLANAR_RGB_INT8, RGB, RGBA, RGB_INT8, YUYV};
 #[cfg(target_os = "linux")]
 use edgefirst_tensor::TensorMemory;
 use edgefirst_tensor::{TensorMapTrait, TensorTrait};
+#[cfg(target_os = "linux")]
 use std::mem::ManuallyDrop;
 
 #[cfg(feature = "opencv")]
