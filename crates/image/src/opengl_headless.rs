@@ -1281,11 +1281,7 @@ impl ImageProcessorTrait for GLProcessorST {
         }
 
         let is_dma = match dst.tensor.memory() {
-            edgefirst_tensor::TensorMemory::Dma
-                if self.setup_renderbuffer_dma(dst).is_ok() =>
-            {
-                true
-            }
+            edgefirst_tensor::TensorMemory::Dma if self.setup_renderbuffer_dma(dst).is_ok() => true,
             _ => {
                 // Add dest rect to make sure dst is rendered fully
                 self.setup_renderbuffer_non_dma(
@@ -1350,11 +1346,7 @@ impl ImageProcessorTrait for GLProcessorST {
         }
 
         let is_dma = match dst.tensor.memory() {
-            edgefirst_tensor::TensorMemory::Dma
-                if self.setup_renderbuffer_dma(dst).is_ok() =>
-            {
-                true
-            }
+            edgefirst_tensor::TensorMemory::Dma if self.setup_renderbuffer_dma(dst).is_ok() => true,
             _ => {
                 self.setup_renderbuffer_non_dma(
                     dst,
