@@ -25,11 +25,11 @@ approx = "0.5.1"
 cbindgen = "0.29"
 errno = "0.3"
 argminmax = { version = "0.6.3", default-features = false }
-criterion = { version = "0.5", default-features = false, features = ["html_reports", "plotters", "cargo_bench_support"] }
 ctor = "0.4.2"
 divan = "0.1.21"
 dma-heap = "0.4.1"
 # Internal crates
+edgefirst-bench = { path = "crates/bench" }
 edgefirst-hal = { version = "0.8.0", path = "crates/hal" }
 edgefirst-decoder = { version = "0.8.0", path = "crates/decoder" }
 edgefirst-image = { version = "0.8.0", path = "crates/image" }

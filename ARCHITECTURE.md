@@ -1,7 +1,7 @@
 # EdgeFirst Hardware Abstraction Layer - Architecture
 
-**Version:** 2.1
-**Last Updated:** February 17, 2026
+**Version:** 2.2
+**Last Updated:** February 25, 2026
 **Status:** Production
 **Audience:** Developers contributing to EdgeFirst HAL or integrating it into applications
 
@@ -504,9 +504,12 @@ process shutdown:
    `eglReleaseThread()` after this handler has already run, it dereferences
    freed memory ([Ubuntu Bug #1946621](https://bugs.launchpad.net/ubuntu/+source/mesa/+bug/1946621)).
 
-4. **Vendor EGL driver bugs.** NXP Vivante drivers cause a double-free in
-   `gcoOS_FreeMemo` when both `eglDestroyContext` and `eglTerminate` are called.
-   Similar bugs exist in Qualcomm Adreno and NVIDIA drivers.
+4. **Vendor EGL driver bugs.** Some vendor EGL drivers (e.g. Qualcomm Adreno,
+   older NVIDIA) may misbehave during cleanup. On NXP Vivante, earlier
+   observations suggested a double-free in `gcoOS_FreeMemo` when both
+   `eglDestroyContext` and `eglTerminate` are called, but this was not
+   conclusively confirmed. The `catch_unwind` guard (Layer 3) absorbs any
+   driver-side panics during cleanup.
 
 ### Solution
 
@@ -526,16 +529,19 @@ addressing a different failure mode:
 │   Catches panics from eglDestroyContext/eglMakeCurrent  │
 │   if function pointers are invalidated                  │
 ├─────────────────────────────────────────────────────────┤
-│ Layer 4: Omit eglTerminate                              │
-│   Avoids double-free on Vivante/ARM drivers             │
+│ Layer 4: eglTerminate inside catch_unwind               │
+│   Releases ref-counted display; catch_unwind absorbs    │
+│   any driver-side misbehaviour                          │
 └─────────────────────────────────────────────────────────┘
 ```
 
 The `GlContext::drop` implementation performs explicit EGL resource cleanup
-(destroy context, destroy surface) inside `catch_unwind`, then intentionally
-skips dropping the `Rc<Egl>` wrapper. The EGL library handle is leaked via
-`Box::leak` at load time so it is never `dlclose`'d. The OS reclaims all
-resources when the process exits.
+(destroy context, destroy surface, terminate display) inside `catch_unwind`,
+then intentionally skips dropping the `Rc<Egl>` wrapper. The EGL library
+handle is leaked via `Box::leak` at load time so it is never `dlclose`'d.
+`eglTerminate` is ref-counted per the EGL spec: each `eglInitialize`
+increments a reference count and each `eglTerminate` decrements it, so the
+display is only truly torn down when the last reference is released.
 
 ### Industry Precedent
 
@@ -559,8 +565,11 @@ same problem:
 
 `catch_unwind` catches Rust panics but cannot catch fatal signals (`SIGABRT`,
 `SIGSEGV`, `SIGBUS`) that originate from heap corruption inside the C driver.
-The `Box::leak` and `ManuallyDrop` layers mitigate this by avoiding the code
-paths that trigger corruption in the first place.
+The `Box::leak` layer prevents `dlclose` from unmapping driver code, and the
+`ManuallyDrop<Rc<Egl>>` layer avoids `eglReleaseThread` calls into freed
+Mesa state. If a driver causes a fatal signal during `eglTerminate`, the
+process will crash — but this has not been observed in practice on any
+supported platform (NXP i.MX8 Vivante, NXP i.MX95 Mali/Panfrost, Mesa x86_64).
 
 ### References
 
@@ -570,6 +579,70 @@ paths that trigger corruption in the first place.
 - wgpu SIGSEGV on library unload: [wgpu #246](https://github.com/gfx-rs/wgpu/issues/246)
 - PyO3 Drop after finalization: [PyO3 #4632](https://github.com/PyO3/pyo3/issues/4632)
 - Python finalization order: [CPython docs — Py_FinalizeEx](https://docs.python.org/3/c-api/init.html)
+
+## G2D Resource Cleanup
+
+### Problem
+
+On NXP i.MX platforms, the G2D hardware accelerator (`libg2d.so.2`) and the EGL
+library (`libEGL.so.1`) share kernel driver state through the Vivante `galcore`
+device (`/dev/galcore`). When both libraries are loaded, calling `dlclose` on
+either one can trigger heap corruption (`corrupted double-linked list`) during
+process exit because the atexit handlers registered by the shared `galcore`
+driver become inconsistent.
+
+### Solution
+
+For production code, `G2DProcessor` is used normally and dropped by Rust's
+ownership system. The `Box::leak` of the EGL library handle (Layer 1 in the
+EGL cleanup strategy above) prevents `dlclose` from unmapping `libEGL.so.1`,
+which keeps the shared `galcore` state intact during process shutdown.
+
+For benchmark code (where `G2DProcessor` instances are created and destroyed
+many times within a single process), use `ManuallyDrop<G2DProcessor>` to
+prevent repeated `g2d_close` + `dlclose` cycles that can exhaust driver
+resources. The benchmark harness (`crates/bench`) wraps G2D processor
+instances in `ManuallyDrop` to avoid this pattern.
+
+### Resource Leak Prevention Policy
+
+All GPU and DMA resources must be properly released. Specifically:
+
+- **EGL displays**: `eglTerminate` must be called in `GlContext::drop`. The
+  EGL spec ref-counts display connections, so each `eglTerminate` decrements
+  the count and only tears down state when it reaches zero.
+- **EGL contexts and surfaces**: `eglDestroyContext` and `eglDestroySurface`
+  must be called before `eglTerminate`.
+- **DMA buffers**: Closed via file descriptor `close()` in `Drop`.
+- **G2D contexts**: `g2d_close` via `G2DProcessor::drop`.
+
+Intentional leaks are limited to the EGL **library handle** (`Box::leak` to
+prevent `dlclose`) and the `Rc<Egl>` wrapper (`ManuallyDrop` to prevent
+`eglReleaseThread`). These are lightweight Rust-side objects; the actual
+GPU/display resources are released by the explicit cleanup calls above.
+
+## Testing with GPU Resources
+
+### Single-Threaded Test Execution
+
+All test execution must use single-threaded mode (`--test-threads=1` for
+`cargo test`, `-j 1` for `cargo nextest`). This is required because:
+
+1. **EGL display sharing**: When multiple tests run in parallel threads within
+   one process, `eglTerminate` on one thread can tear down a shared EGL display
+   while other threads still reference it. This causes intermittent test failures
+   that are difficult to reproduce.
+
+2. **G2D driver state**: The `galcore` kernel driver maintains per-process state
+   that is not safe to access from concurrent threads creating and destroying
+   G2D contexts.
+
+3. **DMA-heap allocation**: Concurrent DMA-heap allocations from multiple test
+   threads can exhaust the CMA pool on memory-constrained embedded targets.
+
+This constraint applies to CI (`test.yml`), the Makefile, and local development.
+The `cargo nextest` runner already provides per-test process isolation, but
+`-j 1` is still specified to prevent DMA/GPU contention across test processes.
 
 ## Performance Considerations
 

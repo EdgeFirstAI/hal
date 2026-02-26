@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    Crop, Error, Flip, FunctionTimer, ImageProcessorTrait, Rect, Result, Rotation, TensorImage,
-    TensorImageDst, TensorImageRef, GREY, NV12, NV16, PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, YUYV,
+    fourcc_is_int8, fourcc_uint8_equivalent, Crop, Error, Flip, FunctionTimer, ImageProcessorTrait,
+    Rect, Result, Rotation, TensorImage, TensorImageDst, TensorImageRef, GREY, NV12, NV16,
+    PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, YUYV,
 };
 #[cfg(feature = "decoder")]
 use edgefirst_decoder::{DetectBox, ProtoData, Segmentation};
@@ -1751,6 +1752,24 @@ impl ImageProcessorTrait for CPUProcessor {
         flip: Flip,
         crop: Crop,
     ) -> Result<()> {
+        // Int8 formats: delegate to uint8 pipeline, then apply XOR 0x80
+        if fourcc_is_int8(dst.fourcc()) {
+            let uint8_fourcc = fourcc_uint8_equivalent(dst.fourcc());
+            let mut tmp = TensorImage::new(
+                dst.width(),
+                dst.height(),
+                uint8_fourcc,
+                Some(edgefirst_tensor::TensorMemory::Mem),
+            )?;
+            self.convert(src, &mut tmp, rotation, flip, crop)?;
+            let src_map = tmp.tensor().map()?;
+            let mut dst_map = dst.tensor().map()?;
+            for (d, s) in dst_map.iter_mut().zip(src_map.iter()) {
+                *d = s ^ 0x80;
+            }
+            return Ok(());
+        }
+
         crop.check_crop(src, dst)?;
         // supported destinations and srcs:
         let intermediate = match (src.fourcc(), dst.fourcc()) {

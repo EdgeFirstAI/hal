@@ -125,6 +125,17 @@ pub const PLANAR_RGB: FourCharCode = four_char_code!("8BPS");
 // TODO: What fourcc code is planar RGBA?
 pub const PLANAR_RGBA: FourCharCode = four_char_code!("8BPA");
 
+/// Packed RGB with uint8→int8 XOR 0x80 reinterpretation.
+/// The underlying bytes are uint8 with MSB flipped; when cast to i8, values
+/// map correctly: uint8 0 → int8 -128, uint8 128 → int8 0, uint8 255 → int8 127.
+pub const RGB_INT8: FourCharCode = four_char_code!("RGBi");
+
+/// Planar RGB (channels-first) with uint8→int8 XOR 0x80 reinterpretation.
+/// The underlying bytes are uint8 with MSB flipped; when cast to i8, values
+/// map correctly: uint8 0 → int8 -128, uint8 128 → int8 0, uint8 255 → int8 127.
+/// Tensor shape is `[3, H, W]` (channels-first).
+pub const PLANAR_RGB_INT8: FourCharCode = four_char_code!("8BPi");
+
 /// An image represented as a tensor with associated format information.
 #[derive(Debug)]
 pub struct TensorImage {
@@ -219,6 +230,8 @@ impl TensorImage {
     /// | `YUYV` | `[H, W, 2]` | YUV 4:2:2 interleaved |
     /// | `PLANAR_RGB`  | `[3, H, W]` | Channels-first (3 planes) |
     /// | `PLANAR_RGBA` | `[4, H, W]` | Channels-first (4 planes) |
+    /// | `RGB_INT8` | `[H, W, 3]` | Packed RGB, int8 via XOR 0x80 |
+    /// | `PLANAR_RGB_INT8` | `[3, H, W]` | Planar RGB, int8 via XOR 0x80 |
     /// | `NV12` | `[H*3/2, W]` | Semi-planar YUV 4:2:0 (2D) |
     /// | `NV16` | `[H*2, W]`   | Semi-planar YUV 4:2:2 (2D) |
     ///
@@ -727,6 +740,11 @@ impl TensorImage {
             false => self.width() * self.channels(),
         }
     }
+
+    /// Returns the buffer identity of the underlying tensor.
+    pub fn buffer_identity(&self) -> &edgefirst_tensor::BufferIdentity {
+        self.tensor.buffer_identity()
+    }
 }
 
 /// Trait for types that can be used as destination images for conversion.
@@ -751,6 +769,8 @@ pub trait TensorImageDst {
     fn channels(&self) -> usize;
     /// Returns the row stride in bytes.
     fn row_stride(&self) -> usize;
+    /// Returns the buffer identity of the underlying tensor.
+    fn buffer_identity(&self) -> &edgefirst_tensor::BufferIdentity;
 }
 
 impl TensorImageDst for TensorImage {
@@ -784,6 +804,10 @@ impl TensorImageDst for TensorImage {
 
     fn row_stride(&self) -> usize {
         TensorImage::row_stride(self)
+    }
+
+    fn buffer_identity(&self) -> &edgefirst_tensor::BufferIdentity {
+        TensorImage::buffer_identity(self)
     }
 }
 
@@ -955,6 +979,10 @@ impl TensorImageDst for TensorImageRef<'_> {
 
     fn row_stride(&self) -> usize {
         TensorImageRef::row_stride(self)
+    }
+
+    fn buffer_identity(&self) -> &edgefirst_tensor::BufferIdentity {
+        self.tensor.buffer_identity()
     }
 }
 
@@ -1682,6 +1710,8 @@ fn fourcc_channels(fourcc: FourCharCode) -> Result<usize> {
         NV16 => Ok(2), // NV16 has 2 channel. 2nd channel is full size
         PLANAR_RGB => Ok(3),
         PLANAR_RGBA => Ok(4),
+        RGB_INT8 => Ok(3),
+        PLANAR_RGB_INT8 => Ok(3),
         _ => Err(Error::NotSupported(format!(
             "Unsupported fourcc: {}",
             fourcc.to_string()
@@ -1699,11 +1729,33 @@ fn fourcc_planar(fourcc: FourCharCode) -> Result<bool> {
         NV16 => Ok(true),        // Planar YUV
         PLANAR_RGB => Ok(true),  // Planar RGB
         PLANAR_RGBA => Ok(true), // Planar RGBA
+        RGB_INT8 => Ok(false),
+        PLANAR_RGB_INT8 => Ok(true),
         _ => Err(Error::NotSupported(format!(
             "Unsupported fourcc: {}",
             fourcc.to_string()
         ))),
     }
+}
+
+/// Returns `true` if the format uses XOR 0x80 int8 reinterpretation.
+pub(crate) fn fourcc_is_int8(fourcc: FourCharCode) -> bool {
+    matches!(fourcc, RGB_INT8 | PLANAR_RGB_INT8)
+}
+
+/// Returns the uint8 equivalent of an int8 format, or the format unchanged.
+#[allow(dead_code)] // Will be used by Task 5 (non-DMA int8 path)
+pub(crate) fn fourcc_uint8_equivalent(fourcc: FourCharCode) -> FourCharCode {
+    match fourcc {
+        RGB_INT8 => RGB,
+        PLANAR_RGB_INT8 => PLANAR_RGB,
+        other => other,
+    }
+}
+
+/// Returns `true` if the format is packed RGB (3 bytes per pixel, interleaved).
+pub(crate) fn fourcc_is_packed_rgb(fourcc: FourCharCode) -> bool {
+    matches!(fourcc, RGB | RGB_INT8)
 }
 
 pub(crate) struct FunctionTimer<T: Display> {
@@ -4129,5 +4181,71 @@ mod image_tests {
         }
 
         check_dst(&img_ref);
+    }
+
+    #[test]
+    fn test_rgb_int8_format() {
+        let img = TensorImage::new(1280, 720, RGB_INT8, Some(TensorMemory::Mem)).unwrap();
+        assert_eq!(img.width(), 1280);
+        assert_eq!(img.height(), 720);
+        assert_eq!(img.channels(), 3);
+        assert!(!img.is_planar());
+        assert_eq!(img.fourcc(), RGB_INT8);
+    }
+
+    #[test]
+    fn test_planar_rgb_int8_format() {
+        let img = TensorImage::new(1280, 720, PLANAR_RGB_INT8, Some(TensorMemory::Mem)).unwrap();
+        assert_eq!(img.width(), 1280);
+        assert_eq!(img.height(), 720);
+        assert_eq!(img.channels(), 3);
+        assert!(img.is_planar());
+        assert_eq!(img.fourcc(), PLANAR_RGB_INT8);
+    }
+
+    #[test]
+    fn test_rgb_int8_from_tensor() {
+        let tensor = Tensor::<u8>::new(&[720, 1280, 3], None, None).unwrap();
+        let img = TensorImage::from_tensor(tensor, RGB_INT8).unwrap();
+        assert_eq!(img.width(), 1280);
+        assert_eq!(img.height(), 720);
+        assert_eq!(img.channels(), 3);
+        assert!(!img.is_planar());
+        assert_eq!(img.fourcc(), RGB_INT8);
+    }
+
+    #[test]
+    fn test_planar_rgb_int8_from_tensor() {
+        let tensor = Tensor::<u8>::new(&[3, 720, 1280], None, None).unwrap();
+        let img = TensorImage::from_tensor(tensor, PLANAR_RGB_INT8).unwrap();
+        assert_eq!(img.width(), 1280);
+        assert_eq!(img.height(), 720);
+        assert_eq!(img.channels(), 3);
+        assert!(img.is_planar());
+        assert_eq!(img.fourcc(), PLANAR_RGB_INT8);
+    }
+
+    #[test]
+    fn test_fourcc_is_int8() {
+        assert!(fourcc_is_int8(RGB_INT8));
+        assert!(fourcc_is_int8(PLANAR_RGB_INT8));
+        assert!(!fourcc_is_int8(RGB));
+        assert!(!fourcc_is_int8(PLANAR_RGB));
+        assert!(!fourcc_is_int8(RGBA));
+    }
+
+    #[test]
+    fn test_fourcc_uint8_equivalent() {
+        assert_eq!(fourcc_uint8_equivalent(RGB_INT8), RGB);
+        assert_eq!(fourcc_uint8_equivalent(PLANAR_RGB_INT8), PLANAR_RGB);
+        assert_eq!(fourcc_uint8_equivalent(RGBA), RGBA);
+    }
+
+    #[test]
+    fn test_fourcc_is_packed_rgb() {
+        assert!(fourcc_is_packed_rgb(RGB));
+        assert!(fourcc_is_packed_rgb(RGB_INT8));
+        assert!(!fourcc_is_packed_rgb(PLANAR_RGB));
+        assert!(!fourcc_is_packed_rgb(RGBA));
     }
 }

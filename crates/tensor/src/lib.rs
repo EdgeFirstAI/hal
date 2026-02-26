@@ -46,7 +46,46 @@ use std::os::fd::OwnedFd;
 use std::{
     fmt,
     ops::{Deref, DerefMut},
+    sync::{Arc, Weak},
 };
+
+/// Unique identity for a tensor's underlying buffer.
+///
+/// Created fresh on every buffer allocation or import. The `id` is a random
+/// u64 used as a cache key. The `guard` is an `Arc<()>` whose weak references
+/// allow downstream caches to detect when the buffer has been dropped.
+#[derive(Debug, Clone)]
+pub struct BufferIdentity {
+    id: u64,
+    guard: Arc<()>,
+}
+
+impl BufferIdentity {
+    /// Create a new unique buffer identity.
+    pub fn new() -> Self {
+        Self {
+            id: rand::random(),
+            guard: Arc::new(()),
+        }
+    }
+
+    /// Unique identifier for this buffer. Changes when the buffer changes.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Returns a weak reference to the buffer guard. Goes dead when the
+    /// owning Tensor is dropped (and no clones remain).
+    pub fn weak(&self) -> Weak<()> {
+        Arc::downgrade(&self.guard)
+    }
+}
+
+impl Default for BufferIdentity {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[cfg(target_os = "linux")]
 use nix::sys::stat::{major, minor};
@@ -106,6 +145,9 @@ where
     /// Map the tensor into memory and return a TensorMap for accessing the
     /// data.
     fn map(&self) -> Result<TensorMap<T>>;
+
+    /// Get the buffer identity for cache keying and liveness tracking.
+    fn buffer_identity(&self) -> &BufferIdentity;
 }
 
 pub trait TensorMapTrait<T>
@@ -393,6 +435,16 @@ where
             #[cfg(unix)]
             Tensor::Shm(t) => t.map(),
             Tensor::Mem(t) => t.map(),
+        }
+    }
+
+    fn buffer_identity(&self) -> &BufferIdentity {
+        match self {
+            #[cfg(target_os = "linux")]
+            Tensor::Dma(t) => t.buffer_identity(),
+            #[cfg(unix)]
+            Tensor::Shm(t) => t.buffer_identity(),
+            Tensor::Mem(t) => t.buffer_identity(),
         }
     }
 }
@@ -992,6 +1044,53 @@ mod tests {
         view_mut[[0, 0, 0]] = 42.0;
         assert_eq!(view_mut[[0, 0, 0]], 42.0);
         assert_eq!(tensor_map[0], 42.0, "Value at index 0 should be 42");
+    }
+
+    #[test]
+    fn test_buffer_identity_unique() {
+        let id1 = BufferIdentity::new();
+        let id2 = BufferIdentity::new();
+        assert_ne!(
+            id1.id(),
+            id2.id(),
+            "Two identities should have different ids"
+        );
+    }
+
+    #[test]
+    fn test_buffer_identity_clone_shares_guard() {
+        let id1 = BufferIdentity::new();
+        let weak = id1.weak();
+        assert!(
+            weak.upgrade().is_some(),
+            "Weak should be alive while original exists"
+        );
+
+        let id2 = id1.clone();
+        assert_eq!(id1.id(), id2.id(), "Cloned identity should have same id");
+
+        drop(id1);
+        assert!(
+            weak.upgrade().is_some(),
+            "Weak should still be alive (clone holds Arc)"
+        );
+
+        drop(id2);
+        assert!(
+            weak.upgrade().is_none(),
+            "Weak should be dead after all clones dropped"
+        );
+    }
+
+    #[test]
+    fn test_tensor_buffer_identity() {
+        let t1 = Tensor::<u8>::new(&[100], Some(TensorMemory::Mem), Some("t1")).unwrap();
+        let t2 = Tensor::<u8>::new(&[100], Some(TensorMemory::Mem), Some("t2")).unwrap();
+        assert_ne!(
+            t1.buffer_identity().id(),
+            t2.buffer_identity().id(),
+            "Different tensors should have different buffer ids"
+        );
     }
 
     // Any test that cares about the fd count must grab it exclusively.

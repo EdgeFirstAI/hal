@@ -8,6 +8,7 @@ __pycache__
 *.wheel
 *.egg
 *.egg-info
+*.log
 cobertura.xml
 coverage.xml
 .DS_Store
