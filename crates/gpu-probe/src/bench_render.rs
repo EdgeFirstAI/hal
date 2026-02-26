@@ -60,6 +60,7 @@ pub(crate) fn rgb888_fourcc() -> u32 {
     gbm::drm::buffer::DrmFourcc::Bgr888 as u32
 }
 
+
 /// Compile a shader program from vertex + fragment source strings.
 ///
 /// Returns `Ok(program_id)` on success. On failure, deletes all intermediate
