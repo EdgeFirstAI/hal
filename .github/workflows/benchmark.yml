@@ -282,11 +282,11 @@ jobs:
                   for line in f:
                       stripped = line.strip()
                       # Custom harness format: "name  median=1.23ms  mean=..."
-                      m = re.match(r'^(\S+)\s+median=\s*([\d.]+)(ms|us|ns|s)', stripped)
+                      m = re.match(r'^(\S+)\s+median=\s*([\d.]+)(ms|us|µs|ns|s)', stripped)
                       if m:
                           name = m.group(1)
                           val, unit = float(m.group(2)), m.group(3)
-                          mult = {'ns': 1, 'us': 1e3, 'ms': 1e6, 's': 1e9}
+                          mult = {'ns': 1, 'us': 1e3, 'µs': 1e3, 'ms': 1e6, 's': 1e9}
                           ns = val * mult.get(unit, 1)
                           # Extract throughput if present
                           thrpt = 'N/A'

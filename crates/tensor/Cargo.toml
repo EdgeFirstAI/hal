@@ -22,7 +22,6 @@ env_logger = { workspace = true }
 log = { workspace = true }
 ndarray = { workspace = true, optional = true }
 num-traits = { workspace = true }
-rand = { workspace = true }
 uuid = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

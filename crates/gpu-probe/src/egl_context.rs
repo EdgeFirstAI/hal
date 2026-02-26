@@ -392,14 +392,15 @@ impl GpuContext {
 
 impl Drop for GpuContext {
     fn drop(&mut self) {
-        // Destroy context and surface but intentionally skip eglTerminate —
-        // some drivers (e.g. Vivante on i.MX8) crash during shutdown.
+        // Defence-in-depth cleanup: destroy context, surface, and terminate
+        // the EGL display inside catch_unwind to absorb driver panics.
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = self.egl.make_current(self.display, None, None, None);
             let _ = self.egl.destroy_context(self.display, self.ctx);
             let _ = self.egl.destroy_surface(self.display, self.surface);
+            let _ = self.egl.terminate(self.display);
         }));
         std::panic::set_hook(prev_hook);
     }
