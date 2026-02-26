@@ -30,6 +30,7 @@ ctor = "0.4.2"
 divan = "0.1.21"
 dma-heap = "0.4.1"
 # Internal crates
+edgefirst-bench = { path = "crates/bench" }
 edgefirst-hal = { version = "0.8.0", path = "crates/hal" }
 edgefirst-decoder = { version = "0.8.0", path = "crates/decoder" }
 edgefirst-image = { version = "0.8.0", path = "crates/image" }

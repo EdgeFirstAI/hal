@@ -26,7 +26,10 @@ LICENSE_OVERRIDES = {
     "edgefirst-tracker@0.5.0": "Apache-2.0",
     "edgefirst_hal@0.5.0": "Apache-2.0",  # Python package name
     "g2d-sys@1.2.0": "Apache-2.0",
+    "edgefirst-bench@0.8.0": "Apache-2.0",
+    "gpu-probe@0.8.0": "Apache-2.0",
     # Unversioned entries (from scancode source scan)
+    "edgefirst-bench@unknown": "Apache-2.0",
     "edgefirst-hal@unknown": "Apache-2.0",
     "edgefirst-hal-capi@unknown": "Apache-2.0",
     "edgefirst-decoder@unknown": "Apache-2.0",
@@ -34,6 +37,7 @@ LICENSE_OVERRIDES = {
     "edgefirst-tensor@unknown": "Apache-2.0",
     "edgefirst-tracker@unknown": "Apache-2.0",
     "edgefirst_hal@unknown": "Apache-2.0",
+    "gpu-probe@unknown": "Apache-2.0",
 }
 
 # License policy - CUSTOMIZE THESE FOR YOUR ORGANIZATION

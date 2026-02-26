@@ -324,12 +324,13 @@ jobs:
 
       - name: Run Clippy
         # Use default features only (no OpenCV, no Linux-specific hardware features)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        # Exclude Linux-only crates (gpu-probe, edgefirst-bench) that depend on DMA, EGL, DRM
+        run: cargo clippy --workspace --all-targets --exclude gpu-probe --exclude edgefirst-bench -- -D warnings
 
       - name: Run Rust tests
         run: |
           set -o pipefail
-          cargo nextest run --workspace 2>&1 | tee target/test-metrics-rust-macos.txt
+          cargo nextest run --workspace --exclude gpu-probe --exclude edgefirst-bench 2>&1 | tee target/test-metrics-rust-macos.txt
 
       - name: Build C API library
         run: cargo build --release -p edgefirst-hal-capi
