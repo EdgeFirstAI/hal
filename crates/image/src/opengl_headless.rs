@@ -1281,24 +1281,19 @@ impl ImageProcessorTrait for GLProcessorST {
         }
 
         let is_dma = match dst.tensor.memory() {
-            edgefirst_tensor::TensorMemory::Dma => {
-                if self.setup_renderbuffer_dma(dst).is_ok() {
-                    true
-                } else {
-                    self.setup_renderbuffer_non_dma(
-                        dst,
-                        Crop::new().with_dst_rect(Some(Rect::new(0, 0, 0, 0))),
-                    )?;
-                    false
-                }
+            edgefirst_tensor::TensorMemory::Dma
+                if self.setup_renderbuffer_dma(dst).is_ok() =>
+            {
+                true
             }
             _ => {
+                // Add dest rect to make sure dst is rendered fully
                 self.setup_renderbuffer_non_dma(
                     dst,
                     Crop::new().with_dst_rect(Some(Rect::new(0, 0, 0, 0))),
                 )?;
                 false
-            } // Add dest rect to make sure dst is rendered fully
+            }
         };
 
         gls::enable(gls::gl::BLEND);
@@ -1355,16 +1350,10 @@ impl ImageProcessorTrait for GLProcessorST {
         }
 
         let is_dma = match dst.tensor.memory() {
-            edgefirst_tensor::TensorMemory::Dma => {
-                if self.setup_renderbuffer_dma(dst).is_ok() {
-                    true
-                } else {
-                    self.setup_renderbuffer_non_dma(
-                        dst,
-                        Crop::new().with_dst_rect(Some(Rect::new(0, 0, 0, 0))),
-                    )?;
-                    false
-                }
+            edgefirst_tensor::TensorMemory::Dma
+                if self.setup_renderbuffer_dma(dst).is_ok() =>
+            {
+                true
             }
             _ => {
                 self.setup_renderbuffer_non_dma(
