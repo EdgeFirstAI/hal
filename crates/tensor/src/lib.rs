@@ -31,12 +31,14 @@ mod dma;
 mod dmabuf;
 mod error;
 mod mem;
+mod pbo;
 #[cfg(unix)]
 mod shm;
 
 #[cfg(target_os = "linux")]
 pub use crate::dma::{DmaMap, DmaTensor};
 pub use crate::mem::{MemMap, MemTensor};
+pub use crate::pbo::{PboMapping, PboOps};
 #[cfg(unix)]
 pub use crate::shm::{ShmMap, ShmTensor};
 pub use error::{Error, Result};
