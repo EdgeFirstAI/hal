@@ -222,8 +222,32 @@ pub fn probe_egl_displays() -> Result<Vec<EglDisplayInfo>, Error> {
     Ok(results)
 }
 
+/// Tracks which data-transfer method is active for moving pixels
+/// between CPU memory and GPU textures/framebuffers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransferBackend {
+    /// Zero-copy via EGLImage imported from DMA-buf file descriptors.
+    /// Available on i.MX8 (Vivante), i.MX95 (Mali), Jetson, and any
+    /// platform where `EGL_EXT_image_dma_buf_import` is present AND
+    /// the GPU can actually render through DMA-buf-backed textures.
+    DmaBuf,
+
+    /// Synchronous `glTexSubImage2D` upload + `glReadnPixels` readback.
+    /// Used when DMA-buf is unavailable or when the DMA-buf verification
+    /// probe fails (e.g. NVIDIA discrete GPUs where EGLImage creation
+    /// succeeds but rendered data is all zeros).
+    Sync,
+}
+
+impl TransferBackend {
+    /// Returns `true` if DMA-buf zero-copy is available.
+    pub(crate) fn is_dma(self) -> bool {
+        self == TransferBackend::DmaBuf
+    }
+}
+
 pub(crate) struct GlContext {
-    pub(crate) support_dma: bool,
+    pub(crate) transfer_backend: TransferBackend,
     pub(crate) display: EglDisplayType,
     pub(crate) ctx: egl::Context,
     /// Wrapped in ManuallyDrop because the khronos-egl Dynamic instance's
@@ -338,12 +362,17 @@ impl GlContext {
         // goes through FBOs backed by EGLImages.
         egl.make_current(display.as_display(), None, None, Some(ctx))?;
 
-        let support_dma = Self::egl_check_support_dma(&egl).is_ok();
+        let has_dma_extensions = Self::egl_check_support_dma(&egl).is_ok();
+        let transfer_backend = if has_dma_extensions {
+            TransferBackend::DmaBuf
+        } else {
+            TransferBackend::Sync
+        };
         Ok(GlContext {
             display,
             ctx,
             egl: ManuallyDrop::new(egl),
-            support_dma,
+            transfer_backend,
         })
     }
 
@@ -700,7 +729,7 @@ pub struct GLProcessorThreaded {
 
     // This is only None when the converter is being dropped.
     sender: Option<Sender<GLProcessorMessage>>,
-    support_dma: bool,
+    transfer_backend: TransferBackend,
 }
 
 unsafe impl Send for GLProcessorThreaded {}
@@ -728,7 +757,7 @@ impl GLProcessorThreaded {
                     return;
                 }
             };
-            let _ = create_ctx_send.send(Ok(gl_converter.gl_context.support_dma));
+            let _ = create_ctx_send.send(Ok(gl_converter.gl_context.transfer_backend));
             while let Some(msg) = recv.blocking_recv() {
                 match msg {
                     GLProcessorMessage::ImageConvert(src, mut dst, rotation, flip, crop, resp) => {
@@ -791,20 +820,20 @@ impl GLProcessorThreaded {
         // let handle = tokio::task::spawn(func());
         let handle = std::thread::spawn(func);
 
-        let support_dma = match create_ctx_recv.blocking_recv() {
+        let transfer_backend = match create_ctx_recv.blocking_recv() {
             Ok(Err(e)) => return Err(e),
             Err(_) => {
                 return Err(Error::Internal(
                     "GL converter error messaging closed without update".to_string(),
                 ));
             }
-            Ok(Ok(supports_dma)) => supports_dma,
+            Ok(Ok(tb)) => tb,
         };
 
         Ok(Self {
             handle: Some(handle),
             sender: Some(send),
-            support_dma,
+            transfer_backend,
         })
     }
 }
@@ -819,14 +848,14 @@ impl ImageProcessorTrait for GLProcessorThreaded {
         crop: Crop,
     ) -> crate::Result<()> {
         crop.check_crop(src, dst)?;
-        if !GLProcessorST::check_src_format_supported(self.support_dma, src) {
+        if !GLProcessorST::check_src_format_supported(self.transfer_backend, src) {
             return Err(crate::Error::NotSupported(format!(
                 "Opengl doesn't support {} source texture",
                 src.fourcc().display()
             )));
         }
 
-        if !GLProcessorST::check_dst_format_supported(self.support_dma, dst) {
+        if !GLProcessorST::check_dst_format_supported(self.transfer_backend, dst) {
             return Err(crate::Error::NotSupported(format!(
                 "Opengl doesn't support {} destination texture",
                 dst.fourcc().display()
@@ -1211,14 +1240,14 @@ impl ImageProcessorTrait for GLProcessorST {
         crop: Crop,
     ) -> crate::Result<()> {
         crop.check_crop(src, dst)?;
-        if !Self::check_src_format_supported(self.gl_context.support_dma, src) {
+        if !Self::check_src_format_supported(self.gl_context.transfer_backend, src) {
             return Err(crate::Error::NotSupported(format!(
                 "Opengl doesn't support {} source texture",
                 src.fourcc().display()
             )));
         }
 
-        if !Self::check_dst_format_supported(self.gl_context.support_dma, dst) {
+        if !Self::check_dst_format_supported(self.gl_context.transfer_backend, dst) {
             return Err(crate::Error::NotSupported(format!(
                 "Opengl doesn't support {} destination texture",
                 dst.fourcc().display()
@@ -1230,7 +1259,7 @@ impl ImageProcessorTrait for GLProcessorST {
             src.tensor().memory()
         );
         check_gl_error(function!(), line!())?;
-        if self.gl_context.support_dma && dst.tensor().memory() == TensorMemory::Dma {
+        if self.gl_context.transfer_backend.is_dma() && dst.tensor().memory() == TensorMemory::Dma {
             // Packed RGB is now supported via DMA with buffer reinterpretation
             let res = self.convert_dest_dma(dst, src, rotation, flip, crop);
             return res;
@@ -1652,7 +1681,7 @@ impl GLProcessorST {
     /// backed renderbuffer. Creates a small test FBO and checks completeness.
     /// Returns `false` on any failure (DMA unavailable, EGLImage rejected, FBO incomplete).
     fn probe_rgb_direct_support(&self) -> bool {
-        if !self.gl_context.support_dma {
+        if !self.gl_context.transfer_backend.is_dma() {
             log::debug!("probe_rgb_direct: no DMA support");
             return false;
         }
@@ -2123,8 +2152,8 @@ impl GLProcessorST {
         Ok(results)
     }
 
-    fn check_src_format_supported(support_dma: bool, img: &TensorImage) -> bool {
-        if support_dma && img.tensor().memory() == TensorMemory::Dma {
+    fn check_src_format_supported(backend: TransferBackend, img: &TensorImage) -> bool {
+        if backend.is_dma() && img.tensor().memory() == TensorMemory::Dma {
             // EGLImage supports RGBA, GREY, YUYV, and NV12 for DMA buffers
             matches!(img.fourcc(), RGBA | GREY | YUYV | NV12)
         } else {
@@ -2132,8 +2161,8 @@ impl GLProcessorST {
         }
     }
 
-    fn check_dst_format_supported(support_dma: bool, img: &TensorImage) -> bool {
-        if support_dma && img.tensor().memory() == TensorMemory::Dma {
+    fn check_dst_format_supported(backend: TransferBackend, img: &TensorImage) -> bool {
+        if backend.is_dma() && img.tensor().memory() == TensorMemory::Dma {
             matches!(
                 img.fourcc(),
                 RGBA | GREY | PLANAR_RGB | RGB | RGB_INT8 | PLANAR_RGB_INT8
@@ -2229,7 +2258,7 @@ impl GLProcessorST {
         flip: Flip,
         crop: Crop,
     ) -> crate::Result<()> {
-        assert!(self.gl_context.support_dma);
+        assert!(self.gl_context.transfer_backend.is_dma());
         if fourcc_is_packed_rgb(dst.fourcc()) {
             if self.support_rgb_direct {
                 self.convert_to_rgb_direct(src, dst, rotation, flip, crop)
@@ -2446,7 +2475,7 @@ impl GLProcessorST {
             crate::Rotation::Rotate180 => 2,
             crate::Rotation::CounterClockwise90 => 3,
         };
-        if self.gl_context.support_dma && src.tensor().memory() == TensorMemory::Dma {
+        if self.gl_context.transfer_backend.is_dma() && src.tensor().memory() == TensorMemory::Dma {
             match self.get_or_create_egl_image(CacheKind::Src, src) {
                 Ok(src_egl) => self.draw_camera_texture_eglimage(
                     src,
