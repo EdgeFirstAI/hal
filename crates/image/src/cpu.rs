@@ -1752,20 +1752,16 @@ impl ImageProcessorTrait for CPUProcessor {
         flip: Flip,
         crop: Crop,
     ) -> Result<()> {
-        // Int8 formats: delegate to uint8 pipeline, then apply XOR 0x80
+        // Int8 formats: convert directly into dst as uint8 (layouts are
+        // identical), then XOR 0x80 in-place. Avoids a temporary allocation.
         if fourcc_is_int8(dst.fourcc()) {
-            let uint8_fourcc = fourcc_uint8_equivalent(dst.fourcc());
-            let mut tmp = TensorImage::new(
-                dst.width(),
-                dst.height(),
-                uint8_fourcc,
-                Some(edgefirst_tensor::TensorMemory::Mem),
-            )?;
-            self.convert(src, &mut tmp, rotation, flip, crop)?;
-            let src_map = tmp.tensor().map()?;
+            let int8_fourcc = dst.fourcc();
+            dst.set_fourcc(fourcc_uint8_equivalent(int8_fourcc));
+            self.convert(src, dst, rotation, flip, crop)?;
+            dst.set_fourcc(int8_fourcc);
             let mut dst_map = dst.tensor().map()?;
-            for (d, s) in dst_map.iter_mut().zip(src_map.iter()) {
-                *d = s ^ 0x80;
+            for byte in dst_map.iter_mut() {
+                *byte ^= 0x80;
             }
             return Ok(());
         }

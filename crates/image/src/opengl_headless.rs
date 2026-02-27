@@ -613,12 +613,11 @@ impl Drop for GlContext {
                 .egl
                 .destroy_context(self.display.as_display(), self.ctx);
 
-            // Note: eglTerminate is intentionally NOT called here. While the
-            // EGL spec says eglInitialize/eglTerminate are ref-counted, some
-            // drivers (notably Vivante) invalidate all resources on the display
-            // when any thread calls eglTerminate. This breaks multi-threaded
-            // use where multiple GlContext instances share the same underlying
-            // DRM render node. EGL resources are cleaned up on process exit.
+            // eglTerminate is ref-counted per the EGL spec: each eglInitialize
+            // increments a counter and each eglTerminate decrements it. The
+            // display is only truly torn down when the last reference is
+            // released. catch_unwind absorbs any driver-side misbehaviour.
+            let _ = self.egl.terminate(self.display.as_display());
         }));
         std::panic::set_hook(prev_hook);
 
@@ -1254,14 +1253,22 @@ struct CachedEglImage {
     guard: std::sync::Weak<()>,
     /// Optional GL renderbuffer backed by this EGLImage (used by direct RGB path).
     renderbuffer: Option<u32>,
+    /// Monotonic access counter for LRU eviction.
+    last_used: u64,
 }
 
 /// EGLImage cache owned by GLProcessorST.
+///
+/// Uses a HashMap with a monotonic counter for LRU eviction: each access
+/// updates the entry's `last_used` timestamp, and eviction removes the entry
+/// with the smallest `last_used` value.
 struct EglImageCache {
     entries: std::collections::HashMap<u64, CachedEglImage>,
     capacity: usize,
     hits: u64,
     misses: u64,
+    /// Monotonic counter incremented on each access for LRU tracking.
+    access_counter: u64,
 }
 
 impl EglImageCache {
@@ -1271,6 +1278,28 @@ impl EglImageCache {
             capacity,
             hits: 0,
             misses: 0,
+            access_counter: 0,
+        }
+    }
+
+    /// Allocate a new LRU timestamp.
+    fn next_timestamp(&mut self) -> u64 {
+        self.access_counter += 1;
+        self.access_counter
+    }
+
+    /// Evict the least recently used entry.
+    fn evict_lru(&mut self) {
+        if let Some((&evict_id, _)) = self
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used)
+        {
+            if let Some(evicted) = self.entries.remove(&evict_id) {
+                if let Some(rbo) = evicted.renderbuffer {
+                    unsafe { gls::gl::DeleteRenderbuffers(1, &rbo) };
+                }
+            }
         }
     }
 
@@ -4297,22 +4326,18 @@ impl GLProcessorST {
                 CacheKind::Src => &mut self.src_egl_cache,
                 CacheKind::Dst => &mut self.dst_egl_cache,
             };
-            if let Some(cached) = egl_cache.entries.get(&id) {
+            let ts = egl_cache.next_timestamp();
+            if let Some(cached) = egl_cache.entries.get_mut(&id) {
                 egl_cache.hits += 1;
+                cached.last_used = ts;
                 log::trace!("EglImageCache {:?} hit: id={id:#x}", cache);
                 return Ok(cached.egl_image.egl_image);
             }
             egl_cache.misses += 1;
             log::trace!("EglImageCache {:?} miss: id={id:#x}", cache);
-            // Evict oldest entry if at capacity.
+            // Evict least-recently-used entry if at capacity.
             if egl_cache.entries.len() >= egl_cache.capacity {
-                if let Some(&evict_id) = egl_cache.entries.keys().next() {
-                    if let Some(evicted) = egl_cache.entries.remove(&evict_id) {
-                        if let Some(rbo) = evicted.renderbuffer {
-                            unsafe { gls::gl::DeleteRenderbuffers(1, &rbo) };
-                        }
-                    }
-                }
+                egl_cache.evict_lru();
             }
         }
 
@@ -4323,12 +4348,14 @@ impl GLProcessorST {
             CacheKind::Src => &mut self.src_egl_cache,
             CacheKind::Dst => &mut self.dst_egl_cache,
         };
+        let ts = egl_cache.next_timestamp();
         egl_cache.entries.insert(
             id,
             CachedEglImage {
                 egl_image: egl_image_obj,
                 guard,
                 renderbuffer: None,
+                last_used: ts,
             },
         );
         Ok(handle)
@@ -4389,8 +4416,10 @@ impl GLProcessorST {
         let id = img.buffer_identity().id();
         self.dst_egl_cache.sweep();
 
-        if let Some(cached) = self.dst_egl_cache.entries.get(&id) {
+        let ts = self.dst_egl_cache.next_timestamp();
+        if let Some(cached) = self.dst_egl_cache.entries.get_mut(&id) {
             self.dst_egl_cache.hits += 1;
+            cached.last_used = ts;
             log::trace!("EglImageCache dst (RGB) hit: id={id:#x}");
             return Ok(cached.egl_image.egl_image);
         }
@@ -4398,24 +4427,20 @@ impl GLProcessorST {
         log::trace!("EglImageCache dst (RGB) miss: id={id:#x}");
 
         if self.dst_egl_cache.entries.len() >= self.dst_egl_cache.capacity {
-            if let Some(&evict_id) = self.dst_egl_cache.entries.keys().next() {
-                if let Some(evicted) = self.dst_egl_cache.entries.remove(&evict_id) {
-                    if let Some(rbo) = evicted.renderbuffer {
-                        unsafe { gls::gl::DeleteRenderbuffers(1, &rbo) };
-                    }
-                }
-            }
+            self.dst_egl_cache.evict_lru();
         }
 
         let egl_image_obj = self.create_egl_image_with_dims(img, width, height, drm_format, bpp)?;
         let handle = egl_image_obj.egl_image;
         let guard = img.buffer_identity().weak();
+        let ts = self.dst_egl_cache.next_timestamp();
         self.dst_egl_cache.entries.insert(
             id,
             CachedEglImage {
                 egl_image: egl_image_obj,
                 guard,
                 renderbuffer: None,
+                last_used: ts,
             },
         );
         Ok(handle)
@@ -4435,9 +4460,11 @@ impl GLProcessorST {
         self.dst_egl_cache.sweep();
 
         // Check cache for existing entry with renderbuffer
-        if let Some(cached) = self.dst_egl_cache.entries.get(&id) {
+        let ts = self.dst_egl_cache.next_timestamp();
+        if let Some(cached) = self.dst_egl_cache.entries.get_mut(&id) {
             if let Some(rbo) = cached.renderbuffer {
                 self.dst_egl_cache.hits += 1;
+                cached.last_used = ts;
                 log::trace!("EglImageCache dst (rgb_direct) hit: id={id:#x}");
                 return Ok((rbo, width, height));
             }
@@ -4445,15 +4472,9 @@ impl GLProcessorST {
         self.dst_egl_cache.misses += 1;
         log::trace!("EglImageCache dst (rgb_direct) miss: id={id:#x}");
 
-        // Evict if at capacity
+        // Evict least-recently-used entry if at capacity
         if self.dst_egl_cache.entries.len() >= self.dst_egl_cache.capacity {
-            if let Some(&evict_id) = self.dst_egl_cache.entries.keys().next() {
-                if let Some(evicted) = self.dst_egl_cache.entries.remove(&evict_id) {
-                    if let Some(rbo) = evicted.renderbuffer {
-                        unsafe { gls::gl::DeleteRenderbuffers(1, &rbo) };
-                    }
-                }
-            }
+            self.dst_egl_cache.evict_lru();
         }
 
         // Create EGLImage from BGR888 DMA-buf
@@ -4478,12 +4499,14 @@ impl GLProcessorST {
 
         // Cache both
         let guard = dst.buffer_identity().weak();
+        let ts = self.dst_egl_cache.next_timestamp();
         self.dst_egl_cache.entries.insert(
             id,
             CachedEglImage {
                 egl_image: egl_image_obj,
                 guard,
                 renderbuffer: Some(rbo),
+                last_used: ts,
             },
         );
 
@@ -5895,23 +5918,28 @@ void main(){
 "
 }
 
-/// Int8 variant of [`generate_planar_rgb_shader`]. Applies `fract(v + 0.5)` to
-/// each channel, which is the GL-safe equivalent of XOR 0x80 for converting
-/// unsigned [0,255] texel values to signed int8 representation.
+/// Int8 variant of [`generate_planar_rgb_shader`]. Applies XOR 0x80 bias
+/// to each RGB channel (uint8 → int8 conversion) using the bit-exact
+/// quantize+mod approach: `floor(v * 255 + 0.5) + 128 mod 256 / 255`.
 fn generate_planar_rgb_int8_shader() -> &'static str {
     "\
 #version 300 es
 #extension GL_OES_EGL_image_external_essl3 : require
-precision mediump float;
+precision highp float;
 uniform samplerExternalOES tex;
 in vec3 fragPos;
 in vec2 tc;
 
 out vec4 color;
 
+vec3 int8_bias(vec3 v) {
+    vec3 q = floor(v * 255.0 + 0.5);
+    return mod(q + 128.0, 256.0) / 255.0;
+}
+
 void main(){
     vec4 c = texture(tex, tc);
-    color = vec4(fract(c.r + 0.5), fract(c.g + 0.5), fract(c.b + 0.5), c.a);
+    color = vec4(int8_bias(c.rgb), c.a);
 }
 "
 }
@@ -6429,9 +6457,8 @@ void main() {
 /// Packed RGB -> RGBA8 packing shader with int8 XOR 0x80 bias (2D source, pass 2).
 ///
 /// Same packing logic as [`generate_packed_rgba8_shader_2d`] but applies
-/// `fract(v + 0.5)` to each channel value before writing. In normalised
-/// float space this is equivalent to XOR 0x80 on the uint8 representation,
-/// converting unsigned [0, 255] to signed [-128, 127] (two's-complement).
+/// bit-exact XOR 0x80 bias via quantize+mod: `floor(v * 255 + 0.5) + 128
+/// mod 256 / 255`. This matches the CPU `byte ^ 0x80` operation exactly.
 fn generate_packed_rgba8_int8_shader_2d() -> &'static str {
     "\
 #version 300 es
@@ -6439,6 +6466,12 @@ precision highp float;
 precision highp int;
 uniform sampler2D tex;
 out vec4 color;
+
+vec4 int8_bias(vec4 v) {
+    vec4 q = floor(v * 255.0 + 0.5);
+    return mod(q + 128.0, 256.0) / 255.0;
+}
+
 void main() {
     // gl_FragCoord is at pixel center (n+0.5). Use floor() for robust
     // integer pixel index on all GPUs (Vivante, Mali, Adreno).
@@ -6453,11 +6486,11 @@ void main() {
     // Extract channels based on phase (base % 3), then apply int8 bias
     int phase = base - px0 * 3;
     if (phase == 0) {
-        color = fract(vec4(s0.r, s0.g, s0.b, s1.r) + 0.5);
+        color = int8_bias(vec4(s0.r, s0.g, s0.b, s1.r));
     } else if (phase == 1) {
-        color = fract(vec4(s0.g, s0.b, s1.r, s1.g) + 0.5);
+        color = int8_bias(vec4(s0.g, s0.b, s1.r, s1.g));
     } else {
-        color = fract(vec4(s0.b, s1.r, s1.g, s1.b) + 0.5);
+        color = int8_bias(vec4(s0.b, s1.r, s1.g, s1.b));
     }
 }
 "
