@@ -1018,11 +1018,15 @@ class Rect:
 class EglDisplayKind:
     """Identifies the type of EGL display used for headless OpenGL ES rendering.
 
-    Display types:
-        Gbm: Direct GPU access via DRM render node (/dev/dri/renderD128).
-            No compositor required. Preferred for headless edge AI.
+    The HAL creates a surfaceless GLES 3.0 context and renders exclusively
+    through FBOs. No window or PBuffer surface is created.
+
+    Display types (probed in priority order):
         PlatformDevice: EGL device enumeration via EGL_EXT_device_enumeration.
-            Also headless/compositor-free. Common on NVIDIA GPUs.
+            Headless/compositor-free with zero external deps. Works on NVIDIA
+            and newer Vivante drivers.
+        Gbm: Direct GPU access via DRM render node (/dev/dri/renderD128).
+            No compositor required. Needed on ARM Mali and older Vivante.
         Default: Uses eglGetDisplay(EGL_DEFAULT_DISPLAY). Connects to
             Wayland compositor or X server if available. May block on
             headless systems.
@@ -1048,8 +1052,9 @@ class EglDisplayInfo:
 def probe_egl_displays() -> list[EglDisplayInfo]:
     """Probe for available EGL displays supporting headless OpenGL ES 3.0.
 
-    Returns displays in priority order (GBM, PlatformDevice, Default).
-    Each display is validated with eglInitialize + eglChooseConfig.
+    Returns displays in priority order (PlatformDevice, GBM, Default).
+    Each display is validated with eglInitialize and checked for required
+    extensions (EGL_KHR_surfaceless_context, EGL_KHR_no_config_context).
     An empty list means OpenGL is not available on this system.
 
     Raises:

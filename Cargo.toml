@@ -42,7 +42,7 @@ fast_image_resize = { version = "5.2.0", features = ["image", "rayon"] }
 four-char-code = "2.3.0"
 g2d-sys = "1.2.0"
 
-gbm = { package = "edgefirst-gbm", version = "0.18.1", default-features = false, features = ["dynamic", "drm-support"] }
+gbm = { package = "edgefirst-gbm", version = "0.18.2", default-features = false, features = ["dynamic", "drm-support"] }
 gls = "0.1.6"
 half = "2.7.1"
 image = { version = "0.25.6", default-features = false, features = ["png"] }

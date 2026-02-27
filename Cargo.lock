@@ -573,9 +573,9 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-gbm"
-version = "0.18.1"
+version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f0b69de3318098ed618db4873804c38fdacf664e708cb7ab8ab0e163c9afaeb"
+checksum = "4dd6165adfc3801870e0671ba026f050030383604afc0c84e3ba25a094584857"
 dependencies = [
  "bitflags",
  "drm",
