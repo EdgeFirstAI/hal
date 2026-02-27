@@ -157,7 +157,7 @@ impl TryFrom<&str> for FourCC {
             "YUYV" => Ok(FourCC::YUYV),
             "RGBA" => Ok(FourCC::RGBA),
             "RGB" | "RGB " => Ok(FourCC::RGB),
-            "NV12" => Ok(FourCC::RGB),
+            "NV12" => Ok(FourCC::NV12),
             "Y800" | "GREY" | "GRAY" => Ok(FourCC::GREY),
             "8BPS" => Ok(FourCC::PLANAR_RGB),
             _ => Err(Error::Format(value.to_string())),
@@ -1130,7 +1130,7 @@ pub enum PyRotation {
 impl PyRotation {
     #[staticmethod]
     pub fn degrees_clockwise(angle: usize) -> PyRotation {
-        match angle.rem_euclid(90) {
+        match angle.rem_euclid(360) {
             0 => PyRotation::Rotate0,
             90 => PyRotation::Clockwise90,
             180 => PyRotation::Rotate180,
