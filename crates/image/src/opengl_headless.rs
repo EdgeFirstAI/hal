@@ -229,6 +229,10 @@ pub(crate) enum TransferBackend {
     /// the GPU can actually render through DMA-buf-backed textures.
     DmaBuf,
 
+    /// GPU buffer via Pixel Buffer Object. Used when DMA-buf is unavailable
+    /// but OpenGL is present. Data stays in GPU-accessible memory.
+    Pbo,
+
     /// Synchronous `glTexSubImage2D` upload + `glReadnPixels` readback.
     /// Used when DMA-buf is unavailable or when the DMA-buf verification
     /// probe fails (e.g. NVIDIA discrete GPUs where EGLImage creation
@@ -240,6 +244,12 @@ impl TransferBackend {
     /// Returns `true` if DMA-buf zero-copy is available.
     pub(crate) fn is_dma(self) -> bool {
         self == TransferBackend::DmaBuf
+    }
+
+    /// Returns `true` if PBO transfer is active.
+    #[allow(dead_code)]
+    pub(crate) fn is_pbo(self) -> bool {
+        self == TransferBackend::Pbo
     }
 }
 
@@ -1831,10 +1841,16 @@ impl GLProcessorST {
         // Verify DMA-buf actually works (catches NVIDIA discrete GPUs where
         // EGLImage creation succeeds but rendered data is all zeros)
         if converter.gl_context.transfer_backend.is_dma() && !converter.verify_dma_buf_roundtrip() {
-            log::info!("DMA-buf verification failed — falling back to synchronous transfers");
-            converter.gl_context.transfer_backend = TransferBackend::Sync;
+            log::info!("DMA-buf verification failed — falling back to PBO transfers");
+            converter.gl_context.transfer_backend = TransferBackend::Pbo;
             // RGB direct rendering also requires DMA, so disable it
             converter.support_rgb_direct = false;
+        }
+
+        // If DMA-buf failed/unavailable but GL is alive, use PBO transfers
+        if converter.gl_context.transfer_backend == TransferBackend::Sync {
+            log::info!("Upgrading transfer backend from Sync to Pbo (GL context available)");
+            converter.gl_context.transfer_backend = TransferBackend::Pbo;
         }
 
         log::debug!(

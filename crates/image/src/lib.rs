@@ -1404,6 +1404,67 @@ impl ImageProcessor {
         }
         Ok(())
     }
+
+    /// Create a `TensorImage` with the best available memory backend.
+    ///
+    /// Priority: DMA-buf → PBO → system memory.
+    ///
+    /// # Arguments
+    ///
+    /// * `width` - Image width in pixels
+    /// * `height` - Image height in pixels
+    /// * `fourcc` - Pixel format as a FourCC code
+    ///
+    /// # Returns
+    ///
+    /// A `TensorImage` backed by the highest-performance memory type
+    /// available on this system.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if all allocation strategies fail.
+    pub fn create_image(
+        &self,
+        width: usize,
+        height: usize,
+        fourcc: four_char_code::FourCharCode,
+    ) -> Result<TensorImage> {
+        // Try DMA (if GL backend uses DmaBuf)
+        #[cfg(target_os = "linux")]
+        #[cfg(feature = "opengl")]
+        if self
+            .opengl
+            .as_ref()
+            .is_some_and(|gl| gl.transfer_backend() == opengl_headless::TransferBackend::DmaBuf)
+        {
+            if let Ok(img) = TensorImage::new(
+                width,
+                height,
+                fourcc,
+                Some(edgefirst_tensor::TensorMemory::Dma),
+            ) {
+                return Ok(img);
+            }
+        }
+
+        // Try PBO (if GL available)
+        #[cfg(target_os = "linux")]
+        #[cfg(feature = "opengl")]
+        if let Some(gl) = &self.opengl {
+            match gl.create_pbo_image(width, height, fourcc) {
+                Ok(img) => return Ok(img),
+                Err(e) => log::debug!("PBO image creation failed, falling back to Mem: {e:?}"),
+            }
+        }
+
+        // Fallback to Mem
+        TensorImage::new(
+            width,
+            height,
+            fourcc,
+            Some(edgefirst_tensor::TensorMemory::Mem),
+        )
+    }
 }
 
 impl ImageProcessorTrait for ImageProcessor {
