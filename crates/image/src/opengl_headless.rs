@@ -1670,8 +1670,22 @@ impl GLProcessorST {
         // Probe GPU capability for direct RGB rendering
         converter.support_rgb_direct = converter.probe_rgb_direct_support();
 
+        // Verify DMA-buf actually works (catches NVIDIA discrete GPUs where
+        // EGLImage creation succeeds but rendered data is all zeros)
+        if converter.gl_context.transfer_backend.is_dma()
+            && !converter.verify_dma_buf_roundtrip()
+        {
+            log::info!(
+                "DMA-buf verification failed — falling back to synchronous transfers"
+            );
+            converter.gl_context.transfer_backend = TransferBackend::Sync;
+            // RGB direct rendering also requires DMA, so disable it
+            converter.support_rgb_direct = false;
+        }
+
         log::debug!(
-            "GLConverter created (rgb_direct={})",
+            "GLConverter created (transfer={:?}, rgb_direct={})",
+            converter.gl_context.transfer_backend,
             converter.support_rgb_direct
         );
         Ok(converter)
@@ -1761,6 +1775,95 @@ impl GLProcessorST {
 
         log::info!("probe_rgb_direct: BGR888 renderbuffer FBO support = {result}");
         result
+    }
+
+    /// Verify that DMA-buf EGLImage round-trip actually works on this GPU.
+    ///
+    /// Renders a solid red quad to a 64x64 DMA-buf-backed RGBA texture via
+    /// EGLImage, then reads it back and checks that the center pixel is red.
+    /// Returns `true` if the data round-trips correctly.
+    ///
+    /// This catches GPUs like NVIDIA discrete where `eglCreateImage` from
+    /// `dma_heap` fds succeeds but the rendered data is all zeros.
+    fn verify_dma_buf_roundtrip(&mut self) -> bool {
+        // Allocate a 64x64 RGBA DMA source tensor and fill it with solid red
+        let src = match TensorImage::new(64, 64, RGBA, Some(TensorMemory::Dma)) {
+            Ok(img) => img,
+            Err(e) => {
+                log::info!("verify_dma_buf_roundtrip: failed to allocate DMA source: {e}");
+                return false;
+            }
+        };
+
+        {
+            let mut map = match src.tensor().map() {
+                Ok(m) => m,
+                Err(e) => {
+                    log::info!("verify_dma_buf_roundtrip: failed to map DMA source: {e}");
+                    return false;
+                }
+            };
+            for pixel in map.chunks_exact_mut(4) {
+                pixel[0] = 255; // R
+                pixel[1] = 0; // G
+                pixel[2] = 0; // B
+                pixel[3] = 255; // A
+            }
+        }
+
+        // Allocate a 64x64 RGBA DMA destination tensor
+        let mut dst = match TensorImage::new(64, 64, RGBA, Some(TensorMemory::Dma)) {
+            Ok(img) => img,
+            Err(e) => {
+                log::info!("verify_dma_buf_roundtrip: failed to allocate DMA destination: {e}");
+                return false;
+            }
+        };
+
+        // Run the full DMA-buf EGLImage render pipeline
+        if let Err(e) = self.convert_dest_dma(
+            &mut dst,
+            &src,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        ) {
+            log::info!("verify_dma_buf_roundtrip: convert_dest_dma failed: {e}");
+            return false;
+        }
+
+        // Read back the center pixel at (32, 32) from the destination
+        let map = match dst.tensor().map() {
+            Ok(m) => m,
+            Err(e) => {
+                log::info!("verify_dma_buf_roundtrip: failed to map DMA destination: {e}");
+                return false;
+            }
+        };
+
+        let offset = (32 * 64 + 32) * 4;
+        if map.len() < offset + 4 {
+            log::info!("verify_dma_buf_roundtrip: destination buffer too small");
+            return false;
+        }
+
+        let r = map[offset];
+        let g = map[offset + 1];
+        let b = map[offset + 2];
+        let a = map[offset + 3];
+
+        let pass = r > 250 && g < 5 && b < 5 && a > 250;
+
+        if pass {
+            log::info!("verify_dma_buf_roundtrip: PASSED (center pixel RGBA={r},{g},{b},{a})");
+        } else {
+            log::info!(
+                "verify_dma_buf_roundtrip: FAILED (center pixel RGBA={r},{g},{b},{a}, \
+                 expected ~255,0,0,255)"
+            );
+        }
+
+        pass
     }
 
     /// Sets the interpolation mode for int8 proto textures.
