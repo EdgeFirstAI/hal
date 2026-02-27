@@ -1,11 +1,17 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Vision pipeline benchmarks using Criterion.
+//! Vision pipeline benchmarks using a custom in-process harness.
 //!
-//! Focused benchmarks for realistic camera-to-model preprocessing scenarios:
-//! - Primary: Camera (YUYV) → Model (RGBA/RGB) with letterbox
-//! - Secondary: Format conversion (no resize)
+//! Criterion runs each benchmark in a forked subprocess. On i.MX8MP this
+//! causes `corrupted double-linked list` crashes after GPU driver state is
+//! poisoned across the fork boundary. On i.MX95 the Mali/Panfrost driver
+//! exhausts EGL display connections by the 4th OpenGL benchmark. This is
+//! fundamentally incompatible with GPU hardware initialization.
+//!
+//! This harness runs all benchmarks sequentially in a single process with
+//! no forking, using the same `BenchResult`/`run_bench` pattern proven in
+//! `crates/gpu-probe/src/bench.rs`.
 //!
 //! ## Run benchmarks (host)
 //! ```bash
@@ -14,33 +20,20 @@
 //!
 //! ## Run benchmarks (on-target, cross-compiled)
 //! ```bash
-//! # The --bench flag is required for Criterion to run actual measurements
 //! ./pipeline_benchmark --bench
 //! ```
-//!
-//! ## View HTML report
-//! Open `target/criterion/report/index.html` after running benchmarks.
 
 mod common;
 
-#[cfg(target_os = "linux")]
-use common::g2d_available;
-#[cfg(all(target_os = "linux", feature = "opengl"))]
-use common::opengl_available;
-use common::{calculate_letterbox, get_test_data, BenchConfig};
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use common::{calculate_letterbox, get_test_data, run_bench, BenchConfig};
 
-#[cfg(target_os = "linux")]
-use edgefirst_image::G2DProcessor;
-#[cfg(all(target_os = "linux", feature = "opengl"))]
-use edgefirst_image::GLProcessorThreaded;
-use edgefirst_image::{
-    CPUProcessor, Crop, Flip, ImageProcessorTrait, Rect, Rotation, TensorImage, NV12, RGB, RGBA,
-    YUYV,
-};
+use edgefirst_image::{CPUProcessor, Crop, Flip, ImageProcessorTrait, Rect, Rotation, TensorImage};
+use edgefirst_image::{NV12, PLANAR_RGB_INT8, RGB, RGBA, RGB_INT8, YUYV};
 #[cfg(target_os = "linux")]
 use edgefirst_tensor::TensorMemory;
 use edgefirst_tensor::{TensorMapTrait, TensorTrait};
+#[cfg(target_os = "linux")]
+use std::mem::ManuallyDrop;
 
 #[cfg(feature = "opencv")]
 use opencv::{
@@ -49,111 +42,28 @@ use opencv::{
     prelude::*,
 };
 
+const WARMUP: usize = 10;
+const ITERATIONS: usize = 100;
+
 // =============================================================================
 // Primary Benchmarks: Camera → Model (letterbox)
 // =============================================================================
 
-/// Primary use case: Camera YUYV → Model RGBA with letterbox
-#[allow(unused_variables)] // has_g2d/has_opengl used conditionally on Linux
-fn bench_letterbox(c: &mut Criterion) {
-    let mut group = c.benchmark_group("letterbox");
-    group.sample_size(100);
+#[allow(unused_variables)]
+fn bench_letterbox(configs: &[BenchConfig]) {
+    println!("\n== Letterbox: Camera → Model ==\n");
 
-    // Check hardware availability once at start (not per-iteration)
-    #[cfg(target_os = "linux")]
-    let has_g2d = g2d_available();
-    #[cfg(not(target_os = "linux"))]
-    let has_g2d = false;
-
-    #[cfg(all(target_os = "linux", feature = "opengl"))]
-    let has_opengl = opengl_available();
-    #[cfg(not(all(target_os = "linux", feature = "opengl")))]
-    let has_opengl = false;
-
-    // Configurations: most valuable for YOLO model preprocessing
-    let configs = vec![
-        // 1080p camera → YOLO standard (640x640)
-        BenchConfig {
-            in_w: 1920,
-            in_h: 1080,
-            out_w: 640,
-            out_h: 640,
-            in_fmt: YUYV,
-            out_fmt: RGBA,
-        },
-        BenchConfig {
-            in_w: 1920,
-            in_h: 1080,
-            out_w: 640,
-            out_h: 640,
-            in_fmt: YUYV,
-            out_fmt: RGB,
-        },
-        BenchConfig {
-            in_w: 1920,
-            in_h: 1080,
-            out_w: 640,
-            out_h: 640,
-            in_fmt: NV12,
-            out_fmt: RGBA,
-        },
-        // 4K camera → YOLO standard (640x640)
-        BenchConfig {
-            in_w: 3840,
-            in_h: 2160,
-            out_w: 640,
-            out_h: 640,
-            in_fmt: YUYV,
-            out_fmt: RGBA,
-        },
-        BenchConfig {
-            in_w: 3840,
-            in_h: 2160,
-            out_w: 640,
-            out_h: 640,
-            in_fmt: YUYV,
-            out_fmt: RGB,
-        },
-        BenchConfig {
-            in_w: 3840,
-            in_h: 2160,
-            out_w: 640,
-            out_h: 640,
-            in_fmt: NV12,
-            out_fmt: RGBA,
-        },
-        // 4K camera → YOLO hi-res (1280x1280)
-        BenchConfig {
-            in_w: 3840,
-            in_h: 2160,
-            out_w: 1280,
-            out_h: 1280,
-            in_fmt: YUYV,
-            out_fmt: RGBA,
-        },
-        BenchConfig {
-            in_w: 3840,
-            in_h: 2160,
-            out_w: 1280,
-            out_h: 1280,
-            in_fmt: YUYV,
-            out_fmt: RGB,
-        },
-        BenchConfig {
-            in_w: 3840,
-            in_h: 2160,
-            out_w: 1280,
-            out_h: 1280,
-            in_fmt: NV12,
-            out_fmt: RGBA,
-        },
-    ];
-
-    for config in &configs {
-        group.throughput(config.throughput());
+    for config in configs {
+        let (left, top, new_w, new_h) =
+            calculate_letterbox(config.in_w, config.in_h, config.out_w, config.out_h);
+        let crop = Crop::new()
+            .with_dst_rect(Some(Rect::new(left, top, new_w, new_h)))
+            .with_dst_color(Some([114, 114, 114, 255]));
+        let throughput = config.throughput();
 
         // HAL CPU
         {
+            let name = format!("letterbox/cpu/{}", config.id());
             let src = TensorImage::new(config.in_w, config.in_h, config.in_fmt, None).unwrap();
             let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
             src.tensor().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
@@ -161,34 +71,28 @@ fn bench_letterbox(c: &mut Criterion) {
                 TensorImage::new(config.out_w, config.out_h, config.out_fmt, None).unwrap();
             let mut proc = CPUProcessor::new();
 
-            let (left, top, new_w, new_h) =
-                calculate_letterbox(config.in_w, config.in_h, config.out_w, config.out_h);
-            let crop = Crop::new()
-                .with_dst_rect(Some(Rect::new(left, top, new_w, new_h)))
-                .with_dst_color(Some([114, 114, 114, 255]));
-
-            group.bench_with_input(BenchmarkId::new("cpu", config.id()), &config, |b, _| {
-                b.iter(|| {
-                    proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop)
-                        .unwrap();
-                    black_box(&dst);
-                });
+            let result = run_bench(&name, WARMUP, ITERATIONS, || {
+                proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop)
+                    .unwrap();
             });
+            result.print_summary_with_throughput(throughput);
         }
 
-        // HAL G2D (for YUYV and NV12 input)
+        // HAL G2D (for YUYV/NV12 input → RGBA/RGB output only)
         #[cfg(target_os = "linux")]
-        if has_g2d && (config.in_fmt == YUYV || config.in_fmt == NV12) {
+        if (config.in_fmt == YUYV || config.in_fmt == NV12)
+            && (config.out_fmt == RGBA || config.out_fmt == RGB)
+        {
+            use edgefirst_image::G2DProcessor;
+
+            let name = format!("letterbox/g2d/{}", config.id());
             let Ok(src) = TensorImage::new(
                 config.in_w,
                 config.in_h,
                 config.in_fmt,
                 Some(TensorMemory::Dma),
             ) else {
-                eprintln!(
-                    "G2D: DMA allocation failed for {}x{} - skipping",
-                    config.in_w, config.in_h
-                );
+                println!("  {:50} [skipped: DMA unavailable]", name);
                 continue;
             };
             let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
@@ -199,334 +103,212 @@ fn bench_letterbox(c: &mut Criterion) {
                 config.out_fmt,
                 Some(TensorMemory::Dma),
             ) else {
+                println!("  {:50} [skipped: DMA unavailable]", name);
                 continue;
             };
-            let mut proc = G2DProcessor::new().unwrap();
+            // ManuallyDrop: prevent g2d_close + dlclose("libg2d.so.2") which
+            // triggers Vivante galcore atexit heap corruption on i.MX8.
+            // Same rationale as the EGL Box::leak in opengl_headless.rs.
+            let Ok(proc) = G2DProcessor::new() else {
+                println!("  {:50} [skipped: G2D unavailable]", name);
+                continue;
+            };
+            let mut proc = ManuallyDrop::new(proc);
 
-            let (left, top, new_w, new_h) =
-                calculate_letterbox(config.in_w, config.in_h, config.out_w, config.out_h);
-            let crop = Crop::new()
-                .with_dst_rect(Some(Rect::new(left, top, new_w, new_h)))
-                .with_dst_color(Some([114, 114, 114, 255]));
-
-            group.bench_with_input(BenchmarkId::new("g2d", config.id()), &config, |b, _| {
-                b.iter(|| {
-                    proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop)
-                        .unwrap();
-                    black_box(&dst);
-                });
+            let result = run_bench(&name, WARMUP, ITERATIONS, || {
+                proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop)
+                    .unwrap();
             });
+            result.print_summary_with_throughput(throughput);
         }
 
-        // HAL OpenGL (for YUYV/NV12 → RGBA output)
-        // Resources created inside closure to survive Criterion's subprocess fork
+        // HAL OpenGL (for YUYV/NV12 → RGBA/RGB/RGB_INT8/PLANAR_RGB_INT8 output)
         #[cfg(all(target_os = "linux", feature = "opengl"))]
-        if has_opengl && (config.in_fmt == YUYV || config.in_fmt == NV12) && config.out_fmt == RGBA
+        if (config.in_fmt == YUYV || config.in_fmt == NV12)
+            && (config.out_fmt == RGBA
+                || config.out_fmt == RGB
+                || config.out_fmt == RGB_INT8
+                || config.out_fmt == PLANAR_RGB_INT8)
         {
-            let config = config.clone();
-            group.bench_with_input(
-                BenchmarkId::new("opengl", config.id()),
-                &config,
-                |b, config| {
-                    // Create resources in the child subprocess after fork
-                    let src = TensorImage::new(
-                        config.in_w,
-                        config.in_h,
-                        config.in_fmt,
-                        Some(TensorMemory::Dma),
-                    )
+            use edgefirst_image::GLProcessorThreaded;
+
+            let name = format!("letterbox/opengl/{}", config.id());
+            let Ok(src) = TensorImage::new(
+                config.in_w,
+                config.in_h,
+                config.in_fmt,
+                Some(TensorMemory::Dma),
+            ) else {
+                println!("  {:50} [skipped: DMA unavailable]", name);
+                continue;
+            };
+            let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
+            src.tensor().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
+            let Ok(mut dst) = TensorImage::new(
+                config.out_w,
+                config.out_h,
+                config.out_fmt,
+                Some(TensorMemory::Dma),
+            ) else {
+                println!("  {:50} [skipped: DMA unavailable]", name);
+                continue;
+            };
+            let Ok(mut proc) = GLProcessorThreaded::new(None) else {
+                println!("  {:50} [skipped: OpenGL unavailable]", name);
+                continue;
+            };
+
+            let result = run_bench(&name, WARMUP, ITERATIONS, || {
+                proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop)
                     .unwrap();
-                    let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
-                    src.tensor().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
-                    let mut dst = TensorImage::new(
-                        config.out_w,
-                        config.out_h,
-                        config.out_fmt,
-                        Some(TensorMemory::Dma),
-                    )
-                    .unwrap();
-                    let mut proc = GLProcessorThreaded::new(None).unwrap();
-
-                    let (left, top, new_w, new_h) =
-                        calculate_letterbox(config.in_w, config.in_h, config.out_w, config.out_h);
-                    let crop = Crop::new()
-                        .with_dst_rect(Some(Rect::new(left, top, new_w, new_h)))
-                        .with_dst_color(Some([114, 114, 114, 255]));
-
-                    // Warmup for OpenGL shader compilation (not measured)
-                    let _ = proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop);
-
-                    b.iter(|| {
-                        proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop)
-                            .unwrap();
-                        black_box(&dst);
-                    });
-                },
-            );
+            });
+            result.print_summary_with_throughput(throughput);
         }
 
         // OpenCV
         #[cfg(feature = "opencv")]
-        {
-            let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
-            let cv_type = if config.in_fmt == YUYV {
-                CV_8UC2
-            } else {
-                CV_8UC3
-            };
-            let channels = if config.in_fmt == YUYV { 2 } else { 3 };
+        bench_letterbox_opencv(config, left, top, new_w, new_h, throughput);
+    }
+}
 
-            let src_mat = unsafe {
-                Mat::new_rows_cols_with_data_unsafe(
-                    config.in_h as i32,
-                    config.in_w as i32,
-                    cv_type,
-                    data.as_ptr() as *mut std::ffi::c_void,
-                    config.in_w * channels,
-                )
-                .unwrap()
-            };
+#[cfg(feature = "opencv")]
+#[allow(clippy::too_many_arguments)]
+fn bench_letterbox_opencv(
+    config: &BenchConfig,
+    left: usize,
+    top: usize,
+    new_w: usize,
+    new_h: usize,
+    throughput: u64,
+) {
+    let color_code = if config.in_fmt == YUYV && config.out_fmt == RGBA {
+        imgproc::COLOR_YUV2RGBA_YUYV
+    } else if config.in_fmt == YUYV && config.out_fmt == RGB {
+        imgproc::COLOR_YUV2RGB_YUYV
+    } else {
+        return; // Skip NV12 and unsupported combos
+    };
 
-            let out_channels = if config.out_fmt == RGBA { 4 } else { 3 };
-            let out_cv_type = if config.out_fmt == RGBA {
-                CV_8UC4
-            } else {
-                CV_8UC3
-            };
-            let mut dst_data = vec![0u8; config.out_w * config.out_h * out_channels];
-            let mut dst_mat = unsafe {
-                Mat::new_rows_cols_with_data_unsafe(
-                    config.out_h as i32,
-                    config.out_w as i32,
-                    out_cv_type,
-                    dst_data.as_mut_ptr() as *mut std::ffi::c_void,
-                    config.out_w * out_channels,
-                )
-                .unwrap()
-            };
+    let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
+    let cv_type = if config.in_fmt == YUYV {
+        CV_8UC2
+    } else {
+        CV_8UC3
+    };
+    let channels = if config.in_fmt == YUYV { 2 } else { 3 };
 
-            let mut converted = Mat::default();
-            let mut resized = Mat::default();
+    let src_mat = unsafe {
+        Mat::new_rows_cols_with_data_unsafe(
+            config.in_h as i32,
+            config.in_w as i32,
+            cv_type,
+            data.as_ptr() as *mut std::ffi::c_void,
+            config.in_w * channels,
+        )
+        .unwrap()
+    };
 
-            let color_code = if config.in_fmt == YUYV && config.out_fmt == RGBA {
-                imgproc::COLOR_YUV2RGBA_YUYV
-            } else if config.in_fmt == YUYV && config.out_fmt == RGB {
-                imgproc::COLOR_YUV2RGB_YUYV
-            } else {
-                -1
-            };
+    let out_channels = if config.out_fmt == RGBA { 4 } else { 3 };
+    let out_cv_type = if config.out_fmt == RGBA {
+        CV_8UC4
+    } else {
+        CV_8UC3
+    };
+    let lb_size = Size::new(new_w as i32, new_h as i32);
 
-            let (left, top, new_w, new_h) =
-                calculate_letterbox(config.in_w, config.in_h, config.out_w, config.out_h);
-            let lb_size = Size::new(new_w as i32, new_h as i32);
+    // Single-threaded
+    {
+        let name = format!("letterbox/opencv-1cpu/{}", config.id());
+        let mut dst_data = vec![0u8; config.out_w * config.out_h * out_channels];
+        let mut dst_mat = unsafe {
+            Mat::new_rows_cols_with_data_unsafe(
+                config.out_h as i32,
+                config.out_w as i32,
+                out_cv_type,
+                dst_data.as_mut_ptr() as *mut std::ffi::c_void,
+                config.out_w * out_channels,
+            )
+            .unwrap()
+        };
+        let mut converted = Mat::default();
+        let mut resized = Mat::default();
 
-            // Single-threaded OpenCV benchmark
-            group.bench_with_input(
-                BenchmarkId::new("opencv-1cpu", config.id()),
-                &config,
-                |b, _| {
-                    set_num_threads(1).unwrap();
-                    b.iter(|| {
-                        // Color conversion
-                        if color_code >= 0 {
-                            imgproc::cvt_color_def(&src_mat, &mut converted, color_code).unwrap();
-                        }
-                        let working = if color_code >= 0 {
-                            &converted
-                        } else {
-                            &src_mat
-                        };
-
-                        // Resize with letterbox
-                        imgproc::resize(
-                            working,
-                            &mut resized,
-                            lb_size,
-                            0.0,
-                            0.0,
-                            imgproc::INTER_LINEAR,
-                        )
-                        .unwrap();
-
-                        // Fill background and copy
-                        let no_mask = Mat::default();
-                        dst_mat.set_to(&Scalar::all(114.0), &no_mask).unwrap();
-                        let roi = opencv::core::Rect::new(
-                            left as i32,
-                            top as i32,
-                            lb_size.width,
-                            lb_size.height,
-                        );
-                        let mut dst_roi = Mat::roi_mut(&mut dst_mat, roi).unwrap();
-                        resized.copy_to(&mut dst_roi).unwrap();
-
-                        black_box(&dst_data);
-                    });
-                },
-            );
-
-            // Multi-threaded OpenCV benchmark (auto thread count)
-            group.bench_with_input(
-                BenchmarkId::new("opencv-multi", config.id()),
-                &config,
-                |b, _| {
-                    set_num_threads(0).unwrap(); // 0 = auto (use all available cores)
-                    b.iter(|| {
-                        // Color conversion
-                        if color_code >= 0 {
-                            imgproc::cvt_color_def(&src_mat, &mut converted, color_code).unwrap();
-                        }
-                        let working = if color_code >= 0 {
-                            &converted
-                        } else {
-                            &src_mat
-                        };
-
-                        // Resize with letterbox
-                        imgproc::resize(
-                            working,
-                            &mut resized,
-                            lb_size,
-                            0.0,
-                            0.0,
-                            imgproc::INTER_LINEAR,
-                        )
-                        .unwrap();
-
-                        // Fill background and copy
-                        let no_mask = Mat::default();
-                        dst_mat.set_to(&Scalar::all(114.0), &no_mask).unwrap();
-                        let roi = opencv::core::Rect::new(
-                            left as i32,
-                            top as i32,
-                            lb_size.width,
-                            lb_size.height,
-                        );
-                        let mut dst_roi = Mat::roi_mut(&mut dst_mat, roi).unwrap();
-                        resized.copy_to(&mut dst_roi).unwrap();
-
-                        black_box(&dst_data);
-                    });
-                },
-            );
-        }
+        let result = run_bench(&name, WARMUP, ITERATIONS, || {
+            set_num_threads(1).unwrap();
+            imgproc::cvt_color_def(&src_mat, &mut converted, color_code).unwrap();
+            imgproc::resize(
+                &converted,
+                &mut resized,
+                lb_size,
+                0.0,
+                0.0,
+                imgproc::INTER_LINEAR,
+            )
+            .unwrap();
+            let no_mask = Mat::default();
+            dst_mat.set_to(&Scalar::all(114.0), &no_mask).unwrap();
+            let roi =
+                opencv::core::Rect::new(left as i32, top as i32, lb_size.width, lb_size.height);
+            let mut dst_roi = Mat::roi_mut(&mut dst_mat, roi).unwrap();
+            resized.copy_to(&mut dst_roi).unwrap();
+        });
+        result.print_summary_with_throughput(throughput);
     }
 
-    group.finish();
+    // Multi-threaded
+    {
+        let name = format!("letterbox/opencv-multi/{}", config.id());
+        let mut dst_data = vec![0u8; config.out_w * config.out_h * out_channels];
+        let mut dst_mat = unsafe {
+            Mat::new_rows_cols_with_data_unsafe(
+                config.out_h as i32,
+                config.out_w as i32,
+                out_cv_type,
+                dst_data.as_mut_ptr() as *mut std::ffi::c_void,
+                config.out_w * out_channels,
+            )
+            .unwrap()
+        };
+        let mut converted = Mat::default();
+        let mut resized = Mat::default();
+
+        let result = run_bench(&name, WARMUP, ITERATIONS, || {
+            set_num_threads(0).unwrap();
+            imgproc::cvt_color_def(&src_mat, &mut converted, color_code).unwrap();
+            imgproc::resize(
+                &converted,
+                &mut resized,
+                lb_size,
+                0.0,
+                0.0,
+                imgproc::INTER_LINEAR,
+            )
+            .unwrap();
+            let no_mask = Mat::default();
+            dst_mat.set_to(&Scalar::all(114.0), &no_mask).unwrap();
+            let roi =
+                opencv::core::Rect::new(left as i32, top as i32, lb_size.width, lb_size.height);
+            let mut dst_roi = Mat::roi_mut(&mut dst_mat, roi).unwrap();
+            resized.copy_to(&mut dst_roi).unwrap();
+        });
+        result.print_summary_with_throughput(throughput);
+    }
 }
 
 // =============================================================================
 // Secondary Benchmarks: Format Conversion (no resize)
 // =============================================================================
 
-/// Format conversion without resize (for ISP output scenarios)
-#[allow(unused_variables)] // has_g2d/has_opengl used conditionally on Linux
-fn bench_convert(c: &mut Criterion) {
-    let mut group = c.benchmark_group("convert");
-    group.sample_size(100);
+#[allow(unused_variables)]
+fn bench_convert(configs: &[BenchConfig]) {
+    println!("\n== Convert: Format Conversion ==\n");
 
-    // Check hardware availability once at start
-    #[cfg(target_os = "linux")]
-    let has_g2d = g2d_available();
-    #[cfg(not(target_os = "linux"))]
-    let has_g2d = false;
-
-    #[cfg(all(target_os = "linux", feature = "opengl"))]
-    let has_opengl = opengl_available();
-    #[cfg(not(all(target_os = "linux", feature = "opengl")))]
-    let has_opengl = false;
-
-    // Configurations: format conversion at camera resolution
-    let configs = vec![
-        // 1080p conversions
-        BenchConfig {
-            in_w: 1920,
-            in_h: 1080,
-            out_w: 1920,
-            out_h: 1080,
-            in_fmt: YUYV,
-            out_fmt: RGBA,
-        },
-        BenchConfig {
-            in_w: 1920,
-            in_h: 1080,
-            out_w: 1920,
-            out_h: 1080,
-            in_fmt: YUYV,
-            out_fmt: RGB,
-        },
-        BenchConfig {
-            in_w: 1920,
-            in_h: 1080,
-            out_w: 1920,
-            out_h: 1080,
-            in_fmt: NV12,
-            out_fmt: RGBA,
-        },
-        BenchConfig {
-            in_w: 1920,
-            in_h: 1080,
-            out_w: 1920,
-            out_h: 1080,
-            in_fmt: NV12,
-            out_fmt: RGB,
-        },
-        BenchConfig {
-            in_w: 1920,
-            in_h: 1080,
-            out_w: 1920,
-            out_h: 1080,
-            in_fmt: RGB,
-            out_fmt: RGBA,
-        },
-        // 4K conversions
-        BenchConfig {
-            in_w: 3840,
-            in_h: 2160,
-            out_w: 3840,
-            out_h: 2160,
-            in_fmt: YUYV,
-            out_fmt: RGBA,
-        },
-        BenchConfig {
-            in_w: 3840,
-            in_h: 2160,
-            out_w: 3840,
-            out_h: 2160,
-            in_fmt: YUYV,
-            out_fmt: RGB,
-        },
-        BenchConfig {
-            in_w: 3840,
-            in_h: 2160,
-            out_w: 3840,
-            out_h: 2160,
-            in_fmt: NV12,
-            out_fmt: RGBA,
-        },
-        BenchConfig {
-            in_w: 3840,
-            in_h: 2160,
-            out_w: 3840,
-            out_h: 2160,
-            in_fmt: NV12,
-            out_fmt: RGB,
-        },
-        BenchConfig {
-            in_w: 3840,
-            in_h: 2160,
-            out_w: 3840,
-            out_h: 2160,
-            in_fmt: RGB,
-            out_fmt: RGBA,
-        },
-    ];
-
-    for config in &configs {
-        group.throughput(config.throughput());
+    for config in configs {
+        let throughput = config.throughput();
 
         // HAL CPU
         {
+            let name = format!("convert/cpu/{}", config.id());
             let src = TensorImage::new(config.in_w, config.in_h, config.in_fmt, None).unwrap();
             let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
             src.tensor().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
@@ -534,24 +316,28 @@ fn bench_convert(c: &mut Criterion) {
                 TensorImage::new(config.out_w, config.out_h, config.out_fmt, None).unwrap();
             let mut proc = CPUProcessor::new();
 
-            group.bench_with_input(BenchmarkId::new("cpu", config.id()), &config, |b, _| {
-                b.iter(|| {
-                    proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-                        .unwrap();
-                    black_box(&dst);
-                });
+            let result = run_bench(&name, WARMUP, ITERATIONS, || {
+                proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+                    .unwrap();
             });
+            result.print_summary_with_throughput(throughput);
         }
 
-        // HAL G2D (for YUYV and NV12 input)
+        // HAL G2D (for YUYV/NV12 input → RGBA/RGB output only)
         #[cfg(target_os = "linux")]
-        if has_g2d && (config.in_fmt == YUYV || config.in_fmt == NV12) {
+        if (config.in_fmt == YUYV || config.in_fmt == NV12)
+            && (config.out_fmt == RGBA || config.out_fmt == RGB)
+        {
+            use edgefirst_image::G2DProcessor;
+
+            let name = format!("convert/g2d/{}", config.id());
             let Ok(src) = TensorImage::new(
                 config.in_w,
                 config.in_h,
                 config.in_fmt,
                 Some(TensorMemory::Dma),
             ) else {
+                println!("  {:50} [skipped: DMA unavailable]", name);
                 continue;
             };
             let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
@@ -562,202 +348,167 @@ fn bench_convert(c: &mut Criterion) {
                 config.out_fmt,
                 Some(TensorMemory::Dma),
             ) else {
+                println!("  {:50} [skipped: DMA unavailable]", name);
                 continue;
             };
-            let mut proc = G2DProcessor::new().unwrap();
+            // ManuallyDrop: prevent g2d_close + dlclose("libg2d.so.2") which
+            // triggers Vivante galcore atexit heap corruption on i.MX8.
+            // Same rationale as the EGL Box::leak in opengl_headless.rs.
+            let Ok(proc) = G2DProcessor::new() else {
+                println!("  {:50} [skipped: G2D unavailable]", name);
+                continue;
+            };
+            let mut proc = ManuallyDrop::new(proc);
 
-            group.bench_with_input(BenchmarkId::new("g2d", config.id()), &config, |b, _| {
-                b.iter(|| {
-                    proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-                        .unwrap();
-                    black_box(&dst);
-                });
+            let result = run_bench(&name, WARMUP, ITERATIONS, || {
+                proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+                    .unwrap();
             });
+            result.print_summary_with_throughput(throughput);
         }
 
-        // HAL OpenGL (for YUYV→RGBA and NV12→RGBA)
-        // Resources created inside closure to survive Criterion's subprocess fork
+        // HAL OpenGL (for YUYV/NV12 → RGBA/RGB/RGB_INT8/PLANAR_RGB_INT8)
         #[cfg(all(target_os = "linux", feature = "opengl"))]
-        if has_opengl && (config.in_fmt == YUYV || config.in_fmt == NV12) && config.out_fmt == RGBA
+        if (config.in_fmt == YUYV || config.in_fmt == NV12)
+            && (config.out_fmt == RGBA
+                || config.out_fmt == RGB
+                || config.out_fmt == RGB_INT8
+                || config.out_fmt == PLANAR_RGB_INT8)
         {
-            let config = config.clone();
-            group.bench_with_input(
-                BenchmarkId::new("opengl", config.id()),
-                &config,
-                |b, config| {
-                    let src = TensorImage::new(
-                        config.in_w,
-                        config.in_h,
-                        config.in_fmt,
-                        Some(TensorMemory::Dma),
-                    )
-                    .unwrap();
-                    let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
-                    src.tensor().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
-                    let mut dst = TensorImage::new(
-                        config.out_w,
-                        config.out_h,
-                        config.out_fmt,
-                        Some(TensorMemory::Dma),
-                    )
-                    .unwrap();
-                    let mut proc = GLProcessorThreaded::new(None).unwrap();
+            use edgefirst_image::GLProcessorThreaded;
 
-                    // Warmup (not measured)
-                    let _ =
-                        proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop());
-
-                    b.iter(|| {
-                        proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-                            .unwrap();
-                        black_box(&dst);
-                    });
-                },
-            );
-        }
-
-        // OpenCV (skip NV12 - complex handling)
-        #[cfg(feature = "opencv")]
-        if config.in_fmt != NV12 {
+            let name = format!("convert/opengl/{}", config.id());
+            let Ok(src) = TensorImage::new(
+                config.in_w,
+                config.in_h,
+                config.in_fmt,
+                Some(TensorMemory::Dma),
+            ) else {
+                println!("  {:50} [skipped: DMA unavailable]", name);
+                continue;
+            };
             let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
-            let (cv_type, channels) = if config.in_fmt == YUYV {
-                (CV_8UC2, 2)
-            } else {
-                (CV_8UC3, 3)
+            src.tensor().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
+            let Ok(mut dst) = TensorImage::new(
+                config.out_w,
+                config.out_h,
+                config.out_fmt,
+                Some(TensorMemory::Dma),
+            ) else {
+                println!("  {:50} [skipped: DMA unavailable]", name);
+                continue;
+            };
+            let Ok(mut proc) = GLProcessorThreaded::new(None) else {
+                println!("  {:50} [skipped: OpenGL unavailable]", name);
+                continue;
             };
 
-            let src_mat = unsafe {
-                Mat::new_rows_cols_with_data_unsafe(
-                    config.in_h as i32,
-                    config.in_w as i32,
-                    cv_type,
-                    data.as_ptr() as *mut std::ffi::c_void,
-                    config.in_w * channels,
-                )
-                .unwrap()
-            };
-
-            let out_channels = if config.out_fmt == RGBA { 4 } else { 3 };
-            let out_cv_type = if config.out_fmt == RGBA {
-                CV_8UC4
-            } else {
-                CV_8UC3
-            };
-            let mut dst_data = vec![0u8; config.out_w * config.out_h * out_channels];
-            let mut dst_mat = unsafe {
-                Mat::new_rows_cols_with_data_unsafe(
-                    config.out_h as i32,
-                    config.out_w as i32,
-                    out_cv_type,
-                    dst_data.as_mut_ptr() as *mut std::ffi::c_void,
-                    config.out_w * out_channels,
-                )
-                .unwrap()
-            };
-
-            let color_code = match (config.in_fmt, config.out_fmt) {
-                (f1, f2) if f1 == YUYV && f2 == RGBA => imgproc::COLOR_YUV2RGBA_YUYV,
-                (f1, f2) if f1 == YUYV && f2 == RGB => imgproc::COLOR_YUV2RGB_YUYV,
-                (f1, f2) if f1 == RGB && f2 == RGBA => imgproc::COLOR_RGB2RGBA,
-                _ => continue,
-            };
-
-            // Single-threaded OpenCV benchmark
-            group.bench_with_input(
-                BenchmarkId::new("opencv-1cpu", config.id()),
-                &config,
-                |b, _| {
-                    set_num_threads(1).unwrap();
-                    b.iter(|| {
-                        imgproc::cvt_color_def(&src_mat, &mut dst_mat, color_code).unwrap();
-                        black_box(&dst_data);
-                    });
-                },
-            );
-
-            // Multi-threaded OpenCV benchmark
-            group.bench_with_input(
-                BenchmarkId::new("opencv-multi", config.id()),
-                &config,
-                |b, _| {
-                    set_num_threads(0).unwrap();
-                    b.iter(|| {
-                        imgproc::cvt_color_def(&src_mat, &mut dst_mat, color_code).unwrap();
-                        black_box(&dst_data);
-                    });
-                },
-            );
+            let result = run_bench(&name, WARMUP, ITERATIONS, || {
+                proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+                    .unwrap();
+            });
+            result.print_summary_with_throughput(throughput);
         }
+
+        // OpenCV (skip NV12)
+        #[cfg(feature = "opencv")]
+        bench_convert_opencv(config, throughput);
+    }
+}
+
+#[cfg(feature = "opencv")]
+fn bench_convert_opencv(config: &BenchConfig, throughput: u64) {
+    let color_code = match (config.in_fmt, config.out_fmt) {
+        (f1, f2) if f1 == YUYV && f2 == RGBA => imgproc::COLOR_YUV2RGBA_YUYV,
+        (f1, f2) if f1 == YUYV && f2 == RGB => imgproc::COLOR_YUV2RGB_YUYV,
+        (f1, f2) if f1 == RGB && f2 == RGBA => imgproc::COLOR_RGB2RGBA,
+        _ => return,
+    };
+
+    let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
+    let (cv_type, channels) = if config.in_fmt == YUYV {
+        (CV_8UC2, 2)
+    } else {
+        (CV_8UC3, 3)
+    };
+
+    let src_mat = unsafe {
+        Mat::new_rows_cols_with_data_unsafe(
+            config.in_h as i32,
+            config.in_w as i32,
+            cv_type,
+            data.as_ptr() as *mut std::ffi::c_void,
+            config.in_w * channels,
+        )
+        .unwrap()
+    };
+
+    let out_channels = if config.out_fmt == RGBA { 4 } else { 3 };
+    let out_cv_type = if config.out_fmt == RGBA {
+        CV_8UC4
+    } else {
+        CV_8UC3
+    };
+
+    // Single-threaded
+    {
+        let name = format!("convert/opencv-1cpu/{}", config.id());
+        let mut dst_data = vec![0u8; config.out_w * config.out_h * out_channels];
+        let mut dst_mat = unsafe {
+            Mat::new_rows_cols_with_data_unsafe(
+                config.out_h as i32,
+                config.out_w as i32,
+                out_cv_type,
+                dst_data.as_mut_ptr() as *mut std::ffi::c_void,
+                config.out_w * out_channels,
+            )
+            .unwrap()
+        };
+
+        let result = run_bench(&name, WARMUP, ITERATIONS, || {
+            set_num_threads(1).unwrap();
+            imgproc::cvt_color_def(&src_mat, &mut dst_mat, color_code).unwrap();
+        });
+        result.print_summary_with_throughput(throughput);
     }
 
-    group.finish();
+    // Multi-threaded
+    {
+        let name = format!("convert/opencv-multi/{}", config.id());
+        let mut dst_data = vec![0u8; config.out_w * config.out_h * out_channels];
+        let mut dst_mat = unsafe {
+            Mat::new_rows_cols_with_data_unsafe(
+                config.out_h as i32,
+                config.out_w as i32,
+                out_cv_type,
+                dst_data.as_mut_ptr() as *mut std::ffi::c_void,
+                config.out_w * out_channels,
+            )
+            .unwrap()
+        };
+
+        let result = run_bench(&name, WARMUP, ITERATIONS, || {
+            set_num_threads(0).unwrap();
+            imgproc::cvt_color_def(&src_mat, &mut dst_mat, color_code).unwrap();
+        });
+        result.print_summary_with_throughput(throughput);
+    }
 }
 
 // =============================================================================
 // Resize Benchmarks: Same aspect ratio (no letterbox)
 // =============================================================================
 
-/// Downscale with same aspect ratio (16:9 → 16:9)
-#[allow(unused_variables)] // has_g2d/has_opengl used conditionally on Linux
-fn bench_resize(c: &mut Criterion) {
-    let mut group = c.benchmark_group("resize");
-    group.sample_size(100);
+#[allow(unused_variables)]
+fn bench_resize(configs: &[BenchConfig]) {
+    println!("\n== Resize: Same Aspect Ratio ==\n");
 
-    // Check hardware availability once at start
-    #[cfg(target_os = "linux")]
-    let has_g2d = g2d_available();
-    #[cfg(not(target_os = "linux"))]
-    let has_g2d = false;
-
-    #[cfg(all(target_os = "linux", feature = "opengl"))]
-    let has_opengl = opengl_available();
-    #[cfg(not(all(target_os = "linux", feature = "opengl")))]
-    let has_opengl = false;
-
-    // Configurations: 16:9 → 16:9 downscale
-    let configs = vec![
-        // 4K → 1080p (common display scaling)
-        BenchConfig {
-            in_w: 3840,
-            in_h: 2160,
-            out_w: 1920,
-            out_h: 1080,
-            in_fmt: YUYV,
-            out_fmt: RGBA,
-        },
-        BenchConfig {
-            in_w: 3840,
-            in_h: 2160,
-            out_w: 1920,
-            out_h: 1080,
-            in_fmt: YUYV,
-            out_fmt: RGB,
-        },
-        // 4K → 720p
-        BenchConfig {
-            in_w: 3840,
-            in_h: 2160,
-            out_w: 1280,
-            out_h: 720,
-            in_fmt: YUYV,
-            out_fmt: RGBA,
-        },
-        // 1080p → 720p
-        BenchConfig {
-            in_w: 1920,
-            in_h: 1080,
-            out_w: 1280,
-            out_h: 720,
-            in_fmt: YUYV,
-            out_fmt: RGBA,
-        },
-    ];
-
-    for config in &configs {
-        group.throughput(config.throughput());
+    for config in configs {
+        let throughput = config.throughput();
 
         // HAL CPU
         {
+            let name = format!("resize/cpu/{}", config.id());
             let src = TensorImage::new(config.in_w, config.in_h, config.in_fmt, None).unwrap();
             let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
             src.tensor().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
@@ -765,24 +516,26 @@ fn bench_resize(c: &mut Criterion) {
                 TensorImage::new(config.out_w, config.out_h, config.out_fmt, None).unwrap();
             let mut proc = CPUProcessor::new();
 
-            group.bench_with_input(BenchmarkId::new("cpu", config.id()), &config, |b, _| {
-                b.iter(|| {
-                    proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-                        .unwrap();
-                    black_box(&dst);
-                });
+            let result = run_bench(&name, WARMUP, ITERATIONS, || {
+                proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+                    .unwrap();
             });
+            result.print_summary_with_throughput(throughput);
         }
 
         // HAL G2D
         #[cfg(target_os = "linux")]
-        if has_g2d && config.in_fmt == YUYV {
+        if config.in_fmt == YUYV {
+            use edgefirst_image::G2DProcessor;
+
+            let name = format!("resize/g2d/{}", config.id());
             let Ok(src) = TensorImage::new(
                 config.in_w,
                 config.in_h,
                 config.in_fmt,
                 Some(TensorMemory::Dma),
             ) else {
+                println!("  {:50} [skipped: DMA unavailable]", name);
                 continue;
             };
             let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
@@ -793,246 +546,319 @@ fn bench_resize(c: &mut Criterion) {
                 config.out_fmt,
                 Some(TensorMemory::Dma),
             ) else {
+                println!("  {:50} [skipped: DMA unavailable]", name);
                 continue;
             };
-            let mut proc = G2DProcessor::new().unwrap();
+            // ManuallyDrop: prevent g2d_close + dlclose("libg2d.so.2") which
+            // triggers Vivante galcore atexit heap corruption on i.MX8.
+            // Same rationale as the EGL Box::leak in opengl_headless.rs.
+            let Ok(proc) = G2DProcessor::new() else {
+                println!("  {:50} [skipped: G2D unavailable]", name);
+                continue;
+            };
+            let mut proc = ManuallyDrop::new(proc);
 
-            group.bench_with_input(BenchmarkId::new("g2d", config.id()), &config, |b, _| {
-                b.iter(|| {
-                    proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-                        .unwrap();
-                    black_box(&dst);
-                });
+            let result = run_bench(&name, WARMUP, ITERATIONS, || {
+                proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+                    .unwrap();
             });
+            result.print_summary_with_throughput(throughput);
         }
 
         // HAL OpenGL
-        // Resources created inside closure to survive Criterion's subprocess fork
         #[cfg(all(target_os = "linux", feature = "opengl"))]
-        if has_opengl && config.in_fmt == YUYV && config.out_fmt == RGBA {
-            let config = config.clone();
-            group.bench_with_input(
-                BenchmarkId::new("opengl", config.id()),
-                &config,
-                |b, config| {
-                    let src = TensorImage::new(
-                        config.in_w,
-                        config.in_h,
-                        config.in_fmt,
-                        Some(TensorMemory::Dma),
-                    )
-                    .unwrap();
-                    let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
-                    src.tensor().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
-                    let mut dst = TensorImage::new(
-                        config.out_w,
-                        config.out_h,
-                        config.out_fmt,
-                        Some(TensorMemory::Dma),
-                    )
-                    .unwrap();
-                    let mut proc = GLProcessorThreaded::new(None).unwrap();
+        if config.in_fmt == YUYV && config.out_fmt == RGBA {
+            use edgefirst_image::GLProcessorThreaded;
 
-                    // Warmup (not measured)
-                    let _ =
-                        proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop());
+            let name = format!("resize/opengl/{}", config.id());
+            let Ok(src) = TensorImage::new(
+                config.in_w,
+                config.in_h,
+                config.in_fmt,
+                Some(TensorMemory::Dma),
+            ) else {
+                println!("  {:50} [skipped: DMA unavailable]", name);
+                continue;
+            };
+            let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
+            src.tensor().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
+            let Ok(mut dst) = TensorImage::new(
+                config.out_w,
+                config.out_h,
+                config.out_fmt,
+                Some(TensorMemory::Dma),
+            ) else {
+                println!("  {:50} [skipped: DMA unavailable]", name);
+                continue;
+            };
+            let Ok(mut proc) = GLProcessorThreaded::new(None) else {
+                println!("  {:50} [skipped: OpenGL unavailable]", name);
+                continue;
+            };
 
-                    b.iter(|| {
-                        proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-                            .unwrap();
-                        black_box(&dst);
-                    });
-                },
-            );
+            let result = run_bench(&name, WARMUP, ITERATIONS, || {
+                proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+                    .unwrap();
+            });
+            result.print_summary_with_throughput(throughput);
         }
 
         // OpenCV
         #[cfg(feature = "opencv")]
-        {
-            let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
-            let src_mat = unsafe {
-                Mat::new_rows_cols_with_data_unsafe(
-                    config.in_h as i32,
-                    config.in_w as i32,
-                    CV_8UC2,
-                    data.as_ptr() as *mut std::ffi::c_void,
-                    config.in_w * 2,
-                )
-                .unwrap()
-            };
+        bench_resize_opencv(config, throughput);
+    }
+}
 
-            let out_channels = if config.out_fmt == RGBA { 4 } else { 3 };
-            let out_cv_type = if config.out_fmt == RGBA {
-                CV_8UC4
-            } else {
-                CV_8UC3
-            };
-            let mut dst_data = vec![0u8; config.out_w * config.out_h * out_channels];
-            let mut dst_mat = unsafe {
-                Mat::new_rows_cols_with_data_unsafe(
-                    config.out_h as i32,
-                    config.out_w as i32,
-                    out_cv_type,
-                    dst_data.as_mut_ptr() as *mut std::ffi::c_void,
-                    config.out_w * out_channels,
-                )
-                .unwrap()
-            };
+#[cfg(feature = "opencv")]
+fn bench_resize_opencv(config: &BenchConfig, throughput: u64) {
+    let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
+    let src_mat = unsafe {
+        Mat::new_rows_cols_with_data_unsafe(
+            config.in_h as i32,
+            config.in_w as i32,
+            CV_8UC2,
+            data.as_ptr() as *mut std::ffi::c_void,
+            config.in_w * 2,
+        )
+        .unwrap()
+    };
 
-            let mut converted = Mat::default();
-            let mut resized = Mat::default();
-            let color_code = if config.out_fmt == RGBA {
-                imgproc::COLOR_YUV2RGBA_YUYV
-            } else {
-                imgproc::COLOR_YUV2RGB_YUYV
-            };
-            let target_size = Size::new(config.out_w as i32, config.out_h as i32);
+    let out_channels = if config.out_fmt == RGBA { 4 } else { 3 };
+    let out_cv_type = if config.out_fmt == RGBA {
+        CV_8UC4
+    } else {
+        CV_8UC3
+    };
+    let color_code = if config.out_fmt == RGBA {
+        imgproc::COLOR_YUV2RGBA_YUYV
+    } else {
+        imgproc::COLOR_YUV2RGB_YUYV
+    };
+    let target_size = Size::new(config.out_w as i32, config.out_h as i32);
 
-            // Single-threaded OpenCV benchmark
-            group.bench_with_input(
-                BenchmarkId::new("opencv-1cpu", config.id()),
-                &config,
-                |b, _| {
-                    set_num_threads(1).unwrap();
-                    b.iter(|| {
-                        imgproc::cvt_color_def(&src_mat, &mut converted, color_code).unwrap();
-                        imgproc::resize(
-                            &converted,
-                            &mut resized,
-                            target_size,
-                            0.0,
-                            0.0,
-                            imgproc::INTER_LINEAR,
-                        )
-                        .unwrap();
-                        resized.copy_to(&mut dst_mat).unwrap();
-                        black_box(&dst_data);
-                    });
-                },
-            );
+    // Single-threaded
+    {
+        let name = format!("resize/opencv-1cpu/{}", config.id());
+        let mut dst_data = vec![0u8; config.out_w * config.out_h * out_channels];
+        let mut dst_mat = unsafe {
+            Mat::new_rows_cols_with_data_unsafe(
+                config.out_h as i32,
+                config.out_w as i32,
+                out_cv_type,
+                dst_data.as_mut_ptr() as *mut std::ffi::c_void,
+                config.out_w * out_channels,
+            )
+            .unwrap()
+        };
+        let mut converted = Mat::default();
+        let mut resized = Mat::default();
 
-            // Multi-threaded OpenCV benchmark
-            group.bench_with_input(
-                BenchmarkId::new("opencv-multi", config.id()),
-                &config,
-                |b, _| {
-                    set_num_threads(0).unwrap();
-                    b.iter(|| {
-                        imgproc::cvt_color_def(&src_mat, &mut converted, color_code).unwrap();
-                        imgproc::resize(
-                            &converted,
-                            &mut resized,
-                            target_size,
-                            0.0,
-                            0.0,
-                            imgproc::INTER_LINEAR,
-                        )
-                        .unwrap();
-                        resized.copy_to(&mut dst_mat).unwrap();
-                        black_box(&dst_data);
-                    });
-                },
-            );
-        }
+        let result = run_bench(&name, WARMUP, ITERATIONS, || {
+            set_num_threads(1).unwrap();
+            imgproc::cvt_color_def(&src_mat, &mut converted, color_code).unwrap();
+            imgproc::resize(
+                &converted,
+                &mut resized,
+                target_size,
+                0.0,
+                0.0,
+                imgproc::INTER_LINEAR,
+            )
+            .unwrap();
+            resized.copy_to(&mut dst_mat).unwrap();
+        });
+        result.print_summary_with_throughput(throughput);
     }
 
-    group.finish();
+    // Multi-threaded
+    {
+        let name = format!("resize/opencv-multi/{}", config.id());
+        let mut dst_data = vec![0u8; config.out_w * config.out_h * out_channels];
+        let mut dst_mat = unsafe {
+            Mat::new_rows_cols_with_data_unsafe(
+                config.out_h as i32,
+                config.out_w as i32,
+                out_cv_type,
+                dst_data.as_mut_ptr() as *mut std::ffi::c_void,
+                config.out_w * out_channels,
+            )
+            .unwrap()
+        };
+        let mut converted = Mat::default();
+        let mut resized = Mat::default();
+
+        let result = run_bench(&name, WARMUP, ITERATIONS, || {
+            set_num_threads(0).unwrap();
+            imgproc::cvt_color_def(&src_mat, &mut converted, color_code).unwrap();
+            imgproc::resize(
+                &converted,
+                &mut resized,
+                target_size,
+                0.0,
+                0.0,
+                imgproc::INTER_LINEAR,
+            )
+            .unwrap();
+            resized.copy_to(&mut dst_mat).unwrap();
+        });
+        result.print_summary_with_throughput(throughput);
+    }
 }
 
 // =============================================================================
 // Letterbox Pipeline Benchmarks: Realistic camera→model with clear+resize
 // =============================================================================
 
-/// Realistic letterbox pipeline: 1920×1080 → 640×640 with aspect ratio bars.
-///
-/// Compares full pipelines:
-/// - **CPU**: mmap dst → fill border strips → CPU resize+convert
-/// - **G2D**: g2d_clear → g2d_blit → single g2d_finish
-///
-/// Tests both YUYV and RGBA inputs with top/bottom (landscape→square) bars.
-/// The 1920×1080 → 640×640 letterbox produces ~44% clear area (140px bars
-/// top and bottom).
 #[allow(unused_variables)]
-fn bench_letterbox_pipeline(c: &mut Criterion) {
-    let mut group = c.benchmark_group("letterbox_pipeline");
-    group.sample_size(100);
+fn bench_letterbox_pipeline() {
+    println!("\n== Letterbox Pipeline: Realistic Camera→Model ==\n");
 
-    #[cfg(target_os = "linux")]
-    let has_g2d = g2d_available();
-    #[cfg(not(target_os = "linux"))]
-    let has_g2d = false;
-
-    let src_w: usize = 1920;
-    let src_h: usize = 1080;
-    let dst_w: usize = 640;
-    let dst_h: usize = 640;
-
-    // Aspect-ratio preserving fit: 1920×1080 → 640×360 centered in 640×640
-    let scale = f64::min(dst_w as f64 / src_w as f64, dst_h as f64 / src_h as f64);
-    let content_w = (src_w as f64 * scale) as usize;
-    let content_h = (src_h as f64 * scale) as usize;
-    let pad_left = (dst_w - content_w) / 2;
-    let pad_top = (dst_h - content_h) / 2;
-    let dst_rect = Rect::new(pad_left, pad_top, content_w, content_h);
-    let color: [u8; 4] = [114, 114, 114, 255];
+    let pipeline_configs: &[(usize, usize, usize, usize)] = &[
+        (1920, 1080, 640, 640), // 1080p → YOLO standard
+        (3840, 2160, 640, 640), // 4K → YOLO standard
+    ];
 
     let src_formats: &[(&str, four_char_code::FourCharCode)] = &[("YUYV", YUYV), ("RGBA", RGBA)];
 
-    for &(fmt_name, src_fmt) in src_formats {
-        // CPU pipeline: fill borders + CPU resize/convert
-        {
-            let src = TensorImage::new(src_w, src_h, src_fmt, None).unwrap();
-            src.tensor().map().unwrap().as_mut_slice().fill(128);
-            let mut dst = TensorImage::new(dst_w, dst_h, RGBA, None).unwrap();
-            let crop = Crop::new()
-                .with_dst_rect(Some(dst_rect))
-                .with_dst_color(Some(color));
-            let mut cpu = CPUProcessor::new();
+    for &(src_w, src_h, dst_w, dst_h) in pipeline_configs {
+        let scale = f64::min(dst_w as f64 / src_w as f64, dst_h as f64 / src_h as f64);
+        let content_w = (src_w as f64 * scale) as usize;
+        let content_h = (src_h as f64 * scale) as usize;
+        let pad_left = (dst_w - content_w) / 2;
+        let pad_top = (dst_h - content_h) / 2;
+        let dst_rect = Rect::new(pad_left, pad_top, content_w, content_h);
+        let color: [u8; 4] = [114, 114, 114, 255];
+        let crop = Crop::new()
+            .with_dst_rect(Some(dst_rect))
+            .with_dst_color(Some(color));
 
-            group.bench_function(BenchmarkId::new("cpu", fmt_name), |b| {
-                b.iter(|| {
+        // Throughput based on YUYV input (2 bytes/pixel)
+        let throughput = (src_w * src_h * 2) as u64;
+
+        for &(fmt_name, src_fmt) in src_formats {
+            // CPU pipeline
+            {
+                let name = format!(
+                    "pipeline/cpu/{}x{}->{}x{}/{}",
+                    src_w, src_h, dst_w, dst_h, fmt_name
+                );
+                let src = TensorImage::new(src_w, src_h, src_fmt, None).unwrap();
+                src.tensor().map().unwrap().as_mut_slice().fill(128);
+                let mut dst = TensorImage::new(dst_w, dst_h, RGBA, None).unwrap();
+                let mut cpu = CPUProcessor::new();
+
+                let result = run_bench(&name, WARMUP, ITERATIONS, || {
                     cpu.convert(&src, &mut dst, Rotation::None, Flip::None, crop)
                         .unwrap();
-                    black_box(&dst);
                 });
-            });
-        }
+                result.print_summary_with_throughput(throughput);
+            }
 
-        // G2D pipeline: g2d_clear + g2d_blit + finish (single GPU sync)
-        #[cfg(target_os = "linux")]
-        if has_g2d {
-            let Ok(src) = TensorImage::new(src_w, src_h, src_fmt, Some(TensorMemory::Dma)) else {
-                eprintln!("G2D: DMA alloc failed for {src_w}×{src_h} {fmt_name}");
-                continue;
-            };
-            src.tensor().map().unwrap().as_mut_slice().fill(128);
-            let Ok(mut dst) = TensorImage::new(dst_w, dst_h, RGBA, Some(TensorMemory::Dma)) else {
-                eprintln!("G2D: DMA alloc failed for {dst_w}×{dst_h} RGBA");
-                continue;
-            };
-            let crop = Crop::new()
-                .with_dst_rect(Some(dst_rect))
-                .with_dst_color(Some(color));
-            let mut proc = G2DProcessor::new().unwrap();
+            // G2D pipeline
+            #[cfg(target_os = "linux")]
+            {
+                use edgefirst_image::G2DProcessor;
 
-            group.bench_function(BenchmarkId::new("g2d", fmt_name), |b| {
-                b.iter(|| {
+                let name = format!(
+                    "pipeline/g2d/{}x{}->{}x{}/{}",
+                    src_w, src_h, dst_w, dst_h, fmt_name
+                );
+                let Ok(src) = TensorImage::new(src_w, src_h, src_fmt, Some(TensorMemory::Dma))
+                else {
+                    println!("  {:50} [skipped: DMA unavailable]", name);
+                    continue;
+                };
+                src.tensor().map().unwrap().as_mut_slice().fill(128);
+                let Ok(mut dst) = TensorImage::new(dst_w, dst_h, RGBA, Some(TensorMemory::Dma))
+                else {
+                    println!("  {:50} [skipped: DMA unavailable]", name);
+                    continue;
+                };
+                // ManuallyDrop: prevent g2d_close + dlclose("libg2d.so.2") which
+                // triggers Vivante galcore atexit heap corruption on i.MX8.
+                // Same rationale as the EGL Box::leak in opengl_headless.rs.
+                let Ok(proc) = G2DProcessor::new() else {
+                    println!("  {:50} [skipped: G2D unavailable]", name);
+                    continue;
+                };
+                let mut proc = ManuallyDrop::new(proc);
+
+                let result = run_bench(&name, WARMUP, ITERATIONS, || {
                     proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop)
                         .unwrap();
-                    black_box(&dst);
                 });
-            });
+                result.print_summary_with_throughput(throughput);
+            }
         }
     }
-
-    group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_letterbox,
-    bench_convert,
-    bench_resize,
-    bench_letterbox_pipeline
-);
-criterion_main!(benches);
+// =============================================================================
+// Main
+// =============================================================================
+
+fn main() {
+    // Parse --bench flag (Criterion compat for `cargo bench`)
+    // Just consume the flag silently — we always run benchmarks.
+    let _args: Vec<String> = std::env::args().collect();
+
+    println!("Pipeline Benchmark — custom in-process harness (no fork)");
+    println!("  warmup={WARMUP}  iterations={ITERATIONS}");
+
+    // --- Letterbox configs ---
+    let letterbox_configs = vec![
+        // 1080p camera → YOLO standard (640x640)
+        BenchConfig::new(1920, 1080, 640, 640, YUYV, RGBA),
+        BenchConfig::new(1920, 1080, 640, 640, YUYV, RGB),
+        BenchConfig::new(1920, 1080, 640, 640, YUYV, RGB_INT8),
+        BenchConfig::new(1920, 1080, 640, 640, YUYV, PLANAR_RGB_INT8),
+        BenchConfig::new(1920, 1080, 640, 640, NV12, RGBA),
+        // 4K camera → YOLO standard (640x640)
+        BenchConfig::new(3840, 2160, 640, 640, YUYV, RGBA),
+        BenchConfig::new(3840, 2160, 640, 640, YUYV, RGB),
+        BenchConfig::new(3840, 2160, 640, 640, YUYV, RGB_INT8),
+        BenchConfig::new(3840, 2160, 640, 640, NV12, RGBA),
+        // 4K camera → YOLO hi-res (1280x1280)
+        BenchConfig::new(3840, 2160, 1280, 1280, YUYV, RGBA),
+        BenchConfig::new(3840, 2160, 1280, 1280, YUYV, RGB),
+        BenchConfig::new(3840, 2160, 1280, 1280, YUYV, RGB_INT8),
+        BenchConfig::new(3840, 2160, 1280, 1280, NV12, RGBA),
+    ];
+    bench_letterbox(&letterbox_configs);
+
+    // --- Convert configs ---
+    let convert_configs = vec![
+        // 1080p conversions
+        BenchConfig::new(1920, 1080, 1920, 1080, YUYV, RGBA),
+        BenchConfig::new(1920, 1080, 1920, 1080, YUYV, RGB),
+        BenchConfig::new(1920, 1080, 1920, 1080, YUYV, RGB_INT8),
+        BenchConfig::new(1920, 1080, 1920, 1080, NV12, RGBA),
+        BenchConfig::new(1920, 1080, 1920, 1080, NV12, RGB),
+        BenchConfig::new(1920, 1080, 1920, 1080, RGB, RGBA),
+        // 4K conversions
+        BenchConfig::new(3840, 2160, 3840, 2160, YUYV, RGBA),
+        BenchConfig::new(3840, 2160, 3840, 2160, YUYV, RGB),
+        BenchConfig::new(3840, 2160, 3840, 2160, YUYV, RGB_INT8),
+        BenchConfig::new(3840, 2160, 3840, 2160, NV12, RGBA),
+        BenchConfig::new(3840, 2160, 3840, 2160, NV12, RGB),
+        BenchConfig::new(3840, 2160, 3840, 2160, RGB, RGBA),
+    ];
+    bench_convert(&convert_configs);
+
+    // --- Resize configs ---
+    let resize_configs = vec![
+        // 4K → 1080p
+        BenchConfig::new(3840, 2160, 1920, 1080, YUYV, RGBA),
+        BenchConfig::new(3840, 2160, 1920, 1080, YUYV, RGB),
+        // 4K → 720p
+        BenchConfig::new(3840, 2160, 1280, 720, YUYV, RGBA),
+        // 1080p → 720p
+        BenchConfig::new(1920, 1080, 1280, 720, YUYV, RGBA),
+    ];
+    bench_resize(&resize_configs);
+
+    // --- Letterbox pipeline ---
+    bench_letterbox_pipeline();
+
+    println!("\nDone.");
+}

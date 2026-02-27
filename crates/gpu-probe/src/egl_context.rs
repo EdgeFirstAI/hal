@@ -280,6 +280,43 @@ impl GpuContext {
         value
     }
 
+    /// Check whether the GPU supports RGB8 renderbuffers and the
+    /// `glEGLImageTargetRenderbufferStorageOES` entry point needed to back
+    /// them with an EGLImage.
+    ///
+    /// Returns `true` when **both** conditions are met:
+    /// 1. RGB8 renderbuffer format is available — either via OpenGL ES 3.0+
+    ///    (which mandates `GL_RGB8`) or the `GL_OES_rgb8_rgba8` extension.
+    /// 2. The `glEGLImageTargetRenderbufferStorageOES` function pointer is
+    ///    resolvable through `eglGetProcAddress`.
+    pub fn has_rgb8_renderbuffer(&self) -> bool {
+        let version = self.gl_version();
+        let has_rgb8_format = if version.contains("OpenGL ES 3.") {
+            true
+        } else {
+            let ext_str = unsafe {
+                let ptr = gls::gl::GetString(gls::gl::EXTENSIONS);
+                if ptr.is_null() {
+                    return false;
+                }
+                CStr::from_ptr(ptr as *const c_char)
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            ext_str
+                .split_ascii_whitespace()
+                .any(|e| e == "GL_OES_rgb8_rgba8")
+        };
+
+        if !has_rgb8_format {
+            return false;
+        }
+
+        self.egl
+            .get_proc_address("glEGLImageTargetRenderbufferStorageOES")
+            .is_some()
+    }
+
     // -------------------------------------------------------------------
     // EGLImage / DMA-buf helpers
     // -------------------------------------------------------------------
@@ -354,14 +391,15 @@ impl GpuContext {
 
 impl Drop for GpuContext {
     fn drop(&mut self) {
-        // Destroy context and surface but intentionally skip eglTerminate —
-        // some drivers (e.g. Vivante on i.MX8) crash during shutdown.
+        // Defence-in-depth cleanup: destroy context, surface, and terminate
+        // the EGL display inside catch_unwind to absorb driver panics.
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = self.egl.make_current(self.display, None, None, None);
             let _ = self.egl.destroy_context(self.display, self.ctx);
             let _ = self.egl.destroy_surface(self.display, self.surface);
+            let _ = self.egl.terminate(self.display);
         }));
         std::panic::set_hook(prev_hook);
     }

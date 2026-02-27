@@ -55,6 +55,11 @@ pub(crate) fn rgba_fourcc() -> u32 {
     gbm::drm::buffer::DrmFourcc::Abgr8888 as u32
 }
 
+/// DRM FourCC for packed BGR888 (RGB888 in DRM naming).
+pub(crate) fn rgb888_fourcc() -> u32 {
+    gbm::drm::buffer::DrmFourcc::Bgr888 as u32
+}
+
 /// Compile a shader program from vertex + fragment source strings.
 ///
 /// Returns `Ok(program_id)` on success. On failure, deletes all intermediate

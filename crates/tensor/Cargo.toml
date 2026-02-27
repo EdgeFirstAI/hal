@@ -33,7 +33,6 @@ nix = { workspace = true }
 
 [dev-dependencies]
 divan = { workspace = true }
-rand = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 procfs = { workspace = true }

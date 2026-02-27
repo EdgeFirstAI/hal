@@ -165,7 +165,7 @@ test-rust:
 		exit 1; \
 	fi
 	@cargo llvm-cov nextest $(LLVM_COV_PROFILE) $(RUST_FEATURES) --workspace \
-		--exclude edgefirst_hal --lcov --output-path target/rust-coverage.lcov
+		--exclude edgefirst_hal --lcov --output-path target/rust-coverage.lcov -j 1
 	@echo "✓ Rust tests passed"
 	@echo "Coverage report: target/rust-coverage.lcov"
 

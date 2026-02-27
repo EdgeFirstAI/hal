@@ -7,6 +7,7 @@ mod bench_egl_image;
 mod bench_fbo;
 mod bench_pipeline;
 mod bench_render;
+mod bench_rgb_direct;
 mod bench_rgb_packing;
 mod bench_shader;
 mod bench_texture;
@@ -14,6 +15,7 @@ mod egl_context;
 mod probe;
 mod probe_int_textures;
 mod probe_min_sizes;
+mod probe_rgb_fbo;
 
 use egl_context::GpuContext;
 
@@ -42,11 +44,14 @@ fn main() {
     };
 
     // Capability probe
-    if !bench_only {
+    let has_rgb8_fbo = if !bench_only {
         probe::run_probes(&ctx);
         probe_int_textures::run(&ctx);
         probe_min_sizes::run(&ctx);
-    }
+        probe_rgb_fbo::run(&ctx)
+    } else {
+        false
+    };
 
     // Benchmarks
     if !probe_only {
@@ -79,6 +84,15 @@ fn main() {
             bench_pipeline::run(&ctx);
             bench_rgb_packing::run_verify(&ctx);
             bench_rgb_packing::run(&ctx);
+            if has_rgb8_fbo {
+                bench_rgb_direct::run_verify(&ctx);
+                bench_rgb_direct::run(&ctx);
+            } else {
+                println!("== Verification: Direct RGB Render == SKIP (RGB8 FBO not supported)");
+                println!();
+                println!("== Benchmark: Direct RGB Render == SKIP (RGB8 FBO not supported)");
+                println!();
+            }
         } else if !has_egl_image {
             println!("== Verification: DMA-buf Pipeline == SKIP (EGL_EXT_image_dma_buf_import not available)");
             println!();

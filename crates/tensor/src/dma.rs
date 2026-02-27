@@ -33,6 +33,7 @@ where
     pub _marker: std::marker::PhantomData<T>,
     #[cfg(target_os = "linux")]
     _drm_attachment: Option<crate::dmabuf::DrmAttachment>,
+    identity: crate::BufferIdentity,
 }
 
 unsafe impl<T> Send for DmaTensor<T> where T: Num + Clone + fmt::Debug + Send + Sync {}
@@ -73,6 +74,7 @@ where
             shape: shape.to_vec(),
             _marker: std::marker::PhantomData,
             _drm_attachment: drm_attachment,
+            identity: crate::BufferIdentity::new(),
         })
     }
 
@@ -103,6 +105,7 @@ where
             _marker: std::marker::PhantomData,
             #[cfg(target_os = "linux")]
             _drm_attachment: drm_attachment,
+            identity: crate::BufferIdentity::new(),
         })
     }
 
@@ -145,6 +148,10 @@ where
             &self.shape,
         )?))
     }
+
+    fn buffer_identity(&self) -> &crate::BufferIdentity {
+        &self.identity
+    }
 }
 
 impl<T> AsRawFd for DmaTensor<T>
@@ -171,6 +178,7 @@ where
             _marker: std::marker::PhantomData,
             #[cfg(target_os = "linux")]
             _drm_attachment: drm_attachment,
+            identity: self.identity.clone(),
         })
     }
 }
