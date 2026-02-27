@@ -4,10 +4,11 @@
 #![allow(dead_code)]
 //! EGL context bootstrap for headless GPU probing.
 //!
-//! Opens a DRM render node, creates a GBM device, obtains an EGL platform
-//! display, and initialises a GLES 3.0 PBuffer context. This is a standalone
-//! version of the HAL's `opengl_headless::GlContext` stripped down for
-//! diagnostic / benchmarking use only.
+//! Obtains an EGL display (via PlatformDevice or GBM fallback), creates a
+//! surfaceless GLES 3.0 context using `EGL_KHR_no_config_context`, and makes
+//! it current with `EGL_NO_SURFACE`. This is a standalone version of the
+//! HAL's `opengl_headless::GlContext` stripped down for diagnostic /
+//! benchmarking use only.
 
 use gbm::{
     drm::{control::Device as DrmControlDevice, Device as DrmDevice},
@@ -28,6 +29,11 @@ use std::{
 // ---------------------------------------------------------------------------
 
 const PLATFORM_GBM_KHR: u32 = 0x31D7;
+const PLATFORM_DEVICE_EXT: u32 = 0x313F;
+
+/// EGL_KHR_no_config_context: null config for eglCreateContext.
+const NO_CONFIG_KHR: egl::Config =
+    unsafe { std::mem::transmute(std::ptr::null_mut::<std::ffi::c_void>()) };
 
 #[allow(dead_code)]
 const LINUX_DMA_BUF: u32 = 0x3270;
@@ -111,89 +117,137 @@ impl Card {
 // GpuContext
 // ---------------------------------------------------------------------------
 
-/// Holds an initialised EGL display, GLES 3.0 context, and the backing GBM
-/// device. Provides helper methods for querying GL/EGL strings and creating
-/// EGLImages from DMA-buf file descriptors.
+/// Backing storage for the EGL display — keeps the underlying resource alive.
+enum DisplayBacking {
+    /// PlatformDevice display — no external resources needed.
+    Device,
+    /// GBM display — the GBM device must outlive the EGL display.
+    Gbm(Device<Card>),
+}
+
+/// Holds an initialised EGL display, surfaceless GLES 3.0 context, and the
+/// backing display resource. Provides helper methods for querying GL/EGL
+/// strings and creating EGLImages from DMA-buf file descriptors.
 pub struct GpuContext {
     egl: Egl,
     display: Display,
-    surface: egl::Surface,
     ctx: egl::Context,
-    // The GBM device must outlive the EGL display.
-    _gbm: Device<Card>,
+    _backing: DisplayBacking,
 }
 
 impl GpuContext {
-    /// Bootstrap a headless GLES 3.0 context via GBM + EGL.
+    /// Bootstrap a headless GLES 3.0 surfaceless context.
+    ///
+    /// Tries PlatformDevice first (zero external deps), falls back to GBM.
     pub fn new() -> Result<Self, String> {
-        // 1. Open DRM render node and create GBM device
-        let card = Card::open_any()?;
-        let gbm = Device::new(card).map_err(|e| format!("GBM device creation failed: {e}"))?;
-        debug!("GBM device: {gbm:?}");
-
-        // 2. Load EGL
         let egl: Egl = unsafe {
             Instance::<Dynamic<_, EGL1_4>>::load_required_from(get_egl_lib()?)
                 .map_err(|e| format!("EGL instance load failed: {e}"))?
         };
 
-        // 3. Get platform display (EGL 1.5 -> EXT fallback)
+        // Try PlatformDevice first
+        match Self::get_platform_device_display(&egl) {
+            Ok((display, backing)) => {
+                return Self::init_surfaceless(egl, display, backing);
+            }
+            Err(e) => debug!("PlatformDevice not available: {e}"),
+        }
+
+        // Fall back to GBM
+        let (display, backing) = Self::get_gbm_display(&egl)?;
+        Self::init_surfaceless(egl, display, backing)
+    }
+
+    fn get_platform_device_display(egl: &Egl) -> Result<(Display, DisplayBacking), String> {
+        let client_exts = egl
+            .query_string(None, egl::EXTENSIONS)
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        if !client_exts.contains("EGL_EXT_device_enumeration") {
+            return Err("EGL_EXT_device_enumeration not available".into());
+        }
+        if !client_exts.contains("EGL_EXT_platform_device") {
+            return Err("EGL_EXT_platform_device not available".into());
+        }
+
+        let query_devices_fn = egl
+            .get_proc_address("eglQueryDevicesEXT")
+            .ok_or("eglQueryDevicesEXT not available")?;
+        let query_devices: unsafe extern "system" fn(
+            max_devices: egl::Int,
+            devices: *mut *mut c_void,
+            num_devices: *mut egl::Int,
+        ) -> egl::Boolean = unsafe { std::mem::transmute(query_devices_fn) };
+
+        let mut devices = [null_mut(); 10];
+        let mut num_devices: egl::Int = 0;
+        unsafe { query_devices(10, devices.as_mut_ptr(), &mut num_devices) };
+        if num_devices == 0 {
+            return Err("eglQueryDevicesEXT returned 0 devices".into());
+        }
+        debug!("EGL devices found: {num_devices}");
+
         let display = egl_get_platform_display_with_fallback(
-            &egl,
+            egl,
+            PLATFORM_DEVICE_EXT,
+            devices[0],
+            &[egl::ATTRIB_NONE],
+        )?;
+
+        Ok((display, DisplayBacking::Device))
+    }
+
+    fn get_gbm_display(egl: &Egl) -> Result<(Display, DisplayBacking), String> {
+        let card = Card::open_any()?;
+        let gbm = Device::new(card).map_err(|e| format!("GBM device creation failed: {e}"))?;
+        debug!("GBM device: {gbm:?}");
+
+        let display = egl_get_platform_display_with_fallback(
+            egl,
             PLATFORM_GBM_KHR,
             gbm.as_raw() as *mut c_void,
             &[egl::ATTRIB_NONE],
         )?;
+
+        Ok((display, DisplayBacking::Gbm(gbm)))
+    }
+
+    fn init_surfaceless(
+        egl: Egl,
+        display: Display,
+        backing: DisplayBacking,
+    ) -> Result<Self, String> {
         debug!("EGL display: {display:?}");
 
-        // 4. Initialise EGL
         egl.initialize(display)
             .map_err(|e| format!("eglInitialize failed: {e}"))?;
 
-        // 5. Choose config: GLES 3.0, RGBA8, PBUFFER
-        let attributes = [
-            egl::SURFACE_TYPE,
-            egl::PBUFFER_BIT,
-            egl::RENDERABLE_TYPE,
-            egl::OPENGL_ES3_BIT,
-            egl::RED_SIZE,
-            8,
-            egl::GREEN_SIZE,
-            8,
-            egl::BLUE_SIZE,
-            8,
-            egl::ALPHA_SIZE,
-            8,
-            egl::NONE,
-        ];
-        let config = egl
-            .choose_first_config(display, &attributes)
-            .map_err(|e| format!("eglChooseConfig failed: {e}"))?
-            .ok_or("no suitable EGL config found (GLES3 RGBA8 PBuffer)")?;
-        debug!("EGL config: {config:?}");
+        // Verify required extensions
+        let ext_str = egl
+            .query_string(Some(display), egl::EXTENSIONS)
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
 
-        // 6. Create 64x64 PBuffer surface
-        let surface = egl
-            .create_pbuffer_surface(
-                display,
-                config,
-                &[egl::WIDTH, 64, egl::HEIGHT, 64, egl::NONE],
-            )
-            .map_err(|e| format!("eglCreatePbufferSurface failed: {e}"))?;
+        if !ext_str.contains("EGL_KHR_surfaceless_context") {
+            return Err("EGL_KHR_surfaceless_context not supported".into());
+        }
+        if !ext_str.contains("EGL_KHR_no_config_context") {
+            return Err("EGL_KHR_no_config_context not supported".into());
+        }
 
-        // 7. Bind OPENGL_ES_API, create GLES 3.0 context, make current
         egl.bind_api(egl::OPENGL_ES_API)
             .map_err(|e| format!("eglBindAPI failed: {e}"))?;
 
         let context_attributes = [egl::CONTEXT_MAJOR_VERSION, 3, egl::NONE];
         let ctx = egl
-            .create_context(display, config, None, &context_attributes)
+            .create_context(display, NO_CONFIG_KHR, None, &context_attributes)
             .map_err(|e| format!("eglCreateContext failed: {e}"))?;
 
-        egl.make_current(display, Some(surface), Some(surface), Some(ctx))
-            .map_err(|e| format!("eglMakeCurrent failed: {e}"))?;
+        egl.make_current(display, None, None, Some(ctx))
+            .map_err(|e| format!("eglMakeCurrent (surfaceless) failed: {e}"))?;
 
-        // 8. Load GL function pointers
+        // Load GL function pointers
         gls::load_with(|s| {
             egl.get_proc_address(s)
                 .map_or(std::ptr::null(), |p| p as *const _)
@@ -202,9 +256,8 @@ impl GpuContext {
         Ok(GpuContext {
             egl,
             display,
-            surface,
             ctx,
-            _gbm: gbm,
+            _backing: backing,
         })
     }
 
@@ -391,14 +444,13 @@ impl GpuContext {
 
 impl Drop for GpuContext {
     fn drop(&mut self) {
-        // Defence-in-depth cleanup: destroy context, surface, and terminate
-        // the EGL display inside catch_unwind to absorb driver panics.
+        // Defence-in-depth cleanup: destroy context and terminate the EGL
+        // display inside catch_unwind to absorb driver panics.
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = self.egl.make_current(self.display, None, None, None);
             let _ = self.egl.destroy_context(self.display, self.ctx);
-            let _ = self.egl.destroy_surface(self.display, self.surface);
             let _ = self.egl.terminate(self.display);
         }));
         std::panic::set_hook(prev_hook);

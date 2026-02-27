@@ -611,8 +611,10 @@ All GPU and DMA resources must be properly released. Specifically:
 - **EGL displays**: `eglTerminate` must be called in `GlContext::drop`. The
   EGL spec ref-counts display connections, so each `eglTerminate` decrements
   the count and only tears down state when it reaches zero.
-- **EGL contexts and surfaces**: `eglDestroyContext` and `eglDestroySurface`
-  must be called before `eglTerminate`.
+- **EGL contexts**: `eglDestroyContext` must be called before `eglTerminate`.
+  No EGL surfaces are created — the HAL uses surfaceless contexts
+  (`EGL_KHR_surfaceless_context` + `EGL_KHR_no_config_context`) and renders
+  exclusively through FBOs backed by EGLImages imported from DMA-buf.
 - **DMA buffers**: Closed via file descriptor `close()` in `Drop`.
 - **G2D contexts**: `g2d_close` via `G2DProcessor::drop`.
 

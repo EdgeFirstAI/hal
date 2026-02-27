@@ -58,25 +58,30 @@ use crate::MaskResult;
 
 /// Identifies the type of EGL display used for headless OpenGL ES rendering.
 ///
-/// The HAL probes displays in priority order: GBM first (direct GPU access),
-/// then platform device enumeration, then the default display. Use
+/// The HAL creates a surfaceless GLES 3.0 context
+/// (`EGL_KHR_surfaceless_context` + `EGL_KHR_no_config_context`) and
+/// renders exclusively through FBOs backed by EGLImages imported from
+/// DMA-buf file descriptors. No window or PBuffer surface is created.
+///
+/// Displays are probed in priority order: PlatformDevice first (zero
+/// external dependencies), then GBM, then Default. Use
 /// [`probe_egl_displays`] to discover which are available and
 /// [`ImageProcessorConfig::egl_display`](crate::ImageProcessorConfig::egl_display)
 /// to override the auto-detection.
 ///
 /// # Display Types
 ///
+/// - **`PlatformDevice`** — Uses `EGL_EXT_device_enumeration` to query
+///   available EGL devices via `eglQueryDevicesEXT`, then selects the first
+///   device with `eglGetPlatformDisplay(EGL_EXT_platform_device, ...)`.
+///   Headless and compositor-free with zero external library dependencies.
+///   Works on NVIDIA GPUs and newer Vivante drivers.
+///
 /// - **`Gbm`** — Opens a DRM render node (e.g. `/dev/dri/renderD128`) and
 ///   creates a GBM (Generic Buffer Manager) device, then calls
-///   `eglGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, gbm_device)`. This is a
-///   direct GPU path through the DRM/KMS subsystem — no compositor required.
-///   Preferred for headless edge AI workloads. On some drivers (e.g. Vivante
-///   on i.MX8), this path may trigger heap corruption during process shutdown.
-///
-/// - **`PlatformDevice`** — Uses the `EGL_EXT_device_enumeration` extension
-///   to query available EGL devices via `eglQueryDevicesEXT`, then selects the
-///   first device with `eglGetPlatformDisplay(EGL_EXT_platform_device, ...)`.
-///   Also headless and compositor-free. Common on NVIDIA GPUs.
+///   `eglGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, gbm_device)`. Requires
+///   `libgbm` and a DRM render node. Needed on ARM Mali (i.MX95) and older
+///   Vivante drivers that do not expose `EGL_EXT_platform_device`.
 ///
 /// - **`Default`** — Calls `eglGetDisplay(EGL_DEFAULT_DISPLAY)`, letting the
 ///   EGL implementation choose the display. On Wayland systems this connects
@@ -127,38 +132,39 @@ fn get_egl_lib() -> Result<&'static libloading::Library, crate::Error> {
 
 type Egl = Instance<Dynamic<&'static libloading::Library, EGL1_4>>;
 
-/// Check whether an EGL display supports GLES3 RGBA8 PBuffer rendering.
+/// Check whether an EGL display supports the surfaceless + no-config context
+/// extensions required by the HAL's FBO-based rendering pipeline.
 ///
-/// Returns `true` if `eglChooseConfig` finds at least one matching config.
-fn probe_config_check(egl: &Egl, display: egl::Display) -> bool {
-    let attributes = [
-        egl::SURFACE_TYPE,
-        egl::PBUFFER_BIT,
-        egl::RENDERABLE_TYPE,
-        egl::OPENGL_ES3_BIT,
-        egl::RED_SIZE,
-        8,
-        egl::GREEN_SIZE,
-        8,
-        egl::BLUE_SIZE,
-        8,
-        egl::ALPHA_SIZE,
-        8,
-        egl::NONE,
+/// Queries `eglQueryString(display, EGL_EXTENSIONS)` and checks for
+/// `EGL_KHR_surfaceless_context` and `EGL_KHR_no_config_context`.
+fn probe_display_extensions(egl: &Egl, display: egl::Display) -> bool {
+    let Ok(ext_str) = egl.query_string(Some(display), egl::EXTENSIONS) else {
+        return false;
+    };
+    let exts = ext_str.to_string_lossy();
+
+    let required = [
+        "EGL_KHR_surfaceless_context",
+        "EGL_KHR_no_config_context",
     ];
-    egl.choose_first_config(display, &attributes)
-        .ok()
-        .flatten()
-        .is_some()
+
+    for r in &required {
+        if !exts.contains(r) {
+            log::debug!("Display missing required extension: {r}");
+            return false;
+        }
+    }
+
+    egl.bind_api(egl::OPENGL_ES_API).is_ok()
 }
 
 /// Probe for available EGL displays supporting headless OpenGL ES 3.0.
 ///
-/// Returns validated displays in priority order (GBM, PlatformDevice,
-/// Default). Each display is validated with `eglInitialize` +
-/// `eglChooseConfig` using the same GLES3 RGBA8 PBuffer attributes used by
-/// the image processor. Probed state is cleaned up with `eglTerminate` — no
-/// EGL resources are left alive.
+/// Returns validated displays in priority order (PlatformDevice, GBM,
+/// Default). Each display is validated with `eglInitialize` + extension
+/// checks for `EGL_KHR_surfaceless_context` and `EGL_KHR_no_config_context`.
+/// Probed state is cleaned up with `eglTerminate` — no EGL resources are
+/// left alive.
 ///
 /// An empty list means OpenGL is not available on this system.
 ///
@@ -171,25 +177,11 @@ pub fn probe_egl_displays() -> Result<Vec<EglDisplayInfo>, Error> {
 
     let mut results = Vec::new();
 
-    // GBM
-    if let Ok(display_type) = GlContext::egl_get_gbm_display(&egl) {
-        let display = display_type.as_display();
-        if egl.initialize(display).is_ok() {
-            if probe_config_check(&egl, display) {
-                results.push(EglDisplayInfo {
-                    kind: EglDisplayKind::Gbm,
-                    description: "GBM via /dev/dri/renderD128".to_string(),
-                });
-            }
-            let _ = egl.terminate(display);
-        }
-    }
-
-    // PlatformDevice
+    // PlatformDevice first (zero external deps, works on NVIDIA + newer Vivante)
     if let Ok(display_type) = GlContext::egl_get_platform_display_from_device(&egl) {
         let display = display_type.as_display();
         if egl.initialize(display).is_ok() {
-            if probe_config_check(&egl, display) {
+            if probe_display_extensions(&egl, display) {
                 results.push(EglDisplayInfo {
                     kind: EglDisplayKind::PlatformDevice,
                     description: "EGL platform device via EGL_EXT_device_enumeration".to_string(),
@@ -199,11 +191,25 @@ pub fn probe_egl_displays() -> Result<Vec<EglDisplayInfo>, Error> {
         }
     }
 
-    // Default
+    // GBM second (needed for Mali + old Vivante)
+    if let Ok(display_type) = GlContext::egl_get_gbm_display(&egl) {
+        let display = display_type.as_display();
+        if egl.initialize(display).is_ok() {
+            if probe_display_extensions(&egl, display) {
+                results.push(EglDisplayInfo {
+                    kind: EglDisplayKind::Gbm,
+                    description: "GBM via /dev/dri/renderD128".to_string(),
+                });
+            }
+            let _ = egl.terminate(display);
+        }
+    }
+
+    // Default last (needs compositor)
     if let Ok(display_type) = GlContext::egl_get_default_display(&egl) {
         let display = display_type.as_display();
         if egl.initialize(display).is_ok() {
-            if probe_config_check(&egl, display) {
+            if probe_display_extensions(&egl, display) {
                 results.push(EglDisplayInfo {
                     kind: EglDisplayKind::Default,
                     description: "EGL default display".to_string(),
@@ -218,7 +224,6 @@ pub fn probe_egl_displays() -> Result<Vec<EglDisplayInfo>, Error> {
 
 pub(crate) struct GlContext {
     pub(crate) support_dma: bool,
-    pub(crate) surface: Option<egl::Surface>,
     pub(crate) display: EglDisplayType,
     pub(crate) ctx: egl::Context,
     /// Wrapped in ManuallyDrop because the khronos-egl Dynamic instance's
@@ -263,15 +268,7 @@ impl GlContext {
             });
         }
 
-        // Try headless-friendly EGL methods first (GBM/DRM, device enumeration)
-        // before the default display, which may block if a compositor (Wayland)
-        // is expected but not running.
-        if let Ok(headless) = Self::try_initialize_egl(egl.clone(), Self::egl_get_gbm_display) {
-            return Ok(headless);
-        } else {
-            log::debug!("Didn't initialize EGL with GBM Display");
-        }
-
+        // Try PlatformDevice first (zero external deps, works on NVIDIA + newer Vivante)
         if let Ok(headless) =
             Self::try_initialize_egl(egl.clone(), Self::egl_get_platform_display_from_device)
         {
@@ -280,6 +277,14 @@ impl GlContext {
             log::debug!("Didn't initialize EGL with platform display from device enumeration");
         }
 
+        // GBM second (needed for Mali + old Vivante that lack EGL_EXT_platform_device)
+        if let Ok(headless) = Self::try_initialize_egl(egl.clone(), Self::egl_get_gbm_display) {
+            return Ok(headless);
+        } else {
+            log::debug!("Didn't initialize EGL with GBM Display");
+        }
+
+        // Default display last (needs compositor)
         if let Ok(headless) = Self::try_initialize_egl(egl.clone(), Self::egl_get_default_display) {
             return Ok(headless);
         } else {
@@ -298,56 +303,48 @@ impl GlContext {
         let display = display_fn(&egl)?;
         log::debug!("egl initialize with display: {:x?}", display.as_display());
         egl.initialize(display.as_display())?;
-        let attributes = [
-            egl::SURFACE_TYPE,
-            egl::PBUFFER_BIT,
-            egl::RENDERABLE_TYPE,
-            egl::OPENGL_ES3_BIT,
-            egl::RED_SIZE,
-            8,
-            egl::GREEN_SIZE,
-            8,
-            egl::BLUE_SIZE,
-            8,
-            egl::ALPHA_SIZE,
-            8,
-            egl::NONE,
-        ];
 
-        let config =
-            if let Some(config) = egl.choose_first_config(display.as_display(), &attributes)? {
-                config
-            } else {
-                return Err(crate::Error::NotImplemented(
-                    "Did not find valid OpenGL ES config".to_string(),
-                ));
-            };
+        // Verify required extensions for surfaceless + no-config context
+        let ext_str = egl.query_string(Some(display.as_display()), egl::EXTENSIONS)?;
+        let exts = ext_str.to_string_lossy();
 
-        debug!("config: {config:?}");
+        if !exts.contains("EGL_KHR_surfaceless_context") {
+            return Err(crate::Error::GLVersion(
+                "EGL display does not support EGL_KHR_surfaceless_context".to_string(),
+            ));
+        }
 
-        let surface = Some(egl.create_pbuffer_surface(
-            display.as_display(),
-            config,
-            &[egl::WIDTH, 64, egl::HEIGHT, 64, egl::NONE],
-        )?);
+        if !exts.contains("EGL_KHR_no_config_context") {
+            return Err(crate::Error::GLVersion(
+                "EGL display does not support EGL_KHR_no_config_context".to_string(),
+            ));
+        }
 
         egl.bind_api(egl::OPENGL_ES_API)?;
-        let context_attributes = [egl::CONTEXT_MAJOR_VERSION, 3, egl::NONE, egl::NONE];
 
-        let ctx = egl.create_context(display.as_display(), config, None, &context_attributes)?;
+        // No-config context: pass EGL_NO_CONFIG_KHR (null) instead of a
+        // real config. The context is not bound to any specific framebuffer
+        // format — it works with any FBO attachment format.
+        let context_attributes = [egl::CONTEXT_MAJOR_VERSION, 3, egl::NONE, egl::NONE];
+        let ctx = egl.create_context(
+            display.as_display(),
+            egl_ext::NO_CONFIG_KHR,
+            None,
+            &context_attributes,
+        )?;
         debug!("ctx: {ctx:?}");
 
-        egl.make_current(display.as_display(), surface, surface, Some(ctx))?;
+        // Surfaceless context: no PBuffer surface needed. All rendering
+        // goes through FBOs backed by EGLImages.
+        egl.make_current(display.as_display(), None, None, Some(ctx))?;
 
         let support_dma = Self::egl_check_support_dma(&egl).is_ok();
-        let headless = GlContext {
+        Ok(GlContext {
             display,
             ctx,
             egl: ManuallyDrop::new(egl),
-            surface,
             support_dma,
-        };
-        Ok(headless)
+        })
     }
 
     fn egl_get_default_display(egl: &Egl) -> Result<EglDisplayType, crate::Error> {
@@ -580,17 +577,12 @@ impl Drop for GlContext {
                 .egl
                 .destroy_context(self.display.as_display(), self.ctx);
 
-            if let Some(surface) = self.surface.take() {
-                let _ = self.egl.destroy_surface(self.display.as_display(), surface);
-            }
-
-            // eglTerminate decrements the ref count on the display connection.
-            // Since eglInitialize is ref-counted per the EGL spec, this only
-            // tears down internal state when the last reference is released.
-            // probe_egl_displays() already calls eglTerminate successfully on
-            // all platforms; catch_unwind provides a safety net for any driver
-            // that misbehaves.
-            let _ = self.egl.terminate(self.display.as_display());
+            // Note: eglTerminate is intentionally NOT called here. While the
+            // EGL spec says eglInitialize/eglTerminate are ref-counted, some
+            // drivers (notably Vivante) invalidate all resources on the display
+            // when any thread calls eglTerminate. This breaks multi-threaded
+            // use where multiple GlContext instances share the same underlying
+            // DRM render node. EGL resources are cleaned up on process exit.
         }));
         std::panic::set_hook(prev_hook);
 
@@ -598,8 +590,6 @@ impl Drop for GlContext {
         // khronos-egl Dynamic instance's Drop calls eglReleaseThread() which
         // panics if the EGL library has been unloaded (local/x86_64) or
         // causes heap corruption by calling into invalid memory (ARM).
-        // The Rc wrapper is a lightweight Rust-side object; the actual EGL
-        // display resources are released by eglTerminate above.
     }
 }
 
@@ -2176,7 +2166,6 @@ impl GLProcessorST {
         log::debug!("GL Extensions: {extensions}");
         let required_ext = [
             "GL_OES_EGL_image_external_essl3",
-            "GL_OES_surfaceless_context",
         ];
         let extensions = extensions.split_ascii_whitespace().collect::<BTreeSet<_>>();
         for required in required_ext {
@@ -4978,6 +4967,15 @@ mod egl_ext {
     pub(crate) const PLATFORM_GBM_KHR: u32 = 0x31D7;
 
     pub(crate) const PLATFORM_DEVICE_EXT: u32 = 0x313F;
+
+    /// EGL_KHR_no_config_context: null config for eglCreateContext.
+    /// Defined as ((EGLConfig)0) in the EGL spec.
+    ///
+    /// # Safety
+    /// The EGL spec defines EGL_NO_CONFIG_KHR as a null pointer. This is
+    /// a safe transmute since `Config` is a newtype wrapper around `*mut c_void`.
+    pub(crate) const NO_CONFIG_KHR: khronos_egl::Config =
+        unsafe { std::mem::transmute(std::ptr::null_mut::<std::ffi::c_void>()) };
 }
 
 fn generate_vertex_shader() -> &'static str {
@@ -6041,36 +6039,21 @@ mod gl_tests {
             eprintln!("  {:?}: {}", d.kind, d.description);
         }
 
-        // GBM requires /dev/dri/renderD128 — skip hardware-specific
-        // assertions when it is not present (CI runners, non-GPU hosts).
-        if !kinds.contains(&EglDisplayKind::Gbm) {
-            eprintln!(
-                "SKIPPED: {} - GBM not available (no /dev/dri/renderD128), got: {kinds:?}",
-                function!()
+        // Verify priority ordering: PlatformDevice > GBM > Default.
+        // Not all display types are available on every system, but the
+        // ones that are present must appear in this order.
+        let priority = |k: &EglDisplayKind| match k {
+            EglDisplayKind::PlatformDevice => 0,
+            EglDisplayKind::Gbm => 1,
+            EglDisplayKind::Default => 2,
+        };
+        for w in kinds.windows(2) {
+            assert!(
+                priority(&w[0]) < priority(&w[1]),
+                "Display ordering violated: {:?} should come after {:?}",
+                w[1],
+                w[0],
             );
-            return;
-        }
-
-        // On i.MX hardware at least two display types should be available
-        assert!(
-            displays.len() >= 2,
-            "Expected at least 2 display types, got {}: {kinds:?}",
-            displays.len()
-        );
-
-        // Verify ordering: GBM should come first (priority order)
-        assert_eq!(
-            displays[0].kind,
-            EglDisplayKind::Gbm,
-            "First display should be GBM (priority order)"
-        );
-
-        // Log which optional types are available
-        if !kinds.contains(&EglDisplayKind::PlatformDevice) {
-            eprintln!("Note: PlatformDevice not available on this system");
-        }
-        if !kinds.contains(&EglDisplayKind::Default) {
-            eprintln!("Note: Default display not available (no compositor running)");
         }
     }
 
