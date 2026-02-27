@@ -181,3 +181,83 @@ def test_from_fd_shm():
             assert (data == 233).all()
     except Exception:
         os.close(fd)
+
+
+def test_create_image():
+    """Test ImageProcessor.create_image() returns a valid, mappable image."""
+    converter = ImageProcessor()
+    img = converter.create_image(320, 240, FourCC.RGBA)
+    assert img.width == 320
+    assert img.height == 240
+    assert img.format == FourCC.RGBA
+
+    # Image should be mappable
+    with img.map() as m:
+        data = np.frombuffer(m.view(), dtype=np.uint8)
+        assert len(data) == 320 * 240 * 4
+
+
+def test_create_image_formats():
+    """Test create_image with different pixel formats."""
+    converter = ImageProcessor()
+    for fourcc, channels in [(FourCC.RGB, 3), (FourCC.RGBA, 4), (FourCC.GREY, 1)]:
+        img = converter.create_image(160, 120, fourcc)
+        assert img.width == 160
+        assert img.height == 120
+        assert img.format == fourcc
+        with img.map() as m:
+            data = np.frombuffer(m.view(), dtype=np.uint8)
+            assert len(data) == 160 * 120 * channels
+
+
+def test_create_image_convert():
+    """Test that images from create_image() work with convert()."""
+    converter = ImageProcessor()
+
+    # Load a source image normally
+    src = TensorImage.load("testdata/zidane.jpg", FourCC.RGBA)
+
+    # Create destination via create_image (may use PBO, DMA, or Mem)
+    dst = converter.create_image(640, 640, FourCC.RGBA)
+
+    # Convert should succeed regardless of backing type
+    converter.convert(src, dst)
+
+    # Verify the result has actual pixel data (not all zeros)
+    n = np.zeros((640, 640, 3), dtype=np.uint8)
+    dst.normalize_to_numpy(n)
+    assert n.any(), "Destination image is all zeros after convert"
+
+    # Compare with standard TensorImage destination
+    dst_mem = TensorImage(640, 640, FourCC.RGBA)
+    converter.convert(src, dst_mem)
+    n_mem = np.zeros((640, 640, 3), dtype=np.uint8)
+    dst_mem.normalize_to_numpy(n_mem)
+
+    assert calculate_similarity_rms_u8(n, n_mem) > 0.95
+
+
+def test_create_image_roundtrip():
+    """Test create_image as both src and dst for convert()."""
+    converter = ImageProcessor()
+
+    # Create source via create_image and fill it
+    src = converter.create_image(640, 480, FourCC.RGBA)
+    with src.map() as m:
+        data = np.frombuffer(m.view(), dtype=np.uint8).copy()
+        # Fill with a gradient pattern
+        data[:] = np.tile(np.arange(256, dtype=np.uint8), len(data) // 256 + 1)[
+            : len(data)
+        ]
+        m.view()[:] = data
+
+    # Create destination via create_image
+    dst = converter.create_image(320, 240, FourCC.RGBA)
+
+    # Convert using both create_image tensors
+    converter.convert(src, dst)
+
+    # Verify destination has data (not zeros)
+    with dst.map() as m:
+        result = np.frombuffer(m.view(), dtype=np.uint8)
+        assert result.any(), "Destination is all zeros after roundtrip convert"

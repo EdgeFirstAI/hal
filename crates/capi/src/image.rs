@@ -936,6 +936,40 @@ pub unsafe extern "C" fn hal_image_processor_set_class_colors(
     0
 }
 
+/// Create a new tensor image using the processor's optimal memory backend.
+///
+/// Selects the best available backing storage based on hardware capabilities:
+/// DMA-buf > PBO (GPU buffer) > system memory. Images created this way benefit
+/// from zero-copy GPU paths when used with the same processor's convert().
+///
+/// @param processor Image processor handle
+/// @param width Image width in pixels
+/// @param height Image height in pixels
+/// @param fourcc Pixel format (HAL_FOURCC_*)
+/// @return New tensor image handle on success, NULL on error
+/// @par Errors (errno):
+/// - EINVAL: Invalid argument (NULL processor, zero dimensions)
+/// - ENOMEM: Memory allocation failed
+#[no_mangle]
+pub unsafe extern "C" fn hal_image_processor_create_image(
+    processor: *mut HalImageProcessor,
+    width: size_t,
+    height: size_t,
+    fourcc: HalFourcc,
+) -> *mut HalTensorImage {
+    if processor.is_null() || width == 0 || height == 0 {
+        return set_error_null(libc::EINVAL);
+    }
+
+    let image = try_or_null!(
+        unsafe { &(*processor) }
+            .inner
+            .create_image(width, height, fourcc.to_fourcc()),
+        libc::ENOMEM
+    );
+    Box::into_raw(Box::new(HalTensorImage { inner: image }))
+}
+
 /// Free an image processor.
 ///
 /// @param processor Image processor handle to free (can be NULL, no-op)
@@ -1628,6 +1662,109 @@ mod tests {
             let fourcc = format.to_fourcc();
             let back = HalFourcc::from_fourcc(fourcc);
             assert_eq!(back, Some(format), "Roundtrip failed for {:?}", format);
+        }
+    }
+
+    #[test]
+    fn test_image_processor_create_image_null_params() {
+        unsafe {
+            // NULL processor
+            let img =
+                hal_image_processor_create_image(std::ptr::null_mut(), 640, 480, HalFourcc::Rgba);
+            assert!(img.is_null());
+
+            // Zero width
+            let processor = hal_image_processor_new();
+            if processor.is_null() {
+                return;
+            }
+            let img = hal_image_processor_create_image(processor, 0, 480, HalFourcc::Rgba);
+            assert!(img.is_null());
+
+            // Zero height
+            let img = hal_image_processor_create_image(processor, 640, 0, HalFourcc::Rgba);
+            assert!(img.is_null());
+
+            hal_image_processor_free(processor);
+        }
+    }
+
+    #[test]
+    fn test_image_processor_create_image() {
+        use crate::tensor::{hal_tensor_map_data_const, hal_tensor_map_size, hal_tensor_map_unmap};
+
+        unsafe {
+            let processor = hal_image_processor_new();
+            if processor.is_null() {
+                eprintln!("SKIPPED: test_image_processor_create_image — no processor available");
+                return;
+            }
+
+            let formats = [
+                (HalFourcc::Rgb, 3),
+                (HalFourcc::Rgba, 4),
+                (HalFourcc::Grey, 1),
+            ];
+
+            for (fourcc, channels) in formats {
+                let img = hal_image_processor_create_image(processor, 320, 240, fourcc);
+                assert!(
+                    !img.is_null(),
+                    "create_image failed for {:?}",
+                    fourcc
+                );
+
+                assert_eq!(hal_tensor_image_width(img), 320);
+                assert_eq!(hal_tensor_image_height(img), 240);
+                assert_eq!(hal_tensor_image_fourcc(img), fourcc);
+
+                // Verify the image is mappable
+                let map = hal_tensor_image_map_create(img);
+                assert!(!map.is_null(), "map failed for {:?}", fourcc);
+                assert_eq!(hal_tensor_map_size(map), 320 * 240 * channels);
+                assert!(!hal_tensor_map_data_const(map).is_null());
+                hal_tensor_map_unmap(map);
+
+                hal_tensor_image_free(img);
+            }
+
+            hal_image_processor_free(processor);
+        }
+    }
+
+    #[test]
+    fn test_image_processor_create_image_convert() {
+        unsafe {
+            let processor = hal_image_processor_new();
+            if processor.is_null() {
+                eprintln!(
+                    "SKIPPED: test_image_processor_create_image_convert — no processor available"
+                );
+                return;
+            }
+
+            // Create source image via create_image (may be PBO or Mem)
+            let src = hal_image_processor_create_image(processor, 320, 240, HalFourcc::Rgba);
+            assert!(!src.is_null());
+
+            // Create destination image via create_image
+            let dst = hal_image_processor_create_image(processor, 160, 120, HalFourcc::Rgba);
+            assert!(!dst.is_null());
+
+            // Convert should succeed regardless of backing (PBO, DMA, or Mem)
+            let ret = hal_image_processor_convert(
+                processor,
+                src,
+                dst,
+                HalRotation::None,
+                HalFlip::None,
+                std::ptr::null(),
+            );
+            assert_eq!(ret, 0, "convert() with create_image tensors failed");
+
+            hal_tensor_image_free(src);
+            hal_tensor_image_free(dst);
+            hal_image_processor_free(processor);
         }
     }
 }
