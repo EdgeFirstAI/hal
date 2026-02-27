@@ -447,7 +447,11 @@ impl GlContext {
             ));
         }
 
-        // just use the first device?
+        if devices.is_empty() {
+            return Err(Error::GLVersion(
+                "EGL_EXT_device_enumeration returned 0 devices".to_string(),
+            ));
+        }
         let disp = Self::egl_get_platform_display_with_fallback(
             egl,
             egl_ext::PLATFORM_DEVICE_EXT,
@@ -483,7 +487,6 @@ impl GlContext {
                 "EGL does not support eglDestroyImageKHR function".to_string(),
             ));
         }
-        // Err(crate::Error::GLVersion("EGL Version too low".to_string()))
         Ok(())
     }
 
