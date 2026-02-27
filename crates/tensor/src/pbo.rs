@@ -398,7 +398,9 @@ mod tests {
     fn test_pbo_tensor_reshape() {
         let ops = MockPboOps::new(24);
         let mut tensor = PboTensor::<u8>::from_pbo(3, 24, &[2, 3, 4], None, ops);
-        tensor.reshape(&[4, 6]).expect("compatible reshape should succeed");
+        tensor
+            .reshape(&[4, 6])
+            .expect("compatible reshape should succeed");
         assert_eq!(tensor.shape(), &[4, 6]);
         let result = tensor.reshape(&[100]);
         assert!(result.is_err(), "incompatible reshape should fail");

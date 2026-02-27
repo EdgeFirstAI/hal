@@ -1432,6 +1432,11 @@ impl ImageProcessorTrait for GLProcessorST {
             let res = self.convert_dest_dma(dst, src, rotation, flip, crop);
             return res;
         }
+        // PBO-to-PBO: both tensors are PBO-backed, use GL buffer bindings for readback
+        if src.tensor().memory() == TensorMemory::Pbo && dst.tensor().memory() == TensorMemory::Pbo
+        {
+            return self.convert_pbo_to_pbo(dst, src, rotation, flip, crop);
+        }
         let start = Instant::now();
         let res = self.convert_dest_non_dma(dst, src, rotation, flip, crop);
         log::debug!("convert_dest_non_dma takes {:?}", start.elapsed());
@@ -2672,6 +2677,105 @@ impl GLProcessorST {
             }
         }
         log::debug!("Read from framebuffer takes {:?}", start.elapsed());
+        Ok(())
+    }
+
+    /// Convert between two PBO-backed images.
+    ///
+    /// Source is uploaded via the normal texture path (maps the PBO for CPU access).
+    /// Destination uses GL_PIXEL_PACK_BUFFER for zero-copy readback into the PBO.
+    fn convert_pbo_to_pbo(
+        &mut self,
+        dst: &mut TensorImage,
+        src: &TensorImage,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> crate::Result<()> {
+        // Safety check: neither PBO must be mapped; extract dst buffer_id before releasing borrows
+        let dst_buffer_id = {
+            let src_pbo = match &src.tensor {
+                edgefirst_tensor::Tensor::Pbo(p) => p,
+                _ => {
+                    return Err(crate::Error::OpenGl(
+                        "convert_pbo_to_pbo: src is not a PBO tensor".to_string(),
+                    ))
+                }
+            };
+            let dst_pbo = match &dst.tensor {
+                edgefirst_tensor::Tensor::Pbo(p) => p,
+                _ => {
+                    return Err(crate::Error::OpenGl(
+                        "convert_pbo_to_pbo: dst is not a PBO tensor".to_string(),
+                    ))
+                }
+            };
+
+            if src_pbo.is_mapped() || dst_pbo.is_mapped() {
+                return Err(crate::Error::OpenGl(
+                    "Cannot convert PBO tensors while they are mapped".to_string(),
+                ));
+            }
+
+            dst_pbo.buffer_id()
+        };
+
+        // Setup renderbuffer (same as non-DMA path)
+        self.setup_renderbuffer_non_dma(dst, crop)?;
+
+        // Upload source and render using existing pipeline
+        // (convert_to maps the source tensor internally for texture upload)
+        let start = Instant::now();
+        if dst.is_planar() {
+            self.convert_to_planar(src, dst, rotation, flip, crop)?;
+        } else {
+            self.convert_to(src, dst, rotation, flip, crop)?;
+        }
+        log::debug!("PBO render takes {:?}", start.elapsed());
+
+        // Readback into destination PBO instead of CPU memory
+        let start_read = Instant::now();
+        let dest_format = match dst.fourcc() {
+            crate::RGB | crate::RGB_INT8 => gls::gl::RGB,
+            crate::RGBA => gls::gl::RGBA,
+            crate::GREY => gls::gl::RED,
+            _ => {
+                return Err(crate::Error::NotSupported(format!(
+                    "PBO readback not supported for {}",
+                    dst.fourcc().display()
+                )))
+            }
+        };
+
+        unsafe {
+            // Bind destination PBO as PACK buffer — glReadnPixels will write into it
+            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, dst_buffer_id);
+            gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
+            gls::gl::ReadnPixels(
+                0,
+                0,
+                dst.width() as i32,
+                dst.height() as i32,
+                dest_format,
+                gls::gl::UNSIGNED_BYTE,
+                dst.tensor.len() as i32,
+                std::ptr::null_mut(), // NULL pointer = write to bound PACK buffer
+            );
+            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+            gls::gl::Finish();
+        }
+
+        check_gl_error(function!(), line!())?;
+
+        // Handle int8 XOR if needed (must map PBO to do this)
+        if fourcc_is_int8(dst.fourcc()) {
+            let mut dst_map = dst.tensor().map()?;
+            for byte in dst_map.iter_mut() {
+                *byte ^= 0x80;
+            }
+        }
+
+        log::debug!("PBO readback takes {:?}", start_read.elapsed());
         Ok(())
     }
 

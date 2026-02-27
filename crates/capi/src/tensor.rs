@@ -93,6 +93,9 @@ impl From<TensorMemory> for HalTensorMemory {
             TensorMemory::Dma => HalTensorMemory::Dma,
             #[cfg(unix)]
             TensorMemory::Shm => HalTensorMemory::Shm,
+            // PBO tensors are GPU-only and not representable in the C API;
+            // report as Mem so callers can still inspect the memory type.
+            TensorMemory::Pbo => HalTensorMemory::Mem,
         }
     }
 }
