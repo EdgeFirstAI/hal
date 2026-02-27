@@ -38,7 +38,7 @@ mod shm;
 #[cfg(target_os = "linux")]
 pub use crate::dma::{DmaMap, DmaTensor};
 pub use crate::mem::{MemMap, MemTensor};
-pub use crate::pbo::{PboMapping, PboOps};
+pub use crate::pbo::{PboMap, PboMapping, PboOps, PboTensor};
 #[cfg(unix)]
 pub use crate::shm::{ShmMap, ShmTensor};
 pub use error::{Error, Result};
@@ -225,6 +225,10 @@ pub enum TensorMemory {
 
     /// Regular system memory allocation
     Mem,
+
+    /// OpenGL Pixel Buffer Object memory. Created by ImageProcessor
+    /// when DMA-buf is unavailable but OpenGL is present.
+    Pbo,
 }
 
 impl From<TensorMemory> for String {
@@ -235,6 +239,7 @@ impl From<TensorMemory> for String {
             #[cfg(unix)]
             TensorMemory::Shm => "shm".to_owned(),
             TensorMemory::Mem => "mem".to_owned(),
+            TensorMemory::Pbo => "pbo".to_owned(),
         }
     }
 }
@@ -249,6 +254,7 @@ impl TryFrom<&str> for TensorMemory {
             #[cfg(unix)]
             "shm" => Ok(TensorMemory::Shm),
             "mem" => Ok(TensorMemory::Mem),
+            "pbo" => Ok(TensorMemory::Pbo),
             _ => Err(Error::InvalidMemoryType(s.to_owned())),
         }
     }
@@ -264,6 +270,7 @@ where
     #[cfg(unix)]
     Shm(ShmTensor<T>),
     Mem(MemTensor<T>),
+    Pbo(PboTensor<T>),
 }
 
 impl<T> Tensor<T>
@@ -301,6 +308,9 @@ where
             #[cfg(unix)]
             Some(TensorMemory::Shm) => ShmTensor::<T>::new(shape, name).map(Tensor::Shm),
             Some(TensorMemory::Mem) => MemTensor::<T>::new(shape, name).map(Tensor::Mem),
+            Some(TensorMemory::Pbo) => Err(crate::error::Error::NotImplemented(
+                "PboTensor cannot be created via Tensor::new() — use ImageProcessor::create_image()".to_owned(),
+            )),
             None => {
                 if std::env::var("EDGEFIRST_TENSOR_FORCE_MEM")
                     .is_ok_and(|x| x != "0" && x.to_lowercase() != "false")
@@ -393,6 +403,7 @@ where
             Tensor::Dma(t) => t.clone_fd(),
             Tensor::Shm(t) => t.clone_fd(),
             Tensor::Mem(t) => t.clone_fd(),
+            Tensor::Pbo(t) => t.clone_fd(),
         }
     }
 
@@ -403,6 +414,7 @@ where
             #[cfg(unix)]
             Tensor::Shm(_) => TensorMemory::Shm,
             Tensor::Mem(_) => TensorMemory::Mem,
+            Tensor::Pbo(_) => TensorMemory::Pbo,
         }
     }
 
@@ -413,6 +425,7 @@ where
             #[cfg(unix)]
             Tensor::Shm(t) => t.name(),
             Tensor::Mem(t) => t.name(),
+            Tensor::Pbo(t) => t.name(),
         }
     }
 
@@ -423,6 +436,7 @@ where
             #[cfg(unix)]
             Tensor::Shm(t) => t.shape(),
             Tensor::Mem(t) => t.shape(),
+            Tensor::Pbo(t) => t.shape(),
         }
     }
 
@@ -433,6 +447,7 @@ where
             #[cfg(unix)]
             Tensor::Shm(t) => t.reshape(shape),
             Tensor::Mem(t) => t.reshape(shape),
+            Tensor::Pbo(t) => t.reshape(shape),
         }
     }
 
@@ -443,6 +458,7 @@ where
             #[cfg(unix)]
             Tensor::Shm(t) => t.map(),
             Tensor::Mem(t) => t.map(),
+            Tensor::Pbo(t) => t.map(),
         }
     }
 
@@ -453,6 +469,7 @@ where
             #[cfg(unix)]
             Tensor::Shm(t) => t.buffer_identity(),
             Tensor::Mem(t) => t.buffer_identity(),
+            Tensor::Pbo(t) => t.buffer_identity(),
         }
     }
 }
@@ -466,6 +483,7 @@ where
     #[cfg(unix)]
     Shm(ShmMap<T>),
     Mem(MemMap<T>),
+    Pbo(PboMap<T>),
 }
 
 impl<T> TensorMapTrait<T> for TensorMap<T>
@@ -479,6 +497,7 @@ where
             #[cfg(unix)]
             TensorMap::Shm(map) => map.shape(),
             TensorMap::Mem(map) => map.shape(),
+            TensorMap::Pbo(map) => map.shape(),
         }
     }
 
@@ -489,6 +508,7 @@ where
             #[cfg(unix)]
             TensorMap::Shm(map) => map.unmap(),
             TensorMap::Mem(map) => map.unmap(),
+            TensorMap::Pbo(map) => map.unmap(),
         }
     }
 
@@ -499,6 +519,7 @@ where
             #[cfg(unix)]
             TensorMap::Shm(map) => map.as_slice(),
             TensorMap::Mem(map) => map.as_slice(),
+            TensorMap::Pbo(map) => map.as_slice(),
         }
     }
 
@@ -509,6 +530,7 @@ where
             #[cfg(unix)]
             TensorMap::Shm(map) => map.as_mut_slice(),
             TensorMap::Mem(map) => map.as_mut_slice(),
+            TensorMap::Pbo(map) => map.as_mut_slice(),
         }
     }
 }
@@ -526,6 +548,7 @@ where
             #[cfg(unix)]
             TensorMap::Shm(map) => map.deref(),
             TensorMap::Mem(map) => map.deref(),
+            TensorMap::Pbo(map) => map.deref(),
         }
     }
 }
@@ -541,6 +564,7 @@ where
             #[cfg(unix)]
             TensorMap::Shm(map) => map.deref_mut(),
             TensorMap::Mem(map) => map.deref_mut(),
+            TensorMap::Pbo(map) => map.deref_mut(),
         }
     }
 }
