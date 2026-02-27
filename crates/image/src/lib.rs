@@ -4310,4 +4310,92 @@ mod image_tests {
         assert!(!fourcc_is_packed_rgb(PLANAR_RGB));
         assert!(!fourcc_is_packed_rgb(RGBA));
     }
+
+    /// Integration test that exercises the PBO-to-PBO convert path.
+    /// Uses ImageProcessor::create_image() to allocate PBO-backed tensors,
+    /// then converts between them. Skipped when GL is unavailable or the
+    /// backend is not PBO (e.g. DMA-buf systems).
+    #[cfg(target_os = "linux")]
+    #[cfg(feature = "opengl")]
+    #[test]
+    fn test_convert_pbo_to_pbo() {
+        let mut converter = ImageProcessor::new().unwrap();
+
+        // Skip if GL is not available or backend is not PBO
+        let is_pbo = converter
+            .opengl
+            .as_ref()
+            .is_some_and(|gl| gl.transfer_backend() == opengl_headless::TransferBackend::Pbo);
+        if !is_pbo {
+            eprintln!("Skipping test_convert_pbo_to_pbo: backend is not PBO");
+            return;
+        }
+
+        let src_w = 640;
+        let src_h = 480;
+        let dst_w = 320;
+        let dst_h = 240;
+
+        // Create PBO-backed source image
+        let pbo_src = converter.create_image(src_w, src_h, RGBA).unwrap();
+        assert_eq!(
+            pbo_src.tensor().memory(),
+            TensorMemory::Pbo,
+            "create_image should produce a PBO tensor"
+        );
+
+        // Fill source PBO with test pattern: load JPEG then convert Mem→PBO
+        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let jpeg_src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
+
+        // Resize JPEG into a Mem temp of the right size, then copy into PBO
+        let mut mem_src = TensorImage::new(src_w, src_h, RGBA, Some(TensorMemory::Mem)).unwrap();
+        CPUProcessor::new()
+            .convert(
+                &jpeg_src,
+                &mut mem_src,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+
+        // Copy pixel data into the PBO source by mapping it
+        {
+            let src_data = mem_src.tensor().map().unwrap();
+            let mut pbo_map = pbo_src.tensor().map().unwrap();
+            pbo_map.copy_from_slice(&src_data);
+        }
+
+        // Create PBO-backed destination image
+        let mut pbo_dst = converter.create_image(dst_w, dst_h, RGBA).unwrap();
+        assert_eq!(pbo_dst.tensor().memory(), TensorMemory::Pbo);
+
+        // Convert PBO→PBO (this exercises convert_pbo_to_pbo)
+        converter
+            .convert(
+                &pbo_src,
+                &mut pbo_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+
+        // Verify: compare with CPU-only conversion of the same input
+        let mut cpu_dst =
+            TensorImage::new(dst_w, dst_h, RGBA, Some(TensorMemory::Mem)).unwrap();
+        CPUProcessor::new()
+            .convert(
+                &mem_src,
+                &mut cpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+
+        compare_images(&pbo_dst, &cpu_dst, 0.95, function!());
+        log::info!("test_convert_pbo_to_pbo: PASS — PBO-to-PBO convert matches CPU reference");
+    }
 }
