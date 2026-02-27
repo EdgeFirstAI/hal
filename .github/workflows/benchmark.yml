@@ -148,15 +148,9 @@ jobs:
               name=$(basename "$bench")
               echo ""
               echo "=== Running $name ==="
-              "$bench" --bench --save-baseline github-ci 2>&1 | tee "benchmark-results/${name}.txt"
+              "$bench" --bench 2>&1 | tee "benchmark-results/${name}.txt"
             fi
           done
-
-          # Package Criterion JSON data
-          if [ -d "target/criterion" ]; then
-            echo "Packaging Criterion JSON data..."
-            tar -czf benchmark-results/criterion-data.tar.gz -C target criterion
-          fi
 
       - name: Upload Rust benchmark results
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
@@ -268,12 +262,6 @@ jobs:
           echo "=== Python Benchmarks ===" >> benchmark-output.txt
           cat python-benchmark-results/benchmark.txt >> benchmark-output.txt 2>/dev/null || echo "No Python benchmarks" >> benchmark-output.txt
 
-          # Extract Criterion JSON data
-          if [ -f rust-benchmark-results/criterion-data.tar.gz ]; then
-            echo "Extracting Criterion JSON data..."
-            tar -xzf rust-benchmark-results/criterion-data.tar.gz
-          fi
-
           # Parse all benchmark data into a unified JSON
           python3 << 'PARSE_SCRIPT'
           import json
@@ -284,83 +272,53 @@ jobs:
           rust_benchmarks = []
           python_benchmarks = []
 
-          # ── Parse Criterion JSON files for Rust benchmarks ──
-          criterion_dir = 'criterion'
-          if os.path.isdir(criterion_dir):
-              print("Using Criterion JSON data for Rust benchmarks")
-              for bench_json in glob.glob(f'{criterion_dir}/**/new/benchmark.json', recursive=True):
-                  estimates_json = os.path.join(os.path.dirname(bench_json), 'estimates.json')
-                  if not os.path.exists(estimates_json):
-                      continue
-                  try:
-                      with open(bench_json) as f:
-                          bench_data = json.load(f)
-                      with open(estimates_json) as f:
-                          estimates = json.load(f)
-
-                      full_id = bench_data.get('full_id', '')
-                      if not full_id:
+          # ── Parse Rust benchmark text output ──
+          # Supports two output formats:
+          #   1. Custom harness (edgefirst-bench): "name  median=1.23ms  mean=... [throughput]"
+          #   2. Divan:  "name  ... fastest │ ... │ ... slowest │ ... median │ ..."
+          print("Parsing Rust benchmark text output")
+          for txt_file in glob.glob('rust-benchmark-results/*.txt'):
+              with open(txt_file) as f:
+                  for line in f:
+                      stripped = line.strip()
+                      # Custom harness format: "name  median=1.23ms  mean=..."
+                      m = re.match(r'^(\S+)\s+median=\s*([\d.]+)(ms|us|µs|ns|s)', stripped)
+                      if m:
+                          name = m.group(1)
+                          val, unit = float(m.group(2)), m.group(3)
+                          mult = {'ns': 1, 'us': 1e3, 'µs': 1e3, 'ms': 1e6, 's': 1e9}
+                          ns = val * mult.get(unit, 1)
+                          # Extract throughput if present
+                          thrpt = 'N/A'
+                          thrpt_m = re.search(r'\[([\d.]+\s*[GMKT]iB/s)\]', stripped)
+                          if thrpt_m:
+                              thrpt = thrpt_m.group(1)
+                          rust_benchmarks.append({
+                              'name': name,
+                              'time': f"{val:.4f} {unit}",
+                              'time_ns': ns,
+                              'throughput': thrpt,
+                          })
                           continue
-
-                      # Use slope if available (more accurate), else median
-                      time_data = estimates.get('slope') or estimates.get('median', {})
-                      point_estimate = time_data.get('point_estimate')
-                      if point_estimate is None:
-                          continue
-
-                      ns = float(point_estimate)
-
-                      # Format time string
-                      if ns >= 1e9:
-                          time_str = f"{ns/1e9:.4f} s"
-                      elif ns >= 1e6:
-                          time_str = f"{ns/1e6:.4f} ms"
-                      elif ns >= 1e3:
-                          time_str = f"{ns/1e3:.4f} us"
-                      else:
-                          time_str = f"{ns:.4f} ns"
-
-                      # Calculate throughput
-                      thrpt_str = 'N/A'
-                      throughput = bench_data.get('throughput', {})
-                      if throughput:
-                          bytes_per_iter = throughput.get('Bytes')
-                          if bytes_per_iter and ns > 0:
-                              bps = bytes_per_iter * 1e9 / ns
-                              if bps >= 1024**3:
-                                  thrpt_str = f"{bps/1024**3:.2f} GiB/s"
-                              elif bps >= 1024**2:
-                                  thrpt_str = f"{bps/1024**2:.2f} MiB/s"
-                              else:
-                                  thrpt_str = f"{bps/1024:.2f} KiB/s"
-
-                      rust_benchmarks.append({
-                          'name': full_id,
-                          'time': time_str,
-                          'time_ns': ns,
-                          'throughput': thrpt_str,
-                      })
-                  except Exception as e:
-                      print(f"Warning: Failed to parse {bench_json}: {e}")
-
-          # ── Fallback: parse Criterion text output ──
-          if not rust_benchmarks:
-              print("No Criterion JSON found, parsing text output")
-              for txt_file in glob.glob('rust-benchmark-results/*.txt'):
-                  with open(txt_file) as f:
-                      for line in f:
-                          # Match: "benchmark_name  time:   [1.234 ms 1.345 ms 1.456 ms]"
-                          m = re.match(r'^(\S+)\s+time:\s+\[[\d.]+ \w+ ([\d.]+) (\w+)', line.strip())
-                          if m:
-                              name, val, unit = m.group(1), float(m.group(2)), m.group(3)
-                              mult = {'ns': 1, 'us': 1e3, 'ms': 1e6, 's': 1e9}
-                              ns = val * mult.get(unit, 1)
-                              rust_benchmarks.append({
-                                  'name': name,
-                                  'time': f"{val:.4f} {unit}",
-                                  'time_ns': ns,
-                                  'throughput': 'N/A',
-                              })
+                      # Divan format: "name  ... │ median value │ ..."
+                      m = re.match(r'^(\S+)\s+.*?fastest\s*│', stripped)
+                      if m:
+                          name = m.group(1)
+                          # Try to extract median time from the line
+                          parts = stripped.split('│')
+                          if len(parts) >= 4:
+                              median_str = parts[3].strip()
+                              tm = re.match(r'([\d.]+)\s*(\w+)', median_str)
+                              if tm:
+                                  val, unit = float(tm.group(1)), tm.group(2)
+                                  mult = {'ns': 1, 'us': 1e3, 'µs': 1e3, 'ms': 1e6, 's': 1e9}
+                                  ns = val * mult.get(unit, 1)
+                                  rust_benchmarks.append({
+                                      'name': name,
+                                      'time': f"{val:.4f} {unit}",
+                                      'time_ns': ns,
+                                      'throughput': 'N/A',
+                                  })
 
           # ── Parse Python benchmark JSON ──
           for py_json in ['python-benchmark-results/benchmark.json', 'python-benchmark-results/standalone.json']:

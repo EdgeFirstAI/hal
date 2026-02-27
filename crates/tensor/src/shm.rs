@@ -26,6 +26,7 @@ where
     pub fd: OwnedFd,
     pub shape: Vec<usize>,
     pub _marker: std::marker::PhantomData<T>,
+    identity: crate::BufferIdentity,
 }
 
 unsafe impl<T> Send for ShmTensor<T> where T: Num + Clone + fmt::Debug + Send + Sync {}
@@ -69,6 +70,7 @@ where
             fd: shm_fd,
             shape: shape.to_vec(),
             _marker: std::marker::PhantomData,
+            identity: crate::BufferIdentity::new(),
         })
     }
 
@@ -87,6 +89,7 @@ where
             fd,
             shape: shape.to_vec(),
             _marker: std::marker::PhantomData,
+            identity: crate::BufferIdentity::new(),
         })
     }
 
@@ -143,6 +146,10 @@ where
             shape: self.shape.clone(),
             _marker: std::marker::PhantomData,
         }))
+    }
+
+    fn buffer_identity(&self) -> &crate::BufferIdentity {
+        &self.identity
     }
 }
 

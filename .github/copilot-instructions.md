@@ -2,7 +2,7 @@
 
 **Purpose:** Instructions for AI coding assistants (GitHub Copilot, Cursor, Claude Code, etc.) working on this project.
 
-**Version:** 1.1
+**Version:** 1.2
 **Last Updated:** February 2026
 
 ---
@@ -261,9 +261,9 @@ tests/
 ### Running Tests
 
 ```bash
-make test          # Run all tests
-cargo test         # Rust only
-pytest tests/      # Python only
+make test                       # Run all tests (single-threaded via -j 1)
+cargo test -- --test-threads=1  # Rust only (MUST use --test-threads=1)
+pytest tests/                   # Python only
 ```
 
 ---
@@ -503,6 +503,44 @@ When adding features:
 - Use feature flags for optional hardware support
 - Test on multiple platforms if possible
 
+### GPU and Hardware Resource Cleanup
+
+**EGL/OpenGL cleanup** uses a defense-in-depth strategy (see ARCHITECTURE.md for
+full details). Key rules:
+
+1. **Always call `eglTerminate`** in `GlContext::drop` — EGL display connections
+   are ref-counted. Omitting `eglTerminate` causes display connection exhaustion.
+2. **Never call `eglReleaseThread`** — Mesa's atexit handler may have already
+   freed the per-thread state, causing a use-after-free.
+3. **Leak the EGL library handle** via `Box::leak` — prevents `dlclose` from
+   unmapping driver code that atexit handlers still reference.
+4. **Wrap all EGL cleanup in `catch_unwind`** — absorbs panics from drivers
+   that misbehave during teardown.
+
+**G2D cleanup** rules:
+
+1. **Normal code**: Let `G2DProcessor::drop` run naturally (calls `g2d_close`).
+2. **Benchmark code**: Use `ManuallyDrop<G2DProcessor>` to avoid repeated
+   `g2d_close` + `dlclose` cycles that can corrupt shared `galcore` state.
+3. **Never `dlclose` the G2D library** while EGL is also loaded — they share
+   the Vivante `galcore` kernel driver.
+
+**Resource leak prevention**: All GPU resources (EGL displays, contexts,
+surfaces) and DMA buffers must be explicitly released. Only the EGL library
+handle and `Rc<Egl>` wrapper are intentionally leaked (they are lightweight
+Rust objects; actual GPU resources are freed by explicit cleanup calls).
+
+### Testing with GPU Resources
+
+**All tests must run single-threaded.** Use `--test-threads=1` for `cargo test`
+and `-j 1` for `cargo nextest`. This prevents:
+- EGL display races (concurrent `eglTerminate` tearing down shared state)
+- G2D driver contention (galcore is not thread-safe for context creation)
+- DMA-heap CMA pool exhaustion on memory-constrained embedded targets
+
+This applies to CI, the Makefile, and local development. See ARCHITECTURE.md
+section "Testing with GPU Resources" for details.
+
 ### Common Pitfalls
 
 1. **Don't mix tensor types unnecessarily** - Use `None` for automatic selection
@@ -512,6 +550,9 @@ When adding features:
 5. **Don't skip tests** - Add both Rust and Python tests for new features
 6. **Don't forget documentation** - Public APIs need doc comments
 7. **Don't nest `with_quantized!` macros** - Each nesting level multiplies monomorphized paths by 6 (6^N explosion). Dequantize tensors sequentially with `dequant_3d!`/`dequant_4d!` helpers, or split into independent phases that each nest at most 2 levels
+8. **Don't run tests in parallel** - Always use `--test-threads=1` or `-j 1` (see above)
+9. **Don't skip `eglTerminate`** - Omitting it leaks EGL display connections
+10. **Don't `dlclose` GPU libraries** - Use `Box::leak` to keep driver code mapped
 
 ---
 

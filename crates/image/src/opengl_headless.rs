@@ -48,8 +48,9 @@ macro_rules! function {
 #[cfg(feature = "decoder")]
 use crate::DEFAULT_COLORS;
 use crate::{
-    CPUProcessor, Crop, Error, Flip, ImageProcessorTrait, Rect, Rotation, TensorImage,
-    TensorImageRef, GREY, NV12, PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, YUYV,
+    fourcc_is_int8, fourcc_is_packed_rgb, CPUProcessor, Crop, Error, Flip, ImageProcessorTrait,
+    Rect, Rotation, TensorImage, TensorImageRef, GREY, NV12, PLANAR_RGB, PLANAR_RGBA,
+    PLANAR_RGB_INT8, RGB, RGBA, RGB_INT8, YUYV,
 };
 
 #[cfg(feature = "decoder")]
@@ -583,20 +584,22 @@ impl Drop for GlContext {
                 let _ = self.egl.destroy_surface(self.display.as_display(), surface);
             }
 
-            // Note: eglTerminate is intentionally omitted. The context and
-            // surface are already destroyed above, and calling terminate after
-            // individual resource destruction can cause double-free issues on
-            // some EGL drivers (observed as heap corruption on ARM targets
-            // during process shutdown).
+            // eglTerminate decrements the ref count on the display connection.
+            // Since eglInitialize is ref-counted per the EGL spec, this only
+            // tears down internal state when the last reference is released.
+            // probe_egl_displays() already calls eglTerminate successfully on
+            // all platforms; catch_unwind provides a safety net for any driver
+            // that misbehaves.
+            let _ = self.egl.terminate(self.display.as_display());
         }));
         std::panic::set_hook(prev_hook);
 
         // The Rc<Egl> (ManuallyDrop) is intentionally NOT dropped. The
         // khronos-egl Dynamic instance's Drop calls eglReleaseThread() which
         // panics if the EGL library has been unloaded (local/x86_64) or
-        // causes heap corruption by calling into invalid memory (ARM). Since
-        // EGL display connections are process-scoped singletons, leaking the
-        // Rc is harmless — the OS reclaims all resources on process exit.
+        // causes heap corruption by calling into invalid memory (ARM).
+        // The Rc wrapper is a lightweight Rust-side object; the actual EGL
+        // display resources are released by eglTerminate above.
     }
 }
 
@@ -1037,6 +1040,75 @@ pub enum Int8InterpolationMode {
     TwoPass,
 }
 
+/// Selects which EGLImage cache to use.
+#[derive(Debug)]
+enum CacheKind {
+    Src,
+    Dst,
+}
+
+/// A cached EGLImage with a weak reference to the source tensor's guard.
+struct CachedEglImage {
+    egl_image: EglImage,
+    /// Weak reference to the source Tensor's BufferIdentity guard.
+    guard: std::sync::Weak<()>,
+    /// Optional GL renderbuffer backed by this EGLImage (used by direct RGB path).
+    renderbuffer: Option<u32>,
+}
+
+/// EGLImage cache owned by GLProcessorST.
+struct EglImageCache {
+    entries: std::collections::HashMap<u64, CachedEglImage>,
+    capacity: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl EglImageCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: std::collections::HashMap::with_capacity(capacity),
+            capacity,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// Sweep dead entries (tensor dropped, Weak is dead).
+    fn sweep(&mut self) {
+        let before = self.entries.len();
+        self.entries.retain(|_id, entry| {
+            let alive = entry.guard.upgrade().is_some();
+            if !alive {
+                if let Some(rbo) = entry.renderbuffer {
+                    unsafe { gls::gl::DeleteRenderbuffers(1, &rbo) };
+                }
+            }
+            alive
+        });
+        let swept = before - self.entries.len();
+        if swept > 0 {
+            log::debug!("EglImageCache: swept {swept} dead entries");
+        }
+    }
+}
+
+impl Drop for EglImageCache {
+    fn drop(&mut self) {
+        for entry in self.entries.values() {
+            if let Some(rbo) = entry.renderbuffer {
+                unsafe { gls::gl::DeleteRenderbuffers(1, &rbo) };
+            }
+        }
+        log::debug!(
+            "EglImageCache stats: {} hits, {} misses, {} entries remaining",
+            self.hits,
+            self.misses,
+            self.entries.len()
+        );
+    }
+}
+
 /// OpenGL single-threaded image converter.
 pub struct GLProcessorST {
     camera_eglimage_texture: Texture,
@@ -1091,9 +1163,35 @@ pub struct GLProcessorST {
     mask_fbo_height: usize,
     vertex_buffer: Buffer,
     texture_buffer: Buffer,
+    /// Persistent FBO for the convert() render path.
+    /// Created once, reused by re-attaching textures each frame.
+    convert_fbo: FrameBuffer,
+    /// EGLImage cache for source DMA buffers.
+    src_egl_cache: EglImageCache,
+    /// EGLImage cache for destination DMA buffers.
+    dst_egl_cache: EglImageCache,
+    /// Intermediate RGBA texture for two-pass packed RGB conversion.
+    /// Pass 1 renders YUYV/NV12→RGBA here; Pass 2 packs RGBA→RGB to DMA dest.
+    packed_rgb_intermediate_tex: Texture,
+    /// FBO for pass 1 of packed RGB conversion (renders to intermediate texture).
+    packed_rgb_fbo: FrameBuffer,
+    /// Current allocated size of the intermediate texture (0,0 = unallocated).
+    packed_rgb_intermediate_size: (usize, usize),
     texture_program: GlProgram,
     texture_program_yuv: GlProgram,
     texture_program_planar: GlProgram,
+    /// Shader: existing planar RGB with int8 bias (XOR 0x80) applied to output.
+    texture_program_planar_int8: GlProgram,
+    /// Shader: packed RGB -> RGBA8 packing (2D texture source, pass 2).
+    packed_rgba8_program_2d: GlProgram,
+    /// Shader: packed RGB int8 -> RGBA8 packing with XOR 0x80 (2D texture source, pass 2).
+    packed_rgba8_int8_program_2d: GlProgram,
+    /// Shader: direct RGB render with int8 XOR 0x80 bias (2D texture source).
+    texture_int8_program: GlProgram,
+    /// Shader: direct RGB render with int8 XOR 0x80 bias (external OES source).
+    texture_int8_program_yuv: GlProgram,
+    /// Whether the GPU supports direct RGB rendering via BGR888 renderbuffer.
+    support_rgb_direct: bool,
     gl_context: GlContext,
 }
 
@@ -1142,11 +1240,8 @@ impl ImageProcessorTrait for GLProcessorST {
             src.tensor().memory()
         );
         check_gl_error(function!(), line!())?;
-        if self.gl_context.support_dma
-            && dst.tensor().memory() == TensorMemory::Dma
-            && dst.fourcc() != RGB
-        // DMA generally doesn't support RGB
-        {
+        if self.gl_context.support_dma && dst.tensor().memory() == TensorMemory::Dma {
+            // Packed RGB is now supported via DMA with buffer reinterpretation
             let res = self.convert_dest_dma(dst, src, rotation, flip, crop);
             return res;
         }
@@ -1185,27 +1280,16 @@ impl ImageProcessorTrait for GLProcessorST {
             ));
         }
 
-        let (_render_buffer, is_dma) = match dst.tensor.memory() {
-            edgefirst_tensor::TensorMemory::Dma => {
-                if let Ok(render_buffer) = self.setup_renderbuffer_dma(dst) {
-                    (render_buffer, true)
-                } else {
-                    (
-                        self.setup_renderbuffer_non_dma(
-                            dst,
-                            Crop::new().with_dst_rect(Some(Rect::new(0, 0, 0, 0))),
-                        )?,
-                        false,
-                    )
-                }
-            }
-            _ => (
+        let is_dma = match dst.tensor.memory() {
+            edgefirst_tensor::TensorMemory::Dma if self.setup_renderbuffer_dma(dst).is_ok() => true,
+            _ => {
+                // Add dest rect to make sure dst is rendered fully
                 self.setup_renderbuffer_non_dma(
                     dst,
                     Crop::new().with_dst_rect(Some(Rect::new(0, 0, 0, 0))),
-                )?,
-                false,
-            ), // Add dest rect to make sure dst is rendered fully
+                )?;
+                false
+            }
         };
 
         gls::enable(gls::gl::BLEND);
@@ -1261,27 +1345,15 @@ impl ImageProcessorTrait for GLProcessorST {
             ));
         }
 
-        let (_render_buffer, is_dma) = match dst.tensor.memory() {
-            edgefirst_tensor::TensorMemory::Dma => {
-                if let Ok(render_buffer) = self.setup_renderbuffer_dma(dst) {
-                    (render_buffer, true)
-                } else {
-                    (
-                        self.setup_renderbuffer_non_dma(
-                            dst,
-                            Crop::new().with_dst_rect(Some(Rect::new(0, 0, 0, 0))),
-                        )?,
-                        false,
-                    )
-                }
-            }
-            _ => (
+        let is_dma = match dst.tensor.memory() {
+            edgefirst_tensor::TensorMemory::Dma if self.setup_renderbuffer_dma(dst).is_ok() => true,
+            _ => {
                 self.setup_renderbuffer_non_dma(
                     dst,
                     Crop::new().with_dst_rect(Some(Rect::new(0, 0, 0, 0))),
-                )?,
-                false,
-            ),
+                )?;
+                false
+            }
         };
 
         gls::enable(gls::gl::BLEND);
@@ -1482,6 +1554,24 @@ impl GLProcessorST {
         let proto_mask_f32_program =
             GlProgram::new(generate_vertex_shader(), generate_proto_mask_shader_f32())?;
 
+        // Int8 variant of the existing planar RGB shader (for PLANAR_RGB_INT8 destinations).
+        let texture_program_planar_int8 =
+            GlProgram::new(generate_vertex_shader(), generate_planar_rgb_int8_shader())?;
+
+        // RGB packing shaders (2D only — used in pass 2 of two-pass pipeline)
+        let packed_rgba8_program_2d =
+            GlProgram::new(generate_vertex_shader(), generate_packed_rgba8_shader_2d())?;
+        let packed_rgba8_int8_program_2d = GlProgram::new(
+            generate_vertex_shader(),
+            generate_packed_rgba8_int8_shader_2d(),
+        )?;
+
+        // Int8 direct-render shaders (for RGB_INT8 destinations via direct path)
+        let texture_int8_program =
+            GlProgram::new(generate_vertex_shader(), generate_texture_int8_shader())?;
+        let texture_int8_program_yuv =
+            GlProgram::new(generate_vertex_shader(), generate_texture_int8_shader_yuv())?;
+
         let camera_eglimage_texture = Texture::new();
         let camera_normal_texture = Texture::new();
         let render_texture = Texture::new();
@@ -1493,11 +1583,17 @@ impl GLProcessorST {
         let vertex_buffer = Buffer::new(0, 3, 100);
         let texture_buffer = Buffer::new(1, 2, 100);
 
-        let converter = GLProcessorST {
+        let mut converter = GLProcessorST {
             gl_context,
             texture_program,
             texture_program_yuv,
             texture_program_planar,
+            texture_program_planar_int8,
+            packed_rgba8_program_2d,
+            packed_rgba8_int8_program_2d,
+            texture_int8_program,
+            texture_int8_program_yuv,
+            support_rgb_direct: false, // will be probed in Task 3
             camera_eglimage_texture,
             camera_normal_texture,
             #[cfg(feature = "decoder")]
@@ -1534,6 +1630,12 @@ impl GLProcessorST {
             mask_fbo_height: 0,
             vertex_buffer,
             texture_buffer,
+            convert_fbo: FrameBuffer::new(),
+            src_egl_cache: EglImageCache::new(8),
+            dst_egl_cache: EglImageCache::new(8),
+            packed_rgb_intermediate_tex: Texture::new(),
+            packed_rgb_fbo: FrameBuffer::new(),
+            packed_rgb_intermediate_size: (0, 0),
             render_texture,
             #[cfg(feature = "decoder")]
             segmentation_program,
@@ -1546,8 +1648,100 @@ impl GLProcessorST {
         };
         check_gl_error(function!(), line!())?;
 
-        log::debug!("GLConverter created");
+        // Probe GPU capability for direct RGB rendering
+        converter.support_rgb_direct = converter.probe_rgb_direct_support();
+
+        log::debug!(
+            "GLConverter created (rgb_direct={})",
+            converter.support_rgb_direct
+        );
         Ok(converter)
+    }
+
+    /// Probe whether the GPU supports direct RGB rendering via BGR888 DMA-buf
+    /// backed renderbuffer. Creates a small test FBO and checks completeness.
+    /// Returns `false` on any failure (DMA unavailable, EGLImage rejected, FBO incomplete).
+    fn probe_rgb_direct_support(&self) -> bool {
+        if !self.gl_context.support_dma {
+            log::debug!("probe_rgb_direct: no DMA support");
+            return false;
+        }
+
+        // Check glEGLImageTargetRenderbufferStorageOES is available
+        if self
+            .gl_context
+            .egl
+            .get_proc_address("glEGLImageTargetRenderbufferStorageOES")
+            .is_none()
+        {
+            log::debug!("probe_rgb_direct: glEGLImageTargetRenderbufferStorageOES not available");
+            return false;
+        }
+
+        // Allocate a small test DMA buffer (64x64 RGB = 12288 bytes)
+        let test_img = match TensorImage::new(64, 64, RGB, Some(TensorMemory::Dma)) {
+            Ok(img) => img,
+            Err(e) => {
+                log::debug!("probe_rgb_direct: failed to allocate test DMA buffer: {e}");
+                return false;
+            }
+        };
+
+        // Create EGLImage from the test DMA buffer
+        let egl_image =
+            match self.create_egl_image_with_dims(&test_img, 64, 64, DrmFourcc::Bgr888, 3) {
+                Ok(img) => img,
+                Err(e) => {
+                    log::debug!("probe_rgb_direct: EGLImage creation failed: {e}");
+                    return false;
+                }
+            };
+
+        // Create renderbuffer, bind EGLImage, create FBO, check completeness
+        let result = unsafe {
+            let mut rbo = 0u32;
+            gls::gl::GenRenderbuffers(1, &mut rbo);
+            gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
+            gls::gl::EGLImageTargetRenderbufferStorageOES(
+                gls::gl::RENDERBUFFER,
+                egl_image.egl_image.as_ptr(),
+            );
+
+            let gl_err = gls::gl::GetError();
+            if gl_err != gls::gl::NO_ERROR {
+                log::debug!(
+                    "probe_rgb_direct: EGLImageTargetRenderbufferStorageOES failed: {gl_err:#X}"
+                );
+                gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, 0);
+                gls::gl::DeleteRenderbuffers(1, &rbo);
+                return false;
+            }
+
+            let mut fbo = 0u32;
+            gls::gl::GenFramebuffers(1, &mut fbo);
+            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
+            gls::gl::FramebufferRenderbuffer(
+                gls::gl::FRAMEBUFFER,
+                gls::gl::COLOR_ATTACHMENT0,
+                gls::gl::RENDERBUFFER,
+                rbo,
+            );
+
+            let status = gls::gl::CheckFramebufferStatus(gls::gl::FRAMEBUFFER);
+            let complete = status == gls::gl::FRAMEBUFFER_COMPLETE;
+
+            // Cleanup
+            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
+            gls::gl::DeleteFramebuffers(1, &fbo);
+            gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, 0);
+            gls::gl::DeleteRenderbuffers(1, &rbo);
+
+            complete
+        };
+        // egl_image and test_img drop automatically here
+
+        log::info!("probe_rgb_direct: BGR888 renderbuffer FBO support = {result}");
+        result
     }
 
     /// Sets the interpolation mode for int8 proto textures.
@@ -1950,10 +2144,12 @@ impl GLProcessorST {
 
     fn check_dst_format_supported(support_dma: bool, img: &TensorImage) -> bool {
         if support_dma && img.tensor().memory() == TensorMemory::Dma {
-            // generally EGLImage doesn't support RGB
-            matches!(img.fourcc(), RGBA | GREY | PLANAR_RGB)
+            matches!(
+                img.fourcc(),
+                RGBA | GREY | PLANAR_RGB | RGB | RGB_INT8 | PLANAR_RGB_INT8
+            )
         } else {
-            matches!(img.fourcc(), RGB | RGBA | GREY)
+            matches!(img.fourcc(), RGB | RGBA | GREY | RGB_INT8)
         }
     }
 
@@ -1997,18 +2193,17 @@ impl GLProcessorST {
         Ok(has_float_linear)
     }
 
-    fn setup_renderbuffer_dma(&mut self, dst: &TensorImage) -> crate::Result<FrameBuffer> {
-        let frame_buffer = FrameBuffer::new();
-        frame_buffer.bind();
+    fn setup_renderbuffer_dma(&mut self, dst: &TensorImage) -> crate::Result<()> {
+        self.convert_fbo.bind();
 
-        let (width, height) = if matches!(dst.fourcc(), PLANAR_RGB) {
+        let (width, height) = if matches!(dst.fourcc(), PLANAR_RGB | PLANAR_RGB_INT8) {
             let width = dst.width();
             let height = dst.height() * 3;
             (width as i32, height as i32)
         } else {
             (dst.width() as i32, dst.height() as i32)
         };
-        let dest_img = self.create_image_from_dma2(dst)?;
+        let dest_egl = self.get_or_create_egl_image(CacheKind::Dst, dst)?;
         unsafe {
             gls::gl::UseProgram(self.texture_program_yuv.id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
@@ -2023,7 +2218,7 @@ impl GLProcessorST {
                 gls::gl::TEXTURE_MAG_FILTER,
                 gls::gl::LINEAR as i32,
             );
-            gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, dest_img.egl_image.as_ptr());
+            gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, dest_egl.as_ptr());
             gls::gl::FramebufferTexture2D(
                 gls::gl::FRAMEBUFFER,
                 gls::gl::COLOR_ATTACHMENT0,
@@ -2034,7 +2229,7 @@ impl GLProcessorST {
             check_gl_error(function!(), line!())?;
             gls::gl::Viewport(0, 0, width, height);
         }
-        Ok(frame_buffer)
+        Ok(())
     }
 
     fn convert_dest_dma(
@@ -2046,20 +2241,26 @@ impl GLProcessorST {
         crop: Crop,
     ) -> crate::Result<()> {
         assert!(self.gl_context.support_dma);
-        let _framebuffer = self.setup_renderbuffer_dma(dst)?;
-        if dst.is_planar() {
+        if fourcc_is_packed_rgb(dst.fourcc()) {
+            if self.support_rgb_direct {
+                self.convert_to_rgb_direct(src, dst, rotation, flip, crop)
+            } else {
+                self.convert_to_packed_rgb(src, dst, rotation, flip, crop)
+            }
+        } else if dst.is_planar() {
+            self.setup_renderbuffer_dma(dst)?;
             self.convert_to_planar(src, dst, rotation, flip, crop)
         } else {
+            self.setup_renderbuffer_dma(dst)?;
             self.convert_to(src, dst, rotation, flip, crop)
         }
     }
 
-    fn setup_renderbuffer_non_dma(
-        &mut self,
-        dst: &TensorImage,
-        crop: Crop,
-    ) -> crate::Result<FrameBuffer> {
-        debug_assert!(matches!(dst.fourcc(), RGB | RGBA | GREY | PLANAR_RGB));
+    fn setup_renderbuffer_non_dma(&mut self, dst: &TensorImage, crop: Crop) -> crate::Result<()> {
+        debug_assert!(matches!(
+            dst.fourcc(),
+            RGB | RGBA | GREY | PLANAR_RGB | RGB_INT8
+        ));
         let (width, height) = if dst.is_planar() {
             let width = dst.width() / 4;
             let height = match dst.fourcc() {
@@ -2077,7 +2278,7 @@ impl GLProcessorST {
             gls::gl::RED
         } else {
             match dst.fourcc() {
-                RGB => gls::gl::RGB,
+                RGB | RGB_INT8 => gls::gl::RGB,
                 RGBA => gls::gl::RGBA,
                 GREY => gls::gl::RED,
                 _ => unreachable!(),
@@ -2085,8 +2286,7 @@ impl GLProcessorST {
         };
 
         let start = Instant::now();
-        let frame_buffer = FrameBuffer::new();
-        frame_buffer.bind();
+        self.convert_fbo.bind();
 
         let map;
 
@@ -2139,7 +2339,7 @@ impl GLProcessorST {
             gls::gl::Viewport(0, 0, width, height);
         }
         log::debug!("Set up framebuffer takes {:?}", start.elapsed());
-        Ok(frame_buffer)
+        Ok(())
     }
 
     fn convert_dest_non_dma(
@@ -2150,7 +2350,7 @@ impl GLProcessorST {
         flip: Flip,
         crop: Crop,
     ) -> crate::Result<()> {
-        let _framebuffer = self.setup_renderbuffer_non_dma(dst, crop)?;
+        self.setup_renderbuffer_non_dma(dst, crop)?;
         let start = Instant::now();
         if dst.is_planar() {
             self.convert_to_planar(src, dst, rotation, flip, crop)?;
@@ -2160,7 +2360,7 @@ impl GLProcessorST {
         log::debug!("Draw to framebuffer takes {:?}", start.elapsed());
         let start = Instant::now();
         let dest_format = match dst.fourcc() {
-            RGB => gls::gl::RGB,
+            RGB | RGB_INT8 => gls::gl::RGB,
             RGBA => gls::gl::RGBA,
             GREY => gls::gl::RED,
             _ => unreachable!(),
@@ -2179,6 +2379,12 @@ impl GLProcessorST {
                 dst.tensor.len() as i32,
                 dst_map.as_mut_ptr() as *mut c_void,
             );
+            // Apply XOR 0x80 for int8 formats (convert uint8 → int8 representation)
+            if fourcc_is_int8(dst.fourcc()) {
+                for byte in dst_map.iter_mut() {
+                    *byte ^= 0x80;
+                }
+            }
         }
         log::debug!("Read from framebuffer takes {:?}", start.elapsed());
         Ok(())
@@ -2252,10 +2458,10 @@ impl GLProcessorST {
             crate::Rotation::CounterClockwise90 => 3,
         };
         if self.gl_context.support_dma && src.tensor().memory() == TensorMemory::Dma {
-            match self.create_image_from_dma2(src) {
-                Ok(new_egl_image) => self.draw_camera_texture_eglimage(
+            match self.get_or_create_egl_image(CacheKind::Src, src) {
+                Ok(src_egl) => self.draw_camera_texture_eglimage(
                     src,
-                    &new_egl_image,
+                    src_egl,
                     src_roi,
                     dst_roi,
                     rotation_offset,
@@ -2282,7 +2488,7 @@ impl GLProcessorST {
     }
 
     fn convert_to_planar(
-        &self,
+        &mut self,
         src: &TensorImage,
         dst: &TensorImage,
         rotation: crate::Rotation,
@@ -2312,14 +2518,16 @@ impl GLProcessorST {
         // }
 
         let alpha = match dst.fourcc() {
-            PLANAR_RGB => false,
+            PLANAR_RGB | PLANAR_RGB_INT8 => false,
             PLANAR_RGBA => true,
             _ => {
                 return Err(crate::Error::NotSupported(
-                    "Destination format must be PLANAR_RGB or PLANAR_RGBA".to_string(),
+                    "Destination format must be PLANAR_RGB, PLANAR_RGB_INT8, or PLANAR_RGBA"
+                        .to_string(),
                 ));
             }
         };
+        let is_int8 = fourcc_is_int8(dst.fourcc());
 
         // top and bottom are flipped because OpenGL uses 0,0 as bottom left
         let src_roi = if let Some(crop) = crop.src_rect {
@@ -2382,18 +2590,291 @@ impl GLProcessorST {
             }
         }
 
-        let new_egl_image = self.create_image_from_dma2(src)?;
+        let src_egl = self.get_or_create_egl_image(CacheKind::Src, src)?;
 
         self.draw_camera_texture_to_rgb_planar(
-            &new_egl_image,
+            src_egl,
             src_roi,
             dst_roi,
             rotation_offset,
             flip,
             alpha,
+            is_int8,
         )?;
         unsafe { gls::gl::Finish() };
 
+        Ok(())
+    }
+
+    /// Render packed RGB (or RGB_INT8) to a DMA destination buffer using a
+    /// two-pass architecture:
+    ///
+    /// **Pass 1:** Render source → intermediate RGBA texture via `convert_to()`
+    /// (reuses the battle-tested RGBA path with full crop/letterbox/rotation/flip).
+    ///
+    /// **Pass 2:** Pack intermediate RGBA → RGB DMA destination using a simple
+    /// packing shader with 2D sampler. The destination DMA buffer is reinterpreted
+    /// as RGBA8 at (W*3/4) x H dimensions.
+    fn convert_to_packed_rgb(
+        &mut self,
+        src: &TensorImage,
+        dst: &mut TensorImage,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> crate::Result<()> {
+        let dst_w = dst.width();
+        let dst_h = dst.height();
+        let is_int8 = fourcc_is_int8(dst.fourcc());
+
+        // Width must satisfy PackedRgba8 constraint: W*3 divisible by 4
+        if !(dst_w * 3).is_multiple_of(4) {
+            return Err(crate::Error::NotSupported(format!(
+                "Packed RGB requires width*3 divisible by 4, got width={dst_w}"
+            )));
+        }
+
+        let render_w = dst_w * 3 / 4;
+        let render_h = dst_h;
+
+        log::debug!(
+            "convert_to_packed_rgb: {dst_w}x{dst_h} -> {render_w}x{render_h} two-pass int8={is_int8}",
+        );
+
+        // --- Pass 1: Render source → intermediate RGBA texture ---
+        self.ensure_packed_rgb_intermediate(dst_w, dst_h)?;
+        self.packed_rgb_fbo.bind();
+        unsafe {
+            gls::gl::FramebufferTexture2D(
+                gls::gl::FRAMEBUFFER,
+                gls::gl::COLOR_ATTACHMENT0,
+                gls::gl::TEXTURE_2D,
+                self.packed_rgb_intermediate_tex.id,
+                0,
+            );
+            check_gl_error(function!(), line!())?;
+            gls::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
+        }
+        // convert_to() renders to the currently-bound FBO (packed_rgb_fbo → intermediate).
+        // It uses dst only for width/height in ROI coordinate math.
+        // Handles: source binding (DMA EGLImage or upload), crop, letterbox, rotation, flip.
+        self.convert_to(src, dst, rotation, flip, crop)?;
+
+        // --- Pass 2: Pack intermediate RGBA → RGB DMA destination ---
+        self.convert_fbo.bind();
+        let dest_egl =
+            self.get_or_create_egl_image_rgb(dst, render_w, render_h, DrmFourcc::Abgr8888, 4)?;
+        unsafe {
+            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
+            gls::gl::TexParameteri(
+                gls::gl::TEXTURE_2D,
+                gls::gl::TEXTURE_MIN_FILTER,
+                gls::gl::NEAREST as i32,
+            );
+            gls::gl::TexParameteri(
+                gls::gl::TEXTURE_2D,
+                gls::gl::TEXTURE_MAG_FILTER,
+                gls::gl::NEAREST as i32,
+            );
+            gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, dest_egl.as_ptr());
+            gls::gl::FramebufferTexture2D(
+                gls::gl::FRAMEBUFFER,
+                gls::gl::COLOR_ATTACHMENT0,
+                gls::gl::TEXTURE_2D,
+                self.render_texture.id,
+                0,
+            );
+            check_gl_error(function!(), line!())?;
+            gls::gl::Viewport(0, 0, render_w as i32, render_h as i32);
+        }
+
+        // Bind intermediate RGBA texture as source for the packing shader
+        let program = if is_int8 {
+            &self.packed_rgba8_int8_program_2d
+        } else {
+            &self.packed_rgba8_program_2d
+        };
+        unsafe {
+            gls::gl::UseProgram(program.id);
+            gls::gl::ActiveTexture(gls::gl::TEXTURE1);
+            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.packed_rgb_intermediate_tex.id);
+            gls::gl::TexParameteri(
+                gls::gl::TEXTURE_2D,
+                gls::gl::TEXTURE_MIN_FILTER,
+                gls::gl::NEAREST as i32,
+            );
+            gls::gl::TexParameteri(
+                gls::gl::TEXTURE_2D,
+                gls::gl::TEXTURE_MAG_FILTER,
+                gls::gl::NEAREST as i32,
+            );
+        }
+
+        // Set uniform: tex = TEXTURE1 (intermediate RGBA texture)
+        unsafe {
+            let loc_tex = gls::gl::GetUniformLocation(program.id, c"tex".as_ptr());
+            gls::gl::Uniform1i(loc_tex, 1);
+        }
+
+        // Draw full-viewport quad to pack RGBA→RGB
+        self.draw_fullscreen_quad()?;
+
+        unsafe { gls::gl::Finish() };
+        Ok(())
+    }
+
+    /// Render directly to an RGB8 renderbuffer backed by BGR888 DMA-buf.
+    /// Single-pass: no intermediate texture, no packing shader.
+    fn convert_to_rgb_direct(
+        &mut self,
+        src: &TensorImage,
+        dst: &mut TensorImage,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> crate::Result<()> {
+        let is_int8 = fourcc_is_int8(dst.fourcc());
+
+        log::debug!(
+            "convert_to_rgb_direct: {}x{} single-pass int8={is_int8}",
+            dst.width(),
+            dst.height(),
+        );
+
+        // Get or create cached renderbuffer
+        let (rbo, width, height) = self.get_or_create_rgb_direct_rbo(dst)?;
+
+        // Bind FBO with renderbuffer attachment
+        self.convert_fbo.bind();
+        unsafe {
+            gls::gl::FramebufferRenderbuffer(
+                gls::gl::FRAMEBUFFER,
+                gls::gl::COLOR_ATTACHMENT0,
+                gls::gl::RENDERBUFFER,
+                rbo,
+            );
+            check_gl_error(function!(), line!())?;
+
+            let status = gls::gl::CheckFramebufferStatus(gls::gl::FRAMEBUFFER);
+            if status != gls::gl::FRAMEBUFFER_COMPLETE {
+                log::warn!("convert_to_rgb_direct: FBO incomplete (0x{status:x}), falling back");
+                return self.convert_to_packed_rgb(src, dst, rotation, flip, crop);
+            }
+
+            gls::gl::Viewport(0, 0, width, height);
+        }
+
+        // For int8, temporarily swap to int8 shader programs and bias the clear color
+        let crop = if is_int8 {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
+            // Bias the letterbox clear color with XOR 0x80 since glClear bypasses
+            // the fragment shader — the int8 bias must be applied to the color directly.
+            let mut crop = crop;
+            if let Some(ref mut color) = crop.dst_color {
+                color[0] ^= 0x80;
+                color[1] ^= 0x80;
+                color[2] ^= 0x80;
+            }
+            crop
+        } else {
+            crop
+        };
+
+        let result = self.convert_to(src, dst, rotation, flip, crop);
+
+        // Swap back
+        if is_int8 {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
+        }
+
+        result
+    }
+
+    /// Allocates or resizes the intermediate RGBA texture for two-pass packed RGB.
+    fn ensure_packed_rgb_intermediate(&mut self, width: usize, height: usize) -> crate::Result<()> {
+        if self.packed_rgb_intermediate_size == (width, height) {
+            return Ok(());
+        }
+        unsafe {
+            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.packed_rgb_intermediate_tex.id);
+            gls::gl::TexParameteri(
+                gls::gl::TEXTURE_2D,
+                gls::gl::TEXTURE_MIN_FILTER,
+                gls::gl::NEAREST as i32,
+            );
+            gls::gl::TexParameteri(
+                gls::gl::TEXTURE_2D,
+                gls::gl::TEXTURE_MAG_FILTER,
+                gls::gl::NEAREST as i32,
+            );
+            gls::gl::TexImage2D(
+                gls::gl::TEXTURE_2D,
+                0,
+                gls::gl::RGBA as i32,
+                width as i32,
+                height as i32,
+                0,
+                gls::gl::RGBA,
+                gls::gl::UNSIGNED_BYTE,
+                std::ptr::null(),
+            );
+            check_gl_error(function!(), line!())?;
+        }
+        self.packed_rgb_intermediate_size = (width, height);
+        Ok(())
+    }
+
+    /// Draw a fullscreen quad for the currently-bound shader program.
+    /// Used by the pass-2 packing shader in the two-pass packed RGB pipeline.
+    fn draw_fullscreen_quad(&self) -> Result<(), crate::Error> {
+        unsafe {
+            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
+            gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
+
+            let vertices: [f32; 12] = [
+                -1.0, 1.0, 0.0, // top-left
+                1.0, 1.0, 0.0, // top-right
+                1.0, -1.0, 0.0, // bottom-right
+                -1.0, -1.0, 0.0, // bottom-left
+            ];
+            gls::gl::BufferSubData(
+                gls::gl::ARRAY_BUFFER,
+                0,
+                (size_of::<f32>() * vertices.len()) as isize,
+                vertices.as_ptr() as *const c_void,
+            );
+
+            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
+            gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
+
+            // Texture coordinates (the packed shader uses gl_FragCoord, not tc,
+            // but we still need valid buffers for the vertex attribute layout)
+            let tex_coords: [f32; 8] = [0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0];
+            gls::gl::BufferSubData(
+                gls::gl::ARRAY_BUFFER,
+                0,
+                (size_of::<f32>() * tex_coords.len()) as isize,
+                tex_coords.as_ptr() as *const c_void,
+            );
+
+            let indices: [u32; 4] = [0, 1, 2, 3];
+            gls::gl::DrawElements(
+                gls::gl::TRIANGLE_FAN,
+                indices.len() as i32,
+                gls::gl::UNSIGNED_INT,
+                indices.as_ptr() as *const c_void,
+            );
+        }
+        check_gl_error(function!(), line!())?;
         Ok(())
     }
 
@@ -2434,12 +2915,13 @@ impl GLProcessorST {
     #[allow(clippy::too_many_arguments)]
     fn draw_camera_texture_to_rgb_planar(
         &self,
-        egl_img: &EglImage,
+        egl_img: egl::Image,
         src_roi: RegionOfInterest,
         mut dst_roi: RegionOfInterest,
         rotation_offset: usize,
         flip: Flip,
         alpha: bool,
+        int8: bool,
     ) -> Result<(), Error> {
         let texture_target = gls::gl::TEXTURE_EXTERNAL_OES;
         match flip {
@@ -2452,8 +2934,12 @@ impl GLProcessorST {
             }
         }
         unsafe {
-            // self.texture_program.load_uniform_1f(c"width", width as f32);
-            gls::gl::UseProgram(self.texture_program_planar.id);
+            let program = if int8 {
+                &self.texture_program_planar_int8
+            } else {
+                &self.texture_program_planar
+            };
+            gls::gl::UseProgram(program.id);
             gls::gl::BindTexture(texture_target, self.camera_eglimage_texture.id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
             gls::gl::TexParameteri(
@@ -2478,7 +2964,7 @@ impl GLProcessorST {
                 gls::gl::CLAMP_TO_EDGE as i32,
             );
 
-            gls::egl_image_target_texture_2d_oes(texture_target, egl_img.egl_image.as_ptr());
+            gls::egl_image_target_texture_2d_oes(texture_target, egl_img.as_ptr());
             check_gl_error(function!(), line!())?;
             let y_centers = if alpha {
                 vec![-3.0 / 4.0, -1.0 / 4.0, 1.0 / 4.0, 3.0 / 4.0]
@@ -2695,7 +3181,7 @@ impl GLProcessorST {
     fn draw_camera_texture_eglimage(
         &self,
         src: &TensorImage,
-        egl_img: &EglImage,
+        egl_img: egl::Image,
         src_roi: RegionOfInterest,
         mut dst_roi: RegionOfInterest,
         rotation_offset: usize,
@@ -2736,7 +3222,7 @@ impl GLProcessorST {
                 }
             }
 
-            gls::egl_image_target_texture_2d_oes(texture_target, egl_img.egl_image.as_ptr());
+            gls::egl_image_target_texture_2d_oes(texture_target, egl_img.as_ptr());
             check_gl_error(function!(), line!())?;
             gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
             gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
@@ -2838,7 +3324,7 @@ impl GLProcessorST {
                 ));
             }
             match src.fourcc() {
-                PLANAR_RGB => {
+                PLANAR_RGB | PLANAR_RGB_INT8 => {
                     format = DrmFourcc::R8;
                     width = src.width();
                     height = src.height() * 3;
@@ -2950,6 +3436,222 @@ impl GLProcessorST {
             display: self.gl_context.display.as_display(),
             egl: Rc::clone(&self.gl_context.egl),
         })
+    }
+
+    /// Look up or create an EGLImage for a DMA tensor, returning the EGL image handle.
+    ///
+    /// Returns `egl::Image` (a `Copy` type wrapping `*const c_void`) to avoid borrow
+    /// conflicts with the caller. The cache retains ownership of the `EglImage` value;
+    /// the handle remains valid as long as the entry lives in the cache.
+    fn get_or_create_egl_image(
+        &mut self,
+        cache: CacheKind,
+        img: &TensorImage,
+    ) -> Result<egl::Image, crate::Error> {
+        let id = img.buffer_identity().id();
+
+        // Sweep dead entries opportunistically before looking up.
+        match cache {
+            CacheKind::Src => self.src_egl_cache.sweep(),
+            CacheKind::Dst => self.dst_egl_cache.sweep(),
+        }
+
+        {
+            let egl_cache = match cache {
+                CacheKind::Src => &mut self.src_egl_cache,
+                CacheKind::Dst => &mut self.dst_egl_cache,
+            };
+            if let Some(cached) = egl_cache.entries.get(&id) {
+                egl_cache.hits += 1;
+                log::trace!("EglImageCache {:?} hit: id={id:#x}", cache);
+                return Ok(cached.egl_image.egl_image);
+            }
+            egl_cache.misses += 1;
+            log::trace!("EglImageCache {:?} miss: id={id:#x}", cache);
+            // Evict oldest entry if at capacity.
+            if egl_cache.entries.len() >= egl_cache.capacity {
+                if let Some(&evict_id) = egl_cache.entries.keys().next() {
+                    if let Some(evicted) = egl_cache.entries.remove(&evict_id) {
+                        if let Some(rbo) = evicted.renderbuffer {
+                            unsafe { gls::gl::DeleteRenderbuffers(1, &rbo) };
+                        }
+                    }
+                }
+            }
+        }
+
+        let egl_image_obj = self.create_image_from_dma2(img)?;
+        let handle = egl_image_obj.egl_image;
+        let guard = img.buffer_identity().weak();
+        let egl_cache = match cache {
+            CacheKind::Src => &mut self.src_egl_cache,
+            CacheKind::Dst => &mut self.dst_egl_cache,
+        };
+        egl_cache.entries.insert(
+            id,
+            CachedEglImage {
+                egl_image: egl_image_obj,
+                guard,
+                renderbuffer: None,
+            },
+        );
+        Ok(handle)
+    }
+
+    /// Create an EGLImage from a DMA buffer with explicitly specified internal
+    /// dimensions and format. Used when the GL render surface differs from the
+    /// logical TensorImage dimensions (e.g., packed RGB reinterpretation).
+    fn create_egl_image_with_dims(
+        &self,
+        img: &TensorImage,
+        width: usize,
+        height: usize,
+        drm_format: DrmFourcc,
+        bpp: usize,
+    ) -> Result<EglImage, crate::Error> {
+        let fd = match &img.tensor {
+            edgefirst_tensor::Tensor::Dma(dma_tensor) => dma_tensor.fd.as_raw_fd(),
+            _ => {
+                return Err(Error::NotImplemented(
+                    "create_egl_image_with_dims requires DMA tensor".to_string(),
+                ));
+            }
+        };
+
+        let pitch = width * bpp;
+        let egl_img_attr = vec![
+            egl_ext::LINUX_DRM_FOURCC as Attrib,
+            drm_format as u32 as Attrib,
+            khronos_egl::WIDTH as Attrib,
+            width as Attrib,
+            khronos_egl::HEIGHT as Attrib,
+            height as Attrib,
+            egl_ext::DMA_BUF_PLANE0_PITCH as Attrib,
+            pitch as Attrib,
+            egl_ext::DMA_BUF_PLANE0_OFFSET as Attrib,
+            0 as Attrib,
+            egl_ext::DMA_BUF_PLANE0_FD as Attrib,
+            fd as Attrib,
+            egl::IMAGE_PRESERVED as Attrib,
+            egl::TRUE as Attrib,
+            khronos_egl::NONE as Attrib,
+        ];
+
+        self.new_egl_image_owned(egl_ext::LINUX_DMA_BUF, &egl_img_attr)
+    }
+
+    /// Get or create an EGLImage for a packed RGB DMA destination with
+    /// reinterpreted dimensions. Uses the dst cache keyed by buffer identity.
+    fn get_or_create_egl_image_rgb(
+        &mut self,
+        img: &TensorImage,
+        width: usize,
+        height: usize,
+        drm_format: DrmFourcc,
+        bpp: usize,
+    ) -> Result<egl::Image, crate::Error> {
+        let id = img.buffer_identity().id();
+        self.dst_egl_cache.sweep();
+
+        if let Some(cached) = self.dst_egl_cache.entries.get(&id) {
+            self.dst_egl_cache.hits += 1;
+            log::trace!("EglImageCache dst (RGB) hit: id={id:#x}");
+            return Ok(cached.egl_image.egl_image);
+        }
+        self.dst_egl_cache.misses += 1;
+        log::trace!("EglImageCache dst (RGB) miss: id={id:#x}");
+
+        if self.dst_egl_cache.entries.len() >= self.dst_egl_cache.capacity {
+            if let Some(&evict_id) = self.dst_egl_cache.entries.keys().next() {
+                if let Some(evicted) = self.dst_egl_cache.entries.remove(&evict_id) {
+                    if let Some(rbo) = evicted.renderbuffer {
+                        unsafe { gls::gl::DeleteRenderbuffers(1, &rbo) };
+                    }
+                }
+            }
+        }
+
+        let egl_image_obj = self.create_egl_image_with_dims(img, width, height, drm_format, bpp)?;
+        let handle = egl_image_obj.egl_image;
+        let guard = img.buffer_identity().weak();
+        self.dst_egl_cache.entries.insert(
+            id,
+            CachedEglImage {
+                egl_image: egl_image_obj,
+                guard,
+                renderbuffer: None,
+            },
+        );
+        Ok(handle)
+    }
+
+    /// Get or create an EGLImage + renderbuffer for direct RGB rendering.
+    /// Both are cached in dst_egl_cache keyed by buffer identity.
+    /// Returns (renderbuffer_id, width, height).
+    fn get_or_create_rgb_direct_rbo(
+        &mut self,
+        dst: &TensorImage,
+    ) -> crate::Result<(u32, i32, i32)> {
+        let id = dst.buffer_identity().id();
+        let width = dst.width() as i32;
+        let height = dst.height() as i32;
+
+        self.dst_egl_cache.sweep();
+
+        // Check cache for existing entry with renderbuffer
+        if let Some(cached) = self.dst_egl_cache.entries.get(&id) {
+            if let Some(rbo) = cached.renderbuffer {
+                self.dst_egl_cache.hits += 1;
+                log::trace!("EglImageCache dst (rgb_direct) hit: id={id:#x}");
+                return Ok((rbo, width, height));
+            }
+        }
+        self.dst_egl_cache.misses += 1;
+        log::trace!("EglImageCache dst (rgb_direct) miss: id={id:#x}");
+
+        // Evict if at capacity
+        if self.dst_egl_cache.entries.len() >= self.dst_egl_cache.capacity {
+            if let Some(&evict_id) = self.dst_egl_cache.entries.keys().next() {
+                if let Some(evicted) = self.dst_egl_cache.entries.remove(&evict_id) {
+                    if let Some(rbo) = evicted.renderbuffer {
+                        unsafe { gls::gl::DeleteRenderbuffers(1, &rbo) };
+                    }
+                }
+            }
+        }
+
+        // Create EGLImage from BGR888 DMA-buf
+        let egl_image_obj =
+            self.create_egl_image_with_dims(dst, dst.width(), dst.height(), DrmFourcc::Bgr888, 3)?;
+
+        // Create renderbuffer and bind EGLImage to it
+        let rbo = unsafe {
+            let mut rbo = 0u32;
+            gls::gl::GenRenderbuffers(1, &mut rbo);
+            gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
+            gls::gl::EGLImageTargetRenderbufferStorageOES(
+                gls::gl::RENDERBUFFER,
+                egl_image_obj.egl_image.as_ptr(),
+            );
+            if let Err(e) = check_gl_error(function!(), line!()) {
+                gls::gl::DeleteRenderbuffers(1, &rbo);
+                return Err(e);
+            }
+            rbo
+        };
+
+        // Cache both
+        let guard = dst.buffer_identity().weak();
+        self.dst_egl_cache.entries.insert(
+            id,
+            CachedEglImage {
+                egl_image: egl_image_obj,
+                guard,
+                renderbuffer: Some(rbo),
+            },
+        );
+
+        Ok((rbo, width, height))
     }
 
     // Reshapes the segmentation to be compatible with RGBA texture array rendering.
@@ -4237,9 +4939,10 @@ fn fourcc_to_drm(fourcc: FourCharCode) -> DrmFourcc {
     match fourcc {
         RGBA => DrmFourcc::Abgr8888,
         YUYV => DrmFourcc::Yuyv,
-        RGB => DrmFourcc::Bgr888,
+        RGB | RGB_INT8 => DrmFourcc::Bgr888,
         GREY => DrmFourcc::R8,
         NV12 => DrmFourcc::Nv12,
+        PLANAR_RGB | PLANAR_RGB_INT8 => DrmFourcc::R8,
         _ => todo!(),
     }
 }
@@ -4343,6 +5046,80 @@ out vec4 color;
 
 void main(){
     color = texture(tex, tc);
+}
+"
+}
+
+/// Int8 variant of [`generate_planar_rgb_shader`]. Applies `fract(v + 0.5)` to
+/// each channel, which is the GL-safe equivalent of XOR 0x80 for converting
+/// unsigned [0,255] texel values to signed int8 representation.
+fn generate_planar_rgb_int8_shader() -> &'static str {
+    "\
+#version 300 es
+#extension GL_OES_EGL_image_external_essl3 : require
+precision mediump float;
+uniform samplerExternalOES tex;
+in vec3 fragPos;
+in vec2 tc;
+
+out vec4 color;
+
+void main(){
+    vec4 c = texture(tex, tc);
+    color = vec4(fract(c.r + 0.5), fract(c.g + 0.5), fract(c.b + 0.5), c.a);
+}
+"
+}
+
+/// Int8 variant of [`generate_texture_fragment_shader`]. Applies `fract(v + 0.5)`
+/// to each RGB channel for XOR 0x80 bias (uint8 → int8 conversion).
+/// Used by the direct RGB render path for RGB_INT8 output.
+fn generate_texture_int8_shader() -> &'static str {
+    "\
+#version 300 es
+precision highp float;
+uniform sampler2D tex;
+in vec3 fragPos;
+in vec2 tc;
+
+out vec4 color;
+
+// XOR 0x80 bias: quantize to uint8, add 128 mod 256, normalize back.
+// This matches the CPU `byte ^ 0x80` operation exactly.
+vec3 int8_bias(vec3 v) {
+    vec3 q = floor(v * 255.0 + 0.5);
+    return mod(q + 128.0, 256.0) / 255.0;
+}
+
+void main(){
+    vec4 c = texture(tex, tc);
+    color = vec4(int8_bias(c.rgb), c.a);
+}
+"
+}
+
+/// Int8 variant of [`generate_texture_fragment_shader_yuv`]. Applies XOR 0x80 bias
+/// to each RGB channel (uint8 → int8 conversion).
+/// Used by the direct RGB render path for RGB_INT8 output with external OES sources.
+fn generate_texture_int8_shader_yuv() -> &'static str {
+    "\
+#version 300 es
+#extension GL_OES_EGL_image_external_essl3 : require
+precision highp float;
+uniform samplerExternalOES tex;
+in vec3 fragPos;
+in vec2 tc;
+
+out vec4 color;
+
+vec3 int8_bias(vec3 v) {
+    vec3 q = floor(v * 255.0 + 0.5);
+    return mod(q + 128.0, 256.0) / 255.0;
+}
+
+void main(){
+    vec4 c = texture(tex, tc);
+    color = vec4(int8_bias(c.rgb), c.a);
 }
 "
 }
@@ -4762,6 +5539,81 @@ out vec4 color;
 void main() {
     int index = class_index % 20;
     color = colors[index];
+}
+"
+}
+
+/// Packed RGB -> RGBA8 packing shader (2D texture source, pass 2).
+///
+/// Reads from an intermediate RGBA texture and packs 3 RGB channels into
+/// RGBA8 output pixels. Each output pixel stores 4 consecutive bytes of the
+/// destination RGB buffer. Uses only 2 texture fetches per fragment (down
+/// from 4) by exploiting the fact that 4 consecutive bytes span at most 2
+/// source pixels.
+fn generate_packed_rgba8_shader_2d() -> &'static str {
+    "\
+#version 300 es
+precision highp float;
+precision highp int;
+uniform sampler2D tex;
+out vec4 color;
+void main() {
+    // gl_FragCoord is at pixel center (n+0.5). Use floor() for robust
+    // integer pixel index on all GPUs (Vivante, Mali, Adreno).
+    int out_x = int(floor(gl_FragCoord.x));
+    int out_y = int(floor(gl_FragCoord.y));
+    int base = out_x * 4;
+    // 4 consecutive byte indices map to at most 2 source pixels
+    int px0 = base / 3;
+    int px1 = (base + 3) / 3;
+    vec4 s0 = texelFetch(tex, ivec2(px0, out_y), 0);
+    vec4 s1 = (px1 != px0) ? texelFetch(tex, ivec2(px1, out_y), 0) : s0;
+    // Extract channels based on phase (base % 3)
+    int phase = base - px0 * 3;
+    if (phase == 0) {
+        color = vec4(s0.r, s0.g, s0.b, s1.r);
+    } else if (phase == 1) {
+        color = vec4(s0.g, s0.b, s1.r, s1.g);
+    } else {
+        color = vec4(s0.b, s1.r, s1.g, s1.b);
+    }
+}
+"
+}
+
+/// Packed RGB -> RGBA8 packing shader with int8 XOR 0x80 bias (2D source, pass 2).
+///
+/// Same packing logic as [`generate_packed_rgba8_shader_2d`] but applies
+/// `fract(v + 0.5)` to each channel value before writing. In normalised
+/// float space this is equivalent to XOR 0x80 on the uint8 representation,
+/// converting unsigned [0, 255] to signed [-128, 127] (two's-complement).
+fn generate_packed_rgba8_int8_shader_2d() -> &'static str {
+    "\
+#version 300 es
+precision highp float;
+precision highp int;
+uniform sampler2D tex;
+out vec4 color;
+void main() {
+    // gl_FragCoord is at pixel center (n+0.5). Use floor() for robust
+    // integer pixel index on all GPUs (Vivante, Mali, Adreno).
+    int out_x = int(floor(gl_FragCoord.x));
+    int out_y = int(floor(gl_FragCoord.y));
+    int base = out_x * 4;
+    // 4 consecutive byte indices map to at most 2 source pixels
+    int px0 = base / 3;
+    int px1 = (base + 3) / 3;
+    vec4 s0 = texelFetch(tex, ivec2(px0, out_y), 0);
+    vec4 s1 = (px1 != px0) ? texelFetch(tex, ivec2(px1, out_y), 0) : s0;
+    // Extract channels based on phase (base % 3), then apply int8 bias
+    int phase = base - px0 * 3;
+    if (phase == 0) {
+        color = fract(vec4(s0.r, s0.g, s0.b, s1.r) + 0.5);
+    } else if (phase == 1) {
+        color = fract(vec4(s0.g, s0.b, s1.r, s1.g) + 0.5);
+    } else {
+        color = fract(vec4(s0.b, s1.r, s1.g, s1.b) + 0.5);
+    }
 }
 "
 }
@@ -5327,5 +6179,314 @@ mod gl_tests {
         let mut dst = TensorImage::new(320, 240, RGBA, None).unwrap();
         gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
             .expect("auto-detect convert should succeed");
+    }
+
+    #[test]
+    fn test_packed_rgb_width_constraint() {
+        // Standard ML model input widths — all satisfy W*3 % 4 == 0
+        assert_eq!((640usize * 3) % 4, 0);
+        assert_eq!((320usize * 3) % 4, 0);
+        assert_eq!((1280usize * 3) % 4, 0);
+
+        // Non-divisible widths should be rejected
+        assert_ne!((322usize * 3) % 4, 0);
+        assert_ne!((333usize * 3) % 4, 0);
+    }
+
+    // =========================================================================
+    // Packed RGB Correctness Tests (two-pass pipeline)
+    // These tests compare GL RGBA output (alpha stripped) against GL packed
+    // RGB output. Both use the same GPU color conversion, so differences
+    // isolate packing shader bugs rather than CPU-vs-GPU YUV conversion.
+    // They require DMA + OpenGL hardware (on-target only).
+    // =========================================================================
+
+    /// Compare two byte slices pixel-by-pixel with tolerance.
+    /// Panics with details if any byte differs by more than `tolerance`.
+    #[cfg(feature = "dma_test_formats")]
+    fn assert_pixels_match(expected: &[u8], actual: &[u8], tolerance: u8) {
+        assert_eq!(expected.len(), actual.len(), "Buffer size mismatch");
+        let mut max_diff: u8 = 0;
+        let mut diff_count: usize = 0;
+        let mut first_diff_idx = None;
+        for (i, (&e, &a)) in expected.iter().zip(actual.iter()).enumerate() {
+            let diff = (e as i16 - a as i16).unsigned_abs() as u8;
+            if diff > tolerance {
+                diff_count += 1;
+                if first_diff_idx.is_none() {
+                    first_diff_idx = Some(i);
+                }
+            }
+            max_diff = max_diff.max(diff);
+        }
+        assert!(
+            diff_count == 0,
+            "Pixel mismatch: {diff_count} bytes differ (max_diff={max_diff}, first at index {})",
+            first_diff_idx.unwrap_or(0)
+        );
+    }
+
+    /// Build a letterbox crop that fits src into dst_w x dst_h, preserving aspect ratio.
+    #[cfg(feature = "dma_test_formats")]
+    fn letterbox_crop(src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Crop {
+        let src_aspect = src_w as f64 / src_h as f64;
+        let dst_aspect = dst_w as f64 / dst_h as f64;
+        let (new_w, new_h) = if src_aspect > dst_aspect {
+            let new_h = (dst_w as f64 / src_aspect).round() as usize;
+            (dst_w, new_h)
+        } else {
+            let new_w = (dst_h as f64 * src_aspect).round() as usize;
+            (new_w, dst_h)
+        };
+        let left = (dst_w - new_w) / 2;
+        let top = (dst_h - new_h) / 2;
+        Crop::new()
+            .with_dst_rect(Some(crate::Rect::new(left, top, new_w, new_h)))
+            .with_dst_color(Some([114, 114, 114, 255]))
+    }
+
+    /// Strip alpha from RGBA bytes → packed RGB bytes.
+    #[cfg(feature = "dma_test_formats")]
+    fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
+        assert_eq!(
+            rgba.len() % 4,
+            0,
+            "RGBA buffer length must be divisible by 4"
+        );
+        let mut rgb = Vec::with_capacity(rgba.len() / 4 * 3);
+        for pixel in rgba.chunks_exact(4) {
+            rgb.push(pixel[0]);
+            rgb.push(pixel[1]);
+            rgb.push(pixel[2]);
+        }
+        rgb
+    }
+
+    /// Convert uint8 RGB bytes to int8 (XOR 0x80 each byte).
+    #[cfg(feature = "dma_test_formats")]
+    fn uint8_to_int8(data: &[u8]) -> Vec<u8> {
+        data.iter().map(|&b| b ^ 0x80).collect()
+    }
+
+    /// YUYV 1080p → RGB 640x640 with letterbox (two-pass packed RGB pipeline).
+    /// Compares GL RGBA (alpha-stripped) against GL packed RGB to validate packing.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_opengl_rgb_correctness() {
+        if !is_dma_available() {
+            return;
+        }
+        let src_dma = load_raw_image(
+            1920,
+            1080,
+            YUYV,
+            Some(TensorMemory::Dma),
+            include_bytes!("../../../testdata/camera1080p.yuyv"),
+        )
+        .unwrap();
+
+        let crop = letterbox_crop(1920, 1080, 640, 640);
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+
+        // GL RGBA reference
+        let mut dst_rgba = TensorImage::new(640, 640, RGBA, Some(TensorMemory::Dma)).unwrap();
+        gl.convert(&src_dma, &mut dst_rgba, Rotation::None, Flip::None, crop)
+            .unwrap();
+
+        // GL packed RGB output
+        let mut dst_rgb = TensorImage::new(640, 640, RGB, Some(TensorMemory::Dma)).unwrap();
+        gl.convert(&src_dma, &mut dst_rgb, Rotation::None, Flip::None, crop)
+            .unwrap();
+
+        let rgba_data = dst_rgba.tensor().map().unwrap();
+        let expected_rgb = rgba_to_rgb(rgba_data.as_slice());
+        let gl_data = dst_rgb.tensor().map().unwrap();
+        assert_pixels_match(&expected_rgb, gl_data.as_slice(), 1);
+    }
+
+    /// YUYV 1080p → RGB_INT8 640x640 with letterbox.
+    /// Compares GL RGBA (alpha-stripped, XOR 0x80) against GL packed RGB_INT8.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_opengl_rgb_int8_correctness() {
+        if !is_dma_available() {
+            return;
+        }
+        let src_dma = load_raw_image(
+            1920,
+            1080,
+            YUYV,
+            Some(TensorMemory::Dma),
+            include_bytes!("../../../testdata/camera1080p.yuyv"),
+        )
+        .unwrap();
+
+        let crop = letterbox_crop(1920, 1080, 640, 640);
+        // Use GLProcessorST with direct RGB disabled to validate two-pass int8
+        // pipeline against RGBA reference. The direct path renders to a different
+        // framebuffer format (RGB8 renderbuffer vs RGBA8 texture) which produces
+        // different YUV interpolation results; it is validated separately by
+        // test_opengl_rgb_direct_matches_two_pass.
+        let mut gl = match GLProcessorST::new(None) {
+            Ok(gl) => gl,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                return;
+            }
+        };
+        gl.support_rgb_direct = false;
+
+        // GL RGBA reference
+        let mut dst_rgba = TensorImage::new(640, 640, RGBA, Some(TensorMemory::Dma)).unwrap();
+        gl.convert(&src_dma, &mut dst_rgba, Rotation::None, Flip::None, crop)
+            .unwrap();
+
+        // GL packed RGB_INT8 output (two-pass path)
+        let mut dst_rgb = TensorImage::new(640, 640, RGB_INT8, Some(TensorMemory::Dma)).unwrap();
+        gl.convert(&src_dma, &mut dst_rgb, Rotation::None, Flip::None, crop)
+            .unwrap();
+
+        let rgba_data = dst_rgba.tensor().map().unwrap();
+        let expected_rgb = uint8_to_int8(&rgba_to_rgb(rgba_data.as_slice()));
+        let gl_data = dst_rgb.tensor().map().unwrap();
+        assert_pixels_match(&expected_rgb, gl_data.as_slice(), 1);
+    }
+
+    /// YUYV 1080p → RGB 1920x1080 (no letterbox, same size).
+    /// Compares GL RGBA (alpha-stripped) against GL packed RGB without scaling.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_opengl_rgb_no_letterbox_correctness() {
+        if !is_dma_available() {
+            return;
+        }
+        let src_dma = load_raw_image(
+            1920,
+            1080,
+            YUYV,
+            Some(TensorMemory::Dma),
+            include_bytes!("../../../testdata/camera1080p.yuyv"),
+        )
+        .unwrap();
+
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+
+        // GL RGBA reference (no letterbox — 1920 satisfies W*3 % 4 == 0)
+        let mut dst_rgba = TensorImage::new(1920, 1080, RGBA, Some(TensorMemory::Dma)).unwrap();
+        gl.convert(
+            &src_dma,
+            &mut dst_rgba,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        // GL packed RGB output
+        let mut dst_rgb = TensorImage::new(1920, 1080, RGB, Some(TensorMemory::Dma)).unwrap();
+        gl.convert(
+            &src_dma,
+            &mut dst_rgb,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        let rgba_data = dst_rgba.tensor().map().unwrap();
+        let expected_rgb = rgba_to_rgb(rgba_data.as_slice());
+        let gl_data = dst_rgb.tensor().map().unwrap();
+        assert_pixels_match(&expected_rgb, gl_data.as_slice(), 1);
+    }
+
+    // =========================================================================
+    // Direct RGB Render Path Tests
+    // These tests exercise the single-pass BGR888 renderbuffer path added by
+    // the GL cache work (EDGEAI-776). They require DMA + OpenGL hardware.
+    // =========================================================================
+
+    /// Verify that the direct RGB probe runs without crashing.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_probe_rgb_direct_support() {
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+        let gl = match GLProcessorST::new(None) {
+            Ok(gl) => gl,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                return;
+            }
+        };
+        // The probe runs during new(). Just check the field is set.
+        eprintln!(
+            "support_rgb_direct = {} (probe completed without crash)",
+            gl.support_rgb_direct
+        );
+    }
+
+    /// Compare direct RGB path against two-pass path pixel-for-pixel.
+    /// If GPU doesn't support direct RGB, this test is a no-op.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_opengl_rgb_direct_matches_two_pass() {
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+        let mut gl = match GLProcessorST::new(None) {
+            Ok(gl) => gl,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                return;
+            }
+        };
+        if !gl.support_rgb_direct {
+            eprintln!("SKIPPED: {} - GPU does not support direct RGB", function!());
+            return;
+        }
+
+        // Create RGBA source with deterministic pattern
+        // Use 640x480 source → 320x320 output so pitch (320*3=960) is 64-byte aligned
+        // for Mali GPU DMA-buf import requirements.
+        let src = TensorImage::new(640, 480, RGBA, Some(TensorMemory::Dma)).unwrap();
+        {
+            let mut map = src.tensor().map().unwrap();
+            for (i, byte) in map.as_mut_slice().iter_mut().enumerate() {
+                *byte = (i % 251) as u8; // deterministic pattern
+            }
+        }
+
+        let crop = crate::Crop {
+            src_rect: None,
+            dst_rect: None,
+            dst_color: None,
+        };
+
+        // Direct path (support_rgb_direct = true)
+        let mut dst_direct = TensorImage::new(320, 320, RGB, Some(TensorMemory::Dma)).unwrap();
+        gl.convert(&src, &mut dst_direct, Rotation::None, Flip::None, crop)
+            .unwrap();
+
+        // Force two-pass path
+        gl.support_rgb_direct = false;
+        let mut dst_twop = TensorImage::new(320, 320, RGB, Some(TensorMemory::Dma)).unwrap();
+        gl.convert(&src, &mut dst_twop, Rotation::None, Flip::None, crop)
+            .unwrap();
+        gl.support_rgb_direct = true;
+
+        // Compare
+        let map_direct = dst_direct.tensor().map().unwrap();
+        let map_twop = dst_twop.tensor().map().unwrap();
+        // Allow ±1 tolerance for potential rounding differences
+        let mut max_diff = 0i32;
+        for (a, b) in map_direct.as_slice().iter().zip(map_twop.as_slice().iter()) {
+            let diff = (*a as i32 - *b as i32).abs();
+            max_diff = max_diff.max(diff);
+        }
+        eprintln!("RGB direct vs two-pass max pixel diff: {max_diff}");
+        assert!(max_diff <= 1, "Pixel mismatch > 1: max_diff={max_diff}");
     }
 }

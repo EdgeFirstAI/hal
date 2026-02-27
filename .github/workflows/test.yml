@@ -205,7 +205,7 @@ jobs:
           # Run tests but don't generate report yet - we'll combine with Python test coverage
           # Use default,opencv features; exclude g2d_test_formats,dma_test_formats (on-target only)
           cargo llvm-cov nextest --cargo-profile profiling --features default,opencv --workspace \
-            --no-report \
+            --no-report -j 1 \
             2>&1 | tee target/test-metrics-rust-x86_64.txt
 
       - name: Build C API library
@@ -330,7 +330,7 @@ jobs:
       - name: Run Rust tests
         run: |
           set -o pipefail
-          cargo nextest run --workspace --exclude gpu-probe --exclude edgefirst-bench 2>&1 | tee target/test-metrics-rust-macos.txt
+          cargo nextest run --workspace -j 1 --exclude gpu-probe --exclude edgefirst-bench 2>&1 | tee target/test-metrics-rust-macos.txt
 
       - name: Build C API library
         run: cargo build --release -p edgefirst-hal-capi
