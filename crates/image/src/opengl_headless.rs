@@ -143,10 +143,7 @@ fn probe_display_extensions(egl: &Egl, display: egl::Display) -> bool {
     };
     let exts = ext_str.to_string_lossy();
 
-    let required = [
-        "EGL_KHR_surfaceless_context",
-        "EGL_KHR_no_config_context",
-    ];
+    let required = ["EGL_KHR_surfaceless_context", "EGL_KHR_no_config_context"];
 
     for r in &required {
         if !exts.contains(r) {
@@ -716,6 +713,61 @@ enum GLProcessorMessage {
         usize,
         tokio::sync::oneshot::Sender<Result<Vec<MaskResult>, Error>>,
     ),
+    PboCreate(
+        usize, // buffer size in bytes
+        tokio::sync::oneshot::Sender<Result<u32, Error>>,
+    ),
+    PboMap(
+        u32,   // buffer_id
+        usize, // size
+        tokio::sync::oneshot::Sender<Result<edgefirst_tensor::PboMapping, Error>>,
+    ),
+    PboUnmap(
+        u32, // buffer_id
+        tokio::sync::oneshot::Sender<Result<(), Error>>,
+    ),
+    PboDelete(u32), // fire-and-forget, no reply
+}
+
+/// Implements PboOps by sending commands to the GL thread.
+struct GlPboOps {
+    sender: Sender<GLProcessorMessage>,
+}
+
+impl edgefirst_tensor::PboOps for GlPboOps {
+    fn map_buffer(
+        &self,
+        buffer_id: u32,
+        size: usize,
+    ) -> edgefirst_tensor::Result<edgefirst_tensor::PboMapping> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.sender
+            .blocking_send(GLProcessorMessage::PboMap(buffer_id, size, tx))
+            .map_err(|_| edgefirst_tensor::Error::PboDisconnected)?;
+        rx.blocking_recv()
+            .map_err(|_| edgefirst_tensor::Error::PboDisconnected)?
+            .map_err(|e| {
+                edgefirst_tensor::Error::NotImplemented(format!("GL PBO map failed: {e:?}"))
+            })
+    }
+
+    fn unmap_buffer(&self, buffer_id: u32) -> edgefirst_tensor::Result<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.sender
+            .blocking_send(GLProcessorMessage::PboUnmap(buffer_id, tx))
+            .map_err(|_| edgefirst_tensor::Error::PboDisconnected)?;
+        rx.blocking_recv()
+            .map_err(|_| edgefirst_tensor::Error::PboDisconnected)?
+            .map_err(|e| {
+                edgefirst_tensor::Error::NotImplemented(format!("GL PBO unmap failed: {e:?}"))
+            })
+    }
+
+    fn delete_buffer(&self, buffer_id: u32) {
+        let _ = self
+            .sender
+            .blocking_send(GLProcessorMessage::PboDelete(buffer_id));
+    }
 }
 
 /// OpenGL multi-threaded image converter. The actual conversion is done in a
@@ -813,6 +865,62 @@ impl GLProcessorThreaded {
                         );
                         let _ = resp.send(res);
                     }
+                    GLProcessorMessage::PboCreate(size, resp) => {
+                        let result = unsafe {
+                            let mut id: u32 = 0;
+                            gls::gl::GenBuffers(1, &mut id);
+                            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, id);
+                            gls::gl::BufferData(
+                                gls::gl::PIXEL_PACK_BUFFER,
+                                size as isize,
+                                std::ptr::null(),
+                                gls::gl::STREAM_COPY,
+                            );
+                            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+                            match check_gl_error("PboCreate", 0) {
+                                Ok(()) => Ok(id),
+                                Err(e) => {
+                                    gls::gl::DeleteBuffers(1, &id);
+                                    Err(e)
+                                }
+                            }
+                        };
+                        let _ = resp.send(result);
+                    }
+                    GLProcessorMessage::PboMap(buffer_id, size, resp) => {
+                        let result = unsafe {
+                            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, buffer_id);
+                            let ptr = gls::gl::MapBufferRange(
+                                gls::gl::PIXEL_PACK_BUFFER,
+                                0,
+                                size as isize,
+                                gls::gl::MAP_READ_BIT | gls::gl::MAP_WRITE_BIT,
+                            );
+                            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+                            if ptr.is_null() {
+                                Err(crate::Error::OpenGl(
+                                    "glMapBufferRange returned null".to_string(),
+                                ))
+                            } else {
+                                Ok(edgefirst_tensor::PboMapping {
+                                    ptr: ptr as *mut u8,
+                                    size,
+                                })
+                            }
+                        };
+                        let _ = resp.send(result);
+                    }
+                    GLProcessorMessage::PboUnmap(buffer_id, resp) => {
+                        unsafe {
+                            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, buffer_id);
+                            gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
+                            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+                        }
+                        let _ = resp.send(Ok(()));
+                    }
+                    GLProcessorMessage::PboDelete(buffer_id) => unsafe {
+                        gls::gl::DeleteBuffers(1, &buffer_id);
+                    },
                 }
             }
         };
@@ -1037,6 +1145,56 @@ impl GLProcessorThreaded {
         resp_recv.blocking_recv().map_err(|_| {
             Error::Internal("GL converter error messaging closed without update".to_string())
         })?
+    }
+
+    /// Create a PBO-backed TensorImage on the GL thread.
+    pub fn create_pbo_image(
+        &self,
+        width: usize,
+        height: usize,
+        fourcc: four_char_code::FourCharCode,
+    ) -> Result<crate::TensorImage, Error> {
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or(Error::OpenGl("GL processor is shutting down".to_string()))?;
+
+        let channels = crate::fourcc_channels(fourcc)?;
+        let size = width * height * channels;
+        if size == 0 {
+            return Err(Error::OpenGl("Invalid image dimensions".to_string()));
+        }
+
+        // Allocate PBO on the GL thread
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        sender
+            .blocking_send(GLProcessorMessage::PboCreate(size, tx))
+            .map_err(|_| Error::OpenGl("GL thread channel closed".to_string()))?;
+        let buffer_id = rx
+            .blocking_recv()
+            .map_err(|_| Error::OpenGl("GL thread did not respond".to_string()))??;
+
+        let ops: std::sync::Arc<dyn edgefirst_tensor::PboOps> = std::sync::Arc::new(GlPboOps {
+            sender: sender.clone(),
+        });
+
+        let shape = if crate::fourcc_planar(fourcc)? {
+            vec![channels, height, width]
+        } else {
+            vec![height, width, channels]
+        };
+
+        let pbo_tensor =
+            edgefirst_tensor::PboTensor::<u8>::from_pbo(buffer_id, size, &shape, None, ops);
+        let tensor = edgefirst_tensor::Tensor::Pbo(pbo_tensor);
+        crate::TensorImage::from_tensor(tensor, fourcc)
+            .map_err(|e| Error::OpenGl(format!("Failed to wrap PBO tensor as image: {e:?}")))
+    }
+
+    /// Returns the active transfer backend.
+    #[allow(dead_code)]
+    pub(crate) fn transfer_backend(&self) -> TransferBackend {
+        self.transfer_backend
     }
 }
 
@@ -1672,12 +1830,8 @@ impl GLProcessorST {
 
         // Verify DMA-buf actually works (catches NVIDIA discrete GPUs where
         // EGLImage creation succeeds but rendered data is all zeros)
-        if converter.gl_context.transfer_backend.is_dma()
-            && !converter.verify_dma_buf_roundtrip()
-        {
-            log::info!(
-                "DMA-buf verification failed — falling back to synchronous transfers"
-            );
+        if converter.gl_context.transfer_backend.is_dma() && !converter.verify_dma_buf_roundtrip() {
+            log::info!("DMA-buf verification failed — falling back to synchronous transfers");
             converter.gl_context.transfer_backend = TransferBackend::Sync;
             // RGB direct rendering also requires DMA, so disable it
             converter.support_rgb_direct = false;
@@ -1821,13 +1975,9 @@ impl GLProcessorST {
         };
 
         // Run the full DMA-buf EGLImage render pipeline
-        if let Err(e) = self.convert_dest_dma(
-            &mut dst,
-            &src,
-            Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
-        ) {
+        if let Err(e) =
+            self.convert_dest_dma(&mut dst, &src, Rotation::None, Flip::None, Crop::no_crop())
+        {
             log::info!("verify_dma_buf_roundtrip: convert_dest_dma failed: {e}");
             return false;
         }
@@ -2296,9 +2446,7 @@ impl GLProcessorST {
                 .to_string()
         };
         log::debug!("GL Extensions: {extensions}");
-        let required_ext = [
-            "GL_OES_EGL_image_external_essl3",
-        ];
+        let required_ext = ["GL_OES_EGL_image_external_essl3"];
         let extensions = extensions.split_ascii_whitespace().collect::<BTreeSet<_>>();
         for required in required_ext {
             if !extensions.contains(required) {
@@ -3480,6 +3628,11 @@ impl GLProcessorST {
             edgefirst_tensor::Tensor::Mem(_) => {
                 return Err(Error::NotImplemented(
                     "OpenGL EGLImage doesn't support MEM".to_string(),
+                ));
+            }
+            edgefirst_tensor::Tensor::Pbo(_) => {
+                return Err(Error::NotImplemented(
+                    "OpenGL EGLImage doesn't support PBO".to_string(),
                 ));
             }
         };
