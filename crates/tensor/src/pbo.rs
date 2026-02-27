@@ -309,3 +309,134 @@ where
         self.unmap();
     }
 }
+
+impl<T> Clone for PboTensor<T>
+where
+    T: Num + Clone + fmt::Debug + Send + Sync,
+{
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            shape: self.shape.clone(),
+            handle: Arc::clone(&self.handle),
+            identity: self.identity.clone(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mock PboOps that uses a Vec<u8> as backing storage instead of GL.
+    struct MockPboOps {
+        storage: Mutex<Vec<u8>>,
+    }
+
+    impl MockPboOps {
+        fn new(size: usize) -> Arc<Self> {
+            Arc::new(Self {
+                storage: Mutex::new(vec![0u8; size]),
+            })
+        }
+    }
+
+    impl PboOps for MockPboOps {
+        fn map_buffer(&self, _buffer_id: u32, size: usize) -> Result<PboMapping> {
+            let storage = self.storage.lock().expect("lock");
+            assert_eq!(storage.len(), size);
+            Ok(PboMapping {
+                ptr: storage.as_ptr() as *mut u8,
+                size,
+            })
+        }
+
+        fn unmap_buffer(&self, _buffer_id: u32) -> Result<()> {
+            Ok(())
+        }
+
+        fn delete_buffer(&self, _buffer_id: u32) {}
+    }
+
+    #[test]
+    fn test_pbo_tensor_create_and_metadata() {
+        let ops = MockPboOps::new(24);
+        let tensor = PboTensor::<u8>::from_pbo(42, 24, &[2, 3, 4], Some("test_pbo"), ops);
+        assert_eq!(tensor.memory(), TensorMemory::Pbo);
+        assert_eq!(tensor.name(), "test_pbo");
+        assert_eq!(tensor.shape(), &[2, 3, 4]);
+        assert_eq!(tensor.buffer_id(), 42);
+        assert!(!tensor.is_mapped());
+    }
+
+    #[test]
+    fn test_pbo_tensor_map_write_read() {
+        let ops = MockPboOps::new(12);
+        let tensor = PboTensor::<u8>::from_pbo(1, 12, &[3, 4], Some("rw_test"), ops);
+        {
+            let mut map = tensor.map().expect("map should succeed");
+            assert_eq!(map.shape(), &[3, 4]);
+            assert!(tensor.is_mapped());
+            map.as_mut_slice().fill(0xAB);
+            assert!(map.as_slice().iter().all(|&b| b == 0xAB));
+        }
+        assert!(!tensor.is_mapped());
+    }
+
+    #[test]
+    fn test_pbo_tensor_double_map_fails() {
+        let ops = MockPboOps::new(8);
+        let tensor = PboTensor::<u8>::from_pbo(2, 8, &[8], None, ops);
+        let _map1 = tensor.map().expect("first map should succeed");
+        assert!(tensor.is_mapped());
+        let result = tensor.map();
+        assert!(result.is_err(), "second map while mapped should fail");
+    }
+
+    #[test]
+    fn test_pbo_tensor_reshape() {
+        let ops = MockPboOps::new(24);
+        let mut tensor = PboTensor::<u8>::from_pbo(3, 24, &[2, 3, 4], None, ops);
+        tensor.reshape(&[4, 6]).expect("compatible reshape should succeed");
+        assert_eq!(tensor.shape(), &[4, 6]);
+        let result = tensor.reshape(&[100]);
+        assert!(result.is_err(), "incompatible reshape should fail");
+    }
+
+    #[test]
+    fn test_pbo_tensor_buffer_identity() {
+        let ops1 = MockPboOps::new(8);
+        let ops2 = MockPboOps::new(8);
+        let t1 = PboTensor::<u8>::from_pbo(1, 8, &[8], None, ops1);
+        let t2 = PboTensor::<u8>::from_pbo(2, 8, &[8], None, ops2);
+        assert_ne!(t1.buffer_identity().id(), t2.buffer_identity().id());
+    }
+
+    #[test]
+    fn test_pbo_tensor_new_returns_error() {
+        let result = PboTensor::<u8>::new(&[8], None);
+        assert!(result.is_err(), "PboTensor::new() should fail");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_pbo_tensor_fd_ops_return_error() {
+        let ops = MockPboOps::new(8);
+        let tensor = PboTensor::<u8>::from_pbo(1, 8, &[8], None, ops);
+        assert!(tensor.clone_fd().is_err());
+    }
+
+    #[test]
+    fn test_pbo_via_tensor_enum() {
+        let ops = MockPboOps::new(12);
+        let pbo = PboTensor::<u8>::from_pbo(10, 12, &[3, 4], Some("enum_test"), ops);
+        let tensor = crate::Tensor::Pbo(pbo);
+        assert_eq!(tensor.memory(), TensorMemory::Pbo);
+        assert_eq!(tensor.name(), "enum_test");
+        assert_eq!(tensor.shape(), &[3, 4]);
+        let mut map = tensor.map().expect("map via enum");
+        map.as_mut_slice().fill(42);
+        assert!(map.as_slice().iter().all(|&b| b == 42));
+    }
+}
