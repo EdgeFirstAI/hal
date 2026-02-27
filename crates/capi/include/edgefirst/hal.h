@@ -1416,6 +1416,27 @@ int hal_image_processor_set_class_colors(struct hal_image_processor *processor,
                                          size_t num_colors);
 
 /**
+ * Create a new tensor image using the processor's optimal memory backend.
+ *
+ * Selects the best available backing storage based on hardware capabilities:
+ * DMA-buf > PBO (GPU buffer) > system memory. Images created this way benefit
+ * from zero-copy GPU paths when used with the same processor's convert().
+ *
+ * @param processor Image processor handle
+ * @param width Image width in pixels
+ * @param height Image height in pixels
+ * @param fourcc Pixel format (HAL_FOURCC_*)
+ * @return New tensor image handle on success, NULL on error
+ * @par Errors (errno):
+ * - EINVAL: Invalid argument (NULL processor, zero dimensions)
+ * - ENOMEM: Memory allocation failed
+ */
+struct hal_tensor_image *hal_image_processor_create_image(struct hal_image_processor *processor,
+                                                          size_t width,
+                                                          size_t height,
+                                                          enum hal_fourcc fourcc);
+
+/**
  * Free an image processor.
  *
  * @param processor Image processor handle to free (can be NULL, no-op)

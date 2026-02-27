@@ -1065,6 +1065,27 @@ impl PyImageProcessor {
         Ok(())
     }
 
+    /// Create an image with the processor's optimal memory backend.
+    ///
+    /// Selects the best available backing storage based on hardware capabilities:
+    /// DMA-buf > PBO (GPU buffer) > system memory. Images created this way benefit
+    /// from zero-copy GPU paths when used with this processor's convert().
+    #[pyo3(signature = (width, height, fourcc = FourCC::RGBA))]
+    pub fn create_image(
+        &self,
+        width: usize,
+        height: usize,
+        fourcc: FourCC,
+    ) -> Result<PyTensorImage> {
+        let fourcc: four_char_code::FourCharCode = fourcc.into();
+        let img = self
+            .0
+            .lock()
+            .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?
+            .create_image(width, height, fourcc)?;
+        Ok(PyTensorImage(img))
+    }
+
     pub fn set_class_colors(&mut self, colors: Vec<[u8; 4]>) -> Result<()> {
         if let Ok(mut l) = self.0.lock() {
             l.set_class_colors(&colors)?
