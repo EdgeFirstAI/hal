@@ -2692,8 +2692,8 @@ impl GLProcessorST {
         flip: Flip,
         crop: Crop,
     ) -> crate::Result<()> {
-        // Safety check: neither PBO must be mapped; extract dst buffer_id before releasing borrows
-        let dst_buffer_id = {
+        // Safety check: neither PBO must be mapped; extract buffer IDs before releasing borrows
+        let (src_buffer_id, dst_buffer_id) = {
             let src_pbo = match &src.tensor {
                 edgefirst_tensor::Tensor::Pbo(p) => p,
                 _ => {
@@ -2717,20 +2717,20 @@ impl GLProcessorST {
                 ));
             }
 
-            dst_pbo.buffer_id()
+            (src_pbo.buffer_id(), dst_pbo.buffer_id())
         };
 
         // Setup renderbuffer (same as non-DMA path)
         self.setup_renderbuffer_non_dma(dst, crop)?;
 
-        // Upload source and render using existing pipeline
-        // (convert_to maps the source tensor internally for texture upload)
+        // Upload source from PBO and render.
+        // We cannot call convert_to/draw_src_texture directly because they
+        // call src.tensor().map() which sends a message back to THIS thread,
+        // causing a deadlock. Instead, bind the source PBO as UNPACK buffer
+        // and upload to the texture with a NULL pointer — GL reads directly
+        // from the PBO, zero CPU copy.
         let start = Instant::now();
-        if dst.is_planar() {
-            self.convert_to_planar(src, dst, rotation, flip, crop)?;
-        } else {
-            self.convert_to(src, dst, rotation, flip, crop)?;
-        }
+        self.draw_src_texture_from_pbo(src, src_buffer_id, dst, rotation, flip, crop)?;
         log::debug!("PBO render takes {:?}", start.elapsed());
 
         // Readback into destination PBO instead of CPU memory
@@ -2767,15 +2767,275 @@ impl GLProcessorST {
 
         check_gl_error(function!(), line!())?;
 
-        // Handle int8 XOR if needed (must map PBO to do this)
+        // Handle int8 XOR if needed (must map PBO to do this on the GL thread
+        // directly, since we're already on the GL thread)
         if fourcc_is_int8(dst.fourcc()) {
-            let mut dst_map = dst.tensor().map()?;
-            for byte in dst_map.iter_mut() {
-                *byte ^= 0x80;
+            unsafe {
+                gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, dst_buffer_id);
+                let ptr = gls::gl::MapBufferRange(
+                    gls::gl::PIXEL_PACK_BUFFER,
+                    0,
+                    dst.tensor.len() as isize,
+                    gls::gl::MAP_READ_BIT | gls::gl::MAP_WRITE_BIT,
+                );
+                if !ptr.is_null() {
+                    let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, dst.tensor.len());
+                    for byte in slice.iter_mut() {
+                        *byte ^= 0x80;
+                    }
+                    gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
+                }
+                gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
             }
+            check_gl_error(function!(), line!())?;
         }
 
         log::debug!("PBO readback takes {:?}", start_read.elapsed());
+        Ok(())
+    }
+
+    /// Upload source image from a PBO and render to the current framebuffer.
+    /// This is the PBO equivalent of draw_src_texture — instead of mapping
+    /// the tensor to CPU and calling glTexImage2D with a data pointer, we
+    /// bind the source PBO as GL_PIXEL_UNPACK_BUFFER and pass NULL, causing
+    /// GL to read directly from the PBO (zero CPU copy).
+    fn draw_src_texture_from_pbo(
+        &mut self,
+        src: &TensorImage,
+        src_buffer_id: u32,
+        dst: &TensorImage,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> Result<(), Error> {
+        let texture_target = gls::gl::TEXTURE_2D;
+        let texture_format = match src.fourcc() {
+            crate::RGB | crate::RGB_INT8 => gls::gl::RGB,
+            crate::RGBA => gls::gl::RGBA,
+            crate::GREY => gls::gl::RED,
+            _ => {
+                return Err(Error::NotSupported(format!(
+                    "PBO upload not supported for {:?}",
+                    src.fourcc()
+                )));
+            }
+        };
+
+        let has_crop = crop.dst_rect.is_some_and(|x| {
+            x.left != 0 || x.top != 0 || x.width != dst.width() || x.height != dst.height()
+        });
+
+        // top and bottom are flipped because OpenGL uses 0,0 as bottom left
+        let src_roi = if let Some(crop) = crop.src_rect {
+            RegionOfInterest {
+                left: crop.left as f32 / src.width() as f32,
+                top: (crop.top + crop.height) as f32 / src.height() as f32,
+                right: (crop.left + crop.width) as f32 / src.width() as f32,
+                bottom: crop.top as f32 / src.height() as f32,
+            }
+        } else {
+            RegionOfInterest {
+                left: 0.,
+                top: 1.,
+                right: 1.,
+                bottom: 0.,
+            }
+        };
+
+        let cvt_screen_coord = |normalized| normalized * 2.0 - 1.0;
+        let mut dst_roi = if let Some(crop) = crop.dst_rect {
+            RegionOfInterest {
+                left: cvt_screen_coord(crop.left as f32 / dst.width() as f32),
+                top: cvt_screen_coord((crop.top + crop.height) as f32 / dst.height() as f32),
+                right: cvt_screen_coord((crop.left + crop.width) as f32 / dst.width() as f32),
+                bottom: cvt_screen_coord(crop.top as f32 / dst.height() as f32),
+            }
+        } else {
+            RegionOfInterest {
+                left: -1.,
+                top: 1.,
+                right: 1.,
+                bottom: -1.,
+            }
+        };
+
+        let rotation_offset = match rotation {
+            crate::Rotation::None => 0,
+            crate::Rotation::Clockwise90 => 1,
+            crate::Rotation::Rotate180 => 2,
+            crate::Rotation::CounterClockwise90 => 3,
+        };
+
+        unsafe {
+            if has_crop {
+                if let Some(dst_color) = crop.dst_color {
+                    gls::gl::ClearColor(
+                        dst_color[0] as f32 / 255.0,
+                        dst_color[1] as f32 / 255.0,
+                        dst_color[2] as f32 / 255.0,
+                        dst_color[3] as f32 / 255.0,
+                    );
+                    gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
+                }
+            }
+
+            gls::gl::UseProgram(self.texture_program.id);
+            gls::gl::BindTexture(texture_target, self.camera_normal_texture.id);
+            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+            gls::gl::TexParameteri(
+                texture_target,
+                gls::gl::TEXTURE_MIN_FILTER,
+                gls::gl::LINEAR as i32,
+            );
+            gls::gl::TexParameteri(
+                texture_target,
+                gls::gl::TEXTURE_MAG_FILTER,
+                gls::gl::LINEAR as i32,
+            );
+            if src.fourcc() == crate::GREY {
+                for swizzle in [
+                    gls::gl::TEXTURE_SWIZZLE_R,
+                    gls::gl::TEXTURE_SWIZZLE_G,
+                    gls::gl::TEXTURE_SWIZZLE_B,
+                ] {
+                    gls::gl::TexParameteri(gls::gl::TEXTURE_2D, swizzle, gls::gl::RED as i32);
+                }
+            } else {
+                for (swizzle, src_component) in [
+                    (gls::gl::TEXTURE_SWIZZLE_R, gls::gl::RED),
+                    (gls::gl::TEXTURE_SWIZZLE_G, gls::gl::GREEN),
+                    (gls::gl::TEXTURE_SWIZZLE_B, gls::gl::BLUE),
+                ] {
+                    gls::gl::TexParameteri(gls::gl::TEXTURE_2D, swizzle, src_component as i32);
+                }
+            }
+
+            // Bind source PBO as UNPACK buffer — glTexImage2D reads from it
+            gls::gl::BindBuffer(gls::gl::PIXEL_UNPACK_BUFFER, src_buffer_id);
+            gls::gl::TexImage2D(
+                texture_target,
+                0,
+                texture_format as i32,
+                src.width() as i32,
+                src.height() as i32,
+                0,
+                texture_format,
+                gls::gl::UNSIGNED_BYTE,
+                std::ptr::null(), // NULL = read from bound UNPACK buffer
+            );
+            gls::gl::BindBuffer(gls::gl::PIXEL_UNPACK_BUFFER, 0);
+
+            // Force texture cache state to be rebuilt next call
+            self.camera_normal_texture.width = 0;
+
+            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
+            gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
+
+            match flip {
+                crate::Flip::None => {}
+                crate::Flip::Vertical => {
+                    std::mem::swap(&mut dst_roi.top, &mut dst_roi.bottom);
+                }
+                crate::Flip::Horizontal => {
+                    std::mem::swap(&mut dst_roi.left, &mut dst_roi.right);
+                }
+            }
+
+            let camera_vertices: [f32; 12] = [
+                dst_roi.left,
+                dst_roi.top,
+                0., // left top
+                dst_roi.right,
+                dst_roi.top,
+                0., // right top
+                dst_roi.right,
+                dst_roi.bottom,
+                0., // right bottom
+                dst_roi.left,
+                dst_roi.bottom,
+                0., // left bottom
+            ];
+            gls::gl::BufferData(
+                gls::gl::ARRAY_BUFFER,
+                (camera_vertices.len() * std::mem::size_of::<f32>()) as isize,
+                camera_vertices.as_ptr() as *const c_void,
+                gls::gl::STATIC_DRAW,
+            );
+            gls::gl::VertexAttribPointer(
+                self.vertex_buffer.buffer_index,
+                3,
+                gls::gl::FLOAT,
+                gls::gl::FALSE,
+                0,
+                std::ptr::null(),
+            );
+
+            let texture_coords: [[f32; 8]; 4] = [
+                [
+                    src_roi.left,
+                    src_roi.top,
+                    src_roi.right,
+                    src_roi.top,
+                    src_roi.right,
+                    src_roi.bottom,
+                    src_roi.left,
+                    src_roi.bottom,
+                ],
+                [
+                    src_roi.left,
+                    src_roi.bottom,
+                    src_roi.left,
+                    src_roi.top,
+                    src_roi.right,
+                    src_roi.top,
+                    src_roi.right,
+                    src_roi.bottom,
+                ],
+                [
+                    src_roi.right,
+                    src_roi.bottom,
+                    src_roi.left,
+                    src_roi.bottom,
+                    src_roi.left,
+                    src_roi.top,
+                    src_roi.right,
+                    src_roi.top,
+                ],
+                [
+                    src_roi.right,
+                    src_roi.top,
+                    src_roi.right,
+                    src_roi.bottom,
+                    src_roi.left,
+                    src_roi.bottom,
+                    src_roi.left,
+                    src_roi.top,
+                ],
+            ];
+            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
+            gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
+            gls::gl::BufferData(
+                gls::gl::ARRAY_BUFFER,
+                (texture_coords[0].len() * std::mem::size_of::<f32>()) as isize,
+                texture_coords[rotation_offset].as_ptr() as *const c_void,
+                gls::gl::STATIC_DRAW,
+            );
+            gls::gl::VertexAttribPointer(
+                self.texture_buffer.buffer_index,
+                2,
+                gls::gl::FLOAT,
+                gls::gl::FALSE,
+                0,
+                std::ptr::null(),
+            );
+            gls::gl::DrawArrays(gls::gl::TRIANGLE_FAN, 0, 4);
+            gls::gl::DisableVertexAttribArray(self.vertex_buffer.buffer_index);
+            gls::gl::DisableVertexAttribArray(self.texture_buffer.buffer_index);
+
+            gls::gl::Finish();
+        }
+
+        check_gl_error(function!(), line!())?;
         Ok(())
     }
 
