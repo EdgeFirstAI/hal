@@ -643,6 +643,13 @@ impl TensorImage {
         self.fourcc
     }
 
+    /// Override the FourCC format tag without touching the underlying tensor.
+    /// Used internally for int8 ↔ uint8 format aliasing where the pixel layout
+    /// is identical and only the interpretation differs.
+    pub(crate) fn set_fourcc(&mut self, fourcc: FourCharCode) {
+        self.fourcc = fourcc;
+    }
+
     /// # Examples
     /// ```rust
     /// use edgefirst_image::{RGB, TensorImage};
