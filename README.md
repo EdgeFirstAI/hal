@@ -43,7 +43,7 @@ import edgefirst_hal as ef
 # Load and process image
 img = ef.TensorImage.load("image.jpg", ef.FourCC.RGB)
 converter = ef.ImageProcessor()
-output = ef.TensorImage(640, 640)
+output = converter.create_image(640, 640, ef.FourCC.RGB)
 converter.convert(img, output)
 
 # Decode YOLO outputs
@@ -53,18 +53,22 @@ boxes, scores, classes = decoder.decode([output0, output1])
 
 #### Rust
 ```rust
-use edgefirst_hal::image::{TensorImage, ImageProcessor};
-use edgefirst_hal::decoder::Decoder;
+use edgefirst_hal::image::{TensorImage, ImageProcessor, RGB};
 
 // Load and process image
 let input = TensorImage::load("image.jpg", Some(RGB), None)?;
 let mut converter = ImageProcessor::new()?;
-let mut output = TensorImage::new(640, 640, RGB, None)?;
+let mut output = converter.create_image(640, 640, RGB)?;
 converter.convert(&input, &mut output, Default::default())?;
+```
 
-// Decode model outputs
-let decoder = Decoder::new(config, 0.5, 0.45)?;
-let (boxes, scores, classes) = decoder.decode_detection(&outputs)?;
+#### C
+```c
+#include <edgefirst/hal.h>
+
+struct hal_image_processor *proc = hal_image_processor_new();
+struct hal_tensor_image *dst = hal_image_processor_create_image(proc, 640, 640, HAL_FOURCC_RGB);
+hal_image_processor_convert(proc, src, dst, HAL_ROTATION_NONE, HAL_FLIP_NONE, NULL);
 ```
 
 ## System Architecture
@@ -378,6 +382,100 @@ flowchart LR
 - IOCTL interface for DMA buffer operations
 - Version detection and capability queries
 
+## Creating GPU-Optimal Images
+
+`ImageProcessor::create_image()` is the **preferred way** to allocate images
+for use with `convert()`. It automatically selects the fastest available memory
+backend for the current GPU:
+
+| Priority | Backend | Transfer Method | Platforms |
+|----------|---------|-----------------|-----------|
+| 1st | **DMA-buf** | Zero-copy EGLImage import | NXP i.MX 8M Plus, i.MX 95 |
+| 2nd | **PBO** (Pixel Buffer Object) | Zero-copy GL buffer binding | NVIDIA desktop GPUs |
+| 3rd | **Mem** (heap) | CPU memcpy fallback | All platforms |
+
+The backend is selected once at `ImageProcessor::new()` time based on a
+runtime GPU capability probe. All subsequent `create_image()` calls use the
+same backend.
+
+**Best practice**: Create your output images once and reuse them across your
+pipeline loop. Creating images is relatively expensive (GPU buffer allocation,
+format negotiation); reusing them amortizes that cost over thousands of frames.
+
+### Rust
+```rust
+let mut converter = ImageProcessor::new()?;
+
+// Create reusable output buffer — allocated once
+let mut output = converter.create_image(640, 640, RGB)?;
+
+for frame in camera_frames {
+    // Reuse output buffer each iteration — no allocation
+    converter.convert(&frame, &mut output, Default::default())?;
+    run_inference(&output)?;
+}
+```
+
+### Python
+```python
+converter = ef.ImageProcessor()
+
+# Create reusable output buffer — allocated once
+output = converter.create_image(640, 640, ef.FourCC.RGB)
+
+for frame in camera_frames:
+    # Reuse output buffer each iteration — no allocation
+    converter.convert(frame, output)
+    run_inference(output)
+```
+
+### C
+```c
+struct hal_image_processor *proc = hal_image_processor_new();
+
+/* Create reusable output buffer — allocated once */
+struct hal_tensor_image *output = hal_image_processor_create_image(
+    proc, 640, 640, HAL_FOURCC_RGB);
+
+for (;;) {
+    /* Reuse output buffer each iteration — no allocation */
+    hal_image_processor_convert(proc, frame, output,
+        HAL_ROTATION_NONE, HAL_FLIP_NONE, NULL);
+    run_inference(output);
+}
+
+hal_tensor_image_free(output);
+hal_image_processor_free(proc);
+```
+
+### DMA-buf Permissions
+
+For the DMA-buf backend to be selected, the process needs access to
+`/dev/dma_heap/linux,cma` (or `/dev/dma_heap/system` on some kernels) and a
+DRM render node (`/dev/dri/renderD128`). On embedded Linux systems, this
+typically requires one of:
+
+- Running as root
+- Adding the user to the `video` and `render` groups:
+  ```bash
+  sudo usermod -aG video,render $USER
+  ```
+- Setting appropriate udev rules for the DMA heap and DRI devices
+
+If DMA-buf allocation fails (insufficient permissions, no CMA region, or the
+GPU driver cannot import the resulting buffers), `create_image()` transparently
+falls back to PBO or heap memory with no API change required.
+
+### Platform GPU Support
+
+| Platform | GPU | `create_image()` backend | Notes |
+|----------|-----|--------------------------|-------|
+| NXP i.MX 8M Plus | Vivante GC7000UL | DMA-buf | Full zero-copy via EGLImage + G2D |
+| NXP i.MX 95 | Mali G310 (Panfrost) | DMA-buf | Full zero-copy via EGLImage |
+| NVIDIA Desktop | GeForce (proprietary) | PBO | DMA-buf alloc works but EGL import fails; PBO provides GPU-native buffers |
+| Generic x86_64 | Mesa (llvmpipe/iris) | DMA-buf or PBO | Depends on driver DMA-buf support |
+| No GPU / macOS | N/A | Mem | CPU fallback, still functional |
+
 ## Advanced Examples
 
 <details>
@@ -386,17 +484,16 @@ flowchart LR
 ### Image Conversion
 
 ```rust
-use edgefirst_hal::image::{TensorImage, ImageProcessor, RGBA, RGB};
-use edgefirst_hal::tensor::TensorMemory;
+use edgefirst_hal::image::{TensorImage, ImageProcessor, RGB};
 
 // Load image from JPEG
 let input = TensorImage::load("testdata/zidane.jpg", Some(RGB), None)?;
 
-// Create converter (auto-selects G2D or CPU)
+// Create converter (auto-selects best backend: G2D, OpenGL, CPU)
 let mut converter = ImageProcessor::new()?;
 
-// Create output buffer
-let mut output = TensorImage::new(640, 640, RGB, Some(TensorMemory::Dma))?;
+// Create output buffer with optimal GPU memory (DMA > PBO > Mem)
+let mut output = converter.create_image(640, 640, RGB)?;
 
 // Convert and resize
 converter.convert(&input, &mut output, Default::default())?;
@@ -469,8 +566,8 @@ tensor_img = ef.TensorImage.load("testdata/zidane.jpg", ef.FourCC.RGB)
 # Create converter
 converter = ef.ImageProcessor()
 
-# Create output image
-output = ef.TensorImage(640, 640)
+# Create output image with optimal GPU memory (DMA > PBO > Mem)
+output = converter.create_image(640, 640, ef.FourCC.RGB)
 
 # Resize with hardware acceleration
 converter.convert(tensor_img, output)
@@ -574,6 +671,7 @@ Consistent error handling throughout:
 | Feature | Linux (i.MX) | Linux (Generic) | macOS | Windows |
 |---------|--------------|-----------------|-------|---------|
 | DMA Tensors | ✅ | ✅ | ❌ | ❌ |
+| PBO Tensors (GPU) | ✅ | ✅ | ❌ | ❌ |
 | Shared Memory Tensors | ✅ | ✅ | ✅ | ✅ |
 | Heap Tensors | ✅ | ✅ | ✅ | ✅ |
 | G2D Acceleration | ✅ | ❌ | ❌ | ❌ |
