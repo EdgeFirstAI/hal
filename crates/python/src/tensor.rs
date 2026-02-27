@@ -88,6 +88,9 @@ impl From<TensorMemory> for PyTensorMemory {
             #[cfg(unix)]
             TensorMemory::Shm => PyTensorMemory::SHM,
             TensorMemory::Mem => PyTensorMemory::MEM,
+            // PBO tensors are GPU-only and not representable in the Python API;
+            // report as MEM so callers can still inspect the memory type.
+            TensorMemory::Pbo => PyTensorMemory::MEM,
         }
     }
 }
