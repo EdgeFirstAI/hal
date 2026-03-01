@@ -1644,6 +1644,117 @@ mod decoder_tests {
         );
     }
 
+    /// Regression test: config-driven path with NCHW protos (no dshape).
+    /// Simulates YOLOv8-seg ONNX outputs where protos are (1, 32, 160, 160)
+    /// and the YAML config has no dshape field — the exact scenario from
+    /// hal_mask_matmul_bug.md.
+    #[test]
+    fn test_decoder_masks_nchw_protos() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+
+        // Load test data — boxes as [116, 8400]
+        let boxes_raw = include_bytes!("../../../testdata/yolov8_boxes_116x8400.bin");
+        let boxes_raw =
+            unsafe { std::slice::from_raw_parts(boxes_raw.as_ptr() as *const i8, boxes_raw.len()) };
+        let boxes_2d = ndarray::Array2::from_shape_vec((116, 8400), boxes_raw.to_vec()).unwrap();
+        let quant_boxes = Quantization::new(0.021287761628627777, 31);
+
+        // Load protos as HWC [160, 160, 32] (file layout) then dequantize
+        let protos_raw = include_bytes!("../../../testdata/yolov8_protos_160x160x32.bin");
+        let protos_raw = unsafe {
+            std::slice::from_raw_parts(protos_raw.as_ptr() as *const i8, protos_raw.len())
+        };
+        let protos_hwc =
+            ndarray::Array3::from_shape_vec((160, 160, 32), protos_raw.to_vec()).unwrap();
+        let quant_protos = Quantization::new(0.02491161972284317, -117);
+        let protos_f32_hwc = dequantize_ndarray::<_, _, f32>(protos_hwc.view(), quant_protos);
+
+        // ---- Reference: direct call with HWC protos (known working) ----
+        let seg = dequantize_ndarray::<_, _, f32>(boxes_2d.view(), quant_boxes);
+        let mut ref_boxes: Vec<_> = Vec::with_capacity(10);
+        let mut ref_masks: Vec<_> = Vec::with_capacity(10);
+        decode_yolo_segdet_float(
+            seg.view(),
+            protos_f32_hwc.view(),
+            score_threshold,
+            iou_threshold,
+            Some(configs::Nms::ClassAgnostic),
+            &mut ref_boxes,
+            &mut ref_masks,
+        );
+        assert_eq!(ref_boxes.len(), 2);
+
+        // ---- Config-driven path: NCHW protos, no dshape ----
+        // Permute protos to NCHW [1, 32, 160, 160] as an ONNX model would output
+        let protos_f32_chw = protos_f32_hwc.permuted_axes([2, 0, 1]); // [32, 160, 160]
+        let protos_nchw = protos_f32_chw.insert_axis(ndarray::Axis(0)); // [1, 32, 160, 160]
+
+        // Build boxes as [1, 116, 8400] f32
+        let seg_3d = seg.insert_axis(ndarray::Axis(0)); // [1, 116, 8400]
+
+        // Build decoder from config with no dshape on protos
+        let decoder = DecoderBuilder::default()
+            .with_config_yolo_segdet(
+                configs::Detection {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: None,
+                    shape: vec![1, 116, 8400],
+                    dshape: vec![],
+                    normalized: Some(true),
+                    anchors: None,
+                },
+                configs::Protos {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: None,
+                    shape: vec![1, 32, 160, 160],
+                    dshape: vec![], // No dshape — simulates YAML without dshape
+                },
+                None, // decoder version
+            )
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .build()
+            .unwrap();
+
+        let mut cfg_boxes: Vec<_> = Vec::with_capacity(10);
+        let mut cfg_masks: Vec<_> = Vec::with_capacity(10);
+        decoder
+            .decode_float(
+                &[seg_3d.view().into_dyn(), protos_nchw.view().into_dyn()],
+                &mut cfg_boxes,
+                &mut cfg_masks,
+            )
+            .unwrap();
+
+        // Must produce the same number of detections
+        assert_eq!(
+            cfg_boxes.len(),
+            ref_boxes.len(),
+            "config path produced {} boxes, reference produced {}",
+            cfg_boxes.len(),
+            ref_boxes.len()
+        );
+
+        // Boxes must match
+        for (i, (cb, rb)) in cfg_boxes.iter().zip(&ref_boxes).enumerate() {
+            assert!(
+                cb.equal_within_delta(rb, 0.01),
+                "box {i} mismatch: config={cb:?}, reference={rb:?}"
+            );
+        }
+
+        // Masks must match pixel-for-pixel
+        for (i, (cm, rm)) in cfg_masks.iter().zip(&ref_masks).enumerate() {
+            let cm_arr = segmentation_to_mask(cm.segmentation.view()).unwrap();
+            let rm_arr = segmentation_to_mask(rm.segmentation.view()).unwrap();
+            assert_eq!(
+                cm_arr, rm_arr,
+                "mask {i} pixel mismatch between config-driven and reference paths"
+            );
+        }
+    }
+
     #[test]
     fn test_decoder_masks_i8() {
         let score_threshold = 0.45;

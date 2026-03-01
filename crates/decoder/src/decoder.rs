@@ -733,9 +733,9 @@ enum ConfigSource {
 
 impl Default for DecoderBuilder {
     /// Creates a default DecoderBuilder with no configuration and 0.5 score
-    /// threshold and 0.5 OU threshold.
+    /// threshold and 0.5 IoU threshold.
     ///
-    /// A valid confguration must be provided before building the Decoder.
+    /// A valid configuration must be provided before building the Decoder.
     ///
     /// # Examples
     /// ```rust
@@ -763,9 +763,9 @@ impl Default for DecoderBuilder {
 
 impl DecoderBuilder {
     /// Creates a default DecoderBuilder with no configuration and 0.5 score
-    /// threshold and 0.5 OU threshold.
+    /// threshold and 0.5 IoU threshold.
     ///
-    /// A valid confguration must be provided before building the Decoder.
+    /// A valid configuration must be provided before building the Decoder.
     ///
     /// # Examples
     /// ```rust
@@ -1705,7 +1705,8 @@ impl DecoderBuilder {
             ],
         )?;
 
-        let protos_count = Self::get_protos_count(&protos.dshape).unwrap_or(protos.shape[3]);
+        let protos_count = Self::get_protos_count(&protos.dshape)
+            .unwrap_or_else(|| protos.shape[1].min(protos.shape[3]));
         log::debug!("Protos count: {}", protos_count);
         log::debug!("Detection dshape: {:?}", detection.dshape);
         let classes = if !detection.dshape.is_empty() {
@@ -1758,7 +1759,8 @@ impl DecoderBuilder {
             ],
         )?;
 
-        let protos_count = Self::get_protos_count(&protos.dshape).unwrap_or(protos.shape[3]);
+        let protos_count = Self::get_protos_count(&protos.dshape)
+            .unwrap_or_else(|| protos.shape[1].min(protos.shape[3]));
         log::debug!("Protos count: {}", protos_count);
         log::debug!("Detection dshape: {:?}", detection.dshape);
 
@@ -1894,7 +1896,7 @@ impl DecoderBuilder {
                 DecoderError::InvalidConfig("Could not find num_protos in config".to_string())
             })?
         } else {
-            protos.shape[3]
+            protos.shape[1].min(protos.shape[3])
         };
 
         if boxes_num != scores_num {
@@ -3248,6 +3250,7 @@ impl Decoder {
 
                 let protos_tensor = Self::swap_axes_if_needed(p, protos.into());
                 let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
+                let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
                 decode_yolo_segdet_quant(
                     (box_tensor, quant_boxes),
                     (protos_tensor, quant_protos),
@@ -3374,6 +3377,7 @@ impl Decoder {
 
                 let protos_tensor = Self::swap_axes_if_needed(p, protos.into());
                 let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
+                let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
                 impl_yolo_split_segdet_quant_process_masks::<_, _>(
                     boxes,
                     (mask_tensor, quant_masks),
@@ -3528,6 +3532,7 @@ impl Decoder {
 
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
+        let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
         decode_yolo_segdet_float(
             boxes_tensor,
             protos_tensor,
@@ -3607,6 +3612,7 @@ impl Decoder {
         let (protos_tensor, _) = Self::find_outputs_with_shape(&protos.shape, outputs, &skip)?;
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
+        let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
         decode_yolo_split_segdet_float(
             boxes_tensor,
             scores_tensor,
@@ -3682,6 +3688,7 @@ impl Decoder {
             Self::find_outputs_with_shape(&protos_config.shape, outputs, &[det_ind])?;
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos_config.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
+        let protos_tensor = Self::protos_to_hwc(protos_tensor, protos_config);
 
         crate::yolo::decode_yolo_end_to_end_segdet_float(
             det_tensor,
@@ -3875,6 +3882,7 @@ impl Decoder {
             Self::find_outputs_with_shape(&protos_config.shape, outputs, &skip)?;
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos_config.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
+        let protos_tensor = Self::protos_to_hwc(protos_tensor, protos_config);
 
         crate::yolo::decode_yolo_split_end_to_end_segdet_float(
             boxes_tensor,
@@ -4079,6 +4087,7 @@ impl Decoder {
 
                 let protos_tensor = Self::swap_axes_if_needed(p, protos.into());
                 let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
+                let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
                 crate::yolo::impl_yolo_segdet_quant_proto::<XYWH, _, _>(
                     (box_tensor, quant_boxes),
                     (protos_tensor, quant_protos),
@@ -4110,6 +4119,7 @@ impl Decoder {
         let (protos_tensor, _) = Self::find_outputs_with_shape(&protos.shape, outputs, &[ind])?;
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
+        let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
 
         Ok(crate::yolo::impl_yolo_segdet_float_proto::<XYWH, _, _>(
             boxes_tensor,
@@ -4194,6 +4204,7 @@ impl Decoder {
 
                 let protos_tensor = Self::swap_axes_if_needed(p, protos.into());
                 let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
+                let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
 
                 crate::yolo::extract_proto_data_quant(
                     det_indices,
@@ -4241,6 +4252,7 @@ impl Decoder {
         let (protos_tensor, _) = Self::find_outputs_with_shape(&protos.shape, outputs, &skip)?;
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
+        let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
 
         Ok(crate::yolo::impl_yolo_split_segdet_float_proto::<
             XYWH,
@@ -4286,6 +4298,7 @@ impl Decoder {
             Self::find_outputs_with_shape(&protos_config.shape, outputs, &[det_ind])?;
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos_config.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
+        let protos_tensor = Self::protos_to_hwc(protos_tensor, protos_config);
 
         crate::yolo::decode_yolo_end_to_end_segdet_float_proto(
             det_tensor,
@@ -4399,6 +4412,7 @@ impl Decoder {
             Self::find_outputs_with_shape(&protos_config.shape, outputs, &skip)?;
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos_config.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
+        let protos_tensor = Self::protos_to_hwc(protos_tensor, protos_config);
 
         crate::yolo::decode_yolo_split_end_to_end_segdet_float_proto(
             boxes_tensor,
@@ -4689,6 +4703,42 @@ impl Decoder {
             (ConfigOutputRef::Protos(_), _) => Self::yolo_protos_order,
             (ConfigOutputRef::MaskCoefficients(_), _) => Self::yolo_maskcoefficients_order,
             (ConfigOutputRef::Classes(_), _) => Self::yolo_scores_order,
+        }
+    }
+
+    /// Ensure a 3D protos tensor is in HWC order.  When dshape is set,
+    /// `swap_axes_if_needed` already reorders the 4D tensor to NHWC before
+    /// the batch-dim slice, so the resulting 3D view is already HWC.
+    ///
+    /// When dshape is empty (no named dimensions), we detect the layout by
+    /// comparing axis sizes: the channel/proto count (e.g. 32) is always
+    /// smaller than the spatial dimensions (e.g. 160×160).  If axis 0 is
+    /// the smallest, the tensor is CHW and needs permutation to HWC;
+    /// otherwise it is already HWC.
+    ///
+    /// **Known limitations**: the heuristic fails when the channel count is
+    /// not strictly the smallest dimension (e.g. protos shape `(32, 1, 1)`
+    /// or `(160, 5, 5)`).  Set `dshape` in the config for reliable axis
+    /// ordering in these edge cases.
+    fn protos_to_hwc<'a, T>(
+        protos: ArrayView<'a, T, ndarray::Ix3>,
+        config: &configs::Protos,
+    ) -> ArrayView<'a, T, ndarray::Ix3> {
+        if config.dshape.is_empty() {
+            let (d0, d1, d2) = protos.dim();
+            log::warn!(
+                "protos_to_hwc: no dshape configured, using size heuristic on \
+                 shape ({d0}, {d1}, {d2}); set dshape in config for reliable ordering"
+            );
+            if d0 < d1 && d0 < d2 {
+                // CHW (from NCHW) → permute to HWC
+                protos.permuted_axes([1, 2, 0])
+            } else {
+                // Already HWC (from NHWC) or ambiguous — keep as-is
+                protos
+            }
+        } else {
+            protos
         }
     }
 

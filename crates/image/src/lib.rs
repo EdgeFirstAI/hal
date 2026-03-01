@@ -4390,8 +4390,7 @@ mod image_tests {
             .unwrap();
 
         // Verify: compare with CPU-only conversion of the same input
-        let mut cpu_dst =
-            TensorImage::new(dst_w, dst_h, RGBA, Some(TensorMemory::Mem)).unwrap();
+        let mut cpu_dst = TensorImage::new(dst_w, dst_h, RGBA, Some(TensorMemory::Mem)).unwrap();
         CPUProcessor::new()
             .convert(
                 &mem_src,

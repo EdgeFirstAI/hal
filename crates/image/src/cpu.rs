@@ -2175,11 +2175,15 @@ impl ImageProcessorTrait for CPUProcessor {
         for (det, coeff) in detect.iter().zip(proto_data.mask_coefficients.iter()) {
             let start_x = (output_width as f32 * det.bbox.xmin).round() as usize;
             let start_y = (output_height as f32 * det.bbox.ymin).round() as usize;
-            let end_x = ((output_width as f32 * det.bbox.xmax).round() as usize).min(output_width);
-            let end_y =
-                ((output_height as f32 * det.bbox.ymax).round() as usize).min(output_height);
-            let bbox_w = end_x.saturating_sub(start_x).max(1);
-            let bbox_h = end_y.saturating_sub(start_y).max(1);
+            // Use span-based rounding to match the numpy reference convention.
+            let bbox_w = ((det.bbox.xmax - det.bbox.xmin) * output_width as f32)
+                .round()
+                .max(1.0) as usize;
+            let bbox_h = ((det.bbox.ymax - det.bbox.ymin) * output_height as f32)
+                .round()
+                .max(1.0) as usize;
+            let bbox_w = bbox_w.min(output_width.saturating_sub(start_x));
+            let bbox_h = bbox_h.min(output_height.saturating_sub(start_y));
 
             let mut pixels = vec![0u8; bbox_w * bbox_h];
 

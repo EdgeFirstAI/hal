@@ -1708,11 +1708,7 @@ mod tests {
 
             for (fourcc, channels) in formats {
                 let img = hal_image_processor_create_image(processor, 320, 240, fourcc);
-                assert!(
-                    !img.is_null(),
-                    "create_image failed for {:?}",
-                    fourcc
-                );
+                assert!(!img.is_null(), "create_image failed for {:?}", fourcc);
 
                 assert_eq!(hal_tensor_image_width(img), 320);
                 assert_eq!(hal_tensor_image_height(img), 240);
