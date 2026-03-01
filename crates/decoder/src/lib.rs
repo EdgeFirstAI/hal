@@ -1592,7 +1592,8 @@ mod decoder_tests {
             Some(configs::Nms::ClassAgnostic),
             &mut output_boxes,
             &mut output_masks,
-        );
+        )
+        .unwrap();
         assert_eq!(output_boxes.len(), 2);
         assert_eq!(output_boxes.len(), output_masks.len());
 
@@ -1682,7 +1683,8 @@ mod decoder_tests {
             Some(configs::Nms::ClassAgnostic),
             &mut ref_boxes,
             &mut ref_masks,
-        );
+        )
+        .unwrap();
         assert_eq!(ref_boxes.len(), 2);
 
         // ---- Config-driven path: NCHW protos, no dshape ----
@@ -1815,7 +1817,8 @@ mod decoder_tests {
             Some(configs::Nms::ClassAgnostic),
             &mut output_boxes,
             &mut output_masks,
-        );
+        )
+        .unwrap();
 
         let mut output_boxes1: Vec<_> = Vec::with_capacity(500);
         let mut output_masks1: Vec<_> = Vec::with_capacity(500);
@@ -1841,7 +1844,8 @@ mod decoder_tests {
             Some(configs::Nms::ClassAgnostic),
             &mut output_boxes_f32,
             &mut output_masks_f32,
-        );
+        )
+        .unwrap();
 
         let mut output_boxes1_f32: Vec<_> = Vec::with_capacity(500);
         let mut output_masks1_f32: Vec<_> = Vec::with_capacity(500);
@@ -2047,7 +2051,8 @@ mod decoder_tests {
             Some(configs::Nms::ClassAgnostic),
             &mut output_boxes_f32,
             &mut output_masks_f32,
-        );
+        )
+        .unwrap();
 
         let mut output_boxes1: Vec<_> = Vec::with_capacity(500);
         let mut output_masks1: Vec<_> = Vec::with_capacity(500);
@@ -2171,7 +2176,8 @@ mod decoder_tests {
             Some(configs::Nms::ClassAgnostic),
             &mut output_boxes_f32,
             &mut output_masks_f32,
-        );
+        )
+        .unwrap();
 
         assert_eq!(output_boxes.len(), output_boxes_f32.len());
         assert_eq!(output_masks.len(), output_masks_f32.len());

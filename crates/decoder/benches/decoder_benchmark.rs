@@ -378,7 +378,8 @@ fn decoder_masks(bencher: divan::Bencher) {
             Some(Nms::ClassAgnostic),
             &mut output_boxes,
             &mut output_masks,
-        );
+        )
+        .unwrap();
         black_box_drop(output_boxes);
         black_box_drop(output_masks);
     });
@@ -415,7 +416,8 @@ fn decoder_masks_i8(bencher: divan::Bencher) {
             Some(Nms::ClassAgnostic),
             &mut output_boxes,
             &mut output_masks,
-        );
+        )
+        .unwrap();
         black_box_drop(output_boxes);
         black_box_drop(output_masks);
     });

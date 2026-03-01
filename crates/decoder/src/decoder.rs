@@ -3259,11 +3259,9 @@ impl Decoder {
                     self.nms,
                     output_boxes,
                     output_masks,
-                );
-            });
-        });
-
-        Ok(())
+                )
+            })
+        })
     }
 
     fn decode_yolo_split_det_quantized(
@@ -3386,9 +3384,7 @@ impl Decoder {
                     output_masks,
                 )
             })
-        });
-
-        Ok(())
+        })
     }
 
     fn decode_modelpack_det_split_float<D>(
@@ -3541,8 +3537,7 @@ impl Decoder {
             self.nms,
             output_boxes,
             output_masks,
-        );
-        Ok(())
+        )
     }
 
     fn decode_yolo_split_det_float<T>(
@@ -3623,8 +3618,7 @@ impl Decoder {
             self.nms,
             output_boxes,
             output_masks,
-        );
-        Ok(())
+        )
     }
 
     /// Decodes end-to-end YOLO detection outputs (post-NMS from model).
