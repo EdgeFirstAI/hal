@@ -7,7 +7,6 @@ use ndarray::{
     parallel::prelude::{IntoParallelIterator, ParallelIterator},
     s, Array2, Array3, ArrayView1, ArrayView2, ArrayView3,
 };
-use ndarray_stats::QuantileExt;
 use num_traits::{AsPrimitive, Float, PrimInt, Signed};
 
 use crate::{
@@ -742,7 +741,8 @@ pub fn impl_yolo_segdet_quant<
     f32: AsPrimitive<BOX>,
 {
     let (boxes, quant_boxes) = boxes;
-    let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&boxes);
+    let num_protos = protos.0.dim().2;
+    let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&boxes, num_protos);
 
     let boxes = impl_yolo_split_segdet_quant_get_boxes::<B, _, _>(
         (boxes_tensor.reversed_axes(), quant_boxes),
@@ -786,7 +786,8 @@ pub fn impl_yolo_segdet_float<
 ) where
     f32: AsPrimitive<BOX>,
 {
-    let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&boxes);
+    let num_protos = protos.dim().2;
+    let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&boxes, num_protos);
 
     let boxes = postprocess_boxes_index_float::<B, _, _>(
         score_threshold.as_(),
@@ -1013,8 +1014,9 @@ where
 {
     let (boxes_arr, quant_boxes) = boxes;
     let (protos_arr, quant_protos) = protos;
+    let num_protos = protos_arr.dim().2;
 
-    let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&boxes_arr);
+    let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&boxes_arr, num_protos);
 
     let det_indices = impl_yolo_split_segdet_quant_get_boxes::<B, _, _>(
         (boxes_tensor.reversed_axes(), quant_boxes),
@@ -1025,7 +1027,6 @@ where
         output_boxes.capacity(),
     );
 
-    let mask_tensor = mask_tensor.reversed_axes();
     extract_proto_data_quant(
         det_indices,
         mask_tensor,
@@ -1053,7 +1054,8 @@ pub fn impl_yolo_segdet_float_proto<
 where
     f32: AsPrimitive<BOX>,
 {
-    let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&boxes);
+    let num_protos = protos.dim().2;
+    let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&boxes, num_protos);
 
     let det_indices = postprocess_boxes_index_float::<B, _, _>(
         score_threshold.as_(),
@@ -1063,7 +1065,6 @@ where
     let mut det_indices = dispatch_nms_extra_float(nms, iou_threshold, det_indices);
     det_indices.truncate(output_boxes.capacity());
 
-    let mask_tensor = mask_tensor.reversed_axes();
     extract_proto_data_float(det_indices, mask_tensor, protos, output_boxes)
 }
 
@@ -1326,9 +1327,15 @@ fn postprocess_yolo<'a, T>(
 
 fn postprocess_yolo_seg<'a, T>(
     output: &'a ArrayView2<'_, T>,
+    num_protos: usize,
 ) -> (ArrayView2<'a, T>, ArrayView2<'a, T>, ArrayView2<'a, T>) {
-    assert!(output.shape()[0] > 32 + 4, "Output shape is too short");
-    let num_classes = output.shape()[0] - 4 - 32;
+    assert!(
+        output.shape()[0] > num_protos + 4,
+        "Output shape is too short: {} <= {} + 4",
+        output.shape()[0],
+        num_protos
+    );
+    let num_classes = output.shape()[0] - 4 - num_protos;
     let boxes_tensor = output.slice(s![..4, ..,]).reversed_axes();
     let scores_tensor = output.slice(s![4..(num_classes + 4), ..,]).reversed_axes();
     let mask_tensor = output.slice(s![(num_classes + 4).., ..,]).reversed_axes();
@@ -1427,6 +1434,11 @@ fn protobox<'a, T>(
     (cropped, roi_norm)
 }
 
+/// Compute a single instance segmentation mask from mask coefficients and
+/// proto maps (float path).
+///
+/// Computes `sigmoid(coefficients · protos)` and maps to `[0, 255]`.
+/// Returns an `(H, W, 1)` u8 array.
 fn make_segmentation<
     MASK: Float + AsPrimitive<f32> + Send + Sync,
     PROTO: Float + AsPrimitive<f32> + Send + Sync,
@@ -1449,14 +1461,18 @@ fn make_segmentation<
         .into_shape_with_order((shape[0], shape[1], 1))
         .unwrap();
 
-    let min = *mask.min().unwrap_or(&0.0);
-    let max = *mask.max().unwrap_or(&1.0);
-    let max = max.max(-min);
-    let min = -max;
-    let u8_max = 256.0;
-    mask.map(|x| ((*x - min) / (max - min) * u8_max) as u8)
+    mask.map(|x| {
+        let sigmoid = 1.0 / (1.0 + (-*x).exp());
+        (sigmoid * 255.0).round() as u8
+    })
 }
 
+/// Compute a single instance segmentation mask from quantized mask
+/// coefficients and proto maps.
+///
+/// Dequantizes both inputs (subtracting zero-points), computes the dot
+/// product, applies sigmoid, and maps to `[0, 255]`.
+/// Returns an `(H, W, 1)` u8 array.
 fn make_segmentation_quant<
     MASK: PrimInt + AsPrimitive<DEST> + Send + Sync,
     PROTO: PrimInt + AsPrimitive<DEST> + Send + Sync,
@@ -1492,11 +1508,12 @@ where
         .into_shape_with_order((shape[0], shape[1], 1))
         .unwrap();
 
-    let min = *segmentation.min().unwrap_or(&DEST::zero());
-    let max = *segmentation.max().unwrap_or(&DEST::one());
-    let max = max.max(-min);
-    let min = -max;
-    segmentation.map(|x| ((*x - min).as_() / (max - min).as_() * 256.0) as u8)
+    let combined_scale = quant_masks.scale * quant_protos.scale;
+    segmentation.map(|x| {
+        let val: f32 = (*x).as_() * combined_scale;
+        let sigmoid = 1.0 / (1.0 + (-val).exp());
+        (sigmoid * 255.0).round() as u8
+    })
 }
 
 /// Converts Yolo Instance Segmentation into a 2D mask.
@@ -1922,5 +1939,57 @@ mod tests {
             result,
             Err(crate::DecoderError::InvalidShape(s)) if s.contains("(H, W, 1)")
         ));
+    }
+
+    // ========================================================================
+    // Regression: impl_yolo_segdet_float_proto must not double-reverse mask_tensor
+    // ========================================================================
+
+    #[test]
+    fn test_segdet_float_proto_no_panic() {
+        // Simulates YOLOv8n-seg: output0 = [116, 8400] (4 box + 80 class + 32 mask coeff)
+        // output1 (protos) = [32, 160, 160]
+        let num_proposals = 100; // enough to produce idx >= 32
+        let num_classes = 80;
+        let num_mask_coeffs = 32;
+        let rows = 4 + num_classes + num_mask_coeffs; // 116
+
+        // Fill boxes with valid xywh data so some detections pass the threshold.
+        // Layout is [116, num_proposals] row-major: row 0=cx, 1=cy, 2=w, 3=h,
+        // rows 4..84=class scores, rows 84..116=mask coefficients.
+        let mut data = vec![0.0f32; rows * num_proposals];
+        for i in 0..num_proposals {
+            let row = |r: usize| r * num_proposals + i;
+            data[row(0)] = 320.0; // cx
+            data[row(1)] = 320.0; // cy
+            data[row(2)] = 50.0; // w
+            data[row(3)] = 50.0; // h
+            data[row(4)] = 0.9; // class-0 score
+        }
+        let boxes = ndarray::Array2::from_shape_vec((rows, num_proposals), data).unwrap();
+
+        // Protos must be in HWC order (decoder.rs protos_to_hwc converts
+        // before calling into these functions).
+        let protos = ndarray::Array3::<f32>::zeros((160, 160, num_mask_coeffs));
+
+        let mut output_boxes = Vec::with_capacity(300);
+
+        // This panicked before fix: mask_tensor.row(idx) with idx >= 32
+        let proto_data = impl_yolo_segdet_float_proto::<XYWH, _, _>(
+            boxes.view(),
+            protos.view(),
+            0.5,
+            0.7,
+            Some(Nms::default()),
+            &mut output_boxes,
+        );
+
+        // Should produce detections (NMS will collapse many overlapping boxes)
+        assert!(!output_boxes.is_empty());
+        assert_eq!(proto_data.mask_coefficients.len(), output_boxes.len());
+        // Each mask coefficient vector should have 32 elements
+        for coeffs in &proto_data.mask_coefficients {
+            assert_eq!(coeffs.len(), num_mask_coeffs);
+        }
     }
 }

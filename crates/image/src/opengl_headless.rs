@@ -570,7 +570,7 @@ impl GlContext {
         }
     }
 
-    fn egl_destory_image_with_fallback(
+    fn egl_destroy_image_with_fallback(
         egl: &Egl,
         display: Display,
         image: egl::Image,
@@ -936,12 +936,19 @@ impl GLProcessorThreaded {
                         let _ = resp.send(result);
                     }
                     GLProcessorMessage::PboUnmap(buffer_id, resp) => {
-                        unsafe {
+                        let result = unsafe {
                             gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, buffer_id);
-                            gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
+                            let ok = gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
                             gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
-                        }
-                        let _ = resp.send(Ok(()));
+                            if ok == gls::gl::FALSE {
+                                Err(Error::OpenGl(
+                                    "PBO data was corrupted during mapping".into(),
+                                ))
+                            } else {
+                                check_gl_error("PboUnmap", 0)
+                            }
+                        };
+                        let _ = resp.send(result);
                     }
                     GLProcessorMessage::PboDelete(buffer_id) => unsafe {
                         gls::gl::DeleteBuffers(1, &buffer_id);
@@ -1293,11 +1300,7 @@ impl EglImageCache {
 
     /// Evict the least recently used entry.
     fn evict_lru(&mut self) {
-        if let Some((&evict_id, _)) = self
-            .entries
-            .iter()
-            .min_by_key(|(_, entry)| entry.last_used)
-        {
+        if let Some((&evict_id, _)) = self.entries.iter().min_by_key(|(_, entry)| entry.last_used) {
             if let Some(evicted) = self.entries.remove(&evict_id) {
                 if let Some(rbo) = evicted.renderbuffer {
                     unsafe { gls::gl::DeleteRenderbuffers(1, &rbo) };
@@ -2282,6 +2285,8 @@ impl GLProcessorST {
                     &proto_data.mask_coefficients,
                     output_width,
                     output_height,
+                    width,
+                    height,
                 )
             }
             ProtoTensor::Float(protos_f32) => {
@@ -2329,6 +2334,8 @@ impl GLProcessorST {
                     &proto_data.mask_coefficients,
                     output_width,
                     output_height,
+                    width,
+                    height,
                 )
             }
         }
@@ -2351,6 +2358,7 @@ impl GLProcessorST {
     /// For each detection: clear FBO, set coefficients, render quad, read back
     /// the bounding-box region as R8 pixels.
     #[cfg(feature = "decoder")]
+    #[allow(clippy::too_many_arguments)]
     fn render_mask_quads(
         &self,
         program: &GlProgram,
@@ -2358,6 +2366,8 @@ impl GLProcessorST {
         mask_coefficients: &[Vec<f32>],
         output_width: usize,
         output_height: usize,
+        _proto_width: usize,
+        _proto_height: usize,
     ) -> crate::Result<Vec<MaskResult>> {
         let mut results = Vec::with_capacity(detect.len());
 
@@ -2392,31 +2402,42 @@ impl GLProcessorST {
             }
             program.load_uniform_4fv(c"mask_coeff", &packed_coeff)?;
 
-            // Compute bbox pixel coordinates, clamped to FBO bounds.
+            // Compute bbox pixel coordinates.  Use span-based rounding for
+            // dimensions to match the numpy reference (round((xmax-xmin)*W))
+            // rather than endpoint subtraction (round(xmax*W)-round(xmin*W)),
+            // which avoids off-by-one mismatches on small objects.
             let ow = output_width as i32;
             let oh = output_height as i32;
-            let bbox_x = (det.bbox.xmin * output_width as f32).round() as i32;
-            let bbox_y = (det.bbox.ymin * output_height as f32).round() as i32;
-            let bbox_x2 = (det.bbox.xmax * output_width as f32).round() as i32;
-            let bbox_y2 = (det.bbox.ymax * output_height as f32).round() as i32;
+            let owf = output_width as f32;
+            let ohf = output_height as f32;
+            let bbox_x = (det.bbox.xmin * owf).round() as i32;
+            let bbox_y = (det.bbox.ymin * ohf).round() as i32;
+            let bbox_w = ((det.bbox.xmax - det.bbox.xmin) * owf).round() as i32;
+            let bbox_h = ((det.bbox.ymax - det.bbox.ymin) * ohf).round() as i32;
             let bbox_x = bbox_x.max(0).min(ow);
             let bbox_y = bbox_y.max(0).min(oh);
-            let bbox_x2 = bbox_x2.max(bbox_x).min(ow);
-            let bbox_y2 = bbox_y2.max(bbox_y).min(oh);
-            let bbox_w = (bbox_x2 - bbox_x).max(1);
-            let bbox_h = (bbox_y2 - bbox_y).max(1);
+            let bbox_w = bbox_w.max(1).min(ow - bbox_x);
+            let bbox_h = bbox_h.max(1).min(oh - bbox_y);
 
-            // Compute NDC coordinates for the quad
-            let cvt = |normalized: f32| normalized * 2.0 - 1.0;
-            let dst_left = cvt(det.bbox.xmin);
-            let dst_right = cvt(det.bbox.xmax);
-            let dst_top = cvt(det.bbox.ymax);
-            let dst_bottom = cvt(det.bbox.ymin);
+            // Derive pixel-exact NDC coordinates from the readback region so
+            // the rasterized quad exactly covers every pixel we read back.
+            let dst_left = bbox_x as f32 / owf * 2.0 - 1.0;
+            let dst_right = (bbox_x + bbox_w) as f32 / owf * 2.0 - 1.0;
+            let dst_bottom = bbox_y as f32 / ohf * 2.0 - 1.0;
+            let dst_top = (bbox_y + bbox_h) as f32 / ohf * 2.0 - 1.0;
 
-            let src_left = det.bbox.xmin;
-            let src_right = det.bbox.xmax;
-            let src_top = 1.0 - det.bbox.ymin;
-            let src_bottom = 1.0 - det.bbox.ymax;
+            // Proto texture coords: tex row 0 = image top (data uploaded
+            // row-major where y=0 is image top; GL treats first data row as
+            // texture bottom, so texelFetch(y=0) returns image top).
+            // tc.y=0 → image top, tc.y=1 → image bottom.
+            // At NDC top (image bottom = ymax) we need tc.y = ymax.
+            // At NDC bottom (image top = ymin) we need tc.y = ymin.
+            // Use the readback pixel boundaries for the texture coordinates
+            // so the mapping is consistent with the rasterized quad.
+            let src_left = bbox_x as f32 / owf;
+            let src_right = (bbox_x + bbox_w) as f32 / owf;
+            let src_bottom = bbox_y as f32 / ohf;
+            let src_top = (bbox_y + bbox_h) as f32 / ohf;
 
             unsafe {
                 gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
@@ -4177,7 +4198,7 @@ impl GLProcessorST {
             }
             width = src.width();
             height = src.height();
-            format = fourcc_to_drm(NV12);
+            format = fourcc_to_drm(NV12)?;
             channels = 1; // Y plane pitch is 1 byte per pixel
         } else if src.is_planar() {
             if !src.width().is_multiple_of(16) {
@@ -4208,7 +4229,7 @@ impl GLProcessorST {
             }
             width = src.width();
             height = src.height();
-            format = fourcc_to_drm(src.fourcc());
+            format = fourcc_to_drm(src.fourcc())?;
             channels = src.channels();
         }
 
@@ -5496,7 +5517,7 @@ impl Drop for EglImage {
 
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let e =
-                GlContext::egl_destory_image_with_fallback(&self.egl, self.display, self.egl_image);
+                GlContext::egl_destroy_image_with_fallback(&self.egl, self.display, self.egl_image);
             if let Err(e) = e {
                 error!("Could not destroy EGL image: {e:?}");
             }
@@ -5797,15 +5818,17 @@ fn check_gl_error(name: &str, line: u32) -> Result<(), Error> {
     Ok(())
 }
 
-fn fourcc_to_drm(fourcc: FourCharCode) -> DrmFourcc {
+fn fourcc_to_drm(fourcc: FourCharCode) -> Result<DrmFourcc, Error> {
     match fourcc {
-        RGBA => DrmFourcc::Abgr8888,
-        YUYV => DrmFourcc::Yuyv,
-        RGB | RGB_INT8 => DrmFourcc::Bgr888,
-        GREY => DrmFourcc::R8,
-        NV12 => DrmFourcc::Nv12,
-        PLANAR_RGB | PLANAR_RGB_INT8 => DrmFourcc::R8,
-        _ => todo!(),
+        RGBA => Ok(DrmFourcc::Abgr8888),
+        YUYV => Ok(DrmFourcc::Yuyv),
+        RGB | RGB_INT8 => Ok(DrmFourcc::Bgr888),
+        GREY => Ok(DrmFourcc::R8),
+        NV12 => Ok(DrmFourcc::Nv12),
+        PLANAR_RGB | PLANAR_RGB_INT8 => Ok(DrmFourcc::R8),
+        _ => Err(Error::NotSupported(format!(
+            "FourCC {fourcc:?} has no DRM format mapping"
+        ))),
     }
 }
 
