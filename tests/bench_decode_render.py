@@ -94,11 +94,28 @@ def get_model_outputs(tflite_path):
 
 
 def generate_synthetic_outputs():
-    """Generate synthetic int8 outputs matching yolov8n-seg shape."""
-    return [
-        np.random.randint(-128, 127, size=spec["shape"], dtype=spec["dtype"])
-        for spec in SYNTHETIC_OUTPUTS
-    ]
+    """Generate synthetic int8 outputs matching yolov8n-seg shape.
+
+    Box values are constrained so that dequantized coordinates stay within
+    [0, 1] (the decoder rejects un-normalized boxes).  With the fallback
+    quantization params (scale=0.004, zp=-125), the dequantized value is
+    (int8 + 125) * 0.004.  Boxes are in cxcywh format, so xmax = cx + w/2
+    can exceed 1.0 if cx and w are both large.  Constraining box int8 values
+    to [-125, 0] keeps all dequantized coordinates in [0, 0.5], ensuring
+    xyxy stays within [0, 1].
+    """
+    results = []
+    for spec in SYNTHETIC_OUTPUTS:
+        if spec is SYNTHETIC_OUTPUTS[2]:  # boxes tensor
+            arr = np.random.randint(
+                -125, 0, size=spec["shape"], dtype=spec["dtype"]
+            )
+        else:
+            arr = np.random.randint(
+                -128, 127, size=spec["shape"], dtype=spec["dtype"]
+            )
+        results.append(arr)
+    return results
 
 
 def get_target_info(gpu_display):
@@ -180,6 +197,99 @@ def bench_mask_path(
     return times, n_dets
 
 
+def bench_mask_atlas_path(
+    decoder, processor, outputs, n_iter, output_width=640, output_height=640
+):
+    """Benchmark: decode_and_render_mask_atlas() (GPU atlas readback path)."""
+    times = []
+    n_dets = 0
+    for _ in range(n_iter):
+        t0 = time.perf_counter()
+        boxes, scores, classes, atlas, metadata = decoder.decode_and_render_mask_atlas(
+            outputs, processor, output_width=output_width, output_height=output_height
+        )
+        elapsed = time.perf_counter() - t0
+        times.append(elapsed * 1000)  # ms
+        n_dets = len(boxes)
+    return times, n_dets
+
+
+def verify_atlas_correctness(
+    decoder, processor, outputs, output_width=640, output_height=640
+):
+    """Verify atlas path produces identical masks to per-detection path.
+
+    Runs both decode_and_render_masks() and decode_and_render_mask_atlas(),
+    then compares per-detection bbox crops from the atlas against the
+    reference per-detection masks. They should be identical or within +-1
+    due to floating-point rounding.
+    """
+    # Get per-detection reference masks
+    boxes_ref, scores_ref, classes_ref, masks_ref = decoder.decode_and_render_masks(
+        outputs, processor, output_width=output_width, output_height=output_height
+    )
+
+    # Get atlas masks
+    boxes_atl, scores_atl, classes_atl, atlas, metadata = (
+        decoder.decode_and_render_mask_atlas(
+            outputs, processor, output_width=output_width, output_height=output_height
+        )
+    )
+
+    n_ref = len(boxes_ref)
+    n_atl = len(boxes_atl)
+
+    if n_ref != n_atl:
+        print(
+            f"  FAIL: detection count mismatch: "
+            f"per-detection={n_ref}, atlas={n_atl}"
+        )
+        return False
+
+    if n_ref == 0:
+        print("  Atlas correctness: 0 detections (nothing to compare)")
+        return True
+
+    max_diff = 0
+    mismatched = 0
+
+    for i in range(n_ref):
+        x, y, w, h = metadata[i]
+
+        # Extract crop from atlas: atlas shape is [N, H, W]
+        atlas_crop = atlas[i, y : y + h, x : x + w]
+
+        # Reference mask shape is (H, W, 1) — squeeze the last dim
+        ref_crop = masks_ref[i][:, :, 0]
+
+        if atlas_crop.shape != ref_crop.shape:
+            print(
+                f"  FAIL: detection {i} shape mismatch: "
+                f"atlas_crop={atlas_crop.shape}, ref={ref_crop.shape}"
+            )
+            mismatched += 1
+            continue
+
+        diff = np.abs(atlas_crop.astype(np.int16) - ref_crop.astype(np.int16))
+        det_max_diff = int(diff.max())
+        max_diff = max(max_diff, det_max_diff)
+
+        if det_max_diff > 1:
+            mismatched += 1
+            print(
+                f"  WARNING: detection {i} max pixel diff = {det_max_diff} "
+                f"(crop {w}x{h} at ({x},{y}))"
+            )
+
+    ok = mismatched == 0
+    status = "PASS" if ok else "FAIL"
+    print(
+        f"  Atlas correctness: {n_ref} detections, "
+        f"max pixel diff = {max_diff} [{status}]"
+    )
+    return ok
+
+
 def has_set_int8_interpolation(processor):
     """Check if the processor supports set_int8_interpolation."""
     return hasattr(processor, "set_int8_interpolation")
@@ -234,6 +344,11 @@ def main():
         metavar="PATH",
         default=None,
         help="Write benchmark results to a JSON file for cross-target comparison",
+    )
+    parser.add_argument(
+        "--verify-atlas",
+        action="store_true",
+        help="Run atlas correctness verification before benchmarking",
     )
     args = parser.parse_args()
 
@@ -343,6 +458,10 @@ def main():
         bench_old_path(decoder, processor, dst, outputs, args.warmup)
         bench_fused_path(decoder, processor, dst, outputs, args.warmup)
         bench_mask_path(decoder, processor, outputs, args.warmup)
+        try:
+            bench_mask_atlas_path(decoder, processor, outputs, args.warmup)
+        except RuntimeError:
+            pass  # atlas may fail if n_detections * height > GL_MAX_TEXTURE_SIZE
 
         # --- Benchmark 2-step path ---
         old_times, old_dets = bench_old_path(
@@ -390,6 +509,43 @@ def main():
         mask_saved = statistics.mean(old_times) - statistics.mean(mask_times)
         print(f"    -> {mask_speedup:.2f}x ({mask_saved:+.2f}ms vs 2-step)")
         thresh_results["decode_and_render_masks"] = compute_stats(mask_times)
+
+        # --- Atlas correctness verification (if requested) ---
+        if args.verify_atlas:
+            print(f"\n  Atlas correctness verification (threshold={thresh}):")
+            try:
+                verify_atlas_correctness(decoder, processor, outputs)
+            except RuntimeError as e:
+                print(f"  SKIP: atlas verification failed ({e})")
+
+        # --- Benchmark mask atlas path ---
+        try:
+            atlas_times, atlas_dets = bench_mask_atlas_path(
+                decoder, processor, outputs, args.iterations
+            )
+            report("decode_and_render_mask_atlas()", atlas_times)
+            atlas_speedup = statistics.mean(old_times) / statistics.mean(atlas_times)
+            atlas_saved = statistics.mean(old_times) - statistics.mean(atlas_times)
+            print(f"    -> {atlas_speedup:.2f}x ({atlas_saved:+.2f}ms vs 2-step)")
+            if statistics.mean(mask_times) > 0:
+                atlas_vs_mask = (
+                    statistics.mean(mask_times) / statistics.mean(atlas_times)
+                )
+                atlas_mask_saved = (
+                    statistics.mean(mask_times) - statistics.mean(atlas_times)
+                )
+                print(
+                    f"    -> {atlas_vs_mask:.2f}x "
+                    f"({atlas_mask_saved:+.2f}ms vs per-detection masks)"
+                )
+            thresh_results["decode_and_render_mask_atlas"] = compute_stats(atlas_times)
+        except RuntimeError as e:
+            # Atlas may fail if detection count * output_height exceeds
+            # GL_MAX_TEXTURE_SIZE (e.g. 100 detections * 640 = 64000 > 16384).
+            print(
+                f"  decode_and_render_mask_atlas()  SKIPPED "
+                f"({old_dets} detections exceed GPU atlas capacity)"
+            )
 
         print(f"  {'─' * 95}")
 
