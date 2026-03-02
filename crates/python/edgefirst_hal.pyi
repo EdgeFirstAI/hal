@@ -436,6 +436,35 @@ class Decoder:
         """
         ...
 
+    def decode_and_render_mask_atlas(
+        self,
+        model_output: List[np.ndarray],
+        processor: ImageProcessor,
+        output_width: int = 640,
+        output_height: int = 640,
+        max_boxes: int = 100,
+    ) -> Tuple[
+        npt.NDArray[np.float32],
+        npt.NDArray[np.float32],
+        npt.NDArray[np.int32],
+        npt.NDArray[np.uint8],
+        List[Tuple[int, int, int, int]],
+    ]:
+        """
+        Decode model outputs and render all instance masks into a batched
+        atlas tensor shaped ``[N, output_height, output_width]`` as uint8.
+
+        Significantly faster than ``decode_and_render_masks()`` on GPU
+        backends because it renders all masks in a single pass with one PBO
+        readback instead of per-detection readback.
+
+        Returns:
+            Tuple of (boxes, scores, classes, atlas, metadata) where atlas
+            is an ndarray of shape ``[N, H, W]`` and metadata is a list of
+            ``(x, y, w, h)`` tuples for bbox crops within each atlas slot.
+        """
+        ...
+
     @staticmethod
     def decode_yolo_det(
         model_output: Union[
