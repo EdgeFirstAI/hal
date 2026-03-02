@@ -725,6 +725,14 @@ enum GLProcessorMessage {
         usize,
         tokio::sync::oneshot::Sender<Result<Vec<MaskResult>, Error>>,
     ),
+    #[cfg(feature = "decoder")]
+    RenderMaskAtlas(
+        SendablePtr<DetectBox>,
+        Box<ProtoData>,
+        usize, // output_width
+        usize, // output_height
+        tokio::sync::oneshot::Sender<Result<(Vec<u8>, Vec<MaskResult>), Error>>,
+    ),
     PboCreate(
         usize, // buffer size in bytes
         tokio::sync::oneshot::Sender<Result<u32, Error>>,
@@ -887,6 +895,23 @@ impl GLProcessorThreaded {
                     ) => {
                         let det = unsafe { std::slice::from_raw_parts(det.ptr.as_ptr(), det.len) };
                         let res = gl_converter.render_masks_from_protos(
+                            det,
+                            &proto_data,
+                            output_width,
+                            output_height,
+                        );
+                        let _ = resp.send(res);
+                    }
+                    #[cfg(feature = "decoder")]
+                    GLProcessorMessage::RenderMaskAtlas(
+                        det,
+                        proto_data,
+                        output_width,
+                        output_height,
+                        resp,
+                    ) => {
+                        let det = unsafe { std::slice::from_raw_parts(det.ptr.as_ptr(), det.len) };
+                        let res = gl_converter.render_masks_from_protos_atlas(
                             det,
                             &proto_data,
                             output_width,
@@ -1123,6 +1148,23 @@ impl ImageProcessorTrait for GLProcessorThreaded {
     }
 
     #[cfg(feature = "decoder")]
+    fn render_masks_from_protos_atlas(
+        &mut self,
+        detect: &[DetectBox],
+        proto_data: ProtoData,
+        output_width: usize,
+        output_height: usize,
+    ) -> crate::Result<(Vec<u8>, Vec<MaskResult>)> {
+        GLProcessorThreaded::render_masks_from_protos_atlas(
+            self,
+            detect,
+            proto_data,
+            output_width,
+            output_height,
+        )
+    }
+
+    #[cfg(feature = "decoder")]
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<(), crate::Error> {
         let (err_send, err_recv) = tokio::sync::oneshot::channel();
         self.sender
@@ -1168,6 +1210,39 @@ impl GLProcessorThreaded {
             .as_ref()
             .unwrap()
             .blocking_send(GLProcessorMessage::RenderMasksFromProtos(
+                SendablePtr {
+                    ptr: NonNull::new(detect.as_ptr() as *mut DetectBox).unwrap(),
+                    len: detect.len(),
+                },
+                Box::new(proto_data),
+                output_width,
+                output_height,
+                resp_send,
+            ))
+            .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
+        resp_recv.blocking_recv().map_err(|_| {
+            Error::Internal("GL converter error messaging closed without update".to_string())
+        })?
+    }
+
+    /// Render all detection masks into a single atlas via the GL thread.
+    ///
+    /// Returns `(atlas_pixels, metadata)` where `atlas_pixels` is a contiguous
+    /// `Vec<u8>` of shape `[N, output_height, output_width]` and `metadata`
+    /// contains per-detection bbox coordinates.
+    #[cfg(feature = "decoder")]
+    pub fn render_masks_from_protos_atlas(
+        &mut self,
+        detect: &[DetectBox],
+        proto_data: ProtoData,
+        output_width: usize,
+        output_height: usize,
+    ) -> Result<(Vec<u8>, Vec<MaskResult>), crate::Error> {
+        let (resp_send, resp_recv) = tokio::sync::oneshot::channel();
+        self.sender
+            .as_ref()
+            .unwrap()
+            .blocking_send(GLProcessorMessage::RenderMaskAtlas(
                 SendablePtr {
                     ptr: NonNull::new(detect.as_ptr() as *mut DetectBox).unwrap(),
                     len: detect.len(),
@@ -1401,6 +1476,12 @@ pub struct GLProcessorST {
     #[cfg(feature = "decoder")]
     /// Current allocated height of mask FBO texture.
     mask_fbo_height: usize,
+    #[cfg(feature = "decoder")]
+    /// PBO buffer ID for atlas readback (0 = not allocated).
+    mask_atlas_pbo: u32,
+    #[cfg(feature = "decoder")]
+    /// Current atlas capacity in number of mask slots.
+    mask_atlas_slots: usize,
     vertex_buffer: Buffer,
     texture_buffer: Buffer,
     /// Persistent FBO for the convert() render path.
@@ -1445,6 +1526,9 @@ impl Drop for GLProcessorST {
                 }
                 if self.mask_fbo_texture != 0 {
                     gls::gl::DeleteTextures(1, &self.mask_fbo_texture);
+                }
+                if self.mask_atlas_pbo != 0 {
+                    gls::gl::DeleteBuffers(1, &self.mask_atlas_pbo);
                 }
             }
         }
@@ -1661,6 +1745,23 @@ impl ImageProcessorTrait for GLProcessorST {
         output_height: usize,
     ) -> crate::Result<Vec<MaskResult>> {
         GLProcessorST::render_masks_from_protos(
+            self,
+            detect,
+            &proto_data,
+            output_width,
+            output_height,
+        )
+    }
+
+    #[cfg(feature = "decoder")]
+    fn render_masks_from_protos_atlas(
+        &mut self,
+        detect: &[DetectBox],
+        proto_data: ProtoData,
+        output_width: usize,
+        output_height: usize,
+    ) -> crate::Result<(Vec<u8>, Vec<MaskResult>)> {
+        GLProcessorST::render_masks_from_protos_atlas(
             self,
             detect,
             &proto_data,
@@ -1887,6 +1988,10 @@ impl GLProcessorST {
             mask_fbo_width: 0,
             #[cfg(feature = "decoder")]
             mask_fbo_height: 0,
+            #[cfg(feature = "decoder")]
+            mask_atlas_pbo: 0,
+            #[cfg(feature = "decoder")]
+            mask_atlas_slots: 0,
             vertex_buffer,
             texture_buffer,
             convert_fbo: FrameBuffer::new(),
@@ -2183,6 +2288,44 @@ impl GLProcessorST {
         Ok(())
     }
 
+    /// Ensures the mask atlas FBO and PBO are allocated for the given number
+    /// of mask slots. Reuses the mask FBO (resized to `width x height*n_slots`)
+    /// and allocates/resizes a PBO for the atlas readback.
+    #[cfg(feature = "decoder")]
+    fn ensure_mask_atlas(
+        &mut self,
+        width: usize,
+        height: usize,
+        n_slots: usize,
+    ) -> crate::Result<()> {
+        let atlas_height = height * n_slots;
+        if self.mask_fbo_width == width
+            && self.mask_fbo_height >= atlas_height
+            && self.mask_fbo != 0
+            && self.mask_atlas_pbo != 0
+        {
+            self.mask_atlas_slots = n_slots;
+            return Ok(());
+        }
+        self.ensure_mask_fbo(width, atlas_height)?;
+        let pbo_size = width * atlas_height;
+        unsafe {
+            if self.mask_atlas_pbo == 0 {
+                gls::gl::GenBuffers(1, &mut self.mask_atlas_pbo);
+            }
+            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, self.mask_atlas_pbo);
+            gls::gl::BufferData(
+                gls::gl::PIXEL_PACK_BUFFER,
+                pbo_size as isize,
+                std::ptr::null(),
+                gls::gl::DYNAMIC_READ,
+            );
+            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+        }
+        self.mask_atlas_slots = n_slots;
+        Ok(())
+    }
+
     /// Render per-instance grayscale masks at full output resolution.
     ///
     /// For each detection, renders a quad to a dedicated R8 FBO using a
@@ -2358,6 +2501,205 @@ impl GLProcessorST {
         })
     }
 
+    /// Render all detection masks into a single atlas texture and read back
+    /// as a contiguous buffer, with one PBO readback for all masks.
+    ///
+    /// Returns `(atlas_pixels, metadata)` where `atlas_pixels` is a contiguous
+    /// `Vec<u8>` of size `output_width * output_height * N` and `metadata`
+    /// contains per-detection bbox info (with empty pixel vecs).
+    #[cfg(feature = "decoder")]
+    pub fn render_masks_from_protos_atlas(
+        &mut self,
+        detect: &[DetectBox],
+        proto_data: &ProtoData,
+        output_width: usize,
+        output_height: usize,
+    ) -> crate::Result<(Vec<u8>, Vec<MaskResult>)> {
+        use crate::FunctionTimer;
+
+        let _timer = FunctionTimer::new("GLProcessorST::render_masks_from_protos_atlas");
+
+        if detect.is_empty() || proto_data.mask_coefficients.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        let (height, width, num_protos) = proto_data.protos.dim();
+        let texture_target = gls::gl::TEXTURE_2D_ARRAY;
+
+        // Save current FBO and viewport
+        let (saved_fbo, saved_viewport) = unsafe {
+            let mut fbo: i32 = 0;
+            gls::gl::GetIntegerv(gls::gl::FRAMEBUFFER_BINDING, &mut fbo);
+            let mut vp = [0i32; 4];
+            gls::gl::GetIntegerv(gls::gl::VIEWPORT, vp.as_mut_ptr());
+            (fbo as u32, vp)
+        };
+
+        // Ensure atlas FBO and PBO are allocated (must be done before the
+        // match block to avoid borrow conflicts with shader references)
+        self.ensure_mask_atlas(output_width, output_height, detect.len())?;
+
+        // Upload proto texture array and select the appropriate shader
+        gls::active_texture(gls::gl::TEXTURE0);
+        gls::bind_texture(texture_target, self.proto_texture.id);
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_MIN_FILTER,
+            gls::gl::NEAREST as i32,
+        );
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_MAG_FILTER,
+            gls::gl::NEAREST as i32,
+        );
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_WRAP_S,
+            gls::gl::CLAMP_TO_EDGE as i32,
+        );
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_WRAP_T,
+            gls::gl::CLAMP_TO_EDGE as i32,
+        );
+
+        let atlas_result = match &proto_data.protos {
+            ProtoTensor::Quantized {
+                protos,
+                quantization,
+            } => {
+                let mut tex_data = vec![0i8; height * width * num_protos];
+                for k in 0..num_protos {
+                    for y in 0..height {
+                        for x in 0..width {
+                            tex_data[k * height * width + y * width + x] = protos[[y, x, k]];
+                        }
+                    }
+                }
+                gls::tex_image3d(
+                    texture_target,
+                    0,
+                    gls::gl::R8I as i32,
+                    width as i32,
+                    height as i32,
+                    num_protos as i32,
+                    0,
+                    gls::gl::RED_INTEGER,
+                    gls::gl::BYTE,
+                    Some(&tex_data),
+                );
+
+                let proto_scale = quantization.scale;
+                let proto_scaled_zp = -(quantization.zero_point as f32) * quantization.scale;
+
+                let program = match self.int8_interpolation_mode {
+                    Int8InterpolationMode::Nearest => &self.proto_mask_int8_nearest_program,
+                    _ => &self.proto_mask_int8_bilinear_program,
+                };
+                gls::use_program(program.id);
+                program.load_uniform_1i(c"num_protos", num_protos as i32)?;
+                program.load_uniform_1f(c"proto_scale", proto_scale)?;
+                program.load_uniform_1f(c"proto_scaled_zp", proto_scaled_zp)?;
+
+                self.render_mask_atlas(
+                    program,
+                    detect,
+                    &proto_data.mask_coefficients,
+                    output_width,
+                    output_height,
+                )
+            }
+            ProtoTensor::Float(protos_f32) => {
+                let mut tex_data = vec![0.0f32; height * width * num_protos];
+                for k in 0..num_protos {
+                    for y in 0..height {
+                        for x in 0..width {
+                            tex_data[k * height * width + y * width + x] = protos_f32[[y, x, k]];
+                        }
+                    }
+                }
+                gls::tex_image3d(
+                    texture_target,
+                    0,
+                    gls::gl::R32F as i32,
+                    width as i32,
+                    height as i32,
+                    num_protos as i32,
+                    0,
+                    gls::gl::RED,
+                    gls::gl::FLOAT,
+                    Some(&tex_data),
+                );
+                if self.has_float_linear {
+                    gls::tex_parameteri(
+                        texture_target,
+                        gls::gl::TEXTURE_MIN_FILTER,
+                        gls::gl::LINEAR as i32,
+                    );
+                    gls::tex_parameteri(
+                        texture_target,
+                        gls::gl::TEXTURE_MAG_FILTER,
+                        gls::gl::LINEAR as i32,
+                    );
+                }
+
+                let program = &self.proto_mask_f32_program;
+                gls::use_program(program.id);
+                program.load_uniform_1i(c"num_protos", num_protos as i32)?;
+
+                self.render_mask_atlas(
+                    program,
+                    detect,
+                    &proto_data.mask_coefficients,
+                    output_width,
+                    output_height,
+                )
+            }
+        };
+
+        // Restore previous FBO + viewport
+        unsafe {
+            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, saved_fbo);
+            gls::gl::Viewport(
+                saved_viewport[0],
+                saved_viewport[1],
+                saved_viewport[2],
+                saved_viewport[3],
+            );
+        }
+
+        let atlas_pixels = atlas_result?;
+
+        // Compute per-detection MaskResult metadata (with empty pixels vecs)
+        let owf = output_width as f32;
+        let ohf = output_height as f32;
+        let ow = output_width as i32;
+        let oh = output_height as i32;
+
+        let metadata: Vec<MaskResult> = detect
+            .iter()
+            .map(|det| {
+                let bbox_x = (det.bbox.xmin * owf).round() as i32;
+                let bbox_y = (det.bbox.ymin * ohf).round() as i32;
+                let bbox_w = ((det.bbox.xmax - det.bbox.xmin) * owf).round() as i32;
+                let bbox_h = ((det.bbox.ymax - det.bbox.ymin) * ohf).round() as i32;
+                let bbox_x = bbox_x.max(0).min(ow);
+                let bbox_y = bbox_y.max(0).min(oh);
+                let bbox_w = bbox_w.max(1).min(ow - bbox_x);
+                let bbox_h = bbox_h.max(1).min(oh - bbox_y);
+                MaskResult {
+                    x: bbox_x as usize,
+                    y: bbox_y as usize,
+                    w: bbox_w as usize,
+                    h: bbox_h as usize,
+                    pixels: Vec::new(),
+                }
+            })
+            .collect();
+
+        Ok((atlas_pixels, metadata))
+    }
+
     /// Render per-detection quads to the mask FBO and read back bbox regions.
     ///
     /// For each detection: clear FBO, set coefficients, render quad, read back
@@ -2509,6 +2851,165 @@ impl GLProcessorST {
         }
 
         Ok(results)
+    }
+
+    /// Render all detection masks into a single atlas FBO, then read back
+    /// into a PBO.  Returns a contiguous `Vec<u8>` of size
+    /// `output_width * output_height * detect.len()` laid out as
+    /// `[N, output_height, output_width]`.
+    ///
+    /// Caller **must** call `ensure_mask_atlas()` before this method.
+    #[cfg(feature = "decoder")]
+    fn render_mask_atlas(
+        &self,
+        program: &GlProgram,
+        detect: &[DetectBox],
+        mask_coefficients: &[Vec<f32>],
+        output_width: usize,
+        output_height: usize,
+    ) -> crate::Result<Vec<u8>> {
+        let n = detect.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+
+        let atlas_height = output_height * n;
+
+        unsafe {
+            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, self.mask_fbo);
+            gls::gl::Viewport(0, 0, output_width as i32, atlas_height as i32);
+            gls::gl::Disable(gls::gl::BLEND);
+            gls::gl::ClearColor(0.0, 0.0, 0.0, 0.0);
+            gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
+        }
+
+        let owf = output_width as f32;
+        let ohf = output_height as f32;
+        let ahf = atlas_height as f32;
+
+        if let Some(first_coeff) = mask_coefficients.first() {
+            if first_coeff.len() > 32 {
+                log::warn!(
+                    "render_mask_atlas: {} mask coefficients exceeds shader \
+                     limit of 32 — coefficients will be truncated",
+                    first_coeff.len()
+                );
+            }
+        }
+
+        for (i, (det, coeff)) in detect.iter().zip(mask_coefficients.iter()).enumerate() {
+            let mut packed_coeff = [[0.0f32; 4]; 8];
+            for (j, val) in coeff.iter().enumerate().take(32) {
+                packed_coeff[j / 4][j % 4] = *val;
+            }
+            program.load_uniform_4fv(c"mask_coeff", &packed_coeff)?;
+
+            // Bbox pixel coords within the single-frame cell
+            let ow = output_width as i32;
+            let oh = output_height as i32;
+            let bbox_x = (det.bbox.xmin * owf).round() as i32;
+            let bbox_y = (det.bbox.ymin * ohf).round() as i32;
+            let bbox_w = ((det.bbox.xmax - det.bbox.xmin) * owf).round() as i32;
+            let bbox_h = ((det.bbox.ymax - det.bbox.ymin) * ohf).round() as i32;
+            let bbox_x = bbox_x.max(0).min(ow);
+            let bbox_y = bbox_y.max(0).min(oh);
+            let bbox_w = bbox_w.max(1).min(ow - bbox_x);
+            let bbox_h = bbox_h.max(1).min(oh - bbox_y);
+
+            // Atlas slot offset
+            let slot_y_offset = (i * output_height) as i32;
+            let abs_y = slot_y_offset + bbox_y;
+
+            // NDC coords in atlas space
+            let dst_left = bbox_x as f32 / owf * 2.0 - 1.0;
+            let dst_right = (bbox_x + bbox_w) as f32 / owf * 2.0 - 1.0;
+            let dst_bottom = abs_y as f32 / ahf * 2.0 - 1.0;
+            let dst_top = (abs_y + bbox_h) as f32 / ahf * 2.0 - 1.0;
+
+            // Proto texture coords (map bbox to proto space)
+            let src_left = bbox_x as f32 / owf;
+            let src_right = (bbox_x + bbox_w) as f32 / owf;
+            let src_bottom = bbox_y as f32 / ohf;
+            let src_top = (bbox_y + bbox_h) as f32 / ohf;
+
+            unsafe {
+                gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
+                gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
+                let verts: [f32; 12] = [
+                    dst_left, dst_top, 0.0,
+                    dst_right, dst_top, 0.0,
+                    dst_right, dst_bottom, 0.0,
+                    dst_left, dst_bottom, 0.0,
+                ];
+                gls::gl::BufferSubData(
+                    gls::gl::ARRAY_BUFFER,
+                    0,
+                    (size_of::<f32>() * 12) as isize,
+                    verts.as_ptr() as *const c_void,
+                );
+
+                gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
+                gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
+                let tc: [f32; 8] = [
+                    src_left, src_top,
+                    src_right, src_top,
+                    src_right, src_bottom,
+                    src_left, src_bottom,
+                ];
+                gls::gl::BufferSubData(
+                    gls::gl::ARRAY_BUFFER,
+                    0,
+                    (size_of::<f32>() * 8) as isize,
+                    tc.as_ptr() as *const c_void,
+                );
+
+                let idx: [u32; 4] = [0, 1, 2, 3];
+                gls::gl::DrawElements(
+                    gls::gl::TRIANGLE_FAN,
+                    4,
+                    gls::gl::UNSIGNED_INT,
+                    idx.as_ptr() as *const c_void,
+                );
+            }
+        }
+
+        // ONE readback for all masks
+        let atlas_bytes = output_width * atlas_height;
+        let mut pixels = vec![0u8; atlas_bytes];
+
+        unsafe {
+            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, self.mask_atlas_pbo);
+            gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
+            gls::gl::ReadnPixels(
+                0,
+                0,
+                output_width as i32,
+                atlas_height as i32,
+                gls::gl::RED,
+                gls::gl::UNSIGNED_BYTE,
+                atlas_bytes as i32,
+                std::ptr::null_mut(),
+            );
+            gls::gl::Finish();
+
+            let ptr = gls::gl::MapBufferRange(
+                gls::gl::PIXEL_PACK_BUFFER,
+                0,
+                atlas_bytes as isize,
+                gls::gl::MAP_READ_BIT,
+            );
+            if ptr.is_null() {
+                gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+                return Err(crate::Error::OpenGl(
+                    "Failed to map atlas PBO for readback".to_string(),
+                ));
+            }
+            std::ptr::copy_nonoverlapping(ptr as *const u8, pixels.as_mut_ptr(), atlas_bytes);
+            gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
+            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+        }
+
+        Ok(pixels)
     }
 
     fn check_src_format_supported(backend: TransferBackend, img: &TensorImage) -> bool {

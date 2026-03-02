@@ -2334,6 +2334,50 @@ impl ImageProcessorTrait for CPUProcessor {
     }
 
     #[cfg(feature = "decoder")]
+    fn render_masks_from_protos_atlas(
+        &mut self,
+        detect: &[crate::DetectBox],
+        proto_data: crate::ProtoData,
+        output_width: usize,
+        output_height: usize,
+    ) -> Result<(Vec<u8>, Vec<crate::MaskResult>)> {
+        use crate::FunctionTimer;
+
+        let _timer = FunctionTimer::new("CPUProcessor::render_masks_from_protos_atlas");
+
+        // Render per-detection masks via existing path
+        let mask_results =
+            self.render_masks_from_protos(detect, proto_data, output_width, output_height)?;
+
+        // Pack into atlas layout: [N, output_height, output_width]
+        let n = mask_results.len();
+        let slot_size = output_width * output_height;
+        let mut atlas = vec![0u8; n * slot_size];
+        let mut metadata = Vec::with_capacity(n);
+
+        for (i, mr) in mask_results.iter().enumerate() {
+            let slot_offset = i * slot_size;
+            for row in 0..mr.h {
+                let dst_start = slot_offset + (mr.y + row) * output_width + mr.x;
+                let src_start = row * mr.w;
+                if dst_start + mr.w <= atlas.len() && src_start + mr.w <= mr.pixels.len() {
+                    atlas[dst_start..dst_start + mr.w]
+                        .copy_from_slice(&mr.pixels[src_start..src_start + mr.w]);
+                }
+            }
+            metadata.push(crate::MaskResult {
+                x: mr.x,
+                y: mr.y,
+                w: mr.w,
+                h: mr.h,
+                pixels: Vec::new(),
+            });
+        }
+
+        Ok((atlas, metadata))
+    }
+
+    #[cfg(feature = "decoder")]
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<()> {
         for (c, new_c) in self.colors.iter_mut().zip(colors.iter()) {
             *c = *new_c;
