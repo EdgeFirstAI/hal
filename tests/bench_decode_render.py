@@ -7,16 +7,18 @@ model is available, otherwise falls back to synthetic int8 data matching the
 model output shapes.
 
 Usage:
-    python tests/bench_decode_render.py [--iterations N] [--warmup N]
+    python tests/bench_decode_render.py [--iterations N] [--warmup N] [--json results.json]
 """
 
 import argparse
+import io
 import json
 import os
+import platform
+import socket
 import statistics
 import time
 import zipfile
-import io
 
 import numpy as np
 
@@ -97,6 +99,39 @@ def generate_synthetic_outputs():
         np.random.randint(-128, 127, size=spec["shape"], dtype=spec["dtype"])
         for spec in SYNTHETIC_OUTPUTS
     ]
+
+
+def get_target_info(gpu_display):
+    """Collect target identification for cross-target comparison."""
+    info = {
+        "hostname": socket.gethostname(),
+        "platform": platform.platform(),
+        "arch": platform.machine(),
+        "python": platform.python_version(),
+        "egl_display": "none",
+        "egl_description": "",
+    }
+    try:
+        displays = probe_egl_displays()
+        if displays:
+            info["egl_display"] = str(displays[0].kind)
+            info["egl_description"] = displays[0].description
+    except Exception:
+        pass  # defaults already set
+    return info
+
+
+def compute_stats(times):
+    """Compute timing statistics from a list of per-iteration times (ms)."""
+    sorted_times = sorted(times)
+    return {
+        "mean": round(statistics.mean(times), 4),
+        "median": round(statistics.median(times), 4),
+        "p95": round(sorted_times[int(len(sorted_times) * 0.95)], 4),
+        "min": round(min(times), 4),
+        "max": round(max(times), 4),
+        "times": [round(t, 4) for t in times],
+    }
 
 
 def bench_old_path(decoder, processor, dst, outputs, n_iter):
@@ -194,6 +229,12 @@ def main():
         default=None,
         help="Test specific int8 interpolation mode(s) for fused path",
     )
+    parser.add_argument(
+        "--json",
+        metavar="PATH",
+        default=None,
+        help="Write benchmark results to a JSON file for cross-target comparison",
+    )
     args = parser.parse_args()
 
     # --- GPU / EGL display diagnostics ---
@@ -211,6 +252,10 @@ def main():
     except RuntimeError as e:
         print(f"  EGL probe failed: {e} — rendering will use CPU fallback")
         gpu_display = None
+
+    # --- Collect target info and prepare results dict ---
+    target_info = get_target_info(gpu_display)
+    results = {}
 
     # --- Setup decoder config ---
     if os.path.exists(args.model) and not args.synthetic:
@@ -291,6 +336,8 @@ def main():
 
     for thresh in thresholds:
         decoder = Decoder(metadata, score_threshold=thresh, iou_threshold=0.45)
+        thresh_key = str(thresh)
+        thresh_results = {}
 
         # --- Warmup ---
         bench_old_path(decoder, processor, dst, outputs, args.warmup)
@@ -301,6 +348,9 @@ def main():
         old_times, old_dets = bench_old_path(
             decoder, processor, dst, outputs, args.iterations
         )
+
+        thresh_results["n_detections"] = old_dets
+        thresh_results["decode_render_to_image"] = compute_stats(old_times)
 
         print(f"\n  score_threshold={thresh} ({old_dets} detections):")
         print(f"  {'─' * 95}")
@@ -319,6 +369,7 @@ def main():
                 speedup = statistics.mean(old_times) / statistics.mean(fused_times)
                 saved = statistics.mean(old_times) - statistics.mean(fused_times)
                 print(f"    -> {speedup:.2f}x ({saved:+.2f}ms vs 2-step)")
+                thresh_results[f"decode_and_render_{mode}"] = compute_stats(fused_times)
         else:
             # No interpolation API — benchmark single fused path
             fused_times, fused_dets = bench_fused_path(
@@ -328,6 +379,7 @@ def main():
             speedup = statistics.mean(old_times) / statistics.mean(fused_times)
             saved = statistics.mean(old_times) - statistics.mean(fused_times)
             print(f"  Speedup: {speedup:.2f}x ({saved:+.2f}ms per frame)")
+            thresh_results["decode_and_render"] = compute_stats(fused_times)
 
         # --- Benchmark mask readback path ---
         mask_times, mask_dets = bench_mask_path(
@@ -337,8 +389,21 @@ def main():
         mask_speedup = statistics.mean(old_times) / statistics.mean(mask_times)
         mask_saved = statistics.mean(old_times) - statistics.mean(mask_times)
         print(f"    -> {mask_speedup:.2f}x ({mask_saved:+.2f}ms vs 2-step)")
+        thresh_results["decode_and_render_masks"] = compute_stats(mask_times)
 
         print(f"  {'─' * 95}")
+
+        results[thresh_key] = thresh_results
+
+    # --- Write JSON output if requested ---
+    if args.json:
+        output = {
+            "target": target_info,
+            "results": results,
+        }
+        with open(args.json, "w") as f:
+            json.dump(output, f, indent=2)
+        print(f"\nResults written to: {args.json}")
 
 
 if __name__ == "__main__":
