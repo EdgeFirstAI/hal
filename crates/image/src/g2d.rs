@@ -214,6 +214,19 @@ impl ImageProcessorTrait for G2DProcessor {
     }
 
     #[cfg(feature = "decoder")]
+    fn render_masks_from_protos_atlas(
+        &mut self,
+        _detect: &[crate::DetectBox],
+        _proto_data: crate::ProtoData,
+        _output_width: usize,
+        _output_height: usize,
+    ) -> Result<(Vec<u8>, Vec<crate::MaskResult>)> {
+        Err(Error::NotImplemented(
+            "G2D does not support rendering mask atlas".to_string(),
+        ))
+    }
+
+    #[cfg(feature = "decoder")]
     fn set_class_colors(&mut self, _: &[[u8; 4]]) -> Result<()> {
         Err(Error::NotImplemented(
             "G2D does not support setting colors for rendering detection or segmentation overlays"

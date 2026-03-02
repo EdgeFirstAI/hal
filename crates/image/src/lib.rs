@@ -1273,6 +1273,25 @@ pub trait ImageProcessorTrait {
     ) -> Result<Vec<MaskResult>>;
 
     #[cfg(feature = "decoder")]
+    /// Renders all detection masks into a single atlas buffer with one GPU
+    /// readback, returning the contiguous pixel data and per-detection bbox
+    /// metadata.
+    ///
+    /// The atlas is laid out as `[N, output_height, output_width]` in row-major
+    /// order. Each slot corresponds to one detection, with the mask rendered
+    /// at its bounding-box region and zeros elsewhere.
+    ///
+    /// Returns `(atlas_pixels, metadata)` where `metadata` contains the bbox
+    /// coordinates for each detection (with empty pixel vecs).
+    fn render_masks_from_protos_atlas(
+        &mut self,
+        detect: &[DetectBox],
+        proto_data: ProtoData,
+        output_width: usize,
+        output_height: usize,
+    ) -> Result<(Vec<u8>, Vec<MaskResult>)>;
+
+    #[cfg(feature = "decoder")]
     /// Sets the colors used for rendering segmentation masks. Up to 17 colors
     /// can be set.
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<()>;
@@ -1771,6 +1790,52 @@ impl ImageProcessorTrait for ImageProcessor {
         }
         if let Some(cpu) = self.cpu.as_mut() {
             return cpu.render_masks_from_protos(detect, proto_data, output_width, output_height);
+        }
+        Err(Error::NoConverter)
+    }
+
+    #[cfg(feature = "decoder")]
+    fn render_masks_from_protos_atlas(
+        &mut self,
+        detect: &[DetectBox],
+        proto_data: ProtoData,
+        output_width: usize,
+        output_height: usize,
+    ) -> Result<(Vec<u8>, Vec<MaskResult>)> {
+        if detect.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        #[cfg(target_os = "linux")]
+        #[cfg(feature = "opengl")]
+        {
+            let has_opengl = self.opengl.is_some();
+            if has_opengl {
+                let opengl = self.opengl.as_mut().unwrap();
+                match opengl.render_masks_from_protos_atlas(
+                    detect,
+                    proto_data,
+                    output_width,
+                    output_height,
+                ) {
+                    Ok(r) => return Ok(r),
+                    Err(e) => {
+                        log::trace!(
+                            "render_masks_from_protos_atlas didn't work with opengl: {e:?}"
+                        );
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        // CPU fallback: render per-detection masks and pack into atlas layout
+        if let Some(cpu) = self.cpu.as_mut() {
+            return cpu.render_masks_from_protos_atlas(
+                detect,
+                proto_data,
+                output_width,
+                output_height,
+            );
         }
         Err(Error::NoConverter)
     }
