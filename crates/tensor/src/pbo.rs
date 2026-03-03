@@ -37,7 +37,15 @@ unsafe impl Send for PboMapping {}
 /// All methods are blocking — they send commands to the GL thread
 /// and wait for completion. Implementations must ensure GL context
 /// is current on the thread that executes the actual GL calls.
-pub trait PboOps: Send + Sync {
+///
+/// # Safety
+///
+/// Implementations must ensure:
+/// - `map_buffer` returns a valid, aligned pointer to `size` bytes of
+///   CPU-accessible memory that remains valid until `unmap_buffer` is called.
+/// - `unmap_buffer` invalidates the pointer and releases the mapping.
+/// - `delete_buffer` frees the GL buffer resources.
+pub unsafe trait PboOps: Send + Sync {
     /// Map the PBO for CPU read/write access.
     /// The returned PboMapping is valid until `unmap_buffer` is called.
     fn map_buffer(&self, buffer_id: u32, size: usize) -> Result<PboMapping>;
@@ -102,15 +110,31 @@ where
     ///
     /// Called by the image crate after creating the PBO on the GL thread.
     /// Users should not call this directly — use `ImageProcessor::create_image()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::ShapeMismatch` if `size` does not equal
+    /// `shape.iter().product::<usize>() * std::mem::size_of::<T>()`.
+    /// Returns `Error::InvalidSize` if `size` is zero.
     pub fn from_pbo(
         buffer_id: u32,
         size: usize,
         shape: &[usize],
         name: Option<&str>,
         ops: Arc<dyn PboOps>,
-    ) -> Self {
+    ) -> Result<Self> {
+        let expected = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+        if size != expected {
+            return Err(Error::ShapeMismatch(format!(
+                "PBO size {size} does not match shape {shape:?} * sizeof({}) = {expected}",
+                std::any::type_name::<T>(),
+            )));
+        }
+        if size == 0 {
+            return Err(Error::InvalidSize(0));
+        }
         let name = name.unwrap_or("pbo_tensor").to_owned();
-        Self {
+        Ok(Self {
             name,
             shape: shape.to_vec(),
             handle: Arc::new(PboHandle {
@@ -121,7 +145,7 @@ where
             }),
             identity: BufferIdentity::new(),
             _marker: PhantomData,
-        }
+        })
     }
 
     /// Returns the GL buffer ID for this PBO.
@@ -342,7 +366,9 @@ mod tests {
         }
     }
 
-    impl PboOps for MockPboOps {
+    // SAFETY: MockPboOps returns a valid pointer to a Vec<u8> that remains
+    // valid while the Mutex is held (tests are single-threaded).
+    unsafe impl PboOps for MockPboOps {
         fn map_buffer(&self, _buffer_id: u32, size: usize) -> Result<PboMapping> {
             let storage = self.storage.lock().expect("lock");
             assert_eq!(storage.len(), size);
@@ -362,7 +388,7 @@ mod tests {
     #[test]
     fn test_pbo_tensor_create_and_metadata() {
         let ops = MockPboOps::new(24);
-        let tensor = PboTensor::<u8>::from_pbo(42, 24, &[2, 3, 4], Some("test_pbo"), ops);
+        let tensor = PboTensor::<u8>::from_pbo(42, 24, &[2, 3, 4], Some("test_pbo"), ops).unwrap();
         assert_eq!(tensor.memory(), TensorMemory::Pbo);
         assert_eq!(tensor.name(), "test_pbo");
         assert_eq!(tensor.shape(), &[2, 3, 4]);
@@ -373,7 +399,7 @@ mod tests {
     #[test]
     fn test_pbo_tensor_map_write_read() {
         let ops = MockPboOps::new(12);
-        let tensor = PboTensor::<u8>::from_pbo(1, 12, &[3, 4], Some("rw_test"), ops);
+        let tensor = PboTensor::<u8>::from_pbo(1, 12, &[3, 4], Some("rw_test"), ops).unwrap();
         {
             let mut map = tensor.map().expect("map should succeed");
             assert_eq!(map.shape(), &[3, 4]);
@@ -387,7 +413,7 @@ mod tests {
     #[test]
     fn test_pbo_tensor_double_map_fails() {
         let ops = MockPboOps::new(8);
-        let tensor = PboTensor::<u8>::from_pbo(2, 8, &[8], None, ops);
+        let tensor = PboTensor::<u8>::from_pbo(2, 8, &[8], None, ops).unwrap();
         let _map1 = tensor.map().expect("first map should succeed");
         assert!(tensor.is_mapped());
         let result = tensor.map();
@@ -397,7 +423,7 @@ mod tests {
     #[test]
     fn test_pbo_tensor_reshape() {
         let ops = MockPboOps::new(24);
-        let mut tensor = PboTensor::<u8>::from_pbo(3, 24, &[2, 3, 4], None, ops);
+        let mut tensor = PboTensor::<u8>::from_pbo(3, 24, &[2, 3, 4], None, ops).unwrap();
         tensor
             .reshape(&[4, 6])
             .expect("compatible reshape should succeed");
@@ -410,8 +436,8 @@ mod tests {
     fn test_pbo_tensor_buffer_identity() {
         let ops1 = MockPboOps::new(8);
         let ops2 = MockPboOps::new(8);
-        let t1 = PboTensor::<u8>::from_pbo(1, 8, &[8], None, ops1);
-        let t2 = PboTensor::<u8>::from_pbo(2, 8, &[8], None, ops2);
+        let t1 = PboTensor::<u8>::from_pbo(1, 8, &[8], None, ops1).unwrap();
+        let t2 = PboTensor::<u8>::from_pbo(2, 8, &[8], None, ops2).unwrap();
         assert_ne!(t1.buffer_identity().id(), t2.buffer_identity().id());
     }
 
@@ -425,14 +451,28 @@ mod tests {
     #[test]
     fn test_pbo_tensor_fd_ops_return_error() {
         let ops = MockPboOps::new(8);
-        let tensor = PboTensor::<u8>::from_pbo(1, 8, &[8], None, ops);
+        let tensor = PboTensor::<u8>::from_pbo(1, 8, &[8], None, ops).unwrap();
         assert!(tensor.clone_fd().is_err());
+    }
+
+    #[test]
+    fn test_pbo_tensor_from_pbo_size_mismatch() {
+        let ops = MockPboOps::new(24);
+        let result = PboTensor::<u8>::from_pbo(1, 24, &[2, 3, 5], None, ops);
+        assert!(result.is_err(), "mismatched size/shape should fail");
+    }
+
+    #[test]
+    fn test_pbo_tensor_from_pbo_zero_size() {
+        let ops = MockPboOps::new(0);
+        let result = PboTensor::<u8>::from_pbo(1, 0, &[0], None, ops);
+        assert!(result.is_err(), "zero size should fail");
     }
 
     #[test]
     fn test_pbo_via_tensor_enum() {
         let ops = MockPboOps::new(12);
-        let pbo = PboTensor::<u8>::from_pbo(10, 12, &[3, 4], Some("enum_test"), ops);
+        let pbo = PboTensor::<u8>::from_pbo(10, 12, &[3, 4], Some("enum_test"), ops).unwrap();
         let tensor = crate::Tensor::Pbo(pbo);
         assert_eq!(tensor.memory(), TensorMemory::Pbo);
         assert_eq!(tensor.name(), "enum_test");
