@@ -197,14 +197,16 @@ impl From<HalCrop> for Crop {
 ///
 /// A TensorImage combines a tensor with image format metadata (width, height, fourcc).
 pub struct HalTensorImage {
-    inner: TensorImage,
+    /// Accessible to `decoder.rs` for `hal_decoder_draw_masks()`.
+    pub(crate) inner: TensorImage,
 }
 
 /// Opaque image processor type.
 ///
 /// The ImageProcessor handles format conversion with hardware acceleration when available.
 pub struct HalImageProcessor {
-    inner: ImageProcessor,
+    /// Accessible to `decoder.rs` for `hal_decoder_draw_masks()`.
+    pub(crate) inner: ImageProcessor,
 }
 
 // ============================================================================
@@ -855,22 +857,22 @@ pub unsafe extern "C" fn hal_image_processor_convert_ref(
     0
 }
 
-/// Render detection boxes and segmentation masks onto an image.
+/// Draw detection boxes and segmentation masks onto an image.
 ///
 /// Draws bounding boxes (with labels) and segmentation overlays on the
 /// destination image. Uses hardware acceleration (OpenGL) when available,
 /// falling back to CPU rendering.
 ///
 /// @param processor Image processor handle
-/// @param dst Destination image to render onto
+/// @param dst Destination image to draw onto
 /// @param detections Detection box list (can be NULL for segmentation-only)
 /// @param segmentations Segmentation list (can be NULL for detection-only)
 /// @return 0 on success, -1 on error
 /// @par Errors (errno):
 /// - EINVAL: Invalid argument (NULL processor or dst)
-/// - EIO: Rendering failed
+/// - EIO: Drawing failed
 #[no_mangle]
-pub unsafe extern "C" fn hal_image_processor_render_to_image(
+pub unsafe extern "C" fn hal_image_processor_draw_masks(
     processor: *mut HalImageProcessor,
     dst: *mut HalTensorImage,
     detections: *const HalDetectBoxList,
@@ -891,7 +893,7 @@ pub unsafe extern "C" fn hal_image_processor_render_to_image(
     };
 
     try_or_errno!(
-        unsafe { &mut (*processor) }.inner.render_to_image(
+        unsafe { &mut (*processor) }.inner.draw_masks(
             &mut unsafe { &mut (*dst) }.inner,
             detect_slice,
             seg_slice,
@@ -903,8 +905,8 @@ pub unsafe extern "C" fn hal_image_processor_render_to_image(
 
 /// Set class colors for segmentation rendering.
 ///
-/// Colors are used when rendering segmentation masks via
-/// hal_image_processor_render_to_image(). Each color is an RGBA tuple.
+/// Colors are used when drawing segmentation masks via
+/// hal_image_processor_draw_masks(). Each color is an RGBA tuple.
 ///
 /// @param processor Image processor handle
 /// @param colors Pointer to array of RGBA color tuples ([u8; 4] per color)
@@ -1524,7 +1526,7 @@ mod tests {
     }
 
     #[test]
-    fn test_image_processor_render_to_image_null_params() {
+    fn test_image_processor_draw_masks_null_params() {
         unsafe {
             let processor = hal_image_processor_new();
             if processor.is_null() {
@@ -1536,7 +1538,7 @@ mod tests {
 
             // NULL processor
             assert_eq!(
-                hal_image_processor_render_to_image(
+                hal_image_processor_draw_masks(
                     std::ptr::null_mut(),
                     dst,
                     std::ptr::null(),
@@ -1547,7 +1549,7 @@ mod tests {
 
             // NULL dst
             assert_eq!(
-                hal_image_processor_render_to_image(
+                hal_image_processor_draw_masks(
                     processor,
                     std::ptr::null_mut(),
                     std::ptr::null(),

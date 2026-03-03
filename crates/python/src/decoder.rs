@@ -784,9 +784,9 @@ impl PyDecoder {
         Ok((boxes, scores, classes, masks))
     }
 
-    /// Decode model outputs and render results directly onto the destination
+    /// Decode model outputs and draw masks directly onto the destination
     /// image in a single call. Masks never leave Rust, eliminating the
-    /// Python round-trip overhead of `decode()` + `render_to_image()`.
+    /// Python round-trip overhead of `decode()` + `draw_masks()`.
     ///
     /// For segmentation models, prototype data is passed directly to the
     /// renderer without materializing intermediate mask arrays in Python.
@@ -795,7 +795,7 @@ impl PyDecoder {
     ///
     /// Returns `(boxes, scores, classes)` — no mask arrays are returned.
     #[pyo3(signature = (model_output, processor, dst, max_boxes=100))]
-    pub fn decode_and_render<'py>(
+    pub fn draw_masks<'py>(
         self_: PyRef<'py, Self>,
         model_output: ListOfReadOnlyArrayGenericDyn,
         processor: &mut PyImageProcessor,
@@ -877,11 +877,9 @@ impl PyDecoder {
         if let Ok(mut l) = processor.0.lock() {
             if let Some(proto_data) = proto_result {
                 // Fused path: render directly from proto data (masks stay in Rust)
-                l.render_from_protos(&mut dst.0, &output_boxes, &proto_data)
+                l.draw_masks_proto(&mut dst.0, &output_boxes, &proto_data)
                     .map_err(|e| {
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "render_from_protos: {e:#?}"
-                        ))
+                        pyo3::exceptions::PyRuntimeError::new_err(format!("draw_masks_proto: {e:#?}"))
                     })?;
             } else {
                 // Detection-only or unsupported model: fall back to standard decode + render
@@ -954,10 +952,10 @@ impl PyDecoder {
                 if let Err(e) = result {
                     return Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")));
                 }
-                l.render_to_image(&mut dst.0, &output_boxes, &output_masks)
+                l.draw_masks(&mut dst.0, &output_boxes, &output_masks)
                     .map_err(|e| {
                         pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "render_to_image: {e:#?}"
+                            "draw_masks: {e:#?}"
                         ))
                     })?;
             }
@@ -968,83 +966,19 @@ impl PyDecoder {
         Ok((boxes, scores, classes))
     }
 
-    /// Decode model outputs and render per-instance grayscale masks at full
-    /// output resolution in a single fused call.
+    /// Decode model outputs and return per-detection masks at the specified
+    /// output resolution.
     ///
-    /// For segmentation models, prototype data is rendered on the GPU at the
-    /// specified output resolution using `sigmoid(mask_coeff @ protos)` without
-    /// thresholding. Each mask covers only its bounding-box region.
+    /// Internally uses GPU atlas rendering when available, then splits the
+    /// atlas into individual per-detection mask arrays.
     ///
-    /// Returns `(boxes, scores, classes, masks)` where masks is a list of
-    /// `ndarray(H, W)` uint8 arrays (one per detection, bbox-sized).
-    #[pyo3(signature = (model_output, processor, output_width=640, output_height=640, max_boxes=100))]
-    pub fn decode_and_render_masks<'py>(
-        self_: PyRef<'py, Self>,
-        model_output: ListOfReadOnlyArrayGenericDyn,
-        processor: &mut PyImageProcessor,
-        output_width: usize,
-        output_height: usize,
-        max_boxes: usize,
-    ) -> PyResult<PySegDetOutput<'py>> {
-        let mut output_boxes = Vec::with_capacity(max_boxes);
-
-        let proto_result =
-            Self::decode_proto_result(&self_, &model_output, &mut output_boxes)?;
-
-        let py = self_.py();
-
-        // Render masks from proto data
-        let mask_arrays = if let Some(proto_data) = proto_result {
-            if let Ok(mut l) = processor.0.lock() {
-                let mask_results = l
-                    .render_masks_from_protos(
-                        &output_boxes,
-                        proto_data,
-                        output_width,
-                        output_height,
-                    )
-                    .map_err(|e| {
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "render_masks_from_protos: {e:#?}"
-                        ))
-                    })?;
-
-                mask_results
-                    .into_iter()
-                    .map(|mr| {
-                        let arr = ndarray::Array2::from_shape_vec((mr.h, mr.w), mr.pixels).unwrap();
-                        // Convert Array2<u8> to Array3<u8> with shape (H, W, 1)
-                        let arr = arr.insert_axis(ndarray::Axis(2));
-                        arr.to_pyarray(py)
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            }
-        } else {
-            // Detection-only model: no masks
-            Vec::new()
-        };
-
-        let (boxes, scores, classes) = convert_detect_box(py, &output_boxes);
-        Ok((boxes, scores, classes, mask_arrays))
-    }
-
-    /// Decode model outputs and render all masks into a batched atlas buffer.
-    ///
-    /// Similar to `decode_and_render_masks` but returns a single contiguous
-    /// atlas array of shape `[N, output_height, output_width]` instead of a
-    /// list of per-detection mask arrays. This uses a single PBO readback
-    /// for all masks, which is significantly faster on GPU.
-    ///
-    /// Returns `(boxes, scores, classes, atlas, metadata)` where:
+    /// Returns `(boxes, scores, classes, masks)` where:
     /// - `boxes`: `ndarray[N, 4]` of `f32` bounding boxes
     /// - `scores`: `ndarray[N]` of `f32` confidence scores
-    /// - `classes`: `ndarray[N]` of `i32` class indices
-    /// - `atlas`: `ndarray[N, H, W]` of `u8` mask pixels
-    /// - `metadata`: list of `(x, y, w, h)` tuples with per-detection bbox info
+    /// - `classes`: `ndarray[N]` of `uintp` class indices
+    /// - `masks`: list of `ndarray[H, W]` of `u8` — one per detection
     #[pyo3(signature = (model_output, processor, output_width=640, output_height=640, max_boxes=100))]
-    pub fn decode_and_render_mask_atlas<'py>(
+    pub fn decode_masks<'py>(
         self_: PyRef<'py, Self>,
         model_output: ListOfReadOnlyArrayGenericDyn,
         processor: &mut PyImageProcessor,
@@ -1054,72 +988,79 @@ impl PyDecoder {
     ) -> PyResult<(
         Bound<'py, PyArray2<f32>>,
         Bound<'py, PyArray1<f32>>,
-        Bound<'py, PyArray1<i32>>,
-        Bound<'py, PyArray3<u8>>,
-        Vec<(usize, usize, usize, usize)>,
+        Bound<'py, PyArray1<usize>>,
+        Vec<Bound<'py, PyArray2<u8>>>,
     )> {
         let mut output_boxes = Vec::with_capacity(max_boxes);
-        let proto_result =
-            Self::decode_proto_result(&self_, &model_output, &mut output_boxes)?;
+        let proto_result = Self::decode_proto_result(&self_, &model_output, &mut output_boxes)?;
 
         let py = self_.py();
-        let n = output_boxes.len();
 
-        let (atlas_arr, metadata_tuples) = if let Some(proto_data) = proto_result {
+        let masks: Vec<ndarray::Array2<u8>> = if let Some(proto_data) = proto_result {
             if let Ok(mut l) = processor.0.lock() {
-                let (atlas_pixels, mask_metadata) = l
-                    .render_masks_from_protos_atlas(
-                        &output_boxes,
-                        proto_data,
-                        output_width,
-                        output_height,
-                    )
+                let (atlas_pixels, regions) = l
+                    .decode_masks_atlas(&output_boxes, proto_data, output_width, output_height)
                     .map_err(|e| {
                         pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "render_masks_from_protos_atlas: {e:#?}"
+                            "decode_masks_atlas: {e:#?}"
                         ))
                     })?;
 
-                let atlas = if n > 0 {
-                    ndarray::Array3::from_shape_vec(
-                        (n, output_height, output_width),
-                        atlas_pixels,
-                    )
-                    .map_err(|e| {
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "atlas reshape failed: {e:#?}"
-                        ))
-                    })?
+                let atlas_h = if !regions.is_empty() {
+                    let last = regions.last().unwrap();
+                    last.atlas_y_offset + last.padded_h
                 } else {
-                    ndarray::Array3::zeros((0, output_height, output_width))
+                    0
                 };
-                let meta: Vec<(usize, usize, usize, usize)> = mask_metadata
-                    .iter()
-                    .map(|mr| (mr.x, mr.y, mr.w, mr.h))
-                    .collect();
-                (atlas, meta)
+
+                if atlas_h > 0 && !regions.is_empty() {
+                    // Split atlas into individual mask arrays
+                    regions
+                        .iter()
+                        .map(|r| {
+                            let mut mask =
+                                ndarray::Array2::<u8>::zeros((r.bbox_h, r.bbox_w));
+                            // The atlas renders each detection at absolute
+                            // position (padded_x, atlas_y_offset) in the atlas.
+                            // The bbox region within the padded strip starts at
+                            // row offset (bbox_y - padded_y) from atlas_y_offset,
+                            // and at absolute column bbox_x.
+                            let src_y_start = r.atlas_y_offset + (r.bbox_y - r.padded_y);
+                            let src_x_start = r.bbox_x;
+                            for dy in 0..r.bbox_h {
+                                let src_row = src_y_start + dy;
+                                if src_row >= atlas_h {
+                                    break;
+                                }
+                                let src_offset = src_row * output_width + src_x_start;
+                                let copy_w = r.bbox_w.min(output_width - src_x_start);
+                                mask.row_mut(dy)
+                                    .as_slice_mut()
+                                    .unwrap()[..copy_w]
+                                    .copy_from_slice(
+                                        &atlas_pixels[src_offset..src_offset + copy_w],
+                                    );
+                            }
+                            mask
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                }
             } else {
-                (
-                    ndarray::Array3::zeros((0, output_height, output_width)),
-                    Vec::new(),
-                )
+                Vec::new()
             }
         } else {
-            (
-                ndarray::Array3::zeros((0, output_height, output_width)),
-                Vec::new(),
-            )
+            Vec::new()
         };
 
-        let (boxes, scores, _classes) = convert_detect_box(py, &output_boxes);
-        // Convert classes from usize to i32 for the atlas return type
-        let classes_i32 = output_boxes
-            .iter()
-            .map(|b| b.label as i32)
-            .collect::<Vec<_>>();
-        let classes_i32 = Array1::from_vec(classes_i32).into_pyarray(py);
+        let (boxes, scores, classes) = convert_detect_box(py, &output_boxes);
+        let py_masks: Vec<Bound<'py, PyArray2<u8>>> = masks
+            .into_iter()
+            .map(|m| m.into_pyarray(py))
+            .collect();
 
-        Ok((boxes, scores, classes_i32, atlas_arr.into_pyarray(py), metadata_tuples))
+        Ok((boxes, scores, classes, py_masks))
     }
 
     #[staticmethod]

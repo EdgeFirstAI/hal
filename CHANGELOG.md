@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`hal_decoder_draw_masks()` C API function**: fused decode+render path
+  that mirrors the Python `Decoder.draw_masks()` binding — takes decoder,
+  processor, raw model outputs, and destination image; returns rendered overlay
+  and detection boxes in a single call. Internally selects proto-based GPU
+  matmul path for seg models, with automatic fallback to decoded-mask rendering
+  for detection-only models.
+
+- **`hal_decoder_decode_masks()` C API function**: decodes segmentation model
+  outputs and returns per-detection pixel masks at the specified output
+  resolution. Mirrors the Python `Decoder.decode_masks()` binding.
+
 - **PBO (Pixel Buffer Object) tensor backend** (`edgefirst-tensor`):
   `PboTensor<T>` provides GPU-native buffer storage for platforms where DMA-buf
   is unavailable (e.g. NVIDIA desktop GPUs). PBO tensors are managed by the
@@ -66,6 +77,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Mask API renamed for clarity** — API names now use consistent verbs:
+  `decode` = get mask data back, `draw` = overlay onto image. The compound
+  names that accumulated during iterative optimization have been replaced
+  with shorter, intent-revealing names across all language bindings:
+
+  | Layer | Old Name | New Name |
+  |-------|----------|----------|
+  | Rust trait | `render_masks()` | `draw_masks_proto()` |
+  | Rust trait | `render_masks_decoded()` | `draw_masks()` |
+  | Rust trait | `render_mask_atlas()` | `decode_masks_atlas()` |
+  | Rust enum | `RenderMasks` | `DrawMasksProto` |
+  | Rust enum | `RenderMasksDecoded` | `DrawMasks` |
+  | Rust enum | `RenderMaskAtlas` | `DecodeMasksAtlas` |
+  | Python `Decoder` | `render_masks()` | `draw_masks()` |
+  | Python `ImageProcessor` | `render_masks_decoded()` | `draw_masks()` |
+  | C API | `hal_decoder_render_masks()` | `hal_decoder_draw_masks()` |
+  | C API | `hal_image_processor_render_masks_decoded()` | `hal_image_processor_draw_masks()` |
+
+  **Migration guide:**
+  - **Python users**: rename `decoder.render_masks(...)` →
+    `decoder.draw_masks(...)` and `processor.render_masks_decoded(...)` →
+    `processor.draw_masks(...)`
+  - **C users**: rename `hal_decoder_render_masks()` →
+    `hal_decoder_draw_masks()` and `hal_image_processor_render_masks_decoded()` →
+    `hal_image_processor_draw_masks()`
+  - **Rust users**: rename `render_masks()` → `draw_masks_proto()`,
+    `render_masks_decoded()` → `draw_masks()`, and
+    `render_mask_atlas()` → `decode_masks_atlas()` on `ImageProcessorTrait`
+    implementors
+
+- **`Decoder.decode_masks()` return type changed** — now returns individual
+  per-detection masks as `List[ndarray]` (each shape `(H, W)`, uint8) instead
+  of the raw atlas tuple. The atlas packing is now an internal optimization.
+
 - ARCHITECTURE.md updated to v2.3: documents PBO tensor architecture,
   `create_image()` backend selection, PBO convert dispatch table, and
   `WeakSender` shutdown design
@@ -78,9 +123,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- GPU per-instance segmentation mask rendering: `decode_and_render_masks()` Python
-  binding and `render_masks_from_protos()` on `ImageProcessorTrait` with GL, CPU,
-  and G2D (stub) backends — renders sigmoid(mask_coeff @ protos) in fragment shaders,
+- GPU segmentation mask atlas rendering: `decode_masks()` Python binding and
+  `render_mask_atlas()` on `ImageProcessorTrait` with GL, CPU, and G2D (stub)
+  backends — renders all masks in a single GPU pass with one PBO readback,
   eliminating CPU mask computation and per-mask GL resize roundtrips
 - EGL display probe and override API: `probe_egl_displays()`, `EglDisplayKind` enum,
   `EglDisplayInfo` struct, and `ImageProcessor::with_config()` constructor in Rust;

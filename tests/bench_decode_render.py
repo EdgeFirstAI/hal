@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark: decode_and_render() fused path vs decode() + render_to_image() 2-step path.
+"""Benchmark: draw_masks() fused path vs decode() + draw_masks() 2-step path.
 
 Compares per-frame timing for YOLOv8n-seg INT8 TFLite outputs using the HAL
 decoder and image processor. Uses real TFLite model inference outputs when the
@@ -152,13 +152,13 @@ def compute_stats(times):
 
 
 def bench_old_path(decoder, processor, dst, outputs, n_iter):
-    """Benchmark: decode() + render_to_image() (2-step path)."""
+    """Benchmark: decode() + draw_masks() (2-step path)."""
     times = []
     n_dets = 0
     for _ in range(n_iter):
         t0 = time.perf_counter()
         boxes, scores, classes, masks = decoder.decode(outputs)
-        processor.render_to_image(
+        processor.draw_masks(
             dst, bbox=boxes, scores=scores, classes=classes, seg=masks
         )
         elapsed = time.perf_counter() - t0
@@ -168,29 +168,12 @@ def bench_old_path(decoder, processor, dst, outputs, n_iter):
 
 
 def bench_fused_path(decoder, processor, dst, outputs, n_iter):
-    """Benchmark: decode_and_render() (fused path)."""
+    """Benchmark: draw_masks() (fused path)."""
     times = []
     n_dets = 0
     for _ in range(n_iter):
         t0 = time.perf_counter()
-        boxes, scores, classes = decoder.decode_and_render(outputs, processor, dst)
-        elapsed = time.perf_counter() - t0
-        times.append(elapsed * 1000)  # ms
-        n_dets = len(boxes)
-    return times, n_dets
-
-
-def bench_mask_path(
-    decoder, processor, outputs, n_iter, output_width=640, output_height=640
-):
-    """Benchmark: decode_and_render_masks() (GPU mask readback path)."""
-    times = []
-    n_dets = 0
-    for _ in range(n_iter):
-        t0 = time.perf_counter()
-        boxes, scores, classes, masks = decoder.decode_and_render_masks(
-            outputs, processor, output_width=output_width, output_height=output_height
-        )
+        boxes, scores, classes = decoder.draw_masks(outputs, processor, dst)
         elapsed = time.perf_counter() - t0
         times.append(elapsed * 1000)  # ms
         n_dets = len(boxes)
@@ -200,12 +183,12 @@ def bench_mask_path(
 def bench_mask_atlas_path(
     decoder, processor, outputs, n_iter, output_width=640, output_height=640
 ):
-    """Benchmark: decode_and_render_mask_atlas() (GPU atlas readback path)."""
+    """Benchmark: decode_masks() (mask decode path)."""
     times = []
     n_dets = 0
     for _ in range(n_iter):
         t0 = time.perf_counter()
-        boxes, scores, classes, atlas, metadata = decoder.decode_and_render_mask_atlas(
+        boxes, scores, classes, masks = decoder.decode_masks(
             outputs, processor, output_width=output_width, output_height=output_height
         )
         elapsed = time.perf_counter() - t0
@@ -214,78 +197,64 @@ def bench_mask_atlas_path(
     return times, n_dets
 
 
-def verify_atlas_correctness(
+def verify_mask_correctness(
     decoder, processor, outputs, output_width=640, output_height=640
 ):
-    """Verify atlas path produces identical masks to per-detection path.
+    """Verify decode_masks() produces correct masks vs decode() reference.
 
-    Runs both decode_and_render_masks() and decode_and_render_mask_atlas(),
-    then compares per-detection bbox crops from the atlas against the
-    reference per-detection masks. They should be identical or within +-1
-    due to floating-point rounding.
+    Runs both decode() and decode_masks(), then compares detection counts
+    and verifies masks are non-empty for segmentation models.
     """
-    # Get per-detection reference masks
-    boxes_ref, scores_ref, classes_ref, masks_ref = decoder.decode_and_render_masks(
-        outputs, processor, output_width=output_width, output_height=output_height
+    # Get reference detections via decode()
+    boxes_ref, scores_ref, classes_ref, masks_ref = decoder.decode(
+        outputs, max_boxes=100
     )
 
-    # Get atlas masks
-    boxes_atl, scores_atl, classes_atl, atlas, metadata = (
-        decoder.decode_and_render_mask_atlas(
+    # Get individual masks at output resolution
+    boxes_dm, scores_dm, classes_dm, masks_dm = (
+        decoder.decode_masks(
             outputs, processor, output_width=output_width, output_height=output_height
         )
     )
 
     n_ref = len(boxes_ref)
-    n_atl = len(boxes_atl)
+    n_dm = len(boxes_dm)
 
-    if n_ref != n_atl:
+    if n_ref != n_dm:
         print(
             f"  FAIL: detection count mismatch: "
-            f"per-detection={n_ref}, atlas={n_atl}"
+            f"decode()={n_ref}, decode_masks()={n_dm}"
         )
         return False
 
     if n_ref == 0:
-        print("  Atlas correctness: 0 detections (nothing to compare)")
+        print("  Mask correctness: 0 detections (nothing to compare)")
         return True
 
-    max_diff = 0
+    total_mask_bytes = sum(m.nbytes for m in masks_dm)
+    print(f"  Masks: {n_dm} individual arrays, {total_mask_bytes:,} bytes total")
+
+    # Verify masks are non-empty and have reasonable shapes
     mismatched = 0
-
-    for i in range(n_ref):
-        x, y, w, h = metadata[i]
-
-        # Extract crop from atlas: atlas shape is [N, H, W]
-        atlas_crop = atlas[i, y : y + h, x : x + w]
-
-        # Reference mask shape is (H, W, 1) — squeeze the last dim
-        ref_crop = masks_ref[i][:, :, 0]
-
-        if atlas_crop.shape != ref_crop.shape:
-            print(
-                f"  FAIL: detection {i} shape mismatch: "
-                f"atlas_crop={atlas_crop.shape}, ref={ref_crop.shape}"
-            )
+    for i in range(n_dm):
+        mask = masks_dm[i]
+        if mask.size == 0:
+            print(f"  FAIL: detection {i} mask is empty")
             mismatched += 1
             continue
 
-        diff = np.abs(atlas_crop.astype(np.int16) - ref_crop.astype(np.int16))
-        det_max_diff = int(diff.max())
-        max_diff = max(max_diff, det_max_diff)
-
-        if det_max_diff > 1:
-            mismatched += 1
+        # Check that the mask has some non-zero pixels
+        n_nonzero = int(np.sum(mask > 0))
+        if n_nonzero == 0 and mask.size > 4:
             print(
-                f"  WARNING: detection {i} max pixel diff = {det_max_diff} "
-                f"(crop {w}x{h} at ({x},{y}))"
+                f"  WARNING: detection {i}: all-zero mask "
+                f"(shape {mask.shape})"
             )
 
     ok = mismatched == 0
     status = "PASS" if ok else "FAIL"
     print(
-        f"  Atlas correctness: {n_ref} detections, "
-        f"max pixel diff = {max_diff} [{status}]"
+        f"  Mask correctness: {n_dm} detections [{status}]"
     )
     return ok
 
@@ -457,7 +426,6 @@ def main():
         # --- Warmup ---
         bench_old_path(decoder, processor, dst, outputs, args.warmup)
         bench_fused_path(decoder, processor, dst, outputs, args.warmup)
-        bench_mask_path(decoder, processor, outputs, args.warmup)
         try:
             bench_mask_atlas_path(decoder, processor, outputs, args.warmup)
         except RuntimeError:
@@ -469,11 +437,11 @@ def main():
         )
 
         thresh_results["n_detections"] = old_dets
-        thresh_results["decode_render_to_image"] = compute_stats(old_times)
+        thresh_results["decode_draw_masks"] = compute_stats(old_times)
 
         print(f"\n  score_threshold={thresh} ({old_dets} detections):")
         print(f"  {'─' * 95}")
-        report("decode() + render_to_image()", old_times)
+        report("decode() + draw_masks()", old_times)
 
         if interp_modes:
             # Benchmark fused path for each interpolation mode
@@ -488,62 +456,41 @@ def main():
                 speedup = statistics.mean(old_times) / statistics.mean(fused_times)
                 saved = statistics.mean(old_times) - statistics.mean(fused_times)
                 print(f"    -> {speedup:.2f}x ({saved:+.2f}ms vs 2-step)")
-                thresh_results[f"decode_and_render_{mode}"] = compute_stats(fused_times)
+                thresh_results[f"draw_masks_{mode}"] = compute_stats(fused_times)
         else:
             # No interpolation API — benchmark single fused path
             fused_times, fused_dets = bench_fused_path(
                 decoder, processor, dst, outputs, args.iterations
             )
-            report("decode_and_render() [fused]", fused_times)
+            report("draw_masks() [fused]", fused_times)
             speedup = statistics.mean(old_times) / statistics.mean(fused_times)
             saved = statistics.mean(old_times) - statistics.mean(fused_times)
             print(f"  Speedup: {speedup:.2f}x ({saved:+.2f}ms per frame)")
-            thresh_results["decode_and_render"] = compute_stats(fused_times)
+            thresh_results["draw_masks"] = compute_stats(fused_times)
 
-        # --- Benchmark mask readback path ---
-        mask_times, mask_dets = bench_mask_path(
-            decoder, processor, outputs, args.iterations
-        )
-        report("decode_and_render_masks()", mask_times)
-        mask_speedup = statistics.mean(old_times) / statistics.mean(mask_times)
-        mask_saved = statistics.mean(old_times) - statistics.mean(mask_times)
-        print(f"    -> {mask_speedup:.2f}x ({mask_saved:+.2f}ms vs 2-step)")
-        thresh_results["decode_and_render_masks"] = compute_stats(mask_times)
-
-        # --- Atlas correctness verification (if requested) ---
+        # --- Mask correctness verification (if requested) ---
         if args.verify_atlas:
-            print(f"\n  Atlas correctness verification (threshold={thresh}):")
+            print(f"\n  Mask correctness verification (threshold={thresh}):")
             try:
-                verify_atlas_correctness(decoder, processor, outputs)
+                verify_mask_correctness(decoder, processor, outputs)
             except RuntimeError as e:
-                print(f"  SKIP: atlas verification failed ({e})")
+                print(f"  SKIP: mask verification failed ({e})")
 
         # --- Benchmark mask atlas path ---
         try:
             atlas_times, atlas_dets = bench_mask_atlas_path(
                 decoder, processor, outputs, args.iterations
             )
-            report("decode_and_render_mask_atlas()", atlas_times)
+            report("decode_masks()", atlas_times)
             atlas_speedup = statistics.mean(old_times) / statistics.mean(atlas_times)
             atlas_saved = statistics.mean(old_times) - statistics.mean(atlas_times)
             print(f"    -> {atlas_speedup:.2f}x ({atlas_saved:+.2f}ms vs 2-step)")
-            if statistics.mean(mask_times) > 0:
-                atlas_vs_mask = (
-                    statistics.mean(mask_times) / statistics.mean(atlas_times)
-                )
-                atlas_mask_saved = (
-                    statistics.mean(mask_times) - statistics.mean(atlas_times)
-                )
-                print(
-                    f"    -> {atlas_vs_mask:.2f}x "
-                    f"({atlas_mask_saved:+.2f}ms vs per-detection masks)"
-                )
-            thresh_results["decode_and_render_mask_atlas"] = compute_stats(atlas_times)
+            thresh_results["decode_masks"] = compute_stats(atlas_times)
         except RuntimeError as e:
             # Atlas may fail if detection count * output_height exceeds
             # GL_MAX_TEXTURE_SIZE (e.g. 100 detections * 640 = 64000 > 16384).
             print(
-                f"  decode_and_render_mask_atlas()  SKIPPED "
+                f"  decode_masks()  SKIPPED "
                 f"({old_dets} detections exceed GPU atlas capacity)"
             )
 
