@@ -122,6 +122,7 @@ pub enum ImageDest3<'py> {
 #[allow(non_camel_case_types)]
 pub enum FourCC {
     YUYV,
+    VYUY,
     RGBA,
     RGB,
     NV12,
@@ -155,6 +156,7 @@ impl TryFrom<&str> for FourCC {
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         match value.to_uppercase().as_str() {
             "YUYV" => Ok(FourCC::YUYV),
+            "VYUY" => Ok(FourCC::VYUY),
             "RGBA" => Ok(FourCC::RGBA),
             "RGB" | "RGB " => Ok(FourCC::RGB),
             "NV12" => Ok(FourCC::NV12),
@@ -169,6 +171,7 @@ impl From<FourCC> for FourCharCode {
     fn from(val: FourCC) -> Self {
         match val {
             FourCC::YUYV => image::YUYV,
+            FourCC::VYUY => image::VYUY,
             FourCC::RGBA => image::RGBA,
             FourCC::RGB => image::RGB,
             FourCC::NV12 => image::NV12,

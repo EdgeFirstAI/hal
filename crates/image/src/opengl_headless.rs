@@ -50,7 +50,7 @@ use crate::DEFAULT_COLORS;
 use crate::{
     fourcc_is_int8, fourcc_is_packed_rgb, CPUProcessor, Crop, Error, Flip, ImageProcessorTrait,
     Rect, Rotation, TensorImage, TensorImageRef, GREY, NV12, PLANAR_RGB, PLANAR_RGBA,
-    PLANAR_RGB_INT8, RGB, RGBA, RGB_INT8, YUYV,
+    PLANAR_RGB_INT8, RGB, RGBA, RGB_INT8, VYUY, YUYV,
 };
 
 #[cfg(feature = "decoder")]
@@ -2508,7 +2508,9 @@ impl GLProcessorST {
 
     fn check_src_format_supported(backend: TransferBackend, img: &TensorImage) -> bool {
         if backend.is_dma() && img.tensor().memory() == TensorMemory::Dma {
-            // EGLImage supports RGBA, GREY, YUYV, and NV12 for DMA buffers
+            // EGLImage supports RGBA, GREY, YUYV, and NV12 for DMA buffers.
+            // VYUY excluded: Vivante GPU accepts the DRM fourcc but produces
+            // incorrect output (similarity ~0.28 vs reference).
             matches!(img.fourcc(), RGBA | GREY | YUYV | NV12)
         } else {
             matches!(img.fourcc(), RGB | RGBA | GREY)
@@ -2615,7 +2617,11 @@ impl GLProcessorST {
             if self.support_rgb_direct {
                 self.convert_to_rgb_direct(src, dst, rotation, flip, crop)
             } else {
-                self.convert_to_packed_rgb(src, dst, rotation, flip, crop)
+                // Two-pass packed RGB is slower than G2D/CPU; decline so
+                // ImageProcessor falls through to a faster backend.
+                Err(crate::Error::NotSupported(
+                    "OpenGL two-pass packed RGB disabled (no direct RGB support)".into(),
+                ))
             }
         } else if dst.is_planar() {
             self.setup_renderbuffer_dma(dst)?;
@@ -4290,7 +4296,7 @@ impl GLProcessorST {
             ]);
         }
 
-        if matches!(src.fourcc(), YUYV | NV12) {
+        if matches!(src.fourcc(), YUYV | VYUY | NV12) {
             egl_img_attr.append(&mut vec![
                 egl_ext::YUV_COLOR_SPACE_HINT as Attrib,
                 egl_ext::ITU_REC709 as Attrib,
@@ -5822,6 +5828,7 @@ fn fourcc_to_drm(fourcc: FourCharCode) -> Result<DrmFourcc, Error> {
     match fourcc {
         RGBA => Ok(DrmFourcc::Abgr8888),
         YUYV => Ok(DrmFourcc::Yuyv),
+        VYUY => Ok(DrmFourcc::Vyuy),
         RGB | RGB_INT8 => Ok(DrmFourcc::Bgr888),
         GREY => Ok(DrmFourcc::R8),
         NV12 => Ok(DrmFourcc::Nv12),
