@@ -108,6 +108,8 @@ mod opengl_headless;
 
 /// 8 bit interleaved YUV422, limited range
 pub const YUYV: FourCharCode = four_char_code!("YUYV");
+/// 8 bit interleaved YUV422 (VYUY byte order), limited range
+pub const VYUY: FourCharCode = four_char_code!("VYUY");
 /// 8 bit planar YUV420, limited range
 pub const NV12: FourCharCode = four_char_code!("NV12");
 /// 8 bit planar YUV422, limited range
@@ -1770,12 +1772,12 @@ impl ImageProcessorTrait for ImageProcessor {
 
 fn fourcc_channels(fourcc: FourCharCode) -> Result<usize> {
     match fourcc {
-        RGBA => Ok(4), // RGBA has 4 channels (R, G, B, A)
-        RGB => Ok(3),  // RGB has 3 channels (R, G, B)
-        YUYV => Ok(2), // YUYV has 2 channels (Y and UV)
-        GREY => Ok(1), // Y800 has 1 channel (Y)
-        NV12 => Ok(2), // NV12 has 2 channel. 2nd channel is half empty
-        NV16 => Ok(2), // NV16 has 2 channel. 2nd channel is full size
+        RGBA => Ok(4),        // RGBA has 4 channels (R, G, B, A)
+        RGB => Ok(3),         // RGB has 3 channels (R, G, B)
+        YUYV | VYUY => Ok(2), // YUYV/VYUY has 2 channels (Y and UV)
+        GREY => Ok(1),        // Y800 has 1 channel (Y)
+        NV12 => Ok(2),        // NV12 has 2 channel. 2nd channel is half empty
+        NV16 => Ok(2),        // NV16 has 2 channel. 2nd channel is full size
         PLANAR_RGB => Ok(3),
         PLANAR_RGBA => Ok(4),
         RGB_INT8 => Ok(3),
@@ -1789,14 +1791,14 @@ fn fourcc_channels(fourcc: FourCharCode) -> Result<usize> {
 
 fn fourcc_planar(fourcc: FourCharCode) -> Result<bool> {
     match fourcc {
-        RGBA => Ok(false),       // RGBA has 4 channels (R, G, B, A)
-        RGB => Ok(false),        // RGB has 3 channels (R, G, B)
-        YUYV => Ok(false),       // YUYV has 2 channels (Y and UV)
-        GREY => Ok(false),       // Y800 has 1 channel (Y)
-        NV12 => Ok(true),        // Planar YUV
-        NV16 => Ok(true),        // Planar YUV
-        PLANAR_RGB => Ok(true),  // Planar RGB
-        PLANAR_RGBA => Ok(true), // Planar RGBA
+        RGBA => Ok(false),        // RGBA has 4 channels (R, G, B, A)
+        RGB => Ok(false),         // RGB has 3 channels (R, G, B)
+        YUYV | VYUY => Ok(false), // YUYV/VYUY has 2 channels (Y and UV)
+        GREY => Ok(false),        // Y800 has 1 channel (Y)
+        NV12 => Ok(true),         // Planar YUV
+        NV16 => Ok(true),         // Planar YUV
+        PLANAR_RGB => Ok(true),   // Planar RGB
+        PLANAR_RGBA => Ok(true),  // Planar RGBA
         RGB_INT8 => Ok(false),
         PLANAR_RGB_INT8 => Ok(true),
         _ => Err(Error::NotSupported(format!(
@@ -3690,6 +3692,221 @@ mod image_tests {
             )
             .unwrap();
         compare_images(&dst_gl, &dst_cpu, 0.98, function!());
+    }
+
+    #[test]
+    fn test_vyuy_to_rgba_cpu() {
+        let file = include_bytes!("../../../testdata/camera720p.vyuy").to_vec();
+        let src = TensorImage::new(1280, 720, VYUY, None).unwrap();
+        src.tensor()
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(&file);
+
+        let mut dst = TensorImage::new(1280, 720, RGBA, None).unwrap();
+        let mut cpu_converter = CPUProcessor::new();
+
+        cpu_converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap();
+
+        let target_image = TensorImage::new(1280, 720, RGBA, None).unwrap();
+        target_image
+            .tensor()
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(include_bytes!("../../../testdata/camera720p.rgba"));
+
+        compare_images(&dst, &target_image, 0.98, function!());
+    }
+
+    #[test]
+    fn test_vyuy_to_rgb_cpu() {
+        let file = include_bytes!("../../../testdata/camera720p.vyuy").to_vec();
+        let src = TensorImage::new(1280, 720, VYUY, None).unwrap();
+        src.tensor()
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(&file);
+
+        let mut dst = TensorImage::new(1280, 720, RGB, None).unwrap();
+        let mut cpu_converter = CPUProcessor::new();
+
+        cpu_converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap();
+
+        let target_image = TensorImage::new(1280, 720, RGB, None).unwrap();
+        target_image
+            .tensor()
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .as_chunks_mut::<3>()
+            .0
+            .iter_mut()
+            .zip(
+                include_bytes!("../../../testdata/camera720p.rgba")
+                    .as_chunks::<4>()
+                    .0,
+            )
+            .for_each(|(dst, src)| *dst = [src[0], src[1], src[2]]);
+
+        compare_images(&dst, &target_image, 0.98, function!());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_vyuy_to_rgba_g2d() {
+        if !is_g2d_available() {
+            eprintln!("SKIPPED: test_vyuy_to_rgba_g2d - G2D library (libg2d.so.2) not available");
+            return;
+        }
+        if !is_dma_available() {
+            eprintln!(
+                "SKIPPED: test_vyuy_to_rgba_g2d - DMA memory allocation not available (permission denied or no DMA-BUF support)"
+            );
+            return;
+        }
+
+        let src = load_bytes_to_tensor(
+            1280,
+            720,
+            VYUY,
+            None,
+            include_bytes!("../../../testdata/camera720p.vyuy"),
+        )
+        .unwrap();
+
+        let mut dst = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma)).unwrap();
+        let mut g2d_converter = G2DProcessor::new().unwrap();
+
+        match g2d_converter.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop()) {
+            Err(Error::G2D(_)) => {
+                eprintln!("SKIPPED: test_vyuy_to_rgba_g2d - G2D does not support VYUY format");
+                return;
+            }
+            r => r.unwrap(),
+        }
+
+        let target_image = TensorImage::new(1280, 720, RGBA, None).unwrap();
+        target_image
+            .tensor()
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(include_bytes!("../../../testdata/camera720p.rgba"));
+
+        compare_images(&dst, &target_image, 0.98, function!());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_vyuy_to_rgb_g2d() {
+        if !is_g2d_available() {
+            eprintln!("SKIPPED: test_vyuy_to_rgb_g2d - G2D library (libg2d.so.2) not available");
+            return;
+        }
+        if !is_dma_available() {
+            eprintln!(
+                "SKIPPED: test_vyuy_to_rgb_g2d - DMA memory allocation not available (permission denied or no DMA-BUF support)"
+            );
+            return;
+        }
+
+        let src = load_bytes_to_tensor(
+            1280,
+            720,
+            VYUY,
+            None,
+            include_bytes!("../../../testdata/camera720p.vyuy"),
+        )
+        .unwrap();
+
+        let mut g2d_dst = TensorImage::new(1280, 720, RGB, Some(TensorMemory::Dma)).unwrap();
+        let mut g2d_converter = G2DProcessor::new().unwrap();
+
+        match g2d_converter.convert(
+            &src,
+            &mut g2d_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        ) {
+            Err(Error::G2D(_)) => {
+                eprintln!("SKIPPED: test_vyuy_to_rgb_g2d - G2D does not support VYUY format");
+                return;
+            }
+            r => r.unwrap(),
+        }
+
+        let mut cpu_dst = TensorImage::new(1280, 720, RGB, None).unwrap();
+        let mut cpu_converter: CPUProcessor = CPUProcessor::new();
+
+        cpu_converter
+            .convert(
+                &src,
+                &mut cpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+
+        compare_images(&g2d_dst, &cpu_dst, 0.98, function!());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[cfg(feature = "opengl")]
+    fn test_vyuy_to_rgba_opengl() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+        if !is_dma_available() {
+            eprintln!(
+                "SKIPPED: {} - DMA memory allocation not available (permission denied or no DMA-BUF support)",
+                function!()
+            );
+            return;
+        }
+
+        let src = load_bytes_to_tensor(
+            1280,
+            720,
+            VYUY,
+            Some(TensorMemory::Dma),
+            include_bytes!("../../../testdata/camera720p.vyuy"),
+        )
+        .unwrap();
+
+        let mut dst = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma)).unwrap();
+        let mut gl_converter = GLProcessorThreaded::new(None).unwrap();
+
+        match gl_converter.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop()) {
+            Err(Error::NotSupported(_)) => {
+                eprintln!(
+                    "SKIPPED: {} - OpenGL does not support VYUY DMA format",
+                    function!()
+                );
+                return;
+            }
+            r => r.unwrap(),
+        }
+
+        let target_image = TensorImage::new(1280, 720, RGBA, None).unwrap();
+        target_image
+            .tensor()
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(include_bytes!("../../../testdata/camera720p.rgba"));
+
+        compare_images(&dst, &target_image, 0.98, function!());
     }
 
     #[test]

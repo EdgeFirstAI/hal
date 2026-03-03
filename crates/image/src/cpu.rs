@@ -4,7 +4,7 @@
 use crate::{
     fourcc_is_int8, fourcc_uint8_equivalent, Crop, Error, Flip, FunctionTimer, ImageProcessorTrait,
     Rect, Result, Rotation, TensorImage, TensorImageDst, TensorImageRef, GREY, NV12, NV16,
-    PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, YUYV,
+    PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, VYUY, YUYV,
 };
 #[cfg(feature = "decoder")]
 use edgefirst_decoder::{DetectBox, ProtoData, Segmentation};
@@ -297,6 +297,102 @@ impl CPUProcessor {
         for ((s, y), uv) in src_chunks.iter().zip(y_plane).zip(uv_plane) {
             *y = s[0];
             *uv = s[1];
+        }
+        Ok(())
+    }
+
+    fn convert_vyuy_to_rgb(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), VYUY);
+        assert_eq!(dst.fourcc(), RGB);
+        let src = yuv::YuvPackedImage::<u8> {
+            yuy: &src.tensor.map()?,
+            yuy_stride: src.row_stride() as u32,
+            width: src.width() as u32,
+            height: src.height() as u32,
+        };
+
+        Ok(yuv::vyuy422_to_rgb(
+            &src,
+            dst.tensor.map()?.as_mut_slice(),
+            dst.width() as u32 * 3,
+            yuv::YuvRange::Limited,
+            yuv::YuvStandardMatrix::Bt709,
+        )?)
+    }
+
+    fn convert_vyuy_to_rgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), VYUY);
+        assert_eq!(dst.fourcc(), RGBA);
+        let src = yuv::YuvPackedImage::<u8> {
+            yuy: &src.tensor.map()?,
+            yuy_stride: src.row_stride() as u32,
+            width: src.width() as u32,
+            height: src.height() as u32,
+        };
+
+        Ok(yuv::vyuy422_to_rgba(
+            &src,
+            dst.tensor.map()?.as_mut_slice(),
+            dst.row_stride() as u32,
+            yuv::YuvRange::Limited,
+            yuv::YuvStandardMatrix::Bt709,
+        )?)
+    }
+
+    fn convert_vyuy_to_8bps(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), VYUY);
+        assert_eq!(dst.fourcc(), PLANAR_RGB);
+        let mut tmp = TensorImage::new(src.width(), src.height(), RGB, None)?;
+        Self::convert_vyuy_to_rgb(src, &mut tmp)?;
+        Self::convert_rgb_to_8bps(&tmp, dst)
+    }
+
+    fn convert_vyuy_to_prgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), VYUY);
+        assert_eq!(dst.fourcc(), PLANAR_RGBA);
+        let mut tmp = TensorImage::new(src.width(), src.height(), RGB, None)?;
+        Self::convert_vyuy_to_rgb(src, &mut tmp)?;
+        Self::convert_rgb_to_prgba(&tmp, dst)
+    }
+
+    fn convert_vyuy_to_grey(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), VYUY);
+        assert_eq!(dst.fourcc(), GREY);
+        let src_map = src.tensor.map()?;
+        let mut dst_map = dst.tensor.map()?;
+        // VYUY byte order: [V, Y0, U, Y1] — Y at offsets 1, 3
+        let src_chunks = src_map.as_chunks::<16>();
+        let dst_chunks = dst_map.as_chunks_mut::<8>();
+        for (s, d) in src_chunks.0.iter().zip(dst_chunks.0) {
+            for (di, si) in (1..16).step_by(2).enumerate() {
+                d[di] = limit_to_full(s[si]);
+            }
+        }
+
+        for (di, si) in (1..src_chunks.1.len()).step_by(2).enumerate() {
+            dst_chunks.1[di] = limit_to_full(src_chunks.1[si]);
+        }
+
+        Ok(())
+    }
+
+    fn convert_vyuy_to_nv16(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
+        assert_eq!(src.fourcc(), VYUY);
+        assert_eq!(dst.fourcc(), NV16);
+        let src_map = src.tensor.map()?;
+        let mut dst_map = dst.tensor.map()?;
+
+        // VYUY byte order: [V, Y0, U, Y1] — per 4-byte macropixel
+        let src_chunks = src_map.as_chunks::<4>().0;
+        let (y_plane, uv_plane) = dst_map.split_at_mut(dst.row_stride() * dst.height());
+        let y_pairs = y_plane.as_chunks_mut::<2>().0;
+        let uv_pairs = uv_plane.as_chunks_mut::<2>().0;
+
+        for ((s, y), uv) in src_chunks.iter().zip(y_pairs).zip(uv_pairs) {
+            y[0] = s[1]; // Y0
+            y[1] = s[3]; // Y1
+            uv[0] = s[2]; // U
+            uv[1] = s[0]; // V
         }
         Ok(())
     }
@@ -965,6 +1061,13 @@ impl CPUProcessor {
                 | (YUYV, PLANAR_RGB)
                 | (YUYV, PLANAR_RGBA)
                 | (YUYV, NV16)
+                | (VYUY, RGB)
+                | (VYUY, RGBA)
+                | (VYUY, GREY)
+                | (VYUY, VYUY)
+                | (VYUY, PLANAR_RGB)
+                | (VYUY, PLANAR_RGBA)
+                | (VYUY, NV16)
                 | (RGBA, RGB)
                 | (RGBA, RGBA)
                 | (RGBA, GREY)
@@ -1010,6 +1113,13 @@ impl CPUProcessor {
             (YUYV, PLANAR_RGB) => Self::convert_yuyv_to_8bps(src, dst),
             (YUYV, PLANAR_RGBA) => Self::convert_yuyv_to_prgba(src, dst),
             (YUYV, NV16) => Self::convert_yuyv_to_nv16(src, dst),
+            (VYUY, RGB) => Self::convert_vyuy_to_rgb(src, dst),
+            (VYUY, RGBA) => Self::convert_vyuy_to_rgba(src, dst),
+            (VYUY, GREY) => Self::convert_vyuy_to_grey(src, dst),
+            (VYUY, VYUY) => Self::copy_image(src, dst),
+            (VYUY, PLANAR_RGB) => Self::convert_vyuy_to_8bps(src, dst),
+            (VYUY, PLANAR_RGBA) => Self::convert_vyuy_to_prgba(src, dst),
+            (VYUY, NV16) => Self::convert_vyuy_to_nv16(src, dst),
             (RGBA, RGB) => Self::convert_rgba_to_rgb(src, dst),
             (RGBA, RGBA) => Self::copy_image(src, dst),
             (RGBA, GREY) => Self::convert_rgba_to_grey(src, dst),
@@ -1783,6 +1893,13 @@ impl ImageProcessorTrait for CPUProcessor {
             (YUYV, PLANAR_RGB) => RGB,
             (YUYV, PLANAR_RGBA) => RGBA,
             (YUYV, NV16) => RGBA,
+            (VYUY, RGB) => RGB,
+            (VYUY, RGBA) => RGBA,
+            (VYUY, GREY) => GREY,
+            (VYUY, VYUY) => RGBA, // RGBA intermediary for VYUY dest resize/convert/rotation/flip
+            (VYUY, PLANAR_RGB) => RGB,
+            (VYUY, PLANAR_RGBA) => RGBA,
+            (VYUY, NV16) => RGBA,
             (RGBA, RGB) => RGBA,
             (RGBA, RGBA) => RGBA,
             (RGBA, GREY) => GREY,
@@ -1934,6 +2051,11 @@ impl ImageProcessorTrait for CPUProcessor {
             (YUYV, GREY) => GREY,
             (YUYV, PLANAR_RGB) => RGB,
             (YUYV, PLANAR_RGBA) => RGBA,
+            (VYUY, RGB) => RGB,
+            (VYUY, RGBA) => RGBA,
+            (VYUY, GREY) => GREY,
+            (VYUY, PLANAR_RGB) => RGB,
+            (VYUY, PLANAR_RGBA) => RGBA,
             (RGBA, RGB) => RGBA,
             (RGBA, RGBA) => RGBA,
             (RGBA, GREY) => GREY,
