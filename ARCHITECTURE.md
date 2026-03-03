@@ -1,7 +1,7 @@
 # EdgeFirst Hardware Abstraction Layer - Architecture
 
-**Version:** 2.3
-**Last Updated:** February 27, 2026
+**Version:** 2.4
+**Last Updated:** March 3, 2026
 **Status:** Production
 **Audience:** Developers contributing to EdgeFirst HAL or integrating it into applications
 
@@ -317,6 +317,69 @@ flowchart TD
     style Det fill:#90ee90
     style Seg fill:#90ee90
 ```
+
+#### Instance Segmentation Mask Rendering
+
+YOLO segmentation models produce **proto masks** (shared basis masks at reduced
+resolution, typically 160x160) and **mask coefficients** (per-detection linear
+combination weights). The raw mask for detection `i` is:
+
+```
+mask_raw[i] = coefficients[i] @ protos    # shape: (proto_h, proto_w)
+```
+
+The HAL provides two workflows for consuming these masks:
+
+| Workflow | Python | Rust | C |
+|----------|--------|------|---|
+| **Decode** — get per-detection pixel masks | `decoder.decode_masks()` | `decode_masks_atlas()` | `hal_decoder_decode_masks()` |
+| **Draw** — overlay colored masks onto image | `decoder.draw_masks()` | `draw_masks_proto()` | `hal_decoder_draw_masks()` |
+| **Draw pre-decoded** — draw already-decoded masks | `processor.draw_masks()` | `draw_masks()` | `hal_image_processor_draw_masks()` |
+
+**Fused proto→pixel algorithm (`draw_masks_proto`)**
+
+Instead of computing the matmul at proto resolution and upsampling the result,
+the fused path upsamples the proto field itself and evaluates the dot product at
+every output pixel:
+
+```
+For each output pixel (x, y) in bbox at 640x640:
+    bilinear_sample(protos, proto_coords(x, y))  →  32 interpolated values
+    dot(coefficients, interpolated_protos)        →  raw logit
+    sigmoid(raw)                                  →  mask value [0, 1]
+    round(sigmoid × 255)                          →  uint8 pixel
+```
+
+This is algebraically equivalent to bilinear upsampling after matmul (because
+both bilinear interpolation and the dot product are linear), but avoids
+materializing intermediate tensors. Key design choices:
+
+- **No proto-resolution crop** — the full 160x160 proto field is sampled,
+  avoiding the boundary erosion artifact of crop-before-upsample approaches.
+- **Sigmoid after interpolation** — sigmoid is nonlinear, so applying it after
+  spatial operations preserves the full dynamic range through interpolation.
+- **Continuous uint8 output** — preserves confidence information rather than
+  binarizing. Callers can threshold at `> 127` for binary masks.
+
+This approach is mathematically equivalent to Ultralytics' `retina_masks=True`
+(`process_mask_native`) for binary mask output. Empirical validation across 26
+matched detections on COCO val2017 images confirms **0.993 mean mask IoU**
+between the two methods.
+
+**GPU implementation (OpenGL)**
+
+Three GLSL fragment shader variants handle different proto data formats:
+
+| Shader | Proto format | Interpolation | Notes |
+|--------|-------------|---------------|-------|
+| `int8_nearest` | R8I (quantized) | Nearest | Fastest, lowest quality |
+| `int8_bilinear` | R8I (quantized) | Manual bilinear in shader | Manual 4-tap with dequantization |
+| `f32` | R32F (float) | Hardware `texture()` with GL_LINEAR | Best quality, uses GPU sampler |
+
+The GPU renders a quad per detection, the fragment shader evaluates the mask at
+every pixel, and the result is read back via PBO as R8 uint8 values. For the
+atlas path (`decode_masks_atlas`), all detections are packed into a single
+texture atlas and read back in one PBO transfer.
 
 ### 4. Tracker HAL (`edgefirst_tracker`)
 
@@ -722,6 +785,34 @@ All test execution must use single-threaded mode (`--test-threads=1` for
 This constraint applies to CI (`test.yml`), the Makefile, and local development.
 The `cargo nextest` runner already provides per-test process isolation, but
 `-j 1` is still specified to prevent DMA/GPU contention across test processes.
+
+### Mask Rendering Benchmarks
+
+The mask rendering benchmarks use a custom in-process harness (`edgefirst-bench`)
+instead of Criterion to avoid GPU driver crashes from fork-based benchmarking
+on i.MX8/i.MX95 targets.
+
+**Rust benchmark** (`crates/image/benches/mask_benchmark.rs`):
+- `decode_masks/proto` — NMS + extract mask coefficients (no mask materialization)
+- `decode_masks/materialize` — NMS + extract proto data + materialize pixel masks on CPU
+- `draw_masks/{cpu,opengl}` — pre-decoded mask overlay
+- `draw_masks_proto/{cpu,opengl}` — fused proto→overlay
+- `decode_masks_atlas/{cpu,opengl}` — proto→pixel atlas (all masks in single GPU pass)
+
+Run: `cargo bench -p edgefirst-image --bench mask_benchmark`
+
+**Python benchmarks** (`tests/bench_decode_render.py`):
+- `decode() + draw_masks()` — 2-step path (decode to proto-res masks, then draw)
+- `draw_masks() [fused]` — single-call fused decode+draw path
+- `decode_masks()` — decode masks at output resolution
+
+Run: `python tests/bench_decode_render.py [--iterations N] [--json results.json]`
+
+**Python profiling** (`tests/profile_decode_render.py`):
+Isolated hot-loop profiling designed for `perf record`. Separates setup (model
+load, EGL init) from the measured loop.
+
+Run: `perf record -F 997 --call-graph dwarf -- python tests/profile_decode_render.py fused`
 
 ## Performance Considerations
 

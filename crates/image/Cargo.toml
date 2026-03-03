@@ -13,9 +13,8 @@ categories = ["multimedia::images", "multimedia::video", "embedded"]
 documentation = "https://docs.rs/edgefirst-image"
 
 [features]
-default = ["opengl", "decoder"]
+default = ["opengl"]
 opengl = ["dep:khronos-egl", "dep:gbm"]
-decoder = ["dep:edgefirst-decoder", "dep:ndarray-stats"]
 opencv = ["dep:opencv"]
 g2d_test_formats = []
 dma_test_formats = []
@@ -42,8 +41,8 @@ tokio = { workspace = true }
 yuv = { workspace = true }
 zune-jpeg = { workspace = true }
 zune-png = { workspace = true }
-edgefirst-decoder = { workspace = true, optional = true }
-ndarray-stats = { workspace = true, optional = true}
+edgefirst-decoder = { workspace = true }
+ndarray-stats = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 dma-heap = { workspace = true }
@@ -62,6 +61,10 @@ harness = false
 
 [[bench]]
 name = "pipeline_benchmark"
+harness = false
+
+[[bench]]
+name = "mask_benchmark"
 harness = false
 
 [lints.rust]

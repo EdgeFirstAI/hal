@@ -992,7 +992,7 @@ impl PyImageProcessor {
     }
 
     #[pyo3(signature = (dst, bbox, scores, classes, seg=vec![]))]
-    pub fn render_to_image(
+    pub fn draw_masks(
         &mut self,
         dst: &mut PyTensorImage,
         bbox: PyReadonlyArray2<f32>,
@@ -1062,7 +1062,7 @@ impl PyImageProcessor {
             })
             .collect::<Vec<_>>();
         if let Ok(mut l) = self.0.lock() {
-            l.render_to_image(&mut dst.0, &detect, &seg)?
+            l.draw_masks(&mut dst.0, &detect, &seg)?
         };
         // Ok(PyTensorImage(dst_image))
         Ok(())
