@@ -1438,21 +1438,27 @@ impl ImageProcessor {
         height: usize,
         fourcc: four_char_code::FourCharCode,
     ) -> Result<TensorImage> {
-        // Try DMA (if GL backend uses DmaBuf)
+        // Try DMA first on Linux — skip only when GL has explicitly selected PBO
+        // as the preferred transfer path (PBO is better than DMA in that case).
         #[cfg(target_os = "linux")]
-        #[cfg(feature = "opengl")]
-        if self
-            .opengl
-            .as_ref()
-            .is_some_and(|gl| gl.transfer_backend() == opengl_headless::TransferBackend::DmaBuf)
         {
-            if let Ok(img) = TensorImage::new(
-                width,
-                height,
-                fourcc,
-                Some(edgefirst_tensor::TensorMemory::Dma),
-            ) {
-                return Ok(img);
+            #[cfg(feature = "opengl")]
+            let gl_uses_pbo = self
+                .opengl
+                .as_ref()
+                .is_some_and(|gl| gl.transfer_backend() == opengl_headless::TransferBackend::Pbo);
+            #[cfg(not(feature = "opengl"))]
+            let gl_uses_pbo = false;
+
+            if !gl_uses_pbo {
+                if let Ok(img) = TensorImage::new(
+                    width,
+                    height,
+                    fourcc,
+                    Some(edgefirst_tensor::TensorMemory::Dma),
+                ) {
+                    return Ok(img);
+                }
             }
         }
 

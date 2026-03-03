@@ -751,7 +751,11 @@ struct GlPboOps {
     sender: WeakSender<GLProcessorMessage>,
 }
 
-impl edgefirst_tensor::PboOps for GlPboOps {
+// SAFETY: GlPboOps sends all GL operations to the dedicated GL thread via a
+// channel. `map_buffer` returns a CPU-visible pointer from `glMapBufferRange`
+// that remains valid until `unmap_buffer` calls `glUnmapBuffer` on the GL thread.
+// `delete_buffer` sends a fire-and-forget deletion command to the GL thread.
+unsafe impl edgefirst_tensor::PboOps for GlPboOps {
     fn map_buffer(
         &self,
         buffer_id: u32,
@@ -1217,7 +1221,8 @@ impl GLProcessorThreaded {
         };
 
         let pbo_tensor =
-            edgefirst_tensor::PboTensor::<u8>::from_pbo(buffer_id, size, &shape, None, ops);
+            edgefirst_tensor::PboTensor::<u8>::from_pbo(buffer_id, size, &shape, None, ops)
+                .map_err(|e| Error::OpenGl(format!("PBO tensor creation failed: {e:?}")))?;
         let tensor = edgefirst_tensor::Tensor::Pbo(pbo_tensor);
         crate::TensorImage::from_tensor(tensor, fourcc)
             .map_err(|e| Error::OpenGl(format!("Failed to wrap PBO tensor as image: {e:?}")))
@@ -2768,8 +2773,9 @@ impl GLProcessorST {
 
     /// Convert between two PBO-backed images.
     ///
-    /// Source is uploaded via the normal texture path (maps the PBO for CPU access).
-    /// Destination uses GL_PIXEL_PACK_BUFFER for zero-copy readback into the PBO.
+    /// Source PBO is bound as `GL_PIXEL_UNPACK_BUFFER` for zero-copy texture upload
+    /// (avoids `tensor.map()` to prevent GL-thread deadlocks). Destination uses
+    /// `GL_PIXEL_PACK_BUFFER` for zero-copy readback into the PBO.
     fn convert_pbo_to_pbo(
         &mut self,
         dst: &mut TensorImage,

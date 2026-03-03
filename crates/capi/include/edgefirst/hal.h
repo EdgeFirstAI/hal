@@ -276,6 +276,10 @@ typedef enum hal_tensor_memory {
    * POSIX Shared Memory allocation (Linux only, for IPC)
    */
   HAL_TENSOR_MEMORY_SHM = 2,
+  /**
+   * GPU Pixel Buffer Object allocation (zero-copy GPU upload/readback)
+   */
+  HAL_TENSOR_MEMORY_PBO = 3,
 } hal_tensor_memory;
 
 /**

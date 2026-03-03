@@ -624,6 +624,11 @@ class TensorMemory(enum.Enum):
         POSIX Shared Memory allocation. Suitable for inter-process
         communication, but not suitable for hardware acceleration.
         """
+    PBO: TensorMemory
+    """
+    GPU Pixel Buffer Object (PBO) allocation. Used for zero-copy GPU
+    upload/readback on platforms without DMA-buf support.
+    """
     MEM: TensorMemory
     """Regular system memory allocation"""
 
