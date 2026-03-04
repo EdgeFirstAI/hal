@@ -2830,6 +2830,7 @@ impl GLProcessorST {
         let dest_format = match dst.fourcc() {
             crate::RGB | crate::RGB_INT8 => gls::gl::RGB,
             crate::RGBA => gls::gl::RGBA,
+            crate::BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
             crate::GREY => gls::gl::RED,
             _ => {
                 return Err(crate::Error::NotSupported(format!(
@@ -3172,6 +3173,7 @@ impl GLProcessorST {
         let dest_format = match dst.fourcc() {
             crate::RGB | crate::RGB_INT8 => gls::gl::RGB,
             crate::RGBA => gls::gl::RGBA,
+            crate::BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
             crate::GREY => gls::gl::RED,
             _ => {
                 return Err(crate::Error::NotSupported(format!(
@@ -3260,8 +3262,14 @@ impl GLProcessorST {
         let dest_format = match dst.fourcc() {
             crate::RGB | crate::RGB_INT8 => gls::gl::RGB,
             crate::RGBA => gls::gl::RGBA,
+            crate::BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
             crate::GREY => gls::gl::RED,
-            _ => unreachable!(),
+            _ => {
+                return Err(crate::Error::NotSupported(format!(
+                    "PBO readback not supported for {}",
+                    dst.fourcc().display()
+                )))
+            }
         };
         unsafe {
             let mut dst_map = dst.tensor().map()?;
@@ -6566,9 +6574,9 @@ mod gl_tests {
     use crate::{TensorImage, BGRA, RGBA};
     #[cfg(feature = "dma_test_formats")]
     use crate::{NV12, YUYV};
-    use edgefirst_tensor::{TensorMapTrait, TensorTrait};
     #[cfg(feature = "dma_test_formats")]
     use edgefirst_tensor::{is_dma_available, TensorMemory};
+    use edgefirst_tensor::{TensorMapTrait, TensorTrait};
     use image::buffer::ConvertBuffer;
     use ndarray::Array3;
 
@@ -7432,8 +7440,7 @@ mod gl_tests {
         let mut gl = GLProcessorThreaded::new(None).unwrap();
 
         // Convert to RGBA as reference
-        let mut rgba_dst =
-            TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma)).unwrap();
+        let mut rgba_dst = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma)).unwrap();
         gl.convert(
             &src,
             &mut rgba_dst,
@@ -7444,8 +7451,7 @@ mod gl_tests {
         .unwrap();
 
         // Convert to BGRA
-        let mut bgra_dst =
-            TensorImage::new(1280, 720, BGRA, Some(TensorMemory::Dma)).unwrap();
+        let mut bgra_dst = TensorImage::new(1280, 720, BGRA, Some(TensorMemory::Dma)).unwrap();
         gl.convert(
             &src,
             &mut bgra_dst,
@@ -7496,8 +7502,7 @@ mod gl_tests {
 
         let mut gl = GLProcessorThreaded::new(None).unwrap();
 
-        let mut rgba_dst =
-            TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma)).unwrap();
+        let mut rgba_dst = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma)).unwrap();
         gl.convert(
             &src,
             &mut rgba_dst,
@@ -7507,8 +7512,7 @@ mod gl_tests {
         )
         .unwrap();
 
-        let mut bgra_dst =
-            TensorImage::new(1280, 720, BGRA, Some(TensorMemory::Dma)).unwrap();
+        let mut bgra_dst = TensorImage::new(1280, 720, BGRA, Some(TensorMemory::Dma)).unwrap();
         gl.convert(
             &src,
             &mut bgra_dst,
@@ -7548,8 +7552,7 @@ mod gl_tests {
             return;
         }
 
-        let seg_bytes =
-            include_bytes!("../../../testdata/modelpack_seg_2x160x160.bin").to_vec();
+        let seg_bytes = include_bytes!("../../../testdata/modelpack_seg_2x160x160.bin").to_vec();
 
         // Build segmentation data (shared between both renders)
         let make_seg = || {

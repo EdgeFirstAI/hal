@@ -808,12 +808,9 @@ mod g2d_tests {
     #[cfg(target_os = "linux")]
     fn test_g2d_bgra_no_resize() {
         for src_fmt in [RGBA, YUYV, NV12, BGRA] {
-            let res = test_g2d_bgra_no_resize_(src_fmt);
-            if let Err(e) = res {
-                println!("{} to BGRA failed: {e:?}", src_fmt.display());
-            } else {
-                println!("{} to BGRA success", src_fmt.display());
-            }
+            test_g2d_bgra_no_resize_(src_fmt).unwrap_or_else(|e| {
+                panic!("{} to BGRA failed: {e:?}", src_fmt.display());
+            });
         }
     }
 
@@ -839,11 +836,23 @@ mod g2d_tests {
 
         // Convert to BGRA via G2D
         let mut bgra_dst = TensorImage::new(1280, 720, BGRA, Some(TensorMemory::Dma))?;
-        g2d.convert_(&src2, &mut bgra_dst, Rotation::None, Flip::None, Crop::no_crop())?;
+        g2d.convert_(
+            &src2,
+            &mut bgra_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )?;
 
         // Convert to RGBA via G2D as reference
         let mut rgba_dst = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma))?;
-        g2d.convert_(&src2, &mut rgba_dst, Rotation::None, Flip::None, Crop::no_crop())?;
+        g2d.convert_(
+            &src2,
+            &mut rgba_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )?;
 
         // Copy both to CPU memory for comparison
         let bgra_cpu = TensorImage::new(1280, 720, BGRA, None)?;
@@ -873,22 +882,26 @@ mod g2d_tests {
             .enumerate()
         {
             assert_eq!(
-                bc[0], rc[2],
+                bc[0],
+                rc[2],
                 "{} to BGRA: pixel {i} B mismatch",
                 g2d_in_fmt.display()
             );
             assert_eq!(
-                bc[1], rc[1],
+                bc[1],
+                rc[1],
                 "{} to BGRA: pixel {i} G mismatch",
                 g2d_in_fmt.display()
             );
             assert_eq!(
-                bc[2], rc[0],
+                bc[2],
+                rc[0],
                 "{} to BGRA: pixel {i} R mismatch",
                 g2d_in_fmt.display()
             );
             assert_eq!(
-                bc[3], rc[3],
+                bc[3],
+                rc[3],
                 "{} to BGRA: pixel {i} A mismatch",
                 g2d_in_fmt.display()
             );
