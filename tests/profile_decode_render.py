@@ -119,7 +119,9 @@ def main():
         if args.path == "fused":
             decoder.draw_masks(outputs, processor, dst)
         elif args.path == "masks":
-            decoder.decode_masks(outputs, processor, output_width=640, output_height=640)
+            decoder.decode_masks(
+                outputs, processor, output_width=640, output_height=640
+            )
         else:
             boxes, scores, classes, masks = decoder.decode(outputs)
             processor.draw_masks(
@@ -135,7 +137,9 @@ def main():
             decoder.draw_masks(outputs, processor, dst)
     elif args.path == "masks":
         for _ in range(args.iterations):
-            decoder.decode_masks(outputs, processor, output_width=640, output_height=640)
+            decoder.decode_masks(
+                outputs, processor, output_width=640, output_height=640
+            )
     else:
         for _ in range(args.iterations):
             boxes, scores, classes, masks = decoder.decode(outputs)

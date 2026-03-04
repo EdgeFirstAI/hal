@@ -1606,9 +1606,12 @@ pub unsafe extern "C" fn hal_decoder_decode_masks(
     let masks = if let Some(proto_data) = proto_data {
         {
             let (atlas_pixels, regions) = try_or_errno!(
-                (*processor)
-                    .inner
-                    .decode_masks_atlas(&boxes, proto_data, output_width, output_height),
+                (*processor).inner.decode_masks_atlas(
+                    &boxes,
+                    proto_data,
+                    output_width,
+                    output_height
+                ),
                 libc::EIO
             );
 
@@ -1644,11 +1647,9 @@ pub unsafe extern "C" fn hal_decoder_decode_masks(
                         mask_data[dst_offset..dst_offset + r.bbox_w]
                             .copy_from_slice(&atlas_pixels[src_offset..src_offset + r.bbox_w]);
                     }
-                    let mask_arr = ndarray::Array3::from_shape_vec(
-                        (r.bbox_h, r.bbox_w, 1),
-                        mask_data,
-                    )
-                    .unwrap_or_else(|_| ndarray::Array3::zeros((0, 0, 1)));
+                    let mask_arr =
+                        ndarray::Array3::from_shape_vec((r.bbox_h, r.bbox_w, 1), mask_data)
+                            .unwrap_or_else(|_| ndarray::Array3::zeros((0, 0, 1)));
                     seg_masks.push(Segmentation {
                         xmin: det.bbox.xmin,
                         ymin: det.bbox.ymin,

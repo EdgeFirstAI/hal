@@ -1633,10 +1633,7 @@ impl ImageProcessorTrait for ImageProcessor {
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
         if let Some(opengl) = self.opengl.as_mut() {
-            log::trace!(
-                "draw_masks started with opengl in {:?}",
-                start.elapsed()
-            );
+            log::trace!("draw_masks started with opengl in {:?}", start.elapsed());
             match opengl.draw_masks(dst, detect, segmentation) {
                 Ok(_) => {
                     log::trace!("draw_masks with opengl in {:?}", start.elapsed());
@@ -1647,10 +1644,7 @@ impl ImageProcessorTrait for ImageProcessor {
                 }
             }
         }
-        log::trace!(
-            "draw_masks started with cpu in {:?}",
-            start.elapsed()
-        );
+        log::trace!("draw_masks started with cpu in {:?}", start.elapsed());
         if let Some(cpu) = self.cpu.as_mut() {
             match cpu.draw_masks(dst, detect, segmentation) {
                 Ok(_) => {
@@ -1683,7 +1677,10 @@ impl ImageProcessorTrait for ImageProcessor {
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
         if let Some(opengl) = self.opengl.as_mut() {
-            log::trace!("draw_masks_proto started with opengl in {:?}", start.elapsed());
+            log::trace!(
+                "draw_masks_proto started with opengl in {:?}",
+                start.elapsed()
+            );
             match opengl.draw_masks_proto(dst, detect, proto_data) {
                 Ok(_) => {
                     log::trace!("draw_masks_proto with opengl in {:?}", start.elapsed());

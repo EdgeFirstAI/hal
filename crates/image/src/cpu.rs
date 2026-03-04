@@ -3249,9 +3249,7 @@ mod cpu_tests {
         };
 
         let mut renderer = CPUProcessor::new();
-        renderer
-            .draw_masks(&mut image, &[], &[seg])
-            .unwrap();
+        renderer.draw_masks(&mut image, &[], &[seg]).unwrap();
 
         image.save_jpeg("test_segmentation.jpg", 80).unwrap();
     }
@@ -3293,9 +3291,7 @@ mod cpu_tests {
             .set_class_colors(&[[255, 255, 0, 233], [128, 128, 255, 100]])
             .unwrap();
         assert_eq!(renderer.colors[1], [128, 128, 255, 100]);
-        renderer
-            .draw_masks(&mut image, &[detect], &[seg])
-            .unwrap();
+        renderer.draw_masks(&mut image, &[detect], &[seg]).unwrap();
         let expected = TensorImage::load(
             include_bytes!("../../../testdata/output_render_cpu.jpg"),
             Some(RGBA),

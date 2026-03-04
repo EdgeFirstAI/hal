@@ -6596,9 +6596,7 @@ mod gl_tests {
         };
 
         let mut renderer = GLProcessorThreaded::new(None).unwrap();
-        renderer
-            .draw_masks(&mut image, &[], &[seg])
-            .unwrap();
+        renderer.draw_masks(&mut image, &[], &[seg]).unwrap();
     }
 
     #[test]
@@ -6635,9 +6633,7 @@ mod gl_tests {
         };
 
         let mut renderer = GLProcessorThreaded::new(None).unwrap();
-        renderer
-            .draw_masks(&mut image, &[], &[seg])
-            .unwrap();
+        renderer.draw_masks(&mut image, &[], &[seg]).unwrap();
     }
 
     #[test]
@@ -6681,9 +6677,7 @@ mod gl_tests {
         renderer
             .set_class_colors(&[[255, 255, 0, 233], [128, 128, 255, 100]])
             .unwrap();
-        renderer
-            .draw_masks(&mut image, &[detect], &[seg])
-            .unwrap();
+        renderer.draw_masks(&mut image, &[detect], &[seg]).unwrap();
 
         let expected = TensorImage::load(
             include_bytes!("../../../testdata/output_render_gl.jpg"),
@@ -6720,9 +6714,7 @@ mod gl_tests {
         renderer
             .set_class_colors(&[[255, 255, 0, 233], [128, 128, 255, 100]])
             .unwrap();
-        renderer
-            .draw_masks(&mut image, &[detect], &[])
-            .unwrap();
+        renderer.draw_masks(&mut image, &[detect], &[]).unwrap();
     }
 
     static GL_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

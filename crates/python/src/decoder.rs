@@ -879,7 +879,9 @@ impl PyDecoder {
                 // Fused path: render directly from proto data (masks stay in Rust)
                 l.draw_masks_proto(&mut dst.0, &output_boxes, &proto_data)
                     .map_err(|e| {
-                        pyo3::exceptions::PyRuntimeError::new_err(format!("draw_masks_proto: {e:#?}"))
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "draw_masks_proto: {e:#?}"
+                        ))
                     })?;
             } else {
                 // Detection-only or unsupported model: fall back to standard decode + render
@@ -954,9 +956,7 @@ impl PyDecoder {
                 }
                 l.draw_masks(&mut dst.0, &output_boxes, &output_masks)
                     .map_err(|e| {
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "draw_masks: {e:#?}"
-                        ))
+                        pyo3::exceptions::PyRuntimeError::new_err(format!("draw_masks: {e:#?}"))
                     })?;
             }
         }
@@ -1018,8 +1018,7 @@ impl PyDecoder {
                     regions
                         .iter()
                         .map(|r| -> PyResult<_> {
-                            let mut mask =
-                                ndarray::Array2::<u8>::zeros((r.bbox_h, r.bbox_w));
+                            let mut mask = ndarray::Array2::<u8>::zeros((r.bbox_h, r.bbox_w));
                             // The atlas renders each detection at absolute
                             // position (padded_x, atlas_y_offset) in the atlas.
                             // The bbox region within the padded strip starts at
@@ -1028,12 +1027,12 @@ impl PyDecoder {
                             let src_y_start = r.atlas_y_offset + (r.bbox_y - r.padded_y);
                             let src_x_start = r.bbox_x;
                             if src_x_start + r.bbox_w > output_width {
-                                return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                                    format!(
-                                        "decode_masks: bbox x={}..{} exceeds atlas width {}",
-                                        src_x_start, src_x_start + r.bbox_w, output_width
-                                    ),
-                                ));
+                                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                    "decode_masks: bbox x={}..{} exceeds atlas width {}",
+                                    src_x_start,
+                                    src_x_start + r.bbox_w,
+                                    output_width
+                                )));
                             }
                             for dy in 0..r.bbox_h {
                                 let src_row = src_y_start + dy;
@@ -1041,9 +1040,7 @@ impl PyDecoder {
                                     break;
                                 }
                                 let src_offset = src_row * output_width + src_x_start;
-                                mask.row_mut(dy)
-                                    .as_slice_mut()
-                                    .unwrap()[..r.bbox_w]
+                                mask.row_mut(dy).as_slice_mut().unwrap()[..r.bbox_w]
                                     .copy_from_slice(
                                         &atlas_pixels[src_offset..src_offset + r.bbox_w],
                                     );
@@ -1062,10 +1059,8 @@ impl PyDecoder {
         };
 
         let (boxes, scores, classes) = convert_detect_box(py, &output_boxes);
-        let py_masks: Vec<Bound<'py, PyArray2<u8>>> = masks
-            .into_iter()
-            .map(|m| m.into_pyarray(py))
-            .collect();
+        let py_masks: Vec<Bound<'py, PyArray2<u8>>> =
+            masks.into_iter().map(|m| m.into_pyarray(py)).collect();
 
         Ok((boxes, scores, classes, py_masks))
     }
