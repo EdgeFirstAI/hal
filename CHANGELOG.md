@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-03-04
+
 ### Added
 
 - **`hal_decoder_draw_masks()` C API function**: fused decode+render path
