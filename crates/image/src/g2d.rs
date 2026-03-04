@@ -5,7 +5,7 @@
 
 use crate::{
     CPUProcessor, Crop, Error, Flip, ImageProcessorTrait, Result, Rotation, TensorImage,
-    TensorImageRef, NV12, RGB, RGBA, YUYV,
+    TensorImageRef, BGRA, NV12, RGB, RGBA, YUYV,
 };
 use edgefirst_tensor::Tensor;
 use g2d_sys::{G2DFormat, G2DPhysical, G2DSurface, G2D};
@@ -152,6 +152,10 @@ impl ImageProcessorTrait for G2DProcessor {
             (NV12, RGBA) => {}
             (NV12, YUYV) => {}
             (NV12, RGB) => {}
+            (RGBA, BGRA) => {}
+            (YUYV, BGRA) => {}
+            (NV12, BGRA) => {}
+            (BGRA, BGRA) => {}
             (s, d) => {
                 return Err(Error::NotSupported(format!(
                     "G2D does not support {} to {} conversion",
