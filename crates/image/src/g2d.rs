@@ -147,6 +147,8 @@ impl ImageProcessorTrait for G2DProcessor {
             (YUYV, RGBA) => {}
             (YUYV, YUYV) => {}
             (YUYV, RGB) => {}
+            // VYUY: i.MX8MP G2D hardware rejects VYUY blits (only YUYV/UYVY
+            // among packed YUV 4:2:2). ImageProcessor falls through to CPU.
             (NV12, RGBA) => {}
             (NV12, YUYV) => {}
             (NV12, RGB) => {}

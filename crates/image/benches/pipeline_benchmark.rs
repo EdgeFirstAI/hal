@@ -28,7 +28,7 @@ mod common;
 use common::{calculate_letterbox, get_test_data, run_bench, BenchConfig};
 
 use edgefirst_image::{CPUProcessor, Crop, Flip, ImageProcessorTrait, Rect, Rotation, TensorImage};
-use edgefirst_image::{NV12, PLANAR_RGB_INT8, RGB, RGBA, RGB_INT8, YUYV};
+use edgefirst_image::{NV12, PLANAR_RGB_INT8, RGB, RGBA, RGB_INT8, VYUY, YUYV};
 #[cfg(target_os = "linux")]
 use edgefirst_tensor::TensorMemory;
 use edgefirst_tensor::{TensorMapTrait, TensorTrait};
@@ -78,9 +78,9 @@ fn bench_letterbox(configs: &[BenchConfig]) {
             result.print_summary_with_throughput(throughput);
         }
 
-        // HAL G2D (for YUYV/NV12 input → RGBA/RGB output only)
+        // HAL G2D (for YUYV/VYUY/NV12 input → RGBA/RGB output only)
         #[cfg(target_os = "linux")]
-        if (config.in_fmt == YUYV || config.in_fmt == NV12)
+        if (config.in_fmt == YUYV || config.in_fmt == VYUY || config.in_fmt == NV12)
             && (config.out_fmt == RGBA || config.out_fmt == RGB)
         {
             use edgefirst_image::G2DProcessor;
@@ -115,6 +115,12 @@ fn bench_letterbox(configs: &[BenchConfig]) {
             };
             let mut proc = ManuallyDrop::new(proc);
 
+            // Pre-flight: skip if format is not supported by G2D
+            if let Err(e) = proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop) {
+                println!("  {:50} [skipped: {}]", name, e);
+                continue;
+            }
+
             let result = run_bench(&name, WARMUP, ITERATIONS, || {
                 proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop)
                     .unwrap();
@@ -122,9 +128,9 @@ fn bench_letterbox(configs: &[BenchConfig]) {
             result.print_summary_with_throughput(throughput);
         }
 
-        // HAL OpenGL (for YUYV/NV12 → RGBA/RGB/RGB_INT8/PLANAR_RGB_INT8 output)
+        // HAL OpenGL (for YUYV/VYUY/NV12 → RGBA/RGB/RGB_INT8/PLANAR_RGB_INT8 output)
         #[cfg(all(target_os = "linux", feature = "opengl"))]
-        if (config.in_fmt == YUYV || config.in_fmt == NV12)
+        if (config.in_fmt == YUYV || config.in_fmt == VYUY || config.in_fmt == NV12)
             && (config.out_fmt == RGBA
                 || config.out_fmt == RGB
                 || config.out_fmt == RGB_INT8
@@ -157,6 +163,12 @@ fn bench_letterbox(configs: &[BenchConfig]) {
                 println!("  {:50} [skipped: OpenGL unavailable]", name);
                 continue;
             };
+
+            // Pre-flight: skip if format/path is not supported
+            if let Err(e) = proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop) {
+                println!("  {:50} [skipped: {}]", name, e);
+                continue;
+            }
 
             let result = run_bench(&name, WARMUP, ITERATIONS, || {
                 proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop)
@@ -323,9 +335,9 @@ fn bench_convert(configs: &[BenchConfig]) {
             result.print_summary_with_throughput(throughput);
         }
 
-        // HAL G2D (for YUYV/NV12 input → RGBA/RGB output only)
+        // HAL G2D (for YUYV/VYUY/NV12 input → RGBA/RGB output only)
         #[cfg(target_os = "linux")]
-        if (config.in_fmt == YUYV || config.in_fmt == NV12)
+        if (config.in_fmt == YUYV || config.in_fmt == VYUY || config.in_fmt == NV12)
             && (config.out_fmt == RGBA || config.out_fmt == RGB)
         {
             use edgefirst_image::G2DProcessor;
@@ -360,6 +372,14 @@ fn bench_convert(configs: &[BenchConfig]) {
             };
             let mut proc = ManuallyDrop::new(proc);
 
+            // Pre-flight: skip if format is not supported by G2D
+            if let Err(e) =
+                proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            {
+                println!("  {:50} [skipped: {}]", name, e);
+                continue;
+            }
+
             let result = run_bench(&name, WARMUP, ITERATIONS, || {
                 proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
                     .unwrap();
@@ -367,9 +387,9 @@ fn bench_convert(configs: &[BenchConfig]) {
             result.print_summary_with_throughput(throughput);
         }
 
-        // HAL OpenGL (for YUYV/NV12 → RGBA/RGB/RGB_INT8/PLANAR_RGB_INT8)
+        // HAL OpenGL (for YUYV/VYUY/NV12 → RGBA/RGB/RGB_INT8/PLANAR_RGB_INT8)
         #[cfg(all(target_os = "linux", feature = "opengl"))]
-        if (config.in_fmt == YUYV || config.in_fmt == NV12)
+        if (config.in_fmt == YUYV || config.in_fmt == VYUY || config.in_fmt == NV12)
             && (config.out_fmt == RGBA
                 || config.out_fmt == RGB
                 || config.out_fmt == RGB_INT8
@@ -402,6 +422,14 @@ fn bench_convert(configs: &[BenchConfig]) {
                 println!("  {:50} [skipped: OpenGL unavailable]", name);
                 continue;
             };
+
+            // Pre-flight: skip if format/path is not supported
+            if let Err(e) =
+                proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            {
+                println!("  {:50} [skipped: {}]", name, e);
+                continue;
+            }
 
             let result = run_bench(&name, WARMUP, ITERATIONS, || {
                 proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
@@ -595,6 +623,14 @@ fn bench_resize(configs: &[BenchConfig]) {
                 println!("  {:50} [skipped: OpenGL unavailable]", name);
                 continue;
             };
+
+            // Pre-flight: skip if format/path is not supported
+            if let Err(e) =
+                proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            {
+                println!("  {:50} [skipped: {}]", name, e);
+                continue;
+            }
 
             let result = run_bench(&name, WARMUP, ITERATIONS, || {
                 proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
@@ -812,6 +848,8 @@ fn main() {
         BenchConfig::new(1920, 1080, 640, 640, YUYV, RGB),
         BenchConfig::new(1920, 1080, 640, 640, YUYV, RGB_INT8),
         BenchConfig::new(1920, 1080, 640, 640, YUYV, PLANAR_RGB_INT8),
+        BenchConfig::new(1920, 1080, 640, 640, VYUY, RGBA),
+        BenchConfig::new(1920, 1080, 640, 640, VYUY, RGB),
         BenchConfig::new(1920, 1080, 640, 640, NV12, RGBA),
         // 4K camera → YOLO standard (640x640)
         BenchConfig::new(3840, 2160, 640, 640, YUYV, RGBA),
@@ -832,6 +870,8 @@ fn main() {
         BenchConfig::new(1920, 1080, 1920, 1080, YUYV, RGBA),
         BenchConfig::new(1920, 1080, 1920, 1080, YUYV, RGB),
         BenchConfig::new(1920, 1080, 1920, 1080, YUYV, RGB_INT8),
+        BenchConfig::new(1920, 1080, 1920, 1080, VYUY, RGBA),
+        BenchConfig::new(1920, 1080, 1920, 1080, VYUY, RGB),
         BenchConfig::new(1920, 1080, 1920, 1080, NV12, RGBA),
         BenchConfig::new(1920, 1080, 1920, 1080, NV12, RGB),
         BenchConfig::new(1920, 1080, 1920, 1080, RGB, RGBA),

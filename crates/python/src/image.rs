@@ -122,6 +122,7 @@ pub enum ImageDest3<'py> {
 #[allow(non_camel_case_types)]
 pub enum FourCC {
     YUYV,
+    VYUY,
     RGBA,
     RGB,
     NV12,
@@ -155,9 +156,10 @@ impl TryFrom<&str> for FourCC {
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         match value.to_uppercase().as_str() {
             "YUYV" => Ok(FourCC::YUYV),
+            "VYUY" => Ok(FourCC::VYUY),
             "RGBA" => Ok(FourCC::RGBA),
             "RGB" | "RGB " => Ok(FourCC::RGB),
-            "NV12" => Ok(FourCC::RGB),
+            "NV12" => Ok(FourCC::NV12),
             "Y800" | "GREY" | "GRAY" => Ok(FourCC::GREY),
             "8BPS" => Ok(FourCC::PLANAR_RGB),
             _ => Err(Error::Format(value.to_string())),
@@ -169,6 +171,7 @@ impl From<FourCC> for FourCharCode {
     fn from(val: FourCC) -> Self {
         match val {
             FourCC::YUYV => image::YUYV,
+            FourCC::VYUY => image::VYUY,
             FourCC::RGBA => image::RGBA,
             FourCC::RGB => image::RGB,
             FourCC::NV12 => image::NV12,
@@ -1065,6 +1068,27 @@ impl PyImageProcessor {
         Ok(())
     }
 
+    /// Create an image with the processor's optimal memory backend.
+    ///
+    /// Selects the best available backing storage based on hardware capabilities:
+    /// DMA-buf > PBO (GPU buffer) > system memory. Images created this way benefit
+    /// from zero-copy GPU paths when used with this processor's convert().
+    #[pyo3(signature = (width, height, fourcc = FourCC::RGBA))]
+    pub fn create_image(
+        &self,
+        width: usize,
+        height: usize,
+        fourcc: FourCC,
+    ) -> Result<PyTensorImage> {
+        let fourcc: four_char_code::FourCharCode = fourcc.into();
+        let img = self
+            .0
+            .lock()
+            .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?
+            .create_image(width, height, fourcc)?;
+        Ok(PyTensorImage(img))
+    }
+
     pub fn set_class_colors(&mut self, colors: Vec<[u8; 4]>) -> Result<()> {
         if let Ok(mut l) = self.0.lock() {
             l.set_class_colors(&colors)?
@@ -1109,7 +1133,7 @@ pub enum PyRotation {
 impl PyRotation {
     #[staticmethod]
     pub fn degrees_clockwise(angle: usize) -> PyRotation {
-        match angle.rem_euclid(90) {
+        match angle.rem_euclid(360) {
             0 => PyRotation::Rotate0,
             90 => PyRotation::Clockwise90,
             180 => PyRotation::Rotate180,

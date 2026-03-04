@@ -65,6 +65,7 @@ pub enum PyTensorMemory {
     DMA,
     #[cfg(unix)]
     SHM,
+    PBO,
     MEM,
 }
 
@@ -75,6 +76,7 @@ impl From<PyTensorMemory> for TensorMemory {
             PyTensorMemory::DMA => TensorMemory::Dma,
             #[cfg(unix)]
             PyTensorMemory::SHM => TensorMemory::Shm,
+            PyTensorMemory::PBO => TensorMemory::Pbo,
             PyTensorMemory::MEM => TensorMemory::Mem,
         }
     }
@@ -87,6 +89,7 @@ impl From<TensorMemory> for PyTensorMemory {
             TensorMemory::Dma => PyTensorMemory::DMA,
             #[cfg(unix)]
             TensorMemory::Shm => PyTensorMemory::SHM,
+            TensorMemory::Pbo => PyTensorMemory::PBO,
             TensorMemory::Mem => PyTensorMemory::MEM,
         }
     }

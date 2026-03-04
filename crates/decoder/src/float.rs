@@ -142,26 +142,26 @@ pub fn nms_extra_float<E: Send + Sync>(
 
     // Outer loop over all boxes.
     for i in 0..boxes.len() {
-        if boxes[i].0.score <= 0.0 {
+        if boxes[i].0.score < 0.0 {
             // this box was merged with a different box earlier
             continue;
         }
         for j in (i + 1)..boxes.len() {
             // Inner loop over boxes with lower score (later in the list).
 
-            if boxes[j].0.score <= 0.0 {
+            if boxes[j].0.score < 0.0 {
                 // this box was suppressed by different box earlier
                 continue;
             }
             if jaccard(&boxes[j].0.bbox, &boxes[i].0.bbox, iou) {
                 // max_box(boxes[j].bbox, &mut boxes[i].bbox);
-                boxes[j].0.score = 0.0;
+                boxes[j].0.score = -1.0;
             }
         }
     }
 
-    // Filter out boxes with a score of 0.0.
-    boxes.into_iter().filter(|b| b.0.score > 0.0).collect()
+    // Filter out suppressed boxes.
+    boxes.into_iter().filter(|b| b.0.score >= 0.0).collect()
 }
 
 /// Class-aware NMS: only suppress boxes with the same label.
@@ -232,22 +232,22 @@ pub fn nms_extra_class_aware_float<E: Send + Sync>(
     }
 
     for i in 0..boxes.len() {
-        if boxes[i].0.score <= 0.0 {
+        if boxes[i].0.score < 0.0 {
             continue;
         }
         for j in (i + 1)..boxes.len() {
-            if boxes[j].0.score <= 0.0 {
+            if boxes[j].0.score < 0.0 {
                 continue;
             }
             // Only suppress if same class AND overlapping
             if boxes[j].0.label == boxes[i].0.label
                 && jaccard(&boxes[j].0.bbox, &boxes[i].0.bbox, iou)
             {
-                boxes[j].0.score = 0.0;
+                boxes[j].0.score = -1.0;
             }
         }
     }
-    boxes.into_iter().filter(|b| b.0.score > 0.0).collect()
+    boxes.into_iter().filter(|b| b.0.score >= 0.0).collect()
 }
 
 /// Returns true if the IOU of the given bounding boxes is greater than the iou

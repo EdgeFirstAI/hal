@@ -27,7 +27,7 @@ use std::{
     thread::JoinHandle,
     time::Instant,
 };
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{Sender, WeakSender};
 
 macro_rules! function {
     () => {{
@@ -50,7 +50,7 @@ use crate::DEFAULT_COLORS;
 use crate::{
     fourcc_is_int8, fourcc_is_packed_rgb, CPUProcessor, Crop, Error, Flip, ImageProcessorTrait,
     Rect, Rotation, TensorImage, TensorImageRef, GREY, NV12, PLANAR_RGB, PLANAR_RGBA,
-    PLANAR_RGB_INT8, RGB, RGBA, RGB_INT8, YUYV,
+    PLANAR_RGB_INT8, RGB, RGBA, RGB_INT8, VYUY, YUYV,
 };
 
 #[cfg(feature = "decoder")]
@@ -58,25 +58,30 @@ use crate::MaskResult;
 
 /// Identifies the type of EGL display used for headless OpenGL ES rendering.
 ///
-/// The HAL probes displays in priority order: GBM first (direct GPU access),
-/// then platform device enumeration, then the default display. Use
+/// The HAL creates a surfaceless GLES 3.0 context
+/// (`EGL_KHR_surfaceless_context` + `EGL_KHR_no_config_context`) and
+/// renders exclusively through FBOs backed by EGLImages imported from
+/// DMA-buf file descriptors. No window or PBuffer surface is created.
+///
+/// Displays are probed in priority order: PlatformDevice first (zero
+/// external dependencies), then GBM, then Default. Use
 /// [`probe_egl_displays`] to discover which are available and
 /// [`ImageProcessorConfig::egl_display`](crate::ImageProcessorConfig::egl_display)
 /// to override the auto-detection.
 ///
 /// # Display Types
 ///
+/// - **`PlatformDevice`** — Uses `EGL_EXT_device_enumeration` to query
+///   available EGL devices via `eglQueryDevicesEXT`, then selects the first
+///   device with `eglGetPlatformDisplay(EGL_EXT_platform_device, ...)`.
+///   Headless and compositor-free with zero external library dependencies.
+///   Works on NVIDIA GPUs and newer Vivante drivers.
+///
 /// - **`Gbm`** — Opens a DRM render node (e.g. `/dev/dri/renderD128`) and
 ///   creates a GBM (Generic Buffer Manager) device, then calls
-///   `eglGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, gbm_device)`. This is a
-///   direct GPU path through the DRM/KMS subsystem — no compositor required.
-///   Preferred for headless edge AI workloads. On some drivers (e.g. Vivante
-///   on i.MX8), this path may trigger heap corruption during process shutdown.
-///
-/// - **`PlatformDevice`** — Uses the `EGL_EXT_device_enumeration` extension
-///   to query available EGL devices via `eglQueryDevicesEXT`, then selects the
-///   first device with `eglGetPlatformDisplay(EGL_EXT_platform_device, ...)`.
-///   Also headless and compositor-free. Common on NVIDIA GPUs.
+///   `eglGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, gbm_device)`. Requires
+///   `libgbm` and a DRM render node. Needed on ARM Mali (i.MX95) and older
+///   Vivante drivers that do not expose `EGL_EXT_platform_device`.
 ///
 /// - **`Default`** — Calls `eglGetDisplay(EGL_DEFAULT_DISPLAY)`, letting the
 ///   EGL implementation choose the display. On Wayland systems this connects
@@ -127,38 +132,36 @@ fn get_egl_lib() -> Result<&'static libloading::Library, crate::Error> {
 
 type Egl = Instance<Dynamic<&'static libloading::Library, EGL1_4>>;
 
-/// Check whether an EGL display supports GLES3 RGBA8 PBuffer rendering.
+/// Check whether an EGL display supports the surfaceless + no-config context
+/// extensions required by the HAL's FBO-based rendering pipeline.
 ///
-/// Returns `true` if `eglChooseConfig` finds at least one matching config.
-fn probe_config_check(egl: &Egl, display: egl::Display) -> bool {
-    let attributes = [
-        egl::SURFACE_TYPE,
-        egl::PBUFFER_BIT,
-        egl::RENDERABLE_TYPE,
-        egl::OPENGL_ES3_BIT,
-        egl::RED_SIZE,
-        8,
-        egl::GREEN_SIZE,
-        8,
-        egl::BLUE_SIZE,
-        8,
-        egl::ALPHA_SIZE,
-        8,
-        egl::NONE,
-    ];
-    egl.choose_first_config(display, &attributes)
-        .ok()
-        .flatten()
-        .is_some()
+/// Queries `eglQueryString(display, EGL_EXTENSIONS)` and checks for
+/// `EGL_KHR_surfaceless_context` and `EGL_KHR_no_config_context`.
+fn probe_display_extensions(egl: &Egl, display: egl::Display) -> bool {
+    let Ok(ext_str) = egl.query_string(Some(display), egl::EXTENSIONS) else {
+        return false;
+    };
+    let exts = ext_str.to_string_lossy();
+
+    let required = ["EGL_KHR_surfaceless_context", "EGL_KHR_no_config_context"];
+
+    for r in &required {
+        if !exts.contains(r) {
+            log::debug!("Display missing required extension: {r}");
+            return false;
+        }
+    }
+
+    egl.bind_api(egl::OPENGL_ES_API).is_ok()
 }
 
 /// Probe for available EGL displays supporting headless OpenGL ES 3.0.
 ///
-/// Returns validated displays in priority order (GBM, PlatformDevice,
-/// Default). Each display is validated with `eglInitialize` +
-/// `eglChooseConfig` using the same GLES3 RGBA8 PBuffer attributes used by
-/// the image processor. Probed state is cleaned up with `eglTerminate` — no
-/// EGL resources are left alive.
+/// Returns validated displays in priority order (PlatformDevice, GBM,
+/// Default). Each display is validated with `eglInitialize` + extension
+/// checks for `EGL_KHR_surfaceless_context` and `EGL_KHR_no_config_context`.
+/// Probed state is cleaned up with `eglTerminate` — no EGL resources are
+/// left alive.
 ///
 /// An empty list means OpenGL is not available on this system.
 ///
@@ -171,25 +174,11 @@ pub fn probe_egl_displays() -> Result<Vec<EglDisplayInfo>, Error> {
 
     let mut results = Vec::new();
 
-    // GBM
-    if let Ok(display_type) = GlContext::egl_get_gbm_display(&egl) {
-        let display = display_type.as_display();
-        if egl.initialize(display).is_ok() {
-            if probe_config_check(&egl, display) {
-                results.push(EglDisplayInfo {
-                    kind: EglDisplayKind::Gbm,
-                    description: "GBM via /dev/dri/renderD128".to_string(),
-                });
-            }
-            let _ = egl.terminate(display);
-        }
-    }
-
-    // PlatformDevice
+    // PlatformDevice first (zero external deps, works on NVIDIA + newer Vivante)
     if let Ok(display_type) = GlContext::egl_get_platform_display_from_device(&egl) {
         let display = display_type.as_display();
         if egl.initialize(display).is_ok() {
-            if probe_config_check(&egl, display) {
+            if probe_display_extensions(&egl, display) {
                 results.push(EglDisplayInfo {
                     kind: EglDisplayKind::PlatformDevice,
                     description: "EGL platform device via EGL_EXT_device_enumeration".to_string(),
@@ -199,11 +188,25 @@ pub fn probe_egl_displays() -> Result<Vec<EglDisplayInfo>, Error> {
         }
     }
 
-    // Default
+    // GBM second (needed for Mali + old Vivante)
+    if let Ok(display_type) = GlContext::egl_get_gbm_display(&egl) {
+        let display = display_type.as_display();
+        if egl.initialize(display).is_ok() {
+            if probe_display_extensions(&egl, display) {
+                results.push(EglDisplayInfo {
+                    kind: EglDisplayKind::Gbm,
+                    description: "GBM via /dev/dri/renderD128".to_string(),
+                });
+            }
+            let _ = egl.terminate(display);
+        }
+    }
+
+    // Default last (needs compositor)
     if let Ok(display_type) = GlContext::egl_get_default_display(&egl) {
         let display = display_type.as_display();
         if egl.initialize(display).is_ok() {
-            if probe_config_check(&egl, display) {
+            if probe_display_extensions(&egl, display) {
                 results.push(EglDisplayInfo {
                     kind: EglDisplayKind::Default,
                     description: "EGL default display".to_string(),
@@ -216,9 +219,42 @@ pub fn probe_egl_displays() -> Result<Vec<EglDisplayInfo>, Error> {
     Ok(results)
 }
 
+/// Tracks which data-transfer method is active for moving pixels
+/// between CPU memory and GPU textures/framebuffers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransferBackend {
+    /// Zero-copy via EGLImage imported from DMA-buf file descriptors.
+    /// Available on i.MX8 (Vivante), i.MX95 (Mali), Jetson, and any
+    /// platform where `EGL_EXT_image_dma_buf_import` is present AND
+    /// the GPU can actually render through DMA-buf-backed textures.
+    DmaBuf,
+
+    /// GPU buffer via Pixel Buffer Object. Used when DMA-buf is unavailable
+    /// but OpenGL is present. Data stays in GPU-accessible memory.
+    Pbo,
+
+    /// Synchronous `glTexSubImage2D` upload + `glReadnPixels` readback.
+    /// Used when DMA-buf is unavailable or when the DMA-buf verification
+    /// probe fails (e.g. NVIDIA discrete GPUs where EGLImage creation
+    /// succeeds but rendered data is all zeros).
+    Sync,
+}
+
+impl TransferBackend {
+    /// Returns `true` if DMA-buf zero-copy is available.
+    pub(crate) fn is_dma(self) -> bool {
+        self == TransferBackend::DmaBuf
+    }
+
+    /// Returns `true` if PBO transfer is active.
+    #[allow(dead_code)]
+    pub(crate) fn is_pbo(self) -> bool {
+        self == TransferBackend::Pbo
+    }
+}
+
 pub(crate) struct GlContext {
-    pub(crate) support_dma: bool,
-    pub(crate) surface: Option<egl::Surface>,
+    pub(crate) transfer_backend: TransferBackend,
     pub(crate) display: EglDisplayType,
     pub(crate) ctx: egl::Context,
     /// Wrapped in ManuallyDrop because the khronos-egl Dynamic instance's
@@ -263,15 +299,7 @@ impl GlContext {
             });
         }
 
-        // Try headless-friendly EGL methods first (GBM/DRM, device enumeration)
-        // before the default display, which may block if a compositor (Wayland)
-        // is expected but not running.
-        if let Ok(headless) = Self::try_initialize_egl(egl.clone(), Self::egl_get_gbm_display) {
-            return Ok(headless);
-        } else {
-            log::debug!("Didn't initialize EGL with GBM Display");
-        }
-
+        // Try PlatformDevice first (zero external deps, works on NVIDIA + newer Vivante)
         if let Ok(headless) =
             Self::try_initialize_egl(egl.clone(), Self::egl_get_platform_display_from_device)
         {
@@ -280,6 +308,14 @@ impl GlContext {
             log::debug!("Didn't initialize EGL with platform display from device enumeration");
         }
 
+        // GBM second (needed for Mali + old Vivante that lack EGL_EXT_platform_device)
+        if let Ok(headless) = Self::try_initialize_egl(egl.clone(), Self::egl_get_gbm_display) {
+            return Ok(headless);
+        } else {
+            log::debug!("Didn't initialize EGL with GBM Display");
+        }
+
+        // Default display last (needs compositor)
         if let Ok(headless) = Self::try_initialize_egl(egl.clone(), Self::egl_get_default_display) {
             return Ok(headless);
         } else {
@@ -298,56 +334,53 @@ impl GlContext {
         let display = display_fn(&egl)?;
         log::debug!("egl initialize with display: {:x?}", display.as_display());
         egl.initialize(display.as_display())?;
-        let attributes = [
-            egl::SURFACE_TYPE,
-            egl::PBUFFER_BIT,
-            egl::RENDERABLE_TYPE,
-            egl::OPENGL_ES3_BIT,
-            egl::RED_SIZE,
-            8,
-            egl::GREEN_SIZE,
-            8,
-            egl::BLUE_SIZE,
-            8,
-            egl::ALPHA_SIZE,
-            8,
-            egl::NONE,
-        ];
 
-        let config =
-            if let Some(config) = egl.choose_first_config(display.as_display(), &attributes)? {
-                config
-            } else {
-                return Err(crate::Error::NotImplemented(
-                    "Did not find valid OpenGL ES config".to_string(),
-                ));
-            };
+        // Verify required extensions for surfaceless + no-config context
+        let ext_str = egl.query_string(Some(display.as_display()), egl::EXTENSIONS)?;
+        let exts = ext_str.to_string_lossy();
 
-        debug!("config: {config:?}");
+        if !exts.contains("EGL_KHR_surfaceless_context") {
+            return Err(crate::Error::GLVersion(
+                "EGL display does not support EGL_KHR_surfaceless_context".to_string(),
+            ));
+        }
 
-        let surface = Some(egl.create_pbuffer_surface(
-            display.as_display(),
-            config,
-            &[egl::WIDTH, 64, egl::HEIGHT, 64, egl::NONE],
-        )?);
+        if !exts.contains("EGL_KHR_no_config_context") {
+            return Err(crate::Error::GLVersion(
+                "EGL display does not support EGL_KHR_no_config_context".to_string(),
+            ));
+        }
 
         egl.bind_api(egl::OPENGL_ES_API)?;
-        let context_attributes = [egl::CONTEXT_MAJOR_VERSION, 3, egl::NONE, egl::NONE];
 
-        let ctx = egl.create_context(display.as_display(), config, None, &context_attributes)?;
+        // No-config context: pass EGL_NO_CONFIG_KHR (null) instead of a
+        // real config. The context is not bound to any specific framebuffer
+        // format — it works with any FBO attachment format.
+        let context_attributes = [egl::CONTEXT_MAJOR_VERSION, 3, egl::NONE, egl::NONE];
+        let ctx = egl.create_context(
+            display.as_display(),
+            egl_ext::NO_CONFIG_KHR,
+            None,
+            &context_attributes,
+        )?;
         debug!("ctx: {ctx:?}");
 
-        egl.make_current(display.as_display(), surface, surface, Some(ctx))?;
+        // Surfaceless context: no PBuffer surface needed. All rendering
+        // goes through FBOs backed by EGLImages.
+        egl.make_current(display.as_display(), None, None, Some(ctx))?;
 
-        let support_dma = Self::egl_check_support_dma(&egl).is_ok();
-        let headless = GlContext {
+        let has_dma_extensions = Self::egl_check_support_dma(&egl).is_ok();
+        let transfer_backend = if has_dma_extensions {
+            TransferBackend::DmaBuf
+        } else {
+            TransferBackend::Sync
+        };
+        Ok(GlContext {
             display,
             ctx,
             egl: ManuallyDrop::new(egl),
-            surface,
-            support_dma,
-        };
-        Ok(headless)
+            transfer_backend,
+        })
     }
 
     fn egl_get_default_display(egl: &Egl) -> Result<EglDisplayType, crate::Error> {
@@ -414,7 +447,11 @@ impl GlContext {
             ));
         }
 
-        // just use the first device?
+        if devices.is_empty() {
+            return Err(Error::GLVersion(
+                "EGL_EXT_device_enumeration returned 0 devices".to_string(),
+            ));
+        }
         let disp = Self::egl_get_platform_display_with_fallback(
             egl,
             egl_ext::PLATFORM_DEVICE_EXT,
@@ -450,7 +487,6 @@ impl GlContext {
                 "EGL does not support eglDestroyImageKHR function".to_string(),
             ));
         }
-        // Err(crate::Error::GLVersion("EGL Version too low".to_string()))
         Ok(())
     }
 
@@ -534,7 +570,7 @@ impl GlContext {
         }
     }
 
-    fn egl_destory_image_with_fallback(
+    fn egl_destroy_image_with_fallback(
         egl: &Egl,
         display: Display,
         image: egl::Image,
@@ -580,16 +616,10 @@ impl Drop for GlContext {
                 .egl
                 .destroy_context(self.display.as_display(), self.ctx);
 
-            if let Some(surface) = self.surface.take() {
-                let _ = self.egl.destroy_surface(self.display.as_display(), surface);
-            }
-
-            // eglTerminate decrements the ref count on the display connection.
-            // Since eglInitialize is ref-counted per the EGL spec, this only
-            // tears down internal state when the last reference is released.
-            // probe_egl_displays() already calls eglTerminate successfully on
-            // all platforms; catch_unwind provides a safety net for any driver
-            // that misbehaves.
+            // eglTerminate is ref-counted per the EGL spec: each eglInitialize
+            // increments a counter and each eglTerminate decrements it. The
+            // display is only truly torn down when the last reference is
+            // released. catch_unwind absorbs any driver-side misbehaviour.
             let _ = self.egl.terminate(self.display.as_display());
         }));
         std::panic::set_hook(prev_hook);
@@ -598,8 +628,6 @@ impl Drop for GlContext {
         // khronos-egl Dynamic instance's Drop calls eglReleaseThread() which
         // panics if the EGL library has been unloaded (local/x86_64) or
         // causes heap corruption by calling into invalid memory (ARM).
-        // The Rc wrapper is a lightweight Rust-side object; the actual EGL
-        // display resources are released by eglTerminate above.
     }
 }
 
@@ -697,6 +725,78 @@ enum GLProcessorMessage {
         usize,
         tokio::sync::oneshot::Sender<Result<Vec<MaskResult>, Error>>,
     ),
+    PboCreate(
+        usize, // buffer size in bytes
+        tokio::sync::oneshot::Sender<Result<u32, Error>>,
+    ),
+    PboMap(
+        u32,   // buffer_id
+        usize, // size
+        tokio::sync::oneshot::Sender<Result<edgefirst_tensor::PboMapping, Error>>,
+    ),
+    PboUnmap(
+        u32, // buffer_id
+        tokio::sync::oneshot::Sender<Result<(), Error>>,
+    ),
+    PboDelete(u32), // fire-and-forget, no reply
+}
+
+/// Implements PboOps by sending commands to the GL thread.
+///
+/// Uses a `WeakSender` so that PBO images don't keep the GL thread's channel
+/// alive. When the `GLProcessorThreaded` is dropped, its `Sender` is the last
+/// strong reference — dropping it closes the channel and lets the GL thread
+/// exit. PBO operations after that return `PboDisconnected`.
+struct GlPboOps {
+    sender: WeakSender<GLProcessorMessage>,
+}
+
+// SAFETY: GlPboOps sends all GL operations to the dedicated GL thread via a
+// channel. `map_buffer` returns a CPU-visible pointer from `glMapBufferRange`
+// that remains valid until `unmap_buffer` calls `glUnmapBuffer` on the GL thread.
+// `delete_buffer` sends a fire-and-forget deletion command to the GL thread.
+unsafe impl edgefirst_tensor::PboOps for GlPboOps {
+    fn map_buffer(
+        &self,
+        buffer_id: u32,
+        size: usize,
+    ) -> edgefirst_tensor::Result<edgefirst_tensor::PboMapping> {
+        let sender = self
+            .sender
+            .upgrade()
+            .ok_or(edgefirst_tensor::Error::PboDisconnected)?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        sender
+            .blocking_send(GLProcessorMessage::PboMap(buffer_id, size, tx))
+            .map_err(|_| edgefirst_tensor::Error::PboDisconnected)?;
+        rx.blocking_recv()
+            .map_err(|_| edgefirst_tensor::Error::PboDisconnected)?
+            .map_err(|e| {
+                edgefirst_tensor::Error::NotImplemented(format!("GL PBO map failed: {e:?}"))
+            })
+    }
+
+    fn unmap_buffer(&self, buffer_id: u32) -> edgefirst_tensor::Result<()> {
+        let sender = self
+            .sender
+            .upgrade()
+            .ok_or(edgefirst_tensor::Error::PboDisconnected)?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        sender
+            .blocking_send(GLProcessorMessage::PboUnmap(buffer_id, tx))
+            .map_err(|_| edgefirst_tensor::Error::PboDisconnected)?;
+        rx.blocking_recv()
+            .map_err(|_| edgefirst_tensor::Error::PboDisconnected)?
+            .map_err(|e| {
+                edgefirst_tensor::Error::NotImplemented(format!("GL PBO unmap failed: {e:?}"))
+            })
+    }
+
+    fn delete_buffer(&self, buffer_id: u32) {
+        if let Some(sender) = self.sender.upgrade() {
+            let _ = sender.blocking_send(GLProcessorMessage::PboDelete(buffer_id));
+        }
+    }
 }
 
 /// OpenGL multi-threaded image converter. The actual conversion is done in a
@@ -710,7 +810,7 @@ pub struct GLProcessorThreaded {
 
     // This is only None when the converter is being dropped.
     sender: Option<Sender<GLProcessorMessage>>,
-    support_dma: bool,
+    transfer_backend: TransferBackend,
 }
 
 unsafe impl Send for GLProcessorThreaded {}
@@ -738,7 +838,7 @@ impl GLProcessorThreaded {
                     return;
                 }
             };
-            let _ = create_ctx_send.send(Ok(gl_converter.gl_context.support_dma));
+            let _ = create_ctx_send.send(Ok(gl_converter.gl_context.transfer_backend));
             while let Some(msg) = recv.blocking_recv() {
                 match msg {
                     GLProcessorMessage::ImageConvert(src, mut dst, rotation, flip, crop, resp) => {
@@ -794,6 +894,69 @@ impl GLProcessorThreaded {
                         );
                         let _ = resp.send(res);
                     }
+                    GLProcessorMessage::PboCreate(size, resp) => {
+                        let result = unsafe {
+                            let mut id: u32 = 0;
+                            gls::gl::GenBuffers(1, &mut id);
+                            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, id);
+                            gls::gl::BufferData(
+                                gls::gl::PIXEL_PACK_BUFFER,
+                                size as isize,
+                                std::ptr::null(),
+                                gls::gl::STREAM_COPY,
+                            );
+                            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+                            match check_gl_error("PboCreate", 0) {
+                                Ok(()) => Ok(id),
+                                Err(e) => {
+                                    gls::gl::DeleteBuffers(1, &id);
+                                    Err(e)
+                                }
+                            }
+                        };
+                        let _ = resp.send(result);
+                    }
+                    GLProcessorMessage::PboMap(buffer_id, size, resp) => {
+                        let result = unsafe {
+                            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, buffer_id);
+                            let ptr = gls::gl::MapBufferRange(
+                                gls::gl::PIXEL_PACK_BUFFER,
+                                0,
+                                size as isize,
+                                gls::gl::MAP_READ_BIT | gls::gl::MAP_WRITE_BIT,
+                            );
+                            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+                            if ptr.is_null() {
+                                Err(crate::Error::OpenGl(
+                                    "glMapBufferRange returned null".to_string(),
+                                ))
+                            } else {
+                                Ok(edgefirst_tensor::PboMapping {
+                                    ptr: ptr as *mut u8,
+                                    size,
+                                })
+                            }
+                        };
+                        let _ = resp.send(result);
+                    }
+                    GLProcessorMessage::PboUnmap(buffer_id, resp) => {
+                        let result = unsafe {
+                            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, buffer_id);
+                            let ok = gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
+                            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+                            if ok == gls::gl::FALSE {
+                                Err(Error::OpenGl(
+                                    "PBO data was corrupted during mapping".into(),
+                                ))
+                            } else {
+                                check_gl_error("PboUnmap", 0)
+                            }
+                        };
+                        let _ = resp.send(result);
+                    }
+                    GLProcessorMessage::PboDelete(buffer_id) => unsafe {
+                        gls::gl::DeleteBuffers(1, &buffer_id);
+                    },
                 }
             }
         };
@@ -801,20 +964,20 @@ impl GLProcessorThreaded {
         // let handle = tokio::task::spawn(func());
         let handle = std::thread::spawn(func);
 
-        let support_dma = match create_ctx_recv.blocking_recv() {
+        let transfer_backend = match create_ctx_recv.blocking_recv() {
             Ok(Err(e)) => return Err(e),
             Err(_) => {
                 return Err(Error::Internal(
                     "GL converter error messaging closed without update".to_string(),
                 ));
             }
-            Ok(Ok(supports_dma)) => supports_dma,
+            Ok(Ok(tb)) => tb,
         };
 
         Ok(Self {
             handle: Some(handle),
             sender: Some(send),
-            support_dma,
+            transfer_backend,
         })
     }
 }
@@ -829,14 +992,14 @@ impl ImageProcessorTrait for GLProcessorThreaded {
         crop: Crop,
     ) -> crate::Result<()> {
         crop.check_crop(src, dst)?;
-        if !GLProcessorST::check_src_format_supported(self.support_dma, src) {
+        if !GLProcessorST::check_src_format_supported(self.transfer_backend, src) {
             return Err(crate::Error::NotSupported(format!(
                 "Opengl doesn't support {} source texture",
                 src.fourcc().display()
             )));
         }
 
-        if !GLProcessorST::check_dst_format_supported(self.support_dma, dst) {
+        if !GLProcessorST::check_dst_format_supported(self.transfer_backend, dst) {
             return Err(crate::Error::NotSupported(format!(
                 "Opengl doesn't support {} destination texture",
                 dst.fourcc().display()
@@ -1019,6 +1182,57 @@ impl GLProcessorThreaded {
             Error::Internal("GL converter error messaging closed without update".to_string())
         })?
     }
+
+    /// Create a PBO-backed TensorImage on the GL thread.
+    pub fn create_pbo_image(
+        &self,
+        width: usize,
+        height: usize,
+        fourcc: four_char_code::FourCharCode,
+    ) -> Result<crate::TensorImage, Error> {
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or(Error::OpenGl("GL processor is shutting down".to_string()))?;
+
+        let channels = crate::fourcc_channels(fourcc)?;
+        let size = width * height * channels;
+        if size == 0 {
+            return Err(Error::OpenGl("Invalid image dimensions".to_string()));
+        }
+
+        // Allocate PBO on the GL thread
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        sender
+            .blocking_send(GLProcessorMessage::PboCreate(size, tx))
+            .map_err(|_| Error::OpenGl("GL thread channel closed".to_string()))?;
+        let buffer_id = rx
+            .blocking_recv()
+            .map_err(|_| Error::OpenGl("GL thread did not respond".to_string()))??;
+
+        let ops: std::sync::Arc<dyn edgefirst_tensor::PboOps> = std::sync::Arc::new(GlPboOps {
+            sender: sender.downgrade(),
+        });
+
+        let shape = if crate::fourcc_planar(fourcc)? {
+            vec![channels, height, width]
+        } else {
+            vec![height, width, channels]
+        };
+
+        let pbo_tensor =
+            edgefirst_tensor::PboTensor::<u8>::from_pbo(buffer_id, size, &shape, None, ops)
+                .map_err(|e| Error::OpenGl(format!("PBO tensor creation failed: {e:?}")))?;
+        let tensor = edgefirst_tensor::Tensor::Pbo(pbo_tensor);
+        crate::TensorImage::from_tensor(tensor, fourcc)
+            .map_err(|e| Error::OpenGl(format!("Failed to wrap PBO tensor as image: {e:?}")))
+    }
+
+    /// Returns the active transfer backend.
+    #[allow(dead_code)]
+    pub(crate) fn transfer_backend(&self) -> TransferBackend {
+        self.transfer_backend
+    }
 }
 
 impl Drop for GLProcessorThreaded {
@@ -1054,14 +1268,22 @@ struct CachedEglImage {
     guard: std::sync::Weak<()>,
     /// Optional GL renderbuffer backed by this EGLImage (used by direct RGB path).
     renderbuffer: Option<u32>,
+    /// Monotonic access counter for LRU eviction.
+    last_used: u64,
 }
 
 /// EGLImage cache owned by GLProcessorST.
+///
+/// Uses a HashMap with a monotonic counter for LRU eviction: each access
+/// updates the entry's `last_used` timestamp, and eviction removes the entry
+/// with the smallest `last_used` value.
 struct EglImageCache {
     entries: std::collections::HashMap<u64, CachedEglImage>,
     capacity: usize,
     hits: u64,
     misses: u64,
+    /// Monotonic counter incremented on each access for LRU tracking.
+    access_counter: u64,
 }
 
 impl EglImageCache {
@@ -1071,6 +1293,24 @@ impl EglImageCache {
             capacity,
             hits: 0,
             misses: 0,
+            access_counter: 0,
+        }
+    }
+
+    /// Allocate a new LRU timestamp.
+    fn next_timestamp(&mut self) -> u64 {
+        self.access_counter += 1;
+        self.access_counter
+    }
+
+    /// Evict the least recently used entry.
+    fn evict_lru(&mut self) {
+        if let Some((&evict_id, _)) = self.entries.iter().min_by_key(|(_, entry)| entry.last_used) {
+            if let Some(evicted) = self.entries.remove(&evict_id) {
+                if let Some(rbo) = evicted.renderbuffer {
+                    unsafe { gls::gl::DeleteRenderbuffers(1, &rbo) };
+                }
+            }
         }
     }
 
@@ -1221,14 +1461,14 @@ impl ImageProcessorTrait for GLProcessorST {
         crop: Crop,
     ) -> crate::Result<()> {
         crop.check_crop(src, dst)?;
-        if !Self::check_src_format_supported(self.gl_context.support_dma, src) {
+        if !Self::check_src_format_supported(self.gl_context.transfer_backend, src) {
             return Err(crate::Error::NotSupported(format!(
                 "Opengl doesn't support {} source texture",
                 src.fourcc().display()
             )));
         }
 
-        if !Self::check_dst_format_supported(self.gl_context.support_dma, dst) {
+        if !Self::check_dst_format_supported(self.gl_context.transfer_backend, dst) {
             return Err(crate::Error::NotSupported(format!(
                 "Opengl doesn't support {} destination texture",
                 dst.fourcc().display()
@@ -1240,10 +1480,29 @@ impl ImageProcessorTrait for GLProcessorST {
             src.tensor().memory()
         );
         check_gl_error(function!(), line!())?;
-        if self.gl_context.support_dma && dst.tensor().memory() == TensorMemory::Dma {
+        if self.gl_context.transfer_backend.is_dma() && dst.tensor().memory() == TensorMemory::Dma {
             // Packed RGB is now supported via DMA with buffer reinterpretation
             let res = self.convert_dest_dma(dst, src, rotation, flip, crop);
             return res;
+        }
+        // PBO-to-PBO: both tensors are PBO-backed, use GL buffer bindings for
+        // both upload and readback (zero CPU copy for both directions)
+        if src.tensor().memory() == TensorMemory::Pbo && dst.tensor().memory() == TensorMemory::Pbo
+        {
+            return self.convert_pbo_to_pbo(dst, src, rotation, flip, crop);
+        }
+        // PBO dst with non-PBO src: use normal texture upload for src (which
+        // maps the Mem/DMA tensor), but PBO PACK readback for dst.
+        // This avoids the deadlock that would occur if convert_dest_non_dma
+        // tried to map() the PBO dst on the GL thread.
+        if dst.tensor().memory() == TensorMemory::Pbo {
+            return self.convert_any_to_pbo(dst, src, rotation, flip, crop);
+        }
+        // PBO src with non-PBO dst: the src tensor's map() would deadlock on
+        // the GL thread, so use PBO UNPACK upload. Readback goes to Mem dst
+        // via normal ReadnPixels into mapped memory.
+        if src.tensor().memory() == TensorMemory::Pbo {
+            return self.convert_pbo_to_mem(dst, src, rotation, flip, crop);
         }
         let start = Instant::now();
         let res = self.convert_dest_non_dma(dst, src, rotation, flip, crop);
@@ -1651,8 +1910,24 @@ impl GLProcessorST {
         // Probe GPU capability for direct RGB rendering
         converter.support_rgb_direct = converter.probe_rgb_direct_support();
 
+        // Verify DMA-buf actually works (catches NVIDIA discrete GPUs where
+        // EGLImage creation succeeds but rendered data is all zeros)
+        if converter.gl_context.transfer_backend.is_dma() && !converter.verify_dma_buf_roundtrip() {
+            log::info!("DMA-buf verification failed — falling back to PBO transfers");
+            converter.gl_context.transfer_backend = TransferBackend::Pbo;
+            // RGB direct rendering also requires DMA, so disable it
+            converter.support_rgb_direct = false;
+        }
+
+        // If DMA-buf failed/unavailable but GL is alive, use PBO transfers
+        if converter.gl_context.transfer_backend == TransferBackend::Sync {
+            log::info!("Upgrading transfer backend from Sync to Pbo (GL context available)");
+            converter.gl_context.transfer_backend = TransferBackend::Pbo;
+        }
+
         log::debug!(
-            "GLConverter created (rgb_direct={})",
+            "GLConverter created (transfer={:?}, rgb_direct={})",
+            converter.gl_context.transfer_backend,
             converter.support_rgb_direct
         );
         Ok(converter)
@@ -1662,7 +1937,7 @@ impl GLProcessorST {
     /// backed renderbuffer. Creates a small test FBO and checks completeness.
     /// Returns `false` on any failure (DMA unavailable, EGLImage rejected, FBO incomplete).
     fn probe_rgb_direct_support(&self) -> bool {
-        if !self.gl_context.support_dma {
+        if !self.gl_context.transfer_backend.is_dma() {
             log::debug!("probe_rgb_direct: no DMA support");
             return false;
         }
@@ -1742,6 +2017,91 @@ impl GLProcessorST {
 
         log::info!("probe_rgb_direct: BGR888 renderbuffer FBO support = {result}");
         result
+    }
+
+    /// Verify that DMA-buf EGLImage round-trip actually works on this GPU.
+    ///
+    /// Renders a solid red quad to a 64x64 DMA-buf-backed RGBA texture via
+    /// EGLImage, then reads it back and checks that the center pixel is red.
+    /// Returns `true` if the data round-trips correctly.
+    ///
+    /// This catches GPUs like NVIDIA discrete where `eglCreateImage` from
+    /// `dma_heap` fds succeeds but the rendered data is all zeros.
+    fn verify_dma_buf_roundtrip(&mut self) -> bool {
+        // Allocate a 64x64 RGBA DMA source tensor and fill it with solid red
+        let src = match TensorImage::new(64, 64, RGBA, Some(TensorMemory::Dma)) {
+            Ok(img) => img,
+            Err(e) => {
+                log::info!("verify_dma_buf_roundtrip: failed to allocate DMA source: {e}");
+                return false;
+            }
+        };
+
+        {
+            let mut map = match src.tensor().map() {
+                Ok(m) => m,
+                Err(e) => {
+                    log::info!("verify_dma_buf_roundtrip: failed to map DMA source: {e}");
+                    return false;
+                }
+            };
+            for pixel in map.chunks_exact_mut(4) {
+                pixel[0] = 255; // R
+                pixel[1] = 0; // G
+                pixel[2] = 0; // B
+                pixel[3] = 255; // A
+            }
+        }
+
+        // Allocate a 64x64 RGBA DMA destination tensor
+        let mut dst = match TensorImage::new(64, 64, RGBA, Some(TensorMemory::Dma)) {
+            Ok(img) => img,
+            Err(e) => {
+                log::info!("verify_dma_buf_roundtrip: failed to allocate DMA destination: {e}");
+                return false;
+            }
+        };
+
+        // Run the full DMA-buf EGLImage render pipeline
+        if let Err(e) =
+            self.convert_dest_dma(&mut dst, &src, Rotation::None, Flip::None, Crop::no_crop())
+        {
+            log::info!("verify_dma_buf_roundtrip: convert_dest_dma failed: {e}");
+            return false;
+        }
+
+        // Read back the center pixel at (32, 32) from the destination
+        let map = match dst.tensor().map() {
+            Ok(m) => m,
+            Err(e) => {
+                log::info!("verify_dma_buf_roundtrip: failed to map DMA destination: {e}");
+                return false;
+            }
+        };
+
+        let offset = (32 * 64 + 32) * 4;
+        if map.len() < offset + 4 {
+            log::info!("verify_dma_buf_roundtrip: destination buffer too small");
+            return false;
+        }
+
+        let r = map[offset];
+        let g = map[offset + 1];
+        let b = map[offset + 2];
+        let a = map[offset + 3];
+
+        let pass = r > 250 && g < 5 && b < 5 && a > 250;
+
+        if pass {
+            log::info!("verify_dma_buf_roundtrip: PASSED (center pixel RGBA={r},{g},{b},{a})");
+        } else {
+            log::info!(
+                "verify_dma_buf_roundtrip: FAILED (center pixel RGBA={r},{g},{b},{a}, \
+                 expected ~255,0,0,255)"
+            );
+        }
+
+        pass
     }
 
     /// Sets the interpolation mode for int8 proto textures.
@@ -1930,6 +2290,8 @@ impl GLProcessorST {
                     &proto_data.mask_coefficients,
                     output_width,
                     output_height,
+                    width,
+                    height,
                 )
             }
             ProtoTensor::Float(protos_f32) => {
@@ -1977,6 +2339,8 @@ impl GLProcessorST {
                     &proto_data.mask_coefficients,
                     output_width,
                     output_height,
+                    width,
+                    height,
                 )
             }
         }
@@ -1999,6 +2363,7 @@ impl GLProcessorST {
     /// For each detection: clear FBO, set coefficients, render quad, read back
     /// the bounding-box region as R8 pixels.
     #[cfg(feature = "decoder")]
+    #[allow(clippy::too_many_arguments)]
     fn render_mask_quads(
         &self,
         program: &GlProgram,
@@ -2006,6 +2371,8 @@ impl GLProcessorST {
         mask_coefficients: &[Vec<f32>],
         output_width: usize,
         output_height: usize,
+        _proto_width: usize,
+        _proto_height: usize,
     ) -> crate::Result<Vec<MaskResult>> {
         let mut results = Vec::with_capacity(detect.len());
 
@@ -2040,31 +2407,42 @@ impl GLProcessorST {
             }
             program.load_uniform_4fv(c"mask_coeff", &packed_coeff)?;
 
-            // Compute bbox pixel coordinates, clamped to FBO bounds.
+            // Compute bbox pixel coordinates.  Use span-based rounding for
+            // dimensions to match the numpy reference (round((xmax-xmin)*W))
+            // rather than endpoint subtraction (round(xmax*W)-round(xmin*W)),
+            // which avoids off-by-one mismatches on small objects.
             let ow = output_width as i32;
             let oh = output_height as i32;
-            let bbox_x = (det.bbox.xmin * output_width as f32).round() as i32;
-            let bbox_y = (det.bbox.ymin * output_height as f32).round() as i32;
-            let bbox_x2 = (det.bbox.xmax * output_width as f32).round() as i32;
-            let bbox_y2 = (det.bbox.ymax * output_height as f32).round() as i32;
+            let owf = output_width as f32;
+            let ohf = output_height as f32;
+            let bbox_x = (det.bbox.xmin * owf).round() as i32;
+            let bbox_y = (det.bbox.ymin * ohf).round() as i32;
+            let bbox_w = ((det.bbox.xmax - det.bbox.xmin) * owf).round() as i32;
+            let bbox_h = ((det.bbox.ymax - det.bbox.ymin) * ohf).round() as i32;
             let bbox_x = bbox_x.max(0).min(ow);
             let bbox_y = bbox_y.max(0).min(oh);
-            let bbox_x2 = bbox_x2.max(bbox_x).min(ow);
-            let bbox_y2 = bbox_y2.max(bbox_y).min(oh);
-            let bbox_w = (bbox_x2 - bbox_x).max(1);
-            let bbox_h = (bbox_y2 - bbox_y).max(1);
+            let bbox_w = bbox_w.max(1).min(ow - bbox_x);
+            let bbox_h = bbox_h.max(1).min(oh - bbox_y);
 
-            // Compute NDC coordinates for the quad
-            let cvt = |normalized: f32| normalized * 2.0 - 1.0;
-            let dst_left = cvt(det.bbox.xmin);
-            let dst_right = cvt(det.bbox.xmax);
-            let dst_top = cvt(det.bbox.ymax);
-            let dst_bottom = cvt(det.bbox.ymin);
+            // Derive pixel-exact NDC coordinates from the readback region so
+            // the rasterized quad exactly covers every pixel we read back.
+            let dst_left = bbox_x as f32 / owf * 2.0 - 1.0;
+            let dst_right = (bbox_x + bbox_w) as f32 / owf * 2.0 - 1.0;
+            let dst_bottom = bbox_y as f32 / ohf * 2.0 - 1.0;
+            let dst_top = (bbox_y + bbox_h) as f32 / ohf * 2.0 - 1.0;
 
-            let src_left = det.bbox.xmin;
-            let src_right = det.bbox.xmax;
-            let src_top = 1.0 - det.bbox.ymin;
-            let src_bottom = 1.0 - det.bbox.ymax;
+            // Proto texture coords: tex row 0 = image top (data uploaded
+            // row-major where y=0 is image top; GL treats first data row as
+            // texture bottom, so texelFetch(y=0) returns image top).
+            // tc.y=0 → image top, tc.y=1 → image bottom.
+            // At NDC top (image bottom = ymax) we need tc.y = ymax.
+            // At NDC bottom (image top = ymin) we need tc.y = ymin.
+            // Use the readback pixel boundaries for the texture coordinates
+            // so the mapping is consistent with the rasterized quad.
+            let src_left = bbox_x as f32 / owf;
+            let src_right = (bbox_x + bbox_w) as f32 / owf;
+            let src_bottom = bbox_y as f32 / ohf;
+            let src_top = (bbox_y + bbox_h) as f32 / ohf;
 
             unsafe {
                 gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
@@ -2133,17 +2511,19 @@ impl GLProcessorST {
         Ok(results)
     }
 
-    fn check_src_format_supported(support_dma: bool, img: &TensorImage) -> bool {
-        if support_dma && img.tensor().memory() == TensorMemory::Dma {
-            // EGLImage supports RGBA, GREY, YUYV, and NV12 for DMA buffers
+    fn check_src_format_supported(backend: TransferBackend, img: &TensorImage) -> bool {
+        if backend.is_dma() && img.tensor().memory() == TensorMemory::Dma {
+            // EGLImage supports RGBA, GREY, YUYV, and NV12 for DMA buffers.
+            // VYUY excluded: Vivante GPU accepts the DRM fourcc but produces
+            // incorrect output (similarity ~0.28 vs reference).
             matches!(img.fourcc(), RGBA | GREY | YUYV | NV12)
         } else {
             matches!(img.fourcc(), RGB | RGBA | GREY)
         }
     }
 
-    fn check_dst_format_supported(support_dma: bool, img: &TensorImage) -> bool {
-        if support_dma && img.tensor().memory() == TensorMemory::Dma {
+    fn check_dst_format_supported(backend: TransferBackend, img: &TensorImage) -> bool {
+        if backend.is_dma() && img.tensor().memory() == TensorMemory::Dma {
             matches!(
                 img.fourcc(),
                 RGBA | GREY | PLANAR_RGB | RGB | RGB_INT8 | PLANAR_RGB_INT8
@@ -2174,10 +2554,7 @@ impl GLProcessorST {
                 .to_string()
         };
         log::debug!("GL Extensions: {extensions}");
-        let required_ext = [
-            "GL_OES_EGL_image_external_essl3",
-            "GL_OES_surfaceless_context",
-        ];
+        let required_ext = ["GL_OES_EGL_image_external_essl3"];
         let extensions = extensions.split_ascii_whitespace().collect::<BTreeSet<_>>();
         for required in required_ext {
             if !extensions.contains(required) {
@@ -2240,12 +2617,16 @@ impl GLProcessorST {
         flip: Flip,
         crop: Crop,
     ) -> crate::Result<()> {
-        assert!(self.gl_context.support_dma);
+        assert!(self.gl_context.transfer_backend.is_dma());
         if fourcc_is_packed_rgb(dst.fourcc()) {
             if self.support_rgb_direct {
                 self.convert_to_rgb_direct(src, dst, rotation, flip, crop)
             } else {
-                self.convert_to_packed_rgb(src, dst, rotation, flip, crop)
+                // Two-pass packed RGB is slower than G2D/CPU; decline so
+                // ImageProcessor falls through to a faster backend.
+                Err(crate::Error::NotSupported(
+                    "OpenGL two-pass packed RGB disabled (no direct RGB support)".into(),
+                ))
             }
         } else if dst.is_planar() {
             self.setup_renderbuffer_dma(dst)?;
@@ -2390,6 +2771,521 @@ impl GLProcessorST {
         Ok(())
     }
 
+    /// Convert between two PBO-backed images.
+    ///
+    /// Source PBO is bound as `GL_PIXEL_UNPACK_BUFFER` for zero-copy texture upload
+    /// (avoids `tensor.map()` to prevent GL-thread deadlocks). Destination uses
+    /// `GL_PIXEL_PACK_BUFFER` for zero-copy readback into the PBO.
+    fn convert_pbo_to_pbo(
+        &mut self,
+        dst: &mut TensorImage,
+        src: &TensorImage,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> crate::Result<()> {
+        // Safety check: neither PBO must be mapped; extract buffer IDs before releasing borrows
+        let (src_buffer_id, dst_buffer_id) = {
+            let src_pbo = match &src.tensor {
+                edgefirst_tensor::Tensor::Pbo(p) => p,
+                _ => {
+                    return Err(crate::Error::OpenGl(
+                        "convert_pbo_to_pbo: src is not a PBO tensor".to_string(),
+                    ))
+                }
+            };
+            let dst_pbo = match &dst.tensor {
+                edgefirst_tensor::Tensor::Pbo(p) => p,
+                _ => {
+                    return Err(crate::Error::OpenGl(
+                        "convert_pbo_to_pbo: dst is not a PBO tensor".to_string(),
+                    ))
+                }
+            };
+
+            if src_pbo.is_mapped() || dst_pbo.is_mapped() {
+                return Err(crate::Error::OpenGl(
+                    "Cannot convert PBO tensors while they are mapped".to_string(),
+                ));
+            }
+
+            (src_pbo.buffer_id(), dst_pbo.buffer_id())
+        };
+
+        // Setup renderbuffer (same as non-DMA path)
+        self.setup_renderbuffer_non_dma(dst, crop)?;
+
+        // Upload source from PBO and render.
+        // We cannot call convert_to/draw_src_texture directly because they
+        // call src.tensor().map() which sends a message back to THIS thread,
+        // causing a deadlock. Instead, bind the source PBO as UNPACK buffer
+        // and upload to the texture with a NULL pointer — GL reads directly
+        // from the PBO, zero CPU copy.
+        let start = Instant::now();
+        self.draw_src_texture_from_pbo(src, src_buffer_id, dst, rotation, flip, crop)?;
+        log::debug!("PBO render takes {:?}", start.elapsed());
+
+        // Readback into destination PBO instead of CPU memory
+        let start_read = Instant::now();
+        let dest_format = match dst.fourcc() {
+            crate::RGB | crate::RGB_INT8 => gls::gl::RGB,
+            crate::RGBA => gls::gl::RGBA,
+            crate::GREY => gls::gl::RED,
+            _ => {
+                return Err(crate::Error::NotSupported(format!(
+                    "PBO readback not supported for {}",
+                    dst.fourcc().display()
+                )))
+            }
+        };
+
+        unsafe {
+            // Bind destination PBO as PACK buffer — glReadnPixels will write into it
+            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, dst_buffer_id);
+            gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
+            gls::gl::ReadnPixels(
+                0,
+                0,
+                dst.width() as i32,
+                dst.height() as i32,
+                dest_format,
+                gls::gl::UNSIGNED_BYTE,
+                dst.tensor.len() as i32,
+                std::ptr::null_mut(), // NULL pointer = write to bound PACK buffer
+            );
+            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+            gls::gl::Finish();
+        }
+
+        check_gl_error(function!(), line!())?;
+
+        // Handle int8 XOR if needed (must map PBO to do this on the GL thread
+        // directly, since we're already on the GL thread)
+        if fourcc_is_int8(dst.fourcc()) {
+            unsafe {
+                gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, dst_buffer_id);
+                let ptr = gls::gl::MapBufferRange(
+                    gls::gl::PIXEL_PACK_BUFFER,
+                    0,
+                    dst.tensor.len() as isize,
+                    gls::gl::MAP_READ_BIT | gls::gl::MAP_WRITE_BIT,
+                );
+                if !ptr.is_null() {
+                    let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, dst.tensor.len());
+                    for byte in slice.iter_mut() {
+                        *byte ^= 0x80;
+                    }
+                    gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
+                }
+                gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+            }
+            check_gl_error(function!(), line!())?;
+        }
+
+        log::debug!("PBO readback takes {:?}", start_read.elapsed());
+        Ok(())
+    }
+
+    /// Upload source image from a PBO and render to the current framebuffer.
+    /// This is the PBO equivalent of draw_src_texture — instead of mapping
+    /// the tensor to CPU and calling glTexImage2D with a data pointer, we
+    /// bind the source PBO as GL_PIXEL_UNPACK_BUFFER and pass NULL, causing
+    /// GL to read directly from the PBO (zero CPU copy).
+    fn draw_src_texture_from_pbo(
+        &mut self,
+        src: &TensorImage,
+        src_buffer_id: u32,
+        dst: &TensorImage,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> Result<(), Error> {
+        let texture_target = gls::gl::TEXTURE_2D;
+        let texture_format = match src.fourcc() {
+            crate::RGB | crate::RGB_INT8 => gls::gl::RGB,
+            crate::RGBA => gls::gl::RGBA,
+            crate::GREY => gls::gl::RED,
+            _ => {
+                return Err(Error::NotSupported(format!(
+                    "PBO upload not supported for {:?}",
+                    src.fourcc()
+                )));
+            }
+        };
+
+        let has_crop = crop.dst_rect.is_some_and(|x| {
+            x.left != 0 || x.top != 0 || x.width != dst.width() || x.height != dst.height()
+        });
+
+        // top and bottom are flipped because OpenGL uses 0,0 as bottom left
+        let src_roi = if let Some(crop) = crop.src_rect {
+            RegionOfInterest {
+                left: crop.left as f32 / src.width() as f32,
+                top: (crop.top + crop.height) as f32 / src.height() as f32,
+                right: (crop.left + crop.width) as f32 / src.width() as f32,
+                bottom: crop.top as f32 / src.height() as f32,
+            }
+        } else {
+            RegionOfInterest {
+                left: 0.,
+                top: 1.,
+                right: 1.,
+                bottom: 0.,
+            }
+        };
+
+        let cvt_screen_coord = |normalized| normalized * 2.0 - 1.0;
+        let mut dst_roi = if let Some(crop) = crop.dst_rect {
+            RegionOfInterest {
+                left: cvt_screen_coord(crop.left as f32 / dst.width() as f32),
+                top: cvt_screen_coord((crop.top + crop.height) as f32 / dst.height() as f32),
+                right: cvt_screen_coord((crop.left + crop.width) as f32 / dst.width() as f32),
+                bottom: cvt_screen_coord(crop.top as f32 / dst.height() as f32),
+            }
+        } else {
+            RegionOfInterest {
+                left: -1.,
+                top: 1.,
+                right: 1.,
+                bottom: -1.,
+            }
+        };
+
+        let rotation_offset = match rotation {
+            crate::Rotation::None => 0,
+            crate::Rotation::Clockwise90 => 1,
+            crate::Rotation::Rotate180 => 2,
+            crate::Rotation::CounterClockwise90 => 3,
+        };
+
+        unsafe {
+            if has_crop {
+                if let Some(dst_color) = crop.dst_color {
+                    gls::gl::ClearColor(
+                        dst_color[0] as f32 / 255.0,
+                        dst_color[1] as f32 / 255.0,
+                        dst_color[2] as f32 / 255.0,
+                        dst_color[3] as f32 / 255.0,
+                    );
+                    gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
+                }
+            }
+
+            gls::gl::UseProgram(self.texture_program.id);
+            gls::gl::BindTexture(texture_target, self.camera_normal_texture.id);
+            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+            gls::gl::TexParameteri(
+                texture_target,
+                gls::gl::TEXTURE_MIN_FILTER,
+                gls::gl::LINEAR as i32,
+            );
+            gls::gl::TexParameteri(
+                texture_target,
+                gls::gl::TEXTURE_MAG_FILTER,
+                gls::gl::LINEAR as i32,
+            );
+            if src.fourcc() == crate::GREY {
+                for swizzle in [
+                    gls::gl::TEXTURE_SWIZZLE_R,
+                    gls::gl::TEXTURE_SWIZZLE_G,
+                    gls::gl::TEXTURE_SWIZZLE_B,
+                ] {
+                    gls::gl::TexParameteri(gls::gl::TEXTURE_2D, swizzle, gls::gl::RED as i32);
+                }
+            } else {
+                for (swizzle, src_component) in [
+                    (gls::gl::TEXTURE_SWIZZLE_R, gls::gl::RED),
+                    (gls::gl::TEXTURE_SWIZZLE_G, gls::gl::GREEN),
+                    (gls::gl::TEXTURE_SWIZZLE_B, gls::gl::BLUE),
+                ] {
+                    gls::gl::TexParameteri(gls::gl::TEXTURE_2D, swizzle, src_component as i32);
+                }
+            }
+
+            // Bind source PBO as UNPACK buffer — glTexImage2D reads from it
+            gls::gl::BindBuffer(gls::gl::PIXEL_UNPACK_BUFFER, src_buffer_id);
+            gls::gl::TexImage2D(
+                texture_target,
+                0,
+                texture_format as i32,
+                src.width() as i32,
+                src.height() as i32,
+                0,
+                texture_format,
+                gls::gl::UNSIGNED_BYTE,
+                std::ptr::null(), // NULL = read from bound UNPACK buffer
+            );
+            gls::gl::BindBuffer(gls::gl::PIXEL_UNPACK_BUFFER, 0);
+
+            // Force texture cache state to be rebuilt next call
+            self.camera_normal_texture.width = 0;
+
+            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
+            gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
+
+            match flip {
+                crate::Flip::None => {}
+                crate::Flip::Vertical => {
+                    std::mem::swap(&mut dst_roi.top, &mut dst_roi.bottom);
+                }
+                crate::Flip::Horizontal => {
+                    std::mem::swap(&mut dst_roi.left, &mut dst_roi.right);
+                }
+            }
+
+            let camera_vertices: [f32; 12] = [
+                dst_roi.left,
+                dst_roi.top,
+                0., // left top
+                dst_roi.right,
+                dst_roi.top,
+                0., // right top
+                dst_roi.right,
+                dst_roi.bottom,
+                0., // right bottom
+                dst_roi.left,
+                dst_roi.bottom,
+                0., // left bottom
+            ];
+            gls::gl::BufferData(
+                gls::gl::ARRAY_BUFFER,
+                (camera_vertices.len() * std::mem::size_of::<f32>()) as isize,
+                camera_vertices.as_ptr() as *const c_void,
+                gls::gl::STATIC_DRAW,
+            );
+            gls::gl::VertexAttribPointer(
+                self.vertex_buffer.buffer_index,
+                3,
+                gls::gl::FLOAT,
+                gls::gl::FALSE,
+                0,
+                std::ptr::null(),
+            );
+
+            let texture_coords: [[f32; 8]; 4] = [
+                [
+                    src_roi.left,
+                    src_roi.top,
+                    src_roi.right,
+                    src_roi.top,
+                    src_roi.right,
+                    src_roi.bottom,
+                    src_roi.left,
+                    src_roi.bottom,
+                ],
+                [
+                    src_roi.left,
+                    src_roi.bottom,
+                    src_roi.left,
+                    src_roi.top,
+                    src_roi.right,
+                    src_roi.top,
+                    src_roi.right,
+                    src_roi.bottom,
+                ],
+                [
+                    src_roi.right,
+                    src_roi.bottom,
+                    src_roi.left,
+                    src_roi.bottom,
+                    src_roi.left,
+                    src_roi.top,
+                    src_roi.right,
+                    src_roi.top,
+                ],
+                [
+                    src_roi.right,
+                    src_roi.top,
+                    src_roi.right,
+                    src_roi.bottom,
+                    src_roi.left,
+                    src_roi.bottom,
+                    src_roi.left,
+                    src_roi.top,
+                ],
+            ];
+            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
+            gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
+            gls::gl::BufferData(
+                gls::gl::ARRAY_BUFFER,
+                (texture_coords[0].len() * std::mem::size_of::<f32>()) as isize,
+                texture_coords[rotation_offset].as_ptr() as *const c_void,
+                gls::gl::STATIC_DRAW,
+            );
+            gls::gl::VertexAttribPointer(
+                self.texture_buffer.buffer_index,
+                2,
+                gls::gl::FLOAT,
+                gls::gl::FALSE,
+                0,
+                std::ptr::null(),
+            );
+            gls::gl::DrawArrays(gls::gl::TRIANGLE_FAN, 0, 4);
+            gls::gl::DisableVertexAttribArray(self.vertex_buffer.buffer_index);
+            gls::gl::DisableVertexAttribArray(self.texture_buffer.buffer_index);
+
+            gls::gl::Finish();
+        }
+
+        check_gl_error(function!(), line!())?;
+        Ok(())
+    }
+
+    /// Convert any source (Mem/DMA) to a PBO destination.
+    /// Source is uploaded via normal texture path (maps tensor for CPU upload).
+    /// Destination readback uses PBO PACK binding (no map on GL thread).
+    fn convert_any_to_pbo(
+        &mut self,
+        dst: &mut TensorImage,
+        src: &TensorImage,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> crate::Result<()> {
+        let dst_buffer_id = match &dst.tensor {
+            edgefirst_tensor::Tensor::Pbo(p) => {
+                if p.is_mapped() {
+                    return Err(crate::Error::OpenGl(
+                        "Cannot convert to a mapped PBO tensor".to_string(),
+                    ));
+                }
+                p.buffer_id()
+            }
+            _ => {
+                return Err(crate::Error::OpenGl(
+                    "convert_any_to_pbo: dst is not a PBO tensor".to_string(),
+                ))
+            }
+        };
+
+        self.setup_renderbuffer_non_dma(dst, crop)?;
+        let start = Instant::now();
+        if dst.is_planar() {
+            self.convert_to_planar(src, dst, rotation, flip, crop)?;
+        } else {
+            self.convert_to(src, dst, rotation, flip, crop)?;
+        }
+        log::debug!("any-to-PBO render takes {:?}", start.elapsed());
+
+        // PBO readback
+        let start_read = Instant::now();
+        let dest_format = match dst.fourcc() {
+            crate::RGB | crate::RGB_INT8 => gls::gl::RGB,
+            crate::RGBA => gls::gl::RGBA,
+            crate::GREY => gls::gl::RED,
+            _ => {
+                return Err(crate::Error::NotSupported(format!(
+                    "PBO readback not supported for {}",
+                    dst.fourcc().display()
+                )))
+            }
+        };
+        unsafe {
+            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, dst_buffer_id);
+            gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
+            gls::gl::ReadnPixels(
+                0,
+                0,
+                dst.width() as i32,
+                dst.height() as i32,
+                dest_format,
+                gls::gl::UNSIGNED_BYTE,
+                dst.tensor.len() as i32,
+                std::ptr::null_mut(),
+            );
+            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+            gls::gl::Finish();
+        }
+        check_gl_error(function!(), line!())?;
+
+        if fourcc_is_int8(dst.fourcc()) {
+            unsafe {
+                gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, dst_buffer_id);
+                let ptr = gls::gl::MapBufferRange(
+                    gls::gl::PIXEL_PACK_BUFFER,
+                    0,
+                    dst.tensor.len() as isize,
+                    gls::gl::MAP_READ_BIT | gls::gl::MAP_WRITE_BIT,
+                );
+                if !ptr.is_null() {
+                    let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, dst.tensor.len());
+                    for byte in slice.iter_mut() {
+                        *byte ^= 0x80;
+                    }
+                    gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
+                }
+                gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+            }
+            check_gl_error(function!(), line!())?;
+        }
+
+        log::debug!("any-to-PBO readback takes {:?}", start_read.elapsed());
+        Ok(())
+    }
+
+    /// Convert a PBO source to a non-PBO (Mem) destination.
+    /// Source is uploaded via PBO UNPACK binding (no map on GL thread).
+    /// Destination readback uses normal ReadnPixels into mapped Mem tensor.
+    fn convert_pbo_to_mem(
+        &mut self,
+        dst: &mut TensorImage,
+        src: &TensorImage,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> crate::Result<()> {
+        let src_buffer_id = match &src.tensor {
+            edgefirst_tensor::Tensor::Pbo(p) => {
+                if p.is_mapped() {
+                    return Err(crate::Error::OpenGl(
+                        "Cannot convert from a mapped PBO tensor".to_string(),
+                    ));
+                }
+                p.buffer_id()
+            }
+            _ => {
+                return Err(crate::Error::OpenGl(
+                    "convert_pbo_to_mem: src is not a PBO tensor".to_string(),
+                ))
+            }
+        };
+
+        self.setup_renderbuffer_non_dma(dst, crop)?;
+        let start = Instant::now();
+        self.draw_src_texture_from_pbo(src, src_buffer_id, dst, rotation, flip, crop)?;
+        log::debug!("PBO-to-mem render takes {:?}", start.elapsed());
+
+        // Normal readback into Mem dst
+        let start = Instant::now();
+        let dest_format = match dst.fourcc() {
+            crate::RGB | crate::RGB_INT8 => gls::gl::RGB,
+            crate::RGBA => gls::gl::RGBA,
+            crate::GREY => gls::gl::RED,
+            _ => unreachable!(),
+        };
+        unsafe {
+            let mut dst_map = dst.tensor().map()?;
+            gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
+            gls::gl::ReadnPixels(
+                0,
+                0,
+                dst.width() as i32,
+                dst.height() as i32,
+                dest_format,
+                gls::gl::UNSIGNED_BYTE,
+                dst.tensor.len() as i32,
+                dst_map.as_mut_ptr() as *mut c_void,
+            );
+            if fourcc_is_int8(dst.fourcc()) {
+                for byte in dst_map.iter_mut() {
+                    *byte ^= 0x80;
+                }
+            }
+        }
+        log::debug!("PBO-to-mem readback takes {:?}", start.elapsed());
+        Ok(())
+    }
+
     fn convert_to(
         &mut self,
         src: &TensorImage,
@@ -2457,7 +3353,7 @@ impl GLProcessorST {
             crate::Rotation::Rotate180 => 2,
             crate::Rotation::CounterClockwise90 => 3,
         };
-        if self.gl_context.support_dma && src.tensor().memory() == TensorMemory::Dma {
+        if self.gl_context.transfer_backend.is_dma() && src.tensor().memory() == TensorMemory::Dma {
             match self.get_or_create_egl_image(CacheKind::Src, src) {
                 Ok(src_egl) => self.draw_camera_texture_eglimage(
                     src,
@@ -3314,7 +4210,7 @@ impl GLProcessorST {
             }
             width = src.width();
             height = src.height();
-            format = fourcc_to_drm(NV12);
+            format = fourcc_to_drm(NV12)?;
             channels = 1; // Y plane pitch is 1 byte per pixel
         } else if src.is_planar() {
             if !src.width().is_multiple_of(16) {
@@ -3345,7 +4241,7 @@ impl GLProcessorST {
             }
             width = src.width();
             height = src.height();
-            format = fourcc_to_drm(src.fourcc());
+            format = fourcc_to_drm(src.fourcc())?;
             channels = src.channels();
         }
 
@@ -3359,6 +4255,11 @@ impl GLProcessorST {
             edgefirst_tensor::Tensor::Mem(_) => {
                 return Err(Error::NotImplemented(
                     "OpenGL EGLImage doesn't support MEM".to_string(),
+                ));
+            }
+            edgefirst_tensor::Tensor::Pbo(_) => {
+                return Err(Error::NotImplemented(
+                    "OpenGL EGLImage doesn't support PBO".to_string(),
                 ));
             }
         };
@@ -3401,7 +4302,7 @@ impl GLProcessorST {
             ]);
         }
 
-        if matches!(src.fourcc(), YUYV | NV12) {
+        if matches!(src.fourcc(), YUYV | VYUY | NV12) {
             egl_img_attr.append(&mut vec![
                 egl_ext::YUV_COLOR_SPACE_HINT as Attrib,
                 egl_ext::ITU_REC709 as Attrib,
@@ -3461,22 +4362,18 @@ impl GLProcessorST {
                 CacheKind::Src => &mut self.src_egl_cache,
                 CacheKind::Dst => &mut self.dst_egl_cache,
             };
-            if let Some(cached) = egl_cache.entries.get(&id) {
+            let ts = egl_cache.next_timestamp();
+            if let Some(cached) = egl_cache.entries.get_mut(&id) {
                 egl_cache.hits += 1;
+                cached.last_used = ts;
                 log::trace!("EglImageCache {:?} hit: id={id:#x}", cache);
                 return Ok(cached.egl_image.egl_image);
             }
             egl_cache.misses += 1;
             log::trace!("EglImageCache {:?} miss: id={id:#x}", cache);
-            // Evict oldest entry if at capacity.
+            // Evict least-recently-used entry if at capacity.
             if egl_cache.entries.len() >= egl_cache.capacity {
-                if let Some(&evict_id) = egl_cache.entries.keys().next() {
-                    if let Some(evicted) = egl_cache.entries.remove(&evict_id) {
-                        if let Some(rbo) = evicted.renderbuffer {
-                            unsafe { gls::gl::DeleteRenderbuffers(1, &rbo) };
-                        }
-                    }
-                }
+                egl_cache.evict_lru();
             }
         }
 
@@ -3487,12 +4384,14 @@ impl GLProcessorST {
             CacheKind::Src => &mut self.src_egl_cache,
             CacheKind::Dst => &mut self.dst_egl_cache,
         };
+        let ts = egl_cache.next_timestamp();
         egl_cache.entries.insert(
             id,
             CachedEglImage {
                 egl_image: egl_image_obj,
                 guard,
                 renderbuffer: None,
+                last_used: ts,
             },
         );
         Ok(handle)
@@ -3553,8 +4452,10 @@ impl GLProcessorST {
         let id = img.buffer_identity().id();
         self.dst_egl_cache.sweep();
 
-        if let Some(cached) = self.dst_egl_cache.entries.get(&id) {
+        let ts = self.dst_egl_cache.next_timestamp();
+        if let Some(cached) = self.dst_egl_cache.entries.get_mut(&id) {
             self.dst_egl_cache.hits += 1;
+            cached.last_used = ts;
             log::trace!("EglImageCache dst (RGB) hit: id={id:#x}");
             return Ok(cached.egl_image.egl_image);
         }
@@ -3562,24 +4463,20 @@ impl GLProcessorST {
         log::trace!("EglImageCache dst (RGB) miss: id={id:#x}");
 
         if self.dst_egl_cache.entries.len() >= self.dst_egl_cache.capacity {
-            if let Some(&evict_id) = self.dst_egl_cache.entries.keys().next() {
-                if let Some(evicted) = self.dst_egl_cache.entries.remove(&evict_id) {
-                    if let Some(rbo) = evicted.renderbuffer {
-                        unsafe { gls::gl::DeleteRenderbuffers(1, &rbo) };
-                    }
-                }
-            }
+            self.dst_egl_cache.evict_lru();
         }
 
         let egl_image_obj = self.create_egl_image_with_dims(img, width, height, drm_format, bpp)?;
         let handle = egl_image_obj.egl_image;
         let guard = img.buffer_identity().weak();
+        let ts = self.dst_egl_cache.next_timestamp();
         self.dst_egl_cache.entries.insert(
             id,
             CachedEglImage {
                 egl_image: egl_image_obj,
                 guard,
                 renderbuffer: None,
+                last_used: ts,
             },
         );
         Ok(handle)
@@ -3599,9 +4496,11 @@ impl GLProcessorST {
         self.dst_egl_cache.sweep();
 
         // Check cache for existing entry with renderbuffer
-        if let Some(cached) = self.dst_egl_cache.entries.get(&id) {
+        let ts = self.dst_egl_cache.next_timestamp();
+        if let Some(cached) = self.dst_egl_cache.entries.get_mut(&id) {
             if let Some(rbo) = cached.renderbuffer {
                 self.dst_egl_cache.hits += 1;
+                cached.last_used = ts;
                 log::trace!("EglImageCache dst (rgb_direct) hit: id={id:#x}");
                 return Ok((rbo, width, height));
             }
@@ -3609,15 +4508,9 @@ impl GLProcessorST {
         self.dst_egl_cache.misses += 1;
         log::trace!("EglImageCache dst (rgb_direct) miss: id={id:#x}");
 
-        // Evict if at capacity
+        // Evict least-recently-used entry if at capacity
         if self.dst_egl_cache.entries.len() >= self.dst_egl_cache.capacity {
-            if let Some(&evict_id) = self.dst_egl_cache.entries.keys().next() {
-                if let Some(evicted) = self.dst_egl_cache.entries.remove(&evict_id) {
-                    if let Some(rbo) = evicted.renderbuffer {
-                        unsafe { gls::gl::DeleteRenderbuffers(1, &rbo) };
-                    }
-                }
-            }
+            self.dst_egl_cache.evict_lru();
         }
 
         // Create EGLImage from BGR888 DMA-buf
@@ -3642,12 +4535,14 @@ impl GLProcessorST {
 
         // Cache both
         let guard = dst.buffer_identity().weak();
+        let ts = self.dst_egl_cache.next_timestamp();
         self.dst_egl_cache.entries.insert(
             id,
             CachedEglImage {
                 egl_image: egl_image_obj,
                 guard,
                 renderbuffer: Some(rbo),
+                last_used: ts,
             },
         );
 
@@ -4634,7 +5529,7 @@ impl Drop for EglImage {
 
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let e =
-                GlContext::egl_destory_image_with_fallback(&self.egl, self.display, self.egl_image);
+                GlContext::egl_destroy_image_with_fallback(&self.egl, self.display, self.egl_image);
             if let Err(e) = e {
                 error!("Could not destroy EGL image: {e:?}");
             }
@@ -4935,15 +5830,18 @@ fn check_gl_error(name: &str, line: u32) -> Result<(), Error> {
     Ok(())
 }
 
-fn fourcc_to_drm(fourcc: FourCharCode) -> DrmFourcc {
+fn fourcc_to_drm(fourcc: FourCharCode) -> Result<DrmFourcc, Error> {
     match fourcc {
-        RGBA => DrmFourcc::Abgr8888,
-        YUYV => DrmFourcc::Yuyv,
-        RGB | RGB_INT8 => DrmFourcc::Bgr888,
-        GREY => DrmFourcc::R8,
-        NV12 => DrmFourcc::Nv12,
-        PLANAR_RGB | PLANAR_RGB_INT8 => DrmFourcc::R8,
-        _ => todo!(),
+        RGBA => Ok(DrmFourcc::Abgr8888),
+        YUYV => Ok(DrmFourcc::Yuyv),
+        VYUY => Ok(DrmFourcc::Vyuy),
+        RGB | RGB_INT8 => Ok(DrmFourcc::Bgr888),
+        GREY => Ok(DrmFourcc::R8),
+        NV12 => Ok(DrmFourcc::Nv12),
+        PLANAR_RGB | PLANAR_RGB_INT8 => Ok(DrmFourcc::R8),
+        _ => Err(Error::NotSupported(format!(
+            "FourCC {fourcc:?} has no DRM format mapping"
+        ))),
     }
 }
 
@@ -4978,6 +5876,15 @@ mod egl_ext {
     pub(crate) const PLATFORM_GBM_KHR: u32 = 0x31D7;
 
     pub(crate) const PLATFORM_DEVICE_EXT: u32 = 0x313F;
+
+    /// EGL_KHR_no_config_context: null config for eglCreateContext.
+    /// Defined as ((EGLConfig)0) in the EGL spec.
+    ///
+    /// # Safety
+    /// The EGL spec defines EGL_NO_CONFIG_KHR as a null pointer. This is
+    /// a safe transmute since `Config` is a newtype wrapper around `*mut c_void`.
+    pub(crate) const NO_CONFIG_KHR: khronos_egl::Config =
+        unsafe { std::mem::transmute(std::ptr::null_mut::<std::ffi::c_void>()) };
 }
 
 fn generate_vertex_shader() -> &'static str {
@@ -5050,23 +5957,28 @@ void main(){
 "
 }
 
-/// Int8 variant of [`generate_planar_rgb_shader`]. Applies `fract(v + 0.5)` to
-/// each channel, which is the GL-safe equivalent of XOR 0x80 for converting
-/// unsigned [0,255] texel values to signed int8 representation.
+/// Int8 variant of [`generate_planar_rgb_shader`]. Applies XOR 0x80 bias
+/// to each RGB channel (uint8 → int8 conversion) using the bit-exact
+/// quantize+mod approach: `floor(v * 255 + 0.5) + 128 mod 256 / 255`.
 fn generate_planar_rgb_int8_shader() -> &'static str {
     "\
 #version 300 es
 #extension GL_OES_EGL_image_external_essl3 : require
-precision mediump float;
+precision highp float;
 uniform samplerExternalOES tex;
 in vec3 fragPos;
 in vec2 tc;
 
 out vec4 color;
 
+vec3 int8_bias(vec3 v) {
+    vec3 q = floor(v * 255.0 + 0.5);
+    return mod(q + 128.0, 256.0) / 255.0;
+}
+
 void main(){
     vec4 c = texture(tex, tc);
-    color = vec4(fract(c.r + 0.5), fract(c.g + 0.5), fract(c.b + 0.5), c.a);
+    color = vec4(int8_bias(c.rgb), c.a);
 }
 "
 }
@@ -5584,9 +6496,8 @@ void main() {
 /// Packed RGB -> RGBA8 packing shader with int8 XOR 0x80 bias (2D source, pass 2).
 ///
 /// Same packing logic as [`generate_packed_rgba8_shader_2d`] but applies
-/// `fract(v + 0.5)` to each channel value before writing. In normalised
-/// float space this is equivalent to XOR 0x80 on the uint8 representation,
-/// converting unsigned [0, 255] to signed [-128, 127] (two's-complement).
+/// bit-exact XOR 0x80 bias via quantize+mod: `floor(v * 255 + 0.5) + 128
+/// mod 256 / 255`. This matches the CPU `byte ^ 0x80` operation exactly.
 fn generate_packed_rgba8_int8_shader_2d() -> &'static str {
     "\
 #version 300 es
@@ -5594,6 +6505,12 @@ precision highp float;
 precision highp int;
 uniform sampler2D tex;
 out vec4 color;
+
+vec4 int8_bias(vec4 v) {
+    vec4 q = floor(v * 255.0 + 0.5);
+    return mod(q + 128.0, 256.0) / 255.0;
+}
+
 void main() {
     // gl_FragCoord is at pixel center (n+0.5). Use floor() for robust
     // integer pixel index on all GPUs (Vivante, Mali, Adreno).
@@ -5608,11 +6525,11 @@ void main() {
     // Extract channels based on phase (base % 3), then apply int8 bias
     int phase = base - px0 * 3;
     if (phase == 0) {
-        color = fract(vec4(s0.r, s0.g, s0.b, s1.r) + 0.5);
+        color = int8_bias(vec4(s0.r, s0.g, s0.b, s1.r));
     } else if (phase == 1) {
-        color = fract(vec4(s0.g, s0.b, s1.r, s1.g) + 0.5);
+        color = int8_bias(vec4(s0.g, s0.b, s1.r, s1.g));
     } else {
-        color = fract(vec4(s0.b, s1.r, s1.g, s1.b) + 0.5);
+        color = int8_bias(vec4(s0.b, s1.r, s1.g, s1.b));
     }
 }
 "
@@ -6041,36 +6958,21 @@ mod gl_tests {
             eprintln!("  {:?}: {}", d.kind, d.description);
         }
 
-        // GBM requires /dev/dri/renderD128 — skip hardware-specific
-        // assertions when it is not present (CI runners, non-GPU hosts).
-        if !kinds.contains(&EglDisplayKind::Gbm) {
-            eprintln!(
-                "SKIPPED: {} - GBM not available (no /dev/dri/renderD128), got: {kinds:?}",
-                function!()
+        // Verify priority ordering: PlatformDevice > GBM > Default.
+        // Not all display types are available on every system, but the
+        // ones that are present must appear in this order.
+        let priority = |k: &EglDisplayKind| match k {
+            EglDisplayKind::PlatformDevice => 0,
+            EglDisplayKind::Gbm => 1,
+            EglDisplayKind::Default => 2,
+        };
+        for w in kinds.windows(2) {
+            assert!(
+                priority(&w[0]) < priority(&w[1]),
+                "Display ordering violated: {:?} should come after {:?}",
+                w[1],
+                w[0],
             );
-            return;
-        }
-
-        // On i.MX hardware at least two display types should be available
-        assert!(
-            displays.len() >= 2,
-            "Expected at least 2 display types, got {}: {kinds:?}",
-            displays.len()
-        );
-
-        // Verify ordering: GBM should come first (priority order)
-        assert_eq!(
-            displays[0].kind,
-            EglDisplayKind::Gbm,
-            "First display should be GBM (priority order)"
-        );
-
-        // Log which optional types are available
-        if !kinds.contains(&EglDisplayKind::PlatformDevice) {
-            eprintln!("Note: PlatformDevice not available on this system");
-        }
-        if !kinds.contains(&EglDisplayKind::Default) {
-            eprintln!("Note: Default display not available (no compositor running)");
         }
     }
 

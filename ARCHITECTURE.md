@@ -1,7 +1,7 @@
 # EdgeFirst Hardware Abstraction Layer - Architecture
 
-**Version:** 2.2
-**Last Updated:** February 25, 2026
+**Version:** 2.3
+**Last Updated:** February 27, 2026
 **Status:** Production
 **Audience:** Developers contributing to EdgeFirst HAL or integrating it into applications
 
@@ -73,15 +73,21 @@ classDiagram
     class MemTensor~T~ {
         Standard heap allocation
     }
-    
+
+    class PboTensor~T~ {
+        OpenGL Pixel Buffer Object
+    }
+
     TensorTrait <|.. DmaTensor
     TensorTrait <|.. ShmTensor
     TensorTrait <|.. MemTensor
+    TensorTrait <|.. PboTensor
 ```
 
 **Key Features**:
 - Generic over numeric types (u8, i8, u16, i16, u32, i32, u64, i64, f32, f64)
 - Automatic memory type selection with fallback chain: DMA → Shared Memory → Heap
+- PBO (Pixel Buffer Object) tensors for GPU-accelerated image processing
 - Memory mapping with `TensorMap<T>` for safe access
 - File descriptor sharing for zero-copy IPC
 - Cross-platform support (Linux optimized, macOS/Windows via heap memory)
@@ -105,6 +111,23 @@ flowchart TD
     style UseShm fill:#87ceeb
     style UseMem fill:#ffeb9c
 ```
+
+**PBO Tensor Memory (`PboTensor<T>`)**:
+
+PBO tensors are a GPU-native memory type created by the OpenGL backend when
+`ImageProcessor::create_image()` is called and DMA-buf is not available. Unlike
+the other tensor types, PBO tensors are not allocated by the tensor crate
+directly — they are OpenGL Pixel Buffer Objects managed by the GL thread. The
+tensor crate provides the `PboTensor` wrapper and the `PboOps` trait that the
+GL backend implements to perform map/unmap/delete operations.
+
+PBO tensors use a `WeakSender` to communicate with the GL thread. This is a
+critical design choice: if `PboTensor` held a strong `Sender`, any surviving
+PBO tensor would keep the GL thread's message channel alive, preventing
+`GLProcessorThreaded::drop()` from joining the GL thread at shutdown. The
+`WeakSender` pattern allows the GL thread to exit cleanly when the
+`ImageProcessor` is dropped, even if PBO tensors still exist — subsequent
+PBO operations on orphaned tensors return `PboDisconnected`.
 
 ### 2. Image HAL (`edgefirst_image`)
 
@@ -176,6 +199,61 @@ flowchart TD
     style GL fill:#87ceeb
     style CPU fill:#ffeb9c
     style Output fill:#e8f5e9
+```
+
+**GPU-Optimal Image Creation (`ImageProcessor::create_image()`)**:
+
+`create_image()` is the preferred way to allocate images for use with
+`ImageProcessor::convert()`. It probes the GPU at initialization time and
+selects the best available memory backend in priority order:
+
+```mermaid
+flowchart TD
+    Create["ImageProcessor::create_image(w, h, fourcc)"]
+    DMA{DMA-buf roundtrip<br/>verified at init?}
+    PBO{OpenGL PBO<br/>available?}
+    Mem[MemTensor<br/>heap fallback]
+
+    Create --> DMA
+    DMA -->|Yes| UseDMA["DmaTensor<br/>Zero-copy EGLImage import"]
+    DMA -->|No| PBO
+    PBO -->|Yes| UsePBO["PboTensor<br/>Zero-copy GL buffer binding"]
+    PBO -->|No| Mem
+
+    style UseDMA fill:#90ee90
+    style UsePBO fill:#87ceeb
+    style Mem fill:#ffeb9c
+```
+
+| Backend | When selected | GPU transfer method | Platforms |
+|---------|---------------|---------------------|-----------|
+| DMA-buf | GPU supports EGLImage import from DMA-buf FDs | Zero-copy: `EGL_EXT_image_dma_buf_import` — the GPU reads/writes the DMA buffer directly via EGLImage, no pixel copies | NXP i.MX 8M Plus (Vivante), NXP i.MX 95 (Mali/Panfrost) |
+| PBO | OpenGL ES 3.0 available but DMA-buf roundtrip fails | Zero-copy GL binding: `GL_PIXEL_UNPACK_BUFFER` for upload, `GL_PIXEL_PACK_BUFFER` for readback — data stays in GPU-accessible memory | NVIDIA desktop GPUs, systems without DMA-buf permissions |
+| Mem | No GPU or OpenGL not available | CPU `memcpy` via `glTexImage2D`/`glReadnPixels` with mapped host pointers | All platforms (fallback) |
+
+**Why PBO matters**: On desktop Linux with NVIDIA GPUs, DMA-buf allocation
+succeeds (via `/dev/dma_heap/system`) but the NVIDIA EGL driver cannot import
+those buffers — the `verify_dma_buf_roundtrip()` check catches this at
+initialization. Without PBO, every `convert()` call would fall back to CPU
+`memcpy` for upload and readback. PBO keeps the data in GPU-accessible buffers,
+enabling the same zero-copy shader pipeline used on DMA platforms.
+
+**PBO Convert Dispatch**:
+
+When `convert()` is called with PBO-backed images, the GL thread must not call
+`tensor.map()` on those images — doing so would send a message back to itself
+and deadlock. Instead, the convert path dispatches to specialized methods:
+
+```
+┌─────────────────────────────┬──────────────────────────────────────────┐
+│ Source → Destination        │ Method                                    │
+├─────────────────────────────┼──────────────────────────────────────────┤
+│ DMA → DMA                   │ convert_dest_dma (EGLImage both sides)   │
+│ PBO → PBO                   │ convert_pbo_to_pbo (UNPACK + PACK)       │
+│ Mem/DMA → PBO               │ convert_any_to_pbo (texture + PACK)      │
+│ PBO → Mem                   │ convert_pbo_to_mem (UNPACK + ReadnPixels) │
+│ Mem/DMA → Mem/DMA           │ convert_dest_non_dma (texture + memcpy)  │
+└─────────────────────────────┴──────────────────────────────────────────┘
 ```
 
 ### 3. Decoder HAL (`edgefirst_decoder`)
@@ -338,19 +416,18 @@ flowchart LR
 ### Pattern 1: Basic Image Conversion
 
 ```rust
-use edgefirst_hal::image::{TensorImage, ImageProcessor, RGBA, RGB};
-use edgefirst_hal::tensor::TensorMemory;
+use edgefirst_hal::image::{TensorImage, ImageProcessor, RGB};
 
 // Load image from JPEG
 let input = TensorImage::load("testdata/zidane.jpg", Some(RGB), None)?;
 
-// Create converter (auto-selects G2D or CPU)
+// Create converter (auto-selects best backend: G2D, OpenGL, CPU)
 let mut converter = ImageProcessor::new()?;
 
-// Create output buffer
-let mut output = TensorImage::new(640, 640, RGB, Some(TensorMemory::Dma))?;
+// Create output buffer with optimal GPU memory (DMA > PBO > Mem)
+let mut output = converter.create_image(640, 640, RGB)?;
 
-// Convert and resize
+// Convert and resize — zero-copy if DMA or PBO backend is active
 converter.convert(&input, &mut output, Default::default())?;
 ```
 
@@ -428,8 +505,8 @@ tensor_img = ef.TensorImage.load("testdata/zidane.jpg", ef.FourCC.RGB)
 # Create converter
 converter = ef.ImageProcessor()
 
-# Create output image
-output = ef.TensorImage(640, 640)
+# Create output image with optimal GPU memory (DMA > PBO > Mem)
+output = converter.create_image(640, 640, ef.FourCC.RGB)
 
 # Resize with hardware acceleration
 converter.convert(tensor_img, output)
@@ -611,8 +688,10 @@ All GPU and DMA resources must be properly released. Specifically:
 - **EGL displays**: `eglTerminate` must be called in `GlContext::drop`. The
   EGL spec ref-counts display connections, so each `eglTerminate` decrements
   the count and only tears down state when it reaches zero.
-- **EGL contexts and surfaces**: `eglDestroyContext` and `eglDestroySurface`
-  must be called before `eglTerminate`.
+- **EGL contexts**: `eglDestroyContext` must be called before `eglTerminate`.
+  No EGL surfaces are created — the HAL uses surfaceless contexts
+  (`EGL_KHR_surfaceless_context` + `EGL_KHR_no_config_context`) and renders
+  exclusively through FBOs backed by EGLImages imported from DMA-buf.
 - **DMA buffers**: Closed via file descriptor `close()` in `Drop`.
 - **G2D contexts**: `g2d_close` via `G2DProcessor::drop`.
 
@@ -703,6 +782,7 @@ Consistent error handling throughout:
 | Feature | Linux (i.MX) | Linux (Generic) | macOS | Windows |
 |---------|--------------|-----------------|-------|---------|
 | DMA Tensors | ✅ | ✅ | ❌ | ❌ |
+| PBO Tensors (GPU) | ✅ | ✅ | ❌ | ❌ |
 | Shared Memory Tensors | ✅ | ✅ | ✅ | ✅ |
 | Heap Tensors | ✅ | ✅ | ✅ | ✅ |
 | G2D Acceleration | ✅ | ❌ | ❌ | ❌ |

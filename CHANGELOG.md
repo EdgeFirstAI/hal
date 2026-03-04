@@ -7,6 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **PBO (Pixel Buffer Object) tensor backend** (`edgefirst-tensor`):
+  `PboTensor<T>` provides GPU-native buffer storage for platforms where DMA-buf
+  is unavailable (e.g. NVIDIA desktop GPUs). PBO tensors are managed by the
+  OpenGL thread via a `WeakSender` channel that allows clean shutdown without
+  blocking on orphaned tensors.
+
+- **`ImageProcessor::create_image()`** factory method that probes GPU
+  capabilities at initialization and selects the optimal memory backend:
+  DMA-buf > PBO > heap memory. This is now the preferred way to allocate
+  images for use with `convert()`. Available in Rust, Python
+  (`ImageProcessor.create_image()`), and C
+  (`hal_image_processor_create_image()`).
+
+- **PBO convert paths** for all source/destination combinations:
+  `convert_pbo_to_pbo()` (both PBO), `convert_any_to_pbo()` (Mem/DMA source
+  to PBO destination), and `convert_pbo_to_mem()` (PBO source to Mem
+  destination). All paths use direct GL buffer bindings
+  (`GL_PIXEL_UNPACK_BUFFER` / `GL_PIXEL_PACK_BUFFER`) to avoid the deadlock
+  that would occur if the GL thread called `tensor.map()` on a PBO tensor.
+
+- **`hal_image_processor_create_image()`** C API function with documentation,
+  null-safety checks, and errno-based error reporting
+
+- **Python `ImageProcessor.create_image()`** method with format parameter
+  defaulting to RGBA
+
+- Python tests: `test_create_image`, `test_create_image_formats`,
+  `test_create_image_convert`, `test_create_image_roundtrip`
+
+- C API tests: `test_image_processor_create_image`,
+  `test_image_processor_create_image_null_params`,
+  `test_image_processor_create_image_convert`
+
+- Rust integration test: `test_convert_pbo_to_pbo` exercising PBO-to-PBO
+  conversion with SSIM comparison against CPU reference
+
+### Fixed
+
+- **GL thread shutdown hang**: `GlPboOps` used a strong `Sender` clone that
+  kept the GL thread's message channel alive after `GLProcessorThreaded` was
+  dropped, causing `handle.join()` to block indefinitely. Changed to
+  `WeakSender` so the channel closes when the last `ImageProcessor` reference
+  is dropped.
+
+- **PBO-to-PBO deadlock**: `convert_pbo_to_pbo()` called `draw_src_texture()`
+  which invoked `tensor.map()` on the GL thread, sending a message back to
+  itself. Added `draw_src_texture_from_pbo()` that binds the source PBO as
+  `GL_PIXEL_UNPACK_BUFFER` with a NULL `glTexImage2D` pointer for zero-copy
+  upload.
+
+- **Mixed PBO/Mem deadlock**: `convert_dest_non_dma()` called
+  `dst.tensor().map()` on the GL thread for PBO destinations. Added dedicated
+  `convert_any_to_pbo()` and `convert_pbo_to_mem()` methods that use GL buffer
+  bindings instead of tensor mapping.
+
+### Changed
+
+- ARCHITECTURE.md updated to v2.3: documents PBO tensor architecture,
+  `create_image()` backend selection, PBO convert dispatch table, and
+  `WeakSender` shutdown design
+
+- README.md updated: `create_image()` presented as preferred image allocation
+  method with usage guidance for Rust, Python, and C; DMA-buf permission
+  requirements; platform GPU support table
+
 ## [0.8.0] - 2026-02-24
 
 ### Added

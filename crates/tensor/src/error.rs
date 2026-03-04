@@ -14,6 +14,10 @@ pub enum Error {
     #[cfg(target_os = "linux")]
     UnknownDeviceType(u64, u64),
     InvalidMemoryType(String),
+    /// The GL context backing a PBO tensor has been destroyed.
+    PboDisconnected,
+    /// The PBO buffer is currently mapped and cannot be used for GL operations.
+    PboMapped,
     #[cfg(feature = "ndarray")]
     NdArrayError(ndarray::ShapeError),
 }
