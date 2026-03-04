@@ -2241,9 +2241,11 @@ impl ImageProcessorTrait for CPUProcessor {
             return Ok(());
         }
 
-        let is_modelpack = segmentation[0].segmentation.shape()[2] > 1;
+        // Semantic segmentation (e.g. ModelPack) has C > 1 (multi-class),
+        // instance segmentation (e.g. YOLO) has C = 1 (binary per-instance).
+        let is_semantic = segmentation[0].segmentation.shape()[2] > 1;
 
-        if is_modelpack {
+        if is_semantic {
             self.render_modelpack_segmentation(dst, dst_slice, &segmentation[0])?;
         } else {
             for (seg, detect) in segmentation.iter().zip(detect) {
