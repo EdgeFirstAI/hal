@@ -1635,7 +1635,7 @@ pub unsafe extern "C" fn hal_decoder_decode_masks(
                             src_x_start + r.bbox_w,
                             output_width
                         );
-                        return libc::EIO;
+                        return set_error(libc::EIO);
                     }
                     for dy in 0..r.bbox_h {
                         let src_row = src_y_start + dy;

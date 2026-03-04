@@ -82,6 +82,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names that accumulated during iterative optimization have been replaced
   with shorter, intent-revealing names across all language bindings:
 
+  **Renamed methods:**
+
   | Layer | Old Name | New Name |
   |-------|----------|----------|
   | Rust trait | `render_masks()` | `draw_masks_proto()` |
@@ -90,18 +92,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   | Rust enum | `RenderMasks` | `DrawMasksProto` |
   | Rust enum | `RenderMasksDecoded` | `DrawMasks` |
   | Rust enum | `RenderMaskAtlas` | `DecodeMasksAtlas` |
-  | Python `Decoder` | `render_masks()` | `draw_masks()` |
-  | Python `ImageProcessor` | `render_masks_decoded()` | `draw_masks()` |
-  | C API | `hal_decoder_render_masks()` | `hal_decoder_draw_masks()` |
-  | C API | `hal_image_processor_render_masks_decoded()` | `hal_image_processor_draw_masks()` |
+  | Python `Decoder` | `decode_and_render()` | `draw_masks()` |
+  | Python `ImageProcessor` | `render_to_image()` | `draw_masks()` |
+  | C API | `hal_image_processor_render_to_image()` | `hal_image_processor_draw_masks()` |
+
+  **New methods (no previous equivalent):**
+
+  | Layer | New Name |
+  |-------|----------|
+  | Python `Decoder` | `decode_masks()` |
+  | C API | `hal_decoder_draw_masks()` |
+  | C API | `hal_decoder_decode_masks()` |
 
   **Migration guide:**
-  - **Python users**: rename `decoder.render_masks(...)` →
-    `decoder.draw_masks(...)` and `processor.render_masks_decoded(...)` →
-    `processor.draw_masks(...)`
-  - **C users**: rename `hal_decoder_render_masks()` →
-    `hal_decoder_draw_masks()` and `hal_image_processor_render_masks_decoded()` →
-    `hal_image_processor_draw_masks()`
+  - **Python users**: rename `decoder.decode_and_render(...)` →
+    `decoder.draw_masks(...)` and `processor.render_to_image(...)` →
+    `processor.draw_masks(...)`; `decoder.decode_masks(...)` is new
+  - **C users**: rename `hal_image_processor_render_to_image()` →
+    `hal_image_processor_draw_masks()`; `hal_decoder_draw_masks()` and
+    `hal_decoder_decode_masks()` are new
   - **Rust users**: rename `render_masks()` → `draw_masks_proto()`,
     `render_masks_decoded()` → `draw_masks()`, and
     `render_mask_atlas()` → `decode_masks_atlas()` on `ImageProcessorTrait`
@@ -111,7 +120,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-detection masks as `List[ndarray]` (each shape `(H, W)`, uint8) instead
   of the raw atlas tuple. The atlas packing is now an internal optimization.
 
-- ARCHITECTURE.md updated to v2.3: documents PBO tensor architecture,
+- ARCHITECTURE.md updated to v2.4: documents PBO tensor architecture,
   `create_image()` backend selection, PBO convert dispatch table, and
   `WeakSender` shutdown design
 
