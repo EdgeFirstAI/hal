@@ -141,6 +141,9 @@ pub const NV12: FourCharCode = four_char_code!("NV12");
 pub const NV16: FourCharCode = four_char_code!("NV16");
 /// 8 bit RGBA
 pub const RGBA: FourCharCode = four_char_code!("RGBA");
+/// 8 bit BGRA (byte order: B, G, R, A). Used by Cairo/Wayland (ARGB32 on
+/// little-endian).
+pub const BGRA: FourCharCode = four_char_code!("BGRA");
 /// 8 bit RGB
 pub const RGB: FourCharCode = four_char_code!("RGB ");
 /// 8 bit grayscale, full range
@@ -1778,7 +1781,7 @@ impl ImageProcessorTrait for ImageProcessor {
 
 fn fourcc_channels(fourcc: FourCharCode) -> Result<usize> {
     match fourcc {
-        RGBA => Ok(4),        // RGBA has 4 channels (R, G, B, A)
+        RGBA | BGRA => Ok(4), // RGBA/BGRA has 4 channels (R, G, B, A)
         RGB => Ok(3),         // RGB has 3 channels (R, G, B)
         YUYV | VYUY => Ok(2), // YUYV/VYUY has 2 channels (Y and UV)
         GREY => Ok(1),        // Y800 has 1 channel (Y)
@@ -1797,7 +1800,7 @@ fn fourcc_channels(fourcc: FourCharCode) -> Result<usize> {
 
 fn fourcc_planar(fourcc: FourCharCode) -> Result<bool> {
     match fourcc {
-        RGBA => Ok(false),        // RGBA has 4 channels (R, G, B, A)
+        RGBA | BGRA => Ok(false), // RGBA/BGRA has 4 channels (R, G, B, A)
         RGB => Ok(false),         // RGB has 3 channels (R, G, B)
         YUYV | VYUY => Ok(false), // YUYV/VYUY has 2 channels (Y and UV)
         GREY => Ok(false),        // Y800 has 1 channel (Y)
