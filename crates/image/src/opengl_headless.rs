@@ -45,7 +45,7 @@ macro_rules! function {
 
 use crate::{
     fourcc_is_int8, fourcc_is_packed_rgb, CPUProcessor, Crop, Error, Flip, ImageProcessorTrait,
-    MaskRegion, Rect, Rotation, TensorImage, TensorImageRef, DEFAULT_COLORS, GREY, NV12,
+    MaskRegion, Rect, Rotation, TensorImage, TensorImageRef, BGRA, DEFAULT_COLORS, GREY, NV12,
     PLANAR_RGB, PLANAR_RGBA, PLANAR_RGB_INT8, RGB, RGBA, RGB_INT8, VYUY, YUYV,
 };
 
@@ -1500,9 +1500,9 @@ impl ImageProcessorTrait for GLProcessorST {
         use crate::FunctionTimer;
 
         let _timer = FunctionTimer::new("GLProcessorST::draw_masks");
-        if !matches!(dst.fourcc(), RGBA | RGB) {
+        if !matches!(dst.fourcc(), RGBA | BGRA | RGB) {
             return Err(crate::Error::NotSupported(
-                "Opengl image rendering only supports RGBA or RGB images".to_string(),
+                "Opengl image rendering only supports RGBA, BGRA, or RGB images".to_string(),
             ));
         }
 
@@ -1535,6 +1535,7 @@ impl ImageProcessorTrait for GLProcessorST {
             let format = match dst.fourcc() {
                 RGB => gls::gl::RGB,
                 RGBA => gls::gl::RGBA,
+                BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
                 _ => unreachable!(),
             };
             unsafe {
@@ -1564,9 +1565,9 @@ impl ImageProcessorTrait for GLProcessorST {
         use crate::FunctionTimer;
 
         let _timer = FunctionTimer::new("GLProcessorST::draw_masks_proto");
-        if !matches!(dst.fourcc(), RGBA | RGB) {
+        if !matches!(dst.fourcc(), RGBA | BGRA | RGB) {
             return Err(crate::Error::NotSupported(
-                "Opengl image rendering only supports RGBA or RGB images".to_string(),
+                "Opengl image rendering only supports RGBA, BGRA, or RGB images".to_string(),
             ));
         }
 
@@ -1598,6 +1599,7 @@ impl ImageProcessorTrait for GLProcessorST {
             let format = match dst.fourcc() {
                 RGB => gls::gl::RGB,
                 RGBA => gls::gl::RGBA,
+                BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
                 _ => unreachable!(),
             };
             unsafe {
@@ -2522,10 +2524,10 @@ impl GLProcessorST {
         if backend.is_dma() && img.tensor().memory() == TensorMemory::Dma {
             matches!(
                 img.fourcc(),
-                RGBA | GREY | PLANAR_RGB | RGB | RGB_INT8 | PLANAR_RGB_INT8
+                RGBA | BGRA | GREY | PLANAR_RGB | RGB | RGB_INT8 | PLANAR_RGB_INT8
             )
         } else {
-            matches!(img.fourcc(), RGB | RGBA | GREY | RGB_INT8)
+            matches!(img.fourcc(), RGB | RGBA | BGRA | GREY | RGB_INT8)
         }
     }
 
@@ -2636,7 +2638,7 @@ impl GLProcessorST {
     fn setup_renderbuffer_non_dma(&mut self, dst: &TensorImage, crop: Crop) -> crate::Result<()> {
         debug_assert!(matches!(
             dst.fourcc(),
-            RGB | RGBA | GREY | PLANAR_RGB | RGB_INT8
+            RGB | RGBA | BGRA | GREY | PLANAR_RGB | RGB_INT8
         ));
         let (width, height) = if dst.is_planar() {
             let width = dst.width() / 4;
@@ -2657,6 +2659,7 @@ impl GLProcessorST {
             match dst.fourcc() {
                 RGB | RGB_INT8 => gls::gl::RGB,
                 RGBA => gls::gl::RGBA,
+                BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
                 GREY => gls::gl::RED,
                 _ => unreachable!(),
             }
@@ -5820,6 +5823,7 @@ fn check_gl_error(name: &str, line: u32) -> Result<(), Error> {
 fn fourcc_to_drm(fourcc: FourCharCode) -> Result<DrmFourcc, Error> {
     match fourcc {
         RGBA => Ok(DrmFourcc::Abgr8888),
+        BGRA => Ok(DrmFourcc::Argb8888),
         YUYV => Ok(DrmFourcc::Yuyv),
         VYUY => Ok(DrmFourcc::Vyuy),
         RGB | RGB_INT8 => Ok(DrmFourcc::Bgr888),
