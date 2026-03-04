@@ -405,22 +405,29 @@ class Decoder:
         max_boxes: int = 100,
     ) -> DetectionOutput:
         """
-        Decode model outputs and draw masks directly onto the destination
-        image in a single call. Masks never leave Rust, eliminating the
-        Python round-trip overhead of ``decode()`` + ``draw_masks()``.
+        Decode model outputs and draw colored masks directly onto the
+        destination image in a single fused call. This is the fastest path
+        for visualization — masks never leave Rust/GPU, eliminating the
+        Python round-trip overhead of ``decode()`` + ``processor.draw_masks()``.
 
         For segmentation models, prototype data is passed directly to the
-        renderer without materializing intermediate mask arrays in Python.
-        For detection-only models, this falls back to the standard drawing
-        path.
+        renderer which evaluates the mask at every output pixel. For
+        detection-only models, this falls back to the standard drawing path.
 
         Returns ``(boxes, scores, classes)`` — no mask arrays are returned.
+        Use ``decode_masks()`` if you need the raw mask pixels.
 
         Args:
             model_output: List of model output tensors (same types as ``decode``).
             processor: ImageProcessor instance for drawing.
-            dst: Destination TensorImage to draw onto.
+            dst: Destination TensorImage to draw onto. Must be ``RGBA`` or
+                ``RGB`` for CPU backend, or ``RGBA``/``BGRA``/``RGB`` for
+                OpenGL backend.
             max_boxes: Maximum number of detections to return (default: 100).
+
+        Raises:
+            RuntimeError: If ``dst`` format is unsupported by the active backend,
+                or if the ImageProcessor uses G2D (mask rendering not supported).
         """
         ...
 
@@ -433,24 +440,36 @@ class Decoder:
         max_boxes: int = 100,
     ) -> SegDetOutput:
         """
-        Decode model outputs and return per-detection masks at the specified
-        output resolution.
+        Decode model outputs and return per-detection binary masks.
 
-        Internally uses GPU atlas rendering when available, then splits the
-        atlas into individual per-detection mask arrays. Each mask is a binary
-        ``uint8`` array of shape ``(H, W)`` covering the detection's bounding
-        box region, where 255 indicates mask presence.
+        Internally uses GPU atlas rendering when available (OpenGL), then
+        splits the atlas into individual per-detection mask arrays. Each mask
+        is a binary ``uint8`` array of shape ``(bbox_h, bbox_w)`` covering
+        the detection's bounding box region, where ``255`` = mask presence
+        and ``0`` = background. Threshold at ``> 127`` for boolean masks.
+
+        Use this method when you need the raw mask pixels for downstream
+        processing (tracking, area measurement, custom compositing). For
+        direct overlay onto a display frame, prefer ``draw_masks()`` which
+        avoids the Python round-trip.
 
         Args:
             model_output: List of model output tensors (same types as ``decode``).
             processor: ImageProcessor instance for GPU-accelerated mask rendering.
-            output_width: Width of the mask output resolution (default: 640).
-            output_height: Height of the mask output resolution (default: 640).
+            output_width: Coordinate-space width for bounding box interpretation
+                (default: 640). This is **not** the per-mask array width — each
+                returned mask is sized to its detection's bounding box.
+            output_height: Coordinate-space height for bounding box interpretation
+                (default: 640). Typically matches the model input resolution.
             max_boxes: Maximum number of detections to return (default: 100).
 
         Returns:
             ``(boxes, scores, classes, masks)`` where masks is a list of
-            ``ndarray[H, W]`` of ``uint8`` — one per detection.
+            ``ndarray[bbox_h, bbox_w]`` of ``uint8`` — one per detection.
+
+        Raises:
+            RuntimeError: If the ImageProcessor uses G2D (mask rendering not
+                supported on G2D). Use an OpenGL or CPU processor instead.
         """
         ...
 
@@ -810,6 +829,10 @@ class FourCC(enum.Enum):
     RGBA: FourCC
     """RGBA format (Red, Green, Blue, Alpha)"""
 
+    BGRA: FourCC
+    """BGRA format (Blue, Green, Red, Alpha). Destination-only format for
+    Cairo/Wayland compositing (ARGB32 on little-endian)."""
+
     RGB: FourCC
     """RGB format (Red, Green, Blue)"""
 
@@ -1106,9 +1129,28 @@ class ImageProcessor:
         seg: List[npt.NDArray[np.uint8]] = [],
     ) -> None:
         """
-        Draw detection and segmentation masks onto the destination image.
-        The `bbox`, `scores`, and `classes` parameters should correspond to the decoded outputs of a detection model.
-        The optional `seg` parameter can be used to provide segmentation masks to draw.
+        Draw detection boxes and optional segmentation masks onto ``dst``.
+
+        This method draws pre-decoded results. For the fused decode+draw path
+        (recommended for most use cases), use ``Decoder.draw_masks()`` instead.
+
+        Args:
+            dst: Destination image. Must be ``RGBA`` or ``RGB`` for CPU backend,
+                or ``RGBA``/``BGRA``/``RGB`` for OpenGL.
+            bbox: ``(N, 4)`` float32 array of normalized bounding boxes in
+                ``[x1, y1, x2, y2]`` format with values in ``[0, 1]``.
+            scores: ``(N,)`` float32 array of confidence scores.
+            classes: ``(N,)`` uintp array of class indices.
+            seg: Optional list of ``uint8`` mask arrays from ``decode()``.
+                Each element has shape ``(H, W, C)``. When ``C=1`` (instance
+                segmentation, e.g. YOLO), one mask per detection is expected
+                (``len(seg) <= len(bbox)``). When ``C > 1`` (semantic
+                segmentation, e.g. ModelPack), a single mask covers all classes.
+
+        Raises:
+            RuntimeError: If ``dst`` format is unsupported by the active backend.
+            ValueError: If ``bbox``, ``scores``, ``classes`` lengths do not match,
+                or if ``bbox`` shape is not ``(N, 4)``.
         """
         ...
 

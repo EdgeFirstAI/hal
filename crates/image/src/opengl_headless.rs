@@ -45,7 +45,7 @@ macro_rules! function {
 
 use crate::{
     fourcc_is_int8, fourcc_is_packed_rgb, CPUProcessor, Crop, Error, Flip, ImageProcessorTrait,
-    MaskRegion, Rect, Rotation, TensorImage, TensorImageRef, DEFAULT_COLORS, GREY, NV12,
+    MaskRegion, Rect, Rotation, TensorImage, TensorImageRef, BGRA, DEFAULT_COLORS, GREY, NV12,
     PLANAR_RGB, PLANAR_RGBA, PLANAR_RGB_INT8, RGB, RGBA, RGB_INT8, VYUY, YUYV,
 };
 
@@ -802,6 +802,7 @@ pub struct GLProcessorThreaded {
     // This is only None when the converter is being dropped.
     sender: Option<Sender<GLProcessorMessage>>,
     transfer_backend: TransferBackend,
+    has_bgra: bool,
 }
 
 unsafe impl Send for GLProcessorThreaded {}
@@ -829,7 +830,10 @@ impl GLProcessorThreaded {
                     return;
                 }
             };
-            let _ = create_ctx_send.send(Ok(gl_converter.gl_context.transfer_backend));
+            let _ = create_ctx_send.send(Ok((
+                gl_converter.gl_context.transfer_backend,
+                gl_converter.has_bgra,
+            )));
             while let Some(msg) = recv.blocking_recv() {
                 match msg {
                     GLProcessorMessage::ImageConvert(src, mut dst, rotation, flip, crop, resp) => {
@@ -952,7 +956,7 @@ impl GLProcessorThreaded {
         // let handle = tokio::task::spawn(func());
         let handle = std::thread::spawn(func);
 
-        let transfer_backend = match create_ctx_recv.blocking_recv() {
+        let (transfer_backend, has_bgra) = match create_ctx_recv.blocking_recv() {
             Ok(Err(e)) => return Err(e),
             Err(_) => {
                 return Err(Error::Internal(
@@ -966,6 +970,7 @@ impl GLProcessorThreaded {
             handle: Some(handle),
             sender: Some(send),
             transfer_backend,
+            has_bgra,
         })
     }
 }
@@ -987,7 +992,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
             )));
         }
 
-        if !GLProcessorST::check_dst_format_supported(self.transfer_backend, dst) {
+        if !GLProcessorST::check_dst_format_supported(self.transfer_backend, dst, self.has_bgra) {
             return Err(crate::Error::NotSupported(format!(
                 "Opengl doesn't support {} destination texture",
                 dst.fourcc().display()
@@ -1350,6 +1355,8 @@ pub struct GLProcessorST {
     color_program: GlProgram,
     /// Whether GL_OES_texture_float_linear is available (allows GL_LINEAR on R32F textures).
     has_float_linear: bool,
+    /// Whether GL_EXT_texture_format_BGRA8888 is available (allows BGRA destinations).
+    has_bgra: bool,
     /// Interpolation mode for int8 proto textures.
     int8_interpolation_mode: Int8InterpolationMode,
     /// Intermediate FBO texture for two-pass int8 dequant path.
@@ -1436,7 +1443,7 @@ impl ImageProcessorTrait for GLProcessorST {
             )));
         }
 
-        if !Self::check_dst_format_supported(self.gl_context.transfer_backend, dst) {
+        if !Self::check_dst_format_supported(self.gl_context.transfer_backend, dst, self.has_bgra) {
             return Err(crate::Error::NotSupported(format!(
                 "Opengl doesn't support {} destination texture",
                 dst.fourcc().display()
@@ -1500,9 +1507,9 @@ impl ImageProcessorTrait for GLProcessorST {
         use crate::FunctionTimer;
 
         let _timer = FunctionTimer::new("GLProcessorST::draw_masks");
-        if !matches!(dst.fourcc(), RGBA | RGB) {
+        if !matches!(dst.fourcc(), RGBA | BGRA | RGB) {
             return Err(crate::Error::NotSupported(
-                "Opengl image rendering only supports RGBA or RGB images".to_string(),
+                "Opengl image rendering only supports RGBA, BGRA, or RGB images".to_string(),
             ));
         }
 
@@ -1535,6 +1542,7 @@ impl ImageProcessorTrait for GLProcessorST {
             let format = match dst.fourcc() {
                 RGB => gls::gl::RGB,
                 RGBA => gls::gl::RGBA,
+                BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
                 _ => unreachable!(),
             };
             unsafe {
@@ -1564,9 +1572,9 @@ impl ImageProcessorTrait for GLProcessorST {
         use crate::FunctionTimer;
 
         let _timer = FunctionTimer::new("GLProcessorST::draw_masks_proto");
-        if !matches!(dst.fourcc(), RGBA | RGB) {
+        if !matches!(dst.fourcc(), RGBA | BGRA | RGB) {
             return Err(crate::Error::NotSupported(
-                "Opengl image rendering only supports RGBA or RGB images".to_string(),
+                "Opengl image rendering only supports RGBA, BGRA, or RGB images".to_string(),
             ));
         }
 
@@ -1598,6 +1606,7 @@ impl ImageProcessorTrait for GLProcessorST {
             let format = match dst.fourcc() {
                 RGB => gls::gl::RGB,
                 RGBA => gls::gl::RGBA,
+                BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
                 _ => unreachable!(),
             };
             unsafe {
@@ -1678,7 +1687,7 @@ impl GLProcessorST {
                 .map_or(std::ptr::null(), |p| p as *const _)
         });
 
-        let has_float_linear = Self::gl_check_support()?;
+        let (has_float_linear, has_bgra) = Self::gl_check_support()?;
 
         // Uploads and downloads are all packed with no alignment requirements
         unsafe {
@@ -1802,6 +1811,7 @@ impl GLProcessorST {
             proto_dequant_int8_program,
             proto_segmentation_f32_program,
             has_float_linear,
+            has_bgra,
             int8_interpolation_mode: Int8InterpolationMode::Bilinear,
             proto_dequant_texture,
             proto_mask_logit_int8_bilinear_program,
@@ -2518,20 +2528,27 @@ impl GLProcessorST {
         }
     }
 
-    fn check_dst_format_supported(backend: TransferBackend, img: &TensorImage) -> bool {
+    fn check_dst_format_supported(
+        backend: TransferBackend,
+        img: &TensorImage,
+        has_bgra: bool,
+    ) -> bool {
+        if img.fourcc() == BGRA && !has_bgra {
+            return false;
+        }
         if backend.is_dma() && img.tensor().memory() == TensorMemory::Dma {
             matches!(
                 img.fourcc(),
-                RGBA | GREY | PLANAR_RGB | RGB | RGB_INT8 | PLANAR_RGB_INT8
+                RGBA | BGRA | GREY | PLANAR_RGB | RGB | RGB_INT8 | PLANAR_RGB_INT8
             )
         } else {
-            matches!(img.fourcc(), RGB | RGBA | GREY | RGB_INT8)
+            matches!(img.fourcc(), RGB | RGBA | BGRA | GREY | RGB_INT8)
         }
     }
 
-    /// Checks required GL extensions and returns whether optional capabilities
-    /// are available. Returns `has_float_linear` (GL_OES_texture_float_linear).
-    fn gl_check_support() -> Result<bool, crate::Error> {
+    /// Checks required GL extensions and returns optional capability flags:
+    /// `(has_float_linear, has_bgra)`.
+    fn gl_check_support() -> Result<(bool, bool), crate::Error> {
         if let Ok(version) = gls::get_string(gls::gl::SHADING_LANGUAGE_VERSION) {
             log::debug!("GL Shading Language Version: {version:?}");
         } else {
@@ -2563,7 +2580,10 @@ impl GLProcessorST {
         let has_float_linear = extensions.contains("GL_OES_texture_float_linear");
         log::debug!("GL_OES_texture_float_linear: {has_float_linear}");
 
-        Ok(has_float_linear)
+        let has_bgra = extensions.contains("GL_EXT_texture_format_BGRA8888");
+        log::debug!("GL_EXT_texture_format_BGRA8888: {has_bgra}");
+
+        Ok((has_float_linear, has_bgra))
     }
 
     fn setup_renderbuffer_dma(&mut self, dst: &TensorImage) -> crate::Result<()> {
@@ -2636,7 +2656,7 @@ impl GLProcessorST {
     fn setup_renderbuffer_non_dma(&mut self, dst: &TensorImage, crop: Crop) -> crate::Result<()> {
         debug_assert!(matches!(
             dst.fourcc(),
-            RGB | RGBA | GREY | PLANAR_RGB | RGB_INT8
+            RGB | RGBA | BGRA | GREY | PLANAR_RGB | RGB_INT8
         ));
         let (width, height) = if dst.is_planar() {
             let width = dst.width() / 4;
@@ -2657,6 +2677,7 @@ impl GLProcessorST {
             match dst.fourcc() {
                 RGB | RGB_INT8 => gls::gl::RGB,
                 RGBA => gls::gl::RGBA,
+                BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
                 GREY => gls::gl::RED,
                 _ => unreachable!(),
             }
@@ -2739,6 +2760,7 @@ impl GLProcessorST {
         let dest_format = match dst.fourcc() {
             RGB | RGB_INT8 => gls::gl::RGB,
             RGBA => gls::gl::RGBA,
+            BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
             GREY => gls::gl::RED,
             _ => unreachable!(),
         };
@@ -2826,6 +2848,7 @@ impl GLProcessorST {
         let dest_format = match dst.fourcc() {
             crate::RGB | crate::RGB_INT8 => gls::gl::RGB,
             crate::RGBA => gls::gl::RGBA,
+            crate::BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
             crate::GREY => gls::gl::RED,
             _ => {
                 return Err(crate::Error::NotSupported(format!(
@@ -3168,6 +3191,7 @@ impl GLProcessorST {
         let dest_format = match dst.fourcc() {
             crate::RGB | crate::RGB_INT8 => gls::gl::RGB,
             crate::RGBA => gls::gl::RGBA,
+            crate::BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
             crate::GREY => gls::gl::RED,
             _ => {
                 return Err(crate::Error::NotSupported(format!(
@@ -3256,8 +3280,14 @@ impl GLProcessorST {
         let dest_format = match dst.fourcc() {
             crate::RGB | crate::RGB_INT8 => gls::gl::RGB,
             crate::RGBA => gls::gl::RGBA,
+            crate::BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
             crate::GREY => gls::gl::RED,
-            _ => unreachable!(),
+            _ => {
+                return Err(crate::Error::NotSupported(format!(
+                    "PBO readback not supported for {}",
+                    dst.fourcc().display()
+                )))
+            }
         };
         unsafe {
             let mut dst_map = dst.tensor().map()?;
@@ -5820,6 +5850,7 @@ fn check_gl_error(name: &str, line: u32) -> Result<(), Error> {
 fn fourcc_to_drm(fourcc: FourCharCode) -> Result<DrmFourcc, Error> {
     match fourcc {
         RGBA => Ok(DrmFourcc::Abgr8888),
+        BGRA => Ok(DrmFourcc::Argb8888),
         YUYV => Ok(DrmFourcc::Yuyv),
         VYUY => Ok(DrmFourcc::Vyuy),
         RGB | RGB_INT8 => Ok(DrmFourcc::Bgr888),
@@ -6558,12 +6589,12 @@ void main() {
 #[cfg(feature = "opengl")]
 mod gl_tests {
     use super::*;
-    use crate::{TensorImage, RGBA};
+    use crate::{TensorImage, BGRA, RGBA};
     #[cfg(feature = "dma_test_formats")]
     use crate::{NV12, YUYV};
-    use edgefirst_tensor::TensorTrait;
     #[cfg(feature = "dma_test_formats")]
-    use edgefirst_tensor::{is_dma_available, TensorMapTrait, TensorMemory};
+    use edgefirst_tensor::{is_dma_available, TensorMemory};
+    use edgefirst_tensor::{TensorMapTrait, TensorTrait};
     use image::buffer::ConvertBuffer;
     use ndarray::Array3;
 
@@ -7401,5 +7432,283 @@ mod gl_tests {
         }
         eprintln!("RGB direct vs two-pass max pixel diff: {max_diff}");
         assert!(max_diff <= 1, "Pixel mismatch > 1: max_diff={max_diff}");
+    }
+
+    // ---- BGRA destination tests ----
+
+    /// Test OpenGL NV12→BGRA conversion with DMA buffers.
+    /// Compares against NV12→RGBA by verifying R↔B swap.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_opengl_nv12_to_bgra() {
+        if !is_dma_available() {
+            eprintln!("SKIPPED: test_opengl_nv12_to_bgra - DMA not available");
+            return;
+        }
+
+        let src = load_raw_image(
+            1280,
+            720,
+            NV12,
+            Some(TensorMemory::Dma),
+            include_bytes!("../../../testdata/camera720p.nv12"),
+        )
+        .unwrap();
+
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+
+        // Convert to RGBA as reference
+        let mut rgba_dst = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma)).unwrap();
+        gl.convert(
+            &src,
+            &mut rgba_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        // Convert to BGRA
+        let mut bgra_dst = TensorImage::new(1280, 720, BGRA, Some(TensorMemory::Dma)).unwrap();
+        gl.convert(
+            &src,
+            &mut bgra_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        // Compare: BGRA[B,G,R,A] should match RGBA[R,G,B,A] with R↔B swapped
+        let bgra_map = bgra_dst.tensor().map().unwrap();
+        let rgba_map = rgba_dst.tensor().map().unwrap();
+        let bgra_buf = bgra_map.as_slice();
+        let rgba_buf = rgba_map.as_slice();
+
+        assert_eq!(bgra_buf.len(), rgba_buf.len());
+        let mut max_diff = 0i32;
+        for (bc, rc) in bgra_buf.chunks_exact(4).zip(rgba_buf.chunks_exact(4)) {
+            max_diff = max_diff.max((bc[0] as i32 - rc[2] as i32).abs()); // B
+            max_diff = max_diff.max((bc[1] as i32 - rc[1] as i32).abs()); // G
+            max_diff = max_diff.max((bc[2] as i32 - rc[0] as i32).abs()); // R
+            max_diff = max_diff.max((bc[3] as i32 - rc[3] as i32).abs()); // A
+        }
+        eprintln!("NV12→BGRA vs NV12→RGBA max channel diff: {max_diff}");
+        assert!(
+            max_diff <= 1,
+            "BGRA/RGBA channel mismatch > 1: max_diff={max_diff}"
+        );
+    }
+
+    /// Test OpenGL YUYV→BGRA conversion with DMA buffers.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_opengl_yuyv_to_bgra() {
+        if !is_dma_available() {
+            eprintln!("SKIPPED: test_opengl_yuyv_to_bgra - DMA not available");
+            return;
+        }
+
+        let src = load_raw_image(
+            1280,
+            720,
+            YUYV,
+            Some(TensorMemory::Dma),
+            include_bytes!("../../../testdata/camera720p.yuyv"),
+        )
+        .unwrap();
+
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+
+        let mut rgba_dst = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma)).unwrap();
+        gl.convert(
+            &src,
+            &mut rgba_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        let mut bgra_dst = TensorImage::new(1280, 720, BGRA, Some(TensorMemory::Dma)).unwrap();
+        gl.convert(
+            &src,
+            &mut bgra_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        let bgra_map = bgra_dst.tensor().map().unwrap();
+        let rgba_map = rgba_dst.tensor().map().unwrap();
+        let bgra_buf = bgra_map.as_slice();
+        let rgba_buf = rgba_map.as_slice();
+
+        let mut max_diff = 0i32;
+        for (bc, rc) in bgra_buf.chunks_exact(4).zip(rgba_buf.chunks_exact(4)) {
+            max_diff = max_diff.max((bc[0] as i32 - rc[2] as i32).abs());
+            max_diff = max_diff.max((bc[1] as i32 - rc[1] as i32).abs());
+            max_diff = max_diff.max((bc[2] as i32 - rc[0] as i32).abs());
+            max_diff = max_diff.max((bc[3] as i32 - rc[3] as i32).abs());
+        }
+        eprintln!("YUYV→BGRA vs YUYV→RGBA max channel diff: {max_diff}");
+        assert!(
+            max_diff <= 1,
+            "BGRA/RGBA channel mismatch > 1: max_diff={max_diff}"
+        );
+    }
+
+    /// Test draw_masks() with BGRA destination (segmentation).
+    /// Draws the same masks to both RGBA and BGRA, then verifies R↔B swap.
+    #[test]
+    fn test_draw_masks_bgra() {
+        use edgefirst_decoder::Segmentation;
+
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: test_draw_masks_bgra - OpenGL not available");
+            return;
+        }
+
+        let seg_bytes = include_bytes!("../../../testdata/modelpack_seg_2x160x160.bin").to_vec();
+
+        // Build segmentation data (shared between both renders)
+        let make_seg = || {
+            let mut s = Array3::from_shape_vec((2, 160, 160), seg_bytes.clone()).unwrap();
+            s.swap_axes(0, 1);
+            s.swap_axes(1, 2);
+            let s = s.as_standard_layout().to_owned();
+            Segmentation {
+                segmentation: s,
+                xmin: 0.0,
+                ymin: 0.0,
+                xmax: 1.0,
+                ymax: 1.0,
+            }
+        };
+
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+
+        // Render to RGBA
+        let mut rgba_img = TensorImage::load(
+            include_bytes!("../../../testdata/giraffe.jpg"),
+            Some(RGBA),
+            None,
+        )
+        .unwrap();
+        gl.draw_masks(&mut rgba_img, &[], &[make_seg()]).unwrap();
+
+        // Render to BGRA (convert source to BGRA first)
+        let rgba_src = TensorImage::load(
+            include_bytes!("../../../testdata/giraffe.jpg"),
+            Some(RGBA),
+            None,
+        )
+        .unwrap();
+        let mut bgra_img =
+            TensorImage::new(rgba_src.width(), rgba_src.height(), BGRA, None).unwrap();
+        gl.convert(
+            &rgba_src,
+            &mut bgra_img,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+        gl.draw_masks(&mut bgra_img, &[], &[make_seg()]).unwrap();
+
+        // Verify BGRA output matches RGBA output with R↔B swapped
+        let rgba_map = rgba_img.tensor().map().unwrap();
+        let bgra_map = bgra_img.tensor().map().unwrap();
+        let rgba_buf = rgba_map.as_slice();
+        let bgra_buf = bgra_map.as_slice();
+        assert_eq!(rgba_buf.len(), bgra_buf.len());
+
+        let mut max_diff = 0i32;
+        for (rc, bc) in rgba_buf.chunks_exact(4).zip(bgra_buf.chunks_exact(4)) {
+            max_diff = max_diff.max((rc[0] as i32 - bc[2] as i32).abs()); // R
+            max_diff = max_diff.max((rc[1] as i32 - bc[1] as i32).abs()); // G
+            max_diff = max_diff.max((rc[2] as i32 - bc[0] as i32).abs()); // B
+            max_diff = max_diff.max((rc[3] as i32 - bc[3] as i32).abs()); // A
+        }
+        eprintln!("draw_masks BGRA vs RGBA max channel diff: {max_diff}");
+        assert!(
+            max_diff <= 1,
+            "draw_masks BGRA/RGBA channel mismatch > 1: max_diff={max_diff}"
+        );
+    }
+
+    /// Test draw_masks() with BGRA destination using Mem memory (boxes).
+    /// Draws same boxes to RGBA and BGRA, then verifies R↔B swap.
+    #[test]
+    fn test_draw_masks_bgra_mem() {
+        use edgefirst_decoder::DetectBox;
+
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: test_draw_masks_bgra_mem - OpenGL not available");
+            return;
+        }
+
+        let detect = DetectBox {
+            bbox: [0.59375, 0.25, 0.9375, 0.725].into(),
+            score: 0.99,
+            label: 0,
+        };
+        let colors = [[255, 255, 0, 233], [128, 128, 255, 100]];
+
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        gl.set_class_colors(&colors).unwrap();
+
+        // Render boxes to RGBA
+        let mut rgba_img = TensorImage::load(
+            include_bytes!("../../../testdata/giraffe.jpg"),
+            Some(RGBA),
+            Some(edgefirst_tensor::TensorMemory::Mem),
+        )
+        .unwrap();
+        gl.draw_masks(&mut rgba_img, &[detect], &[]).unwrap();
+
+        // Render boxes to BGRA
+        let rgba_src = TensorImage::load(
+            include_bytes!("../../../testdata/giraffe.jpg"),
+            Some(RGBA),
+            Some(edgefirst_tensor::TensorMemory::Mem),
+        )
+        .unwrap();
+        let mut bgra_img = TensorImage::new(
+            rgba_src.width(),
+            rgba_src.height(),
+            BGRA,
+            Some(edgefirst_tensor::TensorMemory::Mem),
+        )
+        .unwrap();
+        gl.convert(
+            &rgba_src,
+            &mut bgra_img,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+        gl.draw_masks(&mut bgra_img, &[detect], &[]).unwrap();
+
+        // Verify BGRA output matches RGBA output with R↔B swapped
+        let rgba_map = rgba_img.tensor().map().unwrap();
+        let bgra_map = bgra_img.tensor().map().unwrap();
+        let rgba_buf = rgba_map.as_slice();
+        let bgra_buf = bgra_map.as_slice();
+
+        let mut max_diff = 0i32;
+        for (rc, bc) in rgba_buf.chunks_exact(4).zip(bgra_buf.chunks_exact(4)) {
+            max_diff = max_diff.max((rc[0] as i32 - bc[2] as i32).abs());
+            max_diff = max_diff.max((rc[1] as i32 - bc[1] as i32).abs());
+            max_diff = max_diff.max((rc[2] as i32 - bc[0] as i32).abs());
+            max_diff = max_diff.max((rc[3] as i32 - bc[3] as i32).abs());
+        }
+        eprintln!("draw_masks_mem BGRA vs RGBA max channel diff: {max_diff}");
+        assert!(
+            max_diff <= 1,
+            "draw_masks_mem BGRA/RGBA channel mismatch > 1: max_diff={max_diff}"
+        );
     }
 }
