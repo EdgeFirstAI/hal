@@ -6,7 +6,6 @@ use crate::{
     Rect, Result, Rotation, TensorImage, TensorImageDst, TensorImageRef, GREY, NV12, NV16,
     PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, VYUY, YUYV,
 };
-#[cfg(feature = "decoder")]
 use edgefirst_decoder::{DetectBox, ProtoData, Segmentation};
 use edgefirst_tensor::{TensorMapTrait, TensorTrait};
 use four_char_code::FourCharCode;
@@ -22,7 +21,6 @@ use std::ops::Shr;
 pub struct CPUProcessor {
     resizer: fast_image_resize::Resizer,
     options: fast_image_resize::ResizeOptions,
-    #[cfg(feature = "decoder")]
     colors: [[u8; 4]; 20],
 }
 
@@ -64,7 +62,6 @@ impl CPUProcessor {
         Self {
             resizer,
             options,
-            #[cfg(feature = "decoder")]
             colors: crate::DEFAULT_COLORS_U8,
         }
     }
@@ -79,7 +76,6 @@ impl CPUProcessor {
         Self {
             resizer,
             options,
-            #[cfg(feature = "decoder")]
             colors: crate::DEFAULT_COLORS_U8,
         }
     }
@@ -1671,7 +1667,6 @@ impl CPUProcessor {
         [y, u, y, v]
     }
 
-    #[cfg(feature = "decoder")]
     fn render_modelpack_segmentation(
         &mut self,
         dst: &TensorImage,
@@ -1733,7 +1728,6 @@ impl CPUProcessor {
         Ok(())
     }
 
-    #[cfg(feature = "decoder")]
     fn render_yolo_segmentation(
         &mut self,
         dst: &TensorImage,
@@ -1786,7 +1780,6 @@ impl CPUProcessor {
         Ok(())
     }
 
-    #[cfg(feature = "decoder")]
     fn render_box(
         &mut self,
         dst: &TensorImage,
@@ -1850,6 +1843,71 @@ impl CPUProcessor {
             }
         }
         Ok(())
+    }
+
+    /// Renders per-instance grayscale masks from raw prototype data at full
+    /// output resolution. Used internally by [`decode_masks_atlas`] to generate
+    /// per-detection mask crops that are then packed into the atlas.
+    fn render_masks_from_protos(
+        &mut self,
+        detect: &[crate::DetectBox],
+        proto_data: crate::ProtoData,
+        output_width: usize,
+        output_height: usize,
+    ) -> Result<Vec<crate::MaskResult>> {
+        use crate::FunctionTimer;
+
+        let _timer = FunctionTimer::new("CPUProcessor::render_masks_from_protos");
+
+        if detect.is_empty() || proto_data.mask_coefficients.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let protos_cow = proto_data.protos.as_f32();
+        let protos = protos_cow.as_ref();
+        let proto_h = protos.shape()[0];
+        let proto_w = protos.shape()[1];
+        let num_protos = protos.shape()[2];
+
+        let mut results = Vec::with_capacity(detect.len());
+
+        for (det, coeff) in detect.iter().zip(proto_data.mask_coefficients.iter()) {
+            let start_x = (output_width as f32 * det.bbox.xmin).round() as usize;
+            let start_y = (output_height as f32 * det.bbox.ymin).round() as usize;
+            // Use span-based rounding to match the numpy reference convention.
+            let bbox_w = ((det.bbox.xmax - det.bbox.xmin) * output_width as f32)
+                .round()
+                .max(1.0) as usize;
+            let bbox_h = ((det.bbox.ymax - det.bbox.ymin) * output_height as f32)
+                .round()
+                .max(1.0) as usize;
+            let bbox_w = bbox_w.min(output_width.saturating_sub(start_x));
+            let bbox_h = bbox_h.min(output_height.saturating_sub(start_y));
+
+            let mut pixels = vec![0u8; bbox_w * bbox_h];
+
+            for row in 0..bbox_h {
+                let y = start_y + row;
+                for col in 0..bbox_w {
+                    let x = start_x + col;
+                    let px = (x as f32 / output_width as f32) * proto_w as f32 - 0.5;
+                    let py = (y as f32 / output_height as f32) * proto_h as f32 - 0.5;
+                    let acc = bilinear_dot(protos, coeff, num_protos, px, py, proto_w, proto_h);
+                    let mask = 1.0 / (1.0 + (-acc).exp());
+                    pixels[row * bbox_w + col] = if mask > 0.5 { 255 } else { 0 };
+                }
+            }
+
+            results.push(crate::MaskResult {
+                x: start_x,
+                y: start_y,
+                w: bbox_w,
+                h: bbox_h,
+                pixels,
+            });
+        }
+
+        Ok(results)
     }
 }
 
@@ -2160,8 +2218,7 @@ impl ImageProcessorTrait for CPUProcessor {
         Ok(())
     }
 
-    #[cfg(feature = "decoder")]
-    fn render_to_image(
+    fn draw_masks(
         &mut self,
         dst: &mut TensorImage,
         detect: &[DetectBox],
@@ -2173,7 +2230,7 @@ impl ImageProcessorTrait for CPUProcessor {
             ));
         }
 
-        let _timer = FunctionTimer::new("CPUProcessor::render_to_image");
+        let _timer = FunctionTimer::new("CPUProcessor::draw_masks");
 
         let mut map = dst.tensor.map()?;
         let dst_slice = map.as_mut_slice();
@@ -2184,9 +2241,11 @@ impl ImageProcessorTrait for CPUProcessor {
             return Ok(());
         }
 
-        let is_modelpack = segmentation[0].segmentation.shape()[2] > 1;
+        // Semantic segmentation (e.g. ModelPack) has C > 1 (multi-class),
+        // instance segmentation (e.g. YOLO) has C = 1 (binary per-instance).
+        let is_semantic = segmentation[0].segmentation.shape()[2] > 1;
 
-        if is_modelpack {
+        if is_semantic {
             self.render_modelpack_segmentation(dst, dst_slice, &segmentation[0])?;
         } else {
             for (seg, detect) in segmentation.iter().zip(detect) {
@@ -2197,8 +2256,7 @@ impl ImageProcessorTrait for CPUProcessor {
         Ok(())
     }
 
-    #[cfg(feature = "decoder")]
-    fn render_from_protos(
+    fn draw_masks_proto(
         &mut self,
         dst: &mut TensorImage,
         detect: &[DetectBox],
@@ -2210,7 +2268,7 @@ impl ImageProcessorTrait for CPUProcessor {
             ));
         }
 
-        let _timer = FunctionTimer::new("CPUProcessor::render_from_protos");
+        let _timer = FunctionTimer::new("CPUProcessor::draw_masks_proto");
 
         let mut map = dst.tensor.map()?;
         let dst_slice = map.as_mut_slice();
@@ -2270,70 +2328,74 @@ impl ImageProcessorTrait for CPUProcessor {
         Ok(())
     }
 
-    #[cfg(feature = "decoder")]
-    fn render_masks_from_protos(
+    fn decode_masks_atlas(
         &mut self,
         detect: &[crate::DetectBox],
         proto_data: crate::ProtoData,
         output_width: usize,
         output_height: usize,
-    ) -> Result<Vec<crate::MaskResult>> {
+    ) -> Result<(Vec<u8>, Vec<crate::MaskRegion>)> {
         use crate::FunctionTimer;
 
-        let _timer = FunctionTimer::new("CPUProcessor::render_masks_from_protos");
+        let _timer = FunctionTimer::new("CPUProcessor::decode_masks_atlas");
 
-        if detect.is_empty() || proto_data.mask_coefficients.is_empty() {
-            return Ok(Vec::new());
+        let padding = 4usize;
+
+        // Render per-detection masks via existing path
+        let mask_results =
+            self.render_masks_from_protos(detect, proto_data, output_width, output_height)?;
+
+        // Pack into compact atlas: each strip is padded bbox height
+        let ow = output_width as i32;
+        let oh = output_height as i32;
+        let pad = padding as i32;
+
+        let mut regions = Vec::with_capacity(mask_results.len());
+        let mut atlas_y = 0usize;
+
+        // Pre-compute regions
+        for mr in &mask_results {
+            let bx = mr.x as i32;
+            let by = mr.y as i32;
+            let bw = mr.w as i32;
+            let bh = mr.h as i32;
+            let padded_x = (bx - pad).max(0);
+            let padded_y = (by - pad).max(0);
+            let padded_w = ((bx + bw + pad).min(ow) - padded_x).max(1);
+            let padded_h = ((by + bh + pad).min(oh) - padded_y).max(1);
+            regions.push(crate::MaskRegion {
+                atlas_y_offset: atlas_y,
+                padded_x: padded_x as usize,
+                padded_y: padded_y as usize,
+                padded_w: padded_w as usize,
+                padded_h: padded_h as usize,
+                bbox_x: mr.x,
+                bbox_y: mr.y,
+                bbox_w: mr.w,
+                bbox_h: mr.h,
+            });
+            atlas_y += padded_h as usize;
         }
 
-        let protos_cow = proto_data.protos.as_f32();
-        let protos = protos_cow.as_ref();
-        let proto_h = protos.shape()[0];
-        let proto_w = protos.shape()[1];
-        let num_protos = protos.shape()[2];
+        let atlas_height = atlas_y;
+        let mut atlas = vec![0u8; output_width * atlas_height];
 
-        let mut results = Vec::with_capacity(detect.len());
-
-        for (det, coeff) in detect.iter().zip(proto_data.mask_coefficients.iter()) {
-            let start_x = (output_width as f32 * det.bbox.xmin).round() as usize;
-            let start_y = (output_height as f32 * det.bbox.ymin).round() as usize;
-            // Use span-based rounding to match the numpy reference convention.
-            let bbox_w = ((det.bbox.xmax - det.bbox.xmin) * output_width as f32)
-                .round()
-                .max(1.0) as usize;
-            let bbox_h = ((det.bbox.ymax - det.bbox.ymin) * output_height as f32)
-                .round()
-                .max(1.0) as usize;
-            let bbox_w = bbox_w.min(output_width.saturating_sub(start_x));
-            let bbox_h = bbox_h.min(output_height.saturating_sub(start_y));
-
-            let mut pixels = vec![0u8; bbox_w * bbox_h];
-
-            for row in 0..bbox_h {
-                let y = start_y + row;
-                for col in 0..bbox_w {
-                    let x = start_x + col;
-                    let px = (x as f32 / output_width as f32) * proto_w as f32 - 0.5;
-                    let py = (y as f32 / output_height as f32) * proto_h as f32 - 0.5;
-                    let acc = bilinear_dot(protos, coeff, num_protos, px, py, proto_w, proto_h);
-                    let mask = 1.0 / (1.0 + (-acc).exp());
-                    pixels[row * bbox_w + col] = (mask * 255.0).round() as u8;
+        for (mr, region) in mask_results.iter().zip(regions.iter()) {
+            // Copy mask pixels into the atlas at the correct position
+            for row in 0..mr.h {
+                let dst_row = region.atlas_y_offset + (mr.y - region.padded_y) + row;
+                let dst_start = dst_row * output_width + mr.x;
+                let src_start = row * mr.w;
+                if dst_start + mr.w <= atlas.len() && src_start + mr.w <= mr.pixels.len() {
+                    atlas[dst_start..dst_start + mr.w]
+                        .copy_from_slice(&mr.pixels[src_start..src_start + mr.w]);
                 }
             }
-
-            results.push(crate::MaskResult {
-                x: start_x,
-                y: start_y,
-                w: bbox_w,
-                h: bbox_h,
-                pixels,
-            });
         }
 
-        Ok(results)
+        Ok((atlas, regions))
     }
 
-    #[cfg(feature = "decoder")]
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<()> {
         for (c, new_c) in self.colors.iter_mut().zip(colors.iter()) {
             *c = *new_c;
@@ -2347,7 +2409,6 @@ impl ImageProcessorTrait for CPUProcessor {
 ///
 /// Samples the four nearest proto texels, weights by bilinear coefficients,
 /// and simultaneously computes the dot product with the mask coefficients.
-#[cfg(feature = "decoder")]
 #[inline]
 fn bilinear_dot(
     protos: &ndarray::Array3<f32>,
@@ -3159,7 +3220,6 @@ mod cpu_tests {
     }
 
     #[test]
-    #[cfg(feature = "decoder")]
     fn test_segmentation() {
         use edgefirst_decoder::Segmentation;
         use ndarray::Array3;
@@ -3189,13 +3249,12 @@ mod cpu_tests {
         };
 
         let mut renderer = CPUProcessor::new();
-        renderer.render_to_image(&mut image, &[], &[seg]).unwrap();
+        renderer.draw_masks(&mut image, &[], &[seg]).unwrap();
 
         image.save_jpeg("test_segmentation.jpg", 80).unwrap();
     }
 
     #[test]
-    #[cfg(feature = "decoder")]
     fn test_segmentation_yolo() {
         use edgefirst_decoder::Segmentation;
         use ndarray::Array3;
@@ -3232,9 +3291,7 @@ mod cpu_tests {
             .set_class_colors(&[[255, 255, 0, 233], [128, 128, 255, 100]])
             .unwrap();
         assert_eq!(renderer.colors[1], [128, 128, 255, 100]);
-        renderer
-            .render_to_image(&mut image, &[detect], &[seg])
-            .unwrap();
+        renderer.draw_masks(&mut image, &[detect], &[seg]).unwrap();
         let expected = TensorImage::load(
             include_bytes!("../../../testdata/output_render_cpu.jpg"),
             Some(RGBA),

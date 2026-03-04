@@ -38,7 +38,16 @@ A tuple containing:
 - boxes: A NumPy array of shape (N, 4) containing the bounding boxes in (x1, y1, x2, y2) format.
 - scores: A NumPy array of shape (N,) containing the confidence scores for each bounding box.
 - class_ids: A NumPy array of shape (N,) containing the class IDs for each bounding box.
-- masks: A list of NumPy arrays, each of shape (H, W, ...) containing detected segmentation mask.
+- masks: A list of NumPy arrays containing per-detection segmentation masks.
+  The exact shape depends on the method:
+
+  - ``decode()``: shape ``(H, W, C)`` at prototype resolution. For instance
+    segmentation models (e.g. YOLO) ``C=1`` — a binary per-instance mask
+    (threshold at 128). For semantic segmentation models (e.g. ModelPack)
+    ``C=num_classes`` — per-pixel class scores (use ``argmax`` over ``C``
+    to get the class index).
+  - ``decode_masks()``: shape ``(H, W)`` at the requested output resolution.
+    Binary ``uint8`` where 255 = mask presence.
 """
 
 class DecoderType(enum.Enum):
@@ -378,10 +387,17 @@ class Decoder:
 
         The accepted floating point types are `np.float16`, `np.float32` and `np.float64`. All outputs must be
         the same floating point type.
+
+        Masks are returned at prototype resolution as 3D arrays of shape
+        ``(H, W, C)``. For instance segmentation models (e.g. YOLO) ``C=1``
+        — a binary per-instance mask (threshold at 128). For semantic
+        segmentation models (e.g. ModelPack) ``C=num_classes`` — per-pixel
+        class scores (use ``argmax`` over the last axis). Use
+        ``decode_masks()`` to get upsampled 2D binary masks.
         """
         ...
 
-    def decode_and_render(
+    def draw_masks(
         self,
         model_output: List[np.ndarray],
         processor: ImageProcessor,
@@ -389,26 +405,26 @@ class Decoder:
         max_boxes: int = 100,
     ) -> DetectionOutput:
         """
-        Decode model outputs and render results directly onto the destination
+        Decode model outputs and draw masks directly onto the destination
         image in a single call. Masks never leave Rust, eliminating the
-        Python round-trip overhead of ``decode()`` + ``render_to_image()``.
+        Python round-trip overhead of ``decode()`` + ``draw_masks()``.
 
         For segmentation models, prototype data is passed directly to the
         renderer without materializing intermediate mask arrays in Python.
-        For detection-only models, this falls back to the standard rendering
+        For detection-only models, this falls back to the standard drawing
         path.
 
         Returns ``(boxes, scores, classes)`` — no mask arrays are returned.
 
         Args:
             model_output: List of model output tensors (same types as ``decode``).
-            processor: ImageProcessor instance for rendering.
-            dst: Destination TensorImage to render onto.
+            processor: ImageProcessor instance for drawing.
+            dst: Destination TensorImage to draw onto.
             max_boxes: Maximum number of detections to return (default: 100).
         """
         ...
 
-    def decode_and_render_masks(
+    def decode_masks(
         self,
         model_output: List[np.ndarray],
         processor: ImageProcessor,
@@ -417,22 +433,24 @@ class Decoder:
         max_boxes: int = 100,
     ) -> SegDetOutput:
         """
-        Decode model outputs and render per-instance grayscale masks at full
-        output resolution in a single fused call.
+        Decode model outputs and return per-detection masks at the specified
+        output resolution.
 
-        For segmentation models, prototype data is rendered on the GPU at the
-        specified output resolution using ``sigmoid(mask_coeff @ protos)``
-        without thresholding. Each mask covers only its bounding-box region,
-        returned as a uint8 array shaped ``(H, W, 1)`` with values 0–255.
-
-        For detection-only models, returns an empty mask list.
+        Internally uses GPU atlas rendering when available, then splits the
+        atlas into individual per-detection mask arrays. Each mask is a binary
+        ``uint8`` array of shape ``(H, W)`` covering the detection's bounding
+        box region, where 255 indicates mask presence.
 
         Args:
             model_output: List of model output tensors (same types as ``decode``).
-            processor: ImageProcessor instance for GPU mask rendering.
-            output_width: Width of the full output resolution (default: 640).
-            output_height: Height of the full output resolution (default: 640).
+            processor: ImageProcessor instance for GPU-accelerated mask rendering.
+            output_width: Width of the mask output resolution (default: 640).
+            output_height: Height of the mask output resolution (default: 640).
             max_boxes: Maximum number of detections to return (default: 100).
+
+        Returns:
+            ``(boxes, scores, classes, masks)`` where masks is a list of
+            ``ndarray[H, W]`` of ``uint8`` — one per detection.
         """
         ...
 
@@ -1079,7 +1097,7 @@ class ImageProcessor:
                 available displays. Ignored if EDGEFIRST_DISABLE_GL=1.
         """
         ...
-    def render_to_image(
+    def draw_masks(
         self,
         dst: TensorImage,
         bbox: npt.NDArray[np.float32],
@@ -1088,9 +1106,9 @@ class ImageProcessor:
         seg: List[npt.NDArray[np.uint8]] = [],
     ) -> None:
         """
-        Render detection and segmentation results onto the destination image.
+        Draw detection and segmentation masks onto the destination image.
         The `bbox`, `scores`, and `classes` parameters should correspond to the decoded outputs of a detection model.
-        The optional `seg` parameter can be used to provide segmentation masks to render.
+        The optional `seg` parameter can be used to provide segmentation masks to draw.
         """
         ...
 

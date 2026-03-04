@@ -55,7 +55,6 @@ and hardware acceleration. However, this will increase the performance of the CP
 */
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
-#[cfg(feature = "decoder")]
 use edgefirst_decoder::{DetectBox, ProtoData, Segmentation};
 use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait as _};
 use enum_dispatch::enum_dispatch;
@@ -76,7 +75,6 @@ pub use g2d::G2DProcessor;
 pub use opengl_headless::GLProcessorThreaded;
 #[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
-#[cfg(feature = "decoder")]
 pub use opengl_headless::Int8InterpolationMode;
 #[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
@@ -86,19 +84,46 @@ pub use opengl_headless::{probe_egl_displays, EglDisplayInfo, EglDisplayKind};
 ///
 /// Contains the bounding-box region in output image coordinates and the
 /// raw uint8 pixel data (RED channel only, 0–255 representing sigmoid output).
-#[cfg(feature = "decoder")]
 #[derive(Debug, Clone)]
-pub struct MaskResult {
+pub(crate) struct MaskResult {
     /// X offset of the bbox region in the output image.
-    pub x: usize,
+    pub(crate) x: usize,
     /// Y offset of the bbox region in the output image.
-    pub y: usize,
+    pub(crate) y: usize,
     /// Width of the bbox region.
-    pub w: usize,
+    pub(crate) w: usize,
     /// Height of the bbox region.
-    pub h: usize,
+    pub(crate) h: usize,
     /// Grayscale pixel data (w * h bytes, row-major).
-    pub pixels: Vec<u8>,
+    pub(crate) pixels: Vec<u8>,
+}
+
+/// Region metadata for a single detection within a compact mask atlas.
+///
+/// The atlas packs padded bounding-box strips vertically.  This struct
+/// records where each detection's strip lives in the atlas and how it
+/// maps back to the original output coordinate space.
+#[must_use]
+#[derive(Debug, Clone, Copy)]
+pub struct MaskRegion {
+    /// Row offset of this detection's strip in the atlas.
+    pub atlas_y_offset: usize,
+    /// Left edge of the padded bbox in output image coordinates.
+    pub padded_x: usize,
+    /// Top edge of the padded bbox in output image coordinates.
+    pub padded_y: usize,
+    /// Width of the padded bbox.
+    pub padded_w: usize,
+    /// Height of the padded bbox (= number of atlas rows for this strip).
+    pub padded_h: usize,
+    /// Original (unpadded) bbox left edge in output image coordinates.
+    pub bbox_x: usize,
+    /// Original (unpadded) bbox top edge in output image coordinates.
+    pub bbox_y: usize,
+    /// Original (unpadded) bbox width.
+    pub bbox_w: usize,
+    /// Original (unpadded) bbox height.
+    pub bbox_h: usize,
 }
 
 mod cpu;
@@ -1231,48 +1256,41 @@ pub trait ImageProcessorTrait {
         crop: Crop,
     ) -> Result<()>;
 
-    #[cfg(feature = "decoder")]
-    fn render_to_image(
+    /// Draw pre-decoded masks onto image.
+    fn draw_masks(
         &mut self,
         dst: &mut TensorImage,
         detect: &[DetectBox],
         segmentation: &[Segmentation],
     ) -> Result<()>;
 
-    #[cfg(feature = "decoder")]
-    /// Renders detection boxes and segmentation masks from raw prototype data.
+    /// Draw masks from proto data onto image (fused decode+draw).
     ///
     /// For YOLO segmentation models, this avoids materializing intermediate
     /// `Array3<u8>` masks. The `ProtoData` contains mask coefficients and the
     /// prototype tensor; the renderer computes `mask_coeff @ protos` directly.
-    ///
-    /// Phase 1 implementation materializes masks internally and delegates to
-    /// existing render paths. Phase 2 will compute masks in the GPU shader.
-    fn render_from_protos(
+    fn draw_masks_proto(
         &mut self,
         dst: &mut TensorImage,
         detect: &[DetectBox],
         proto_data: &ProtoData,
     ) -> Result<()>;
 
-    #[cfg(feature = "decoder")]
-    /// Renders per-instance grayscale masks from raw prototype data at full
-    /// output resolution.
+    /// Decode masks to atlas buffer (internal, used by decode_masks).
     ///
-    /// Each mask is rendered at the detection's bounding-box region using
-    /// `sigmoid(mask_coeff @ protos)` without thresholding, producing
-    /// continuous [0,255] values suitable for soft IoU computation.
+    /// The atlas is a compact vertical strip where each detection occupies a
+    /// strip sized to its padded bounding box (not the full output resolution).
     ///
-    /// Returns one [`MaskResult`] per detection with the bbox-cropped pixels.
-    fn render_masks_from_protos(
+    /// Returns `(atlas_pixels, regions)` where `regions` describes each
+    /// detection's location and bbox within the atlas.
+    fn decode_masks_atlas(
         &mut self,
         detect: &[DetectBox],
         proto_data: ProtoData,
         output_width: usize,
         output_height: usize,
-    ) -> Result<Vec<MaskResult>>;
+    ) -> Result<(Vec<u8>, Vec<MaskRegion>)>;
 
-    #[cfg(feature = "decoder")]
     /// Sets the colors used for rendering segmentation masks. Up to 17 colors
     /// can be set.
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<()>;
@@ -1406,7 +1424,6 @@ impl ImageProcessor {
     /// backend. No-op if OpenGL is not available.
     #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
-    #[cfg(feature = "decoder")]
     pub fn set_int8_interpolation_mode(&mut self, mode: Int8InterpolationMode) -> Result<()> {
         if let Some(ref mut gl) = self.opengl {
             gl.set_int8_interpolation_mode(mode)?;
@@ -1599,8 +1616,7 @@ impl ImageProcessorTrait for ImageProcessor {
         Err(Error::NoConverter)
     }
 
-    #[cfg(feature = "decoder")]
-    fn render_to_image(
+    fn draw_masks(
         &mut self,
         dst: &mut TensorImage,
         detect: &[DetectBox],
@@ -1617,26 +1633,26 @@ impl ImageProcessorTrait for ImageProcessor {
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
         if let Some(opengl) = self.opengl.as_mut() {
-            log::trace!("image started with opengl in {:?}", start.elapsed());
-            match opengl.render_to_image(dst, detect, segmentation) {
+            log::trace!("draw_masks started with opengl in {:?}", start.elapsed());
+            match opengl.draw_masks(dst, detect, segmentation) {
                 Ok(_) => {
-                    log::trace!("image rendered with opengl in {:?}", start.elapsed());
+                    log::trace!("draw_masks with opengl in {:?}", start.elapsed());
                     return Ok(());
                 }
                 Err(e) => {
-                    log::trace!("image didn't render with opengl: {e:?}")
+                    log::trace!("draw_masks didn't work with opengl: {e:?}")
                 }
             }
         }
-        log::trace!("image started with cpu in {:?}", start.elapsed());
+        log::trace!("draw_masks started with cpu in {:?}", start.elapsed());
         if let Some(cpu) = self.cpu.as_mut() {
-            match cpu.render_to_image(dst, detect, segmentation) {
+            match cpu.draw_masks(dst, detect, segmentation) {
                 Ok(_) => {
-                    log::trace!("image render with cpu in {:?}", start.elapsed());
+                    log::trace!("draw_masks with cpu in {:?}", start.elapsed());
                     return Ok(());
                 }
                 Err(e) => {
-                    log::trace!("image didn't render with cpu: {e:?}");
+                    log::trace!("draw_masks didn't work with cpu: {e:?}");
                     return Err(e);
                 }
             }
@@ -1644,8 +1660,7 @@ impl ImageProcessorTrait for ImageProcessor {
         Err(Error::NoConverter)
     }
 
-    #[cfg(feature = "decoder")]
-    fn render_from_protos(
+    fn draw_masks_proto(
         &mut self,
         dst: &mut TensorImage,
         detect: &[DetectBox],
@@ -1663,31 +1678,28 @@ impl ImageProcessorTrait for ImageProcessor {
         #[cfg(feature = "opengl")]
         if let Some(opengl) = self.opengl.as_mut() {
             log::trace!(
-                "render_from_protos started with opengl in {:?}",
+                "draw_masks_proto started with opengl in {:?}",
                 start.elapsed()
             );
-            match opengl.render_from_protos(dst, detect, proto_data) {
+            match opengl.draw_masks_proto(dst, detect, proto_data) {
                 Ok(_) => {
-                    log::trace!("render_from_protos with opengl in {:?}", start.elapsed());
+                    log::trace!("draw_masks_proto with opengl in {:?}", start.elapsed());
                     return Ok(());
                 }
                 Err(e) => {
-                    log::trace!("render_from_protos didn't work with opengl: {e:?}")
+                    log::trace!("draw_masks_proto didn't work with opengl: {e:?}")
                 }
             }
         }
-        log::trace!(
-            "render_from_protos started with cpu in {:?}",
-            start.elapsed()
-        );
+        log::trace!("draw_masks_proto started with cpu in {:?}", start.elapsed());
         if let Some(cpu) = self.cpu.as_mut() {
-            match cpu.render_from_protos(dst, detect, proto_data) {
+            match cpu.draw_masks_proto(dst, detect, proto_data) {
                 Ok(_) => {
-                    log::trace!("render_from_protos with cpu in {:?}", start.elapsed());
+                    log::trace!("draw_masks_proto with cpu in {:?}", start.elapsed());
                     return Ok(());
                 }
                 Err(e) => {
-                    log::trace!("render_from_protos didn't work with cpu: {e:?}");
+                    log::trace!("draw_masks_proto didn't work with cpu: {e:?}");
                     return Err(e);
                 }
             }
@@ -1695,7 +1707,6 @@ impl ImageProcessorTrait for ImageProcessor {
         Err(Error::NoConverter)
     }
 
-    #[cfg(feature = "decoder")]
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<()> {
         let start = Instant::now();
 
@@ -1731,46 +1742,35 @@ impl ImageProcessorTrait for ImageProcessor {
         Err(Error::NoConverter)
     }
 
-    #[cfg(feature = "decoder")]
-    fn render_masks_from_protos(
+    fn decode_masks_atlas(
         &mut self,
         detect: &[DetectBox],
         proto_data: ProtoData,
         output_width: usize,
         output_height: usize,
-    ) -> Result<Vec<MaskResult>> {
+    ) -> Result<(Vec<u8>, Vec<MaskRegion>)> {
         if detect.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
 
-        // OpenGL path takes ownership; CPU fallback uses reference.
-        // Try OpenGL first — if it fails, fall through to CPU with the
-        // original data (OpenGL failure returns proto_data via Err).
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
         {
             let has_opengl = self.opengl.is_some();
             if has_opengl {
                 let opengl = self.opengl.as_mut().unwrap();
-                match opengl.render_masks_from_protos(
-                    detect,
-                    proto_data,
-                    output_width,
-                    output_height,
-                ) {
+                match opengl.decode_masks_atlas(detect, proto_data, output_width, output_height) {
                     Ok(r) => return Ok(r),
                     Err(e) => {
-                        log::trace!("render_masks_from_protos didn't work with opengl: {e:?}");
-                        // proto_data was moved into the GL thread — must use
-                        // CPU path with fresh data, but since OpenGL rarely
-                        // fails at this point, this is acceptable.
+                        log::trace!("decode_masks_atlas didn't work with opengl: {e:?}");
                         return Err(e);
                     }
                 }
             }
         }
+        // CPU fallback: render per-detection masks and pack into compact atlas
         if let Some(cpu) = self.cpu.as_mut() {
-            return cpu.render_masks_from_protos(detect, proto_data, output_width, output_height);
+            return cpu.decode_masks_atlas(detect, proto_data, output_width, output_height);
         }
         Err(Error::NoConverter)
     }
@@ -1855,7 +1855,6 @@ impl<T: Display> Drop for FunctionTimer<T> {
     }
 }
 
-#[cfg(feature = "decoder")]
 const DEFAULT_COLORS: [[f32; 4]; 20] = [
     [0., 1., 0., 0.7],
     [1., 0.5568628, 0., 0.7],
@@ -1879,7 +1878,6 @@ const DEFAULT_COLORS: [[f32; 4]; 20] = [
     [1., 1., 1., 0.7],
 ];
 
-#[cfg(feature = "decoder")]
 const fn denorm<const M: usize, const N: usize>(a: [[f32; M]; N]) -> [[u8; M]; N] {
     let mut result = [[0; M]; N];
     let mut i = 0;
@@ -1894,7 +1892,6 @@ const fn denorm<const M: usize, const N: usize>(a: [[f32; M]; N]) -> [[u8; M]; N
     result
 }
 
-#[cfg(feature = "decoder")]
 const DEFAULT_COLORS_U8: [[u8; 4]; 20] = denorm(DEFAULT_COLORS);
 
 #[cfg(test)]
@@ -2466,6 +2463,7 @@ mod image_tests {
     }
 
     #[test]
+    #[ignore] // Vivante GPU hangs with concurrent EGL contexts on i.MX8MP
     #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
     fn test_opengl_10_threads() {

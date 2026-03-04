@@ -1030,6 +1030,61 @@ const uint8_t *hal_segmentation_list_get_mask(const struct hal_segmentation_list
 void hal_segmentation_list_free(struct hal_segmentation_list *list);
 
 /**
+ * Decode model outputs and draw masks directly onto a destination image.
+ *
+ * This is the fused path: for segmentation models, prototype data is passed
+ * directly to the renderer without materializing intermediate mask arrays.
+ * For detection-only models, this falls back to decode + draw_masks.
+ *
+ * @param decoder Decoder handle
+ * @param processor Image processor handle
+ * @param outputs Array of output tensor pointers
+ * @param num_outputs Number of output tensors
+ * @param dst Destination image to draw onto
+ * @param out_boxes Output parameter for detection box list (caller must free)
+ * @return 0 on success, -1 on error
+ * @par Errors (errno):
+ * - EINVAL: Invalid argument (NULL decoder/processor/outputs/dst/out_boxes)
+ * - EIO: Decoding or drawing failed
+ */
+int hal_decoder_draw_masks(const struct hal_decoder *decoder,
+                           struct hal_image_processor *processor,
+                           const struct hal_tensor *const *outputs,
+                           size_t num_outputs,
+                           struct hal_tensor_image *dst,
+                           struct hal_detect_box_list **out_boxes);
+
+/**
+ * Decode model outputs and return masks at a specified output resolution.
+ *
+ * Internally renders masks into a compact atlas and splits them into
+ * individual per-detection segmentation results. The returned
+ * `out_masks` is a segmentation list where each entry contains a
+ * binary mask cropped to the detection's bounding box.
+ *
+ * @param decoder Decoder handle
+ * @param processor Image processor handle
+ * @param outputs Array of output tensor pointers
+ * @param num_outputs Number of output tensors
+ * @param output_width Target mask width
+ * @param output_height Target mask height
+ * @param out_boxes Output parameter for detection box list (caller must free)
+ * @param out_masks Output parameter for segmentation list (caller must free)
+ * @return 0 on success, -1 on error
+ * @par Errors (errno):
+ * - EINVAL: Invalid argument (NULL decoder/processor/outputs/out_boxes/out_masks)
+ * - EIO: Decoding failed
+ */
+int hal_decoder_decode_masks(const struct hal_decoder *decoder,
+                             struct hal_image_processor *processor,
+                             const struct hal_tensor *const *outputs,
+                             size_t num_outputs,
+                             size_t output_width,
+                             size_t output_height,
+                             struct hal_detect_box_list **out_boxes,
+                             struct hal_segmentation_list **out_masks);
+
+/**
  * Create a new rectangle.
  *
  * @param left Left edge (x coordinate)
@@ -1381,31 +1436,31 @@ int hal_image_processor_convert_ref(struct hal_image_processor *processor,
                                     const struct hal_crop *crop);
 
 /**
- * Render detection boxes and segmentation masks onto an image.
+ * Draw detection boxes and segmentation masks onto an image.
  *
  * Draws bounding boxes (with labels) and segmentation overlays on the
  * destination image. Uses hardware acceleration (OpenGL) when available,
  * falling back to CPU rendering.
  *
  * @param processor Image processor handle
- * @param dst Destination image to render onto
+ * @param dst Destination image to draw onto
  * @param detections Detection box list (can be NULL for segmentation-only)
  * @param segmentations Segmentation list (can be NULL for detection-only)
  * @return 0 on success, -1 on error
  * @par Errors (errno):
  * - EINVAL: Invalid argument (NULL processor or dst)
- * - EIO: Rendering failed
+ * - EIO: Drawing failed
  */
-int hal_image_processor_render_to_image(struct hal_image_processor *processor,
-                                        struct hal_tensor_image *dst,
-                                        const struct hal_detect_box_list *detections,
-                                        const struct hal_segmentation_list *segmentations);
+int hal_image_processor_draw_masks(struct hal_image_processor *processor,
+                                   struct hal_tensor_image *dst,
+                                   const struct hal_detect_box_list *detections,
+                                   const struct hal_segmentation_list *segmentations);
 
 /**
  * Set class colors for segmentation rendering.
  *
- * Colors are used when rendering segmentation masks via
- * hal_image_processor_render_to_image(). Each color is an RGBA tuple.
+ * Colors are used when drawing segmentation masks via
+ * hal_image_processor_draw_masks(). Each color is an RGBA tuple.
  *
  * @param processor Image processor handle
  * @param colors Pointer to array of RGBA color tuples ([u8; 4] per color)
