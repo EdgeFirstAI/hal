@@ -974,17 +974,22 @@ impl PyDecoder {
         Ok((boxes, scores, classes))
     }
 
-    /// Decode model outputs and return per-detection masks at the specified
-    /// output resolution.
+    /// Decode model outputs and return per-detection binary masks.
     ///
-    /// Internally uses GPU atlas rendering when available, then splits the
-    /// atlas into individual per-detection mask arrays.
+    /// Internally uses GPU atlas rendering when available (OpenGL), then splits
+    /// the atlas into individual per-detection mask arrays. Each mask is a
+    /// binary `u8` array of shape `(bbox_h, bbox_w)` — `255` = mask presence,
+    /// `0` = background.
+    ///
+    /// `output_width` and `output_height` define the coordinate space for
+    /// bounding box interpretation, not the per-mask dimensions. Each returned
+    /// mask is sized to its detection's bounding box.
     ///
     /// Returns `(boxes, scores, classes, masks)` where:
     /// - `boxes`: `ndarray[N, 4]` of `f32` bounding boxes
     /// - `scores`: `ndarray[N]` of `f32` confidence scores
     /// - `classes`: `ndarray[N]` of `uintp` class indices
-    /// - `masks`: list of `ndarray[H, W]` of `u8` — one per detection
+    /// - `masks`: list of `ndarray[bbox_h, bbox_w]` of `u8` — one per detection
     #[pyo3(signature = (model_output, processor, output_width=640, output_height=640, max_boxes=100))]
     pub fn decode_masks<'py>(
         self_: PyRef<'py, Self>,

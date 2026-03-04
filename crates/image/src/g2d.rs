@@ -5,7 +5,7 @@
 
 use crate::{
     CPUProcessor, Crop, Error, Flip, ImageProcessorTrait, Result, Rotation, TensorImage,
-    TensorImageRef, NV12, RGB, RGBA, YUYV,
+    TensorImageRef, BGRA, NV12, RGB, RGBA, YUYV,
 };
 use edgefirst_tensor::Tensor;
 use g2d_sys::{G2DFormat, G2DPhysical, G2DSurface, G2D};
@@ -152,6 +152,10 @@ impl ImageProcessorTrait for G2DProcessor {
             (NV12, RGBA) => {}
             (NV12, YUYV) => {}
             (NV12, RGB) => {}
+            (RGBA, BGRA) => {}
+            (YUYV, BGRA) => {}
+            (NV12, BGRA) => {}
+            (BGRA, BGRA) => {}
             (s, d) => {
                 return Err(Error::NotSupported(format!(
                     "G2D does not support {} to {} conversion",
@@ -307,8 +311,8 @@ impl TryFrom<&mut TensorImage> for G2DSurface {
 mod g2d_tests {
     use super::*;
     use crate::{
-        CPUProcessor, Flip, G2DProcessor, ImageProcessorTrait, Rect, Rotation, TensorImage, GREY,
-        NV12, RGB, RGBA, YUYV,
+        CPUProcessor, Flip, G2DProcessor, ImageProcessorTrait, Rect, Rotation, TensorImage, BGRA,
+        GREY, NV12, RGB, RGBA, YUYV,
     };
     use edgefirst_tensor::{is_dma_available, TensorMapTrait, TensorMemory, TensorTrait};
     use four_char_code::FourCharCode;
@@ -796,5 +800,112 @@ mod g2d_tests {
             .copy_from_slice(dst.tensor().map()?.as_slice());
 
         compare_images(&reference, &cpu_dst, 0.98, "g2d_yuyv_to_rgb_reference")
+    }
+
+    /// Test G2D native BGRA conversion for all supported source formats.
+    /// Compares G2D src→BGRA against G2D src→RGBA by verifying R↔B swap.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_g2d_bgra_no_resize() {
+        for src_fmt in [RGBA, YUYV, NV12, BGRA] {
+            test_g2d_bgra_no_resize_(src_fmt).unwrap_or_else(|e| {
+                panic!("{} to BGRA failed: {e:?}", src_fmt.display());
+            });
+        }
+    }
+
+    fn test_g2d_bgra_no_resize_(g2d_in_fmt: FourCharCode) -> Result<(), crate::Error> {
+        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let src = TensorImage::load_jpeg(&file, Some(RGB), None)?;
+
+        // Create DMA buffer for G2D input
+        let mut src2 = TensorImage::new(1280, 720, g2d_in_fmt, Some(TensorMemory::Dma))?;
+        let mut cpu_converter = CPUProcessor::new();
+
+        if g2d_in_fmt == NV12 {
+            let nv12_bytes = include_bytes!("../../../testdata/zidane.nv12");
+            src2.tensor()
+                .map()?
+                .as_mut_slice()
+                .copy_from_slice(nv12_bytes);
+        } else {
+            cpu_converter.convert(&src, &mut src2, Rotation::None, Flip::None, Crop::no_crop())?;
+        }
+
+        let mut g2d = G2DProcessor::new()?;
+
+        // Convert to BGRA via G2D
+        let mut bgra_dst = TensorImage::new(1280, 720, BGRA, Some(TensorMemory::Dma))?;
+        g2d.convert_(
+            &src2,
+            &mut bgra_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )?;
+
+        // Convert to RGBA via G2D as reference
+        let mut rgba_dst = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma))?;
+        g2d.convert_(
+            &src2,
+            &mut rgba_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )?;
+
+        // Copy both to CPU memory for comparison
+        let bgra_cpu = TensorImage::new(1280, 720, BGRA, None)?;
+        bgra_cpu
+            .tensor()
+            .map()?
+            .as_mut_slice()
+            .copy_from_slice(bgra_dst.tensor().map()?.as_slice());
+
+        let rgba_cpu = TensorImage::new(1280, 720, RGBA, None)?;
+        rgba_cpu
+            .tensor()
+            .map()?
+            .as_mut_slice()
+            .copy_from_slice(rgba_dst.tensor().map()?.as_slice());
+
+        // Verify BGRA output has R↔B swapped vs RGBA output
+        let bgra_map = bgra_cpu.tensor().map()?;
+        let rgba_map = rgba_cpu.tensor().map()?;
+        let bgra_buf = bgra_map.as_slice();
+        let rgba_buf = rgba_map.as_slice();
+
+        assert_eq!(bgra_buf.len(), rgba_buf.len());
+        for (i, (bc, rc)) in bgra_buf
+            .chunks_exact(4)
+            .zip(rgba_buf.chunks_exact(4))
+            .enumerate()
+        {
+            assert_eq!(
+                bc[0],
+                rc[2],
+                "{} to BGRA: pixel {i} B mismatch",
+                g2d_in_fmt.display()
+            );
+            assert_eq!(
+                bc[1],
+                rc[1],
+                "{} to BGRA: pixel {i} G mismatch",
+                g2d_in_fmt.display()
+            );
+            assert_eq!(
+                bc[2],
+                rc[0],
+                "{} to BGRA: pixel {i} R mismatch",
+                g2d_in_fmt.display()
+            );
+            assert_eq!(
+                bc[3],
+                rc[3],
+                "{} to BGRA: pixel {i} A mismatch",
+                g2d_in_fmt.display()
+            );
+        }
+        Ok(())
     }
 }
