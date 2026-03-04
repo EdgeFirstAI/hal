@@ -4,7 +4,7 @@
 //! Shared utilities for image processing benchmarks.
 #![allow(dead_code, unused_imports)]
 
-use edgefirst_image::{NV12, PLANAR_RGB, PLANAR_RGB_INT8, RGB, RGBA, RGB_INT8, YUYV};
+use edgefirst_image::{NV12, PLANAR_RGB, PLANAR_RGB_INT8, RGB, RGBA, RGB_INT8, VYUY, YUYV};
 use four_char_code::FourCharCode;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -90,6 +90,8 @@ pub fn find_testdata_path(filename: &str) -> std::path::PathBuf {
 pub fn format_name(f: FourCharCode) -> &'static str {
     if f == YUYV {
         "YUYV"
+    } else if f == VYUY {
+        "VYUY"
     } else if f == NV12 {
         "NV12"
     } else if f == RGB {
@@ -199,7 +201,7 @@ impl BenchConfig {
     /// Calculate throughput in bytes based on input size.
     pub fn throughput(&self) -> u64 {
         let bytes = match self.in_fmt {
-            f if f == YUYV => self.in_w * self.in_h * 2,
+            f if f == YUYV || f == VYUY => self.in_w * self.in_h * 2,
             f if f == NV12 => self.in_w * self.in_h * 3 / 2,
             f if f == RGB || f == RGB_INT8 || f == PLANAR_RGB || f == PLANAR_RGB_INT8 => {
                 self.in_w * self.in_h * 3
@@ -218,7 +220,9 @@ impl BenchConfig {
 pub const CAMERA_1080P_YUYV: &[u8] = include_bytes!("../../../testdata/camera1080p.yuyv");
 pub const CAMERA_1080P_NV12: &[u8] = include_bytes!("../../../testdata/camera1080p.nv12");
 pub const CAMERA_1080P_RGB: &[u8] = include_bytes!("../../../testdata/camera1080p.rgb");
+pub const CAMERA_1080P_VYUY: &[u8] = include_bytes!("../../../testdata/camera1080p.vyuy");
 pub const CAMERA_4K_YUYV: &[u8] = include_bytes!("../../../testdata/camera4k.yuyv");
+pub const CAMERA_4K_VYUY: &[u8] = include_bytes!("../../../testdata/camera4k.vyuy");
 pub const CAMERA_4K_NV12: &[u8] = include_bytes!("../../../testdata/camera4k.nv12");
 pub const CAMERA_4K_RGB: &[u8] = include_bytes!("../../../testdata/camera4k.rgb");
 
@@ -226,9 +230,11 @@ pub const CAMERA_4K_RGB: &[u8] = include_bytes!("../../../testdata/camera4k.rgb"
 pub fn get_test_data(width: usize, height: usize, format: FourCharCode) -> &'static [u8] {
     match (width, height, format) {
         (1920, 1080, f) if f == YUYV => CAMERA_1080P_YUYV,
+        (1920, 1080, f) if f == VYUY => CAMERA_1080P_VYUY,
         (1920, 1080, f) if f == NV12 => CAMERA_1080P_NV12,
         (1920, 1080, f) if f == RGB => CAMERA_1080P_RGB,
         (3840, 2160, f) if f == YUYV => CAMERA_4K_YUYV,
+        (3840, 2160, f) if f == VYUY => CAMERA_4K_VYUY,
         (3840, 2160, f) if f == NV12 => CAMERA_4K_NV12,
         (3840, 2160, f) if f == RGB => CAMERA_4K_RGB,
         _ => panic!("No test data for {}x{} {:?}", width, height, format),

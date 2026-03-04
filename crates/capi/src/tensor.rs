@@ -69,6 +69,8 @@ pub enum HalTensorMemory {
     Dma = 1,
     /// POSIX Shared Memory allocation (Linux only, for IPC)
     Shm = 2,
+    /// GPU Pixel Buffer Object allocation (zero-copy GPU upload/readback)
+    Pbo = 3,
 }
 
 impl From<HalTensorMemory> for Option<TensorMemory> {
@@ -79,6 +81,7 @@ impl From<HalTensorMemory> for Option<TensorMemory> {
             HalTensorMemory::Dma => Some(TensorMemory::Dma),
             #[cfg(target_os = "linux")]
             HalTensorMemory::Shm => Some(TensorMemory::Shm),
+            HalTensorMemory::Pbo => Some(TensorMemory::Pbo),
             #[cfg(not(target_os = "linux"))]
             _ => Some(TensorMemory::Mem),
         }
@@ -93,6 +96,7 @@ impl From<TensorMemory> for HalTensorMemory {
             TensorMemory::Dma => HalTensorMemory::Dma,
             #[cfg(unix)]
             TensorMemory::Shm => HalTensorMemory::Shm,
+            TensorMemory::Pbo => HalTensorMemory::Pbo,
         }
     }
 }

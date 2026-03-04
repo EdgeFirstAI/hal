@@ -1173,7 +1173,8 @@ impl PyDecoder {
                     nms,
                     &mut output_boxes,
                     &mut output_masks,
-                );
+                )
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))?;
             }
             (ReadOnlyArrayGeneric2::Int8(boxes), ReadOnlyArrayGeneric3::Int8(protos)) => {
                 edgefirst_hal::decoder::yolo::decode_yolo_segdet_quant(
@@ -1184,7 +1185,8 @@ impl PyDecoder {
                     nms,
                     &mut output_boxes,
                     &mut output_masks,
-                );
+                )
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))?;
             }
             (ReadOnlyArrayGeneric2::Float32(boxes), ReadOnlyArrayGeneric3::Float32(protos)) => {
                 edgefirst_hal::decoder::yolo::decode_yolo_segdet_float(
@@ -1195,7 +1197,8 @@ impl PyDecoder {
                     nms,
                     &mut output_boxes,
                     &mut output_masks,
-                );
+                )
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))?;
             }
             (ReadOnlyArrayGeneric2::Float64(boxes), ReadOnlyArrayGeneric3::Float64(protos)) => {
                 edgefirst_hal::decoder::yolo::decode_yolo_segdet_float(
@@ -1206,7 +1209,8 @@ impl PyDecoder {
                     nms,
                     &mut output_boxes,
                     &mut output_masks,
-                );
+                )
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))?;
             }
             _ => {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(
