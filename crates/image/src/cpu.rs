@@ -1894,7 +1894,7 @@ impl CPUProcessor {
                     let py = (y as f32 / output_height as f32) * proto_h as f32 - 0.5;
                     let acc = bilinear_dot(protos, coeff, num_protos, px, py, proto_w, proto_h);
                     let mask = 1.0 / (1.0 + (-acc).exp());
-                    pixels[row * bbox_w + col] = (mask * 255.0).round() as u8;
+                    pixels[row * bbox_w + col] = if mask > 0.5 { 255 } else { 0 };
                 }
             }
 
