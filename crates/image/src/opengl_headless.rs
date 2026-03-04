@@ -802,6 +802,7 @@ pub struct GLProcessorThreaded {
     // This is only None when the converter is being dropped.
     sender: Option<Sender<GLProcessorMessage>>,
     transfer_backend: TransferBackend,
+    has_bgra: bool,
 }
 
 unsafe impl Send for GLProcessorThreaded {}
@@ -829,7 +830,10 @@ impl GLProcessorThreaded {
                     return;
                 }
             };
-            let _ = create_ctx_send.send(Ok(gl_converter.gl_context.transfer_backend));
+            let _ = create_ctx_send.send(Ok((
+                gl_converter.gl_context.transfer_backend,
+                gl_converter.has_bgra,
+            )));
             while let Some(msg) = recv.blocking_recv() {
                 match msg {
                     GLProcessorMessage::ImageConvert(src, mut dst, rotation, flip, crop, resp) => {
@@ -952,7 +956,7 @@ impl GLProcessorThreaded {
         // let handle = tokio::task::spawn(func());
         let handle = std::thread::spawn(func);
 
-        let transfer_backend = match create_ctx_recv.blocking_recv() {
+        let (transfer_backend, has_bgra) = match create_ctx_recv.blocking_recv() {
             Ok(Err(e)) => return Err(e),
             Err(_) => {
                 return Err(Error::Internal(
@@ -966,6 +970,7 @@ impl GLProcessorThreaded {
             handle: Some(handle),
             sender: Some(send),
             transfer_backend,
+            has_bgra,
         })
     }
 }
@@ -987,7 +992,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
             )));
         }
 
-        if !GLProcessorST::check_dst_format_supported(self.transfer_backend, dst) {
+        if !GLProcessorST::check_dst_format_supported(self.transfer_backend, dst, self.has_bgra) {
             return Err(crate::Error::NotSupported(format!(
                 "Opengl doesn't support {} destination texture",
                 dst.fourcc().display()
@@ -1350,6 +1355,8 @@ pub struct GLProcessorST {
     color_program: GlProgram,
     /// Whether GL_OES_texture_float_linear is available (allows GL_LINEAR on R32F textures).
     has_float_linear: bool,
+    /// Whether GL_EXT_texture_format_BGRA8888 is available (allows BGRA destinations).
+    has_bgra: bool,
     /// Interpolation mode for int8 proto textures.
     int8_interpolation_mode: Int8InterpolationMode,
     /// Intermediate FBO texture for two-pass int8 dequant path.
@@ -1436,7 +1443,7 @@ impl ImageProcessorTrait for GLProcessorST {
             )));
         }
 
-        if !Self::check_dst_format_supported(self.gl_context.transfer_backend, dst) {
+        if !Self::check_dst_format_supported(self.gl_context.transfer_backend, dst, self.has_bgra) {
             return Err(crate::Error::NotSupported(format!(
                 "Opengl doesn't support {} destination texture",
                 dst.fourcc().display()
@@ -1680,7 +1687,7 @@ impl GLProcessorST {
                 .map_or(std::ptr::null(), |p| p as *const _)
         });
 
-        let has_float_linear = Self::gl_check_support()?;
+        let (has_float_linear, has_bgra) = Self::gl_check_support()?;
 
         // Uploads and downloads are all packed with no alignment requirements
         unsafe {
@@ -1804,6 +1811,7 @@ impl GLProcessorST {
             proto_dequant_int8_program,
             proto_segmentation_f32_program,
             has_float_linear,
+            has_bgra,
             int8_interpolation_mode: Int8InterpolationMode::Bilinear,
             proto_dequant_texture,
             proto_mask_logit_int8_bilinear_program,
@@ -2520,7 +2528,14 @@ impl GLProcessorST {
         }
     }
 
-    fn check_dst_format_supported(backend: TransferBackend, img: &TensorImage) -> bool {
+    fn check_dst_format_supported(
+        backend: TransferBackend,
+        img: &TensorImage,
+        has_bgra: bool,
+    ) -> bool {
+        if img.fourcc() == BGRA && !has_bgra {
+            return false;
+        }
         if backend.is_dma() && img.tensor().memory() == TensorMemory::Dma {
             matches!(
                 img.fourcc(),
@@ -2531,9 +2546,9 @@ impl GLProcessorST {
         }
     }
 
-    /// Checks required GL extensions and returns whether optional capabilities
-    /// are available. Returns `has_float_linear` (GL_OES_texture_float_linear).
-    fn gl_check_support() -> Result<bool, crate::Error> {
+    /// Checks required GL extensions and returns optional capability flags:
+    /// `(has_float_linear, has_bgra)`.
+    fn gl_check_support() -> Result<(bool, bool), crate::Error> {
         if let Ok(version) = gls::get_string(gls::gl::SHADING_LANGUAGE_VERSION) {
             log::debug!("GL Shading Language Version: {version:?}");
         } else {
@@ -2565,7 +2580,10 @@ impl GLProcessorST {
         let has_float_linear = extensions.contains("GL_OES_texture_float_linear");
         log::debug!("GL_OES_texture_float_linear: {has_float_linear}");
 
-        Ok(has_float_linear)
+        let has_bgra = extensions.contains("GL_EXT_texture_format_BGRA8888");
+        log::debug!("GL_EXT_texture_format_BGRA8888: {has_bgra}");
+
+        Ok((has_float_linear, has_bgra))
     }
 
     fn setup_renderbuffer_dma(&mut self, dst: &TensorImage) -> crate::Result<()> {

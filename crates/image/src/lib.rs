@@ -1811,7 +1811,7 @@ impl ImageProcessorTrait for ImageProcessor {
 
 fn fourcc_channels(fourcc: FourCharCode) -> Result<usize> {
     match fourcc {
-        RGBA | BGRA => Ok(4), // RGBA/BGRA has 4 channels (R, G, B, A)
+        RGBA | BGRA => Ok(4), // RGBA/BGRA: 4 channels
         RGB => Ok(3),         // RGB has 3 channels (R, G, B)
         YUYV | VYUY => Ok(2), // YUYV/VYUY has 2 channels (Y and UV)
         GREY => Ok(1),        // Y800 has 1 channel (Y)
@@ -1830,7 +1830,7 @@ fn fourcc_channels(fourcc: FourCharCode) -> Result<usize> {
 
 fn fourcc_planar(fourcc: FourCharCode) -> Result<bool> {
     match fourcc {
-        RGBA | BGRA => Ok(false), // RGBA/BGRA has 4 channels (R, G, B, A)
+        RGBA | BGRA => Ok(false), // RGBA/BGRA: 4 channels, interleaved
         RGB => Ok(false),         // RGB has 3 channels (R, G, B)
         YUYV | VYUY => Ok(false), // YUYV/VYUY has 2 channels (Y and UV)
         GREY => Ok(false),        // Y800 has 1 channel (Y)
