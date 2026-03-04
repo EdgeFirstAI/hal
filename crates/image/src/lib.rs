@@ -1259,7 +1259,21 @@ pub trait ImageProcessorTrait {
         crop: Crop,
     ) -> Result<()>;
 
-    /// Draw pre-decoded masks onto image.
+    /// Draw pre-decoded detection boxes and segmentation masks onto `dst`.
+    ///
+    /// Supports two segmentation modes based on the mask channel count:
+    /// - **Instance segmentation** (`C=1`): one `Segmentation` per detection,
+    ///   `segmentation` and `detect` are zipped.
+    /// - **Semantic segmentation** (`C>1`): a single `Segmentation` covering
+    ///   all classes; only the first element is used.
+    ///
+    /// # Format requirements
+    ///
+    /// - CPU backend: `dst` must be `RGBA` or `RGB`.
+    /// - OpenGL backend: `dst` must be `RGBA`, `BGRA`, or `RGB`.
+    /// - G2D backend: not implemented (returns `NotImplemented`).
+    ///
+    /// An empty `segmentation` slice is valid — only bounding boxes are drawn.
     fn draw_masks(
         &mut self,
         dst: &mut TensorImage,
@@ -1271,7 +1285,16 @@ pub trait ImageProcessorTrait {
     ///
     /// For YOLO segmentation models, this avoids materializing intermediate
     /// `Array3<u8>` masks. The `ProtoData` contains mask coefficients and the
-    /// prototype tensor; the renderer computes `mask_coeff @ protos` directly.
+    /// prototype tensor; the renderer computes `mask_coeff @ protos` directly
+    /// at the output resolution using bilinear sampling.
+    ///
+    /// `detect` and `proto_data.mask_coefficients` must have the same length
+    /// (enforced by zip — excess entries are silently ignored). An empty
+    /// `detect` slice is valid and returns immediately after drawing nothing.
+    ///
+    /// # Format requirements
+    ///
+    /// Same as [`draw_masks`](Self::draw_masks). G2D returns `NotImplemented`.
     fn draw_masks_proto(
         &mut self,
         dst: &mut TensorImage,
@@ -1279,13 +1302,20 @@ pub trait ImageProcessorTrait {
         proto_data: &ProtoData,
     ) -> Result<()>;
 
-    /// Decode masks to atlas buffer (internal, used by decode_masks).
+    /// Decode masks into a compact atlas buffer.
     ///
-    /// The atlas is a compact vertical strip where each detection occupies a
-    /// strip sized to its padded bounding box (not the full output resolution).
+    /// Used internally by the Python/C `decode_masks` APIs. The atlas is a
+    /// compact vertical strip where each detection occupies a strip sized to
+    /// its padded bounding box (not the full output resolution).
+    ///
+    /// `output_width` and `output_height` define the coordinate space for
+    /// interpreting bounding boxes — individual mask regions are bbox-sized.
+    /// Mask pixels are binary: `255` = presence, `0` = background.
     ///
     /// Returns `(atlas_pixels, regions)` where `regions` describes each
     /// detection's location and bbox within the atlas.
+    ///
+    /// G2D backend returns `NotImplemented`.
     fn decode_masks_atlas(
         &mut self,
         detect: &[DetectBox],
@@ -4627,5 +4657,15 @@ mod image_tests {
 
         compare_images(&pbo_dst, &cpu_dst, 0.95, function!());
         log::info!("test_convert_pbo_to_pbo: PASS — PBO-to-PBO convert matches CPU reference");
+    }
+
+    #[test]
+    fn test_tensor_image_bgra() {
+        let img =
+            TensorImage::new(640, 480, BGRA, Some(edgefirst_tensor::TensorMemory::Mem)).unwrap();
+        assert_eq!(img.width(), 640);
+        assert_eq!(img.height(), 480);
+        assert_eq!(img.channels(), 4);
+        assert_eq!(img.fourcc(), BGRA);
     }
 }
