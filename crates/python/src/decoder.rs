@@ -3,8 +3,8 @@
 
 use edgefirst_hal::decoder::{
     configs, configs::Nms, dequantize_cpu, modelpack::ModelPackDetectionConfig,
-    segmentation_to_mask, ConfigOutput, Decoder, DecoderBuilder, DetectBox, Quantization,
-    Segmentation,
+    segmentation_to_mask, ConfigOutput, Decoder, DecoderBuilder, DetectBox, ProtoData,
+    Quantization, Segmentation,
 };
 use edgefirst_hal::image::ImageProcessorTrait;
 
@@ -451,6 +451,14 @@ pub type PySegDetOutput<'py> = (
     Vec<Bound<'py, PyArray3<u8>>>,
 );
 
+/// Like [`PySegDetOutput`] but with 2D masks `(H, W)` instead of 3D `(H, W, C)`.
+pub type PySegDetOutput2D<'py> = (
+    Bound<'py, PyArray2<f32>>,
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<usize>>,
+    Vec<Bound<'py, PyArray2<u8>>>,
+);
+
 #[derive(FromPyObject)]
 pub enum ArrayQuantized<'a> {
     UInt8(PyReadonlyArrayDyn<'a, u8>),
@@ -784,9 +792,9 @@ impl PyDecoder {
         Ok((boxes, scores, classes, masks))
     }
 
-    /// Decode model outputs and render results directly onto the destination
+    /// Decode model outputs and draw masks directly onto the destination
     /// image in a single call. Masks never leave Rust, eliminating the
-    /// Python round-trip overhead of `decode()` + `render_to_image()`.
+    /// Python round-trip overhead of `decode()` + `draw_masks()`.
     ///
     /// For segmentation models, prototype data is passed directly to the
     /// renderer without materializing intermediate mask arrays in Python.
@@ -795,7 +803,7 @@ impl PyDecoder {
     ///
     /// Returns `(boxes, scores, classes)` — no mask arrays are returned.
     #[pyo3(signature = (model_output, processor, dst, max_boxes=100))]
-    pub fn decode_and_render<'py>(
+    pub fn draw_masks<'py>(
         self_: PyRef<'py, Self>,
         model_output: ListOfReadOnlyArrayGenericDyn,
         processor: &mut PyImageProcessor,
@@ -877,10 +885,10 @@ impl PyDecoder {
         if let Ok(mut l) = processor.0.lock() {
             if let Some(proto_data) = proto_result {
                 // Fused path: render directly from proto data (masks stay in Rust)
-                l.render_from_protos(&mut dst.0, &output_boxes, &proto_data)
+                l.draw_masks_proto(&mut dst.0, &output_boxes, &proto_data)
                     .map_err(|e| {
                         pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "render_from_protos: {e:#?}"
+                            "draw_masks_proto: {e:#?}"
                         ))
                     })?;
             } else {
@@ -954,11 +962,9 @@ impl PyDecoder {
                 if let Err(e) = result {
                     return Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")));
                 }
-                l.render_to_image(&mut dst.0, &output_boxes, &output_masks)
+                l.draw_masks(&mut dst.0, &output_boxes, &output_masks)
                     .map_err(|e| {
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "render_to_image: {e:#?}"
-                        ))
+                        pyo3::exceptions::PyRuntimeError::new_err(format!("draw_masks: {e:#?}"))
                     })?;
             }
         }
@@ -968,131 +974,98 @@ impl PyDecoder {
         Ok((boxes, scores, classes))
     }
 
-    /// Decode model outputs and render per-instance grayscale masks at full
-    /// output resolution in a single fused call.
+    /// Decode model outputs and return per-detection masks at the specified
+    /// output resolution.
     ///
-    /// For segmentation models, prototype data is rendered on the GPU at the
-    /// specified output resolution using `sigmoid(mask_coeff @ protos)` without
-    /// thresholding. Each mask covers only its bounding-box region.
+    /// Internally uses GPU atlas rendering when available, then splits the
+    /// atlas into individual per-detection mask arrays.
     ///
-    /// Returns `(boxes, scores, classes, masks)` where masks is a list of
-    /// `ndarray(H, W)` uint8 arrays (one per detection, bbox-sized).
+    /// Returns `(boxes, scores, classes, masks)` where:
+    /// - `boxes`: `ndarray[N, 4]` of `f32` bounding boxes
+    /// - `scores`: `ndarray[N]` of `f32` confidence scores
+    /// - `classes`: `ndarray[N]` of `uintp` class indices
+    /// - `masks`: list of `ndarray[H, W]` of `u8` — one per detection
     #[pyo3(signature = (model_output, processor, output_width=640, output_height=640, max_boxes=100))]
-    pub fn decode_and_render_masks<'py>(
+    pub fn decode_masks<'py>(
         self_: PyRef<'py, Self>,
         model_output: ListOfReadOnlyArrayGenericDyn,
         processor: &mut PyImageProcessor,
         output_width: usize,
         output_height: usize,
         max_boxes: usize,
-    ) -> PyResult<PySegDetOutput<'py>> {
+    ) -> PyResult<PySegDetOutput2D<'py>> {
         let mut output_boxes = Vec::with_capacity(max_boxes);
-
-        // Decode with proto path (same as decode_and_render)
-        let proto_result = match &model_output {
-            ListOfReadOnlyArrayGenericDyn::Quantized(items) => {
-                let outputs = items
-                    .iter()
-                    .map(|x| match x {
-                        ArrayQuantized::UInt8(arr) => arr.as_array().into(),
-                        ArrayQuantized::Int8(arr) => arr.as_array().into(),
-                        ArrayQuantized::UInt16(arr) => arr.as_array().into(),
-                        ArrayQuantized::Int16(arr) => arr.as_array().into(),
-                        ArrayQuantized::UInt32(arr) => arr.as_array().into(),
-                        ArrayQuantized::Int32(arr) => arr.as_array().into(),
-                    })
-                    .collect::<Vec<_>>();
-                self_
-                    .decoder
-                    .decode_quantized_proto(&outputs, &mut output_boxes)
-                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))?
-            }
-            ListOfReadOnlyArrayGenericDyn::Float16(items) => {
-                let outputs = items
-                    .iter()
-                    .filter_map(|x| match x {
-                        WithInt32Array::Val(x) => Some(x.arr.as_array()),
-                        WithInt32Array::Int32(_) => None,
-                    })
-                    .collect::<Vec<_>>();
-                let outputs = outputs
-                    .iter()
-                    .map(|arr| arr.map(|x| x.to_f32()))
-                    .collect::<Vec<_>>();
-                let output_views = outputs
-                    .iter()
-                    .map(|output| output.view())
-                    .collect::<Vec<_>>();
-                self_
-                    .decoder
-                    .decode_float_proto(&output_views, &mut output_boxes)
-                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))?
-            }
-            ListOfReadOnlyArrayGenericDyn::Float32(items) => {
-                let outputs = items
-                    .iter()
-                    .filter_map(|x| match x {
-                        WithInt32Array::Val(x) => Some(x.as_array()),
-                        WithInt32Array::Int32(_) => None,
-                    })
-                    .collect::<Vec<_>>();
-                self_
-                    .decoder
-                    .decode_float_proto(&outputs, &mut output_boxes)
-                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))?
-            }
-            ListOfReadOnlyArrayGenericDyn::Float64(items) => {
-                let outputs = items
-                    .iter()
-                    .filter_map(|x| match x {
-                        WithInt32Array::Val(x) => Some(x.as_array()),
-                        WithInt32Array::Int32(_) => None,
-                    })
-                    .collect::<Vec<_>>();
-                self_
-                    .decoder
-                    .decode_float_proto(&outputs, &mut output_boxes)
-                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))?
-            }
-        };
+        let proto_result = Self::decode_proto_result(&self_, &model_output, &mut output_boxes)?;
 
         let py = self_.py();
 
-        // Render masks from proto data
-        let mask_arrays = if let Some(proto_data) = proto_result {
+        let masks: Vec<ndarray::Array2<u8>> = if let Some(proto_data) = proto_result {
             if let Ok(mut l) = processor.0.lock() {
-                let mask_results = l
-                    .render_masks_from_protos(
-                        &output_boxes,
-                        proto_data,
-                        output_width,
-                        output_height,
-                    )
+                let (atlas_pixels, regions) = l
+                    .decode_masks_atlas(&output_boxes, proto_data, output_width, output_height)
                     .map_err(|e| {
                         pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "render_masks_from_protos: {e:#?}"
+                            "decode_masks_atlas: {e:#?}"
                         ))
                     })?;
 
-                mask_results
-                    .into_iter()
-                    .map(|mr| {
-                        let arr = ndarray::Array2::from_shape_vec((mr.h, mr.w), mr.pixels).unwrap();
-                        // Convert Array2<u8> to Array3<u8> with shape (H, W, 1)
-                        let arr = arr.insert_axis(ndarray::Axis(2));
-                        arr.to_pyarray(py)
-                    })
-                    .collect()
+                let atlas_h = if !regions.is_empty() {
+                    let last = regions.last().unwrap();
+                    last.atlas_y_offset + last.padded_h
+                } else {
+                    0
+                };
+
+                if atlas_h > 0 && !regions.is_empty() {
+                    // Split atlas into individual mask arrays
+                    regions
+                        .iter()
+                        .map(|r| -> PyResult<_> {
+                            let mut mask = ndarray::Array2::<u8>::zeros((r.bbox_h, r.bbox_w));
+                            // The atlas renders each detection at absolute
+                            // position (padded_x, atlas_y_offset) in the atlas.
+                            // The bbox region within the padded strip starts at
+                            // row offset (bbox_y - padded_y) from atlas_y_offset,
+                            // and at absolute column bbox_x.
+                            let src_y_start = r.atlas_y_offset + (r.bbox_y - r.padded_y);
+                            let src_x_start = r.bbox_x;
+                            if src_x_start + r.bbox_w > output_width {
+                                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                    "decode_masks: bbox x={}..{} exceeds atlas width {}",
+                                    src_x_start,
+                                    src_x_start + r.bbox_w,
+                                    output_width
+                                )));
+                            }
+                            for dy in 0..r.bbox_h {
+                                let src_row = src_y_start + dy;
+                                if src_row >= atlas_h {
+                                    break;
+                                }
+                                let src_offset = src_row * output_width + src_x_start;
+                                mask.row_mut(dy).as_slice_mut().unwrap()[..r.bbox_w]
+                                    .copy_from_slice(
+                                        &atlas_pixels[src_offset..src_offset + r.bbox_w],
+                                    );
+                            }
+                            Ok(mask)
+                        })
+                        .collect::<PyResult<Vec<_>>>()?
+                } else {
+                    Vec::new()
+                }
             } else {
                 Vec::new()
             }
         } else {
-            // Detection-only model: no masks
             Vec::new()
         };
 
         let (boxes, scores, classes) = convert_detect_box(py, &output_boxes);
-        Ok((boxes, scores, classes, mask_arrays))
+        let py_masks: Vec<Bound<'py, PyArray2<u8>>> =
+            masks.into_iter().map(|m| m.into_pyarray(py)).collect();
+
+        Ok((boxes, scores, classes, py_masks))
     }
 
     #[staticmethod]
@@ -1513,6 +1486,82 @@ impl PyDecoder {
     #[getter(normalized_boxes)]
     fn get_normalized_boxes(&self) -> Option<bool> {
         self.decoder.normalized_boxes()
+    }
+}
+
+/// Private helpers for PyDecoder (not exposed to Python).
+impl PyDecoder {
+    /// Decode model outputs and extract ProtoData for segmentation models.
+    ///
+    /// Returns `Some(ProtoData)` for segmentation models, `None` for
+    /// detection-only models.
+    fn decode_proto_result(
+        &self,
+        model_output: &ListOfReadOnlyArrayGenericDyn,
+        output_boxes: &mut Vec<DetectBox>,
+    ) -> PyResult<Option<ProtoData>> {
+        match model_output {
+            ListOfReadOnlyArrayGenericDyn::Quantized(items) => {
+                let outputs = items
+                    .iter()
+                    .map(|x| match x {
+                        ArrayQuantized::UInt8(arr) => arr.as_array().into(),
+                        ArrayQuantized::Int8(arr) => arr.as_array().into(),
+                        ArrayQuantized::UInt16(arr) => arr.as_array().into(),
+                        ArrayQuantized::Int16(arr) => arr.as_array().into(),
+                        ArrayQuantized::UInt32(arr) => arr.as_array().into(),
+                        ArrayQuantized::Int32(arr) => arr.as_array().into(),
+                    })
+                    .collect::<Vec<_>>();
+                self.decoder
+                    .decode_quantized_proto(&outputs, output_boxes)
+                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))
+            }
+            ListOfReadOnlyArrayGenericDyn::Float16(items) => {
+                let outputs = items
+                    .iter()
+                    .filter_map(|x| match x {
+                        WithInt32Array::Val(x) => Some(x.arr.as_array()),
+                        WithInt32Array::Int32(_) => None,
+                    })
+                    .collect::<Vec<_>>();
+                let outputs = outputs
+                    .iter()
+                    .map(|arr| arr.map(|x| x.to_f32()))
+                    .collect::<Vec<_>>();
+                let output_views = outputs
+                    .iter()
+                    .map(|output| output.view())
+                    .collect::<Vec<_>>();
+                self.decoder
+                    .decode_float_proto(&output_views, output_boxes)
+                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))
+            }
+            ListOfReadOnlyArrayGenericDyn::Float32(items) => {
+                let outputs = items
+                    .iter()
+                    .filter_map(|x| match x {
+                        WithInt32Array::Val(x) => Some(x.as_array()),
+                        WithInt32Array::Int32(_) => None,
+                    })
+                    .collect::<Vec<_>>();
+                self.decoder
+                    .decode_float_proto(&outputs, output_boxes)
+                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))
+            }
+            ListOfReadOnlyArrayGenericDyn::Float64(items) => {
+                let outputs = items
+                    .iter()
+                    .filter_map(|x| match x {
+                        WithInt32Array::Val(x) => Some(x.as_array()),
+                        WithInt32Array::Int32(_) => None,
+                    })
+                    .collect::<Vec<_>>();
+                self.decoder
+                    .decode_float_proto(&outputs, output_boxes)
+                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))
+            }
+        }
     }
 }
 

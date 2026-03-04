@@ -176,44 +176,40 @@ impl ImageProcessorTrait for G2DProcessor {
         cpu.convert_ref(src, dst, rotation, flip, crop)
     }
 
-    #[cfg(feature = "decoder")]
-    fn render_to_image(
+    fn draw_masks(
         &mut self,
         _dst: &mut TensorImage,
         _detect: &[crate::DetectBox],
         _segmentation: &[crate::Segmentation],
     ) -> Result<()> {
         Err(Error::NotImplemented(
-            "G2D does not support rendering detection or segmentation overlays".to_string(),
+            "G2D does not support drawing detection or segmentation overlays".to_string(),
         ))
     }
 
-    #[cfg(feature = "decoder")]
-    fn render_from_protos(
+    fn draw_masks_proto(
         &mut self,
         _dst: &mut TensorImage,
         _detect: &[crate::DetectBox],
         _proto_data: &crate::ProtoData,
     ) -> Result<()> {
         Err(Error::NotImplemented(
-            "G2D does not support rendering detection or segmentation overlays".to_string(),
+            "G2D does not support drawing detection or segmentation overlays".to_string(),
         ))
     }
 
-    #[cfg(feature = "decoder")]
-    fn render_masks_from_protos(
+    fn decode_masks_atlas(
         &mut self,
         _detect: &[crate::DetectBox],
         _proto_data: crate::ProtoData,
         _output_width: usize,
         _output_height: usize,
-    ) -> Result<Vec<crate::MaskResult>> {
+    ) -> Result<(Vec<u8>, Vec<crate::MaskRegion>)> {
         Err(Error::NotImplemented(
-            "G2D does not support rendering per-instance masks".to_string(),
+            "G2D does not support decoding mask atlas".to_string(),
         ))
     }
 
-    #[cfg(feature = "decoder")]
     fn set_class_colors(&mut self, _: &[[u8; 4]]) -> Result<()> {
         Err(Error::NotImplemented(
             "G2D does not support setting colors for rendering detection or segmentation overlays"

@@ -504,7 +504,7 @@ def run_hal_pipeline(image_path, metadata, interp, processor, save_path=None):
 
 
 def run_hal_pipeline_bench(image_path, metadata, interp, processor):
-    """HAL pipeline using fused OpenGL decode_and_render for benchmarking.
+    """HAL pipeline using fused OpenGL draw_masks for benchmarking.
 
     Returns elapsed_ms_dict (no visual output — uses HAL's built-in colors).
     """
@@ -536,7 +536,7 @@ def run_hal_pipeline_bench(image_path, metadata, interp, processor):
     render_dst = TensorImage(640, 640, FourCC.RGBA)
     processor.convert(dst_rgb, render_dst)
     decoder = Decoder(metadata, score_threshold=0.25, iou_threshold=0.45)
-    decoder.decode_and_render(outputs, processor, render_dst)
+    decoder.draw_masks(outputs, processor, render_dst)
     timings["decode+render"] = (time.perf_counter() - t0) * 1000
 
     timings["total"] = sum(timings.values())
@@ -662,7 +662,7 @@ def main():
             for stage, times in all_t.items():
                 report(f"hal/{stage}", times)
 
-            # Benchmark HAL fused decode_and_render (OpenGL)
+            # Benchmark HAL fused draw_masks (OpenGL)
             print("\n--- HAL Pipeline (fused OpenGL decode+render) ---")
             for _ in range(args.warmup):
                 run_hal_pipeline_bench(args.image, metadata, interp, hal_processor)

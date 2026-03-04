@@ -441,8 +441,13 @@ pub struct Segmentation {
     pub xmax: f32,
     /// bottom-most normalized coordinate of the segmentation box
     pub ymax: f32,
-    /// 3D segmentation array. If the last dimension is 1, values equal or above
-    /// 128 are considered objects. Otherwise the object is the argmax index
+    /// 3D segmentation array of shape `(H, W, C)`.
+    ///
+    /// For instance segmentation (e.g. YOLO): `C=1` — binary per-instance
+    /// mask where values >= 128 indicate object presence.
+    ///
+    /// For semantic segmentation (e.g. ModelPack): `C=num_classes` — per-pixel
+    /// class scores where the object class is the argmax index.
     pub segmentation: Array3<u8>,
 }
 

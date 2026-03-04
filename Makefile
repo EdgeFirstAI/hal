@@ -28,7 +28,7 @@ CARGO_PROFILE := --profile profiling
 LLVM_COV_PROFILE := --cargo-profile profiling
 
 # Rust features (all except opencv, which requires libclang at build time)
-RUST_FEATURES := --features opengl,decoder,ndarray
+RUST_FEATURES := --features opengl,ndarray
 
 # ===========================================================================
 # STANDARD TARGETS
