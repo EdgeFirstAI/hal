@@ -2742,6 +2742,7 @@ impl GLProcessorST {
         let dest_format = match dst.fourcc() {
             RGB | RGB_INT8 => gls::gl::RGB,
             RGBA => gls::gl::RGBA,
+            BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
             GREY => gls::gl::RED,
             _ => unreachable!(),
         };
@@ -6562,12 +6563,12 @@ void main() {
 #[cfg(feature = "opengl")]
 mod gl_tests {
     use super::*;
-    use crate::{TensorImage, RGBA};
+    use crate::{TensorImage, BGRA, RGBA};
     #[cfg(feature = "dma_test_formats")]
     use crate::{NV12, YUYV};
-    use edgefirst_tensor::TensorTrait;
+    use edgefirst_tensor::{TensorMapTrait, TensorTrait};
     #[cfg(feature = "dma_test_formats")]
-    use edgefirst_tensor::{is_dma_available, TensorMapTrait, TensorMemory};
+    use edgefirst_tensor::{is_dma_available, TensorMemory};
     use image::buffer::ConvertBuffer;
     use ndarray::Array3;
 
@@ -7405,5 +7406,288 @@ mod gl_tests {
         }
         eprintln!("RGB direct vs two-pass max pixel diff: {max_diff}");
         assert!(max_diff <= 1, "Pixel mismatch > 1: max_diff={max_diff}");
+    }
+
+    // ---- BGRA destination tests ----
+
+    /// Test OpenGL NV12→BGRA conversion with DMA buffers.
+    /// Compares against NV12→RGBA by verifying R↔B swap.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_opengl_nv12_to_bgra() {
+        if !is_dma_available() {
+            eprintln!("SKIPPED: test_opengl_nv12_to_bgra - DMA not available");
+            return;
+        }
+
+        let src = load_raw_image(
+            1280,
+            720,
+            NV12,
+            Some(TensorMemory::Dma),
+            include_bytes!("../../../testdata/camera720p.nv12"),
+        )
+        .unwrap();
+
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+
+        // Convert to RGBA as reference
+        let mut rgba_dst =
+            TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma)).unwrap();
+        gl.convert(
+            &src,
+            &mut rgba_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        // Convert to BGRA
+        let mut bgra_dst =
+            TensorImage::new(1280, 720, BGRA, Some(TensorMemory::Dma)).unwrap();
+        gl.convert(
+            &src,
+            &mut bgra_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        // Compare: BGRA[B,G,R,A] should match RGBA[R,G,B,A] with R↔B swapped
+        let bgra_map = bgra_dst.tensor().map().unwrap();
+        let rgba_map = rgba_dst.tensor().map().unwrap();
+        let bgra_buf = bgra_map.as_slice();
+        let rgba_buf = rgba_map.as_slice();
+
+        assert_eq!(bgra_buf.len(), rgba_buf.len());
+        let mut max_diff = 0i32;
+        for (bc, rc) in bgra_buf.chunks_exact(4).zip(rgba_buf.chunks_exact(4)) {
+            max_diff = max_diff.max((bc[0] as i32 - rc[2] as i32).abs()); // B
+            max_diff = max_diff.max((bc[1] as i32 - rc[1] as i32).abs()); // G
+            max_diff = max_diff.max((bc[2] as i32 - rc[0] as i32).abs()); // R
+            max_diff = max_diff.max((bc[3] as i32 - rc[3] as i32).abs()); // A
+        }
+        eprintln!("NV12→BGRA vs NV12→RGBA max channel diff: {max_diff}");
+        assert!(
+            max_diff <= 1,
+            "BGRA/RGBA channel mismatch > 1: max_diff={max_diff}"
+        );
+    }
+
+    /// Test OpenGL YUYV→BGRA conversion with DMA buffers.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_opengl_yuyv_to_bgra() {
+        if !is_dma_available() {
+            eprintln!("SKIPPED: test_opengl_yuyv_to_bgra - DMA not available");
+            return;
+        }
+
+        let src = load_raw_image(
+            1280,
+            720,
+            YUYV,
+            Some(TensorMemory::Dma),
+            include_bytes!("../../../testdata/camera720p.yuyv"),
+        )
+        .unwrap();
+
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+
+        let mut rgba_dst =
+            TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma)).unwrap();
+        gl.convert(
+            &src,
+            &mut rgba_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        let mut bgra_dst =
+            TensorImage::new(1280, 720, BGRA, Some(TensorMemory::Dma)).unwrap();
+        gl.convert(
+            &src,
+            &mut bgra_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        let bgra_map = bgra_dst.tensor().map().unwrap();
+        let rgba_map = rgba_dst.tensor().map().unwrap();
+        let bgra_buf = bgra_map.as_slice();
+        let rgba_buf = rgba_map.as_slice();
+
+        let mut max_diff = 0i32;
+        for (bc, rc) in bgra_buf.chunks_exact(4).zip(rgba_buf.chunks_exact(4)) {
+            max_diff = max_diff.max((bc[0] as i32 - rc[2] as i32).abs());
+            max_diff = max_diff.max((bc[1] as i32 - rc[1] as i32).abs());
+            max_diff = max_diff.max((bc[2] as i32 - rc[0] as i32).abs());
+            max_diff = max_diff.max((bc[3] as i32 - rc[3] as i32).abs());
+        }
+        eprintln!("YUYV→BGRA vs YUYV→RGBA max channel diff: {max_diff}");
+        assert!(
+            max_diff <= 1,
+            "BGRA/RGBA channel mismatch > 1: max_diff={max_diff}"
+        );
+    }
+
+    /// Test draw_masks() with BGRA destination (segmentation).
+    /// Draws the same masks to both RGBA and BGRA, then verifies R↔B swap.
+    #[test]
+    fn test_draw_masks_bgra() {
+        use edgefirst_decoder::Segmentation;
+
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: test_draw_masks_bgra - OpenGL not available");
+            return;
+        }
+
+        let seg_bytes =
+            include_bytes!("../../../testdata/modelpack_seg_2x160x160.bin").to_vec();
+
+        // Build segmentation data (shared between both renders)
+        let make_seg = || {
+            let mut s = Array3::from_shape_vec((2, 160, 160), seg_bytes.clone()).unwrap();
+            s.swap_axes(0, 1);
+            s.swap_axes(1, 2);
+            let s = s.as_standard_layout().to_owned();
+            Segmentation {
+                segmentation: s,
+                xmin: 0.0,
+                ymin: 0.0,
+                xmax: 1.0,
+                ymax: 1.0,
+            }
+        };
+
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+
+        // Render to RGBA
+        let mut rgba_img = TensorImage::load(
+            include_bytes!("../../../testdata/giraffe.jpg"),
+            Some(RGBA),
+            None,
+        )
+        .unwrap();
+        gl.draw_masks(&mut rgba_img, &[], &[make_seg()]).unwrap();
+
+        // Render to BGRA (convert source to BGRA first)
+        let rgba_src = TensorImage::load(
+            include_bytes!("../../../testdata/giraffe.jpg"),
+            Some(RGBA),
+            None,
+        )
+        .unwrap();
+        let mut bgra_img =
+            TensorImage::new(rgba_src.width(), rgba_src.height(), BGRA, None).unwrap();
+        gl.convert(
+            &rgba_src,
+            &mut bgra_img,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+        gl.draw_masks(&mut bgra_img, &[], &[make_seg()]).unwrap();
+
+        // Verify BGRA output matches RGBA output with R↔B swapped
+        let rgba_map = rgba_img.tensor().map().unwrap();
+        let bgra_map = bgra_img.tensor().map().unwrap();
+        let rgba_buf = rgba_map.as_slice();
+        let bgra_buf = bgra_map.as_slice();
+        assert_eq!(rgba_buf.len(), bgra_buf.len());
+
+        let mut max_diff = 0i32;
+        for (rc, bc) in rgba_buf.chunks_exact(4).zip(bgra_buf.chunks_exact(4)) {
+            max_diff = max_diff.max((rc[0] as i32 - bc[2] as i32).abs()); // R
+            max_diff = max_diff.max((rc[1] as i32 - bc[1] as i32).abs()); // G
+            max_diff = max_diff.max((rc[2] as i32 - bc[0] as i32).abs()); // B
+            max_diff = max_diff.max((rc[3] as i32 - bc[3] as i32).abs()); // A
+        }
+        eprintln!("draw_masks BGRA vs RGBA max channel diff: {max_diff}");
+        assert!(
+            max_diff <= 1,
+            "draw_masks BGRA/RGBA channel mismatch > 1: max_diff={max_diff}"
+        );
+    }
+
+    /// Test draw_masks() with BGRA destination using Mem memory (boxes).
+    /// Draws same boxes to RGBA and BGRA, then verifies R↔B swap.
+    #[test]
+    fn test_draw_masks_bgra_mem() {
+        use edgefirst_decoder::DetectBox;
+
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: test_draw_masks_bgra_mem - OpenGL not available");
+            return;
+        }
+
+        let detect = DetectBox {
+            bbox: [0.59375, 0.25, 0.9375, 0.725].into(),
+            score: 0.99,
+            label: 0,
+        };
+        let colors = [[255, 255, 0, 233], [128, 128, 255, 100]];
+
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        gl.set_class_colors(&colors).unwrap();
+
+        // Render boxes to RGBA
+        let mut rgba_img = TensorImage::load(
+            include_bytes!("../../../testdata/giraffe.jpg"),
+            Some(RGBA),
+            Some(edgefirst_tensor::TensorMemory::Mem),
+        )
+        .unwrap();
+        gl.draw_masks(&mut rgba_img, &[detect], &[]).unwrap();
+
+        // Render boxes to BGRA
+        let rgba_src = TensorImage::load(
+            include_bytes!("../../../testdata/giraffe.jpg"),
+            Some(RGBA),
+            Some(edgefirst_tensor::TensorMemory::Mem),
+        )
+        .unwrap();
+        let mut bgra_img = TensorImage::new(
+            rgba_src.width(),
+            rgba_src.height(),
+            BGRA,
+            Some(edgefirst_tensor::TensorMemory::Mem),
+        )
+        .unwrap();
+        gl.convert(
+            &rgba_src,
+            &mut bgra_img,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+        gl.draw_masks(&mut bgra_img, &[detect], &[]).unwrap();
+
+        // Verify BGRA output matches RGBA output with R↔B swapped
+        let rgba_map = rgba_img.tensor().map().unwrap();
+        let bgra_map = bgra_img.tensor().map().unwrap();
+        let rgba_buf = rgba_map.as_slice();
+        let bgra_buf = bgra_map.as_slice();
+
+        let mut max_diff = 0i32;
+        for (rc, bc) in rgba_buf.chunks_exact(4).zip(bgra_buf.chunks_exact(4)) {
+            max_diff = max_diff.max((rc[0] as i32 - bc[2] as i32).abs());
+            max_diff = max_diff.max((rc[1] as i32 - bc[1] as i32).abs());
+            max_diff = max_diff.max((rc[2] as i32 - bc[0] as i32).abs());
+            max_diff = max_diff.max((rc[3] as i32 - bc[3] as i32).abs());
+        }
+        eprintln!("draw_masks_mem BGRA vs RGBA max channel diff: {max_diff}");
+        assert!(
+            max_diff <= 1,
+            "draw_masks_mem BGRA/RGBA channel mismatch > 1: max_diff={max_diff}"
+        );
     }
 }

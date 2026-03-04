@@ -2501,7 +2501,7 @@ fn bilinear_dot(
 mod cpu_tests {
 
     use super::*;
-    use crate::{CPUProcessor, Rotation, TensorImageRef, RGBA};
+    use crate::{CPUProcessor, Rotation, TensorImageRef, BGRA, RGBA};
     use edgefirst_tensor::{Tensor, TensorMapTrait, TensorMemory};
     use image::buffer::ConvertBuffer;
 
@@ -3530,5 +3530,199 @@ mod cpu_tests {
         assert_eq!(data[center_idx], 0); // R
         assert_eq!(data[16 + center_idx], 0); // G
         assert_eq!(data[32 + center_idx], 0); // B
+    }
+
+    #[test]
+    fn test_convert_rgba_to_bgra() {
+        use edgefirst_tensor::TensorMemory;
+        // 2x1 image: pixel0 = [R=10, G=20, B=30, A=255], pixel1 = [R=40, G=50, B=60, A=128]
+        let src = TensorImage::new(2, 1, RGBA, Some(TensorMemory::Mem)).unwrap();
+        {
+            let mut map = src.tensor().map().unwrap();
+            let buf = map.as_mut_slice();
+            buf[0..4].copy_from_slice(&[10, 20, 30, 255]);
+            buf[4..8].copy_from_slice(&[40, 50, 60, 128]);
+        }
+        let mut dst = TensorImage::new(2, 1, BGRA, Some(TensorMemory::Mem)).unwrap();
+        CPUProcessor::convert_format(&src, &mut dst).unwrap();
+        let map = dst.tensor().map().unwrap();
+        let buf = map.as_slice();
+        // BGRA byte order: [B, G, R, A]
+        assert_eq!(&buf[0..4], &[30, 20, 10, 255]);
+        assert_eq!(&buf[4..8], &[60, 50, 40, 128]);
+    }
+
+    #[test]
+    fn test_convert_rgb_to_bgra() {
+        // Convert RGB→RGBA and RGB→BGRA, verify R↔B swap matches
+        let src = TensorImage::new(2, 1, RGB, Some(TensorMemory::Mem)).unwrap();
+        {
+            let mut map = src.tensor().map().unwrap();
+            let buf = map.as_mut_slice();
+            buf[0..3].copy_from_slice(&[100, 150, 200]);
+            buf[3..6].copy_from_slice(&[50, 75, 25]);
+        }
+        let mut rgba_dst = TensorImage::new(2, 1, RGBA, Some(TensorMemory::Mem)).unwrap();
+        CPUProcessor::convert_format(&src, &mut rgba_dst).unwrap();
+
+        let mut bgra_dst = TensorImage::new(2, 1, BGRA, Some(TensorMemory::Mem)).unwrap();
+        CPUProcessor::convert_format(&src, &mut bgra_dst).unwrap();
+
+        assert_bgra_matches_rgba(&bgra_dst, &rgba_dst);
+
+        // Also verify the B,G,R channels are correct (alpha may vary)
+        let map = bgra_dst.tensor().map().unwrap();
+        let buf = map.as_slice();
+        assert_eq!(buf[0], 200, "pixel 0 B");
+        assert_eq!(buf[1], 150, "pixel 0 G");
+        assert_eq!(buf[2], 100, "pixel 0 R");
+        assert_eq!(buf[4], 25, "pixel 1 B");
+        assert_eq!(buf[5], 75, "pixel 1 G");
+        assert_eq!(buf[6], 50, "pixel 1 R");
+    }
+
+    #[test]
+    fn test_convert_grey_to_bgra() {
+        // 2x1 greyscale image
+        let src = TensorImage::new(2, 1, GREY, Some(TensorMemory::Mem)).unwrap();
+        {
+            let mut map = src.tensor().map().unwrap();
+            let buf = map.as_mut_slice();
+            buf[0] = 128;
+            buf[1] = 64;
+        }
+        let mut dst = TensorImage::new(2, 1, BGRA, Some(TensorMemory::Mem)).unwrap();
+        CPUProcessor::convert_format(&src, &mut dst).unwrap();
+        let map = dst.tensor().map().unwrap();
+        let buf = map.as_slice();
+        // Grey→BGRA: all channels same value, A=255; R↔B swap is no-op on grey
+        assert_eq!(&buf[0..4], &[128, 128, 128, 255]);
+        assert_eq!(&buf[4..8], &[64, 64, 64, 255]);
+    }
+
+    #[test]
+    fn test_convert_bgra_to_bgra_copy() {
+        // Verify BGRA→BGRA is a straight copy
+        let src = TensorImage::new(2, 1, BGRA, Some(TensorMemory::Mem)).unwrap();
+        {
+            let mut map = src.tensor().map().unwrap();
+            let buf = map.as_mut_slice();
+            buf[0..4].copy_from_slice(&[10, 20, 30, 255]);
+            buf[4..8].copy_from_slice(&[40, 50, 60, 128]);
+        }
+        let mut dst = TensorImage::new(2, 1, BGRA, Some(TensorMemory::Mem)).unwrap();
+        CPUProcessor::convert_format(&src, &mut dst).unwrap();
+        let map = dst.tensor().map().unwrap();
+        let buf = map.as_slice();
+        assert_eq!(&buf[0..4], &[10, 20, 30, 255]);
+        assert_eq!(&buf[4..8], &[40, 50, 60, 128]);
+    }
+
+    /// Helper: compare BGRA output against RGBA output by verifying R↔B swap.
+    /// Since CPU BGRA conversion is RGBA conversion + R↔B swizzle, the results
+    /// must be byte-exact after accounting for the channel swap.
+    fn assert_bgra_matches_rgba(bgra: &TensorImage, rgba: &TensorImage) {
+        assert_eq!(bgra.fourcc(), BGRA);
+        assert_eq!(rgba.fourcc(), RGBA);
+        assert_eq!(bgra.width(), rgba.width());
+        assert_eq!(bgra.height(), rgba.height());
+
+        let bgra_map = bgra.tensor().map().unwrap();
+        let rgba_map = rgba.tensor().map().unwrap();
+        let bgra_buf = bgra_map.as_slice();
+        let rgba_buf = rgba_map.as_slice();
+
+        assert_eq!(bgra_buf.len(), rgba_buf.len());
+        for (i, (bc, rc)) in bgra_buf
+            .chunks_exact(4)
+            .zip(rgba_buf.chunks_exact(4))
+            .enumerate()
+        {
+            assert_eq!(bc[0], rc[2], "pixel {i}: B(bgra) != B(rgba)");
+            assert_eq!(bc[1], rc[1], "pixel {i}: G mismatch");
+            assert_eq!(bc[2], rc[0], "pixel {i}: R(bgra) != R(rgba)");
+            assert_eq!(bc[3], rc[3], "pixel {i}: A mismatch");
+        }
+    }
+
+    #[test]
+    fn test_convert_nv12_to_bgra() {
+        let src = load_bytes_to_tensor(
+            1280,
+            720,
+            NV12,
+            None,
+            include_bytes!("../../../testdata/camera720p.nv12"),
+        )
+        .unwrap();
+
+        // Convert to both RGBA and BGRA, then compare
+        let mut rgba_dst = TensorImage::new(1280, 720, RGBA, None).unwrap();
+        CPUProcessor::convert_format(&src, &mut rgba_dst).unwrap();
+
+        let mut bgra_dst = TensorImage::new(1280, 720, BGRA, None).unwrap();
+        CPUProcessor::convert_format(&src, &mut bgra_dst).unwrap();
+
+        assert_bgra_matches_rgba(&bgra_dst, &rgba_dst);
+    }
+
+    #[test]
+    fn test_convert_yuyv_to_bgra() {
+        let src = load_bytes_to_tensor(
+            1280,
+            720,
+            YUYV,
+            None,
+            include_bytes!("../../../testdata/camera720p.yuyv"),
+        )
+        .unwrap();
+
+        let mut rgba_dst = TensorImage::new(1280, 720, RGBA, None).unwrap();
+        CPUProcessor::convert_format(&src, &mut rgba_dst).unwrap();
+
+        let mut bgra_dst = TensorImage::new(1280, 720, BGRA, None).unwrap();
+        CPUProcessor::convert_format(&src, &mut bgra_dst).unwrap();
+
+        assert_bgra_matches_rgba(&bgra_dst, &rgba_dst);
+    }
+
+    #[test]
+    fn test_convert_vyuy_to_bgra() {
+        let src = load_bytes_to_tensor(
+            1280,
+            720,
+            VYUY,
+            None,
+            include_bytes!("../../../testdata/camera720p.vyuy"),
+        )
+        .unwrap();
+
+        let mut rgba_dst = TensorImage::new(1280, 720, RGBA, None).unwrap();
+        CPUProcessor::convert_format(&src, &mut rgba_dst).unwrap();
+
+        let mut bgra_dst = TensorImage::new(1280, 720, BGRA, None).unwrap();
+        CPUProcessor::convert_format(&src, &mut bgra_dst).unwrap();
+
+        assert_bgra_matches_rgba(&bgra_dst, &rgba_dst);
+    }
+
+    #[test]
+    fn test_convert_nv16_to_bgra() {
+        let src = load_bytes_to_tensor(
+            1280,
+            720,
+            NV16,
+            None,
+            include_bytes!("../../../testdata/camera720p.nv16"),
+        )
+        .unwrap();
+
+        let mut rgba_dst = TensorImage::new(1280, 720, RGBA, None).unwrap();
+        CPUProcessor::convert_format(&src, &mut rgba_dst).unwrap();
+
+        let mut bgra_dst = TensorImage::new(1280, 720, BGRA, None).unwrap();
+        CPUProcessor::convert_format(&src, &mut bgra_dst).unwrap();
+
+        assert_bgra_matches_rgba(&bgra_dst, &rgba_dst);
     }
 }
