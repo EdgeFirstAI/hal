@@ -3,8 +3,8 @@
 
 use crate::{
     fourcc_is_int8, fourcc_uint8_equivalent, Crop, Error, Flip, FunctionTimer, ImageProcessorTrait,
-    Rect, Result, Rotation, TensorImage, TensorImageDst, TensorImageRef, GREY, NV12, NV16,
-    BGRA, PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, VYUY, YUYV,
+    Rect, Result, Rotation, TensorImage, TensorImageDst, TensorImageRef, BGRA, GREY, NV12, NV16,
+    PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, VYUY, YUYV,
 };
 use edgefirst_decoder::{DetectBox, ProtoData, Segmentation};
 use edgefirst_tensor::{TensorMapTrait, TensorTrait};
@@ -878,10 +878,7 @@ impl CPUProcessor {
     }
 
     fn copy_image(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
-        assert!(
-            src.fourcc() == dst.fourcc()
-                || matches!((src.fourcc(), dst.fourcc()), (RGBA, BGRA) | (BGRA, RGBA))
-        );
+        assert_eq!(src.fourcc(), dst.fourcc());
         dst.tensor().map()?.copy_from_slice(&src.tensor().map()?);
         Ok(())
     }
@@ -1098,6 +1095,13 @@ impl CPUProcessor {
                 | (GREY, PLANAR_RGB)
                 | (GREY, PLANAR_RGBA)
                 | (GREY, NV16)
+                | (NV12, BGRA)
+                | (YUYV, BGRA)
+                | (VYUY, BGRA)
+                | (RGBA, BGRA)
+                | (RGB, BGRA)
+                | (GREY, BGRA)
+                | (BGRA, BGRA)
         )
     }
 
@@ -1178,7 +1182,7 @@ impl CPUProcessor {
                 Self::swizzle_rb_4chan(dst)
             }
             (RGBA, BGRA) => {
-                Self::copy_image(src, dst)?;
+                dst.tensor().map()?.copy_from_slice(&src.tensor().map()?);
                 Self::swizzle_rb_4chan(dst)
             }
             (RGB, BGRA) => {
@@ -2032,6 +2036,13 @@ impl ImageProcessorTrait for CPUProcessor {
             (GREY, PLANAR_RGB) => GREY,
             (GREY, PLANAR_RGBA) => GREY,
             (GREY, NV16) => GREY,
+            (NV12, BGRA) => RGBA,
+            (YUYV, BGRA) => RGBA,
+            (VYUY, BGRA) => RGBA,
+            (RGBA, BGRA) => RGBA,
+            (RGB, BGRA) => RGB,
+            (GREY, BGRA) => GREY,
+            (BGRA, BGRA) => BGRA,
             (s, d) => {
                 return Err(Error::NotSupported(format!(
                     "Conversion from {} to {}",
