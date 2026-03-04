@@ -156,6 +156,10 @@ impl CPUProcessor {
         )?)
     }
 
+    // NOTE: The `*_to_rgba` helpers below all accept BGRA destinations
+    // (`assert!(matches!(dst.fourcc(), RGBA | BGRA))`). They always write
+    // pixels in RGBA channel order; for BGRA destinations the caller applies
+    // an R↔B swizzle afterwards via `swizzle_rb_4chan`.
     fn convert_nv12_to_rgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), NV12);
         assert!(matches!(dst.fourcc(), RGBA | BGRA));
