@@ -38,7 +38,16 @@ A tuple containing:
 - boxes: A NumPy array of shape (N, 4) containing the bounding boxes in (x1, y1, x2, y2) format.
 - scores: A NumPy array of shape (N,) containing the confidence scores for each bounding box.
 - class_ids: A NumPy array of shape (N,) containing the class IDs for each bounding box.
-- masks: A list of NumPy arrays, each of shape (H, W, ...) containing detected segmentation mask.
+- masks: A list of NumPy arrays containing per-detection segmentation masks.
+  The exact shape depends on the method:
+
+  - ``decode()``: shape ``(H, W, C)`` at prototype resolution. For instance
+    segmentation models (e.g. YOLO) ``C=1`` — a binary per-instance mask
+    (threshold at 128). For semantic segmentation models (e.g. ModelPack)
+    ``C=num_classes`` — per-pixel class scores (use ``argmax`` over ``C``
+    to get the class index).
+  - ``decode_masks()``: shape ``(H, W)`` at the requested output resolution.
+    Binary ``uint8`` where 255 = mask presence.
 """
 
 class DecoderType(enum.Enum):
@@ -378,6 +387,13 @@ class Decoder:
 
         The accepted floating point types are `np.float16`, `np.float32` and `np.float64`. All outputs must be
         the same floating point type.
+
+        Masks are returned at prototype resolution as 3D arrays of shape
+        ``(H, W, C)``. For instance segmentation models (e.g. YOLO) ``C=1``
+        — a binary per-instance mask (threshold at 128). For semantic
+        segmentation models (e.g. ModelPack) ``C=num_classes`` — per-pixel
+        class scores (use ``argmax`` over the last axis). Use
+        ``decode_masks()`` to get upsampled 2D binary masks.
         """
         ...
 

@@ -1620,38 +1620,44 @@ pub unsafe extern "C" fn hal_decoder_decode_masks(
             };
 
             if atlas_h > 0 && !regions.is_empty() {
-                regions
-                    .iter()
-                    .zip(boxes.iter())
-                    .map(|(r, det)| {
-                        let mut mask_data = vec![0u8; r.bbox_h * r.bbox_w];
-                        let src_y_start = r.atlas_y_offset + (r.bbox_y - r.padded_y);
-                        let src_x_start = r.bbox_x;
-                        for dy in 0..r.bbox_h {
-                            let src_row = src_y_start + dy;
-                            if src_row >= atlas_h {
-                                break;
-                            }
-                            let src_offset = src_row * output_width + src_x_start;
-                            let copy_w = r.bbox_w.min(output_width - src_x_start);
-                            let dst_offset = dy * r.bbox_w;
-                            mask_data[dst_offset..dst_offset + copy_w]
-                                .copy_from_slice(&atlas_pixels[src_offset..src_offset + copy_w]);
+                let mut seg_masks = Vec::with_capacity(regions.len());
+                for (r, det) in regions.iter().zip(boxes.iter()) {
+                    let mut mask_data = vec![0u8; r.bbox_h * r.bbox_w];
+                    let src_y_start = r.atlas_y_offset + (r.bbox_y - r.padded_y);
+                    let src_x_start = r.bbox_x;
+                    if src_x_start + r.bbox_w > output_width {
+                        eprintln!(
+                            "decode_masks: bbox x={}..{} exceeds atlas width {}",
+                            src_x_start,
+                            src_x_start + r.bbox_w,
+                            output_width
+                        );
+                        return libc::EIO;
+                    }
+                    for dy in 0..r.bbox_h {
+                        let src_row = src_y_start + dy;
+                        if src_row >= atlas_h {
+                            break;
                         }
-                        let mask_arr = ndarray::Array3::from_shape_vec(
-                            (r.bbox_h, r.bbox_w, 1),
-                            mask_data,
-                        )
-                        .unwrap_or_else(|_| ndarray::Array3::zeros((0, 0, 1)));
-                        Segmentation {
-                            xmin: det.bbox.xmin,
-                            ymin: det.bbox.ymin,
-                            xmax: det.bbox.xmax,
-                            ymax: det.bbox.ymax,
-                            segmentation: mask_arr,
-                        }
-                    })
-                    .collect()
+                        let src_offset = src_row * output_width + src_x_start;
+                        let dst_offset = dy * r.bbox_w;
+                        mask_data[dst_offset..dst_offset + r.bbox_w]
+                            .copy_from_slice(&atlas_pixels[src_offset..src_offset + r.bbox_w]);
+                    }
+                    let mask_arr = ndarray::Array3::from_shape_vec(
+                        (r.bbox_h, r.bbox_w, 1),
+                        mask_data,
+                    )
+                    .unwrap_or_else(|_| ndarray::Array3::zeros((0, 0, 1)));
+                    seg_masks.push(Segmentation {
+                        xmin: det.bbox.xmin,
+                        ymin: det.bbox.ymin,
+                        xmax: det.bbox.xmax,
+                        ymax: det.bbox.ymax,
+                        segmentation: mask_arr,
+                    });
+                }
+                seg_masks
             } else {
                 Vec::new()
             }

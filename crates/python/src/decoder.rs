@@ -1017,7 +1017,7 @@ impl PyDecoder {
                     // Split atlas into individual mask arrays
                     regions
                         .iter()
-                        .map(|r| {
+                        .map(|r| -> PyResult<_> {
                             let mut mask =
                                 ndarray::Array2::<u8>::zeros((r.bbox_h, r.bbox_w));
                             // The atlas renders each detection at absolute
@@ -1027,23 +1027,30 @@ impl PyDecoder {
                             // and at absolute column bbox_x.
                             let src_y_start = r.atlas_y_offset + (r.bbox_y - r.padded_y);
                             let src_x_start = r.bbox_x;
+                            if src_x_start + r.bbox_w > output_width {
+                                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                                    format!(
+                                        "decode_masks: bbox x={}..{} exceeds atlas width {}",
+                                        src_x_start, src_x_start + r.bbox_w, output_width
+                                    ),
+                                ));
+                            }
                             for dy in 0..r.bbox_h {
                                 let src_row = src_y_start + dy;
                                 if src_row >= atlas_h {
                                     break;
                                 }
                                 let src_offset = src_row * output_width + src_x_start;
-                                let copy_w = r.bbox_w.min(output_width - src_x_start);
                                 mask.row_mut(dy)
                                     .as_slice_mut()
-                                    .unwrap()[..copy_w]
+                                    .unwrap()[..r.bbox_w]
                                     .copy_from_slice(
-                                        &atlas_pixels[src_offset..src_offset + copy_w],
+                                        &atlas_pixels[src_offset..src_offset + r.bbox_w],
                                     );
                             }
-                            mask
+                            Ok(mask)
                         })
-                        .collect()
+                        .collect::<PyResult<Vec<_>>>()?
                 } else {
                     Vec::new()
                 }
