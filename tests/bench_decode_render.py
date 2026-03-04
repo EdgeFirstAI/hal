@@ -105,8 +105,8 @@ def generate_synthetic_outputs():
     xyxy stays within [0, 1].
     """
     results = []
-    for spec in SYNTHETIC_OUTPUTS:
-        if spec is SYNTHETIC_OUTPUTS[2]:  # boxes tensor
+    for i, spec in enumerate(SYNTHETIC_OUTPUTS):
+        if i == 2:  # boxes tensor
             arr = np.random.randint(-125, 0, size=spec["shape"], dtype=spec["dtype"])
         else:
             arr = np.random.randint(-128, 127, size=spec["shape"], dtype=spec["dtype"])

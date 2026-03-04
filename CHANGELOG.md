@@ -86,12 +86,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   | Layer | Old Name | New Name |
   |-------|----------|----------|
-  | Rust trait | `render_masks()` | `draw_masks_proto()` |
-  | Rust trait | `render_masks_decoded()` | `draw_masks()` |
-  | Rust trait | `render_mask_atlas()` | `decode_masks_atlas()` |
-  | Rust enum | `RenderMasks` | `DrawMasksProto` |
-  | Rust enum | `RenderMasksDecoded` | `DrawMasks` |
-  | Rust enum | `RenderMaskAtlas` | `DecodeMasksAtlas` |
+  | Rust trait | `render_from_protos()` | `draw_masks_proto()` |
+  | Rust trait | `render_to_image()` | `draw_masks()` |
+  | Rust trait | `render_masks_from_protos()` | `decode_masks_atlas()` |
+  | Rust enum | `ImageRenderProtos` | `DrawMasksProto` |
+  | Rust enum | `ImageRender` | `DrawMasks` |
+  | Rust enum | `RenderMasksFromProtos` | `DecodeMasksAtlas` |
   | Python `Decoder` | `decode_and_render()` | `draw_masks()` |
   | Python `ImageProcessor` | `render_to_image()` | `draw_masks()` |
   | C API | `hal_image_processor_render_to_image()` | `hal_image_processor_draw_masks()` |
@@ -111,9 +111,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **C users**: rename `hal_image_processor_render_to_image()` →
     `hal_image_processor_draw_masks()`; `hal_decoder_draw_masks()` and
     `hal_decoder_decode_masks()` are new
-  - **Rust users**: rename `render_masks()` → `draw_masks_proto()`,
-    `render_masks_decoded()` → `draw_masks()`, and
-    `render_mask_atlas()` → `decode_masks_atlas()` on `ImageProcessorTrait`
+  - **Rust users**: rename `render_from_protos()` → `draw_masks_proto()`,
+    `render_to_image()` → `draw_masks()`, and
+    `render_masks_from_protos()` → `decode_masks_atlas()` on `ImageProcessorTrait`
     implementors
 
 - **`Decoder.decode_masks()` return type changed** — now returns individual
