@@ -36,11 +36,11 @@ const ITERATIONS: usize = 200;
 
 // Quantization parameters from the YOLOv8 segmentation test model.
 const QUANT_BOXES: Quantization = Quantization {
-    scale: 0.01948494464159012,
+    scale: 0.019_484_945,
     zero_point: 20,
 };
 const QUANT_PROTOS: Quantization = Quantization {
-    scale: 0.020889872685074806,
+    scale: 0.020_889_873,
     zero_point: -115,
 };
 
@@ -87,10 +87,7 @@ fn decode_proto_data() -> (Vec<DetectBox>, ProtoData) {
 /// boxes. This bypasses the decoder's NORM_LIMIT check (which rejects boxes
 /// whose coordinates exceed 1.01) so we always get valid pre-decoded masks
 /// for benchmarking `draw_masks`.
-fn materialize_segmentations(
-    detect: &[DetectBox],
-    proto_data: &ProtoData,
-) -> Vec<Segmentation> {
+fn materialize_segmentations(detect: &[DetectBox], proto_data: &ProtoData) -> Vec<Segmentation> {
     let protos_f32 = proto_data.protos.as_f32();
     let proto_h = protos_f32.shape()[0];
     let proto_w = protos_f32.shape()[1];
@@ -212,8 +209,7 @@ fn bench_draw_masks() {
         let mut proc = CPUProcessor::new();
 
         let result = run_bench(name, WARMUP, ITERATIONS, || {
-            proc.draw_masks(&mut dst, &detect, &segmentation)
-                .unwrap();
+            proc.draw_masks(&mut dst, &detect, &segmentation).unwrap();
         });
         result.print_summary();
     }
@@ -238,8 +234,7 @@ fn bench_draw_masks() {
         };
 
         let result = run_bench(name, WARMUP, ITERATIONS, || {
-            proc.draw_masks(&mut dst, &detect, &segmentation)
-                .unwrap();
+            proc.draw_masks(&mut dst, &detect, &segmentation).unwrap();
         });
         result.print_summary();
     }
@@ -264,7 +259,8 @@ fn bench_draw_masks_proto() {
         let mut proc = CPUProcessor::new();
 
         let result = run_bench(name, WARMUP, ITERATIONS, || {
-            proc.draw_masks_proto(&mut dst, &detect, &proto_data).unwrap();
+            proc.draw_masks_proto(&mut dst, &detect, &proto_data)
+                .unwrap();
         });
         result.print_summary();
     }
@@ -280,7 +276,10 @@ fn bench_draw_masks_proto() {
             } else if let Ok(d) = TensorImage::new(OUTPUT_W, OUTPUT_H, RGBA, None) {
                 ("draw_masks_proto/opengl/heap", d)
             } else {
-                println!("  {:50} [skipped: allocation failed]", "draw_masks_proto/opengl");
+                println!(
+                    "  {:50} [skipped: allocation failed]",
+                    "draw_masks_proto/opengl"
+                );
                 return;
             };
         let Ok(mut proc) = GLProcessorThreaded::new(None) else {
@@ -289,7 +288,8 @@ fn bench_draw_masks_proto() {
         };
 
         let result = run_bench(name, WARMUP, ITERATIONS, || {
-            proc.draw_masks_proto(&mut dst, &detect, &proto_data).unwrap();
+            proc.draw_masks_proto(&mut dst, &detect, &proto_data)
+                .unwrap();
         });
         result.print_summary();
     }

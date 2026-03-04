@@ -107,13 +107,9 @@ def generate_synthetic_outputs():
     results = []
     for spec in SYNTHETIC_OUTPUTS:
         if spec is SYNTHETIC_OUTPUTS[2]:  # boxes tensor
-            arr = np.random.randint(
-                -125, 0, size=spec["shape"], dtype=spec["dtype"]
-            )
+            arr = np.random.randint(-125, 0, size=spec["shape"], dtype=spec["dtype"])
         else:
-            arr = np.random.randint(
-                -128, 127, size=spec["shape"], dtype=spec["dtype"]
-            )
+            arr = np.random.randint(-128, 127, size=spec["shape"], dtype=spec["dtype"])
         results.append(arr)
     return results
 
@@ -158,9 +154,7 @@ def bench_old_path(decoder, processor, dst, outputs, n_iter):
     for _ in range(n_iter):
         t0 = time.perf_counter()
         boxes, scores, classes, masks = decoder.decode(outputs)
-        processor.draw_masks(
-            dst, bbox=boxes, scores=scores, classes=classes, seg=masks
-        )
+        processor.draw_masks(dst, bbox=boxes, scores=scores, classes=classes, seg=masks)
         elapsed = time.perf_counter() - t0
         times.append(elapsed * 1000)  # ms
         n_dets = len(boxes)
@@ -211,10 +205,8 @@ def verify_mask_correctness(
     )
 
     # Get individual masks at output resolution
-    boxes_dm, scores_dm, classes_dm, masks_dm = (
-        decoder.decode_masks(
-            outputs, processor, output_width=output_width, output_height=output_height
-        )
+    boxes_dm, scores_dm, classes_dm, masks_dm = decoder.decode_masks(
+        outputs, processor, output_width=output_width, output_height=output_height
     )
 
     n_ref = len(boxes_ref)
@@ -222,8 +214,7 @@ def verify_mask_correctness(
 
     if n_ref != n_dm:
         print(
-            f"  FAIL: detection count mismatch: "
-            f"decode()={n_ref}, decode_masks()={n_dm}"
+            f"  FAIL: detection count mismatch: decode()={n_ref}, decode_masks()={n_dm}"
         )
         return False
 
@@ -246,16 +237,11 @@ def verify_mask_correctness(
         # Check that the mask has some non-zero pixels
         n_nonzero = int(np.sum(mask > 0))
         if n_nonzero == 0 and mask.size > 4:
-            print(
-                f"  WARNING: detection {i}: all-zero mask "
-                f"(shape {mask.shape})"
-            )
+            print(f"  WARNING: detection {i}: all-zero mask (shape {mask.shape})")
 
     ok = mismatched == 0
     status = "PASS" if ok else "FAIL"
-    print(
-        f"  Mask correctness: {n_dm} detections [{status}]"
-    )
+    print(f"  Mask correctness: {n_dm} detections [{status}]")
     return ok
 
 
@@ -486,7 +472,7 @@ def main():
             atlas_saved = statistics.mean(old_times) - statistics.mean(atlas_times)
             print(f"    -> {atlas_speedup:.2f}x ({atlas_saved:+.2f}ms vs 2-step)")
             thresh_results["decode_masks"] = compute_stats(atlas_times)
-        except RuntimeError as e:
+        except RuntimeError:
             # Atlas may fail if detection count * output_height exceeds
             # GL_MAX_TEXTURE_SIZE (e.g. 100 detections * 640 = 64000 > 16384).
             print(
