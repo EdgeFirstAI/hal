@@ -451,6 +451,14 @@ pub type PySegDetOutput<'py> = (
     Vec<Bound<'py, PyArray3<u8>>>,
 );
 
+/// Like [`PySegDetOutput`] but with 2D masks `(H, W)` instead of 3D `(H, W, C)`.
+pub type PySegDetOutput2D<'py> = (
+    Bound<'py, PyArray2<f32>>,
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<usize>>,
+    Vec<Bound<'py, PyArray2<u8>>>,
+);
+
 #[derive(FromPyObject)]
 pub enum ArrayQuantized<'a> {
     UInt8(PyReadonlyArrayDyn<'a, u8>),
@@ -985,12 +993,7 @@ impl PyDecoder {
         output_width: usize,
         output_height: usize,
         max_boxes: usize,
-    ) -> PyResult<(
-        Bound<'py, PyArray2<f32>>,
-        Bound<'py, PyArray1<f32>>,
-        Bound<'py, PyArray1<usize>>,
-        Vec<Bound<'py, PyArray2<u8>>>,
-    )> {
+    ) -> PyResult<PySegDetOutput2D<'py>> {
         let mut output_boxes = Vec::with_capacity(max_boxes);
         let proto_result = Self::decode_proto_result(&self_, &model_output, &mut output_boxes)?;
 
