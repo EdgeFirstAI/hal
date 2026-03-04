@@ -441,6 +441,13 @@ class Decoder:
         ``uint8`` array of shape ``(H, W)`` covering the detection's bounding
         box region, where 255 indicates mask presence.
 
+        Args:
+            model_output: List of model output tensors (same types as ``decode``).
+            processor: ImageProcessor instance for GPU-accelerated mask rendering.
+            output_width: Width of the mask output resolution (default: 640).
+            output_height: Height of the mask output resolution (default: 640).
+            max_boxes: Maximum number of detections to return (default: 100).
+
         Returns:
             ``(boxes, scores, classes, masks)`` where masks is a list of
             ``ndarray[H, W]`` of ``uint8`` — one per detection.

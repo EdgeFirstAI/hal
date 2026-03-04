@@ -2184,7 +2184,8 @@ impl GLProcessorST {
     /// as a contiguous buffer, with one PBO readback for all masks.
     ///
     /// Returns `(atlas_pixels, metadata)` where `atlas_pixels` is a contiguous
-    /// `Vec<u8>` of size `output_width * output_height * N` and `metadata`
+    /// `Vec<u8>` of size `output_width * compact_atlas_height` (where
+    /// `compact_atlas_height` is the sum of padded bbox heights) and `metadata`
     /// contains per-detection bbox info (with empty pixel vecs).
     pub fn decode_masks_atlas(
         &mut self,
@@ -6332,10 +6333,10 @@ void main() {
     for (int i = 0; i < groups; i++) {
         int base = i * 4;
         vec4 raw = vec4(
-            float(texelFetch(proto_tex, ivec3(ix, iy, base), 0).r),
-            float(texelFetch(proto_tex, ivec3(ix, iy, base + 1), 0).r),
-            float(texelFetch(proto_tex, ivec3(ix, iy, base + 2), 0).r),
-            float(texelFetch(proto_tex, ivec3(ix, iy, base + 3), 0).r)
+            float(texelFetch(proto_tex, ivec3(ix, iy, min(base, num_protos - 1)), 0).r),
+            float(texelFetch(proto_tex, ivec3(ix, iy, min(base + 1, num_protos - 1)), 0).r),
+            float(texelFetch(proto_tex, ivec3(ix, iy, min(base + 2, num_protos - 1)), 0).r),
+            float(texelFetch(proto_tex, ivec3(ix, iy, min(base + 3, num_protos - 1)), 0).r)
         );
         acc += dot(mask_coeff[i], raw);
     }
@@ -6384,29 +6385,33 @@ void main() {
     float acc = 0.0;
     for (int i = 0; i < groups; i++) {
         int base = i * 4;
+        int l0 = min(base, num_protos - 1);
+        int l1 = min(base + 1, num_protos - 1);
+        int l2 = min(base + 2, num_protos - 1);
+        int l3 = min(base + 3, num_protos - 1);
         vec4 r00 = vec4(
-            float(texelFetch(proto_tex, ivec3(p0.x, p0.y, base), 0).r),
-            float(texelFetch(proto_tex, ivec3(p0.x, p0.y, base + 1), 0).r),
-            float(texelFetch(proto_tex, ivec3(p0.x, p0.y, base + 2), 0).r),
-            float(texelFetch(proto_tex, ivec3(p0.x, p0.y, base + 3), 0).r)
+            float(texelFetch(proto_tex, ivec3(p0.x, p0.y, l0), 0).r),
+            float(texelFetch(proto_tex, ivec3(p0.x, p0.y, l1), 0).r),
+            float(texelFetch(proto_tex, ivec3(p0.x, p0.y, l2), 0).r),
+            float(texelFetch(proto_tex, ivec3(p0.x, p0.y, l3), 0).r)
         );
         vec4 r10 = vec4(
-            float(texelFetch(proto_tex, ivec3(p1.x, p0.y, base), 0).r),
-            float(texelFetch(proto_tex, ivec3(p1.x, p0.y, base + 1), 0).r),
-            float(texelFetch(proto_tex, ivec3(p1.x, p0.y, base + 2), 0).r),
-            float(texelFetch(proto_tex, ivec3(p1.x, p0.y, base + 3), 0).r)
+            float(texelFetch(proto_tex, ivec3(p1.x, p0.y, l0), 0).r),
+            float(texelFetch(proto_tex, ivec3(p1.x, p0.y, l1), 0).r),
+            float(texelFetch(proto_tex, ivec3(p1.x, p0.y, l2), 0).r),
+            float(texelFetch(proto_tex, ivec3(p1.x, p0.y, l3), 0).r)
         );
         vec4 r01 = vec4(
-            float(texelFetch(proto_tex, ivec3(p0.x, p1.y, base), 0).r),
-            float(texelFetch(proto_tex, ivec3(p0.x, p1.y, base + 1), 0).r),
-            float(texelFetch(proto_tex, ivec3(p0.x, p1.y, base + 2), 0).r),
-            float(texelFetch(proto_tex, ivec3(p0.x, p1.y, base + 3), 0).r)
+            float(texelFetch(proto_tex, ivec3(p0.x, p1.y, l0), 0).r),
+            float(texelFetch(proto_tex, ivec3(p0.x, p1.y, l1), 0).r),
+            float(texelFetch(proto_tex, ivec3(p0.x, p1.y, l2), 0).r),
+            float(texelFetch(proto_tex, ivec3(p0.x, p1.y, l3), 0).r)
         );
         vec4 r11 = vec4(
-            float(texelFetch(proto_tex, ivec3(p1.x, p1.y, base), 0).r),
-            float(texelFetch(proto_tex, ivec3(p1.x, p1.y, base + 1), 0).r),
-            float(texelFetch(proto_tex, ivec3(p1.x, p1.y, base + 2), 0).r),
-            float(texelFetch(proto_tex, ivec3(p1.x, p1.y, base + 3), 0).r)
+            float(texelFetch(proto_tex, ivec3(p1.x, p1.y, l0), 0).r),
+            float(texelFetch(proto_tex, ivec3(p1.x, p1.y, l1), 0).r),
+            float(texelFetch(proto_tex, ivec3(p1.x, p1.y, l2), 0).r),
+            float(texelFetch(proto_tex, ivec3(p1.x, p1.y, l3), 0).r)
         );
         vec4 interp = r00 * w00 + r10 * w10 + r01 * w01 + r11 * w11;
         acc += dot(mask_coeff[i], interp);
@@ -6441,10 +6446,10 @@ void main() {
     for (int i = 0; i < groups; i++) {
         int base = i * 4;
         vec4 val = vec4(
-            texture(proto_tex, vec3(tc, float(base))).r,
-            texture(proto_tex, vec3(tc, float(base + 1))).r,
-            texture(proto_tex, vec3(tc, float(base + 2))).r,
-            texture(proto_tex, vec3(tc, float(base + 3))).r
+            texture(proto_tex, vec3(tc, float(min(base, num_protos - 1)))).r,
+            texture(proto_tex, vec3(tc, float(min(base + 1, num_protos - 1)))).r,
+            texture(proto_tex, vec3(tc, float(min(base + 2, num_protos - 1)))).r,
+            texture(proto_tex, vec3(tc, float(min(base + 3, num_protos - 1)))).r
         );
         acc += dot(mask_coeff[i], val);
     }

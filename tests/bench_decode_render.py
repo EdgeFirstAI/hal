@@ -114,7 +114,7 @@ def generate_synthetic_outputs():
     return results
 
 
-def get_target_info(gpu_display):
+def get_target_info():
     """Collect target identification for cross-target comparison."""
     info = {
         "hostname": socket.gethostname(),
@@ -324,7 +324,7 @@ def main():
         gpu_display = None
 
     # --- Collect target info and prepare results dict ---
-    target_info = get_target_info(gpu_display)
+    target_info = get_target_info()
     results = {}
 
     # --- Setup decoder config ---
