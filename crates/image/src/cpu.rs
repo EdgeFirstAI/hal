@@ -4,7 +4,7 @@
 use crate::{
     fourcc_is_int8, fourcc_uint8_equivalent, Crop, Error, Flip, FunctionTimer, ImageProcessorTrait,
     Rect, Result, Rotation, TensorImage, TensorImageDst, TensorImageRef, GREY, NV12, NV16,
-    PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, VYUY, YUYV,
+    BGRA, PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, VYUY, YUYV,
 };
 use edgefirst_decoder::{DetectBox, ProtoData, Segmentation};
 use edgefirst_tensor::{TensorMapTrait, TensorTrait};
@@ -158,7 +158,7 @@ impl CPUProcessor {
 
     fn convert_nv12_to_rgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), NV12);
-        assert_eq!(dst.fourcc(), RGBA);
+        assert!(matches!(dst.fourcc(), RGBA | BGRA));
         let map = src.tensor.map()?;
         let y_stride = src.width() as u32;
         let uv_stride = src.width() as u32;
@@ -227,7 +227,7 @@ impl CPUProcessor {
 
     fn convert_yuyv_to_rgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), YUYV);
-        assert_eq!(dst.fourcc(), RGBA);
+        assert!(matches!(dst.fourcc(), RGBA | BGRA));
         let src = yuv::YuvPackedImage::<u8> {
             yuy: &src.tensor.map()?,
             yuy_stride: src.row_stride() as u32, // we assume packed yuyv
@@ -318,7 +318,7 @@ impl CPUProcessor {
 
     fn convert_vyuy_to_rgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), VYUY);
-        assert_eq!(dst.fourcc(), RGBA);
+        assert!(matches!(dst.fourcc(), RGBA | BGRA));
         let src = yuv::YuvPackedImage::<u8> {
             yuy: &src.tensor.map()?,
             yuy_stride: src.row_stride() as u32,
@@ -413,7 +413,7 @@ impl CPUProcessor {
 
     fn convert_grey_to_rgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), GREY);
-        assert_eq!(dst.fourcc(), RGBA);
+        assert!(matches!(dst.fourcc(), RGBA | BGRA));
         let src = yuv::YuvGrayImage::<u8> {
             y_plane: &src.tensor.map()?,
             y_stride: src.row_stride() as u32,
@@ -697,7 +697,7 @@ impl CPUProcessor {
 
     fn convert_rgb_to_rgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), RGB);
-        assert_eq!(dst.fourcc(), RGBA);
+        assert!(matches!(dst.fourcc(), RGBA | BGRA));
 
         Ok(yuv::rgb_to_rgba(
             src.tensor.map()?.as_slice(),
@@ -878,8 +878,21 @@ impl CPUProcessor {
     }
 
     fn copy_image(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
-        assert_eq!(src.fourcc(), dst.fourcc());
+        assert!(
+            src.fourcc() == dst.fourcc()
+                || matches!((src.fourcc(), dst.fourcc()), (RGBA, BGRA) | (BGRA, RGBA))
+        );
         dst.tensor().map()?.copy_from_slice(&src.tensor().map()?);
+        Ok(())
+    }
+
+    /// Swap R and B channels in-place for an interleaved 4-channel image.
+    fn swizzle_rb_4chan(dst: &mut TensorImage) -> Result<()> {
+        let mut map = dst.tensor().map()?;
+        let buf = map.as_mut_slice();
+        for chunk in buf.chunks_exact_mut(4) {
+            chunk.swap(0, 2);
+        }
         Ok(())
     }
 
@@ -912,7 +925,7 @@ impl CPUProcessor {
 
     fn convert_nv16_to_rgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), NV16);
-        assert_eq!(dst.fourcc(), RGBA);
+        assert!(matches!(dst.fourcc(), RGBA | BGRA));
         let map = src.tensor.map()?;
         let y_stride = src.width() as u32;
         let uv_stride = src.width() as u32;
@@ -964,7 +977,7 @@ impl CPUProcessor {
 
     fn convert_8bps_to_rgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), PLANAR_RGB);
-        assert_eq!(dst.fourcc(), RGBA);
+        assert!(matches!(dst.fourcc(), RGBA | BGRA));
 
         let src_map = src.tensor().map()?;
         let src_ = src_map.as_slice();
@@ -1016,7 +1029,7 @@ impl CPUProcessor {
 
     fn convert_prgba_to_rgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), PLANAR_RGBA);
-        assert_eq!(dst.fourcc(), RGBA);
+        assert!(matches!(dst.fourcc(), RGBA | BGRA));
 
         let src_map = src.tensor().map()?;
         let src_ = src_map.as_slice();
@@ -1145,6 +1158,46 @@ impl CPUProcessor {
             (PLANAR_RGB, RGBA) => Self::convert_8bps_to_rgba(src, dst),
             (PLANAR_RGBA, RGB) => Self::convert_prgba_to_rgb(src, dst),
             (PLANAR_RGBA, RGBA) => Self::convert_prgba_to_rgba(src, dst),
+
+            // BGRA destination: convert to RGBA layout, then swap R and B
+            (BGRA, BGRA) => Self::copy_image(src, dst),
+            (NV12, BGRA) => {
+                Self::convert_nv12_to_rgba(src, dst)?;
+                Self::swizzle_rb_4chan(dst)
+            }
+            (NV16, BGRA) => {
+                Self::convert_nv16_to_rgba(src, dst)?;
+                Self::swizzle_rb_4chan(dst)
+            }
+            (YUYV, BGRA) => {
+                Self::convert_yuyv_to_rgba(src, dst)?;
+                Self::swizzle_rb_4chan(dst)
+            }
+            (VYUY, BGRA) => {
+                Self::convert_vyuy_to_rgba(src, dst)?;
+                Self::swizzle_rb_4chan(dst)
+            }
+            (RGBA, BGRA) => {
+                Self::copy_image(src, dst)?;
+                Self::swizzle_rb_4chan(dst)
+            }
+            (RGB, BGRA) => {
+                Self::convert_rgb_to_rgba(src, dst)?;
+                Self::swizzle_rb_4chan(dst)
+            }
+            (GREY, BGRA) => {
+                Self::convert_grey_to_rgba(src, dst)?;
+                Self::swizzle_rb_4chan(dst)
+            }
+            (PLANAR_RGB, BGRA) => {
+                Self::convert_8bps_to_rgba(src, dst)?;
+                Self::swizzle_rb_4chan(dst)
+            }
+            (PLANAR_RGBA, BGRA) => {
+                Self::convert_prgba_to_rgba(src, dst)?;
+                Self::swizzle_rb_4chan(dst)
+            }
+
             (s, d) => Err(Error::NotSupported(format!(
                 "Conversion from {} to {}",
                 s.display(),
