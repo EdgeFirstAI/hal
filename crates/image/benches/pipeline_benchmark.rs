@@ -28,7 +28,7 @@ mod common;
 use common::{calculate_letterbox, get_test_data, run_bench, BenchConfig, BenchSuite};
 
 use edgefirst_image::{CPUProcessor, Crop, Flip, ImageProcessorTrait, Rect, Rotation, TensorImage};
-use edgefirst_image::{NV12, PLANAR_RGB_INT8, RGB, RGBA, RGB_INT8, VYUY, YUYV};
+use edgefirst_image::{BGRA, GREY, NV12, NV16, PLANAR_RGB_INT8, RGB, RGBA, RGB_INT8, VYUY, YUYV};
 #[cfg(target_os = "linux")]
 use edgefirst_tensor::TensorMemory;
 use edgefirst_tensor::{TensorMapTrait, TensorTrait};
@@ -79,10 +79,13 @@ fn bench_letterbox(configs: &[BenchConfig], suite: &mut BenchSuite) {
             suite.record(&result);
         }
 
-        // HAL G2D (for YUYV/VYUY/NV12 input → RGBA/RGB output only)
+        // HAL G2D (for YUYV/VYUY/NV12/NV16 input → RGBA/RGB/BGRA output only)
         #[cfg(target_os = "linux")]
-        if (config.in_fmt == YUYV || config.in_fmt == VYUY || config.in_fmt == NV12)
-            && (config.out_fmt == RGBA || config.out_fmt == RGB)
+        if (config.in_fmt == YUYV
+            || config.in_fmt == VYUY
+            || config.in_fmt == NV12
+            || config.in_fmt == NV16)
+            && (config.out_fmt == RGBA || config.out_fmt == RGB || config.out_fmt == BGRA)
         {
             use edgefirst_image::G2DProcessor;
 
@@ -130,11 +133,15 @@ fn bench_letterbox(configs: &[BenchConfig], suite: &mut BenchSuite) {
             suite.record(&result);
         }
 
-        // HAL OpenGL (for YUYV/VYUY/NV12 → RGBA/RGB/RGB_INT8/PLANAR_RGB_INT8 output)
+        // HAL OpenGL (for YUYV/VYUY/NV12/NV16 → RGBA/RGB/BGRA/RGB_INT8/PLANAR_RGB_INT8 output)
         #[cfg(all(target_os = "linux", feature = "opengl"))]
-        if (config.in_fmt == YUYV || config.in_fmt == VYUY || config.in_fmt == NV12)
+        if (config.in_fmt == YUYV
+            || config.in_fmt == VYUY
+            || config.in_fmt == NV12
+            || config.in_fmt == NV16)
             && (config.out_fmt == RGBA
                 || config.out_fmt == RGB
+                || config.out_fmt == BGRA
                 || config.out_fmt == RGB_INT8
                 || config.out_fmt == PLANAR_RGB_INT8)
         {
@@ -342,10 +349,13 @@ fn bench_convert(configs: &[BenchConfig], suite: &mut BenchSuite) {
             suite.record(&result);
         }
 
-        // HAL G2D (for YUYV/VYUY/NV12 input → RGBA/RGB output only)
+        // HAL G2D (for YUYV/VYUY/NV12/NV16 input → RGBA/RGB/BGRA output only)
         #[cfg(target_os = "linux")]
-        if (config.in_fmt == YUYV || config.in_fmt == VYUY || config.in_fmt == NV12)
-            && (config.out_fmt == RGBA || config.out_fmt == RGB)
+        if (config.in_fmt == YUYV
+            || config.in_fmt == VYUY
+            || config.in_fmt == NV12
+            || config.in_fmt == NV16)
+            && (config.out_fmt == RGBA || config.out_fmt == RGB || config.out_fmt == BGRA)
         {
             use edgefirst_image::G2DProcessor;
 
@@ -395,11 +405,15 @@ fn bench_convert(configs: &[BenchConfig], suite: &mut BenchSuite) {
             suite.record(&result);
         }
 
-        // HAL OpenGL (for YUYV/VYUY/NV12 → RGBA/RGB/RGB_INT8/PLANAR_RGB_INT8)
+        // HAL OpenGL (for YUYV/VYUY/NV12/NV16 → RGBA/RGB/BGRA/RGB_INT8/PLANAR_RGB_INT8)
         #[cfg(all(target_os = "linux", feature = "opengl"))]
-        if (config.in_fmt == YUYV || config.in_fmt == VYUY || config.in_fmt == NV12)
+        if (config.in_fmt == YUYV
+            || config.in_fmt == VYUY
+            || config.in_fmt == NV12
+            || config.in_fmt == NV16)
             && (config.out_fmt == RGBA
                 || config.out_fmt == RGB
+                || config.out_fmt == BGRA
                 || config.out_fmt == RGB_INT8
                 || config.out_fmt == PLANAR_RGB_INT8)
         {
@@ -848,6 +862,88 @@ fn bench_letterbox_pipeline(suite: &mut BenchSuite) {
 }
 
 // =============================================================================
+// Rotation Benchmarks
+// =============================================================================
+
+#[allow(unused_variables, unused_mut)]
+fn bench_rotate(suite: &mut BenchSuite) {
+    println!("\n== Rotate ==\n");
+
+    let rotations = [
+        (Rotation::Clockwise90, "CW90"),
+        (Rotation::Rotate180, "180"),
+        (Rotation::CounterClockwise90, "CCW90"),
+    ];
+
+    let configs: &[(usize, usize, &str)] = &[(1920, 1080, "1080p"), (3840, 2160, "4K")];
+
+    for &(w, h, res) in configs {
+        for &(rotation, rot_name) in &rotations {
+            let throughput = (w * h * 4) as u64; // RGBA
+
+            // CPU
+            {
+                let name = format!("rotate/cpu/{res}/{rot_name}/RGBA");
+                let src = TensorImage::new(w, h, RGBA, None).unwrap();
+                src.tensor().map().unwrap().as_mut_slice().fill(128);
+                let (dst_w, dst_h) = match rotation {
+                    Rotation::Rotate180 | Rotation::None => (w, h),
+                    _ => (h, w), // Clockwise90 and CounterClockwise90 swap dimensions
+                };
+                let mut dst = TensorImage::new(dst_w, dst_h, RGBA, None).unwrap();
+                let mut proc = CPUProcessor::new();
+
+                let result = run_bench(&name, WARMUP, ITERATIONS, || {
+                    proc.convert(&src, &mut dst, rotation, Flip::None, Crop::no_crop())
+                        .unwrap();
+                });
+                result.print_summary_with_throughput(throughput);
+                suite.record(&result);
+            }
+
+            // OpenGL
+            #[cfg(all(target_os = "linux", feature = "opengl"))]
+            {
+                use edgefirst_image::GLProcessorThreaded;
+
+                let name = format!("rotate/opengl/{res}/{rot_name}/RGBA");
+                let Ok(src) = TensorImage::new(w, h, RGBA, Some(TensorMemory::Dma)) else {
+                    println!("  {:50} [skipped: DMA unavailable]", name);
+                    continue;
+                };
+                src.tensor().map().unwrap().as_mut_slice().fill(128);
+                let (dst_w, dst_h) = match rotation {
+                    Rotation::Rotate180 | Rotation::None => (w, h),
+                    _ => (h, w),
+                };
+                let Ok(mut dst) = TensorImage::new(dst_w, dst_h, RGBA, Some(TensorMemory::Dma))
+                else {
+                    println!("  {:50} [skipped: DMA unavailable]", name);
+                    continue;
+                };
+                let Ok(mut proc) = GLProcessorThreaded::new(None) else {
+                    println!("  {:50} [skipped: OpenGL unavailable]", name);
+                    continue;
+                };
+
+                if let Err(e) = proc.convert(&src, &mut dst, rotation, Flip::None, Crop::no_crop())
+                {
+                    println!("  {:50} [skipped: {}]", name, e);
+                    continue;
+                }
+
+                let result = run_bench(&name, WARMUP, ITERATIONS, || {
+                    proc.convert(&src, &mut dst, rotation, Flip::None, Crop::no_crop())
+                        .unwrap();
+                });
+                result.print_summary_with_throughput(throughput);
+                suite.record(&result);
+            }
+        }
+    }
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
@@ -879,6 +975,11 @@ fn main() {
         BenchConfig::new(3840, 2160, 1280, 1280, YUYV, RGB),
         BenchConfig::new(3840, 2160, 1280, 1280, YUYV, RGB_INT8),
         BenchConfig::new(3840, 2160, 1280, 1280, NV12, RGBA),
+        // BGRA destinations
+        BenchConfig::new(1920, 1080, 640, 640, YUYV, BGRA),
+        BenchConfig::new(3840, 2160, 640, 640, YUYV, BGRA),
+        // NV16 input
+        BenchConfig::new(1920, 1080, 640, 640, NV16, RGBA),
     ];
     bench_letterbox(&letterbox_configs, &mut suite);
 
@@ -900,6 +1001,13 @@ fn main() {
         BenchConfig::new(3840, 2160, 3840, 2160, NV12, RGBA),
         BenchConfig::new(3840, 2160, 3840, 2160, NV12, RGB),
         BenchConfig::new(3840, 2160, 3840, 2160, RGB, RGBA),
+        // BGRA conversions
+        BenchConfig::new(1920, 1080, 1920, 1080, RGBA, BGRA),
+        BenchConfig::new(1920, 1080, 1920, 1080, RGB, BGRA),
+        // NV16 conversions
+        BenchConfig::new(1920, 1080, 1920, 1080, NV16, RGBA),
+        // GREY destination
+        BenchConfig::new(1920, 1080, 1920, 1080, RGBA, GREY),
     ];
     bench_convert(&convert_configs, &mut suite);
 
@@ -914,6 +1022,9 @@ fn main() {
         BenchConfig::new(1920, 1080, 1280, 720, YUYV, RGBA),
     ];
     bench_resize(&resize_configs, &mut suite);
+
+    // --- Rotation benchmarks ---
+    bench_rotate(&mut suite);
 
     // --- Letterbox pipeline ---
     bench_letterbox_pipeline(&mut suite);
