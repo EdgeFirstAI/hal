@@ -32,7 +32,6 @@ libc = { workspace = true }
 nix = { workspace = true }
 
 [dev-dependencies]
-divan = { workspace = true }
 edgefirst-bench = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]

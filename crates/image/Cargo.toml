@@ -50,7 +50,6 @@ g2d-sys = { workspace = true }
 gbm = { workspace = true, optional = true }
 
 [dev-dependencies]
-divan = { workspace = true }
 edgefirst-bench = { workspace = true }
 image = { workspace = true }
 image-compare = { workspace = true }
