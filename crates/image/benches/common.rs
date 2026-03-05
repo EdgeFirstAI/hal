@@ -15,7 +15,7 @@ use edgefirst_image::{G2DProcessor, TensorImage};
 use edgefirst_tensor::TensorMemory;
 
 // Re-export the benchmark harness from the shared crate.
-pub use edgefirst_bench::{run_bench, BenchResult};
+pub use edgefirst_bench::{run_bench, BenchResult, BenchSuite};
 
 // =============================================================================
 // Hardware Availability Cache

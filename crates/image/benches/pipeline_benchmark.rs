@@ -25,7 +25,7 @@
 
 mod common;
 
-use common::{calculate_letterbox, get_test_data, run_bench, BenchConfig};
+use common::{calculate_letterbox, get_test_data, run_bench, BenchConfig, BenchSuite};
 
 use edgefirst_image::{CPUProcessor, Crop, Flip, ImageProcessorTrait, Rect, Rotation, TensorImage};
 use edgefirst_image::{NV12, PLANAR_RGB_INT8, RGB, RGBA, RGB_INT8, VYUY, YUYV};
@@ -50,7 +50,7 @@ const ITERATIONS: usize = 100;
 // =============================================================================
 
 #[allow(unused_variables)]
-fn bench_letterbox(configs: &[BenchConfig]) {
+fn bench_letterbox(configs: &[BenchConfig], suite: &mut BenchSuite) {
     println!("\n== Letterbox: Camera → Model ==\n");
 
     for config in configs {
@@ -76,6 +76,7 @@ fn bench_letterbox(configs: &[BenchConfig]) {
                     .unwrap();
             });
             result.print_summary_with_throughput(throughput);
+            suite.record(&result);
         }
 
         // HAL G2D (for YUYV/VYUY/NV12 input → RGBA/RGB output only)
@@ -126,6 +127,7 @@ fn bench_letterbox(configs: &[BenchConfig]) {
                     .unwrap();
             });
             result.print_summary_with_throughput(throughput);
+            suite.record(&result);
         }
 
         // HAL OpenGL (for YUYV/VYUY/NV12 → RGBA/RGB/RGB_INT8/PLANAR_RGB_INT8 output)
@@ -175,11 +177,12 @@ fn bench_letterbox(configs: &[BenchConfig]) {
                     .unwrap();
             });
             result.print_summary_with_throughput(throughput);
+            suite.record(&result);
         }
 
         // OpenCV
         #[cfg(feature = "opencv")]
-        bench_letterbox_opencv(config, left, top, new_w, new_h, throughput);
+        bench_letterbox_opencv(config, left, top, new_w, new_h, throughput, suite);
     }
 }
 
@@ -192,6 +195,7 @@ fn bench_letterbox_opencv(
     new_w: usize,
     new_h: usize,
     throughput: u64,
+    suite: &mut BenchSuite,
 ) {
     let color_code = if config.in_fmt == YUYV && config.out_fmt == RGBA {
         imgproc::COLOR_YUV2RGBA_YUYV
@@ -265,6 +269,7 @@ fn bench_letterbox_opencv(
             resized.copy_to(&mut dst_roi).unwrap();
         });
         result.print_summary_with_throughput(throughput);
+        suite.record(&result);
     }
 
     // Multi-threaded
@@ -304,6 +309,7 @@ fn bench_letterbox_opencv(
             resized.copy_to(&mut dst_roi).unwrap();
         });
         result.print_summary_with_throughput(throughput);
+        suite.record(&result);
     }
 }
 
@@ -312,7 +318,7 @@ fn bench_letterbox_opencv(
 // =============================================================================
 
 #[allow(unused_variables)]
-fn bench_convert(configs: &[BenchConfig]) {
+fn bench_convert(configs: &[BenchConfig], suite: &mut BenchSuite) {
     println!("\n== Convert: Format Conversion ==\n");
 
     for config in configs {
@@ -333,6 +339,7 @@ fn bench_convert(configs: &[BenchConfig]) {
                     .unwrap();
             });
             result.print_summary_with_throughput(throughput);
+            suite.record(&result);
         }
 
         // HAL G2D (for YUYV/VYUY/NV12 input → RGBA/RGB output only)
@@ -385,6 +392,7 @@ fn bench_convert(configs: &[BenchConfig]) {
                     .unwrap();
             });
             result.print_summary_with_throughput(throughput);
+            suite.record(&result);
         }
 
         // HAL OpenGL (for YUYV/VYUY/NV12 → RGBA/RGB/RGB_INT8/PLANAR_RGB_INT8)
@@ -436,16 +444,17 @@ fn bench_convert(configs: &[BenchConfig]) {
                     .unwrap();
             });
             result.print_summary_with_throughput(throughput);
+            suite.record(&result);
         }
 
         // OpenCV (skip NV12)
         #[cfg(feature = "opencv")]
-        bench_convert_opencv(config, throughput);
+        bench_convert_opencv(config, throughput, suite);
     }
 }
 
 #[cfg(feature = "opencv")]
-fn bench_convert_opencv(config: &BenchConfig, throughput: u64) {
+fn bench_convert_opencv(config: &BenchConfig, throughput: u64, suite: &mut BenchSuite) {
     let color_code = match (config.in_fmt, config.out_fmt) {
         (f1, f2) if f1 == YUYV && f2 == RGBA => imgproc::COLOR_YUV2RGBA_YUYV,
         (f1, f2) if f1 == YUYV && f2 == RGB => imgproc::COLOR_YUV2RGB_YUYV,
@@ -498,6 +507,7 @@ fn bench_convert_opencv(config: &BenchConfig, throughput: u64) {
             imgproc::cvt_color_def(&src_mat, &mut dst_mat, color_code).unwrap();
         });
         result.print_summary_with_throughput(throughput);
+        suite.record(&result);
     }
 
     // Multi-threaded
@@ -520,6 +530,7 @@ fn bench_convert_opencv(config: &BenchConfig, throughput: u64) {
             imgproc::cvt_color_def(&src_mat, &mut dst_mat, color_code).unwrap();
         });
         result.print_summary_with_throughput(throughput);
+        suite.record(&result);
     }
 }
 
@@ -528,7 +539,7 @@ fn bench_convert_opencv(config: &BenchConfig, throughput: u64) {
 // =============================================================================
 
 #[allow(unused_variables)]
-fn bench_resize(configs: &[BenchConfig]) {
+fn bench_resize(configs: &[BenchConfig], suite: &mut BenchSuite) {
     println!("\n== Resize: Same Aspect Ratio ==\n");
 
     for config in configs {
@@ -549,6 +560,7 @@ fn bench_resize(configs: &[BenchConfig]) {
                     .unwrap();
             });
             result.print_summary_with_throughput(throughput);
+            suite.record(&result);
         }
 
         // HAL G2D
@@ -591,6 +603,7 @@ fn bench_resize(configs: &[BenchConfig]) {
                     .unwrap();
             });
             result.print_summary_with_throughput(throughput);
+            suite.record(&result);
         }
 
         // HAL OpenGL
@@ -637,16 +650,17 @@ fn bench_resize(configs: &[BenchConfig]) {
                     .unwrap();
             });
             result.print_summary_with_throughput(throughput);
+            suite.record(&result);
         }
 
         // OpenCV
         #[cfg(feature = "opencv")]
-        bench_resize_opencv(config, throughput);
+        bench_resize_opencv(config, throughput, suite);
     }
 }
 
 #[cfg(feature = "opencv")]
-fn bench_resize_opencv(config: &BenchConfig, throughput: u64) {
+fn bench_resize_opencv(config: &BenchConfig, throughput: u64, suite: &mut BenchSuite) {
     let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
     let src_mat = unsafe {
         Mat::new_rows_cols_with_data_unsafe(
@@ -704,6 +718,7 @@ fn bench_resize_opencv(config: &BenchConfig, throughput: u64) {
             resized.copy_to(&mut dst_mat).unwrap();
         });
         result.print_summary_with_throughput(throughput);
+        suite.record(&result);
     }
 
     // Multi-threaded
@@ -738,6 +753,7 @@ fn bench_resize_opencv(config: &BenchConfig, throughput: u64) {
             resized.copy_to(&mut dst_mat).unwrap();
         });
         result.print_summary_with_throughput(throughput);
+        suite.record(&result);
     }
 }
 
@@ -746,7 +762,7 @@ fn bench_resize_opencv(config: &BenchConfig, throughput: u64) {
 // =============================================================================
 
 #[allow(unused_variables)]
-fn bench_letterbox_pipeline() {
+fn bench_letterbox_pipeline(suite: &mut BenchSuite) {
     println!("\n== Letterbox Pipeline: Realistic Camera→Model ==\n");
 
     let pipeline_configs: &[(usize, usize, usize, usize)] = &[
@@ -788,6 +804,7 @@ fn bench_letterbox_pipeline() {
                         .unwrap();
                 });
                 result.print_summary_with_throughput(throughput);
+                suite.record(&result);
             }
 
             // G2D pipeline
@@ -824,6 +841,7 @@ fn bench_letterbox_pipeline() {
                         .unwrap();
                 });
                 result.print_summary_with_throughput(throughput);
+                suite.record(&result);
             }
         }
     }
@@ -836,7 +854,7 @@ fn bench_letterbox_pipeline() {
 fn main() {
     // Parse --bench flag (Criterion compat for `cargo bench`)
     // Just consume the flag silently — we always run benchmarks.
-    let _args: Vec<String> = std::env::args().collect();
+    let mut suite = BenchSuite::from_args();
 
     println!("Pipeline Benchmark — custom in-process harness (no fork)");
     println!("  warmup={WARMUP}  iterations={ITERATIONS}");
@@ -862,7 +880,7 @@ fn main() {
         BenchConfig::new(3840, 2160, 1280, 1280, YUYV, RGB_INT8),
         BenchConfig::new(3840, 2160, 1280, 1280, NV12, RGBA),
     ];
-    bench_letterbox(&letterbox_configs);
+    bench_letterbox(&letterbox_configs, &mut suite);
 
     // --- Convert configs ---
     let convert_configs = vec![
@@ -883,7 +901,7 @@ fn main() {
         BenchConfig::new(3840, 2160, 3840, 2160, NV12, RGB),
         BenchConfig::new(3840, 2160, 3840, 2160, RGB, RGBA),
     ];
-    bench_convert(&convert_configs);
+    bench_convert(&convert_configs, &mut suite);
 
     // --- Resize configs ---
     let resize_configs = vec![
@@ -895,10 +913,11 @@ fn main() {
         // 1080p → 720p
         BenchConfig::new(1920, 1080, 1280, 720, YUYV, RGBA),
     ];
-    bench_resize(&resize_configs);
+    bench_resize(&resize_configs, &mut suite);
 
     // --- Letterbox pipeline ---
-    bench_letterbox_pipeline();
+    bench_letterbox_pipeline(&mut suite);
 
+    suite.finish();
     println!("\nDone.");
 }
