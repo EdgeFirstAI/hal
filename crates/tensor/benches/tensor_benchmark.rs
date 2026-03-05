@@ -19,7 +19,7 @@
 
 #[cfg(target_os = "linux")]
 use edgefirst_tensor::is_dma_available;
-use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait as _};
+use edgefirst_tensor::{Tensor, TensorMapTrait as _, TensorMemory, TensorTrait as _};
 use num_traits::Num;
 
 use edgefirst_bench::{run_bench, BenchSuite};
@@ -65,6 +65,24 @@ fn bench_backend<T: Num + Clone + Send + Sync + std::fmt::Debug>(
     }
 }
 
+fn bench_memcpy(suite: &mut BenchSuite, mem: TensorMemory, backend: &str) {
+    println!("\n== memcpy/{backend} ==\n");
+    for (size, res) in SIZES {
+        let name = format!("memcpy/{backend}/{res}");
+        let tensor =
+            Tensor::<u8>::new(size.as_slice(), Some(mem), None).expect("Failed to allocate tensor");
+        let nbytes = size.iter().product::<usize>();
+        let src_data = vec![0xAAu8; nbytes];
+
+        let result = run_bench(&name, WARMUP, ITERATIONS, || {
+            let mut map = tensor.map().expect("Failed to map tensor");
+            map.as_mut_slice().copy_from_slice(&src_data);
+        });
+        result.print_summary_with_throughput(nbytes as u64);
+        suite.record(&result);
+    }
+}
+
 fn main() {
     env_logger::init();
 
@@ -88,6 +106,17 @@ fn main() {
             bench_backend::<i8>(&mut suite, TensorMemory::Dma, "dma", "i8");
         } else {
             println!("\n  {:50} [skipped: DMA unavailable]", "alloc+map/dma/*");
+        }
+    }
+
+    bench_memcpy(&mut suite, TensorMemory::Mem, "mem");
+    #[cfg(target_os = "linux")]
+    {
+        bench_memcpy(&mut suite, TensorMemory::Shm, "shm");
+        if is_dma_available() {
+            bench_memcpy(&mut suite, TensorMemory::Dma, "dma");
+        } else {
+            println!("\n  {:50} [skipped: DMA unavailable]", "memcpy/dma/*");
         }
     }
 

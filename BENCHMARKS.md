@@ -160,8 +160,11 @@ EDGEFIRST_DISABLE_GL=1 EDGEFIRST_DISABLE_CPU=1 cargo bench ...
 # On platforms with OpenGL, this triggers PBO buffer strategy
 EDGEFIRST_TENSOR_FORCE_MEM=1 cargo bench ...
 
-# Force PBO buffer strategy for OpenGL (even when DMA-buf is available)
-# TODO: requires new EDGEFIRST_FORCE_TRANSFER_BACKEND=pbo env var (Phase 0)
+# Force a specific processing backend (cpu, g2d, opengl)
+EDGEFIRST_FORCE_BACKEND=opengl cargo bench -p edgefirst-image --bench pipeline_benchmark -- --bench
+
+# Force PBO transfer strategy for OpenGL (even when DMA-buf is available)
+EDGEFIRST_FORCE_TRANSFER=pbo cargo bench -p edgefirst-image --bench pipeline_benchmark -- --bench
 ```
 
 ### Output Format

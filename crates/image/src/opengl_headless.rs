@@ -1858,14 +1858,14 @@ impl GLProcessorST {
 
         // Allow env-var override for benchmarking specific transfer paths.
         // Values: "dmabuf", "pbo", "sync" (case-insensitive).
-        if let Ok(val) = std::env::var("EDGEFIRST_FORCE_TRANSFER_BACKEND") {
+        if let Ok(val) = std::env::var("EDGEFIRST_FORCE_TRANSFER") {
             let forced = match val.to_ascii_lowercase().as_str() {
                 "dmabuf" | "dma" => Some(TransferBackend::DmaBuf),
                 "pbo" => Some(TransferBackend::Pbo),
                 "sync" => Some(TransferBackend::Sync),
                 other => {
                     log::warn!(
-                        "EDGEFIRST_FORCE_TRANSFER_BACKEND={other:?} not recognised \
+                        "EDGEFIRST_FORCE_TRANSFER={other:?} not recognised \
                          (expected dmabuf|pbo|sync), ignoring"
                     );
                     None
@@ -1873,7 +1873,7 @@ impl GLProcessorST {
             };
             if let Some(backend) = forced {
                 log::info!(
-                    "EDGEFIRST_FORCE_TRANSFER_BACKEND override: {:?} → {backend:?}",
+                    "EDGEFIRST_FORCE_TRANSFER override: {:?} → {backend:?}",
                     converter.gl_context.transfer_backend
                 );
                 converter.gl_context.transfer_backend = backend;
