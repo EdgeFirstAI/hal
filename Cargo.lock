@@ -560,7 +560,7 @@ name = "edgefirst-decoder"
 version = "0.9.0"
 dependencies = [
  "argminmax",
- "divan",
+ "edgefirst-bench",
  "env_logger",
  "fast-math",
  "image",
