@@ -39,6 +39,11 @@ converter.convert(&img, &mut dst, Rotation::None, Flip::None, Crop::default())?;
 ## Environment Variables
 The behavior of the `edgefirst_image::ImageProcessor` struct can be influenced by the
 following environment variables:
+- `EDGEFIRST_FORCE_BACKEND`: When set to `cpu`, `g2d`, or `opengl` (case-insensitive),
+  only that single backend is initialized and no fallback chain is used. If the
+  forced backend fails to initialize, an error is returned immediately. This is
+  useful for benchmarking individual backends in isolation. When this variable is
+  set, the `EDGEFIRST_DISABLE_*` variables are ignored.
 - `EDGEFIRST_DISABLE_GL`: If set to `1`, disables the use of OpenGL for image
   conversion, forcing the use of CPU or other available hardware methods.
 - `EDGEFIRST_DISABLE_G2D`: If set to `1`, disables the use of G2D for image
@@ -1348,6 +1353,17 @@ pub struct ImageProcessorConfig {
     pub egl_display: Option<EglDisplayKind>,
 }
 
+/// Backend forced via the `EDGEFIRST_FORCE_BACKEND` environment variable.
+///
+/// When set, the [`ImageProcessor`] only initializes and dispatches to the
+/// selected backend — no fallback chain is used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForcedBackend {
+    Cpu,
+    G2d,
+    OpenGl,
+}
+
 /// Image converter that uses available hardware acceleration or CPU as a
 /// fallback.
 #[derive(Debug)]
@@ -1367,6 +1383,9 @@ pub struct ImageProcessor {
     /// if the EDGEFIRST_DISABLE_GL environment variable is not set and OpenGL
     /// ES is available.
     pub opengl: Option<GLProcessorThreaded>,
+
+    /// When set, only the specified backend is used — no fallback chain.
+    pub(crate) forced_backend: Option<ForcedBackend>,
 }
 
 unsafe impl Send for ImageProcessor {}
@@ -1399,6 +1418,86 @@ impl ImageProcessor {
     /// still takes precedence over any override.
     #[allow(unused_variables)]
     pub fn with_config(config: ImageProcessorConfig) -> Result<Self> {
+        // ── EDGEFIRST_FORCE_BACKEND ──────────────────────────────────
+        // When set, only the requested backend is initialised and no
+        // fallback chain is used. Accepted values (case-insensitive):
+        //   "cpu", "g2d", "opengl"
+        if let Ok(val) = std::env::var("EDGEFIRST_FORCE_BACKEND") {
+            let val_lower = val.to_lowercase();
+            let forced = match val_lower.as_str() {
+                "cpu" => ForcedBackend::Cpu,
+                "g2d" => ForcedBackend::G2d,
+                "opengl" => ForcedBackend::OpenGl,
+                other => {
+                    return Err(Error::ForcedBackendUnavailable(format!(
+                        "unknown EDGEFIRST_FORCE_BACKEND value: {other:?} (expected cpu, g2d, or opengl)"
+                    )));
+                }
+            };
+
+            log::info!("EDGEFIRST_FORCE_BACKEND={val} — only initializing {val_lower} backend");
+
+            return match forced {
+                ForcedBackend::Cpu => Ok(Self {
+                    cpu: Some(CPUProcessor::new()),
+                    #[cfg(target_os = "linux")]
+                    g2d: None,
+                    #[cfg(target_os = "linux")]
+                    #[cfg(feature = "opengl")]
+                    opengl: None,
+                    forced_backend: Some(ForcedBackend::Cpu),
+                }),
+                ForcedBackend::G2d => {
+                    #[cfg(target_os = "linux")]
+                    {
+                        let g2d = G2DProcessor::new().map_err(|e| {
+                            Error::ForcedBackendUnavailable(format!(
+                                "g2d forced but failed to initialize: {e:?}"
+                            ))
+                        })?;
+                        Ok(Self {
+                            cpu: None,
+                            g2d: Some(g2d),
+                            #[cfg(feature = "opengl")]
+                            opengl: None,
+                            forced_backend: Some(ForcedBackend::G2d),
+                        })
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        Err(Error::ForcedBackendUnavailable(
+                            "g2d backend is only available on Linux".into(),
+                        ))
+                    }
+                }
+                ForcedBackend::OpenGl => {
+                    #[cfg(target_os = "linux")]
+                    #[cfg(feature = "opengl")]
+                    {
+                        let opengl = GLProcessorThreaded::new(config.egl_display).map_err(|e| {
+                            Error::ForcedBackendUnavailable(format!(
+                                "opengl forced but failed to initialize: {e:?}"
+                            ))
+                        })?;
+                        Ok(Self {
+                            cpu: None,
+                            g2d: None,
+                            opengl: Some(opengl),
+                            forced_backend: Some(ForcedBackend::OpenGl),
+                        })
+                    }
+                    #[cfg(not(all(target_os = "linux", feature = "opengl")))]
+                    {
+                        Err(Error::ForcedBackendUnavailable(
+                            "opengl backend requires Linux with the 'opengl' feature enabled"
+                                .into(),
+                        ))
+                    }
+                }
+            };
+        }
+
+        // ── Existing DISABLE logic (unchanged) ──────────────────────
         #[cfg(target_os = "linux")]
         let g2d = if std::env::var("EDGEFIRST_DISABLE_G2D")
             .map(|x| x != "0" && x.to_lowercase() != "false")
@@ -1450,6 +1549,7 @@ impl ImageProcessor {
             #[cfg(target_os = "linux")]
             #[cfg(feature = "opengl")]
             opengl,
+            forced_backend: None,
         })
     }
 
@@ -1548,6 +1648,34 @@ impl ImageProcessorTrait for ImageProcessor {
     ) -> Result<()> {
         let start = Instant::now();
 
+        // ── Forced backend: no fallback chain ────────────────────────
+        if let Some(forced) = self.forced_backend {
+            return match forced {
+                ForcedBackend::Cpu => {
+                    if let Some(cpu) = self.cpu.as_mut() {
+                        return cpu.convert(src, dst, rotation, flip, crop);
+                    }
+                    Err(Error::ForcedBackendUnavailable("cpu".into()))
+                }
+                ForcedBackend::G2d => {
+                    #[cfg(target_os = "linux")]
+                    if let Some(g2d) = self.g2d.as_mut() {
+                        return g2d.convert(src, dst, rotation, flip, crop);
+                    }
+                    Err(Error::ForcedBackendUnavailable("g2d".into()))
+                }
+                ForcedBackend::OpenGl => {
+                    #[cfg(target_os = "linux")]
+                    #[cfg(feature = "opengl")]
+                    if let Some(opengl) = self.opengl.as_mut() {
+                        return opengl.convert(src, dst, rotation, flip, crop);
+                    }
+                    Err(Error::ForcedBackendUnavailable("opengl".into()))
+                }
+            };
+        }
+
+        // ── Existing fallback chain ──────────────────────────────────
         #[cfg(target_os = "linux")]
         if let Some(g2d) = self.g2d.as_mut() {
             log::trace!("image started with g2d in {:?}", start.elapsed());
@@ -1629,6 +1757,33 @@ impl ImageProcessorTrait for ImageProcessor {
     ) -> Result<()> {
         let start = Instant::now();
 
+        // ── Forced backend: no fallback chain ────────────────────────
+        if let Some(forced) = self.forced_backend {
+            return match forced {
+                ForcedBackend::Cpu => {
+                    if let Some(cpu) = self.cpu.as_mut() {
+                        return cpu.convert_ref(src, dst, rotation, flip, crop);
+                    }
+                    Err(Error::ForcedBackendUnavailable("cpu".into()))
+                }
+                ForcedBackend::G2d => {
+                    #[cfg(target_os = "linux")]
+                    if let Some(g2d) = self.g2d.as_mut() {
+                        return g2d.convert_ref(src, dst, rotation, flip, crop);
+                    }
+                    Err(Error::ForcedBackendUnavailable("g2d".into()))
+                }
+                ForcedBackend::OpenGl => {
+                    #[cfg(target_os = "linux")]
+                    #[cfg(feature = "opengl")]
+                    if let Some(opengl) = self.opengl.as_mut() {
+                        return opengl.convert_ref(src, dst, rotation, flip, crop);
+                    }
+                    Err(Error::ForcedBackendUnavailable("opengl".into()))
+                }
+            };
+        }
+
         // For TensorImageRef, we prefer CPU since hardware accelerators typically
         // don't support PLANAR_RGB output which is the common model input format.
         // The CPU path uses the generic conversion functions that work with any
@@ -1659,6 +1814,29 @@ impl ImageProcessorTrait for ImageProcessor {
 
         if detect.is_empty() && segmentation.is_empty() {
             return Ok(());
+        }
+
+        // ── Forced backend: no fallback chain ────────────────────────
+        if let Some(forced) = self.forced_backend {
+            return match forced {
+                ForcedBackend::Cpu => {
+                    if let Some(cpu) = self.cpu.as_mut() {
+                        return cpu.draw_masks(dst, detect, segmentation);
+                    }
+                    Err(Error::ForcedBackendUnavailable("cpu".into()))
+                }
+                ForcedBackend::G2d => Err(Error::NotSupported(
+                    "g2d does not support draw_masks".into(),
+                )),
+                ForcedBackend::OpenGl => {
+                    #[cfg(target_os = "linux")]
+                    #[cfg(feature = "opengl")]
+                    if let Some(opengl) = self.opengl.as_mut() {
+                        return opengl.draw_masks(dst, detect, segmentation);
+                    }
+                    Err(Error::ForcedBackendUnavailable("opengl".into()))
+                }
+            };
         }
 
         // skip G2D as it doesn't support rendering to image
@@ -1705,6 +1883,29 @@ impl ImageProcessorTrait for ImageProcessor {
             return Ok(());
         }
 
+        // ── Forced backend: no fallback chain ────────────────────────
+        if let Some(forced) = self.forced_backend {
+            return match forced {
+                ForcedBackend::Cpu => {
+                    if let Some(cpu) = self.cpu.as_mut() {
+                        return cpu.draw_masks_proto(dst, detect, proto_data);
+                    }
+                    Err(Error::ForcedBackendUnavailable("cpu".into()))
+                }
+                ForcedBackend::G2d => Err(Error::NotSupported(
+                    "g2d does not support draw_masks_proto".into(),
+                )),
+                ForcedBackend::OpenGl => {
+                    #[cfg(target_os = "linux")]
+                    #[cfg(feature = "opengl")]
+                    if let Some(opengl) = self.opengl.as_mut() {
+                        return opengl.draw_masks_proto(dst, detect, proto_data);
+                    }
+                    Err(Error::ForcedBackendUnavailable("opengl".into()))
+                }
+            };
+        }
+
         // skip G2D as it doesn't support rendering to image
 
         #[cfg(target_os = "linux")]
@@ -1742,6 +1943,29 @@ impl ImageProcessorTrait for ImageProcessor {
 
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<()> {
         let start = Instant::now();
+
+        // ── Forced backend: no fallback chain ────────────────────────
+        if let Some(forced) = self.forced_backend {
+            return match forced {
+                ForcedBackend::Cpu => {
+                    if let Some(cpu) = self.cpu.as_mut() {
+                        return cpu.set_class_colors(colors);
+                    }
+                    Err(Error::ForcedBackendUnavailable("cpu".into()))
+                }
+                ForcedBackend::G2d => Err(Error::NotSupported(
+                    "g2d does not support set_class_colors".into(),
+                )),
+                ForcedBackend::OpenGl => {
+                    #[cfg(target_os = "linux")]
+                    #[cfg(feature = "opengl")]
+                    if let Some(opengl) = self.opengl.as_mut() {
+                        return opengl.set_class_colors(colors);
+                    }
+                    Err(Error::ForcedBackendUnavailable("opengl".into()))
+                }
+            };
+        }
 
         // skip G2D as it doesn't support rendering to image
 
@@ -1784,6 +2008,39 @@ impl ImageProcessorTrait for ImageProcessor {
     ) -> Result<(Vec<u8>, Vec<MaskRegion>)> {
         if detect.is_empty() {
             return Ok((Vec::new(), Vec::new()));
+        }
+
+        // ── Forced backend: no fallback chain ────────────────────────
+        if let Some(forced) = self.forced_backend {
+            return match forced {
+                ForcedBackend::Cpu => {
+                    if let Some(cpu) = self.cpu.as_mut() {
+                        return cpu.decode_masks_atlas(
+                            detect,
+                            proto_data,
+                            output_width,
+                            output_height,
+                        );
+                    }
+                    Err(Error::ForcedBackendUnavailable("cpu".into()))
+                }
+                ForcedBackend::G2d => Err(Error::NotSupported(
+                    "g2d does not support decode_masks_atlas".into(),
+                )),
+                ForcedBackend::OpenGl => {
+                    #[cfg(target_os = "linux")]
+                    #[cfg(feature = "opengl")]
+                    if let Some(opengl) = self.opengl.as_mut() {
+                        return opengl.decode_masks_atlas(
+                            detect,
+                            proto_data,
+                            output_width,
+                            output_height,
+                        );
+                    }
+                    Err(Error::ForcedBackendUnavailable("opengl".into()))
+                }
+            };
         }
 
         #[cfg(target_os = "linux")]
