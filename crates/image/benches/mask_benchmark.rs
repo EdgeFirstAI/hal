@@ -22,7 +22,7 @@
 
 mod common;
 
-use common::run_bench;
+use common::{run_bench, BenchSuite};
 
 use edgefirst_decoder::yolo::impl_yolo_segdet_quant_proto;
 use edgefirst_decoder::{DetectBox, Nms, ProtoData, Quantization, Segmentation, XYWH};
@@ -144,7 +144,7 @@ fn materialize_segmentations(detect: &[DetectBox], proto_data: &ProtoData) -> Ve
 // decode_masks: CPU decode cost (not rendering)
 // =============================================================================
 
-fn bench_decode_masks() {
+fn bench_decode_masks(suite: &mut BenchSuite) {
     println!("\n== decode_masks: CPU Decode Cost ==\n");
 
     let boxes = load_boxes_i8();
@@ -167,6 +167,7 @@ fn bench_decode_masks() {
             );
         });
         result.print_summary();
+        suite.record(&result);
     }
 
     // Full decode: NMS + extract proto data + materialize pixel masks on CPU.
@@ -186,6 +187,7 @@ fn bench_decode_masks() {
             let _seg = materialize_segmentations(&output_boxes, &proto_data);
         });
         result.print_summary();
+        suite.record(&result);
     }
 }
 
@@ -194,7 +196,7 @@ fn bench_decode_masks() {
 // =============================================================================
 
 #[allow(unused_variables)]
-fn bench_draw_masks() {
+fn bench_draw_masks(suite: &mut BenchSuite) {
     println!("\n== draw_masks: Pre-decoded Mask Overlay ==\n");
 
     let (detect, proto_data) = decode_proto_data();
@@ -212,6 +214,7 @@ fn bench_draw_masks() {
             proc.draw_masks(&mut dst, &detect, &segmentation).unwrap();
         });
         result.print_summary();
+        suite.record(&result);
     }
 
     // OpenGL
@@ -237,6 +240,7 @@ fn bench_draw_masks() {
             proc.draw_masks(&mut dst, &detect, &segmentation).unwrap();
         });
         result.print_summary();
+        suite.record(&result);
     }
 }
 
@@ -245,7 +249,7 @@ fn bench_draw_masks() {
 // =============================================================================
 
 #[allow(unused_variables)]
-fn bench_draw_masks_proto() {
+fn bench_draw_masks_proto(suite: &mut BenchSuite) {
     println!("\n== draw_masks_proto: Fused Proto → Overlay ==\n");
 
     let (detect, proto_data) = decode_proto_data();
@@ -263,6 +267,7 @@ fn bench_draw_masks_proto() {
                 .unwrap();
         });
         result.print_summary();
+        suite.record(&result);
     }
 
     // OpenGL
@@ -292,6 +297,7 @@ fn bench_draw_masks_proto() {
                 .unwrap();
         });
         result.print_summary();
+        suite.record(&result);
     }
 }
 
@@ -300,7 +306,7 @@ fn bench_draw_masks_proto() {
 // =============================================================================
 
 #[allow(unused_variables)]
-fn bench_decode_masks_atlas() {
+fn bench_decode_masks_atlas(suite: &mut BenchSuite) {
     println!("\n== decode_masks_atlas: Proto → Pixel Atlas ==\n");
 
     let (detect, proto_data) = decode_proto_data();
@@ -321,6 +327,7 @@ fn bench_decode_masks_atlas() {
                 .unwrap();
         });
         result.print_summary();
+        suite.record(&result);
     }
 
     // OpenGL
@@ -340,6 +347,7 @@ fn bench_decode_masks_atlas() {
                 .unwrap();
         });
         result.print_summary();
+        suite.record(&result);
     }
 }
 
@@ -348,13 +356,16 @@ fn bench_decode_masks_atlas() {
 // =============================================================================
 
 fn main() {
+    let mut suite = BenchSuite::from_args();
+
     println!("Mask Rendering Benchmark — custom in-process harness (no fork)");
     println!("  warmup={WARMUP}  iterations={ITERATIONS}");
 
-    bench_decode_masks();
-    bench_draw_masks();
-    bench_draw_masks_proto();
-    bench_decode_masks_atlas();
+    bench_decode_masks(&mut suite);
+    bench_draw_masks(&mut suite);
+    bench_draw_masks_proto(&mut suite);
+    bench_decode_masks_atlas(&mut suite);
 
+    suite.finish();
     println!("\nDone.");
 }
