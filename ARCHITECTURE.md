@@ -1,6 +1,6 @@
 # EdgeFirst Hardware Abstraction Layer - Architecture
 
-**Version:** 2.5
+**Version:** 2.6
 **Last Updated:** March 4, 2026
 **Status:** Production
 **Audience:** Developers contributing to EdgeFirst HAL or integrating it into applications
@@ -16,28 +16,33 @@ The EdgeFirst Hardware Abstraction Layer (HAL) is a Rust-based system that provi
 ```mermaid
 graph TB
     subgraph "EdgeFirst HAL"
-        Python["Python Bindings (edgefirst-hal)<br/>PyO3-based Python API exposing core functionality"]
+        Python["Python Bindings (edgefirst-hal)<br/>PyO3-based Python API"]
+        CAPI["C API Bindings (edgefirst-hal-capi)<br/>cbindgen-generated C headers"]
         Main["Main HAL Crate (edgefirst)<br/>Re-exports tensor, image, decoder"]
-        
+
         Python --> Main
-        
+        CAPI --> Main
+
         Tensor["Tensor HAL<br/>Zero-copy memory buffers"]
         Image["Image Converter HAL<br/>Format conversion & resize"]
         Decoder["Decoder HAL<br/>Model output post-processing"]
         Tracker["Tracker HAL<br/>Multi-object tracking"]
-        
+
         Main --> Tensor
         Main --> Image
         Main --> Decoder
-        
+
         Image --> Tensor
+        Image --> Decoder
         Image --> G2D["G2D FFI (g2d-sys)<br/>NXP i.MX hardware acceleration"]
+        CAPI --> Tracker
     end
-    
+
     Tensor -.-> DMA["Linux DMA-Heap<br/>Shared Memory"]
     Decoder -.-> PostProc["Model Output<br/>Post-Processing"]
-    
+
     style Python fill:#e1f5ff
+    style CAPI fill:#e1f5ff
     style Main fill:#fff4e1
     style Tensor fill:#e8f5e9
     style Image fill:#e8f5e9
@@ -85,12 +90,26 @@ classDiagram
 ```
 
 **Key Features**:
-- Generic over numeric types (u8, i8, u16, i16, u32, i32, u64, i64, f32, f64)
+- Generic over numeric types (`T: Num + Clone + Debug + Send + Sync`) — commonly u8, i8, u16, i16, u32, i32, f32, f64
 - Automatic memory type selection with fallback chain: DMA → Shared Memory → Heap
 - PBO (Pixel Buffer Object) tensors for GPU-accelerated image processing
-- Memory mapping with `TensorMap<T>` for safe access
-- File descriptor sharing for zero-copy IPC
-- Cross-platform support (Linux optimized, macOS/Windows via heap memory)
+- Memory mapping with `TensorMap<T>` for safe access (RAII map/unmap lifecycle)
+- `BufferIdentity` for cache keying and liveness tracking (monotonic ID + `Arc<()>` guard with weak reference detection)
+- File descriptor sharing for zero-copy IPC (DMA-buf and SHM both support fd cloning)
+- Cross-platform support (Linux optimized, macOS via SHM + heap, Windows via heap only)
+
+**Tensor Memory Mapping**:
+
+Each tensor backend provides a corresponding map type that implements `TensorMapTrait<T>`:
+
+| Tensor | Map | Mechanism |
+|--------|-----|-----------|
+| `DmaTensor<T>` | `DmaMap<T>` | `mmap` + `DMA_BUF_IOCTL_SYNC` for cache coherency |
+| `ShmTensor<T>` | `ShmMap<T>` | `mmap`/`munmap` on POSIX shared memory fd |
+| `MemTensor<T>` | `MemMap<T>` | Direct raw pointer into `Vec<T>` (no syscall) |
+| `PboTensor<T>` | `PboMap<T>` | GL thread `glMapBufferRange`/`glUnmapBuffer` via channel |
+
+`TensorMap<T>` implements `Deref<Target=[T]>` and `DerefMut`, providing slice access. When the `ndarray` feature is enabled, `TensorMapTrait` also provides `view()` and `view_mut()` for ndarray `ArrayView` access.
 
 **Memory Type Selection Logic**:
 ```mermaid
@@ -138,33 +157,104 @@ PBO operations on orphaned tensors return `PboDisconnected`.
 classDiagram
     class ImageProcessorTrait {
         <<trait>>
-        +convert(src, dst, options)
+        +convert(src, dst, rotation, flip, crop)
+        +convert_ref(src, dst_ref, rotation, flip, crop)
+        +draw_masks(dst, detections, segmentations)
+        +draw_masks_proto(dst, detections, proto_data)
+        +decode_masks_atlas(detections, proto_data, w, h)
+        +set_class_colors(colors)
     }
-    
-    class G2DConverter {
+
+    class ImageProcessor {
+        cpu: Option~CPUProcessor~
+        g2d: Option~G2DProcessor~
+        opengl: Option~GLProcessorThreaded~
+        +new() orchestrator with fallback chain
+        +create_image(w, h, fourcc) GPU-optimal alloc
+    }
+
+    class G2DProcessor {
         NXP i.MX G2D hardware
     }
-    
-    class GLConverterThreaded {
-        OpenGL GPU acceleration
+
+    class GLProcessorThreaded {
+        Threaded OpenGL ES wrapper
+        sends messages to GL thread
     }
-    
-    class CPUConverter {
-        fast_image_resize fallback
+
+    class GLProcessorST {
+        Single-threaded GL impl
+        owns EGL context + all GL state
     }
-    
-    ImageProcessorTrait <|.. G2DConverter
-    ImageProcessorTrait <|.. GLConverterThreaded
-    ImageProcessorTrait <|.. CPUConverter
+
+    class CPUProcessor {
+        fast_image_resize + rayon
+    }
+
+    ImageProcessorTrait <|.. ImageProcessor
+    ImageProcessorTrait <|.. G2DProcessor
+    ImageProcessorTrait <|.. GLProcessorThreaded
+    ImageProcessorTrait <|.. GLProcessorST
+    ImageProcessorTrait <|.. CPUProcessor
+    ImageProcessor o-- G2DProcessor
+    ImageProcessor o-- GLProcessorThreaded
+    ImageProcessor o-- CPUProcessor
+    GLProcessorThreaded *-- GLProcessorST : owns via thread
 ```
 
+**`ImageProcessor` Dispatch Priority**: G2D (if supported for the format pair) → CPU (for same-size, no-rotation, simple format copies) → OpenGL (GPU-accelerated) → CPU (general fallback). Environment variables `EDGEFIRST_DISABLE_GL`, `EDGEFIRST_DISABLE_G2D`, `EDGEFIRST_DISABLE_CPU` can override this chain.
+
 **Supported Operations**:
-- Format conversion (YUYV, NV12, RGB, RGBA, BGRA, GREY, Planar RGB)
+- Format conversion (YUYV, VYUY, NV12, NV16, RGB, RGBA, BGRA, GREY, Planar RGB, Planar RGBA, RGB int8, Planar RGB int8)
 - Resize with various interpolation methods
 - Rotation (0°, 90°, 180°, 270°)
 - Flip (horizontal, vertical)
 - Crop and region-of-interest
-- Normalization (signed, unsigned, raw)
+- Instance segmentation mask rendering (draw and decode workflows)
+
+**TensorImage**:
+
+`TensorImage` wraps `Tensor<u8>` with pixel format metadata:
+
+```rust
+pub struct TensorImage {
+    tensor: Tensor<u8>,
+    fourcc: FourCharCode,
+    is_planar: bool,
+}
+```
+
+Width, height, channels, and stride are **not stored** — they are computed from the tensor shape and FourCC on every access. The tensor shape encoding depends on the pixel format:
+
+| Format | Tensor Shape | Notes |
+|--------|-------------|-------|
+| RGB, RGBA, BGRA, GREY, YUYV, VYUY | `[H, W, C]` | Interleaved (channels-last) |
+| PLANAR_RGB, PLANAR_RGBA, PLANAR_RGB_INT8 | `[C, H, W]` | Channels-first |
+| NV12 | `[H*3/2, W]` | 2D — Y plane (H rows) + UV plane (H/2 rows) |
+| NV16 | `[H*2, W]` | 2D — Y plane (H rows) + UV plane (H rows) |
+
+**`TensorImageRef<'a>`** is a borrowed variant wrapping `&'a mut Tensor<u8>` instead of owning it. This enables zero-copy writes directly into a model's pre-allocated input tensor.
+
+**`TensorImageDst`** trait abstracts over `TensorImage` (owned) and `TensorImageRef` (borrowed) so all image processor implementations can accept either as a destination.
+
+**Pixel Format Constants**:
+
+Pixel formats are `FourCharCode` values defined in the image crate:
+
+| Constant | FourCC | Description |
+|----------|--------|-------------|
+| `YUYV` | `"YUYV"` | 8-bit YUV 4:2:2 interleaved |
+| `VYUY` | `"VYUY"` | 8-bit YUV 4:2:2 (VYUY byte order) |
+| `NV12` | `"NV12"` | 8-bit semi-planar YUV 4:2:0 |
+| `NV16` | `"NV16"` | 8-bit semi-planar YUV 4:2:2 |
+| `RGBA` | `"RGBA"` | 8-bit RGBA |
+| `BGRA` | `"BGRA"` | 8-bit BGRA (Cairo/Wayland native) |
+| `RGB` | `"RGB "` | 8-bit RGB |
+| `GREY` | `"Y800"` | 8-bit grayscale |
+| `PLANAR_RGB` | `"8BPS"` | 8-bit channels-first RGB |
+| `PLANAR_RGBA` | `"8BPA"` | 8-bit channels-first RGBA |
+| `RGB_INT8` | `"RGBi"` | Packed RGB with uint8→int8 XOR 0x80 reinterpretation |
+| `PLANAR_RGB_INT8` | `"8BPi"` | Planar RGB with uint8→int8 XOR 0x80 reinterpretation |
 
 **Planar RGB Format**:
 Planar RGB (FourCC: 8BPS) stores color channels in separate planes rather than interleaved. This format is particularly useful for:
@@ -230,6 +320,22 @@ flowchart TD
 | DMA-buf | GPU supports EGLImage import from DMA-buf FDs | Zero-copy: `EGL_EXT_image_dma_buf_import` — the GPU reads/writes the DMA buffer directly via EGLImage, no pixel copies | NXP i.MX 8M Plus (Vivante), NXP i.MX 95 (Mali/Panfrost) |
 | PBO | OpenGL ES 3.0 available but DMA-buf roundtrip fails | Zero-copy GL binding: `GL_PIXEL_UNPACK_BUFFER` for upload, `GL_PIXEL_PACK_BUFFER` for readback — data stays in GPU-accessible memory | NVIDIA desktop GPUs, systems without DMA-buf permissions |
 | Mem | No GPU or OpenGL not available | CPU `memcpy` via `glTexImage2D`/`glReadnPixels` with mapped host pointers | All platforms (fallback) |
+
+**GL Transfer Backend Selection**:
+
+The OpenGL processor selects a transfer backend at initialization time:
+
+| Backend | Detection | GPU Upload | GPU Readback |
+|---------|-----------|-----------|--------------|
+| `DmaBuf` | `verify_dma_buf_roundtrip()` passes | `EGL_EXT_image_dma_buf_import` (zero-copy) | EGLImage export (zero-copy) |
+| `Pbo` | OpenGL ES 3.0 available, DMA-buf fails | `GL_PIXEL_UNPACK_BUFFER` | `GL_PIXEL_PACK_BUFFER` |
+| `Sync` | Fallback | `glTexImage2D` with host pointer | `glReadnPixels` to host pointer |
+
+**GL Thread Architecture**:
+
+`GLProcessorThreaded` is the public thread-safe wrapper. It spawns a dedicated GL thread that owns the EGL context and all GL state (`GLProcessorST`). All operations are sent as `GLProcessorMessage` enum variants through a channel and block on a oneshot reply. This design is required because EGL contexts are thread-local — all GL calls must happen on the thread that created the context.
+
+The `PboOps` trait bridges the tensor crate and the GL thread: `PboTensor` holds a `WeakSender` to the GL thread channel. When the tensor needs to map/unmap/delete the PBO, it sends a message through this channel. The weak sender ensures PBO tensors don't prevent GL thread shutdown.
 
 **Why PBO matters**: On desktop Linux with NVIDIA GPUs, DMA-buf allocation
 succeeds (via `/dev/dma_heap/system`) but the NVIDIA EGL driver cannot import
@@ -500,18 +606,43 @@ flowchart LR
     PyO3[PyO3 Bindings]
     Rust[Rust Core HAL]
     HW[Hardware Accelerators / CPU]
-    
+
     Py --> PyO3
     PyO3 --> Rust
     Rust --> HW
-    
+
     style Py fill:#3776ab,color:#fff
     style PyO3 fill:#ce422b
     style Rust fill:#dea584
     style HW fill:#90ee90
 ```
 
-### 6. G2D FFI (`g2d-sys`)
+### Cross-Crate Dependencies
+
+The `edgefirst_image` crate depends on `edgefirst_decoder` for the `DetectBox`, `ProtoData`, and `Segmentation` types used in the mask rendering APIs (`draw_masks`, `draw_masks_proto`, `decode_masks_atlas`). This means the image crate imports decoder types but does not import the `Decoder` itself — it only needs the output data structures that describe detections and masks.
+
+### 6. C API Bindings (`edgefirst-hal-capi`)
+
+**Purpose**: Expose HAL functionality to C/C++ consumers via cbindgen-generated headers.
+
+**Architecture**:
+- Builds as both `staticlib` and `cdylib`
+- cbindgen generates C headers from Rust source annotations
+- Opaque handle pattern: C code operates on `HalTensor*`, `HalImageProcessor*`, etc.
+- All functions return error codes; error messages retrieved via `hal_error_message()`
+- Covers tensor, image, decoder, and tracker APIs
+
+**Source files** (`crates/capi/src/`):
+
+| File | Lines | Scope |
+|------|------:|-------|
+| `tensor.rs` | ~1,200 | Tensor create, map, reshape, fd sharing |
+| `image.rs` | ~1,800 | ImageProcessor, TensorImage, convert, draw |
+| `decoder.rs` | ~2,800 | Decoder create, decode detection/segmentation |
+| `tracker.rs` | ~300 | ByteTrack create, update |
+| `error.rs` | ~120 | Error handling utilities |
+
+### 7. G2D FFI (`g2d-sys`)
 
 **Purpose**: Foreign Function Interface to NXP i.MX G2D library.
 
@@ -520,6 +651,12 @@ flowchart LR
 - Safe Rust wrapper types
 - IOCTL interface for DMA buffer operations
 - Version detection and capability queries
+
+### 8. GPU Probe (`gpu-probe`)
+
+**Purpose**: Standalone binary for probing GPU capabilities and benchmarking transfer methods.
+
+Used during development and CI to verify EGL/OpenGL support, benchmark RGB packing strategies, test DMA-buf roundtrip, and measure pipeline throughput on target hardware.
 
 ## Common API Usage Patterns
 
@@ -928,11 +1065,13 @@ Consistent error handling throughout:
 |---------|--------------|-----------------|-------|---------|
 | DMA Tensors | ✅ | ✅ | ❌ | ❌ |
 | PBO Tensors (GPU) | ✅ | ✅ | ❌ | ❌ |
-| Shared Memory Tensors | ✅ | ✅ | ✅ | ✅ |
+| Shared Memory Tensors | ✅ | ✅ | ✅ | ❌ |
 | Heap Tensors | ✅ | ✅ | ✅ | ✅ |
 | G2D Acceleration | ✅ | ❌ | ❌ | ❌ |
 | OpenGL Acceleration | ✅ (optional) | ✅ (optional) | ❌ | ❌ |
 | CPU Fallback | ✅ | ✅ | ✅ | ✅ |
+
+> **Note**: Shared Memory uses POSIX `shm_open` and is available on Unix platforms only (`#[cfg(unix)]`). Windows is not supported for SHM tensors.
 
 ## Dependencies
 
@@ -951,31 +1090,40 @@ Consistent error handling throughout:
 
 ```mermaid
 graph TD
-    EF[edgefirst<br/>top-level]
+    EF[edgefirst<br/>top-level re-export]
     Tensor[edgefirst_tensor]
     Image[edgefirst_image]
     Decoder[edgefirst_decoder]
-    G2D[g2d-sys<br/>optional]
-    
+    Tracker[edgefirst_tracker]
+    G2D[g2d-sys<br/>optional, Linux only]
+
     EF --> Tensor
     EF --> Image
     EF --> Decoder
     Image --> Tensor
+    Image --> Decoder
     Image -.optional.-> G2D
-    
+
     Python[edgefirst-hal<br/>Python bindings]
     PyO3[pyo3]
     Numpy[numpy]
-    
+
     Python --> EF
     Python --> PyO3
     Python --> Numpy
-    
-    Tracker[tracker<br/>standalone]
-    
+
+    CAPI[edgefirst-hal-capi<br/>C API bindings]
+    CAPI --> EF
+    CAPI --> Tracker
+
+    GpuProbe[gpu-probe<br/>binary]
+    GpuProbe --> Image
+
     style EF fill:#fff4e1
     style Python fill:#e1f5ff
+    style CAPI fill:#e1f5ff
     style Tracker fill:#e8f5e9
+    style GpuProbe fill:#f5f5f5
 ```
 
 ## Source Code Organization
@@ -986,35 +1134,61 @@ hal/
 ├── .github/
 │   └── workflows/          # CI/CD automation
 │       ├── test.yml        # Rust + Python testing
-│       ├── release.yml     # PyPI publishing
+│       ├── release.yml     # PyPI + crates.io publishing
 │       └── nightly.yml     # Nightly builds
 ├── crates/
-│   ├── edgefirst/          # Top-level re-export crate
+│   ├── hal/                # Top-level re-export crate (edgefirst)
 │   ├── tensor/             # Zero-copy tensor abstraction
 │   ├── image/              # Image processing HAL
+│   │   └── src/
+│   │       ├── lib.rs      # TensorImage, ImageProcessor, format constants
+│   │       ├── cpu.rs      # CPU format conversion, resize, masks
+│   │       ├── g2d.rs      # NXP G2D hardware accelerator
+│   │       ├── opengl_headless.rs  # EGL/OpenGL headless renderer
+│   │       └── error.rs
 │   ├── decoder/            # Model output decoding
-│   ├── tracker/            # Object tracking
-│   ├── g2d-sys/            # NXP G2D FFI
+│   │   └── src/
+│   │       ├── lib.rs      # Public API, DecoderBuilder
+│   │       ├── decoder.rs  # Core decode logic, config parsing
+│   │       ├── yolo.rs     # YOLO-specific decoding
+│   │       └── modelpack.rs # ModelPack format support
+│   ├── tracker/            # Object tracking (ByteTrack)
+│   ├── capi/               # C API bindings (cbindgen, staticlib/cdylib)
+│   ├── gpu-probe/          # GPU capability probing binary
+│   ├── bench/              # Benchmark harness (avoids Criterion fork issues)
 │   └── python/             # PyO3 Python bindings
 ├── tests/                  # Python integration tests
 ├── testdata/               # Test data (Git LFS)
-├── README.md               # Project overview
+├── README.md
 ├── ARCHITECTURE.md         # This document
-├── CONTRIBUTING.md         # Contribution guidelines
-├── SECURITY.md             # Security policy
-├── CODE_OF_CONDUCT.md      # Community standards
-├── CHANGELOG.md            # Release history
-├── LICENSE                 # Apache-2.0 license
+├── CONTRIBUTING.md
+├── SECURITY.md
+├── CODE_OF_CONDUCT.md
+├── CHANGELOG.md
+├── LICENSE                 # Apache-2.0
 └── NOTICE                  # Third-party attributions
 ```
 
 ### Crate Dependency Graph
 ```
-python (edgefirst-hal) → edgefirst → tensor, image, decoder, tracker
-image → tensor, g2d-sys
-decoder → (standalone)
-tracker → (standalone)
+python (edgefirst-hal) → edgefirst → tensor, image, decoder
+capi → edgefirst → tensor, image, decoder, tracker
+image → tensor, decoder (for DetectBox/ProtoData/Segmentation types), g2d-sys
+decoder → (standalone — no internal crate deps)
+tracker → (standalone — no internal crate deps)
 ```
+
+### Notable File Sizes
+
+Several files are significantly larger than typical Rust modules:
+
+| File | Lines | Content |
+|------|------:|---------|
+| `image/src/opengl_headless.rs` | ~7,700 | EGL context, GL processors, shaders, RAII types, tests |
+| `decoder/src/decoder.rs` | ~6,900 | Config parsing, decode logic, postprocessing |
+| `image/src/lib.rs` | ~4,700 | TensorImage, ImageProcessor, format helpers |
+| `image/src/cpu.rs` | ~3,700 | CPU format conversion, resize, mask rendering |
+| `capi/src/decoder.rs` | ~2,800 | C API decoder bindings |
 
 ---
 
