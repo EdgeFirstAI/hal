@@ -55,8 +55,8 @@ fn bench_backend<T: Num + Clone + Send + Sync + std::fmt::Debug>(
     println!("\n== map/{backend}/{type_name} ==\n");
     for (size, res) in SIZES {
         let name = format!("map/{backend}/{type_name}/{res}");
-        let tensor = Tensor::<T>::new(size.as_slice(), Some(mem), None)
-            .expect("Failed to allocate tensor");
+        let tensor =
+            Tensor::<T>::new(size.as_slice(), Some(mem), None).expect("Failed to allocate tensor");
         let result = run_bench(&name, WARMUP, ITERATIONS, || {
             let _m = tensor.map().expect("Failed to map tensor");
         });
@@ -87,10 +87,7 @@ fn main() {
             bench_backend::<u8>(&mut suite, TensorMemory::Dma, "dma", "u8");
             bench_backend::<i8>(&mut suite, TensorMemory::Dma, "dma", "i8");
         } else {
-            println!(
-                "\n  {:50} [skipped: DMA unavailable]",
-                "alloc+map/dma/*"
-            );
+            println!("\n  {:50} [skipped: DMA unavailable]", "alloc+map/dma/*");
         }
     }
 
