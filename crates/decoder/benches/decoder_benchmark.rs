@@ -3,7 +3,7 @@
 
 #![allow(clippy::excessive_precision)]
 
-use divan::black_box_drop;
+use edgefirst_bench::{run_bench, BenchSuite};
 use edgefirst_decoder::{
     byte::{nms_int, postprocess_boxes_quant},
     dequant_detect_box, dequantize_cpu, dequantize_cpu_chunked, dequantize_ndarray,
@@ -16,8 +16,10 @@ use edgefirst_decoder::{
 };
 use ndarray::s;
 
-#[divan::bench()]
-fn decoder_yolo_quant(bencher: divan::Bencher) {
+const WARMUP: usize = 10;
+const ITERATIONS: usize = 200;
+
+fn bench_yolo_quant(suite: &mut BenchSuite) {
     let score_threshold = 0.25;
     let iou_threshold = 0.70;
     let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
@@ -28,7 +30,7 @@ fn decoder_yolo_quant(bencher: divan::Bencher) {
         zero_point: -123,
     };
 
-    bencher.bench_local(|| {
+    let result = run_bench("decoder/yolo/quant", WARMUP, ITERATIONS, || {
         let mut output_boxes: Vec<_> = Vec::with_capacity(50);
         decode_yolo_det(
             (out.view(), quant),
@@ -38,10 +40,11 @@ fn decoder_yolo_quant(bencher: divan::Bencher) {
             &mut output_boxes,
         );
     });
+    result.print_summary();
+    suite.record(&result);
 }
 
-#[divan::bench()]
-fn decoder_quant_decode_boxes(bencher: divan::Bencher) {
+fn bench_quant_decode_boxes(suite: &mut BenchSuite) {
     let score_threshold = 0.25;
     let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
     let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
@@ -53,7 +56,8 @@ fn decoder_quant_decode_boxes(bencher: divan::Bencher) {
     let score_threshold = (score_threshold / quant.scale + quant.zero_point as f32) as i8;
     let boxes_tensor = out.slice(s![..4, ..,]).reversed_axes();
     let scores_tensor = out.slice(s![4..(80 + 4), ..,]).reversed_axes();
-    bencher.bench_local(|| {
+
+    let result = run_bench("decoder/quant/decode_boxes", WARMUP, ITERATIONS, || {
         let _ = postprocess_boxes_quant::<XYWH, _, _>(
             score_threshold,
             boxes_tensor,
@@ -61,17 +65,16 @@ fn decoder_quant_decode_boxes(bencher: divan::Bencher) {
             quant,
         );
     });
+    result.print_summary();
+    suite.record(&result);
 }
 
-#[divan::bench()]
-fn decoder_quant_nms(bencher: divan::Bencher) {
+fn bench_quant_nms(suite: &mut BenchSuite) {
     let score_threshold = 0.01;
     let iou_threshold = 0.70;
     let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
     let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
     let out = out.to_vec();
-    // let output = ndarray::Array2::from_shape_vec((84, 8400),
-    // output.clone()).unwrap();
     let quant = Quantization {
         scale: 0.0040811873,
         zero_point: -123,
@@ -83,20 +86,21 @@ fn decoder_quant_nms(bencher: divan::Bencher) {
     let scores_tensor = out.slice(s![4..(80 + 4), ..,]).reversed_axes();
     let boxes =
         postprocess_boxes_quant::<XYWH, _, _>(score_threshold, boxes_tensor, scores_tensor, quant);
-    bencher
-        .with_inputs(|| boxes.clone())
-        .bench_local_values(|boxes| {
-            let boxes = nms_int(iou_threshold, boxes);
-            let len = output_boxes.capacity().min(boxes.len());
-            output_boxes.clear();
-            for b in boxes.iter().take(len) {
-                output_boxes.push(dequant_detect_box(b, quant));
-            }
-        });
+
+    let result = run_bench("decoder/quant/nms", WARMUP, ITERATIONS, || {
+        let boxes = boxes.clone();
+        let boxes = nms_int(iou_threshold, boxes);
+        let len = output_boxes.capacity().min(boxes.len());
+        output_boxes.clear();
+        for b in boxes.iter().take(len) {
+            output_boxes.push(dequant_detect_box(b, quant));
+        }
+    });
+    result.print_summary();
+    suite.record(&result);
 }
 
-#[divan::bench()]
-fn decoder_yolo_f32(bencher: divan::Bencher) {
+fn bench_yolo_f32(suite: &mut BenchSuite) {
     let score_threshold = 0.25;
     let iou_threshold = 0.70;
     let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
@@ -107,90 +111,86 @@ fn decoder_yolo_f32(bencher: divan::Bencher) {
         zero_point: -123,
     };
 
-    bencher
-        .with_inputs(|| out.clone())
-        .bench_local_values(|out| {
-            let mut buf = vec![0.0; 84 * 8400];
-            dequantize_cpu_chunked(&out, quant, &mut buf);
-            let mut output_boxes: Vec<_> = Vec::with_capacity(50);
-            let out = ndarray::Array2::from_shape_vec((84, 8400), buf).unwrap();
-            decode_yolo_det_float(
-                out.view(),
-                score_threshold,
-                iou_threshold,
-                Some(Nms::ClassAgnostic),
-                &mut output_boxes,
-            );
-            black_box_drop(output_boxes);
-        });
+    let result = run_bench("decoder/yolo/f32", WARMUP, ITERATIONS, || {
+        let out = out.clone();
+        let mut buf = vec![0.0; 84 * 8400];
+        dequantize_cpu_chunked(&out, quant, &mut buf);
+        let mut output_boxes: Vec<_> = Vec::with_capacity(50);
+        let out = ndarray::Array2::from_shape_vec((84, 8400), buf).unwrap();
+        decode_yolo_det_float(
+            out.view(),
+            score_threshold,
+            iou_threshold,
+            Some(Nms::ClassAgnostic),
+            &mut output_boxes,
+        );
+        std::hint::black_box(output_boxes);
+    });
+    result.print_summary();
+    suite.record(&result);
 }
 
-#[divan::bench()]
-fn decoder_i8_dequantize(bencher: divan::Bencher) {
+fn bench_dequantize_i8(suite: &mut BenchSuite) {
     let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
     let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
     let out = out.to_vec();
-    // let output = ndarray::Array2::from_shape_vec((84, 8400),
-    // output.clone()).unwrap();
-    let quant = Quantization {
-        scale: 0.0040811873,
-        zero_point: -123,
-    };
-
-    let buf = vec![0.0; 84 * 8400];
-    bencher
-        .with_inputs(|| buf.clone())
-        .bench_local_values(|mut buf| {
-            dequantize_cpu(&out, quant, &mut buf);
-            let out = ndarray::Array2::from_shape_vec((84, 8400), buf).unwrap();
-            black_box_drop(out);
-        });
-}
-
-#[divan::bench()]
-fn decoder_i8_dequantize_chunked(bencher: divan::Bencher) {
-    let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
-    let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
-    let out = out.to_vec();
-    // let output = ndarray::Array2::from_shape_vec((84, 8400),
-    // output.clone()).unwrap();
     let quant = Quantization {
         scale: 0.0040811873,
         zero_point: -123,
     };
     let buf = vec![0.0; 84 * 8400];
-    bencher
-        .with_inputs(|| buf.clone())
-        .bench_local_values(|mut buf| {
-            dequantize_cpu_chunked(&out, quant, &mut buf);
-            let out = ndarray::Array2::from_shape_vec((84, 8400), buf).unwrap();
-            black_box_drop(out);
-        });
+
+    let result = run_bench("decoder/dequantize/i8", WARMUP, ITERATIONS, || {
+        let mut buf = buf.clone();
+        dequantize_cpu(&out, quant, &mut buf);
+        let out = ndarray::Array2::from_shape_vec((84, 8400), buf).unwrap();
+        std::hint::black_box(out);
+    });
+    result.print_summary();
+    suite.record(&result);
 }
 
-#[divan::bench()]
-fn decoder_i16_dequantize(bencher: divan::Bencher) {
+fn bench_dequantize_i8_chunked(suite: &mut BenchSuite) {
+    let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
+    let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
+    let out = out.to_vec();
+    let quant = Quantization {
+        scale: 0.0040811873,
+        zero_point: -123,
+    };
+    let buf = vec![0.0; 84 * 8400];
+
+    let result = run_bench("decoder/dequantize/i8_chunked", WARMUP, ITERATIONS, || {
+        let mut buf = buf.clone();
+        dequantize_cpu_chunked(&out, quant, &mut buf);
+        let out = ndarray::Array2::from_shape_vec((84, 8400), buf).unwrap();
+        std::hint::black_box(out);
+    });
+    result.print_summary();
+    suite.record(&result);
+}
+
+fn bench_dequantize_i16(suite: &mut BenchSuite) {
     let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
     let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
     let out: Vec<_> = out.iter().map(|x| *x as i16 * *x as i16).collect();
-    // let output = ndarray::Array2::from_shape_vec((84, 8400),
-    // output.clone()).unwrap();
     let quant = Quantization {
         scale: 0.0040811873,
         zero_point: -123,
     };
     let buf = vec![0.0; 84 * 8400];
-    bencher
-        .with_inputs(|| buf.clone())
-        .bench_local_values(|mut buf| {
-            dequantize_cpu(&out, quant, &mut buf);
-            let out = ndarray::Array2::from_shape_vec((84, 8400), buf).unwrap();
-            black_box_drop(out);
-        });
+
+    let result = run_bench("decoder/dequantize/i16", WARMUP, ITERATIONS, || {
+        let mut buf = buf.clone();
+        dequantize_cpu(&out, quant, &mut buf);
+        let out = ndarray::Array2::from_shape_vec((84, 8400), buf).unwrap();
+        std::hint::black_box(out);
+    });
+    result.print_summary();
+    suite.record(&result);
 }
 
-#[divan::bench()]
-fn decoder_i16_dequantize_chunked(bencher: divan::Bencher) {
+fn bench_dequantize_i16_chunked(suite: &mut BenchSuite) {
     let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
     let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
     let out: Vec<_> = out.iter().map(|x| *x as i16).collect();
@@ -199,23 +199,22 @@ fn decoder_i16_dequantize_chunked(bencher: divan::Bencher) {
         zero_point: -123,
     };
     let buf = vec![0.0; 84 * 8400];
-    bencher
-        .with_inputs(|| buf.clone())
-        .bench_local_values(|mut buf| {
-            dequantize_cpu_chunked(&out, quant, &mut buf);
-            let out = ndarray::Array2::from_shape_vec((84, 8400), buf).unwrap();
-            black_box_drop(out);
-        });
+
+    let result = run_bench("decoder/dequantize/i16_chunked", WARMUP, ITERATIONS, || {
+        let mut buf = buf.clone();
+        dequantize_cpu_chunked(&out, quant, &mut buf);
+        let out = ndarray::Array2::from_shape_vec((84, 8400), buf).unwrap();
+        std::hint::black_box(out);
+    });
+    result.print_summary();
+    suite.record(&result);
 }
 
-#[divan::bench()]
-fn decoder_f32_decode_boxes(bencher: divan::Bencher) {
+fn bench_f32_decode_boxes(suite: &mut BenchSuite) {
     let score_threshold = 0.25;
     let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
     let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
     let out = out.to_vec();
-    // let output = ndarray::Array2::from_shape_vec((84, 8400),
-    // output.clone()).unwrap();
     let quant = Quantization {
         scale: 0.0040811873,
         zero_point: -123,
@@ -223,27 +222,25 @@ fn decoder_f32_decode_boxes(bencher: divan::Bencher) {
     let mut buf = vec![0.0; 84 * 8400];
     dequantize_cpu_chunked(&out, quant, &mut buf);
 
-    bencher
-        .with_inputs(|| buf.clone())
-        .bench_local_values(|out| {
-            let out = ndarray::Array2::from_shape_vec((84, 8400), out).unwrap();
-            let boxes_tensor = out.slice(s![..4, ..,]).reversed_axes();
-            let scores_tensor = out.slice(s![4..(80 + 4), ..,]).reversed_axes();
-            let boxes =
-                postprocess_boxes_float::<XYWH, _, _>(score_threshold, boxes_tensor, scores_tensor);
-            black_box_drop(boxes);
-        });
+    let result = run_bench("decoder/f32/decode_boxes", WARMUP, ITERATIONS, || {
+        let out = buf.clone();
+        let out = ndarray::Array2::from_shape_vec((84, 8400), out).unwrap();
+        let boxes_tensor = out.slice(s![..4, ..,]).reversed_axes();
+        let scores_tensor = out.slice(s![4..(80 + 4), ..,]).reversed_axes();
+        let boxes =
+            postprocess_boxes_float::<XYWH, _, _>(score_threshold, boxes_tensor, scores_tensor);
+        std::hint::black_box(boxes);
+    });
+    result.print_summary();
+    suite.record(&result);
 }
 
-#[divan::bench()]
-fn decoder_f32_nms(bencher: divan::Bencher) {
+fn bench_f32_nms(suite: &mut BenchSuite) {
     let score_threshold = 0.01;
     let iou_threshold = 0.70;
     let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
     let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
     let out = out.to_vec();
-    // let output = ndarray::Array2::from_shape_vec((84, 8400),
-    // output.clone()).unwrap();
     let quant = Quantization {
         scale: 0.0040811873,
         zero_point: -123,
@@ -254,22 +251,23 @@ fn decoder_f32_nms(bencher: divan::Bencher) {
     let boxes_tensor = out.slice(s![..4, ..,]).reversed_axes();
     let scores_tensor = out.slice(s![4..(80 + 4), ..,]).reversed_axes();
     let boxes = postprocess_boxes_float::<XYWH, _, _>(score_threshold, boxes_tensor, scores_tensor);
-    bencher
-        .with_inputs(|| boxes.clone())
-        .bench_local_values(|boxes| {
-            let mut output_boxes: Vec<_> = Vec::with_capacity(50);
-            let boxes = nms_float(iou_threshold, boxes);
-            let len = output_boxes.capacity().min(boxes.len());
-            output_boxes.clear();
-            for b in boxes.into_iter().take(len) {
-                output_boxes.push(b);
-            }
-            black_box_drop(output_boxes);
-        });
+
+    let result = run_bench("decoder/f32/nms", WARMUP, ITERATIONS, || {
+        let boxes = boxes.clone();
+        let mut output_boxes: Vec<_> = Vec::with_capacity(50);
+        let boxes = nms_float(iou_threshold, boxes);
+        let len = output_boxes.capacity().min(boxes.len());
+        output_boxes.clear();
+        for b in boxes.into_iter().take(len) {
+            output_boxes.push(b);
+        }
+        std::hint::black_box(output_boxes);
+    });
+    result.print_summary();
+    suite.record(&result);
 }
 
-#[divan::bench()]
-fn decoder_modelpack_u8(bencher: divan::Bencher) {
+fn bench_modelpack_u8(suite: &mut BenchSuite) {
     let score_threshold = 0.45;
     let iou_threshold = 0.45;
     let boxes = include_bytes!("../../../testdata/modelpack_boxes_1935x1x4.bin");
@@ -289,7 +287,7 @@ fn decoder_modelpack_u8(bencher: divan::Bencher) {
     };
 
     let mut output_boxes: Vec<_> = Vec::with_capacity(50);
-    bencher.bench_local(|| {
+    let result = run_bench("decoder/modelpack/u8", WARMUP, ITERATIONS, || {
         decode_modelpack_det(
             (boxes.view(), quant_boxes),
             (scores.view(), quant_scores),
@@ -298,10 +296,11 @@ fn decoder_modelpack_u8(bencher: divan::Bencher) {
             &mut output_boxes,
         )
     });
+    result.print_summary();
+    suite.record(&result);
 }
 
-#[divan::bench()]
-fn decoder_modelpack_split_u8(bencher: divan::Bencher) {
+fn bench_modelpack_split_u8(suite: &mut BenchSuite) {
     let score_threshold = 0.45;
     let iou_threshold = 0.45;
     let detect0 = include_bytes!("../../../testdata/modelpack_split_9x15x18.bin");
@@ -334,7 +333,8 @@ fn decoder_modelpack_split_u8(bencher: divan::Bencher) {
     let outputs = [detect0.view(), detect1.view()];
     let configs = [config0, config1];
     let mut output_boxes: Vec<_> = Vec::with_capacity(2);
-    bencher.bench_local(|| {
+
+    let result = run_bench("decoder/modelpack/split_u8", WARMUP, ITERATIONS, || {
         decode_modelpack_split_quant(
             &outputs,
             &configs,
@@ -343,10 +343,11 @@ fn decoder_modelpack_split_u8(bencher: divan::Bencher) {
             &mut output_boxes,
         )
     });
+    result.print_summary();
+    suite.record(&result);
 }
 
-#[divan::bench()]
-fn decoder_masks(bencher: divan::Bencher) {
+fn bench_masks_f32(suite: &mut BenchSuite) {
     let score_threshold = 0.45;
     let iou_threshold = 0.45;
     let boxes = include_bytes!("../../../testdata/yolov8_boxes_116x8400.bin");
@@ -365,7 +366,7 @@ fn decoder_masks(bencher: divan::Bencher) {
         zero_point: -115,
     };
 
-    bencher.bench_local(|| {
+    let result = run_bench("decoder/masks/f32", WARMUP, ITERATIONS, || {
         let protos = dequantize_ndarray::<_, _, f32>(protos.view(), quant_protos);
         let seg = dequantize_ndarray::<_, _, f32>(boxes.view(), quant_boxes);
         let mut output_boxes: Vec<_> = Vec::with_capacity(50);
@@ -380,13 +381,14 @@ fn decoder_masks(bencher: divan::Bencher) {
             &mut output_masks,
         )
         .unwrap();
-        black_box_drop(output_boxes);
-        black_box_drop(output_masks);
+        std::hint::black_box(output_boxes);
+        std::hint::black_box(output_masks);
     });
+    result.print_summary();
+    suite.record(&result);
 }
 
-#[divan::bench()]
-fn decoder_masks_i8(bencher: divan::Bencher) {
+fn bench_masks_i8(suite: &mut BenchSuite) {
     let score_threshold = 0.45;
     let iou_threshold = 0.45;
     let boxes = include_bytes!("../../../testdata/yolov8_boxes_116x8400.bin");
@@ -405,7 +407,7 @@ fn decoder_masks_i8(bencher: divan::Bencher) {
         zero_point: -115,
     };
 
-    bencher.bench_local(|| {
+    let result = run_bench("decoder/masks/i8", WARMUP, ITERATIONS, || {
         let mut output_boxes: Vec<_> = Vec::with_capacity(50);
         let mut output_masks: Vec<_> = Vec::with_capacity(50);
         decode_yolo_segdet_quant(
@@ -418,12 +420,47 @@ fn decoder_masks_i8(bencher: divan::Bencher) {
             &mut output_masks,
         )
         .unwrap();
-        black_box_drop(output_boxes);
-        black_box_drop(output_masks);
+        std::hint::black_box(output_boxes);
+        std::hint::black_box(output_masks);
     });
+    result.print_summary();
+    suite.record(&result);
 }
 
 fn main() {
     env_logger::init();
-    divan::main();
+
+    println!("Decoder Benchmark — edgefirst-bench in-process harness (no fork)");
+    println!("  warmup={WARMUP}  iterations={ITERATIONS}");
+
+    let mut suite = BenchSuite::from_args();
+
+    println!("\n== YOLO ==\n");
+    bench_yolo_quant(&mut suite);
+    bench_yolo_f32(&mut suite);
+
+    println!("\n== Quant ==\n");
+    bench_quant_decode_boxes(&mut suite);
+    bench_quant_nms(&mut suite);
+
+    println!("\n== Dequantize ==\n");
+    bench_dequantize_i8(&mut suite);
+    bench_dequantize_i8_chunked(&mut suite);
+    bench_dequantize_i16(&mut suite);
+    bench_dequantize_i16_chunked(&mut suite);
+
+    println!("\n== Float ==\n");
+    bench_f32_decode_boxes(&mut suite);
+    bench_f32_nms(&mut suite);
+
+    println!("\n== ModelPack ==\n");
+    bench_modelpack_u8(&mut suite);
+    bench_modelpack_split_u8(&mut suite);
+
+    println!("\n== Masks ==\n");
+    bench_masks_f32(&mut suite);
+    bench_masks_i8(&mut suite);
+
+    suite.finish();
+    println!("\nDone.");
 }
