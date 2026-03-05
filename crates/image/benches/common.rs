@@ -228,6 +228,10 @@ impl BenchConfig {
 // Embedded Test Data
 // =============================================================================
 
+pub const CAMERA_720P_YUYV: &[u8] = include_bytes!("../../../testdata/camera720p.yuyv");
+pub const CAMERA_720P_VYUY: &[u8] = include_bytes!("../../../testdata/camera720p.vyuy");
+pub const CAMERA_720P_NV12: &[u8] = include_bytes!("../../../testdata/camera720p.nv12");
+pub const CAMERA_720P_RGB: &[u8] = include_bytes!("../../../testdata/camera720p.rgb");
 pub const CAMERA_1080P_YUYV: &[u8] = include_bytes!("../../../testdata/camera1080p.yuyv");
 pub const CAMERA_1080P_NV12: &[u8] = include_bytes!("../../../testdata/camera1080p.nv12");
 pub const CAMERA_1080P_RGB: &[u8] = include_bytes!("../../../testdata/camera1080p.rgb");
@@ -245,6 +249,10 @@ static CAMERA_1080P_NV16: LazyLock<Vec<u8>> = LazyLock::new(|| vec![128u8; 1920 
 /// Get embedded test data for a given resolution and format.
 pub fn get_test_data(width: usize, height: usize, format: FourCharCode) -> &'static [u8] {
     match (width, height, format) {
+        (1280, 720, f) if f == YUYV => CAMERA_720P_YUYV,
+        (1280, 720, f) if f == VYUY => CAMERA_720P_VYUY,
+        (1280, 720, f) if f == NV12 => CAMERA_720P_NV12,
+        (1280, 720, f) if f == RGB => CAMERA_720P_RGB,
         (1920, 1080, f) if f == YUYV => CAMERA_1080P_YUYV,
         (1920, 1080, f) if f == VYUY => CAMERA_1080P_VYUY,
         (1920, 1080, f) if f == NV12 => CAMERA_1080P_NV12,
