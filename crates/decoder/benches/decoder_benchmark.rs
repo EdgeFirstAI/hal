@@ -173,7 +173,7 @@ fn bench_dequantize_i8_chunked(suite: &mut BenchSuite) {
 fn bench_dequantize_i16(suite: &mut BenchSuite) {
     let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
     let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
-    let out: Vec<_> = out.iter().map(|x| *x as i16 * *x as i16).collect();
+    let out: Vec<_> = out.iter().map(|x| *x as i16).collect();
     let quant = Quantization {
         scale: 0.0040811873,
         zero_point: -123,
