@@ -1856,6 +1856,33 @@ impl GLProcessorST {
             converter.gl_context.transfer_backend = TransferBackend::Pbo;
         }
 
+        // Allow env-var override for benchmarking specific transfer paths.
+        // Values: "dmabuf", "pbo", "sync" (case-insensitive).
+        if let Ok(val) = std::env::var("EDGEFIRST_FORCE_TRANSFER_BACKEND") {
+            let forced = match val.to_ascii_lowercase().as_str() {
+                "dmabuf" | "dma" => Some(TransferBackend::DmaBuf),
+                "pbo" => Some(TransferBackend::Pbo),
+                "sync" => Some(TransferBackend::Sync),
+                other => {
+                    log::warn!(
+                        "EDGEFIRST_FORCE_TRANSFER_BACKEND={other:?} not recognised \
+                         (expected dmabuf|pbo|sync), ignoring"
+                    );
+                    None
+                }
+            };
+            if let Some(backend) = forced {
+                log::info!(
+                    "EDGEFIRST_FORCE_TRANSFER_BACKEND override: {:?} → {backend:?}",
+                    converter.gl_context.transfer_backend
+                );
+                converter.gl_context.transfer_backend = backend;
+                if !backend.is_dma() {
+                    converter.support_rgb_direct = false;
+                }
+            }
+        }
+
         log::debug!(
             "GLConverter created (transfer={:?}, rgb_direct={})",
             converter.gl_context.transfer_backend,
