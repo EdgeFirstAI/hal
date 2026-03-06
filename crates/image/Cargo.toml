@@ -66,5 +66,10 @@ harness = false
 name = "mask_benchmark"
 harness = false
 
+[[bench]]
+name = "opencv_benchmark"
+harness = false
+required-features = ["opencv"]
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }
