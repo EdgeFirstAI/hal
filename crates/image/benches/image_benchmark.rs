@@ -24,8 +24,8 @@ use common::{find_testdata_path, format_name, get_test_data, run_bench, BenchCon
 use edgefirst_bench::BenchSuite;
 
 use edgefirst_image::{
-    Crop, Flip, ImageProcessor, ImageProcessorTrait, Rotation, TensorImage, GREY, NV16,
-    PLANAR_RGB, RGB, RGBA, YUYV,
+    Crop, Flip, ImageProcessor, ImageProcessorTrait, Rotation, TensorImage, GREY, NV16, PLANAR_RGB,
+    RGB, RGBA, YUYV,
 };
 #[cfg(target_os = "linux")]
 use edgefirst_tensor::TensorMemory;
@@ -305,7 +305,7 @@ fn bench_hires(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
         BenchConfig::new(1920, 1080, 1920, 1080, RGB, RGB),
     ];
 
-    run_hires_configs(proc, suite, &configs_1080p, "hires/1080p");
+    run_hires_configs(proc, suite, configs_1080p, "hires/1080p");
 
     // --- 4K source ---
     println!("\n== Hires: 4K Source ==\n");
@@ -337,7 +337,7 @@ fn bench_hires(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
         BenchConfig::new(3840, 2160, 3840, 2160, RGB, RGB),
     ];
 
-    run_hires_configs(proc, suite, &configs_4k, "hires/4k");
+    run_hires_configs(proc, suite, configs_4k, "hires/4k");
 }
 
 /// Run a set of hires benchmark configs using the ImageProcessor.
@@ -355,7 +355,10 @@ fn run_hires_configs(
     // YUYV source
     let yuyv_src = {
         let Ok(src) = proc.create_image(src_w, src_h, YUYV) else {
-            println!("  [skipped: could not allocate YUYV source {}x{}]", src_w, src_h);
+            println!(
+                "  [skipped: could not allocate YUYV source {}x{}]",
+                src_w, src_h
+            );
             return;
         };
         let data = get_test_data(src_w, src_h, YUYV);
@@ -366,7 +369,10 @@ fn run_hires_configs(
     // RGBA source
     let rgba_src = {
         let Ok(src) = proc.create_image(src_w, src_h, RGBA) else {
-            println!("  [skipped: could not allocate RGBA source {}x{}]", src_w, src_h);
+            println!(
+                "  [skipped: could not allocate RGBA source {}x{}]",
+                src_w, src_h
+            );
             return;
         };
         let data: &[u8] = if src_w == 1920 && src_h == 1080 {
@@ -381,7 +387,10 @@ fn run_hires_configs(
     // RGB source — convert from RGBA
     let rgb_src = {
         let Ok(mut rgb) = proc.create_image(src_w, src_h, RGB) else {
-            println!("  [skipped: could not allocate RGB source {}x{}]", src_w, src_h);
+            println!(
+                "  [skipped: could not allocate RGB source {}x{}]",
+                src_w, src_h
+            );
             return;
         };
         if let Err(e) = proc.convert(

@@ -246,6 +246,11 @@ pub const CAMERA_4K_RGB: &[u8] = include_bytes!("../../../testdata/camera4k.rgb"
 // throughput benchmarks.
 static CAMERA_1080P_NV16: LazyLock<Vec<u8>> = LazyLock::new(|| vec![128u8; 1920 * 1080 * 2]);
 
+// RGBA synthetic data for format conversion benchmarks (e.g. RGBA -> BGRA,
+// RGBA -> GREY). No real capture file needed; mid-gray is sufficient for
+// throughput measurement.
+static CAMERA_1080P_RGBA: LazyLock<Vec<u8>> = LazyLock::new(|| vec![128u8; 1920 * 1080 * 4]);
+
 /// Get embedded test data for a given resolution and format.
 pub fn get_test_data(width: usize, height: usize, format: FourCharCode) -> &'static [u8] {
     match (width, height, format) {
@@ -258,6 +263,7 @@ pub fn get_test_data(width: usize, height: usize, format: FourCharCode) -> &'sta
         (1920, 1080, f) if f == NV12 => CAMERA_1080P_NV12,
         (1920, 1080, f) if f == NV16 => &CAMERA_1080P_NV16,
         (1920, 1080, f) if f == RGB => CAMERA_1080P_RGB,
+        (1920, 1080, f) if f == RGBA => &CAMERA_1080P_RGBA,
         (3840, 2160, f) if f == YUYV => CAMERA_4K_YUYV,
         (3840, 2160, f) if f == VYUY => CAMERA_4K_VYUY,
         (3840, 2160, f) if f == NV12 => CAMERA_4K_NV12,
