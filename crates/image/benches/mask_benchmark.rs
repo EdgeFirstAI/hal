@@ -242,7 +242,8 @@ fn bench_draw_masks_proto(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
     }
 
     let result = run_bench(name, WARMUP, ITERATIONS, || {
-        proc.draw_masks_proto(&mut dst, &detect, &proto_data).unwrap();
+        proc.draw_masks_proto(&mut dst, &detect, &proto_data)
+            .unwrap();
     });
     result.print_summary();
     suite.record(&result);
