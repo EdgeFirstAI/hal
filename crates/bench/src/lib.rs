@@ -404,7 +404,10 @@ mod tests {
     fn test_bench_suite_finish_writes_file() {
         use std::fs;
 
-        let tmp_path = std::env::temp_dir().join("edgefirst_bench_test_output.json");
+        let tmp_path = std::env::temp_dir().join(format!(
+            "edgefirst_bench_test_output_{}.json",
+            std::process::id()
+        ));
         let path_str = tmp_path.to_string_lossy().to_string();
 
         let mut suite = BenchSuite {

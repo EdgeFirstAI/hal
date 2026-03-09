@@ -749,7 +749,7 @@ The HAL includes dedicated benchmark binaries for measuring performance across p
 
 | Binary | Crate | What It Measures |
 |--------|-------|-----------------|
-| `tensor_benchmark` | `edgefirst-tensor` | Tensor allocation and map/unmap latency across buffer types (Heap, SHM, DMA, PBO) |
+| `tensor_benchmark` | `edgefirst-tensor` | Tensor allocation and map/unmap latency across buffer types (Heap, SHM, DMA) |
 | `image_benchmark` | `edgefirst-image` | Low-level image operations: crop, flip, rotate, resize, draw |
 | `pipeline_benchmark` | `edgefirst-image` | Letterbox pipeline and format conversion (camera→model input) |
 | `mask_benchmark` | `edgefirst-image` | Mask rendering: draw_masks, draw_masks_proto, decode_masks_atlas, hybrid path |
@@ -786,7 +786,7 @@ cargo-zigbuild build --target aarch64-unknown-linux-gnu --release \
 
 ### Deploying to Targets
 
-SSH hostnames are configured in `~/.ssh/config`: `imx8mp-frdm`, `imx95-frdm`, `raspberrypi`
+SSH hostnames are configured in `~/.ssh/config`: `imx8mp-frdm`, `imx95-frdm`, `rpi5-hailo`
 
 ```bash
 # Copy benchmark binary to target

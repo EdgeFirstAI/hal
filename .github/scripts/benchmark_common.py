@@ -1,5 +1,7 @@
 """Shared utilities, constants, and configs for benchmark scripts."""
 
+from __future__ import annotations
+
 import argparse
 import json
 from pathlib import Path
@@ -65,7 +67,7 @@ def print_section(title: str):
 
 
 # Consistent platform ordering
-PLATFORMS = ["imx8mp-frdm", "imx95-frdm", "raspberrypi", "x86-desktop"]
+PLATFORMS = ["imx8mp-frdm", "imx95-frdm", "rpi5-hailo", "x86-desktop"]
 
 # All compute backends for iteration
 ALL_BACKENDS = ["auto", "cpu", "g2d", "opengl"]
@@ -78,8 +80,8 @@ PIPELINE_CONFIGS = [
     ("imx95-frdm", "G2D", "DMA", "pipeline-g2d"),
     ("imx95-frdm", "GL", "DMA", "pipeline-opengl"),
     ("imx95-frdm", "CPU", "Heap", "pipeline-cpu"),
-    ("raspberrypi", "GL", "DMA", "pipeline-opengl"),
-    ("raspberrypi", "CPU", "Heap", "pipeline-cpu"),
+    ("rpi5-hailo", "GL", "DMA", "pipeline-opengl"),
+    ("rpi5-hailo", "CPU", "Heap", "pipeline-cpu"),
     ("x86-desktop", "GL", "PBO", "pipeline-opengl"),
     ("x86-desktop", "CPU", "Heap", "pipeline-cpu"),
 ]
@@ -90,8 +92,8 @@ MASK_CONFIGS = [
     ("imx8mp-frdm", "CPU", "Heap", "mask-cpu"),
     ("imx95-frdm", "GL", "DMA", "mask-opengl"),
     ("imx95-frdm", "CPU", "Heap", "mask-cpu"),
-    ("raspberrypi", "GL", "DMA", "mask-opengl"),
-    ("raspberrypi", "CPU", "Heap", "mask-cpu"),
+    ("rpi5-hailo", "GL", "DMA", "mask-opengl"),
+    ("rpi5-hailo", "CPU", "Heap", "mask-cpu"),
     ("x86-desktop", "GL", "PBO", "mask-opengl"),
     ("x86-desktop", "CPU", "Heap", "mask-cpu"),
 ]
@@ -100,6 +102,6 @@ MASK_CONFIGS = [
 TENSOR_CONFIGS = [
     ("imx8mp-frdm", ["mem", "shm", "dma"]),
     ("imx95-frdm", ["mem", "shm", "dma"]),
-    ("raspberrypi", ["mem", "shm", "dma"]),
+    ("rpi5-hailo", ["mem", "shm", "dma"]),
     ("x86-desktop", ["mem", "shm"]),
 ]

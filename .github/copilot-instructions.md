@@ -618,14 +618,14 @@ See [README.md § Benchmarking](../README.md#benchmarking) for full instructions
 
 | Binary | Crate | What It Measures |
 |--------|-------|-----------------|
-| `tensor_benchmark` | `edgefirst-tensor` | Allocation and map/unmap latency (Heap, SHM, DMA, PBO) |
+| `tensor_benchmark` | `edgefirst-tensor` | Allocation and map/unmap latency (Heap, SHM, DMA) |
 | `pipeline_benchmark` | `edgefirst-image` | Letterbox pipeline and format conversion |
 | `mask_benchmark` | `edgefirst-image` | Mask rendering paths (GL, CPU, hybrid) |
 | `decoder_benchmark` | `edgefirst-decoder` | YOLO post-processing, NMS, dequantization |
 
 **Key env vars:** `EDGEFIRST_FORCE_BACKEND={cpu,opengl,g2d}`, `EDGEFIRST_FORCE_TRANSFER=pbo`
 
-**JSON convention:** `benchmarks/<platform>/<name>.json` (platforms: `imx8mp-frdm`, `imx95-frdm`, `raspberrypi`, `x86-desktop`)
+**JSON convention:** `benchmarks/<platform>/<name>.json` (platforms: `imx8mp-frdm`, `imx95-frdm`, `rpi5-hailo`, `x86-desktop`)
 
 **Updating tables:** `python3 .github/scripts/generate_benchmark_tables.py --data-dir benchmarks/`
 

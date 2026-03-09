@@ -1914,12 +1914,16 @@ impl ImageProcessorTrait for ImageProcessor {
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
         if let Some(opengl) = self.opengl.as_mut() {
-            let cpu = self.cpu.as_ref().expect("CPU backend is always available");
+            let Some(cpu) = self.cpu.as_ref() else {
+                return Err(Error::Internal(
+                    "draw_masks_proto requires CPU backend for hybrid path".into(),
+                ));
+            };
             log::trace!(
                 "draw_masks_proto started with hybrid (cpu+opengl) in {:?}",
                 start.elapsed()
             );
-            let segmentation = cpu.materialize_segmentations(detect, proto_data);
+            let segmentation = cpu.materialize_segmentations(detect, proto_data)?;
             match opengl.draw_masks(dst, detect, &segmentation) {
                 Ok(_) => {
                     log::trace!(
@@ -1935,7 +1939,11 @@ impl ImageProcessorTrait for ImageProcessor {
         }
 
         // CPU-only fallback (no OpenGL, or hybrid GL overlay failed)
-        let cpu = self.cpu.as_mut().expect("CPU backend is always available");
+        let Some(cpu) = self.cpu.as_mut() else {
+            return Err(Error::Internal(
+                "draw_masks_proto requires CPU backend for fallback path".into(),
+            ));
+        };
         log::trace!("draw_masks_proto started with cpu in {:?}", start.elapsed());
         cpu.draw_masks_proto(dst, detect, proto_data)
     }
