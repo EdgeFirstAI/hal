@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Generate BENCHMARKS.md table content from collected JSON data."""
 
+from __future__ import annotations
+
 from pathlib import Path
 
 from benchmark_common import (
@@ -129,18 +131,20 @@ def gen_decoder_detect_table(data_dir: Path):
 
 
 def gen_decoder_seg_table(data_dir: Path):
-    print("\n**YOLOv8 Segmentation (detection + mask coefficients):**\n")
-    print("| Platform | Data Type | Full Segdet | Masks Only |")
-    print("|----------|-----------|------------|------------|")
+    print("\n**YOLOv8 Segmentation (mask coefficient → pixel decode):**\n")
+    print("| Platform | Data Type | Masks Decode |")
+    print("|----------|-----------|-------------|")
 
     for platform in PLATFORMS:
         data = load_json(data_dir, platform, "decoder")
         if data is None:
             continue
-        segdet = get_bench(data, "decoder/yolo_segdet/quant")
-        masks = get_bench(data, "decoder/masks/f32")
-        if segdet is not None or masks is not None:
-            print(f"| {platform} | i8 (quant) | {fmt_us(segdet)} | {fmt_us(masks)} |")
+        masks_i8 = get_bench(data, "decoder/masks/i8")
+        masks_f32 = get_bench(data, "decoder/masks/f32")
+        if masks_i8 is not None:
+            print(f"| {platform} | i8 (quant) | {fmt_us(masks_i8)} |")
+        if masks_f32 is not None:
+            print(f"| {platform} | f32 | {fmt_us(masks_f32)} |")
 
 
 # ============================================================================

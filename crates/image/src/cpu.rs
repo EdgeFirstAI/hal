@@ -1917,9 +1917,9 @@ impl CPUProcessor {
         &self,
         detect: &[crate::DetectBox],
         proto_data: &crate::ProtoData,
-    ) -> Vec<edgefirst_decoder::Segmentation> {
+    ) -> crate::Result<Vec<edgefirst_decoder::Segmentation>> {
         if detect.is_empty() || proto_data.mask_coefficients.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let protos_cow = proto_data.protos.as_f32();
@@ -1938,9 +1938,9 @@ impl CPUProcessor {
                 let xmax = det.bbox.xmax.clamp(0.0, 1.0);
                 let ymax = det.bbox.ymax.clamp(0.0, 1.0);
 
-                // Map to proto-space pixel coordinates
-                let x0 = (xmin * proto_w as f32) as usize;
-                let y0 = (ymin * proto_h as f32) as usize;
+                // Map to proto-space pixel coordinates (clamp to valid range)
+                let x0 = ((xmin * proto_w as f32) as usize).min(proto_w.saturating_sub(1));
+                let y0 = ((ymin * proto_h as f32) as usize).min(proto_h.saturating_sub(1));
                 let x1 = ((xmax * proto_w as f32).ceil() as usize).min(proto_w);
                 let y1 = ((ymax * proto_h as f32).ceil() as usize).min(proto_h);
 
@@ -1949,30 +1949,30 @@ impl CPUProcessor {
 
                 // Extract proto ROI and compute mask_coeff @ protos
                 let roi = protos.slice(ndarray::s![y0..y0 + roi_h, x0..x0 + roi_w, ..]);
-                let coeff_arr =
-                    ndarray::Array2::from_shape_vec((1, num_protos), coeff.clone()).unwrap();
+                let coeff_arr = ndarray::Array2::from_shape_vec((1, num_protos), coeff.clone())
+                    .map_err(|e| crate::Error::Internal(format!("mask coeff shape: {e}")))?;
                 let protos_2d = roi
                     .to_shape((roi_h * roi_w, num_protos))
-                    .unwrap()
+                    .map_err(|e| crate::Error::Internal(format!("proto reshape: {e}")))?
                     .reversed_axes();
                 let mask = coeff_arr.dot(&protos_2d);
                 let mask = mask
                     .into_shape_with_order((roi_h, roi_w, 1))
-                    .unwrap()
+                    .map_err(|e| crate::Error::Internal(format!("mask reshape: {e}")))?
                     .mapv(|x: f32| {
                         let sigmoid = 1.0 / (1.0 + (-x).exp());
                         (sigmoid * 255.0).round() as u8
                     });
 
-                edgefirst_decoder::Segmentation {
+                Ok(edgefirst_decoder::Segmentation {
                     xmin: x0 as f32 / proto_w as f32,
                     ymin: y0 as f32 / proto_h as f32,
                     xmax: x1 as f32 / proto_w as f32,
                     ymax: y1 as f32 / proto_h as f32,
                     segmentation: mask,
-                }
+                })
             })
-            .collect()
+            .collect::<crate::Result<Vec<_>>>()
     }
 
     /// Renders per-instance grayscale masks from raw prototype data at full

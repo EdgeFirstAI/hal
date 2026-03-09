@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Extract benchmark results from JSON files and print summary tables."""
 
+from __future__ import annotations
+
 from pathlib import Path
 
 from benchmark_common import (
@@ -31,7 +33,7 @@ def tensor_results(data_dir: Path):
         print("    Allocation:")
         for buf in ["mem", "shm", "dma", "pbo"]:
             vals = []
-            for res in ["480p", "720p", "1080p", "4K"]:
+            for res in ["360p", "720p", "1080p", "4K"]:
                 v = get_bench(data, f"alloc/{buf}/u8/{res}")
                 vals.append(fmt_us(v))
             if any(v != "—" for v in vals):
@@ -41,7 +43,7 @@ def tensor_results(data_dir: Path):
         print("    Map/Unmap:")
         for buf in ["mem", "shm", "dma", "pbo"]:
             vals = []
-            for res in ["480p", "720p", "1080p", "4K"]:
+            for res in ["360p", "720p", "1080p", "4K"]:
                 v = get_bench(data, f"map/{buf}/u8/{res}")
                 vals.append(fmt_us(v))
             if any(v != "—" for v in vals):
