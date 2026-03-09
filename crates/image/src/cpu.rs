@@ -1906,6 +1906,75 @@ impl CPUProcessor {
         Ok(())
     }
 
+    /// Materialize segmentation masks from proto data into `Vec<Segmentation>`.
+    ///
+    /// This is the CPU-side decode step of the hybrid mask rendering path:
+    /// call this to get pre-decoded masks, then pass them to
+    /// [`draw_masks`](crate::ImageProcessorTrait::draw_masks) for GPU overlay.
+    /// Benchmarks show this hybrid path (CPU decode + GL overlay) is faster
+    /// than the fused GPU `draw_masks_proto` on all tested platforms.
+    pub fn materialize_segmentations(
+        &self,
+        detect: &[crate::DetectBox],
+        proto_data: &crate::ProtoData,
+    ) -> Vec<edgefirst_decoder::Segmentation> {
+        if detect.is_empty() || proto_data.mask_coefficients.is_empty() {
+            return Vec::new();
+        }
+
+        let protos_cow = proto_data.protos.as_f32();
+        let protos = protos_cow.as_ref();
+        let proto_h = protos.shape()[0];
+        let proto_w = protos.shape()[1];
+        let num_protos = protos.shape()[2];
+
+        detect
+            .iter()
+            .zip(proto_data.mask_coefficients.iter())
+            .map(|(det, coeff)| {
+                // Clamp bbox to [0, 1]
+                let xmin = det.bbox.xmin.clamp(0.0, 1.0);
+                let ymin = det.bbox.ymin.clamp(0.0, 1.0);
+                let xmax = det.bbox.xmax.clamp(0.0, 1.0);
+                let ymax = det.bbox.ymax.clamp(0.0, 1.0);
+
+                // Map to proto-space pixel coordinates
+                let x0 = (xmin * proto_w as f32) as usize;
+                let y0 = (ymin * proto_h as f32) as usize;
+                let x1 = ((xmax * proto_w as f32).ceil() as usize).min(proto_w);
+                let y1 = ((ymax * proto_h as f32).ceil() as usize).min(proto_h);
+
+                let roi_w = x1.saturating_sub(x0).max(1);
+                let roi_h = y1.saturating_sub(y0).max(1);
+
+                // Extract proto ROI and compute mask_coeff @ protos
+                let roi = protos.slice(ndarray::s![y0..y0 + roi_h, x0..x0 + roi_w, ..]);
+                let coeff_arr =
+                    ndarray::Array2::from_shape_vec((1, num_protos), coeff.clone()).unwrap();
+                let protos_2d = roi
+                    .to_shape((roi_h * roi_w, num_protos))
+                    .unwrap()
+                    .reversed_axes();
+                let mask = coeff_arr.dot(&protos_2d);
+                let mask = mask
+                    .into_shape_with_order((roi_h, roi_w, 1))
+                    .unwrap()
+                    .mapv(|x: f32| {
+                        let sigmoid = 1.0 / (1.0 + (-x).exp());
+                        (sigmoid * 255.0).round() as u8
+                    });
+
+                edgefirst_decoder::Segmentation {
+                    xmin: x0 as f32 / proto_w as f32,
+                    ymin: y0 as f32 / proto_h as f32,
+                    xmax: x1 as f32 / proto_w as f32,
+                    ymax: y1 as f32 / proto_h as f32,
+                    segmentation: mask,
+                }
+            })
+            .collect()
+    }
+
     /// Renders per-instance grayscale masks from raw prototype data at full
     /// output resolution. Used internally by [`decode_masks_atlas`] to generate
     /// per-detection mask crops that are then packed into the atlas.
