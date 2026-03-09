@@ -1908,37 +1908,36 @@ impl ImageProcessorTrait for ImageProcessor {
 
         // skip G2D as it doesn't support rendering to image
 
+        // Hybrid path: CPU materialize + GL overlay (benchmarked faster than
+        // full-GPU draw_masks_proto on all tested platforms: 27× on imx8mp,
+        // 4× on imx95, 2.5× on rpi5, 1.6× on x86).
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
         if let Some(opengl) = self.opengl.as_mut() {
+            let cpu = self.cpu.as_ref().expect("CPU backend is always available");
             log::trace!(
-                "draw_masks_proto started with opengl in {:?}",
+                "draw_masks_proto started with hybrid (cpu+opengl) in {:?}",
                 start.elapsed()
             );
-            match opengl.draw_masks_proto(dst, detect, proto_data) {
+            let segmentation = cpu.materialize_segmentations(detect, proto_data);
+            match opengl.draw_masks(dst, detect, &segmentation) {
                 Ok(_) => {
-                    log::trace!("draw_masks_proto with opengl in {:?}", start.elapsed());
+                    log::trace!(
+                        "draw_masks_proto with hybrid (cpu+opengl) in {:?}",
+                        start.elapsed()
+                    );
                     return Ok(());
                 }
                 Err(e) => {
-                    log::trace!("draw_masks_proto didn't work with opengl: {e:?}")
+                    log::trace!("draw_masks_proto hybrid path failed, falling back to cpu: {e:?}");
                 }
             }
         }
+
+        // CPU-only fallback (no OpenGL, or hybrid GL overlay failed)
+        let cpu = self.cpu.as_mut().expect("CPU backend is always available");
         log::trace!("draw_masks_proto started with cpu in {:?}", start.elapsed());
-        if let Some(cpu) = self.cpu.as_mut() {
-            match cpu.draw_masks_proto(dst, detect, proto_data) {
-                Ok(_) => {
-                    log::trace!("draw_masks_proto with cpu in {:?}", start.elapsed());
-                    return Ok(());
-                }
-                Err(e) => {
-                    log::trace!("draw_masks_proto didn't work with cpu: {e:?}");
-                    return Err(e);
-                }
-            }
-        }
-        Err(Error::NoConverter)
+        cpu.draw_masks_proto(dst, detect, proto_data)
     }
 
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<()> {

@@ -277,6 +277,38 @@ fn bench_decode_masks_atlas(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
 }
 
 // =============================================================================
+// hybrid_materialize_and_draw: CPU decode + GPU/CPU overlay
+// =============================================================================
+
+fn bench_hybrid_materialize_and_draw(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
+    println!("\n== hybrid_materialize_and_draw: CPU Decode + Overlay ==\n");
+
+    let (detect, proto_data) = decode_proto_data();
+    let n_detect = detect.len();
+    println!("  Decoded {n_detect} detections for benchmarking\n");
+
+    let name = "hybrid_materialize_and_draw";
+    let Ok(mut dst) = proc.create_image(OUTPUT_W, OUTPUT_H, RGBA) else {
+        println!("  {:50} [skipped: allocation failed]", name);
+        return;
+    };
+
+    // Verify the hybrid path works before benchmarking.
+    let segmentation = materialize_segmentations(&detect, &proto_data);
+    if let Err(e) = proc.draw_masks(&mut dst, &detect, &segmentation) {
+        println!("  {:50} [unsupported: {}]", name, e);
+        return;
+    }
+
+    let result = run_bench(name, WARMUP, ITERATIONS, || {
+        let segmentation = materialize_segmentations(&detect, &proto_data);
+        proc.draw_masks(&mut dst, &detect, &segmentation).unwrap();
+    });
+    result.print_summary();
+    suite.record(&result);
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
@@ -291,6 +323,7 @@ fn main() {
     bench_draw_masks(&mut proc, &mut suite);
     bench_draw_masks_proto(&mut proc, &mut suite);
     bench_decode_masks_atlas(&mut proc, &mut suite);
+    bench_hybrid_materialize_and_draw(&mut proc, &mut suite);
 
     suite.finish();
     println!("\nDone.");
