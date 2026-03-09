@@ -2,7 +2,7 @@
 
 **Version:** 1.2
 **Last Updated:** March 9, 2026
-**Status:** Baseline results collected for imx8mp-frdm, imx95-frdm, rpi5-hailo, x86-desktop
+**Status:** Baseline results collected for imx8mp-frdm, imx95-frdm, raspberrypi, x86-desktop
 
 ---
 
@@ -22,7 +22,7 @@ Each benchmark category runs across all available **compute backends**:
 |----------------|-------------|-----------|
 | **CPU** | Pure software using vectorized operations + Rayon parallelism | All |
 | **OpenGL** | GPU-accelerated via OpenGL ES shader pipeline | Linux with EGL |
-| **G2D** | NXP 2D hardware blitter (Vivante) | NXP i.MX Familly |
+| **G2D** | NXP 2D hardware blitter (Vivante) | NXP i.MX Family |
 
 Future backends may include OpenCL, Vulkan, and other vendor-specific 2D accelerators.
 
@@ -95,71 +95,7 @@ All benchmarks use the `edgefirst-bench` custom harness which:
 
 ## Running Benchmarks
 
-### Quick Start
-
-```bash
-# Run all Rust benchmarks
-make bench
-
-# Run specific benchmark suites
-cargo bench -p edgefirst-image --bench pipeline_benchmark -- --bench
-cargo bench -p edgefirst-image --bench image_benchmark
-cargo bench -p edgefirst-image --bench mask_benchmark -- --bench
-cargo bench -p edgefirst-decoder --bench decoder_benchmark
-cargo bench -p edgefirst-tensor --bench tensor_benchmark
-
-# Run Python benchmarks
-source venv/bin/activate
-python tests/bench_decode_render.py --iterations 200 --json results.json
-```
-
-### Cross-Compile and Run on Target
-
-```bash
-# Build benchmarks for aarch64
-cargo-zigbuild test --target aarch64-unknown-linux-gnu --release --no-run \
-    --workspace --exclude edgefirst_hal
-
-# Copy to target
-scp target/aarch64-unknown-linux-gnu/release/deps/pipeline_benchmark-* target:/tmp/
-
-# Run on target
-ssh target '/tmp/pipeline_benchmark-* --bench'
-```
-
-### Controlling Compute Backends
-
-Use `EDGEFIRST_FORCE_BACKEND` to isolate individual compute backends:
-
-```bash
-# CPU-only
-EDGEFIRST_FORCE_BACKEND=cpu cargo bench -p edgefirst-image --bench pipeline_benchmark -- --bench
-
-# OpenGL-only
-EDGEFIRST_FORCE_BACKEND=opengl cargo bench -p edgefirst-image --bench pipeline_benchmark -- --bench
-
-# G2D-only (NXP i.MX platforms only)
-EDGEFIRST_FORCE_BACKEND=g2d cargo bench -p edgefirst-image --bench pipeline_benchmark -- --bench
-```
-
-### Controlling Buffer Strategies
-
-```bash
-# Force PBO transfer strategy for OpenGL (even when DMA-buf is available)
-EDGEFIRST_FORCE_TRANSFER=pbo cargo bench -p edgefirst-image --bench pipeline_benchmark -- --bench
-```
-
-### Output Format
-
-Benchmark results are printed as:
-```
-  benchmark/name                                     median=   1.23ms  mean=   1.45ms  min=   1.10ms  max=   2.30ms  p95=   1.89ms  (n=200)
-```
-
-Use `--json <path>` to produce machine-readable output:
-```bash
-cargo bench -p edgefirst-image --bench pipeline_benchmark -- --bench --json results.json
-```
+See [README.md § Benchmarking](README.md#benchmarking) for full instructions on running benchmarks locally, cross-compiling for aarch64, and deploying to target platforms.
 
 JSON files are collected in `benchmarks/<platform>/` and processed by `.github/scripts/generate_benchmark_tables.py` to produce the tables in this document.
 
@@ -223,11 +159,11 @@ JSON files are collected in `benchmarks/<platform>/` and processed by `.github/s
 | **DMA-buf** | Yes (system heap, DMA roundtrip may fail — PBO path likely) |
 | **Notes** | NVIDIA EGL may not import DMA-buf from system heap; PBO path expected |
 
-### rpi5-hailo
+### raspberrypi
 
 | Property | Value |
 |----------|-------|
-| **Platform ID** | `rpi5-hailo` |
+| **Platform ID** | `raspberrypi` |
 | **SoC** | Broadcom BCM2712 |
 | **CPU** | 4× Cortex-A76 @ 2.4 GHz |
 | **GPU** | VideoCore VII (OpenGL ES 3.1 via Mesa V3D) |
@@ -269,9 +205,9 @@ Measures `Tensor::new()` latency for each buffer type and resolution.
 | imx95-frdm | MEM | 263 us | 596 us | 2.4 ms |
 | imx95-frdm | SHM | 31 us | 31 us | 31 us |
 | imx95-frdm | DMA | 988 us | 2.1 ms | 8.4 ms |
-| rpi5-hailo | MEM | 281 us | 740 us | 3.6 ms |
-| rpi5-hailo | SHM | 6.0 us | 6.0 us | 6.0 us |
-| rpi5-hailo | DMA | 714 us | 1.6 ms | 6.3 ms |
+| raspberrypi | MEM | 281 us | 740 us | 3.6 ms |
+| raspberrypi | SHM | 6.0 us | 6.0 us | 6.0 us |
+| raspberrypi | DMA | 714 us | 1.6 ms | 6.3 ms |
 | x86-desktop | MEM | 71 us | 239 us | 1.2 ms |
 | x86-desktop | SHM | 4.0 us | 4.0 us | 4.0 us |
 
@@ -285,8 +221,8 @@ Measures `tensor.map()` round-trip latency. MEM buffers have zero map overhead (
 | imx8mp-frdm | DMA | 348 us | 766 us | 3.0 ms |
 | imx95-frdm | SHM | 12 us | 12 us | 12 us |
 | imx95-frdm | DMA | 277 us | 624 us | 2.5 ms |
-| rpi5-hailo | SHM | 2.0 us | 2.0 us | 2.0 us |
-| rpi5-hailo | DMA | 99 us | 220 us | 868 us |
+| raspberrypi | SHM | 2.0 us | 2.0 us | 2.0 us |
+| raspberrypi | DMA | 99 us | 220 us | 868 us |
 | x86-desktop | SHM | 1.0 us | 1.0 us | 1.0 us |
 
 ### Image Preprocessing: Letterbox Pipeline (Camera → Model Input)
@@ -303,8 +239,8 @@ The most critical benchmark: simulates a real camera-to-model preprocessing pipe
 | imx95-frdm | G2D | DMA | 3.9 ms | 4.6 ms | — | 3.8 ms | — |
 | imx95-frdm | GL | DMA | 1.4 ms | 1.4 ms | 2.8 ms | 1.7 ms | — |
 | imx95-frdm | CPU | Heap | 14.6 ms | 14.9 ms | 17.0 ms | 19.1 ms | 14.6 ms |
-| rpi5-hailo | GL | DMA | 3.3 ms | — | 16.9 ms | 1.2 ms | — |
-| rpi5-hailo | CPU | Heap | 7.6 ms | 7.2 ms | 7.4 ms | 7.4 ms | 7.6 ms |
+| raspberrypi | GL | DMA | 3.3 ms | — | 16.9 ms | 1.2 ms | — |
+| raspberrypi | CPU | Heap | 7.6 ms | 7.2 ms | 7.4 ms | 7.4 ms | 7.6 ms |
 | x86-desktop | GL | PBO | — | — | — | — | — |
 | x86-desktop | CPU | Heap | 1.7 ms | 1.5 ms | 1.9 ms | 1.4 ms | 1.8 ms |
 
@@ -320,12 +256,12 @@ The most critical benchmark: simulates a real camera-to-model preprocessing pipe
 | imx95-frdm | G2D | DMA | 13.9 ms | 16.6 ms | 13.2 ms |
 | imx95-frdm | GL | DMA | 1.8 ms | 1.7 ms | 5.0 ms |
 | imx95-frdm | CPU | Heap | 46.2 ms | 41.7 ms | 66.5 ms |
-| rpi5-hailo | GL | DMA | 18.6 ms | — | — |
-| rpi5-hailo | CPU | Heap | 23.9 ms | 19.8 ms | 22.2 ms |
+| raspberrypi | GL | DMA | 18.6 ms | — | — |
+| raspberrypi | CPU | Heap | 23.9 ms | 19.8 ms | 22.2 ms |
 | x86-desktop | GL | PBO | — | — | — |
 | x86-desktop | CPU | Heap | 7.7 ms | 6.4 ms | 9.5 ms |
 
-> **Note:** rpi5-hailo GL shows "—" for 4K NV12→RGBA because Mesa V3D cannot allocate DMA-buf textures at 4K resolution. Only 1080p and below are supported.
+> **Note:** raspberrypi GL shows "—" for 4K NV12→RGBA because Mesa V3D cannot allocate DMA-buf textures at 4K resolution. Only 1080p and below are supported.
 
 ### Format Conversion (Same Size, No Resize)
 
@@ -339,8 +275,8 @@ The most critical benchmark: simulates a real camera-to-model preprocessing pipe
 | imx95-frdm | G2D | DMA | 4.7 ms | 4.3 ms | 4.5 ms | — | — | — |
 | imx95-frdm | GL | DMA | 3.3 ms | 3.1 ms | 3.2 ms | — | 3.4 ms | 3.1 ms |
 | imx95-frdm | CPU | Heap | 12.3 ms | 10.8 ms | 15.8 ms | 10.9 ms | 24.2 ms | 8.8 ms |
-| rpi5-hailo | GL | DMA | 16.4 ms | — | 5.5 ms | — | 17.2 ms | 6.2 ms |
-| rpi5-hailo | CPU | Heap | 6.8 ms | 5.4 ms | 8.0 ms | 6.5 ms | 12.1 ms | 2.5 ms |
+| raspberrypi | GL | DMA | 16.4 ms | — | 5.5 ms | — | 17.2 ms | 6.2 ms |
+| raspberrypi | CPU | Heap | 6.8 ms | 5.4 ms | 8.0 ms | 6.5 ms | 12.1 ms | 2.5 ms |
 | x86-desktop | GL | PBO | — | — | — | 1.2 ms | 1.5 ms | 1.5 ms |
 | x86-desktop | CPU | Heap | 616 us | 619 us | 255 us | 323 us | 1.1 ms | 295 us |
 
@@ -356,8 +292,8 @@ All CPU-only (decoder is not GPU-accelerated).
 | imx8mp-frdm | f32 | 6.5 ms | — | — | — |
 | imx95-frdm | i8 (quant) | 833 us | 770 us | 19 us | 2.9 ms |
 | imx95-frdm | f32 | 6.3 ms | — | — | — |
-| rpi5-hailo | i8 (quant) | 247 us | 251 us | 4.0 us | 2.1 ms |
-| rpi5-hailo | f32 | 3.0 ms | — | — | — |
+| raspberrypi | i8 (quant) | 247 us | 251 us | 4.0 us | 2.1 ms |
+| raspberrypi | f32 | 3.0 ms | — | — | — |
 | x86-desktop | i8 (quant) | 70 us | 69 us | 2.0 us | 418 us |
 | x86-desktop | f32 | 582 us | — | — | — |
 
@@ -367,7 +303,7 @@ All CPU-only (decoder is not GPU-accelerated).
 |----------|-----------|------------|------------|
 | imx8mp-frdm | i8 (quant) | — | 6.4 ms |
 | imx95-frdm | i8 (quant) | — | 6.6 ms |
-| rpi5-hailo | i8 (quant) | — | 2.6 ms |
+| raspberrypi | i8 (quant) | — | 2.6 ms |
 | x86-desktop | i8 (quant) | — | 850 us |
 
 ### Mask Rendering
@@ -380,8 +316,8 @@ All CPU-only (decoder is not GPU-accelerated).
 | imx8mp-frdm | CPU | Heap | 5.9 ms | 80.2 ms | 77.8 ms | 9.0 ms |
 | imx95-frdm | GL | DMA | 1.9 ms | 25.2 ms | 28.0 ms | 5.7 ms |
 | imx95-frdm | CPU | Heap | 6.0 ms | 78.1 ms | 75.7 ms | 9.0 ms |
-| rpi5-hailo | GL | DMA | 1.5 ms | 7.6 ms | 7.9 ms | 2.4 ms |
-| rpi5-hailo | CPU | Heap | 1.1 ms | 15.0 ms | 14.7 ms | 1.9 ms |
+| raspberrypi | GL | DMA | 1.5 ms | 7.6 ms | 7.9 ms | 2.4 ms |
+| raspberrypi | CPU | Heap | 1.1 ms | 15.0 ms | 14.7 ms | 1.9 ms |
 | x86-desktop | GL | PBO | 107 us | 802 us | 923 us | 394 us |
 | x86-desktop | CPU | Heap | 519 us | 5.9 ms | 5.9 ms | 786 us |
 
@@ -395,7 +331,7 @@ The hybrid path decodes masks on CPU (`materialize_segmentations`) then overlays
 |----------|-------------------------------|-------------|---------|----------------------|
 | imx8mp-frdm | 275 ms | 5.9 ms | **47×** | 6.0 ms |
 | imx95-frdm | 25.2 ms | 5.7 ms | **4.4×** | 5.6 ms |
-| rpi5-hailo | 7.6 ms | 2.4 ms | **3.2×** | 2.4 ms |
+| raspberrypi | 7.6 ms | 2.4 ms | **3.2×** | 2.4 ms |
 | x86-desktop | 802 us | 394 us | **2.0×** | 386 us |
 
 > **Note:** "Auto draw_masks_proto" confirms the auto path now selects the hybrid path — timings match `hybrid_materialize_and_draw`.
@@ -406,7 +342,7 @@ The hybrid path decodes masks on CPU (`materialize_segmentations`) then overlays
 |----------|-------------------------------|-------------------------------------------|
 | imx8mp-frdm | 1.6 ms | 4.9 ms |
 | imx95-frdm | 1.3 ms | 4.3 ms |
-| rpi5-hailo | 527 us | 1.5 ms |
+| raspberrypi | 527 us | 1.5 ms |
 | x86-desktop | 122 us | 429 us |
 
 ---
@@ -430,7 +366,7 @@ The hybrid path decodes masks on CPU (`materialize_segmentations`) then overlays
 
 5. **imx8mp-frdm GL mask rendering anomalously slow** — draw_masks_proto takes 275ms on Vivante GC7000UL vs 25.2ms on Mali G310 (imx95-frdm). The Vivante driver appears to have inefficiencies with the mask shader.
 
-6. **rpi5-hailo 4K DMA-buf allocation fails** — Mesa V3D driver cannot allocate DMA-buf textures at 3840×2160. OpenGL benchmarks at 4K are skipped on this platform.
+6. **raspberrypi 4K DMA-buf allocation fails** — Mesa V3D driver cannot allocate DMA-buf textures at 3840×2160. OpenGL benchmarks at 4K are skipped on this platform.
 
 7. **x86-desktop OpenGL cannot import YUV textures** — NVIDIA PBO path does not support YUYV/NV12/VYUY source textures. OpenGL letterbox and convert benchmarks show "—" for YUV source formats on this platform.
 
@@ -453,5 +389,5 @@ The hybrid path decodes masks on CPU (`materialize_segmentations`) then overlays
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.2 | 2026-03-09 | Add hybrid mask benchmark and comparison table; auto-selection now prefers hybrid path |
-| 1.1 | 2026-03-08 | Baseline results for imx8mp-frdm, imx95-frdm, rpi5-hailo, x86-desktop |
+| 1.1 | 2026-03-08 | Baseline results for imx8mp-frdm, imx95-frdm, raspberrypi, x86-desktop |
 | 1.0 | 2026-03-04 | Initial document with strategy, platforms, and gap analysis |

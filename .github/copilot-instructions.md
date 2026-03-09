@@ -2,8 +2,8 @@
 
 **Purpose:** Instructions for AI coding assistants (GitHub Copilot, Cursor, Claude Code, etc.) working on this project.
 
-**Version:** 1.2
-**Last Updated:** February 2026
+**Version:** 1.3
+**Last Updated:** March 2026
 
 ---
 
@@ -612,83 +612,22 @@ pub fn function_name(arg1: Type1, arg2: Type2) -> Result<ReturnType> {
 
 ## Benchmarks
 
-### Benchmark Binaries
+See [README.md § Benchmarking](../README.md#benchmarking) for full instructions on running, cross-compiling, and deploying benchmarks. See [BENCHMARKS.md](../BENCHMARKS.md) for collected results and analysis.
+
+### Quick Reference
 
 | Binary | Crate | What It Measures |
 |--------|-------|-----------------|
-| `tensor_benchmark` | `edgefirst-tensor` | Tensor allocation and map/unmap latency across buffer types (Heap, SHM, DMA, PBO) |
-| `image_benchmark` | `edgefirst-image` | Low-level image operations: crop, flip, rotate, resize, draw |
-| `pipeline_benchmark` | `edgefirst-image` | Letterbox pipeline and format conversion (camera→model input) |
-| `mask_benchmark` | `edgefirst-image` | Mask rendering: draw_masks, draw_masks_proto, decode_masks_atlas, hybrid path |
-| `opencv_benchmark` | `edgefirst-image` | OpenCV baseline comparison for same operations |
-| `decoder_benchmark` | `edgefirst-decoder` | YOLO detection/segmentation post-processing, NMS, dequantization |
+| `tensor_benchmark` | `edgefirst-tensor` | Allocation and map/unmap latency (Heap, SHM, DMA, PBO) |
+| `pipeline_benchmark` | `edgefirst-image` | Letterbox pipeline and format conversion |
+| `mask_benchmark` | `edgefirst-image` | Mask rendering paths (GL, CPU, hybrid) |
+| `decoder_benchmark` | `edgefirst-decoder` | YOLO post-processing, NMS, dequantization |
 
-### Running Locally (x86)
+**Key env vars:** `EDGEFIRST_FORCE_BACKEND={cpu,opengl,g2d}`, `EDGEFIRST_FORCE_TRANSFER=pbo`
 
-```bash
-# Auto backend selection (default)
-cargo bench -p edgefirst-image --bench mask_benchmark
+**JSON convention:** `benchmarks/<platform>/<name>.json` (platforms: `imx8mp-frdm`, `imx95-frdm`, `raspberrypi`, `x86-desktop`)
 
-# Force CPU backend
-EDGEFIRST_FORCE_BACKEND=cpu cargo bench -p edgefirst-image --bench mask_benchmark
-
-# Force OpenGL backend
-EDGEFIRST_FORCE_BACKEND=opengl cargo bench -p edgefirst-image --bench pipeline_benchmark
-```
-
-### Cross-Compiling for aarch64
-
-```bash
-cargo-zigbuild build --target aarch64-unknown-linux-gnu --release \
-    -p edgefirst-image --features opengl --bench mask_benchmark
-
-cargo-zigbuild build --target aarch64-unknown-linux-gnu --release \
-    -p edgefirst-image --features opengl --bench pipeline_benchmark
-
-cargo-zigbuild build --target aarch64-unknown-linux-gnu --release \
-    -p edgefirst-tensor --bench tensor_benchmark
-
-cargo-zigbuild build --target aarch64-unknown-linux-gnu --release \
-    -p edgefirst-decoder --bench decoder_benchmark
-```
-
-### Deploying to Targets
-
-SSH hostnames are configured in `~/.ssh/config`:
-
-```bash
-# Copy benchmark binary to target
-scp target/aarch64-unknown-linux-gnu/release/deps/mask_benchmark-* imx8mp-frdm:/tmp/
-
-# Run on target
-ssh imx8mp-frdm '/tmp/mask_benchmark-* --bench --json /tmp/mask-opengl.json'
-```
-
-Target hostnames: `imx8mp-frdm`, `imx95-frdm`, `raspberrypi`
-
-### JSON Output Convention
-
-All benchmarks accept `--bench --json <path>` to write structured JSON results:
-
-```bash
-./mask_benchmark --bench --json results.json
-```
-
-Store results in `benchmarks/<platform>/<name>.json`, e.g.:
-- `benchmarks/imx8mp-frdm/mask-opengl.json`
-- `benchmarks/x86-desktop/pipeline-cpu.json`
-
-### Updating BENCHMARKS.md
-
-```bash
-python3 .github/scripts/generate_benchmark_tables.py --data-dir benchmarks/
-```
-
-This prints markdown tables to stdout. Copy the relevant sections into `BENCHMARKS.md`.
-
-### Platform Naming
-
-The `raspberrypi` directory in `benchmarks/` corresponds to `rpi5-hailo` in BENCHMARKS.md.
+**Updating tables:** `python3 .github/scripts/generate_benchmark_tables.py --data-dir benchmarks/`
 
 ---
 
