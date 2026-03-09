@@ -27,9 +27,7 @@ use edgefirst_image::{
     Crop, Flip, ImageProcessor, ImageProcessorTrait, Rotation, TensorImage, GREY, NV16, PLANAR_RGB,
     RGB, RGBA, YUYV,
 };
-#[cfg(target_os = "linux")]
-use edgefirst_tensor::TensorMemory;
-use edgefirst_tensor::{TensorMapTrait, TensorTrait};
+use edgefirst_tensor::{TensorMapTrait, TensorMemory, TensorTrait};
 
 const WARMUP: usize = 10;
 const ITERATIONS: usize = 100;
