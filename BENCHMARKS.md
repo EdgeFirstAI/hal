@@ -161,7 +161,7 @@ Use `--json <path>` to produce machine-readable output:
 cargo bench -p edgefirst-image --bench pipeline_benchmark -- --bench --json results.json
 ```
 
-JSON files are collected in `benchmarks/<platform>/` and processed by `benchmarks/generate_tables.py` to produce the tables in this document.
+JSON files are collected in `benchmarks/<platform>/` and processed by `.github/scripts/generate_benchmark_tables.py` to produce the tables in this document.
 
 ---
 
