@@ -1446,7 +1446,12 @@ fn protobox<'a, T>(
     // pixel-space boxes (e.g. 0-640) which must be normalized before calling
     // decode(). Without this check, pixel-space coordinates silently clamp to
     // the proto boundary, producing empty (0, 0, C) masks for every detection.
-    const NORM_LIMIT: f32 = 1.01;
+    //
+    // The limit is set to 2.0 (not 1.01) because YOLO models legitimately
+    // predict coordinates slightly > 1.0 for objects near frame edges.
+    // Any value > 2.0 is clearly pixel-space (even the smallest practical
+    // model input of 32×32 would produce coordinates >> 2.0).
+    const NORM_LIMIT: f32 = 2.0;
     if roi.xmin > NORM_LIMIT
         || roi.ymin > NORM_LIMIT
         || roi.xmax > NORM_LIMIT
