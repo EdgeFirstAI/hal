@@ -741,6 +741,75 @@ python -m pip install pillow
 
 **Note**: Python tests require the Python bindings to be built via `maturin develop` first, as they test the PyO3 interface.
 
+## Benchmarking
+
+The HAL includes dedicated benchmark binaries for measuring performance across platforms and compute backends.
+
+### Benchmark Binaries
+
+| Binary | Crate | What It Measures |
+|--------|-------|-----------------|
+| `tensor_benchmark` | `edgefirst-tensor` | Tensor allocation and map/unmap latency across buffer types (Heap, SHM, DMA, PBO) |
+| `image_benchmark` | `edgefirst-image` | Low-level image operations: crop, flip, rotate, resize, draw |
+| `pipeline_benchmark` | `edgefirst-image` | Letterbox pipeline and format conversion (camera→model input) |
+| `mask_benchmark` | `edgefirst-image` | Mask rendering: draw_masks, draw_masks_proto, decode_masks_atlas, hybrid path |
+| `opencv_benchmark` | `edgefirst-image` | OpenCV baseline comparison for same operations |
+| `decoder_benchmark` | `edgefirst-decoder` | YOLO detection/segmentation post-processing, NMS, dequantization |
+
+### Running Locally
+
+```bash
+# Auto backend selection (default)
+cargo bench -p edgefirst-image --bench pipeline_benchmark -- --bench
+
+# Force a specific compute backend
+EDGEFIRST_FORCE_BACKEND=cpu cargo bench -p edgefirst-image --bench pipeline_benchmark -- --bench
+EDGEFIRST_FORCE_BACKEND=opengl cargo bench -p edgefirst-image --bench pipeline_benchmark -- --bench
+EDGEFIRST_FORCE_BACKEND=g2d cargo bench -p edgefirst-image --bench pipeline_benchmark -- --bench
+
+# Force PBO buffer transfer strategy (even when DMA-buf is available)
+EDGEFIRST_FORCE_TRANSFER=pbo cargo bench -p edgefirst-image --bench pipeline_benchmark -- --bench
+```
+
+### Cross-Compiling for aarch64
+
+```bash
+cargo-zigbuild build --target aarch64-unknown-linux-gnu --release \
+    -p edgefirst-image --features opengl --bench pipeline_benchmark
+
+cargo-zigbuild build --target aarch64-unknown-linux-gnu --release \
+    -p edgefirst-tensor --bench tensor_benchmark
+
+cargo-zigbuild build --target aarch64-unknown-linux-gnu --release \
+    -p edgefirst-decoder --bench decoder_benchmark
+```
+
+### Deploying to Targets
+
+SSH hostnames are configured in `~/.ssh/config`: `imx8mp-frdm`, `imx95-frdm`, `raspberrypi`
+
+```bash
+# Copy benchmark binary to target
+scp target/aarch64-unknown-linux-gnu/release/deps/pipeline_benchmark-* imx8mp-frdm:/tmp/
+
+# Run on target with JSON output
+ssh imx8mp-frdm '/tmp/pipeline_benchmark-* --bench --json /tmp/pipeline-cpu.json'
+```
+
+### JSON Output Convention
+
+All benchmarks accept `--bench --json <path>` to write structured JSON results. Store results in `benchmarks/<platform>/<name>.json`:
+- `benchmarks/imx8mp-frdm/mask-opengl.json`
+- `benchmarks/x86-desktop/pipeline-cpu.json`
+
+### Updating BENCHMARKS.md
+
+```bash
+python3 .github/scripts/generate_benchmark_tables.py --data-dir benchmarks/
+```
+
+This prints markdown tables to stdout. Copy the relevant sections into [BENCHMARKS.md](BENCHMARKS.md), which contains the full results and analysis.
+
 ## Dependencies
 
 ### Key External Dependencies
