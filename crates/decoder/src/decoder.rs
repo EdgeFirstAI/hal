@@ -6899,7 +6899,7 @@ outputs:
     fn test_decode_quantized_proto_returns_none_no_model() {
         // Detection-only decoder has no segmentation model → returns Ok(None)
         let decoder = build_det_only_decoder();
-        let data = vec![0i8; 1 * 84 * 8400];
+        let data = vec![0i8; 84 * 8400];
         let arr = ndarray::Array3::from_shape_vec((1, 84, 8400), data).unwrap();
         let mut output_boxes: Vec<DetectBox> = Vec::with_capacity(50);
         let result = decoder.decode_quantized_proto(&[arr.view().into()], &mut output_boxes);
@@ -6914,7 +6914,7 @@ outputs:
     fn test_decode_float_proto_returns_none_no_model() {
         // Detection-only decoder has no segmentation model → returns Ok(None)
         let decoder = build_det_only_decoder();
-        let data = vec![0.0f32; 1 * 84 * 8400];
+        let data = vec![0.0f32; 84 * 8400];
         let arr = ndarray::Array3::from_shape_vec((1, 84, 8400), data).unwrap();
         let mut output_boxes: Vec<DetectBox> = Vec::with_capacity(50);
         let result = decoder.decode_float_proto(&[arr.view().into_dyn()], &mut output_boxes);
@@ -6928,7 +6928,7 @@ outputs:
     #[test]
     fn test_decode_quantized_proto_clears_outputs() {
         let decoder = build_det_only_decoder();
-        let data = vec![0i8; 1 * 84 * 8400];
+        let data = vec![0i8; 84 * 8400];
         let arr = ndarray::Array3::from_shape_vec((1, 84, 8400), data).unwrap();
 
         // Pre-populate output_boxes with stale data
