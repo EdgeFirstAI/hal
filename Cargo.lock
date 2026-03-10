@@ -518,14 +518,14 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "edgefirst-bench"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "edgefirst-decoder"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "argminmax",
  "edgefirst-bench",
@@ -567,7 +567,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-hal"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "edgefirst-decoder",
  "edgefirst-image",
@@ -576,7 +576,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-hal-capi"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "cbindgen",
  "edgefirst-decoder",
@@ -596,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-image"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "ctor",
  "dma-heap",
@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tensor"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "ctor",
  "dma-heap",
@@ -648,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tracker"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "enum_dispatch",
  "lapjv",
@@ -661,7 +661,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst_hal"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "approx",
  "edgefirst-hal",
@@ -1012,7 +1012,7 @@ dependencies = [
 
 [[package]]
 name = "gpu-probe"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "edgefirst-bench",
  "edgefirst-gbm",
