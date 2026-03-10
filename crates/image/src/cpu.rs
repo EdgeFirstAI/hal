@@ -3809,4 +3809,147 @@ mod cpu_tests {
 
         assert_bgra_matches_rgba(&bgra_dst, &rgba_dst);
     }
+
+    // ========================================================================
+    // Tests for materialize_segmentations
+    // ========================================================================
+
+    fn make_proto_data(
+        proto_h: usize,
+        proto_w: usize,
+        num_protos: usize,
+        coefficients: Vec<Vec<f32>>,
+    ) -> crate::ProtoData {
+        crate::ProtoData {
+            mask_coefficients: coefficients,
+            protos: edgefirst_decoder::ProtoTensor::Float(ndarray::Array3::<f32>::zeros((
+                proto_h, proto_w, num_protos,
+            ))),
+        }
+    }
+
+    fn make_detect_box(xmin: f32, ymin: f32, xmax: f32, ymax: f32) -> crate::DetectBox {
+        crate::DetectBox {
+            bbox: edgefirst_decoder::BoundingBox {
+                xmin,
+                ymin,
+                xmax,
+                ymax,
+            },
+            score: 0.9,
+            label: 0,
+        }
+    }
+
+    #[test]
+    fn test_materialize_empty_detections() {
+        let cpu = CPUProcessor::new();
+        let proto_data = make_proto_data(8, 8, 4, vec![vec![1.0; 4]]);
+        let result = cpu.materialize_segmentations(&[], &proto_data);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_materialize_empty_proto_data() {
+        let cpu = CPUProcessor::new();
+        let proto_data = make_proto_data(8, 8, 4, vec![]);
+        let det = [make_detect_box(0.1, 0.1, 0.5, 0.5)];
+        let result = cpu.materialize_segmentations(&det, &proto_data);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_materialize_single_detection() {
+        let cpu = CPUProcessor::new();
+        let proto_data = make_proto_data(8, 8, 4, vec![vec![0.5; 4]]);
+        let det = [make_detect_box(0.1, 0.1, 0.5, 0.5)];
+        let result = cpu.materialize_segmentations(&det, &proto_data);
+        assert!(result.is_ok());
+        let segs = result.unwrap();
+        assert_eq!(segs.len(), 1);
+        // Segmentation should have shape (H, W, 1) with non-zero spatial dims
+        assert!(segs[0].segmentation.shape()[0] > 0);
+        assert!(segs[0].segmentation.shape()[1] > 0);
+        assert_eq!(segs[0].segmentation.shape()[2], 1);
+    }
+
+    #[test]
+    fn test_materialize_bbox_edge_one() {
+        let cpu = CPUProcessor::new();
+        let proto_data = make_proto_data(8, 8, 4, vec![vec![0.5; 4]]);
+        let det = [make_detect_box(0.5, 0.5, 1.0, 1.0)];
+        let result = cpu.materialize_segmentations(&det, &proto_data);
+        assert!(
+            result.is_ok(),
+            "bbox at exact boundary (1.0) should not panic"
+        );
+        let segs = result.unwrap();
+        assert_eq!(segs.len(), 1);
+    }
+
+    #[test]
+    fn test_materialize_bbox_negative_clamp() {
+        let cpu = CPUProcessor::new();
+        let proto_data = make_proto_data(8, 8, 4, vec![vec![0.5; 4]]);
+        let det = [make_detect_box(-0.5, -0.5, 0.5, 0.5)];
+        let result = cpu.materialize_segmentations(&det, &proto_data);
+        assert!(
+            result.is_ok(),
+            "negative coordinates should be clamped to 0"
+        );
+        let segs = result.unwrap();
+        assert_eq!(segs.len(), 1);
+        // xmin should be clamped to 0.0
+        assert!((segs[0].xmin - 0.0).abs() < 0.01);
+        assert!((segs[0].ymin - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_materialize_invalid_coeff_shape() {
+        let cpu = CPUProcessor::new();
+        // Proto has 4 channels but coefficients have 6 elements — mismatch
+        let proto_data = make_proto_data(8, 8, 4, vec![vec![0.5; 6]]);
+        let det = [make_detect_box(0.1, 0.1, 0.5, 0.5)];
+        let result = cpu.materialize_segmentations(&det, &proto_data);
+        assert!(
+            result.is_err(),
+            "mismatched coeff count vs proto channels should error"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, crate::Error::Internal(s) if s.contains("coeff")),
+            "error should mention coefficient shape: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_materialize_multiple_detections() {
+        let cpu = CPUProcessor::new();
+        let proto_data = make_proto_data(8, 8, 4, vec![vec![0.5; 4], vec![0.3; 4], vec![0.1; 4]]);
+        let det = [
+            make_detect_box(0.0, 0.0, 0.5, 0.5),
+            make_detect_box(0.5, 0.0, 1.0, 0.5),
+            make_detect_box(0.0, 0.5, 0.5, 1.0),
+        ];
+        let result = cpu.materialize_segmentations(&det, &proto_data);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_materialize_zero_area_bbox() {
+        let cpu = CPUProcessor::new();
+        let proto_data = make_proto_data(8, 8, 4, vec![vec![0.5; 4]]);
+        // xmin == xmax → zero-width bbox
+        let det = [make_detect_box(0.5, 0.1, 0.5, 0.5)];
+        let result = cpu.materialize_segmentations(&det, &proto_data);
+        assert!(
+            result.is_ok(),
+            "zero-area bbox should return Ok with degenerate segmentation"
+        );
+        let segs = result.unwrap();
+        assert_eq!(segs.len(), 1);
+    }
 }

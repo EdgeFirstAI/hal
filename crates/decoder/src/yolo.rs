@@ -1994,8 +1994,68 @@ mod tests {
     }
 
     // ========================================================================
-    // Regression: impl_yolo_segdet_float_proto must not double-reverse mask_tensor
+    // Tests for protobox / NORM_LIMIT regression
     // ========================================================================
+
+    #[test]
+    fn test_protobox_clamps_edge_coordinates() {
+        // bbox with xmax=1.0 should not panic (OOB guard)
+        let protos = Array3::<f32>::zeros((16, 16, 4));
+        let view = protos.view();
+        let roi = BoundingBox {
+            xmin: 0.5,
+            ymin: 0.5,
+            xmax: 1.0,
+            ymax: 1.0,
+        };
+        let result = protobox(&view, &roi);
+        assert!(result.is_ok(), "protobox should accept xmax=1.0");
+        let (cropped, _roi_norm) = result.unwrap();
+        // Cropped region must have non-zero spatial dimensions
+        assert!(cropped.shape()[0] > 0);
+        assert!(cropped.shape()[1] > 0);
+        assert_eq!(cropped.shape()[2], 4);
+    }
+
+    #[test]
+    fn test_protobox_rejects_wildly_out_of_range() {
+        // bbox with coords > NORM_LIMIT (e.g. 3.0) returns error
+        let protos = Array3::<f32>::zeros((16, 16, 4));
+        let view = protos.view();
+        let roi = BoundingBox {
+            xmin: 0.0,
+            ymin: 0.0,
+            xmax: 3.0,
+            ymax: 3.0,
+        };
+        let result = protobox(&view, &roi);
+        assert!(
+            matches!(result, Err(crate::DecoderError::InvalidShape(s)) if s.contains("un-normalized")),
+            "protobox should reject coords > NORM_LIMIT"
+        );
+    }
+
+    #[test]
+    fn test_protobox_accepts_slightly_over_one() {
+        // bbox with coords at 1.5 (within NORM_LIMIT=2.0) succeeds
+        let protos = Array3::<f32>::zeros((16, 16, 4));
+        let view = protos.view();
+        let roi = BoundingBox {
+            xmin: 0.0,
+            ymin: 0.0,
+            xmax: 1.5,
+            ymax: 1.5,
+        };
+        let result = protobox(&view, &roi);
+        assert!(
+            result.is_ok(),
+            "protobox should accept coords <= NORM_LIMIT (2.0)"
+        );
+        let (cropped, _roi_norm) = result.unwrap();
+        // Entire proto map should be selected when coords > 1.0 (clamped to boundary)
+        assert_eq!(cropped.shape()[0], 16);
+        assert_eq!(cropped.shape()[1], 16);
+    }
 
     #[test]
     fn test_segdet_float_proto_no_panic() {
