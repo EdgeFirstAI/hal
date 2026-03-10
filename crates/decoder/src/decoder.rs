@@ -6866,4 +6866,95 @@ outputs:
         assert_eq!(boxes.dshape.len(), 3);
         assert_eq!(boxes.dshape[2], (configs::DimName::BoxCoords, 4));
     }
+
+    // ========================================================================
+    // Tests for decode_quantized_proto / decode_float_proto
+    // ========================================================================
+
+    /// Build a detection-only decoder (YoloDet) — decode_*_proto returns Ok(None).
+    fn build_det_only_decoder() -> Decoder {
+        DecoderBuilder::default()
+            .with_config_yolo_det(
+                configs::Detection {
+                    decoder: DecoderType::Ultralytics,
+                    shape: vec![1, 84, 8400],
+                    anchors: None,
+                    quantization: Some((0.004, -123).into()),
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumFeatures, 84),
+                        (DimName::NumBoxes, 8400),
+                    ],
+                    normalized: Some(true),
+                },
+                Some(DecoderVersion::Yolo11),
+            )
+            .with_score_threshold(0.25)
+            .with_iou_threshold(0.7)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_decode_quantized_proto_returns_none_no_model() {
+        // Detection-only decoder has no segmentation model → returns Ok(None)
+        let decoder = build_det_only_decoder();
+        let data = vec![0i8; 1 * 84 * 8400];
+        let arr = ndarray::Array3::from_shape_vec((1, 84, 8400), data).unwrap();
+        let mut output_boxes: Vec<DetectBox> = Vec::with_capacity(50);
+        let result = decoder.decode_quantized_proto(&[arr.view().into()], &mut output_boxes);
+        assert!(result.is_ok());
+        assert!(
+            result.unwrap().is_none(),
+            "detection-only decoder should return None for proto"
+        );
+    }
+
+    #[test]
+    fn test_decode_float_proto_returns_none_no_model() {
+        // Detection-only decoder has no segmentation model → returns Ok(None)
+        let decoder = build_det_only_decoder();
+        let data = vec![0.0f32; 1 * 84 * 8400];
+        let arr = ndarray::Array3::from_shape_vec((1, 84, 8400), data).unwrap();
+        let mut output_boxes: Vec<DetectBox> = Vec::with_capacity(50);
+        let result = decoder.decode_float_proto(&[arr.view().into_dyn()], &mut output_boxes);
+        assert!(result.is_ok());
+        assert!(
+            result.unwrap().is_none(),
+            "detection-only decoder should return None for proto"
+        );
+    }
+
+    #[test]
+    fn test_decode_quantized_proto_clears_outputs() {
+        let decoder = build_det_only_decoder();
+        let data = vec![0i8; 1 * 84 * 8400];
+        let arr = ndarray::Array3::from_shape_vec((1, 84, 8400), data).unwrap();
+
+        // Pre-populate output_boxes with stale data
+        let mut output_boxes: Vec<DetectBox> = vec![
+            DetectBox {
+                bbox: crate::BoundingBox {
+                    xmin: 0.0,
+                    ymin: 0.0,
+                    xmax: 1.0,
+                    ymax: 1.0,
+                },
+                score: 0.99,
+                label: 0,
+            };
+            5
+        ];
+        assert_eq!(output_boxes.len(), 5);
+
+        let _ = decoder.decode_quantized_proto(&[arr.view().into()], &mut output_boxes);
+        // output_boxes should have been cleared before decode
+        // (for det-only, no new detections are added since it returns None early,
+        // but the clear happens at the top of the function)
+        assert!(
+            output_boxes.is_empty(),
+            "decode_quantized_proto should clear output_boxes: got {} items",
+            output_boxes.len()
+        );
+    }
 }

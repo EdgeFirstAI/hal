@@ -7884,4 +7884,52 @@ mod gl_tests {
             "draw_masks_mem BGRA/RGBA channel mismatch > 1: max_diff={max_diff}"
         );
     }
+
+    // ========================================================================
+    // GL smoke tests for mask rendering and PBO destinations
+    // ========================================================================
+
+    #[test]
+    fn test_gl_mask_render_smoke() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let mut image = TensorImage::new(64, 64, RGBA, None).unwrap();
+
+        // Render with empty detections and segmentations — should succeed trivially
+        let result = gl.draw_masks(&mut image, &[], &[]);
+        assert!(
+            result.is_ok(),
+            "GL mask render with empty data should succeed: {result:?}"
+        );
+
+        // Verify output dimensions are unchanged
+        assert_eq!(image.width(), 64);
+        assert_eq!(image.height(), 64);
+    }
+
+    #[test]
+    fn test_gl_pbo_destination_smoke() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        let gl = GLProcessorThreaded::new(None).unwrap();
+        let result = gl.create_pbo_image(64, 64, RGBA);
+        match result {
+            Ok(pbo_img) => {
+                assert_eq!(pbo_img.width(), 64);
+                assert_eq!(pbo_img.height(), 64);
+                assert_eq!(pbo_img.fourcc(), RGBA);
+            }
+            Err(e) => {
+                // PBO may not be supported on all GL implementations
+                eprintln!("SKIPPED: {} - PBO not supported: {e:?}", function!());
+            }
+        }
+    }
 }

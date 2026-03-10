@@ -4932,4 +4932,137 @@ mod image_tests {
         assert_eq!(img.channels(), 4);
         assert_eq!(img.fourcc(), BGRA);
     }
+
+    // ========================================================================
+    // Tests for EDGEFIRST_FORCE_BACKEND env var
+    // ========================================================================
+
+    #[test]
+    fn test_force_backend_cpu() {
+        let original = std::env::var("EDGEFIRST_FORCE_BACKEND").ok();
+        unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "cpu") };
+        let result = ImageProcessor::new();
+        match original {
+            Some(s) => unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", s) },
+            None => unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") },
+        }
+        let converter = result.unwrap();
+        assert!(converter.cpu.is_some());
+        assert_eq!(converter.forced_backend, Some(ForcedBackend::Cpu));
+    }
+
+    #[test]
+    fn test_force_backend_invalid() {
+        let original = std::env::var("EDGEFIRST_FORCE_BACKEND").ok();
+        unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "invalid") };
+        let result = ImageProcessor::new();
+        match original {
+            Some(s) => unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", s) },
+            None => unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") },
+        }
+        assert!(
+            matches!(&result, Err(Error::ForcedBackendUnavailable(s)) if s.contains("unknown")),
+            "invalid backend value should return ForcedBackendUnavailable error: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_force_backend_unset() {
+        let original = std::env::var("EDGEFIRST_FORCE_BACKEND").ok();
+        unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") };
+        let result = ImageProcessor::new();
+        match original {
+            Some(s) => unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", s) },
+            None => unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") },
+        }
+        let converter = result.unwrap();
+        assert!(converter.forced_backend.is_none());
+    }
+
+    // ========================================================================
+    // Tests for hybrid mask path error handling
+    // ========================================================================
+
+    #[test]
+    fn test_draw_masks_proto_no_cpu_returns_error() {
+        // Disable CPU backend to trigger the error path
+        let original_cpu = std::env::var("EDGEFIRST_DISABLE_CPU").ok();
+        unsafe { std::env::set_var("EDGEFIRST_DISABLE_CPU", "1") };
+        let original_gl = std::env::var("EDGEFIRST_DISABLE_GL").ok();
+        unsafe { std::env::set_var("EDGEFIRST_DISABLE_GL", "1") };
+        let original_g2d = std::env::var("EDGEFIRST_DISABLE_G2D").ok();
+        unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", "1") };
+
+        let result = ImageProcessor::new();
+
+        match original_cpu {
+            Some(s) => unsafe { std::env::set_var("EDGEFIRST_DISABLE_CPU", s) },
+            None => unsafe { std::env::remove_var("EDGEFIRST_DISABLE_CPU") },
+        }
+        match original_gl {
+            Some(s) => unsafe { std::env::set_var("EDGEFIRST_DISABLE_GL", s) },
+            None => unsafe { std::env::remove_var("EDGEFIRST_DISABLE_GL") },
+        }
+        match original_g2d {
+            Some(s) => unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", s) },
+            None => unsafe { std::env::remove_var("EDGEFIRST_DISABLE_G2D") },
+        }
+
+        let mut converter = result.unwrap();
+        assert!(converter.cpu.is_none(), "CPU should be disabled");
+
+        let mut dst = TensorImage::new(640, 480, RGBA, Some(TensorMemory::Mem)).unwrap();
+        let det = [DetectBox {
+            bbox: edgefirst_decoder::BoundingBox {
+                xmin: 0.1,
+                ymin: 0.1,
+                xmax: 0.5,
+                ymax: 0.5,
+            },
+            score: 0.9,
+            label: 0,
+        }];
+        let proto_data = ProtoData {
+            mask_coefficients: vec![vec![0.5; 4]],
+            protos: edgefirst_decoder::ProtoTensor::Float(ndarray::Array3::<f32>::zeros((8, 8, 4))),
+        };
+        let result = converter.draw_masks_proto(&mut dst, &det, &proto_data);
+        assert!(
+            matches!(&result, Err(Error::Internal(s)) if s.contains("CPU backend")),
+            "draw_masks_proto without CPU should return Internal error: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_draw_masks_proto_cpu_fallback_works() {
+        // Force CPU-only backend to ensure the CPU fallback path executes
+        let original = std::env::var("EDGEFIRST_FORCE_BACKEND").ok();
+        unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "cpu") };
+        let result = ImageProcessor::new();
+        match original {
+            Some(s) => unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", s) },
+            None => unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") },
+        }
+
+        let mut converter = result.unwrap();
+        assert!(converter.cpu.is_some());
+
+        let mut dst = TensorImage::new(64, 64, RGBA, Some(TensorMemory::Mem)).unwrap();
+        let det = [DetectBox {
+            bbox: edgefirst_decoder::BoundingBox {
+                xmin: 0.1,
+                ymin: 0.1,
+                xmax: 0.5,
+                ymax: 0.5,
+            },
+            score: 0.9,
+            label: 0,
+        }];
+        let proto_data = ProtoData {
+            mask_coefficients: vec![vec![0.5; 4]],
+            protos: edgefirst_decoder::ProtoTensor::Float(ndarray::Array3::<f32>::zeros((8, 8, 4))),
+        };
+        let result = converter.draw_masks_proto(&mut dst, &det, &proto_data);
+        assert!(result.is_ok(), "CPU fallback path should work: {result:?}");
+    }
 }
