@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-03-10
+
 ### Added
 
 - **BGRA destination format**: `create_image()` and `convert()` now accept
@@ -17,6 +19,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and C (fourcc `"BGRA"`). `draw_masks()` and `draw_masks_proto()` support
   BGRA destination images on the OpenGL backend; CPU mask rendering
   accepts only RGBA/RGB destinations.
+
+- **`EDGEFIRST_FORCE_BACKEND` environment variable**: forces `ImageProcessor`
+  to initialize only the specified backend (`cpu`, `g2d`, or `opengl`) with
+  no fallback chain. Useful for benchmarking individual backends in isolation.
+
+- **Hybrid CPU+GL mask rendering path**: `draw_masks_proto()` now materializes
+  segmentations on CPU via `materialize_segmentations()` then composites via
+  OpenGL, which is 2.5–27× faster than the previous full-GPU path across
+  tested platforms (imx8mp, imx95, rpi5, x86).
+
+- **`CPUProcessor::materialize_segmentations()`**: new public method that
+  computes per-detection segmentation masks from raw prototype data without
+  rendering them onto an image.
+
+- **Platform benchmark infrastructure**: migrated all benchmarks from Divan to
+  `edgefirst-bench` with JSON output support (`BenchSuite`), added dedicated
+  benchmark binaries (`tensor_benchmark`, `pipeline_benchmark`,
+  `mask_benchmark`, `decoder_benchmark`, `opencv_benchmark`), and added
+  benchmark data collection scripts and `BENCHMARKS.md` results document.
+
+- **Test coverage for new APIs**: 21 new tests covering NORM_LIMIT regression
+  (protobox), `materialize_segmentations`, `EDGEFIRST_FORCE_BACKEND` env var,
+  hybrid mask path error handling, `decode_*_proto` functions, and GL smoke
+  tests.
+
+### Fixed
+
+- **YOLO NORM_LIMIT too restrictive**: relaxed `NORM_LIMIT` from 1.01 to 2.0
+  in `protobox()` to allow YOLO models that legitimately predict bounding box
+  coordinates slightly > 1.0 for objects near frame edges. Coordinates > 2.0
+  still return `InvalidShape` to catch un-normalized pixel-space boxes.
+
+### Changed
+
+- ARCHITECTURE.md updated to v2.6: documents hybrid mask path, benchmark
+  infrastructure, and `EDGEFIRST_FORCE_BACKEND` env var
+- README.md updated with benchmarking section and quick-reference commands
 
 ## [0.9.0] - 2026-03-04
 
