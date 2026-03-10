@@ -22,13 +22,11 @@
 
 mod common;
 
-use common::run_bench;
+use common::{run_bench, BenchSuite};
 
 use edgefirst_decoder::yolo::impl_yolo_segdet_quant_proto;
 use edgefirst_decoder::{DetectBox, Nms, ProtoData, Quantization, Segmentation, XYWH};
-use edgefirst_image::{CPUProcessor, ImageProcessorTrait, TensorImage, RGBA};
-#[cfg(target_os = "linux")]
-use edgefirst_tensor::TensorMemory;
+use edgefirst_image::{ImageProcessor, ImageProcessorTrait, RGBA};
 use ndarray::s;
 
 const WARMUP: usize = 10;
@@ -144,7 +142,7 @@ fn materialize_segmentations(detect: &[DetectBox], proto_data: &ProtoData) -> Ve
 // decode_masks: CPU decode cost (not rendering)
 // =============================================================================
 
-fn bench_decode_masks() {
+fn bench_decode_masks(suite: &mut BenchSuite) {
     println!("\n== decode_masks: CPU Decode Cost ==\n");
 
     let boxes = load_boxes_i8();
@@ -167,6 +165,7 @@ fn bench_decode_masks() {
             );
         });
         result.print_summary();
+        suite.record(&result);
     }
 
     // Full decode: NMS + extract proto data + materialize pixel masks on CPU.
@@ -186,6 +185,7 @@ fn bench_decode_masks() {
             let _seg = materialize_segmentations(&output_boxes, &proto_data);
         });
         result.print_summary();
+        suite.record(&result);
     }
 }
 
@@ -193,8 +193,7 @@ fn bench_decode_masks() {
 // draw_masks: pre-decoded mask overlay
 // =============================================================================
 
-#[allow(unused_variables)]
-fn bench_draw_masks() {
+fn bench_draw_masks(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
     println!("\n== draw_masks: Pre-decoded Mask Overlay ==\n");
 
     let (detect, proto_data) = decode_proto_data();
@@ -202,145 +201,111 @@ fn bench_draw_masks() {
     let n_detect = detect.len();
     println!("  Materialized {n_detect} detection masks for benchmarking\n");
 
-    // CPU
-    {
-        let name = "draw_masks/cpu";
-        let mut dst = TensorImage::new(OUTPUT_W, OUTPUT_H, RGBA, None).unwrap();
-        let mut proc = CPUProcessor::new();
+    let name = "draw_masks";
+    let Ok(mut dst) = proc.create_image(OUTPUT_W, OUTPUT_H, RGBA) else {
+        println!("  {:50} [skipped: allocation failed]", name);
+        return;
+    };
 
-        let result = run_bench(name, WARMUP, ITERATIONS, || {
-            proc.draw_masks(&mut dst, &detect, &segmentation).unwrap();
-        });
-        result.print_summary();
+    if let Err(e) = proc.draw_masks(&mut dst, &detect, &segmentation) {
+        println!("  {:50} [unsupported: {}]", name, e);
+        return;
     }
 
-    // OpenGL
-    #[cfg(all(target_os = "linux", feature = "opengl"))]
-    {
-        use edgefirst_image::GLProcessorThreaded;
-
-        let (name, mut dst) =
-            if let Ok(d) = TensorImage::new(OUTPUT_W, OUTPUT_H, RGBA, Some(TensorMemory::Dma)) {
-                ("draw_masks/opengl/dma", d)
-            } else if let Ok(d) = TensorImage::new(OUTPUT_W, OUTPUT_H, RGBA, None) {
-                ("draw_masks/opengl/heap", d)
-            } else {
-                println!("  {:50} [skipped: allocation failed]", "draw_masks/opengl");
-                return;
-            };
-        let Ok(mut proc) = GLProcessorThreaded::new(None) else {
-            println!("  {:50} [skipped: OpenGL unavailable]", name);
-            return;
-        };
-
-        let result = run_bench(name, WARMUP, ITERATIONS, || {
-            proc.draw_masks(&mut dst, &detect, &segmentation).unwrap();
-        });
-        result.print_summary();
-    }
+    let result = run_bench(name, WARMUP, ITERATIONS, || {
+        proc.draw_masks(&mut dst, &detect, &segmentation).unwrap();
+    });
+    result.print_summary();
+    suite.record(&result);
 }
 
 // =============================================================================
 // draw_masks_proto: fused proto → overlay
 // =============================================================================
 
-#[allow(unused_variables)]
-fn bench_draw_masks_proto() {
+fn bench_draw_masks_proto(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
     println!("\n== draw_masks_proto: Fused Proto → Overlay ==\n");
 
     let (detect, proto_data) = decode_proto_data();
     let n_detect = detect.len();
     println!("  Decoded {n_detect} detections for benchmarking\n");
 
-    // CPU
-    {
-        let name = "draw_masks_proto/cpu";
-        let mut dst = TensorImage::new(OUTPUT_W, OUTPUT_H, RGBA, None).unwrap();
-        let mut proc = CPUProcessor::new();
+    let name = "draw_masks_proto";
+    let Ok(mut dst) = proc.create_image(OUTPUT_W, OUTPUT_H, RGBA) else {
+        println!("  {:50} [skipped: allocation failed]", name);
+        return;
+    };
 
-        let result = run_bench(name, WARMUP, ITERATIONS, || {
-            proc.draw_masks_proto(&mut dst, &detect, &proto_data)
-                .unwrap();
-        });
-        result.print_summary();
+    if let Err(e) = proc.draw_masks_proto(&mut dst, &detect, &proto_data) {
+        println!("  {:50} [unsupported: {}]", name, e);
+        return;
     }
 
-    // OpenGL
-    #[cfg(all(target_os = "linux", feature = "opengl"))]
-    {
-        use edgefirst_image::GLProcessorThreaded;
-
-        let (name, mut dst) =
-            if let Ok(d) = TensorImage::new(OUTPUT_W, OUTPUT_H, RGBA, Some(TensorMemory::Dma)) {
-                ("draw_masks_proto/opengl/dma", d)
-            } else if let Ok(d) = TensorImage::new(OUTPUT_W, OUTPUT_H, RGBA, None) {
-                ("draw_masks_proto/opengl/heap", d)
-            } else {
-                println!(
-                    "  {:50} [skipped: allocation failed]",
-                    "draw_masks_proto/opengl"
-                );
-                return;
-            };
-        let Ok(mut proc) = GLProcessorThreaded::new(None) else {
-            println!("  {:50} [skipped: OpenGL unavailable]", name);
-            return;
-        };
-
-        let result = run_bench(name, WARMUP, ITERATIONS, || {
-            proc.draw_masks_proto(&mut dst, &detect, &proto_data)
-                .unwrap();
-        });
-        result.print_summary();
-    }
+    let result = run_bench(name, WARMUP, ITERATIONS, || {
+        proc.draw_masks_proto(&mut dst, &detect, &proto_data)
+            .unwrap();
+    });
+    result.print_summary();
+    suite.record(&result);
 }
 
 // =============================================================================
 // decode_masks_atlas: proto → pixel atlas
 // =============================================================================
 
-#[allow(unused_variables)]
-fn bench_decode_masks_atlas() {
+fn bench_decode_masks_atlas(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
     println!("\n== decode_masks_atlas: Proto → Pixel Atlas ==\n");
 
     let (detect, proto_data) = decode_proto_data();
     let n_detect = detect.len();
     println!("  Decoded {n_detect} detections for benchmarking\n");
 
-    // CPU
-    // Note: proto_data.clone() is required because the trait consumes ProtoData
-    // by value (needed for the GL thread channel).  Clone cost (~0.1ms for 32
-    // protos at 160x160) is included in the measurement.
-    {
-        let name = "decode_masks_atlas/cpu";
-        let mut proc = CPUProcessor::new();
-
-        let result = run_bench(name, WARMUP, ITERATIONS, || {
-            let _atlas = proc
-                .decode_masks_atlas(&detect, proto_data.clone(), OUTPUT_W, OUTPUT_H)
-                .unwrap();
-        });
-        result.print_summary();
+    let name = "decode_masks_atlas";
+    // Note: proto_data.clone() is required because decode_masks_atlas consumes ProtoData by value.
+    if let Err(e) = proc.decode_masks_atlas(&detect, proto_data.clone(), OUTPUT_W, OUTPUT_H) {
+        println!("  {:50} [unsupported: {}]", name, e);
+        return;
     }
 
-    // OpenGL
-    #[cfg(all(target_os = "linux", feature = "opengl"))]
-    {
-        use edgefirst_image::GLProcessorThreaded;
+    let result = run_bench(name, WARMUP, ITERATIONS, || {
+        let _atlas = proc
+            .decode_masks_atlas(&detect, proto_data.clone(), OUTPUT_W, OUTPUT_H)
+            .unwrap();
+    });
+    result.print_summary();
+    suite.record(&result);
+}
 
-        let name = "decode_masks_atlas/opengl";
-        let Ok(mut proc) = GLProcessorThreaded::new(None) else {
-            println!("  {:50} [skipped: OpenGL unavailable]", name);
-            return;
-        };
+// =============================================================================
+// hybrid_materialize_and_draw: CPU decode + GPU/CPU overlay
+// =============================================================================
 
-        let result = run_bench(name, WARMUP, ITERATIONS, || {
-            let _atlas = proc
-                .decode_masks_atlas(&detect, proto_data.clone(), OUTPUT_W, OUTPUT_H)
-                .unwrap();
-        });
-        result.print_summary();
+fn bench_hybrid_materialize_and_draw(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
+    println!("\n== hybrid_materialize_and_draw: CPU Decode + Overlay ==\n");
+
+    let (detect, proto_data) = decode_proto_data();
+    let n_detect = detect.len();
+    println!("  Decoded {n_detect} detections for benchmarking\n");
+
+    let name = "hybrid_materialize_and_draw";
+    let Ok(mut dst) = proc.create_image(OUTPUT_W, OUTPUT_H, RGBA) else {
+        println!("  {:50} [skipped: allocation failed]", name);
+        return;
+    };
+
+    // Verify the hybrid path works before benchmarking.
+    let segmentation = materialize_segmentations(&detect, &proto_data);
+    if let Err(e) = proc.draw_masks(&mut dst, &detect, &segmentation) {
+        println!("  {:50} [unsupported: {}]", name, e);
+        return;
     }
+
+    let result = run_bench(name, WARMUP, ITERATIONS, || {
+        let segmentation = materialize_segmentations(&detect, &proto_data);
+        proc.draw_masks(&mut dst, &detect, &segmentation).unwrap();
+    });
+    result.print_summary();
+    suite.record(&result);
 }
 
 // =============================================================================
@@ -348,13 +313,18 @@ fn bench_decode_masks_atlas() {
 // =============================================================================
 
 fn main() {
-    println!("Mask Rendering Benchmark — custom in-process harness (no fork)");
+    let mut suite = BenchSuite::from_args();
+    let mut proc = ImageProcessor::new().expect("Failed to create ImageProcessor");
+
+    println!("Mask Rendering Benchmark — edgefirst-bench harness");
     println!("  warmup={WARMUP}  iterations={ITERATIONS}");
 
-    bench_decode_masks();
-    bench_draw_masks();
-    bench_draw_masks_proto();
-    bench_decode_masks_atlas();
+    bench_decode_masks(&mut suite);
+    bench_draw_masks(&mut proc, &mut suite);
+    bench_draw_masks_proto(&mut proc, &mut suite);
+    bench_decode_masks_atlas(&mut proc, &mut suite);
+    bench_hybrid_materialize_and_draw(&mut proc, &mut suite);
 
+    suite.finish();
     println!("\nDone.");
 }

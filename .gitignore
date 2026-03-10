@@ -28,5 +28,8 @@ env.sh
 /WP1/
 *.profraw
 
+# Benchmark intermediate data (JSON results, logs)
+/benchmarks/
+
 # C API build artifacts
 crates/capi/build/
