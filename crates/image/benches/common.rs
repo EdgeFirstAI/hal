@@ -4,10 +4,12 @@
 //! Shared utilities for image processing benchmarks.
 #![allow(dead_code, unused_imports)]
 
-use edgefirst_image::{NV12, PLANAR_RGB, PLANAR_RGB_INT8, RGB, RGBA, RGB_INT8, VYUY, YUYV};
+use edgefirst_image::{
+    BGRA, GREY, NV12, NV16, PLANAR_RGB, PLANAR_RGB_INT8, RGB, RGBA, RGB_INT8, VYUY, YUYV,
+};
 use four_char_code::FourCharCode;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
 #[cfg(target_os = "linux")]
 use edgefirst_image::{G2DProcessor, TensorImage};
@@ -15,7 +17,7 @@ use edgefirst_image::{G2DProcessor, TensorImage};
 use edgefirst_tensor::TensorMemory;
 
 // Re-export the benchmark harness from the shared crate.
-pub use edgefirst_bench::{run_bench, BenchResult};
+pub use edgefirst_bench::{run_bench, BenchResult, BenchSuite};
 
 // =============================================================================
 // Hardware Availability Cache
@@ -104,6 +106,12 @@ pub fn format_name(f: FourCharCode) -> &'static str {
         "8BPS"
     } else if f == PLANAR_RGB_INT8 {
         "8BPi"
+    } else if f == BGRA {
+        "BGRA"
+    } else if f == NV16 {
+        "NV16"
+    } else if f == GREY {
+        "GREY"
     } else {
         "???"
     }
@@ -203,10 +211,13 @@ impl BenchConfig {
         let bytes = match self.in_fmt {
             f if f == YUYV || f == VYUY => self.in_w * self.in_h * 2,
             f if f == NV12 => self.in_w * self.in_h * 3 / 2,
+            f if f == NV16 => self.in_w * self.in_h * 2, // 4:2:2 like YUYV
             f if f == RGB || f == RGB_INT8 || f == PLANAR_RGB || f == PLANAR_RGB_INT8 => {
                 self.in_w * self.in_h * 3
             }
             f if f == RGBA => self.in_w * self.in_h * 4,
+            f if f == BGRA => self.in_w * self.in_h * 4,
+            f if f == GREY => self.in_w * self.in_h,
             _ => self.in_w * self.in_h,
         };
         bytes as u64
@@ -217,6 +228,10 @@ impl BenchConfig {
 // Embedded Test Data
 // =============================================================================
 
+pub const CAMERA_720P_YUYV: &[u8] = include_bytes!("../../../testdata/camera720p.yuyv");
+pub const CAMERA_720P_VYUY: &[u8] = include_bytes!("../../../testdata/camera720p.vyuy");
+pub const CAMERA_720P_NV12: &[u8] = include_bytes!("../../../testdata/camera720p.nv12");
+pub const CAMERA_720P_RGB: &[u8] = include_bytes!("../../../testdata/camera720p.rgb");
 pub const CAMERA_1080P_YUYV: &[u8] = include_bytes!("../../../testdata/camera1080p.yuyv");
 pub const CAMERA_1080P_NV12: &[u8] = include_bytes!("../../../testdata/camera1080p.nv12");
 pub const CAMERA_1080P_RGB: &[u8] = include_bytes!("../../../testdata/camera1080p.rgb");
@@ -226,13 +241,29 @@ pub const CAMERA_4K_VYUY: &[u8] = include_bytes!("../../../testdata/camera4k.vyu
 pub const CAMERA_4K_NV12: &[u8] = include_bytes!("../../../testdata/camera4k.nv12");
 pub const CAMERA_4K_RGB: &[u8] = include_bytes!("../../../testdata/camera4k.rgb");
 
+// NV16 is 4:2:2 semi-planar: Y plane (W*H) + interleaved UV plane (W*H).
+// No real capture file available; synthetic mid-gray data is sufficient for
+// throughput benchmarks.
+static CAMERA_1080P_NV16: LazyLock<Vec<u8>> = LazyLock::new(|| vec![128u8; 1920 * 1080 * 2]);
+
+// RGBA synthetic data for format conversion benchmarks (e.g. RGBA -> BGRA,
+// RGBA -> GREY). No real capture file needed; mid-gray is sufficient for
+// throughput measurement.
+static CAMERA_1080P_RGBA: LazyLock<Vec<u8>> = LazyLock::new(|| vec![128u8; 1920 * 1080 * 4]);
+
 /// Get embedded test data for a given resolution and format.
 pub fn get_test_data(width: usize, height: usize, format: FourCharCode) -> &'static [u8] {
     match (width, height, format) {
+        (1280, 720, f) if f == YUYV => CAMERA_720P_YUYV,
+        (1280, 720, f) if f == VYUY => CAMERA_720P_VYUY,
+        (1280, 720, f) if f == NV12 => CAMERA_720P_NV12,
+        (1280, 720, f) if f == RGB => CAMERA_720P_RGB,
         (1920, 1080, f) if f == YUYV => CAMERA_1080P_YUYV,
         (1920, 1080, f) if f == VYUY => CAMERA_1080P_VYUY,
         (1920, 1080, f) if f == NV12 => CAMERA_1080P_NV12,
+        (1920, 1080, f) if f == NV16 => &CAMERA_1080P_NV16,
         (1920, 1080, f) if f == RGB => CAMERA_1080P_RGB,
+        (1920, 1080, f) if f == RGBA => &CAMERA_1080P_RGBA,
         (3840, 2160, f) if f == YUYV => CAMERA_4K_YUYV,
         (3840, 2160, f) if f == VYUY => CAMERA_4K_VYUY,
         (3840, 2160, f) if f == NV12 => CAMERA_4K_NV12,

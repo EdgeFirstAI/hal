@@ -2,8 +2,8 @@
 
 **Purpose:** Instructions for AI coding assistants (GitHub Copilot, Cursor, Claude Code, etc.) working on this project.
 
-**Version:** 1.2
-**Last Updated:** February 2026
+**Version:** 1.3
+**Last Updated:** March 2026
 
 ---
 
@@ -607,6 +607,27 @@ pub fn function_name(arg1: Type1, arg2: Type2) -> Result<ReturnType> {
 - **Over-engineering:** Prefer simple solutions
 - **Missing edge cases:** Explicitly test boundaries
 - **License violations:** AI may suggest incompatible code
+
+---
+
+## Benchmarks
+
+See [README.md § Benchmarking](../README.md#benchmarking) for full instructions on running, cross-compiling, and deploying benchmarks. See [BENCHMARKS.md](../BENCHMARKS.md) for collected results and analysis.
+
+### Quick Reference
+
+| Binary | Crate | What It Measures |
+|--------|-------|-----------------|
+| `tensor_benchmark` | `edgefirst-tensor` | Allocation and map/unmap latency (Heap, SHM, DMA) |
+| `pipeline_benchmark` | `edgefirst-image` | Letterbox pipeline and format conversion |
+| `mask_benchmark` | `edgefirst-image` | Mask rendering paths (GL, CPU, hybrid) |
+| `decoder_benchmark` | `edgefirst-decoder` | YOLO post-processing, NMS, dequantization |
+
+**Key env vars:** `EDGEFIRST_FORCE_BACKEND={cpu,opengl,g2d}`, `EDGEFIRST_FORCE_TRANSFER=pbo`
+
+**JSON convention:** `benchmarks/<platform>/<name>.json` (platforms: `imx8mp-frdm`, `imx95-frdm`, `rpi5-hailo`, `x86-desktop`)
+
+**Updating tables:** `python3 .github/scripts/generate_benchmark_tables.py --data-dir benchmarks/`
 
 ---
 

@@ -1906,6 +1906,75 @@ impl CPUProcessor {
         Ok(())
     }
 
+    /// Materialize segmentation masks from proto data into `Vec<Segmentation>`.
+    ///
+    /// This is the CPU-side decode step of the hybrid mask rendering path:
+    /// call this to get pre-decoded masks, then pass them to
+    /// [`draw_masks`](crate::ImageProcessorTrait::draw_masks) for GPU overlay.
+    /// Benchmarks show this hybrid path (CPU decode + GL overlay) is faster
+    /// than the fused GPU `draw_masks_proto` on all tested platforms.
+    pub fn materialize_segmentations(
+        &self,
+        detect: &[crate::DetectBox],
+        proto_data: &crate::ProtoData,
+    ) -> crate::Result<Vec<edgefirst_decoder::Segmentation>> {
+        if detect.is_empty() || proto_data.mask_coefficients.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let protos_cow = proto_data.protos.as_f32();
+        let protos = protos_cow.as_ref();
+        let proto_h = protos.shape()[0];
+        let proto_w = protos.shape()[1];
+        let num_protos = protos.shape()[2];
+
+        detect
+            .iter()
+            .zip(proto_data.mask_coefficients.iter())
+            .map(|(det, coeff)| {
+                // Clamp bbox to [0, 1]
+                let xmin = det.bbox.xmin.clamp(0.0, 1.0);
+                let ymin = det.bbox.ymin.clamp(0.0, 1.0);
+                let xmax = det.bbox.xmax.clamp(0.0, 1.0);
+                let ymax = det.bbox.ymax.clamp(0.0, 1.0);
+
+                // Map to proto-space pixel coordinates (clamp to valid range)
+                let x0 = ((xmin * proto_w as f32) as usize).min(proto_w.saturating_sub(1));
+                let y0 = ((ymin * proto_h as f32) as usize).min(proto_h.saturating_sub(1));
+                let x1 = ((xmax * proto_w as f32).ceil() as usize).min(proto_w);
+                let y1 = ((ymax * proto_h as f32).ceil() as usize).min(proto_h);
+
+                let roi_w = x1.saturating_sub(x0).max(1);
+                let roi_h = y1.saturating_sub(y0).max(1);
+
+                // Extract proto ROI and compute mask_coeff @ protos
+                let roi = protos.slice(ndarray::s![y0..y0 + roi_h, x0..x0 + roi_w, ..]);
+                let coeff_arr = ndarray::Array2::from_shape_vec((1, num_protos), coeff.clone())
+                    .map_err(|e| crate::Error::Internal(format!("mask coeff shape: {e}")))?;
+                let protos_2d = roi
+                    .to_shape((roi_h * roi_w, num_protos))
+                    .map_err(|e| crate::Error::Internal(format!("proto reshape: {e}")))?
+                    .reversed_axes();
+                let mask = coeff_arr.dot(&protos_2d);
+                let mask = mask
+                    .into_shape_with_order((roi_h, roi_w, 1))
+                    .map_err(|e| crate::Error::Internal(format!("mask reshape: {e}")))?
+                    .mapv(|x: f32| {
+                        let sigmoid = 1.0 / (1.0 + (-x).exp());
+                        (sigmoid * 255.0).round() as u8
+                    });
+
+                Ok(edgefirst_decoder::Segmentation {
+                    xmin: x0 as f32 / proto_w as f32,
+                    ymin: y0 as f32 / proto_h as f32,
+                    xmax: x1 as f32 / proto_w as f32,
+                    ymax: y1 as f32 / proto_h as f32,
+                    segmentation: mask,
+                })
+            })
+            .collect::<crate::Result<Vec<_>>>()
+    }
+
     /// Renders per-instance grayscale masks from raw prototype data at full
     /// output resolution. Used internally by [`decode_masks_atlas`] to generate
     /// per-detection mask crops that are then packed into the atlas.
@@ -3739,5 +3808,148 @@ mod cpu_tests {
         CPUProcessor::convert_format(&src, &mut bgra_dst).unwrap();
 
         assert_bgra_matches_rgba(&bgra_dst, &rgba_dst);
+    }
+
+    // ========================================================================
+    // Tests for materialize_segmentations
+    // ========================================================================
+
+    fn make_proto_data(
+        proto_h: usize,
+        proto_w: usize,
+        num_protos: usize,
+        coefficients: Vec<Vec<f32>>,
+    ) -> crate::ProtoData {
+        crate::ProtoData {
+            mask_coefficients: coefficients,
+            protos: edgefirst_decoder::ProtoTensor::Float(ndarray::Array3::<f32>::zeros((
+                proto_h, proto_w, num_protos,
+            ))),
+        }
+    }
+
+    fn make_detect_box(xmin: f32, ymin: f32, xmax: f32, ymax: f32) -> crate::DetectBox {
+        crate::DetectBox {
+            bbox: edgefirst_decoder::BoundingBox {
+                xmin,
+                ymin,
+                xmax,
+                ymax,
+            },
+            score: 0.9,
+            label: 0,
+        }
+    }
+
+    #[test]
+    fn test_materialize_empty_detections() {
+        let cpu = CPUProcessor::new();
+        let proto_data = make_proto_data(8, 8, 4, vec![vec![1.0; 4]]);
+        let result = cpu.materialize_segmentations(&[], &proto_data);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_materialize_empty_proto_data() {
+        let cpu = CPUProcessor::new();
+        let proto_data = make_proto_data(8, 8, 4, vec![]);
+        let det = [make_detect_box(0.1, 0.1, 0.5, 0.5)];
+        let result = cpu.materialize_segmentations(&det, &proto_data);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_materialize_single_detection() {
+        let cpu = CPUProcessor::new();
+        let proto_data = make_proto_data(8, 8, 4, vec![vec![0.5; 4]]);
+        let det = [make_detect_box(0.1, 0.1, 0.5, 0.5)];
+        let result = cpu.materialize_segmentations(&det, &proto_data);
+        assert!(result.is_ok());
+        let segs = result.unwrap();
+        assert_eq!(segs.len(), 1);
+        // Segmentation should have shape (H, W, 1) with non-zero spatial dims
+        assert!(segs[0].segmentation.shape()[0] > 0);
+        assert!(segs[0].segmentation.shape()[1] > 0);
+        assert_eq!(segs[0].segmentation.shape()[2], 1);
+    }
+
+    #[test]
+    fn test_materialize_bbox_edge_one() {
+        let cpu = CPUProcessor::new();
+        let proto_data = make_proto_data(8, 8, 4, vec![vec![0.5; 4]]);
+        let det = [make_detect_box(0.5, 0.5, 1.0, 1.0)];
+        let result = cpu.materialize_segmentations(&det, &proto_data);
+        assert!(
+            result.is_ok(),
+            "bbox at exact boundary (1.0) should not panic"
+        );
+        let segs = result.unwrap();
+        assert_eq!(segs.len(), 1);
+    }
+
+    #[test]
+    fn test_materialize_bbox_negative_clamp() {
+        let cpu = CPUProcessor::new();
+        let proto_data = make_proto_data(8, 8, 4, vec![vec![0.5; 4]]);
+        let det = [make_detect_box(-0.5, -0.5, 0.5, 0.5)];
+        let result = cpu.materialize_segmentations(&det, &proto_data);
+        assert!(
+            result.is_ok(),
+            "negative coordinates should be clamped to 0"
+        );
+        let segs = result.unwrap();
+        assert_eq!(segs.len(), 1);
+        // xmin should be clamped to 0.0
+        assert!((segs[0].xmin - 0.0).abs() < 0.01);
+        assert!((segs[0].ymin - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_materialize_invalid_coeff_shape() {
+        let cpu = CPUProcessor::new();
+        // Proto has 4 channels but coefficients have 6 elements — mismatch
+        let proto_data = make_proto_data(8, 8, 4, vec![vec![0.5; 6]]);
+        let det = [make_detect_box(0.1, 0.1, 0.5, 0.5)];
+        let result = cpu.materialize_segmentations(&det, &proto_data);
+        assert!(
+            result.is_err(),
+            "mismatched coeff count vs proto channels should error"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, crate::Error::Internal(s) if s.contains("coeff")),
+            "error should mention coefficient shape: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_materialize_multiple_detections() {
+        let cpu = CPUProcessor::new();
+        let proto_data = make_proto_data(8, 8, 4, vec![vec![0.5; 4], vec![0.3; 4], vec![0.1; 4]]);
+        let det = [
+            make_detect_box(0.0, 0.0, 0.5, 0.5),
+            make_detect_box(0.5, 0.0, 1.0, 0.5),
+            make_detect_box(0.0, 0.5, 0.5, 1.0),
+        ];
+        let result = cpu.materialize_segmentations(&det, &proto_data);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_materialize_zero_area_bbox() {
+        let cpu = CPUProcessor::new();
+        let proto_data = make_proto_data(8, 8, 4, vec![vec![0.5; 4]]);
+        // xmin == xmax → zero-width bbox
+        let det = [make_detect_box(0.5, 0.1, 0.5, 0.5)];
+        let result = cpu.materialize_segmentations(&det, &proto_data);
+        assert!(
+            result.is_ok(),
+            "zero-area bbox should return Ok with degenerate segmentation"
+        );
+        let segs = result.unwrap();
+        assert_eq!(segs.len(), 1);
     }
 }

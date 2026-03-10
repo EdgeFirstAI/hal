@@ -1513,8 +1513,27 @@ impl ImageProcessorTrait for GLProcessorST {
             ));
         }
 
-        let is_dma = match dst.tensor.memory() {
+        // Determine memory backend and set up the framebuffer.
+        // PBO tensors need special handling: calling tensor.map() on the GL
+        // thread would deadlock because PboOps sends a message back to this
+        // thread. Instead, bind the PBO as GL_PIXEL_UNPACK_BUFFER so
+        // TexImage2D reads directly from GPU memory (zero CPU copy).
+        let memory = dst.tensor.memory();
+        let pbo_buffer_id = if memory == edgefirst_tensor::TensorMemory::Pbo {
+            match &dst.tensor {
+                edgefirst_tensor::Tensor::Pbo(p) if !p.is_mapped() => Some(p.buffer_id()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let is_dma = match memory {
             edgefirst_tensor::TensorMemory::Dma if self.setup_renderbuffer_dma(dst).is_ok() => true,
+            _ if pbo_buffer_id.is_some() => {
+                self.setup_renderbuffer_from_pbo(dst, pbo_buffer_id.unwrap())?;
+                false
+            }
             _ => {
                 // Add dest rect to make sure dst is rendered fully
                 self.setup_renderbuffer_non_dma(
@@ -1538,25 +1557,47 @@ impl ImageProcessorTrait for GLProcessorST {
 
         gls::finish();
         if !is_dma {
-            let mut dst_map = dst.tensor().map()?;
             let format = match dst.fourcc() {
                 RGB => gls::gl::RGB,
                 RGBA => gls::gl::RGBA,
                 BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
                 _ => unreachable!(),
             };
-            unsafe {
-                gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                gls::gl::ReadnPixels(
-                    0,
-                    0,
-                    dst.width() as i32,
-                    dst.height() as i32,
-                    format,
-                    gls::gl::UNSIGNED_BYTE,
-                    dst.tensor.len() as i32,
-                    dst_map.as_mut_ptr() as *mut c_void,
-                );
+            if let Some(buffer_id) = pbo_buffer_id {
+                // PBO readback: bind as PACK buffer, ReadnPixels writes
+                // directly into PBO memory (zero CPU copy).
+                unsafe {
+                    gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, buffer_id);
+                    gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
+                    gls::gl::ReadnPixels(
+                        0,
+                        0,
+                        dst.width() as i32,
+                        dst.height() as i32,
+                        format,
+                        gls::gl::UNSIGNED_BYTE,
+                        dst.tensor.len() as i32,
+                        std::ptr::null_mut(),
+                    );
+                    gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+                    gls::gl::Finish();
+                }
+                check_gl_error(function!(), line!())?;
+            } else {
+                let mut dst_map = dst.tensor().map()?;
+                unsafe {
+                    gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
+                    gls::gl::ReadnPixels(
+                        0,
+                        0,
+                        dst.width() as i32,
+                        dst.height() as i32,
+                        format,
+                        gls::gl::UNSIGNED_BYTE,
+                        dst.tensor.len() as i32,
+                        dst_map.as_mut_ptr() as *mut c_void,
+                    );
+                }
             }
         }
 
@@ -1578,8 +1619,23 @@ impl ImageProcessorTrait for GLProcessorST {
             ));
         }
 
-        let is_dma = match dst.tensor.memory() {
+        // PBO detection — same rationale as draw_masks.
+        let memory = dst.tensor.memory();
+        let pbo_buffer_id = if memory == edgefirst_tensor::TensorMemory::Pbo {
+            match &dst.tensor {
+                edgefirst_tensor::Tensor::Pbo(p) if !p.is_mapped() => Some(p.buffer_id()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let is_dma = match memory {
             edgefirst_tensor::TensorMemory::Dma if self.setup_renderbuffer_dma(dst).is_ok() => true,
+            _ if pbo_buffer_id.is_some() => {
+                self.setup_renderbuffer_from_pbo(dst, pbo_buffer_id.unwrap())?;
+                false
+            }
             _ => {
                 self.setup_renderbuffer_non_dma(
                     dst,
@@ -1602,25 +1658,45 @@ impl ImageProcessorTrait for GLProcessorST {
 
         gls::finish();
         if !is_dma {
-            let mut dst_map = dst.tensor().map()?;
             let format = match dst.fourcc() {
                 RGB => gls::gl::RGB,
                 RGBA => gls::gl::RGBA,
                 BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
                 _ => unreachable!(),
             };
-            unsafe {
-                gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                gls::gl::ReadnPixels(
-                    0,
-                    0,
-                    dst.width() as i32,
-                    dst.height() as i32,
-                    format,
-                    gls::gl::UNSIGNED_BYTE,
-                    dst.tensor.len() as i32,
-                    dst_map.as_mut_ptr() as *mut c_void,
-                );
+            if let Some(buffer_id) = pbo_buffer_id {
+                unsafe {
+                    gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, buffer_id);
+                    gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
+                    gls::gl::ReadnPixels(
+                        0,
+                        0,
+                        dst.width() as i32,
+                        dst.height() as i32,
+                        format,
+                        gls::gl::UNSIGNED_BYTE,
+                        dst.tensor.len() as i32,
+                        std::ptr::null_mut(),
+                    );
+                    gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+                    gls::gl::Finish();
+                }
+                check_gl_error(function!(), line!())?;
+            } else {
+                let mut dst_map = dst.tensor().map()?;
+                unsafe {
+                    gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
+                    gls::gl::ReadnPixels(
+                        0,
+                        0,
+                        dst.width() as i32,
+                        dst.height() as i32,
+                        format,
+                        gls::gl::UNSIGNED_BYTE,
+                        dst.tensor.len() as i32,
+                        dst_map.as_mut_ptr() as *mut c_void,
+                    );
+                }
             }
         }
 
@@ -1854,6 +1930,33 @@ impl GLProcessorST {
         if converter.gl_context.transfer_backend == TransferBackend::Sync {
             log::info!("Upgrading transfer backend from Sync to Pbo (GL context available)");
             converter.gl_context.transfer_backend = TransferBackend::Pbo;
+        }
+
+        // Allow env-var override for benchmarking specific transfer paths.
+        // Values: "dmabuf", "pbo", "sync" (case-insensitive).
+        if let Ok(val) = std::env::var("EDGEFIRST_FORCE_TRANSFER") {
+            let forced = match val.to_ascii_lowercase().as_str() {
+                "dmabuf" | "dma" => Some(TransferBackend::DmaBuf),
+                "pbo" => Some(TransferBackend::Pbo),
+                "sync" => Some(TransferBackend::Sync),
+                other => {
+                    log::warn!(
+                        "EDGEFIRST_FORCE_TRANSFER={other:?} not recognised \
+                         (expected dmabuf|pbo|sync), ignoring"
+                    );
+                    None
+                }
+            };
+            if let Some(backend) = forced {
+                log::info!(
+                    "EDGEFIRST_FORCE_TRANSFER override: {:?} → {backend:?}",
+                    converter.gl_context.transfer_backend
+                );
+                converter.gl_context.transfer_backend = backend;
+                if !backend.is_dma() {
+                    converter.support_rgb_direct = false;
+                }
+            }
         }
 
         log::debug!(
@@ -2737,6 +2840,76 @@ impl GLProcessorST {
             gls::gl::Viewport(0, 0, width, height);
         }
         log::debug!("Set up framebuffer takes {:?}", start.elapsed());
+        Ok(())
+    }
+
+    /// Set up a framebuffer for overlay rendering on a PBO-backed destination.
+    ///
+    /// Binds the PBO as `GL_PIXEL_UNPACK_BUFFER` and uploads its contents to
+    /// the render texture via `TexImage2D` with a NULL pointer — GL reads
+    /// directly from PBO memory without any CPU-side `map()` call. This avoids
+    /// the deadlock that occurs when `setup_renderbuffer_non_dma` tries to
+    /// `tensor.map()` a PBO on the GL thread.
+    fn setup_renderbuffer_from_pbo(
+        &mut self,
+        dst: &TensorImage,
+        buffer_id: u32,
+    ) -> crate::Result<()> {
+        let (width, height) = (dst.width() as i32, dst.height() as i32);
+        let format = match dst.fourcc() {
+            RGB => gls::gl::RGB,
+            RGBA => gls::gl::RGBA,
+            BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
+            _ => {
+                return Err(crate::Error::NotSupported(format!(
+                    "PBO renderbuffer not supported for {}",
+                    dst.fourcc().display()
+                )))
+            }
+        };
+        self.convert_fbo.bind();
+        unsafe {
+            gls::gl::UseProgram(self.texture_program.id);
+            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
+            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+            gls::gl::TexParameteri(
+                gls::gl::TEXTURE_2D,
+                gls::gl::TEXTURE_MIN_FILTER,
+                gls::gl::LINEAR as i32,
+            );
+            gls::gl::TexParameteri(
+                gls::gl::TEXTURE_2D,
+                gls::gl::TEXTURE_MAG_FILTER,
+                gls::gl::LINEAR as i32,
+            );
+
+            // Upload existing PBO content to the render texture.
+            // Binding PBO as UNPACK buffer makes TexImage2D read from it.
+            gls::gl::BindBuffer(gls::gl::PIXEL_UNPACK_BUFFER, buffer_id);
+            gls::gl::TexImage2D(
+                gls::gl::TEXTURE_2D,
+                0,
+                format as i32,
+                width,
+                height,
+                0,
+                format,
+                gls::gl::UNSIGNED_BYTE,
+                std::ptr::null(),
+            );
+            gls::gl::BindBuffer(gls::gl::PIXEL_UNPACK_BUFFER, 0);
+
+            check_gl_error(function!(), line!())?;
+            gls::gl::FramebufferTexture2D(
+                gls::gl::FRAMEBUFFER,
+                gls::gl::COLOR_ATTACHMENT0,
+                gls::gl::TEXTURE_2D,
+                self.render_texture.id,
+                0,
+            );
+            check_gl_error(function!(), line!())?;
+            gls::gl::Viewport(0, 0, width, height);
+        }
         Ok(())
     }
 
@@ -7710,5 +7883,53 @@ mod gl_tests {
             max_diff <= 1,
             "draw_masks_mem BGRA/RGBA channel mismatch > 1: max_diff={max_diff}"
         );
+    }
+
+    // ========================================================================
+    // GL smoke tests for mask rendering and PBO destinations
+    // ========================================================================
+
+    #[test]
+    fn test_gl_mask_render_smoke() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let mut image = TensorImage::new(64, 64, RGBA, None).unwrap();
+
+        // Render with empty detections and segmentations — should succeed trivially
+        let result = gl.draw_masks(&mut image, &[], &[]);
+        assert!(
+            result.is_ok(),
+            "GL mask render with empty data should succeed: {result:?}"
+        );
+
+        // Verify output dimensions are unchanged
+        assert_eq!(image.width(), 64);
+        assert_eq!(image.height(), 64);
+    }
+
+    #[test]
+    fn test_gl_pbo_destination_smoke() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        let gl = GLProcessorThreaded::new(None).unwrap();
+        let result = gl.create_pbo_image(64, 64, RGBA);
+        match result {
+            Ok(pbo_img) => {
+                assert_eq!(pbo_img.width(), 64);
+                assert_eq!(pbo_img.height(), 64);
+                assert_eq!(pbo_img.fourcc(), RGBA);
+            }
+            Err(e) => {
+                // PBO may not be supported on all GL implementations
+                eprintln!("SKIPPED: {} - PBO not supported: {e:?}", function!());
+            }
+        }
     }
 }

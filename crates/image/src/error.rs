@@ -36,6 +36,7 @@ pub enum Error {
     OpenGl(String),
     Internal(String),
     CropInvalid(String),
+    ForcedBackendUnavailable(String),
     NoConverter,
 }
 
