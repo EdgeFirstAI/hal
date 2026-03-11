@@ -283,6 +283,30 @@ typedef enum hal_tensor_memory {
 } hal_tensor_memory;
 
 /**
+ * Compute backend selection for image processing.
+ *
+ * @see hal_image_processor_new_with_backend
+ */
+typedef enum HalComputeBackend {
+  /**
+   * Auto-detect based on hardware and environment variables.
+   */
+  HAL_COMPUTE_BACKEND_AUTO = 0,
+  /**
+   * CPU-only processing.
+   */
+  HAL_COMPUTE_BACKEND_CPU = 1,
+  /**
+   * Prefer G2D hardware blitter (with CPU fallback).
+   */
+  HAL_COMPUTE_BACKEND_G2D = 2,
+  /**
+   * Prefer OpenGL ES (with CPU fallback).
+   */
+  HAL_COMPUTE_BACKEND_OPENGL = 3,
+} HalComputeBackend;
+
+/**
  * Image rotation angles.
  */
 typedef enum hal_rotation {
@@ -1384,6 +1408,22 @@ struct hal_tensor_map *hal_tensor_image_map_create(const struct hal_tensor_image
  * - ENOTSUP: No suitable image processing backend available
  */
 struct hal_image_processor *hal_image_processor_new(void);
+
+/**
+ * Create a new image processor with a specific compute backend.
+ *
+ * When `backend` is not `HAL_COMPUTE_BACKEND_AUTO`, the processor
+ * initializes the requested backend plus CPU as a fallback chain.
+ * Environment variables (`EDGEFIRST_FORCE_BACKEND`, `EDGEFIRST_DISABLE_*`)
+ * are ignored in this case.
+ *
+ * @param backend Preferred compute backend
+ * @return New image processor handle on success, NULL on error
+ * @par Errors (errno):
+ * - ENOMEM: Memory allocation failed
+ * - ENOTSUP: No suitable image processing backend available
+ */
+struct hal_image_processor *hal_image_processor_new_with_backend(enum HalComputeBackend backend);
 
 /**
  * Convert an image to a different format/size.

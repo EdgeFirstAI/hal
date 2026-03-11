@@ -11,8 +11,9 @@ use crate::error::{set_error, set_error_null};
 use crate::tensor::{HalTensor, HalTensorMap, HalTensorMemory};
 use crate::{check_null, check_null_ret_null, try_or_errno, try_or_null};
 use edgefirst_image::{
-    Crop, Flip, ImageProcessor, ImageProcessorTrait, Rect, Rotation, TensorImage, TensorImageRef,
-    GREY, NV12, NV16, PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, YUYV,
+    ComputeBackend, Crop, Flip, ImageProcessor, ImageProcessorConfig, ImageProcessorTrait, Rect,
+    Rotation, TensorImage, TensorImageRef, GREY, NV12, NV16, PLANAR_RGB, PLANAR_RGBA, RGB, RGBA,
+    YUYV,
 };
 use edgefirst_tensor::{TensorMemory, TensorTrait};
 use libc::{c_char, c_int, c_void, size_t};
@@ -750,7 +751,61 @@ pub unsafe extern "C" fn hal_tensor_image_map_create(
 /// - ENOTSUP: No suitable image processing backend available
 #[no_mangle]
 pub unsafe extern "C" fn hal_image_processor_new() -> *mut HalImageProcessor {
+    let _ = env_logger::try_init();
     let processor = try_or_null!(ImageProcessor::new(), libc::ENOTSUP);
+    Box::into_raw(Box::new(HalImageProcessor { inner: processor }))
+}
+
+/// Compute backend selection for image processing.
+///
+/// @see hal_image_processor_new_with_backend
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HalComputeBackend {
+    /// Auto-detect based on hardware and environment variables.
+    Auto = 0,
+    /// CPU-only processing.
+    Cpu = 1,
+    /// Prefer G2D hardware blitter (with CPU fallback).
+    G2d = 2,
+    /// Prefer OpenGL ES (with CPU fallback).
+    #[allow(non_camel_case_types)]
+    Opengl = 3,
+}
+
+impl From<HalComputeBackend> for ComputeBackend {
+    fn from(b: HalComputeBackend) -> Self {
+        match b {
+            HalComputeBackend::Auto => ComputeBackend::Auto,
+            HalComputeBackend::Cpu => ComputeBackend::Cpu,
+            HalComputeBackend::G2d => ComputeBackend::G2d,
+            HalComputeBackend::Opengl => ComputeBackend::OpenGl,
+        }
+    }
+}
+
+/// Create a new image processor with a specific compute backend.
+///
+/// When `backend` is not `HAL_COMPUTE_BACKEND_AUTO`, the processor
+/// initializes the requested backend plus CPU as a fallback chain.
+/// Environment variables (`EDGEFIRST_FORCE_BACKEND`, `EDGEFIRST_DISABLE_*`)
+/// are ignored in this case.
+///
+/// @param backend Preferred compute backend
+/// @return New image processor handle on success, NULL on error
+/// @par Errors (errno):
+/// - ENOMEM: Memory allocation failed
+/// - ENOTSUP: No suitable image processing backend available
+#[no_mangle]
+pub unsafe extern "C" fn hal_image_processor_new_with_backend(
+    backend: HalComputeBackend,
+) -> *mut HalImageProcessor {
+    let _ = env_logger::try_init();
+    let config = ImageProcessorConfig {
+        backend: backend.into(),
+        ..Default::default()
+    };
+    let processor = try_or_null!(ImageProcessor::with_config(config), libc::ENOTSUP);
     Box::into_raw(Box::new(HalImageProcessor { inner: processor }))
 }
 
