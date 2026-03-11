@@ -1338,7 +1338,7 @@ pub trait ImageProcessorTrait {
 /// Configuration for [`ImageProcessor`] construction.
 ///
 /// Use with [`ImageProcessor::with_config`] to override the default EGL
-/// display auto-detection. The default configuration (all fields `None`)
+/// display auto-detection and backend selection. The default configuration
 /// preserves the existing auto-detection behaviour.
 #[derive(Debug, Clone, Default)]
 pub struct ImageProcessorConfig {
@@ -1352,9 +1352,47 @@ pub struct ImageProcessorConfig {
     #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
     pub egl_display: Option<EglDisplayKind>,
+
+    /// Preferred compute backend.
+    ///
+    /// When set to a specific backend (not [`ComputeBackend::Auto`]), the
+    /// processor initializes that backend plus CPU as a fallback chain.
+    /// This takes precedence over `EDGEFIRST_FORCE_BACKEND` and the
+    /// `EDGEFIRST_DISABLE_*` environment variables.
+    ///
+    /// - [`ComputeBackend::OpenGl`]: init OpenGL + CPU, skip G2D
+    /// - [`ComputeBackend::G2d`]: init G2D + CPU, skip OpenGL
+    /// - [`ComputeBackend::Cpu`]: init CPU only
+    /// - [`ComputeBackend::Auto`]: existing env-var-driven selection
+    pub backend: ComputeBackend,
 }
 
-/// Backend forced via the `EDGEFIRST_FORCE_BACKEND` environment variable.
+/// Compute backend selection for [`ImageProcessor`].
+///
+/// Use with [`ImageProcessorConfig::backend`] to select which backend the
+/// processor should prefer. When a specific backend is selected, the
+/// processor initializes that backend plus CPU as a fallback. When `Auto`
+/// is used, the existing environment-variable-driven selection applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComputeBackend {
+    /// Auto-detect based on available hardware and environment variables.
+    Auto,
+    /// CPU-only processing (no hardware acceleration).
+    Cpu,
+    /// Prefer G2D hardware blitter (+ CPU fallback).
+    G2d,
+    /// Prefer OpenGL ES (+ CPU fallback).
+    OpenGl,
+}
+
+impl Default for ComputeBackend {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+/// Backend forced via the `EDGEFIRST_FORCE_BACKEND` environment variable
+/// or [`ImageProcessorConfig::backend`].
 ///
 /// When set, the [`ImageProcessor`] only initializes and dispatches to the
 /// selected backend — no fallback chain is used.
@@ -1414,11 +1452,90 @@ impl ImageProcessor {
 
     /// Creates a new `ImageProcessor` with the given configuration.
     ///
-    /// This allows overriding the EGL display type used for OpenGL
-    /// acceleration. The `EDGEFIRST_DISABLE_GL=1` environment variable
-    /// still takes precedence over any override.
+    /// When [`ImageProcessorConfig::backend`] is set to a specific backend,
+    /// environment variables are ignored and the processor initializes the
+    /// requested backend plus CPU as a fallback.
+    ///
+    /// When `Auto`, the existing `EDGEFIRST_FORCE_BACKEND` and
+    /// `EDGEFIRST_DISABLE_*` environment variables apply.
     #[allow(unused_variables)]
     pub fn with_config(config: ImageProcessorConfig) -> Result<Self> {
+        // ── Config-driven backend selection ──────────────────────────
+        // When the caller explicitly requests a backend via the config,
+        // skip all environment variable logic.
+        match config.backend {
+            ComputeBackend::Cpu => {
+                log::info!("ComputeBackend::Cpu — CPU only");
+                return Ok(Self {
+                    cpu: Some(CPUProcessor::new()),
+                    #[cfg(target_os = "linux")]
+                    g2d: None,
+                    #[cfg(target_os = "linux")]
+                    #[cfg(feature = "opengl")]
+                    opengl: None,
+                    forced_backend: None,
+                });
+            }
+            ComputeBackend::G2d => {
+                log::info!("ComputeBackend::G2d — G2D + CPU fallback");
+                #[cfg(target_os = "linux")]
+                {
+                    let g2d = match G2DProcessor::new() {
+                        Ok(g) => Some(g),
+                        Err(e) => {
+                            log::warn!("G2D requested but failed to initialize: {e:?}");
+                            None
+                        }
+                    };
+                    return Ok(Self {
+                        cpu: Some(CPUProcessor::new()),
+                        g2d,
+                        #[cfg(feature = "opengl")]
+                        opengl: None,
+                        forced_backend: None,
+                    });
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    log::warn!("G2D requested but not available on this platform, using CPU");
+                    return Ok(Self {
+                        cpu: Some(CPUProcessor::new()),
+                        forced_backend: None,
+                    });
+                }
+            }
+            ComputeBackend::OpenGl => {
+                log::info!("ComputeBackend::OpenGl — OpenGL + CPU fallback");
+                #[cfg(target_os = "linux")]
+                {
+                    #[cfg(feature = "opengl")]
+                    let opengl = match GLProcessorThreaded::new(config.egl_display) {
+                        Ok(gl) => Some(gl),
+                        Err(e) => {
+                            log::warn!("OpenGL requested but failed to initialize: {e:?}");
+                            None
+                        }
+                    };
+                    return Ok(Self {
+                        cpu: Some(CPUProcessor::new()),
+                        g2d: None,
+                        #[cfg(feature = "opengl")]
+                        opengl,
+                        forced_backend: None,
+                    });
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    log::warn!("OpenGL requested but not available on this platform, using CPU");
+                    return Ok(Self {
+                        cpu: Some(CPUProcessor::new()),
+                        forced_backend: None,
+                    });
+                }
+            }
+            ComputeBackend::Auto => { /* fall through to env-var logic below */ }
+        }
+
         // ── EDGEFIRST_FORCE_BACKEND ──────────────────────────────────
         // When set, only the requested backend is initialised and no
         // fallback chain is used. Accepted values (case-insensitive):
