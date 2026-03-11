@@ -31,7 +31,7 @@ let decoder = DecoderBuilder::new()
     .build()?;
 
 // Get the model output from the model. Here we load it from a test data file for demonstration purposes.
-let model_output: Vec<i8> = include_bytes!("../../../testdata/yolov8s_80_classes.bin")
+let model_output: Vec<i8> = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/yolov8s_80_classes.bin"))
     .iter()
     .map(|b| *b as i8)
     .collect();
@@ -791,10 +791,16 @@ mod decoder_tests {
     fn test_decoder_modelpack() {
         let score_threshold = 0.45;
         let iou_threshold = 0.45;
-        let boxes = include_bytes!("../../../testdata/modelpack_boxes_1935x1x4.bin");
+        let boxes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/modelpack_boxes_1935x1x4.bin"
+        ));
         let boxes = ndarray::Array4::from_shape_vec((1, 1935, 1, 4), boxes.to_vec()).unwrap();
 
-        let scores = include_bytes!("../../../testdata/modelpack_scores_1935x1.bin");
+        let scores = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/modelpack_scores_1935x1.bin"
+        ));
         let scores = ndarray::Array3::from_shape_vec((1, 1935, 1), scores.to_vec()).unwrap();
 
         let quant_boxes = (0.004656755365431309, 21).into();
@@ -891,10 +897,16 @@ mod decoder_tests {
     fn test_decoder_modelpack_split_u8() {
         let score_threshold = 0.45;
         let iou_threshold = 0.45;
-        let detect0 = include_bytes!("../../../testdata/modelpack_split_9x15x18.bin");
+        let detect0 = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/modelpack_split_9x15x18.bin"
+        ));
         let detect0 = ndarray::Array4::from_shape_vec((1, 9, 15, 18), detect0.to_vec()).unwrap();
 
-        let detect1 = include_bytes!("../../../testdata/modelpack_split_17x30x18.bin");
+        let detect1 = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/modelpack_split_17x30x18.bin"
+        ));
         let detect1 = ndarray::Array4::from_shape_vec((1, 17, 30, 18), detect1.to_vec()).unwrap();
 
         let quant0 = (0.08547406643629074, 174).into();
@@ -1010,15 +1022,25 @@ mod decoder_tests {
     fn test_decoder_parse_config_modelpack_split_u8() {
         let score_threshold = 0.45;
         let iou_threshold = 0.45;
-        let detect0 = include_bytes!("../../../testdata/modelpack_split_9x15x18.bin");
+        let detect0 = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/modelpack_split_9x15x18.bin"
+        ));
         let detect0 = ndarray::Array4::from_shape_vec((1, 9, 15, 18), detect0.to_vec()).unwrap();
 
-        let detect1 = include_bytes!("../../../testdata/modelpack_split_17x30x18.bin");
+        let detect1 = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/modelpack_split_17x30x18.bin"
+        ));
         let detect1 = ndarray::Array4::from_shape_vec((1, 17, 30, 18), detect1.to_vec()).unwrap();
 
         let decoder = DecoderBuilder::default()
             .with_config_yaml_str(
-                include_str!("../../../testdata/modelpack_split.yaml").to_string(),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../testdata/modelpack_split.yaml"
+                ))
+                .to_string(),
             )
             .with_score_threshold(score_threshold)
             .with_iou_threshold(iou_threshold)
@@ -1054,7 +1076,10 @@ mod decoder_tests {
 
     #[test]
     fn test_modelpack_seg() {
-        let out = include_bytes!("../../../testdata/modelpack_seg_2x160x160.bin");
+        let out = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/modelpack_seg_2x160x160.bin"
+        ));
         let out = ndarray::Array4::from_shape_vec((1, 2, 160, 160), out.to_vec()).unwrap();
         let quant = (1.0 / 255.0, 0).into();
 
@@ -1113,7 +1138,10 @@ mod decoder_tests {
     }
     #[test]
     fn test_modelpack_seg_quant() {
-        let out = include_bytes!("../../../testdata/modelpack_seg_2x160x160.bin");
+        let out = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/modelpack_seg_2x160x160.bin"
+        ));
         let out_u8 = ndarray::Array4::from_shape_vec((1, 2, 160, 160), out.to_vec()).unwrap();
         let out_i8 = out_u8.mapv(|x| (x as i16 - 128) as i8);
         let out_u16 = out_u8.mapv(|x| (x as u16) << 8);
@@ -1211,13 +1239,22 @@ mod decoder_tests {
         let score_threshold = 0.45;
         let iou_threshold = 0.45;
 
-        let boxes = include_bytes!("../../../testdata/modelpack_boxes_1935x1x4.bin");
+        let boxes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/modelpack_boxes_1935x1x4.bin"
+        ));
         let boxes = Array4::from_shape_vec((1, 1935, 1, 4), boxes.to_vec()).unwrap();
 
-        let scores = include_bytes!("../../../testdata/modelpack_scores_1935x1.bin");
+        let scores = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/modelpack_scores_1935x1.bin"
+        ));
         let scores = Array3::from_shape_vec((1, 1935, 1), scores.to_vec()).unwrap();
 
-        let seg = include_bytes!("../../../testdata/modelpack_seg_2x160x160.bin");
+        let seg = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/modelpack_seg_2x160x160.bin"
+        ));
         let seg = Array4::from_shape_vec((1, 2, 160, 160), seg.to_vec()).unwrap();
 
         let quant_boxes = (0.004656755365431309, 21).into();
@@ -1328,13 +1365,22 @@ mod decoder_tests {
         let score_threshold = 0.8;
         let iou_threshold = 0.5;
 
-        let seg = include_bytes!("../../../testdata/modelpack_seg_2x160x160.bin");
+        let seg = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/modelpack_seg_2x160x160.bin"
+        ));
         let seg = ndarray::Array4::from_shape_vec((1, 2, 160, 160), seg.to_vec()).unwrap();
 
-        let detect0 = include_bytes!("../../../testdata/modelpack_split_9x15x18.bin");
+        let detect0 = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/modelpack_split_9x15x18.bin"
+        ));
         let detect0 = ndarray::Array4::from_shape_vec((1, 9, 15, 18), detect0.to_vec()).unwrap();
 
-        let detect1 = include_bytes!("../../../testdata/modelpack_split_17x30x18.bin");
+        let detect1 = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/modelpack_split_17x30x18.bin"
+        ));
         let detect1 = ndarray::Array4::from_shape_vec((1, 17, 30, 18), detect1.to_vec()).unwrap();
 
         let quant0 = (0.08547406643629074, 174).into();
@@ -1464,7 +1510,10 @@ mod decoder_tests {
 
     #[test]
     fn test_dequant_chunked() {
-        let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
+        let out = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8s_80_classes.bin"
+        ));
         let mut out =
             unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) }.to_vec();
         out.push(123); // make sure to test non multiple of 16 length
@@ -1488,7 +1537,10 @@ mod decoder_tests {
     fn test_decoder_yolo_det() {
         let score_threshold = 0.25;
         let iou_threshold = 0.7;
-        let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
+        let out = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8s_80_classes.bin"
+        ));
         let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
         let out = Array3::from_shape_vec((1, 84, 8400), out.to_vec()).unwrap();
         let quant = (0.0040811873, -123).into();
@@ -1575,12 +1627,18 @@ mod decoder_tests {
     fn test_decoder_masks() {
         let score_threshold = 0.45;
         let iou_threshold = 0.45;
-        let boxes = include_bytes!("../../../testdata/yolov8_boxes_116x8400.bin");
+        let boxes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_boxes_116x8400.bin"
+        ));
         let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
         let boxes = ndarray::Array2::from_shape_vec((116, 8400), boxes.to_vec()).unwrap();
         let quant_boxes = Quantization::new(0.021287761628627777, 31);
 
-        let protos = include_bytes!("../../../testdata/yolov8_protos_160x160x32.bin");
+        let protos = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_protos_160x160x32.bin"
+        ));
         let protos =
             unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
         let protos = ndarray::Array3::from_shape_vec((160, 160, 32), protos.to_vec()).unwrap();
@@ -1636,7 +1694,10 @@ mod decoder_tests {
             1.0 / 160.0, // wider range because mask will expand the box
         ));
 
-        let full_mask = include_bytes!("../../../testdata/yolov8_mask_results.bin");
+        let full_mask = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_mask_results.bin"
+        ));
         let full_mask = ndarray::Array2::from_shape_vec((160, 160), full_mask.to_vec()).unwrap();
 
         let cropped_mask = full_mask.slice(ndarray::s![
@@ -1660,14 +1721,20 @@ mod decoder_tests {
         let iou_threshold = 0.45;
 
         // Load test data — boxes as [116, 8400]
-        let boxes_raw = include_bytes!("../../../testdata/yolov8_boxes_116x8400.bin");
+        let boxes_raw = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_boxes_116x8400.bin"
+        ));
         let boxes_raw =
             unsafe { std::slice::from_raw_parts(boxes_raw.as_ptr() as *const i8, boxes_raw.len()) };
         let boxes_2d = ndarray::Array2::from_shape_vec((116, 8400), boxes_raw.to_vec()).unwrap();
         let quant_boxes = Quantization::new(0.021287761628627777, 31);
 
         // Load protos as HWC [160, 160, 32] (file layout) then dequantize
-        let protos_raw = include_bytes!("../../../testdata/yolov8_protos_160x160x32.bin");
+        let protos_raw = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_protos_160x160x32.bin"
+        ));
         let protos_raw = unsafe {
             std::slice::from_raw_parts(protos_raw.as_ptr() as *const i8, protos_raw.len())
         };
@@ -1766,12 +1833,18 @@ mod decoder_tests {
     fn test_decoder_masks_i8() {
         let score_threshold = 0.45;
         let iou_threshold = 0.45;
-        let boxes = include_bytes!("../../../testdata/yolov8_boxes_116x8400.bin");
+        let boxes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_boxes_116x8400.bin"
+        ));
         let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
         let boxes = ndarray::Array3::from_shape_vec((1, 116, 8400), boxes.to_vec()).unwrap();
         let quant_boxes = (0.021287761628627777, 31).into();
 
-        let protos = include_bytes!("../../../testdata/yolov8_protos_160x160x32.bin");
+        let protos = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_protos_160x160x32.bin"
+        ));
         let protos =
             unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
         let protos = ndarray::Array4::from_shape_vec((1, 160, 160, 32), protos.to_vec()).unwrap();
@@ -1883,7 +1956,10 @@ mod decoder_tests {
     fn test_decoder_yolo_split() {
         let score_threshold = 0.45;
         let iou_threshold = 0.45;
-        let boxes = include_bytes!("../../../testdata/yolov8_boxes_116x8400.bin");
+        let boxes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_boxes_116x8400.bin"
+        ));
         let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
         let boxes: Vec<_> = boxes.iter().map(|x| *x as i16 * 256).collect();
         let boxes = ndarray::Array3::from_shape_vec((1, 116, 8400), boxes).unwrap();
@@ -1964,14 +2040,20 @@ mod decoder_tests {
     fn test_decoder_masks_config_mixed() {
         let score_threshold = 0.45;
         let iou_threshold = 0.45;
-        let boxes = include_bytes!("../../../testdata/yolov8_boxes_116x8400.bin");
+        let boxes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_boxes_116x8400.bin"
+        ));
         let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
         let boxes: Vec<_> = boxes.iter().map(|x| *x as i16 * 256).collect();
         let boxes = ndarray::Array3::from_shape_vec((1, 116, 8400), boxes).unwrap();
 
         let quant_boxes = Quantization::new(0.021287761628627777 / 256.0, 31 * 256);
 
-        let protos = include_bytes!("../../../testdata/yolov8_protos_160x160x32.bin");
+        let protos = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_protos_160x160x32.bin"
+        ));
         let protos =
             unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
         let protos: Vec<_> = protos.to_vec();
@@ -2088,7 +2170,10 @@ mod decoder_tests {
     fn test_decoder_masks_config_i32() {
         let score_threshold = 0.45;
         let iou_threshold = 0.45;
-        let boxes = include_bytes!("../../../testdata/yolov8_boxes_116x8400.bin");
+        let boxes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_boxes_116x8400.bin"
+        ));
         let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
         let scale = 1 << 23;
         let boxes: Vec<_> = boxes.iter().map(|x| *x as i32 * scale).collect();
@@ -2096,7 +2181,10 @@ mod decoder_tests {
 
         let quant_boxes = Quantization::new(0.021287761628627777 / scale as f32, 31 * scale);
 
-        let protos = include_bytes!("../../../testdata/yolov8_protos_160x160x32.bin");
+        let protos = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_protos_160x160x32.bin"
+        ));
         let protos =
             unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
         let protos: Vec<_> = protos.iter().map(|x| *x as i32 * scale).collect();
@@ -2199,7 +2287,10 @@ mod decoder_tests {
         let yolo_det = || {
             let score_threshold = 0.25;
             let iou_threshold = 0.7;
-            let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
+            let out = include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/yolov8s_80_classes.bin"
+            ));
             let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
             let out = Array3::from_shape_vec((1, 84, 8400), out.to_vec()).unwrap();
             let quant = (0.0040811873, -123).into();
@@ -2268,14 +2359,23 @@ mod decoder_tests {
             let score_threshold = 0.8;
             let iou_threshold = 0.5;
 
-            let seg = include_bytes!("../../../testdata/modelpack_seg_2x160x160.bin");
+            let seg = include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/modelpack_seg_2x160x160.bin"
+            ));
             let seg = ndarray::Array4::from_shape_vec((1, 2, 160, 160), seg.to_vec()).unwrap();
 
-            let detect0 = include_bytes!("../../../testdata/modelpack_split_9x15x18.bin");
+            let detect0 = include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/modelpack_split_9x15x18.bin"
+            ));
             let detect0 =
                 ndarray::Array4::from_shape_vec((1, 9, 15, 18), detect0.to_vec()).unwrap();
 
-            let detect1 = include_bytes!("../../../testdata/modelpack_split_17x30x18.bin");
+            let detect1 = include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/modelpack_split_17x30x18.bin"
+            ));
             let detect1 =
                 ndarray::Array4::from_shape_vec((1, 17, 30, 18), detect1.to_vec()).unwrap();
 

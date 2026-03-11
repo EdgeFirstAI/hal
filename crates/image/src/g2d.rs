@@ -339,7 +339,11 @@ mod g2d_tests {
     ) -> Result<(), crate::Error> {
         let dst_width = 1280;
         let dst_height = 720;
-        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane.jpg"
+        ))
+        .to_vec();
         let src = TensorImage::load_jpeg(&file, Some(RGB), None)?;
 
         // Create DMA buffer for G2D input
@@ -349,7 +353,10 @@ mod g2d_tests {
 
         // For NV12 input, load from file since CPU doesn't support RGB→NV12
         if g2d_in_fmt == NV12 {
-            let nv12_bytes = include_bytes!("../../../testdata/zidane.nv12");
+            let nv12_bytes = include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/zidane.nv12"
+            ));
             src2.tensor()
                 .map()?
                 .as_mut_slice()
@@ -422,7 +429,11 @@ mod g2d_tests {
     ) -> Result<(), crate::Error> {
         let dst_width = 600;
         let dst_height = 400;
-        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane.jpg"
+        ))
+        .to_vec();
         let src = TensorImage::load_jpeg(&file, Some(RGB), None)?;
 
         let mut cpu_converter = CPUProcessor::new();
@@ -441,7 +452,10 @@ mod g2d_tests {
 
         // For NV12 input, load from file since CPU doesn't support RGB→NV12
         if g2d_in_fmt == NV12 {
-            let nv12_bytes = include_bytes!("../../../testdata/zidane.nv12");
+            let nv12_bytes = include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/zidane.nv12"
+            ));
             src2.tensor()
                 .map()?
                 .as_mut_slice()
@@ -498,7 +512,11 @@ mod g2d_tests {
             }),
             dst_color: None,
         };
-        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane.jpg"
+        ))
+        .to_vec();
         let src = TensorImage::load_jpeg(&file, Some(RGB), None)?;
 
         let mut cpu_converter = CPUProcessor::new();
@@ -512,7 +530,10 @@ mod g2d_tests {
 
         // For NV12 input, load from file since CPU doesn't support RGB→NV12
         if g2d_in_fmt == NV12 {
-            let nv12_bytes = include_bytes!("../../../testdata/zidane.nv12");
+            let nv12_bytes = include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/zidane.nv12"
+            ));
             src2.tensor()
                 .map()?
                 .as_mut_slice()
@@ -651,7 +672,10 @@ mod g2d_tests {
             720,
             NV12,
             Some(TensorMemory::Dma),
-            include_bytes!("../../../testdata/camera720p.nv12"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.nv12"
+            )),
         )?;
 
         // Load RGBA reference (ffmpeg-generated)
@@ -660,7 +684,10 @@ mod g2d_tests {
             720,
             RGBA,
             None,
-            include_bytes!("../../../testdata/camera720p.rgba"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.rgba"
+            )),
         )?;
 
         // Convert using G2D
@@ -692,7 +719,10 @@ mod g2d_tests {
             720,
             NV12,
             Some(TensorMemory::Dma),
-            include_bytes!("../../../testdata/camera720p.nv12"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.nv12"
+            )),
         )?;
 
         // Load RGB reference (ffmpeg-generated)
@@ -701,7 +731,10 @@ mod g2d_tests {
             720,
             RGB,
             None,
-            include_bytes!("../../../testdata/camera720p.rgb"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.rgb"
+            )),
         )?;
 
         // Convert using G2D
@@ -733,7 +766,10 @@ mod g2d_tests {
             720,
             YUYV,
             Some(TensorMemory::Dma),
-            include_bytes!("../../../testdata/camera720p.yuyv"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.yuyv"
+            )),
         )?;
 
         // Load RGBA reference (ffmpeg-generated)
@@ -742,7 +778,10 @@ mod g2d_tests {
             720,
             RGBA,
             None,
-            include_bytes!("../../../testdata/camera720p.rgba"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.rgba"
+            )),
         )?;
 
         // Convert using G2D
@@ -774,7 +813,10 @@ mod g2d_tests {
             720,
             YUYV,
             Some(TensorMemory::Dma),
-            include_bytes!("../../../testdata/camera720p.yuyv"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.yuyv"
+            )),
         )?;
 
         // Load RGB reference (ffmpeg-generated)
@@ -783,7 +825,10 @@ mod g2d_tests {
             720,
             RGB,
             None,
-            include_bytes!("../../../testdata/camera720p.rgb"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.rgb"
+            )),
         )?;
 
         // Convert using G2D
@@ -815,7 +860,11 @@ mod g2d_tests {
     }
 
     fn test_g2d_bgra_no_resize_(g2d_in_fmt: FourCharCode) -> Result<(), crate::Error> {
-        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane.jpg"
+        ))
+        .to_vec();
         let src = TensorImage::load_jpeg(&file, Some(RGB), None)?;
 
         // Create DMA buffer for G2D input
@@ -823,7 +872,10 @@ mod g2d_tests {
         let mut cpu_converter = CPUProcessor::new();
 
         if g2d_in_fmt == NV12 {
-            let nv12_bytes = include_bytes!("../../../testdata/zidane.nv12");
+            let nv12_bytes = include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/zidane.nv12"
+            ));
             src2.tensor()
                 .map()?
                 .as_mut_slice()
