@@ -27,7 +27,7 @@ the appropriate conversion method based on the available hardware.
 ```rust
 # use edgefirst_image::{ImageProcessor, TensorImage, RGBA, RGB, Rotation, Flip, Crop, ImageProcessorTrait};
 # fn main() -> Result<(), edgefirst_image::Error> {
-let image = include_bytes!("../../../testdata/zidane.jpg");
+let image = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/zidane.jpg"));
 let img = TensorImage::load(image, Some(RGBA), None)?;
 let mut converter = ImageProcessor::new()?;
 let mut dst = TensorImage::new(640, 480, RGB, None)?;
@@ -134,6 +134,7 @@ pub struct MaskRegion {
 mod cpu;
 mod error;
 mod g2d;
+#[path = "gl/mod.rs"]
 mod opengl_headless;
 
 /// 8 bit interleaved YUV422, limited range
@@ -374,7 +375,7 @@ impl TensorImage {
     /// use edgefirst_image::{RGBA, TensorImage};
     /// use edgefirst_tensor::TensorMemory;
     /// # fn main() -> Result<(), edgefirst_image::Error> {
-    /// let jpeg_bytes = include_bytes!("../../../testdata/zidane.png");
+    /// let jpeg_bytes = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/zidane.png"));
     /// let img = TensorImage::load(jpeg_bytes, Some(RGBA), Some(TensorMemory::Mem))?;
     /// assert_eq!(img.width(), 1280);
     /// assert_eq!(img.height(), 720);
@@ -407,7 +408,7 @@ impl TensorImage {
     /// use edgefirst_image::{RGB, TensorImage};
     /// use edgefirst_tensor::TensorMemory;
     /// # fn main() -> Result<(), edgefirst_image::Error> {
-    /// let jpeg_bytes = include_bytes!("../../../testdata/zidane.jpg");
+    /// let jpeg_bytes = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/zidane.jpg"));
     /// let img = TensorImage::load_jpeg(jpeg_bytes, Some(RGB), Some(TensorMemory::Mem))?;
     /// assert_eq!(img.width(), 1280);
     /// assert_eq!(img.height(), 720);
@@ -520,7 +521,7 @@ impl TensorImage {
     /// use edgefirst_image::{RGB, TensorImage};
     /// use edgefirst_tensor::TensorMemory;
     /// # fn main() -> Result<(), edgefirst_image::Error> {
-    /// let png_bytes = include_bytes!("../../../testdata/zidane.png");
+    /// let png_bytes = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/zidane.png"));
     /// let img = TensorImage::load_png(png_bytes, Some(RGB), Some(TensorMemory::Mem))?;
     /// assert_eq!(img.width(), 1280);
     /// assert_eq!(img.height(), 720);
@@ -1400,7 +1401,7 @@ impl ImageProcessor {
     /// ```rust
     /// # use edgefirst_image::{ImageProcessor, TensorImage, RGBA, RGB, Rotation, Flip, Crop, ImageProcessorTrait};
     /// # fn main() -> Result<(), edgefirst_image::Error> {
-    /// let image = include_bytes!("../../../testdata/zidane.jpg");
+    /// let image = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/zidane.jpg"));
     /// let img = TensorImage::load(image, Some(RGBA), None)?;
     /// let mut converter = ImageProcessor::new()?;
     /// let mut dst = TensorImage::new(640, 480, RGB, None)?;
@@ -2300,7 +2301,10 @@ mod image_tests {
 
     #[test]
     fn test_load_resize_save() {
-        let file = include_bytes!("../../../testdata/zidane.jpg");
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane.jpg"
+        ));
         let img = TensorImage::load_jpeg(file, Some(RGBA), None).unwrap();
         assert_eq!(img.width(), 1280);
         assert_eq!(img.height(), 720);
@@ -2325,9 +2329,10 @@ mod image_tests {
     #[test]
     fn test_from_tensor_planar() -> Result<(), Error> {
         let tensor = Tensor::new(&[3, 720, 1280], None, None)?;
-        tensor
-            .map()?
-            .copy_from_slice(include_bytes!("../../../testdata/camera720p.8bps"));
+        tensor.map()?.copy_from_slice(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/camera720p.8bps"
+        )));
         let planar = TensorImage::from_tensor(tensor, PLANAR_RGB)?;
 
         let rbga = load_bytes_to_tensor(
@@ -2335,7 +2340,10 @@ mod image_tests {
             720,
             RGBA,
             None,
-            include_bytes!("../../../testdata/camera720p.rgba"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.rgba"
+            )),
         )?;
         compare_images_convert_to_rgb(&planar, &rbga, 0.98, function!());
 
@@ -2357,7 +2365,10 @@ mod image_tests {
             720,
             PLANAR_RGB,
             None,
-            include_bytes!("../../../testdata/camera720p.8bps"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.8bps"
+            )),
         )
         .unwrap();
 
@@ -2375,7 +2386,10 @@ mod image_tests {
             720,
             YUYV,
             None,
-            include_bytes!("../../../testdata/camera720p.yuyv"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.yuyv"
+            )),
         )
         .unwrap();
 
@@ -2490,14 +2504,20 @@ mod image_tests {
     #[test]
     fn test_load_grey() {
         let grey_img = TensorImage::load_jpeg(
-            include_bytes!("../../../testdata/grey.jpg"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/grey.jpg"
+            )),
             Some(RGBA),
             None,
         )
         .unwrap();
 
         let grey_but_rgb_img = TensorImage::load_jpeg(
-            include_bytes!("../../../testdata/grey-rgb.jpg"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/grey-rgb.jpg"
+            )),
             Some(RGBA),
             None,
         )
@@ -2521,7 +2541,11 @@ mod image_tests {
     fn test_new_image_converter() {
         let dst_width = 640;
         let dst_height = 360;
-        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane.jpg"
+        ))
+        .to_vec();
         let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         let mut converter_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
@@ -2553,7 +2577,11 @@ mod image_tests {
 
     #[test]
     fn test_crop_skip() {
-        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane.jpg"
+        ))
+        .to_vec();
         let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         let mut converter_dst = TensorImage::new(1280, 720, RGBA, None).unwrap();
@@ -2613,13 +2641,21 @@ mod image_tests {
 
     #[test]
     fn test_load_jpeg_with_exif() {
-        let file = include_bytes!("../../../testdata/zidane_rotated_exif.jpg").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane_rotated_exif.jpg"
+        ))
+        .to_vec();
         let loaded = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         assert_eq!(loaded.height(), 1280);
         assert_eq!(loaded.width(), 720);
 
-        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane.jpg"
+        ))
+        .to_vec();
         let cpu_src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         let (dst_width, dst_height) = (cpu_src.height(), cpu_src.width());
@@ -2642,13 +2678,21 @@ mod image_tests {
 
     #[test]
     fn test_load_png_with_exif() {
-        let file = include_bytes!("../../../testdata/zidane_rotated_exif_180.png").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane_rotated_exif_180.png"
+        ))
+        .to_vec();
         let loaded = TensorImage::load_png(&file, Some(RGBA), None).unwrap();
 
         assert_eq!(loaded.height(), 720);
         assert_eq!(loaded.width(), 1280);
 
-        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane.jpg"
+        ))
+        .to_vec();
         let cpu_src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         let mut cpu_dst = TensorImage::new(1280, 720, RGBA, None).unwrap();
@@ -2683,7 +2727,11 @@ mod image_tests {
 
         let dst_width = 640;
         let dst_height = 360;
-        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane.jpg"
+        ))
+        .to_vec();
         let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
 
         let mut g2d_dst =
@@ -2725,7 +2773,11 @@ mod image_tests {
 
         let dst_width = 640;
         let dst_height = 360;
-        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane.jpg"
+        ))
+        .to_vec();
         let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
@@ -2794,7 +2846,10 @@ mod image_tests {
         }
 
         let img = TensorImage::load_jpeg(
-            include_bytes!("../../../testdata/grey.jpg"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/grey.jpg"
+            )),
             Some(GREY),
             None,
         )
@@ -2844,7 +2899,11 @@ mod image_tests {
 
         let dst_width = 640;
         let dst_height = 640;
-        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane.jpg"
+        ))
+        .to_vec();
         let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
@@ -2908,7 +2967,11 @@ mod image_tests {
 
         let dst_width = 640;
         let dst_height = 640;
-        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane.jpg"
+        ))
+        .to_vec();
         let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
@@ -2962,7 +3025,11 @@ mod image_tests {
 
         let dst_width = 640;
         let dst_height = 640;
-        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane.jpg"
+        ))
+        .to_vec();
         let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
@@ -3028,7 +3095,11 @@ mod image_tests {
 
         let dst_width = 640;
         let dst_height = 360;
-        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane.jpg"
+        ))
+        .to_vec();
         let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
@@ -3088,7 +3159,11 @@ mod image_tests {
 
         let dst_width = 640;
         let dst_height = 640;
-        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane.jpg"
+        ))
+        .to_vec();
         let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
@@ -3137,7 +3212,11 @@ mod image_tests {
 
         let dst_width = 640;
         let dst_height = 640;
-        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane.jpg"
+        ))
+        .to_vec();
 
         let mut cpu_converter = CPUProcessor::new();
 
@@ -3221,7 +3300,11 @@ mod image_tests {
         // This test rotates the image 4 times and checks that the image was returned to
         // be the same Currently doesn't check if rotations actually rotated in
         // right direction
-        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane.jpg"
+        ))
+        .to_vec();
 
         let unchanged_src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
         let mut src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
@@ -3293,7 +3376,11 @@ mod image_tests {
             Rotation::Clockwise90 | Rotation::CounterClockwise90 => (size.1, size.0),
         };
 
-        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane.jpg"
+        ))
+        .to_vec();
         let src = TensorImage::load_jpeg(&file, Some(RGBA), tensor_memory).unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
@@ -3345,7 +3432,11 @@ mod image_tests {
             Rotation::Clockwise90 | Rotation::CounterClockwise90 => (size.1, size.0),
         };
 
-        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane.jpg"
+        ))
+        .to_vec();
         let src = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Dma)).unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGBA, None).unwrap();
@@ -3373,7 +3464,10 @@ mod image_tests {
             720,
             RGBA,
             None,
-            include_bytes!("../../../testdata/camera720p.rgba"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.rgba"
+            )),
         )
         .unwrap();
 
@@ -3436,7 +3530,10 @@ mod image_tests {
             720,
             RGBA,
             None,
-            include_bytes!("../../../testdata/camera720p.rgba"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.rgba"
+            )),
         )
         .unwrap();
 
@@ -3500,7 +3597,10 @@ mod image_tests {
             720,
             RGBA,
             Some(TensorMemory::Dma),
-            include_bytes!("../../../testdata/camera720p.rgba"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.rgba"
+            )),
         )
         .unwrap();
 
@@ -3549,7 +3649,11 @@ mod image_tests {
 
     #[test]
     fn test_yuyv_to_rgba_cpu() {
-        let file = include_bytes!("../../../testdata/camera720p.yuyv").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/camera720p.yuyv"
+        ))
+        .to_vec();
         let src = TensorImage::new(1280, 720, YUYV, None).unwrap();
         src.tensor()
             .map()
@@ -3570,14 +3674,21 @@ mod image_tests {
             .map()
             .unwrap()
             .as_mut_slice()
-            .copy_from_slice(include_bytes!("../../../testdata/camera720p.rgba"));
+            .copy_from_slice(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.rgba"
+            )));
 
         compare_images(&dst, &target_image, 0.98, function!());
     }
 
     #[test]
     fn test_yuyv_to_rgb_cpu() {
-        let file = include_bytes!("../../../testdata/camera720p.yuyv").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/camera720p.yuyv"
+        ))
+        .to_vec();
         let src = TensorImage::new(1280, 720, YUYV, None).unwrap();
         src.tensor()
             .map()
@@ -3602,9 +3713,12 @@ mod image_tests {
             .0
             .iter_mut()
             .zip(
-                include_bytes!("../../../testdata/camera720p.rgba")
-                    .as_chunks::<4>()
-                    .0,
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../testdata/camera720p.rgba"
+                ))
+                .as_chunks::<4>()
+                .0,
             )
             .for_each(|(dst, src)| *dst = [src[0], src[1], src[2]]);
 
@@ -3630,7 +3744,10 @@ mod image_tests {
             720,
             YUYV,
             None,
-            include_bytes!("../../../testdata/camera720p.yuyv"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.yuyv"
+            )),
         )
         .unwrap();
 
@@ -3647,7 +3764,10 @@ mod image_tests {
             .map()
             .unwrap()
             .as_mut_slice()
-            .copy_from_slice(include_bytes!("../../../testdata/camera720p.rgba"));
+            .copy_from_slice(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.rgba"
+            )));
 
         compare_images(&dst, &target_image, 0.98, function!());
     }
@@ -3673,7 +3793,10 @@ mod image_tests {
             720,
             YUYV,
             Some(TensorMemory::Dma),
-            include_bytes!("../../../testdata/camera720p.yuyv"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.yuyv"
+            )),
         )
         .unwrap();
 
@@ -3690,7 +3813,10 @@ mod image_tests {
             .map()
             .unwrap()
             .as_mut_slice()
-            .copy_from_slice(include_bytes!("../../../testdata/camera720p.rgba"));
+            .copy_from_slice(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.rgba"
+            )));
 
         compare_images(&dst, &target_image, 0.98, function!());
     }
@@ -3714,7 +3840,10 @@ mod image_tests {
             720,
             YUYV,
             None,
-            include_bytes!("../../../testdata/camera720p.yuyv"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.yuyv"
+            )),
         )
         .unwrap();
 
@@ -3768,7 +3897,10 @@ mod image_tests {
             720,
             YUYV,
             None,
-            include_bytes!("../../../testdata/camera720p.yuyv"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.yuyv"
+            )),
         )
         .unwrap();
 
@@ -3809,7 +3941,10 @@ mod image_tests {
             720,
             YUYV,
             None,
-            include_bytes!("../../../testdata/camera720p.yuyv"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.yuyv"
+            )),
         )
         .unwrap();
 
@@ -3828,7 +3963,10 @@ mod image_tests {
             720,
             RGBA,
             None,
-            include_bytes!("../../../testdata/camera720p.rgba"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.rgba"
+            )),
         )
         .unwrap();
         cpu_converter
@@ -3865,7 +4003,10 @@ mod image_tests {
             720,
             YUYV,
             Some(TensorMemory::Dma),
-            include_bytes!("../../../testdata/camera720p.yuyv"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.yuyv"
+            )),
         )
         .unwrap();
 
@@ -3941,7 +4082,10 @@ mod image_tests {
             720,
             YUYV,
             Some(TensorMemory::Dma),
-            include_bytes!("../../../testdata/camera720p.yuyv"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.yuyv"
+            )),
         )
         .unwrap();
 
@@ -3997,7 +4141,11 @@ mod image_tests {
 
     #[test]
     fn test_vyuy_to_rgba_cpu() {
-        let file = include_bytes!("../../../testdata/camera720p.vyuy").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/camera720p.vyuy"
+        ))
+        .to_vec();
         let src = TensorImage::new(1280, 720, VYUY, None).unwrap();
         src.tensor()
             .map()
@@ -4018,14 +4166,21 @@ mod image_tests {
             .map()
             .unwrap()
             .as_mut_slice()
-            .copy_from_slice(include_bytes!("../../../testdata/camera720p.rgba"));
+            .copy_from_slice(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.rgba"
+            )));
 
         compare_images(&dst, &target_image, 0.98, function!());
     }
 
     #[test]
     fn test_vyuy_to_rgb_cpu() {
-        let file = include_bytes!("../../../testdata/camera720p.vyuy").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/camera720p.vyuy"
+        ))
+        .to_vec();
         let src = TensorImage::new(1280, 720, VYUY, None).unwrap();
         src.tensor()
             .map()
@@ -4050,9 +4205,12 @@ mod image_tests {
             .0
             .iter_mut()
             .zip(
-                include_bytes!("../../../testdata/camera720p.rgba")
-                    .as_chunks::<4>()
-                    .0,
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../testdata/camera720p.rgba"
+                ))
+                .as_chunks::<4>()
+                .0,
             )
             .for_each(|(dst, src)| *dst = [src[0], src[1], src[2]]);
 
@@ -4078,7 +4236,10 @@ mod image_tests {
             720,
             VYUY,
             None,
-            include_bytes!("../../../testdata/camera720p.vyuy"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.vyuy"
+            )),
         )
         .unwrap();
 
@@ -4099,7 +4260,10 @@ mod image_tests {
             .map()
             .unwrap()
             .as_mut_slice()
-            .copy_from_slice(include_bytes!("../../../testdata/camera720p.rgba"));
+            .copy_from_slice(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.rgba"
+            )));
 
         compare_images(&dst, &target_image, 0.98, function!());
     }
@@ -4123,7 +4287,10 @@ mod image_tests {
             720,
             VYUY,
             None,
-            include_bytes!("../../../testdata/camera720p.vyuy"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.vyuy"
+            )),
         )
         .unwrap();
 
@@ -4181,7 +4348,10 @@ mod image_tests {
             720,
             VYUY,
             Some(TensorMemory::Dma),
-            include_bytes!("../../../testdata/camera720p.vyuy"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.vyuy"
+            )),
         )
         .unwrap();
 
@@ -4205,14 +4375,21 @@ mod image_tests {
             .map()
             .unwrap()
             .as_mut_slice()
-            .copy_from_slice(include_bytes!("../../../testdata/camera720p.rgba"));
+            .copy_from_slice(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.rgba"
+            )));
 
         compare_images(&dst, &target_image, 0.98, function!());
     }
 
     #[test]
     fn test_nv12_to_rgba_cpu() {
-        let file = include_bytes!("../../../testdata/zidane.nv12").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane.nv12"
+        ))
+        .to_vec();
         let src = TensorImage::new(1280, 720, NV12, None).unwrap();
         src.tensor().map().unwrap().as_mut_slice()[0..(1280 * 720 * 3 / 2)].copy_from_slice(&file);
 
@@ -4224,7 +4401,10 @@ mod image_tests {
             .unwrap();
 
         let target_image = TensorImage::load_jpeg(
-            include_bytes!("../../../testdata/zidane.jpg"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/zidane.jpg"
+            )),
             Some(RGBA),
             None,
         )
@@ -4235,7 +4415,11 @@ mod image_tests {
 
     #[test]
     fn test_nv12_to_rgb_cpu() {
-        let file = include_bytes!("../../../testdata/zidane.nv12").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane.nv12"
+        ))
+        .to_vec();
         let src = TensorImage::new(1280, 720, NV12, None).unwrap();
         src.tensor().map().unwrap().as_mut_slice()[0..(1280 * 720 * 3 / 2)].copy_from_slice(&file);
 
@@ -4247,7 +4431,10 @@ mod image_tests {
             .unwrap();
 
         let target_image = TensorImage::load_jpeg(
-            include_bytes!("../../../testdata/zidane.jpg"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/zidane.jpg"
+            )),
             Some(RGB),
             None,
         )
@@ -4258,7 +4445,11 @@ mod image_tests {
 
     #[test]
     fn test_nv12_to_grey_cpu() {
-        let file = include_bytes!("../../../testdata/zidane.nv12").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane.nv12"
+        ))
+        .to_vec();
         let src = TensorImage::new(1280, 720, NV12, None).unwrap();
         src.tensor().map().unwrap().as_mut_slice()[0..(1280 * 720 * 3 / 2)].copy_from_slice(&file);
 
@@ -4270,7 +4461,10 @@ mod image_tests {
             .unwrap();
 
         let target_image = TensorImage::load_jpeg(
-            include_bytes!("../../../testdata/zidane.jpg"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/zidane.jpg"
+            )),
             Some(GREY),
             None,
         )
@@ -4281,7 +4475,11 @@ mod image_tests {
 
     #[test]
     fn test_nv12_to_yuyv_cpu() {
-        let file = include_bytes!("../../../testdata/zidane.nv12").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane.nv12"
+        ))
+        .to_vec();
         let src = TensorImage::new(1280, 720, NV12, None).unwrap();
         src.tensor().map().unwrap().as_mut_slice()[0..(1280 * 720 * 3 / 2)].copy_from_slice(&file);
 
@@ -4293,7 +4491,10 @@ mod image_tests {
             .unwrap();
 
         let target_image = TensorImage::load_jpeg(
-            include_bytes!("../../../testdata/zidane.jpg"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/zidane.jpg"
+            )),
             Some(RGB),
             None,
         )
@@ -4414,7 +4615,11 @@ mod image_tests {
 
         let dst_width = 640;
         let dst_height = 640;
-        let file = include_bytes!("../../../testdata/test_image.jpg").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/test_image.jpg"
+        ))
+        .to_vec();
         let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         let mut cpu_dst = TensorImage::new(dst_width, dst_height, PLANAR_RGB, None).unwrap();
@@ -4469,7 +4674,11 @@ mod image_tests {
 
     #[test]
     fn test_cpu_resize_nv16() {
-        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane.jpg"
+        ))
+        .to_vec();
         let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         let mut cpu_nv16_dst = TensorImage::new(640, 640, NV16, None).unwrap();
@@ -4870,7 +5079,11 @@ mod image_tests {
         );
 
         // Fill source PBO with test pattern: load JPEG then convert Mem→PBO
-        let file = include_bytes!("../../../testdata/zidane.jpg").to_vec();
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane.jpg"
+        ))
+        .to_vec();
         let jpeg_src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
 
         // Resize JPEG into a Mem temp of the right size, then copy into PBO
