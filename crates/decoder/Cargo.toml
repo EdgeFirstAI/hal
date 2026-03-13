@@ -14,11 +14,11 @@ documentation = "https://docs.rs/edgefirst-decoder"
 
 [features]
 #default = ["tracker"]
-#tracker = ["dep:edgefirst-tracker"]
+tracker = ["dep:edgefirst-tracker"]
 
 [dependencies]
 argminmax = { workspace = true }
-#edgefirst-tracker = { workspace = true, optional = true }
+edgefirst-tracker = { workspace = true, optional = true }
 env_logger = { workspace = true }
 fast-math = { workspace = true }
 log = { workspace = true }

@@ -529,6 +529,7 @@ version = "0.9.1"
 dependencies = [
  "argminmax",
  "edgefirst-bench",
+ "edgefirst-tracker",
  "env_logger",
  "fast-math",
  "image",
