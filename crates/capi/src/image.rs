@@ -472,6 +472,85 @@ pub unsafe extern "C" fn hal_tensor_image_from_tensor(
     Box::into_raw(Box::new(HalTensorImage { inner: image }))
 }
 
+/// Create a multiplane tensor image from separate Y and UV DMA-BUF file descriptors.
+///
+/// This is used for V4L2 multi-planar NV12 (`V4L2_PIX_FMT_NV12M`) where the
+/// Y and UV planes are in separate DMA-BUF allocations. The HAL takes ownership
+/// of both file descriptors on success; they remain owned by the caller on error.
+///
+/// @param y_fd    DMA-BUF file descriptor for the Y (luma) plane
+/// @param width   Image width in pixels
+/// @param height  Image height in pixels
+/// @param uv_fd   DMA-BUF file descriptor for the UV (chroma) plane
+/// @param fourcc  Pixel format (must be HAL_FOURCC_NV12 or HAL_FOURCC_NV16)
+/// @param out     Receives the new tensor image handle on success
+/// @return 0 on success, -1 on error (errno set)
+/// @par Errors (errno):
+/// - EINVAL: Invalid argument or unsupported fourcc
+/// - EIO:    Failed to wrap DMA-BUF file descriptor
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_image_from_planes(
+    y_fd: c_int,
+    width: u32,
+    height: u32,
+    uv_fd: c_int,
+    fourcc: HalFourcc,
+    out: *mut *mut HalTensorImage,
+) -> c_int {
+    check_null!(out);
+    if y_fd < 0 || uv_fd < 0 || width == 0 || height == 0 {
+        set_error(libc::EINVAL);
+        return -1;
+    }
+
+    let fc = fourcc.to_fourcc();
+    let w = width as usize;
+    let h = height as usize;
+
+    // Determine chroma height based on format
+    let chroma_h = if fc == NV12 {
+        h / 2
+    } else if fc == NV16 {
+        h
+    } else {
+        set_error(libc::EINVAL);
+        return -1;
+    };
+
+    // Take ownership of the file descriptors
+    use std::os::unix::io::FromRawFd;
+    let y_owned = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(y_fd) };
+    let uv_owned = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(uv_fd) };
+
+    let luma = match edgefirst_tensor::Tensor::<u8>::from_fd(y_owned, &[h, w], Some("luma")) {
+        Ok(t) => t,
+        Err(_) => {
+            set_error(libc::EIO);
+            return -1;
+        }
+    };
+
+    let chroma =
+        match edgefirst_tensor::Tensor::<u8>::from_fd(uv_owned, &[chroma_h, w], Some("chroma")) {
+            Ok(t) => t,
+            Err(_) => {
+                set_error(libc::EIO);
+                return -1;
+            }
+        };
+
+    let image = match TensorImage::from_planes(luma, chroma, fc) {
+        Ok(img) => img,
+        Err(_) => {
+            set_error(libc::EINVAL);
+            return -1;
+        }
+    };
+
+    unsafe { *out = Box::into_raw(Box::new(HalTensorImage { inner: image })) };
+    0
+}
+
 /// Load a JPEG image from memory.
 ///
 /// @param data Pointer to JPEG data

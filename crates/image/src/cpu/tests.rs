@@ -1423,4 +1423,224 @@ mod cpu_tests {
         let segs = result.unwrap();
         assert_eq!(segs.len(), 1);
     }
+
+    // ── Multiplane NV12 tests ───────────────────────────────────────
+
+    #[test]
+    fn test_multiplane_tensor_image_creation() -> Result<()> {
+        let luma = Tensor::<u8>::new(&[720, 1280], Some(TensorMemory::Mem), Some("luma"))?;
+        let chroma = Tensor::<u8>::new(&[360, 1280], Some(TensorMemory::Mem), Some("chroma"))?;
+        let img = TensorImage::from_planes(luma, chroma, NV12)?;
+
+        assert_eq!(img.width(), 1280);
+        assert_eq!(img.height(), 720);
+        assert_eq!(img.fourcc(), NV12);
+        assert!(img.is_multiplane());
+        assert!(img.chroma_tensor().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn test_multiplane_is_multiplane() -> Result<()> {
+        // Contiguous NV12 should NOT be multiplane
+        let contiguous = TensorImage::new(640, 480, NV12, Some(TensorMemory::Mem))?;
+        assert!(!contiguous.is_multiplane());
+        assert!(contiguous.chroma_tensor().is_none());
+
+        // from_planes should be multiplane
+        let luma = Tensor::<u8>::new(&[480, 640], Some(TensorMemory::Mem), None)?;
+        let chroma = Tensor::<u8>::new(&[240, 640], Some(TensorMemory::Mem), None)?;
+        let multiplane = TensorImage::from_planes(luma, chroma, NV12)?;
+        assert!(multiplane.is_multiplane());
+        assert!(multiplane.chroma_tensor().is_some());
+
+        // RGB should NOT be multiplane
+        let rgb = TensorImage::new(640, 480, RGB, Some(TensorMemory::Mem))?;
+        assert!(!rgb.is_multiplane());
+        Ok(())
+    }
+
+    #[test]
+    fn test_multiplane_invalid_shapes() {
+        // Wrong fourcc (RGB not supported)
+        let luma = Tensor::<u8>::new(&[480, 640], Some(TensorMemory::Mem), None).unwrap();
+        let chroma = Tensor::<u8>::new(&[240, 640], Some(TensorMemory::Mem), None).unwrap();
+        assert!(TensorImage::from_planes(luma, chroma, RGB).is_err());
+
+        // Chroma height mismatch for NV12 (should be H/2)
+        let luma = Tensor::<u8>::new(&[480, 640], Some(TensorMemory::Mem), None).unwrap();
+        let chroma = Tensor::<u8>::new(&[480, 640], Some(TensorMemory::Mem), None).unwrap();
+        assert!(TensorImage::from_planes(luma, chroma, NV12).is_err());
+
+        // Chroma width mismatch
+        let luma = Tensor::<u8>::new(&[480, 640], Some(TensorMemory::Mem), None).unwrap();
+        let chroma = Tensor::<u8>::new(&[240, 320], Some(TensorMemory::Mem), None).unwrap();
+        assert!(TensorImage::from_planes(luma, chroma, NV12).is_err());
+
+        // 3D luma (should be 2D)
+        let luma = Tensor::<u8>::new(&[480, 640, 1], Some(TensorMemory::Mem), None).unwrap();
+        let chroma = Tensor::<u8>::new(&[240, 640], Some(TensorMemory::Mem), None).unwrap();
+        assert!(TensorImage::from_planes(luma, chroma, NV12).is_err());
+    }
+
+    #[test]
+    fn test_multiplane_nv12_to_rgb_cpu() -> Result<()> {
+        // Load NV12 test data as contiguous buffer
+        let nv12_bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/camera720p.nv12"
+        ));
+        let width = 1280usize;
+        let height = 720usize;
+        let y_size = width * height;
+        let uv_size = width * (height / 2);
+
+        // ── Contiguous path (baseline) ──────────────────────────────
+        let contiguous = load_bytes_to_tensor(width, height, NV12, None, nv12_bytes)?;
+        let mut dst_contiguous = TensorImage::new(width, height, RGB, None)?;
+        let mut converter = CPUProcessor::default();
+        converter.convert(
+            &contiguous,
+            &mut dst_contiguous,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        )?;
+
+        // ── Multiplane path ─────────────────────────────────────────
+        let luma = Tensor::<u8>::new(&[height, width], Some(TensorMemory::Mem), Some("luma"))?;
+        luma.map()?.as_mut_slice()[..y_size].copy_from_slice(&nv12_bytes[..y_size]);
+
+        let chroma = Tensor::<u8>::new(
+            &[height / 2, width],
+            Some(TensorMemory::Mem),
+            Some("chroma"),
+        )?;
+        chroma.map()?.as_mut_slice()[..uv_size]
+            .copy_from_slice(&nv12_bytes[y_size..y_size + uv_size]);
+
+        let multiplane = TensorImage::from_planes(luma, chroma, NV12)?;
+        let mut dst_multiplane = TensorImage::new(width, height, RGB, None)?;
+        converter.convert(
+            &multiplane,
+            &mut dst_multiplane,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        )?;
+
+        // ── Compare: both paths must produce identical output ───────
+        let contiguous_map = dst_contiguous.tensor().map()?;
+        let multiplane_map = dst_multiplane.tensor().map()?;
+        assert_eq!(
+            contiguous_map.as_slice(),
+            multiplane_map.as_slice(),
+            "multiplane NV12→RGB must match contiguous path"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_multiplane_nv12_to_rgba_cpu() -> Result<()> {
+        let nv12_bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/camera720p.nv12"
+        ));
+        let width = 1280usize;
+        let height = 720usize;
+        let y_size = width * height;
+        let uv_size = width * (height / 2);
+
+        let contiguous = load_bytes_to_tensor(width, height, NV12, None, nv12_bytes)?;
+        let mut dst_contiguous = TensorImage::new(width, height, RGBA, None)?;
+        let mut converter = CPUProcessor::default();
+        converter.convert(
+            &contiguous,
+            &mut dst_contiguous,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        )?;
+
+        let luma = Tensor::<u8>::new(&[height, width], Some(TensorMemory::Mem), Some("luma"))?;
+        luma.map()?.as_mut_slice()[..y_size].copy_from_slice(&nv12_bytes[..y_size]);
+        let chroma = Tensor::<u8>::new(
+            &[height / 2, width],
+            Some(TensorMemory::Mem),
+            Some("chroma"),
+        )?;
+        chroma.map()?.as_mut_slice()[..uv_size]
+            .copy_from_slice(&nv12_bytes[y_size..y_size + uv_size]);
+
+        let multiplane = TensorImage::from_planes(luma, chroma, NV12)?;
+        let mut dst_multiplane = TensorImage::new(width, height, RGBA, None)?;
+        converter.convert(
+            &multiplane,
+            &mut dst_multiplane,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        )?;
+
+        let contiguous_map = dst_contiguous.tensor().map()?;
+        let multiplane_map = dst_multiplane.tensor().map()?;
+        assert_eq!(
+            contiguous_map.as_slice(),
+            multiplane_map.as_slice(),
+            "multiplane NV12→RGBA must match contiguous path"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_multiplane_nv12_to_grey_cpu() -> Result<()> {
+        let nv12_bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/camera720p.nv12"
+        ));
+        let width = 1280usize;
+        let height = 720usize;
+        let y_size = width * height;
+        let uv_size = width * (height / 2);
+
+        let contiguous = load_bytes_to_tensor(width, height, NV12, None, nv12_bytes)?;
+        let mut dst_contiguous = TensorImage::new(width, height, GREY, None)?;
+        let mut converter = CPUProcessor::default();
+        converter.convert(
+            &contiguous,
+            &mut dst_contiguous,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        )?;
+
+        let luma = Tensor::<u8>::new(&[height, width], Some(TensorMemory::Mem), Some("luma"))?;
+        luma.map()?.as_mut_slice()[..y_size].copy_from_slice(&nv12_bytes[..y_size]);
+        let chroma = Tensor::<u8>::new(
+            &[height / 2, width],
+            Some(TensorMemory::Mem),
+            Some("chroma"),
+        )?;
+        chroma.map()?.as_mut_slice()[..uv_size]
+            .copy_from_slice(&nv12_bytes[y_size..y_size + uv_size]);
+
+        let multiplane = TensorImage::from_planes(luma, chroma, NV12)?;
+        let mut dst_multiplane = TensorImage::new(width, height, GREY, None)?;
+        converter.convert(
+            &multiplane,
+            &mut dst_multiplane,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        )?;
+
+        let contiguous_map = dst_contiguous.tensor().map()?;
+        let multiplane_map = dst_multiplane.tensor().map()?;
+        assert_eq!(
+            contiguous_map.as_slice(),
+            multiplane_map.as_slice(),
+            "multiplane NV12→GREY must match contiguous path"
+        );
+        Ok(())
+    }
 }

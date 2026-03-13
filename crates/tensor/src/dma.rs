@@ -212,7 +212,10 @@ where
         {
             trace!("DmaMap: sync start fd={} size={size}", fd.as_raw_fd());
             if let Err(e) = crate::dmabuf::start_readwrite(&fd) {
-                warn!("DmaMap: DMA_BUF_IOCTL_SYNC(START) failed fd={}: {e}", fd.as_raw_fd());
+                warn!(
+                    "DmaMap: DMA_BUF_IOCTL_SYNC(START) failed fd={}: {e}",
+                    fd.as_raw_fd()
+                );
                 return Err(Error::NixError(e));
             }
         }
