@@ -1,8 +1,8 @@
 # EdgeFirst HAL - Benchmarks
 
-**Version:** 1.2
-**Last Updated:** March 9, 2026
-**Status:** Baseline results collected for imx8mp-frdm, imx95-frdm, rpi5-hailo, x86-desktop
+**Version:** 1.4
+**Last Updated:** March 13, 2026
+**Status:** Added planar RGB format benchmarks (8BPS/8BPi), documented NV12→planar GPU hang on Vivante, updated all platforms
 
 ---
 
@@ -79,7 +79,15 @@ These infrastructure benchmarks isolate the memory subsystem overhead from the c
 - 1280×1280 — high-resolution models
 
 **Source formats:** YUYV, VYUY, NV12, NV16, RGBA, RGB, GREY
-**Destination formats:** RGBA, BGRA, RGB, GREY, PLANAR_RGB, and INT8 variants
+**Destination formats:** RGBA, BGRA, RGB, RGB_INT8, GREY, PLANAR_RGB (8BPS), PLANAR_RGB_INT8 (8BPi)
+
+### Format Abbreviations
+
+| Abbreviation | Format | Description |
+|-------------|--------|-------------|
+| **8BPS** | PLANAR_RGB | 3× separate float32 planes (R, G, B) |
+| **8BPi** | PLANAR_RGB_INT8 | 3× separate uint8 planes (R, G, B) |
+| **RGBi** | RGB_INT8 | Packed RGB, uint8 per channel |
 
 ### Measurement Methodology
 
@@ -89,7 +97,7 @@ All benchmarks use the `edgefirst-bench` custom harness which:
 - Reports: median, mean, min, max, p95, p99
 - Reports throughput in MiB/s where applicable
 
-**Standard parameters:** 10 warmup iterations, 200 measured iterations (adjustable per benchmark).
+**Standard parameters:** 10 warmup iterations, 100 measured iterations (adjustable per benchmark).
 
 ---
 
@@ -129,7 +137,7 @@ JSON files are collected in `benchmarks/<platform>/` and processed by `.github/s
 | **OS** | NXP BSP (Linux 6.12) |
 | **G2D** | Yes (Vivante) |
 | **DMA-buf** | Yes (CMA) |
-| **Notes** | NXP evaluation board; same SoC as maivin, latest NXP BSP |
+| **Notes** | NXP evaluation board; same SoC as maivin, latest NXP BSP. **NV12→planar blocked on GL** (GPU hang, see Known Issues §10). |
 
 ### imx95-frdm
 
@@ -171,7 +179,7 @@ JSON files are collected in `benchmarks/<platform>/` and processed by `.github/s
 | **OS** | Raspberry Pi OS (Debian 12) |
 | **G2D** | No |
 | **DMA-buf** | Yes (system heap) |
-| **Notes** | Mesa V3D driver; DMA-buf roundtrip status TBD |
+| **Notes** | Mesa V3D driver; no RGB/RGBi packed GL support (two-pass disabled) |
 
 ### x86-desktop
 
@@ -229,39 +237,72 @@ Measures `tensor.map()` round-trip latency. MEM buffers have zero map overhead (
 
 The most critical benchmark: simulates a real camera-to-model preprocessing pipeline with format conversion, resize, and letterbox padding.
 
-**1080p → 640×640:**
+#### Packed Formats (1080p → 640×640)
 
-| Platform | Compute | Buffer | YUYV→RGBA | YUYV→RGB | YUYV→8BPi | NV12→RGBA | VYUY→RGBA |
-|----------|---------|--------|-----------|----------|-----------|-----------|-----------|
-| imx8mp-frdm | G2D | DMA | 3.3 ms | 4.2 ms | — | 4.1 ms | — |
-| imx8mp-frdm | GL | DMA | 1.8 ms | — | 5.6 ms | 3.5 ms | — |
-| imx8mp-frdm | CPU | Heap | 17.4 ms | 17.6 ms | 19.9 ms | 21.5 ms | 17.5 ms |
-| imx95-frdm | G2D | DMA | 3.9 ms | 4.6 ms | — | 3.8 ms | — |
-| imx95-frdm | GL | DMA | 1.4 ms | 1.4 ms | 2.8 ms | 1.7 ms | — |
-| imx95-frdm | CPU | Heap | 14.6 ms | 14.9 ms | 17.0 ms | 19.1 ms | 14.6 ms |
-| rpi5-hailo | GL | DMA | 3.3 ms | — | 16.9 ms | 1.2 ms | — |
-| rpi5-hailo | CPU | Heap | 7.6 ms | 7.2 ms | 7.4 ms | 7.4 ms | 7.6 ms |
-| x86-desktop | GL | PBO | — | — | — | — | — |
-| x86-desktop | CPU | Heap | 1.7 ms | 1.5 ms | 1.9 ms | 1.4 ms | 1.8 ms |
+| Platform | Compute | Buffer | YUYV→RGBA | YUYV→RGB | YUYV→RGBi | NV12→RGBA | NV12→RGBi | VYUY→RGBA |
+|----------|---------|--------|-----------|----------|-----------|-----------|-----------|-----------|
+| imx8mp-frdm | G2D | DMA | 3.0 ms | 4.2 ms | — | 4.1 ms | — | — |
+| imx8mp-frdm | GL | DMA | 1.8 ms | — | — | 3.5 ms | — | — |
+| imx8mp-frdm | CPU | Heap | 17.7 ms | 17.5 ms | 19.4 ms | 20.6 ms | 18.5 ms | 17.5 ms |
+| imx95-frdm | G2D | DMA | 3.9 ms | 4.0 ms | — | 3.8 ms | — | — |
+| imx95-frdm | GL | DMA | 1.2 ms | 1.3 ms | 1.3 ms | 1.5 ms | 1.6 ms | — |
+| imx95-frdm | CPU | Heap | 14.4 ms | 14.9 ms | 16.4 ms | 19.0 ms | 17.0 ms | 14.4 ms |
+| rpi5-hailo | GL | DMA | 3.3 ms | — | — | 1.2 ms | — | — |
+| rpi5-hailo | CPU | Heap | 7.7 ms | 7.2 ms | 6.2 ms | 7.4 ms | 5.7 ms | 7.6 ms |
+| x86-desktop | GL | PBO | — | — | — | — | — | — |
+| x86-desktop | CPU | Heap | 1.4 ms | 1.4 ms | 1.4 ms | 1.1 ms | 1.0 ms | 1.5 ms |
 
-> **Note:** x86-desktop GL shows "—" because NVIDIA PBO cannot import YUYV/NV12 textures directly. On x86, OpenGL is only effective for RGBA↔RGBA operations.
+> **Note:** imx8mp-frdm GL "—" for RGB/RGBi: Vivante GL lacks packed RGB support (two-pass disabled). rpi5-hailo GL same limitation on Mesa V3D. x86-desktop GL cannot import YUV textures via PBO.
 
-**4K → 640×640:**
+#### Planar Formats (1080p → 640×640)
+
+Planar formats (8BPS = PLANAR_RGB, 8BPi = PLANAR_RGB_INT8) use separate memory planes for each color channel — required by some ML inference frameworks.
+
+| Platform | Compute | Buffer | YUYV→8BPS | YUYV→8BPi | NV12→8BPS | NV12→8BPi |
+|----------|---------|--------|-----------|-----------|-----------|-----------|
+| imx8mp-frdm | G2D | DMA | — | — | — | — |
+| imx8mp-frdm | GL | DMA | 5.5 ms | 5.5 ms | **BLOCKED** | **BLOCKED** |
+| imx8mp-frdm | CPU | Heap | 18.2 ms | 20.1 ms | 17.7 ms | 19.3 ms |
+| imx95-frdm | G2D | DMA | — | — | — | — |
+| imx95-frdm | GL | DMA | 2.4 ms | 2.8 ms | 3.6 ms | 3.6 ms |
+| imx95-frdm | CPU | Heap | 16.4 ms | 17.0 ms | 15.5 ms | 17.0 ms |
+| rpi5-hailo | GL | DMA | 16.7 ms | 16.7 ms | 5.0 ms | 5.1 ms |
+| rpi5-hailo | CPU | Heap | 8.6 ms | 8.8 ms | 8.0 ms | 8.0 ms |
+| x86-desktop | GL | PBO | — | — | — | — |
+| x86-desktop | CPU | Heap | 1.5 ms | 1.5 ms | 1.1 ms | 1.2 ms |
+
+> **BLOCKED:** NV12→planar on Vivante GC7000UL causes an unrecoverable GPU hang (kernel Ds state, requires reboot). The HAL explicitly blocks this combination on Vivante GPUs and falls back to CPU in auto mode. See Known Issues §10 and `VSI_GPU_NV12_BUG.md`.
+>
+> G2D does not support planar output formats.
+
+#### Packed Formats (4K → 640×640)
 
 | Platform | Compute | Buffer | YUYV→RGBA | YUYV→RGB | NV12→RGBA |
 |----------|---------|--------|-----------|----------|-----------|
 | imx8mp-frdm | G2D | DMA | 4.2 ms | 5.7 ms | 6.8 ms |
-| imx8mp-frdm | GL | DMA | 2.4 ms | — | 9.3 ms |
-| imx8mp-frdm | CPU | Heap | 58.8 ms | 49.5 ms | 75.7 ms |
-| imx95-frdm | G2D | DMA | 13.9 ms | 16.6 ms | 13.2 ms |
-| imx95-frdm | GL | DMA | 1.8 ms | 1.7 ms | 5.0 ms |
-| imx95-frdm | CPU | Heap | 46.2 ms | 41.7 ms | 66.5 ms |
-| rpi5-hailo | GL | DMA | 18.6 ms | — | — |
+| imx8mp-frdm | GL | DMA | 2.4 ms | — | 9.7 ms |
+| imx8mp-frdm | CPU | Heap | 59.5 ms | 50.0 ms | 75.7 ms |
+| imx95-frdm | G2D | DMA | 13.9 ms | 14.6 ms | 13.3 ms |
+| imx95-frdm | GL | DMA | 1.6 ms | 1.7 ms | 4.7 ms |
+| imx95-frdm | CPU | Heap | 46.2 ms | 41.2 ms | 64.5 ms |
+| rpi5-hailo | GL | DMA | 18.5 ms | — | 5.0 ms |
 | rpi5-hailo | CPU | Heap | 23.9 ms | 19.8 ms | 22.2 ms |
 | x86-desktop | GL | PBO | — | — | — |
-| x86-desktop | CPU | Heap | 7.7 ms | 6.4 ms | 9.5 ms |
+| x86-desktop | CPU | Heap | 6.8 ms | 5.5 ms | 6.3 ms |
 
-> **Note:** rpi5-hailo GL shows "—" for 4K NV12→RGBA because Mesa V3D cannot allocate DMA-buf textures at 4K resolution. Only 1080p and below are supported.
+#### Planar Formats (4K → 640×640)
+
+| Platform | Compute | Buffer | YUYV→8BPS | YUYV→8BPi | NV12→8BPS | NV12→8BPi |
+|----------|---------|--------|-----------|-----------|-----------|-----------|
+| imx8mp-frdm | GL | DMA | 8.1 ms | 8.2 ms | **BLOCKED** | **BLOCKED** |
+| imx8mp-frdm | CPU | Heap | 50.9 ms | 52.5 ms | — | — |
+| imx95-frdm | GL | DMA | 3.7 ms | 3.6 ms | 8.4 ms | 9.1 ms |
+| imx95-frdm | CPU | Heap | 46.2 ms | 46.2 ms | — | — |
+| rpi5-hailo | GL | DMA | 102.1 ms | 102.2 ms | 25.8 ms | 25.8 ms |
+| rpi5-hailo | CPU | Heap | 23.9 ms | 23.9 ms | 22.2 ms | 22.2 ms |
+| x86-desktop | CPU | Heap | 5.8 ms | 5.8 ms | 5.1 ms | 5.2 ms |
+
+> **Note:** rpi5-hailo GL YUYV→planar at 4K is ~102ms (very slow) — CPU is 4× faster at 24ms. This appears to be a Mesa V3D bottleneck with MRT at high input resolution. NV12→planar is much faster (26ms) because V3D handles NV12 DMA-buf import more efficiently.
 
 ### Format Conversion (Same Size, No Resize)
 
@@ -270,15 +311,15 @@ The most critical benchmark: simulates a real camera-to-model preprocessing pipe
 | Platform | Compute | Buffer | YUYV→RGBA | YUYV→RGB | NV12→RGBA | RGB→RGBA | RGBA→BGRA | RGBA→GREY |
 |----------|---------|--------|-----------|----------|-----------|----------|-----------|-----------|
 | imx8mp-frdm | G2D | DMA | 6.4 ms | 11.1 ms | 6.3 ms | — | — | — |
-| imx8mp-frdm | GL | DMA | 7.3 ms | — | 8.0 ms | — | 7.9 ms | 7.7 ms |
-| imx8mp-frdm | CPU | Heap | 13.7 ms | 11.8 ms | 13.0 ms | 13.8 ms | 30.5 ms | 10.1 ms |
-| imx95-frdm | G2D | DMA | 4.7 ms | 4.3 ms | 4.5 ms | — | — | — |
-| imx95-frdm | GL | DMA | 3.3 ms | 3.1 ms | 3.2 ms | — | 3.4 ms | 3.1 ms |
-| imx95-frdm | CPU | Heap | 12.3 ms | 10.8 ms | 15.8 ms | 10.9 ms | 24.2 ms | 8.8 ms |
-| rpi5-hailo | GL | DMA | 16.4 ms | — | 5.5 ms | — | 17.2 ms | 6.2 ms |
-| rpi5-hailo | CPU | Heap | 6.8 ms | 5.4 ms | 8.0 ms | 6.5 ms | 12.1 ms | 2.5 ms |
+| imx8mp-frdm | GL | DMA | 7.1 ms | — | 6.5 ms | — | 7.9 ms | 7.7 ms |
+| imx8mp-frdm | CPU | Heap | 6.4 ms | 11.1 ms | 6.5 ms | 13.8 ms | 32.2 ms | 10.1 ms |
+| imx95-frdm | G2D | DMA | 3.6 ms | 3.4 ms | 3.5 ms | — | — | — |
+| imx95-frdm | GL | DMA | 2.4 ms | 2.5 ms | 3.2 ms | — | — | — |
+| imx95-frdm | CPU | Heap | 4.6 ms | 4.3 ms | 4.5 ms | 10.7 ms | 25.5 ms | 8.6 ms |
+| rpi5-hailo | GL | DMA | 7.3 ms | — | 5.4 ms | — | 17.2 ms | 6.2 ms |
+| rpi5-hailo | CPU | Heap | 6.9 ms | 5.5 ms | 8.1 ms | 6.4 ms | 12.1 ms | 2.5 ms |
 | x86-desktop | GL | PBO | — | — | — | 1.2 ms | 1.5 ms | 1.5 ms |
-| x86-desktop | CPU | Heap | 616 us | 619 us | 255 us | 323 us | 1.1 ms | 295 us |
+| x86-desktop | CPU | Heap | 574 us | 585 us | 233 us | 305 us | 1.0 ms | 302 us |
 
 ### Decoder Post-Processing
 
@@ -316,16 +357,16 @@ All CPU-only (decoder is not GPU-accelerated).
 
 | Platform | Compute | Buffer | draw_masks (pre-decoded) | draw_masks_proto (fused) | decode_masks_atlas | hybrid_materialize_and_draw |
 |----------|---------|--------|------------------------|------------------------|--------------------|---------------------------|
-| imx8mp-frdm | GL | DMA | 2.6 ms | 275 ms | 432 ms | 5.9 ms |
+| imx8mp-frdm | GL | DMA | 2.6 ms | 5.9 ms | 408 ms | 5.9 ms |
 | imx8mp-frdm | CPU | Heap | 5.9 ms | 80.2 ms | 77.8 ms | 9.0 ms |
-| imx95-frdm | GL | DMA | 1.9 ms | 25.2 ms | 28.0 ms | 5.7 ms |
-| imx95-frdm | CPU | Heap | 6.0 ms | 78.1 ms | 75.7 ms | 9.0 ms |
-| rpi5-hailo | GL | DMA | 1.5 ms | 7.6 ms | 7.9 ms | 2.4 ms |
-| rpi5-hailo | CPU | Heap | 1.1 ms | 15.0 ms | 14.7 ms | 1.9 ms |
-| x86-desktop | GL | PBO | 107 us | 802 us | 923 us | 394 us |
-| x86-desktop | CPU | Heap | 519 us | 5.9 ms | 5.9 ms | 786 us |
+| imx95-frdm | GL | DMA | 1.9 ms | 5.5 ms | 28.2 ms | 5.3 ms |
+| imx95-frdm | CPU | Heap | 7.3 ms | 78.8 ms | 76.1 ms | 10.3 ms |
+| rpi5-hailo | GL | DMA | 1.5 ms | 2.4 ms | 7.7 ms | 2.4 ms |
+| rpi5-hailo | CPU | Heap | 1.5 ms | 15.0 ms | 14.7 ms | 1.9 ms |
+| x86-desktop | GL | PBO | 102 us | 375 us | 847 us | 394 us |
+| x86-desktop | CPU | Heap | 102 us | 5.9 ms | 5.9 ms | 786 us |
 
-> **Note:** imx8mp-frdm GL mask performance is anomalously slow (275ms for `draw_masks_proto` vs 25.2ms on imx95-frdm). This appears to be a Vivante GC7000UL driver inefficiency with the mask shader — investigation is tracked.
+> **Note:** imx8mp-frdm GL `decode_masks_atlas` degraded from 432ms to 408ms — still anomalously slow compared to other platforms. This is a Vivante GC7000UL driver inefficiency with the atlas shader path.
 
 **Hybrid Path Comparison (CPU materialize + GL overlay vs fused GPU):**
 
@@ -333,21 +374,21 @@ The hybrid path decodes masks on CPU (`materialize_segmentations`) then overlays
 
 | Platform | Full GPU (GL draw_masks_proto) | Hybrid (GL) | Speedup | Auto draw_masks_proto |
 |----------|-------------------------------|-------------|---------|----------------------|
-| imx8mp-frdm | 275 ms | 5.9 ms | **47×** | 6.0 ms |
-| imx95-frdm | 25.2 ms | 5.7 ms | **4.4×** | 5.6 ms |
-| rpi5-hailo | 7.6 ms | 2.4 ms | **3.2×** | 2.4 ms |
-| x86-desktop | 802 us | 394 us | **2.0×** | 386 us |
+| imx8mp-frdm | 5.9 ms | 5.9 ms | **1.0×** | 5.9 ms |
+| imx95-frdm | 5.5 ms | 5.3 ms | **1.0×** | 5.5 ms |
+| rpi5-hailo | 2.4 ms | 2.4 ms | **1.0×** | 2.4 ms |
+| x86-desktop | 375 us | 394 us | **0.9×** | 375 us |
 
-> **Note:** "Auto draw_masks_proto" confirms the auto path now selects the hybrid path — timings match `hybrid_materialize_and_draw`.
+> **Note:** The fused GPU path has improved significantly on imx8mp-frdm (from 275ms → 5.9ms) due to shader optimizations. The hybrid and fused paths are now comparable on all platforms.
 
 **Mask Decode Cost (CPU-only, measured in mask_benchmark):**
 
 | Platform | Proto Decode (NMS+coefficients) | Full Materialize (NMS+coefficients+pixels) |
 |----------|-------------------------------|-------------------------------------------|
-| imx8mp-frdm | 1.6 ms | 4.9 ms |
-| imx95-frdm | 1.3 ms | 4.3 ms |
-| rpi5-hailo | 527 us | 1.5 ms |
-| x86-desktop | 122 us | 429 us |
+| imx8mp-frdm | 1.5 ms | 4.9 ms |
+| imx95-frdm | 1.3 ms | 4.4 ms |
+| rpi5-hailo | 419 us | 1.5 ms |
+| x86-desktop | 117 us | 423 us |
 
 ---
 
@@ -368,23 +409,33 @@ The hybrid path decodes masks on CPU (`materialize_segmentations`) then overlays
 
 ### Known Performance Issues
 
-5. **imx8mp-frdm GL mask rendering anomalously slow** — draw_masks_proto takes 275ms on Vivante GC7000UL vs 25.2ms on Mali G310 (imx95-frdm). The Vivante driver appears to have inefficiencies with the mask shader.
+5. **imx8mp-frdm GL mask atlas anomalously slow** — `decode_masks_atlas` takes 408ms on Vivante GC7000UL vs 28ms on Mali G310 (imx95-frdm). The Vivante driver appears to have inefficiencies with the atlas shader path.
 
-6. **rpi5-hailo 4K DMA-buf allocation fails** — Mesa V3D driver cannot allocate DMA-buf textures at 3840×2160. OpenGL benchmarks at 4K are skipped on this platform.
+6. **rpi5-hailo 4K DMA-buf allocation fails** — Mesa V3D driver cannot allocate DMA-buf textures at 3840×2160 for same-size conversion. OpenGL convert benchmarks at 4K produce GL errors on this platform.
 
 7. **x86-desktop OpenGL cannot import YUV textures** — NVIDIA PBO path does not support YUYV/NV12/VYUY source textures. OpenGL letterbox and convert benchmarks show "—" for YUV source formats on this platform.
 
+8. **imx95-frdm GL DMA-buf slower than PBO for letterbox** — v1.2 benchmarks labelled imx95-frdm GL as "DMA" but were actually running on PBO (EGL extension query bug caused DMA-buf roundtrip probe to fail). After fixing the extension query (v1.3), GL now uses true DMA-buf import. DMA-buf letterbox 1080p→640 YUYV→RGBA is 3.4ms vs 1.4ms on PBO — the DMA-buf import/export overhead exceeds PBO zero-copy bind. G2D improved (3.5ms from 3.9ms). Fused mask rendering (`draw_masks_proto`) dramatically improved: 5.2ms from 25.2ms (**4.8× faster**).
+
+9. **BGRA framebuffer CPU byte-swap overhead** — BGRA textures as framebuffer attachments have GPU-dependent swizzle behavior (some implementations don't swizzle fragment shader output). Workaround uses RGBA format internally with CPU-side R↔B byte swaps on upload and readback. RGBA→BGRA conversion on imx95-frdm GL went from 3.4ms (v1.2 PBO, no swap needed) to 26.5ms (v1.3 DMA + CPU swap). CPU backend RGBA→BGRA is 24.5ms for reference.
+
+10. **NV12→planar GPU hang on Vivante GC7000UL** — Rendering from an NV12 source texture (via `EGL_LINUX_DMA_BUF_EXT`) to a planar RGB framebuffer (MRT with 3× color attachments) causes an **unrecoverable GPU hang** on the Vivante GC7000UL (i.MX 8M Plus, galcore 6.4.11). The GPU command processor stalls permanently, the calling process enters kernel uninterruptible sleep (Ds state), cannot be killed even with SIGKILL, and the galcore driver state is corrupted system-wide — all subsequent GPU operations from any process hang until a full board reboot. YUYV→planar and NV12→packed work fine; the bug is specific to NV12 multi-plane texture + MRT output. The HAL explicitly blocks this combination on Vivante GPUs and falls back to CPU in auto mode. See `VSI_GPU_NV12_BUG.md` for the full vendor bug report.
+
+11. **rpi5-hailo GL planar at 4K is slow** — YUYV→8BPS/8BPi at 4K takes ~102ms on Mesa V3D GL, while CPU handles it in ~24ms. NV12→planar at 4K is ~26ms on GL. The bottleneck appears to be in Mesa V3D's MRT path when combined with high-resolution YUYV texture sampling.
+
+12. **imx8mp-frdm GL lacks RGB/RGBi packed support** — Vivante GC7000UL OpenGL does not support packed RGB output without a two-pass approach (RGBA render then strip alpha), which is currently disabled. All RGB/RGBi results on this platform use CPU or G2D.
+
+13. **rpi5-hailo GL lacks RGB/RGBi packed support** — Same limitation as imx8mp-frdm: Mesa V3D two-pass packed RGB is disabled.
+
 ### Missing Format Coverage
 
-8. **No NV16 benchmarks** — Only NV12 is tested for semi-planar formats. NV16 (4:2:2 semi-planar) has different memory layout characteristics.
-
-9. **No planar RGBA benchmarks** — Only planar RGB is tested.
+14. **No NV16 benchmarks** — NV16 (4:2:2 semi-planar) conversion is not yet implemented. Benchmarks show `NotSupported` errors.
 
 ### Missing Scenarios
 
-10. **No PBO tensor allocation benchmarks** — Tensor allocation benchmarks cover Mem, SHM, and DMA but not PBO (which requires GL context).
+15. **No PBO tensor allocation benchmarks** — Tensor allocation benchmarks cover Mem, SHM, and DMA but not PBO (which requires GL context).
 
-11. **No end-to-end pipeline benchmark** — No benchmark covers the full camera → preprocess → decode → mask render cycle in a single measurement.
+16. **No end-to-end pipeline benchmark** — No benchmark covers the full camera → preprocess → decode → mask render cycle in a single measurement.
 
 ---
 
@@ -392,6 +443,8 @@ The hybrid path decodes masks on CPU (`materialize_segmentations`) then overlays
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 1.4 | 2026-03-13 | Add planar RGB (8BPS/8BPi) format benchmarks; document NV12→planar GPU hang on Vivante GC7000UL (blocked, CPU fallback); split letterbox tables into packed/planar; update mask rendering (imx8mp fused GPU improved 275ms→5.9ms); add rpi5 GL planar performance notes; refresh all platforms |
+| 1.3 | 2026-03-12 | Update imx95-frdm after DMA-buf fix (GL now uses true DMA-buf, was PBO); BGRA CPU byte-swap workaround; fused mask rendering 4.8× faster |
 | 1.2 | 2026-03-09 | Add hybrid mask benchmark and comparison table; auto-selection now prefers hybrid path |
 | 1.1 | 2026-03-08 | Baseline results for imx8mp-frdm, imx95-frdm, rpi5-hailo, x86-desktop |
 | 1.0 | 2026-03-04 | Initial document with strategy, platforms, and gap analysis |

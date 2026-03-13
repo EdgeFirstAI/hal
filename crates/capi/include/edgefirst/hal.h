@@ -1239,6 +1239,31 @@ struct hal_tensor_image *hal_tensor_image_from_tensor(struct hal_tensor *tensor,
                                                       enum hal_fourcc fourcc);
 
 /**
+ * Create a multiplane tensor image from separate Y and UV DMA-BUF file descriptors.
+ *
+ * This is used for V4L2 multi-planar NV12 (`V4L2_PIX_FMT_NV12M`) where the
+ * Y and UV planes are in separate DMA-BUF allocations. The HAL takes ownership
+ * of both file descriptors on success; they remain owned by the caller on error.
+ *
+ * @param y_fd    DMA-BUF file descriptor for the Y (luma) plane
+ * @param width   Image width in pixels
+ * @param height  Image height in pixels
+ * @param uv_fd   DMA-BUF file descriptor for the UV (chroma) plane
+ * @param fourcc  Pixel format (must be HAL_FOURCC_NV12 or HAL_FOURCC_NV16)
+ * @param out     Receives the new tensor image handle on success
+ * @return 0 on success, -1 on error (errno set)
+ * @par Errors (errno):
+ * - EINVAL: Invalid argument or unsupported fourcc
+ * - EIO:    Failed to wrap DMA-BUF file descriptor
+ */
+int hal_tensor_image_from_planes(int y_fd,
+                                 uint32_t width,
+                                 uint32_t height,
+                                 int uv_fd,
+                                 enum hal_fourcc fourcc,
+                                 struct hal_tensor_image **out);
+
+/**
  * Load a JPEG image from memory.
  *
  * @param data Pointer to JPEG data

@@ -14,7 +14,7 @@ mod gl_tests {
     use crate::{NV12, RGB_INT8, YUYV};
     use edgefirst_decoder::DetectBox;
     #[cfg(feature = "dma_test_formats")]
-    use edgefirst_tensor::{is_dma_available, TensorMemory};
+    use edgefirst_tensor::{is_dma_available, Tensor, TensorMemory};
     use edgefirst_tensor::{TensorMapTrait, TensorTrait};
     #[cfg(feature = "dma_test_formats")]
     use four_char_code::FourCharCode;
@@ -752,6 +752,16 @@ mod gl_tests {
                 return;
             }
         };
+
+        // Two-pass packed RGB is intentionally rejected on the DMA backend.
+        // This test validates the two-pass int8 pipeline which requires non-DMA.
+        if gl.gl_context.transfer_backend.is_dma() {
+            eprintln!(
+                "SKIPPED: {} - DMA backend does not support two-pass packed RGB",
+                function!()
+            );
+            return;
+        }
         gl.support_rgb_direct = false;
 
         // GL RGBA reference
@@ -890,6 +900,16 @@ mod gl_tests {
         let mut dst_direct = TensorImage::new(320, 320, RGB, Some(TensorMemory::Dma)).unwrap();
         gl.convert(&src, &mut dst_direct, Rotation::None, Flip::None, crop)
             .unwrap();
+
+        // Two-pass packed RGB is intentionally rejected on the DMA backend
+        // (convert_dest_dma returns NotSupported) because it's slower than
+        // the direct path. Skip the comparison when DMA is active.
+        if gl.gl_context.transfer_backend.is_dma() {
+            eprintln!(
+                "SKIPPED two-pass comparison: DMA backend does not support two-pass packed RGB"
+            );
+            return;
+        }
 
         // Force two-pass path
         gl.support_rgb_direct = false;
@@ -1257,5 +1277,240 @@ mod gl_tests {
                 eprintln!("SKIPPED: {} - PBO not supported: {e:?}", function!());
             }
         }
+    }
+
+    // ---- Multiplane NV12 GPU tests ----
+
+    /// Helper: load NV12 raw bytes into separate DMA-backed luma and chroma tensors,
+    /// returning a multiplane TensorImage suitable for GPU EGLImage import.
+    #[cfg(feature = "dma_test_formats")]
+    fn load_multiplane_nv12_dma(width: usize, height: usize, nv12_bytes: &[u8]) -> TensorImage {
+        let y_size = width * height;
+        let uv_size = width * (height / 2);
+        assert_eq!(nv12_bytes.len(), y_size + uv_size);
+
+        let luma = Tensor::new(&[height, width], Some(TensorMemory::Dma), Some("luma"))
+            .expect("DMA luma tensor");
+        luma.map().unwrap().as_mut_slice()[..y_size].copy_from_slice(&nv12_bytes[..y_size]);
+
+        let chroma = Tensor::new(
+            &[height / 2, width],
+            Some(TensorMemory::Dma),
+            Some("chroma"),
+        )
+        .expect("DMA chroma tensor");
+        chroma.map().unwrap().as_mut_slice()[..uv_size].copy_from_slice(&nv12_bytes[y_size..]);
+
+        TensorImage::from_planes(luma, chroma, NV12).expect("multiplane NV12")
+    }
+
+    /// Multiplane NV12 → RGBA via OpenGL DMA-BUF EGLImage (two separate FDs).
+    /// Compares against contiguous NV12 → RGBA to prove EGL multi-plane import works.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_multiplane_nv12_to_rgba_opengl() {
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+
+        let nv12_bytes: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/camera720p.nv12"
+        ));
+
+        // Contiguous NV12 (single DMA-BUF)
+        let src_contiguous =
+            load_raw_image(1280, 720, NV12, Some(TensorMemory::Dma), nv12_bytes).unwrap();
+
+        // Multiplane NV12 (two DMA-BUFs)
+        let src_multiplane = load_multiplane_nv12_dma(1280, 720, nv12_bytes);
+        assert!(src_multiplane.is_multiplane());
+
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+
+        // Convert contiguous
+        let mut dst_contig = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma)).unwrap();
+        gl.convert(
+            &src_contiguous,
+            &mut dst_contig,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        // Convert multiplane
+        let mut dst_multi = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma)).unwrap();
+        gl.convert(
+            &src_multiplane,
+            &mut dst_multi,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        // Compare pixel-for-pixel (should be identical — same data, different import path)
+        let map_contig = dst_contig.tensor().map().unwrap();
+        let map_multi = dst_multi.tensor().map().unwrap();
+        assert_pixels_match(map_contig.as_slice(), map_multi.as_slice(), 0);
+    }
+
+    /// Multiplane NV12 720p → packed RGB 640x640 with letterbox resize via GL.
+    /// Validates the packing shader works with multiplane EGLImage source.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_multiplane_nv12_to_rgb_letterbox_opengl() {
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+
+        let nv12_bytes: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/camera720p.nv12"
+        ));
+
+        let src_contiguous =
+            load_raw_image(1280, 720, NV12, Some(TensorMemory::Dma), nv12_bytes).unwrap();
+        let src_multiplane = load_multiplane_nv12_dma(1280, 720, nv12_bytes);
+
+        let crop = letterbox_crop(1280, 720, 640, 640);
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+
+        // Contiguous → packed RGB with letterbox
+        let mut dst_contig = TensorImage::new(640, 640, RGB, Some(TensorMemory::Dma)).unwrap();
+        gl.convert(
+            &src_contiguous,
+            &mut dst_contig,
+            Rotation::None,
+            Flip::None,
+            crop,
+        )
+        .unwrap();
+
+        // Multiplane → packed RGB with letterbox
+        let mut dst_multi = TensorImage::new(640, 640, RGB, Some(TensorMemory::Dma)).unwrap();
+        gl.convert(
+            &src_multiplane,
+            &mut dst_multi,
+            Rotation::None,
+            Flip::None,
+            crop,
+        )
+        .unwrap();
+
+        let map_contig = dst_contig.tensor().map().unwrap();
+        let map_multi = dst_multi.tensor().map().unwrap();
+        assert_pixels_match(map_contig.as_slice(), map_multi.as_slice(), 0);
+    }
+
+    /// Multiplane NV12 720p → packed RGB_INT8 640x640 with letterbox resize via GL.
+    /// Validates the int8 packing shader (XOR 0x80) works with multiplane source.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_multiplane_nv12_to_rgb_int8_letterbox_opengl() {
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+
+        let nv12_bytes: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/camera720p.nv12"
+        ));
+
+        let src_contiguous =
+            load_raw_image(1280, 720, NV12, Some(TensorMemory::Dma), nv12_bytes).unwrap();
+        let src_multiplane = load_multiplane_nv12_dma(1280, 720, nv12_bytes);
+
+        let crop = letterbox_crop(1280, 720, 640, 640);
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+
+        // Contiguous → packed RGB_INT8 with letterbox
+        let mut dst_contig = TensorImage::new(640, 640, RGB_INT8, Some(TensorMemory::Dma)).unwrap();
+        gl.convert(
+            &src_contiguous,
+            &mut dst_contig,
+            Rotation::None,
+            Flip::None,
+            crop,
+        )
+        .unwrap();
+
+        // Multiplane → packed RGB_INT8 with letterbox
+        let mut dst_multi = TensorImage::new(640, 640, RGB_INT8, Some(TensorMemory::Dma)).unwrap();
+        gl.convert(
+            &src_multiplane,
+            &mut dst_multi,
+            Rotation::None,
+            Flip::None,
+            crop,
+        )
+        .unwrap();
+
+        let map_contig = dst_contig.tensor().map().unwrap();
+        let map_multi = dst_multi.tensor().map().unwrap();
+        assert_pixels_match(map_contig.as_slice(), map_multi.as_slice(), 0);
+    }
+
+    /// Multiplane NV12 720p → packed RGB via direct RGB renderbuffer path.
+    /// Validates direct single-pass rendering with multiplane EGLImage source.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_multiplane_nv12_rgb_direct_opengl() {
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+        let mut gl = match GLProcessorST::new(None) {
+            Ok(gl) => gl,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                return;
+            }
+        };
+        if !gl.support_rgb_direct {
+            eprintln!("SKIPPED: {} - GPU does not support direct RGB", function!());
+            return;
+        }
+
+        let nv12_bytes: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/camera720p.nv12"
+        ));
+
+        let src_contiguous =
+            load_raw_image(1280, 720, NV12, Some(TensorMemory::Dma), nv12_bytes).unwrap();
+        let src_multiplane = load_multiplane_nv12_dma(1280, 720, nv12_bytes);
+
+        let crop = letterbox_crop(1280, 720, 640, 640);
+
+        // Contiguous → direct RGB
+        let mut dst_contig = TensorImage::new(640, 640, RGB, Some(TensorMemory::Dma)).unwrap();
+        gl.convert(
+            &src_contiguous,
+            &mut dst_contig,
+            Rotation::None,
+            Flip::None,
+            crop,
+        )
+        .unwrap();
+
+        // Multiplane → direct RGB
+        let mut dst_multi = TensorImage::new(640, 640, RGB, Some(TensorMemory::Dma)).unwrap();
+        gl.convert(
+            &src_multiplane,
+            &mut dst_multi,
+            Rotation::None,
+            Flip::None,
+            crop,
+        )
+        .unwrap();
+
+        let map_contig = dst_contig.tensor().map().unwrap();
+        let map_multi = dst_multi.tensor().map().unwrap();
+        assert_pixels_match(map_contig.as_slice(), map_multi.as_slice(), 0);
     }
 }

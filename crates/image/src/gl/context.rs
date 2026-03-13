@@ -232,7 +232,7 @@ impl GlContext {
         // goes through FBOs backed by EGLImages.
         egl.make_current(display.as_display(), None, None, Some(ctx))?;
 
-        let has_dma_extensions = Self::egl_check_support_dma(&egl).is_ok();
+        let has_dma_extensions = Self::egl_check_support_dma(&egl, display.as_display()).is_ok();
         let transfer_backend = if has_dma_extensions {
             TransferBackend::DmaBuf
         } else {
@@ -327,10 +327,13 @@ impl GlContext {
         Ok(EglDisplayType::PlatformDisplay(disp))
     }
 
-    fn egl_check_support_dma(egl: &Egl) -> Result<(), crate::Error> {
-        let extensions = egl.query_string(None, egl::EXTENSIONS)?;
+    fn egl_check_support_dma(egl: &Egl, display: egl::Display) -> Result<(), crate::Error> {
+        // Query **display** extensions (not client extensions) because
+        // EGL_EXT_image_dma_buf_import is a display extension on Mali and
+        // other GPUs — it does not appear in the client extension string.
+        let extensions = egl.query_string(Some(display), egl::EXTENSIONS)?;
         let extensions = extensions.to_string_lossy();
-        log::debug!("EGL Extensions: {}", extensions);
+        log::debug!("EGL Display Extensions (DMA check): {}", extensions);
 
         if !extensions.contains("EGL_EXT_image_dma_buf_import") {
             return Err(crate::Error::GLVersion(

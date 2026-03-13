@@ -26,8 +26,11 @@ pub(super) struct CachedEglImage {
 /// Uses a HashMap with a monotonic counter for LRU eviction: each access
 /// updates the entry's `last_used` timestamp, and eviction removes the entry
 /// with the smallest `last_used` value.
+/// Cache key: `(luma_id, chroma_id)`. For single-plane images, `chroma_id` is `None`.
+pub(super) type EglCacheKey = (u64, Option<u64>);
+
 pub(super) struct EglImageCache {
-    pub(super) entries: std::collections::HashMap<u64, CachedEglImage>,
+    pub(super) entries: std::collections::HashMap<EglCacheKey, CachedEglImage>,
     pub(super) capacity: usize,
     pub(super) hits: u64,
     pub(super) misses: u64,

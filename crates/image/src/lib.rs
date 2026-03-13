@@ -178,6 +178,8 @@ pub struct TensorImage {
     tensor: Tensor<u8>,
     fourcc: FourCharCode,
     is_planar: bool,
+    /// Second plane for multiplane NV12/NV16 (separate DMA-BUF allocation).
+    chroma: Option<Tensor<u8>>,
 }
 
 impl TensorImage {
@@ -216,6 +218,7 @@ impl TensorImage {
                 tensor,
                 fourcc,
                 is_planar,
+                chroma: None,
             });
         }
 
@@ -229,6 +232,7 @@ impl TensorImage {
                 tensor,
                 fourcc,
                 is_planar,
+                chroma: None,
             });
         }
 
@@ -240,6 +244,7 @@ impl TensorImage {
                 tensor,
                 fourcc,
                 is_planar,
+                chroma: None,
             });
         }
 
@@ -250,6 +255,7 @@ impl TensorImage {
             tensor,
             fourcc,
             is_planar,
+            chroma: None,
         })
     }
 
@@ -338,6 +344,7 @@ impl TensorImage {
                 tensor,
                 fourcc,
                 is_planar,
+                chroma: None,
             });
         }
 
@@ -363,7 +370,97 @@ impl TensorImage {
             tensor,
             fourcc,
             is_planar,
+            chroma: None,
         })
+    }
+
+    /// Creates a multiplane `TensorImage` from separate Y and UV DMA-BUF tensors.
+    ///
+    /// This constructor supports multi-planar NV12/NV16 formats where the Y (luma)
+    /// and UV (chroma) planes are in separate DMA-BUF allocations, each with its
+    /// own file descriptor. This is common with V4L2 decoders and ISPs on NXP i.MX
+    /// platforms that export `V4L2_PIX_FMT_NV12M`.
+    ///
+    /// # Arguments
+    ///
+    /// * `luma` - Y plane tensor with shape `[H, W]`
+    /// * `chroma` - UV plane tensor with shape `[H/2, W]` for NV12, `[H, W]` for NV16
+    /// * `fourcc` - Pixel format (`NV12` or `NV16`)
+    ///
+    /// # Returns
+    ///
+    /// A multiplane `TensorImage` where [`is_multiplane()`](Self::is_multiplane)
+    /// returns `true`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - `fourcc` is not `NV12` or `NV16`
+    /// - Luma shape is not 2D `[H, W]`
+    /// - Chroma shape does not match the expected dimensions for the format
+    pub fn from_planes(luma: Tensor<u8>, chroma: Tensor<u8>, fourcc: FourCharCode) -> Result<Self> {
+        if fourcc != NV12 && fourcc != NV16 {
+            return Err(Error::NotSupported(format!(
+                "from_planes() only supports NV12/NV16, got {}",
+                fourcc.to_string()
+            )));
+        }
+
+        let luma_shape = luma.shape();
+        if luma_shape.len() != 2 {
+            return Err(Error::InvalidShape(format!(
+                "Luma tensor must be 2D [H, W], got {}: {:?}",
+                luma_shape.len(),
+                luma_shape
+            )));
+        }
+        let height = luma_shape[0];
+        let width = luma_shape[1];
+
+        let chroma_shape = chroma.shape();
+        if chroma_shape.len() != 2 {
+            return Err(Error::InvalidShape(format!(
+                "Chroma tensor must be 2D, got {}: {:?}",
+                chroma_shape.len(),
+                chroma_shape
+            )));
+        }
+
+        let expected_chroma_h = if fourcc == NV12 { height / 2 } else { height };
+        if chroma_shape[0] != expected_chroma_h || chroma_shape[1] != width {
+            return Err(Error::InvalidShape(format!(
+                "Chroma shape {:?} does not match expected [{}, {}] for {} with luma [{}, {}]",
+                chroma_shape,
+                expected_chroma_h,
+                width,
+                fourcc.to_string(),
+                height,
+                width
+            )));
+        }
+
+        Ok(Self {
+            tensor: luma,
+            fourcc,
+            is_planar: true,
+            chroma: Some(chroma),
+        })
+    }
+
+    /// Returns whether this image uses separate plane allocations (true multiplane).
+    ///
+    /// When `true`, the luma (Y) and chroma (UV) planes are in separate tensors,
+    /// typically backed by different DMA-BUF file descriptors. Use
+    /// [`chroma_tensor()`](Self::chroma_tensor) to access the UV plane.
+    pub fn is_multiplane(&self) -> bool {
+        self.chroma.is_some()
+    }
+
+    /// Returns a reference to the chroma plane tensor for multiplane images.
+    ///
+    /// Returns `None` for single-buffer (contiguous) images.
+    pub fn chroma_tensor(&self) -> Option<&Tensor<u8>> {
+        self.chroma.as_ref()
     }
 
     /// Loads an image from the given byte slice, attempting to decode it as
@@ -732,6 +829,10 @@ impl TensorImage {
     /// # Ok(())
     /// # }
     pub fn height(&self) -> usize {
+        // Multiplane: luma tensor shape is [H, W] directly
+        if self.chroma.is_some() {
+            return self.tensor.shape()[0];
+        }
         // NV12 uses shape [H*3/2, W], so height = shape[0] * 2 / 3
         if self.fourcc == NV12 {
             return self.tensor.shape()[0] * 2 / 3;
@@ -814,6 +915,14 @@ pub trait TensorImageDst {
     fn row_stride(&self) -> usize;
     /// Returns the buffer identity of the underlying tensor.
     fn buffer_identity(&self) -> &edgefirst_tensor::BufferIdentity;
+    /// Returns whether this image uses separate plane allocations (true multiplane).
+    fn is_multiplane(&self) -> bool {
+        false
+    }
+    /// Returns a reference to the chroma plane tensor for multiplane images.
+    fn chroma_tensor(&self) -> Option<&Tensor<u8>> {
+        None
+    }
 }
 
 impl TensorImageDst for TensorImage {
@@ -851,6 +960,14 @@ impl TensorImageDst for TensorImage {
 
     fn buffer_identity(&self) -> &edgefirst_tensor::BufferIdentity {
         TensorImage::buffer_identity(self)
+    }
+
+    fn is_multiplane(&self) -> bool {
+        self.chroma.is_some()
+    }
+
+    fn chroma_tensor(&self) -> Option<&Tensor<u8>> {
+        self.chroma.as_ref()
     }
 }
 
@@ -1373,9 +1490,10 @@ pub struct ImageProcessorConfig {
 /// processor should prefer. When a specific backend is selected, the
 /// processor initializes that backend plus CPU as a fallback. When `Auto`
 /// is used, the existing environment-variable-driven selection applies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ComputeBackend {
     /// Auto-detect based on available hardware and environment variables.
+    #[default]
     Auto,
     /// CPU-only processing (no hardware acceleration).
     Cpu,
@@ -1383,12 +1501,6 @@ pub enum ComputeBackend {
     G2d,
     /// Prefer OpenGL ES (+ CPU fallback).
     OpenGl,
-}
-
-impl Default for ComputeBackend {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 /// Backend forced via the `EDGEFIRST_FORCE_BACKEND` environment variable
@@ -1766,6 +1878,12 @@ impl ImageProcessorTrait for ImageProcessor {
     ) -> Result<()> {
         let start = Instant::now();
 
+        if let Some(ref forced) = self.forced_backend {
+            log::trace!("ImageProcessor::convert: forced backend = {forced:?}");
+        } else {
+            log::trace!("ImageProcessor::convert: auto backend selection");
+        }
+
         // ── Forced backend: no fallback chain ────────────────────────
         if let Some(forced) = self.forced_backend {
             return match forced {
@@ -1803,7 +1921,7 @@ impl ImageProcessorTrait for ImageProcessor {
                     return Ok(());
                 }
                 Err(e) => {
-                    log::trace!("image didn't convert with g2d: {e:?}")
+                    log::warn!("G2D conversion failed, falling back: {e:?}")
                 }
             }
         }
@@ -1845,7 +1963,7 @@ impl ImageProcessorTrait for ImageProcessor {
                     return Ok(());
                 }
                 Err(e) => {
-                    log::trace!("image didn't convert with opengl: {e:?}")
+                    log::warn!("OpenGL conversion failed, falling back to CPU: {e:?}")
                 }
             }
         }
