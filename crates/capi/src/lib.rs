@@ -13,11 +13,13 @@
 mod decoder;
 mod error;
 mod image;
+mod log;
 mod tensor;
 mod tracker;
 
 pub use decoder::*;
 pub use error::*;
 pub use image::*;
+pub use log::*;
 pub use tensor::*;
 pub use tracker::*;

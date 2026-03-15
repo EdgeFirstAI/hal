@@ -1921,7 +1921,7 @@ impl ImageProcessorTrait for ImageProcessor {
                     return Ok(());
                 }
                 Err(e) => {
-                    log::warn!("G2D conversion failed, falling back: {e:?}")
+                    log::debug!("G2D conversion not supported, falling back: {e:?}")
                 }
             }
         }
@@ -1963,7 +1963,7 @@ impl ImageProcessorTrait for ImageProcessor {
                     return Ok(());
                 }
                 Err(e) => {
-                    log::warn!("OpenGL conversion failed, falling back to CPU: {e:?}")
+                    log::debug!("OpenGL conversion not supported, falling back to CPU: {e:?}")
                 }
             }
         }

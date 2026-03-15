@@ -85,7 +85,7 @@ These infrastructure benchmarks isolate the memory subsystem overhead from the c
 
 | Abbreviation | Format | Description |
 |-------------|--------|-------------|
-| **8BPS** | PLANAR_RGB | 3× separate float32 planes (R, G, B) |
+| **8BPS** | PLANAR_RGB | 3× separate uint8 planes (R, G, B) |
 | **8BPi** | PLANAR_RGB_INT8 | 3× separate uint8 planes (R, G, B) |
 | **RGBi** | RGB_INT8 | Packed RGB, uint8 per channel |
 
@@ -429,7 +429,7 @@ The hybrid path decodes masks on CPU (`materialize_segmentations`) then overlays
 
 ### Missing Format Coverage
 
-14. **No NV16 benchmarks** — NV16 (4:2:2 semi-planar) conversion is not yet implemented. Benchmarks show `NotSupported` errors.
+14. **No NV16 benchmarks** — NV16 (4:2:2 semi-planar) CPU conversion exists but G2D/GL paths and benchmarks are missing.
 
 ### Missing Scenarios
 
