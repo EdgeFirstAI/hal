@@ -584,7 +584,6 @@ dependencies = [
  "edgefirst-image",
  "edgefirst-tensor",
  "edgefirst-tracker",
- "env_logger",
  "errno",
  "four-char-code",
  "half",

@@ -1225,76 +1225,42 @@ with its own file descriptor:
 
 When GStreamer negotiates `video/x-raw(memory:DMABuf), format=DMA_DRM,
 drm-format=NV12`, the upstream element may deliver buffers with 2 `GstMemory`
-blocks (one per plane). The HAL cannot wrap these into a single `DmaTensor`
-because:
+blocks (one per plane).
 
-1. `DmaTensor` has only one `fd` field
-2. `from_fd()` takes one fd — there is no API for multi-fd construction
-3. The EGL import hardcodes `DMA_BUF_PLANE1_FD = fd` (same fd as plane 0)
-   with `DMA_BUF_PLANE1_OFFSET = W*H`, which is wrong when UV is in a
-   different allocation at offset 0
+### Multi-Plane Support (Implemented)
 
-### Current Workaround
+The HAL supports multi-plane DMA-BUF NV12/NV16 via a two-tensor approach
+rather than extending `DmaTensor` with multiple fds:
 
-The GStreamer `edgefirstcameraadaptor` element detects multi-plane buffers
-(`gst_buffer_n_memory() > 1`) and falls back to a CPU memory copy:
+**C API**: `hal_tensor_image_from_planes(y_fd, width, height, uv_fd, fourcc, out)`
+takes separate Y and UV file descriptors, wraps each into its own
+`Tensor<u8>` via `from_fd()`, and combines them with `TensorImage::from_planes()`.
 
-```
-multi-plane DMA-BUF → GstVideoFrame map (CPU) → memcpy → hal_tensor_image (contiguous)
-```
+**Image crate**: `TensorImage::from_planes(luma, chroma, fourcc)` stores the
+two tensors as separate planes inside the `TensorImage`, preserving their
+independent DMA-BUF allocations for zero-copy GPU import.
 
-This defeats the purpose of DMA-BUF zero-copy and adds ~2ms of latency on
-1080p NV12 frames. The fallback is logged as:
-
-```
-multi-plane DMA-BUF buffer (2 memories), using copy path
-```
-
-### What Works Today (Zero-Copy)
+**OpenGL path**: `create_image_from_dma2()` uses per-plane fds in EGL
+attributes (`DMA_BUF_PLANE0_FD → y_fd`, `DMA_BUF_PLANE1_FD → uv_fd`),
+each at offset 0.
 
 | Scenario | Zero-Copy | Notes |
 |----------|-----------|-------|
 | Single-fd NV12 DMA-BUF | Yes | V4L2 single-planar capture, HAL-allocated buffers |
 | Single-fd YUYV/RGB/RGBA DMA-BUF | Yes | Always single-plane |
 | System memory input | N/A | Copied into HAL tensor regardless |
-| Multi-fd NV12 (NM12) DMA-BUF | **No** | Falls back to CPU copy |
+| Multi-fd NV12/NV16 DMA-BUF | Yes | Via `hal_tensor_image_from_planes()` |
 
-### Required Changes for Multi-Plane Support
+### GStreamer Integration (External)
 
-To achieve true zero-copy with multi-planar formats, the following changes
-are needed across the HAL stack:
-
-**1. Tensor crate** (`crates/tensor/`):
-- `DmaTensor<T>`: Change `fd: OwnedFd` → `fds: Vec<OwnedFd>` with per-plane
-  offsets and sizes
-- `TensorTrait`: Add `from_fds(fds: Vec<OwnedFd>, offsets: &[usize], ...)` or
-  extend `from_fd()` to accept plane metadata
-- Backward compatibility: single-fd tensors become `fds.len() == 1`
-
-**2. Image crate** (`crates/image/`):
-- `TensorImage`: Add plane metadata (offset, stride per plane) alongside the
-  existing shape encoding
-- `create_image_from_dma2()`: Use per-plane fds in EGL attributes:
-  ```
-  DMA_BUF_PLANE0_FD → fds[0]
-  DMA_BUF_PLANE1_FD → fds[1]  (not fds[0] with offset)
-  ```
-- G2D backend: May need separate `g2d_surface` per plane
-
-**3. C API** (`crates/capi/`):
-- New function: `hal_tensor_from_fds(dtype, fds[], nfds, offsets[], strides[],
-  shape, ndim, name)` or extend `hal_tensor_image` to accept per-plane fd info
-- Existing `hal_tensor_from_fd()` remains for single-fd backward compatibility
-
-**4. GStreamer integration** (external):
-- `edgefirstcameraadaptor`: Extract per-plane fd via
-  `gst_dmabuf_memory_get_fd()` on each `GstMemory` block, pass plane fds to
-  HAL multi-fd API
-- Remove CPU copy fallback for multi-plane buffers
+The `edgefirstcameraadaptor` element detects multi-plane buffers
+(`gst_buffer_n_memory() > 1`) and extracts per-plane fds via
+`gst_dmabuf_memory_get_fd()` on each `GstMemory` block, passing them to
+`hal_tensor_image_from_planes()` for zero-copy import.
 
 ### Tracking
 
-This work is tracked under **EDGEAI-1107**.
+This work was implemented under **EDGEAI-1107**.
 
 ## Contributing
 

@@ -475,8 +475,11 @@ pub unsafe extern "C" fn hal_tensor_image_from_tensor(
 /// Create a multiplane tensor image from separate Y and UV DMA-BUF file descriptors.
 ///
 /// This is used for V4L2 multi-planar NV12 (`V4L2_PIX_FMT_NV12M`) where the
-/// Y and UV planes are in separate DMA-BUF allocations. The HAL takes ownership
-/// of both file descriptors on success; they remain owned by the caller on error.
+/// Y and UV planes are in separate DMA-BUF allocations.
+///
+/// **Ownership**: The HAL always takes ownership of both file descriptors,
+/// even on error. The caller must not close `y_fd` or `uv_fd` after calling
+/// this function. The two file descriptors must be distinct (`y_fd != uv_fd`).
 ///
 /// @param y_fd    DMA-BUF file descriptor for the Y (luma) plane
 /// @param width   Image width in pixels
@@ -499,6 +502,10 @@ pub unsafe extern "C" fn hal_tensor_image_from_planes(
 ) -> c_int {
     check_null!(out);
     if y_fd < 0 || uv_fd < 0 || width == 0 || height == 0 {
+        set_error(libc::EINVAL);
+        return -1;
+    }
+    if y_fd == uv_fd {
         set_error(libc::EINVAL);
         return -1;
     }
@@ -830,7 +837,6 @@ pub unsafe extern "C" fn hal_tensor_image_map_create(
 /// - ENOTSUP: No suitable image processing backend available
 #[no_mangle]
 pub unsafe extern "C" fn hal_image_processor_new() -> *mut HalImageProcessor {
-    let _ = env_logger::try_init();
     let processor = try_or_null!(ImageProcessor::new(), libc::ENOTSUP);
     Box::into_raw(Box::new(HalImageProcessor { inner: processor }))
 }
@@ -879,7 +885,9 @@ impl From<HalComputeBackend> for ComputeBackend {
 pub unsafe extern "C" fn hal_image_processor_new_with_backend(
     backend: HalComputeBackend,
 ) -> *mut HalImageProcessor {
-    let _ = env_logger::try_init();
+    // `needless_update` fires on macOS where `ImageProcessorConfig` has only
+    // `backend`, but on Linux the struct also has the cfg-gated `egl_display`.
+    #[allow(clippy::needless_update)]
     let config = ImageProcessorConfig {
         backend: backend.into(),
         ..Default::default()
