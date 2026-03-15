@@ -48,6 +48,9 @@ fn run_single_test(backend: ComputeBackend, config: &BenchConfig, result_fd: i32
     // Set alarm for GPU hang detection
     unsafe { libc::alarm(TIMEOUT_SECS) };
 
+    // `needless_update` fires on macOS where `ImageProcessorConfig` has only
+    // `backend`, but on Linux the struct also has the cfg-gated `egl_display`.
+    #[allow(clippy::needless_update)]
     let ipc_config = ImageProcessorConfig {
         backend,
         ..Default::default()
