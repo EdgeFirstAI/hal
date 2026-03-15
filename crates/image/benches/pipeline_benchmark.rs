@@ -285,9 +285,7 @@ fn bench_letterbox_pipeline(
     let formats: Vec<_> = all_formats
         .into_iter()
         .filter(|(inf, outf)| {
-            !(skip_nv12_planar
-                && *inf == NV12
-                && matches!(*outf, PLANAR_RGB | PLANAR_RGB_INT8))
+            !(skip_nv12_planar && *inf == NV12 && matches!(*outf, PLANAR_RGB | PLANAR_RGB_INT8))
         })
         .collect();
 
@@ -409,9 +407,8 @@ fn main() {
         // NV16 input
         BenchConfig::new(1920, 1080, 640, 640, NV16, RGBA),
     ];
-    let is_nv12_planar = |c: &BenchConfig| {
-        c.in_fmt == NV12 && matches!(c.out_fmt, PLANAR_RGB | PLANAR_RGB_INT8)
-    };
+    let is_nv12_planar =
+        |c: &BenchConfig| c.in_fmt == NV12 && matches!(c.out_fmt, PLANAR_RGB | PLANAR_RGB_INT8);
     let letterbox_configs: Vec<_> = letterbox_configs
         .into_iter()
         .filter(|c| c.in_w <= max_width)

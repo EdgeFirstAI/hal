@@ -36,7 +36,7 @@ const TIMEOUT_SECS: u32 = 30;
 fn median(times: &mut [Duration]) -> Duration {
     times.sort();
     let mid = times.len() / 2;
-    if times.len() % 2 == 0 {
+    if times.len().is_multiple_of(2) {
         (times[mid - 1] + times[mid]) / 2
     } else {
         times[mid]
@@ -44,11 +44,7 @@ fn median(times: &mut [Duration]) -> Duration {
 }
 
 /// Run a single test in the current process and write results to the given fd.
-fn run_single_test(
-    backend: ComputeBackend,
-    config: &BenchConfig,
-    result_fd: i32,
-) {
+fn run_single_test(backend: ComputeBackend, config: &BenchConfig, result_fd: i32) {
     // Set alarm for GPU hang detection
     unsafe { libc::alarm(TIMEOUT_SECS) };
 
@@ -111,7 +107,10 @@ fn run_single_test(
     for i in 0..10 {
         let start = Instant::now();
         if let Err(e) = proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop) {
-            write_result(result_fd, &format!("FAILED:iter_{i}:{e}:{single_ms:.1}:0:{}", i + 1));
+            write_result(
+                result_fd,
+                &format!("FAILED:iter_{i}:{e}:{single_ms:.1}:0:{}", i + 1),
+            );
             return;
         }
         times.push(start.elapsed());
@@ -127,7 +126,10 @@ fn run_single_test(
     } else {
         "OK"
     };
-    write_result(result_fd, &format!("{status}:{single_ms:.1}:{med_ms:.1}:11"));
+    write_result(
+        result_fd,
+        &format!("{status}:{single_ms:.1}:{med_ms:.1}:11"),
+    );
 }
 
 fn write_result(fd: i32, msg: &str) {
@@ -145,16 +147,25 @@ fn run_test_forked(
 ) -> (String, String, String, String, usize, String) {
     let name = format!(
         "letterbox/{}x{}/{}->{}/{}x{}",
-        config.in_w, config.in_h,
+        config.in_w,
+        config.in_h,
         format_name(config.in_fmt),
         format_name(config.out_fmt),
-        config.out_w, config.out_h,
+        config.out_w,
+        config.out_h,
     );
 
     // Create a pipe for result communication
     let mut pipe_fds = [0i32; 2];
     if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
-        return (name, backend_name.to_string(), "—".into(), "—".into(), 0, "FAILED: pipe".into());
+        return (
+            name,
+            backend_name.to_string(),
+            "—".into(),
+            "—".into(),
+            0,
+            "FAILED: pipe".into(),
+        );
     }
     let read_fd = pipe_fds[0];
     let write_fd = pipe_fds[1];
@@ -166,7 +177,14 @@ fn run_test_forked(
                 libc::close(read_fd);
                 libc::close(write_fd);
             }
-            (name, backend_name.to_string(), "—".into(), "—".into(), 0, "FAILED: fork".into())
+            (
+                name,
+                backend_name.to_string(),
+                "—".into(),
+                "—".into(),
+                0,
+                "FAILED: fork".into(),
+            )
         }
         0 => {
             // Child process
@@ -184,9 +202,7 @@ fn run_test_forked(
             let mut status: i32 = 0;
 
             loop {
-                let ret = unsafe {
-                    libc::waitpid(child_pid, &mut status, libc::WNOHANG)
-                };
+                let ret = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
                 if ret == child_pid {
                     break;
                 }
@@ -198,7 +214,14 @@ fn run_test_forked(
                     unsafe { libc::kill(child_pid, libc::SIGKILL) };
                     unsafe { libc::waitpid(child_pid, &mut status, 0) };
                     unsafe { libc::close(read_fd) };
-                    return (name, backend_name.to_string(), "—".into(), "—".into(), 0, "GPU_HANG (timeout)".into());
+                    return (
+                        name,
+                        backend_name.to_string(),
+                        "—".into(),
+                        "—".into(),
+                        0,
+                        "GPU_HANG (timeout)".into(),
+                    );
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -221,7 +244,14 @@ fn run_test_forked(
                     11 => "SIGSEGV (crash)",
                     _ => "unknown signal",
                 };
-                return (name, backend_name.to_string(), "—".into(), "—".into(), 0, format!("GPU_HANG: {sig_name}"));
+                return (
+                    name,
+                    backend_name.to_string(),
+                    "—".into(),
+                    "—".into(),
+                    0,
+                    format!("GPU_HANG: {sig_name}"),
+                );
             }
 
             // Parse result: STATUS:single_ms:med_ms:iters  or  FAILED:reason:detail:...
@@ -237,14 +267,28 @@ fn parse_result(
 ) -> (String, String, String, String, usize, String) {
     let parts: Vec<&str> = result.splitn(4, ':').collect();
     if parts.is_empty() {
-        return (name.to_string(), backend_name.to_string(), "—".into(), "—".into(), 0, "FAILED: no result".into());
+        return (
+            name.to_string(),
+            backend_name.to_string(),
+            "—".into(),
+            "—".into(),
+            0,
+            "FAILED: no result".into(),
+        );
     }
 
     let status = parts[0];
     if status == "FAILED" {
         let reason = parts.get(1).unwrap_or(&"unknown");
         let detail = parts.get(2).unwrap_or(&"");
-        return (name.to_string(), backend_name.to_string(), "—".into(), "—".into(), 0, format!("FAILED: {reason}: {detail}"));
+        return (
+            name.to_string(),
+            backend_name.to_string(),
+            "—".into(),
+            "—".into(),
+            0,
+            format!("FAILED: {reason}: {detail}"),
+        );
     }
 
     // OK/SLOW/TOO_SLOW:single_ms:med_ms:iters
@@ -254,7 +298,14 @@ fn parse_result(
     let iters: usize = iters_str.parse().unwrap_or(0);
     let med_display = if med == "0" { "—".to_string() } else { med };
 
-    (name.to_string(), backend_name.to_string(), single, med_display, iters, status.to_string())
+    (
+        name.to_string(),
+        backend_name.to_string(),
+        single,
+        med_display,
+        iters,
+        status.to_string(),
+    )
 }
 
 fn main() {
@@ -298,17 +349,20 @@ fn main() {
         (NV12, PLANAR_RGB),
     ];
     use four_char_code::FourCharCode;
-    let resolutions = [
-        (1920, 1080, "1080p"),
-        (1280, 720, "720p"),
-    ];
+    let resolutions = [(1920, 1080, "1080p"), (1280, 720, "720p")];
 
-    println!("=== Letterbox Sanity Check (forked, {}s timeout per test) ===", TIMEOUT_SECS);
-    println!("Date: {}", std::process::Command::new("date")
-        .arg("-Iseconds")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|_| "unknown".into()));
+    println!(
+        "=== Letterbox Sanity Check (forked, {}s timeout per test) ===",
+        TIMEOUT_SECS
+    );
+    println!(
+        "Date: {}",
+        std::process::Command::new("date")
+            .arg("-Iseconds")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|_| "unknown".into())
+    );
     println!();
 
     println!(
@@ -341,8 +395,14 @@ fn main() {
     let ok = all_results.iter().filter(|r| r.5 == "OK").count();
     let slow = all_results.iter().filter(|r| r.5 == "SLOW").count();
     let too_slow = all_results.iter().filter(|r| r.5 == "TOO_SLOW").count();
-    let hang = all_results.iter().filter(|r| r.5.starts_with("GPU_HANG")).count();
-    let failed = all_results.iter().filter(|r| r.5.starts_with("FAILED")).count();
+    let hang = all_results
+        .iter()
+        .filter(|r| r.5.starts_with("GPU_HANG"))
+        .count();
+    let failed = all_results
+        .iter()
+        .filter(|r| r.5.starts_with("FAILED"))
+        .count();
     let total = all_results.len();
     println!("Total: {total}  OK: {ok}  SLOW: {slow}  TOO_SLOW: {too_slow}  GPU_HANG: {hang}  FAILED: {failed}");
 
