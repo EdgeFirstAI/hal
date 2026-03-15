@@ -241,8 +241,22 @@ impl TryFrom<&TensorImage> for G2DSurface {
         // height)
         let base_addr = phys.address();
         let planes = if img.fourcc() == NV12 {
-            let uv_offset = (img.width() * img.height()) as u64;
-            [base_addr, base_addr + uv_offset, 0]
+            if img.is_multiplane() {
+                // Multiplane: UV in separate DMA-BUF, get its physical address
+                let uv_phys: G2DPhysical = match img.chroma_tensor().unwrap() {
+                    Tensor::Dma(t) => t.as_raw_fd(),
+                    _ => {
+                        return Err(Error::NotImplemented(
+                            "g2d multiplane chroma must be DMA-backed".to_string(),
+                        ));
+                    }
+                }
+                .try_into()?;
+                [base_addr, uv_phys.address(), 0]
+            } else {
+                let uv_offset = (img.width() * img.height()) as u64;
+                [base_addr, base_addr + uv_offset, 0]
+            }
         } else {
             [base_addr, 0, 0]
         };
@@ -282,8 +296,21 @@ impl TryFrom<&mut TensorImage> for G2DSurface {
         // NV12 is a two-plane format: Y plane followed by interleaved UV plane
         let base_addr = phys.address();
         let planes = if img.fourcc() == NV12 {
-            let uv_offset = (img.width() * img.height()) as u64;
-            [base_addr, base_addr + uv_offset, 0]
+            if img.is_multiplane() {
+                let uv_phys: G2DPhysical = match img.chroma_tensor().unwrap() {
+                    Tensor::Dma(t) => t.as_raw_fd(),
+                    _ => {
+                        return Err(Error::NotImplemented(
+                            "g2d multiplane chroma must be DMA-backed".to_string(),
+                        ));
+                    }
+                }
+                .try_into()?;
+                [base_addr, uv_phys.address(), 0]
+            } else {
+                let uv_offset = (img.width() * img.height()) as u64;
+                [base_addr, base_addr + uv_offset, 0]
+            }
         } else {
             [base_addr, 0, 0]
         };

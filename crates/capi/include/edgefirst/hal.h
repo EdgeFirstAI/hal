@@ -283,6 +283,30 @@ typedef enum hal_tensor_memory {
 } hal_tensor_memory;
 
 /**
+ * Compute backend selection for image processing.
+ *
+ * @see hal_image_processor_new_with_backend
+ */
+typedef enum hal_compute_backend {
+  /**
+   * Auto-detect based on hardware and environment variables.
+   */
+  HAL_COMPUTE_BACKEND_AUTO = 0,
+  /**
+   * CPU-only processing.
+   */
+  HAL_COMPUTE_BACKEND_CPU = 1,
+  /**
+   * Prefer G2D hardware blitter (with CPU fallback).
+   */
+  HAL_COMPUTE_BACKEND_G2D = 2,
+  /**
+   * Prefer OpenGL ES (with CPU fallback).
+   */
+  HAL_COMPUTE_BACKEND_OPENGL = 3,
+} hal_compute_backend;
+
+/**
  * Image rotation angles.
  */
 typedef enum hal_rotation {
@@ -321,6 +345,34 @@ typedef enum hal_flip {
    */
   HAL_FLIP_HORIZONTAL = 2,
 } hal_flip;
+
+/**
+ * Log severity level.
+ *
+ * Maps 1:1 to Rust `log::Level`.
+ */
+typedef enum hal_log_level {
+  /**
+   * Errors — unrecoverable or unexpected failures.
+   */
+  HAL_LOG_LEVEL_ERROR = 1,
+  /**
+   * Warnings — degraded but recoverable situations.
+   */
+  HAL_LOG_LEVEL_WARN = 2,
+  /**
+   * Informational messages.
+   */
+  HAL_LOG_LEVEL_INFO = 3,
+  /**
+   * Debug-level detail.
+   */
+  HAL_LOG_LEVEL_DEBUG = 4,
+  /**
+   * Fine-grained trace output.
+   */
+  HAL_LOG_LEVEL_TRACE = 5,
+} hal_log_level;
 
 /**
  * Data type of tensor elements.
@@ -571,6 +623,19 @@ typedef struct hal_crop {
    */
   bool has_dst_color;
 } hal_crop;
+
+/**
+ * Callback function type for log messages.
+ *
+ * @param level     Severity level of the message
+ * @param target    Module path that produced the message (null-terminated)
+ * @param message   Log message text (null-terminated)
+ * @param userdata  Opaque pointer passed to `hal_log_init_callback`
+ */
+typedef void (*hal_log_callback)(enum hal_log_level level,
+                                 const char *target,
+                                 const char *message,
+                                 void *userdata);
 
 /**
  * Track information for a tracked object.
@@ -1215,6 +1280,34 @@ struct hal_tensor_image *hal_tensor_image_from_tensor(struct hal_tensor *tensor,
                                                       enum hal_fourcc fourcc);
 
 /**
+ * Create a multiplane tensor image from separate Y and UV DMA-BUF file descriptors.
+ *
+ * This is used for V4L2 multi-planar NV12 (`V4L2_PIX_FMT_NV12M`) where the
+ * Y and UV planes are in separate DMA-BUF allocations.
+ *
+ * **Ownership**: The HAL always takes ownership of both file descriptors,
+ * even on error. The caller must not close `y_fd` or `uv_fd` after calling
+ * this function. The two file descriptors must be distinct (`y_fd != uv_fd`).
+ *
+ * @param y_fd    DMA-BUF file descriptor for the Y (luma) plane
+ * @param width   Image width in pixels
+ * @param height  Image height in pixels
+ * @param uv_fd   DMA-BUF file descriptor for the UV (chroma) plane
+ * @param fourcc  Pixel format (must be HAL_FOURCC_NV12 or HAL_FOURCC_NV16)
+ * @param out     Receives the new tensor image handle on success
+ * @return 0 on success, -1 on error (errno set)
+ * @par Errors (errno):
+ * - EINVAL: Invalid argument or unsupported fourcc
+ * - EIO:    Failed to wrap DMA-BUF file descriptor
+ */
+int hal_tensor_image_from_planes(int y_fd,
+                                 uint32_t width,
+                                 uint32_t height,
+                                 int uv_fd,
+                                 enum hal_fourcc fourcc,
+                                 struct hal_tensor_image **out);
+
+/**
  * Load a JPEG image from memory.
  *
  * @param data Pointer to JPEG data
@@ -1386,6 +1479,22 @@ struct hal_tensor_map *hal_tensor_image_map_create(const struct hal_tensor_image
 struct hal_image_processor *hal_image_processor_new(void);
 
 /**
+ * Create a new image processor with a specific compute backend.
+ *
+ * When `backend` is not `HAL_COMPUTE_BACKEND_AUTO`, the processor
+ * initializes the requested backend plus CPU as a fallback chain.
+ * Environment variables (`EDGEFIRST_FORCE_BACKEND`, `EDGEFIRST_DISABLE_*`)
+ * are ignored in this case.
+ *
+ * @param backend Preferred compute backend
+ * @return New image processor handle on success, NULL on error
+ * @par Errors (errno):
+ * - ENOMEM: Memory allocation failed
+ * - ENOTSUP: No suitable image processing backend available
+ */
+struct hal_image_processor *hal_image_processor_new_with_backend(enum hal_compute_backend backend);
+
+/**
  * Convert an image to a different format/size.
  *
  * Performs format conversion, scaling, rotation, flip, and crop operations.
@@ -1501,6 +1610,62 @@ struct hal_tensor_image *hal_image_processor_create_image(struct hal_image_proce
  * @param processor Image processor handle to free (can be NULL, no-op)
  */
 void hal_image_processor_free(struct hal_image_processor *processor);
+
+/**
+ * Initialise HAL logging to a `FILE*` stream.
+ *
+ * Writes `[LEVEL] target: message` lines to the given stream, typically
+ * `stderr`. Only the first successful call takes effect; subsequent calls
+ * return `-1` with `errno = EALREADY`.
+ *
+ * **Thread safety**: The `stream` must remain valid for the lifetime of the
+ * process. On glibc/musl, `stderr` and other standard streams are internally
+ * locked per-call, so individual lines will not be corrupted. However, two
+ * log lines from different threads may interleave. If fully ordered output
+ * is required, use `hal_log_init_callback` with an application-side lock.
+ *
+ * @param stream     Open `FILE*` to write log output to (e.g. `stderr`)
+ * @param max_level  Maximum log level to emit (messages above this are dropped)
+ * @return 0 on success, -1 on error
+ * @par Errors (errno):
+ * - EINVAL:  `stream` is NULL
+ * - EALREADY: logging has already been initialised
+ *
+ * @par Example
+ * @code{.c}
+ * hal_log_init_file(stderr, HAL_LOG_LEVEL_DEBUG);
+ * @endcode
+ */
+int hal_log_init_file(FILE *stream, enum hal_log_level max_level);
+
+/**
+ * Initialise HAL logging with a user-provided callback.
+ *
+ * Each log record is forwarded to `cb` with the level, target module name,
+ * formatted message, and the opaque `userdata` pointer. This allows routing
+ * HAL log output into GStreamer, syslog, or any other logging framework.
+ *
+ * Only the first successful call takes effect; subsequent calls return `-1`
+ * with `errno = EALREADY`.
+ *
+ * @param cb         Callback function invoked for each log message
+ * @param userdata   Opaque pointer forwarded to the callback (may be NULL)
+ * @param max_level  Maximum log level to emit
+ * @return 0 on success, -1 on error
+ * @par Errors (errno):
+ * - EINVAL:  `cb` is NULL
+ * - EALREADY: logging has already been initialised
+ *
+ * @par Example
+ * @code{.c}
+ * void my_logger(hal_log_level level, const char* target,
+ *                const char* message, void* userdata) {
+ *     fprintf(stderr, "[%d] %s: %s\n", level, target, message);
+ * }
+ * hal_log_init_callback(my_logger, NULL, HAL_LOG_LEVEL_TRACE);
+ * @endcode
+ */
+int hal_log_init_callback(hal_log_callback cb, void *userdata, enum hal_log_level max_level);
 
 /**
  * Check if DMA (Direct Memory Access) buffer allocation is available.

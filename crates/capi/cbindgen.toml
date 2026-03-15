@@ -86,6 +86,9 @@ item_types = ["enums", "structs", "unions", "typedefs", "opaque", "functions", "
 "HalByteTrack" = "hal_bytetrack"
 "HalTrackInfoList" = "hal_track_info_list"
 "HalTensorMap" = "hal_tensor_map"
+"HalComputeBackend" = "hal_compute_backend"
+"HalLogLevel" = "hal_log_level"
+"HalLogCallback" = "hal_log_callback"
 
 [enum]
 rename_variants = "ScreamingSnakeCase"
