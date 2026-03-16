@@ -509,6 +509,7 @@ where
     impl_yolo_split_segdet_process_masks(boxes, mask_coeff, protos, output_boxes, output_masks)
 }
 
+#[allow(clippy::type_complexity)]
 pub(crate) fn postprocess_yolo_end_to_end_segdet<'a, T>(
     output: &'a ArrayView2<'_, T>,
     num_protos: usize,
@@ -545,6 +546,7 @@ pub(crate) fn postprocess_yolo_end_to_end_segdet<'a, T>(
     Ok((boxes, scores, classes, mask_coeff))
 }
 
+#[allow(clippy::type_complexity)]
 pub(crate) fn postprocess_yolo_split_end_to_end_segdet<
     'a,
     'b,
@@ -1369,15 +1371,6 @@ pub(crate) fn postprocess_yolo_seg<'a, T>(
     let scores_tensor = output.slice(s![4..(num_classes + 4), ..,]).reversed_axes();
     let mask_tensor = output.slice(s![(num_classes + 4).., ..,]).reversed_axes();
     (boxes_tensor, scores_tensor, mask_tensor)
-}
-
-pub(crate) fn postprocess_yolo_split_det<'a, 'b, BOX, SCORE>(
-    boxes_tensor: ArrayView2<'a, BOX>,
-    scores_tensor: ArrayView2<'b, SCORE>,
-) -> (ArrayView2<'a, BOX>, ArrayView2<'b, SCORE>) {
-    let boxes_tensor = boxes_tensor.reversed_axes();
-    let scores_tensor = scores_tensor.reversed_axes();
-    (boxes_tensor, scores_tensor)
 }
 
 pub(crate) fn postprocess_yolo_split_segdet<'a, 'b, 'c, BOX, SCORE, MASK>(
