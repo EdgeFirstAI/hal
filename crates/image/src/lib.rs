@@ -417,6 +417,12 @@ impl TensorImage {
         let height = luma_shape[0];
         let width = luma_shape[1];
 
+        if fourcc == NV12 && height % 2 != 0 {
+            return Err(Error::InvalidShape(format!(
+                "NV12 requires even height, got {height}"
+            )));
+        }
+
         let chroma_shape = chroma.shape();
         if chroma_shape.len() != 2 {
             return Err(Error::InvalidShape(format!(

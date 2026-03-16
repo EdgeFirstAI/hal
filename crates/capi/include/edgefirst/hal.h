@@ -1285,9 +1285,11 @@ struct hal_tensor_image *hal_tensor_image_from_tensor(struct hal_tensor *tensor,
  * This is used for V4L2 multi-planar NV12 (`V4L2_PIX_FMT_NV12M`) where the
  * Y and UV planes are in separate DMA-BUF allocations.
  *
- * **Ownership**: The HAL always takes ownership of both file descriptors,
- * even on error. The caller must not close `y_fd` or `uv_fd` after calling
- * this function. The two file descriptors must be distinct (`y_fd != uv_fd`).
+ * **Ownership**: Ownership is transferred once the function validates that
+ * both FDs are non-negative, non-zero dimensions, and distinct. After that
+ * point, the HAL closes them on any error. If validation of the FD values
+ * themselves fails (negative FD, zero dimensions, or `y_fd == uv_fd`), the
+ * caller retains ownership.
  *
  * @param y_fd    DMA-BUF file descriptor for the Y (luma) plane
  * @param width   Image width in pixels
