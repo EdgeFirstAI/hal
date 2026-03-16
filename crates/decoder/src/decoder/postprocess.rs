@@ -1498,11 +1498,11 @@ impl edgefirst_tracker::DetectionBox for DetectBox {
 use edgefirst_tracker::TrackInfo;
 
 #[cfg(feature = "tracker")]
-pub trait DecoderTracker: edgefirst_tracker::Tracker<DetectBox> {}
-
-#[cfg(feature = "tracker")]
 impl Decoder {
-    pub(super) fn decode_tracked_modelpack_det_quantized<TR: DecoderTracker>(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn decode_tracked_modelpack_det_quantized<
+        TR: edgefirst_tracker::Tracker<DetectBox>,
+    >(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -1546,7 +1546,9 @@ impl Decoder {
         Ok(())
     }
 
-    pub(super) fn decode_tracked_modelpack_det_split_quantized<TR: DecoderTracker>(
+    pub(super) fn decode_tracked_modelpack_det_split_quantized<
+        TR: edgefirst_tracker::Tracker<DetectBox>,
+    >(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -1604,7 +1606,7 @@ impl Decoder {
         Ok(())
     }
 
-    pub(super) fn decode_tracked_yolo_det_quantized<TR: DecoderTracker>(
+    pub(super) fn decode_tracked_yolo_det_quantized<TR: edgefirst_tracker::Tracker<DetectBox>>(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -1635,7 +1637,10 @@ impl Decoder {
         Ok(())
     }
 
-    pub(super) fn decode_tracked_yolo_segdet_quantized<TR: DecoderTracker>(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn decode_tracked_yolo_segdet_quantized<
+        TR: edgefirst_tracker::Tracker<DetectBox>,
+    >(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -1646,6 +1651,7 @@ impl Decoder {
         output_masks: &mut Vec<Segmentation>,
         output_tracks: &mut Vec<TrackInfo>,
     ) -> Result<(), DecoderError> {
+        log::info!("decode_tracked_yolo_segdet_quantized");
         let (boxes_tensor, ind) =
             Self::find_outputs_with_shape_quantized(&boxes.shape, outputs, &[])?;
         let (protos_tensor, _) =
@@ -1698,7 +1704,10 @@ impl Decoder {
         Ok(())
     }
 
-    pub(super) fn decode_tracked_yolo_split_det_quantized<TR: DecoderTracker>(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn decode_tracked_yolo_split_det_quantized<
+        TR: edgefirst_tracker::Tracker<DetectBox>,
+    >(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -1744,7 +1753,9 @@ impl Decoder {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn decode_tracked_yolo_split_segdet_quantized<TR: DecoderTracker>(
+    pub(super) fn decode_tracked_yolo_split_segdet_quantized<
+        TR: edgefirst_tracker::Tracker<DetectBox>,
+    >(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -1833,7 +1844,10 @@ impl Decoder {
         Ok(())
     }
 
-    pub(super) fn decode_tracked_modelpack_det_split_float<TR: DecoderTracker, D>(
+    pub(super) fn decode_tracked_modelpack_det_split_float<
+        TR: edgefirst_tracker::Tracker<DetectBox>,
+        D,
+    >(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -1875,7 +1889,8 @@ impl Decoder {
         Ok(())
     }
 
-    pub(super) fn decode_tracked_modelpack_det_float<TR: DecoderTracker, T>(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn decode_tracked_modelpack_det_float<TR: edgefirst_tracker::Tracker<DetectBox>, T>(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -1909,7 +1924,7 @@ impl Decoder {
         Ok(())
     }
 
-    pub(super) fn decode_tracked_yolo_det_float<TR: DecoderTracker, T>(
+    pub(super) fn decode_tracked_yolo_det_float<TR: edgefirst_tracker::Tracker<DetectBox>, T>(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -1938,7 +1953,7 @@ impl Decoder {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn decode_tracked_yolo_segdet_float<TR: DecoderTracker, T>(
+    pub(super) fn decode_tracked_yolo_segdet_float<TR: edgefirst_tracker::Tracker<DetectBox>, T>(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -1993,7 +2008,11 @@ impl Decoder {
         Ok(())
     }
 
-    pub(super) fn decode_tracked_yolo_split_det_float<TR: DecoderTracker, T>(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn decode_tracked_yolo_split_det_float<
+        TR: edgefirst_tracker::Tracker<DetectBox>,
+        T,
+    >(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -2029,7 +2048,10 @@ impl Decoder {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn decode_tracked_yolo_split_segdet_float<TR: DecoderTracker, T>(
+    pub(super) fn decode_tracked_yolo_split_segdet_float<
+        TR: edgefirst_tracker::Tracker<DetectBox>,
+        T,
+    >(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -2104,7 +2126,10 @@ impl Decoder {
     /// Input shape: (1, N, 6+) where columns are [x1, y1, x2, y2, conf, class,
     /// ...] Boxes are output directly from model (may be normalized or
     /// pixel coords depending on config).
-    pub(super) fn decode_tracked_yolo_end_to_end_det_float<TR: DecoderTracker, T>(
+    pub(super) fn decode_tracked_yolo_end_to_end_det_float<
+        TR: edgefirst_tracker::Tracker<DetectBox>,
+        T,
+    >(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -2137,7 +2162,11 @@ impl Decoder {
     /// - detection: (1, N, 6 + num_protos) where columns are [x1, y1, x2, y2,
     ///   conf, class, mask_coeff_0, ..., mask_coeff_31]
     /// - protos: (1, proto_height, proto_width, num_protos)
-    pub(super) fn decode_tracked_yolo_end_to_end_segdet_float<TR: DecoderTracker, T>(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn decode_tracked_yolo_end_to_end_segdet_float<
+        TR: edgefirst_tracker::Tracker<DetectBox>,
+        T,
+    >(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -2203,7 +2232,9 @@ impl Decoder {
 
     /// Decodes monolithic end-to-end YOLO detection from quantized tensors.
     /// Dequantizes then delegates to the float decode path.
-    pub(super) fn decode_tracked_yolo_end_to_end_det_quantized<TR: DecoderTracker>(
+    pub(super) fn decode_tracked_yolo_end_to_end_det_quantized<
+        TR: edgefirst_tracker::Tracker<DetectBox>,
+    >(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -2238,7 +2269,9 @@ impl Decoder {
 
     /// Decodes monolithic end-to-end YOLO seg detection from quantized tensors.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn decode_tracked_yolo_end_to_end_segdet_quantized<TR: DecoderTracker>(
+    pub(super) fn decode_tracked_yolo_end_to_end_segdet_quantized<
+        TR: edgefirst_tracker::Tracker<DetectBox>,
+    >(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -2337,7 +2370,11 @@ impl Decoder {
     }
 
     /// Decodes split end-to-end YOLO detection from float tensors.
-    pub(super) fn decode_tracked_yolo_split_end_to_end_det_float<TR: DecoderTracker, T>(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn decode_tracked_yolo_split_end_to_end_det_float<
+        TR: edgefirst_tracker::Tracker<DetectBox>,
+        T,
+    >(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -2383,7 +2420,10 @@ impl Decoder {
 
     /// Decodes split end-to-end YOLO seg detection from float tensors.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn decode_tracked_yolo_split_end_to_end_segdet_float<TR: DecoderTracker, T>(
+    pub(super) fn decode_tracked_yolo_split_end_to_end_segdet_float<
+        TR: edgefirst_tracker::Tracker<DetectBox>,
+        T,
+    >(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -2470,7 +2510,10 @@ impl Decoder {
 
     /// Decodes split end-to-end YOLO detection from quantized tensors.
     /// Dequantizes each tensor then delegates to the float decode path.
-    pub(super) fn decode_tracked_yolo_split_end_to_end_det_quantized<TR: DecoderTracker>(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn decode_tracked_yolo_split_end_to_end_det_quantized<
+        TR: edgefirst_tracker::Tracker<DetectBox>,
+    >(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -2536,7 +2579,9 @@ impl Decoder {
 
     /// Decodes split end-to-end YOLO seg detection from quantized tensors.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn decode_tracked_yolo_split_end_to_end_segdet_quantized<TR: DecoderTracker>(
+    pub(super) fn decode_tracked_yolo_split_end_to_end_segdet_quantized<
+        TR: edgefirst_tracker::Tracker<DetectBox>,
+    >(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -2663,8 +2708,10 @@ impl Decoder {
     // ------------------------------------------------------------------
     // Proto-extraction private helpers (mirror the non-proto variants)
     // ------------------------------------------------------------------
-
-    pub(super) fn decode_tracked_yolo_segdet_quantized_proto<TR: DecoderTracker>(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn decode_tracked_yolo_segdet_quantized_proto<
+        TR: edgefirst_tracker::Tracker<DetectBox>,
+    >(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -2741,8 +2788,11 @@ impl Decoder {
 
         Ok(proto)
     }
-
-    pub(super) fn decode_tracked_yolo_segdet_float_proto<TR: DecoderTracker, T>(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn decode_tracked_yolo_segdet_float_proto<
+        TR: edgefirst_tracker::Tracker<DetectBox>,
+        T,
+    >(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -2789,7 +2839,9 @@ impl Decoder {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn decode_tracked_yolo_split_segdet_quantized_proto<TR: DecoderTracker>(
+    pub(super) fn decode_tracked_yolo_split_segdet_quantized_proto<
+        TR: edgefirst_tracker::Tracker<DetectBox>,
+    >(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -2885,7 +2937,10 @@ impl Decoder {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn decode_tracked_yolo_split_segdet_float_proto<TR: DecoderTracker, T>(
+    pub(super) fn decode_tracked_yolo_split_segdet_float_proto<
+        TR: edgefirst_tracker::Tracker<DetectBox>,
+        T,
+    >(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -2945,8 +3000,11 @@ impl Decoder {
         output_boxes.extend(old_boxes);
         Ok(protos)
     }
-
-    pub(super) fn decode_tracked_yolo_end_to_end_segdet_float_proto<TR: DecoderTracker, T>(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn decode_tracked_yolo_end_to_end_segdet_float_proto<
+        TR: edgefirst_tracker::Tracker<DetectBox>,
+        T,
+    >(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -3004,7 +3062,10 @@ impl Decoder {
         Ok(protos)
     }
 
-    pub(super) fn decode_tracked_yolo_end_to_end_segdet_quantized_proto<TR: DecoderTracker>(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn decode_tracked_yolo_end_to_end_segdet_quantized_proto<
+        TR: edgefirst_tracker::Tracker<DetectBox>,
+    >(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -3089,7 +3150,10 @@ impl Decoder {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn decode_tracked_yolo_split_end_to_end_segdet_float_proto<TR: DecoderTracker, T>(
+    pub(super) fn decode_tracked_yolo_split_end_to_end_segdet_float_proto<
+        TR: edgefirst_tracker::Tracker<DetectBox>,
+        T,
+    >(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -3169,7 +3233,7 @@ impl Decoder {
 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn decode_tracked_yolo_split_end_to_end_segdet_quantized_proto<
-        TR: DecoderTracker,
+        TR: edgefirst_tracker::Tracker<DetectBox>,
     >(
         &self,
         tracker: &mut TR,
@@ -3283,7 +3347,7 @@ impl Decoder {
         Ok(protos)
     }
 
-    fn update_tracker_yolo_segdet<TR: DecoderTracker>(
+    fn update_tracker_yolo_segdet<TR: edgefirst_tracker::Tracker<DetectBox>>(
         tracker: &mut TR,
         timestamp: u64,
         boxes: Vec<(DetectBox, usize)>,
@@ -3329,7 +3393,7 @@ impl Decoder {
         (live_boxes, old_boxes)
     }
 
-    fn update_tracker<TR: DecoderTracker>(
+    fn update_tracker<TR: edgefirst_tracker::Tracker<DetectBox>>(
         tracker: &mut TR,
         timestamp: u64,
         output_boxes: &mut Vec<DetectBox>,

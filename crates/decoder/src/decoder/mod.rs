@@ -4,8 +4,6 @@
 use ndarray::{ArrayView, ArrayViewD, Dimension};
 use num_traits::{AsPrimitive, Float};
 
-#[cfg(feature = "tracker")]
-use crate::decoder::postprocess::DecoderTracker;
 use crate::{DecoderError, DetectBox, ProtoData, Segmentation};
 
 pub mod config;
@@ -739,7 +737,7 @@ impl Decoder {
     /// #    Ok(())
     /// # }
     /// ```
-    pub fn decode_tracked_quantized<TR: DecoderTracker>(
+    pub fn decode_tracked_quantized<TR: edgefirst_tracker::Tracker<DetectBox>>(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -772,37 +770,74 @@ impl Decoder {
                 detection,
                 segmentation,
             } => {
-                self.decode_modelpack_det_split_quantized(outputs, detection, output_boxes)?;
+                self.decode_tracked_modelpack_det_split_quantized(
+                    tracker,
+                    timestamp,
+                    outputs,
+                    detection,
+                    output_boxes,
+                    output_tracks,
+                )?;
                 self.decode_modelpack_seg_quantized(outputs, segmentation, output_masks)
             }
-            ModelType::ModelPackDet { boxes, scores } => {
-                self.decode_modelpack_det_quantized(outputs, boxes, scores, output_boxes)
-            }
-            ModelType::ModelPackDetSplit { detection } => {
-                self.decode_modelpack_det_split_quantized(outputs, detection, output_boxes)
-            }
+            ModelType::ModelPackDet { boxes, scores } => self
+                .decode_tracked_modelpack_det_quantized(
+                    tracker,
+                    timestamp,
+                    outputs,
+                    boxes,
+                    scores,
+                    output_boxes,
+                    output_tracks,
+                ),
+            ModelType::ModelPackDetSplit { detection } => self
+                .decode_tracked_modelpack_det_split_quantized(
+                    tracker,
+                    timestamp,
+                    outputs,
+                    detection,
+                    output_boxes,
+                    output_tracks,
+                ),
             ModelType::ModelPackSeg { segmentation } => {
                 self.decode_modelpack_seg_quantized(outputs, segmentation, output_masks)
             }
-            ModelType::YoloDet { boxes } => {
-                self.decode_yolo_det_quantized(outputs, boxes, output_boxes)
-            }
-            ModelType::YoloSegDet { boxes, protos } => self.decode_yolo_segdet_quantized(
+            ModelType::YoloDet { boxes } => self.decode_tracked_yolo_det_quantized(
+                tracker,
+                timestamp,
+                outputs,
+                boxes,
+                output_boxes,
+                output_tracks,
+            ),
+            ModelType::YoloSegDet { boxes, protos } => self.decode_tracked_yolo_segdet_quantized(
+                tracker,
+                timestamp,
                 outputs,
                 boxes,
                 protos,
                 output_boxes,
                 output_masks,
+                output_tracks,
             ),
-            ModelType::YoloSplitDet { boxes, scores } => {
-                self.decode_yolo_split_det_quantized(outputs, boxes, scores, output_boxes)
-            }
+            ModelType::YoloSplitDet { boxes, scores } => self
+                .decode_tracked_yolo_split_det_quantized(
+                    tracker,
+                    timestamp,
+                    outputs,
+                    boxes,
+                    scores,
+                    output_boxes,
+                    output_tracks,
+                ),
             ModelType::YoloSplitSegDet {
                 boxes,
                 scores,
                 mask_coeff,
                 protos,
-            } => self.decode_yolo_split_segdet_quantized(
+            } => self.decode_tracked_yolo_split_segdet_quantized(
+                tracker,
+                timestamp,
                 outputs,
                 boxes,
                 scores,
@@ -810,28 +845,41 @@ impl Decoder {
                 protos,
                 output_boxes,
                 output_masks,
+                output_tracks,
             ),
-            ModelType::YoloEndToEndDet { boxes } => {
-                self.decode_yolo_end_to_end_det_quantized(outputs, boxes, output_boxes)
-            }
+            ModelType::YoloEndToEndDet { boxes } => self
+                .decode_tracked_yolo_end_to_end_det_quantized(
+                    tracker,
+                    timestamp,
+                    outputs,
+                    boxes,
+                    output_boxes,
+                    output_tracks,
+                ),
             ModelType::YoloEndToEndSegDet { boxes, protos } => self
-                .decode_yolo_end_to_end_segdet_quantized(
+                .decode_tracked_yolo_end_to_end_segdet_quantized(
+                    tracker,
+                    timestamp,
                     outputs,
                     boxes,
                     protos,
                     output_boxes,
                     output_masks,
+                    output_tracks,
                 ),
             ModelType::YoloSplitEndToEndDet {
                 boxes,
                 scores,
                 classes,
-            } => self.decode_yolo_split_end_to_end_det_quantized(
+            } => self.decode_tracked_yolo_split_end_to_end_det_quantized(
+                tracker,
+                timestamp,
                 outputs,
                 boxes,
                 scores,
                 classes,
                 output_boxes,
+                output_tracks,
             ),
             ModelType::YoloSplitEndToEndSegDet {
                 boxes,
@@ -839,7 +887,9 @@ impl Decoder {
                 classes,
                 mask_coeff,
                 protos,
-            } => self.decode_yolo_split_end_to_end_segdet_quantized(
+            } => self.decode_tracked_yolo_split_end_to_end_segdet_quantized(
+                tracker,
+                timestamp,
                 outputs,
                 boxes,
                 scores,
@@ -848,6 +898,7 @@ impl Decoder {
                 protos,
                 output_boxes,
                 output_masks,
+                output_tracks,
             ),
         }
     }
@@ -908,7 +959,7 @@ impl Decoder {
     ///
     /// #    Ok(())
     /// # }
-    pub fn decode_tracked_float<TR: DecoderTracker, T>(
+    pub fn decode_tracked_float<TR: edgefirst_tracker::Tracker<DetectBox>, T>(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -1100,7 +1151,7 @@ impl Decoder {
     /// Returns `Ok(None)` for detection-only and ModelPack models (use
     /// `decode_quantized` for those). Returns `Ok(Some(ProtoData))` for
     /// YOLO segmentation models.
-    pub fn decode_tracked_quantized_proto<TR: DecoderTracker>(
+    pub fn decode_tracked_quantized_proto<TR: edgefirst_tracker::Tracker<DetectBox>>(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -1194,7 +1245,7 @@ impl Decoder {
     ///
     /// Returns `Ok(None)` for detection-only and ModelPack models. Returns
     /// `Ok(Some(ProtoData))` for YOLO segmentation models.
-    pub fn decode_tracked_float_proto<TR: DecoderTracker, T>(
+    pub fn decode_tracked_float_proto<TR: edgefirst_tracker::Tracker<DetectBox>, T>(
         &self,
         tracker: &mut TR,
         timestamp: u64,
