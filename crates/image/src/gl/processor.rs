@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use edgefirst_decoder::{DetectBox, ProtoData, ProtoTensor, Segmentation};
-use edgefirst_tensor::{TensorMemory, TensorTrait};
+use edgefirst_tensor::{TensorMapTrait, TensorMemory, TensorTrait};
 use gbm::drm::buffer::DrmFourcc;
 use khronos_egl::{self as egl, Attrib};
 use std::collections::BTreeSet;
@@ -15,7 +15,7 @@ use std::time::Instant;
 use super::cache::CachedEglImage;
 use super::EglDisplayKind;
 
-use super::cache::{CacheKind, EglImageCache};
+use super::cache::{CacheKind, EglCacheKey, EglImageCache};
 use super::context::{egl_ext, GlContext};
 use super::resources::{Buffer, EglImage, FrameBuffer, GlProgram, Texture};
 use super::shaders::*;
@@ -71,6 +71,16 @@ pub struct GLProcessorST {
     src_egl_cache: EglImageCache,
     /// EGLImage cache for destination DMA buffers.
     dst_egl_cache: EglImageCache,
+    /// Currently bound EGLImage key on render_texture (dst side).
+    /// Skip glEGLImageTargetTexture2DOES when unchanged.
+    last_bound_dst_egl: Option<EglCacheKey>,
+    /// Currently bound EGLImage key on camera_eglimage_texture (src side).
+    last_bound_src_egl: Option<EglCacheKey>,
+    /// Whether the BGRA byte-swap workaround warning has been logged.
+    bgra_warned: bool,
+    /// Whether the GPU is a Verisilicon/Vivante core (detected via GL_RENDERER).
+    /// Used to block operations known to cause unrecoverable GPU hangs.
+    is_vivante: bool,
     /// Intermediate RGBA texture for two-pass packed RGB conversion.
     /// Pass 1 renders YUYV/NV12→RGBA here; Pass 2 packs RGBA→RGB to DMA dest.
     packed_rgb_intermediate_tex: Texture,
@@ -137,6 +147,33 @@ impl ImageProcessorTrait for GLProcessorST {
                 dst.fourcc().display()
             )));
         }
+
+        // BLOCKED: NV12 source + planar RGB destination causes an unrecoverable
+        // GPU hang on the Verisilicon/Vivante GC7000UL (i.MX 8M Plus, galcore 6.4.11).
+        //
+        // When this combination is submitted to the GPU, the hardware command
+        // processor stalls permanently. The calling process enters kernel
+        // uninterruptible sleep (Ds state) and cannot be killed — even SIGKILL
+        // is ignored. The galcore driver state is corrupted system-wide: all
+        // subsequent GPU operations from any process will also hang until the
+        // board is fully rebooted.
+        //
+        // The bug is specific to NV12 (multi-plane YUV) as the source texture
+        // combined with MRT (Multiple Render Target) framebuffer output. YUYV
+        // sources to the same planar framebuffers work correctly.
+        //
+        // See VSI_GPU_NV12_BUG.md for reproduction steps and vendor bug report.
+        if self.is_vivante
+            && src.fourcc() == NV12
+            && matches!(dst.fourcc(), PLANAR_RGB | PLANAR_RGB_INT8)
+        {
+            return Err(crate::Error::NotSupported(format!(
+                "NV12 → {} is blocked on Vivante GPU: triggers unrecoverable GPU hang \
+                 requiring reboot (see VSI_GPU_NV12_BUG.md). Use CPU or G2D backend instead.",
+                dst.fourcc().display()
+            )));
+        }
+
         log::debug!(
             "dst tensor: {:?} src tensor :{:?}",
             dst.tensor().memory(),
@@ -145,6 +182,11 @@ impl ImageProcessorTrait for GLProcessorST {
         check_gl_error(function!(), line!())?;
         if self.gl_context.transfer_backend.is_dma() && dst.tensor().memory() == TensorMemory::Dma {
             // Packed RGB is now supported via DMA with buffer reinterpretation
+            log::trace!(
+                "GL convert: DMA path (src={:?}, dst={:?})",
+                src.tensor().memory(),
+                dst.tensor().memory()
+            );
             let res = self.convert_dest_dma(dst, src, rotation, flip, crop);
             return res;
         }
@@ -152,6 +194,7 @@ impl ImageProcessorTrait for GLProcessorST {
         // both upload and readback (zero CPU copy for both directions)
         if src.tensor().memory() == TensorMemory::Pbo && dst.tensor().memory() == TensorMemory::Pbo
         {
+            log::trace!("GL convert: PBO-to-PBO path");
             return self.convert_pbo_to_pbo(dst, src, rotation, flip, crop);
         }
         // PBO dst with non-PBO src: use normal texture upload for src (which
@@ -159,14 +202,24 @@ impl ImageProcessorTrait for GLProcessorST {
         // This avoids the deadlock that would occur if convert_dest_non_dma
         // tried to map() the PBO dst on the GL thread.
         if dst.tensor().memory() == TensorMemory::Pbo {
+            log::trace!(
+                "GL convert: any-to-PBO path (src={:?})",
+                src.tensor().memory()
+            );
             return self.convert_any_to_pbo(dst, src, rotation, flip, crop);
         }
         // PBO src with non-PBO dst: the src tensor's map() would deadlock on
         // the GL thread, so use PBO UNPACK upload. Readback goes to Mem dst
         // via normal ReadnPixels into mapped memory.
         if src.tensor().memory() == TensorMemory::Pbo {
+            log::trace!("GL convert: PBO-to-mem path");
             return self.convert_pbo_to_mem(dst, src, rotation, flip, crop);
         }
+        log::trace!(
+            "GL convert: non-DMA path (src={:?}, dst={:?})",
+            src.tensor().memory(),
+            dst.tensor().memory()
+        );
         let start = Instant::now();
         let res = self.convert_dest_non_dma(dst, src, rotation, flip, crop);
         log::debug!("convert_dest_non_dma takes {:?}", start.elapsed());
@@ -182,6 +235,7 @@ impl ImageProcessorTrait for GLProcessorST {
         crop: Crop,
     ) -> crate::Result<()> {
         // OpenGL doesn't support PLANAR_RGB output, delegate to CPU
+        log::warn!("GL: PLANAR_RGB output not supported, delegating to CPU");
         let mut cpu = CPUProcessor::new();
         cpu.convert_ref(src, dst, rotation, flip, crop)
     }
@@ -245,10 +299,10 @@ impl ImageProcessorTrait for GLProcessorST {
 
         gls::finish();
         if !is_dma {
+            // BGRA framebuffer uses RGBA internally; read as RGBA and swap.
             let format = match dst.fourcc() {
                 RGB => gls::gl::RGB,
-                RGBA => gls::gl::RGBA,
-                BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
+                RGBA | BGRA => gls::gl::RGBA,
                 _ => unreachable!(),
             };
             if let Some(buffer_id) = pbo_buffer_id {
@@ -271,6 +325,13 @@ impl ImageProcessorTrait for GLProcessorST {
                     gls::gl::Finish();
                 }
                 check_gl_error(function!(), line!())?;
+                // PBO BGRA swap: map PBO, swap R↔B, unmap.
+                if dst.fourcc() == BGRA {
+                    let mut dst_map = dst.tensor().map()?;
+                    for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
+                        chunk.swap(0, 2);
+                    }
+                }
             } else {
                 let mut dst_map = dst.tensor().map()?;
                 unsafe {
@@ -285,6 +346,12 @@ impl ImageProcessorTrait for GLProcessorST {
                         dst.tensor.len() as i32,
                         dst_map.as_mut_ptr() as *mut c_void,
                     );
+                }
+                // Swap R↔B for BGRA output.
+                if dst.fourcc() == BGRA {
+                    for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
+                        chunk.swap(0, 2);
+                    }
                 }
             }
         }
@@ -346,10 +413,10 @@ impl ImageProcessorTrait for GLProcessorST {
 
         gls::finish();
         if !is_dma {
+            // BGRA framebuffer uses RGBA internally; read as RGBA and swap.
             let format = match dst.fourcc() {
                 RGB => gls::gl::RGB,
-                RGBA => gls::gl::RGBA,
-                BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
+                RGBA | BGRA => gls::gl::RGBA,
                 _ => unreachable!(),
             };
             if let Some(buffer_id) = pbo_buffer_id {
@@ -370,6 +437,12 @@ impl ImageProcessorTrait for GLProcessorST {
                     gls::gl::Finish();
                 }
                 check_gl_error(function!(), line!())?;
+                if dst.fourcc() == BGRA {
+                    let mut dst_map = dst.tensor().map()?;
+                    for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
+                        chunk.swap(0, 2);
+                    }
+                }
             } else {
                 let mut dst_map = dst.tensor().map()?;
                 unsafe {
@@ -384,6 +457,11 @@ impl ImageProcessorTrait for GLProcessorST {
                         dst.tensor.len() as i32,
                         dst_map.as_mut_ptr() as *mut c_void,
                     );
+                }
+                if dst.fourcc() == BGRA {
+                    for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
+                        chunk.swap(0, 2);
+                    }
                 }
             }
         }
@@ -451,7 +529,7 @@ impl GLProcessorST {
                 .map_or(std::ptr::null(), |p| p as *const _)
         });
 
-        let (has_float_linear, has_bgra) = Self::gl_check_support()?;
+        let (has_float_linear, has_bgra, is_vivante) = Self::gl_check_support()?;
 
         // Uploads and downloads are all packed with no alignment requirements
         unsafe {
@@ -591,6 +669,10 @@ impl GLProcessorST {
             convert_fbo: FrameBuffer::new(),
             src_egl_cache: EglImageCache::new(8),
             dst_egl_cache: EglImageCache::new(8),
+            last_bound_dst_egl: None,
+            last_bound_src_egl: None,
+            bgra_warned: false,
+            is_vivante,
             packed_rgb_intermediate_tex: Texture::new(),
             packed_rgb_fbo: FrameBuffer::new(),
             packed_rgb_intermediate_size: (0, 0),
@@ -1339,11 +1421,29 @@ impl GLProcessorST {
 
     /// Checks required GL extensions and returns optional capability flags:
     /// `(has_float_linear, has_bgra)`.
-    fn gl_check_support() -> Result<(bool, bool), crate::Error> {
+    /// Query GL capabilities and detect GPU vendor.
+    ///
+    /// Returns `(has_float_linear, has_bgra, is_vivante)`.
+    fn gl_check_support() -> Result<(bool, bool, bool), crate::Error> {
         if let Ok(version) = gls::get_string(gls::gl::SHADING_LANGUAGE_VERSION) {
             log::debug!("GL Shading Language Version: {version:?}");
         } else {
             log::warn!("Could not get GL Shading Language Version");
+        }
+
+        // Detect Vivante/Verisilicon GPU via GL_RENDERER string.
+        let is_vivante = gls::get_string(gls::gl::RENDERER)
+            .map(|r| {
+                log::info!("GL_RENDERER: {r}");
+                let lower = r.to_ascii_lowercase();
+                lower.contains("vivante") || lower.contains("gc7000") || lower.contains("galcore")
+            })
+            .unwrap_or(false);
+        if is_vivante {
+            log::warn!(
+                "Vivante GPU detected — NV12 → planar RGB conversions will be \
+                 blocked to avoid unrecoverable GPU hang (see VSI_GPU_NV12_BUG.md)"
+            );
         }
 
         let extensions = unsafe {
@@ -1374,7 +1474,7 @@ impl GLProcessorST {
         let has_bgra = extensions.contains("GL_EXT_texture_format_BGRA8888");
         log::debug!("GL_EXT_texture_format_BGRA8888: {has_bgra}");
 
-        Ok((has_float_linear, has_bgra))
+        Ok((has_float_linear, has_bgra, is_vivante))
     }
 
     fn setup_renderbuffer_dma(&mut self, dst: &TensorImage) -> crate::Result<()> {
@@ -1387,30 +1487,44 @@ impl GLProcessorST {
         } else {
             (dst.width() as i32, dst.height() as i32)
         };
-        let dest_egl = self.get_or_create_egl_image(CacheKind::Dst, dst)?;
+
+        let luma_id = dst.buffer_identity().id();
+        let chroma_id = dst.chroma_tensor().map(|t| t.buffer_identity().id());
+        let dst_key = (luma_id, chroma_id);
+
+        if self.last_bound_dst_egl != Some(dst_key) {
+            let dest_egl = self.get_or_create_egl_image(CacheKind::Dst, dst)?;
+            unsafe {
+                gls::gl::UseProgram(self.texture_program_yuv.id);
+                gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+                gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
+                gls::gl::TexParameteri(
+                    gls::gl::TEXTURE_2D,
+                    gls::gl::TEXTURE_MIN_FILTER,
+                    gls::gl::LINEAR as i32,
+                );
+                gls::gl::TexParameteri(
+                    gls::gl::TEXTURE_2D,
+                    gls::gl::TEXTURE_MAG_FILTER,
+                    gls::gl::LINEAR as i32,
+                );
+                gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, dest_egl.as_ptr());
+                gls::gl::FramebufferTexture2D(
+                    gls::gl::FRAMEBUFFER,
+                    gls::gl::COLOR_ATTACHMENT0,
+                    gls::gl::TEXTURE_2D,
+                    self.render_texture.id,
+                    0,
+                );
+                check_gl_error(function!(), line!())?;
+            }
+            self.last_bound_dst_egl = Some(dst_key);
+            log::trace!("setup_renderbuffer_dma: bound new dst EGLImage id={luma_id:#x}");
+        } else {
+            log::trace!("setup_renderbuffer_dma: reusing bound dst EGLImage id={luma_id:#x}");
+        }
+
         unsafe {
-            gls::gl::UseProgram(self.texture_program_yuv.id);
-            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MIN_FILTER,
-                gls::gl::LINEAR as i32,
-            );
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MAG_FILTER,
-                gls::gl::LINEAR as i32,
-            );
-            gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, dest_egl.as_ptr());
-            gls::gl::FramebufferTexture2D(
-                gls::gl::FRAMEBUFFER,
-                gls::gl::COLOR_ATTACHMENT0,
-                gls::gl::TEXTURE_2D,
-                self.render_texture.id,
-                0,
-            );
-            check_gl_error(function!(), line!())?;
             gls::gl::Viewport(0, 0, width, height);
         }
         Ok(())
@@ -1427,8 +1541,13 @@ impl GLProcessorST {
         assert!(self.gl_context.transfer_backend.is_dma());
         if fourcc_is_packed_rgb(dst.fourcc()) {
             if self.support_rgb_direct {
+                log::trace!(
+                    "convert_dest_dma: direct RGB path for {}",
+                    dst.fourcc().display()
+                );
                 self.convert_to_rgb_direct(src, dst, rotation, flip, crop)
             } else {
+                log::trace!("convert_dest_dma: declining packed RGB (no direct RGB support)");
                 // Two-pass packed RGB is slower than G2D/CPU; decline so
                 // ImageProcessor falls through to a faster backend.
                 Err(crate::Error::NotSupported(
@@ -1436,9 +1555,18 @@ impl GLProcessorST {
                 ))
             }
         } else if dst.is_planar() {
+            log::trace!(
+                "convert_dest_dma: planar output path for {}",
+                dst.fourcc().display()
+            );
             self.setup_renderbuffer_dma(dst)?;
             self.convert_to_planar(src, dst, rotation, flip, crop)
         } else {
+            log::trace!(
+                "convert_dest_dma: standard DMA path for {} → {}",
+                src.fourcc().display(),
+                dst.fourcc().display()
+            );
             self.setup_renderbuffer_dma(dst)?;
             self.convert_to(src, dst, rotation, flip, crop)
         }
@@ -1462,13 +1590,24 @@ impl GLProcessorST {
             (dst.width() as i32, dst.height() as i32)
         };
 
+        // BGRA textures as framebuffer color attachments have GPU-dependent
+        // swizzle behavior: some implementations don't swizzle fragment shader
+        // output, causing R↔B channel swap. Work around this by using RGBA
+        // format internally — BGRA pixel data is byte-swapped (R↔B) before
+        // upload, and the readback path swaps back.
+        let is_bgra = !dst.is_planar() && dst.fourcc() == BGRA;
+        if is_bgra && !self.bgra_warned {
+            log::warn!(
+                "BGRA destination: using RGBA internal format with CPU R↔B byte-swap workaround"
+            );
+            self.bgra_warned = true;
+        }
         let format = if dst.is_planar() {
             gls::gl::RED
         } else {
             match dst.fourcc() {
                 RGB | RGB_INT8 => gls::gl::RGB,
-                RGBA => gls::gl::RGBA,
-                BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
+                RGBA | BGRA => gls::gl::RGBA, // BGRA uses RGBA internally
                 GREY => gls::gl::RED,
                 _ => unreachable!(),
             }
@@ -1478,6 +1617,7 @@ impl GLProcessorST {
         self.convert_fbo.bind();
 
         let map;
+        let mut swapped_buf;
 
         let pixels = if crop.dst_rect.is_none_or(|crop| {
             crop.top == 0
@@ -1488,7 +1628,16 @@ impl GLProcessorST {
             std::ptr::null()
         } else {
             map = dst.tensor().map()?;
-            map.as_ptr() as *const c_void
+            if is_bgra {
+                // Swap R↔B to convert BGRA→RGBA for the RGBA texture.
+                swapped_buf = map.as_slice().to_vec();
+                for chunk in swapped_buf.chunks_exact_mut(4) {
+                    chunk.swap(0, 2);
+                }
+                swapped_buf.as_ptr() as *const c_void
+            } else {
+                map.as_ptr() as *const c_void
+            }
         };
         unsafe {
             gls::gl::UseProgram(self.texture_program.id);
@@ -1544,10 +1693,13 @@ impl GLProcessorST {
         buffer_id: u32,
     ) -> crate::Result<()> {
         let (width, height) = (dst.width() as i32, dst.height() as i32);
+        // BGRA uses RGBA internally to avoid framebuffer swizzle issues
+        // (see setup_renderbuffer_non_dma). For PBO, the BGRA data is uploaded
+        // as RGBA (R↔B appear swapped in the texture), and the readback path
+        // swaps them back.
         let format = match dst.fourcc() {
             RGB => gls::gl::RGB,
-            RGBA => gls::gl::RGBA,
-            BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
+            RGBA | BGRA => gls::gl::RGBA,
             _ => {
                 return Err(crate::Error::NotSupported(format!(
                     "PBO renderbuffer not supported for {}",
@@ -1618,10 +1770,11 @@ impl GLProcessorST {
         }
         log::debug!("Draw to framebuffer takes {:?}", start.elapsed());
         let start = Instant::now();
+        // BGRA framebuffer uses RGBA internally (see setup_renderbuffer_non_dma),
+        // so read back as RGBA and swap R↔B to produce BGRA output.
         let dest_format = match dst.fourcc() {
             RGB | RGB_INT8 => gls::gl::RGB,
-            RGBA => gls::gl::RGBA,
-            BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
+            RGBA | BGRA => gls::gl::RGBA,
             GREY => gls::gl::RED,
             _ => unreachable!(),
         };
@@ -1639,6 +1792,12 @@ impl GLProcessorST {
                 dst.tensor.len() as i32,
                 dst_map.as_mut_ptr() as *mut c_void,
             );
+            // Swap R↔B for BGRA output (framebuffer was RGBA internally).
+            if dst.fourcc() == BGRA {
+                for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
+                    chunk.swap(0, 2);
+                }
+            }
             // Apply XOR 0x80 for int8 formats (convert uint8 → int8 representation)
             if fourcc_is_int8(dst.fourcc()) {
                 for byte in dst_map.iter_mut() {
@@ -1706,10 +1865,10 @@ impl GLProcessorST {
 
         // Readback into destination PBO instead of CPU memory
         let start_read = Instant::now();
+        // BGRA framebuffer uses RGBA internally; read as RGBA, swap later.
         let dest_format = match dst.fourcc() {
             crate::RGB | crate::RGB_INT8 => gls::gl::RGB,
-            crate::RGBA => gls::gl::RGBA,
-            crate::BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
+            crate::RGBA | crate::BGRA => gls::gl::RGBA,
             crate::GREY => gls::gl::RED,
             _ => {
                 return Err(crate::Error::NotSupported(format!(
@@ -1739,9 +1898,9 @@ impl GLProcessorST {
 
         check_gl_error(function!(), line!())?;
 
-        // Handle int8 XOR if needed (must map PBO to do this on the GL thread
-        // directly, since we're already on the GL thread)
-        if fourcc_is_int8(dst.fourcc()) {
+        // Handle BGRA R↔B swap and/or int8 XOR if needed (must map PBO to do
+        // this on the GL thread directly, since we're already on the GL thread).
+        if dst.fourcc() == crate::BGRA || fourcc_is_int8(dst.fourcc()) {
             unsafe {
                 gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, dst_buffer_id);
                 let ptr = gls::gl::MapBufferRange(
@@ -1752,8 +1911,15 @@ impl GLProcessorST {
                 );
                 if !ptr.is_null() {
                     let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, dst.tensor.len());
-                    for byte in slice.iter_mut() {
-                        *byte ^= 0x80;
+                    if dst.fourcc() == crate::BGRA {
+                        for chunk in slice.chunks_exact_mut(4) {
+                            chunk.swap(0, 2);
+                        }
+                    }
+                    if fourcc_is_int8(dst.fourcc()) {
+                        for byte in slice.iter_mut() {
+                            *byte ^= 0x80;
+                        }
                     }
                     gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
                 }
@@ -2049,10 +2215,10 @@ impl GLProcessorST {
 
         // PBO readback
         let start_read = Instant::now();
+        // BGRA framebuffer uses RGBA internally; read as RGBA, swap later.
         let dest_format = match dst.fourcc() {
             crate::RGB | crate::RGB_INT8 => gls::gl::RGB,
-            crate::RGBA => gls::gl::RGBA,
-            crate::BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
+            crate::RGBA | crate::BGRA => gls::gl::RGBA,
             crate::GREY => gls::gl::RED,
             _ => {
                 return Err(crate::Error::NotSupported(format!(
@@ -2079,7 +2245,7 @@ impl GLProcessorST {
         }
         check_gl_error(function!(), line!())?;
 
-        if fourcc_is_int8(dst.fourcc()) {
+        if dst.fourcc() == crate::BGRA || fourcc_is_int8(dst.fourcc()) {
             unsafe {
                 gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, dst_buffer_id);
                 let ptr = gls::gl::MapBufferRange(
@@ -2090,8 +2256,15 @@ impl GLProcessorST {
                 );
                 if !ptr.is_null() {
                     let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, dst.tensor.len());
-                    for byte in slice.iter_mut() {
-                        *byte ^= 0x80;
+                    if dst.fourcc() == crate::BGRA {
+                        for chunk in slice.chunks_exact_mut(4) {
+                            chunk.swap(0, 2);
+                        }
+                    }
+                    if fourcc_is_int8(dst.fourcc()) {
+                        for byte in slice.iter_mut() {
+                            *byte ^= 0x80;
+                        }
                     }
                     gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
                 }
@@ -2138,10 +2311,10 @@ impl GLProcessorST {
 
         // Normal readback into Mem dst
         let start = Instant::now();
+        // BGRA framebuffer uses RGBA internally; read as RGBA, swap later.
         let dest_format = match dst.fourcc() {
             crate::RGB | crate::RGB_INT8 => gls::gl::RGB,
-            crate::RGBA => gls::gl::RGBA,
-            crate::BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
+            crate::RGBA | crate::BGRA => gls::gl::RGBA,
             crate::GREY => gls::gl::RED,
             _ => {
                 return Err(crate::Error::NotSupported(format!(
@@ -2163,6 +2336,11 @@ impl GLProcessorST {
                 dst.tensor.len() as i32,
                 dst_map.as_mut_ptr() as *mut c_void,
             );
+            if dst.fourcc() == crate::BGRA {
+                for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
+                    chunk.swap(0, 2);
+                }
+            }
             if fourcc_is_int8(dst.fourcc()) {
                 for byte in dst_map.iter_mut() {
                     *byte ^= 0x80;
@@ -2311,6 +2489,10 @@ impl GLProcessorST {
             }
         };
         let is_int8 = fourcc_is_int8(dst.fourcc());
+        log::trace!(
+            "convert_to_planar: int8={is_int8}, interpolation={:?}",
+            self.int8_interpolation_mode
+        );
 
         // top and bottom are flipped because OpenGL uses 0,0 as bottom left
         let src_roi = if let Some(crop) = crop.src_rect {
@@ -2962,7 +3144,7 @@ impl GLProcessorST {
     }
 
     fn draw_camera_texture_eglimage(
-        &self,
+        &mut self,
         src: &TensorImage,
         egl_img: egl::Image,
         src_roi: RegionOfInterest,
@@ -2970,7 +3152,10 @@ impl GLProcessorST {
         rotation_offset: usize,
         flip: Flip,
     ) -> Result<(), Error> {
-        // let texture_target = gls::gl::TEXTURE_2D;
+        let luma_id = src.buffer_identity().id();
+        let chroma_id = src.chroma_tensor().map(|t| t.buffer_identity().id());
+        let src_key = (luma_id, chroma_id);
+
         let texture_target = gls::gl::TEXTURE_EXTERNAL_OES;
         unsafe {
             gls::gl::UseProgram(self.texture_program_yuv.id);
@@ -3005,8 +3190,14 @@ impl GLProcessorST {
                 }
             }
 
-            gls::egl_image_target_texture_2d_oes(texture_target, egl_img.as_ptr());
-            check_gl_error(function!(), line!())?;
+            if self.last_bound_src_egl != Some(src_key) {
+                gls::egl_image_target_texture_2d_oes(texture_target, egl_img.as_ptr());
+                check_gl_error(function!(), line!())?;
+                self.last_bound_src_egl = Some(src_key);
+                log::trace!("draw_camera: bound new src EGLImage id={luma_id:#x}");
+            } else {
+                log::trace!("draw_camera: reusing bound src EGLImage id={luma_id:#x}");
+            }
             gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
             gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
 
@@ -3151,6 +3342,20 @@ impl GLProcessorST {
             }
         };
 
+        // For multiplane NV12, get the UV plane's fd from the chroma tensor
+        let uv_fd = if src.is_multiplane() {
+            match src.chroma_tensor().unwrap() {
+                edgefirst_tensor::Tensor::Dma(dma_tensor) => Some(dma_tensor.fd.as_raw_fd()),
+                _ => {
+                    return Err(Error::NotImplemented(
+                        "Multiplane chroma tensor must be DMA-backed".to_string(),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
         // For NV12, plane0 pitch is width (Y is 1 byte/pixel)
         // For other formats, pitch is width * channels
         let plane0_pitch = if src.fourcc() == NV12 {
@@ -3178,10 +3383,16 @@ impl GLProcessorST {
 
         // NV12 requires a second plane for UV data
         if src.fourcc() == NV12 {
-            let uv_offset = width * height; // Y plane size
+            let (plane1_fd, uv_offset) = if let Some(chroma_fd) = uv_fd {
+                // Multiplane: UV in separate DMA-BUF at offset 0
+                (chroma_fd, 0)
+            } else {
+                // Contiguous: UV follows Y in same buffer
+                (fd, width * height)
+            };
             egl_img_attr.append(&mut vec![
                 egl_ext::DMA_BUF_PLANE1_FD as Attrib,
-                fd as Attrib,
+                plane1_fd as Attrib,
                 egl_ext::DMA_BUF_PLANE1_OFFSET as Attrib,
                 uv_offset as Attrib,
                 egl_ext::DMA_BUF_PLANE1_PITCH as Attrib,
@@ -3236,12 +3447,27 @@ impl GLProcessorST {
         cache: CacheKind,
         img: &TensorImage,
     ) -> Result<egl::Image, crate::Error> {
-        let id = img.buffer_identity().id();
+        let luma_id = img.buffer_identity().id();
+        let chroma_id = img.chroma_tensor().map(|t| t.buffer_identity().id());
+        let id = (luma_id, chroma_id);
 
         // Sweep dead entries opportunistically before looking up.
+        // Invalidate binding state since sweep may remove the bound entry.
         match cache {
-            CacheKind::Src => self.src_egl_cache.sweep(),
-            CacheKind::Dst => self.dst_egl_cache.sweep(),
+            CacheKind::Src => {
+                let before = self.src_egl_cache.entries.len();
+                self.src_egl_cache.sweep();
+                if self.src_egl_cache.entries.len() < before {
+                    self.last_bound_src_egl = None;
+                }
+            }
+            CacheKind::Dst => {
+                let before = self.dst_egl_cache.entries.len();
+                self.dst_egl_cache.sweep();
+                if self.dst_egl_cache.entries.len() < before {
+                    self.last_bound_dst_egl = None;
+                }
+            }
         }
 
         {
@@ -3253,15 +3479,21 @@ impl GLProcessorST {
             if let Some(cached) = egl_cache.entries.get_mut(&id) {
                 egl_cache.hits += 1;
                 cached.last_used = ts;
-                log::trace!("EglImageCache {:?} hit: id={id:#x}", cache);
+                log::trace!("EglImageCache {:?} hit: id={luma_id:#x}", cache);
                 return Ok(cached.egl_image.egl_image);
             }
             egl_cache.misses += 1;
-            log::trace!("EglImageCache {:?} miss: id={id:#x}", cache);
+            log::trace!("EglImageCache {:?} miss: id={luma_id:#x}", cache);
             // Evict least-recently-used entry if at capacity.
             if egl_cache.entries.len() >= egl_cache.capacity {
                 egl_cache.evict_lru();
             }
+        }
+        // Invalidate binding state: a cache miss means we're creating a new
+        // EGLImage, and the eviction above may have removed the bound entry.
+        match cache {
+            CacheKind::Src => self.last_bound_src_egl = None,
+            CacheKind::Dst => self.last_bound_dst_egl = None,
         }
 
         let egl_image_obj = self.create_image_from_dma2(img)?;
@@ -3336,18 +3568,24 @@ impl GLProcessorST {
         drm_format: DrmFourcc,
         bpp: usize,
     ) -> Result<egl::Image, crate::Error> {
-        let id = img.buffer_identity().id();
+        let id = (img.buffer_identity().id(), None);
+        let before = self.dst_egl_cache.entries.len();
         self.dst_egl_cache.sweep();
+        if self.dst_egl_cache.entries.len() < before {
+            self.last_bound_dst_egl = None;
+        }
 
         let ts = self.dst_egl_cache.next_timestamp();
         if let Some(cached) = self.dst_egl_cache.entries.get_mut(&id) {
             self.dst_egl_cache.hits += 1;
             cached.last_used = ts;
-            log::trace!("EglImageCache dst (RGB) hit: id={id:#x}");
+            log::trace!("EglImageCache dst (RGB) hit: id={:#x}", id.0);
             return Ok(cached.egl_image.egl_image);
         }
         self.dst_egl_cache.misses += 1;
-        log::trace!("EglImageCache dst (RGB) miss: id={id:#x}");
+        log::trace!("EglImageCache dst (RGB) miss: id={:#x}", id.0);
+        // Invalidate dst binding state on cache miss (new EGLImage creation).
+        self.last_bound_dst_egl = None;
 
         if self.dst_egl_cache.entries.len() >= self.dst_egl_cache.capacity {
             self.dst_egl_cache.evict_lru();
@@ -3376,7 +3614,7 @@ impl GLProcessorST {
         &mut self,
         dst: &TensorImage,
     ) -> crate::Result<(u32, i32, i32)> {
-        let id = dst.buffer_identity().id();
+        let id = (dst.buffer_identity().id(), None);
         let width = dst.width() as i32;
         let height = dst.height() as i32;
 
@@ -3388,12 +3626,12 @@ impl GLProcessorST {
             if let Some(rbo) = cached.renderbuffer {
                 self.dst_egl_cache.hits += 1;
                 cached.last_used = ts;
-                log::trace!("EglImageCache dst (rgb_direct) hit: id={id:#x}");
+                log::trace!("EglImageCache dst (rgb_direct) hit: id={:#x}", id.0);
                 return Ok((rbo, width, height));
             }
         }
         self.dst_egl_cache.misses += 1;
-        log::trace!("EglImageCache dst (rgb_direct) miss: id={id:#x}");
+        log::trace!("EglImageCache dst (rgb_direct) miss: id={:#x}", id.0);
 
         // Evict least-recently-used entry if at capacity
         if self.dst_egl_cache.entries.len() >= self.dst_egl_cache.capacity {
@@ -3422,14 +3660,14 @@ impl GLProcessorST {
 
         // Cache both
         let guard = dst.buffer_identity().weak();
-        let ts = self.dst_egl_cache.next_timestamp();
+        let ts2 = self.dst_egl_cache.next_timestamp();
         self.dst_egl_cache.entries.insert(
             id,
             CachedEglImage {
                 egl_image: egl_image_obj,
                 guard,
                 renderbuffer: Some(rbo),
-                last_used: ts,
+                last_used: ts2,
             },
         );
 

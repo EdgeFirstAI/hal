@@ -588,6 +588,7 @@ dependencies = [
  "four-char-code",
  "half",
  "libc",
+ "log",
  "ndarray 0.16.1",
  "serde_json",
  "serde_yaml",

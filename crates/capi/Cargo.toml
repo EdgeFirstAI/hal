@@ -30,6 +30,7 @@ half = { workspace = true }
 uuid = { workspace = true }
 ndarray = { workspace = true }
 four-char-code = { workspace = true }
+log = { workspace = true }
 
 [build-dependencies]
 cbindgen = "0.29"

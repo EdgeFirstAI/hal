@@ -27,18 +27,39 @@ impl CPUProcessor {
     pub(super) fn convert_nv12_to_rgb(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), NV12);
         assert_eq!(dst.fourcc(), RGB);
-        let map = src.tensor.map()?;
-        let y_stride = src.width() as u32;
-        let uv_stride = src.width() as u32;
-        let slices = map.as_slice().split_at(y_stride as usize * src.height());
 
+        if src.is_multiplane() {
+            let y_map = src.tensor.map()?;
+            let uv_map = src.chroma.as_ref().unwrap().map()?;
+            Self::nv12_to_rgb_kernel(
+                y_map.as_slice(),
+                uv_map.as_slice(),
+                src.width(),
+                src.height(),
+                dst,
+            )
+        } else {
+            let map = src.tensor.map()?;
+            let y_stride = src.width();
+            let (y_plane, uv_plane) = map.as_slice().split_at(y_stride * src.height());
+            Self::nv12_to_rgb_kernel(y_plane, uv_plane, src.width(), src.height(), dst)
+        }
+    }
+
+    fn nv12_to_rgb_kernel(
+        y_plane: &[u8],
+        uv_plane: &[u8],
+        width: usize,
+        height: usize,
+        dst: &mut TensorImage,
+    ) -> Result<()> {
         let src = yuv::YuvBiPlanarImage {
-            y_plane: slices.0,
-            y_stride,
-            uv_plane: slices.1,
-            uv_stride,
-            width: src.width() as u32,
-            height: src.height() as u32,
+            y_plane,
+            y_stride: width as u32,
+            uv_plane,
+            uv_stride: width as u32,
+            width: width as u32,
+            height: height as u32,
         };
 
         Ok(yuv::yuv_nv12_to_rgb(
@@ -58,18 +79,39 @@ impl CPUProcessor {
     pub(super) fn convert_nv12_to_rgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), NV12);
         assert!(matches!(dst.fourcc(), RGBA | BGRA));
-        let map = src.tensor.map()?;
-        let y_stride = src.width() as u32;
-        let uv_stride = src.width() as u32;
-        let slices = map.as_slice().split_at(y_stride as usize * src.height());
 
+        if src.is_multiplane() {
+            let y_map = src.tensor.map()?;
+            let uv_map = src.chroma.as_ref().unwrap().map()?;
+            Self::nv12_to_rgba_kernel(
+                y_map.as_slice(),
+                uv_map.as_slice(),
+                src.width(),
+                src.height(),
+                dst,
+            )
+        } else {
+            let map = src.tensor.map()?;
+            let y_stride = src.width();
+            let (y_plane, uv_plane) = map.as_slice().split_at(y_stride * src.height());
+            Self::nv12_to_rgba_kernel(y_plane, uv_plane, src.width(), src.height(), dst)
+        }
+    }
+
+    fn nv12_to_rgba_kernel(
+        y_plane: &[u8],
+        uv_plane: &[u8],
+        width: usize,
+        height: usize,
+        dst: &mut TensorImage,
+    ) -> Result<()> {
         let src = yuv::YuvBiPlanarImage {
-            y_plane: slices.0,
-            y_stride,
-            uv_plane: slices.1,
-            uv_stride,
-            width: src.width() as u32,
-            height: src.height() as u32,
+            y_plane,
+            y_stride: width as u32,
+            uv_plane,
+            uv_stride: width as u32,
+            width: width as u32,
+            height: height as u32,
         };
 
         Ok(yuv::yuv_nv12_to_rgba(
@@ -85,13 +127,15 @@ impl CPUProcessor {
     pub(super) fn convert_nv12_to_grey(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), NV12);
         assert_eq!(dst.fourcc(), GREY);
+
+        // For both multiplane and contiguous, we only need the Y plane.
+        // For multiplane, the luma tensor IS the Y plane directly.
+        // For contiguous, Y is the first H*W bytes.
         let src_map = src.tensor.map()?;
+        let y_len = src.width() * src.height();
+        let y_slice = &src_map.as_slice()[..y_len];
+
         let mut dst_map = dst.tensor.map()?;
-        let y_stride = src.width() as u32;
-        let y_slice = src_map
-            .as_slice()
-            .split_at(y_stride as usize * src.height())
-            .0;
         let src_chunks = y_slice.as_chunks::<8>();
         let dst_chunks = dst_map.as_chunks_mut::<8>();
         for (s, d) in src_chunks.0.iter().zip(dst_chunks.0) {
@@ -795,18 +839,39 @@ impl CPUProcessor {
     pub(super) fn convert_nv16_to_rgb(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), NV16);
         assert_eq!(dst.fourcc(), RGB);
-        let map = src.tensor.map()?;
-        let y_stride = src.width() as u32;
-        let uv_stride = src.width() as u32;
-        let slices = map.as_slice().split_at(y_stride as usize * src.height());
 
+        if src.is_multiplane() {
+            let y_map = src.tensor.map()?;
+            let uv_map = src.chroma.as_ref().unwrap().map()?;
+            Self::nv16_to_rgb_kernel(
+                y_map.as_slice(),
+                uv_map.as_slice(),
+                src.width(),
+                src.height(),
+                dst,
+            )
+        } else {
+            let map = src.tensor.map()?;
+            let y_stride = src.width();
+            let (y_plane, uv_plane) = map.as_slice().split_at(y_stride * src.height());
+            Self::nv16_to_rgb_kernel(y_plane, uv_plane, src.width(), src.height(), dst)
+        }
+    }
+
+    fn nv16_to_rgb_kernel(
+        y_plane: &[u8],
+        uv_plane: &[u8],
+        width: usize,
+        height: usize,
+        dst: &mut TensorImage,
+    ) -> Result<()> {
         let src = yuv::YuvBiPlanarImage {
-            y_plane: slices.0,
-            y_stride,
-            uv_plane: slices.1,
-            uv_stride,
-            width: src.width() as u32,
-            height: src.height() as u32,
+            y_plane,
+            y_stride: width as u32,
+            uv_plane,
+            uv_stride: width as u32,
+            width: width as u32,
+            height: height as u32,
         };
 
         Ok(yuv::yuv_nv16_to_rgb(
@@ -822,18 +887,39 @@ impl CPUProcessor {
     pub(super) fn convert_nv16_to_rgba(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
         assert_eq!(src.fourcc(), NV16);
         assert!(matches!(dst.fourcc(), RGBA | BGRA));
-        let map = src.tensor.map()?;
-        let y_stride = src.width() as u32;
-        let uv_stride = src.width() as u32;
-        let slices = map.as_slice().split_at(y_stride as usize * src.height());
 
+        if src.is_multiplane() {
+            let y_map = src.tensor.map()?;
+            let uv_map = src.chroma.as_ref().unwrap().map()?;
+            Self::nv16_to_rgba_kernel(
+                y_map.as_slice(),
+                uv_map.as_slice(),
+                src.width(),
+                src.height(),
+                dst,
+            )
+        } else {
+            let map = src.tensor.map()?;
+            let y_stride = src.width();
+            let (y_plane, uv_plane) = map.as_slice().split_at(y_stride * src.height());
+            Self::nv16_to_rgba_kernel(y_plane, uv_plane, src.width(), src.height(), dst)
+        }
+    }
+
+    fn nv16_to_rgba_kernel(
+        y_plane: &[u8],
+        uv_plane: &[u8],
+        width: usize,
+        height: usize,
+        dst: &mut TensorImage,
+    ) -> Result<()> {
         let src = yuv::YuvBiPlanarImage {
-            y_plane: slices.0,
-            y_stride,
-            uv_plane: slices.1,
-            uv_stride,
-            width: src.width() as u32,
-            height: src.height() as u32,
+            y_plane,
+            y_stride: width as u32,
+            uv_plane,
+            uv_stride: width as u32,
+            width: width as u32,
+            height: height as u32,
         };
 
         Ok(yuv::yuv_nv16_to_rgba(

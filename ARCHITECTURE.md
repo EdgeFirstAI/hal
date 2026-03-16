@@ -1,7 +1,7 @@
 # EdgeFirst Hardware Abstraction Layer - Architecture
 
-**Version:** 2.6
-**Last Updated:** March 4, 2026
+**Version:** 2.7
+**Last Updated:** March 11, 2026
 **Status:** Production
 **Audience:** Developers contributing to EdgeFirst HAL or integrating it into applications
 
@@ -1191,6 +1191,76 @@ Several files are significantly larger than typical Rust modules:
 | `capi/src/decoder.rs` | ~2,800 | C API decoder bindings |
 
 ---
+
+## Appendix A: Multi-Plane DMA-BUF Limitation
+
+### Current State
+
+The HAL's DMA-BUF integration assumes a **single file descriptor per buffer**
+with all planes stored contiguously. This is baked into multiple layers:
+
+| Layer | Assumption | Code Location |
+|-------|-----------|---------------|
+| `DmaTensor<T>` | Single `fd: OwnedFd` field | `crates/tensor/src/dma.rs:31` |
+| `TensorTrait::from_fd()` | Takes one `OwnedFd` | `crates/tensor/src/dma.rs:88` |
+| `hal_tensor_from_fd()` C API | Takes one `int fd` | `crates/capi/include/edgefirst/hal.h` |
+| `TensorImage` NV12 shape | `[H*3/2, W]` — contiguous Y+UV | `crates/image/src/lib.rs` |
+| EGL NV12 import | Same fd for both planes, UV offset = `W*H` | `crates/image/src/opengl_headless.rs:4492–4501` |
+
+This works correctly when the kernel allocates NV12 from a single CMA/system
+DMA-heap buffer (e.g. `hal_tensor_image_new()`, `hal_image_processor_create_image()`).
+The Y and UV planes are contiguous in physical memory and share one fd.
+
+### The Problem: Multi-Planar Formats
+
+Video hardware on NXP i.MX platforms frequently produces **multi-planar**
+NV12 buffers where Y and UV reside in separate DMA-BUF allocations, each
+with its own file descriptor:
+
+| Source | V4L2 Format | Planes | Behavior |
+|--------|-------------|--------|----------|
+| VPU (Hantro/Amphion) via `v4l2h264dec` | `V4L2_PIX_FMT_NV12M` (NM12) | 2 fds | Y and UV in separate DMA-BUFs |
+| NeoISP via `libcamerasrc` | `V4L2_PIX_FMT_NV12M` (NM12) | 2 fds | Y and UV in separate DMA-BUFs |
+| MIPI-CSI direct capture | `V4L2_PIX_FMT_NV12` (NV12) | 1 fd | Contiguous — works today |
+
+When GStreamer negotiates `video/x-raw(memory:DMABuf), format=DMA_DRM,
+drm-format=NV12`, the upstream element may deliver buffers with 2 `GstMemory`
+blocks (one per plane).
+
+### Multi-Plane Support (Implemented)
+
+The HAL supports multi-plane DMA-BUF NV12/NV16 via a two-tensor approach
+rather than extending `DmaTensor` with multiple fds:
+
+**C API**: `hal_tensor_image_from_planes(y_fd, width, height, uv_fd, fourcc, out)`
+takes separate Y and UV file descriptors, wraps each into its own
+`Tensor<u8>` via `from_fd()`, and combines them with `TensorImage::from_planes()`.
+
+**Image crate**: `TensorImage::from_planes(luma, chroma, fourcc)` stores the
+two tensors as separate planes inside the `TensorImage`, preserving their
+independent DMA-BUF allocations for zero-copy GPU import.
+
+**OpenGL path**: `create_image_from_dma2()` uses per-plane fds in EGL
+attributes (`DMA_BUF_PLANE0_FD → y_fd`, `DMA_BUF_PLANE1_FD → uv_fd`),
+each at offset 0.
+
+| Scenario | Zero-Copy | Notes |
+|----------|-----------|-------|
+| Single-fd NV12 DMA-BUF | Yes | V4L2 single-planar capture, HAL-allocated buffers |
+| Single-fd YUYV/RGB/RGBA DMA-BUF | Yes | Always single-plane |
+| System memory input | N/A | Copied into HAL tensor regardless |
+| Multi-fd NV12/NV16 DMA-BUF | Yes | Via `hal_tensor_image_from_planes()` |
+
+### GStreamer Integration (External)
+
+The `edgefirstcameraadaptor` element detects multi-plane buffers
+(`gst_buffer_n_memory() > 1`) and extracts per-plane fds via
+`gst_dmabuf_memory_get_fd()` on each `GstMemory` block, passing them to
+`hal_tensor_image_from_planes()` for zero-copy import.
+
+### Tracking
+
+This work was implemented under **EDGEAI-1107**.
 
 ## Contributing
 

@@ -11,8 +11,9 @@ use crate::error::{set_error, set_error_null};
 use crate::tensor::{HalTensor, HalTensorMap, HalTensorMemory};
 use crate::{check_null, check_null_ret_null, try_or_errno, try_or_null};
 use edgefirst_image::{
-    Crop, Flip, ImageProcessor, ImageProcessorTrait, Rect, Rotation, TensorImage, TensorImageRef,
-    GREY, NV12, NV16, PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, YUYV,
+    ComputeBackend, Crop, Flip, ImageProcessor, ImageProcessorConfig, ImageProcessorTrait, Rect,
+    Rotation, TensorImage, TensorImageRef, GREY, NV12, NV16, PLANAR_RGB, PLANAR_RGBA, RGB, RGBA,
+    YUYV,
 };
 use edgefirst_tensor::{TensorMemory, TensorTrait};
 use libc::{c_char, c_int, c_void, size_t};
@@ -471,6 +472,95 @@ pub unsafe extern "C" fn hal_tensor_image_from_tensor(
     Box::into_raw(Box::new(HalTensorImage { inner: image }))
 }
 
+/// Create a multiplane tensor image from separate Y and UV DMA-BUF file descriptors.
+///
+/// This is used for V4L2 multi-planar NV12 (`V4L2_PIX_FMT_NV12M`) where the
+/// Y and UV planes are in separate DMA-BUF allocations.
+///
+/// **Ownership**: Ownership is transferred once the function validates that
+/// both FDs are non-negative, non-zero dimensions, and distinct. After that
+/// point, the HAL closes them on any error. If validation of the FD values
+/// themselves fails (negative FD, zero dimensions, or `y_fd == uv_fd`), the
+/// caller retains ownership.
+///
+/// @param y_fd    DMA-BUF file descriptor for the Y (luma) plane
+/// @param width   Image width in pixels
+/// @param height  Image height in pixels
+/// @param uv_fd   DMA-BUF file descriptor for the UV (chroma) plane
+/// @param fourcc  Pixel format (must be HAL_FOURCC_NV12 or HAL_FOURCC_NV16)
+/// @param out     Receives the new tensor image handle on success
+/// @return 0 on success, -1 on error (errno set)
+/// @par Errors (errno):
+/// - EINVAL: Invalid argument or unsupported fourcc
+/// - EIO:    Failed to wrap DMA-BUF file descriptor
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_image_from_planes(
+    y_fd: c_int,
+    width: u32,
+    height: u32,
+    uv_fd: c_int,
+    fourcc: HalFourcc,
+    out: *mut *mut HalTensorImage,
+) -> c_int {
+    check_null!(out);
+    if y_fd < 0 || uv_fd < 0 || width == 0 || height == 0 {
+        set_error(libc::EINVAL);
+        return -1;
+    }
+    if y_fd == uv_fd {
+        set_error(libc::EINVAL);
+        return -1;
+    }
+
+    // Take ownership of the file descriptors early so they auto-close on any
+    // subsequent error return, making the documented ownership contract truthful.
+    use std::os::unix::io::FromRawFd;
+    let y_owned = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(y_fd) };
+    let uv_owned = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(uv_fd) };
+
+    let fc = fourcc.to_fourcc();
+    let w = width as usize;
+    let h = height as usize;
+
+    // Determine chroma height based on format
+    let chroma_h = if fc == NV12 {
+        h / 2
+    } else if fc == NV16 {
+        h
+    } else {
+        set_error(libc::EINVAL);
+        return -1; // y_owned and uv_owned drop here, closing FDs
+    };
+
+    let luma = match edgefirst_tensor::Tensor::<u8>::from_fd(y_owned, &[h, w], Some("luma")) {
+        Ok(t) => t,
+        Err(_) => {
+            set_error(libc::EIO);
+            return -1;
+        }
+    };
+
+    let chroma =
+        match edgefirst_tensor::Tensor::<u8>::from_fd(uv_owned, &[chroma_h, w], Some("chroma")) {
+            Ok(t) => t,
+            Err(_) => {
+                set_error(libc::EIO);
+                return -1;
+            }
+        };
+
+    let image = match TensorImage::from_planes(luma, chroma, fc) {
+        Ok(img) => img,
+        Err(_) => {
+            set_error(libc::EINVAL);
+            return -1;
+        }
+    };
+
+    unsafe { *out = Box::into_raw(Box::new(HalTensorImage { inner: image })) };
+    0
+}
+
 /// Load a JPEG image from memory.
 ///
 /// @param data Pointer to JPEG data
@@ -751,6 +841,61 @@ pub unsafe extern "C" fn hal_tensor_image_map_create(
 #[no_mangle]
 pub unsafe extern "C" fn hal_image_processor_new() -> *mut HalImageProcessor {
     let processor = try_or_null!(ImageProcessor::new(), libc::ENOTSUP);
+    Box::into_raw(Box::new(HalImageProcessor { inner: processor }))
+}
+
+/// Compute backend selection for image processing.
+///
+/// @see hal_image_processor_new_with_backend
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HalComputeBackend {
+    /// Auto-detect based on hardware and environment variables.
+    Auto = 0,
+    /// CPU-only processing.
+    Cpu = 1,
+    /// Prefer G2D hardware blitter (with CPU fallback).
+    G2d = 2,
+    /// Prefer OpenGL ES (with CPU fallback).
+    #[allow(non_camel_case_types)]
+    Opengl = 3,
+}
+
+impl From<HalComputeBackend> for ComputeBackend {
+    fn from(b: HalComputeBackend) -> Self {
+        match b {
+            HalComputeBackend::Auto => ComputeBackend::Auto,
+            HalComputeBackend::Cpu => ComputeBackend::Cpu,
+            HalComputeBackend::G2d => ComputeBackend::G2d,
+            HalComputeBackend::Opengl => ComputeBackend::OpenGl,
+        }
+    }
+}
+
+/// Create a new image processor with a specific compute backend.
+///
+/// When `backend` is not `HAL_COMPUTE_BACKEND_AUTO`, the processor
+/// initializes the requested backend plus CPU as a fallback chain.
+/// Environment variables (`EDGEFIRST_FORCE_BACKEND`, `EDGEFIRST_DISABLE_*`)
+/// are ignored in this case.
+///
+/// @param backend Preferred compute backend
+/// @return New image processor handle on success, NULL on error
+/// @par Errors (errno):
+/// - ENOMEM: Memory allocation failed
+/// - ENOTSUP: No suitable image processing backend available
+#[no_mangle]
+pub unsafe extern "C" fn hal_image_processor_new_with_backend(
+    backend: HalComputeBackend,
+) -> *mut HalImageProcessor {
+    // `needless_update` fires on macOS where `ImageProcessorConfig` has only
+    // `backend`, but on Linux the struct also has the cfg-gated `egl_display`.
+    #[allow(clippy::needless_update)]
+    let config = ImageProcessorConfig {
+        backend: backend.into(),
+        ..Default::default()
+    };
+    let processor = try_or_null!(ImageProcessor::with_config(config), libc::ENOTSUP);
     Box::into_raw(Box::new(HalImageProcessor { inner: processor }))
 }
 
