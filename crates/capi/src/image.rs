@@ -477,9 +477,11 @@ pub unsafe extern "C" fn hal_tensor_image_from_tensor(
 /// This is used for V4L2 multi-planar NV12 (`V4L2_PIX_FMT_NV12M`) where the
 /// Y and UV planes are in separate DMA-BUF allocations.
 ///
-/// **Ownership**: The HAL always takes ownership of both file descriptors,
-/// even on error. The caller must not close `y_fd` or `uv_fd` after calling
-/// this function. The two file descriptors must be distinct (`y_fd != uv_fd`).
+/// **Ownership**: Ownership is transferred once the function validates that
+/// both FDs are non-negative, non-zero dimensions, and distinct. After that
+/// point, the HAL closes them on any error. If validation of the FD values
+/// themselves fails (negative FD, zero dimensions, or `y_fd == uv_fd`), the
+/// caller retains ownership.
 ///
 /// @param y_fd    DMA-BUF file descriptor for the Y (luma) plane
 /// @param width   Image width in pixels
@@ -510,6 +512,12 @@ pub unsafe extern "C" fn hal_tensor_image_from_planes(
         return -1;
     }
 
+    // Take ownership of the file descriptors early so they auto-close on any
+    // subsequent error return, making the documented ownership contract truthful.
+    use std::os::unix::io::FromRawFd;
+    let y_owned = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(y_fd) };
+    let uv_owned = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(uv_fd) };
+
     let fc = fourcc.to_fourcc();
     let w = width as usize;
     let h = height as usize;
@@ -521,13 +529,8 @@ pub unsafe extern "C" fn hal_tensor_image_from_planes(
         h
     } else {
         set_error(libc::EINVAL);
-        return -1;
+        return -1; // y_owned and uv_owned drop here, closing FDs
     };
-
-    // Take ownership of the file descriptors
-    use std::os::unix::io::FromRawFd;
-    let y_owned = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(y_fd) };
-    let uv_owned = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(uv_fd) };
 
     let luma = match edgefirst_tensor::Tensor::<u8>::from_fd(y_owned, &[h, w], Some("luma")) {
         Ok(t) => t,

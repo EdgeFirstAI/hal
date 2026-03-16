@@ -127,11 +127,10 @@ impl log::Log for HalLogger {
                     record.target(),
                     record.args()
                 );
-                if let Ok(c_msg) = CString::new(msg) {
-                    unsafe {
-                        libc::fputs(c_msg.as_ptr(), *stream);
-                        libc::fflush(*stream);
-                    }
+                let c_msg = to_cstring(&msg);
+                unsafe {
+                    libc::fputs(c_msg.as_ptr(), *stream);
+                    libc::fflush(*stream);
                 }
             }
             LoggerKind::Callback { cb, userdata } => {
