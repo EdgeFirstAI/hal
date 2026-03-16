@@ -415,8 +415,21 @@ Python wheels are built separately via `maturin` in CI.
 
 ### Pre-Commit Verification (MANDATORY)
 
-**Before every commit, you MUST run the full verification suite and confirm
-all steps pass. Never commit with failing checks.**
+**You MUST run `make format lint` before EVERY commit.** No exceptions.
+**You MUST run `make sbom` before EVERY pull request.** No exceptions.
+
+These are non-negotiable gates. If either fails, fix the issue before
+proceeding. Do not skip, defer, or rationalize skipping these steps.
+
+```bash
+# Before EVERY commit:
+make format lint
+
+# Before EVERY PR (in addition to format + lint):
+make sbom
+```
+
+For a full pre-commit verification (recommended but not always required):
 
 ```bash
 make format lint check test sbom
