@@ -1509,144 +1509,6 @@ use crate::yolo::postprocess_yolo_seg;
 #[cfg(feature = "tracker")]
 impl Decoder {
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn decode_tracked_modelpack_det_quantized<
-        TR: edgefirst_tracker::Tracker<DetectBox>,
-    >(
-        &self,
-        tracker: &mut TR,
-        timestamp: u64,
-        outputs: &[ArrayViewDQuantized],
-        boxes: &configs::Boxes,
-        scores: &configs::Scores,
-        output_boxes: &mut Vec<DetectBox>,
-        output_tracks: &mut Vec<TrackInfo>,
-    ) -> Result<(), DecoderError> {
-        let (boxes_tensor, ind) =
-            Self::find_outputs_with_shape_quantized(&boxes.shape, outputs, &[])?;
-        let (scores_tensor, _) =
-            Self::find_outputs_with_shape_quantized(&scores.shape, outputs, &[ind])?;
-        let quant_boxes = boxes
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-        let quant_scores = scores
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-
-        with_quantized!(boxes_tensor, b, {
-            with_quantized!(scores_tensor, s, {
-                let boxes_tensor = Self::swap_axes_if_needed(b, boxes.into());
-                let boxes_tensor = boxes_tensor.slice(s![0, .., 0, ..]);
-
-                let scores_tensor = Self::swap_axes_if_needed(s, scores.into());
-                let scores_tensor = scores_tensor.slice(s![0, .., ..]);
-                decode_modelpack_det(
-                    (boxes_tensor, quant_boxes),
-                    (scores_tensor, quant_scores),
-                    self.score_threshold,
-                    self.iou_threshold,
-                    output_boxes,
-                );
-            });
-        });
-
-        Self::update_tracker(tracker, timestamp, output_boxes, output_tracks);
-        Ok(())
-    }
-
-    pub(super) fn decode_tracked_modelpack_det_split_quantized<
-        TR: edgefirst_tracker::Tracker<DetectBox>,
-    >(
-        &self,
-        tracker: &mut TR,
-        timestamp: u64,
-        outputs: &[ArrayViewDQuantized],
-        detection: &[configs::Detection],
-        output_boxes: &mut Vec<DetectBox>,
-        output_tracks: &mut Vec<TrackInfo>,
-    ) -> Result<(), DecoderError> {
-        let new_detection = detection
-            .iter()
-            .map(|x| match &x.anchors {
-                None => Err(DecoderError::InvalidConfig(
-                    "ModelPack Split Detection missing anchors".to_string(),
-                )),
-                Some(a) => Ok(ModelPackDetectionConfig {
-                    anchors: a.clone(),
-                    quantization: None,
-                }),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let new_outputs = Self::match_outputs_to_detect_quantized(detection, outputs)?;
-
-        macro_rules! dequant_output {
-            ($det_tensor:expr, $detection:expr) => {{
-                let det_tensor = Self::swap_axes_if_needed($det_tensor, $detection.into());
-                let det_tensor = det_tensor.slice(s![0, .., .., ..]);
-                if let Some(q) = $detection.quantization {
-                    dequantize_ndarray(det_tensor, q.into())
-                } else {
-                    det_tensor.map(|x| *x as f32)
-                }
-            }};
-        }
-
-        let new_outputs = new_outputs
-            .iter()
-            .zip(detection)
-            .map(|(det_tensor, detection)| {
-                with_quantized!(det_tensor, d, dequant_output!(d, detection))
-            })
-            .collect::<Vec<_>>();
-
-        let new_outputs_view = new_outputs
-            .iter()
-            .map(|d: &Array3<f32>| d.view())
-            .collect::<Vec<_>>();
-        decode_modelpack_split_float(
-            &new_outputs_view,
-            &new_detection,
-            self.score_threshold,
-            self.iou_threshold,
-            output_boxes,
-        );
-        Self::update_tracker(tracker, timestamp, output_boxes, output_tracks);
-        Ok(())
-    }
-
-    pub(super) fn decode_tracked_yolo_det_quantized<TR: edgefirst_tracker::Tracker<DetectBox>>(
-        &self,
-        tracker: &mut TR,
-        timestamp: u64,
-        outputs: &[ArrayViewDQuantized],
-        boxes: &configs::Detection,
-        output_boxes: &mut Vec<DetectBox>,
-        output_tracks: &mut Vec<TrackInfo>,
-    ) -> Result<(), DecoderError> {
-        let (boxes_tensor, _) =
-            Self::find_outputs_with_shape_quantized(&boxes.shape, outputs, &[])?;
-        let quant_boxes = boxes
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-
-        with_quantized!(boxes_tensor, b, {
-            let boxes_tensor = Self::swap_axes_if_needed(b, boxes.into());
-            let boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
-            decode_yolo_det(
-                (boxes_tensor, quant_boxes),
-                self.score_threshold,
-                self.iou_threshold,
-                self.nms,
-                output_boxes,
-            );
-        });
-        Self::update_tracker(tracker, timestamp, output_boxes, output_tracks);
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn decode_tracked_yolo_segdet_quantized<
         TR: edgefirst_tracker::Tracker<DetectBox>,
     >(
@@ -1710,54 +1572,6 @@ impl Decoder {
                 output_boxes.extend(old_boxes);
             })
         });
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn decode_tracked_yolo_split_det_quantized<
-        TR: edgefirst_tracker::Tracker<DetectBox>,
-    >(
-        &self,
-        tracker: &mut TR,
-        timestamp: u64,
-        outputs: &[ArrayViewDQuantized],
-        boxes: &configs::Boxes,
-        scores: &configs::Scores,
-        output_boxes: &mut Vec<DetectBox>,
-        output_tracks: &mut Vec<TrackInfo>,
-    ) -> Result<(), DecoderError> {
-        let (boxes_tensor, ind) =
-            Self::find_outputs_with_shape_quantized(&boxes.shape, outputs, &[])?;
-        let (scores_tensor, _) =
-            Self::find_outputs_with_shape_quantized(&scores.shape, outputs, &[ind])?;
-        let quant_boxes = boxes
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-        let quant_scores = scores
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-
-        with_quantized!(boxes_tensor, b, {
-            with_quantized!(scores_tensor, s, {
-                let boxes_tensor = Self::swap_axes_if_needed(b, boxes.into());
-                let boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
-
-                let scores_tensor = Self::swap_axes_if_needed(s, scores.into());
-                let scores_tensor = scores_tensor.slice(s![0, .., ..]);
-                decode_yolo_split_det_quant(
-                    (boxes_tensor, quant_boxes),
-                    (scores_tensor, quant_scores),
-                    self.score_threshold,
-                    self.iou_threshold,
-                    self.nms,
-                    output_boxes,
-                );
-            });
-        });
-
-        Self::update_tracker(tracker, timestamp, output_boxes, output_tracks);
         Ok(())
     }
 
@@ -1857,114 +1671,6 @@ impl Decoder {
         Ok(())
     }
 
-    pub(super) fn decode_tracked_modelpack_det_split_float<
-        TR: edgefirst_tracker::Tracker<DetectBox>,
-        D,
-    >(
-        &self,
-        tracker: &mut TR,
-        timestamp: u64,
-        outputs: &[ArrayViewD<D>],
-        detection: &[configs::Detection],
-        output_boxes: &mut Vec<DetectBox>,
-        output_tracks: &mut Vec<TrackInfo>,
-    ) -> Result<(), DecoderError>
-    where
-        D: AsPrimitive<f32>,
-    {
-        let new_detection = detection
-            .iter()
-            .map(|x| match &x.anchors {
-                None => Err(DecoderError::InvalidConfig(
-                    "ModelPack Split Detection missing anchors".to_string(),
-                )),
-                Some(a) => Ok(ModelPackDetectionConfig {
-                    anchors: a.clone(),
-                    quantization: None,
-                }),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let new_outputs = Self::match_outputs_to_detect(detection, outputs)?;
-        let new_outputs = new_outputs
-            .into_iter()
-            .map(|x| x.slice(s![0, .., .., ..]))
-            .collect::<Vec<_>>();
-
-        decode_modelpack_split_float(
-            &new_outputs,
-            &new_detection,
-            self.score_threshold,
-            self.iou_threshold,
-            output_boxes,
-        );
-        Self::update_tracker(tracker, timestamp, output_boxes, output_tracks);
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn decode_tracked_modelpack_det_float<TR: edgefirst_tracker::Tracker<DetectBox>, T>(
-        &self,
-        tracker: &mut TR,
-        timestamp: u64,
-        outputs: &[ArrayViewD<T>],
-        boxes: &configs::Boxes,
-        scores: &configs::Scores,
-        output_boxes: &mut Vec<DetectBox>,
-        output_tracks: &mut Vec<TrackInfo>,
-    ) -> Result<(), DecoderError>
-    where
-        T: Float + AsPrimitive<f32> + Send + Sync + 'static,
-        f32: AsPrimitive<T>,
-    {
-        let (boxes_tensor, ind) = Self::find_outputs_with_shape(&boxes.shape, outputs, &[])?;
-
-        let boxes_tensor = Self::swap_axes_if_needed(boxes_tensor, boxes.into());
-        let boxes_tensor = boxes_tensor.slice(s![0, .., 0, ..]);
-
-        let (scores_tensor, _) = Self::find_outputs_with_shape(&scores.shape, outputs, &[ind])?;
-        let scores_tensor = Self::swap_axes_if_needed(scores_tensor, scores.into());
-        let scores_tensor = scores_tensor.slice(s![0, .., ..]);
-
-        decode_modelpack_float(
-            boxes_tensor,
-            scores_tensor,
-            self.score_threshold,
-            self.iou_threshold,
-            output_boxes,
-        );
-        Self::update_tracker(tracker, timestamp, output_boxes, output_tracks);
-        Ok(())
-    }
-
-    pub(super) fn decode_tracked_yolo_det_float<TR: edgefirst_tracker::Tracker<DetectBox>, T>(
-        &self,
-        tracker: &mut TR,
-        timestamp: u64,
-        outputs: &[ArrayViewD<T>],
-        boxes: &configs::Detection,
-        output_boxes: &mut Vec<DetectBox>,
-        output_tracks: &mut Vec<TrackInfo>,
-    ) -> Result<(), DecoderError>
-    where
-        T: Float + AsPrimitive<f32> + Send + Sync + 'static,
-        f32: AsPrimitive<T>,
-    {
-        let (boxes_tensor, _) = Self::find_outputs_with_shape(&boxes.shape, outputs, &[])?;
-
-        let boxes_tensor = Self::swap_axes_if_needed(boxes_tensor, boxes.into());
-        let boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
-        decode_yolo_det_float(
-            boxes_tensor,
-            self.score_threshold,
-            self.iou_threshold,
-            self.nms,
-            output_boxes,
-        );
-        Self::update_tracker(tracker, timestamp, output_boxes, output_tracks);
-        Ok(())
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(super) fn decode_tracked_yolo_segdet_float<TR: edgefirst_tracker::Tracker<DetectBox>, T>(
         &self,
@@ -2018,45 +1724,6 @@ impl Decoder {
         )?;
 
         output_boxes.extend(old_boxes);
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn decode_tracked_yolo_split_det_float<
-        TR: edgefirst_tracker::Tracker<DetectBox>,
-        T,
-    >(
-        &self,
-        tracker: &mut TR,
-        timestamp: u64,
-        outputs: &[ArrayViewD<T>],
-        boxes: &configs::Boxes,
-        scores: &configs::Scores,
-        output_boxes: &mut Vec<DetectBox>,
-        output_tracks: &mut Vec<TrackInfo>,
-    ) -> Result<(), DecoderError>
-    where
-        T: Float + AsPrimitive<f32> + Send + Sync + 'static,
-        f32: AsPrimitive<T>,
-    {
-        let (boxes_tensor, ind) = Self::find_outputs_with_shape(&boxes.shape, outputs, &[])?;
-        let boxes_tensor = Self::swap_axes_if_needed(boxes_tensor, boxes.into());
-        let boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
-
-        let (scores_tensor, _) = Self::find_outputs_with_shape(&scores.shape, outputs, &[ind])?;
-
-        let scores_tensor = Self::swap_axes_if_needed(scores_tensor, scores.into());
-        let scores_tensor = scores_tensor.slice(s![0, .., ..]);
-
-        decode_yolo_split_det_float(
-            boxes_tensor,
-            scores_tensor,
-            self.score_threshold,
-            self.iou_threshold,
-            self.nms,
-            output_boxes,
-        );
-        Self::update_tracker(tracker, timestamp, output_boxes, output_tracks);
         Ok(())
     }
 
@@ -2134,40 +1801,6 @@ impl Decoder {
         Ok(())
     }
 
-    /// Decodes end-to-end YOLO detection outputs (post-NMS from model).
-    ///
-    /// Input shape: (1, N, 6+) where columns are [x1, y1, x2, y2, conf, class,
-    /// ...] Boxes are output directly from model (may be normalized or
-    /// pixel coords depending on config).
-    pub(super) fn decode_tracked_yolo_end_to_end_det_float<
-        TR: edgefirst_tracker::Tracker<DetectBox>,
-        T,
-    >(
-        &self,
-        tracker: &mut TR,
-        timestamp: u64,
-        outputs: &[ArrayViewD<T>],
-        boxes_config: &configs::Detection,
-        output_boxes: &mut Vec<DetectBox>,
-        output_tracks: &mut Vec<TrackInfo>,
-    ) -> Result<(), DecoderError>
-    where
-        T: Float + AsPrimitive<f32> + Send + Sync + 'static,
-        f32: AsPrimitive<T>,
-    {
-        let (det_tensor, _) = Self::find_outputs_with_shape(&boxes_config.shape, outputs, &[])?;
-        let det_tensor = Self::swap_axes_if_needed(det_tensor, boxes_config.into());
-        let det_tensor = det_tensor.slice(s![0, .., ..]);
-
-        crate::yolo::decode_yolo_end_to_end_det_float(
-            det_tensor,
-            self.score_threshold,
-            output_boxes,
-        )?;
-        Self::update_tracker(tracker, timestamp, output_boxes, output_tracks);
-        Ok(())
-    }
-
     /// Decodes end-to-end YOLO detection + segmentation outputs (post-NMS from
     /// model).
     ///
@@ -2240,43 +1873,6 @@ impl Decoder {
             output_masks,
         )?;
         output_boxes.extend(old_boxes);
-        Ok(())
-    }
-
-    /// Decodes monolithic end-to-end YOLO detection from quantized tensors.
-    /// Dequantizes then delegates to the float decode path.
-    pub(super) fn decode_tracked_yolo_end_to_end_det_quantized<
-        TR: edgefirst_tracker::Tracker<DetectBox>,
-    >(
-        &self,
-        tracker: &mut TR,
-        timestamp: u64,
-        outputs: &[ArrayViewDQuantized],
-        boxes_config: &configs::Detection,
-        output_boxes: &mut Vec<DetectBox>,
-        output_tracks: &mut Vec<TrackInfo>,
-    ) -> Result<(), DecoderError> {
-        let (det_tensor, _) =
-            Self::find_outputs_with_shape_quantized(&boxes_config.shape, outputs, &[])?;
-        let quant = boxes_config
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-
-        with_quantized!(det_tensor, d, {
-            let d = Self::swap_axes_if_needed(d, boxes_config.into());
-            let d = d.slice(s![0, .., ..]);
-            let dequant = d.map(|v| {
-                let val: f32 = v.as_();
-                (val - quant.zero_point as f32) * quant.scale
-            });
-            crate::yolo::decode_yolo_end_to_end_det_float(
-                dequant.view(),
-                self.score_threshold,
-                output_boxes,
-            )?;
-        });
-        Self::update_tracker(tracker, timestamp, output_boxes, output_tracks);
         Ok(())
     }
 
@@ -2382,55 +1978,6 @@ impl Decoder {
         Ok(())
     }
 
-    /// Decodes split end-to-end YOLO detection from float tensors.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn decode_tracked_yolo_split_end_to_end_det_float<
-        TR: edgefirst_tracker::Tracker<DetectBox>,
-        T,
-    >(
-        &self,
-        tracker: &mut TR,
-        timestamp: u64,
-        outputs: &[ArrayViewD<T>],
-        boxes_config: &configs::Boxes,
-        scores_config: &configs::Scores,
-        classes_config: &configs::Classes,
-        output_boxes: &mut Vec<DetectBox>,
-        output_tracks: &mut Vec<TrackInfo>,
-    ) -> Result<(), DecoderError>
-    where
-        T: Float + AsPrimitive<f32> + Send + Sync + 'static,
-        f32: AsPrimitive<T>,
-    {
-        let mut skip = vec![];
-        let (boxes_tensor, ind) =
-            Self::find_outputs_with_shape(&boxes_config.shape, outputs, &skip)?;
-        let boxes_tensor = Self::swap_axes_if_needed(boxes_tensor, boxes_config.into());
-        let boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
-        skip.push(ind);
-
-        let (scores_tensor, ind) =
-            Self::find_outputs_with_shape(&scores_config.shape, outputs, &skip)?;
-        let scores_tensor = Self::swap_axes_if_needed(scores_tensor, scores_config.into());
-        let scores_tensor = scores_tensor.slice(s![0, .., ..]);
-        skip.push(ind);
-
-        let (classes_tensor, _) =
-            Self::find_outputs_with_shape(&classes_config.shape, outputs, &skip)?;
-        let classes_tensor = Self::swap_axes_if_needed(classes_tensor, classes_config.into());
-        let classes_tensor = classes_tensor.slice(s![0, .., ..]);
-
-        crate::yolo::decode_yolo_split_end_to_end_det_float(
-            boxes_tensor,
-            scores_tensor,
-            classes_tensor,
-            self.score_threshold,
-            output_boxes,
-        )?;
-        Self::update_tracker(tracker, timestamp, output_boxes, output_tracks);
-        Ok(())
-    }
-
     /// Decodes split end-to-end YOLO seg detection from float tensors.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn decode_tracked_yolo_split_end_to_end_segdet_float<
@@ -2518,75 +2065,6 @@ impl Decoder {
 
         output_boxes.extend(old_boxes);
 
-        Ok(())
-    }
-
-    /// Decodes split end-to-end YOLO detection from quantized tensors.
-    /// Dequantizes each tensor then delegates to the float decode path.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn decode_tracked_yolo_split_end_to_end_det_quantized<
-        TR: edgefirst_tracker::Tracker<DetectBox>,
-    >(
-        &self,
-        tracker: &mut TR,
-        timestamp: u64,
-        outputs: &[ArrayViewDQuantized],
-        boxes_config: &configs::Boxes,
-        scores_config: &configs::Scores,
-        classes_config: &configs::Classes,
-        output_boxes: &mut Vec<DetectBox>,
-        output_tracks: &mut Vec<TrackInfo>,
-    ) -> Result<(), DecoderError> {
-        let mut skip = vec![];
-        let (boxes_tensor, ind) =
-            Self::find_outputs_with_shape_quantized(&boxes_config.shape, outputs, &skip)?;
-        skip.push(ind);
-        let (scores_tensor, ind) =
-            Self::find_outputs_with_shape_quantized(&scores_config.shape, outputs, &skip)?;
-        skip.push(ind);
-        let (classes_tensor, _) =
-            Self::find_outputs_with_shape_quantized(&classes_config.shape, outputs, &skip)?;
-
-        let quant_boxes = boxes_config
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-        let quant_scores = scores_config
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-        let quant_classes = classes_config
-            .quantization
-            .map(Quantization::from)
-            .unwrap_or_default();
-
-        // Dequantize each tensor independently to avoid monomorphization explosion.
-        // Nesting N with_quantized! calls produces 6^N instantiations; sequential is 6*N.
-        macro_rules! dequant_3d {
-            ($tensor:expr, $config:expr, $quant:expr) => {{
-                with_quantized!($tensor, t, {
-                    let t = Self::swap_axes_if_needed(t, $config.into());
-                    let t = t.slice(s![0, .., ..]);
-                    t.map(|v| {
-                        let val: f32 = v.as_();
-                        (val - $quant.zero_point as f32) * $quant.scale
-                    })
-                })
-            }};
-        }
-
-        let dequant_b = dequant_3d!(boxes_tensor, boxes_config, quant_boxes);
-        let dequant_s = dequant_3d!(scores_tensor, scores_config, quant_scores);
-        let dequant_c = dequant_3d!(classes_tensor, classes_config, quant_classes);
-
-        crate::yolo::decode_yolo_split_end_to_end_det_float(
-            dequant_b.view(),
-            dequant_s.view(),
-            dequant_c.view(),
-            self.score_threshold,
-            output_boxes,
-        )?;
-        Self::update_tracker(tracker, timestamp, output_boxes, output_tracks);
         Ok(())
     }
 
@@ -3408,7 +2886,7 @@ impl Decoder {
         (live_boxes, old_boxes)
     }
 
-    fn update_tracker<TR: edgefirst_tracker::Tracker<DetectBox>>(
+    pub(super) fn update_tracker<TR: edgefirst_tracker::Tracker<DetectBox>>(
         tracker: &mut TR,
         timestamp: u64,
         output_boxes: &mut Vec<DetectBox>,

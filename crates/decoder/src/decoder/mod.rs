@@ -752,67 +752,10 @@ impl Decoder {
         output_boxes.clear();
         output_masks.clear();
         output_tracks.clear();
+
+        // yolo segdet variants require special handling to seperate boxes that come from decoding vs active tracks.
+        // Only boxes that come from decoding can be used for proto/mask generation.
         match &self.model_type {
-            ModelType::ModelPackSegDet {
-                boxes,
-                scores,
-                segmentation,
-            } => {
-                self.decode_tracked_modelpack_det_quantized(
-                    tracker,
-                    timestamp,
-                    outputs,
-                    boxes,
-                    scores,
-                    output_boxes,
-                    output_tracks,
-                )?;
-                self.decode_modelpack_seg_quantized(outputs, segmentation, output_masks)
-            }
-            ModelType::ModelPackSegDetSplit {
-                detection,
-                segmentation,
-            } => {
-                self.decode_tracked_modelpack_det_split_quantized(
-                    tracker,
-                    timestamp,
-                    outputs,
-                    detection,
-                    output_boxes,
-                    output_tracks,
-                )?;
-                self.decode_modelpack_seg_quantized(outputs, segmentation, output_masks)
-            }
-            ModelType::ModelPackDet { boxes, scores } => self
-                .decode_tracked_modelpack_det_quantized(
-                    tracker,
-                    timestamp,
-                    outputs,
-                    boxes,
-                    scores,
-                    output_boxes,
-                    output_tracks,
-                ),
-            ModelType::ModelPackDetSplit { detection } => self
-                .decode_tracked_modelpack_det_split_quantized(
-                    tracker,
-                    timestamp,
-                    outputs,
-                    detection,
-                    output_boxes,
-                    output_tracks,
-                ),
-            ModelType::ModelPackSeg { segmentation } => {
-                self.decode_modelpack_seg_quantized(outputs, segmentation, output_masks)
-            }
-            ModelType::YoloDet { boxes } => self.decode_tracked_yolo_det_quantized(
-                tracker,
-                timestamp,
-                outputs,
-                boxes,
-                output_boxes,
-                output_tracks,
-            ),
             ModelType::YoloSegDet { boxes, protos } => self.decode_tracked_yolo_segdet_quantized(
                 tracker,
                 timestamp,
@@ -823,16 +766,6 @@ impl Decoder {
                 output_masks,
                 output_tracks,
             ),
-            ModelType::YoloSplitDet { boxes, scores } => self
-                .decode_tracked_yolo_split_det_quantized(
-                    tracker,
-                    timestamp,
-                    outputs,
-                    boxes,
-                    scores,
-                    output_boxes,
-                    output_tracks,
-                ),
             ModelType::YoloSplitSegDet {
                 boxes,
                 scores,
@@ -850,15 +783,6 @@ impl Decoder {
                 output_masks,
                 output_tracks,
             ),
-            ModelType::YoloEndToEndDet { boxes } => self
-                .decode_tracked_yolo_end_to_end_det_quantized(
-                    tracker,
-                    timestamp,
-                    outputs,
-                    boxes,
-                    output_boxes,
-                    output_tracks,
-                ),
             ModelType::YoloEndToEndSegDet { boxes, protos } => self
                 .decode_tracked_yolo_end_to_end_segdet_quantized(
                     tracker,
@@ -870,20 +794,6 @@ impl Decoder {
                     output_masks,
                     output_tracks,
                 ),
-            ModelType::YoloSplitEndToEndDet {
-                boxes,
-                scores,
-                classes,
-            } => self.decode_tracked_yolo_split_end_to_end_det_quantized(
-                tracker,
-                timestamp,
-                outputs,
-                boxes,
-                scores,
-                classes,
-                output_boxes,
-                output_tracks,
-            ),
             ModelType::YoloSplitEndToEndSegDet {
                 boxes,
                 scores,
@@ -903,6 +813,11 @@ impl Decoder {
                 output_masks,
                 output_tracks,
             ),
+            _ => {
+                self.decode_quantized(outputs, output_boxes, output_masks)?;
+                Self::update_tracker(tracker, timestamp, output_boxes, output_tracks);
+                Ok(())
+            }
         }
     }
 
@@ -979,70 +894,6 @@ impl Decoder {
         output_masks.clear();
         output_tracks.clear();
         match &self.model_type {
-            ModelType::ModelPackSegDet {
-                boxes,
-                scores,
-                segmentation,
-            } => {
-                self.decode_tracked_modelpack_det_float(
-                    tracker,
-                    timestamp,
-                    outputs,
-                    boxes,
-                    scores,
-                    output_boxes,
-                    output_tracks,
-                )?;
-                self.decode_modelpack_seg_float(outputs, segmentation, output_masks)?;
-            }
-            ModelType::ModelPackSegDetSplit {
-                detection,
-                segmentation,
-            } => {
-                self.decode_tracked_modelpack_det_split_float(
-                    tracker,
-                    timestamp,
-                    outputs,
-                    detection,
-                    output_boxes,
-                    output_tracks,
-                )?;
-                self.decode_modelpack_seg_float(outputs, segmentation, output_masks)?;
-            }
-            ModelType::ModelPackDet { boxes, scores } => {
-                self.decode_tracked_modelpack_det_float(
-                    tracker,
-                    timestamp,
-                    outputs,
-                    boxes,
-                    scores,
-                    output_boxes,
-                    output_tracks,
-                )?;
-            }
-            ModelType::ModelPackDetSplit { detection } => {
-                self.decode_tracked_modelpack_det_split_float(
-                    tracker,
-                    timestamp,
-                    outputs,
-                    detection,
-                    output_boxes,
-                    output_tracks,
-                )?;
-            }
-            ModelType::ModelPackSeg { segmentation } => {
-                self.decode_modelpack_seg_float(outputs, segmentation, output_masks)?;
-            }
-            ModelType::YoloDet { boxes } => {
-                self.decode_tracked_yolo_det_float(
-                    tracker,
-                    timestamp,
-                    outputs,
-                    boxes,
-                    output_boxes,
-                    output_tracks,
-                )?;
-            }
             ModelType::YoloSegDet { boxes, protos } => {
                 self.decode_tracked_yolo_segdet_float(
                     tracker,
@@ -1052,17 +903,6 @@ impl Decoder {
                     protos,
                     output_boxes,
                     output_masks,
-                    output_tracks,
-                )?;
-            }
-            ModelType::YoloSplitDet { boxes, scores } => {
-                self.decode_tracked_yolo_split_det_float(
-                    tracker,
-                    timestamp,
-                    outputs,
-                    boxes,
-                    scores,
-                    output_boxes,
                     output_tracks,
                 )?;
             }
@@ -1085,16 +925,6 @@ impl Decoder {
                     output_tracks,
                 )?;
             }
-            ModelType::YoloEndToEndDet { boxes } => {
-                self.decode_tracked_yolo_end_to_end_det_float(
-                    tracker,
-                    timestamp,
-                    outputs,
-                    boxes,
-                    output_boxes,
-                    output_tracks,
-                )?;
-            }
             ModelType::YoloEndToEndSegDet { boxes, protos } => {
                 self.decode_tracked_yolo_end_to_end_segdet_float(
                     tracker,
@@ -1104,22 +934,6 @@ impl Decoder {
                     protos,
                     output_boxes,
                     output_masks,
-                    output_tracks,
-                )?;
-            }
-            ModelType::YoloSplitEndToEndDet {
-                boxes,
-                scores,
-                classes,
-            } => {
-                self.decode_tracked_yolo_split_end_to_end_det_float(
-                    tracker,
-                    timestamp,
-                    outputs,
-                    boxes,
-                    scores,
-                    classes,
-                    output_boxes,
                     output_tracks,
                 )?;
             }
@@ -1143,6 +957,10 @@ impl Decoder {
                     output_masks,
                     output_tracks,
                 )?;
+            }
+            _ => {
+                self.decode_float(outputs, output_boxes, output_masks)?;
+                Self::update_tracker(tracker, timestamp, output_boxes, output_tracks);
             }
         }
         Ok(())
