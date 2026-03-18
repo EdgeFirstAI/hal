@@ -1,8 +1,8 @@
 # EdgeFirst HAL - Benchmarks
 
-**Version:** 1.4
-**Last Updated:** March 13, 2026
-**Status:** Added planar RGB format benchmarks (8BPS/8BPi), documented NV12→planar GPU hang on Vivante, updated all platforms
+**Version:** 1.5
+**Last Updated:** March 18, 2026
+**Status:** Removed stale known issues, updated documentation accuracy
 
 ---
 
@@ -137,7 +137,7 @@ JSON files are collected in `benchmarks/<platform>/` and processed by `.github/s
 | **OS** | NXP BSP (Linux 6.12) |
 | **G2D** | Yes (Vivante) |
 | **DMA-buf** | Yes (CMA) |
-| **Notes** | NXP evaluation board; same SoC as maivin, latest NXP BSP. **NV12→planar blocked on GL** (GPU hang, see Known Issues §10). |
+| **Notes** | NXP evaluation board; same SoC as maivin, latest NXP BSP. **NV12→planar blocked on GL** (GPU hang, see Known Issues §9). |
 
 ### imx95-frdm
 
@@ -271,7 +271,7 @@ Planar formats (8BPS = PLANAR_RGB, 8BPi = PLANAR_RGB_INT8) use separate memory p
 | x86-desktop | GL | PBO | — | — | — | — |
 | x86-desktop | CPU | Heap | 1.5 ms | 1.5 ms | 1.1 ms | 1.2 ms |
 
-> **BLOCKED:** NV12→planar on Vivante GC7000UL causes an unrecoverable GPU hang (kernel Ds state, requires reboot). The HAL explicitly blocks this combination on Vivante GPUs and falls back to CPU in auto mode. See Known Issues §10 and `VSI_GPU_NV12_BUG.md`.
+> **BLOCKED:** NV12→planar on Vivante GC7000UL causes an unrecoverable GPU hang (kernel Ds state, requires reboot). The HAL explicitly blocks this combination on Vivante GPUs and falls back to CPU in auto mode. See Known Issues §9 and `VSI_GPU_NV12_BUG.md`.
 >
 > G2D does not support planar output formats.
 
@@ -403,39 +403,37 @@ The hybrid path decodes masks on CPU (`materialize_segmentations`) then overlays
 
 ### Missing Buffer Strategy Coverage
 
-3. **No mechanism to force PBO on DMA-capable platforms** — Benchmarks on i.MX platforms only test the DMA-buf buffer path for OpenGL. There is no way to force the PBO buffer strategy to compare PBO vs DMA-buf transfer performance on the same hardware. *Requires: `EDGEFIRST_FORCE_TRANSFER=pbo` env var support.*
-
-4. **No forced Sync (memcpy) benchmarks** — No benchmark of the Sync fallback (`glTexImage2D`/`glReadnPixels` memcpy) to quantify the overhead of non-zero-copy GPU upload/readback.
+3. **No forced Sync (memcpy) benchmarks** — No benchmark of the Sync fallback (`glTexImage2D`/`glReadnPixels` memcpy) to quantify the overhead of non-zero-copy GPU upload/readback.
 
 ### Known Performance Issues
 
-5. **imx8mp-frdm GL mask atlas anomalously slow** — `decode_masks_atlas` takes 408ms on Vivante GC7000UL vs 28ms on Mali G310 (imx95-frdm). The Vivante driver appears to have inefficiencies with the atlas shader path.
+4. **imx8mp-frdm GL mask atlas anomalously slow** — `decode_masks_atlas` takes 408ms on Vivante GC7000UL vs 28ms on Mali G310 (imx95-frdm). The Vivante driver appears to have inefficiencies with the atlas shader path.
 
-6. **rpi5-hailo 4K DMA-buf allocation fails** — Mesa V3D driver cannot allocate DMA-buf textures at 3840×2160 for same-size conversion. OpenGL convert benchmarks at 4K produce GL errors on this platform.
+5. **rpi5-hailo 4K DMA-buf allocation fails** — Mesa V3D driver cannot allocate DMA-buf textures at 3840×2160 for same-size conversion. OpenGL convert benchmarks at 4K produce GL errors on this platform.
 
-7. **x86-desktop OpenGL cannot import YUV textures** — NVIDIA PBO path does not support YUYV/NV12/VYUY source textures. OpenGL letterbox and convert benchmarks show "—" for YUV source formats on this platform.
+6. **x86-desktop OpenGL cannot import YUV textures** — NVIDIA PBO path does not support YUYV/NV12/VYUY source textures. OpenGL letterbox and convert benchmarks show "—" for YUV source formats on this platform.
 
-8. **imx95-frdm GL DMA-buf slower than PBO for letterbox** — v1.2 benchmarks labelled imx95-frdm GL as "DMA" but were actually running on PBO (EGL extension query bug caused DMA-buf roundtrip probe to fail). After fixing the extension query (v1.3), GL now uses true DMA-buf import. DMA-buf letterbox 1080p→640 YUYV→RGBA is 3.4ms vs 1.4ms on PBO — the DMA-buf import/export overhead exceeds PBO zero-copy bind. G2D improved (3.5ms from 3.9ms). Fused mask rendering (`draw_masks_proto`) dramatically improved: 5.2ms from 25.2ms (**4.8× faster**).
+7. **imx95-frdm GL DMA-buf slower than PBO for letterbox** — v1.2 benchmarks labelled imx95-frdm GL as "DMA" but were actually running on PBO (EGL extension query bug caused DMA-buf roundtrip probe to fail). After fixing the extension query (v1.3), GL now uses true DMA-buf import. DMA-buf letterbox 1080p→640 YUYV→RGBA is 3.4ms vs 1.4ms on PBO — the DMA-buf import/export overhead exceeds PBO zero-copy bind. G2D improved (3.5ms from 3.9ms). Fused mask rendering (`draw_masks_proto`) dramatically improved: 5.2ms from 25.2ms (**4.8× faster**).
 
-9. **BGRA framebuffer CPU byte-swap overhead** — BGRA textures as framebuffer attachments have GPU-dependent swizzle behavior (some implementations don't swizzle fragment shader output). Workaround uses RGBA format internally with CPU-side R↔B byte swaps on upload and readback. RGBA→BGRA conversion on imx95-frdm GL went from 3.4ms (v1.2 PBO, no swap needed) to 26.5ms (v1.3 DMA + CPU swap). CPU backend RGBA→BGRA is 24.5ms for reference.
+8. **BGRA framebuffer CPU byte-swap overhead** — BGRA textures as framebuffer attachments have GPU-dependent swizzle behavior (some implementations don't swizzle fragment shader output). Workaround uses RGBA format internally with CPU-side R↔B byte swaps on upload and readback. RGBA→BGRA conversion on imx95-frdm GL went from 3.4ms (v1.2 PBO, no swap needed) to 26.5ms (v1.3 DMA + CPU swap). CPU backend RGBA→BGRA is 24.5ms for reference.
 
-10. **NV12→planar GPU hang on Vivante GC7000UL** — Rendering from an NV12 source texture (via `EGL_LINUX_DMA_BUF_EXT`) to a planar RGB framebuffer (MRT with 3× color attachments) causes an **unrecoverable GPU hang** on the Vivante GC7000UL (i.MX 8M Plus, galcore 6.4.11). The GPU command processor stalls permanently, the calling process enters kernel uninterruptible sleep (Ds state), cannot be killed even with SIGKILL, and the galcore driver state is corrupted system-wide — all subsequent GPU operations from any process hang until a full board reboot. YUYV→planar and NV12→packed work fine; the bug is specific to NV12 multi-plane texture + MRT output. The HAL explicitly blocks this combination on Vivante GPUs and falls back to CPU in auto mode. See `VSI_GPU_NV12_BUG.md` for the full vendor bug report.
+9. **NV12→planar GPU hang on Vivante GC7000UL** — Rendering from an NV12 source texture (via `EGL_LINUX_DMA_BUF_EXT`) to a planar RGB framebuffer (MRT with 3× color attachments) causes an **unrecoverable GPU hang** on the Vivante GC7000UL (i.MX 8M Plus, galcore 6.4.11). The GPU command processor stalls permanently, the calling process enters kernel uninterruptible sleep (Ds state), cannot be killed even with SIGKILL, and the galcore driver state is corrupted system-wide — all subsequent GPU operations from any process hang until a full board reboot. YUYV→planar and NV12→packed work fine; the bug is specific to NV12 multi-plane texture + MRT output. The HAL explicitly blocks this combination on Vivante GPUs and falls back to CPU in auto mode. See `VSI_GPU_NV12_BUG.md` for the full vendor bug report.
 
-11. **rpi5-hailo GL planar at 4K is slow** — YUYV→8BPS/8BPi at 4K takes ~102ms on Mesa V3D GL, while CPU handles it in ~24ms. NV12→planar at 4K is ~26ms on GL. The bottleneck appears to be in Mesa V3D's MRT path when combined with high-resolution YUYV texture sampling.
+10. **rpi5-hailo GL planar at 4K is slow** — YUYV→8BPS/8BPi at 4K takes ~102ms on Mesa V3D GL, while CPU handles it in ~24ms. NV12→planar at 4K is ~26ms on GL. The bottleneck appears to be in Mesa V3D's MRT path when combined with high-resolution YUYV texture sampling.
 
-12. **imx8mp-frdm GL lacks RGB/RGBi packed support** — Vivante GC7000UL OpenGL does not support packed RGB output without a two-pass approach (RGBA render then strip alpha), which is currently disabled. All RGB/RGBi results on this platform use CPU or G2D.
+11. **imx8mp-frdm GL lacks RGB/RGBi packed support** — Vivante GC7000UL OpenGL does not support packed RGB output without a two-pass approach (RGBA render then strip alpha), which is currently disabled. All RGB/RGBi results on this platform use CPU or G2D.
 
-13. **rpi5-hailo GL lacks RGB/RGBi packed support** — Same limitation as imx8mp-frdm: Mesa V3D two-pass packed RGB is disabled.
+12. **rpi5-hailo GL lacks RGB/RGBi packed support** — Same limitation as imx8mp-frdm: Mesa V3D two-pass packed RGB is disabled.
 
 ### Missing Format Coverage
 
-14. **No NV16 benchmarks** — NV16 (4:2:2 semi-planar) CPU conversion exists but G2D/GL paths and benchmarks are missing.
+13. **No NV16 benchmarks** — NV16 (4:2:2 semi-planar) CPU conversion exists but G2D/GL paths and benchmarks are missing.
 
 ### Missing Scenarios
 
-15. **No PBO tensor allocation benchmarks** — Tensor allocation benchmarks cover Mem, SHM, and DMA but not PBO (which requires GL context).
+14. **No PBO tensor allocation benchmarks** — Tensor allocation benchmarks cover Mem, SHM, and DMA but not PBO (which requires GL context).
 
-16. **No end-to-end pipeline benchmark** — No benchmark covers the full camera → preprocess → decode → mask render cycle in a single measurement.
+15. **No end-to-end pipeline benchmark** — No benchmark covers the full camera → preprocess → decode → mask render cycle in a single measurement.
 
 ---
 
@@ -443,6 +441,7 @@ The hybrid path decodes masks on CPU (`materialize_segmentations`) then overlays
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 1.5 | 2026-03-18 | Remove stale Known Issue #3 (EDGEFIRST_FORCE_TRANSFER=pbo now implemented); documentation accuracy updates |
 | 1.4 | 2026-03-13 | Add planar RGB (8BPS/8BPi) format benchmarks; document NV12→planar GPU hang on Vivante GC7000UL (blocked, CPU fallback); split letterbox tables into packed/planar; update mask rendering (imx8mp fused GPU improved 275ms→5.9ms); add rpi5 GL planar performance notes; refresh all platforms |
 | 1.3 | 2026-03-12 | Update imx95-frdm after DMA-buf fix (GL now uses true DMA-buf, was PBO); BGRA CPU byte-swap workaround; fused mask rendering 4.8× faster |
 | 1.2 | 2026-03-09 | Add hybrid mask benchmark and comparison table; auto-selection now prefers hybrid path |

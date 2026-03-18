@@ -10,7 +10,7 @@ This is the umbrella crate that re-exports the core EdgeFirst HAL components:
 
 - [`edgefirst-tensor`](https://crates.io/crates/edgefirst-tensor) - Zero-copy tensor memory management (DMA, SHM, system memory)
 - [`edgefirst-image`](https://crates.io/crates/edgefirst-image) - High-performance image processing and format conversion
-- [`edgefirst-decoder`](https://crates.io/crates/edgefirst-decoder) - ML model output decoding (YOLO, ModelPack)
+- [`edgefirst-decoder`](https://crates.io/crates/edgefirst-decoder) - ML model output decoding (YOLOv5/v8/v11/v26, ModelPack)
 
 ## Features
 

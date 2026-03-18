@@ -155,10 +155,10 @@ pub const RGB: FourCharCode = four_char_code!("RGB ");
 /// 8 bit grayscale, full range
 pub const GREY: FourCharCode = four_char_code!("Y800");
 
-// TODO: planar RGB is 8BPS? https://fourcc.org/8bps/
+/// 8 bit planar RGB (channels-first). FourCC `8BPS`.
 pub const PLANAR_RGB: FourCharCode = four_char_code!("8BPS");
 
-// TODO: What fourcc code is planar RGBA?
+/// 8 bit planar RGBA (channels-first). FourCC `8BPA`.
 pub const PLANAR_RGBA: FourCharCode = four_char_code!("8BPA");
 
 /// Packed RGB with uint8→int8 XOR 0x80 reinterpretation.
