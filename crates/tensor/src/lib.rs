@@ -599,7 +599,14 @@ where
                 // NV12 (4:2:0): H lines luma + H/2 lines chroma = H * 3/2 total
                 // NV16 (4:2:2): H lines luma + H lines chroma = H * 2 total
                 let total_h = match format {
-                    PixelFormat::Nv12 => height * 3 / 2,
+                    PixelFormat::Nv12 => {
+                        if !height.is_multiple_of(2) {
+                            return Err(Error::InvalidArgument(format!(
+                                "NV12 requires even height, got {height}"
+                            )));
+                        }
+                        height * 3 / 2
+                    }
                     PixelFormat::Nv16 => height * 2,
                     _ => {
                         return Err(Error::InvalidArgument(format!(
@@ -640,6 +647,25 @@ where
                     return Err(Error::InvalidShape(format!(
                         "semi-planar format {format:?} expects [H*k, W], got {shape:?}"
                     )));
+                }
+                match format {
+                    PixelFormat::Nv12 => {
+                        if !shape[0].is_multiple_of(3) {
+                            return Err(Error::InvalidShape(format!(
+                                "NV12 contiguous shape[0] must be divisible by 3, got {}",
+                                shape[0]
+                            )));
+                        }
+                    }
+                    PixelFormat::Nv16 => {
+                        if !shape[0].is_multiple_of(2) {
+                            return Err(Error::InvalidShape(format!(
+                                "NV16 contiguous shape[0] must be even, got {}",
+                                shape[0]
+                            )));
+                        }
+                    }
+                    _ => {}
                 }
             }
         }

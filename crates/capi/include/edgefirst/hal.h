@@ -1413,7 +1413,7 @@ bool hal_tensor_image_is_planar(const struct hal_tensor_image *image);
  * Get the number of channels in a tensor image.
  *
  * Returns the number of color channels (e.g., 3 for RGB, 4 for RGBA,
- * 1 for GREY, 2 for NV12).
+ * 1 for GREY/NV12/NV16 (luma plane)).
  *
  * @param image Tensor image handle
  * @return Number of channels, or 0 if image is NULL
