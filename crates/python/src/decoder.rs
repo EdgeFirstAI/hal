@@ -9,6 +9,7 @@ use edgefirst_hal::decoder::{
 use edgefirst_hal::image::ImageProcessorTrait;
 
 use crate::image::{PyImageProcessor, PyTensorImage};
+use crate::tracker::{PyByteTrack, PyTrackInfo};
 
 /// NMS (Non-Maximum Suppression) mode for filtering overlapping detections.
 ///
@@ -451,6 +452,14 @@ pub type PySegDetOutput<'py> = (
     Vec<Bound<'py, PyArray3<u8>>>,
 );
 
+pub type PySegDetTrackedOutput<'py> = (
+    Bound<'py, PyArray2<f32>>,
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<usize>>,
+    Vec<Bound<'py, PyArray3<u8>>>,
+    Vec<PyTrackInfo>,
+);
+
 /// Like [`PySegDetOutput`] but with 2D masks `(H, W)` instead of 3D `(H, W, C)`.
 pub type PySegDetOutput2D<'py> = (
     Bound<'py, PyArray2<f32>>,
@@ -610,7 +619,7 @@ impl PyDecoder {
     ///     nms: NMS mode - Nms.ClassAgnostic (default), Nms.ClassAware, or None
     /// to bypass NMS
     #[new]
-    #[pyo3(signature = (config, score_threshold=0.1, iou_threshold=0.7, nms=PyNms::ClassAgnostic))]
+    #[pyo3(signature = (config, score_threshold=0.1, iou_threshold=0.7, nms=PyNms::ClassAgnostic,))]
     pub fn new(
         config: Bound<PyAny>,
         score_threshold: f32,
@@ -790,6 +799,110 @@ impl PyDecoder {
         let (boxes, scores, classes) = convert_detect_box(py, &output_boxes);
         let masks = convert_seg_mask(py, &output_masks);
         Ok((boxes, scores, classes, masks))
+    }
+
+    #[pyo3(signature = (tracker, timestamp, model_output, max_boxes=100))]
+    pub fn decode_tracked<'py>(
+        self_: PyRef<'py, Self>,
+        tracker: &mut PyByteTrack,
+        timestamp: u64,
+        model_output: ListOfReadOnlyArrayGenericDyn,
+        max_boxes: usize,
+    ) -> PyResult<PySegDetTrackedOutput<'py>> {
+        let mut output_boxes = Vec::with_capacity(max_boxes);
+        let mut output_masks = Vec::with_capacity(max_boxes);
+        let mut output_tracks = Vec::with_capacity(max_boxes);
+        let result = match model_output {
+            ListOfReadOnlyArrayGenericDyn::Quantized(items) => {
+                let outputs = items
+                    .iter()
+                    .map(|x| match x {
+                        ArrayQuantized::UInt8(arr) => arr.as_array().into(),
+                        ArrayQuantized::Int8(arr) => arr.as_array().into(),
+                        ArrayQuantized::UInt16(arr) => arr.as_array().into(),
+                        ArrayQuantized::Int16(arr) => arr.as_array().into(),
+                        ArrayQuantized::UInt32(arr) => arr.as_array().into(),
+                        ArrayQuantized::Int32(arr) => arr.as_array().into(),
+                    })
+                    .collect::<Vec<_>>();
+                self_.decoder.decode_tracked_quantized(
+                    tracker,
+                    timestamp,
+                    &outputs,
+                    &mut output_boxes,
+                    &mut output_masks,
+                    &mut output_tracks,
+                )
+            }
+            ListOfReadOnlyArrayGenericDyn::Float16(items) => {
+                let outputs = items
+                    .iter()
+                    .filter_map(|x| match x {
+                        WithInt32Array::Val(x) => Some(x.arr.as_array()),
+                        WithInt32Array::Int32(_) => None,
+                    })
+                    .collect::<Vec<_>>();
+
+                let outputs = outputs
+                    .iter()
+                    .map(|arr| arr.map(|x| x.to_f32()))
+                    .collect::<Vec<_>>();
+                let output_views = outputs
+                    .iter()
+                    .map(|output| output.view())
+                    .collect::<Vec<_>>();
+                self_.decoder.decode_tracked_float(
+                    tracker,
+                    timestamp,
+                    &output_views,
+                    &mut output_boxes,
+                    &mut output_masks,
+                    &mut output_tracks,
+                )
+            }
+            ListOfReadOnlyArrayGenericDyn::Float32(items) => {
+                let outputs = items
+                    .iter()
+                    .filter_map(|x| match x {
+                        WithInt32Array::Val(x) => Some(x.as_array()),
+                        WithInt32Array::Int32(_) => None,
+                    })
+                    .collect::<Vec<_>>();
+                self_.decoder.decode_tracked_float(
+                    tracker,
+                    timestamp,
+                    &outputs,
+                    &mut output_boxes,
+                    &mut output_masks,
+                    &mut output_tracks,
+                )
+            }
+            ListOfReadOnlyArrayGenericDyn::Float64(items) => {
+                let outputs = items
+                    .iter()
+                    .filter_map(|x| match x {
+                        WithInt32Array::Val(x) => Some(x.as_array()),
+                        WithInt32Array::Int32(_) => None,
+                    })
+                    .collect::<Vec<_>>();
+                self_.decoder.decode_tracked_float(
+                    tracker,
+                    timestamp,
+                    &outputs,
+                    &mut output_boxes,
+                    &mut output_masks,
+                    &mut output_tracks,
+                )
+            }
+        };
+        if let Err(e) = result {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")));
+        }
+        let py = self_.py();
+        let (boxes, scores, classes) = convert_detect_box(py, &output_boxes);
+        let masks = convert_seg_mask(py, &output_masks);
+        let tracks = output_tracks.into_iter().map(|t| t.into()).collect();
+        Ok((boxes, scores, classes, masks, tracks))
     }
 
     /// Decode model outputs and draw masks directly onto the destination
