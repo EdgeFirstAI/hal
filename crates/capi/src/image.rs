@@ -747,7 +747,7 @@ pub unsafe extern "C" fn hal_tensor_image_is_planar(image: *const HalTensorImage
 /// Get the number of channels in a tensor image.
 ///
 /// Returns the number of color channels (e.g., 3 for RGB, 4 for RGBA,
-/// 1 for GREY, 2 for NV12).
+/// 1 for GREY/NV12/NV16 (luma plane)).
 ///
 /// @param image Tensor image handle
 /// @return Number of channels, or 0 if image is NULL
@@ -1022,7 +1022,7 @@ pub unsafe extern "C" fn hal_image_processor_convert_ref(
         _ => unreachable!(), // validated above
     };
 
-    if let Err(_) = u8_tensor.set_format(dst_fourcc.to_pixel_format()) {
+    if u8_tensor.set_format(dst_fourcc.to_pixel_format()).is_err() {
         // Put tensor back and return error
         unsafe { std::ptr::write(dst_tensor, HalTensor::U8(u8_tensor)) };
         return set_error(libc::EINVAL);

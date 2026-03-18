@@ -344,8 +344,8 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(usize::MAX);
-    // Optional: skip PixelFormat::Nv12 planar combos (hangs on Vivante GC7000UL)
-    let skip_nv12_planar = std::env::var("BENCH_SKIP_PixelFormat::Nv12_PLANAR").is_ok();
+    // Optional: skip NV12 planar combos (hangs on Vivante GC7000UL)
+    let skip_nv12_planar = std::env::var("BENCH_SKIP_NV12_PLANAR").is_ok();
 
     println!("Pipeline Benchmark — edgefirst-bench harness");
     println!("  warmup={WARMUP}  iterations={ITERATIONS}");

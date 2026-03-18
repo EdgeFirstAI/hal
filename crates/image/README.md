@@ -133,8 +133,8 @@ See [BENCHMARKS.md](../../BENCHMARKS.md) for per-platform performance numbers.
 You can write directly into a pre-allocated model input tensor by setting its pixel format and converting it to a `TensorDyn`:
 
 ```rust,ignore
-let mut model_input = Tensor::<u8>::new(&[1, 640, 640, 3], None, None)?;
-model_input.set_format(Some(PixelFormat::Rgb));
+let mut model_input = Tensor::<u8>::new(&[640, 640, 3], None, None)?;
+model_input.set_format(PixelFormat::Rgb)?;
 let mut dst = TensorDyn::from(model_input);
 processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::letterbox())?;
 ```
