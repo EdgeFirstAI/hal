@@ -19,7 +19,7 @@ abi3-py38 = ["pyo3/abi3-py38"]
 abi3-py311 = ["pyo3/abi3-py311"]
 
 [dependencies]
-edgefirst-hal = { workspace = true }
+edgefirst-hal = { workspace = true, features = ["tracker"] }
 env_logger = { workspace = true }
 four-char-code = { workspace = true }
 half = { workspace = true }
@@ -28,6 +28,7 @@ ndarray = { workspace = true }
 numpy = { workspace = true }
 pyo3 = { workspace = true, features = ["extension-module"] }
 pythonize = { workspace = true }
+uuid = "1.22.0"
 
 [build-dependencies]
 pyo3-build-config = { workspace = true, features = ["resolve-config"] }

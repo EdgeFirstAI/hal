@@ -687,6 +687,9 @@ impl Decoder {
 pub use edgefirst_tracker::TrackInfo;
 
 #[cfg(feature = "tracker")]
+pub use edgefirst_tracker::Tracker;
+
+#[cfg(feature = "tracker")]
 impl Decoder {
     /// This function decodes quantized model outputs into detection boxes and
     /// segmentation masks. The quantized outputs can be of u8, i8, u16, i16,

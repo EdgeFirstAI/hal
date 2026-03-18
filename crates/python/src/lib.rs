@@ -8,6 +8,7 @@ use pyo3::prelude::*;
 pub mod decoder;
 pub mod image;
 pub mod tensor;
+pub mod tracker;
 
 pub struct FunctionTimer {
     name: String,
@@ -61,6 +62,9 @@ pub mod edgefirst_hal {
         m.add_class::<decoder::PyDecoderVersion>()?;
         m.add_class::<decoder::PyDimName>()?;
         m.add_class::<decoder::PyOutput>()?;
+
+        m.add_class::<tracker::PyTrackInfo>()?;
+        m.add_class::<tracker::PyByteTrack>()?;
 
         Ok(())
     }

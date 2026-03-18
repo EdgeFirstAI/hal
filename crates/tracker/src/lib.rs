@@ -41,8 +41,6 @@ pub trait Tracker<T: DetectionBox> {
     fn get_active_tracks(&self) -> Vec<ActiveTrackInfo<T>>;
 }
 
-pub trait TrackerGetActive {}
-
 impl<T, TR> Tracker<T> for Arc<Mutex<TR>>
 where
     T: DetectionBox,
