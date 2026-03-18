@@ -15,6 +15,7 @@ This crate provides a unified interface for managing multi-dimensional arrays (t
 | **DMA** | Linux DMA-BUF allocation | Hardware accelerators (GPU, NPU, video codecs) |
 | **SHM** | POSIX shared memory | Inter-process communication, zero-copy IPC |
 | **Mem** | Standard heap allocation | General purpose, maximum compatibility |
+| **PBO** | OpenGL Pixel Buffer Object | GPU-accelerated image processing (created by ImageProcessor) |
 
 ## Features
 
@@ -46,12 +47,12 @@ let fd = tensor.clone_fd()?;
 
 ## Platform Support
 
-| Platform | DMA | SHM | Mem |
-|----------|-----|-----|-----|
-| Linux | Yes | Yes | Yes |
-| macOS | No | Yes | Yes |
-| Other Unix | No | Yes | Yes |
-| Windows | No | No | Yes |
+| Platform | DMA | SHM | Mem | PBO |
+|----------|-----|-----|-----|-----|
+| Linux | Yes | Yes | Yes | Yes (with OpenGL) |
+| macOS | No | Yes | Yes | No |
+| Other Unix | No | Yes | Yes | No |
+| Windows | No | No | Yes | No |
 
 ## Feature Flags
 

@@ -10,7 +10,7 @@ This crate provides hardware-accelerated image loading, format conversion, resiz
 
 ## Features
 
-- **Multiple backends** - Automatic selection of fastest available: G2D → OpenGL → CPU
+- **Multiple backends** — Automatic selection: G2D (if format supported) → CPU (same-size simple copies) → OpenGL (GPU) → CPU (general fallback)
 - **Format conversion** - RGBA, RGB, NV12, NV16, YUYV, GREY, planar formats
 - **Geometric transforms** - Resize, rotate (90° increments), flip, crop
 - **Zero-copy integration** - Works with `edgefirst-tensor` DMA/SHM buffers
@@ -63,6 +63,11 @@ dst.save_jpeg("output.jpg", 90)?;
 | YUYV | YUV 4:2:2 packed | 2 |
 | GREY | 8-bit grayscale | 1 |
 | 8BPS | Planar RGB | 3 |
+| VYUY | YUV 4:2:2 packed (VYUY order) | 2 |
+| BGRA | 32-bit BGRA | 4 |
+| RGBi | Packed RGB int8 (XOR 0x80) | 3 |
+| 8BPi | Planar RGB int8 (XOR 0x80) | 3 |
+| 8BPA | Planar RGBA | 4 |
 
 ## Feature Flags
 
@@ -74,6 +79,74 @@ dst.save_jpeg("output.jpg", 90)?;
 - `EDGEFIRST_DISABLE_G2D` - Disable G2D backend
 - `EDGEFIRST_DISABLE_GL` - Disable OpenGL backend
 - `EDGEFIRST_DISABLE_CPU` - Disable CPU backend
+- `EDGEFIRST_FORCE_BACKEND` — Force a single backend: `cpu`, `g2d`, or `opengl`. Disables fallback chain.
+- `EDGEFIRST_FORCE_TRANSFER` — Force GPU transfer method: `pbo` or `dmabuf`
+- `EDGEFIRST_TENSOR_FORCE_MEM` — Set to `1` to force heap memory (disables DMA/SHM)
+
+## Segmentation Mask Rendering
+
+Three rendering pipelines for YOLO instance segmentation masks:
+
+### Fused GPU Proto Path (`draw_masks_proto`)
+
+Computes `sigmoid(coefficients @ protos)` per-pixel in a fragment shader — no intermediate mask materialization. Preferred for real-time overlay.
+
+```rust,ignore
+let (detections, proto_data) = decoder.decode_quantized_proto(&outputs)?;
+processor.draw_masks_proto(&mut frame, &detections, &proto_data)?;
+```
+
+### Hybrid CPU+GPU Path
+
+CPU materializes binary masks (`materialize_segmentations()`), then OpenGL overlays them. Auto-selected when both CPU and GL backends are available.
+
+### Atlas Decode Path (`decode_masks_atlas`)
+
+Renders all detection masks into a compact vertical strip atlas via GPU, reads back as uint8 arrays. Use when you need per-instance mask pixels for downstream processing.
+
+```rust,ignore
+let masks = processor.decode_masks_atlas(&detections, &proto_data, 640, 640)?;
+```
+
+### Shader Variants
+
+| Variant | Proto Format | Interpolation |
+|---------|-------------|---------------|
+| int8-nearest | R8I quantized | Nearest neighbor |
+| int8-bilinear | R8I quantized | Manual 4-tap bilinear |
+| f32 | R32F float | Hardware GL_LINEAR |
+| f16 | R16F half | Hardware GL_LINEAR |
+
+### Int8 Interpolation Mode
+
+Control quantized proto interpolation quality:
+
+```rust,ignore
+processor.set_int8_interpolation_mode(Int8InterpolationMode::Bilinear);
+```
+
+See [BENCHMARKS.md](../../BENCHMARKS.md) for per-platform performance numbers.
+
+## Zero-Copy Model Input (`convert_ref`)
+
+`convert_ref()` writes directly into a pre-allocated model input tensor, avoiding an intermediate copy:
+
+```rust,ignore
+let mut model_input = Tensor::<u8>::new(&[1, 640, 640, 3], None, None)?;
+let mut dst_ref = TensorImageRef::new(&mut model_input, 640, 640, RGB)?;
+processor.convert(&src, &mut dst_ref, Rotation::None, Flip::None, Crop::letterbox())?;
+```
+
+## Multiplane NV12/NV16
+
+For V4L2 multi-planar DMA-BUF buffers (separate Y and UV file descriptors):
+
+```rust,ignore
+let img = TensorImage::from_planes(y_tensor, uv_tensor, NV12)?;
+processor.convert(&img, &mut dst, Rotation::None, Flip::None, Crop::default())?;
+```
+
+The OpenGL backend imports each plane's DMA-BUF fd separately for zero-copy GPU access.
 
 ## License
 

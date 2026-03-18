@@ -1,7 +1,7 @@
 # EdgeFirst Hardware Abstraction Layer - Architecture
 
-**Version:** 2.7
-**Last Updated:** March 11, 2026
+**Version:** 2.8
+**Last Updated:** March 18, 2026
 **Status:** Production
 **Audience:** Developers contributing to EdgeFirst HAL or integrating it into applications
 
@@ -221,8 +221,14 @@ pub struct TensorImage {
     tensor: Tensor<u8>,
     fourcc: FourCharCode,
     is_planar: bool,
+    /// Second plane for multiplane NV12/NV16 (separate DMA-BUF allocation).
+    chroma: Option<Tensor<u8>>,
 }
 ```
+
+The `chroma` field supports multi-plane DMA-BUF NV12/NV16 where Y and UV planes
+are in separate allocations (common with V4L2 `NV12M` format). Constructed via
+`TensorImage::from_planes()`. See [Appendix A: Multi-Plane DMA-BUF](#appendix-a-multi-plane-dma-buf-limitation) for details.
 
 Width, height, channels, and stride are **not stored** — they are computed from the tensor shape and FourCC on every access. The tensor shape encoding depends on the pixel format:
 
@@ -367,13 +373,50 @@ and deadlock. Instead, the convert path dispatches to specialized methods:
 **Purpose**: Post-processing for object detection and segmentation model outputs.
 
 **Supported Decoders**:
-- **YOLO** (YOLOv5, YOLOv8, YOLOv11)
+- **YOLO** (YOLOv5, YOLOv8, YOLOv11, YOLOv26)
   - Object detection
   - Instance segmentation
   - Split output format support
+  - End-to-end models with embedded NMS (YOLOv26)
   - Mixed data type support (different types per input tensor)
 - **ModelPack** (Au-Zone proprietary format)
   - Detection with anchor-based decoding
+
+**YOLO26 End-to-End Support**:
+
+YOLOv26 models can be exported with embedded NMS (one-to-one matching heads),
+eliminating external NMS post-processing. The `DecoderVersion::Yolo26` variant
+triggers end-to-end model type selection:
+
+| Config Field | Value | Effect |
+|-------------|-------|--------|
+| `decoder_version` | `"yolo26"` | Selects end-to-end model types, bypasses NMS |
+| `decoder_version` | `"yolov8"` | Uses traditional model types with external NMS |
+
+When `decoder_version` is `"yolo26"`, `DecoderVersion::is_end_to_end()` returns
+`true` and the decoder selects one of the end-to-end `ModelType` variants:
+
+| ModelType | Tensors | Format |
+|-----------|---------|--------|
+| `YoloEndToEndDet` | 1 | `[batch, N, 6+]` — xyxy, conf, class |
+| `YoloEndToEndSegDet` | 2 | `[batch, N, 6+num_protos]` + protos |
+| `YoloSplitEndToEndDet` | 3 | boxes `[B,N,4]` + scores `[B,N,1]` + classes `[B,N,1]` |
+| `YoloSplitEndToEndSegDet` | 5 | boxes + scores + classes + mask_coeff + protos |
+
+For non-end-to-end YOLO26 exports (`end2end=false`), use `decoder_version: "yolov8"`
+with an explicit `nms` field (`ClassAgnostic` or `ClassAware`).
+
+**NMS Modes** (`Option<Nms>`):
+- `Some(Nms::ClassAgnostic)` — suppress overlapping boxes regardless of class (default)
+- `Some(Nms::ClassAware)` — only suppress boxes sharing the same class label
+- `None` — bypass NMS entirely (auto-set for end-to-end models)
+
+**Proto Mask API**:
+
+For segmentation models, `decode_quantized_proto()` and `decode_float_proto()`
+return raw proto data and mask coefficients without materializing pixel masks.
+These are the preferred entry point for fused GPU rendering via
+`ImageProcessor::draw_masks_proto()`.
 
 **Architecture**:
 ```mermaid
@@ -397,18 +440,28 @@ flowchart LR
 ```mermaid
 flowchart TD
     Raw[Model Raw Output<br/>quantized or float]
-    
+    E2E{End-to-end?<br/>decoder_version = yolo26}
+
     Quant{Quantized?}
     Dequant[Dequantization<br/>scale, zero_point]
-    
+
     Parse[Parse boxes & scores<br/>XYWH → XYXY conversion]
     NMS[Non-Maximum Suppression<br/>IoU threshold filtering]
     Filter[Filter by score threshold]
-    
+
+    E2EParse[Parse post-NMS output<br/>XYXY + conf + class directly]
+    E2EFilter[Filter by score threshold]
+
     Det[Detection boxes<br/>bbox, score, class]
     Seg[Segmentation masks<br/>per-box mask matrices]
-    
-    Raw --> Quant
+
+    Raw --> E2E
+    E2E -->|Yes| E2EParse
+    E2EParse --> E2EFilter
+    E2EFilter --> Det
+    E2EFilter --> Seg
+
+    E2E -->|No| Quant
     Quant -->|Yes| Dequant
     Quant -->|No| Parse
     Dequant --> Parse
@@ -416,10 +469,12 @@ flowchart TD
     NMS --> Filter
     Filter --> Det
     Filter --> Seg
-    
+
     style Raw fill:#e1f5ff
+    style E2E fill:#fff4e1
     style Dequant fill:#fff4e1
     style NMS fill:#ffeb9c
+    style E2EParse fill:#87ceeb
     style Det fill:#90ee90
     style Seg fill:#90ee90
 ```
@@ -1142,16 +1197,26 @@ hal/
 │   ├── image/              # Image processing HAL
 │   │   └── src/
 │   │       ├── lib.rs      # TensorImage, ImageProcessor, format constants
-│   │       ├── cpu.rs      # CPU format conversion, resize, masks
+│   │       ├── cpu/        # CPU format conversion, resize, masks
 │   │       ├── g2d.rs      # NXP G2D hardware accelerator
-│   │       ├── opengl_headless.rs  # EGL/OpenGL headless renderer
+│   │       ├── gl/         # EGL/OpenGL headless renderer
+│   │       │   ├── mod.rs      # Public types, Int8InterpolationMode
+│   │       │   ├── processor.rs # GPU rendering pipelines
+│   │       │   ├── shaders.rs  # GLSL shader generators
+│   │       │   ├── context.rs  # EGL context management
+│   │       │   ├── threaded.rs # Thread-safe wrapper
+│   │       │   ├── resources.rs # GL resource management
+│   │       │   └── cache.rs    # Shader/texture caching
 │   │       └── error.rs
 │   ├── decoder/            # Model output decoding
 │   │   └── src/
-│   │       ├── lib.rs      # Public API, DecoderBuilder
-│   │       ├── decoder.rs  # Core decode logic, config parsing
-│   │       ├── yolo.rs     # YOLO-specific decoding
-│   │       └── modelpack.rs # ModelPack format support
+│   │       ├── lib.rs      # Public API
+│   │       └── decoder/    # Core decode logic
+│   │           ├── mod.rs      # Decoder struct, decode methods
+│   │           ├── builder.rs  # DecoderBuilder, model type resolution
+│   │           ├── configs.rs  # ModelType, DecoderVersion, Nms enums
+│   │           ├── postprocess.rs # NMS, dequantization, box parsing
+│   │           └── helpers.rs  # Shared utilities
 │   ├── tracker/            # Object tracking (ByteTrack)
 │   ├── capi/               # C API bindings (cbindgen, staticlib/cdylib)
 │   ├── gpu-probe/          # GPU capability probing binary
@@ -1180,14 +1245,14 @@ tracker → (standalone — no internal crate deps)
 
 ### Notable File Sizes
 
-Several files are significantly larger than typical Rust modules:
+Several modules are significantly larger than typical Rust modules:
 
-| File | Lines | Content |
-|------|------:|---------|
-| `image/src/opengl_headless.rs` | ~7,700 | EGL context, GL processors, shaders, RAII types, tests |
-| `decoder/src/decoder.rs` | ~6,900 | Config parsing, decode logic, postprocessing |
-| `image/src/lib.rs` | ~4,700 | TensorImage, ImageProcessor, format helpers |
-| `image/src/cpu.rs` | ~3,700 | CPU format conversion, resize, mask rendering |
+| File / Module | Lines | Content |
+|---------------|------:|---------|
+| `image/src/gl/` (total) | ~8,600 | EGL context, GL processors, shaders, caching, tests |
+| `image/src/gl/processor.rs` | ~4,600 | GPU rendering pipelines (convert, masks, atlas) |
+| `decoder/src/decoder/` (total) | ~7,000 | Config parsing, decode logic, postprocessing, tests |
+| `image/src/lib.rs` | ~5,500 | TensorImage, ImageProcessor, format helpers |
 | `capi/src/decoder.rs` | ~2,800 | C API decoder bindings |
 
 ---

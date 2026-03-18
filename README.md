@@ -11,7 +11,7 @@ The EdgeFirst Hardware Abstraction Layer (HAL) is a Rust-based system that provi
 
 - ✨ **Zero-Copy Memory Management** - DMA-heap optimized tensors with automatic fallback
 - 🚀 **Hardware-Accelerated Image Processing** - G2D, OpenGL, and optimized CPU paths
-- 🎯 **YOLO Decoder** - YOLOv5/v8/v11 detection and segmentation support
+- 🎯 **YOLO Decoder** - YOLOv5/v8/v11/v26 detection and segmentation support (including end-to-end models)
 - 🔌 **Python Bindings** - PyO3-based API with numpy integration
 - ⚡ **Multi-Object Tracking** - ByteTrack algorithm with Kalman filtering
 - 🔧 **Cross-Platform** - Linux (i.MX optimized), macOS, Windows support
@@ -31,7 +31,7 @@ pip install edgefirst-hal
 #### Rust
 ```toml
 [dependencies]
-edgefirst = "0.1.0"
+edgefirst = "0.9.1"
 ```
 
 ### Basic Usage
@@ -77,27 +77,31 @@ hal_image_processor_convert(proc, src, dst, HAL_ROTATION_NONE, HAL_FLIP_NONE, NU
 graph TB
     subgraph "EdgeFirst HAL Ecosystem"
         Python["Python Bindings (edgefirst-hal)<br/>PyO3-based Python API exposing core functionality"]
+        CAPI["C API Bindings (edgefirst-hal-capi)<br/>cbindgen-generated C headers"]
         Main["Main HAL Crate (edgefirst)<br/>Re-exports tensor, image, decoder"]
-        
+
         Python --> Main
-        
+        CAPI --> Main
+
         Tensor["Tensor HAL<br/>Zero-copy memory buffers"]
         Image["Image Converter HAL<br/>Format conversion & resize"]
         Decoder["Decoder HAL<br/>Model output post-processing"]
         Tracker["Tracker HAL<br/>Multi-object tracking"]
-        
+
         Main --> Tensor
         Main --> Image
         Main --> Decoder
-        
+        CAPI --> Tracker
+
         Image --> Tensor
         Image --> G2D["G2D FFI (g2d-sys)<br/>NXP i.MX hardware acceleration"]
     end
-    
+
     Tensor -.-> DMA["Linux DMA-Heap<br/>Shared Memory"]
     Decoder -.-> PostProc["Model Output<br/>Post-Processing"]
-    
+
     style Python fill:#e1f5ff
+    style CAPI fill:#e1f5ff
     style Main fill:#fff4e1
     style Tensor fill:#e8f5e9
     style Image fill:#e8f5e9
@@ -134,9 +138,14 @@ classDiagram
         Standard heap allocation
     }
     
+    class PboTensor~T~ {
+        OpenGL Pixel Buffer Object
+    }
+
     TensorTrait <|.. DmaTensor
     TensorTrait <|.. ShmTensor
     TensorTrait <|.. MemTensor
+    TensorTrait <|.. PboTensor
 ```
 
 **Key Features**:
@@ -196,7 +205,7 @@ classDiagram
 ```
 
 **Supported Operations**:
-- Format conversion (YUYV, NV12, RGB, RGBA, GREY, Planar RGB)
+- Format conversion (YUYV, VYUY, NV12, NV16, RGB, RGBA, BGRA, GREY, Planar RGB, Planar RGBA, RGB int8, Planar RGB int8)
 - Resize with various interpolation methods
 - Rotation (0°, 90°, 180°, 270°)
 - Flip (horizontal, vertical)
@@ -215,15 +224,26 @@ Planar RGB (FourCC: 8BPS) stores color channels in separate planes rather than i
 flowchart TD
     Input[Input Image<br/>JPEG/PNG bytes or raw pixels]
     TI[TensorImage<br/>Tensor&lt;u8&gt; + FourCC format]
-    Conv[ImageProcessor::convert<br/>1. Check if G2D can handle<br/>2. Fallback to CPU if needed<br/>3. Apply transforms]
+    Conv{ImageProcessor::convert<br/>Backend selection}
+    G2D[G2D Acceleration<br/>NXP i.MX only]
+    GL[OpenGL Acceleration<br/>GPU accelerated]
+    CPU[CPU Fallback<br/>fast_image_resize]
     Output[Output Image<br/>TensorImage or numpy array]
-    
+
     Input --> TI
     TI --> Conv
-    Conv --> Output
-    
+    Conv -->|Supported on i.MX| G2D
+    Conv -->|Linux with GPU| GL
+    Conv -->|Always available| CPU
+    G2D --> Output
+    GL --> Output
+    CPU --> Output
+
     style TI fill:#e1f5ff
     style Conv fill:#fff4e1
+    style G2D fill:#90ee90
+    style GL fill:#87ceeb
+    style CPU fill:#ffeb9c
     style Output fill:#e8f5e9
 ```
 
@@ -232,10 +252,11 @@ flowchart TD
 **Purpose**: Post-processing for object detection and segmentation model outputs.
 
 **Supported Decoders**:
-- **YOLO** (YOLOv5, YOLOv8, YOLOv11)
+- **YOLO** (YOLOv5, YOLOv8, YOLOv11, YOLOv26)
   - Object detection
   - Instance segmentation
   - Split output format support
+  - End-to-end models (embedded NMS)
   - Mixed data type support (different types per input tensor)
 - **ModelPack** (Au-Zone proprietary format)
   - Detection with anchor-based decoding
@@ -638,9 +659,10 @@ Python wrapper types use a `Py` prefix (e.g., `PyTensor`, `PyTensorImage`) to cl
 
 ### Image Processing Strategy
 
-1. **G2D**: ~10-50x faster than CPU for format conversion and resize on i.MX
-2. **OpenGL**: GPU-accelerated, good for complex pipelines
-3. **CPU (SIMD)**: Fallback with Rayon parallelization
+1. **G2D**: NXP i.MX hardware acceleration (when format pair is supported)
+2. **CPU**: Fast path for same-size, no-rotation, simple format copies
+3. **OpenGL**: GPU-accelerated for complex pipelines (resize, rotation, YUV conversion)
+4. **CPU**: General fallback with SIMD + Rayon parallelization
 
 ### Decoder Optimization
 
@@ -651,11 +673,11 @@ Python wrapper types use a `Py` prefix (e.g., `PyTensor`, `PyTensorImage`) to cl
 
 ## Thread Safety
 
-All major types implement `Send + Sync`:
-- `Tensor<T>`: Safe to share across threads
-- `TensorImage`: Thread-safe
-- `ImageProcessor`: Thread-local (create per thread)
-- `Decoder`: Thread-safe for read operations
+Thread safety of major types:
+- `Tensor<T>`: `Send + Sync` — safe to share across threads
+- `TensorImage`: `Send + Sync` — thread-safe
+- `ImageProcessor`: `Send` but **not** `Sync` — create one per thread (GPU contexts are thread-local)
+- `Decoder`: `Send + Sync` — thread-safe for read operations
 
 ## Error Handling
 
