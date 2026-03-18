@@ -22,6 +22,7 @@ pub trait DetectionBox: Debug + Clone {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TrackInfo {
     pub uuid: Uuid,
+    /// This is the current tracked location of the object, which may be smoothed by the tracker. It is in XYXY format (xmin, ymin, xmax, ymax).
     pub tracked_location: [f32; 4],
     pub count: i32,
     pub created: u64,
@@ -31,8 +32,8 @@ pub struct TrackInfo {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ActiveTrackInfo<T: DetectionBox> {
     pub info: TrackInfo,
-    // /// The last raw box associated with the track. This is before any smoothing
-    // /// introduced by the tracker
+    /// The last raw box associated with the track. This is before any smoothing
+    /// introduced by the tracker
     pub last_box: T,
 }
 

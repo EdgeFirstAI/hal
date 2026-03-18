@@ -33,6 +33,8 @@ serde_yaml = { workspace = true }
 [dev-dependencies]
 edgefirst-bench = { workspace = true }
 image = { workspace = true }
+rand = { workspace = true }
+rand_distr = { workspace = true }
 
 [[bench]]
 name = "decoder_benchmark"

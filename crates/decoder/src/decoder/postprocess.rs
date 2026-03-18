@@ -7,7 +7,6 @@ use num_traits::{AsPrimitive, Float};
 
 use super::configs::{self};
 use super::{ArrayViewDQuantized, Decoder};
-use crate::yolo::postprocess_yolo_seg;
 use crate::{
     dequantize_ndarray,
     modelpack::{
@@ -325,12 +324,15 @@ impl Decoder {
             with_quantized!(scores_tensor, s, {
                 let boxes_tensor = Self::swap_axes_if_needed(b, boxes.into());
                 let boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
+                let boxes_tensor = boxes_tensor.reversed_axes();
 
                 let scores_tensor = Self::swap_axes_if_needed(s, scores.into());
                 let scores_tensor = scores_tensor.slice(s![0, .., ..]);
+                let scores_tensor = scores_tensor.reversed_axes();
+
                 impl_yolo_split_segdet_quant_get_boxes::<XYWH, _, _>(
-                    (boxes_tensor.reversed_axes(), quant_boxes),
-                    (scores_tensor.reversed_axes(), quant_scores),
+                    (boxes_tensor, quant_boxes),
+                    (scores_tensor, quant_scores),
                     self.score_threshold,
                     self.iou_threshold,
                     self.nms,
@@ -343,13 +345,15 @@ impl Decoder {
             with_quantized!(protos_tensor, p, {
                 let mask_tensor = Self::swap_axes_if_needed(m, mask_coeff.into());
                 let mask_tensor = mask_tensor.slice(s![0, .., ..]);
+                let mask_tensor = mask_tensor.reversed_axes();
 
                 let protos_tensor = Self::swap_axes_if_needed(p, protos.into());
                 let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
                 let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
+
                 impl_yolo_split_segdet_quant_process_masks::<_, _>(
                     boxes,
-                    (mask_tensor.reversed_axes(), quant_masks),
+                    (mask_tensor, quant_masks),
                     (protos_tensor, quant_protos),
                     output_boxes,
                     output_masks,
@@ -1145,9 +1149,11 @@ impl Decoder {
             with_quantized!(scores_tensor, s, {
                 let boxes_tensor = Self::swap_axes_if_needed(b, boxes.into());
                 let boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
+                let boxes_tensor = boxes_tensor.reversed_axes();
 
                 let scores_tensor = Self::swap_axes_if_needed(s, scores.into());
                 let scores_tensor = scores_tensor.slice(s![0, .., ..]);
+                let scores_tensor = scores_tensor.reversed_axes();
 
                 impl_yolo_split_segdet_quant_get_boxes::<XYWH, _, _>(
                     (boxes_tensor, quant_boxes),
@@ -1498,6 +1504,9 @@ impl edgefirst_tracker::DetectionBox for DetectBox {
 use edgefirst_tracker::TrackInfo;
 
 #[cfg(feature = "tracker")]
+use crate::yolo::postprocess_yolo_seg;
+
+#[cfg(feature = "tracker")]
 impl Decoder {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn decode_tracked_modelpack_det_quantized<
@@ -1806,9 +1815,12 @@ impl Decoder {
             with_quantized!(scores_tensor, s, {
                 let boxes_tensor = Self::swap_axes_if_needed(b, boxes.into());
                 let boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
+                let boxes_tensor = boxes_tensor.reversed_axes();
 
                 let scores_tensor = Self::swap_axes_if_needed(s, scores.into());
                 let scores_tensor = scores_tensor.slice(s![0, .., ..]);
+                let scores_tensor = scores_tensor.reversed_axes();
+
                 impl_yolo_split_segdet_quant_get_boxes::<XYWH, _, _>(
                     (boxes_tensor, quant_boxes),
                     (scores_tensor, quant_scores),
@@ -1827,6 +1839,7 @@ impl Decoder {
             with_quantized!(protos_tensor, p, {
                 let mask_tensor = Self::swap_axes_if_needed(m, mask_coeff.into());
                 let mask_tensor = mask_tensor.slice(s![0, .., ..]);
+                let mask_tensor = mask_tensor.reversed_axes();
 
                 let protos_tensor = Self::swap_axes_if_needed(p, protos.into());
                 let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
@@ -2892,9 +2905,11 @@ impl Decoder {
             with_quantized!(scores_tensor, s, {
                 let boxes_tensor = Self::swap_axes_if_needed(b, boxes.into());
                 let boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
+                let boxes_tensor = boxes_tensor.reversed_axes();
 
                 let scores_tensor = Self::swap_axes_if_needed(s, scores.into());
                 let scores_tensor = scores_tensor.slice(s![0, .., ..]);
+                let scores_tensor = scores_tensor.reversed_axes();
 
                 impl_yolo_split_segdet_quant_get_boxes::<XYWH, _, _>(
                     (boxes_tensor, quant_boxes),

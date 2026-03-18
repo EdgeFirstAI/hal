@@ -5,7 +5,7 @@ use crate::{
     kalman::ConstantVelocityXYAHModel2, ActiveTrackInfo, DetectionBox, TrackInfo, Tracker,
 };
 use lapjv::{lapjv, Matrix};
-use log::{debug, trace};
+use log::trace;
 use nalgebra::{Dyn, OMatrix, U4};
 use uuid::Uuid;
 
@@ -124,17 +124,18 @@ impl<T: DetectionBox> Tracklet<T> {
     fn update(&mut self, detect_box: &T, ts: u64) {
         self.count += 1;
         self.last_updated = ts;
-        self.filter.update(&vaalbox_to_xyah(&detect_box.bbox()));
+        self.filter.update(&xyxy_to_xyah(&detect_box.bbox()));
         self.last_box = detect_box.clone();
     }
 
     pub fn get_predicted_location(&self) -> [f32; 4] {
-        let predicted_xyah = self.filter.mean.as_slice();
-        xyah_to_vaalbox(predicted_xyah)
+        let projected = self.filter.project().0;
+        let predicted_xyah = projected.as_slice();
+        xyah_to_xyxy(predicted_xyah)
     }
 }
 
-fn vaalbox_to_xyah(vaal_box: &[f32; 4]) -> [f32; 4] {
+fn xyxy_to_xyah(vaal_box: &[f32; 4]) -> [f32; 4] {
     let x = (vaal_box[2] + vaal_box[0]) / 2.0;
     let y = (vaal_box[3] + vaal_box[1]) / 2.0;
     let w = (vaal_box[2] - vaal_box[0]).max(EPSILON);
@@ -144,7 +145,7 @@ fn vaalbox_to_xyah(vaal_box: &[f32; 4]) -> [f32; 4] {
     [x, y, a, h]
 }
 
-fn xyah_to_vaalbox(xyah: &[f32]) -> [f32; 4] {
+fn xyah_to_xyxy(xyah: &[f32]) -> [f32; 4] {
     assert!(xyah.len() >= 4);
     let [x, y, a, h] = xyah[0..4] else {
         unreachable!()
@@ -186,7 +187,7 @@ fn box_cost<T: DetectionBox>(
 
     // use iou between predicted box and real box:
     let predicted_xyah = track.filter.mean.as_slice();
-    let expected = xyah_to_vaalbox(predicted_xyah);
+    let expected = xyah_to_xyxy(predicted_xyah);
     let iou = iou(&expected, &new_box.bbox());
     if iou < iou_threshold {
         return INVALID_MATCH;
@@ -207,7 +208,7 @@ impl<T: DetectionBox> ByteTrack<T> {
         let dims = boxes.len().max(self.tracklets.len());
         let mut measurements = OMatrix::<f32, Dyn, U4>::from_element(boxes.len(), 0.0);
         for (i, mut row) in measurements.row_iter_mut().enumerate() {
-            row.copy_from_slice(&vaalbox_to_xyah(&boxes[i].bbox()));
+            row.copy_from_slice(&xyxy_to_xyah(&boxes[i].bbox()));
         }
 
         // TODO: use matrix math for IOU, should speed up computation, and store it in
@@ -292,7 +293,7 @@ impl<T: DetectionBox> ByteTrack<T> {
         for i in (0..self.tracklets.len()).rev() {
             let expiry = self.tracklets[i].last_updated + self.track_extra_lifespan;
             if expiry < timestamp {
-                debug!("Tracklet removed: {:?}", self.tracklets[i].id);
+                trace!("Tracklet removed: {:?}", self.tracklets[i].id);
                 let _ = self.tracklets.swap_remove(i);
             }
         }
@@ -316,7 +317,7 @@ impl<T: DetectionBox> ByteTrack<T> {
             let new_tracklet = Tracklet {
                 id,
                 filter: ConstantVelocityXYAHModel2::new(
-                    &vaalbox_to_xyah(&boxes[i].bbox()),
+                    &xyxy_to_xyah(&boxes[i].bbox()),
                     self.track_update,
                 ),
                 last_updated: timestamp,
@@ -469,8 +470,8 @@ mod tests {
     #[test]
     fn test_vaalbox_xyah_roundtrip() {
         let box1 = [0.0134, 0.02135, 0.12438, 0.691];
-        let xyah = vaalbox_to_xyah(&box1);
-        let box2 = xyah_to_vaalbox(&xyah);
+        let xyah = xyxy_to_xyah(&box1);
+        let box2 = xyah_to_xyxy(&xyah);
 
         assert!((box1[0] - box2[0]).abs() < f32::EPSILON);
         assert!((box1[1] - box2[1]).abs() < f32::EPSILON);
