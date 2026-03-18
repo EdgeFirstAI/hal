@@ -20,7 +20,7 @@ name = "edgefirst_hal"
 edgefirst-hal = { workspace = true }
 edgefirst-tensor = { workspace = true }
 edgefirst-image = { workspace = true }
-edgefirst-decoder = { workspace = true }
+edgefirst-decoder = { workspace = true, features = ["tracker"] }
 edgefirst-tracker = { workspace = true }
 errno = "0.3"
 libc = { workspace = true }
