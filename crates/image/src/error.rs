@@ -38,6 +38,8 @@ pub enum Error {
     CropInvalid(String),
     ForcedBackendUnavailable(String),
     NoConverter,
+    NotAnImage,
+    UnsupportedFormat(String),
 }
 
 impl From<std::io::Error> for Error {

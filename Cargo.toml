@@ -43,7 +43,7 @@ g2d-sys = "1.2.0"
 
 gbm = { package = "edgefirst-gbm", version = "0.18.2", default-features = false, features = ["dynamic", "drm-support"] }
 gls = "0.1.6"
-half = "2.7.1"
+half = { version = "2.7.1", features = ["num-traits"] }
 image = { version = "0.25.6", default-features = false, features = ["png"] }
 image-compare = "0.4.2"
 jpeg-encoder = { version = "0.6.1", features = ["simd"] }

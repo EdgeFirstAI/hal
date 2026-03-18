@@ -255,6 +255,14 @@ typedef enum hal_fourcc {
    * 8-bit planar RGBA (4 planes)
    */
   HAL_FOURCC_PLANAR_RGBA = 7,
+  /**
+   * 8-bit BGRA (4 channels, blue first)
+   */
+  HAL_FOURCC_BGRA = 8,
+  /**
+   * 8-bit interleaved YUV422, limited range (VYUY byte order)
+   */
+  HAL_FOURCC_VYUY = 9,
 } hal_fourcc;
 
 /**
@@ -510,7 +518,7 @@ typedef struct hal_tensor hal_tensor;
 /**
  * Opaque tensor image type.
  *
- * A TensorImage combines a tensor with image format metadata (width, height, fourcc).
+ * Wraps a `TensorDyn` with image format metadata (pixel format, width, height).
  */
 typedef struct hal_tensor_image hal_tensor_image;
 

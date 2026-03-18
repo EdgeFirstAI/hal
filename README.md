@@ -41,9 +41,9 @@ edgefirst = "0.9.1"
 import edgefirst_hal as ef
 
 # Load and process image
-img = ef.TensorImage.load("image.jpg", ef.FourCC.RGB)
+img = ef.TensorImage.load("image.jpg", ef.PixelFormat.Rgb)
 converter = ef.ImageProcessor()
-output = converter.create_image(640, 640, ef.FourCC.RGB)
+output = converter.create_image(640, 640, ef.PixelFormat.Rgb)
 converter.convert(img, output)
 
 # Decode YOLO outputs
@@ -53,13 +53,15 @@ boxes, scores, classes = decoder.decode([output0, output1])
 
 #### Rust
 ```rust
-use edgefirst_hal::image::{TensorImage, ImageProcessor, RGB};
+use edgefirst_image::{load_image, ImageProcessor, ImageProcessorTrait, Rotation, Flip, Crop};
+use edgefirst_tensor::{PixelFormat, DType, TensorDyn};
 
 // Load and process image
-let input = TensorImage::load("image.jpg", Some(RGB), None)?;
+let bytes = std::fs::read("image.jpg")?;
+let input = load_image(&bytes, Some(PixelFormat::Rgb), None)?;
 let mut converter = ImageProcessor::new()?;
-let mut output = converter.create_image(640, 640, RGB)?;
-converter.convert(&input, &mut output, Default::default())?;
+let mut output = converter.create_image(640, 640, PixelFormat::Rgb, None)?;
+converter.convert(&input, &mut output, Rotation::None, Flip::None, Crop::default())?;
 ```
 
 #### C
@@ -213,22 +215,22 @@ classDiagram
 - Normalization (signed, unsigned, raw)
 
 **Planar RGB Format**:
-Planar RGB (FourCC: 8BPS) stores color channels in separate planes rather than interleaved. This format is particularly useful for:
+Planar RGB (`PixelFormat::PlanarRgb`) stores color channels in separate planes rather than interleaved. This format is particularly useful for:
 - Neural network preprocessing where planar layout is required
 - Hardware accelerators that prefer planar data
 - Efficient SIMD operations on individual color channels
 - GPU texture operations via OpenGL with swizzled grayscale textures
 
-**TensorImage Flow**:
+**Image Processing Flow**:
 ```mermaid
 flowchart TD
     Input[Input Image<br/>JPEG/PNG bytes or raw pixels]
-    TI[TensorImage<br/>Tensor&lt;u8&gt; + FourCC format]
+    TI[TensorDyn<br/>type-erased tensor + PixelFormat]
     Conv{ImageProcessor::convert<br/>Backend selection}
     G2D[G2D Acceleration<br/>NXP i.MX only]
     GL[OpenGL Acceleration<br/>GPU accelerated]
     CPU[CPU Fallback<br/>fast_image_resize]
-    Output[Output Image<br/>TensorImage or numpy array]
+    Output[Output Image<br/>TensorDyn or numpy array]
 
     Input --> TI
     TI --> Conv
@@ -373,7 +375,7 @@ flowchart TD
 - `PyTensorImage`: Image container with format metadata
 - `PyImageProcessor`: Image processing operations
 - `PyDecoder`: Model output decoding
-- `FourCC`, `Normalization`, `PyRect`, `PyRotation`, `PyFlip`: Configuration enums
+- `PixelFormat`, `Normalization`, `PyRect`, `PyRotation`, `PyFlip`: Configuration enums
 
 **Python Integration**:
 ```mermaid
@@ -428,11 +430,11 @@ format negotiation); reusing them amortizes that cost over thousands of frames.
 let mut converter = ImageProcessor::new()?;
 
 // Create reusable output buffer — allocated once
-let mut output = converter.create_image(640, 640, RGB)?;
+let mut output = converter.create_image(640, 640, PixelFormat::Rgb, None)?;
 
 for frame in camera_frames {
     // Reuse output buffer each iteration — no allocation
-    converter.convert(&frame, &mut output, Default::default())?;
+    converter.convert(&frame, &mut output, Rotation::None, Flip::None, Crop::default())?;
     run_inference(&output)?;
 }
 ```
@@ -442,7 +444,7 @@ for frame in camera_frames {
 converter = ef.ImageProcessor()
 
 # Create reusable output buffer — allocated once
-output = converter.create_image(640, 640, ef.FourCC.RGB)
+output = converter.create_image(640, 640, ef.PixelFormat.Rgb)
 
 for frame in camera_frames:
     # Reuse output buffer each iteration — no allocation
@@ -505,19 +507,21 @@ falls back to PBO or heap memory with no API change required.
 ### Image Conversion
 
 ```rust
-use edgefirst_hal::image::{TensorImage, ImageProcessor, RGB};
+use edgefirst_image::{load_image, ImageProcessor, ImageProcessorTrait, Rotation, Flip, Crop};
+use edgefirst_tensor::{PixelFormat, TensorDyn};
 
 // Load image from JPEG
-let input = TensorImage::load("testdata/zidane.jpg", Some(RGB), None)?;
+let bytes = std::fs::read("testdata/zidane.jpg")?;
+let input = load_image(&bytes, Some(PixelFormat::Rgb), None)?;
 
 // Create converter (auto-selects best backend: G2D, OpenGL, CPU)
 let mut converter = ImageProcessor::new()?;
 
 // Create output buffer with optimal GPU memory (DMA > PBO > Mem)
-let mut output = converter.create_image(640, 640, RGB)?;
+let mut output = converter.create_image(640, 640, PixelFormat::Rgb, None)?;
 
 // Convert and resize
-converter.convert(&input, &mut output, Default::default())?;
+converter.convert(&input, &mut output, Rotation::None, Flip::None, Crop::default())?;
 ```
 
 ### Detection Decoding
@@ -582,13 +586,13 @@ import edgefirst_hal as ef
 import numpy as np
 
 # Load image from file
-tensor_img = ef.TensorImage.load("testdata/zidane.jpg", ef.FourCC.RGB)
+tensor_img = ef.TensorImage.load("testdata/zidane.jpg", ef.PixelFormat.Rgb)
 
 # Create converter
 converter = ef.ImageProcessor()
 
 # Create output image with optimal GPU memory (DMA > PBO > Mem)
-output = converter.create_image(640, 640, ef.FourCC.RGB)
+output = converter.create_image(640, 640, ef.PixelFormat.Rgb)
 
 # Resize with hardware acceleration
 converter.convert(tensor_img, output)
@@ -647,7 +651,7 @@ Raw FFI bindings are wrapped in safe Rust types that enforce correct usage at co
 
 ### 7. Python Wrapper Naming Convention
 
-Python wrapper types use a `Py` prefix (e.g., `PyTensor`, `PyTensorImage`) to clearly distinguish them from their Rust counterparts (`Tensor`, `TensorImage`). This convention makes it explicit which types are Python-facing and which are internal Rust types.
+Python wrapper types use a `Py` prefix (e.g., `PyTensor`, `PyTensorImage`) to clearly distinguish them from their Rust counterparts (`Tensor`, `TensorDyn`). The Python `TensorImage` class wraps a `TensorDyn` internally, providing a familiar image-oriented API to Python users. This convention makes it explicit which types are Python-facing and which are internal Rust types.
 
 ## Performance Considerations
 
@@ -675,7 +679,7 @@ Python wrapper types use a `Py` prefix (e.g., `PyTensor`, `PyTensorImage`) to cl
 
 Thread safety of major types:
 - `Tensor<T>`: `Send + Sync` — safe to share across threads
-- `TensorImage`: `Send + Sync` — thread-safe
+- `TensorDyn`: `Send + Sync` — thread-safe
 - `ImageProcessor`: `Send` but **not** `Sync` — create one per thread (GPU contexts are thread-local)
 - `Decoder`: `Send + Sync` — thread-safe for read operations
 
@@ -843,7 +847,6 @@ This prints markdown tables to stdout. Copy the relevant sections into [BENCHMAR
 - **zune-jpeg/zune-png**: Image decoding
 - **dma-heap**: Linux DMA allocation
 - **nix**: Unix system calls
-- **four-char-code**: FourCC format codes
 
 ### Internal Dependency Graph
 

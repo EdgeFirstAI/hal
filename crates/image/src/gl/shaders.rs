@@ -2,14 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::Error;
-use four_char_code::FourCharCode;
+use edgefirst_tensor::PixelFormat;
 use gbm::drm::buffer::DrmFourcc;
 use log::error;
 use std::ffi::{c_char, CString};
 use std::ptr::null;
 use std::str::FromStr;
-
-use crate::{BGRA, GREY, NV12, PLANAR_RGB, PLANAR_RGB_INT8, RGB, RGBA, RGB_INT8, VYUY, YUYV};
 
 pub(super) fn compile_shader_from_str(
     shader: u32,
@@ -60,18 +58,18 @@ pub(super) fn check_gl_error(name: &str, line: u32) -> Result<(), Error> {
     Ok(())
 }
 
-pub(super) fn fourcc_to_drm(fourcc: FourCharCode) -> Result<DrmFourcc, Error> {
-    match fourcc {
-        RGBA => Ok(DrmFourcc::Abgr8888),
-        BGRA => Ok(DrmFourcc::Argb8888),
-        YUYV => Ok(DrmFourcc::Yuyv),
-        VYUY => Ok(DrmFourcc::Vyuy),
-        RGB | RGB_INT8 => Ok(DrmFourcc::Bgr888),
-        GREY => Ok(DrmFourcc::R8),
-        NV12 => Ok(DrmFourcc::Nv12),
-        PLANAR_RGB | PLANAR_RGB_INT8 => Ok(DrmFourcc::R8),
+pub(super) fn pixel_format_to_drm(fmt: PixelFormat) -> Result<DrmFourcc, Error> {
+    match fmt {
+        PixelFormat::Rgba => Ok(DrmFourcc::Abgr8888),
+        PixelFormat::Bgra => Ok(DrmFourcc::Argb8888),
+        PixelFormat::Yuyv => Ok(DrmFourcc::Yuyv),
+        PixelFormat::Vyuy => Ok(DrmFourcc::Vyuy),
+        PixelFormat::Rgb => Ok(DrmFourcc::Bgr888),
+        PixelFormat::Grey => Ok(DrmFourcc::R8),
+        PixelFormat::Nv12 => Ok(DrmFourcc::Nv12),
+        PixelFormat::PlanarRgb => Ok(DrmFourcc::R8),
         _ => Err(Error::NotSupported(format!(
-            "FourCC {fourcc:?} has no DRM format mapping"
+            "PixelFormat {fmt:?} has no DRM format mapping"
         ))),
     }
 }
@@ -174,7 +172,7 @@ void main(){
 
 /// Int8 variant of [`generate_texture_fragment_shader`]. Applies `fract(v + 0.5)`
 /// to each RGB channel for XOR 0x80 bias (uint8 → int8 conversion).
-/// Used by the direct RGB render path for RGB_INT8 output.
+/// Used by the direct RGB render path for int8 RGB output.
 pub(super) fn generate_texture_int8_shader() -> &'static str {
     "\
 #version 300 es
@@ -201,7 +199,7 @@ void main(){
 
 /// Int8 variant of [`generate_texture_fragment_shader_yuv`]. Applies XOR 0x80 bias
 /// to each RGB channel (uint8 → int8 conversion).
-/// Used by the direct RGB render path for RGB_INT8 output with external OES sources.
+/// Used by the direct RGB render path for int8 RGB output with external OES sources.
 pub(super) fn generate_texture_int8_shader_yuv() -> &'static str {
     "\
 #version 300 es

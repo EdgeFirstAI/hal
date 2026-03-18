@@ -23,12 +23,13 @@ This is the umbrella crate that re-exports the core EdgeFirst HAL components:
 
 ```rust,ignore
 use edgefirst_hal::{tensor, image, decoder};
+use edgefirst_tensor::PixelFormat;
 
 // Create a tensor with automatic memory selection
 let tensor = tensor::Tensor::<f32>::new(&[1, 3, 640, 640], None, None)?;
 
 // Load and process an image
-let img = image::TensorImage::load(&image_bytes, Some(image::RGBA), None)?;
+let img = image::load_image(&image_bytes, Some(PixelFormat::Rgba), None)?;
 let mut processor = image::ImageProcessor::new()?;
 processor.convert(&img, &mut dst, image::Rotation::None, image::Flip::None, image::Crop::default())?;
 

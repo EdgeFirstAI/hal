@@ -25,9 +25,7 @@ mod common;
 use common::{calculate_letterbox, get_test_data, run_bench, BenchConfig, BenchSuite};
 
 use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rect, Rotation};
-use edgefirst_image::{
-    BGRA, GREY, NV12, NV16, PLANAR_RGB, PLANAR_RGB_INT8, RGB, RGBA, RGB_INT8, VYUY, YUYV,
-};
+use edgefirst_tensor::PixelFormat;
 use edgefirst_tensor::{TensorMapTrait, TensorTrait};
 
 const WARMUP: usize = 10;
@@ -49,13 +47,14 @@ fn bench_letterbox(configs: &[BenchConfig], proc: &mut ImageProcessor, suite: &m
         let throughput = config.throughput();
         let name = format!("letterbox/{}", config.id());
 
-        let Ok(src) = proc.create_image(config.in_w, config.in_h, config.in_fmt) else {
+        let Ok(src) = proc.create_image(config.in_w, config.in_h, config.in_fmt, None) else {
             println!("  {:50} [skipped: allocation failed]", name);
             continue;
         };
         let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
-        src.tensor().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
-        let Ok(mut dst) = proc.create_image(config.out_w, config.out_h, config.out_fmt) else {
+        src.as_u8().unwrap().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
+        let Ok(mut dst) = proc.create_image(config.out_w, config.out_h, config.out_fmt, None)
+        else {
             println!("  {:50} [skipped: allocation failed]", name);
             continue;
         };
@@ -86,13 +85,14 @@ fn bench_convert(configs: &[BenchConfig], proc: &mut ImageProcessor, suite: &mut
         let throughput = config.throughput();
         let name = format!("convert/{}", config.id());
 
-        let Ok(src) = proc.create_image(config.in_w, config.in_h, config.in_fmt) else {
+        let Ok(src) = proc.create_image(config.in_w, config.in_h, config.in_fmt, None) else {
             println!("  {:50} [skipped: allocation failed]", name);
             continue;
         };
         let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
-        src.tensor().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
-        let Ok(mut dst) = proc.create_image(config.out_w, config.out_h, config.out_fmt) else {
+        src.as_u8().unwrap().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
+        let Ok(mut dst) = proc.create_image(config.out_w, config.out_h, config.out_fmt, None)
+        else {
             println!("  {:50} [skipped: allocation failed]", name);
             continue;
         };
@@ -123,13 +123,14 @@ fn bench_resize(configs: &[BenchConfig], proc: &mut ImageProcessor, suite: &mut 
         let throughput = config.throughput();
         let name = format!("resize/{}", config.id());
 
-        let Ok(src) = proc.create_image(config.in_w, config.in_h, config.in_fmt) else {
+        let Ok(src) = proc.create_image(config.in_w, config.in_h, config.in_fmt, None) else {
             println!("  {:50} [skipped: allocation failed]", name);
             continue;
         };
         let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
-        src.tensor().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
-        let Ok(mut dst) = proc.create_image(config.out_w, config.out_h, config.out_fmt) else {
+        src.as_u8().unwrap().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
+        let Ok(mut dst) = proc.create_image(config.out_w, config.out_h, config.out_fmt, None)
+        else {
             println!("  {:50} [skipped: allocation failed]", name);
             continue;
         };
@@ -168,21 +169,21 @@ fn bench_rotate(proc: &mut ImageProcessor, suite: &mut BenchSuite, max_width: us
             continue;
         }
         for (rotation, rot_name) in &rotations {
-            let name = format!("rotate/{res}/{rot_name}/YUYV->RGBA");
+            let name = format!("rotate/{res}/{rot_name}/PixelFormat::Yuyv->PixelFormat::Rgba");
 
-            let Ok(src) = proc.create_image(w, h, YUYV) else {
+            let Ok(src) = proc.create_image(w, h, PixelFormat::Yuyv, None) else {
                 println!("  {:50} [skipped: allocation failed]", name);
                 continue;
             };
-            let data = get_test_data(w, h, YUYV);
-            src.tensor().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
+            let data = get_test_data(w, h, PixelFormat::Yuyv);
+            src.as_u8().unwrap().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
 
             // For CW90/CCW90 rotations, dst dimensions are swapped
             let (dw, dh) = match rotation {
                 Rotation::Clockwise90 | Rotation::CounterClockwise90 => (h, w),
                 _ => (w, h),
             };
-            let Ok(mut dst) = proc.create_image(dw, dh, RGBA) else {
+            let Ok(mut dst) = proc.create_image(dw, dh, PixelFormat::Rgba, None) else {
                 println!("  {:50} [skipped: allocation failed]", name);
                 continue;
             };
@@ -192,7 +193,7 @@ fn bench_rotate(proc: &mut ImageProcessor, suite: &mut BenchSuite, max_width: us
                 continue;
             }
 
-            let throughput = (w * h * 2) as u64; // YUYV = 2 bytes/pixel
+            let throughput = (w * h * 2) as u64; // PixelFormat::Yuyv = 2 bytes/pixel
             let result = run_bench(&name, WARMUP, ITERATIONS, || {
                 proc.convert(&src, &mut dst, *rotation, Flip::None, Crop::no_crop())
                     .unwrap();
@@ -221,15 +222,15 @@ fn bench_flip(proc: &mut ImageProcessor, suite: &mut BenchSuite, max_width: usiz
             continue;
         }
         for (flip, flip_name) in &flips {
-            let name = format!("flip/{res}/{flip_name}/YUYV->RGBA");
+            let name = format!("flip/{res}/{flip_name}/PixelFormat::Yuyv->PixelFormat::Rgba");
 
-            let Ok(src) = proc.create_image(w, h, YUYV) else {
+            let Ok(src) = proc.create_image(w, h, PixelFormat::Yuyv, None) else {
                 println!("  {:50} [skipped: allocation failed]", name);
                 continue;
             };
-            let data = get_test_data(w, h, YUYV);
-            src.tensor().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
-            let Ok(mut dst) = proc.create_image(w, h, RGBA) else {
+            let data = get_test_data(w, h, PixelFormat::Yuyv);
+            src.as_u8().unwrap().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
+            let Ok(mut dst) = proc.create_image(w, h, PixelFormat::Rgba, None) else {
                 println!("  {:50} [skipped: allocation failed]", name);
                 continue;
             };
@@ -239,7 +240,7 @@ fn bench_flip(proc: &mut ImageProcessor, suite: &mut BenchSuite, max_width: usiz
                 continue;
             }
 
-            let throughput = (w * h * 2) as u64; // YUYV = 2 bytes/pixel
+            let throughput = (w * h * 2) as u64; // PixelFormat::Yuyv = 2 bytes/pixel
             let result = run_bench(&name, WARMUP, ITERATIONS, || {
                 proc.convert(&src, &mut dst, Rotation::None, *flip, Crop::no_crop())
                     .unwrap();
@@ -271,21 +272,21 @@ fn bench_letterbox_pipeline(
     .filter(|(w, _, _)| *w <= max_width)
     .collect();
     let all_formats = [
-        (YUYV, RGBA),
-        (YUYV, RGB),
-        (YUYV, RGB_INT8),
-        (YUYV, PLANAR_RGB),
-        (YUYV, PLANAR_RGB_INT8),
-        (NV12, RGBA),
-        (NV12, RGB),
-        (NV12, RGB_INT8),
-        (NV12, PLANAR_RGB),
-        (NV12, PLANAR_RGB_INT8),
+        (PixelFormat::Yuyv, PixelFormat::Rgba),
+        (PixelFormat::Yuyv, PixelFormat::Rgb),
+        (PixelFormat::Yuyv, PixelFormat::Rgb),
+        (PixelFormat::Yuyv, PixelFormat::PlanarRgb),
+        (PixelFormat::Yuyv, PixelFormat::PlanarRgb),
+        (PixelFormat::Nv12, PixelFormat::Rgba),
+        (PixelFormat::Nv12, PixelFormat::Rgb),
+        (PixelFormat::Nv12, PixelFormat::Rgb),
+        (PixelFormat::Nv12, PixelFormat::PlanarRgb),
+        (PixelFormat::Nv12, PixelFormat::PlanarRgb),
     ];
     let formats: Vec<_> = all_formats
         .into_iter()
         .filter(|(inf, outf)| {
-            !(skip_nv12_planar && *inf == NV12 && matches!(*outf, PLANAR_RGB | PLANAR_RGB_INT8))
+            !(skip_nv12_planar && *inf == PixelFormat::Nv12 && *outf == PixelFormat::PlanarRgb)
         })
         .collect();
 
@@ -302,13 +303,13 @@ fn bench_letterbox_pipeline(
                 .with_dst_rect(Some(Rect::new(left, top, new_w, new_h)))
                 .with_dst_color(Some([114, 114, 114, 255]));
 
-            let Ok(src) = proc.create_image(w, h, *in_fmt) else {
+            let Ok(src) = proc.create_image(w, h, *in_fmt, None) else {
                 println!("  {:50} [skipped: allocation failed]", name);
                 continue;
             };
             let data = get_test_data(w, h, *in_fmt);
-            src.tensor().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
-            let Ok(mut dst) = proc.create_image(640, 640, *out_fmt) else {
+            src.as_u8().unwrap().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
+            let Ok(mut dst) = proc.create_image(640, 640, *out_fmt, None) else {
                 println!("  {:50} [skipped: allocation failed]", name);
                 continue;
             };
@@ -343,8 +344,8 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(usize::MAX);
-    // Optional: skip NV12 planar combos (hangs on Vivante GC7000UL)
-    let skip_nv12_planar = std::env::var("BENCH_SKIP_NV12_PLANAR").is_ok();
+    // Optional: skip PixelFormat::Nv12 planar combos (hangs on Vivante GC7000UL)
+    let skip_nv12_planar = std::env::var("BENCH_SKIP_PixelFormat::Nv12_PLANAR").is_ok();
 
     println!("Pipeline Benchmark — edgefirst-bench harness");
     println!("  warmup={WARMUP}  iterations={ITERATIONS}");
@@ -358,57 +359,155 @@ fn main() {
     // --- Letterbox configs (720p, 1080p, 4K) ---
     let letterbox_configs = vec![
         // 720p camera -> YOLO standard (640x640)
-        BenchConfig::new(1280, 720, 640, 640, YUYV, RGBA),
-        BenchConfig::new(1280, 720, 640, 640, YUYV, RGB),
-        BenchConfig::new(1280, 720, 640, 640, YUYV, RGB_INT8),
-        BenchConfig::new(1280, 720, 640, 640, YUYV, PLANAR_RGB),
-        BenchConfig::new(1280, 720, 640, 640, YUYV, PLANAR_RGB_INT8),
-        BenchConfig::new(1280, 720, 640, 640, NV12, RGBA),
-        BenchConfig::new(1280, 720, 640, 640, NV12, RGB),
-        BenchConfig::new(1280, 720, 640, 640, NV12, RGB_INT8),
-        BenchConfig::new(1280, 720, 640, 640, NV12, PLANAR_RGB),
-        BenchConfig::new(1280, 720, 640, 640, NV12, PLANAR_RGB_INT8),
+        BenchConfig::new(1280, 720, 640, 640, PixelFormat::Yuyv, PixelFormat::Rgba),
+        BenchConfig::new(1280, 720, 640, 640, PixelFormat::Yuyv, PixelFormat::Rgb),
+        BenchConfig::new(1280, 720, 640, 640, PixelFormat::Yuyv, PixelFormat::Rgb),
+        BenchConfig::new(
+            1280,
+            720,
+            640,
+            640,
+            PixelFormat::Yuyv,
+            PixelFormat::PlanarRgb,
+        ),
+        BenchConfig::new(
+            1280,
+            720,
+            640,
+            640,
+            PixelFormat::Yuyv,
+            PixelFormat::PlanarRgb,
+        ),
+        BenchConfig::new(1280, 720, 640, 640, PixelFormat::Nv12, PixelFormat::Rgba),
+        BenchConfig::new(1280, 720, 640, 640, PixelFormat::Nv12, PixelFormat::Rgb),
+        BenchConfig::new(1280, 720, 640, 640, PixelFormat::Nv12, PixelFormat::Rgb),
+        BenchConfig::new(
+            1280,
+            720,
+            640,
+            640,
+            PixelFormat::Nv12,
+            PixelFormat::PlanarRgb,
+        ),
+        BenchConfig::new(
+            1280,
+            720,
+            640,
+            640,
+            PixelFormat::Nv12,
+            PixelFormat::PlanarRgb,
+        ),
         // 1080p camera -> YOLO standard (640x640)
-        BenchConfig::new(1920, 1080, 640, 640, YUYV, RGBA),
-        BenchConfig::new(1920, 1080, 640, 640, YUYV, RGB),
-        BenchConfig::new(1920, 1080, 640, 640, YUYV, RGB_INT8),
-        BenchConfig::new(1920, 1080, 640, 640, YUYV, PLANAR_RGB),
-        BenchConfig::new(1920, 1080, 640, 640, YUYV, PLANAR_RGB_INT8),
-        BenchConfig::new(1920, 1080, 640, 640, VYUY, RGBA),
-        BenchConfig::new(1920, 1080, 640, 640, VYUY, RGB),
-        BenchConfig::new(1920, 1080, 640, 640, NV12, RGBA),
-        BenchConfig::new(1920, 1080, 640, 640, NV12, RGB),
-        BenchConfig::new(1920, 1080, 640, 640, NV12, RGB_INT8),
-        BenchConfig::new(1920, 1080, 640, 640, NV12, PLANAR_RGB),
-        BenchConfig::new(1920, 1080, 640, 640, NV12, PLANAR_RGB_INT8),
+        BenchConfig::new(1920, 1080, 640, 640, PixelFormat::Yuyv, PixelFormat::Rgba),
+        BenchConfig::new(1920, 1080, 640, 640, PixelFormat::Yuyv, PixelFormat::Rgb),
+        BenchConfig::new(1920, 1080, 640, 640, PixelFormat::Yuyv, PixelFormat::Rgb),
+        BenchConfig::new(
+            1920,
+            1080,
+            640,
+            640,
+            PixelFormat::Yuyv,
+            PixelFormat::PlanarRgb,
+        ),
+        BenchConfig::new(
+            1920,
+            1080,
+            640,
+            640,
+            PixelFormat::Yuyv,
+            PixelFormat::PlanarRgb,
+        ),
+        BenchConfig::new(1920, 1080, 640, 640, PixelFormat::Vyuy, PixelFormat::Rgba),
+        BenchConfig::new(1920, 1080, 640, 640, PixelFormat::Vyuy, PixelFormat::Rgb),
+        BenchConfig::new(1920, 1080, 640, 640, PixelFormat::Nv12, PixelFormat::Rgba),
+        BenchConfig::new(1920, 1080, 640, 640, PixelFormat::Nv12, PixelFormat::Rgb),
+        BenchConfig::new(1920, 1080, 640, 640, PixelFormat::Nv12, PixelFormat::Rgb),
+        BenchConfig::new(
+            1920,
+            1080,
+            640,
+            640,
+            PixelFormat::Nv12,
+            PixelFormat::PlanarRgb,
+        ),
+        BenchConfig::new(
+            1920,
+            1080,
+            640,
+            640,
+            PixelFormat::Nv12,
+            PixelFormat::PlanarRgb,
+        ),
         // 4K camera -> YOLO standard (640x640)
-        BenchConfig::new(3840, 2160, 640, 640, YUYV, RGBA),
-        BenchConfig::new(3840, 2160, 640, 640, YUYV, RGB),
-        BenchConfig::new(3840, 2160, 640, 640, YUYV, RGB_INT8),
-        BenchConfig::new(3840, 2160, 640, 640, YUYV, PLANAR_RGB),
-        BenchConfig::new(3840, 2160, 640, 640, YUYV, PLANAR_RGB_INT8),
-        BenchConfig::new(3840, 2160, 640, 640, NV12, RGBA),
-        BenchConfig::new(3840, 2160, 640, 640, NV12, RGB),
-        BenchConfig::new(3840, 2160, 640, 640, NV12, RGB_INT8),
-        BenchConfig::new(3840, 2160, 640, 640, NV12, PLANAR_RGB),
-        BenchConfig::new(3840, 2160, 640, 640, NV12, PLANAR_RGB_INT8),
+        BenchConfig::new(3840, 2160, 640, 640, PixelFormat::Yuyv, PixelFormat::Rgba),
+        BenchConfig::new(3840, 2160, 640, 640, PixelFormat::Yuyv, PixelFormat::Rgb),
+        BenchConfig::new(3840, 2160, 640, 640, PixelFormat::Yuyv, PixelFormat::Rgb),
+        BenchConfig::new(
+            3840,
+            2160,
+            640,
+            640,
+            PixelFormat::Yuyv,
+            PixelFormat::PlanarRgb,
+        ),
+        BenchConfig::new(
+            3840,
+            2160,
+            640,
+            640,
+            PixelFormat::Yuyv,
+            PixelFormat::PlanarRgb,
+        ),
+        BenchConfig::new(3840, 2160, 640, 640, PixelFormat::Nv12, PixelFormat::Rgba),
+        BenchConfig::new(3840, 2160, 640, 640, PixelFormat::Nv12, PixelFormat::Rgb),
+        BenchConfig::new(3840, 2160, 640, 640, PixelFormat::Nv12, PixelFormat::Rgb),
+        BenchConfig::new(
+            3840,
+            2160,
+            640,
+            640,
+            PixelFormat::Nv12,
+            PixelFormat::PlanarRgb,
+        ),
+        BenchConfig::new(
+            3840,
+            2160,
+            640,
+            640,
+            PixelFormat::Nv12,
+            PixelFormat::PlanarRgb,
+        ),
         // 4K camera -> YOLO hi-res (1280x1280)
-        BenchConfig::new(3840, 2160, 1280, 1280, YUYV, RGBA),
-        BenchConfig::new(3840, 2160, 1280, 1280, YUYV, RGB),
-        BenchConfig::new(3840, 2160, 1280, 1280, YUYV, RGB_INT8),
-        BenchConfig::new(3840, 2160, 1280, 1280, YUYV, PLANAR_RGB_INT8),
-        BenchConfig::new(3840, 2160, 1280, 1280, NV12, RGBA),
-        BenchConfig::new(3840, 2160, 1280, 1280, NV12, RGB),
-        BenchConfig::new(3840, 2160, 1280, 1280, NV12, RGB_INT8),
-        BenchConfig::new(3840, 2160, 1280, 1280, NV12, PLANAR_RGB_INT8),
-        // BGRA destinations
-        BenchConfig::new(1920, 1080, 640, 640, YUYV, BGRA),
-        BenchConfig::new(3840, 2160, 640, 640, YUYV, BGRA),
-        // NV16 input
-        BenchConfig::new(1920, 1080, 640, 640, NV16, RGBA),
+        BenchConfig::new(3840, 2160, 1280, 1280, PixelFormat::Yuyv, PixelFormat::Rgba),
+        BenchConfig::new(3840, 2160, 1280, 1280, PixelFormat::Yuyv, PixelFormat::Rgb),
+        BenchConfig::new(3840, 2160, 1280, 1280, PixelFormat::Yuyv, PixelFormat::Rgb),
+        BenchConfig::new(
+            3840,
+            2160,
+            1280,
+            1280,
+            PixelFormat::Yuyv,
+            PixelFormat::PlanarRgb,
+        ),
+        BenchConfig::new(3840, 2160, 1280, 1280, PixelFormat::Nv12, PixelFormat::Rgba),
+        BenchConfig::new(3840, 2160, 1280, 1280, PixelFormat::Nv12, PixelFormat::Rgb),
+        BenchConfig::new(3840, 2160, 1280, 1280, PixelFormat::Nv12, PixelFormat::Rgb),
+        BenchConfig::new(
+            3840,
+            2160,
+            1280,
+            1280,
+            PixelFormat::Nv12,
+            PixelFormat::PlanarRgb,
+        ),
+        // PixelFormat::Bgra destinations
+        BenchConfig::new(1920, 1080, 640, 640, PixelFormat::Yuyv, PixelFormat::Bgra),
+        BenchConfig::new(3840, 2160, 640, 640, PixelFormat::Yuyv, PixelFormat::Bgra),
+        // PixelFormat::Nv16 input
+        BenchConfig::new(1920, 1080, 640, 640, PixelFormat::Nv16, PixelFormat::Rgba),
     ];
     let is_nv12_planar =
-        |c: &BenchConfig| c.in_fmt == NV12 && matches!(c.out_fmt, PLANAR_RGB | PLANAR_RGB_INT8);
+        |c: &BenchConfig| c.in_fmt == PixelFormat::Nv12 && c.out_fmt == PixelFormat::PlanarRgb;
     let letterbox_configs: Vec<_> = letterbox_configs
         .into_iter()
         .filter(|c| c.in_w <= max_width)
@@ -419,28 +518,28 @@ fn main() {
     // --- Convert configs ---
     let convert_configs = vec![
         // 1080p conversions
-        BenchConfig::new(1920, 1080, 1920, 1080, YUYV, RGBA),
-        BenchConfig::new(1920, 1080, 1920, 1080, YUYV, RGB),
-        BenchConfig::new(1920, 1080, 1920, 1080, YUYV, RGB_INT8),
-        BenchConfig::new(1920, 1080, 1920, 1080, VYUY, RGBA),
-        BenchConfig::new(1920, 1080, 1920, 1080, VYUY, RGB),
-        BenchConfig::new(1920, 1080, 1920, 1080, NV12, RGBA),
-        BenchConfig::new(1920, 1080, 1920, 1080, NV12, RGB),
-        BenchConfig::new(1920, 1080, 1920, 1080, RGB, RGBA),
+        BenchConfig::new(1920, 1080, 1920, 1080, PixelFormat::Yuyv, PixelFormat::Rgba),
+        BenchConfig::new(1920, 1080, 1920, 1080, PixelFormat::Yuyv, PixelFormat::Rgb),
+        BenchConfig::new(1920, 1080, 1920, 1080, PixelFormat::Yuyv, PixelFormat::Rgb),
+        BenchConfig::new(1920, 1080, 1920, 1080, PixelFormat::Vyuy, PixelFormat::Rgba),
+        BenchConfig::new(1920, 1080, 1920, 1080, PixelFormat::Vyuy, PixelFormat::Rgb),
+        BenchConfig::new(1920, 1080, 1920, 1080, PixelFormat::Nv12, PixelFormat::Rgba),
+        BenchConfig::new(1920, 1080, 1920, 1080, PixelFormat::Nv12, PixelFormat::Rgb),
+        BenchConfig::new(1920, 1080, 1920, 1080, PixelFormat::Rgb, PixelFormat::Rgba),
         // 4K conversions
-        BenchConfig::new(3840, 2160, 3840, 2160, YUYV, RGBA),
-        BenchConfig::new(3840, 2160, 3840, 2160, YUYV, RGB),
-        BenchConfig::new(3840, 2160, 3840, 2160, YUYV, RGB_INT8),
-        BenchConfig::new(3840, 2160, 3840, 2160, NV12, RGBA),
-        BenchConfig::new(3840, 2160, 3840, 2160, NV12, RGB),
-        BenchConfig::new(3840, 2160, 3840, 2160, RGB, RGBA),
-        // BGRA conversions
-        BenchConfig::new(1920, 1080, 1920, 1080, RGBA, BGRA),
-        BenchConfig::new(1920, 1080, 1920, 1080, RGB, BGRA),
-        // NV16 conversions
-        BenchConfig::new(1920, 1080, 1920, 1080, NV16, RGBA),
-        // GREY destination
-        BenchConfig::new(1920, 1080, 1920, 1080, RGBA, GREY),
+        BenchConfig::new(3840, 2160, 3840, 2160, PixelFormat::Yuyv, PixelFormat::Rgba),
+        BenchConfig::new(3840, 2160, 3840, 2160, PixelFormat::Yuyv, PixelFormat::Rgb),
+        BenchConfig::new(3840, 2160, 3840, 2160, PixelFormat::Yuyv, PixelFormat::Rgb),
+        BenchConfig::new(3840, 2160, 3840, 2160, PixelFormat::Nv12, PixelFormat::Rgba),
+        BenchConfig::new(3840, 2160, 3840, 2160, PixelFormat::Nv12, PixelFormat::Rgb),
+        BenchConfig::new(3840, 2160, 3840, 2160, PixelFormat::Rgb, PixelFormat::Rgba),
+        // PixelFormat::Bgra conversions
+        BenchConfig::new(1920, 1080, 1920, 1080, PixelFormat::Rgba, PixelFormat::Bgra),
+        BenchConfig::new(1920, 1080, 1920, 1080, PixelFormat::Rgb, PixelFormat::Bgra),
+        // PixelFormat::Nv16 conversions
+        BenchConfig::new(1920, 1080, 1920, 1080, PixelFormat::Nv16, PixelFormat::Rgba),
+        // PixelFormat::Grey destination
+        BenchConfig::new(1920, 1080, 1920, 1080, PixelFormat::Rgba, PixelFormat::Grey),
     ];
     let convert_configs: Vec<_> = convert_configs
         .into_iter()
@@ -451,12 +550,12 @@ fn main() {
     // --- Resize configs ---
     let resize_configs = vec![
         // 4K -> 1080p
-        BenchConfig::new(3840, 2160, 1920, 1080, YUYV, RGBA),
-        BenchConfig::new(3840, 2160, 1920, 1080, YUYV, RGB),
+        BenchConfig::new(3840, 2160, 1920, 1080, PixelFormat::Yuyv, PixelFormat::Rgba),
+        BenchConfig::new(3840, 2160, 1920, 1080, PixelFormat::Yuyv, PixelFormat::Rgb),
         // 4K -> 720p
-        BenchConfig::new(3840, 2160, 1280, 720, YUYV, RGBA),
+        BenchConfig::new(3840, 2160, 1280, 720, PixelFormat::Yuyv, PixelFormat::Rgba),
         // 1080p -> 720p
-        BenchConfig::new(1920, 1080, 1280, 720, YUYV, RGBA),
+        BenchConfig::new(1920, 1080, 1280, 720, PixelFormat::Yuyv, PixelFormat::Rgba),
     ];
     let resize_configs: Vec<_> = resize_configs
         .into_iter()
