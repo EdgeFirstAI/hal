@@ -1752,8 +1752,8 @@ void hal_tensor_map_unmap(struct hal_tensor_map *map);
 /**
  * Create a new ByteTrack tracker with specified parameters.
  *
- * @param track_thresh Score threshold for creating new tracks
- * @param high_thresh High confidence threshold for first-pass matching
+ * @param track_update Smoothness threshold for track updates (high = more stable tracks, low = more responsive to changes)
+ * @param high_thresh High confidence threshold for first-pass matching and creating new tracks
  * @param match_thresh IOU threshold for matching detections to tracks
  * @param frame_rate Expected frame rate of the input video
  * @param track_buffer Number of frames to keep lost tracks before deletion
@@ -1761,7 +1761,7 @@ void hal_tensor_map_unmap(struct hal_tensor_map *map);
  * @par Errors (errno):
  * - ENOMEM: Memory allocation failed
  */
-struct hal_bytetrack *hal_bytetrack_new(float track_thresh,
+struct hal_bytetrack *hal_bytetrack_new(float track_update,
                                         float high_thresh,
                                         float match_thresh,
                                         int frame_rate,
@@ -1771,7 +1771,7 @@ struct hal_bytetrack *hal_bytetrack_new(float track_thresh,
  * Create a new ByteTrack tracker with default parameters.
  *
  * Default values:
- * - track_thresh: 0.25
+ * - track_update: 0.25
  * - high_thresh: 0.7
  * - match_thresh: 0.25
  * - track_extra_lifespan: 500ms
