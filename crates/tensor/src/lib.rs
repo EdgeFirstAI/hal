@@ -649,21 +649,17 @@ where
                     )));
                 }
                 match format {
-                    PixelFormat::Nv12 => {
-                        if !shape[0].is_multiple_of(3) {
-                            return Err(Error::InvalidShape(format!(
-                                "NV12 contiguous shape[0] must be divisible by 3, got {}",
-                                shape[0]
-                            )));
-                        }
+                    PixelFormat::Nv12 if !shape[0].is_multiple_of(3) => {
+                        return Err(Error::InvalidShape(format!(
+                            "NV12 contiguous shape[0] must be divisible by 3, got {}",
+                            shape[0]
+                        )));
                     }
-                    PixelFormat::Nv16 => {
-                        if !shape[0].is_multiple_of(2) {
-                            return Err(Error::InvalidShape(format!(
-                                "NV16 contiguous shape[0] must be even, got {}",
-                                shape[0]
-                            )));
-                        }
+                    PixelFormat::Nv16 if !shape[0].is_multiple_of(2) => {
+                        return Err(Error::InvalidShape(format!(
+                            "NV16 contiguous shape[0] must be even, got {}",
+                            shape[0]
+                        )));
                     }
                     _ => {}
                 }
