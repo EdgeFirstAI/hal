@@ -822,36 +822,43 @@ class TensorMap:
     def __enter__(self) -> TensorMap: ...
     def __exit__(self, _exc_type, _exc_value, _traceback) -> None: ...
 
-class FourCC(enum.Enum):
-    YUYV: FourCC
-    """YUYV format (YUV 4:2:2)"""
+class PixelFormat(enum.Enum):
+    """Pixel format for image tensors."""
 
-    RGBA: FourCC
-    """RGBA format (Red, Green, Blue, Alpha)"""
+    Rgb: PixelFormat
+    """Packed RGB [H, W, 3]"""
 
-    BGRA: FourCC
-    """BGRA format (Blue, Green, Red, Alpha). Destination-only format for
+    Rgba: PixelFormat
+    """Packed RGBA [H, W, 4]"""
+
+    Bgra: PixelFormat
+    """Packed BGRA [H, W, 4]. Destination-only format for
     Cairo/Wayland compositing (ARGB32 on little-endian)."""
 
-    RGB: FourCC
-    """RGB format (Red, Green, Blue)"""
+    Grey: PixelFormat
+    """Grayscale [H, W, 1]"""
 
-    NV12: FourCC
-    """NV12 format (YUV 4:2:0)"""
+    Yuyv: PixelFormat
+    """Packed YUV 4:2:2, YUYV byte order [H, W, 2]"""
 
-    NV16: FourCC
-    """NV16 format (YUV 4:2:2)"""
+    Vyuy: PixelFormat
+    """Packed YUV 4:2:2, VYUY byte order [H, W, 2]"""
 
-    GREY: FourCC
-    """Greyscale format"""
+    Nv12: PixelFormat
+    """Semi-planar YUV 4:2:0 [H*3/2, W]"""
 
-    PLANAR_RGB: FourCC
-    """Planar RGB format (Red plane, Green plane, Blue plane)"""
+    Nv16: PixelFormat
+    """Semi-planar YUV 4:2:2 [H*2, W]"""
 
-    PLANAR_RGBA: FourCC
-    """Planar RGBA format (Red plane, Green plane, Blue plane, Alpha plane)"""
+    PlanarRgb: PixelFormat
+    """Planar RGB, channels-first [3, H, W]"""
 
-    def __init__(self, fourcc: str) -> None: ...
+    PlanarRgba: PixelFormat
+    """Planar RGBA, channels-first [4, H, W]"""
+
+    def __init__(self, name: str) -> None:
+        """Create a PixelFormat from a string name (e.g. 'RGBA', 'NV12', 'GREY')."""
+        ...
 
 class Normalization(enum.Enum):
     DEFAULT: Normalization
@@ -901,7 +908,7 @@ class TensorImage:
         self,
         width: int,
         height: int,
-        fourcc: FourCC = FourCC.RGBA,
+        format: PixelFormat = PixelFormat.Rgba,
         mem: None | TensorMemory = None,
     ) -> None:
         """
@@ -915,7 +922,7 @@ class TensorImage:
         def from_fd(
             fd: int,
             shape: list[int],
-            fourcc: FourCC,
+            format: PixelFormat,
         ) -> TensorImage:
             """
             Load an image from a file descriptor, inspecting the file descriptor to determine
@@ -926,23 +933,23 @@ class TensorImage:
             (planar). The semi-planar formats NV12 and NV16 use a 2D shape because
             their Y and UV planes have different heights:
 
-            ===============  ==================  ====================================
-            Format           Shape               Description
-            ===============  ==================  ====================================
-            FourCC.RGB       [H, W, 3]           3-channel interleaved
-            FourCC.RGBA      [H, W, 4]           4-channel interleaved
-            FourCC.GREY      [H, W, 1]           Single-channel grayscale
-            FourCC.YUYV      [H, W, 2]           YUV 4:2:2 interleaved
-            FourCC.PLANAR_RGB   [3, H, W]        Channels-first (3 planes)
-            FourCC.PLANAR_RGBA  [4, H, W]        Channels-first (4 planes)
-            FourCC.NV12      [H * 3 // 2, W]     Semi-planar YUV 4:2:0 (2D)
-            FourCC.NV16      [H * 2, W]          Semi-planar YUV 4:2:2 (2D)
-            ===============  ==================  ====================================
+            ==================  ==================  ====================================
+            Format               Shape               Description
+            ==================  ==================  ====================================
+            PixelFormat.Rgb      [H, W, 3]           3-channel interleaved
+            PixelFormat.Rgba     [H, W, 4]           4-channel interleaved
+            PixelFormat.Grey     [H, W, 1]           Single-channel grayscale
+            PixelFormat.Yuyv     [H, W, 2]           YUV 4:2:2 interleaved
+            PixelFormat.PlanarRgb   [3, H, W]        Channels-first (3 planes)
+            PixelFormat.PlanarRgba  [4, H, W]        Channels-first (4 planes)
+            PixelFormat.Nv12     [H * 3 // 2, W]     Semi-planar YUV 4:2:0 (2D)
+            PixelFormat.Nv16     [H * 2, W]          Semi-planar YUV 4:2:2 (2D)
+            ==================  ==================  ====================================
 
             For example, a 1080p NV12 frame has 1080 Y rows plus 540 UV rows,
             giving shape ``[1620, 1920]``.
 
-            The ``fourcc`` parameter specifies the pixel format of the image data.
+            The ``format`` parameter specifies the pixel format of the image data.
 
             This will take ownership of the file descriptor, and the file descriptor will
             be closed when the tensor is dropped.
@@ -952,12 +959,12 @@ class TensorImage:
     @staticmethod
     def load_from_bytes(
         data: bytes,
-        fourcc: None | FourCC = FourCC.RGBA,
+        format: None | PixelFormat = PixelFormat.Rgba,
         mem: None | TensorMemory = None,
     ) -> TensorImage:
         """
         Load a JPEG or PNG image from a bytes object.
-        The `fourcc` parameter can be used to specify the destination pixel format of the image data.
+        The `format` parameter can be used to specify the destination pixel format of the image data.
         The optional `mem` parameter can be used to specify the type of memory allocation for the image.
         """
         ...
@@ -965,11 +972,11 @@ class TensorImage:
     @staticmethod
     def load(
         filename: str,
-        fourcc: None | FourCC = FourCC.RGBA,
+        format: None | PixelFormat = PixelFormat.Rgba,
         mem: None | TensorMemory = None,
     ) -> TensorImage:
         """
-        Load a JPEG or PNG image from disk. The `fourcc` parameter can be used to specify the destination pixel format of the image data.
+        Load a JPEG or PNG image from disk. The `format` parameter can be used to specify the destination pixel format of the image data.
         The optional `mem` parameter can be used to specify the type of memory allocation for the image.
         """
         ...
@@ -1003,7 +1010,7 @@ class TensorImage:
         ...
 
     @property
-    def format(self) -> FourCC:
+    def format(self) -> PixelFormat:
         """The pixel format of the image."""
         ...
 
@@ -1174,5 +1181,38 @@ class ImageProcessor:
         """
         Convert the source image to the destination image format, with optional rotation, flipping, cropping.
         The fill color can be used for areas outside the destination crop. The fill color is provided as RGBA values.
+        """
+        ...
+
+    def create_image(
+        self,
+        width: int,
+        height: int,
+        format: PixelFormat = PixelFormat.Rgba,
+    ) -> TensorImage:
+        """Create an image with the processor's optimal memory backend.
+
+        Selects the best available backing storage based on hardware capabilities:
+        DMA-buf > PBO (GPU buffer) > system memory. Images created this way benefit
+        from zero-copy GPU paths when used with this processor's ``convert()``.
+
+        Args:
+            width: Image width in pixels.
+            height: Image height in pixels.
+            format: Pixel format (default: ``PixelFormat.Rgba``).
+
+        Returns:
+            A new ``TensorImage`` backed by the optimal memory type.
+        """
+        ...
+
+    def set_int8_interpolation(self, mode: str) -> None:
+        """Sets the interpolation mode for int8 proto textures.
+
+        Accepts "nearest", "bilinear", or "twopass". Default is "bilinear".
+        Only affects rendering of quantized (int8) proto segmentation masks.
+
+        Args:
+            mode: Interpolation mode string.
         """
         ...

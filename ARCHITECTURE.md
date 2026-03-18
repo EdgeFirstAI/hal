@@ -170,7 +170,7 @@ classDiagram
         g2d: Option~G2DProcessor~
         opengl: Option~GLProcessorThreaded~
         +new() orchestrator with fallback chain
-        +create_image(w, h, fourcc) GPU-optimal alloc
+        +create_image(w, h, PixelFormat, Option~TensorMemory~) GPU-optimal alloc
     }
 
     class G2DProcessor {
@@ -212,73 +212,75 @@ classDiagram
 - Crop and region-of-interest
 - Instance segmentation mask rendering (draw and decode workflows)
 
-**TensorImage**:
+**TensorDyn (Image Representation)**:
 
-`TensorImage` wraps `Tensor<u8>` with pixel format metadata:
+`TensorDyn` is the type-erased tensor enum that serves as the primary image type.
+It wraps `Tensor<T>` variants for different element types and carries an optional
+`PixelFormat` describing the spatial pixel layout. The format and element type are
+orthogonal: `PixelFormat` describes the spatial arrangement (e.g. packed RGB,
+semi-planar NV12) while `DType` describes the element storage (e.g. `U8`, `I8`,
+`F32`).
 
 ```rust
-pub struct TensorImage {
-    tensor: Tensor<u8>,
-    fourcc: FourCharCode,
-    is_planar: bool,
+pub struct Tensor<T> {
+    storage: TensorStorage<T>,
+    format: Option<PixelFormat>,
     /// Second plane for multiplane NV12/NV16 (separate DMA-BUF allocation).
-    chroma: Option<Tensor<u8>>,
+    chroma: Option<Box<Tensor<T>>>,
 }
 ```
 
 The `chroma` field supports multi-plane DMA-BUF NV12/NV16 where Y and UV planes
 are in separate allocations (common with V4L2 `NV12M` format). Constructed via
-`TensorImage::from_planes()`. See [Appendix A: Multi-Plane DMA-BUF](#appendix-a-multi-plane-dma-buf-limitation) for details.
+`Tensor::from_planes()`. See [Appendix A: Multi-Plane DMA-BUF](#appendix-a-multi-plane-dma-buf-limitation) for details.
 
-Width, height, channels, and stride are **not stored** — they are computed from the tensor shape and FourCC on every access. The tensor shape encoding depends on the pixel format:
+Image construction uses `TensorDyn::image(w, h, PixelFormat, DType, mem)` which
+allocates the appropriate tensor shape and sets the pixel format metadata.
+
+Width, height, channels, and stride are **not stored** — they are computed from the tensor shape and `PixelFormat` on every access. The tensor shape encoding depends on the pixel format:
 
 | Format | Tensor Shape | Notes |
 |--------|-------------|-------|
-| RGB, RGBA, BGRA, GREY, YUYV, VYUY | `[H, W, C]` | Interleaved (channels-last) |
-| PLANAR_RGB, PLANAR_RGBA, PLANAR_RGB_INT8 | `[C, H, W]` | Channels-first |
-| NV12 | `[H*3/2, W]` | 2D — Y plane (H rows) + UV plane (H/2 rows) |
-| NV16 | `[H*2, W]` | 2D — Y plane (H rows) + UV plane (H rows) |
+| Rgb, Rgba, Bgra, Grey, Yuyv, Vyuy | `[H, W, C]` | Interleaved (channels-last) |
+| PlanarRgb, PlanarRgba | `[C, H, W]` | Channels-first |
+| Nv12 | `[H*3/2, W]` | 2D — Y plane (H rows) + UV plane (H/2 rows) |
+| Nv16 | `[H*2, W]` | 2D — Y plane (H rows) + UV plane (H rows) |
 
-**`TensorImageRef<'a>`** is a borrowed variant wrapping `&'a mut Tensor<u8>` instead of owning it. This enables zero-copy writes directly into a model's pre-allocated input tensor.
+**PixelFormat Enum**:
 
-**`TensorImageDst`** trait abstracts over `TensorImage` (owned) and `TensorImageRef` (borrowed) so all image processor implementations can accept either as a destination.
+Pixel formats are variants of the `PixelFormat` enum defined in the tensor crate.
+Int8 variants use `DType::I8` with any `PixelFormat` rather than separate format constants.
 
-**Pixel Format Constants**:
-
-Pixel formats are `FourCharCode` values defined in the image crate:
-
-| Constant | FourCC | Description |
-|----------|--------|-------------|
-| `YUYV` | `"YUYV"` | 8-bit YUV 4:2:2 interleaved |
-| `VYUY` | `"VYUY"` | 8-bit YUV 4:2:2 (VYUY byte order) |
-| `NV12` | `"NV12"` | 8-bit semi-planar YUV 4:2:0 |
-| `NV16` | `"NV16"` | 8-bit semi-planar YUV 4:2:2 |
-| `RGBA` | `"RGBA"` | 8-bit RGBA |
-| `BGRA` | `"BGRA"` | 8-bit BGRA (Cairo/Wayland native) |
-| `RGB` | `"RGB "` | 8-bit RGB |
-| `GREY` | `"Y800"` | 8-bit grayscale |
-| `PLANAR_RGB` | `"8BPS"` | 8-bit channels-first RGB |
-| `PLANAR_RGBA` | `"8BPA"` | 8-bit channels-first RGBA |
-| `RGB_INT8` | `"RGBi"` | Packed RGB with uint8→int8 XOR 0x80 reinterpretation |
-| `PLANAR_RGB_INT8` | `"8BPi"` | Planar RGB with uint8→int8 XOR 0x80 reinterpretation |
+| Variant | Display | Channels | Layout |
+|---------|---------|----------|--------|
+| `PixelFormat::Rgb` | RGB | 3 | Packed |
+| `PixelFormat::Rgba` | RGBA | 4 | Packed |
+| `PixelFormat::Bgra` | BGRA | 4 | Packed |
+| `PixelFormat::Grey` | Y800 | 1 | Packed |
+| `PixelFormat::Yuyv` | YUYV | 2 | Packed |
+| `PixelFormat::Vyuy` | VYUY | 2 | Packed |
+| `PixelFormat::Nv12` | NV12 | 1 | SemiPlanar |
+| `PixelFormat::Nv16` | NV16 | 1 | SemiPlanar |
+| `PixelFormat::PlanarRgb` | PlanarRgb | 3 | Planar |
+| `PixelFormat::PlanarRgba` | PlanarRgba | 4 | Planar |
 
 **Planar RGB Format**:
-Planar RGB (FourCC: 8BPS) stores color channels in separate planes rather than interleaved. This format is particularly useful for:
+Planar RGB (`PixelFormat::PlanarRgb`) stores color channels in separate planes rather than interleaved. This format is particularly useful for:
 - Neural network preprocessing where planar layout is required
 - Hardware accelerators that prefer planar data
 - Efficient SIMD operations on individual color channels
 - GPU texture operations via OpenGL with swizzled grayscale textures
 
-**TensorImage Flow**:
+**Image Processing Flow**:
 ```mermaid
 flowchart TD
     Input[Input Image<br/>JPEG/PNG bytes or raw pixels]
-    TI[TensorImage<br/>Tensor&lt;u8&gt; + FourCC format]
+    TI[TensorDyn<br/>type-erased tensor + PixelFormat]
     Conv{ImageProcessor::convert<br/>Backend selection}
     G2D[G2D Acceleration<br/>NXP i.MX only]
     GL[OpenGL Acceleration<br/>GPU accelerated]
     CPU[CPU Fallback<br/>fast_image_resize]
-    Output[Output Image<br/>TensorImage or numpy array]
+    Output[Output Image<br/>TensorDyn or numpy array]
     
     Input --> TI
     TI --> Conv
@@ -305,7 +307,7 @@ selects the best available memory backend in priority order:
 
 ```mermaid
 flowchart TD
-    Create["ImageProcessor::create_image(w, h, fourcc)"]
+    Create["ImageProcessor::create_image(w, h, PixelFormat, mem)"]
     DMA{DMA-buf roundtrip<br/>verified at init?}
     PBO{OpenGL PBO<br/>available?}
     Mem[MemTensor<br/>heap fallback]
@@ -652,7 +654,7 @@ flowchart TD
 - `PyTensorImage`: Image container with format metadata
 - `PyImageProcessor`: Image processing operations
 - `PyDecoder`: Model output decoding
-- `FourCC`, `Normalization`, `PyRect`, `PyRotation`, `PyFlip`: Configuration enums
+- `PixelFormat`, `Normalization`, `PyRect`, `PyRotation`, `PyFlip`: Configuration enums
 
 **Python Integration**:
 ```mermaid
@@ -692,7 +694,7 @@ The `edgefirst_image` crate depends on `edgefirst_decoder` for the `DetectBox`, 
 | File | Lines | Scope |
 |------|------:|-------|
 | `tensor.rs` | ~1,200 | Tensor create, map, reshape, fd sharing |
-| `image.rs` | ~1,800 | ImageProcessor, TensorImage, convert, draw |
+| `image.rs` | ~1,800 | ImageProcessor, convert, draw |
 | `decoder.rs` | ~2,800 | Decoder create, decode detection/segmentation |
 | `tracker.rs` | ~300 | ByteTrack create, update |
 | `error.rs` | ~120 | Error handling utilities |
@@ -718,19 +720,21 @@ Used during development and CI to verify EGL/OpenGL support, benchmark RGB packi
 ### Pattern 1: Basic Image Conversion
 
 ```rust
-use edgefirst_hal::image::{TensorImage, ImageProcessor, RGB};
+use edgefirst_image::{load_image, ImageProcessor, ImageProcessorTrait, Rotation, Flip, Crop};
+use edgefirst_tensor::{PixelFormat, TensorDyn};
 
 // Load image from JPEG
-let input = TensorImage::load("testdata/zidane.jpg", Some(RGB), None)?;
+let bytes = std::fs::read("testdata/zidane.jpg")?;
+let input = load_image(&bytes, Some(PixelFormat::Rgb), None)?;
 
 // Create converter (auto-selects best backend: G2D, OpenGL, CPU)
 let mut converter = ImageProcessor::new()?;
 
 // Create output buffer with optimal GPU memory (DMA > PBO > Mem)
-let mut output = converter.create_image(640, 640, RGB)?;
+let mut output = converter.create_image(640, 640, PixelFormat::Rgb, None)?;
 
 // Convert and resize — zero-copy if DMA or PBO backend is active
-converter.convert(&input, &mut output, Default::default())?;
+converter.convert(&input, &mut output, Rotation::None, Flip::None, Crop::default())?;
 ```
 
 ### Pattern 2: Detection Decoding
@@ -802,13 +806,13 @@ import edgefirst_hal as ef
 import numpy as np
 
 # Load image from file
-tensor_img = ef.TensorImage.load("testdata/zidane.jpg", ef.FourCC.RGB)
+tensor_img = ef.TensorImage.load("testdata/zidane.jpg", ef.PixelFormat.Rgb)
 
 # Create converter
 converter = ef.ImageProcessor()
 
 # Create output image with optimal GPU memory (DMA > PBO > Mem)
-output = converter.create_image(640, 640, ef.FourCC.RGB)
+output = converter.create_image(640, 640, ef.PixelFormat.Rgb)
 
 # Resize with hardware acceleration
 converter.convert(tensor_img, output)
@@ -852,7 +856,7 @@ Raw FFI bindings are wrapped in safe Rust types that enforce correct usage at co
 
 ### 7. Python Wrapper Naming Convention
 
-Python wrapper types use a `Py` prefix (e.g., `PyTensor`, `PyTensorImage`) to clearly distinguish them from their Rust counterparts (`Tensor`, `TensorImage`). This convention makes it explicit which types are Python-facing and which are internal Rust types.
+Python wrapper types use a `Py` prefix (e.g., `PyTensor`, `PyTensorImage`) to clearly distinguish them from their Rust counterparts (`Tensor`, `TensorDyn`). The Python `TensorImage` class wraps a `TensorDyn` internally. This convention makes it explicit which types are Python-facing and which are internal Rust types.
 
 ## EGL/GL Resource Cleanup at Process Shutdown
 
@@ -1101,7 +1105,7 @@ Decoder implementations use:
 
 All major types implement `Send + Sync`:
 - `Tensor<T>`: Safe to share across threads
-- `TensorImage`: Thread-safe
+- `TensorDyn`: Thread-safe
 - `ImageProcessor`: Thread-local (create per thread)
 - `Decoder`: Thread-safe for read operations
 
@@ -1139,7 +1143,6 @@ Consistent error handling throughout:
 - **zune-jpeg/zune-png**: Image decoding
 - **dma-heap**: Linux DMA allocation
 - **nix**: Unix system calls
-- **four-char-code**: FourCC format codes
 
 ### Internal Dependency Graph
 
@@ -1196,7 +1199,7 @@ hal/
 │   ├── tensor/             # Zero-copy tensor abstraction
 │   ├── image/              # Image processing HAL
 │   │   └── src/
-│   │       ├── lib.rs      # TensorImage, ImageProcessor, format constants
+│   │       ├── lib.rs      # load_image, save_jpeg, ImageProcessor
 │   │       ├── cpu/        # CPU format conversion, resize, masks
 │   │       ├── g2d.rs      # NXP G2D hardware accelerator
 │   │       ├── gl/         # EGL/OpenGL headless renderer
@@ -1252,7 +1255,7 @@ Several modules are significantly larger than typical Rust modules:
 | `image/src/gl/` (total) | ~8,600 | EGL context, GL processors, shaders, caching, tests |
 | `image/src/gl/processor.rs` | ~4,600 | GPU rendering pipelines (convert, masks, atlas) |
 | `decoder/src/decoder/` (total) | ~7,000 | Config parsing, decode logic, postprocessing, tests |
-| `image/src/lib.rs` | ~5,500 | TensorImage, ImageProcessor, format helpers |
+| `image/src/lib.rs` | ~5,500 | load_image, save_jpeg, ImageProcessor |
 | `capi/src/decoder.rs` | ~2,800 | C API decoder bindings |
 
 ---
@@ -1269,7 +1272,7 @@ with all planes stored contiguously. This is baked into multiple layers:
 | `DmaTensor<T>` | Single `fd: OwnedFd` field | `crates/tensor/src/dma.rs:31` |
 | `TensorTrait::from_fd()` | Takes one `OwnedFd` | `crates/tensor/src/dma.rs:88` |
 | `hal_tensor_from_fd()` C API | Takes one `int fd` | `crates/capi/include/edgefirst/hal.h` |
-| `TensorImage` NV12 shape | `[H*3/2, W]` — contiguous Y+UV | `crates/image/src/lib.rs` |
+| `TensorDyn` NV12 shape | `[H*3/2, W]` — contiguous Y+UV | `crates/tensor/src/lib.rs` |
 | EGL NV12 import | Same fd for both planes, UV offset = `W*H` | `crates/image/src/opengl_headless.rs:4492–4501` |
 
 This works correctly when the kernel allocates NV12 from a single CMA/system
@@ -1299,10 +1302,10 @@ rather than extending `DmaTensor` with multiple fds:
 
 **C API**: `hal_tensor_image_from_planes(y_fd, width, height, uv_fd, fourcc, out)`
 takes separate Y and UV file descriptors, wraps each into its own
-`Tensor<u8>` via `from_fd()`, and combines them with `TensorImage::from_planes()`.
+`Tensor<u8>` via `from_fd()`, and combines them with `Tensor::from_planes()`.
 
-**Image crate**: `TensorImage::from_planes(luma, chroma, fourcc)` stores the
-two tensors as separate planes inside the `TensorImage`, preserving their
+**Tensor crate**: `Tensor::from_planes(luma, chroma, PixelFormat::Nv12)` stores the
+two tensors as separate planes inside the `Tensor`, preserving their
 independent DMA-BUF allocations for zero-copy GPU import.
 
 **OpenGL path**: `create_image_from_dma2()` uses per-plane fds in EGL

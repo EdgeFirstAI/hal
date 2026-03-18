@@ -117,12 +117,6 @@ impl TransferBackend {
     pub(crate) fn is_dma(self) -> bool {
         self == TransferBackend::DmaBuf
     }
-
-    /// Returns `true` if PBO transfer is active.
-    #[allow(dead_code)]
-    pub(crate) fn is_pbo(self) -> bool {
-        self == TransferBackend::Pbo
-    }
 }
 
 /// Interpolation mode for int8 proto textures (GL_R8I cannot use GL_LINEAR).

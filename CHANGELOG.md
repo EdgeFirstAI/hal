@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   BGRA as a destination format for Cairo/Wayland compositing (ARGB32 on
   little-endian). Supported natively on OpenGL (via `GL_BGRA`) and G2D
   (`G2D_BGRA8888`); CPU backend uses R/B channel swizzle after RGBA
-  conversion. Available in Rust (`BGRA` constant), Python (`FourCC.BGRA`),
+  conversion. Available in Rust (`PixelFormat::Bgra`), Python (`PixelFormat.Bgra`),
   and C (fourcc `"BGRA"`). `draw_masks()` and `draw_masks_proto()` support
   BGRA destination images on the OpenGL backend; CPU mask rendering
   accepts only RGBA/RGB destinations.

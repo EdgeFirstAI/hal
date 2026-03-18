@@ -11,11 +11,10 @@ use crate::error::{set_error, set_error_null};
 use crate::tensor::{HalTensor, HalTensorMap, HalTensorMemory};
 use crate::{check_null, check_null_ret_null, try_or_errno, try_or_null};
 use edgefirst_image::{
-    ComputeBackend, Crop, Flip, ImageProcessor, ImageProcessorConfig, ImageProcessorTrait, Rect,
-    Rotation, TensorImage, TensorImageRef, GREY, NV12, NV16, PLANAR_RGB, PLANAR_RGBA, RGB, RGBA,
-    YUYV,
+    load_image, save_jpeg, ComputeBackend, Crop, Flip, ImageProcessor, ImageProcessorConfig,
+    ImageProcessorTrait, Rect, Rotation,
 };
-use edgefirst_tensor::{TensorMemory, TensorTrait};
+use edgefirst_tensor::{PixelFormat, PixelLayout, TensorDyn, TensorMemory, TensorTrait};
 use libc::{c_char, c_int, c_void, size_t};
 use std::ffi::CStr;
 
@@ -39,41 +38,41 @@ pub enum HalFourcc {
     PlanarRgb = 6,
     /// 8-bit planar RGBA (4 planes)
     PlanarRgba = 7,
+    /// 8-bit BGRA (4 channels, blue first)
+    Bgra = 8,
+    /// 8-bit interleaved YUV422, limited range (VYUY byte order)
+    Vyuy = 9,
 }
 
 impl HalFourcc {
-    fn to_fourcc(self) -> four_char_code::FourCharCode {
+    fn to_pixel_format(self) -> PixelFormat {
         match self {
-            HalFourcc::Yuyv => YUYV,
-            HalFourcc::Nv12 => NV12,
-            HalFourcc::Nv16 => NV16,
-            HalFourcc::Rgba => RGBA,
-            HalFourcc::Rgb => RGB,
-            HalFourcc::Grey => GREY,
-            HalFourcc::PlanarRgb => PLANAR_RGB,
-            HalFourcc::PlanarRgba => PLANAR_RGBA,
+            HalFourcc::Yuyv => PixelFormat::Yuyv,
+            HalFourcc::Nv12 => PixelFormat::Nv12,
+            HalFourcc::Nv16 => PixelFormat::Nv16,
+            HalFourcc::Rgba => PixelFormat::Rgba,
+            HalFourcc::Rgb => PixelFormat::Rgb,
+            HalFourcc::Grey => PixelFormat::Grey,
+            HalFourcc::PlanarRgb => PixelFormat::PlanarRgb,
+            HalFourcc::PlanarRgba => PixelFormat::PlanarRgba,
+            HalFourcc::Bgra => PixelFormat::Bgra,
+            HalFourcc::Vyuy => PixelFormat::Vyuy,
         }
     }
 
-    fn from_fourcc(fourcc: four_char_code::FourCharCode) -> Option<Self> {
-        if fourcc == YUYV {
-            Some(HalFourcc::Yuyv)
-        } else if fourcc == NV12 {
-            Some(HalFourcc::Nv12)
-        } else if fourcc == NV16 {
-            Some(HalFourcc::Nv16)
-        } else if fourcc == RGBA {
-            Some(HalFourcc::Rgba)
-        } else if fourcc == RGB {
-            Some(HalFourcc::Rgb)
-        } else if fourcc == GREY {
-            Some(HalFourcc::Grey)
-        } else if fourcc == PLANAR_RGB {
-            Some(HalFourcc::PlanarRgb)
-        } else if fourcc == PLANAR_RGBA {
-            Some(HalFourcc::PlanarRgba)
-        } else {
-            None
+    fn from_pixel_format(fmt: PixelFormat) -> Self {
+        match fmt {
+            PixelFormat::Rgb => HalFourcc::Rgb,
+            PixelFormat::Rgba => HalFourcc::Rgba,
+            PixelFormat::Grey => HalFourcc::Grey,
+            PixelFormat::Yuyv => HalFourcc::Yuyv,
+            PixelFormat::Nv12 => HalFourcc::Nv12,
+            PixelFormat::Nv16 => HalFourcc::Nv16,
+            PixelFormat::PlanarRgb => HalFourcc::PlanarRgb,
+            PixelFormat::PlanarRgba => HalFourcc::PlanarRgba,
+            PixelFormat::Bgra => HalFourcc::Bgra,
+            PixelFormat::Vyuy => HalFourcc::Vyuy,
+            _ => HalFourcc::Rgb,
         }
     }
 }
@@ -196,10 +195,10 @@ impl From<HalCrop> for Crop {
 
 /// Opaque tensor image type.
 ///
-/// A TensorImage combines a tensor with image format metadata (width, height, fourcc).
+/// Wraps a `TensorDyn` with image format metadata (pixel format, width, height).
 pub struct HalTensorImage {
     /// Accessible to `decoder.rs` for `hal_decoder_draw_masks()`.
-    pub(crate) inner: TensorImage,
+    pub(crate) inner: TensorDyn,
 }
 
 /// Opaque image processor type.
@@ -326,12 +325,18 @@ pub unsafe extern "C" fn hal_tensor_image_new(
     }
 
     let mem_opt: Option<TensorMemory> = memory.into();
-    let image = try_or_null!(
-        TensorImage::new(width, height, fourcc.to_fourcc(), mem_opt),
+    let dyn_tensor = try_or_null!(
+        edgefirst_tensor::TensorDyn::image(
+            width,
+            height,
+            fourcc.to_pixel_format(),
+            edgefirst_tensor::DType::U8,
+            mem_opt,
+        ),
         libc::ENOMEM
     );
 
-    Box::into_raw(Box::new(HalTensorImage { inner: image }))
+    Box::into_raw(Box::new(HalTensorImage { inner: dyn_tensor }))
 }
 
 /// Load an image from memory (JPEG or PNG).
@@ -362,12 +367,12 @@ pub unsafe extern "C" fn hal_tensor_image_load(
     let data_slice = unsafe { std::slice::from_raw_parts(data, len) };
     let mem_opt: Option<TensorMemory> = memory.into();
 
-    let image = try_or_null!(
-        TensorImage::load(data_slice, Some(fourcc.to_fourcc()), mem_opt),
+    let dyn_tensor = try_or_null!(
+        load_image(data_slice, Some(fourcc.to_pixel_format()), mem_opt),
         libc::EBADMSG
     );
 
-    Box::into_raw(Box::new(HalTensorImage { inner: image }))
+    Box::into_raw(Box::new(HalTensorImage { inner: dyn_tensor }))
 }
 
 /// Load an image from a file (JPEG or PNG).
@@ -406,12 +411,12 @@ pub unsafe extern "C" fn hal_tensor_image_load_file(
     };
 
     let mem_opt: Option<TensorMemory> = memory.into();
-    let image = try_or_null!(
-        TensorImage::load(&data, Some(fourcc.to_fourcc()), mem_opt),
+    let dyn_tensor = try_or_null!(
+        load_image(&data, Some(fourcc.to_pixel_format()), mem_opt),
         libc::EBADMSG
     );
 
-    Box::into_raw(Box::new(HalTensorImage { inner: image }))
+    Box::into_raw(Box::new(HalTensorImage { inner: dyn_tensor }))
 }
 
 /// Create a tensor image from an existing u8 tensor.
@@ -453,8 +458,8 @@ pub unsafe extern "C" fn hal_tensor_image_from_tensor(
         return set_error_null(libc::EINVAL);
     }
 
-    let fc = fourcc.to_fourcc();
-    let is_semi_planar = fc == NV12 || fc == NV16;
+    let fmt = fourcc.to_pixel_format();
+    let is_semi_planar = matches!(fmt, PixelFormat::Nv12 | PixelFormat::Nv16);
     let expected_ndim = if is_semi_planar { 2 } else { 3 };
     if hal_tensor.ndim() != expected_ndim {
         return set_error_null(libc::EINVAL);
@@ -462,14 +467,18 @@ pub unsafe extern "C" fn hal_tensor_image_from_tensor(
 
     // Validation passed — now take ownership (safe: we validated above)
     let boxed = unsafe { Box::from_raw(tensor) };
-    let u8_tensor = match *boxed {
+    let mut u8_tensor = match *boxed {
         HalTensor::U8(t) => t,
         _ => unreachable!(), // validated above
     };
 
-    let image = try_or_null!(TensorImage::from_tensor(u8_tensor, fc), libc::EINVAL);
+    if u8_tensor.set_format(fmt).is_err() {
+        return set_error_null(libc::EINVAL);
+    }
 
-    Box::into_raw(Box::new(HalTensorImage { inner: image }))
+    Box::into_raw(Box::new(HalTensorImage {
+        inner: TensorDyn::U8(u8_tensor),
+    }))
 }
 
 /// Create a multiplane tensor image from separate Y and UV DMA-BUF file descriptors.
@@ -518,18 +527,18 @@ pub unsafe extern "C" fn hal_tensor_image_from_planes(
     let y_owned = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(y_fd) };
     let uv_owned = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(uv_fd) };
 
-    let fc = fourcc.to_fourcc();
+    let fmt = fourcc.to_pixel_format();
     let w = width as usize;
     let h = height as usize;
 
     // Determine chroma height based on format
-    let chroma_h = if fc == NV12 {
-        h / 2
-    } else if fc == NV16 {
-        h
-    } else {
-        set_error(libc::EINVAL);
-        return -1; // y_owned and uv_owned drop here, closing FDs
+    let chroma_h = match fmt {
+        PixelFormat::Nv12 => h / 2,
+        PixelFormat::Nv16 => h,
+        _ => {
+            set_error(libc::EINVAL);
+            return -1; // y_owned and uv_owned drop here, closing FDs
+        }
     };
 
     let luma = match edgefirst_tensor::Tensor::<u8>::from_fd(y_owned, &[h, w], Some("luma")) {
@@ -549,15 +558,15 @@ pub unsafe extern "C" fn hal_tensor_image_from_planes(
             }
         };
 
-    let image = match TensorImage::from_planes(luma, chroma, fc) {
-        Ok(img) => img,
+    let dyn_tensor = match edgefirst_tensor::Tensor::<u8>::from_planes(luma, chroma, fmt) {
+        Ok(t) => TensorDyn::U8(t),
         Err(_) => {
             set_error(libc::EINVAL);
             return -1;
         }
     };
 
-    unsafe { *out = Box::into_raw(Box::new(HalTensorImage { inner: image })) };
+    unsafe { *out = Box::into_raw(Box::new(HalTensorImage { inner: dyn_tensor })) };
     0
 }
 
@@ -587,12 +596,12 @@ pub unsafe extern "C" fn hal_tensor_image_load_jpeg(
     let data_slice = unsafe { std::slice::from_raw_parts(data, len) };
     let mem_opt: Option<TensorMemory> = memory.into();
 
-    let image = try_or_null!(
-        TensorImage::load_jpeg(data_slice, Some(fourcc.to_fourcc()), mem_opt),
+    let dyn_tensor = try_or_null!(
+        load_image(data_slice, Some(fourcc.to_pixel_format()), mem_opt),
         libc::EBADMSG
     );
 
-    Box::into_raw(Box::new(HalTensorImage { inner: image }))
+    Box::into_raw(Box::new(HalTensorImage { inner: dyn_tensor }))
 }
 
 /// Load a PNG image from memory.
@@ -621,12 +630,12 @@ pub unsafe extern "C" fn hal_tensor_image_load_png(
     let data_slice = unsafe { std::slice::from_raw_parts(data, len) };
     let mem_opt: Option<TensorMemory> = memory.into();
 
-    let image = try_or_null!(
-        TensorImage::load_png(data_slice, Some(fourcc.to_fourcc()), mem_opt),
+    let dyn_tensor = try_or_null!(
+        load_image(data_slice, Some(fourcc.to_pixel_format()), mem_opt),
         libc::EBADMSG
     );
 
-    Box::into_raw(Box::new(HalTensorImage { inner: image }))
+    Box::into_raw(Box::new(HalTensorImage { inner: dyn_tensor }))
 }
 
 /// Save a tensor image as JPEG.
@@ -657,10 +666,9 @@ pub unsafe extern "C" fn hal_tensor_image_save_jpeg(
         quality as u8
     };
 
-    try_or_errno!(
-        unsafe { &(*image) }.inner.save_jpeg(path_str, quality),
-        libc::EIO
-    );
+    let dyn_ref = &unsafe { &(*image) }.inner;
+
+    try_or_errno!(save_jpeg(dyn_ref, path_str, quality), libc::EIO);
     0
 }
 
@@ -687,7 +695,7 @@ pub unsafe extern "C" fn hal_tensor_image_width(image: *const HalTensorImage) ->
     if image.is_null() {
         return 0;
     }
-    unsafe { &(*image) }.inner.width()
+    unsafe { &(*image) }.inner.width().unwrap_or(0)
 }
 
 /// Get the height of a tensor image.
@@ -699,7 +707,7 @@ pub unsafe extern "C" fn hal_tensor_image_height(image: *const HalTensorImage) -
     if image.is_null() {
         return 0;
     }
-    unsafe { &(*image) }.inner.height()
+    unsafe { &(*image) }.inner.height().unwrap_or(0)
 }
 
 /// Get the pixel format of a tensor image.
@@ -711,7 +719,10 @@ pub unsafe extern "C" fn hal_tensor_image_fourcc(image: *const HalTensorImage) -
     if image.is_null() {
         return HalFourcc::Rgb;
     }
-    HalFourcc::from_fourcc(unsafe { &(*image) }.inner.fourcc()).unwrap_or(HalFourcc::Rgb)
+    match unsafe { &(*image) }.inner.format() {
+        Some(fmt) => HalFourcc::from_pixel_format(fmt),
+        None => HalFourcc::Rgb,
+    }
 }
 
 /// Check if a tensor image uses a planar pixel format.
@@ -727,7 +738,10 @@ pub unsafe extern "C" fn hal_tensor_image_is_planar(image: *const HalTensorImage
     if image.is_null() {
         return false;
     }
-    unsafe { &(*image) }.inner.is_planar()
+    match unsafe { &(*image) }.inner.format() {
+        Some(fmt) => !matches!(fmt.layout(), PixelLayout::Packed),
+        None => false,
+    }
 }
 
 /// Get the number of channels in a tensor image.
@@ -742,7 +756,10 @@ pub unsafe extern "C" fn hal_tensor_image_channels(image: *const HalTensorImage)
     if image.is_null() {
         return 0;
     }
-    unsafe { &(*image) }.inner.channels()
+    match unsafe { &(*image) }.inner.format() {
+        Some(fmt) => fmt.channels(),
+        None => 0,
+    }
 }
 
 /// Get the row stride of a tensor image in bytes.
@@ -757,7 +774,14 @@ pub unsafe extern "C" fn hal_tensor_image_row_stride(image: *const HalTensorImag
     if image.is_null() {
         return 0;
     }
-    unsafe { &(*image) }.inner.row_stride()
+    let dyn_ref = &unsafe { &(*image) }.inner;
+    match (dyn_ref.format(), dyn_ref.width()) {
+        (Some(fmt), Some(w)) => match fmt.layout() {
+            PixelLayout::Packed => w * fmt.channels(),
+            _ => w,
+        },
+        _ => 0,
+    }
 }
 
 /// Clone the file descriptor associated with a tensor image (Linux only).
@@ -776,9 +800,14 @@ pub unsafe extern "C" fn hal_tensor_image_clone_fd(image: *const HalTensorImage)
     use std::os::fd::IntoRawFd;
 
     check_null!(image);
-    match unsafe { &(*image) }.inner.tensor().clone_fd() {
-        Ok(fd) => fd.into_raw_fd(),
-        Err(_) => set_error(libc::EIO),
+    let dyn_ref = &unsafe { &(*image) }.inner;
+    // Image tensors are always u8
+    match dyn_ref.as_u8() {
+        Some(t) => match t.clone_fd() {
+            Ok(fd) => fd.into_raw_fd(),
+            Err(_) => set_error(libc::EIO),
+        },
+        None => set_error(libc::ENOTSUP),
     }
 }
 
@@ -801,7 +830,11 @@ pub unsafe extern "C" fn hal_tensor_image_tensor(image: *const HalTensorImage) -
     if image.is_null() {
         return std::ptr::null();
     }
-    unsafe { &(*image) }.inner.tensor() as *const _ as *const c_void
+    // Image tensors are always u8; return a pointer to the inner Tensor<u8>
+    match unsafe { &(*image) }.inner.as_u8() {
+        Some(t) => t as *const _ as *const c_void,
+        None => std::ptr::null(),
+    }
 }
 
 /// Map a tensor image's underlying tensor for CPU access.
@@ -821,7 +854,11 @@ pub unsafe extern "C" fn hal_tensor_image_map_create(
 ) -> *mut HalTensorMap {
     check_null_ret_null!(image);
 
-    let tensor = unsafe { &(*image) }.inner.tensor();
+    // Image tensors are always u8
+    let tensor = match unsafe { &(*image) }.inner.as_u8() {
+        Some(t) => t,
+        None => return set_error_null(libc::ENOTSUP),
+    };
     let map = try_or_null!(tensor.map(), libc::EIO);
     Box::into_raw(Box::new(HalTensorMap::U8(map)))
 }
@@ -972,16 +1009,26 @@ pub unsafe extern "C" fn hal_image_processor_convert_ref(
 ) -> c_int {
     check_null!(processor, src, dst_tensor);
 
-    // Get a mutable reference to the u8 tensor
-    let tensor_ref = match unsafe { &mut *dst_tensor } {
+    // Validate that the tensor is u8 before taking ownership
+    if !matches!(unsafe { &*dst_tensor }, HalTensor::U8(_)) {
+        return set_error(libc::EINVAL);
+    }
+
+    // Temporarily take ownership of the HalTensor to extract the inner Tensor<u8>,
+    // set its pixel format, wrap in TensorDyn, call convert, then put it back.
+    let hal_tensor = unsafe { Box::from_raw(dst_tensor) };
+    let mut u8_tensor = match *hal_tensor {
         HalTensor::U8(t) => t,
-        _ => return set_error(libc::EINVAL),
+        _ => unreachable!(), // validated above
     };
 
-    let mut dst_ref = try_or_errno!(
-        TensorImageRef::from_borrowed_tensor(tensor_ref, dst_fourcc.to_fourcc()),
-        libc::EINVAL
-    );
+    if let Err(_) = u8_tensor.set_format(dst_fourcc.to_pixel_format()) {
+        // Put tensor back and return error
+        unsafe { std::ptr::write(dst_tensor, HalTensor::U8(u8_tensor)) };
+        return set_error(libc::EINVAL);
+    }
+
+    let mut dst_dyn = TensorDyn::U8(u8_tensor);
 
     let crop_config = if crop.is_null() {
         Crop::default()
@@ -989,16 +1036,21 @@ pub unsafe extern "C" fn hal_image_processor_convert_ref(
         unsafe { *crop }.into()
     };
 
-    try_or_errno!(
-        unsafe { &mut (*processor) }.inner.convert_ref(
-            &unsafe { &(*src) }.inner,
-            &mut dst_ref,
-            rotation.into(),
-            flip.into(),
-            crop_config,
-        ),
-        libc::EIO
+    let result = unsafe { &mut (*processor) }.inner.convert(
+        &unsafe { &(*src) }.inner,
+        &mut dst_dyn,
+        rotation.into(),
+        flip.into(),
+        crop_config,
     );
+
+    // Put the tensor back regardless of success/failure
+    match dst_dyn {
+        TensorDyn::U8(t) => unsafe { std::ptr::write(dst_tensor, HalTensor::U8(t)) },
+        _ => unreachable!(),
+    }
+
+    try_or_errno!(result, libc::EIO);
     0
 }
 
@@ -1108,13 +1160,13 @@ pub unsafe extern "C" fn hal_image_processor_create_image(
         return set_error_null(libc::EINVAL);
     }
 
-    let image = try_or_null!(
+    let dyn_tensor = try_or_null!(
         unsafe { &(*processor) }
             .inner
-            .create_image(width, height, fourcc.to_fourcc()),
+            .create_image(width, height, fourcc.to_pixel_format(), None),
         libc::ENOMEM
     );
-    Box::into_raw(Box::new(HalTensorImage { inner: image }))
+    Box::into_raw(Box::new(HalTensorImage { inner: dyn_tensor }))
 }
 
 /// Free an image processor.
@@ -1792,8 +1844,8 @@ mod tests {
     }
 
     #[test]
-    fn test_fourcc_to_from_fourcc() {
-        // Test all fourcc conversions roundtrip
+    fn test_pixel_format_roundtrip() {
+        // Test all PixelFormat conversions roundtrip
         let formats = [
             HalFourcc::Yuyv,
             HalFourcc::Nv12,
@@ -1803,12 +1855,14 @@ mod tests {
             HalFourcc::Grey,
             HalFourcc::PlanarRgb,
             HalFourcc::PlanarRgba,
+            HalFourcc::Bgra,
+            HalFourcc::Vyuy,
         ];
 
         for format in formats {
-            let fourcc = format.to_fourcc();
-            let back = HalFourcc::from_fourcc(fourcc);
-            assert_eq!(back, Some(format), "Roundtrip failed for {:?}", format);
+            let pf = format.to_pixel_format();
+            let back = HalFourcc::from_pixel_format(pf);
+            assert_eq!(back, format, "Roundtrip failed for {:?}", format);
         }
     }
 

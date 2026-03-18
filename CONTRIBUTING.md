@@ -296,25 +296,29 @@ cargo bench -p edgefirst_tensor
 ///
 /// # Arguments
 ///
-/// * `src` - Source tensor image
-/// * `dst` - Destination tensor image (must be pre-allocated)
-/// * `options` - Conversion options (resize, rotate, etc.)
+/// * `src` - Source image as a `TensorDyn`
+/// * `dst` - Destination image as a `TensorDyn` (must be pre-allocated)
+/// * `rotation` - Rotation to apply
+/// * `flip` - Flip to apply
+/// * `crop` - Crop region
 ///
 /// # Examples
 ///
 /// ```rust
-/// use edgefirst_hal::image::{TensorImage, ImageProcessor};
+/// use edgefirst_image::{load_image, ImageProcessor, ImageProcessorTrait, Rotation, Flip, Crop};
+/// use edgefirst_tensor::{PixelFormat, TensorDyn};
 ///
-/// let src = TensorImage::load("input.jpg", None, None)?;
-/// let mut dst = TensorImage::new(640, 640, RGB, None)?;
-/// let converter = ImageProcessor::new()?;
-/// converter.convert(&src, &mut dst, Default::default())?;
+/// let bytes = std::fs::read("input.jpg")?;
+/// let src = load_image(&bytes, Some(PixelFormat::Rgb), None)?;
+/// let mut converter = ImageProcessor::new()?;
+/// let mut dst = converter.create_image(640, 640, PixelFormat::Rgb, None)?;
+/// converter.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())?;
 /// ```
 ///
 /// # Errors
 ///
 /// Returns `ImageError` if conversion fails or formats are incompatible.
-pub fn convert(&self, src: &TensorImage, dst: &mut TensorImage, options: ConvertOptions) -> Result<()> {
+pub fn convert(&mut self, src: &TensorDyn, dst: &mut TensorDyn, rotation: Rotation, flip: Flip, crop: Crop) -> Result<()> {
     // Implementation
 }
 ```

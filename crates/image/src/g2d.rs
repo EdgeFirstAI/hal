@@ -3,13 +3,28 @@
 
 #![cfg(target_os = "linux")]
 
-use crate::{
-    CPUProcessor, Crop, Error, Flip, ImageProcessorTrait, Result, Rotation, TensorImage,
-    TensorImageRef, BGRA, NV12, RGB, RGBA, YUYV,
-};
-use edgefirst_tensor::Tensor;
+use crate::{CPUProcessor, Crop, Error, Flip, ImageProcessorTrait, Result, Rotation};
+use edgefirst_tensor::{DType, PixelFormat, Tensor, TensorDyn};
+use four_char_code::FourCharCode;
 use g2d_sys::{G2DFormat, G2DPhysical, G2DSurface, G2D};
 use std::{os::fd::AsRawFd, time::Instant};
+
+/// Convert a PixelFormat to the G2D-compatible FourCharCode.
+fn pixelfmt_to_fourcc(fmt: PixelFormat) -> FourCharCode {
+    use four_char_code::four_char_code;
+    match fmt {
+        PixelFormat::Rgb => four_char_code!("RGB "),
+        PixelFormat::Rgba => four_char_code!("RGBA"),
+        PixelFormat::Bgra => four_char_code!("BGRA"),
+        PixelFormat::Grey => four_char_code!("Y800"),
+        PixelFormat::Yuyv => four_char_code!("YUYV"),
+        PixelFormat::Vyuy => four_char_code!("VYUY"),
+        PixelFormat::Nv12 => four_char_code!("NV12"),
+        PixelFormat::Nv16 => four_char_code!("NV16"),
+        // Planar formats have no standard FourCC; use RGBA as fallback
+        _ => four_char_code!("RGBA"),
+    }
+}
 
 /// G2DConverter implements the ImageProcessor trait using the NXP G2D
 /// library for hardware-accelerated image processing on i.MX platforms.
@@ -37,16 +52,56 @@ impl G2DProcessor {
         self.g2d.version()
     }
 
-    fn convert_(
+    fn convert_impl(
         &mut self,
-        src: &TensorImage,
-        dst: &mut TensorImage,
+        src_dyn: &TensorDyn,
+        dst_dyn: &mut TensorDyn,
         rotation: Rotation,
         flip: Flip,
         crop: Crop,
     ) -> Result<()> {
-        let mut src_surface: G2DSurface = src.try_into()?;
-        let mut dst_surface: G2DSurface = dst.try_into()?;
+        if src_dyn.dtype() != DType::U8 || dst_dyn.dtype() != DType::U8 {
+            return Err(Error::NotSupported(
+                "G2D only supports u8 tensors".to_string(),
+            ));
+        }
+
+        let src_fmt = src_dyn.format().ok_or(Error::NotAnImage)?;
+        let dst_fmt = dst_dyn.format().ok_or(Error::NotAnImage)?;
+
+        // Validate supported format pairs
+        use PixelFormat::*;
+        match (src_fmt, dst_fmt) {
+            (Rgba, Rgba) => {}
+            (Rgba, Yuyv) => {}
+            (Rgba, Rgb) => {}
+            (Yuyv, Rgba) => {}
+            (Yuyv, Yuyv) => {}
+            (Yuyv, Rgb) => {}
+            // VYUY: i.MX8MP G2D hardware rejects VYUY blits (only YUYV/UYVY
+            // among packed YUV 4:2:2). ImageProcessor falls through to CPU.
+            (Nv12, Rgba) => {}
+            (Nv12, Yuyv) => {}
+            (Nv12, Rgb) => {}
+            (Rgba, Bgra) => {}
+            (Yuyv, Bgra) => {}
+            (Nv12, Bgra) => {}
+            (Bgra, Bgra) => {}
+            (s, d) => {
+                return Err(Error::NotSupported(format!(
+                    "G2D does not support {} to {} conversion",
+                    s, d
+                )));
+            }
+        }
+
+        crop.check_crop_dyn(src_dyn, dst_dyn)?;
+
+        let src = src_dyn.as_u8().unwrap();
+        let dst = dst_dyn.as_u8_mut().unwrap();
+
+        let mut src_surface = tensor_to_g2d_surface(src)?;
+        let mut dst_surface = tensor_to_g2d_surface(dst)?;
 
         src_surface.rot = match flip {
             Flip::None => g2d_sys::g2d_rotation_G2D_ROTATION_0,
@@ -68,6 +123,9 @@ impl G2DProcessor {
             src_surface.bottom = (crop_rect.top + crop_rect.height) as i32;
         }
 
+        let dst_w = dst.width().unwrap();
+        let dst_h = dst.height().unwrap();
+
         // Clear the destination with the letterbox color before blitting the
         // image into the sub-region.
         //
@@ -77,11 +135,11 @@ impl G2DProcessor {
             && crop.dst_rect.is_some_and(|dst_rect| {
                 dst_rect.left != 0
                     || dst_rect.top != 0
-                    || dst_rect.width != dst.width()
-                    || dst_rect.height != dst.height()
+                    || dst_rect.width != dst_w
+                    || dst_rect.height != dst_h
             });
 
-        if needs_clear && dst.fourcc != RGB {
+        if needs_clear && dst_fmt != Rgb {
             if let Some(dst_color) = crop.dst_color {
                 let start = Instant::now();
                 self.g2d.clear(&mut dst_surface, dst_color)?;
@@ -91,7 +149,7 @@ impl G2DProcessor {
 
         if let Some(crop_rect) = crop.dst_rect {
             dst_surface.planes[0] += ((crop_rect.top * dst_surface.width as usize + crop_rect.left)
-                * dst.channels()) as u64;
+                * dst_fmt.channels()) as u64;
 
             dst_surface.right = crop_rect.width as i32;
             dst_surface.bottom = crop_rect.height as i32;
@@ -104,10 +162,10 @@ impl G2DProcessor {
         self.g2d.finish()?;
 
         // CPU fallback for RGB888 (unsupported by g2d_clear)
-        if needs_clear && dst.fourcc == RGB {
+        if needs_clear && dst_fmt == Rgb {
             if let (Some(dst_color), Some(dst_rect)) = (crop.dst_color, crop.dst_rect) {
                 let start = Instant::now();
-                CPUProcessor::fill_image_outside_crop(dst, dst_color, dst_rect)?;
+                CPUProcessor::fill_image_outside_crop_u8(dst, dst_color, dst_rect)?;
                 log::trace!("cpu fill takes {:?}", start.elapsed());
             }
         }
@@ -117,72 +175,20 @@ impl G2DProcessor {
 }
 
 impl ImageProcessorTrait for G2DProcessor {
-    /// Converts the source image to the destination image using G2D.
-    ///
-    /// # Arguments
-    ///
-    /// * `dst` - The destination image to be converted to.
-    /// * `src` - The source image to convert from.
-    /// * `rotation` - The rotation to apply to the destination image (after
-    ///   crop if specified).
-    /// * `crop` - An optional rectangle specifying the area to crop from the
-    ///   source image.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` indicating success or failure of the conversion.
     fn convert(
         &mut self,
-        src: &TensorImage,
-        dst: &mut TensorImage,
+        src: &TensorDyn,
+        dst: &mut TensorDyn,
         rotation: Rotation,
         flip: Flip,
         crop: Crop,
     ) -> Result<()> {
-        crop.check_crop(src, dst)?;
-        match (src.fourcc(), dst.fourcc()) {
-            (RGBA, RGBA) => {}
-            (RGBA, YUYV) => {}
-            (RGBA, RGB) => {}
-            (YUYV, RGBA) => {}
-            (YUYV, YUYV) => {}
-            (YUYV, RGB) => {}
-            // VYUY: i.MX8MP G2D hardware rejects VYUY blits (only YUYV/UYVY
-            // among packed YUV 4:2:2). ImageProcessor falls through to CPU.
-            (NV12, RGBA) => {}
-            (NV12, YUYV) => {}
-            (NV12, RGB) => {}
-            (RGBA, BGRA) => {}
-            (YUYV, BGRA) => {}
-            (NV12, BGRA) => {}
-            (BGRA, BGRA) => {}
-            (s, d) => {
-                return Err(Error::NotSupported(format!(
-                    "G2D does not support {} to {} conversion",
-                    s.display(),
-                    d.display()
-                )));
-            }
-        }
-        self.convert_(src, dst, rotation, flip, crop)
-    }
-
-    fn convert_ref(
-        &mut self,
-        src: &TensorImage,
-        dst: &mut TensorImageRef<'_>,
-        rotation: Rotation,
-        flip: Flip,
-        crop: Crop,
-    ) -> Result<()> {
-        // G2D doesn't support PLANAR_RGB output, delegate to CPU
-        let mut cpu = CPUProcessor::new();
-        cpu.convert_ref(src, dst, rotation, flip, crop)
+        self.convert_impl(src, dst, rotation, flip, crop)
     }
 
     fn draw_masks(
         &mut self,
-        _dst: &mut TensorImage,
+        _dst: &mut TensorDyn,
         _detect: &[crate::DetectBox],
         _segmentation: &[crate::Segmentation],
     ) -> Result<()> {
@@ -193,7 +199,7 @@ impl ImageProcessorTrait for G2DProcessor {
 
     fn draw_masks_proto(
         &mut self,
-        _dst: &mut TensorImage,
+        _dst: &mut TensorDyn,
         _detect: &[crate::DetectBox],
         _proto_data: &crate::ProtoData,
     ) -> Result<()> {
@@ -222,134 +228,85 @@ impl ImageProcessorTrait for G2DProcessor {
     }
 }
 
-impl TryFrom<&TensorImage> for G2DSurface {
-    type Error = Error;
+/// Build a `G2DSurface` from a `Tensor<u8>` that carries pixel-format metadata.
+///
+/// The tensor must be backed by DMA memory and must have a pixel format set.
+fn tensor_to_g2d_surface(img: &Tensor<u8>) -> Result<G2DSurface> {
+    let fmt = img.format().ok_or(Error::NotAnImage)?;
+    let dma = img
+        .as_dma()
+        .ok_or_else(|| Error::NotImplemented("g2d only supports Dma memory".to_string()))?;
+    let phys: G2DPhysical = dma.fd.as_raw_fd().try_into()?;
 
-    fn try_from(img: &TensorImage) -> Result<Self, Self::Error> {
-        let phys: G2DPhysical = match img.tensor() {
-            Tensor::Dma(t) => t.as_raw_fd(),
-            _ => {
-                return Err(Error::NotImplemented(
-                    "g2d only supports Dma memory".to_string(),
-                ));
-            }
-        }
-        .try_into()?;
-
-        // NV12 is a two-plane format: Y plane followed by interleaved UV plane
-        // planes[0] = Y plane start, planes[1] = UV plane start (Y size = width *
-        // height)
-        let base_addr = phys.address();
-        let planes = if img.fourcc() == NV12 {
-            if img.is_multiplane() {
-                // Multiplane: UV in separate DMA-BUF, get its physical address
-                let uv_phys: G2DPhysical = match img.chroma_tensor().unwrap() {
-                    Tensor::Dma(t) => t.as_raw_fd(),
-                    _ => {
-                        return Err(Error::NotImplemented(
-                            "g2d multiplane chroma must be DMA-backed".to_string(),
-                        ));
-                    }
-                }
-                .try_into()?;
-                [base_addr, uv_phys.address(), 0]
-            } else {
-                let uv_offset = (img.width() * img.height()) as u64;
-                [base_addr, base_addr + uv_offset, 0]
-            }
+    // NV12 is a two-plane format: Y plane followed by interleaved UV plane.
+    // planes[0] = Y plane start, planes[1] = UV plane start (Y size = width * height)
+    let base_addr = phys.address();
+    let planes = if fmt == PixelFormat::Nv12 {
+        if img.is_multiplane() {
+            // Multiplane: UV in separate DMA-BUF, get its physical address
+            let chroma = img.chroma().unwrap();
+            let chroma_dma = chroma.as_dma().ok_or_else(|| {
+                Error::NotImplemented("g2d multiplane chroma must be DMA-backed".to_string())
+            })?;
+            let uv_phys: G2DPhysical = chroma_dma.fd.as_raw_fd().try_into()?;
+            [base_addr, uv_phys.address(), 0]
         } else {
-            [base_addr, 0, 0]
-        };
-
-        Ok(Self {
-            planes,
-            format: G2DFormat::try_from(img.fourcc())?.format(),
-            left: 0,
-            top: 0,
-            right: img.width() as i32,
-            bottom: img.height() as i32,
-            stride: img.width() as i32,
-            width: img.width() as i32,
-            height: img.height() as i32,
-            blendfunc: 0,
-            clrcolor: 0,
-            rot: 0,
-            global_alpha: 0,
-        })
-    }
-}
-
-impl TryFrom<&mut TensorImage> for G2DSurface {
-    type Error = Error;
-
-    fn try_from(img: &mut TensorImage) -> Result<Self, Self::Error> {
-        let phys: G2DPhysical = match img.tensor() {
-            Tensor::Dma(t) => t.as_raw_fd(),
-            _ => {
-                return Err(Error::NotImplemented(
-                    "g2d only supports Dma memory".to_string(),
-                ));
-            }
+            let w = img.width().unwrap();
+            let h = img.height().unwrap();
+            let uv_offset = (w * h) as u64;
+            [base_addr, base_addr + uv_offset, 0]
         }
-        .try_into()?;
+    } else {
+        [base_addr, 0, 0]
+    };
 
-        // NV12 is a two-plane format: Y plane followed by interleaved UV plane
-        let base_addr = phys.address();
-        let planes = if img.fourcc() == NV12 {
-            if img.is_multiplane() {
-                let uv_phys: G2DPhysical = match img.chroma_tensor().unwrap() {
-                    Tensor::Dma(t) => t.as_raw_fd(),
-                    _ => {
-                        return Err(Error::NotImplemented(
-                            "g2d multiplane chroma must be DMA-backed".to_string(),
-                        ));
-                    }
-                }
-                .try_into()?;
-                [base_addr, uv_phys.address(), 0]
-            } else {
-                let uv_offset = (img.width() * img.height()) as u64;
-                [base_addr, base_addr + uv_offset, 0]
-            }
-        } else {
-            [base_addr, 0, 0]
-        };
+    let w = img.width().unwrap();
+    let h = img.height().unwrap();
+    let fourcc = pixelfmt_to_fourcc(fmt);
 
-        Ok(Self {
-            planes,
-            format: G2DFormat::try_from(img.fourcc())?.format(),
-            left: 0,
-            top: 0,
-            right: img.width() as i32,
-            bottom: img.height() as i32,
-            stride: img.width() as i32,
-            width: img.width() as i32,
-            height: img.height() as i32,
-            blendfunc: 0,
-            clrcolor: 0,
-            rot: 0,
-            global_alpha: 0,
-        })
-    }
+    Ok(G2DSurface {
+        planes,
+        format: G2DFormat::try_from(fourcc)?.format(),
+        left: 0,
+        top: 0,
+        right: w as i32,
+        bottom: h as i32,
+        stride: w as i32,
+        width: w as i32,
+        height: h as i32,
+        blendfunc: 0,
+        clrcolor: 0,
+        rot: 0,
+        global_alpha: 0,
+    })
 }
 
 #[cfg(feature = "g2d_test_formats")]
 #[cfg(test)]
 mod g2d_tests {
     use super::*;
-    use crate::{
-        CPUProcessor, Flip, G2DProcessor, ImageProcessorTrait, Rect, Rotation, TensorImage, BGRA,
-        GREY, NV12, RGB, RGBA, YUYV,
+    use crate::{CPUProcessor, Flip, G2DProcessor, ImageProcessorTrait, Rect, Rotation};
+    use edgefirst_tensor::{
+        is_dma_available, DType, PixelFormat, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
     };
-    use edgefirst_tensor::{is_dma_available, TensorMapTrait, TensorMemory, TensorTrait};
-    use four_char_code::FourCharCode;
     use image::buffer::ConvertBuffer;
 
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_formats_no_resize() {
-        for i in [RGBA, YUYV, RGB, GREY, NV12] {
-            for o in [RGBA, YUYV, RGB, GREY] {
+        for i in [
+            PixelFormat::Rgba,
+            PixelFormat::Yuyv,
+            PixelFormat::Rgb,
+            PixelFormat::Grey,
+            PixelFormat::Nv12,
+        ] {
+            for o in [
+                PixelFormat::Rgba,
+                PixelFormat::Yuyv,
+                PixelFormat::Rgb,
+                PixelFormat::Grey,
+            ] {
                 let res = test_g2d_format_no_resize_(i, o);
                 if let Err(e) = res {
                     println!("{} to {} failed: {e:?}", i.display(), o.display());
@@ -361,8 +318,8 @@ mod g2d_tests {
     }
 
     fn test_g2d_format_no_resize_(
-        g2d_in_fmt: FourCharCode,
-        g2d_out_fmt: FourCharCode,
+        g2d_in_fmt: PixelFormat,
+        g2d_out_fmt: PixelFormat,
     ) -> Result<(), crate::Error> {
         let dst_width = 1280;
         let dst_height = 720;
@@ -371,20 +328,21 @@ mod g2d_tests {
             "/../../testdata/zidane.jpg"
         ))
         .to_vec();
-        let src = TensorImage::load_jpeg(&file, Some(RGB), None)?;
+        let src = crate::load_image(&file, Some(PixelFormat::Rgb), None)?;
 
         // Create DMA buffer for G2D input
-        let mut src2 = TensorImage::new(1280, 720, g2d_in_fmt, Some(TensorMemory::Dma))?;
+        let mut src2 = TensorDyn::image(1280, 720, g2d_in_fmt, DType::U8, Some(TensorMemory::Dma))?;
 
         let mut cpu_converter = CPUProcessor::new();
 
-        // For NV12 input, load from file since CPU doesn't support RGB→NV12
-        if g2d_in_fmt == NV12 {
+        // For PixelFormat::Nv12 input, load from file since CPU doesn't support PixelFormat::Rgb→PixelFormat::Nv12
+        if g2d_in_fmt == PixelFormat::Nv12 {
             let nv12_bytes = include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../testdata/zidane.nv12"
             ));
-            src2.tensor()
+            src2.as_u8()
+                .unwrap()
                 .map()?
                 .as_mut_slice()
                 .copy_from_slice(nv12_bytes);
@@ -392,18 +350,32 @@ mod g2d_tests {
             cpu_converter.convert(&src, &mut src2, Rotation::None, Flip::None, Crop::no_crop())?;
         }
 
-        let mut g2d_dst =
-            TensorImage::new(dst_width, dst_height, g2d_out_fmt, Some(TensorMemory::Dma))?;
+        let mut g2d_dst = TensorDyn::image(
+            dst_width,
+            dst_height,
+            g2d_out_fmt,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )?;
         let mut g2d_converter = G2DProcessor::new()?;
-        g2d_converter.convert_(
-            &src2,
-            &mut g2d_dst,
+        let src2_dyn = src2;
+        let mut g2d_dst_dyn = g2d_dst;
+        g2d_converter.convert(
+            &src2_dyn,
+            &mut g2d_dst_dyn,
             Rotation::None,
             Flip::None,
             Crop::no_crop(),
         )?;
+        g2d_dst = {
+            let mut __t = g2d_dst_dyn.into_u8().unwrap();
+            __t.set_format(g2d_out_fmt)
+                .map_err(|e| crate::Error::Internal(e.to_string()))?;
+            TensorDyn::from(__t)
+        };
 
-        let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGB, None)?;
+        let mut cpu_dst =
+            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgb, DType::U8, None)?;
         cpu_converter.convert(
             &g2d_dst,
             &mut cpu_dst,
@@ -423,8 +395,19 @@ mod g2d_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_formats_with_resize() {
-        for i in [RGBA, YUYV, RGB, GREY, NV12] {
-            for o in [RGBA, YUYV, RGB, GREY] {
+        for i in [
+            PixelFormat::Rgba,
+            PixelFormat::Yuyv,
+            PixelFormat::Rgb,
+            PixelFormat::Grey,
+            PixelFormat::Nv12,
+        ] {
+            for o in [
+                PixelFormat::Rgba,
+                PixelFormat::Yuyv,
+                PixelFormat::Rgb,
+                PixelFormat::Grey,
+            ] {
                 let res = test_g2d_format_with_resize_(i, o);
                 if let Err(e) = res {
                     println!("{} to {} failed: {e:?}", i.display(), o.display());
@@ -438,8 +421,19 @@ mod g2d_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_formats_with_resize_dst_crop() {
-        for i in [RGBA, YUYV, RGB, GREY, NV12] {
-            for o in [RGBA, YUYV, RGB, GREY] {
+        for i in [
+            PixelFormat::Rgba,
+            PixelFormat::Yuyv,
+            PixelFormat::Rgb,
+            PixelFormat::Grey,
+            PixelFormat::Nv12,
+        ] {
+            for o in [
+                PixelFormat::Rgba,
+                PixelFormat::Yuyv,
+                PixelFormat::Rgb,
+                PixelFormat::Grey,
+            ] {
                 let res = test_g2d_format_with_resize_dst_crop(i, o);
                 if let Err(e) = res {
                     println!("{} to {} failed: {e:?}", i.display(), o.display());
@@ -451,8 +445,8 @@ mod g2d_tests {
     }
 
     fn test_g2d_format_with_resize_(
-        g2d_in_fmt: FourCharCode,
-        g2d_out_fmt: FourCharCode,
+        g2d_in_fmt: PixelFormat,
+        g2d_out_fmt: PixelFormat,
     ) -> Result<(), crate::Error> {
         let dst_width = 600;
         let dst_height = 400;
@@ -461,11 +455,17 @@ mod g2d_tests {
             "/../../testdata/zidane.jpg"
         ))
         .to_vec();
-        let src = TensorImage::load_jpeg(&file, Some(RGB), None)?;
+        let src = crate::load_image(&file, Some(PixelFormat::Rgb), None)?;
 
         let mut cpu_converter = CPUProcessor::new();
 
-        let mut reference = TensorImage::new(dst_width, dst_height, RGB, Some(TensorMemory::Dma))?;
+        let mut reference = TensorDyn::image(
+            dst_width,
+            dst_height,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )?;
         cpu_converter.convert(
             &src,
             &mut reference,
@@ -475,15 +475,16 @@ mod g2d_tests {
         )?;
 
         // Create DMA buffer for G2D input
-        let mut src2 = TensorImage::new(1280, 720, g2d_in_fmt, Some(TensorMemory::Dma))?;
+        let mut src2 = TensorDyn::image(1280, 720, g2d_in_fmt, DType::U8, Some(TensorMemory::Dma))?;
 
-        // For NV12 input, load from file since CPU doesn't support RGB→NV12
-        if g2d_in_fmt == NV12 {
+        // For PixelFormat::Nv12 input, load from file since CPU doesn't support PixelFormat::Rgb→PixelFormat::Nv12
+        if g2d_in_fmt == PixelFormat::Nv12 {
             let nv12_bytes = include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../testdata/zidane.nv12"
             ));
-            src2.tensor()
+            src2.as_u8()
+                .unwrap()
                 .map()?
                 .as_mut_slice()
                 .copy_from_slice(nv12_bytes);
@@ -491,18 +492,32 @@ mod g2d_tests {
             cpu_converter.convert(&src, &mut src2, Rotation::None, Flip::None, Crop::no_crop())?;
         }
 
-        let mut g2d_dst =
-            TensorImage::new(dst_width, dst_height, g2d_out_fmt, Some(TensorMemory::Dma))?;
+        let mut g2d_dst = TensorDyn::image(
+            dst_width,
+            dst_height,
+            g2d_out_fmt,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )?;
         let mut g2d_converter = G2DProcessor::new()?;
-        g2d_converter.convert_(
-            &src2,
-            &mut g2d_dst,
+        let src2_dyn = src2;
+        let mut g2d_dst_dyn = g2d_dst;
+        g2d_converter.convert(
+            &src2_dyn,
+            &mut g2d_dst_dyn,
             Rotation::None,
             Flip::None,
             Crop::no_crop(),
         )?;
+        g2d_dst = {
+            let mut __t = g2d_dst_dyn.into_u8().unwrap();
+            __t.set_format(g2d_out_fmt)
+                .map_err(|e| crate::Error::Internal(e.to_string()))?;
+            TensorDyn::from(__t)
+        };
 
-        let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGB, None)?;
+        let mut cpu_dst =
+            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgb, DType::U8, None)?;
         cpu_converter.convert(
             &g2d_dst,
             &mut cpu_dst,
@@ -524,8 +539,8 @@ mod g2d_tests {
     }
 
     fn test_g2d_format_with_resize_dst_crop(
-        g2d_in_fmt: FourCharCode,
-        g2d_out_fmt: FourCharCode,
+        g2d_in_fmt: PixelFormat,
+        g2d_out_fmt: PixelFormat,
     ) -> Result<(), crate::Error> {
         let dst_width = 600;
         let dst_height = 400;
@@ -544,24 +559,37 @@ mod g2d_tests {
             "/../../testdata/zidane.jpg"
         ))
         .to_vec();
-        let src = TensorImage::load_jpeg(&file, Some(RGB), None)?;
+        let src = crate::load_image(&file, Some(PixelFormat::Rgb), None)?;
 
         let mut cpu_converter = CPUProcessor::new();
 
-        let mut reference = TensorImage::new(dst_width, dst_height, RGB, Some(TensorMemory::Dma))?;
-        reference.tensor.map().unwrap().as_mut_slice().fill(128);
+        let mut reference = TensorDyn::image(
+            dst_width,
+            dst_height,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )?;
+        reference
+            .as_u8()
+            .unwrap()
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .fill(128);
         cpu_converter.convert(&src, &mut reference, Rotation::None, Flip::None, crop)?;
 
         // Create DMA buffer for G2D input
-        let mut src2 = TensorImage::new(1280, 720, g2d_in_fmt, Some(TensorMemory::Dma))?;
+        let mut src2 = TensorDyn::image(1280, 720, g2d_in_fmt, DType::U8, Some(TensorMemory::Dma))?;
 
-        // For NV12 input, load from file since CPU doesn't support RGB→NV12
-        if g2d_in_fmt == NV12 {
+        // For PixelFormat::Nv12 input, load from file since CPU doesn't support PixelFormat::Rgb→PixelFormat::Nv12
+        if g2d_in_fmt == PixelFormat::Nv12 {
             let nv12_bytes = include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../testdata/zidane.nv12"
             ));
-            src2.tensor()
+            src2.as_u8()
+                .unwrap()
                 .map()?
                 .as_mut_slice()
                 .copy_from_slice(nv12_bytes);
@@ -569,13 +597,39 @@ mod g2d_tests {
             cpu_converter.convert(&src, &mut src2, Rotation::None, Flip::None, Crop::no_crop())?;
         }
 
-        let mut g2d_dst =
-            TensorImage::new(dst_width, dst_height, g2d_out_fmt, Some(TensorMemory::Dma))?;
-        g2d_dst.tensor.map().unwrap().as_mut_slice().fill(128);
+        let mut g2d_dst = TensorDyn::image(
+            dst_width,
+            dst_height,
+            g2d_out_fmt,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )?;
+        g2d_dst
+            .as_u8()
+            .unwrap()
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .fill(128);
         let mut g2d_converter = G2DProcessor::new()?;
-        g2d_converter.convert_(&src2, &mut g2d_dst, Rotation::None, Flip::None, crop)?;
+        let src2_dyn = src2;
+        let mut g2d_dst_dyn = g2d_dst;
+        g2d_converter.convert(
+            &src2_dyn,
+            &mut g2d_dst_dyn,
+            Rotation::None,
+            Flip::None,
+            crop,
+        )?;
+        g2d_dst = {
+            let mut __t = g2d_dst_dyn.into_u8().unwrap();
+            __t.set_format(g2d_out_fmt)
+                .map_err(|e| crate::Error::Internal(e.to_string()))?;
+            TensorDyn::from(__t)
+        };
 
-        let mut cpu_dst = TensorImage::new(dst_width, dst_height, RGB, None)?;
+        let mut cpu_dst =
+            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgb, DType::U8, None)?;
         cpu_converter.convert(
             &g2d_dst,
             &mut cpu_dst,
@@ -597,29 +651,33 @@ mod g2d_tests {
     }
 
     fn compare_images(
-        img1: &TensorImage,
-        img2: &TensorImage,
+        img1: &TensorDyn,
+        img2: &TensorDyn,
         threshold: f64,
         name: &str,
     ) -> Result<(), crate::Error> {
         assert_eq!(img1.height(), img2.height(), "Heights differ");
         assert_eq!(img1.width(), img2.width(), "Widths differ");
-        assert_eq!(img1.fourcc(), img2.fourcc(), "FourCC differ");
-        assert!(
-            matches!(img1.fourcc(), RGB | RGBA),
-            "FourCC must be RGB or RGBA for comparison"
+        assert_eq!(
+            img1.format().unwrap(),
+            img2.format().unwrap(),
+            "PixelFormat differ"
         );
-        let image1 = match img1.fourcc() {
-            RGB => image::RgbImage::from_vec(
-                img1.width() as u32,
-                img1.height() as u32,
-                img1.tensor().map().unwrap().to_vec(),
+        assert!(
+            matches!(img1.format().unwrap(), PixelFormat::Rgb | PixelFormat::Rgba),
+            "format must be Rgb or Rgba for comparison"
+        );
+        let image1 = match img1.format().unwrap() {
+            PixelFormat::Rgb => image::RgbImage::from_vec(
+                img1.width().unwrap() as u32,
+                img1.height().unwrap() as u32,
+                img1.as_u8().unwrap().map().unwrap().to_vec(),
             )
             .unwrap(),
-            RGBA => image::RgbaImage::from_vec(
-                img1.width() as u32,
-                img1.height() as u32,
-                img1.tensor().map().unwrap().to_vec(),
+            PixelFormat::Rgba => image::RgbaImage::from_vec(
+                img1.width().unwrap() as u32,
+                img1.height().unwrap() as u32,
+                img1.as_u8().unwrap().map().unwrap().to_vec(),
             )
             .unwrap()
             .convert(),
@@ -627,17 +685,17 @@ mod g2d_tests {
             _ => unreachable!(),
         };
 
-        let image2 = match img2.fourcc() {
-            RGB => image::RgbImage::from_vec(
-                img2.width() as u32,
-                img2.height() as u32,
-                img2.tensor().map().unwrap().to_vec(),
+        let image2 = match img2.format().unwrap() {
+            PixelFormat::Rgb => image::RgbImage::from_vec(
+                img2.width().unwrap() as u32,
+                img2.height().unwrap() as u32,
+                img2.as_u8().unwrap().map().unwrap().to_vec(),
             )
             .unwrap(),
-            RGBA => image::RgbaImage::from_vec(
-                img2.width() as u32,
-                img2.height() as u32,
-                img2.tensor().map().unwrap().to_vec(),
+            PixelFormat::Rgba => image::RgbaImage::from_vec(
+                img2.width().unwrap() as u32,
+                img2.height().unwrap() as u32,
+                img2.as_u8().unwrap().map().unwrap().to_vec(),
             )
             .unwrap()
             .convert(),
@@ -655,11 +713,6 @@ mod g2d_tests {
         if similarity.score < threshold {
             image1.save(format!("{name}_1.png")).unwrap();
             image2.save(format!("{name}_2.png")).unwrap();
-            // similarity
-            //     .image
-            //     .to_color_map()
-            //     .save(format!("{name}.png"))
-            //     .unwrap();
             return Err(Error::Internal(format!(
                 "{name}: converted image and target image have similarity score too low: {} < {}",
                 similarity.score, threshold
@@ -669,35 +722,35 @@ mod g2d_tests {
     }
 
     // =========================================================================
-    // NV12 Reference Validation Tests
-    // These tests compare G2D NV12 conversions against ffmpeg-generated references
+    // PixelFormat::Nv12 Reference Validation Tests
+    // These tests compare G2D PixelFormat::Nv12 conversions against ffmpeg-generated references
     // =========================================================================
 
     fn load_raw_image(
         width: usize,
         height: usize,
-        fourcc: FourCharCode,
+        fourcc: PixelFormat,
         memory: Option<TensorMemory>,
         bytes: &[u8],
-    ) -> Result<TensorImage, crate::Error> {
-        let img = TensorImage::new(width, height, fourcc, memory)?;
-        let mut map = img.tensor().map()?;
+    ) -> Result<TensorDyn, crate::Error> {
+        let img = TensorDyn::image(width, height, fourcc, DType::U8, memory)?;
+        let mut map = img.as_u8().unwrap().map()?;
         map.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
         Ok(img)
     }
 
-    /// Test G2D NV12→RGBA conversion against ffmpeg reference
+    /// Test G2D PixelFormat::Nv12→PixelFormat::Rgba conversion against ffmpeg reference
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_nv12_to_rgba_reference() -> Result<(), crate::Error> {
         if !is_dma_available() {
             return Ok(());
         }
-        // Load NV12 source
+        // Load PixelFormat::Nv12 source
         let src = load_raw_image(
             1280,
             720,
-            NV12,
+            PixelFormat::Nv12,
             Some(TensorMemory::Dma),
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -705,11 +758,11 @@ mod g2d_tests {
             )),
         )?;
 
-        // Load RGBA reference (ffmpeg-generated)
+        // Load PixelFormat::Rgba reference (ffmpeg-generated)
         let reference = load_raw_image(
             1280,
             720,
-            RGBA,
+            PixelFormat::Rgba,
             None,
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -718,33 +771,54 @@ mod g2d_tests {
         )?;
 
         // Convert using G2D
-        let mut dst = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma))?;
+        let mut dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )?;
         let mut g2d = G2DProcessor::new()?;
-        g2d.convert_(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())?;
+        let src_dyn = src;
+        let mut dst_dyn = dst;
+        g2d.convert(
+            &src_dyn,
+            &mut dst_dyn,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )?;
+        dst = {
+            let mut __t = dst_dyn.into_u8().unwrap();
+            __t.set_format(PixelFormat::Rgba)
+                .map_err(|e| crate::Error::Internal(e.to_string()))?;
+            TensorDyn::from(__t)
+        };
 
         // Copy to CPU for comparison
-        let cpu_dst = TensorImage::new(1280, 720, RGBA, None)?;
+        let cpu_dst = TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None)?;
         cpu_dst
-            .tensor()
+            .as_u8()
+            .unwrap()
             .map()?
             .as_mut_slice()
-            .copy_from_slice(dst.tensor().map()?.as_slice());
+            .copy_from_slice(dst.as_u8().unwrap().map()?.as_slice());
 
         compare_images(&reference, &cpu_dst, 0.98, "g2d_nv12_to_rgba_reference")
     }
 
-    /// Test G2D NV12→RGB conversion against ffmpeg reference
+    /// Test G2D PixelFormat::Nv12→PixelFormat::Rgb conversion against ffmpeg reference
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_nv12_to_rgb_reference() -> Result<(), crate::Error> {
         if !is_dma_available() {
             return Ok(());
         }
-        // Load NV12 source
+        // Load PixelFormat::Nv12 source
         let src = load_raw_image(
             1280,
             720,
-            NV12,
+            PixelFormat::Nv12,
             Some(TensorMemory::Dma),
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -752,11 +826,11 @@ mod g2d_tests {
             )),
         )?;
 
-        // Load RGB reference (ffmpeg-generated)
+        // Load PixelFormat::Rgb reference (ffmpeg-generated)
         let reference = load_raw_image(
             1280,
             720,
-            RGB,
+            PixelFormat::Rgb,
             None,
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -765,33 +839,54 @@ mod g2d_tests {
         )?;
 
         // Convert using G2D
-        let mut dst = TensorImage::new(1280, 720, RGB, Some(TensorMemory::Dma))?;
+        let mut dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )?;
         let mut g2d = G2DProcessor::new()?;
-        g2d.convert_(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())?;
+        let src_dyn = src;
+        let mut dst_dyn = dst;
+        g2d.convert(
+            &src_dyn,
+            &mut dst_dyn,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )?;
+        dst = {
+            let mut __t = dst_dyn.into_u8().unwrap();
+            __t.set_format(PixelFormat::Rgb)
+                .map_err(|e| crate::Error::Internal(e.to_string()))?;
+            TensorDyn::from(__t)
+        };
 
         // Copy to CPU for comparison
-        let cpu_dst = TensorImage::new(1280, 720, RGB, None)?;
+        let cpu_dst = TensorDyn::image(1280, 720, PixelFormat::Rgb, DType::U8, None)?;
         cpu_dst
-            .tensor()
+            .as_u8()
+            .unwrap()
             .map()?
             .as_mut_slice()
-            .copy_from_slice(dst.tensor().map()?.as_slice());
+            .copy_from_slice(dst.as_u8().unwrap().map()?.as_slice());
 
         compare_images(&reference, &cpu_dst, 0.98, "g2d_nv12_to_rgb_reference")
     }
 
-    /// Test G2D YUYV→RGBA conversion against ffmpeg reference
+    /// Test G2D PixelFormat::Yuyv→PixelFormat::Rgba conversion against ffmpeg reference
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_yuyv_to_rgba_reference() -> Result<(), crate::Error> {
         if !is_dma_available() {
             return Ok(());
         }
-        // Load YUYV source
+        // Load PixelFormat::Yuyv source
         let src = load_raw_image(
             1280,
             720,
-            YUYV,
+            PixelFormat::Yuyv,
             Some(TensorMemory::Dma),
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -799,11 +894,11 @@ mod g2d_tests {
             )),
         )?;
 
-        // Load RGBA reference (ffmpeg-generated)
+        // Load PixelFormat::Rgba reference (ffmpeg-generated)
         let reference = load_raw_image(
             1280,
             720,
-            RGBA,
+            PixelFormat::Rgba,
             None,
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -812,33 +907,54 @@ mod g2d_tests {
         )?;
 
         // Convert using G2D
-        let mut dst = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma))?;
+        let mut dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )?;
         let mut g2d = G2DProcessor::new()?;
-        g2d.convert_(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())?;
+        let src_dyn = src;
+        let mut dst_dyn = dst;
+        g2d.convert(
+            &src_dyn,
+            &mut dst_dyn,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )?;
+        dst = {
+            let mut __t = dst_dyn.into_u8().unwrap();
+            __t.set_format(PixelFormat::Rgba)
+                .map_err(|e| crate::Error::Internal(e.to_string()))?;
+            TensorDyn::from(__t)
+        };
 
         // Copy to CPU for comparison
-        let cpu_dst = TensorImage::new(1280, 720, RGBA, None)?;
+        let cpu_dst = TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None)?;
         cpu_dst
-            .tensor()
+            .as_u8()
+            .unwrap()
             .map()?
             .as_mut_slice()
-            .copy_from_slice(dst.tensor().map()?.as_slice());
+            .copy_from_slice(dst.as_u8().unwrap().map()?.as_slice());
 
         compare_images(&reference, &cpu_dst, 0.98, "g2d_yuyv_to_rgba_reference")
     }
 
-    /// Test G2D YUYV→RGB conversion against ffmpeg reference
+    /// Test G2D PixelFormat::Yuyv→PixelFormat::Rgb conversion against ffmpeg reference
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_yuyv_to_rgb_reference() -> Result<(), crate::Error> {
         if !is_dma_available() {
             return Ok(());
         }
-        // Load YUYV source
+        // Load PixelFormat::Yuyv source
         let src = load_raw_image(
             1280,
             720,
-            YUYV,
+            PixelFormat::Yuyv,
             Some(TensorMemory::Dma),
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -846,11 +962,11 @@ mod g2d_tests {
             )),
         )?;
 
-        // Load RGB reference (ffmpeg-generated)
+        // Load PixelFormat::Rgb reference (ffmpeg-generated)
         let reference = load_raw_image(
             1280,
             720,
-            RGB,
+            PixelFormat::Rgb,
             None,
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -859,51 +975,78 @@ mod g2d_tests {
         )?;
 
         // Convert using G2D
-        let mut dst = TensorImage::new(1280, 720, RGB, Some(TensorMemory::Dma))?;
+        let mut dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )?;
         let mut g2d = G2DProcessor::new()?;
-        g2d.convert_(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())?;
+        let src_dyn = src;
+        let mut dst_dyn = dst;
+        g2d.convert(
+            &src_dyn,
+            &mut dst_dyn,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )?;
+        dst = {
+            let mut __t = dst_dyn.into_u8().unwrap();
+            __t.set_format(PixelFormat::Rgb)
+                .map_err(|e| crate::Error::Internal(e.to_string()))?;
+            TensorDyn::from(__t)
+        };
 
         // Copy to CPU for comparison
-        let cpu_dst = TensorImage::new(1280, 720, RGB, None)?;
+        let cpu_dst = TensorDyn::image(1280, 720, PixelFormat::Rgb, DType::U8, None)?;
         cpu_dst
-            .tensor()
+            .as_u8()
+            .unwrap()
             .map()?
             .as_mut_slice()
-            .copy_from_slice(dst.tensor().map()?.as_slice());
+            .copy_from_slice(dst.as_u8().unwrap().map()?.as_slice());
 
         compare_images(&reference, &cpu_dst, 0.98, "g2d_yuyv_to_rgb_reference")
     }
 
-    /// Test G2D native BGRA conversion for all supported source formats.
-    /// Compares G2D src→BGRA against G2D src→RGBA by verifying R↔B swap.
+    /// Test G2D native PixelFormat::Bgra conversion for all supported source formats.
+    /// Compares G2D src→PixelFormat::Bgra against G2D src→PixelFormat::Rgba by verifying R↔B swap.
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_bgra_no_resize() {
-        for src_fmt in [RGBA, YUYV, NV12, BGRA] {
+        for src_fmt in [
+            PixelFormat::Rgba,
+            PixelFormat::Yuyv,
+            PixelFormat::Nv12,
+            PixelFormat::Bgra,
+        ] {
             test_g2d_bgra_no_resize_(src_fmt).unwrap_or_else(|e| {
-                panic!("{} to BGRA failed: {e:?}", src_fmt.display());
+                panic!("{} to PixelFormat::Bgra failed: {e:?}", src_fmt.display());
             });
         }
     }
 
-    fn test_g2d_bgra_no_resize_(g2d_in_fmt: FourCharCode) -> Result<(), crate::Error> {
+    fn test_g2d_bgra_no_resize_(g2d_in_fmt: PixelFormat) -> Result<(), crate::Error> {
         let file = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../testdata/zidane.jpg"
         ))
         .to_vec();
-        let src = TensorImage::load_jpeg(&file, Some(RGB), None)?;
+        let src = crate::load_image(&file, Some(PixelFormat::Rgb), None)?;
 
         // Create DMA buffer for G2D input
-        let mut src2 = TensorImage::new(1280, 720, g2d_in_fmt, Some(TensorMemory::Dma))?;
+        let mut src2 = TensorDyn::image(1280, 720, g2d_in_fmt, DType::U8, Some(TensorMemory::Dma))?;
         let mut cpu_converter = CPUProcessor::new();
 
-        if g2d_in_fmt == NV12 {
+        if g2d_in_fmt == PixelFormat::Nv12 {
             let nv12_bytes = include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../testdata/zidane.nv12"
             ));
-            src2.tensor()
+            src2.as_u8()
+                .unwrap()
                 .map()?
                 .as_mut_slice()
                 .copy_from_slice(nv12_bytes);
@@ -913,44 +1056,82 @@ mod g2d_tests {
 
         let mut g2d = G2DProcessor::new()?;
 
-        // Convert to BGRA via G2D
-        let mut bgra_dst = TensorImage::new(1280, 720, BGRA, Some(TensorMemory::Dma))?;
-        g2d.convert_(
-            &src2,
-            &mut bgra_dst,
+        // Convert to PixelFormat::Bgra via G2D
+        let mut bgra_dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Bgra,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )?;
+        let src2_dyn = src2;
+        let mut bgra_dst_dyn = bgra_dst;
+        g2d.convert(
+            &src2_dyn,
+            &mut bgra_dst_dyn,
             Rotation::None,
             Flip::None,
             Crop::no_crop(),
         )?;
+        bgra_dst = {
+            let mut __t = bgra_dst_dyn.into_u8().unwrap();
+            __t.set_format(PixelFormat::Bgra)
+                .map_err(|e| crate::Error::Internal(e.to_string()))?;
+            TensorDyn::from(__t)
+        };
 
-        // Convert to RGBA via G2D as reference
-        let mut rgba_dst = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma))?;
-        g2d.convert_(
-            &src2,
-            &mut rgba_dst,
+        // Reconstruct src2 from dyn for PixelFormat::Rgba conversion
+        let src2 = {
+            let mut __t = src2_dyn.into_u8().unwrap();
+            __t.set_format(g2d_in_fmt)
+                .map_err(|e| crate::Error::Internal(e.to_string()))?;
+            TensorDyn::from(__t)
+        };
+
+        // Convert to PixelFormat::Rgba via G2D as reference
+        let mut rgba_dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )?;
+        let src2_dyn2 = src2;
+        let mut rgba_dst_dyn = rgba_dst;
+        g2d.convert(
+            &src2_dyn2,
+            &mut rgba_dst_dyn,
             Rotation::None,
             Flip::None,
             Crop::no_crop(),
         )?;
+        rgba_dst = {
+            let mut __t = rgba_dst_dyn.into_u8().unwrap();
+            __t.set_format(PixelFormat::Rgba)
+                .map_err(|e| crate::Error::Internal(e.to_string()))?;
+            TensorDyn::from(__t)
+        };
 
         // Copy both to CPU memory for comparison
-        let bgra_cpu = TensorImage::new(1280, 720, BGRA, None)?;
+        let bgra_cpu = TensorDyn::image(1280, 720, PixelFormat::Bgra, DType::U8, None)?;
         bgra_cpu
-            .tensor()
+            .as_u8()
+            .unwrap()
             .map()?
             .as_mut_slice()
-            .copy_from_slice(bgra_dst.tensor().map()?.as_slice());
+            .copy_from_slice(bgra_dst.as_u8().unwrap().map()?.as_slice());
 
-        let rgba_cpu = TensorImage::new(1280, 720, RGBA, None)?;
+        let rgba_cpu = TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None)?;
         rgba_cpu
-            .tensor()
+            .as_u8()
+            .unwrap()
             .map()?
             .as_mut_slice()
-            .copy_from_slice(rgba_dst.tensor().map()?.as_slice());
+            .copy_from_slice(rgba_dst.as_u8().unwrap().map()?.as_slice());
 
-        // Verify BGRA output has R↔B swapped vs RGBA output
-        let bgra_map = bgra_cpu.tensor().map()?;
-        let rgba_map = rgba_cpu.tensor().map()?;
+        // Verify PixelFormat::Bgra output has R↔B swapped vs PixelFormat::Rgba output
+        let bgra_map = bgra_cpu.as_u8().unwrap().map()?;
+        let rgba_map = rgba_cpu.as_u8().unwrap().map()?;
         let bgra_buf = bgra_map.as_slice();
         let rgba_buf = rgba_map.as_slice();
 
@@ -963,25 +1144,25 @@ mod g2d_tests {
             assert_eq!(
                 bc[0],
                 rc[2],
-                "{} to BGRA: pixel {i} B mismatch",
+                "{} to PixelFormat::Bgra: pixel {i} B mismatch",
                 g2d_in_fmt.display()
             );
             assert_eq!(
                 bc[1],
                 rc[1],
-                "{} to BGRA: pixel {i} G mismatch",
+                "{} to PixelFormat::Bgra: pixel {i} G mismatch",
                 g2d_in_fmt.display()
             );
             assert_eq!(
                 bc[2],
                 rc[0],
-                "{} to BGRA: pixel {i} R mismatch",
+                "{} to PixelFormat::Bgra: pixel {i} R mismatch",
                 g2d_in_fmt.display()
             );
             assert_eq!(
                 bc[3],
                 rc[3],
-                "{} to BGRA: pixel {i} A mismatch",
+                "{} to PixelFormat::Bgra: pixel {i} A mismatch",
                 g2d_in_fmt.display()
             );
         }
