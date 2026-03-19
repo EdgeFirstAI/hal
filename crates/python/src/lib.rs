@@ -48,7 +48,6 @@ pub mod edgefirst_hal {
         m.add_class::<image::PyRotation>()?;
         m.add_class::<image::PyFlip>()?;
         m.add_class::<image::PyImageProcessor>()?;
-        m.add_class::<image::PyTensorImage>()?;
         m.add_class::<image::PyEglDisplayKind>()?;
         #[cfg(target_os = "linux")]
         {
