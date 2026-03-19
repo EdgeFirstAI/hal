@@ -7,7 +7,7 @@
 //! into detection boxes and segmentation masks.
 
 use crate::error::{set_error, set_error_null, str_to_c_string};
-use crate::image::{HalImageProcessor, HalTensorImage};
+use crate::image::HalImageProcessor;
 use crate::tensor::HalTensor;
 use crate::{check_null, check_null_ret_null, try_or_errno, try_or_null};
 use edgefirst_decoder::{
@@ -15,7 +15,7 @@ use edgefirst_decoder::{
     ConfigOutput, Decoder, DecoderBuilder, DetectBox, ProtoData, Quantization, Segmentation,
 };
 use edgefirst_image::ImageProcessorTrait;
-use edgefirst_tensor::{Tensor, TensorMapTrait, TensorMemory, TensorTrait};
+use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait};
 use libc::{c_char, c_int, size_t};
 use ndarray::ArrayViewD;
 use std::ffi::CStr;
@@ -873,7 +873,7 @@ pub unsafe extern "C" fn hal_decoder_decode(
     if outputs_slice[0].is_null() {
         return set_error(libc::EINVAL);
     }
-    let is_float = matches!(unsafe { &*outputs_slice[0] }, HalTensor::F32(_));
+    let is_float = matches!(unsafe { &*outputs_slice[0] }.inner, TensorDyn::F32(_));
 
     let mut boxes: Vec<DetectBox> = Vec::with_capacity(100);
     let mut masks: Vec<Segmentation> = Vec::new();
@@ -885,8 +885,8 @@ pub unsafe extern "C" fn hal_decoder_decode(
             if tensor_ptr.is_null() {
                 return set_error(libc::EINVAL);
             }
-            match unsafe { &*tensor_ptr } {
-                HalTensor::F32(t) => {
+            match &unsafe { &*tensor_ptr }.inner {
+                TensorDyn::F32(t) => {
                     let map = try_or_errno!(t.map(), libc::EIO);
                     maps.push(map);
                 }
@@ -958,43 +958,43 @@ unsafe fn decode_quantized_inner(
             set_error(libc::EINVAL);
             return Err(-1);
         }
-        let map = match unsafe { &*tensor_ptr } {
-            HalTensor::U8(t) => match t.map() {
+        let map = match &unsafe { &*tensor_ptr }.inner {
+            TensorDyn::U8(t) => match t.map() {
                 Ok(m) => TypedMap::U8(m),
                 Err(_) => {
                     set_error(libc::EIO);
                     return Err(-1);
                 }
             },
-            HalTensor::I8(t) => match t.map() {
+            TensorDyn::I8(t) => match t.map() {
                 Ok(m) => TypedMap::I8(m),
                 Err(_) => {
                     set_error(libc::EIO);
                     return Err(-1);
                 }
             },
-            HalTensor::U16(t) => match t.map() {
+            TensorDyn::U16(t) => match t.map() {
                 Ok(m) => TypedMap::U16(m),
                 Err(_) => {
                     set_error(libc::EIO);
                     return Err(-1);
                 }
             },
-            HalTensor::I16(t) => match t.map() {
+            TensorDyn::I16(t) => match t.map() {
                 Ok(m) => TypedMap::I16(m),
                 Err(_) => {
                     set_error(libc::EIO);
                     return Err(-1);
                 }
             },
-            HalTensor::U32(t) => match t.map() {
+            TensorDyn::U32(t) => match t.map() {
                 Ok(m) => TypedMap::U32(m),
                 Err(_) => {
                     set_error(libc::EIO);
                     return Err(-1);
                 }
             },
-            HalTensor::I32(t) => match t.map() {
+            TensorDyn::I32(t) => match t.map() {
                 Ok(m) => TypedMap::I32(m),
                 Err(_) => {
                     set_error(libc::EIO);
@@ -1153,8 +1153,8 @@ pub unsafe extern "C" fn hal_dequantize(
     let quant_rust: Quantization = quant.into();
 
     // Output must be f32
-    let output_tensor = match unsafe { &mut *output } {
-        HalTensor::F32(t) => t,
+    let output_tensor = match &mut unsafe { &mut *output }.inner {
+        TensorDyn::F32(t) => t,
         _ => return set_error(libc::EINVAL),
     };
     let mut out_map = try_or_errno!(output_tensor.map(), libc::EIO);
@@ -1171,13 +1171,13 @@ pub unsafe extern "C" fn hal_dequantize(
         }};
     }
 
-    match unsafe { &*input } {
-        HalTensor::U8(t) => dequantize_typed!(t),
-        HalTensor::I8(t) => dequantize_typed!(t),
-        HalTensor::U16(t) => dequantize_typed!(t),
-        HalTensor::I16(t) => dequantize_typed!(t),
-        HalTensor::U32(t) => dequantize_typed!(t),
-        HalTensor::I32(t) => dequantize_typed!(t),
+    match &unsafe { &*input }.inner {
+        TensorDyn::U8(t) => dequantize_typed!(t),
+        TensorDyn::I8(t) => dequantize_typed!(t),
+        TensorDyn::U16(t) => dequantize_typed!(t),
+        TensorDyn::I16(t) => dequantize_typed!(t),
+        TensorDyn::U32(t) => dequantize_typed!(t),
+        TensorDyn::I32(t) => dequantize_typed!(t),
         _ => return set_error(libc::EINVAL), // f32/f64/u64/i64 not supported
     }
 
@@ -1229,7 +1229,9 @@ pub unsafe extern "C" fn hal_segmentation_to_mask(
         .copy_from_slice(mask_2d.as_slice().unwrap());
     map.unmap();
 
-    Box::into_raw(Box::new(HalTensor::U8(tensor)))
+    Box::into_raw(Box::new(HalTensor {
+        inner: TensorDyn::U8(tensor),
+    }))
 }
 
 /// Free a decoder.
@@ -1410,7 +1412,7 @@ pub unsafe extern "C" fn hal_decoder_draw_masks(
     processor: *mut HalImageProcessor,
     outputs: *const *const HalTensor,
     num_outputs: size_t,
-    dst: *mut HalTensorImage,
+    dst: *mut HalTensor,
     out_boxes: *mut *mut HalDetectBoxList,
 ) -> c_int {
     check_null!(decoder, processor, outputs, dst, out_boxes);
@@ -1424,7 +1426,7 @@ pub unsafe extern "C" fn hal_decoder_draw_masks(
     if outputs_slice[0].is_null() {
         return set_error(libc::EINVAL);
     }
-    let is_float = matches!(unsafe { &*outputs_slice[0] }, HalTensor::F32(_));
+    let is_float = matches!(unsafe { &*outputs_slice[0] }.inner, TensorDyn::F32(_));
 
     let mut boxes: Vec<DetectBox> = Vec::with_capacity(100);
 
@@ -1435,8 +1437,8 @@ pub unsafe extern "C" fn hal_decoder_draw_masks(
             if tensor_ptr.is_null() {
                 return set_error(libc::EINVAL);
             }
-            match unsafe { &*tensor_ptr } {
-                HalTensor::F32(t) => {
+            match &unsafe { &*tensor_ptr }.inner {
+                TensorDyn::F32(t) => {
                     let map = try_or_errno!(t.map(), libc::EIO);
                     maps.push(map);
                 }
@@ -1560,7 +1562,7 @@ pub unsafe extern "C" fn hal_decoder_decode_masks(
     if outputs_slice[0].is_null() {
         return set_error(libc::EINVAL);
     }
-    let is_float = matches!(unsafe { &*outputs_slice[0] }, HalTensor::F32(_));
+    let is_float = matches!(unsafe { &*outputs_slice[0] }.inner, TensorDyn::F32(_));
 
     let mut boxes: Vec<DetectBox> = Vec::with_capacity(100);
 
@@ -1571,8 +1573,8 @@ pub unsafe extern "C" fn hal_decoder_decode_masks(
             if tensor_ptr.is_null() {
                 return set_error(libc::EINVAL);
             }
-            match unsafe { &*tensor_ptr } {
-                HalTensor::F32(t) => {
+            match &unsafe { &*tensor_ptr }.inner {
+                TensorDyn::F32(t) => {
                     let map = try_or_errno!(t.map(), libc::EIO);
                     maps.push(map);
                 }
@@ -1689,8 +1691,8 @@ unsafe fn decode_quantized_proto_inner(
             }
 
             fn map_tensor(tensor: &HalTensor) -> Result<TypedMap, c_int> {
-                match tensor {
-                    $(HalTensor::$variant(t) => Ok(TypedMap::$variant(t.map().map_err(|_| {
+                match &tensor.inner {
+                    $(TensorDyn::$variant(t) => Ok(TypedMap::$variant(t.map().map_err(|_| {
                         set_error(libc::EIO);
                         -1
                     })?))),+,

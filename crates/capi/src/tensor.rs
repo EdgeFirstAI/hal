@@ -9,7 +9,7 @@
 
 use crate::error::{c_str_to_option, set_error, set_error_null, str_to_c_string};
 use crate::{check_null, check_null_ret_null, try_or_null};
-use edgefirst_tensor::{Tensor, TensorMap, TensorMapTrait, TensorMemory, TensorTrait};
+use edgefirst_tensor::{DType, TensorDyn, TensorMap, TensorMapTrait, TensorMemory, TensorTrait};
 use libc::{c_char, c_int, size_t};
 
 #[cfg(unix)]
@@ -104,67 +104,61 @@ impl From<TensorMemory> for HalTensorMemory {
 /// Type-erased tensor that can hold any supported data type.
 ///
 /// This is an opaque type - use hal_tensor_* functions to interact with it.
-pub enum HalTensor {
-    U8(Tensor<u8>),
-    I8(Tensor<i8>),
-    U16(Tensor<u16>),
-    I16(Tensor<i16>),
-    U32(Tensor<u32>),
-    I32(Tensor<i32>),
-    U64(Tensor<u64>),
-    I64(Tensor<i64>),
-    F32(Tensor<f32>),
-    F64(Tensor<f64>),
+pub struct HalTensor {
+    pub(crate) inner: TensorDyn,
 }
 
 impl HalTensor {
     pub fn dtype(&self) -> HalDtype {
-        match self {
-            HalTensor::U8(_) => HalDtype::U8,
-            HalTensor::I8(_) => HalDtype::I8,
-            HalTensor::U16(_) => HalDtype::U16,
-            HalTensor::I16(_) => HalDtype::I16,
-            HalTensor::U32(_) => HalDtype::U32,
-            HalTensor::I32(_) => HalDtype::I32,
-            HalTensor::U64(_) => HalDtype::U64,
-            HalTensor::I64(_) => HalDtype::I64,
-            HalTensor::F32(_) => HalDtype::F32,
-            HalTensor::F64(_) => HalDtype::F64,
-        }
+        self.inner.dtype().into()
     }
+}
 
-    pub fn ndim(&self) -> usize {
-        match self {
-            HalTensor::U8(t) => t.shape().len(),
-            HalTensor::I8(t) => t.shape().len(),
-            HalTensor::U16(t) => t.shape().len(),
-            HalTensor::I16(t) => t.shape().len(),
-            HalTensor::U32(t) => t.shape().len(),
-            HalTensor::I32(t) => t.shape().len(),
-            HalTensor::U64(t) => t.shape().len(),
-            HalTensor::I64(t) => t.shape().len(),
-            HalTensor::F32(t) => t.shape().len(),
-            HalTensor::F64(t) => t.shape().len(),
+impl From<HalDtype> for DType {
+    fn from(d: HalDtype) -> Self {
+        match d {
+            HalDtype::U8 => DType::U8,
+            HalDtype::I8 => DType::I8,
+            HalDtype::U16 => DType::U16,
+            HalDtype::I16 => DType::I16,
+            HalDtype::U32 => DType::U32,
+            HalDtype::I32 => DType::I32,
+            HalDtype::U64 => DType::U64,
+            HalDtype::I64 => DType::I64,
+            HalDtype::F32 => DType::F32,
+            HalDtype::F64 => DType::F64,
         }
     }
 }
 
-/// Macro to dispatch a method call to all tensor variants
-macro_rules! dispatch_tensor {
-    ($self:expr, |$t:ident| $body:expr) => {
-        match $self {
-            HalTensor::U8($t) => $body,
-            HalTensor::I8($t) => $body,
-            HalTensor::U16($t) => $body,
-            HalTensor::I16($t) => $body,
-            HalTensor::U32($t) => $body,
-            HalTensor::I32($t) => $body,
-            HalTensor::U64($t) => $body,
-            HalTensor::I64($t) => $body,
-            HalTensor::F32($t) => $body,
-            HalTensor::F64($t) => $body,
+impl From<DType> for HalDtype {
+    fn from(d: DType) -> Self {
+        match d {
+            DType::U8 => HalDtype::U8,
+            DType::I8 => HalDtype::I8,
+            DType::U16 => HalDtype::U16,
+            DType::I16 => HalDtype::I16,
+            DType::U32 => HalDtype::U32,
+            DType::I32 => HalDtype::I32,
+            DType::U64 => HalDtype::U64,
+            DType::I64 => HalDtype::I64,
+            DType::F32 => HalDtype::F32,
+            DType::F64 => HalDtype::F64,
+            _ => HalDtype::U8, // F16 and future types not in C API
         }
-    };
+    }
+}
+
+impl From<TensorDyn> for HalTensor {
+    fn from(t: TensorDyn) -> Self {
+        Self { inner: t }
+    }
+}
+
+impl From<HalTensor> for TensorDyn {
+    fn from(t: HalTensor) -> Self {
+        t.inner
+    }
 }
 
 /// Type-erased tensor map for CPU access to tensor data.
@@ -260,61 +254,13 @@ pub unsafe extern "C" fn hal_tensor_new(
     let shape_slice = unsafe { std::slice::from_raw_parts(shape, ndim) };
     let name_opt = unsafe { c_str_to_option(name) };
     let mem_opt: Option<TensorMemory> = memory.into();
+    let dt: DType = dtype.into();
 
-    let tensor = match dtype {
-        HalDtype::U8 => try_or_null!(
-            Tensor::<u8>::new(shape_slice, mem_opt, name_opt),
-            libc::ENOMEM
-        )
-        .pipe(HalTensor::U8),
-        HalDtype::I8 => try_or_null!(
-            Tensor::<i8>::new(shape_slice, mem_opt, name_opt),
-            libc::ENOMEM
-        )
-        .pipe(HalTensor::I8),
-        HalDtype::U16 => try_or_null!(
-            Tensor::<u16>::new(shape_slice, mem_opt, name_opt),
-            libc::ENOMEM
-        )
-        .pipe(HalTensor::U16),
-        HalDtype::I16 => try_or_null!(
-            Tensor::<i16>::new(shape_slice, mem_opt, name_opt),
-            libc::ENOMEM
-        )
-        .pipe(HalTensor::I16),
-        HalDtype::U32 => try_or_null!(
-            Tensor::<u32>::new(shape_slice, mem_opt, name_opt),
-            libc::ENOMEM
-        )
-        .pipe(HalTensor::U32),
-        HalDtype::I32 => try_or_null!(
-            Tensor::<i32>::new(shape_slice, mem_opt, name_opt),
-            libc::ENOMEM
-        )
-        .pipe(HalTensor::I32),
-        HalDtype::U64 => try_or_null!(
-            Tensor::<u64>::new(shape_slice, mem_opt, name_opt),
-            libc::ENOMEM
-        )
-        .pipe(HalTensor::U64),
-        HalDtype::I64 => try_or_null!(
-            Tensor::<i64>::new(shape_slice, mem_opt, name_opt),
-            libc::ENOMEM
-        )
-        .pipe(HalTensor::I64),
-        HalDtype::F32 => try_or_null!(
-            Tensor::<f32>::new(shape_slice, mem_opt, name_opt),
-            libc::ENOMEM
-        )
-        .pipe(HalTensor::F32),
-        HalDtype::F64 => try_or_null!(
-            Tensor::<f64>::new(shape_slice, mem_opt, name_opt),
-            libc::ENOMEM
-        )
-        .pipe(HalTensor::F64),
-    };
-
-    Box::into_raw(Box::new(tensor))
+    let tensor = try_or_null!(
+        TensorDyn::new(shape_slice, dt, mem_opt, name_opt),
+        libc::ENOMEM
+    );
+    Box::into_raw(Box::new(HalTensor { inner: tensor }))
 }
 
 /// Create a new tensor from an existing file descriptor (Linux only).
@@ -348,61 +294,13 @@ pub unsafe extern "C" fn hal_tensor_from_fd(
     let shape_slice = unsafe { std::slice::from_raw_parts(shape, ndim) };
     let name_opt = unsafe { c_str_to_option(name) };
     let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let dt: DType = dtype.into();
 
-    let tensor = match dtype {
-        HalDtype::U8 => try_or_null!(
-            Tensor::<u8>::from_fd(owned_fd, shape_slice, name_opt),
-            libc::EIO
-        )
-        .pipe(HalTensor::U8),
-        HalDtype::I8 => try_or_null!(
-            Tensor::<i8>::from_fd(owned_fd, shape_slice, name_opt),
-            libc::EIO
-        )
-        .pipe(HalTensor::I8),
-        HalDtype::U16 => try_or_null!(
-            Tensor::<u16>::from_fd(owned_fd, shape_slice, name_opt),
-            libc::EIO
-        )
-        .pipe(HalTensor::U16),
-        HalDtype::I16 => try_or_null!(
-            Tensor::<i16>::from_fd(owned_fd, shape_slice, name_opt),
-            libc::EIO
-        )
-        .pipe(HalTensor::I16),
-        HalDtype::U32 => try_or_null!(
-            Tensor::<u32>::from_fd(owned_fd, shape_slice, name_opt),
-            libc::EIO
-        )
-        .pipe(HalTensor::U32),
-        HalDtype::I32 => try_or_null!(
-            Tensor::<i32>::from_fd(owned_fd, shape_slice, name_opt),
-            libc::EIO
-        )
-        .pipe(HalTensor::I32),
-        HalDtype::U64 => try_or_null!(
-            Tensor::<u64>::from_fd(owned_fd, shape_slice, name_opt),
-            libc::EIO
-        )
-        .pipe(HalTensor::U64),
-        HalDtype::I64 => try_or_null!(
-            Tensor::<i64>::from_fd(owned_fd, shape_slice, name_opt),
-            libc::EIO
-        )
-        .pipe(HalTensor::I64),
-        HalDtype::F32 => try_or_null!(
-            Tensor::<f32>::from_fd(owned_fd, shape_slice, name_opt),
-            libc::EIO
-        )
-        .pipe(HalTensor::F32),
-        HalDtype::F64 => try_or_null!(
-            Tensor::<f64>::from_fd(owned_fd, shape_slice, name_opt),
-            libc::EIO
-        )
-        .pipe(HalTensor::F64),
-    };
-
-    Box::into_raw(Box::new(tensor))
+    let tensor = try_or_null!(
+        TensorDyn::from_fd(owned_fd, shape_slice, dt, name_opt),
+        libc::EIO
+    );
+    Box::into_raw(Box::new(HalTensor { inner: tensor }))
 }
 
 /// Create a new tensor from an existing file descriptor (stub for non-Unix).
@@ -467,7 +365,7 @@ pub unsafe extern "C" fn hal_tensor_memory_type(tensor: *const HalTensor) -> Hal
     if tensor.is_null() {
         return HalTensorMemory::Mem;
     }
-    dispatch_tensor!(unsafe { &*tensor }, |t| t.memory().into())
+    unsafe { &*tensor }.inner.memory().into()
 }
 
 /// Get the name of a tensor.
@@ -481,7 +379,7 @@ pub unsafe extern "C" fn hal_tensor_name(tensor: *const HalTensor) -> *mut c_cha
     if tensor.is_null() {
         return std::ptr::null_mut();
     }
-    let name = dispatch_tensor!(unsafe { &*tensor }, |t| t.name());
+    let name = unsafe { &*tensor }.inner.name();
     str_to_c_string(&name)
 }
 
@@ -504,7 +402,7 @@ pub unsafe extern "C" fn hal_tensor_shape(
         return std::ptr::null();
     }
 
-    let shape = dispatch_tensor!(unsafe { &*tensor }, |t| t.shape());
+    let shape = unsafe { &*tensor }.inner.shape();
     if !out_ndim.is_null() {
         unsafe { *out_ndim = shape.len() };
     }
@@ -520,7 +418,7 @@ pub unsafe extern "C" fn hal_tensor_len(tensor: *const HalTensor) -> size_t {
     if tensor.is_null() {
         return 0;
     }
-    dispatch_tensor!(unsafe { &*tensor }, |t| t.len())
+    unsafe { &*tensor }.inner.shape().iter().product()
 }
 
 /// Get the total size in bytes of a tensor's data.
@@ -532,7 +430,7 @@ pub unsafe extern "C" fn hal_tensor_size(tensor: *const HalTensor) -> size_t {
     if tensor.is_null() {
         return 0;
     }
-    dispatch_tensor!(unsafe { &*tensor }, |t| t.size())
+    unsafe { &*tensor }.inner.size()
 }
 
 /// Clone the file descriptor associated with a tensor (Linux only).
@@ -549,8 +447,7 @@ pub unsafe extern "C" fn hal_tensor_size(tensor: *const HalTensor) -> size_t {
 #[cfg(unix)]
 pub unsafe extern "C" fn hal_tensor_clone_fd(tensor: *const HalTensor) -> c_int {
     check_null!(tensor);
-    let result = dispatch_tensor!(unsafe { &*tensor }, |t| t.clone_fd());
-    match result {
+    match unsafe { &*tensor }.inner.clone_fd() {
         Ok(fd) => fd.into_raw_fd(),
         Err(_) => set_error(libc::EIO),
     }
@@ -586,8 +483,7 @@ pub unsafe extern "C" fn hal_tensor_reshape(
 
     let shape_slice = unsafe { std::slice::from_raw_parts(shape, ndim) };
 
-    let result = dispatch_tensor!(unsafe { &mut *tensor }, |t| t.reshape(shape_slice));
-    match result {
+    match unsafe { &mut *tensor }.inner.reshape(shape_slice) {
         Ok(()) => 0,
         Err(_) => set_error(libc::EINVAL),
     }
@@ -612,17 +508,18 @@ pub unsafe extern "C" fn hal_tensor_reshape(
 pub unsafe extern "C" fn hal_tensor_map_create(tensor: *const HalTensor) -> *mut HalTensorMap {
     check_null_ret_null!(tensor);
 
-    let map = match unsafe { &*tensor } {
-        HalTensor::U8(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::U8),
-        HalTensor::I8(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::I8),
-        HalTensor::U16(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::U16),
-        HalTensor::I16(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::I16),
-        HalTensor::U32(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::U32),
-        HalTensor::I32(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::I32),
-        HalTensor::U64(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::U64),
-        HalTensor::I64(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::I64),
-        HalTensor::F32(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::F32),
-        HalTensor::F64(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::F64),
+    let map = match &unsafe { &*tensor }.inner {
+        TensorDyn::U8(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::U8),
+        TensorDyn::I8(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::I8),
+        TensorDyn::U16(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::U16),
+        TensorDyn::I16(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::I16),
+        TensorDyn::U32(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::U32),
+        TensorDyn::I32(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::I32),
+        TensorDyn::U64(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::U64),
+        TensorDyn::I64(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::I64),
+        TensorDyn::F32(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::F32),
+        TensorDyn::F64(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::F64),
+        _ => return set_error_null(libc::ENOTSUP),
     };
 
     Box::into_raw(Box::new(map))
