@@ -1014,10 +1014,9 @@ pub unsafe extern "C" fn hal_image_processor_convert_ref(
         return set_error(libc::EINVAL);
     }
 
-    // Temporarily take ownership of the HalTensor to extract the inner Tensor<u8>,
-    // set its pixel format, wrap in TensorDyn, call convert, then put it back.
-    let hal_tensor = unsafe { Box::from_raw(dst_tensor) };
-    let mut u8_tensor = match *hal_tensor {
+    // Move the HalTensor value out of the allocation without freeing the
+    // allocation itself.  We will write a new value back via ptr::write.
+    let mut u8_tensor = match unsafe { std::ptr::read(dst_tensor) } {
         HalTensor::U8(t) => t,
         _ => unreachable!(), // validated above
     };
