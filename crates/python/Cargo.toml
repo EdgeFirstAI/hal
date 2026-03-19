@@ -26,7 +26,7 @@ half = { workspace = true }
 log = { workspace = true }
 ndarray = { workspace = true }
 numpy = { workspace = true }
-pyo3 = { workspace = true, features = ["extension-module", "multiple-pymethods"] }
+pyo3 = { workspace = true, features = ["extension-module"] }
 pythonize = { workspace = true }
 
 [build-dependencies]
