@@ -554,12 +554,23 @@ impl PyTensorMap {
         }
 
         let mapped = slf2.mapped.as_ref().unwrap();
-        let mut shape = mapped
-            .shape()
-            .iter()
-            .map(|&s| s as isize)
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        let shape: Vec<isize> = mapped.shape().iter().map(|&s| s as isize).collect();
+        let ndim = shape.len();
+
+        // Compute C-contiguous strides: strides[i] = itemsize * product(shape[i+1..])
+        let itemsize = mapped.element_size() as isize;
+        let mut strides = vec![0isize; ndim];
+        if ndim > 0 {
+            strides[ndim - 1] = itemsize;
+            for i in (0..ndim - 1).rev() {
+                strides[i] = strides[i + 1] * shape[i + 1];
+            }
+        }
+
+        // Box both arrays together so we can recover the length in __releasebuffer__.
+        // Store (shape_ptr, strides_ptr, ndim) using view.internal.
+        let mut shape = shape.into_boxed_slice();
+        let mut strides = strides.into_boxed_slice();
 
         let ptr = mapped.data_ptr();
         let format = CString::new(mapped.format_str()).unwrap();
@@ -567,17 +578,20 @@ impl PyTensorMap {
         unsafe {
             (*view).buf = ptr;
             (*view).len = mapped.size() as isize;
-            (*view).itemsize = mapped.element_size() as isize;
+            (*view).itemsize = itemsize;
             (*view).readonly = 0;
 
             (*view).format = format.into_raw(); // dropped in __releasebuffer__
 
-            (*view).ndim = shape.len() as i32;
+            (*view).ndim = ndim as i32;
             (*view).shape = shape.as_mut_ptr();
+            (*view).strides = strides.as_mut_ptr();
+            // Store ndim in internal so __releasebuffer__ can reconstruct the slices.
+            (*view).internal = ndim as *mut c_void;
             std::mem::forget(shape); // dropped in __releasebuffer__
+            std::mem::forget(strides); // dropped in __releasebuffer__
 
             (*view).suboffsets = std::ptr::null_mut();
-            (*view).internal = std::ptr::null_mut();
 
             (*view).obj = slf.into_ptr();
         }
@@ -588,7 +602,14 @@ impl PyTensorMap {
     #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
     unsafe fn __releasebuffer__(&mut self, view: *mut Py_buffer) {
         drop(unsafe { CString::from_raw((*view).format) });
-        drop(unsafe { Box::from_raw((*view).shape) });
+        let ndim = unsafe { (*view).internal } as usize;
+        if ndim > 0 {
+            // Reconstruct the boxed slices with the correct length.
+            drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut((*view).shape, ndim)) });
+            drop(unsafe {
+                Box::from_raw(std::ptr::slice_from_raw_parts_mut((*view).strides, ndim))
+            });
+        }
     }
 
     fn __enter__(slf: Bound<'_, Self>) -> PyResult<Bound<'_, Self>> {
