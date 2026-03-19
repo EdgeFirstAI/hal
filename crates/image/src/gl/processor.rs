@@ -2543,7 +2543,12 @@ impl GLProcessorST {
                     flip,
                 )?,
                 Err(e) => {
-                    log::warn!("EGL image creation failed for {src_fmt:?}: {e:?}");
+                    let src_w = src.width().unwrap_or(0);
+                    let src_h = src.height().unwrap_or(0);
+                    log::warn!(
+                        "EGL image creation failed for {src_fmt} ({src_w}x{src_h}), \
+                         falling back to texture upload (slower): {e}"
+                    );
                     let start = Instant::now();
                     self.draw_src_texture(src, src_fmt, src_roi, dst_roi, rotation_offset, flip)?;
                     log::debug!("draw_src_texture takes {:?}", start.elapsed());
@@ -3423,10 +3428,9 @@ impl GLProcessorST {
         // NV12 is semi-planar but handled specially via EGL multi-plane import
         if src_fmt == PixelFormat::Nv12 {
             if !src_w.is_multiple_of(4) {
-                return Err(Error::NotSupported(
-                    "OpenGL EGLImage doesn't support image widths which are not multiples of 4"
-                        .to_string(),
-                ));
+                return Err(Error::NotSupported(format!(
+                    "EGLImage requires width divisible by 4 for {src_fmt}, got {src_w}"
+                )));
             }
             width = src_w;
             height = src_h;
@@ -3434,10 +3438,9 @@ impl GLProcessorST {
             channels = 1; // Y plane pitch is 1 byte per pixel
         } else if src_fmt.layout() == PixelLayout::Planar {
             if !src_w.is_multiple_of(16) {
-                return Err(Error::NotSupported(
-                    "OpenGL Planar RGB EGLImage doesn't support image widths which are not multiples of 16"
-                        .to_string(),
-                ));
+                return Err(Error::NotSupported(format!(
+                    "EGLImage requires width divisible by 16 for {src_fmt}, got {src_w}"
+                )));
             }
             match src_fmt {
                 PixelFormat::PlanarRgb => {
@@ -3454,10 +3457,9 @@ impl GLProcessorST {
             };
         } else {
             if !src_w.is_multiple_of(4) {
-                return Err(Error::NotSupported(
-                    "OpenGL EGLImage doesn't support image widths which are not multiples of 4"
-                        .to_string(),
-                ));
+                return Err(Error::NotSupported(format!(
+                    "EGLImage requires width divisible by 4 for {src_fmt}, got {src_w}"
+                )));
             }
             width = src_w;
             height = src_h;
@@ -3615,25 +3617,29 @@ impl GLProcessorST {
             }
             egl_cache.misses += 1;
             log::trace!("EglImageCache {:?} miss: id={luma_id:#x}", cache);
-            // Evict least-recently-used entry if at capacity.
-            if egl_cache.entries.len() >= egl_cache.capacity {
-                egl_cache.evict_lru();
-            }
         }
-        // Invalidate binding state: a cache miss means we're creating a new
-        // EGLImage, and the eviction above may have removed the bound entry.
+
+        // Create the EGL image BEFORE evicting — if creation fails, we don't
+        // want to have destroyed a valid cache entry for nothing.
+        let egl_image_obj = self.create_image_from_dma2(img, img_fmt)?;
+
+        // Invalidate binding state: we're inserting a new entry and may evict
+        // the currently-bound one.
         match cache {
             CacheKind::Src => self.last_bound_src_egl = None,
             CacheKind::Dst => self.last_bound_dst_egl = None,
         }
 
-        let egl_image_obj = self.create_image_from_dma2(img, img_fmt)?;
         let handle = egl_image_obj.egl_image;
         let guard = img.buffer_identity().weak();
         let egl_cache = match cache {
             CacheKind::Src => &mut self.src_egl_cache,
             CacheKind::Dst => &mut self.dst_egl_cache,
         };
+        // Evict least-recently-used entry if at capacity.
+        if egl_cache.entries.len() >= egl_cache.capacity {
+            egl_cache.evict_lru();
+        }
         let ts = egl_cache.next_timestamp();
         egl_cache.entries.insert(
             id,
