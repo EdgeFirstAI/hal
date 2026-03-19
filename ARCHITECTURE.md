@@ -651,7 +651,6 @@ flowchart TD
 
 **Exposed Classes**:
 - `PyTensor`: Generic tensor with numpy buffer protocol
-- `PyTensorImage`: Image container with format metadata
 - `PyImageProcessor`: Image processing operations
 - `PyDecoder`: Model output decoding
 - `PixelFormat`, `Normalization`, `PyRect`, `PyRotation`, `PyFlip`: Configuration enums
@@ -806,7 +805,7 @@ import edgefirst_hal as ef
 import numpy as np
 
 # Load image from file
-tensor_img = ef.TensorImage.load("testdata/zidane.jpg", ef.PixelFormat.Rgb)
+tensor_img = ef.Tensor.load("testdata/zidane.jpg", ef.PixelFormat.Rgb)
 
 # Create converter
 converter = ef.ImageProcessor()
@@ -856,7 +855,7 @@ Raw FFI bindings are wrapped in safe Rust types that enforce correct usage at co
 
 ### 7. Python Wrapper Naming Convention
 
-Python wrapper types use a `Py` prefix (e.g., `PyTensor`, `PyTensorImage`) to clearly distinguish them from their Rust counterparts (`Tensor`, `TensorDyn`). The Python `TensorImage` class wraps a `TensorDyn` internally. This convention makes it explicit which types are Python-facing and which are internal Rust types.
+Python wrapper types use a `Py` prefix (e.g., `PyTensor`, `PyPixelFormat`) to clearly distinguish them from their Rust counterparts. The Python `Tensor` class wraps `TensorDyn` internally. This convention makes it explicit which types are Python-facing and which are internal Rust types.
 
 ## EGL/GL Resource Cleanup at Process Shutdown
 
@@ -1276,7 +1275,7 @@ with all planes stored contiguously. This is baked into multiple layers:
 | EGL NV12 import | Same fd for both planes, UV offset = `W*H` | `crates/image/src/opengl_headless.rs:4492–4501` |
 
 This works correctly when the kernel allocates NV12 from a single CMA/system
-DMA-heap buffer (e.g. `hal_tensor_image_new()`, `hal_image_processor_create_image()`).
+DMA-heap buffer (e.g. `hal_tensor_new()`, `hal_image_processor_create_image()`).
 The Y and UV planes are contiguous in physical memory and share one fd.
 
 ### The Problem: Multi-Planar Formats
@@ -1300,7 +1299,7 @@ blocks (one per plane).
 The HAL supports multi-plane DMA-BUF NV12/NV16 via a two-tensor approach
 rather than extending `DmaTensor` with multiple fds:
 
-**C API**: `hal_tensor_image_from_planes(y_fd, width, height, uv_fd, fourcc, out)`
+**C API**: `hal_tensor_from_planes(y_fd, width, height, uv_fd, fourcc, out)`
 takes separate Y and UV file descriptors, wraps each into its own
 `Tensor<u8>` via `from_fd()`, and combines them with `Tensor::from_planes()`.
 
@@ -1317,14 +1316,14 @@ each at offset 0.
 | Single-fd NV12 DMA-BUF | Yes | V4L2 single-planar capture, HAL-allocated buffers |
 | Single-fd YUYV/RGB/RGBA DMA-BUF | Yes | Always single-plane |
 | System memory input | N/A | Copied into HAL tensor regardless |
-| Multi-fd NV12/NV16 DMA-BUF | Yes | Via `hal_tensor_image_from_planes()` |
+| Multi-fd NV12/NV16 DMA-BUF | Yes | Via `hal_tensor_from_planes()` |
 
 ### GStreamer Integration (External)
 
 The `edgefirstcameraadaptor` element detects multi-plane buffers
 (`gst_buffer_n_memory() > 1`) and extracts per-plane fds via
 `gst_dmabuf_memory_get_fd()` on each `GstMemory` block, passing them to
-`hal_tensor_image_from_planes()` for zero-copy import.
+`hal_tensor_from_planes()` for zero-copy import.
 
 ### Tracking
 

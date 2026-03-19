@@ -41,7 +41,7 @@ edgefirst = "0.9.1"
 import edgefirst_hal as ef
 
 # Load and process image
-img = ef.TensorImage.load("image.jpg", ef.PixelFormat.Rgb)
+img = ef.Tensor.load("image.jpg", ef.PixelFormat.Rgb)
 converter = ef.ImageProcessor()
 output = converter.create_image(640, 640, ef.PixelFormat.Rgb)
 converter.convert(img, output)
@@ -69,7 +69,7 @@ converter.convert(&input, &mut output, Rotation::None, Flip::None, Crop::default
 #include <edgefirst/hal.h>
 
 struct hal_image_processor *proc = hal_image_processor_new();
-struct hal_tensor_image *dst = hal_image_processor_create_image(proc, 640, 640, HAL_FOURCC_RGB);
+struct hal_tensor *dst = hal_image_processor_create_image(proc, 640, 640, HAL_FOURCC_RGB);
 hal_image_processor_convert(proc, src, dst, HAL_ROTATION_NONE, HAL_FLIP_NONE, NULL);
 ```
 
@@ -372,7 +372,6 @@ flowchart TD
 
 **Exposed Classes**:
 - `PyTensor`: Generic tensor with numpy buffer protocol
-- `PyTensorImage`: Image container with format metadata
 - `PyImageProcessor`: Image processing operations
 - `PyDecoder`: Model output decoding
 - `PixelFormat`, `Normalization`, `PyRect`, `PyRotation`, `PyFlip`: Configuration enums
@@ -457,7 +456,7 @@ for frame in camera_frames:
 struct hal_image_processor *proc = hal_image_processor_new();
 
 /* Create reusable output buffer — allocated once */
-struct hal_tensor_image *output = hal_image_processor_create_image(
+struct hal_tensor *output = hal_image_processor_create_image(
     proc, 640, 640, HAL_FOURCC_RGB);
 
 for (;;) {
@@ -467,7 +466,7 @@ for (;;) {
     run_inference(output);
 }
 
-hal_tensor_image_free(output);
+hal_tensor_free(output);
 hal_image_processor_free(proc);
 ```
 
@@ -586,7 +585,7 @@ import edgefirst_hal as ef
 import numpy as np
 
 # Load image from file
-tensor_img = ef.TensorImage.load("testdata/zidane.jpg", ef.PixelFormat.Rgb)
+tensor_img = ef.Tensor.load("testdata/zidane.jpg", ef.PixelFormat.Rgb)
 
 # Create converter
 converter = ef.ImageProcessor()
@@ -651,7 +650,7 @@ Raw FFI bindings are wrapped in safe Rust types that enforce correct usage at co
 
 ### 7. Python Wrapper Naming Convention
 
-Python wrapper types use a `Py` prefix (e.g., `PyTensor`, `PyTensorImage`) to clearly distinguish them from their Rust counterparts (`Tensor`, `TensorDyn`). The Python `TensorImage` class wraps a `TensorDyn` internally, providing a familiar image-oriented API to Python users. This convention makes it explicit which types are Python-facing and which are internal Rust types.
+Python wrapper types use a `Py` prefix (e.g., `PyTensor`, `PyPixelFormat`) to clearly distinguish them from their Rust counterparts. The Python `Tensor` class wraps `TensorDyn` internally. This convention makes it explicit which types are Python-facing and which are internal Rust types.
 
 ## Performance Considerations
 
