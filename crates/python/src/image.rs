@@ -601,6 +601,7 @@ fn normalize_to_float_16<'py>(
                 d.convert_from_f32_slice(s);
             });
             dst.1.convert_from_f32_slice(tmp_.1);
+            return Ok(());
         }
     }
     match normalization {

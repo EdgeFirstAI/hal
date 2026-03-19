@@ -422,6 +422,10 @@ typedef enum hal_dtype {
    */
   HAL_DTYPE_I64 = 7,
   /**
+   * 16-bit floating point (half)
+   */
+  HAL_DTYPE_F16 = 8,
+  /**
    * 32-bit floating point (float)
    */
   HAL_DTYPE_F32 = 9,

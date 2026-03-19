@@ -855,14 +855,20 @@ pub unsafe extern "C" fn hal_image_processor_convert_ref(
         return set_error(libc::EINVAL);
     }
 
-    // Temporarily take the inner TensorDyn out via ptr::read so we can
-    // modify the format on the inner Tensor<u8> and pass it to convert.
-    let mut dst_dyn = unsafe { std::ptr::read(&(*dst_tensor).inner) };
+    // Move the inner TensorDyn out via ptr::read so we can modify the
+    // format on the inner Tensor<u8> and pass it to convert. We wrap the
+    // source in ManuallyDrop to prevent a double-free if convert() panics.
+    let dst_dyn = unsafe { std::ptr::read(&(*dst_tensor).inner) };
+    let mut dst_dyn = std::mem::ManuallyDrop::new(dst_dyn);
 
-    if let TensorDyn::U8(ref mut t) = dst_dyn {
+    if let TensorDyn::U8(ref mut t) = *dst_dyn {
         if t.set_format(dst_fourcc.to_pixel_format()).is_err() {
-            // Put tensor back and return error
-            unsafe { std::ptr::write(&mut (*dst_tensor).inner, dst_dyn) };
+            unsafe {
+                std::ptr::write(
+                    &mut (*dst_tensor).inner,
+                    std::mem::ManuallyDrop::into_inner(dst_dyn),
+                )
+            };
             return set_error(libc::EINVAL);
         }
     }
@@ -882,7 +888,12 @@ pub unsafe extern "C" fn hal_image_processor_convert_ref(
     );
 
     // Put the tensor back regardless of success/failure
-    unsafe { std::ptr::write(&mut (*dst_tensor).inner, dst_dyn) };
+    unsafe {
+        std::ptr::write(
+            &mut (*dst_tensor).inner,
+            std::mem::ManuallyDrop::into_inner(dst_dyn),
+        )
+    };
 
     try_or_errno!(result, libc::EIO);
     0

@@ -38,6 +38,8 @@ pub enum HalDtype {
     U64 = 6,
     /// Signed 64-bit integer (int64_t)
     I64 = 7,
+    /// 16-bit floating point (half)
+    F16 = 8,
     /// 32-bit floating point (float)
     F32 = 9,
     /// 64-bit floating point (double)
@@ -49,7 +51,7 @@ impl HalDtype {
     pub fn size(&self) -> usize {
         match self {
             HalDtype::U8 | HalDtype::I8 => 1,
-            HalDtype::U16 | HalDtype::I16 => 2,
+            HalDtype::U16 | HalDtype::I16 | HalDtype::F16 => 2,
             HalDtype::U32 | HalDtype::I32 | HalDtype::F32 => 4,
             HalDtype::U64 | HalDtype::I64 | HalDtype::F64 => 8,
         }
@@ -125,6 +127,7 @@ impl From<HalDtype> for DType {
             HalDtype::I32 => DType::I32,
             HalDtype::U64 => DType::U64,
             HalDtype::I64 => DType::I64,
+            HalDtype::F16 => DType::F16,
             HalDtype::F32 => DType::F32,
             HalDtype::F64 => DType::F64,
         }
@@ -144,7 +147,8 @@ impl From<DType> for HalDtype {
             DType::I64 => HalDtype::I64,
             DType::F32 => HalDtype::F32,
             DType::F64 => HalDtype::F64,
-            _ => HalDtype::U8, // F16 and future types not in C API
+            DType::F16 => HalDtype::F16,
+            _ => HalDtype::U8, // Future types not yet in C API
         }
     }
 }
