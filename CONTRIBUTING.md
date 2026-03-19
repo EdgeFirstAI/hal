@@ -113,18 +113,25 @@ python -m pytest tests/
 
 ```bash
 git add .
-git commit -m "feat: add new tensor operation for matrix multiplication"
+git commit -s -m "EDGEAI-123: Add tensor operation for matrix multiplication"
 git push origin feature/your-feature-name
 ```
 
 **Commit Message Convention:**
-- `feat:` - New feature
-- `fix:` - Bug fix
-- `docs:` - Documentation changes
-- `test:` - Adding or updating tests
-- `refactor:` - Code refactoring
-- `perf:` - Performance improvements
-- `chore:` - Maintenance tasks
+
+For feature/bug work with a JIRA ticket:
+```
+EDGEAI-123: Brief description of the change
+```
+
+For housekeeping (no JIRA ticket required):
+```
+Release v0.6.0
+Update CI workflow to use latest actions
+Fix typo in README
+```
+
+See `.github/copilot-instructions.md` for full details.
 
 ### 6. Submit Pull Request
 
