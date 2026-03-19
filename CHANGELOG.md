@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: Unified Tensor API** — `TensorImage` removed from all APIs.
+  The `Tensor` type is now the single tensor type across Rust, C, and Python.
+  - **Python**: `TensorImage(w, h, fmt)` → `Tensor.image(w, h, fmt)`;
+    `TensorImage.load()` → `Tensor.load()`; `FourCC` → `PixelFormat`
+  - **C**: `hal_tensor_image_*` functions replaced by `hal_tensor_*` equivalents
+    (e.g., `hal_tensor_new_image()`, `hal_tensor_load_image()`,
+    `hal_tensor_width()`, `hal_tensor_fourcc()`);
+    `HalTensorImage` removed — use `HalTensor` for all tensors
+  - **Rust**: `TensorDyn` is the unified type-erased tensor;
+    `PyTensor` and `HalTensor` now wrap `TensorDyn` directly
+
+### Added
+
+- `TensorDyn::new()`, `TensorDyn::from_fd()`, `TensorDyn::size()`,
+  `TensorDyn::memory()`, `TensorDyn::reshape()`, `TensorDyn::clone_fd()`
+  methods for complete type-erased tensor operations
+- `HalDtype::F16` variant in C API for float16 tensor support
+- NV12 even-height validation in `Tensor::image()`
+- Semi-planar shape constraint validation in `Tensor::set_format()`
+
+### Fixed
+
+- EGL image cache evict-before-create causing unnecessary cache churn
+  and potential fd accumulation on GREY format fallback
+- Use-after-free in `hal_image_processor_convert_ref` (replaced
+  `Box::from_raw` with `ptr::read` + `ManuallyDrop`)
+- Missing `return Ok(())` in stable `normalize_to_float_16` RGBA path
+  that caused double-processing
+- Clippy `iflet_redundant_pattern_matching` and `collapsible_match` lints
+- Broken `FourCC` imports and variant casing in Python tests
+- Stale `.display()` calls in G2D tests and duplicate `.as_u8()` in GL tests
+- Pinned Rust toolchain versions in CI to prevent profraw format corruption
+  across build/coverage-processing jobs
+
 ## [0.9.1] - 2026-03-10
 
 ### Added

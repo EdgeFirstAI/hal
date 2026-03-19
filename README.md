@@ -371,10 +371,10 @@ flowchart TD
 **Purpose**: Expose HAL functionality to Python via PyO3.
 
 **Exposed Classes**:
-- `PyTensor`: Generic tensor with numpy buffer protocol
-- `PyImageProcessor`: Image processing operations
-- `PyDecoder`: Model output decoding
-- `PixelFormat`, `Normalization`, `PyRect`, `PyRotation`, `PyFlip`: Configuration enums
+- `Tensor`: Unified tensor with image support and numpy buffer protocol
+- `ImageProcessor`: Image processing operations
+- `Decoder`: Model output decoding
+- `PixelFormat`, `Normalization`, `Rect`, `Rotation`, `Flip`: Configuration types
 
 **Python Integration**:
 ```mermaid

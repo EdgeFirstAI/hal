@@ -40,7 +40,7 @@ def calculate_similarity_rms_u8(imageA, imageB) -> float:
 
 def test_flip():
     src = Tensor.load("testdata/zidane.jpg", PixelFormat.Rgba)
-    dst = Tensor.image(1280, 720)
+    dst = Tensor.image(1280, 720, PixelFormat.Rgba)
     converter = ImageProcessor()
     converter.convert(src, dst, flip=Flip.Horizontal)
 

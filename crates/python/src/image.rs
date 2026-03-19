@@ -92,8 +92,7 @@ pub enum ImageDest3<'py> {
 
 /// Pixel format for image tensors.
 ///
-/// Replaces the legacy `FourCC` enum. Each variant maps directly to an
-/// `edgefirst_tensor::PixelFormat` value.
+/// Each variant maps directly to an `edgefirst_tensor::PixelFormat` value.
 #[pyclass(name = "PixelFormat", eq, eq_int)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PyPixelFormat {
