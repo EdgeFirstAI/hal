@@ -1547,12 +1547,7 @@ mod gl_tests {
 
         // Multiplane PixelFormat::Nv12 (two DMA-BUFs)
         let src_multiplane = load_multiplane_nv12_dma(1280, 720, nv12_bytes);
-        assert!(src_multiplane
-            .as_u8()
-            .unwrap()
-            .as_u8()
-            .unwrap()
-            .is_multiplane());
+        assert!(src_multiplane.as_u8().unwrap().is_multiplane());
 
         let mut gl = GLProcessorThreaded::new(None).unwrap();
 
