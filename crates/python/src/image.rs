@@ -5,7 +5,7 @@ use crate::tensor::PyTensor;
 use edgefirst_hal::{
     decoder::{BoundingBox, DetectBox, Segmentation},
     image::{self, Crop, Flip, ImageProcessorConfig, ImageProcessorTrait, Rect, Rotation},
-    tensor::{self as tensor, PixelFormat, TensorMapTrait, TensorTrait},
+    tensor::{self as tensor, PixelFormat, TensorDyn, TensorMapTrait, TensorTrait},
 };
 
 use ndarray::{
@@ -183,136 +183,133 @@ pub enum Normalization {
     RAW,
 }
 
-// Image-specific methods on PyTensor that depend on numpy types.
-#[pymethods]
-impl PyTensor {
-    #[pyo3(signature = (dst, normalization=Normalization::DEFAULT, zero_point=None))]
-    pub fn normalize_to_numpy(
-        &self,
-        dst: ImageDest3,
-        normalization: Normalization,
-        zero_point: Option<i64>,
-    ) -> crate::image::Result<()> {
-        let _timer = crate::FunctionTimer::new("normalize_to_numpy".to_string());
+/// Normalize image tensor data and write to a numpy array.
+/// Called from PyTensor.normalize_to_numpy() in tensor.rs.
+pub(crate) fn normalize_tensor_to_numpy(
+    tensor_dyn: &TensorDyn,
+    dst: ImageDest3,
+    normalization: Normalization,
+    zero_point: Option<i64>,
+) -> Result<()> {
+    let _timer = crate::FunctionTimer::new("normalize_to_numpy".to_string());
 
-        let tensor_u8 = self
-            .0
-            .as_u8()
-            .ok_or_else(|| Error::Format("Tensor is not U8".to_string()))?;
-        let shape = tensor_u8.shape();
-        let shape = [shape[0], shape[1], shape[2]];
-        let dst_shape = match &dst {
-            ImageDest3::UInt8(dst) => dst.shape(),
-            ImageDest3::Int8(dst) => dst.shape(),
-            ImageDest3::Float16(dst) => dst.shape(),
-            ImageDest3::Float32(dst) => dst.shape(),
-            ImageDest3::Float64(dst) => dst.shape(),
-        }
-        .to_vec();
+    let tensor_u8 = tensor_dyn
+        .as_u8()
+        .ok_or_else(|| Error::Format("Tensor is not U8".to_string()))?;
+    let shape = tensor_u8.shape();
+    let shape = [shape[0], shape[1], shape[2]];
+    let dst_shape = match &dst {
+        ImageDest3::UInt8(dst) => dst.shape(),
+        ImageDest3::Int8(dst) => dst.shape(),
+        ImageDest3::Float16(dst) => dst.shape(),
+        ImageDest3::Float32(dst) => dst.shape(),
+        ImageDest3::Float64(dst) => dst.shape(),
+    }
+    .to_vec();
 
-        if dst_shape[..2] != shape[..2] {
+    if dst_shape[..2] != shape[..2] {
+        return Err(Error::Format(format!(
+            "Shape Mismatch: Expected {:?} but got {:?}",
+            shape, dst_shape
+        )));
+    }
+
+    let fmt = tensor_dyn.format();
+    if fmt == Some(PixelFormat::Rgba) {
+        if dst_shape[2] != 4 && dst_shape[2] != 3 {
             return Err(Error::Format(format!(
                 "Shape Mismatch: Expected {:?} but got {:?}",
                 shape, dst_shape
             )));
         }
-
-        let fmt = self.0.format();
-        if fmt == Some(PixelFormat::Rgba) {
-            if dst_shape[2] != 4 && dst_shape[2] != 3 {
-                return Err(Error::Format(format!(
-                    "Shape Mismatch: Expected {:?} but got {:?}",
-                    shape, dst_shape
-                )));
-            }
-        } else if dst_shape[2] != shape[2] {
-            return Err(Error::Format(format!(
-                "Shape Mismatch: Expected {:?} but got {:?}",
-                shape, dst_shape
-            )));
-        }
-
-        let is_rgba = fmt == Some(PixelFormat::Rgba);
-
-        match dst {
-            ImageDest3::UInt8(mut dst) => normalize_to_uint8(
-                tensor_u8,
-                shape,
-                &mut dst,
-                [dst_shape[0], dst_shape[1], dst_shape[2]],
-                normalization,
-                zero_point,
-                is_rgba,
-            ),
-            ImageDest3::Int8(mut dst) => normalize_to_int8(
-                tensor_u8,
-                shape,
-                &mut dst,
-                [dst_shape[0], dst_shape[1], dst_shape[2]],
-                normalization,
-                zero_point,
-                is_rgba,
-            ),
-            ImageDest3::Float16(mut dst) => normalize_to_float_16(
-                tensor_u8,
-                shape,
-                &mut dst,
-                [dst_shape[0], dst_shape[1], dst_shape[2]],
-                normalization,
-                zero_point,
-                is_rgba,
-            ),
-            ImageDest3::Float32(mut dst) => normalize_to_float_32(
-                tensor_u8,
-                shape,
-                &mut dst,
-                [dst_shape[0], dst_shape[1], dst_shape[2]],
-                normalization,
-                zero_point,
-                is_rgba,
-            ),
-            ImageDest3::Float64(mut dst) => normalize_to_float_64(
-                tensor_u8,
-                shape,
-                &mut dst,
-                [dst_shape[0], dst_shape[1], dst_shape[2]],
-                normalization,
-                zero_point,
-                is_rgba,
-            ),
-        }
+    } else if dst_shape[2] != shape[2] {
+        return Err(Error::Format(format!(
+            "Shape Mismatch: Expected {:?} but got {:?}",
+            shape, dst_shape
+        )));
     }
 
-    pub fn copy_from_numpy(&mut self, src: PyArrayLike3<u8>) -> crate::image::Result<()> {
-        let src = src.as_array();
-        let tensor_u8 = self
-            .0
-            .as_u8()
-            .ok_or_else(|| Error::Format("Tensor is not U8".to_string()))?;
-        let w = tensor_u8
-            .width()
-            .ok_or_else(|| Error::Format("not an image".to_string()))?;
-        let h = tensor_u8
-            .height()
-            .ok_or_else(|| Error::Format("not an image".to_string()))?;
-        let fmt = tensor_u8
-            .format()
-            .ok_or_else(|| Error::Format("not an image".to_string()))?;
-        let shape = [h, w, fmt.channels()];
-        if src.shape() != shape {
-            return Err(Error::Format(format!(
-                "Shape Mismatch: Expected {:?} but got {:?}",
-                shape,
-                src.shape()
-            )));
-        }
+    let is_rgba = fmt == Some(PixelFormat::Rgba);
 
-        let mut map = tensor_u8.map()?;
-        let data = map.as_mut_slice();
-        let mut ndarray = ArrayViewMut3::from_shape(shape, data)?;
-        ndarray.assign(&src);
-        Ok(())
+    match dst {
+        ImageDest3::UInt8(mut dst) => normalize_to_uint8(
+            tensor_u8,
+            shape,
+            &mut dst,
+            [dst_shape[0], dst_shape[1], dst_shape[2]],
+            normalization,
+            zero_point,
+            is_rgba,
+        ),
+        ImageDest3::Int8(mut dst) => normalize_to_int8(
+            tensor_u8,
+            shape,
+            &mut dst,
+            [dst_shape[0], dst_shape[1], dst_shape[2]],
+            normalization,
+            zero_point,
+            is_rgba,
+        ),
+        ImageDest3::Float16(mut dst) => normalize_to_float_16(
+            tensor_u8,
+            shape,
+            &mut dst,
+            [dst_shape[0], dst_shape[1], dst_shape[2]],
+            normalization,
+            zero_point,
+            is_rgba,
+        ),
+        ImageDest3::Float32(mut dst) => normalize_to_float_32(
+            tensor_u8,
+            shape,
+            &mut dst,
+            [dst_shape[0], dst_shape[1], dst_shape[2]],
+            normalization,
+            zero_point,
+            is_rgba,
+        ),
+        ImageDest3::Float64(mut dst) => normalize_to_float_64(
+            tensor_u8,
+            shape,
+            &mut dst,
+            [dst_shape[0], dst_shape[1], dst_shape[2]],
+            normalization,
+            zero_point,
+            is_rgba,
+        ),
     }
+}
+
+/// Copy data from a numpy array into a tensor.
+/// Called from PyTensor.copy_from_numpy() in tensor.rs.
+pub(crate) fn copy_numpy_to_tensor(tensor_dyn: &TensorDyn, src: PyArrayLike3<u8>) -> Result<()> {
+    let src = src.as_array();
+    let tensor_u8 = tensor_dyn
+        .as_u8()
+        .ok_or_else(|| Error::Format("Tensor is not U8".to_string()))?;
+    let w = tensor_u8
+        .width()
+        .ok_or_else(|| Error::Format("not an image".to_string()))?;
+    let h = tensor_u8
+        .height()
+        .ok_or_else(|| Error::Format("not an image".to_string()))?;
+    let fmt = tensor_u8
+        .format()
+        .ok_or_else(|| Error::Format("not an image".to_string()))?;
+    let shape = [h, w, fmt.channels()];
+    if src.shape() != shape {
+        return Err(Error::Format(format!(
+            "Shape Mismatch: Expected {:?} but got {:?}",
+            shape,
+            src.shape()
+        )));
+    }
+
+    let mut map = tensor_u8.map()?;
+    let data = map.as_mut_slice();
+    let mut ndarray = ArrayViewMut3::from_shape(shape, data)?;
+    ndarray.assign(&src);
+    Ok(())
 }
 
 #[inline(always)]

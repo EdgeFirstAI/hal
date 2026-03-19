@@ -60,6 +60,12 @@ impl From<edgefirst_hal::image::Error> for Error {
     }
 }
 
+impl From<crate::image::Error> for Error {
+    fn from(err: crate::image::Error) -> Self {
+        Error::Format(format!("{err}"))
+    }
+}
+
 impl From<Error> for PyErr {
     fn from(err: Error) -> PyErr {
         pyo3::exceptions::PyRuntimeError::new_err(err.to_string())
@@ -488,6 +494,27 @@ impl PyTensor {
             .format()
             .map(|f| f.layout() == PixelLayout::Planar)
             .unwrap_or(false)
+    }
+
+    /// Normalize image data and write to a numpy array.
+    #[pyo3(signature = (dst, normalization=crate::image::Normalization::DEFAULT, zero_point=None))]
+    fn normalize_to_numpy(
+        &self,
+        dst: crate::image::ImageDest3,
+        normalization: crate::image::Normalization,
+        zero_point: Option<i64>,
+    ) -> Result<()> {
+        Ok(crate::image::normalize_tensor_to_numpy(
+            &self.0,
+            dst,
+            normalization,
+            zero_point,
+        )?)
+    }
+
+    /// Copy data from a numpy array into this tensor.
+    fn copy_from_numpy(&mut self, src: numpy::PyArrayLike3<u8>) -> Result<()> {
+        Ok(crate::image::copy_numpy_to_tensor(&self.0, src)?)
     }
 }
 

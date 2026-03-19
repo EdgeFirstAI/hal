@@ -337,18 +337,14 @@ fn main() {
     // Test safe combos first, known GPU-hang combos last (PixelFormat::Nv12→planar on Vivante).
     // Each (input, output) pair — ordered so GPU-hang candidates are last.
     let test_combos: Vec<(PixelFormat, PixelFormat)> = vec![
-        // PixelFormat::Yuyv sources — all safe on Vivante
+        // Yuyv sources — all safe on Vivante
         (PixelFormat::Yuyv, PixelFormat::Rgba),
         (PixelFormat::Yuyv, PixelFormat::Rgb),
-        (PixelFormat::Yuyv, PixelFormat::Rgb),
         (PixelFormat::Yuyv, PixelFormat::PlanarRgb),
-        (PixelFormat::Yuyv, PixelFormat::PlanarRgb),
-        // PixelFormat::Nv12 sources — packed/PixelFormat::Rgba are safe, planar may hang
+        // Nv12 sources — packed/Rgba are safe, planar may hang
         (PixelFormat::Nv12, PixelFormat::Rgba),
         (PixelFormat::Nv12, PixelFormat::Rgb),
-        (PixelFormat::Nv12, PixelFormat::Rgb),
-        // PixelFormat::Nv12 → planar: KNOWN GPU HANG RISK on Vivante GC7000UL
-        (PixelFormat::Nv12, PixelFormat::PlanarRgb),
+        // Nv12 → planar: KNOWN GPU HANG RISK on Vivante GC7000UL
         (PixelFormat::Nv12, PixelFormat::PlanarRgb),
     ];
     let resolutions = [(1920, 1080, "1080p"), (1280, 720, "720p")];
