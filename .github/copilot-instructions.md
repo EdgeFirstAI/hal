@@ -346,7 +346,7 @@ crates/
 - Enum variants: PascalCase (e.g., `DmaTensor`, `ShmTensor`, `MemTensor`)
 
 **Python Wrapper Types:**
-- Use `Py` prefix: `PyTensor`, `PyTensorImage`, `PyPixelFormat`, `PyImageProcessor`
+- Use `Py` prefix: `PyTensor`, `PyPixelFormat`, `PyImageProcessor`
 - Located in `crates/python/src/`
 
 ### Memory Management Pattern
