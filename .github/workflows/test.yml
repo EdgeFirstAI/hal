@@ -57,6 +57,11 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   PYTHON_VERSION: '3.11'
+  # Pin Rust toolchain versions to ensure profraw format compatibility across
+  # jobs (build-arm produces instrumented binaries, process-hardware-coverage
+  # merges profraw files — both must use the same LLVM version).
+  RUST_STABLE_VERSION: '1.94.0'
+  RUST_NIGHTLY_VERSION: 'nightly-2026-03-15'
 
 jobs:
   # ===========================================================================
@@ -102,7 +107,7 @@ jobs:
       - name: Set up Rust stable toolchain
         uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE_VERSION }}
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5  # v2.8.2
@@ -159,13 +164,13 @@ jobs:
       - name: Set up Rust stable toolchain
         uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE_VERSION }}
           components: llvm-tools-preview, clippy, rustfmt
 
       - name: Set up Rust nightly toolchain (for Python builds)
         uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # nightly
         with:
-          toolchain: nightly
+          toolchain: ${{ env.RUST_NIGHTLY_VERSION }}
           components: llvm-tools-preview, rustfmt, clippy
 
       - name: Cache Rust dependencies
@@ -305,7 +310,7 @@ jobs:
       - name: Set up Rust stable toolchain
         uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE_VERSION }}
           components: clippy, rustfmt
 
       - name: Cache Rust dependencies
@@ -395,13 +400,13 @@ jobs:
       - name: Set up Rust stable toolchain
         uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE_VERSION }}
           components: llvm-tools-preview, clippy, rustfmt
 
       - name: Set up Rust nightly toolchain (for Python builds)
         uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # nightly
         with:
-          toolchain: nightly
+          toolchain: ${{ env.RUST_NIGHTLY_VERSION }}
           components: llvm-tools-preview, rustfmt, clippy
 
       - name: Cache Rust dependencies
@@ -560,7 +565,7 @@ jobs:
       - name: Set up Rust stable toolchain
         uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE_VERSION }}
           components: llvm-tools-preview
 
       - name: Run pre-built Rust tests
@@ -907,7 +912,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE_VERSION }}
           components: llvm-tools-preview
 
       - name: Process Rust profraw files
