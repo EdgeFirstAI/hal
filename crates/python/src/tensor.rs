@@ -6,8 +6,9 @@ use edgefirst_hal::tensor::{self, DType, TensorDyn, TensorMapTrait, TensorMemory
 use pyo3::ffi::Py_buffer;
 use pyo3::{exceptions::PyBufferError, ffi::PyMemoryView_FromMemory, prelude::*};
 
+use std::ffi::c_void;
 #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
-use std::ffi::{c_int, c_void, CString};
+use std::ffi::{c_int, CString};
 #[cfg(unix)]
 use std::os::fd::{IntoRawFd, RawFd};
 
