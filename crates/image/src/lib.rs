@@ -1663,7 +1663,7 @@ mod image_tests {
     }
 
     #[test]
-    fn test_invalid_jpeg_fourcc() -> Result<(), Error> {
+    fn test_invalid_jpeg_format() -> Result<(), Error> {
         let result = crate::load_image(&[123; 5000], Some(PixelFormat::Yuyv), None);
         assert!(matches!(
             result,
@@ -2015,7 +2015,7 @@ mod image_tests {
     }
 
     #[test]
-    fn test_invalid_format_fourcc() {
+    fn test_invalid_pixel_format() {
         // PixelFormat::from_fourcc returns None for unknown formats,
         // so TensorDyn::image cannot be called with an invalid format.
         assert!(PixelFormat::from_fourcc(u32::from_le_bytes(*b"TEST")).is_none());
@@ -4443,11 +4443,11 @@ mod image_tests {
     fn load_bytes_to_tensor(
         width: usize,
         height: usize,
-        fourcc: PixelFormat,
+        format: PixelFormat,
         memory: Option<TensorMemory>,
         bytes: &[u8],
     ) -> Result<TensorDyn, Error> {
-        let src = TensorDyn::image(width, height, fourcc, DType::U8, memory)?;
+        let src = TensorDyn::image(width, height, format, DType::U8, memory)?;
         src.as_u8()
             .unwrap()
             .map()?
@@ -4659,7 +4659,7 @@ mod image_tests {
     // =========================================================================
 
     #[test]
-    fn test_nv12_tensor_image_creation() {
+    fn test_nv12_image_creation() {
         let width = 640;
         let height = 480;
         let img = TensorDyn::image(width, height, PixelFormat::Nv12, DType::U8, None).unwrap();
@@ -4679,7 +4679,7 @@ mod image_tests {
     }
 
     // =========================================================================
-    // Tensor Format Metadata Tests (replaces TensorImageRef / FourCC tests)
+    // Tensor Format Metadata Tests
     // =========================================================================
 
     #[test]
@@ -4771,7 +4771,7 @@ mod image_tests {
 
     #[test]
     fn test_dtype_determines_int8() {
-        // DType::I8 indicates int8 data — replaces fourcc_is_int8
+        // DType::I8 indicates int8 data
         let u8_img = TensorDyn::image(64, 64, PixelFormat::Rgb, DType::U8, None).unwrap();
         let i8_img = TensorDyn::image(64, 64, PixelFormat::Rgb, DType::I8, None).unwrap();
         assert_eq!(u8_img.dtype(), DType::U8);
@@ -4780,7 +4780,7 @@ mod image_tests {
 
     #[test]
     fn test_pixel_layout_packed_vs_planar() {
-        // Replaces fourcc_is_packed_rgb
+        // Packed vs planar layout classification
         assert_eq!(PixelFormat::Rgb.layout(), PixelLayout::Packed);
         assert_eq!(PixelFormat::Rgba.layout(), PixelLayout::Packed);
         assert_eq!(PixelFormat::PlanarRgb.layout(), PixelLayout::Planar);
@@ -4902,7 +4902,7 @@ mod image_tests {
     }
 
     #[test]
-    fn test_tensor_image_bgra() {
+    fn test_image_bgra() {
         let img = TensorDyn::image(
             640,
             480,

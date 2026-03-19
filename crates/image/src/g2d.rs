@@ -721,11 +721,11 @@ mod g2d_tests {
     fn load_raw_image(
         width: usize,
         height: usize,
-        fourcc: PixelFormat,
+        format: PixelFormat,
         memory: Option<TensorMemory>,
         bytes: &[u8],
     ) -> Result<TensorDyn, crate::Error> {
-        let img = TensorDyn::image(width, height, fourcc, DType::U8, memory)?;
+        let img = TensorDyn::image(width, height, format, DType::U8, memory)?;
         let mut map = img.as_u8().unwrap().map()?;
         map.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
         Ok(img)
