@@ -123,6 +123,27 @@ impl TensorDyn {
         dispatch!(self, height)
     }
 
+    /// Return the total size of this tensor in bytes.
+    pub fn size(&self) -> usize {
+        dispatch!(self, size)
+    }
+
+    /// Return the memory allocation type.
+    pub fn memory(&self) -> TensorMemory {
+        dispatch!(self, memory)
+    }
+
+    /// Reshape this tensor. Total element count must remain the same.
+    pub fn reshape(&mut self, shape: &[usize]) -> crate::Result<()> {
+        dispatch!(self, reshape, shape)
+    }
+
+    /// Clone the file descriptor associated with this tensor.
+    #[cfg(unix)]
+    pub fn clone_fd(&self) -> crate::Result<std::os::fd::OwnedFd> {
+        dispatch!(self, clone_fd)
+    }
+
     /// Return `true` if this tensor uses separate plane allocations.
     pub fn is_multiplane(&self) -> bool {
         dispatch!(self, is_multiplane)
@@ -141,6 +162,51 @@ impl TensorDyn {
     downcast_methods!(F16, f16, as_f16, as_f16_mut, into_f16);
     downcast_methods!(F32, f32, as_f32, as_f32_mut, into_f32);
     downcast_methods!(F64, f64, as_f64, as_f64_mut, into_f64);
+
+    /// Create a type-erased tensor with the given shape and element type.
+    pub fn new(
+        shape: &[usize],
+        dtype: DType,
+        memory: Option<TensorMemory>,
+        name: Option<&str>,
+    ) -> crate::Result<Self> {
+        match dtype {
+            DType::U8 => Tensor::<u8>::new(shape, memory, name).map(Self::U8),
+            DType::I8 => Tensor::<i8>::new(shape, memory, name).map(Self::I8),
+            DType::U16 => Tensor::<u16>::new(shape, memory, name).map(Self::U16),
+            DType::I16 => Tensor::<i16>::new(shape, memory, name).map(Self::I16),
+            DType::U32 => Tensor::<u32>::new(shape, memory, name).map(Self::U32),
+            DType::I32 => Tensor::<i32>::new(shape, memory, name).map(Self::I32),
+            DType::U64 => Tensor::<u64>::new(shape, memory, name).map(Self::U64),
+            DType::I64 => Tensor::<i64>::new(shape, memory, name).map(Self::I64),
+            DType::F16 => Tensor::<f16>::new(shape, memory, name).map(Self::F16),
+            DType::F32 => Tensor::<f32>::new(shape, memory, name).map(Self::F32),
+            DType::F64 => Tensor::<f64>::new(shape, memory, name).map(Self::F64),
+        }
+    }
+
+    /// Create a type-erased tensor from a file descriptor.
+    #[cfg(unix)]
+    pub fn from_fd(
+        fd: std::os::fd::OwnedFd,
+        shape: &[usize],
+        dtype: DType,
+        name: Option<&str>,
+    ) -> crate::Result<Self> {
+        match dtype {
+            DType::U8 => Tensor::<u8>::from_fd(fd, shape, name).map(Self::U8),
+            DType::I8 => Tensor::<i8>::from_fd(fd, shape, name).map(Self::I8),
+            DType::U16 => Tensor::<u16>::from_fd(fd, shape, name).map(Self::U16),
+            DType::I16 => Tensor::<i16>::from_fd(fd, shape, name).map(Self::I16),
+            DType::U32 => Tensor::<u32>::from_fd(fd, shape, name).map(Self::U32),
+            DType::I32 => Tensor::<i32>::from_fd(fd, shape, name).map(Self::I32),
+            DType::U64 => Tensor::<u64>::from_fd(fd, shape, name).map(Self::U64),
+            DType::I64 => Tensor::<i64>::from_fd(fd, shape, name).map(Self::I64),
+            DType::F16 => Tensor::<f16>::from_fd(fd, shape, name).map(Self::F16),
+            DType::F32 => Tensor::<f32>::from_fd(fd, shape, name).map(Self::F32),
+            DType::F64 => Tensor::<f64>::from_fd(fd, shape, name).map(Self::F64),
+        }
+    }
 
     /// Create a type-erased image tensor.
     ///

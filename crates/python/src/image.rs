@@ -1,14 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
-    tensor::{PyTensorMap, PyTensorMemory, TensorMapT},
-    FunctionTimer,
-};
+use crate::tensor::PyTensor;
 use edgefirst_hal::{
     decoder::{BoundingBox, DetectBox, Segmentation},
     image::{self, Crop, Flip, ImageProcessorConfig, ImageProcessorTrait, Rect, Rotation},
-    tensor::{self, DType, PixelFormat, PixelLayout, TensorDyn, TensorMapTrait, TensorTrait},
+    tensor::{self as tensor, PixelFormat, TensorMapTrait, TensorTrait},
 };
 
 use ndarray::{
@@ -22,8 +19,6 @@ use numpy::{
     PyUntypedArrayMethods,
 };
 use pyo3::prelude::*;
-#[cfg(target_os = "linux")]
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::{
     fmt::{self},
     sync::Mutex,
@@ -189,81 +184,22 @@ pub enum Normalization {
     RAW,
 }
 
-#[pyclass(name = "TensorImage")]
-pub struct PyTensorImage(pub(crate) TensorDyn);
-
+// Image-specific methods on PyTensor that depend on numpy types.
 #[pymethods]
-impl PyTensorImage {
-    #[new]
-    #[pyo3(signature = (width, height, format = PyPixelFormat::Rgba, mem = None))]
-    pub fn new(
-        width: usize,
-        height: usize,
-        format: PyPixelFormat,
-        mem: Option<PyTensorMemory>,
-    ) -> Result<Self> {
-        let fmt: PixelFormat = format.into();
-        let memory = mem.map(|x| x.into());
-        let tensor = TensorDyn::image(width, height, fmt, DType::U8, memory)?;
-        Ok(PyTensorImage(tensor))
-    }
-
-    #[cfg(target_os = "linux")]
-    #[staticmethod]
-    #[pyo3(signature = (fd, shape, format))]
-    pub fn from_fd(fd: RawFd, shape: Vec<usize>, format: PyPixelFormat) -> Result<Self> {
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let mut tensor = tensor::Tensor::<u8>::from_fd(fd, &shape, None)?;
-        tensor.set_format(format.into())?;
-        Ok(PyTensorImage(TensorDyn::from(tensor)))
-    }
-
-    #[staticmethod]
-    #[pyo3(signature = (data, format = Some(PyPixelFormat::Rgba), mem = None))]
-    pub fn load_from_bytes(
-        data: &[u8],
-        format: Option<PyPixelFormat>,
-        mem: Option<PyTensorMemory>,
-    ) -> Result<Self> {
-        let fmt = format.map(|f| f.into());
-        let memory = mem.map(|x| x.into());
-        let tensor = image::load_image(data, fmt, memory)?;
-        Ok(PyTensorImage(tensor))
-    }
-
-    #[staticmethod]
-    #[pyo3(signature = (filename, format = Some(PyPixelFormat::Rgba), mem = None))]
-    pub fn load(
-        filename: &str,
-        format: Option<PyPixelFormat>,
-        mem: Option<PyTensorMemory>,
-    ) -> Result<Self> {
-        let fmt = format.map(|f| f.into());
-        let data = std::fs::read(filename)?;
-        let memory = mem.map(|x| x.into());
-        let tensor = image::load_image(&data, fmt, memory)?;
-        Ok(PyTensorImage(tensor))
-    }
-
-    #[pyo3(signature = (filename, quality=80))]
-    pub fn save_jpeg(&self, filename: &str, quality: u8) -> Result<()> {
-        image::save_jpeg(&self.0, filename, quality)?;
-        Ok(())
-    }
-
+impl PyTensor {
     #[pyo3(signature = (dst, normalization=Normalization::DEFAULT, zero_point=None))]
     pub fn normalize_to_numpy(
         &self,
         dst: ImageDest3,
         normalization: Normalization,
         zero_point: Option<i64>,
-    ) -> Result<()> {
-        let _timer = FunctionTimer::new("normalize_to_numpy".to_string());
+    ) -> crate::image::Result<()> {
+        let _timer = crate::FunctionTimer::new("normalize_to_numpy".to_string());
 
         let tensor_u8 = self
             .0
             .as_u8()
-            .ok_or_else(|| Error::Format("TensorImage is not U8".to_string()))?;
+            .ok_or_else(|| Error::Format("Tensor is not U8".to_string()))?;
         let shape = tensor_u8.shape();
         let shape = [shape[0], shape[1], shape[2]];
         let dst_shape = match &dst {
@@ -348,12 +284,12 @@ impl PyTensorImage {
         }
     }
 
-    pub fn copy_from_numpy(&mut self, src: PyArrayLike3<u8>) -> Result<()> {
+    pub fn copy_from_numpy(&mut self, src: PyArrayLike3<u8>) -> crate::image::Result<()> {
         let src = src.as_array();
         let tensor_u8 = self
             .0
             .as_u8()
-            .ok_or_else(|| Error::Format("TensorImage is not U8".to_string()))?;
+            .ok_or_else(|| Error::Format("Tensor is not U8".to_string()))?;
         let w = tensor_u8
             .width()
             .ok_or_else(|| Error::Format("not an image".to_string()))?;
@@ -377,47 +313,6 @@ impl PyTensorImage {
         let mut ndarray = ArrayViewMut3::from_shape(shape, data)?;
         ndarray.assign(&src);
         Ok(())
-    }
-
-    #[getter]
-    pub fn format(&self) -> Result<PyPixelFormat> {
-        let fmt = self
-            .0
-            .format()
-            .ok_or_else(|| Error::Format("tensor has no pixel format".to_string()))?;
-        PyPixelFormat::try_from(fmt)
-    }
-
-    #[getter]
-    pub fn width(&self) -> Result<usize> {
-        self.0
-            .width()
-            .ok_or_else(|| Error::Format("not an image".to_string()))
-    }
-
-    #[getter]
-    pub fn height(&self) -> Result<usize> {
-        self.0
-            .height()
-            .ok_or_else(|| Error::Format("not an image".to_string()))
-    }
-
-    #[getter]
-    pub fn is_planar(&self) -> bool {
-        self.0
-            .format()
-            .map(|f| f.layout() == PixelLayout::Planar)
-            .unwrap_or(false)
-    }
-
-    pub fn map(&self) -> Result<PyTensorMap> {
-        let tensor_u8 = self
-            .0
-            .as_u8()
-            .ok_or_else(|| Error::Format("TensorImage is not U8".to_string()))?;
-        Ok(PyTensorMap {
-            mapped: Some(tensor_u8.map().map(TensorMapT::TensorU8)?),
-        })
     }
 }
 
@@ -1005,8 +900,8 @@ impl PyImageProcessor {
     #[pyo3(signature = (src, dst, rotation = PyRotation::Rotate0, flip = PyFlip::NoFlip, src_crop = None, dst_crop = None, dst_color = None))]
     pub fn convert(
         &mut self,
-        src: &PyTensorImage,
-        dst: &mut PyTensorImage,
+        src: &PyTensor,
+        dst: &mut PyTensor,
         rotation: PyRotation,
         flip: PyFlip,
         src_crop: Option<PyRect>,
@@ -1031,7 +926,7 @@ impl PyImageProcessor {
     #[pyo3(signature = (dst, bbox, scores, classes, seg=vec![]))]
     pub fn draw_masks(
         &mut self,
-        dst: &mut PyTensorImage,
+        dst: &mut PyTensor,
         bbox: PyReadonlyArray2<f32>,
         scores: PyReadonlyArray1<f32>,
         classes: PyReadonlyArray1<usize>,
@@ -1117,14 +1012,14 @@ impl PyImageProcessor {
         width: usize,
         height: usize,
         format: PyPixelFormat,
-    ) -> Result<PyTensorImage> {
+    ) -> Result<PyTensor> {
         let fmt: PixelFormat = format.into();
         let dyn_tensor = self
             .0
             .lock()
             .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?
             .create_image(width, height, fmt, None)?;
-        Ok(PyTensorImage(dyn_tensor))
+        Ok(PyTensor(dyn_tensor))
     }
 
     pub fn set_class_colors(&mut self, colors: Vec<[u8; 4]>) -> Result<()> {
