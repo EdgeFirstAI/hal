@@ -309,9 +309,9 @@ mod g2d_tests {
             ] {
                 let res = test_g2d_format_no_resize_(i, o);
                 if let Err(e) = res {
-                    println!("{} to {} failed: {e:?}", i.display(), o.display());
+                    println!("{i} to {o} failed: {e:?}");
                 } else {
-                    println!("{} to {} success", i.display(), o.display());
+                    println!("{i} to {o} success");
                 }
             }
         }
@@ -388,7 +388,7 @@ mod g2d_tests {
             &src,
             &cpu_dst,
             0.98,
-            &format!("{}_to_{}", g2d_in_fmt.display(), g2d_out_fmt.display()),
+            &format!("{g2d_in_fmt}_to_{g2d_out_fmt}"),
         )
     }
 
@@ -410,9 +410,9 @@ mod g2d_tests {
             ] {
                 let res = test_g2d_format_with_resize_(i, o);
                 if let Err(e) = res {
-                    println!("{} to {} failed: {e:?}", i.display(), o.display());
+                    println!("{i} to {o} failed: {e:?}");
                 } else {
-                    println!("{} to {} success", i.display(), o.display());
+                    println!("{i} to {o} success");
                 }
             }
         }
@@ -436,9 +436,9 @@ mod g2d_tests {
             ] {
                 let res = test_g2d_format_with_resize_dst_crop(i, o);
                 if let Err(e) = res {
-                    println!("{} to {} failed: {e:?}", i.display(), o.display());
+                    println!("{i} to {o} failed: {e:?}");
                 } else {
-                    println!("{} to {} success", i.display(), o.display());
+                    println!("{i} to {o} success");
                 }
             }
         }
@@ -530,11 +530,7 @@ mod g2d_tests {
             &reference,
             &cpu_dst,
             0.98,
-            &format!(
-                "{}_to_{}_resized",
-                g2d_in_fmt.display(),
-                g2d_out_fmt.display()
-            ),
+            &format!("{g2d_in_fmt}_to_{g2d_out_fmt}_resized"),
         )
     }
 
@@ -642,11 +638,7 @@ mod g2d_tests {
             &reference,
             &cpu_dst,
             0.98,
-            &format!(
-                "{}_to_{}_resized_dst_crop",
-                g2d_in_fmt.display(),
-                g2d_out_fmt.display()
-            ),
+            &format!("{g2d_in_fmt}_to_{g2d_out_fmt}_resized_dst_crop"),
         )
     }
 
@@ -1023,7 +1015,7 @@ mod g2d_tests {
             PixelFormat::Bgra,
         ] {
             test_g2d_bgra_no_resize_(src_fmt).unwrap_or_else(|e| {
-                panic!("{} to PixelFormat::Bgra failed: {e:?}", src_fmt.display());
+                panic!("{src_fmt} to PixelFormat::Bgra failed: {e:?}");
             });
         }
     }
@@ -1142,28 +1134,20 @@ mod g2d_tests {
             .enumerate()
         {
             assert_eq!(
-                bc[0],
-                rc[2],
-                "{} to PixelFormat::Bgra: pixel {i} B mismatch",
-                g2d_in_fmt.display()
+                bc[0], rc[2],
+                "{g2d_in_fmt} to PixelFormat::Bgra: pixel {i} B mismatch",
             );
             assert_eq!(
-                bc[1],
-                rc[1],
-                "{} to PixelFormat::Bgra: pixel {i} G mismatch",
-                g2d_in_fmt.display()
+                bc[1], rc[1],
+                "{g2d_in_fmt} to PixelFormat::Bgra: pixel {i} G mismatch",
             );
             assert_eq!(
-                bc[2],
-                rc[0],
-                "{} to PixelFormat::Bgra: pixel {i} R mismatch",
-                g2d_in_fmt.display()
+                bc[2], rc[0],
+                "{g2d_in_fmt} to PixelFormat::Bgra: pixel {i} R mismatch",
             );
             assert_eq!(
-                bc[3],
-                rc[3],
-                "{} to PixelFormat::Bgra: pixel {i} A mismatch",
-                g2d_in_fmt.display()
+                bc[3], rc[3],
+                "{g2d_in_fmt} to PixelFormat::Bgra: pixel {i} A mismatch",
             );
         }
         Ok(())

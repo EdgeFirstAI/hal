@@ -5,7 +5,7 @@ import pytest
 import os
 import math
 
-from edgefirst_hal import TensorImage, ImageProcessor, Flip, FourCC, Rotation
+from edgefirst_hal import TensorImage, ImageProcessor, Flip, PixelFormat, Rotation
 import numpy as np
 
 pytestmark = pytest.mark.benchmark
@@ -78,8 +78,8 @@ finally:
 def test_resize_cpu_rgba_to_rgba(benchmark):
     """Benchmark CPU RGBA to RGBA resize."""
 
-    src = TensorImage.load("testdata/zidane.jpg", FourCC.RGBA)
-    dst = TensorImage(*dst_size, FourCC.RGBA)
+    src = TensorImage.load("testdata/zidane.jpg", PixelFormat.RGBA)
+    dst = TensorImage(*dst_size, PixelFormat.RGBA)
 
     benchmark(cpu_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
 
@@ -96,9 +96,9 @@ def test_resize_cv2_rgba_to_rgba(benchmark):
     """Benchmark CV2 RGBA to RGBA resize."""
     cv2 = pytest.importorskip("cv2")
 
-    src = TensorImage.load("testdata/zidane.jpg", FourCC.RGBA)
-    dst_cv2 = TensorImage(*dst_size, FourCC.RGBA)
-    dst = TensorImage(*dst_size, FourCC.RGBA)
+    src = TensorImage.load("testdata/zidane.jpg", PixelFormat.RGBA)
+    dst_cv2 = TensorImage(*dst_size, PixelFormat.RGBA)
+    dst = TensorImage(*dst_size, PixelFormat.RGBA)
 
     def resize(arr, size, dst):
         cv2.resize(arr, size, dst=dst)
@@ -128,8 +128,8 @@ def test_resize_cv2_rgba_to_rgba(benchmark):
 @pytest.mark.benchmark(group="rgba_to_rgba", warmup_iterations=3)
 def test_resize_gl_rgba_to_rgba(benchmark):
     """Benchmark GL RGBA to RGBA resize."""
-    src = TensorImage.load("testdata/zidane.jpg", FourCC.RGBA)
-    dst = TensorImage(*dst_size, FourCC.RGBA)
+    src = TensorImage.load("testdata/zidane.jpg", PixelFormat.RGBA)
+    dst = TensorImage(*dst_size, PixelFormat.RGBA)
 
     try:
         gl_processor.convert(src, dst, Rotation.Rotate0, Flip.NoFlip)
@@ -150,8 +150,8 @@ def test_resize_gl_rgba_to_rgba(benchmark):
 def test_resize_g2d_rgba_to_rgba(benchmark):
     """Benchmark G2D RGBA to RGBA resize."""
 
-    src = TensorImage.load("testdata/zidane.jpg", FourCC.RGBA)
-    dst = TensorImage(*dst_size, FourCC.RGBA)
+    src = TensorImage.load("testdata/zidane.jpg", PixelFormat.RGBA)
+    dst = TensorImage(*dst_size, PixelFormat.RGBA)
 
     try:
         g2d_processor.convert(src, dst, Rotation.Rotate0, Flip.NoFlip)
@@ -172,8 +172,8 @@ def test_resize_g2d_rgba_to_rgba(benchmark):
 def test_resize_cpu_rgba_to_rgb(benchmark):
     """Benchmark CPU RGBA to RGB resize."""
 
-    src = TensorImage.load("testdata/zidane.jpg", FourCC.RGBA)
-    dst = TensorImage(*dst_size, FourCC.RGB)
+    src = TensorImage.load("testdata/zidane.jpg", PixelFormat.RGBA)
+    dst = TensorImage(*dst_size, PixelFormat.RGB)
 
     benchmark(cpu_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
     with dst.map() as d:
@@ -189,9 +189,9 @@ def test_resize_cv2_rgba_to_rgb(benchmark):
     """Benchmark CV2 RGBA to RGB resize."""
     cv2 = pytest.importorskip("cv2")
 
-    src = TensorImage.load("testdata/zidane.jpg", FourCC.RGBA)
-    dst_cv2 = TensorImage(*dst_size, FourCC.RGB)
-    dst = TensorImage(*dst_size, FourCC.RGB)
+    src = TensorImage.load("testdata/zidane.jpg", PixelFormat.RGBA)
+    dst_cv2 = TensorImage(*dst_size, PixelFormat.RGB)
+    dst = TensorImage(*dst_size, PixelFormat.RGB)
 
     tmp = np.zeros((src.height, src.width, 3), dtype=np.uint8)
 
@@ -224,8 +224,8 @@ def test_resize_cv2_rgba_to_rgb(benchmark):
 @pytest.mark.benchmark(group="rgba_to_rgb", warmup_iterations=3)
 def test_resize_g2d_rgba_to_rgb(benchmark):
     """Benchmark G2D RGBA to RGB resize."""
-    src = TensorImage.load("testdata/zidane.jpg", FourCC.RGBA)
-    dst = TensorImage(*dst_size, FourCC.RGB)
+    src = TensorImage.load("testdata/zidane.jpg", PixelFormat.RGBA)
+    dst = TensorImage(*dst_size, PixelFormat.RGB)
 
     try:
         g2d_processor.convert(src, dst, Rotation.Rotate0, Flip.NoFlip)
@@ -250,12 +250,12 @@ def test_resize_cpu_yuyv_to_rgba(benchmark):
     with open("testdata/camera720p.rgba", "rb") as f:
         expected_bytes = f.read()
 
-    src = TensorImage(1280, 720, FourCC("YUYV"))
+    src = TensorImage(1280, 720, PixelFormat("YUYV"))
     src_array = np.frombuffer(data, dtype=np.uint8)
     with src.map() as m:
         np.frombuffer(m.view(), dtype=np.uint8)[:] = src_array
 
-    dst = TensorImage(*dst_size, FourCC.RGBA)
+    dst = TensorImage(*dst_size, PixelFormat.RGBA)
 
     benchmark(cpu_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
     with dst.map() as d:
@@ -274,13 +274,13 @@ def test_resize_cv2_yuyv_to_rgba(benchmark):
     with open("testdata/camera720p.yuyv", "rb") as f:
         data = f.read()
 
-    src = TensorImage(1280, 720, FourCC("YUYV"))
+    src = TensorImage(1280, 720, PixelFormat("YUYV"))
     src_array = np.frombuffer(data, dtype=np.uint8)
     with src.map() as m:
         np.frombuffer(m.view(), dtype=np.uint8)[:] = src_array
 
-    dst_cv2 = TensorImage(*dst_size, FourCC.RGBA)
-    dst = TensorImage(*dst_size, FourCC.RGBA)
+    dst_cv2 = TensorImage(*dst_size, PixelFormat.RGBA)
+    dst = TensorImage(*dst_size, PixelFormat.RGBA)
 
     tmp = np.zeros((src.height, src.width, 4), dtype=np.uint8)
 
@@ -319,12 +319,12 @@ def test_resize_gl_yuyv_to_rgba(benchmark):
     with open("testdata/camera720p.rgba", "rb") as f:
         expected_bytes = f.read()
 
-    src = TensorImage(1280, 720, FourCC("YUYV"))
+    src = TensorImage(1280, 720, PixelFormat("YUYV"))
     src_array = np.frombuffer(data, dtype=np.uint8)
     with src.map() as m:
         np.frombuffer(m.view(), dtype=np.uint8)[:] = src_array
 
-    dst = TensorImage(*dst_size, FourCC.RGBA)
+    dst = TensorImage(*dst_size, PixelFormat.RGBA)
 
     try:
         gl_processor.convert(src, dst, Rotation.Rotate0, Flip.NoFlip)
@@ -349,12 +349,12 @@ def test_resize_g2d_yuyv_to_rgba(benchmark):
     with open("testdata/camera720p.rgba", "rb") as f:
         expected_bytes = f.read()
 
-    src = TensorImage(1280, 720, FourCC("YUYV"))
+    src = TensorImage(1280, 720, PixelFormat("YUYV"))
     src_array = np.frombuffer(data, dtype=np.uint8)
     with src.map() as m:
         np.frombuffer(m.view(), dtype=np.uint8)[:] = src_array
 
-    dst = TensorImage(*dst_size, FourCC.RGBA)
+    dst = TensorImage(*dst_size, PixelFormat.RGBA)
 
     try:
         g2d_processor.convert(src, dst, Rotation.Rotate0, Flip.NoFlip)
@@ -379,12 +379,12 @@ def test_resize_cpu_yuyv_to_rgb(benchmark):
     with open("testdata/camera720p.rgb", "rb") as f:
         expected_bytes = f.read()
 
-    src = TensorImage(1280, 720, FourCC("YUYV"))
+    src = TensorImage(1280, 720, PixelFormat("YUYV"))
     src_array = np.frombuffer(data, dtype=np.uint8)
     with src.map() as m:
         np.frombuffer(m.view(), dtype=np.uint8)[:] = src_array
 
-    dst = TensorImage(*dst_size, FourCC.RGB)
+    dst = TensorImage(*dst_size, PixelFormat.RGB)
 
     benchmark(cpu_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
     with dst.map() as d:
@@ -403,13 +403,13 @@ def test_resize_cv2_yuyv_to_rgb(benchmark):
     with open("testdata/camera720p.yuyv", "rb") as f:
         data = f.read()
 
-    src = TensorImage(1280, 720, FourCC("YUYV"))
+    src = TensorImage(1280, 720, PixelFormat("YUYV"))
     src_array = np.frombuffer(data, dtype=np.uint8)
     with src.map() as m:
         np.frombuffer(m.view(), dtype=np.uint8)[:] = src_array
 
-    dst_cv2 = TensorImage(*dst_size, FourCC.RGB)
-    dst = TensorImage(*dst_size, FourCC.RGB)
+    dst_cv2 = TensorImage(*dst_size, PixelFormat.RGB)
+    dst = TensorImage(*dst_size, PixelFormat.RGB)
 
     tmp = np.zeros((src.height, src.width, 3), dtype=np.uint8)
 
@@ -448,12 +448,12 @@ def test_resize_g2d_yuyv_to_rgb(benchmark):
     with open("testdata/camera720p.rgb", "rb") as f:
         expected_bytes = f.read()
 
-    src = TensorImage(1280, 720, FourCC("YUYV"))
+    src = TensorImage(1280, 720, PixelFormat("YUYV"))
     src_array = np.frombuffer(data, dtype=np.uint8)
     with src.map() as m:
         np.frombuffer(m.view(), dtype=np.uint8)[:] = src_array
 
-    dst = TensorImage(*dst_size, FourCC.RGB)
+    dst = TensorImage(*dst_size, PixelFormat.RGB)
 
     try:
         g2d_processor.convert(src, dst, Rotation.Rotate0, Flip.NoFlip)
@@ -474,14 +474,14 @@ def test_load_jpeg_person(benchmark):
     with open("testdata/person.jpg", "rb") as f:
         data = f.read()
 
-    benchmark(TensorImage.load_from_bytes, data, FourCC.RGBA)
+    benchmark(TensorImage.load_from_bytes, data, PixelFormat.RGBA)
 
 
 def test_load_jpeg_zidane(benchmark):
     """Benchmark JPEG loading for zidane.jpg."""
     with open("testdata/zidane.jpg", "rb") as f:
         data = f.read()
-    benchmark(TensorImage.load_from_bytes, data, FourCC.RGBA)
+    benchmark(TensorImage.load_from_bytes, data, PixelFormat.RGBA)
 
 
 @pytest.mark.benchmark(group="rotate_90", warmup_iterations=3)
@@ -490,8 +490,8 @@ def test_cpu_rotate_90(benchmark):
     with open("testdata/zidane.jpg", "rb") as f:
         data = f.read()
 
-    src = TensorImage.load_from_bytes(data, FourCC.RGBA)
-    dst = TensorImage(src.height, src.width, FourCC.RGBA)
+    src = TensorImage.load_from_bytes(data, PixelFormat.RGBA)
+    dst = TensorImage(src.height, src.width, PixelFormat.RGBA)
 
     benchmark(cpu_processor.convert, src, dst, Rotation.Clockwise90, Flip.NoFlip)
     expected = load_image(
@@ -512,8 +512,8 @@ def test_cv2_rotate_90(benchmark):
     """Benchmark OpenCV 90 degree rotation."""
     cv2 = pytest.importorskip("cv2")
 
-    src = TensorImage.load("testdata/zidane.jpg", FourCC.RGBA)
-    dst = TensorImage(src.height, src.width, FourCC.RGBA)
+    src = TensorImage.load("testdata/zidane.jpg", PixelFormat.RGBA)
+    dst = TensorImage(src.height, src.width, PixelFormat.RGBA)
 
     with src.map() as m, dst.map() as d:
         arr_src = np.frombuffer(m.view(), dtype=np.uint8).reshape(
@@ -547,8 +547,8 @@ def test_gl_rotate_90(benchmark):
     with open("testdata/zidane.jpg", "rb") as f:
         data = f.read()
 
-    src = TensorImage.load_from_bytes(data, FourCC.RGBA)
-    dst = TensorImage(src.height, src.width, FourCC.RGBA)
+    src = TensorImage.load_from_bytes(data, PixelFormat.RGBA)
+    dst = TensorImage(src.height, src.width, PixelFormat.RGBA)
 
     try:
         gl_processor.convert(src, dst, Rotation.Clockwise90, Flip.NoFlip)
@@ -575,8 +575,8 @@ def test_g2d_rotate_90(benchmark):
     with open("testdata/zidane.jpg", "rb") as f:
         data = f.read()
 
-    src = TensorImage.load_from_bytes(data, FourCC.RGBA)
-    dst = TensorImage(src.height, src.width, FourCC.RGBA)
+    src = TensorImage.load_from_bytes(data, PixelFormat.RGBA)
+    dst = TensorImage(src.height, src.width, PixelFormat.RGBA)
 
     try:
         g2d_processor.convert(src, dst, Rotation.Clockwise90, Flip.NoFlip)
@@ -603,8 +603,8 @@ def test_cpu_rotate_180(benchmark):
     with open("testdata/zidane.jpg", "rb") as f:
         data = f.read()
 
-    src = TensorImage.load_from_bytes(data, FourCC.RGBA)
-    dst = TensorImage(src.width, src.height, FourCC.RGBA)
+    src = TensorImage.load_from_bytes(data, PixelFormat.RGBA)
+    dst = TensorImage(src.width, src.height, PixelFormat.RGBA)
 
     benchmark(cpu_processor.convert, src, dst, Rotation.Rotate180, Flip.NoFlip)
 
@@ -626,8 +626,8 @@ def test_cv2_rotate_180(benchmark):
     """Benchmark OpenCV 180 degree rotation."""
     cv2 = pytest.importorskip("cv2")
 
-    src = TensorImage.load("testdata/zidane.jpg", FourCC.RGBA)
-    dst = TensorImage(src.width, src.height, FourCC.RGBA)
+    src = TensorImage.load("testdata/zidane.jpg", PixelFormat.RGBA)
+    dst = TensorImage(src.width, src.height, PixelFormat.RGBA)
 
     with src.map() as m, dst.map() as d:
         arr_src = np.frombuffer(m.view(), dtype=np.uint8).reshape(
@@ -661,8 +661,8 @@ def test_gl_rotate_180(benchmark):
     with open("testdata/zidane.jpg", "rb") as f:
         data = f.read()
 
-    src = TensorImage.load_from_bytes(data, FourCC.RGBA)
-    dst = TensorImage(src.width, src.height, FourCC.RGBA)
+    src = TensorImage.load_from_bytes(data, PixelFormat.RGBA)
+    dst = TensorImage(src.width, src.height, PixelFormat.RGBA)
 
     try:
         gl_processor.convert(src, dst, Rotation.Rotate180, Flip.NoFlip)
@@ -687,8 +687,8 @@ def test_gl_rotate_180(benchmark):
 def test_g2d_rotate_180(benchmark):
     """Benchmark G2D 180 degree rotation."""
 
-    src = TensorImage.load("testdata/zidane.jpg", FourCC.RGBA)
-    dst = TensorImage(src.width, src.height, FourCC.RGBA)
+    src = TensorImage.load("testdata/zidane.jpg", PixelFormat.RGBA)
+    dst = TensorImage(src.width, src.height, PixelFormat.RGBA)
 
     try:
         g2d_processor.convert(src, dst, Rotation.Rotate180, Flip.NoFlip)
