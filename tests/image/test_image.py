@@ -62,7 +62,7 @@ def test_grey_load():
     grey = np.zeros((grey_.height, grey_.width, 1), dtype=np.uint8)
     grey_.normalize_to_numpy(grey)
 
-    default_ = Tensor.load("testdata/grey.jpg")
+    default_ = Tensor.load("testdata/grey.jpg", PixelFormat.Rgb)
     default = np.zeros((default_.height, default_.width, 3), dtype=np.uint8)
     default_.normalize_to_numpy(default)
 
