@@ -145,12 +145,12 @@ mod cpu_tests {
     fn load_bytes_to_tensor(
         width: usize,
         height: usize,
-        fourcc: PixelFormat,
+        format: PixelFormat,
         memory: Option<TensorMemory>,
         bytes: &[u8],
     ) -> Result<TensorDyn, Error> {
         log::debug!("Current function is {}", function!());
-        let src = TensorDyn::image(width, height, fourcc, DType::U8, memory)?;
+        let src = TensorDyn::image(width, height, format, DType::U8, memory)?;
         src.as_u8().unwrap().map()?.as_mut_slice()[0..bytes.len()].copy_from_slice(bytes);
         Ok(src)
     }
@@ -1092,7 +1092,7 @@ mod cpu_tests {
 
     // =========================================================================
     // Generic Conversion Tests
-    // (TensorImageRef tests removed — TensorImageRef has been replaced by TensorDyn)
+    // (These tests use TensorDyn for all image representations)
     // =========================================================================
 
     #[test]
@@ -1110,7 +1110,7 @@ mod cpu_tests {
             }
         }
 
-        // Create planar PixelFormat::Rgb destination using TensorImageRef
+        // Create planar PixelFormat::Rgb destination using TensorDyn
         let mut dst = TensorDyn::image(4, 4, PixelFormat::PlanarRgb, DType::U8, None).unwrap();
 
         {
@@ -1796,7 +1796,7 @@ mod cpu_tests {
     // ── Multiplane PixelFormat::Nv12 tests ───────────────────────────────────────
 
     #[test]
-    fn test_multiplane_tensor_image_creation() -> Result<()> {
+    fn test_multiplane_nv12_creation() -> Result<()> {
         let luma = Tensor::<u8>::new(&[720, 1280], Some(TensorMemory::Mem), Some("luma"))?;
         let chroma = Tensor::<u8>::new(&[360, 1280], Some(TensorMemory::Mem), Some("chroma"))?;
         let img = {
@@ -1849,7 +1849,7 @@ mod cpu_tests {
 
     #[test]
     fn test_multiplane_invalid_shapes() {
-        // Wrong fourcc (PixelFormat::Rgb not supported)
+        // Wrong format (PixelFormat::Rgb not supported for multiplane)
         let luma = Tensor::<u8>::new(&[480, 640], Some(TensorMemory::Mem), None).unwrap();
         let chroma = Tensor::<u8>::new(&[240, 640], Some(TensorMemory::Mem), None).unwrap();
         assert!(Tensor::<u8>::from_planes(luma, chroma, PixelFormat::Rgb).is_err());
