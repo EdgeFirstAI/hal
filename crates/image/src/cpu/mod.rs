@@ -417,17 +417,19 @@ impl CPUProcessor {
                 self.convert_u8(src, dst, src_fmt, dst_fmt, rotation, flip, crop)
             }
             (DType::U8, DType::I8) => {
-                // Int8 output: convert as u8 into a temporary, then XOR 0x80
+                // Int8 output: reinterpret the i8 destination as u8 (layout-
+                // identical), convert directly into it, then XOR 0x80 in-place.
                 let src_u8 = src.as_u8().unwrap();
                 let dst_i8 = dst.as_i8_mut().unwrap();
-                let dst_w = dst_i8.width().unwrap();
-                let dst_h = dst_i8.height().unwrap();
-                let mut tmp = Tensor::<u8>::image(dst_w, dst_h, dst_fmt, Some(TensorMemory::Mem))?;
-                self.convert_u8(src_u8, &mut tmp, src_fmt, dst_fmt, rotation, flip, crop)?;
-                let src_map = tmp.map()?;
-                let mut dst_map = dst_i8.map()?;
-                for (d, s) in dst_map.iter_mut().zip(src_map.as_slice()) {
-                    *d = (*s ^ 0x80) as i8;
+                // SAFETY: Tensor<i8> and Tensor<u8> are layout-identical
+                // (same element size, no T-dependent drop glue). Same
+                // rationale as gl::processor::tensor_i8_as_u8_mut.
+                let dst_u8 = unsafe { &mut *(dst_i8 as *mut Tensor<i8> as *mut Tensor<u8>) };
+                self.convert_u8(src_u8, dst_u8, src_fmt, dst_fmt, rotation, flip, crop)?;
+                // Apply XOR 0x80 bias in-place (u8 → i8 conversion)
+                let mut map = dst_u8.map()?;
+                for b in map.as_mut_slice() {
+                    *b ^= 0x80;
                 }
                 Ok(())
             }

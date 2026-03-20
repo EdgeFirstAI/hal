@@ -266,6 +266,59 @@ typedef enum hal_fourcc {
 } hal_fourcc;
 
 /**
+ * Data type of tensor elements.
+ *
+ * Used to query the type of elements stored in a tensor and interpret
+ * the void* data pointer returned by hal_tensor_map_data().
+ */
+typedef enum hal_dtype {
+  /**
+   * Unsigned 8-bit integer (uint8_t)
+   */
+  HAL_DTYPE_U8 = 0,
+  /**
+   * Signed 8-bit integer (int8_t)
+   */
+  HAL_DTYPE_I8 = 1,
+  /**
+   * Unsigned 16-bit integer (uint16_t)
+   */
+  HAL_DTYPE_U16 = 2,
+  /**
+   * Signed 16-bit integer (int16_t)
+   */
+  HAL_DTYPE_I16 = 3,
+  /**
+   * Unsigned 32-bit integer (uint32_t)
+   */
+  HAL_DTYPE_U32 = 4,
+  /**
+   * Signed 32-bit integer (int32_t)
+   */
+  HAL_DTYPE_I32 = 5,
+  /**
+   * Unsigned 64-bit integer (uint64_t)
+   */
+  HAL_DTYPE_U64 = 6,
+  /**
+   * Signed 64-bit integer (int64_t)
+   */
+  HAL_DTYPE_I64 = 7,
+  /**
+   * 16-bit floating point (half)
+   */
+  HAL_DTYPE_F16 = 8,
+  /**
+   * 32-bit floating point (float)
+   */
+  HAL_DTYPE_F32 = 9,
+  /**
+   * 64-bit floating point (double)
+   */
+  HAL_DTYPE_F64 = 10,
+} hal_dtype;
+
+/**
  * Memory allocation type for tensors.
  *
  * Controls how tensor memory is allocated. DMA is recommended for hardware
@@ -381,59 +434,6 @@ typedef enum hal_log_level {
    */
   HAL_LOG_LEVEL_TRACE = 5,
 } hal_log_level;
-
-/**
- * Data type of tensor elements.
- *
- * Used to query the type of elements stored in a tensor and interpret
- * the void* data pointer returned by hal_tensor_map_data().
- */
-typedef enum hal_dtype {
-  /**
-   * Unsigned 8-bit integer (uint8_t)
-   */
-  HAL_DTYPE_U8 = 0,
-  /**
-   * Signed 8-bit integer (int8_t)
-   */
-  HAL_DTYPE_I8 = 1,
-  /**
-   * Unsigned 16-bit integer (uint16_t)
-   */
-  HAL_DTYPE_U16 = 2,
-  /**
-   * Signed 16-bit integer (int16_t)
-   */
-  HAL_DTYPE_I16 = 3,
-  /**
-   * Unsigned 32-bit integer (uint32_t)
-   */
-  HAL_DTYPE_U32 = 4,
-  /**
-   * Signed 32-bit integer (int32_t)
-   */
-  HAL_DTYPE_I32 = 5,
-  /**
-   * Unsigned 64-bit integer (uint64_t)
-   */
-  HAL_DTYPE_U64 = 6,
-  /**
-   * Signed 64-bit integer (int64_t)
-   */
-  HAL_DTYPE_I64 = 7,
-  /**
-   * 16-bit floating point (half)
-   */
-  HAL_DTYPE_F16 = 8,
-  /**
-   * 32-bit floating point (float)
-   */
-  HAL_DTYPE_F32 = 9,
-  /**
-   * 64-bit floating point (double)
-   */
-  HAL_DTYPE_F64 = 10,
-} hal_dtype;
 
 /**
  * Opaque ByteTrack tracker type.
@@ -1202,9 +1202,15 @@ void hal_crop_set_dst_color(struct hal_crop *crop, uint8_t r, uint8_t g, uint8_t
 /**
  * Create a new empty image tensor.
  *
+ * @note When an image processor is available, prefer
+ * hal_image_processor_create_image() which selects the optimal memory
+ * backend (DMA-buf, PBO, or system memory) automatically. Direct
+ * allocation via this function bypasses PBO-backed GPU zero-copy paths.
+ *
  * @param width Image width in pixels
  * @param height Image height in pixels
  * @param fourcc Pixel format (HAL_FOURCC_*)
+ * @param dtype Data type of tensor elements (HAL_DTYPE_*)
  * @param memory Memory allocation type (HAL_TENSOR_DMA recommended)
  * @return New tensor handle on success, NULL on error
  * @par Errors (errno):
@@ -1214,6 +1220,7 @@ void hal_crop_set_dst_color(struct hal_crop *crop, uint8_t r, uint8_t g, uint8_t
 struct hal_tensor *hal_tensor_new_image(size_t width,
                                         size_t height,
                                         enum hal_fourcc fourcc,
+                                        enum hal_dtype dtype,
                                         enum hal_tensor_memory memory);
 
 /**
@@ -1518,15 +1525,19 @@ int hal_image_processor_set_class_colors(struct hal_image_processor *processor,
  * @param width Image width in pixels
  * @param height Image height in pixels
  * @param fourcc Pixel format (HAL_FOURCC_*)
+ * @param dtype Data type of tensor elements (HAL_DTYPE_*)
  * @return New tensor handle on success, NULL on error
  * @par Errors (errno):
- * - EINVAL: Invalid argument (NULL processor, zero dimensions)
+ * - EINVAL: Invalid argument (NULL processor, zero dimensions, invalid shape)
+ * - ENOTSUP: Unsupported format or operation
+ * - EIO: I/O error during DMA or GPU buffer allocation
  * - ENOMEM: Memory allocation failed
  */
 struct hal_tensor *hal_image_processor_create_image(struct hal_image_processor *processor,
                                                     size_t width,
                                                     size_t height,
-                                                    enum hal_fourcc fourcc);
+                                                    enum hal_fourcc fourcc,
+                                                    enum hal_dtype dtype);
 
 /**
  * Free an image processor.

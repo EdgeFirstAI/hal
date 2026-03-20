@@ -60,7 +60,7 @@ use edgefirst_tensor::{PixelFormat, DType, TensorDyn};
 let bytes = std::fs::read("image.jpg")?;
 let input = load_image(&bytes, Some(PixelFormat::Rgb), None)?;
 let mut converter = ImageProcessor::new()?;
-let mut output = converter.create_image(640, 640, PixelFormat::Rgb, None)?;
+let mut output = converter.create_image(640, 640, PixelFormat::Rgb, DType::U8, None)?;
 converter.convert(&input, &mut output, Rotation::None, Flip::None, Crop::default())?;
 ```
 
@@ -69,7 +69,7 @@ converter.convert(&input, &mut output, Rotation::None, Flip::None, Crop::default
 #include <edgefirst/hal.h>
 
 struct hal_image_processor *proc = hal_image_processor_new();
-struct hal_tensor *dst = hal_image_processor_create_image(proc, 640, 640, HAL_FOURCC_RGB);
+struct hal_tensor *dst = hal_image_processor_create_image(proc, 640, 640, HAL_FOURCC_RGB, HAL_DTYPE_U8);
 hal_image_processor_convert(proc, src, dst, HAL_ROTATION_NONE, HAL_FLIP_NONE, NULL);
 ```
 
@@ -429,7 +429,7 @@ format negotiation); reusing them amortizes that cost over thousands of frames.
 let mut converter = ImageProcessor::new()?;
 
 // Create reusable output buffer — allocated once
-let mut output = converter.create_image(640, 640, PixelFormat::Rgb, None)?;
+let mut output = converter.create_image(640, 640, PixelFormat::Rgb, DType::U8, None)?;
 
 for frame in camera_frames {
     // Reuse output buffer each iteration — no allocation
@@ -457,7 +457,7 @@ struct hal_image_processor *proc = hal_image_processor_new();
 
 /* Create reusable output buffer — allocated once */
 struct hal_tensor *output = hal_image_processor_create_image(
-    proc, 640, 640, HAL_FOURCC_RGB);
+    proc, 640, 640, HAL_FOURCC_RGB, HAL_DTYPE_U8);
 
 for (;;) {
     /* Reuse output buffer each iteration — no allocation */
@@ -507,7 +507,7 @@ falls back to PBO or heap memory with no API change required.
 
 ```rust
 use edgefirst_image::{load_image, ImageProcessor, ImageProcessorTrait, Rotation, Flip, Crop};
-use edgefirst_tensor::{PixelFormat, TensorDyn};
+use edgefirst_tensor::{PixelFormat, DType, TensorDyn};
 
 // Load image from JPEG
 let bytes = std::fs::read("testdata/zidane.jpg")?;
@@ -517,7 +517,7 @@ let input = load_image(&bytes, Some(PixelFormat::Rgb), None)?;
 let mut converter = ImageProcessor::new()?;
 
 // Create output buffer with optimal GPU memory (DMA > PBO > Mem)
-let mut output = converter.create_image(640, 640, PixelFormat::Rgb, None)?;
+let mut output = converter.create_image(640, 640, PixelFormat::Rgb, DType::U8, None)?;
 
 // Convert and resize
 converter.convert(&input, &mut output, Rotation::None, Flip::None, Crop::default())?;

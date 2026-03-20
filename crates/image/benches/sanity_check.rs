@@ -26,7 +26,7 @@ use edgefirst_image::{
     ComputeBackend, Crop, Flip, ImageProcessor, ImageProcessorConfig, ImageProcessorTrait, Rect,
     Rotation,
 };
-use edgefirst_tensor::PixelFormat;
+use edgefirst_tensor::{DType, PixelFormat};
 use edgefirst_tensor::{TensorMapTrait, TensorTrait};
 use std::io::{Read as _, Write as _};
 use std::time::{Duration, Instant};
@@ -63,7 +63,7 @@ fn run_single_test(backend: ComputeBackend, config: &BenchConfig, result_fd: i32
         }
     };
 
-    let src = match proc.create_image(config.in_w, config.in_h, config.in_fmt, None) {
+    let src = match proc.create_image(config.in_w, config.in_h, config.in_fmt, DType::U8, None) {
         Ok(s) => s,
         Err(e) => {
             write_result(result_fd, &format!("FAILED:src_alloc:{e}:0:0:0"));
@@ -73,13 +73,14 @@ fn run_single_test(backend: ComputeBackend, config: &BenchConfig, result_fd: i32
     let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
     src.as_u8().unwrap().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
 
-    let mut dst = match proc.create_image(config.out_w, config.out_h, config.out_fmt, None) {
-        Ok(d) => d,
-        Err(e) => {
-            write_result(result_fd, &format!("FAILED:dst_alloc:{e}:0:0:0"));
-            return;
-        }
-    };
+    let mut dst =
+        match proc.create_image(config.out_w, config.out_h, config.out_fmt, DType::U8, None) {
+            Ok(d) => d,
+            Err(e) => {
+                write_result(result_fd, &format!("FAILED:dst_alloc:{e}:0:0:0"));
+                return;
+            }
+        };
 
     let (left, top, new_w, new_h) =
         calculate_letterbox(config.in_w, config.in_h, config.out_w, config.out_h);

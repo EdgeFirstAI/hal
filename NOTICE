@@ -121,6 +121,7 @@ that require attribution:
   * lapjv 0.2.1 (MIT)
   * lebe 0.5.3 (BSD-3-Clause)
   * libc 0.2.181 (Apache-2.0, MIT)
+  * libm 0.2.16 (MIT)
   * linux-raw-sys 0.11.0 (Apache-2.0, LLVM-exception, MIT)
   * linux-raw-sys 0.4.15 (Apache-2.0, LLVM-exception, MIT)
   * linux-raw-sys 0.6.5 (Apache-2.0, LLVM-exception, MIT)
