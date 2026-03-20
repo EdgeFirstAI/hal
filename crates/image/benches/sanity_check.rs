@@ -312,6 +312,7 @@ fn parse_result(
 }
 
 fn main() {
+    env_logger::init();
     let backend_env = std::env::var("EDGEFIRST_FORCE_BACKEND").unwrap_or_default();
 
     let backends: Vec<(ComputeBackend, &str)> = if !backend_env.is_empty() {

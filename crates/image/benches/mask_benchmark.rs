@@ -314,6 +314,7 @@ fn bench_hybrid_materialize_and_draw(proc: &mut ImageProcessor, suite: &mut Benc
 // =============================================================================
 
 fn main() {
+    env_logger::init();
     let mut suite = BenchSuite::from_args();
     let mut proc = ImageProcessor::new().expect("Failed to create ImageProcessor");
 
