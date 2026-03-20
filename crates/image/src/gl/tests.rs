@@ -8,16 +8,12 @@ mod gl_tests {
     use crate::opengl_headless::processor::GLProcessorST;
     use crate::{
         probe_egl_displays, Crop, EglDisplayKind, Flip, GLProcessorThreaded, ImageProcessorTrait,
-        Rotation, TensorImage, BGRA, GREY, PLANAR_RGB, RGB, RGBA,
+        Rotation,
     };
-    #[cfg(feature = "dma_test_formats")]
-    use crate::{NV12, RGB_INT8, YUYV};
     use edgefirst_decoder::DetectBox;
     #[cfg(feature = "dma_test_formats")]
     use edgefirst_tensor::{is_dma_available, Tensor, TensorMemory};
-    use edgefirst_tensor::{TensorMapTrait, TensorTrait};
-    #[cfg(feature = "dma_test_formats")]
-    use four_char_code::FourCharCode;
+    use edgefirst_tensor::{DType, PixelFormat, TensorDyn, TensorMapTrait, TensorTrait};
     use image::buffer::ConvertBuffer;
     use ndarray::Array3;
 
@@ -30,12 +26,12 @@ mod gl_tests {
             return;
         }
 
-        let mut image = TensorImage::load(
+        let image = crate::load_image(
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../testdata/giraffe.jpg"
             )),
-            Some(RGBA),
+            Some(PixelFormat::Rgba),
             None,
         )
         .unwrap();
@@ -62,7 +58,8 @@ mod gl_tests {
         };
 
         let mut renderer = GLProcessorThreaded::new(None).unwrap();
-        renderer.draw_masks(&mut image, &[], &[seg]).unwrap();
+        let mut image_dyn = image;
+        renderer.draw_masks(&mut image_dyn, &[], &[seg]).unwrap();
     }
 
     #[test]
@@ -74,12 +71,12 @@ mod gl_tests {
             return;
         }
 
-        let mut image = TensorImage::load(
+        let image = crate::load_image(
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../testdata/giraffe.jpg"
             )),
-            Some(RGBA),
+            Some(PixelFormat::Rgba),
             Some(edgefirst_tensor::TensorMemory::Mem),
         )
         .unwrap();
@@ -106,7 +103,8 @@ mod gl_tests {
         };
 
         let mut renderer = GLProcessorThreaded::new(None).unwrap();
-        renderer.draw_masks(&mut image, &[], &[seg]).unwrap();
+        let mut image_dyn = image;
+        renderer.draw_masks(&mut image_dyn, &[], &[seg]).unwrap();
     }
 
     #[test]
@@ -119,15 +117,16 @@ mod gl_tests {
             return;
         }
 
-        let mut image = TensorImage::load(
+        let image = crate::load_image(
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../testdata/giraffe.jpg"
             )),
-            Some(RGBA),
+            Some(PixelFormat::Rgba),
             None,
         )
         .unwrap();
+        let mut image_dyn = image;
 
         let segmentation = Array3::from_shape_vec(
             (76, 55, 1),
@@ -157,14 +156,21 @@ mod gl_tests {
         renderer
             .set_class_colors(&[[255, 255, 0, 233], [128, 128, 255, 100]])
             .unwrap();
-        renderer.draw_masks(&mut image, &[detect], &[seg]).unwrap();
+        renderer
+            .draw_masks(&mut image_dyn, &[detect], &[seg])
+            .unwrap();
 
-        let expected = TensorImage::load(
+        let image = {
+            let mut __t = image_dyn.into_u8().unwrap();
+            __t.set_format(PixelFormat::Rgba).unwrap();
+            TensorDyn::from(__t)
+        };
+        let expected = crate::load_image(
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../testdata/output_render_gl.jpg"
             )),
-            Some(RGBA),
+            Some(PixelFormat::Rgba),
             None,
         )
         .unwrap();
@@ -181,15 +187,16 @@ mod gl_tests {
             return;
         }
 
-        let mut image = TensorImage::load(
+        let image = crate::load_image(
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../testdata/giraffe.jpg"
             )),
-            Some(RGBA),
+            Some(PixelFormat::Rgba),
             None,
         )
         .unwrap();
+        let mut image_dyn = image;
 
         let detect = DetectBox {
             bbox: [0.59375, 0.25, 0.9375, 0.725].into(),
@@ -200,7 +207,7 @@ mod gl_tests {
         renderer
             .set_class_colors(&[[255, 255, 0, 233], [128, 128, 255, 100]])
             .unwrap();
-        renderer.draw_masks(&mut image, &[detect], &[]).unwrap();
+        renderer.draw_masks(&mut image_dyn, &[detect], &[]).unwrap();
     }
 
     static GL_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -217,71 +224,78 @@ mod gl_tests {
         }
     }
 
-    fn compare_images(img1: &TensorImage, img2: &TensorImage, threshold: f64, name: &str) {
+    fn compare_images(img1: &TensorDyn, img2: &TensorDyn, threshold: f64, name: &str) {
         assert_eq!(img1.height(), img2.height(), "Heights differ");
         assert_eq!(img1.width(), img2.width(), "Widths differ");
-        assert_eq!(img1.fourcc(), img2.fourcc(), "FourCC differ");
+        assert_eq!(
+            img1.format().unwrap(),
+            img2.format().unwrap(),
+            "PixelFormat differ"
+        );
         assert!(
-            matches!(img1.fourcc(), RGB | RGBA | GREY | PLANAR_RGB),
-            "FourCC must be RGB or RGBA for comparison"
+            matches!(
+                img1.format().unwrap(),
+                PixelFormat::Rgb | PixelFormat::Rgba | PixelFormat::Grey | PixelFormat::PlanarRgb
+            ),
+            "format must be Rgb or Rgba for comparison"
         );
 
-        let image1 = match img1.fourcc() {
-            RGB => image::RgbImage::from_vec(
-                img1.width() as u32,
-                img1.height() as u32,
-                img1.tensor().map().unwrap().to_vec(),
+        let image1 = match img1.format().unwrap() {
+            PixelFormat::Rgb => image::RgbImage::from_vec(
+                img1.width().unwrap() as u32,
+                img1.height().unwrap() as u32,
+                img1.as_u8().unwrap().map().unwrap().to_vec(),
             )
             .unwrap(),
-            RGBA => image::RgbaImage::from_vec(
-                img1.width() as u32,
-                img1.height() as u32,
-                img1.tensor().map().unwrap().to_vec(),
+            PixelFormat::Rgba => image::RgbaImage::from_vec(
+                img1.width().unwrap() as u32,
+                img1.height().unwrap() as u32,
+                img1.as_u8().unwrap().map().unwrap().to_vec(),
             )
             .unwrap()
             .convert(),
-            GREY => image::GrayImage::from_vec(
-                img1.width() as u32,
-                img1.height() as u32,
-                img1.tensor().map().unwrap().to_vec(),
+            PixelFormat::Grey => image::GrayImage::from_vec(
+                img1.width().unwrap() as u32,
+                img1.height().unwrap() as u32,
+                img1.as_u8().unwrap().map().unwrap().to_vec(),
             )
             .unwrap()
             .convert(),
-            PLANAR_RGB => image::GrayImage::from_vec(
-                img1.width() as u32,
-                (img1.height() * 3) as u32,
-                img1.tensor().map().unwrap().to_vec(),
+            PixelFormat::PlanarRgb => image::GrayImage::from_vec(
+                img1.width().unwrap() as u32,
+                (img1.height().unwrap() * 3) as u32,
+                img1.as_u8().unwrap().map().unwrap().to_vec(),
             )
             .unwrap()
             .convert(),
             _ => return,
         };
 
-        let image2 = match img2.fourcc() {
-            RGB => image::RgbImage::from_vec(
-                img2.width() as u32,
-                img2.height() as u32,
-                img2.tensor().map().unwrap().to_vec(),
+        let image2 = match img2.format().unwrap() {
+            PixelFormat::Rgb => image::RgbImage::from_vec(
+                img2.width().unwrap() as u32,
+                img2.height().unwrap() as u32,
+                img2.as_u8().unwrap().map().unwrap().to_vec(),
             )
             .unwrap(),
-            RGBA => image::RgbaImage::from_vec(
-                img2.width() as u32,
-                img2.height() as u32,
-                img2.tensor().map().unwrap().to_vec(),
+            PixelFormat::Rgba => image::RgbaImage::from_vec(
+                img2.width().unwrap() as u32,
+                img2.height().unwrap() as u32,
+                img2.as_u8().unwrap().map().unwrap().to_vec(),
             )
             .unwrap()
             .convert(),
-            GREY => image::GrayImage::from_vec(
-                img2.width() as u32,
-                img2.height() as u32,
-                img2.tensor().map().unwrap().to_vec(),
+            PixelFormat::Grey => image::GrayImage::from_vec(
+                img2.width().unwrap() as u32,
+                img2.height().unwrap() as u32,
+                img2.as_u8().unwrap().map().unwrap().to_vec(),
             )
             .unwrap()
             .convert(),
-            PLANAR_RGB => image::GrayImage::from_vec(
-                img2.width() as u32,
-                (img2.height() * 3) as u32,
-                img2.tensor().map().unwrap().to_vec(),
+            PixelFormat::PlanarRgb => image::GrayImage::from_vec(
+                img2.width().unwrap() as u32,
+                (img2.height().unwrap() * 3) as u32,
+                img2.as_u8().unwrap().map().unwrap().to_vec(),
             )
             .unwrap()
             .convert(),
@@ -310,8 +324,8 @@ mod gl_tests {
     }
 
     // =========================================================================
-    // NV12 Reference Validation Tests
-    // These tests compare OpenGL NV12 conversions against ffmpeg-generated
+    // PixelFormat::Nv12 Reference Validation Tests
+    // These tests compare OpenGL PixelFormat::Nv12 conversions against ffmpeg-generated
     // references
     // =========================================================================
 
@@ -319,28 +333,28 @@ mod gl_tests {
     fn load_raw_image(
         width: usize,
         height: usize,
-        fourcc: FourCharCode,
+        format: PixelFormat,
         memory: Option<TensorMemory>,
         bytes: &[u8],
-    ) -> Result<TensorImage, crate::Error> {
-        let img = TensorImage::new(width, height, fourcc, memory)?;
-        let mut map = img.tensor().map()?;
+    ) -> Result<TensorDyn, crate::Error> {
+        let img = TensorDyn::image(width, height, format, DType::U8, memory)?;
+        let mut map = img.as_u8().unwrap().map()?;
         map.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
         Ok(img)
     }
 
-    /// Test OpenGL NV12→RGBA conversion against ffmpeg reference
+    /// Test OpenGL PixelFormat::Nv12→PixelFormat::Rgba conversion against ffmpeg reference
     #[test]
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn test_opengl_nv12_to_rgba_reference() {
         if !is_dma_available() {
             return;
         }
-        // Load NV12 source with DMA
+        // Load PixelFormat::Nv12 source with DMA
         let src = load_raw_image(
             1280,
             720,
-            NV12,
+            PixelFormat::Nv12,
             Some(TensorMemory::Dma),
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -349,11 +363,11 @@ mod gl_tests {
         )
         .unwrap();
 
-        // Load RGBA reference (ffmpeg-generated)
+        // Load PixelFormat::Rgba reference (ffmpeg-generated)
         let reference = load_raw_image(
             1280,
             720,
-            RGBA,
+            PixelFormat::Rgba,
             None,
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -363,35 +377,51 @@ mod gl_tests {
         .unwrap();
 
         // Convert using OpenGL
-        let mut dst = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma)).unwrap();
+        let dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
         let mut gl = GLProcessorThreaded::new(None).unwrap();
-        gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-            .unwrap();
+        let src_dyn = src;
+        let mut dst_dyn = dst;
+        gl.convert(
+            &src_dyn,
+            &mut dst_dyn,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
 
         // Copy to CPU for comparison
-        let cpu_dst = TensorImage::new(1280, 720, RGBA, None).unwrap();
+        let cpu_dst = TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None).unwrap();
         cpu_dst
-            .tensor()
+            .as_u8()
+            .unwrap()
             .map()
             .unwrap()
             .as_mut_slice()
-            .copy_from_slice(dst.tensor().map().unwrap().as_slice());
+            .copy_from_slice(dst_dyn.as_u8().unwrap().map().unwrap().as_slice());
 
         compare_images(&reference, &cpu_dst, 0.98, "opengl_nv12_to_rgba_reference");
     }
 
-    /// Test OpenGL YUYV→RGBA conversion against ffmpeg reference
+    /// Test OpenGL PixelFormat::Yuyv→PixelFormat::Rgba conversion against ffmpeg reference
     #[test]
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn test_opengl_yuyv_to_rgba_reference() {
         if !is_dma_available() {
             return;
         }
-        // Load YUYV source with DMA
+        // Load PixelFormat::Yuyv source with DMA
         let src = load_raw_image(
             1280,
             720,
-            YUYV,
+            PixelFormat::Yuyv,
             Some(TensorMemory::Dma),
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -400,11 +430,11 @@ mod gl_tests {
         )
         .unwrap();
 
-        // Load RGBA reference (ffmpeg-generated)
+        // Load PixelFormat::Rgba reference (ffmpeg-generated)
         let reference = load_raw_image(
             1280,
             720,
-            RGBA,
+            PixelFormat::Rgba,
             None,
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -414,19 +444,35 @@ mod gl_tests {
         .unwrap();
 
         // Convert using OpenGL
-        let mut dst = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma)).unwrap();
+        let dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
         let mut gl = GLProcessorThreaded::new(None).unwrap();
-        gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-            .unwrap();
+        let src_dyn = src;
+        let mut dst_dyn = dst;
+        gl.convert(
+            &src_dyn,
+            &mut dst_dyn,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
 
         // Copy to CPU for comparison
-        let cpu_dst = TensorImage::new(1280, 720, RGBA, None).unwrap();
+        let cpu_dst = TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None).unwrap();
         cpu_dst
-            .tensor()
+            .as_u8()
+            .unwrap()
             .map()
             .unwrap()
             .as_mut_slice()
-            .copy_from_slice(dst.tensor().map().unwrap().as_slice());
+            .copy_from_slice(dst_dyn.as_u8().unwrap().map().unwrap().as_slice());
 
         compare_images(&reference, &cpu_dst, 0.98, "opengl_yuyv_to_rgba_reference");
     }
@@ -510,22 +556,28 @@ mod gl_tests {
                 )
             });
 
-            // Smoke test: do a simple RGBA → RGBA conversion to verify the
+            // Smoke test: do a simple PixelFormat::Rgba → PixelFormat::Rgba conversion to verify the
             // GL context is fully functional.
-            let src = TensorImage::load(
+            let src = crate::load_image(
                 include_bytes!(concat!(
                     env!("CARGO_MANIFEST_DIR"),
                     "/../../testdata/zidane.jpg"
                 )),
-                Some(RGBA),
+                Some(PixelFormat::Rgba),
                 None,
             )
             .unwrap();
-            let mut dst = TensorImage::new(320, 240, RGBA, None).unwrap();
-            gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-                .unwrap_or_else(|e| {
-                    panic!("convert() with {:?} display failed: {e:?}", display.kind)
-                });
+            let dst = TensorDyn::image(320, 240, PixelFormat::Rgba, DType::U8, None).unwrap();
+            let src_dyn = src;
+            let mut dst_dyn = dst;
+            gl.convert(
+                &src_dyn,
+                &mut dst_dyn,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap_or_else(|e| panic!("convert() with {:?} display failed: {e:?}", display.kind));
             eprintln!("  {:?} display: convert OK", display.kind);
         }
     }
@@ -579,18 +631,26 @@ mod gl_tests {
         }
 
         let mut gl = GLProcessorThreaded::new(None).expect("auto-detect should succeed");
-        let src = TensorImage::load(
+        let src = crate::load_image(
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../testdata/zidane.jpg"
             )),
-            Some(RGBA),
+            Some(PixelFormat::Rgba),
             None,
         )
         .unwrap();
-        let mut dst = TensorImage::new(320, 240, RGBA, None).unwrap();
-        gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-            .expect("auto-detect convert should succeed");
+        let dst = TensorDyn::image(320, 240, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let src_dyn = src;
+        let mut dst_dyn = dst;
+        gl.convert(
+            &src_dyn,
+            &mut dst_dyn,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .expect("auto-detect convert should succeed");
     }
 
     #[test]
@@ -606,9 +666,9 @@ mod gl_tests {
     }
 
     // =========================================================================
-    // Packed RGB Correctness Tests (two-pass pipeline)
-    // These tests compare GL RGBA output (alpha stripped) against GL packed
-    // RGB output. Both use the same GPU color conversion, so differences
+    // Packed PixelFormat::Rgb Correctness Tests (two-pass pipeline)
+    // These tests compare GL PixelFormat::Rgba output (alpha stripped) against GL packed
+    // PixelFormat::Rgb output. Both use the same GPU color conversion, so differences
     // isolate packing shader bugs rather than CPU-vs-GPU YUV conversion.
     // They require DMA + OpenGL hardware (on-target only).
     // =========================================================================
@@ -657,13 +717,13 @@ mod gl_tests {
             .with_dst_color(Some([114, 114, 114, 255]))
     }
 
-    /// Strip alpha from RGBA bytes → packed RGB bytes.
+    /// Strip alpha from PixelFormat::Rgba bytes → packed PixelFormat::Rgb bytes.
     #[cfg(feature = "dma_test_formats")]
     fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
         assert_eq!(
             rgba.len() % 4,
             0,
-            "RGBA buffer length must be divisible by 4"
+            "PixelFormat::Rgba buffer length must be divisible by 4"
         );
         let mut rgb = Vec::with_capacity(rgba.len() / 4 * 3);
         for pixel in rgba.chunks_exact(4) {
@@ -674,14 +734,14 @@ mod gl_tests {
         rgb
     }
 
-    /// Convert uint8 RGB bytes to int8 (XOR 0x80 each byte).
+    /// Convert uint8 PixelFormat::Rgb bytes to int8 (XOR 0x80 each byte).
     #[cfg(feature = "dma_test_formats")]
     fn uint8_to_int8(data: &[u8]) -> Vec<u8> {
         data.iter().map(|&b| b ^ 0x80).collect()
     }
 
-    /// YUYV 1080p → RGB 640x640 with letterbox (two-pass packed RGB pipeline).
-    /// Compares GL RGBA (alpha-stripped) against GL packed RGB to validate packing.
+    /// PixelFormat::Yuyv 1080p → PixelFormat::Rgb 640x640 with letterbox (two-pass packed PixelFormat::Rgb pipeline).
+    /// Compares GL PixelFormat::Rgba (alpha-stripped) against GL packed PixelFormat::Rgb to validate packing.
     #[test]
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn test_opengl_rgb_correctness() {
@@ -691,7 +751,7 @@ mod gl_tests {
         let src_dma = load_raw_image(
             1920,
             1080,
-            YUYV,
+            PixelFormat::Yuyv,
             Some(TensorMemory::Dma),
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -702,25 +762,48 @@ mod gl_tests {
 
         let crop = letterbox_crop(1920, 1080, 640, 640);
         let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let src_dyn = src_dma;
 
-        // GL RGBA reference
-        let mut dst_rgba = TensorImage::new(640, 640, RGBA, Some(TensorMemory::Dma)).unwrap();
-        gl.convert(&src_dma, &mut dst_rgba, Rotation::None, Flip::None, crop)
+        // GL PixelFormat::Rgba reference
+        let dst_rgba = TensorDyn::image(
+            640,
+            640,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        let mut dst_rgba_dyn = dst_rgba;
+        gl.convert(
+            &src_dyn,
+            &mut dst_rgba_dyn,
+            Rotation::None,
+            Flip::None,
+            crop,
+        )
+        .unwrap();
+
+        // GL packed PixelFormat::Rgb output
+        let dst_rgb = TensorDyn::image(
+            640,
+            640,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        let mut dst_rgb_dyn = dst_rgb;
+        gl.convert(&src_dyn, &mut dst_rgb_dyn, Rotation::None, Flip::None, crop)
             .unwrap();
 
-        // GL packed RGB output
-        let mut dst_rgb = TensorImage::new(640, 640, RGB, Some(TensorMemory::Dma)).unwrap();
-        gl.convert(&src_dma, &mut dst_rgb, Rotation::None, Flip::None, crop)
-            .unwrap();
-
-        let rgba_data = dst_rgba.tensor().map().unwrap();
+        let rgba_data = dst_rgba_dyn.as_u8().unwrap().map().unwrap();
         let expected_rgb = rgba_to_rgb(rgba_data.as_slice());
-        let gl_data = dst_rgb.tensor().map().unwrap();
+        let gl_data = dst_rgb_dyn.as_u8().unwrap().map().unwrap();
         assert_pixels_match(&expected_rgb, gl_data.as_slice(), 1);
     }
 
-    /// YUYV 1080p → RGB_INT8 640x640 with letterbox.
-    /// Compares GL RGBA (alpha-stripped, XOR 0x80) against GL packed RGB_INT8.
+    /// PixelFormat::Yuyv 1080p → PixelFormat::Rgb 640x640 with letterbox.
+    /// Compares GL PixelFormat::Rgba (alpha-stripped, XOR 0x80) against GL packed PixelFormat::Rgb.
     #[test]
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn test_opengl_rgb_int8_correctness() {
@@ -730,7 +813,7 @@ mod gl_tests {
         let src_dma = load_raw_image(
             1920,
             1080,
-            YUYV,
+            PixelFormat::Yuyv,
             Some(TensorMemory::Dma),
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -740,8 +823,8 @@ mod gl_tests {
         .unwrap();
 
         let crop = letterbox_crop(1920, 1080, 640, 640);
-        // Use GLProcessorST with direct RGB disabled to validate two-pass int8
-        // pipeline against RGBA reference. The direct path renders to a different
+        // Use GLProcessorST with direct PixelFormat::Rgb disabled to validate two-pass int8
+        // pipeline against PixelFormat::Rgba reference. The direct path renders to a different
         // framebuffer format (RGB8 renderbuffer vs RGBA8 texture) which produces
         // different YUV interpolation results; it is validated separately by
         // test_opengl_rgb_direct_matches_two_pass.
@@ -753,35 +836,58 @@ mod gl_tests {
             }
         };
 
-        // Two-pass packed RGB is intentionally rejected on the DMA backend.
+        // Two-pass packed PixelFormat::Rgb is intentionally rejected on the DMA backend.
         // This test validates the two-pass int8 pipeline which requires non-DMA.
         if gl.gl_context.transfer_backend.is_dma() {
             eprintln!(
-                "SKIPPED: {} - DMA backend does not support two-pass packed RGB",
+                "SKIPPED: {} - DMA backend does not support two-pass packed PixelFormat::Rgb",
                 function!()
             );
             return;
         }
         gl.support_rgb_direct = false;
+        let src_dyn = src_dma;
 
-        // GL RGBA reference
-        let mut dst_rgba = TensorImage::new(640, 640, RGBA, Some(TensorMemory::Dma)).unwrap();
-        gl.convert(&src_dma, &mut dst_rgba, Rotation::None, Flip::None, crop)
+        // GL PixelFormat::Rgba reference
+        let dst_rgba = TensorDyn::image(
+            640,
+            640,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        let mut dst_rgba_dyn = dst_rgba;
+        gl.convert(
+            &src_dyn,
+            &mut dst_rgba_dyn,
+            Rotation::None,
+            Flip::None,
+            crop,
+        )
+        .unwrap();
+
+        // GL packed PixelFormat::Rgb output (two-pass path)
+        let dst_rgb = TensorDyn::image(
+            640,
+            640,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        let mut dst_rgb_dyn = dst_rgb;
+        gl.convert(&src_dyn, &mut dst_rgb_dyn, Rotation::None, Flip::None, crop)
             .unwrap();
 
-        // GL packed RGB_INT8 output (two-pass path)
-        let mut dst_rgb = TensorImage::new(640, 640, RGB_INT8, Some(TensorMemory::Dma)).unwrap();
-        gl.convert(&src_dma, &mut dst_rgb, Rotation::None, Flip::None, crop)
-            .unwrap();
-
-        let rgba_data = dst_rgba.tensor().map().unwrap();
+        let rgba_data = dst_rgba_dyn.as_u8().unwrap().map().unwrap();
         let expected_rgb = uint8_to_int8(&rgba_to_rgb(rgba_data.as_slice()));
-        let gl_data = dst_rgb.tensor().map().unwrap();
+        let gl_data = dst_rgb_dyn.as_u8().unwrap().map().unwrap();
         assert_pixels_match(&expected_rgb, gl_data.as_slice(), 1);
     }
 
-    /// YUYV 1080p → RGB 1920x1080 (no letterbox, same size).
-    /// Compares GL RGBA (alpha-stripped) against GL packed RGB without scaling.
+    /// PixelFormat::Yuyv 1080p → PixelFormat::Rgb 1920x1080 (no letterbox, same size).
+    /// Compares GL PixelFormat::Rgba (alpha-stripped) against GL packed PixelFormat::Rgb without scaling.
     #[test]
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn test_opengl_rgb_no_letterbox_correctness() {
@@ -791,7 +897,7 @@ mod gl_tests {
         let src_dma = load_raw_image(
             1920,
             1080,
-            YUYV,
+            PixelFormat::Yuyv,
             Some(TensorMemory::Dma),
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -801,42 +907,59 @@ mod gl_tests {
         .unwrap();
 
         let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let src_dyn = src_dma;
 
-        // GL RGBA reference (no letterbox — 1920 satisfies W*3 % 4 == 0)
-        let mut dst_rgba = TensorImage::new(1920, 1080, RGBA, Some(TensorMemory::Dma)).unwrap();
+        // GL PixelFormat::Rgba reference (no letterbox — 1920 satisfies W*3 % 4 == 0)
+        let dst_rgba = TensorDyn::image(
+            1920,
+            1080,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        let mut dst_rgba_dyn = dst_rgba;
         gl.convert(
-            &src_dma,
-            &mut dst_rgba,
+            &src_dyn,
+            &mut dst_rgba_dyn,
             Rotation::None,
             Flip::None,
             Crop::no_crop(),
         )
         .unwrap();
 
-        // GL packed RGB output
-        let mut dst_rgb = TensorImage::new(1920, 1080, RGB, Some(TensorMemory::Dma)).unwrap();
+        // GL packed PixelFormat::Rgb output
+        let dst_rgb = TensorDyn::image(
+            1920,
+            1080,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        let mut dst_rgb_dyn = dst_rgb;
         gl.convert(
-            &src_dma,
-            &mut dst_rgb,
+            &src_dyn,
+            &mut dst_rgb_dyn,
             Rotation::None,
             Flip::None,
             Crop::no_crop(),
         )
         .unwrap();
 
-        let rgba_data = dst_rgba.tensor().map().unwrap();
+        let rgba_data = dst_rgba_dyn.as_u8().unwrap().map().unwrap();
         let expected_rgb = rgba_to_rgb(rgba_data.as_slice());
-        let gl_data = dst_rgb.tensor().map().unwrap();
+        let gl_data = dst_rgb_dyn.as_u8().unwrap().map().unwrap();
         assert_pixels_match(&expected_rgb, gl_data.as_slice(), 1);
     }
 
     // =========================================================================
-    // Direct RGB Render Path Tests
+    // Direct PixelFormat::Rgb Render Path Tests
     // These tests exercise the single-pass BGR888 renderbuffer path added by
     // the GL cache work (EDGEAI-776). They require DMA + OpenGL hardware.
     // =========================================================================
 
-    /// Verify that the direct RGB probe runs without crashing.
+    /// Verify that the direct PixelFormat::Rgb probe runs without crashing.
     #[test]
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn test_probe_rgb_direct_support() {
@@ -858,8 +981,8 @@ mod gl_tests {
         );
     }
 
-    /// Compare direct RGB path against two-pass path pixel-for-pixel.
-    /// If GPU doesn't support direct RGB, this test is a no-op.
+    /// Compare direct PixelFormat::Rgb path against two-pass path pixel-for-pixel.
+    /// If GPU doesn't support direct PixelFormat::Rgb, this test is a no-op.
     #[test]
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn test_opengl_rgb_direct_matches_two_pass() {
@@ -875,20 +998,31 @@ mod gl_tests {
             }
         };
         if !gl.support_rgb_direct {
-            eprintln!("SKIPPED: {} - GPU does not support direct RGB", function!());
+            eprintln!(
+                "SKIPPED: {} - GPU does not support direct PixelFormat::Rgb",
+                function!()
+            );
             return;
         }
 
-        // Create RGBA source with deterministic pattern
+        // Create PixelFormat::Rgba source with deterministic pattern
         // Use 640x480 source → 320x320 output so pitch (320*3=960) is 64-byte aligned
         // for Mali GPU DMA-buf import requirements.
-        let src = TensorImage::new(640, 480, RGBA, Some(TensorMemory::Dma)).unwrap();
+        let src = TensorDyn::image(
+            640,
+            480,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
         {
-            let mut map = src.tensor().map().unwrap();
+            let mut map = src.as_u8().unwrap().map().unwrap();
             for (i, byte) in map.as_mut_slice().iter_mut().enumerate() {
                 *byte = (i % 251) as u8; // deterministic pattern
             }
         }
+        let src_dyn = src;
 
         let crop = crate::Crop {
             src_rect: None,
@@ -897,44 +1031,72 @@ mod gl_tests {
         };
 
         // Direct path (support_rgb_direct = true)
-        let mut dst_direct = TensorImage::new(320, 320, RGB, Some(TensorMemory::Dma)).unwrap();
-        gl.convert(&src, &mut dst_direct, Rotation::None, Flip::None, crop)
-            .unwrap();
+        let dst_direct = TensorDyn::image(
+            320,
+            320,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        let mut dst_direct_dyn = dst_direct;
+        gl.convert(
+            &src_dyn,
+            &mut dst_direct_dyn,
+            Rotation::None,
+            Flip::None,
+            crop,
+        )
+        .unwrap();
 
-        // Two-pass packed RGB is intentionally rejected on the DMA backend
+        // Two-pass packed PixelFormat::Rgb is intentionally rejected on the DMA backend
         // (convert_dest_dma returns NotSupported) because it's slower than
         // the direct path. Skip the comparison when DMA is active.
         if gl.gl_context.transfer_backend.is_dma() {
             eprintln!(
-                "SKIPPED two-pass comparison: DMA backend does not support two-pass packed RGB"
+                "SKIPPED two-pass comparison: DMA backend does not support two-pass packed PixelFormat::Rgb"
             );
             return;
         }
 
         // Force two-pass path
         gl.support_rgb_direct = false;
-        let mut dst_twop = TensorImage::new(320, 320, RGB, Some(TensorMemory::Dma)).unwrap();
-        gl.convert(&src, &mut dst_twop, Rotation::None, Flip::None, crop)
-            .unwrap();
+        let dst_twop = TensorDyn::image(
+            320,
+            320,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        let mut dst_twop_dyn = dst_twop;
+        gl.convert(
+            &src_dyn,
+            &mut dst_twop_dyn,
+            Rotation::None,
+            Flip::None,
+            crop,
+        )
+        .unwrap();
         gl.support_rgb_direct = true;
 
         // Compare
-        let map_direct = dst_direct.tensor().map().unwrap();
-        let map_twop = dst_twop.tensor().map().unwrap();
+        let map_direct = dst_direct_dyn.as_u8().unwrap().map().unwrap();
+        let map_twop = dst_twop_dyn.as_u8().unwrap().map().unwrap();
         // Allow ±1 tolerance for potential rounding differences
         let mut max_diff = 0i32;
         for (a, b) in map_direct.as_slice().iter().zip(map_twop.as_slice().iter()) {
             let diff = (*a as i32 - *b as i32).abs();
             max_diff = max_diff.max(diff);
         }
-        eprintln!("RGB direct vs two-pass max pixel diff: {max_diff}");
+        eprintln!("PixelFormat::Rgb direct vs two-pass max pixel diff: {max_diff}");
         assert!(max_diff <= 1, "Pixel mismatch > 1: max_diff={max_diff}");
     }
 
-    // ---- BGRA destination tests ----
+    // ---- PixelFormat::Bgra destination tests ----
 
-    /// Test OpenGL NV12→BGRA conversion with DMA buffers.
-    /// Compares against NV12→RGBA by verifying R↔B swap.
+    /// Test OpenGL PixelFormat::Nv12→PixelFormat::Bgra conversion with DMA buffers.
+    /// Compares against PixelFormat::Nv12→PixelFormat::Rgba by verifying R↔B swap.
     #[test]
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn test_opengl_nv12_to_bgra() {
@@ -946,7 +1108,7 @@ mod gl_tests {
         let src = load_raw_image(
             1280,
             720,
-            NV12,
+            PixelFormat::Nv12,
             Some(TensorMemory::Dma),
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -956,32 +1118,49 @@ mod gl_tests {
         .unwrap();
 
         let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let src_dyn = src;
 
-        // Convert to RGBA as reference
-        let mut rgba_dst = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma)).unwrap();
+        // Convert to PixelFormat::Rgba as reference
+        let rgba_dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        let mut rgba_dst_dyn = rgba_dst;
         gl.convert(
-            &src,
-            &mut rgba_dst,
+            &src_dyn,
+            &mut rgba_dst_dyn,
             Rotation::None,
             Flip::None,
             Crop::no_crop(),
         )
         .unwrap();
 
-        // Convert to BGRA
-        let mut bgra_dst = TensorImage::new(1280, 720, BGRA, Some(TensorMemory::Dma)).unwrap();
+        // Convert to PixelFormat::Bgra
+        let bgra_dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Bgra,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        let mut bgra_dst_dyn = bgra_dst;
         gl.convert(
-            &src,
-            &mut bgra_dst,
+            &src_dyn,
+            &mut bgra_dst_dyn,
             Rotation::None,
             Flip::None,
             Crop::no_crop(),
         )
         .unwrap();
 
-        // Compare: BGRA[B,G,R,A] should match RGBA[R,G,B,A] with R↔B swapped
-        let bgra_map = bgra_dst.tensor().map().unwrap();
-        let rgba_map = rgba_dst.tensor().map().unwrap();
+        // Compare: PixelFormat::Bgra[B,G,R,A] should match PixelFormat::Rgba[R,G,B,A] with R↔B swapped
+        let bgra_map = bgra_dst_dyn.as_u8().unwrap().map().unwrap();
+        let rgba_map = rgba_dst_dyn.as_u8().unwrap().map().unwrap();
         let bgra_buf = bgra_map.as_slice();
         let rgba_buf = rgba_map.as_slice();
 
@@ -993,14 +1172,14 @@ mod gl_tests {
             max_diff = max_diff.max((bc[2] as i32 - rc[0] as i32).abs()); // R
             max_diff = max_diff.max((bc[3] as i32 - rc[3] as i32).abs()); // A
         }
-        eprintln!("NV12→BGRA vs NV12→RGBA max channel diff: {max_diff}");
+        eprintln!("PixelFormat::Nv12→PixelFormat::Bgra vs PixelFormat::Nv12→PixelFormat::Rgba max channel diff: {max_diff}");
         assert!(
             max_diff <= 1,
-            "BGRA/RGBA channel mismatch > 1: max_diff={max_diff}"
+            "PixelFormat::Bgra/PixelFormat::Rgba channel mismatch > 1: max_diff={max_diff}"
         );
     }
 
-    /// Test OpenGL YUYV→BGRA conversion with DMA buffers.
+    /// Test OpenGL PixelFormat::Yuyv→PixelFormat::Bgra conversion with DMA buffers.
     #[test]
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn test_opengl_yuyv_to_bgra() {
@@ -1012,7 +1191,7 @@ mod gl_tests {
         let src = load_raw_image(
             1280,
             720,
-            YUYV,
+            PixelFormat::Yuyv,
             Some(TensorMemory::Dma),
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -1022,29 +1201,46 @@ mod gl_tests {
         .unwrap();
 
         let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let src_dyn = src;
 
-        let mut rgba_dst = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma)).unwrap();
+        let rgba_dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        let mut rgba_dst_dyn = rgba_dst;
         gl.convert(
-            &src,
-            &mut rgba_dst,
+            &src_dyn,
+            &mut rgba_dst_dyn,
             Rotation::None,
             Flip::None,
             Crop::no_crop(),
         )
         .unwrap();
 
-        let mut bgra_dst = TensorImage::new(1280, 720, BGRA, Some(TensorMemory::Dma)).unwrap();
+        let bgra_dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Bgra,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        let mut bgra_dst_dyn = bgra_dst;
         gl.convert(
-            &src,
-            &mut bgra_dst,
+            &src_dyn,
+            &mut bgra_dst_dyn,
             Rotation::None,
             Flip::None,
             Crop::no_crop(),
         )
         .unwrap();
 
-        let bgra_map = bgra_dst.tensor().map().unwrap();
-        let rgba_map = rgba_dst.tensor().map().unwrap();
+        let bgra_map = bgra_dst_dyn.as_u8().unwrap().map().unwrap();
+        let rgba_map = rgba_dst_dyn.as_u8().unwrap().map().unwrap();
         let bgra_buf = bgra_map.as_slice();
         let rgba_buf = rgba_map.as_slice();
 
@@ -1055,15 +1251,15 @@ mod gl_tests {
             max_diff = max_diff.max((bc[2] as i32 - rc[0] as i32).abs());
             max_diff = max_diff.max((bc[3] as i32 - rc[3] as i32).abs());
         }
-        eprintln!("YUYV→BGRA vs YUYV→RGBA max channel diff: {max_diff}");
+        eprintln!("PixelFormat::Yuyv→PixelFormat::Bgra vs PixelFormat::Yuyv→PixelFormat::Rgba max channel diff: {max_diff}");
         assert!(
             max_diff <= 1,
-            "BGRA/RGBA channel mismatch > 1: max_diff={max_diff}"
+            "PixelFormat::Bgra/PixelFormat::Rgba channel mismatch > 1: max_diff={max_diff}"
         );
     }
 
-    /// Test draw_masks() with BGRA destination (segmentation).
-    /// Draws the same masks to both RGBA and BGRA, then verifies R↔B swap.
+    /// Test draw_masks() with PixelFormat::Bgra destination (segmentation).
+    /// Draws the same masks to both PixelFormat::Rgba and PixelFormat::Bgra, then verifies R↔B swap.
     #[test]
     fn test_draw_masks_bgra() {
         use edgefirst_decoder::Segmentation;
@@ -1096,43 +1292,54 @@ mod gl_tests {
 
         let mut gl = GLProcessorThreaded::new(None).unwrap();
 
-        // Render to RGBA
-        let mut rgba_img = TensorImage::load(
+        // Render to PixelFormat::Rgba
+        let rgba_img = crate::load_image(
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../testdata/giraffe.jpg"
             )),
-            Some(RGBA),
+            Some(PixelFormat::Rgba),
             None,
         )
         .unwrap();
-        gl.draw_masks(&mut rgba_img, &[], &[make_seg()]).unwrap();
+        let mut rgba_img_dyn = rgba_img;
+        gl.draw_masks(&mut rgba_img_dyn, &[], &[make_seg()])
+            .unwrap();
 
-        // Render to BGRA (convert source to BGRA first)
-        let rgba_src = TensorImage::load(
+        // Render to PixelFormat::Bgra (convert source to PixelFormat::Bgra first)
+        let rgba_src = crate::load_image(
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../testdata/giraffe.jpg"
             )),
-            Some(RGBA),
+            Some(PixelFormat::Rgba),
             None,
         )
         .unwrap();
-        let mut bgra_img =
-            TensorImage::new(rgba_src.width(), rgba_src.height(), BGRA, None).unwrap();
+        let bgra_img = TensorDyn::image(
+            rgba_src.width().unwrap(),
+            rgba_src.height().unwrap(),
+            PixelFormat::Bgra,
+            DType::U8,
+            None,
+        )
+        .unwrap();
+        let rgba_src_dyn = rgba_src;
+        let mut bgra_img_dyn = bgra_img;
         gl.convert(
-            &rgba_src,
-            &mut bgra_img,
+            &rgba_src_dyn,
+            &mut bgra_img_dyn,
             Rotation::None,
             Flip::None,
             Crop::no_crop(),
         )
         .unwrap();
-        gl.draw_masks(&mut bgra_img, &[], &[make_seg()]).unwrap();
+        gl.draw_masks(&mut bgra_img_dyn, &[], &[make_seg()])
+            .unwrap();
 
-        // Verify BGRA output matches RGBA output with R↔B swapped
-        let rgba_map = rgba_img.tensor().map().unwrap();
-        let bgra_map = bgra_img.tensor().map().unwrap();
+        // Verify PixelFormat::Bgra output matches PixelFormat::Rgba output with R↔B swapped
+        let rgba_map = rgba_img_dyn.as_u8().unwrap().map().unwrap();
+        let bgra_map = bgra_img_dyn.as_u8().unwrap().map().unwrap();
         let rgba_buf = rgba_map.as_slice();
         let bgra_buf = bgra_map.as_slice();
         assert_eq!(rgba_buf.len(), bgra_buf.len());
@@ -1144,15 +1351,15 @@ mod gl_tests {
             max_diff = max_diff.max((rc[2] as i32 - bc[0] as i32).abs()); // B
             max_diff = max_diff.max((rc[3] as i32 - bc[3] as i32).abs()); // A
         }
-        eprintln!("draw_masks BGRA vs RGBA max channel diff: {max_diff}");
+        eprintln!("draw_masks PixelFormat::Bgra vs PixelFormat::Rgba max channel diff: {max_diff}");
         assert!(
             max_diff <= 1,
-            "draw_masks BGRA/RGBA channel mismatch > 1: max_diff={max_diff}"
+            "draw_masks PixelFormat::Bgra/PixelFormat::Rgba channel mismatch > 1: max_diff={max_diff}"
         );
     }
 
-    /// Test draw_masks() with BGRA destination using Mem memory (boxes).
-    /// Draws same boxes to RGBA and BGRA, then verifies R↔B swap.
+    /// Test draw_masks() with PixelFormat::Bgra destination using Mem memory (boxes).
+    /// Draws same boxes to PixelFormat::Rgba and PixelFormat::Bgra, then verifies R↔B swap.
     #[test]
     fn test_draw_masks_bgra_mem() {
         use edgefirst_decoder::DetectBox;
@@ -1172,48 +1379,52 @@ mod gl_tests {
         let mut gl = GLProcessorThreaded::new(None).unwrap();
         gl.set_class_colors(&colors).unwrap();
 
-        // Render boxes to RGBA
-        let mut rgba_img = TensorImage::load(
+        // Render boxes to PixelFormat::Rgba
+        let rgba_img = crate::load_image(
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../testdata/giraffe.jpg"
             )),
-            Some(RGBA),
+            Some(PixelFormat::Rgba),
             Some(edgefirst_tensor::TensorMemory::Mem),
         )
         .unwrap();
-        gl.draw_masks(&mut rgba_img, &[detect], &[]).unwrap();
+        let mut rgba_img_dyn = rgba_img;
+        gl.draw_masks(&mut rgba_img_dyn, &[detect], &[]).unwrap();
 
-        // Render boxes to BGRA
-        let rgba_src = TensorImage::load(
+        // Render boxes to PixelFormat::Bgra
+        let rgba_src = crate::load_image(
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../testdata/giraffe.jpg"
             )),
-            Some(RGBA),
+            Some(PixelFormat::Rgba),
             Some(edgefirst_tensor::TensorMemory::Mem),
         )
         .unwrap();
-        let mut bgra_img = TensorImage::new(
-            rgba_src.width(),
-            rgba_src.height(),
-            BGRA,
+        let bgra_img = TensorDyn::image(
+            rgba_src.width().unwrap(),
+            rgba_src.height().unwrap(),
+            PixelFormat::Bgra,
+            DType::U8,
             Some(edgefirst_tensor::TensorMemory::Mem),
         )
         .unwrap();
+        let rgba_src_dyn = rgba_src;
+        let mut bgra_img_dyn = bgra_img;
         gl.convert(
-            &rgba_src,
-            &mut bgra_img,
+            &rgba_src_dyn,
+            &mut bgra_img_dyn,
             Rotation::None,
             Flip::None,
             Crop::no_crop(),
         )
         .unwrap();
-        gl.draw_masks(&mut bgra_img, &[detect], &[]).unwrap();
+        gl.draw_masks(&mut bgra_img_dyn, &[detect], &[]).unwrap();
 
-        // Verify BGRA output matches RGBA output with R↔B swapped
-        let rgba_map = rgba_img.tensor().map().unwrap();
-        let bgra_map = bgra_img.tensor().map().unwrap();
+        // Verify PixelFormat::Bgra output matches PixelFormat::Rgba output with R↔B swapped
+        let rgba_map = rgba_img_dyn.as_u8().unwrap().map().unwrap();
+        let bgra_map = bgra_img_dyn.as_u8().unwrap().map().unwrap();
         let rgba_buf = rgba_map.as_slice();
         let bgra_buf = bgra_map.as_slice();
 
@@ -1224,10 +1435,12 @@ mod gl_tests {
             max_diff = max_diff.max((rc[2] as i32 - bc[0] as i32).abs());
             max_diff = max_diff.max((rc[3] as i32 - bc[3] as i32).abs());
         }
-        eprintln!("draw_masks_mem BGRA vs RGBA max channel diff: {max_diff}");
+        eprintln!(
+            "draw_masks_mem PixelFormat::Bgra vs PixelFormat::Rgba max channel diff: {max_diff}"
+        );
         assert!(
             max_diff <= 1,
-            "draw_masks_mem BGRA/RGBA channel mismatch > 1: max_diff={max_diff}"
+            "draw_masks_mem PixelFormat::Bgra/PixelFormat::Rgba channel mismatch > 1: max_diff={max_diff}"
         );
     }
 
@@ -1243,18 +1456,19 @@ mod gl_tests {
         }
 
         let mut gl = GLProcessorThreaded::new(None).unwrap();
-        let mut image = TensorImage::new(64, 64, RGBA, None).unwrap();
+        let image = TensorDyn::image(64, 64, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let mut image_dyn = image;
 
         // Render with empty detections and segmentations — should succeed trivially
-        let result = gl.draw_masks(&mut image, &[], &[]);
+        let result = gl.draw_masks(&mut image_dyn, &[], &[]);
         assert!(
             result.is_ok(),
             "GL mask render with empty data should succeed: {result:?}"
         );
 
         // Verify output dimensions are unchanged
-        assert_eq!(image.width(), 64);
-        assert_eq!(image.height(), 64);
+        assert_eq!(image_dyn.width(), Some(64));
+        assert_eq!(image_dyn.height(), Some(64));
     }
 
     #[test]
@@ -1265,12 +1479,12 @@ mod gl_tests {
         }
 
         let gl = GLProcessorThreaded::new(None).unwrap();
-        let result = gl.create_pbo_image(64, 64, RGBA);
+        let result = gl.create_pbo_image(64, 64, PixelFormat::Rgba);
         match result {
             Ok(pbo_img) => {
-                assert_eq!(pbo_img.width(), 64);
-                assert_eq!(pbo_img.height(), 64);
-                assert_eq!(pbo_img.fourcc(), RGBA);
+                assert_eq!(pbo_img.width(), Some(64));
+                assert_eq!(pbo_img.height(), Some(64));
+                assert_eq!(pbo_img.format().unwrap(), PixelFormat::Rgba);
             }
             Err(e) => {
                 // PBO may not be supported on all GL implementations
@@ -1279,12 +1493,12 @@ mod gl_tests {
         }
     }
 
-    // ---- Multiplane NV12 GPU tests ----
+    // ---- Multiplane PixelFormat::Nv12 GPU tests ----
 
-    /// Helper: load NV12 raw bytes into separate DMA-backed luma and chroma tensors,
-    /// returning a multiplane TensorImage suitable for GPU EGLImage import.
+    /// Helper: load PixelFormat::Nv12 raw bytes into separate DMA-backed luma and chroma tensors,
+    /// returning a multiplane TensorDyn suitable for GPU EGLImage import.
     #[cfg(feature = "dma_test_formats")]
-    fn load_multiplane_nv12_dma(width: usize, height: usize, nv12_bytes: &[u8]) -> TensorImage {
+    fn load_multiplane_nv12_dma(width: usize, height: usize, nv12_bytes: &[u8]) -> TensorDyn {
         let y_size = width * height;
         let uv_size = width * (height / 2);
         assert_eq!(nv12_bytes.len(), y_size + uv_size);
@@ -1301,11 +1515,13 @@ mod gl_tests {
         .expect("DMA chroma tensor");
         chroma.map().unwrap().as_mut_slice()[..uv_size].copy_from_slice(&nv12_bytes[y_size..]);
 
-        TensorImage::from_planes(luma, chroma, NV12).expect("multiplane NV12")
+        Tensor::<u8>::from_planes(luma, chroma, PixelFormat::Nv12)
+            .map(TensorDyn::from)
+            .expect("multiplane PixelFormat::Nv12")
     }
 
-    /// Multiplane NV12 → RGBA via OpenGL DMA-BUF EGLImage (two separate FDs).
-    /// Compares against contiguous NV12 → RGBA to prove EGL multi-plane import works.
+    /// Multiplane PixelFormat::Nv12 → PixelFormat::Rgba via OpenGL DMA-BUF EGLImage (two separate FDs).
+    /// Compares against contiguous PixelFormat::Nv12 → PixelFormat::Rgba to prove EGL multi-plane import works.
     #[test]
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn test_multiplane_nv12_to_rgba_opengl() {
@@ -1319,21 +1535,36 @@ mod gl_tests {
             "/../../testdata/camera720p.nv12"
         ));
 
-        // Contiguous NV12 (single DMA-BUF)
-        let src_contiguous =
-            load_raw_image(1280, 720, NV12, Some(TensorMemory::Dma), nv12_bytes).unwrap();
+        // Contiguous PixelFormat::Nv12 (single DMA-BUF)
+        let src_contiguous = load_raw_image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Dma),
+            nv12_bytes,
+        )
+        .unwrap();
 
-        // Multiplane NV12 (two DMA-BUFs)
+        // Multiplane PixelFormat::Nv12 (two DMA-BUFs)
         let src_multiplane = load_multiplane_nv12_dma(1280, 720, nv12_bytes);
-        assert!(src_multiplane.is_multiplane());
+        assert!(src_multiplane.as_u8().unwrap().is_multiplane());
 
         let mut gl = GLProcessorThreaded::new(None).unwrap();
 
         // Convert contiguous
-        let mut dst_contig = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma)).unwrap();
+        let dst_contig = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        let src_contiguous_dyn = src_contiguous;
+        let mut dst_contig_dyn = dst_contig;
         gl.convert(
-            &src_contiguous,
-            &mut dst_contig,
+            &src_contiguous_dyn,
+            &mut dst_contig_dyn,
             Rotation::None,
             Flip::None,
             Crop::no_crop(),
@@ -1341,10 +1572,19 @@ mod gl_tests {
         .unwrap();
 
         // Convert multiplane
-        let mut dst_multi = TensorImage::new(1280, 720, RGBA, Some(TensorMemory::Dma)).unwrap();
+        let dst_multi = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        let src_multiplane_dyn = src_multiplane;
+        let mut dst_multi_dyn = dst_multi;
         gl.convert(
-            &src_multiplane,
-            &mut dst_multi,
+            &src_multiplane_dyn,
+            &mut dst_multi_dyn,
             Rotation::None,
             Flip::None,
             Crop::no_crop(),
@@ -1352,12 +1592,12 @@ mod gl_tests {
         .unwrap();
 
         // Compare pixel-for-pixel (should be identical — same data, different import path)
-        let map_contig = dst_contig.tensor().map().unwrap();
-        let map_multi = dst_multi.tensor().map().unwrap();
+        let map_contig = dst_contig_dyn.as_u8().unwrap().map().unwrap();
+        let map_multi = dst_multi_dyn.as_u8().unwrap().map().unwrap();
         assert_pixels_match(map_contig.as_slice(), map_multi.as_slice(), 0);
     }
 
-    /// Multiplane NV12 720p → packed RGB 640x640 with letterbox resize via GL.
+    /// Multiplane PixelFormat::Nv12 720p → packed PixelFormat::Rgb 640x640 with letterbox resize via GL.
     /// Validates the packing shader works with multiplane EGLImage source.
     #[test]
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
@@ -1372,41 +1612,65 @@ mod gl_tests {
             "/../../testdata/camera720p.nv12"
         ));
 
-        let src_contiguous =
-            load_raw_image(1280, 720, NV12, Some(TensorMemory::Dma), nv12_bytes).unwrap();
+        let src_contiguous = load_raw_image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Dma),
+            nv12_bytes,
+        )
+        .unwrap();
         let src_multiplane = load_multiplane_nv12_dma(1280, 720, nv12_bytes);
 
         let crop = letterbox_crop(1280, 720, 640, 640);
         let mut gl = GLProcessorThreaded::new(None).unwrap();
 
-        // Contiguous → packed RGB with letterbox
-        let mut dst_contig = TensorImage::new(640, 640, RGB, Some(TensorMemory::Dma)).unwrap();
+        // Contiguous → packed PixelFormat::Rgb with letterbox
+        let dst_contig = TensorDyn::image(
+            640,
+            640,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        let src_contiguous_dyn = src_contiguous;
+        let mut dst_contig_dyn = dst_contig;
         gl.convert(
-            &src_contiguous,
-            &mut dst_contig,
+            &src_contiguous_dyn,
+            &mut dst_contig_dyn,
             Rotation::None,
             Flip::None,
             crop,
         )
         .unwrap();
 
-        // Multiplane → packed RGB with letterbox
-        let mut dst_multi = TensorImage::new(640, 640, RGB, Some(TensorMemory::Dma)).unwrap();
+        // Multiplane → packed PixelFormat::Rgb with letterbox
+        let dst_multi = TensorDyn::image(
+            640,
+            640,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        let src_multiplane_dyn = src_multiplane;
+        let mut dst_multi_dyn = dst_multi;
         gl.convert(
-            &src_multiplane,
-            &mut dst_multi,
+            &src_multiplane_dyn,
+            &mut dst_multi_dyn,
             Rotation::None,
             Flip::None,
             crop,
         )
         .unwrap();
 
-        let map_contig = dst_contig.tensor().map().unwrap();
-        let map_multi = dst_multi.tensor().map().unwrap();
+        let map_contig = dst_contig_dyn.as_u8().unwrap().map().unwrap();
+        let map_multi = dst_multi_dyn.as_u8().unwrap().map().unwrap();
         assert_pixels_match(map_contig.as_slice(), map_multi.as_slice(), 0);
     }
 
-    /// Multiplane NV12 720p → packed RGB_INT8 640x640 with letterbox resize via GL.
+    /// Multiplane PixelFormat::Nv12 720p → packed PixelFormat::Rgb 640x640 with letterbox resize via GL.
     /// Validates the int8 packing shader (XOR 0x80) works with multiplane source.
     #[test]
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
@@ -1421,41 +1685,65 @@ mod gl_tests {
             "/../../testdata/camera720p.nv12"
         ));
 
-        let src_contiguous =
-            load_raw_image(1280, 720, NV12, Some(TensorMemory::Dma), nv12_bytes).unwrap();
+        let src_contiguous = load_raw_image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Dma),
+            nv12_bytes,
+        )
+        .unwrap();
         let src_multiplane = load_multiplane_nv12_dma(1280, 720, nv12_bytes);
 
         let crop = letterbox_crop(1280, 720, 640, 640);
         let mut gl = GLProcessorThreaded::new(None).unwrap();
 
-        // Contiguous → packed RGB_INT8 with letterbox
-        let mut dst_contig = TensorImage::new(640, 640, RGB_INT8, Some(TensorMemory::Dma)).unwrap();
+        // Contiguous → packed PixelFormat::Rgb with letterbox
+        let dst_contig = TensorDyn::image(
+            640,
+            640,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        let src_contiguous_dyn = src_contiguous;
+        let mut dst_contig_dyn = dst_contig;
         gl.convert(
-            &src_contiguous,
-            &mut dst_contig,
+            &src_contiguous_dyn,
+            &mut dst_contig_dyn,
             Rotation::None,
             Flip::None,
             crop,
         )
         .unwrap();
 
-        // Multiplane → packed RGB_INT8 with letterbox
-        let mut dst_multi = TensorImage::new(640, 640, RGB_INT8, Some(TensorMemory::Dma)).unwrap();
+        // Multiplane → packed PixelFormat::Rgb with letterbox
+        let dst_multi = TensorDyn::image(
+            640,
+            640,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        let src_multiplane_dyn = src_multiplane;
+        let mut dst_multi_dyn = dst_multi;
         gl.convert(
-            &src_multiplane,
-            &mut dst_multi,
+            &src_multiplane_dyn,
+            &mut dst_multi_dyn,
             Rotation::None,
             Flip::None,
             crop,
         )
         .unwrap();
 
-        let map_contig = dst_contig.tensor().map().unwrap();
-        let map_multi = dst_multi.tensor().map().unwrap();
+        let map_contig = dst_contig_dyn.as_u8().unwrap().map().unwrap();
+        let map_multi = dst_multi_dyn.as_u8().unwrap().map().unwrap();
         assert_pixels_match(map_contig.as_slice(), map_multi.as_slice(), 0);
     }
 
-    /// Multiplane NV12 720p → packed RGB via direct RGB renderbuffer path.
+    /// Multiplane PixelFormat::Nv12 720p → packed PixelFormat::Rgb via direct PixelFormat::Rgb renderbuffer path.
     /// Validates direct single-pass rendering with multiplane EGLImage source.
     #[test]
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
@@ -1472,7 +1760,10 @@ mod gl_tests {
             }
         };
         if !gl.support_rgb_direct {
-            eprintln!("SKIPPED: {} - GPU does not support direct RGB", function!());
+            eprintln!(
+                "SKIPPED: {} - GPU does not support direct PixelFormat::Rgb",
+                function!()
+            );
             return;
         }
 
@@ -1481,36 +1772,60 @@ mod gl_tests {
             "/../../testdata/camera720p.nv12"
         ));
 
-        let src_contiguous =
-            load_raw_image(1280, 720, NV12, Some(TensorMemory::Dma), nv12_bytes).unwrap();
+        let src_contiguous = load_raw_image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Dma),
+            nv12_bytes,
+        )
+        .unwrap();
         let src_multiplane = load_multiplane_nv12_dma(1280, 720, nv12_bytes);
 
         let crop = letterbox_crop(1280, 720, 640, 640);
 
-        // Contiguous → direct RGB
-        let mut dst_contig = TensorImage::new(640, 640, RGB, Some(TensorMemory::Dma)).unwrap();
+        // Contiguous → direct PixelFormat::Rgb
+        let dst_contig = TensorDyn::image(
+            640,
+            640,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        let src_contiguous_dyn = src_contiguous;
+        let mut dst_contig_dyn = dst_contig;
         gl.convert(
-            &src_contiguous,
-            &mut dst_contig,
+            &src_contiguous_dyn,
+            &mut dst_contig_dyn,
             Rotation::None,
             Flip::None,
             crop,
         )
         .unwrap();
 
-        // Multiplane → direct RGB
-        let mut dst_multi = TensorImage::new(640, 640, RGB, Some(TensorMemory::Dma)).unwrap();
+        // Multiplane → direct PixelFormat::Rgb
+        let dst_multi = TensorDyn::image(
+            640,
+            640,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        let src_multiplane_dyn = src_multiplane;
+        let mut dst_multi_dyn = dst_multi;
         gl.convert(
-            &src_multiplane,
-            &mut dst_multi,
+            &src_multiplane_dyn,
+            &mut dst_multi_dyn,
             Rotation::None,
             Flip::None,
             crop,
         )
         .unwrap();
 
-        let map_contig = dst_contig.tensor().map().unwrap();
-        let map_multi = dst_multi.tensor().map().unwrap();
+        let map_contig = dst_contig_dyn.as_u8().unwrap().map().unwrap();
+        let map_multi = dst_multi_dyn.as_u8().unwrap().map().unwrap();
         assert_pixels_match(map_contig.as_slice(), map_multi.as_slice(), 0);
     }
 }

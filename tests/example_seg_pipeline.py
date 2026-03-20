@@ -444,13 +444,13 @@ def run_hal_pipeline(image_path, metadata, interp, processor, save_path=None):
 
     Returns (bgr_640x640, boxes, scores, classes, elapsed_ms_dict).
     """
-    from edgefirst_hal import TensorImage, FourCC, Rect, Decoder
+    from edgefirst_hal import Tensor, PixelFormat, Rect, Decoder
 
     timings = {}
 
     # 1. Load
     t0 = time.perf_counter()
-    src = TensorImage.load(image_path, fourcc=FourCC.RGB)
+    src = Tensor.load(image_path, format=PixelFormat.Rgb)
     timings["load"] = (time.perf_counter() - t0) * 1000
 
     # 2. Letterbox
@@ -459,7 +459,7 @@ def run_hal_pipeline(image_path, metadata, interp, processor, save_path=None):
     nw, nh = int(src.width * scale), int(src.height * scale)
     px, py = (640 - nw) // 2, (640 - nh) // 2
 
-    dst_rgb = TensorImage(640, 640, FourCC.RGB)
+    dst_rgb = Tensor.image(640, 640, PixelFormat.Rgb)
     processor.convert(
         src,
         dst_rgb,
@@ -508,19 +508,19 @@ def run_hal_pipeline_bench(image_path, metadata, interp, processor):
 
     Returns elapsed_ms_dict (no visual output — uses HAL's built-in colors).
     """
-    from edgefirst_hal import TensorImage, FourCC, Rect, Decoder
+    from edgefirst_hal import Tensor, PixelFormat, Rect, Decoder
 
     timings = {}
 
     t0 = time.perf_counter()
-    src = TensorImage.load(image_path, fourcc=FourCC.RGB)
+    src = Tensor.load(image_path, format=PixelFormat.Rgb)
     timings["load"] = (time.perf_counter() - t0) * 1000
 
     t0 = time.perf_counter()
     scale = min(640 / src.width, 640 / src.height)
     nw, nh = int(src.width * scale), int(src.height * scale)
     px, py = (640 - nw) // 2, (640 - nh) // 2
-    dst_rgb = TensorImage(640, 640, FourCC.RGB)
+    dst_rgb = Tensor.image(640, 640, PixelFormat.Rgb)
     processor.convert(
         src, dst_rgb, dst_crop=Rect(px, py, nw, nh), dst_color=[114, 114, 114, 255]
     )
@@ -533,7 +533,7 @@ def run_hal_pipeline_bench(image_path, metadata, interp, processor):
     timings["inference"] = (time.perf_counter() - t0) * 1000
 
     t0 = time.perf_counter()
-    render_dst = TensorImage(640, 640, FourCC.RGBA)
+    render_dst = Tensor.image(640, 640, PixelFormat.Rgba)
     processor.convert(dst_rgb, render_dst)
     decoder = Decoder(metadata, score_threshold=0.25, iou_threshold=0.45)
     decoder.draw_masks(outputs, processor, render_dst)

@@ -2,10 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from edgefirst_hal import (
-    TensorImage,
     ImageProcessor,
     Flip,
-    FourCC,
+    PixelFormat,
     Normalization,
     Rotation,
     Rect,
@@ -40,8 +39,8 @@ def calculate_similarity_rms_u8(imageA, imageB) -> float:
 
 
 def test_flip():
-    src = TensorImage.load("testdata/zidane.jpg", FourCC.RGBA)
-    dst = TensorImage(1280, 720)
+    src = Tensor.load("testdata/zidane.jpg", PixelFormat.Rgba)
+    dst = Tensor.image(1280, 720, PixelFormat.Rgba)
     converter = ImageProcessor()
     converter.convert(src, dst, flip=Flip.Horizontal)
 
@@ -55,15 +54,15 @@ def test_flip():
 
 
 def test_grey_load():
-    rgba_ = TensorImage.load("testdata/grey.jpg", FourCC.RGBA)
+    rgba_ = Tensor.load("testdata/grey.jpg", PixelFormat.Rgba)
     rgba = np.zeros((rgba_.height, rgba_.width, 4), dtype=np.uint8)
     rgba_.normalize_to_numpy(rgba)
 
-    grey_ = TensorImage.load("testdata/grey.jpg", FourCC.GREY)
+    grey_ = Tensor.load("testdata/grey.jpg", PixelFormat.Grey)
     grey = np.zeros((grey_.height, grey_.width, 1), dtype=np.uint8)
     grey_.normalize_to_numpy(grey)
 
-    default_ = TensorImage.load("testdata/grey.jpg")
+    default_ = Tensor.load("testdata/grey.jpg", PixelFormat.Rgb)
     default = np.zeros((default_.height, default_.width, 3), dtype=np.uint8)
     default_.normalize_to_numpy(default)
 
@@ -73,8 +72,8 @@ def test_grey_load():
 
 
 def test_normalize():
-    src = TensorImage.load("testdata/zidane.jpg", FourCC.RGBA)
-    dst = TensorImage(640, 640, fourcc=FourCC.RGBA)
+    src = Tensor.load("testdata/zidane.jpg", PixelFormat.Rgba)
+    dst = Tensor.image(640, 640, format=PixelFormat.Rgba)
     converter = ImageProcessor()
     converter.convert(src, dst)
     n = np.zeros((640, 640, 3), dtype=np.int8)
@@ -88,7 +87,7 @@ def test_normalize():
 
 
 def test_render():
-    dst = TensorImage.load("testdata/giraffe.jpg", FourCC.RGBA)
+    dst = Tensor.load("testdata/giraffe.jpg", PixelFormat.Rgba)
     seg = np.fromfile("testdata/yolov8_seg_crop_76x55.bin", dtype=np.uint8).reshape(
         (76, 55, 1)
     )
@@ -112,8 +111,8 @@ def test_render():
 
 
 def test_rgb_resize():
-    src = TensorImage.load("testdata/zidane.jpg", FourCC.RGB)
-    dst = TensorImage(640, 640, FourCC.RGBA)
+    src = Tensor.load("testdata/zidane.jpg", PixelFormat.Rgb)
+    dst = Tensor.image(640, 640, PixelFormat.Rgba)
     converter = ImageProcessor()
     converter.convert(src, dst)
     with dst.map() as m:
@@ -123,8 +122,8 @@ def test_rgb_resize():
 
 
 def test_rgba_to_rgb():
-    src = TensorImage.load("testdata/zidane.jpg", FourCC.RGBA)
-    dst = TensorImage(1280, 720, FourCC.RGB)
+    src = Tensor.load("testdata/zidane.jpg", PixelFormat.Rgba)
+    dst = Tensor.image(1280, 720, PixelFormat.Rgb)
     converter = ImageProcessor()
     converter.convert(src, dst, Rotation.Rotate0, Flip.NoFlip, Rect(0, 0, 1280, 720))
 
@@ -135,8 +134,8 @@ def test_rgba_to_rgb():
 
 
 def test_enum_cmp():
-    dst = TensorImage(640, 640, fourcc=FourCC.RGBA)
-    assert dst.format == FourCC.RGBA
+    dst = Tensor.image(640, 640, format=PixelFormat.Rgba)
+    assert dst.format == PixelFormat.Rgba
 
 
 def test_from_fd_dma():
@@ -151,11 +150,9 @@ def test_from_fd_dma():
 
     fd = tensor.fd
     try:
-        img = TensorImage.from_fd(fd, [720, 1280, 4], FourCC.RGBA)
+        img = Tensor.from_fd(fd, [720, 1280, 4], dtype="uint8")
         with img.map() as m:
-            data = np.frombuffer(m.view(), dtype=np.uint8).reshape(
-                (img.height, img.width, 4)
-            )
+            data = np.frombuffer(m.view(), dtype=np.uint8).reshape(720, 1280, 4)
             assert (data == 233).all()
     except Exception:
         os.close(fd)
@@ -173,11 +170,9 @@ def test_from_fd_shm():
 
     fd = tensor.fd
     try:
-        img = TensorImage.from_fd(fd, [720, 1280, 4], FourCC.RGBA)
+        img = Tensor.from_fd(fd, [720, 1280, 4], dtype="uint8")
         with img.map() as m:
-            data = np.frombuffer(m.view(), dtype=np.uint8).reshape(
-                (img.height, img.width, 4)
-            )
+            data = np.frombuffer(m.view(), dtype=np.uint8).reshape(720, 1280, 4)
             assert (data == 233).all()
     except Exception:
         os.close(fd)
@@ -186,10 +181,10 @@ def test_from_fd_shm():
 def test_create_image():
     """Test ImageProcessor.create_image() returns a valid, mappable image."""
     converter = ImageProcessor()
-    img = converter.create_image(320, 240, FourCC.RGBA)
+    img = converter.create_image(320, 240, PixelFormat.Rgba)
     assert img.width == 320
     assert img.height == 240
-    assert img.format == FourCC.RGBA
+    assert img.format == PixelFormat.Rgba
 
     # Image should be mappable
     with img.map() as m:
@@ -200,11 +195,15 @@ def test_create_image():
 def test_create_image_formats():
     """Test create_image with different pixel formats."""
     converter = ImageProcessor()
-    for fourcc, channels in [(FourCC.RGB, 3), (FourCC.RGBA, 4), (FourCC.GREY, 1)]:
-        img = converter.create_image(160, 120, fourcc)
+    for fmt, channels in [
+        (PixelFormat.Rgb, 3),
+        (PixelFormat.Rgba, 4),
+        (PixelFormat.Grey, 1),
+    ]:
+        img = converter.create_image(160, 120, fmt)
         assert img.width == 160
         assert img.height == 120
-        assert img.format == fourcc
+        assert img.format == fmt
         with img.map() as m:
             data = np.frombuffer(m.view(), dtype=np.uint8)
             assert len(data) == 160 * 120 * channels
@@ -215,10 +214,10 @@ def test_create_image_convert():
     converter = ImageProcessor()
 
     # Load a source image normally
-    src = TensorImage.load("testdata/zidane.jpg", FourCC.RGBA)
+    src = Tensor.load("testdata/zidane.jpg", PixelFormat.Rgba)
 
     # Create destination via create_image (may use PBO, DMA, or Mem)
-    dst = converter.create_image(640, 640, FourCC.RGBA)
+    dst = converter.create_image(640, 640, PixelFormat.Rgba)
 
     # Convert should succeed regardless of backing type
     converter.convert(src, dst)
@@ -228,8 +227,8 @@ def test_create_image_convert():
     dst.normalize_to_numpy(n)
     assert n.any(), "Destination image is all zeros after convert"
 
-    # Compare with standard TensorImage destination
-    dst_mem = TensorImage(640, 640, FourCC.RGBA)
+    # Compare with standard Tensor destination
+    dst_mem = Tensor.image(640, 640, PixelFormat.Rgba)
     converter.convert(src, dst_mem)
     n_mem = np.zeros((640, 640, 3), dtype=np.uint8)
     dst_mem.normalize_to_numpy(n_mem)
@@ -242,7 +241,7 @@ def test_create_image_roundtrip():
     converter = ImageProcessor()
 
     # Create source via create_image and fill it
-    src = converter.create_image(640, 480, FourCC.RGBA)
+    src = converter.create_image(640, 480, PixelFormat.Rgba)
     with src.map() as m:
         data = np.frombuffer(m.view(), dtype=np.uint8).copy()
         # Fill with a gradient pattern
@@ -252,7 +251,7 @@ def test_create_image_roundtrip():
         m.view()[:] = data
 
     # Create destination via create_image
-    dst = converter.create_image(320, 240, FourCC.RGBA)
+    dst = converter.create_image(320, 240, PixelFormat.Rgba)
 
     # Convert using both create_image tensors
     converter.convert(src, dst)

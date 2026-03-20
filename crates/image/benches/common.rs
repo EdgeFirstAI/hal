@@ -4,17 +4,14 @@
 //! Shared utilities for image processing benchmarks.
 #![allow(dead_code, unused_imports)]
 
-use edgefirst_image::{
-    BGRA, GREY, NV12, NV16, PLANAR_RGB, PLANAR_RGB_INT8, RGB, RGBA, RGB_INT8, VYUY, YUYV,
-};
-use four_char_code::FourCharCode;
+use edgefirst_tensor::PixelFormat;
 use std::path::Path;
 use std::sync::{LazyLock, OnceLock};
 
 #[cfg(target_os = "linux")]
-use edgefirst_image::{G2DProcessor, TensorImage};
+use edgefirst_image::G2DProcessor;
 #[cfg(target_os = "linux")]
-use edgefirst_tensor::TensorMemory;
+use edgefirst_tensor::{DType, TensorDyn, TensorMemory};
 
 // Re-export the benchmark harness from the shared crate.
 pub use edgefirst_bench::{run_bench, BenchResult, BenchSuite};
@@ -34,7 +31,14 @@ static OPENGL_AVAILABLE: OnceLock<bool> = OnceLock::new();
 /// Check if DMA memory allocation is available on this system.
 #[cfg(target_os = "linux")]
 pub fn dma_available() -> bool {
-    TensorImage::new(64, 64, RGBA, Some(TensorMemory::Dma)).is_ok()
+    TensorDyn::image(
+        64,
+        64,
+        PixelFormat::Rgba,
+        DType::U8,
+        Some(TensorMemory::Dma),
+    )
+    .is_ok()
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -88,32 +92,19 @@ pub fn find_testdata_path(filename: &str) -> std::path::PathBuf {
     panic!("Unable to locate test file: {filename}");
 }
 
-/// Get the human-readable name for a FourCC format.
-pub fn format_name(f: FourCharCode) -> &'static str {
-    if f == YUYV {
-        "YUYV"
-    } else if f == VYUY {
-        "VYUY"
-    } else if f == NV12 {
-        "NV12"
-    } else if f == RGB {
-        "RGB"
-    } else if f == RGB_INT8 {
-        "RGBi"
-    } else if f == RGBA {
-        "RGBA"
-    } else if f == PLANAR_RGB {
-        "8BPS"
-    } else if f == PLANAR_RGB_INT8 {
-        "8BPi"
-    } else if f == BGRA {
-        "BGRA"
-    } else if f == NV16 {
-        "NV16"
-    } else if f == GREY {
-        "GREY"
-    } else {
-        "???"
+/// Get the human-readable name for a PixelFormat.
+pub fn format_name(f: PixelFormat) -> &'static str {
+    match f {
+        PixelFormat::Yuyv => "YUYV",
+        PixelFormat::Vyuy => "VYUY",
+        PixelFormat::Nv12 => "NV12",
+        PixelFormat::Rgb => "RGB",
+        PixelFormat::Rgba => "RGBA",
+        PixelFormat::PlanarRgb => "8BPS",
+        PixelFormat::Bgra => "BGRA",
+        PixelFormat::Nv16 => "NV16",
+        PixelFormat::Grey => "GREY",
+        _ => "???",
     }
 }
 
@@ -159,8 +150,8 @@ pub struct BenchConfig {
     pub in_h: usize,
     pub out_w: usize,
     pub out_h: usize,
-    pub in_fmt: FourCharCode,
-    pub out_fmt: FourCharCode,
+    pub in_fmt: PixelFormat,
+    pub out_fmt: PixelFormat,
 }
 
 impl BenchConfig {
@@ -170,8 +161,8 @@ impl BenchConfig {
         in_h: usize,
         out_w: usize,
         out_h: usize,
-        in_fmt: FourCharCode,
-        out_fmt: FourCharCode,
+        in_fmt: PixelFormat,
+        out_fmt: PixelFormat,
     ) -> Self {
         Self {
             in_w,
@@ -209,15 +200,13 @@ impl BenchConfig {
     /// Calculate throughput in bytes based on input size.
     pub fn throughput(&self) -> u64 {
         let bytes = match self.in_fmt {
-            f if f == YUYV || f == VYUY => self.in_w * self.in_h * 2,
-            f if f == NV12 => self.in_w * self.in_h * 3 / 2,
-            f if f == NV16 => self.in_w * self.in_h * 2, // 4:2:2 like YUYV
-            f if f == RGB || f == RGB_INT8 || f == PLANAR_RGB || f == PLANAR_RGB_INT8 => {
-                self.in_w * self.in_h * 3
-            }
-            f if f == RGBA => self.in_w * self.in_h * 4,
-            f if f == BGRA => self.in_w * self.in_h * 4,
-            f if f == GREY => self.in_w * self.in_h,
+            PixelFormat::Yuyv | PixelFormat::Vyuy => self.in_w * self.in_h * 2,
+            PixelFormat::Nv12 => self.in_w * self.in_h * 3 / 2,
+            PixelFormat::Nv16 => self.in_w * self.in_h * 2, // 4:2:2 like YUYV
+            PixelFormat::Rgb | PixelFormat::PlanarRgb => self.in_w * self.in_h * 3,
+            PixelFormat::Rgba => self.in_w * self.in_h * 4,
+            PixelFormat::Bgra => self.in_w * self.in_h * 4,
+            PixelFormat::Grey => self.in_w * self.in_h,
             _ => self.in_w * self.in_h,
         };
         bytes as u64
@@ -252,22 +241,22 @@ static CAMERA_1080P_NV16: LazyLock<Vec<u8>> = LazyLock::new(|| vec![128u8; 1920 
 static CAMERA_1080P_RGBA: LazyLock<Vec<u8>> = LazyLock::new(|| vec![128u8; 1920 * 1080 * 4]);
 
 /// Get embedded test data for a given resolution and format.
-pub fn get_test_data(width: usize, height: usize, format: FourCharCode) -> &'static [u8] {
+pub fn get_test_data(width: usize, height: usize, format: PixelFormat) -> &'static [u8] {
     match (width, height, format) {
-        (1280, 720, f) if f == YUYV => CAMERA_720P_YUYV,
-        (1280, 720, f) if f == VYUY => CAMERA_720P_VYUY,
-        (1280, 720, f) if f == NV12 => CAMERA_720P_NV12,
-        (1280, 720, f) if f == RGB => CAMERA_720P_RGB,
-        (1920, 1080, f) if f == YUYV => CAMERA_1080P_YUYV,
-        (1920, 1080, f) if f == VYUY => CAMERA_1080P_VYUY,
-        (1920, 1080, f) if f == NV12 => CAMERA_1080P_NV12,
-        (1920, 1080, f) if f == NV16 => &CAMERA_1080P_NV16,
-        (1920, 1080, f) if f == RGB => CAMERA_1080P_RGB,
-        (1920, 1080, f) if f == RGBA => &CAMERA_1080P_RGBA,
-        (3840, 2160, f) if f == YUYV => CAMERA_4K_YUYV,
-        (3840, 2160, f) if f == VYUY => CAMERA_4K_VYUY,
-        (3840, 2160, f) if f == NV12 => CAMERA_4K_NV12,
-        (3840, 2160, f) if f == RGB => CAMERA_4K_RGB,
+        (1280, 720, PixelFormat::Yuyv) => CAMERA_720P_YUYV,
+        (1280, 720, PixelFormat::Vyuy) => CAMERA_720P_VYUY,
+        (1280, 720, PixelFormat::Nv12) => CAMERA_720P_NV12,
+        (1280, 720, PixelFormat::Rgb) => CAMERA_720P_RGB,
+        (1920, 1080, PixelFormat::Yuyv) => CAMERA_1080P_YUYV,
+        (1920, 1080, PixelFormat::Vyuy) => CAMERA_1080P_VYUY,
+        (1920, 1080, PixelFormat::Nv12) => CAMERA_1080P_NV12,
+        (1920, 1080, PixelFormat::Nv16) => &CAMERA_1080P_NV16,
+        (1920, 1080, PixelFormat::Rgb) => CAMERA_1080P_RGB,
+        (1920, 1080, PixelFormat::Rgba) => &CAMERA_1080P_RGBA,
+        (3840, 2160, PixelFormat::Yuyv) => CAMERA_4K_YUYV,
+        (3840, 2160, PixelFormat::Vyuy) => CAMERA_4K_VYUY,
+        (3840, 2160, PixelFormat::Nv12) => CAMERA_4K_NV12,
+        (3840, 2160, PixelFormat::Rgb) => CAMERA_4K_RGB,
         _ => panic!("No test data for {}x{} {:?}", width, height, format),
     }
 }

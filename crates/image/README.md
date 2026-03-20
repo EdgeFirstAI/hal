@@ -19,17 +19,18 @@ This crate provides hardware-accelerated image loading, format conversion, resiz
 ## Quick Start
 
 ```rust
-use edgefirst_image::{TensorImage, ImageProcessor, Rotation, Flip, Crop, RGBA};
+use edgefirst_image::{load_image, save_jpeg, ImageProcessor, ImageProcessorTrait, Rotation, Flip, Crop};
+use edgefirst_tensor::{PixelFormat, DType, TensorDyn};
 
 // Load an image
 let bytes = std::fs::read("input.jpg")?;
-let src = TensorImage::load(&bytes, Some(RGBA), None)?;
+let src = load_image(&bytes, Some(PixelFormat::Rgba), None)?;
 
 // Create processor (auto-selects best backend)
 let mut processor = ImageProcessor::new()?;
 
 // Create destination with desired size
-let mut dst = TensorImage::new(640, 640, RGBA, None)?;
+let mut dst = processor.create_image(640, 640, PixelFormat::Rgba, None)?;
 
 // Convert with resize, rotation, letterboxing
 processor.convert(
@@ -41,7 +42,7 @@ processor.convert(
 )?;
 
 // Save result
-dst.save_jpeg("output.jpg", 90)?;
+save_jpeg(&dst, "output.jpg", 90)?;
 ```
 
 ## Backends
@@ -54,20 +55,20 @@ dst.save_jpeg("output.jpg", 90)?;
 
 ## Supported Formats
 
-| FourCC | Description | Channels |
+| Format | Description | Channels |
 |--------|-------------|----------|
-| RGBA | 32-bit RGBA | 4 |
-| RGB | 24-bit RGB | 3 |
-| NV12 | YUV 4:2:0 semi-planar | 1.5 |
-| NV16 | YUV 4:2:2 semi-planar | 2 |
-| YUYV | YUV 4:2:2 packed | 2 |
-| GREY | 8-bit grayscale | 1 |
-| 8BPS | Planar RGB | 3 |
-| VYUY | YUV 4:2:2 packed (VYUY order) | 2 |
-| BGRA | 32-bit BGRA | 4 |
-| RGBi | Packed RGB int8 (XOR 0x80) | 3 |
-| 8BPi | Planar RGB int8 (XOR 0x80) | 3 |
-| 8BPA | Planar RGBA | 4 |
+| `PixelFormat::Rgba` | 32-bit RGBA | 4 |
+| `PixelFormat::Rgb` | 24-bit RGB | 3 |
+| `PixelFormat::Nv12` | YUV 4:2:0 semi-planar | 1.5 |
+| `PixelFormat::Nv16` | YUV 4:2:2 semi-planar | 2 |
+| `PixelFormat::Yuyv` | YUV 4:2:2 packed | 2 |
+| `PixelFormat::Grey` | 8-bit grayscale | 1 |
+| `PixelFormat::PlanarRgb` | Planar RGB | 3 |
+| `PixelFormat::Vyuy` | YUV 4:2:2 packed (VYUY order) | 2 |
+| `PixelFormat::Bgra` | 32-bit BGRA | 4 |
+| `PixelFormat::PlanarRgba` | Planar RGBA | 4 |
+
+Note: Int8 variants (e.g. packed RGB int8, planar RGB int8) use `DType::I8` with the corresponding `PixelFormat` rather than separate format constants.
 
 ## Feature Flags
 
@@ -127,14 +128,15 @@ processor.set_int8_interpolation_mode(Int8InterpolationMode::Bilinear);
 
 See [BENCHMARKS.md](../../BENCHMARKS.md) for per-platform performance numbers.
 
-## Zero-Copy Model Input (`convert_ref`)
+## Zero-Copy Model Input
 
-`convert_ref()` writes directly into a pre-allocated model input tensor, avoiding an intermediate copy:
+You can write directly into a pre-allocated model input tensor by setting its pixel format and converting it to a `TensorDyn`:
 
 ```rust,ignore
-let mut model_input = Tensor::<u8>::new(&[1, 640, 640, 3], None, None)?;
-let mut dst_ref = TensorImageRef::new(&mut model_input, 640, 640, RGB)?;
-processor.convert(&src, &mut dst_ref, Rotation::None, Flip::None, Crop::letterbox())?;
+let mut model_input = Tensor::<u8>::new(&[640, 640, 3], None, None)?;
+model_input.set_format(PixelFormat::Rgb)?;
+let mut dst = TensorDyn::from(model_input);
+processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::letterbox())?;
 ```
 
 ## Multiplane NV12/NV16
@@ -142,8 +144,9 @@ processor.convert(&src, &mut dst_ref, Rotation::None, Flip::None, Crop::letterbo
 For V4L2 multi-planar DMA-BUF buffers (separate Y and UV file descriptors):
 
 ```rust,ignore
-let img = TensorImage::from_planes(y_tensor, uv_tensor, NV12)?;
-processor.convert(&img, &mut dst, Rotation::None, Flip::None, Crop::default())?;
+let img = Tensor::from_planes(y_tensor, uv_tensor, PixelFormat::Nv12)?;
+let src = TensorDyn::from(img);
+processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())?;
 ```
 
 The OpenGL backend imports each plane's DMA-BUF fd separately for zero-copy GPU access.

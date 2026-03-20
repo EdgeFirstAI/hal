@@ -26,7 +26,7 @@ use edgefirst_image::{
     ComputeBackend, Crop, Flip, ImageProcessor, ImageProcessorConfig, ImageProcessorTrait, Rect,
     Rotation,
 };
-use edgefirst_image::{NV12, PLANAR_RGB, PLANAR_RGB_INT8, RGB, RGBA, RGB_INT8, YUYV};
+use edgefirst_tensor::PixelFormat;
 use edgefirst_tensor::{TensorMapTrait, TensorTrait};
 use std::io::{Read as _, Write as _};
 use std::time::{Duration, Instant};
@@ -63,7 +63,7 @@ fn run_single_test(backend: ComputeBackend, config: &BenchConfig, result_fd: i32
         }
     };
 
-    let src = match proc.create_image(config.in_w, config.in_h, config.in_fmt) {
+    let src = match proc.create_image(config.in_w, config.in_h, config.in_fmt, None) {
         Ok(s) => s,
         Err(e) => {
             write_result(result_fd, &format!("FAILED:src_alloc:{e}:0:0:0"));
@@ -71,9 +71,9 @@ fn run_single_test(backend: ComputeBackend, config: &BenchConfig, result_fd: i32
         }
     };
     let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
-    src.tensor().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
+    src.as_u8().unwrap().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
 
-    let mut dst = match proc.create_image(config.out_w, config.out_h, config.out_fmt) {
+    let mut dst = match proc.create_image(config.out_w, config.out_h, config.out_fmt, None) {
         Ok(d) => d,
         Err(e) => {
             write_result(result_fd, &format!("FAILED:dst_alloc:{e}:0:0:0"));
@@ -334,24 +334,19 @@ fn main() {
         ]
     };
 
-    // Test safe combos first, known GPU-hang combos last (NV12→planar on Vivante).
+    // Test safe combos first, known GPU-hang combos last (PixelFormat::Nv12→planar on Vivante).
     // Each (input, output) pair — ordered so GPU-hang candidates are last.
-    let test_combos: Vec<(FourCharCode, FourCharCode)> = vec![
-        // YUYV sources — all safe on Vivante
-        (YUYV, RGBA),
-        (YUYV, RGB),
-        (YUYV, RGB_INT8),
-        (YUYV, PLANAR_RGB),
-        (YUYV, PLANAR_RGB_INT8),
-        // NV12 sources — packed/RGBA are safe, planar may hang
-        (NV12, RGBA),
-        (NV12, RGB),
-        (NV12, RGB_INT8),
-        // NV12 → planar: KNOWN GPU HANG RISK on Vivante GC7000UL
-        (NV12, PLANAR_RGB_INT8),
-        (NV12, PLANAR_RGB),
+    let test_combos: Vec<(PixelFormat, PixelFormat)> = vec![
+        // Yuyv sources — all safe on Vivante
+        (PixelFormat::Yuyv, PixelFormat::Rgba),
+        (PixelFormat::Yuyv, PixelFormat::Rgb),
+        (PixelFormat::Yuyv, PixelFormat::PlanarRgb),
+        // Nv12 sources — packed/Rgba are safe, planar may hang
+        (PixelFormat::Nv12, PixelFormat::Rgba),
+        (PixelFormat::Nv12, PixelFormat::Rgb),
+        // Nv12 → planar: KNOWN GPU HANG RISK on Vivante GC7000UL
+        (PixelFormat::Nv12, PixelFormat::PlanarRgb),
     ];
-    use four_char_code::FourCharCode;
     let resolutions = [(1920, 1080, "1080p"), (1280, 720, "720p")];
 
     println!(

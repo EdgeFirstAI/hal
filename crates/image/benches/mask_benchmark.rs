@@ -26,7 +26,8 @@ use common::{run_bench, BenchSuite};
 
 use edgefirst_decoder::yolo::impl_yolo_segdet_quant_proto;
 use edgefirst_decoder::{DetectBox, Nms, ProtoData, Quantization, Segmentation, XYWH};
-use edgefirst_image::{ImageProcessor, ImageProcessorTrait, RGBA};
+use edgefirst_image::{ImageProcessor, ImageProcessorTrait};
+use edgefirst_tensor::PixelFormat;
 use ndarray::s;
 
 const WARMUP: usize = 10;
@@ -202,7 +203,7 @@ fn bench_draw_masks(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
     println!("  Materialized {n_detect} detection masks for benchmarking\n");
 
     let name = "draw_masks";
-    let Ok(mut dst) = proc.create_image(OUTPUT_W, OUTPUT_H, RGBA) else {
+    let Ok(mut dst) = proc.create_image(OUTPUT_W, OUTPUT_H, PixelFormat::Rgba, None) else {
         println!("  {:50} [skipped: allocation failed]", name);
         return;
     };
@@ -231,7 +232,7 @@ fn bench_draw_masks_proto(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
     println!("  Decoded {n_detect} detections for benchmarking\n");
 
     let name = "draw_masks_proto";
-    let Ok(mut dst) = proc.create_image(OUTPUT_W, OUTPUT_H, RGBA) else {
+    let Ok(mut dst) = proc.create_image(OUTPUT_W, OUTPUT_H, PixelFormat::Rgba, None) else {
         println!("  {:50} [skipped: allocation failed]", name);
         return;
     };
@@ -288,7 +289,7 @@ fn bench_hybrid_materialize_and_draw(proc: &mut ImageProcessor, suite: &mut Benc
     println!("  Decoded {n_detect} detections for benchmarking\n");
 
     let name = "hybrid_materialize_and_draw";
-    let Ok(mut dst) = proc.create_image(OUTPUT_W, OUTPUT_H, RGBA) else {
+    let Ok(mut dst) = proc.create_image(OUTPUT_W, OUTPUT_H, PixelFormat::Rgba, None) else {
         println!("  {:50} [skipped: allocation failed]", name);
         return;
     };
