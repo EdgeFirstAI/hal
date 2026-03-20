@@ -4,7 +4,7 @@
 #![cfg(target_os = "linux")]
 
 use crate::{CPUProcessor, Crop, Error, Flip, ImageProcessorTrait, Result, Rotation};
-use edgefirst_tensor::{DType, PixelFormat, Tensor, TensorDyn};
+use edgefirst_tensor::{DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait, TensorTrait};
 use four_char_code::FourCharCode;
 use g2d_sys::{G2DFormat, G2DPhysical, G2DSurface, G2D};
 use std::{os::fd::AsRawFd, time::Instant};
@@ -60,9 +60,15 @@ impl G2DProcessor {
         flip: Flip,
         crop: Crop,
     ) -> Result<()> {
-        if src_dyn.dtype() != DType::U8 || dst_dyn.dtype() != DType::U8 {
+        if src_dyn.dtype() != DType::U8 {
             return Err(Error::NotSupported(
-                "G2D only supports u8 tensors".to_string(),
+                "G2D only supports u8 source tensors".to_string(),
+            ));
+        }
+        let is_int8_dst = dst_dyn.dtype() == DType::I8;
+        if dst_dyn.dtype() != DType::U8 && !is_int8_dst {
+            return Err(Error::NotSupported(
+                "G2D only supports u8 or i8 destination tensors".to_string(),
             ));
         }
 
@@ -98,7 +104,15 @@ impl G2DProcessor {
         crop.check_crop_dyn(src_dyn, dst_dyn)?;
 
         let src = src_dyn.as_u8().unwrap();
-        let dst = dst_dyn.as_u8_mut().unwrap();
+        // For i8 destinations, reinterpret as u8 for G2D (same byte layout).
+        // The XOR 0x80 post-pass is applied after the blit completes.
+        let dst = if is_int8_dst {
+            // SAFETY: i8 and u8 have identical layout and size.
+            let i8_tensor = dst_dyn.as_i8_mut().unwrap();
+            unsafe { &mut *(i8_tensor as *mut Tensor<i8> as *mut Tensor<u8>) }
+        } else {
+            dst_dyn.as_u8_mut().unwrap()
+        };
 
         let mut src_surface = tensor_to_g2d_surface(src)?;
         let mut dst_surface = tensor_to_g2d_surface(dst)?;
@@ -168,6 +182,17 @@ impl G2DProcessor {
                 CPUProcessor::fill_image_outside_crop_u8(dst, dst_color, dst_rect)?;
                 log::trace!("cpu fill takes {:?}", start.elapsed());
             }
+        }
+
+        // Apply XOR 0x80 for int8 output (u8→i8 bias conversion)
+        if is_int8_dst {
+            let start = Instant::now();
+            let mut map = dst.map()?;
+            let data = map.as_mut_slice();
+            for byte in data.iter_mut() {
+                *byte ^= 0x80;
+            }
+            log::trace!("g2d int8 XOR 0x80 post-pass takes {:?}", start.elapsed());
         }
 
         Ok(())
