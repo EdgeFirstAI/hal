@@ -1092,36 +1092,37 @@ impl GLProcessorST {
             src.memory()
         );
         check_gl_error(function!(), line!())?;
+        log::trace!(
+            "GL convert_impl: {src_fmt}→{dst_fmt} int8={is_int8} \
+             src_mem={:?} dst_mem={:?} transfer={:?}",
+            src.memory(),
+            dst.memory(),
+            self.gl_context.transfer_backend,
+        );
+
         if self.gl_context.transfer_backend.is_dma() && dst.memory() == TensorMemory::Dma {
-            log::trace!(
-                "GL convert: DMA path (src={:?}, dst={:?})",
-                src.memory(),
-                dst.memory()
-            );
+            log::trace!("GL path: DMA (zero-copy EGLImage)");
             let res =
                 self.convert_dest_dma(dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop);
+            log::trace!("GL DMA result: {}", if res.is_ok() { "ok" } else { "err" });
             return res;
         }
         if src.memory() == TensorMemory::Pbo && dst.memory() == TensorMemory::Pbo {
-            log::trace!("GL convert: PBO-to-PBO path");
+            log::trace!("GL path: PBO-to-PBO");
             return self
                 .convert_pbo_to_pbo(dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop);
         }
         if dst.memory() == TensorMemory::Pbo {
-            log::trace!("GL convert: any-to-PBO path (src={:?})", src.memory());
+            log::trace!("GL path: any-to-PBO (src={:?})", src.memory());
             return self
                 .convert_any_to_pbo(dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop);
         }
         if src.memory() == TensorMemory::Pbo {
-            log::trace!("GL convert: PBO-to-mem path");
+            log::trace!("GL path: PBO-to-mem");
             return self
                 .convert_pbo_to_mem(dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop);
         }
-        log::trace!(
-            "GL convert: non-DMA path (src={:?}, dst={:?})",
-            src.memory(),
-            dst.memory()
-        );
+        log::trace!("GL path: non-DMA (CPU upload/readback)");
         let start = Instant::now();
         let res =
             self.convert_dest_non_dma(dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop);
@@ -1536,14 +1537,25 @@ impl GLProcessorST {
     ) -> crate::Result<()> {
         assert!(self.gl_context.transfer_backend.is_dma());
         if dst_fmt == PixelFormat::Rgb {
-            log::trace!("convert_dest_dma: two-pass packed RGB for {dst_fmt}");
+            log::trace!(
+                "GL DMA dispatch: {src_fmt}→{dst_fmt} int8={is_int8} → two-pass packed RGB \
+                 (RGBA intermediate + packed_rgba8{}shader)",
+                if is_int8 { "_int8_" } else { "_" }
+            );
             self.convert_to_packed_rgb(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
         } else if dst_fmt.layout() == PixelLayout::Planar {
-            log::trace!("convert_dest_dma: planar output path for {dst_fmt}");
+            log::trace!(
+                "GL DMA dispatch: {src_fmt}→{dst_fmt} int8={is_int8} → planar output \
+                 (renderbuffer + planar{}shader)",
+                if is_int8 { "_int8_" } else { "_" }
+            );
             self.setup_renderbuffer_dma(dst, dst_fmt)?;
             self.convert_to_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
         } else {
-            log::trace!("convert_dest_dma: standard DMA path for {src_fmt} → {dst_fmt}");
+            log::trace!(
+                "GL DMA dispatch: {src_fmt}→{dst_fmt} int8={is_int8} → single-pass EGLImage \
+                 (renderbuffer direct)"
+            );
             self.setup_renderbuffer_dma(dst, dst_fmt)?;
             self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)
         }

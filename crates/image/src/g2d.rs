@@ -60,6 +60,22 @@ impl G2DProcessor {
         flip: Flip,
         crop: Crop,
     ) -> Result<()> {
+        let src_fmt_str = src_dyn
+            .format()
+            .map(|f| format!("{f}"))
+            .unwrap_or_else(|| "none".into());
+        let dst_fmt_str = dst_dyn
+            .format()
+            .map(|f| format!("{f}"))
+            .unwrap_or_else(|| "none".into());
+        log::trace!(
+            "G2D convert: {src_fmt_str}({:?}/{:?}) → {dst_fmt_str}({:?}/{:?})",
+            src_dyn.dtype(),
+            src_dyn.memory(),
+            dst_dyn.dtype(),
+            dst_dyn.memory(),
+        );
+
         if src_dyn.dtype() != DType::U8 {
             return Err(Error::NotSupported(
                 "G2D only supports u8 source tensors".to_string(),
@@ -171,9 +187,10 @@ impl G2DProcessor {
             dst_surface.height = crop_rect.height as i32;
         }
 
-        log::trace!("Blitting from {src_surface:?} to {dst_surface:?}");
+        log::trace!("G2D blit: {src_fmt}→{dst_fmt} int8={is_int8_dst}");
         self.g2d.blit(&src_surface, &dst_surface)?;
         self.g2d.finish()?;
+        log::trace!("G2D blit complete");
 
         // CPU fallback for RGB888 (unsupported by g2d_clear)
         if needs_clear && dst_fmt == Rgb {
