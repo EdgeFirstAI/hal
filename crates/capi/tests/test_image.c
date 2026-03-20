@@ -7,62 +7,62 @@
 #include <unistd.h>
 
 // =============================================================================
-// TensorImage Creation Tests
+// Image Tensor Creation Tests
 // =============================================================================
 
 static void test_tensor_image_new_rgb(void) {
     TEST("tensor_image_new_rgb");
 
-    struct hal_tensor_image* img = hal_tensor_image_new(640, 480, HAL_FOURCC_RGB, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* img = hal_tensor_new_image(640, 480, HAL_FOURCC_RGB, HAL_TENSOR_MEMORY_MEM);
     ASSERT_NOT_NULL(img);
 
-    ASSERT_EQ(640, hal_tensor_image_width(img));
-    ASSERT_EQ(480, hal_tensor_image_height(img));
-    ASSERT_EQ(HAL_FOURCC_RGB, hal_tensor_image_fourcc(img));
+    ASSERT_EQ(640, hal_tensor_width(img));
+    ASSERT_EQ(480, hal_tensor_height(img));
+    ASSERT_EQ(HAL_FOURCC_RGB, hal_tensor_fourcc(img));
 
-    hal_tensor_image_free(img);
+    hal_tensor_free(img);
     TEST_PASS();
 }
 
 static void test_tensor_image_new_rgba(void) {
     TEST("tensor_image_new_rgba");
 
-    struct hal_tensor_image* img = hal_tensor_image_new(1920, 1080, HAL_FOURCC_RGBA, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* img = hal_tensor_new_image(1920, 1080, HAL_FOURCC_RGBA, HAL_TENSOR_MEMORY_MEM);
     ASSERT_NOT_NULL(img);
 
-    ASSERT_EQ(1920, hal_tensor_image_width(img));
-    ASSERT_EQ(1080, hal_tensor_image_height(img));
-    ASSERT_EQ(HAL_FOURCC_RGBA, hal_tensor_image_fourcc(img));
+    ASSERT_EQ(1920, hal_tensor_width(img));
+    ASSERT_EQ(1080, hal_tensor_height(img));
+    ASSERT_EQ(HAL_FOURCC_RGBA, hal_tensor_fourcc(img));
 
-    hal_tensor_image_free(img);
+    hal_tensor_free(img);
     TEST_PASS();
 }
 
 static void test_tensor_image_new_nv12(void) {
     TEST("tensor_image_new_nv12");
 
-    struct hal_tensor_image* img = hal_tensor_image_new(640, 480, HAL_FOURCC_NV12, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* img = hal_tensor_new_image(640, 480, HAL_FOURCC_NV12, HAL_TENSOR_MEMORY_MEM);
     ASSERT_NOT_NULL(img);
 
-    ASSERT_EQ(640, hal_tensor_image_width(img));
-    ASSERT_EQ(480, hal_tensor_image_height(img));
-    ASSERT_EQ(HAL_FOURCC_NV12, hal_tensor_image_fourcc(img));
+    ASSERT_EQ(640, hal_tensor_width(img));
+    ASSERT_EQ(480, hal_tensor_height(img));
+    ASSERT_EQ(HAL_FOURCC_NV12, hal_tensor_fourcc(img));
 
-    hal_tensor_image_free(img);
+    hal_tensor_free(img);
     TEST_PASS();
 }
 
 static void test_tensor_image_new_grey(void) {
     TEST("tensor_image_new_grey");
 
-    struct hal_tensor_image* img = hal_tensor_image_new(256, 256, HAL_FOURCC_GREY, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* img = hal_tensor_new_image(256, 256, HAL_FOURCC_GREY, HAL_TENSOR_MEMORY_MEM);
     ASSERT_NOT_NULL(img);
 
-    ASSERT_EQ(256, hal_tensor_image_width(img));
-    ASSERT_EQ(256, hal_tensor_image_height(img));
-    ASSERT_EQ(HAL_FOURCC_GREY, hal_tensor_image_fourcc(img));
+    ASSERT_EQ(256, hal_tensor_width(img));
+    ASSERT_EQ(256, hal_tensor_height(img));
+    ASSERT_EQ(HAL_FOURCC_GREY, hal_tensor_fourcc(img));
 
-    hal_tensor_image_free(img);
+    hal_tensor_free(img);
     TEST_PASS();
 }
 
@@ -71,13 +71,13 @@ static void test_tensor_image_new_invalid(void) {
 
     // Zero width
     errno = 0;
-    struct hal_tensor_image* img = hal_tensor_image_new(0, 480, HAL_FOURCC_RGB, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* img = hal_tensor_new_image(0, 480, HAL_FOURCC_RGB, HAL_TENSOR_MEMORY_MEM);
     ASSERT_NULL(img);
     ASSERT_ERRNO(EINVAL);
 
     // Zero height
     errno = 0;
-    img = hal_tensor_image_new(640, 0, HAL_FOURCC_RGB, HAL_TENSOR_MEMORY_MEM);
+    img = hal_tensor_new_image(640, 0, HAL_FOURCC_RGB, HAL_TENSOR_MEMORY_MEM);
     ASSERT_NULL(img);
     ASSERT_ERRNO(EINVAL);
 
@@ -87,13 +87,13 @@ static void test_tensor_image_new_invalid(void) {
 static void test_tensor_image_null_handling(void) {
     TEST("tensor_image_null_handling");
 
-    ASSERT_EQ(0, hal_tensor_image_width(NULL));
-    ASSERT_EQ(0, hal_tensor_image_height(NULL));
-    ASSERT_EQ(HAL_FOURCC_RGB, hal_tensor_image_fourcc(NULL)); // Default to RGB
-    ASSERT_NULL(hal_tensor_image_tensor(NULL));
+    ASSERT_EQ(0, hal_tensor_width(NULL));
+    ASSERT_EQ(0, hal_tensor_height(NULL));
+    ASSERT_EQ(HAL_FOURCC_RGB, hal_tensor_fourcc(NULL)); // Default to RGB
+    ASSERT_NULL(hal_tensor_shape(NULL, NULL));
 
     // Free NULL should be no-op
-    hal_tensor_image_free(NULL);
+    hal_tensor_free(NULL);
 
     TEST_PASS();
 }
@@ -219,11 +219,11 @@ static void test_image_processor_convert_rgb_to_rgb(void) {
     }
 
     // Create source image
-    struct hal_tensor_image* src = hal_tensor_image_new(320, 240, HAL_FOURCC_RGB, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* src = hal_tensor_new_image(320, 240, HAL_FOURCC_RGB, HAL_TENSOR_MEMORY_MEM);
     ASSERT_NOT_NULL(src);
 
     // Create destination image (same size)
-    struct hal_tensor_image* dst = hal_tensor_image_new(320, 240, HAL_FOURCC_RGB, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* dst = hal_tensor_new_image(320, 240, HAL_FOURCC_RGB, HAL_TENSOR_MEMORY_MEM);
     ASSERT_NOT_NULL(dst);
 
     // Convert with no rotation/flip/crop
@@ -231,8 +231,8 @@ static void test_image_processor_convert_rgb_to_rgb(void) {
                                               HAL_ROTATION_NONE, HAL_FLIP_NONE, NULL);
     ASSERT_EQ(0, result);
 
-    hal_tensor_image_free(src);
-    hal_tensor_image_free(dst);
+    hal_tensor_free(src);
+    hal_tensor_free(dst);
     hal_image_processor_free(proc);
     TEST_PASS();
 }
@@ -247,11 +247,11 @@ static void test_image_processor_convert_scale(void) {
     }
 
     // Create source image
-    struct hal_tensor_image* src = hal_tensor_image_new(640, 480, HAL_FOURCC_RGB, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* src = hal_tensor_new_image(640, 480, HAL_FOURCC_RGB, HAL_TENSOR_MEMORY_MEM);
     ASSERT_NOT_NULL(src);
 
     // Create destination image (different size - scaling)
-    struct hal_tensor_image* dst = hal_tensor_image_new(320, 240, HAL_FOURCC_RGB, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* dst = hal_tensor_new_image(320, 240, HAL_FOURCC_RGB, HAL_TENSOR_MEMORY_MEM);
     ASSERT_NOT_NULL(dst);
 
     // Scale down
@@ -259,8 +259,8 @@ static void test_image_processor_convert_scale(void) {
                                               HAL_ROTATION_NONE, HAL_FLIP_NONE, NULL);
     ASSERT_EQ(0, result);
 
-    hal_tensor_image_free(src);
-    hal_tensor_image_free(dst);
+    hal_tensor_free(src);
+    hal_tensor_free(dst);
     hal_image_processor_free(proc);
     TEST_PASS();
 }
@@ -274,19 +274,19 @@ static void test_image_processor_convert_with_rotation(void) {
         return;
     }
 
-    struct hal_tensor_image* src = hal_tensor_image_new(640, 480, HAL_FOURCC_RGB, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* src = hal_tensor_new_image(640, 480, HAL_FOURCC_RGB, HAL_TENSOR_MEMORY_MEM);
     ASSERT_NOT_NULL(src);
 
     // For 90-degree rotation, dst should be 480x640
-    struct hal_tensor_image* dst = hal_tensor_image_new(480, 640, HAL_FOURCC_RGB, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* dst = hal_tensor_new_image(480, 640, HAL_FOURCC_RGB, HAL_TENSOR_MEMORY_MEM);
     ASSERT_NOT_NULL(dst);
 
     int result = hal_image_processor_convert(proc, src, dst,
                                               HAL_ROTATION_ROTATE90, HAL_FLIP_NONE, NULL);
     ASSERT_EQ(0, result);
 
-    hal_tensor_image_free(src);
-    hal_tensor_image_free(dst);
+    hal_tensor_free(src);
+    hal_tensor_free(dst);
     hal_image_processor_free(proc);
     TEST_PASS();
 }
@@ -300,7 +300,7 @@ static void test_image_processor_convert_invalid(void) {
         return;
     }
 
-    struct hal_tensor_image* img = hal_tensor_image_new(320, 240, HAL_FOURCC_RGB, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* img = hal_tensor_new_image(320, 240, HAL_FOURCC_RGB, HAL_TENSOR_MEMORY_MEM);
     ASSERT_NOT_NULL(img);
 
     // NULL processor
@@ -324,7 +324,7 @@ static void test_image_processor_convert_invalid(void) {
     ASSERT_EQ(-1, result);
     ASSERT_ERRNO(EINVAL);
 
-    hal_tensor_image_free(img);
+    hal_tensor_free(img);
     hal_image_processor_free(proc);
     TEST_PASS();
 }
@@ -341,18 +341,18 @@ static void test_tensor_image_dma(void) {
         return;
     }
 
-    struct hal_tensor_image* img = hal_tensor_image_new(640, 480, HAL_FOURCC_RGB, HAL_TENSOR_MEMORY_DMA);
+    struct hal_tensor* img = hal_tensor_new_image(640, 480, HAL_FOURCC_RGB, HAL_TENSOR_MEMORY_DMA);
     ASSERT_NOT_NULL(img);
 
-    ASSERT_EQ(640, hal_tensor_image_width(img));
-    ASSERT_EQ(480, hal_tensor_image_height(img));
+    ASSERT_EQ(640, hal_tensor_width(img));
+    ASSERT_EQ(480, hal_tensor_height(img));
 
     // Clone FD should work for DMA images
-    int fd = hal_tensor_image_clone_fd(img);
+    int fd = hal_tensor_clone_fd(img);
     ASSERT_TRUE(fd >= 0);
     close(fd);
 
-    hal_tensor_image_free(img);
+    hal_tensor_free(img);
     TEST_PASS();
 }
 

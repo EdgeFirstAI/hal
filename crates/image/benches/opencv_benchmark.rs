@@ -14,7 +14,11 @@
 mod common;
 
 use common::{calculate_letterbox, get_test_data, run_bench, BenchConfig, BenchSuite};
-use edgefirst_image::{RGB, RGBA, YUYV};
+use edgefirst_tensor::PixelFormat;
+
+const RGB: PixelFormat = PixelFormat::Rgb;
+const RGBA: PixelFormat = PixelFormat::Rgba;
+const YUYV: PixelFormat = PixelFormat::Yuyv;
 
 use opencv::{
     core::{set_num_threads, Mat, Scalar, Size, CV_8UC2, CV_8UC3, CV_8UC4},

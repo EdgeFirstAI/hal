@@ -20,6 +20,9 @@ pub enum Error {
     PboMapped,
     #[cfg(feature = "ndarray")]
     NdArrayError(ndarray::ShapeError),
+    InvalidShape(String),
+    InvalidArgument(String),
+    InvalidOperation(String),
 }
 
 impl From<std::io::Error> for Error {

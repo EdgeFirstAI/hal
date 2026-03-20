@@ -29,7 +29,6 @@ serde_yaml = { workspace = true }
 half = { workspace = true }
 uuid = { workspace = true }
 ndarray = { workspace = true }
-four-char-code = { workspace = true }
 log = { workspace = true }
 
 [build-dependencies]

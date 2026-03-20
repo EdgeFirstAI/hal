@@ -2,14 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::CPUProcessor;
-use crate::{Result, TensorImage};
+use crate::Result;
 use edgefirst_decoder::{DetectBox, Segmentation};
 use ndarray::Axis;
 
 impl CPUProcessor {
     pub(super) fn render_modelpack_segmentation(
         &mut self,
-        dst: &TensorImage,
+        dst_w: usize,
+        dst_h: usize,
+        dst_rs: usize,
+        dst_c: usize,
         dst_slice: &mut [u8],
         segmentation: &Segmentation,
     ) -> Result<()> {
@@ -19,18 +22,18 @@ impl CPUProcessor {
         let [seg_height, seg_width, seg_classes] = *seg.shape() else {
             unreachable!("Array3 did not have [usize; 3] as shape");
         };
-        let start_y = (dst.height() as f32 * segmentation.ymin).round();
-        let end_y = (dst.height() as f32 * segmentation.ymax).round();
-        let start_x = (dst.width() as f32 * segmentation.xmin).round();
-        let end_x = (dst.width() as f32 * segmentation.xmax).round();
+        let start_y = (dst_h as f32 * segmentation.ymin).round();
+        let end_y = (dst_h as f32 * segmentation.ymax).round();
+        let start_x = (dst_w as f32 * segmentation.xmin).round();
+        let end_x = (dst_w as f32 * segmentation.xmax).round();
 
         let scale_x = (seg_width as f32 - 1.0) / ((end_x - start_x) - 1.0);
         let scale_y = (seg_height as f32 - 1.0) / ((end_y - start_y) - 1.0);
 
-        let start_x_u = (start_x as usize).min(dst.width());
-        let start_y_u = (start_y as usize).min(dst.height());
-        let end_x_u = (end_x as usize).min(dst.width());
-        let end_y_u = (end_y as usize).min(dst.height());
+        let start_x_u = (start_x as usize).min(dst_w);
+        let start_y_u = (start_y as usize).min(dst_h);
+        let end_x_u = (end_x as usize).min(dst_w);
+        let end_y_u = (end_y as usize).min(dst_h);
 
         let argmax = seg.map_axis(Axis(2), |r| r.argmax().unwrap());
         let get_value_at_nearest = |x: f32, y: f32| -> usize {
@@ -56,7 +59,7 @@ impl CPUProcessor {
 
                 let alpha = color[3] as u16;
 
-                let dst_index = (y * dst.row_stride()) + (x * dst.channels());
+                let dst_index = (y * dst_rs) + (x * dst_c);
                 for c in 0..3 {
                     dst_slice[dst_index + c] = ((color[c] as u16 * alpha
                         + dst_slice[dst_index + c] as u16 * (255 - alpha))
@@ -68,9 +71,13 @@ impl CPUProcessor {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn render_yolo_segmentation(
         &mut self,
-        dst: &TensorImage,
+        dst_w: usize,
+        dst_h: usize,
+        dst_rs: usize,
+        dst_c: usize,
         dst_slice: &mut [u8],
         segmentation: &Segmentation,
         class: usize,
@@ -81,18 +88,18 @@ impl CPUProcessor {
         };
         debug_assert_eq!(classes, 1);
 
-        let start_y = (dst.height() as f32 * segmentation.ymin).round();
-        let end_y = (dst.height() as f32 * segmentation.ymax).round();
-        let start_x = (dst.width() as f32 * segmentation.xmin).round();
-        let end_x = (dst.width() as f32 * segmentation.xmax).round();
+        let start_y = (dst_h as f32 * segmentation.ymin).round();
+        let end_y = (dst_h as f32 * segmentation.ymax).round();
+        let start_x = (dst_w as f32 * segmentation.xmin).round();
+        let end_x = (dst_w as f32 * segmentation.xmax).round();
 
         let scale_x = (seg_width as f32 - 1.0) / ((end_x - start_x) - 1.0);
         let scale_y = (seg_height as f32 - 1.0) / ((end_y - start_y) - 1.0);
 
-        let start_x_u = (start_x as usize).min(dst.width());
-        let start_y_u = (start_y as usize).min(dst.height());
-        let end_x_u = (end_x as usize).min(dst.width());
-        let end_y_u = (end_y as usize).min(dst.height());
+        let start_x_u = (start_x as usize).min(dst_w);
+        let start_y_u = (start_y as usize).min(dst_h);
+        let end_x_u = (end_x as usize).min(dst_w);
+        let end_y_u = (end_y as usize).min(dst_h);
 
         for y in start_y_u..end_y_u {
             for x in start_x_u..end_x_u {
@@ -108,7 +115,7 @@ impl CPUProcessor {
 
                 let alpha = color[3] as u16;
 
-                let dst_index = (y * dst.row_stride()) + (x * dst.channels());
+                let dst_index = (y * dst_rs) + (x * dst_c);
                 for c in 0..3 {
                     dst_slice[dst_index + c] = ((color[c] as u16 * alpha
                         + dst_slice[dst_index + c] as u16 * (255 - alpha))
@@ -122,11 +129,15 @@ impl CPUProcessor {
 
     pub(super) fn render_box(
         &mut self,
-        dst: &TensorImage,
+        dst_w: usize,
+        dst_h: usize,
+        dst_rs: usize,
+        dst_c: usize,
         dst_slice: &mut [u8],
         detect: &[DetectBox],
     ) -> Result<()> {
         const LINE_THICKNESS: usize = 3;
+
         for d in detect {
             use edgefirst_decoder::BoundingBox;
 
@@ -140,23 +151,23 @@ impl CPUProcessor {
                 ymax: bbox.ymax.clamp(0.0, 1.0),
             };
             let inner = [
-                ((dst.width() - 1) as f32 * bbox.xmin - 0.5).round() as usize,
-                ((dst.height() - 1) as f32 * bbox.ymin - 0.5).round() as usize,
-                ((dst.width() - 1) as f32 * bbox.xmax + 0.5).round() as usize,
-                ((dst.height() - 1) as f32 * bbox.ymax + 0.5).round() as usize,
+                ((dst_w - 1) as f32 * bbox.xmin - 0.5).round() as usize,
+                ((dst_h - 1) as f32 * bbox.ymin - 0.5).round() as usize,
+                ((dst_w - 1) as f32 * bbox.xmax + 0.5).round() as usize,
+                ((dst_h - 1) as f32 * bbox.ymax + 0.5).round() as usize,
             ];
 
             let outer = [
                 inner[0].saturating_sub(LINE_THICKNESS),
                 inner[1].saturating_sub(LINE_THICKNESS),
-                (inner[2] + LINE_THICKNESS).min(dst.width()),
-                (inner[3] + LINE_THICKNESS).min(dst.height()),
+                (inner[2] + LINE_THICKNESS).min(dst_w),
+                (inner[3] + LINE_THICKNESS).min(dst_h),
             ];
 
             // top line
             for y in outer[1] + 1..=inner[1] {
                 for x in outer[0] + 1..outer[2] {
-                    let index = (y * dst.row_stride()) + (x * dst.channels());
+                    let index = (y * dst_rs) + (x * dst_c);
                     dst_slice[index..(index + 3)].copy_from_slice(&[r, g, b]);
                 }
             }
@@ -164,12 +175,12 @@ impl CPUProcessor {
             // left and right lines
             for y in inner[1]..inner[3] {
                 for x in outer[0] + 1..=inner[0] {
-                    let index = (y * dst.row_stride()) + (x * dst.channels());
+                    let index = (y * dst_rs) + (x * dst_c);
                     dst_slice[index..(index + 3)].copy_from_slice(&[r, g, b]);
                 }
 
                 for x in inner[2]..outer[2] {
-                    let index = (y * dst.row_stride()) + (x * dst.channels());
+                    let index = (y * dst_rs) + (x * dst_c);
                     dst_slice[index..(index + 3)].copy_from_slice(&[r, g, b]);
                 }
             }
@@ -177,7 +188,7 @@ impl CPUProcessor {
             // bottom line
             for y in inner[3]..outer[3] {
                 for x in outer[0] + 1..outer[2] {
-                    let index = (y * dst.row_stride()) + (x * dst.channels());
+                    let index = (y * dst_rs) + (x * dst_c);
                     dst_slice[index..(index + 3)].copy_from_slice(&[r, g, b]);
                 }
             }

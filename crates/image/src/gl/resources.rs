@@ -259,7 +259,6 @@ impl GlProgram {
         })
     }
 
-    #[allow(dead_code)]
     pub(super) fn load_uniform_1f(&self, name: &CStr, value: f32) -> Result<(), crate::Error> {
         unsafe {
             gls::gl::UseProgram(self.id);
@@ -269,7 +268,6 @@ impl GlProgram {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub(super) fn load_uniform_1i(&self, name: &CStr, value: i32) -> Result<(), crate::Error> {
         unsafe {
             gls::gl::UseProgram(self.id);
