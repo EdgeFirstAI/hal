@@ -1612,13 +1612,34 @@ impl GLProcessorST {
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
         self.setup_renderbuffer_non_dma(dst, dst_fmt, crop)?;
-        let start = Instant::now();
-        if dst_fmt.layout() == PixelLayout::Planar {
-            self.convert_to_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)?;
-        } else {
-            self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)?;
+
+        // For int8 non-planar output, swap to int8 shader programs.
+        if is_int8 && dst_fmt.layout() != PixelLayout::Planar {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
         }
+
+        let start = Instant::now();
+        let render_result = if dst_fmt.layout() == PixelLayout::Planar {
+            self.convert_to_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
+        } else {
+            self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)
+        };
+
+        if is_int8 && dst_fmt.layout() != PixelLayout::Planar {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
+        }
+        render_result?;
         log::debug!("Draw to framebuffer takes {:?}", start.elapsed());
+
+        // ReadnPixels into Mem dst — data is already int8-biased by the shader.
         let start = Instant::now();
         let dest_format = match dst_fmt {
             PixelFormat::Rgb => gls::gl::RGB,
@@ -1643,11 +1664,6 @@ impl GLProcessorST {
             if dst_fmt == PixelFormat::Bgra {
                 for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
                     chunk.swap(0, 2);
-                }
-            }
-            if is_int8 {
-                for byte in dst_map.iter_mut() {
-                    *byte ^= 0x80;
                 }
             }
         }
@@ -1872,6 +1888,16 @@ impl GLProcessorST {
 
         self.setup_renderbuffer_non_dma(dst, dst_fmt, crop)?;
 
+        // For int8 output, swap to int8 shader programs so the GPU applies
+        // XOR 0x80 in the fragment shader — no CPU readback needed for int8.
+        if is_int8 {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
+        }
+
         // Upload source from PBO and render.
         // We cannot call convert_to/draw_src_texture directly because they
         // call src.tensor().map() which sends a message back to THIS thread,
@@ -1879,7 +1905,7 @@ impl GLProcessorST {
         // and upload to the texture with a NULL pointer — GL reads directly
         // from the PBO, zero CPU copy.
         let start = Instant::now();
-        self.draw_src_texture_from_pbo(
+        let render_result = self.draw_src_texture_from_pbo(
             src,
             src_fmt,
             src_buffer_id,
@@ -1888,7 +1914,16 @@ impl GLProcessorST {
             rotation,
             flip,
             crop,
-        )?;
+        );
+        // Swap shaders back before checking result
+        if is_int8 {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
+        }
+        render_result?;
         log::debug!("PBO render takes {:?}", start.elapsed());
 
         let start_read = Instant::now();
@@ -1924,9 +1959,9 @@ impl GLProcessorST {
 
         check_gl_error(function!(), line!())?;
 
-        // Handle BGRA R↔B swap and/or int8 XOR if needed (must map PBO to do
-        // this on the GL thread directly, since we're already on the GL thread).
-        if dst_fmt == PixelFormat::Bgra || is_int8 {
+        // Handle BGRA R↔B swap if needed (must map PBO on the GL thread).
+        // Int8 XOR 0x80 is handled in the fragment shader — no CPU map needed.
+        if dst_fmt == PixelFormat::Bgra {
             unsafe {
                 gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, dst_buffer_id);
                 let ptr = gls::gl::MapBufferRange(
@@ -1937,15 +1972,8 @@ impl GLProcessorST {
                 );
                 if !ptr.is_null() {
                     let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, dst.len());
-                    if dst_fmt == PixelFormat::Bgra {
-                        for chunk in slice.chunks_exact_mut(4) {
-                            chunk.swap(0, 2);
-                        }
-                    }
-                    if is_int8 {
-                        for byte in slice.iter_mut() {
-                            *byte ^= 0x80;
-                        }
+                    for chunk in slice.chunks_exact_mut(4) {
+                        chunk.swap(0, 2);
                     }
                     gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
                 }
@@ -2234,12 +2262,32 @@ impl GLProcessorST {
         let dst_buffer_id = dst_pbo.buffer_id();
 
         self.setup_renderbuffer_non_dma(dst, dst_fmt, crop)?;
-        let start = Instant::now();
-        if dst_fmt.layout() == PixelLayout::Planar {
-            self.convert_to_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)?;
-        } else {
-            self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)?;
+
+        // For int8 non-planar output, swap to int8 shader programs.
+        // Planar path handles int8 internally via its own int8 shader.
+        if is_int8 && dst_fmt.layout() != PixelLayout::Planar {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
         }
+
+        let start = Instant::now();
+        let render_result = if dst_fmt.layout() == PixelLayout::Planar {
+            self.convert_to_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
+        } else {
+            self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)
+        };
+
+        if is_int8 && dst_fmt.layout() != PixelLayout::Planar {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
+        }
+        render_result?;
         log::debug!("any-to-PBO render takes {:?}", start.elapsed());
 
         let start_read = Instant::now();
@@ -2273,7 +2321,9 @@ impl GLProcessorST {
         }
         check_gl_error(function!(), line!())?;
 
-        if dst_fmt == PixelFormat::Bgra || is_int8 {
+        // Handle BGRA R↔B swap if needed (must map PBO on the GL thread).
+        // Int8 XOR 0x80 is handled in the fragment shader — no CPU map needed.
+        if dst_fmt == PixelFormat::Bgra {
             unsafe {
                 gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, dst_buffer_id);
                 let ptr = gls::gl::MapBufferRange(
@@ -2284,15 +2334,8 @@ impl GLProcessorST {
                 );
                 if !ptr.is_null() {
                     let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, dst.len());
-                    if dst_fmt == PixelFormat::Bgra {
-                        for chunk in slice.chunks_exact_mut(4) {
-                            chunk.swap(0, 2);
-                        }
-                    }
-                    if is_int8 {
-                        for byte in slice.iter_mut() {
-                            *byte ^= 0x80;
-                        }
+                    for chunk in slice.chunks_exact_mut(4) {
+                        chunk.swap(0, 2);
                     }
                     gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
                 }
@@ -2331,8 +2374,19 @@ impl GLProcessorST {
         let src_buffer_id = src_pbo.buffer_id();
 
         self.setup_renderbuffer_non_dma(dst, dst_fmt, crop)?;
+
+        // For int8 output, swap to int8 shader programs so the GPU renders
+        // XOR'd values — ReadnPixels then reads already-biased data.
+        if is_int8 {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
+        }
+
         let start = Instant::now();
-        self.draw_src_texture_from_pbo(
+        let render_result = self.draw_src_texture_from_pbo(
             src,
             src_fmt,
             src_buffer_id,
@@ -2341,12 +2395,20 @@ impl GLProcessorST {
             rotation,
             flip,
             crop,
-        )?;
+        );
+
+        if is_int8 {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
+        }
+        render_result?;
         log::debug!("PBO-to-mem render takes {:?}", start.elapsed());
 
-        // Normal readback into Mem dst
+        // ReadnPixels into Mem dst — data is already int8-biased by the shader.
         let start = Instant::now();
-        // BGRA framebuffer uses RGBA internally; read as RGBA, swap later.
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
         let dest_format = match dst_fmt {
@@ -2375,11 +2437,6 @@ impl GLProcessorST {
             if dst_fmt == PixelFormat::Bgra {
                 for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
                     chunk.swap(0, 2);
-                }
-            }
-            if is_int8 {
-                for byte in dst_map.iter_mut() {
-                    *byte ^= 0x80;
                 }
             }
         }
