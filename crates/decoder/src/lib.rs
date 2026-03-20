@@ -2782,14 +2782,32 @@ mod decoder_tests {
 mod decoder_tracked_tests {
 
     use edgefirst_tracker::{ByteTrackBuilder, Tracker};
-    use ndarray::{s, Array3};
+    use ndarray::{array, s, Array, Array2, Array3, Array4, ArrayView, Axis, Dimension};
+    use num_traits::{AsPrimitive, Float, PrimInt};
     use rand::{RngExt, SeedableRng};
     use rand_distr::StandardNormal;
 
     use crate::{
         configs::{self, DimName},
-        dequantize_ndarray, BoundingBox, DecoderBuilder, DetectBox,
+        dequantize_ndarray, BoundingBox, DecoderBuilder, DetectBox, Quantization,
     };
+
+    pub fn quantize_ndarray<T: PrimInt + 'static, D: Dimension, F: Float + AsPrimitive<T>>(
+        input: ArrayView<F, D>,
+        quant: Quantization,
+    ) -> Array<T, D>
+    where
+        i32: num_traits::AsPrimitive<F>,
+        f32: num_traits::AsPrimitive<F>,
+    {
+        let zero_point = quant.zero_point.as_();
+        let div_scale = F::one() / quant.scale.as_();
+        if zero_point != F::zero() {
+            input.mapv(|d| (d * div_scale + zero_point).round().as_())
+        } else {
+            input.mapv(|d| (d * div_scale).round().as_())
+        }
+    }
 
     #[test]
     fn test_decoder_tracked_random_jitter() {
@@ -3141,6 +3159,214 @@ mod decoder_tracked_tests {
     }
 
     #[test]
+    fn test_decoder_tracked_segdet_proto() {
+        use crate::configs::Nms;
+        use crate::DecoderBuilder;
+
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+        let boxes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_boxes_116x8400.bin"
+        ));
+        let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
+        let mut boxes = ndarray::Array3::from_shape_vec((1, 116, 8400), boxes.to_vec()).unwrap();
+
+        let protos = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_protos_160x160x32.bin"
+        ));
+        let protos =
+            unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
+        let protos = ndarray::Array4::from_shape_vec((1, 160, 160, 32), protos.to_vec()).unwrap();
+
+        let config = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_seg.yaml"
+        ));
+
+        let decoder = DecoderBuilder::default()
+            .with_config_yaml_str(config.to_string())
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .with_nms(Some(Nms::ClassAgnostic))
+            .build()
+            .unwrap();
+
+        let expected_boxes = [
+            DetectBox {
+                bbox: BoundingBox {
+                    xmin: 0.08515105,
+                    ymin: 0.7131401,
+                    xmax: 0.29802868,
+                    ymax: 0.8195788,
+                },
+                score: 0.91537374,
+                label: 23,
+            },
+            DetectBox {
+                bbox: BoundingBox {
+                    xmin: 0.59605736,
+                    ymin: 0.25545314,
+                    xmax: 0.93666154,
+                    ymax: 0.72378385,
+                },
+                score: 0.91537374,
+                label: 23,
+            },
+        ];
+
+        let mut tracker = ByteTrackBuilder::new()
+            .track_update(0.1)
+            .track_high_conf(0.7)
+            .build();
+
+        let mut output_boxes = Vec::with_capacity(50);
+        let mut output_tracks = Vec::with_capacity(50);
+
+        decoder
+            .decode_tracked_quantized_proto(
+                &mut tracker,
+                0,
+                &[boxes.view().into(), protos.view().into()],
+                &mut output_boxes,
+                &mut output_tracks,
+            )
+            .unwrap();
+
+        assert_eq!(output_boxes.len(), 2);
+        assert!(output_boxes[0].equal_within_delta(&expected_boxes[0], 1.0 / 160.0));
+        assert!(output_boxes[1].equal_within_delta(&expected_boxes[1], 1.0 / 160.0));
+
+        // give the decoder a final frame with no detections to ensure tracks are properly predicting forward when detection is missing
+        let mut scores_values = boxes.slice_mut(s![0, 4..84, ..]);
+        for score in scores_values.iter_mut() {
+            *score = i8::MIN; // set all scores to minimum to simulate no detections
+        }
+        let protos = decoder
+            .decode_tracked_quantized_proto(
+                &mut tracker,
+                100_000_000 / 3,
+                &[boxes.view().into(), protos.view().into()],
+                &mut output_boxes,
+                &mut output_tracks,
+            )
+            .unwrap();
+
+        assert!(output_boxes[0].equal_within_delta(&expected_boxes[0], 1e-6));
+        assert!(output_boxes[1].equal_within_delta(&expected_boxes[1], 1e-6));
+
+        // no masks when the boxes are from tracker prediction without a matching detection
+        assert!(protos.is_some_and(|x| x.mask_coefficients.is_empty()));
+    }
+
+    #[test]
+    fn test_decoder_tracked_segdet_proto_float() {
+        use crate::configs::Nms;
+        use crate::DecoderBuilder;
+
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+        let boxes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_boxes_116x8400.bin"
+        ));
+        let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
+        let boxes = ndarray::Array3::from_shape_vec((1, 116, 8400), boxes.to_vec()).unwrap();
+        let quant_boxes = (0.021287762, 31);
+        let mut boxes = dequantize_ndarray(boxes.view(), quant_boxes.into());
+
+        let protos = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_protos_160x160x32.bin"
+        ));
+        let protos =
+            unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
+        let protos = ndarray::Array4::from_shape_vec((1, 160, 160, 32), protos.to_vec()).unwrap();
+        let quant_protos = (0.02491162, -117);
+        let protos = dequantize_ndarray(protos.view(), quant_protos.into());
+
+        let config = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_seg.yaml"
+        ));
+
+        let decoder = DecoderBuilder::default()
+            .with_config_yaml_str(config.to_string())
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .with_nms(Some(Nms::ClassAgnostic))
+            .build()
+            .unwrap();
+
+        let expected_boxes = [
+            DetectBox {
+                bbox: BoundingBox {
+                    xmin: 0.08515105,
+                    ymin: 0.7131401,
+                    xmax: 0.29802868,
+                    ymax: 0.8195788,
+                },
+                score: 0.91537374,
+                label: 23,
+            },
+            DetectBox {
+                bbox: BoundingBox {
+                    xmin: 0.59605736,
+                    ymin: 0.25545314,
+                    xmax: 0.93666154,
+                    ymax: 0.72378385,
+                },
+                score: 0.91537374,
+                label: 23,
+            },
+        ];
+
+        let mut tracker = ByteTrackBuilder::new()
+            .track_update(0.1)
+            .track_high_conf(0.7)
+            .build();
+
+        let mut output_boxes = Vec::with_capacity(50);
+        let mut output_tracks = Vec::with_capacity(50);
+
+        decoder
+            .decode_tracked_float_proto(
+                &mut tracker,
+                0,
+                &[boxes.view().into_dyn(), protos.view().into_dyn()],
+                &mut output_boxes,
+                &mut output_tracks,
+            )
+            .unwrap();
+
+        assert_eq!(output_boxes.len(), 2);
+        assert!(output_boxes[0].equal_within_delta(&expected_boxes[0], 1.0 / 160.0));
+        assert!(output_boxes[1].equal_within_delta(&expected_boxes[1], 1.0 / 160.0));
+
+        // give the decoder a final frame with no detections to ensure tracks are properly predicting forward when detection is missing
+        let mut scores_values = boxes.slice_mut(s![0, 4..84, ..]);
+        for score in scores_values.iter_mut() {
+            *score = 0.0; // set all scores to minimum to simulate no detections
+        }
+        let protos = decoder
+            .decode_tracked_float_proto(
+                &mut tracker,
+                100_000_000 / 3,
+                &[boxes.view().into_dyn(), protos.view().into_dyn()],
+                &mut output_boxes,
+                &mut output_tracks,
+            )
+            .unwrap();
+
+        assert!(output_boxes[0].equal_within_delta(&expected_boxes[0], 1e-6));
+        assert!(output_boxes[1].equal_within_delta(&expected_boxes[1], 1e-6));
+
+        // no masks when the boxes are from tracker prediction without a matching detection
+        assert!(protos.is_some_and(|x| x.mask_coefficients.is_empty()));
+    }
+
+    #[test]
     fn test_decoder_tracked_segdet_split() {
         let score_threshold = 0.45;
         let iou_threshold = 0.45;
@@ -3456,6 +3682,1362 @@ mod decoder_tracked_tests {
 
         // no masks when the boxes are from tracker prediction without a matching detection
         assert!(output_masks.is_empty())
+    }
+
+    #[test]
+    fn test_decoder_tracked_segdet_split_proto() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+
+        let boxes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_boxes_116x8400.bin"
+        ));
+        let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
+        let boxes = boxes.to_vec();
+        let boxes = ndarray::Array3::from_shape_vec((1, 116, 8400), boxes).unwrap();
+
+        let mask = boxes.slice(s![.., 84.., ..]).to_owned();
+        let mut scores = boxes.slice(s![.., 4..84, ..]).to_owned();
+        let boxes = boxes.slice(s![.., ..4, ..]).to_owned();
+
+        let quant_boxes = (0.021287762, 31);
+
+        let protos = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_protos_160x160x32.bin"
+        ));
+        let protos =
+            unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
+        let protos = protos.to_vec();
+        let protos = ndarray::Array4::from_shape_vec((1, 160, 160, 32), protos).unwrap();
+        let quant_protos = (0.02491162, -117);
+        let decoder = DecoderBuilder::default()
+            .with_config_yolo_split_segdet(
+                configs::Boxes {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: Some(quant_boxes.into()),
+                    shape: vec![1, 4, 8400],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::BoxCoords, 4),
+                        (DimName::NumBoxes, 8400),
+                    ],
+                    normalized: Some(true),
+                },
+                configs::Scores {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: Some(quant_boxes.into()),
+                    shape: vec![1, 80, 8400],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumClasses, 80),
+                        (DimName::NumBoxes, 8400),
+                    ],
+                },
+                configs::MaskCoefficients {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: Some(quant_boxes.into()),
+                    shape: vec![1, 32, 8400],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumProtos, 32),
+                        (DimName::NumBoxes, 8400),
+                    ],
+                },
+                configs::Protos {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: Some(quant_protos.into()),
+                    shape: vec![1, 160, 160, 32],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::Height, 160),
+                        (DimName::Width, 160),
+                        (DimName::NumProtos, 32),
+                    ],
+                },
+            )
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .build()
+            .unwrap();
+
+        let expected_boxes = [
+            DetectBox {
+                bbox: BoundingBox {
+                    xmin: 0.08515105,
+                    ymin: 0.7131401,
+                    xmax: 0.29802868,
+                    ymax: 0.8195788,
+                },
+                score: 0.91537374,
+                label: 23,
+            },
+            DetectBox {
+                bbox: BoundingBox {
+                    xmin: 0.59605736,
+                    ymin: 0.25545314,
+                    xmax: 0.93666154,
+                    ymax: 0.72378385,
+                },
+                score: 0.91537374,
+                label: 23,
+            },
+        ];
+
+        let mut tracker = ByteTrackBuilder::new()
+            .track_update(0.1)
+            .track_high_conf(0.7)
+            .build();
+
+        let mut output_boxes = Vec::with_capacity(50);
+        let mut output_tracks = Vec::with_capacity(50);
+
+        decoder
+            .decode_tracked_quantized_proto(
+                &mut tracker,
+                0,
+                &[
+                    boxes.view().into(),
+                    scores.view().into(),
+                    mask.view().into(),
+                    protos.view().into(),
+                ],
+                &mut output_boxes,
+                &mut output_tracks,
+            )
+            .unwrap();
+
+        assert_eq!(output_boxes.len(), 2);
+        assert!(output_boxes[0].equal_within_delta(&expected_boxes[0], 1.0 / 160.0));
+        assert!(output_boxes[1].equal_within_delta(&expected_boxes[1], 1.0 / 160.0));
+
+        // give the decoder a final frame with no detections to ensure tracks are properly predicting forward when detection is missing
+
+        for score in scores.iter_mut() {
+            *score = i8::MIN; // set all scores to minimum to simulate no detections
+        }
+        let protos = decoder
+            .decode_tracked_quantized_proto(
+                &mut tracker,
+                100_000_000 / 3,
+                &[
+                    boxes.view().into(),
+                    scores.view().into(),
+                    mask.view().into(),
+                    protos.view().into(),
+                ],
+                &mut output_boxes,
+                &mut output_tracks,
+            )
+            .unwrap();
+
+        assert!(output_boxes[0].equal_within_delta(&expected_boxes[0], 1e-6));
+        assert!(output_boxes[1].equal_within_delta(&expected_boxes[1], 1e-6));
+
+        // no masks when the boxes are from tracker prediction without a matching detection
+        assert!(protos.is_some_and(|x| x.mask_coefficients.is_empty()));
+    }
+
+    #[test]
+    fn test_decoder_tracked_segdet_split_proto_float() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+
+        let boxes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_boxes_116x8400.bin"
+        ));
+        let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
+        let boxes = boxes.to_vec();
+        let boxes = ndarray::Array3::from_shape_vec((1, 116, 8400), boxes).unwrap();
+        let quant_boxes = (0.021287762, 31);
+        let boxes = dequantize_ndarray(boxes.view(), quant_boxes.into());
+
+        let mask = boxes.slice(s![.., 84.., ..]).to_owned();
+        let mut scores = boxes.slice(s![.., 4..84, ..]).to_owned();
+        let boxes = boxes.slice(s![.., ..4, ..]).to_owned();
+
+        let protos = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_protos_160x160x32.bin"
+        ));
+        let protos =
+            unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
+        let protos = protos.to_vec();
+        let protos = ndarray::Array4::from_shape_vec((1, 160, 160, 32), protos).unwrap();
+        let quant_protos = (0.02491162, -117);
+        let protos = dequantize_ndarray(protos.view(), quant_protos.into());
+
+        let decoder = DecoderBuilder::default()
+            .with_config_yolo_split_segdet(
+                configs::Boxes {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: Some(quant_boxes.into()),
+                    shape: vec![1, 4, 8400],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::BoxCoords, 4),
+                        (DimName::NumBoxes, 8400),
+                    ],
+                    normalized: Some(true),
+                },
+                configs::Scores {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: Some(quant_boxes.into()),
+                    shape: vec![1, 80, 8400],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumClasses, 80),
+                        (DimName::NumBoxes, 8400),
+                    ],
+                },
+                configs::MaskCoefficients {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: Some(quant_boxes.into()),
+                    shape: vec![1, 32, 8400],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumProtos, 32),
+                        (DimName::NumBoxes, 8400),
+                    ],
+                },
+                configs::Protos {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: Some(quant_protos.into()),
+                    shape: vec![1, 160, 160, 32],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::Height, 160),
+                        (DimName::Width, 160),
+                        (DimName::NumProtos, 32),
+                    ],
+                },
+            )
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .build()
+            .unwrap();
+
+        let expected_boxes = [
+            DetectBox {
+                bbox: BoundingBox {
+                    xmin: 0.08515105,
+                    ymin: 0.7131401,
+                    xmax: 0.29802868,
+                    ymax: 0.8195788,
+                },
+                score: 0.91537374,
+                label: 23,
+            },
+            DetectBox {
+                bbox: BoundingBox {
+                    xmin: 0.59605736,
+                    ymin: 0.25545314,
+                    xmax: 0.93666154,
+                    ymax: 0.72378385,
+                },
+                score: 0.91537374,
+                label: 23,
+            },
+        ];
+
+        let mut tracker = ByteTrackBuilder::new()
+            .track_update(0.1)
+            .track_high_conf(0.7)
+            .build();
+
+        let mut output_boxes = Vec::with_capacity(50);
+        let mut output_tracks = Vec::with_capacity(50);
+
+        decoder
+            .decode_tracked_float_proto(
+                &mut tracker,
+                0,
+                &[
+                    boxes.view().into_dyn(),
+                    scores.view().into_dyn(),
+                    mask.view().into_dyn(),
+                    protos.view().into_dyn(),
+                ],
+                &mut output_boxes,
+                &mut output_tracks,
+            )
+            .unwrap();
+
+        assert_eq!(output_boxes.len(), 2);
+        assert!(output_boxes[0].equal_within_delta(&expected_boxes[0], 1.0 / 160.0));
+        assert!(output_boxes[1].equal_within_delta(&expected_boxes[1], 1.0 / 160.0));
+
+        // give the decoder a final frame with no detections to ensure tracks are properly predicting forward when detection is missing
+
+        for score in scores.iter_mut() {
+            *score = 0.0; // set all scores to minimum to simulate no detections
+        }
+        let protos = decoder
+            .decode_tracked_float_proto(
+                &mut tracker,
+                100_000_000 / 3,
+                &[
+                    boxes.view().into_dyn(),
+                    scores.view().into_dyn(),
+                    mask.view().into_dyn(),
+                    protos.view().into_dyn(),
+                ],
+                &mut output_boxes,
+                &mut output_tracks,
+            )
+            .unwrap();
+
+        assert!(output_boxes[0].equal_within_delta(&expected_boxes[0], 1e-6));
+        assert!(output_boxes[1].equal_within_delta(&expected_boxes[1], 1e-6));
+
+        // no masks when the boxes are from tracker prediction without a matching detection
+        assert!(protos.is_some_and(|x| x.mask_coefficients.is_empty()));
+    }
+
+    #[test]
+    fn test_decoder_tracked_end_to_end_segdet() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+
+        let mut boxes = Array2::zeros((10, 4));
+        let mut scores = Array2::zeros((10, 1));
+        let mut classes = Array2::zeros((10, 1));
+        let mask = Array2::zeros((10, 32));
+        let protos = Array3::<f64>::zeros((160, 160, 32));
+        let protos = protos.insert_axis(Axis(0));
+
+        let protos_quant = (1.0 / 255.0, 0.0);
+        let protos: Array4<u8> = quantize_ndarray(protos.view(), protos_quant.into());
+
+        boxes
+            .slice_mut(s![0, ..,])
+            .assign(&array![0.1234, 0.1234, 0.2345, 0.2345]);
+        scores.slice_mut(s![0, ..]).assign(&array![0.9876]);
+        classes.slice_mut(s![0, ..]).assign(&array![2.0]);
+
+        let detect = ndarray::concatenate![
+            Axis(1),
+            boxes.view(),
+            scores.view(),
+            classes.view(),
+            mask.view()
+        ];
+        let detect = detect.insert_axis(Axis(0));
+        assert_eq!(detect.shape(), &[1, 10, 38]);
+        let detect_quant = (2.0 / 255.0, 0.0);
+        let mut detect: Array3<u8> = quantize_ndarray(detect.view(), detect_quant.into());
+        let config = "
+decoder_version: yolo26
+outputs:
+ - type: detection
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 38]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [num_features, 38]
+   normalized: true
+ - type: protos
+   decoder: ultralytics
+   quantization: [0.0039215686274509803921568627451, 128]
+   shape: [1, 160, 160, 32]
+   dshape:
+    - [batch, 1]
+    - [height, 160]
+    - [width, 160]
+    - [num_protos, 32]
+";
+
+        let decoder = DecoderBuilder::default()
+            .with_config_yaml_str(config.to_string())
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .build()
+            .unwrap();
+
+        // Expected boxes doesn't match the float values exactly due to quantization error
+        let expected_boxes = [DetectBox {
+            bbox: BoundingBox {
+                xmin: 0.12549022,
+                ymin: 0.12549022,
+                xmax: 0.23529413,
+                ymax: 0.23529413,
+            },
+            score: 0.98823535,
+            label: 2,
+        }];
+
+        let mut tracker = ByteTrackBuilder::new()
+            .track_update(0.1)
+            .track_high_conf(0.7)
+            .build();
+
+        let mut output_boxes = Vec::with_capacity(50);
+        let mut output_masks = Vec::with_capacity(50);
+        let mut output_tracks = Vec::with_capacity(50);
+
+        decoder
+            .decode_tracked_quantized(
+                &mut tracker,
+                0,
+                &[detect.view().into(), protos.view().into()],
+                &mut output_boxes,
+                &mut output_masks,
+                &mut output_tracks,
+            )
+            .unwrap();
+
+        assert_eq!(output_boxes.len(), 1);
+        assert!(output_boxes[0].equal_within_delta(&expected_boxes[0], 1.0 / 160.0));
+
+        // give the decoder a final frame with no detections to ensure tracks are properly predicting forward when detection is missing
+
+        for score in detect.slice_mut(s![.., .., 4]).iter_mut() {
+            *score = u8::MIN; // set all scores to minimum to simulate no detections
+        }
+
+        decoder
+            .decode_tracked_quantized(
+                &mut tracker,
+                100_000_000 / 3,
+                &[detect.view().into(), protos.view().into()],
+                &mut output_boxes,
+                &mut output_masks,
+                &mut output_tracks,
+            )
+            .unwrap();
+        assert!(output_boxes[0].equal_within_delta(&expected_boxes[0], 1e-6));
+        // no masks when the boxes are from tracker prediction without a matching detection
+        assert!(output_masks.is_empty())
+    }
+
+    #[test]
+    fn test_decoder_tracked_end_to_end_segdet_float() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+
+        let mut boxes = Array2::zeros((10, 4));
+        let mut scores = Array2::zeros((10, 1));
+        let mut classes = Array2::zeros((10, 1));
+        let mask = Array2::zeros((10, 32));
+        let protos = Array3::<f64>::zeros((160, 160, 32));
+        let protos = protos.insert_axis(Axis(0));
+
+        boxes
+            .slice_mut(s![0, ..,])
+            .assign(&array![0.1234, 0.1234, 0.2345, 0.2345]);
+        scores.slice_mut(s![0, ..]).assign(&array![0.9876]);
+        classes.slice_mut(s![0, ..]).assign(&array![2.0]);
+
+        let detect = ndarray::concatenate![
+            Axis(1),
+            boxes.view(),
+            scores.view(),
+            classes.view(),
+            mask.view()
+        ];
+        let mut detect = detect.insert_axis(Axis(0));
+        assert_eq!(detect.shape(), &[1, 10, 38]);
+        let config = "
+decoder_version: yolo26
+outputs:
+ - type: detection
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 38]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [num_features, 38]
+   normalized: true
+ - type: protos
+   decoder: ultralytics
+   quantization: [0.0039215686274509803921568627451, 128]
+   shape: [1, 160, 160, 32]
+   dshape:
+    - [batch, 1]
+    - [height, 160]
+    - [width, 160]
+    - [num_protos, 32]
+";
+
+        let decoder = DecoderBuilder::default()
+            .with_config_yaml_str(config.to_string())
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .build()
+            .unwrap();
+
+        let expected_boxes = [DetectBox {
+            bbox: BoundingBox {
+                xmin: 0.1234,
+                ymin: 0.1234,
+                xmax: 0.2345,
+                ymax: 0.2345,
+            },
+            score: 0.9876,
+            label: 2,
+        }];
+
+        let mut tracker = ByteTrackBuilder::new()
+            .track_update(0.1)
+            .track_high_conf(0.7)
+            .build();
+
+        let mut output_boxes = Vec::with_capacity(50);
+        let mut output_masks = Vec::with_capacity(50);
+        let mut output_tracks = Vec::with_capacity(50);
+
+        decoder
+            .decode_tracked_float(
+                &mut tracker,
+                0,
+                &[detect.view().into_dyn(), protos.view().into_dyn()],
+                &mut output_boxes,
+                &mut output_masks,
+                &mut output_tracks,
+            )
+            .unwrap();
+
+        assert_eq!(output_boxes.len(), 1);
+        assert!(output_boxes[0].equal_within_delta(&expected_boxes[0], 1.0 / 160.0));
+
+        // give the decoder a final frame with no detections to ensure tracks are properly predicting forward when detection is missing
+
+        for score in detect.slice_mut(s![.., .., 4]).iter_mut() {
+            *score = 0.0; // set all scores to minimum to simulate no detections
+        }
+
+        decoder
+            .decode_tracked_float(
+                &mut tracker,
+                100_000_000 / 3,
+                &[detect.view().into_dyn(), protos.view().into_dyn()],
+                &mut output_boxes,
+                &mut output_masks,
+                &mut output_tracks,
+            )
+            .unwrap();
+        assert!(output_boxes[0].equal_within_delta(&expected_boxes[0], 1e-6));
+        // no masks when the boxes are from tracker prediction without a matching detection
+        assert!(output_masks.is_empty())
+    }
+
+    #[test]
+    fn test_decoder_tracked_end_to_end_segdet_proto() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+
+        let mut boxes = Array2::zeros((10, 4));
+        let mut scores = Array2::zeros((10, 1));
+        let mut classes = Array2::zeros((10, 1));
+        let mask = Array2::zeros((10, 32));
+        let protos = Array3::<f64>::zeros((160, 160, 32));
+        let protos = protos.insert_axis(Axis(0));
+
+        let protos_quant = (1.0 / 255.0, 0.0);
+        let protos: Array4<u8> = quantize_ndarray(protos.view(), protos_quant.into());
+
+        boxes
+            .slice_mut(s![0, ..,])
+            .assign(&array![0.1234, 0.1234, 0.2345, 0.2345]);
+        scores.slice_mut(s![0, ..]).assign(&array![0.9876]);
+        classes.slice_mut(s![0, ..]).assign(&array![2.0]);
+
+        let detect = ndarray::concatenate![
+            Axis(1),
+            boxes.view(),
+            scores.view(),
+            classes.view(),
+            mask.view()
+        ];
+        let detect = detect.insert_axis(Axis(0));
+        assert_eq!(detect.shape(), &[1, 10, 38]);
+        let detect_quant = (2.0 / 255.0, 0.0);
+        let mut detect: Array3<u8> = quantize_ndarray(detect.view(), detect_quant.into());
+        let config = "
+decoder_version: yolo26
+outputs:
+ - type: detection
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 38]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [num_features, 38]
+   normalized: true
+ - type: protos
+   decoder: ultralytics
+   quantization: [0.0039215686274509803921568627451, 128]
+   shape: [1, 160, 160, 32]
+   dshape:
+    - [batch, 1]
+    - [height, 160]
+    - [width, 160]
+    - [num_protos, 32]
+";
+
+        let decoder = DecoderBuilder::default()
+            .with_config_yaml_str(config.to_string())
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .build()
+            .unwrap();
+
+        // Expected boxes doesn't match the float values exactly due to quantization error
+        let expected_boxes = [DetectBox {
+            bbox: BoundingBox {
+                xmin: 0.12549022,
+                ymin: 0.12549022,
+                xmax: 0.23529413,
+                ymax: 0.23529413,
+            },
+            score: 0.98823535,
+            label: 2,
+        }];
+
+        let mut tracker = ByteTrackBuilder::new()
+            .track_update(0.1)
+            .track_high_conf(0.7)
+            .build();
+
+        let mut output_boxes = Vec::with_capacity(50);
+        let mut output_tracks = Vec::with_capacity(50);
+
+        decoder
+            .decode_tracked_quantized_proto(
+                &mut tracker,
+                0,
+                &[detect.view().into(), protos.view().into()],
+                &mut output_boxes,
+                &mut output_tracks,
+            )
+            .unwrap();
+
+        assert_eq!(output_boxes.len(), 1);
+        assert!(output_boxes[0].equal_within_delta(&expected_boxes[0], 1.0 / 160.0));
+
+        // give the decoder a final frame with no detections to ensure tracks are properly predicting forward when detection is missing
+
+        for score in detect.slice_mut(s![.., .., 4]).iter_mut() {
+            *score = u8::MIN; // set all scores to minimum to simulate no detections
+        }
+
+        let protos = decoder
+            .decode_tracked_quantized_proto(
+                &mut tracker,
+                100_000_000 / 3,
+                &[detect.view().into(), protos.view().into()],
+                &mut output_boxes,
+                &mut output_tracks,
+            )
+            .unwrap();
+        assert!(output_boxes[0].equal_within_delta(&expected_boxes[0], 1e-6));
+        // no masks when the boxes are from tracker prediction without a matching detection
+        assert!(protos.is_some_and(|x| x.mask_coefficients.is_empty()))
+    }
+
+    #[test]
+    fn test_decoder_tracked_end_to_end_segdet_proto_float() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+
+        let mut boxes = Array2::zeros((10, 4));
+        let mut scores = Array2::zeros((10, 1));
+        let mut classes = Array2::zeros((10, 1));
+        let mask = Array2::zeros((10, 32));
+        let protos = Array3::<f64>::zeros((160, 160, 32));
+        let protos = protos.insert_axis(Axis(0));
+
+        boxes
+            .slice_mut(s![0, ..,])
+            .assign(&array![0.1234, 0.1234, 0.2345, 0.2345]);
+        scores.slice_mut(s![0, ..]).assign(&array![0.9876]);
+        classes.slice_mut(s![0, ..]).assign(&array![2.0]);
+
+        let detect = ndarray::concatenate![
+            Axis(1),
+            boxes.view(),
+            scores.view(),
+            classes.view(),
+            mask.view()
+        ];
+        let mut detect = detect.insert_axis(Axis(0));
+        assert_eq!(detect.shape(), &[1, 10, 38]);
+        let config = "
+decoder_version: yolo26
+outputs:
+ - type: detection
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 38]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [num_features, 38]
+   normalized: true
+ - type: protos
+   decoder: ultralytics
+   quantization: [0.0039215686274509803921568627451, 128]
+   shape: [1, 160, 160, 32]
+   dshape:
+    - [batch, 1]
+    - [height, 160]
+    - [width, 160]
+    - [num_protos, 32]
+";
+
+        let decoder = DecoderBuilder::default()
+            .with_config_yaml_str(config.to_string())
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .build()
+            .unwrap();
+
+        let expected_boxes = [DetectBox {
+            bbox: BoundingBox {
+                xmin: 0.1234,
+                ymin: 0.1234,
+                xmax: 0.2345,
+                ymax: 0.2345,
+            },
+            score: 0.9876,
+            label: 2,
+        }];
+
+        let mut tracker = ByteTrackBuilder::new()
+            .track_update(0.1)
+            .track_high_conf(0.7)
+            .build();
+
+        let mut output_boxes = Vec::with_capacity(50);
+        let mut output_tracks = Vec::with_capacity(50);
+
+        decoder
+            .decode_tracked_float_proto(
+                &mut tracker,
+                0,
+                &[detect.view().into_dyn(), protos.view().into_dyn()],
+                &mut output_boxes,
+                &mut output_tracks,
+            )
+            .unwrap();
+
+        assert_eq!(output_boxes.len(), 1);
+        assert!(output_boxes[0].equal_within_delta(&expected_boxes[0], 1.0 / 160.0));
+
+        // give the decoder a final frame with no detections to ensure tracks are properly predicting forward when detection is missing
+
+        for score in detect.slice_mut(s![.., .., 4]).iter_mut() {
+            *score = 0.0; // set all scores to minimum to simulate no detections
+        }
+
+        let protos = decoder
+            .decode_tracked_float_proto(
+                &mut tracker,
+                100_000_000 / 3,
+                &[detect.view().into_dyn(), protos.view().into_dyn()],
+                &mut output_boxes,
+                &mut output_tracks,
+            )
+            .unwrap();
+        assert!(output_boxes[0].equal_within_delta(&expected_boxes[0], 1e-6));
+        // no masks when the boxes are from tracker prediction without a matching detection
+        assert!(protos.is_some_and(|x| x.mask_coefficients.is_empty()))
+    }
+
+    #[test]
+    fn test_decoder_tracked_end_to_end_segdet_split() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+
+        let mut boxes = Array2::zeros((10, 4));
+        let mut scores = Array2::zeros((10, 1));
+        let mut classes = Array2::zeros((10, 1));
+        let mask: Array2<f64> = Array2::zeros((10, 32));
+        let protos = Array3::<f64>::zeros((160, 160, 32));
+        let protos = protos.insert_axis(Axis(0));
+
+        let protos_quant = (1.0 / 255.0, 0.0);
+        let protos: Array4<u8> = quantize_ndarray(protos.view(), protos_quant.into());
+
+        boxes
+            .slice_mut(s![0, ..,])
+            .assign(&array![0.1234, 0.1234, 0.2345, 0.2345]);
+        scores.slice_mut(s![0, ..]).assign(&array![0.9876]);
+        classes.slice_mut(s![0, ..]).assign(&array![2.0]);
+
+        let boxes = boxes.insert_axis(Axis(0));
+        let scores = scores.insert_axis(Axis(0));
+        let classes = classes.insert_axis(Axis(0));
+        let mask = mask.insert_axis(Axis(0));
+
+        let detect_quant = (2.0 / 255.0, 0.0);
+        let boxes: Array3<u8> = quantize_ndarray(boxes.view(), detect_quant.into());
+        let mut scores: Array3<u8> = quantize_ndarray(scores.view(), detect_quant.into());
+        let classes: Array3<u8> = quantize_ndarray(classes.view(), detect_quant.into());
+        let mask: Array3<u8> = quantize_ndarray(mask.view(), detect_quant.into());
+
+        let config = "
+decoder_version: yolo26
+outputs:
+ - type: boxes
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 4]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [box_coords, 4]
+   normalized: true
+ - type: scores
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 1]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [num_classes, 1]
+ - type: classes
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 1]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [num_classes, 1]
+ - type: mask_coefficients
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 32]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [num_protos, 32]
+ - type: protos
+   decoder: ultralytics
+   quantization: [0.0039215686274509803921568627451, 128]
+   shape: [1, 160, 160, 32]
+   dshape:
+    - [batch, 1]
+    - [height, 160]
+    - [width, 160]
+    - [num_protos, 32]
+";
+
+        let decoder = DecoderBuilder::default()
+            .with_config_yaml_str(config.to_string())
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .build()
+            .unwrap();
+
+        // Expected boxes doesn't match the float values exactly due to quantization error
+        let expected_boxes = [DetectBox {
+            bbox: BoundingBox {
+                xmin: 0.12549022,
+                ymin: 0.12549022,
+                xmax: 0.23529413,
+                ymax: 0.23529413,
+            },
+            score: 0.98823535,
+            label: 2,
+        }];
+
+        let mut tracker = ByteTrackBuilder::new()
+            .track_update(0.1)
+            .track_high_conf(0.7)
+            .build();
+
+        let mut output_boxes = Vec::with_capacity(50);
+        let mut output_masks = Vec::with_capacity(50);
+        let mut output_tracks = Vec::with_capacity(50);
+
+        decoder
+            .decode_tracked_quantized(
+                &mut tracker,
+                0,
+                &[
+                    boxes.view().into(),
+                    scores.view().into(),
+                    classes.view().into(),
+                    mask.view().into(),
+                    protos.view().into(),
+                ],
+                &mut output_boxes,
+                &mut output_masks,
+                &mut output_tracks,
+            )
+            .unwrap();
+
+        assert_eq!(output_boxes.len(), 1);
+        assert!(output_boxes[0].equal_within_delta(&expected_boxes[0], 1.0 / 160.0));
+
+        // give the decoder a final frame with no detections to ensure tracks are properly predicting forward when detection is missing
+
+        for score in scores.slice_mut(s![.., .., ..]).iter_mut() {
+            *score = u8::MIN; // set all scores to minimum to simulate no detections
+        }
+
+        decoder
+            .decode_tracked_quantized(
+                &mut tracker,
+                100_000_000 / 3,
+                &[
+                    boxes.view().into(),
+                    scores.view().into(),
+                    classes.view().into(),
+                    mask.view().into(),
+                    protos.view().into(),
+                ],
+                &mut output_boxes,
+                &mut output_masks,
+                &mut output_tracks,
+            )
+            .unwrap();
+        assert!(output_boxes[0].equal_within_delta(&expected_boxes[0], 1e-6));
+        // no masks when the boxes are from tracker prediction without a matching detection
+        assert!(output_masks.is_empty())
+    }
+    #[test]
+    fn test_decoder_tracked_end_to_end_segdet_split_float() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+
+        let mut boxes = Array2::zeros((10, 4));
+        let mut scores = Array2::zeros((10, 1));
+        let mut classes = Array2::zeros((10, 1));
+        let mask: Array2<f64> = Array2::zeros((10, 32));
+        let protos = Array3::<f64>::zeros((160, 160, 32));
+        let protos = protos.insert_axis(Axis(0));
+
+        boxes
+            .slice_mut(s![0, ..,])
+            .assign(&array![0.1234, 0.1234, 0.2345, 0.2345]);
+        scores.slice_mut(s![0, ..]).assign(&array![0.9876]);
+        classes.slice_mut(s![0, ..]).assign(&array![2.0]);
+
+        let boxes = boxes.insert_axis(Axis(0));
+        let mut scores = scores.insert_axis(Axis(0));
+        let classes = classes.insert_axis(Axis(0));
+        let mask = mask.insert_axis(Axis(0));
+
+        let config = "
+decoder_version: yolo26
+outputs:
+ - type: boxes
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 4]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [box_coords, 4]
+   normalized: true
+ - type: scores
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 1]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [num_classes, 1]
+ - type: classes
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 1]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [num_classes, 1]
+ - type: mask_coefficients
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 32]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [num_protos, 32]
+ - type: protos
+   decoder: ultralytics
+   quantization: [0.0039215686274509803921568627451, 128]
+   shape: [1, 160, 160, 32]
+   dshape:
+    - [batch, 1]
+    - [height, 160]
+    - [width, 160]
+    - [num_protos, 32]
+";
+
+        let decoder = DecoderBuilder::default()
+            .with_config_yaml_str(config.to_string())
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .build()
+            .unwrap();
+
+        // Expected boxes doesn't match the float values exactly due to quantization error
+        let expected_boxes = [DetectBox {
+            bbox: BoundingBox {
+                xmin: 0.1234,
+                ymin: 0.1234,
+                xmax: 0.2345,
+                ymax: 0.2345,
+            },
+            score: 0.9876,
+            label: 2,
+        }];
+
+        let mut tracker = ByteTrackBuilder::new()
+            .track_update(0.1)
+            .track_high_conf(0.7)
+            .build();
+
+        let mut output_boxes = Vec::with_capacity(50);
+        let mut output_masks = Vec::with_capacity(50);
+        let mut output_tracks = Vec::with_capacity(50);
+
+        decoder
+            .decode_tracked_float(
+                &mut tracker,
+                0,
+                &[
+                    boxes.view().into_dyn(),
+                    scores.view().into_dyn(),
+                    classes.view().into_dyn(),
+                    mask.view().into_dyn(),
+                    protos.view().into_dyn(),
+                ],
+                &mut output_boxes,
+                &mut output_masks,
+                &mut output_tracks,
+            )
+            .unwrap();
+
+        assert_eq!(output_boxes.len(), 1);
+        assert!(output_boxes[0].equal_within_delta(&expected_boxes[0], 1.0 / 160.0));
+
+        // give the decoder a final frame with no detections to ensure tracks are properly predicting forward when detection is missing
+
+        for score in scores.slice_mut(s![.., .., ..]).iter_mut() {
+            *score = 0.0; // set all scores to minimum to simulate no detections
+        }
+
+        decoder
+            .decode_tracked_float(
+                &mut tracker,
+                100_000_000 / 3,
+                &[
+                    boxes.view().into_dyn(),
+                    scores.view().into_dyn(),
+                    classes.view().into_dyn(),
+                    mask.view().into_dyn(),
+                    protos.view().into_dyn(),
+                ],
+                &mut output_boxes,
+                &mut output_masks,
+                &mut output_tracks,
+            )
+            .unwrap();
+        assert!(output_boxes[0].equal_within_delta(&expected_boxes[0], 1e-6));
+        // no masks when the boxes are from tracker prediction without a matching detection
+        assert!(output_masks.is_empty())
+    }
+
+    #[test]
+    fn test_decoder_tracked_end_to_end_segdet_split_proto() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+
+        let mut boxes = Array2::zeros((10, 4));
+        let mut scores = Array2::zeros((10, 1));
+        let mut classes = Array2::zeros((10, 1));
+        let mask: Array2<f64> = Array2::zeros((10, 32));
+        let protos = Array3::<f64>::zeros((160, 160, 32));
+        let protos = protos.insert_axis(Axis(0));
+
+        let protos_quant = (1.0 / 255.0, 0.0);
+        let protos: Array4<u8> = quantize_ndarray(protos.view(), protos_quant.into());
+
+        boxes
+            .slice_mut(s![0, ..,])
+            .assign(&array![0.1234, 0.1234, 0.2345, 0.2345]);
+        scores.slice_mut(s![0, ..]).assign(&array![0.9876]);
+        classes.slice_mut(s![0, ..]).assign(&array![2.0]);
+
+        let boxes = boxes.insert_axis(Axis(0));
+        let scores = scores.insert_axis(Axis(0));
+        let classes = classes.insert_axis(Axis(0));
+        let mask = mask.insert_axis(Axis(0));
+
+        let detect_quant = (2.0 / 255.0, 0.0);
+        let boxes: Array3<u8> = quantize_ndarray(boxes.view(), detect_quant.into());
+        let mut scores: Array3<u8> = quantize_ndarray(scores.view(), detect_quant.into());
+        let classes: Array3<u8> = quantize_ndarray(classes.view(), detect_quant.into());
+        let mask: Array3<u8> = quantize_ndarray(mask.view(), detect_quant.into());
+
+        let config = "
+decoder_version: yolo26
+outputs:
+ - type: boxes
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 4]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [box_coords, 4]
+   normalized: true
+ - type: scores
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 1]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [num_classes, 1]
+ - type: classes
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 1]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [num_classes, 1]
+ - type: mask_coefficients
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 32]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [num_protos, 32]
+ - type: protos
+   decoder: ultralytics
+   quantization: [0.0039215686274509803921568627451, 128]
+   shape: [1, 160, 160, 32]
+   dshape:
+    - [batch, 1]
+    - [height, 160]
+    - [width, 160]
+    - [num_protos, 32]
+";
+
+        let decoder = DecoderBuilder::default()
+            .with_config_yaml_str(config.to_string())
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .build()
+            .unwrap();
+
+        // Expected boxes doesn't match the float values exactly due to quantization error
+        let expected_boxes = [DetectBox {
+            bbox: BoundingBox {
+                xmin: 0.12549022,
+                ymin: 0.12549022,
+                xmax: 0.23529413,
+                ymax: 0.23529413,
+            },
+            score: 0.98823535,
+            label: 2,
+        }];
+
+        let mut tracker = ByteTrackBuilder::new()
+            .track_update(0.1)
+            .track_high_conf(0.7)
+            .build();
+
+        let mut output_boxes = Vec::with_capacity(50);
+        let mut output_tracks = Vec::with_capacity(50);
+
+        decoder
+            .decode_tracked_quantized_proto(
+                &mut tracker,
+                0,
+                &[
+                    boxes.view().into(),
+                    scores.view().into(),
+                    classes.view().into(),
+                    mask.view().into(),
+                    protos.view().into(),
+                ],
+                &mut output_boxes,
+                &mut output_tracks,
+            )
+            .unwrap();
+
+        assert_eq!(output_boxes.len(), 1);
+        assert!(output_boxes[0].equal_within_delta(&expected_boxes[0], 1.0 / 160.0));
+
+        // give the decoder a final frame with no detections to ensure tracks are properly predicting forward when detection is missing
+
+        for score in scores.slice_mut(s![.., .., ..]).iter_mut() {
+            *score = u8::MIN; // set all scores to minimum to simulate no detections
+        }
+
+        let protos = decoder
+            .decode_tracked_quantized_proto(
+                &mut tracker,
+                100_000_000 / 3,
+                &[
+                    boxes.view().into(),
+                    scores.view().into(),
+                    classes.view().into(),
+                    mask.view().into(),
+                    protos.view().into(),
+                ],
+                &mut output_boxes,
+                &mut output_tracks,
+            )
+            .unwrap();
+        assert!(output_boxes[0].equal_within_delta(&expected_boxes[0], 1e-6));
+        // no masks when the boxes are from tracker prediction without a matching detection
+        assert!(protos.is_some_and(|x| x.mask_coefficients.is_empty()))
+    }
+    #[test]
+    fn test_decoder_tracked_end_to_end_segdet_split_proto_float() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+
+        let mut boxes = Array2::zeros((10, 4));
+        let mut scores = Array2::zeros((10, 1));
+        let mut classes = Array2::zeros((10, 1));
+        let mask: Array2<f64> = Array2::zeros((10, 32));
+        let protos = Array3::<f64>::zeros((160, 160, 32));
+        let protos = protos.insert_axis(Axis(0));
+
+        boxes
+            .slice_mut(s![0, ..,])
+            .assign(&array![0.1234, 0.1234, 0.2345, 0.2345]);
+        scores.slice_mut(s![0, ..]).assign(&array![0.9876]);
+        classes.slice_mut(s![0, ..]).assign(&array![2.0]);
+
+        let boxes = boxes.insert_axis(Axis(0));
+        let mut scores = scores.insert_axis(Axis(0));
+        let classes = classes.insert_axis(Axis(0));
+        let mask = mask.insert_axis(Axis(0));
+
+        let config = "
+decoder_version: yolo26
+outputs:
+ - type: boxes
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 4]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [box_coords, 4]
+   normalized: true
+ - type: scores
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 1]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [num_classes, 1]
+ - type: classes
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 1]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [num_classes, 1]
+ - type: mask_coefficients
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 32]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [num_protos, 32]
+ - type: protos
+   decoder: ultralytics
+   quantization: [0.0039215686274509803921568627451, 128]
+   shape: [1, 160, 160, 32]
+   dshape:
+    - [batch, 1]
+    - [height, 160]
+    - [width, 160]
+    - [num_protos, 32]
+";
+
+        let decoder = DecoderBuilder::default()
+            .with_config_yaml_str(config.to_string())
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .build()
+            .unwrap();
+
+        // Expected boxes doesn't match the float values exactly due to quantization error
+        let expected_boxes = [DetectBox {
+            bbox: BoundingBox {
+                xmin: 0.1234,
+                ymin: 0.1234,
+                xmax: 0.2345,
+                ymax: 0.2345,
+            },
+            score: 0.9876,
+            label: 2,
+        }];
+
+        let mut tracker = ByteTrackBuilder::new()
+            .track_update(0.1)
+            .track_high_conf(0.7)
+            .build();
+
+        let mut output_boxes = Vec::with_capacity(50);
+        let mut output_tracks = Vec::with_capacity(50);
+
+        decoder
+            .decode_tracked_float_proto(
+                &mut tracker,
+                0,
+                &[
+                    boxes.view().into_dyn(),
+                    scores.view().into_dyn(),
+                    classes.view().into_dyn(),
+                    mask.view().into_dyn(),
+                    protos.view().into_dyn(),
+                ],
+                &mut output_boxes,
+                &mut output_tracks,
+            )
+            .unwrap();
+
+        assert_eq!(output_boxes.len(), 1);
+        assert!(output_boxes[0].equal_within_delta(&expected_boxes[0], 1.0 / 160.0));
+
+        // give the decoder a final frame with no detections to ensure tracks are properly predicting forward when detection is missing
+
+        for score in scores.slice_mut(s![.., .., ..]).iter_mut() {
+            *score = 0.0; // set all scores to minimum to simulate no detections
+        }
+
+        let protos = decoder
+            .decode_tracked_float_proto(
+                &mut tracker,
+                100_000_000 / 3,
+                &[
+                    boxes.view().into_dyn(),
+                    scores.view().into_dyn(),
+                    classes.view().into_dyn(),
+                    mask.view().into_dyn(),
+                    protos.view().into_dyn(),
+                ],
+                &mut output_boxes,
+                &mut output_tracks,
+            )
+            .unwrap();
+        assert!(output_boxes[0].equal_within_delta(&expected_boxes[0], 1e-6));
+        // no masks when the boxes are from tracker prediction without a matching detection
+        assert!(protos.is_some_and(|x| x.mask_coefficients.is_empty()))
     }
 
     #[test]
