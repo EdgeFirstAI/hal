@@ -1177,17 +1177,25 @@ class ImageProcessor:
         width: int,
         height: int,
         format: PixelFormat = PixelFormat.Rgba,
+        dtype: str = "uint8",
     ) -> Tensor:
         """Create an image tensor with the processor's optimal memory backend.
 
         Selects the best available backing storage based on hardware capabilities:
-        DMA-buf > PBO (GPU buffer) > system memory. Images created this way benefit
-        from zero-copy GPU paths when used with this processor's ``convert()``.
+        DMA-buf > PBO (GPU buffer, byte-sized types: uint8, int8) > system memory.
+        Images created this way benefit from zero-copy GPU paths when used with
+        this processor's ``convert()``.
 
         Args:
             width: Image width in pixels.
             height: Image height in pixels.
             format: Pixel format (default: ``PixelFormat.Rgba``).
+            dtype: Element data type string (default: ``"uint8"``).
+                Supported values: ``"uint8"``, ``"int8"``, ``"uint16"``,
+                ``"int16"``, ``"uint32"``, ``"int32"``, ``"uint64"``,
+                ``"int64"``, ``"float16"``, ``"float32"``, ``"float64"``.
+                PBO is only available for byte-sized types (``"uint8"``,
+                ``"int8"``); other types fall back to system memory.
 
         Returns:
             A new image ``Tensor`` backed by the optimal memory type.

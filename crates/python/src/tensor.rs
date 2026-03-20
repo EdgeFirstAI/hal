@@ -111,7 +111,7 @@ impl From<TensorMemory> for PyTensorMemory {
 }
 
 /// Parse a Python dtype string (e.g. "float32", "uint8") into a `DType`.
-fn parse_dtype(dtype: &str) -> Result<DType> {
+pub(crate) fn parse_dtype(dtype: &str) -> Result<DType> {
     match dtype {
         "uint8" => Ok(DType::U8),
         "int8" => Ok(DType::I8),

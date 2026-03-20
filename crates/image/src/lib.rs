@@ -31,7 +31,7 @@ the appropriate conversion method based on the available hardware.
 let image = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/zidane.jpg"));
 let src = load_image(image, Some(PixelFormat::Rgba), None)?;
 let mut converter = ImageProcessor::new()?;
-let mut dst = TensorDyn::image(640, 480, PixelFormat::Rgb, DType::U8, None)?;
+let mut dst = converter.create_image(640, 480, PixelFormat::Rgb, DType::U8, None)?;
 converter.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())?;
 # Ok(())
 # }
@@ -533,7 +533,7 @@ impl ImageProcessor {
     /// let image = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/zidane.jpg"));
     /// let src = load_image(image, Some(PixelFormat::Rgba), None)?;
     /// let mut converter = ImageProcessor::new()?;
-    /// let mut dst = TensorDyn::image(640, 480, PixelFormat::Rgb, DType::U8, None)?;
+    /// let mut dst = converter.create_image(640, 480, PixelFormat::Rgb, DType::U8, None)?;
     /// converter.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())?;
     /// # Ok(())
     /// # }
@@ -776,13 +776,25 @@ impl ImageProcessor {
 
     /// Create a [`TensorDyn`] image with the best available memory backend.
     ///
-    /// Priority: DMA-buf → PBO → system memory.
+    /// Priority: DMA-buf → PBO (byte-sized types: u8, i8) → system memory.
+    ///
+    /// Use this method instead of [`TensorDyn::image()`] when the tensor will
+    /// be used with [`ImageProcessor::convert()`]. It selects the optimal
+    /// memory backing (including PBO for GPU zero-copy) which direct
+    /// allocation cannot achieve.
+    ///
+    /// This method is on [`ImageProcessor`] rather than [`ImageProcessorTrait`]
+    /// because optimal allocation requires knowledge of the active compute
+    /// backends (e.g. the GL context handle for PBO allocation). Individual
+    /// backend implementations ([`CPUProcessor`], etc.) do not have this
+    /// cross-backend visibility.
     ///
     /// # Arguments
     ///
     /// * `width` - Image width in pixels
     /// * `height` - Image height in pixels
     /// * `format` - Pixel format
+    /// * `dtype` - Element data type (e.g. `DType::U8`, `DType::I8`)
     /// * `memory` - Optional memory type override; when `None`, the best
     ///   available backend is selected automatically.
     ///
@@ -799,17 +811,12 @@ impl ImageProcessor {
         width: usize,
         height: usize,
         format: PixelFormat,
+        dtype: DType,
         memory: Option<TensorMemory>,
     ) -> Result<TensorDyn> {
         // If an explicit memory type is requested, honour it directly.
         if let Some(mem) = memory {
-            return Ok(TensorDyn::image(
-                width,
-                height,
-                format,
-                DType::U8,
-                Some(mem),
-            )?);
+            return Ok(TensorDyn::image(width, height, format, dtype, Some(mem))?);
         }
 
         // Try DMA first on Linux — skip only when GL has explicitly selected PBO
@@ -829,7 +836,7 @@ impl ImageProcessor {
                     width,
                     height,
                     format,
-                    DType::U8,
+                    dtype,
                     Some(edgefirst_tensor::TensorMemory::Dma),
                 ) {
                     return Ok(img);
@@ -837,13 +844,34 @@ impl ImageProcessor {
             }
         }
 
-        // Try PBO (if GL available)
+        // Try PBO (if GL available).
+        // PBO buffers are u8-sized; the int8 shader emulates i8 output via
+        // XOR 0x80 on the same underlying buffer, so both U8 and I8 work.
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
-        if let Some(gl) = &self.opengl {
-            match gl.create_pbo_image(width, height, format) {
-                Ok(t) => return Ok(TensorDyn::from(t)),
-                Err(e) => log::debug!("PBO image creation failed, falling back to Mem: {e:?}"),
+        if dtype.size() == 1 {
+            if let Some(gl) = &self.opengl {
+                match gl.create_pbo_image(width, height, format) {
+                    Ok(t) => {
+                        if dtype == DType::I8 {
+                            // SAFETY: Tensor<u8> and Tensor<i8> are layout-
+                            // identical (same element size, no T-dependent
+                            // drop glue). The int8 shader applies XOR 0x80
+                            // on the same PBO buffer. Same rationale as
+                            // gl::processor::tensor_i8_as_u8_mut.
+                            // Invariant: PBO tensors never have chroma
+                            // (create_pbo_image → Tensor::wrap sets it None).
+                            debug_assert!(
+                                t.chroma().is_none(),
+                                "PBO i8 transmute requires chroma == None"
+                            );
+                            let t_i8: Tensor<i8> = unsafe { std::mem::transmute(t) };
+                            return Ok(TensorDyn::from(t_i8));
+                        }
+                        return Ok(TensorDyn::from(t));
+                    }
+                    Err(e) => log::debug!("PBO image creation failed, falling back to Mem: {e:?}"),
+                }
             }
         }
 
@@ -852,7 +880,7 @@ impl ImageProcessor {
             width,
             height,
             format,
-            DType::U8,
+            dtype,
             Some(edgefirst_tensor::TensorMemory::Mem),
         )?)
     }
@@ -1955,9 +1983,10 @@ mod image_tests {
         .to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
 
-        let converter_dst =
-            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
         let mut converter = ImageProcessor::new().unwrap();
+        let converter_dst = converter
+            .create_image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None)
+            .unwrap();
         let (result, src, converter_dst) = convert_img(
             &mut converter,
             src,
@@ -1985,6 +2014,47 @@ mod image_tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn test_create_image_dtype_i8() {
+        let mut converter = ImageProcessor::new().unwrap();
+
+        // I8 image should allocate successfully via create_image
+        let dst = converter
+            .create_image(320, 240, PixelFormat::Rgb, DType::I8, None)
+            .unwrap();
+        assert_eq!(dst.dtype(), DType::I8);
+        assert!(dst.width() == Some(320));
+        assert!(dst.height() == Some(240));
+        assert_eq!(dst.format(), Some(PixelFormat::Rgb));
+
+        // U8 for comparison
+        let dst_u8 = converter
+            .create_image(320, 240, PixelFormat::Rgb, DType::U8, None)
+            .unwrap();
+        assert_eq!(dst_u8.dtype(), DType::U8);
+
+        // Convert into I8 dst should succeed
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane.jpg"
+        ))
+        .to_vec();
+        let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
+        let mut dst_i8 = converter
+            .create_image(320, 240, PixelFormat::Rgb, DType::I8, None)
+            .unwrap();
+        converter
+            .convert(
+                &src,
+                &mut dst_i8,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+    }
+
+    #[test]
     fn test_crop_skip() {
         let file = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -1993,9 +2063,10 @@ mod image_tests {
         .to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
 
-        let converter_dst =
-            TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None).unwrap();
         let mut converter = ImageProcessor::new().unwrap();
+        let converter_dst = converter
+            .create_image(1280, 720, PixelFormat::Rgba, DType::U8, None)
+            .unwrap();
         let crop = Crop::new()
             .with_src_rect(Some(Rect::new(0, 0, 640, 640)))
             .with_dst_rect(Some(Rect::new(0, 0, 640, 640)));
@@ -4824,7 +4895,7 @@ mod image_tests {
 
         // Create PBO-backed source image
         let pbo_src = converter
-            .create_image(src_w, src_h, PixelFormat::Rgba, None)
+            .create_image(src_w, src_h, PixelFormat::Rgba, DType::U8, None)
             .unwrap();
         assert_eq!(
             pbo_src.as_u8().unwrap().memory(),
@@ -4868,7 +4939,7 @@ mod image_tests {
 
         // Create PBO-backed destination image
         let pbo_dst = converter
-            .create_image(dst_w, dst_h, PixelFormat::Rgba, None)
+            .create_image(dst_w, dst_h, PixelFormat::Rgba, DType::U8, None)
             .unwrap();
         assert_eq!(pbo_dst.as_u8().unwrap().memory(), TensorMemory::Pbo);
 

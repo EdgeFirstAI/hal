@@ -25,7 +25,7 @@ mod common;
 use common::{calculate_letterbox, get_test_data, run_bench, BenchConfig, BenchSuite};
 
 use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rect, Rotation};
-use edgefirst_tensor::{DType, PixelFormat, TensorDyn, TensorMapTrait, TensorTrait};
+use edgefirst_tensor::{DType, PixelFormat, TensorMapTrait, TensorTrait};
 
 const WARMUP: usize = 10;
 const ITERATIONS: usize = 100;
@@ -46,13 +46,15 @@ fn bench_letterbox(configs: &[BenchConfig], proc: &mut ImageProcessor, suite: &m
         let throughput = config.throughput();
         let name = format!("letterbox/{}", config.id());
 
-        let Ok(src) = proc.create_image(config.in_w, config.in_h, config.in_fmt, None) else {
+        let Ok(src) = proc.create_image(config.in_w, config.in_h, config.in_fmt, DType::U8, None)
+        else {
             println!("  {:50} [skipped: allocation failed]", name);
             continue;
         };
         let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
         src.as_u8().unwrap().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
-        let Ok(mut dst) = proc.create_image(config.out_w, config.out_h, config.out_fmt, None)
+        let Ok(mut dst) =
+            proc.create_image(config.out_w, config.out_h, config.out_fmt, DType::U8, None)
         else {
             println!("  {:50} [skipped: allocation failed]", name);
             continue;
@@ -84,13 +86,15 @@ fn bench_convert(configs: &[BenchConfig], proc: &mut ImageProcessor, suite: &mut
         let throughput = config.throughput();
         let name = format!("convert/{}", config.id());
 
-        let Ok(src) = proc.create_image(config.in_w, config.in_h, config.in_fmt, None) else {
+        let Ok(src) = proc.create_image(config.in_w, config.in_h, config.in_fmt, DType::U8, None)
+        else {
             println!("  {:50} [skipped: allocation failed]", name);
             continue;
         };
         let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
         src.as_u8().unwrap().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
-        let Ok(mut dst) = proc.create_image(config.out_w, config.out_h, config.out_fmt, None)
+        let Ok(mut dst) =
+            proc.create_image(config.out_w, config.out_h, config.out_fmt, DType::U8, None)
         else {
             println!("  {:50} [skipped: allocation failed]", name);
             continue;
@@ -122,13 +126,15 @@ fn bench_resize(configs: &[BenchConfig], proc: &mut ImageProcessor, suite: &mut 
         let throughput = config.throughput();
         let name = format!("resize/{}", config.id());
 
-        let Ok(src) = proc.create_image(config.in_w, config.in_h, config.in_fmt, None) else {
+        let Ok(src) = proc.create_image(config.in_w, config.in_h, config.in_fmt, DType::U8, None)
+        else {
             println!("  {:50} [skipped: allocation failed]", name);
             continue;
         };
         let data = get_test_data(config.in_w, config.in_h, config.in_fmt);
         src.as_u8().unwrap().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
-        let Ok(mut dst) = proc.create_image(config.out_w, config.out_h, config.out_fmt, None)
+        let Ok(mut dst) =
+            proc.create_image(config.out_w, config.out_h, config.out_fmt, DType::U8, None)
         else {
             println!("  {:50} [skipped: allocation failed]", name);
             continue;
@@ -170,7 +176,7 @@ fn bench_rotate(proc: &mut ImageProcessor, suite: &mut BenchSuite, max_width: us
         for (rotation, rot_name) in &rotations {
             let name = format!("rotate/{res}/{rot_name}/PixelFormat::Yuyv->PixelFormat::Rgba");
 
-            let Ok(src) = proc.create_image(w, h, PixelFormat::Yuyv, None) else {
+            let Ok(src) = proc.create_image(w, h, PixelFormat::Yuyv, DType::U8, None) else {
                 println!("  {:50} [skipped: allocation failed]", name);
                 continue;
             };
@@ -182,7 +188,7 @@ fn bench_rotate(proc: &mut ImageProcessor, suite: &mut BenchSuite, max_width: us
                 Rotation::Clockwise90 | Rotation::CounterClockwise90 => (h, w),
                 _ => (w, h),
             };
-            let Ok(mut dst) = proc.create_image(dw, dh, PixelFormat::Rgba, None) else {
+            let Ok(mut dst) = proc.create_image(dw, dh, PixelFormat::Rgba, DType::U8, None) else {
                 println!("  {:50} [skipped: allocation failed]", name);
                 continue;
             };
@@ -223,13 +229,13 @@ fn bench_flip(proc: &mut ImageProcessor, suite: &mut BenchSuite, max_width: usiz
         for (flip, flip_name) in &flips {
             let name = format!("flip/{res}/{flip_name}/PixelFormat::Yuyv->PixelFormat::Rgba");
 
-            let Ok(src) = proc.create_image(w, h, PixelFormat::Yuyv, None) else {
+            let Ok(src) = proc.create_image(w, h, PixelFormat::Yuyv, DType::U8, None) else {
                 println!("  {:50} [skipped: allocation failed]", name);
                 continue;
             };
             let data = get_test_data(w, h, PixelFormat::Yuyv);
             src.as_u8().unwrap().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
-            let Ok(mut dst) = proc.create_image(w, h, PixelFormat::Rgba, None) else {
+            let Ok(mut dst) = proc.create_image(w, h, PixelFormat::Rgba, DType::U8, None) else {
                 println!("  {:50} [skipped: allocation failed]", name);
                 continue;
             };
@@ -309,13 +315,13 @@ fn bench_letterbox_pipeline(
                 .with_dst_rect(Some(Rect::new(left, top, new_w, new_h)))
                 .with_dst_color(Some([114, 114, 114, 255]));
 
-            let Ok(src) = proc.create_image(w, h, *in_fmt, None) else {
+            let Ok(src) = proc.create_image(w, h, *in_fmt, DType::U8, None) else {
                 println!("  {:50} [skipped: allocation failed]", name);
                 continue;
             };
             let data = get_test_data(w, h, *in_fmt);
             src.as_u8().unwrap().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
-            let Ok(mut dst) = TensorDyn::image(640, 640, *out_fmt, *out_dtype, None) else {
+            let Ok(mut dst) = proc.create_image(640, 640, *out_fmt, *out_dtype, None) else {
                 println!("  {:50} [skipped: allocation failed]", name);
                 continue;
             };

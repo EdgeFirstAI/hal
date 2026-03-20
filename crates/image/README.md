@@ -30,7 +30,7 @@ let src = load_image(&bytes, Some(PixelFormat::Rgba), None)?;
 let mut processor = ImageProcessor::new()?;
 
 // Create destination with desired size
-let mut dst = processor.create_image(640, 640, PixelFormat::Rgba, None)?;
+let mut dst = processor.create_image(640, 640, PixelFormat::Rgba, DType::U8, None)?;
 
 // Convert with resize, rotation, letterboxing
 processor.convert(
@@ -130,7 +130,17 @@ See [BENCHMARKS.md](../../BENCHMARKS.md) for per-platform performance numbers.
 
 ## Zero-Copy Model Input
 
-You can write directly into a pre-allocated model input tensor by setting its pixel format and converting it to a `TensorDyn`:
+Use `create_image()` to allocate the destination tensor with the processor's
+optimal memory backend (DMA-buf, PBO, or system memory). This enables
+zero-copy GPU paths that direct `Tensor::new()` allocation cannot achieve:
+
+```rust,ignore
+let mut dst = processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None)?;
+processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::letterbox())?;
+```
+
+If you need to write into a pre-allocated buffer with a specific memory type
+(e.g. an NPU-bound tensor), you can still use direct allocation:
 
 ```rust,ignore
 let mut model_input = Tensor::<u8>::new(&[640, 640, 3], None, None)?;
