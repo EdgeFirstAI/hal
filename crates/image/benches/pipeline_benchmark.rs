@@ -25,8 +25,7 @@ mod common;
 use common::{calculate_letterbox, get_test_data, run_bench, BenchConfig, BenchSuite};
 
 use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rect, Rotation};
-use edgefirst_tensor::PixelFormat;
-use edgefirst_tensor::{TensorMapTrait, TensorTrait};
+use edgefirst_tensor::{DType, PixelFormat, TensorDyn, TensorMapTrait, TensorTrait};
 
 const WARMUP: usize = 10;
 const ITERATIONS: usize = 100;
@@ -271,29 +270,36 @@ fn bench_letterbox_pipeline(
     .into_iter()
     .filter(|(w, _, _)| *w <= max_width)
     .collect();
-    let all_formats = [
-        (PixelFormat::Yuyv, PixelFormat::Rgba),
-        (PixelFormat::Yuyv, PixelFormat::Rgb),
-        (PixelFormat::Yuyv, PixelFormat::Rgb),
-        (PixelFormat::Yuyv, PixelFormat::PlanarRgb),
-        (PixelFormat::Yuyv, PixelFormat::PlanarRgb),
-        (PixelFormat::Nv12, PixelFormat::Rgba),
-        (PixelFormat::Nv12, PixelFormat::Rgb),
-        (PixelFormat::Nv12, PixelFormat::Rgb),
-        (PixelFormat::Nv12, PixelFormat::PlanarRgb),
-        (PixelFormat::Nv12, PixelFormat::PlanarRgb),
+    // (input_format, output_format, output_dtype) — u8 and i8 output variants
+    let all_combos: Vec<(PixelFormat, PixelFormat, DType)> = vec![
+        // u8 output
+        (PixelFormat::Yuyv, PixelFormat::Rgba, DType::U8),
+        (PixelFormat::Yuyv, PixelFormat::Rgb, DType::U8),
+        (PixelFormat::Yuyv, PixelFormat::PlanarRgb, DType::U8),
+        (PixelFormat::Nv12, PixelFormat::Rgba, DType::U8),
+        (PixelFormat::Nv12, PixelFormat::Rgb, DType::U8),
+        (PixelFormat::Nv12, PixelFormat::PlanarRgb, DType::U8),
+        // i8 output (int8 model input)
+        (PixelFormat::Yuyv, PixelFormat::Rgb, DType::I8),
+        (PixelFormat::Yuyv, PixelFormat::PlanarRgb, DType::I8),
+        (PixelFormat::Nv12, PixelFormat::Rgb, DType::I8),
+        (PixelFormat::Nv12, PixelFormat::PlanarRgb, DType::I8),
     ];
-    let formats: Vec<_> = all_formats
+    let combos: Vec<_> = all_combos
         .into_iter()
-        .filter(|(inf, outf)| {
+        .filter(|(inf, outf, _)| {
             !(skip_nv12_planar && *inf == PixelFormat::Nv12 && *outf == PixelFormat::PlanarRgb)
         })
         .collect();
 
     for (w, h, res) in pipelines {
-        for (in_fmt, out_fmt) in &formats {
+        for (in_fmt, out_fmt, out_dtype) in &combos {
+            let dtype_suffix = match out_dtype {
+                DType::I8 => "_i8",
+                _ => "",
+            };
             let name = format!(
-                "pipeline/{res}/{}->{}/640x640",
+                "pipeline/{res}/{}->{}{dtype_suffix}/640x640",
                 common::format_name(*in_fmt),
                 common::format_name(*out_fmt),
             );
@@ -309,7 +315,7 @@ fn bench_letterbox_pipeline(
             };
             let data = get_test_data(w, h, *in_fmt);
             src.as_u8().unwrap().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
-            let Ok(mut dst) = proc.create_image(640, 640, *out_fmt, None) else {
+            let Ok(mut dst) = TensorDyn::image(640, 640, *out_fmt, *out_dtype, None) else {
                 println!("  {:50} [skipped: allocation failed]", name);
                 continue;
             };
