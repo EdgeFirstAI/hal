@@ -2140,8 +2140,7 @@ impl Decoder {
         ) -> M,
     ) -> Result<M, DecoderError> {
         use crate::{
-            yolo::impl_yolo_end_to_end_segdet_get_boxes,
-            yolo::impl_yolo_split_segdet_process_masks, yolo::postprocess_yolo_end_to_end_segdet,
+            yolo::impl_yolo_end_to_end_segdet_get_boxes, yolo::postprocess_yolo_end_to_end_segdet,
             XYXY,
         };
 
@@ -2392,8 +2391,7 @@ impl Decoder {
         ) -> M,
     ) -> Result<M, DecoderError> {
         use crate::yolo::{
-            impl_yolo_end_to_end_segdet_get_boxes, impl_yolo_split_segdet_process_masks,
-            postprocess_yolo_split_end_to_end_segdet,
+            impl_yolo_end_to_end_segdet_get_boxes, postprocess_yolo_split_end_to_end_segdet,
         };
         use crate::XYXY;
 
