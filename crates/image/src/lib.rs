@@ -873,26 +873,50 @@ impl ImageProcessorTrait for ImageProcessor {
         crop: Crop,
     ) -> Result<()> {
         let start = Instant::now();
+        let src_fmt = src
+            .format()
+            .map(|f| format!("{f}"))
+            .unwrap_or_else(|| "none".into());
+        let dst_fmt = dst
+            .format()
+            .map(|f| format!("{f}"))
+            .unwrap_or_else(|| "none".into());
+        let src_dtype = src.dtype();
+        let dst_dtype = dst.dtype();
+        let src_mem = src.memory();
+        let dst_mem = dst.memory();
 
-        if let Some(ref forced) = self.forced_backend {
-            log::trace!("ImageProcessor::convert: forced backend = {forced:?}");
-        } else {
-            log::trace!("ImageProcessor::convert: auto backend selection");
-        }
+        log::trace!(
+            "convert: {src_fmt}({src_dtype:?}/{src_mem:?}) → {dst_fmt}({dst_dtype:?}/{dst_mem:?}), \
+             rotation={rotation:?}, flip={flip:?}, backend={:?}",
+            self.forced_backend.as_ref().map(|f| format!("{f:?}")).unwrap_or_else(|| "auto".into()),
+        );
 
         // ── Forced backend: no fallback chain ────────────────────────
         if let Some(forced) = self.forced_backend {
             return match forced {
                 ForcedBackend::Cpu => {
                     if let Some(cpu) = self.cpu.as_mut() {
-                        return cpu.convert(src, dst, rotation, flip, crop);
+                        let r = cpu.convert(src, dst, rotation, flip, crop);
+                        log::trace!(
+                            "convert: forced=cpu result={} ({:?})",
+                            if r.is_ok() { "ok" } else { "err" },
+                            start.elapsed()
+                        );
+                        return r;
                     }
                     Err(Error::ForcedBackendUnavailable("cpu".into()))
                 }
                 ForcedBackend::G2d => {
                     #[cfg(target_os = "linux")]
                     if let Some(g2d) = self.g2d.as_mut() {
-                        return g2d.convert(src, dst, rotation, flip, crop);
+                        let r = g2d.convert(src, dst, rotation, flip, crop);
+                        log::trace!(
+                            "convert: forced=g2d result={} ({:?})",
+                            if r.is_ok() { "ok" } else { "err" },
+                            start.elapsed()
+                        );
+                        return r;
                     }
                     Err(Error::ForcedBackendUnavailable("g2d".into()))
                 }
@@ -900,7 +924,13 @@ impl ImageProcessorTrait for ImageProcessor {
                     #[cfg(target_os = "linux")]
                     #[cfg(feature = "opengl")]
                     if let Some(opengl) = self.opengl.as_mut() {
-                        return opengl.convert(src, dst, rotation, flip, crop);
+                        let r = opengl.convert(src, dst, rotation, flip, crop);
+                        log::trace!(
+                            "convert: forced=opengl result={} ({:?})",
+                            if r.is_ok() { "ok" } else { "err" },
+                            start.elapsed()
+                        );
+                        return r;
                     }
                     Err(Error::ForcedBackendUnavailable("opengl".into()))
                 }
@@ -911,41 +941,47 @@ impl ImageProcessorTrait for ImageProcessor {
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
         if let Some(opengl) = self.opengl.as_mut() {
-            log::trace!("auto: trying opengl ({:?})", start.elapsed());
             match opengl.convert(src, dst, rotation, flip, crop) {
                 Ok(_) => {
-                    log::trace!("auto: converted with opengl ({:?})", start.elapsed());
+                    log::trace!(
+                        "convert: auto selected=opengl for {src_fmt}→{dst_fmt} ({:?})",
+                        start.elapsed()
+                    );
                     return Ok(());
                 }
                 Err(e) => {
-                    log::debug!("auto: OpenGL declined, trying next backend: {e:?}")
+                    log::trace!("convert: auto opengl declined {src_fmt}→{dst_fmt}: {e}");
                 }
             }
         }
 
         #[cfg(target_os = "linux")]
         if let Some(g2d) = self.g2d.as_mut() {
-            log::trace!("auto: trying g2d ({:?})", start.elapsed());
             match g2d.convert(src, dst, rotation, flip, crop) {
                 Ok(_) => {
-                    log::trace!("auto: converted with g2d ({:?})", start.elapsed());
+                    log::trace!(
+                        "convert: auto selected=g2d for {src_fmt}→{dst_fmt} ({:?})",
+                        start.elapsed()
+                    );
                     return Ok(());
                 }
                 Err(e) => {
-                    log::debug!("auto: G2D declined, trying next backend: {e:?}")
+                    log::trace!("convert: auto g2d declined {src_fmt}→{dst_fmt}: {e}");
                 }
             }
         }
 
         if let Some(cpu) = self.cpu.as_mut() {
-            log::trace!("auto: trying cpu ({:?})", start.elapsed());
             match cpu.convert(src, dst, rotation, flip, crop) {
                 Ok(_) => {
-                    log::trace!("auto: converted with cpu ({:?})", start.elapsed());
+                    log::trace!(
+                        "convert: auto selected=cpu for {src_fmt}→{dst_fmt} ({:?})",
+                        start.elapsed()
+                    );
                     return Ok(());
                 }
                 Err(e) => {
-                    log::debug!("auto: CPU failed: {e:?}");
+                    log::trace!("convert: auto cpu failed {src_fmt}→{dst_fmt}: {e}");
                     return Err(e);
                 }
             }
