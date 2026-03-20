@@ -342,6 +342,7 @@ fn bench_letterbox_pipeline(
 // =============================================================================
 
 fn main() {
+    env_logger::init();
     let mut suite = BenchSuite::from_args();
     let mut proc = ImageProcessor::new().expect("Failed to create ImageProcessor");
 
