@@ -112,7 +112,7 @@ pub struct HalTensor {
 
 impl HalTensor {
     pub fn dtype(&self) -> HalDtype {
-        self.inner.dtype().into()
+        HalDtype::try_from(self.inner.dtype()).unwrap_or(HalDtype::U8)
     }
 }
 
@@ -134,21 +134,23 @@ impl From<HalDtype> for DType {
     }
 }
 
-impl From<DType> for HalDtype {
-    fn from(d: DType) -> Self {
+impl TryFrom<DType> for HalDtype {
+    type Error = DType;
+
+    fn try_from(d: DType) -> std::result::Result<Self, Self::Error> {
         match d {
-            DType::U8 => HalDtype::U8,
-            DType::I8 => HalDtype::I8,
-            DType::U16 => HalDtype::U16,
-            DType::I16 => HalDtype::I16,
-            DType::U32 => HalDtype::U32,
-            DType::I32 => HalDtype::I32,
-            DType::U64 => HalDtype::U64,
-            DType::I64 => HalDtype::I64,
-            DType::F32 => HalDtype::F32,
-            DType::F64 => HalDtype::F64,
-            DType::F16 => HalDtype::F16,
-            _ => HalDtype::U8, // Future types not yet in C API
+            DType::U8 => Ok(HalDtype::U8),
+            DType::I8 => Ok(HalDtype::I8),
+            DType::U16 => Ok(HalDtype::U16),
+            DType::I16 => Ok(HalDtype::I16),
+            DType::U32 => Ok(HalDtype::U32),
+            DType::I32 => Ok(HalDtype::I32),
+            DType::U64 => Ok(HalDtype::U64),
+            DType::I64 => Ok(HalDtype::I64),
+            DType::F16 => Ok(HalDtype::F16),
+            DType::F32 => Ok(HalDtype::F32),
+            DType::F64 => Ok(HalDtype::F64),
+            other => Err(other),
         }
     }
 }
@@ -177,6 +179,7 @@ pub enum HalTensorMap {
     I32(TensorMap<i32>),
     U64(TensorMap<u64>),
     I64(TensorMap<i64>),
+    F16(TensorMap<half::f16>),
     F32(TensorMap<f32>),
     F64(TensorMap<f64>),
 }
@@ -193,6 +196,7 @@ macro_rules! dispatch_map {
             HalTensorMap::I32($m) => $body,
             HalTensorMap::U64($m) => $body,
             HalTensorMap::I64($m) => $body,
+            HalTensorMap::F16($m) => $body,
             HalTensorMap::F32($m) => $body,
             HalTensorMap::F64($m) => $body,
         }
@@ -521,6 +525,7 @@ pub unsafe extern "C" fn hal_tensor_map_create(tensor: *const HalTensor) -> *mut
         TensorDyn::I32(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::I32),
         TensorDyn::U64(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::U64),
         TensorDyn::I64(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::I64),
+        TensorDyn::F16(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::F16),
         TensorDyn::F32(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::F32),
         TensorDyn::F64(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::F64),
         _ => return set_error_null(libc::ENOTSUP),

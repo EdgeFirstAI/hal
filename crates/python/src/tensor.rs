@@ -121,6 +121,7 @@ fn parse_dtype(dtype: &str) -> Result<DType> {
         "int32" => Ok(DType::I32),
         "uint64" => Ok(DType::U64),
         "int64" => Ok(DType::I64),
+        "float16" => Ok(DType::F16),
         "float32" => Ok(DType::F32),
         "float64" => Ok(DType::F64),
         _ => Err(Error::UnsupportedDataType(dtype.to_string())),
@@ -158,6 +159,7 @@ pub enum TensorMapT {
     TensorI32(tensor::TensorMap<i32>),
     TensorU64(tensor::TensorMap<u64>),
     TensorI64(tensor::TensorMap<i64>),
+    TensorF16(tensor::TensorMap<half::f16>),
     TensorF32(tensor::TensorMap<f32>),
     TensorF64(tensor::TensorMap<f64>),
 }
@@ -174,6 +176,7 @@ macro_rules! map_dispatch {
             TensorMapT::TensorI32(m) => m.$method($($arg),*),
             TensorMapT::TensorU64(m) => m.$method($($arg),*),
             TensorMapT::TensorI64(m) => m.$method($($arg),*),
+            TensorMapT::TensorF16(m) => m.$method($($arg),*),
             TensorMapT::TensorF32(m) => m.$method($($arg),*),
             TensorMapT::TensorF64(m) => m.$method($($arg),*),
         }
@@ -204,6 +207,7 @@ impl TensorMapT {
             TensorMapT::TensorI32(_) => std::mem::size_of::<i32>(),
             TensorMapT::TensorU64(_) => std::mem::size_of::<u64>(),
             TensorMapT::TensorI64(_) => std::mem::size_of::<i64>(),
+            TensorMapT::TensorF16(_) => std::mem::size_of::<half::f16>(),
             TensorMapT::TensorF32(_) => std::mem::size_of::<f32>(),
             TensorMapT::TensorF64(_) => std::mem::size_of::<f64>(),
         }
@@ -222,6 +226,9 @@ impl TensorMapT {
             TensorMapT::TensorI32(m) => Ok(m.as_ref()[index].into_pyobject(py)?.into()),
             TensorMapT::TensorU64(m) => Ok(m.as_ref()[index].into_pyobject(py)?.into()),
             TensorMapT::TensorI64(m) => Ok(m.as_ref()[index].into_pyobject(py)?.into()),
+            TensorMapT::TensorF16(m) => Ok(half::f16::to_f32(m.as_ref()[index])
+                .into_pyobject(py)?
+                .into()),
             TensorMapT::TensorF32(m) => Ok(m.as_ref()[index].into_pyobject(py)?.into()),
             TensorMapT::TensorF64(m) => Ok(m.as_ref()[index].into_pyobject(py)?.into()),
         }
@@ -240,6 +247,9 @@ impl TensorMapT {
             TensorMapT::TensorI32(m) => m.as_mut()[index] = value.extract::<i32>(py)?,
             TensorMapT::TensorU64(m) => m.as_mut()[index] = value.extract::<u64>(py)?,
             TensorMapT::TensorI64(m) => m.as_mut()[index] = value.extract::<i64>(py)?,
+            TensorMapT::TensorF16(m) => {
+                m.as_mut()[index] = half::f16::from_f32(value.extract::<f32>(py)?)
+            }
             TensorMapT::TensorF32(m) => m.as_mut()[index] = value.extract::<f32>(py)?,
             TensorMapT::TensorF64(m) => m.as_mut()[index] = value.extract::<f64>(py)?,
         }
@@ -257,6 +267,7 @@ impl TensorMapT {
             TensorMapT::TensorI32(m) => m.as_ref().as_ptr() as *mut c_void,
             TensorMapT::TensorU64(m) => m.as_ref().as_ptr() as *mut c_void,
             TensorMapT::TensorI64(m) => m.as_ref().as_ptr() as *mut c_void,
+            TensorMapT::TensorF16(m) => m.as_ref().as_ptr() as *mut c_void,
             TensorMapT::TensorF32(m) => m.as_ref().as_ptr() as *mut c_void,
             TensorMapT::TensorF64(m) => m.as_ref().as_ptr() as *mut c_void,
         }
@@ -274,6 +285,7 @@ impl TensorMapT {
             TensorMapT::TensorI32(_) => "i",
             TensorMapT::TensorU64(_) => "Q",
             TensorMapT::TensorI64(_) => "q",
+            TensorMapT::TensorF16(_) => "e",
             TensorMapT::TensorF32(_) => "f",
             TensorMapT::TensorF64(_) => "d",
         }
@@ -289,6 +301,7 @@ impl TensorMapT {
             TensorMapT::TensorI32(_) => "int32",
             TensorMapT::TensorU64(_) => "uint64",
             TensorMapT::TensorI64(_) => "int64",
+            TensorMapT::TensorF16(_) => "float16",
             TensorMapT::TensorF32(_) => "float32",
             TensorMapT::TensorF64(_) => "float64",
         }
@@ -306,9 +319,7 @@ fn map_tensor_dyn(t: &TensorDyn) -> tensor::Result<TensorMapT> {
         TensorDyn::I32(t) => t.map().map(TensorMapT::TensorI32),
         TensorDyn::U64(t) => t.map().map(TensorMapT::TensorU64),
         TensorDyn::I64(t) => t.map().map(TensorMapT::TensorI64),
-        TensorDyn::F16(_) => Err(tensor::Error::InvalidArgument(
-            "float16 tensor mapping not supported in Python".to_string(),
-        )),
+        TensorDyn::F16(t) => t.map().map(TensorMapT::TensorF16),
         TensorDyn::F32(t) => t.map().map(TensorMapT::TensorF32),
         TensorDyn::F64(t) => t.map().map(TensorMapT::TensorF64),
         _ => Err(tensor::Error::InvalidArgument(
