@@ -823,11 +823,6 @@ mod gl_tests {
         .unwrap();
 
         let crop = letterbox_crop(1920, 1080, 640, 640);
-        // Use GLProcessorST with direct PixelFormat::Rgb disabled to validate two-pass int8
-        // pipeline against PixelFormat::Rgba reference. The direct path renders to a different
-        // framebuffer format (RGB8 renderbuffer vs RGBA8 texture) which produces
-        // different YUV interpolation results; it is validated separately by
-        // test_opengl_rgb_direct_matches_two_pass.
         let mut gl = match GLProcessorST::new(None) {
             Ok(gl) => gl,
             Err(e) => {
@@ -845,7 +840,6 @@ mod gl_tests {
             );
             return;
         }
-        gl.support_rgb_direct = false;
         let src_dyn = src_dma;
 
         // GL PixelFormat::Rgba reference
@@ -951,146 +945,6 @@ mod gl_tests {
         let expected_rgb = rgba_to_rgb(rgba_data.as_slice());
         let gl_data = dst_rgb_dyn.as_u8().unwrap().map().unwrap();
         assert_pixels_match(&expected_rgb, gl_data.as_slice(), 1);
-    }
-
-    // =========================================================================
-    // Direct PixelFormat::Rgb Render Path Tests
-    // These tests exercise the single-pass BGR888 renderbuffer path added by
-    // the GL cache work (EDGEAI-776). They require DMA + OpenGL hardware.
-    // =========================================================================
-
-    /// Verify that the direct PixelFormat::Rgb probe runs without crashing.
-    #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
-    fn test_probe_rgb_direct_support() {
-        if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
-            return;
-        }
-        let gl = match GLProcessorST::new(None) {
-            Ok(gl) => gl,
-            Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
-                return;
-            }
-        };
-        // The probe runs during new(). Just check the field is set.
-        eprintln!(
-            "support_rgb_direct = {} (probe completed without crash)",
-            gl.support_rgb_direct
-        );
-    }
-
-    /// Compare direct PixelFormat::Rgb path against two-pass path pixel-for-pixel.
-    /// If GPU doesn't support direct PixelFormat::Rgb, this test is a no-op.
-    #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
-    fn test_opengl_rgb_direct_matches_two_pass() {
-        if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
-            return;
-        }
-        let mut gl = match GLProcessorST::new(None) {
-            Ok(gl) => gl,
-            Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
-                return;
-            }
-        };
-        if !gl.support_rgb_direct {
-            eprintln!(
-                "SKIPPED: {} - GPU does not support direct PixelFormat::Rgb",
-                function!()
-            );
-            return;
-        }
-
-        // Create PixelFormat::Rgba source with deterministic pattern
-        // Use 640x480 source → 320x320 output so pitch (320*3=960) is 64-byte aligned
-        // for Mali GPU DMA-buf import requirements.
-        let src = TensorDyn::image(
-            640,
-            480,
-            PixelFormat::Rgba,
-            DType::U8,
-            Some(TensorMemory::Dma),
-        )
-        .unwrap();
-        {
-            let mut map = src.as_u8().unwrap().map().unwrap();
-            for (i, byte) in map.as_mut_slice().iter_mut().enumerate() {
-                *byte = (i % 251) as u8; // deterministic pattern
-            }
-        }
-        let src_dyn = src;
-
-        let crop = crate::Crop {
-            src_rect: None,
-            dst_rect: None,
-            dst_color: None,
-        };
-
-        // Direct path (support_rgb_direct = true)
-        let dst_direct = TensorDyn::image(
-            320,
-            320,
-            PixelFormat::Rgb,
-            DType::U8,
-            Some(TensorMemory::Dma),
-        )
-        .unwrap();
-        let mut dst_direct_dyn = dst_direct;
-        gl.convert(
-            &src_dyn,
-            &mut dst_direct_dyn,
-            Rotation::None,
-            Flip::None,
-            crop,
-        )
-        .unwrap();
-
-        // Two-pass packed PixelFormat::Rgb is intentionally rejected on the DMA backend
-        // (convert_dest_dma returns NotSupported) because it's slower than
-        // the direct path. Skip the comparison when DMA is active.
-        if gl.gl_context.transfer_backend.is_dma() {
-            eprintln!(
-                "SKIPPED two-pass comparison: DMA backend does not support two-pass packed PixelFormat::Rgb"
-            );
-            return;
-        }
-
-        // Force two-pass path
-        gl.support_rgb_direct = false;
-        let dst_twop = TensorDyn::image(
-            320,
-            320,
-            PixelFormat::Rgb,
-            DType::U8,
-            Some(TensorMemory::Dma),
-        )
-        .unwrap();
-        let mut dst_twop_dyn = dst_twop;
-        gl.convert(
-            &src_dyn,
-            &mut dst_twop_dyn,
-            Rotation::None,
-            Flip::None,
-            crop,
-        )
-        .unwrap();
-        gl.support_rgb_direct = true;
-
-        // Compare
-        let map_direct = dst_direct_dyn.as_u8().unwrap().map().unwrap();
-        let map_twop = dst_twop_dyn.as_u8().unwrap().map().unwrap();
-        // Allow ±1 tolerance for potential rounding differences
-        let mut max_diff = 0i32;
-        for (a, b) in map_direct.as_slice().iter().zip(map_twop.as_slice().iter()) {
-            let diff = (*a as i32 - *b as i32).abs();
-            max_diff = max_diff.max(diff);
-        }
-        eprintln!("PixelFormat::Rgb direct vs two-pass max pixel diff: {max_diff}");
-        assert!(max_diff <= 1, "Pixel mismatch > 1: max_diff={max_diff}");
     }
 
     // ---- PixelFormat::Bgra destination tests ----
@@ -1719,92 +1573,6 @@ mod gl_tests {
         .unwrap();
 
         // Multiplane → packed PixelFormat::Rgb with letterbox
-        let dst_multi = TensorDyn::image(
-            640,
-            640,
-            PixelFormat::Rgb,
-            DType::U8,
-            Some(TensorMemory::Dma),
-        )
-        .unwrap();
-        let src_multiplane_dyn = src_multiplane;
-        let mut dst_multi_dyn = dst_multi;
-        gl.convert(
-            &src_multiplane_dyn,
-            &mut dst_multi_dyn,
-            Rotation::None,
-            Flip::None,
-            crop,
-        )
-        .unwrap();
-
-        let map_contig = dst_contig_dyn.as_u8().unwrap().map().unwrap();
-        let map_multi = dst_multi_dyn.as_u8().unwrap().map().unwrap();
-        assert_pixels_match(map_contig.as_slice(), map_multi.as_slice(), 0);
-    }
-
-    /// Multiplane PixelFormat::Nv12 720p → packed PixelFormat::Rgb via direct PixelFormat::Rgb renderbuffer path.
-    /// Validates direct single-pass rendering with multiplane EGLImage source.
-    #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
-    fn test_multiplane_nv12_rgb_direct_opengl() {
-        if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
-            return;
-        }
-        let mut gl = match GLProcessorST::new(None) {
-            Ok(gl) => gl,
-            Err(e) => {
-                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
-                return;
-            }
-        };
-        if !gl.support_rgb_direct {
-            eprintln!(
-                "SKIPPED: {} - GPU does not support direct PixelFormat::Rgb",
-                function!()
-            );
-            return;
-        }
-
-        let nv12_bytes: &[u8] = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/camera720p.nv12"
-        ));
-
-        let src_contiguous = load_raw_image(
-            1280,
-            720,
-            PixelFormat::Nv12,
-            Some(TensorMemory::Dma),
-            nv12_bytes,
-        )
-        .unwrap();
-        let src_multiplane = load_multiplane_nv12_dma(1280, 720, nv12_bytes);
-
-        let crop = letterbox_crop(1280, 720, 640, 640);
-
-        // Contiguous → direct PixelFormat::Rgb
-        let dst_contig = TensorDyn::image(
-            640,
-            640,
-            PixelFormat::Rgb,
-            DType::U8,
-            Some(TensorMemory::Dma),
-        )
-        .unwrap();
-        let src_contiguous_dyn = src_contiguous;
-        let mut dst_contig_dyn = dst_contig;
-        gl.convert(
-            &src_contiguous_dyn,
-            &mut dst_contig_dyn,
-            Rotation::None,
-            Flip::None,
-            crop,
-        )
-        .unwrap();
-
-        // Multiplane → direct PixelFormat::Rgb
         let dst_multi = TensorDyn::image(
             640,
             640,
