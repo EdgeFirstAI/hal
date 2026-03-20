@@ -5191,4 +5191,96 @@ outputs:
         assert!(output_boxes[0].equal_within_delta(&expected_boxes[0], 1e-3));
         assert!(output_boxes[1].equal_within_delta(&expected_boxes[1], 1e-3));
     }
+
+    #[test]
+    fn test_decoder_tracked_end_to_end_float() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+
+        let mut boxes = Array2::zeros((10, 4));
+        let mut scores = Array2::zeros((10, 1));
+        let mut classes = Array2::zeros((10, 1));
+
+        boxes
+            .slice_mut(s![0, ..,])
+            .assign(&array![0.1234, 0.1234, 0.2345, 0.2345]);
+        scores.slice_mut(s![0, ..]).assign(&array![0.9876]);
+        classes.slice_mut(s![0, ..]).assign(&array![2.0]);
+
+        let detect = ndarray::concatenate![Axis(1), boxes.view(), scores.view(), classes.view(),];
+        let mut detect = detect.insert_axis(Axis(0));
+        assert_eq!(detect.shape(), &[1, 10, 6]);
+        let config = "
+decoder_version: yolo26
+outputs:
+ - type: detection
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 6]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [num_features, 6]
+   normalized: true
+";
+
+        let decoder = DecoderBuilder::default()
+            .with_config_yaml_str(config.to_string())
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .build()
+            .unwrap();
+
+        let expected_boxes = [DetectBox {
+            bbox: BoundingBox {
+                xmin: 0.1234,
+                ymin: 0.1234,
+                xmax: 0.2345,
+                ymax: 0.2345,
+            },
+            score: 0.9876,
+            label: 2,
+        }];
+
+        let mut tracker = ByteTrackBuilder::new()
+            .track_update(0.1)
+            .track_high_conf(0.7)
+            .build();
+
+        let mut output_boxes = Vec::with_capacity(50);
+        let mut output_masks = Vec::with_capacity(50);
+        let mut output_tracks = Vec::with_capacity(50);
+
+        decoder
+            .decode_tracked_float(
+                &mut tracker,
+                0,
+                &[detect.view().into_dyn()],
+                &mut output_boxes,
+                &mut output_masks,
+                &mut output_tracks,
+            )
+            .unwrap();
+
+        assert_eq!(output_boxes.len(), 1);
+        assert!(output_boxes[0].equal_within_delta(&expected_boxes[0], 1e-6));
+
+        // give the decoder a final frame with no detections to ensure tracks are properly predicting forward when detection is missing
+
+        for score in detect.slice_mut(s![.., .., 4]).iter_mut() {
+            *score = 0.0; // set all scores to minimum to simulate no detections
+        }
+
+        decoder
+            .decode_tracked_float(
+                &mut tracker,
+                100_000_000 / 3,
+                &[detect.view().into_dyn()],
+                &mut output_boxes,
+                &mut output_masks,
+                &mut output_tracks,
+            )
+            .unwrap();
+        assert!(output_boxes[0].equal_within_delta(&expected_boxes[0], 1e-6));
+    }
 }
