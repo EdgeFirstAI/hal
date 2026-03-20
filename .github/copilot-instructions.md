@@ -375,11 +375,16 @@ All public APIs return `Result<T, E>` with specific error types:
 
 ### Hardware Acceleration Pattern
 
-Image processing uses a fallback chain: G2D → OpenGL → CPU
+Image processing uses a fallback chain: OpenGL → G2D → CPU
 
 ```rust
 impl ImageProcessorTrait for ImageProcessor {
     fn convert(&mut self, src: &TensorDyn, dst: &mut TensorDyn) -> Result<()> {
+        if let Some(gl) = &mut self.gl {
+            if gl.can_convert(src.format, dst.format) {
+                return gl.convert(src, dst, options);
+            }
+        }
         if let Some(g2d) = &mut self.g2d {
             if g2d.can_convert(src.format, dst.format) {
                 return g2d.convert(src, dst, options);

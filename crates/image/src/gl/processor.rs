@@ -89,6 +89,10 @@ pub struct GLProcessorST {
     packed_rgb_intermediate_size: (usize, usize),
     texture_program: GlProgram,
     texture_program_yuv: GlProgram,
+    /// Int8 variant of texture_program — applies XOR 0x80 bias in fragment shader.
+    texture_int8_program: GlProgram,
+    /// Int8 variant of texture_program_yuv — applies XOR 0x80 bias in fragment shader.
+    texture_int8_program_yuv: GlProgram,
     texture_program_planar: GlProgram,
     /// Shader: existing planar RGB with int8 bias (XOR 0x80) applied to output.
     texture_program_planar_int8: GlProgram,
@@ -299,6 +303,11 @@ impl GLProcessorST {
             generate_texture_fragment_shader_yuv(),
         )?;
 
+        let texture_int8_program =
+            GlProgram::new(generate_vertex_shader(), generate_texture_int8_shader())?;
+        let texture_int8_program_yuv =
+            GlProgram::new(generate_vertex_shader(), generate_texture_int8_shader_yuv())?;
+
         let segmentation_program =
             GlProgram::new(generate_vertex_shader(), generate_segmentation_shader())?;
         segmentation_program.load_uniform_4fv(c"colors", &DEFAULT_COLORS)?;
@@ -382,6 +391,8 @@ impl GLProcessorST {
             gl_context,
             texture_program,
             texture_program_yuv,
+            texture_int8_program,
+            texture_int8_program_yuv,
             texture_program_planar,
             texture_program_planar_int8,
             packed_rgba8_program_2d,
@@ -1554,10 +1565,35 @@ impl GLProcessorST {
         } else {
             log::trace!(
                 "GL DMA dispatch: {src_fmt}→{dst_fmt} int8={is_int8} → single-pass EGLImage \
-                 (renderbuffer direct)"
+                 (renderbuffer, {}shader)",
+                if is_int8 { "int8 " } else { "standard " }
             );
             self.setup_renderbuffer_dma(dst, dst_fmt)?;
-            self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)
+            // For int8 output, swap to int8 shader programs that apply XOR 0x80
+            // in the fragment shader — zero CPU readback.
+            if is_int8 {
+                std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+                std::mem::swap(
+                    &mut self.texture_program_yuv,
+                    &mut self.texture_int8_program_yuv,
+                );
+                // Bias the letterbox clear color since glClear bypasses the shader.
+                let mut crop = crop;
+                if let Some(ref mut color) = crop.dst_color {
+                    color[0] ^= 0x80;
+                    color[1] ^= 0x80;
+                    color[2] ^= 0x80;
+                }
+                let result = self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop);
+                std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+                std::mem::swap(
+                    &mut self.texture_program_yuv,
+                    &mut self.texture_int8_program_yuv,
+                );
+                result
+            } else {
+                self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)
+            }
         }
     }
 

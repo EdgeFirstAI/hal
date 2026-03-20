@@ -144,6 +144,59 @@ void main(){
 "
 }
 
+/// Int8 variant of [`generate_texture_fragment_shader`]. Applies `fract(v + 0.5)`
+/// to each RGB channel for XOR 0x80 bias (uint8 → int8 conversion).
+/// Used for single-pass RGBA/BGRA/Grey int8 output via DMA EGLImage renderbuffer.
+pub(super) fn generate_texture_int8_shader() -> &'static str {
+    "\
+#version 300 es
+precision highp float;
+uniform sampler2D tex;
+in vec3 fragPos;
+in vec2 tc;
+
+out vec4 color;
+
+// XOR 0x80 bias: quantize to uint8, add 128 mod 256, normalize back.
+// This matches the CPU `byte ^ 0x80` operation exactly.
+vec3 int8_bias(vec3 v) {
+    vec3 q = floor(v * 255.0 + 0.5);
+    return mod(q + 128.0, 256.0) / 255.0;
+}
+
+void main(){
+    vec4 c = texture(tex, tc);
+    color = vec4(int8_bias(c.rgb), c.a);
+}
+"
+}
+
+/// Int8 variant of [`generate_texture_fragment_shader_yuv`]. Applies XOR 0x80 bias
+/// to each RGB channel (uint8 → int8 conversion).
+/// Used for single-pass int8 output with external OES sources (YUV EGLImage).
+pub(super) fn generate_texture_int8_shader_yuv() -> &'static str {
+    "\
+#version 300 es
+#extension GL_OES_EGL_image_external_essl3 : require
+precision highp float;
+uniform samplerExternalOES tex;
+in vec3 fragPos;
+in vec2 tc;
+
+out vec4 color;
+
+vec3 int8_bias(vec3 v) {
+    vec3 q = floor(v * 255.0 + 0.5);
+    return mod(q + 128.0, 256.0) / 255.0;
+}
+
+void main(){
+    vec4 c = texture(tex, tc);
+    color = vec4(int8_bias(c.rgb), c.a);
+}
+"
+}
+
 /// Int8 variant of [`generate_planar_rgb_shader`]. Applies XOR 0x80 bias
 /// to each RGB channel (uint8 → int8 conversion) using the bit-exact
 /// quantize+mod approach: `floor(v * 255 + 0.5) + 128 mod 256 / 255`.

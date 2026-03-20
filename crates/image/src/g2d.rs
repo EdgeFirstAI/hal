@@ -123,7 +123,13 @@ impl G2DProcessor {
         // For i8 destinations, reinterpret as u8 for G2D (same byte layout).
         // The XOR 0x80 post-pass is applied after the blit completes.
         let dst = if is_int8_dst {
-            // SAFETY: i8 and u8 have identical layout and size.
+            // SAFETY: Tensor<i8> and Tensor<u8> have identical memory layout.
+            // The T parameter only affects PhantomData<T> (zero-sized) in
+            // TensorStorage variants and the typed view from map(). The chroma
+            // field (Option<Box<Tensor<T>>>) is also layout-identical. This
+            // reinterpreted reference is used only for shape/fd access and the
+            // G2D blit (which operates on raw DMA bytes). It does not outlive
+            // dst_dyn and is never stored.
             let i8_tensor = dst_dyn.as_i8_mut().unwrap();
             unsafe { &mut *(i8_tensor as *mut Tensor<i8> as *mut Tensor<u8>) }
         } else {
@@ -201,7 +207,10 @@ impl G2DProcessor {
             }
         }
 
-        // Apply XOR 0x80 for int8 output (u8→i8 bias conversion)
+        // Apply XOR 0x80 for int8 output (u8→i8 bias conversion).
+        // map() triggers DMA_BUF_SYNC_START (cache invalidation) so CPU reads
+        // the G2D-written data correctly. The map drop triggers DMA_BUF_SYNC_END
+        // (cache flush) so downstream DMA consumers see the XOR'd data.
         if is_int8_dst {
             let start = Instant::now();
             let mut map = dst.map()?;

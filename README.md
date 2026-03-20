@@ -513,7 +513,7 @@ use edgefirst_tensor::{PixelFormat, TensorDyn};
 let bytes = std::fs::read("testdata/zidane.jpg")?;
 let input = load_image(&bytes, Some(PixelFormat::Rgb), None)?;
 
-// Create converter (auto-selects best backend: G2D, OpenGL, CPU)
+// Create converter (auto-selects best backend: OpenGL, G2D, CPU)
 let mut converter = ImageProcessor::new()?;
 
 // Create output buffer with optimal GPU memory (DMA > PBO > Mem)
@@ -662,10 +662,9 @@ Python wrapper types use a `Py` prefix (e.g., `PyTensor`, `PyPixelFormat`) to cl
 
 ### Image Processing Strategy
 
-1. **G2D**: NXP i.MX hardware acceleration (when format pair is supported)
-2. **CPU**: Fast path for same-size, no-rotation, simple format copies
-3. **OpenGL**: GPU-accelerated for complex pipelines (resize, rotation, YUV conversion)
-4. **CPU**: General fallback with SIMD + Rayon parallelization
+1. **OpenGL**: GPU-accelerated pipeline (resize, YUV conversion, letterbox)
+2. **G2D**: NXP i.MX 2D hardware blitter (when format pair is supported)
+3. **CPU**: SIMD + Rayon parallelized fallback for all platforms
 
 ### Decoder Optimization
 
