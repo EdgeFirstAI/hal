@@ -570,7 +570,6 @@ pub(crate) fn postprocess_yolo_split_end_to_end_segdet<
     ),
     crate::DecoderError,
 > {
-    println!("boxes.shape()={:?}", boxes.shape());
     if boxes.shape()[0] != 4 {
         return Err(crate::DecoderError::InvalidShape(format!(
             "Split end-to-end boxes must have 4 columns, got {}",
@@ -849,9 +848,8 @@ where
 {
     let mut boxes = postprocess_boxes_index_float::<B, _, _>(score_threshold.as_(), boxes, scores);
     boxes.truncate(max_boxes);
-
     for (b, ind) in &mut boxes {
-        b.label = classes[*ind].as_() as usize;
+        b.label = classes[*ind].as_().round() as usize;
     }
     boxes
 }
