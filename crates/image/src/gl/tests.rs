@@ -831,15 +831,7 @@ mod gl_tests {
             }
         };
 
-        // Two-pass packed PixelFormat::Rgb is intentionally rejected on the DMA backend.
-        // This test validates the two-pass int8 pipeline which requires non-DMA.
-        if gl.gl_context.transfer_backend.is_dma() {
-            eprintln!(
-                "SKIPPED: {} - DMA backend does not support two-pass packed PixelFormat::Rgb",
-                function!()
-            );
-            return;
-        }
+        // Two-pass packed RGB is now supported on the DMA backend.
         let src_dyn = src_dma;
 
         // GL PixelFormat::Rgba reference
