@@ -451,7 +451,7 @@ pub struct ImageProcessorConfig {
     /// Preferred compute backend.
     ///
     /// When set to a specific backend (not [`ComputeBackend::Auto`]), the
-    /// processor initializes that backend plus CPU as a fallback chain.
+    /// processor initializes that backend with no fallback — returns an error if the conversion is not supported.
     /// This takes precedence over `EDGEFIRST_FORCE_BACKEND` and the
     /// `EDGEFIRST_DISABLE_*` environment variables.
     ///
@@ -907,71 +907,45 @@ impl ImageProcessorTrait for ImageProcessor {
             };
         }
 
-        // ── Existing fallback chain ──────────────────────────────────
-        #[cfg(target_os = "linux")]
-        if let Some(g2d) = self.g2d.as_mut() {
-            log::trace!("image started with g2d in {:?}", start.elapsed());
-            match g2d.convert(src, dst, rotation, flip, crop) {
-                Ok(_) => {
-                    log::trace!("image converted with g2d in {:?}", start.elapsed());
-                    return Ok(());
-                }
-                Err(e) => {
-                    log::debug!("G2D conversion not supported, falling back: {e:?}")
-                }
-            }
-        }
-
-        // if the image is just a copy without an resizing, send it to the CPU and
-        // skip OpenGL
-        let src_shape = match crop.src_rect {
-            Some(s) => (s.width, s.height),
-            None => (src.width().unwrap_or(0), src.height().unwrap_or(0)),
-        };
-        let dst_shape = match crop.dst_rect {
-            Some(d) => (d.width, d.height),
-            None => (dst.width().unwrap_or(0), dst.height().unwrap_or(0)),
-        };
-
-        // TODO: Check if still use CPU when rotation or flip is enabled
-        if src_shape == dst_shape && flip == Flip::None && rotation == Rotation::None {
-            if let Some(cpu) = self.cpu.as_mut() {
-                match cpu.convert(src, dst, rotation, flip, crop) {
-                    Ok(_) => {
-                        log::trace!("image converted with cpu in {:?}", start.elapsed());
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        log::trace!("image didn't convert with cpu: {e:?}");
-                        return Err(e);
-                    }
-                }
-            }
-        }
-
+        // ── Auto fallback chain: OpenGL → G2D → CPU ──────────────────
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
         if let Some(opengl) = self.opengl.as_mut() {
-            log::trace!("image started with opengl in {:?}", start.elapsed());
+            log::trace!("auto: trying opengl ({:?})", start.elapsed());
             match opengl.convert(src, dst, rotation, flip, crop) {
                 Ok(_) => {
-                    log::trace!("image converted with opengl in {:?}", start.elapsed());
+                    log::trace!("auto: converted with opengl ({:?})", start.elapsed());
                     return Ok(());
                 }
                 Err(e) => {
-                    log::debug!("OpenGL conversion not supported, falling back to CPU: {e:?}")
+                    log::debug!("auto: OpenGL declined, trying next backend: {e:?}")
                 }
             }
         }
-        log::trace!("image started with cpu in {:?}", start.elapsed());
-        if let Some(cpu) = self.cpu.as_mut() {
-            match cpu.convert(src, dst, rotation, flip, crop) {
+
+        #[cfg(target_os = "linux")]
+        if let Some(g2d) = self.g2d.as_mut() {
+            log::trace!("auto: trying g2d ({:?})", start.elapsed());
+            match g2d.convert(src, dst, rotation, flip, crop) {
                 Ok(_) => {
-                    log::trace!("image converted with cpu in {:?}", start.elapsed());
+                    log::trace!("auto: converted with g2d ({:?})", start.elapsed());
                     return Ok(());
                 }
                 Err(e) => {
-                    log::trace!("image didn't convert with cpu: {e:?}");
+                    log::debug!("auto: G2D declined, trying next backend: {e:?}")
+                }
+            }
+        }
+
+        if let Some(cpu) = self.cpu.as_mut() {
+            log::trace!("auto: trying cpu ({:?})", start.elapsed());
+            match cpu.convert(src, dst, rotation, flip, crop) {
+                Ok(_) => {
+                    log::trace!("auto: converted with cpu ({:?})", start.elapsed());
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::debug!("auto: CPU failed: {e:?}");
                     return Err(e);
                 }
             }
