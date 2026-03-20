@@ -1653,10 +1653,10 @@ impl GLProcessorST {
                     src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop,
                 )
             } else {
-                log::trace!("convert_dest_dma: declining packed RGB (no direct RGB support)");
-                Err(crate::Error::NotSupported(
-                    "OpenGL two-pass packed RGB disabled (no direct RGB support)".into(),
-                ))
+                log::trace!("convert_dest_dma: two-pass packed RGB path for {dst_fmt}");
+                self.convert_to_packed_rgb(
+                    src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop,
+                )
             }
         } else if dst_fmt.layout() == PixelLayout::Planar {
             log::trace!("convert_dest_dma: planar output path for {dst_fmt}");
