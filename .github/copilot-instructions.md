@@ -379,18 +379,21 @@ Image processing uses a fallback chain: OpenGL → G2D → CPU
 
 ```rust
 impl ImageProcessorTrait for ImageProcessor {
-    fn convert(&mut self, src: &TensorDyn, dst: &mut TensorDyn) -> Result<()> {
-        if let Some(gl) = &mut self.gl {
-            if gl.can_convert(src.format, dst.format) {
-                return gl.convert(src, dst, options);
+    fn convert(&mut self, src: &TensorDyn, dst: &mut TensorDyn,
+               rotation: Rotation, flip: Flip, crop: Crop) -> Result<()> {
+        if let Some(opengl) = &mut self.opengl {
+            match opengl.convert(src, dst, rotation, flip, crop) {
+                Ok(_) => return Ok(()),
+                Err(_) => { /* fall through */ }
             }
         }
         if let Some(g2d) = &mut self.g2d {
-            if g2d.can_convert(src.format, dst.format) {
-                return g2d.convert(src, dst, options);
+            match g2d.convert(src, dst, rotation, flip, crop) {
+                Ok(_) => return Ok(()),
+                Err(_) => { /* fall through */ }
             }
         }
-        self.cpu.convert(src, dst, options)
+        self.cpu.convert(src, dst, rotation, flip, crop)
     }
 }
 ```

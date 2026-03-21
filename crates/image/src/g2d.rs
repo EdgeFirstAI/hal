@@ -60,21 +60,17 @@ impl G2DProcessor {
         flip: Flip,
         crop: Crop,
     ) -> Result<()> {
-        let src_fmt_str = src_dyn
-            .format()
-            .map(|f| format!("{f}"))
-            .unwrap_or_else(|| "none".into());
-        let dst_fmt_str = dst_dyn
-            .format()
-            .map(|f| format!("{f}"))
-            .unwrap_or_else(|| "none".into());
-        log::trace!(
-            "G2D convert: {src_fmt_str}({:?}/{:?}) → {dst_fmt_str}({:?}/{:?})",
-            src_dyn.dtype(),
-            src_dyn.memory(),
-            dst_dyn.dtype(),
-            dst_dyn.memory(),
-        );
+        if log::log_enabled!(log::Level::Trace) {
+            log::trace!(
+                "G2D convert: {:?}({:?}/{:?}) → {:?}({:?}/{:?})",
+                src_dyn.format(),
+                src_dyn.dtype(),
+                src_dyn.memory(),
+                dst_dyn.format(),
+                dst_dyn.dtype(),
+                dst_dyn.memory(),
+            );
+        }
 
         if src_dyn.dtype() != DType::U8 {
             return Err(Error::NotSupported(

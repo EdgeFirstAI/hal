@@ -1561,6 +1561,18 @@ impl GLProcessorST {
                 if is_int8 { "_int8_" } else { "_" }
             );
             self.setup_renderbuffer_dma(dst, dst_fmt)?;
+            // Bias letterbox clear color for int8 — glClear bypasses the shader.
+            let crop = if is_int8 {
+                let mut crop = crop;
+                if let Some(ref mut color) = crop.dst_color {
+                    color[0] ^= 0x80;
+                    color[1] ^= 0x80;
+                    color[2] ^= 0x80;
+                }
+                crop
+            } else {
+                crop
+            };
             self.convert_to_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
         } else {
             log::trace!(
@@ -1612,6 +1624,19 @@ impl GLProcessorST {
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
         self.setup_renderbuffer_non_dma(dst, dst_fmt, crop)?;
+
+        // Bias letterbox clear color for int8 — glClear bypasses the shader.
+        let crop = if is_int8 {
+            let mut crop = crop;
+            if let Some(ref mut color) = crop.dst_color {
+                color[0] ^= 0x80;
+                color[1] ^= 0x80;
+                color[2] ^= 0x80;
+            }
+            crop
+        } else {
+            crop
+        };
 
         // For int8 non-planar output, swap to int8 shader programs.
         if is_int8 && dst_fmt.layout() != PixelLayout::Planar {
