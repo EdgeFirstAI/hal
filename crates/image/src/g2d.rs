@@ -210,10 +210,7 @@ impl G2DProcessor {
         if is_int8_dst {
             let start = Instant::now();
             let mut map = dst.map()?;
-            let data = map.as_mut_slice();
-            for byte in data.iter_mut() {
-                *byte ^= 0x80;
-            }
+            crate::cpu::apply_int8_xor_bias(map.as_mut_slice(), dst_fmt);
             log::trace!("g2d int8 XOR 0x80 post-pass takes {:?}", start.elapsed());
         }
 

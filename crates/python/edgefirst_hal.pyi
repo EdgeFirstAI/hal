@@ -1195,7 +1195,8 @@ class ImageProcessor:
                 ``"int16"``, ``"uint32"``, ``"int32"``, ``"uint64"``,
                 ``"int64"``, ``"float16"``, ``"float32"``, ``"float64"``.
                 PBO is only available for byte-sized types (``"uint8"``,
-                ``"int8"``); other types fall back to system memory.
+                ``"int8"``); other types still prefer DMA-buf when available
+                and otherwise use system memory.
 
         Returns:
             A new image ``Tensor`` backed by the optimal memory type.
