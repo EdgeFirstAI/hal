@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-03-20
+
 ### Changed
 
 - **BREAKING: Unified Tensor API** — `TensorImage` removed from all APIs.
@@ -28,6 +30,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `HalDtype::F16` variant in C API for float16 tensor support
 - NV12 even-height validation in `Tensor::image()`
 - Semi-planar shape constraint validation in `Tensor::set_format()`
+- **`dtype` parameter on `create_image()`** across Rust, C, and Python APIs.
+  Supports `DType::I8` / `"int8"` for direct signed int8 tensor output;
+  PBO-backed images support `u8` and `i8` byte-sized types, other dtypes
+  prefer DMA-buf when available and fall back to system memory
+- **Int8 GPU shaders** for all GL render paths (DMA, non-DMA, non-DMA
+  planar, PBO-to-PBO). The fragment shader applies XOR 0x80 bias on the
+  GPU, eliminating the CPU readback + XOR post-pass for ~2× faster int8
+  letterbox pipeline on GPU-capable platforms
+- Comprehensive `trace`-level logging in the convert dispatch path for
+  profiling backend selection and per-stage timing
+- **Dual Python wheel builds** (`abi3-py311` and `abi3-py38`). Python 3.11+
+  users get zero-copy buffer protocol support; Python 3.8–3.10 users get a
+  compatible fallback. Pip automatically selects the best wheel
 
 ### Fixed
 
@@ -40,8 +55,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Clippy `iflet_redundant_pattern_matching` and `collapsible_match` lints
 - Broken `FourCC` imports and variant casing in Python tests
 - Stale `.display()` calls in G2D tests and duplicate `.as_u8()` in GL tests
+- Int8 letterbox bias on all four GL render paths — `glClear` bypasses the
+  fragment shader, so `crop.dst_color` must be XOR'd on the CPU side before
+  calling `glClearColor`
+- Alpha-channel preservation in CPU and G2D int8 XOR bias — now skips
+  alpha bytes for Rgba/Bgra formats, matching GL shader behavior
+- GL auto-backend priority: OpenGL is now preferred over G2D when both
+  are available
 - Pinned Rust toolchain versions in CI to prevent profraw format corruption
-  across build/coverage-processing jobs
+  across build/coverage-processing jobs; `--failure-mode=all` for
+  `llvm-profdata merge` to skip corrupted profraw files from GPU driver
+  crashes
 
 ## [0.9.1] - 2026-03-10
 

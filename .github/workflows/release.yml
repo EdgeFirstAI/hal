@@ -35,6 +35,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_STABLE_VERSION: '1.94.0'
 
 jobs:
   build-wheels:
@@ -72,7 +73,7 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE_VERSION }}
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
@@ -82,8 +83,15 @@ jobs:
       - name: Install maturin
         run: pip install ${{ matrix.maturin-deps }}
 
-      - name: Build wheels
+      - name: Build wheels (Python 3.11+ — zero-copy buffer protocol)
         run: maturin build --release -m crates/python/Cargo.toml --features abi3-py311 ${{ matrix.maturin-args }}
+
+      - name: Build wheels (Python 3.8+ — compatible fallback)
+        shell: bash
+        run: |
+          # Strip --sdist from args (sdist already generated in the py311 build above)
+          ARGS="${{ matrix.maturin-args }}"
+          maturin build --release -m crates/python/Cargo.toml --features abi3-py38 ${ARGS//--sdist/}
 
       - name: Upload wheels
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
@@ -119,7 +127,7 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE_VERSION }}
 
       - name: Build C API library
         run: cargo build --release -p edgefirst-hal-capi
@@ -211,7 +219,7 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE_VERSION }}
 
       - name: Authenticate to crates.io (Trusted Publishing)
         uses: rust-lang/crates-io-auth-action@v1
