@@ -4,50 +4,69 @@
 [![Documentation](https://docs.rs/edgefirst-hal/badge.svg)](https://docs.rs/edgefirst-hal)
 [![License](https://img.shields.io/crates/l/edgefirst-hal.svg)](LICENSE)
 
-**EdgeFirst Hardware Abstraction Layer** - A unified Rust library for edge AI inference pipelines.
+**EdgeFirst Hardware Abstraction Layer** — a unified Rust library for edge AI inference pipelines.
 
 This is the umbrella crate that re-exports the core EdgeFirst HAL components:
 
-- [`edgefirst-tensor`](https://crates.io/crates/edgefirst-tensor) - Zero-copy tensor memory management (DMA, SHM, system memory)
-- [`edgefirst-image`](https://crates.io/crates/edgefirst-image) - High-performance image processing and format conversion
-- [`edgefirst-decoder`](https://crates.io/crates/edgefirst-decoder) - ML model output decoding (YOLOv5/v8/v11/v26, ModelPack)
+- [`edgefirst-tensor`](https://crates.io/crates/edgefirst-tensor) — Zero-copy tensor memory management (DMA, SHM, PBO, system memory)
+- [`edgefirst-image`](https://crates.io/crates/edgefirst-image) — Hardware-accelerated image processing and format conversion
+- [`edgefirst-decoder`](https://crates.io/crates/edgefirst-decoder) — ML model output decoding (YOLOv5/v8/v11/v26, ModelPack)
+- [`edgefirst-tracker`](https://crates.io/crates/edgefirst-tracker) — Multi-object tracking (ByteTrack)
 
 ## Features
 
-- **Zero-copy memory management** with DMA-BUF and POSIX shared memory support
-- **Hardware-accelerated image processing** via G2D (NXP i.MX) and OpenGL
+- **Zero-copy memory management** with DMA-BUF, POSIX shared memory, and PBO support
+- **Hardware-accelerated image processing** via OpenGL, G2D (NXP i.MX), and optimized CPU
 - **Efficient ML post-processing** for object detection and segmentation models
-- **Cross-platform** - Linux (with hardware acceleration), macOS, and other Unix systems
+- **Int8 GPU shaders** for direct signed int8 output without CPU post-processing
+- **Cross-platform** — Linux (with hardware acceleration), macOS, and other Unix systems
 
 ## Quick Start
 
 ```rust,ignore
-use edgefirst_hal::{tensor, image, decoder};
-use edgefirst_tensor::PixelFormat;
+use edgefirst_image::{load_image, ImageProcessor, ImageProcessorTrait, Rotation, Flip, Crop};
+use edgefirst_tensor::{PixelFormat, DType};
 
-// Create a tensor with automatic memory selection
-let tensor = tensor::Tensor::<f32>::new(&[1, 3, 640, 640], None, None)?;
+// Load a source image
+let bytes = std::fs::read("image.jpg")?;
+let input = load_image(&bytes, Some(PixelFormat::Rgb), None)?;
 
-// Load and process an image
-let img = image::load_image(&image_bytes, Some(PixelFormat::Rgba), None)?;
-let mut processor = image::ImageProcessor::new()?;
-processor.convert(&img, &mut dst, image::Rotation::None, image::Flip::None, image::Crop::default())?;
+// Create an image processor (auto-selects best backend)
+let mut processor = ImageProcessor::new()?;
 
-// Decode YOLO model outputs
-let decoder = decoder::DecoderBuilder::new()
-    .with_score_threshold(0.25)
-    .with_iou_threshold(0.7)
-    .build()?;
+// Allocate a GPU-optimal output buffer — always use create_image() for
+// destinations passed to convert(). This selects the best memory type
+// (DMA-buf, PBO, or system memory) for zero-copy GPU paths.
+let mut output = processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None)?;
+
+// Convert with letterbox resize
+processor.convert(&input, &mut output, Rotation::None, Flip::None, Crop::default())?;
 ```
+
+> **Why `create_image()`?** Creating tensors directly with `Tensor::new()` or
+> `TensorDyn::image()` bypasses GPU memory negotiation. The processor cannot
+> allocate PBO-backed buffers without knowing the GL context. Use `create_image()`
+> for any tensor that will be passed to `convert()`.
 
 ## Platform Support
 
 | Platform | Memory Types | Image Acceleration |
 |----------|--------------|-------------------|
-| Linux (i.MX8) | DMA, SHM, Mem | G2D, OpenGL, CPU |
-| Linux (other) | SHM, Mem | OpenGL, CPU |
-| macOS | SHM, Mem | CPU |
+| Linux (NXP i.MX8/i.MX95) | DMA, SHM, PBO, Mem | OpenGL, G2D, CPU |
+| Linux (other) | SHM, PBO, Mem | OpenGL, CPU |
+| macOS | Mem | CPU |
 | Other Unix | SHM, Mem | CPU |
+
+## Python Bindings
+
+This library is also available as a Python package:
+
+```bash
+pip install edgefirst-hal
+```
+
+See [`edgefirst-hal` on PyPI](https://pypi.org/project/edgefirst-hal/) for
+Python-specific documentation.
 
 ## License
 
@@ -57,4 +76,5 @@ Licensed under the Apache License, Version 2.0. See [LICENSE](https://github.com
 
 - [EdgeFirst AI](https://edgefirst.ai)
 - [GitHub Repository](https://github.com/EdgeFirstAI/hal)
-- [Documentation](https://docs.rs/edgefirst-hal)
+- [API Documentation](https://docs.rs/edgefirst-hal)
+- [Python Package](https://pypi.org/project/edgefirst-hal/)

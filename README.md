@@ -2,7 +2,7 @@
 
 [![Build Status](https://github.com/EdgeFirstAI/hal/workflows/CI/badge.svg)](https://github.com/EdgeFirstAI/hal/actions)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Crates.io](https://img.shields.io/crates/v/edgefirst.svg)](https://crates.io/crates/edgefirst)
+[![Crates.io](https://img.shields.io/crates/v/edgefirst-hal.svg)](https://crates.io/crates/edgefirst-hal)
 [![PyPI](https://img.shields.io/pypi/v/edgefirst-hal.svg)](https://pypi.org/project/edgefirst-hal/)
 
 The EdgeFirst Hardware Abstraction Layer (HAL) is a Rust-based system that provides hardware-accelerated abstractions for computer vision and machine learning tasks on embedded Linux platforms. The HAL consists of multiple specialized crates that work together to provide high-performance image processing, tensor operations, model inference decoding, and object tracking.
@@ -31,7 +31,7 @@ pip install edgefirst-hal
 #### Rust
 ```toml
 [dependencies]
-edgefirst = "0.9.1"
+edgefirst-hal = "0.10"
 ```
 
 ### Basic Usage

@@ -10,7 +10,7 @@ This crate provides hardware-accelerated image loading, format conversion, resiz
 
 ## Features
 
-- **Multiple backends** — Automatic selection: G2D (if format supported) → CPU (same-size simple copies) → OpenGL (GPU) → CPU (general fallback)
+- **Multiple backends** — Automatic selection: OpenGL (GPU) → G2D (NXP i.MX) → CPU (fallback)
 - **Format conversion** - RGBA, RGB, NV12, NV16, YUYV, GREY, planar formats
 - **Geometric transforms** - Resize, rotate (90° increments), flip, crop
 - **Zero-copy integration** - Works with `edgefirst-tensor` DMA/SHM buffers
