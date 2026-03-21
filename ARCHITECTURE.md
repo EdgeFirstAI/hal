@@ -170,7 +170,7 @@ classDiagram
         g2d: Option~G2DProcessor~
         opengl: Option~GLProcessorThreaded~
         +new() orchestrator with fallback chain
-        +create_image(w, h, PixelFormat, Option~TensorMemory~) GPU-optimal alloc
+        +create_image(w, h, PixelFormat, DType, Option~TensorMemory~) GPU-optimal alloc
     }
 
     class G2DProcessor {
@@ -307,7 +307,7 @@ selects the best available memory backend in priority order:
 
 ```mermaid
 flowchart TD
-    Create["ImageProcessor::create_image(w, h, PixelFormat, mem)"]
+    Create["ImageProcessor::create_image(w, h, PixelFormat, DType, mem)"]
     DMA{DMA-buf roundtrip<br/>verified at init?}
     PBO{OpenGL PBO<br/>available?}
     Mem[MemTensor<br/>heap fallback]
@@ -720,7 +720,7 @@ Used during development and CI to verify EGL/OpenGL support, benchmark RGB packi
 
 ```rust
 use edgefirst_image::{load_image, ImageProcessor, ImageProcessorTrait, Rotation, Flip, Crop};
-use edgefirst_tensor::{PixelFormat, TensorDyn};
+use edgefirst_tensor::{PixelFormat, DType, TensorDyn};
 
 // Load image from JPEG
 let bytes = std::fs::read("testdata/zidane.jpg")?;
@@ -730,7 +730,7 @@ let input = load_image(&bytes, Some(PixelFormat::Rgb), None)?;
 let mut converter = ImageProcessor::new()?;
 
 // Create output buffer with optimal GPU memory (DMA > PBO > Mem)
-let mut output = converter.create_image(640, 640, PixelFormat::Rgb, None)?;
+let mut output = converter.create_image(640, 640, PixelFormat::Rgb, DType::U8, None)?;
 
 // Convert and resize — zero-copy if DMA or PBO backend is active
 converter.convert(&input, &mut output, Rotation::None, Flip::None, Crop::default())?;

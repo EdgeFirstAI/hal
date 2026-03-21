@@ -31,7 +31,7 @@ the appropriate conversion method based on the available hardware.
 let image = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/zidane.jpg"));
 let src = load_image(image, Some(PixelFormat::Rgba), None)?;
 let mut converter = ImageProcessor::new()?;
-let mut dst = TensorDyn::image(640, 480, PixelFormat::Rgb, DType::U8, None)?;
+let mut dst = converter.create_image(640, 480, PixelFormat::Rgb, DType::U8, None)?;
 converter.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())?;
 # Ok(())
 # }
@@ -451,7 +451,7 @@ pub struct ImageProcessorConfig {
     /// Preferred compute backend.
     ///
     /// When set to a specific backend (not [`ComputeBackend::Auto`]), the
-    /// processor initializes that backend plus CPU as a fallback chain.
+    /// processor initializes that backend with no fallback — returns an error if the conversion is not supported.
     /// This takes precedence over `EDGEFIRST_FORCE_BACKEND` and the
     /// `EDGEFIRST_DISABLE_*` environment variables.
     ///
@@ -533,7 +533,7 @@ impl ImageProcessor {
     /// let image = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/zidane.jpg"));
     /// let src = load_image(image, Some(PixelFormat::Rgba), None)?;
     /// let mut converter = ImageProcessor::new()?;
-    /// let mut dst = TensorDyn::image(640, 480, PixelFormat::Rgb, DType::U8, None)?;
+    /// let mut dst = converter.create_image(640, 480, PixelFormat::Rgb, DType::U8, None)?;
     /// converter.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())?;
     /// # Ok(())
     /// # }
@@ -776,13 +776,25 @@ impl ImageProcessor {
 
     /// Create a [`TensorDyn`] image with the best available memory backend.
     ///
-    /// Priority: DMA-buf → PBO → system memory.
+    /// Priority: DMA-buf → PBO (byte-sized types: u8, i8) → system memory.
+    ///
+    /// Use this method instead of [`TensorDyn::image()`] when the tensor will
+    /// be used with [`ImageProcessor::convert()`]. It selects the optimal
+    /// memory backing (including PBO for GPU zero-copy) which direct
+    /// allocation cannot achieve.
+    ///
+    /// This method is on [`ImageProcessor`] rather than [`ImageProcessorTrait`]
+    /// because optimal allocation requires knowledge of the active compute
+    /// backends (e.g. the GL context handle for PBO allocation). Individual
+    /// backend implementations ([`CPUProcessor`], etc.) do not have this
+    /// cross-backend visibility.
     ///
     /// # Arguments
     ///
     /// * `width` - Image width in pixels
     /// * `height` - Image height in pixels
     /// * `format` - Pixel format
+    /// * `dtype` - Element data type (e.g. `DType::U8`, `DType::I8`)
     /// * `memory` - Optional memory type override; when `None`, the best
     ///   available backend is selected automatically.
     ///
@@ -799,17 +811,12 @@ impl ImageProcessor {
         width: usize,
         height: usize,
         format: PixelFormat,
+        dtype: DType,
         memory: Option<TensorMemory>,
     ) -> Result<TensorDyn> {
         // If an explicit memory type is requested, honour it directly.
         if let Some(mem) = memory {
-            return Ok(TensorDyn::image(
-                width,
-                height,
-                format,
-                DType::U8,
-                Some(mem),
-            )?);
+            return Ok(TensorDyn::image(width, height, format, dtype, Some(mem))?);
         }
 
         // Try DMA first on Linux — skip only when GL has explicitly selected PBO
@@ -829,7 +836,7 @@ impl ImageProcessor {
                     width,
                     height,
                     format,
-                    DType::U8,
+                    dtype,
                     Some(edgefirst_tensor::TensorMemory::Dma),
                 ) {
                     return Ok(img);
@@ -837,13 +844,34 @@ impl ImageProcessor {
             }
         }
 
-        // Try PBO (if GL available)
+        // Try PBO (if GL available).
+        // PBO buffers are u8-sized; the int8 shader emulates i8 output via
+        // XOR 0x80 on the same underlying buffer, so both U8 and I8 work.
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
-        if let Some(gl) = &self.opengl {
-            match gl.create_pbo_image(width, height, format) {
-                Ok(t) => return Ok(TensorDyn::from(t)),
-                Err(e) => log::debug!("PBO image creation failed, falling back to Mem: {e:?}"),
+        if dtype.size() == 1 {
+            if let Some(gl) = &self.opengl {
+                match gl.create_pbo_image(width, height, format) {
+                    Ok(t) => {
+                        if dtype == DType::I8 {
+                            // SAFETY: Tensor<u8> and Tensor<i8> are layout-
+                            // identical (same element size, no T-dependent
+                            // drop glue). The int8 shader applies XOR 0x80
+                            // on the same PBO buffer. Same rationale as
+                            // gl::processor::tensor_i8_as_u8_mut.
+                            // Invariant: PBO tensors never have chroma
+                            // (create_pbo_image → Tensor::wrap sets it None).
+                            debug_assert!(
+                                t.chroma().is_none(),
+                                "PBO i8 transmute requires chroma == None"
+                            );
+                            let t_i8: Tensor<i8> = unsafe { std::mem::transmute(t) };
+                            return Ok(TensorDyn::from(t_i8));
+                        }
+                        return Ok(TensorDyn::from(t));
+                    }
+                    Err(e) => log::debug!("PBO image creation failed, falling back to Mem: {e:?}"),
+                }
             }
         }
 
@@ -852,7 +880,7 @@ impl ImageProcessor {
             width,
             height,
             format,
-            DType::U8,
+            dtype,
             Some(edgefirst_tensor::TensorMemory::Mem),
         )?)
     }
@@ -873,26 +901,43 @@ impl ImageProcessorTrait for ImageProcessor {
         crop: Crop,
     ) -> Result<()> {
         let start = Instant::now();
-
-        if let Some(ref forced) = self.forced_backend {
-            log::trace!("ImageProcessor::convert: forced backend = {forced:?}");
-        } else {
-            log::trace!("ImageProcessor::convert: auto backend selection");
-        }
+        let src_fmt = src.format();
+        let dst_fmt = dst.format();
+        log::trace!(
+            "convert: {src_fmt:?}({:?}/{:?}) → {dst_fmt:?}({:?}/{:?}), \
+             rotation={rotation:?}, flip={flip:?}, backend={:?}",
+            src.dtype(),
+            src.memory(),
+            dst.dtype(),
+            dst.memory(),
+            self.forced_backend,
+        );
 
         // ── Forced backend: no fallback chain ────────────────────────
         if let Some(forced) = self.forced_backend {
             return match forced {
                 ForcedBackend::Cpu => {
                     if let Some(cpu) = self.cpu.as_mut() {
-                        return cpu.convert(src, dst, rotation, flip, crop);
+                        let r = cpu.convert(src, dst, rotation, flip, crop);
+                        log::trace!(
+                            "convert: forced=cpu result={} ({:?})",
+                            if r.is_ok() { "ok" } else { "err" },
+                            start.elapsed()
+                        );
+                        return r;
                     }
                     Err(Error::ForcedBackendUnavailable("cpu".into()))
                 }
                 ForcedBackend::G2d => {
                     #[cfg(target_os = "linux")]
                     if let Some(g2d) = self.g2d.as_mut() {
-                        return g2d.convert(src, dst, rotation, flip, crop);
+                        let r = g2d.convert(src, dst, rotation, flip, crop);
+                        log::trace!(
+                            "convert: forced=g2d result={} ({:?})",
+                            if r.is_ok() { "ok" } else { "err" },
+                            start.elapsed()
+                        );
+                        return r;
                     }
                     Err(Error::ForcedBackendUnavailable("g2d".into()))
                 }
@@ -900,78 +945,64 @@ impl ImageProcessorTrait for ImageProcessor {
                     #[cfg(target_os = "linux")]
                     #[cfg(feature = "opengl")]
                     if let Some(opengl) = self.opengl.as_mut() {
-                        return opengl.convert(src, dst, rotation, flip, crop);
+                        let r = opengl.convert(src, dst, rotation, flip, crop);
+                        log::trace!(
+                            "convert: forced=opengl result={} ({:?})",
+                            if r.is_ok() { "ok" } else { "err" },
+                            start.elapsed()
+                        );
+                        return r;
                     }
                     Err(Error::ForcedBackendUnavailable("opengl".into()))
                 }
             };
         }
 
-        // ── Existing fallback chain ──────────────────────────────────
-        #[cfg(target_os = "linux")]
-        if let Some(g2d) = self.g2d.as_mut() {
-            log::trace!("image started with g2d in {:?}", start.elapsed());
-            match g2d.convert(src, dst, rotation, flip, crop) {
-                Ok(_) => {
-                    log::trace!("image converted with g2d in {:?}", start.elapsed());
-                    return Ok(());
-                }
-                Err(e) => {
-                    log::debug!("G2D conversion not supported, falling back: {e:?}")
-                }
-            }
-        }
-
-        // if the image is just a copy without an resizing, send it to the CPU and
-        // skip OpenGL
-        let src_shape = match crop.src_rect {
-            Some(s) => (s.width, s.height),
-            None => (src.width().unwrap_or(0), src.height().unwrap_or(0)),
-        };
-        let dst_shape = match crop.dst_rect {
-            Some(d) => (d.width, d.height),
-            None => (dst.width().unwrap_or(0), dst.height().unwrap_or(0)),
-        };
-
-        // TODO: Check if still use CPU when rotation or flip is enabled
-        if src_shape == dst_shape && flip == Flip::None && rotation == Rotation::None {
-            if let Some(cpu) = self.cpu.as_mut() {
-                match cpu.convert(src, dst, rotation, flip, crop) {
-                    Ok(_) => {
-                        log::trace!("image converted with cpu in {:?}", start.elapsed());
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        log::trace!("image didn't convert with cpu: {e:?}");
-                        return Err(e);
-                    }
-                }
-            }
-        }
-
+        // ── Auto fallback chain: OpenGL → G2D → CPU ──────────────────
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
         if let Some(opengl) = self.opengl.as_mut() {
-            log::trace!("image started with opengl in {:?}", start.elapsed());
             match opengl.convert(src, dst, rotation, flip, crop) {
                 Ok(_) => {
-                    log::trace!("image converted with opengl in {:?}", start.elapsed());
+                    log::trace!(
+                        "convert: auto selected=opengl for {src_fmt:?}→{dst_fmt:?} ({:?})",
+                        start.elapsed()
+                    );
                     return Ok(());
                 }
                 Err(e) => {
-                    log::debug!("OpenGL conversion not supported, falling back to CPU: {e:?}")
+                    log::trace!("convert: auto opengl declined {src_fmt:?}→{dst_fmt:?}: {e}");
                 }
             }
         }
-        log::trace!("image started with cpu in {:?}", start.elapsed());
-        if let Some(cpu) = self.cpu.as_mut() {
-            match cpu.convert(src, dst, rotation, flip, crop) {
+
+        #[cfg(target_os = "linux")]
+        if let Some(g2d) = self.g2d.as_mut() {
+            match g2d.convert(src, dst, rotation, flip, crop) {
                 Ok(_) => {
-                    log::trace!("image converted with cpu in {:?}", start.elapsed());
+                    log::trace!(
+                        "convert: auto selected=g2d for {src_fmt:?}→{dst_fmt:?} ({:?})",
+                        start.elapsed()
+                    );
                     return Ok(());
                 }
                 Err(e) => {
-                    log::trace!("image didn't convert with cpu: {e:?}");
+                    log::trace!("convert: auto g2d declined {src_fmt:?}→{dst_fmt:?}: {e}");
+                }
+            }
+        }
+
+        if let Some(cpu) = self.cpu.as_mut() {
+            match cpu.convert(src, dst, rotation, flip, crop) {
+                Ok(_) => {
+                    log::trace!(
+                        "convert: auto selected=cpu for {src_fmt:?}→{dst_fmt:?} ({:?})",
+                        start.elapsed()
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::trace!("convert: auto cpu failed {src_fmt:?}→{dst_fmt:?}: {e}");
                     return Err(e);
                 }
             }
@@ -1945,9 +1976,10 @@ mod image_tests {
         .to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
 
-        let converter_dst =
-            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
         let mut converter = ImageProcessor::new().unwrap();
+        let converter_dst = converter
+            .create_image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None)
+            .unwrap();
         let (result, src, converter_dst) = convert_img(
             &mut converter,
             src,
@@ -1975,6 +2007,47 @@ mod image_tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn test_create_image_dtype_i8() {
+        let mut converter = ImageProcessor::new().unwrap();
+
+        // I8 image should allocate successfully via create_image
+        let dst = converter
+            .create_image(320, 240, PixelFormat::Rgb, DType::I8, None)
+            .unwrap();
+        assert_eq!(dst.dtype(), DType::I8);
+        assert!(dst.width() == Some(320));
+        assert!(dst.height() == Some(240));
+        assert_eq!(dst.format(), Some(PixelFormat::Rgb));
+
+        // U8 for comparison
+        let dst_u8 = converter
+            .create_image(320, 240, PixelFormat::Rgb, DType::U8, None)
+            .unwrap();
+        assert_eq!(dst_u8.dtype(), DType::U8);
+
+        // Convert into I8 dst should succeed
+        let file = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane.jpg"
+        ))
+        .to_vec();
+        let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
+        let mut dst_i8 = converter
+            .create_image(320, 240, PixelFormat::Rgb, DType::I8, None)
+            .unwrap();
+        converter
+            .convert(
+                &src,
+                &mut dst_i8,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+    }
+
+    #[test]
     fn test_crop_skip() {
         let file = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -1983,9 +2056,10 @@ mod image_tests {
         .to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
 
-        let converter_dst =
-            TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None).unwrap();
         let mut converter = ImageProcessor::new().unwrap();
+        let converter_dst = converter
+            .create_image(1280, 720, PixelFormat::Rgba, DType::U8, None)
+            .unwrap();
         let crop = Crop::new()
             .with_src_rect(Some(Rect::new(0, 0, 640, 640)))
             .with_dst_rect(Some(Rect::new(0, 0, 640, 640)));
@@ -4814,7 +4888,7 @@ mod image_tests {
 
         // Create PBO-backed source image
         let pbo_src = converter
-            .create_image(src_w, src_h, PixelFormat::Rgba, None)
+            .create_image(src_w, src_h, PixelFormat::Rgba, DType::U8, None)
             .unwrap();
         assert_eq!(
             pbo_src.as_u8().unwrap().memory(),
@@ -4858,7 +4932,7 @@ mod image_tests {
 
         // Create PBO-backed destination image
         let pbo_dst = converter
-            .create_image(dst_w, dst_h, PixelFormat::Rgba, None)
+            .create_image(dst_w, dst_h, PixelFormat::Rgba, DType::U8, None)
             .unwrap();
         assert_eq!(pbo_dst.as_u8().unwrap().memory(), TensorMemory::Pbo);
 

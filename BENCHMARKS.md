@@ -1,8 +1,8 @@
 # EdgeFirst HAL - Benchmarks
 
-**Version:** 1.5
-**Last Updated:** March 18, 2026
-**Status:** Removed stale known issues, updated documentation accuracy
+**Version:** 2.0
+**Last Updated:** March 20, 2026
+**Status:** Updated for TensorDyn unification — added u8/i8 DType benchmarks, updated auto-backend priority (OpenGL→G2D→CPU), added comprehensive per-backend comparison tables
 
 ---
 
@@ -79,15 +79,18 @@ These infrastructure benchmarks isolate the memory subsystem overhead from the c
 - 1280×1280 — high-resolution models
 
 **Source formats:** YUYV, VYUY, NV12, NV16, RGBA, RGB, GREY
-**Destination formats:** RGBA, BGRA, RGB, RGB_INT8, GREY, PLANAR_RGB (8BPS), PLANAR_RGB_INT8 (8BPi)
+**Destination formats:** RGBA, BGRA, RGB, GREY, PlanarRgb (8BPS)
+**Output dtypes:** u8 (default), i8 (int8 quantized model input — XOR 0x80 bias)
 
 ### Format Abbreviations
 
-| Abbreviation | Format | Description |
-|-------------|--------|-------------|
-| **8BPS** | PLANAR_RGB | 3× separate uint8 planes (R, G, B) |
-| **8BPi** | PLANAR_RGB_INT8 | 3× separate uint8 planes (R, G, B) |
-| **RGBi** | RGB_INT8 | Packed RGB, uint8 per channel |
+| Benchmark Name | PixelFormat | DType | Description |
+|---------------|-------------|-------|-------------|
+| **RGBA** | `PixelFormat::Rgba` | `U8` | 4-channel packed RGBA |
+| **RGB** | `PixelFormat::Rgb` | `U8` | 3-channel packed RGB |
+| **8BPS** | `PixelFormat::PlanarRgb` | `U8` | 3× separate u8 planes (R, G, B) |
+| **RGB_i8** | `PixelFormat::Rgb` | `I8` | Packed RGB with XOR 0x80 bias |
+| **8BPS_i8** | `PixelFormat::PlanarRgb` | `I8` | Planar RGB with XOR 0x80 bias |
 
 ### Measurement Methodology
 
@@ -98,6 +101,8 @@ All benchmarks use the `edgefirst-bench` custom harness which:
 - Reports throughput in MiB/s where applicable
 
 **Standard parameters:** 10 warmup iterations, 100 measured iterations (adjustable per benchmark).
+
+**Table notation:** **bold** = fastest backend for this conversion; `—` = data not collected; `N/A` = not supported by this backend; `BLOCKED` = actively disabled due to hardware bug (see Known Issues).
 
 ---
 
@@ -179,7 +184,7 @@ JSON files are collected in `benchmarks/<platform>/` and processed by `.github/s
 | **OS** | Raspberry Pi OS (Debian 12) |
 | **G2D** | No |
 | **DMA-buf** | Yes (system heap) |
-| **Notes** | Mesa V3D driver; no RGB/RGBi packed GL support (two-pass disabled) |
+| **Notes** | Mesa V3D driver; RGB/RGB_i8 packed GL via two-pass packing shader |
 
 ### x86-desktop
 
@@ -235,64 +240,103 @@ Measures `tensor.map()` round-trip latency. MEM buffers have zero map overhead (
 
 ### Image Preprocessing: Letterbox Pipeline (Camera → Model Input)
 
-The most critical benchmark: simulates a real camera-to-model preprocessing pipeline with format conversion, resize, and letterbox padding.
+The most critical benchmark: simulates a real camera-to-model preprocessing pipeline with format conversion, resize, and letterbox padding. All times are median milliseconds. **Bold** = fastest backend for that conversion.
 
-#### Packed Formats (1080p → 640×640)
+**Auto-backend priority:** OpenGL → G2D → CPU. The auto column shows what the HAL selects automatically.
 
-| Platform | Compute | Buffer | YUYV→RGBA | YUYV→RGB | YUYV→RGBi | NV12→RGBA | NV12→RGBi | VYUY→RGBA |
-|----------|---------|--------|-----------|----------|-----------|-----------|-----------|-----------|
-| imx8mp-frdm | G2D | DMA | 3.0 ms | 4.2 ms | — | 4.1 ms | — | — |
-| imx8mp-frdm | GL | DMA | 1.8 ms | — | — | 3.5 ms | — | — |
-| imx8mp-frdm | CPU | Heap | 17.7 ms | 17.5 ms | 19.4 ms | 20.6 ms | 18.5 ms | 17.5 ms |
-| imx95-frdm | G2D | DMA | 3.9 ms | 4.0 ms | — | 3.8 ms | — | — |
-| imx95-frdm | GL | DMA | 1.2 ms | 1.3 ms | 1.3 ms | 1.5 ms | 1.6 ms | — |
-| imx95-frdm | CPU | Heap | 14.4 ms | 14.9 ms | 16.4 ms | 19.0 ms | 17.0 ms | 14.4 ms |
-| rpi5-hailo | GL | DMA | 3.3 ms | — | — | 1.2 ms | — | — |
-| rpi5-hailo | CPU | Heap | 7.7 ms | 7.2 ms | 6.2 ms | 7.4 ms | 5.7 ms | 7.6 ms |
-| x86-desktop | GL | PBO | — | — | — | — | — | — |
-| x86-desktop | CPU | Heap | 1.4 ms | 1.4 ms | 1.4 ms | 1.1 ms | 1.0 ms | 1.5 ms |
+**Date:** March 20, 2026 (post-TensorDyn unification, v0.9.1+)
 
-> **Note:** imx8mp-frdm GL "—" for RGB/RGBi: Vivante GL lacks packed RGB support (two-pass disabled). rpi5-hailo GL same limitation on Mesa V3D. x86-desktop GL cannot import YUV textures via PBO.
+#### imx8mp-frdm (Cortex-A53, Vivante GC7000UL, G2D) — 720p → 640×640
 
-#### Planar Formats (1080p → 640×640)
+| Conversion | CPU | G2D | OpenGL | Auto |
+|---|---|---|---|---|
+| YUYV→RGBA | 10.1 | 2.1 | **1.3** | 1.3 |
+| YUYV→RGB | 9.2 | **3.4** | 11.5 | 11.4 ¹ |
+| YUYV→8BPS | 9.9 | N/A | **4.1** | 4.1 |
+| NV12→RGBA | 9.9 | 2.2 | **1.8** | 1.8 |
+| NV12→RGB | 8.8 | **3.5** | 12.7 | 12.4 ¹ |
+| NV12→8BPS | — | — | BLOCKED ² | — |
+| YUYV→RGB_i8 | 10.5 | **5.4** | 15.0 | 14.9 ¹ |
+| YUYV→8BPS_i8 | 11.2 | N/A | **4.1** | 4.1 |
+| NV12→RGB_i8 | 10.3 | **5.5** | 15.7 | 15.9 ¹ |
+| NV12→8BPS_i8 | — | — | BLOCKED ² | — |
 
-Planar formats (8BPS = PLANAR_RGB, 8BPi = PLANAR_RGB_INT8) use separate memory planes for each color channel — required by some ML inference frameworks.
+#### imx95-frdm (Cortex-A55, Mali GPU, G2D) — 720p → 640×640
 
-| Platform | Compute | Buffer | YUYV→8BPS | YUYV→8BPi | NV12→8BPS | NV12→8BPi |
-|----------|---------|--------|-----------|-----------|-----------|-----------|
-| imx8mp-frdm | G2D | DMA | — | — | — | — |
-| imx8mp-frdm | GL | DMA | 5.5 ms | 5.5 ms | **BLOCKED** | **BLOCKED** |
-| imx8mp-frdm | CPU | Heap | 18.2 ms | 20.1 ms | 17.7 ms | 19.3 ms |
-| imx95-frdm | G2D | DMA | — | — | — | — |
-| imx95-frdm | GL | DMA | 2.4 ms | 2.8 ms | 3.6 ms | 3.6 ms |
-| imx95-frdm | CPU | Heap | 16.4 ms | 17.0 ms | 15.5 ms | 17.0 ms |
-| rpi5-hailo | GL | DMA | 16.7 ms | 16.7 ms | 5.0 ms | 5.1 ms |
-| rpi5-hailo | CPU | Heap | 8.6 ms | 8.8 ms | 8.0 ms | 8.0 ms |
-| x86-desktop | GL | PBO | — | — | — | — |
-| x86-desktop | CPU | Heap | 1.5 ms | 1.5 ms | 1.1 ms | 1.2 ms |
+| Conversion | CPU | G2D | OpenGL | Auto |
+|---|---|---|---|---|
+| YUYV→RGBA | 8.9 | 2.1 | **1.1** | 1.1 |
+| YUYV→RGB | 8.4 | **2.3** | 3.2 | 3.1 |
+| YUYV→8BPS | 8.7 | N/A | **2.1** | 2.0 |
+| NV12→RGBA | 10.4 | 2.0 | **1.1** | 1.1 |
+| NV12→RGB | 8.8 | **2.2** | 3.2 | 3.3 |
+| NV12→8BPS | 10.3 | N/A | **2.3** | 2.2 |
+| YUYV→RGB_i8 | 8.7 | 3.9 | **4.4** | 4.5 |
+| YUYV→8BPS_i8 | 9.4 | N/A | **2.6** | 2.6 |
+| NV12→RGB_i8 | 9.7 | 3.9 | **4.6** | 4.5 |
+| NV12→8BPS_i8 | 10.6 | N/A | **2.6** | 2.6 |
 
-> **BLOCKED:** NV12→planar on Vivante GC7000UL causes an unrecoverable GPU hang (kernel Ds state, requires reboot). The HAL explicitly blocks this combination on Vivante GPUs and falls back to CPU in auto mode. See Known Issues §9 and `VSI_GPU_NV12_BUG.md`.
+#### rpi5-hailo (Cortex-A76, VideoCore GPU, no G2D) — 720p → 640×640
+
+| Conversion | CPU | OpenGL | Auto |
+|---|---|---|---|
+| YUYV→RGBA | 3.9 | **1.4** | 1.4 |
+| YUYV→RGB | 3.4 | **2.2** | 2.2 |
+| YUYV→8BPS | **4.2** | 6.3 | 6.3 ³ |
+| NV12→RGBA | 3.9 | **0.7** | 0.7 |
+| NV12→RGB | 3.1 | **1.5** | 1.5 |
+| NV12→8BPS | 3.9 | **2.5** | 2.5 |
+| YUYV→RGB_i8 | 4.2 | **2.4** | 2.4 |
+| YUYV→8BPS_i8 | **4.8** | 6.3 | 6.3 ³ |
+| NV12→RGB_i8 | 3.9 | **1.7** | 1.7 |
+| NV12→8BPS_i8 | 3.9 | **2.7** | 2.7 |
+
+#### x86-desktop (AMD Ryzen 9, CPU only) — 720p → 640×640
+
+| Conversion | CPU |
+|---|---|
+| YUYV→RGBA | 0.8 |
+| YUYV→RGB | 0.8 |
+| YUYV→8BPS | 1.0 |
+| NV12→RGBA | 0.7 |
+| NV12→RGB | 0.6 |
+| YUYV→RGB_i8 | 1.0 |
+| YUYV→8BPS_i8 | 1.1 |
+| NV12→RGB_i8 | 0.8 |
+
+#### Notes
+
+> ¹ **Packed RGB on Vivante GC7000UL:** OpenGL's two-pass packed RGB packing shader
+> is 3-4× slower than G2D's hardware blitter for packed RGB output on Vivante.
+> The auto-backend selects OpenGL first (which succeeds but slowly). In production,
+> the recommended workflow is **YUYV/NV12→RGBA** (1.3-1.8ms via OpenGL, zero-copy
+> EGLImage) with the TFLite VX Delegate CameraAdaptor handling RGBA→RGB and
+> optional u8→i8 conversion inside the NPU graph. The packed RGB path is for
+> offline/debug use only.
 >
-> G2D does not support planar output formats.
+> ² **BLOCKED: NV12→PlanarRgb on Vivante GC7000UL** causes an unrecoverable GPU
+> hang (kernel Ds state, requires reboot). The HAL explicitly blocks this
+> combination on Vivante GPUs. Forced OpenGL returns `NotSupported`. Auto-backend
+> uses CPU. G2D does not support planar output. See `VSI_GPU_NV12_BUG.md`.
+>
+> ³ **YUYV→PlanarRgb on VideoCore:** The OpenGL planar packing shader is slower
+> than CPU on VideoCore for YUYV input. Future work: benchmark-driven auto-backend
+> selection to use CPU for this specific conversion.
+>
+> **G2D i8 support:** G2D performs u8→u8 conversion via hardware blitter, then a
+> CPU post-pass applies XOR 0x80 for i8 output. This is why G2D i8 times are
+> roughly G2D u8 time + ~2ms for the XOR pass.
+>
+> **OpenGL i8 support:** Uses the int8 packing shader (XOR 0x80 bias in the
+> fragment shader). No CPU readback — the XOR is computed on the GPU.
+>
+> **Trace logging:** Set `RUST_LOG=edgefirst_image=trace` to see which backend
+> and shader path is selected for each conversion. Set `EDGEFIRST_FORCE_BACKEND=cpu|g2d|opengl`
+> to force a specific backend (returns error if conversion is not supported).
 
-#### Packed Formats (4K → 640×640)
+#### 4K Planar Formats (3840×2160 → 640×640)
 
-| Platform | Compute | Buffer | YUYV→RGBA | YUYV→RGB | NV12→RGBA |
-|----------|---------|--------|-----------|----------|-----------|
-| imx8mp-frdm | G2D | DMA | 4.2 ms | 5.7 ms | 6.8 ms |
-| imx8mp-frdm | GL | DMA | 2.4 ms | — | 9.7 ms |
-| imx8mp-frdm | CPU | Heap | 59.5 ms | 50.0 ms | 75.7 ms |
-| imx95-frdm | G2D | DMA | 13.9 ms | 14.6 ms | 13.3 ms |
-| imx95-frdm | GL | DMA | 1.6 ms | 1.7 ms | 4.7 ms |
-| imx95-frdm | CPU | Heap | 46.2 ms | 41.2 ms | 64.5 ms |
-| rpi5-hailo | GL | DMA | 18.5 ms | — | 5.0 ms |
-| rpi5-hailo | CPU | Heap | 23.9 ms | 19.8 ms | 22.2 ms |
-| x86-desktop | GL | PBO | — | — | — |
-| x86-desktop | CPU | Heap | 6.8 ms | 5.5 ms | 6.3 ms |
-
-#### Planar Formats (4K → 640×640)
-
-| Platform | Compute | Buffer | YUYV→8BPS | YUYV→8BPi | NV12→8BPS | NV12→8BPi |
+| Platform | Compute | Buffer | YUYV→8BPS | YUYV→8BPS_i8 | NV12→8BPS | NV12→8BPS_i8 |
 |----------|---------|--------|-----------|-----------|-----------|-----------|
 | imx8mp-frdm | GL | DMA | 8.1 ms | 8.2 ms | **BLOCKED** | **BLOCKED** |
 | imx8mp-frdm | CPU | Heap | 50.9 ms | 52.5 ms | — | — |
@@ -419,11 +463,11 @@ The hybrid path decodes masks on CPU (`materialize_segmentations`) then overlays
 
 9. **NV12→planar GPU hang on Vivante GC7000UL** — Rendering from an NV12 source texture (via `EGL_LINUX_DMA_BUF_EXT`) to a planar RGB framebuffer (MRT with 3× color attachments) causes an **unrecoverable GPU hang** on the Vivante GC7000UL (i.MX 8M Plus, galcore 6.4.11). The GPU command processor stalls permanently, the calling process enters kernel uninterruptible sleep (Ds state), cannot be killed even with SIGKILL, and the galcore driver state is corrupted system-wide — all subsequent GPU operations from any process hang until a full board reboot. YUYV→planar and NV12→packed work fine; the bug is specific to NV12 multi-plane texture + MRT output. The HAL explicitly blocks this combination on Vivante GPUs and falls back to CPU in auto mode. See `VSI_GPU_NV12_BUG.md` for the full vendor bug report.
 
-10. **rpi5-hailo GL planar at 4K is slow** — YUYV→8BPS/8BPi at 4K takes ~102ms on Mesa V3D GL, while CPU handles it in ~24ms. NV12→planar at 4K is ~26ms on GL. The bottleneck appears to be in Mesa V3D's MRT path when combined with high-resolution YUYV texture sampling.
+10. **rpi5-hailo GL planar at 4K is slow** — YUYV→8BPS/8BPS_i8 at 4K takes ~102ms on Mesa V3D GL, while CPU handles it in ~24ms. NV12→planar at 4K is ~26ms on GL. The bottleneck appears to be in Mesa V3D's MRT path when combined with high-resolution YUYV texture sampling.
 
-11. **imx8mp-frdm GL lacks RGB/RGBi packed support** — Vivante GC7000UL OpenGL does not support packed RGB output without a two-pass approach (RGBA render then strip alpha), which is currently disabled. All RGB/RGBi results on this platform use CPU or G2D.
+11. **imx8mp-frdm GL packed RGB uses two-pass approach** — Vivante GC7000UL OpenGL does not support packed RGB output natively; the two-pass packed RGB packing shader renders to an RGBA intermediate then packs to RGB using a dedicated shader. This two-pass approach is now enabled but is 3-4× slower than G2D's hardware blitter for packed RGB output on Vivante (see footnote ¹ in 720p tables).
 
-12. **rpi5-hailo GL lacks RGB/RGBi packed support** — Same limitation as imx8mp-frdm: Mesa V3D two-pass packed RGB is disabled.
+12. **rpi5-hailo GL packed RGB uses two-pass approach** — Same as imx8mp-frdm: Mesa V3D uses the two-pass packed RGB packing shader (RGBA intermediate then dedicated RGB packing shader). Now enabled but may be slower than CPU for some conversions on VideoCore.
 
 ### Missing Format Coverage
 
@@ -441,6 +485,7 @@ The hybrid path decodes masks on CPU (`materialize_segmentations`) then overlays
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 2.0 | 2026-03-20 | TensorDyn unification: auto-backend priority changed to OpenGL→G2D→CPU; always use two-pass packed RGB (rgb_direct removed); added per-platform forced-backend comparison tables at 720p; added u8/i8 DType benchmark variants; replaced 8BPi with 8BPS_i8 naming |
 | 1.5 | 2026-03-18 | Remove stale Known Issue #3 (EDGEFIRST_FORCE_TRANSFER=pbo now implemented); documentation accuracy updates |
 | 1.4 | 2026-03-13 | Add planar RGB (8BPS/8BPi) format benchmarks; document NV12→planar GPU hang on Vivante GC7000UL (blocked, CPU fallback); split letterbox tables into packed/planar; update mask rendering (imx8mp fused GPU improved 275ms→5.9ms); add rpi5 GL planar performance notes; refresh all platforms |
 | 1.3 | 2026-03-12 | Update imx95-frdm after DMA-buf fix (GL now uses true DMA-buf, was PBO); BGRA CPU byte-swap workaround; fused mask rendering 4.8× faster |
