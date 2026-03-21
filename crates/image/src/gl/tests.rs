@@ -853,12 +853,12 @@ mod gl_tests {
         )
         .unwrap();
 
-        // GL packed PixelFormat::Rgb output (two-pass path)
+        // GL packed PixelFormat::Rgb int8 output (two-pass path with XOR 0x80 bias)
         let dst_rgb = TensorDyn::image(
             640,
             640,
             PixelFormat::Rgb,
-            DType::U8,
+            DType::I8,
             Some(TensorMemory::Dma),
         )
         .unwrap();
@@ -868,8 +868,12 @@ mod gl_tests {
 
         let rgba_data = dst_rgba_dyn.as_u8().unwrap().map().unwrap();
         let expected_rgb = uint8_to_int8(&rgba_to_rgb(rgba_data.as_slice()));
-        let gl_data = dst_rgb_dyn.as_u8().unwrap().map().unwrap();
-        assert_pixels_match(&expected_rgb, gl_data.as_slice(), 1);
+        // Map raw i8 bytes as u8 for comparison — the XOR 0x80 bias is in the data.
+        let gl_data = dst_rgb_dyn.as_i8().unwrap().map().unwrap();
+        let gl_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(gl_data.as_slice().as_ptr().cast(), gl_data.len())
+        };
+        assert_pixels_match(&expected_rgb, gl_bytes, 1);
     }
 
     /// PixelFormat::Yuyv 1080p → PixelFormat::Rgb 1920x1080 (no letterbox, same size).
@@ -1544,12 +1548,12 @@ mod gl_tests {
         let crop = letterbox_crop(1280, 720, 640, 640);
         let mut gl = GLProcessorThreaded::new(None).unwrap();
 
-        // Contiguous → packed PixelFormat::Rgb with letterbox
+        // Contiguous → packed PixelFormat::Rgb int8 with letterbox
         let dst_contig = TensorDyn::image(
             640,
             640,
             PixelFormat::Rgb,
-            DType::U8,
+            DType::I8,
             Some(TensorMemory::Dma),
         )
         .unwrap();
@@ -1564,12 +1568,12 @@ mod gl_tests {
         )
         .unwrap();
 
-        // Multiplane → packed PixelFormat::Rgb with letterbox
+        // Multiplane → packed PixelFormat::Rgb int8 with letterbox
         let dst_multi = TensorDyn::image(
             640,
             640,
             PixelFormat::Rgb,
-            DType::U8,
+            DType::I8,
             Some(TensorMemory::Dma),
         )
         .unwrap();
@@ -1584,8 +1588,15 @@ mod gl_tests {
         )
         .unwrap();
 
-        let map_contig = dst_contig_dyn.as_u8().unwrap().map().unwrap();
-        let map_multi = dst_multi_dyn.as_u8().unwrap().map().unwrap();
-        assert_pixels_match(map_contig.as_slice(), map_multi.as_slice(), 0);
+        // Map raw i8 bytes as u8 for comparison — both have XOR 0x80 bias.
+        let map_contig = dst_contig_dyn.as_i8().unwrap().map().unwrap();
+        let contig_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(map_contig.as_slice().as_ptr().cast(), map_contig.len())
+        };
+        let map_multi = dst_multi_dyn.as_i8().unwrap().map().unwrap();
+        let multi_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(map_multi.as_slice().as_ptr().cast(), map_multi.len())
+        };
+        assert_pixels_match(contig_bytes, multi_bytes, 0);
     }
 }

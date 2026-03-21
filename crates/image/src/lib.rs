@@ -901,23 +901,16 @@ impl ImageProcessorTrait for ImageProcessor {
         crop: Crop,
     ) -> Result<()> {
         let start = Instant::now();
-        let src_fmt = src
-            .format()
-            .map(|f| format!("{f}"))
-            .unwrap_or_else(|| "none".into());
-        let dst_fmt = dst
-            .format()
-            .map(|f| format!("{f}"))
-            .unwrap_or_else(|| "none".into());
-        let src_dtype = src.dtype();
-        let dst_dtype = dst.dtype();
-        let src_mem = src.memory();
-        let dst_mem = dst.memory();
-
+        let src_fmt = src.format();
+        let dst_fmt = dst.format();
         log::trace!(
-            "convert: {src_fmt}({src_dtype:?}/{src_mem:?}) → {dst_fmt}({dst_dtype:?}/{dst_mem:?}), \
+            "convert: {src_fmt:?}({:?}/{:?}) → {dst_fmt:?}({:?}/{:?}), \
              rotation={rotation:?}, flip={flip:?}, backend={:?}",
-            self.forced_backend.as_ref().map(|f| format!("{f:?}")).unwrap_or_else(|| "auto".into()),
+            src.dtype(),
+            src.memory(),
+            dst.dtype(),
+            dst.memory(),
+            self.forced_backend,
         );
 
         // ── Forced backend: no fallback chain ────────────────────────
@@ -972,13 +965,13 @@ impl ImageProcessorTrait for ImageProcessor {
             match opengl.convert(src, dst, rotation, flip, crop) {
                 Ok(_) => {
                     log::trace!(
-                        "convert: auto selected=opengl for {src_fmt}→{dst_fmt} ({:?})",
+                        "convert: auto selected=opengl for {src_fmt:?}→{dst_fmt:?} ({:?})",
                         start.elapsed()
                     );
                     return Ok(());
                 }
                 Err(e) => {
-                    log::trace!("convert: auto opengl declined {src_fmt}→{dst_fmt}: {e}");
+                    log::trace!("convert: auto opengl declined {src_fmt:?}→{dst_fmt:?}: {e}");
                 }
             }
         }
@@ -988,13 +981,13 @@ impl ImageProcessorTrait for ImageProcessor {
             match g2d.convert(src, dst, rotation, flip, crop) {
                 Ok(_) => {
                     log::trace!(
-                        "convert: auto selected=g2d for {src_fmt}→{dst_fmt} ({:?})",
+                        "convert: auto selected=g2d for {src_fmt:?}→{dst_fmt:?} ({:?})",
                         start.elapsed()
                     );
                     return Ok(());
                 }
                 Err(e) => {
-                    log::trace!("convert: auto g2d declined {src_fmt}→{dst_fmt}: {e}");
+                    log::trace!("convert: auto g2d declined {src_fmt:?}→{dst_fmt:?}: {e}");
                 }
             }
         }
@@ -1003,13 +996,13 @@ impl ImageProcessorTrait for ImageProcessor {
             match cpu.convert(src, dst, rotation, flip, crop) {
                 Ok(_) => {
                     log::trace!(
-                        "convert: auto selected=cpu for {src_fmt}→{dst_fmt} ({:?})",
+                        "convert: auto selected=cpu for {src_fmt:?}→{dst_fmt:?} ({:?})",
                         start.elapsed()
                     );
                     return Ok(());
                 }
                 Err(e) => {
-                    log::trace!("convert: auto cpu failed {src_fmt}→{dst_fmt}: {e}");
+                    log::trace!("convert: auto cpu failed {src_fmt:?}→{dst_fmt:?}: {e}");
                     return Err(e);
                 }
             }

@@ -144,9 +144,10 @@ void main(){
 "
 }
 
-/// Int8 variant of [`generate_texture_fragment_shader`]. Applies `fract(v + 0.5)`
-/// to each RGB channel for XOR 0x80 bias (uint8 → int8 conversion).
-/// Used for single-pass RGBA/BGRA/Grey int8 output via DMA EGLImage renderbuffer.
+/// Int8 variant of [`generate_texture_fragment_shader`]. Quantizes each RGB
+/// channel to uint8, applies XOR 0x80 bias via `(q + 128) mod 256`, then
+/// normalizes back. Used for single-pass RGBA/BGRA/Grey int8 output via DMA
+/// EGLImage renderbuffer.
 pub(super) fn generate_texture_int8_shader() -> &'static str {
     "\
 #version 300 es
