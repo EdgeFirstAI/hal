@@ -42,6 +42,34 @@ fn row_stride_for(width: usize, fmt: PixelFormat) -> usize {
     }
 }
 
+/// Apply XOR 0x80 bias to color channels only, preserving alpha.
+///
+/// Matches GL int8 shader behavior: `vec4(int8_bias(c.rgb), c.a)`.
+/// For formats without alpha, XORs every byte (fast path).
+pub(crate) fn apply_int8_xor_bias(data: &mut [u8], fmt: PixelFormat) {
+    use edgefirst_tensor::PixelLayout;
+    if !fmt.has_alpha() {
+        for b in data.iter_mut() {
+            *b ^= 0x80;
+        }
+    } else if fmt.layout() == PixelLayout::Planar {
+        // Planar with alpha (e.g. PlanarRgba): XOR color planes, skip alpha plane.
+        let channels = fmt.channels();
+        let plane_size = data.len() / channels;
+        for b in data[..plane_size * (channels - 1)].iter_mut() {
+            *b ^= 0x80;
+        }
+    } else {
+        // Packed with alpha (Rgba, Bgra): XOR color bytes, skip alpha byte.
+        let channels = fmt.channels();
+        for pixel in data.chunks_exact_mut(channels) {
+            for b in &mut pixel[..channels - 1] {
+                *b ^= 0x80;
+            }
+        }
+    }
+}
+
 impl CPUProcessor {
     /// Creates a new CPUConverter with bilinear resizing.
     pub fn new() -> Self {
@@ -428,9 +456,7 @@ impl CPUProcessor {
                 self.convert_u8(src_u8, dst_u8, src_fmt, dst_fmt, rotation, flip, crop)?;
                 // Apply XOR 0x80 bias in-place (u8 → i8 conversion)
                 let mut map = dst_u8.map()?;
-                for b in map.as_mut_slice() {
-                    *b ^= 0x80;
-                }
+                apply_int8_xor_bias(map.as_mut_slice(), dst_fmt);
                 Ok(())
             }
             (s, d) => Err(Error::NotSupported(format!("dtype {s} -> {d}",))),
