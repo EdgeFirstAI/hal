@@ -89,6 +89,10 @@ pub struct GLProcessorST {
     packed_rgb_intermediate_size: (usize, usize),
     texture_program: GlProgram,
     texture_program_yuv: GlProgram,
+    /// Int8 variant of texture_program — applies XOR 0x80 bias in fragment shader.
+    texture_int8_program: GlProgram,
+    /// Int8 variant of texture_program_yuv — applies XOR 0x80 bias in fragment shader.
+    texture_int8_program_yuv: GlProgram,
     texture_program_planar: GlProgram,
     /// Shader: existing planar RGB with int8 bias (XOR 0x80) applied to output.
     texture_program_planar_int8: GlProgram,
@@ -96,12 +100,6 @@ pub struct GLProcessorST {
     packed_rgba8_program_2d: GlProgram,
     /// Shader: packed RGB int8 -> RGBA8 packing with XOR 0x80 (2D texture source, pass 2).
     packed_rgba8_int8_program_2d: GlProgram,
-    /// Shader: direct RGB render with int8 XOR 0x80 bias (2D texture source).
-    texture_int8_program: GlProgram,
-    /// Shader: direct RGB render with int8 XOR 0x80 bias (external OES source).
-    texture_int8_program_yuv: GlProgram,
-    /// Whether the GPU supports direct RGB rendering via BGR888 renderbuffer.
-    pub(crate) support_rgb_direct: bool,
     pub(super) gl_context: GlContext,
 }
 
@@ -305,6 +303,11 @@ impl GLProcessorST {
             generate_texture_fragment_shader_yuv(),
         )?;
 
+        let texture_int8_program =
+            GlProgram::new(generate_vertex_shader(), generate_texture_int8_shader())?;
+        let texture_int8_program_yuv =
+            GlProgram::new(generate_vertex_shader(), generate_texture_int8_shader_yuv())?;
+
         let segmentation_program =
             GlProgram::new(generate_vertex_shader(), generate_segmentation_shader())?;
         segmentation_program.load_uniform_4fv(c"colors", &DEFAULT_COLORS)?;
@@ -375,12 +378,6 @@ impl GLProcessorST {
             generate_packed_rgba8_int8_shader_2d(),
         )?;
 
-        // Int8 direct-render shaders (for packed RGB int8 destinations via direct path)
-        let texture_int8_program =
-            GlProgram::new(generate_vertex_shader(), generate_texture_int8_shader())?;
-        let texture_int8_program_yuv =
-            GlProgram::new(generate_vertex_shader(), generate_texture_int8_shader_yuv())?;
-
         let camera_eglimage_texture = Texture::new();
         let camera_normal_texture = Texture::new();
         let render_texture = Texture::new();
@@ -394,13 +391,12 @@ impl GLProcessorST {
             gl_context,
             texture_program,
             texture_program_yuv,
+            texture_int8_program,
+            texture_int8_program_yuv,
             texture_program_planar,
             texture_program_planar_int8,
             packed_rgba8_program_2d,
             packed_rgba8_int8_program_2d,
-            texture_int8_program,
-            texture_int8_program_yuv,
-            support_rgb_direct: false, // will be probed in Task 3
             camera_eglimage_texture,
             camera_normal_texture,
             segmentation_texture,
@@ -441,16 +437,11 @@ impl GLProcessorST {
         };
         check_gl_error(function!(), line!())?;
 
-        // Probe GPU capability for direct RGB rendering
-        converter.support_rgb_direct = converter.probe_rgb_direct_support();
-
         // Verify DMA-buf actually works (catches NVIDIA discrete GPUs where
         // EGLImage creation succeeds but rendered data is all zeros)
         if converter.gl_context.transfer_backend.is_dma() && !converter.verify_dma_buf_roundtrip() {
             log::info!("DMA-buf verification failed — falling back to PBO transfers");
             converter.gl_context.transfer_backend = TransferBackend::Pbo;
-            // RGB direct rendering also requires DMA, so disable it
-            converter.support_rgb_direct = false;
         }
 
         // If DMA-buf failed/unavailable but GL is alive, use PBO transfers
@@ -480,105 +471,14 @@ impl GLProcessorST {
                     converter.gl_context.transfer_backend
                 );
                 converter.gl_context.transfer_backend = backend;
-                if !backend.is_dma() {
-                    converter.support_rgb_direct = false;
-                }
             }
         }
 
         log::debug!(
-            "GLConverter created (transfer={:?}, rgb_direct={})",
+            "GLConverter created (transfer={:?})",
             converter.gl_context.transfer_backend,
-            converter.support_rgb_direct
         );
         Ok(converter)
-    }
-
-    /// Probe whether the GPU supports direct RGB rendering via BGR888 DMA-buf
-    /// backed renderbuffer. Creates a small test FBO and checks completeness.
-    /// Returns `false` on any failure (DMA unavailable, EGLImage rejected, FBO incomplete).
-    fn probe_rgb_direct_support(&self) -> bool {
-        if !self.gl_context.transfer_backend.is_dma() {
-            log::debug!("probe_rgb_direct: no DMA support");
-            return false;
-        }
-
-        // Check glEGLImageTargetRenderbufferStorageOES is available
-        if self
-            .gl_context
-            .egl
-            .get_proc_address("glEGLImageTargetRenderbufferStorageOES")
-            .is_none()
-        {
-            log::debug!("probe_rgb_direct: glEGLImageTargetRenderbufferStorageOES not available");
-            return false;
-        }
-
-        // Allocate a small test DMA buffer (64x64 RGB = 12288 bytes)
-        let test_img = match Tensor::<u8>::image(64, 64, PixelFormat::Rgb, Some(TensorMemory::Dma))
-        {
-            Ok(img) => img,
-            Err(e) => {
-                log::debug!("probe_rgb_direct: failed to allocate test DMA buffer: {e}");
-                return false;
-            }
-        };
-
-        // Create EGLImage from the test DMA buffer
-        let egl_image =
-            match self.create_egl_image_with_dims(&test_img, 64, 64, DrmFourcc::Bgr888, 3) {
-                Ok(img) => img,
-                Err(e) => {
-                    log::debug!("probe_rgb_direct: EGLImage creation failed: {e}");
-                    return false;
-                }
-            };
-
-        // Create renderbuffer, bind EGLImage, create FBO, check completeness
-        let result = unsafe {
-            let mut rbo = 0u32;
-            gls::gl::GenRenderbuffers(1, &mut rbo);
-            gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
-            gls::gl::EGLImageTargetRenderbufferStorageOES(
-                gls::gl::RENDERBUFFER,
-                egl_image.egl_image.as_ptr(),
-            );
-
-            let gl_err = gls::gl::GetError();
-            if gl_err != gls::gl::NO_ERROR {
-                log::debug!(
-                    "probe_rgb_direct: EGLImageTargetRenderbufferStorageOES failed: {gl_err:#X}"
-                );
-                gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, 0);
-                gls::gl::DeleteRenderbuffers(1, &rbo);
-                return false;
-            }
-
-            let mut fbo = 0u32;
-            gls::gl::GenFramebuffers(1, &mut fbo);
-            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
-            gls::gl::FramebufferRenderbuffer(
-                gls::gl::FRAMEBUFFER,
-                gls::gl::COLOR_ATTACHMENT0,
-                gls::gl::RENDERBUFFER,
-                rbo,
-            );
-
-            let status = gls::gl::CheckFramebufferStatus(gls::gl::FRAMEBUFFER);
-            let complete = status == gls::gl::FRAMEBUFFER_COMPLETE;
-
-            // Cleanup
-            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
-            gls::gl::DeleteFramebuffers(1, &fbo);
-            gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, 0);
-            gls::gl::DeleteRenderbuffers(1, &rbo);
-
-            complete
-        };
-        // egl_image and test_img drop automatically here
-
-        log::info!("probe_rgb_direct: BGR888 renderbuffer FBO support = {result}");
-        result
     }
 
     /// Verify that DMA-buf EGLImage round-trip actually works on this GPU.
@@ -1203,36 +1103,37 @@ impl GLProcessorST {
             src.memory()
         );
         check_gl_error(function!(), line!())?;
+        log::trace!(
+            "GL convert_impl: {src_fmt}→{dst_fmt} int8={is_int8} \
+             src_mem={:?} dst_mem={:?} transfer={:?}",
+            src.memory(),
+            dst.memory(),
+            self.gl_context.transfer_backend,
+        );
+
         if self.gl_context.transfer_backend.is_dma() && dst.memory() == TensorMemory::Dma {
-            log::trace!(
-                "GL convert: DMA path (src={:?}, dst={:?})",
-                src.memory(),
-                dst.memory()
-            );
+            log::trace!("GL path: DMA (zero-copy EGLImage)");
             let res =
                 self.convert_dest_dma(dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop);
+            log::trace!("GL DMA result: {}", if res.is_ok() { "ok" } else { "err" });
             return res;
         }
         if src.memory() == TensorMemory::Pbo && dst.memory() == TensorMemory::Pbo {
-            log::trace!("GL convert: PBO-to-PBO path");
+            log::trace!("GL path: PBO-to-PBO");
             return self
                 .convert_pbo_to_pbo(dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop);
         }
         if dst.memory() == TensorMemory::Pbo {
-            log::trace!("GL convert: any-to-PBO path (src={:?})", src.memory());
+            log::trace!("GL path: any-to-PBO (src={:?})", src.memory());
             return self
                 .convert_any_to_pbo(dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop);
         }
         if src.memory() == TensorMemory::Pbo {
-            log::trace!("GL convert: PBO-to-mem path");
+            log::trace!("GL path: PBO-to-mem");
             return self
                 .convert_pbo_to_mem(dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop);
         }
-        log::trace!(
-            "GL convert: non-DMA path (src={:?}, dst={:?})",
-            src.memory(),
-            dst.memory()
-        );
+        log::trace!("GL path: non-DMA (CPU upload/readback)");
         let start = Instant::now();
         let res =
             self.convert_dest_non_dma(dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop);
@@ -1647,25 +1548,64 @@ impl GLProcessorST {
     ) -> crate::Result<()> {
         assert!(self.gl_context.transfer_backend.is_dma());
         if dst_fmt == PixelFormat::Rgb {
-            if self.support_rgb_direct {
-                log::trace!("convert_dest_dma: direct RGB path for {dst_fmt}");
-                self.convert_to_rgb_direct(
-                    src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop,
-                )
-            } else {
-                log::trace!("convert_dest_dma: declining packed RGB (no direct RGB support)");
-                Err(crate::Error::NotSupported(
-                    "OpenGL two-pass packed RGB disabled (no direct RGB support)".into(),
-                ))
-            }
+            log::trace!(
+                "GL DMA dispatch: {src_fmt}→{dst_fmt} int8={is_int8} → two-pass packed RGB \
+                 (RGBA intermediate + packed_rgba8{}shader)",
+                if is_int8 { "_int8_" } else { "_" }
+            );
+            self.convert_to_packed_rgb(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
         } else if dst_fmt.layout() == PixelLayout::Planar {
-            log::trace!("convert_dest_dma: planar output path for {dst_fmt}");
+            log::trace!(
+                "GL DMA dispatch: {src_fmt}→{dst_fmt} int8={is_int8} → planar output \
+                 (renderbuffer + planar{}shader)",
+                if is_int8 { "_int8_" } else { "_" }
+            );
             self.setup_renderbuffer_dma(dst, dst_fmt)?;
+            // Bias letterbox clear color for int8 — glClear bypasses the shader.
+            let crop = if is_int8 {
+                let mut crop = crop;
+                if let Some(ref mut color) = crop.dst_color {
+                    color[0] ^= 0x80;
+                    color[1] ^= 0x80;
+                    color[2] ^= 0x80;
+                }
+                crop
+            } else {
+                crop
+            };
             self.convert_to_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
         } else {
-            log::trace!("convert_dest_dma: standard DMA path for {src_fmt} → {dst_fmt}");
+            log::trace!(
+                "GL DMA dispatch: {src_fmt}→{dst_fmt} int8={is_int8} → single-pass EGLImage \
+                 (renderbuffer, {}shader)",
+                if is_int8 { "int8 " } else { "standard " }
+            );
             self.setup_renderbuffer_dma(dst, dst_fmt)?;
-            self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)
+            // For int8 output, swap to int8 shader programs that apply XOR 0x80
+            // in the fragment shader — zero CPU readback.
+            if is_int8 {
+                std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+                std::mem::swap(
+                    &mut self.texture_program_yuv,
+                    &mut self.texture_int8_program_yuv,
+                );
+                // Bias the letterbox clear color since glClear bypasses the shader.
+                let mut crop = crop;
+                if let Some(ref mut color) = crop.dst_color {
+                    color[0] ^= 0x80;
+                    color[1] ^= 0x80;
+                    color[2] ^= 0x80;
+                }
+                let result = self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop);
+                std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+                std::mem::swap(
+                    &mut self.texture_program_yuv,
+                    &mut self.texture_int8_program_yuv,
+                );
+                result
+            } else {
+                self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)
+            }
         }
     }
 
@@ -1684,13 +1624,47 @@ impl GLProcessorST {
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
         self.setup_renderbuffer_non_dma(dst, dst_fmt, crop)?;
-        let start = Instant::now();
-        if dst_fmt.layout() == PixelLayout::Planar {
-            self.convert_to_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)?;
+
+        // Bias letterbox clear color for int8 — glClear bypasses the shader.
+        let crop = if is_int8 {
+            let mut crop = crop;
+            if let Some(ref mut color) = crop.dst_color {
+                color[0] ^= 0x80;
+                color[1] ^= 0x80;
+                color[2] ^= 0x80;
+            }
+            crop
         } else {
-            self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)?;
+            crop
+        };
+
+        // For int8 non-planar output, swap to int8 shader programs.
+        if is_int8 && dst_fmt.layout() != PixelLayout::Planar {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
         }
+
+        let start = Instant::now();
+        let render_result = if dst_fmt.layout() == PixelLayout::Planar {
+            self.convert_to_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
+        } else {
+            self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)
+        };
+
+        if is_int8 && dst_fmt.layout() != PixelLayout::Planar {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
+        }
+        render_result?;
         log::debug!("Draw to framebuffer takes {:?}", start.elapsed());
+
+        // ReadnPixels into Mem dst — data is already int8-biased by the shader.
         let start = Instant::now();
         let dest_format = match dst_fmt {
             PixelFormat::Rgb => gls::gl::RGB,
@@ -1715,11 +1689,6 @@ impl GLProcessorST {
             if dst_fmt == PixelFormat::Bgra {
                 for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
                     chunk.swap(0, 2);
-                }
-            }
-            if is_int8 {
-                for byte in dst_map.iter_mut() {
-                    *byte ^= 0x80;
                 }
             }
         }
@@ -1944,6 +1913,29 @@ impl GLProcessorST {
 
         self.setup_renderbuffer_non_dma(dst, dst_fmt, crop)?;
 
+        // For int8 output, swap to int8 shader programs so the GPU applies
+        // XOR 0x80 in the fragment shader — no CPU readback needed for int8.
+        if is_int8 {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
+        }
+
+        // Bias letterbox clear color for int8 — glClear bypasses the shader.
+        let crop = if is_int8 {
+            let mut crop = crop;
+            if let Some(ref mut color) = crop.dst_color {
+                color[0] ^= 0x80;
+                color[1] ^= 0x80;
+                color[2] ^= 0x80;
+            }
+            crop
+        } else {
+            crop
+        };
+
         // Upload source from PBO and render.
         // We cannot call convert_to/draw_src_texture directly because they
         // call src.tensor().map() which sends a message back to THIS thread,
@@ -1951,7 +1943,7 @@ impl GLProcessorST {
         // and upload to the texture with a NULL pointer — GL reads directly
         // from the PBO, zero CPU copy.
         let start = Instant::now();
-        self.draw_src_texture_from_pbo(
+        let render_result = self.draw_src_texture_from_pbo(
             src,
             src_fmt,
             src_buffer_id,
@@ -1960,7 +1952,16 @@ impl GLProcessorST {
             rotation,
             flip,
             crop,
-        )?;
+        );
+        // Swap shaders back before checking result
+        if is_int8 {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
+        }
+        render_result?;
         log::debug!("PBO render takes {:?}", start.elapsed());
 
         let start_read = Instant::now();
@@ -1996,9 +1997,9 @@ impl GLProcessorST {
 
         check_gl_error(function!(), line!())?;
 
-        // Handle BGRA R↔B swap and/or int8 XOR if needed (must map PBO to do
-        // this on the GL thread directly, since we're already on the GL thread).
-        if dst_fmt == PixelFormat::Bgra || is_int8 {
+        // Handle BGRA R↔B swap if needed (must map PBO on the GL thread).
+        // Int8 XOR 0x80 is handled in the fragment shader — no CPU map needed.
+        if dst_fmt == PixelFormat::Bgra {
             unsafe {
                 gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, dst_buffer_id);
                 let ptr = gls::gl::MapBufferRange(
@@ -2009,15 +2010,8 @@ impl GLProcessorST {
                 );
                 if !ptr.is_null() {
                     let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, dst.len());
-                    if dst_fmt == PixelFormat::Bgra {
-                        for chunk in slice.chunks_exact_mut(4) {
-                            chunk.swap(0, 2);
-                        }
-                    }
-                    if is_int8 {
-                        for byte in slice.iter_mut() {
-                            *byte ^= 0x80;
-                        }
+                    for chunk in slice.chunks_exact_mut(4) {
+                        chunk.swap(0, 2);
                     }
                     gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
                 }
@@ -2306,12 +2300,32 @@ impl GLProcessorST {
         let dst_buffer_id = dst_pbo.buffer_id();
 
         self.setup_renderbuffer_non_dma(dst, dst_fmt, crop)?;
-        let start = Instant::now();
-        if dst_fmt.layout() == PixelLayout::Planar {
-            self.convert_to_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)?;
-        } else {
-            self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)?;
+
+        // For int8 non-planar output, swap to int8 shader programs.
+        // Planar path handles int8 internally via its own int8 shader.
+        if is_int8 && dst_fmt.layout() != PixelLayout::Planar {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
         }
+
+        let start = Instant::now();
+        let render_result = if dst_fmt.layout() == PixelLayout::Planar {
+            self.convert_to_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
+        } else {
+            self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)
+        };
+
+        if is_int8 && dst_fmt.layout() != PixelLayout::Planar {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
+        }
+        render_result?;
         log::debug!("any-to-PBO render takes {:?}", start.elapsed());
 
         let start_read = Instant::now();
@@ -2345,7 +2359,9 @@ impl GLProcessorST {
         }
         check_gl_error(function!(), line!())?;
 
-        if dst_fmt == PixelFormat::Bgra || is_int8 {
+        // Handle BGRA R↔B swap if needed (must map PBO on the GL thread).
+        // Int8 XOR 0x80 is handled in the fragment shader — no CPU map needed.
+        if dst_fmt == PixelFormat::Bgra {
             unsafe {
                 gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, dst_buffer_id);
                 let ptr = gls::gl::MapBufferRange(
@@ -2356,15 +2372,8 @@ impl GLProcessorST {
                 );
                 if !ptr.is_null() {
                     let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, dst.len());
-                    if dst_fmt == PixelFormat::Bgra {
-                        for chunk in slice.chunks_exact_mut(4) {
-                            chunk.swap(0, 2);
-                        }
-                    }
-                    if is_int8 {
-                        for byte in slice.iter_mut() {
-                            *byte ^= 0x80;
-                        }
+                    for chunk in slice.chunks_exact_mut(4) {
+                        chunk.swap(0, 2);
                     }
                     gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
                 }
@@ -2403,8 +2412,19 @@ impl GLProcessorST {
         let src_buffer_id = src_pbo.buffer_id();
 
         self.setup_renderbuffer_non_dma(dst, dst_fmt, crop)?;
+
+        // For int8 output, swap to int8 shader programs so the GPU renders
+        // XOR'd values — ReadnPixels then reads already-biased data.
+        if is_int8 {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
+        }
+
         let start = Instant::now();
-        self.draw_src_texture_from_pbo(
+        let render_result = self.draw_src_texture_from_pbo(
             src,
             src_fmt,
             src_buffer_id,
@@ -2413,12 +2433,20 @@ impl GLProcessorST {
             rotation,
             flip,
             crop,
-        )?;
+        );
+
+        if is_int8 {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
+        }
+        render_result?;
         log::debug!("PBO-to-mem render takes {:?}", start.elapsed());
 
-        // Normal readback into Mem dst
+        // ReadnPixels into Mem dst — data is already int8-biased by the shader.
         let start = Instant::now();
-        // BGRA framebuffer uses RGBA internally; read as RGBA, swap later.
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
         let dest_format = match dst_fmt {
@@ -2447,11 +2475,6 @@ impl GLProcessorST {
             if dst_fmt == PixelFormat::Bgra {
                 for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
                     chunk.swap(0, 2);
-                }
-            }
-            if is_int8 {
-                for byte in dst_map.iter_mut() {
-                    *byte ^= 0x80;
                 }
             }
         }
@@ -2819,84 +2842,6 @@ impl GLProcessorST {
 
         unsafe { gls::gl::Finish() };
         Ok(())
-    }
-
-    /// Render directly to an RGB8 renderbuffer backed by BGR888 DMA-buf.
-    /// Single-pass: no intermediate texture, no packing shader.
-    #[allow(clippy::too_many_arguments)]
-    fn convert_to_rgb_direct(
-        &mut self,
-        src: &Tensor<u8>,
-        src_fmt: PixelFormat,
-        dst: &mut Tensor<u8>,
-        dst_fmt: PixelFormat,
-        is_int8: bool,
-        rotation: crate::Rotation,
-        flip: Flip,
-        crop: Crop,
-    ) -> crate::Result<()> {
-        let dst_w = dst.width().ok_or(Error::NotAnImage)?;
-        let dst_h = dst.height().ok_or(Error::NotAnImage)?;
-
-        log::debug!("convert_to_rgb_direct: {dst_w}x{dst_h} single-pass int8={is_int8}",);
-
-        // Get or create cached renderbuffer
-        let (rbo, width, height) = self.get_or_create_rgb_direct_rbo(dst, dst_fmt)?;
-
-        // Bind FBO with renderbuffer attachment
-        self.convert_fbo.bind();
-        unsafe {
-            gls::gl::FramebufferRenderbuffer(
-                gls::gl::FRAMEBUFFER,
-                gls::gl::COLOR_ATTACHMENT0,
-                gls::gl::RENDERBUFFER,
-                rbo,
-            );
-            check_gl_error(function!(), line!())?;
-
-            let status = gls::gl::CheckFramebufferStatus(gls::gl::FRAMEBUFFER);
-            if status != gls::gl::FRAMEBUFFER_COMPLETE {
-                log::warn!("convert_to_rgb_direct: FBO incomplete (0x{status:x}), falling back");
-                return self.convert_to_packed_rgb(
-                    src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop,
-                );
-            }
-
-            gls::gl::Viewport(0, 0, width, height);
-        }
-
-        // For int8, temporarily swap to int8 shader programs and bias the clear color
-        let crop = if is_int8 {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
-            // Bias the letterbox clear color with XOR 0x80 since glClear bypasses
-            // the fragment shader — the int8 bias must be applied to the color directly.
-            let mut crop = crop;
-            if let Some(ref mut color) = crop.dst_color {
-                color[0] ^= 0x80;
-                color[1] ^= 0x80;
-                color[2] ^= 0x80;
-            }
-            crop
-        } else {
-            crop
-        };
-
-        let result = self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop);
-
-        // Swap back
-        if is_int8 {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
-        }
-
-        result
     }
 
     /// Allocates or resizes the intermediate RGBA texture for two-pass packed RGB.
@@ -3739,76 +3684,6 @@ impl GLProcessorST {
             },
         );
         Ok(handle)
-    }
-
-    /// Get or create an EGLImage + renderbuffer for direct RGB rendering.
-    /// Both are cached in dst_egl_cache keyed by buffer identity.
-    /// Returns (renderbuffer_id, width, height).
-    fn get_or_create_rgb_direct_rbo(
-        &mut self,
-        dst: &Tensor<u8>,
-        _dst_fmt: PixelFormat,
-    ) -> crate::Result<(u32, i32, i32)> {
-        let id = (dst.buffer_identity().id(), None);
-        let dst_w = dst.width().ok_or(Error::NotAnImage)?;
-        let dst_h = dst.height().ok_or(Error::NotAnImage)?;
-        let width = dst_w as i32;
-        let height = dst_h as i32;
-
-        self.dst_egl_cache.sweep();
-
-        // Check cache for existing entry with renderbuffer
-        let ts = self.dst_egl_cache.next_timestamp();
-        if let Some(cached) = self.dst_egl_cache.entries.get_mut(&id) {
-            if let Some(rbo) = cached.renderbuffer {
-                self.dst_egl_cache.hits += 1;
-                cached.last_used = ts;
-                log::trace!("EglImageCache dst (rgb_direct) hit: id={:#x}", id.0);
-                return Ok((rbo, width, height));
-            }
-        }
-        self.dst_egl_cache.misses += 1;
-        log::trace!("EglImageCache dst (rgb_direct) miss: id={:#x}", id.0);
-
-        // Evict least-recently-used entry if at capacity
-        if self.dst_egl_cache.entries.len() >= self.dst_egl_cache.capacity {
-            self.dst_egl_cache.evict_lru();
-        }
-
-        // Create EGLImage from BGR888 DMA-buf
-        let egl_image_obj =
-            self.create_egl_image_with_dims(dst, dst_w, dst_h, DrmFourcc::Bgr888, 3)?;
-
-        // Create renderbuffer and bind EGLImage to it
-        let rbo = unsafe {
-            let mut rbo = 0u32;
-            gls::gl::GenRenderbuffers(1, &mut rbo);
-            gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
-            gls::gl::EGLImageTargetRenderbufferStorageOES(
-                gls::gl::RENDERBUFFER,
-                egl_image_obj.egl_image.as_ptr(),
-            );
-            if let Err(e) = check_gl_error(function!(), line!()) {
-                gls::gl::DeleteRenderbuffers(1, &rbo);
-                return Err(e);
-            }
-            rbo
-        };
-
-        // Cache both
-        let guard = dst.buffer_identity().weak();
-        let ts2 = self.dst_egl_cache.next_timestamp();
-        self.dst_egl_cache.entries.insert(
-            id,
-            CachedEglImage {
-                egl_image: egl_image_obj,
-                guard,
-                renderbuffer: Some(rbo),
-                last_used: ts2,
-            },
-        );
-
-        Ok((rbo, width, height))
     }
 
     // Reshapes the segmentation to be compatible with RGBA texture array rendering.

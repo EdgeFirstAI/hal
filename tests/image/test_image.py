@@ -40,8 +40,8 @@ def calculate_similarity_rms_u8(imageA, imageB) -> float:
 
 def test_flip():
     src = Tensor.load("testdata/zidane.jpg", PixelFormat.Rgba)
-    dst = Tensor.image(1280, 720, PixelFormat.Rgba)
     converter = ImageProcessor()
+    dst = converter.create_image(1280, 720, PixelFormat.Rgba)
     converter.convert(src, dst, flip=Flip.Horizontal)
 
     n = np.zeros((720, 1280, 3), dtype=np.uint8)
@@ -73,8 +73,8 @@ def test_grey_load():
 
 def test_normalize():
     src = Tensor.load("testdata/zidane.jpg", PixelFormat.Rgba)
-    dst = Tensor.image(640, 640, format=PixelFormat.Rgba)
     converter = ImageProcessor()
+    dst = converter.create_image(640, 640, PixelFormat.Rgba)
     converter.convert(src, dst)
     n = np.zeros((640, 640, 3), dtype=np.int8)
     dst.normalize_to_numpy(n, normalization=Normalization.SIGNED)
@@ -112,8 +112,8 @@ def test_render():
 
 def test_rgb_resize():
     src = Tensor.load("testdata/zidane.jpg", PixelFormat.Rgb)
-    dst = Tensor.image(640, 640, PixelFormat.Rgba)
     converter = ImageProcessor()
+    dst = converter.create_image(640, 640, PixelFormat.Rgba)
     converter.convert(src, dst)
     with dst.map() as m:
         n = np.array(m.view()).reshape((dst.height, dst.width, 4))
@@ -123,8 +123,8 @@ def test_rgb_resize():
 
 def test_rgba_to_rgb():
     src = Tensor.load("testdata/zidane.jpg", PixelFormat.Rgba)
-    dst = Tensor.image(1280, 720, PixelFormat.Rgb)
     converter = ImageProcessor()
+    dst = converter.create_image(1280, 720, PixelFormat.Rgb)
     converter.convert(src, dst, Rotation.Rotate0, Flip.NoFlip, Rect(0, 0, 1280, 720))
 
     with dst.map() as m:
@@ -207,6 +207,21 @@ def test_create_image_formats():
         with img.map() as m:
             data = np.frombuffer(m.view(), dtype=np.uint8)
             assert len(data) == 160 * 120 * channels
+
+
+def test_create_image_dtype_i8():
+    """Test create_image with dtype='int8'."""
+    converter = ImageProcessor()
+    img = converter.create_image(320, 240, PixelFormat.Rgb, dtype="int8")
+    assert img.width == 320
+    assert img.height == 240
+    assert img.format == PixelFormat.Rgb
+    assert img.dtype == "int8"
+
+    # Convert into i8 destination should succeed
+    src = Tensor.load("testdata/zidane.jpg", PixelFormat.Rgba)
+    dst = converter.create_image(640, 640, PixelFormat.Rgb, dtype="int8")
+    converter.convert(src, dst)
 
 
 def test_create_image_convert():

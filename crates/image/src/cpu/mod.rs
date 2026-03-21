@@ -42,6 +42,34 @@ fn row_stride_for(width: usize, fmt: PixelFormat) -> usize {
     }
 }
 
+/// Apply XOR 0x80 bias to color channels only, preserving alpha.
+///
+/// Matches GL int8 shader behavior: `vec4(int8_bias(c.rgb), c.a)`.
+/// For formats without alpha, XORs every byte (fast path).
+pub(crate) fn apply_int8_xor_bias(data: &mut [u8], fmt: PixelFormat) {
+    use edgefirst_tensor::PixelLayout;
+    if !fmt.has_alpha() {
+        for b in data.iter_mut() {
+            *b ^= 0x80;
+        }
+    } else if fmt.layout() == PixelLayout::Planar {
+        // Planar with alpha (e.g. PlanarRgba): XOR color planes, skip alpha plane.
+        let channels = fmt.channels();
+        let plane_size = data.len() / channels;
+        for b in data[..plane_size * (channels - 1)].iter_mut() {
+            *b ^= 0x80;
+        }
+    } else {
+        // Packed with alpha (Rgba, Bgra): XOR color bytes, skip alpha byte.
+        let channels = fmt.channels();
+        for pixel in data.chunks_exact_mut(channels) {
+            for b in &mut pixel[..channels - 1] {
+                *b ^= 0x80;
+            }
+        }
+    }
+}
+
 impl CPUProcessor {
     /// Creates a new CPUConverter with bilinear resizing.
     pub fn new() -> Self {
@@ -417,18 +445,18 @@ impl CPUProcessor {
                 self.convert_u8(src, dst, src_fmt, dst_fmt, rotation, flip, crop)
             }
             (DType::U8, DType::I8) => {
-                // Int8 output: convert as u8 into a temporary, then XOR 0x80
+                // Int8 output: reinterpret the i8 destination as u8 (layout-
+                // identical), convert directly into it, then XOR 0x80 in-place.
                 let src_u8 = src.as_u8().unwrap();
                 let dst_i8 = dst.as_i8_mut().unwrap();
-                let dst_w = dst_i8.width().unwrap();
-                let dst_h = dst_i8.height().unwrap();
-                let mut tmp = Tensor::<u8>::image(dst_w, dst_h, dst_fmt, Some(TensorMemory::Mem))?;
-                self.convert_u8(src_u8, &mut tmp, src_fmt, dst_fmt, rotation, flip, crop)?;
-                let src_map = tmp.map()?;
-                let mut dst_map = dst_i8.map()?;
-                for (d, s) in dst_map.iter_mut().zip(src_map.as_slice()) {
-                    *d = (*s ^ 0x80) as i8;
-                }
+                // SAFETY: Tensor<i8> and Tensor<u8> are layout-identical
+                // (same element size, no T-dependent drop glue). Same
+                // rationale as gl::processor::tensor_i8_as_u8_mut.
+                let dst_u8 = unsafe { &mut *(dst_i8 as *mut Tensor<i8> as *mut Tensor<u8>) };
+                self.convert_u8(src_u8, dst_u8, src_fmt, dst_fmt, rotation, flip, crop)?;
+                // Apply XOR 0x80 bias in-place (u8 → i8 conversion)
+                let mut map = dst_u8.map()?;
+                apply_int8_xor_bias(map.as_mut_slice(), dst_fmt);
                 Ok(())
             }
             (s, d) => Err(Error::NotSupported(format!("dtype {s} -> {d}",))),

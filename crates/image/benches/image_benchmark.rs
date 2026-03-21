@@ -24,7 +24,7 @@ use common::{find_testdata_path, format_name, get_test_data, run_bench, BenchCon
 use edgefirst_bench::BenchSuite;
 
 use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rotation};
-use edgefirst_tensor::{PixelFormat, TensorMapTrait, TensorMemory, TensorTrait};
+use edgefirst_tensor::{DType, PixelFormat, TensorMapTrait, TensorMemory, TensorTrait};
 
 const WARMUP: usize = 10;
 const ITERATIONS: usize = 100;
@@ -135,7 +135,7 @@ fn bench_resize(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
         for &(w, h) in target_sizes {
             let name = format!("resize/zidane/{}x{}/RGBA->RGBA", w, h);
             let throughput = (sw * sh * 4) as u64;
-            let Ok(mut dst) = proc.create_image(w, h, PixelFormat::Rgba, None) else {
+            let Ok(mut dst) = proc.create_image(w, h, PixelFormat::Rgba, DType::U8, None) else {
                 println!("  {:50} [skipped: allocation failed]", name);
                 continue;
             };
@@ -176,7 +176,7 @@ fn bench_resize(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
         for &(w, h) in target_sizes {
             let name = format!("resize/zidane/{}x{}/RGB->RGB", w, h);
             let throughput = (sw * sh * 3) as u64;
-            let Ok(mut dst) = proc.create_image(w, h, PixelFormat::Rgb, None) else {
+            let Ok(mut dst) = proc.create_image(w, h, PixelFormat::Rgb, DType::U8, None) else {
                 println!("  {:50} [skipped: allocation failed]", name);
                 continue;
             };
@@ -258,12 +258,12 @@ fn bench_convert(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
         );
         let throughput = w as u64 * h as u64 * bpp;
 
-        let Ok(src) = proc.create_image(w, h, in_fmt, None) else {
+        let Ok(src) = proc.create_image(w, h, in_fmt, DType::U8, None) else {
             println!("  {:50} [skipped: allocation failed]", name);
             continue;
         };
         src.as_u8().unwrap().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
-        let Ok(mut dst) = proc.create_image(w, h, out_fmt, None) else {
+        let Ok(mut dst) = proc.create_image(w, h, out_fmt, DType::U8, None) else {
             println!("  {:50} [skipped: allocation failed]", name);
             continue;
         };
@@ -311,7 +311,8 @@ fn bench_rotate(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
         let name = format!("rotate/{}deg/PixelFormat::Rgba", deg);
         let throughput = (w * h * 4) as u64;
 
-        let Ok(mut dst) = proc.create_image(dst_w, dst_h, PixelFormat::Rgba, None) else {
+        let Ok(mut dst) = proc.create_image(dst_w, dst_h, PixelFormat::Rgba, DType::U8, None)
+        else {
             println!("  {:50} [skipped: allocation failed]", name);
             continue;
         };
@@ -409,7 +410,7 @@ fn run_hires_configs(
 
     // PixelFormat::Yuyv source
     let yuyv_src = {
-        let Ok(src) = proc.create_image(src_w, src_h, PixelFormat::Yuyv, None) else {
+        let Ok(src) = proc.create_image(src_w, src_h, PixelFormat::Yuyv, DType::U8, None) else {
             println!(
                 "  [skipped: could not allocate PixelFormat::Yuyv source {}x{}]",
                 src_w, src_h
@@ -423,7 +424,7 @@ fn run_hires_configs(
 
     // PixelFormat::Rgba source
     let rgba_src = {
-        let Ok(src) = proc.create_image(src_w, src_h, PixelFormat::Rgba, None) else {
+        let Ok(src) = proc.create_image(src_w, src_h, PixelFormat::Rgba, DType::U8, None) else {
             println!(
                 "  [skipped: could not allocate PixelFormat::Rgba source {}x{}]",
                 src_w, src_h
@@ -441,7 +442,7 @@ fn run_hires_configs(
 
     // PixelFormat::Rgb source — convert from PixelFormat::Rgba
     let rgb_src = {
-        let Ok(mut rgb) = proc.create_image(src_w, src_h, PixelFormat::Rgb, None) else {
+        let Ok(mut rgb) = proc.create_image(src_w, src_h, PixelFormat::Rgb, DType::U8, None) else {
             println!(
                 "  [skipped: could not allocate PixelFormat::Rgb source {}x{}]",
                 src_w, src_h
@@ -472,7 +473,8 @@ fn run_hires_configs(
             _ => continue,
         };
 
-        let Ok(mut dst) = proc.create_image(config.out_w, config.out_h, config.out_fmt, None)
+        let Ok(mut dst) =
+            proc.create_image(config.out_w, config.out_h, config.out_fmt, DType::U8, None)
         else {
             println!("  {:50} [skipped: allocation failed]", name);
             continue;
@@ -498,6 +500,7 @@ fn run_hires_configs(
 // =============================================================================
 
 fn main() {
+    env_logger::init();
     let mut suite = BenchSuite::from_args();
     let mut proc = ImageProcessor::new().expect("Failed to create ImageProcessor");
 

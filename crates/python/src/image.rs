@@ -1003,19 +1003,21 @@ impl PyImageProcessor {
     /// Selects the best available backing storage based on hardware capabilities:
     /// DMA-buf > PBO (GPU buffer) > system memory. Images created this way benefit
     /// from zero-copy GPU paths when used with this processor's convert().
-    #[pyo3(signature = (width, height, format = PyPixelFormat::Rgba))]
+    #[pyo3(signature = (width, height, format = PyPixelFormat::Rgba, dtype = "uint8"))]
     pub fn create_image(
         &self,
         width: usize,
         height: usize,
         format: PyPixelFormat,
+        dtype: &str,
     ) -> Result<PyTensor> {
         let fmt: PixelFormat = format.into();
+        let dt = crate::tensor::parse_dtype(dtype).map_err(|e| Error::InvalidArg(e.to_string()))?;
         let dyn_tensor = self
             .0
             .lock()
             .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?
-            .create_image(width, height, fmt, None)?;
+            .create_image(width, height, fmt, dt, None)?;
         Ok(PyTensor(dyn_tensor))
     }
 
