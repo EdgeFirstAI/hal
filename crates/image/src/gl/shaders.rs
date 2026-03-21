@@ -146,8 +146,9 @@ void main(){
 
 /// Int8 variant of [`generate_texture_fragment_shader`]. Quantizes each RGB
 /// channel to uint8, applies XOR 0x80 bias via `(q + 128) mod 256`, then
-/// normalizes back. Used for single-pass RGBA/BGRA/Grey int8 output via DMA
-/// EGLImage renderbuffer.
+/// normalizes back. Intended for non-external 2D texture sources
+/// (e.g., RGBA/BGRA/Grey textures bound as `sampler2D`). DMA/EGLImage and
+/// other external-OES paths use [`generate_texture_int8_shader_yuv`].
 pub(super) fn generate_texture_int8_shader() -> &'static str {
     "\
 #version 300 es

@@ -1923,6 +1923,19 @@ impl GLProcessorST {
             );
         }
 
+        // Bias letterbox clear color for int8 — glClear bypasses the shader.
+        let crop = if is_int8 {
+            let mut crop = crop;
+            if let Some(ref mut color) = crop.dst_color {
+                color[0] ^= 0x80;
+                color[1] ^= 0x80;
+                color[2] ^= 0x80;
+            }
+            crop
+        } else {
+            crop
+        };
+
         // Upload source from PBO and render.
         // We cannot call convert_to/draw_src_texture directly because they
         // call src.tensor().map() which sends a message back to THIS thread,
