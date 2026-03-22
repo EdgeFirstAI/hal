@@ -807,6 +807,35 @@ class Tensor:
     def reshape(self, shape: list[int]) -> None: ...
     """Reshape the tensor to the given shape. The total number of elements must remain the same."""
 
+    def set_format(self, format: PixelFormat) -> None:
+        """Attach pixel format metadata to this tensor.
+
+        Validates that the tensor's shape is compatible with the format's
+        layout (packed, planar, or semi-planar). This enables ``from_fd()``
+        tensors to be used as image conversion destinations.
+
+        Args:
+            format: Pixel format to attach.
+
+        Raises:
+            RuntimeError: If the tensor shape doesn't match the format layout.
+        """
+        ...
+
+    if sys.platform == "linux":
+        def dmabuf_clone(self) -> int:
+            """Clone the DMA-BUF file descriptor backing this tensor.
+
+            Returns a new file descriptor that the caller must close.
+
+            Returns:
+                A new file descriptor (int) that the caller must close.
+
+            Raises:
+                RuntimeError: If the tensor is not DMA-backed or fd clone fails.
+            """
+            ...
+
     def map(self) -> TensorMap: ...
     """Returns a mapped view of the tensor data for direct access."""
 
@@ -1202,6 +1231,39 @@ class ImageProcessor:
             A new image ``Tensor`` backed by the optimal memory type.
         """
         ...
+
+    if sys.platform == "linux":
+        def create_image_from_fd(
+            self,
+            fd: int,
+            width: int,
+            height: int,
+            format: PixelFormat,
+            dtype: str = "uint8",
+        ) -> Tensor:
+            """Create an image tensor backed by an external DMA-BUF file descriptor.
+
+            The GPU renders directly into this buffer via EGL DMA-BUF import —
+            no CPU copy is needed after ``convert()``. The caller retains
+            ownership of the underlying buffer; the returned tensor borrows
+            it via ``dup(fd)``.
+
+            Args:
+                fd: DMA-BUF file descriptor (caller retains ownership).
+                width: Image width in pixels.
+                height: Image height in pixels.
+                format: Pixel format of the buffer.
+                dtype: Element data type string (default: ``"uint8"``).
+
+            Returns:
+                A new image ``Tensor`` backed by the external DMA-BUF.
+
+            Raises:
+                RuntimeError: If the file descriptor is invalid, dimensions are zero,
+                    the format layout is unsupported, NV12 height is odd, or the
+                    fd clone syscall fails.
+            """
+            ...
 
     def set_int8_interpolation(self, mode: str) -> None:
         """Sets the interpolation mode for int8 proto textures.
