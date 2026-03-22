@@ -541,6 +541,9 @@ where
     pub(crate) storage: TensorStorage<T>,
     format: Option<PixelFormat>,
     chroma: Option<Box<Tensor<T>>>,
+    /// Row stride in bytes for externally allocated buffers with row padding.
+    /// `None` means tightly packed (stride == width * bytes_per_pixel).
+    row_stride: Option<usize>,
 }
 
 impl<T> Tensor<T>
@@ -553,6 +556,7 @@ where
             storage,
             format: None,
             chroma: None,
+            row_stride: None,
         }
     }
 
@@ -680,6 +684,11 @@ where
                 }
             }
         }
+        // Clear stored stride when format changes — the stride may be invalid
+        // for the new format. Caller must re-set stride after changing format.
+        if self.format != Some(format) {
+            self.row_stride = None;
+        }
         self.format = Some(format);
         Ok(())
     }
@@ -781,6 +790,7 @@ where
             storage: luma.storage,
             format: Some(format),
             chroma: Some(Box::new(chroma)),
+            row_stride: luma.row_stride,
         })
     }
 
@@ -792,6 +802,77 @@ where
     /// Access the chroma plane for multiplane semi-planar images.
     pub fn chroma(&self) -> Option<&Tensor<T>> {
         self.chroma.as_deref()
+    }
+
+    /// Row stride in bytes (`None` = tightly packed).
+    pub fn row_stride(&self) -> Option<usize> {
+        self.row_stride
+    }
+
+    /// Effective row stride: the stored stride if set, otherwise the minimum
+    /// stride computed from the format and width. Returns `None` if no format
+    /// is set.
+    pub fn effective_row_stride(&self) -> Option<usize> {
+        if let Some(s) = self.row_stride {
+            return Some(s);
+        }
+        let fmt = self.format?;
+        let w = self.width()?;
+        Some(match fmt.layout() {
+            PixelLayout::Packed => w * fmt.channels(),
+            PixelLayout::Planar | PixelLayout::SemiPlanar => w,
+        })
+    }
+
+    /// Set the row stride in bytes for externally allocated buffers with
+    /// row padding (e.g. V4L2 or GStreamer allocators).
+    ///
+    /// The stride is propagated to the EGL DMA-BUF import attributes so
+    /// the GPU interprets the padded buffer layout correctly. Must be
+    /// called after [`set_format`](Self::set_format) and before the tensor
+    /// is first passed to [`ImageProcessor::convert`]. The stored stride
+    /// is cleared automatically if the pixel format is later changed.
+    ///
+    /// # Arguments
+    ///
+    /// * `stride` - Row stride in bytes. Must be >= the minimum stride for
+    ///   the format (width * channels for packed, width for
+    ///   planar/semi-planar).
+    ///
+    /// # Errors
+    ///
+    /// * `InvalidArgument` if no pixel format is set on this tensor
+    /// * `InvalidArgument` if `stride` is less than the minimum for the
+    ///   format and width
+    pub fn set_row_stride(&mut self, stride: usize) -> Result<()> {
+        let fmt = self.format.ok_or_else(|| {
+            Error::InvalidArgument("cannot set row_stride without a pixel format".into())
+        })?;
+        let w = self.width().ok_or_else(|| {
+            Error::InvalidArgument("cannot determine width for row_stride validation".into())
+        })?;
+        let min_stride = match fmt.layout() {
+            PixelLayout::Packed => w * fmt.channels(),
+            PixelLayout::Planar | PixelLayout::SemiPlanar => w,
+        };
+        if stride < min_stride {
+            return Err(Error::InvalidArgument(format!(
+                "row_stride {stride} < minimum {min_stride} for {fmt:?} at width {w}"
+            )));
+        }
+        self.row_stride = Some(stride);
+        Ok(())
+    }
+
+    /// Builder-style variant of [`set_row_stride`](Self::set_row_stride),
+    /// consuming and returning `self`.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`set_row_stride`](Self::set_row_stride).
+    pub fn with_row_stride(mut self, stride: usize) -> Result<Self> {
+        self.set_row_stride(stride)?;
+        Ok(self)
     }
 
     /// Downcast to PBO tensor reference (for GL backends).
@@ -839,6 +920,7 @@ where
             storage: TensorStorage::Pbo(pbo),
             format: None,
             chroma: None,
+            row_stride: None,
         }
     }
 }
@@ -887,10 +969,16 @@ where
         }
         self.storage.reshape(shape)?;
         self.format = None;
+        self.row_stride = None;
         Ok(())
     }
 
     fn map(&self) -> Result<TensorMap<T>> {
+        if self.row_stride.is_some() {
+            return Err(Error::InvalidOperation(
+                "CPU mapping of strided tensors is not supported; use GPU path only".into(),
+            ));
+        }
         self.storage.map()
     }
 

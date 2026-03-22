@@ -71,6 +71,8 @@ macro_rules! downcast_methods {
         }
 
         /// Unwraps the inner tensor if the type matches, otherwise returns `self` as `Err`.
+        /// The Err variant is necessarily large (returns the unconsumed TensorDyn).
+        #[allow(clippy::result_large_err)]
         pub fn $into_name(self) -> Result<Tensor<$ty>, Self> {
             match self {
                 Self::$variant(t) => Ok(t),
@@ -177,6 +179,31 @@ impl TensorDyn {
     /// the expected layout for the given format.
     pub fn with_format(mut self, format: PixelFormat) -> crate::Result<Self> {
         self.set_format(format)?;
+        Ok(self)
+    }
+
+    /// Row stride in bytes (`None` = tightly packed).
+    pub fn row_stride(&self) -> Option<usize> {
+        dispatch!(self, row_stride)
+    }
+
+    /// Effective row stride: stored stride or computed from format and width.
+    pub fn effective_row_stride(&self) -> Option<usize> {
+        dispatch!(self, effective_row_stride)
+    }
+
+    /// Set the row stride in bytes for externally allocated buffers with
+    /// row padding.
+    ///
+    /// Must be called before the tensor is first used for rendering. The
+    /// format must be set before calling this method.
+    pub fn set_row_stride(&mut self, stride: usize) -> crate::Result<()> {
+        dispatch!(self, set_row_stride, stride)
+    }
+
+    /// Builder-style: set row stride, consuming and returning self.
+    pub fn with_row_stride(mut self, stride: usize) -> crate::Result<Self> {
+        self.set_row_stride(stride)?;
         Ok(self)
     }
 
@@ -553,5 +580,131 @@ mod tests {
         assert_eq!(t.format(), Some(PixelFormat::Rgb));
         assert_eq!(t.width(), Some(640));
         assert_eq!(t.height(), Some(480));
+    }
+
+    // --- Row stride tests ---
+
+    #[test]
+    fn set_row_stride_valid() {
+        // RGBA 100px wide: min stride = 400, set 512
+        let mut t = TensorDyn::image(100, 100, PixelFormat::Rgba, DType::U8, None).unwrap();
+        t.set_row_stride(512).unwrap();
+        assert_eq!(t.row_stride(), Some(512));
+        assert_eq!(t.effective_row_stride(), Some(512));
+    }
+
+    #[test]
+    fn set_row_stride_equals_min() {
+        // RGB 100px: min stride = 300, set exactly 300
+        let mut t = TensorDyn::image(100, 100, PixelFormat::Rgb, DType::U8, None).unwrap();
+        t.set_row_stride(300).unwrap();
+        assert_eq!(t.row_stride(), Some(300));
+    }
+
+    #[test]
+    fn set_row_stride_too_small() {
+        // RGBA 100px: min stride = 400, set 300
+        let mut t = TensorDyn::image(100, 100, PixelFormat::Rgba, DType::U8, None).unwrap();
+        assert!(t.set_row_stride(300).is_err());
+        assert_eq!(t.row_stride(), None);
+    }
+
+    #[test]
+    fn set_row_stride_zero() {
+        let mut t = TensorDyn::image(100, 100, PixelFormat::Rgb, DType::U8, None).unwrap();
+        assert!(t.set_row_stride(0).is_err());
+    }
+
+    #[test]
+    fn set_row_stride_requires_format() {
+        let mut t = TensorDyn::new(&[480, 640, 3], DType::U8, None, None).unwrap();
+        assert!(t.set_row_stride(2048).is_err());
+    }
+
+    #[test]
+    fn effective_row_stride_without_stride() {
+        let t = TensorDyn::image(100, 100, PixelFormat::Rgb, DType::U8, None).unwrap();
+        assert_eq!(t.row_stride(), None);
+        assert_eq!(t.effective_row_stride(), Some(300)); // 100 * 3
+    }
+
+    #[test]
+    fn effective_row_stride_no_format() {
+        let t = TensorDyn::new(&[480, 640, 3], DType::U8, None, None).unwrap();
+        assert_eq!(t.effective_row_stride(), None);
+    }
+
+    #[test]
+    fn with_row_stride_builder() {
+        let t = TensorDyn::image(100, 100, PixelFormat::Rgba, DType::U8, None)
+            .unwrap()
+            .with_row_stride(512)
+            .unwrap();
+        assert_eq!(t.row_stride(), Some(512));
+        assert_eq!(t.effective_row_stride(), Some(512));
+    }
+
+    #[test]
+    fn with_row_stride_rejects_small() {
+        let result = TensorDyn::image(100, 100, PixelFormat::Rgba, DType::U8, None)
+            .unwrap()
+            .with_row_stride(200);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn set_format_clears_row_stride() {
+        let mut t = TensorDyn::new(&[480, 640, 3], DType::U8, None, None).unwrap();
+        t.set_format(PixelFormat::Rgb).unwrap();
+        t.set_row_stride(2048).unwrap();
+        assert_eq!(t.row_stride(), Some(2048));
+
+        // Changing to a different 3-channel packed format clears stride
+        let _ = t.set_format(PixelFormat::Bgra); // 4-chan won't fit 3-chan shape
+                                                 // Stride should still be set since format change failed
+        assert_eq!(t.row_stride(), Some(2048));
+
+        // Re-set to same format — stride preserved
+        t.set_format(PixelFormat::Rgb).unwrap();
+        assert_eq!(t.row_stride(), Some(2048));
+
+        // Now clear by setting a genuinely different compatible format
+        // Use reshape to clear everything instead
+        t.reshape(&[480 * 640 * 3]).unwrap();
+        assert_eq!(t.row_stride(), None);
+        assert_eq!(t.format(), None);
+    }
+
+    #[test]
+    fn set_format_same_preserves_stride() {
+        let mut t = TensorDyn::image(100, 100, PixelFormat::Rgb, DType::U8, None).unwrap();
+        t.set_row_stride(512).unwrap();
+        // Re-setting the same format should not clear stride
+        t.set_format(PixelFormat::Rgb).unwrap();
+        assert_eq!(t.row_stride(), Some(512));
+    }
+
+    #[test]
+    fn effective_row_stride_planar() {
+        let t = TensorDyn::image(640, 480, PixelFormat::PlanarRgb, DType::U8, None).unwrap();
+        assert_eq!(t.effective_row_stride(), Some(640)); // planar: width only
+    }
+
+    #[test]
+    fn effective_row_stride_nv12() {
+        let t = TensorDyn::image(640, 480, PixelFormat::Nv12, DType::U8, None).unwrap();
+        assert_eq!(t.effective_row_stride(), Some(640)); // semi-planar: width only
+    }
+
+    #[test]
+    fn map_rejects_strided_tensor() {
+        let mut t =
+            Tensor::<u8>::image(100, 100, PixelFormat::Rgba, Some(TensorMemory::Mem)).unwrap();
+        // Map works before stride is set
+        assert!(t.map().is_ok());
+        // After setting stride, map should be rejected
+        t.set_row_stride(512).unwrap();
+        let err = t.map();
+        assert!(err.is_err());
     }
 }

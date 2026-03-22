@@ -1403,13 +1403,15 @@ bool hal_tensor_is_planar(const struct hal_tensor *tensor);
 size_t hal_tensor_channels(const struct hal_tensor *tensor);
 
 /**
- * Get the row stride of an image tensor in bytes.
+ * Get the effective row stride of an image tensor in bytes.
  *
- * For planar formats this is equal to the width. For interleaved formats
- * this is width * channels.
+ * If an explicit stride was set (e.g. via
+ * `hal_image_processor_create_image_from_fd_with_stride`), that value is
+ * returned. Otherwise the minimum stride is computed from the format:
+ * width for planar/semi-planar formats, width * channels for packed.
  *
  * @param tensor Image tensor handle
- * @return Row stride in bytes, or 0 if tensor is NULL or not an image
+ * @return Row stride in bytes, or 0 if tensor is NULL or format is unset
  */
 size_t hal_tensor_row_stride(const struct hal_tensor *tensor);
 
@@ -1565,6 +1567,45 @@ struct hal_tensor *hal_image_processor_create_image_from_fd(struct hal_image_pro
                                                             size_t height,
                                                             enum hal_fourcc fourcc,
                                                             enum hal_dtype dtype);
+
+/**
+ * Create an image tensor from a DMA-BUF fd with an explicit row stride.
+ *
+ * Use when the external buffer has row padding (stride > width *
+ * bytes_per_pixel), common with V4L2 and GStreamer allocators.
+ *
+ * @param processor Image processor handle
+ * @param fd DMA-BUF file descriptor (caller retains ownership)
+ * @param width Image width in pixels
+ * @param height Image height in pixels
+ * @param fourcc Pixel format (HAL_FOURCC_*)
+ * @param dtype Data type of tensor elements (HAL_DTYPE_*)
+ * @param row_stride Row stride in bytes (must be >= width * bytes_per_pixel)
+ * @return New tensor handle on success, NULL on error
+ * @par Errors (errno):
+ * - EINVAL: Invalid argument (NULL processor, zero dimensions, bad fd,
+ *   stride too small)
+ * - ENOTSUP: Not supported on this platform
+ * - EIO: Underlying I/O error or unexpected internal failure
+ */
+struct hal_tensor *hal_image_processor_create_image_from_fd_with_stride(struct hal_image_processor *processor,
+                                                                        int fd,
+                                                                        size_t width,
+                                                                        size_t height,
+                                                                        enum hal_fourcc fourcc,
+                                                                        enum hal_dtype dtype,
+                                                                        size_t row_stride);
+
+/**
+ * Create image from fd with stride stub for non-Linux platforms.
+ */
+struct hal_tensor *hal_image_processor_create_image_from_fd_with_stride(struct hal_image_processor *processor,
+                                                                        int fd,
+                                                                        size_t width,
+                                                                        size_t height,
+                                                                        enum hal_fourcc fourcc,
+                                                                        enum hal_dtype dtype,
+                                                                        size_t row_stride);
 
 /**
  * Free an image processor.

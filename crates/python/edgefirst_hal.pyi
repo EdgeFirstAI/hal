@@ -1240,6 +1240,7 @@ class ImageProcessor:
             height: int,
             format: PixelFormat,
             dtype: str = "uint8",
+            row_stride: int | None = None,
         ) -> Tensor:
             """Create an image tensor backed by an external DMA-BUF file descriptor.
 
@@ -1254,14 +1255,17 @@ class ImageProcessor:
                 height: Image height in pixels.
                 format: Pixel format of the buffer.
                 dtype: Element data type string (default: ``"uint8"``).
+                row_stride: Row stride in bytes for buffers with row padding
+                    (default: ``None`` = tightly packed). Use when the buffer
+                    was allocated by V4L2 or GStreamer with alignment padding.
 
             Returns:
                 A new image ``Tensor`` backed by the external DMA-BUF.
 
             Raises:
                 RuntimeError: If the file descriptor is invalid, dimensions are zero,
-                    the format layout is unsupported, NV12 height is odd, or the
-                    fd clone syscall fails.
+                    the format layout is unsupported, NV12 height is odd, the
+                    fd clone syscall fails, or stride is smaller than the minimum.
             """
             ...
 
