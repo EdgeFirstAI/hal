@@ -1027,7 +1027,7 @@ impl PyImageProcessor {
     /// no CPU copy is needed after ``convert()``. The caller retains ownership
     /// of the underlying buffer; the returned tensor borrows it via ``dup(fd)``.
     #[cfg(target_os = "linux")]
-    #[pyo3(signature = (fd, width, height, format, dtype = "uint8"))]
+    #[pyo3(signature = (fd, width, height, format, dtype = "uint8", row_stride = None))]
     pub fn create_image_from_fd(
         &self,
         fd: std::os::fd::RawFd,
@@ -1035,6 +1035,7 @@ impl PyImageProcessor {
         height: usize,
         format: PyPixelFormat,
         dtype: &str,
+        row_stride: Option<usize>,
     ) -> Result<PyTensor> {
         use std::os::fd::BorrowedFd;
         if fd < 0 {
@@ -1043,11 +1044,16 @@ impl PyImageProcessor {
         let fmt: PixelFormat = format.into();
         let dt = crate::tensor::parse_dtype(dtype).map_err(|e| Error::InvalidArg(e.to_string()))?;
         let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-        let dyn_tensor = self
+        let proc = self
             .0
             .lock()
-            .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?
-            .create_image_from_fd(borrowed, width, height, fmt, dt)?;
+            .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
+        let dyn_tensor = match row_stride {
+            Some(stride) => {
+                proc.create_image_from_fd_with_stride(borrowed, width, height, fmt, dt, stride)?
+            }
+            None => proc.create_image_from_fd(borrowed, width, height, fmt, dt)?,
+        };
         Ok(PyTensor(dyn_tensor))
     }
 

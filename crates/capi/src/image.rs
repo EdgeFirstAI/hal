@@ -711,26 +711,22 @@ pub unsafe extern "C" fn hal_tensor_channels(tensor: *const HalTensor) -> size_t
     }
 }
 
-/// Get the row stride of an image tensor in bytes.
+/// Get the effective row stride of an image tensor in bytes.
 ///
-/// For planar formats this is equal to the width. For interleaved formats
-/// this is width * channels.
+/// If an explicit stride was set (e.g. via
+/// `hal_image_processor_create_image_from_fd_with_stride`), that value is
+/// returned. Otherwise the minimum stride is computed from the format:
+/// width for planar/semi-planar formats, width * channels for packed.
 ///
 /// @param tensor Image tensor handle
-/// @return Row stride in bytes, or 0 if tensor is NULL or not an image
+/// @return Row stride in bytes, or 0 if tensor is NULL or format is unset
 #[no_mangle]
 pub unsafe extern "C" fn hal_tensor_row_stride(tensor: *const HalTensor) -> size_t {
     if tensor.is_null() {
         return 0;
     }
     let dyn_ref = &unsafe { &(*tensor) }.inner;
-    match (dyn_ref.format(), dyn_ref.width()) {
-        (Some(fmt), Some(w)) => match fmt.layout() {
-            PixelLayout::Packed => w * fmt.channels(),
-            _ => w,
-        },
-        _ => 0,
-    }
+    dyn_ref.effective_row_stride().unwrap_or(0)
 }
 
 // ============================================================================
@@ -1060,6 +1056,82 @@ pub unsafe extern "C" fn hal_image_processor_create_image_from_fd(
     _height: size_t,
     _fourcc: HalFourcc,
     _dtype: HalDtype,
+) -> *mut HalTensor {
+    set_error_null(libc::ENOTSUP)
+}
+
+/// Create an image tensor from a DMA-BUF fd with an explicit row stride.
+///
+/// Use when the external buffer has row padding (stride > width *
+/// bytes_per_pixel), common with V4L2 and GStreamer allocators.
+///
+/// @param processor Image processor handle
+/// @param fd DMA-BUF file descriptor (caller retains ownership)
+/// @param width Image width in pixels
+/// @param height Image height in pixels
+/// @param fourcc Pixel format (HAL_FOURCC_*)
+/// @param dtype Data type of tensor elements (HAL_DTYPE_*)
+/// @param row_stride Row stride in bytes (must be >= width * bytes_per_pixel)
+/// @return New tensor handle on success, NULL on error
+/// @par Errors (errno):
+/// - EINVAL: Invalid argument (NULL processor, zero dimensions, bad fd,
+///   stride too small)
+/// - ENOTSUP: Not supported on this platform
+/// - EIO: Underlying I/O error or unexpected internal failure
+#[no_mangle]
+#[cfg(target_os = "linux")]
+pub unsafe extern "C" fn hal_image_processor_create_image_from_fd_with_stride(
+    processor: *mut HalImageProcessor,
+    fd: c_int,
+    width: size_t,
+    height: size_t,
+    fourcc: HalFourcc,
+    dtype: HalDtype,
+    row_stride: size_t,
+) -> *mut HalTensor {
+    if processor.is_null() || width == 0 || height == 0 || fd < 0 || row_stride == 0 {
+        return set_error_null(libc::EINVAL);
+    }
+
+    use std::os::fd::BorrowedFd;
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    let dyn_tensor = match unsafe { &(*processor) }
+        .inner
+        .create_image_from_fd_with_stride(
+            borrowed,
+            width,
+            height,
+            fourcc.to_pixel_format(),
+            dtype.into(),
+            row_stride,
+        ) {
+        Ok(t) => t,
+        Err(e) => {
+            return set_error_null(match &e {
+                edgefirst_image::Error::InvalidShape(_) | edgefirst_image::Error::NotAnImage => {
+                    libc::EINVAL
+                }
+                edgefirst_image::Error::NotSupported(_)
+                | edgefirst_image::Error::NotImplemented(_) => libc::ENOTSUP,
+                edgefirst_image::Error::Io(io) => io.raw_os_error().unwrap_or(libc::EIO),
+                _ => libc::EIO,
+            });
+        }
+    };
+    Box::into_raw(Box::new(HalTensor { inner: dyn_tensor }))
+}
+
+/// Create image from fd with stride stub for non-Linux platforms.
+#[no_mangle]
+#[cfg(not(target_os = "linux"))]
+pub unsafe extern "C" fn hal_image_processor_create_image_from_fd_with_stride(
+    _processor: *mut HalImageProcessor,
+    _fd: c_int,
+    _width: size_t,
+    _height: size_t,
+    _fourcc: HalFourcc,
+    _dtype: HalDtype,
+    _row_stride: size_t,
 ) -> *mut HalTensor {
     set_error_null(libc::ENOTSUP)
 }
@@ -1941,6 +2013,93 @@ mod tests {
 
                 hal_image_processor_free(processor);
             }
+        }
+    }
+
+    #[test]
+    fn test_create_image_from_fd_with_stride_null_params() {
+        unsafe {
+            // NULL processor should return NULL
+            let result = hal_image_processor_create_image_from_fd_with_stride(
+                std::ptr::null_mut(),
+                0,
+                640,
+                480,
+                HalFourcc::Rgba,
+                HalDtype::U8,
+                2560,
+            );
+            assert!(result.is_null());
+
+            // fd = -1 should return NULL
+            let processor = hal_image_processor_new();
+            if !processor.is_null() {
+                let result = hal_image_processor_create_image_from_fd_with_stride(
+                    processor,
+                    -1,
+                    640,
+                    480,
+                    HalFourcc::Rgba,
+                    HalDtype::U8,
+                    2560,
+                );
+                assert!(result.is_null());
+
+                // row_stride = 0 should return NULL
+                let result = hal_image_processor_create_image_from_fd_with_stride(
+                    processor,
+                    0,
+                    640,
+                    480,
+                    HalFourcc::Rgba,
+                    HalDtype::U8,
+                    0,
+                );
+                assert!(result.is_null());
+
+                // width = 0 should return NULL
+                let result = hal_image_processor_create_image_from_fd_with_stride(
+                    processor,
+                    0,
+                    0,
+                    480,
+                    HalFourcc::Rgba,
+                    HalDtype::U8,
+                    2560,
+                );
+                assert!(result.is_null());
+
+                hal_image_processor_free(processor);
+            }
+        }
+    }
+
+    #[test]
+    fn test_image_row_stride_with_explicit_stride() {
+        unsafe {
+            // Create an RGBA image and set an explicit stride via the Rust API
+            let mut t = edgefirst_tensor::TensorDyn::image(
+                100,
+                100,
+                edgefirst_tensor::PixelFormat::Rgba,
+                edgefirst_tensor::DType::U8,
+                None,
+            )
+            .unwrap();
+            t.set_row_stride(512).unwrap();
+
+            let tensor = Box::into_raw(Box::new(HalTensor { inner: t }));
+
+            // hal_tensor_row_stride should return the explicit stride, not width*channels
+            let stride = hal_tensor_row_stride(tensor);
+            assert_eq!(stride, 512);
+
+            // Verify width*channels would be 400 (different from 512)
+            let width = crate::image::hal_tensor_width(tensor);
+            let channels = crate::image::hal_tensor_channels(tensor);
+            assert_eq!(width * channels, 400);
+
+            hal_tensor_free(tensor);
         }
     }
 }

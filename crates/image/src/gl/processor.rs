@@ -3433,13 +3433,15 @@ impl GLProcessorST {
             None
         };
 
-        // For NV12, plane0 pitch is width (Y is 1 byte/pixel)
-        // For other formats, pitch is width * channels
-        let plane0_pitch = if src_fmt == PixelFormat::Nv12 {
-            width
-        } else {
-            width * channels
-        };
+        // Use the tensor's stored stride if set (for externally allocated buffers
+        // with row padding), otherwise compute the tightly-packed pitch.
+        let plane0_pitch = src.effective_row_stride().unwrap_or_else(|| {
+            if src_fmt == PixelFormat::Nv12 {
+                width
+            } else {
+                width * channels
+            }
+        });
 
         let mut egl_img_attr = vec![
             egl_ext::LINUX_DRM_FOURCC as Attrib,
@@ -3464,8 +3466,16 @@ impl GLProcessorST {
                 // Multiplane: UV in separate DMA-BUF at offset 0
                 (chroma_fd, 0)
             } else {
-                // Contiguous: UV follows Y in same buffer
-                (fd, width * height)
+                // Contiguous: UV follows Y in same buffer.
+                // Use stride-aware offset — if Y has padding, UV starts
+                // at stride * height, not width * height.
+                (fd, plane0_pitch * height)
+            };
+            let plane1_pitch = if let Some(chroma) = src.chroma() {
+                chroma.effective_row_stride().unwrap_or(width)
+            } else {
+                // Contiguous NV12: UV stride matches Y stride
+                plane0_pitch
             };
             egl_img_attr.append(&mut vec![
                 egl_ext::DMA_BUF_PLANE1_FD as Attrib,
@@ -3473,7 +3483,7 @@ impl GLProcessorST {
                 egl_ext::DMA_BUF_PLANE1_OFFSET as Attrib,
                 uv_offset as Attrib,
                 egl_ext::DMA_BUF_PLANE1_PITCH as Attrib,
-                width as Attrib, // UV plane has same width as Y plane
+                plane1_pitch as Attrib,
             ]);
         }
 

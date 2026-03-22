@@ -960,6 +960,49 @@ impl ImageProcessor {
         }
         Ok(tensor.with_format(format)?)
     }
+
+    /// Create an image from a DMA-BUF fd with an explicit row stride.
+    ///
+    /// Use this when the external buffer has row padding (stride > width *
+    /// bytes_per_pixel), common with V4L2 and GStreamer allocators that align
+    /// rows to cache-line or tile boundaries. The stride is forwarded to the
+    /// EGL DMA-BUF import attributes so the GPU interprets the padded layout
+    /// correctly.
+    ///
+    /// # Arguments
+    ///
+    /// * `fd` - Borrowed reference to the DMA-BUF file descriptor
+    /// * `width` - Image width in pixels
+    /// * `height` - Image height in pixels
+    /// * `format` - Pixel format of the buffer
+    /// * `dtype` - Element data type (e.g. `DType::U8`)
+    /// * `row_stride` - Row stride in bytes (must be >= width * channels for
+    ///   packed formats, or >= width for planar/semi-planar formats)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// * The fd clone syscall fails
+    /// * The shape is invalid for the given format (e.g. odd height for NV12)
+    /// * `row_stride` is less than the minimum for the format and width
+    /// * The format layout is unsupported
+    ///
+    /// # Platform
+    ///
+    /// Linux only (`#[cfg(target_os = "linux")]`).
+    #[cfg(target_os = "linux")]
+    pub fn create_image_from_fd_with_stride(
+        &self,
+        fd: std::os::fd::BorrowedFd<'_>,
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+        dtype: DType,
+        row_stride: usize,
+    ) -> Result<TensorDyn> {
+        let tensor = self.create_image_from_fd(fd, width, height, format, dtype)?;
+        Ok(tensor.with_row_stride(row_stride)?)
+    }
 }
 
 impl ImageProcessorTrait for ImageProcessor {
