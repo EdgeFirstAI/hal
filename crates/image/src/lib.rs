@@ -951,7 +951,14 @@ impl ImageProcessor {
                 )));
             }
         };
-        Ok(TensorDyn::from_fd(owned, &shape, dtype, None)?.with_format(format)?)
+        let tensor = TensorDyn::from_fd(owned, &shape, dtype, None)?;
+        if tensor.memory() != TensorMemory::Dma {
+            return Err(Error::NotSupported(format!(
+                "create_image_from_fd requires DMA-backed fd, got {:?}",
+                tensor.memory()
+            )));
+        }
+        Ok(tensor.with_format(format)?)
     }
 }
 

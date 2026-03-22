@@ -882,7 +882,7 @@ pub unsafe extern "C" fn hal_image_processor_convert_ref(
     let dst_inner = unsafe { &mut (*dst_tensor).inner };
 
     // Validate that the tensor is u8 and attach the requested pixel format.
-    if let TensorDyn::U8(ref mut t) = dst_inner {
+    if let TensorDyn::U8(ref mut t) = *dst_inner {
         if t.set_format(dst_fourcc.to_pixel_format()).is_err() {
             return set_error(libc::EINVAL);
         }
