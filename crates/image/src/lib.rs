@@ -5218,10 +5218,14 @@ mod image_tests {
 
     #[test]
     fn test_set_format_then_cpu_convert() {
-        // Force CPU backend
+        // Force CPU backend (save/restore to avoid leaking into other tests)
+        let original = std::env::var("EDGEFIRST_FORCE_BACKEND").ok();
         unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "cpu") };
         let mut processor = ImageProcessor::new().unwrap();
-        unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") };
+        match original {
+            Some(s) => unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", s) },
+            None => unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") },
+        }
 
         // Load a source image
         let image = include_bytes!(concat!(
