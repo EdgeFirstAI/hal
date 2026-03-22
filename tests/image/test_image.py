@@ -15,6 +15,7 @@ import numpy as np
 from PIL import Image
 import math
 import os
+import sys
 import pytest
 
 
@@ -275,3 +276,11 @@ def test_create_image_roundtrip():
     with dst.map() as m:
         result = np.frombuffer(m.view(), dtype=np.uint8)
         assert result.any(), "Destination is all zeros after roundtrip convert"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="create_image_from_fd is Linux-only")
+def test_create_image_from_fd_negative_fd():
+    """create_image_from_fd raises RuntimeError for invalid fd."""
+    processor = ImageProcessor()
+    with pytest.raises(RuntimeError):
+        processor.create_image_from_fd(-1, 640, 640, PixelFormat.Rgb)

@@ -1364,6 +1364,22 @@ size_t hal_tensor_height(const struct hal_tensor *tensor);
 enum hal_fourcc hal_tensor_fourcc(const struct hal_tensor *tensor);
 
 /**
+ * Attach pixel format metadata to a tensor.
+ *
+ * Validates that the tensor's shape is compatible with the format's
+ * layout (packed, planar, or semi-planar). This enables tensors
+ * created via `hal_tensor_from_fd()` to be used as image conversion
+ * destinations.
+ *
+ * @param tensor Tensor handle
+ * @param fourcc Pixel format to attach (HAL_FOURCC_*)
+ * @return 0 on success, -1 on error
+ * @par Errors (errno):
+ * - EINVAL: NULL tensor or shape doesn't match format layout
+ */
+int hal_tensor_set_format(struct hal_tensor *tensor, enum hal_fourcc fourcc);
+
+/**
  * Check if an image tensor uses a planar pixel format.
  *
  * Planar formats store each color channel in a separate plane (e.g., NV12,
@@ -1538,6 +1554,43 @@ struct hal_tensor *hal_image_processor_create_image(struct hal_image_processor *
                                                     size_t height,
                                                     enum hal_fourcc fourcc,
                                                     enum hal_dtype dtype);
+
+/**
+ * Create an image tensor backed by an external DMA-BUF file descriptor.
+ *
+ * The GPU renders directly into this buffer via EGL DMA-BUF import —
+ * no CPU copy is needed after hal_image_processor_convert(). The caller
+ * retains ownership of the underlying buffer; the returned tensor borrows
+ * it via dup(fd).
+ *
+ * @param processor Image processor handle
+ * @param fd DMA-BUF file descriptor (caller retains ownership)
+ * @param width Image width in pixels
+ * @param height Image height in pixels
+ * @param fourcc Pixel format (HAL_FOURCC_*)
+ * @param dtype Data type of tensor elements (HAL_DTYPE_*)
+ * @return New tensor handle on success, NULL on error
+ * @par Errors (errno):
+ * - EINVAL: Invalid argument (NULL processor, zero dimensions, bad fd)
+ * - ENOTSUP: Not supported on this platform
+ * - EIO: fd clone or format validation failed
+ */
+struct hal_tensor *hal_image_processor_create_image_from_fd(struct hal_image_processor *processor,
+                                                            int fd,
+                                                            size_t width,
+                                                            size_t height,
+                                                            enum hal_fourcc fourcc,
+                                                            enum hal_dtype dtype);
+
+/**
+ * Create image from fd stub for non-Linux platforms.
+ */
+struct hal_tensor *hal_image_processor_create_image_from_fd(struct hal_image_processor *processor,
+                                                            int fd,
+                                                            size_t width,
+                                                            size_t height,
+                                                            enum hal_fourcc fourcc,
+                                                            enum hal_dtype dtype);
 
 /**
  * Free an image processor.
@@ -1762,6 +1815,29 @@ int hal_tensor_clone_fd(const struct hal_tensor *tensor);
  * Clone file descriptor stub for non-Unix platforms.
  */
 int hal_tensor_clone_fd(const struct hal_tensor *tensor);
+
+/**
+ * Clone the DMA-BUF file descriptor backing a tensor.
+ *
+ * Unlike hal_tensor_clone_fd(), this function returns a clear error if the
+ * tensor is not DMA-backed, rather than a generic I/O error. Use this when
+ * you specifically need a DMA-BUF fd for zero-copy hardware import.
+ *
+ * Creates a new owned file descriptor that the caller must close().
+ *
+ * @param tensor Tensor handle
+ * @return New file descriptor on success, -1 on error
+ * @par Errors (errno):
+ * - EINVAL: NULL tensor
+ * - ENOTSUP: Tensor is not DMA-backed (Mem, Shm, or Pbo)
+ * - EIO: Failed to clone file descriptor
+ */
+int hal_tensor_dmabuf_clone(const struct hal_tensor *tensor);
+
+/**
+ * Clone DMA-BUF fd stub for non-Linux platforms.
+ */
+int hal_tensor_dmabuf_clone(const struct hal_tensor *tensor);
 
 /**
  * Reshape a tensor to a new shape.

@@ -884,6 +884,75 @@ impl ImageProcessor {
             Some(edgefirst_tensor::TensorMemory::Mem),
         )?)
     }
+
+    /// Create an image tensor backed by an external DMA-BUF file descriptor.
+    ///
+    /// The GPU renders directly into this buffer via EGL DMA-BUF import —
+    /// no CPU copy is needed after `convert()`. The caller retains ownership
+    /// of the underlying buffer; the returned tensor borrows it via `dup(fd)`.
+    ///
+    /// # Arguments
+    ///
+    /// * `fd` - Borrowed reference to the DMA-BUF file descriptor
+    /// * `width` - Image width in pixels
+    /// * `height` - Image height in pixels
+    /// * `format` - Pixel format of the buffer
+    /// * `dtype` - Element data type (e.g. `DType::U8`)
+    ///
+    /// # Returns
+    ///
+    /// A `TensorDyn` configured as an image with the given format, backed by a
+    /// `dup`'d copy of the caller's file descriptor.
+    ///
+    /// # Platform
+    ///
+    /// Linux only. Returns `Error::NotSupported` on other platforms.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the fd clone fails or the resulting shape is
+    /// invalid for the given format.
+    #[cfg(target_os = "linux")]
+    pub fn create_image_from_fd(
+        &self,
+        fd: std::os::fd::BorrowedFd<'_>,
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+        dtype: DType,
+    ) -> Result<TensorDyn> {
+        let owned = fd.try_clone_to_owned().map_err(Error::Io)?;
+        let shape = match format.layout() {
+            PixelLayout::Packed => vec![height, width, format.channels()],
+            PixelLayout::Planar => vec![format.channels(), height, width],
+            PixelLayout::SemiPlanar => {
+                let total_h = match format {
+                    PixelFormat::Nv12 => {
+                        if !height.is_multiple_of(2) {
+                            return Err(Error::InvalidShape(format!(
+                                "NV12 requires even height, got {height}"
+                            )));
+                        }
+                        height * 3 / 2
+                    }
+                    PixelFormat::Nv16 => height * 2,
+                    _ => {
+                        return Err(Error::InvalidShape(format!(
+                            "unknown semi-planar height multiplier for {format:?}"
+                        )))
+                    }
+                };
+                vec![total_h, width]
+            }
+            _ => {
+                return Err(Error::NotSupported(format!(
+                    "unsupported pixel layout for create_image_from_fd: {:?}",
+                    format.layout()
+                )));
+            }
+        };
+        Ok(TensorDyn::from_fd(owned, &shape, dtype, None)?.with_format(format)?)
+    }
 }
 
 impl ImageProcessorTrait for ImageProcessor {
@@ -5138,5 +5207,35 @@ mod image_tests {
         };
         let result = converter.draw_masks_proto(&mut dst_dyn, &det, &proto_data);
         assert!(result.is_ok(), "CPU fallback path should work: {result:?}");
+    }
+
+    #[test]
+    fn test_set_format_then_cpu_convert() {
+        // Force CPU backend
+        unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "cpu") };
+        let mut processor = ImageProcessor::new().unwrap();
+        unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") };
+
+        // Load a source image
+        let image = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/zidane.jpg"
+        ));
+        let src = load_image(image, Some(PixelFormat::Rgba), None).unwrap();
+
+        // Create a raw tensor, then attach format — simulating the from_fd workflow
+        let mut dst =
+            TensorDyn::new(&[640, 640, 3], DType::U8, Some(TensorMemory::Mem), None).unwrap();
+        dst.set_format(PixelFormat::Rgb).unwrap();
+
+        // Convert should work with the set_format-annotated tensor
+        processor
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+            .unwrap();
+
+        // Verify format survived conversion
+        assert_eq!(dst.format(), Some(PixelFormat::Rgb));
+        assert_eq!(dst.width(), Some(640));
+        assert_eq!(dst.height(), Some(640));
     }
 }
