@@ -809,18 +809,19 @@ where
         self.row_stride
     }
 
-    /// Effective row stride: the stored stride if set, otherwise the minimum
-    /// stride computed from the format and width. Returns `None` if no format
-    /// is set.
+    /// Effective row stride in bytes: the stored stride if set, otherwise the
+    /// minimum stride computed from the format, width, and element size.
+    /// Returns `None` if no format is set.
     pub fn effective_row_stride(&self) -> Option<usize> {
         if let Some(s) = self.row_stride {
             return Some(s);
         }
         let fmt = self.format?;
         let w = self.width()?;
+        let elem = std::mem::size_of::<T>();
         Some(match fmt.layout() {
-            PixelLayout::Packed => w * fmt.channels(),
-            PixelLayout::Planar | PixelLayout::SemiPlanar => w,
+            PixelLayout::Packed => w * fmt.channels() * elem,
+            PixelLayout::Planar | PixelLayout::SemiPlanar => w * elem,
         })
     }
 
@@ -836,8 +837,8 @@ where
     /// # Arguments
     ///
     /// * `stride` - Row stride in bytes. Must be >= the minimum stride for
-    ///   the format (width * channels for packed, width for
-    ///   planar/semi-planar).
+    ///   the format (width * channels * sizeof(T) for packed,
+    ///   width * sizeof(T) for planar/semi-planar).
     ///
     /// # Errors
     ///
@@ -851,9 +852,10 @@ where
         let w = self.width().ok_or_else(|| {
             Error::InvalidArgument("cannot determine width for row_stride validation".into())
         })?;
+        let elem = std::mem::size_of::<T>();
         let min_stride = match fmt.layout() {
-            PixelLayout::Packed => w * fmt.channels(),
-            PixelLayout::Planar | PixelLayout::SemiPlanar => w,
+            PixelLayout::Packed => w * fmt.channels() * elem,
+            PixelLayout::Planar | PixelLayout::SemiPlanar => w * elem,
         };
         if stride < min_stride {
             return Err(Error::InvalidArgument(format!(
