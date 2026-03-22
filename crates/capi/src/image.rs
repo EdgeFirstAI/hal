@@ -1071,7 +1071,8 @@ pub unsafe extern "C" fn hal_image_processor_create_image_from_fd(
 /// @param height Image height in pixels
 /// @param fourcc Pixel format (HAL_FOURCC_*)
 /// @param dtype Data type of tensor elements (HAL_DTYPE_*)
-/// @param row_stride Row stride in bytes (must be >= width * bytes_per_pixel)
+/// @param row_stride Row stride in bytes (must be >= minimum stride for the
+///   format: width * channels for packed, width for planar/semi-planar)
 /// @return New tensor handle on success, NULL on error
 /// @par Errors (errno):
 /// - EINVAL: Invalid argument (NULL processor, zero dimensions, bad fd,

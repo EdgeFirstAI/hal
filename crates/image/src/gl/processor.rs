@@ -3472,7 +3472,11 @@ impl GLProcessorST {
                 (fd, plane0_pitch * height)
             };
             let plane1_pitch = if let Some(chroma) = src.chroma() {
-                chroma.effective_row_stride().unwrap_or(width)
+                // Multiplane: use chroma's own stride, or fall back to Y pitch
+                // (chroma tensors from from_planes() have no format, so they
+                // can't carry a row_stride — use the luma pitch since NV12 UV
+                // row width in bytes equals Y row width)
+                chroma.effective_row_stride().unwrap_or(plane0_pitch)
             } else {
                 // Contiguous NV12: UV stride matches Y stride
                 plane0_pitch
