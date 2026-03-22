@@ -1559,16 +1559,6 @@ struct hal_tensor *hal_image_processor_create_image_from_fd(struct hal_image_pro
                                                             enum hal_dtype dtype);
 
 /**
- * Create image from fd stub for non-Linux platforms.
- */
-struct hal_tensor *hal_image_processor_create_image_from_fd(struct hal_image_processor *processor,
-                                                            int fd,
-                                                            size_t width,
-                                                            size_t height,
-                                                            enum hal_fourcc fourcc,
-                                                            enum hal_dtype dtype);
-
-/**
  * Create an image tensor from a DMA-BUF fd with an explicit row stride.
  *
  * Use when the external buffer has row padding (stride > width *
@@ -1587,17 +1577,6 @@ struct hal_tensor *hal_image_processor_create_image_from_fd(struct hal_image_pro
  *   stride too small)
  * - ENOTSUP: Not supported on this platform
  * - EIO: Underlying I/O error or unexpected internal failure
- */
-struct hal_tensor *hal_image_processor_create_image_from_fd_with_stride(struct hal_image_processor *processor,
-                                                                        int fd,
-                                                                        size_t width,
-                                                                        size_t height,
-                                                                        enum hal_fourcc fourcc,
-                                                                        enum hal_dtype dtype,
-                                                                        size_t row_stride);
-
-/**
- * Create image from fd with stride stub for non-Linux platforms.
  */
 struct hal_tensor *hal_image_processor_create_image_from_fd_with_stride(struct hal_image_processor *processor,
                                                                         int fd,
@@ -1846,11 +1825,6 @@ int hal_tensor_clone_fd(const struct hal_tensor *tensor);
  * - EINVAL: NULL tensor
  * - ENOTSUP: Tensor is not DMA-backed (Mem, Shm, or Pbo)
  * - EIO: Failed to clone file descriptor
- */
-int hal_tensor_dmabuf_clone(const struct hal_tensor *tensor);
-
-/**
- * Clone DMA-BUF fd stub for non-Linux platforms.
  */
 int hal_tensor_dmabuf_clone(const struct hal_tensor *tensor);
 

@@ -494,7 +494,7 @@ pub unsafe extern "C" fn hal_tensor_dmabuf_clone(tensor: *const HalTensor) -> c_
     }
 }
 
-/// Clone DMA-BUF fd stub for non-Linux platforms.
+/// cbindgen:ignore
 #[no_mangle]
 #[cfg(not(target_os = "linux"))]
 pub unsafe extern "C" fn hal_tensor_dmabuf_clone(_tensor: *const HalTensor) -> c_int {
