@@ -1046,7 +1046,7 @@ pub unsafe extern "C" fn hal_image_processor_create_image_from_fd(
     Box::into_raw(Box::new(HalTensor { inner: dyn_tensor }))
 }
 
-/// Create image from fd stub for non-Linux platforms.
+/// cbindgen:ignore
 #[no_mangle]
 #[cfg(not(target_os = "linux"))]
 pub unsafe extern "C" fn hal_image_processor_create_image_from_fd(
@@ -1121,7 +1121,7 @@ pub unsafe extern "C" fn hal_image_processor_create_image_from_fd_with_stride(
     Box::into_raw(Box::new(HalTensor { inner: dyn_tensor }))
 }
 
-/// Create image from fd with stride stub for non-Linux platforms.
+/// cbindgen:ignore
 #[no_mangle]
 #[cfg(not(target_os = "linux"))]
 pub unsafe extern "C" fn hal_image_processor_create_image_from_fd_with_stride(
