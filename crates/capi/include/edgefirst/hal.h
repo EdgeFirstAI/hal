@@ -1571,9 +1571,10 @@ struct hal_tensor *hal_image_processor_create_image(struct hal_image_processor *
  * @param dtype Data type of tensor elements (HAL_DTYPE_*)
  * @return New tensor handle on success, NULL on error
  * @par Errors (errno):
- * - EINVAL: Invalid argument (NULL processor, zero dimensions, bad fd)
+ * - EINVAL: Invalid argument (NULL processor, zero dimensions, bad fd,
+ *   invalid image shape, or not an image)
  * - ENOTSUP: Not supported on this platform
- * - EIO: fd clone or format validation failed
+ * - EIO: Underlying I/O error or unexpected internal failure
  */
 struct hal_tensor *hal_image_processor_create_image_from_fd(struct hal_image_processor *processor,
                                                             int fd,

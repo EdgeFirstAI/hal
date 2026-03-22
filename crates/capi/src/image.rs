@@ -1065,9 +1065,10 @@ pub unsafe extern "C" fn hal_image_processor_create_image(
 /// @param dtype Data type of tensor elements (HAL_DTYPE_*)
 /// @return New tensor handle on success, NULL on error
 /// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL processor, zero dimensions, bad fd)
+/// - EINVAL: Invalid argument (NULL processor, zero dimensions, bad fd,
+///   invalid image shape, or not an image)
 /// - ENOTSUP: Not supported on this platform
-/// - EIO: fd clone or format validation failed
+/// - EIO: Underlying I/O error or unexpected internal failure
 #[no_mangle]
 #[cfg(target_os = "linux")]
 pub unsafe extern "C" fn hal_image_processor_create_image_from_fd(
