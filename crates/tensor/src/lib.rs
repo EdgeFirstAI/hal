@@ -623,6 +623,21 @@ where
     }
 
     /// Attach format metadata to an existing tensor.
+    ///
+    /// # Arguments
+    ///
+    /// * `format` - The pixel format to attach
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` on success, with the format stored as metadata on the tensor.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidShape` if the tensor shape is incompatible with
+    /// the format's layout (packed expects `[H, W, C]`, planar expects
+    /// `[C, H, W]`, semi-planar expects `[H*k, W]` with format-specific
+    /// height constraints).
     pub fn set_format(&mut self, format: PixelFormat) -> Result<()> {
         let shape = self.shape();
         match format.layout() {
@@ -793,6 +808,28 @@ where
         match &self.storage {
             TensorStorage::Dma(d) => Some(d),
             _ => None,
+        }
+    }
+
+    /// Borrow the DMA-BUF file descriptor backing this tensor.
+    ///
+    /// # Returns
+    ///
+    /// A borrowed reference to the DMA-BUF file descriptor, tied to `self`'s
+    /// lifetime.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotImplemented` if the tensor is not DMA-backed.
+    #[cfg(target_os = "linux")]
+    pub fn dmabuf(&self) -> Result<std::os::fd::BorrowedFd<'_>> {
+        use std::os::fd::AsFd;
+        match &self.storage {
+            TensorStorage::Dma(dma) => Ok(dma.fd.as_fd()),
+            _ => Err(Error::NotImplemented(format!(
+                "dmabuf requires DMA-backed tensor, got {:?}",
+                self.storage.memory()
+            ))),
         }
     }
 

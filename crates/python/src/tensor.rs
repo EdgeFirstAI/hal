@@ -414,6 +414,29 @@ impl PyTensor {
         Ok(self.0.reshape(&shape)?)
     }
 
+    /// Attach pixel format metadata to this tensor.
+    ///
+    /// Validates that the tensor's shape is compatible with the format's
+    /// layout (packed, planar, or semi-planar). This enables
+    /// `from_fd()` tensors to be used as image conversion destinations.
+    fn set_format(&mut self, format: crate::image::PyPixelFormat) -> Result<()> {
+        use edgefirst_hal::tensor::PixelFormat;
+        let fmt: PixelFormat = format.into();
+        Ok(self.0.set_format(fmt)?)
+    }
+
+    /// Clone the DMA-BUF file descriptor backing this tensor.
+    ///
+    /// Returns a new file descriptor that the caller must close.
+    ///
+    /// Raises RuntimeError if the tensor is not DMA-backed or if the
+    /// fd clone syscall fails.
+    #[cfg(target_os = "linux")]
+    fn dmabuf_clone(&self) -> Result<RawFd> {
+        let owned = self.0.dmabuf_clone()?;
+        Ok(owned.into_raw_fd())
+    }
+
     fn map(&self) -> Result<PyTensorMap> {
         Ok(PyTensorMap {
             mapped: Some(map_tensor_dyn(&self.0)?),
