@@ -7,6 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-03-22
+
+### Added
+
+- **Zero-copy external buffer rendering** (`create_image_from_fd`) across
+  Rust, C, and Python APIs. Enables GPU rendering directly into a
+  caller-owned DMA-BUF — eliminating the `memcpy` between HAL's output
+  buffer and an NPU delegate's input buffer. The caller retains ownership
+  of the fd; HAL borrows it via `dup(fd)`.
+
+  **Rust:**
+  ```rust,ignore
+  let mut dst = processor.create_image_from_fd(
+      vx_fd.as_fd(), 640, 640, PixelFormat::Rgb, DType::U8,
+  )?;
+  processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::letterbox())?;
+  ```
+
+  **Python:**
+  ```python
+  dst = processor.create_image_from_fd(vx_fd, 640, 640, ef.PixelFormat.Rgb)
+  processor.convert(src, dst)
+  ```
+
+  **C:**
+  ```c
+  struct hal_tensor *dst = hal_image_processor_create_image_from_fd(
+      proc, vx_fd, 640, 640, HAL_FOURCC_RGB, HAL_DTYPE_U8);
+  ```
+
+  Returns `Error::NotSupported` if the fd is not DMA-backed (e.g. POSIX
+  shm fd), ensuring the zero-copy contract is enforced at the API boundary.
+
+- **Tensor pixel-format metadata** — `TensorDyn::set_format()` and
+  `TensorDyn::with_format()` attach a `PixelFormat` to any tensor,
+  enabling `convert()` to use raw tensors created via `from_fd()` or
+  `Tensor::new()` as image destinations without going through
+  `create_image()`. Shape validation ensures the format matches the
+  tensor dimensions. Available in Python (`Tensor.set_format()`) and
+  C (`hal_tensor_set_format()`).
+
+- **DMA-BUF fd accessors** — `TensorDyn::dmabuf()` (borrows the fd) and
+  `TensorDyn::dmabuf_clone()` (returns an owned duplicate) for exporting
+  HAL-allocated DMA-BUF buffers to external consumers.
+  `Tensor::<T>::dmabuf()` provides the same on typed tensors. Available
+  in Python (`Tensor.dmabuf_clone()`) and C (`hal_tensor_dmabuf_clone()`).
+
+  Use case: HAL allocates via `create_image()`, consumer imports the fd:
+  ```rust,ignore
+  let hal_dst = processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None)?;
+  let fd = hal_dst.dmabuf_clone()?;  // Error if not DMA-backed
+  delegate.register_buffer(fd)?;
+  ```
+
+- PyPI README (`crates/python/README.md`) with quick-start, zero-copy
+  external buffer examples, and platform support matrix
+
+### Removed
+
+- **`hal_image_processor_convert_ref`** — removed from Rust, C header, and
+  ARCHITECTURE.md. This function was redundant with the `hal_tensor_set_format()`
+  + `hal_image_processor_convert()` two-step and had been a recurring source of
+  safety bugs (use-after-free in v0.9, unsound `ptr::read`/`ManuallyDrop` in
+  v0.10.0). Callers should use:
+  ```c
+  hal_tensor_set_format(dst, fourcc);
+  hal_image_processor_convert(proc, src, dst, rotation, flip, crop);
+  ```
+
+### Fixed
+
+- Corrected errno documentation for `hal_image_processor_create_image_from_fd`
+  in both Rust doc comments and `hal.h` header: `InvalidShape` / `NotAnImage`
+  map to `EINVAL` (not `EIO`)
+
 ## [0.10.0] - 2026-03-20
 
 ### Changed

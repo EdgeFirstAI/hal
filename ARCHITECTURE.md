@@ -158,7 +158,6 @@ classDiagram
     class ImageProcessorTrait {
         <<trait>>
         +convert(src, dst, rotation, flip, crop)
-        +convert_ref(src, dst_ref, rotation, flip, crop)
         +draw_masks(dst, detections, segmentations)
         +draw_masks_proto(dst, detections, proto_data)
         +decode_masks_atlas(detections, proto_data, w, h)

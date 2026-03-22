@@ -1465,33 +1465,6 @@ int hal_image_processor_convert(struct hal_image_processor *processor,
                                 const struct hal_crop *crop);
 
 /**
- * Convert an image into a borrowed tensor reference.
- *
- * This enables zero-copy preprocessing directly into a model's pre-allocated
- * input buffer. The destination tensor must be u8 dtype with a 3D shape
- * matching the specified output format.
- *
- * @param processor Image processor handle
- * @param src Source image tensor
- * @param dst_tensor Destination u8 tensor (not consumed, must remain valid)
- * @param dst_fourcc Output pixel format for the destination
- * @param rotation Rotation to apply
- * @param flip Flip to apply
- * @param crop Crop configuration (can be NULL for no crop)
- * @return 0 on success, -1 on error
- * @par Errors (errno):
- * - EINVAL: Invalid argument (NULL processor/src/dst_tensor, wrong dtype, invalid shape)
- * - EIO: Conversion failed
- */
-int hal_image_processor_convert_ref(struct hal_image_processor *processor,
-                                    const struct hal_tensor *src,
-                                    struct hal_tensor *dst_tensor,
-                                    enum hal_fourcc dst_fourcc,
-                                    enum hal_rotation rotation,
-                                    enum hal_flip flip,
-                                    const struct hal_crop *crop);
-
-/**
  * Draw detection boxes and segmentation masks onto an image.
  *
  * Draws bounding boxes (with labels) and segmentation overlays on the
