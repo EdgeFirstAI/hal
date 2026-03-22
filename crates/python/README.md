@@ -83,6 +83,40 @@ dst_i8 = processor.create_image(640, 640, ef.PixelFormat.Rgb, dtype="int8")
 processor.convert(src, dst_i8)
 ```
 
+## Zero-Copy External Buffer (Linux)
+
+When integrating with an NPU delegate that owns DMA-BUF buffers, render
+directly into the delegate's buffer to eliminate a `memcpy`:
+
+```python
+import edgefirst_hal as ef
+
+processor = ef.ImageProcessor()
+src = ef.Tensor.load("frame.jpg", ef.PixelFormat.Rgb)
+
+# Render directly into the delegate's DMA-BUF — zero copies
+dst = processor.create_image_from_fd(vx_fd, 640, 640, ef.PixelFormat.Rgb)
+processor.convert(src, dst)
+
+# Reverse: HAL allocates, consumer imports the fd
+hal_dst = processor.create_image(640, 640, ef.PixelFormat.Rgb)
+fd = hal_dst.dmabuf_clone()  # Raises if not DMA-backed
+delegate.register(fd)
+```
+
+You can also attach format metadata to any raw tensor created via `from_fd()`:
+
+```python
+t = ef.Tensor.from_fd(some_fd, [480, 640, 3])
+t.set_format(ef.PixelFormat.Rgb)
+processor.convert(src, t)
+```
+
+**Performance tip:** When rotating through a pool of DMA-BUFs (e.g. 2-3
+from an NPU delegate), create the `Tensor` wrappers once at init and
+reuse them across frames. This avoids EGL image cache misses (~100-300us
+each on Vivante GPUs).
+
 ## YOLO Decoding
 
 ```python

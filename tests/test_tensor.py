@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import numpy as np
-from edgefirst_hal import Tensor, TensorMemory
+from edgefirst_hal import Tensor, TensorMemory, PixelFormat
 import os
+import sys
 import pytest
 import gc
 
@@ -547,3 +548,28 @@ def test_shm_fd_leak_with_from_fd():
     assert start_fds == end_fds, (
         f"File descriptor leak detected: {start_fds} -> {end_fds}"
     )
+
+
+def test_set_format_packed():
+    """set_format attaches pixel format metadata to a raw tensor."""
+    t = Tensor([480, 640, 3], dtype="uint8", mem=TensorMemory.MEM)
+    assert t.format is None
+    t.set_format(PixelFormat.Rgb)
+    assert t.format == PixelFormat.Rgb
+    assert t.width == 640
+    assert t.height == 480
+
+
+def test_set_format_rejects_wrong_shape():
+    """set_format raises RuntimeError when shape doesn't match format."""
+    t = Tensor([480, 640, 4], dtype="uint8", mem=TensorMemory.MEM)
+    with pytest.raises(RuntimeError):
+        t.set_format(PixelFormat.Rgb)  # expects 3 channels, got 4
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="DMA-BUF is Linux-only")
+def test_dmabuf_clone_mem_raises():
+    """dmabuf_clone raises RuntimeError on non-DMA tensors."""
+    t = Tensor([4, 4], dtype="float32", mem=TensorMemory.MEM)
+    with pytest.raises(RuntimeError):
+        t.dmabuf_clone()

@@ -149,6 +149,37 @@ let mut dst = TensorDyn::from(model_input);
 processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::letterbox())?;
 ```
 
+## Zero-Copy External Buffer (Linux)
+
+When integrating with an NPU delegate (e.g. VxDelegate) that owns its own
+DMA-BUF buffers, use `create_image_from_fd()` to render directly into the
+delegate's buffer — eliminating the `memcpy` between HAL's buffer and the
+delegate's buffer:
+
+```rust,ignore
+// UC1: Render into VxDelegate's DMA-BUF — zero copies
+let mut dst = processor.create_image_from_fd(
+    vx_fd.as_fd(),       // borrow — caller keeps ownership
+    640, 640,
+    PixelFormat::Rgb,
+    DType::U8,
+)?;
+processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::letterbox())?;
+// dst's backing memory IS vx_fd — no memcpy needed
+```
+
+For the reverse direction (HAL allocates, consumer imports):
+
+```rust,ignore
+let hal_dst = processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None)?;
+let fd = hal_dst.dmabuf_clone()?;  // Error if not DMA-backed
+vxdelegate.register_buffer(fd)?;
+```
+
+**Performance tip:** When rotating through a pool of DMA-BUFs (e.g. 2-3
+from VxDelegate), create the `TensorDyn` wrappers once at init and reuse
+them across frames. This avoids EGL image cache misses (~100-300us each).
+
 ## Multiplane NV12/NV16
 
 For V4L2 multi-planar DMA-BUF buffers (separate Y and UV file descriptors):

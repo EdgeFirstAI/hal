@@ -138,10 +138,88 @@ impl TensorDyn {
         dispatch!(self, reshape, shape)
     }
 
+    /// Attach pixel format metadata to this tensor.
+    ///
+    /// Validates that the tensor's shape is compatible with the format's
+    /// layout (packed, planar, or semi-planar).
+    ///
+    /// # Arguments
+    ///
+    /// * `format` - The pixel format to attach
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` on success, with the format stored as metadata on the tensor.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidShape` if the tensor shape doesn't match
+    /// the expected layout for the given format.
+    pub fn set_format(&mut self, format: PixelFormat) -> crate::Result<()> {
+        dispatch!(self, set_format, format)
+    }
+
+    /// Attach pixel format metadata, consuming and returning self.
+    ///
+    /// Enables builder-style chaining.
+    ///
+    /// # Arguments
+    ///
+    /// * `format` - The pixel format to attach
+    ///
+    /// # Returns
+    ///
+    /// The tensor with format metadata attached.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidShape` if the tensor shape doesn't match
+    /// the expected layout for the given format.
+    pub fn with_format(mut self, format: PixelFormat) -> crate::Result<Self> {
+        self.set_format(format)?;
+        Ok(self)
+    }
+
     /// Clone the file descriptor associated with this tensor.
     #[cfg(unix)]
     pub fn clone_fd(&self) -> crate::Result<std::os::fd::OwnedFd> {
         dispatch!(self, clone_fd)
+    }
+
+    /// Clone the DMA-BUF file descriptor backing this tensor (Linux only).
+    ///
+    /// # Returns
+    ///
+    /// An owned duplicate of the DMA-BUF file descriptor.
+    ///
+    /// # Errors
+    ///
+    /// * `Error::NotImplemented` if the tensor is not DMA-backed (Mem/Shm/Pbo)
+    /// * `Error::IoError` if the fd clone syscall fails (e.g., fd limit reached)
+    #[cfg(target_os = "linux")]
+    pub fn dmabuf_clone(&self) -> crate::Result<std::os::fd::OwnedFd> {
+        if self.memory() != TensorMemory::Dma {
+            return Err(crate::Error::NotImplemented(format!(
+                "dmabuf_clone requires DMA-backed tensor, got {:?}",
+                self.memory()
+            )));
+        }
+        self.clone_fd()
+    }
+
+    /// Borrow the DMA-BUF file descriptor backing this tensor (Linux only).
+    ///
+    /// # Returns
+    ///
+    /// A borrowed reference to the DMA-BUF file descriptor, tied to `self`'s
+    /// lifetime.
+    ///
+    /// # Errors
+    ///
+    /// * `Error::NotImplemented` if the tensor is not DMA-backed
+    #[cfg(target_os = "linux")]
+    pub fn dmabuf(&self) -> crate::Result<std::os::fd::BorrowedFd<'_>> {
+        dispatch!(self, dmabuf)
     }
 
     /// Return `true` if this tensor uses separate plane allocations.
@@ -373,5 +451,107 @@ mod tests {
         let dyn_t = TensorDyn::image(640, 480, PixelFormat::Rgb, DType::I8, None).unwrap();
         assert_eq!(dyn_t.dtype(), DType::I8);
         assert_eq!(dyn_t.format(), Some(PixelFormat::Rgb));
+    }
+
+    #[test]
+    fn set_format_packed() {
+        let mut t = TensorDyn::new(&[480, 640, 3], DType::U8, None, None).unwrap();
+        assert_eq!(t.format(), None);
+        t.set_format(PixelFormat::Rgb).unwrap();
+        assert_eq!(t.format(), Some(PixelFormat::Rgb));
+        assert_eq!(t.width(), Some(640));
+        assert_eq!(t.height(), Some(480));
+    }
+
+    #[test]
+    fn set_format_planar() {
+        let mut t = TensorDyn::new(&[3, 480, 640], DType::U8, None, None).unwrap();
+        t.set_format(PixelFormat::PlanarRgb).unwrap();
+        assert_eq!(t.format(), Some(PixelFormat::PlanarRgb));
+        assert_eq!(t.width(), Some(640));
+        assert_eq!(t.height(), Some(480));
+    }
+
+    #[test]
+    fn set_format_rejects_wrong_shape() {
+        let mut t = TensorDyn::new(&[480, 640, 4], DType::U8, None, None).unwrap();
+        assert!(t.set_format(PixelFormat::Rgb).is_err());
+    }
+
+    #[test]
+    fn with_format_builder() {
+        let t = TensorDyn::new(&[480, 640, 4], DType::U8, None, None)
+            .unwrap()
+            .with_format(PixelFormat::Rgba)
+            .unwrap();
+        assert_eq!(t.format(), Some(PixelFormat::Rgba));
+        assert_eq!(t.width(), Some(640));
+        assert_eq!(t.height(), Some(480));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dmabuf_clone_mem_tensor_fails() {
+        let t = TensorDyn::new(&[480, 640, 3], DType::U8, Some(TensorMemory::Mem), None).unwrap();
+        assert_eq!(t.memory(), TensorMemory::Mem);
+        assert!(t.dmabuf_clone().is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dmabuf_mem_tensor_fails() {
+        let t = TensorDyn::new(&[480, 640, 3], DType::U8, Some(TensorMemory::Mem), None).unwrap();
+        assert!(t.dmabuf().is_err());
+    }
+
+    #[test]
+    fn set_format_semi_planar_nv12() {
+        // 720 rows = 480 * 3/2 (NV12: height + height/2 for chroma)
+        let mut t = TensorDyn::new(&[720, 640], DType::U8, Some(TensorMemory::Mem), None).unwrap();
+        t.set_format(PixelFormat::Nv12).unwrap();
+        assert_eq!(t.format(), Some(PixelFormat::Nv12));
+        assert_eq!(t.width(), Some(640));
+        assert_eq!(t.height(), Some(480));
+    }
+
+    #[test]
+    fn set_format_semi_planar_nv16() {
+        // 960 rows = 480 * 2 (NV16: height + height for chroma)
+        let mut t = TensorDyn::new(&[960, 640], DType::U8, Some(TensorMemory::Mem), None).unwrap();
+        t.set_format(PixelFormat::Nv16).unwrap();
+        assert_eq!(t.format(), Some(PixelFormat::Nv16));
+        assert_eq!(t.width(), Some(640));
+        assert_eq!(t.height(), Some(480));
+    }
+
+    #[test]
+    fn with_format_rejects_wrong_shape() {
+        let result = TensorDyn::new(&[480, 640, 4], DType::U8, None, None)
+            .unwrap()
+            .with_format(PixelFormat::Rgb);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn set_format_preserved_after_rejection() {
+        let mut t = TensorDyn::new(&[480, 640, 3], DType::U8, None, None).unwrap();
+        t.set_format(PixelFormat::Rgb).unwrap();
+        assert_eq!(t.format(), Some(PixelFormat::Rgb));
+
+        // Rgba requires 4 channels, should fail on a 3-channel tensor
+        assert!(t.set_format(PixelFormat::Rgba).is_err());
+
+        // Original format should be preserved
+        assert_eq!(t.format(), Some(PixelFormat::Rgb));
+    }
+
+    #[test]
+    fn set_format_idempotent() {
+        let mut t = TensorDyn::new(&[480, 640, 3], DType::U8, None, None).unwrap();
+        t.set_format(PixelFormat::Rgb).unwrap();
+        t.set_format(PixelFormat::Rgb).unwrap();
+        assert_eq!(t.format(), Some(PixelFormat::Rgb));
+        assert_eq!(t.width(), Some(640));
+        assert_eq!(t.height(), Some(480));
     }
 }

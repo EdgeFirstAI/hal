@@ -457,6 +457,7 @@ pub unsafe extern "C" fn hal_tensor_clone_fd(tensor: *const HalTensor) -> c_int 
     check_null!(tensor);
     match unsafe { &*tensor }.inner.clone_fd() {
         Ok(fd) => fd.into_raw_fd(),
+        Err(edgefirst_tensor::Error::NotImplemented(_)) => set_error(libc::ENOTSUP),
         Err(_) => set_error(libc::EIO),
     }
 }
@@ -465,6 +466,38 @@ pub unsafe extern "C" fn hal_tensor_clone_fd(tensor: *const HalTensor) -> c_int 
 #[no_mangle]
 #[cfg(not(unix))]
 pub unsafe extern "C" fn hal_tensor_clone_fd(_tensor: *const HalTensor) -> c_int {
+    set_error(libc::ENOTSUP)
+}
+
+/// Clone the DMA-BUF file descriptor backing a tensor.
+///
+/// Unlike hal_tensor_clone_fd(), this function returns a clear error if the
+/// tensor is not DMA-backed, rather than a generic I/O error. Use this when
+/// you specifically need a DMA-BUF fd for zero-copy hardware import.
+///
+/// Creates a new owned file descriptor that the caller must close().
+///
+/// @param tensor Tensor handle
+/// @return New file descriptor on success, -1 on error
+/// @par Errors (errno):
+/// - EINVAL: NULL tensor
+/// - ENOTSUP: Tensor is not DMA-backed (Mem, Shm, or Pbo)
+/// - EIO: Failed to clone file descriptor
+#[no_mangle]
+#[cfg(target_os = "linux")]
+pub unsafe extern "C" fn hal_tensor_dmabuf_clone(tensor: *const HalTensor) -> c_int {
+    check_null!(tensor);
+    match unsafe { &*tensor }.inner.dmabuf_clone() {
+        Ok(fd) => fd.into_raw_fd(),
+        Err(edgefirst_tensor::Error::NotImplemented(_)) => set_error(libc::ENOTSUP),
+        Err(_) => set_error(libc::EIO),
+    }
+}
+
+/// Clone DMA-BUF fd stub for non-Linux platforms.
+#[no_mangle]
+#[cfg(not(target_os = "linux"))]
+pub unsafe extern "C" fn hal_tensor_dmabuf_clone(_tensor: *const HalTensor) -> c_int {
     set_error(libc::ENOTSUP)
 }
 
@@ -1075,6 +1108,33 @@ mod tests {
 
             // NULL tensor should return -1
             assert_eq!(hal_tensor_clone_fd(std::ptr::null()), -1);
+
+            hal_tensor_free(tensor);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_tensor_dmabuf_clone_mem_tensor() {
+        unsafe {
+            let shape: [size_t; 2] = [4, 4];
+            let tensor = hal_tensor_new(
+                HalDtype::F32,
+                shape.as_ptr(),
+                shape.len(),
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert!(!tensor.is_null());
+
+            // MEM tensors are not DMA-backed, should return -1 with ENOTSUP
+            let fd = hal_tensor_dmabuf_clone(tensor);
+            assert_eq!(fd, -1);
+            assert_eq!(errno::errno().0, libc::ENOTSUP);
+
+            // NULL tensor should return -1 with EINVAL
+            assert_eq!(hal_tensor_dmabuf_clone(std::ptr::null()), -1);
+            assert_eq!(errno::errno().0, libc::EINVAL);
 
             hal_tensor_free(tensor);
         }
