@@ -23,7 +23,6 @@ use crate::{
     DecoderError, DetectBox, ProtoData, Quantization, Segmentation, XYWH,
 };
 
-
 macro_rules! dequant_3d {
     ($tensor:expr, $config:expr, $quant:expr) => {{
         with_quantized!($tensor, t, {
@@ -1583,7 +1582,6 @@ macro_rules! process_tracked_yolo_segmentation_split {
         mask_data
     }};
 }
-
 
 #[cfg(feature = "tracker")]
 use edgefirst_tracker::TrackInfo;
