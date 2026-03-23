@@ -23,6 +23,32 @@ use crate::{
     DecoderError, DetectBox, ProtoData, Quantization, Segmentation, XYWH,
 };
 
+
+macro_rules! dequant_3d {
+    ($tensor:expr, $config:expr, $quant:expr) => {{
+        with_quantized!($tensor, t, {
+            let t = Self::swap_axes_if_needed(t, $config.into());
+            let t = t.slice(s![0, .., ..]);
+            t.map(|v| {
+                let val: f32 = v.as_();
+                (val - $quant.zero_point as f32) * $quant.scale
+            })
+        })
+    }};
+}
+macro_rules! dequant_4d {
+    ($tensor:expr, $config:expr, $quant:expr) => {{
+        with_quantized!($tensor, t, {
+            let t = Self::swap_axes_if_needed(t, $config.into());
+            let t = t.slice(s![0, .., .., ..]);
+            t.map(|v| {
+                let val: f32 = v.as_();
+                (val - $quant.zero_point as f32) * $quant.scale
+            })
+        })
+    }};
+}
+
 impl Decoder {
     pub(super) fn decode_modelpack_det_quantized(
         &self,
@@ -726,33 +752,6 @@ impl Decoder {
             .map(Quantization::from)
             .unwrap_or_default();
 
-        // Dequantize each tensor independently to avoid monomorphization explosion.
-        // Nesting 2 with_quantized! calls produces 6^2 = 36 instantiations; sequential is 6*2 = 12.
-        macro_rules! dequant_3d {
-            ($tensor:expr, $config:expr, $quant:expr) => {{
-                with_quantized!($tensor, t, {
-                    let t = Self::swap_axes_if_needed(t, $config.into());
-                    let t = t.slice(s![0, .., ..]);
-                    t.map(|v| {
-                        let val: f32 = v.as_();
-                        (val - $quant.zero_point as f32) * $quant.scale
-                    })
-                })
-            }};
-        }
-        macro_rules! dequant_4d {
-            ($tensor:expr, $config:expr, $quant:expr) => {{
-                with_quantized!($tensor, t, {
-                    let t = Self::swap_axes_if_needed(t, $config.into());
-                    let t = t.slice(s![0, .., .., ..]);
-                    t.map(|v| {
-                        let val: f32 = v.as_();
-                        (val - $quant.zero_point as f32) * $quant.scale
-                    })
-                })
-            }};
-        }
-
         let dequant_d = dequant_3d!(det_tensor, boxes_config, quant_det);
         let dequant_p = dequant_4d!(protos_tensor, protos_config, quant_protos);
 
@@ -901,21 +900,6 @@ impl Decoder {
             .map(Quantization::from)
             .unwrap_or_default();
 
-        // Dequantize each tensor independently to avoid monomorphization explosion.
-        // Nesting N with_quantized! calls produces 6^N instantiations; sequential is 6*N.
-        macro_rules! dequant_3d {
-            ($tensor:expr, $config:expr, $quant:expr) => {{
-                with_quantized!($tensor, t, {
-                    let t = Self::swap_axes_if_needed(t, $config.into());
-                    let t = t.slice(s![0, .., ..]);
-                    t.map(|v| {
-                        let val: f32 = v.as_();
-                        (val - $quant.zero_point as f32) * $quant.scale
-                    })
-                })
-            }};
-        }
-
         let dequant_b = dequant_3d!(boxes_tensor, boxes_config, quant_boxes);
         let dequant_s = dequant_3d!(scores_tensor, scores_config, quant_scores);
         let dequant_c = dequant_3d!(classes_tensor, classes_config, quant_classes);
@@ -979,33 +963,6 @@ impl Decoder {
             .quantization
             .map(Quantization::from)
             .unwrap_or_default();
-
-        // Dequantize each tensor independently to avoid monomorphization explosion.
-        // Nesting 5 with_quantized! calls would produce 6^5 = 7776 instantiations.
-        macro_rules! dequant_3d {
-            ($tensor:expr, $config:expr, $quant:expr) => {{
-                with_quantized!($tensor, t, {
-                    let t = Self::swap_axes_if_needed(t, $config.into());
-                    let t = t.slice(s![0, .., ..]);
-                    t.map(|v| {
-                        let val: f32 = v.as_();
-                        (val - $quant.zero_point as f32) * $quant.scale
-                    })
-                })
-            }};
-        }
-        macro_rules! dequant_4d {
-            ($tensor:expr, $config:expr, $quant:expr) => {{
-                with_quantized!($tensor, t, {
-                    let t = Self::swap_axes_if_needed(t, $config.into());
-                    let t = t.slice(s![0, .., .., ..]);
-                    t.map(|v| {
-                        let val: f32 = v.as_();
-                        (val - $quant.zero_point as f32) * $quant.scale
-                    })
-                })
-            }};
-        }
 
         let dequant_b = dequant_3d!(boxes_tensor, boxes_config, quant_boxes);
         let dequant_s = dequant_3d!(scores_tensor, scores_config, quant_scores);
@@ -1302,33 +1259,6 @@ impl Decoder {
             .map(Quantization::from)
             .unwrap_or_default();
 
-        // Dequantize each tensor independently to avoid monomorphization explosion.
-        // Nesting 2 with_quantized! calls produces 6^2 = 36 instantiations; sequential is 6*2 = 12.
-        macro_rules! dequant_3d {
-            ($tensor:expr, $config:expr, $quant:expr) => {{
-                with_quantized!($tensor, t, {
-                    let t = Self::swap_axes_if_needed(t, $config.into());
-                    let t = t.slice(s![0, .., ..]);
-                    t.map(|v| {
-                        let val: f32 = v.as_();
-                        (val - $quant.zero_point as f32) * $quant.scale
-                    })
-                })
-            }};
-        }
-        macro_rules! dequant_4d {
-            ($tensor:expr, $config:expr, $quant:expr) => {{
-                with_quantized!($tensor, t, {
-                    let t = Self::swap_axes_if_needed(t, $config.into());
-                    let t = t.slice(s![0, .., .., ..]);
-                    t.map(|v| {
-                        let val: f32 = v.as_();
-                        (val - $quant.zero_point as f32) * $quant.scale
-                    })
-                })
-            }};
-        }
-
         let dequant_d = dequant_3d!(det_tensor, boxes_config, quant_det);
         let dequant_p = dequant_4d!(protos_tensor, protos_config, quant_protos);
 
@@ -1445,31 +1375,6 @@ impl Decoder {
             .quantization
             .map(Quantization::from)
             .unwrap_or_default();
-
-        macro_rules! dequant_3d {
-            ($tensor:expr, $config:expr, $quant:expr) => {{
-                with_quantized!($tensor, t, {
-                    let t = Self::swap_axes_if_needed(t, $config.into());
-                    let t = t.slice(s![0, .., ..]);
-                    t.map(|v| {
-                        let val: f32 = v.as_();
-                        (val - $quant.zero_point as f32) * $quant.scale
-                    })
-                })
-            }};
-        }
-        macro_rules! dequant_4d {
-            ($tensor:expr, $config:expr, $quant:expr) => {{
-                with_quantized!($tensor, t, {
-                    let t = Self::swap_axes_if_needed(t, $config.into());
-                    let t = t.slice(s![0, .., .., ..]);
-                    t.map(|v| {
-                        let val: f32 = v.as_();
-                        (val - $quant.zero_point as f32) * $quant.scale
-                    })
-                })
-            }};
-        }
 
         let dequant_b = dequant_3d!(boxes_tensor, boxes_config, quant_boxes);
         let dequant_s = dequant_3d!(scores_tensor, scores_config, quant_scores);
@@ -1679,30 +1584,6 @@ macro_rules! process_tracked_yolo_segmentation_split {
     }};
 }
 
-macro_rules! dequant_3d {
-    ($tensor:expr, $config:expr, $quant:expr) => {{
-        with_quantized!($tensor, t, {
-            let t = Self::swap_axes_if_needed(t, $config.into());
-            let t = t.slice(s![0, .., ..]);
-            t.map(|v| {
-                let val: f32 = v.as_();
-                (val - $quant.zero_point as f32) * $quant.scale
-            })
-        })
-    }};
-}
-macro_rules! dequant_4d {
-    ($tensor:expr, $config:expr, $quant:expr) => {{
-        with_quantized!($tensor, t, {
-            let t = Self::swap_axes_if_needed(t, $config.into());
-            let t = t.slice(s![0, .., .., ..]);
-            t.map(|v| {
-                let val: f32 = v.as_();
-                (val - $quant.zero_point as f32) * $quant.scale
-            })
-        })
-    }};
-}
 
 #[cfg(feature = "tracker")]
 use edgefirst_tracker::TrackInfo;
@@ -2118,6 +1999,7 @@ impl Decoder {
         .flatten()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn process_tracked_yolo_end_to_end_segdet_quantized<
         TR: edgefirst_tracker::Tracker<DetectBox>,
         M,
@@ -2229,6 +2111,7 @@ impl Decoder {
         .flatten()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn process_tracked_yolo_split_end_to_end_segdet_float<
         T,
         TR: edgefirst_tracker::Tracker<DetectBox>,
@@ -2366,6 +2249,7 @@ impl Decoder {
         .flatten()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn process_tracked_yolo_split_end_to_end_segdet_quantized<
         TR: edgefirst_tracker::Tracker<DetectBox>,
         M,
