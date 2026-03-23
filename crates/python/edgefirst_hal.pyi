@@ -1382,7 +1382,9 @@ class TrackInfo:
 class ActiveTrackInfo:
     def __init__(self,
                  info: TrackInfo,
-                 last_box: Tuple[Tuple[float, float, float, float], float, int]) -> None:
+                 bbox: Tuple[float, float, float, float],
+                 score: float,
+                 label: int) -> None:
         """Information about an actively tracked object."""
         ...
 
