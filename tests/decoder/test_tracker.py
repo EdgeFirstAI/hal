@@ -94,3 +94,35 @@ def test_yolo_seg():
     last_updates = [track.last_updated for track in tracks]
     assert last_updates == [300_000_000, 300_000_000]
     assert len(masks) == 2
+
+
+def test_new_track_info():
+    track_info = edgefirst_hal.TrackInfo(
+        uuid="123e4567e89b12d3a456426614174000",
+        tracked_location=(0.1, 0.2, 0.3, 0.4),
+        count=1,
+        created=100_000_000,
+        last_updated=100_000_000,
+    )
+    assert track_info.uuid == "123e4567-e89b-12d3-a456-426614174000"
+    assert np.allclose(track_info.tracked_location, [0.1, 0.2, 0.3, 0.4], atol=1e-5)
+    assert track_info.count == 1
+    assert track_info.created == 100_000_000
+    assert track_info.last_updated == 100_000_000
+
+
+def test_new_active_track_info():
+    track_info = edgefirst_hal.TrackInfo(
+        uuid="123e4567e89b12d3a456426614174000",
+        tracked_location=(0.1, 0.2, 0.3, 0.4),
+        count=1,
+        created=100_000_000,
+        last_updated=100_000_000,
+    )
+    active_track_info = edgefirst_hal.ActiveTrackInfo(
+        track_info, (0.1, 0.2, 0.3, 0.4), 0.3, 2
+    )
+    assert active_track_info.info.uuid == "123e4567-e89b-12d3-a456-426614174000"
+    assert np.allclose(active_track_info.last_box[0], [0.1, 0.2, 0.3, 0.4], atol=1e-5)
+    assert np.isclose(active_track_info.last_box[1], 0.3, atol=1e-5)
+    assert active_track_info.last_box[2] == 2
