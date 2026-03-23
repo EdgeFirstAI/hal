@@ -1,7 +1,7 @@
 # EdgeFirst Hardware Abstraction Layer - Architecture
 
-**Version:** 2.6
-**Last Updated:** March 4, 2026
+**Version:** 2.8
+**Last Updated:** March 18, 2026
 **Status:** Production
 **Audience:** Developers contributing to EdgeFirst HAL or integrating it into applications
 
@@ -158,7 +158,6 @@ classDiagram
     class ImageProcessorTrait {
         <<trait>>
         +convert(src, dst, rotation, flip, crop)
-        +convert_ref(src, dst_ref, rotation, flip, crop)
         +draw_masks(dst, detections, segmentations)
         +draw_masks_proto(dst, detections, proto_data)
         +decode_masks_atlas(detections, proto_data, w, h)
@@ -170,7 +169,7 @@ classDiagram
         g2d: Option~G2DProcessor~
         opengl: Option~GLProcessorThreaded~
         +new() orchestrator with fallback chain
-        +create_image(w, h, fourcc) GPU-optimal alloc
+        +create_image(w, h, PixelFormat, DType, Option~TensorMemory~) GPU-optimal alloc
     }
 
     class G2DProcessor {
@@ -212,67 +211,75 @@ classDiagram
 - Crop and region-of-interest
 - Instance segmentation mask rendering (draw and decode workflows)
 
-**TensorImage**:
+**TensorDyn (Image Representation)**:
 
-`TensorImage` wraps `Tensor<u8>` with pixel format metadata:
+`TensorDyn` is the type-erased tensor enum that serves as the primary image type.
+It wraps `Tensor<T>` variants for different element types and carries an optional
+`PixelFormat` describing the spatial pixel layout. The format and element type are
+orthogonal: `PixelFormat` describes the spatial arrangement (e.g. packed RGB,
+semi-planar NV12) while `DType` describes the element storage (e.g. `U8`, `I8`,
+`F32`).
 
 ```rust
-pub struct TensorImage {
-    tensor: Tensor<u8>,
-    fourcc: FourCharCode,
-    is_planar: bool,
+pub struct Tensor<T> {
+    storage: TensorStorage<T>,
+    format: Option<PixelFormat>,
+    /// Second plane for multiplane NV12/NV16 (separate DMA-BUF allocation).
+    chroma: Option<Box<Tensor<T>>>,
 }
 ```
 
-Width, height, channels, and stride are **not stored** — they are computed from the tensor shape and FourCC on every access. The tensor shape encoding depends on the pixel format:
+The `chroma` field supports multi-plane DMA-BUF NV12/NV16 where Y and UV planes
+are in separate allocations (common with V4L2 `NV12M` format). Constructed via
+`Tensor::from_planes()`. See [Appendix A: Multi-Plane DMA-BUF](#appendix-a-multi-plane-dma-buf-limitation) for details.
+
+Image construction uses `TensorDyn::image(w, h, PixelFormat, DType, mem)` which
+allocates the appropriate tensor shape and sets the pixel format metadata.
+
+Width, height, channels, and stride are **not stored** — they are computed from the tensor shape and `PixelFormat` on every access. The tensor shape encoding depends on the pixel format:
 
 | Format | Tensor Shape | Notes |
 |--------|-------------|-------|
-| RGB, RGBA, BGRA, GREY, YUYV, VYUY | `[H, W, C]` | Interleaved (channels-last) |
-| PLANAR_RGB, PLANAR_RGBA, PLANAR_RGB_INT8 | `[C, H, W]` | Channels-first |
-| NV12 | `[H*3/2, W]` | 2D — Y plane (H rows) + UV plane (H/2 rows) |
-| NV16 | `[H*2, W]` | 2D — Y plane (H rows) + UV plane (H rows) |
+| Rgb, Rgba, Bgra, Grey, Yuyv, Vyuy | `[H, W, C]` | Interleaved (channels-last) |
+| PlanarRgb, PlanarRgba | `[C, H, W]` | Channels-first |
+| Nv12 | `[H*3/2, W]` | 2D — Y plane (H rows) + UV plane (H/2 rows) |
+| Nv16 | `[H*2, W]` | 2D — Y plane (H rows) + UV plane (H rows) |
 
-**`TensorImageRef<'a>`** is a borrowed variant wrapping `&'a mut Tensor<u8>` instead of owning it. This enables zero-copy writes directly into a model's pre-allocated input tensor.
+**PixelFormat Enum**:
 
-**`TensorImageDst`** trait abstracts over `TensorImage` (owned) and `TensorImageRef` (borrowed) so all image processor implementations can accept either as a destination.
+Pixel formats are variants of the `PixelFormat` enum defined in the tensor crate.
+Int8 variants use `DType::I8` with any `PixelFormat` rather than separate format constants.
 
-**Pixel Format Constants**:
-
-Pixel formats are `FourCharCode` values defined in the image crate:
-
-| Constant | FourCC | Description |
-|----------|--------|-------------|
-| `YUYV` | `"YUYV"` | 8-bit YUV 4:2:2 interleaved |
-| `VYUY` | `"VYUY"` | 8-bit YUV 4:2:2 (VYUY byte order) |
-| `NV12` | `"NV12"` | 8-bit semi-planar YUV 4:2:0 |
-| `NV16` | `"NV16"` | 8-bit semi-planar YUV 4:2:2 |
-| `RGBA` | `"RGBA"` | 8-bit RGBA |
-| `BGRA` | `"BGRA"` | 8-bit BGRA (Cairo/Wayland native) |
-| `RGB` | `"RGB "` | 8-bit RGB |
-| `GREY` | `"Y800"` | 8-bit grayscale |
-| `PLANAR_RGB` | `"8BPS"` | 8-bit channels-first RGB |
-| `PLANAR_RGBA` | `"8BPA"` | 8-bit channels-first RGBA |
-| `RGB_INT8` | `"RGBi"` | Packed RGB with uint8→int8 XOR 0x80 reinterpretation |
-| `PLANAR_RGB_INT8` | `"8BPi"` | Planar RGB with uint8→int8 XOR 0x80 reinterpretation |
+| Variant | Display | Channels | Layout |
+|---------|---------|----------|--------|
+| `PixelFormat::Rgb` | RGB | 3 | Packed |
+| `PixelFormat::Rgba` | RGBA | 4 | Packed |
+| `PixelFormat::Bgra` | BGRA | 4 | Packed |
+| `PixelFormat::Grey` | Y800 | 1 | Packed |
+| `PixelFormat::Yuyv` | YUYV | 2 | Packed |
+| `PixelFormat::Vyuy` | VYUY | 2 | Packed |
+| `PixelFormat::Nv12` | NV12 | 1 | SemiPlanar |
+| `PixelFormat::Nv16` | NV16 | 1 | SemiPlanar |
+| `PixelFormat::PlanarRgb` | PlanarRgb | 3 | Planar |
+| `PixelFormat::PlanarRgba` | PlanarRgba | 4 | Planar |
 
 **Planar RGB Format**:
-Planar RGB (FourCC: 8BPS) stores color channels in separate planes rather than interleaved. This format is particularly useful for:
+Planar RGB (`PixelFormat::PlanarRgb`) stores color channels in separate planes rather than interleaved. This format is particularly useful for:
 - Neural network preprocessing where planar layout is required
 - Hardware accelerators that prefer planar data
 - Efficient SIMD operations on individual color channels
 - GPU texture operations via OpenGL with swizzled grayscale textures
 
-**TensorImage Flow**:
+**Image Processing Flow**:
 ```mermaid
 flowchart TD
     Input[Input Image<br/>JPEG/PNG bytes or raw pixels]
-    TI[TensorImage<br/>Tensor&lt;u8&gt; + FourCC format]
+    TI[TensorDyn<br/>type-erased tensor + PixelFormat]
     Conv{ImageProcessor::convert<br/>Backend selection}
     G2D[G2D Acceleration<br/>NXP i.MX only]
     GL[OpenGL Acceleration<br/>GPU accelerated]
     CPU[CPU Fallback<br/>fast_image_resize]
-    Output[Output Image<br/>TensorImage or numpy array]
+    Output[Output Image<br/>TensorDyn or numpy array]
     
     Input --> TI
     TI --> Conv
@@ -299,7 +306,7 @@ selects the best available memory backend in priority order:
 
 ```mermaid
 flowchart TD
-    Create["ImageProcessor::create_image(w, h, fourcc)"]
+    Create["ImageProcessor::create_image(w, h, PixelFormat, DType, mem)"]
     DMA{DMA-buf roundtrip<br/>verified at init?}
     PBO{OpenGL PBO<br/>available?}
     Mem[MemTensor<br/>heap fallback]
@@ -367,13 +374,50 @@ and deadlock. Instead, the convert path dispatches to specialized methods:
 **Purpose**: Post-processing for object detection and segmentation model outputs.
 
 **Supported Decoders**:
-- **YOLO** (YOLOv5, YOLOv8, YOLOv11)
+- **YOLO** (YOLOv5, YOLOv8, YOLOv11, YOLOv26)
   - Object detection
   - Instance segmentation
   - Split output format support
+  - End-to-end models with embedded NMS (YOLOv26)
   - Mixed data type support (different types per input tensor)
 - **ModelPack** (Au-Zone proprietary format)
   - Detection with anchor-based decoding
+
+**YOLO26 End-to-End Support**:
+
+YOLOv26 models can be exported with embedded NMS (one-to-one matching heads),
+eliminating external NMS post-processing. The `DecoderVersion::Yolo26` variant
+triggers end-to-end model type selection:
+
+| Config Field | Value | Effect |
+|-------------|-------|--------|
+| `decoder_version` | `"yolo26"` | Selects end-to-end model types, bypasses NMS |
+| `decoder_version` | `"yolov8"` | Uses traditional model types with external NMS |
+
+When `decoder_version` is `"yolo26"`, `DecoderVersion::is_end_to_end()` returns
+`true` and the decoder selects one of the end-to-end `ModelType` variants:
+
+| ModelType | Tensors | Format |
+|-----------|---------|--------|
+| `YoloEndToEndDet` | 1 | `[batch, N, 6+]` — xyxy, conf, class |
+| `YoloEndToEndSegDet` | 2 | `[batch, N, 6+num_protos]` + protos |
+| `YoloSplitEndToEndDet` | 3 | boxes `[B,N,4]` + scores `[B,N,1]` + classes `[B,N,1]` |
+| `YoloSplitEndToEndSegDet` | 5 | boxes + scores + classes + mask_coeff + protos |
+
+For non-end-to-end YOLO26 exports (`end2end=false`), use `decoder_version: "yolov8"`
+with an explicit `nms` field (`ClassAgnostic` or `ClassAware`).
+
+**NMS Modes** (`Option<Nms>`):
+- `Some(Nms::ClassAgnostic)` — suppress overlapping boxes regardless of class (default)
+- `Some(Nms::ClassAware)` — only suppress boxes sharing the same class label
+- `None` — bypass NMS entirely (auto-set for end-to-end models)
+
+**Proto Mask API**:
+
+For segmentation models, `decode_quantized_proto()` and `decode_float_proto()`
+return raw proto data and mask coefficients without materializing pixel masks.
+These are the preferred entry point for fused GPU rendering via
+`ImageProcessor::draw_masks_proto()`.
 
 **Architecture**:
 ```mermaid
@@ -397,18 +441,28 @@ flowchart LR
 ```mermaid
 flowchart TD
     Raw[Model Raw Output<br/>quantized or float]
-    
+    E2E{End-to-end?<br/>decoder_version = yolo26}
+
     Quant{Quantized?}
     Dequant[Dequantization<br/>scale, zero_point]
-    
+
     Parse[Parse boxes & scores<br/>XYWH → XYXY conversion]
     NMS[Non-Maximum Suppression<br/>IoU threshold filtering]
     Filter[Filter by score threshold]
-    
+
+    E2EParse[Parse post-NMS output<br/>XYXY + conf + class directly]
+    E2EFilter[Filter by score threshold]
+
     Det[Detection boxes<br/>bbox, score, class]
     Seg[Segmentation masks<br/>per-box mask matrices]
-    
-    Raw --> Quant
+
+    Raw --> E2E
+    E2E -->|Yes| E2EParse
+    E2EParse --> E2EFilter
+    E2EFilter --> Det
+    E2EFilter --> Seg
+
+    E2E -->|No| Quant
     Quant -->|Yes| Dequant
     Quant -->|No| Parse
     Dequant --> Parse
@@ -416,10 +470,12 @@ flowchart TD
     NMS --> Filter
     Filter --> Det
     Filter --> Seg
-    
+
     style Raw fill:#e1f5ff
+    style E2E fill:#fff4e1
     style Dequant fill:#fff4e1
     style NMS fill:#ffeb9c
+    style E2EParse fill:#87ceeb
     style Det fill:#90ee90
     style Seg fill:#90ee90
 ```
@@ -593,11 +649,10 @@ flowchart TD
 **Purpose**: Expose HAL functionality to Python via PyO3.
 
 **Exposed Classes**:
-- `PyTensor`: Generic tensor with numpy buffer protocol
-- `PyTensorImage`: Image container with format metadata
-- `PyImageProcessor`: Image processing operations
-- `PyDecoder`: Model output decoding
-- `FourCC`, `Normalization`, `PyRect`, `PyRotation`, `PyFlip`: Configuration enums
+- `Tensor`: Unified tensor with image support and numpy buffer protocol
+- `ImageProcessor`: Image processing operations
+- `Decoder`: Model output decoding
+- `PixelFormat`, `Normalization`, `Rect`, `Rotation`, `Flip`: Configuration types
 
 **Python Integration**:
 ```mermaid
@@ -637,7 +692,7 @@ The `edgefirst_image` crate depends on `edgefirst_decoder` for the `DetectBox`, 
 | File | Lines | Scope |
 |------|------:|-------|
 | `tensor.rs` | ~1,200 | Tensor create, map, reshape, fd sharing |
-| `image.rs` | ~1,800 | ImageProcessor, TensorImage, convert, draw |
+| `image.rs` | ~1,800 | ImageProcessor, convert, draw |
 | `decoder.rs` | ~2,800 | Decoder create, decode detection/segmentation |
 | `tracker.rs` | ~300 | ByteTrack create, update |
 | `error.rs` | ~120 | Error handling utilities |
@@ -663,19 +718,21 @@ Used during development and CI to verify EGL/OpenGL support, benchmark RGB packi
 ### Pattern 1: Basic Image Conversion
 
 ```rust
-use edgefirst_hal::image::{TensorImage, ImageProcessor, RGB};
+use edgefirst_image::{load_image, ImageProcessor, ImageProcessorTrait, Rotation, Flip, Crop};
+use edgefirst_tensor::{PixelFormat, DType, TensorDyn};
 
 // Load image from JPEG
-let input = TensorImage::load("testdata/zidane.jpg", Some(RGB), None)?;
+let bytes = std::fs::read("testdata/zidane.jpg")?;
+let input = load_image(&bytes, Some(PixelFormat::Rgb), None)?;
 
 // Create converter (auto-selects best backend: G2D, OpenGL, CPU)
 let mut converter = ImageProcessor::new()?;
 
 // Create output buffer with optimal GPU memory (DMA > PBO > Mem)
-let mut output = converter.create_image(640, 640, RGB)?;
+let mut output = converter.create_image(640, 640, PixelFormat::Rgb, DType::U8, None)?;
 
 // Convert and resize — zero-copy if DMA or PBO backend is active
-converter.convert(&input, &mut output, Default::default())?;
+converter.convert(&input, &mut output, Rotation::None, Flip::None, Crop::default())?;
 ```
 
 ### Pattern 2: Detection Decoding
@@ -747,13 +804,13 @@ import edgefirst_hal as ef
 import numpy as np
 
 # Load image from file
-tensor_img = ef.TensorImage.load("testdata/zidane.jpg", ef.FourCC.RGB)
+tensor_img = ef.Tensor.load("testdata/zidane.jpg", ef.PixelFormat.Rgb)
 
 # Create converter
 converter = ef.ImageProcessor()
 
 # Create output image with optimal GPU memory (DMA > PBO > Mem)
-output = converter.create_image(640, 640, ef.FourCC.RGB)
+output = converter.create_image(640, 640, ef.PixelFormat.Rgb)
 
 # Resize with hardware acceleration
 converter.convert(tensor_img, output)
@@ -797,7 +854,7 @@ Raw FFI bindings are wrapped in safe Rust types that enforce correct usage at co
 
 ### 7. Python Wrapper Naming Convention
 
-Python wrapper types use a `Py` prefix (e.g., `PyTensor`, `PyTensorImage`) to clearly distinguish them from their Rust counterparts (`Tensor`, `TensorImage`). This convention makes it explicit which types are Python-facing and which are internal Rust types.
+Python wrapper types use a `Py` prefix (e.g., `PyTensor`, `PyPixelFormat`) to clearly distinguish them from their Rust counterparts. The Python `Tensor` class wraps `TensorDyn` internally. This convention makes it explicit which types are Python-facing and which are internal Rust types.
 
 ## EGL/GL Resource Cleanup at Process Shutdown
 
@@ -1046,7 +1103,7 @@ Decoder implementations use:
 
 All major types implement `Send + Sync`:
 - `Tensor<T>`: Safe to share across threads
-- `TensorImage`: Thread-safe
+- `TensorDyn`: Thread-safe
 - `ImageProcessor`: Thread-local (create per thread)
 - `Decoder`: Thread-safe for read operations
 
@@ -1084,7 +1141,6 @@ Consistent error handling throughout:
 - **zune-jpeg/zune-png**: Image decoding
 - **dma-heap**: Linux DMA allocation
 - **nix**: Unix system calls
-- **four-char-code**: FourCC format codes
 
 ### Internal Dependency Graph
 
@@ -1141,17 +1197,27 @@ hal/
 │   ├── tensor/             # Zero-copy tensor abstraction
 │   ├── image/              # Image processing HAL
 │   │   └── src/
-│   │       ├── lib.rs      # TensorImage, ImageProcessor, format constants
-│   │       ├── cpu.rs      # CPU format conversion, resize, masks
+│   │       ├── lib.rs      # load_image, save_jpeg, ImageProcessor
+│   │       ├── cpu/        # CPU format conversion, resize, masks
 │   │       ├── g2d.rs      # NXP G2D hardware accelerator
-│   │       ├── opengl_headless.rs  # EGL/OpenGL headless renderer
+│   │       ├── gl/         # EGL/OpenGL headless renderer
+│   │       │   ├── mod.rs      # Public types, Int8InterpolationMode
+│   │       │   ├── processor.rs # GPU rendering pipelines
+│   │       │   ├── shaders.rs  # GLSL shader generators
+│   │       │   ├── context.rs  # EGL context management
+│   │       │   ├── threaded.rs # Thread-safe wrapper
+│   │       │   ├── resources.rs # GL resource management
+│   │       │   └── cache.rs    # Shader/texture caching
 │   │       └── error.rs
 │   ├── decoder/            # Model output decoding
 │   │   └── src/
-│   │       ├── lib.rs      # Public API, DecoderBuilder
-│   │       ├── decoder.rs  # Core decode logic, config parsing
-│   │       ├── yolo.rs     # YOLO-specific decoding
-│   │       └── modelpack.rs # ModelPack format support
+│   │       ├── lib.rs      # Public API
+│   │       └── decoder/    # Core decode logic
+│   │           ├── mod.rs      # Decoder struct, decode methods
+│   │           ├── builder.rs  # DecoderBuilder, model type resolution
+│   │           ├── configs.rs  # ModelType, DecoderVersion, Nms enums
+│   │           ├── postprocess.rs # NMS, dequantization, box parsing
+│   │           └── helpers.rs  # Shared utilities
 │   ├── tracker/            # Object tracking (ByteTrack)
 │   ├── capi/               # C API bindings (cbindgen, staticlib/cdylib)
 │   ├── gpu-probe/          # GPU capability probing binary
@@ -1180,17 +1246,87 @@ tracker → (standalone — no internal crate deps)
 
 ### Notable File Sizes
 
-Several files are significantly larger than typical Rust modules:
+Several modules are significantly larger than typical Rust modules:
 
-| File | Lines | Content |
-|------|------:|---------|
-| `image/src/opengl_headless.rs` | ~7,700 | EGL context, GL processors, shaders, RAII types, tests |
-| `decoder/src/decoder.rs` | ~6,900 | Config parsing, decode logic, postprocessing |
-| `image/src/lib.rs` | ~4,700 | TensorImage, ImageProcessor, format helpers |
-| `image/src/cpu.rs` | ~3,700 | CPU format conversion, resize, mask rendering |
+| File / Module | Lines | Content |
+|---------------|------:|---------|
+| `image/src/gl/` (total) | ~8,600 | EGL context, GL processors, shaders, caching, tests |
+| `image/src/gl/processor.rs` | ~4,600 | GPU rendering pipelines (convert, masks, atlas) |
+| `decoder/src/decoder/` (total) | ~7,000 | Config parsing, decode logic, postprocessing, tests |
+| `image/src/lib.rs` | ~5,500 | load_image, save_jpeg, ImageProcessor |
 | `capi/src/decoder.rs` | ~2,800 | C API decoder bindings |
 
 ---
+
+## Appendix A: Multi-Plane DMA-BUF Limitation
+
+### Current State
+
+The HAL's DMA-BUF integration assumes a **single file descriptor per buffer**
+with all planes stored contiguously. This is baked into multiple layers:
+
+| Layer | Assumption | Code Location |
+|-------|-----------|---------------|
+| `DmaTensor<T>` | Single `fd: OwnedFd` field | `crates/tensor/src/dma.rs:31` |
+| `TensorTrait::from_fd()` | Takes one `OwnedFd` | `crates/tensor/src/dma.rs:88` |
+| `hal_tensor_from_fd()` C API | Takes one `int fd` | `crates/capi/include/edgefirst/hal.h` |
+| `TensorDyn` NV12 shape | `[H*3/2, W]` — contiguous Y+UV | `crates/tensor/src/lib.rs` |
+| EGL NV12 import | Same fd for both planes, UV offset = `W*H` | `crates/image/src/opengl_headless.rs:4492–4501` |
+
+This works correctly when the kernel allocates NV12 from a single CMA/system
+DMA-heap buffer (e.g. `hal_tensor_new()`, `hal_image_processor_create_image()`).
+The Y and UV planes are contiguous in physical memory and share one fd.
+
+### The Problem: Multi-Planar Formats
+
+Video hardware on NXP i.MX platforms frequently produces **multi-planar**
+NV12 buffers where Y and UV reside in separate DMA-BUF allocations, each
+with its own file descriptor:
+
+| Source | V4L2 Format | Planes | Behavior |
+|--------|-------------|--------|----------|
+| VPU (Hantro/Amphion) via `v4l2h264dec` | `V4L2_PIX_FMT_NV12M` (NM12) | 2 fds | Y and UV in separate DMA-BUFs |
+| NeoISP via `libcamerasrc` | `V4L2_PIX_FMT_NV12M` (NM12) | 2 fds | Y and UV in separate DMA-BUFs |
+| MIPI-CSI direct capture | `V4L2_PIX_FMT_NV12` (NV12) | 1 fd | Contiguous — works today |
+
+When GStreamer negotiates `video/x-raw(memory:DMABuf), format=DMA_DRM,
+drm-format=NV12`, the upstream element may deliver buffers with 2 `GstMemory`
+blocks (one per plane).
+
+### Multi-Plane Support (Implemented)
+
+The HAL supports multi-plane DMA-BUF NV12/NV16 via a two-tensor approach
+rather than extending `DmaTensor` with multiple fds:
+
+**C API**: `hal_tensor_from_planes(y_fd, width, height, uv_fd, fourcc, out)`
+takes separate Y and UV file descriptors, wraps each into its own
+`Tensor<u8>` via `from_fd()`, and combines them with `Tensor::from_planes()`.
+
+**Tensor crate**: `Tensor::from_planes(luma, chroma, PixelFormat::Nv12)` stores the
+two tensors as separate planes inside the `Tensor`, preserving their
+independent DMA-BUF allocations for zero-copy GPU import.
+
+**OpenGL path**: `create_image_from_dma2()` uses per-plane fds in EGL
+attributes (`DMA_BUF_PLANE0_FD → y_fd`, `DMA_BUF_PLANE1_FD → uv_fd`),
+each at offset 0.
+
+| Scenario | Zero-Copy | Notes |
+|----------|-----------|-------|
+| Single-fd NV12 DMA-BUF | Yes | V4L2 single-planar capture, HAL-allocated buffers |
+| Single-fd YUYV/RGB/RGBA DMA-BUF | Yes | Always single-plane |
+| System memory input | N/A | Copied into HAL tensor regardless |
+| Multi-fd NV12/NV16 DMA-BUF | Yes | Via `hal_tensor_from_planes()` |
+
+### GStreamer Integration (External)
+
+The `edgefirstcameraadaptor` element detects multi-plane buffers
+(`gst_buffer_n_memory() > 1`) and extracts per-plane fds via
+`gst_dmabuf_memory_get_fd()` on each `GstMemory` block, passing them to
+`hal_tensor_from_planes()` for zero-copy import.
+
+### Tracking
+
+This work was implemented under **EDGEAI-1107**.
 
 ## Contributing
 

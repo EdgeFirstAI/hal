@@ -25,8 +25,8 @@ import numpy as np
 from edgefirst_hal import (
     Decoder,
     ImageProcessor,
-    TensorImage,
-    FourCC,
+    Tensor,
+    PixelFormat,
     probe_egl_displays,
 )
 
@@ -384,7 +384,7 @@ def main():
 
     # --- Create processor and image ---
     processor = ImageProcessor(egl_display=gpu_display)
-    dst = TensorImage(640, 640, FourCC.RGBA)
+    dst = Tensor.image(640, 640, PixelFormat.Rgba)
 
     print(f"\nOutput shapes: {[o.shape for o in outputs]}")
     print(f"Output dtypes: {[o.dtype for o in outputs]}")

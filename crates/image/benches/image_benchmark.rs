@@ -23,11 +23,8 @@ mod common;
 use common::{find_testdata_path, format_name, get_test_data, run_bench, BenchConfig};
 use edgefirst_bench::BenchSuite;
 
-use edgefirst_image::{
-    Crop, Flip, ImageProcessor, ImageProcessorTrait, Rotation, TensorImage, GREY, NV16, PLANAR_RGB,
-    RGB, RGBA, YUYV,
-};
-use edgefirst_tensor::{TensorMapTrait, TensorMemory, TensorTrait};
+use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rotation};
+use edgefirst_tensor::{DType, PixelFormat, TensorMapTrait, TensorMemory, TensorTrait};
 
 const WARMUP: usize = 10;
 const ITERATIONS: usize = 100;
@@ -43,14 +40,18 @@ const CAMERA_4K_RGBA: &[u8] = include_bytes!("../../../testdata/camera4k.rgba");
 fn bench_load(suite: &mut BenchSuite) {
     println!("\n== Load: JPEG to Memory Backends ==\n");
 
-    // Load 3 test images to Mem backend in RGBA
+    // Load 3 test images to Mem backend in PixelFormat::Rgba
     for name in &["jaguar.jpg", "person.jpg", "zidane.jpg"] {
         let path = find_testdata_path(name);
         let bench_name = format!("load/mem/RGBA/{}", name.strip_suffix(".jpg").unwrap());
         let file = std::fs::read(&path).unwrap();
         let result = run_bench(&bench_name, WARMUP, ITERATIONS, || {
-            let img = TensorImage::load_jpeg(&file, Some(RGBA), Some(TensorMemory::Mem))
-                .expect("Failed to load JPEG");
+            let img = edgefirst_image::load_image(
+                &file,
+                Some(PixelFormat::Rgba),
+                Some(TensorMemory::Mem),
+            )
+            .expect("Failed to load JPEG");
             std::hint::black_box(img);
         });
         result.print_summary();
@@ -65,8 +66,12 @@ fn bench_load(suite: &mut BenchSuite) {
         {
             let name = "load/shm/RGBA/zidane";
             let result = run_bench(name, WARMUP, ITERATIONS, || {
-                let img = TensorImage::load_jpeg(zidane, Some(RGBA), Some(TensorMemory::Shm))
-                    .expect("Failed to load JPEG");
+                let img = edgefirst_image::load_image(
+                    zidane,
+                    Some(PixelFormat::Rgba),
+                    Some(TensorMemory::Shm),
+                )
+                .expect("Failed to load JPEG");
                 std::hint::black_box(img);
             });
             result.print_summary();
@@ -76,8 +81,12 @@ fn bench_load(suite: &mut BenchSuite) {
         if common::dma_available() {
             let name = "load/dma/RGBA/zidane";
             let result = run_bench(name, WARMUP, ITERATIONS, || {
-                let img = TensorImage::load_jpeg(zidane, Some(RGBA), Some(TensorMemory::Dma))
-                    .expect("Failed to load JPEG");
+                let img = edgefirst_image::load_image(
+                    zidane,
+                    Some(PixelFormat::Rgba),
+                    Some(TensorMemory::Dma),
+                )
+                .expect("Failed to load JPEG");
                 std::hint::black_box(img);
             });
             result.print_summary();
@@ -90,10 +99,14 @@ fn bench_load(suite: &mut BenchSuite) {
     // Load zidane to different formats (Mem backend)
     println!("\n== Load: JPEG to Different Formats ==\n");
     let zidane = include_bytes!("../../../testdata/zidane.jpg");
-    for (fmt, fmt_name) in &[(RGBA, "RGBA"), (RGB, "RGB"), (GREY, "GREY")] {
+    for (fmt, fmt_name) in &[
+        (PixelFormat::Rgba, "RGBA"),
+        (PixelFormat::Rgb, "RGB"),
+        (PixelFormat::Grey, "GREY"),
+    ] {
         let bench_name = format!("load/mem/{}/zidane", fmt_name);
         let result = run_bench(&bench_name, WARMUP, ITERATIONS, || {
-            let img = TensorImage::load_jpeg(zidane, Some(*fmt), Some(TensorMemory::Mem))
+            let img = edgefirst_image::load_image(zidane, Some(*fmt), Some(TensorMemory::Mem))
                 .expect("Failed to load JPEG");
             std::hint::black_box(img);
         });
@@ -115,28 +128,39 @@ fn bench_resize(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
 
     // RGBA→RGBA resize
     {
-        let src = TensorImage::load_jpeg(&file, Some(RGBA), None).unwrap();
-        let (sw, sh) = (src.width(), src.height());
+        let src = edgefirst_image::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
+        let (sw, sh) = (src.width().unwrap(), src.height().unwrap());
+        let src_dyn = src;
 
         for &(w, h) in target_sizes {
             let name = format!("resize/zidane/{}x{}/RGBA->RGBA", w, h);
             let throughput = (sw * sh * 4) as u64;
-            let Ok(mut dst) = proc.create_image(w, h, RGBA) else {
+            let Ok(mut dst) = proc.create_image(w, h, PixelFormat::Rgba, DType::U8, None) else {
                 println!("  {:50} [skipped: allocation failed]", name);
                 continue;
             };
 
             // Pre-flight
-            if let Err(e) =
-                proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-            {
+            if let Err(e) = proc.convert(
+                &src_dyn,
+                &mut dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            ) {
                 println!("  {:50} [unsupported: {}]", name, e);
                 continue;
             }
 
             let result = run_bench(&name, WARMUP, ITERATIONS, || {
-                proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-                    .unwrap();
+                proc.convert(
+                    &src_dyn,
+                    &mut dst,
+                    Rotation::None,
+                    Flip::None,
+                    Crop::no_crop(),
+                )
+                .unwrap();
             });
             result.print_summary_with_throughput(throughput);
             suite.record(&result);
@@ -145,28 +169,39 @@ fn bench_resize(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
 
     // RGB→RGB resize
     {
-        let src = TensorImage::load_jpeg(&file, Some(RGB), None).unwrap();
-        let (sw, sh) = (src.width(), src.height());
+        let src = edgefirst_image::load_image(&file, Some(PixelFormat::Rgb), None).unwrap();
+        let (sw, sh) = (src.width().unwrap(), src.height().unwrap());
+        let src_dyn = src;
 
         for &(w, h) in target_sizes {
             let name = format!("resize/zidane/{}x{}/RGB->RGB", w, h);
             let throughput = (sw * sh * 3) as u64;
-            let Ok(mut dst) = proc.create_image(w, h, RGB) else {
+            let Ok(mut dst) = proc.create_image(w, h, PixelFormat::Rgb, DType::U8, None) else {
                 println!("  {:50} [skipped: allocation failed]", name);
                 continue;
             };
 
             // Pre-flight
-            if let Err(e) =
-                proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-            {
+            if let Err(e) = proc.convert(
+                &src_dyn,
+                &mut dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            ) {
                 println!("  {:50} [unsupported: {}]", name, e);
                 continue;
             }
 
             let result = run_bench(&name, WARMUP, ITERATIONS, || {
-                proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
-                    .unwrap();
+                proc.convert(
+                    &src_dyn,
+                    &mut dst,
+                    Rotation::None,
+                    Flip::None,
+                    Crop::no_crop(),
+                )
+                .unwrap();
             });
             result.print_summary_with_throughput(throughput);
             suite.record(&result);
@@ -185,14 +220,34 @@ fn bench_convert(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
     let h = 1080usize;
 
     let configs: &[(_, _, &[u8], u64)] = &[
-        (YUYV, RGBA, get_test_data(w, h, YUYV), 2),
-        (YUYV, RGB, get_test_data(w, h, YUYV), 2),
-        (YUYV, YUYV, get_test_data(w, h, YUYV), 2),
-        (RGBA, YUYV, CAMERA_1080P_RGBA, 4),
-        (RGBA, RGB, CAMERA_1080P_RGBA, 4),
-        (RGBA, RGBA, CAMERA_1080P_RGBA, 4),
-        (RGBA, PLANAR_RGB, CAMERA_1080P_RGBA, 4),
-        (RGBA, NV16, CAMERA_1080P_RGBA, 4),
+        (
+            PixelFormat::Yuyv,
+            PixelFormat::Rgba,
+            get_test_data(w, h, PixelFormat::Yuyv),
+            2,
+        ),
+        (
+            PixelFormat::Yuyv,
+            PixelFormat::Rgb,
+            get_test_data(w, h, PixelFormat::Yuyv),
+            2,
+        ),
+        (
+            PixelFormat::Yuyv,
+            PixelFormat::Yuyv,
+            get_test_data(w, h, PixelFormat::Yuyv),
+            2,
+        ),
+        (PixelFormat::Rgba, PixelFormat::Yuyv, CAMERA_1080P_RGBA, 4),
+        (PixelFormat::Rgba, PixelFormat::Rgb, CAMERA_1080P_RGBA, 4),
+        (PixelFormat::Rgba, PixelFormat::Rgba, CAMERA_1080P_RGBA, 4),
+        (
+            PixelFormat::Rgba,
+            PixelFormat::PlanarRgb,
+            CAMERA_1080P_RGBA,
+            4,
+        ),
+        (PixelFormat::Rgba, PixelFormat::Nv16, CAMERA_1080P_RGBA, 4),
     ];
 
     for &(in_fmt, out_fmt, data, bpp) in configs {
@@ -203,12 +258,12 @@ fn bench_convert(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
         );
         let throughput = w as u64 * h as u64 * bpp;
 
-        let Ok(src) = proc.create_image(w, h, in_fmt) else {
+        let Ok(src) = proc.create_image(w, h, in_fmt, DType::U8, None) else {
             println!("  {:50} [skipped: allocation failed]", name);
             continue;
         };
-        src.tensor().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
-        let Ok(mut dst) = proc.create_image(w, h, out_fmt) else {
+        src.as_u8().unwrap().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
+        let Ok(mut dst) = proc.create_image(w, h, out_fmt, DType::U8, None) else {
             println!("  {:50} [skipped: allocation failed]", name);
             continue;
         };
@@ -236,8 +291,10 @@ fn bench_rotate(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
     println!("\n== Rotate: 90/180/270 degree rotations ==\n");
 
     let zidane = include_bytes!("../../../testdata/zidane.jpg");
-    let src = TensorImage::load_jpeg(zidane, Some(RGBA), None).expect("Failed to load zidane.jpg");
-    let (w, h) = (src.width(), src.height());
+    let src = edgefirst_image::load_image(zidane, Some(PixelFormat::Rgba), None)
+        .expect("Failed to load zidane.jpg");
+    let (w, h) = (src.width().unwrap(), src.height().unwrap());
+    let src_dyn = src;
 
     let rotations: &[(Rotation, &str)] = &[
         (Rotation::Clockwise90, "90"),
@@ -251,22 +308,23 @@ fn bench_rotate(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
             Rotation::Clockwise90 | Rotation::CounterClockwise90 => (h, w),
             _ => (w, h),
         };
-        let name = format!("rotate/{}deg/RGBA", deg);
+        let name = format!("rotate/{}deg/PixelFormat::Rgba", deg);
         let throughput = (w * h * 4) as u64;
 
-        let Ok(mut dst) = proc.create_image(dst_w, dst_h, RGBA) else {
+        let Ok(mut dst) = proc.create_image(dst_w, dst_h, PixelFormat::Rgba, DType::U8, None)
+        else {
             println!("  {:50} [skipped: allocation failed]", name);
             continue;
         };
 
         // Pre-flight
-        if let Err(e) = proc.convert(&src, &mut dst, rot, Flip::None, Crop::no_crop()) {
+        if let Err(e) = proc.convert(&src_dyn, &mut dst, rot, Flip::None, Crop::no_crop()) {
             println!("  {:50} [unsupported: {}]", name, e);
             continue;
         }
 
         let result = run_bench(&name, WARMUP, ITERATIONS, || {
-            proc.convert(&src, &mut dst, rot, Flip::None, Crop::no_crop())
+            proc.convert(&src_dyn, &mut dst, rot, Flip::None, Crop::no_crop())
                 .unwrap();
         });
         result.print_summary_with_throughput(throughput);
@@ -283,24 +341,24 @@ fn bench_hires(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
     println!("\n== Hires: 1080p Source ==\n");
 
     let configs_1080p: &[BenchConfig] = &[
-        BenchConfig::new(1920, 1080, 640, 360, YUYV, YUYV),
-        BenchConfig::new(1920, 1080, 1280, 720, YUYV, YUYV),
-        BenchConfig::new(1920, 1080, 1920, 1080, YUYV, YUYV),
-        BenchConfig::new(1920, 1080, 640, 360, YUYV, RGBA),
-        BenchConfig::new(1920, 1080, 1280, 720, YUYV, RGBA),
-        BenchConfig::new(1920, 1080, 1920, 1080, YUYV, RGBA),
-        BenchConfig::new(1920, 1080, 640, 360, YUYV, RGB),
-        BenchConfig::new(1920, 1080, 1280, 720, YUYV, RGB),
-        BenchConfig::new(1920, 1080, 1920, 1080, YUYV, RGB),
-        BenchConfig::new(1920, 1080, 640, 360, RGBA, RGBA),
-        BenchConfig::new(1920, 1080, 1280, 720, RGBA, RGBA),
-        BenchConfig::new(1920, 1080, 1920, 1080, RGBA, RGBA),
-        BenchConfig::new(1920, 1080, 640, 360, RGBA, RGB),
-        BenchConfig::new(1920, 1080, 1280, 720, RGBA, RGB),
-        BenchConfig::new(1920, 1080, 1920, 1080, RGBA, RGB),
-        BenchConfig::new(1920, 1080, 640, 360, RGB, RGB),
-        BenchConfig::new(1920, 1080, 1280, 720, RGB, RGB),
-        BenchConfig::new(1920, 1080, 1920, 1080, RGB, RGB),
+        BenchConfig::new(1920, 1080, 640, 360, PixelFormat::Yuyv, PixelFormat::Yuyv),
+        BenchConfig::new(1920, 1080, 1280, 720, PixelFormat::Yuyv, PixelFormat::Yuyv),
+        BenchConfig::new(1920, 1080, 1920, 1080, PixelFormat::Yuyv, PixelFormat::Yuyv),
+        BenchConfig::new(1920, 1080, 640, 360, PixelFormat::Yuyv, PixelFormat::Rgba),
+        BenchConfig::new(1920, 1080, 1280, 720, PixelFormat::Yuyv, PixelFormat::Rgba),
+        BenchConfig::new(1920, 1080, 1920, 1080, PixelFormat::Yuyv, PixelFormat::Rgba),
+        BenchConfig::new(1920, 1080, 640, 360, PixelFormat::Yuyv, PixelFormat::Rgb),
+        BenchConfig::new(1920, 1080, 1280, 720, PixelFormat::Yuyv, PixelFormat::Rgb),
+        BenchConfig::new(1920, 1080, 1920, 1080, PixelFormat::Yuyv, PixelFormat::Rgb),
+        BenchConfig::new(1920, 1080, 640, 360, PixelFormat::Rgba, PixelFormat::Rgba),
+        BenchConfig::new(1920, 1080, 1280, 720, PixelFormat::Rgba, PixelFormat::Rgba),
+        BenchConfig::new(1920, 1080, 1920, 1080, PixelFormat::Rgba, PixelFormat::Rgba),
+        BenchConfig::new(1920, 1080, 640, 360, PixelFormat::Rgba, PixelFormat::Rgb),
+        BenchConfig::new(1920, 1080, 1280, 720, PixelFormat::Rgba, PixelFormat::Rgb),
+        BenchConfig::new(1920, 1080, 1920, 1080, PixelFormat::Rgba, PixelFormat::Rgb),
+        BenchConfig::new(1920, 1080, 640, 360, PixelFormat::Rgb, PixelFormat::Rgb),
+        BenchConfig::new(1920, 1080, 1280, 720, PixelFormat::Rgb, PixelFormat::Rgb),
+        BenchConfig::new(1920, 1080, 1920, 1080, PixelFormat::Rgb, PixelFormat::Rgb),
     ];
 
     run_hires_configs(proc, suite, configs_1080p, "hires/1080p");
@@ -309,30 +367,30 @@ fn bench_hires(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
     println!("\n== Hires: 4K Source ==\n");
 
     let configs_4k: &[BenchConfig] = &[
-        BenchConfig::new(3840, 2160, 640, 360, YUYV, YUYV),
-        BenchConfig::new(3840, 2160, 1280, 720, YUYV, YUYV),
-        BenchConfig::new(3840, 2160, 1920, 1080, YUYV, YUYV),
-        BenchConfig::new(3840, 2160, 3840, 2160, YUYV, YUYV),
-        BenchConfig::new(3840, 2160, 640, 360, YUYV, RGBA),
-        BenchConfig::new(3840, 2160, 1280, 720, YUYV, RGBA),
-        BenchConfig::new(3840, 2160, 1920, 1080, YUYV, RGBA),
-        BenchConfig::new(3840, 2160, 3840, 2160, YUYV, RGBA),
-        BenchConfig::new(3840, 2160, 640, 360, YUYV, RGB),
-        BenchConfig::new(3840, 2160, 1280, 720, YUYV, RGB),
-        BenchConfig::new(3840, 2160, 1920, 1080, YUYV, RGB),
-        BenchConfig::new(3840, 2160, 3840, 2160, YUYV, RGB),
-        BenchConfig::new(3840, 2160, 640, 360, RGBA, RGBA),
-        BenchConfig::new(3840, 2160, 1280, 720, RGBA, RGBA),
-        BenchConfig::new(3840, 2160, 1920, 1080, RGBA, RGBA),
-        BenchConfig::new(3840, 2160, 3840, 2160, RGBA, RGBA),
-        BenchConfig::new(3840, 2160, 640, 360, RGBA, RGB),
-        BenchConfig::new(3840, 2160, 1280, 720, RGBA, RGB),
-        BenchConfig::new(3840, 2160, 1920, 1080, RGBA, RGB),
-        BenchConfig::new(3840, 2160, 3840, 2160, RGBA, RGB),
-        BenchConfig::new(3840, 2160, 640, 360, RGB, RGB),
-        BenchConfig::new(3840, 2160, 1280, 720, RGB, RGB),
-        BenchConfig::new(3840, 2160, 1920, 1080, RGB, RGB),
-        BenchConfig::new(3840, 2160, 3840, 2160, RGB, RGB),
+        BenchConfig::new(3840, 2160, 640, 360, PixelFormat::Yuyv, PixelFormat::Yuyv),
+        BenchConfig::new(3840, 2160, 1280, 720, PixelFormat::Yuyv, PixelFormat::Yuyv),
+        BenchConfig::new(3840, 2160, 1920, 1080, PixelFormat::Yuyv, PixelFormat::Yuyv),
+        BenchConfig::new(3840, 2160, 3840, 2160, PixelFormat::Yuyv, PixelFormat::Yuyv),
+        BenchConfig::new(3840, 2160, 640, 360, PixelFormat::Yuyv, PixelFormat::Rgba),
+        BenchConfig::new(3840, 2160, 1280, 720, PixelFormat::Yuyv, PixelFormat::Rgba),
+        BenchConfig::new(3840, 2160, 1920, 1080, PixelFormat::Yuyv, PixelFormat::Rgba),
+        BenchConfig::new(3840, 2160, 3840, 2160, PixelFormat::Yuyv, PixelFormat::Rgba),
+        BenchConfig::new(3840, 2160, 640, 360, PixelFormat::Yuyv, PixelFormat::Rgb),
+        BenchConfig::new(3840, 2160, 1280, 720, PixelFormat::Yuyv, PixelFormat::Rgb),
+        BenchConfig::new(3840, 2160, 1920, 1080, PixelFormat::Yuyv, PixelFormat::Rgb),
+        BenchConfig::new(3840, 2160, 3840, 2160, PixelFormat::Yuyv, PixelFormat::Rgb),
+        BenchConfig::new(3840, 2160, 640, 360, PixelFormat::Rgba, PixelFormat::Rgba),
+        BenchConfig::new(3840, 2160, 1280, 720, PixelFormat::Rgba, PixelFormat::Rgba),
+        BenchConfig::new(3840, 2160, 1920, 1080, PixelFormat::Rgba, PixelFormat::Rgba),
+        BenchConfig::new(3840, 2160, 3840, 2160, PixelFormat::Rgba, PixelFormat::Rgba),
+        BenchConfig::new(3840, 2160, 640, 360, PixelFormat::Rgba, PixelFormat::Rgb),
+        BenchConfig::new(3840, 2160, 1280, 720, PixelFormat::Rgba, PixelFormat::Rgb),
+        BenchConfig::new(3840, 2160, 1920, 1080, PixelFormat::Rgba, PixelFormat::Rgb),
+        BenchConfig::new(3840, 2160, 3840, 2160, PixelFormat::Rgba, PixelFormat::Rgb),
+        BenchConfig::new(3840, 2160, 640, 360, PixelFormat::Rgb, PixelFormat::Rgb),
+        BenchConfig::new(3840, 2160, 1280, 720, PixelFormat::Rgb, PixelFormat::Rgb),
+        BenchConfig::new(3840, 2160, 1920, 1080, PixelFormat::Rgb, PixelFormat::Rgb),
+        BenchConfig::new(3840, 2160, 3840, 2160, PixelFormat::Rgb, PixelFormat::Rgb),
     ];
 
     run_hires_configs(proc, suite, configs_4k, "hires/4k");
@@ -346,29 +404,29 @@ fn run_hires_configs(
     prefix: &str,
 ) {
     // Pre-create source images for each input format used in these configs.
-    // We need YUYV, RGBA, and RGB sources at the resolution of the first config
+    // We need PixelFormat::Yuyv, PixelFormat::Rgba, and PixelFormat::Rgb sources at the resolution of the first config
     // (all configs in a batch share the same input resolution).
     let (src_w, src_h) = (configs[0].in_w, configs[0].in_h);
 
-    // YUYV source
+    // PixelFormat::Yuyv source
     let yuyv_src = {
-        let Ok(src) = proc.create_image(src_w, src_h, YUYV) else {
+        let Ok(src) = proc.create_image(src_w, src_h, PixelFormat::Yuyv, DType::U8, None) else {
             println!(
-                "  [skipped: could not allocate YUYV source {}x{}]",
+                "  [skipped: could not allocate PixelFormat::Yuyv source {}x{}]",
                 src_w, src_h
             );
             return;
         };
-        let data = get_test_data(src_w, src_h, YUYV);
-        src.tensor().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
+        let data = get_test_data(src_w, src_h, PixelFormat::Yuyv);
+        src.as_u8().unwrap().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
         src
     };
 
-    // RGBA source
+    // PixelFormat::Rgba source
     let rgba_src = {
-        let Ok(src) = proc.create_image(src_w, src_h, RGBA) else {
+        let Ok(src) = proc.create_image(src_w, src_h, PixelFormat::Rgba, DType::U8, None) else {
             println!(
-                "  [skipped: could not allocate RGBA source {}x{}]",
+                "  [skipped: could not allocate PixelFormat::Rgba source {}x{}]",
                 src_w, src_h
             );
             return;
@@ -378,15 +436,15 @@ fn run_hires_configs(
         } else {
             CAMERA_4K_RGBA
         };
-        src.tensor().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
+        src.as_u8().unwrap().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
         src
     };
 
-    // RGB source — convert from RGBA
+    // PixelFormat::Rgb source — convert from PixelFormat::Rgba
     let rgb_src = {
-        let Ok(mut rgb) = proc.create_image(src_w, src_h, RGB) else {
+        let Ok(mut rgb) = proc.create_image(src_w, src_h, PixelFormat::Rgb, DType::U8, None) else {
             println!(
-                "  [skipped: could not allocate RGB source {}x{}]",
+                "  [skipped: could not allocate PixelFormat::Rgb source {}x{}]",
                 src_w, src_h
             );
             return;
@@ -409,13 +467,15 @@ fn run_hires_configs(
         let throughput = config.throughput();
 
         let src = match config.in_fmt {
-            f if f == YUYV => &yuyv_src,
-            f if f == RGBA => &rgba_src,
-            f if f == RGB => &rgb_src,
+            PixelFormat::Yuyv => &yuyv_src,
+            PixelFormat::Rgba => &rgba_src,
+            PixelFormat::Rgb => &rgb_src,
             _ => continue,
         };
 
-        let Ok(mut dst) = proc.create_image(config.out_w, config.out_h, config.out_fmt) else {
+        let Ok(mut dst) =
+            proc.create_image(config.out_w, config.out_h, config.out_fmt, DType::U8, None)
+        else {
             println!("  {:50} [skipped: allocation failed]", name);
             continue;
         };
@@ -440,6 +500,7 @@ fn run_hires_configs(
 // =============================================================================
 
 fn main() {
+    env_logger::init();
     let mut suite = BenchSuite::from_args();
     let mut proc = ImageProcessor::new().expect("Failed to create ImageProcessor");
 

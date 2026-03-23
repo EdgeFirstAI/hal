@@ -9,16 +9,14 @@ use tokio::sync::mpsc::{Sender, WeakSender};
 use super::processor::GLProcessorST;
 use super::shaders::check_gl_error;
 use super::{EglDisplayKind, Int8InterpolationMode, TransferBackend};
-use crate::{
-    CPUProcessor, Crop, Error, Flip, ImageProcessorTrait, MaskRegion, Rotation, TensorImage,
-    TensorImageRef,
-};
+use crate::{Crop, Error, Flip, ImageProcessorTrait, MaskRegion, Rotation};
+use edgefirst_tensor::TensorDyn;
 
 #[allow(clippy::type_complexity)]
 enum GLProcessorMessage {
     ImageConvert(
-        SendablePtr<TensorImage>,
-        SendablePtr<TensorImage>,
+        SendablePtr<TensorDyn>,
+        SendablePtr<TensorDyn>,
         Rotation,
         Flip,
         Crop,
@@ -29,13 +27,13 @@ enum GLProcessorMessage {
         tokio::sync::oneshot::Sender<Result<(), Error>>,
     ),
     DrawMasks(
-        SendablePtr<TensorImage>,
+        SendablePtr<TensorDyn>,
         SendablePtr<DetectBox>,
         SendablePtr<Segmentation>,
         tokio::sync::oneshot::Sender<Result<(), Error>>,
     ),
     DrawMasksProto(
-        SendablePtr<TensorImage>,
+        SendablePtr<TensorDyn>,
         SendablePtr<DetectBox>,
         Box<ProtoData>,
         tokio::sync::oneshot::Sender<Result<(), Error>>,
@@ -137,7 +135,6 @@ pub struct GLProcessorThreaded {
     // This is only None when the converter is being dropped.
     sender: Option<Sender<GLProcessorMessage>>,
     transfer_backend: TransferBackend,
-    has_bgra: bool,
 }
 
 unsafe impl Send for GLProcessorThreaded {}
@@ -165,10 +162,7 @@ impl GLProcessorThreaded {
                     return;
                 }
             };
-            let _ = create_ctx_send.send(Ok((
-                gl_converter.gl_context.transfer_backend,
-                gl_converter.has_bgra,
-            )));
+            let _ = create_ctx_send.send(Ok(gl_converter.gl_context.transfer_backend));
             while let Some(msg) = recv.blocking_recv() {
                 match msg {
                     GLProcessorMessage::ImageConvert(src, mut dst, rotation, flip, crop, resp) => {
@@ -291,7 +285,7 @@ impl GLProcessorThreaded {
         // let handle = tokio::task::spawn(func());
         let handle = std::thread::spawn(func);
 
-        let (transfer_backend, has_bgra) = match create_ctx_recv.blocking_recv() {
+        let transfer_backend = match create_ctx_recv.blocking_recv() {
             Ok(Err(e)) => return Err(e),
             Err(_) => {
                 return Err(Error::Internal(
@@ -305,7 +299,6 @@ impl GLProcessorThreaded {
             handle: Some(handle),
             sender: Some(send),
             transfer_backend,
-            has_bgra,
         })
     }
 }
@@ -313,38 +306,23 @@ impl GLProcessorThreaded {
 impl ImageProcessorTrait for GLProcessorThreaded {
     fn convert(
         &mut self,
-        src: &TensorImage,
-        dst: &mut TensorImage,
+        src: &TensorDyn,
+        dst: &mut TensorDyn,
         rotation: crate::Rotation,
         flip: Flip,
         crop: Crop,
     ) -> crate::Result<()> {
-        crop.check_crop(src, dst)?;
-        if !GLProcessorST::check_src_format_supported(self.transfer_backend, src) {
-            return Err(crate::Error::NotSupported(format!(
-                "Opengl doesn't support {} source texture",
-                src.fourcc().display()
-            )));
-        }
-
-        if !GLProcessorST::check_dst_format_supported(self.transfer_backend, dst, self.has_bgra) {
-            return Err(crate::Error::NotSupported(format!(
-                "Opengl doesn't support {} destination texture",
-                dst.fourcc().display()
-            )));
-        }
-
         let (err_send, err_recv) = tokio::sync::oneshot::channel();
         self.sender
             .as_ref()
             .unwrap()
             .blocking_send(GLProcessorMessage::ImageConvert(
                 SendablePtr {
-                    ptr: src.into(),
+                    ptr: NonNull::from(src),
                     len: 1,
                 },
                 SendablePtr {
-                    ptr: dst.into(),
+                    ptr: NonNull::from(dst),
                     len: 1,
                 },
                 rotation,
@@ -358,22 +336,9 @@ impl ImageProcessorTrait for GLProcessorThreaded {
         })?
     }
 
-    fn convert_ref(
-        &mut self,
-        src: &TensorImage,
-        dst: &mut TensorImageRef<'_>,
-        rotation: Rotation,
-        flip: Flip,
-        crop: Crop,
-    ) -> crate::Result<()> {
-        // OpenGL doesn't support PLANAR_RGB output, delegate to CPU
-        let mut cpu = CPUProcessor::new();
-        cpu.convert_ref(src, dst, rotation, flip, crop)
-    }
-
     fn draw_masks(
         &mut self,
-        dst: &mut TensorImage,
+        dst: &mut TensorDyn,
         detect: &[crate::DetectBox],
         segmentation: &[crate::Segmentation],
     ) -> crate::Result<()> {
@@ -383,7 +348,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
             .unwrap()
             .blocking_send(GLProcessorMessage::DrawMasks(
                 SendablePtr {
-                    ptr: dst.into(),
+                    ptr: NonNull::from(dst),
                     len: 1,
                 },
                 SendablePtr {
@@ -404,7 +369,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
 
     fn draw_masks_proto(
         &mut self,
-        dst: &mut TensorImage,
+        dst: &mut TensorDyn,
         detect: &[DetectBox],
         proto_data: &ProtoData,
     ) -> crate::Result<()> {
@@ -414,7 +379,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
             .unwrap()
             .blocking_send(GLProcessorMessage::DrawMasksProto(
                 SendablePtr {
-                    ptr: NonNull::new(dst as *mut TensorImage).unwrap(),
+                    ptr: NonNull::from(dst),
                     len: 1,
                 },
                 SendablePtr {
@@ -508,20 +473,33 @@ impl GLProcessorThreaded {
         })?
     }
 
-    /// Create a PBO-backed TensorImage on the GL thread.
+    /// Create a PBO-backed [`Tensor<u8>`] image on the GL thread.
     pub fn create_pbo_image(
         &self,
         width: usize,
         height: usize,
-        fourcc: four_char_code::FourCharCode,
-    ) -> Result<crate::TensorImage, Error> {
+        format: edgefirst_tensor::PixelFormat,
+    ) -> Result<edgefirst_tensor::Tensor<u8>, Error> {
         let sender = self
             .sender
             .as_ref()
             .ok_or(Error::OpenGl("GL processor is shutting down".to_string()))?;
 
-        let channels = crate::fourcc_channels(fourcc)?;
-        let size = width * height * channels;
+        let channels = format.channels();
+        let size = match format.layout() {
+            edgefirst_tensor::PixelLayout::SemiPlanar => {
+                // NV12: W*H*3/2, NV16: W*H*2
+                match format {
+                    edgefirst_tensor::PixelFormat::Nv12 => width * height * 3 / 2,
+                    edgefirst_tensor::PixelFormat::Nv16 => width * height * 2,
+                    _ => width * height * channels,
+                }
+            }
+            edgefirst_tensor::PixelLayout::Packed | edgefirst_tensor::PixelLayout::Planar => {
+                width * height * channels
+            }
+            _ => width * height * channels,
+        };
         if size == 0 {
             return Err(Error::OpenGl("Invalid image dimensions".to_string()));
         }
@@ -539,22 +517,30 @@ impl GLProcessorThreaded {
             sender: sender.downgrade(),
         });
 
-        let shape = if crate::fourcc_planar(fourcc)? {
-            vec![channels, height, width]
-        } else {
-            vec![height, width, channels]
+        let shape = match format.layout() {
+            edgefirst_tensor::PixelLayout::Planar => vec![channels, height, width],
+            edgefirst_tensor::PixelLayout::SemiPlanar => {
+                let total_h = match format {
+                    edgefirst_tensor::PixelFormat::Nv12 => height * 3 / 2,
+                    edgefirst_tensor::PixelFormat::Nv16 => height * 2,
+                    _ => height * 2,
+                };
+                vec![total_h, width]
+            }
+            _ => vec![height, width, channels],
         };
 
         let pbo_tensor =
             edgefirst_tensor::PboTensor::<u8>::from_pbo(buffer_id, size, &shape, None, ops)
                 .map_err(|e| Error::OpenGl(format!("PBO tensor creation failed: {e:?}")))?;
-        let tensor = edgefirst_tensor::Tensor::Pbo(pbo_tensor);
-        crate::TensorImage::from_tensor(tensor, fourcc)
-            .map_err(|e| Error::OpenGl(format!("Failed to wrap PBO tensor as image: {e:?}")))
+        let mut tensor = edgefirst_tensor::Tensor::from_pbo(pbo_tensor);
+        tensor
+            .set_format(format)
+            .map_err(|e| Error::OpenGl(format!("Failed to set format on PBO tensor: {e:?}")))?;
+        Ok(tensor)
     }
 
     /// Returns the active transfer backend.
-    #[allow(dead_code)]
     pub(crate) fn transfer_backend(&self) -> TransferBackend {
         self.transfer_backend
     }

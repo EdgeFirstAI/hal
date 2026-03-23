@@ -1,19 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
-    tensor::{PyTensorMap, PyTensorMemory, TensorMapT},
-    FunctionTimer,
-};
+use crate::tensor::PyTensor;
 use edgefirst_hal::{
     decoder::{BoundingBox, DetectBox, Segmentation},
-    image::{
-        self, Crop, Flip, ImageProcessorConfig, ImageProcessorTrait, Rect, Rotation, TensorImage,
-        RGBA,
-    },
-    tensor::{self, TensorMapTrait, TensorTrait},
+    image::{self, Crop, Flip, ImageProcessorConfig, ImageProcessorTrait, Rect, Rotation},
+    tensor::{self as tensor, PixelFormat, TensorDyn, TensorMapTrait, TensorTrait},
 };
-use four_char_code::FourCharCode;
 
 use ndarray::{
     parallel::prelude::{
@@ -26,31 +19,12 @@ use numpy::{
     PyUntypedArrayMethods,
 };
 use pyo3::prelude::*;
-#[cfg(target_os = "linux")]
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::{
     fmt::{self},
     sync::Mutex,
 };
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
-
-// pub struct PyArrayF16_<'py> {
-//     pub arr: PyReadonlyArrayDyn<'py, half::f16>,
-// }
-
-// impl<'py> FromPy<PyAny><'py> for PyArrayF16_<'py> {
-//     fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
-//         if let Ok(array) = ob.downcast::<PyArrayDyn<half::f16>>() {
-//             return Ok(Self {
-//                 arr: array.readonly(),
-//             });
-//         }
-//         Err(pyo3::exceptions::PyRuntimeError::new_err(
-//             "Could not parse array as f16 numpy array".to_string(),
-//         ))
-//     }
-// }
 
 #[derive(Debug)]
 pub enum Error {
@@ -116,21 +90,87 @@ pub enum ImageDest3<'py> {
     Float64(PyReadwriteArray3<'py, f64>),
 }
 
-#[pyclass(eq, eq_int)]
+/// Pixel format for image tensors.
+///
+/// Each variant maps directly to an `edgefirst_tensor::PixelFormat` value.
+#[pyclass(name = "PixelFormat", eq, eq_int)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(clippy::upper_case_acronyms)]
-#[allow(non_camel_case_types)]
-pub enum FourCC {
-    YUYV,
-    VYUY,
-    RGBA,
-    BGRA,
-    RGB,
-    NV12,
-    NV16,
-    GREY,
-    PLANAR_RGB,
-    PLANAR_RGBA,
+pub enum PyPixelFormat {
+    Rgb = 1,
+    Rgba = 2,
+    Bgra = 3,
+    Grey = 4,
+    Yuyv = 5,
+    Vyuy = 6,
+    Nv12 = 7,
+    Nv16 = 8,
+    PlanarRgb = 9,
+    PlanarRgba = 10,
+}
+
+#[pymethods]
+impl PyPixelFormat {
+    #[new]
+    pub fn new(name: &str) -> Result<Self> {
+        Self::try_from(name)
+    }
+}
+
+impl TryFrom<&str> for PyPixelFormat {
+    type Error = Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value.to_uppercase().as_str() {
+            "YUYV" => Ok(PyPixelFormat::Yuyv),
+            "VYUY" => Ok(PyPixelFormat::Vyuy),
+            "RGBA" => Ok(PyPixelFormat::Rgba),
+            "BGRA" => Ok(PyPixelFormat::Bgra),
+            "RGB" | "RGB " => Ok(PyPixelFormat::Rgb),
+            "NV12" => Ok(PyPixelFormat::Nv12),
+            "NV16" => Ok(PyPixelFormat::Nv16),
+            "Y800" | "GREY" | "GRAY" => Ok(PyPixelFormat::Grey),
+            "8BPS" | "PLANAR_RGB" | "PLANARRGB" => Ok(PyPixelFormat::PlanarRgb),
+            "PLANAR_RGBA" | "PLANARRGBA" => Ok(PyPixelFormat::PlanarRgba),
+            _ => Err(Error::Format(value.to_string())),
+        }
+    }
+}
+
+impl From<PyPixelFormat> for PixelFormat {
+    fn from(val: PyPixelFormat) -> Self {
+        match val {
+            PyPixelFormat::Rgb => PixelFormat::Rgb,
+            PyPixelFormat::Rgba => PixelFormat::Rgba,
+            PyPixelFormat::Bgra => PixelFormat::Bgra,
+            PyPixelFormat::Grey => PixelFormat::Grey,
+            PyPixelFormat::Yuyv => PixelFormat::Yuyv,
+            PyPixelFormat::Vyuy => PixelFormat::Vyuy,
+            PyPixelFormat::Nv12 => PixelFormat::Nv12,
+            PyPixelFormat::Nv16 => PixelFormat::Nv16,
+            PyPixelFormat::PlanarRgb => PixelFormat::PlanarRgb,
+            PyPixelFormat::PlanarRgba => PixelFormat::PlanarRgba,
+        }
+    }
+}
+
+impl TryFrom<PixelFormat> for PyPixelFormat {
+    type Error = Error;
+
+    fn try_from(val: PixelFormat) -> Result<Self, Self::Error> {
+        match val {
+            PixelFormat::Rgb => Ok(PyPixelFormat::Rgb),
+            PixelFormat::Rgba => Ok(PyPixelFormat::Rgba),
+            PixelFormat::Bgra => Ok(PyPixelFormat::Bgra),
+            PixelFormat::Grey => Ok(PyPixelFormat::Grey),
+            PixelFormat::Yuyv => Ok(PyPixelFormat::Yuyv),
+            PixelFormat::Vyuy => Ok(PyPixelFormat::Vyuy),
+            PixelFormat::Nv12 => Ok(PyPixelFormat::Nv12),
+            PixelFormat::Nv16 => Ok(PyPixelFormat::Nv16),
+            PixelFormat::PlanarRgb => Ok(PyPixelFormat::PlanarRgb),
+            PixelFormat::PlanarRgba => Ok(PyPixelFormat::PlanarRgba),
+            _ => Err(Error::Format(format!("unsupported pixel format: {val:?}"))),
+        }
+    }
 }
 
 #[pyclass(eq, eq_int)]
@@ -143,264 +183,144 @@ pub enum Normalization {
     RAW,
 }
 
-#[pymethods]
-impl FourCC {
-    #[new]
-    pub fn new(fourcc: &str) -> Result<Self> {
-        Self::try_from(fourcc)
+/// Normalize image tensor data and write to a numpy array.
+/// Called from PyTensor.normalize_to_numpy() in tensor.rs.
+pub(crate) fn normalize_tensor_to_numpy(
+    tensor_dyn: &TensorDyn,
+    dst: ImageDest3,
+    normalization: Normalization,
+    zero_point: Option<i64>,
+) -> Result<()> {
+    let _timer = crate::FunctionTimer::new("normalize_to_numpy".to_string());
+
+    let tensor_u8 = tensor_dyn
+        .as_u8()
+        .ok_or_else(|| Error::Format("Tensor is not U8".to_string()))?;
+    let shape = tensor_u8.shape();
+    let shape = [shape[0], shape[1], shape[2]];
+    let dst_shape = match &dst {
+        ImageDest3::UInt8(dst) => dst.shape(),
+        ImageDest3::Int8(dst) => dst.shape(),
+        ImageDest3::Float16(dst) => dst.shape(),
+        ImageDest3::Float32(dst) => dst.shape(),
+        ImageDest3::Float64(dst) => dst.shape(),
     }
-}
+    .to_vec();
 
-impl TryFrom<&str> for FourCC {
-    type Error = Error;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value.to_uppercase().as_str() {
-            "YUYV" => Ok(FourCC::YUYV),
-            "VYUY" => Ok(FourCC::VYUY),
-            "RGBA" => Ok(FourCC::RGBA),
-            "BGRA" => Ok(FourCC::BGRA),
-            "RGB" | "RGB " => Ok(FourCC::RGB),
-            "NV12" => Ok(FourCC::NV12),
-            "Y800" | "GREY" | "GRAY" => Ok(FourCC::GREY),
-            "8BPS" => Ok(FourCC::PLANAR_RGB),
-            _ => Err(Error::Format(value.to_string())),
-        }
-    }
-}
-
-impl From<FourCC> for FourCharCode {
-    fn from(val: FourCC) -> Self {
-        match val {
-            FourCC::YUYV => image::YUYV,
-            FourCC::VYUY => image::VYUY,
-            FourCC::RGBA => image::RGBA,
-            FourCC::BGRA => image::BGRA,
-            FourCC::RGB => image::RGB,
-            FourCC::NV12 => image::NV12,
-            FourCC::NV16 => image::NV16,
-            FourCC::GREY => image::GREY,
-            FourCC::PLANAR_RGB => image::PLANAR_RGB,
-            FourCC::PLANAR_RGBA => image::PLANAR_RGBA,
-        }
-    }
-}
-
-impl TryFrom<FourCharCode> for FourCC {
-    type Error = Error;
-
-    fn try_from(value: FourCharCode) -> Result<Self, Self::Error> {
-        Self::try_from(value.to_string().to_uppercase().as_str())
-    }
-}
-
-#[pyclass(name = "TensorImage")]
-pub struct PyTensorImage(pub(crate) image::TensorImage);
-
-#[pymethods]
-impl PyTensorImage {
-    #[new]
-    #[pyo3(signature = (width, height, fourcc = FourCC::RGBA, mem = None))]
-    pub fn new(
-        width: usize,
-        height: usize,
-        fourcc: FourCC,
-        mem: Option<PyTensorMemory>,
-    ) -> Result<Self> {
-        let fourcc: FourCharCode = fourcc.into();
-        let mem = mem.map(|x| x.into());
-        let tensor_image = image::TensorImage::new(width, height, fourcc, mem)?;
-        Ok(PyTensorImage(tensor_image))
+    if dst_shape[..2] != shape[..2] {
+        return Err(Error::Format(format!(
+            "Shape Mismatch: Expected {:?} but got {:?}",
+            shape, dst_shape
+        )));
     }
 
-    #[cfg(target_os = "linux")]
-    #[staticmethod]
-    #[pyo3(signature = (fd, shape, fourcc))]
-    pub fn from_fd(fd: RawFd, shape: Vec<usize>, fourcc: FourCC) -> Result<Self> {
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let tensor = tensor::Tensor::from_fd(fd, &shape, None)?;
-        let tensor_image = image::TensorImage::from_tensor(tensor, fourcc.into())?;
-        Ok(PyTensorImage(tensor_image))
-    }
-
-    #[staticmethod]
-    #[pyo3(signature = (data, fourcc = Some(FourCC::RGBA), mem = None))]
-    pub fn load_from_bytes(
-        data: &[u8],
-        fourcc: Option<FourCC>,
-        mem: Option<PyTensorMemory>,
-    ) -> Result<Self> {
-        let fourcc = fourcc.map(|f| f.into());
-        let mem = mem.map(|x| x.into());
-        let tensor_image = image::TensorImage::load(data, fourcc, mem)?;
-        Ok(PyTensorImage(tensor_image))
-    }
-
-    #[staticmethod]
-    #[pyo3(signature = (filename, fourcc = Some(FourCC::RGBA), mem = None))]
-    pub fn load(
-        filename: &str,
-        fourcc: Option<FourCC>,
-        mem: Option<PyTensorMemory>,
-    ) -> Result<Self> {
-        let fourcc = fourcc.map(|f| f.into());
-        let data = std::fs::read(filename)?;
-        let mem = mem.map(|x| x.into());
-        let tensor_image = image::TensorImage::load(&data, fourcc, mem)?;
-        Ok(PyTensorImage(tensor_image))
-    }
-
-    #[pyo3(signature = (filename, quality=80))]
-    pub fn save_jpeg(&self, filename: &str, quality: u8) -> Result<()> {
-        self.0.save_jpeg(filename, quality)?;
-        Ok(())
-    }
-
-    #[pyo3(signature = (dst, normalization=Normalization::DEFAULT, zero_point=None))]
-    pub fn normalize_to_numpy(
-        &self,
-        dst: ImageDest3,
-        normalization: Normalization,
-        zero_point: Option<i64>,
-    ) -> Result<()> {
-        let _timer = FunctionTimer::new("normalize_to_numpy".to_string());
-
-        let tensor = &self.0;
-        let shape = tensor.tensor().shape();
-        let shape = [shape[0], shape[1], shape[2]];
-        let dst_shape = match &dst {
-            ImageDest3::UInt8(dst) => dst.shape(),
-            ImageDest3::Int8(dst) => dst.shape(),
-            ImageDest3::Float16(dst) => dst.shape(),
-            ImageDest3::Float32(dst) => dst.shape(),
-            ImageDest3::Float64(dst) => dst.shape(),
-        }
-        .to_vec();
-
-        if dst_shape[..2] != shape[..2] {
+    let fmt = tensor_dyn.format();
+    if fmt == Some(PixelFormat::Rgba) {
+        if dst_shape[2] != 4 && dst_shape[2] != 3 {
             return Err(Error::Format(format!(
                 "Shape Mismatch: Expected {:?} but got {:?}",
                 shape, dst_shape
             )));
         }
-
-        match self.0.fourcc() {
-            RGBA => {
-                if dst_shape[2] != 4 && dst_shape[2] != 3 {
-                    return Err(Error::Format(format!(
-                        "Shape Mismatch: Expected {:?} but got {:?}",
-                        shape, dst_shape
-                    )));
-                }
-            }
-            _ => {
-                if dst_shape[2] != shape[2] {
-                    return Err(Error::Format(format!(
-                        "Shape Mismatch: Expected {:?} but got {:?}",
-                        shape, dst_shape
-                    )));
-                }
-            }
-        }
-
-        match dst {
-            ImageDest3::UInt8(mut dst) => normalize_to_uint8(
-                &self.0,
-                shape,
-                &mut dst,
-                [dst_shape[0], dst_shape[1], dst_shape[2]],
-                normalization,
-                zero_point,
-            ),
-            ImageDest3::Int8(mut dst) => normalize_to_int8(
-                &self.0,
-                shape,
-                &mut dst,
-                [dst_shape[0], dst_shape[1], dst_shape[2]],
-                normalization,
-                zero_point,
-            ),
-            ImageDest3::Float16(mut dst) => normalize_to_float_16(
-                &self.0,
-                shape,
-                &mut dst,
-                [dst_shape[0], dst_shape[1], dst_shape[2]],
-                normalization,
-                zero_point,
-            ),
-            ImageDest3::Float32(mut dst) => normalize_to_float_32(
-                &self.0,
-                shape,
-                &mut dst,
-                [dst_shape[0], dst_shape[1], dst_shape[2]],
-                normalization,
-                zero_point,
-            ),
-            ImageDest3::Float64(mut dst) => normalize_to_float_64(
-                &self.0,
-                shape,
-                &mut dst,
-                [dst_shape[0], dst_shape[1], dst_shape[2]],
-                normalization,
-                zero_point,
-            ),
-        }
+    } else if dst_shape[2] != shape[2] {
+        return Err(Error::Format(format!(
+            "Shape Mismatch: Expected {:?} but got {:?}",
+            shape, dst_shape
+        )));
     }
 
-    pub fn copy_from_numpy(&mut self, src: PyArrayLike3<u8>) -> Result<()> {
-        let src = src.as_array();
-        let tensor = &self.0;
-        let shape = [tensor.height(), tensor.width(), tensor.channels()];
-        if src.shape() != shape {
-            return Err(Error::Format(format!(
-                "Shape Mismatch: Expected {:?} but got {:?}",
-                shape,
-                src.shape()
-            )));
-        }
+    let is_rgba = fmt == Some(PixelFormat::Rgba);
 
-        let mut map = tensor.tensor().map()?;
-        let data = map.as_mut_slice();
-        let mut ndarray = ArrayViewMut3::from_shape(shape, data)?;
-        ndarray.assign(&src);
-        Ok(())
+    match dst {
+        ImageDest3::UInt8(mut dst) => normalize_to_uint8(
+            tensor_u8,
+            shape,
+            &mut dst,
+            [dst_shape[0], dst_shape[1], dst_shape[2]],
+            normalization,
+            zero_point,
+            is_rgba,
+        ),
+        ImageDest3::Int8(mut dst) => normalize_to_int8(
+            tensor_u8,
+            shape,
+            &mut dst,
+            [dst_shape[0], dst_shape[1], dst_shape[2]],
+            normalization,
+            zero_point,
+            is_rgba,
+        ),
+        ImageDest3::Float16(mut dst) => normalize_to_float_16(
+            tensor_u8,
+            shape,
+            &mut dst,
+            [dst_shape[0], dst_shape[1], dst_shape[2]],
+            normalization,
+            zero_point,
+            is_rgba,
+        ),
+        ImageDest3::Float32(mut dst) => normalize_to_float_32(
+            tensor_u8,
+            shape,
+            &mut dst,
+            [dst_shape[0], dst_shape[1], dst_shape[2]],
+            normalization,
+            zero_point,
+            is_rgba,
+        ),
+        ImageDest3::Float64(mut dst) => normalize_to_float_64(
+            tensor_u8,
+            shape,
+            &mut dst,
+            [dst_shape[0], dst_shape[1], dst_shape[2]],
+            normalization,
+            zero_point,
+            is_rgba,
+        ),
+    }
+}
+
+/// Copy data from a numpy array into a tensor.
+/// Called from PyTensor.copy_from_numpy() in tensor.rs.
+pub(crate) fn copy_numpy_to_tensor(tensor_dyn: &TensorDyn, src: PyArrayLike3<u8>) -> Result<()> {
+    let src = src.as_array();
+    let tensor_u8 = tensor_dyn
+        .as_u8()
+        .ok_or_else(|| Error::Format("Tensor is not U8".to_string()))?;
+    let w = tensor_u8
+        .width()
+        .ok_or_else(|| Error::Format("not an image".to_string()))?;
+    let h = tensor_u8
+        .height()
+        .ok_or_else(|| Error::Format("not an image".to_string()))?;
+    let fmt = tensor_u8
+        .format()
+        .ok_or_else(|| Error::Format("not an image".to_string()))?;
+    let shape = [h, w, fmt.channels()];
+    if src.shape() != shape {
+        return Err(Error::Format(format!(
+            "Shape Mismatch: Expected {:?} but got {:?}",
+            shape,
+            src.shape()
+        )));
     }
 
-    #[getter]
-    pub fn format(&self) -> Result<FourCC> {
-        self.0.fourcc().try_into()
-    }
-
-    #[getter]
-    pub fn width(&self) -> usize {
-        self.0.width()
-    }
-
-    #[getter]
-    pub fn height(&self) -> usize {
-        self.0.height()
-    }
-
-    #[getter]
-    pub fn is_planar(&self) -> bool {
-        self.0.is_planar()
-    }
-
-    pub fn map(&self) -> Result<PyTensorMap> {
-        Ok(PyTensorMap {
-            mapped: Some(self.0.tensor().map().map(TensorMapT::TensorU8)?),
-        })
-    }
+    let mut map = tensor_u8.map()?;
+    let data = map.as_mut_slice();
+    let mut ndarray = ArrayViewMut3::from_shape(shape, data)?;
+    ndarray.assign(&src);
+    Ok(())
 }
 
 #[inline(always)]
 fn normalize_to_uint8<'py>(
-    tensor: &TensorImage,
+    tensor: &tensor::Tensor<u8>,
     shape: [usize; 3],
     dst: &mut PyReadwriteArray3<'py, u8>,
     dst_shape: [usize; 3],
     normalization: Normalization,
     zero_point: Option<i64>,
+    is_rgba: bool,
 ) -> Result<()> {
     if !matches!(normalization, Normalization::RAW | Normalization::DEFAULT) {
         return Err(Error::InvalidArg(
@@ -413,11 +333,11 @@ fn normalize_to_uint8<'py>(
         ));
     }
     let mut dst = dst.as_array_mut();
-    let map = tensor.tensor().map()?;
+    let map = tensor.map()?;
     let data = map.as_slice();
     let ndarray = ArrayView3::from_shape(shape, data)?;
 
-    if tensor.fourcc() == RGBA && dst_shape[2] == 3 {
+    if is_rgba && dst_shape[2] == 3 {
         if let Some(dst) = dst.as_slice_mut() {
             let dst = dst.as_chunks_mut::<3>().0;
             let src = data.as_chunks::<4>().0;
@@ -435,17 +355,19 @@ fn normalize_to_uint8<'py>(
         .and(&ndarray.slice(ndarray::s![.., .., ..dst_shape[2]]))
         .into_par_iter()
         .for_each(|(x, y)| *x = *y);
+
     Ok(())
 }
 
 #[inline(always)]
 fn normalize_to_int8<'py>(
-    tensor: &TensorImage,
+    tensor: &tensor::Tensor<u8>,
     shape: [usize; 3],
     dst: &mut PyReadwriteArray3<'py, i8>,
     dst_shape: [usize; 3],
     normalization: Normalization,
     zero_point: Option<i64>,
+    is_rgba: bool,
 ) -> Result<()> {
     if !matches!(
         normalization,
@@ -467,10 +389,10 @@ fn normalize_to_int8<'py>(
         128
     };
     let mut dst = dst.as_array_mut();
-    let map = tensor.tensor().map()?;
+    let map = tensor.map()?;
     let data = map.as_slice();
     let ndarray = ArrayView3::from_shape(shape, data)?;
-    if tensor.fourcc() == RGBA && dst_shape[2] == 3 {
+    if is_rgba && dst_shape[2] == 3 {
         if let Some(dst) = dst.as_slice_mut() {
             let dst = dst.as_chunks_mut::<3>().0;
             let src = data.as_chunks::<4>().0;
@@ -509,12 +431,13 @@ fn normalize_to_int8<'py>(
 #[inline(always)]
 #[cfg(nightly)]
 fn normalize_to_float_16<'py>(
-    tensor: &TensorImage,
+    tensor: &tensor::Tensor<u8>,
     shape: [usize; 3],
     dst: &mut PyReadwriteArray3<'py, half::f16>,
     dst_shape: [usize; 3],
     normalization: Normalization,
     zero_point: Option<i64>,
+    is_rgba: bool,
 ) -> Result<()> {
     let dst: ArrayViewMut3<half::f16> = dst.as_array_mut();
     // SAFETY: half::f16 has the same memory layout as native f16
@@ -543,10 +466,10 @@ fn normalize_to_float_16<'py>(
         }
     };
 
-    let map = tensor.tensor().map()?;
+    let map = tensor.map()?;
     let data = map.as_slice();
     let ndarray = ArrayView3::from_shape(shape, data)?;
-    if tensor.fourcc() == RGBA && dst_shape[2] == 3 {
+    if is_rgba && dst_shape[2] == 3 {
         if let Some(dst) = dst.as_slice_mut() {
             let dst = dst.as_chunks_mut::<3>().0;
             let src = data.as_chunks::<4>().0;
@@ -602,16 +525,17 @@ fn normalize_to_float_16<'py>(
 #[inline(always)]
 #[cfg(not(nightly))]
 fn normalize_to_float_16<'py>(
-    tensor: &TensorImage,
+    tensor: &tensor::Tensor<u8>,
     shape: [usize; 3],
     dst: &mut PyReadwriteArray3<'py, half::f16>,
     dst_shape: [usize; 3],
     normalization: Normalization,
     zero_point: Option<i64>,
+    is_rgba: bool,
 ) -> Result<()> {
     use half::slice::HalfFloatSliceExt;
     let mut dst: ArrayViewMut3<half::f16> = dst.as_array_mut();
-    let map = tensor.tensor().map()?;
+    let map = tensor.map()?;
     let data = map.as_slice();
     let ndarray = ArrayView3::from_shape(shape, data)?;
 
@@ -622,7 +546,7 @@ fn normalize_to_float_16<'py>(
             )));
         }
         match normalization {
-            Normalization::SIGNED | Normalization::DEFAULT => zp as f32 / 255.0,
+            Normalization::SIGNED | Normalization::DEFAULT => zp as f32 / 127.5,
             Normalization::UNSIGNED | Normalization::RAW if zp != 0 => {
                 return Err(Error::InvalidArg(
                     "RAW or UNSIGNED normalization does not support setting zero point".to_string(),
@@ -637,7 +561,7 @@ fn normalize_to_float_16<'py>(
         }
     };
 
-    if tensor.fourcc() == RGBA && dst_shape[2] == 3 {
+    if is_rgba && dst_shape[2] == 3 {
         if let Some(dst) = dst.as_slice_mut() {
             let mut tmp = vec![0.0; dst.len()];
             let tmp_ = tmp.as_chunks_mut::<3>().0;
@@ -673,6 +597,7 @@ fn normalize_to_float_16<'py>(
                 d.convert_from_f32_slice(s);
             });
             dst.1.convert_from_f32_slice(tmp_.1);
+            return Ok(());
         }
     }
     match normalization {
@@ -707,15 +632,16 @@ fn normalize_to_float_16<'py>(
 
 #[inline(always)]
 fn normalize_to_float_32<'py>(
-    tensor: &TensorImage,
+    tensor: &tensor::Tensor<u8>,
     shape: [usize; 3],
     dst: &mut PyReadwriteArray3<'py, f32>,
     dst_shape: [usize; 3],
     normalization: Normalization,
     zero_point: Option<i64>,
+    is_rgba: bool,
 ) -> Result<()> {
     let mut dst = dst.as_array_mut();
-    let map = tensor.tensor().map()?;
+    let map = tensor.map()?;
     let data = map.as_slice();
     let ndarray = ArrayView3::from_shape(shape, data)?;
 
@@ -726,7 +652,7 @@ fn normalize_to_float_32<'py>(
             )));
         }
         match normalization {
-            Normalization::SIGNED | Normalization::DEFAULT => zp as f32 / 255.0,
+            Normalization::SIGNED | Normalization::DEFAULT => zp as f32 / 127.5,
             Normalization::UNSIGNED | Normalization::RAW if zp != 0 => {
                 return Err(Error::InvalidArg(
                     "RAW or UNSIGNED normalization does not support setting zero point".to_string(),
@@ -741,7 +667,7 @@ fn normalize_to_float_32<'py>(
         }
     };
 
-    if tensor.fourcc() == RGBA && dst_shape[2] == 3 {
+    if is_rgba && dst_shape[2] == 3 {
         if let Some(dst) = dst.as_slice_mut() {
             let dst = dst.as_chunks_mut::<3>().0;
             let src = data.as_chunks::<4>().0;
@@ -792,15 +718,16 @@ fn normalize_to_float_32<'py>(
 
 #[inline(always)]
 fn normalize_to_float_64<'py>(
-    tensor: &TensorImage,
+    tensor: &tensor::Tensor<u8>,
     shape: [usize; 3],
     dst: &mut PyReadwriteArray3<'py, f64>,
     dst_shape: [usize; 3],
     normalization: Normalization,
     zero_point: Option<i64>,
+    is_rgba: bool,
 ) -> Result<()> {
     let mut dst = dst.as_array_mut();
-    let map = tensor.tensor().map()?;
+    let map = tensor.map()?;
     let data = map.as_slice();
     let ndarray = ArrayView3::from_shape(shape, data)?;
 
@@ -811,13 +738,13 @@ fn normalize_to_float_64<'py>(
             )));
         }
         match normalization {
-            Normalization::SIGNED | Normalization::DEFAULT => zp as f64 / 255.0,
+            Normalization::SIGNED | Normalization::DEFAULT => zp as f64 / 127.5,
             Normalization::UNSIGNED | Normalization::RAW if zp != 0 => {
                 return Err(Error::InvalidArg(
                     "RAW or UNSIGNED normalization does not support setting zero point".to_string(),
                 ));
             }
-            _ => 0.1,
+            _ => 0.0,
         }
     } else {
         match normalization {
@@ -826,7 +753,7 @@ fn normalize_to_float_64<'py>(
         }
     };
 
-    if tensor.fourcc() == RGBA && dst_shape[2] == 3 {
+    if is_rgba && dst_shape[2] == 3 {
         if let Some(dst) = dst.as_slice_mut() {
             let dst = dst.as_chunks_mut::<3>().0;
             let src = data.as_chunks::<4>().0;
@@ -970,34 +897,33 @@ impl PyImageProcessor {
     #[pyo3(signature = (src, dst, rotation = PyRotation::Rotate0, flip = PyFlip::NoFlip, src_crop = None, dst_crop = None, dst_color = None))]
     pub fn convert(
         &mut self,
-        src: &PyTensorImage,
-        dst: &mut PyTensorImage,
+        src: &PyTensor,
+        dst: &mut PyTensor,
         rotation: PyRotation,
         flip: PyFlip,
         src_crop: Option<PyRect>,
         dst_crop: Option<PyRect>,
         dst_color: Option<[u8; 4]>,
     ) -> Result<()> {
-        if let Ok(mut l) = self.0.lock() {
-            l.convert(
-                &src.0,
-                &mut dst.0,
-                rotation.into(),
-                flip.into(),
-                Crop {
-                    src_rect: src_crop.map(|x| x.into()),
-                    dst_rect: dst_crop.map(|x| x.into()),
-                    dst_color,
-                },
-            )?
+        let rotation = rotation.into();
+        let flip = flip.into();
+        let crop = Crop {
+            src_rect: src_crop.map(|x| x.into()),
+            dst_rect: dst_crop.map(|x| x.into()),
+            dst_color,
         };
+        let mut l = self
+            .0
+            .lock()
+            .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
+        l.convert(&src.0, &mut dst.0, rotation, flip, crop)?;
         Ok(())
     }
 
     #[pyo3(signature = (dst, bbox, scores, classes, seg=vec![]))]
     pub fn draw_masks(
         &mut self,
-        dst: &mut PyTensorImage,
+        dst: &mut PyTensor,
         bbox: PyReadonlyArray2<f32>,
         scores: PyReadonlyArray1<f32>,
         classes: PyReadonlyArray1<usize>,
@@ -1064,10 +990,11 @@ impl PyImageProcessor {
                 }
             })
             .collect::<Vec<_>>();
-        if let Ok(mut l) = self.0.lock() {
-            l.draw_masks(&mut dst.0, &detect, &seg)?
-        };
-        // Ok(PyTensorImage(dst_image))
+        let mut l = self
+            .0
+            .lock()
+            .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
+        l.draw_masks(&mut dst.0, &detect, &seg)?;
         Ok(())
     }
 
@@ -1076,26 +1003,59 @@ impl PyImageProcessor {
     /// Selects the best available backing storage based on hardware capabilities:
     /// DMA-buf > PBO (GPU buffer) > system memory. Images created this way benefit
     /// from zero-copy GPU paths when used with this processor's convert().
-    #[pyo3(signature = (width, height, fourcc = FourCC::RGBA))]
+    #[pyo3(signature = (width, height, format = PyPixelFormat::Rgba, dtype = "uint8"))]
     pub fn create_image(
         &self,
         width: usize,
         height: usize,
-        fourcc: FourCC,
-    ) -> Result<PyTensorImage> {
-        let fourcc: four_char_code::FourCharCode = fourcc.into();
-        let img = self
+        format: PyPixelFormat,
+        dtype: &str,
+    ) -> Result<PyTensor> {
+        let fmt: PixelFormat = format.into();
+        let dt = crate::tensor::parse_dtype(dtype).map_err(|e| Error::InvalidArg(e.to_string()))?;
+        let dyn_tensor = self
             .0
             .lock()
             .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?
-            .create_image(width, height, fourcc)?;
-        Ok(PyTensorImage(img))
+            .create_image(width, height, fmt, dt, None)?;
+        Ok(PyTensor(dyn_tensor))
+    }
+
+    /// Create an image tensor backed by an external DMA-BUF file descriptor.
+    ///
+    /// The GPU renders directly into this buffer via EGL DMA-BUF import —
+    /// no CPU copy is needed after ``convert()``. The caller retains ownership
+    /// of the underlying buffer; the returned tensor borrows it via ``dup(fd)``.
+    #[cfg(target_os = "linux")]
+    #[pyo3(signature = (fd, width, height, format, dtype = "uint8"))]
+    pub fn create_image_from_fd(
+        &self,
+        fd: std::os::fd::RawFd,
+        width: usize,
+        height: usize,
+        format: PyPixelFormat,
+        dtype: &str,
+    ) -> Result<PyTensor> {
+        use std::os::fd::BorrowedFd;
+        if fd < 0 {
+            return Err(Error::InvalidArg("Invalid file descriptor".to_string()));
+        }
+        let fmt: PixelFormat = format.into();
+        let dt = crate::tensor::parse_dtype(dtype).map_err(|e| Error::InvalidArg(e.to_string()))?;
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        let dyn_tensor = self
+            .0
+            .lock()
+            .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?
+            .create_image_from_fd(borrowed, width, height, fmt, dt)?;
+        Ok(PyTensor(dyn_tensor))
     }
 
     pub fn set_class_colors(&mut self, colors: Vec<[u8; 4]>) -> Result<()> {
-        if let Ok(mut l) = self.0.lock() {
-            l.set_class_colors(&colors)?
-        };
+        self.0
+            .lock()
+            .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?
+            .set_class_colors(&colors)?;
         Ok(())
     }
 
@@ -1116,9 +1076,10 @@ impl PyImageProcessor {
             )))
             }
         };
-        if let Ok(mut l) = self.0.lock() {
-            l.set_int8_interpolation_mode(mode)?
-        };
+        self.0
+            .lock()
+            .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?
+            .set_int8_interpolation_mode(mode)?;
         Ok(())
     }
 }

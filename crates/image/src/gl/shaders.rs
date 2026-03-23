@@ -2,14 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::Error;
-use four_char_code::FourCharCode;
+use edgefirst_tensor::PixelFormat;
 use gbm::drm::buffer::DrmFourcc;
 use log::error;
 use std::ffi::{c_char, CString};
 use std::ptr::null;
 use std::str::FromStr;
-
-use crate::{BGRA, GREY, NV12, PLANAR_RGB, PLANAR_RGB_INT8, RGB, RGBA, RGB_INT8, VYUY, YUYV};
 
 pub(super) fn compile_shader_from_str(
     shader: u32,
@@ -60,18 +58,18 @@ pub(super) fn check_gl_error(name: &str, line: u32) -> Result<(), Error> {
     Ok(())
 }
 
-pub(super) fn fourcc_to_drm(fourcc: FourCharCode) -> Result<DrmFourcc, Error> {
-    match fourcc {
-        RGBA => Ok(DrmFourcc::Abgr8888),
-        BGRA => Ok(DrmFourcc::Argb8888),
-        YUYV => Ok(DrmFourcc::Yuyv),
-        VYUY => Ok(DrmFourcc::Vyuy),
-        RGB | RGB_INT8 => Ok(DrmFourcc::Bgr888),
-        GREY => Ok(DrmFourcc::R8),
-        NV12 => Ok(DrmFourcc::Nv12),
-        PLANAR_RGB | PLANAR_RGB_INT8 => Ok(DrmFourcc::R8),
+pub(super) fn pixel_format_to_drm(fmt: PixelFormat) -> Result<DrmFourcc, Error> {
+    match fmt {
+        PixelFormat::Rgba => Ok(DrmFourcc::Abgr8888),
+        PixelFormat::Bgra => Ok(DrmFourcc::Argb8888),
+        PixelFormat::Yuyv => Ok(DrmFourcc::Yuyv),
+        PixelFormat::Vyuy => Ok(DrmFourcc::Vyuy),
+        PixelFormat::Rgb => Ok(DrmFourcc::Bgr888),
+        PixelFormat::Grey => Ok(DrmFourcc::R8),
+        PixelFormat::Nv12 => Ok(DrmFourcc::Nv12),
+        PixelFormat::PlanarRgb => Ok(DrmFourcc::R8),
         _ => Err(Error::NotSupported(format!(
-            "FourCC {fourcc:?} has no DRM format mapping"
+            "PixelFormat {fmt:?} has no DRM format mapping"
         ))),
     }
 }
@@ -146,35 +144,11 @@ void main(){
 "
 }
 
-/// Int8 variant of [`generate_planar_rgb_shader`]. Applies XOR 0x80 bias
-/// to each RGB channel (uint8 → int8 conversion) using the bit-exact
-/// quantize+mod approach: `floor(v * 255 + 0.5) + 128 mod 256 / 255`.
-pub(super) fn generate_planar_rgb_int8_shader() -> &'static str {
-    "\
-#version 300 es
-#extension GL_OES_EGL_image_external_essl3 : require
-precision highp float;
-uniform samplerExternalOES tex;
-in vec3 fragPos;
-in vec2 tc;
-
-out vec4 color;
-
-vec3 int8_bias(vec3 v) {
-    vec3 q = floor(v * 255.0 + 0.5);
-    return mod(q + 128.0, 256.0) / 255.0;
-}
-
-void main(){
-    vec4 c = texture(tex, tc);
-    color = vec4(int8_bias(c.rgb), c.a);
-}
-"
-}
-
-/// Int8 variant of [`generate_texture_fragment_shader`]. Applies `fract(v + 0.5)`
-/// to each RGB channel for XOR 0x80 bias (uint8 → int8 conversion).
-/// Used by the direct RGB render path for RGB_INT8 output.
+/// Int8 variant of [`generate_texture_fragment_shader`]. Quantizes each RGB
+/// channel to uint8, applies XOR 0x80 bias via `(q + 128) mod 256`, then
+/// normalizes back. Intended for non-external 2D texture sources
+/// (e.g., RGBA/BGRA/Grey textures bound as `sampler2D`). DMA/EGLImage and
+/// other external-OES paths use [`generate_texture_int8_shader_yuv`].
 pub(super) fn generate_texture_int8_shader() -> &'static str {
     "\
 #version 300 es
@@ -201,8 +175,34 @@ void main(){
 
 /// Int8 variant of [`generate_texture_fragment_shader_yuv`]. Applies XOR 0x80 bias
 /// to each RGB channel (uint8 → int8 conversion).
-/// Used by the direct RGB render path for RGB_INT8 output with external OES sources.
+/// Used for single-pass int8 output with external OES sources (YUV EGLImage).
 pub(super) fn generate_texture_int8_shader_yuv() -> &'static str {
+    "\
+#version 300 es
+#extension GL_OES_EGL_image_external_essl3 : require
+precision highp float;
+uniform samplerExternalOES tex;
+in vec3 fragPos;
+in vec2 tc;
+
+out vec4 color;
+
+vec3 int8_bias(vec3 v) {
+    vec3 q = floor(v * 255.0 + 0.5);
+    return mod(q + 128.0, 256.0) / 255.0;
+}
+
+void main(){
+    vec4 c = texture(tex, tc);
+    color = vec4(int8_bias(c.rgb), c.a);
+}
+"
+}
+
+/// Int8 variant of [`generate_planar_rgb_shader`]. Applies XOR 0x80 bias
+/// to each RGB channel (uint8 → int8 conversion) using the bit-exact
+/// quantize+mod approach: `floor(v * 255 + 0.5) + 128 mod 256 / 255`.
+pub(super) fn generate_planar_rgb_int8_shader() -> &'static str {
     "\
 #version 300 es
 #extension GL_OES_EGL_image_external_essl3 : require

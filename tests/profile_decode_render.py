@@ -32,8 +32,8 @@ import numpy as np
 from edgefirst_hal import (
     Decoder,
     ImageProcessor,
-    TensorImage,
-    FourCC,
+    Tensor,
+    PixelFormat,
     probe_egl_displays,
 )
 
@@ -110,7 +110,7 @@ def main():
     print(f"Outputs: {[o.shape for o in outputs]}", file=sys.stderr)
 
     processor = ImageProcessor(egl_display=gpu_display)
-    dst = TensorImage(640, 640, FourCC.RGBA)
+    dst = Tensor.image(640, 640, PixelFormat.Rgba)
     decoder = Decoder(metadata, score_threshold=args.threshold, iou_threshold=0.45)
 
     # --- Warmup ---

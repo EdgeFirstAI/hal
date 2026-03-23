@@ -18,22 +18,25 @@ assert_eq!(tensor.name(), "test_tensor");
 #    Ok(())
 # }
 ```
+
 ## Overview
-The main structures and traits provided by the `edgefirst_tensor` crate is the `TensorTrait` and `TensorMapTrait` traits,
+The main structures and traits provided by the `edgefirst_tensor` crate are `TensorTrait` and `TensorMapTrait`,
 which define the behavior of Tensors and their memory mappings, respectively.
-The `Tensor` enum encapsulates different tensor implementations based on the memory type, while the `TensorMap` enum
-provides access to the underlying data.
-```
+The `Tensor<T>` struct wraps a backend-specific storage with optional image format metadata (`PixelFormat`),
+while the `TensorMap` enum provides access to the underlying data. The `TensorDyn` type-erased enum
+wraps `Tensor<T>` for runtime element-type dispatch.
  */
 #[cfg(target_os = "linux")]
 mod dma;
 #[cfg(target_os = "linux")]
 mod dmabuf;
 mod error;
+mod format;
 mod mem;
 mod pbo;
 #[cfg(unix)]
 mod shm;
+mod tensor_dyn;
 
 #[cfg(target_os = "linux")]
 pub use crate::dma::{DmaMap, DmaTensor};
@@ -42,7 +45,9 @@ pub use crate::pbo::{PboMap, PboMapping, PboOps, PboTensor};
 #[cfg(unix)]
 pub use crate::shm::{ShmMap, ShmTensor};
 pub use error::{Error, Result};
+pub use format::{PixelFormat, PixelLayout};
 use num_traits::Num;
+use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
 use std::{
@@ -53,6 +58,60 @@ use std::{
         Arc, Weak,
     },
 };
+pub use tensor_dyn::TensorDyn;
+
+/// Element type discriminant for runtime type identification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+#[non_exhaustive]
+pub enum DType {
+    U8,
+    I8,
+    U16,
+    I16,
+    U32,
+    I32,
+    U64,
+    I64,
+    F16,
+    F32,
+    F64,
+}
+
+impl DType {
+    /// Size of one element in bytes.
+    pub const fn size(&self) -> usize {
+        match self {
+            Self::U8 | Self::I8 => 1,
+            Self::U16 | Self::I16 | Self::F16 => 2,
+            Self::U32 | Self::I32 | Self::F32 => 4,
+            Self::U64 | Self::I64 | Self::F64 => 8,
+        }
+    }
+
+    /// Short type name (e.g., "u8", "f32", "f16").
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::U8 => "u8",
+            Self::I8 => "i8",
+            Self::U16 => "u16",
+            Self::I16 => "i16",
+            Self::U32 => "u32",
+            Self::I32 => "i32",
+            Self::U64 => "u64",
+            Self::I64 => "i64",
+            Self::F16 => "f16",
+            Self::F32 => "f32",
+            Self::F64 => "f64",
+        }
+    }
+}
+
+impl fmt::Display for DType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
 
 /// Monotonic counter for buffer identity IDs.
 static NEXT_BUFFER_ID: AtomicU64 = AtomicU64::new(1);
@@ -261,7 +320,8 @@ impl TryFrom<&str> for TensorMemory {
 }
 
 #[derive(Debug)]
-pub enum Tensor<T>
+#[allow(dead_code)] // Variants are constructed by downstream crates via pub(crate) helpers
+pub(crate) enum TensorStorage<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
 {
@@ -273,10 +333,229 @@ where
     Pbo(PboTensor<T>),
 }
 
+impl<T> TensorStorage<T>
+where
+    T: Num + Clone + fmt::Debug + Send + Sync,
+{
+    /// Create a new tensor storage with the given shape, memory type, and
+    /// optional name. If no name is given, a random name will be generated.
+    /// If no memory type is given, the best available memory type will be
+    /// chosen based on the platform and environment variables.
+    fn new(shape: &[usize], memory: Option<TensorMemory>, name: Option<&str>) -> Result<Self> {
+        match memory {
+            #[cfg(target_os = "linux")]
+            Some(TensorMemory::Dma) => {
+                DmaTensor::<T>::new(shape, name).map(TensorStorage::Dma)
+            }
+            #[cfg(unix)]
+            Some(TensorMemory::Shm) => {
+                ShmTensor::<T>::new(shape, name).map(TensorStorage::Shm)
+            }
+            Some(TensorMemory::Mem) => {
+                MemTensor::<T>::new(shape, name).map(TensorStorage::Mem)
+            }
+            Some(TensorMemory::Pbo) => Err(crate::error::Error::NotImplemented(
+                "PboTensor cannot be created via Tensor::new() — use ImageProcessor::create_image()".to_owned(),
+            )),
+            None => {
+                if std::env::var("EDGEFIRST_TENSOR_FORCE_MEM")
+                    .is_ok_and(|x| x != "0" && x.to_lowercase() != "false")
+                {
+                    MemTensor::<T>::new(shape, name).map(TensorStorage::Mem)
+                } else {
+                    #[cfg(target_os = "linux")]
+                    {
+                        // Linux: Try DMA -> SHM -> Mem
+                        match DmaTensor::<T>::new(shape, name) {
+                            Ok(tensor) => Ok(TensorStorage::Dma(tensor)),
+                            Err(_) => {
+                                match ShmTensor::<T>::new(shape, name)
+                                    .map(TensorStorage::Shm)
+                                {
+                                    Ok(tensor) => Ok(tensor),
+                                    Err(_) => MemTensor::<T>::new(shape, name)
+                                        .map(TensorStorage::Mem),
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(all(unix, not(target_os = "linux")))]
+                    {
+                        // macOS/BSD: Try SHM -> Mem (no DMA)
+                        match ShmTensor::<T>::new(shape, name) {
+                            Ok(tensor) => Ok(TensorStorage::Shm(tensor)),
+                            Err(_) => {
+                                MemTensor::<T>::new(shape, name).map(TensorStorage::Mem)
+                            }
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        // Windows/other: Mem only
+                        MemTensor::<T>::new(shape, name).map(TensorStorage::Mem)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Create a new tensor storage using the given file descriptor, shape,
+    /// and optional name.
+    #[cfg(unix)]
+    fn from_fd(fd: OwnedFd, shape: &[usize], name: Option<&str>) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            use nix::sys::stat::fstat;
+
+            let stat = fstat(&fd)?;
+            let major = major(stat.st_dev);
+            let minor = minor(stat.st_dev);
+
+            log::debug!("Creating tensor from fd: major={major}, minor={minor}");
+
+            if major != 0 {
+                // Dma and Shm tensors are expected to have major number 0
+                return Err(Error::UnknownDeviceType(major, minor));
+            }
+
+            match minor {
+                9 | 10 => {
+                    // minor number 9 & 10 indicates DMA memory
+                    DmaTensor::<T>::from_fd(fd, shape, name).map(TensorStorage::Dma)
+                }
+                _ => {
+                    // other minor numbers are assumed to be shared memory
+                    ShmTensor::<T>::from_fd(fd, shape, name).map(TensorStorage::Shm)
+                }
+            }
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            // On macOS/BSD, always use SHM (no DMA support)
+            ShmTensor::<T>::from_fd(fd, shape, name).map(TensorStorage::Shm)
+        }
+    }
+}
+
+impl<T> TensorTrait<T> for TensorStorage<T>
+where
+    T: Num + Clone + fmt::Debug + Send + Sync,
+{
+    fn new(shape: &[usize], name: Option<&str>) -> Result<Self> {
+        Self::new(shape, None, name)
+    }
+
+    #[cfg(unix)]
+    fn from_fd(fd: OwnedFd, shape: &[usize], name: Option<&str>) -> Result<Self> {
+        Self::from_fd(fd, shape, name)
+    }
+
+    #[cfg(unix)]
+    fn clone_fd(&self) -> Result<OwnedFd> {
+        match self {
+            #[cfg(target_os = "linux")]
+            TensorStorage::Dma(t) => t.clone_fd(),
+            TensorStorage::Shm(t) => t.clone_fd(),
+            TensorStorage::Mem(t) => t.clone_fd(),
+            TensorStorage::Pbo(t) => t.clone_fd(),
+        }
+    }
+
+    fn memory(&self) -> TensorMemory {
+        match self {
+            #[cfg(target_os = "linux")]
+            TensorStorage::Dma(_) => TensorMemory::Dma,
+            #[cfg(unix)]
+            TensorStorage::Shm(_) => TensorMemory::Shm,
+            TensorStorage::Mem(_) => TensorMemory::Mem,
+            TensorStorage::Pbo(_) => TensorMemory::Pbo,
+        }
+    }
+
+    fn name(&self) -> String {
+        match self {
+            #[cfg(target_os = "linux")]
+            TensorStorage::Dma(t) => t.name(),
+            #[cfg(unix)]
+            TensorStorage::Shm(t) => t.name(),
+            TensorStorage::Mem(t) => t.name(),
+            TensorStorage::Pbo(t) => t.name(),
+        }
+    }
+
+    fn shape(&self) -> &[usize] {
+        match self {
+            #[cfg(target_os = "linux")]
+            TensorStorage::Dma(t) => t.shape(),
+            #[cfg(unix)]
+            TensorStorage::Shm(t) => t.shape(),
+            TensorStorage::Mem(t) => t.shape(),
+            TensorStorage::Pbo(t) => t.shape(),
+        }
+    }
+
+    fn reshape(&mut self, shape: &[usize]) -> Result<()> {
+        match self {
+            #[cfg(target_os = "linux")]
+            TensorStorage::Dma(t) => t.reshape(shape),
+            #[cfg(unix)]
+            TensorStorage::Shm(t) => t.reshape(shape),
+            TensorStorage::Mem(t) => t.reshape(shape),
+            TensorStorage::Pbo(t) => t.reshape(shape),
+        }
+    }
+
+    fn map(&self) -> Result<TensorMap<T>> {
+        match self {
+            #[cfg(target_os = "linux")]
+            TensorStorage::Dma(t) => t.map(),
+            #[cfg(unix)]
+            TensorStorage::Shm(t) => t.map(),
+            TensorStorage::Mem(t) => t.map(),
+            TensorStorage::Pbo(t) => t.map(),
+        }
+    }
+
+    fn buffer_identity(&self) -> &BufferIdentity {
+        match self {
+            #[cfg(target_os = "linux")]
+            TensorStorage::Dma(t) => t.buffer_identity(),
+            #[cfg(unix)]
+            TensorStorage::Shm(t) => t.buffer_identity(),
+            TensorStorage::Mem(t) => t.buffer_identity(),
+            TensorStorage::Pbo(t) => t.buffer_identity(),
+        }
+    }
+}
+
+/// Multi-backend tensor with optional image format metadata.
+///
+/// When `format` is `Some`, this tensor represents an image. Width, height,
+/// and channels are derived from `shape` + `format`. When `format` is `None`,
+/// this is a raw tensor (identical to the pre-refactoring behavior).
+#[derive(Debug)]
+pub struct Tensor<T>
+where
+    T: Num + Clone + fmt::Debug + Send + Sync,
+{
+    pub(crate) storage: TensorStorage<T>,
+    format: Option<PixelFormat>,
+    chroma: Option<Box<Tensor<T>>>,
+}
+
 impl<T> Tensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
 {
+    /// Wrap a TensorStorage in a Tensor with no image metadata.
+    pub(crate) fn wrap(storage: TensorStorage<T>) -> Self {
+        Self {
+            storage,
+            format: None,
+            chroma: None,
+        }
+    }
+
     /// Create a new tensor with the given shape, memory type, and optional
     /// name. If no name is given, a random name will be generated. If no
     /// memory type is given, the best available memory type will be chosen
@@ -302,47 +581,264 @@ where
     /// # }
     /// ```
     pub fn new(shape: &[usize], memory: Option<TensorMemory>, name: Option<&str>) -> Result<Self> {
-        match memory {
-            #[cfg(target_os = "linux")]
-            Some(TensorMemory::Dma) => DmaTensor::<T>::new(shape, name).map(Tensor::Dma),
-            #[cfg(unix)]
-            Some(TensorMemory::Shm) => ShmTensor::<T>::new(shape, name).map(Tensor::Shm),
-            Some(TensorMemory::Mem) => MemTensor::<T>::new(shape, name).map(Tensor::Mem),
-            Some(TensorMemory::Pbo) => Err(crate::error::Error::NotImplemented(
-                "PboTensor cannot be created via Tensor::new() — use ImageProcessor::create_image()".to_owned(),
-            )),
-            None => {
-                if std::env::var("EDGEFIRST_TENSOR_FORCE_MEM")
-                    .is_ok_and(|x| x != "0" && x.to_lowercase() != "false")
-                {
-                    MemTensor::<T>::new(shape, name).map(Tensor::Mem)
+        TensorStorage::new(shape, memory, name).map(Self::wrap)
+    }
+
+    /// Create an image tensor with the given format.
+    pub fn image(
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+        memory: Option<TensorMemory>,
+    ) -> Result<Self> {
+        let shape = match format.layout() {
+            PixelLayout::Packed => vec![height, width, format.channels()],
+            PixelLayout::Planar => vec![format.channels(), height, width],
+            PixelLayout::SemiPlanar => {
+                // Contiguous semi-planar: luma + interleaved chroma in one allocation.
+                // NV12 (4:2:0): H lines luma + H/2 lines chroma = H * 3/2 total
+                // NV16 (4:2:2): H lines luma + H lines chroma = H * 2 total
+                let total_h = match format {
+                    PixelFormat::Nv12 => {
+                        if !height.is_multiple_of(2) {
+                            return Err(Error::InvalidArgument(format!(
+                                "NV12 requires even height, got {height}"
+                            )));
+                        }
+                        height * 3 / 2
+                    }
+                    PixelFormat::Nv16 => height * 2,
+                    _ => {
+                        return Err(Error::InvalidArgument(format!(
+                            "unknown semi-planar height multiplier for {format:?}"
+                        )))
+                    }
+                };
+                vec![total_h, width]
+            }
+        };
+        let mut t = Self::new(&shape, memory, None)?;
+        t.format = Some(format);
+        Ok(t)
+    }
+
+    /// Attach format metadata to an existing tensor.
+    ///
+    /// # Arguments
+    ///
+    /// * `format` - The pixel format to attach
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` on success, with the format stored as metadata on the tensor.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidShape` if the tensor shape is incompatible with
+    /// the format's layout (packed expects `[H, W, C]`, planar expects
+    /// `[C, H, W]`, semi-planar expects `[H*k, W]` with format-specific
+    /// height constraints).
+    pub fn set_format(&mut self, format: PixelFormat) -> Result<()> {
+        let shape = self.shape();
+        match format.layout() {
+            PixelLayout::Packed => {
+                if shape.len() != 3 || shape[2] != format.channels() {
+                    return Err(Error::InvalidShape(format!(
+                        "packed format {format:?} expects [H, W, {}], got {shape:?}",
+                        format.channels()
+                    )));
+                }
+            }
+            PixelLayout::Planar => {
+                if shape.len() != 3 || shape[0] != format.channels() {
+                    return Err(Error::InvalidShape(format!(
+                        "planar format {format:?} expects [{}, H, W], got {shape:?}",
+                        format.channels()
+                    )));
+                }
+            }
+            PixelLayout::SemiPlanar => {
+                if shape.len() != 2 {
+                    return Err(Error::InvalidShape(format!(
+                        "semi-planar format {format:?} expects [H*k, W], got {shape:?}"
+                    )));
+                }
+                match format {
+                    PixelFormat::Nv12 if !shape[0].is_multiple_of(3) => {
+                        return Err(Error::InvalidShape(format!(
+                            "NV12 contiguous shape[0] must be divisible by 3, got {}",
+                            shape[0]
+                        )));
+                    }
+                    PixelFormat::Nv16 if !shape[0].is_multiple_of(2) => {
+                        return Err(Error::InvalidShape(format!(
+                            "NV16 contiguous shape[0] must be even, got {}",
+                            shape[0]
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.format = Some(format);
+        Ok(())
+    }
+
+    /// Pixel format (None if not an image).
+    pub fn format(&self) -> Option<PixelFormat> {
+        self.format
+    }
+
+    /// Image width (None if not an image).
+    pub fn width(&self) -> Option<usize> {
+        let fmt = self.format?;
+        let shape = self.shape();
+        match fmt.layout() {
+            PixelLayout::Packed => Some(shape[1]),
+            PixelLayout::Planar => Some(shape[2]),
+            PixelLayout::SemiPlanar => Some(shape[1]),
+        }
+    }
+
+    /// Image height (None if not an image).
+    pub fn height(&self) -> Option<usize> {
+        let fmt = self.format?;
+        let shape = self.shape();
+        match fmt.layout() {
+            PixelLayout::Packed => Some(shape[0]),
+            PixelLayout::Planar => Some(shape[1]),
+            PixelLayout::SemiPlanar => {
+                if self.is_multiplane() {
+                    Some(shape[0])
                 } else {
-                    #[cfg(target_os = "linux")]
-                    {
-                        // Linux: Try DMA -> SHM -> Mem
-                        match DmaTensor::<T>::new(shape, name) {
-                            Ok(tensor) => Ok(Tensor::Dma(tensor)),
-                            Err(_) => match ShmTensor::<T>::new(shape, name).map(Tensor::Shm) {
-                                Ok(tensor) => Ok(tensor),
-                                Err(_) => MemTensor::<T>::new(shape, name).map(Tensor::Mem),
-                            },
-                        }
-                    }
-                    #[cfg(all(unix, not(target_os = "linux")))]
-                    {
-                        // macOS/BSD: Try SHM -> Mem (no DMA)
-                        match ShmTensor::<T>::new(shape, name) {
-                            Ok(tensor) => Ok(Tensor::Shm(tensor)),
-                            Err(_) => MemTensor::<T>::new(shape, name).map(Tensor::Mem),
-                        }
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        // Windows/other: Mem only
-                        MemTensor::<T>::new(shape, name).map(Tensor::Mem)
+                    match fmt {
+                        PixelFormat::Nv12 => Some(shape[0] * 2 / 3),
+                        PixelFormat::Nv16 => Some(shape[0] / 2),
+                        _ => None,
                     }
                 }
             }
+        }
+    }
+
+    /// Create from separate Y and UV planes (multiplane NV12/NV16).
+    pub fn from_planes(luma: Tensor<T>, chroma: Tensor<T>, format: PixelFormat) -> Result<Self> {
+        if format.layout() != PixelLayout::SemiPlanar {
+            return Err(Error::InvalidArgument(format!(
+                "from_planes requires a semi-planar format, got {format:?}"
+            )));
+        }
+        if chroma.format.is_some() || chroma.chroma.is_some() {
+            return Err(Error::InvalidArgument(
+                "chroma tensor must be a raw tensor (no format or chroma metadata)".into(),
+            ));
+        }
+        let luma_shape = luma.shape();
+        let chroma_shape = chroma.shape();
+        if luma_shape.len() != 2 || chroma_shape.len() != 2 {
+            return Err(Error::InvalidArgument(format!(
+                "from_planes expects 2D shapes, got luma={luma_shape:?} chroma={chroma_shape:?}"
+            )));
+        }
+        if luma_shape[1] != chroma_shape[1] {
+            return Err(Error::InvalidArgument(format!(
+                "luma width {} != chroma width {}",
+                luma_shape[1], chroma_shape[1]
+            )));
+        }
+        match format {
+            PixelFormat::Nv12 => {
+                if luma_shape[0] % 2 != 0 {
+                    return Err(Error::InvalidArgument(format!(
+                        "NV12 requires even luma height, got {}",
+                        luma_shape[0]
+                    )));
+                }
+                if chroma_shape[0] != luma_shape[0] / 2 {
+                    return Err(Error::InvalidArgument(format!(
+                        "NV12 chroma height {} != luma height / 2 ({})",
+                        chroma_shape[0],
+                        luma_shape[0] / 2
+                    )));
+                }
+            }
+            PixelFormat::Nv16 => {
+                if chroma_shape[0] != luma_shape[0] {
+                    return Err(Error::InvalidArgument(format!(
+                        "NV16 chroma height {} != luma height {}",
+                        chroma_shape[0], luma_shape[0]
+                    )));
+                }
+            }
+            _ => {
+                return Err(Error::InvalidArgument(format!(
+                    "from_planes only supports NV12 and NV16, got {format:?}"
+                )));
+            }
+        }
+
+        Ok(Tensor {
+            storage: luma.storage,
+            format: Some(format),
+            chroma: Some(Box::new(chroma)),
+        })
+    }
+
+    /// Whether this tensor uses separate plane allocations.
+    pub fn is_multiplane(&self) -> bool {
+        self.chroma.is_some()
+    }
+
+    /// Access the chroma plane for multiplane semi-planar images.
+    pub fn chroma(&self) -> Option<&Tensor<T>> {
+        self.chroma.as_deref()
+    }
+
+    /// Downcast to PBO tensor reference (for GL backends).
+    pub fn as_pbo(&self) -> Option<&PboTensor<T>> {
+        match &self.storage {
+            TensorStorage::Pbo(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Downcast to DMA tensor reference (for EGL import, G2D).
+    #[cfg(target_os = "linux")]
+    pub fn as_dma(&self) -> Option<&DmaTensor<T>> {
+        match &self.storage {
+            TensorStorage::Dma(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    /// Borrow the DMA-BUF file descriptor backing this tensor.
+    ///
+    /// # Returns
+    ///
+    /// A borrowed reference to the DMA-BUF file descriptor, tied to `self`'s
+    /// lifetime.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotImplemented` if the tensor is not DMA-backed.
+    #[cfg(target_os = "linux")]
+    pub fn dmabuf(&self) -> Result<std::os::fd::BorrowedFd<'_>> {
+        use std::os::fd::AsFd;
+        match &self.storage {
+            TensorStorage::Dma(dma) => Ok(dma.fd.as_fd()),
+            _ => Err(Error::NotImplemented(format!(
+                "dmabuf requires DMA-backed tensor, got {:?}",
+                self.storage.memory()
+            ))),
+        }
+    }
+
+    /// Construct a Tensor from a PBO tensor (for GL backends that allocate PBOs).
+    pub fn from_pbo(pbo: PboTensor<T>) -> Self {
+        Self {
+            storage: TensorStorage::Pbo(pbo),
+            format: None,
+            chroma: None,
         }
     }
 }
@@ -351,126 +847,55 @@ impl<T> TensorTrait<T> for Tensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
 {
-    fn new(shape: &[usize], name: Option<&str>) -> Result<Self> {
+    fn new(shape: &[usize], name: Option<&str>) -> Result<Self>
+    where
+        Self: Sized,
+    {
         Self::new(shape, None, name)
     }
 
     #[cfg(unix)]
-    /// Create a new tensor using the given file descriptor, shape, and optional
-    /// name. If no name is given, a random name will be generated.
-    ///
-    /// On Linux: Inspects the file descriptor to determine the appropriate tensor type
-    /// (Dma or Shm) based on the device major and minor numbers.
-    /// On other Unix (macOS): Always creates SHM tensor.
-    fn from_fd(fd: OwnedFd, shape: &[usize], name: Option<&str>) -> Result<Self> {
-        #[cfg(target_os = "linux")]
-        {
-            use nix::sys::stat::fstat;
-
-            let stat = fstat(&fd)?;
-            let major = major(stat.st_dev);
-            let minor = minor(stat.st_dev);
-
-            log::debug!("Creating tensor from fd: major={major}, minor={minor}");
-
-            if major != 0 {
-                // Dma and Shm tensors are expected to have major number 0
-                return Err(Error::UnknownDeviceType(major, minor));
-            }
-
-            match minor {
-                9 | 10 => {
-                    // minor number 9 & 10 indicates DMA memory
-                    DmaTensor::<T>::from_fd(fd, shape, name).map(Tensor::Dma)
-                }
-                _ => {
-                    // other minor numbers are assumed to be shared memory
-                    ShmTensor::<T>::from_fd(fd, shape, name).map(Tensor::Shm)
-                }
-            }
-        }
-        #[cfg(all(unix, not(target_os = "linux")))]
-        {
-            // On macOS/BSD, always use SHM (no DMA support)
-            ShmTensor::<T>::from_fd(fd, shape, name).map(Tensor::Shm)
-        }
+    fn from_fd(fd: std::os::fd::OwnedFd, shape: &[usize], name: Option<&str>) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        Ok(Self::wrap(TensorStorage::from_fd(fd, shape, name)?))
     }
 
     #[cfg(unix)]
-    fn clone_fd(&self) -> Result<OwnedFd> {
-        match self {
-            #[cfg(target_os = "linux")]
-            Tensor::Dma(t) => t.clone_fd(),
-            Tensor::Shm(t) => t.clone_fd(),
-            Tensor::Mem(t) => t.clone_fd(),
-            Tensor::Pbo(t) => t.clone_fd(),
-        }
+    fn clone_fd(&self) -> Result<std::os::fd::OwnedFd> {
+        self.storage.clone_fd()
     }
 
     fn memory(&self) -> TensorMemory {
-        match self {
-            #[cfg(target_os = "linux")]
-            Tensor::Dma(_) => TensorMemory::Dma,
-            #[cfg(unix)]
-            Tensor::Shm(_) => TensorMemory::Shm,
-            Tensor::Mem(_) => TensorMemory::Mem,
-            Tensor::Pbo(_) => TensorMemory::Pbo,
-        }
+        self.storage.memory()
     }
 
     fn name(&self) -> String {
-        match self {
-            #[cfg(target_os = "linux")]
-            Tensor::Dma(t) => t.name(),
-            #[cfg(unix)]
-            Tensor::Shm(t) => t.name(),
-            Tensor::Mem(t) => t.name(),
-            Tensor::Pbo(t) => t.name(),
-        }
+        self.storage.name()
     }
 
     fn shape(&self) -> &[usize] {
-        match self {
-            #[cfg(target_os = "linux")]
-            Tensor::Dma(t) => t.shape(),
-            #[cfg(unix)]
-            Tensor::Shm(t) => t.shape(),
-            Tensor::Mem(t) => t.shape(),
-            Tensor::Pbo(t) => t.shape(),
-        }
+        self.storage.shape()
     }
 
     fn reshape(&mut self, shape: &[usize]) -> Result<()> {
-        match self {
-            #[cfg(target_os = "linux")]
-            Tensor::Dma(t) => t.reshape(shape),
-            #[cfg(unix)]
-            Tensor::Shm(t) => t.reshape(shape),
-            Tensor::Mem(t) => t.reshape(shape),
-            Tensor::Pbo(t) => t.reshape(shape),
+        if self.chroma.is_some() {
+            return Err(Error::InvalidOperation(
+                "cannot reshape a multiplane tensor — decompose planes first".into(),
+            ));
         }
+        self.storage.reshape(shape)?;
+        self.format = None;
+        Ok(())
     }
 
     fn map(&self) -> Result<TensorMap<T>> {
-        match self {
-            #[cfg(target_os = "linux")]
-            Tensor::Dma(t) => t.map(),
-            #[cfg(unix)]
-            Tensor::Shm(t) => t.map(),
-            Tensor::Mem(t) => t.map(),
-            Tensor::Pbo(t) => t.map(),
-        }
+        self.storage.map()
     }
 
     fn buffer_identity(&self) -> &BufferIdentity {
-        match self {
-            #[cfg(target_os = "linux")]
-            Tensor::Dma(t) => t.buffer_identity(),
-            #[cfg(unix)]
-            Tensor::Shm(t) => t.buffer_identity(),
-            Tensor::Mem(t) => t.buffer_identity(),
-            Tensor::Pbo(t) => t.buffer_identity(),
-        }
+        self.storage.buffer_identity()
     }
 }
 
@@ -618,6 +1043,145 @@ pub fn is_shm_available() -> bool {
 #[cfg(not(unix))]
 pub fn is_shm_available() -> bool {
     false
+}
+
+#[cfg(test)]
+mod dtype_tests {
+    use super::*;
+
+    #[test]
+    fn dtype_size() {
+        assert_eq!(DType::U8.size(), 1);
+        assert_eq!(DType::I8.size(), 1);
+        assert_eq!(DType::U16.size(), 2);
+        assert_eq!(DType::I16.size(), 2);
+        assert_eq!(DType::U32.size(), 4);
+        assert_eq!(DType::I32.size(), 4);
+        assert_eq!(DType::U64.size(), 8);
+        assert_eq!(DType::I64.size(), 8);
+        assert_eq!(DType::F16.size(), 2);
+        assert_eq!(DType::F32.size(), 4);
+        assert_eq!(DType::F64.size(), 8);
+    }
+
+    #[test]
+    fn dtype_name() {
+        assert_eq!(DType::U8.name(), "u8");
+        assert_eq!(DType::F16.name(), "f16");
+        assert_eq!(DType::F32.name(), "f32");
+    }
+
+    #[test]
+    fn dtype_serde_roundtrip() {
+        use serde_json;
+        let dt = DType::F16;
+        let json = serde_json::to_string(&dt).unwrap();
+        let back: DType = serde_json::from_str(&json).unwrap();
+        assert_eq!(dt, back);
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    #[test]
+    fn raw_tensor_has_no_format() {
+        let t = Tensor::<u8>::new(&[480, 640, 3], None, None).unwrap();
+        assert!(t.format().is_none());
+        assert!(t.width().is_none());
+        assert!(t.height().is_none());
+        assert!(!t.is_multiplane());
+        assert!(t.chroma().is_none());
+    }
+
+    #[test]
+    fn image_tensor_packed() {
+        let t = Tensor::<u8>::image(640, 480, PixelFormat::Rgba, None).unwrap();
+        assert_eq!(t.format(), Some(PixelFormat::Rgba));
+        assert_eq!(t.width(), Some(640));
+        assert_eq!(t.height(), Some(480));
+        assert_eq!(t.shape(), &[480, 640, 4]);
+        assert!(!t.is_multiplane());
+    }
+
+    #[test]
+    fn image_tensor_planar() {
+        let t = Tensor::<u8>::image(640, 480, PixelFormat::PlanarRgb, None).unwrap();
+        assert_eq!(t.format(), Some(PixelFormat::PlanarRgb));
+        assert_eq!(t.width(), Some(640));
+        assert_eq!(t.height(), Some(480));
+        assert_eq!(t.shape(), &[3, 480, 640]);
+    }
+
+    #[test]
+    fn image_tensor_semi_planar_contiguous() {
+        let t = Tensor::<u8>::image(640, 480, PixelFormat::Nv12, None).unwrap();
+        assert_eq!(t.format(), Some(PixelFormat::Nv12));
+        assert_eq!(t.width(), Some(640));
+        assert_eq!(t.height(), Some(480));
+        // NV12: H*3/2 = 720
+        assert_eq!(t.shape(), &[720, 640]);
+        assert!(!t.is_multiplane());
+    }
+
+    #[test]
+    fn set_format_valid() {
+        let mut t = Tensor::<u8>::new(&[480, 640, 3], None, None).unwrap();
+        assert!(t.format().is_none());
+        t.set_format(PixelFormat::Rgb).unwrap();
+        assert_eq!(t.format(), Some(PixelFormat::Rgb));
+        assert_eq!(t.width(), Some(640));
+        assert_eq!(t.height(), Some(480));
+    }
+
+    #[test]
+    fn set_format_invalid_shape() {
+        let mut t = Tensor::<u8>::new(&[480, 640, 4], None, None).unwrap();
+        // RGB expects 3 channels, not 4
+        let err = t.set_format(PixelFormat::Rgb);
+        assert!(err.is_err());
+        // Original tensor is unmodified
+        assert!(t.format().is_none());
+    }
+
+    #[test]
+    fn reshape_clears_format() {
+        let mut t = Tensor::<u8>::image(640, 480, PixelFormat::Rgba, None).unwrap();
+        assert_eq!(t.format(), Some(PixelFormat::Rgba));
+        // Reshape to flat — format cleared
+        t.reshape(&[480 * 640 * 4]).unwrap();
+        assert!(t.format().is_none());
+    }
+
+    #[test]
+    fn from_planes_nv12() {
+        let y = Tensor::<u8>::new(&[480, 640], None, None).unwrap();
+        let uv = Tensor::<u8>::new(&[240, 640], None, None).unwrap();
+        let img = Tensor::from_planes(y, uv, PixelFormat::Nv12).unwrap();
+        assert_eq!(img.format(), Some(PixelFormat::Nv12));
+        assert!(img.is_multiplane());
+        assert!(img.chroma().is_some());
+        assert_eq!(img.width(), Some(640));
+        assert_eq!(img.height(), Some(480));
+    }
+
+    #[test]
+    fn from_planes_rejects_non_semiplanar() {
+        let y = Tensor::<u8>::new(&[480, 640], None, None).unwrap();
+        let uv = Tensor::<u8>::new(&[240, 640], None, None).unwrap();
+        let err = Tensor::from_planes(y, uv, PixelFormat::Rgb);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn reshape_multiplane_errors() {
+        let y = Tensor::<u8>::new(&[480, 640], None, None).unwrap();
+        let uv = Tensor::<u8>::new(&[240, 640], None, None).unwrap();
+        let mut img = Tensor::from_planes(y, uv, PixelFormat::Nv12).unwrap();
+        let err = img.reshape(&[480 * 640 + 240 * 640]);
+        assert!(err.is_err());
+    }
 }
 
 #[cfg(test)]

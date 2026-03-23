@@ -1,14 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
-    fourcc_is_int8, fourcc_uint8_equivalent, Crop, Error, Flip, FunctionTimer, ImageProcessorTrait,
-    Rect, Result, Rotation, TensorImage, TensorImageDst, TensorImageRef, BGRA, GREY, NV12, NV16,
-    PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, VYUY, YUYV,
-};
+use crate::{Crop, Error, Flip, FunctionTimer, ImageProcessorTrait, Rect, Result, Rotation};
 use edgefirst_decoder::{DetectBox, ProtoData, Segmentation};
-use edgefirst_tensor::{TensorMapTrait, TensorTrait};
-use four_char_code::FourCharCode;
+use edgefirst_tensor::{
+    DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
+};
 
 mod convert;
 mod masks;
@@ -32,6 +29,44 @@ unsafe impl Sync for CPUProcessor {}
 impl Default for CPUProcessor {
     fn default() -> Self {
         Self::new_bilinear()
+    }
+}
+
+/// Compute row stride for a packed-format Tensor<u8> image given its format.
+fn row_stride_for(width: usize, fmt: PixelFormat) -> usize {
+    use edgefirst_tensor::PixelLayout;
+    match fmt.layout() {
+        PixelLayout::Packed => width * fmt.channels(),
+        PixelLayout::Planar | PixelLayout::SemiPlanar => width,
+        _ => width, // fallback for non-exhaustive
+    }
+}
+
+/// Apply XOR 0x80 bias to color channels only, preserving alpha.
+///
+/// Matches GL int8 shader behavior: `vec4(int8_bias(c.rgb), c.a)`.
+/// For formats without alpha, XORs every byte (fast path).
+pub(crate) fn apply_int8_xor_bias(data: &mut [u8], fmt: PixelFormat) {
+    use edgefirst_tensor::PixelLayout;
+    if !fmt.has_alpha() {
+        for b in data.iter_mut() {
+            *b ^= 0x80;
+        }
+    } else if fmt.layout() == PixelLayout::Planar {
+        // Planar with alpha (e.g. PlanarRgba): XOR color planes, skip alpha plane.
+        let channels = fmt.channels();
+        let plane_size = data.len() / channels;
+        for b in data[..plane_size * (channels - 1)].iter_mut() {
+            *b ^= 0x80;
+        }
+    } else {
+        // Packed with alpha (Rgba, Bgra): XOR color bytes, skip alpha byte.
+        let channels = fmt.channels();
+        for pixel in data.chunks_exact_mut(channels) {
+            for b in &mut pixel[..channels - 1] {
+                *b ^= 0x80;
+            }
+        }
     }
 }
 
@@ -72,195 +107,210 @@ impl CPUProcessor {
         }
     }
 
-    pub(crate) fn support_conversion(src: FourCharCode, dst: FourCharCode) -> bool {
+    pub(crate) fn support_conversion_pf(src: PixelFormat, dst: PixelFormat) -> bool {
+        use PixelFormat::*;
         matches!(
             (src, dst),
-            (NV12, RGB)
-                | (NV12, RGBA)
-                | (NV12, GREY)
-                | (NV16, RGB)
-                | (NV16, RGBA)
-                | (YUYV, RGB)
-                | (YUYV, RGBA)
-                | (YUYV, GREY)
-                | (YUYV, YUYV)
-                | (YUYV, PLANAR_RGB)
-                | (YUYV, PLANAR_RGBA)
-                | (YUYV, NV16)
-                | (VYUY, RGB)
-                | (VYUY, RGBA)
-                | (VYUY, GREY)
-                | (VYUY, VYUY)
-                | (VYUY, PLANAR_RGB)
-                | (VYUY, PLANAR_RGBA)
-                | (VYUY, NV16)
-                | (RGBA, RGB)
-                | (RGBA, RGBA)
-                | (RGBA, GREY)
-                | (RGBA, YUYV)
-                | (RGBA, PLANAR_RGB)
-                | (RGBA, PLANAR_RGBA)
-                | (RGBA, NV16)
-                | (RGB, RGB)
-                | (RGB, RGBA)
-                | (RGB, GREY)
-                | (RGB, YUYV)
-                | (RGB, PLANAR_RGB)
-                | (RGB, PLANAR_RGBA)
-                | (RGB, NV16)
-                | (GREY, RGB)
-                | (GREY, RGBA)
-                | (GREY, GREY)
-                | (GREY, YUYV)
-                | (GREY, PLANAR_RGB)
-                | (GREY, PLANAR_RGBA)
-                | (GREY, NV16)
-                | (NV12, BGRA)
-                | (YUYV, BGRA)
-                | (VYUY, BGRA)
-                | (RGBA, BGRA)
-                | (RGB, BGRA)
-                | (GREY, BGRA)
-                | (BGRA, BGRA)
+            (Nv12, Rgb)
+                | (Nv12, Rgba)
+                | (Nv12, Grey)
+                | (Nv16, Rgb)
+                | (Nv16, Rgba)
+                | (Nv16, Bgra)
+                | (Yuyv, Rgb)
+                | (Yuyv, Rgba)
+                | (Yuyv, Grey)
+                | (Yuyv, Yuyv)
+                | (Yuyv, PlanarRgb)
+                | (Yuyv, PlanarRgba)
+                | (Yuyv, Nv16)
+                | (Vyuy, Rgb)
+                | (Vyuy, Rgba)
+                | (Vyuy, Grey)
+                | (Vyuy, Vyuy)
+                | (Vyuy, PlanarRgb)
+                | (Vyuy, PlanarRgba)
+                | (Vyuy, Nv16)
+                | (Rgba, Rgb)
+                | (Rgba, Rgba)
+                | (Rgba, Grey)
+                | (Rgba, Yuyv)
+                | (Rgba, PlanarRgb)
+                | (Rgba, PlanarRgba)
+                | (Rgba, Nv16)
+                | (Rgb, Rgb)
+                | (Rgb, Rgba)
+                | (Rgb, Grey)
+                | (Rgb, Yuyv)
+                | (Rgb, PlanarRgb)
+                | (Rgb, PlanarRgba)
+                | (Rgb, Nv16)
+                | (Grey, Rgb)
+                | (Grey, Rgba)
+                | (Grey, Grey)
+                | (Grey, Yuyv)
+                | (Grey, PlanarRgb)
+                | (Grey, PlanarRgba)
+                | (Grey, Nv16)
+                | (Nv12, Bgra)
+                | (Yuyv, Bgra)
+                | (Vyuy, Bgra)
+                | (Rgba, Bgra)
+                | (Rgb, Bgra)
+                | (Grey, Bgra)
+                | (Bgra, Bgra)
+                | (PlanarRgb, Rgb)
+                | (PlanarRgb, Rgba)
+                | (PlanarRgba, Rgb)
+                | (PlanarRgba, Rgba)
+                | (PlanarRgb, Bgra)
+                | (PlanarRgba, Bgra)
         )
     }
 
-    pub(crate) fn convert_format(src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
-        // shapes should be equal
+    /// Format conversion dispatch for Tensor<u8> with PixelFormat metadata.
+    pub(crate) fn convert_format_pf(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        src_fmt: PixelFormat,
+        dst_fmt: PixelFormat,
+    ) -> Result<()> {
         let _timer = FunctionTimer::new(format!(
             "ImageProcessor::convert_format {} to {}",
-            src.fourcc().display(),
-            dst.fourcc().display()
+            src_fmt, dst_fmt,
         ));
-        assert_eq!(src.height(), dst.height());
-        assert_eq!(src.width(), dst.width());
 
-        match (src.fourcc(), dst.fourcc()) {
-            (NV12, RGB) => Self::convert_nv12_to_rgb(src, dst),
-            (NV12, RGBA) => Self::convert_nv12_to_rgba(src, dst),
-            (NV12, GREY) => Self::convert_nv12_to_grey(src, dst),
-            (YUYV, RGB) => Self::convert_yuyv_to_rgb(src, dst),
-            (YUYV, RGBA) => Self::convert_yuyv_to_rgba(src, dst),
-            (YUYV, GREY) => Self::convert_yuyv_to_grey(src, dst),
-            (YUYV, YUYV) => Self::copy_image(src, dst),
-            (YUYV, PLANAR_RGB) => Self::convert_yuyv_to_8bps(src, dst),
-            (YUYV, PLANAR_RGBA) => Self::convert_yuyv_to_prgba(src, dst),
-            (YUYV, NV16) => Self::convert_yuyv_to_nv16(src, dst),
-            (VYUY, RGB) => Self::convert_vyuy_to_rgb(src, dst),
-            (VYUY, RGBA) => Self::convert_vyuy_to_rgba(src, dst),
-            (VYUY, GREY) => Self::convert_vyuy_to_grey(src, dst),
-            (VYUY, VYUY) => Self::copy_image(src, dst),
-            (VYUY, PLANAR_RGB) => Self::convert_vyuy_to_8bps(src, dst),
-            (VYUY, PLANAR_RGBA) => Self::convert_vyuy_to_prgba(src, dst),
-            (VYUY, NV16) => Self::convert_vyuy_to_nv16(src, dst),
-            (RGBA, RGB) => Self::convert_rgba_to_rgb(src, dst),
-            (RGBA, RGBA) => Self::copy_image(src, dst),
-            (RGBA, GREY) => Self::convert_rgba_to_grey(src, dst),
-            (RGBA, YUYV) => Self::convert_rgba_to_yuyv(src, dst),
-            (RGBA, PLANAR_RGB) => Self::convert_rgba_to_8bps(src, dst),
-            (RGBA, PLANAR_RGBA) => Self::convert_rgba_to_prgba(src, dst),
-            (RGBA, NV16) => Self::convert_rgba_to_nv16(src, dst),
-            (RGB, RGB) => Self::copy_image(src, dst),
-            (RGB, RGBA) => Self::convert_rgb_to_rgba(src, dst),
-            (RGB, GREY) => Self::convert_rgb_to_grey(src, dst),
-            (RGB, YUYV) => Self::convert_rgb_to_yuyv(src, dst),
-            (RGB, PLANAR_RGB) => Self::convert_rgb_to_8bps(src, dst),
-            (RGB, PLANAR_RGBA) => Self::convert_rgb_to_prgba(src, dst),
-            (RGB, NV16) => Self::convert_rgb_to_nv16(src, dst),
-            (GREY, RGB) => Self::convert_grey_to_rgb(src, dst),
-            (GREY, RGBA) => Self::convert_grey_to_rgba(src, dst),
-            (GREY, GREY) => Self::copy_image(src, dst),
-            (GREY, YUYV) => Self::convert_grey_to_yuyv(src, dst),
-            (GREY, PLANAR_RGB) => Self::convert_grey_to_8bps(src, dst),
-            (GREY, PLANAR_RGBA) => Self::convert_grey_to_prgba(src, dst),
-            (GREY, NV16) => Self::convert_grey_to_nv16(src, dst),
+        use PixelFormat::*;
+        match (src_fmt, dst_fmt) {
+            (Nv12, Rgb) => Self::convert_nv12_to_rgb(src, dst),
+            (Nv12, Rgba) => Self::convert_nv12_to_rgba(src, dst),
+            (Nv12, Grey) => Self::convert_nv12_to_grey(src, dst),
+            (Yuyv, Rgb) => Self::convert_yuyv_to_rgb(src, dst),
+            (Yuyv, Rgba) => Self::convert_yuyv_to_rgba(src, dst),
+            (Yuyv, Grey) => Self::convert_yuyv_to_grey(src, dst),
+            (Yuyv, Yuyv) => Self::copy_image(src, dst),
+            (Yuyv, PlanarRgb) => Self::convert_yuyv_to_8bps(src, dst),
+            (Yuyv, PlanarRgba) => Self::convert_yuyv_to_prgba(src, dst),
+            (Yuyv, Nv16) => Self::convert_yuyv_to_nv16(src, dst),
+            (Vyuy, Rgb) => Self::convert_vyuy_to_rgb(src, dst),
+            (Vyuy, Rgba) => Self::convert_vyuy_to_rgba(src, dst),
+            (Vyuy, Grey) => Self::convert_vyuy_to_grey(src, dst),
+            (Vyuy, Vyuy) => Self::copy_image(src, dst),
+            (Vyuy, PlanarRgb) => Self::convert_vyuy_to_8bps(src, dst),
+            (Vyuy, PlanarRgba) => Self::convert_vyuy_to_prgba(src, dst),
+            (Vyuy, Nv16) => Self::convert_vyuy_to_nv16(src, dst),
+            (Rgba, Rgb) => Self::convert_rgba_to_rgb(src, dst),
+            (Rgba, Rgba) => Self::copy_image(src, dst),
+            (Rgba, Grey) => Self::convert_rgba_to_grey(src, dst),
+            (Rgba, Yuyv) => Self::convert_rgba_to_yuyv(src, dst),
+            (Rgba, PlanarRgb) => Self::convert_rgba_to_8bps(src, dst),
+            (Rgba, PlanarRgba) => Self::convert_rgba_to_prgba(src, dst),
+            (Rgba, Nv16) => Self::convert_rgba_to_nv16(src, dst),
+            (Rgb, Rgb) => Self::copy_image(src, dst),
+            (Rgb, Rgba) => Self::convert_rgb_to_rgba(src, dst),
+            (Rgb, Grey) => Self::convert_rgb_to_grey(src, dst),
+            (Rgb, Yuyv) => Self::convert_rgb_to_yuyv(src, dst),
+            (Rgb, PlanarRgb) => Self::convert_rgb_to_8bps(src, dst),
+            (Rgb, PlanarRgba) => Self::convert_rgb_to_prgba(src, dst),
+            (Rgb, Nv16) => Self::convert_rgb_to_nv16(src, dst),
+            (Grey, Rgb) => Self::convert_grey_to_rgb(src, dst),
+            (Grey, Rgba) => Self::convert_grey_to_rgba(src, dst),
+            (Grey, Grey) => Self::copy_image(src, dst),
+            (Grey, Yuyv) => Self::convert_grey_to_yuyv(src, dst),
+            (Grey, PlanarRgb) => Self::convert_grey_to_8bps(src, dst),
+            (Grey, PlanarRgba) => Self::convert_grey_to_prgba(src, dst),
+            (Grey, Nv16) => Self::convert_grey_to_nv16(src, dst),
 
             // the following converts are added for use in testing
-            (NV16, RGB) => Self::convert_nv16_to_rgb(src, dst),
-            (NV16, RGBA) => Self::convert_nv16_to_rgba(src, dst),
-            (PLANAR_RGB, RGB) => Self::convert_8bps_to_rgb(src, dst),
-            (PLANAR_RGB, RGBA) => Self::convert_8bps_to_rgba(src, dst),
-            (PLANAR_RGBA, RGB) => Self::convert_prgba_to_rgb(src, dst),
-            (PLANAR_RGBA, RGBA) => Self::convert_prgba_to_rgba(src, dst),
+            (Nv16, Rgb) => Self::convert_nv16_to_rgb(src, dst),
+            (Nv16, Rgba) => Self::convert_nv16_to_rgba(src, dst),
+            (PlanarRgb, Rgb) => Self::convert_8bps_to_rgb(src, dst),
+            (PlanarRgb, Rgba) => Self::convert_8bps_to_rgba(src, dst),
+            (PlanarRgba, Rgb) => Self::convert_prgba_to_rgb(src, dst),
+            (PlanarRgba, Rgba) => Self::convert_prgba_to_rgba(src, dst),
 
             // BGRA destination: convert to RGBA layout, then swap R and B
-            (BGRA, BGRA) => Self::copy_image(src, dst),
-            (NV12, BGRA) => {
+            (Bgra, Bgra) => Self::copy_image(src, dst),
+            (Nv12, Bgra) => {
                 Self::convert_nv12_to_rgba(src, dst)?;
                 Self::swizzle_rb_4chan(dst)
             }
-            (NV16, BGRA) => {
+            (Nv16, Bgra) => {
                 Self::convert_nv16_to_rgba(src, dst)?;
                 Self::swizzle_rb_4chan(dst)
             }
-            (YUYV, BGRA) => {
+            (Yuyv, Bgra) => {
                 Self::convert_yuyv_to_rgba(src, dst)?;
                 Self::swizzle_rb_4chan(dst)
             }
-            (VYUY, BGRA) => {
+            (Vyuy, Bgra) => {
                 Self::convert_vyuy_to_rgba(src, dst)?;
                 Self::swizzle_rb_4chan(dst)
             }
-            (RGBA, BGRA) => {
-                dst.tensor().map()?.copy_from_slice(&src.tensor().map()?);
+            (Rgba, Bgra) => {
+                dst.map()?.copy_from_slice(&src.map()?);
                 Self::swizzle_rb_4chan(dst)
             }
-            (RGB, BGRA) => {
+            (Rgb, Bgra) => {
                 Self::convert_rgb_to_rgba(src, dst)?;
                 Self::swizzle_rb_4chan(dst)
             }
-            (GREY, BGRA) => {
+            (Grey, Bgra) => {
                 Self::convert_grey_to_rgba(src, dst)?;
                 Self::swizzle_rb_4chan(dst)
             }
-            (PLANAR_RGB, BGRA) => {
+            (PlanarRgb, Bgra) => {
                 Self::convert_8bps_to_rgba(src, dst)?;
                 Self::swizzle_rb_4chan(dst)
             }
-            (PLANAR_RGBA, BGRA) => {
+            (PlanarRgba, Bgra) => {
                 Self::convert_prgba_to_rgba(src, dst)?;
                 Self::swizzle_rb_4chan(dst)
             }
 
-            (s, d) => Err(Error::NotSupported(format!(
-                "Conversion from {} to {}",
-                s.display(),
-                d.display()
-            ))),
+            (s, d) => Err(Error::NotSupported(format!("Conversion from {s} to {d}",))),
         }
     }
 
-    /// Generic copy for same-format images that works with any TensorImageDst.
-    fn copy_image_generic<D: TensorImageDst>(src: &TensorImage, dst: &mut D) -> Result<()> {
-        assert_eq!(src.fourcc(), dst.fourcc());
-        dst.tensor_mut()
-            .map()?
-            .copy_from_slice(&src.tensor().map()?);
-        Ok(())
+    /// Tensor<u8>-based fill_image_outside_crop.
+    pub(crate) fn fill_image_outside_crop_u8(
+        dst: &mut Tensor<u8>,
+        rgba: [u8; 4],
+        crop: Rect,
+    ) -> Result<()> {
+        let dst_fmt = dst.format().unwrap();
+        let dst_w = dst.width().unwrap();
+        let dst_h = dst.height().unwrap();
+        let mut dst_map = dst.map()?;
+        let dst_tup = (dst_map.as_mut_slice(), dst_w, dst_h);
+        Self::fill_outside_crop_dispatch(dst_tup, dst_fmt, rgba, crop)
     }
 
-    /// Format conversion that writes to a generic TensorImageDst.
-    /// Supports common zero-copy preprocessing cases.
-    pub(crate) fn convert_format_generic<D: TensorImageDst>(
-        src: &TensorImage,
-        dst: &mut D,
+    /// Common fill dispatch by format.
+    fn fill_outside_crop_dispatch(
+        dst: (&mut [u8], usize, usize),
+        fmt: PixelFormat,
+        rgba: [u8; 4],
+        crop: Rect,
     ) -> Result<()> {
-        let _timer = FunctionTimer::new(format!(
-            "ImageProcessor::convert_format_generic {} to {}",
-            src.fourcc().display(),
-            dst.fourcc().display()
-        ));
-        assert_eq!(src.height(), dst.height());
-        assert_eq!(src.width(), dst.width());
-
-        match (src.fourcc(), dst.fourcc()) {
-            (RGB, PLANAR_RGB) => Self::convert_rgb_to_planar_rgb_generic(src, dst),
-            (RGBA, PLANAR_RGB) => Self::convert_rgba_to_planar_rgb_generic(src, dst),
-            (f1, f2) if f1 == f2 => Self::copy_image_generic(src, dst),
-            (s, d) => Err(Error::NotSupported(format!(
-                "Generic conversion from {} to {} not supported",
-                s.display(),
-                d.display()
+        use PixelFormat::*;
+        match fmt {
+            Rgba | Bgra => Self::fill_image_outside_crop_(dst, rgba, crop),
+            Rgb => Self::fill_image_outside_crop_(dst, Self::rgba_to_rgb(rgba), crop),
+            Grey => Self::fill_image_outside_crop_(dst, Self::rgba_to_grey(rgba), crop),
+            Yuyv => Self::fill_image_outside_crop_(
+                (dst.0, dst.1 / 2, dst.2),
+                Self::rgba_to_yuyv(rgba),
+                Rect::new(crop.left / 2, crop.top, crop.width.div_ceil(2), crop.height),
+            ),
+            PlanarRgb => Self::fill_image_outside_crop_planar(dst, Self::rgba_to_rgb(rgba), crop),
+            PlanarRgba => Self::fill_image_outside_crop_planar(dst, rgba, crop),
+            Nv16 => {
+                let yuyv = Self::rgba_to_yuyv(rgba);
+                Self::fill_image_outside_crop_yuv_semiplanar(dst, yuyv[0], [yuyv[1], yuyv[3]], crop)
+            }
+            _ => Err(Error::Internal(format!(
+                "Found unexpected destination {fmt}",
             ))),
         }
     }
@@ -269,428 +319,33 @@ impl CPUProcessor {
 impl ImageProcessorTrait for CPUProcessor {
     fn convert(
         &mut self,
-        src: &TensorImage,
-        dst: &mut TensorImage,
+        src: &TensorDyn,
+        dst: &mut TensorDyn,
         rotation: Rotation,
         flip: Flip,
         crop: Crop,
     ) -> Result<()> {
-        // Int8 formats: convert directly into dst as uint8 (layouts are
-        // identical), then XOR 0x80 in-place. Avoids a temporary allocation.
-        if fourcc_is_int8(dst.fourcc()) {
-            let int8_fourcc = dst.fourcc();
-            dst.set_fourcc(fourcc_uint8_equivalent(int8_fourcc));
-            if let Err(e) = self.convert(src, dst, rotation, flip, crop) {
-                dst.set_fourcc(int8_fourcc);
-                return Err(e);
-            }
-            dst.set_fourcc(int8_fourcc);
-            let mut dst_map = dst.tensor().map()?;
-            for byte in dst_map.iter_mut() {
-                *byte ^= 0x80;
-            }
-            return Ok(());
-        }
-
-        crop.check_crop(src, dst)?;
-        // supported destinations and srcs:
-        let intermediate = match (src.fourcc(), dst.fourcc()) {
-            (NV12, RGB) => RGB,
-            (NV12, RGBA) => RGBA,
-            (NV12, GREY) => GREY,
-            (NV12, YUYV) => RGBA, // RGBA intermediary for YUYV dest resize/convert/rotation/flip
-            (NV12, NV16) => RGBA, // RGBA intermediary for YUYV dest resize/convert/rotation/flip
-            (NV12, PLANAR_RGB) => RGB,
-            (NV12, PLANAR_RGBA) => RGBA,
-            (YUYV, RGB) => RGB,
-            (YUYV, RGBA) => RGBA,
-            (YUYV, GREY) => GREY,
-            (YUYV, YUYV) => RGBA, // RGBA intermediary for YUYV dest resize/convert/rotation/flip
-            (YUYV, PLANAR_RGB) => RGB,
-            (YUYV, PLANAR_RGBA) => RGBA,
-            (YUYV, NV16) => RGBA,
-            (VYUY, RGB) => RGB,
-            (VYUY, RGBA) => RGBA,
-            (VYUY, GREY) => GREY,
-            (VYUY, VYUY) => RGBA, // RGBA intermediary for VYUY dest resize/convert/rotation/flip
-            (VYUY, PLANAR_RGB) => RGB,
-            (VYUY, PLANAR_RGBA) => RGBA,
-            (VYUY, NV16) => RGBA,
-            (RGBA, RGB) => RGBA,
-            (RGBA, RGBA) => RGBA,
-            (RGBA, GREY) => GREY,
-            (RGBA, YUYV) => RGBA, // RGBA intermediary for YUYV dest resize/convert/rotation/flip
-            (RGBA, PLANAR_RGB) => RGBA,
-            (RGBA, PLANAR_RGBA) => RGBA,
-            (RGBA, NV16) => RGBA,
-            (RGB, RGB) => RGB,
-            (RGB, RGBA) => RGB,
-            (RGB, GREY) => GREY,
-            (RGB, YUYV) => RGB, // RGB intermediary for YUYV dest resize/convert/rotation/flip
-            (RGB, PLANAR_RGB) => RGB,
-            (RGB, PLANAR_RGBA) => RGB,
-            (RGB, NV16) => RGB,
-            (GREY, RGB) => RGB,
-            (GREY, RGBA) => RGBA,
-            (GREY, GREY) => GREY,
-            (GREY, YUYV) => GREY,
-            (GREY, PLANAR_RGB) => GREY,
-            (GREY, PLANAR_RGBA) => GREY,
-            (GREY, NV16) => GREY,
-            (NV12, BGRA) => RGBA,
-            (YUYV, BGRA) => RGBA,
-            (VYUY, BGRA) => RGBA,
-            (RGBA, BGRA) => RGBA,
-            (RGB, BGRA) => RGB,
-            (GREY, BGRA) => GREY,
-            (BGRA, BGRA) => BGRA,
-            (s, d) => {
-                return Err(Error::NotSupported(format!(
-                    "Conversion from {} to {}",
-                    s.display(),
-                    d.display()
-                )));
-            }
-        };
-
-        // let crop = crop.src_rect;
-
-        let need_resize_flip_rotation = rotation != Rotation::None
-            || flip != Flip::None
-            || src.width() != dst.width()
-            || src.height() != dst.height()
-            || crop.src_rect.is_some_and(|crop| {
-                crop != Rect {
-                    left: 0,
-                    top: 0,
-                    width: src.width(),
-                    height: src.height(),
-                }
-            })
-            || crop.dst_rect.is_some_and(|crop| {
-                crop != Rect {
-                    left: 0,
-                    top: 0,
-                    width: dst.width(),
-                    height: dst.height(),
-                }
-            });
-
-        // check if a direct conversion can be done
-        if !need_resize_flip_rotation && Self::support_conversion(src.fourcc(), dst.fourcc()) {
-            return Self::convert_format(src, dst);
-        };
-
-        // any extra checks
-        if dst.fourcc() == YUYV && !dst.width().is_multiple_of(2) {
-            return Err(Error::NotSupported(format!(
-                "{} destination must have width divisible by 2",
-                dst.fourcc().display(),
-            )));
-        }
-
-        // create tmp buffer
-        let mut tmp_buffer;
-        let tmp;
-        if intermediate != src.fourcc() {
-            tmp_buffer = TensorImage::new(
-                src.width(),
-                src.height(),
-                intermediate,
-                Some(edgefirst_tensor::TensorMemory::Mem),
-            )?;
-
-            Self::convert_format(src, &mut tmp_buffer)?;
-            tmp = &tmp_buffer;
-        } else {
-            tmp = src;
-        }
-
-        // format must be RGB/RGBA/GREY
-        debug_assert!(matches!(tmp.fourcc(), RGB | RGBA | GREY));
-        if tmp.fourcc() == dst.fourcc() {
-            self.resize_flip_rotate(tmp, dst, rotation, flip, crop)?;
-        } else if !need_resize_flip_rotation {
-            Self::convert_format(tmp, dst)?;
-        } else {
-            let mut tmp2 = TensorImage::new(
-                dst.width(),
-                dst.height(),
-                tmp.fourcc(),
-                Some(edgefirst_tensor::TensorMemory::Mem),
-            )?;
-            if crop.dst_rect.is_some_and(|crop| {
-                crop != Rect {
-                    left: 0,
-                    top: 0,
-                    width: dst.width(),
-                    height: dst.height(),
-                }
-            }) && crop.dst_color.is_none()
-            {
-                // convert the dst into tmp2 when there is a dst crop
-                // TODO: this could be optimized by changing convert_format to take a
-                // destination crop?
-
-                Self::convert_format(dst, &mut tmp2)?;
-            }
-            self.resize_flip_rotate(tmp, &mut tmp2, rotation, flip, crop)?;
-            Self::convert_format(&tmp2, dst)?;
-        }
-        if let (Some(dst_rect), Some(dst_color)) = (crop.dst_rect, crop.dst_color) {
-            let full_rect = Rect {
-                left: 0,
-                top: 0,
-                width: dst.width(),
-                height: dst.height(),
-            };
-            if dst_rect != full_rect {
-                Self::fill_image_outside_crop(dst, dst_color, dst_rect)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn convert_ref(
-        &mut self,
-        src: &TensorImage,
-        dst: &mut TensorImageRef<'_>,
-        rotation: Rotation,
-        flip: Flip,
-        crop: Crop,
-    ) -> Result<()> {
-        crop.check_crop_ref(src, dst)?;
-
-        // Determine intermediate format needed for conversion
-        let intermediate = match (src.fourcc(), dst.fourcc()) {
-            (NV12, RGB) => RGB,
-            (NV12, RGBA) => RGBA,
-            (NV12, GREY) => GREY,
-            (NV12, PLANAR_RGB) => RGB,
-            (NV12, PLANAR_RGBA) => RGBA,
-            (YUYV, RGB) => RGB,
-            (YUYV, RGBA) => RGBA,
-            (YUYV, GREY) => GREY,
-            (YUYV, PLANAR_RGB) => RGB,
-            (YUYV, PLANAR_RGBA) => RGBA,
-            (VYUY, RGB) => RGB,
-            (VYUY, RGBA) => RGBA,
-            (VYUY, GREY) => GREY,
-            (VYUY, PLANAR_RGB) => RGB,
-            (VYUY, PLANAR_RGBA) => RGBA,
-            (RGBA, RGB) => RGBA,
-            (RGBA, RGBA) => RGBA,
-            (RGBA, GREY) => GREY,
-            (RGBA, PLANAR_RGB) => RGBA,
-            (RGBA, PLANAR_RGBA) => RGBA,
-            (RGB, RGB) => RGB,
-            (RGB, RGBA) => RGB,
-            (RGB, GREY) => GREY,
-            (RGB, PLANAR_RGB) => RGB,
-            (RGB, PLANAR_RGBA) => RGB,
-            (GREY, RGB) => RGB,
-            (GREY, RGBA) => RGBA,
-            (GREY, GREY) => GREY,
-            (GREY, PLANAR_RGB) => GREY,
-            (GREY, PLANAR_RGBA) => GREY,
-            (s, d) => {
-                return Err(Error::NotSupported(format!(
-                    "Conversion from {} to {}",
-                    s.display(),
-                    d.display()
-                )));
-            }
-        };
-
-        let need_resize_flip_rotation = rotation != Rotation::None
-            || flip != Flip::None
-            || src.width() != dst.width()
-            || src.height() != dst.height()
-            || crop.src_rect.is_some_and(|crop| {
-                crop != Rect {
-                    left: 0,
-                    top: 0,
-                    width: src.width(),
-                    height: src.height(),
-                }
-            })
-            || crop.dst_rect.is_some_and(|crop| {
-                crop != Rect {
-                    left: 0,
-                    top: 0,
-                    width: dst.width(),
-                    height: dst.height(),
-                }
-            });
-
-        // Simple case: no resize/flip/rotation needed
-        if !need_resize_flip_rotation {
-            // Try direct generic conversion (zero-copy path)
-            if let Ok(()) = Self::convert_format_generic(src, dst) {
-                return Ok(());
-            }
-        }
-
-        // Complex case: need intermediate buffers
-        // First, convert source to intermediate format if needed
-        let mut tmp_buffer;
-        let tmp: &TensorImage;
-        if intermediate != src.fourcc() {
-            tmp_buffer = TensorImage::new(
-                src.width(),
-                src.height(),
-                intermediate,
-                Some(edgefirst_tensor::TensorMemory::Mem),
-            )?;
-            Self::convert_format(src, &mut tmp_buffer)?;
-            tmp = &tmp_buffer;
-        } else {
-            tmp = src;
-        }
-
-        // Process resize/flip/rotation if needed
-        if need_resize_flip_rotation {
-            // Create intermediate buffer for resize output
-            let mut tmp2 = TensorImage::new(
-                dst.width(),
-                dst.height(),
-                tmp.fourcc(),
-                Some(edgefirst_tensor::TensorMemory::Mem),
-            )?;
-            self.resize_flip_rotate(tmp, &mut tmp2, rotation, flip, crop)?;
-
-            // Final conversion to destination (zero-copy into dst)
-            Self::convert_format_generic(&tmp2, dst)?;
-        } else {
-            // Direct conversion (already checked above, but handle edge cases)
-            Self::convert_format_generic(tmp, dst)?;
-        }
-
-        // Handle destination crop fill if needed
-        if let (Some(dst_rect), Some(dst_color)) = (crop.dst_rect, crop.dst_color) {
-            let full_rect = Rect {
-                left: 0,
-                top: 0,
-                width: dst.width(),
-                height: dst.height(),
-            };
-            if dst_rect != full_rect {
-                Self::fill_image_outside_crop_generic(dst, dst_color, dst_rect)?;
-            }
-        }
-
-        Ok(())
+        self.convert_impl(src, dst, rotation, flip, crop)
     }
 
     fn draw_masks(
         &mut self,
-        dst: &mut TensorImage,
+        dst: &mut TensorDyn,
         detect: &[DetectBox],
         segmentation: &[Segmentation],
     ) -> Result<()> {
-        if !matches!(dst.fourcc(), RGBA | RGB) {
-            return Err(crate::Error::NotSupported(
-                "CPU image rendering only supports RGBA or RGB images".to_string(),
-            ));
-        }
-
-        let _timer = FunctionTimer::new("CPUProcessor::draw_masks");
-
-        let mut map = dst.tensor.map()?;
-        let dst_slice = map.as_mut_slice();
-
-        self.render_box(dst, dst_slice, detect)?;
-
-        if segmentation.is_empty() {
-            return Ok(());
-        }
-
-        // Semantic segmentation (e.g. ModelPack) has C > 1 (multi-class),
-        // instance segmentation (e.g. YOLO) has C = 1 (binary per-instance).
-        let is_semantic = segmentation[0].segmentation.shape()[2] > 1;
-
-        if is_semantic {
-            self.render_modelpack_segmentation(dst, dst_slice, &segmentation[0])?;
-        } else {
-            for (seg, detect) in segmentation.iter().zip(detect) {
-                self.render_yolo_segmentation(dst, dst_slice, seg, detect.label)?;
-            }
-        }
-
-        Ok(())
+        let dst = dst.as_u8_mut().ok_or(Error::NotAnImage)?;
+        self.draw_masks_impl(dst, detect, segmentation)
     }
 
     fn draw_masks_proto(
         &mut self,
-        dst: &mut TensorImage,
+        dst: &mut TensorDyn,
         detect: &[DetectBox],
         proto_data: &ProtoData,
     ) -> Result<()> {
-        if !matches!(dst.fourcc(), RGBA | RGB) {
-            return Err(crate::Error::NotSupported(
-                "CPU image rendering only supports RGBA or RGB images".to_string(),
-            ));
-        }
-
-        let _timer = FunctionTimer::new("CPUProcessor::draw_masks_proto");
-
-        let mut map = dst.tensor.map()?;
-        let dst_slice = map.as_mut_slice();
-
-        self.render_box(dst, dst_slice, detect)?;
-
-        if detect.is_empty() || proto_data.mask_coefficients.is_empty() {
-            return Ok(());
-        }
-
-        let protos_cow = proto_data.protos.as_f32();
-        let protos = protos_cow.as_ref();
-        let proto_h = protos.shape()[0];
-        let proto_w = protos.shape()[1];
-        let num_protos = protos.shape()[2];
-        let dst_w = dst.width();
-        let dst_h = dst.height();
-        let row_stride = dst.row_stride();
-        let channels = dst.channels();
-
-        for (det, coeff) in detect.iter().zip(proto_data.mask_coefficients.iter()) {
-            let color = self.colors[det.label % self.colors.len()];
-            let alpha = color[3] as u16;
-
-            // Pixel bounds of the detection in dst image space
-            let start_x = (dst_w as f32 * det.bbox.xmin).round() as usize;
-            let start_y = (dst_h as f32 * det.bbox.ymin).round() as usize;
-            let end_x = ((dst_w as f32 * det.bbox.xmax).round() as usize).min(dst_w);
-            let end_y = ((dst_h as f32 * det.bbox.ymax).round() as usize).min(dst_h);
-
-            for y in start_y..end_y {
-                for x in start_x..end_x {
-                    // Map pixel (x, y) to proto space
-                    let px = (x as f32 / dst_w as f32) * proto_w as f32 - 0.5;
-                    let py = (y as f32 / dst_h as f32) * proto_h as f32 - 0.5;
-
-                    // Bilinear interpolation + dot product
-                    let acc = bilinear_dot(protos, coeff, num_protos, px, py, proto_w, proto_h);
-
-                    // Sigmoid threshold
-                    let mask = 1.0 / (1.0 + (-acc).exp());
-                    if mask < 0.5 {
-                        continue;
-                    }
-
-                    // Alpha blend
-                    let dst_index = y * row_stride + x * channels;
-                    for c in 0..3 {
-                        dst_slice[dst_index + c] = ((color[c] as u16 * alpha
-                            + dst_slice[dst_index + c] as u16 * (255 - alpha))
-                            / 255) as u8;
-                    }
-                }
-            }
-        }
-
-        Ok(())
+        let dst = dst.as_u8_mut().ok_or(Error::NotAnImage)?;
+        self.draw_masks_proto_impl(dst, detect, proto_data)
     }
 
     fn decode_masks_atlas(
@@ -765,6 +420,351 @@ impl ImageProcessorTrait for CPUProcessor {
         for (c, new_c) in self.colors.iter_mut().zip(colors.iter()) {
             *c = *new_c;
         }
+        Ok(())
+    }
+}
+
+// Internal methods — dtype-aware dispatch layer.
+impl CPUProcessor {
+    /// Top-level conversion dispatcher: handles dtype combinations.
+    pub(crate) fn convert_impl(
+        &mut self,
+        src: &TensorDyn,
+        dst: &mut TensorDyn,
+        rotation: Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> Result<()> {
+        let src_fmt = src.format().ok_or(Error::NotAnImage)?;
+        let dst_fmt = dst.format().ok_or(Error::NotAnImage)?;
+
+        match (src.dtype(), dst.dtype()) {
+            (DType::U8, DType::U8) => {
+                let src = src.as_u8().unwrap();
+                let dst = dst.as_u8_mut().unwrap();
+                self.convert_u8(src, dst, src_fmt, dst_fmt, rotation, flip, crop)
+            }
+            (DType::U8, DType::I8) => {
+                // Int8 output: reinterpret the i8 destination as u8 (layout-
+                // identical), convert directly into it, then XOR 0x80 in-place.
+                let src_u8 = src.as_u8().unwrap();
+                let dst_i8 = dst.as_i8_mut().unwrap();
+                // SAFETY: Tensor<i8> and Tensor<u8> are layout-identical
+                // (same element size, no T-dependent drop glue). Same
+                // rationale as gl::processor::tensor_i8_as_u8_mut.
+                let dst_u8 = unsafe { &mut *(dst_i8 as *mut Tensor<i8> as *mut Tensor<u8>) };
+                self.convert_u8(src_u8, dst_u8, src_fmt, dst_fmt, rotation, flip, crop)?;
+                // Apply XOR 0x80 bias in-place (u8 → i8 conversion)
+                let mut map = dst_u8.map()?;
+                apply_int8_xor_bias(map.as_mut_slice(), dst_fmt);
+                Ok(())
+            }
+            (s, d) => Err(Error::NotSupported(format!("dtype {s} -> {d}",))),
+        }
+    }
+
+    /// U8-to-U8 conversion: the full format conversion + resize pipeline.
+    #[allow(clippy::too_many_arguments)]
+    fn convert_u8(
+        &mut self,
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        src_fmt: PixelFormat,
+        dst_fmt: PixelFormat,
+        rotation: Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> Result<()> {
+        use PixelFormat::*;
+
+        let src_w = src.width().unwrap();
+        let src_h = src.height().unwrap();
+        let dst_w = dst.width().unwrap();
+        let dst_h = dst.height().unwrap();
+
+        crop.check_crop_dims(src_w, src_h, dst_w, dst_h)?;
+
+        // Determine intermediate format for the resize step
+        let intermediate = match (src_fmt, dst_fmt) {
+            (Nv12, Rgb) => Rgb,
+            (Nv12, Rgba) => Rgba,
+            (Nv12, Grey) => Grey,
+            (Nv12, Yuyv) => Rgba,
+            (Nv12, Nv16) => Rgba,
+            (Nv12, PlanarRgb) => Rgb,
+            (Nv12, PlanarRgba) => Rgba,
+            (Yuyv, Rgb) => Rgb,
+            (Yuyv, Rgba) => Rgba,
+            (Yuyv, Grey) => Grey,
+            (Yuyv, Yuyv) => Rgba,
+            (Yuyv, PlanarRgb) => Rgb,
+            (Yuyv, PlanarRgba) => Rgba,
+            (Yuyv, Nv16) => Rgba,
+            (Vyuy, Rgb) => Rgb,
+            (Vyuy, Rgba) => Rgba,
+            (Vyuy, Grey) => Grey,
+            (Vyuy, Vyuy) => Rgba,
+            (Vyuy, PlanarRgb) => Rgb,
+            (Vyuy, PlanarRgba) => Rgba,
+            (Vyuy, Nv16) => Rgba,
+            (Rgba, Rgb) => Rgba,
+            (Rgba, Rgba) => Rgba,
+            (Rgba, Grey) => Grey,
+            (Rgba, Yuyv) => Rgba,
+            (Rgba, PlanarRgb) => Rgba,
+            (Rgba, PlanarRgba) => Rgba,
+            (Rgba, Nv16) => Rgba,
+            (Rgb, Rgb) => Rgb,
+            (Rgb, Rgba) => Rgb,
+            (Rgb, Grey) => Grey,
+            (Rgb, Yuyv) => Rgb,
+            (Rgb, PlanarRgb) => Rgb,
+            (Rgb, PlanarRgba) => Rgb,
+            (Rgb, Nv16) => Rgb,
+            (Grey, Rgb) => Rgb,
+            (Grey, Rgba) => Rgba,
+            (Grey, Grey) => Grey,
+            (Grey, Yuyv) => Grey,
+            (Grey, PlanarRgb) => Grey,
+            (Grey, PlanarRgba) => Grey,
+            (Grey, Nv16) => Grey,
+            (Nv12, Bgra) => Rgba,
+            (Yuyv, Bgra) => Rgba,
+            (Vyuy, Bgra) => Rgba,
+            (Rgba, Bgra) => Rgba,
+            (Rgb, Bgra) => Rgb,
+            (Grey, Bgra) => Grey,
+            (Bgra, Bgra) => Bgra,
+            (Nv16, Rgb) => Rgb,
+            (Nv16, Rgba) => Rgba,
+            (Nv16, Bgra) => Rgba,
+            (PlanarRgb, Rgb) => Rgb,
+            (PlanarRgb, Rgba) => Rgb,
+            (PlanarRgb, Bgra) => Rgb,
+            (PlanarRgba, Rgb) => Rgba,
+            (PlanarRgba, Rgba) => Rgba,
+            (PlanarRgba, Bgra) => Rgba,
+            (s, d) => {
+                return Err(Error::NotSupported(format!("Conversion from {s} to {d}",)));
+            }
+        };
+
+        let need_resize_flip_rotation = rotation != Rotation::None
+            || flip != Flip::None
+            || src_w != dst_w
+            || src_h != dst_h
+            || crop.src_rect.is_some_and(|c| {
+                c != Rect {
+                    left: 0,
+                    top: 0,
+                    width: src_w,
+                    height: src_h,
+                }
+            })
+            || crop.dst_rect.is_some_and(|c| {
+                c != Rect {
+                    left: 0,
+                    top: 0,
+                    width: dst_w,
+                    height: dst_h,
+                }
+            });
+
+        // check if a direct conversion can be done
+        if !need_resize_flip_rotation && Self::support_conversion_pf(src_fmt, dst_fmt) {
+            return Self::convert_format_pf(src, dst, src_fmt, dst_fmt);
+        }
+
+        // any extra checks
+        if dst_fmt == Yuyv && !dst_w.is_multiple_of(2) {
+            return Err(Error::NotSupported(format!(
+                "{} destination must have width divisible by 2",
+                dst_fmt,
+            )));
+        }
+
+        // create tmp buffer
+        let mut tmp_buffer;
+        let tmp;
+        let tmp_fmt;
+        if intermediate != src_fmt {
+            tmp_buffer = Tensor::<u8>::image(src_w, src_h, intermediate, Some(TensorMemory::Mem))?;
+
+            Self::convert_format_pf(src, &mut tmp_buffer, src_fmt, intermediate)?;
+            tmp = &tmp_buffer;
+            tmp_fmt = intermediate;
+        } else {
+            tmp = src;
+            tmp_fmt = src_fmt;
+        }
+
+        // format must be RGB/RGBA/GREY
+        debug_assert!(matches!(tmp_fmt, Rgb | Rgba | Grey));
+        if tmp_fmt == dst_fmt {
+            self.resize_flip_rotate_pf(tmp, dst, dst_fmt, rotation, flip, crop)?;
+        } else if !need_resize_flip_rotation {
+            Self::convert_format_pf(tmp, dst, tmp_fmt, dst_fmt)?;
+        } else {
+            let mut tmp2 = Tensor::<u8>::image(dst_w, dst_h, tmp_fmt, Some(TensorMemory::Mem))?;
+            if crop.dst_rect.is_some_and(|c| {
+                c != Rect {
+                    left: 0,
+                    top: 0,
+                    width: dst_w,
+                    height: dst_h,
+                }
+            }) && crop.dst_color.is_none()
+            {
+                Self::convert_format_pf(dst, &mut tmp2, dst_fmt, tmp_fmt)?;
+            }
+            self.resize_flip_rotate_pf(tmp, &mut tmp2, tmp_fmt, rotation, flip, crop)?;
+            Self::convert_format_pf(&tmp2, dst, tmp_fmt, dst_fmt)?;
+        }
+        if let (Some(dst_rect), Some(dst_color)) = (crop.dst_rect, crop.dst_color) {
+            let full_rect = Rect {
+                left: 0,
+                top: 0,
+                width: dst_w,
+                height: dst_h,
+            };
+            if dst_rect != full_rect {
+                Self::fill_image_outside_crop_u8(dst, dst_color, dst_rect)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn draw_masks_impl(
+        &mut self,
+        dst: &mut Tensor<u8>,
+        detect: &[DetectBox],
+        segmentation: &[Segmentation],
+    ) -> Result<()> {
+        let dst_fmt = dst.format().ok_or(Error::NotAnImage)?;
+        if !matches!(dst_fmt, PixelFormat::Rgba | PixelFormat::Rgb) {
+            return Err(crate::Error::NotSupported(
+                "CPU image rendering only supports RGBA or RGB images".to_string(),
+            ));
+        }
+
+        let _timer = FunctionTimer::new("CPUProcessor::draw_masks");
+
+        let dst_w = dst.width().unwrap();
+        let dst_h = dst.height().unwrap();
+        let dst_rs = row_stride_for(dst_w, dst_fmt);
+        let dst_c = dst_fmt.channels();
+
+        let mut map = dst.map()?;
+        let dst_slice = map.as_mut_slice();
+
+        self.render_box(dst_w, dst_h, dst_rs, dst_c, dst_slice, detect)?;
+
+        if segmentation.is_empty() {
+            return Ok(());
+        }
+
+        // Semantic segmentation (e.g. ModelPack) has C > 1 (multi-class),
+        // instance segmentation (e.g. YOLO) has C = 1 (binary per-instance).
+        let is_semantic = segmentation[0].segmentation.shape()[2] > 1;
+
+        if is_semantic {
+            self.render_modelpack_segmentation(
+                dst_w,
+                dst_h,
+                dst_rs,
+                dst_c,
+                dst_slice,
+                &segmentation[0],
+            )?;
+        } else {
+            for (seg, detect) in segmentation.iter().zip(detect) {
+                self.render_yolo_segmentation(
+                    dst_w,
+                    dst_h,
+                    dst_rs,
+                    dst_c,
+                    dst_slice,
+                    seg,
+                    detect.label,
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn draw_masks_proto_impl(
+        &mut self,
+        dst: &mut Tensor<u8>,
+        detect: &[DetectBox],
+        proto_data: &ProtoData,
+    ) -> Result<()> {
+        let dst_fmt = dst.format().ok_or(Error::NotAnImage)?;
+        if !matches!(dst_fmt, PixelFormat::Rgba | PixelFormat::Rgb) {
+            return Err(crate::Error::NotSupported(
+                "CPU image rendering only supports RGBA or RGB images".to_string(),
+            ));
+        }
+
+        let _timer = FunctionTimer::new("CPUProcessor::draw_masks_proto");
+
+        let dst_w = dst.width().unwrap();
+        let dst_h = dst.height().unwrap();
+        let dst_rs = row_stride_for(dst_w, dst_fmt);
+        let channels = dst_fmt.channels();
+
+        let mut map = dst.map()?;
+        let dst_slice = map.as_mut_slice();
+
+        self.render_box(dst_w, dst_h, dst_rs, channels, dst_slice, detect)?;
+
+        if detect.is_empty() || proto_data.mask_coefficients.is_empty() {
+            return Ok(());
+        }
+
+        let protos_cow = proto_data.protos.as_f32();
+        let protos = protos_cow.as_ref();
+        let proto_h = protos.shape()[0];
+        let proto_w = protos.shape()[1];
+        let num_protos = protos.shape()[2];
+
+        for (det, coeff) in detect.iter().zip(proto_data.mask_coefficients.iter()) {
+            let color = self.colors[det.label % self.colors.len()];
+            let alpha = color[3] as u16;
+
+            // Pixel bounds of the detection in dst image space
+            let start_x = (dst_w as f32 * det.bbox.xmin).round() as usize;
+            let start_y = (dst_h as f32 * det.bbox.ymin).round() as usize;
+            let end_x = ((dst_w as f32 * det.bbox.xmax).round() as usize).min(dst_w);
+            let end_y = ((dst_h as f32 * det.bbox.ymax).round() as usize).min(dst_h);
+
+            for y in start_y..end_y {
+                for x in start_x..end_x {
+                    // Map pixel (x, y) to proto space
+                    let px = (x as f32 / dst_w as f32) * proto_w as f32 - 0.5;
+                    let py = (y as f32 / dst_h as f32) * proto_h as f32 - 0.5;
+
+                    // Bilinear interpolation + dot product
+                    let acc = bilinear_dot(protos, coeff, num_protos, px, py, proto_w, proto_h);
+
+                    // Sigmoid threshold
+                    let mask = 1.0 / (1.0 + (-acc).exp());
+                    if mask < 0.5 {
+                        continue;
+                    }
+
+                    // Alpha blend
+                    let dst_index = y * dst_rs + x * channels;
+                    for c in 0..3 {
+                        dst_slice[dst_index + c] = ((color[c] as u16 * alpha
+                            + dst_slice[dst_index + c] as u16 * (255 - alpha))
+                            / 255) as u8;
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 }
