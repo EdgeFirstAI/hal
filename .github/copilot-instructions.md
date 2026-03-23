@@ -341,12 +341,12 @@ crates/
 ### Naming Conventions
 
 **Rust Types:**
-- Core types: `Tensor<T>`, `TensorImage`, `ImageProcessor`, `Decoder`
+- Core types: `Tensor<T>`, `TensorDyn`, `PixelFormat`, `DType`, `ImageProcessor`, `Decoder`
 - Trait names: `TensorTrait<T>`, `ImageProcessorTrait`
 - Enum variants: PascalCase (e.g., `DmaTensor`, `ShmTensor`, `MemTensor`)
 
 **Python Wrapper Types:**
-- Use `Py` prefix: `PyTensor`, `PyTensorImage`, `PyImageProcessor`
+- Use `Py` prefix: `PyTensor`, `PyPixelFormat`, `PyImageProcessor`
 - Located in `crates/python/src/`
 
 ### Memory Management Pattern
@@ -375,17 +375,25 @@ All public APIs return `Result<T, E>` with specific error types:
 
 ### Hardware Acceleration Pattern
 
-Image processing uses a fallback chain: G2D → OpenGL → CPU
+Image processing uses a fallback chain: OpenGL → G2D → CPU
 
 ```rust
 impl ImageProcessorTrait for ImageProcessor {
-    fn convert(&mut self, src: &TensorImage, dst: &mut TensorImage) -> Result<()> {
-        if let Some(g2d) = &mut self.g2d {
-            if g2d.can_convert(src.format, dst.format) {
-                return g2d.convert(src, dst, options);
+    fn convert(&mut self, src: &TensorDyn, dst: &mut TensorDyn,
+               rotation: Rotation, flip: Flip, crop: Crop) -> Result<()> {
+        if let Some(opengl) = &mut self.opengl {
+            match opengl.convert(src, dst, rotation, flip, crop) {
+                Ok(_) => return Ok(()),
+                Err(_) => { /* fall through */ }
             }
         }
-        self.cpu.convert(src, dst, options)
+        if let Some(g2d) = &mut self.g2d {
+            match g2d.convert(src, dst, rotation, flip, crop) {
+                Ok(_) => return Ok(()),
+                Err(_) => { /* fall through */ }
+            }
+        }
+        self.cpu.convert(src, dst, rotation, flip, crop)
     }
 }
 ```
@@ -415,8 +423,21 @@ Python wheels are built separately via `maturin` in CI.
 
 ### Pre-Commit Verification (MANDATORY)
 
-**Before every commit, you MUST run the full verification suite and confirm
-all steps pass. Never commit with failing checks.**
+**You MUST run `make format lint` before EVERY commit.** No exceptions.
+**You MUST run `make sbom` before EVERY pull request.** No exceptions.
+
+These are non-negotiable gates. If either fails, fix the issue before
+proceeding. Do not skip, defer, or rationalize skipping these steps.
+
+```bash
+# Before EVERY commit:
+make format lint
+
+# Before EVERY PR (in addition to format + lint):
+make sbom
+```
+
+For a full pre-commit verification (recommended but not always required):
 
 ```bash
 make format lint check test sbom
@@ -473,11 +494,11 @@ cargo bench -p edgefirst_image
 5. Update type stubs in `crates/python/edgefirst_hal.pyi`
 
 **Adding a New Image Format:**
-1. Add FourCC variant in dependency `four-char-code`
-2. Update format conversion logic in `crates/image/src/`
-3. Add G2D support (if hardware supports it)
-4. Add CPU fallback
-5. Add Python tests
+1. Add variant to `PixelFormat` enum in `crates/tensor/src/format.rs`
+2. Update `channels()`, `layout()`, `is_yuv()`, `has_alpha()`, `to_fourcc()`/`from_fourcc()` methods
+3. Update format conversion logic in `crates/image/src/cpu/` (convert.rs, mod.rs dispatch tables)
+4. Add G2D support (if hardware supports it) — update `pixelfmt_to_fourcc()` in g2d.rs
+5. Add CPU fallback and Python tests
 
 ### Code Style
 

@@ -473,7 +473,7 @@ mod tests {
     fn test_pbo_via_tensor_enum() {
         let ops = MockPboOps::new(12);
         let pbo = PboTensor::<u8>::from_pbo(10, 12, &[3, 4], Some("enum_test"), ops).unwrap();
-        let tensor = crate::Tensor::Pbo(pbo);
+        let tensor = crate::Tensor::wrap(crate::TensorStorage::Pbo(pbo));
         assert_eq!(tensor.memory(), TensorMemory::Pbo);
         assert_eq!(tensor.name(), "enum_test");
         assert_eq!(tensor.shape(), &[3, 4]);

@@ -1,32 +1,31 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
-    Crop, Error, Flip, FunctionTimer, Rect, Result, Rotation, TensorImage, TensorImageDst, GREY,
-    NV16, PLANAR_RGB, PLANAR_RGBA, RGB, RGBA, YUYV,
-};
-use edgefirst_tensor::{TensorMapTrait, TensorTrait};
+use crate::{Crop, Error, Flip, FunctionTimer, Rect, Result, Rotation};
+use edgefirst_tensor::{PixelFormat, Tensor, TensorTrait};
 use ndarray::{ArrayView3, ArrayViewMut3, Axis};
 use rayon::iter::IndexedParallelIterator;
 
-use super::CPUProcessor;
+use super::{row_stride_for, CPUProcessor};
 
 impl CPUProcessor {
-    pub(crate) fn flip_rotate_ndarray(
+    /// Core flip/rotate using ndarray, parameterized by dimensions.
+    pub(crate) fn flip_rotate_ndarray_pf(
         src_map: &[u8],
         dst_map: &mut [u8],
-        dst: &TensorImage,
+        dst_w: usize,
+        dst_h: usize,
+        dst_c: usize,
         rotation: Rotation,
         flip: Flip,
     ) -> Result<(), crate::Error> {
-        let mut dst_view =
-            ArrayViewMut3::from_shape((dst.height(), dst.width(), dst.channels()), dst_map)?;
+        let mut dst_view = ArrayViewMut3::from_shape((dst_h, dst_w, dst_c), dst_map)?;
         let mut src_view = match rotation {
             Rotation::None | Rotation::Rotate180 => {
-                ArrayView3::from_shape((dst.height(), dst.width(), dst.channels()), src_map)?
+                ArrayView3::from_shape((dst_h, dst_w, dst_c), src_map)?
             }
             Rotation::Clockwise90 | Rotation::CounterClockwise90 => {
-                ArrayView3::from_shape((dst.width(), dst.height(), dst.channels()), src_map)?
+                ArrayView3::from_shape((dst_w, dst_h, dst_c), src_map)?
             }
         };
 
@@ -61,25 +60,27 @@ impl CPUProcessor {
         Ok(())
     }
 
-    pub(super) fn resize_flip_rotate(
+    /// Resize/flip/rotate with explicit PixelFormat (used by convert_u8).
+    pub(super) fn resize_flip_rotate_pf(
         &mut self,
-        src: &TensorImage,
-        dst: &mut TensorImage,
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        fmt: PixelFormat,
         rotation: Rotation,
         flip: Flip,
         crop: Crop,
     ) -> Result<()> {
+        let src_w = src.width().unwrap();
+        let src_h = src.height().unwrap();
+        let dst_w = dst.width().unwrap();
+        let dst_h = dst.height().unwrap();
+        let channels = fmt.channels();
         let _timer = FunctionTimer::new(format!(
             "ImageProcessor::resize_flip_rotate {}x{} to {}x{} {}",
-            src.width(),
-            src.height(),
-            dst.width(),
-            dst.height(),
-            dst.fourcc().display()
+            src_w, src_h, dst_w, dst_h, fmt,
         ));
-        assert_eq!(src.fourcc(), dst.fourcc());
 
-        let src_type = match src.channels() {
+        let src_type = match channels {
             1 => fast_image_resize::PixelType::U8,
             3 => fast_image_resize::PixelType::U8x3,
             4 => fast_image_resize::PixelType::U8x4,
@@ -90,9 +91,8 @@ impl CPUProcessor {
             }
         };
 
-        let mut src_map = src.tensor().map()?;
-
-        let mut dst_map = dst.tensor().map()?;
+        let mut src_map = src.map()?;
+        let mut dst_map = dst.map()?;
 
         let options = if let Some(crop) = crop.src_rect {
             self.options.crop(
@@ -105,39 +105,41 @@ impl CPUProcessor {
             self.options
         };
 
-        let mut dst_rect = crop.dst_rect.unwrap_or_else(|| Rect {
+        let mut dst_rect = crop.dst_rect.unwrap_or(Rect {
             left: 0,
             top: 0,
-            width: dst.width(),
-            height: dst.height(),
+            width: dst_w,
+            height: dst_h,
         });
 
         // adjust crop box for rotation/flip
-        Self::adjust_dest_rect_for_rotate_flip(&mut dst_rect, dst, rotation, flip);
+        Self::adjust_dest_rect_for_rotate_flip_dims(&mut dst_rect, dst_w, dst_h, rotation, flip);
 
-        let needs_resize = src.width() != dst.width()
-            || src.height() != dst.height()
-            || crop.src_rect.is_some_and(|crop| {
-                crop != Rect {
+        let dst_rs = row_stride_for(dst_w, fmt);
+
+        let needs_resize = src_w != dst_w
+            || src_h != dst_h
+            || crop.src_rect.is_some_and(|c| {
+                c != Rect {
                     left: 0,
                     top: 0,
-                    width: src.width(),
-                    height: src.height(),
+                    width: src_w,
+                    height: src_h,
                 }
             })
-            || crop.dst_rect.is_some_and(|crop| {
-                crop != Rect {
+            || crop.dst_rect.is_some_and(|c| {
+                c != Rect {
                     left: 0,
                     top: 0,
-                    width: dst.width(),
-                    height: dst.height(),
+                    width: dst_w,
+                    height: dst_h,
                 }
             });
 
         if needs_resize {
             let src_view = fast_image_resize::images::Image::from_slice_u8(
-                src.width() as u32,
-                src.height() as u32,
+                src_w as u32,
+                src_h as u32,
                 &mut src_map,
                 src_type,
             )?;
@@ -145,8 +147,8 @@ impl CPUProcessor {
             match (rotation, flip) {
                 (Rotation::None, Flip::None) => {
                     let mut dst_view = fast_image_resize::images::Image::from_slice_u8(
-                        dst.width() as u32,
-                        dst.height() as u32,
+                        dst_w as u32,
+                        dst_h as u32,
                         &mut dst_map,
                         src_type,
                     )?;
@@ -162,10 +164,10 @@ impl CPUProcessor {
                     self.resizer.resize(&src_view, &mut dst_view, &options)?;
                 }
                 (Rotation::Clockwise90, _) | (Rotation::CounterClockwise90, _) => {
-                    let mut tmp = vec![0; dst.row_stride() * dst.height()];
+                    let mut tmp = vec![0; dst_rs * dst_h];
                     let mut tmp_view = fast_image_resize::images::Image::from_slice_u8(
-                        dst.height() as u32,
-                        dst.width() as u32,
+                        dst_h as u32,
+                        dst_w as u32,
                         &mut tmp,
                         src_type,
                     )?;
@@ -179,13 +181,21 @@ impl CPUProcessor {
                     )?;
 
                     self.resizer.resize(&src_view, &mut tmp_view, &options)?;
-                    Self::flip_rotate_ndarray(&tmp, &mut dst_map, dst, rotation, flip)?;
+                    Self::flip_rotate_ndarray_pf(
+                        &tmp,
+                        &mut dst_map,
+                        dst_w,
+                        dst_h,
+                        channels,
+                        rotation,
+                        flip,
+                    )?;
                 }
                 (Rotation::None, _) | (Rotation::Rotate180, _) => {
-                    let mut tmp = vec![0; dst.row_stride() * dst.height()];
+                    let mut tmp = vec![0; dst_rs * dst_h];
                     let mut tmp_view = fast_image_resize::images::Image::from_slice_u8(
-                        dst.width() as u32,
-                        dst.height() as u32,
+                        dst_w as u32,
+                        dst_h as u32,
                         &mut tmp,
                         src_type,
                     )?;
@@ -199,18 +209,35 @@ impl CPUProcessor {
                     )?;
 
                     self.resizer.resize(&src_view, &mut tmp_view, &options)?;
-                    Self::flip_rotate_ndarray(&tmp, &mut dst_map, dst, rotation, flip)?;
+                    Self::flip_rotate_ndarray_pf(
+                        &tmp,
+                        &mut dst_map,
+                        dst_w,
+                        dst_h,
+                        channels,
+                        rotation,
+                        flip,
+                    )?;
                 }
             }
         } else {
-            Self::flip_rotate_ndarray(&src_map, &mut dst_map, dst, rotation, flip)?;
+            Self::flip_rotate_ndarray_pf(
+                &src_map,
+                &mut dst_map,
+                dst_w,
+                dst_h,
+                channels,
+                rotation,
+                flip,
+            )?;
         }
         Ok(())
     }
 
-    pub(super) fn adjust_dest_rect_for_rotate_flip(
+    fn adjust_dest_rect_for_rotate_flip_dims(
         crop: &mut Rect,
-        dst: &TensorImage,
+        dst_w: usize,
+        dst_h: usize,
         rot: Rotation,
         flip: Flip,
     ) {
@@ -219,22 +246,22 @@ impl CPUProcessor {
             Rotation::Clockwise90 => {
                 *crop = Rect {
                     left: crop.top,
-                    top: dst.width() - crop.left - crop.width,
+                    top: dst_w - crop.left - crop.width,
                     width: crop.height,
                     height: crop.width,
                 }
             }
             Rotation::Rotate180 => {
                 *crop = Rect {
-                    left: dst.width() - crop.left - crop.width,
-                    top: dst.height() - crop.top - crop.height,
+                    left: dst_w - crop.left - crop.width,
+                    top: dst_h - crop.top - crop.height,
                     width: crop.width,
                     height: crop.height,
                 }
             }
             Rotation::CounterClockwise90 => {
                 *crop = Rect {
-                    left: dst.height() - crop.top - crop.height,
+                    left: dst_h - crop.top - crop.height,
                     top: crop.left,
                     width: crop.height,
                     height: crop.width,
@@ -244,68 +271,8 @@ impl CPUProcessor {
 
         match flip {
             Flip::None => {}
-            Flip::Vertical => crop.top = dst.height() - crop.top - crop.height,
-            Flip::Horizontal => crop.left = dst.width() - crop.left - crop.width,
-        }
-    }
-
-    /// Fills the area outside a crop rectangle with the specified color.
-    pub fn fill_image_outside_crop(dst: &mut TensorImage, rgba: [u8; 4], crop: Rect) -> Result<()> {
-        let dst_fourcc = dst.fourcc();
-        let mut dst_map = dst.tensor().map()?;
-        let dst = (dst_map.as_mut_slice(), dst.width(), dst.height());
-        match dst_fourcc {
-            RGBA => Self::fill_image_outside_crop_(dst, rgba, crop),
-            RGB => Self::fill_image_outside_crop_(dst, Self::rgba_to_rgb(rgba), crop),
-            GREY => Self::fill_image_outside_crop_(dst, Self::rgba_to_grey(rgba), crop),
-            YUYV => Self::fill_image_outside_crop_(
-                (dst.0, dst.1 / 2, dst.2),
-                Self::rgba_to_yuyv(rgba),
-                Rect::new(crop.left / 2, crop.top, crop.width.div_ceil(2), crop.height),
-            ),
-            PLANAR_RGB => Self::fill_image_outside_crop_planar(dst, Self::rgba_to_rgb(rgba), crop),
-            PLANAR_RGBA => Self::fill_image_outside_crop_planar(dst, rgba, crop),
-            NV16 => {
-                let yuyv = Self::rgba_to_yuyv(rgba);
-                Self::fill_image_outside_crop_yuv_semiplanar(dst, yuyv[0], [yuyv[1], yuyv[3]], crop)
-            }
-            _ => Err(Error::Internal(format!(
-                "Found unexpected destination {}",
-                dst_fourcc.display()
-            ))),
-        }
-    }
-
-    /// Generic fill for TensorImageDst types.
-    pub(crate) fn fill_image_outside_crop_generic<D: TensorImageDst>(
-        dst: &mut D,
-        rgba: [u8; 4],
-        crop: Rect,
-    ) -> Result<()> {
-        let dst_fourcc = dst.fourcc();
-        let dst_width = dst.width();
-        let dst_height = dst.height();
-        let mut dst_map = dst.tensor_mut().map()?;
-        let dst = (dst_map.as_mut_slice(), dst_width, dst_height);
-        match dst_fourcc {
-            RGBA => Self::fill_image_outside_crop_(dst, rgba, crop),
-            RGB => Self::fill_image_outside_crop_(dst, Self::rgba_to_rgb(rgba), crop),
-            GREY => Self::fill_image_outside_crop_(dst, Self::rgba_to_grey(rgba), crop),
-            YUYV => Self::fill_image_outside_crop_(
-                (dst.0, dst.1 / 2, dst.2),
-                Self::rgba_to_yuyv(rgba),
-                Rect::new(crop.left / 2, crop.top, crop.width.div_ceil(2), crop.height),
-            ),
-            PLANAR_RGB => Self::fill_image_outside_crop_planar(dst, Self::rgba_to_rgb(rgba), crop),
-            PLANAR_RGBA => Self::fill_image_outside_crop_planar(dst, rgba, crop),
-            NV16 => {
-                let yuyv = Self::rgba_to_yuyv(rgba);
-                Self::fill_image_outside_crop_yuv_semiplanar(dst, yuyv[0], [yuyv[1], yuyv[3]], crop)
-            }
-            _ => Err(Error::Internal(format!(
-                "Found unexpected destination {}",
-                dst_fourcc.display()
-            ))),
+            Flip::Vertical => crop.top = dst_h - crop.top - crop.height,
+            Flip::Horizontal => crop.left = dst_w - crop.left - crop.width,
         }
     }
 
@@ -367,7 +334,6 @@ impl CPUProcessor {
             prelude::ParallelSliceMut,
         };
 
-        // map.as_mut_slice().splitn_mut(n, pred)
         let s_rem = dst;
 
         s_rem

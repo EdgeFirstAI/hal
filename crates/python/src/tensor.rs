@@ -1,15 +1,16 @@
-// SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
+// SPDX-FileCopyrightText: Copyright 2025-2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-use edgefirst_hal::tensor::{self, TensorMapTrait, TensorMemory, TensorTrait};
+use edgefirst_hal::tensor::{self, DType, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait};
 #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
 use pyo3::ffi::Py_buffer;
 use pyo3::{exceptions::PyBufferError, ffi::PyMemoryView_FromMemory, prelude::*};
 
+use std::ffi::c_void;
 #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
-use std::ffi::{c_int, c_void, CString};
+use std::ffi::{c_int, CString};
 #[cfg(unix)]
-use std::os::fd::{IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{IntoRawFd, RawFd};
 
 use std::{
     fmt::{self, Display},
@@ -24,6 +25,7 @@ pub enum Error {
     UnsupportedMemoryType(String),
     UnsupportedDataType(String),
     TensorMap(String),
+    Format(String),
     Io(std::io::Error),
 }
 
@@ -34,6 +36,7 @@ impl fmt::Display for Error {
             Error::UnsupportedMemoryType(msg) => write!(f, "Invalid memory type: {msg}"),
             Error::UnsupportedDataType(msg) => write!(f, "Invalid data type: {msg}"),
             Error::TensorMap(msg) => write!(f, "Tensor map error: {msg}"),
+            Error::Format(msg) => write!(f, "Format error: {msg}"),
             Error::Io(e) => write!(f, "IO error: {e:?}"),
         }
     }
@@ -48,6 +51,18 @@ impl From<tensor::Error> for Error {
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
         Error::Io(err)
+    }
+}
+
+impl From<edgefirst_hal::image::Error> for Error {
+    fn from(err: edgefirst_hal::image::Error) -> Self {
+        Error::Format(format!("{err:?}"))
+    }
+}
+
+impl From<crate::image::Error> for Error {
+    fn from(err: crate::image::Error) -> Self {
+        Error::Format(format!("{err}"))
     }
 }
 
@@ -95,148 +110,45 @@ impl From<TensorMemory> for PyTensorMemory {
     }
 }
 
-#[derive(Debug)]
-pub enum TensorT {
-    TensorU8(tensor::Tensor<u8>),
-    TensorI8(tensor::Tensor<i8>),
-    TensorU16(tensor::Tensor<u16>),
-    TensorI16(tensor::Tensor<i16>),
-    TensorU32(tensor::Tensor<u32>),
-    TensorI32(tensor::Tensor<i32>),
-    TensorU64(tensor::Tensor<u64>),
-    TensorI64(tensor::Tensor<i64>),
-    TensorF32(tensor::Tensor<f32>),
-    TensorF64(tensor::Tensor<f64>),
-}
-
-impl Display for TensorT {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_fmt(format_args!("{:?}", self))
+/// Parse a Python dtype string (e.g. "float32", "uint8") into a `DType`.
+pub(crate) fn parse_dtype(dtype: &str) -> Result<DType> {
+    match dtype {
+        "uint8" => Ok(DType::U8),
+        "int8" => Ok(DType::I8),
+        "uint16" => Ok(DType::U16),
+        "int16" => Ok(DType::I16),
+        "uint32" => Ok(DType::U32),
+        "int32" => Ok(DType::I32),
+        "uint64" => Ok(DType::U64),
+        "int64" => Ok(DType::I64),
+        "float16" => Ok(DType::F16),
+        "float32" => Ok(DType::F32),
+        "float64" => Ok(DType::F64),
+        _ => Err(Error::UnsupportedDataType(dtype.to_string())),
     }
 }
 
-impl TensorT {
-    pub fn dtype(&self) -> String {
-        match self {
-            TensorT::TensorU8(_) => "uint8".to_string(),
-            TensorT::TensorI8(_) => "int8".to_string(),
-            TensorT::TensorU16(_) => "uint16".to_string(),
-            TensorT::TensorI16(_) => "int16".to_string(),
-            TensorT::TensorU32(_) => "uint32".to_string(),
-            TensorT::TensorI32(_) => "int32".to_string(),
-            TensorT::TensorU64(_) => "uint64".to_string(),
-            TensorT::TensorI64(_) => "int64".to_string(),
-            TensorT::TensorF32(_) => "float32".to_string(),
-            TensorT::TensorF64(_) => "float64".to_string(),
-        }
-    }
-
-    pub fn size(&self) -> usize {
-        match self {
-            TensorT::TensorU8(t) => t.size(),
-            TensorT::TensorI8(t) => t.size(),
-            TensorT::TensorU16(t) => t.size(),
-            TensorT::TensorI16(t) => t.size(),
-            TensorT::TensorU32(t) => t.size(),
-            TensorT::TensorI32(t) => t.size(),
-            TensorT::TensorU64(t) => t.size(),
-            TensorT::TensorI64(t) => t.size(),
-            TensorT::TensorF32(t) => t.size(),
-            TensorT::TensorF64(t) => t.size(),
-        }
-    }
-
-    pub fn memory(&self) -> tensor::TensorMemory {
-        match self {
-            TensorT::TensorU8(t) => t.memory(),
-            TensorT::TensorI8(t) => t.memory(),
-            TensorT::TensorU16(t) => t.memory(),
-            TensorT::TensorI16(t) => t.memory(),
-            TensorT::TensorU32(t) => t.memory(),
-            TensorT::TensorI32(t) => t.memory(),
-            TensorT::TensorU64(t) => t.memory(),
-            TensorT::TensorI64(t) => t.memory(),
-            TensorT::TensorF32(t) => t.memory(),
-            TensorT::TensorF64(t) => t.memory(),
-        }
-    }
-
-    pub fn name(&self) -> String {
-        match self {
-            TensorT::TensorU8(t) => t.name(),
-            TensorT::TensorI8(t) => t.name(),
-            TensorT::TensorU16(t) => t.name(),
-            TensorT::TensorI16(t) => t.name(),
-            TensorT::TensorU32(t) => t.name(),
-            TensorT::TensorI32(t) => t.name(),
-            TensorT::TensorU64(t) => t.name(),
-            TensorT::TensorI64(t) => t.name(),
-            TensorT::TensorF32(t) => t.name(),
-            TensorT::TensorF64(t) => t.name(),
-        }
-    }
-
-    pub fn shape(&self) -> &[usize] {
-        match self {
-            TensorT::TensorU8(t) => t.shape(),
-            TensorT::TensorI8(t) => t.shape(),
-            TensorT::TensorU16(t) => t.shape(),
-            TensorT::TensorI16(t) => t.shape(),
-            TensorT::TensorU32(t) => t.shape(),
-            TensorT::TensorI32(t) => t.shape(),
-            TensorT::TensorU64(t) => t.shape(),
-            TensorT::TensorI64(t) => t.shape(),
-            TensorT::TensorF32(t) => t.shape(),
-            TensorT::TensorF64(t) => t.shape(),
-        }
-    }
-
-    pub fn reshape(&mut self, shape: &[usize]) -> tensor::Result<()> {
-        match self {
-            TensorT::TensorU8(t) => t.reshape(shape),
-            TensorT::TensorI8(t) => t.reshape(shape),
-            TensorT::TensorU16(t) => t.reshape(shape),
-            TensorT::TensorI16(t) => t.reshape(shape),
-            TensorT::TensorU32(t) => t.reshape(shape),
-            TensorT::TensorI32(t) => t.reshape(shape),
-            TensorT::TensorU64(t) => t.reshape(shape),
-            TensorT::TensorI64(t) => t.reshape(shape),
-            TensorT::TensorF32(t) => t.reshape(shape),
-            TensorT::TensorF64(t) => t.reshape(shape),
-        }
-    }
-
-    pub fn map(&self) -> tensor::Result<TensorMapT> {
-        match self {
-            TensorT::TensorU8(t) => t.map().map(TensorMapT::TensorU8),
-            TensorT::TensorI8(t) => t.map().map(TensorMapT::TensorI8),
-            TensorT::TensorU16(t) => t.map().map(TensorMapT::TensorU16),
-            TensorT::TensorI16(t) => t.map().map(TensorMapT::TensorI16),
-            TensorT::TensorU32(t) => t.map().map(TensorMapT::TensorU32),
-            TensorT::TensorI32(t) => t.map().map(TensorMapT::TensorI32),
-            TensorT::TensorU64(t) => t.map().map(TensorMapT::TensorU64),
-            TensorT::TensorI64(t) => t.map().map(TensorMapT::TensorI64),
-            TensorT::TensorF32(t) => t.map().map(TensorMapT::TensorF32),
-            TensorT::TensorF64(t) => t.map().map(TensorMapT::TensorF64),
-        }
-    }
-
-    #[cfg(unix)]
-    pub fn clone_fd(&self) -> tensor::Result<OwnedFd> {
-        match self {
-            TensorT::TensorU8(t) => t.clone_fd(),
-            TensorT::TensorI8(t) => t.clone_fd(),
-            TensorT::TensorU16(t) => t.clone_fd(),
-            TensorT::TensorI16(t) => t.clone_fd(),
-            TensorT::TensorU32(t) => t.clone_fd(),
-            TensorT::TensorI32(t) => t.clone_fd(),
-            TensorT::TensorU64(t) => t.clone_fd(),
-            TensorT::TensorI64(t) => t.clone_fd(),
-            TensorT::TensorF32(t) => t.clone_fd(),
-            TensorT::TensorF64(t) => t.clone_fd(),
-        }
+/// Convert a `DType` to a Python dtype string.
+fn dtype_to_str(dtype: DType) -> &'static str {
+    match dtype {
+        DType::U8 => "uint8",
+        DType::I8 => "int8",
+        DType::U16 => "uint16",
+        DType::I16 => "int16",
+        DType::U32 => "uint32",
+        DType::I32 => "int32",
+        DType::U64 => "uint64",
+        DType::I64 => "int64",
+        DType::F16 => "float16",
+        DType::F32 => "float32",
+        DType::F64 => "float64",
+        _ => "unknown",
     }
 }
+
+// ─── Type-erased TensorMap ──────────────────────────────────────────────────
+// Needed for Python buffer protocol — must dispatch per dtype to get typed
+// pointers, format strings, and per-element operations.
 
 pub enum TensorMapT {
     TensorU8(tensor::TensorMap<u8>),
@@ -247,54 +159,41 @@ pub enum TensorMapT {
     TensorI32(tensor::TensorMap<i32>),
     TensorU64(tensor::TensorMap<u64>),
     TensorI64(tensor::TensorMap<i64>),
+    TensorF16(tensor::TensorMap<half::f16>),
     TensorF32(tensor::TensorMap<f32>),
     TensorF64(tensor::TensorMap<f64>),
 }
 
+/// Dispatch a method call across all TensorMapT variants.
+macro_rules! map_dispatch {
+    ($self:expr, $method:ident $(, $arg:expr)*) => {
+        match $self {
+            TensorMapT::TensorU8(m) => m.$method($($arg),*),
+            TensorMapT::TensorI8(m) => m.$method($($arg),*),
+            TensorMapT::TensorU16(m) => m.$method($($arg),*),
+            TensorMapT::TensorI16(m) => m.$method($($arg),*),
+            TensorMapT::TensorU32(m) => m.$method($($arg),*),
+            TensorMapT::TensorI32(m) => m.$method($($arg),*),
+            TensorMapT::TensorU64(m) => m.$method($($arg),*),
+            TensorMapT::TensorI64(m) => m.$method($($arg),*),
+            TensorMapT::TensorF16(m) => m.$method($($arg),*),
+            TensorMapT::TensorF32(m) => m.$method($($arg),*),
+            TensorMapT::TensorF64(m) => m.$method($($arg),*),
+        }
+    };
+}
+
 impl TensorMapT {
     pub fn unmap(&mut self) {
-        match self {
-            TensorMapT::TensorU8(map) => map.unmap(),
-            TensorMapT::TensorI8(map) => map.unmap(),
-            TensorMapT::TensorU16(map) => map.unmap(),
-            TensorMapT::TensorI16(map) => map.unmap(),
-            TensorMapT::TensorU32(map) => map.unmap(),
-            TensorMapT::TensorI32(map) => map.unmap(),
-            TensorMapT::TensorU64(map) => map.unmap(),
-            TensorMapT::TensorI64(map) => map.unmap(),
-            TensorMapT::TensorF32(map) => map.unmap(),
-            TensorMapT::TensorF64(map) => map.unmap(),
-        }
+        map_dispatch!(self, unmap);
     }
 
     pub fn shape(&self) -> &[usize] {
-        match self {
-            TensorMapT::TensorU8(map) => map.shape(),
-            TensorMapT::TensorI8(map) => map.shape(),
-            TensorMapT::TensorU16(map) => map.shape(),
-            TensorMapT::TensorI16(map) => map.shape(),
-            TensorMapT::TensorU32(map) => map.shape(),
-            TensorMapT::TensorI32(map) => map.shape(),
-            TensorMapT::TensorU64(map) => map.shape(),
-            TensorMapT::TensorI64(map) => map.shape(),
-            TensorMapT::TensorF32(map) => map.shape(),
-            TensorMapT::TensorF64(map) => map.shape(),
-        }
+        map_dispatch!(self, shape)
     }
 
     pub fn size(&self) -> usize {
-        match self {
-            TensorMapT::TensorU8(map) => map.size(),
-            TensorMapT::TensorI8(map) => map.size(),
-            TensorMapT::TensorU16(map) => map.size(),
-            TensorMapT::TensorI16(map) => map.size(),
-            TensorMapT::TensorU32(map) => map.size(),
-            TensorMapT::TensorI32(map) => map.size(),
-            TensorMapT::TensorU64(map) => map.size(),
-            TensorMapT::TensorI64(map) => map.size(),
-            TensorMapT::TensorF32(map) => map.size(),
-            TensorMapT::TensorF64(map) => map.size(),
-        }
+        map_dispatch!(self, size)
     }
 
     #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
@@ -308,12 +207,12 @@ impl TensorMapT {
             TensorMapT::TensorI32(_) => std::mem::size_of::<i32>(),
             TensorMapT::TensorU64(_) => std::mem::size_of::<u64>(),
             TensorMapT::TensorI64(_) => std::mem::size_of::<i64>(),
+            TensorMapT::TensorF16(_) => std::mem::size_of::<half::f16>(),
             TensorMapT::TensorF32(_) => std::mem::size_of::<f32>(),
             TensorMapT::TensorF64(_) => std::mem::size_of::<f64>(),
         }
     }
 
-    /// Get value at index and convert to Python object
     pub fn get_value_at(&self, index: usize, py: Python) -> PyResult<Py<PyAny>> {
         if index >= self.size() {
             return Err(PyBufferError::new_err("Index out of bounds"));
@@ -327,12 +226,14 @@ impl TensorMapT {
             TensorMapT::TensorI32(m) => Ok(m.as_ref()[index].into_pyobject(py)?.into()),
             TensorMapT::TensorU64(m) => Ok(m.as_ref()[index].into_pyobject(py)?.into()),
             TensorMapT::TensorI64(m) => Ok(m.as_ref()[index].into_pyobject(py)?.into()),
+            TensorMapT::TensorF16(m) => Ok(half::f16::to_f32(m.as_ref()[index])
+                .into_pyobject(py)?
+                .into()),
             TensorMapT::TensorF32(m) => Ok(m.as_ref()[index].into_pyobject(py)?.into()),
             TensorMapT::TensorF64(m) => Ok(m.as_ref()[index].into_pyobject(py)?.into()),
         }
     }
 
-    /// Set value at index from Python object
     pub fn set_value_at(&mut self, index: usize, value: Py<PyAny>, py: Python) -> PyResult<()> {
         if index >= self.size() {
             return Err(PyBufferError::new_err("Index out of bounds"));
@@ -346,19 +247,101 @@ impl TensorMapT {
             TensorMapT::TensorI32(m) => m.as_mut()[index] = value.extract::<i32>(py)?,
             TensorMapT::TensorU64(m) => m.as_mut()[index] = value.extract::<u64>(py)?,
             TensorMapT::TensorI64(m) => m.as_mut()[index] = value.extract::<i64>(py)?,
+            TensorMapT::TensorF16(m) => {
+                m.as_mut()[index] = half::f16::from_f32(value.extract::<f32>(py)?)
+            }
             TensorMapT::TensorF32(m) => m.as_mut()[index] = value.extract::<f32>(py)?,
             TensorMapT::TensorF64(m) => m.as_mut()[index] = value.extract::<f64>(py)?,
         }
         Ok(())
     }
+
+    /// Get a raw pointer to the mapped data (for Python buffer protocol).
+    fn data_ptr(&self) -> *mut c_void {
+        match self {
+            TensorMapT::TensorU8(m) => m.as_ref().as_ptr() as *mut c_void,
+            TensorMapT::TensorI8(m) => m.as_ref().as_ptr() as *mut c_void,
+            TensorMapT::TensorU16(m) => m.as_ref().as_ptr() as *mut c_void,
+            TensorMapT::TensorI16(m) => m.as_ref().as_ptr() as *mut c_void,
+            TensorMapT::TensorU32(m) => m.as_ref().as_ptr() as *mut c_void,
+            TensorMapT::TensorI32(m) => m.as_ref().as_ptr() as *mut c_void,
+            TensorMapT::TensorU64(m) => m.as_ref().as_ptr() as *mut c_void,
+            TensorMapT::TensorI64(m) => m.as_ref().as_ptr() as *mut c_void,
+            TensorMapT::TensorF16(m) => m.as_ref().as_ptr() as *mut c_void,
+            TensorMapT::TensorF32(m) => m.as_ref().as_ptr() as *mut c_void,
+            TensorMapT::TensorF64(m) => m.as_ref().as_ptr() as *mut c_void,
+        }
+    }
+
+    /// Get the struct format character for Python buffer protocol.
+    #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
+    fn format_str(&self) -> &'static str {
+        match self {
+            TensorMapT::TensorU8(_) => "B",
+            TensorMapT::TensorI8(_) => "b",
+            TensorMapT::TensorU16(_) => "H",
+            TensorMapT::TensorI16(_) => "h",
+            TensorMapT::TensorU32(_) => "I",
+            TensorMapT::TensorI32(_) => "i",
+            TensorMapT::TensorU64(_) => "Q",
+            TensorMapT::TensorI64(_) => "q",
+            TensorMapT::TensorF16(_) => "e",
+            TensorMapT::TensorF32(_) => "f",
+            TensorMapT::TensorF64(_) => "d",
+        }
+    }
+
+    fn dtype_name(&self) -> &'static str {
+        match self {
+            TensorMapT::TensorU8(_) => "uint8",
+            TensorMapT::TensorI8(_) => "int8",
+            TensorMapT::TensorU16(_) => "uint16",
+            TensorMapT::TensorI16(_) => "int16",
+            TensorMapT::TensorU32(_) => "uint32",
+            TensorMapT::TensorI32(_) => "int32",
+            TensorMapT::TensorU64(_) => "uint64",
+            TensorMapT::TensorI64(_) => "int64",
+            TensorMapT::TensorF16(_) => "float16",
+            TensorMapT::TensorF32(_) => "float32",
+            TensorMapT::TensorF64(_) => "float64",
+        }
+    }
 }
 
+/// Map a `TensorDyn` to a `TensorMapT`.
+fn map_tensor_dyn(t: &TensorDyn) -> tensor::Result<TensorMapT> {
+    match t {
+        TensorDyn::U8(t) => t.map().map(TensorMapT::TensorU8),
+        TensorDyn::I8(t) => t.map().map(TensorMapT::TensorI8),
+        TensorDyn::U16(t) => t.map().map(TensorMapT::TensorU16),
+        TensorDyn::I16(t) => t.map().map(TensorMapT::TensorI16),
+        TensorDyn::U32(t) => t.map().map(TensorMapT::TensorU32),
+        TensorDyn::I32(t) => t.map().map(TensorMapT::TensorI32),
+        TensorDyn::U64(t) => t.map().map(TensorMapT::TensorU64),
+        TensorDyn::I64(t) => t.map().map(TensorMapT::TensorI64),
+        TensorDyn::F16(t) => t.map().map(TensorMapT::TensorF16),
+        TensorDyn::F32(t) => t.map().map(TensorMapT::TensorF32),
+        TensorDyn::F64(t) => t.map().map(TensorMapT::TensorF64),
+        _ => Err(tensor::Error::InvalidArgument(
+            "unsupported dtype for tensor mapping".to_string(),
+        )),
+    }
+}
+
+// ─── PyTensor ───────────────────────────────────────────────────────────────
+
 #[pyclass(name = "Tensor", str)]
-pub struct PyTensor(TensorT);
+pub struct PyTensor(pub(crate) TensorDyn);
 
 impl Display for PyTensor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_fmt(format_args!("{:?}", self.0))
+        write!(
+            f,
+            "Tensor(dtype={}, shape={:?}, memory={:?})",
+            dtype_to_str(self.0.dtype()),
+            self.0.shape(),
+            self.0.memory(),
+        )
     }
 }
 
@@ -372,22 +355,9 @@ impl PyTensor {
         mem: Option<PyTensorMemory>,
         name: Option<&str>,
     ) -> Result<Self> {
-        let mem = mem.map(|x| x.into());
-
-        let tensor = match dtype {
-            "uint8" => TensorT::TensorU8(tensor::Tensor::new(&shape, mem, name)?),
-            "int8" => TensorT::TensorI8(tensor::Tensor::new(&shape, mem, name)?),
-            "uint16" => TensorT::TensorU16(tensor::Tensor::new(&shape, mem, name)?),
-            "int16" => TensorT::TensorI16(tensor::Tensor::new(&shape, mem, name)?),
-            "uint32" => TensorT::TensorU32(tensor::Tensor::new(&shape, mem, name)?),
-            "int32" => TensorT::TensorI32(tensor::Tensor::new(&shape, mem, name)?),
-            "uint64" => TensorT::TensorU64(tensor::Tensor::new(&shape, mem, name)?),
-            "int64" => TensorT::TensorI64(tensor::Tensor::new(&shape, mem, name)?),
-            "float32" => TensorT::TensorF32(tensor::Tensor::new(&shape, mem, name)?),
-            "float64" => TensorT::TensorF64(tensor::Tensor::new(&shape, mem, name)?),
-            _ => return Err(Error::UnsupportedDataType(dtype.to_string())),
-        };
-
+        let dt = parse_dtype(dtype)?;
+        let memory = mem.map(|x| x.into());
+        let tensor = TensorDyn::new(&shape, dt, memory, name)?;
         Ok(PyTensor(tensor))
     }
 
@@ -402,29 +372,15 @@ impl PyTensor {
                 "Invalid file descriptor",
             )));
         }
-
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-
-        let tensor = match dtype {
-            "uint8" => TensorT::TensorU8(tensor::Tensor::from_fd(fd, &shape, name)?),
-            "int8" => TensorT::TensorI8(tensor::Tensor::from_fd(fd, &shape, name)?),
-            "uint16" => TensorT::TensorU16(tensor::Tensor::from_fd(fd, &shape, name)?),
-            "int16" => TensorT::TensorI16(tensor::Tensor::from_fd(fd, &shape, name)?),
-            "uint32" => TensorT::TensorU32(tensor::Tensor::from_fd(fd, &shape, name)?),
-            "int32" => TensorT::TensorI32(tensor::Tensor::from_fd(fd, &shape, name)?),
-            "uint64" => TensorT::TensorU64(tensor::Tensor::from_fd(fd, &shape, name)?),
-            "int64" => TensorT::TensorI64(tensor::Tensor::from_fd(fd, &shape, name)?),
-            "float32" => TensorT::TensorF32(tensor::Tensor::from_fd(fd, &shape, name)?),
-            "float64" => TensorT::TensorF64(tensor::Tensor::from_fd(fd, &shape, name)?),
-            _ => return Err(Error::UnsupportedDataType(dtype.to_string())),
-        };
-
+        let dt = parse_dtype(dtype)?;
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+        let tensor = TensorDyn::from_fd(fd, &shape, dt, name)?;
         Ok(PyTensor(tensor))
     }
 
     #[getter]
     fn dtype(&self) -> String {
-        self.0.dtype()
+        dtype_to_str(self.0.dtype()).to_string()
     }
 
     #[getter]
@@ -443,8 +399,8 @@ impl PyTensor {
     }
 
     #[getter]
-    fn shape(&self) -> &[usize] {
-        self.0.shape()
+    fn shape(&self) -> Vec<usize> {
+        self.0.shape().to_vec()
     }
 
     #[cfg(unix)]
@@ -458,12 +414,145 @@ impl PyTensor {
         Ok(self.0.reshape(&shape)?)
     }
 
+    /// Attach pixel format metadata to this tensor.
+    ///
+    /// Validates that the tensor's shape is compatible with the format's
+    /// layout (packed, planar, or semi-planar). This enables
+    /// `from_fd()` tensors to be used as image conversion destinations.
+    fn set_format(&mut self, format: crate::image::PyPixelFormat) -> Result<()> {
+        use edgefirst_hal::tensor::PixelFormat;
+        let fmt: PixelFormat = format.into();
+        Ok(self.0.set_format(fmt)?)
+    }
+
+    /// Clone the DMA-BUF file descriptor backing this tensor.
+    ///
+    /// Returns a new file descriptor that the caller must close.
+    ///
+    /// Raises RuntimeError if the tensor is not DMA-backed or if the
+    /// fd clone syscall fails.
+    #[cfg(target_os = "linux")]
+    fn dmabuf_clone(&self) -> Result<RawFd> {
+        let owned = self.0.dmabuf_clone()?;
+        Ok(owned.into_raw_fd())
+    }
+
     fn map(&self) -> Result<PyTensorMap> {
         Ok(PyTensorMap {
-            mapped: Some(self.0.map()?),
+            mapped: Some(map_tensor_dyn(&self.0)?),
         })
     }
+
+    // ── Image-specific methods ──────────────────────────────────────────
+
+    /// Create an image tensor with the given dimensions and pixel format.
+    #[staticmethod]
+    #[pyo3(signature = (width, height, format, mem = None))]
+    fn image(
+        width: usize,
+        height: usize,
+        format: crate::image::PyPixelFormat,
+        mem: Option<PyTensorMemory>,
+    ) -> Result<Self> {
+        use edgefirst_hal::tensor::PixelFormat;
+        let fmt: PixelFormat = format.into();
+        let memory = mem.map(|x| x.into());
+        let tensor = TensorDyn::image(width, height, fmt, DType::U8, memory)?;
+        Ok(PyTensor(tensor))
+    }
+
+    /// Load an image from a file, decoding JPEG/PNG automatically.
+    #[staticmethod]
+    #[pyo3(signature = (filename, format = None, mem = None))]
+    fn load(
+        filename: &str,
+        format: Option<crate::image::PyPixelFormat>,
+        mem: Option<PyTensorMemory>,
+    ) -> Result<Self> {
+        use edgefirst_hal::image;
+        let fmt = format.map(|f| f.into());
+        let data = std::fs::read(filename)?;
+        let memory = mem.map(|x| x.into());
+        let tensor = image::load_image(&data, fmt, memory)?;
+        Ok(PyTensor(tensor))
+    }
+
+    /// Load an image from raw bytes, decoding JPEG/PNG automatically.
+    #[staticmethod]
+    #[pyo3(signature = (data, format = None, mem = None))]
+    fn load_from_bytes(
+        data: &[u8],
+        format: Option<crate::image::PyPixelFormat>,
+        mem: Option<PyTensorMemory>,
+    ) -> Result<Self> {
+        use edgefirst_hal::image;
+        let fmt = format.map(|f| f.into());
+        let memory = mem.map(|x| x.into());
+        let tensor = image::load_image(data, fmt, memory)?;
+        Ok(PyTensor(tensor))
+    }
+
+    /// Save this image tensor as a JPEG file.
+    #[pyo3(signature = (filename, quality=80))]
+    fn save_jpeg(&self, filename: &str, quality: u8) -> Result<()> {
+        use edgefirst_hal::image;
+        image::save_jpeg(&self.0, filename, quality)?;
+        Ok(())
+    }
+
+    /// Pixel format of this tensor (None if not an image tensor).
+    #[getter]
+    fn format(&self) -> Option<crate::image::PyPixelFormat> {
+        self.0
+            .format()
+            .and_then(|f| crate::image::PyPixelFormat::try_from(f).ok())
+    }
+
+    /// Image width in pixels (None if not an image tensor).
+    #[getter]
+    fn width(&self) -> Option<usize> {
+        self.0.width()
+    }
+
+    /// Image height in pixels (None if not an image tensor).
+    #[getter]
+    fn height(&self) -> Option<usize> {
+        self.0.height()
+    }
+
+    /// Whether this image uses a planar pixel layout.
+    #[getter]
+    fn is_planar(&self) -> bool {
+        use edgefirst_hal::tensor::PixelLayout;
+        self.0
+            .format()
+            .map(|f| f.layout() == PixelLayout::Planar)
+            .unwrap_or(false)
+    }
+
+    /// Normalize image data and write to a numpy array.
+    #[pyo3(signature = (dst, normalization=crate::image::Normalization::DEFAULT, zero_point=None))]
+    fn normalize_to_numpy(
+        &self,
+        dst: crate::image::ImageDest3,
+        normalization: crate::image::Normalization,
+        zero_point: Option<i64>,
+    ) -> Result<()> {
+        Ok(crate::image::normalize_tensor_to_numpy(
+            &self.0,
+            dst,
+            normalization,
+            zero_point,
+        )?)
+    }
+
+    /// Copy data from a numpy array into this tensor.
+    fn copy_from_numpy(&mut self, src: numpy::PyArrayLike3<u8>) -> Result<()> {
+        Ok(crate::image::copy_numpy_to_tensor(&self.0, src)?)
+    }
 }
+
+// ─── PyTensorMap ────────────────────────────────────────────────────────────
 
 #[pyclass(name = "TensorMap")]
 pub struct PyTensorMap {
@@ -484,76 +573,7 @@ impl PyTensorMap {
 
     fn __repr__(&self) -> String {
         match &self.mapped {
-            Some(TensorMapT::TensorU8(map)) => {
-                format!(
-                    "TensorMap(dtype=uint8, shape={:?}) => {:?}",
-                    map.shape(),
-                    map.to_vec()
-                )
-            }
-            Some(TensorMapT::TensorI8(map)) => {
-                format!(
-                    "TensorMap(dtype=int8, shape={:?}) => {:?}",
-                    map.shape(),
-                    map.to_vec()
-                )
-            }
-            Some(TensorMapT::TensorU16(map)) => {
-                format!(
-                    "TensorMap(dtype=uint16, shape={:?}) => {:?}",
-                    map.shape(),
-                    map.to_vec()
-                )
-            }
-            Some(TensorMapT::TensorI16(map)) => {
-                format!(
-                    "TensorMap(dtype=int16, shape={:?}) => {:?}",
-                    map.shape(),
-                    map.to_vec()
-                )
-            }
-            Some(TensorMapT::TensorU32(map)) => {
-                format!(
-                    "TensorMap(dtype=uint32, shape={:?}) => {:?}",
-                    map.shape(),
-                    map.to_vec()
-                )
-            }
-            Some(TensorMapT::TensorI32(map)) => {
-                format!(
-                    "TensorMap(dtype=int32, shape={:?}) => {:?}",
-                    map.shape(),
-                    map.to_vec()
-                )
-            }
-            Some(TensorMapT::TensorU64(map)) => {
-                format!(
-                    "TensorMap(dtype=uint64, shape={:?}) => {:?}",
-                    map.shape(),
-                    map.to_vec()
-                )
-            }
-            Some(TensorMapT::TensorI64(map)) => {
-                format!(
-                    "TensorMap(dtype=int64, shape={:?}) => {:?}",
-                    map.shape(),
-                    map.to_vec()
-                )
-            }
-            Some(TensorMapT::TensorF32(map)) => {
-                format!(
-                    "TensorMap(dtype=float32, shape={:?}) => {:?}",
-                    map.shape(),
-                    map.to_vec()
-                )
-            }
-            Some(TensorMapT::TensorF64(map)) => {
-                format!(
-                    "TensorMap(dtype=float64, shape={:?}) => {:?}",
-                    map.shape(),
-                    map.to_vec()
-                )
-            }
+            Some(m) => format!("TensorMap(dtype={}, shape={:?})", m.dtype_name(), m.shape(),),
             None => "Unmapped Tensor".to_string(),
         }
     }
@@ -595,54 +615,44 @@ impl PyTensorMap {
         }
 
         let mapped = slf2.mapped.as_ref().unwrap();
-        let mut shape = mapped
-            .shape()
-            .iter()
-            .map(|&s| s as isize)
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        let shape: Vec<isize> = mapped.shape().iter().map(|&s| s as isize).collect();
+        let ndim = shape.len();
 
-        // Create a memory view from the mapped buffer
-        let ptr = match mapped {
-            TensorMapT::TensorU8(m) => m.as_ref().as_ptr() as *mut c_void,
-            TensorMapT::TensorI8(m) => m.as_ref().as_ptr() as *mut c_void,
-            TensorMapT::TensorU16(m) => m.as_ref().as_ptr() as *mut c_void,
-            TensorMapT::TensorI16(m) => m.as_ref().as_ptr() as *mut c_void,
-            TensorMapT::TensorU32(m) => m.as_ref().as_ptr() as *mut c_void,
-            TensorMapT::TensorI32(m) => m.as_ref().as_ptr() as *mut c_void,
-            TensorMapT::TensorU64(m) => m.as_ref().as_ptr() as *mut c_void,
-            TensorMapT::TensorI64(m) => m.as_ref().as_ptr() as *mut c_void,
-            TensorMapT::TensorF32(m) => m.as_ref().as_ptr() as *mut c_void,
-            TensorMapT::TensorF64(m) => m.as_ref().as_ptr() as *mut c_void,
-        };
+        // Compute C-contiguous strides: strides[i] = itemsize * product(shape[i+1..])
+        let itemsize = mapped.element_size() as isize;
+        let mut strides = vec![0isize; ndim];
+        if ndim > 0 {
+            strides[ndim - 1] = itemsize;
+            for i in (0..ndim - 1).rev() {
+                strides[i] = strides[i + 1] * shape[i + 1];
+            }
+        }
 
-        let format = match mapped {
-            TensorMapT::TensorU8(_) => CString::new("B").unwrap(),
-            TensorMapT::TensorI8(_) => CString::new("b").unwrap(),
-            TensorMapT::TensorU16(_) => CString::new("H").unwrap(),
-            TensorMapT::TensorI16(_) => CString::new("h").unwrap(),
-            TensorMapT::TensorU32(_) => CString::new("I").unwrap(),
-            TensorMapT::TensorI32(_) => CString::new("i").unwrap(),
-            TensorMapT::TensorU64(_) => CString::new("Q").unwrap(),
-            TensorMapT::TensorI64(_) => CString::new("q").unwrap(),
-            TensorMapT::TensorF32(_) => CString::new("f").unwrap(),
-            TensorMapT::TensorF64(_) => CString::new("d").unwrap(),
-        };
+        // Box both arrays together so we can recover the length in __releasebuffer__.
+        // Store (shape_ptr, strides_ptr, ndim) using view.internal.
+        let mut shape = shape.into_boxed_slice();
+        let mut strides = strides.into_boxed_slice();
+
+        let ptr = mapped.data_ptr();
+        let format = CString::new(mapped.format_str()).unwrap();
 
         unsafe {
             (*view).buf = ptr;
             (*view).len = mapped.size() as isize;
-            (*view).itemsize = mapped.element_size() as isize;
+            (*view).itemsize = itemsize;
             (*view).readonly = 0;
 
             (*view).format = format.into_raw(); // dropped in __releasebuffer__
 
-            (*view).ndim = shape.len() as i32;
+            (*view).ndim = ndim as i32;
             (*view).shape = shape.as_mut_ptr();
+            (*view).strides = strides.as_mut_ptr();
+            // Store ndim in internal so __releasebuffer__ can reconstruct the slices.
+            (*view).internal = ndim as *mut c_void;
             std::mem::forget(shape); // dropped in __releasebuffer__
+            std::mem::forget(strides); // dropped in __releasebuffer__
 
             (*view).suboffsets = std::ptr::null_mut();
-            (*view).internal = std::ptr::null_mut();
 
             (*view).obj = slf.into_ptr();
         }
@@ -653,7 +663,14 @@ impl PyTensorMap {
     #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
     unsafe fn __releasebuffer__(&mut self, view: *mut Py_buffer) {
         drop(unsafe { CString::from_raw((*view).format) });
-        drop(unsafe { Box::from_raw((*view).shape) });
+        let ndim = unsafe { (*view).internal } as usize;
+        if ndim > 0 {
+            // Reconstruct the boxed slices with the correct length.
+            drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut((*view).shape, ndim)) });
+            drop(unsafe {
+                Box::from_raw(std::ptr::slice_from_raw_parts_mut((*view).strides, ndim))
+            });
+        }
     }
 
     fn __enter__(slf: Bound<'_, Self>) -> PyResult<Bound<'_, Self>> {
@@ -674,20 +691,7 @@ impl PyTensorMap {
         }
 
         let mapped = self.mapped.as_ref().unwrap();
-
-        // Create a memory view from the mapped buffer
-        let ptr = match mapped {
-            TensorMapT::TensorU8(m) => m.as_ref().as_ptr() as *mut c_char,
-            TensorMapT::TensorI8(m) => m.as_ref().as_ptr() as *mut c_char,
-            TensorMapT::TensorU16(m) => m.as_ref().as_ptr() as *mut c_char,
-            TensorMapT::TensorI16(m) => m.as_ref().as_ptr() as *mut c_char,
-            TensorMapT::TensorU32(m) => m.as_ref().as_ptr() as *mut c_char,
-            TensorMapT::TensorI32(m) => m.as_ref().as_ptr() as *mut c_char,
-            TensorMapT::TensorU64(m) => m.as_ref().as_ptr() as *mut c_char,
-            TensorMapT::TensorI64(m) => m.as_ref().as_ptr() as *mut c_char,
-            TensorMapT::TensorF32(m) => m.as_ref().as_ptr() as *mut c_char,
-            TensorMapT::TensorF64(m) => m.as_ref().as_ptr() as *mut c_char,
-        };
+        let ptr = mapped.data_ptr() as *mut c_char;
 
         let mem = unsafe {
             PyMemoryView_FromMemory(

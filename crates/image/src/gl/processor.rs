@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use edgefirst_decoder::{DetectBox, ProtoData, ProtoTensor, Segmentation};
-use edgefirst_tensor::{TensorMemory, TensorTrait};
+use edgefirst_tensor::{
+    PixelFormat, PixelLayout, Tensor, TensorMapTrait, TensorMemory, TensorTrait,
+};
 use gbm::drm::buffer::DrmFourcc;
 use khronos_egl::{self as egl, Attrib};
 use std::collections::BTreeSet;
@@ -15,16 +17,13 @@ use std::time::Instant;
 use super::cache::CachedEglImage;
 use super::EglDisplayKind;
 
-use super::cache::{CacheKind, EglImageCache};
+use super::cache::{CacheKind, EglCacheKey, EglImageCache};
 use super::context::{egl_ext, GlContext};
 use super::resources::{Buffer, EglImage, FrameBuffer, GlProgram, Texture};
 use super::shaders::*;
 use super::{Int8InterpolationMode, RegionOfInterest, TransferBackend};
-use crate::{
-    fourcc_is_int8, fourcc_is_packed_rgb, CPUProcessor, Crop, Error, Flip, ImageProcessorTrait,
-    MaskRegion, Rect, Rotation, TensorImage, TensorImageRef, BGRA, DEFAULT_COLORS, GREY, NV12,
-    PLANAR_RGB, PLANAR_RGBA, PLANAR_RGB_INT8, RGB, RGBA, RGB_INT8, VYUY, YUYV,
-};
+use crate::{Crop, Error, Flip, ImageProcessorTrait, MaskRegion, Rect, Rotation, DEFAULT_COLORS};
+use edgefirst_tensor::TensorDyn;
 
 /// OpenGL single-threaded image converter.
 pub struct GLProcessorST {
@@ -71,6 +70,16 @@ pub struct GLProcessorST {
     src_egl_cache: EglImageCache,
     /// EGLImage cache for destination DMA buffers.
     dst_egl_cache: EglImageCache,
+    /// Currently bound EGLImage key on render_texture (dst side).
+    /// Skip glEGLImageTargetTexture2DOES when unchanged.
+    last_bound_dst_egl: Option<EglCacheKey>,
+    /// Currently bound EGLImage key on camera_eglimage_texture (src side).
+    last_bound_src_egl: Option<EglCacheKey>,
+    /// Whether the BGRA byte-swap workaround warning has been logged.
+    bgra_warned: bool,
+    /// Whether the GPU is a Verisilicon/Vivante core (detected via GL_RENDERER).
+    /// Used to block operations known to cause unrecoverable GPU hangs.
+    is_vivante: bool,
     /// Intermediate RGBA texture for two-pass packed RGB conversion.
     /// Pass 1 renders YUYV/NV12→RGBA here; Pass 2 packs RGBA→RGB to DMA dest.
     packed_rgb_intermediate_tex: Texture,
@@ -80,6 +89,10 @@ pub struct GLProcessorST {
     packed_rgb_intermediate_size: (usize, usize),
     texture_program: GlProgram,
     texture_program_yuv: GlProgram,
+    /// Int8 variant of texture_program — applies XOR 0x80 bias in fragment shader.
+    texture_int8_program: GlProgram,
+    /// Int8 variant of texture_program_yuv — applies XOR 0x80 bias in fragment shader.
+    texture_int8_program_yuv: GlProgram,
     texture_program_planar: GlProgram,
     /// Shader: existing planar RGB with int8 bias (XOR 0x80) applied to output.
     texture_program_planar_int8: GlProgram,
@@ -87,12 +100,6 @@ pub struct GLProcessorST {
     packed_rgba8_program_2d: GlProgram,
     /// Shader: packed RGB int8 -> RGBA8 packing with XOR 0x80 (2D texture source, pass 2).
     packed_rgba8_int8_program_2d: GlProgram,
-    /// Shader: direct RGB render with int8 XOR 0x80 bias (2D texture source).
-    texture_int8_program: GlProgram,
-    /// Shader: direct RGB render with int8 XOR 0x80 bias (external OES source).
-    texture_int8_program_yuv: GlProgram,
-    /// Whether the GPU supports direct RGB rendering via BGR888 renderbuffer.
-    pub(crate) support_rgb_direct: bool,
     pub(super) gl_context: GlContext,
 }
 
@@ -114,281 +121,107 @@ impl Drop for GLProcessorST {
     }
 }
 
+/// Reinterpret a `&mut Tensor<i8>` as `&mut Tensor<u8>`.
+///
+/// # Safety
+/// `i8` and `u8` have identical size, alignment, and validity for all bit
+/// patterns. `Tensor<T>` stores data behind indirection (DMA-BUF fd, SHM
+/// mapping, mmap'd memory, or PBO) — the `T` parameter affects only the
+/// typed view returned by `map()`, not the struct layout. The GL backend
+/// operates on raw bytes and applies XOR 0x80 bias either in the fragment
+/// shader or as a CPU post-process, so the reinterpretation is semantically
+/// correct. This transmutation must not be used to access `chroma()` through
+/// the returned reference — the chroma `Box<Tensor<T>>` would also be
+/// reinterpreted and its drop glue could theoretically differ.
+unsafe fn tensor_i8_as_u8_mut(t: &mut Tensor<i8>) -> &mut Tensor<u8> {
+    &mut *(t as *mut Tensor<i8> as *mut Tensor<u8>)
+}
+
+/// Reinterpret a `&Tensor<i8>` as `&Tensor<u8>`.
+///
+/// # Safety
+/// Same rationale as [`tensor_i8_as_u8_mut`]. The returned reference must not
+/// be used to access `chroma()`.
+unsafe fn tensor_i8_as_u8(t: &Tensor<i8>) -> &Tensor<u8> {
+    &*(t as *const Tensor<i8> as *const Tensor<u8>)
+}
+
+/// Extract `&Tensor<u8>` and `PixelFormat` from a `&TensorDyn` source.
+/// For I8 sources, reinterprets the bytes as u8.
+fn dyn_to_u8_src(src: &TensorDyn) -> crate::Result<(&Tensor<u8>, PixelFormat)> {
+    match src {
+        TensorDyn::U8(t) => {
+            let fmt = t.format().ok_or(Error::NotAnImage)?;
+            Ok((t, fmt))
+        }
+        TensorDyn::I8(t) => {
+            let fmt = t.format().ok_or(Error::NotAnImage)?;
+            // SAFETY: i8/u8 are layout-identical
+            Ok((unsafe { tensor_i8_as_u8(t) }, fmt))
+        }
+        _ => Err(Error::UnsupportedFormat(format!(
+            "GL backend requires u8 or i8 source, got {:?}",
+            src.dtype()
+        ))),
+    }
+}
+
+/// Extract `&mut Tensor<u8>`, `PixelFormat`, and `is_int8` from a `&mut TensorDyn` destination.
+/// For I8 destinations, reinterprets the bytes as u8 and sets `is_int8 = true`.
+fn dyn_to_u8_dst(dst: &mut TensorDyn) -> crate::Result<(&mut Tensor<u8>, PixelFormat, bool)> {
+    match dst {
+        TensorDyn::U8(t) => {
+            let fmt = t.format().ok_or(Error::NotAnImage)?;
+            Ok((t, fmt, false))
+        }
+        TensorDyn::I8(t) => {
+            let fmt = t.format().ok_or(Error::NotAnImage)?;
+            // SAFETY: i8/u8 are layout-identical
+            Ok((unsafe { tensor_i8_as_u8_mut(t) }, fmt, true))
+        }
+        _ => Err(Error::UnsupportedFormat(format!(
+            "GL backend requires u8 or i8 destination, got {:?}",
+            dst.dtype()
+        ))),
+    }
+}
+
 impl ImageProcessorTrait for GLProcessorST {
     fn convert(
         &mut self,
-        src: &TensorImage,
-        dst: &mut TensorImage,
+        src: &TensorDyn,
+        dst: &mut TensorDyn,
         rotation: crate::Rotation,
         flip: Flip,
         crop: Crop,
     ) -> crate::Result<()> {
-        crop.check_crop(src, dst)?;
-        if !Self::check_src_format_supported(self.gl_context.transfer_backend, src) {
-            return Err(crate::Error::NotSupported(format!(
-                "Opengl doesn't support {} source texture",
-                src.fourcc().display()
-            )));
-        }
+        crop.check_crop_dyn(src, dst)?;
+        let (src_u8, src_fmt) = dyn_to_u8_src(src)?;
+        let (dst_u8, dst_fmt, is_int8) = dyn_to_u8_dst(dst)?;
 
-        if !Self::check_dst_format_supported(self.gl_context.transfer_backend, dst, self.has_bgra) {
-            return Err(crate::Error::NotSupported(format!(
-                "Opengl doesn't support {} destination texture",
-                dst.fourcc().display()
-            )));
-        }
-        log::debug!(
-            "dst tensor: {:?} src tensor :{:?}",
-            dst.tensor().memory(),
-            src.tensor().memory()
-        );
-        check_gl_error(function!(), line!())?;
-        if self.gl_context.transfer_backend.is_dma() && dst.tensor().memory() == TensorMemory::Dma {
-            // Packed RGB is now supported via DMA with buffer reinterpretation
-            let res = self.convert_dest_dma(dst, src, rotation, flip, crop);
-            return res;
-        }
-        // PBO-to-PBO: both tensors are PBO-backed, use GL buffer bindings for
-        // both upload and readback (zero CPU copy for both directions)
-        if src.tensor().memory() == TensorMemory::Pbo && dst.tensor().memory() == TensorMemory::Pbo
-        {
-            return self.convert_pbo_to_pbo(dst, src, rotation, flip, crop);
-        }
-        // PBO dst with non-PBO src: use normal texture upload for src (which
-        // maps the Mem/DMA tensor), but PBO PACK readback for dst.
-        // This avoids the deadlock that would occur if convert_dest_non_dma
-        // tried to map() the PBO dst on the GL thread.
-        if dst.tensor().memory() == TensorMemory::Pbo {
-            return self.convert_any_to_pbo(dst, src, rotation, flip, crop);
-        }
-        // PBO src with non-PBO dst: the src tensor's map() would deadlock on
-        // the GL thread, so use PBO UNPACK upload. Readback goes to Mem dst
-        // via normal ReadnPixels into mapped memory.
-        if src.tensor().memory() == TensorMemory::Pbo {
-            return self.convert_pbo_to_mem(dst, src, rotation, flip, crop);
-        }
-        let start = Instant::now();
-        let res = self.convert_dest_non_dma(dst, src, rotation, flip, crop);
-        log::debug!("convert_dest_non_dma takes {:?}", start.elapsed());
-        res
-    }
-
-    fn convert_ref(
-        &mut self,
-        src: &TensorImage,
-        dst: &mut TensorImageRef<'_>,
-        rotation: Rotation,
-        flip: Flip,
-        crop: Crop,
-    ) -> crate::Result<()> {
-        // OpenGL doesn't support PLANAR_RGB output, delegate to CPU
-        let mut cpu = CPUProcessor::new();
-        cpu.convert_ref(src, dst, rotation, flip, crop)
+        self.convert_impl(
+            src_u8, src_fmt, dst_u8, dst_fmt, is_int8, rotation, flip, crop,
+        )
     }
 
     fn draw_masks(
         &mut self,
-        dst: &mut TensorImage,
+        dst: &mut TensorDyn,
         detect: &[DetectBox],
         segmentation: &[Segmentation],
     ) -> Result<(), crate::Error> {
-        use crate::FunctionTimer;
-
-        let _timer = FunctionTimer::new("GLProcessorST::draw_masks");
-        if !matches!(dst.fourcc(), RGBA | BGRA | RGB) {
-            return Err(crate::Error::NotSupported(
-                "Opengl image rendering only supports RGBA, BGRA, or RGB images".to_string(),
-            ));
-        }
-
-        // Determine memory backend and set up the framebuffer.
-        // PBO tensors need special handling: calling tensor.map() on the GL
-        // thread would deadlock because PboOps sends a message back to this
-        // thread. Instead, bind the PBO as GL_PIXEL_UNPACK_BUFFER so
-        // TexImage2D reads directly from GPU memory (zero CPU copy).
-        let memory = dst.tensor.memory();
-        let pbo_buffer_id = if memory == edgefirst_tensor::TensorMemory::Pbo {
-            match &dst.tensor {
-                edgefirst_tensor::Tensor::Pbo(p) if !p.is_mapped() => Some(p.buffer_id()),
-                _ => None,
-            }
-        } else {
-            None
-        };
-
-        let is_dma = match memory {
-            edgefirst_tensor::TensorMemory::Dma if self.setup_renderbuffer_dma(dst).is_ok() => true,
-            _ if pbo_buffer_id.is_some() => {
-                self.setup_renderbuffer_from_pbo(dst, pbo_buffer_id.unwrap())?;
-                false
-            }
-            _ => {
-                // Add dest rect to make sure dst is rendered fully
-                self.setup_renderbuffer_non_dma(
-                    dst,
-                    Crop::new().with_dst_rect(Some(Rect::new(0, 0, 0, 0))),
-                )?;
-                false
-            }
-        };
-
-        gls::enable(gls::gl::BLEND);
-        gls::blend_func_separate(
-            gls::gl::SRC_ALPHA,
-            gls::gl::ONE_MINUS_SRC_ALPHA,
-            gls::gl::ZERO,
-            gls::gl::ONE,
-        );
-
-        self.render_box(dst, detect)?;
-        self.render_segmentation(detect, segmentation)?;
-
-        gls::finish();
-        if !is_dma {
-            let format = match dst.fourcc() {
-                RGB => gls::gl::RGB,
-                RGBA => gls::gl::RGBA,
-                BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
-                _ => unreachable!(),
-            };
-            if let Some(buffer_id) = pbo_buffer_id {
-                // PBO readback: bind as PACK buffer, ReadnPixels writes
-                // directly into PBO memory (zero CPU copy).
-                unsafe {
-                    gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, buffer_id);
-                    gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                    gls::gl::ReadnPixels(
-                        0,
-                        0,
-                        dst.width() as i32,
-                        dst.height() as i32,
-                        format,
-                        gls::gl::UNSIGNED_BYTE,
-                        dst.tensor.len() as i32,
-                        std::ptr::null_mut(),
-                    );
-                    gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
-                    gls::gl::Finish();
-                }
-                check_gl_error(function!(), line!())?;
-            } else {
-                let mut dst_map = dst.tensor().map()?;
-                unsafe {
-                    gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                    gls::gl::ReadnPixels(
-                        0,
-                        0,
-                        dst.width() as i32,
-                        dst.height() as i32,
-                        format,
-                        gls::gl::UNSIGNED_BYTE,
-                        dst.tensor.len() as i32,
-                        dst_map.as_mut_ptr() as *mut c_void,
-                    );
-                }
-            }
-        }
-
-        Ok(())
+        let (dst_u8, dst_fmt, _is_int8) = dyn_to_u8_dst(dst)?;
+        self.draw_masks_impl(dst_u8, dst_fmt, detect, segmentation)
     }
 
     fn draw_masks_proto(
         &mut self,
-        dst: &mut TensorImage,
+        dst: &mut TensorDyn,
         detect: &[DetectBox],
         proto_data: &ProtoData,
     ) -> crate::Result<()> {
-        use crate::FunctionTimer;
-
-        let _timer = FunctionTimer::new("GLProcessorST::draw_masks_proto");
-        if !matches!(dst.fourcc(), RGBA | BGRA | RGB) {
-            return Err(crate::Error::NotSupported(
-                "Opengl image rendering only supports RGBA, BGRA, or RGB images".to_string(),
-            ));
-        }
-
-        // PBO detection — same rationale as draw_masks.
-        let memory = dst.tensor.memory();
-        let pbo_buffer_id = if memory == edgefirst_tensor::TensorMemory::Pbo {
-            match &dst.tensor {
-                edgefirst_tensor::Tensor::Pbo(p) if !p.is_mapped() => Some(p.buffer_id()),
-                _ => None,
-            }
-        } else {
-            None
-        };
-
-        let is_dma = match memory {
-            edgefirst_tensor::TensorMemory::Dma if self.setup_renderbuffer_dma(dst).is_ok() => true,
-            _ if pbo_buffer_id.is_some() => {
-                self.setup_renderbuffer_from_pbo(dst, pbo_buffer_id.unwrap())?;
-                false
-            }
-            _ => {
-                self.setup_renderbuffer_non_dma(
-                    dst,
-                    Crop::new().with_dst_rect(Some(Rect::new(0, 0, 0, 0))),
-                )?;
-                false
-            }
-        };
-
-        gls::enable(gls::gl::BLEND);
-        gls::blend_func_separate(
-            gls::gl::SRC_ALPHA,
-            gls::gl::ONE_MINUS_SRC_ALPHA,
-            gls::gl::ZERO,
-            gls::gl::ONE,
-        );
-
-        self.render_box(dst, detect)?;
-        self.render_proto_segmentation(detect, proto_data)?;
-
-        gls::finish();
-        if !is_dma {
-            let format = match dst.fourcc() {
-                RGB => gls::gl::RGB,
-                RGBA => gls::gl::RGBA,
-                BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
-                _ => unreachable!(),
-            };
-            if let Some(buffer_id) = pbo_buffer_id {
-                unsafe {
-                    gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, buffer_id);
-                    gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                    gls::gl::ReadnPixels(
-                        0,
-                        0,
-                        dst.width() as i32,
-                        dst.height() as i32,
-                        format,
-                        gls::gl::UNSIGNED_BYTE,
-                        dst.tensor.len() as i32,
-                        std::ptr::null_mut(),
-                    );
-                    gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
-                    gls::gl::Finish();
-                }
-                check_gl_error(function!(), line!())?;
-            } else {
-                let mut dst_map = dst.tensor().map()?;
-                unsafe {
-                    gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                    gls::gl::ReadnPixels(
-                        0,
-                        0,
-                        dst.width() as i32,
-                        dst.height() as i32,
-                        format,
-                        gls::gl::UNSIGNED_BYTE,
-                        dst.tensor.len() as i32,
-                        dst_map.as_mut_ptr() as *mut c_void,
-                    );
-                }
-            }
-        }
-
-        Ok(())
+        let (dst_u8, dst_fmt, _is_int8) = dyn_to_u8_dst(dst)?;
+        self.draw_masks_proto_impl(dst_u8, dst_fmt, detect, proto_data)
     }
 
     fn decode_masks_atlas(
@@ -451,7 +284,7 @@ impl GLProcessorST {
                 .map_or(std::ptr::null(), |p| p as *const _)
         });
 
-        let (has_float_linear, has_bgra) = Self::gl_check_support()?;
+        let (has_float_linear, has_bgra, is_vivante) = Self::gl_check_support()?;
 
         // Uploads and downloads are all packed with no alignment requirements
         unsafe {
@@ -469,6 +302,11 @@ impl GLProcessorST {
             generate_vertex_shader(),
             generate_texture_fragment_shader_yuv(),
         )?;
+
+        let texture_int8_program =
+            GlProgram::new(generate_vertex_shader(), generate_texture_int8_shader())?;
+        let texture_int8_program_yuv =
+            GlProgram::new(generate_vertex_shader(), generate_texture_int8_shader_yuv())?;
 
         let segmentation_program =
             GlProgram::new(generate_vertex_shader(), generate_segmentation_shader())?;
@@ -528,7 +366,7 @@ impl GLProcessorST {
             generate_proto_mask_logit_shader_f32(),
         )?;
 
-        // Int8 variant of the existing planar RGB shader (for PLANAR_RGB_INT8 destinations).
+        // Int8 variant of the existing planar RGB shader (for planar RGB int8 destinations).
         let texture_program_planar_int8 =
             GlProgram::new(generate_vertex_shader(), generate_planar_rgb_int8_shader())?;
 
@@ -539,12 +377,6 @@ impl GLProcessorST {
             generate_vertex_shader(),
             generate_packed_rgba8_int8_shader_2d(),
         )?;
-
-        // Int8 direct-render shaders (for RGB_INT8 destinations via direct path)
-        let texture_int8_program =
-            GlProgram::new(generate_vertex_shader(), generate_texture_int8_shader())?;
-        let texture_int8_program_yuv =
-            GlProgram::new(generate_vertex_shader(), generate_texture_int8_shader_yuv())?;
 
         let camera_eglimage_texture = Texture::new();
         let camera_normal_texture = Texture::new();
@@ -559,13 +391,12 @@ impl GLProcessorST {
             gl_context,
             texture_program,
             texture_program_yuv,
+            texture_int8_program,
+            texture_int8_program_yuv,
             texture_program_planar,
             texture_program_planar_int8,
             packed_rgba8_program_2d,
             packed_rgba8_int8_program_2d,
-            texture_int8_program,
-            texture_int8_program_yuv,
-            support_rgb_direct: false, // will be probed in Task 3
             camera_eglimage_texture,
             camera_normal_texture,
             segmentation_texture,
@@ -591,6 +422,10 @@ impl GLProcessorST {
             convert_fbo: FrameBuffer::new(),
             src_egl_cache: EglImageCache::new(8),
             dst_egl_cache: EglImageCache::new(8),
+            last_bound_dst_egl: None,
+            last_bound_src_egl: None,
+            bgra_warned: false,
+            is_vivante,
             packed_rgb_intermediate_tex: Texture::new(),
             packed_rgb_fbo: FrameBuffer::new(),
             packed_rgb_intermediate_size: (0, 0),
@@ -602,16 +437,11 @@ impl GLProcessorST {
         };
         check_gl_error(function!(), line!())?;
 
-        // Probe GPU capability for direct RGB rendering
-        converter.support_rgb_direct = converter.probe_rgb_direct_support();
-
         // Verify DMA-buf actually works (catches NVIDIA discrete GPUs where
         // EGLImage creation succeeds but rendered data is all zeros)
         if converter.gl_context.transfer_backend.is_dma() && !converter.verify_dma_buf_roundtrip() {
             log::info!("DMA-buf verification failed — falling back to PBO transfers");
             converter.gl_context.transfer_backend = TransferBackend::Pbo;
-            // RGB direct rendering also requires DMA, so disable it
-            converter.support_rgb_direct = false;
         }
 
         // If DMA-buf failed/unavailable but GL is alive, use PBO transfers
@@ -641,104 +471,14 @@ impl GLProcessorST {
                     converter.gl_context.transfer_backend
                 );
                 converter.gl_context.transfer_backend = backend;
-                if !backend.is_dma() {
-                    converter.support_rgb_direct = false;
-                }
             }
         }
 
         log::debug!(
-            "GLConverter created (transfer={:?}, rgb_direct={})",
+            "GLConverter created (transfer={:?})",
             converter.gl_context.transfer_backend,
-            converter.support_rgb_direct
         );
         Ok(converter)
-    }
-
-    /// Probe whether the GPU supports direct RGB rendering via BGR888 DMA-buf
-    /// backed renderbuffer. Creates a small test FBO and checks completeness.
-    /// Returns `false` on any failure (DMA unavailable, EGLImage rejected, FBO incomplete).
-    fn probe_rgb_direct_support(&self) -> bool {
-        if !self.gl_context.transfer_backend.is_dma() {
-            log::debug!("probe_rgb_direct: no DMA support");
-            return false;
-        }
-
-        // Check glEGLImageTargetRenderbufferStorageOES is available
-        if self
-            .gl_context
-            .egl
-            .get_proc_address("glEGLImageTargetRenderbufferStorageOES")
-            .is_none()
-        {
-            log::debug!("probe_rgb_direct: glEGLImageTargetRenderbufferStorageOES not available");
-            return false;
-        }
-
-        // Allocate a small test DMA buffer (64x64 RGB = 12288 bytes)
-        let test_img = match TensorImage::new(64, 64, RGB, Some(TensorMemory::Dma)) {
-            Ok(img) => img,
-            Err(e) => {
-                log::debug!("probe_rgb_direct: failed to allocate test DMA buffer: {e}");
-                return false;
-            }
-        };
-
-        // Create EGLImage from the test DMA buffer
-        let egl_image =
-            match self.create_egl_image_with_dims(&test_img, 64, 64, DrmFourcc::Bgr888, 3) {
-                Ok(img) => img,
-                Err(e) => {
-                    log::debug!("probe_rgb_direct: EGLImage creation failed: {e}");
-                    return false;
-                }
-            };
-
-        // Create renderbuffer, bind EGLImage, create FBO, check completeness
-        let result = unsafe {
-            let mut rbo = 0u32;
-            gls::gl::GenRenderbuffers(1, &mut rbo);
-            gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
-            gls::gl::EGLImageTargetRenderbufferStorageOES(
-                gls::gl::RENDERBUFFER,
-                egl_image.egl_image.as_ptr(),
-            );
-
-            let gl_err = gls::gl::GetError();
-            if gl_err != gls::gl::NO_ERROR {
-                log::debug!(
-                    "probe_rgb_direct: EGLImageTargetRenderbufferStorageOES failed: {gl_err:#X}"
-                );
-                gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, 0);
-                gls::gl::DeleteRenderbuffers(1, &rbo);
-                return false;
-            }
-
-            let mut fbo = 0u32;
-            gls::gl::GenFramebuffers(1, &mut fbo);
-            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
-            gls::gl::FramebufferRenderbuffer(
-                gls::gl::FRAMEBUFFER,
-                gls::gl::COLOR_ATTACHMENT0,
-                gls::gl::RENDERBUFFER,
-                rbo,
-            );
-
-            let status = gls::gl::CheckFramebufferStatus(gls::gl::FRAMEBUFFER);
-            let complete = status == gls::gl::FRAMEBUFFER_COMPLETE;
-
-            // Cleanup
-            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
-            gls::gl::DeleteFramebuffers(1, &fbo);
-            gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, 0);
-            gls::gl::DeleteRenderbuffers(1, &rbo);
-
-            complete
-        };
-        // egl_image and test_img drop automatically here
-
-        log::info!("probe_rgb_direct: BGR888 renderbuffer FBO support = {result}");
-        result
     }
 
     /// Verify that DMA-buf EGLImage round-trip actually works on this GPU.
@@ -751,7 +491,7 @@ impl GLProcessorST {
     /// `dma_heap` fds succeeds but the rendered data is all zeros.
     fn verify_dma_buf_roundtrip(&mut self) -> bool {
         // Allocate a 64x64 RGBA DMA source tensor and fill it with solid red
-        let src = match TensorImage::new(64, 64, RGBA, Some(TensorMemory::Dma)) {
+        let src = match Tensor::<u8>::image(64, 64, PixelFormat::Rgba, Some(TensorMemory::Dma)) {
             Ok(img) => img,
             Err(e) => {
                 log::info!("verify_dma_buf_roundtrip: failed to allocate DMA source: {e}");
@@ -760,7 +500,7 @@ impl GLProcessorST {
         };
 
         {
-            let mut map = match src.tensor().map() {
+            let mut map = match src.map() {
                 Ok(m) => m,
                 Err(e) => {
                     log::info!("verify_dma_buf_roundtrip: failed to map DMA source: {e}");
@@ -776,7 +516,8 @@ impl GLProcessorST {
         }
 
         // Allocate a 64x64 RGBA DMA destination tensor
-        let mut dst = match TensorImage::new(64, 64, RGBA, Some(TensorMemory::Dma)) {
+        let mut dst = match Tensor::<u8>::image(64, 64, PixelFormat::Rgba, Some(TensorMemory::Dma))
+        {
             Ok(img) => img,
             Err(e) => {
                 log::info!("verify_dma_buf_roundtrip: failed to allocate DMA destination: {e}");
@@ -785,15 +526,22 @@ impl GLProcessorST {
         };
 
         // Run the full DMA-buf EGLImage render pipeline
-        if let Err(e) =
-            self.convert_dest_dma(&mut dst, &src, Rotation::None, Flip::None, Crop::no_crop())
-        {
+        if let Err(e) = self.convert_dest_dma(
+            &mut dst,
+            PixelFormat::Rgba,
+            &src,
+            PixelFormat::Rgba,
+            false,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        ) {
             log::info!("verify_dma_buf_roundtrip: convert_dest_dma failed: {e}");
             return false;
         }
 
         // Read back the center pixel at (32, 32) from the destination
-        let map = match dst.tensor().map() {
+        let map = match dst.map() {
             Ok(m) => m,
             Err(e) => {
                 log::info!("verify_dma_buf_roundtrip: failed to map DMA destination: {e}");
@@ -1308,42 +1056,394 @@ impl GLProcessorST {
         Ok((pixels, regions))
     }
 
-    pub(super) fn check_src_format_supported(backend: TransferBackend, img: &TensorImage) -> bool {
-        if backend.is_dma() && img.tensor().memory() == TensorMemory::Dma {
+    // Internal methods operating on Tensor<u8> + PixelFormat directly.
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn convert_impl(
+        &mut self,
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
+        dst: &mut Tensor<u8>,
+        dst_fmt: PixelFormat,
+        is_int8: bool,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> crate::Result<()> {
+        if !Self::check_src_format_supported(self.gl_context.transfer_backend, src, src_fmt) {
+            return Err(crate::Error::NotSupported(format!(
+                "Opengl doesn't support {src_fmt} source texture",
+            )));
+        }
+
+        if !Self::check_dst_format_supported(
+            self.gl_context.transfer_backend,
+            dst,
+            dst_fmt,
+            is_int8,
+            self.has_bgra,
+        ) {
+            return Err(crate::Error::NotSupported(format!(
+                "Opengl doesn't support {dst_fmt} destination texture",
+            )));
+        }
+
+        // BLOCKED: NV12 source + planar RGB destination causes an unrecoverable
+        // GPU hang on the Verisilicon/Vivante GC7000UL (i.MX 8M Plus, galcore 6.4.11).
+        if self.is_vivante && src_fmt == PixelFormat::Nv12 && dst_fmt == PixelFormat::PlanarRgb {
+            return Err(crate::Error::NotSupported(format!(
+                "NV12 → {dst_fmt} is blocked on Vivante GPU: triggers unrecoverable GPU hang \
+                 requiring reboot (see VSI_GPU_NV12_BUG.md). Use CPU or G2D backend instead.",
+            )));
+        }
+
+        log::debug!(
+            "dst tensor: {:?} src tensor :{:?}",
+            dst.memory(),
+            src.memory()
+        );
+        check_gl_error(function!(), line!())?;
+        log::trace!(
+            "GL convert_impl: {src_fmt}→{dst_fmt} int8={is_int8} \
+             src_mem={:?} dst_mem={:?} transfer={:?}",
+            src.memory(),
+            dst.memory(),
+            self.gl_context.transfer_backend,
+        );
+
+        if self.gl_context.transfer_backend.is_dma() && dst.memory() == TensorMemory::Dma {
+            log::trace!("GL path: DMA (zero-copy EGLImage)");
+            let res =
+                self.convert_dest_dma(dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop);
+            log::trace!("GL DMA result: {}", if res.is_ok() { "ok" } else { "err" });
+            return res;
+        }
+        if src.memory() == TensorMemory::Pbo && dst.memory() == TensorMemory::Pbo {
+            log::trace!("GL path: PBO-to-PBO");
+            return self
+                .convert_pbo_to_pbo(dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop);
+        }
+        if dst.memory() == TensorMemory::Pbo {
+            log::trace!("GL path: any-to-PBO (src={:?})", src.memory());
+            return self
+                .convert_any_to_pbo(dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop);
+        }
+        if src.memory() == TensorMemory::Pbo {
+            log::trace!("GL path: PBO-to-mem");
+            return self
+                .convert_pbo_to_mem(dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop);
+        }
+        log::trace!("GL path: non-DMA (CPU upload/readback)");
+        let start = Instant::now();
+        let res =
+            self.convert_dest_non_dma(dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop);
+        log::debug!("convert_dest_non_dma takes {:?}", start.elapsed());
+        res
+    }
+
+    pub(super) fn draw_masks_impl(
+        &mut self,
+        dst: &mut Tensor<u8>,
+        dst_fmt: PixelFormat,
+        detect: &[DetectBox],
+        segmentation: &[Segmentation],
+    ) -> Result<(), crate::Error> {
+        use crate::FunctionTimer;
+
+        let _timer = FunctionTimer::new("GLProcessorST::draw_masks");
+        if !matches!(
+            dst_fmt,
+            PixelFormat::Rgba | PixelFormat::Bgra | PixelFormat::Rgb
+        ) {
+            return Err(crate::Error::NotSupported(
+                "Opengl image rendering only supports RGBA, BGRA, or RGB images".to_string(),
+            ));
+        }
+
+        let dst_w = dst.width().ok_or(Error::NotAnImage)?;
+        let dst_h = dst.height().ok_or(Error::NotAnImage)?;
+        let memory = dst.memory();
+        let pbo_buffer_id = if memory == TensorMemory::Pbo {
+            match dst.as_pbo() {
+                Some(p) if !p.is_mapped() => Some(p.buffer_id()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let is_dma = match memory {
+            TensorMemory::Dma if self.setup_renderbuffer_dma(dst, dst_fmt).is_ok() => true,
+            _ if pbo_buffer_id.is_some() => {
+                self.setup_renderbuffer_from_pbo(dst, dst_fmt, pbo_buffer_id.unwrap())?;
+                false
+            }
+            _ => {
+                self.setup_renderbuffer_non_dma(
+                    dst,
+                    dst_fmt,
+                    Crop::new().with_dst_rect(Some(Rect::new(0, 0, 0, 0))),
+                )?;
+                false
+            }
+        };
+
+        gls::enable(gls::gl::BLEND);
+        gls::blend_func_separate(
+            gls::gl::SRC_ALPHA,
+            gls::gl::ONE_MINUS_SRC_ALPHA,
+            gls::gl::ZERO,
+            gls::gl::ONE,
+        );
+
+        self.render_box(dst_w, dst_h, detect)?;
+        self.render_segmentation(detect, segmentation)?;
+
+        gls::finish();
+        if !is_dma {
+            let format = match dst_fmt {
+                PixelFormat::Rgb => gls::gl::RGB,
+                PixelFormat::Rgba | PixelFormat::Bgra => gls::gl::RGBA,
+                _ => unreachable!(),
+            };
+            if let Some(buffer_id) = pbo_buffer_id {
+                unsafe {
+                    gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, buffer_id);
+                    gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
+                    gls::gl::ReadnPixels(
+                        0,
+                        0,
+                        dst_w as i32,
+                        dst_h as i32,
+                        format,
+                        gls::gl::UNSIGNED_BYTE,
+                        dst.len() as i32,
+                        std::ptr::null_mut(),
+                    );
+                    gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+                    gls::gl::Finish();
+                }
+                check_gl_error(function!(), line!())?;
+                if dst_fmt == PixelFormat::Bgra {
+                    let mut dst_map = dst.map()?;
+                    for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
+                        chunk.swap(0, 2);
+                    }
+                }
+            } else {
+                let mut dst_map = dst.map()?;
+                unsafe {
+                    gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
+                    gls::gl::ReadnPixels(
+                        0,
+                        0,
+                        dst_w as i32,
+                        dst_h as i32,
+                        format,
+                        gls::gl::UNSIGNED_BYTE,
+                        dst.len() as i32,
+                        dst_map.as_mut_ptr() as *mut c_void,
+                    );
+                }
+                if dst_fmt == PixelFormat::Bgra {
+                    for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
+                        chunk.swap(0, 2);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(super) fn draw_masks_proto_impl(
+        &mut self,
+        dst: &mut Tensor<u8>,
+        dst_fmt: PixelFormat,
+        detect: &[DetectBox],
+        proto_data: &ProtoData,
+    ) -> crate::Result<()> {
+        use crate::FunctionTimer;
+
+        let _timer = FunctionTimer::new("GLProcessorST::draw_masks_proto");
+        if !matches!(
+            dst_fmt,
+            PixelFormat::Rgba | PixelFormat::Bgra | PixelFormat::Rgb
+        ) {
+            return Err(crate::Error::NotSupported(
+                "Opengl image rendering only supports RGBA, BGRA, or RGB images".to_string(),
+            ));
+        }
+
+        let dst_w = dst.width().ok_or(Error::NotAnImage)?;
+        let dst_h = dst.height().ok_or(Error::NotAnImage)?;
+        let memory = dst.memory();
+        let pbo_buffer_id = if memory == TensorMemory::Pbo {
+            match dst.as_pbo() {
+                Some(p) if !p.is_mapped() => Some(p.buffer_id()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let is_dma = match memory {
+            TensorMemory::Dma if self.setup_renderbuffer_dma(dst, dst_fmt).is_ok() => true,
+            _ if pbo_buffer_id.is_some() => {
+                self.setup_renderbuffer_from_pbo(dst, dst_fmt, pbo_buffer_id.unwrap())?;
+                false
+            }
+            _ => {
+                self.setup_renderbuffer_non_dma(
+                    dst,
+                    dst_fmt,
+                    Crop::new().with_dst_rect(Some(Rect::new(0, 0, 0, 0))),
+                )?;
+                false
+            }
+        };
+
+        gls::enable(gls::gl::BLEND);
+        gls::blend_func_separate(
+            gls::gl::SRC_ALPHA,
+            gls::gl::ONE_MINUS_SRC_ALPHA,
+            gls::gl::ZERO,
+            gls::gl::ONE,
+        );
+
+        self.render_box(dst_w, dst_h, detect)?;
+        self.render_proto_segmentation(detect, proto_data)?;
+
+        gls::finish();
+        if !is_dma {
+            let format = match dst_fmt {
+                PixelFormat::Rgb => gls::gl::RGB,
+                PixelFormat::Rgba | PixelFormat::Bgra => gls::gl::RGBA,
+                _ => unreachable!(),
+            };
+            if let Some(buffer_id) = pbo_buffer_id {
+                unsafe {
+                    gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, buffer_id);
+                    gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
+                    gls::gl::ReadnPixels(
+                        0,
+                        0,
+                        dst_w as i32,
+                        dst_h as i32,
+                        format,
+                        gls::gl::UNSIGNED_BYTE,
+                        dst.len() as i32,
+                        std::ptr::null_mut(),
+                    );
+                    gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+                    gls::gl::Finish();
+                }
+                check_gl_error(function!(), line!())?;
+                if dst_fmt == PixelFormat::Bgra {
+                    let mut dst_map = dst.map()?;
+                    for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
+                        chunk.swap(0, 2);
+                    }
+                }
+            } else {
+                let mut dst_map = dst.map()?;
+                unsafe {
+                    gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
+                    gls::gl::ReadnPixels(
+                        0,
+                        0,
+                        dst_w as i32,
+                        dst_h as i32,
+                        format,
+                        gls::gl::UNSIGNED_BYTE,
+                        dst.len() as i32,
+                        dst_map.as_mut_ptr() as *mut c_void,
+                    );
+                }
+                if dst_fmt == PixelFormat::Bgra {
+                    for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
+                        chunk.swap(0, 2);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(super) fn check_src_format_supported(
+        backend: TransferBackend,
+        img: &Tensor<u8>,
+        fmt: PixelFormat,
+    ) -> bool {
+        if backend.is_dma() && img.memory() == TensorMemory::Dma {
             // EGLImage supports RGBA, GREY, YUYV, and NV12 for DMA buffers.
             // VYUY excluded: Vivante GPU accepts the DRM fourcc but produces
             // incorrect output (similarity ~0.28 vs reference).
-            matches!(img.fourcc(), RGBA | GREY | YUYV | NV12)
+            matches!(
+                fmt,
+                PixelFormat::Rgba | PixelFormat::Grey | PixelFormat::Yuyv | PixelFormat::Nv12
+            )
         } else {
-            matches!(img.fourcc(), RGB | RGBA | GREY)
+            matches!(
+                fmt,
+                PixelFormat::Rgb | PixelFormat::Rgba | PixelFormat::Grey
+            )
         }
     }
 
     pub(super) fn check_dst_format_supported(
         backend: TransferBackend,
-        img: &TensorImage,
+        img: &Tensor<u8>,
+        fmt: PixelFormat,
+        _is_int8: bool,
         has_bgra: bool,
     ) -> bool {
-        if img.fourcc() == BGRA && !has_bgra {
+        if fmt == PixelFormat::Bgra && !has_bgra {
             return false;
         }
-        if backend.is_dma() && img.tensor().memory() == TensorMemory::Dma {
+        if backend.is_dma() && img.memory() == TensorMemory::Dma {
             matches!(
-                img.fourcc(),
-                RGBA | BGRA | GREY | PLANAR_RGB | RGB | RGB_INT8 | PLANAR_RGB_INT8
+                fmt,
+                PixelFormat::Rgba
+                    | PixelFormat::Bgra
+                    | PixelFormat::Grey
+                    | PixelFormat::PlanarRgb
+                    | PixelFormat::Rgb
             )
         } else {
-            matches!(img.fourcc(), RGB | RGBA | BGRA | GREY | RGB_INT8)
+            matches!(
+                fmt,
+                PixelFormat::Rgb | PixelFormat::Rgba | PixelFormat::Bgra | PixelFormat::Grey
+            )
         }
     }
 
     /// Checks required GL extensions and returns optional capability flags:
     /// `(has_float_linear, has_bgra)`.
-    fn gl_check_support() -> Result<(bool, bool), crate::Error> {
+    /// Query GL capabilities and detect GPU vendor.
+    ///
+    /// Returns `(has_float_linear, has_bgra, is_vivante)`.
+    fn gl_check_support() -> Result<(bool, bool, bool), crate::Error> {
         if let Ok(version) = gls::get_string(gls::gl::SHADING_LANGUAGE_VERSION) {
             log::debug!("GL Shading Language Version: {version:?}");
         } else {
             log::warn!("Could not get GL Shading Language Version");
+        }
+
+        // Detect Vivante/Verisilicon GPU via GL_RENDERER string.
+        let is_vivante = gls::get_string(gls::gl::RENDERER)
+            .map(|r| {
+                log::info!("GL_RENDERER: {r}");
+                let lower = r.to_ascii_lowercase();
+                lower.contains("vivante") || lower.contains("gc7000") || lower.contains("galcore")
+            })
+            .unwrap_or(false);
+        if is_vivante {
+            log::warn!(
+                "Vivante GPU detected — NV12 → planar RGB conversions will be \
+                 blocked to avoid unrecoverable GPU hang (see VSI_GPU_NV12_BUG.md)"
+            );
         }
 
         let extensions = unsafe {
@@ -1374,102 +1474,270 @@ impl GLProcessorST {
         let has_bgra = extensions.contains("GL_EXT_texture_format_BGRA8888");
         log::debug!("GL_EXT_texture_format_BGRA8888: {has_bgra}");
 
-        Ok((has_float_linear, has_bgra))
+        Ok((has_float_linear, has_bgra, is_vivante))
     }
 
-    fn setup_renderbuffer_dma(&mut self, dst: &TensorImage) -> crate::Result<()> {
+    fn setup_renderbuffer_dma(
+        &mut self,
+        dst: &Tensor<u8>,
+        dst_fmt: PixelFormat,
+    ) -> crate::Result<()> {
         self.convert_fbo.bind();
+        let dst_w = dst.width().ok_or(Error::NotAnImage)?;
+        let dst_h = dst.height().ok_or(Error::NotAnImage)?;
 
-        let (width, height) = if matches!(dst.fourcc(), PLANAR_RGB | PLANAR_RGB_INT8) {
-            let width = dst.width();
-            let height = dst.height() * 3;
-            (width as i32, height as i32)
+        let (width, height) = if dst_fmt == PixelFormat::PlanarRgb {
+            (dst_w as i32, (dst_h * 3) as i32)
         } else {
-            (dst.width() as i32, dst.height() as i32)
+            (dst_w as i32, dst_h as i32)
         };
-        let dest_egl = self.get_or_create_egl_image(CacheKind::Dst, dst)?;
+
+        let luma_id = dst.buffer_identity().id();
+        let chroma_id = dst.chroma().map(|t| t.buffer_identity().id());
+        let dst_key = (luma_id, chroma_id);
+
+        if self.last_bound_dst_egl != Some(dst_key) {
+            let dest_egl = self.get_or_create_egl_image(CacheKind::Dst, dst, dst_fmt)?;
+            unsafe {
+                gls::gl::UseProgram(self.texture_program_yuv.id);
+                gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+                gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
+                gls::gl::TexParameteri(
+                    gls::gl::TEXTURE_2D,
+                    gls::gl::TEXTURE_MIN_FILTER,
+                    gls::gl::LINEAR as i32,
+                );
+                gls::gl::TexParameteri(
+                    gls::gl::TEXTURE_2D,
+                    gls::gl::TEXTURE_MAG_FILTER,
+                    gls::gl::LINEAR as i32,
+                );
+                gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, dest_egl.as_ptr());
+                gls::gl::FramebufferTexture2D(
+                    gls::gl::FRAMEBUFFER,
+                    gls::gl::COLOR_ATTACHMENT0,
+                    gls::gl::TEXTURE_2D,
+                    self.render_texture.id,
+                    0,
+                );
+                check_gl_error(function!(), line!())?;
+            }
+            self.last_bound_dst_egl = Some(dst_key);
+            log::trace!("setup_renderbuffer_dma: bound new dst EGLImage id={luma_id:#x}");
+        } else {
+            log::trace!("setup_renderbuffer_dma: reusing bound dst EGLImage id={luma_id:#x}");
+        }
+
         unsafe {
-            gls::gl::UseProgram(self.texture_program_yuv.id);
-            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MIN_FILTER,
-                gls::gl::LINEAR as i32,
-            );
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MAG_FILTER,
-                gls::gl::LINEAR as i32,
-            );
-            gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, dest_egl.as_ptr());
-            gls::gl::FramebufferTexture2D(
-                gls::gl::FRAMEBUFFER,
-                gls::gl::COLOR_ATTACHMENT0,
-                gls::gl::TEXTURE_2D,
-                self.render_texture.id,
-                0,
-            );
-            check_gl_error(function!(), line!())?;
             gls::gl::Viewport(0, 0, width, height);
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn convert_dest_dma(
         &mut self,
-        dst: &mut TensorImage,
-        src: &TensorImage,
+        dst: &mut Tensor<u8>,
+        dst_fmt: PixelFormat,
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
+        is_int8: bool,
         rotation: crate::Rotation,
         flip: Flip,
         crop: Crop,
     ) -> crate::Result<()> {
         assert!(self.gl_context.transfer_backend.is_dma());
-        if fourcc_is_packed_rgb(dst.fourcc()) {
-            if self.support_rgb_direct {
-                self.convert_to_rgb_direct(src, dst, rotation, flip, crop)
+        if dst_fmt == PixelFormat::Rgb {
+            log::trace!(
+                "GL DMA dispatch: {src_fmt}→{dst_fmt} int8={is_int8} → two-pass packed RGB \
+                 (RGBA intermediate + packed_rgba8{}shader)",
+                if is_int8 { "_int8_" } else { "_" }
+            );
+            self.convert_to_packed_rgb(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
+        } else if dst_fmt.layout() == PixelLayout::Planar {
+            log::trace!(
+                "GL DMA dispatch: {src_fmt}→{dst_fmt} int8={is_int8} → planar output \
+                 (renderbuffer + planar{}shader)",
+                if is_int8 { "_int8_" } else { "_" }
+            );
+            self.setup_renderbuffer_dma(dst, dst_fmt)?;
+            // Bias letterbox clear color for int8 — glClear bypasses the shader.
+            let crop = if is_int8 {
+                let mut crop = crop;
+                if let Some(ref mut color) = crop.dst_color {
+                    color[0] ^= 0x80;
+                    color[1] ^= 0x80;
+                    color[2] ^= 0x80;
+                }
+                crop
             } else {
-                // Two-pass packed RGB is slower than G2D/CPU; decline so
-                // ImageProcessor falls through to a faster backend.
-                Err(crate::Error::NotSupported(
-                    "OpenGL two-pass packed RGB disabled (no direct RGB support)".into(),
-                ))
-            }
-        } else if dst.is_planar() {
-            self.setup_renderbuffer_dma(dst)?;
-            self.convert_to_planar(src, dst, rotation, flip, crop)
+                crop
+            };
+            self.convert_to_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
         } else {
-            self.setup_renderbuffer_dma(dst)?;
-            self.convert_to(src, dst, rotation, flip, crop)
+            log::trace!(
+                "GL DMA dispatch: {src_fmt}→{dst_fmt} int8={is_int8} → single-pass EGLImage \
+                 (renderbuffer, {}shader)",
+                if is_int8 { "int8 " } else { "standard " }
+            );
+            self.setup_renderbuffer_dma(dst, dst_fmt)?;
+            // For int8 output, swap to int8 shader programs that apply XOR 0x80
+            // in the fragment shader — zero CPU readback.
+            if is_int8 {
+                std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+                std::mem::swap(
+                    &mut self.texture_program_yuv,
+                    &mut self.texture_int8_program_yuv,
+                );
+                // Bias the letterbox clear color since glClear bypasses the shader.
+                let mut crop = crop;
+                if let Some(ref mut color) = crop.dst_color {
+                    color[0] ^= 0x80;
+                    color[1] ^= 0x80;
+                    color[2] ^= 0x80;
+                }
+                let result = self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop);
+                std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+                std::mem::swap(
+                    &mut self.texture_program_yuv,
+                    &mut self.texture_int8_program_yuv,
+                );
+                result
+            } else {
+                self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)
+            }
         }
     }
 
-    fn setup_renderbuffer_non_dma(&mut self, dst: &TensorImage, crop: Crop) -> crate::Result<()> {
-        debug_assert!(matches!(
-            dst.fourcc(),
-            RGB | RGBA | BGRA | GREY | PLANAR_RGB | RGB_INT8
-        ));
-        let (width, height) = if dst.is_planar() {
-            let width = dst.width() / 4;
-            let height = match dst.fourcc() {
-                RGBA => dst.height() * 4,
-                RGB => dst.height() * 3,
-                GREY => dst.height(),
+    #[allow(clippy::too_many_arguments)]
+    fn convert_dest_non_dma(
+        &mut self,
+        dst: &mut Tensor<u8>,
+        dst_fmt: PixelFormat,
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
+        is_int8: bool,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> crate::Result<()> {
+        let dst_w = dst.width().ok_or(Error::NotAnImage)?;
+        let dst_h = dst.height().ok_or(Error::NotAnImage)?;
+        self.setup_renderbuffer_non_dma(dst, dst_fmt, crop)?;
+
+        // Bias letterbox clear color for int8 — glClear bypasses the shader.
+        let crop = if is_int8 {
+            let mut crop = crop;
+            if let Some(ref mut color) = crop.dst_color {
+                color[0] ^= 0x80;
+                color[1] ^= 0x80;
+                color[2] ^= 0x80;
+            }
+            crop
+        } else {
+            crop
+        };
+
+        // For int8 non-planar output, swap to int8 shader programs.
+        if is_int8 && dst_fmt.layout() != PixelLayout::Planar {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
+        }
+
+        let start = Instant::now();
+        let render_result = if dst_fmt.layout() == PixelLayout::Planar {
+            self.convert_to_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
+        } else {
+            self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)
+        };
+
+        if is_int8 && dst_fmt.layout() != PixelLayout::Planar {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
+        }
+        render_result?;
+        log::debug!("Draw to framebuffer takes {:?}", start.elapsed());
+
+        // ReadnPixels into Mem dst — data is already int8-biased by the shader.
+        let start = Instant::now();
+        let dest_format = match dst_fmt {
+            PixelFormat::Rgb => gls::gl::RGB,
+            PixelFormat::Rgba | PixelFormat::Bgra => gls::gl::RGBA,
+            PixelFormat::Grey => gls::gl::RED,
+            _ => unreachable!(),
+        };
+
+        unsafe {
+            let mut dst_map = dst.map()?;
+            gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
+            gls::gl::ReadnPixels(
+                0,
+                0,
+                dst_w as i32,
+                dst_h as i32,
+                dest_format,
+                gls::gl::UNSIGNED_BYTE,
+                dst.len() as i32,
+                dst_map.as_mut_ptr() as *mut c_void,
+            );
+            if dst_fmt == PixelFormat::Bgra {
+                for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
+                    chunk.swap(0, 2);
+                }
+            }
+        }
+        log::debug!("Read from framebuffer takes {:?}", start.elapsed());
+        Ok(())
+    }
+
+    fn setup_renderbuffer_non_dma(
+        &mut self,
+        dst: &Tensor<u8>,
+        dst_fmt: PixelFormat,
+        crop: Crop,
+    ) -> crate::Result<()> {
+        let dst_w = dst.width().ok_or(Error::NotAnImage)?;
+        let dst_h = dst.height().ok_or(Error::NotAnImage)?;
+        let is_planar = dst_fmt.layout() == PixelLayout::Planar;
+
+        let (width, height) = if is_planar {
+            let width = dst_w / 4;
+            let height = match dst_fmt.channels() {
+                4 => dst_h * 4,
+                3 => dst_h * 3,
+                1 => dst_h,
                 _ => unreachable!(),
             };
             (width as i32, height as i32)
         } else {
-            (dst.width() as i32, dst.height() as i32)
+            (dst_w as i32, dst_h as i32)
         };
 
-        let format = if dst.is_planar() {
+        // BGRA textures as framebuffer color attachments have GPU-dependent
+        // swizzle behavior: some implementations don't swizzle fragment shader
+        // output, causing R↔B channel swap. Work around this by using RGBA
+        // format internally — BGRA pixel data is byte-swapped (R↔B) before
+        // upload, and the readback path swaps back.
+        let is_bgra = !is_planar && dst_fmt == PixelFormat::Bgra;
+        if is_bgra && !self.bgra_warned {
+            log::warn!(
+                "BGRA destination: using RGBA internal format with CPU R↔B byte-swap workaround"
+            );
+            self.bgra_warned = true;
+        }
+        let format = if is_planar {
             gls::gl::RED
         } else {
-            match dst.fourcc() {
-                RGB | RGB_INT8 => gls::gl::RGB,
-                RGBA => gls::gl::RGBA,
-                BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
-                GREY => gls::gl::RED,
+            match dst_fmt {
+                PixelFormat::Rgb => gls::gl::RGB,
+                PixelFormat::Rgba | PixelFormat::Bgra => gls::gl::RGBA, // BGRA uses RGBA internally
+                PixelFormat::Grey => gls::gl::RED,
                 _ => unreachable!(),
             }
         };
@@ -1478,17 +1746,24 @@ impl GLProcessorST {
         self.convert_fbo.bind();
 
         let map;
+        let mut swapped_buf;
 
         let pixels = if crop.dst_rect.is_none_or(|crop| {
-            crop.top == 0
-                && crop.left == 0
-                && crop.height == dst.height()
-                && crop.width == dst.width()
+            crop.top == 0 && crop.left == 0 && crop.height == dst_h && crop.width == dst_w
         }) {
             std::ptr::null()
         } else {
-            map = dst.tensor().map()?;
-            map.as_ptr() as *const c_void
+            map = dst.map()?;
+            if is_bgra {
+                // Swap R↔B to convert BGRA→RGBA for the RGBA texture.
+                swapped_buf = map.as_slice().to_vec();
+                for chunk in swapped_buf.chunks_exact_mut(4) {
+                    chunk.swap(0, 2);
+                }
+                swapped_buf.as_ptr() as *const c_void
+            } else {
+                map.as_ptr() as *const c_void
+            }
         };
         unsafe {
             gls::gl::UseProgram(self.texture_program.id);
@@ -1540,18 +1815,19 @@ impl GLProcessorST {
     /// `tensor.map()` a PBO on the GL thread.
     fn setup_renderbuffer_from_pbo(
         &mut self,
-        dst: &TensorImage,
+        dst: &Tensor<u8>,
+        dst_fmt: PixelFormat,
         buffer_id: u32,
     ) -> crate::Result<()> {
-        let (width, height) = (dst.width() as i32, dst.height() as i32);
-        let format = match dst.fourcc() {
-            RGB => gls::gl::RGB,
-            RGBA => gls::gl::RGBA,
-            BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
+        let dst_w = dst.width().ok_or(Error::NotAnImage)?;
+        let dst_h = dst.height().ok_or(Error::NotAnImage)?;
+        let (width, height) = (dst_w as i32, dst_h as i32);
+        let format = match dst_fmt {
+            PixelFormat::Rgb => gls::gl::RGB,
+            PixelFormat::Rgba | PixelFormat::Bgra => gls::gl::RGBA,
             _ => {
                 return Err(crate::Error::NotSupported(format!(
-                    "PBO renderbuffer not supported for {}",
-                    dst.fourcc().display()
+                    "PBO renderbuffer not supported for {dst_fmt}",
                 )))
             }
         };
@@ -1601,86 +1877,30 @@ impl GLProcessorST {
         Ok(())
     }
 
-    fn convert_dest_non_dma(
-        &mut self,
-        dst: &mut TensorImage,
-        src: &TensorImage,
-        rotation: crate::Rotation,
-        flip: Flip,
-        crop: Crop,
-    ) -> crate::Result<()> {
-        self.setup_renderbuffer_non_dma(dst, crop)?;
-        let start = Instant::now();
-        if dst.is_planar() {
-            self.convert_to_planar(src, dst, rotation, flip, crop)?;
-        } else {
-            self.convert_to(src, dst, rotation, flip, crop)?;
-        }
-        log::debug!("Draw to framebuffer takes {:?}", start.elapsed());
-        let start = Instant::now();
-        let dest_format = match dst.fourcc() {
-            RGB | RGB_INT8 => gls::gl::RGB,
-            RGBA => gls::gl::RGBA,
-            BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
-            GREY => gls::gl::RED,
-            _ => unreachable!(),
-        };
-
-        unsafe {
-            let mut dst_map = dst.tensor().map()?;
-            gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-            gls::gl::ReadnPixels(
-                0,
-                0,
-                dst.width() as i32,
-                dst.height() as i32,
-                dest_format,
-                gls::gl::UNSIGNED_BYTE,
-                dst.tensor.len() as i32,
-                dst_map.as_mut_ptr() as *mut c_void,
-            );
-            // Apply XOR 0x80 for int8 formats (convert uint8 → int8 representation)
-            if fourcc_is_int8(dst.fourcc()) {
-                for byte in dst_map.iter_mut() {
-                    *byte ^= 0x80;
-                }
-            }
-        }
-        log::debug!("Read from framebuffer takes {:?}", start.elapsed());
-        Ok(())
-    }
-
     /// Convert between two PBO-backed images.
     ///
     /// Source PBO is bound as `GL_PIXEL_UNPACK_BUFFER` for zero-copy texture upload
     /// (avoids `tensor.map()` to prevent GL-thread deadlocks). Destination uses
     /// `GL_PIXEL_PACK_BUFFER` for zero-copy readback into the PBO.
+    #[allow(clippy::too_many_arguments)]
     fn convert_pbo_to_pbo(
         &mut self,
-        dst: &mut TensorImage,
-        src: &TensorImage,
+        dst: &mut Tensor<u8>,
+        dst_fmt: PixelFormat,
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
+        is_int8: bool,
         rotation: crate::Rotation,
         flip: Flip,
         crop: Crop,
     ) -> crate::Result<()> {
-        // Safety check: neither PBO must be mapped; extract buffer IDs before releasing borrows
         let (src_buffer_id, dst_buffer_id) = {
-            let src_pbo = match &src.tensor {
-                edgefirst_tensor::Tensor::Pbo(p) => p,
-                _ => {
-                    return Err(crate::Error::OpenGl(
-                        "convert_pbo_to_pbo: src is not a PBO tensor".to_string(),
-                    ))
-                }
-            };
-            let dst_pbo = match &dst.tensor {
-                edgefirst_tensor::Tensor::Pbo(p) => p,
-                _ => {
-                    return Err(crate::Error::OpenGl(
-                        "convert_pbo_to_pbo: dst is not a PBO tensor".to_string(),
-                    ))
-                }
-            };
+            let src_pbo = src.as_pbo().ok_or_else(|| {
+                crate::Error::OpenGl("convert_pbo_to_pbo: src is not a PBO tensor".to_string())
+            })?;
+            let dst_pbo = dst.as_pbo().ok_or_else(|| {
+                crate::Error::OpenGl("convert_pbo_to_pbo: dst is not a PBO tensor".to_string())
+            })?;
 
             if src_pbo.is_mapped() || dst_pbo.is_mapped() {
                 return Err(crate::Error::OpenGl(
@@ -1691,8 +1911,30 @@ impl GLProcessorST {
             (src_pbo.buffer_id(), dst_pbo.buffer_id())
         };
 
-        // Setup renderbuffer (same as non-DMA path)
-        self.setup_renderbuffer_non_dma(dst, crop)?;
+        self.setup_renderbuffer_non_dma(dst, dst_fmt, crop)?;
+
+        // For int8 output, swap to int8 shader programs so the GPU applies
+        // XOR 0x80 in the fragment shader — no CPU readback needed for int8.
+        if is_int8 {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
+        }
+
+        // Bias letterbox clear color for int8 — glClear bypasses the shader.
+        let crop = if is_int8 {
+            let mut crop = crop;
+            if let Some(ref mut color) = crop.dst_color {
+                color[0] ^= 0x80;
+                color[1] ^= 0x80;
+                color[2] ^= 0x80;
+            }
+            crop
+        } else {
+            crop
+        };
 
         // Upload source from PBO and render.
         // We cannot call convert_to/draw_src_texture directly because they
@@ -1701,37 +1943,53 @@ impl GLProcessorST {
         // and upload to the texture with a NULL pointer — GL reads directly
         // from the PBO, zero CPU copy.
         let start = Instant::now();
-        self.draw_src_texture_from_pbo(src, src_buffer_id, dst, rotation, flip, crop)?;
+        let render_result = self.draw_src_texture_from_pbo(
+            src,
+            src_fmt,
+            src_buffer_id,
+            dst,
+            dst_fmt,
+            rotation,
+            flip,
+            crop,
+        );
+        // Swap shaders back before checking result
+        if is_int8 {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
+        }
+        render_result?;
         log::debug!("PBO render takes {:?}", start.elapsed());
 
-        // Readback into destination PBO instead of CPU memory
         let start_read = Instant::now();
-        let dest_format = match dst.fourcc() {
-            crate::RGB | crate::RGB_INT8 => gls::gl::RGB,
-            crate::RGBA => gls::gl::RGBA,
-            crate::BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
-            crate::GREY => gls::gl::RED,
+        let dest_format = match dst_fmt {
+            PixelFormat::Rgb => gls::gl::RGB,
+            PixelFormat::Rgba | PixelFormat::Bgra => gls::gl::RGBA,
+            PixelFormat::Grey => gls::gl::RED,
             _ => {
                 return Err(crate::Error::NotSupported(format!(
-                    "PBO readback not supported for {}",
-                    dst.fourcc().display()
+                    "PBO readback not supported for {dst_fmt}",
                 )))
             }
         };
+        let dst_w = dst.width().ok_or(Error::NotAnImage)?;
+        let dst_h = dst.height().ok_or(Error::NotAnImage)?;
 
         unsafe {
-            // Bind destination PBO as PACK buffer — glReadnPixels will write into it
             gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, dst_buffer_id);
             gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
             gls::gl::ReadnPixels(
                 0,
                 0,
-                dst.width() as i32,
-                dst.height() as i32,
+                dst_w as i32,
+                dst_h as i32,
                 dest_format,
                 gls::gl::UNSIGNED_BYTE,
-                dst.tensor.len() as i32,
-                std::ptr::null_mut(), // NULL pointer = write to bound PACK buffer
+                dst.len() as i32,
+                std::ptr::null_mut(),
             );
             gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
             gls::gl::Finish();
@@ -1739,21 +1997,21 @@ impl GLProcessorST {
 
         check_gl_error(function!(), line!())?;
 
-        // Handle int8 XOR if needed (must map PBO to do this on the GL thread
-        // directly, since we're already on the GL thread)
-        if fourcc_is_int8(dst.fourcc()) {
+        // Handle BGRA R↔B swap if needed (must map PBO on the GL thread).
+        // Int8 XOR 0x80 is handled in the fragment shader — no CPU map needed.
+        if dst_fmt == PixelFormat::Bgra {
             unsafe {
                 gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, dst_buffer_id);
                 let ptr = gls::gl::MapBufferRange(
                     gls::gl::PIXEL_PACK_BUFFER,
                     0,
-                    dst.tensor.len() as isize,
+                    dst.len() as isize,
                     gls::gl::MAP_READ_BIT | gls::gl::MAP_WRITE_BIT,
                 );
                 if !ptr.is_null() {
-                    let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, dst.tensor.len());
-                    for byte in slice.iter_mut() {
-                        *byte ^= 0x80;
+                    let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, dst.len());
+                    for chunk in slice.chunks_exact_mut(4) {
+                        chunk.swap(0, 2);
                     }
                     gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
                 }
@@ -1771,39 +2029,44 @@ impl GLProcessorST {
     /// the tensor to CPU and calling glTexImage2D with a data pointer, we
     /// bind the source PBO as GL_PIXEL_UNPACK_BUFFER and pass NULL, causing
     /// GL to read directly from the PBO (zero CPU copy).
+    #[allow(clippy::too_many_arguments)]
     fn draw_src_texture_from_pbo(
         &mut self,
-        src: &TensorImage,
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
         src_buffer_id: u32,
-        dst: &TensorImage,
+        dst: &Tensor<u8>,
+        _dst_fmt: PixelFormat,
         rotation: crate::Rotation,
         flip: Flip,
         crop: Crop,
     ) -> Result<(), Error> {
+        let src_w = src.width().ok_or(Error::NotAnImage)?;
+        let src_h = src.height().ok_or(Error::NotAnImage)?;
+        let dst_w = dst.width().ok_or(Error::NotAnImage)?;
+        let dst_h = dst.height().ok_or(Error::NotAnImage)?;
         let texture_target = gls::gl::TEXTURE_2D;
-        let texture_format = match src.fourcc() {
-            crate::RGB | crate::RGB_INT8 => gls::gl::RGB,
-            crate::RGBA => gls::gl::RGBA,
-            crate::GREY => gls::gl::RED,
+        let texture_format = match src_fmt {
+            PixelFormat::Rgb => gls::gl::RGB,
+            PixelFormat::Rgba => gls::gl::RGBA,
+            PixelFormat::Grey => gls::gl::RED,
             _ => {
                 return Err(Error::NotSupported(format!(
-                    "PBO upload not supported for {:?}",
-                    src.fourcc()
+                    "PBO upload not supported for {src_fmt:?}",
                 )));
             }
         };
 
-        let has_crop = crop.dst_rect.is_some_and(|x| {
-            x.left != 0 || x.top != 0 || x.width != dst.width() || x.height != dst.height()
-        });
+        let has_crop = crop
+            .dst_rect
+            .is_some_and(|x| x.left != 0 || x.top != 0 || x.width != dst_w || x.height != dst_h);
 
-        // top and bottom are flipped because OpenGL uses 0,0 as bottom left
         let src_roi = if let Some(crop) = crop.src_rect {
             RegionOfInterest {
-                left: crop.left as f32 / src.width() as f32,
-                top: (crop.top + crop.height) as f32 / src.height() as f32,
-                right: (crop.left + crop.width) as f32 / src.width() as f32,
-                bottom: crop.top as f32 / src.height() as f32,
+                left: crop.left as f32 / src_w as f32,
+                top: (crop.top + crop.height) as f32 / src_h as f32,
+                right: (crop.left + crop.width) as f32 / src_w as f32,
+                bottom: crop.top as f32 / src_h as f32,
             }
         } else {
             RegionOfInterest {
@@ -1817,10 +2080,10 @@ impl GLProcessorST {
         let cvt_screen_coord = |normalized| normalized * 2.0 - 1.0;
         let mut dst_roi = if let Some(crop) = crop.dst_rect {
             RegionOfInterest {
-                left: cvt_screen_coord(crop.left as f32 / dst.width() as f32),
-                top: cvt_screen_coord((crop.top + crop.height) as f32 / dst.height() as f32),
-                right: cvt_screen_coord((crop.left + crop.width) as f32 / dst.width() as f32),
-                bottom: cvt_screen_coord(crop.top as f32 / dst.height() as f32),
+                left: cvt_screen_coord(crop.left as f32 / dst_w as f32),
+                top: cvt_screen_coord((crop.top + crop.height) as f32 / dst_h as f32),
+                right: cvt_screen_coord((crop.left + crop.width) as f32 / dst_w as f32),
+                bottom: cvt_screen_coord(crop.top as f32 / dst_h as f32),
             }
         } else {
             RegionOfInterest {
@@ -1864,7 +2127,7 @@ impl GLProcessorST {
                 gls::gl::TEXTURE_MAG_FILTER,
                 gls::gl::LINEAR as i32,
             );
-            if src.fourcc() == crate::GREY {
+            if src_fmt == PixelFormat::Grey {
                 for swizzle in [
                     gls::gl::TEXTURE_SWIZZLE_R,
                     gls::gl::TEXTURE_SWIZZLE_G,
@@ -1888,8 +2151,8 @@ impl GLProcessorST {
                 texture_target,
                 0,
                 texture_format as i32,
-                src.width() as i32,
-                src.height() as i32,
+                src_w as i32,
+                src_h as i32,
                 0,
                 texture_format,
                 gls::gl::UNSIGNED_BYTE,
@@ -2014,64 +2277,81 @@ impl GLProcessorST {
     /// Convert any source (Mem/DMA) to a PBO destination.
     /// Source is uploaded via normal texture path (maps tensor for CPU upload).
     /// Destination readback uses PBO PACK binding (no map on GL thread).
+    #[allow(clippy::too_many_arguments)]
     fn convert_any_to_pbo(
         &mut self,
-        dst: &mut TensorImage,
-        src: &TensorImage,
+        dst: &mut Tensor<u8>,
+        dst_fmt: PixelFormat,
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
+        is_int8: bool,
         rotation: crate::Rotation,
         flip: Flip,
         crop: Crop,
     ) -> crate::Result<()> {
-        let dst_buffer_id = match &dst.tensor {
-            edgefirst_tensor::Tensor::Pbo(p) => {
-                if p.is_mapped() {
-                    return Err(crate::Error::OpenGl(
-                        "Cannot convert to a mapped PBO tensor".to_string(),
-                    ));
-                }
-                p.buffer_id()
-            }
-            _ => {
-                return Err(crate::Error::OpenGl(
-                    "convert_any_to_pbo: dst is not a PBO tensor".to_string(),
-                ))
-            }
+        let dst_pbo = dst.as_pbo().ok_or_else(|| {
+            crate::Error::OpenGl("convert_any_to_pbo: dst is not a PBO tensor".to_string())
+        })?;
+        if dst_pbo.is_mapped() {
+            return Err(crate::Error::OpenGl(
+                "Cannot convert to a mapped PBO tensor".to_string(),
+            ));
+        }
+        let dst_buffer_id = dst_pbo.buffer_id();
+
+        self.setup_renderbuffer_non_dma(dst, dst_fmt, crop)?;
+
+        // For int8 non-planar output, swap to int8 shader programs.
+        // Planar path handles int8 internally via its own int8 shader.
+        if is_int8 && dst_fmt.layout() != PixelLayout::Planar {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
+        }
+
+        let start = Instant::now();
+        let render_result = if dst_fmt.layout() == PixelLayout::Planar {
+            self.convert_to_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
+        } else {
+            self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)
         };
 
-        self.setup_renderbuffer_non_dma(dst, crop)?;
-        let start = Instant::now();
-        if dst.is_planar() {
-            self.convert_to_planar(src, dst, rotation, flip, crop)?;
-        } else {
-            self.convert_to(src, dst, rotation, flip, crop)?;
+        if is_int8 && dst_fmt.layout() != PixelLayout::Planar {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
         }
+        render_result?;
         log::debug!("any-to-PBO render takes {:?}", start.elapsed());
 
-        // PBO readback
         let start_read = Instant::now();
-        let dest_format = match dst.fourcc() {
-            crate::RGB | crate::RGB_INT8 => gls::gl::RGB,
-            crate::RGBA => gls::gl::RGBA,
-            crate::BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
-            crate::GREY => gls::gl::RED,
+        let dest_format = match dst_fmt {
+            PixelFormat::Rgb => gls::gl::RGB,
+            PixelFormat::Rgba | PixelFormat::Bgra => gls::gl::RGBA,
+            PixelFormat::Grey => gls::gl::RED,
             _ => {
                 return Err(crate::Error::NotSupported(format!(
-                    "PBO readback not supported for {}",
-                    dst.fourcc().display()
+                    "PBO readback not supported for {dst_fmt}",
                 )))
             }
         };
+        let dst_w = dst.width().ok_or(Error::NotAnImage)?;
+        let dst_h = dst.height().ok_or(Error::NotAnImage)?;
         unsafe {
             gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, dst_buffer_id);
             gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
             gls::gl::ReadnPixels(
                 0,
                 0,
-                dst.width() as i32,
-                dst.height() as i32,
+                dst_w as i32,
+                dst_h as i32,
                 dest_format,
                 gls::gl::UNSIGNED_BYTE,
-                dst.tensor.len() as i32,
+                dst.len() as i32,
                 std::ptr::null_mut(),
             );
             gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
@@ -2079,19 +2359,21 @@ impl GLProcessorST {
         }
         check_gl_error(function!(), line!())?;
 
-        if fourcc_is_int8(dst.fourcc()) {
+        // Handle BGRA R↔B swap if needed (must map PBO on the GL thread).
+        // Int8 XOR 0x80 is handled in the fragment shader — no CPU map needed.
+        if dst_fmt == PixelFormat::Bgra {
             unsafe {
                 gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, dst_buffer_id);
                 let ptr = gls::gl::MapBufferRange(
                     gls::gl::PIXEL_PACK_BUFFER,
                     0,
-                    dst.tensor.len() as isize,
+                    dst.len() as isize,
                     gls::gl::MAP_READ_BIT | gls::gl::MAP_WRITE_BIT,
                 );
                 if !ptr.is_null() {
-                    let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, dst.tensor.len());
-                    for byte in slice.iter_mut() {
-                        *byte ^= 0x80;
+                    let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, dst.len());
+                    for chunk in slice.chunks_exact_mut(4) {
+                        chunk.swap(0, 2);
                     }
                     gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
                 }
@@ -2107,65 +2389,92 @@ impl GLProcessorST {
     /// Convert a PBO source to a non-PBO (Mem) destination.
     /// Source is uploaded via PBO UNPACK binding (no map on GL thread).
     /// Destination readback uses normal ReadnPixels into mapped Mem tensor.
+    #[allow(clippy::too_many_arguments)]
     fn convert_pbo_to_mem(
         &mut self,
-        dst: &mut TensorImage,
-        src: &TensorImage,
+        dst: &mut Tensor<u8>,
+        dst_fmt: PixelFormat,
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
+        is_int8: bool,
         rotation: crate::Rotation,
         flip: Flip,
         crop: Crop,
     ) -> crate::Result<()> {
-        let src_buffer_id = match &src.tensor {
-            edgefirst_tensor::Tensor::Pbo(p) => {
-                if p.is_mapped() {
-                    return Err(crate::Error::OpenGl(
-                        "Cannot convert from a mapped PBO tensor".to_string(),
-                    ));
-                }
-                p.buffer_id()
-            }
-            _ => {
-                return Err(crate::Error::OpenGl(
-                    "convert_pbo_to_mem: src is not a PBO tensor".to_string(),
-                ))
-            }
-        };
+        let src_pbo = src.as_pbo().ok_or_else(|| {
+            crate::Error::OpenGl("convert_pbo_to_mem: src is not a PBO tensor".to_string())
+        })?;
+        if src_pbo.is_mapped() {
+            return Err(crate::Error::OpenGl(
+                "Cannot convert from a mapped PBO tensor".to_string(),
+            ));
+        }
+        let src_buffer_id = src_pbo.buffer_id();
 
-        self.setup_renderbuffer_non_dma(dst, crop)?;
+        self.setup_renderbuffer_non_dma(dst, dst_fmt, crop)?;
+
+        // For int8 output, swap to int8 shader programs so the GPU renders
+        // XOR'd values — ReadnPixels then reads already-biased data.
+        if is_int8 {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
+        }
+
         let start = Instant::now();
-        self.draw_src_texture_from_pbo(src, src_buffer_id, dst, rotation, flip, crop)?;
+        let render_result = self.draw_src_texture_from_pbo(
+            src,
+            src_fmt,
+            src_buffer_id,
+            dst,
+            dst_fmt,
+            rotation,
+            flip,
+            crop,
+        );
+
+        if is_int8 {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
+        }
+        render_result?;
         log::debug!("PBO-to-mem render takes {:?}", start.elapsed());
 
-        // Normal readback into Mem dst
+        // ReadnPixels into Mem dst — data is already int8-biased by the shader.
         let start = Instant::now();
-        let dest_format = match dst.fourcc() {
-            crate::RGB | crate::RGB_INT8 => gls::gl::RGB,
-            crate::RGBA => gls::gl::RGBA,
-            crate::BGRA => 0x80E1, // GL_BGRA (GL_EXT_texture_format_BGRA8888)
-            crate::GREY => gls::gl::RED,
+        let dst_w = dst.width().ok_or(Error::NotAnImage)?;
+        let dst_h = dst.height().ok_or(Error::NotAnImage)?;
+        let dest_format = match dst_fmt {
+            PixelFormat::Rgb => gls::gl::RGB,
+            PixelFormat::Rgba | PixelFormat::Bgra => gls::gl::RGBA,
+            PixelFormat::Grey => gls::gl::RED,
             _ => {
                 return Err(crate::Error::NotSupported(format!(
-                    "PBO readback not supported for {}",
-                    dst.fourcc().display()
+                    "PBO readback not supported for {dst_fmt}",
                 )))
             }
         };
         unsafe {
-            let mut dst_map = dst.tensor().map()?;
+            let mut dst_map = dst.map()?;
             gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
             gls::gl::ReadnPixels(
                 0,
                 0,
-                dst.width() as i32,
-                dst.height() as i32,
+                dst_w as i32,
+                dst_h as i32,
                 dest_format,
                 gls::gl::UNSIGNED_BYTE,
-                dst.tensor.len() as i32,
+                dst.len() as i32,
                 dst_map.as_mut_ptr() as *mut c_void,
             );
-            if fourcc_is_int8(dst.fourcc()) {
-                for byte in dst_map.iter_mut() {
-                    *byte ^= 0x80;
+            if dst_fmt == PixelFormat::Bgra {
+                for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
+                    chunk.swap(0, 2);
                 }
             }
         }
@@ -2173,19 +2482,26 @@ impl GLProcessorST {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn convert_to(
         &mut self,
-        src: &TensorImage,
-        dst: &TensorImage,
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
+        dst: &Tensor<u8>,
+        _dst_fmt: PixelFormat,
         rotation: crate::Rotation,
         flip: Flip,
         crop: Crop,
     ) -> Result<(), crate::Error> {
+        let src_w = src.width().ok_or(Error::NotAnImage)?;
+        let src_h = src.height().ok_or(Error::NotAnImage)?;
+        let dst_w = dst.width().ok_or(Error::NotAnImage)?;
+        let dst_h = dst.height().ok_or(Error::NotAnImage)?;
         check_gl_error(function!(), line!())?;
 
-        let has_crop = crop.dst_rect.is_some_and(|x| {
-            x.left != 0 || x.top != 0 || x.width != dst.width() || x.height != dst.height()
-        });
+        let has_crop = crop
+            .dst_rect
+            .is_some_and(|x| x.left != 0 || x.top != 0 || x.width != dst_w || x.height != dst_h);
         if has_crop {
             if let Some(dst_color) = crop.dst_color {
                 unsafe {
@@ -2200,13 +2516,12 @@ impl GLProcessorST {
             }
         }
 
-        // top and bottom are flipped because OpenGL uses 0,0 as bottom left
         let src_roi = if let Some(crop) = crop.src_rect {
             RegionOfInterest {
-                left: crop.left as f32 / src.width() as f32,
-                top: (crop.top + crop.height) as f32 / src.height() as f32,
-                right: (crop.left + crop.width) as f32 / src.width() as f32,
-                bottom: crop.top as f32 / src.height() as f32,
+                left: crop.left as f32 / src_w as f32,
+                top: (crop.top + crop.height) as f32 / src_h as f32,
+                right: (crop.left + crop.width) as f32 / src_w as f32,
+                bottom: crop.top as f32 / src_h as f32,
             }
         } else {
             RegionOfInterest {
@@ -2217,14 +2532,13 @@ impl GLProcessorST {
             }
         };
 
-        // top and bottom are flipped because OpenGL uses 0,0 as bottom left
         let cvt_screen_coord = |normalized| normalized * 2.0 - 1.0;
         let dst_roi = if let Some(crop) = crop.dst_rect {
             RegionOfInterest {
-                left: cvt_screen_coord(crop.left as f32 / dst.width() as f32),
-                top: cvt_screen_coord((crop.top + crop.height) as f32 / dst.height() as f32),
-                right: cvt_screen_coord((crop.left + crop.width) as f32 / dst.width() as f32),
-                bottom: cvt_screen_coord(crop.top as f32 / dst.height() as f32),
+                left: cvt_screen_coord(crop.left as f32 / dst_w as f32),
+                top: cvt_screen_coord((crop.top + crop.height) as f32 / dst_h as f32),
+                right: cvt_screen_coord((crop.left + crop.width) as f32 / dst_w as f32),
+                bottom: cvt_screen_coord(crop.top as f32 / dst_h as f32),
             }
         } else {
             RegionOfInterest {
@@ -2240,10 +2554,11 @@ impl GLProcessorST {
             crate::Rotation::Rotate180 => 2,
             crate::Rotation::CounterClockwise90 => 3,
         };
-        if self.gl_context.transfer_backend.is_dma() && src.tensor().memory() == TensorMemory::Dma {
-            match self.get_or_create_egl_image(CacheKind::Src, src) {
+        if self.gl_context.transfer_backend.is_dma() && src.memory() == TensorMemory::Dma {
+            match self.get_or_create_egl_image(CacheKind::Src, src, src_fmt) {
                 Ok(src_egl) => self.draw_camera_texture_eglimage(
                     src,
+                    src_fmt,
                     src_egl,
                     src_roi,
                     dst_roi,
@@ -2251,15 +2566,20 @@ impl GLProcessorST {
                     flip,
                 )?,
                 Err(e) => {
-                    log::warn!("EGL image creation failed for {:?}: {:?}", src.fourcc(), e);
+                    let src_w = src.width().unwrap_or(0);
+                    let src_h = src.height().unwrap_or(0);
+                    log::warn!(
+                        "EGL image creation failed for {src_fmt} ({src_w}x{src_h}), \
+                         falling back to texture upload (slower): {e}"
+                    );
                     let start = Instant::now();
-                    self.draw_src_texture(src, src_roi, dst_roi, rotation_offset, flip)?;
+                    self.draw_src_texture(src, src_fmt, src_roi, dst_roi, rotation_offset, flip)?;
                     log::debug!("draw_src_texture takes {:?}", start.elapsed());
                 }
             }
         } else {
             let start = Instant::now();
-            self.draw_src_texture(src, src_roi, dst_roi, rotation_offset, flip)?;
+            self.draw_src_texture(src, src_fmt, src_roi, dst_roi, rotation_offset, flip)?;
             log::debug!("draw_src_texture takes {:?}", start.elapsed());
         }
 
@@ -2270,14 +2590,22 @@ impl GLProcessorST {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn convert_to_planar(
         &mut self,
-        src: &TensorImage,
-        dst: &TensorImage,
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
+        dst: &Tensor<u8>,
+        dst_fmt: PixelFormat,
+        is_int8: bool,
         rotation: crate::Rotation,
         flip: Flip,
         crop: Crop,
     ) -> Result<(), crate::Error> {
+        let src_w = src.width().ok_or(Error::NotAnImage)?;
+        let src_h = src.height().ok_or(Error::NotAnImage)?;
+        let dst_w = dst.width().ok_or(Error::NotAnImage)?;
+        let dst_h = dst.height().ok_or(Error::NotAnImage)?;
         // if let Some(crop) = crop.src_rect
         //     && (crop.left > 0
         //         || crop.top > 0
@@ -2300,25 +2628,26 @@ impl GLProcessorST {
         //     ));
         // }
 
-        let alpha = match dst.fourcc() {
-            PLANAR_RGB | PLANAR_RGB_INT8 => false,
-            PLANAR_RGBA => true,
+        let alpha = match dst_fmt {
+            PixelFormat::PlanarRgb => false,
+            PixelFormat::PlanarRgba => true,
             _ => {
                 return Err(crate::Error::NotSupported(
-                    "Destination format must be PLANAR_RGB, PLANAR_RGB_INT8, or PLANAR_RGBA"
-                        .to_string(),
+                    "Destination format must be PlanarRgb or PlanarRgba".to_string(),
                 ));
             }
         };
-        let is_int8 = fourcc_is_int8(dst.fourcc());
+        log::trace!(
+            "convert_to_planar: int8={is_int8}, interpolation={:?}",
+            self.int8_interpolation_mode
+        );
 
-        // top and bottom are flipped because OpenGL uses 0,0 as bottom left
         let src_roi = if let Some(crop) = crop.src_rect {
             RegionOfInterest {
-                left: crop.left as f32 / src.width() as f32,
-                top: (crop.top + crop.height) as f32 / src.height() as f32,
-                right: (crop.left + crop.width) as f32 / src.width() as f32,
-                bottom: crop.top as f32 / src.height() as f32,
+                left: crop.left as f32 / src_w as f32,
+                top: (crop.top + crop.height) as f32 / src_h as f32,
+                right: (crop.left + crop.width) as f32 / src_w as f32,
+                bottom: crop.top as f32 / src_h as f32,
             }
         } else {
             RegionOfInterest {
@@ -2329,14 +2658,13 @@ impl GLProcessorST {
             }
         };
 
-        // top and bottom are flipped because OpenGL uses 0,0 as bottom left
         let cvt_screen_coord = |normalized| normalized * 2.0 - 1.0;
         let dst_roi = if let Some(crop) = crop.dst_rect {
             RegionOfInterest {
-                left: cvt_screen_coord(crop.left as f32 / dst.width() as f32),
-                top: cvt_screen_coord((crop.top + crop.height) as f32 / dst.height() as f32),
-                right: cvt_screen_coord((crop.left + crop.width) as f32 / dst.width() as f32),
-                bottom: cvt_screen_coord(crop.top as f32 / dst.height() as f32),
+                left: cvt_screen_coord(crop.left as f32 / dst_w as f32),
+                top: cvt_screen_coord((crop.top + crop.height) as f32 / dst_h as f32),
+                right: cvt_screen_coord((crop.left + crop.width) as f32 / dst_w as f32),
+                bottom: cvt_screen_coord(crop.top as f32 / dst_h as f32),
             }
         } else {
             RegionOfInterest {
@@ -2353,14 +2681,14 @@ impl GLProcessorST {
             crate::Rotation::CounterClockwise90 => 3,
         };
 
-        let has_crop = crop.dst_rect.is_some_and(|x| {
-            x.left != 0 || x.top != 0 || x.width != dst.width() || x.height != dst.height()
-        });
+        let has_crop = crop
+            .dst_rect
+            .is_some_and(|x| x.left != 0 || x.top != 0 || x.width != dst_w || x.height != dst_h);
         if has_crop {
             if let Some(dst_color) = crop.dst_color {
                 self.clear_rect_planar(
-                    dst.width(),
-                    dst.height(),
+                    dst_w,
+                    dst_h,
                     dst_roi,
                     [
                         dst_color[0] as f32 / 255.0,
@@ -2373,7 +2701,7 @@ impl GLProcessorST {
             }
         }
 
-        let src_egl = self.get_or_create_egl_image(CacheKind::Src, src)?;
+        let src_egl = self.get_or_create_egl_image(CacheKind::Src, src, src_fmt)?;
 
         self.draw_camera_texture_to_rgb_planar(
             src_egl,
@@ -2389,7 +2717,7 @@ impl GLProcessorST {
         Ok(())
     }
 
-    /// Render packed RGB (or RGB_INT8) to a DMA destination buffer using a
+    /// Render packed RGB (or int8 RGB) to a DMA destination buffer using a
     /// two-pass architecture:
     ///
     /// **Pass 1:** Render source → intermediate RGBA texture via `convert_to()`
@@ -2398,17 +2726,20 @@ impl GLProcessorST {
     /// **Pass 2:** Pack intermediate RGBA → RGB DMA destination using a simple
     /// packing shader with 2D sampler. The destination DMA buffer is reinterpreted
     /// as RGBA8 at (W*3/4) x H dimensions.
+    #[allow(clippy::too_many_arguments)]
     fn convert_to_packed_rgb(
         &mut self,
-        src: &TensorImage,
-        dst: &mut TensorImage,
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
+        dst: &mut Tensor<u8>,
+        dst_fmt: PixelFormat,
+        is_int8: bool,
         rotation: crate::Rotation,
         flip: Flip,
         crop: Crop,
     ) -> crate::Result<()> {
-        let dst_w = dst.width();
-        let dst_h = dst.height();
-        let is_int8 = fourcc_is_int8(dst.fourcc());
+        let dst_w = dst.width().ok_or(Error::NotAnImage)?;
+        let dst_h = dst.height().ok_or(Error::NotAnImage)?;
 
         // Width must satisfy PackedRgba8 constraint: W*3 divisible by 4
         if !(dst_w * 3).is_multiple_of(4) {
@@ -2441,12 +2772,18 @@ impl GLProcessorST {
         // convert_to() renders to the currently-bound FBO (packed_rgb_fbo → intermediate).
         // It uses dst only for width/height in ROI coordinate math.
         // Handles: source binding (DMA EGLImage or upload), crop, letterbox, rotation, flip.
-        self.convert_to(src, dst, rotation, flip, crop)?;
+        self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)?;
 
         // --- Pass 2: Pack intermediate RGBA → RGB DMA destination ---
         self.convert_fbo.bind();
-        let dest_egl =
-            self.get_or_create_egl_image_rgb(dst, render_w, render_h, DrmFourcc::Abgr8888, 4)?;
+        let dest_egl = self.get_or_create_egl_image_rgb(
+            dst,
+            dst_fmt,
+            render_w,
+            render_h,
+            DrmFourcc::Abgr8888,
+            4,
+        )?;
         unsafe {
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
             gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
@@ -2505,81 +2842,6 @@ impl GLProcessorST {
 
         unsafe { gls::gl::Finish() };
         Ok(())
-    }
-
-    /// Render directly to an RGB8 renderbuffer backed by BGR888 DMA-buf.
-    /// Single-pass: no intermediate texture, no packing shader.
-    fn convert_to_rgb_direct(
-        &mut self,
-        src: &TensorImage,
-        dst: &mut TensorImage,
-        rotation: crate::Rotation,
-        flip: Flip,
-        crop: Crop,
-    ) -> crate::Result<()> {
-        let is_int8 = fourcc_is_int8(dst.fourcc());
-
-        log::debug!(
-            "convert_to_rgb_direct: {}x{} single-pass int8={is_int8}",
-            dst.width(),
-            dst.height(),
-        );
-
-        // Get or create cached renderbuffer
-        let (rbo, width, height) = self.get_or_create_rgb_direct_rbo(dst)?;
-
-        // Bind FBO with renderbuffer attachment
-        self.convert_fbo.bind();
-        unsafe {
-            gls::gl::FramebufferRenderbuffer(
-                gls::gl::FRAMEBUFFER,
-                gls::gl::COLOR_ATTACHMENT0,
-                gls::gl::RENDERBUFFER,
-                rbo,
-            );
-            check_gl_error(function!(), line!())?;
-
-            let status = gls::gl::CheckFramebufferStatus(gls::gl::FRAMEBUFFER);
-            if status != gls::gl::FRAMEBUFFER_COMPLETE {
-                log::warn!("convert_to_rgb_direct: FBO incomplete (0x{status:x}), falling back");
-                return self.convert_to_packed_rgb(src, dst, rotation, flip, crop);
-            }
-
-            gls::gl::Viewport(0, 0, width, height);
-        }
-
-        // For int8, temporarily swap to int8 shader programs and bias the clear color
-        let crop = if is_int8 {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
-            // Bias the letterbox clear color with XOR 0x80 since glClear bypasses
-            // the fragment shader — the int8 bias must be applied to the color directly.
-            let mut crop = crop;
-            if let Some(ref mut color) = crop.dst_color {
-                color[0] ^= 0x80;
-                color[1] ^= 0x80;
-                color[2] ^= 0x80;
-            }
-            crop
-        } else {
-            crop
-        };
-
-        let result = self.convert_to(src, dst, rotation, flip, crop);
-
-        // Swap back
-        if is_int8 {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
-        }
-
-        result
     }
 
     /// Allocates or resizes the intermediate RGBA texture for two-pass packed RGB.
@@ -2831,21 +3093,23 @@ impl GLProcessorST {
 
     fn draw_src_texture(
         &mut self,
-        src: &TensorImage,
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
         src_roi: RegionOfInterest,
         mut dst_roi: RegionOfInterest,
         rotation_offset: usize,
         flip: Flip,
     ) -> Result<(), Error> {
+        let src_w = src.width().ok_or(Error::NotAnImage)?;
+        let src_h = src.height().ok_or(Error::NotAnImage)?;
         let texture_target = gls::gl::TEXTURE_2D;
-        let texture_format = match src.fourcc() {
-            RGB => gls::gl::RGB,
-            RGBA => gls::gl::RGBA,
-            GREY => gls::gl::RED,
+        let texture_format = match src_fmt {
+            PixelFormat::Rgb => gls::gl::RGB,
+            PixelFormat::Rgba => gls::gl::RGBA,
+            PixelFormat::Grey => gls::gl::RED,
             _ => {
                 return Err(Error::NotSupported(format!(
-                    "draw_src_texture does not support {:?} (use DMA-BUF path for YUV)",
-                    src.fourcc()
+                    "draw_src_texture does not support {src_fmt:?} (use DMA-BUF path for YUV)",
                 )));
             }
         };
@@ -2863,7 +3127,7 @@ impl GLProcessorST {
                 gls::gl::TEXTURE_MAG_FILTER,
                 gls::gl::LINEAR as i32,
             );
-            if src.fourcc() == GREY {
+            if src_fmt == PixelFormat::Grey {
                 for swizzle in [
                     gls::gl::TEXTURE_SWIZZLE_R,
                     gls::gl::TEXTURE_SWIZZLE_G,
@@ -2872,20 +3136,20 @@ impl GLProcessorST {
                     gls::gl::TexParameteri(gls::gl::TEXTURE_2D, swizzle, gls::gl::RED as i32);
                 }
             } else {
-                for (swizzle, src) in [
+                for (swizzle, src_comp) in [
                     (gls::gl::TEXTURE_SWIZZLE_R, gls::gl::RED),
                     (gls::gl::TEXTURE_SWIZZLE_G, gls::gl::GREEN),
                     (gls::gl::TEXTURE_SWIZZLE_B, gls::gl::BLUE),
                 ] {
-                    gls::gl::TexParameteri(gls::gl::TEXTURE_2D, swizzle, src as i32);
+                    gls::gl::TexParameteri(gls::gl::TEXTURE_2D, swizzle, src_comp as i32);
                 }
             }
             self.camera_normal_texture.update_texture(
                 texture_target,
-                src.width(),
-                src.height(),
+                src_w,
+                src_h,
                 texture_format,
-                &src.tensor().map()?,
+                &src.map()?,
             );
 
             gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
@@ -2961,16 +3225,21 @@ impl GLProcessorST {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_camera_texture_eglimage(
-        &self,
-        src: &TensorImage,
+        &mut self,
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
         egl_img: egl::Image,
         src_roi: RegionOfInterest,
         mut dst_roi: RegionOfInterest,
         rotation_offset: usize,
         flip: Flip,
     ) -> Result<(), Error> {
-        // let texture_target = gls::gl::TEXTURE_2D;
+        let luma_id = src.buffer_identity().id();
+        let chroma_id = src.chroma().map(|t| t.buffer_identity().id());
+        let src_key = (luma_id, chroma_id);
+
         let texture_target = gls::gl::TEXTURE_EXTERNAL_OES;
         unsafe {
             gls::gl::UseProgram(self.texture_program_yuv.id);
@@ -2987,7 +3256,7 @@ impl GLProcessorST {
                 gls::gl::LINEAR as i32,
             );
 
-            if src.fourcc() == GREY {
+            if src_fmt == PixelFormat::Grey {
                 for swizzle in [
                     gls::gl::TEXTURE_SWIZZLE_R,
                     gls::gl::TEXTURE_SWIZZLE_G,
@@ -2996,17 +3265,23 @@ impl GLProcessorST {
                     gls::gl::TexParameteri(gls::gl::TEXTURE_2D, swizzle, gls::gl::RED as i32);
                 }
             } else {
-                for (swizzle, src) in [
+                for (swizzle, src_comp) in [
                     (gls::gl::TEXTURE_SWIZZLE_R, gls::gl::RED),
                     (gls::gl::TEXTURE_SWIZZLE_G, gls::gl::GREEN),
                     (gls::gl::TEXTURE_SWIZZLE_B, gls::gl::BLUE),
                 ] {
-                    gls::gl::TexParameteri(gls::gl::TEXTURE_2D, swizzle, src as i32);
+                    gls::gl::TexParameteri(gls::gl::TEXTURE_2D, swizzle, src_comp as i32);
                 }
             }
 
-            gls::egl_image_target_texture_2d_oes(texture_target, egl_img.as_ptr());
-            check_gl_error(function!(), line!())?;
+            if self.last_bound_src_egl != Some(src_key) {
+                gls::egl_image_target_texture_2d_oes(texture_target, egl_img.as_ptr());
+                check_gl_error(function!(), line!())?;
+                self.last_bound_src_egl = Some(src_key);
+                log::trace!("draw_camera: bound new src EGLImage id={luma_id:#x}");
+            } else {
+                log::trace!("draw_camera: reusing bound src EGLImage id={luma_id:#x}");
+            }
             gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
             gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
 
@@ -3081,79 +3356,86 @@ impl GLProcessorST {
         Ok(())
     }
 
-    fn create_image_from_dma2(&self, src: &TensorImage) -> Result<EglImage, crate::Error> {
+    fn create_image_from_dma2(
+        &self,
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
+    ) -> Result<EglImage, crate::Error> {
         let width;
         let height;
         let format;
         let channels;
 
+        let src_w = src.width().ok_or(Error::NotAnImage)?;
+        let src_h = src.height().ok_or(Error::NotAnImage)?;
+        let src_channels = src_fmt.channels();
+
         // NV12 is semi-planar but handled specially via EGL multi-plane import
-        if src.fourcc() == NV12 {
-            if !src.width().is_multiple_of(4) {
-                return Err(Error::NotSupported(
-                    "OpenGL EGLImage doesn't support image widths which are not multiples of 4"
-                        .to_string(),
-                ));
+        if src_fmt == PixelFormat::Nv12 {
+            if !src_w.is_multiple_of(4) {
+                return Err(Error::NotSupported(format!(
+                    "EGLImage requires width divisible by 4 for {src_fmt}, got {src_w}"
+                )));
             }
-            width = src.width();
-            height = src.height();
-            format = fourcc_to_drm(NV12)?;
+            width = src_w;
+            height = src_h;
+            format = pixel_format_to_drm(PixelFormat::Nv12)?;
             channels = 1; // Y plane pitch is 1 byte per pixel
-        } else if src.is_planar() {
-            if !src.width().is_multiple_of(16) {
-                return Err(Error::NotSupported(
-                    "OpenGL Planar RGB EGLImage doesn't support image widths which are not multiples of 16"
-                        .to_string(),
-                ));
+        } else if src_fmt.layout() == PixelLayout::Planar {
+            if !src_w.is_multiple_of(16) {
+                return Err(Error::NotSupported(format!(
+                    "EGLImage requires width divisible by 16 for {src_fmt}, got {src_w}"
+                )));
             }
-            match src.fourcc() {
-                PLANAR_RGB | PLANAR_RGB_INT8 => {
+            match src_fmt {
+                PixelFormat::PlanarRgb => {
                     format = DrmFourcc::R8;
-                    width = src.width();
-                    height = src.height() * 3;
+                    width = src_w;
+                    height = src_h * 3;
                     channels = 1;
                 }
-                fourcc => {
+                _ => {
                     return Err(crate::Error::NotSupported(format!(
-                        "Unsupported Planar FourCC {fourcc:?}"
+                        "Unsupported Planar format {src_fmt:?}"
                     )));
                 }
             };
         } else {
-            if !src.width().is_multiple_of(4) {
-                return Err(Error::NotSupported(
-                    "OpenGL EGLImage doesn't support image widths which are not multiples of 4"
-                        .to_string(),
-                ));
+            if !src_w.is_multiple_of(4) {
+                return Err(Error::NotSupported(format!(
+                    "EGLImage requires width divisible by 4 for {src_fmt}, got {src_w}"
+                )));
             }
-            width = src.width();
-            height = src.height();
-            format = fourcc_to_drm(src.fourcc())?;
-            channels = src.channels();
+            width = src_w;
+            height = src_h;
+            format = pixel_format_to_drm(src_fmt)?;
+            channels = src_channels;
         }
 
-        let fd = match &src.tensor {
-            edgefirst_tensor::Tensor::Dma(dma_tensor) => dma_tensor.fd.as_raw_fd(),
-            edgefirst_tensor::Tensor::Shm(_) => {
-                return Err(Error::NotImplemented(
-                    "OpenGL EGLImage doesn't support SHM".to_string(),
-                ));
+        let dma = src.as_dma().ok_or_else(|| {
+            Error::NotImplemented(format!(
+                "OpenGL EGLImage requires DMA tensor, got {:?}",
+                src.memory()
+            ))
+        })?;
+        let fd = dma.fd.as_raw_fd();
+
+        // For multiplane NV12, get the UV plane's fd from the chroma tensor
+        let uv_fd = if src.is_multiplane() {
+            {
+                let chroma = src.chroma().unwrap();
+                let chroma_dma = chroma.as_dma().ok_or_else(|| {
+                    Error::NotImplemented("Multiplane chroma tensor must be DMA-backed".to_string())
+                })?;
+                Some(chroma_dma.fd.as_raw_fd())
             }
-            edgefirst_tensor::Tensor::Mem(_) => {
-                return Err(Error::NotImplemented(
-                    "OpenGL EGLImage doesn't support MEM".to_string(),
-                ));
-            }
-            edgefirst_tensor::Tensor::Pbo(_) => {
-                return Err(Error::NotImplemented(
-                    "OpenGL EGLImage doesn't support PBO".to_string(),
-                ));
-            }
+        } else {
+            None
         };
 
         // For NV12, plane0 pitch is width (Y is 1 byte/pixel)
         // For other formats, pitch is width * channels
-        let plane0_pitch = if src.fourcc() == NV12 {
+        let plane0_pitch = if src_fmt == PixelFormat::Nv12 {
             width
         } else {
             width * channels
@@ -3177,11 +3459,17 @@ impl GLProcessorST {
         ];
 
         // NV12 requires a second plane for UV data
-        if src.fourcc() == NV12 {
-            let uv_offset = width * height; // Y plane size
+        if src_fmt == PixelFormat::Nv12 {
+            let (plane1_fd, uv_offset) = if let Some(chroma_fd) = uv_fd {
+                // Multiplane: UV in separate DMA-BUF at offset 0
+                (chroma_fd, 0)
+            } else {
+                // Contiguous: UV follows Y in same buffer
+                (fd, width * height)
+            };
             egl_img_attr.append(&mut vec![
                 egl_ext::DMA_BUF_PLANE1_FD as Attrib,
-                fd as Attrib,
+                plane1_fd as Attrib,
                 egl_ext::DMA_BUF_PLANE1_OFFSET as Attrib,
                 uv_offset as Attrib,
                 egl_ext::DMA_BUF_PLANE1_PITCH as Attrib,
@@ -3189,7 +3477,7 @@ impl GLProcessorST {
             ]);
         }
 
-        if matches!(src.fourcc(), YUYV | VYUY | NV12) {
+        if src_fmt.is_yuv() {
             egl_img_attr.append(&mut vec![
                 egl_ext::YUV_COLOR_SPACE_HINT as Attrib,
                 egl_ext::ITU_REC709 as Attrib,
@@ -3234,14 +3522,30 @@ impl GLProcessorST {
     fn get_or_create_egl_image(
         &mut self,
         cache: CacheKind,
-        img: &TensorImage,
+        img: &Tensor<u8>,
+        img_fmt: PixelFormat,
     ) -> Result<egl::Image, crate::Error> {
-        let id = img.buffer_identity().id();
+        let luma_id = img.buffer_identity().id();
+        let chroma_id = img.chroma().map(|t| t.buffer_identity().id());
+        let id = (luma_id, chroma_id);
 
         // Sweep dead entries opportunistically before looking up.
+        // Invalidate binding state since sweep may remove the bound entry.
         match cache {
-            CacheKind::Src => self.src_egl_cache.sweep(),
-            CacheKind::Dst => self.dst_egl_cache.sweep(),
+            CacheKind::Src => {
+                let before = self.src_egl_cache.entries.len();
+                self.src_egl_cache.sweep();
+                if self.src_egl_cache.entries.len() < before {
+                    self.last_bound_src_egl = None;
+                }
+            }
+            CacheKind::Dst => {
+                let before = self.dst_egl_cache.entries.len();
+                self.dst_egl_cache.sweep();
+                if self.dst_egl_cache.entries.len() < before {
+                    self.last_bound_dst_egl = None;
+                }
+            }
         }
 
         {
@@ -3253,24 +3557,34 @@ impl GLProcessorST {
             if let Some(cached) = egl_cache.entries.get_mut(&id) {
                 egl_cache.hits += 1;
                 cached.last_used = ts;
-                log::trace!("EglImageCache {:?} hit: id={id:#x}", cache);
+                log::trace!("EglImageCache {:?} hit: id={luma_id:#x}", cache);
                 return Ok(cached.egl_image.egl_image);
             }
             egl_cache.misses += 1;
-            log::trace!("EglImageCache {:?} miss: id={id:#x}", cache);
-            // Evict least-recently-used entry if at capacity.
-            if egl_cache.entries.len() >= egl_cache.capacity {
-                egl_cache.evict_lru();
-            }
+            log::trace!("EglImageCache {:?} miss: id={luma_id:#x}", cache);
         }
 
-        let egl_image_obj = self.create_image_from_dma2(img)?;
+        // Create the EGL image BEFORE evicting — if creation fails, we don't
+        // want to have destroyed a valid cache entry for nothing.
+        let egl_image_obj = self.create_image_from_dma2(img, img_fmt)?;
+
+        // Invalidate binding state: we're inserting a new entry and may evict
+        // the currently-bound one.
+        match cache {
+            CacheKind::Src => self.last_bound_src_egl = None,
+            CacheKind::Dst => self.last_bound_dst_egl = None,
+        }
+
         let handle = egl_image_obj.egl_image;
         let guard = img.buffer_identity().weak();
         let egl_cache = match cache {
             CacheKind::Src => &mut self.src_egl_cache,
             CacheKind::Dst => &mut self.dst_egl_cache,
         };
+        // Evict least-recently-used entry if at capacity.
+        if egl_cache.entries.len() >= egl_cache.capacity {
+            egl_cache.evict_lru();
+        }
         let ts = egl_cache.next_timestamp();
         egl_cache.entries.insert(
             id,
@@ -3286,23 +3600,19 @@ impl GLProcessorST {
 
     /// Create an EGLImage from a DMA buffer with explicitly specified internal
     /// dimensions and format. Used when the GL render surface differs from the
-    /// logical TensorImage dimensions (e.g., packed RGB reinterpretation).
+    /// logical image dimensions (e.g., packed RGB reinterpretation).
     fn create_egl_image_with_dims(
         &self,
-        img: &TensorImage,
+        img: &Tensor<u8>,
         width: usize,
         height: usize,
         drm_format: DrmFourcc,
         bpp: usize,
     ) -> Result<EglImage, crate::Error> {
-        let fd = match &img.tensor {
-            edgefirst_tensor::Tensor::Dma(dma_tensor) => dma_tensor.fd.as_raw_fd(),
-            _ => {
-                return Err(Error::NotImplemented(
-                    "create_egl_image_with_dims requires DMA tensor".to_string(),
-                ));
-            }
-        };
+        let dma = img.as_dma().ok_or_else(|| {
+            Error::NotImplemented("create_egl_image_with_dims requires DMA tensor".to_string())
+        })?;
+        let fd = dma.fd.as_raw_fd();
 
         let pitch = width * bpp;
         let egl_img_attr = vec![
@@ -3330,24 +3640,31 @@ impl GLProcessorST {
     /// reinterpreted dimensions. Uses the dst cache keyed by buffer identity.
     fn get_or_create_egl_image_rgb(
         &mut self,
-        img: &TensorImage,
+        img: &Tensor<u8>,
+        _img_fmt: PixelFormat,
         width: usize,
         height: usize,
         drm_format: DrmFourcc,
         bpp: usize,
     ) -> Result<egl::Image, crate::Error> {
-        let id = img.buffer_identity().id();
+        let id = (img.buffer_identity().id(), None);
+        let before = self.dst_egl_cache.entries.len();
         self.dst_egl_cache.sweep();
+        if self.dst_egl_cache.entries.len() < before {
+            self.last_bound_dst_egl = None;
+        }
 
         let ts = self.dst_egl_cache.next_timestamp();
         if let Some(cached) = self.dst_egl_cache.entries.get_mut(&id) {
             self.dst_egl_cache.hits += 1;
             cached.last_used = ts;
-            log::trace!("EglImageCache dst (RGB) hit: id={id:#x}");
+            log::trace!("EglImageCache dst (RGB) hit: id={:#x}", id.0);
             return Ok(cached.egl_image.egl_image);
         }
         self.dst_egl_cache.misses += 1;
-        log::trace!("EglImageCache dst (RGB) miss: id={id:#x}");
+        log::trace!("EglImageCache dst (RGB) miss: id={:#x}", id.0);
+        // Invalidate dst binding state on cache miss (new EGLImage creation).
+        self.last_bound_dst_egl = None;
 
         if self.dst_egl_cache.entries.len() >= self.dst_egl_cache.capacity {
             self.dst_egl_cache.evict_lru();
@@ -3367,73 +3684,6 @@ impl GLProcessorST {
             },
         );
         Ok(handle)
-    }
-
-    /// Get or create an EGLImage + renderbuffer for direct RGB rendering.
-    /// Both are cached in dst_egl_cache keyed by buffer identity.
-    /// Returns (renderbuffer_id, width, height).
-    fn get_or_create_rgb_direct_rbo(
-        &mut self,
-        dst: &TensorImage,
-    ) -> crate::Result<(u32, i32, i32)> {
-        let id = dst.buffer_identity().id();
-        let width = dst.width() as i32;
-        let height = dst.height() as i32;
-
-        self.dst_egl_cache.sweep();
-
-        // Check cache for existing entry with renderbuffer
-        let ts = self.dst_egl_cache.next_timestamp();
-        if let Some(cached) = self.dst_egl_cache.entries.get_mut(&id) {
-            if let Some(rbo) = cached.renderbuffer {
-                self.dst_egl_cache.hits += 1;
-                cached.last_used = ts;
-                log::trace!("EglImageCache dst (rgb_direct) hit: id={id:#x}");
-                return Ok((rbo, width, height));
-            }
-        }
-        self.dst_egl_cache.misses += 1;
-        log::trace!("EglImageCache dst (rgb_direct) miss: id={id:#x}");
-
-        // Evict least-recently-used entry if at capacity
-        if self.dst_egl_cache.entries.len() >= self.dst_egl_cache.capacity {
-            self.dst_egl_cache.evict_lru();
-        }
-
-        // Create EGLImage from BGR888 DMA-buf
-        let egl_image_obj =
-            self.create_egl_image_with_dims(dst, dst.width(), dst.height(), DrmFourcc::Bgr888, 3)?;
-
-        // Create renderbuffer and bind EGLImage to it
-        let rbo = unsafe {
-            let mut rbo = 0u32;
-            gls::gl::GenRenderbuffers(1, &mut rbo);
-            gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
-            gls::gl::EGLImageTargetRenderbufferStorageOES(
-                gls::gl::RENDERBUFFER,
-                egl_image_obj.egl_image.as_ptr(),
-            );
-            if let Err(e) = check_gl_error(function!(), line!()) {
-                gls::gl::DeleteRenderbuffers(1, &rbo);
-                return Err(e);
-            }
-            rbo
-        };
-
-        // Cache both
-        let guard = dst.buffer_identity().weak();
-        let ts = self.dst_egl_cache.next_timestamp();
-        self.dst_egl_cache.entries.insert(
-            id,
-            CachedEglImage {
-                egl_image: egl_image_obj,
-                guard,
-                renderbuffer: Some(rbo),
-                last_used: ts,
-            },
-        );
-
-        Ok((rbo, width, height))
     }
 
     // Reshapes the segmentation to be compatible with RGBA texture array rendering.
@@ -4330,7 +4580,12 @@ impl GLProcessorST {
         Ok(())
     }
 
-    fn render_box(&mut self, dst: &TensorImage, detect: &[DetectBox]) -> Result<(), Error> {
+    fn render_box(
+        &mut self,
+        dst_w: usize,
+        dst_h: usize,
+        detect: &[DetectBox],
+    ) -> Result<(), Error> {
         unsafe {
             gls::gl::UseProgram(self.color_program.id);
             let rescale = |x: f32| x * 2.0 - 1.0;
@@ -4342,10 +4597,10 @@ impl GLProcessorST {
                 gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
                 let bbox: [f32; 4] = d.bbox.into();
                 let outer_box = [
-                    bbox[0] - thickness / dst.width() as f32,
-                    bbox[1] - thickness / dst.height() as f32,
-                    bbox[2] + thickness / dst.width() as f32,
-                    bbox[3] + thickness / dst.height() as f32,
+                    bbox[0] - thickness / dst_w as f32,
+                    bbox[1] - thickness / dst_h as f32,
+                    bbox[2] + thickness / dst_w as f32,
+                    bbox[3] + thickness / dst_h as f32,
                 ];
                 let camera_vertices: [f32; 24] = [
                     rescale(bbox[0]),

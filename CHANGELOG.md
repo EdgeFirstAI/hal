@@ -7,6 +7,141 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-03-22
+
+### Added
+
+- **Zero-copy external buffer rendering** (`create_image_from_fd`) across
+  Rust, C, and Python APIs. Enables GPU rendering directly into a
+  caller-owned DMA-BUF — eliminating the `memcpy` between HAL's output
+  buffer and an NPU delegate's input buffer. The caller retains ownership
+  of the fd; HAL borrows it via `dup(fd)`.
+
+  **Rust:**
+  ```rust,ignore
+  let mut dst = processor.create_image_from_fd(
+      vx_fd.as_fd(), 640, 640, PixelFormat::Rgb, DType::U8,
+  )?;
+  processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::letterbox())?;
+  ```
+
+  **Python:**
+  ```python
+  dst = processor.create_image_from_fd(vx_fd, 640, 640, ef.PixelFormat.Rgb)
+  processor.convert(src, dst)
+  ```
+
+  **C:**
+  ```c
+  struct hal_tensor *dst = hal_image_processor_create_image_from_fd(
+      proc, vx_fd, 640, 640, HAL_FOURCC_RGB, HAL_DTYPE_U8);
+  ```
+
+  Returns `Error::NotSupported` if the fd is not DMA-backed (e.g. POSIX
+  shm fd), ensuring the zero-copy contract is enforced at the API boundary.
+
+- **Tensor pixel-format metadata** — `TensorDyn::set_format()` and
+  `TensorDyn::with_format()` attach a `PixelFormat` to any tensor,
+  enabling `convert()` to use raw tensors created via `from_fd()` or
+  `Tensor::new()` as image destinations without going through
+  `create_image()`. Shape validation ensures the format matches the
+  tensor dimensions. Available in Python (`Tensor.set_format()`) and
+  C (`hal_tensor_set_format()`).
+
+- **DMA-BUF fd accessors** — `TensorDyn::dmabuf()` (borrows the fd) and
+  `TensorDyn::dmabuf_clone()` (returns an owned duplicate) for exporting
+  HAL-allocated DMA-BUF buffers to external consumers.
+  `Tensor::<T>::dmabuf()` provides the same on typed tensors. Available
+  in Python (`Tensor.dmabuf_clone()`) and C (`hal_tensor_dmabuf_clone()`).
+
+  Use case: HAL allocates via `create_image()`, consumer imports the fd:
+  ```rust,ignore
+  let hal_dst = processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None)?;
+  let fd = hal_dst.dmabuf_clone()?;  // Error if not DMA-backed
+  delegate.register_buffer(fd)?;
+  ```
+
+- PyPI README (`crates/python/README.md`) with quick-start, zero-copy
+  external buffer examples, and platform support matrix
+
+### Removed
+
+- **`hal_image_processor_convert_ref`** — removed from Rust, C header, and
+  ARCHITECTURE.md. This function was redundant with the `hal_tensor_set_format()`
+  + `hal_image_processor_convert()` two-step and had been a recurring source of
+  safety bugs (use-after-free in v0.9, unsound `ptr::read`/`ManuallyDrop` in
+  v0.10.0). Callers should use:
+  ```c
+  hal_tensor_set_format(dst, fourcc);
+  hal_image_processor_convert(proc, src, dst, rotation, flip, crop);
+  ```
+
+### Fixed
+
+- Corrected errno documentation for `hal_image_processor_create_image_from_fd`
+  in both Rust doc comments and `hal.h` header: `InvalidShape` / `NotAnImage`
+  map to `EINVAL` (not `EIO`)
+
+## [0.10.0] - 2026-03-20
+
+### Changed
+
+- **BREAKING: Unified Tensor API** — `TensorImage` removed from all APIs.
+  The `Tensor` type is now the single tensor type across Rust, C, and Python.
+  - **Python**: `TensorImage(w, h, fmt)` → `Tensor.image(w, h, fmt)`;
+    `TensorImage.load()` → `Tensor.load()`; `FourCC` → `PixelFormat`
+  - **C**: `hal_tensor_image_*` functions replaced by `hal_tensor_*` equivalents
+    (e.g., `hal_tensor_new_image()`, `hal_tensor_load_image()`,
+    `hal_tensor_width()`, `hal_tensor_fourcc()`);
+    `HalTensorImage` removed — use `HalTensor` for all tensors
+  - **Rust**: `TensorDyn` is the unified type-erased tensor;
+    `PyTensor` and `HalTensor` now wrap `TensorDyn` directly
+
+### Added
+
+- `TensorDyn::new()`, `TensorDyn::from_fd()`, `TensorDyn::size()`,
+  `TensorDyn::memory()`, `TensorDyn::reshape()`, `TensorDyn::clone_fd()`
+  methods for complete type-erased tensor operations
+- `HalDtype::F16` variant in C API for float16 tensor support
+- NV12 even-height validation in `Tensor::image()`
+- Semi-planar shape constraint validation in `Tensor::set_format()`
+- **`dtype` parameter on `create_image()`** across Rust, C, and Python APIs.
+  Supports `DType::I8` / `"int8"` for direct signed int8 tensor output;
+  PBO-backed images support `u8` and `i8` byte-sized types, other dtypes
+  prefer DMA-buf when available and fall back to system memory
+- **Int8 GPU shaders** for all GL render paths (DMA, non-DMA, non-DMA
+  planar, PBO-to-PBO). The fragment shader applies XOR 0x80 bias on the
+  GPU, eliminating the CPU readback + XOR post-pass for ~2× faster int8
+  letterbox pipeline on GPU-capable platforms
+- Comprehensive `trace`-level logging in the convert dispatch path for
+  profiling backend selection and per-stage timing
+- **Dual Python wheel builds** (`abi3-py311` and `abi3-py38`). Python 3.11+
+  users get zero-copy buffer protocol support; Python 3.8–3.10 users get a
+  compatible fallback. Pip automatically selects the best wheel
+
+### Fixed
+
+- EGL image cache evict-before-create causing unnecessary cache churn
+  and potential fd accumulation on GREY format fallback
+- Use-after-free in `hal_image_processor_convert_ref` (replaced
+  `Box::from_raw` with `ptr::read` + `ManuallyDrop`)
+- Missing `return Ok(())` in stable `normalize_to_float_16` RGBA path
+  that caused double-processing
+- Clippy `iflet_redundant_pattern_matching` and `collapsible_match` lints
+- Broken `FourCC` imports and variant casing in Python tests
+- Stale `.display()` calls in G2D tests and duplicate `.as_u8()` in GL tests
+- Int8 letterbox bias on all four GL render paths — `glClear` bypasses the
+  fragment shader, so `crop.dst_color` must be XOR'd on the CPU side before
+  calling `glClearColor`
+- Alpha-channel preservation in CPU and G2D int8 XOR bias — now skips
+  alpha bytes for Rgba/Bgra formats, matching GL shader behavior
+- GL auto-backend priority: OpenGL is now preferred over G2D when both
+  are available
+- Pinned Rust toolchain versions in CI to prevent profraw format corruption
+  across build/coverage-processing jobs; `--failure-mode=all` for
+  `llvm-profdata merge` to skip corrupted profraw files from GPU driver
+  crashes
+
 ## [0.9.1] - 2026-03-10
 
 ### Added
@@ -15,7 +150,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   BGRA as a destination format for Cairo/Wayland compositing (ARGB32 on
   little-endian). Supported natively on OpenGL (via `GL_BGRA`) and G2D
   (`G2D_BGRA8888`); CPU backend uses R/B channel swizzle after RGBA
-  conversion. Available in Rust (`BGRA` constant), Python (`FourCC.BGRA`),
+  conversion. Available in Rust (`PixelFormat::Bgra`), Python (`PixelFormat.Bgra`),
   and C (fourcc `"BGRA"`). `draw_masks()` and `draw_masks_proto()` support
   BGRA destination images on the OpenGL backend; CPU mask rendering
   accepts only RGBA/RGB destinations.

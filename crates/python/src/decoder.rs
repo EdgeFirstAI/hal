@@ -8,7 +8,9 @@ use edgefirst_hal::decoder::{
 };
 use edgefirst_hal::image::ImageProcessorTrait;
 
-use crate::image::{PyImageProcessor, PyTensorImage};
+use crate::image::PyImageProcessor;
+use crate::tensor::PyTensor;
+
 use crate::tracker::{PyByteTrack, PyTrackInfo};
 
 /// NMS (Non-Maximum Suppression) mode for filtering overlapping detections.
@@ -920,7 +922,7 @@ impl PyDecoder {
         self_: PyRef<'py, Self>,
         model_output: ListOfReadOnlyArrayGenericDyn,
         processor: &mut PyImageProcessor,
-        dst: &mut PyTensorImage,
+        dst: &mut PyTensor,
         max_boxes: usize,
     ) -> PyResult<PyDetOutput<'py>> {
         let mut output_boxes = Vec::with_capacity(max_boxes);

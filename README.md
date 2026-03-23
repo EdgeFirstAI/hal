@@ -2,7 +2,7 @@
 
 [![Build Status](https://github.com/EdgeFirstAI/hal/workflows/CI/badge.svg)](https://github.com/EdgeFirstAI/hal/actions)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Crates.io](https://img.shields.io/crates/v/edgefirst.svg)](https://crates.io/crates/edgefirst)
+[![Crates.io](https://img.shields.io/crates/v/edgefirst-hal.svg)](https://crates.io/crates/edgefirst-hal)
 [![PyPI](https://img.shields.io/pypi/v/edgefirst-hal.svg)](https://pypi.org/project/edgefirst-hal/)
 
 The EdgeFirst Hardware Abstraction Layer (HAL) is a Rust-based system that provides hardware-accelerated abstractions for computer vision and machine learning tasks on embedded Linux platforms. The HAL consists of multiple specialized crates that work together to provide high-performance image processing, tensor operations, model inference decoding, and object tracking.
@@ -11,7 +11,7 @@ The EdgeFirst Hardware Abstraction Layer (HAL) is a Rust-based system that provi
 
 - ✨ **Zero-Copy Memory Management** - DMA-heap optimized tensors with automatic fallback
 - 🚀 **Hardware-Accelerated Image Processing** - G2D, OpenGL, and optimized CPU paths
-- 🎯 **YOLO Decoder** - YOLOv5/v8/v11 detection and segmentation support
+- 🎯 **YOLO Decoder** - YOLOv5/v8/v11/v26 detection and segmentation support (including end-to-end models)
 - 🔌 **Python Bindings** - PyO3-based API with numpy integration
 - ⚡ **Multi-Object Tracking** - ByteTrack algorithm with Kalman filtering
 - 🔧 **Cross-Platform** - Linux (i.MX optimized), macOS, Windows support
@@ -31,7 +31,7 @@ pip install edgefirst-hal
 #### Rust
 ```toml
 [dependencies]
-edgefirst = "0.1.0"
+edgefirst-hal = "0.10"
 ```
 
 ### Basic Usage
@@ -41,9 +41,9 @@ edgefirst = "0.1.0"
 import edgefirst_hal as ef
 
 # Load and process image
-img = ef.TensorImage.load("image.jpg", ef.FourCC.RGB)
+img = ef.Tensor.load("image.jpg", ef.PixelFormat.Rgb)
 converter = ef.ImageProcessor()
-output = converter.create_image(640, 640, ef.FourCC.RGB)
+output = converter.create_image(640, 640, ef.PixelFormat.Rgb)
 converter.convert(img, output)
 
 # Decode YOLO outputs
@@ -53,13 +53,15 @@ boxes, scores, classes = decoder.decode([output0, output1])
 
 #### Rust
 ```rust
-use edgefirst_hal::image::{TensorImage, ImageProcessor, RGB};
+use edgefirst_image::{load_image, ImageProcessor, ImageProcessorTrait, Rotation, Flip, Crop};
+use edgefirst_tensor::{PixelFormat, DType, TensorDyn};
 
 // Load and process image
-let input = TensorImage::load("image.jpg", Some(RGB), None)?;
+let bytes = std::fs::read("image.jpg")?;
+let input = load_image(&bytes, Some(PixelFormat::Rgb), None)?;
 let mut converter = ImageProcessor::new()?;
-let mut output = converter.create_image(640, 640, RGB)?;
-converter.convert(&input, &mut output, Default::default())?;
+let mut output = converter.create_image(640, 640, PixelFormat::Rgb, DType::U8, None)?;
+converter.convert(&input, &mut output, Rotation::None, Flip::None, Crop::default())?;
 ```
 
 #### C
@@ -67,7 +69,7 @@ converter.convert(&input, &mut output, Default::default())?;
 #include <edgefirst/hal.h>
 
 struct hal_image_processor *proc = hal_image_processor_new();
-struct hal_tensor_image *dst = hal_image_processor_create_image(proc, 640, 640, HAL_FOURCC_RGB);
+struct hal_tensor *dst = hal_image_processor_create_image(proc, 640, 640, HAL_FOURCC_RGB, HAL_DTYPE_U8);
 hal_image_processor_convert(proc, src, dst, HAL_ROTATION_NONE, HAL_FLIP_NONE, NULL);
 ```
 
@@ -77,27 +79,31 @@ hal_image_processor_convert(proc, src, dst, HAL_ROTATION_NONE, HAL_FLIP_NONE, NU
 graph TB
     subgraph "EdgeFirst HAL Ecosystem"
         Python["Python Bindings (edgefirst-hal)<br/>PyO3-based Python API exposing core functionality"]
+        CAPI["C API Bindings (edgefirst-hal-capi)<br/>cbindgen-generated C headers"]
         Main["Main HAL Crate (edgefirst)<br/>Re-exports tensor, image, decoder"]
-        
+
         Python --> Main
-        
+        CAPI --> Main
+
         Tensor["Tensor HAL<br/>Zero-copy memory buffers"]
         Image["Image Converter HAL<br/>Format conversion & resize"]
         Decoder["Decoder HAL<br/>Model output post-processing"]
         Tracker["Tracker HAL<br/>Multi-object tracking"]
-        
+
         Main --> Tensor
         Main --> Image
         Main --> Decoder
-        
+        CAPI --> Tracker
+
         Image --> Tensor
         Image --> G2D["G2D FFI (g2d-sys)<br/>NXP i.MX hardware acceleration"]
     end
-    
+
     Tensor -.-> DMA["Linux DMA-Heap<br/>Shared Memory"]
     Decoder -.-> PostProc["Model Output<br/>Post-Processing"]
-    
+
     style Python fill:#e1f5ff
+    style CAPI fill:#e1f5ff
     style Main fill:#fff4e1
     style Tensor fill:#e8f5e9
     style Image fill:#e8f5e9
@@ -134,9 +140,14 @@ classDiagram
         Standard heap allocation
     }
     
+    class PboTensor~T~ {
+        OpenGL Pixel Buffer Object
+    }
+
     TensorTrait <|.. DmaTensor
     TensorTrait <|.. ShmTensor
     TensorTrait <|.. MemTensor
+    TensorTrait <|.. PboTensor
 ```
 
 **Key Features**:
@@ -196,7 +207,7 @@ classDiagram
 ```
 
 **Supported Operations**:
-- Format conversion (YUYV, NV12, RGB, RGBA, GREY, Planar RGB)
+- Format conversion (YUYV, VYUY, NV12, NV16, RGB, RGBA, BGRA, GREY, Planar RGB, Planar RGBA, RGB int8, Planar RGB int8)
 - Resize with various interpolation methods
 - Rotation (0°, 90°, 180°, 270°)
 - Flip (horizontal, vertical)
@@ -204,26 +215,37 @@ classDiagram
 - Normalization (signed, unsigned, raw)
 
 **Planar RGB Format**:
-Planar RGB (FourCC: 8BPS) stores color channels in separate planes rather than interleaved. This format is particularly useful for:
+Planar RGB (`PixelFormat::PlanarRgb`) stores color channels in separate planes rather than interleaved. This format is particularly useful for:
 - Neural network preprocessing where planar layout is required
 - Hardware accelerators that prefer planar data
 - Efficient SIMD operations on individual color channels
 - GPU texture operations via OpenGL with swizzled grayscale textures
 
-**TensorImage Flow**:
+**Image Processing Flow**:
 ```mermaid
 flowchart TD
     Input[Input Image<br/>JPEG/PNG bytes or raw pixels]
-    TI[TensorImage<br/>Tensor&lt;u8&gt; + FourCC format]
-    Conv[ImageProcessor::convert<br/>1. Check if G2D can handle<br/>2. Fallback to CPU if needed<br/>3. Apply transforms]
-    Output[Output Image<br/>TensorImage or numpy array]
-    
+    TI[TensorDyn<br/>type-erased tensor + PixelFormat]
+    Conv{ImageProcessor::convert<br/>Backend selection}
+    G2D[G2D Acceleration<br/>NXP i.MX only]
+    GL[OpenGL Acceleration<br/>GPU accelerated]
+    CPU[CPU Fallback<br/>fast_image_resize]
+    Output[Output Image<br/>TensorDyn or numpy array]
+
     Input --> TI
     TI --> Conv
-    Conv --> Output
-    
+    Conv -->|Supported on i.MX| G2D
+    Conv -->|Linux with GPU| GL
+    Conv -->|Always available| CPU
+    G2D --> Output
+    GL --> Output
+    CPU --> Output
+
     style TI fill:#e1f5ff
     style Conv fill:#fff4e1
+    style G2D fill:#90ee90
+    style GL fill:#87ceeb
+    style CPU fill:#ffeb9c
     style Output fill:#e8f5e9
 ```
 
@@ -232,10 +254,11 @@ flowchart TD
 **Purpose**: Post-processing for object detection and segmentation model outputs.
 
 **Supported Decoders**:
-- **YOLO** (YOLOv5, YOLOv8, YOLOv11)
+- **YOLO** (YOLOv5, YOLOv8, YOLOv11, YOLOv26)
   - Object detection
   - Instance segmentation
   - Split output format support
+  - End-to-end models (embedded NMS)
   - Mixed data type support (different types per input tensor)
 - **ModelPack** (Au-Zone proprietary format)
   - Detection with anchor-based decoding
@@ -348,11 +371,10 @@ flowchart TD
 **Purpose**: Expose HAL functionality to Python via PyO3.
 
 **Exposed Classes**:
-- `PyTensor`: Generic tensor with numpy buffer protocol
-- `PyTensorImage`: Image container with format metadata
-- `PyImageProcessor`: Image processing operations
-- `PyDecoder`: Model output decoding
-- `FourCC`, `Normalization`, `PyRect`, `PyRotation`, `PyFlip`: Configuration enums
+- `Tensor`: Unified tensor with image support and numpy buffer protocol
+- `ImageProcessor`: Image processing operations
+- `Decoder`: Model output decoding
+- `PixelFormat`, `Normalization`, `Rect`, `Rotation`, `Flip`: Configuration types
 
 **Python Integration**:
 ```mermaid
@@ -407,11 +429,11 @@ format negotiation); reusing them amortizes that cost over thousands of frames.
 let mut converter = ImageProcessor::new()?;
 
 // Create reusable output buffer — allocated once
-let mut output = converter.create_image(640, 640, RGB)?;
+let mut output = converter.create_image(640, 640, PixelFormat::Rgb, DType::U8, None)?;
 
 for frame in camera_frames {
     // Reuse output buffer each iteration — no allocation
-    converter.convert(&frame, &mut output, Default::default())?;
+    converter.convert(&frame, &mut output, Rotation::None, Flip::None, Crop::default())?;
     run_inference(&output)?;
 }
 ```
@@ -421,7 +443,7 @@ for frame in camera_frames {
 converter = ef.ImageProcessor()
 
 # Create reusable output buffer — allocated once
-output = converter.create_image(640, 640, ef.FourCC.RGB)
+output = converter.create_image(640, 640, ef.PixelFormat.Rgb)
 
 for frame in camera_frames:
     # Reuse output buffer each iteration — no allocation
@@ -434,8 +456,8 @@ for frame in camera_frames:
 struct hal_image_processor *proc = hal_image_processor_new();
 
 /* Create reusable output buffer — allocated once */
-struct hal_tensor_image *output = hal_image_processor_create_image(
-    proc, 640, 640, HAL_FOURCC_RGB);
+struct hal_tensor *output = hal_image_processor_create_image(
+    proc, 640, 640, HAL_FOURCC_RGB, HAL_DTYPE_U8);
 
 for (;;) {
     /* Reuse output buffer each iteration — no allocation */
@@ -444,7 +466,7 @@ for (;;) {
     run_inference(output);
 }
 
-hal_tensor_image_free(output);
+hal_tensor_free(output);
 hal_image_processor_free(proc);
 ```
 
@@ -484,19 +506,21 @@ falls back to PBO or heap memory with no API change required.
 ### Image Conversion
 
 ```rust
-use edgefirst_hal::image::{TensorImage, ImageProcessor, RGB};
+use edgefirst_image::{load_image, ImageProcessor, ImageProcessorTrait, Rotation, Flip, Crop};
+use edgefirst_tensor::{PixelFormat, DType, TensorDyn};
 
 // Load image from JPEG
-let input = TensorImage::load("testdata/zidane.jpg", Some(RGB), None)?;
+let bytes = std::fs::read("testdata/zidane.jpg")?;
+let input = load_image(&bytes, Some(PixelFormat::Rgb), None)?;
 
-// Create converter (auto-selects best backend: G2D, OpenGL, CPU)
+// Create converter (auto-selects best backend: OpenGL, G2D, CPU)
 let mut converter = ImageProcessor::new()?;
 
 // Create output buffer with optimal GPU memory (DMA > PBO > Mem)
-let mut output = converter.create_image(640, 640, RGB)?;
+let mut output = converter.create_image(640, 640, PixelFormat::Rgb, DType::U8, None)?;
 
 // Convert and resize
-converter.convert(&input, &mut output, Default::default())?;
+converter.convert(&input, &mut output, Rotation::None, Flip::None, Crop::default())?;
 ```
 
 ### Detection Decoding
@@ -561,13 +585,13 @@ import edgefirst_hal as ef
 import numpy as np
 
 # Load image from file
-tensor_img = ef.TensorImage.load("testdata/zidane.jpg", ef.FourCC.RGB)
+tensor_img = ef.Tensor.load("testdata/zidane.jpg", ef.PixelFormat.Rgb)
 
 # Create converter
 converter = ef.ImageProcessor()
 
 # Create output image with optimal GPU memory (DMA > PBO > Mem)
-output = converter.create_image(640, 640, ef.FourCC.RGB)
+output = converter.create_image(640, 640, ef.PixelFormat.Rgb)
 
 # Resize with hardware acceleration
 converter.convert(tensor_img, output)
@@ -626,7 +650,7 @@ Raw FFI bindings are wrapped in safe Rust types that enforce correct usage at co
 
 ### 7. Python Wrapper Naming Convention
 
-Python wrapper types use a `Py` prefix (e.g., `PyTensor`, `PyTensorImage`) to clearly distinguish them from their Rust counterparts (`Tensor`, `TensorImage`). This convention makes it explicit which types are Python-facing and which are internal Rust types.
+Python wrapper types use a `Py` prefix (e.g., `PyTensor`, `PyPixelFormat`) to clearly distinguish them from their Rust counterparts. The Python `Tensor` class wraps `TensorDyn` internally. This convention makes it explicit which types are Python-facing and which are internal Rust types.
 
 ## Performance Considerations
 
@@ -638,9 +662,9 @@ Python wrapper types use a `Py` prefix (e.g., `PyTensor`, `PyTensorImage`) to cl
 
 ### Image Processing Strategy
 
-1. **G2D**: ~10-50x faster than CPU for format conversion and resize on i.MX
-2. **OpenGL**: GPU-accelerated, good for complex pipelines
-3. **CPU (SIMD)**: Fallback with Rayon parallelization
+1. **OpenGL**: GPU-accelerated pipeline (resize, YUV conversion, letterbox)
+2. **G2D**: NXP i.MX 2D hardware blitter (when format pair is supported)
+3. **CPU**: SIMD + Rayon parallelized fallback for all platforms
 
 ### Decoder Optimization
 
@@ -651,11 +675,11 @@ Python wrapper types use a `Py` prefix (e.g., `PyTensor`, `PyTensorImage`) to cl
 
 ## Thread Safety
 
-All major types implement `Send + Sync`:
-- `Tensor<T>`: Safe to share across threads
-- `TensorImage`: Thread-safe
-- `ImageProcessor`: Thread-local (create per thread)
-- `Decoder`: Thread-safe for read operations
+Thread safety of major types:
+- `Tensor<T>`: `Send + Sync` — safe to share across threads
+- `TensorDyn`: `Send + Sync` — thread-safe
+- `ImageProcessor`: `Send` but **not** `Sync` — create one per thread (GPU contexts are thread-local)
+- `Decoder`: `Send + Sync` — thread-safe for read operations
 
 ## Error Handling
 
@@ -821,7 +845,6 @@ This prints markdown tables to stdout. Copy the relevant sections into [BENCHMAR
 - **zune-jpeg/zune-png**: Image decoding
 - **dma-heap**: Linux DMA allocation
 - **nix**: Unix system calls
-- **four-char-code**: FourCC format codes
 
 ### Internal Dependency Graph
 

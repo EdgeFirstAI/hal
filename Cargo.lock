@@ -538,14 +538,14 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "edgefirst-bench"
-version = "0.9.1"
+version = "0.11.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "edgefirst-decoder"
-version = "0.9.1"
+version = "0.11.0"
 dependencies = [
  "argminmax",
  "edgefirst-bench",
@@ -590,7 +590,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-hal"
-version = "0.9.1"
+version = "0.11.0"
 dependencies = [
  "edgefirst-decoder",
  "edgefirst-image",
@@ -600,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-hal-capi"
-version = "0.9.1"
+version = "0.11.0"
 dependencies = [
  "cbindgen",
  "edgefirst-decoder",
@@ -609,9 +609,9 @@ dependencies = [
  "edgefirst-tensor",
  "edgefirst-tracker",
  "errno",
- "four-char-code",
  "half",
  "libc",
+ "log",
  "ndarray 0.16.1",
  "serde_json",
  "serde_yaml",
@@ -620,7 +620,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-image"
-version = "0.9.1"
+version = "0.11.0"
 dependencies = [
  "ctor",
  "dma-heap",
@@ -655,24 +655,27 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tensor"
-version = "0.9.1"
+version = "0.11.0"
 dependencies = [
  "ctor",
  "dma-heap",
  "edgefirst-bench",
  "env_logger",
+ "half",
  "libc",
  "log",
  "ndarray 0.16.1",
  "nix 0.30.1",
  "num-traits",
  "procfs",
+ "serde",
+ "serde_json",
  "uuid",
 ]
 
 [[package]]
 name = "edgefirst-tracker"
-version = "0.9.1"
+version = "0.11.0"
 dependencies = [
  "enum_dispatch",
  "lapjv",
@@ -685,7 +688,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst_hal"
-version = "0.9.1"
+version = "0.11.0"
 dependencies = [
  "approx",
  "edgefirst-hal",
@@ -1038,7 +1041,7 @@ dependencies = [
 
 [[package]]
 name = "gpu-probe"
-version = "0.9.1"
+version = "0.11.0"
 dependencies = [
  "edgefirst-bench",
  "edgefirst-gbm",
@@ -1059,6 +1062,7 @@ checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
 dependencies = [
  "cfg-if",
  "crunchy",
+ "num-traits",
  "zerocopy",
 ]
 

@@ -447,7 +447,7 @@ class Decoder:
         self,
         model_output: List[np.ndarray],
         processor: ImageProcessor,
-        dst: TensorImage,
+        dst: Tensor,
         max_boxes: int = 100,
     ) -> DetectionOutput:
         """
@@ -466,7 +466,7 @@ class Decoder:
         Args:
             model_output: List of model output tensors (same types as ``decode``).
             processor: ImageProcessor instance for drawing.
-            dst: Destination TensorImage to draw onto. Must be ``RGBA`` or
+            dst: Destination image tensor to draw onto. Must be ``RGBA`` or
                 ``RGB`` for CPU backend, or ``RGBA``/``BGRA``/``RGB`` for
                 OpenGL backend.
             max_boxes: Maximum number of detections to return (default: 100).
@@ -857,8 +857,151 @@ class Tensor:
     def reshape(self, shape: list[int]) -> None: ...
     """Reshape the tensor to the given shape. The total number of elements must remain the same."""
 
+    def set_format(self, format: PixelFormat) -> None:
+        """Attach pixel format metadata to this tensor.
+
+        Validates that the tensor's shape is compatible with the format's
+        layout (packed, planar, or semi-planar). This enables ``from_fd()``
+        tensors to be used as image conversion destinations.
+
+        Args:
+            format: Pixel format to attach.
+
+        Raises:
+            RuntimeError: If the tensor shape doesn't match the format layout.
+        """
+        ...
+
+    if sys.platform == "linux":
+        def dmabuf_clone(self) -> int:
+            """Clone the DMA-BUF file descriptor backing this tensor.
+
+            Returns a new file descriptor that the caller must close.
+
+            Returns:
+                A new file descriptor (int) that the caller must close.
+
+            Raises:
+                RuntimeError: If the tensor is not DMA-backed or fd clone fails.
+            """
+            ...
+
     def map(self) -> TensorMap: ...
     """Returns a mapped view of the tensor data for direct access."""
+
+    @staticmethod
+    def image(
+        width: int,
+        height: int,
+        format: PixelFormat,
+        mem: TensorMemory | None = None,
+    ) -> Tensor:
+        """Create an image tensor with the given dimensions and pixel format.
+
+        Args:
+            width: Image width in pixels.
+            height: Image height in pixels.
+            format: Pixel format for the image data.
+            mem: Optional memory type override. If None, the best available
+                memory type is chosen automatically.
+        """
+        ...
+
+    @staticmethod
+    def load(
+        filename: str,
+        format: PixelFormat | None = None,
+        mem: TensorMemory | None = None,
+    ) -> Tensor:
+        """Load an image from a file, decoding JPEG/PNG automatically.
+
+        Args:
+            filename: Path to the image file.
+            format: Optional destination pixel format. If None, the format is
+                inferred from the file contents.
+            mem: Optional memory type override.
+        """
+        ...
+
+    @staticmethod
+    def load_from_bytes(
+        data: bytes,
+        format: PixelFormat | None = None,
+        mem: TensorMemory | None = None,
+    ) -> Tensor:
+        """Load an image from raw bytes, decoding JPEG/PNG automatically.
+
+        Args:
+            data: Raw image bytes (JPEG or PNG encoded).
+            format: Optional destination pixel format. If None, the format is
+                inferred from the data.
+            mem: Optional memory type override.
+        """
+        ...
+
+    def save_jpeg(self, filename: str, quality: int = 80) -> None:
+        """Save this image tensor as a JPEG file.
+
+        The tensor must have an image pixel format (e.g. RGB, RGBA).
+
+        Args:
+            filename: Output file path.
+            quality: JPEG quality (1-100, default 80).
+        """
+        ...
+
+    def normalize_to_numpy(
+        self,
+        dst: npt.NDArray[np.uint8]
+        | npt.NDArray[np.int8]
+        | npt.NDArray[np.float32]
+        | npt.NDArray[np.float64],
+        normalization: "Normalization" = ...,
+        zero_point: None | int = None,
+    ) -> None:
+        """Normalize image data and write to a numpy array.
+
+        The optional ``zero_point`` parameter specifies the zero point for
+        signed normalization. RGBA images are converted to RGB by dropping
+        the alpha channel.
+
+        Args:
+            dst: Destination numpy array.
+            normalization: Normalization mode (default: DEFAULT).
+            zero_point: Optional zero point for signed normalization.
+        """
+        ...
+
+    def copy_from_numpy(self, src: npt.NDArray[np.uint8]) -> None:
+        """Copy data from a numpy array into this tensor.
+
+        The shape and data type of the numpy array must match the tensor's
+        format.
+
+        Args:
+            src: Source numpy array.
+        """
+        ...
+
+    @property
+    def format(self) -> PixelFormat | None:
+        """Pixel format of this tensor (None if not an image tensor)."""
+        ...
+
+    @property
+    def width(self) -> int | None:
+        """Image width in pixels (None if not an image tensor)."""
+        ...
+
+    @property
+    def height(self) -> int | None:
+        """Image height in pixels (None if not an image tensor)."""
+        ...
+
+    @property
+    def is_planar(self) -> bool:
+        """Whether this image uses a planar pixel layout."""
+        ...
 
 
 class TensorMap:
@@ -874,36 +1017,43 @@ class TensorMap:
     def __exit__(self, _exc_type, _exc_value, _traceback) -> None: ...
 
 
-class FourCC(enum.Enum):
-    YUYV: FourCC
-    """YUYV format (YUV 4:2:2)"""
+class PixelFormat(enum.Enum):
+    """Pixel format for image tensors."""
 
-    RGBA: FourCC
-    """RGBA format (Red, Green, Blue, Alpha)"""
+    Rgb: PixelFormat
+    """Packed RGB [H, W, 3]"""
 
-    BGRA: FourCC
-    """BGRA format (Blue, Green, Red, Alpha). Destination-only format for
+    Rgba: PixelFormat
+    """Packed RGBA [H, W, 4]"""
+
+    Bgra: PixelFormat
+    """Packed BGRA [H, W, 4]. Destination-only format for
     Cairo/Wayland compositing (ARGB32 on little-endian)."""
 
-    RGB: FourCC
-    """RGB format (Red, Green, Blue)"""
+    Grey: PixelFormat
+    """Grayscale [H, W, 1]"""
 
-    NV12: FourCC
-    """NV12 format (YUV 4:2:0)"""
+    Yuyv: PixelFormat
+    """Packed YUV 4:2:2, YUYV byte order [H, W, 2]"""
 
-    NV16: FourCC
-    """NV16 format (YUV 4:2:2)"""
+    Vyuy: PixelFormat
+    """Packed YUV 4:2:2, VYUY byte order [H, W, 2]"""
 
-    GREY: FourCC
-    """Greyscale format"""
+    Nv12: PixelFormat
+    """Semi-planar YUV 4:2:0 [H*3/2, W]"""
 
-    PLANAR_RGB: FourCC
-    """Planar RGB format (Red plane, Green plane, Blue plane)"""
+    Nv16: PixelFormat
+    """Semi-planar YUV 4:2:2 [H*2, W]"""
 
-    PLANAR_RGBA: FourCC
-    """Planar RGBA format (Red plane, Green plane, Blue plane, Alpha plane)"""
+    PlanarRgb: PixelFormat
+    """Planar RGB, channels-first [3, H, W]"""
 
-    def __init__(self, fourcc: str) -> None: ...
+    PlanarRgba: PixelFormat
+    """Planar RGBA, channels-first [4, H, W]"""
+
+    def __init__(self, name: str) -> None:
+        """Create a PixelFormat from a string name (e.g. 'RGBA', 'NV12', 'GREY')."""
+        ...
 
 
 class Normalization(enum.Enum):
@@ -948,133 +1098,6 @@ class Normalization(enum.Enum):
     | `np.float32` | value             |
     | `np.float64` | value             |
     """
-
-
-class TensorImage:
-    def __init__(
-        self,
-        width: int,
-        height: int,
-        fourcc: FourCC = FourCC.RGBA,
-        mem: None | TensorMemory = None,
-    ) -> None:
-        """
-        Create a new TensorImage with the specified width, height, and pixel format.
-        The optional `mem` parameter can be used to specify the type of memory allocation for the image.
-        """
-        ...
-
-    if sys.platform == "linux":
-        @staticmethod
-        def from_fd(
-            fd: int,
-            shape: list[int],
-            fourcc: FourCC,
-        ) -> TensorImage:
-            """
-            Load an image from a file descriptor, inspecting the file descriptor to determine
-            the appropriate tensor type (DMA or SHM) based on the device major and minor numbers.
-
-            The ``shape`` must match the pixel format. Most formats use a 3D shape
-            ``[height, width, channels]`` (interleaved) or ``[channels, height, width]``
-            (planar). The semi-planar formats NV12 and NV16 use a 2D shape because
-            their Y and UV planes have different heights:
-
-            ===============  ==================  ====================================
-            Format           Shape               Description
-            ===============  ==================  ====================================
-            FourCC.RGB       [H, W, 3]           3-channel interleaved
-            FourCC.RGBA      [H, W, 4]           4-channel interleaved
-            FourCC.GREY      [H, W, 1]           Single-channel grayscale
-            FourCC.YUYV      [H, W, 2]           YUV 4:2:2 interleaved
-            FourCC.PLANAR_RGB   [3, H, W]        Channels-first (3 planes)
-            FourCC.PLANAR_RGBA  [4, H, W]        Channels-first (4 planes)
-            FourCC.NV12      [H * 3 // 2, W]     Semi-planar YUV 4:2:0 (2D)
-            FourCC.NV16      [H * 2, W]          Semi-planar YUV 4:2:2 (2D)
-            ===============  ==================  ====================================
-
-            For example, a 1080p NV12 frame has 1080 Y rows plus 540 UV rows,
-            giving shape ``[1620, 1920]``.
-
-            The ``fourcc`` parameter specifies the pixel format of the image data.
-
-            This will take ownership of the file descriptor, and the file descriptor will
-            be closed when the tensor is dropped.
-            """
-            ...
-
-    @staticmethod
-    def load_from_bytes(
-        data: bytes,
-        fourcc: None | FourCC = FourCC.RGBA,
-        mem: None | TensorMemory = None,
-    ) -> TensorImage:
-        """
-        Load a JPEG or PNG image from a bytes object.
-        The `fourcc` parameter can be used to specify the destination pixel format of the image data.
-        The optional `mem` parameter can be used to specify the type of memory allocation for the image.
-        """
-        ...
-
-    @staticmethod
-    def load(
-        filename: str,
-        fourcc: None | FourCC = FourCC.RGBA,
-        mem: None | TensorMemory = None,
-    ) -> TensorImage:
-        """
-        Load a JPEG or PNG image from disk. The `fourcc` parameter can be used to specify the destination pixel format of the image data.
-        The optional `mem` parameter can be used to specify the type of memory allocation for the image.
-        """
-        ...
-
-    def save_jpeg(self, filename: str, quality: int = 80) -> None:
-        """Save the image as a JPEG file to disk with the specified quality (1-100). The image must be RGB or RGBA format."""
-        ...
-
-    def normalize_to_numpy(
-        self,
-        dst: npt.NDArray[np.uint8]
-        | npt.NDArray[np.int8]
-        | npt.NDArray[np.float32]
-        | npt.NDArray[np.float64],
-        normalization: Normalization = Normalization.DEFAULT,
-        zero_point: None | int = None,
-    ) -> None:
-        """
-        Normalize the image data into a NumPy array with the specified data type and normalization method.
-        The optional `zero_point` parameter can be used to specify the zero point for signed normalization.
-        This will also convert RGBA images to RGB by dropping the alpha channel.
-        """
-        ...
-
-    def copy_from_numpy(self, src: npt.NDArray[np.uint8]) -> None:
-        """Copy data from a NumPy array into the image. The shape and data type of the NumPy array must match the image's format."""
-        ...
-
-    def map(self) -> TensorMap:
-        """Returns a mapped view of the image data for direct access."""
-        ...
-
-    @property
-    def format(self) -> FourCC:
-        """The pixel format of the image."""
-        ...
-
-    @property
-    def width(self) -> int:
-        """The width of the image in pixels."""
-        ...
-
-    @property
-    def height(self) -> int:
-        """The height of the image in pixels."""
-        ...
-
-    @property
-    def is_planar(self) -> bool:
-        """If the image format is planar."""
-        ...
 
 
 class Flip(enum.Enum):
@@ -1184,7 +1207,7 @@ class ImageProcessor:
 
     def draw_masks(
         self,
-        dst: TensorImage,
+        dst: Tensor,
         bbox: npt.NDArray[np.float32],
         scores: npt.NDArray[np.float32],
         classes: npt.NDArray[np.uintp],
@@ -1225,8 +1248,8 @@ class ImageProcessor:
 
     def convert(
         self,
-        src: TensorImage,
-        dst: TensorImage,
+        src: Tensor,
+        dst: Tensor,
         rotation: Rotation = Rotation.Rotate0,
         flip: Flip = Flip.NoFlip,
         src_crop: Rect | None = None,
@@ -1238,6 +1261,80 @@ class ImageProcessor:
         The fill color can be used for areas outside the destination crop. The fill color is provided as RGBA values.
         """
         ...
+
+    def create_image(
+        self,
+        width: int,
+        height: int,
+        format: PixelFormat = PixelFormat.Rgba,
+        dtype: str = "uint8",
+    ) -> Tensor:
+        """Create an image tensor with the processor's optimal memory backend.
+
+        Selects the best available backing storage based on hardware capabilities:
+        DMA-buf > PBO (GPU buffer, byte-sized types: uint8, int8) > system memory.
+        Images created this way benefit from zero-copy GPU paths when used with
+        this processor's ``convert()``.
+
+        Args:
+            width: Image width in pixels.
+            height: Image height in pixels.
+            format: Pixel format (default: ``PixelFormat.Rgba``).
+            dtype: Element data type string (default: ``"uint8"``).
+                Supported values: ``"uint8"``, ``"int8"``, ``"uint16"``,
+                ``"int16"``, ``"uint32"``, ``"int32"``, ``"uint64"``,
+                ``"int64"``, ``"float16"``, ``"float32"``, ``"float64"``.
+                PBO is only available for byte-sized types (``"uint8"``,
+                ``"int8"``); other types still prefer DMA-buf when available
+                and otherwise use system memory.
+
+        Returns:
+            A new image ``Tensor`` backed by the optimal memory type.
+        """
+        ...
+
+    if sys.platform == "linux":
+        def create_image_from_fd(
+            self,
+            fd: int,
+            width: int,
+            height: int,
+            format: PixelFormat,
+            dtype: str = "uint8",
+        ) -> Tensor:
+            """Create an image tensor backed by an external DMA-BUF file descriptor.
+
+            The GPU renders directly into this buffer via EGL DMA-BUF import —
+            no CPU copy is needed after ``convert()``. The caller retains
+            ownership of the underlying buffer; the returned tensor borrows
+            it via ``dup(fd)``.
+
+            Args:
+                fd: DMA-BUF file descriptor (caller retains ownership).
+                width: Image width in pixels.
+                height: Image height in pixels.
+                format: Pixel format of the buffer.
+                dtype: Element data type string (default: ``"uint8"``).
+
+            Returns:
+                A new image ``Tensor`` backed by the external DMA-BUF.
+
+            Raises:
+                RuntimeError: If the file descriptor is invalid, dimensions are zero,
+                    the format layout is unsupported, NV12 height is odd, or the
+                    fd clone syscall fails.
+            """
+            ...
+
+    def set_int8_interpolation(self, mode: str) -> None:
+        """Sets the interpolation mode for int8 proto textures.
+
+        Accepts "nearest", "bilinear", or "twopass". Default is "bilinear".
+        Only affects rendering of quantized (int8) proto segmentation masks.
+
+        Args:
+            mode: Interpolation mode string.
+        """
 
 
 class TrackInfo:

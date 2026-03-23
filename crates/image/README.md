@@ -10,7 +10,7 @@ This crate provides hardware-accelerated image loading, format conversion, resiz
 
 ## Features
 
-- **Multiple backends** - Automatic selection of fastest available: G2D → OpenGL → CPU
+- **Multiple backends** — Automatic selection: OpenGL (GPU) → G2D (NXP i.MX) → CPU (fallback)
 - **Format conversion** - RGBA, RGB, NV12, NV16, YUYV, GREY, planar formats
 - **Geometric transforms** - Resize, rotate (90° increments), flip, crop
 - **Zero-copy integration** - Works with `edgefirst-tensor` DMA/SHM buffers
@@ -19,17 +19,18 @@ This crate provides hardware-accelerated image loading, format conversion, resiz
 ## Quick Start
 
 ```rust
-use edgefirst_image::{TensorImage, ImageProcessor, Rotation, Flip, Crop, RGBA};
+use edgefirst_image::{load_image, save_jpeg, ImageProcessor, ImageProcessorTrait, Rotation, Flip, Crop};
+use edgefirst_tensor::{PixelFormat, DType, TensorDyn};
 
 // Load an image
 let bytes = std::fs::read("input.jpg")?;
-let src = TensorImage::load(&bytes, Some(RGBA), None)?;
+let src = load_image(&bytes, Some(PixelFormat::Rgba), None)?;
 
 // Create processor (auto-selects best backend)
 let mut processor = ImageProcessor::new()?;
 
 // Create destination with desired size
-let mut dst = TensorImage::new(640, 640, RGBA, None)?;
+let mut dst = processor.create_image(640, 640, PixelFormat::Rgba, DType::U8, None)?;
 
 // Convert with resize, rotation, letterboxing
 processor.convert(
@@ -41,7 +42,7 @@ processor.convert(
 )?;
 
 // Save result
-dst.save_jpeg("output.jpg", 90)?;
+save_jpeg(&dst, "output.jpg", 90)?;
 ```
 
 ## Backends
@@ -54,15 +55,20 @@ dst.save_jpeg("output.jpg", 90)?;
 
 ## Supported Formats
 
-| FourCC | Description | Channels |
+| Format | Description | Channels |
 |--------|-------------|----------|
-| RGBA | 32-bit RGBA | 4 |
-| RGB | 24-bit RGB | 3 |
-| NV12 | YUV 4:2:0 semi-planar | 1.5 |
-| NV16 | YUV 4:2:2 semi-planar | 2 |
-| YUYV | YUV 4:2:2 packed | 2 |
-| GREY | 8-bit grayscale | 1 |
-| 8BPS | Planar RGB | 3 |
+| `PixelFormat::Rgba` | 32-bit RGBA | 4 |
+| `PixelFormat::Rgb` | 24-bit RGB | 3 |
+| `PixelFormat::Nv12` | YUV 4:2:0 semi-planar | 1.5 |
+| `PixelFormat::Nv16` | YUV 4:2:2 semi-planar | 2 |
+| `PixelFormat::Yuyv` | YUV 4:2:2 packed | 2 |
+| `PixelFormat::Grey` | 8-bit grayscale | 1 |
+| `PixelFormat::PlanarRgb` | Planar RGB | 3 |
+| `PixelFormat::Vyuy` | YUV 4:2:2 packed (VYUY order) | 2 |
+| `PixelFormat::Bgra` | 32-bit BGRA | 4 |
+| `PixelFormat::PlanarRgba` | Planar RGBA | 4 |
+
+Note: Int8 variants (e.g. packed RGB int8, planar RGB int8) use `DType::I8` with the corresponding `PixelFormat` rather than separate format constants.
 
 ## Feature Flags
 
@@ -74,6 +80,117 @@ dst.save_jpeg("output.jpg", 90)?;
 - `EDGEFIRST_DISABLE_G2D` - Disable G2D backend
 - `EDGEFIRST_DISABLE_GL` - Disable OpenGL backend
 - `EDGEFIRST_DISABLE_CPU` - Disable CPU backend
+- `EDGEFIRST_FORCE_BACKEND` — Force a single backend: `cpu`, `g2d`, or `opengl`. Disables fallback chain.
+- `EDGEFIRST_FORCE_TRANSFER` — Force GPU transfer method: `pbo` or `dmabuf`
+- `EDGEFIRST_TENSOR_FORCE_MEM` — Set to `1` to force heap memory (disables DMA/SHM)
+
+## Segmentation Mask Rendering
+
+Three rendering pipelines for YOLO instance segmentation masks:
+
+### Fused GPU Proto Path (`draw_masks_proto`)
+
+Computes `sigmoid(coefficients @ protos)` per-pixel in a fragment shader — no intermediate mask materialization. Preferred for real-time overlay.
+
+```rust,ignore
+let (detections, proto_data) = decoder.decode_quantized_proto(&outputs)?;
+processor.draw_masks_proto(&mut frame, &detections, &proto_data)?;
+```
+
+### Hybrid CPU+GPU Path
+
+CPU materializes binary masks (`materialize_segmentations()`), then OpenGL overlays them. Auto-selected when both CPU and GL backends are available.
+
+### Atlas Decode Path (`decode_masks_atlas`)
+
+Renders all detection masks into a compact vertical strip atlas via GPU, reads back as uint8 arrays. Use when you need per-instance mask pixels for downstream processing.
+
+```rust,ignore
+let masks = processor.decode_masks_atlas(&detections, &proto_data, 640, 640)?;
+```
+
+### Shader Variants
+
+| Variant | Proto Format | Interpolation |
+|---------|-------------|---------------|
+| int8-nearest | R8I quantized | Nearest neighbor |
+| int8-bilinear | R8I quantized | Manual 4-tap bilinear |
+| f32 | R32F float | Hardware GL_LINEAR |
+| f16 | R16F half | Hardware GL_LINEAR |
+
+### Int8 Interpolation Mode
+
+Control quantized proto interpolation quality:
+
+```rust,ignore
+processor.set_int8_interpolation_mode(Int8InterpolationMode::Bilinear);
+```
+
+See [BENCHMARKS.md](../../BENCHMARKS.md) for per-platform performance numbers.
+
+## Zero-Copy Model Input
+
+Use `create_image()` to allocate the destination tensor with the processor's
+optimal memory backend (DMA-buf, PBO, or system memory). This enables
+zero-copy GPU paths that direct `Tensor::new()` allocation cannot achieve:
+
+```rust,ignore
+let mut dst = processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None)?;
+processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::letterbox())?;
+```
+
+If you need to write into a pre-allocated buffer with a specific memory type
+(e.g. an NPU-bound tensor), you can still use direct allocation:
+
+```rust,ignore
+let mut model_input = Tensor::<u8>::new(&[640, 640, 3], None, None)?;
+model_input.set_format(PixelFormat::Rgb)?;
+let mut dst = TensorDyn::from(model_input);
+processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::letterbox())?;
+```
+
+## Zero-Copy External Buffer (Linux)
+
+When integrating with an NPU delegate (e.g. VxDelegate) that owns its own
+DMA-BUF buffers, use `create_image_from_fd()` to render directly into the
+delegate's buffer — eliminating the `memcpy` between HAL's buffer and the
+delegate's buffer:
+
+```rust,ignore
+// UC1: Render into VxDelegate's DMA-BUF — zero copies
+let mut dst = processor.create_image_from_fd(
+    vx_fd.as_fd(),       // borrow — caller keeps ownership
+    640, 640,
+    PixelFormat::Rgb,
+    DType::U8,
+)?;
+processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::letterbox())?;
+// dst's backing memory IS vx_fd — no memcpy needed
+```
+
+For the reverse direction (HAL allocates, consumer imports):
+
+```rust,ignore
+let hal_dst = processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None)?;
+let fd = hal_dst.dmabuf_clone()?;  // Error if not DMA-backed
+vxdelegate.register_buffer(fd)?;
+```
+
+**Performance tip:** When rotating through a pool of DMA-BUFs (e.g. 2-3
+from VxDelegate), create the `TensorDyn` wrappers once at init and reuse
+them across frames. This avoids EGL image cache misses (~100-300us each).
+
+## Multiplane NV12/NV16
+
+For V4L2 multi-planar DMA-BUF buffers (separate Y and UV file descriptors):
+
+```rust,ignore
+let img = Tensor::from_planes(y_tensor, uv_tensor, PixelFormat::Nv12)?;
+let src = TensorDyn::from(img);
+processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())?;
+```
+
+The OpenGL backend imports each plane's DMA-BUF fd separately for zero-copy GPU access.
 
 ## License
 
