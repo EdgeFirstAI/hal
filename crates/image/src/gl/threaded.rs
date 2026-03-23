@@ -149,7 +149,6 @@ struct SendablePtr<T: Send> {
 unsafe impl<T> Send for SendablePtr<T> where T: Send {}
 
 /// Extract a human-readable message from a `catch_unwind` panic payload.
-/// Extract a human-readable message from a `catch_unwind` panic payload.
 fn panic_message(info: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = info.downcast_ref::<&str>() {
         s.to_string()
@@ -476,7 +475,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
         let (err_send, err_recv) = tokio::sync::oneshot::channel();
         self.sender
             .as_ref()
-            .ok_or(Error::Internal("GL processor is shutting down".to_string()))?
+            .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
             .blocking_send(GLProcessorMessage::ImageConvert(
                 SendablePtr {
                     ptr: NonNull::from(src),
@@ -506,7 +505,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
         let (err_send, err_recv) = tokio::sync::oneshot::channel();
         self.sender
             .as_ref()
-            .ok_or(Error::Internal("GL processor is shutting down".to_string()))?
+            .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
             .blocking_send(GLProcessorMessage::DrawMasks(
                 SendablePtr {
                     ptr: NonNull::from(dst),
@@ -537,7 +536,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
         let (err_send, err_recv) = tokio::sync::oneshot::channel();
         self.sender
             .as_ref()
-            .ok_or(Error::Internal("GL processor is shutting down".to_string()))?
+            .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
             .blocking_send(GLProcessorMessage::DrawMasksProto(
                 SendablePtr {
                     ptr: NonNull::from(dst),
@@ -576,7 +575,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
         let (err_send, err_recv) = tokio::sync::oneshot::channel();
         self.sender
             .as_ref()
-            .ok_or(Error::Internal("GL processor is shutting down".to_string()))?
+            .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
             .blocking_send(GLProcessorMessage::SetColors(colors.to_vec(), err_send))
             .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
         err_recv.blocking_recv().map_err(|_| {
@@ -594,7 +593,7 @@ impl GLProcessorThreaded {
         let (err_send, err_recv) = tokio::sync::oneshot::channel();
         self.sender
             .as_ref()
-            .ok_or(Error::Internal("GL processor is shutting down".to_string()))?
+            .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
             .blocking_send(GLProcessorMessage::SetInt8Interpolation(mode, err_send))
             .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
         err_recv.blocking_recv().map_err(|_| {
@@ -617,7 +616,7 @@ impl GLProcessorThreaded {
         let (resp_send, resp_recv) = tokio::sync::oneshot::channel();
         self.sender
             .as_ref()
-            .ok_or(Error::Internal("GL processor is shutting down".to_string()))?
+            .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
             .blocking_send(GLProcessorMessage::DecodeMasksAtlas(
                 SendablePtr {
                     ptr: NonNull::new(detect.as_ptr() as *mut DetectBox).unwrap(),
