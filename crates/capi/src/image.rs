@@ -2195,7 +2195,7 @@ mod tests {
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     fn make_test_fd() -> c_int {
-        let mut fds = [0c_int; 2];
+        let mut fds: [c_int; 2] = [0; 2];
         unsafe { libc::pipe(fds.as_mut_ptr()) };
         unsafe { libc::close(fds[1]) };
         fds[0]

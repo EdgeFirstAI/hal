@@ -1470,8 +1470,8 @@ impl GLProcessorST {
             .unwrap_or((false, false));
         if is_vivante {
             log::warn!(
-                "Vivante GPU detected — NV12 → planar RGB conversions will be \
-                 blocked to avoid unrecoverable GPU hang (see VSI_GPU_NV12_BUG.md)"
+                "Vivante GPU detected — NV12 → planar RGB conversions will use \
+                 two-pass workaround to avoid GPU hang (see VSI_GPU_NV12_BUG.md)"
             );
         }
         if is_software_renderer {
@@ -3790,10 +3790,9 @@ impl GLProcessorST {
                 (fd, plane0_pitch * height)
             };
             let plane1_pitch = if let Some(chroma) = src.chroma() {
-                // Multiplane: use chroma's own stride, or fall back to Y pitch
-                // (chroma tensors from from_planes() have no format, so they
-                // can't carry a row_stride — use the luma pitch since NV12 UV
-                // row width in bytes equals Y row width)
+                // Multiplane: use chroma's explicit stride if set (via
+                // set_row_stride_unchecked during import), or fall back to
+                // the luma pitch (NV12 UV row width in bytes equals Y width)
                 chroma.effective_row_stride().unwrap_or(plane0_pitch)
             } else {
                 // Contiguous NV12: UV stride matches Y stride
