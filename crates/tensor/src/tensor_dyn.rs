@@ -207,6 +207,22 @@ impl TensorDyn {
         Ok(self)
     }
 
+    /// Byte offset within the DMA-BUF where image data starts (`None` = 0).
+    pub fn plane_offset(&self) -> Option<usize> {
+        dispatch!(self, plane_offset)
+    }
+
+    /// Set the byte offset within the DMA-BUF where image data starts.
+    pub fn set_plane_offset(&mut self, offset: usize) {
+        dispatch!(self, set_plane_offset, offset)
+    }
+
+    /// Builder-style: set plane offset, consuming and returning self.
+    pub fn with_plane_offset(mut self, offset: usize) -> Self {
+        self.set_plane_offset(offset);
+        self
+    }
+
     /// Clone the file descriptor associated with this tensor.
     #[cfg(unix)]
     pub fn clone_fd(&self) -> crate::Result<std::os::fd::OwnedFd> {
@@ -706,5 +722,91 @@ mod tests {
         t.set_row_stride(512).unwrap();
         let err = t.map();
         assert!(err.is_err());
+    }
+
+    // ── plane_offset tests ──────────────────────────────────────────
+
+    #[test]
+    fn plane_offset_default_none() {
+        let t = TensorDyn::image(100, 100, PixelFormat::Rgba, DType::U8, None).unwrap();
+        assert_eq!(t.plane_offset(), None);
+    }
+
+    #[test]
+    fn set_plane_offset_basic() {
+        let mut t = TensorDyn::image(100, 100, PixelFormat::Rgba, DType::U8, None).unwrap();
+        t.set_plane_offset(4096);
+        assert_eq!(t.plane_offset(), Some(4096));
+    }
+
+    #[test]
+    fn set_plane_offset_zero() {
+        let mut t = TensorDyn::image(100, 100, PixelFormat::Rgb, DType::U8, None).unwrap();
+        t.set_plane_offset(0);
+        assert_eq!(t.plane_offset(), Some(0));
+    }
+
+    #[test]
+    fn set_plane_offset_no_format() {
+        // plane_offset does not require format (it is format-independent)
+        let mut t = TensorDyn::new(&[480, 640, 3], DType::U8, None, None).unwrap();
+        t.set_plane_offset(4096);
+        assert_eq!(t.plane_offset(), Some(4096));
+    }
+
+    #[test]
+    fn with_plane_offset_builder() {
+        let t = TensorDyn::image(100, 100, PixelFormat::Rgba, DType::U8, None)
+            .unwrap()
+            .with_plane_offset(8192);
+        assert_eq!(t.plane_offset(), Some(8192));
+    }
+
+    #[test]
+    fn set_format_clears_plane_offset() {
+        let mut t = TensorDyn::new(&[480, 640, 3], DType::U8, None, None).unwrap();
+        t.set_format(PixelFormat::Rgb).unwrap();
+        t.set_plane_offset(4096);
+        assert_eq!(t.plane_offset(), Some(4096));
+
+        // Re-set same format — offset preserved
+        t.set_format(PixelFormat::Rgb).unwrap();
+        assert_eq!(t.plane_offset(), Some(4096));
+
+        // Reshape clears everything
+        t.reshape(&[480 * 640 * 3]).unwrap();
+        assert_eq!(t.plane_offset(), None);
+        assert_eq!(t.format(), None);
+    }
+
+    #[test]
+    fn map_rejects_offset_tensor() {
+        let mut t =
+            Tensor::<u8>::image(100, 100, PixelFormat::Rgba, Some(TensorMemory::Mem)).unwrap();
+        // Map works before offset is set
+        assert!(t.map().is_ok());
+        // After setting non-zero offset, map should be rejected
+        t.set_plane_offset(4096);
+        assert!(t.map().is_err());
+    }
+
+    #[test]
+    fn map_accepts_zero_offset_tensor() {
+        let mut t =
+            Tensor::<u8>::image(100, 100, PixelFormat::Rgba, Some(TensorMemory::Mem)).unwrap();
+        t.set_plane_offset(0);
+        // Zero offset is fine for CPU mapping
+        assert!(t.map().is_ok());
+    }
+
+    #[test]
+    fn from_planes_propagates_plane_offset() {
+        let mut luma =
+            Tensor::<u8>::new(&[480, 640], Some(TensorMemory::Mem), Some("luma")).unwrap();
+        luma.set_plane_offset(4096);
+        let chroma =
+            Tensor::<u8>::new(&[240, 640], Some(TensorMemory::Mem), Some("chroma")).unwrap();
+        let combined = Tensor::<u8>::from_planes(luma, chroma, PixelFormat::Nv12).unwrap();
+        assert_eq!(combined.plane_offset(), Some(4096));
     }
 }

@@ -1233,21 +1233,25 @@ class ImageProcessor:
         ...
 
     if sys.platform == "linux":
-        def create_image_from_fd(
+        def import_image(
             self,
             fd: int,
             width: int,
             height: int,
             format: PixelFormat,
             dtype: str = "uint8",
-            row_stride: int | None = None,
+            stride: int | None = None,
+            offset: int | None = None,
+            chroma_fd: int | None = None,
+            chroma_stride: int | None = None,
+            chroma_offset: int | None = None,
         ) -> Tensor:
-            """Create an image tensor backed by an external DMA-BUF file descriptor.
+            """Import an external DMA-BUF image.
 
-            The GPU renders directly into this buffer via EGL DMA-BUF import —
-            no CPU copy is needed after ``convert()``. The caller retains
-            ownership of the underlying buffer; the returned tensor borrows
-            it via ``dup(fd)``.
+            The fd is ``dup()``'d immediately — the caller retains ownership.
+            The GPU renders directly into this buffer via EGL DMA-BUF import.
+
+            For multiplane NV12/NV16, pass ``chroma_fd`` for the UV plane.
 
             Args:
                 fd: DMA-BUF file descriptor (caller retains ownership).
@@ -1255,17 +1259,24 @@ class ImageProcessor:
                 height: Image height in pixels.
                 format: Pixel format of the buffer.
                 dtype: Element data type string (default: ``"uint8"``).
-                row_stride: Row stride in bytes for buffers with row padding
-                    (default: ``None`` = tightly packed). Use when the buffer
-                    was allocated by V4L2 or GStreamer with alignment padding.
+                stride: Row stride in bytes for the image plane
+                    (default: ``None`` = tightly packed).
+                offset: Byte offset within the DMA-BUF where image data starts
+                    (default: ``None`` = 0).
+                chroma_fd: DMA-BUF fd for the UV chroma plane, for multiplane
+                    NV12/NV16 (default: ``None`` = single-plane).
+                chroma_stride: Row stride in bytes for the chroma plane
+                    (default: ``None`` = tightly packed).
+                chroma_offset: Byte offset within the chroma DMA-BUF where
+                    data starts (default: ``None`` = 0).
 
             Returns:
-                A new image ``Tensor`` backed by the external DMA-BUF.
+                A new image ``Tensor`` backed by the external DMA-BUF(s).
 
             Raises:
-                RuntimeError: If the file descriptor is invalid, dimensions are zero,
+                RuntimeError: If a file descriptor is invalid, dimensions are zero,
                     the format layout is unsupported, NV12 height is odd, the
-                    fd clone syscall fails, or stride is smaller than the minimum.
+                    fd dup syscall fails, or stride is smaller than the minimum.
             """
             ...
 

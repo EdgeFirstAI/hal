@@ -34,7 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **C:**
   ```c
   struct hal_tensor *dst = hal_image_processor_create_image_from_fd(
-      proc, vx_fd, 640, 640, HAL_FOURCC_RGB, HAL_DTYPE_U8);
+      proc, vx_fd, 640, 640, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8);
   ```
 
   Returns `Error::NotSupported` if the fd is not DMA-backed (e.g. POSIX
@@ -72,7 +72,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   safety bugs (use-after-free in v0.9, unsound `ptr::read`/`ManuallyDrop` in
   v0.10.0). Callers should use:
   ```c
-  hal_tensor_set_format(dst, fourcc);
+  hal_tensor_set_format(dst, format);
   hal_image_processor_convert(proc, src, dst, rotation, flip, crop);
   ```
 
@@ -92,7 +92,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `TensorImage.load()` → `Tensor.load()`; `FourCC` → `PixelFormat`
   - **C**: `hal_tensor_image_*` functions replaced by `hal_tensor_*` equivalents
     (e.g., `hal_tensor_new_image()`, `hal_tensor_load_image()`,
-    `hal_tensor_width()`, `hal_tensor_fourcc()`);
+    `hal_tensor_width()`, `hal_tensor_pixel_format()`);
     `HalTensorImage` removed — use `HalTensor` for all tensors
   - **Rust**: `TensorDyn` is the unified type-erased tensor;
     `PyTensor` and `HalTensor` now wrap `TensorDyn` directly

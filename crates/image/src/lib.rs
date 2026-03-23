@@ -885,15 +885,17 @@ impl ImageProcessor {
         )?)
     }
 
-    /// Create an image tensor backed by an external DMA-BUF file descriptor.
+    /// Import an external DMA-BUF image.
     ///
-    /// The GPU renders directly into this buffer via EGL DMA-BUF import —
-    /// no CPU copy is needed after `convert()`. The caller retains ownership
-    /// of the underlying buffer; the returned tensor borrows it via `dup(fd)`.
+    /// Each [`PlaneDescriptor`] owns an already-duped fd; this method
+    /// consumes the descriptors and takes ownership of those fds (whether
+    /// the call succeeds or fails).
     ///
     /// # Arguments
     ///
-    /// * `fd` - Borrowed reference to the DMA-BUF file descriptor
+    /// * `image` - Plane descriptor for the primary (or only) plane
+    /// * `chroma` - Optional plane descriptor for the UV chroma plane
+    ///   (required for multiplane NV12)
     /// * `width` - Image width in pixels
     /// * `height` - Image height in pixels
     /// * `format` - Pixel format of the buffer
@@ -901,107 +903,191 @@ impl ImageProcessor {
     ///
     /// # Returns
     ///
-    /// A `TensorDyn` configured as an image with the given format, backed by a
-    /// `dup`'d copy of the caller's file descriptor.
-    ///
-    /// # Platform
-    ///
-    /// Linux only. Returns `Error::NotSupported` on other platforms.
+    /// A `TensorDyn` configured as an image.
     ///
     /// # Errors
     ///
-    /// Returns an error if the fd clone fails or the resulting shape is
-    /// invalid for the given format.
+    /// * [`Error::NotSupported`] if `chroma` is `Some` for a non-semi-planar
+    ///   format, or multiplane NV16 (not yet supported), or the fd is not
+    ///   DMA-backed
+    /// * [`Error::InvalidShape`] if NV12 height is odd
+    ///
+    /// # Platform
+    ///
+    /// Linux only.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// use edgefirst_tensor::PlaneDescriptor;
+    ///
+    /// // Single-plane RGBA
+    /// let pd = PlaneDescriptor::new(fd.as_fd())?;
+    /// let src = proc.import_image(pd, None, 1920, 1080, PixelFormat::Rgba, DType::U8)?;
+    ///
+    /// // Multi-plane NV12 with stride
+    /// let y_pd = PlaneDescriptor::new(y_fd.as_fd())?.with_stride(2048);
+    /// let uv_pd = PlaneDescriptor::new(uv_fd.as_fd())?.with_stride(2048);
+    /// let src = proc.import_image(y_pd, Some(uv_pd), 1920, 1080,
+    ///                             PixelFormat::Nv12, DType::U8)?;
+    /// ```
     #[cfg(target_os = "linux")]
-    pub fn create_image_from_fd(
+    pub fn import_image(
         &self,
-        fd: std::os::fd::BorrowedFd<'_>,
+        image: edgefirst_tensor::PlaneDescriptor,
+        chroma: Option<edgefirst_tensor::PlaneDescriptor>,
         width: usize,
         height: usize,
         format: PixelFormat,
         dtype: DType,
     ) -> Result<TensorDyn> {
-        let owned = fd.try_clone_to_owned().map_err(Error::Io)?;
-        let shape = match format.layout() {
-            PixelLayout::Packed => vec![height, width, format.channels()],
-            PixelLayout::Planar => vec![format.channels(), height, width],
-            PixelLayout::SemiPlanar => {
-                let total_h = match format {
-                    PixelFormat::Nv12 => {
-                        if !height.is_multiple_of(2) {
-                            return Err(Error::InvalidShape(format!(
-                                "NV12 requires even height, got {height}"
-                            )));
-                        }
-                        height * 3 / 2
-                    }
-                    PixelFormat::Nv16 => height * 2,
-                    _ => {
-                        return Err(Error::InvalidShape(format!(
-                            "unknown semi-planar height multiplier for {format:?}"
-                        )))
-                    }
-                };
-                vec![total_h, width]
-            }
-            _ => {
+        use edgefirst_tensor::{Tensor, TensorMemory};
+
+        // Capture stride/offset from descriptors before consuming them
+        let image_stride = image.stride();
+        let image_offset = image.offset();
+        let chroma_stride = chroma.as_ref().and_then(|c| c.stride());
+        let chroma_offset = chroma.as_ref().and_then(|c| c.offset());
+
+        if let Some(chroma_pd) = chroma {
+            // ── Multiplane path ──────────────────────────────────────
+            if format.layout() != PixelLayout::SemiPlanar {
                 return Err(Error::NotSupported(format!(
-                    "unsupported pixel layout for create_image_from_fd: {:?}",
-                    format.layout()
+                    "import_image with chroma requires a semi-planar format, got {format:?}"
                 )));
             }
-        };
-        let tensor = TensorDyn::from_fd(owned, &shape, dtype, None)?;
-        if tensor.memory() != TensorMemory::Dma {
-            return Err(Error::NotSupported(format!(
-                "create_image_from_fd requires DMA-backed fd, got {:?}",
-                tensor.memory()
-            )));
-        }
-        Ok(tensor.with_format(format)?)
-    }
 
-    /// Create an image from a DMA-BUF fd with an explicit row stride.
-    ///
-    /// Use this when the external buffer has row padding (stride > width *
-    /// bytes_per_pixel), common with V4L2 and GStreamer allocators that align
-    /// rows to cache-line or tile boundaries. The stride is forwarded to the
-    /// EGL DMA-BUF import attributes so the GPU interprets the padded layout
-    /// correctly.
-    ///
-    /// # Arguments
-    ///
-    /// * `fd` - Borrowed reference to the DMA-BUF file descriptor
-    /// * `width` - Image width in pixels
-    /// * `height` - Image height in pixels
-    /// * `format` - Pixel format of the buffer
-    /// * `dtype` - Element data type (e.g. `DType::U8`)
-    /// * `row_stride` - Row stride in bytes (must be >= width * channels for
-    ///   packed formats, or >= width for planar/semi-planar formats)
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// * The fd clone syscall fails
-    /// * The shape is invalid for the given format (e.g. odd height for NV12)
-    /// * `row_stride` is less than the minimum for the format and width
-    /// * The format layout is unsupported
-    ///
-    /// # Platform
-    ///
-    /// Linux only (`#[cfg(target_os = "linux")]`).
-    #[cfg(target_os = "linux")]
-    pub fn create_image_from_fd_with_stride(
-        &self,
-        fd: std::os::fd::BorrowedFd<'_>,
-        width: usize,
-        height: usize,
-        format: PixelFormat,
-        dtype: DType,
-        row_stride: usize,
-    ) -> Result<TensorDyn> {
-        let tensor = self.create_image_from_fd(fd, width, height, format, dtype)?;
-        Ok(tensor.with_row_stride(row_stride)?)
+            let chroma_h = match format {
+                PixelFormat::Nv12 => {
+                    if !height.is_multiple_of(2) {
+                        return Err(Error::InvalidShape(format!(
+                            "NV12 requires even height, got {height}"
+                        )));
+                    }
+                    height / 2
+                }
+                // NV16 multiplane will be supported in a future release;
+                // the GL backend currently only handles NV12 plane1 attributes.
+                PixelFormat::Nv16 => {
+                    return Err(Error::NotSupported(
+                        "multiplane NV16 is not yet supported; use contiguous NV16 instead".into(),
+                    ))
+                }
+                _ => {
+                    return Err(Error::NotSupported(format!(
+                        "unsupported semi-planar format: {format:?}"
+                    )))
+                }
+            };
+
+            let luma = Tensor::<u8>::from_fd(image.into_fd(), &[height, width], Some("luma"))?;
+            if luma.memory() != TensorMemory::Dma {
+                return Err(Error::NotSupported(format!(
+                    "luma fd must be DMA-backed, got {:?}",
+                    luma.memory()
+                )));
+            }
+
+            let chroma_tensor =
+                Tensor::<u8>::from_fd(chroma_pd.into_fd(), &[chroma_h, width], Some("chroma"))?;
+            if chroma_tensor.memory() != TensorMemory::Dma {
+                return Err(Error::NotSupported(format!(
+                    "chroma fd must be DMA-backed, got {:?}",
+                    chroma_tensor.memory()
+                )));
+            }
+
+            // from_planes creates the combined tensor with format set,
+            // preserving luma's row_stride (currently None since luma was raw).
+            let mut tensor = Tensor::<u8>::from_planes(luma, chroma_tensor, format)?;
+
+            // Apply stride/offset to the combined tensor (luma plane)
+            if let Some(s) = image_stride {
+                tensor.set_row_stride(s)?;
+            }
+            if let Some(o) = image_offset {
+                tensor.set_plane_offset(o);
+            }
+
+            // Apply stride/offset to the chroma sub-tensor.
+            // The chroma tensor is a raw 2D [chroma_h, width] tensor without
+            // format metadata, so we validate stride manually rather than
+            // using set_row_stride (which requires format).
+            if let Some(chroma_ref) = tensor.chroma_mut() {
+                if let Some(s) = chroma_stride {
+                    if s < width {
+                        return Err(Error::InvalidShape(format!(
+                            "chroma stride {s} < minimum {width} for {format:?}"
+                        )));
+                    }
+                    chroma_ref.set_row_stride_unchecked(s);
+                }
+                if let Some(o) = chroma_offset {
+                    chroma_ref.set_plane_offset(o);
+                }
+            }
+
+            if dtype == DType::I8 {
+                // SAFETY: Tensor<u8> and Tensor<i8> have identical layout because
+                // the struct contains only type-erased storage (OwnedFd, shape, name),
+                // no inline T values. This assertion catches layout drift at compile time.
+                const {
+                    assert!(std::mem::size_of::<Tensor<u8>>() == std::mem::size_of::<Tensor<i8>>());
+                    assert!(
+                        std::mem::align_of::<Tensor<u8>>() == std::mem::align_of::<Tensor<i8>>()
+                    );
+                }
+                let tensor_i8: Tensor<i8> = unsafe { std::mem::transmute(tensor) };
+                return Ok(TensorDyn::from(tensor_i8));
+            }
+            Ok(TensorDyn::from(tensor))
+        } else {
+            // ── Single-plane path ────────────────────────────────────
+            let shape = match format.layout() {
+                PixelLayout::Packed => vec![height, width, format.channels()],
+                PixelLayout::Planar => vec![format.channels(), height, width],
+                PixelLayout::SemiPlanar => {
+                    let total_h = match format {
+                        PixelFormat::Nv12 => {
+                            if !height.is_multiple_of(2) {
+                                return Err(Error::InvalidShape(format!(
+                                    "NV12 requires even height, got {height}"
+                                )));
+                            }
+                            height * 3 / 2
+                        }
+                        PixelFormat::Nv16 => height * 2,
+                        _ => {
+                            return Err(Error::InvalidShape(format!(
+                                "unknown semi-planar height multiplier for {format:?}"
+                            )))
+                        }
+                    };
+                    vec![total_h, width]
+                }
+                _ => {
+                    return Err(Error::NotSupported(format!(
+                        "unsupported pixel layout for import_image: {:?}",
+                        format.layout()
+                    )));
+                }
+            };
+            let tensor = TensorDyn::from_fd(image.into_fd(), &shape, dtype, None)?;
+            if tensor.memory() != TensorMemory::Dma {
+                return Err(Error::NotSupported(format!(
+                    "import_image requires DMA-backed fd, got {:?}",
+                    tensor.memory()
+                )));
+            }
+            let mut tensor = tensor.with_format(format)?;
+            if let Some(s) = image_stride {
+                tensor.set_row_stride(s)?;
+            }
+            if let Some(o) = image_offset {
+                tensor.set_plane_offset(o);
+            }
+            Ok(tensor)
+        }
     }
 }
 

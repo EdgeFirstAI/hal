@@ -13,7 +13,7 @@ use edgefirst_tensor::{DType, TensorDyn, TensorMap, TensorMapTrait, TensorMemory
 use libc::{c_char, c_int, size_t};
 
 #[cfg(unix)]
-use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::IntoRawFd;
 
 /// Data type of tensor elements.
 ///
@@ -273,17 +273,33 @@ pub unsafe extern "C" fn hal_tensor_new(
 
 /// Create a new tensor from an existing file descriptor (Linux only).
 ///
-/// Takes ownership of the file descriptor - caller must NOT close it.
+/// The fd is duplicated internally — the caller retains ownership of the
+/// original fd and must close it when done. This is consistent with all
+/// other fd-accepting APIs in this library.
+///
+/// **EGL image cache interaction**: Each call to this function allocates a
+/// new `BufferIdentity` with a globally unique ID. The OpenGL backend uses
+/// `(BufferIdentity.id, chroma_id)` as the EGL image cache key, so a new
+/// tensor object created from the same underlying fd will always produce a
+/// cache miss. To benefit from EGL image cache hits across frames, reuse the
+/// same tensor object — do not recreate it from the fd every frame.
+///
+/// **Live-memory semantics**: When the underlying DMA-BUF contains new frame
+/// data (e.g., written by a V4L2 decoder), the tensor wrapper remains valid
+/// — EGLImage is a handle to physical memory, not a snapshot. Content updates
+/// written to the DMA-BUF between `convert()` calls are visible to the GPU on
+/// the next call, provided the caller does not write to the buffer while a
+/// `convert()` is in progress.
 ///
 /// @param dtype Data type of tensor elements (HAL_DTYPE_*)
-/// @param fd File descriptor for DMA/SHM buffer (ownership transferred)
+/// @param fd File descriptor for DMA/SHM buffer (caller retains ownership)
 /// @param shape Array of dimension sizes (ndim elements)
 /// @param ndim Number of dimensions (1-8)
 /// @param name Optional tensor name for debugging (can be NULL)
 /// @return New tensor handle on success, NULL on error
 /// @par Errors (errno):
 /// - EINVAL: Invalid argument (NULL shape, ndim is 0, invalid fd)
-/// - ENOMEM: Memory allocation failed
+/// - EIO: Failed to duplicate fd or create tensor
 /// - ENOTSUP: Not supported on this platform (non-Unix)
 #[no_mangle]
 #[cfg(unix)]
@@ -301,7 +317,12 @@ pub unsafe extern "C" fn hal_tensor_from_fd(
 
     let shape_slice = unsafe { std::slice::from_raw_parts(shape, ndim) };
     let name_opt = unsafe { c_str_to_option(name) };
-    let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // Dup the fd — caller retains ownership of the original.
+    let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+    let owned_fd = match borrowed.try_clone_to_owned() {
+        Ok(fd) => fd,
+        Err(_) => return set_error_null(libc::EIO),
+    };
     let dt: DType = dtype.into();
 
     let tensor = try_or_null!(
