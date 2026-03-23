@@ -2167,6 +2167,9 @@ mod image_tests {
     }
 
     #[test]
+    #[ignore] // Hangs on desktop platforms where DMA-buf is unavailable and PBO
+              // fallback triggers a GPU driver hang during SHM→texture upload (e.g.,
+              // NVIDIA without /dev/dma_heap permissions). Works on embedded targets.
     fn test_crop_skip() {
         let file = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),

@@ -80,6 +80,9 @@ pub struct GLProcessorST {
     /// Whether the GPU is a Verisilicon/Vivante core (detected via GL_RENDERER).
     /// Used to block operations known to cause unrecoverable GPU hangs.
     is_vivante: bool,
+    /// Whether the renderer is software-based (llvmpipe, softpipe, swrast).
+    /// PBO transfers are disabled on software renderers because readback is unreliable.
+    is_software_renderer: bool,
     /// Intermediate RGBA texture for two-pass packed RGB conversion.
     /// Pass 1 renders YUYV/NV12→RGBA here; Pass 2 packs RGBA→RGB to DMA dest.
     packed_rgb_intermediate_tex: Texture,
@@ -284,7 +287,8 @@ impl GLProcessorST {
                 .map_or(std::ptr::null(), |p| p as *const _)
         });
 
-        let (has_float_linear, has_bgra, is_vivante) = Self::gl_check_support()?;
+        let (has_float_linear, has_bgra, is_vivante, is_software_renderer) =
+            Self::gl_check_support()?;
 
         // Uploads and downloads are all packed with no alignment requirements
         unsafe {
@@ -426,6 +430,7 @@ impl GLProcessorST {
             last_bound_src_egl: None,
             bgra_warned: false,
             is_vivante,
+            is_software_renderer,
             packed_rgb_intermediate_tex: Texture::new(),
             packed_rgb_fbo: FrameBuffer::new(),
             packed_rgb_intermediate_size: (0, 0),
@@ -444,8 +449,12 @@ impl GLProcessorST {
             converter.gl_context.transfer_backend = TransferBackend::Pbo;
         }
 
-        // If DMA-buf failed/unavailable but GL is alive, use PBO transfers
-        if converter.gl_context.transfer_backend == TransferBackend::Sync {
+        // If DMA-buf failed/unavailable but GL is alive, use PBO transfers —
+        // unless the renderer is software-based (llvmpipe/softpipe/swrast), where
+        // PBO readback is known to fail with GL_INVALID_OPERATION.
+        if converter.gl_context.transfer_backend == TransferBackend::Sync
+            && !converter.is_software_renderer
+        {
             log::info!("Upgrading transfer backend from Sync to Pbo (GL context available)");
             converter.gl_context.transfer_backend = TransferBackend::Pbo;
         }
@@ -1035,7 +1044,10 @@ impl GLProcessorST {
                 std::ptr::null_mut(),
             );
             gls::gl::Finish();
+        }
+        check_gl_error(function!(), line!())?;
 
+        unsafe {
             let ptr = gls::gl::MapBufferRange(
                 gls::gl::PIXEL_PACK_BUFFER,
                 0,
@@ -1245,6 +1257,7 @@ impl GLProcessorST {
                         dst_map.as_mut_ptr() as *mut c_void,
                     );
                 }
+                check_gl_error(function!(), line!())?;
                 if dst_fmt == PixelFormat::Bgra {
                     for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
                         chunk.swap(0, 2);
@@ -1360,6 +1373,7 @@ impl GLProcessorST {
                         dst_map.as_mut_ptr() as *mut c_void,
                     );
                 }
+                check_gl_error(function!(), line!())?;
                 if dst_fmt == PixelFormat::Bgra {
                     for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
                         chunk.swap(0, 2);
@@ -1419,30 +1433,42 @@ impl GLProcessorST {
         }
     }
 
-    /// Checks required GL extensions and returns optional capability flags:
-    /// `(has_float_linear, has_bgra)`.
-    /// Query GL capabilities and detect GPU vendor.
+    /// Query GL capabilities and detect GPU vendor/renderer type.
     ///
-    /// Returns `(has_float_linear, has_bgra, is_vivante)`.
-    fn gl_check_support() -> Result<(bool, bool, bool), crate::Error> {
+    /// Returns `(has_float_linear, has_bgra, is_vivante, is_software_renderer)`.
+    fn gl_check_support() -> Result<(bool, bool, bool, bool), crate::Error> {
         if let Ok(version) = gls::get_string(gls::gl::SHADING_LANGUAGE_VERSION) {
             log::debug!("GL Shading Language Version: {version:?}");
         } else {
             log::warn!("Could not get GL Shading Language Version");
         }
 
-        // Detect Vivante/Verisilicon GPU via GL_RENDERER string.
-        let is_vivante = gls::get_string(gls::gl::RENDERER)
+        // Detect GPU vendor and software renderers via GL_RENDERER string.
+        let (is_vivante, is_software_renderer) = gls::get_string(gls::gl::RENDERER)
             .map(|r| {
                 log::info!("GL_RENDERER: {r}");
                 let lower = r.to_ascii_lowercase();
-                lower.contains("vivante") || lower.contains("gc7000") || lower.contains("galcore")
+                let vivante = lower.contains("vivante")
+                    || lower.contains("gc7000")
+                    || lower.contains("galcore");
+                let software = lower.contains("llvmpipe")
+                    || lower.contains("softpipe")
+                    || lower.contains("swrast")
+                    || lower.contains("software rasterizer");
+                (vivante, software)
             })
-            .unwrap_or(false);
+            .unwrap_or((false, false));
         if is_vivante {
             log::warn!(
                 "Vivante GPU detected — NV12 → planar RGB conversions will be \
                  blocked to avoid unrecoverable GPU hang (see VSI_GPU_NV12_BUG.md)"
+            );
+        }
+        if is_software_renderer {
+            log::warn!(
+                "Software renderer detected — PBO transfers will be disabled. \
+                 Image processing will use CPU upload/readback paths (slower). \
+                 Check EGL ICD configuration if a hardware GPU is expected."
             );
         }
 
@@ -1474,7 +1500,7 @@ impl GLProcessorST {
         let has_bgra = extensions.contains("GL_EXT_texture_format_BGRA8888");
         log::debug!("GL_EXT_texture_format_BGRA8888: {has_bgra}");
 
-        Ok((has_float_linear, has_bgra, is_vivante))
+        Ok((has_float_linear, has_bgra, is_vivante, is_software_renderer))
     }
 
     fn setup_renderbuffer_dma(
@@ -1692,6 +1718,7 @@ impl GLProcessorST {
                 }
             }
         }
+        check_gl_error(function!(), line!())?;
         log::debug!("Read from framebuffer takes {:?}", start.elapsed());
         Ok(())
     }
@@ -2008,13 +2035,17 @@ impl GLProcessorST {
                     dst.len() as isize,
                     gls::gl::MAP_READ_BIT | gls::gl::MAP_WRITE_BIT,
                 );
-                if !ptr.is_null() {
-                    let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, dst.len());
-                    for chunk in slice.chunks_exact_mut(4) {
-                        chunk.swap(0, 2);
-                    }
-                    gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
+                if ptr.is_null() {
+                    gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+                    return Err(crate::Error::OpenGl(
+                        "glMapBufferRange returned null for BGRA byte-swap".to_string(),
+                    ));
                 }
+                let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, dst.len());
+                for chunk in slice.chunks_exact_mut(4) {
+                    chunk.swap(0, 2);
+                }
+                gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
                 gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
             }
             check_gl_error(function!(), line!())?;
@@ -2370,13 +2401,17 @@ impl GLProcessorST {
                     dst.len() as isize,
                     gls::gl::MAP_READ_BIT | gls::gl::MAP_WRITE_BIT,
                 );
-                if !ptr.is_null() {
-                    let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, dst.len());
-                    for chunk in slice.chunks_exact_mut(4) {
-                        chunk.swap(0, 2);
-                    }
-                    gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
+                if ptr.is_null() {
+                    gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+                    return Err(crate::Error::OpenGl(
+                        "glMapBufferRange returned null for BGRA byte-swap".to_string(),
+                    ));
                 }
+                let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, dst.len());
+                for chunk in slice.chunks_exact_mut(4) {
+                    chunk.swap(0, 2);
+                }
+                gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
                 gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
             }
             check_gl_error(function!(), line!())?;
@@ -2478,6 +2513,7 @@ impl GLProcessorST {
                 }
             }
         }
+        check_gl_error(function!(), line!())?;
         log::debug!("PBO-to-mem readback takes {:?}", start.elapsed());
         Ok(())
     }
@@ -2713,6 +2749,7 @@ impl GLProcessorST {
             is_int8,
         )?;
         unsafe { gls::gl::Finish() };
+        check_gl_error(function!(), line!())?;
 
         Ok(())
     }
@@ -2841,6 +2878,7 @@ impl GLProcessorST {
         self.draw_fullscreen_quad()?;
 
         unsafe { gls::gl::Finish() };
+        check_gl_error(function!(), line!())?;
         Ok(())
     }
 
