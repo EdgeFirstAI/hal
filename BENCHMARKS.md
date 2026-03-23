@@ -438,7 +438,7 @@ The hybrid path decodes masks on CPU (`materialize_segmentations`) then overlays
 
 ## C API Preprocessing Benchmark (`bench_preproc`)
 
-This section documents results from the C API preprocessing benchmark, which measures end-to-end `ef_image_processor_convert()` latency as seen by a C caller — including EGL/DMA-buf import, GPU dispatch, readback, and any tensor lifecycle overhead. The benchmark is the primary evidence base for the tensor reuse recommendations in ARCHITECTURE.md.
+This section documents results from the C API preprocessing benchmark, which measures end-to-end `hal_image_processor_convert()` latency as seen by a C caller — including EGL/DMA-buf import, GPU dispatch, readback, and any tensor lifecycle overhead. The benchmark is the primary evidence base for the tensor reuse recommendations in ARCHITECTURE.md.
 
 **Source:** `crates/capi/tests/bench_preproc.c`
 

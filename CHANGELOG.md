@@ -82,9 +82,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Corrected errno documentation for `hal_image_processor_create_image_from_fd`
-  in both Rust doc comments and `hal.h` header: `InvalidShape` / `NotAnImage`
-  map to `EINVAL` (not `EIO`)
+- Corrected errno mapping for `hal_import_image`: `InvalidShape` / `NotAnImage`
+  and `Tensor(InvalidArgument/InvalidShape/ShapeMismatch)` map to `EINVAL`
+  (not `EIO`); `UnsupportedFormat` / `NotSupported` map to `ENOTSUP`
 
 ## [0.10.0] - 2026-03-20
 

@@ -951,6 +951,14 @@ impl ImageProcessor {
 
         if let Some(chroma_pd) = chroma {
             // ── Multiplane path ──────────────────────────────────────
+            // Multiplane tensors are backed by Tensor<u8> (or transmuted to
+            // Tensor<i8>). Reject other dtypes to avoid silently returning a
+            // tensor with the wrong element type.
+            if dtype != DType::U8 && dtype != DType::I8 {
+                return Err(Error::NotSupported(format!(
+                    "multiplane import only supports U8/I8, got {dtype:?}"
+                )));
+            }
             if format.layout() != PixelLayout::SemiPlanar {
                 return Err(Error::NotSupported(format!(
                     "import_image with chroma requires a semi-planar format, got {format:?}"
