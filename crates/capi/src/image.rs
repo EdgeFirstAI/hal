@@ -1192,6 +1192,11 @@ pub unsafe extern "C" fn hal_import_image(
     format: HalPixelFormat,
     dtype: HalDtype,
 ) -> *mut HalTensor {
+    // Guard against double-free: if the caller passes the same pointer for
+    // both image and chroma, a second Box::from_raw would free already-freed
+    // memory.  Treat same-pointer as "no chroma" and return EINVAL below.
+    let same_ptr = !chroma.is_null() && std::ptr::eq(chroma, image);
+
     // Consume descriptors unconditionally so the "always consumed" contract
     // holds on every code path (including early EINVAL returns).  The Boxes
     // are dropped at end-of-scope, freeing the OwnedFd inside.
@@ -1200,11 +1205,15 @@ pub unsafe extern "C" fn hal_import_image(
     } else {
         Some(unsafe { Box::from_raw(image) })
     };
-    let chroma_box = if chroma.is_null() {
+    let chroma_box = if chroma.is_null() || same_ptr {
         None
     } else {
         Some(unsafe { Box::from_raw(chroma) })
     };
+
+    if same_ptr {
+        return set_error_null(libc::EINVAL);
+    }
 
     if processor.is_null() || image_box.is_none() || width == 0 || height == 0 {
         return set_error_null(libc::EINVAL);
@@ -1236,10 +1245,19 @@ pub unsafe extern "C" fn hal_import_image(
         Ok(t) => t,
         Err(e) => {
             return set_error_null(match &e {
+                edgefirst_image::Error::Tensor(te) => match te {
+                    edgefirst_tensor::Error::InvalidArgument(_)
+                    | edgefirst_tensor::Error::InvalidShape(_)
+                    | edgefirst_tensor::Error::ShapeMismatch(_) => libc::EINVAL,
+                    edgefirst_tensor::Error::IoError(io) => io.raw_os_error().unwrap_or(libc::EIO),
+                    edgefirst_tensor::Error::NotImplemented(_) => libc::ENOTSUP,
+                    _ => libc::EIO,
+                },
                 edgefirst_image::Error::InvalidShape(_) | edgefirst_image::Error::NotAnImage => {
                     libc::EINVAL
                 }
-                edgefirst_image::Error::NotSupported(_)
+                edgefirst_image::Error::UnsupportedFormat(_)
+                | edgefirst_image::Error::NotSupported(_)
                 | edgefirst_image::Error::NotImplemented(_) => libc::ENOTSUP,
                 edgefirst_image::Error::Io(io) => io.raw_os_error().unwrap_or(libc::EIO),
                 _ => libc::EIO,

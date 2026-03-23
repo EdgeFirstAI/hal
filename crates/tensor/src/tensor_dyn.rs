@@ -675,20 +675,33 @@ mod tests {
         t.set_row_stride(2048).unwrap();
         assert_eq!(t.row_stride(), Some(2048));
 
-        // Changing to a different 3-channel packed format clears stride
-        let _ = t.set_format(PixelFormat::Bgra); // 4-chan won't fit 3-chan shape
-                                                 // Stride should still be set since format change failed
+        // Incompatible format change (4-chan on 3-chan shape) fails — stride preserved
+        let _ = t.set_format(PixelFormat::Bgra);
         assert_eq!(t.row_stride(), Some(2048));
 
         // Re-set to same format — stride preserved
         t.set_format(PixelFormat::Rgb).unwrap();
         assert_eq!(t.row_stride(), Some(2048));
 
-        // Now clear by setting a genuinely different compatible format
-        // Use reshape to clear everything instead
+        // Reshape clears format and stride
         t.reshape(&[480 * 640 * 3]).unwrap();
         assert_eq!(t.row_stride(), None);
         assert_eq!(t.format(), None);
+    }
+
+    #[test]
+    fn set_format_different_compatible_clears_stride() {
+        // RGBA and BGRA are both 4-channel packed — switching between them
+        // succeeds and must clear the stored stride.
+        let mut t = TensorDyn::new(&[480, 640, 4], DType::U8, None, None).unwrap();
+        t.set_format(PixelFormat::Rgba).unwrap();
+        t.set_row_stride(4096).unwrap();
+        assert_eq!(t.row_stride(), Some(4096));
+
+        // Successful format change to a different compatible format clears stride
+        t.set_format(PixelFormat::Bgra).unwrap();
+        assert_eq!(t.format(), Some(PixelFormat::Bgra));
+        assert_eq!(t.row_stride(), None);
     }
 
     #[test]
