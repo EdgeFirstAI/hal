@@ -297,7 +297,7 @@ impl GLProcessorST {
         if is_software_renderer {
             return Err(crate::Error::NotSupported(
                 "software OpenGL renderer detected (llvmpipe/softpipe/swrast); \
-                 using CPU backend instead — check EGL ICD configuration if a \
+                 GL backend disabled — check EGL ICD configuration if a \
                  hardware GPU is expected"
                     .into(),
             ));

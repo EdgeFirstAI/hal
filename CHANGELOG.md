@@ -11,30 +11,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Zero-copy external buffer rendering** (`create_image_from_fd`) across
-  Rust, C, and Python APIs. Enables GPU rendering directly into a
-  caller-owned DMA-BUF — eliminating the `memcpy` between HAL's output
-  buffer and an NPU delegate's input buffer. The caller retains ownership
-  of the fd; HAL borrows it via `dup(fd)`.
+- **Zero-copy external buffer import** (`import_image`) across Rust, C,
+  and Python APIs. Enables GPU rendering directly into a caller-owned
+  DMA-BUF — eliminating the `memcpy` between HAL's output buffer and an
+  NPU delegate's input buffer. Supports per-plane stride and offset for
+  padded allocators (V4L2, GStreamer). The caller retains ownership of
+  the fd; HAL borrows it via `dup(fd)`.
 
   **Rust:**
   ```rust,ignore
-  let mut dst = processor.create_image_from_fd(
-      vx_fd.as_fd(), 640, 640, PixelFormat::Rgb, DType::U8,
-  )?;
+  use edgefirst_tensor::PlaneDescriptor;
+  let pd = PlaneDescriptor::new(vx_fd.as_fd())?.with_stride(bytesperline);
+  let mut dst = processor.import_image(pd, None, 640, 640, PixelFormat::Rgb, DType::U8)?;
   processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::letterbox())?;
   ```
 
   **Python:**
   ```python
-  dst = processor.create_image_from_fd(vx_fd, 640, 640, ef.PixelFormat.Rgb)
+  dst = processor.import_image(vx_fd, 640, 640, ef.PixelFormat.Rgb, stride=bytesperline)
   processor.convert(src, dst)
   ```
 
   **C:**
   ```c
-  struct hal_tensor *dst = hal_image_processor_create_image_from_fd(
-      proc, vx_fd, 640, 640, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8);
+  struct hal_plane_descriptor *pd = hal_plane_descriptor_new(vx_fd);
+  hal_plane_descriptor_set_stride(pd, bytesperline);
+  struct hal_tensor *dst = hal_import_image(proc, pd, NULL,
+                                             640, 640,
+                                             HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8);
   ```
 
   Returns `Error::NotSupported` if the fd is not DMA-backed (e.g. POSIX

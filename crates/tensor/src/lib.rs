@@ -896,7 +896,8 @@ where
 
     /// Effective row stride in bytes: the stored stride if set, otherwise the
     /// minimum stride computed from the format, width, and element size.
-    /// Returns `None` if no format is set.
+    /// Returns `None` only when no format is set and no explicit stride was
+    /// stored via [`set_row_stride`](Self::set_row_stride).
     pub fn effective_row_stride(&self) -> Option<usize> {
         if let Some(s) = self.row_stride {
             return Some(s);
@@ -918,6 +919,12 @@ where
     /// called after [`set_format`](Self::set_format) and before the tensor
     /// is first passed to [`ImageProcessor::convert`]. The stored stride
     /// is cleared automatically if the pixel format is later changed.
+    ///
+    /// No stride-vs-buffer-size validation is performed because the
+    /// backing allocation size is not reliably known: external DMA-BUFs
+    /// may be over-allocated by the allocator, and internal tensors store
+    /// a logical (unpadded) shape. An incorrect stride will be caught by
+    /// the EGL driver at import time.
     ///
     /// # Arguments
     ///
