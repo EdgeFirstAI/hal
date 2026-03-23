@@ -423,7 +423,8 @@ class Decoder:
         ...
 
     def decode_tracked(
-            self, tracker: ByteTrack, timestamp_ns: int, model_output: List[np.ndarray]) -> SegDetTrackedOutput:
+            self, tracker: ByteTrack, timestamp_ns: int, model_output: List[np.ndarray],
+            max_boxes: int = 100) -> SegDetTrackedOutput:
         """
         Decode model outputs into detection and segmentation results with tracking. When giving quantized
         tensors as input, the quantization parameters must be specified in the Decoder configuration.
@@ -439,7 +440,7 @@ class Decoder:
         — a binary per-instance mask (threshold at 128). For semantic
         segmentation models (e.g. ModelPack) ``C=num_classes`` — per-pixel
         class scores (use ``argmax`` over the last axis). Use
-        ``decode_masks()`` to get upsampled 2D binary masks
+        ``decode_masks()`` to get upsampled 2D binary masks.
         """
         ...
 
@@ -1340,11 +1341,10 @@ class ImageProcessor:
 class TrackInfo:
     def __init__(self,
                  uuid: str,
-                 tracked_location: List[float],
+                 tracked_location: Tuple[float, float, float, float],
                  count: int,
                  created: int,
-                 last_updated: int,
-                 last_box: Tuple[List[float], float, int]) -> None:
+                 last_updated: int) -> None:
         """Information about a single tracked object."""
         ...
 
@@ -1354,7 +1354,7 @@ class TrackInfo:
         ...
 
     @property
-    def tracked_location(self) -> npt.NDArray[np.float32]:
+    def tracked_location(self) -> Tuple[float, float, float, float]:
         """The current bounding box of the tracked object in (x1, y1, x2, y2) format."""
         ...
 
@@ -1374,7 +1374,7 @@ class TrackInfo:
         ...
 
     @property
-    def last_box(self) -> Tuple[npt.NDArray[np.float32], float, int]:
+    def last_box(self) -> Tuple[Tuple[float, float, float, float], float, int]:
         """The last bounding box, score, and class ID of the tracked object."""
         ...
 
@@ -1382,7 +1382,7 @@ class TrackInfo:
 class ActiveTrackInfo:
     def __init__(self,
                  info: TrackInfo,
-                 last_box: Tuple[List[float], float, int]) -> None:
+                 last_box: Tuple[Tuple[float, float, float, float], float, int]) -> None:
         """Information about an actively tracked object."""
         ...
 
@@ -1392,7 +1392,7 @@ class ActiveTrackInfo:
         ...
 
     @property
-    def last_box(self) -> Tuple[npt.NDArray[np.float32], float, int]:
+    def last_box(self) -> Tuple[Tuple[float, float, float, float], float, int]:
         """The last bounding box, score, and class ID of the tracked object."""
         ...
 

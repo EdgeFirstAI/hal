@@ -32,12 +32,14 @@ impl ByteTrackBuilder {
     /// - track_extra_lifespan: 500_000_000 (0.5 seconds)
     /// # Examples
     /// ```rust
-    /// use edgefirst_tracker::bytetrack::ByteTrackBuilder;
-    /// let tracker = ByteTrackBuilder::new().build();
+    /// use edgefirst_tracker::{bytetrack::ByteTrackBuilder, Tracker, MockDetection};
+    /// let mut tracker = ByteTrackBuilder::new().build();
     /// assert_eq!(tracker.track_high_conf, 0.7);
     /// assert_eq!(tracker.track_iou, 0.25);
     /// assert_eq!(tracker.track_update, 0.25);
-    /// assert_eq!(tracker.track_extra_lifespan_ns, 500_000_000);
+    /// assert_eq!(tracker.track_extra_lifespan, 500_000_000);
+    /// # let boxes = Vec::<MockDetection>::new();
+    /// # tracker.update(&boxes, 0);
     /// ```
     pub fn new() -> Self {
         Self {
@@ -75,8 +77,8 @@ impl ByteTrackBuilder {
     /// Builds the ByteTrack tracker with the specified parameters.
     /// # Examples
     /// ```rust
-    /// use edgefirst_tracker::bytetrack::ByteTrackBuilder;
-    /// let tracker = ByteTrackBuilder::new()
+    /// use edgefirst_tracker::{bytetrack::ByteTrackBuilder, Tracker, MockDetection};
+    /// let mut tracker = ByteTrackBuilder::new()
     ///     .track_high_conf(0.8)
     ///     .track_iou(0.3)
     ///     .track_update(0.2)
@@ -85,7 +87,9 @@ impl ByteTrackBuilder {
     /// assert_eq!(tracker.track_high_conf, 0.8);
     /// assert_eq!(tracker.track_iou, 0.3);
     /// assert_eq!(tracker.track_update, 0.2);
-    /// assert_eq!(tracker.track_extra_lifespan_ns, 1_000_000_000);
+    /// assert_eq!(tracker.track_extra_lifespan, 1_000_000_000);
+    /// # let boxes = Vec::<MockDetection>::new();
+    /// # tracker.update(&boxes, 0);
     /// ```
     pub fn build<T: DetectionBox>(self) -> ByteTrack<T> {
         ByteTrack {
@@ -435,14 +439,6 @@ mod tests {
     use super::*;
     use crate::*;
 
-    /// Mock detection for testing
-    #[derive(Debug, Clone, Copy)]
-    struct MockDetection {
-        bbox: [f32; 4],
-        score: f32,
-        label: usize,
-    }
-
     impl MockDetection {
         fn new(x1: f32, y1: f32, x2: f32, y2: f32, score: f32) -> Self {
             Self {
@@ -450,20 +446,6 @@ mod tests {
                 score,
                 label: 0,
             }
-        }
-    }
-
-    impl DetectionBox for MockDetection {
-        fn bbox(&self) -> [f32; 4] {
-            self.bbox
-        }
-
-        fn score(&self) -> f32 {
-            self.score
-        }
-
-        fn label(&self) -> usize {
-            self.label
         }
     }
 

@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{
-    fmt::Debug,
-};
+use std::fmt::Debug;
 
 pub use uuid::Uuid;
 pub mod bytetrack;
@@ -14,6 +12,29 @@ pub trait DetectionBox: Debug + Clone {
     fn bbox(&self) -> [f32; 4];
     fn score(&self) -> f32;
     fn label(&self) -> usize;
+}
+
+/// Mock detection box for testing and examples
+#[derive(Debug, Clone, Copy)]
+#[doc(hidden)]
+pub struct MockDetection {
+    bbox: [f32; 4],
+    score: f32,
+    label: usize,
+}
+
+impl DetectionBox for MockDetection {
+    fn bbox(&self) -> [f32; 4] {
+        self.bbox
+    }
+
+    fn score(&self) -> f32 {
+        self.score
+    }
+
+    fn label(&self) -> usize {
+        self.label
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

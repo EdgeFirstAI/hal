@@ -64,6 +64,7 @@ pub mod edgefirst_hal {
 
         m.add_class::<tracker::PyTrackInfo>()?;
         m.add_class::<tracker::PyByteTrack>()?;
+        m.add_class::<tracker::PyActiveTrackInfo>()?;
 
         Ok(())
     }

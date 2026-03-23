@@ -28,7 +28,7 @@ ndarray = { workspace = true }
 numpy = { workspace = true }
 pyo3 = { workspace = true, features = ["extension-module"] }
 pythonize = { workspace = true }
-uuid = "1.22.0"
+uuid = { workspace = true }
 
 [build-dependencies]
 pyo3-build-config = { workspace = true, features = ["resolve-config"] }
