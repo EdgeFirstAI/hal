@@ -278,9 +278,55 @@ def test_create_image_roundtrip():
         assert result.any(), "Destination is all zeros after roundtrip convert"
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="create_image_from_fd is Linux-only")
-def test_create_image_from_fd_negative_fd():
-    """create_image_from_fd raises RuntimeError for invalid fd."""
+@pytest.mark.skipif(sys.platform != "linux", reason="import_image is Linux-only")
+def test_import_image_negative_fd():
+    """import_image raises RuntimeError for invalid fd."""
     processor = ImageProcessor()
     with pytest.raises(RuntimeError):
-        processor.create_image_from_fd(-1, 640, 640, PixelFormat.Rgb)
+        processor.import_image(fd=-1, width=640, height=640, format=PixelFormat.Rgb)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="import_image is Linux-only")
+def test_import_image_negative_chroma_fd():
+    """import_image raises RuntimeError for invalid chroma fd."""
+    processor = ImageProcessor()
+    with pytest.raises(RuntimeError):
+        processor.import_image(
+            fd=0, width=640, height=640, format=PixelFormat.Nv12, chroma_fd=-1
+        )
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="import_image is Linux-only")
+def test_import_image_zero_dimensions():
+    """import_image raises RuntimeError for zero width or height."""
+    processor = ImageProcessor()
+    with pytest.raises(RuntimeError):
+        processor.import_image(fd=0, width=0, height=640, format=PixelFormat.Rgb)
+    with pytest.raises(RuntimeError):
+        processor.import_image(fd=0, width=640, height=0, format=PixelFormat.Rgb)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="import_image is Linux-only")
+def test_import_image_chroma_with_packed_format():
+    """import_image raises RuntimeError when chroma_fd given for non-semi-planar format."""
+    processor = ImageProcessor()
+    with pytest.raises(RuntimeError):
+        processor.import_image(
+            fd=0, width=640, height=480, format=PixelFormat.Rgba, chroma_fd=1
+        )
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="import_image is Linux-only")
+def test_import_image_dma_success():
+    """import_image succeeds with a real DMA-BUF fd (skipped if DMA unavailable)."""
+    try:
+        src = Tensor([480, 640, 4], dtype="uint8", mem=TensorMemory.DMA)
+    except RuntimeError:
+        pytest.skip("DMA allocation not available on this platform")
+    fd = src.fd
+    processor = ImageProcessor()
+    imported = processor.import_image(
+        fd=fd, width=640, height=480, format=PixelFormat.Rgba
+    )
+    assert imported.width == 640
+    assert imported.height == 480

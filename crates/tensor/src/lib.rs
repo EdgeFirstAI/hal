@@ -60,6 +60,80 @@ use std::{
 };
 pub use tensor_dyn::TensorDyn;
 
+/// Per-plane DMA-BUF descriptor for external buffer import.
+///
+/// Owns a duplicated file descriptor plus optional stride and offset metadata.
+/// The fd is duplicated eagerly in [`new()`](Self::new) so that a bad fd is
+/// caught immediately. `import_image` consumes the descriptor and takes
+/// ownership of the duped fd — no further cleanup is needed by the caller.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use edgefirst_tensor::PlaneDescriptor;
+/// use std::os::fd::BorrowedFd;
+///
+/// // SAFETY: fd 42 is hypothetical; real code must pass a valid fd.
+/// let pd = unsafe { PlaneDescriptor::new(BorrowedFd::borrow_raw(42)) }
+///     .unwrap()
+///     .with_stride(2048)
+///     .with_offset(0);
+/// ```
+#[cfg(unix)]
+pub struct PlaneDescriptor {
+    fd: OwnedFd,
+    stride: Option<usize>,
+    offset: Option<usize>,
+}
+
+#[cfg(unix)]
+impl PlaneDescriptor {
+    /// Create a new plane descriptor by duplicating the given file descriptor.
+    ///
+    /// The fd is duped immediately — a bad fd fails here rather than inside
+    /// `import_image`. The caller retains ownership of the original fd.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `dup()` syscall fails (e.g. invalid fd or
+    /// fd limit reached).
+    pub fn new(fd: std::os::fd::BorrowedFd<'_>) -> Result<Self> {
+        let owned = fd.try_clone_to_owned()?;
+        Ok(Self {
+            fd: owned,
+            stride: None,
+            offset: None,
+        })
+    }
+
+    /// Set the row stride in bytes (consuming builder).
+    pub fn with_stride(mut self, stride: usize) -> Self {
+        self.stride = Some(stride);
+        self
+    }
+
+    /// Set the plane offset in bytes (consuming builder).
+    pub fn with_offset(mut self, offset: usize) -> Self {
+        self.offset = Some(offset);
+        self
+    }
+
+    /// Consume the descriptor and return the owned file descriptor.
+    pub fn into_fd(self) -> OwnedFd {
+        self.fd
+    }
+
+    /// Row stride in bytes, if set.
+    pub fn stride(&self) -> Option<usize> {
+        self.stride
+    }
+
+    /// Plane offset in bytes, if set.
+    pub fn offset(&self) -> Option<usize> {
+        self.offset
+    }
+}
+
 /// Element type discriminant for runtime type identification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
@@ -544,6 +618,9 @@ where
     /// Row stride in bytes for externally allocated buffers with row padding.
     /// `None` means tightly packed (stride == width * bytes_per_pixel).
     row_stride: Option<usize>,
+    /// Byte offset within the DMA-BUF where image data starts.
+    /// `None` means offset 0 (data starts at the beginning of the buffer).
+    plane_offset: Option<usize>,
 }
 
 impl<T> Tensor<T>
@@ -557,6 +634,7 @@ where
             format: None,
             chroma: None,
             row_stride: None,
+            plane_offset: None,
         }
     }
 
@@ -684,10 +762,11 @@ where
                 }
             }
         }
-        // Clear stored stride when format changes — the stride may be invalid
-        // for the new format. Caller must re-set stride after changing format.
+        // Clear stored stride/offset when format changes — they may be invalid
+        // for the new format. Caller must re-set after changing format.
         if self.format != Some(format) {
             self.row_stride = None;
+            self.plane_offset = None;
         }
         self.format = Some(format);
         Ok(())
@@ -791,6 +870,7 @@ where
             format: Some(format),
             chroma: Some(Box::new(chroma)),
             row_stride: luma.row_stride,
+            plane_offset: luma.plane_offset,
         })
     }
 
@@ -802,6 +882,11 @@ where
     /// Access the chroma plane for multiplane semi-planar images.
     pub fn chroma(&self) -> Option<&Tensor<T>> {
         self.chroma.as_deref()
+    }
+
+    /// Mutable access to the chroma plane for multiplane semi-planar images.
+    pub fn chroma_mut(&mut self) -> Option<&mut Tensor<T>> {
+        self.chroma.as_deref_mut()
     }
 
     /// Row stride in bytes (`None` = tightly packed).
@@ -866,6 +951,15 @@ where
         Ok(())
     }
 
+    /// Set the row stride without format validation.
+    ///
+    /// Use this for raw sub-tensors (e.g. chroma planes) that don't carry
+    /// format metadata. The caller is responsible for ensuring the stride
+    /// is valid.
+    pub fn set_row_stride_unchecked(&mut self, stride: usize) {
+        self.row_stride = Some(stride);
+    }
+
     /// Builder-style variant of [`set_row_stride`](Self::set_row_stride),
     /// consuming and returning `self`.
     ///
@@ -875,6 +969,27 @@ where
     pub fn with_row_stride(mut self, stride: usize) -> Result<Self> {
         self.set_row_stride(stride)?;
         Ok(self)
+    }
+
+    /// Byte offset within the DMA-BUF where image data starts (`None` = 0).
+    pub fn plane_offset(&self) -> Option<usize> {
+        self.plane_offset
+    }
+
+    /// Set the byte offset within the DMA-BUF where image data starts.
+    ///
+    /// Propagated to `EGL_DMA_BUF_PLANE0_OFFSET_EXT` on GPU import.
+    /// Unlike [`set_row_stride`](Self::set_row_stride), no format is required
+    /// since the offset is format-independent.
+    pub fn set_plane_offset(&mut self, offset: usize) {
+        self.plane_offset = Some(offset);
+    }
+
+    /// Builder-style variant of [`set_plane_offset`](Self::set_plane_offset),
+    /// consuming and returning `self`.
+    pub fn with_plane_offset(mut self, offset: usize) -> Self {
+        self.set_plane_offset(offset);
+        self
     }
 
     /// Downcast to PBO tensor reference (for GL backends).
@@ -923,6 +1038,7 @@ where
             format: None,
             chroma: None,
             row_stride: None,
+            plane_offset: None,
         }
     }
 }
@@ -972,6 +1088,7 @@ where
         self.storage.reshape(shape)?;
         self.format = None;
         self.row_stride = None;
+        self.plane_offset = None;
         Ok(())
     }
 
@@ -979,6 +1096,11 @@ where
         if self.row_stride.is_some() {
             return Err(Error::InvalidOperation(
                 "CPU mapping of strided tensors is not supported; use GPU path only".into(),
+            ));
+        }
+        if self.plane_offset.is_some_and(|o| o > 0) {
+            return Err(Error::InvalidOperation(
+                "CPU mapping of offset tensors is not supported; use GPU path only".into(),
             ));
         }
         self.storage.map()

@@ -18,10 +18,10 @@ use edgefirst_tensor::{PixelFormat, PixelLayout, TensorDyn, TensorMemory, Tensor
 use libc::{c_char, c_int, size_t};
 use std::ffi::CStr;
 
-/// Image pixel format (FourCC codes).
+/// Image pixel format.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HalFourcc {
+pub enum HalPixelFormat {
     /// 8-bit interleaved YUV422, limited range (YUYV)
     Yuyv = 0,
     /// 8-bit planar YUV420, limited range (NV12)
@@ -44,35 +44,39 @@ pub enum HalFourcc {
     Vyuy = 9,
 }
 
-impl HalFourcc {
+impl HalPixelFormat {
     fn to_pixel_format(self) -> PixelFormat {
         match self {
-            HalFourcc::Yuyv => PixelFormat::Yuyv,
-            HalFourcc::Nv12 => PixelFormat::Nv12,
-            HalFourcc::Nv16 => PixelFormat::Nv16,
-            HalFourcc::Rgba => PixelFormat::Rgba,
-            HalFourcc::Rgb => PixelFormat::Rgb,
-            HalFourcc::Grey => PixelFormat::Grey,
-            HalFourcc::PlanarRgb => PixelFormat::PlanarRgb,
-            HalFourcc::PlanarRgba => PixelFormat::PlanarRgba,
-            HalFourcc::Bgra => PixelFormat::Bgra,
-            HalFourcc::Vyuy => PixelFormat::Vyuy,
+            HalPixelFormat::Yuyv => PixelFormat::Yuyv,
+            HalPixelFormat::Nv12 => PixelFormat::Nv12,
+            HalPixelFormat::Nv16 => PixelFormat::Nv16,
+            HalPixelFormat::Rgba => PixelFormat::Rgba,
+            HalPixelFormat::Rgb => PixelFormat::Rgb,
+            HalPixelFormat::Grey => PixelFormat::Grey,
+            HalPixelFormat::PlanarRgb => PixelFormat::PlanarRgb,
+            HalPixelFormat::PlanarRgba => PixelFormat::PlanarRgba,
+            HalPixelFormat::Bgra => PixelFormat::Bgra,
+            HalPixelFormat::Vyuy => PixelFormat::Vyuy,
         }
     }
 
     fn from_pixel_format(fmt: PixelFormat) -> Self {
         match fmt {
-            PixelFormat::Rgb => HalFourcc::Rgb,
-            PixelFormat::Rgba => HalFourcc::Rgba,
-            PixelFormat::Grey => HalFourcc::Grey,
-            PixelFormat::Yuyv => HalFourcc::Yuyv,
-            PixelFormat::Nv12 => HalFourcc::Nv12,
-            PixelFormat::Nv16 => HalFourcc::Nv16,
-            PixelFormat::PlanarRgb => HalFourcc::PlanarRgb,
-            PixelFormat::PlanarRgba => HalFourcc::PlanarRgba,
-            PixelFormat::Bgra => HalFourcc::Bgra,
-            PixelFormat::Vyuy => HalFourcc::Vyuy,
-            _ => HalFourcc::Rgb,
+            PixelFormat::Rgb => HalPixelFormat::Rgb,
+            PixelFormat::Rgba => HalPixelFormat::Rgba,
+            PixelFormat::Grey => HalPixelFormat::Grey,
+            PixelFormat::Yuyv => HalPixelFormat::Yuyv,
+            PixelFormat::Nv12 => HalPixelFormat::Nv12,
+            PixelFormat::Nv16 => HalPixelFormat::Nv16,
+            PixelFormat::PlanarRgb => HalPixelFormat::PlanarRgb,
+            PixelFormat::PlanarRgba => HalPixelFormat::PlanarRgba,
+            PixelFormat::Bgra => HalPixelFormat::Bgra,
+            PixelFormat::Vyuy => HalPixelFormat::Vyuy,
+            // TODO: make this a compile error when new PixelFormat variants are added
+            other => {
+                log::warn!("PixelFormat {other:?} has no C API mapping, defaulting to Rgb");
+                HalPixelFormat::Rgb
+            }
         }
     }
 }
@@ -304,7 +308,7 @@ pub unsafe extern "C" fn hal_crop_set_dst_color(crop: *mut HalCrop, r: u8, g: u8
 ///
 /// @param width Image width in pixels
 /// @param height Image height in pixels
-/// @param fourcc Pixel format (HAL_FOURCC_*)
+/// @param format Pixel format (HAL_PIXEL_FORMAT_*)
 /// @param dtype Data type of tensor elements (HAL_DTYPE_*)
 /// @param memory Memory allocation type (HAL_TENSOR_DMA recommended)
 /// @return New tensor handle on success, NULL on error
@@ -315,7 +319,7 @@ pub unsafe extern "C" fn hal_crop_set_dst_color(crop: *mut HalCrop, r: u8, g: u8
 pub unsafe extern "C" fn hal_tensor_new_image(
     width: size_t,
     height: size_t,
-    fourcc: HalFourcc,
+    format: HalPixelFormat,
     dtype: HalDtype,
     memory: HalTensorMemory,
 ) -> *mut HalTensor {
@@ -328,7 +332,7 @@ pub unsafe extern "C" fn hal_tensor_new_image(
         TensorDyn::image(
             width,
             height,
-            fourcc.to_pixel_format(),
+            format.to_pixel_format(),
             dtype.into(),
             mem_opt,
         ),
@@ -344,7 +348,7 @@ pub unsafe extern "C" fn hal_tensor_new_image(
 ///
 /// @param data Pointer to image data
 /// @param len Length of image data in bytes
-/// @param fourcc Output pixel format (HAL_FOURCC_RGB, HAL_FOURCC_RGBA, or HAL_FOURCC_GREY)
+/// @param format Output pixel format (HAL_PIXEL_FORMAT_RGB, HAL_PIXEL_FORMAT_RGBA, or HAL_PIXEL_FORMAT_GREY)
 /// @param memory Memory allocation type
 /// @return New tensor handle on success, NULL on error
 /// @par Errors (errno):
@@ -355,7 +359,7 @@ pub unsafe extern "C" fn hal_tensor_new_image(
 pub unsafe extern "C" fn hal_tensor_load_image(
     data: *const u8,
     len: size_t,
-    fourcc: HalFourcc,
+    format: HalPixelFormat,
     memory: HalTensorMemory,
 ) -> *mut HalTensor {
     check_null_ret_null!(data);
@@ -367,7 +371,7 @@ pub unsafe extern "C" fn hal_tensor_load_image(
     let mem_opt: Option<TensorMemory> = memory.into();
 
     let dyn_tensor = try_or_null!(
-        load_image(data_slice, Some(fourcc.to_pixel_format()), mem_opt),
+        load_image(data_slice, Some(format.to_pixel_format()), mem_opt),
         libc::EBADMSG
     );
 
@@ -377,7 +381,7 @@ pub unsafe extern "C" fn hal_tensor_load_image(
 /// Load an image from a file (JPEG or PNG).
 ///
 /// @param path Path to the image file
-/// @param fourcc Output pixel format
+/// @param format Output pixel format
 /// @param memory Memory allocation type
 /// @return New tensor handle on success, NULL on error
 /// @par Errors (errno):
@@ -388,7 +392,7 @@ pub unsafe extern "C" fn hal_tensor_load_image(
 #[no_mangle]
 pub unsafe extern "C" fn hal_tensor_load_image_file(
     path: *const c_char,
-    fourcc: HalFourcc,
+    format: HalPixelFormat,
     memory: HalTensorMemory,
 ) -> *mut HalTensor {
     check_null_ret_null!(path);
@@ -411,7 +415,7 @@ pub unsafe extern "C" fn hal_tensor_load_image_file(
 
     let mem_opt: Option<TensorMemory> = memory.into();
     let dyn_tensor = try_or_null!(
-        load_image(&data, Some(fourcc.to_pixel_format()), mem_opt),
+        load_image(&data, Some(format.to_pixel_format()), mem_opt),
         libc::EBADMSG
     );
 
@@ -423,29 +427,38 @@ pub unsafe extern "C" fn hal_tensor_load_image_file(
 /// This is used for V4L2 multi-planar NV12 (`V4L2_PIX_FMT_NV12M`) where the
 /// Y and UV planes are in separate DMA-BUF allocations.
 ///
-/// **Ownership**: Ownership is transferred once the function validates that
-/// both FDs are non-negative, non-zero dimensions, and distinct. After that
-/// point, the HAL closes them on any error. If validation of the FD values
-/// themselves fails (negative FD, zero dimensions, or `y_fd == uv_fd`), the
-/// caller retains ownership.
+/// Both fds are duplicated internally — the caller retains ownership and
+/// must close them when done. This is consistent with all other fd-accepting
+/// APIs in this library.
 ///
-/// @param y_fd    DMA-BUF file descriptor for the Y (luma) plane
+/// **EGL image cache interaction**: Each call creates new `BufferIdentity`
+/// values for both the Y and UV planes. The OpenGL backend caches EGL images
+/// keyed by `(luma_id, chroma_id)`. Recreating the tensor from the same fds
+/// every frame will always cause cache misses. Reuse the same tensor object
+/// across frames so that both plane images are served from cache.
+///
+/// **Live-memory semantics**: EGLImage is a handle to physical memory, not a
+/// snapshot. New frame data written by a V4L2 decoder into the DMA-BUFs is
+/// visible to the GPU on the next `convert()` call as long as the caller does
+/// not write to the buffers while a `convert()` is in progress.
+///
+/// @param y_fd    DMA-BUF file descriptor for the Y (luma) plane (caller retains ownership)
 /// @param width   Image width in pixels
 /// @param height  Image height in pixels
-/// @param uv_fd   DMA-BUF file descriptor for the UV (chroma) plane
-/// @param fourcc  Pixel format (must be HAL_FOURCC_NV12 or HAL_FOURCC_NV16)
+/// @param uv_fd   DMA-BUF file descriptor for the UV (chroma) plane (caller retains ownership)
+/// @param format  Pixel format (must be HAL_PIXEL_FORMAT_NV12 or HAL_PIXEL_FORMAT_NV16)
 /// @param out     Receives the new tensor handle on success
 /// @return 0 on success, -1 on error (errno set)
 /// @par Errors (errno):
-/// - EINVAL: Invalid argument or unsupported fourcc
-/// - EIO:    Failed to wrap DMA-BUF file descriptor
+/// - EINVAL: Invalid argument or unsupported pixel format
+/// - EIO:    Failed to duplicate fd or create tensor
 #[no_mangle]
 pub unsafe extern "C" fn hal_tensor_from_planes(
     y_fd: c_int,
     width: u32,
     height: u32,
     uv_fd: c_int,
-    fourcc: HalFourcc,
+    format: HalPixelFormat,
     out: *mut *mut HalTensor,
 ) -> c_int {
     check_null!(out);
@@ -458,13 +471,25 @@ pub unsafe extern "C" fn hal_tensor_from_planes(
         return -1;
     }
 
-    // Take ownership of the file descriptors early so they auto-close on any
-    // subsequent error return, making the documented ownership contract truthful.
-    use std::os::unix::io::FromRawFd;
-    let y_owned = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(y_fd) };
-    let uv_owned = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(uv_fd) };
+    // Dup both fds — caller retains ownership of the originals.
+    let y_borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(y_fd) };
+    let uv_borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(uv_fd) };
+    let y_owned = match y_borrowed.try_clone_to_owned() {
+        Ok(fd) => fd,
+        Err(_) => {
+            set_error(libc::EIO);
+            return -1;
+        }
+    };
+    let uv_owned = match uv_borrowed.try_clone_to_owned() {
+        Ok(fd) => fd,
+        Err(_) => {
+            set_error(libc::EIO);
+            return -1;
+        }
+    };
 
-    let fmt = fourcc.to_pixel_format();
+    let fmt = format.to_pixel_format();
     let w = width as usize;
     let h = height as usize;
 
@@ -474,7 +499,7 @@ pub unsafe extern "C" fn hal_tensor_from_planes(
         PixelFormat::Nv16 => h,
         _ => {
             set_error(libc::EINVAL);
-            return -1; // y_owned and uv_owned drop here, closing FDs
+            return -1;
         }
     };
 
@@ -511,7 +536,7 @@ pub unsafe extern "C" fn hal_tensor_from_planes(
 ///
 /// @param data Pointer to JPEG data
 /// @param len Length of JPEG data in bytes
-/// @param fourcc Output pixel format (HAL_FOURCC_RGB, HAL_FOURCC_RGBA, or HAL_FOURCC_GREY)
+/// @param format Output pixel format (HAL_PIXEL_FORMAT_RGB, HAL_PIXEL_FORMAT_RGBA, or HAL_PIXEL_FORMAT_GREY)
 /// @param memory Memory allocation type
 /// @return New tensor handle on success, NULL on error
 /// @par Errors (errno):
@@ -522,7 +547,7 @@ pub unsafe extern "C" fn hal_tensor_from_planes(
 pub unsafe extern "C" fn hal_tensor_load_jpeg(
     data: *const u8,
     len: size_t,
-    fourcc: HalFourcc,
+    format: HalPixelFormat,
     memory: HalTensorMemory,
 ) -> *mut HalTensor {
     check_null_ret_null!(data);
@@ -534,7 +559,7 @@ pub unsafe extern "C" fn hal_tensor_load_jpeg(
     let mem_opt: Option<TensorMemory> = memory.into();
 
     let dyn_tensor = try_or_null!(
-        load_image(data_slice, Some(fourcc.to_pixel_format()), mem_opt),
+        load_image(data_slice, Some(format.to_pixel_format()), mem_opt),
         libc::EBADMSG
     );
 
@@ -545,7 +570,7 @@ pub unsafe extern "C" fn hal_tensor_load_jpeg(
 ///
 /// @param data Pointer to PNG data
 /// @param len Length of PNG data in bytes
-/// @param fourcc Output pixel format (HAL_FOURCC_RGB, HAL_FOURCC_RGBA, or HAL_FOURCC_GREY)
+/// @param format Output pixel format (HAL_PIXEL_FORMAT_RGB, HAL_PIXEL_FORMAT_RGBA, or HAL_PIXEL_FORMAT_GREY)
 /// @param memory Memory allocation type
 /// @return New tensor handle on success, NULL on error
 /// @par Errors (errno):
@@ -556,7 +581,7 @@ pub unsafe extern "C" fn hal_tensor_load_jpeg(
 pub unsafe extern "C" fn hal_tensor_load_png(
     data: *const u8,
     len: size_t,
-    fourcc: HalFourcc,
+    format: HalPixelFormat,
     memory: HalTensorMemory,
 ) -> *mut HalTensor {
     check_null_ret_null!(data);
@@ -568,7 +593,7 @@ pub unsafe extern "C" fn hal_tensor_load_png(
     let mem_opt: Option<TensorMemory> = memory.into();
 
     let dyn_tensor = try_or_null!(
-        load_image(data_slice, Some(fourcc.to_pixel_format()), mem_opt),
+        load_image(data_slice, Some(format.to_pixel_format()), mem_opt),
         libc::EBADMSG
     );
 
@@ -640,15 +665,15 @@ pub unsafe extern "C" fn hal_tensor_height(tensor: *const HalTensor) -> size_t {
 /// Get the pixel format of an image tensor.
 ///
 /// @param tensor Image tensor handle
-/// @return Pixel format, or HAL_FOURCC_RGB if tensor is NULL or not an image
+/// @return Pixel format, or HAL_PIXEL_FORMAT_RGB if tensor is NULL or not an image
 #[no_mangle]
-pub unsafe extern "C" fn hal_tensor_fourcc(tensor: *const HalTensor) -> HalFourcc {
+pub unsafe extern "C" fn hal_tensor_pixel_format(tensor: *const HalTensor) -> HalPixelFormat {
     if tensor.is_null() {
-        return HalFourcc::Rgb;
+        return HalPixelFormat::Rgb;
     }
     match unsafe { &(*tensor) }.inner.format() {
-        Some(fmt) => HalFourcc::from_pixel_format(fmt),
-        None => HalFourcc::Rgb,
+        Some(fmt) => HalPixelFormat::from_pixel_format(fmt),
+        None => HalPixelFormat::Rgb,
     }
 }
 
@@ -660,14 +685,17 @@ pub unsafe extern "C" fn hal_tensor_fourcc(tensor: *const HalTensor) -> HalFourc
 /// destinations.
 ///
 /// @param tensor Tensor handle
-/// @param fourcc Pixel format to attach (HAL_FOURCC_*)
+/// @param format Pixel format to attach (HAL_PIXEL_FORMAT_*)
 /// @return 0 on success, -1 on error
 /// @par Errors (errno):
 /// - EINVAL: NULL tensor or shape doesn't match format layout
 #[no_mangle]
-pub unsafe extern "C" fn hal_tensor_set_format(tensor: *mut HalTensor, fourcc: HalFourcc) -> c_int {
+pub unsafe extern "C" fn hal_tensor_set_format(
+    tensor: *mut HalTensor,
+    format: HalPixelFormat,
+) -> c_int {
     check_null!(tensor);
-    let fmt = fourcc.to_pixel_format();
+    let fmt = format.to_pixel_format();
     match unsafe { &mut *tensor }.inner.set_format(fmt) {
         Ok(()) => 0,
         Err(_) => set_error(libc::EINVAL),
@@ -713,10 +741,9 @@ pub unsafe extern "C" fn hal_tensor_channels(tensor: *const HalTensor) -> size_t
 
 /// Get the effective row stride of an image tensor in bytes.
 ///
-/// If an explicit stride was set (e.g. via
-/// `hal_image_processor_create_image_from_fd_with_stride`), that value is
-/// returned. Otherwise the minimum stride is computed from the format:
-/// width for planar/semi-planar formats, width * channels for packed.
+/// If an explicit stride was set (e.g. via `hal_plane_descriptor_set_stride`),
+/// that value is returned. Otherwise the minimum stride is computed from the
+/// format: width for planar/semi-planar formats, width * channels for packed.
 ///
 /// @param tensor Image tensor handle
 /// @return Row stride in bytes, or 0 if tensor is NULL or format is unset
@@ -805,6 +832,30 @@ pub unsafe extern "C" fn hal_image_processor_new_with_backend(
 /// Convert an image to a different format/size.
 ///
 /// Performs format conversion, scaling, rotation, flip, and crop operations.
+/// When the OpenGL backend is active, the function issues a `glFinish()` before
+/// returning, guaranteeing that all GPU reads of `src` and writes to `dst` are
+/// complete. The caller must not write to the `src` DMA-BUF while this function
+/// is in progress.
+///
+/// **EGL image cache**: The OpenGL backend maintains separate LRU caches for
+/// source and destination EGLImages, keyed by the tensor's `BufferIdentity.id`.
+/// Reusing the same tensor objects across frames yields cache hits on both
+/// sides; creating new tensors from the same fds every frame yields cache
+/// misses. See `hal_tensor_from_fd()` and `hal_tensor_from_planes()` for
+/// details on `BufferIdentity` assignment.
+///
+/// **Content updates between calls**: Because EGLImage is a handle to live
+/// physical memory, content written into a DMA-BUF between calls (e.g., by a
+/// video decoder) is visible to the GPU on the next call. The EGL image and
+/// tensor wrapper remain valid and do not need to be recreated.
+///
+/// **Chaining convert() calls**: It is safe to chain calls where the `dst` of
+/// one call becomes the `src` of the next (e.g., NV12 → RGBA → PlanarRgb).
+/// The `glFinish()` issued at the end of each call ensures GPU coherency.
+/// The same DMA-BUF used as both `dst` in one call and `src` in the next will
+/// have two separate EGLImage cache entries (one per cache) without collision.
+/// In-place conversion where `src` and `dst` are the same tensor in a single
+/// call is undefined behavior.
 ///
 /// @param processor Image processor handle
 /// @param src Source image tensor
@@ -936,7 +987,7 @@ pub unsafe extern "C" fn hal_image_processor_set_class_colors(
 /// @param processor Image processor handle
 /// @param width Image width in pixels
 /// @param height Image height in pixels
-/// @param fourcc Pixel format (HAL_FOURCC_*)
+/// @param format Pixel format (HAL_PIXEL_FORMAT_*)
 /// @param dtype Data type of tensor elements (HAL_DTYPE_*)
 /// @return New tensor handle on success, NULL on error
 /// @par Errors (errno):
@@ -949,7 +1000,7 @@ pub unsafe extern "C" fn hal_image_processor_create_image(
     processor: *mut HalImageProcessor,
     width: size_t,
     height: size_t,
-    fourcc: HalFourcc,
+    format: HalPixelFormat,
     dtype: HalDtype,
 ) -> *mut HalTensor {
     if processor.is_null() || width == 0 || height == 0 {
@@ -959,7 +1010,7 @@ pub unsafe extern "C" fn hal_image_processor_create_image(
     let dyn_tensor = match unsafe { &(*processor) }.inner.create_image(
         width,
         height,
-        fourcc.to_pixel_format(),
+        format.to_pixel_format(),
         dtype.into(),
         None,
     ) {
@@ -988,46 +1039,198 @@ pub unsafe extern "C" fn hal_image_processor_create_image(
     Box::into_raw(Box::new(HalTensor { inner: dyn_tensor }))
 }
 
-/// Create an image tensor backed by an external DMA-BUF file descriptor.
+// ============================================================================
+// Plane Descriptor + Image Import
+// ============================================================================
+
+/// Per-plane DMA-BUF descriptor for external buffer import.
 ///
-/// The GPU renders directly into this buffer via EGL DMA-BUF import —
-/// no CPU copy is needed after hal_image_processor_convert(). The caller
-/// retains ownership of the underlying buffer; the returned tensor borrows
-/// it via dup(fd).
+/// The fd is duplicated eagerly in `hal_plane_descriptor_new()` so that a bad
+/// fd fails immediately. `hal_import_image()` **consumes** the descriptor —
+/// do NOT call `hal_plane_descriptor_free()` after a successful import.
+///
+/// @code{.c}
+/// // Single-plane RGBA
+/// struct hal_plane_descriptor *pd = hal_plane_descriptor_new(fd);
+/// hal_plane_descriptor_set_stride(pd, bytesperline);  // optional
+/// struct hal_tensor *src = hal_import_image(proc, pd, NULL,
+///                                            1920, 1080,
+///                                            HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
+/// // pd is consumed — do NOT free it
+///
+/// // Multi-plane NV12
+/// struct hal_plane_descriptor *y_pd = hal_plane_descriptor_new(y_fd);
+/// struct hal_plane_descriptor *uv_pd = hal_plane_descriptor_new(uv_fd);
+/// struct hal_tensor *src = hal_import_image(proc, y_pd, uv_pd,
+///                                            1920, 1080,
+///                                            HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+/// @endcode
+///
+/// @see hal_plane_descriptor_new, hal_import_image
+pub struct HalPlaneDescriptor {
+    inner: Option<edgefirst_tensor::PlaneDescriptor>,
+}
+
+/// Create a new plane descriptor by duplicating a DMA-BUF file descriptor.
+///
+/// The fd is `dup()`'d immediately — the caller retains ownership of the
+/// original fd. A bad fd will cause this call to fail.
+///
+/// @param fd DMA-BUF file descriptor (caller retains ownership)
+/// @return New plane descriptor handle on success, NULL on error
+/// @par Errors (errno):
+/// - EINVAL: fd is negative
+/// - EMFILE/ENFILE: fd dup failed (fd limit reached)
+/// - EIO: other dup failure
+#[no_mangle]
+pub unsafe extern "C" fn hal_plane_descriptor_new(fd: c_int) -> *mut HalPlaneDescriptor {
+    if fd < 0 {
+        return set_error_null(libc::EINVAL);
+    }
+    use std::os::fd::BorrowedFd;
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    let pd = match edgefirst_tensor::PlaneDescriptor::new(borrowed) {
+        Ok(pd) => pd,
+        Err(_) => return set_error_null(libc::EIO),
+    };
+    Box::into_raw(Box::new(HalPlaneDescriptor { inner: Some(pd) }))
+}
+
+/// Free a plane descriptor.
+///
+/// Only call this if the descriptor was NOT consumed by `hal_import_image()`.
+/// Passing NULL is a safe no-op.
+///
+/// @param pd Plane descriptor handle to free (can be NULL)
+#[no_mangle]
+pub unsafe extern "C" fn hal_plane_descriptor_free(pd: *mut HalPlaneDescriptor) {
+    if !pd.is_null() {
+        drop(unsafe { Box::from_raw(pd) });
+    }
+}
+
+/// Set the row stride (bytes per row) on a plane descriptor.
+///
+/// Only needed when the external buffer has row padding. If not set,
+/// the buffer is assumed tightly packed.
+///
+/// @param pd     Plane descriptor handle
+/// @param stride Row stride in bytes (must be > 0)
+/// @return 0 on success, -1 on error
+#[no_mangle]
+pub unsafe extern "C" fn hal_plane_descriptor_set_stride(
+    pd: *mut HalPlaneDescriptor,
+    stride: size_t,
+) -> c_int {
+    check_null!(pd);
+    if stride == 0 {
+        set_error(libc::EINVAL);
+        return -1;
+    }
+    let pd = unsafe { &mut *pd };
+    if let Some(inner) = pd.inner.take() {
+        pd.inner = Some(inner.with_stride(stride));
+        0
+    } else {
+        set_error(libc::EINVAL);
+        -1
+    }
+}
+
+/// Set the byte offset within the DMA-BUF where image data starts.
+///
+/// @param pd     Plane descriptor handle
+/// @param offset Byte offset
+/// @return 0 on success, -1 on error
+/// @par Errors (errno):
+/// - EINVAL: NULL pd or descriptor already consumed
+#[no_mangle]
+pub unsafe extern "C" fn hal_plane_descriptor_set_offset(
+    pd: *mut HalPlaneDescriptor,
+    offset: size_t,
+) -> c_int {
+    check_null!(pd);
+    let pd = unsafe { &mut *pd };
+    if let Some(inner) = pd.inner.take() {
+        pd.inner = Some(inner.with_offset(offset));
+        0
+    } else {
+        set_error(libc::EINVAL);
+        -1
+    }
+}
+
+/// Import an external DMA-BUF image using plane descriptors.
+///
+/// Both plane descriptors are **always consumed** by this call, whether it
+/// succeeds or fails — do NOT call `hal_plane_descriptor_free()` on them
+/// after calling `hal_import_image()`.
+///
+/// The `chroma` parameter is NULL for single-plane formats. For multiplane
+/// NV12/NV16, pass a second descriptor for the UV plane.
 ///
 /// @param processor Image processor handle
-/// @param fd DMA-BUF file descriptor (caller retains ownership)
-/// @param width Image width in pixels
-/// @param height Image height in pixels
-/// @param fourcc Pixel format (HAL_FOURCC_*)
-/// @param dtype Data type of tensor elements (HAL_DTYPE_*)
-/// @return New tensor handle on success, NULL on error
+/// @param image     Plane descriptor for the primary (Y or only) plane (consumed)
+/// @param chroma    Plane descriptor for the UV chroma plane, or NULL (consumed)
+/// @param width     Image width in pixels
+/// @param height    Image height in pixels
+/// @param format    Pixel format (HAL_PIXEL_FORMAT_*)
+/// @param dtype     Data type (HAL_DTYPE_*)
+/// @return New tensor handle on success (free with `hal_tensor_free()`), NULL on error
 /// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL processor, zero dimensions, bad fd,
-///   invalid image shape, or not an image)
-/// - ENOTSUP: Not supported on this platform
-/// - EIO: Underlying I/O error or unexpected internal failure
+/// - EINVAL: NULL processor/image, zero dimensions, consumed descriptor
+/// - EIO:    Failed to create tensor
+/// - ENOTSUP: Not supported on this platform or format not supported
 #[no_mangle]
 #[cfg(target_os = "linux")]
-pub unsafe extern "C" fn hal_image_processor_create_image_from_fd(
+pub unsafe extern "C" fn hal_import_image(
     processor: *mut HalImageProcessor,
-    fd: c_int,
+    image: *mut HalPlaneDescriptor,
+    chroma: *mut HalPlaneDescriptor,
     width: size_t,
     height: size_t,
-    fourcc: HalFourcc,
+    format: HalPixelFormat,
     dtype: HalDtype,
 ) -> *mut HalTensor {
-    if processor.is_null() || width == 0 || height == 0 || fd < 0 {
+    // Consume descriptors unconditionally so the "always consumed" contract
+    // holds on every code path (including early EINVAL returns).  The Boxes
+    // are dropped at end-of-scope, freeing the OwnedFd inside.
+    let image_box = if image.is_null() {
+        None
+    } else {
+        Some(unsafe { Box::from_raw(image) })
+    };
+    let chroma_box = if chroma.is_null() {
+        None
+    } else {
+        Some(unsafe { Box::from_raw(chroma) })
+    };
+
+    if processor.is_null() || image_box.is_none() || width == 0 || height == 0 {
         return set_error_null(libc::EINVAL);
     }
 
-    use std::os::fd::BorrowedFd;
-    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-    let dyn_tensor = match unsafe { &(*processor) }.inner.create_image_from_fd(
-        borrowed,
+    // Extract the inner PlaneDescriptor from each consumed box
+    let image_pd = match image_box.unwrap().inner {
+        Some(pd) => pd,
+        None => return set_error_null(libc::EINVAL),
+    };
+
+    let chroma_pd = match chroma_box {
+        None => None,
+        Some(cb) => match cb.inner {
+            Some(pd) => Some(pd),
+            None => return set_error_null(libc::EINVAL),
+        },
+    };
+
+    let proc_inner = &unsafe { &(*processor) }.inner;
+    let dyn_tensor = match proc_inner.import_image(
+        image_pd,
+        chroma_pd,
         width,
         height,
-        fourcc.to_pixel_format(),
+        format.to_pixel_format(),
         dtype.into(),
     ) {
         Ok(t) => t,
@@ -1043,96 +1246,21 @@ pub unsafe extern "C" fn hal_image_processor_create_image_from_fd(
             });
         }
     };
+
     Box::into_raw(Box::new(HalTensor { inner: dyn_tensor }))
 }
 
 /// cbindgen:ignore
 #[no_mangle]
 #[cfg(not(target_os = "linux"))]
-pub unsafe extern "C" fn hal_image_processor_create_image_from_fd(
+pub unsafe extern "C" fn hal_import_image(
     _processor: *mut HalImageProcessor,
-    _fd: c_int,
+    _image: *mut HalPlaneDescriptor,
+    _chroma: *mut HalPlaneDescriptor,
     _width: size_t,
     _height: size_t,
-    _fourcc: HalFourcc,
+    _format: HalPixelFormat,
     _dtype: HalDtype,
-) -> *mut HalTensor {
-    set_error_null(libc::ENOTSUP)
-}
-
-/// Create an image tensor from a DMA-BUF fd with an explicit row stride.
-///
-/// Use when the external buffer has row padding (stride > width *
-/// bytes_per_pixel), common with V4L2 and GStreamer allocators.
-///
-/// @param processor Image processor handle
-/// @param fd DMA-BUF file descriptor (caller retains ownership)
-/// @param width Image width in pixels
-/// @param height Image height in pixels
-/// @param fourcc Pixel format (HAL_FOURCC_*)
-/// @param dtype Data type of tensor elements (HAL_DTYPE_*)
-/// @param row_stride Row stride in bytes (must be >= minimum stride for the
-///   format: width * channels for packed, width for planar/semi-planar)
-/// @return New tensor handle on success, NULL on error
-/// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL processor, zero dimensions, bad fd,
-///   stride too small)
-/// - ENOTSUP: Not supported on this platform
-/// - EIO: Underlying I/O error or unexpected internal failure
-#[no_mangle]
-#[cfg(target_os = "linux")]
-pub unsafe extern "C" fn hal_image_processor_create_image_from_fd_with_stride(
-    processor: *mut HalImageProcessor,
-    fd: c_int,
-    width: size_t,
-    height: size_t,
-    fourcc: HalFourcc,
-    dtype: HalDtype,
-    row_stride: size_t,
-) -> *mut HalTensor {
-    if processor.is_null() || width == 0 || height == 0 || fd < 0 || row_stride == 0 {
-        return set_error_null(libc::EINVAL);
-    }
-
-    use std::os::fd::BorrowedFd;
-    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-    let dyn_tensor = match unsafe { &(*processor) }
-        .inner
-        .create_image_from_fd_with_stride(
-            borrowed,
-            width,
-            height,
-            fourcc.to_pixel_format(),
-            dtype.into(),
-            row_stride,
-        ) {
-        Ok(t) => t,
-        Err(e) => {
-            return set_error_null(match &e {
-                edgefirst_image::Error::InvalidShape(_) | edgefirst_image::Error::NotAnImage => {
-                    libc::EINVAL
-                }
-                edgefirst_image::Error::NotSupported(_)
-                | edgefirst_image::Error::NotImplemented(_) => libc::ENOTSUP,
-                edgefirst_image::Error::Io(io) => io.raw_os_error().unwrap_or(libc::EIO),
-                _ => libc::EIO,
-            });
-        }
-    };
-    Box::into_raw(Box::new(HalTensor { inner: dyn_tensor }))
-}
-
-/// cbindgen:ignore
-#[no_mangle]
-#[cfg(not(target_os = "linux"))]
-pub unsafe extern "C" fn hal_image_processor_create_image_from_fd_with_stride(
-    _processor: *mut HalImageProcessor,
-    _fd: c_int,
-    _width: size_t,
-    _height: size_t,
-    _fourcc: HalFourcc,
-    _dtype: HalDtype,
-    _row_stride: size_t,
 ) -> *mut HalTensor {
     set_error_null(libc::ENOTSUP)
 }
@@ -1156,45 +1284,49 @@ mod tests {
     #[test]
     fn test_image_create_and_free() {
         unsafe {
-            let image =
-                hal_tensor_new_image(640, 480, HalFourcc::Rgb, HalDtype::U8, HalTensorMemory::Mem);
+            let image = hal_tensor_new_image(
+                640,
+                480,
+                HalPixelFormat::Rgb,
+                HalDtype::U8,
+                HalTensorMemory::Mem,
+            );
             assert!(!image.is_null());
 
             assert_eq!(hal_tensor_width(image), 640);
             assert_eq!(hal_tensor_height(image), 480);
-            assert_eq!(hal_tensor_fourcc(image), HalFourcc::Rgb);
+            assert_eq!(hal_tensor_pixel_format(image), HalPixelFormat::Rgb);
 
             hal_tensor_free(image);
         }
     }
 
     #[test]
-    fn test_image_all_fourcc_formats() {
+    fn test_image_all_pixel_formats() {
         unsafe {
             let formats = [
-                HalFourcc::Rgb,
-                HalFourcc::Rgba,
-                HalFourcc::Grey,
-                HalFourcc::Nv12,
-                HalFourcc::Nv16,
-                HalFourcc::Yuyv,
-                HalFourcc::PlanarRgb,
-                HalFourcc::PlanarRgba,
+                HalPixelFormat::Rgb,
+                HalPixelFormat::Rgba,
+                HalPixelFormat::Grey,
+                HalPixelFormat::Nv12,
+                HalPixelFormat::Nv16,
+                HalPixelFormat::Yuyv,
+                HalPixelFormat::PlanarRgb,
+                HalPixelFormat::PlanarRgba,
             ];
 
-            for fourcc in formats {
+            for fmt in formats {
                 // Use dimensions that work for all formats (divisible by 2 for YUV)
-                let image =
-                    hal_tensor_new_image(320, 240, fourcc, HalDtype::U8, HalTensorMemory::Mem);
+                let image = hal_tensor_new_image(320, 240, fmt, HalDtype::U8, HalTensorMemory::Mem);
                 assert!(
                     !image.is_null(),
-                    "Failed to create image with fourcc {:?}",
-                    fourcc
+                    "Failed to create image with format {:?}",
+                    fmt
                 );
 
                 assert_eq!(hal_tensor_width(image), 320);
                 assert_eq!(hal_tensor_height(image), 240);
-                assert_eq!(hal_tensor_fourcc(image), fourcc);
+                assert_eq!(hal_tensor_pixel_format(image), fmt);
 
                 hal_tensor_free(image);
             }
@@ -1202,10 +1334,13 @@ mod tests {
     }
 
     #[test]
-    fn test_image_fourcc_null() {
+    fn test_image_pixel_format_null() {
         unsafe {
             // NULL image returns Rgb default
-            assert_eq!(hal_tensor_fourcc(std::ptr::null()), HalFourcc::Rgb);
+            assert_eq!(
+                hal_tensor_pixel_format(std::ptr::null()),
+                HalPixelFormat::Rgb
+            );
         }
     }
 
@@ -1228,18 +1363,18 @@ mod tests {
             assert_eq!(hal_tensor_width(tensor), 0);
 
             // Set format to RGB
-            let ret = hal_tensor_set_format(tensor, HalFourcc::Rgb);
+            let ret = hal_tensor_set_format(tensor, HalPixelFormat::Rgb);
             assert_eq!(ret, 0);
-            assert_eq!(hal_tensor_fourcc(tensor), HalFourcc::Rgb);
+            assert_eq!(hal_tensor_pixel_format(tensor), HalPixelFormat::Rgb);
             assert_eq!(hal_tensor_width(tensor), 640);
             assert_eq!(hal_tensor_height(tensor), 480);
 
             // Wrong format should fail (4-channel format on 3-channel tensor)
-            let ret = hal_tensor_set_format(tensor, HalFourcc::Rgba);
+            let ret = hal_tensor_set_format(tensor, HalPixelFormat::Rgba);
             assert_eq!(ret, -1);
 
             // NULL tensor
-            let ret = hal_tensor_set_format(std::ptr::null_mut(), HalFourcc::Rgb);
+            let ret = hal_tensor_set_format(std::ptr::null_mut(), HalPixelFormat::Rgb);
             assert_eq!(ret, -1);
 
             hal_tensor_free(tensor);
@@ -1362,10 +1497,20 @@ mod tests {
                 return;
             }
 
-            let src =
-                hal_tensor_new_image(100, 100, HalFourcc::Rgb, HalDtype::U8, HalTensorMemory::Mem);
-            let dst =
-                hal_tensor_new_image(100, 100, HalFourcc::Rgb, HalDtype::U8, HalTensorMemory::Mem);
+            let src = hal_tensor_new_image(
+                100,
+                100,
+                HalPixelFormat::Rgb,
+                HalDtype::U8,
+                HalTensorMemory::Mem,
+            );
+            let dst = hal_tensor_new_image(
+                100,
+                100,
+                HalPixelFormat::Rgb,
+                HalDtype::U8,
+                HalTensorMemory::Mem,
+            );
             assert!(!src.is_null());
             assert!(!dst.is_null());
 
@@ -1417,8 +1562,12 @@ mod tests {
     #[test]
     fn test_image_load_null_data() {
         unsafe {
-            let image =
-                hal_tensor_load_image(std::ptr::null(), 100, HalFourcc::Rgb, HalTensorMemory::Mem);
+            let image = hal_tensor_load_image(
+                std::ptr::null(),
+                100,
+                HalPixelFormat::Rgb,
+                HalTensorMemory::Mem,
+            );
             assert!(image.is_null());
         }
     }
@@ -1428,7 +1577,7 @@ mod tests {
         unsafe {
             let data = [0u8; 10];
             let image =
-                hal_tensor_load_image(data.as_ptr(), 0, HalFourcc::Rgb, HalTensorMemory::Mem);
+                hal_tensor_load_image(data.as_ptr(), 0, HalPixelFormat::Rgb, HalTensorMemory::Mem);
             assert!(image.is_null());
         }
     }
@@ -1436,8 +1585,11 @@ mod tests {
     #[test]
     fn test_image_load_file_null_path() {
         unsafe {
-            let image =
-                hal_tensor_load_image_file(std::ptr::null(), HalFourcc::Rgb, HalTensorMemory::Mem);
+            let image = hal_tensor_load_image_file(
+                std::ptr::null(),
+                HalPixelFormat::Rgb,
+                HalTensorMemory::Mem,
+            );
             assert!(image.is_null());
         }
     }
@@ -1446,8 +1598,11 @@ mod tests {
     fn test_image_load_file_nonexistent() {
         unsafe {
             let path = CString::new("/nonexistent/path/image.jpg").unwrap();
-            let image =
-                hal_tensor_load_image_file(path.as_ptr(), HalFourcc::Rgb, HalTensorMemory::Mem);
+            let image = hal_tensor_load_image_file(
+                path.as_ptr(),
+                HalPixelFormat::Rgb,
+                HalTensorMemory::Mem,
+            );
             assert!(image.is_null());
         }
     }
@@ -1455,8 +1610,13 @@ mod tests {
     #[test]
     fn test_image_save_jpeg_null_params() {
         unsafe {
-            let image =
-                hal_tensor_new_image(100, 100, HalFourcc::Rgb, HalDtype::U8, HalTensorMemory::Mem);
+            let image = hal_tensor_new_image(
+                100,
+                100,
+                HalPixelFormat::Rgb,
+                HalDtype::U8,
+                HalTensorMemory::Mem,
+            );
             assert!(!image.is_null());
 
             let path = CString::new("/tmp/test.jpg").unwrap();
@@ -1486,8 +1646,13 @@ mod tests {
     #[test]
     fn test_image_is_planar() {
         unsafe {
-            let rgb =
-                hal_tensor_new_image(100, 100, HalFourcc::Rgb, HalDtype::U8, HalTensorMemory::Mem);
+            let rgb = hal_tensor_new_image(
+                100,
+                100,
+                HalPixelFormat::Rgb,
+                HalDtype::U8,
+                HalTensorMemory::Mem,
+            );
             assert!(!rgb.is_null());
             assert!(!hal_tensor_is_planar(rgb));
             hal_tensor_free(rgb);
@@ -1495,7 +1660,7 @@ mod tests {
             let nv12 = hal_tensor_new_image(
                 100,
                 100,
-                HalFourcc::Nv12,
+                HalPixelFormat::Nv12,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
             );
@@ -1506,7 +1671,7 @@ mod tests {
             let planar = hal_tensor_new_image(
                 100,
                 100,
-                HalFourcc::PlanarRgb,
+                HalPixelFormat::PlanarRgb,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
             );
@@ -1522,8 +1687,13 @@ mod tests {
     #[test]
     fn test_image_channels() {
         unsafe {
-            let rgb =
-                hal_tensor_new_image(100, 100, HalFourcc::Rgb, HalDtype::U8, HalTensorMemory::Mem);
+            let rgb = hal_tensor_new_image(
+                100,
+                100,
+                HalPixelFormat::Rgb,
+                HalDtype::U8,
+                HalTensorMemory::Mem,
+            );
             assert!(!rgb.is_null());
             assert_eq!(hal_tensor_channels(rgb), 3);
             hal_tensor_free(rgb);
@@ -1531,7 +1701,7 @@ mod tests {
             let rgba = hal_tensor_new_image(
                 100,
                 100,
-                HalFourcc::Rgba,
+                HalPixelFormat::Rgba,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
             );
@@ -1542,7 +1712,7 @@ mod tests {
             let grey = hal_tensor_new_image(
                 100,
                 100,
-                HalFourcc::Grey,
+                HalPixelFormat::Grey,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
             );
@@ -1558,8 +1728,13 @@ mod tests {
     #[test]
     fn test_image_row_stride() {
         unsafe {
-            let rgb =
-                hal_tensor_new_image(100, 100, HalFourcc::Rgb, HalDtype::U8, HalTensorMemory::Mem);
+            let rgb = hal_tensor_new_image(
+                100,
+                100,
+                HalPixelFormat::Rgb,
+                HalDtype::U8,
+                HalTensorMemory::Mem,
+            );
             assert!(!rgb.is_null());
             assert_eq!(hal_tensor_row_stride(rgb), 300); // 100 * 3
             hal_tensor_free(rgb);
@@ -1567,7 +1742,7 @@ mod tests {
             let planar = hal_tensor_new_image(
                 100,
                 100,
-                HalFourcc::PlanarRgb,
+                HalPixelFormat::PlanarRgb,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
             );
@@ -1583,13 +1758,17 @@ mod tests {
     #[test]
     fn test_image_load_jpeg_null() {
         unsafe {
-            let image =
-                hal_tensor_load_jpeg(std::ptr::null(), 100, HalFourcc::Rgb, HalTensorMemory::Mem);
+            let image = hal_tensor_load_jpeg(
+                std::ptr::null(),
+                100,
+                HalPixelFormat::Rgb,
+                HalTensorMemory::Mem,
+            );
             assert!(image.is_null());
 
             let data = [0u8; 10];
             let image =
-                hal_tensor_load_jpeg(data.as_ptr(), 0, HalFourcc::Rgb, HalTensorMemory::Mem);
+                hal_tensor_load_jpeg(data.as_ptr(), 0, HalPixelFormat::Rgb, HalTensorMemory::Mem);
             assert!(image.is_null());
         }
     }
@@ -1597,12 +1776,17 @@ mod tests {
     #[test]
     fn test_image_load_png_null() {
         unsafe {
-            let image =
-                hal_tensor_load_png(std::ptr::null(), 100, HalFourcc::Rgb, HalTensorMemory::Mem);
+            let image = hal_tensor_load_png(
+                std::ptr::null(),
+                100,
+                HalPixelFormat::Rgb,
+                HalTensorMemory::Mem,
+            );
             assert!(image.is_null());
 
             let data = [0u8; 10];
-            let image = hal_tensor_load_png(data.as_ptr(), 0, HalFourcc::Rgb, HalTensorMemory::Mem);
+            let image =
+                hal_tensor_load_png(data.as_ptr(), 0, HalPixelFormat::Rgb, HalTensorMemory::Mem);
             assert!(image.is_null());
         }
     }
@@ -1615,8 +1799,13 @@ mod tests {
                 return;
             }
 
-            let dst =
-                hal_tensor_new_image(100, 100, HalFourcc::Rgb, HalDtype::U8, HalTensorMemory::Mem);
+            let dst = hal_tensor_new_image(
+                100,
+                100,
+                HalPixelFormat::Rgb,
+                HalDtype::U8,
+                HalTensorMemory::Mem,
+            );
             assert!(!dst.is_null());
 
             // NULL processor
@@ -1694,8 +1883,13 @@ mod tests {
         };
 
         unsafe {
-            let image =
-                hal_tensor_new_image(100, 50, HalFourcc::Rgb, HalDtype::U8, HalTensorMemory::Mem);
+            let image = hal_tensor_new_image(
+                100,
+                50,
+                HalPixelFormat::Rgb,
+                HalDtype::U8,
+                HalTensorMemory::Mem,
+            );
             assert!(!image.is_null());
 
             let map = hal_tensor_map_create(image);
@@ -1723,7 +1917,7 @@ mod tests {
             let image = hal_tensor_new_image(
                 64,
                 64,
-                HalFourcc::PlanarRgb,
+                HalPixelFormat::PlanarRgb,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
             );
@@ -1747,21 +1941,21 @@ mod tests {
     fn test_pixel_format_roundtrip() {
         // Test all PixelFormat conversions roundtrip
         let formats = [
-            HalFourcc::Yuyv,
-            HalFourcc::Nv12,
-            HalFourcc::Nv16,
-            HalFourcc::Rgba,
-            HalFourcc::Rgb,
-            HalFourcc::Grey,
-            HalFourcc::PlanarRgb,
-            HalFourcc::PlanarRgba,
-            HalFourcc::Bgra,
-            HalFourcc::Vyuy,
+            HalPixelFormat::Yuyv,
+            HalPixelFormat::Nv12,
+            HalPixelFormat::Nv16,
+            HalPixelFormat::Rgba,
+            HalPixelFormat::Rgb,
+            HalPixelFormat::Grey,
+            HalPixelFormat::PlanarRgb,
+            HalPixelFormat::PlanarRgba,
+            HalPixelFormat::Bgra,
+            HalPixelFormat::Vyuy,
         ];
 
         for format in formats {
             let pf = format.to_pixel_format();
-            let back = HalFourcc::from_pixel_format(pf);
+            let back = HalPixelFormat::from_pixel_format(pf);
             assert_eq!(back, format, "Roundtrip failed for {:?}", format);
         }
     }
@@ -1774,7 +1968,7 @@ mod tests {
                 std::ptr::null_mut(),
                 640,
                 480,
-                HalFourcc::Rgba,
+                HalPixelFormat::Rgba,
                 HalDtype::U8,
             );
             assert!(img.is_null());
@@ -1784,13 +1978,23 @@ mod tests {
             if processor.is_null() {
                 return;
             }
-            let img =
-                hal_image_processor_create_image(processor, 0, 480, HalFourcc::Rgba, HalDtype::U8);
+            let img = hal_image_processor_create_image(
+                processor,
+                0,
+                480,
+                HalPixelFormat::Rgba,
+                HalDtype::U8,
+            );
             assert!(img.is_null());
 
             // Zero height
-            let img =
-                hal_image_processor_create_image(processor, 640, 0, HalFourcc::Rgba, HalDtype::U8);
+            let img = hal_image_processor_create_image(
+                processor,
+                640,
+                0,
+                HalPixelFormat::Rgba,
+                HalDtype::U8,
+            );
             assert!(img.is_null());
 
             hal_image_processor_free(processor);
@@ -1812,23 +2016,22 @@ mod tests {
             }
 
             let formats = [
-                (HalFourcc::Rgb, 3),
-                (HalFourcc::Rgba, 4),
-                (HalFourcc::Grey, 1),
+                (HalPixelFormat::Rgb, 3),
+                (HalPixelFormat::Rgba, 4),
+                (HalPixelFormat::Grey, 1),
             ];
 
-            for (fourcc, channels) in formats {
-                let img =
-                    hal_image_processor_create_image(processor, 320, 240, fourcc, HalDtype::U8);
-                assert!(!img.is_null(), "create_image failed for {:?}", fourcc);
+            for (fmt, channels) in formats {
+                let img = hal_image_processor_create_image(processor, 320, 240, fmt, HalDtype::U8);
+                assert!(!img.is_null(), "create_image failed for {:?}", fmt);
 
                 assert_eq!(hal_tensor_width(img), 320);
                 assert_eq!(hal_tensor_height(img), 240);
-                assert_eq!(hal_tensor_fourcc(img), fourcc);
+                assert_eq!(hal_tensor_pixel_format(img), fmt);
 
                 // Verify the image is mappable
                 let map = hal_tensor_map_create(img);
-                assert!(!map.is_null(), "map failed for {:?}", fourcc);
+                assert!(!map.is_null(), "map failed for {:?}", fmt);
                 assert_eq!(hal_tensor_map_size(map), 320 * 240 * channels);
                 assert!(!hal_tensor_map_data_const(map).is_null());
                 hal_tensor_map_unmap(map);
@@ -1850,8 +2053,13 @@ mod tests {
             }
 
             // I8 image via create_image
-            let img =
-                hal_image_processor_create_image(processor, 320, 240, HalFourcc::Rgb, HalDtype::I8);
+            let img = hal_image_processor_create_image(
+                processor,
+                320,
+                240,
+                HalPixelFormat::Rgb,
+                HalDtype::I8,
+            );
             assert!(!img.is_null(), "create_image with I8 dtype failed");
             assert_eq!(hal_tensor_dtype(img), HalDtype::I8);
             assert_eq!(hal_tensor_width(img), 320);
@@ -1878,7 +2086,7 @@ mod tests {
                 processor,
                 320,
                 240,
-                HalFourcc::Rgba,
+                HalPixelFormat::Rgba,
                 HalDtype::U8,
             );
             assert!(!src.is_null());
@@ -1888,7 +2096,7 @@ mod tests {
                 processor,
                 160,
                 120,
-                HalFourcc::Rgba,
+                HalPixelFormat::Rgba,
                 HalDtype::U8,
             );
             assert!(!dst.is_null());
@@ -1926,9 +2134,9 @@ mod tests {
             assert!(!tensor.is_null());
 
             // Set format to PlanarRgb
-            let ret = hal_tensor_set_format(tensor, HalFourcc::PlanarRgb);
+            let ret = hal_tensor_set_format(tensor, HalPixelFormat::PlanarRgb);
             assert_eq!(ret, 0);
-            assert_eq!(hal_tensor_fourcc(tensor), HalFourcc::PlanarRgb);
+            assert_eq!(hal_tensor_pixel_format(tensor), HalPixelFormat::PlanarRgb);
             assert_eq!(hal_tensor_width(tensor), 640);
             assert_eq!(hal_tensor_height(tensor), 480);
 
@@ -1952,9 +2160,9 @@ mod tests {
             assert!(!tensor.is_null());
 
             // Set format to Nv12
-            let ret = hal_tensor_set_format(tensor, HalFourcc::Nv12);
+            let ret = hal_tensor_set_format(tensor, HalPixelFormat::Nv12);
             assert_eq!(ret, 0);
-            assert_eq!(hal_tensor_fourcc(tensor), HalFourcc::Nv12);
+            assert_eq!(hal_tensor_pixel_format(tensor), HalPixelFormat::Nv12);
             assert_eq!(hal_tensor_width(tensor), 640);
             assert_eq!(hal_tensor_height(tensor), 480);
 
@@ -1962,116 +2170,233 @@ mod tests {
         }
     }
 
-    #[test]
+    /// Helper: create a valid fd via memfd_create (Linux) or pipe (other Unix).
     #[cfg(target_os = "linux")]
-    fn test_create_image_from_fd_null_params() {
+    fn make_test_fd() -> c_int {
+        unsafe { libc::memfd_create(c"test".as_ptr(), 0) }
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn make_test_fd() -> c_int {
+        let mut fds = [0c_int; 2];
+        unsafe { libc::pipe(fds.as_mut_ptr()) };
+        unsafe { libc::close(fds[1]) };
+        fds[0]
+    }
+
+    #[test]
+    fn test_plane_descriptor_bad_fd() {
         unsafe {
-            // NULL processor should return NULL
-            let result = hal_image_processor_create_image_from_fd(
-                std::ptr::null_mut(),
-                0,
-                640,
-                480,
-                HalFourcc::Rgba,
-                HalDtype::U8,
-            );
-            assert!(result.is_null());
-
-            // fd = -1 should return NULL
-            let processor = hal_image_processor_new();
-            if !processor.is_null() {
-                let result = hal_image_processor_create_image_from_fd(
-                    processor,
-                    -1,
-                    640,
-                    480,
-                    HalFourcc::Rgba,
-                    HalDtype::U8,
-                );
-                assert!(result.is_null());
-
-                // width = 0 should return NULL
-                let result = hal_image_processor_create_image_from_fd(
-                    processor,
-                    0,
-                    0,
-                    480,
-                    HalFourcc::Rgba,
-                    HalDtype::U8,
-                );
-                assert!(result.is_null());
-
-                // height = 0 should return NULL
-                let result = hal_image_processor_create_image_from_fd(
-                    processor,
-                    0,
-                    640,
-                    0,
-                    HalFourcc::Rgba,
-                    HalDtype::U8,
-                );
-                assert!(result.is_null());
-
-                hal_image_processor_free(processor);
-            }
+            let pd = hal_plane_descriptor_new(-1);
+            assert!(pd.is_null());
         }
     }
 
     #[test]
-    fn test_create_image_from_fd_with_stride_null_params() {
+    fn test_plane_descriptor_free_null() {
         unsafe {
-            // NULL processor should return NULL
-            let result = hal_image_processor_create_image_from_fd_with_stride(
+            // NULL is a safe no-op
+            hal_plane_descriptor_free(std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn test_plane_descriptor_set_stride() {
+        let fd = make_test_fd();
+        assert!(fd >= 0, "make_test_fd failed");
+        unsafe {
+            let pd = hal_plane_descriptor_new(fd);
+            libc::close(fd); // original fd — descriptor holds its own dup
+            assert!(!pd.is_null());
+
+            // stride = 0 should fail
+            assert_eq!(hal_plane_descriptor_set_stride(pd, 0), -1);
+
+            // valid stride
+            assert_eq!(hal_plane_descriptor_set_stride(pd, 2048), 0);
+
+            hal_plane_descriptor_free(pd);
+        }
+    }
+
+    #[test]
+    fn test_plane_descriptor_set_offset() {
+        let fd = make_test_fd();
+        assert!(fd >= 0);
+        unsafe {
+            let pd = hal_plane_descriptor_new(fd);
+            libc::close(fd);
+            assert!(!pd.is_null());
+
+            assert_eq!(hal_plane_descriptor_set_offset(pd, 4096), 0);
+            // offset = 0 is also valid
+            assert_eq!(hal_plane_descriptor_set_offset(pd, 0), 0);
+
+            hal_plane_descriptor_free(pd);
+        }
+    }
+
+    #[test]
+    fn test_plane_descriptor_null_set_stride() {
+        unsafe {
+            assert_eq!(
+                hal_plane_descriptor_set_stride(std::ptr::null_mut(), 2048),
+                -1
+            );
+        }
+    }
+
+    #[test]
+    fn test_plane_descriptor_null_set_offset() {
+        unsafe {
+            assert_eq!(hal_plane_descriptor_set_offset(std::ptr::null_mut(), 0), -1);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_import_image_null_processor() {
+        let fd = make_test_fd();
+        assert!(fd >= 0);
+        unsafe {
+            let pd = hal_plane_descriptor_new(fd);
+            libc::close(fd);
+            assert!(!pd.is_null());
+
+            // NULL processor — pd is still consumed (always-consume contract)
+            let result = hal_import_image(
                 std::ptr::null_mut(),
-                0,
+                pd,
+                std::ptr::null_mut(),
                 640,
                 480,
-                HalFourcc::Rgba,
+                HalPixelFormat::Rgba,
                 HalDtype::U8,
-                2560,
+            );
+            assert!(result.is_null());
+            // pd is consumed — do NOT free
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_import_image_null_image() {
+        unsafe {
+            let processor = hal_image_processor_new();
+            if processor.is_null() {
+                return;
+            }
+
+            let result = hal_import_image(
+                processor,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                640,
+                480,
+                HalPixelFormat::Rgba,
+                HalDtype::U8,
             );
             assert!(result.is_null());
 
-            // fd = -1 should return NULL
+            hal_image_processor_free(processor);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_import_image_zero_width() {
+        let fd = make_test_fd();
+        assert!(fd >= 0);
+        unsafe {
+            let pd = hal_plane_descriptor_new(fd);
+            libc::close(fd);
+            assert!(!pd.is_null());
+
             let processor = hal_image_processor_new();
-            if !processor.is_null() {
-                let result = hal_image_processor_create_image_from_fd_with_stride(
-                    processor,
-                    -1,
-                    640,
-                    480,
-                    HalFourcc::Rgba,
-                    HalDtype::U8,
-                    2560,
-                );
-                assert!(result.is_null());
-
-                // row_stride = 0 should return NULL
-                let result = hal_image_processor_create_image_from_fd_with_stride(
-                    processor,
-                    0,
-                    640,
-                    480,
-                    HalFourcc::Rgba,
-                    HalDtype::U8,
-                    0,
-                );
-                assert!(result.is_null());
-
-                // width = 0 should return NULL
-                let result = hal_image_processor_create_image_from_fd_with_stride(
-                    processor,
-                    0,
-                    0,
-                    480,
-                    HalFourcc::Rgba,
-                    HalDtype::U8,
-                    2560,
-                );
-                assert!(result.is_null());
-
-                hal_image_processor_free(processor);
+            if processor.is_null() {
+                hal_plane_descriptor_free(pd);
+                return;
             }
+
+            let result = hal_import_image(
+                processor,
+                pd,
+                std::ptr::null_mut(),
+                0,
+                480,
+                HalPixelFormat::Rgba,
+                HalDtype::U8,
+            );
+            assert!(result.is_null());
+
+            hal_image_processor_free(processor);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_import_image_zero_height() {
+        let fd = make_test_fd();
+        assert!(fd >= 0);
+        unsafe {
+            let pd = hal_plane_descriptor_new(fd);
+            libc::close(fd);
+            assert!(!pd.is_null());
+
+            let processor = hal_image_processor_new();
+            if processor.is_null() {
+                hal_plane_descriptor_free(pd);
+                return;
+            }
+
+            let result = hal_import_image(
+                processor,
+                pd,
+                std::ptr::null_mut(),
+                640,
+                0,
+                HalPixelFormat::Rgba,
+                HalDtype::U8,
+            );
+            assert!(result.is_null());
+
+            hal_image_processor_free(processor);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_import_image_chroma_with_packed_format() {
+        // Passing a chroma descriptor with a non-semi-planar format should fail
+        let fd1 = make_test_fd();
+        let fd2 = make_test_fd();
+        assert!(fd1 >= 0 && fd2 >= 0);
+        unsafe {
+            let pd = hal_plane_descriptor_new(fd1);
+            let cpd = hal_plane_descriptor_new(fd2);
+            libc::close(fd1);
+            libc::close(fd2);
+            assert!(!pd.is_null() && !cpd.is_null());
+
+            let processor = hal_image_processor_new();
+            if processor.is_null() {
+                hal_plane_descriptor_free(pd);
+                hal_plane_descriptor_free(cpd);
+                return;
+            }
+
+            // RGBA is packed — chroma descriptor should cause ENOTSUP
+            let result = hal_import_image(
+                processor,
+                pd,
+                cpd,
+                640,
+                480,
+                HalPixelFormat::Rgba,
+                HalDtype::U8,
+            );
+            assert!(result.is_null());
+
+            hal_image_processor_free(processor);
         }
     }
 
