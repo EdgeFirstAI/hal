@@ -80,9 +80,6 @@ pub struct GLProcessorST {
     /// Whether the GPU is a Verisilicon/Vivante core (detected via GL_RENDERER).
     /// Used to block operations known to cause unrecoverable GPU hangs.
     is_vivante: bool,
-    /// Whether the renderer is software-based (llvmpipe, softpipe, swrast).
-    /// PBO transfers are disabled on software renderers because readback is unreliable.
-    is_software_renderer: bool,
     /// Intermediate RGBA texture for two-pass packed RGB conversion.
     /// Pass 1 renders YUYV/NV12→RGBA here; Pass 2 packs RGBA→RGB to DMA dest.
     packed_rgb_intermediate_tex: Texture,
@@ -290,6 +287,18 @@ impl GLProcessorST {
         let (has_float_linear, has_bgra, is_vivante, is_software_renderer) =
             Self::gl_check_support()?;
 
+        // Software renderers (llvmpipe, softpipe, swrast) are CPU-based OpenGL
+        // implementations that are slower and less capable than our native CPU
+        // backend. Reject them early — the caller falls back to CPU automatically.
+        if is_software_renderer {
+            return Err(crate::Error::NotSupported(
+                "software OpenGL renderer detected (llvmpipe/softpipe/swrast); \
+                 using CPU backend instead — check EGL ICD configuration if a \
+                 hardware GPU is expected"
+                    .into(),
+            ));
+        }
+
         // Uploads and downloads are all packed with no alignment requirements
         unsafe {
             gls::gl::PixelStorei(gls::gl::PACK_ALIGNMENT, 1);
@@ -430,7 +439,6 @@ impl GLProcessorST {
             last_bound_src_egl: None,
             bgra_warned: false,
             is_vivante,
-            is_software_renderer,
             packed_rgb_intermediate_tex: Texture::new(),
             packed_rgb_fbo: FrameBuffer::new(),
             packed_rgb_intermediate_size: (0, 0),
@@ -449,12 +457,9 @@ impl GLProcessorST {
             converter.gl_context.transfer_backend = TransferBackend::Pbo;
         }
 
-        // If DMA-buf failed/unavailable but GL is alive, use PBO transfers —
-        // unless the renderer is software-based (llvmpipe/softpipe/swrast), where
-        // PBO readback is known to fail with GL_INVALID_OPERATION.
-        if converter.gl_context.transfer_backend == TransferBackend::Sync
-            && !converter.is_software_renderer
-        {
+        // If DMA-buf failed/unavailable but GL is alive, use PBO transfers.
+        // Software renderers never reach here — they are rejected above.
+        if converter.gl_context.transfer_backend == TransferBackend::Sync {
             log::info!("Upgrading transfer backend from Sync to Pbo (GL context available)");
             converter.gl_context.transfer_backend = TransferBackend::Pbo;
         }
@@ -1466,8 +1471,8 @@ impl GLProcessorST {
         }
         if is_software_renderer {
             log::warn!(
-                "Software renderer detected — PBO transfers will be disabled. \
-                 Image processing will use CPU upload/readback paths (slower). \
+                "Software OpenGL renderer detected — GPU backend will be disabled. \
+                 Image processing will use the CPU backend instead. \
                  Check EGL ICD configuration if a hardware GPU is expected."
             );
         }
