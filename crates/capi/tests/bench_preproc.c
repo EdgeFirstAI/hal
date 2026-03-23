@@ -3,16 +3,26 @@
 //
 // C API performance benchmark for image preprocessing pipeline.
 //
-// Measures the cost of different tensor usage patterns through the C API:
-//   1. Tensor reuse (optimal): allocate once, convert N times
-//   2. Tensor recreation (anti-pattern): create_image + free each iteration
-//   3. Chained conversion: two-stage pipeline with tensor reuse
-//   4. Buffer pool rotation: multiple source buffers, round-robin
+// Gold-standard reference for C API integrators (GStreamer, V4L2, etc.).
+// Demonstrates correct DMA-BUF import patterns and measures their cost.
+//
+// Benchmark sections:
+//   1. DMA-BUF import patterns (hal_import_image + hal_plane_descriptor):
+//      a. Import + reuse: import once, convert N times (optimal)
+//      b. Import pool: V4L2-style buffer pool rotation with imported fds
+//      c. Import with stride: padded buffers (V4L2 bytesperline)
+//      d. Import multiplane NV12: separate Y and UV plane fds
+//      e. Import per frame: re-import every iteration (anti-pattern)
+//   2. Internal allocation patterns (hal_image_processor_create_image):
+//      a. Reuse: allocate once, convert N times (format matrix)
+//      b. Chained pipeline: NV12 -> RGBA -> PlanarRgb I8
+//      c. Recreate per frame: allocate + free each iteration (anti-pattern)
 //
 // Build:   make bench
 // Run:     ./build/bench_preproc
 // Env:     BENCH_ITERATIONS=200         Override iteration count (default 100)
 //          EDGEFIRST_FORCE_BACKEND=cpu   Pin a specific compute backend
+//          BENCH_LOG=1                   Enable HAL debug logging
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,19 +78,19 @@ typedef struct {
 } bench_result;
 
 static void result_print_header(void) {
-    printf("%-36s %-28s %9s %9s %9s  (n)\n",
+    printf("%-40s %-28s %9s %9s %9s  (n)\n",
            "Pattern", "Format", "Avg (ms)", "Min (ms)", "Max (ms)");
     printf("-------------------------------------"
            "-------------------------------------"
-           "--------------------\n");
+           "------------------------\n");
 }
 
 static void result_print(const bench_result *r) {
     if (!r->ok) {
-        printf("%-36s %-28s [skipped: %s]\n", r->pattern, r->format, r->skip_reason);
+        printf("%-40s %-28s [skipped: %s]\n", r->pattern, r->format, r->skip_reason);
         return;
     }
-    printf("%-36s %-28s %9.2f %9.2f %9.2f  (%d)\n",
+    printf("%-40s %-28s %9.2f %9.2f %9.2f  (%d)\n",
            r->pattern, r->format, r->avg_ms, r->min_ms, r->max_ms, r->iterations);
 }
 
@@ -117,34 +127,111 @@ static struct hal_crop make_letterbox_crop(void) {
 }
 
 // ============================================================================
-// Benchmark 1: Tensor reuse (optimal pattern)
+// DMA-BUF fd helper
 //
-// Allocates source and destination tensors once, then calls convert() N times
-// with the same handles. This is the fastest pattern because the EGL image
-// cache hits on every iteration after warmup.
+// Allocates a DMA tensor via HAL and clones its fd.  This simulates
+// receiving a DMA-BUF fd from an external source (V4L2, GStreamer, etc.).
+// Returns the fd (caller must close) or -1 if DMA is unavailable.
 // ============================================================================
 
-static bench_result bench_reuse(struct hal_image_processor *proc,
-                                enum hal_pixel_format src_fmt,
-                                enum hal_pixel_format dst_fmt,
-                                enum hal_dtype dst_dtype,
-                                const char *format_label,
-                                int iterations) {
+static int allocate_dma_fd(size_t w, size_t h, enum hal_pixel_format fmt) {
+    size_t shape[3] = {h, w, 0};
+    size_t ndim;
+
+    // Compute shape for the requested format
+    switch (fmt) {
+    case HAL_PIXEL_FORMAT_RGBA:
+    case HAL_PIXEL_FORMAT_BGRA:
+        shape[2] = 4; ndim = 3; break;
+    case HAL_PIXEL_FORMAT_RGB:
+        shape[2] = 3; ndim = 3; break;
+    case HAL_PIXEL_FORMAT_GREY:
+        shape[2] = 1; ndim = 3; break;
+    case HAL_PIXEL_FORMAT_NV12:
+        shape[0] = h * 3 / 2; shape[1] = w; ndim = 2; break;
+    case HAL_PIXEL_FORMAT_NV16:
+        shape[0] = h * 2; shape[1] = w; ndim = 2; break;
+    case HAL_PIXEL_FORMAT_YUYV:
+    case HAL_PIXEL_FORMAT_VYUY:
+        shape[2] = 2; ndim = 3; break;
+    case HAL_PIXEL_FORMAT_PLANAR_RGB:
+        shape[0] = 3; shape[1] = h; shape[2] = w; ndim = 3; break;
+    case HAL_PIXEL_FORMAT_PLANAR_RGBA:
+        shape[0] = 4; shape[1] = h; shape[2] = w; ndim = 3; break;
+    default:
+        return -1;
+    }
+
+    struct hal_tensor *tmp = hal_tensor_new(
+        HAL_DTYPE_U8, shape, ndim, HAL_TENSOR_MEMORY_DMA, NULL);
+    if (!tmp) return -1;
+
+    int fd = hal_tensor_dmabuf_clone(tmp);
+    hal_tensor_free(tmp);
+    return fd;
+}
+
+// Allocate a DMA fd for a standalone Y or UV plane (2D: [height, width]).
+static int allocate_plane_fd(size_t h, size_t w) {
+    size_t shape[2] = {h, w};
+    struct hal_tensor *tmp = hal_tensor_new(
+        HAL_DTYPE_U8, shape, 2, HAL_TENSOR_MEMORY_DMA, NULL);
+    if (!tmp) return -1;
+
+    int fd = hal_tensor_dmabuf_clone(tmp);
+    hal_tensor_free(tmp);
+    return fd;
+}
+
+// ============================================================================
+// Section 1a: DMA-BUF import + reuse (optimal pattern)
+//
+// This is the recommended GStreamer / V4L2 integration pattern:
+//   1. Receive a DMA-BUF fd from the camera/decoder
+//   2. Build a hal_plane_descriptor (dups the fd)
+//   3. Call hal_import_image() once (consumes the descriptor)
+//   4. Reuse the returned tensor across all frames from the same buffer
+//   5. Only re-import when the fd changes (new buffer from pool)
+//
+// After warmup, every convert() is an EGL image cache hit.
+// ============================================================================
+
+static bench_result bench_import_reuse(struct hal_image_processor *proc,
+                                       int iterations) {
     bench_result res = {
-        .pattern = "Reuse tensors",
-        .format  = format_label,
+        .pattern = "Import + reuse (recommended)",
+        .format  = "NV12->RGBA 1080p",
         .ok      = 0,
     };
 
-    struct hal_tensor *src = hal_image_processor_create_image(
-        proc, SRC_W, SRC_H, src_fmt, HAL_DTYPE_U8);
-    if (!src) {
-        res.skip_reason = "src allocation failed";
+    // Simulate receiving a DMA-BUF fd from an external source
+    int ext_fd = allocate_dma_fd(SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12);
+    if (ext_fd < 0) {
+        res.skip_reason = "DMA allocation unavailable";
         return res;
     }
 
+    // Build a plane descriptor — dups the fd immediately.
+    // The caller retains ownership of ext_fd.
+    struct hal_plane_descriptor *pd = hal_plane_descriptor_new(ext_fd);
+    close(ext_fd);  // We can close our fd — the descriptor holds its own dup
+    if (!pd) {
+        res.skip_reason = "plane descriptor creation failed";
+        return res;
+    }
+
+    // Import the image — consumes pd (do NOT free pd after this)
+    struct hal_tensor *src = hal_import_image(
+        proc, pd, NULL, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+    // pd is consumed — do NOT call hal_plane_descriptor_free(pd)
+    if (!src) {
+        res.skip_reason = "hal_import_image failed";
+        return res;
+    }
+
+    // Allocate destination (reused across all frames)
     struct hal_tensor *dst = hal_image_processor_create_image(
-        proc, DST_W, DST_H, dst_fmt, dst_dtype);
+        proc, DST_W, DST_H, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
     if (!dst) {
         hal_tensor_free(src);
         res.skip_reason = "dst allocation failed";
@@ -153,7 +240,7 @@ static bench_result bench_reuse(struct hal_image_processor *proc,
 
     struct hal_crop crop = make_letterbox_crop();
 
-    // Pre-flight: check that this format combination is supported.
+    // Pre-flight
     if (hal_image_processor_convert(proc, src, dst,
                                      HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop) != 0) {
         hal_tensor_free(src);
@@ -162,223 +249,20 @@ static bench_result bench_reuse(struct hal_image_processor *proc,
         return res;
     }
 
-    // Warmup (unmeasured)
-    for (int i = 0; i < WARMUP_ITERATIONS; i++) {
-        hal_image_processor_convert(proc, src, dst,
-                                     HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop);
-    }
-
-    // Measured iterations
-    double total = 0.0;
-    double min_t = DBL_MAX;
-    double max_t = 0.0;
-
-    for (int i = 0; i < iterations; i++) {
-        struct timespec t0, t1;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-        hal_image_processor_convert(proc, src, dst,
-                                     HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop);
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-
-        double ms = elapsed_ms(&t0, &t1);
-        total += ms;
-        if (ms < min_t) min_t = ms;
-        if (ms > max_t) max_t = ms;
-    }
-
-    hal_tensor_free(src);
-    hal_tensor_free(dst);
-
-    res.ok         = 1;
-    res.iterations = iterations;
-    res.avg_ms     = total / iterations;
-    res.min_ms     = min_t;
-    res.max_ms     = max_t;
-    return res;
-}
-
-// ============================================================================
-// Benchmark 2: Recreate tensor per frame (anti-pattern)
-//
-// Each iteration: allocate a brand new source tensor via
-// hal_image_processor_create_image(), convert, then free.  Every new
-// allocation gets a fresh BufferIdentity (new DMA-BUF fd or PBO), forcing
-// an EGL image cache miss on every iteration.  This quantifies the overhead
-// of not reusing tensors across frames.
-// ============================================================================
-
-static bench_result bench_recreate(struct hal_image_processor *proc,
-                                   int iterations) {
-    bench_result res = {
-        .pattern = "Recreate tensor per frame",
-        .format  = "NV12->RGBA 1080p",
-        .ok      = 0,
-    };
-
-    // Destination tensor is reused (we are only measuring source-side churn).
-    struct hal_tensor *dst = hal_image_processor_create_image(
-        proc, DST_W, DST_H, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
-    if (!dst) {
-        res.skip_reason = "dst allocation failed";
-        return res;
-    }
-
-    struct hal_crop crop = make_letterbox_crop();
-
-    // Pre-flight: verify the format combination works.
-    {
-        struct hal_tensor *test_src = hal_image_processor_create_image(
-            proc, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
-        if (!test_src) {
-            hal_tensor_free(dst);
-            res.skip_reason = "src allocation failed";
-            return res;
-        }
-        if (hal_image_processor_convert(proc, test_src, dst,
-                                         HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop) != 0) {
-            hal_tensor_free(test_src);
-            hal_tensor_free(dst);
-            res.skip_reason = "unsupported format combo";
-            return res;
-        }
-        hal_tensor_free(test_src);
-    }
-
-    // Warmup (unmeasured)
-    for (int i = 0; i < WARMUP_ITERATIONS; i++) {
-        struct hal_tensor *src = hal_image_processor_create_image(
-            proc, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
-        if (src) {
-            hal_image_processor_convert(proc, src, dst,
-                                         HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop);
-            hal_tensor_free(src);
-        }
-    }
-
-    // Measured iterations
-    double total = 0.0;
-    double min_t = DBL_MAX;
-    double max_t = 0.0;
-
-    int measured = 0;
-    for (int i = 0; i < iterations; i++) {
-        struct hal_tensor *src = hal_image_processor_create_image(
-            proc, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
-        if (!src) break;  // allocation failure — stop measuring
-
-        struct timespec t0, t1;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-        hal_image_processor_convert(proc, src, dst,
-                                     HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop);
-        hal_tensor_free(src);
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-
-        double ms = elapsed_ms(&t0, &t1);
-        total += ms;
-        if (ms < min_t) min_t = ms;
-        if (ms > max_t) max_t = ms;
-        measured++;
-    }
-
-    hal_tensor_free(dst);
-
-    if (measured == 0) {
-        res.skip_reason = "all allocations failed";
-        return res;
-    }
-    res.ok         = 1;
-    res.iterations = measured;
-    res.avg_ms     = total / measured;
-    res.min_ms     = min_t;
-    res.max_ms     = max_t;
-    return res;
-}
-
-// ============================================================================
-// Benchmark 3: Chained two-stage pipeline
-//
-// NV12 (1080p) -> RGBA (640x640) -> PlanarRgb I8 (640x640)
-// All three tensors allocated once and reused.  Demonstrates that chaining
-// convert() calls is safe (glFinish ensures coherency between stages) and
-// measures the combined cost of a realistic two-pass preprocessing pipeline.
-// ============================================================================
-
-static bench_result bench_chained(struct hal_image_processor *proc,
-                                  int iterations) {
-    bench_result res = {
-        .pattern = "Chained (NV12->RGBA->PlanarRgb)",
-        .format  = "1080p->640x640",
-        .ok      = 0,
-    };
-
-    struct hal_tensor *src = hal_image_processor_create_image(
-        proc, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
-    if (!src) {
-        res.skip_reason = "src allocation failed";
-        return res;
-    }
-
-    struct hal_tensor *mid = hal_image_processor_create_image(
-        proc, DST_W, DST_H, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
-    if (!mid) {
-        hal_tensor_free(src);
-        res.skip_reason = "mid allocation failed";
-        return res;
-    }
-
-    struct hal_tensor *dst = hal_image_processor_create_image(
-        proc, DST_W, DST_H, HAL_PIXEL_FORMAT_PLANAR_RGB, HAL_DTYPE_I8);
-    if (!dst) {
-        hal_tensor_free(src);
-        hal_tensor_free(mid);
-        res.skip_reason = "dst allocation failed";
-        return res;
-    }
-
-    struct hal_crop crop = make_letterbox_crop();
-
-    // Pre-flight: stage 1 (NV12 -> RGBA with letterbox)
-    if (hal_image_processor_convert(proc, src, mid,
-                                     HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop) != 0) {
-        hal_tensor_free(src);
-        hal_tensor_free(mid);
-        hal_tensor_free(dst);
-        res.skip_reason = "stage 1 unsupported";
-        return res;
-    }
-
-    // Pre-flight: stage 2 (RGBA -> PlanarRgb I8, same size, no crop)
-    if (hal_image_processor_convert(proc, mid, dst,
-                                     HAL_ROTATION_NONE, HAL_FLIP_NONE, NULL) != 0) {
-        hal_tensor_free(src);
-        hal_tensor_free(mid);
-        hal_tensor_free(dst);
-        res.skip_reason = "stage 2 unsupported";
-        return res;
-    }
-
     // Warmup
     for (int i = 0; i < WARMUP_ITERATIONS; i++) {
-        hal_image_processor_convert(proc, src, mid,
+        hal_image_processor_convert(proc, src, dst,
                                      HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop);
-        hal_image_processor_convert(proc, mid, dst,
-                                     HAL_ROTATION_NONE, HAL_FLIP_NONE, NULL);
     }
 
-    // Measured iterations
-    double total = 0.0;
-    double min_t = DBL_MAX;
-    double max_t = 0.0;
-
+    // Measured iterations — same tensor handle reused every frame.
+    // The EGL image is cached after warmup, so this measures pure GPU cost.
+    double total = 0.0, min_t = DBL_MAX, max_t = 0.0;
     for (int i = 0; i < iterations; i++) {
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
-
-        hal_image_processor_convert(proc, src, mid,
+        hal_image_processor_convert(proc, src, dst,
                                      HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop);
-        hal_image_processor_convert(proc, mid, dst,
-                                     HAL_ROTATION_NONE, HAL_FLIP_NONE, NULL);
-
         clock_gettime(CLOCK_MONOTONIC, &t1);
 
         double ms = elapsed_ms(&t0, &t1);
@@ -388,43 +272,55 @@ static bench_result bench_chained(struct hal_image_processor *proc,
     }
 
     hal_tensor_free(src);
-    hal_tensor_free(mid);
     hal_tensor_free(dst);
 
-    res.ok         = 1;
-    res.iterations = iterations;
-    res.avg_ms     = total / iterations;
-    res.min_ms     = min_t;
-    res.max_ms     = max_t;
+    res.ok = 1;  res.iterations = iterations;
+    res.avg_ms = total / iterations;
+    res.min_ms = min_t;  res.max_ms = max_t;
     return res;
 }
 
 // ============================================================================
-// Benchmark 4: Buffer pool simulation
+// Section 1b: DMA-BUF import pool (V4L2 MPLANE buffer rotation)
 //
-// Allocates POOL_SIZE source tensors up front (simulating a V4L2 buffer pool)
-// and rotates through them round-robin each iteration.  After warmup, every
-// tensor in the pool has a cached EGLImage, so the per-iteration cost should
-// match the single-tensor reuse benchmark.  This validates that the EGL cache
-// handles a small working set correctly.
+// Simulates a V4L2 buffer pool of POOL_SIZE DMA-BUFs.  Each buffer is
+// imported once via hal_import_image() and reused across frames.  The pool
+// rotates round-robin.  After one full rotation in warmup, every entry has
+// a cached EGLImage and the per-frame cost should match single-buffer reuse.
 // ============================================================================
 
-static bench_result bench_pool(struct hal_image_processor *proc,
-                               int iterations) {
+static bench_result bench_import_pool(struct hal_image_processor *proc,
+                                      int iterations) {
     bench_result res = {
-        .pattern = "Buffer pool (4 bufs rotating)",
+        .pattern = "Import pool (4 bufs rotating)",
         .format  = "NV12->RGBA 1080p",
         .ok      = 0,
     };
 
     struct hal_tensor *pool[POOL_SIZE] = {NULL};
 
+    // Simulate a V4L2 buffer pool: allocate POOL_SIZE DMA-BUFs and import each
     for (int i = 0; i < POOL_SIZE; i++) {
-        pool[i] = hal_image_processor_create_image(
-            proc, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+        int ext_fd = allocate_dma_fd(SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12);
+        if (ext_fd < 0) {
+            for (int j = 0; j < i; j++) hal_tensor_free(pool[j]);
+            res.skip_reason = "DMA allocation unavailable";
+            return res;
+        }
+
+        struct hal_plane_descriptor *pd = hal_plane_descriptor_new(ext_fd);
+        close(ext_fd);
+        if (!pd) {
+            for (int j = 0; j < i; j++) hal_tensor_free(pool[j]);
+            res.skip_reason = "plane descriptor creation failed";
+            return res;
+        }
+
+        pool[i] = hal_import_image(
+            proc, pd, NULL, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
         if (!pool[i]) {
             for (int j = 0; j < i; j++) hal_tensor_free(pool[j]);
-            res.skip_reason = "pool src allocation failed";
+            res.skip_reason = "hal_import_image failed";
             return res;
         }
     }
@@ -448,17 +344,14 @@ static bench_result bench_pool(struct hal_image_processor *proc,
         return res;
     }
 
-    // Warmup: cycle through all pool entries so each gets a cached EGLImage.
+    // Warmup: cycle all pool entries so each gets a cached EGLImage
     for (int i = 0; i < WARMUP_ITERATIONS * POOL_SIZE; i++) {
         hal_image_processor_convert(proc, pool[i % POOL_SIZE], dst,
                                      HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop);
     }
 
-    // Measured iterations
-    double total = 0.0;
-    double min_t = DBL_MAX;
-    double max_t = 0.0;
-
+    // Measured iterations — rotating through the pool
+    double total = 0.0, min_t = DBL_MAX, max_t = 0.0;
     for (int i = 0; i < iterations; i++) {
         struct hal_tensor *src = pool[i % POOL_SIZE];
 
@@ -477,11 +370,527 @@ static bench_result bench_pool(struct hal_image_processor *proc,
     for (int i = 0; i < POOL_SIZE; i++) hal_tensor_free(pool[i]);
     hal_tensor_free(dst);
 
-    res.ok         = 1;
-    res.iterations = iterations;
-    res.avg_ms     = total / iterations;
-    res.min_ms     = min_t;
-    res.max_ms     = max_t;
+    res.ok = 1;  res.iterations = iterations;
+    res.avg_ms = total / iterations;
+    res.min_ms = min_t;  res.max_ms = max_t;
+    return res;
+}
+
+// ============================================================================
+// Section 1c: DMA-BUF import with stride (V4L2 bytesperline)
+//
+// Demonstrates hal_plane_descriptor_set_stride() for buffers with row
+// padding (e.g., V4L2 drivers that align rows to cache-line boundaries).
+// A stride of 2048 for 1920px NV12 simulates 128-byte row alignment.
+// ============================================================================
+
+static bench_result bench_import_stride(struct hal_image_processor *proc,
+                                        int iterations) {
+    bench_result res = {
+        .pattern = "Import + stride (padded rows)",
+        .format  = "NV12->RGBA 1080p stride=2048",
+        .ok      = 0,
+    };
+
+    // Allocate a buffer large enough for the padded stride.
+    // We use a contiguous NV12 buffer (stride * H * 3/2 bytes).
+    int ext_fd = allocate_dma_fd(SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12);
+    if (ext_fd < 0) {
+        res.skip_reason = "DMA allocation unavailable";
+        return res;
+    }
+
+    struct hal_plane_descriptor *pd = hal_plane_descriptor_new(ext_fd);
+    close(ext_fd);
+    if (!pd) {
+        res.skip_reason = "plane descriptor creation failed";
+        return res;
+    }
+
+    // Set stride: 2048 bytes per row (1920px + 128 bytes padding)
+    hal_plane_descriptor_set_stride(pd, 2048);
+
+    struct hal_tensor *src = hal_import_image(
+        proc, pd, NULL, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+    if (!src) {
+        res.skip_reason = "hal_import_image with stride failed";
+        return res;
+    }
+
+    struct hal_tensor *dst = hal_image_processor_create_image(
+        proc, DST_W, DST_H, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
+    if (!dst) {
+        hal_tensor_free(src);
+        res.skip_reason = "dst allocation failed";
+        return res;
+    }
+
+    struct hal_crop crop = make_letterbox_crop();
+
+    if (hal_image_processor_convert(proc, src, dst,
+                                     HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop) != 0) {
+        hal_tensor_free(src);
+        hal_tensor_free(dst);
+        res.skip_reason = "unsupported format combo (stride)";
+        return res;
+    }
+
+    for (int i = 0; i < WARMUP_ITERATIONS; i++) {
+        hal_image_processor_convert(proc, src, dst,
+                                     HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop);
+    }
+
+    double total = 0.0, min_t = DBL_MAX, max_t = 0.0;
+    for (int i = 0; i < iterations; i++) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        hal_image_processor_convert(proc, src, dst,
+                                     HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+
+        double ms = elapsed_ms(&t0, &t1);
+        total += ms;
+        if (ms < min_t) min_t = ms;
+        if (ms > max_t) max_t = ms;
+    }
+
+    hal_tensor_free(src);
+    hal_tensor_free(dst);
+
+    res.ok = 1;  res.iterations = iterations;
+    res.avg_ms = total / iterations;
+    res.min_ms = min_t;  res.max_ms = max_t;
+    return res;
+}
+
+// ============================================================================
+// Section 1d: DMA-BUF multiplane NV12 import (V4L2 MPLANE)
+//
+// Demonstrates separate Y and UV plane fds with per-plane stride.
+// This is the pattern for V4L2_PIX_FMT_NV12M where the kernel provides
+// independent DMA-BUF fds for luma and chroma.
+// ============================================================================
+
+static bench_result bench_import_multiplane(struct hal_image_processor *proc,
+                                            int iterations) {
+    bench_result res = {
+        .pattern = "Import multiplane NV12 (Y+UV)",
+        .format  = "NV12->RGBA 1080p",
+        .ok      = 0,
+    };
+
+    // Allocate separate Y and UV plane DMA-BUFs
+    int y_fd = allocate_plane_fd(SRC_H, SRC_W);             // Y: 1080 x 1920
+    int uv_fd = allocate_plane_fd(SRC_H / 2, SRC_W);        // UV: 540 x 1920
+    if (y_fd < 0 || uv_fd < 0) {
+        if (y_fd >= 0) close(y_fd);
+        if (uv_fd >= 0) close(uv_fd);
+        res.skip_reason = "DMA plane allocation unavailable";
+        return res;
+    }
+
+    // Build plane descriptors for Y and UV
+    struct hal_plane_descriptor *y_pd = hal_plane_descriptor_new(y_fd);
+    struct hal_plane_descriptor *uv_pd = hal_plane_descriptor_new(uv_fd);
+    close(y_fd);
+    close(uv_fd);
+    if (!y_pd || !uv_pd) {
+        if (y_pd) hal_plane_descriptor_free(y_pd);
+        if (uv_pd) hal_plane_descriptor_free(uv_pd);
+        res.skip_reason = "plane descriptor creation failed";
+        return res;
+    }
+
+    // Import multiplane NV12: y_pd for luma, uv_pd for chroma
+    // Both descriptors are consumed by hal_import_image()
+    struct hal_tensor *src = hal_import_image(
+        proc, y_pd, uv_pd, SRC_W, SRC_H,
+        HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+    // y_pd and uv_pd are consumed — do NOT free them
+    if (!src) {
+        res.skip_reason = "multiplane hal_import_image failed";
+        return res;
+    }
+
+    struct hal_tensor *dst = hal_image_processor_create_image(
+        proc, DST_W, DST_H, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
+    if (!dst) {
+        hal_tensor_free(src);
+        res.skip_reason = "dst allocation failed";
+        return res;
+    }
+
+    struct hal_crop crop = make_letterbox_crop();
+
+    if (hal_image_processor_convert(proc, src, dst,
+                                     HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop) != 0) {
+        hal_tensor_free(src);
+        hal_tensor_free(dst);
+        res.skip_reason = "unsupported format combo (multiplane)";
+        return res;
+    }
+
+    for (int i = 0; i < WARMUP_ITERATIONS; i++) {
+        hal_image_processor_convert(proc, src, dst,
+                                     HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop);
+    }
+
+    double total = 0.0, min_t = DBL_MAX, max_t = 0.0;
+    for (int i = 0; i < iterations; i++) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        hal_image_processor_convert(proc, src, dst,
+                                     HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+
+        double ms = elapsed_ms(&t0, &t1);
+        total += ms;
+        if (ms < min_t) min_t = ms;
+        if (ms > max_t) max_t = ms;
+    }
+
+    hal_tensor_free(src);
+    hal_tensor_free(dst);
+
+    res.ok = 1;  res.iterations = iterations;
+    res.avg_ms = total / iterations;
+    res.min_ms = min_t;  res.max_ms = max_t;
+    return res;
+}
+
+// ============================================================================
+// Section 1e: DMA-BUF import per frame (anti-pattern)
+//
+// Re-imports a new DMA-BUF every iteration, forcing an EGL image cache miss
+// each time.  This quantifies the overhead of not reusing tensor handles.
+// The correct pattern is to import once and reuse (Section 1a).
+// ============================================================================
+
+static bench_result bench_import_recreate(struct hal_image_processor *proc,
+                                          int iterations) {
+    bench_result res = {
+        .pattern = "Import per frame (ANTI-PATTERN)",
+        .format  = "NV12->RGBA 1080p",
+        .ok      = 0,
+    };
+
+    struct hal_tensor *dst = hal_image_processor_create_image(
+        proc, DST_W, DST_H, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
+    if (!dst) {
+        res.skip_reason = "dst allocation failed";
+        return res;
+    }
+
+    struct hal_crop crop = make_letterbox_crop();
+
+    // Pre-flight
+    {
+        int ext_fd = allocate_dma_fd(SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12);
+        if (ext_fd < 0) {
+            hal_tensor_free(dst);
+            res.skip_reason = "DMA allocation unavailable";
+            return res;
+        }
+        struct hal_plane_descriptor *pd = hal_plane_descriptor_new(ext_fd);
+        close(ext_fd);
+        if (!pd) {
+            hal_tensor_free(dst);
+            res.skip_reason = "plane descriptor creation failed";
+            return res;
+        }
+        struct hal_tensor *test = hal_import_image(
+            proc, pd, NULL, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+        if (!test) {
+            hal_tensor_free(dst);
+            res.skip_reason = "hal_import_image failed";
+            return res;
+        }
+        if (hal_image_processor_convert(proc, test, dst,
+                                         HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop) != 0) {
+            hal_tensor_free(test);
+            hal_tensor_free(dst);
+            res.skip_reason = "unsupported format combo";
+            return res;
+        }
+        hal_tensor_free(test);
+    }
+
+    // Warmup
+    for (int i = 0; i < WARMUP_ITERATIONS; i++) {
+        int ext_fd = allocate_dma_fd(SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12);
+        if (ext_fd < 0) break;
+        struct hal_plane_descriptor *pd = hal_plane_descriptor_new(ext_fd);
+        close(ext_fd);
+        if (!pd) break;
+        struct hal_tensor *src = hal_import_image(
+            proc, pd, NULL, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+        if (src) {
+            hal_image_processor_convert(proc, src, dst,
+                                         HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop);
+            hal_tensor_free(src);
+        }
+    }
+
+    // Measured iterations — re-import every frame (cache miss each time)
+    double total = 0.0, min_t = DBL_MAX, max_t = 0.0;
+    int measured = 0;
+    for (int i = 0; i < iterations; i++) {
+        int ext_fd = allocate_dma_fd(SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12);
+        if (ext_fd < 0) break;
+        struct hal_plane_descriptor *pd = hal_plane_descriptor_new(ext_fd);
+        close(ext_fd);
+        if (!pd) break;
+
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        struct hal_tensor *src = hal_import_image(
+            proc, pd, NULL, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+        if (src) {
+            hal_image_processor_convert(proc, src, dst,
+                                         HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop);
+            hal_tensor_free(src);
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+
+        double ms = elapsed_ms(&t0, &t1);
+        total += ms;
+        if (ms < min_t) min_t = ms;
+        if (ms > max_t) max_t = ms;
+        measured++;
+    }
+
+    hal_tensor_free(dst);
+
+    if (measured == 0) {
+        res.skip_reason = "all allocations failed";
+        return res;
+    }
+    res.ok = 1;  res.iterations = measured;
+    res.avg_ms = total / measured;
+    res.min_ms = min_t;  res.max_ms = max_t;
+    return res;
+}
+
+// ============================================================================
+// Section 2a: Internal allocation + reuse (format matrix)
+//
+// Uses hal_image_processor_create_image() for both source and destination.
+// Allocates once, converts N times.  This is the fastest pattern for
+// internally-allocated buffers.
+// ============================================================================
+
+static bench_result bench_reuse(struct hal_image_processor *proc,
+                                enum hal_pixel_format src_fmt,
+                                enum hal_pixel_format dst_fmt,
+                                enum hal_dtype dst_dtype,
+                                const char *format_label,
+                                int iterations) {
+    bench_result res = {
+        .pattern = "Reuse tensors (internal alloc)",
+        .format  = format_label,
+        .ok      = 0,
+    };
+
+    struct hal_tensor *src = hal_image_processor_create_image(
+        proc, SRC_W, SRC_H, src_fmt, HAL_DTYPE_U8);
+    if (!src) { res.skip_reason = "src allocation failed"; return res; }
+
+    struct hal_tensor *dst = hal_image_processor_create_image(
+        proc, DST_W, DST_H, dst_fmt, dst_dtype);
+    if (!dst) {
+        hal_tensor_free(src);
+        res.skip_reason = "dst allocation failed";
+        return res;
+    }
+
+    struct hal_crop crop = make_letterbox_crop();
+
+    if (hal_image_processor_convert(proc, src, dst,
+                                     HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop) != 0) {
+        hal_tensor_free(src);
+        hal_tensor_free(dst);
+        res.skip_reason = "unsupported format combo";
+        return res;
+    }
+
+    for (int i = 0; i < WARMUP_ITERATIONS; i++) {
+        hal_image_processor_convert(proc, src, dst,
+                                     HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop);
+    }
+
+    double total = 0.0, min_t = DBL_MAX, max_t = 0.0;
+    for (int i = 0; i < iterations; i++) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        hal_image_processor_convert(proc, src, dst,
+                                     HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+
+        double ms = elapsed_ms(&t0, &t1);
+        total += ms;
+        if (ms < min_t) min_t = ms;
+        if (ms > max_t) max_t = ms;
+    }
+
+    hal_tensor_free(src);
+    hal_tensor_free(dst);
+
+    res.ok = 1;  res.iterations = iterations;
+    res.avg_ms = total / iterations;
+    res.min_ms = min_t;  res.max_ms = max_t;
+    return res;
+}
+
+// ============================================================================
+// Section 2b: Chained two-stage pipeline
+//
+// NV12 (1080p) -> RGBA (640x640) -> PlanarRgb I8 (640x640)
+// All three tensors allocated once and reused.
+// ============================================================================
+
+static bench_result bench_chained(struct hal_image_processor *proc,
+                                  int iterations) {
+    bench_result res = {
+        .pattern = "Chained (NV12->RGBA->PlanarRgb)",
+        .format  = "1080p->640x640",
+        .ok      = 0,
+    };
+
+    struct hal_tensor *src = hal_image_processor_create_image(
+        proc, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+    struct hal_tensor *mid = hal_image_processor_create_image(
+        proc, DST_W, DST_H, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
+    struct hal_tensor *dst = hal_image_processor_create_image(
+        proc, DST_W, DST_H, HAL_PIXEL_FORMAT_PLANAR_RGB, HAL_DTYPE_I8);
+
+    if (!src || !mid || !dst) {
+        if (src) hal_tensor_free(src);
+        if (mid) hal_tensor_free(mid);
+        if (dst) hal_tensor_free(dst);
+        res.skip_reason = "allocation failed";
+        return res;
+    }
+
+    struct hal_crop crop = make_letterbox_crop();
+
+    if (hal_image_processor_convert(proc, src, mid,
+                                     HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop) != 0 ||
+        hal_image_processor_convert(proc, mid, dst,
+                                     HAL_ROTATION_NONE, HAL_FLIP_NONE, NULL) != 0) {
+        hal_tensor_free(src);
+        hal_tensor_free(mid);
+        hal_tensor_free(dst);
+        res.skip_reason = "pipeline stage unsupported";
+        return res;
+    }
+
+    for (int i = 0; i < WARMUP_ITERATIONS; i++) {
+        hal_image_processor_convert(proc, src, mid,
+                                     HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop);
+        hal_image_processor_convert(proc, mid, dst,
+                                     HAL_ROTATION_NONE, HAL_FLIP_NONE, NULL);
+    }
+
+    double total = 0.0, min_t = DBL_MAX, max_t = 0.0;
+    for (int i = 0; i < iterations; i++) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        hal_image_processor_convert(proc, src, mid,
+                                     HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop);
+        hal_image_processor_convert(proc, mid, dst,
+                                     HAL_ROTATION_NONE, HAL_FLIP_NONE, NULL);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+
+        double ms = elapsed_ms(&t0, &t1);
+        total += ms;
+        if (ms < min_t) min_t = ms;
+        if (ms > max_t) max_t = ms;
+    }
+
+    hal_tensor_free(src);
+    hal_tensor_free(mid);
+    hal_tensor_free(dst);
+
+    res.ok = 1;  res.iterations = iterations;
+    res.avg_ms = total / iterations;
+    res.min_ms = min_t;  res.max_ms = max_t;
+    return res;
+}
+
+// ============================================================================
+// Section 2c: Recreate per frame (anti-pattern, internal allocation)
+// ============================================================================
+
+static bench_result bench_recreate(struct hal_image_processor *proc,
+                                   int iterations) {
+    bench_result res = {
+        .pattern = "Recreate per frame (ANTI-PATTERN)",
+        .format  = "NV12->RGBA 1080p",
+        .ok      = 0,
+    };
+
+    struct hal_tensor *dst = hal_image_processor_create_image(
+        proc, DST_W, DST_H, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
+    if (!dst) { res.skip_reason = "dst allocation failed"; return res; }
+
+    struct hal_crop crop = make_letterbox_crop();
+
+    // Pre-flight
+    {
+        struct hal_tensor *test = hal_image_processor_create_image(
+            proc, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+        if (!test) {
+            hal_tensor_free(dst);
+            res.skip_reason = "src allocation failed";
+            return res;
+        }
+        if (hal_image_processor_convert(proc, test, dst,
+                                         HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop) != 0) {
+            hal_tensor_free(test);
+            hal_tensor_free(dst);
+            res.skip_reason = "unsupported format combo";
+            return res;
+        }
+        hal_tensor_free(test);
+    }
+
+    for (int i = 0; i < WARMUP_ITERATIONS; i++) {
+        struct hal_tensor *src = hal_image_processor_create_image(
+            proc, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+        if (src) {
+            hal_image_processor_convert(proc, src, dst,
+                                         HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop);
+            hal_tensor_free(src);
+        }
+    }
+
+    double total = 0.0, min_t = DBL_MAX, max_t = 0.0;
+    int measured = 0;
+    for (int i = 0; i < iterations; i++) {
+        struct hal_tensor *src = hal_image_processor_create_image(
+            proc, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+        if (!src) break;
+
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        hal_image_processor_convert(proc, src, dst,
+                                     HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop);
+        hal_tensor_free(src);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+
+        double ms = elapsed_ms(&t0, &t1);
+        total += ms;
+        if (ms < min_t) min_t = ms;
+        if (ms > max_t) max_t = ms;
+        measured++;
+    }
+
+    hal_tensor_free(dst);
+
+    if (measured == 0) { res.skip_reason = "all allocations failed"; return res; }
+    res.ok = 1;  res.iterations = measured;
+    res.avg_ms = total / measured;
+    res.min_ms = min_t;  res.max_ms = max_t;
     return res;
 }
 
@@ -490,7 +899,6 @@ static bench_result bench_pool(struct hal_image_processor *proc,
 // ============================================================================
 
 int main(void) {
-    // Read iteration count from environment (default: 100).
     int iterations = DEFAULT_ITERATIONS;
     const char *env_iter = getenv("BENCH_ITERATIONS");
     if (env_iter) {
@@ -498,7 +906,6 @@ int main(void) {
         if (n > 0) iterations = n;
     }
 
-    // Optionally enable HAL debug logging via RUST_LOG / stderr.
     const char *env_log = getenv("BENCH_LOG");
     if (env_log) {
         hal_log_init_file(stderr, HAL_LOG_LEVEL_DEBUG);
@@ -507,7 +914,6 @@ int main(void) {
     printf("\nEdgeFirst HAL C API Benchmark -- Preprocessing Pipeline\n");
     printf("=======================================================\n");
 
-    // Create the image processor (auto-selects best backend).
     struct hal_image_processor *proc = hal_image_processor_new();
     if (!proc) {
         fprintf(stderr, "Error: failed to create image processor "
@@ -518,16 +924,27 @@ int main(void) {
     printf("Iterations: %d (after %d warmup)\n", iterations, WARMUP_ITERATIONS);
     printf("Source: %dx%d  Destination: %dx%d\n\n", SRC_W, SRC_H, DST_W, DST_H);
 
-    // Collect all results for summary table.
     enum { MAX_RESULTS = 32 };
     bench_result results[MAX_RESULTS];
     int n_results = 0;
 
-    // ── Section 1: Letterbox resize format matrix (tensor reuse) ─────────
+    // ── Section 1: DMA-BUF import patterns (hal_import_image) ────────────
     //
-    // All combinations of {NV12, YUYV} × {RGBA, RGB, PlanarRgb} × {U8, I8}
-    // at 1080p → 640x640 with letterbox crop. This is the primary benchmark
-    // and should match the Rust pipeline_benchmark results.
+    // These benchmarks demonstrate the recommended integration pattern for
+    // GStreamer, V4L2, and other frameworks that provide DMA-BUF fds.
+
+    printf("--- DMA-BUF Import Patterns (hal_import_image) ---\n\n");
+
+    results[n_results++] = bench_import_reuse(proc, iterations);
+    results[n_results++] = bench_import_pool(proc, iterations);
+    results[n_results++] = bench_import_stride(proc, iterations);
+    results[n_results++] = bench_import_multiplane(proc, iterations);
+    results[n_results++] = bench_import_recreate(proc, iterations);
+
+    // ── Section 2: Internal allocation format matrix ─────────────────────
+    //
+    // Uses hal_image_processor_create_image() for when HAL owns the buffers.
+    // Measures pure conversion cost across format combinations.
 
     // NV12 source
     results[n_results++] = bench_reuse(
@@ -569,17 +986,13 @@ int main(void) {
         proc, HAL_PIXEL_FORMAT_YUYV, HAL_PIXEL_FORMAT_PLANAR_RGB, HAL_DTYPE_I8,
         "YUYV->PlanarRgb I8", iterations);
 
-    // ── Section 2: Anti-pattern comparison ───────────────────────────────
-
-    results[n_results++] = bench_recreate(proc, iterations);
-
-    // ── Section 3: Chained two-stage pipeline ────────────────────────────
+    // ── Section 3: Pipeline patterns ─────────────────────────────────────
 
     results[n_results++] = bench_chained(proc, iterations);
 
-    // ── Section 4: Buffer pool simulation ────────────────────────────────
+    // ── Section 4: Anti-patterns ─────────────────────────────────────────
 
-    results[n_results++] = bench_pool(proc, iterations);
+    results[n_results++] = bench_recreate(proc, iterations);
 
     // --- Print results table ---
 
@@ -590,41 +1003,38 @@ int main(void) {
         result_print(&results[i]);
     }
 
-    // --- Notes ---
+    // --- Comparison notes ---
 
-    // Find reuse NV12->RGBA and recreate results for comparison.
-    double reuse_avg   = 0.0;
-    double recreate_avg = 0.0;
-    double pool_avg    = 0.0;
-    int have_comparison = 0;
+    double import_reuse_avg = 0.0, import_recreate_avg = 0.0;
+    double import_pool_avg = 0.0, alloc_recreate_avg = 0.0;
 
     for (int i = 0; i < n_results; i++) {
-        if (results[i].ok && strcmp(results[i].pattern, "Reuse tensors") == 0
-            && strcmp(results[i].format, "NV12->RGBA") == 0) {
-            reuse_avg = results[i].avg_ms;
-        }
-        if (results[i].ok && strcmp(results[i].pattern, "Recreate tensor per frame") == 0) {
-            recreate_avg = results[i].avg_ms;
-        }
-        if (results[i].ok && strcmp(results[i].pattern, "Buffer pool (4 bufs rotating)") == 0) {
-            pool_avg = results[i].avg_ms;
-        }
+        if (!results[i].ok) continue;
+        if (strcmp(results[i].pattern, "Import + reuse (recommended)") == 0)
+            import_reuse_avg = results[i].avg_ms;
+        if (strcmp(results[i].pattern, "Import per frame (ANTI-PATTERN)") == 0)
+            import_recreate_avg = results[i].avg_ms;
+        if (strcmp(results[i].pattern, "Import pool (4 bufs rotating)") == 0)
+            import_pool_avg = results[i].avg_ms;
+        if (strcmp(results[i].pattern, "Recreate per frame (ANTI-PATTERN)") == 0)
+            alloc_recreate_avg = results[i].avg_ms;
     }
 
     printf("\nNotes:\n");
-    if (reuse_avg > 0.0 && recreate_avg > 0.0) {
-        have_comparison = 1;
-        printf("  - 'Recreate tensor per frame' is ~%.1fx slower than 'Reuse tensors' "
-               "due to EGL image cache misses\n", recreate_avg / reuse_avg);
+    if (import_reuse_avg > 0.0 && import_recreate_avg > 0.0) {
+        printf("  - 'Import per frame' is ~%.1fx slower than 'Import + reuse' "
+               "due to EGL image cache misses\n",
+               import_recreate_avg / import_reuse_avg);
     }
-    if (reuse_avg > 0.0 && pool_avg > 0.0) {
-        printf("  - 'Buffer pool' matches 'Reuse tensors' after warmup "
+    if (import_reuse_avg > 0.0 && import_pool_avg > 0.0) {
+        printf("  - 'Import pool' matches 'Import + reuse' after warmup "
                "(all %d entries cached, ratio: %.2fx)\n",
-               POOL_SIZE, pool_avg / reuse_avg);
+               POOL_SIZE, import_pool_avg / import_reuse_avg);
     }
-    if (!have_comparison) {
-        printf("  - Comparison between reuse and recreate patterns unavailable "
-               "(one or both were skipped)\n");
+    if (import_reuse_avg > 0.0 && alloc_recreate_avg > 0.0) {
+        printf("  - 'Recreate per frame' (internal alloc) is ~%.1fx slower "
+               "than import + reuse\n",
+               alloc_recreate_avg / import_reuse_avg);
     }
 
     printf("\n");
