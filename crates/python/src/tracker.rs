@@ -152,12 +152,12 @@ unsafe impl Sync for PyByteTrack {}
 
 impl Tracker<DetectBox> for PyByteTrack {
     fn update(&mut self, boxes: &[DetectBox], timestamp_ns: u64) -> Vec<Option<TrackInfo>> {
-        let mut tracker = self.tracker.lock().unwrap();
+        let mut tracker = self.tracker.lock().unwrap_or_else(|e| e.into_inner());
         tracker.update(boxes, timestamp_ns)
     }
 
     fn get_active_tracks(&self) -> Vec<ActiveTrackInfo<DetectBox>> {
-        let tracker = self.tracker.lock().unwrap();
+        let tracker = self.tracker.lock().unwrap_or_else(|e| e.into_inner());
         tracker.get_active_tracks()
     }
 }

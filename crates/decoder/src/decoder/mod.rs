@@ -753,7 +753,7 @@ impl Decoder {
         output_masks.clear();
         output_tracks.clear();
 
-        // yolo segdet variants require special handling to seperate boxes that come from decoding vs active tracks.
+        // yolo segdet variants require special handling to separate boxes that come from decoding vs active tracks.
         // Only boxes that come from decoding can be used for proto/mask generation.
         match &self.model_type {
             ModelType::YoloSegDet { boxes, protos } => self.decode_tracked_yolo_segdet_quantized(
@@ -826,7 +826,7 @@ impl Decoder {
     /// masks will be decoded. The function clears the provided output
     /// vectors before populating them with the decoded results.
     ///
-    /// This function returns an `Error` if the the provided outputs don't
+    /// This function returns an `Error` if the provided outputs don't
     /// match the configuration provided by the user when building the decoder.
     ///
     /// Any quantization information in the configuration will be ignored.

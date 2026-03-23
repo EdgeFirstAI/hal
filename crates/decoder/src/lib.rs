@@ -2925,16 +2925,6 @@ mod decoder_tracked_tests {
                 .unwrap();
 
             assert_eq!(output_boxes.len(), 2);
-            // println!(
-            //     "Frame {}: Box 0: {:?}, Box 1: {:?}",
-            //     i, output_boxes[0], output_boxes[1]
-            // );
-            println!(
-                "{}, {}, {}",
-                i,
-                (output_boxes[0].bbox.ymin + output_boxes[0].bbox.ymax) / 2.,
-                (output_boxes[1].bbox.ymin + output_boxes[1].bbox.ymax) / 2.,
-            );
             assert!(output_boxes[0].equal_within_delta(&expected_boxes[0], 5e-3));
             assert!(output_boxes[1].equal_within_delta(&expected_boxes[1], 5e-3));
 
@@ -5144,12 +5134,6 @@ outputs:
                 .unwrap();
 
             assert_eq!(output_boxes.len(), 2);
-            println!(
-                "{}, {}, {}",
-                i,
-                (output_boxes[0].bbox.xmin + output_boxes[0].bbox.xmax) / 2.,
-                (output_boxes[1].bbox.xmin + output_boxes[1].bbox.xmax) / 2.,
-            );
         }
         let tracks = tracker.get_active_tracks();
         let predicted_boxes: Vec<_> = tracks
