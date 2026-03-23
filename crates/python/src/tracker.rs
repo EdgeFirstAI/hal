@@ -203,7 +203,7 @@ impl PyByteTrack {
             })
             .collect::<Vec<_>>();
 
-        let tracks = self.tracker.update(&boxes, timestamp_ns);
+        let tracks = <Self as Tracker<DetectBox>>::update(self, &boxes, timestamp_ns);
 
         tracks
             .into_iter()
@@ -212,7 +212,7 @@ impl PyByteTrack {
     }
 
     pub fn get_active_tracks(&self) -> Vec<PyActiveTrackInfo> {
-        let tracks = self.tracker.lock().unwrap().get_active_tracks();
+        let tracks = <Self as Tracker<DetectBox>>::get_active_tracks(self);
         tracks.into_iter().map(|ti| ti.into()).collect()
     }
 }

@@ -2,10 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    cell::RefCell,
     fmt::Debug,
-    rc::Rc,
-    sync::{Arc, Mutex},
 };
 
 pub use uuid::Uuid;
@@ -40,35 +37,4 @@ pub struct ActiveTrackInfo<T: DetectionBox> {
 pub trait Tracker<T: DetectionBox> {
     fn update(&mut self, boxes: &[T], timestamp: u64) -> Vec<Option<TrackInfo>>;
     fn get_active_tracks(&self) -> Vec<ActiveTrackInfo<T>>;
-}
-
-impl<T, TR> Tracker<T> for Arc<Mutex<TR>>
-where
-    T: DetectionBox,
-    TR: Tracker<T>,
-{
-    fn update(&mut self, boxes: &[T], timestamp: u64) -> Vec<Option<TrackInfo>> {
-        let mut tracker = self.lock().unwrap();
-        tracker.update(boxes, timestamp)
-    }
-
-    fn get_active_tracks(&self) -> Vec<ActiveTrackInfo<T>> {
-        let tracker = self.lock().unwrap();
-        tracker.get_active_tracks()
-    }
-}
-
-impl<T, TR> Tracker<T> for Rc<RefCell<TR>>
-where
-    T: DetectionBox,
-    TR: Tracker<T>,
-{
-    fn update(&mut self, boxes: &[T], timestamp: u64) -> Vec<Option<TrackInfo>> {
-        let mut tracker = self.borrow_mut();
-        tracker.update(boxes, timestamp)
-    }
-    fn get_active_tracks(&self) -> Vec<ActiveTrackInfo<T>> {
-        let tracker = self.borrow();
-        tracker.get_active_tracks()
-    }
 }
