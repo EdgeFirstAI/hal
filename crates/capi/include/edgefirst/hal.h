@@ -1289,45 +1289,6 @@ struct hal_tensor *hal_tensor_load_image_file(const char *path,
                                               enum hal_tensor_memory memory);
 
 /**
- * Create a multiplane image tensor from separate Y and UV DMA-BUF file descriptors.
- *
- * This is used for V4L2 multi-planar NV12 (`V4L2_PIX_FMT_NV12M`) where the
- * Y and UV planes are in separate DMA-BUF allocations.
- *
- * Both fds are duplicated internally — the caller retains ownership and
- * must close them when done. This is consistent with all other fd-accepting
- * APIs in this library.
- *
- * **EGL image cache interaction**: Each call creates new `BufferIdentity`
- * values for both the Y and UV planes. The OpenGL backend caches EGL images
- * keyed by `(luma_id, chroma_id)`. Recreating the tensor from the same fds
- * every frame will always cause cache misses. Reuse the same tensor object
- * across frames so that both plane images are served from cache.
- *
- * **Live-memory semantics**: EGLImage is a handle to physical memory, not a
- * snapshot. New frame data written by a V4L2 decoder into the DMA-BUFs is
- * visible to the GPU on the next `convert()` call as long as the caller does
- * not write to the buffers while a `convert()` is in progress.
- *
- * @param y_fd    DMA-BUF file descriptor for the Y (luma) plane (caller retains ownership)
- * @param width   Image width in pixels
- * @param height  Image height in pixels
- * @param uv_fd   DMA-BUF file descriptor for the UV (chroma) plane (caller retains ownership)
- * @param format  Pixel format (must be HAL_PIXEL_FORMAT_NV12 or HAL_PIXEL_FORMAT_NV16)
- * @param out     Receives the new tensor handle on success
- * @return 0 on success, -1 on error (errno set)
- * @par Errors (errno):
- * - EINVAL: Invalid argument or unsupported pixel format
- * - EIO:    Failed to duplicate fd or create tensor
- */
-int hal_tensor_from_planes(int y_fd,
-                           uint32_t width,
-                           uint32_t height,
-                           int uv_fd,
-                           enum hal_pixel_format format,
-                           struct hal_tensor **out);
-
-/**
  * Load a JPEG image from memory.
  *
  * @param data Pointer to JPEG data
@@ -1447,7 +1408,9 @@ size_t hal_tensor_channels(const struct hal_tensor *tensor);
  * format: width for planar/semi-planar formats, width * channels for packed.
  *
  * @param tensor Image tensor handle
- * @return Row stride in bytes, or 0 if tensor is NULL or format is unset
+ * @return Row stride in bytes, or 0 if tensor is NULL, has no pixel format
+ *         set, or is tightly packed (no explicit stride). Check tensor is
+ *         non-NULL separately to distinguish error from tightly-packed.
  */
 size_t hal_tensor_row_stride(const struct hal_tensor *tensor);
 
@@ -1492,7 +1455,7 @@ struct hal_image_processor *hal_image_processor_new_with_backend(enum hal_comput
  * source and destination EGLImages, keyed by the tensor's `BufferIdentity.id`.
  * Reusing the same tensor objects across frames yields cache hits on both
  * sides; creating new tensors from the same fds every frame yields cache
- * misses. See `hal_tensor_from_fd()` and `hal_tensor_from_planes()` for
+ * misses. See `hal_tensor_from_fd()` and `hal_import_image()` for
  * details on `BufferIdentity` assignment.
  *
  * **Content updates between calls**: Because EGLImage is a handle to live
@@ -1624,6 +1587,8 @@ void hal_plane_descriptor_free(struct hal_plane_descriptor *pd);
  * @param pd     Plane descriptor handle
  * @param stride Row stride in bytes (must be > 0)
  * @return 0 on success, -1 on error
+ * @par Errors (errno):
+ * - EINVAL: NULL pd, stride is zero, or descriptor already consumed
  */
 int hal_plane_descriptor_set_stride(struct hal_plane_descriptor *pd, size_t stride);
 
@@ -1812,15 +1777,6 @@ struct hal_tensor *hal_tensor_from_fd(enum hal_dtype dtype,
                                       const char *name);
 
 /**
- * Create a new tensor from an existing file descriptor (stub for non-Unix).
- */
-struct hal_tensor *hal_tensor_from_fd(enum hal_dtype dtype,
-                                      int fd,
-                                      const size_t *shape,
-                                      size_t ndim,
-                                      const char *name);
-
-/**
  * Free a tensor and release its resources.
  *
  * After calling this function, the tensor pointer becomes invalid.
@@ -1905,11 +1861,6 @@ size_t hal_tensor_size(const struct hal_tensor *tensor);
 int hal_tensor_clone_fd(const struct hal_tensor *tensor);
 
 /**
- * Clone file descriptor stub for non-Unix platforms.
- */
-int hal_tensor_clone_fd(const struct hal_tensor *tensor);
-
-/**
  * Clone the DMA-BUF file descriptor backing a tensor.
  *
  * Unlike hal_tensor_clone_fd(), this function returns a clear error if the
@@ -1951,7 +1902,8 @@ int hal_tensor_reshape(struct hal_tensor *tensor, const size_t *shape, size_t nd
  * @param tensor Tensor handle
  * @return Tensor map handle on success, NULL on error
  * @par Errors (errno):
- * - EINVAL: NULL tensor
+ * - EINVAL: NULL tensor, or tensor has non-zero row stride or plane offset
+ *   (CPU mapping of padded buffers is not supported)
  * - EIO: Failed to map tensor memory
  */
 struct hal_tensor_map *hal_tensor_map_create(const struct hal_tensor *tensor);

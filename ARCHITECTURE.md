@@ -397,7 +397,7 @@ explicit removal call.
 
 **Key design implications**:
 
-- `hal_tensor_from_fd()` and `hal_tensor_from_planes()` always allocate a new
+- `hal_tensor_from_fd()` and `hal_import_image()` always allocate a new
   `BufferIdentity`. Callers that re-wrap the same fd each frame will see a cache
   miss on every `convert()` call. Hold the tensor object alive across frames.
 
@@ -1160,7 +1160,7 @@ then swizzles R↔B channels in-place.
 ### C API Performance Recommendations (DMA-BUF / EGL Path)
 
 The following patterns apply when using the DMA-BUF tensor APIs
-(`hal_import_image()`, `hal_tensor_from_fd()`, `hal_tensor_from_planes()`)
+(`hal_import_image()`, `hal_tensor_from_fd()`)
 together with `hal_image_processor_convert()` from C or C++.
 
 > **Reference implementation**: The `bench_preproc` C benchmark
@@ -1358,7 +1358,6 @@ if (pool_tensors[buf_index] == NULL) {
 | `hal_plane_descriptor_new()` | Dups eagerly — caller retains original fd | Never — caller keeps its fd |
 | `hal_import_image()` | Consumes both descriptors (success or fail) | Never — descriptors already duped the fd |
 | `hal_tensor_from_fd()` | HAL takes ownership | Always, if caller needs the fd afterward |
-| `hal_tensor_from_planes()` | HAL takes ownership of both fds | Always, if caller needs the fds afterward |
 
 #### Anti-Patterns
 
@@ -1666,9 +1665,10 @@ blocks (one per plane).
 The HAL supports multi-plane DMA-BUF NV12/NV16 via a two-tensor approach
 rather than extending `DmaTensor` with multiple fds:
 
-**C API**: `hal_tensor_from_planes(y_fd, width, height, uv_fd, format, out)`
-takes separate Y and UV file descriptors, wraps each into its own
+**C API**: `hal_import_image(proc, y_pd, uv_pd, width, height, format, dtype)`
+takes separate Y and UV plane descriptors, wraps each into its own
 `Tensor<u8>` via `from_fd()`, and combines them with `Tensor::from_planes()`.
+Per-plane stride and offset can be set on each descriptor before import.
 
 **Tensor crate**: `Tensor::from_planes(luma, chroma, PixelFormat::Nv12)` stores the
 two tensors as separate planes inside the `Tensor`, preserving their
@@ -1683,14 +1683,14 @@ each at offset 0.
 | Single-fd NV12 DMA-BUF | Yes | V4L2 single-planar capture, HAL-allocated buffers |
 | Single-fd YUYV/RGB/RGBA DMA-BUF | Yes | Always single-plane |
 | System memory input | N/A | Copied into HAL tensor regardless |
-| Multi-fd NV12/NV16 DMA-BUF | Yes | Via `hal_tensor_from_planes()` |
+| Multi-fd NV12/NV16 DMA-BUF | Yes | Via `hal_import_image()` with two plane descriptors |
 
 ### GStreamer Integration (External)
 
 The `edgefirstcameraadaptor` element detects multi-plane buffers
 (`gst_buffer_n_memory() > 1`) and extracts per-plane fds via
 `gst_dmabuf_memory_get_fd()` on each `GstMemory` block, passing them to
-`hal_tensor_from_planes()` for zero-copy import.
+`hal_import_image()` via separate plane descriptors for zero-copy import.
 
 ### Tracking
 

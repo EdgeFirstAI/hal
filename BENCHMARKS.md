@@ -584,6 +584,10 @@ ssh user@target '/tmp/bench_preproc'
 
 The binary requires a DMA-heap device (`/dev/dma_heap/linux,cma` or `/dev/dma_heap/system`) and an EGL display. On x86 with NVIDIA, it automatically falls back to the PBO path.
 
+> **CI environments:** Set `EDGEFIRST_FORCE_BACKEND=cpu` to skip software GL
+> detection overhead. Without this, the GL backend will attempt EGL init,
+> detect llvmpipe/swrast, and fall back to CPU — adding ~200ms to startup.
+
 ---
 
 ## Known Benchmark Gaps
