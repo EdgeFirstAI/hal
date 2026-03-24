@@ -457,16 +457,18 @@ jobs:
           echo "Runner test binaries:"
           ls -la runner-test-binaries/ || echo "No test binaries found"
 
-      - name: Build hardware test binaries (hardware-relevant crates only)
+      - name: Build hardware test binaries (GPU/DMA tests only)
         run: |
           source /tmp/coverage-env.sh
           # Only build crates that exercise hardware paths (G2D, EGL, DMA).
-          # CPU-only crates (bench, decoder, tracker) already run on the aarch64 runner.
+          # CPU-only crates (bench, decoder, tracker, capi) run on the aarch64 runner.
+          # Exclude opencv — no opencv tests run on hardware, and dropping it
+          # significantly reduces binary size (faster transfer to embedded target).
+          # LTO=fat in the profiling profile strips unreachable code across crates.
           cargo nextest run --no-run --cargo-profile profiling \
             --package edgefirst-image \
             --package edgefirst-tensor \
-            --package edgefirst-hal-capi \
-            --features default,opencv,g2d_test_formats,dma_test_formats
+            --features opengl,g2d_test_formats,dma_test_formats
           mkdir -p hardware-test-binaries
           find target/llvm-cov-target/profiling/deps/ -maxdepth 1 -type f -executable \
             ! -name "*.d" ! -name "*.rlib" ! -name "*.rmeta" ! -name "*.so" \

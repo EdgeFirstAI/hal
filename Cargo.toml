@@ -86,3 +86,4 @@ debug = false
 inherits = "release"
 strip = false
 debug = true
+lto = "fat"
