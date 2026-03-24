@@ -1053,6 +1053,7 @@ mod g2d_tests {
     /// Compares G2D src→PixelFormat::Bgra against G2D src→PixelFormat::Rgba by verifying R↔B swap.
     #[test]
     #[cfg(target_os = "linux")]
+    #[ignore = "G2D on i.MX 8MP rejects BGRA as destination format; re-enable when supported"]
     fn test_g2d_bgra_no_resize() {
         for src_fmt in [
             PixelFormat::Rgba,
