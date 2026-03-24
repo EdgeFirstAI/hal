@@ -1337,16 +1337,15 @@ for (int i = 0; i < N_BUFS; i++) {
 }
 ```
 
-With `hal_tensor_from_fd()` the pattern is similar, but since that function
-takes ownership of the fd, the caller must `dup()` first:
+With `hal_tensor_from_fd()` the pattern is similar. The function dups
+the fd internally — the caller retains ownership of the original:
 
 ```c
-// When using hal_tensor_from_fd (takes ownership of fd):
+// When using hal_tensor_from_fd (dups fd, caller retains original):
 if (pool_tensors[buf_index] == NULL) {
-    int duped_fd = dup(v4l2_buf.m.fd);       // keep V4L2's copy alive
     size_t shape[] = { height, width, 1 };    // NV12 luma plane
     pool_tensors[buf_index] = hal_tensor_from_fd(
-        HAL_DTYPE_U8, duped_fd, shape, 3, "v4l2_src");
+        HAL_DTYPE_U8, v4l2_buf.m.fd, shape, 3, "v4l2_src");
     hal_tensor_set_format(pool_tensors[buf_index], HAL_PIXEL_FORMAT_NV12);
 }
 ```
@@ -1357,7 +1356,7 @@ if (pool_tensors[buf_index] == NULL) {
 |----------|-------------|-----------------|
 | `hal_plane_descriptor_new()` | Dups eagerly — caller retains original fd | Never — caller keeps its fd |
 | `hal_import_image()` | Consumes both descriptors (success or fail) | Never — descriptors already duped the fd |
-| `hal_tensor_from_fd()` | HAL takes ownership | Always, if caller needs the fd afterward |
+| `hal_tensor_from_fd()` | Dups internally — caller retains original fd | Never — caller keeps its fd |
 
 #### Anti-Patterns
 
