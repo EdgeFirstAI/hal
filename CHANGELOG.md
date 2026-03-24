@@ -55,10 +55,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **C API preprocessing benchmark** (`crates/capi/tests/bench_preproc.c`) —
   gold-standard integration reference for GStreamer/V4L2 integrators. Covers
-  five DMA-BUF import patterns (reuse, pool, stride, multiplane NV12,
-  per-frame anti-pattern), a full format conversion matrix, and a two-stage
+  seven DMA-BUF import patterns (reuse, pool, stride, multiplane, multiplane
+  with stride, render target, per-frame anti-pattern), a full format
+  conversion matrix, and a two-stage
   chained pipeline. Configurable via `BENCH_ITERATIONS` and
   `EDGEFIRST_FORCE_BACKEND` environment variables.
+
+### Removed
+
+- **`hal_tensor_from_planes()` C API** — replaced by `hal_import_image()` with
+  per-plane `hal_plane_descriptor_new()` descriptors. The new API supports
+  stride, offset, and single-plane formats. See ARCHITECTURE.md
+  "Multi-Plane Support" for updated patterns.
 
 ### Changed
 

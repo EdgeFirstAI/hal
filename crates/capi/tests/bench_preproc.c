@@ -12,8 +12,9 @@
 //      b. Import pool: V4L2-style buffer pool rotation with imported fds
 //      c. Import with stride: padded buffers (V4L2 bytesperline)
 //      d. Import multiplane NV12: separate Y and UV plane fds
-//      e. Import render target: render INTO imported DMA-BUF (zero-copy output)
-//      f. Import per frame: re-import every iteration (anti-pattern)
+//      e. Import multiplane with stride: per-plane stride on Y and UV
+//      f. Import render target: render INTO imported DMA-BUF (zero-copy output)
+//      g. Import per frame: re-import every iteration (anti-pattern)
 //   2. Internal allocation patterns (hal_image_processor_create_image):
 //      a. Reuse: allocate once, convert N times (format matrix)
 //      b. Chained pipeline: NV12 -> RGBA -> PlanarRgb I8
@@ -763,7 +764,7 @@ static bench_result bench_import_render_target(struct hal_image_processor *proc,
 }
 
 // ============================================================================
-// Section 1f: DMA-BUF import per frame (anti-pattern)
+// Section 1g: DMA-BUF import per frame (anti-pattern)
 //
 // Re-imports a new DMA-BUF every iteration, forcing an EGL image cache miss
 // each time.  This quantifies the overhead of not reusing tensor handles.
