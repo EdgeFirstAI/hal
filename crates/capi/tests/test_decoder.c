@@ -373,6 +373,506 @@ static void test_segmentation_to_mask_null(void) {
 }
 
 // =============================================================================
+// Tracked Decoder Tests
+// =============================================================================
+
+
+static inline struct hal_tensor* hal_tensor_new_from_file(
+    enum hal_dtype dtype,
+    const size_t* shape,
+    size_t ndim,
+    enum hal_tensor_memory memory,
+    const char* path
+) {
+    if (!shape || ndim == 0 || !path) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    // Open the file
+    FILE* fp = fopen(path, "rb");
+    if (!fp) {
+        // errno already set by fopen (ENOENT, EACCES, etc.)
+        return NULL;
+    }
+
+    // Get file size
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        errno = EIO;
+        return NULL;
+    }
+    long file_size = ftell(fp);
+    if (file_size < 0) {
+        fclose(fp);
+        errno = EIO;
+        return NULL;
+    }
+    if (fseek(fp, 0, SEEK_SET) != 0) {
+        fclose(fp);
+        errno = EIO;
+        return NULL;
+    }
+
+    // Allocate the tensor (passing NULL data to get a zeroed buffer)
+    struct hal_tensor* tensor = hal_tensor_new(dtype, shape, ndim, memory, NULL);
+    if (!tensor) {
+        fclose(fp);
+        // errno already set by hal_tensor_new
+        return NULL;
+    }
+
+    // Verify file size matches tensor data length
+    size_t data_len = hal_tensor_len(tensor);
+    size_t dtype_size = hal_tensor_dtype_size(tensor);
+    size_t expected_bytes = data_len * dtype_size;
+
+    if ((size_t)file_size != expected_bytes) {
+        fclose(fp);
+        hal_tensor_free(tensor);
+        errno = EIO;
+        return NULL;
+    }
+
+    // Read file data directly into the tensor buffer
+    struct hal_tensor_map* map = hal_tensor_map_create(tensor);
+    void* data = hal_tensor_map_data(map);
+    if (!data) {
+        fclose(fp);
+        hal_tensor_map_unmap(map);
+        hal_tensor_free(tensor);
+        errno = EIO;
+        return NULL;
+    }
+
+    size_t bytes_read = fread(data, 1, expected_bytes, fp);
+    fclose(fp);
+
+    if (bytes_read != expected_bytes) {
+        hal_tensor_map_unmap(map);
+        hal_tensor_free(tensor);
+        errno = EIO;
+        return NULL;
+    }
+
+    hal_tensor_map_unmap(map);
+    return tensor;
+}
+
+static void test_decoder_tracked_linear_motion(void) {
+    TEST("decoder_tracked_linear_motion");
+
+    // Load quantized test data: yolov8s_80_classes.bin as i8 [1, 84, 8400]
+    size_t det_shape[] = {1, 84, 8400};
+    struct hal_tensor* det_tensor = hal_tensor_new_from_file(
+        HAL_DTYPE_I8, det_shape, 3, HAL_TENSOR_MEMORY_MEM,
+        "../../../testdata/yolov8s_80_classes.bin"
+    );
+    ASSERT_NOT_NULL(det_tensor);
+
+    // Build decoder via YAML config
+    static const char* CONFIG =
+        "decoder_version: yolov8\n"
+        "outputs:\n"
+        "  - type: detection\n"
+        "    decoder: ultralytics\n"
+        "    quantization: [0.0040811873, -123]\n"
+        "    shape: [1, 84, 8400]\n"
+        "    dshape:\n"
+        "      - [batch, 1]\n"
+        "      - [num_features, 84]\n"
+        "      - [num_boxes, 8400]\n"
+        "    normalized: true\n"
+        "nms: class_agnostic\n";
+
+    struct hal_decoder_params* params = hal_decoder_params_new();
+    ASSERT_NOT_NULL(params);
+    ASSERT_EQ(0, hal_decoder_params_set_config_yaml(params, CONFIG, 0));
+    hal_decoder_params_set_score_threshold(params, 0.25f);
+    hal_decoder_params_set_iou_threshold(params, 0.1f);
+
+    struct hal_decoder* decoder = hal_decoder_new(params);
+    ASSERT_NOT_NULL(decoder);
+    hal_decoder_params_free(params);
+
+    // Create tracker with matching parameters
+    struct hal_bytetrack* tracker = hal_bytetrack_new(
+        0.1f,   // track_update
+        0.3f,   // high_thresh
+        0.2f,   // match_thresh
+        30,     // frame_rate
+        60      // track_buffer
+    );
+    ASSERT_NOT_NULL(tracker);
+
+    // Frame 0: establish tracks
+    const struct hal_tensor* outputs[] = {det_tensor};
+    struct hal_detect_box_list* boxes = NULL;
+    struct hal_segmentation_list* segs = NULL;
+    struct hal_track_info_list* tracks = NULL;
+
+    int rc = hal_decoder_decode_tracked(
+        decoder, tracker, 0, outputs, 1, &boxes, &segs, &tracks
+    );
+    ASSERT_EQ(0, rc);
+    ASSERT_NOT_NULL(boxes);
+    ASSERT_EQ(2, hal_detect_box_list_len(boxes));
+
+    // Verify initial box positions
+    struct hal_detect_box box0, box1;
+    hal_detect_box_list_get(boxes, 0, &box0);
+    hal_detect_box_list_get(boxes, 1, &box1);
+
+    ASSERT_FLOAT_EQ(0.5285137f, box0.xmin, 1e-3f);
+    ASSERT_FLOAT_EQ(0.05305544f, box0.ymin, 1e-3f);
+    ASSERT_FLOAT_EQ(0.87541467f, box0.xmax, 1e-3f);
+    ASSERT_FLOAT_EQ(0.9998909f, box0.ymax, 1e-3f);
+
+    ASSERT_FLOAT_EQ(0.130598f, box1.xmin, 1e-3f);
+    ASSERT_FLOAT_EQ(0.43260583f, box1.ymin, 1e-3f);
+    ASSERT_FLOAT_EQ(0.35098213f, box1.xmax, 1e-3f);
+    ASSERT_FLOAT_EQ(0.9958097f, box1.ymax, 1e-3f);
+
+    hal_detect_box_list_free(boxes);
+    if (segs) hal_segmentation_list_free(segs);
+    if (tracks) hal_track_info_list_free(tracks);
+
+    // Frames 1-100: apply linear motion to X coordinates
+    // offset per frame = round(i * 1e-3 / 0.0040811873) as i8 added to each x value
+    float quant_scale = 0.0040811873f;
+    size_t data_len = hal_tensor_len(det_tensor);
+    ASSERT_EQ(84 * 8400, data_len);
+
+    for (int i = 1; i <= 100; i++) {
+        // Clone the original tensor for each frame
+        struct hal_tensor* frame = hal_tensor_new_from_file(
+            HAL_DTYPE_I8, det_shape, 3, HAL_TENSOR_MEMORY_MEM,
+            "../../../testdata/yolov8s_80_classes.bin"
+        );
+        ASSERT_NOT_NULL(frame);
+
+        // Add linear X offset: saturating add to x row (row 0 of 84)
+        struct hal_tensor_map* map = hal_tensor_map_create(frame);
+        ASSERT_NOT_NULL(map);
+        int8_t* data = (int8_t*)hal_tensor_map_data(map);
+        ASSERT_NOT_NULL(data);
+        int8_t offset = (int8_t)roundf((float)i * 1e-3f / quant_scale);
+        for (size_t j = 0; j < 8400; j++) {
+            int16_t val = (int16_t)data[j] + (int16_t)offset;
+            if (val > 127) val = 127;
+            if (val < -128) val = -128;
+            data[j] = (int8_t)val;
+        }
+        hal_tensor_map_unmap(map);
+
+        const struct hal_tensor* frame_outputs[] = {frame};
+        uint64_t ts = (uint64_t)100000000 * (uint64_t)i / 3;
+
+        rc = hal_decoder_decode_tracked(
+            decoder, tracker, ts, frame_outputs, 1, &boxes, &segs, &tracks
+        );
+        ASSERT_EQ(0, rc);
+        ASSERT_EQ(2, hal_detect_box_list_len(boxes));
+
+        hal_detect_box_list_free(boxes);
+        if (segs) hal_segmentation_list_free(segs);
+        if (tracks) hal_track_info_list_free(tracks);
+        hal_tensor_free(frame);
+    }
+
+    // Verify active tracks reflect linear motion (total X offset ~0.1)
+    struct hal_track_info_list* active = hal_bytetrack_get_active_tracks(tracker);
+    ASSERT_NOT_NULL(active);
+    ASSERT_EQ(2, hal_track_info_list_len(active));
+
+    struct hal_track_info info0, info1;
+    hal_track_info_list_get(active, 0, &info0);
+    hal_track_info_list_get(active, 1, &info1);
+
+    // Tracked locations should reflect 0.1 X offset
+    ASSERT_FLOAT_EQ(0.5285137f + 0.1f, info0.location[0], 1e-3f);
+    ASSERT_FLOAT_EQ(0.87541467f + 0.1f, info0.location[2], 1e-3f);
+    ASSERT_FLOAT_EQ(0.130598f + 0.1f, info1.location[0], 1e-3f);
+    ASSERT_FLOAT_EQ(0.35098213f + 0.1f, info1.location[2], 1e-3f);
+
+    // Y coordinates should be unchanged
+    ASSERT_FLOAT_EQ(0.05305544f, info0.location[1], 1e-3f);
+    ASSERT_FLOAT_EQ(0.9998909f, info0.location[3], 1e-3f);
+    ASSERT_FLOAT_EQ(0.43260583f, info1.location[1], 1e-3f);
+    ASSERT_FLOAT_EQ(0.9958097f, info1.location[3], 1e-3f);
+
+    hal_track_info_list_free(active);
+
+    // Frame 101: no detections — tracker should predict forward using
+    // learned linear velocity
+    struct hal_tensor* empty_frame = hal_tensor_new_from_file(
+        HAL_DTYPE_I8, det_shape, 3, HAL_TENSOR_MEMORY_MEM,
+        "../../../testdata/yolov8s_80_classes.bin"
+    );
+    ASSERT_NOT_NULL(empty_frame);
+
+    // Zero out all scores (rows 4..84) with i8::MIN (-128)
+    struct hal_tensor_map* map = hal_tensor_map_create(empty_frame);
+    ASSERT_NOT_NULL(map);
+    int8_t* edata = (int8_t*)hal_tensor_map_data(map);
+    ASSERT_NOT_NULL(edata);
+    for (size_t row = 4; row < 84; row++) {
+        for (size_t col = 0; col < 8400; col++) {
+            edata[row * 8400 + col] = -128;
+        }
+    }
+
+    const struct hal_tensor* empty_outputs[] = {empty_frame};
+    uint64_t ts_101 = (uint64_t)100000000 * 101 / 3;
+
+    rc = hal_decoder_decode_tracked(
+        decoder, tracker, ts_101, empty_outputs, 1, &boxes, &segs, &tracks
+    );
+    ASSERT_EQ(0, rc);
+    ASSERT_EQ(2, hal_detect_box_list_len(boxes));
+
+    // Predicted boxes should have ~0.101 X offset (0.1 + one more step of 0.001)
+    hal_detect_box_list_get(boxes, 0, &box0);
+    hal_detect_box_list_get(boxes, 1, &box1);
+
+    ASSERT_FLOAT_EQ(0.5285137f + 0.101f, box0.xmin, 1e-3f);
+    ASSERT_FLOAT_EQ(0.87541467f + 0.101f, box0.xmax, 1e-3f);
+    ASSERT_FLOAT_EQ(0.130598f + 0.101f, box1.xmin, 1e-3f);
+    ASSERT_FLOAT_EQ(0.35098213f + 0.101f, box1.xmax, 1e-3f);
+
+    hal_detect_box_list_free(boxes);
+    if (segs) hal_segmentation_list_free(segs);
+    if (tracks) hal_track_info_list_free(tracks);
+    hal_tensor_map_unmap(map);
+    hal_tensor_free(empty_frame);
+    hal_tensor_free(det_tensor);
+    hal_bytetrack_free(tracker);
+    hal_decoder_free(decoder);
+    TEST_PASS();
+}
+
+static void test_decoder_tracked_end_to_end_segdet_split_proto(void) {
+    TEST("decoder_tracked_end_to_end_segdet_split_proto");
+
+    float quant_scale = 2.0f/255.0f;
+    size_t boxes_shape[] = {1, 10, 4};
+    struct hal_tensor* boxes_tensor = hal_tensor_new(
+        HAL_DTYPE_U8, boxes_shape, 3, HAL_TENSOR_MEMORY_MEM, NULL
+    );
+
+    struct hal_image_processor* processor = hal_image_processor_new();
+    ASSERT_NOT_NULL(processor);
+
+
+    ASSERT_NOT_NULL(boxes_tensor);
+    {
+        struct hal_tensor_map* map = hal_tensor_map_create(boxes_tensor);
+        ASSERT_NOT_NULL(map);
+        uint8_t* data = (uint8_t*)hal_tensor_map_data(map);
+        ASSERT_NOT_NULL(data);
+        memset(data, 0, 10 * 4);
+        data[0] = (uint8_t)roundf(0.1234f / quant_scale);
+        data[1] = (uint8_t)roundf(0.1234f / quant_scale);
+        data[2] = (uint8_t)roundf(0.2345f / quant_scale);
+        data[3] = (uint8_t)roundf(0.2345f / quant_scale);
+        hal_tensor_map_unmap(map);
+    }
+
+    // Scores tensor [1, 10, 1] as u8
+    size_t scores_shape[] = {1, 10, 1};
+    struct hal_tensor* scores_tensor = hal_tensor_new(
+        HAL_DTYPE_U8, scores_shape, 3, HAL_TENSOR_MEMORY_MEM, NULL
+    );
+    ASSERT_NOT_NULL(scores_tensor);
+    {
+        struct hal_tensor_map* map = hal_tensor_map_create(scores_tensor);
+        ASSERT_NOT_NULL(map);
+        uint8_t* data = (uint8_t*)hal_tensor_map_data(map);
+        ASSERT_NOT_NULL(data);
+        memset(data, 0, 10);
+        data[0] = (uint8_t)roundf(0.9876f / quant_scale); // 126
+        hal_tensor_map_unmap(map);
+    }
+
+    // Classes tensor [1, 10, 1] as u8
+    size_t classes_shape[] = {1, 10, 1};
+    struct hal_tensor* classes_tensor = hal_tensor_new(
+        HAL_DTYPE_U8, classes_shape, 3, HAL_TENSOR_MEMORY_MEM, NULL
+    );
+    ASSERT_NOT_NULL(classes_tensor);
+    {
+        struct hal_tensor_map* map = hal_tensor_map_create(classes_tensor);
+        ASSERT_NOT_NULL(map);
+        uint8_t* data = (uint8_t*)hal_tensor_map_data(map);
+        ASSERT_NOT_NULL(data);
+        memset(data, 0, 10);
+        data[0] = (uint8_t)fminf(roundf(2.0f / quant_scale), 255.0f); // 255
+        hal_tensor_map_unmap(map);
+    }
+
+    // Mask coefficients tensor [1, 10, 32] as u8 — all zeros
+    size_t mask_shape[] = {1, 10, 32};
+    struct hal_tensor* mask_tensor = hal_tensor_new(
+        HAL_DTYPE_U8, mask_shape, 3, HAL_TENSOR_MEMORY_MEM, NULL
+    );
+    ASSERT_NOT_NULL(mask_tensor);
+
+    size_t protos_shape[] = {1, 160, 160, 32};
+    struct hal_tensor* protos_tensor = hal_tensor_new(
+        HAL_DTYPE_U8, protos_shape, 4, HAL_TENSOR_MEMORY_MEM, NULL
+    );
+    ASSERT_NOT_NULL(protos_tensor);
+
+    // Build decoder via YAML config (matching the Rust test config)
+    static const char* CONFIG =
+        "decoder_version: yolo26\n"
+        "outputs:\n"
+        "  - type: boxes\n"
+        "    decoder: ultralytics\n"
+        "    quantization: [0.00784313725490196, 0]\n"
+        "    shape: [1, 10, 4]\n"
+        "    dshape:\n"
+        "      - [batch, 1]\n"
+        "      - [num_boxes, 10]\n"
+        "      - [box_coords, 4]\n"
+        "    normalized: true\n"
+        "  - type: scores\n"
+        "    decoder: ultralytics\n"
+        "    quantization: [0.00784313725490196, 0]\n"
+        "    shape: [1, 10, 1]\n"
+        "    dshape:\n"
+        "      - [batch, 1]\n"
+        "      - [num_boxes, 10]\n"
+        "      - [num_classes, 1]\n"
+        "  - type: classes\n"
+        "    decoder: ultralytics\n"
+        "    quantization: [0.00784313725490196, 0]\n"
+        "    shape: [1, 10, 1]\n"
+        "    dshape:\n"
+        "      - [batch, 1]\n"
+        "      - [num_boxes, 10]\n"
+        "      - [num_classes, 1]\n"
+        "  - type: mask_coefficients\n"
+        "    decoder: ultralytics\n"
+        "    quantization: [0.00784313725490196, 0]\n"
+        "    shape: [1, 10, 32]\n"
+        "    dshape:\n"
+        "      - [batch, 1]\n"
+        "      - [num_boxes, 10]\n"
+        "      - [num_protos, 32]\n"
+        "  - type: protos\n"
+        "    decoder: ultralytics\n"
+        "    quantization: [0.0039215686274509803921568627451, 128]\n"
+        "    shape: [1, 160, 160, 32]\n"
+        "    dshape:\n"
+        "      - [batch, 1]\n"
+        "      - [height, 160]\n"
+        "      - [width, 160]\n"
+        "      - [num_protos, 32]\n";
+
+    struct hal_decoder_params* params = hal_decoder_params_new();
+    ASSERT_NOT_NULL(params);
+    ASSERT_EQ(0, hal_decoder_params_set_config_yaml(params, CONFIG, 0));
+    hal_decoder_params_set_score_threshold(params, 0.45f);
+    hal_decoder_params_set_iou_threshold(params, 0.45f);
+
+    struct hal_decoder* decoder = hal_decoder_new(params);
+    ASSERT_NOT_NULL(decoder);
+    hal_decoder_params_free(params);
+
+    // Create tracker
+    struct hal_bytetrack* tracker = hal_bytetrack_new(
+        0.1f,   // track_update
+        0.7f,   // high_thresh
+        0.5f,   // match_thresh
+        30,     // frame_rate
+        30      // track_buffer
+    );
+    ASSERT_NOT_NULL(tracker);
+
+    // Frame 0: decode tracked
+    const struct hal_tensor* outputs[] = {
+        boxes_tensor, scores_tensor, classes_tensor, mask_tensor, protos_tensor
+    };
+    struct hal_detect_box_list* box_list = NULL;
+    struct hal_segmentation_list* seg_list = NULL;
+    struct hal_track_info_list* track_list = NULL;
+
+    struct hal_tensor* image = hal_tensor_new_image(400, 400, HAL_FOURCC_RGBA, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    ASSERT_NOT_NULL(image);
+
+    int rc = hal_decoder_decode_tracked_draw_masks(
+        decoder, tracker, 0, processor, outputs, 5, image, &box_list, &track_list
+    );
+    
+    ASSERT_EQ(0, rc);
+    ASSERT_NOT_NULL(box_list);
+    ASSERT_EQ(1, hal_detect_box_list_len(box_list));
+
+    // Verify detection: expected bbox ~(0.125, 0.125, 0.235, 0.235), score ~0.988, label 2
+    // Difference in expected is due to quantization error from u8
+    struct hal_detect_box box0;
+    hal_detect_box_list_get(box_list, 0, &box0);
+    ASSERT_FLOAT_EQ(0.12549022f, box0.xmin, 1.0f / 160.0f);
+    ASSERT_FLOAT_EQ(0.12549022f, box0.ymin, 1.0f / 160.0f);
+    ASSERT_FLOAT_EQ(0.23529413f, box0.xmax, 1.0f / 160.0f);
+    ASSERT_FLOAT_EQ(0.23529413f, box0.ymax, 1.0f / 160.0f);
+    ASSERT_EQ(2, (int)box0.label);
+
+    hal_detect_box_list_free(box_list);
+    if (seg_list) hal_segmentation_list_free(seg_list);
+    if (track_list) hal_track_info_list_free(track_list);
+
+    // Frame 1: zero all scores to simulate no detections, verify tracker prediction
+    {
+        struct hal_tensor_map* map = hal_tensor_map_create(scores_tensor);
+        ASSERT_NOT_NULL(map);
+        uint8_t* data = (uint8_t*)hal_tensor_map_data(map);
+        ASSERT_NOT_NULL(data);
+        memset(data, 0, 10); // u8::MIN = 0
+        hal_tensor_map_unmap(map);
+    }
+
+    box_list = NULL;
+    seg_list = NULL;
+    track_list = NULL;
+
+    rc = hal_decoder_decode_tracked_draw_masks(
+        decoder, tracker, 100000000 / 3, processor, outputs, 5, image, &box_list, &track_list
+    );
+
+    ASSERT_EQ(0, rc);
+    ASSERT_NOT_NULL(box_list);
+
+    // Tracker should predict the box forward (same location since no motion)
+    ASSERT_EQ(1, hal_detect_box_list_len(box_list));
+    hal_detect_box_list_get(box_list, 0, &box0);
+    ASSERT_FLOAT_EQ(0.12549022f, box0.xmin, 1e-3f);
+    ASSERT_FLOAT_EQ(0.12549022f, box0.ymin, 1e-3f);
+    ASSERT_FLOAT_EQ(0.23529413f, box0.xmax, 1e-3f);
+    ASSERT_FLOAT_EQ(0.23529413f, box0.ymax, 1e-3f);
+
+    // No segmentation masks when boxes come from tracker prediction
+    ASSERT_EQ(0, hal_segmentation_list_len(seg_list));
+
+    hal_detect_box_list_free(box_list);
+    if (seg_list) hal_segmentation_list_free(seg_list);
+    if (track_list) hal_track_info_list_free(track_list);
+
+    hal_tensor_free(boxes_tensor);
+    hal_tensor_free(scores_tensor);
+    hal_tensor_free(classes_tensor);
+    hal_tensor_free(mask_tensor);
+    hal_tensor_free(protos_tensor);
+    hal_tensor_free(image);
+    hal_bytetrack_free(tracker);
+    hal_decoder_free(decoder);
+    hal_image_processor_free(processor);
+    TEST_PASS();
+}
+
+
+// =============================================================================
 // Main Test Runner
 // =============================================================================
 
@@ -408,6 +908,10 @@ void run_decoder_tests(void) {
 
     // Segmentation to mask tests
     test_segmentation_to_mask_null();
+
+    // Tracked decoder tests
+    test_decoder_tracked_linear_motion();
+    test_decoder_tracked_end_to_end_segdet_split_proto();
 }
 
 #ifdef TEST_DECODER_STANDALONE

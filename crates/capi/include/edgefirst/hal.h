@@ -1155,6 +1155,68 @@ int hal_decoder_decode_masks(const struct hal_decoder *decoder,
                              struct hal_segmentation_list **out_masks);
 
 /**
+ * Decode model outputs into tracked detection boxes and segmentation masks.
+ *
+ * Automatically selects the decoding path based on tensor dtype:
+ * - f32 tensors → `decode_tracked_float` path
+ * - Integer tensors (u8, i8, u16, i16, u32, i32) → `decode_tracked_quantized` path
+ *
+ * All output tensors must be the same general category (all float or all integer).
+ *
+ * @param decoder Decoder handle
+ * @param tracker Tracker handle for maintaining object identities across frames
+ * @param timestamp Timestamp for the current frame (e.g., in nanoseconds)
+ * @param outputs Array of output tensor pointers
+ * @param num_outputs Number of output tensors
+ * @param out_boxes Output parameter for detection box list (caller must free)
+ * @param out_segmentations Output parameter for segmentation list (can be NULL; caller must free if non-NULL)
+ * @return 0 on success, -1 on error
+ * @par Errors (errno):
+ * - EINVAL: Invalid argument (NULL decoder/outputs/out_boxes, mixed dtypes)
+ * - EIO: Decoding failed
+ */
+int hal_decoder_decode_tracked(const struct hal_decoder *decoder,
+                               struct hal_bytetrack *tracker,
+                               uint64_t timestamp,
+                               const struct hal_tensor *const *outputs,
+                               size_t num_outputs,
+                               struct hal_detect_box_list **out_boxes,
+                               struct hal_segmentation_list **out_segmentations,
+                               struct hal_track_info_list **out_tracks);
+
+/**
+ * Decode tracked model outputs and draw masks directly onto a destination image.
+ *
+ * This is the fused tracked path: for segmentation models, prototype data is
+ * passed directly to the renderer without materializing intermediate mask
+ * arrays. Object tracking is applied to maintain identities across frames.
+ * For detection-only models, this falls back to tracked decode + draw_masks.
+ *
+ * @param decoder Decoder handle
+ * @param tracker Tracker handle for maintaining object identities across frames
+ * @param timestamp Timestamp for the current frame (e.g., in nanoseconds)
+ * @param processor Image processor handle
+ * @param outputs Array of output tensor pointers
+ * @param num_outputs Number of output tensors
+ * @param dst Destination image to draw onto
+ * @param out_boxes Output parameter for detection box list (caller must free)
+ * @param out_tracks Output parameter for track info list (can be NULL; caller must free if non-NULL)
+ * @return 0 on success, -1 on error
+ * @par Errors (errno):
+ * - EINVAL: Invalid argument (NULL decoder/tracker/processor/outputs/dst/out_boxes)
+ * - EIO: Decoding or drawing failed
+ */
+int hal_decoder_decode_tracked_draw_masks(const struct hal_decoder *decoder,
+                                          struct hal_bytetrack *tracker,
+                                          uint64_t timestamp,
+                                          struct hal_image_processor *processor,
+                                          const struct hal_tensor *const *outputs,
+                                          size_t num_outputs,
+                                          struct hal_tensor *dst,
+                                          struct hal_detect_box_list **out_boxes,
+                                          struct hal_track_info_list **out_tracks);
+
+/**
  * Create a new rectangle.
  *
  * @param left Left edge (x coordinate)
