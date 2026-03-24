@@ -4152,6 +4152,7 @@ mod image_tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    #[ignore = "G2D does not support VYUY; re-enable when hardware support is added"]
     fn test_vyuy_to_rgba_g2d() {
         if !is_g2d_available() {
             eprintln!("SKIPPED: test_vyuy_to_rgba_g2d - G2D library (libg2d.so.2) not available");
@@ -4219,6 +4220,7 @@ mod image_tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    #[ignore = "G2D does not support VYUY; re-enable when hardware support is added"]
     fn test_vyuy_to_rgb_g2d() {
         if !is_g2d_available() {
             eprintln!("SKIPPED: test_vyuy_to_rgb_g2d - G2D library (libg2d.so.2) not available");
