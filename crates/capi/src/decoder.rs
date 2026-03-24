@@ -254,14 +254,14 @@ impl From<HalDimName> for configs::DimName {
 /// enum hal_dim_name scores_dims[] = {HAL_DIM_NAME_BATCH, HAL_DIM_NAME_NUM_CLASSES,
 ///                                     HAL_DIM_NAME_NUM_BOXES};
 /// int s = hal_decoder_params_add_output(params, HAL_OUTPUT_TYPE_SCORES,
-///             HAL_DECODER_ULTRALYTICS, scores_shape, scores_dims, 3);
+///             HAL_DECODER_TYPE_ULTRALYTICS, scores_shape, scores_dims, 3);
 /// hal_decoder_params_output_set_quantization(params, s, 0.003906f, 0);
 ///
 /// size_t boxes_shape[] = {1, 4, 8400};
 /// enum hal_dim_name boxes_dims[] = {HAL_DIM_NAME_BATCH, HAL_DIM_NAME_BOX_COORDS,
 ///                                    HAL_DIM_NAME_NUM_BOXES};
 /// int b = hal_decoder_params_add_output(params, HAL_OUTPUT_TYPE_BOXES,
-///             HAL_DECODER_ULTRALYTICS, boxes_shape, boxes_dims, 3);
+///             HAL_DECODER_TYPE_ULTRALYTICS, boxes_shape, boxes_dims, 3);
 /// hal_decoder_params_output_set_quantization(params, b, 0.019824f, 0);
 ///
 /// hal_decoder_params_set_nms(params, HAL_NMS_CLASS_AGNOSTIC);
@@ -472,7 +472,7 @@ pub unsafe extern "C" fn hal_decoder_params_set_config_file(
 /// enum hal_dim_name dims[] = {HAL_DIM_NAME_BATCH, HAL_DIM_NAME_NUM_CLASSES,
 ///                              HAL_DIM_NAME_NUM_BOXES};
 /// int idx = hal_decoder_params_add_output(params, HAL_OUTPUT_TYPE_SCORES,
-///               HAL_DECODER_ULTRALYTICS, shape, dims, 3);
+///               HAL_DECODER_TYPE_ULTRALYTICS, shape, dims, 3);
 /// @endcode
 ///
 /// @see hal_decoder_params_output_set_quantization
