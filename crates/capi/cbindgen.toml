@@ -55,8 +55,8 @@ trailer = """
 #endif /* EDGEFIRST_HAL_H */
 """
 
-includes = ["stdint.h", "stddef.h", "stdbool.h", "stdio.h"]
-sys_includes = []
+includes = []
+sys_includes = ["stddef.h", "stdio.h"]
 no_includes = false
 
 [export]

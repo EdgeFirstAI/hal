@@ -854,14 +854,14 @@ static bench_result bench_import_recreate(struct hal_image_processor *proc,
             hal_image_processor_convert(proc, src, dst,
                                          HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop);
             hal_tensor_free(src);
-        }
-        clock_gettime(CLOCK_MONOTONIC, &t1);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
 
-        double ms = elapsed_ms(&t0, &t1);
-        total += ms;
-        if (ms < min_t) min_t = ms;
-        if (ms > max_t) max_t = ms;
-        measured++;
+            double ms = elapsed_ms(&t0, &t1);
+            total += ms;
+            if (ms < min_t) min_t = ms;
+            if (ms > max_t) max_t = ms;
+            measured++;
+        }
     }
 
     hal_tensor_free(dst);
