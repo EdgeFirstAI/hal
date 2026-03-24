@@ -28,7 +28,8 @@
 #
 # Runner Notes:
 # - ubuntu-22.04: Standard GitHub-hosted runner (x86_64)
-# - ubuntu-22.04-arm: GitHub ARM64 runner (public repos)
+# - ubuntu-22.04-arm-xlarge: GitHub ARM64 runner, 16 vCPU (aarch64 builds)
+# - ubuntu-22.04-arm: GitHub ARM64 runner, 4 vCPU (aarch64 tests, coverage)
 # - macos-latest: GitHub macOS runner (Apple Silicon)
 # - nxp-imx8mp-latest: NXP i.MX 8M Plus EVK - test-only runner (NO toolchain)
 #
@@ -52,6 +53,10 @@ on:
   pull_request:
     branches: [main, develop]
   workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -e -o pipefail {0}
 
 env:
   CARGO_TERM_COLOR: always
@@ -92,7 +97,6 @@ jobs:
   doc-tests:
     name: Doc Tests
     runs-on: ubuntu-22.04
-    needs: checkout-lfs
     steps:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
@@ -179,7 +183,7 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5  # v2.8.2
         with:
-          shared-key: rust-${{ matrix.platform.name }}
+          shared-key: rust-x86_64
           cache-on-failure: true
 
       - name: Install cargo tools
@@ -211,7 +215,7 @@ jobs:
 
       - name: Run Rust tests with coverage
         run: |
-          set -o pipefail
+
           # Run tests but don't generate report yet - we'll combine with Python test coverage
           # Use default,opencv features; exclude g2d_test_formats,dma_test_formats (on-target only)
           cargo llvm-cov nextest --cargo-profile profiling --features default,opencv --workspace \
@@ -225,13 +229,13 @@ jobs:
 
       - name: Run C API tests
         run: |
-          set -o pipefail
+
           cd crates/capi/tests
           make test 2>&1 | tee ../../../target/test-metrics-capi-x86_64.txt
 
       - name: Run Python tests with coverage
         run: |
-          set -o pipefail
+
           # Source coverage env so Python tests generate profraw for PyO3 bindings
           source /tmp/coverage-env.sh
           # Python tests exercise PyO3 bindings - profraw files generated from instrumented wheel
@@ -251,7 +255,7 @@ jobs:
           grep '^SF:.*crates/python' target/coverage_rust.lcov || echo "  (none found)"
           echo "=== Sample coverage data for crates/python ==="
           # Show hit counts for PyO3 files to verify they're being exercised
-          awk '/^SF:.*crates\/python/{found=1; file=$0} found && /^DA:/{print file": "$0} found && /^end_of_record/{found=0}' target/coverage_rust.lcov | head -20
+          awk '/^SF:.*crates\/python/{found=1; file=$0} found && /^DA:/{print file": "$0} found && /^end_of_record/{found=0}' target/coverage_rust.lcov | head -20 || true
 
       - name: Upload coverage artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
@@ -303,7 +307,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
-          fetch-depth: 0
           lfs: false  # LFS files downloaded separately
 
       - name: Download LFS testdata
@@ -329,9 +332,6 @@ jobs:
         with:
           tool: cargo-nextest
 
-      - name: Check Rust formatting
-        run: cargo fmt --all -- --check
-
       - name: Run Clippy
         # Use default features only (no OpenCV, no Linux-specific hardware features)
         # Exclude Linux-only crates (gpu-probe, edgefirst-bench) that depend on DMA, EGL, DRM
@@ -339,7 +339,7 @@ jobs:
 
       - name: Run Rust tests
         run: |
-          set -o pipefail
+
           cargo nextest run --workspace -j 1 --exclude gpu-probe --exclude edgefirst-bench 2>&1 | tee target/test-metrics-rust-macos.txt
 
       - name: Build C API library
@@ -347,7 +347,7 @@ jobs:
 
       - name: Run C API tests
         run: |
-          set -o pipefail
+
           cd crates/capi/tests
           make test 2>&1 | tee ../../../target/test-metrics-capi-macos.txt
 
@@ -366,7 +366,7 @@ jobs:
   # ===========================================================================
   build-arm:
     name: Build (aarch64)
-    runs-on: ubuntu-22.04-arm
+    runs-on: ubuntu-22.04-arm-xlarge
     needs: checkout-lfs
 
     steps:
@@ -406,13 +406,13 @@ jobs:
         uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # stable
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
-          components: llvm-tools-preview, clippy, rustfmt
+          components: llvm-tools-preview
 
       - name: Set up Rust nightly toolchain (for Python builds)
         uses: dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b  # nightly
         with:
           toolchain: ${{ env.RUST_NIGHTLY_VERSION }}
-          components: llvm-tools-preview, rustfmt, clippy
+          components: llvm-tools-preview
 
       - name: Set Rust stable as default toolchain
         run: rustup default ${{ env.RUST_STABLE_VERSION }}
@@ -428,12 +428,8 @@ jobs:
         with:
           tool: cargo-llvm-cov@0.6.16,cargo-nextest
 
-      - name: Check Rust formatting
-        run: cargo fmt --all -- --check
-
-      - name: Run Clippy
-        # Use default,opencv features; exclude g2d_test_formats,dma_test_formats (on-target only)
-        run: cargo clippy --workspace --all-targets --features default,opencv -- -D warnings
+      # NOTE: cargo fmt and clippy run in build-and-test-x86 — no need to repeat
+      # on aarch64 since they are platform-independent.
 
       - name: Set up coverage instrumentation
         run: .github/scripts/setup-coverage-env.sh
@@ -461,10 +457,19 @@ jobs:
           echo "Runner test binaries:"
           ls -la runner-test-binaries/ || echo "No test binaries found"
 
-      - name: Build hardware test binaries (all-features, no-run)
+      - name: Build hardware test binaries (GPU/DMA tests only)
         run: |
           source /tmp/coverage-env.sh
-          cargo nextest run --workspace --all-features --no-run --cargo-profile profiling
+          # Only build crates that exercise hardware paths (G2D, EGL, DMA).
+          # CPU-only crates (bench, decoder, tracker, capi) run on the aarch64 runner.
+          # Exclude opencv — no opencv tests run on hardware, and dropping it
+          # significantly reduces binary size (faster transfer to embedded target).
+          # LTO=thin in the profiling profile strips unreachable code across crates.
+          cargo nextest run --no-run --cargo-profile profiling \
+            --package edgefirst-image \
+            --features opengl,g2d_test_formats,dma_test_formats
+          cargo nextest run --no-run --cargo-profile profiling \
+            --package edgefirst-tensor
           mkdir -p hardware-test-binaries
           find target/llvm-cov-target/profiling/deps/ -maxdepth 1 -type f -executable \
             ! -name "*.d" ! -name "*.rlib" ! -name "*.rmeta" ! -name "*.so" \
@@ -511,8 +516,6 @@ jobs:
         with:
           name: hardware-test-binaries
           path: |
-            target/profiling/*.so*
-            target/profiling/deps/*.so*
             target/wheels/*.whl
             hardware-test-binaries/
             hardware-capi-tests/
@@ -523,7 +526,8 @@ jobs:
         with:
           name: coverage-binaries-aarch64
           path: |
-            target/llvm-cov-target/profiling/deps/*
+            hardware-test-binaries/
+            target/llvm-cov-target/profiling/deps/*.so
           retention-days: 7
 
   # ===========================================================================
@@ -582,7 +586,7 @@ jobs:
         env:
           LLVM_PROFILE_FILE: ${{ github.workspace }}/build/profraw/rust-%p-%m.profraw
         run: |
-          set -o pipefail
+
           mkdir -p build/profraw build/rust-test-results
           chmod +x runner-test-binaries/* 2>/dev/null || true
           TEST_FAILED=0
@@ -604,7 +608,7 @@ jobs:
 
       - name: Run C API tests
         run: |
-          set -o pipefail
+
           if [ -d "hardware-capi-tests" ] && [ -f "hardware-capi-tests/test_all" ]; then
             echo "=== Running C API tests ==="
             chmod +x hardware-capi-tests/test_all
@@ -618,7 +622,7 @@ jobs:
         env:
           LLVM_PROFILE_FILE: ${{ github.workspace }}/build/profraw/py-%p-%m.profraw
         run: |
-          set -o pipefail
+
           mkdir -p build/profraw
           venv/bin/python -m slipcover --xml --out target/coverage_python.xml \
             -m pytest tests/ -v --tb=short --junitxml=target/pytest_results.xml \
@@ -794,43 +798,60 @@ jobs:
             fi
           fi
 
-      - name: Run pre-built Rust tests
+      - name: Run pre-built Rust tests (hardware-dependent only)
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/target/profiling:$LD_LIBRARY_PATH
           LLVM_PROFILE_FILE: ${{ github.workspace }}/build/profraw/rust-%p-%m.profraw
         run: |
-          set -o pipefail
+          # Only run tests that exercise hardware (G2D, OpenGL/EGL, DMA).
+          # CPU-only tests already run on the ubuntu-22.04-arm-xlarge runner.
           mkdir -p build/rust-test-results build/profraw
           chmod +x hardware-test-binaries/* 2>/dev/null || true
           TEST_FAILED=0
+
+          run_filtered() {
+            local test_bin="$1" filter="$2" label="$3"
+            local test_name
+            test_name=$(basename "$test_bin")
+            echo "=== Running $test_name ($label) ==="
+            EXIT_CODE=0
+            local logfile="build/rust-test-results/${test_name}-${label// /-}.txt"
+            "$test_bin" "$filter" --test-threads=1 2>&1 | tee "$logfile" || EXIT_CODE=$?
+            if [ $EXIT_CODE -ne 0 ]; then
+              # Check if all tests actually passed but process crashed on
+              # exit (Vivante GPU driver SIGABRT during library unload)
+              if grep -q 'test result: ok' "$logfile" && \
+                 ! grep -q 'FAILED' "$logfile"; then
+                echo "::warning::$test_name ($label) exited with code $EXIT_CODE (likely GPU driver crash during shutdown) but all tests passed"
+              else
+                echo "FAILED: $test_name ($label)"
+                TEST_FAILED=1
+              fi
+            fi
+          }
+
           for test_bin in hardware-test-binaries/*; do
-            if [ -x "$test_bin" ] && [ -f "$test_bin" ]; then
-              # Skip .so files (proc-macro shared libraries)
-              if [[ "$test_bin" == *.so ]]; then
-                continue
-              fi
-              test_name=$(basename "$test_bin")
-              echo "=== Running $test_name ==="
-              EXIT_CODE=0
-              "$test_bin" --test-threads=1 2>&1 | tee "build/rust-test-results/${test_name}.txt" || EXIT_CODE=$?
-              if [ $EXIT_CODE -ne 0 ]; then
-                # Check if all tests actually passed but process crashed on
-                # exit (Vivante GPU driver SIGABRT during library unload)
-                if grep -q 'test result: ok' "build/rust-test-results/${test_name}.txt" && \
-                   ! grep -q 'FAILED' "build/rust-test-results/${test_name}.txt"; then
-                  echo "::warning::$test_name exited with code $EXIT_CODE (likely GPU driver crash during shutdown) but all tests passed"
-                else
-                  echo "FAILED: $test_name"
-                  TEST_FAILED=1
-                fi
-              fi
+            [[ -x "$test_bin" && -f "$test_bin" ]] || continue
+            [[ "$test_bin" == *.so ]] && continue
+            test_name=$(basename "$test_bin")
+
+            if [[ "$test_name" == edgefirst_image-* ]]; then
+              # G2D tests (g2d.rs module + lib.rs g2d integration tests)
+              run_filtered "$test_bin" g2d "G2D tests"
+              # OpenGL/EGL tests (gl/tests.rs + lib.rs opengl integration tests)
+              run_filtered "$test_bin" opengl "OpenGL tests"
+            elif [[ "$test_name" == edgefirst_tensor-* ]]; then
+              # DMA-heap tensor tests only
+              run_filtered "$test_bin" dma "DMA tests"
+            else
+              echo "=== Skipping $test_name (CPU-only, covered by aarch64 runner) ==="
             fi
           done
           [ $TEST_FAILED -eq 0 ] || exit 1
 
       - name: Run C API tests
         run: |
-          set -o pipefail
+
           if [ -d "hardware-capi-tests" ] && [ -f "hardware-capi-tests/test_all" ]; then
             echo "=== Running C API tests on hardware ==="
             chmod +x hardware-capi-tests/test_all
@@ -982,7 +1003,7 @@ jobs:
   # ===========================================================================
   sonarcloud:
     name: SonarCloud Analysis
-    needs: [doc-tests, build-and-test-x86, build-and-test-macos, test-arm, hardware-test, process-hardware-coverage]
+    needs: [doc-tests, build-and-test-x86, build-and-test-macos, test-arm, process-hardware-coverage]
     runs-on: ubuntu-22.04
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     permissions:
