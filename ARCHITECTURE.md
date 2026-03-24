@@ -1,7 +1,7 @@
 # EdgeFirst Hardware Abstraction Layer - Architecture
 
-**Version:** 2.8
-**Last Updated:** March 18, 2026
+**Version:** 2.9
+**Last Updated:** March 23, 2026
 **Status:** Production
 **Audience:** Developers contributing to EdgeFirst HAL or integrating it into applications
 
@@ -201,7 +201,7 @@ classDiagram
     GLProcessorThreaded *-- GLProcessorST : owns via thread
 ```
 
-**`ImageProcessor` Dispatch Priority**: G2D (if supported for the format pair) → CPU (for same-size, no-rotation, simple format copies) → OpenGL (GPU-accelerated) → CPU (general fallback). Environment variables `EDGEFIRST_DISABLE_GL`, `EDGEFIRST_DISABLE_G2D`, `EDGEFIRST_DISABLE_CPU` can override this chain.
+**`ImageProcessor` Dispatch Priority**: OpenGL (GPU-accelerated) → G2D (if supported for the format pair) → CPU (general fallback). Environment variables `EDGEFIRST_DISABLE_GL`, `EDGEFIRST_DISABLE_G2D`, `EDGEFIRST_DISABLE_CPU` can override this chain.
 
 **Supported Operations**:
 - Format conversion (YUYV, VYUY, NV12, NV16, RGB, RGBA, BGRA, GREY, Planar RGB, Planar RGBA, RGB int8, Planar RGB int8)
@@ -369,6 +369,72 @@ and deadlock. Instead, the convert path dispatches to specialized methods:
 └─────────────────────────────┴──────────────────────────────────────────┘
 ```
 
+**EGL Image Cache**:
+
+The OpenGL backend maintains two independent LRU caches of EGLImages — one for
+source tensors (`src_egl_cache`) and one for destination tensors
+(`dst_egl_cache`). Each entry is keyed by `(BufferIdentity.id, chroma_id)`.
+
+`BufferIdentity` is a small struct that pairs a globally unique monotonic ID
+(allocated from an `AtomicU64` counter) with an `Arc<()>` liveness guard:
+
+```
+BufferIdentity {
+    id:    u64,     // unique per allocation — new value each time from_fd() is called
+    guard: Arc<()>, // cache entries hold Weak<()>; when tensor drops, weak dies
+}
+```
+
+When a tensor is freed, its `Arc<()>` guard drops. The cache holds only a
+`Weak<()>` reference, so `sweep()` detects dead entries without requiring an
+explicit removal call.
+
+| Pattern | Cache behavior | Performance |
+|---------|---------------|-------------|
+| Same tensor object reused across frames | Cache hit on every frame | Fast path — no EGLImage re-import |
+| New tensor created from same fd each frame | Cache miss on every frame | Slow path — EGLImage re-imported each call |
+| `dst` of call N reused as `src` of call N+1 | Hit in both caches | Two separate entries, no collision |
+
+**Key design implications**:
+
+- `hal_tensor_from_fd()` and `hal_import_image()` always allocate a new
+  `BufferIdentity`. Callers that re-wrap the same fd each frame will see a cache
+  miss on every `convert()` call. Hold the tensor object alive across frames.
+
+- Content written into a DMA-BUF between `convert()` calls (e.g., by a V4L2
+  decoder) is visible on the next call. EGLImage is a handle to live physical
+  memory — it is not a snapshot. The tensor wrapper does not need to be recreated
+  when the buffer contents change.
+
+- The `last_bound_src_egl` optimization skips the `glEGLImageTargetTexture2DOES`
+  rebind when the source EGLImage has not changed between consecutive calls. This
+  is safe because the texture already points at the correct DMA-BUF memory; skipping
+  the rebind does not prevent new frame data from being read.
+
+- A `glFinish()` is issued at the end of every `convert()` call. This guarantees
+  that all GPU reads of the source and writes to the destination are complete
+  before the function returns, making it safe to chain calls and to let the caller
+  write new data into a source buffer immediately after `convert()` returns.
+
+**Vivante NV12 to Planar RGB Two-Pass Workaround**:
+
+A single-pass NV12 → PlanarRgb shader causes a GPU hang on the Vivante GC7000UL
+(NXP i.MX 8M Plus). The workaround splits the conversion into two passes:
+
+```
+Pass 1:  NV12  →  RGBA  (intermediate)
+         All geometry operations here: resize, crop, rotation, flip, letterbox
+
+Pass 2:  RGBA  →  PlanarRgb  (at destination resolution)
+         Deinterleaves RGBA to three separate planes using sampler2D variants
+```
+
+Pass 1 reuses the existing `packed_rgb_intermediate_tex` GL texture — no new
+GPU resources are allocated. Pass 2 uses the same shader infrastructure as
+direct RGBA → PlanarRgb conversions. The two-pass path is selected automatically
+when `is_vivante && src_fmt == Nv12 && dst_fmt.layout() == Planar`. No API
+changes are required from callers.
+
 ### 3. Decoder HAL (`edgefirst_decoder`)
 
 **Purpose**: Post-processing for object detection and segmentation model outputs.
@@ -524,7 +590,7 @@ The HAL provides three workflows for consuming these masks:
 |----------|---------------------|----------------------|-------|
 | **i.MX 8M Plus (imx8mp-frdm)** | ~8–12 ms (OpenGL) | ~10–15 ms (OpenGL) | Vivante GC7000UL GPU; PBO readback adds latency for atlas path |
 | **i.MX 8M Plus (CPU only)** | ~25–40 ms | ~20–35 ms | Single-core Cortex-A53; scales linearly with detection count and bbox area |
-| **i.MX 95 (imx95-frdm)** | ~4–7 ms (OpenGL) | ~5–9 ms (OpenGL) | Verisilicon GPU; faster PBO readback than i.MX 8M Plus |
+| **i.MX 95 (imx95-frdm)** | ~4–7 ms (OpenGL) | ~5–9 ms (OpenGL) | Mali G310 (Panfrost); faster PBO readback than i.MX 8M Plus |
 | **x86_64 desktop (CPU)** | ~3–5 ms | ~2–4 ms | For development; not representative of target hardware |
 
 > These are representative ranges for typical COCO-class detections. Actual
@@ -1091,6 +1157,306 @@ OpenGL renders natively via `GL_BGRA` (`GL_EXT_texture_format_BGRA8888`), G2D
 uses the native `G2D_BGRA8888` format, and the CPU backend converts to RGBA
 then swizzles R↔B channels in-place.
 
+### C API Performance Recommendations (DMA-BUF / EGL Path)
+
+The following patterns apply when using the DMA-BUF tensor APIs
+(`hal_import_image()`, `hal_tensor_from_fd()`)
+together with `hal_image_processor_convert()` from C or C++.
+
+> **Reference implementation**: The `bench_preproc` C benchmark
+> (`crates/capi/tests/bench_preproc.c`) demonstrates every pattern described
+> below in a complete, runnable program. Build it with `make bench` from
+> `crates/capi/tests/`. Use it as a starting point for new integrations.
+
+#### Core Principle: Allocate Once, Reuse Every Frame, Free on Exit
+
+Every call to the tensor-from-fd family of functions allocates a new
+`BufferIdentity` with a globally unique ID. The OpenGL EGL image cache is
+keyed by this ID (see the "EGL Image Cache" section above). A new
+`BufferIdentity` means a cache miss, which means a full `eglCreateImageKHR`
+import on the next `convert()` call. On the i.MX 8M Plus this costs roughly
+0.5--1.5 ms per import — enough to drop below real-time at 30 fps when source
+and destination are both re-imported every frame.
+
+The correct lifecycle follows three phases:
+
+```
+ INIT                         LOOP                         TEARDOWN
+ ──────────────────────────   ──────────────────────────   ─────────────
+ Allocate processor           Reuse same tensors           Free tensors
+ Allocate src/dst tensors     Call convert()               Free processor
+ (from fd or create_image)    (EGL cache hits)
+```
+
+#### Phase 1 — Initialization
+
+Allocate all tensors before entering the processing loop. When the source
+dimensions are not known until the first frame arrives (e.g., V4L2 resolution
+negotiation), allocate on first use and keep the tensors for all subsequent
+frames.
+
+> **Important**: When using `hal_image_processor_convert()`, all
+> internally-allocated tensors (intermediate buffers, output buffers) **must**
+> be created via `hal_image_processor_create_image()`, **not** via
+> `hal_tensor_new()` or `hal_tensor_from_fd()`. The processor's
+> `create_image` method selects the optimal memory backend for the active
+> GPU: DMA-BUF when the GPU uses EGLImage imports (Vivante, Mali), PBO when
+> it uses pixel buffer transfers (NVIDIA desktop), and heap as fallback.
+> Using `hal_tensor_new()` with a hardcoded memory type bypasses this
+> selection and can force a slow transfer path.
+>
+> **`hal_import_image` is NOT the same as `create_image`.** Despite
+> living on the processor object, `hal_import_image()` does not use the
+> processor's backend intelligence — it simply wraps an external DMA-BUF
+> fd as a DMA tensor. It exists only for importing buffers that are
+> **externally allocated** by V4L2, GStreamer, or codec output. Do not
+> use it to create intermediate or destination buffers; use
+> `hal_image_processor_create_image()` for those.
+>
+> | Function | Use for | Memory selection |
+> |----------|---------|-----------------|
+> | `hal_image_processor_create_image()` | Intermediate and output buffers | **Auto** (DMA / PBO / Mem based on GPU) |
+> | `hal_import_image()` | External DMA-BUF import only | Always DMA (wraps caller's fd) |
+> | `hal_tensor_new()` / `hal_tensor_from_fd()` | Low-level tensor creation | Caller-specified (no GPU awareness) |
+
+```c
+// --- Initialization (once) ------------------------------------------------
+
+struct hal_image_processor *proc = hal_image_processor_new();
+
+// Source: external DMA-BUF from a V4L2 capture buffer.
+// hal_plane_descriptor_new dups the fd — caller keeps its copy.
+struct hal_plane_descriptor *pd = hal_plane_descriptor_new(v4l2_buf.m.fd);
+struct hal_tensor *src = hal_import_image(
+    proc, pd, NULL, width, height, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+// pd is consumed by hal_import_image — do NOT free
+
+// Intermediate: processor-allocated RGBA for chained conversion.
+// MUST use create_image (not hal_tensor_new) for optimal memory backend.
+struct hal_tensor *mid = hal_image_processor_create_image(
+    proc, model_w, model_h, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
+
+// Destination: PlanarRgb for model input, also processor-allocated.
+// MUST use create_image (not hal_tensor_new) for optimal memory backend.
+struct hal_tensor *dst = hal_image_processor_create_image(
+    proc, model_w, model_h, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8);
+```
+
+When the external buffer has row padding (stride > width * bytes_per_pixel),
+set the stride on the plane descriptor:
+
+```c
+struct hal_plane_descriptor *pd = hal_plane_descriptor_new(v4l2_buf.m.fd);
+hal_plane_descriptor_set_stride(pd, v4l2_fmt.fmt.pix.bytesperline);
+struct hal_tensor *src = hal_import_image(
+    proc, pd, NULL, width, height, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+// pd is consumed — do NOT free
+```
+
+#### Phase 2 — Main Processing Loop
+
+Reuse the same tensor objects on every frame. The EGL image cache hits on
+the second and all subsequent iterations because the `BufferIdentity.id` has
+not changed.
+
+```c
+// --- Main loop (every frame) ----------------------------------------------
+
+while (running) {
+    // Upstream writes new pixel data into the DMA-BUF (V4L2 DQBUF, decoder
+    // output, etc.). The tensor and its cached EGLImage remain valid — no
+    // need to recreate anything. EGLImage is a handle to live physical memory.
+
+    // Two-pass conversion: NV12 → RGBA → PlanarRgb
+    hal_image_processor_convert(proc, src, mid,
+                                HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop);
+    hal_image_processor_convert(proc, mid, dst,
+                                HAL_ROTATION_NONE, HAL_FLIP_NONE, NULL);
+
+    // Feed dst to the model ...
+}
+```
+
+Both `mid` entries (as destination in pass 1 and as source in pass 2) live in
+independent EGL image caches (`dst_egl_cache` and `src_egl_cache`), so both
+sides achieve cache hits after the first frame.
+
+The `glFinish()` issued at the end of each `convert()` call guarantees
+coherency, making chained calls safe without explicit synchronization.
+
+#### Phase 3 — Teardown
+
+Free tensors only when the pipeline is torn down — typically at program exit
+or when a pipeline is reconfigured (e.g., resolution change).
+
+```c
+// --- Teardown (once) ------------------------------------------------------
+
+hal_tensor_free(dst);
+hal_tensor_free(mid);
+hal_tensor_free(src);
+hal_image_processor_free(proc);
+```
+
+#### Buffer Pool Integration (V4L2 / GStreamer)
+
+When upstream provides DMA-BUF fds from a buffer pool (V4L2 MMAP, GStreamer
+allocator, codec output ring), a small number of physical buffers are cycled
+through a queue. The correct pattern maps each pool slot to a HAL tensor that
+is created once and reused whenever that slot is dequeued.
+
+```c
+// Pool integration example (V4L2 MMAP with N_BUFS buffers)
+
+#define N_BUFS 4
+struct hal_tensor *pool_tensors[N_BUFS] = { NULL };
+
+// At DQBUF time, lazily create or reuse the tensor for this buffer index.
+int buf_index = v4l2_buf.index;  // 0..N_BUFS-1
+
+if (pool_tensors[buf_index] == NULL) {
+    // First time this pool slot is seen — create the HAL tensor.
+    // hal_plane_descriptor_new dups the fd, so V4L2 keeps its copy.
+    struct hal_plane_descriptor *pd = hal_plane_descriptor_new(v4l2_buf.m.fd);
+    pool_tensors[buf_index] = hal_import_image(
+        proc, pd, NULL, width, height,
+        HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+    // pd is consumed — do NOT free
+}
+
+// Reuse the existing tensor — cache hit on every subsequent dequeue.
+hal_image_processor_convert(proc, pool_tensors[buf_index], dst, ...);
+
+// QBUF returns the buffer to the driver; the tensor stays alive.
+ioctl(fd, VIDIOC_QBUF, &v4l2_buf);
+
+// --- Teardown (when stopping capture) ---
+for (int i = 0; i < N_BUFS; i++) {
+    hal_tensor_free(pool_tensors[i]);  // NULL-safe
+    pool_tensors[i] = NULL;
+}
+```
+
+With `hal_tensor_from_fd()` the pattern is similar. The function dups
+the fd internally — the caller retains ownership of the original:
+
+```c
+// When using hal_tensor_from_fd (dups fd, caller retains original):
+if (pool_tensors[buf_index] == NULL) {
+    size_t shape[] = { height, width, 1 };    // NV12 luma plane
+    pool_tensors[buf_index] = hal_tensor_from_fd(
+        HAL_DTYPE_U8, v4l2_buf.m.fd, shape, 3, "v4l2_src");
+    hal_tensor_set_format(pool_tensors[buf_index], HAL_PIXEL_FORMAT_NV12);
+}
+```
+
+#### fd Ownership Summary
+
+| Function | fd ownership | When to `dup()` |
+|----------|-------------|-----------------|
+| `hal_plane_descriptor_new()` | Dups eagerly — caller retains original fd | Never — caller keeps its fd |
+| `hal_import_image()` | Consumes both descriptors (success or fail) | Never — descriptors already duped the fd |
+| `hal_tensor_from_fd()` | Dups internally — caller retains original fd | Never — caller keeps its fd |
+
+#### Anti-Patterns
+
+The following patterns cause severe performance regressions. Each is explained
+with the underlying cost so that the reason is clear, not just the rule.
+
+**1. Creating a tensor from fd every frame**
+
+```c
+// BAD: ~1-3 ms overhead per frame from EGLImage re-import
+while (running) {
+    struct hal_plane_descriptor *pd = hal_plane_descriptor_new(v4l2_buf.m.fd);
+    struct hal_tensor *src = hal_import_image(
+        proc, pd, NULL, width, height, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+    hal_image_processor_convert(proc, src, dst, ...);
+    hal_tensor_free(src);
+}
+```
+
+*Why it is slow*: Every call allocates a new `BufferIdentity` with a fresh ID.
+The EGL image cache keys on `(BufferIdentity.id, chroma_id)`, so the cache
+never hits. Each `convert()` call must call `eglCreateImageKHR` to re-import
+the DMA-BUF as a GL texture. On the Vivante GC7000UL this takes 0.5--1.5 ms.
+When both source and destination are re-imported, the cost doubles.
+
+**2. Freeing and reallocating tensors between frames**
+
+```c
+// BAD: same cost as #1, plus heap allocation overhead
+while (running) {
+    struct hal_tensor *dst = hal_image_processor_create_image(
+        proc, model_w, model_h, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8);
+    hal_image_processor_convert(proc, src, dst, ...);
+    // ... use dst ...
+    hal_tensor_free(dst);
+}
+```
+
+*Why it is slow*: In addition to EGL image cache misses, every iteration
+allocates and frees a DMA-BUF (or PBO), which involves kernel calls
+(`dma-heap ioctl` or `glBufferData`). On memory-constrained embedded
+targets, CMA pool fragmentation can also cause allocation failures
+after sustained operation.
+
+**3. Using the same tensor as both src and dst**
+
+```c
+// BAD: undefined behavior
+hal_image_processor_convert(proc, tensor, tensor, ...);
+```
+
+*Why it fails*: The OpenGL backend binds `src` as a texture and `dst` as a
+framebuffer attachment. Sampling from and rendering to the same image in a
+single draw call is undefined behavior per the OpenGL ES specification.
+Results range from correct output (by accident) to GPU hangs.
+
+**4. Using `hal_tensor_new()` instead of `hal_image_processor_create_image()`**
+
+```c
+// BAD: bypasses processor's memory backend selection
+size_t shape[] = { 640, 640, 3 };
+struct hal_tensor *dst = hal_tensor_new(HAL_DTYPE_U8, shape, 3,
+                                         HAL_TENSOR_MEMORY_DMA, "output");
+hal_image_processor_convert(proc, src, dst, ...);
+```
+
+*Why it is slow*: `hal_image_processor_create_image()` inspects the active GPU
+backend and selects the optimal memory type — DMA-BUF for EGLImage-capable
+GPUs (Vivante, Mali), PBO for desktop GPUs (NVIDIA), heap for CPU-only.
+Calling `hal_tensor_new()` with a hardcoded memory type skips this selection.
+On a PBO-preferred system, a DMA tensor forces a slow `glTexSubImage2D`
+upload; on a DMA-preferred system, a heap tensor forces a full CPU readback.
+Always use `create_image` for tensors that will be passed to `convert()`.
+
+**5. Ignoring row stride for padded buffers**
+
+```c
+// BAD: corrupted output (skewed image)
+struct hal_plane_descriptor *pd = hal_plane_descriptor_new(padded_fd);
+struct hal_tensor *src = hal_import_image(
+    proc, pd, NULL, width, height, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+```
+
+*Why it fails*: Many V4L2 drivers and GStreamer allocators pad rows to
+alignment boundaries (e.g., 128-byte or 256-byte alignment). If the
+stride is not communicated to HAL, the GPU interprets rows at `width *
+bpp` spacing while the actual data is at `stride` spacing, producing a
+skewed or corrupted image. Set the stride on the plane descriptor via
+`hal_plane_descriptor_set_stride()` when
+`bytesperline > width * bytes_per_pixel`.
+
+#### Live-Memory Semantics
+
+After a V4L2 decoder, camera ISP, or codec writes new pixel data into a
+DMA-BUF, the existing tensor and its cached EGLImage remain valid. Do not
+free and recreate the tensor. Simply call `convert()` again. The GPU reads
+the updated content because EGLImage is a handle to physical memory, not a
+snapshot of its contents at import time. This is the key property that makes
+the allocate-once / reuse-every-frame pattern work.
+
 ### Decoder Optimization
 
 Decoder implementations use:
@@ -1298,9 +1664,10 @@ blocks (one per plane).
 The HAL supports multi-plane DMA-BUF NV12/NV16 via a two-tensor approach
 rather than extending `DmaTensor` with multiple fds:
 
-**C API**: `hal_tensor_from_planes(y_fd, width, height, uv_fd, fourcc, out)`
-takes separate Y and UV file descriptors, wraps each into its own
+**C API**: `hal_import_image(proc, y_pd, uv_pd, width, height, format, dtype)`
+takes separate Y and UV plane descriptors, wraps each into its own
 `Tensor<u8>` via `from_fd()`, and combines them with `Tensor::from_planes()`.
+Per-plane stride and offset can be set on each descriptor before import.
 
 **Tensor crate**: `Tensor::from_planes(luma, chroma, PixelFormat::Nv12)` stores the
 two tensors as separate planes inside the `Tensor`, preserving their
@@ -1308,21 +1675,21 @@ independent DMA-BUF allocations for zero-copy GPU import.
 
 **OpenGL path**: `create_image_from_dma2()` uses per-plane fds in EGL
 attributes (`DMA_BUF_PLANE0_FD → y_fd`, `DMA_BUF_PLANE1_FD → uv_fd`),
-each at offset 0.
+with per-plane stride and offset from `PlaneDescriptor` metadata.
 
 | Scenario | Zero-Copy | Notes |
 |----------|-----------|-------|
 | Single-fd NV12 DMA-BUF | Yes | V4L2 single-planar capture, HAL-allocated buffers |
 | Single-fd YUYV/RGB/RGBA DMA-BUF | Yes | Always single-plane |
 | System memory input | N/A | Copied into HAL tensor regardless |
-| Multi-fd NV12/NV16 DMA-BUF | Yes | Via `hal_tensor_from_planes()` |
+| Multi-fd NV12/NV16 DMA-BUF | Yes | Via `hal_import_image()` with two plane descriptors |
 
 ### GStreamer Integration (External)
 
 The `edgefirstcameraadaptor` element detects multi-plane buffers
 (`gst_buffer_n_memory() > 1`) and extracts per-plane fds via
 `gst_dmabuf_memory_get_fd()` on each `GstMemory` block, passing them to
-`hal_tensor_from_planes()` for zero-copy import.
+`hal_import_image()` via separate plane descriptors for zero-copy import.
 
 ### Tracking
 

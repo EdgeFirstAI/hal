@@ -100,6 +100,10 @@ pub struct GLProcessorST {
     packed_rgba8_program_2d: GlProgram,
     /// Shader: packed RGB int8 -> RGBA8 packing with XOR 0x80 (2D texture source, pass 2).
     packed_rgba8_int8_program_2d: GlProgram,
+    /// Shader: planar RGB from 2D texture (two-pass NV12→RGBA→PlanarRgb workaround).
+    texture_program_planar_2d: GlProgram,
+    /// Shader: planar RGB int8 from 2D texture (two-pass NV12→RGBA→PlanarRgb workaround).
+    texture_program_planar_int8_2d: GlProgram,
     pub(super) gl_context: GlContext,
 }
 
@@ -284,7 +288,20 @@ impl GLProcessorST {
                 .map_or(std::ptr::null(), |p| p as *const _)
         });
 
-        let (has_float_linear, has_bgra, is_vivante) = Self::gl_check_support()?;
+        let (has_float_linear, has_bgra, is_vivante, is_software_renderer) =
+            Self::gl_check_support()?;
+
+        // Software renderers (llvmpipe, softpipe, swrast) are CPU-based OpenGL
+        // implementations that are slower and less capable than our native CPU
+        // backend. Reject them early — the caller falls back to CPU automatically.
+        if is_software_renderer {
+            return Err(crate::Error::NotSupported(
+                "software OpenGL renderer detected (llvmpipe/softpipe/swrast); \
+                 GL backend disabled — check EGL ICD configuration if a \
+                 hardware GPU is expected"
+                    .into(),
+            ));
+        }
 
         // Uploads and downloads are all packed with no alignment requirements
         unsafe {
@@ -370,6 +387,14 @@ impl GLProcessorST {
         let texture_program_planar_int8 =
             GlProgram::new(generate_vertex_shader(), generate_planar_rgb_int8_shader())?;
 
+        // Planar RGB shaders with sampler2D (for two-pass NV12→RGBA→PlanarRgb on Vivante)
+        let texture_program_planar_2d =
+            GlProgram::new(generate_vertex_shader(), generate_planar_rgb_shader_2d())?;
+        let texture_program_planar_int8_2d = GlProgram::new(
+            generate_vertex_shader(),
+            generate_planar_rgb_int8_shader_2d(),
+        )?;
+
         // RGB packing shaders (2D only — used in pass 2 of two-pass pipeline)
         let packed_rgba8_program_2d =
             GlProgram::new(generate_vertex_shader(), generate_packed_rgba8_shader_2d())?;
@@ -397,6 +422,8 @@ impl GLProcessorST {
             texture_program_planar_int8,
             packed_rgba8_program_2d,
             packed_rgba8_int8_program_2d,
+            texture_program_planar_2d,
+            texture_program_planar_int8_2d,
             camera_eglimage_texture,
             camera_normal_texture,
             segmentation_texture,
@@ -444,7 +471,8 @@ impl GLProcessorST {
             converter.gl_context.transfer_backend = TransferBackend::Pbo;
         }
 
-        // If DMA-buf failed/unavailable but GL is alive, use PBO transfers
+        // If DMA-buf failed/unavailable but GL is alive, use PBO transfers.
+        // Software renderers never reach here — they are rejected above.
         if converter.gl_context.transfer_backend == TransferBackend::Sync {
             log::info!("Upgrading transfer backend from Sync to Pbo (GL context available)");
             converter.gl_context.transfer_backend = TransferBackend::Pbo;
@@ -1035,7 +1063,10 @@ impl GLProcessorST {
                 std::ptr::null_mut(),
             );
             gls::gl::Finish();
+        }
+        check_gl_error(function!(), line!())?;
 
+        unsafe {
             let ptr = gls::gl::MapBufferRange(
                 gls::gl::PIXEL_PACK_BUFFER,
                 0,
@@ -1071,6 +1102,15 @@ impl GLProcessorST {
         crop: Crop,
     ) -> crate::Result<()> {
         if !Self::check_src_format_supported(self.gl_context.transfer_backend, src, src_fmt) {
+            if src_fmt == PixelFormat::Vyuy
+                && self.gl_context.transfer_backend.is_dma()
+                && src.memory() == TensorMemory::Dma
+            {
+                log::warn!(
+                    "VYUY format not supported via EGL DMA-BUF import; \
+                     falling back to CPU/G2D path"
+                );
+            }
             return Err(crate::Error::NotSupported(format!(
                 "Opengl doesn't support {src_fmt} source texture",
             )));
@@ -1085,15 +1125,6 @@ impl GLProcessorST {
         ) {
             return Err(crate::Error::NotSupported(format!(
                 "Opengl doesn't support {dst_fmt} destination texture",
-            )));
-        }
-
-        // BLOCKED: NV12 source + planar RGB destination causes an unrecoverable
-        // GPU hang on the Verisilicon/Vivante GC7000UL (i.MX 8M Plus, galcore 6.4.11).
-        if self.is_vivante && src_fmt == PixelFormat::Nv12 && dst_fmt == PixelFormat::PlanarRgb {
-            return Err(crate::Error::NotSupported(format!(
-                "NV12 → {dst_fmt} is blocked on Vivante GPU: triggers unrecoverable GPU hang \
-                 requiring reboot (see VSI_GPU_NV12_BUG.md). Use CPU or G2D backend instead.",
             )));
         }
 
@@ -1245,6 +1276,7 @@ impl GLProcessorST {
                         dst_map.as_mut_ptr() as *mut c_void,
                     );
                 }
+                check_gl_error(function!(), line!())?;
                 if dst_fmt == PixelFormat::Bgra {
                     for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
                         chunk.swap(0, 2);
@@ -1360,6 +1392,7 @@ impl GLProcessorST {
                         dst_map.as_mut_ptr() as *mut c_void,
                     );
                 }
+                check_gl_error(function!(), line!())?;
                 if dst_fmt == PixelFormat::Bgra {
                     for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
                         chunk.swap(0, 2);
@@ -1419,30 +1452,42 @@ impl GLProcessorST {
         }
     }
 
-    /// Checks required GL extensions and returns optional capability flags:
-    /// `(has_float_linear, has_bgra)`.
-    /// Query GL capabilities and detect GPU vendor.
+    /// Query GL capabilities and detect GPU vendor/renderer type.
     ///
-    /// Returns `(has_float_linear, has_bgra, is_vivante)`.
-    fn gl_check_support() -> Result<(bool, bool, bool), crate::Error> {
+    /// Returns `(has_float_linear, has_bgra, is_vivante, is_software_renderer)`.
+    fn gl_check_support() -> Result<(bool, bool, bool, bool), crate::Error> {
         if let Ok(version) = gls::get_string(gls::gl::SHADING_LANGUAGE_VERSION) {
             log::debug!("GL Shading Language Version: {version:?}");
         } else {
             log::warn!("Could not get GL Shading Language Version");
         }
 
-        // Detect Vivante/Verisilicon GPU via GL_RENDERER string.
-        let is_vivante = gls::get_string(gls::gl::RENDERER)
+        // Detect GPU vendor and software renderers via GL_RENDERER string.
+        let (is_vivante, is_software_renderer) = gls::get_string(gls::gl::RENDERER)
             .map(|r| {
                 log::info!("GL_RENDERER: {r}");
                 let lower = r.to_ascii_lowercase();
-                lower.contains("vivante") || lower.contains("gc7000") || lower.contains("galcore")
+                let vivante = lower.contains("vivante")
+                    || lower.contains("gc7000")
+                    || lower.contains("galcore");
+                let software = lower.contains("llvmpipe")
+                    || lower.contains("softpipe")
+                    || lower.contains("swrast")
+                    || lower.contains("software rasterizer");
+                (vivante, software)
             })
-            .unwrap_or(false);
+            .unwrap_or((false, false));
         if is_vivante {
             log::warn!(
-                "Vivante GPU detected — NV12 → planar RGB conversions will be \
-                 blocked to avoid unrecoverable GPU hang (see VSI_GPU_NV12_BUG.md)"
+                "Vivante GPU detected — NV12 → planar RGB conversions will use \
+                 two-pass workaround to avoid GPU hang (EDGEAI-1180)"
+            );
+        }
+        if is_software_renderer {
+            log::warn!(
+                "Software OpenGL renderer detected — GPU backend will be disabled. \
+                 Image processing will use the CPU backend instead. \
+                 Check EGL ICD configuration if a hardware GPU is expected."
             );
         }
 
@@ -1474,7 +1519,7 @@ impl GLProcessorST {
         let has_bgra = extensions.contains("GL_EXT_texture_format_BGRA8888");
         log::debug!("GL_EXT_texture_format_BGRA8888: {has_bgra}");
 
-        Ok((has_float_linear, has_bgra, is_vivante))
+        Ok((has_float_linear, has_bgra, is_vivante, is_software_renderer))
     }
 
     fn setup_renderbuffer_dma(
@@ -1555,25 +1600,39 @@ impl GLProcessorST {
             );
             self.convert_to_packed_rgb(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
         } else if dst_fmt.layout() == PixelLayout::Planar {
-            log::trace!(
-                "GL DMA dispatch: {src_fmt}→{dst_fmt} int8={is_int8} → planar output \
-                 (renderbuffer + planar{}shader)",
-                if is_int8 { "_int8_" } else { "_" }
-            );
-            self.setup_renderbuffer_dma(dst, dst_fmt)?;
-            // Bias letterbox clear color for int8 — glClear bypasses the shader.
-            let crop = if is_int8 {
-                let mut crop = crop;
-                if let Some(ref mut color) = crop.dst_color {
-                    color[0] ^= 0x80;
-                    color[1] ^= 0x80;
-                    color[2] ^= 0x80;
-                }
-                crop
+            if self.is_vivante && src_fmt == PixelFormat::Nv12 {
+                // Two-pass workaround: NV12→RGBA intermediate → RGBA→PlanarRgb.
+                // Single-pass NV12+planar causes an unrecoverable GPU hang on
+                // Vivante GC7000UL (i.MX 8M Plus, galcore 6.4.11).
+                log::trace!(
+                    "GL DMA dispatch: {src_fmt}→{dst_fmt} int8={is_int8} → two-pass planar \
+                     (Vivante NV12 workaround: RGBA intermediate + planar_2d{}shader)",
+                    if is_int8 { "_int8_" } else { "_" }
+                );
+                self.convert_nv12_to_planar_two_pass(
+                    src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop,
+                )
             } else {
-                crop
-            };
-            self.convert_to_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
+                log::trace!(
+                    "GL DMA dispatch: {src_fmt}→{dst_fmt} int8={is_int8} → planar output \
+                     (renderbuffer + planar{}shader)",
+                    if is_int8 { "_int8_" } else { "_" }
+                );
+                self.setup_renderbuffer_dma(dst, dst_fmt)?;
+                // Bias letterbox clear color for int8 — glClear bypasses the shader.
+                let crop = if is_int8 {
+                    let mut crop = crop;
+                    if let Some(ref mut color) = crop.dst_color {
+                        color[0] ^= 0x80;
+                        color[1] ^= 0x80;
+                        color[2] ^= 0x80;
+                    }
+                    crop
+                } else {
+                    crop
+                };
+                self.convert_to_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
+            }
         } else {
             log::trace!(
                 "GL DMA dispatch: {src_fmt}→{dst_fmt} int8={is_int8} → single-pass EGLImage \
@@ -1692,6 +1751,7 @@ impl GLProcessorST {
                 }
             }
         }
+        check_gl_error(function!(), line!())?;
         log::debug!("Read from framebuffer takes {:?}", start.elapsed());
         Ok(())
     }
@@ -2008,13 +2068,17 @@ impl GLProcessorST {
                     dst.len() as isize,
                     gls::gl::MAP_READ_BIT | gls::gl::MAP_WRITE_BIT,
                 );
-                if !ptr.is_null() {
-                    let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, dst.len());
-                    for chunk in slice.chunks_exact_mut(4) {
-                        chunk.swap(0, 2);
-                    }
-                    gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
+                if ptr.is_null() {
+                    gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+                    return Err(crate::Error::OpenGl(
+                        "glMapBufferRange returned null for BGRA byte-swap".to_string(),
+                    ));
                 }
+                let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, dst.len());
+                for chunk in slice.chunks_exact_mut(4) {
+                    chunk.swap(0, 2);
+                }
+                gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
                 gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
             }
             check_gl_error(function!(), line!())?;
@@ -2370,13 +2434,17 @@ impl GLProcessorST {
                     dst.len() as isize,
                     gls::gl::MAP_READ_BIT | gls::gl::MAP_WRITE_BIT,
                 );
-                if !ptr.is_null() {
-                    let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, dst.len());
-                    for chunk in slice.chunks_exact_mut(4) {
-                        chunk.swap(0, 2);
-                    }
-                    gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
+                if ptr.is_null() {
+                    gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+                    return Err(crate::Error::OpenGl(
+                        "glMapBufferRange returned null for BGRA byte-swap".to_string(),
+                    ));
                 }
+                let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, dst.len());
+                for chunk in slice.chunks_exact_mut(4) {
+                    chunk.swap(0, 2);
+                }
+                gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
                 gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
             }
             check_gl_error(function!(), line!())?;
@@ -2478,6 +2546,7 @@ impl GLProcessorST {
                 }
             }
         }
+        check_gl_error(function!(), line!())?;
         log::debug!("PBO-to-mem readback takes {:?}", start.elapsed());
         Ok(())
     }
@@ -2713,6 +2782,7 @@ impl GLProcessorST {
             is_int8,
         )?;
         unsafe { gls::gl::Finish() };
+        check_gl_error(function!(), line!())?;
 
         Ok(())
     }
@@ -2841,6 +2911,132 @@ impl GLProcessorST {
         self.draw_fullscreen_quad()?;
 
         unsafe { gls::gl::Finish() };
+        check_gl_error(function!(), line!())?;
+        Ok(())
+    }
+
+    /// Two-pass NV12→PlanarRgb workaround for Vivante GPU.
+    ///
+    /// Single-pass NV12→PlanarRgb causes an unrecoverable GPU hang on the
+    /// Verisilicon/Vivante GC7000UL. This method splits the operation:
+    ///
+    /// **Pass 1:** NV12→RGBA into `packed_rgb_intermediate_tex` via `convert_to()`
+    /// (full resize/crop/rotation/flip, no int8 bias).
+    ///
+    /// **Pass 2:** RGBA→PlanarRgb from intermediate to DMA destination via
+    /// [`draw_intermediate_to_rgb_planar`] (channel deinterleave + optional int8 bias).
+    #[allow(clippy::too_many_arguments)]
+    fn convert_nv12_to_planar_two_pass(
+        &mut self,
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
+        dst: &mut Tensor<u8>,
+        dst_fmt: PixelFormat,
+        is_int8: bool,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> crate::Result<()> {
+        let dst_w = dst.width().ok_or(Error::NotAnImage)?;
+        let dst_h = dst.height().ok_or(Error::NotAnImage)?;
+
+        let alpha = match dst_fmt {
+            PixelFormat::PlanarRgb => false,
+            PixelFormat::PlanarRgba => true,
+            _ => {
+                return Err(crate::Error::NotSupported(
+                    "Destination format must be PlanarRgb or PlanarRgba".to_string(),
+                ));
+            }
+        };
+
+        log::debug!(
+            "convert_nv12_to_planar_two_pass: {src_fmt}→{dst_fmt} {dst_w}x{dst_h} \
+             int8={is_int8} (Vivante two-pass workaround)",
+        );
+
+        // --- Pass 1: NV12→RGBA into intermediate texture ---
+        // No int8 bias here — bias is applied in pass 2's planar shader.
+        self.ensure_packed_rgb_intermediate(dst_w, dst_h)?;
+        self.packed_rgb_fbo.bind();
+        unsafe {
+            gls::gl::FramebufferTexture2D(
+                gls::gl::FRAMEBUFFER,
+                gls::gl::COLOR_ATTACHMENT0,
+                gls::gl::TEXTURE_2D,
+                self.packed_rgb_intermediate_tex.id,
+                0,
+            );
+            check_gl_error(function!(), line!())?;
+            gls::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
+        }
+        // convert_to() renders to the currently-bound FBO (packed_rgb_fbo → intermediate RGBA).
+        // Note: dst_fmt is passed but ignored (_dst_fmt in convert_to's signature) — the actual
+        // output format is RGBA because we bound packed_rgb_fbo above. dst is used only for
+        // width/height in ROI coordinate math.
+        self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)?;
+
+        // --- Pass 2: RGBA→PlanarRgb to DMA destination ---
+        // setup_renderbuffer_dma rebinds convert_fbo with the DMA destination EGLImage,
+        // replacing packed_rgb_fbo that was active during pass 1. It also sets the viewport
+        // to (dst_w, dst_h * 3) for the tall R8 planar renderbuffer.
+        self.setup_renderbuffer_dma(dst, dst_fmt)?;
+
+        // Bias letterbox clear color for int8 — glClear bypasses the shader.
+        let crop = if is_int8 {
+            let mut crop = crop;
+            if let Some(ref mut color) = crop.dst_color {
+                color[0] ^= 0x80;
+                color[1] ^= 0x80;
+                color[2] ^= 0x80;
+            }
+            crop
+        } else {
+            crop
+        };
+
+        // Letterbox fill: clear planar regions outside the destination rect
+        let cvt_screen_coord = |normalized: f32| normalized * 2.0 - 1.0;
+        let dst_roi = if let Some(rect) = crop.dst_rect {
+            RegionOfInterest {
+                left: cvt_screen_coord(rect.left as f32 / dst_w as f32),
+                top: cvt_screen_coord((rect.top + rect.height) as f32 / dst_h as f32),
+                right: cvt_screen_coord((rect.left + rect.width) as f32 / dst_w as f32),
+                bottom: cvt_screen_coord(rect.top as f32 / dst_h as f32),
+            }
+        } else {
+            RegionOfInterest {
+                left: -1.,
+                top: 1.,
+                right: 1.,
+                bottom: -1.,
+            }
+        };
+
+        let has_crop = crop
+            .dst_rect
+            .is_some_and(|x| x.left != 0 || x.top != 0 || x.width != dst_w || x.height != dst_h);
+        if has_crop {
+            if let Some(dst_color) = crop.dst_color {
+                self.clear_rect_planar(
+                    dst_w,
+                    dst_h,
+                    dst_roi,
+                    [
+                        dst_color[0] as f32 / 255.0,
+                        dst_color[1] as f32 / 255.0,
+                        dst_color[2] as f32 / 255.0,
+                        dst_color[3] as f32 / 255.0,
+                    ],
+                    alpha,
+                )?;
+            }
+        }
+
+        self.draw_intermediate_to_rgb_planar(dst_roi, alpha, is_int8)?;
+
+        unsafe { gls::gl::Finish() };
+        check_gl_error(function!(), line!())?;
         Ok(())
     }
 
@@ -3072,6 +3268,134 @@ impl GLProcessorST {
                 let vertices_index: [u32; 4] = [0, 1, 2, 3];
                 // self.texture_program_planar
                 //     .load_uniform_1i(c"color_index", 2 - i as i32);
+
+                gls::gl::TexParameteri(
+                    texture_target,
+                    gls::gl::TEXTURE_SWIZZLE_R,
+                    swizzles[i] as i32,
+                );
+
+                gls::gl::DrawElements(
+                    gls::gl::TRIANGLE_FAN,
+                    vertices_index.len() as i32,
+                    gls::gl::UNSIGNED_INT,
+                    vertices_index.as_ptr() as *const c_void,
+                );
+            }
+            check_gl_error(function!(), line!())?;
+        }
+        Ok(())
+    }
+
+    /// Draw the intermediate RGBA texture to planar RGB output.
+    ///
+    /// Pass 2 of the two-pass NV12→PlanarRgb workaround for Vivante GPUs.
+    /// Mirrors [`draw_camera_texture_to_rgb_planar`] but sources from
+    /// `packed_rgb_intermediate_tex` (a `TEXTURE_2D`) instead of an EGLImage
+    /// (`TEXTURE_EXTERNAL_OES`). No rotation/flip — those were handled in pass 1.
+    fn draw_intermediate_to_rgb_planar(
+        &self,
+        dst_roi: RegionOfInterest,
+        alpha: bool,
+        int8: bool,
+    ) -> Result<(), Error> {
+        let texture_target = gls::gl::TEXTURE_2D;
+        unsafe {
+            let program = if int8 {
+                &self.texture_program_planar_int8_2d
+            } else {
+                &self.texture_program_planar_2d
+            };
+            gls::gl::UseProgram(program.id);
+            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+            gls::gl::BindTexture(texture_target, self.packed_rgb_intermediate_tex.id);
+            gls::gl::TexParameteri(
+                texture_target,
+                gls::gl::TEXTURE_MIN_FILTER,
+                gls::gl::LINEAR as i32,
+            );
+            gls::gl::TexParameteri(
+                texture_target,
+                gls::gl::TEXTURE_MAG_FILTER,
+                gls::gl::LINEAR as i32,
+            );
+            gls::gl::TexParameteri(
+                texture_target,
+                gls::gl::TEXTURE_WRAP_S,
+                gls::gl::CLAMP_TO_EDGE as i32,
+            );
+            gls::gl::TexParameteri(
+                texture_target,
+                gls::gl::TEXTURE_WRAP_T,
+                gls::gl::CLAMP_TO_EDGE as i32,
+            );
+
+            // Set tex uniform to unit 0
+            let loc_tex = gls::gl::GetUniformLocation(program.id, c"tex".as_ptr());
+            gls::gl::Uniform1i(loc_tex, 0);
+
+            check_gl_error(function!(), line!())?;
+
+            let y_centers = if alpha {
+                vec![-3.0 / 4.0, -1.0 / 4.0, 1.0 / 4.0, 3.0 / 4.0]
+            } else {
+                vec![-2.0 / 3.0, 0.0, 2.0 / 3.0]
+            };
+            let swizzles = [gls::gl::RED, gls::gl::GREEN, gls::gl::BLUE, gls::gl::ALPHA];
+
+            // Source ROI is always fullscreen (intermediate is already at destination size)
+            let src_roi = RegionOfInterest {
+                left: 0.0,
+                top: 1.0,
+                right: 1.0,
+                bottom: 0.0,
+            };
+
+            for (i, y_center) in y_centers.iter().enumerate() {
+                gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
+                gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
+                let camera_vertices: [f32; 12] = [
+                    dst_roi.left,
+                    dst_roi.top / 3.0 + y_center,
+                    0., // left top
+                    dst_roi.right,
+                    dst_roi.top / 3.0 + y_center,
+                    0., // right top
+                    dst_roi.right,
+                    dst_roi.bottom / 3.0 + y_center,
+                    0., // right bottom
+                    dst_roi.left,
+                    dst_roi.bottom / 3.0 + y_center,
+                    0., // left bottom
+                ];
+                gls::gl::BufferData(
+                    gls::gl::ARRAY_BUFFER,
+                    (size_of::<f32>() * camera_vertices.len()) as isize,
+                    camera_vertices.as_ptr() as *const c_void,
+                    gls::gl::DYNAMIC_DRAW,
+                );
+
+                gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
+                gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
+                // No rotation — pass 1 already handled it. Use base texture coords directly.
+                let texture_vertices: [f32; 8] = [
+                    src_roi.left,
+                    src_roi.top,
+                    src_roi.right,
+                    src_roi.top,
+                    src_roi.right,
+                    src_roi.bottom,
+                    src_roi.left,
+                    src_roi.bottom,
+                ];
+                gls::gl::BufferData(
+                    gls::gl::ARRAY_BUFFER,
+                    (size_of::<f32>() * texture_vertices.len()) as isize,
+                    texture_vertices.as_ptr() as *const c_void,
+                    gls::gl::DYNAMIC_DRAW,
+                );
+
+                let vertices_index: [u32; 4] = [0, 1, 2, 3];
 
                 gls::gl::TexParameteri(
                     texture_target,
@@ -3433,13 +3757,17 @@ impl GLProcessorST {
             None
         };
 
-        // For NV12, plane0 pitch is width (Y is 1 byte/pixel)
-        // For other formats, pitch is width * channels
-        let plane0_pitch = if src_fmt == PixelFormat::Nv12 {
-            width
-        } else {
-            width * channels
-        };
+        // Use the tensor's stored stride if set (for externally allocated buffers
+        // with row padding), otherwise compute the tightly-packed pitch.
+        let plane0_pitch = src.effective_row_stride().unwrap_or_else(|| {
+            if src_fmt == PixelFormat::Nv12 {
+                width
+            } else {
+                width * channels
+            }
+        });
+
+        let plane0_offset = src.plane_offset().unwrap_or(0);
 
         let mut egl_img_attr = vec![
             egl_ext::LINUX_DRM_FOURCC as Attrib,
@@ -3451,7 +3779,7 @@ impl GLProcessorST {
             egl_ext::DMA_BUF_PLANE0_PITCH as Attrib,
             plane0_pitch as Attrib,
             egl_ext::DMA_BUF_PLANE0_OFFSET as Attrib,
-            0 as Attrib,
+            plane0_offset as Attrib,
             egl_ext::DMA_BUF_PLANE0_FD as Attrib,
             fd as Attrib,
             egl::IMAGE_PRESERVED as Attrib,
@@ -3461,11 +3789,25 @@ impl GLProcessorST {
         // NV12 requires a second plane for UV data
         if src_fmt == PixelFormat::Nv12 {
             let (plane1_fd, uv_offset) = if let Some(chroma_fd) = uv_fd {
-                // Multiplane: UV in separate DMA-BUF at offset 0
-                (chroma_fd, 0)
+                // Multiplane: UV in separate DMA-BUF — use chroma's plane_offset or 0
+                let chroma_offset = src.chroma().and_then(|c| c.plane_offset()).unwrap_or(0);
+                (chroma_fd, chroma_offset)
             } else {
-                // Contiguous: UV follows Y in same buffer
-                (fd, width * height)
+                // Contiguous: UV follows Y in same buffer.
+                // Use stride-aware offset — if Y has padding, UV starts
+                // at stride * height, not width * height.  Include the
+                // luma plane_offset so the UV base is correct when pixel
+                // data does not start at byte 0.
+                (fd, plane0_offset + plane0_pitch * height)
+            };
+            let plane1_pitch = if let Some(chroma) = src.chroma() {
+                // Multiplane: use chroma's explicit stride if set (via
+                // set_row_stride_unchecked during import), or fall back to
+                // the luma pitch (NV12 UV row width in bytes equals Y width)
+                chroma.effective_row_stride().unwrap_or(plane0_pitch)
+            } else {
+                // Contiguous NV12: UV stride matches Y stride
+                plane0_pitch
             };
             egl_img_attr.append(&mut vec![
                 egl_ext::DMA_BUF_PLANE1_FD as Attrib,
@@ -3473,7 +3815,7 @@ impl GLProcessorST {
                 egl_ext::DMA_BUF_PLANE1_OFFSET as Attrib,
                 uv_offset as Attrib,
                 egl_ext::DMA_BUF_PLANE1_PITCH as Attrib,
-                width as Attrib, // UV plane has same width as Y plane
+                plane1_pitch as Attrib,
             ]);
         }
 

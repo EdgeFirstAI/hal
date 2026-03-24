@@ -95,7 +95,7 @@ processor = ef.ImageProcessor()
 src = ef.Tensor.load("frame.jpg", ef.PixelFormat.Rgb)
 
 # Render directly into the delegate's DMA-BUF — zero copies
-dst = processor.create_image_from_fd(vx_fd, 640, 640, ef.PixelFormat.Rgb)
+dst = processor.import_image(fd=vx_fd, width=640, height=640, format=ef.PixelFormat.Rgb)
 processor.convert(src, dst)
 
 # Reverse: HAL allocates, consumer imports the fd

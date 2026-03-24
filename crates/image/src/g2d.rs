@@ -297,7 +297,9 @@ fn tensor_to_g2d_surface(img: &Tensor<u8>) -> Result<G2DSurface> {
         } else {
             let w = img.width().unwrap();
             let h = img.height().unwrap();
-            let uv_offset = (w * h) as u64;
+            let stride = img.effective_row_stride().unwrap_or(w);
+            let offset = img.plane_offset().unwrap_or(0);
+            let uv_offset = (offset + stride * h) as u64;
             [base_addr, base_addr + uv_offset, 0]
         }
     } else {
@@ -1051,6 +1053,7 @@ mod g2d_tests {
     /// Compares G2D src→PixelFormat::Bgra against G2D src→PixelFormat::Rgba by verifying R↔B swap.
     #[test]
     #[cfg(target_os = "linux")]
+    #[ignore = "G2D on i.MX 8MP rejects BGRA as destination format; re-enable when supported"]
     fn test_g2d_bgra_no_resize() {
         for src_fmt in [
             PixelFormat::Rgba,

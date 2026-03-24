@@ -127,6 +127,12 @@ void main(){
 "
 }
 
+/// Planar RGB shader using `samplerExternalOES` for EGLImage sources.
+///
+/// Currently byte-identical to [`generate_texture_fragment_shader_yuv`] but
+/// kept as a separate function so the planar draw path can diverge
+/// independently (e.g., for custom per-channel operations). The `_2d`
+/// variant ([`generate_planar_rgb_shader_2d`]) uses `sampler2D` instead.
 pub(super) fn generate_planar_rgb_shader() -> &'static str {
     "\
 #version 300 es
@@ -208,6 +214,50 @@ pub(super) fn generate_planar_rgb_int8_shader() -> &'static str {
 #extension GL_OES_EGL_image_external_essl3 : require
 precision highp float;
 uniform samplerExternalOES tex;
+in vec3 fragPos;
+in vec2 tc;
+
+out vec4 color;
+
+vec3 int8_bias(vec3 v) {
+    vec3 q = floor(v * 255.0 + 0.5);
+    return mod(q + 128.0, 256.0) / 255.0;
+}
+
+void main(){
+    vec4 c = texture(tex, tc);
+    color = vec4(int8_bias(c.rgb), c.a);
+}
+"
+}
+
+/// 2D-sampler variant of [`generate_planar_rgb_shader`]. Uses `sampler2D`
+/// instead of `samplerExternalOES` for sourcing from intermediate RGBA
+/// textures (e.g., two-pass NV12→RGBA→PlanarRgb on Vivante).
+pub(super) fn generate_planar_rgb_shader_2d() -> &'static str {
+    "\
+#version 300 es
+precision mediump float;
+uniform sampler2D tex;
+in vec3 fragPos;
+in vec2 tc;
+
+out vec4 color;
+
+void main(){
+    color = texture(tex, tc);
+}
+"
+}
+
+/// Int8 variant of [`generate_planar_rgb_shader_2d`]. Applies XOR 0x80 bias
+/// to each RGB channel (uint8 → int8 conversion) using the bit-exact
+/// quantize+mod approach: `floor(v * 255 + 0.5) + 128 mod 256 / 255`.
+pub(super) fn generate_planar_rgb_int8_shader_2d() -> &'static str {
+    "\
+#version 300 es
+precision highp float;
+uniform sampler2D tex;
 in vec3 fragPos;
 in vec2 tc;
 

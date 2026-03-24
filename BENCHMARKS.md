@@ -1,8 +1,8 @@
 # EdgeFirst HAL - Benchmarks
 
-**Version:** 2.0
-**Last Updated:** March 20, 2026
-**Status:** Updated for TensorDyn unification — added u8/i8 DType benchmarks, updated auto-backend priority (OpenGL→G2D→CPU), added comprehensive per-backend comparison tables
+**Version:** 2.1
+**Last Updated:** March 23, 2026
+**Status:** Added C API preprocessing benchmark (`bench_preproc`) results for i.MX 95, i.MX 8MP, and x86 desktop; added tensor reuse impact analysis with quantified EGL cache penalties
 
 ---
 
@@ -436,6 +436,160 @@ The hybrid path decodes masks on CPU (`materialize_segmentations`) then overlays
 
 ---
 
+## C API Preprocessing Benchmark (`bench_preproc`)
+
+This section documents results from the C API preprocessing benchmark, which measures end-to-end `hal_image_processor_convert()` latency as seen by a C caller — including EGL/DMA-buf import, GPU dispatch, readback, and any tensor lifecycle overhead. The benchmark is the primary evidence base for the tensor reuse recommendations in ARCHITECTURE.md.
+
+**Source:** `crates/capi/tests/bench_preproc.c`
+
+**Reference:** ARCHITECTURE.md § "C API Performance Recommendations (DMA-BUF / EGL Path)"
+
+### Test Configuration
+
+| Parameter | Value |
+|-----------|-------|
+| Input | 1920×1080 NV12 or YUYV (DMA-buf) |
+| Output | 640×640 letterbox |
+| Warmup | 5 iterations (unmeasured) |
+| Measured | 100 iterations |
+| Reported | Avg, Min, Max (ms) |
+
+The benchmark exercises six format paths (NV12/YUYV × RGBA/RGB/PlanarRgb, each in u8 and i8 variants), then adds three lifecycle scenarios: recreating the output tensor per frame, chaining two convert calls, and rotating through a four-buffer pool.
+
+### Cross-Platform Summary
+
+Key averages for the most common format paths (1080p → 640×640 letterbox):
+
+| Conversion | i.MX 95 (Mali) | i.MX 8MP (Vivante) | x86 (GTX 1080 PBO) |
+|------------|---------------:|-------------------:|-------------------:|
+| NV12→RGBA | 1.52 ms | 3.39 ms | 1.22 ms |
+| NV12→RGB | 3.68 ms | 14.40 ms | 1.03 ms |
+| NV12→PlanarRgb | 3.67 ms | 17.51 ms | 1.21 ms |
+| YUYV→RGBA | 1.12 ms | 1.72 ms | 1.51 ms |
+| YUYV→RGB | 3.32 ms | 11.95 ms | 1.44 ms |
+| YUYV→PlanarRgb | 2.29 ms | 5.62 ms | 1.58 ms |
+| **Recreate tensor/frame** | **5.00 ms** | **5.61 ms** | **1.23 ms** |
+| **Buffer pool (4 bufs)** | **1.58 ms** | **3.44 ms** | **1.27 ms** |
+
+> **Key insight:** NV12→RGB and NV12→PlanarRgb are 14–20 ms on i.MX 8MP because these paths trigger CPU fallback on Vivante GC7000UL (NV12→planar is blocked due to GPU hang, packed RGB is 3–4× slower than G2D). On i.MX 95 (Mali) and x86 (PBO), all paths stay under 5 ms.
+
+### Per-Platform Detail
+
+#### i.MX 95-EVK (Mali G310, single-pass GL, DMA-buf)
+
+| Benchmark | Avg (ms) | Min (ms) | Max (ms) |
+|-----------|----------|----------|----------|
+| NV12→RGBA | 1.52 | 1.43 | 1.83 |
+| NV12→RGBA I8 | 1.54 | 1.43 | 2.93 |
+| NV12→RGB | 3.68 | 3.50 | 4.00 |
+| NV12→RGB I8 | 4.95 | 4.72 | 5.78 |
+| NV12→PlanarRgb | 3.67 | 3.39 | 4.22 |
+| NV12→PlanarRgb I8 | 3.65 | 3.38 | 4.09 |
+| YUYV→RGBA | 1.12 | 1.05 | 1.17 |
+| YUYV→RGBA I8 | 1.23 | 1.15 | 1.32 |
+| YUYV→RGB | 3.32 | 3.13 | 3.61 |
+| YUYV→RGB I8 | 4.68 | 4.39 | 5.30 |
+| YUYV→PlanarRgb | 2.29 | 2.21 | 2.48 |
+| YUYV→PlanarRgb I8 | 2.60 | 2.55 | 2.75 |
+| Recreate tensor per frame | 5.00 | 4.64 | 5.43 |
+| Chained (NV12→RGBA→PlanarRgb) | 4.12 | 4.00 | 4.54 |
+| Buffer pool (4 bufs rotating) | 1.58 | 1.48 | 1.70 |
+
+#### i.MX 8M Plus EVK-06 (Vivante GC7000UL, DMA-buf)
+
+| Benchmark | Avg (ms) | Min (ms) | Max (ms) |
+|-----------|----------|----------|----------|
+| NV12→RGBA | 3.39 | 3.09 | 3.79 |
+| NV12→RGBA I8 | 3.29 | 3.13 | 3.81 |
+| NV12→RGB | 14.40 | 13.06 | 15.86 |
+| NV12→RGB I8 | 18.00 | 16.64 | 18.89 |
+| NV12→PlanarRgb | 17.51 | 16.84 | 25.29 |
+| NV12→PlanarRgb I8 | 19.75 | 18.64 | 26.45 |
+| YUYV→RGBA | 1.72 | 1.66 | 1.91 |
+| YUYV→RGBA I8 | 1.70 | 1.63 | 1.87 |
+| YUYV→RGB | 11.95 | 10.68 | 12.69 |
+| YUYV→RGB I8 | 15.01 | 13.85 | 16.20 |
+| YUYV→PlanarRgb | 5.62 | 5.24 | 6.32 |
+| YUYV→PlanarRgb I8 | 5.82 | 5.31 | 6.68 |
+| Recreate tensor per frame | 5.61 | 5.01 | 6.70 |
+| Chained (NV12→RGBA→PlanarRgb) | 8.53 | 8.03 | 9.98 |
+| Buffer pool (4 bufs rotating) | 3.44 | 3.15 | 4.11 |
+
+> **Note:** NV12→RGB and NV12→PlanarRgb are 14–20 ms because these paths hit CPU fallback on Vivante (NV12→planar is blocked at the GL layer; packed RGB uses G2D which is slower than on Mali). For latency-sensitive pipelines on i.MX 8MP, prefer NV12→RGBA (3.4 ms) and rely on the VX Delegate CameraAdaptor for the final layout conversion inside the NPU graph.
+
+#### x86 Desktop (NVIDIA GTX 1080, PBO path)
+
+| Benchmark | Avg (ms) | Min (ms) | Max (ms) |
+|-----------|----------|----------|----------|
+| NV12→RGBA | 1.22 | 1.07 | 1.92 |
+| NV12→RGBA I8 | 1.51 | 1.36 | 2.51 |
+| NV12→RGB | 1.03 | 0.94 | 2.45 |
+| NV12→RGB I8 | 1.12 | 1.02 | 1.57 |
+| NV12→PlanarRgb | 1.21 | 1.08 | 1.73 |
+| NV12→PlanarRgb I8 | 1.25 | 1.16 | 3.65 |
+| YUYV→RGBA | 1.51 | 1.41 | 2.15 |
+| YUYV→RGBA I8 | 1.97 | 1.69 | 2.65 |
+| YUYV→RGB | 1.44 | 1.33 | 3.66 |
+| YUYV→RGB I8 | 1.49 | 1.37 | 2.88 |
+| YUYV→PlanarRgb | 1.58 | 1.45 | 2.13 |
+| YUYV→PlanarRgb I8 | 1.67 | 1.51 | 4.26 |
+| Recreate tensor per frame | 1.23 | 1.10 | 2.09 |
+| Chained (NV12→RGBA→PlanarRgb) | 1.47 | 1.34 | 2.14 |
+| Buffer pool (4 bufs rotating) | 1.27 | 1.12 | 3.01 |
+
+> **Note:** All format paths are 1.0–2.0 ms on this platform. The recreate-tensor penalty is negligible (1.0×) because the PBO path does not use `EGLImage` — output tensors are bound directly as PBO destinations so there is no EGL image cache involved.
+
+### Tensor Reuse Impact
+
+Recreating the output tensor on every frame forces a new DMA-buf allocation, a new `EGLImage` import, and a new `GL_TEXTURE_EXTERNAL_OES` binding for that buffer. On EGLImage-based platforms (DMA-buf path), this cache miss dominates — the raw GPU work for the conversion itself is not the bottleneck.
+
+| Platform | Reuse avg | Recreate avg | Penalty | Buffer pool avg | Pool vs. reuse |
+|----------|----------:|-------------:|--------:|----------------:|---------------:|
+| i.MX 95 (Mali) | 1.52 ms | 5.00 ms | **3.3×** | 1.58 ms | 1.04× |
+| i.MX 8MP (Vivante) | 3.39 ms | 5.61 ms | **1.7×** | 3.44 ms | 1.01× |
+| x86 (GTX 1080 PBO) | 1.22 ms | 1.23 ms | **1.0×** | 1.27 ms | 1.04× |
+
+The reuse baseline uses a single source tensor held alive across all 100 frames. The recreate variant calls `hal_tensor_free` and `hal_image_processor_create_image` on the **source** tensor every frame before converting (the destination tensor is reused). The buffer pool variant rotates through four pre-allocated source tensors in round-robin order (simulating a V4L2 buffer pool with multiple frames in flight).
+
+**Buffer pool matches single-tensor reuse on both embedded platforms** (1.01–1.04×). This confirms that the EGL image cache works correctly as long as the same buffer objects are reused — the pool size does not matter as long as each buffer is seen again before its cache entry is evicted. The recreate penalty is entirely attributable to EGL import overhead, not to DMA-buf allocation itself.
+
+**The penalty is zero on PBO** (x86 desktop) because `PboTensor` uses `glBindBuffer` on a pre-allocated PBO, with no `EGLImage` lifecycle. Recreating a PBO tensor is still cheaper than an EGL import on Mali/Vivante.
+
+#### Why This Matters for Embedded Pipelines
+
+A 30 fps camera pipeline has a 33 ms per-frame budget. On i.MX 95:
+
+- Single `convert()` with tensor reuse: **1.5 ms** (4.5% of budget)
+- Single `convert()` with recreated tensor: **5.0 ms** (15% of budget) — a 3.5 ms waste
+- Chained two-step pipeline (NV12→RGBA→PlanarRgb) with reuse: **4.1 ms** (12% of budget)
+- Same chained pipeline if both output tensors are recreated: ~**10 ms** (30% of budget)
+
+On i.MX 8MP, where the per-convert budget is already tighter due to Vivante driver characteristics, the same two-step chain with recreated tensors consumes ~**11 ms** — one third of the entire 33 ms frame budget before inference even begins.
+
+**Conclusion: tensor reuse is not optional on embedded. Allocate output tensors once at pipeline startup and reuse them every frame. Use a buffer pool when multiple frames are in flight concurrently.**
+
+### Running `bench_preproc`
+
+```bash
+# Cross-compile for aarch64
+cargo-zigbuild zigbuild --target aarch64-unknown-linux-gnu --release -p edgefirst-capi
+
+# The C benchmark is built by the capi crate's build.rs; the binary is at:
+#   target/aarch64-unknown-linux-gnu/release/bench_preproc
+
+# Deploy and run on target
+scp target/aarch64-unknown-linux-gnu/release/bench_preproc user@target:/tmp/
+ssh user@target '/tmp/bench_preproc'
+```
+
+The binary requires a DMA-heap device (`/dev/dma_heap/linux,cma` or `/dev/dma_heap/system`) and an EGL display. On x86 with NVIDIA, it automatically falls back to the PBO path.
+
+> **CI environments:** Set `EDGEFIRST_FORCE_BACKEND=cpu` to skip software GL
+> detection overhead. Without this, the GL backend will attempt EGL init,
+> detect llvmpipe/swrast, and fall back to CPU — adding ~200ms to startup.
+
+---
+
 ## Known Benchmark Gaps
 
 ### Missing Platforms
@@ -485,6 +639,7 @@ The hybrid path decodes masks on CPU (`materialize_segmentations`) then overlays
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 2.1 | 2026-03-23 | Add C API preprocessing benchmark (`bench_preproc`) results for i.MX 95-EVK (Mali), i.MX 8MP EVK-06 (Vivante), and x86 desktop (GTX 1080 PBO); add tensor reuse impact analysis (3.3× penalty on i.MX 95, 1.7× on i.MX 8MP, negligible on PBO); document buffer pool validation |
 | 2.0 | 2026-03-20 | TensorDyn unification: auto-backend priority changed to OpenGL→G2D→CPU; always use two-pass packed RGB (rgb_direct removed); added per-platform forced-backend comparison tables at 720p; added u8/i8 DType benchmark variants; replaced 8BPi with 8BPS_i8 naming |
 | 1.5 | 2026-03-18 | Remove stale Known Issue #3 (EDGEFIRST_FORCE_TRANSFER=pbo now implemented); documentation accuracy updates |
 | 1.4 | 2026-03-13 | Add planar RGB (8BPS/8BPi) format benchmarks; document NV12→planar GPU hang on Vivante GC7000UL (blocked, CPU fallback); split letterbox tables into packed/planar; update mask rendering (imx8mp fused GPU improved 275ms→5.9ms); add rpi5 GL planar performance notes; refresh all platforms |
