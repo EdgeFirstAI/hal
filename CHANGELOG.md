@@ -9,105 +9,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Row stride and plane offset for DMA-BUF tensors** — new metadata fields
-  allow HAL to correctly handle externally-allocated buffers with row padding
-  (e.g. V4L2 `bytesperline`, GStreamer allocator alignment). The stride and
-  offset are propagated to EGL `DMA_BUF_PLANE*_PITCH` / `PLANE*_OFFSET`
-  attributes so the GPU interprets padded layouts correctly.
+- **Row stride and plane offset for DMA-BUF tensors** — tensors from
+  `import_image` now carry per-plane stride and offset metadata, propagated
+  end-to-end into EGL `DMA_BUF_PLANE*_PITCH` / `PLANE*_OFFSET` attributes.
+  This enables correct GPU rendering of V4L2 buffers with row padding
+  (e.g. `bytesperline=2048` on a 1920-wide frame). New APIs:
 
-  **Rust:**
-  ```rust,ignore
-  tensor.set_row_stride(2048)?;              // stride in bytes (>= min for format)
-  tensor.set_plane_offset(4096);             // byte offset within the DMA-BUF
-  assert_eq!(tensor.effective_row_stride(), Some(2048));
-  ```
+  | Layer | New APIs |
+  |-------|----------|
+  | Rust | `set_row_stride()`, `with_row_stride()`, `effective_row_stride()`, `set_plane_offset()`, `plane_offset()` |
+  | C | `hal_plane_descriptor_set_stride()`, `hal_plane_descriptor_set_offset()`, `hal_tensor_row_stride()` |
+  | Python | `import_image(..., stride=, offset=, chroma_stride=, chroma_offset=)` |
 
-  **Python:**
-  ```python
-  dst = processor.import_image(fd, 1920, 1080, ef.PixelFormat.Rgb,
-                               stride=2048, offset=0)
-  ```
-
-  **C:**
-  ```c
-  hal_plane_descriptor_set_stride(pd, bytesperline);
-  hal_plane_descriptor_set_offset(pd, offset);
-  size_t stride = hal_tensor_row_stride(tensor);  /* effective stride in bytes */
-  ```
-
-  Changing the pixel format via `set_format()` automatically clears stored
-  stride and offset. `Tensor::map()` rejects strided or offset tensors to
-  prevent incorrect CPU access on padded buffers.
+  Changing the pixel format to a different value via `set_format()` clears
+  stored stride and offset; re-setting the same format preserves both.
+  `Tensor::map()` rejects strided or offset tensors to prevent incorrect
+  CPU access on padded buffers.
 
 - **VYUY pixel format** (`PixelFormat::Vyuy`) — packed YUV 4:2:2 with VYUY
-  byte order, complementing the existing YUYV support. Available in Rust, C
-  (`HAL_PIXEL_FORMAT_VYUY`), and Python (`PixelFormat.Vyuy`). Supported by
-  the GL, G2D, and CPU backends. Note: Vivante GPU produces incorrect output
-  for VYUY via EGL DMA-BUF import (~0.28 SSIM); falls back to 2D texture
-  path automatically.
+  byte order. Available in Rust, C (`HAL_PIXEL_FORMAT_VYUY`), and Python.
+  Note: EGL DMA-BUF import produces incorrect output on Vivante (~0.28
+  SSIM); the GL backend auto-falls back to the CPU/G2D path for this format.
 
-- **Software OpenGL renderer rejection** — the GL backend now detects
-  CPU-based OpenGL implementations (llvmpipe, softpipe, swrast) at init and
-  returns `Error::NotSupported`, causing the auto-detection fallback chain
-  to select the CPU or G2D backend instead. Prevents silently running image
-  processing on a software rasterizer that is slower than the native CPU
-  backend.
+- **Software OpenGL renderer rejection** — the GL backend detects
+  llvmpipe/softpipe/swrast at init and returns `Error::NotSupported`,
+  causing the auto-detection fallback chain to select CPU or G2D instead.
 
-- **C API preprocessing benchmark** (`crates/capi/tests/bench_preproc.c`) —
-  gold-standard integration reference for GStreamer/V4L2 integrators. Covers
-  seven DMA-BUF import patterns (reuse, pool, stride, multiplane, multiplane
-  with stride, render target, per-frame anti-pattern), a full format
-  conversion matrix, and a two-stage
-  chained pipeline. Configurable via `BENCH_ITERATIONS` and
-  `EDGEFIRST_FORCE_BACKEND` environment variables.
+- **GL thread panic safety** — the OpenGL worker thread now wraps all
+  message handlers in `catch_unwind`. A caught panic sets a `poisoned` flag;
+  all subsequent GL calls return `Error::Internal` instead of hanging.
+
+- **C API preprocessing benchmark** (`bench_preproc.c`) — reference for
+  GStreamer/V4L2 integrators covering seven DMA-BUF import patterns, a
+  format conversion matrix, and a two-stage chained pipeline.
 
 ### Removed
 
-- **`hal_tensor_from_planes()` C API** — replaced by `hal_import_image()` with
-  per-plane `hal_plane_descriptor_new()` descriptors. The new API supports
-  stride, offset, and single-plane formats. See ARCHITECTURE.md
-  "Multi-Plane Support" for updated patterns.
+- **`hal_tensor_from_planes()`** — use `hal_import_image()` with separate
+  `hal_plane_descriptor_new()` descriptors instead. The new API supports
+  per-plane stride/offset and is processor-aware (EGL cache compatible).
 
 ### Changed
 
-- **`import_image` now wires stride and offset end-to-end** — per-plane
-  stride and offset from `PlaneDescriptor` are transferred into the
-  resulting tensor's metadata and used during EGL DMA-BUF import. Previously
-  the descriptor carried this metadata but it was not propagated to the GPU.
-
-- **Contiguous NV12 UV byte offset is stride-aware** — the UV plane offset
-  for contiguous (single-fd) NV12 is now computed as `stride * height`
-  instead of `width * height`. This is critical for padded buffers where the
-  luma plane has a stride wider than the image width.
+- **Contiguous NV12 UV offset is stride-aware** — the UV plane byte offset
+  for single-fd NV12 is now `effective_row_stride() * height` instead of
+  `width * height`, fixing corrupted chroma on padded buffers.
 
 - **Multiplane `import_image` rejects unsupported dtypes** — only `U8` and
-  `I8` are supported for multiplane (NV12) imports. Other dtypes (U16, F32)
-  now return `Error::NotSupported` immediately instead of silently producing
-  a `u8`-backed tensor with the wrong element type.
+  `I8` are valid for multiplane NV12 imports; other dtypes return
+  `Error::NotSupported` instead of silently producing a wrong-type tensor.
 
 ### Fixed
 
-- **NV12 UV sampling incorrect for padded buffers** — when a contiguous NV12
-  buffer had a row stride wider than `width` (e.g. V4L2 `bytesperline`
-  alignment to 2048), the UV plane byte offset passed to EGL was wrong,
-  causing corrupted chroma rendering. Now uses `effective_row_stride() * height`.
+- **NV12 UV sampling incorrect for padded buffers** — V4L2 buffers with
+  stride > width caused corrupted chroma because the UV plane offset passed
+  to EGL was computed from width, not from the actual stride.
 
-- **`hal_import_image` double-free on same-pointer args** — passing the same
-  `hal_plane_descriptor` pointer as both `image` and `chroma` caused
-  undefined behavior (double `Box::from_raw`). Now detected and returns
-  `EINVAL`.
-
-- **`hal_import_image` errno mapping for tensor errors** — `Tensor(InvalidArgument)`
-  and `Tensor(InvalidShape)` now correctly map to `EINVAL` instead of falling
-  through to the `EIO` catch-all. `UnsupportedFormat` maps to `ENOTSUP`.
-
-- **macOS build failure** — invalid `0c_int` literal suffix in the
-  `make_test_fd()` helper. Only affected macOS where the `#[cfg]` block is
-  active; dead code on Linux.
-
-- **Vivante NV12→PlanarRGB warning text** — the init-time warning said
-  conversions would be "blocked" but the code actually uses a two-pass
-  workaround (NV12→RGBA→PlanarRgb). Updated to match behavior.
+- **`hal_import_image` double-free** — passing the same pointer as both
+  `image` and `chroma` caused UB. Now returns `EINVAL`.
 
 ## [0.11.0] - 2026-03-22
 
