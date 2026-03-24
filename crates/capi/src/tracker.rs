@@ -44,13 +44,13 @@ impl From<&TrackInfo> for HalTrackInfo {
 
 /// Opaque ByteTrack tracker type.
 pub struct HalByteTrack {
-    inner: ByteTrack<DetectBox>,
+    pub(crate) inner: ByteTrack<DetectBox>,
 }
 
 /// List of track info results.
 #[derive(Debug, Clone)]
 pub struct HalTrackInfoList {
-    tracks: Vec<TrackInfo>,
+    pub(crate) tracks: Vec<TrackInfo>,
 }
 
 // ============================================================================
