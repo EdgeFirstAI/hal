@@ -1480,7 +1480,7 @@ impl GLProcessorST {
         if is_vivante {
             log::warn!(
                 "Vivante GPU detected — NV12 → planar RGB conversions will use \
-                 two-pass workaround to avoid GPU hang (see VSI_GPU_NV12_BUG.md)"
+                 two-pass workaround to avoid GPU hang (EDGEAI-1180)"
             );
         }
         if is_software_renderer {
