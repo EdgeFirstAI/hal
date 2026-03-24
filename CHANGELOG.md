@@ -32,7 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ```c
   hal_plane_descriptor_set_stride(pd, bytesperline);
   hal_plane_descriptor_set_offset(pd, offset);
-  size_t stride = hal_tensor_row_stride(tensor);  /* 0 if tightly packed */
+  size_t stride = hal_tensor_row_stride(tensor);  /* effective stride in bytes */
   ```
 
   Changing the pixel format via `set_format()` automatically clears stored

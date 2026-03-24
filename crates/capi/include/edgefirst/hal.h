@@ -26,7 +26,7 @@ extern "C" {
  * - hal_*_new() functions transfer ownership to caller (must call hal_*_free())
  * - hal_*_get_*() functions returning pointers are borrowed (valid during parent lifetime)
  * - hal_*_clone_fd() creates new owned fd (caller must close())
- * - hal_*_from_fd() takes ownership of fd (caller must NOT close())
+ * - hal_*_from_fd() duplicates the fd internally (caller retains ownership and must close())
  *
  * @section thread_safety Thread Safety
  * - All functions are thread-safe unless documented otherwise
@@ -1409,9 +1409,10 @@ size_t hal_tensor_channels(const struct hal_tensor *tensor);
  * format: width for planar/semi-planar formats, width * channels for packed.
  *
  * @param tensor Image tensor handle
- * @return Row stride in bytes, or 0 if tensor is NULL, has no pixel format
- *         set, or is tightly packed (no explicit stride). Check tensor is
- *         non-NULL separately to distinguish error from tightly-packed.
+ * @return Effective row stride in bytes: the explicit stride if set, or the
+ *         minimum stride computed from format and width (e.g. width * channels
+ *         for packed formats). Returns 0 only when no pixel format is set or
+ *         tensor is NULL.
  */
 size_t hal_tensor_row_stride(const struct hal_tensor *tensor);
 
