@@ -798,7 +798,7 @@ static void test_decoder_tracked_end_to_end_segdet_split_proto(void) {
     struct hal_segmentation_list* seg_list = NULL;
     struct hal_track_info_list* track_list = NULL;
 
-    struct hal_tensor* image = hal_tensor_new_image(400, 400, HAL_FOURCC_RGBA, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* image = hal_tensor_new_image(400, 400, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
     ASSERT_NOT_NULL(image);
 
     int rc = hal_decoder_decode_tracked_draw_masks(
