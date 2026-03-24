@@ -69,7 +69,7 @@ converter.convert(&input, &mut output, Rotation::None, Flip::None, Crop::default
 #include <edgefirst/hal.h>
 
 struct hal_image_processor *proc = hal_image_processor_new();
-struct hal_tensor *dst = hal_image_processor_create_image(proc, 640, 640, HAL_FOURCC_RGB, HAL_DTYPE_U8);
+struct hal_tensor *dst = hal_image_processor_create_image(proc, 640, 640, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8);
 hal_image_processor_convert(proc, src, dst, HAL_ROTATION_NONE, HAL_FLIP_NONE, NULL);
 ```
 
@@ -457,7 +457,7 @@ struct hal_image_processor *proc = hal_image_processor_new();
 
 /* Create reusable output buffer — allocated once */
 struct hal_tensor *output = hal_image_processor_create_image(
-    proc, 640, 640, HAL_FOURCC_RGB, HAL_DTYPE_U8);
+    proc, 640, 640, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8);
 
 for (;;) {
     /* Reuse output buffer each iteration — no allocation */

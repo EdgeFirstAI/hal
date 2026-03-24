@@ -152,18 +152,16 @@ processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::letterbox())
 ## Zero-Copy External Buffer (Linux)
 
 When integrating with an NPU delegate (e.g. VxDelegate) that owns its own
-DMA-BUF buffers, use `create_image_from_fd()` to render directly into the
+DMA-BUF buffers, use `import_image()` to render directly into the
 delegate's buffer — eliminating the `memcpy` between HAL's buffer and the
 delegate's buffer:
 
 ```rust,ignore
+use edgefirst_tensor::PlaneDescriptor;
+
 // UC1: Render into VxDelegate's DMA-BUF — zero copies
-let mut dst = processor.create_image_from_fd(
-    vx_fd.as_fd(),       // borrow — caller keeps ownership
-    640, 640,
-    PixelFormat::Rgb,
-    DType::U8,
-)?;
+let pd = PlaneDescriptor::new(vx_fd.as_fd())?;  // dups fd — caller keeps ownership
+let mut dst = processor.import_image(pd, None, 640, 640, PixelFormat::Rgb, DType::U8)?;
 processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::letterbox())?;
 // dst's backing memory IS vx_fd — no memcpy needed
 ```

@@ -39,7 +39,7 @@ extern "C" {
  * - hal_*_new() functions transfer ownership to caller (must call hal_*_free())
  * - hal_*_get_*() functions returning pointers are borrowed (valid during parent lifetime)
  * - hal_*_clone_fd() creates new owned fd (caller must close())
- * - hal_*_from_fd() takes ownership of fd (caller must NOT close())
+ * - hal_*_from_fd() duplicates the fd internally (caller retains ownership and must close())
  *
  * @section thread_safety Thread Safety
  * - All functions are thread-safe unless documented otherwise
@@ -55,8 +55,8 @@ trailer = """
 #endif /* EDGEFIRST_HAL_H */
 """
 
-includes = ["stdint.h", "stddef.h", "stdbool.h"]
-sys_includes = []
+includes = []
+sys_includes = ["stddef.h", "stdio.h"]
 no_includes = false
 
 [export]
@@ -67,7 +67,7 @@ item_types = ["enums", "structs", "unions", "typedefs", "opaque", "functions", "
 [export.rename]
 "HalDtype" = "hal_dtype"
 "HalTensorMemory" = "hal_tensor_memory"
-"HalFourcc" = "hal_fourcc"
+"HalPixelFormat" = "hal_pixel_format"
 "HalRotation" = "hal_rotation"
 "HalFlip" = "hal_flip"
 "HalNms" = "hal_nms"
@@ -85,6 +85,7 @@ item_types = ["enums", "structs", "unions", "typedefs", "opaque", "functions", "
 "HalByteTrack" = "hal_bytetrack"
 "HalTrackInfoList" = "hal_track_info_list"
 "HalTensorMap" = "hal_tensor_map"
+"HalPlaneDescriptor" = "hal_plane_descriptor"
 "HalComputeBackend" = "hal_compute_backend"
 "HalLogLevel" = "hal_log_level"
 "HalLogCallback" = "hal_log_callback"

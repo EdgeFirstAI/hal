@@ -26,7 +26,7 @@ extern "C" {
  * - hal_*_new() functions transfer ownership to caller (must call hal_*_free())
  * - hal_*_get_*() functions returning pointers are borrowed (valid during parent lifetime)
  * - hal_*_clone_fd() creates new owned fd (caller must close())
- * - hal_*_from_fd() takes ownership of fd (caller must NOT close())
+ * - hal_*_from_fd() duplicates the fd internally (caller retains ownership and must close())
  *
  * @section thread_safety Thread Safety
  * - All functions are thread-safe unless documented otherwise
@@ -42,9 +42,8 @@ extern "C" {
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include "stdint.h"
-#include "stddef.h"
-#include "stdbool.h"
+#include <stddef.h>
+#include <stdio.h>
 
 /**
  * Output type for model tensor outputs.
@@ -220,50 +219,56 @@ typedef enum HalDecoderVersion {
 } HalDecoderVersion;
 
 /**
- * Image pixel format (FourCC codes).
+ * Image pixel format.
  */
-typedef enum hal_fourcc {
+typedef enum hal_pixel_format {
   /**
    * 8-bit interleaved YUV422, limited range (YUYV)
    */
-  HAL_FOURCC_YUYV = 0,
+  HAL_PIXEL_FORMAT_YUYV = 0,
   /**
    * 8-bit planar YUV420, limited range (NV12)
    */
-  HAL_FOURCC_NV12 = 1,
+  HAL_PIXEL_FORMAT_NV12 = 1,
   /**
    * 8-bit planar YUV422, limited range (NV16)
    */
-  HAL_FOURCC_NV16 = 2,
+  HAL_PIXEL_FORMAT_NV16 = 2,
   /**
    * 8-bit RGBA (4 channels)
    */
-  HAL_FOURCC_RGBA = 3,
+  HAL_PIXEL_FORMAT_RGBA = 3,
   /**
    * 8-bit RGB (3 channels)
    */
-  HAL_FOURCC_RGB = 4,
+  HAL_PIXEL_FORMAT_RGB = 4,
   /**
    * 8-bit grayscale, full range (Y800)
    */
-  HAL_FOURCC_GREY = 5,
+  HAL_PIXEL_FORMAT_GREY = 5,
   /**
    * 8-bit planar RGB (3 planes)
    */
-  HAL_FOURCC_PLANAR_RGB = 6,
+  HAL_PIXEL_FORMAT_PLANAR_RGB = 6,
   /**
    * 8-bit planar RGBA (4 planes)
    */
-  HAL_FOURCC_PLANAR_RGBA = 7,
+  HAL_PIXEL_FORMAT_PLANAR_RGBA = 7,
   /**
    * 8-bit BGRA (4 channels, blue first)
    */
-  HAL_FOURCC_BGRA = 8,
+  HAL_PIXEL_FORMAT_BGRA = 8,
   /**
    * 8-bit interleaved YUV422, limited range (VYUY byte order)
+   *
+   * @note On Vivante GPUs (i.MX 8M Plus), VYUY import uses a 2D texture
+   * fallback instead of the EGL external texture path.  The HAL detects
+   * this automatically; no caller action is needed.  Quality is validated
+   * but may differ slightly from the external-texture path used on other
+   * GPUs.
    */
-  HAL_FOURCC_VYUY = 9,
-} hal_fourcc;
+  HAL_PIXEL_FORMAT_VYUY = 9,
+} hal_pixel_format;
 
 /**
  * Data type of tensor elements.
@@ -464,17 +469,17 @@ typedef struct hal_decoder hal_decoder;
  * hal_decoder_params *params = hal_decoder_params_new();
  *
  * size_t scores_shape[] = {1, 80, 8400};
- * enum hal_dim_name scores_dims[] = {HAL_DIM_BATCH, HAL_DIM_NUM_CLASSES,
- *                                     HAL_DIM_NUM_BOXES};
- * int s = hal_decoder_params_add_output(params, HAL_OUTPUT_SCORES,
- *             HAL_DECODER_ULTRALYTICS, scores_shape, scores_dims, 3);
+ * enum hal_dim_name scores_dims[] = {HAL_DIM_NAME_BATCH, HAL_DIM_NAME_NUM_CLASSES,
+ *                                     HAL_DIM_NAME_NUM_BOXES};
+ * int s = hal_decoder_params_add_output(params, HAL_OUTPUT_TYPE_SCORES,
+ *             HAL_DECODER_TYPE_ULTRALYTICS, scores_shape, scores_dims, 3);
  * hal_decoder_params_output_set_quantization(params, s, 0.003906f, 0);
  *
  * size_t boxes_shape[] = {1, 4, 8400};
- * enum hal_dim_name boxes_dims[] = {HAL_DIM_BATCH, HAL_DIM_BOX_COORDS,
- *                                    HAL_DIM_NUM_BOXES};
- * int b = hal_decoder_params_add_output(params, HAL_OUTPUT_BOXES,
- *             HAL_DECODER_ULTRALYTICS, boxes_shape, boxes_dims, 3);
+ * enum hal_dim_name boxes_dims[] = {HAL_DIM_NAME_BATCH, HAL_DIM_NAME_BOX_COORDS,
+ *                                    HAL_DIM_NAME_NUM_BOXES};
+ * int b = hal_decoder_params_add_output(params, HAL_OUTPUT_TYPE_BOXES,
+ *             HAL_DECODER_TYPE_ULTRALYTICS, boxes_shape, boxes_dims, 3);
  * hal_decoder_params_output_set_quantization(params, b, 0.019824f, 0);
  *
  * hal_decoder_params_set_nms(params, HAL_NMS_CLASS_AGNOSTIC);
@@ -506,6 +511,34 @@ typedef struct hal_detect_box_list hal_detect_box_list;
  * The ImageProcessor handles format conversion with hardware acceleration when available.
  */
 typedef struct hal_image_processor hal_image_processor;
+
+/**
+ * Per-plane DMA-BUF descriptor for external buffer import.
+ *
+ * The fd is duplicated eagerly in `hal_plane_descriptor_new()` so that a bad
+ * fd fails immediately. `hal_import_image()` **consumes** the descriptor —
+ * do NOT call `hal_plane_descriptor_free()` after a successful import.
+ *
+ * @code{.c}
+ * // Single-plane RGBA
+ * struct hal_plane_descriptor *pd = hal_plane_descriptor_new(fd);
+ * hal_plane_descriptor_set_stride(pd, bytesperline);  // optional
+ * struct hal_tensor *src = hal_import_image(proc, pd, NULL,
+ *                                            1920, 1080,
+ *                                            HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
+ * // pd is consumed — do NOT free it
+ *
+ * // Multi-plane NV12
+ * struct hal_plane_descriptor *y_pd = hal_plane_descriptor_new(y_fd);
+ * struct hal_plane_descriptor *uv_pd = hal_plane_descriptor_new(uv_fd);
+ * struct hal_tensor *src = hal_import_image(proc, y_pd, uv_pd,
+ *                                            1920, 1080,
+ *                                            HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+ * @endcode
+ *
+ * @see hal_plane_descriptor_new, hal_import_image
+ */
+typedef struct hal_plane_descriptor hal_plane_descriptor;
 
 /**
  * List of segmentation results.
@@ -772,10 +805,10 @@ int hal_decoder_params_set_config_file(struct hal_decoder_params *params, const 
  * @par Example
  * @code{.c}
  * size_t shape[] = {1, 80, 8400};
- * enum hal_dim_name dims[] = {HAL_DIM_BATCH, HAL_DIM_NUM_CLASSES,
- *                              HAL_DIM_NUM_BOXES};
- * int idx = hal_decoder_params_add_output(params, HAL_OUTPUT_SCORES,
- *               HAL_DECODER_ULTRALYTICS, shape, dims, 3);
+ * enum hal_dim_name dims[] = {HAL_DIM_NAME_BATCH, HAL_DIM_NAME_NUM_CLASSES,
+ *                              HAL_DIM_NAME_NUM_BOXES};
+ * int idx = hal_decoder_params_add_output(params, HAL_OUTPUT_TYPE_SCORES,
+ *               HAL_DECODER_TYPE_ULTRALYTICS, shape, dims, 3);
  * @endcode
  *
  * @see hal_decoder_params_output_set_quantization
@@ -806,7 +839,7 @@ int hal_decoder_params_output_set_quantization(struct hal_decoder_params *params
 /**
  * Set anchor boxes on a detection output by index.
  *
- * Only valid for `HAL_OUTPUT_DETECTION` outputs.
+ * Only valid for `HAL_OUTPUT_TYPE_DETECTION` outputs.
  *
  * @param params      Params handle
  * @param index       Output index (returned by `hal_decoder_params_add_output`)
@@ -824,7 +857,7 @@ int hal_decoder_params_output_set_anchors(struct hal_decoder_params *params,
 /**
  * Set the normalized flag on a detection or boxes output by index.
  *
- * Only valid for `HAL_OUTPUT_DETECTION` and `HAL_OUTPUT_BOXES` outputs.
+ * Only valid for `HAL_OUTPUT_TYPE_DETECTION` and `HAL_OUTPUT_TYPE_BOXES` outputs.
  *
  * @param params     Params handle
  * @param index      Output index (returned by `hal_decoder_params_add_output`)
@@ -1271,7 +1304,7 @@ void hal_crop_set_dst_color(struct hal_crop *crop, uint8_t r, uint8_t g, uint8_t
  *
  * @param width Image width in pixels
  * @param height Image height in pixels
- * @param fourcc Pixel format (HAL_FOURCC_*)
+ * @param format Pixel format (HAL_PIXEL_FORMAT_*)
  * @param dtype Data type of tensor elements (HAL_DTYPE_*)
  * @param memory Memory allocation type (HAL_TENSOR_DMA recommended)
  * @return New tensor handle on success, NULL on error
@@ -1281,7 +1314,7 @@ void hal_crop_set_dst_color(struct hal_crop *crop, uint8_t r, uint8_t g, uint8_t
  */
 struct hal_tensor *hal_tensor_new_image(size_t width,
                                         size_t height,
-                                        enum hal_fourcc fourcc,
+                                        enum hal_pixel_format format,
                                         enum hal_dtype dtype,
                                         enum hal_tensor_memory memory);
 
@@ -1292,7 +1325,7 @@ struct hal_tensor *hal_tensor_new_image(size_t width,
  *
  * @param data Pointer to image data
  * @param len Length of image data in bytes
- * @param fourcc Output pixel format (HAL_FOURCC_RGB, HAL_FOURCC_RGBA, or HAL_FOURCC_GREY)
+ * @param format Output pixel format (HAL_PIXEL_FORMAT_RGB, HAL_PIXEL_FORMAT_RGBA, or HAL_PIXEL_FORMAT_GREY)
  * @param memory Memory allocation type
  * @return New tensor handle on success, NULL on error
  * @par Errors (errno):
@@ -1302,14 +1335,14 @@ struct hal_tensor *hal_tensor_new_image(size_t width,
  */
 struct hal_tensor *hal_tensor_load_image(const uint8_t *data,
                                          size_t len,
-                                         enum hal_fourcc fourcc,
+                                         enum hal_pixel_format format,
                                          enum hal_tensor_memory memory);
 
 /**
  * Load an image from a file (JPEG or PNG).
  *
  * @param path Path to the image file
- * @param fourcc Output pixel format
+ * @param format Output pixel format
  * @param memory Memory allocation type
  * @return New tensor handle on success, NULL on error
  * @par Errors (errno):
@@ -1319,45 +1352,15 @@ struct hal_tensor *hal_tensor_load_image(const uint8_t *data,
  * - ENOMEM: Memory allocation failed
  */
 struct hal_tensor *hal_tensor_load_image_file(const char *path,
-                                              enum hal_fourcc fourcc,
+                                              enum hal_pixel_format format,
                                               enum hal_tensor_memory memory);
-
-/**
- * Create a multiplane image tensor from separate Y and UV DMA-BUF file descriptors.
- *
- * This is used for V4L2 multi-planar NV12 (`V4L2_PIX_FMT_NV12M`) where the
- * Y and UV planes are in separate DMA-BUF allocations.
- *
- * **Ownership**: Ownership is transferred once the function validates that
- * both FDs are non-negative, non-zero dimensions, and distinct. After that
- * point, the HAL closes them on any error. If validation of the FD values
- * themselves fails (negative FD, zero dimensions, or `y_fd == uv_fd`), the
- * caller retains ownership.
- *
- * @param y_fd    DMA-BUF file descriptor for the Y (luma) plane
- * @param width   Image width in pixels
- * @param height  Image height in pixels
- * @param uv_fd   DMA-BUF file descriptor for the UV (chroma) plane
- * @param fourcc  Pixel format (must be HAL_FOURCC_NV12 or HAL_FOURCC_NV16)
- * @param out     Receives the new tensor handle on success
- * @return 0 on success, -1 on error (errno set)
- * @par Errors (errno):
- * - EINVAL: Invalid argument or unsupported fourcc
- * - EIO:    Failed to wrap DMA-BUF file descriptor
- */
-int hal_tensor_from_planes(int y_fd,
-                           uint32_t width,
-                           uint32_t height,
-                           int uv_fd,
-                           enum hal_fourcc fourcc,
-                           struct hal_tensor **out);
 
 /**
  * Load a JPEG image from memory.
  *
  * @param data Pointer to JPEG data
  * @param len Length of JPEG data in bytes
- * @param fourcc Output pixel format (HAL_FOURCC_RGB, HAL_FOURCC_RGBA, or HAL_FOURCC_GREY)
+ * @param format Output pixel format (HAL_PIXEL_FORMAT_RGB, HAL_PIXEL_FORMAT_RGBA, or HAL_PIXEL_FORMAT_GREY)
  * @param memory Memory allocation type
  * @return New tensor handle on success, NULL on error
  * @par Errors (errno):
@@ -1367,7 +1370,7 @@ int hal_tensor_from_planes(int y_fd,
  */
 struct hal_tensor *hal_tensor_load_jpeg(const uint8_t *data,
                                         size_t len,
-                                        enum hal_fourcc fourcc,
+                                        enum hal_pixel_format format,
                                         enum hal_tensor_memory memory);
 
 /**
@@ -1375,7 +1378,7 @@ struct hal_tensor *hal_tensor_load_jpeg(const uint8_t *data,
  *
  * @param data Pointer to PNG data
  * @param len Length of PNG data in bytes
- * @param fourcc Output pixel format (HAL_FOURCC_RGB, HAL_FOURCC_RGBA, or HAL_FOURCC_GREY)
+ * @param format Output pixel format (HAL_PIXEL_FORMAT_RGB, HAL_PIXEL_FORMAT_RGBA, or HAL_PIXEL_FORMAT_GREY)
  * @param memory Memory allocation type
  * @return New tensor handle on success, NULL on error
  * @par Errors (errno):
@@ -1385,7 +1388,7 @@ struct hal_tensor *hal_tensor_load_jpeg(const uint8_t *data,
  */
 struct hal_tensor *hal_tensor_load_png(const uint8_t *data,
                                        size_t len,
-                                       enum hal_fourcc fourcc,
+                                       enum hal_pixel_format format,
                                        enum hal_tensor_memory memory);
 
 /**
@@ -1421,9 +1424,9 @@ size_t hal_tensor_height(const struct hal_tensor *tensor);
  * Get the pixel format of an image tensor.
  *
  * @param tensor Image tensor handle
- * @return Pixel format, or HAL_FOURCC_RGB if tensor is NULL or not an image
+ * @return Pixel format, or HAL_PIXEL_FORMAT_RGB if tensor is NULL or not an image
  */
-enum hal_fourcc hal_tensor_fourcc(const struct hal_tensor *tensor);
+enum hal_pixel_format hal_tensor_pixel_format(const struct hal_tensor *tensor);
 
 /**
  * Attach pixel format metadata to a tensor.
@@ -1434,12 +1437,12 @@ enum hal_fourcc hal_tensor_fourcc(const struct hal_tensor *tensor);
  * destinations.
  *
  * @param tensor Tensor handle
- * @param fourcc Pixel format to attach (HAL_FOURCC_*)
+ * @param format Pixel format to attach (HAL_PIXEL_FORMAT_*)
  * @return 0 on success, -1 on error
  * @par Errors (errno):
  * - EINVAL: NULL tensor or shape doesn't match format layout
  */
-int hal_tensor_set_format(struct hal_tensor *tensor, enum hal_fourcc fourcc);
+int hal_tensor_set_format(struct hal_tensor *tensor, enum hal_pixel_format format);
 
 /**
  * Check if an image tensor uses a planar pixel format.
@@ -1465,13 +1468,18 @@ bool hal_tensor_is_planar(const struct hal_tensor *tensor);
 size_t hal_tensor_channels(const struct hal_tensor *tensor);
 
 /**
- * Get the row stride of an image tensor in bytes.
+ * Get the effective row stride of an image tensor in bytes.
  *
- * For planar formats this is equal to the width. For interleaved formats
- * this is width * channels.
+ * If an explicit stride was set (e.g. via `hal_plane_descriptor_set_stride`),
+ * that value is returned. Otherwise the minimum stride is computed from the
+ * format, width, and element size: `width * channels * element_size` for
+ * packed formats, `width * element_size` for planar/semi-planar.
  *
  * @param tensor Image tensor handle
- * @return Row stride in bytes, or 0 if tensor is NULL or not an image
+ * @return Effective row stride in bytes: the explicit stride if set, or the
+ *         minimum stride computed from format, width, and element size.
+ *         Returns 0 only when no pixel format is set (and no explicit stride
+ *         was stored) or tensor is NULL.
  */
 size_t hal_tensor_row_stride(const struct hal_tensor *tensor);
 
@@ -1507,6 +1515,30 @@ struct hal_image_processor *hal_image_processor_new_with_backend(enum hal_comput
  * Convert an image to a different format/size.
  *
  * Performs format conversion, scaling, rotation, flip, and crop operations.
+ * When the OpenGL backend is active, the function issues a `glFinish()` before
+ * returning, guaranteeing that all GPU reads of `src` and writes to `dst` are
+ * complete. The caller must not write to the `src` DMA-BUF while this function
+ * is in progress.
+ *
+ * **EGL image cache**: The OpenGL backend maintains separate LRU caches for
+ * source and destination EGLImages, keyed by the tensor's `BufferIdentity.id`.
+ * Reusing the same tensor objects across frames yields cache hits on both
+ * sides; creating new tensors from the same fds every frame yields cache
+ * misses. See `hal_tensor_from_fd()` and `hal_import_image()` for
+ * details on `BufferIdentity` assignment.
+ *
+ * **Content updates between calls**: Because EGLImage is a handle to live
+ * physical memory, content written into a DMA-BUF between calls (e.g., by a
+ * video decoder) is visible to the GPU on the next call. The EGL image and
+ * tensor wrapper remain valid and do not need to be recreated.
+ *
+ * **Chaining convert() calls**: It is safe to chain calls where the `dst` of
+ * one call becomes the `src` of the next (e.g., NV12 → RGBA → PlanarRgb).
+ * The `glFinish()` issued at the end of each call ensures GPU coherency.
+ * The same DMA-BUF used as both `dst` in one call and `src` in the next will
+ * have two separate EGLImage cache entries (one per cache) without collision.
+ * In-place conversion where `src` and `dst` are the same tensor in a single
+ * call is undefined behavior.
  *
  * @param processor Image processor handle
  * @param src Source image tensor
@@ -1575,7 +1607,7 @@ int hal_image_processor_set_class_colors(struct hal_image_processor *processor,
  * @param processor Image processor handle
  * @param width Image width in pixels
  * @param height Image height in pixels
- * @param fourcc Pixel format (HAL_FOURCC_*)
+ * @param format Pixel format (HAL_PIXEL_FORMAT_*)
  * @param dtype Data type of tensor elements (HAL_DTYPE_*)
  * @return New tensor handle on success, NULL on error
  * @par Errors (errno):
@@ -1587,46 +1619,100 @@ int hal_image_processor_set_class_colors(struct hal_image_processor *processor,
 struct hal_tensor *hal_image_processor_create_image(struct hal_image_processor *processor,
                                                     size_t width,
                                                     size_t height,
-                                                    enum hal_fourcc fourcc,
+                                                    enum hal_pixel_format format,
                                                     enum hal_dtype dtype);
 
 /**
- * Create an image tensor backed by an external DMA-BUF file descriptor.
+ * Create a new plane descriptor by duplicating a DMA-BUF file descriptor.
  *
- * The GPU renders directly into this buffer via EGL DMA-BUF import —
- * no CPU copy is needed after hal_image_processor_convert(). The caller
- * retains ownership of the underlying buffer; the returned tensor borrows
- * it via dup(fd).
+ * The fd is `dup()`'d immediately — the caller retains ownership of the
+ * original fd. A bad fd will cause this call to fail.
  *
- * @param processor Image processor handle
  * @param fd DMA-BUF file descriptor (caller retains ownership)
- * @param width Image width in pixels
- * @param height Image height in pixels
- * @param fourcc Pixel format (HAL_FOURCC_*)
- * @param dtype Data type of tensor elements (HAL_DTYPE_*)
- * @return New tensor handle on success, NULL on error
+ * @return New plane descriptor handle on success, NULL on error
  * @par Errors (errno):
- * - EINVAL: Invalid argument (NULL processor, zero dimensions, bad fd,
- *   invalid image shape, or not an image)
- * - ENOTSUP: Not supported on this platform
- * - EIO: Underlying I/O error or unexpected internal failure
+ * - EINVAL: fd is negative
+ * - EMFILE/ENFILE: fd dup failed (fd limit reached)
+ * - EIO: other dup failure
  */
-struct hal_tensor *hal_image_processor_create_image_from_fd(struct hal_image_processor *processor,
-                                                            int fd,
-                                                            size_t width,
-                                                            size_t height,
-                                                            enum hal_fourcc fourcc,
-                                                            enum hal_dtype dtype);
+struct hal_plane_descriptor *hal_plane_descriptor_new(int fd);
 
 /**
- * Create image from fd stub for non-Linux platforms.
+ * Free a plane descriptor.
+ *
+ * Only call this if the descriptor was NOT consumed by `hal_import_image()`.
+ * Passing NULL is a safe no-op.
+ *
+ * @param pd Plane descriptor handle to free (can be NULL)
  */
-struct hal_tensor *hal_image_processor_create_image_from_fd(struct hal_image_processor *processor,
-                                                            int fd,
-                                                            size_t width,
-                                                            size_t height,
-                                                            enum hal_fourcc fourcc,
-                                                            enum hal_dtype dtype);
+void hal_plane_descriptor_free(struct hal_plane_descriptor *pd);
+
+/**
+ * Set the row stride (bytes per row) on a plane descriptor.
+ *
+ * Only needed when the external buffer has row padding. If not set,
+ * the buffer is assumed tightly packed.
+ *
+ * @note The caller is responsible for ensuring the DMA-BUF allocation
+ * is large enough for the given stride, height, and pixel format.
+ * No buffer-size validation is performed because external DMA-BUF sizes
+ * are not reliably queryable; an incorrect stride is caught by the EGL
+ * driver at import time.
+ *
+ * @param pd     Plane descriptor handle
+ * @param stride Row stride in bytes (must be > 0)
+ * @return 0 on success, -1 on error
+ * @par Errors (errno):
+ * - EINVAL: NULL pd, stride is zero, or descriptor already consumed
+ */
+int hal_plane_descriptor_set_stride(struct hal_plane_descriptor *pd, size_t stride);
+
+/**
+ * Set the byte offset within the DMA-BUF where image data starts.
+ *
+ * @param pd     Plane descriptor handle
+ * @param offset Byte offset
+ * @return 0 on success, -1 on error
+ * @par Errors (errno):
+ * - EINVAL: NULL pd or descriptor already consumed
+ */
+int hal_plane_descriptor_set_offset(struct hal_plane_descriptor *pd, size_t offset);
+
+/**
+ * Import an external DMA-BUF image using plane descriptors.
+ *
+ * Both plane descriptors are **always consumed** by this call, whether it
+ * succeeds or fails — do NOT call `hal_plane_descriptor_free()` on them
+ * after calling `hal_import_image()`.
+ *
+ * The `chroma` parameter is NULL for single-plane formats. For multiplane
+ * NV12, pass a second descriptor for the UV plane.
+ *
+ * @note The caller must ensure the DMA-BUF allocation is large enough for
+ * the specified width, height, format, and any stride/offset set on the
+ * plane descriptors. No buffer-size validation is performed; an
+ * undersized buffer may cause GPU faults or EGL import failure.
+ *
+ * @param processor Image processor handle
+ * @param image     Plane descriptor for the primary (Y or only) plane (consumed)
+ * @param chroma    Plane descriptor for the UV chroma plane, or NULL (consumed)
+ * @param width     Image width in pixels
+ * @param height    Image height in pixels
+ * @param format    Pixel format (HAL_PIXEL_FORMAT_*)
+ * @param dtype     Data type (HAL_DTYPE_*)
+ * @return New tensor handle on success (free with `hal_tensor_free()`), NULL on error
+ * @par Errors (errno):
+ * - EINVAL: NULL processor/image, zero dimensions, consumed descriptor
+ * - EIO:    Failed to create tensor
+ * - ENOTSUP: Not supported on this platform or format not supported
+ */
+struct hal_tensor *hal_import_image(struct hal_image_processor *processor,
+                                    struct hal_plane_descriptor *image,
+                                    struct hal_plane_descriptor *chroma,
+                                    size_t width,
+                                    size_t height,
+                                    enum hal_pixel_format format,
+                                    enum hal_dtype dtype);
 
 /**
  * Free an image processor.
@@ -1735,27 +1821,34 @@ struct hal_tensor *hal_tensor_new(enum hal_dtype dtype,
 /**
  * Create a new tensor from an existing file descriptor (Linux only).
  *
- * Takes ownership of the file descriptor - caller must NOT close it.
+ * The fd is duplicated internally — the caller retains ownership of the
+ * original fd and must close it when done. This is consistent with all
+ * other fd-accepting APIs in this library.
+ *
+ * **EGL image cache interaction**: Each call to this function allocates a
+ * new `BufferIdentity` with a globally unique ID. The OpenGL backend uses
+ * `(BufferIdentity.id, chroma_id)` as the EGL image cache key, so a new
+ * tensor object created from the same underlying fd will always produce a
+ * cache miss. To benefit from EGL image cache hits across frames, reuse the
+ * same tensor object — do not recreate it from the fd every frame.
+ *
+ * **Live-memory semantics**: When the underlying DMA-BUF contains new frame
+ * data (e.g., written by a V4L2 decoder), the tensor wrapper remains valid
+ * — EGLImage is a handle to physical memory, not a snapshot. Content updates
+ * written to the DMA-BUF between `convert()` calls are visible to the GPU on
+ * the next call, provided the caller does not write to the buffer while a
+ * `convert()` is in progress.
  *
  * @param dtype Data type of tensor elements (HAL_DTYPE_*)
- * @param fd File descriptor for DMA/SHM buffer (ownership transferred)
+ * @param fd File descriptor for DMA/SHM buffer (caller retains ownership)
  * @param shape Array of dimension sizes (ndim elements)
  * @param ndim Number of dimensions (1-8)
  * @param name Optional tensor name for debugging (can be NULL)
  * @return New tensor handle on success, NULL on error
  * @par Errors (errno):
  * - EINVAL: Invalid argument (NULL shape, ndim is 0, invalid fd)
- * - ENOMEM: Memory allocation failed
+ * - EIO: Failed to duplicate fd or create tensor
  * - ENOTSUP: Not supported on this platform (non-Unix)
- */
-struct hal_tensor *hal_tensor_from_fd(enum hal_dtype dtype,
-                                      int fd,
-                                      const size_t *shape,
-                                      size_t ndim,
-                                      const char *name);
-
-/**
- * Create a new tensor from an existing file descriptor (stub for non-Unix).
  */
 struct hal_tensor *hal_tensor_from_fd(enum hal_dtype dtype,
                                       int fd,
@@ -1848,11 +1941,6 @@ size_t hal_tensor_size(const struct hal_tensor *tensor);
 int hal_tensor_clone_fd(const struct hal_tensor *tensor);
 
 /**
- * Clone file descriptor stub for non-Unix platforms.
- */
-int hal_tensor_clone_fd(const struct hal_tensor *tensor);
-
-/**
  * Clone the DMA-BUF file descriptor backing a tensor.
  *
  * Unlike hal_tensor_clone_fd(), this function returns a clear error if the
@@ -1867,11 +1955,6 @@ int hal_tensor_clone_fd(const struct hal_tensor *tensor);
  * - EINVAL: NULL tensor
  * - ENOTSUP: Tensor is not DMA-backed (Mem, Shm, or Pbo)
  * - EIO: Failed to clone file descriptor
- */
-int hal_tensor_dmabuf_clone(const struct hal_tensor *tensor);
-
-/**
- * Clone DMA-BUF fd stub for non-Linux platforms.
  */
 int hal_tensor_dmabuf_clone(const struct hal_tensor *tensor);
 
@@ -1899,7 +1982,8 @@ int hal_tensor_reshape(struct hal_tensor *tensor, const size_t *shape, size_t nd
  * @param tensor Tensor handle
  * @return Tensor map handle on success, NULL on error
  * @par Errors (errno):
- * - EINVAL: NULL tensor
+ * - EINVAL: NULL tensor, or tensor has non-zero row stride or plane offset
+ *   (CPU mapping of padded buffers is not supported)
  * - EIO: Failed to map tensor memory
  */
 struct hal_tensor_map *hal_tensor_map_create(const struct hal_tensor *tensor);

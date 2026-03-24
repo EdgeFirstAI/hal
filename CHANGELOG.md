@@ -7,34 +7,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-03-24
+
+### Added
+
+- **Row stride and plane offset for DMA-BUF tensors** — tensors from
+  `import_image` now carry per-plane stride and offset metadata, propagated
+  end-to-end into EGL `DMA_BUF_PLANE*_PITCH` / `PLANE*_OFFSET` attributes.
+  This enables correct GPU rendering of V4L2 buffers with row padding
+  (e.g. `bytesperline=2048` on a 1920-wide frame). New APIs:
+
+  | Layer | New APIs |
+  |-------|----------|
+  | Rust | `set_row_stride()`, `with_row_stride()`, `effective_row_stride()`, `set_plane_offset()`, `plane_offset()` |
+  | C | `hal_plane_descriptor_set_stride()`, `hal_plane_descriptor_set_offset()`, `hal_tensor_row_stride()` |
+  | Python | `import_image(..., stride=, offset=, chroma_stride=, chroma_offset=)` |
+
+  Changing the pixel format to a different value via `set_format()` clears
+  stored stride and offset; re-setting the same format preserves both.
+  `Tensor::map()` rejects strided or offset tensors to prevent incorrect
+  CPU access on padded buffers.
+
+- **VYUY pixel format** (`PixelFormat::Vyuy`) — packed YUV 4:2:2 with VYUY
+  byte order. Available in Rust, C (`HAL_PIXEL_FORMAT_VYUY`), and Python.
+  Note: EGL DMA-BUF import produces incorrect output on Vivante (~0.28
+  SSIM); the GL backend auto-falls back to the CPU/G2D path for this format.
+
+- **Software OpenGL renderer rejection** — the GL backend detects
+  llvmpipe/softpipe/swrast at init and returns `Error::NotSupported`,
+  causing the auto-detection fallback chain to select CPU or G2D instead.
+
+- **GL thread panic safety** — the OpenGL worker thread now wraps all
+  message handlers in `catch_unwind`. A caught panic sets a `poisoned` flag;
+  all subsequent GL calls return `Error::Internal` instead of hanging.
+
+- **C API preprocessing benchmark** (`bench_preproc.c`) — reference for
+  GStreamer/V4L2 integrators covering seven DMA-BUF import patterns, a
+  format conversion matrix, and a two-stage chained pipeline.
+
+### Removed
+
+- **`hal_tensor_from_planes()`** — use `hal_import_image()` with separate
+  `hal_plane_descriptor_new()` descriptors instead. The new API supports
+  per-plane stride/offset and is processor-aware (EGL cache compatible).
+
+### Changed
+
+- **Contiguous NV12 UV offset is stride-aware** — the UV plane byte offset
+  for single-fd NV12 is now `effective_row_stride() * height` instead of
+  `width * height`, fixing corrupted chroma on padded buffers.
+
+- **Multiplane `import_image` rejects unsupported dtypes** — only `U8` and
+  `I8` are valid for multiplane NV12 imports; other dtypes return
+  `Error::NotSupported` instead of silently producing a wrong-type tensor.
+
+### Fixed
+
+- **NV12 UV sampling incorrect for padded buffers** — V4L2 buffers with
+  stride > width caused corrupted chroma because the UV plane offset passed
+  to EGL was computed from width, not from the actual stride.
+
+- **`hal_import_image` double-free** — passing the same pointer as both
+  `image` and `chroma` caused UB. Now returns `EINVAL`.
+
 ## [0.11.0] - 2026-03-22
 
 ### Added
 
-- **Zero-copy external buffer rendering** (`create_image_from_fd`) across
-  Rust, C, and Python APIs. Enables GPU rendering directly into a
-  caller-owned DMA-BUF — eliminating the `memcpy` between HAL's output
-  buffer and an NPU delegate's input buffer. The caller retains ownership
-  of the fd; HAL borrows it via `dup(fd)`.
+- **Zero-copy external buffer import** (`import_image`) across Rust, C,
+  and Python APIs. Enables GPU rendering directly into a caller-owned
+  DMA-BUF — eliminating the `memcpy` between HAL's output buffer and an
+  NPU delegate's input buffer. Supports per-plane stride and offset for
+  padded allocators (V4L2, GStreamer). The caller retains ownership of
+  the fd; HAL borrows it via `dup(fd)`.
 
   **Rust:**
   ```rust,ignore
-  let mut dst = processor.create_image_from_fd(
-      vx_fd.as_fd(), 640, 640, PixelFormat::Rgb, DType::U8,
-  )?;
+  use edgefirst_tensor::PlaneDescriptor;
+  let pd = PlaneDescriptor::new(vx_fd.as_fd())?.with_stride(bytesperline);
+  let mut dst = processor.import_image(pd, None, 640, 640, PixelFormat::Rgb, DType::U8)?;
   processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::letterbox())?;
   ```
 
   **Python:**
   ```python
-  dst = processor.create_image_from_fd(vx_fd, 640, 640, ef.PixelFormat.Rgb)
+  dst = processor.import_image(vx_fd, 640, 640, ef.PixelFormat.Rgb, stride=bytesperline)
   processor.convert(src, dst)
   ```
 
   **C:**
   ```c
-  struct hal_tensor *dst = hal_image_processor_create_image_from_fd(
-      proc, vx_fd, 640, 640, HAL_FOURCC_RGB, HAL_DTYPE_U8);
+  struct hal_plane_descriptor *pd = hal_plane_descriptor_new(vx_fd);
+  hal_plane_descriptor_set_stride(pd, bytesperline);
+  struct hal_tensor *dst = hal_import_image(proc, pd, NULL,
+                                             640, 640,
+                                             HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8);
   ```
 
   Returns `Error::NotSupported` if the fd is not DMA-backed (e.g. POSIX
@@ -72,15 +139,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   safety bugs (use-after-free in v0.9, unsound `ptr::read`/`ManuallyDrop` in
   v0.10.0). Callers should use:
   ```c
-  hal_tensor_set_format(dst, fourcc);
+  hal_tensor_set_format(dst, format);
   hal_image_processor_convert(proc, src, dst, rotation, flip, crop);
   ```
 
 ### Fixed
 
-- Corrected errno documentation for `hal_image_processor_create_image_from_fd`
-  in both Rust doc comments and `hal.h` header: `InvalidShape` / `NotAnImage`
-  map to `EINVAL` (not `EIO`)
+- Corrected errno mapping for `hal_import_image`: `InvalidShape` / `NotAnImage`
+  and `Tensor(InvalidArgument/InvalidShape/ShapeMismatch)` map to `EINVAL`
+  (not `EIO`); `UnsupportedFormat` / `NotSupported` map to `ENOTSUP`
 
 ## [0.10.0] - 2026-03-20
 
@@ -92,7 +159,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `TensorImage.load()` → `Tensor.load()`; `FourCC` → `PixelFormat`
   - **C**: `hal_tensor_image_*` functions replaced by `hal_tensor_*` equivalents
     (e.g., `hal_tensor_new_image()`, `hal_tensor_load_image()`,
-    `hal_tensor_width()`, `hal_tensor_fourcc()`);
+    `hal_tensor_width()`, `hal_tensor_pixel_format()`);
     `HalTensorImage` removed — use `HalTensor` for all tensors
   - **Rust**: `TensorDyn` is the unified type-erased tensor;
     `PyTensor` and `HalTensor` now wrap `TensorDyn` directly
