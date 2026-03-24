@@ -41,6 +41,12 @@ pub enum HalPixelFormat {
     /// 8-bit BGRA (4 channels, blue first)
     Bgra = 8,
     /// 8-bit interleaved YUV422, limited range (VYUY byte order)
+    ///
+    /// @note On Vivante GPUs (i.MX 8M Plus), VYUY import uses a 2D texture
+    /// fallback instead of the EGL external texture path.  The HAL detects
+    /// this automatically; no caller action is needed.  Quality is validated
+    /// but may differ slightly from the external-texture path used on other
+    /// GPUs.
     Vyuy = 9,
 }
 
@@ -984,7 +990,13 @@ pub unsafe extern "C" fn hal_plane_descriptor_new(fd: c_int) -> *mut HalPlaneDes
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
     let pd = match edgefirst_tensor::PlaneDescriptor::new(borrowed) {
         Ok(pd) => pd,
-        Err(_) => return set_error_null(libc::EIO),
+        Err(e) => {
+            let code = match e {
+                edgefirst_tensor::Error::IoError(ref io) => io.raw_os_error().unwrap_or(libc::EIO),
+                _ => libc::EIO,
+            };
+            return set_error_null(code);
+        }
     };
     Box::into_raw(Box::new(HalPlaneDescriptor { inner: Some(pd) }))
 }
@@ -1175,11 +1187,12 @@ pub unsafe extern "C" fn hal_import_image(
     _format: HalPixelFormat,
     _dtype: HalDtype,
 ) -> *mut HalTensor {
+    let same_ptr = !_chroma.is_null() && std::ptr::eq(_chroma, _image);
     // Consume descriptors to uphold the "always consumed" contract.
     if !_image.is_null() {
         drop(unsafe { Box::from_raw(_image) });
     }
-    if !_chroma.is_null() {
+    if !_chroma.is_null() && !same_ptr {
         drop(unsafe { Box::from_raw(_chroma) });
     }
     set_error_null(libc::ENOTSUP)

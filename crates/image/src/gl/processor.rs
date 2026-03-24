@@ -3795,8 +3795,10 @@ impl GLProcessorST {
             } else {
                 // Contiguous: UV follows Y in same buffer.
                 // Use stride-aware offset — if Y has padding, UV starts
-                // at stride * height, not width * height.
-                (fd, plane0_pitch * height)
+                // at stride * height, not width * height.  Include the
+                // luma plane_offset so the UV base is correct when pixel
+                // data does not start at byte 0.
+                (fd, plane0_offset + plane0_pitch * height)
             };
             let plane1_pitch = if let Some(chroma) = src.chroma() {
                 // Multiplane: use chroma's explicit stride if set (via

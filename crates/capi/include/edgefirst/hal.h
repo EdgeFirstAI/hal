@@ -42,10 +42,8 @@ extern "C" {
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include "stdint.h"
-#include "stddef.h"
-#include "stdbool.h"
-#include "stdio.h"
+#include <stddef.h>
+#include <stdio.h>
 
 /**
  * Output type for model tensor outputs.
@@ -262,6 +260,12 @@ typedef enum hal_pixel_format {
   HAL_PIXEL_FORMAT_BGRA = 8,
   /**
    * 8-bit interleaved YUV422, limited range (VYUY byte order)
+   *
+   * @note On Vivante GPUs (i.MX 8M Plus), VYUY import uses a 2D texture
+   * fallback instead of the EGL external texture path.  The HAL detects
+   * this automatically; no caller action is needed.  Quality is validated
+   * but may differ slightly from the external-texture path used on other
+   * GPUs.
    */
   HAL_PIXEL_FORMAT_VYUY = 9,
 } hal_pixel_format;
@@ -465,16 +469,16 @@ typedef struct hal_decoder hal_decoder;
  * hal_decoder_params *params = hal_decoder_params_new();
  *
  * size_t scores_shape[] = {1, 80, 8400};
- * enum hal_dim_name scores_dims[] = {HAL_DIM_BATCH, HAL_DIM_NUM_CLASSES,
- *                                     HAL_DIM_NUM_BOXES};
- * int s = hal_decoder_params_add_output(params, HAL_OUTPUT_SCORES,
+ * enum hal_dim_name scores_dims[] = {HAL_DIM_NAME_BATCH, HAL_DIM_NAME_NUM_CLASSES,
+ *                                     HAL_DIM_NAME_NUM_BOXES};
+ * int s = hal_decoder_params_add_output(params, HAL_OUTPUT_TYPE_SCORES,
  *             HAL_DECODER_ULTRALYTICS, scores_shape, scores_dims, 3);
  * hal_decoder_params_output_set_quantization(params, s, 0.003906f, 0);
  *
  * size_t boxes_shape[] = {1, 4, 8400};
- * enum hal_dim_name boxes_dims[] = {HAL_DIM_BATCH, HAL_DIM_BOX_COORDS,
- *                                    HAL_DIM_NUM_BOXES};
- * int b = hal_decoder_params_add_output(params, HAL_OUTPUT_BOXES,
+ * enum hal_dim_name boxes_dims[] = {HAL_DIM_NAME_BATCH, HAL_DIM_NAME_BOX_COORDS,
+ *                                    HAL_DIM_NAME_NUM_BOXES};
+ * int b = hal_decoder_params_add_output(params, HAL_OUTPUT_TYPE_BOXES,
  *             HAL_DECODER_ULTRALYTICS, boxes_shape, boxes_dims, 3);
  * hal_decoder_params_output_set_quantization(params, b, 0.019824f, 0);
  *
@@ -801,9 +805,9 @@ int hal_decoder_params_set_config_file(struct hal_decoder_params *params, const 
  * @par Example
  * @code{.c}
  * size_t shape[] = {1, 80, 8400};
- * enum hal_dim_name dims[] = {HAL_DIM_BATCH, HAL_DIM_NUM_CLASSES,
- *                              HAL_DIM_NUM_BOXES};
- * int idx = hal_decoder_params_add_output(params, HAL_OUTPUT_SCORES,
+ * enum hal_dim_name dims[] = {HAL_DIM_NAME_BATCH, HAL_DIM_NAME_NUM_CLASSES,
+ *                              HAL_DIM_NAME_NUM_BOXES};
+ * int idx = hal_decoder_params_add_output(params, HAL_OUTPUT_TYPE_SCORES,
  *               HAL_DECODER_ULTRALYTICS, shape, dims, 3);
  * @endcode
  *
@@ -835,7 +839,7 @@ int hal_decoder_params_output_set_quantization(struct hal_decoder_params *params
 /**
  * Set anchor boxes on a detection output by index.
  *
- * Only valid for `HAL_OUTPUT_DETECTION` outputs.
+ * Only valid for `HAL_OUTPUT_TYPE_DETECTION` outputs.
  *
  * @param params      Params handle
  * @param index       Output index (returned by `hal_decoder_params_add_output`)
@@ -853,7 +857,7 @@ int hal_decoder_params_output_set_anchors(struct hal_decoder_params *params,
 /**
  * Set the normalized flag on a detection or boxes output by index.
  *
- * Only valid for `HAL_OUTPUT_DETECTION` and `HAL_OUTPUT_BOXES` outputs.
+ * Only valid for `HAL_OUTPUT_TYPE_DETECTION` and `HAL_OUTPUT_TYPE_BOXES` outputs.
  *
  * @param params     Params handle
  * @param index      Output index (returned by `hal_decoder_params_add_output`)
