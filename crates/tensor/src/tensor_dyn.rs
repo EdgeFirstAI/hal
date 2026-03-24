@@ -71,6 +71,8 @@ macro_rules! downcast_methods {
         }
 
         /// Unwraps the inner tensor if the type matches, otherwise returns `self` as `Err`.
+        /// The Err variant is necessarily large (returns the unconsumed TensorDyn).
+        #[allow(clippy::result_large_err)]
         pub fn $into_name(self) -> Result<Tensor<$ty>, Self> {
             match self {
                 Self::$variant(t) => Ok(t),
@@ -178,6 +180,47 @@ impl TensorDyn {
     pub fn with_format(mut self, format: PixelFormat) -> crate::Result<Self> {
         self.set_format(format)?;
         Ok(self)
+    }
+
+    /// Row stride in bytes (`None` = tightly packed).
+    pub fn row_stride(&self) -> Option<usize> {
+        dispatch!(self, row_stride)
+    }
+
+    /// Effective row stride: stored stride or computed from format and width.
+    pub fn effective_row_stride(&self) -> Option<usize> {
+        dispatch!(self, effective_row_stride)
+    }
+
+    /// Set the row stride in bytes for externally allocated buffers with
+    /// row padding.
+    ///
+    /// Must be called before the tensor is first used for rendering. The
+    /// format must be set before calling this method.
+    pub fn set_row_stride(&mut self, stride: usize) -> crate::Result<()> {
+        dispatch!(self, set_row_stride, stride)
+    }
+
+    /// Builder-style: set row stride, consuming and returning self.
+    pub fn with_row_stride(mut self, stride: usize) -> crate::Result<Self> {
+        self.set_row_stride(stride)?;
+        Ok(self)
+    }
+
+    /// Byte offset within the DMA-BUF where image data starts (`None` = 0).
+    pub fn plane_offset(&self) -> Option<usize> {
+        dispatch!(self, plane_offset)
+    }
+
+    /// Set the byte offset within the DMA-BUF where image data starts.
+    pub fn set_plane_offset(&mut self, offset: usize) {
+        dispatch!(self, set_plane_offset, offset)
+    }
+
+    /// Builder-style: set plane offset, consuming and returning self.
+    pub fn with_plane_offset(mut self, offset: usize) -> Self {
+        self.set_plane_offset(offset);
+        self
     }
 
     /// Clone the file descriptor associated with this tensor.
@@ -553,5 +596,230 @@ mod tests {
         assert_eq!(t.format(), Some(PixelFormat::Rgb));
         assert_eq!(t.width(), Some(640));
         assert_eq!(t.height(), Some(480));
+    }
+
+    // --- Row stride tests ---
+
+    #[test]
+    fn set_row_stride_valid() {
+        // RGBA 100px wide: min stride = 400, set 512
+        let mut t = TensorDyn::image(100, 100, PixelFormat::Rgba, DType::U8, None).unwrap();
+        t.set_row_stride(512).unwrap();
+        assert_eq!(t.row_stride(), Some(512));
+        assert_eq!(t.effective_row_stride(), Some(512));
+    }
+
+    #[test]
+    fn set_row_stride_equals_min() {
+        // RGB 100px: min stride = 300, set exactly 300
+        let mut t = TensorDyn::image(100, 100, PixelFormat::Rgb, DType::U8, None).unwrap();
+        t.set_row_stride(300).unwrap();
+        assert_eq!(t.row_stride(), Some(300));
+    }
+
+    #[test]
+    fn set_row_stride_too_small() {
+        // RGBA 100px: min stride = 400, set 300
+        let mut t = TensorDyn::image(100, 100, PixelFormat::Rgba, DType::U8, None).unwrap();
+        assert!(t.set_row_stride(300).is_err());
+        assert_eq!(t.row_stride(), None);
+    }
+
+    #[test]
+    fn set_row_stride_zero() {
+        let mut t = TensorDyn::image(100, 100, PixelFormat::Rgb, DType::U8, None).unwrap();
+        assert!(t.set_row_stride(0).is_err());
+    }
+
+    #[test]
+    fn set_row_stride_requires_format() {
+        let mut t = TensorDyn::new(&[480, 640, 3], DType::U8, None, None).unwrap();
+        assert!(t.set_row_stride(2048).is_err());
+    }
+
+    #[test]
+    fn effective_row_stride_without_stride() {
+        let t = TensorDyn::image(100, 100, PixelFormat::Rgb, DType::U8, None).unwrap();
+        assert_eq!(t.row_stride(), None);
+        assert_eq!(t.effective_row_stride(), Some(300)); // 100 * 3
+    }
+
+    #[test]
+    fn effective_row_stride_no_format() {
+        let t = TensorDyn::new(&[480, 640, 3], DType::U8, None, None).unwrap();
+        assert_eq!(t.effective_row_stride(), None);
+    }
+
+    #[test]
+    fn with_row_stride_builder() {
+        let t = TensorDyn::image(100, 100, PixelFormat::Rgba, DType::U8, None)
+            .unwrap()
+            .with_row_stride(512)
+            .unwrap();
+        assert_eq!(t.row_stride(), Some(512));
+        assert_eq!(t.effective_row_stride(), Some(512));
+    }
+
+    #[test]
+    fn with_row_stride_rejects_small() {
+        let result = TensorDyn::image(100, 100, PixelFormat::Rgba, DType::U8, None)
+            .unwrap()
+            .with_row_stride(200);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn set_format_clears_row_stride() {
+        let mut t = TensorDyn::new(&[480, 640, 3], DType::U8, None, None).unwrap();
+        t.set_format(PixelFormat::Rgb).unwrap();
+        t.set_row_stride(2048).unwrap();
+        assert_eq!(t.row_stride(), Some(2048));
+
+        // Incompatible format change (4-chan on 3-chan shape) fails — stride preserved
+        let _ = t.set_format(PixelFormat::Bgra);
+        assert_eq!(t.row_stride(), Some(2048));
+
+        // Re-set to same format — stride preserved
+        t.set_format(PixelFormat::Rgb).unwrap();
+        assert_eq!(t.row_stride(), Some(2048));
+
+        // Reshape clears format and stride
+        t.reshape(&[480 * 640 * 3]).unwrap();
+        assert_eq!(t.row_stride(), None);
+        assert_eq!(t.format(), None);
+    }
+
+    #[test]
+    fn set_format_different_compatible_clears_stride() {
+        // RGBA and BGRA are both 4-channel packed — switching between them
+        // succeeds and must clear the stored stride.
+        let mut t = TensorDyn::new(&[480, 640, 4], DType::U8, None, None).unwrap();
+        t.set_format(PixelFormat::Rgba).unwrap();
+        t.set_row_stride(4096).unwrap();
+        assert_eq!(t.row_stride(), Some(4096));
+
+        // Successful format change to a different compatible format clears stride
+        t.set_format(PixelFormat::Bgra).unwrap();
+        assert_eq!(t.format(), Some(PixelFormat::Bgra));
+        assert_eq!(t.row_stride(), None);
+    }
+
+    #[test]
+    fn set_format_same_preserves_stride() {
+        let mut t = TensorDyn::image(100, 100, PixelFormat::Rgb, DType::U8, None).unwrap();
+        t.set_row_stride(512).unwrap();
+        // Re-setting the same format should not clear stride
+        t.set_format(PixelFormat::Rgb).unwrap();
+        assert_eq!(t.row_stride(), Some(512));
+    }
+
+    #[test]
+    fn effective_row_stride_planar() {
+        let t = TensorDyn::image(640, 480, PixelFormat::PlanarRgb, DType::U8, None).unwrap();
+        assert_eq!(t.effective_row_stride(), Some(640)); // planar: width only
+    }
+
+    #[test]
+    fn effective_row_stride_nv12() {
+        let t = TensorDyn::image(640, 480, PixelFormat::Nv12, DType::U8, None).unwrap();
+        assert_eq!(t.effective_row_stride(), Some(640)); // semi-planar: width only
+    }
+
+    #[test]
+    fn map_rejects_strided_tensor() {
+        let mut t =
+            Tensor::<u8>::image(100, 100, PixelFormat::Rgba, Some(TensorMemory::Mem)).unwrap();
+        // Map works before stride is set
+        assert!(t.map().is_ok());
+        // After setting stride, map should be rejected
+        t.set_row_stride(512).unwrap();
+        let err = t.map();
+        assert!(err.is_err());
+    }
+
+    // ── plane_offset tests ──────────────────────────────────────────
+
+    #[test]
+    fn plane_offset_default_none() {
+        let t = TensorDyn::image(100, 100, PixelFormat::Rgba, DType::U8, None).unwrap();
+        assert_eq!(t.plane_offset(), None);
+    }
+
+    #[test]
+    fn set_plane_offset_basic() {
+        let mut t = TensorDyn::image(100, 100, PixelFormat::Rgba, DType::U8, None).unwrap();
+        t.set_plane_offset(4096);
+        assert_eq!(t.plane_offset(), Some(4096));
+    }
+
+    #[test]
+    fn set_plane_offset_zero() {
+        let mut t = TensorDyn::image(100, 100, PixelFormat::Rgb, DType::U8, None).unwrap();
+        t.set_plane_offset(0);
+        assert_eq!(t.plane_offset(), Some(0));
+    }
+
+    #[test]
+    fn set_plane_offset_no_format() {
+        // plane_offset does not require format (it is format-independent)
+        let mut t = TensorDyn::new(&[480, 640, 3], DType::U8, None, None).unwrap();
+        t.set_plane_offset(4096);
+        assert_eq!(t.plane_offset(), Some(4096));
+    }
+
+    #[test]
+    fn with_plane_offset_builder() {
+        let t = TensorDyn::image(100, 100, PixelFormat::Rgba, DType::U8, None)
+            .unwrap()
+            .with_plane_offset(8192);
+        assert_eq!(t.plane_offset(), Some(8192));
+    }
+
+    #[test]
+    fn set_format_clears_plane_offset() {
+        let mut t = TensorDyn::new(&[480, 640, 3], DType::U8, None, None).unwrap();
+        t.set_format(PixelFormat::Rgb).unwrap();
+        t.set_plane_offset(4096);
+        assert_eq!(t.plane_offset(), Some(4096));
+
+        // Re-set same format — offset preserved
+        t.set_format(PixelFormat::Rgb).unwrap();
+        assert_eq!(t.plane_offset(), Some(4096));
+
+        // Reshape clears everything
+        t.reshape(&[480 * 640 * 3]).unwrap();
+        assert_eq!(t.plane_offset(), None);
+        assert_eq!(t.format(), None);
+    }
+
+    #[test]
+    fn map_rejects_offset_tensor() {
+        let mut t =
+            Tensor::<u8>::image(100, 100, PixelFormat::Rgba, Some(TensorMemory::Mem)).unwrap();
+        // Map works before offset is set
+        assert!(t.map().is_ok());
+        // After setting non-zero offset, map should be rejected
+        t.set_plane_offset(4096);
+        assert!(t.map().is_err());
+    }
+
+    #[test]
+    fn map_accepts_zero_offset_tensor() {
+        let mut t =
+            Tensor::<u8>::image(100, 100, PixelFormat::Rgba, Some(TensorMemory::Mem)).unwrap();
+        t.set_plane_offset(0);
+        // Zero offset is fine for CPU mapping
+        assert!(t.map().is_ok());
+    }
+
+    #[test]
+    fn from_planes_propagates_plane_offset() {
+        let mut luma =
+            Tensor::<u8>::new(&[480, 640], Some(TensorMemory::Mem), Some("luma")).unwrap();
+        luma.set_plane_offset(4096);
+        let chroma =
+            Tensor::<u8>::new(&[240, 640], Some(TensorMemory::Mem), Some("chroma")).unwrap();
+        let combined = Tensor::<u8>::from_planes(luma, chroma, PixelFormat::Nv12).unwrap();
+        assert_eq!(combined.plane_offset(), Some(4096));
     }
 }

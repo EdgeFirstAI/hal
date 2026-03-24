@@ -10,6 +10,7 @@
 #   make test_tensor  - Build and run tensor tests only
 #   make clean        - Clean build artifacts
 #   make valgrind     - Run tests with valgrind (memory check)
+#   make bench        - Build and run preprocessing benchmark
 
 # Directories
 CAPI_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))..
@@ -78,6 +79,9 @@ TEST_IMAGE := $(BUILD_DIR)/test_image
 TEST_DECODER := $(BUILD_DIR)/test_decoder
 TEST_TRACKER := $(BUILD_DIR)/test_tracker
 
+# Benchmark executables
+BENCH_PREPROC := $(BUILD_DIR)/bench_preproc
+
 # Default target
 .PHONY: all
 all: $(TEST_ALL)
@@ -115,6 +119,19 @@ $(TEST_DECODER): $(BUILD_DIR)/test_decoder_standalone.o
 
 $(TEST_TRACKER): $(BUILD_DIR)/test_tracker_standalone.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS) $(LIBS)
+
+# Benchmark executable (standalone, does not use test_common.h)
+$(BENCH_PREPROC): bench_preproc.c | $(BUILD_DIR) check-lib
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS) $(LIBS)
+
+# Run preprocessing benchmark
+.PHONY: bench
+bench: $(BENCH_PREPROC)
+	@echo "Running EdgeFirst HAL C API preprocessing benchmark..."
+	@echo "Library: $(LIB_DIR)"
+	@echo "Platform: $(UNAME_S) $(UNAME_M)"
+	@echo ""
+	$(BENCH_PREPROC)
 
 # Run all tests
 .PHONY: test

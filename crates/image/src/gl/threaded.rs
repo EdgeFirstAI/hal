@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use edgefirst_decoder::{DetectBox, ProtoData, Segmentation};
+use std::panic::AssertUnwindSafe;
 use std::ptr::NonNull;
 use std::thread::JoinHandle;
 use tokio::sync::mpsc::{Sender, WeakSender};
@@ -147,6 +148,17 @@ struct SendablePtr<T: Send> {
 
 unsafe impl<T> Send for SendablePtr<T> where T: Send {}
 
+/// Extract a human-readable message from a `catch_unwind` panic payload.
+fn panic_message(info: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = info.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = info.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
 impl GLProcessorThreaded {
     /// Creates a new OpenGL multi-threaded image converter.
     pub fn new(kind: Option<EglDisplayKind>) -> Result<Self, Error> {
@@ -163,41 +175,142 @@ impl GLProcessorThreaded {
                 }
             };
             let _ = create_ctx_send.send(Ok(gl_converter.gl_context.transfer_backend));
+            let mut poisoned = false;
             while let Some(msg) = recv.blocking_recv() {
+                // After a panic, the GL context is in an undefined state. Reject
+                // all subsequent messages with an error rather than risking wrong
+                // output or a GPU hang from corrupted GL state. This follows the
+                // same pattern as std::sync::Mutex poisoning.
+                if poisoned {
+                    let poison_err = crate::Error::Internal(
+                        "GL context is poisoned after a prior panic".to_string(),
+                    );
+                    match msg {
+                        GLProcessorMessage::ImageConvert(.., resp) => {
+                            let _ = resp.send(Err(poison_err));
+                        }
+                        GLProcessorMessage::DrawMasks(.., resp) => {
+                            let _ = resp.send(Err(poison_err));
+                        }
+                        GLProcessorMessage::DrawMasksProto(.., resp) => {
+                            let _ = resp.send(Err(poison_err));
+                        }
+                        GLProcessorMessage::SetColors(_, resp) => {
+                            let _ = resp.send(Err(poison_err));
+                        }
+                        GLProcessorMessage::SetInt8Interpolation(_, resp) => {
+                            let _ = resp.send(Err(poison_err));
+                        }
+                        GLProcessorMessage::DecodeMasksAtlas(.., resp) => {
+                            let _ = resp.send(Err(poison_err));
+                        }
+                        GLProcessorMessage::PboCreate(_, resp) => {
+                            let _ = resp.send(Err(poison_err));
+                        }
+                        GLProcessorMessage::PboMap(_, _, resp) => {
+                            let _ = resp.send(Err(poison_err));
+                        }
+                        GLProcessorMessage::PboUnmap(_, resp) => {
+                            let _ = resp.send(Err(poison_err));
+                        }
+                        GLProcessorMessage::PboDelete(_) => {}
+                    }
+                    continue;
+                }
+
                 match msg {
                     GLProcessorMessage::ImageConvert(src, mut dst, rotation, flip, crop, resp) => {
                         // SAFETY: This is safe because the convert() function waits for the resp to
                         // be sent before dropping the borrow for src and dst
-                        let src = unsafe { src.ptr.as_ref() };
-                        let dst = unsafe { dst.ptr.as_mut() };
-                        let res = gl_converter.convert(src, dst, rotation, flip, crop);
-                        let _ = resp.send(res);
+                        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                            let src = unsafe { src.ptr.as_ref() };
+                            let dst = unsafe { dst.ptr.as_mut() };
+                            gl_converter.convert(src, dst, rotation, flip, crop)
+                        }));
+                        let _ = resp.send(match result {
+                            Ok(res) => res,
+                            Err(e) => {
+                                poisoned = true;
+                                Err(crate::Error::Internal(format!(
+                                    "GL thread panicked during ImageConvert: {}",
+                                    panic_message(e.as_ref()),
+                                )))
+                            }
+                        });
                     }
                     GLProcessorMessage::DrawMasks(mut dst, det, seg, resp) => {
                         // SAFETY: This is safe because the draw_masks() function waits for the
                         // resp to be sent before dropping the borrow for dst, detect, and
                         // segmentation
-                        let dst = unsafe { dst.ptr.as_mut() };
-                        let det = unsafe { std::slice::from_raw_parts(det.ptr.as_ptr(), det.len) };
-                        let seg = unsafe { std::slice::from_raw_parts(seg.ptr.as_ptr(), seg.len) };
-                        let res = gl_converter.draw_masks(dst, det, seg);
-                        let _ = resp.send(res);
+                        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                            let dst = unsafe { dst.ptr.as_mut() };
+                            let det =
+                                unsafe { std::slice::from_raw_parts(det.ptr.as_ptr(), det.len) };
+                            let seg =
+                                unsafe { std::slice::from_raw_parts(seg.ptr.as_ptr(), seg.len) };
+                            gl_converter.draw_masks(dst, det, seg)
+                        }));
+                        let _ = resp.send(match result {
+                            Ok(res) => res,
+                            Err(e) => {
+                                poisoned = true;
+                                Err(crate::Error::Internal(format!(
+                                    "GL thread panicked during DrawMasks: {}",
+                                    panic_message(e.as_ref()),
+                                )))
+                            }
+                        });
                     }
                     GLProcessorMessage::DrawMasksProto(mut dst, det, proto_data, resp) => {
                         // SAFETY: Same safety invariant as DrawMasks — caller
                         // blocks on resp before dropping borrows.
-                        let dst = unsafe { dst.ptr.as_mut() };
-                        let det = unsafe { std::slice::from_raw_parts(det.ptr.as_ptr(), det.len) };
-                        let res = gl_converter.draw_masks_proto(dst, det, &proto_data);
-                        let _ = resp.send(res);
+                        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                            let dst = unsafe { dst.ptr.as_mut() };
+                            let det =
+                                unsafe { std::slice::from_raw_parts(det.ptr.as_ptr(), det.len) };
+                            gl_converter.draw_masks_proto(dst, det, &proto_data)
+                        }));
+                        let _ = resp.send(match result {
+                            Ok(res) => res,
+                            Err(e) => {
+                                poisoned = true;
+                                Err(crate::Error::Internal(format!(
+                                    "GL thread panicked during DrawMasksProto: {}",
+                                    panic_message(e.as_ref()),
+                                )))
+                            }
+                        });
                     }
                     GLProcessorMessage::SetColors(colors, resp) => {
-                        let res = gl_converter.set_class_colors(&colors);
-                        let _ = resp.send(res);
+                        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                            gl_converter.set_class_colors(&colors)
+                        }));
+                        let _ = resp.send(match result {
+                            Ok(res) => res,
+                            Err(e) => {
+                                poisoned = true;
+                                Err(crate::Error::Internal(format!(
+                                    "GL thread panicked during SetColors: {}",
+                                    panic_message(e.as_ref()),
+                                )))
+                            }
+                        });
                     }
                     GLProcessorMessage::SetInt8Interpolation(mode, resp) => {
-                        gl_converter.set_int8_interpolation_mode(mode);
-                        let _ = resp.send(Ok(()));
+                        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                            gl_converter.set_int8_interpolation_mode(mode);
+                            Ok(())
+                        }));
+                        let _ = resp.send(match result {
+                            Ok(res) => res,
+                            Err(e) => {
+                                poisoned = true;
+                                Err(crate::Error::Internal(format!(
+                                    "GL thread panicked during SetInt8Interpolation: {}",
+                                    panic_message(e.as_ref()),
+                                )))
+                            }
+                        });
                     }
                     GLProcessorMessage::DecodeMasksAtlas(
                         det,
@@ -206,17 +319,29 @@ impl GLProcessorThreaded {
                         output_height,
                         resp,
                     ) => {
-                        let det = unsafe { std::slice::from_raw_parts(det.ptr.as_ptr(), det.len) };
-                        let res = gl_converter.decode_masks_atlas(
-                            det,
-                            &proto_data,
-                            output_width,
-                            output_height,
-                        );
-                        let _ = resp.send(res);
+                        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                            let det =
+                                unsafe { std::slice::from_raw_parts(det.ptr.as_ptr(), det.len) };
+                            gl_converter.decode_masks_atlas(
+                                det,
+                                &proto_data,
+                                output_width,
+                                output_height,
+                            )
+                        }));
+                        let _ = resp.send(match result {
+                            Ok(res) => res,
+                            Err(e) => {
+                                poisoned = true;
+                                Err(crate::Error::Internal(format!(
+                                    "GL thread panicked during DecodeMasksAtlas: {}",
+                                    panic_message(e.as_ref()),
+                                )))
+                            }
+                        });
                     }
                     GLProcessorMessage::PboCreate(size, resp) => {
-                        let result = unsafe {
+                        let result = std::panic::catch_unwind(AssertUnwindSafe(|| unsafe {
                             let mut id: u32 = 0;
                             gls::gl::GenBuffers(1, &mut id);
                             gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, id);
@@ -234,11 +359,20 @@ impl GLProcessorThreaded {
                                     Err(e)
                                 }
                             }
-                        };
-                        let _ = resp.send(result);
+                        }));
+                        let _ = resp.send(match result {
+                            Ok(res) => res,
+                            Err(e) => {
+                                poisoned = true;
+                                Err(crate::Error::Internal(format!(
+                                    "GL thread panicked during PboCreate: {}",
+                                    panic_message(e.as_ref()),
+                                )))
+                            }
+                        });
                     }
                     GLProcessorMessage::PboMap(buffer_id, size, resp) => {
-                        let result = unsafe {
+                        let result = std::panic::catch_unwind(AssertUnwindSafe(|| unsafe {
                             gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, buffer_id);
                             let ptr = gls::gl::MapBufferRange(
                                 gls::gl::PIXEL_PACK_BUFFER,
@@ -257,11 +391,20 @@ impl GLProcessorThreaded {
                                     size,
                                 })
                             }
-                        };
-                        let _ = resp.send(result);
+                        }));
+                        let _ = resp.send(match result {
+                            Ok(res) => res,
+                            Err(e) => {
+                                poisoned = true;
+                                Err(crate::Error::Internal(format!(
+                                    "GL thread panicked during PboMap: {}",
+                                    panic_message(e.as_ref()),
+                                )))
+                            }
+                        });
                     }
                     GLProcessorMessage::PboUnmap(buffer_id, resp) => {
-                        let result = unsafe {
+                        let result = std::panic::catch_unwind(AssertUnwindSafe(|| unsafe {
                             gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, buffer_id);
                             let ok = gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
                             gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
@@ -272,12 +415,29 @@ impl GLProcessorThreaded {
                             } else {
                                 check_gl_error("PboUnmap", 0)
                             }
-                        };
-                        let _ = resp.send(result);
+                        }));
+                        let _ = resp.send(match result {
+                            Ok(res) => res,
+                            Err(e) => {
+                                poisoned = true;
+                                Err(crate::Error::Internal(format!(
+                                    "GL thread panicked during PboUnmap: {}",
+                                    panic_message(e.as_ref()),
+                                )))
+                            }
+                        });
                     }
-                    GLProcessorMessage::PboDelete(buffer_id) => unsafe {
-                        gls::gl::DeleteBuffers(1, &buffer_id);
-                    },
+                    GLProcessorMessage::PboDelete(buffer_id) => {
+                        if let Err(e) = std::panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+                            gls::gl::DeleteBuffers(1, &buffer_id);
+                        })) {
+                            poisoned = true;
+                            log::error!(
+                                "GL thread panicked during PboDelete: {}",
+                                panic_message(e.as_ref()),
+                            );
+                        }
+                    }
                 }
             }
         };
@@ -315,7 +475,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
         let (err_send, err_recv) = tokio::sync::oneshot::channel();
         self.sender
             .as_ref()
-            .unwrap()
+            .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
             .blocking_send(GLProcessorMessage::ImageConvert(
                 SendablePtr {
                     ptr: NonNull::from(src),
@@ -345,7 +505,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
         let (err_send, err_recv) = tokio::sync::oneshot::channel();
         self.sender
             .as_ref()
-            .unwrap()
+            .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
             .blocking_send(GLProcessorMessage::DrawMasks(
                 SendablePtr {
                     ptr: NonNull::from(dst),
@@ -376,7 +536,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
         let (err_send, err_recv) = tokio::sync::oneshot::channel();
         self.sender
             .as_ref()
-            .unwrap()
+            .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
             .blocking_send(GLProcessorMessage::DrawMasksProto(
                 SendablePtr {
                     ptr: NonNull::from(dst),
@@ -415,7 +575,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
         let (err_send, err_recv) = tokio::sync::oneshot::channel();
         self.sender
             .as_ref()
-            .unwrap()
+            .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
             .blocking_send(GLProcessorMessage::SetColors(colors.to_vec(), err_send))
             .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
         err_recv.blocking_recv().map_err(|_| {
@@ -433,7 +593,7 @@ impl GLProcessorThreaded {
         let (err_send, err_recv) = tokio::sync::oneshot::channel();
         self.sender
             .as_ref()
-            .unwrap()
+            .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
             .blocking_send(GLProcessorMessage::SetInt8Interpolation(mode, err_send))
             .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
         err_recv.blocking_recv().map_err(|_| {
@@ -456,7 +616,7 @@ impl GLProcessorThreaded {
         let (resp_send, resp_recv) = tokio::sync::oneshot::channel();
         self.sender
             .as_ref()
-            .unwrap()
+            .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
             .blocking_send(GLProcessorMessage::DecodeMasksAtlas(
                 SendablePtr {
                     ptr: NonNull::new(detect.as_ptr() as *mut DetectBox).unwrap(),

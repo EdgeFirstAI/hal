@@ -13,7 +13,7 @@ use edgefirst_tensor::{DType, TensorDyn, TensorMap, TensorMapTrait, TensorMemory
 use libc::{c_char, c_int, size_t};
 
 #[cfg(unix)]
-use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::IntoRawFd;
 
 /// Data type of tensor elements.
 ///
@@ -81,7 +81,7 @@ impl From<HalTensorMemory> for Option<TensorMemory> {
             HalTensorMemory::Mem => Some(TensorMemory::Mem),
             #[cfg(target_os = "linux")]
             HalTensorMemory::Dma => Some(TensorMemory::Dma),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             HalTensorMemory::Shm => Some(TensorMemory::Shm),
             HalTensorMemory::Pbo => Some(TensorMemory::Pbo),
             #[cfg(not(target_os = "linux"))]
@@ -273,20 +273,35 @@ pub unsafe extern "C" fn hal_tensor_new(
 
 /// Create a new tensor from an existing file descriptor (Linux only).
 ///
-/// Takes ownership of the file descriptor - caller must NOT close it.
+/// The fd is duplicated internally — the caller retains ownership of the
+/// original fd and must close it when done. This is consistent with all
+/// other fd-accepting APIs in this library.
+///
+/// **EGL image cache interaction**: Each call to this function allocates a
+/// new `BufferIdentity` with a globally unique ID. The OpenGL backend uses
+/// `(BufferIdentity.id, chroma_id)` as the EGL image cache key, so a new
+/// tensor object created from the same underlying fd will always produce a
+/// cache miss. To benefit from EGL image cache hits across frames, reuse the
+/// same tensor object — do not recreate it from the fd every frame.
+///
+/// **Live-memory semantics**: When the underlying DMA-BUF contains new frame
+/// data (e.g., written by a V4L2 decoder), the tensor wrapper remains valid
+/// — EGLImage is a handle to physical memory, not a snapshot. Content updates
+/// written to the DMA-BUF between `convert()` calls are visible to the GPU on
+/// the next call, provided the caller does not write to the buffer while a
+/// `convert()` is in progress.
 ///
 /// @param dtype Data type of tensor elements (HAL_DTYPE_*)
-/// @param fd File descriptor for DMA/SHM buffer (ownership transferred)
+/// @param fd File descriptor for DMA/SHM buffer (caller retains ownership)
 /// @param shape Array of dimension sizes (ndim elements)
 /// @param ndim Number of dimensions (1-8)
 /// @param name Optional tensor name for debugging (can be NULL)
 /// @return New tensor handle on success, NULL on error
 /// @par Errors (errno):
 /// - EINVAL: Invalid argument (NULL shape, ndim is 0, invalid fd)
-/// - ENOMEM: Memory allocation failed
+/// - EIO: Failed to duplicate fd or create tensor
 /// - ENOTSUP: Not supported on this platform (non-Unix)
 #[no_mangle]
-#[cfg(unix)]
 pub unsafe extern "C" fn hal_tensor_from_fd(
     dtype: HalDtype,
     fd: c_int,
@@ -294,34 +309,34 @@ pub unsafe extern "C" fn hal_tensor_from_fd(
     ndim: size_t,
     name: *const c_char,
 ) -> *mut HalTensor {
-    check_null_ret_null!(shape);
-    if ndim == 0 || ndim > 8 || fd < 0 {
-        return set_error_null(libc::EINVAL);
+    #[cfg(unix)]
+    {
+        check_null_ret_null!(shape);
+        if ndim == 0 || ndim > 8 || fd < 0 {
+            return set_error_null(libc::EINVAL);
+        }
+
+        let shape_slice = unsafe { std::slice::from_raw_parts(shape, ndim) };
+        let name_opt = unsafe { c_str_to_option(name) };
+        // Dup the fd — caller retains ownership of the original.
+        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+        let owned_fd = match borrowed.try_clone_to_owned() {
+            Ok(fd) => fd,
+            Err(_) => return set_error_null(libc::EIO),
+        };
+        let dt: DType = dtype.into();
+
+        let tensor = try_or_null!(
+            TensorDyn::from_fd(owned_fd, shape_slice, dt, name_opt),
+            libc::EIO
+        );
+        Box::into_raw(Box::new(HalTensor { inner: tensor }))
     }
-
-    let shape_slice = unsafe { std::slice::from_raw_parts(shape, ndim) };
-    let name_opt = unsafe { c_str_to_option(name) };
-    let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    let dt: DType = dtype.into();
-
-    let tensor = try_or_null!(
-        TensorDyn::from_fd(owned_fd, shape_slice, dt, name_opt),
-        libc::EIO
-    );
-    Box::into_raw(Box::new(HalTensor { inner: tensor }))
-}
-
-/// Create a new tensor from an existing file descriptor (stub for non-Unix).
-#[no_mangle]
-#[cfg(not(unix))]
-pub unsafe extern "C" fn hal_tensor_from_fd(
-    _dtype: HalDtype,
-    _fd: c_int,
-    _shape: *const size_t,
-    _ndim: size_t,
-    _name: *const c_char,
-) -> *mut HalTensor {
-    set_error_null(libc::ENOTSUP)
+    #[cfg(not(unix))]
+    {
+        let _ = (dtype, fd, shape, ndim, name);
+        set_error_null(libc::ENOTSUP)
+    }
 }
 
 /// Free a tensor and release its resources.
@@ -452,21 +467,21 @@ pub unsafe extern "C" fn hal_tensor_size(tensor: *const HalTensor) -> size_t {
 /// - ENOTSUP: Tensor memory type doesn't support file descriptors, or non-Unix
 /// - EIO: Failed to clone file descriptor
 #[no_mangle]
-#[cfg(unix)]
 pub unsafe extern "C" fn hal_tensor_clone_fd(tensor: *const HalTensor) -> c_int {
-    check_null!(tensor);
-    match unsafe { &*tensor }.inner.clone_fd() {
-        Ok(fd) => fd.into_raw_fd(),
-        Err(edgefirst_tensor::Error::NotImplemented(_)) => set_error(libc::ENOTSUP),
-        Err(_) => set_error(libc::EIO),
+    #[cfg(unix)]
+    {
+        check_null!(tensor);
+        match unsafe { &*tensor }.inner.clone_fd() {
+            Ok(fd) => fd.into_raw_fd(),
+            Err(edgefirst_tensor::Error::NotImplemented(_)) => set_error(libc::ENOTSUP),
+            Err(_) => set_error(libc::EIO),
+        }
     }
-}
-
-/// Clone file descriptor stub for non-Unix platforms.
-#[no_mangle]
-#[cfg(not(unix))]
-pub unsafe extern "C" fn hal_tensor_clone_fd(_tensor: *const HalTensor) -> c_int {
-    set_error(libc::ENOTSUP)
+    #[cfg(not(unix))]
+    {
+        let _ = tensor;
+        set_error(libc::ENOTSUP)
+    }
 }
 
 /// Clone the DMA-BUF file descriptor backing a tensor.
@@ -494,7 +509,7 @@ pub unsafe extern "C" fn hal_tensor_dmabuf_clone(tensor: *const HalTensor) -> c_
     }
 }
 
-/// Clone DMA-BUF fd stub for non-Linux platforms.
+/// cbindgen:ignore
 #[no_mangle]
 #[cfg(not(target_os = "linux"))]
 pub unsafe extern "C" fn hal_tensor_dmabuf_clone(_tensor: *const HalTensor) -> c_int {
@@ -543,24 +558,38 @@ pub unsafe extern "C" fn hal_tensor_reshape(
 /// @param tensor Tensor handle
 /// @return Tensor map handle on success, NULL on error
 /// @par Errors (errno):
-/// - EINVAL: NULL tensor
+/// - EINVAL: NULL tensor, or tensor has non-zero row stride or plane offset
+///   (CPU mapping of padded buffers is not supported)
 /// - EIO: Failed to map tensor memory
 #[no_mangle]
 pub unsafe extern "C" fn hal_tensor_map_create(tensor: *const HalTensor) -> *mut HalTensorMap {
     check_null_ret_null!(tensor);
 
+    // Map the tensor for CPU access.  InvalidOperation (strided/offset
+    // tensors) maps to EINVAL; all other failures map to EIO.
+    macro_rules! map_or_errno {
+        ($t:expr, $variant:path) => {
+            match $t.map() {
+                Ok(m) => $variant(m),
+                Err(edgefirst_tensor::Error::InvalidOperation(_)) => {
+                    return set_error_null(libc::EINVAL)
+                }
+                Err(_) => return set_error_null(libc::EIO),
+            }
+        };
+    }
     let map = match &unsafe { &*tensor }.inner {
-        TensorDyn::U8(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::U8),
-        TensorDyn::I8(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::I8),
-        TensorDyn::U16(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::U16),
-        TensorDyn::I16(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::I16),
-        TensorDyn::U32(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::U32),
-        TensorDyn::I32(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::I32),
-        TensorDyn::U64(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::U64),
-        TensorDyn::I64(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::I64),
-        TensorDyn::F16(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::F16),
-        TensorDyn::F32(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::F32),
-        TensorDyn::F64(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::F64),
+        TensorDyn::U8(t) => map_or_errno!(t, HalTensorMap::U8),
+        TensorDyn::I8(t) => map_or_errno!(t, HalTensorMap::I8),
+        TensorDyn::U16(t) => map_or_errno!(t, HalTensorMap::U16),
+        TensorDyn::I16(t) => map_or_errno!(t, HalTensorMap::I16),
+        TensorDyn::U32(t) => map_or_errno!(t, HalTensorMap::U32),
+        TensorDyn::I32(t) => map_or_errno!(t, HalTensorMap::I32),
+        TensorDyn::U64(t) => map_or_errno!(t, HalTensorMap::U64),
+        TensorDyn::I64(t) => map_or_errno!(t, HalTensorMap::I64),
+        TensorDyn::F16(t) => map_or_errno!(t, HalTensorMap::F16),
+        TensorDyn::F32(t) => map_or_errno!(t, HalTensorMap::F32),
+        TensorDyn::F64(t) => map_or_errno!(t, HalTensorMap::F64),
         _ => return set_error_null(libc::ENOTSUP),
     };
 
@@ -665,20 +694,6 @@ pub unsafe extern "C" fn hal_tensor_map_unmap(map: *mut HalTensorMap) {
 }
 
 // ============================================================================
-// Helper trait for method chaining
-// ============================================================================
-
-trait Pipe: Sized {
-    fn pipe<F, R>(self, f: F) -> R
-    where
-        F: FnOnce(Self) -> R,
-    {
-        f(self)
-    }
-}
-
-impl<T> Pipe for T {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
