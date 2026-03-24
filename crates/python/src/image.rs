@@ -1027,7 +1027,18 @@ impl PyImageProcessor {
     /// no CPU copy is needed after ``convert()``. The caller retains ownership
     /// of the underlying buffer; the fd is ``dup()``'d immediately.
     ///
-    /// For multiplane NV12/NV16, pass ``chroma_fd`` for the UV plane.
+    /// The optional ``stride`` and ``offset`` parameters specify the row stride
+    /// in bytes and the byte offset within the DMA-BUF where pixel data starts.
+    /// Use these when importing buffers with row padding (e.g. V4L2 ``bytesperline``
+    /// > width * bytes_per_pixel). When omitted, rows are assumed tightly packed
+    /// starting at byte 0.
+    ///
+    /// For multiplane NV12, pass ``chroma_fd`` for the UV plane, with optional
+    /// ``chroma_stride`` and ``chroma_offset`` for the UV plane layout.
+    ///
+    /// The caller must ensure the DMA-BUF allocation is large enough for the
+    /// specified dimensions, format, and any stride/offset values. No buffer-size
+    /// validation is performed.
     #[cfg(target_os = "linux")]
     #[pyo3(signature = (fd, width, height, format, dtype = "uint8", stride = None, offset = None, chroma_fd = None, chroma_stride = None, chroma_offset = None))]
     #[allow(clippy::too_many_arguments)]

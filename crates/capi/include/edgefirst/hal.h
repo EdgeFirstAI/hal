@@ -1410,13 +1410,14 @@ size_t hal_tensor_channels(const struct hal_tensor *tensor);
  *
  * If an explicit stride was set (e.g. via `hal_plane_descriptor_set_stride`),
  * that value is returned. Otherwise the minimum stride is computed from the
- * format: width for planar/semi-planar formats, width * channels for packed.
+ * format, width, and element size: `width * channels * element_size` for
+ * packed formats, `width * element_size` for planar/semi-planar.
  *
  * @param tensor Image tensor handle
  * @return Effective row stride in bytes: the explicit stride if set, or the
- *         minimum stride computed from format and width (e.g. width * channels
- *         for packed formats). Returns 0 only when no pixel format is set or
- *         tensor is NULL.
+ *         minimum stride computed from format, width, and element size.
+ *         Returns 0 only when no pixel format is set (and no explicit stride
+ *         was stored) or tensor is NULL.
  */
 size_t hal_tensor_row_stride(const struct hal_tensor *tensor);
 
@@ -1590,6 +1591,12 @@ void hal_plane_descriptor_free(struct hal_plane_descriptor *pd);
  * Only needed when the external buffer has row padding. If not set,
  * the buffer is assumed tightly packed.
  *
+ * @note The caller is responsible for ensuring the DMA-BUF allocation
+ * is large enough for the given stride, height, and pixel format.
+ * No buffer-size validation is performed because external DMA-BUF sizes
+ * are not reliably queryable; an incorrect stride is caught by the EGL
+ * driver at import time.
+ *
  * @param pd     Plane descriptor handle
  * @param stride Row stride in bytes (must be > 0)
  * @return 0 on success, -1 on error
@@ -1617,7 +1624,12 @@ int hal_plane_descriptor_set_offset(struct hal_plane_descriptor *pd, size_t offs
  * after calling `hal_import_image()`.
  *
  * The `chroma` parameter is NULL for single-plane formats. For multiplane
- * NV12/NV16, pass a second descriptor for the UV plane.
+ * NV12, pass a second descriptor for the UV plane.
+ *
+ * @note The caller must ensure the DMA-BUF allocation is large enough for
+ * the specified width, height, format, and any stride/offset set on the
+ * plane descriptors. No buffer-size validation is performed; an
+ * undersized buffer may cause GPU faults or EGL import failure.
  *
  * @param processor Image processor handle
  * @param image     Plane descriptor for the primary (Y or only) plane (consumed)

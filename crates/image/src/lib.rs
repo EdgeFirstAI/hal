@@ -891,6 +891,11 @@ impl ImageProcessor {
     /// consumes the descriptors and takes ownership of those fds (whether
     /// the call succeeds or fails).
     ///
+    /// The caller must ensure the DMA-BUF allocation is large enough for the
+    /// specified width, height, format, and any stride/offset on the plane
+    /// descriptors. No buffer-size validation is performed; an undersized
+    /// buffer may cause GPU faults or EGL import failure.
+    ///
     /// # Arguments
     ///
     /// * `image` - Plane descriptor for the primary (or only) plane
