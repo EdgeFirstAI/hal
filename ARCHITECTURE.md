@@ -1676,7 +1676,7 @@ independent DMA-BUF allocations for zero-copy GPU import.
 
 **OpenGL path**: `create_image_from_dma2()` uses per-plane fds in EGL
 attributes (`DMA_BUF_PLANE0_FD → y_fd`, `DMA_BUF_PLANE1_FD → uv_fd`),
-each at offset 0.
+with per-plane stride and offset from `PlaneDescriptor` metadata.
 
 | Scenario | Zero-Copy | Notes |
 |----------|-----------|-------|

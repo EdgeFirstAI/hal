@@ -637,8 +637,8 @@ pub unsafe extern "C" fn hal_tensor_channels(tensor: *const HalTensor) -> size_t
 ///
 /// @param tensor Image tensor handle
 /// @return Row stride in bytes, or 0 if tensor is NULL, has no pixel format
-///         set, or is tightly packed (no explicit stride). Check tensor is
-///         non-NULL separately to distinguish error from tightly-packed.
+///         set, or has no explicit stride set (tightly packed). Check tensor
+///         is non-NULL separately to distinguish error from tightly-packed.
 #[no_mangle]
 pub unsafe extern "C" fn hal_tensor_row_stride(tensor: *const HalTensor) -> size_t {
     if tensor.is_null() {

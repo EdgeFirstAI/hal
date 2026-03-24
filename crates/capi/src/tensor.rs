@@ -565,18 +565,31 @@ pub unsafe extern "C" fn hal_tensor_reshape(
 pub unsafe extern "C" fn hal_tensor_map_create(tensor: *const HalTensor) -> *mut HalTensorMap {
     check_null_ret_null!(tensor);
 
+    // Map the tensor for CPU access.  InvalidOperation (strided/offset
+    // tensors) maps to EINVAL; all other failures map to EIO.
+    macro_rules! map_or_errno {
+        ($t:expr, $variant:path) => {
+            match $t.map() {
+                Ok(m) => $variant(m),
+                Err(edgefirst_tensor::Error::InvalidOperation(_)) => {
+                    return set_error_null(libc::EINVAL)
+                }
+                Err(_) => return set_error_null(libc::EIO),
+            }
+        };
+    }
     let map = match &unsafe { &*tensor }.inner {
-        TensorDyn::U8(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::U8),
-        TensorDyn::I8(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::I8),
-        TensorDyn::U16(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::U16),
-        TensorDyn::I16(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::I16),
-        TensorDyn::U32(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::U32),
-        TensorDyn::I32(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::I32),
-        TensorDyn::U64(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::U64),
-        TensorDyn::I64(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::I64),
-        TensorDyn::F16(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::F16),
-        TensorDyn::F32(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::F32),
-        TensorDyn::F64(t) => try_or_null!(t.map(), libc::EIO).pipe(HalTensorMap::F64),
+        TensorDyn::U8(t) => map_or_errno!(t, HalTensorMap::U8),
+        TensorDyn::I8(t) => map_or_errno!(t, HalTensorMap::I8),
+        TensorDyn::U16(t) => map_or_errno!(t, HalTensorMap::U16),
+        TensorDyn::I16(t) => map_or_errno!(t, HalTensorMap::I16),
+        TensorDyn::U32(t) => map_or_errno!(t, HalTensorMap::U32),
+        TensorDyn::I32(t) => map_or_errno!(t, HalTensorMap::I32),
+        TensorDyn::U64(t) => map_or_errno!(t, HalTensorMap::U64),
+        TensorDyn::I64(t) => map_or_errno!(t, HalTensorMap::I64),
+        TensorDyn::F16(t) => map_or_errno!(t, HalTensorMap::F16),
+        TensorDyn::F32(t) => map_or_errno!(t, HalTensorMap::F32),
+        TensorDyn::F64(t) => map_or_errno!(t, HalTensorMap::F64),
         _ => return set_error_null(libc::ENOTSUP),
     };
 
@@ -681,20 +694,6 @@ pub unsafe extern "C" fn hal_tensor_map_unmap(map: *mut HalTensorMap) {
 }
 
 // ============================================================================
-// Helper trait for method chaining
-// ============================================================================
-
-trait Pipe: Sized {
-    fn pipe<F, R>(self, f: F) -> R
-    where
-        F: FnOnce(Self) -> R,
-    {
-        f(self)
-    }
-}
-
-impl<T> Pipe for T {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
