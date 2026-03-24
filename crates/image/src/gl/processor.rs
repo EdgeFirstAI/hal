@@ -1102,6 +1102,15 @@ impl GLProcessorST {
         crop: Crop,
     ) -> crate::Result<()> {
         if !Self::check_src_format_supported(self.gl_context.transfer_backend, src, src_fmt) {
+            if src_fmt == PixelFormat::Vyuy
+                && self.gl_context.transfer_backend.is_dma()
+                && src.memory() == TensorMemory::Dma
+            {
+                log::warn!(
+                    "VYUY format on Vivante GPU — using 2D texture path \
+                     (EGL DMA-BUF import produces incorrect output)"
+                );
+            }
             return Err(crate::Error::NotSupported(format!(
                 "Opengl doesn't support {src_fmt} source texture",
             )));

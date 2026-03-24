@@ -12,7 +12,8 @@
 //      b. Import pool: V4L2-style buffer pool rotation with imported fds
 //      c. Import with stride: padded buffers (V4L2 bytesperline)
 //      d. Import multiplane NV12: separate Y and UV plane fds
-//      e. Import per frame: re-import every iteration (anti-pattern)
+//      e. Import render target: render INTO imported DMA-BUF (zero-copy output)
+//      f. Import per frame: re-import every iteration (anti-pattern)
 //   2. Internal allocation patterns (hal_image_processor_create_image):
 //      a. Reuse: allocate once, convert N times (format matrix)
 //      b. Chained pipeline: NV12 -> RGBA -> PlanarRgb I8
@@ -178,6 +179,25 @@ static int allocate_plane_fd(size_t h, size_t w) {
         HAL_DTYPE_U8, shape, 2, HAL_TENSOR_MEMORY_DMA, NULL);
     if (!tmp) return -1;
 
+    int fd = hal_tensor_dmabuf_clone(tmp);
+    hal_tensor_free(tmp);
+    return fd;
+}
+
+// Allocate a DMA fd sized for a specific row stride.
+// The allocation is stride * total_rows bytes (not width * total_rows).
+static int allocate_strided_dma_fd(size_t stride, size_t h,
+                                    enum hal_pixel_format fmt) {
+    size_t total_rows;
+    switch (fmt) {
+    case HAL_PIXEL_FORMAT_NV12: total_rows = h * 3 / 2; break;
+    case HAL_PIXEL_FORMAT_NV16: total_rows = h * 2; break;
+    default: total_rows = h; break;
+    }
+    size_t shape[2] = {total_rows, stride};
+    struct hal_tensor *tmp = hal_tensor_new(
+        HAL_DTYPE_U8, shape, 2, HAL_TENSOR_MEMORY_DMA, NULL);
+    if (!tmp) return -1;
     int fd = hal_tensor_dmabuf_clone(tmp);
     hal_tensor_free(tmp);
     return fd;
@@ -393,8 +413,8 @@ static bench_result bench_import_stride(struct hal_image_processor *proc,
     };
 
     // Allocate a buffer large enough for the padded stride.
-    // We use a contiguous NV12 buffer (stride * H * 3/2 bytes).
-    int ext_fd = allocate_dma_fd(SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12);
+    // With stride=2048 and NV12: need 2048 * 1080 * 3/2 = 3,317,760 bytes.
+    int ext_fd = allocate_strided_dma_fd(2048, SRC_H, HAL_PIXEL_FORMAT_NV12);
     if (ext_fd < 0) {
         res.skip_reason = "DMA allocation unavailable";
         return res;
@@ -559,7 +579,191 @@ static bench_result bench_import_multiplane(struct hal_image_processor *proc,
 }
 
 // ============================================================================
-// Section 1e: DMA-BUF import per frame (anti-pattern)
+// Section 1e: DMA-BUF multiplane NV12 with per-plane stride
+//
+// Same as 1d but with explicit stride on both Y and UV plane descriptors.
+// Exercises the per-plane stride propagation path that V4L2 MPLANE drivers
+// use when rows are padded (e.g. bytesperline=2048 on 1920-wide frames).
+// NV12 UV rows are interleaved U+V at full width, so UV stride == Y stride.
+// ============================================================================
+
+static bench_result bench_import_multiplane_strided(
+        struct hal_image_processor *proc, int iterations) {
+    bench_result res = {
+        .pattern = "Import multiplane+stride NV12",
+        .format  = "NV12->RGBA 1080p stride=2048",
+        .ok      = 0,
+    };
+
+    const size_t stride = 2048;
+
+    // Allocate stride-sized planes
+    int y_fd = allocate_plane_fd(SRC_H, stride);
+    int uv_fd = allocate_plane_fd(SRC_H / 2, stride);
+    if (y_fd < 0 || uv_fd < 0) {
+        if (y_fd >= 0) close(y_fd);
+        if (uv_fd >= 0) close(uv_fd);
+        res.skip_reason = "DMA plane allocation unavailable";
+        return res;
+    }
+
+    struct hal_plane_descriptor *y_pd = hal_plane_descriptor_new(y_fd);
+    struct hal_plane_descriptor *uv_pd = hal_plane_descriptor_new(uv_fd);
+    close(y_fd);
+    close(uv_fd);
+    if (!y_pd || !uv_pd) {
+        if (y_pd) hal_plane_descriptor_free(y_pd);
+        if (uv_pd) hal_plane_descriptor_free(uv_pd);
+        res.skip_reason = "plane descriptor creation failed";
+        return res;
+    }
+
+    // Set per-plane stride
+    hal_plane_descriptor_set_stride(y_pd, stride);
+    hal_plane_descriptor_set_stride(uv_pd, stride);
+
+    struct hal_tensor *src = hal_import_image(
+        proc, y_pd, uv_pd, SRC_W, SRC_H,
+        HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+    if (!src) {
+        res.skip_reason = "multiplane+stride hal_import_image failed";
+        return res;
+    }
+
+    struct hal_tensor *dst = hal_image_processor_create_image(
+        proc, DST_W, DST_H, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
+    if (!dst) {
+        hal_tensor_free(src);
+        res.skip_reason = "dst allocation failed";
+        return res;
+    }
+
+    struct hal_crop crop = make_letterbox_crop();
+
+    if (hal_image_processor_convert(proc, src, dst,
+                                     HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop) != 0) {
+        hal_tensor_free(src);
+        hal_tensor_free(dst);
+        res.skip_reason = "unsupported format combo (multiplane+stride)";
+        return res;
+    }
+
+    for (int i = 0; i < WARMUP_ITERATIONS; i++) {
+        hal_image_processor_convert(proc, src, dst,
+                                     HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop);
+    }
+
+    double total = 0.0, min_t = DBL_MAX, max_t = 0.0;
+    for (int i = 0; i < iterations; i++) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        hal_image_processor_convert(proc, src, dst,
+                                     HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+
+        double ms = elapsed_ms(&t0, &t1);
+        total += ms;
+        if (ms < min_t) min_t = ms;
+        if (ms > max_t) max_t = ms;
+    }
+
+    hal_tensor_free(src);
+    hal_tensor_free(dst);
+
+    res.ok = 1;  res.iterations = iterations;
+    res.avg_ms = total / iterations;
+    res.min_ms = min_t;  res.max_ms = max_t;
+    return res;
+}
+
+// ============================================================================
+// Section 1f: DMA-BUF import as render TARGET (zero-copy output)
+//
+// Primary GStreamer zero-copy pattern: rendering INTO a pre-registered
+// DMA-BUF pool (e.g. Ara-2 NPU input buffers) via hal_import_image().
+// The imported tensor is the DESTINATION of convert(), not the source.
+// ============================================================================
+
+static bench_result bench_import_render_target(struct hal_image_processor *proc,
+                                               int iterations) {
+    bench_result res = {
+        .pattern = "Import render target (dst)",
+        .format  = "NV12->RGBA 1080p",
+        .ok      = 0,
+    };
+
+    // Source: internal HAL allocation (simulates camera input)
+    struct hal_tensor *src = hal_image_processor_create_image(
+        proc, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+    if (!src) {
+        res.skip_reason = "src allocation failed";
+        return res;
+    }
+
+    // Destination: import from external DMA-BUF (simulates NPU pool buffer)
+    int ext_fd = allocate_dma_fd(DST_W, DST_H, HAL_PIXEL_FORMAT_RGBA);
+    if (ext_fd < 0) {
+        hal_tensor_free(src);
+        res.skip_reason = "DMA allocation unavailable";
+        return res;
+    }
+
+    struct hal_plane_descriptor *pd = hal_plane_descriptor_new(ext_fd);
+    close(ext_fd);
+    if (!pd) {
+        hal_tensor_free(src);
+        res.skip_reason = "plane descriptor creation failed";
+        return res;
+    }
+
+    struct hal_tensor *dst = hal_import_image(
+        proc, pd, NULL, DST_W, DST_H, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
+    if (!dst) {
+        hal_tensor_free(src);
+        res.skip_reason = "render target import failed";
+        return res;
+    }
+
+    struct hal_crop crop = make_letterbox_crop();
+
+    if (hal_image_processor_convert(proc, src, dst,
+                                     HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop) != 0) {
+        hal_tensor_free(src);
+        hal_tensor_free(dst);
+        res.skip_reason = "unsupported format combo (render target)";
+        return res;
+    }
+
+    for (int i = 0; i < WARMUP_ITERATIONS; i++) {
+        hal_image_processor_convert(proc, src, dst,
+                                     HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop);
+    }
+
+    double total = 0.0, min_t = DBL_MAX, max_t = 0.0;
+    for (int i = 0; i < iterations; i++) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        hal_image_processor_convert(proc, src, dst,
+                                     HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+
+        double ms = elapsed_ms(&t0, &t1);
+        total += ms;
+        if (ms < min_t) min_t = ms;
+        if (ms > max_t) max_t = ms;
+    }
+
+    hal_tensor_free(src);
+    hal_tensor_free(dst);
+
+    res.ok = 1;  res.iterations = iterations;
+    res.avg_ms = total / iterations;
+    res.min_ms = min_t;  res.max_ms = max_t;
+    return res;
+}
+
+// ============================================================================
+// Section 1f: DMA-BUF import per frame (anti-pattern)
 //
 // Re-imports a new DMA-BUF every iteration, forcing an EGL image cache miss
 // each time.  This quantifies the overhead of not reusing tensor handles.
@@ -939,6 +1143,8 @@ int main(void) {
     results[n_results++] = bench_import_pool(proc, iterations);
     results[n_results++] = bench_import_stride(proc, iterations);
     results[n_results++] = bench_import_multiplane(proc, iterations);
+    results[n_results++] = bench_import_multiplane_strided(proc, iterations);
+    results[n_results++] = bench_import_render_target(proc, iterations);
     results[n_results++] = bench_import_recreate(proc, iterations);
 
     // ── Section 2: Internal allocation format matrix ─────────────────────
