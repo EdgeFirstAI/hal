@@ -636,9 +636,10 @@ pub unsafe extern "C" fn hal_tensor_channels(tensor: *const HalTensor) -> size_t
 /// format: width for planar/semi-planar formats, width * channels for packed.
 ///
 /// @param tensor Image tensor handle
-/// @return Row stride in bytes, or 0 if tensor is NULL, has no pixel format
-///         set, or has no explicit stride set (tightly packed). Check tensor
-///         is non-NULL separately to distinguish error from tightly-packed.
+/// @return Effective row stride in bytes: the explicit stride if set, or the
+///         minimum stride computed from format and width (e.g. width * channels
+///         for packed formats). Returns 0 only when no pixel format is set or
+///         tensor is NULL.
 #[no_mangle]
 pub unsafe extern "C" fn hal_tensor_row_stride(tensor: *const HalTensor) -> size_t {
     if tensor.is_null() {
@@ -1174,6 +1175,13 @@ pub unsafe extern "C" fn hal_import_image(
     _format: HalPixelFormat,
     _dtype: HalDtype,
 ) -> *mut HalTensor {
+    // Consume descriptors to uphold the "always consumed" contract.
+    if !_image.is_null() {
+        drop(unsafe { Box::from_raw(_image) });
+    }
+    if !_chroma.is_null() {
+        drop(unsafe { Box::from_raw(_chroma) });
+    }
     set_error_null(libc::ENOTSUP)
 }
 

@@ -39,7 +39,7 @@ extern "C" {
  * - hal_*_new() functions transfer ownership to caller (must call hal_*_free())
  * - hal_*_get_*() functions returning pointers are borrowed (valid during parent lifetime)
  * - hal_*_clone_fd() creates new owned fd (caller must close())
- * - hal_*_from_fd() takes ownership of fd (caller must NOT close())
+ * - hal_*_from_fd() duplicates the fd internally (caller retains ownership and must close())
  *
  * @section thread_safety Thread Safety
  * - All functions are thread-safe unless documented otherwise

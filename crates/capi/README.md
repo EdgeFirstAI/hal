@@ -128,8 +128,8 @@ Check `errno` after any failure for the specific error code (e.g. `EINVAL`,
   during the parent object's lifetime; do not free them
 - **`hal_*_clone_fd()`** - Creates a new owned file descriptor; caller must
   `close()` it
-- **`hal_*_from_fd()`** - Takes ownership of the file descriptor; caller must
-  NOT `close()` it after the call
+- **`hal_*_from_fd()`** - Duplicates the file descriptor internally; caller
+  retains ownership and must `close()` it when done
 - **`hal_tensor_map_create()` / `hal_tensor_map_unmap()`** - Map provides CPU
   access to tensor data; unmap when done to ensure cache coherency (especially
   for DMA tensors)
