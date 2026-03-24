@@ -795,36 +795,52 @@ jobs:
             fi
           fi
 
-      - name: Run pre-built Rust tests
+      - name: Run pre-built Rust tests (hardware-dependent only)
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/target/profiling:$LD_LIBRARY_PATH
           LLVM_PROFILE_FILE: ${{ github.workspace }}/build/profraw/rust-%p-%m.profraw
         run: |
-
+          # Only run tests that exercise hardware (G2D, OpenGL/EGL, DMA).
+          # CPU-only tests already run on the ubuntu-22.04-arm-xlarge runner.
           mkdir -p build/rust-test-results build/profraw
           chmod +x hardware-test-binaries/* 2>/dev/null || true
           TEST_FAILED=0
+
+          run_filtered() {
+            local test_bin="$1" filter="$2" label="$3"
+            local test_name
+            test_name=$(basename "$test_bin")
+            echo "=== Running $test_name ($label) ==="
+            EXIT_CODE=0
+            "$test_bin" "$filter" --test-threads=1 2>&1 | tee -a "build/rust-test-results/${test_name}.txt" || EXIT_CODE=$?
+            if [ $EXIT_CODE -ne 0 ]; then
+              # Check if all tests actually passed but process crashed on
+              # exit (Vivante GPU driver SIGABRT during library unload)
+              if grep -q 'test result: ok' "build/rust-test-results/${test_name}.txt" && \
+                 ! grep -q 'FAILED' "build/rust-test-results/${test_name}.txt"; then
+                echo "::warning::$test_name ($label) exited with code $EXIT_CODE (likely GPU driver crash during shutdown) but all tests passed"
+              else
+                echo "FAILED: $test_name ($label)"
+                TEST_FAILED=1
+              fi
+            fi
+          }
+
           for test_bin in hardware-test-binaries/*; do
-            if [ -x "$test_bin" ] && [ -f "$test_bin" ]; then
-              # Skip .so files (proc-macro shared libraries)
-              if [[ "$test_bin" == *.so ]]; then
-                continue
-              fi
-              test_name=$(basename "$test_bin")
-              echo "=== Running $test_name ==="
-              EXIT_CODE=0
-              "$test_bin" --test-threads=1 2>&1 | tee "build/rust-test-results/${test_name}.txt" || EXIT_CODE=$?
-              if [ $EXIT_CODE -ne 0 ]; then
-                # Check if all tests actually passed but process crashed on
-                # exit (Vivante GPU driver SIGABRT during library unload)
-                if grep -q 'test result: ok' "build/rust-test-results/${test_name}.txt" && \
-                   ! grep -q 'FAILED' "build/rust-test-results/${test_name}.txt"; then
-                  echo "::warning::$test_name exited with code $EXIT_CODE (likely GPU driver crash during shutdown) but all tests passed"
-                else
-                  echo "FAILED: $test_name"
-                  TEST_FAILED=1
-                fi
-              fi
+            [[ -x "$test_bin" && -f "$test_bin" ]] || continue
+            [[ "$test_bin" == *.so ]] && continue
+            test_name=$(basename "$test_bin")
+
+            if [[ "$test_name" == edgefirst_image-* ]]; then
+              # G2D tests (g2d.rs module + lib.rs g2d integration tests)
+              run_filtered "$test_bin" g2d "G2D tests"
+              # OpenGL/EGL tests (gl/tests.rs + lib.rs opengl integration tests)
+              run_filtered "$test_bin" opengl "OpenGL tests"
+            elif [[ "$test_name" == edgefirst_tensor-* ]]; then
+              # DMA-heap tensor tests only
+              run_filtered "$test_bin" dma "DMA tests"
+            else
+              echo "=== Skipping $test_name (CPU-only, covered by aarch64 runner) ==="
             fi
           done
           [ $TEST_FAILED -eq 0 ] || exit 1
