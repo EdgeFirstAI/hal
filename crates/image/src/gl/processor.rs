@@ -1107,8 +1107,8 @@ impl GLProcessorST {
                 && src.memory() == TensorMemory::Dma
             {
                 log::warn!(
-                    "VYUY format on Vivante GPU — using 2D texture path \
-                     (EGL DMA-BUF import produces incorrect output)"
+                    "VYUY format not supported via EGL DMA-BUF import; \
+                     falling back to CPU/G2D path"
                 );
             }
             return Err(crate::Error::NotSupported(format!(
