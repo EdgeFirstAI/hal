@@ -255,7 +255,7 @@ jobs:
           grep '^SF:.*crates/python' target/coverage_rust.lcov || echo "  (none found)"
           echo "=== Sample coverage data for crates/python ==="
           # Show hit counts for PyO3 files to verify they're being exercised
-          awk '/^SF:.*crates\/python/{found=1; file=$0} found && /^DA:/{print file": "$0} found && /^end_of_record/{found=0}' target/coverage_rust.lcov | head -20
+          awk '/^SF:.*crates\/python/{found=1; file=$0} found && /^DA:/{print file": "$0} found && /^end_of_record/{found=0}' target/coverage_rust.lcov | head -20 || true
 
       - name: Upload coverage artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
