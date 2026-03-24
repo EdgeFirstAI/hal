@@ -34,6 +34,10 @@ where
     #[cfg(target_os = "linux")]
     _drm_attachment: Option<crate::dmabuf::DrmAttachment>,
     identity: crate::BufferIdentity,
+    /// Actual buffer size in bytes (from fstat at creation time).
+    /// May be larger than shape.product() * sizeof(T) for externally
+    /// allocated buffers with row padding.
+    buf_size: usize,
 }
 
 unsafe impl<T> Send for DmaTensor<T> where T: Num + Clone + fmt::Debug + Send + Sync {}
@@ -48,7 +52,7 @@ where
         use log::debug;
         use nix::sys::stat::fstat;
 
-        let size = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+        let logical_size = shape.iter().product::<usize>() * std::mem::size_of::<T>();
         let name = match name {
             Some(name) => name.to_owned(),
             None => {
@@ -62,9 +66,14 @@ where
             Err(_) => dma_heap::Heap::new(dma_heap::HeapKind::System)?,
         };
 
-        let dma_fd = heap.allocate(size)?;
+        let dma_fd = heap.allocate(logical_size)?;
         let stat = fstat(&dma_fd)?;
         debug!("DMA memory stat: {stat:?}");
+        let buf_size = if stat.st_size > 0 {
+            std::cmp::max(stat.st_size as usize, logical_size)
+        } else {
+            logical_size
+        };
 
         let drm_attachment = crate::dmabuf::DrmAttachment::new(&dma_fd);
 
@@ -75,6 +84,7 @@ where
             _marker: std::marker::PhantomData,
             _drm_attachment: drm_attachment,
             identity: crate::BufferIdentity::new(),
+            buf_size,
         })
     }
 
@@ -90,10 +100,29 @@ where
             return Err(Error::InvalidSize(0));
         }
 
-        let size = shape.iter().product::<usize>() * std::mem::size_of::<T>();
-        if size == 0 {
+        let logical_size = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+        if logical_size == 0 {
             return Err(Error::InvalidSize(0));
         }
+
+        // fstat may return st_size=0 for DMA-BUF fds on some kernels;
+        // fall back to logical_size in that case.
+        let buf_size = {
+            #[cfg(target_os = "linux")]
+            {
+                use nix::sys::stat::fstat;
+                match fstat(&fd) {
+                    Ok(stat) if stat.st_size > 0 && stat.st_size as usize >= logical_size => {
+                        stat.st_size as usize
+                    }
+                    _ => logical_size,
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                logical_size
+            }
+        };
 
         #[cfg(target_os = "linux")]
         let drm_attachment = crate::dmabuf::DrmAttachment::new(&fd);
@@ -106,6 +135,7 @@ where
             #[cfg(target_os = "linux")]
             _drm_attachment: drm_attachment,
             identity: crate::BufferIdentity::new(),
+            buf_size,
         })
     }
 
@@ -146,6 +176,7 @@ where
         Ok(TensorMap::Dma(DmaMap::new(
             self.fd.try_clone()?,
             &self.shape,
+            self.buf_size,
         )?))
     }
 
@@ -179,6 +210,7 @@ where
             #[cfg(target_os = "linux")]
             _drm_attachment: drm_attachment,
             identity: self.identity.clone(),
+            buf_size: self.buf_size,
         })
     }
 }
@@ -191,6 +223,8 @@ where
     ptr: Arc<Mutex<DmaPtr>>,
     fd: OwnedFd,
     shape: Vec<usize>,
+    /// Actual mmap'd size (may be > shape.product() * sizeof(T) for padded buffers).
+    mmap_size: usize,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -198,19 +232,24 @@ impl<T> DmaMap<T>
 where
     T: Num + Clone + fmt::Debug,
 {
-    pub fn new(fd: OwnedFd, shape: &[usize]) -> Result<Self> {
+    pub fn new(fd: OwnedFd, shape: &[usize], buf_size: usize) -> Result<Self> {
         if shape.is_empty() {
             return Err(Error::InvalidSize(0));
         }
 
-        let size = shape.iter().product::<usize>() * std::mem::size_of::<T>();
-        if size == 0 {
+        let logical_size = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+        if logical_size == 0 {
             return Err(Error::InvalidSize(0));
         }
 
+        // Use the buffer's actual size (from fstat at DmaTensor creation) to ensure
+        // mmap covers the full allocation, including any row padding from external
+        // allocators. as_slice() still uses the logical element count from shape.
+        let mmap_size = std::cmp::max(buf_size, logical_size);
+
         #[cfg(target_os = "linux")]
         {
-            trace!("DmaMap: sync start fd={} size={size}", fd.as_raw_fd());
+            trace!("DmaMap: sync start fd={} size={mmap_size}", fd.as_raw_fd());
             if let Err(e) = crate::dmabuf::start_readwrite(&fd) {
                 warn!(
                     "DmaMap: DMA_BUF_IOCTL_SYNC(START) failed fd={}: {e}",
@@ -223,7 +262,7 @@ where
         let ptr = unsafe {
             nix::sys::mman::mmap(
                 None,
-                NonZero::new(size).ok_or(Error::InvalidSize(size))?,
+                NonZero::new(mmap_size).ok_or(Error::InvalidSize(mmap_size))?,
                 nix::sys::mman::ProtFlags::PROT_READ | nix::sys::mman::ProtFlags::PROT_WRITE,
                 nix::sys::mman::MapFlags::MAP_SHARED,
                 &fd,
@@ -232,11 +271,12 @@ where
         };
 
         trace!("Mapping DMA memory: {ptr:?}");
-        let dma_ptr = DmaPtr(NonNull::new(ptr.as_ptr()).ok_or(Error::InvalidSize(size))?);
+        let dma_ptr = DmaPtr(NonNull::new(ptr.as_ptr()).ok_or(Error::InvalidSize(mmap_size))?);
         Ok(DmaMap {
             ptr: Arc::new(Mutex::new(dma_ptr)),
             fd,
             shape: shape.to_vec(),
+            mmap_size,
             _marker: std::marker::PhantomData,
         })
     }
@@ -285,7 +325,7 @@ where
     fn unmap(&mut self) {
         let ptr = self.ptr.lock().expect("Failed to lock DmaMap pointer");
 
-        if let Err(e) = unsafe { nix::sys::mman::munmap(**ptr, self.size()) } {
+        if let Err(e) = unsafe { nix::sys::mman::munmap(**ptr, self.mmap_size) } {
             warn!("Failed to unmap DMA memory: {e}");
         }
 

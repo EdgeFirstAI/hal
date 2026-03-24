@@ -1021,33 +1021,84 @@ impl PyImageProcessor {
         Ok(PyTensor(dyn_tensor))
     }
 
-    /// Create an image tensor backed by an external DMA-BUF file descriptor.
+    /// Import an external DMA-BUF image.
     ///
     /// The GPU renders directly into this buffer via EGL DMA-BUF import —
     /// no CPU copy is needed after ``convert()``. The caller retains ownership
-    /// of the underlying buffer; the returned tensor borrows it via ``dup(fd)``.
+    /// of the underlying buffer; the fd is ``dup()``'d immediately.
+    ///
+    /// The optional ``stride`` and ``offset`` parameters specify the row stride
+    /// in bytes and the byte offset within the DMA-BUF where pixel data starts.
+    /// Use these when importing buffers with row padding (e.g. V4L2 ``bytesperline``
+    /// > width * bytes_per_pixel). When omitted, rows are assumed tightly packed
+    /// starting at byte 0.
+    ///
+    /// For multiplane NV12, pass ``chroma_fd`` for the UV plane, with optional
+    /// ``chroma_stride`` and ``chroma_offset`` for the UV plane layout.
+    ///
+    /// The caller must ensure the DMA-BUF allocation is large enough for the
+    /// specified dimensions, format, and any stride/offset values. No buffer-size
+    /// validation is performed.
     #[cfg(target_os = "linux")]
-    #[pyo3(signature = (fd, width, height, format, dtype = "uint8"))]
-    pub fn create_image_from_fd(
+    #[pyo3(signature = (fd, width, height, format, dtype = "uint8", stride = None, offset = None, chroma_fd = None, chroma_stride = None, chroma_offset = None))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_image(
         &self,
         fd: std::os::fd::RawFd,
         width: usize,
         height: usize,
         format: PyPixelFormat,
         dtype: &str,
+        stride: Option<usize>,
+        offset: Option<usize>,
+        chroma_fd: Option<std::os::fd::RawFd>,
+        chroma_stride: Option<usize>,
+        chroma_offset: Option<usize>,
     ) -> Result<PyTensor> {
         use std::os::fd::BorrowedFd;
+        use tensor::PlaneDescriptor;
+
         if fd < 0 {
             return Err(Error::InvalidArg("Invalid file descriptor".to_string()));
         }
         let fmt: PixelFormat = format.into();
         let dt = crate::tensor::parse_dtype(dtype).map_err(|e| Error::InvalidArg(e.to_string()))?;
+
+        // Build image plane descriptor (dups fd eagerly)
         let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-        let dyn_tensor = self
+        let mut image_pd = PlaneDescriptor::new(borrowed)?;
+        if let Some(s) = stride {
+            image_pd = image_pd.with_stride(s);
+        }
+        if let Some(o) = offset {
+            image_pd = image_pd.with_offset(o);
+        }
+
+        // Build optional chroma plane descriptor
+        let chroma_pd = if let Some(c_fd) = chroma_fd {
+            if c_fd < 0 {
+                return Err(Error::InvalidArg(
+                    "Invalid chroma file descriptor".to_string(),
+                ));
+            }
+            let c_borrowed = unsafe { BorrowedFd::borrow_raw(c_fd) };
+            let mut cpd = PlaneDescriptor::new(c_borrowed)?;
+            if let Some(s) = chroma_stride {
+                cpd = cpd.with_stride(s);
+            }
+            if let Some(o) = chroma_offset {
+                cpd = cpd.with_offset(o);
+            }
+            Some(cpd)
+        } else {
+            None
+        };
+
+        let proc = self
             .0
             .lock()
-            .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?
-            .create_image_from_fd(borrowed, width, height, fmt, dt)?;
+            .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
+        let dyn_tensor = proc.import_image(image_pd, chroma_pd, width, height, fmt, dt)?;
         Ok(PyTensor(dyn_tensor))
     }
 
