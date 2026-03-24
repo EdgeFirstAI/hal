@@ -56,7 +56,7 @@ on:
 
 defaults:
   run:
-    shell: bash -o pipefail {0}
+    shell: bash --noprofile --norc -e -o pipefail {0}
 
 env:
   CARGO_TERM_COLOR: always
@@ -464,11 +464,12 @@ jobs:
           # CPU-only crates (bench, decoder, tracker, capi) run on the aarch64 runner.
           # Exclude opencv — no opencv tests run on hardware, and dropping it
           # significantly reduces binary size (faster transfer to embedded target).
-          # LTO=fat in the profiling profile strips unreachable code across crates.
+          # LTO=thin in the profiling profile strips unreachable code across crates.
           cargo nextest run --no-run --cargo-profile profiling \
             --package edgefirst-image \
-            --package edgefirst-tensor \
             --features opengl,g2d_test_formats,dma_test_formats
+          cargo nextest run --no-run --cargo-profile profiling \
+            --package edgefirst-tensor
           mkdir -p hardware-test-binaries
           find target/llvm-cov-target/profiling/deps/ -maxdepth 1 -type f -executable \
             ! -name "*.d" ! -name "*.rlib" ! -name "*.rmeta" ! -name "*.so" \
@@ -814,12 +815,13 @@ jobs:
             test_name=$(basename "$test_bin")
             echo "=== Running $test_name ($label) ==="
             EXIT_CODE=0
-            "$test_bin" "$filter" --test-threads=1 2>&1 | tee -a "build/rust-test-results/${test_name}.txt" || EXIT_CODE=$?
+            local logfile="build/rust-test-results/${test_name}-${label// /-}.txt"
+            "$test_bin" "$filter" --test-threads=1 2>&1 | tee "$logfile" || EXIT_CODE=$?
             if [ $EXIT_CODE -ne 0 ]; then
               # Check if all tests actually passed but process crashed on
               # exit (Vivante GPU driver SIGABRT during library unload)
-              if grep -q 'test result: ok' "build/rust-test-results/${test_name}.txt" && \
-                 ! grep -q 'FAILED' "build/rust-test-results/${test_name}.txt"; then
+              if grep -q 'test result: ok' "$logfile" && \
+                 ! grep -q 'FAILED' "$logfile"; then
                 echo "::warning::$test_name ($label) exited with code $EXIT_CODE (likely GPU driver crash during shutdown) but all tests passed"
               else
                 echo "FAILED: $test_name ($label)"
