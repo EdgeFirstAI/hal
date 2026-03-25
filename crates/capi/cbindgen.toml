@@ -71,6 +71,10 @@ sys_includes = ["stddef.h", "stdio.h"]
 no_includes = false
 
 [export]
+# HalDmabufTensorInfo has no exported functions referencing it (the HAL
+# only defines the type; implementations live in edgefirst-tflite), so
+# cbindgen would otherwise skip it. This list is additive — all other
+# types/functions are still emitted normally.
 include = ["HalDmabufTensorInfo"]
 exclude = []
 item_types = ["enums", "structs", "unions", "typedefs", "opaque", "functions", "constants"]
