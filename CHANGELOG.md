@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-03-25
+
+### Added
+
+- **Integrated object tracking in decoder** (`decode_tracked`) — fused
+  decode+track pipeline that applies ByteTrack multi-object tracking to
+  decoded detections, maintaining persistent track IDs across frames with
+  Kalman-filtered location smoothing. Available across all language bindings:
+
+  | Layer | New APIs |
+  |-------|----------|
+  | Rust | `decode_tracked_quantized()`, `decode_tracked_float()`, `decode_tracked_quantized_proto()`, `decode_tracked_float_proto()` |
+  | C | `hal_decoder_decode_tracked()`, `hal_decoder_decode_tracked_draw_masks()` |
+  | Python | `Decoder.decode_tracked()` |
+
+- **ByteTrack tracker API** — standalone tracker with configurable confidence
+  thresholds, IOU matching, and track lifespan. New types `TrackInfo` (UUID,
+  smoothed location, timestamps, update count) and `ActiveTrackInfo` (track
+  info + raw detection). Available in Rust, C (`hal_bytetrack_*` functions),
+  and Python (`ByteTrack` class).
+
+- **Delegate DMA-BUF API type definitions** (EDGEAI-1189) — C ABI contract
+  for zero-copy NPU integration. Defines `hal_dmabuf_tensor_info` struct
+  (96 bytes, no padding on LP64) and function signatures for delegate
+  implementors: `hal_dmabuf_is_supported()`, `hal_dmabuf_get_tensor_info()`,
+  `hal_dmabuf_sync_for_device()`, `hal_dmabuf_sync_for_cpu()`. Forward-
+  compatible via `info_size` parameter. Types only — function implementations
+  are provided by delegate libraries (e.g. `edgefirst-tflite`).
+
+### Fixed
+
+- Panics, null dereference, and unsafe implementations identified during
+  code review of the tracker integration (EDGEAI-1022)
+
 ## [0.12.0] - 2026-03-24
 
 ### Added
