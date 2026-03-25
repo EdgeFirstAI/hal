@@ -235,6 +235,7 @@ impl ImageProcessorTrait for G2DProcessor {
         _dst: &mut TensorDyn,
         _detect: &[crate::DetectBox],
         _segmentation: &[crate::Segmentation],
+        _overlay: crate::MaskOverlay<'_>,
     ) -> Result<()> {
         Err(Error::NotImplemented(
             "G2D does not support drawing detection or segmentation overlays".to_string(),
@@ -246,6 +247,7 @@ impl ImageProcessorTrait for G2DProcessor {
         _dst: &mut TensorDyn,
         _detect: &[crate::DetectBox],
         _proto_data: &crate::ProtoData,
+        _overlay: crate::MaskOverlay<'_>,
     ) -> Result<()> {
         Err(Error::NotImplemented(
             "G2D does not support drawing detection or segmentation overlays".to_string(),

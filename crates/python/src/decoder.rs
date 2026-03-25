@@ -803,13 +803,15 @@ impl PyDecoder {
     /// path.
     ///
     /// Returns `(boxes, scores, classes)` — no mask arrays are returned.
-    #[pyo3(signature = (model_output, processor, dst, max_boxes=100))]
+    #[pyo3(signature = (model_output, processor, dst, max_boxes=100, background=None, opacity=1.0))]
     pub fn draw_masks<'py>(
         self_: PyRef<'py, Self>,
         model_output: ListOfReadOnlyArrayGenericDyn,
         processor: &mut PyImageProcessor,
         dst: &mut PyTensor,
         max_boxes: usize,
+        background: Option<&PyTensor>,
+        opacity: f32,
     ) -> PyResult<PyDetOutput<'py>> {
         let mut output_boxes = Vec::with_capacity(max_boxes);
         let mut output_masks = Vec::with_capacity(max_boxes);
@@ -883,10 +885,14 @@ impl PyDecoder {
         };
 
         // Render based on whether we got proto data or not
+        let overlay = edgefirst_hal::image::MaskOverlay {
+            background: background.map(|b| &b.0),
+            opacity,
+        };
         if let Ok(mut l) = processor.0.lock() {
             if let Some(proto_data) = proto_result {
                 // Fused path: render directly from proto data (masks stay in Rust)
-                l.draw_masks_proto(&mut dst.0, &output_boxes, &proto_data)
+                l.draw_masks_proto(&mut dst.0, &output_boxes, &proto_data, overlay)
                     .map_err(|e| {
                         pyo3::exceptions::PyRuntimeError::new_err(format!(
                             "draw_masks_proto: {e:#?}"
@@ -963,7 +969,7 @@ impl PyDecoder {
                 if let Err(e) = result {
                     return Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")));
                 }
-                l.draw_masks(&mut dst.0, &output_boxes, &output_masks)
+                l.draw_masks(&mut dst.0, &output_boxes, &output_masks, overlay)
                     .map_err(|e| {
                         pyo3::exceptions::PyRuntimeError::new_err(format!("draw_masks: {e:#?}"))
                     })?;

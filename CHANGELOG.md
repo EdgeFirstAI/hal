@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **YOLO-SEG 2-way split decoder** (`ModelType::YoloSegDet2Way`) — supports
+  TFLite INT8 segmentation models with 3 outputs: a combined detection tensor
+  `[1, nc+4, N]` (boxes + scores), a separate mask-coefficient tensor
+  `[1, 32, N]`, and a prototype-mask tensor `[1, H/4, W/4, 32]`.  The
+  builder auto-selects this variant when `Detection` + `MaskCoefficients` +
+  `Protos` outputs are provided.  Supported in all decode paths (float,
+  quantized, and proto variants).
+
+- **`MaskOverlay` compositing options** for `draw_masks()` and
+  `draw_masks_proto()` — new `overlay` parameter with two controls:
+  - `background: Option<&TensorDyn>` — when set, copies the background
+    image into `dst` before compositing masks, allowing masks to be
+    rendered over a separate frame.
+  - `opacity: f32` (default `1.0`) — scales the alpha of every rendered
+    mask and bounding box color; `0.5` produces semi-transparent overlays.
+
+  Available in Rust, Python (`background=None, opacity=1.0` keyword args
+  on `Decoder.draw_masks()` and `ImageProcessor.draw_masks()`), and C
+  (`hal_decoder_draw_masks()` gains `background` and `opacity` params).
+  All 7 GL fragment shaders updated with `uniform float opacity`.
+
 ## [0.12.0] - 2026-03-24
 
 ### Added

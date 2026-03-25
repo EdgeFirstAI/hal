@@ -920,7 +920,7 @@ impl PyImageProcessor {
         Ok(())
     }
 
-    #[pyo3(signature = (dst, bbox, scores, classes, seg=vec![]))]
+    #[pyo3(signature = (dst, bbox, scores, classes, seg=vec![], background=None, opacity=1.0))]
     pub fn draw_masks(
         &mut self,
         dst: &mut PyTensor,
@@ -928,6 +928,8 @@ impl PyImageProcessor {
         scores: PyReadonlyArray1<f32>,
         classes: PyReadonlyArray1<usize>,
         seg: Vec<PyReadonlyArray3<u8>>,
+        background: Option<&PyTensor>,
+        opacity: f32,
     ) -> Result<()> {
         if bbox.shape()[1] != 4 {
             return Err(Error::InvalidArg("bbox shape must be (N, 4)".to_string()));
@@ -994,7 +996,11 @@ impl PyImageProcessor {
             .0
             .lock()
             .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
-        l.draw_masks(&mut dst.0, &detect, &seg)?;
+        let overlay = image::MaskOverlay {
+            background: background.map(|b| &b.0),
+            opacity,
+        };
+        l.draw_masks(&mut dst.0, &detect, &seg, overlay)?;
         Ok(())
     }
 

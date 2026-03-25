@@ -216,6 +216,70 @@ pub enum Flip {
     Horizontal = 2,
 }
 
+/// Options for mask overlay rendering.
+///
+/// Controls how segmentation masks are composited onto the destination image:
+/// - `background`: when set, the background image is drawn first and masks
+///   are composited over it (result written to `dst`). When `None`, masks
+///   are composited directly over `dst`'s existing content.
+/// - `opacity`: scales the alpha of rendered mask colors. `1.0` (default)
+///   preserves the class color's alpha unchanged; `0.5` makes masks
+///   semi-transparent.
+#[derive(Debug, Clone, Copy)]
+pub struct MaskOverlay<'a> {
+    pub background: Option<&'a TensorDyn>,
+    pub opacity: f32,
+}
+
+impl Default for MaskOverlay<'_> {
+    fn default() -> Self {
+        Self {
+            background: None,
+            opacity: 1.0,
+        }
+    }
+}
+
+impl<'a> MaskOverlay<'a> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_background(mut self, bg: &'a TensorDyn) -> Self {
+        self.background = Some(bg);
+        self
+    }
+
+    pub fn with_opacity(mut self, opacity: f32) -> Self {
+        self.opacity = opacity.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Blit background into dst (if set) and return an overlay with
+    /// background cleared so backends don't need to handle it.
+    fn apply_background(&self, dst: &mut TensorDyn) -> Result<MaskOverlay<'static>> {
+        use edgefirst_tensor::TensorMapTrait;
+        if let Some(bg) = self.background {
+            let bg_u8 = bg.as_u8().ok_or(Error::NotAnImage)?;
+            let dst_u8 = dst.as_u8_mut().ok_or(Error::NotAnImage)?;
+            let bg_map = bg_u8.map()?;
+            let mut dst_map = dst_u8.map()?;
+            let bg_slice = bg_map.as_slice();
+            let dst_slice = dst_map.as_mut_slice();
+            if bg_slice.len() != dst_slice.len() {
+                return Err(Error::InvalidShape(
+                    "background buffer size does not match dst".into(),
+                ));
+            }
+            dst_slice.copy_from_slice(bg_slice);
+        }
+        Ok(MaskOverlay {
+            background: None,
+            opacity: self.opacity,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Crop {
     pub src_rect: Option<Rect>,
@@ -375,11 +439,16 @@ pub trait ImageProcessorTrait {
     /// - G2D backend: not implemented (returns `NotImplemented`).
     ///
     /// An empty `segmentation` slice is valid — only bounding boxes are drawn.
+    ///
+    /// `overlay` controls compositing: `background` replaces dst's base
+    /// content; `opacity` scales mask alpha. Use `MaskOverlay::default()`
+    /// for backward-compatible behaviour.
     fn draw_masks(
         &mut self,
         dst: &mut TensorDyn,
         detect: &[DetectBox],
         segmentation: &[Segmentation],
+        overlay: MaskOverlay<'_>,
     ) -> Result<()>;
 
     /// Draw masks from proto data onto image (fused decode+draw).
@@ -396,11 +465,14 @@ pub trait ImageProcessorTrait {
     /// # Format requirements
     ///
     /// Same as [`draw_masks`](Self::draw_masks). G2D returns `NotImplemented`.
+    ///
+    /// `overlay` controls compositing — see [`draw_masks`](Self::draw_masks).
     fn draw_masks_proto(
         &mut self,
         dst: &mut TensorDyn,
         detect: &[DetectBox],
         proto_data: &ProtoData,
+        overlay: MaskOverlay<'_>,
     ) -> Result<()>;
 
     /// Decode masks into a compact atlas buffer.
@@ -1233,6 +1305,7 @@ impl ImageProcessorTrait for ImageProcessor {
         dst: &mut TensorDyn,
         detect: &[DetectBox],
         segmentation: &[Segmentation],
+        overlay: MaskOverlay<'_>,
     ) -> Result<()> {
         let start = Instant::now();
 
@@ -1244,8 +1317,10 @@ impl ImageProcessorTrait for ImageProcessor {
         if let Some(forced) = self.forced_backend {
             return match forced {
                 ForcedBackend::Cpu => {
+                    // CPU needs background pre-blitted
+                    let overlay = overlay.apply_background(dst)?;
                     if let Some(cpu) = self.cpu.as_mut() {
-                        return cpu.draw_masks(dst, detect, segmentation);
+                        return cpu.draw_masks(dst, detect, segmentation, overlay);
                     }
                     Err(Error::ForcedBackendUnavailable("cpu".into()))
                 }
@@ -1253,10 +1328,11 @@ impl ImageProcessorTrait for ImageProcessor {
                     "g2d does not support draw_masks".into(),
                 )),
                 ForcedBackend::OpenGl => {
+                    // GL handles background natively via GPU blit
                     #[cfg(target_os = "linux")]
                     #[cfg(feature = "opengl")]
                     if let Some(opengl) = self.opengl.as_mut() {
-                        return opengl.draw_masks(dst, detect, segmentation);
+                        return opengl.draw_masks(dst, detect, segmentation, overlay);
                     }
                     Err(Error::ForcedBackendUnavailable("opengl".into()))
                 }
@@ -1265,11 +1341,12 @@ impl ImageProcessorTrait for ImageProcessor {
 
         // skip G2D as it doesn't support rendering to image
 
+        // GL path: pass overlay with background — GL will GPU-blit if DMA-BUF
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
         if let Some(opengl) = self.opengl.as_mut() {
             log::trace!("draw_masks started with opengl in {:?}", start.elapsed());
-            match opengl.draw_masks(dst, detect, segmentation) {
+            match opengl.draw_masks(dst, detect, segmentation, overlay) {
                 Ok(_) => {
                     log::trace!("draw_masks with opengl in {:?}", start.elapsed());
                     return Ok(());
@@ -1279,9 +1356,12 @@ impl ImageProcessorTrait for ImageProcessor {
                 }
             }
         }
+
+        // CPU fallback: blit background via memcpy before rendering
+        let overlay = overlay.apply_background(dst)?;
         log::trace!("draw_masks started with cpu in {:?}", start.elapsed());
         if let Some(cpu) = self.cpu.as_mut() {
-            match cpu.draw_masks(dst, detect, segmentation) {
+            match cpu.draw_masks(dst, detect, segmentation, overlay) {
                 Ok(_) => {
                     log::trace!("draw_masks with cpu in {:?}", start.elapsed());
                     return Ok(());
@@ -1300,6 +1380,7 @@ impl ImageProcessorTrait for ImageProcessor {
         dst: &mut TensorDyn,
         detect: &[DetectBox],
         proto_data: &ProtoData,
+        overlay: MaskOverlay<'_>,
     ) -> Result<()> {
         let start = Instant::now();
 
@@ -1311,8 +1392,9 @@ impl ImageProcessorTrait for ImageProcessor {
         if let Some(forced) = self.forced_backend {
             return match forced {
                 ForcedBackend::Cpu => {
+                    let overlay = overlay.apply_background(dst)?;
                     if let Some(cpu) = self.cpu.as_mut() {
-                        return cpu.draw_masks_proto(dst, detect, proto_data);
+                        return cpu.draw_masks_proto(dst, detect, proto_data, overlay);
                     }
                     Err(Error::ForcedBackendUnavailable("cpu".into()))
                 }
@@ -1323,7 +1405,7 @@ impl ImageProcessorTrait for ImageProcessor {
                     #[cfg(target_os = "linux")]
                     #[cfg(feature = "opengl")]
                     if let Some(opengl) = self.opengl.as_mut() {
-                        return opengl.draw_masks_proto(dst, detect, proto_data);
+                        return opengl.draw_masks_proto(dst, detect, proto_data, overlay);
                     }
                     Err(Error::ForcedBackendUnavailable("opengl".into()))
                 }
@@ -1335,6 +1417,7 @@ impl ImageProcessorTrait for ImageProcessor {
         // Hybrid path: CPU materialize + GL overlay (benchmarked faster than
         // full-GPU draw_masks_proto on all tested platforms: 27× on imx8mp,
         // 4× on imx95, 2.5× on rpi5, 1.6× on x86).
+        // GL handles background natively via GPU blit.
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
         if let Some(opengl) = self.opengl.as_mut() {
@@ -1348,7 +1431,7 @@ impl ImageProcessorTrait for ImageProcessor {
                 start.elapsed()
             );
             let segmentation = cpu.materialize_segmentations(detect, proto_data)?;
-            match opengl.draw_masks(dst, detect, &segmentation) {
+            match opengl.draw_masks(dst, detect, &segmentation, overlay) {
                 Ok(_) => {
                     log::trace!(
                         "draw_masks_proto with hybrid (cpu+opengl) in {:?}",
@@ -1362,14 +1445,15 @@ impl ImageProcessorTrait for ImageProcessor {
             }
         }
 
-        // CPU-only fallback (no OpenGL, or hybrid GL overlay failed)
+        // CPU-only fallback: blit background via memcpy
+        let overlay = overlay.apply_background(dst)?;
         let Some(cpu) = self.cpu.as_mut() else {
             return Err(Error::Internal(
                 "draw_masks_proto requires CPU backend for fallback path".into(),
             ));
         };
         log::trace!("draw_masks_proto started with cpu in {:?}", start.elapsed());
-        cpu.draw_masks_proto(dst, detect, proto_data)
+        cpu.draw_masks_proto(dst, detect, proto_data, overlay)
     }
 
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<()> {
@@ -5315,7 +5399,8 @@ mod image_tests {
             mask_coefficients: vec![vec![0.5; 4]],
             protos: edgefirst_decoder::ProtoTensor::Float(ndarray::Array3::<f32>::zeros((8, 8, 4))),
         };
-        let result = converter.draw_masks_proto(&mut dst_dyn, &det, &proto_data);
+        let result =
+            converter.draw_masks_proto(&mut dst_dyn, &det, &proto_data, Default::default());
         assert!(
             matches!(&result, Err(Error::Internal(s)) if s.contains("CPU backend")),
             "draw_masks_proto without CPU should return Internal error: {result:?}"
@@ -5359,7 +5444,8 @@ mod image_tests {
             mask_coefficients: vec![vec![0.5; 4]],
             protos: edgefirst_decoder::ProtoTensor::Float(ndarray::Array3::<f32>::zeros((8, 8, 4))),
         };
-        let result = converter.draw_masks_proto(&mut dst_dyn, &det, &proto_data);
+        let result =
+            converter.draw_masks_proto(&mut dst_dyn, &det, &proto_data, Default::default());
         assert!(result.is_ok(), "CPU fallback path should work: {result:?}");
     }
 

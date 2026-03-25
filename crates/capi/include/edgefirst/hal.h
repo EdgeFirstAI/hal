@@ -1144,6 +1144,8 @@ void hal_segmentation_list_free(struct hal_segmentation_list *list);
  * @param outputs Array of output tensor pointers
  * @param num_outputs Number of output tensors
  * @param dst Destination image to draw onto
+ * @param background Optional background image (NULL to draw over dst)
+ * @param opacity Mask opacity in [0.0, 1.0] (1.0 = fully opaque)
  * @param out_boxes Output parameter for detection box list (caller must free)
  * @return 0 on success, -1 on error
  * @par Errors (errno):
@@ -1155,6 +1157,8 @@ int hal_decoder_draw_masks(const struct hal_decoder *decoder,
                            const struct hal_tensor *const *outputs,
                            size_t num_outputs,
                            struct hal_tensor *dst,
+                           const struct hal_tensor *background,
+                           float opacity,
                            struct hal_detect_box_list **out_boxes);
 
 /**

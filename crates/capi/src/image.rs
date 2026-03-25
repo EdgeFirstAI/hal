@@ -837,6 +837,7 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks(
             &mut unsafe { &mut (*dst) }.inner,
             detect_slice,
             seg_slice,
+            edgefirst_image::MaskOverlay::default(),
         ),
         libc::EIO
     );

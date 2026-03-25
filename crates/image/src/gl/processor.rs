@@ -40,6 +40,8 @@ pub struct GLProcessorST {
     proto_dequant_int8_program: GlProgram,
     proto_segmentation_f32_program: GlProgram,
     color_program: GlProgram,
+    /// Last opacity value set on shader uniforms (avoids redundant GL calls).
+    cached_opacity: f32,
     /// Whether GL_OES_texture_float_linear is available (allows GL_LINEAR on R32F textures).
     has_float_linear: bool,
     /// Whether GL_EXT_texture_format_BGRA8888 is available (allows BGRA destinations).
@@ -213,9 +215,11 @@ impl ImageProcessorTrait for GLProcessorST {
         dst: &mut TensorDyn,
         detect: &[DetectBox],
         segmentation: &[Segmentation],
+        overlay: crate::MaskOverlay<'_>,
     ) -> Result<(), crate::Error> {
+        let bg = overlay.background.map(|bg| dyn_to_u8_src(bg)).transpose()?;
         let (dst_u8, dst_fmt, _is_int8) = dyn_to_u8_dst(dst)?;
-        self.draw_masks_impl(dst_u8, dst_fmt, detect, segmentation)
+        self.draw_masks_impl(dst_u8, dst_fmt, detect, segmentation, overlay.opacity, bg)
     }
 
     fn draw_masks_proto(
@@ -223,9 +227,11 @@ impl ImageProcessorTrait for GLProcessorST {
         dst: &mut TensorDyn,
         detect: &[DetectBox],
         proto_data: &ProtoData,
+        overlay: crate::MaskOverlay<'_>,
     ) -> crate::Result<()> {
+        let bg = overlay.background.map(|bg| dyn_to_u8_src(bg)).transpose()?;
         let (dst_u8, dst_fmt, _is_int8) = dyn_to_u8_dst(dst)?;
-        self.draw_masks_proto_impl(dst_u8, dst_fmt, detect, proto_data)
+        self.draw_masks_proto_impl(dst_u8, dst_fmt, detect, proto_data, overlay.opacity, bg)
     }
 
     fn decode_masks_atlas(
@@ -461,6 +467,7 @@ impl GLProcessorST {
             instanced_segmentation_program,
             proto_segmentation_program,
             color_program,
+            cached_opacity: f32::NAN, // sentinel: forces first set_opacity_uniform to initialize all shaders
         };
         check_gl_error(function!(), line!())?;
 
@@ -1172,12 +1179,15 @@ impl GLProcessorST {
         res
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn draw_masks_impl(
         &mut self,
         dst: &mut Tensor<u8>,
         dst_fmt: PixelFormat,
         detect: &[DetectBox],
         segmentation: &[Segmentation],
+        opacity: f32,
+        background: Option<(&Tensor<u8>, PixelFormat)>,
     ) -> Result<(), crate::Error> {
         use crate::FunctionTimer;
 
@@ -1219,6 +1229,43 @@ impl GLProcessorST {
             }
         };
 
+        // GPU-blit background into framebuffer if provided and DMA-capable
+        if let Some((bg, bg_fmt)) = background {
+            if is_dma && bg.memory() == TensorMemory::Dma {
+                gls::disable(gls::gl::BLEND);
+                let bg_egl = self.get_or_create_egl_image(CacheKind::Src, bg, bg_fmt)?;
+                self.draw_camera_texture_eglimage(
+                    bg,
+                    bg_fmt,
+                    bg_egl,
+                    RegionOfInterest {
+                        left: 0.0,
+                        top: 1.0,
+                        right: 1.0,
+                        bottom: 0.0,
+                    },
+                    RegionOfInterest {
+                        left: -1.0,
+                        top: 1.0,
+                        right: 1.0,
+                        bottom: -1.0,
+                    },
+                    0,
+                    crate::Flip::None,
+                )?;
+            } else {
+                // Non-DMA background: CPU blit fallback
+                use edgefirst_tensor::TensorMapTrait;
+                let bg_map = bg.map()?;
+                let mut dst_map = dst.map()?;
+                let bg_slice = bg_map.as_slice();
+                let dst_slice = dst_map.as_mut_slice();
+                if bg_slice.len() == dst_slice.len() {
+                    dst_slice.copy_from_slice(bg_slice);
+                }
+            }
+        }
+
         gls::enable(gls::gl::BLEND);
         gls::blend_func_separate(
             gls::gl::SRC_ALPHA,
@@ -1227,6 +1274,7 @@ impl GLProcessorST {
             gls::gl::ONE,
         );
 
+        self.set_opacity_uniform(opacity)?;
         self.render_box(dst_w, dst_h, detect)?;
         self.render_segmentation(detect, segmentation)?;
 
@@ -1288,12 +1336,15 @@ impl GLProcessorST {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn draw_masks_proto_impl(
         &mut self,
         dst: &mut Tensor<u8>,
         dst_fmt: PixelFormat,
         detect: &[DetectBox],
         proto_data: &ProtoData,
+        opacity: f32,
+        background: Option<(&Tensor<u8>, PixelFormat)>,
     ) -> crate::Result<()> {
         use crate::FunctionTimer;
 
@@ -1335,6 +1386,43 @@ impl GLProcessorST {
             }
         };
 
+        // GPU-blit background into framebuffer if provided and DMA-capable
+        if let Some((bg, bg_fmt)) = background {
+            if is_dma && bg.memory() == TensorMemory::Dma {
+                gls::disable(gls::gl::BLEND);
+                let bg_egl = self.get_or_create_egl_image(CacheKind::Src, bg, bg_fmt)?;
+                self.draw_camera_texture_eglimage(
+                    bg,
+                    bg_fmt,
+                    bg_egl,
+                    RegionOfInterest {
+                        left: 0.0,
+                        top: 1.0,
+                        right: 1.0,
+                        bottom: 0.0,
+                    },
+                    RegionOfInterest {
+                        left: -1.0,
+                        top: 1.0,
+                        right: 1.0,
+                        bottom: -1.0,
+                    },
+                    0,
+                    crate::Flip::None,
+                )?;
+            } else {
+                // Non-DMA background: CPU blit fallback
+                use edgefirst_tensor::TensorMapTrait;
+                let bg_map = bg.map()?;
+                let mut dst_map = dst.map()?;
+                let bg_slice = bg_map.as_slice();
+                let dst_slice = dst_map.as_mut_slice();
+                if bg_slice.len() == dst_slice.len() {
+                    dst_slice.copy_from_slice(bg_slice);
+                }
+            }
+        }
+
         gls::enable(gls::gl::BLEND);
         gls::blend_func_separate(
             gls::gl::SRC_ALPHA,
@@ -1343,6 +1431,7 @@ impl GLProcessorST {
             gls::gl::ONE,
         );
 
+        self.set_opacity_uniform(opacity)?;
         self.render_box(dst_w, dst_h, detect)?;
         self.render_proto_segmentation(detect, proto_data)?;
 
@@ -4919,6 +5008,27 @@ impl GLProcessorST {
         }
 
         gls::disable(gls::gl::BLEND);
+        Ok(())
+    }
+
+    /// Set the `opacity` uniform on all segmentation and color shader programs.
+    /// Skips GL calls entirely when opacity hasn't changed since the last call.
+    fn set_opacity_uniform(&mut self, opacity: f32) -> Result<(), Error> {
+        if (opacity - self.cached_opacity).abs() < f32::EPSILON {
+            return Ok(());
+        }
+        for program in [
+            &self.color_program,
+            &self.segmentation_program,
+            &self.instanced_segmentation_program,
+            &self.proto_segmentation_program,
+            &self.proto_segmentation_int8_nearest_program,
+            &self.proto_segmentation_int8_bilinear_program,
+            &self.proto_segmentation_f32_program,
+        ] {
+            program.load_uniform_1f(c"opacity", opacity)?;
+        }
+        self.cached_opacity = opacity;
         Ok(())
     }
 

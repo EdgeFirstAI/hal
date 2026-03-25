@@ -357,6 +357,128 @@ impl Decoder {
         })
     }
 
+    /// Decode 2-way split: combined detection [1,nc+4,N] + separate
+    /// mask_coeff [1,32,N] + protos [1,H,W,32].
+    pub(super) fn decode_yolo_segdet_2way_quantized(
+        &self,
+        outputs: &[ArrayViewDQuantized],
+        detection: &configs::Detection,
+        mask_coeff: &configs::MaskCoefficients,
+        protos: &configs::Protos,
+        output_boxes: &mut Vec<DetectBox>,
+        output_masks: &mut Vec<Segmentation>,
+    ) -> Result<(), DecoderError> {
+        let quant_det = detection
+            .quantization
+            .map(Quantization::from)
+            .unwrap_or_default();
+        let quant_masks = mask_coeff
+            .quantization
+            .map(Quantization::from)
+            .unwrap_or_default();
+        let quant_protos = protos
+            .quantization
+            .map(Quantization::from)
+            .unwrap_or_default();
+
+        let mut skip = vec![];
+
+        let (det_tensor, ind) =
+            Self::find_outputs_with_shape_quantized(&detection.shape, outputs, &skip)?;
+        skip.push(ind);
+
+        let (mask_tensor, ind) =
+            Self::find_outputs_with_shape_quantized(&mask_coeff.shape, outputs, &skip)?;
+        skip.push(ind);
+
+        let (protos_tensor, _) =
+            Self::find_outputs_with_shape_quantized(&protos.shape, outputs, &skip)?;
+
+        // Phase 1: Slice combined detection into boxes[0:4] and scores[4:],
+        // run NMS. Both slices share the detection tensor's quantization.
+        let boxes = with_quantized!(det_tensor, d, {
+            let det = Self::swap_axes_if_needed(d, detection.into());
+            let det = det.slice(s![0, .., ..]);
+            let boxes_view = det.slice(s![..4, ..]);
+            let scores_view = det.slice(s![4.., ..]);
+            impl_yolo_split_segdet_quant_get_boxes::<XYWH, _, _>(
+                (boxes_view, quant_det),
+                (scores_view, quant_det),
+                self.score_threshold,
+                self.iou_threshold,
+                self.nms,
+                output_boxes.capacity(),
+            )
+        });
+
+        // Phase 2: Process masks with separate mask_coeff tensor.
+        with_quantized!(mask_tensor, m, {
+            with_quantized!(protos_tensor, p, {
+                let mask_tensor = Self::swap_axes_if_needed(m, mask_coeff.into());
+                let mask_tensor = mask_tensor.slice(s![0, .., ..]);
+
+                let protos_tensor = Self::swap_axes_if_needed(p, protos.into());
+                let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
+                let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
+                impl_yolo_split_segdet_quant_process_masks::<_, _>(
+                    boxes,
+                    (mask_tensor, quant_masks),
+                    (protos_tensor, quant_protos),
+                    output_boxes,
+                    output_masks,
+                )
+            })
+        })
+    }
+
+    /// Decode 2-way split (float): combined detection + separate mask_coeff +
+    /// protos.
+    pub(super) fn decode_yolo_segdet_2way_float<T>(
+        &self,
+        outputs: &[ArrayViewD<T>],
+        detection: &configs::Detection,
+        mask_coeff: &configs::MaskCoefficients,
+        protos: &configs::Protos,
+        output_boxes: &mut Vec<DetectBox>,
+        output_masks: &mut Vec<Segmentation>,
+    ) -> Result<(), DecoderError>
+    where
+        T: Float + AsPrimitive<f32> + Send + Sync + 'static,
+        f32: AsPrimitive<T>,
+    {
+        let mut skip = vec![];
+        let (det_tensor, ind) = Self::find_outputs_with_shape(&detection.shape, outputs, &skip)?;
+        let det_tensor = Self::swap_axes_if_needed(det_tensor, detection.into());
+        let det_tensor = det_tensor.slice(s![0, .., ..]);
+        skip.push(ind);
+
+        let (mask_tensor, ind) = Self::find_outputs_with_shape(&mask_coeff.shape, outputs, &skip)?;
+        let mask_tensor = Self::swap_axes_if_needed(mask_tensor, mask_coeff.into());
+        let mask_tensor = mask_tensor.slice(s![0, .., ..]);
+        skip.push(ind);
+
+        let (protos_tensor, _) = Self::find_outputs_with_shape(&protos.shape, outputs, &skip)?;
+        let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos.into());
+        let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
+        let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
+
+        // Slice combined detection into boxes and scores
+        let boxes_view = det_tensor.slice(s![..4, ..]);
+        let scores_view = det_tensor.slice(s![4.., ..]);
+
+        decode_yolo_split_segdet_float(
+            boxes_view,
+            scores_view,
+            mask_tensor,
+            protos_tensor,
+            self.score_threshold,
+            self.iou_threshold,
+            self.nms,
+            output_boxes,
+            output_masks,
+        )
+    }
+
     pub(super) fn decode_modelpack_det_split_float<D>(
         &self,
         outputs: &[ArrayViewD<D>],
@@ -1227,6 +1349,134 @@ impl Decoder {
         >(
             boxes_tensor,
             scores_tensor,
+            mask_tensor,
+            protos_tensor,
+            self.score_threshold,
+            self.iou_threshold,
+            self.nms,
+            output_boxes,
+        ))
+    }
+
+    /// Decode 2-way split proto (quantized): combined detection + separate
+    /// mask_coeff + protos → ProtoData.
+    pub(super) fn decode_yolo_segdet_2way_quantized_proto(
+        &self,
+        outputs: &[ArrayViewDQuantized],
+        detection: &configs::Detection,
+        mask_coeff: &configs::MaskCoefficients,
+        protos: &configs::Protos,
+        output_boxes: &mut Vec<DetectBox>,
+    ) -> Result<ProtoData, DecoderError> {
+        let quant_det = detection
+            .quantization
+            .map(Quantization::from)
+            .unwrap_or_default();
+        let quant_masks = mask_coeff
+            .quantization
+            .map(Quantization::from)
+            .unwrap_or_default();
+        let quant_protos = protos
+            .quantization
+            .map(Quantization::from)
+            .unwrap_or_default();
+
+        let mut skip = vec![];
+
+        let (det_tensor, ind) =
+            Self::find_outputs_with_shape_quantized(&detection.shape, outputs, &skip)?;
+        skip.push(ind);
+
+        let (mask_tensor, ind) =
+            Self::find_outputs_with_shape_quantized(&mask_coeff.shape, outputs, &skip)?;
+        skip.push(ind);
+
+        let (protos_tensor, _) =
+            Self::find_outputs_with_shape_quantized(&protos.shape, outputs, &skip)?;
+
+        // Phase 1: Slice detection into boxes + scores, run NMS.
+        let det_indices = with_quantized!(det_tensor, d, {
+            let det = Self::swap_axes_if_needed(d, detection.into());
+            let det = det.slice(s![0, .., ..]);
+            let boxes_view = det.slice(s![..4, ..]);
+            let scores_view = det.slice(s![4.., ..]);
+            impl_yolo_split_segdet_quant_get_boxes::<XYWH, _, _>(
+                (boxes_view, quant_det),
+                (scores_view, quant_det),
+                self.score_threshold,
+                self.iou_threshold,
+                self.nms,
+                output_boxes.capacity(),
+            )
+        });
+
+        // Phase 2: Extract proto data from separate mask_coeff + protos.
+        let proto = with_quantized!(mask_tensor, m, {
+            with_quantized!(protos_tensor, p, {
+                let mask_tensor = Self::swap_axes_if_needed(m, mask_coeff.into());
+                let mask_tensor = mask_tensor.slice(s![0, .., ..]);
+                let mask_tensor = mask_tensor.reversed_axes();
+
+                let protos_tensor = Self::swap_axes_if_needed(p, protos.into());
+                let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
+                let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
+
+                crate::yolo::extract_proto_data_quant(
+                    det_indices,
+                    mask_tensor,
+                    quant_masks,
+                    protos_tensor,
+                    quant_protos,
+                    output_boxes,
+                )
+            })
+        });
+        Ok(proto)
+    }
+
+    /// Decode 2-way split proto (float): combined detection + separate
+    /// mask_coeff + protos → ProtoData.
+    pub(super) fn decode_yolo_segdet_2way_float_proto<T>(
+        &self,
+        outputs: &[ArrayViewD<T>],
+        detection: &configs::Detection,
+        mask_coeff: &configs::MaskCoefficients,
+        protos: &configs::Protos,
+        output_boxes: &mut Vec<DetectBox>,
+    ) -> Result<ProtoData, DecoderError>
+    where
+        T: Float + AsPrimitive<f32> + Send + Sync + 'static,
+        f32: AsPrimitive<T>,
+    {
+        let mut skip = vec![];
+        let (det_tensor, ind) = Self::find_outputs_with_shape(&detection.shape, outputs, &skip)?;
+        let det_tensor = Self::swap_axes_if_needed(det_tensor, detection.into());
+        let det_tensor = det_tensor.slice(s![0, .., ..]);
+        skip.push(ind);
+
+        let (mask_tensor, ind) = Self::find_outputs_with_shape(&mask_coeff.shape, outputs, &skip)?;
+        let mask_tensor = Self::swap_axes_if_needed(mask_tensor, mask_coeff.into());
+        let mask_tensor = mask_tensor.slice(s![0, .., ..]);
+        skip.push(ind);
+
+        let (protos_tensor, _) = Self::find_outputs_with_shape(&protos.shape, outputs, &skip)?;
+        let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos.into());
+        let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
+        let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
+
+        // Slice combined detection into boxes and scores
+        let boxes_view = det_tensor.slice(s![..4, ..]);
+        let scores_view = det_tensor.slice(s![4.., ..]);
+
+        Ok(crate::yolo::impl_yolo_split_segdet_float_proto::<
+            XYWH,
+            _,
+            _,
+            _,
+            _,
+        >(
+            boxes_view,
+            scores_view,
             mask_tensor,
             protos_tensor,
             self.score_threshold,
