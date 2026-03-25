@@ -1882,14 +1882,16 @@ unsafe fn decode_tracked_quantized_proto_inner(
 /// @param outputs Array of output tensor pointers
 /// @param num_outputs Number of output tensors
 /// @param dst Destination image to draw onto
+/// @param background Optional background image (NULL to draw over dst)
+/// @param opacity Mask opacity in [0.0, 1.0] (1.0 = fully opaque, clamped)
 /// @param out_boxes Output parameter for detection box list (caller must free)
 /// @param out_tracks Output parameter for track info list (can be NULL; caller must free if non-NULL)
 /// @return 0 on success, -1 on error
 /// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL decoder/tracker/processor/outputs/dst/out_boxes)
+/// - EINVAL: Invalid argument (NULL decoder/tracker/processor/outputs/dst/out_boxes, or background == dst)
 /// - EIO: Decoding or drawing failed
 #[no_mangle]
-pub unsafe extern "C" fn hal_decoder_decode_tracked_draw_masks(
+pub unsafe extern "C" fn hal_decoder_draw_masks_tracked(
     decoder: *const HalDecoder,
     tracker: *mut HalByteTrack,
     timestamp: u64,
@@ -1897,6 +1899,8 @@ pub unsafe extern "C" fn hal_decoder_decode_tracked_draw_masks(
     outputs: *const *const HalTensor,
     num_outputs: size_t,
     dst: *mut HalTensor,
+    background: *const HalTensor,
+    opacity: f32,
     out_boxes: *mut *mut HalDetectBoxList,
     out_tracks: *mut *mut HalTrackInfoList,
 ) -> c_int {
@@ -1905,6 +1909,21 @@ pub unsafe extern "C" fn hal_decoder_decode_tracked_draw_masks(
     if num_outputs == 0 {
         return set_error(libc::EINVAL);
     }
+
+    // Reject aliased background == dst
+    if !background.is_null() && background as *const _ == dst as *const _ {
+        return set_error(libc::EINVAL);
+    }
+
+    let bg = if background.is_null() {
+        None
+    } else {
+        Some(&unsafe { &*background }.inner)
+    };
+    let overlay = edgefirst_image::MaskOverlay {
+        background: bg,
+        opacity: opacity.clamp(0.0, 1.0),
+    };
 
     let outputs_slice = std::slice::from_raw_parts(outputs, num_outputs);
     check_null!(outputs_slice[0]);
@@ -1957,7 +1976,7 @@ pub unsafe extern "C" fn hal_decoder_decode_tracked_draw_masks(
                     &mut (*dst).inner,
                     &boxes,
                     &proto_data,
-                    edgefirst_image::MaskOverlay::default()
+                    overlay
                 ),
                 libc::EIO
             );
@@ -1976,12 +1995,9 @@ pub unsafe extern "C" fn hal_decoder_decode_tracked_draw_masks(
                 libc::EIO
             );
             try_or_errno!(
-                (*processor).inner.draw_masks(
-                    &mut (*dst).inner,
-                    &boxes,
-                    &masks,
-                    edgefirst_image::MaskOverlay::default()
-                ),
+                (*processor)
+                    .inner
+                    .draw_masks(&mut (*dst).inner, &boxes, &masks, overlay),
                 libc::EIO
             );
         }
@@ -2005,7 +2021,7 @@ pub unsafe extern "C" fn hal_decoder_decode_tracked_draw_masks(
                     &mut (*dst).inner,
                     &boxes,
                     &proto_data,
-                    edgefirst_image::MaskOverlay::default()
+                    overlay
                 ),
                 libc::EIO
             );
@@ -2024,12 +2040,9 @@ pub unsafe extern "C" fn hal_decoder_decode_tracked_draw_masks(
                 return rc;
             }
             try_or_errno!(
-                (*processor).inner.draw_masks(
-                    &mut (*dst).inner,
-                    &boxes,
-                    &masks,
-                    edgefirst_image::MaskOverlay::default()
-                ),
+                (*processor)
+                    .inner
+                    .draw_masks(&mut (*dst).inner, &boxes, &masks, overlay),
                 libc::EIO
             );
         }
@@ -3476,7 +3489,7 @@ outputs:
             let mut box_list: *mut HalDetectBoxList = std::ptr::null_mut();
             let mut track_list: *mut HalTrackInfoList = std::ptr::null_mut();
 
-            let rc = hal_decoder_decode_tracked_draw_masks(
+            let rc = hal_decoder_draw_masks_tracked(
                 decoder,
                 tracker,
                 0,
@@ -3484,6 +3497,8 @@ outputs:
                 outputs.as_ptr(),
                 5,
                 image,
+                std::ptr::null(),
+                1.0,
                 &mut box_list,
                 &mut track_list,
             );
@@ -3517,7 +3532,7 @@ outputs:
             box_list = std::ptr::null_mut();
             track_list = std::ptr::null_mut();
 
-            let rc = hal_decoder_decode_tracked_draw_masks(
+            let rc = hal_decoder_draw_masks_tracked(
                 decoder,
                 tracker,
                 100_000_000 / 3,
@@ -3525,6 +3540,8 @@ outputs:
                 outputs.as_ptr(),
                 5,
                 image,
+                std::ptr::null(),
+                1.0,
                 &mut box_list,
                 &mut track_list,
             );
@@ -3734,7 +3751,7 @@ outputs:
             let mut box_list: *mut HalDetectBoxList = std::ptr::null_mut();
             let mut track_list: *mut HalTrackInfoList = std::ptr::null_mut();
 
-            let rc = hal_decoder_decode_tracked_draw_masks(
+            let rc = hal_decoder_draw_masks_tracked(
                 decoder,
                 tracker,
                 0,
@@ -3742,6 +3759,8 @@ outputs:
                 outputs.as_ptr(),
                 5,
                 image,
+                std::ptr::null(),
+                1.0,
                 &mut box_list,
                 &mut track_list,
             );
@@ -3775,7 +3794,7 @@ outputs:
             box_list = std::ptr::null_mut();
             track_list = std::ptr::null_mut();
 
-            let rc = hal_decoder_decode_tracked_draw_masks(
+            let rc = hal_decoder_draw_masks_tracked(
                 decoder,
                 tracker,
                 100_000_000 / 3,
@@ -3783,6 +3802,8 @@ outputs:
                 outputs.as_ptr(),
                 5,
                 image,
+                std::ptr::null(),
+                1.0,
                 &mut box_list,
                 &mut track_list,
             );
