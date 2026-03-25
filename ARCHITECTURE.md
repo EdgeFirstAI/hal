@@ -160,7 +160,6 @@ classDiagram
         +convert(src, dst, rotation, flip, crop)
         +draw_masks(dst, detections, segmentations)
         +draw_masks_proto(dst, detections, proto_data)
-        +decode_masks_atlas(detections, proto_data, w, h)
         +set_class_colors(colors)
     }
 
@@ -556,11 +555,10 @@ combination weights). The raw mask for detection `i` is:
 mask_raw[i] = coefficients[i] @ protos    # shape: (proto_h, proto_w)
 ```
 
-The HAL provides three workflows for consuming these masks:
+The HAL provides two workflows for consuming these masks:
 
 | Workflow | Python | Rust | C | CPU | OpenGL | G2D |
 |----------|--------|------|---|:---:|:------:|:---:|
-| **Decode** — per-detection binary masks | `decoder.decode_masks()` | `decode_masks_atlas()` | `hal_decoder_decode_masks()` | Yes | Yes | No |
 | **Draw** — fused overlay onto image | `decoder.draw_masks()` | `draw_masks_proto()` | `hal_decoder_draw_masks()` | Yes | Yes | No |
 | **Draw pre-decoded** — draw already-decoded masks | `processor.draw_masks()` | `draw_masks()` | `hal_image_processor_draw_masks()` | Yes | Yes | No |
 
@@ -570,28 +568,17 @@ The HAL provides three workflows for consuming these masks:
 > an OpenGL-capable `ImageProcessor` (pass an `egl_display`) or fall back
 > to CPU rendering.
 
-**Choosing between `decode_masks` and `draw_masks`:**
+**Choosing between `draw_masks` workflows:**
 
 | Use case | Recommended API | Why |
 |----------|----------------|-----|
 | Overlay colored masks onto a display frame | `decoder.draw_masks()` | Fused path — masks never leave Rust/GPU, lowest latency |
-| Export per-instance binary masks for downstream processing (tracking, area measurement, custom compositing) | `decoder.decode_masks()` | Returns individual `uint8` arrays you can manipulate in Python/C |
 | Draw masks you already have (e.g. from a previous `decode()` call) | `processor.draw_masks()` | Accepts pre-decoded `(H, W, C)` mask arrays |
 
 **Format requirements:**
 
 - **CPU backend:** destination image must be `RGBA` or `RGB`.
 - **OpenGL backend:** destination image must be `RGBA`, `BGRA`, or `RGB`.
-- **`decode_masks`** does not require a destination image (masks are returned as arrays). The `output_width` and `output_height` parameters define the **coordinate space** for interpreting bounding boxes — they are not the dimensions of the returned mask arrays. Each returned mask is sized to its detection's bounding box (`bbox_h × bbox_w` pixels), containing binary `uint8` values where `255` = mask presence and `0` = background.
-
-**Performance characteristics (YOLOv8n-seg, 640×640, ~5 detections):**
-
-| Platform | `draw_masks` (fused) | `decode_masks` (atlas) | Notes |
-|----------|---------------------|----------------------|-------|
-| **i.MX 8M Plus (imx8mp-frdm)** | ~8–12 ms (OpenGL) | ~10–15 ms (OpenGL) | Vivante GC7000UL GPU; PBO readback adds latency for atlas path |
-| **i.MX 8M Plus (CPU only)** | ~25–40 ms | ~20–35 ms | Single-core Cortex-A53; scales linearly with detection count and bbox area |
-| **i.MX 95 (imx95-frdm)** | ~4–7 ms (OpenGL) | ~5–9 ms (OpenGL) | Mali G310 (Panfrost); faster PBO readback than i.MX 8M Plus |
-| **x86_64 desktop (CPU)** | ~3–5 ms | ~2–4 ms | For development; not representative of target hardware |
 
 > These are representative ranges for typical COCO-class detections. Actual
 > timings depend on detection count, bounding box sizes, and proto tensor
@@ -609,9 +596,7 @@ For each output pixel (x, y) in bbox at 640×640:
     bilinear_sample(protos, proto_coords(x, y))  →  32 interpolated values
     dot(coefficients, interpolated_protos)        →  raw logit
     sigmoid(raw)                                  →  mask value [0, 1]
-    threshold at 0.5 → blend color onto pixel (draw path)
-    — or —
-    threshold at 0.0 on logit → 0/255 uint8 pixel (decode/atlas path)
+    threshold at 0.5 → blend color onto pixel
 ```
 
 This is algebraically equivalent to bilinear upsampling after matmul (because
@@ -622,9 +607,7 @@ materializing intermediate tensors. Key design choices:
   avoiding the boundary erosion artifact of crop-before-upsample approaches.
 - **Sigmoid after interpolation** — sigmoid is nonlinear, so applying it after
   spatial operations preserves the full dynamic range through interpolation.
-- **Binary output for decode path** — both CPU and GPU atlas paths produce
-  binary `0`/`255` uint8 masks (thresholded at sigmoid 0.5 or logit 0.0).
-  The draw path uses the sigmoid value for alpha-blend weighting.
+- The draw path uses the sigmoid value for alpha-blend weighting.
 
 This approach is mathematically equivalent to Ultralytics' `retina_masks=True`
 (`process_mask_native`) for binary mask output. Empirical validation across 26
@@ -633,28 +616,13 @@ between the two methods.
 
 **GPU implementation (OpenGL)**
 
-Two shader families are used depending on the workflow:
-
 *Draw path (`draw_masks_proto`) — sigmoid shaders with alpha blending:*
 
 The fragment shader computes sigmoid(logit) and blends the detection color onto
 the framebuffer using `GL_SRC_ALPHA / GL_ONE_MINUS_SRC_ALPHA`.
 
-*Atlas/decode path (`decode_masks_atlas`) — logit-threshold shaders:*
-
-| Shader | Proto format | Interpolation | Notes |
-|--------|-------------|---------------|-------|
-| `logit_int8_nearest` | R8I (quantized) | Nearest | Fastest, lowest quality |
-| `logit_int8_bilinear` | R8I (quantized) | Manual bilinear in shader | Manual 4-tap with dequantization |
-| `logit_f32` | R32F (float) | Hardware `texture()` with GL_LINEAR | Best quality, uses GPU sampler |
-
-These shaders output binary `logit > 0 ? 1.0 : 0.0` (skipping the `exp()` per
-fragment), which the PBO readback maps to uint8 `0`/`255`.
-
-The GPU renders a quad per detection, the fragment shader evaluates the mask at
-every pixel, and the result is read back via PBO as R8 uint8 values. For the
-atlas path, all detections are packed into a single texture atlas and read back
-in one PBO transfer.
+The GPU renders a quad per detection, and the fragment shader evaluates the mask
+at every output pixel.
 
 ### 4. Tracker HAL (`edgefirst_tracker`)
 
@@ -740,7 +708,7 @@ flowchart LR
 
 ### Cross-Crate Dependencies
 
-The `edgefirst_image` crate depends on `edgefirst_decoder` for the `DetectBox`, `ProtoData`, and `Segmentation` types used in the mask rendering APIs (`draw_masks`, `draw_masks_proto`, `decode_masks_atlas`). This means the image crate imports decoder types but does not import the `Decoder` itself — it only needs the output data structures that describe detections and masks.
+The `edgefirst_image` crate depends on `edgefirst_decoder` for the `DetectBox`, `ProtoData`, and `Segmentation` types used in the mask rendering APIs (`draw_masks`, `draw_masks_proto`). This means the image crate imports decoder types but does not import the `Decoder` itself — it only needs the output data structures that describe detections and masks.
 
 ### 6. C API Bindings (`edgefirst-hal-capi`)
 
@@ -1104,14 +1072,12 @@ on i.MX8/i.MX95 targets.
 - `decode_masks/materialize` — NMS + extract proto data + materialize pixel masks on CPU
 - `draw_masks/{cpu,opengl}` — pre-decoded mask overlay
 - `draw_masks_proto/{cpu,opengl}` — fused proto→overlay
-- `decode_masks_atlas/{cpu,opengl}` — proto→pixel atlas (all masks in single GPU pass)
 
 Run: `cargo bench -p edgefirst-image --bench mask_benchmark`
 
 **Python benchmarks** (`tests/bench_decode_render.py`):
 - `decode() + draw_masks()` — 2-step path (decode to proto-res masks, then draw)
 - `draw_masks() [fused]` — single-call fused decode+draw path
-- `decode_masks()` — decode masks at output resolution
 
 Run: `python tests/bench_decode_render.py [--iterations N] [--json results.json]`
 

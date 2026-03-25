@@ -3,8 +3,8 @@
 
 use edgefirst_hal::decoder::{
     configs, configs::Nms, dequantize_cpu, modelpack::ModelPackDetectionConfig,
-    segmentation_to_mask, ConfigOutput, Decoder, DecoderBuilder, DetectBox, ProtoData,
-    Quantization, Segmentation,
+    segmentation_to_mask, ConfigOutput, Decoder, DecoderBuilder, DetectBox, Quantization,
+    Segmentation,
 };
 use edgefirst_hal::image::ImageProcessorTrait;
 
@@ -460,14 +460,6 @@ pub type PySegDetTrackedOutput<'py> = (
     Bound<'py, PyArray1<usize>>,
     Vec<Bound<'py, PyArray3<u8>>>,
     Vec<PyTrackInfo>,
-);
-
-/// Like [`PySegDetOutput`] but with 2D masks `(H, W)` instead of 3D `(H, W, C)`.
-pub type PySegDetOutput2D<'py> = (
-    Bound<'py, PyArray2<f32>>,
-    Bound<'py, PyArray1<f32>>,
-    Bound<'py, PyArray1<usize>>,
-    Vec<Bound<'py, PyArray2<u8>>>,
 );
 
 #[derive(FromPyObject)]
@@ -1102,105 +1094,6 @@ impl PyDecoder {
         Ok((boxes, scores, classes))
     }
 
-    /// Decode model outputs and return per-detection binary masks.
-    ///
-    /// Internally uses GPU atlas rendering when available (OpenGL), then splits
-    /// the atlas into individual per-detection mask arrays. Each mask is a
-    /// binary `u8` array of shape `(bbox_h, bbox_w)` — `255` = mask presence,
-    /// `0` = background.
-    ///
-    /// `output_width` and `output_height` define the coordinate space for
-    /// bounding box interpretation, not the per-mask dimensions. Each returned
-    /// mask is sized to its detection's bounding box.
-    ///
-    /// Returns `(boxes, scores, classes, masks)` where:
-    /// - `boxes`: `ndarray[N, 4]` of `f32` bounding boxes
-    /// - `scores`: `ndarray[N]` of `f32` confidence scores
-    /// - `classes`: `ndarray[N]` of `uintp` class indices
-    /// - `masks`: list of `ndarray[bbox_h, bbox_w]` of `u8` — one per detection
-    #[pyo3(signature = (model_output, processor, output_width=640, output_height=640, max_boxes=100))]
-    pub fn decode_masks<'py>(
-        self_: PyRef<'py, Self>,
-        model_output: ListOfReadOnlyArrayGenericDyn,
-        processor: &mut PyImageProcessor,
-        output_width: usize,
-        output_height: usize,
-        max_boxes: usize,
-    ) -> PyResult<PySegDetOutput2D<'py>> {
-        let mut output_boxes = Vec::with_capacity(max_boxes);
-        let proto_result = Self::decode_proto_result(&self_, &model_output, &mut output_boxes)?;
-
-        let py = self_.py();
-
-        let masks: Vec<ndarray::Array2<u8>> = if let Some(proto_data) = proto_result {
-            if let Ok(mut l) = processor.0.lock() {
-                let (atlas_pixels, regions) = l
-                    .decode_masks_atlas(&output_boxes, proto_data, output_width, output_height)
-                    .map_err(|e| {
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "decode_masks_atlas: {e:#?}"
-                        ))
-                    })?;
-
-                let atlas_h = if !regions.is_empty() {
-                    let last = regions.last().unwrap();
-                    last.atlas_y_offset + last.padded_h
-                } else {
-                    0
-                };
-
-                if atlas_h > 0 && !regions.is_empty() {
-                    // Split atlas into individual mask arrays
-                    regions
-                        .iter()
-                        .map(|r| -> PyResult<_> {
-                            let mut mask = ndarray::Array2::<u8>::zeros((r.bbox_h, r.bbox_w));
-                            // The atlas renders each detection at absolute
-                            // position (padded_x, atlas_y_offset) in the atlas.
-                            // The bbox region within the padded strip starts at
-                            // row offset (bbox_y - padded_y) from atlas_y_offset,
-                            // and at absolute column bbox_x.
-                            let src_y_start = r.atlas_y_offset + (r.bbox_y - r.padded_y);
-                            let src_x_start = r.bbox_x;
-                            if src_x_start + r.bbox_w > output_width {
-                                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                                    "decode_masks: bbox x={}..{} exceeds atlas width {}",
-                                    src_x_start,
-                                    src_x_start + r.bbox_w,
-                                    output_width
-                                )));
-                            }
-                            for dy in 0..r.bbox_h {
-                                let src_row = src_y_start + dy;
-                                if src_row >= atlas_h {
-                                    break;
-                                }
-                                let src_offset = src_row * output_width + src_x_start;
-                                mask.row_mut(dy).as_slice_mut().unwrap()[..r.bbox_w]
-                                    .copy_from_slice(
-                                        &atlas_pixels[src_offset..src_offset + r.bbox_w],
-                                    );
-                            }
-                            Ok(mask)
-                        })
-                        .collect::<PyResult<Vec<_>>>()?
-                } else {
-                    Vec::new()
-                }
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-
-        let (boxes, scores, classes) = convert_detect_box(py, &output_boxes);
-        let py_masks: Vec<Bound<'py, PyArray2<u8>>> =
-            masks.into_iter().map(|m| m.into_pyarray(py)).collect();
-
-        Ok((boxes, scores, classes, py_masks))
-    }
-
     #[staticmethod]
     #[pyo3(signature = (boxes, quant_boxes=(1.0, 0), score_threshold=0.1, iou_threshold=0.7, nms=PyNms::ClassAgnostic, max_boxes=100))]
     pub fn decode_yolo_det<'py>(
@@ -1623,81 +1516,6 @@ impl PyDecoder {
 }
 
 /// Private helpers for PyDecoder (not exposed to Python).
-impl PyDecoder {
-    /// Decode model outputs and extract ProtoData for segmentation models.
-    ///
-    /// Returns `Some(ProtoData)` for segmentation models, `None` for
-    /// detection-only models.
-    fn decode_proto_result(
-        &self,
-        model_output: &ListOfReadOnlyArrayGenericDyn,
-        output_boxes: &mut Vec<DetectBox>,
-    ) -> PyResult<Option<ProtoData>> {
-        match model_output {
-            ListOfReadOnlyArrayGenericDyn::Quantized(items) => {
-                let outputs = items
-                    .iter()
-                    .map(|x| match x {
-                        ArrayQuantized::UInt8(arr) => arr.as_array().into(),
-                        ArrayQuantized::Int8(arr) => arr.as_array().into(),
-                        ArrayQuantized::UInt16(arr) => arr.as_array().into(),
-                        ArrayQuantized::Int16(arr) => arr.as_array().into(),
-                        ArrayQuantized::UInt32(arr) => arr.as_array().into(),
-                        ArrayQuantized::Int32(arr) => arr.as_array().into(),
-                    })
-                    .collect::<Vec<_>>();
-                self.decoder
-                    .decode_quantized_proto(&outputs, output_boxes)
-                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))
-            }
-            ListOfReadOnlyArrayGenericDyn::Float16(items) => {
-                let outputs = items
-                    .iter()
-                    .filter_map(|x| match x {
-                        WithInt32Array::Val(x) => Some(x.arr.as_array()),
-                        WithInt32Array::Int32(_) => None,
-                    })
-                    .collect::<Vec<_>>();
-                let outputs = outputs
-                    .iter()
-                    .map(|arr| arr.map(|x| x.to_f32()))
-                    .collect::<Vec<_>>();
-                let output_views = outputs
-                    .iter()
-                    .map(|output| output.view())
-                    .collect::<Vec<_>>();
-                self.decoder
-                    .decode_float_proto(&output_views, output_boxes)
-                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))
-            }
-            ListOfReadOnlyArrayGenericDyn::Float32(items) => {
-                let outputs = items
-                    .iter()
-                    .filter_map(|x| match x {
-                        WithInt32Array::Val(x) => Some(x.as_array()),
-                        WithInt32Array::Int32(_) => None,
-                    })
-                    .collect::<Vec<_>>();
-                self.decoder
-                    .decode_float_proto(&outputs, output_boxes)
-                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))
-            }
-            ListOfReadOnlyArrayGenericDyn::Float64(items) => {
-                let outputs = items
-                    .iter()
-                    .filter_map(|x| match x {
-                        WithInt32Array::Val(x) => Some(x.as_array()),
-                        WithInt32Array::Int32(_) => None,
-                    })
-                    .collect::<Vec<_>>();
-                self.decoder
-                    .decode_float_proto(&outputs, output_boxes)
-                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))
-            }
-        }
-    }
-}
-
 fn convert_detect_box<'py>(py: Python<'py>, output_boxes: &[DetectBox]) -> PyDetOutput<'py> {
     let boxes = output_boxes
         .iter()

@@ -101,14 +101,6 @@ processor.draw_masks_proto(&mut frame, &detections, &proto_data)?;
 
 CPU materializes binary masks (`materialize_segmentations()`), then OpenGL overlays them. Auto-selected when both CPU and GL backends are available.
 
-### Atlas Decode Path (`decode_masks_atlas`)
-
-Renders all detection masks into a compact vertical strip atlas via GPU, reads back as uint8 arrays. Use when you need per-instance mask pixels for downstream processing.
-
-```rust,ignore
-let masks = processor.decode_masks_atlas(&detections, &proto_data, 640, 640)?;
-```
-
 ### Shader Variants
 
 | Variant | Proto Format | Interpolation |

@@ -154,16 +154,15 @@ def gen_decoder_seg_table(data_dir: Path):
 
 def gen_mask_table(data_dir: Path):
     print("\n**640×640 RGBA destination, ~2 detections (YOLOv8n-seg):**\n")
-    print("| Platform | Compute | Buffer | draw_masks (pre-decoded) | draw_masks_proto (fused) | decode_masks_atlas | hybrid_materialize_and_draw |")
-    print("|----------|---------|--------|------------------------|------------------------|--------------------|---------------------------|")
+    print("| Platform | Compute | Buffer | draw_masks (pre-decoded) | draw_masks_proto (fused) | hybrid_materialize_and_draw |")
+    print("|----------|---------|--------|------------------------|------------------------|---------------------------|")
 
     for platform, compute, buf, jf in MASK_CONFIGS:
         data = load_json(data_dir, platform, jf)
         dm = get_bench(data, "draw_masks")
         dmp = get_bench(data, "draw_masks_proto")
-        dma = get_bench(data, "decode_masks_atlas")
         hybrid = get_bench(data, "hybrid_materialize_and_draw")
-        print(f"| {platform} | {compute} | {buf} | {fmt_us(dm)} | {fmt_us(dmp)} | {fmt_us(dma)} | {fmt_us(hybrid)} |")
+        print(f"| {platform} | {compute} | {buf} | {fmt_us(dm)} | {fmt_us(dmp)} | {fmt_us(hybrid)} |")
 
 
 def gen_hybrid_comparison_table(data_dir: Path):

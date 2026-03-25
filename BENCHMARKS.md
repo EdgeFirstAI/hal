@@ -399,18 +399,16 @@ All CPU-only (decoder is not GPU-accelerated).
 
 **640×640 RGBA destination, ~2 detections (YOLOv8n-seg):**
 
-| Platform | Compute | Buffer | draw_masks (pre-decoded) | draw_masks_proto (fused) | decode_masks_atlas | hybrid_materialize_and_draw |
-|----------|---------|--------|------------------------|------------------------|--------------------|---------------------------|
-| imx8mp-frdm | GL | DMA | 2.6 ms | 5.9 ms | 408 ms | 5.9 ms |
-| imx8mp-frdm | CPU | Heap | 5.9 ms | 80.2 ms | 77.8 ms | 9.0 ms |
-| imx95-frdm | GL | DMA | 1.9 ms | 5.5 ms | 28.2 ms | 5.3 ms |
-| imx95-frdm | CPU | Heap | 7.3 ms | 78.8 ms | 76.1 ms | 10.3 ms |
-| rpi5-hailo | GL | DMA | 1.5 ms | 2.4 ms | 7.7 ms | 2.4 ms |
-| rpi5-hailo | CPU | Heap | 1.5 ms | 15.0 ms | 14.7 ms | 1.9 ms |
-| x86-desktop | GL | PBO | 102 us | 375 us | 847 us | 394 us |
-| x86-desktop | CPU | Heap | 102 us | 5.9 ms | 5.9 ms | 786 us |
-
-> **Note:** imx8mp-frdm GL `decode_masks_atlas` degraded from 432ms to 408ms — still anomalously slow compared to other platforms. This is a Vivante GC7000UL driver inefficiency with the atlas shader path.
+| Platform | Compute | Buffer | draw_masks (pre-decoded) | draw_masks_proto (fused) | hybrid_materialize_and_draw |
+|----------|---------|--------|------------------------|------------------------|---------------------------|
+| imx8mp-frdm | GL | DMA | 2.6 ms | 5.9 ms | 5.9 ms |
+| imx8mp-frdm | CPU | Heap | 5.9 ms | 80.2 ms | 9.0 ms |
+| imx95-frdm | GL | DMA | 1.9 ms | 5.5 ms | 5.3 ms |
+| imx95-frdm | CPU | Heap | 7.3 ms | 78.8 ms | 10.3 ms |
+| rpi5-hailo | GL | DMA | 1.5 ms | 2.4 ms | 2.4 ms |
+| rpi5-hailo | CPU | Heap | 1.5 ms | 15.0 ms | 1.9 ms |
+| x86-desktop | GL | PBO | 102 us | 375 us | 394 us |
+| x86-desktop | CPU | Heap | 102 us | 5.9 ms | 786 us |
 
 **Hybrid Path Comparison (CPU materialize + GL overlay vs fused GPU):**
 
@@ -605,23 +603,21 @@ The binary requires a DMA-heap device (`/dev/dma_heap/linux,cma` or `/dev/dma_he
 
 ### Known Performance Issues
 
-4. **imx8mp-frdm GL mask atlas anomalously slow** — `decode_masks_atlas` takes 408ms on Vivante GC7000UL vs 28ms on Mali G310 (imx95-frdm). The Vivante driver appears to have inefficiencies with the atlas shader path.
+4. **rpi5-hailo 4K DMA-buf allocation fails** — Mesa V3D driver cannot allocate DMA-buf textures at 3840×2160 for same-size conversion. OpenGL convert benchmarks at 4K produce GL errors on this platform.
 
-5. **rpi5-hailo 4K DMA-buf allocation fails** — Mesa V3D driver cannot allocate DMA-buf textures at 3840×2160 for same-size conversion. OpenGL convert benchmarks at 4K produce GL errors on this platform.
+5. **x86-desktop OpenGL cannot import YUV textures** — NVIDIA PBO path does not support YUYV/NV12/VYUY source textures. OpenGL letterbox and convert benchmarks show "—" for YUV source formats on this platform.
 
-6. **x86-desktop OpenGL cannot import YUV textures** — NVIDIA PBO path does not support YUYV/NV12/VYUY source textures. OpenGL letterbox and convert benchmarks show "—" for YUV source formats on this platform.
+6. **imx95-frdm GL DMA-buf slower than PBO for letterbox** — v1.2 benchmarks labelled imx95-frdm GL as "DMA" but were actually running on PBO (EGL extension query bug caused DMA-buf roundtrip probe to fail). After fixing the extension query (v1.3), GL now uses true DMA-buf import. DMA-buf letterbox 1080p→640 YUYV→RGBA is 3.4ms vs 1.4ms on PBO — the DMA-buf import/export overhead exceeds PBO zero-copy bind. G2D improved (3.5ms from 3.9ms). Fused mask rendering (`draw_masks_proto`) dramatically improved: 5.2ms from 25.2ms (**4.8× faster**).
 
-7. **imx95-frdm GL DMA-buf slower than PBO for letterbox** — v1.2 benchmarks labelled imx95-frdm GL as "DMA" but were actually running on PBO (EGL extension query bug caused DMA-buf roundtrip probe to fail). After fixing the extension query (v1.3), GL now uses true DMA-buf import. DMA-buf letterbox 1080p→640 YUYV→RGBA is 3.4ms vs 1.4ms on PBO — the DMA-buf import/export overhead exceeds PBO zero-copy bind. G2D improved (3.5ms from 3.9ms). Fused mask rendering (`draw_masks_proto`) dramatically improved: 5.2ms from 25.2ms (**4.8× faster**).
+7. **BGRA framebuffer CPU byte-swap overhead** — BGRA textures as framebuffer attachments have GPU-dependent swizzle behavior (some implementations don't swizzle fragment shader output). Workaround uses RGBA format internally with CPU-side R↔B byte swaps on upload and readback. RGBA→BGRA conversion on imx95-frdm GL went from 3.4ms (v1.2 PBO, no swap needed) to 26.5ms (v1.3 DMA + CPU swap). CPU backend RGBA→BGRA is 24.5ms for reference.
 
-8. **BGRA framebuffer CPU byte-swap overhead** — BGRA textures as framebuffer attachments have GPU-dependent swizzle behavior (some implementations don't swizzle fragment shader output). Workaround uses RGBA format internally with CPU-side R↔B byte swaps on upload and readback. RGBA→BGRA conversion on imx95-frdm GL went from 3.4ms (v1.2 PBO, no swap needed) to 26.5ms (v1.3 DMA + CPU swap). CPU backend RGBA→BGRA is 24.5ms for reference.
+8. **NV12→planar GPU hang on Vivante GC7000UL** — Rendering from an NV12 source texture (via `EGL_LINUX_DMA_BUF_EXT`) to a planar RGB framebuffer (MRT with 3× color attachments) causes an **unrecoverable GPU hang** on the Vivante GC7000UL (i.MX 8M Plus, galcore 6.4.11). The GPU command processor stalls permanently, the calling process enters kernel uninterruptible sleep (Ds state), cannot be killed even with SIGKILL, and the galcore driver state is corrupted system-wide — all subsequent GPU operations from any process hang until a full board reboot. YUYV→planar and NV12→packed work fine; the bug is specific to NV12 multi-plane texture + MRT output. The HAL explicitly blocks this combination on Vivante GPUs and falls back to CPU in auto mode. See `VSI_GPU_NV12_BUG.md` for the full vendor bug report.
 
-9. **NV12→planar GPU hang on Vivante GC7000UL** — Rendering from an NV12 source texture (via `EGL_LINUX_DMA_BUF_EXT`) to a planar RGB framebuffer (MRT with 3× color attachments) causes an **unrecoverable GPU hang** on the Vivante GC7000UL (i.MX 8M Plus, galcore 6.4.11). The GPU command processor stalls permanently, the calling process enters kernel uninterruptible sleep (Ds state), cannot be killed even with SIGKILL, and the galcore driver state is corrupted system-wide — all subsequent GPU operations from any process hang until a full board reboot. YUYV→planar and NV12→packed work fine; the bug is specific to NV12 multi-plane texture + MRT output. The HAL explicitly blocks this combination on Vivante GPUs and falls back to CPU in auto mode. See `VSI_GPU_NV12_BUG.md` for the full vendor bug report.
+9. **rpi5-hailo GL planar at 4K is slow** — YUYV→8BPS/8BPS_i8 at 4K takes ~102ms on Mesa V3D GL, while CPU handles it in ~24ms. NV12→planar at 4K is ~26ms on GL. The bottleneck appears to be in Mesa V3D's MRT path when combined with high-resolution YUYV texture sampling.
 
-10. **rpi5-hailo GL planar at 4K is slow** — YUYV→8BPS/8BPS_i8 at 4K takes ~102ms on Mesa V3D GL, while CPU handles it in ~24ms. NV12→planar at 4K is ~26ms on GL. The bottleneck appears to be in Mesa V3D's MRT path when combined with high-resolution YUYV texture sampling.
+10. **imx8mp-frdm GL packed RGB uses two-pass approach** — Vivante GC7000UL OpenGL does not support packed RGB output natively; the two-pass packed RGB packing shader renders to an RGBA intermediate then packs to RGB using a dedicated shader. This two-pass approach is now enabled but is 3-4× slower than G2D's hardware blitter for packed RGB output on Vivante (see footnote ¹ in 720p tables).
 
-11. **imx8mp-frdm GL packed RGB uses two-pass approach** — Vivante GC7000UL OpenGL does not support packed RGB output natively; the two-pass packed RGB packing shader renders to an RGBA intermediate then packs to RGB using a dedicated shader. This two-pass approach is now enabled but is 3-4× slower than G2D's hardware blitter for packed RGB output on Vivante (see footnote ¹ in 720p tables).
-
-12. **rpi5-hailo GL packed RGB uses two-pass approach** — Same as imx8mp-frdm: Mesa V3D uses the two-pass packed RGB packing shader (RGBA intermediate then dedicated RGB packing shader). Now enabled but may be slower than CPU for some conversions on VideoCore.
+11. **rpi5-hailo GL packed RGB uses two-pass approach** — Same as imx8mp-frdm: Mesa V3D uses the two-pass packed RGB packing shader (RGBA intermediate then dedicated RGB packing shader). Now enabled but may be slower than CPU for some conversions on VideoCore.
 
 ### Missing Format Coverage
 

@@ -3,9 +3,8 @@
 
 //! Mask rendering benchmarks using a custom in-process harness.
 //!
-//! Benchmarks `draw_masks_proto` (fused proto→overlay), `decode_masks_atlas`
-//! (proto→pixel atlas), and `draw_masks` (pre-decoded mask overlay)
-//! for both CPU and OpenGL backends.
+//! Benchmarks `draw_masks_proto` (fused proto→overlay) and `draw_masks`
+//! (pre-decoded mask overlay) for both CPU and OpenGL backends.
 //!
 //! Uses the same fork-free `edgefirst-bench` harness as `pipeline_benchmark.rs`
 //! to avoid GPU driver crashes on i.MX8/i.MX95 targets.
@@ -66,7 +65,7 @@ fn load_protos_i8() -> ndarray::Array3<i8> {
     ndarray::Array3::from_shape_vec((160, 160, 32), bytes.to_vec()).unwrap()
 }
 
-/// Decode into ProtoData (for `draw_masks_proto` and `decode_masks_atlas` benchmarks).
+/// Decode into ProtoData (for `draw_masks_proto` benchmarks).
 fn decode_proto_data() -> (Vec<DetectBox>, ProtoData) {
     let boxes = load_boxes_i8();
     let protos = load_protos_i8();
@@ -150,7 +149,7 @@ fn bench_decode_masks(suite: &mut BenchSuite) {
     let protos = load_protos_i8();
 
     // Proto-only decode: NMS + extract mask coefficients (no mask materialization).
-    // This is the decode cost paid by the fused draw_masks_proto / decode_masks_atlas
+    // This is the decode cost paid by the fused draw_masks_proto
     // paths which let the renderer compute mask_coeff @ protos.
     {
         let name = "decode_masks/proto";
@@ -336,33 +335,6 @@ fn bench_draw_masks_proto(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
 }
 
 // =============================================================================
-// decode_masks_atlas: proto → pixel atlas
-// =============================================================================
-
-fn bench_decode_masks_atlas(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
-    println!("\n== decode_masks_atlas: Proto → Pixel Atlas ==\n");
-
-    let (detect, proto_data) = decode_proto_data();
-    let n_detect = detect.len();
-    println!("  Decoded {n_detect} detections for benchmarking\n");
-
-    let name = "decode_masks_atlas";
-    // Note: proto_data.clone() is required because decode_masks_atlas consumes ProtoData by value.
-    if let Err(e) = proc.decode_masks_atlas(&detect, proto_data.clone(), OUTPUT_W, OUTPUT_H) {
-        println!("  {:50} [unsupported: {}]", name, e);
-        return;
-    }
-
-    let result = run_bench(name, WARMUP, ITERATIONS, || {
-        let _atlas = proc
-            .decode_masks_atlas(&detect, proto_data.clone(), OUTPUT_W, OUTPUT_H)
-            .unwrap();
-    });
-    result.print_summary();
-    suite.record(&result);
-}
-
-// =============================================================================
 // hybrid_materialize_and_draw: CPU decode + GPU/CPU overlay
 // =============================================================================
 
@@ -413,7 +385,6 @@ fn main() {
     bench_draw_masks(&mut proc, &mut suite);
     bench_draw_masks_proto(&mut proc, &mut suite);
     bench_draw_masks_proto_forced_opengl(&mut suite);
-    bench_decode_masks_atlas(&mut proc, &mut suite);
     bench_hybrid_materialize_and_draw(&mut proc, &mut suite);
 
     suite.finish();

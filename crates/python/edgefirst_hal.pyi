@@ -46,8 +46,6 @@ A tuple containing:
     (threshold at 128). For semantic segmentation models (e.g. ModelPack)
     ``C=num_classes`` — per-pixel class scores (use ``argmax`` over ``C``
     to get the class index).
-  - ``decode_masks()``: shape ``(H, W)`` at the requested output resolution.
-    Binary ``uint8`` where 255 = mask presence.
 """
 
 SegDetTrackedOutput = Tuple[
@@ -410,8 +408,7 @@ class Decoder:
         ``(H, W, C)``. For instance segmentation models (e.g. YOLO) ``C=1``
         — a binary per-instance mask (threshold at 128). For semantic
         segmentation models (e.g. ModelPack) ``C=num_classes`` — per-pixel
-        class scores (use ``argmax`` over the last axis). Use
-        ``decode_masks()`` to get upsampled 2D binary masks.
+        class scores (use ``argmax`` over the last axis).
         """
         ...
 
@@ -436,8 +433,7 @@ class Decoder:
         ``(H, W, C)``. For instance segmentation models (e.g. YOLO) ``C=1``
         — a binary per-instance mask (threshold at 128). For semantic
         segmentation models (e.g. ModelPack) ``C=num_classes`` — per-pixel
-        class scores (use ``argmax`` over the last axis). Use
-        ``decode_masks()`` to get upsampled 2D binary masks.
+        class scores (use ``argmax`` over the last axis).
         """
         ...
 
@@ -461,7 +457,6 @@ class Decoder:
         detection-only models, this falls back to the standard drawing path.
 
         Returns ``(boxes, scores, classes)`` — no mask arrays are returned.
-        Use ``decode_masks()`` if you need the raw mask pixels.
 
         Args:
             model_output: List of model output tensors (same types as ``decode``).
@@ -480,48 +475,6 @@ class Decoder:
         Raises:
             RuntimeError: If ``dst`` format is unsupported by the active backend,
                 or if the ImageProcessor uses G2D (mask rendering not supported).
-        """
-        ...
-
-    def decode_masks(
-        self,
-        model_output: List[np.ndarray],
-        processor: ImageProcessor,
-        output_width: int = 640,
-        output_height: int = 640,
-        max_boxes: int = 100,
-    ) -> SegDetOutput:
-        """
-        Decode model outputs and return per-detection binary masks.
-
-        Internally uses GPU atlas rendering when available (OpenGL), then
-        splits the atlas into individual per-detection mask arrays. Each mask
-        is a binary ``uint8`` array of shape ``(bbox_h, bbox_w)`` covering
-        the detection's bounding box region, where ``255`` = mask presence
-        and ``0`` = background. Threshold at ``> 127`` for boolean masks.
-
-        Use this method when you need the raw mask pixels for downstream
-        processing (tracking, area measurement, custom compositing). For
-        direct overlay onto a display frame, prefer ``draw_masks()`` which
-        avoids the Python round-trip.
-
-        Args:
-            model_output: List of model output tensors (same types as ``decode``).
-            processor: ImageProcessor instance for GPU-accelerated mask rendering.
-            output_width: Coordinate-space width for bounding box interpretation
-                (default: 640). This is **not** the per-mask array width — each
-                returned mask is sized to its detection's bounding box.
-            output_height: Coordinate-space height for bounding box interpretation
-                (default: 640). Typically matches the model input resolution.
-            max_boxes: Maximum number of detections to return (default: 100).
-
-        Returns:
-            ``(boxes, scores, classes, masks)`` where masks is a list of
-            ``ndarray[bbox_h, bbox_w]`` of ``uint8`` — one per detection.
-
-        Raises:
-            RuntimeError: If the ImageProcessor uses G2D (mask rendering not
-                supported on G2D). Use an OpenGL or CPU processor instead.
         """
         ...
 

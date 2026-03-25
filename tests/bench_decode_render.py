@@ -174,77 +174,6 @@ def bench_fused_path(decoder, processor, dst, outputs, n_iter):
     return times, n_dets
 
 
-def bench_mask_atlas_path(
-    decoder, processor, outputs, n_iter, output_width=640, output_height=640
-):
-    """Benchmark: decode_masks() (mask decode path)."""
-    times = []
-    n_dets = 0
-    for _ in range(n_iter):
-        t0 = time.perf_counter()
-        boxes, scores, classes, masks = decoder.decode_masks(
-            outputs, processor, output_width=output_width, output_height=output_height
-        )
-        elapsed = time.perf_counter() - t0
-        times.append(elapsed * 1000)  # ms
-        n_dets = len(boxes)
-    return times, n_dets
-
-
-def verify_mask_correctness(
-    decoder, processor, outputs, output_width=640, output_height=640
-):
-    """Verify decode_masks() produces correct masks vs decode() reference.
-
-    Runs both decode() and decode_masks(), then compares detection counts
-    and verifies masks are non-empty for segmentation models.
-    """
-    # Get reference detections via decode()
-    boxes_ref, scores_ref, classes_ref, masks_ref = decoder.decode(
-        outputs, max_boxes=100
-    )
-
-    # Get individual masks at output resolution
-    boxes_dm, scores_dm, classes_dm, masks_dm = decoder.decode_masks(
-        outputs, processor, output_width=output_width, output_height=output_height
-    )
-
-    n_ref = len(boxes_ref)
-    n_dm = len(boxes_dm)
-
-    if n_ref != n_dm:
-        print(
-            f"  FAIL: detection count mismatch: decode()={n_ref}, decode_masks()={n_dm}"
-        )
-        return False
-
-    if n_ref == 0:
-        print("  Mask correctness: 0 detections (nothing to compare)")
-        return True
-
-    total_mask_bytes = sum(m.nbytes for m in masks_dm)
-    print(f"  Masks: {n_dm} individual arrays, {total_mask_bytes:,} bytes total")
-
-    # Verify masks are non-empty and have reasonable shapes
-    mismatched = 0
-    for i in range(n_dm):
-        mask = masks_dm[i]
-        if mask.size == 0:
-            print(f"  FAIL: detection {i} mask is empty")
-            mismatched += 1
-            continue
-
-        # Check that the mask has some non-zero pixels
-        n_nonzero = int(np.sum(mask > 0))
-        if n_nonzero == 0 and mask.size > 4:
-            print(f"  WARNING: detection {i}: all-zero mask (shape {mask.shape})")
-
-    ok = mismatched == 0
-    status = "PASS" if ok else "FAIL"
-    print(f"  Mask correctness: {n_dm} detections [{status}]")
-    return ok
-
-
 def has_set_int8_interpolation(processor):
     """Check if the processor supports set_int8_interpolation."""
     return hasattr(processor, "set_int8_interpolation")
@@ -299,11 +228,6 @@ def main():
         metavar="PATH",
         default=None,
         help="Write benchmark results to a JSON file for cross-target comparison",
-    )
-    parser.add_argument(
-        "--verify-atlas",
-        action="store_true",
-        help="Run atlas correctness verification before benchmarking",
     )
     args = parser.parse_args()
 
@@ -412,10 +336,6 @@ def main():
         # --- Warmup ---
         bench_old_path(decoder, processor, dst, outputs, args.warmup)
         bench_fused_path(decoder, processor, dst, outputs, args.warmup)
-        try:
-            bench_mask_atlas_path(decoder, processor, outputs, args.warmup)
-        except RuntimeError:
-            pass  # atlas may fail if n_detections * height > GL_MAX_TEXTURE_SIZE
 
         # --- Benchmark 2-step path ---
         old_times, old_dets = bench_old_path(
@@ -453,32 +373,6 @@ def main():
             saved = statistics.mean(old_times) - statistics.mean(fused_times)
             print(f"  Speedup: {speedup:.2f}x ({saved:+.2f}ms per frame)")
             thresh_results["draw_masks"] = compute_stats(fused_times)
-
-        # --- Mask correctness verification (if requested) ---
-        if args.verify_atlas:
-            print(f"\n  Mask correctness verification (threshold={thresh}):")
-            try:
-                verify_mask_correctness(decoder, processor, outputs)
-            except RuntimeError as e:
-                print(f"  SKIP: mask verification failed ({e})")
-
-        # --- Benchmark mask atlas path ---
-        try:
-            atlas_times, atlas_dets = bench_mask_atlas_path(
-                decoder, processor, outputs, args.iterations
-            )
-            report("decode_masks()", atlas_times)
-            atlas_speedup = statistics.mean(old_times) / statistics.mean(atlas_times)
-            atlas_saved = statistics.mean(old_times) - statistics.mean(atlas_times)
-            print(f"    -> {atlas_speedup:.2f}x ({atlas_saved:+.2f}ms vs 2-step)")
-            thresh_results["decode_masks"] = compute_stats(atlas_times)
-        except RuntimeError:
-            # Atlas may fail if detection count * output_height exceeds
-            # GL_MAX_TEXTURE_SIZE (e.g. 100 detections * 640 = 64000 > 16384).
-            print(
-                f"  decode_masks()  SKIPPED "
-                f"({old_dets} detections exceed GPU atlas capacity)"
-            )
 
         print(f"  {'─' * 95}")
 
