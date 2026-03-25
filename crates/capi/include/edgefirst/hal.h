@@ -1299,22 +1299,26 @@ int hal_decoder_decode_tracked(const struct hal_decoder *decoder,
  * @param outputs Array of output tensor pointers
  * @param num_outputs Number of output tensors
  * @param dst Destination image to draw onto
+ * @param background Optional background image (NULL to draw over dst)
+ * @param opacity Mask opacity in [0.0, 1.0] (1.0 = fully opaque, clamped)
  * @param out_boxes Output parameter for detection box list (caller must free)
  * @param out_tracks Output parameter for track info list (can be NULL; caller must free if non-NULL)
  * @return 0 on success, -1 on error
  * @par Errors (errno):
- * - EINVAL: Invalid argument (NULL decoder/tracker/processor/outputs/dst/out_boxes)
+ * - EINVAL: Invalid argument (NULL decoder/tracker/processor/outputs/dst/out_boxes, or background == dst)
  * - EIO: Decoding or drawing failed
  */
-int hal_decoder_decode_tracked_draw_masks(const struct hal_decoder *decoder,
-                                          struct hal_bytetrack *tracker,
-                                          uint64_t timestamp,
-                                          struct hal_image_processor *processor,
-                                          const struct hal_tensor *const *outputs,
-                                          size_t num_outputs,
-                                          struct hal_tensor *dst,
-                                          struct hal_detect_box_list **out_boxes,
-                                          struct hal_track_info_list **out_tracks);
+int hal_decoder_draw_masks_tracked(const struct hal_decoder *decoder,
+                                   struct hal_bytetrack *tracker,
+                                   uint64_t timestamp,
+                                   struct hal_image_processor *processor,
+                                   const struct hal_tensor *const *outputs,
+                                   size_t num_outputs,
+                                   struct hal_tensor *dst,
+                                   const struct hal_tensor *background,
+                                   float opacity,
+                                   struct hal_detect_box_list **out_boxes,
+                                   struct hal_track_info_list **out_tracks);
 
 /**
  * Create a new rectangle.
