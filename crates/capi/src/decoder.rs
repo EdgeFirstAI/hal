@@ -1401,6 +1401,8 @@ pub unsafe extern "C" fn hal_segmentation_list_free(list: *mut HalSegmentationLi
 /// @param outputs Array of output tensor pointers
 /// @param num_outputs Number of output tensors
 /// @param dst Destination image to draw onto
+/// @param background Optional background image (NULL to draw over dst)
+/// @param opacity Mask opacity in [0.0, 1.0] (1.0 = fully opaque)
 /// @param out_boxes Output parameter for detection box list (caller must free)
 /// @return 0 on success, -1 on error
 /// @par Errors (errno):
@@ -1413,6 +1415,8 @@ pub unsafe extern "C" fn hal_decoder_draw_masks(
     outputs: *const *const HalTensor,
     num_outputs: size_t,
     dst: *mut HalTensor,
+    background: *const HalTensor,
+    opacity: f32,
     out_boxes: *mut *mut HalDetectBoxList,
 ) -> c_int {
     check_null!(decoder, processor, outputs, dst, out_boxes);
@@ -1420,6 +1424,16 @@ pub unsafe extern "C" fn hal_decoder_draw_masks(
     if num_outputs == 0 {
         return set_error(libc::EINVAL);
     }
+
+    let bg = if background.is_null() {
+        None
+    } else {
+        Some(&unsafe { &*background }.inner)
+    };
+    let overlay = edgefirst_image::MaskOverlay {
+        background: bg,
+        opacity,
+    };
 
     let outputs_slice = std::slice::from_raw_parts(outputs, num_outputs);
 
@@ -1465,9 +1479,12 @@ pub unsafe extern "C" fn hal_decoder_draw_masks(
         if let Some(proto_data) = proto_result {
             // Fused path: render directly from proto data
             try_or_errno!(
-                (*processor)
-                    .inner
-                    .draw_masks_proto(&mut (*dst).inner, &boxes, &proto_data),
+                (*processor).inner.draw_masks_proto(
+                    &mut (*dst).inner,
+                    &boxes,
+                    &proto_data,
+                    overlay
+                ),
                 libc::EIO
             );
         } else {
@@ -1482,7 +1499,7 @@ pub unsafe extern "C" fn hal_decoder_draw_masks(
             try_or_errno!(
                 (*processor)
                     .inner
-                    .draw_masks(&mut (*dst).inner, &boxes, &masks),
+                    .draw_masks(&mut (*dst).inner, &boxes, &masks, overlay),
                 libc::EIO
             );
         }
@@ -1496,9 +1513,12 @@ pub unsafe extern "C" fn hal_decoder_draw_masks(
 
         if let Some(proto_data) = proto_result {
             try_or_errno!(
-                (*processor)
-                    .inner
-                    .draw_masks_proto(&mut (*dst).inner, &boxes, &proto_data),
+                (*processor).inner.draw_masks_proto(
+                    &mut (*dst).inner,
+                    &boxes,
+                    &proto_data,
+                    overlay
+                ),
                 libc::EIO
             );
         } else {
@@ -1512,7 +1532,7 @@ pub unsafe extern "C" fn hal_decoder_draw_masks(
             try_or_errno!(
                 (*processor)
                     .inner
-                    .draw_masks(&mut (*dst).inner, &boxes, &masks),
+                    .draw_masks(&mut (*dst).inner, &boxes, &masks, overlay),
                 libc::EIO
             );
         }

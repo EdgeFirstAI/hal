@@ -209,13 +209,14 @@ fn bench_draw_masks(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
         return;
     };
 
-    if let Err(e) = proc.draw_masks(&mut dst, &detect, &segmentation) {
+    if let Err(e) = proc.draw_masks(&mut dst, &detect, &segmentation, Default::default()) {
         println!("  {:50} [unsupported: {}]", name, e);
         return;
     }
 
     let result = run_bench(name, WARMUP, ITERATIONS, || {
-        proc.draw_masks(&mut dst, &detect, &segmentation).unwrap();
+        proc.draw_masks(&mut dst, &detect, &segmentation, Default::default())
+            .unwrap();
     });
     result.print_summary();
     suite.record(&result);
@@ -239,13 +240,13 @@ fn bench_draw_masks_proto(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
         return;
     };
 
-    if let Err(e) = proc.draw_masks_proto(&mut dst, &detect, &proto_data) {
+    if let Err(e) = proc.draw_masks_proto(&mut dst, &detect, &proto_data, Default::default()) {
         println!("  {:50} [unsupported: {}]", name, e);
         return;
     }
 
     let result = run_bench(name, WARMUP, ITERATIONS, || {
-        proc.draw_masks_proto(&mut dst, &detect, &proto_data)
+        proc.draw_masks_proto(&mut dst, &detect, &proto_data, Default::default())
             .unwrap();
     });
     result.print_summary();
@@ -299,14 +300,15 @@ fn bench_hybrid_materialize_and_draw(proc: &mut ImageProcessor, suite: &mut Benc
 
     // Verify the hybrid path works before benchmarking.
     let segmentation = materialize_segmentations(&detect, &proto_data);
-    if let Err(e) = proc.draw_masks(&mut dst, &detect, &segmentation) {
+    if let Err(e) = proc.draw_masks(&mut dst, &detect, &segmentation, Default::default()) {
         println!("  {:50} [unsupported: {}]", name, e);
         return;
     }
 
     let result = run_bench(name, WARMUP, ITERATIONS, || {
         let segmentation = materialize_segmentations(&detect, &proto_data);
-        proc.draw_masks(&mut dst, &detect, &segmentation).unwrap();
+        proc.draw_masks(&mut dst, &detect, &segmentation, Default::default())
+            .unwrap();
     });
     result.print_summary();
     suite.record(&result);

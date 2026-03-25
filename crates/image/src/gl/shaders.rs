@@ -286,6 +286,7 @@ precision mediump sampler2DArray;
 uniform sampler2DArray tex;
 uniform vec4 colors[20];
 uniform int background_index;
+uniform float opacity;
 
 in vec3 fragPos;
 in vec2 tc;
@@ -326,7 +327,8 @@ void main() {
         discard;
     }
     max_ind = max_ind % 20;
-    color = colors[max_ind];
+    vec4 c = colors[max_ind];
+    color = vec4(c.rgb, c.a * opacity);
 }
 "
 }
@@ -338,6 +340,7 @@ precision mediump float;
 uniform sampler2D mask0;
 uniform vec4 colors[20];
 uniform int class_index;
+uniform float opacity;
 in vec3 fragPos;
 in vec2 tc;
 in vec4 fragColor;
@@ -349,7 +352,8 @@ void main() {
     if (arg == 0) {
         discard;
     }
-    color = colors[class_index % 20];
+    vec4 c = colors[class_index % 20];
+    color = vec4(c.rgb, c.a * opacity);
 }
 "
 }
@@ -365,6 +369,7 @@ uniform vec4 mask_coeff[8];        // 32 coefficients packed as 8 vec4s
 uniform vec4 colors[20];
 uniform int class_index;
 uniform int num_layers;
+uniform float opacity;
 
 in vec2 tc;
 out vec4 color;
@@ -377,7 +382,8 @@ void main() {
     }
     float mask = 1.0 / (1.0 + exp(-acc));  // sigmoid
     if (mask < 0.5) discard;
-    color = colors[class_index % 20];
+    vec4 c = colors[class_index % 20];
+    color = vec4(c.rgb, c.a * opacity);
 }
 "
 }
@@ -403,6 +409,7 @@ uniform int class_index;
 uniform int num_protos;
 uniform float proto_scale;
 uniform float proto_scaled_zp;      // -zero_point * scale
+uniform float opacity;
 
 in vec2 tc;
 out vec4 color;
@@ -420,7 +427,8 @@ void main() {
     }
     float mask = 1.0 / (1.0 + exp(-acc));
     if (mask < 0.5) discard;
-    color = colors[class_index % 20];
+    vec4 c = colors[class_index % 20];
+    color = vec4(c.rgb, c.a * opacity);
 }
 "
 }
@@ -445,6 +453,7 @@ uniform int class_index;
 uniform int num_protos;
 uniform float proto_scale;
 uniform float proto_scaled_zp;      // -zero_point * scale
+uniform float opacity;
 
 in vec2 tc;
 out vec4 color;
@@ -477,7 +486,8 @@ void main() {
     }
     float mask = 1.0 / (1.0 + exp(-acc));
     if (mask < 0.5) discard;
-    color = colors[class_index % 20];
+    vec4 c = colors[class_index % 20];
+    color = vec4(c.rgb, c.a * opacity);
 }
 "
 }
@@ -536,6 +546,7 @@ uniform vec4 mask_coeff[8];        // 32 coefficients packed as 8 vec4s
 uniform vec4 colors[20];
 uniform int class_index;
 uniform int num_protos;
+uniform float opacity;
 
 in vec2 tc;
 out vec4 color;
@@ -549,7 +560,8 @@ void main() {
     }
     float mask = 1.0 / (1.0 + exp(-acc));
     if (mask < 0.5) discard;
-    color = colors[class_index % 20];
+    vec4 c = colors[class_index % 20];
+    color = vec4(c.rgb, c.a * opacity);
 }
 "
 }
@@ -717,11 +729,13 @@ pub(super) fn generate_color_shader() -> &'static str {
 precision mediump float;
 uniform vec4 colors[20];
 uniform int class_index;
+uniform float opacity;
 
 out vec4 color;
 void main() {
     int index = class_index % 20;
-    color = colors[index];
+    vec4 c = colors[index];
+    color = vec4(c.rgb, c.a * opacity);
 }
 "
 }

@@ -403,6 +403,8 @@ class Decoder:
         processor: ImageProcessor,
         dst: Tensor,
         max_boxes: int = 100,
+        background: Optional[Tensor] = None,
+        opacity: float = 1.0,
     ) -> DetectionOutput:
         """
         Decode model outputs and draw colored masks directly onto the
@@ -424,6 +426,12 @@ class Decoder:
                 ``RGB`` for CPU backend, or ``RGBA``/``BGRA``/``RGB`` for
                 OpenGL backend.
             max_boxes: Maximum number of detections to return (default: 100).
+            background: Optional tensor to use as the compositing base instead
+                of ``dst``'s existing content. Must have the same dimensions
+                and format as ``dst``.
+            opacity: Scales the alpha of rendered mask and box colors.
+                ``1.0`` (default) preserves the class color's alpha unchanged;
+                ``0.5`` makes overlays semi-transparent. Clamped to [0, 1].
 
         Raises:
             RuntimeError: If ``dst`` format is unsupported by the active backend,
@@ -1151,6 +1159,8 @@ class ImageProcessor:
         scores: npt.NDArray[np.float32],
         classes: npt.NDArray[np.uintp],
         seg: List[npt.NDArray[np.uint8]] = [],
+        background: Optional[Tensor] = None,
+        opacity: float = 1.0,
     ) -> None:
         """
         Draw detection boxes and optional segmentation masks onto ``dst``.
@@ -1170,6 +1180,12 @@ class ImageProcessor:
                 segmentation, e.g. YOLO), one mask per detection is expected
                 (``len(seg) <= len(bbox)``). When ``C > 1`` (semantic
                 segmentation, e.g. ModelPack), a single mask covers all classes.
+            background: Optional tensor to use as the compositing base instead
+                of ``dst``'s existing content. Must have the same dimensions
+                and format as ``dst``.
+            opacity: Scales the alpha of rendered mask and box colors.
+                ``1.0`` (default) preserves the class color's alpha unchanged;
+                ``0.5`` makes overlays semi-transparent. Clamped to [0, 1].
 
         Raises:
             RuntimeError: If ``dst`` format is unsupported by the active backend.

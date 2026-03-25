@@ -7,6 +7,7 @@ use edgefirst_decoder::{DetectBox, Segmentation};
 use ndarray::Axis;
 
 impl CPUProcessor {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn render_modelpack_segmentation(
         &mut self,
         dst_w: usize,
@@ -15,6 +16,7 @@ impl CPUProcessor {
         dst_c: usize,
         dst_slice: &mut [u8],
         segmentation: &Segmentation,
+        opacity: f32,
     ) -> Result<()> {
         use ndarray_stats::QuantileExt;
 
@@ -57,7 +59,11 @@ impl CPUProcessor {
 
                 let color = self.colors[label % self.colors.len()];
 
-                let alpha = color[3] as u16;
+                let alpha = if opacity == 1.0 {
+                    color[3] as u16
+                } else {
+                    (color[3] as f32 * opacity).round() as u16
+                };
 
                 let dst_index = (y * dst_rs) + (x * dst_c);
                 for c in 0..3 {
@@ -81,6 +87,7 @@ impl CPUProcessor {
         dst_slice: &mut [u8],
         segmentation: &Segmentation,
         class: usize,
+        opacity: f32,
     ) -> Result<()> {
         let seg = &segmentation.segmentation;
         let [seg_height, seg_width, classes] = *seg.shape() else {
@@ -113,7 +120,11 @@ impl CPUProcessor {
 
                 let color = self.colors[class % self.colors.len()];
 
-                let alpha = color[3] as u16;
+                let alpha = if opacity == 1.0 {
+                    color[3] as u16
+                } else {
+                    (color[3] as f32 * opacity).round() as u16
+                };
 
                 let dst_index = (y * dst_rs) + (x * dst_c);
                 for c in 0..3 {

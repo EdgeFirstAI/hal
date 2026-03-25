@@ -59,7 +59,9 @@ mod gl_tests {
 
         let mut renderer = GLProcessorThreaded::new(None).unwrap();
         let mut image_dyn = image;
-        renderer.draw_masks(&mut image_dyn, &[], &[seg]).unwrap();
+        renderer
+            .draw_masks(&mut image_dyn, &[], &[seg], Default::default())
+            .unwrap();
     }
 
     #[test]
@@ -104,7 +106,9 @@ mod gl_tests {
 
         let mut renderer = GLProcessorThreaded::new(None).unwrap();
         let mut image_dyn = image;
-        renderer.draw_masks(&mut image_dyn, &[], &[seg]).unwrap();
+        renderer
+            .draw_masks(&mut image_dyn, &[], &[seg], Default::default())
+            .unwrap();
     }
 
     #[test]
@@ -157,7 +161,7 @@ mod gl_tests {
             .set_class_colors(&[[255, 255, 0, 233], [128, 128, 255, 100]])
             .unwrap();
         renderer
-            .draw_masks(&mut image_dyn, &[detect], &[seg])
+            .draw_masks(&mut image_dyn, &[detect], &[seg], Default::default())
             .unwrap();
 
         let image = {
@@ -207,7 +211,9 @@ mod gl_tests {
         renderer
             .set_class_colors(&[[255, 255, 0, 233], [128, 128, 255, 100]])
             .unwrap();
-        renderer.draw_masks(&mut image_dyn, &[detect], &[]).unwrap();
+        renderer
+            .draw_masks(&mut image_dyn, &[detect], &[], Default::default())
+            .unwrap();
     }
 
     static GL_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1153,7 +1159,7 @@ mod gl_tests {
         )
         .unwrap();
         let mut rgba_img_dyn = rgba_img;
-        gl.draw_masks(&mut rgba_img_dyn, &[], &[make_seg()])
+        gl.draw_masks(&mut rgba_img_dyn, &[], &[make_seg()], Default::default())
             .unwrap();
 
         // Render to PixelFormat::Bgra (convert source to PixelFormat::Bgra first)
@@ -1184,7 +1190,7 @@ mod gl_tests {
             Crop::no_crop(),
         )
         .unwrap();
-        gl.draw_masks(&mut bgra_img_dyn, &[], &[make_seg()])
+        gl.draw_masks(&mut bgra_img_dyn, &[], &[make_seg()], Default::default())
             .unwrap();
 
         // Verify PixelFormat::Bgra output matches PixelFormat::Rgba output with R↔B swapped
@@ -1240,7 +1246,8 @@ mod gl_tests {
         )
         .unwrap();
         let mut rgba_img_dyn = rgba_img;
-        gl.draw_masks(&mut rgba_img_dyn, &[detect], &[]).unwrap();
+        gl.draw_masks(&mut rgba_img_dyn, &[detect], &[], Default::default())
+            .unwrap();
 
         // Render boxes to PixelFormat::Bgra
         let rgba_src = crate::load_image(
@@ -1270,7 +1277,8 @@ mod gl_tests {
             Crop::no_crop(),
         )
         .unwrap();
-        gl.draw_masks(&mut bgra_img_dyn, &[detect], &[]).unwrap();
+        gl.draw_masks(&mut bgra_img_dyn, &[detect], &[], Default::default())
+            .unwrap();
 
         // Verify PixelFormat::Bgra output matches PixelFormat::Rgba output with R↔B swapped
         let rgba_map = rgba_img_dyn.as_u8().unwrap().map().unwrap();
@@ -1310,7 +1318,7 @@ mod gl_tests {
         let mut image_dyn = image;
 
         // Render with empty detections and segmentations — should succeed trivially
-        let result = gl.draw_masks(&mut image_dyn, &[], &[]);
+        let result = gl.draw_masks(&mut image_dyn, &[], &[], Default::default());
         assert!(
             result.is_ok(),
             "GL mask render with empty data should succeed: {result:?}"

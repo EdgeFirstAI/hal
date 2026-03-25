@@ -333,9 +333,10 @@ impl ImageProcessorTrait for CPUProcessor {
         dst: &mut TensorDyn,
         detect: &[DetectBox],
         segmentation: &[Segmentation],
+        overlay: crate::MaskOverlay<'_>,
     ) -> Result<()> {
         let dst = dst.as_u8_mut().ok_or(Error::NotAnImage)?;
-        self.draw_masks_impl(dst, detect, segmentation)
+        self.draw_masks_impl(dst, detect, segmentation, overlay.opacity)
     }
 
     fn draw_masks_proto(
@@ -343,9 +344,10 @@ impl ImageProcessorTrait for CPUProcessor {
         dst: &mut TensorDyn,
         detect: &[DetectBox],
         proto_data: &ProtoData,
+        overlay: crate::MaskOverlay<'_>,
     ) -> Result<()> {
         let dst = dst.as_u8_mut().ok_or(Error::NotAnImage)?;
-        self.draw_masks_proto_impl(dst, detect, proto_data)
+        self.draw_masks_proto_impl(dst, detect, proto_data, overlay.opacity)
     }
 
     fn decode_masks_atlas(
@@ -640,6 +642,7 @@ impl CPUProcessor {
         dst: &mut Tensor<u8>,
         detect: &[DetectBox],
         segmentation: &[Segmentation],
+        opacity: f32,
     ) -> Result<()> {
         let dst_fmt = dst.format().ok_or(Error::NotAnImage)?;
         if !matches!(dst_fmt, PixelFormat::Rgba | PixelFormat::Rgb) {
@@ -676,6 +679,7 @@ impl CPUProcessor {
                 dst_c,
                 dst_slice,
                 &segmentation[0],
+                opacity,
             )?;
         } else {
             for (seg, detect) in segmentation.iter().zip(detect) {
@@ -687,6 +691,7 @@ impl CPUProcessor {
                     dst_slice,
                     seg,
                     detect.label,
+                    opacity,
                 )?;
             }
         }
@@ -699,6 +704,7 @@ impl CPUProcessor {
         dst: &mut Tensor<u8>,
         detect: &[DetectBox],
         proto_data: &ProtoData,
+        opacity: f32,
     ) -> Result<()> {
         let dst_fmt = dst.format().ok_or(Error::NotAnImage)?;
         if !matches!(dst_fmt, PixelFormat::Rgba | PixelFormat::Rgb) {
@@ -731,7 +737,11 @@ impl CPUProcessor {
 
         for (det, coeff) in detect.iter().zip(proto_data.mask_coefficients.iter()) {
             let color = self.colors[det.label % self.colors.len()];
-            let alpha = color[3] as u16;
+            let alpha = if opacity == 1.0 {
+                color[3] as u16
+            } else {
+                (color[3] as f32 * opacity).round() as u16
+            };
 
             // Pixel bounds of the detection in dst image space
             let start_x = (dst_w as f32 * det.bbox.xmin).round() as usize;

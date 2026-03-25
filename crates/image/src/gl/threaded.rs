@@ -31,12 +31,16 @@ enum GLProcessorMessage {
         SendablePtr<TensorDyn>,
         SendablePtr<DetectBox>,
         SendablePtr<Segmentation>,
+        f32,                            // opacity
+        Option<SendablePtr<TensorDyn>>, // background
         tokio::sync::oneshot::Sender<Result<(), Error>>,
     ),
     DrawMasksProto(
         SendablePtr<TensorDyn>,
         SendablePtr<DetectBox>,
         Box<ProtoData>,
+        f32,                            // opacity
+        Option<SendablePtr<TensorDyn>>, // background
         tokio::sync::oneshot::Sender<Result<(), Error>>,
     ),
     SetInt8Interpolation(
@@ -238,17 +242,26 @@ impl GLProcessorThreaded {
                             }
                         });
                     }
-                    GLProcessorMessage::DrawMasks(mut dst, det, seg, resp) => {
+                    GLProcessorMessage::DrawMasks(mut dst, det, seg, opacity, bg, resp) => {
                         // SAFETY: This is safe because the draw_masks() function waits for the
-                        // resp to be sent before dropping the borrow for dst, detect, and
-                        // segmentation
+                        // resp to be sent before dropping the borrow for dst, detect,
+                        // segmentation, and background
                         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                             let dst = unsafe { dst.ptr.as_mut() };
                             let det =
                                 unsafe { std::slice::from_raw_parts(det.ptr.as_ptr(), det.len) };
                             let seg =
                                 unsafe { std::slice::from_raw_parts(seg.ptr.as_ptr(), seg.len) };
-                            gl_converter.draw_masks(dst, det, seg)
+                            let bg_ref = bg.map(|p| unsafe { &*p.ptr.as_ptr() });
+                            gl_converter.draw_masks(
+                                dst,
+                                det,
+                                seg,
+                                crate::MaskOverlay {
+                                    background: bg_ref,
+                                    opacity,
+                                },
+                            )
                         }));
                         let _ = resp.send(match result {
                             Ok(res) => res,
@@ -261,14 +274,30 @@ impl GLProcessorThreaded {
                             }
                         });
                     }
-                    GLProcessorMessage::DrawMasksProto(mut dst, det, proto_data, resp) => {
+                    GLProcessorMessage::DrawMasksProto(
+                        mut dst,
+                        det,
+                        proto_data,
+                        opacity,
+                        bg,
+                        resp,
+                    ) => {
                         // SAFETY: Same safety invariant as DrawMasks — caller
                         // blocks on resp before dropping borrows.
                         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                             let dst = unsafe { dst.ptr.as_mut() };
                             let det =
                                 unsafe { std::slice::from_raw_parts(det.ptr.as_ptr(), det.len) };
-                            gl_converter.draw_masks_proto(dst, det, &proto_data)
+                            let bg_ref = bg.map(|p| unsafe { &*p.ptr.as_ptr() });
+                            gl_converter.draw_masks_proto(
+                                dst,
+                                det,
+                                &proto_data,
+                                crate::MaskOverlay {
+                                    background: bg_ref,
+                                    opacity,
+                                },
+                            )
                         }));
                         let _ = resp.send(match result {
                             Ok(res) => res,
@@ -501,6 +530,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
         dst: &mut TensorDyn,
         detect: &[crate::DetectBox],
         segmentation: &[crate::Segmentation],
+        overlay: crate::MaskOverlay<'_>,
     ) -> crate::Result<()> {
         let (err_send, err_recv) = tokio::sync::oneshot::channel();
         self.sender
@@ -519,6 +549,11 @@ impl ImageProcessorTrait for GLProcessorThreaded {
                     ptr: NonNull::new(segmentation.as_ptr() as *mut Segmentation).unwrap(),
                     len: segmentation.len(),
                 },
+                overlay.opacity,
+                overlay.background.map(|bg| SendablePtr {
+                    ptr: NonNull::from(bg).cast::<TensorDyn>(),
+                    len: 1,
+                }),
                 err_send,
             ))
             .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
@@ -532,6 +567,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
         dst: &mut TensorDyn,
         detect: &[DetectBox],
         proto_data: &ProtoData,
+        overlay: crate::MaskOverlay<'_>,
     ) -> crate::Result<()> {
         let (err_send, err_recv) = tokio::sync::oneshot::channel();
         self.sender
@@ -547,6 +583,11 @@ impl ImageProcessorTrait for GLProcessorThreaded {
                     len: detect.len(),
                 },
                 Box::new(proto_data.clone()),
+                overlay.opacity,
+                overlay.background.map(|bg| SendablePtr {
+                    ptr: NonNull::from(bg).cast::<TensorDyn>(),
+                    len: 1,
+                }),
                 err_send,
             ))
             .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;

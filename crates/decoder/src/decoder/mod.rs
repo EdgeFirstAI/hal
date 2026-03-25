@@ -323,6 +323,18 @@ impl Decoder {
                 output_boxes,
                 output_masks,
             ),
+            ModelType::YoloSegDet2Way {
+                boxes,
+                mask_coeff,
+                protos,
+            } => self.decode_yolo_segdet_2way_quantized(
+                outputs,
+                boxes,
+                mask_coeff,
+                protos,
+                output_boxes,
+                output_masks,
+            ),
             ModelType::YoloEndToEndDet { boxes } => {
                 self.decode_yolo_end_to_end_det_quantized(outputs, boxes, output_boxes)
             }
@@ -482,6 +494,20 @@ impl Decoder {
                     output_masks,
                 )?;
             }
+            ModelType::YoloSegDet2Way {
+                boxes,
+                mask_coeff,
+                protos,
+            } => {
+                self.decode_yolo_segdet_2way_float(
+                    outputs,
+                    boxes,
+                    mask_coeff,
+                    protos,
+                    output_boxes,
+                    output_masks,
+                )?;
+            }
             ModelType::YoloEndToEndDet { boxes } => {
                 self.decode_yolo_end_to_end_det_float(outputs, boxes, output_boxes)?;
             }
@@ -574,6 +600,20 @@ impl Decoder {
                 )?;
                 Ok(Some(proto))
             }
+            ModelType::YoloSegDet2Way {
+                boxes,
+                mask_coeff,
+                protos,
+            } => {
+                let proto = self.decode_yolo_segdet_2way_quantized_proto(
+                    outputs,
+                    boxes,
+                    mask_coeff,
+                    protos,
+                    output_boxes,
+                )?;
+                Ok(Some(proto))
+            }
             ModelType::YoloEndToEndSegDet { boxes, protos } => {
                 let proto = self.decode_yolo_end_to_end_segdet_quantized_proto(
                     outputs,
@@ -646,6 +686,20 @@ impl Decoder {
                     outputs,
                     boxes,
                     scores,
+                    mask_coeff,
+                    protos,
+                    output_boxes,
+                )?;
+                Ok(Some(proto))
+            }
+            ModelType::YoloSegDet2Way {
+                boxes,
+                mask_coeff,
+                protos,
+            } => {
+                let proto = self.decode_yolo_segdet_2way_float_proto(
+                    outputs,
+                    boxes,
                     mask_coeff,
                     protos,
                     output_boxes,
