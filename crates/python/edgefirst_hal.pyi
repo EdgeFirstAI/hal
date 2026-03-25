@@ -1388,10 +1388,6 @@ class TrackInfo:
         """The timestamp (in nanoseconds) when the track was last updated."""
         ...
 
-    @property
-    def last_box(self) -> Tuple[Tuple[float, float, float, float], float, int]:
-        """The last bounding box, score, and class ID of the tracked object."""
-        ...
 
 
 class ActiveTrackInfo:

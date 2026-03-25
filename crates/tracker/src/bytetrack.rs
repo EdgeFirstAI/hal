@@ -250,7 +250,7 @@ impl<T: DetectionBox> ByteTrack<T> {
         tracked: &mut [bool],
         matched_info: &mut [Option<TrackInfo>],
         timestamp: u64,
-        skip_already_matched: bool,
+        log_assignments: bool,
     ) {
         for (i, &x) in assignments.iter().enumerate() {
             if i >= boxes.len() || x >= self.tracklets.len() {
@@ -262,12 +262,12 @@ impl<T: DetectionBox> ByteTrack<T> {
                 continue;
             }
 
-            // For second pass, skip already matched boxes/tracklets
-            if skip_already_matched && (matched[i] || tracked[x]) {
+            // Skip already matched boxes/tracklets
+            if matched[i] || tracked[x] {
                 continue;
             }
 
-            if skip_already_matched {
+            if log_assignments {
                 trace!(
                     "Cost: {} Box: {:#?} UUID: {} Mean: {}",
                     costs[(i, x)],
@@ -285,7 +285,6 @@ impl<T: DetectionBox> ByteTrack<T> {
                 tracked_location: self.tracklets[x].get_predicted_location(),
                 last_updated: timestamp,
             });
-            assert!(!tracked[x]);
             tracked[x] = true;
             self.tracklets[x].update(&boxes[i], timestamp);
         }
@@ -373,33 +372,35 @@ where
                 &matched,
                 &tracked,
             );
-            let ans = lapjv(&costs).unwrap();
-            self.process_assignments(
-                &ans.0,
-                boxes,
-                &costs,
-                &mut matched,
-                &mut tracked,
-                &mut matched_info,
-                timestamp,
-                false,
-            );
+            if let Ok(ans) = lapjv(&costs) {
+                self.process_assignments(
+                    &ans.0,
+                    boxes,
+                    &costs,
+                    &mut matched,
+                    &mut tracked,
+                    &mut matched_info,
+                    timestamp,
+                    false,
+                );
+            }
         }
 
         // Second pass: match remaining tracklets to low-confidence detections
         if !self.tracklets.is_empty() {
             let costs = self.compute_costs(boxes, 0.0, self.track_iou, &matched, &tracked);
-            let ans = lapjv(&costs).unwrap();
-            self.process_assignments(
-                &ans.0,
-                boxes,
-                &costs,
-                &mut matched,
-                &mut tracked,
-                &mut matched_info,
-                timestamp,
-                true,
-            );
+            if let Ok(ans) = lapjv(&costs) {
+                self.process_assignments(
+                    &ans.0,
+                    boxes,
+                    &costs,
+                    &mut matched,
+                    &mut tracked,
+                    &mut matched_info,
+                    timestamp,
+                    true,
+                );
+            }
         }
 
         // Remove expired tracklets

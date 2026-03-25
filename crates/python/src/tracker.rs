@@ -18,9 +18,6 @@ pub struct PyTrackInfo {
     pub track: TrackInfo,
 }
 
-unsafe impl Send for PyTrackInfo {}
-unsafe impl Sync for PyTrackInfo {}
-
 impl From<TrackInfo> for PyTrackInfo {
     fn from(track: TrackInfo) -> Self {
         Self { track }
@@ -88,9 +85,6 @@ impl PyTrackInfo {
 pub struct PyActiveTrackInfo {
     pub track: ActiveTrackInfo<DetectBox>,
 }
-
-unsafe impl Send for PyActiveTrackInfo {}
-unsafe impl Sync for PyActiveTrackInfo {}
 
 impl From<ActiveTrackInfo<DetectBox>> for PyActiveTrackInfo {
     fn from(track: ActiveTrackInfo<DetectBox>) -> Self {
