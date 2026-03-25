@@ -1748,11 +1748,8 @@ pub unsafe extern "C" fn hal_decoder_decode_tracked(
     }
 
     let outputs_slice = std::slice::from_raw_parts(outputs, num_outputs);
-
+    check_null!(outputs_slice[0]);
     // Check the first tensor to determine the decode path
-    if outputs_slice[0].is_null() {
-        return set_error(libc::EINVAL);
-    }
     let is_float = matches!(unsafe { &*outputs_slice[0] }.inner, TensorDyn::F32(_));
 
     let mut boxes: Vec<DetectBox> = Vec::with_capacity(100);
@@ -1762,9 +1759,7 @@ pub unsafe extern "C" fn hal_decoder_decode_tracked(
         // Float decode path: collect f32 tensor maps
         let mut maps = Vec::with_capacity(num_outputs);
         for &tensor_ptr in outputs_slice {
-            if tensor_ptr.is_null() {
-                return set_error(libc::EINVAL);
-            }
+            check_null!(tensor_ptr);
             match &unsafe { &*tensor_ptr }.inner {
                 TensorDyn::F32(t) => {
                     let map = try_or_errno!(t.map(), libc::EIO);
@@ -1885,10 +1880,8 @@ pub unsafe extern "C" fn hal_decoder_decode_tracked_draw_masks(
     }
 
     let outputs_slice = std::slice::from_raw_parts(outputs, num_outputs);
+    check_null!(outputs_slice[0]);
 
-    if outputs_slice[0].is_null() {
-        return set_error(libc::EINVAL);
-    }
     let is_float = matches!(unsafe { &*outputs_slice[0] }.inner, TensorDyn::F32(_));
 
     let mut boxes: Vec<DetectBox> = Vec::with_capacity(100);
@@ -1898,9 +1891,7 @@ pub unsafe extern "C" fn hal_decoder_decode_tracked_draw_masks(
         // Float path: try tracked proto decode first
         let mut maps = Vec::with_capacity(num_outputs);
         for &tensor_ptr in outputs_slice {
-            if tensor_ptr.is_null() {
-                return set_error(libc::EINVAL);
-            }
+            check_null!(tensor_ptr);
             match &unsafe { &*tensor_ptr }.inner {
                 TensorDyn::F32(t) => {
                     let map = try_or_errno!(t.map(), libc::EIO);
@@ -2016,6 +2007,8 @@ pub unsafe extern "C" fn hal_decoder_decode_tracked_draw_masks(
 
 #[cfg(test)]
 mod tests {
+    use edgefirst_decoder::dequantize_cpu;
+
     use super::*;
     use crate::tensor::{
         hal_tensor_free, hal_tensor_map_create, hal_tensor_map_data, hal_tensor_map_unmap,
@@ -3100,16 +3093,6 @@ outputs:
             );
             assert!(!tensor.is_null());
 
-            // Helper to copy raw bytes into a tensor
-            let copy_data_to_tensor = |t: *mut HalTensor, src: &[u8]| {
-                let map = hal_tensor_map_create(t);
-                assert!(!map.is_null());
-                let data = hal_tensor_map_data(map) as *mut u8;
-                assert!(!data.is_null());
-                std::ptr::copy_nonoverlapping(src.as_ptr(), data, src.len());
-                hal_tensor_map_unmap(map);
-            };
-
             // Copy initial data
             copy_data_to_tensor(tensor, raw);
 
@@ -3532,6 +3515,417 @@ outputs:
             hal_bytetrack_free(tracker);
             hal_image_processor_free(processor);
             hal_decoder_free(decoder);
+        }
+    }
+
+    #[test]
+    fn test_decode_tracked_end_to_end_segdet_split_proto_float() {
+        use crate::image::{
+            hal_image_processor_free, hal_image_processor_new, hal_tensor_new_image, HalPixelFormat,
+        };
+        use crate::tracker::{
+            hal_bytetrack_free, hal_bytetrack_new, hal_track_info_list_free, HalTrackInfoList,
+        };
+
+        let yaml = c"
+decoder_version: yolo26
+outputs:
+ - type: boxes
+   decoder: ultralytics
+   shape: [1, 10, 4]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [box_coords, 4]
+   normalized: true
+ - type: scores
+   decoder: ultralytics
+   shape: [1, 10, 1]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [num_classes, 1]
+ - type: classes
+   decoder: ultralytics
+   shape: [1, 10, 1]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [num_classes, 1]
+ - type: mask_coefficients
+   decoder: ultralytics
+   shape: [1, 10, 32]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [num_protos, 32]
+ - type: protos
+   decoder: ultralytics
+   shape: [1, 160, 160, 32]
+   dshape:
+    - [batch, 1]
+    - [height, 160]
+    - [width, 160]
+    - [num_protos, 32]
+";
+
+        unsafe {
+            // --- Create split f32 tensors ---
+
+            // Boxes [1, 10, 4]
+            let boxes_shape: [usize; 3] = [1, 10, 4];
+            let boxes_tensor = hal_tensor_new(
+                HalDtype::F32,
+                boxes_shape.as_ptr(),
+                3,
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert!(!boxes_tensor.is_null());
+            {
+                let map = hal_tensor_map_create(boxes_tensor);
+                assert!(!map.is_null());
+                let data = hal_tensor_map_data(map) as *mut f32;
+                std::ptr::write_bytes(data, 0, 10 * 4);
+                *data.add(0) = 0.1234;
+                *data.add(1) = 0.1234;
+                *data.add(2) = 0.2345;
+                *data.add(3) = 0.2345;
+                hal_tensor_map_unmap(map);
+            }
+
+            // Scores [1, 10, 1]
+            let scores_shape: [usize; 3] = [1, 10, 1];
+            let scores_tensor = hal_tensor_new(
+                HalDtype::F32,
+                scores_shape.as_ptr(),
+                3,
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert!(!scores_tensor.is_null());
+            {
+                let map = hal_tensor_map_create(scores_tensor);
+                assert!(!map.is_null());
+                let data = hal_tensor_map_data(map) as *mut f32;
+                std::ptr::write_bytes(data, 0, 10);
+                *data.add(0) = 0.9876;
+                hal_tensor_map_unmap(map);
+            }
+
+            // Classes [1, 10, 1]
+            let classes_shape: [usize; 3] = [1, 10, 1];
+            let classes_tensor = hal_tensor_new(
+                HalDtype::F32,
+                classes_shape.as_ptr(),
+                3,
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert!(!classes_tensor.is_null());
+            {
+                let map = hal_tensor_map_create(classes_tensor);
+                assert!(!map.is_null());
+                let data = hal_tensor_map_data(map) as *mut f32;
+                std::ptr::write_bytes(data, 0, 10);
+                *data.add(0) = 2.0;
+                hal_tensor_map_unmap(map);
+            }
+
+            // Mask coefficients [1, 10, 32] — all zeros
+            let mask_shape: [usize; 3] = [1, 10, 32];
+            let mask_tensor = hal_tensor_new(
+                HalDtype::F32,
+                mask_shape.as_ptr(),
+                3,
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert!(!mask_tensor.is_null());
+
+            // Protos [1, 160, 160, 32] — all zeros
+            let protos_shape: [usize; 4] = [1, 160, 160, 32];
+            let protos_tensor = hal_tensor_new(
+                HalDtype::F32,
+                protos_shape.as_ptr(),
+                4,
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert!(!protos_tensor.is_null());
+
+            // --- Build decoder ---
+            let params = hal_decoder_params_new();
+            assert!(!params.is_null());
+            assert_eq!(
+                hal_decoder_params_set_config_yaml(params, yaml.as_ptr(), 0),
+                0
+            );
+            hal_decoder_params_set_score_threshold(params, 0.45);
+            hal_decoder_params_set_iou_threshold(params, 0.45);
+            let decoder = hal_decoder_new(params);
+            assert!(!decoder.is_null());
+            hal_decoder_params_free(params);
+
+            // --- Create tracker ---
+            let tracker = hal_bytetrack_new(0.1, 0.7, 0.5, 30, 30);
+            assert!(!tracker.is_null());
+
+            // --- Create image processor and destination image ---
+            let processor = hal_image_processor_new();
+            assert!(!processor.is_null());
+
+            let image = hal_tensor_new_image(
+                400,
+                400,
+                HalPixelFormat::Rgba,
+                HalDtype::U8,
+                HalTensorMemory::Mem,
+            );
+            assert!(!image.is_null());
+
+            // --- Frame 0: decode tracked with proto ---
+            let outputs = [
+                boxes_tensor as *const HalTensor,
+                scores_tensor as *const HalTensor,
+                classes_tensor as *const HalTensor,
+                mask_tensor as *const HalTensor,
+                protos_tensor as *const HalTensor,
+            ];
+            let mut box_list: *mut HalDetectBoxList = std::ptr::null_mut();
+            let mut track_list: *mut HalTrackInfoList = std::ptr::null_mut();
+
+            let rc = hal_decoder_decode_tracked_draw_masks(
+                decoder,
+                tracker,
+                0,
+                processor,
+                outputs.as_ptr(),
+                5,
+                image,
+                &mut box_list,
+                &mut track_list,
+            );
+            assert_eq!(rc, 0);
+            assert!(!box_list.is_null());
+            assert_eq!(hal_detect_box_list_len(box_list), 1);
+
+            let mut box0 = std::mem::zeroed::<HalDetectBox>();
+            assert_eq!(hal_detect_box_list_get(box_list, 0, &mut box0), 0);
+            // No quantization error, so we can use much tighter tolerance
+            assert!((box0.xmin - 0.1234).abs() < 1e-6, "xmin: {}", box0.xmin);
+            assert!((box0.ymin - 0.1234).abs() < 1e-6, "ymin: {}", box0.ymin);
+            assert!((box0.xmax - 0.2345).abs() < 1e-6, "xmax: {}", box0.xmax);
+            assert!((box0.ymax - 0.2345).abs() < 1e-6, "ymax: {}", box0.ymax);
+            assert_eq!(box0.label, 2);
+
+            hal_detect_box_list_free(box_list);
+            if !track_list.is_null() {
+                hal_track_info_list_free(track_list);
+            }
+
+            // --- Frame 1: zero all scores, verify tracker prediction ---
+            {
+                let map = hal_tensor_map_create(scores_tensor);
+                assert!(!map.is_null());
+                let data = hal_tensor_map_data(map) as *mut f32;
+                std::ptr::write_bytes(data, 0, 10);
+                hal_tensor_map_unmap(map);
+            }
+
+            box_list = std::ptr::null_mut();
+            track_list = std::ptr::null_mut();
+
+            let rc = hal_decoder_decode_tracked_draw_masks(
+                decoder,
+                tracker,
+                100_000_000 / 3,
+                processor,
+                outputs.as_ptr(),
+                5,
+                image,
+                &mut box_list,
+                &mut track_list,
+            );
+            assert_eq!(rc, 0);
+            assert!(!box_list.is_null());
+
+            // Tracker predicts the box forward (same location, no motion)
+            assert_eq!(hal_detect_box_list_len(box_list), 1);
+            assert_eq!(hal_detect_box_list_get(box_list, 0, &mut box0), 0);
+            assert!((box0.xmin - 0.1234).abs() < 1e-6);
+            assert!((box0.ymin - 0.1234).abs() < 1e-6);
+            assert!((box0.xmax - 0.2345).abs() < 1e-6);
+            assert!((box0.ymax - 0.2345).abs() < 1e-6);
+
+            hal_detect_box_list_free(box_list);
+            if !track_list.is_null() {
+                hal_track_info_list_free(track_list);
+            }
+
+            // Cleanup
+            hal_tensor_free(boxes_tensor);
+            hal_tensor_free(scores_tensor);
+            hal_tensor_free(classes_tensor);
+            hal_tensor_free(mask_tensor);
+            hal_tensor_free(protos_tensor);
+            hal_tensor_free(image);
+            hal_bytetrack_free(tracker);
+            hal_image_processor_free(processor);
+            hal_decoder_free(decoder);
+        }
+    }
+
+    unsafe fn copy_data_to_tensor<T>(t: *mut HalTensor, src: &[T]) {
+        let map = hal_tensor_map_create(t);
+        assert!(!map.is_null());
+        let data = hal_tensor_map_data(map) as *mut T;
+        assert!(!data.is_null());
+        std::ptr::copy_nonoverlapping(src.as_ptr(), data, src.len());
+        hal_tensor_map_unmap(map);
+    }
+
+    #[test]
+    fn test_decode_tracked_float_and_quant() {
+        use crate::tracker::{hal_bytetrack_new, hal_track_info_list_free};
+
+        let yaml = c"
+decoder_version: yolov8
+outputs:
+ - type: detection
+   decoder: ultralytics
+   quantization: [0.0040811873, -123]
+   shape: [1, 84, 8400]
+   dshape:
+    - [batch, 1]
+    - [num_features, 84]
+    - [num_boxes, 8400]
+   normalized: true
+";
+        unsafe {
+            // Load the yolov8s test data (i8 quantized, shape [1, 84, 8400])
+            let raw = include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/yolov8s_80_classes.bin"
+            ));
+            let raw = std::slice::from_raw_parts(raw.as_ptr() as *const i8, raw.len());
+            let quant = (0.0040811873, -123);
+
+            let params = hal_decoder_params_new();
+            hal_decoder_params_set_config_yaml(params, yaml.as_ptr(), 0);
+            hal_decoder_params_set_score_threshold(params, 0.25);
+            hal_decoder_params_set_iou_threshold(params, 0.1);
+            hal_decoder_params_set_nms(params, HalNms::ClassAgnostic);
+
+            let decoder = hal_decoder_new(params);
+
+            assert!(!decoder.is_null(), "decoder creation failed");
+            hal_decoder_params_free(params);
+
+            let tracker = hal_bytetrack_new(0.1, 0.3, 0.25, 30, 30);
+            assert!(!tracker.is_null());
+
+            // Create i8 tensor from the test data
+            let tensor = hal_tensor_new(
+                HalDtype::I8,
+                [1, 84, 8400].as_ptr(),
+                3,
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert!(!tensor.is_null());
+
+            // Copy initial data
+            copy_data_to_tensor(tensor, raw);
+
+            let outputs = [tensor as *const HalTensor];
+            let mut boxes: *mut HalDetectBoxList = std::ptr::null_mut();
+            let mut segs: *mut HalSegmentationList = std::ptr::null_mut();
+            let mut tracks: *mut HalTrackInfoList = std::ptr::null_mut();
+
+            let rc = hal_decoder_decode_tracked(
+                decoder,
+                tracker,
+                0,
+                outputs.as_ptr(),
+                1,
+                &mut boxes,
+                &mut segs,
+                &mut tracks,
+            );
+            assert_eq!(rc, 0);
+            assert_eq!(hal_detect_box_list_len(boxes), 2);
+
+            let mut box0 = std::mem::zeroed::<HalDetectBox>();
+            let mut box1 = std::mem::zeroed::<HalDetectBox>();
+            assert_eq!(hal_detect_box_list_get(boxes, 0, &mut box0), 0);
+            assert_eq!(hal_detect_box_list_get(boxes, 1, &mut box1), 0);
+
+            assert!((box0.xmin - 0.5285137).abs() < 1e-6);
+            assert!((box0.ymin - 0.05305544).abs() < 1e-6);
+            assert!((box0.xmax - 0.87541467).abs() < 1e-6);
+            assert!((box0.ymax - 0.9998909).abs() < 1e-6);
+            assert_eq!(box0.label, 0);
+
+            assert!((box1.xmin - 0.130598).abs() < 1e-6);
+            assert!((box1.ymin - 0.43260583).abs() < 1e-6);
+            assert!((box1.xmax - 0.35098213).abs() < 1e-6);
+            assert!((box1.ymax - 0.9958097).abs() < 1e-6);
+            assert_eq!(box1.label, 75);
+
+            hal_detect_box_list_free(boxes);
+            if !segs.is_null() {
+                hal_segmentation_list_free(segs);
+            }
+            if !tracks.is_null() {
+                hal_track_info_list_free(tracks);
+            }
+            let mut raw_float = vec![0.0f32; raw.len()];
+            dequantize_cpu(raw, quant.into(), &mut raw_float);
+            let tensor_float = hal_tensor_new(
+                HalDtype::F32,
+                [1, 84, 8400].as_ptr(),
+                3,
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert!(!tensor_float.is_null());
+            copy_data_to_tensor(tensor_float, &raw_float);
+
+            let outputs = [tensor_float as *const HalTensor];
+            let mut boxes_float: *mut HalDetectBoxList = std::ptr::null_mut();
+            let mut segs_float: *mut HalSegmentationList = std::ptr::null_mut();
+            let mut tracks_float: *mut HalTrackInfoList = std::ptr::null_mut();
+
+            let rc = hal_decoder_decode_tracked(
+                decoder,
+                tracker,
+                0,
+                outputs.as_ptr(),
+                1,
+                &mut boxes_float,
+                &mut segs_float,
+                &mut tracks_float,
+            );
+            assert_eq!(rc, 0);
+            assert_eq!(hal_detect_box_list_len(boxes_float), 2);
+
+            let mut box0_float = std::mem::zeroed::<HalDetectBox>();
+            let mut box1_float = std::mem::zeroed::<HalDetectBox>();
+            assert_eq!(hal_detect_box_list_get(boxes_float, 0, &mut box0_float), 0);
+            assert_eq!(hal_detect_box_list_get(boxes_float, 1, &mut box1_float), 0);
+
+            assert!((box0_float.xmin - 0.5285137).abs() < 1e-6);
+            assert!((box0_float.ymin - 0.05305544).abs() < 1e-6);
+            assert!((box0_float.xmax - 0.87541467).abs() < 1e-6);
+            assert!((box0_float.ymax - 0.9998909).abs() < 1e-6);
+            assert_eq!(box0_float.label, 0);
+
+            assert!((box1_float.xmin - 0.130598).abs() < 1e-6);
+            assert!((box1_float.ymin - 0.43260583).abs() < 1e-6);
+            assert!((box1_float.xmax - 0.35098213).abs() < 1e-6);
+            assert!((box1_float.ymax - 0.9958097).abs() < 1e-6);
+            assert_eq!(box1_float.label, 75);
         }
     }
 }
