@@ -33,6 +33,17 @@ extern "C" {
  * - Tensor map operations require external synchronization when used concurrently
  */
 
+/**
+ * @brief Opaque delegate handle.
+ *
+ * Used by the delegate DMA-BUF API (hal_dmabuf_*) to reference an
+ * externally-owned TFLite delegate instance. The delegate lifetime
+ * is managed by the caller; the HAL never creates or destroys delegates.
+ *
+ * A future revision will formalize this as a proper abstraction.
+ */
+typedef void *hal_delegate_t;
+
 
 /* Generated with cbindgen:0.29.2 */
 
@@ -44,6 +55,11 @@ extern "C" {
 #include <stdlib.h>
 #include <stddef.h>
 #include <stdio.h>
+
+/**
+ * Maximum number of dimensions in a delegate tensor shape.
+ */
+#define HAL_DMABUF_MAX_NDIM 8
 
 /**
  * Output type for model tensor outputs.
@@ -702,6 +718,53 @@ typedef struct hal_track_info {
 } hal_track_info;
 
 /**
+ * DMA-BUF tensor information returned by a delegate.
+ *
+ * Describes a single tensor's DMA-BUF allocation, including the file
+ * descriptor, buffer geometry, and element type. The fd is borrowed
+ * from the delegate and must NOT be closed by the caller.
+ *
+ * Fields are ordered to eliminate padding on LP64: all `size_t` fields
+ * first (8-byte aligned), then smaller `int` and enum fields (4 bytes
+ * each) at the end. Total size: 96 bytes on LP64.
+ *
+ * @par Versioning
+ * The companion hal_dmabuf_get_tensor_info() function accepts an
+ * info_size parameter so that the struct can grow in future versions
+ * without breaking ABI. Implementations must zero-initialize the
+ * struct with memset(info, 0, info_size) before populating it, and
+ * only write fields whose offset + size fits within info_size.
+ */
+typedef struct hal_dmabuf_tensor_info {
+  /**
+   * Buffer size in bytes.
+   */
+  size_t size;
+  /**
+   * Byte offset within the DMA-BUF.
+   */
+  size_t offset;
+  /**
+   * Tensor dimensions (up to HAL_DMABUF_MAX_NDIM).
+   *
+   * Uses a literal length so cbindgen can emit the array in the C header.
+   */
+  size_t shape[8];
+  /**
+   * Number of valid entries in `shape`.
+   */
+  size_t ndim;
+  /**
+   * DMA-BUF file descriptor (borrowed — do not close).
+   */
+  int fd;
+  /**
+   * Element data type.
+   */
+  enum hal_dtype dtype;
+} hal_dmabuf_tensor_info;
+
+/**
  * Create new decoder parameters.
  *
  * Returns an opaque handle initialized with safe defaults:
@@ -1190,6 +1253,68 @@ int hal_decoder_decode_masks(const struct hal_decoder *decoder,
                              size_t output_height,
                              struct hal_detect_box_list **out_boxes,
                              struct hal_segmentation_list **out_masks);
+
+/**
+ * Decode model outputs into tracked detection boxes and segmentation masks.
+ *
+ * Automatically selects the decoding path based on tensor dtype:
+ * - f32 tensors → `decode_tracked_float` path
+ * - Integer tensors (u8, i8, u16, i16, u32, i32) → `decode_tracked_quantized` path
+ *
+ * All output tensors must be the same general category (all float or all integer).
+ *
+ * @param decoder Decoder handle
+ * @param tracker Tracker handle for maintaining object identities across frames
+ * @param timestamp Timestamp for the current frame (e.g., in nanoseconds)
+ * @param outputs Array of output tensor pointers
+ * @param num_outputs Number of output tensors
+ * @param out_boxes Output parameter for detection box list (caller must free)
+ * @param out_segmentations Output parameter for segmentation list (can be NULL; caller must free if non-NULL)
+ * @return 0 on success, -1 on error
+ * @par Errors (errno):
+ * - EINVAL: Invalid argument (NULL decoder/outputs/out_boxes, mixed dtypes)
+ * - EIO: Decoding failed
+ */
+int hal_decoder_decode_tracked(const struct hal_decoder *decoder,
+                               struct hal_bytetrack *tracker,
+                               uint64_t timestamp,
+                               const struct hal_tensor *const *outputs,
+                               size_t num_outputs,
+                               struct hal_detect_box_list **out_boxes,
+                               struct hal_segmentation_list **out_segmentations,
+                               struct hal_track_info_list **out_tracks);
+
+/**
+ * Decode tracked model outputs and draw masks directly onto a destination image.
+ *
+ * This is the fused tracked path: for segmentation models, prototype data is
+ * passed directly to the renderer without materializing intermediate mask
+ * arrays. Object tracking is applied to maintain identities across frames.
+ * For detection-only models, this falls back to tracked decode + draw_masks.
+ *
+ * @param decoder Decoder handle
+ * @param tracker Tracker handle for maintaining object identities across frames
+ * @param timestamp Timestamp for the current frame (e.g., in nanoseconds)
+ * @param processor Image processor handle
+ * @param outputs Array of output tensor pointers
+ * @param num_outputs Number of output tensors
+ * @param dst Destination image to draw onto
+ * @param out_boxes Output parameter for detection box list (caller must free)
+ * @param out_tracks Output parameter for track info list (can be NULL; caller must free if non-NULL)
+ * @return 0 on success, -1 on error
+ * @par Errors (errno):
+ * - EINVAL: Invalid argument (NULL decoder/tracker/processor/outputs/dst/out_boxes)
+ * - EIO: Decoding or drawing failed
+ */
+int hal_decoder_decode_tracked_draw_masks(const struct hal_decoder *decoder,
+                                          struct hal_bytetrack *tracker,
+                                          uint64_t timestamp,
+                                          struct hal_image_processor *processor,
+                                          const struct hal_tensor *const *outputs,
+                                          size_t num_outputs,
+                                          struct hal_tensor *dst,
+                                          struct hal_detect_box_list **out_boxes,
+                                          struct hal_track_info_list **out_tracks);
 
 /**
  * Create a new rectangle.
@@ -1990,8 +2115,8 @@ void hal_tensor_map_unmap(struct hal_tensor_map *map);
 /**
  * Create a new ByteTrack tracker with specified parameters.
  *
- * @param track_thresh Score threshold for creating new tracks
- * @param high_thresh High confidence threshold for first-pass matching
+ * @param track_update Smoothness threshold for track updates (high = more stable tracks, low = more responsive to changes)
+ * @param high_thresh High confidence threshold for first-pass matching and creating new tracks
  * @param match_thresh IOU threshold for matching detections to tracks
  * @param frame_rate Expected frame rate of the input video
  * @param track_buffer Number of frames to keep lost tracks before deletion
@@ -1999,7 +2124,7 @@ void hal_tensor_map_unmap(struct hal_tensor_map *map);
  * @par Errors (errno):
  * - ENOMEM: Memory allocation failed
  */
-struct hal_bytetrack *hal_bytetrack_new(float track_thresh,
+struct hal_bytetrack *hal_bytetrack_new(float track_update,
                                         float high_thresh,
                                         float match_thresh,
                                         int frame_rate,
@@ -2009,7 +2134,7 @@ struct hal_bytetrack *hal_bytetrack_new(float track_thresh,
  * Create a new ByteTrack tracker with default parameters.
  *
  * Default values:
- * - track_thresh: 0.25
+ * - track_update: 0.25
  * - high_thresh: 0.7
  * - match_thresh: 0.25
  * - track_extra_lifespan: 500ms

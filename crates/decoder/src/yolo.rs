@@ -35,7 +35,7 @@ fn dispatch_nms_float(nms: Option<Nms>, iou: f32, boxes: Vec<DetectBox>) -> Vec<
 
 /// Dispatches to the appropriate NMS function based on mode for float boxes
 /// with extra data.
-fn dispatch_nms_extra_float<E: Send + Sync>(
+pub(super) fn dispatch_nms_extra_float<E: Send + Sync>(
     nms: Option<Nms>,
     iou: f32,
     boxes: Vec<(DetectBox, E)>,
@@ -413,53 +413,19 @@ where
     T: Float + AsPrimitive<f32> + Send + Sync + 'static,
     f32: AsPrimitive<T>,
 {
-    // Validate input shape: need at least 7 rows (6 base + at least 1 mask coeff)
-    if output.shape()[0] < 7 {
-        return Err(crate::DecoderError::InvalidShape(format!(
-            "End-to-end segdet output requires at least 7 rows, got {}",
-            output.shape()[0]
-        )));
-    }
-
-    let num_mask_coeffs = output.shape()[0] - 6;
-    let num_protos = protos.shape()[2];
-    if num_mask_coeffs != num_protos {
-        return Err(crate::DecoderError::InvalidShape(format!(
-            "Mask coefficients count ({}) doesn't match protos count ({})",
-            num_mask_coeffs, num_protos
-        )));
-    }
-
-    // Input shape: (6+num_protos, N) -> transpose for postprocessing
-    let boxes = output.slice(s![0..4, ..]).reversed_axes();
-    let scores = output.slice(s![4..5, ..]).reversed_axes();
-    let classes = output.slice(s![5, ..]);
-    let mask_coeff = output.slice(s![6.., ..]).reversed_axes();
-    let mut boxes =
-        postprocess_boxes_index_float::<XYXY, _, _>(score_threshold.as_(), boxes, scores);
-    boxes.truncate(output_boxes.capacity());
-
-    for (b, ind) in &mut boxes {
-        b.label = classes[*ind].as_() as usize;
-    }
+    let (boxes, scores, classes, mask_coeff) =
+        postprocess_yolo_end_to_end_segdet(&output, protos.dim().2)?;
+    let boxes = impl_yolo_end_to_end_segdet_get_boxes::<XYXY, _, _, _>(
+        boxes,
+        scores,
+        classes,
+        score_threshold,
+        output_boxes.capacity(),
+    );
 
     // No NMS — model output is already post-NMS
 
-    let boxes = decode_segdet_f32(boxes, mask_coeff, protos)?;
-
-    output_boxes.clear();
-    output_masks.clear();
-    for (b, m) in boxes.into_iter() {
-        output_boxes.push(b);
-        output_masks.push(Segmentation {
-            xmin: b.bbox.xmin,
-            ymin: b.bbox.ymin,
-            xmax: b.bbox.xmax,
-            ymax: b.bbox.ymax,
-            segmentation: m,
-        });
-    }
-    Ok(())
+    impl_yolo_split_segdet_process_masks(boxes, mask_coeff, protos, output_boxes, output_masks)
 }
 
 /// Decodes split end-to-end YOLO detection outputs (post-NMS from model).
@@ -510,10 +476,10 @@ pub fn decode_yolo_split_end_to_end_det_float<T: Float + AsPrimitive<f32>>(
 /// Decodes split end-to-end YOLO detection + segmentation outputs.
 ///
 /// Input shapes (after batch dim removed):
-/// - boxes: (N, 4) — xyxy pixel coordinates
-/// - scores: (N, 1) — confidence
-/// - classes: (N, 1) — class index
-/// - mask_coeff: (N, num_protos) — mask coefficients per detection
+/// - boxes: (4, N) — xyxy pixel coordinates
+/// - scores: (1, N) — confidence
+/// - classes: (1, N) — class index
+/// - mask_coeff: (num_protos, N) — mask coefficients per detection
 /// - protos: (proto_h, proto_w, num_protos) — prototype masks
 #[allow(clippy::too_many_arguments)]
 pub fn decode_yolo_split_end_to_end_segdet_float<T>(
@@ -530,57 +496,92 @@ where
     T: Float + AsPrimitive<f32> + Send + Sync + 'static,
     f32: AsPrimitive<T>,
 {
-    let n = boxes.shape()[0];
-    if boxes.shape()[1] != 4 {
+    let (boxes, scores, classes, mask_coeff) =
+        postprocess_yolo_split_end_to_end_segdet(boxes, scores, &classes, mask_coeff)?;
+    let boxes = impl_yolo_end_to_end_segdet_get_boxes::<XYXY, _, _, _>(
+        boxes,
+        scores,
+        classes,
+        score_threshold,
+        output_boxes.capacity(),
+    );
+
+    impl_yolo_split_segdet_process_masks(boxes, mask_coeff, protos, output_boxes, output_masks)
+}
+
+#[allow(clippy::type_complexity)]
+pub(crate) fn postprocess_yolo_end_to_end_segdet<'a, T>(
+    output: &'a ArrayView2<'_, T>,
+    num_protos: usize,
+) -> Result<
+    (
+        ArrayView2<'a, T>,
+        ArrayView2<'a, T>,
+        ArrayView1<'a, T>,
+        ArrayView2<'a, T>,
+    ),
+    crate::DecoderError,
+> {
+    // Validate input shape: need at least 7 rows (6 base + at least 1 mask coeff)
+    if output.shape()[0] < 7 {
         return Err(crate::DecoderError::InvalidShape(format!(
-            "Split end-to-end boxes must have 4 columns, got {}",
-            boxes.shape()[1]
+            "End-to-end segdet output requires at least 7 rows, got {}",
+            output.shape()[0]
         )));
     }
 
-    // Collect qualifying detections with their indices
-    let mut qualifying: Vec<(DetectBox, usize)> = Vec::with_capacity(output_boxes.capacity());
-    for i in 0..n {
-        let score: f32 = scores[[i, 0]].as_();
-        if score < score_threshold {
-            continue;
-        }
-        if qualifying.len() >= output_boxes.capacity() {
-            break;
-        }
-        qualifying.push((
-            DetectBox {
-                bbox: BoundingBox {
-                    xmin: boxes[[i, 0]].as_(),
-                    ymin: boxes[[i, 1]].as_(),
-                    xmax: boxes[[i, 2]].as_(),
-                    ymax: boxes[[i, 3]].as_(),
-                },
-                score,
-                label: classes[[i, 0]].as_() as usize,
-            },
-            i,
-        ));
+    let num_mask_coeffs = output.shape()[0] - 6;
+    if num_mask_coeffs != num_protos {
+        return Err(crate::DecoderError::InvalidShape(format!(
+            "Mask coefficients count ({}) doesn't match protos count ({})",
+            num_mask_coeffs, num_protos
+        )));
     }
 
-    // Process masks using existing infrastructure
-    let result = decode_segdet_f32(qualifying, mask_coeff, protos)?;
-
-    output_boxes.clear();
-    output_masks.clear();
-    for (b, m) in result.into_iter() {
-        output_masks.push(crate::Segmentation {
-            xmin: b.bbox.xmin,
-            ymin: b.bbox.ymin,
-            xmax: b.bbox.xmax,
-            ymax: b.bbox.ymax,
-            segmentation: m,
-        });
-        output_boxes.push(b);
-    }
-    Ok(())
+    // Input shape: (6+num_protos, N) -> transpose for postprocessing
+    let boxes = output.slice(s![0..4, ..]).reversed_axes();
+    let scores = output.slice(s![4..5, ..]).reversed_axes();
+    let classes = output.slice(s![5, ..]);
+    let mask_coeff = output.slice(s![6.., ..]).reversed_axes();
+    Ok((boxes, scores, classes, mask_coeff))
 }
 
+#[allow(clippy::type_complexity)]
+pub(crate) fn postprocess_yolo_split_end_to_end_segdet<
+    'a,
+    'b,
+    'c,
+    'd,
+    BOXES,
+    SCORES,
+    CLASS,
+    MASK,
+>(
+    boxes: ArrayView2<'a, BOXES>,
+    scores: ArrayView2<'b, SCORES>,
+    classes: &'c ArrayView2<CLASS>,
+    mask_coeff: ArrayView2<'d, MASK>,
+) -> Result<
+    (
+        ArrayView2<'a, BOXES>,
+        ArrayView2<'b, SCORES>,
+        ArrayView1<'c, CLASS>,
+        ArrayView2<'d, MASK>,
+    ),
+    crate::DecoderError,
+> {
+    if boxes.shape()[0] != 4 {
+        return Err(crate::DecoderError::InvalidShape(format!(
+            "Split end-to-end boxes must have 4 columns, got {}",
+            boxes.shape()[0]
+        )));
+    }
+    let boxes = boxes.reversed_axes();
+    let scores = scores.reversed_axes();
+    let classes = classes.slice(s![0, ..]);
+    let mask_coeff = mask_coeff.reversed_axes();
+    Ok((boxes, scores, classes, mask_coeff))
+}
 /// Internal implementation of YOLO decoding for quantized tensors.
 ///
 /// Expected shapes of inputs:
@@ -747,11 +748,11 @@ where
 {
     let (boxes, quant_boxes) = boxes;
     let num_protos = protos.0.dim().2;
-    let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&boxes, num_protos);
 
+    let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&boxes, num_protos);
     let boxes = impl_yolo_split_segdet_quant_get_boxes::<B, _, _>(
-        (boxes_tensor.reversed_axes(), quant_boxes),
-        (scores_tensor.reversed_axes(), quant_boxes),
+        (boxes_tensor, quant_boxes),
+        (scores_tensor, quant_boxes),
         score_threshold,
         iou_threshold,
         nms,
@@ -760,7 +761,7 @@ where
 
     impl_yolo_split_segdet_quant_process_masks::<_, _>(
         boxes,
-        (mask_tensor.reversed_axes(), quant_boxes),
+        (mask_tensor, quant_boxes),
         protos,
         output_boxes,
         output_masks,
@@ -794,15 +795,76 @@ where
 {
     let num_protos = protos.dim().2;
     let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&boxes, num_protos);
+    let boxes = impl_yolo_segdet_get_boxes::<XYWH, _, _>(
+        boxes_tensor,
+        scores_tensor,
+        score_threshold,
+        iou_threshold,
+        nms,
+        output_boxes.capacity(),
+    );
+    impl_yolo_split_segdet_process_masks(boxes, mask_tensor, protos, output_boxes, output_masks)
+}
 
+pub(crate) fn impl_yolo_segdet_get_boxes<
+    B: BBoxTypeTrait,
+    BOX: Float + AsPrimitive<f32> + Send + Sync,
+    SCORE: Float + AsPrimitive<f32> + Send + Sync,
+>(
+    boxes_tensor: ArrayView2<BOX>,
+    scores_tensor: ArrayView2<SCORE>,
+    score_threshold: f32,
+    iou_threshold: f32,
+    nms: Option<Nms>,
+    max_boxes: usize,
+) -> Vec<(DetectBox, usize)>
+where
+    f32: AsPrimitive<SCORE>,
+{
     let boxes = postprocess_boxes_index_float::<B, _, _>(
         score_threshold.as_(),
         boxes_tensor,
         scores_tensor,
     );
     let mut boxes = dispatch_nms_extra_float(nms, iou_threshold, boxes);
-    boxes.truncate(output_boxes.capacity());
-    let boxes = decode_segdet_f32(boxes, mask_tensor, protos)?;
+    boxes.truncate(max_boxes);
+    boxes
+}
+
+pub(crate) fn impl_yolo_end_to_end_segdet_get_boxes<
+    B: BBoxTypeTrait,
+    BOX: Float + AsPrimitive<f32> + Send + Sync,
+    SCORE: Float + AsPrimitive<f32> + Send + Sync,
+    CLASS: AsPrimitive<f32> + Send + Sync,
+>(
+    boxes: ArrayView2<BOX>,
+    scores: ArrayView2<SCORE>,
+    classes: ArrayView1<CLASS>,
+    score_threshold: f32,
+    max_boxes: usize,
+) -> Vec<(DetectBox, usize)>
+where
+    f32: AsPrimitive<SCORE>,
+{
+    let mut boxes = postprocess_boxes_index_float::<B, _, _>(score_threshold.as_(), boxes, scores);
+    boxes.truncate(max_boxes);
+    for (b, ind) in &mut boxes {
+        b.label = classes[*ind].as_().round() as usize;
+    }
+    boxes
+}
+
+pub(crate) fn impl_yolo_split_segdet_process_masks<
+    MASK: Float + AsPrimitive<f32> + Send + Sync,
+    PROTO: Float + AsPrimitive<f32> + Send + Sync,
+>(
+    boxes: Vec<(DetectBox, usize)>,
+    masks_tensor: ArrayView2<MASK>,
+    protos_tensor: ArrayView3<PROTO>,
+    output_boxes: &mut Vec<DetectBox>,
+    output_masks: &mut Vec<Segmentation>,
+) -> Result<(), crate::DecoderError> {
+    let boxes = decode_segdet_f32(boxes, masks_tensor, protos_tensor)?;
     output_boxes.clear();
     output_masks.clear();
     for (b, m) in boxes.into_iter() {
@@ -817,7 +879,9 @@ where
     }
     Ok(())
 }
-
+/// Expected input shapes:
+/// - boxes_tensor: (num_boxes, 4)
+/// - scores_tensor: (num_boxes, num_classes)
 pub(crate) fn impl_yolo_split_segdet_quant_get_boxes<
     B: BBoxTypeTrait,
     BOX: PrimInt + AsPrimitive<f32> + Send + Sync,
@@ -835,9 +899,6 @@ where
 {
     let (boxes_tensor, quant_boxes) = boxes;
     let (scores_tensor, quant_scores) = scores;
-
-    let boxes_tensor = boxes_tensor.reversed_axes();
-    let scores_tensor = scores_tensor.reversed_axes();
 
     let boxes = {
         let score_threshold = quantize_score_threshold(score_threshold, quant_scores);
@@ -868,8 +929,6 @@ pub(crate) fn impl_yolo_split_segdet_quant_process_masks<
 ) -> Result<(), crate::DecoderError> {
     let (masks, quant_masks) = mask_coeff;
     let (protos, quant_protos) = protos;
-
-    let masks = masks.reversed_axes();
 
     let boxes = decode_segdet_quant(boxes, masks, protos, quant_masks, quant_protos)?;
     output_boxes.clear();
@@ -919,6 +978,12 @@ pub fn impl_yolo_split_segdet_quant<
 where
     f32: AsPrimitive<SCORE>,
 {
+    let (boxes_, scores_, mask_coeff_) =
+        postprocess_yolo_split_segdet(boxes.0, scores.0, mask_coeff.0);
+    let boxes = (boxes_, boxes.1);
+    let scores = (scores_, scores.1);
+    let mask_coeff = (mask_coeff_, mask_coeff.1);
+
     let boxes = impl_yolo_split_segdet_quant_get_boxes::<B, _, _>(
         boxes,
         scores,
@@ -969,31 +1034,18 @@ pub fn impl_yolo_split_segdet_float<
 where
     f32: AsPrimitive<SCORE>,
 {
-    let boxes_tensor = boxes_tensor.reversed_axes();
-    let scores_tensor = scores_tensor.reversed_axes();
-    let mask_tensor = mask_tensor.reversed_axes();
+    let (boxes_tensor, scores_tensor, mask_tensor) =
+        postprocess_yolo_split_segdet(boxes_tensor, scores_tensor, mask_tensor);
 
-    let boxes = postprocess_boxes_index_float::<B, _, _>(
-        score_threshold.as_(),
+    let boxes = impl_yolo_segdet_get_boxes::<XYWH, _, _>(
         boxes_tensor,
         scores_tensor,
+        score_threshold,
+        iou_threshold,
+        nms,
+        output_boxes.capacity(),
     );
-    let mut boxes = dispatch_nms_extra_float(nms, iou_threshold, boxes);
-    boxes.truncate(output_boxes.capacity());
-    let boxes = decode_segdet_f32(boxes, mask_tensor, protos)?;
-    output_boxes.clear();
-    output_masks.clear();
-    for (b, m) in boxes.into_iter() {
-        output_boxes.push(b);
-        output_masks.push(Segmentation {
-            xmin: b.bbox.xmin,
-            ymin: b.bbox.ymin,
-            xmax: b.bbox.xmax,
-            ymax: b.bbox.ymax,
-            segmentation: m,
-        });
-    }
-    Ok(())
+    impl_yolo_split_segdet_process_masks(boxes, mask_tensor, protos, output_boxes, output_masks)
 }
 
 // ---------------------------------------------------------------------------
@@ -1030,8 +1082,8 @@ where
     let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&boxes_arr, num_protos);
 
     let det_indices = impl_yolo_split_segdet_quant_get_boxes::<B, _, _>(
-        (boxes_tensor.reversed_axes(), quant_boxes),
-        (scores_tensor.reversed_axes(), quant_boxes),
+        (boxes_tensor, quant_boxes),
+        (scores_tensor, quant_boxes),
         score_threshold,
         iou_threshold,
         nms,
@@ -1068,15 +1120,16 @@ where
     let num_protos = protos.dim().2;
     let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&boxes, num_protos);
 
-    let det_indices = postprocess_boxes_index_float::<B, _, _>(
-        score_threshold.as_(),
+    let boxes = impl_yolo_segdet_get_boxes::<XYWH, _, _>(
         boxes_tensor,
         scores_tensor,
+        score_threshold,
+        iou_threshold,
+        nms,
+        output_boxes.capacity(),
     );
-    let mut det_indices = dispatch_nms_extra_float(nms, iou_threshold, det_indices);
-    det_indices.truncate(output_boxes.capacity());
 
-    extract_proto_data_float(det_indices, mask_tensor, protos, output_boxes)
+    extract_proto_data_float(boxes, mask_tensor, protos, output_boxes)
 }
 
 /// Proto-extraction variant of `impl_yolo_split_segdet_quant`.
@@ -1101,6 +1154,12 @@ pub fn impl_yolo_split_segdet_quant_proto<
 where
     f32: AsPrimitive<SCORE>,
 {
+    let (boxes_, scores_, mask_coeff_) =
+        postprocess_yolo_split_segdet(boxes.0, scores.0, mask_coeff.0);
+    let boxes = (boxes_, boxes.1);
+    let scores = (scores_, scores.1);
+    let mask_coeff = (mask_coeff_, mask_coeff.1);
+
     let det_indices = impl_yolo_split_segdet_quant_get_boxes::<B, _, _>(
         boxes,
         scores,
@@ -1146,17 +1205,16 @@ pub fn impl_yolo_split_segdet_float_proto<
 where
     f32: AsPrimitive<SCORE>,
 {
-    let boxes_tensor = boxes_tensor.reversed_axes();
-    let scores_tensor = scores_tensor.reversed_axes();
-    let mask_tensor = mask_tensor.reversed_axes();
-
-    let det_indices = postprocess_boxes_index_float::<B, _, _>(
-        score_threshold.as_(),
+    let (boxes_tensor, scores_tensor, mask_tensor) =
+        postprocess_yolo_split_segdet(boxes_tensor, scores_tensor, mask_tensor);
+    let det_indices = impl_yolo_segdet_get_boxes::<B, _, _>(
         boxes_tensor,
         scores_tensor,
+        score_threshold,
+        iou_threshold,
+        nms,
+        output_boxes.capacity(),
     );
-    let mut det_indices = dispatch_nms_extra_float(nms, iou_threshold, det_indices);
-    det_indices.truncate(output_boxes.capacity());
 
     extract_proto_data_float(det_indices, mask_tensor, protos, output_boxes)
 }
@@ -1172,36 +1230,18 @@ where
     T: Float + AsPrimitive<f32> + Send + Sync + 'static,
     f32: AsPrimitive<T>,
 {
-    if output.shape()[0] < 7 {
-        return Err(crate::DecoderError::InvalidShape(format!(
-            "End-to-end segdet output requires at least 7 rows, got {}",
-            output.shape()[0]
-        )));
-    }
-
-    let num_mask_coeffs = output.shape()[0] - 6;
-    let num_protos = protos.shape()[2];
-    if num_mask_coeffs != num_protos {
-        return Err(crate::DecoderError::InvalidShape(format!(
-            "Mask coefficients count ({}) doesn't match protos count ({})",
-            num_mask_coeffs, num_protos
-        )));
-    }
-
-    let boxes = output.slice(s![0..4, ..]).reversed_axes();
-    let scores = output.slice(s![4..5, ..]).reversed_axes();
-    let classes = output.slice(s![5, ..]);
-    let mask_coeff = output.slice(s![6.., ..]).reversed_axes();
-    let mut det_indices =
-        postprocess_boxes_index_float::<XYXY, _, _>(score_threshold.as_(), boxes, scores);
-    det_indices.truncate(output_boxes.capacity());
-
-    for (b, ind) in &mut det_indices {
-        b.label = classes[*ind].as_() as usize;
-    }
+    let (boxes, scores, classes, mask_coeff) =
+        postprocess_yolo_end_to_end_segdet(&output, protos.dim().2)?;
+    let boxes = impl_yolo_end_to_end_segdet_get_boxes::<XYXY, _, _, _>(
+        boxes,
+        scores,
+        classes,
+        score_threshold,
+        output_boxes.capacity(),
+    );
 
     Ok(extract_proto_data_float(
-        det_indices,
+        boxes,
         mask_coeff,
         protos,
         output_boxes,
@@ -1223,40 +1263,18 @@ where
     T: Float + AsPrimitive<f32> + Send + Sync + 'static,
     f32: AsPrimitive<T>,
 {
-    let n = boxes.shape()[0];
-    if boxes.shape()[1] != 4 {
-        return Err(crate::DecoderError::InvalidShape(format!(
-            "Split end-to-end boxes must have 4 columns, got {}",
-            boxes.shape()[1]
-        )));
-    }
-
-    let mut qualifying: Vec<(DetectBox, usize)> = Vec::with_capacity(output_boxes.capacity());
-    for i in 0..n {
-        let score: f32 = scores[[i, 0]].as_();
-        if score < score_threshold {
-            continue;
-        }
-        if qualifying.len() >= output_boxes.capacity() {
-            break;
-        }
-        qualifying.push((
-            DetectBox {
-                bbox: BoundingBox {
-                    xmin: boxes[[i, 0]].as_(),
-                    ymin: boxes[[i, 1]].as_(),
-                    xmax: boxes[[i, 2]].as_(),
-                    ymax: boxes[[i, 3]].as_(),
-                },
-                score,
-                label: classes[[i, 0]].as_() as usize,
-            },
-            i,
-        ));
-    }
+    let (boxes, scores, classes, mask_coeff) =
+        postprocess_yolo_split_end_to_end_segdet(boxes, scores, &classes, mask_coeff)?;
+    let boxes = impl_yolo_end_to_end_segdet_get_boxes::<XYXY, _, _, _>(
+        boxes,
+        scores,
+        classes,
+        score_threshold,
+        output_boxes.capacity(),
+    );
 
     Ok(extract_proto_data_float(
-        qualifying,
+        boxes,
         mask_coeff,
         protos,
         output_boxes,
@@ -1264,7 +1282,7 @@ where
 }
 
 /// Helper: extract ProtoData from float mask coefficients + protos.
-fn extract_proto_data_float<
+pub(super) fn extract_proto_data_float<
     MASK: Float + AsPrimitive<f32> + Send + Sync,
     PROTO: Float + AsPrimitive<f32> + Send + Sync,
 >(
@@ -1345,7 +1363,7 @@ fn postprocess_yolo<'a, T>(
     (boxes_tensor, scores_tensor)
 }
 
-fn postprocess_yolo_seg<'a, T>(
+pub(crate) fn postprocess_yolo_seg<'a, T>(
     output: &'a ArrayView2<'_, T>,
     num_protos: usize,
 ) -> (ArrayView2<'a, T>, ArrayView2<'a, T>, ArrayView2<'a, T>) {
@@ -1359,6 +1377,21 @@ fn postprocess_yolo_seg<'a, T>(
     let boxes_tensor = output.slice(s![..4, ..,]).reversed_axes();
     let scores_tensor = output.slice(s![4..(num_classes + 4), ..,]).reversed_axes();
     let mask_tensor = output.slice(s![(num_classes + 4).., ..,]).reversed_axes();
+    (boxes_tensor, scores_tensor, mask_tensor)
+}
+
+pub(crate) fn postprocess_yolo_split_segdet<'a, 'b, 'c, BOX, SCORE, MASK>(
+    boxes_tensor: ArrayView2<'a, BOX>,
+    scores_tensor: ArrayView2<'b, SCORE>,
+    mask_tensor: ArrayView2<'c, MASK>,
+) -> (
+    ArrayView2<'a, BOX>,
+    ArrayView2<'b, SCORE>,
+    ArrayView2<'c, MASK>,
+) {
+    let boxes_tensor = boxes_tensor.reversed_axes();
+    let scores_tensor = scores_tensor.reversed_axes();
+    let mask_tensor = mask_tensor.reversed_axes();
     (boxes_tensor, scores_tensor, mask_tensor)
 }
 
@@ -1946,6 +1979,68 @@ mod tests {
             result,
             Err(crate::DecoderError::InvalidShape(s)) if s.contains("doesn't match protos count")
         ));
+    }
+
+    // ========================================================================
+    // Tests for decode_yolo_split_end_to_end_segdet_float
+    // ========================================================================
+
+    #[test]
+    fn test_split_end_to_end_segdet_basic() {
+        // Create synthetic segdet output: (6 + num_protos, N)
+        // Detection format: [x1, y1, x2, y2, conf, class, mask_coeff_0..31]
+        let num_protos = 32;
+        let num_detections = 2;
+        let num_features = 6 + num_protos;
+
+        // Build detection tensor
+        let mut data = vec![0.0f32; num_features * num_detections];
+        // Detection 0: passes threshold
+        data[0] = 0.1; // x1[0]
+        data[1] = 0.5; // x1[1]
+        data[num_detections] = 0.1; // y1[0]
+        data[num_detections + 1] = 0.5; // y1[1]
+        data[2 * num_detections] = 0.4; // x2[0]
+        data[2 * num_detections + 1] = 0.9; // x2[1]
+        data[3 * num_detections] = 0.4; // y2[0]
+        data[3 * num_detections + 1] = 0.9; // y2[1]
+        data[4 * num_detections] = 0.9; // conf[0] - passes
+        data[4 * num_detections + 1] = 0.3; // conf[1] - fails
+        data[5 * num_detections] = 1.0; // class[0]
+        data[5 * num_detections + 1] = 2.0; // class[1]
+                                            // Fill mask coefficients with small values
+        for i in 6..num_features {
+            data[i * num_detections] = 0.1;
+            data[i * num_detections + 1] = 0.1;
+        }
+
+        let output = Array2::from_shape_vec((num_features, num_detections), data).unwrap();
+        let box_coords = output.slice(s![..4, ..]);
+        let scores = output.slice(s![4..5, ..]);
+        let classes = output.slice(s![5..6, ..]);
+        let mask_coeff = output.slice(s![6.., ..]);
+        // Create protos tensor: (proto_height, proto_width, num_protos)
+        let protos = Array3::<f32>::zeros((16, 16, num_protos));
+
+        let mut boxes = Vec::with_capacity(10);
+        let mut masks = Vec::with_capacity(10);
+        decode_yolo_split_end_to_end_segdet_float(
+            box_coords,
+            scores,
+            classes,
+            mask_coeff,
+            protos.view(),
+            0.5,
+            &mut boxes,
+            &mut masks,
+        )
+        .unwrap();
+
+        // Only detection 0 should pass
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(masks.len(), 1);
+        assert_eq!(boxes[0].label, 1);
+        assert!((boxes[0].score - 0.9).abs() < 0.01);
     }
 
     // ========================================================================

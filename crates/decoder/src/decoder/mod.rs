@@ -736,3 +736,480 @@ impl Decoder {
         }
     }
 }
+
+#[cfg(feature = "tracker")]
+pub use edgefirst_tracker::TrackInfo;
+
+#[cfg(feature = "tracker")]
+pub use edgefirst_tracker::Tracker;
+
+#[cfg(feature = "tracker")]
+impl Decoder {
+    /// This function decodes quantized model outputs into detection boxes and
+    /// segmentation masks. The quantized outputs can be of u8, i8, u16, i16,
+    /// u32, or i32 types. Up to `output_boxes.capacity()` boxes and masks
+    /// will be decoded. The function clears the provided output vectors
+    /// before populating them with the decoded results.
+    ///
+    /// This function returns a `DecoderError` if the the provided outputs don't
+    /// match the configuration provided by the user when building the decoder.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use edgefirst_decoder::{BoundingBox, DecoderBuilder, DetectBox, DecoderResult};
+    /// # use ndarray::Array4;
+    /// # fn main() -> DecoderResult<()> {
+    /// #    let detect0 = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split_9x15x18.bin"));
+    /// #    let detect0 = ndarray::Array4::from_shape_vec((1, 9, 15, 18), detect0.to_vec())?;
+    /// #
+    /// #    let detect1 = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split_17x30x18.bin"));
+    /// #    let detect1 = ndarray::Array4::from_shape_vec((1, 17, 30, 18), detect1.to_vec())?;
+    /// #    let model_output = vec![
+    /// #        detect1.view().into_dyn().into(),
+    /// #        detect0.view().into_dyn().into(),
+    /// #    ];
+    /// let decoder = DecoderBuilder::default()
+    ///     .with_config_yaml_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split.yaml")).to_string())
+    ///     .with_score_threshold(0.45)
+    ///     .with_iou_threshold(0.45)
+    ///     .build()?;
+    ///
+    /// let mut output_boxes: Vec<_> = Vec::with_capacity(10);
+    /// let mut output_masks: Vec<_> = Vec::with_capacity(10);
+    /// decoder.decode_quantized(&model_output, &mut output_boxes, &mut output_masks)?;
+    /// assert!(output_boxes[0].equal_within_delta(
+    ///     &DetectBox {
+    ///         bbox: BoundingBox {
+    ///             xmin: 0.43171933,
+    ///             ymin: 0.68243736,
+    ///             xmax: 0.5626645,
+    ///             ymax: 0.808863,
+    ///         },
+    ///         score: 0.99240804,
+    ///         label: 0
+    ///     },
+    ///     1e-6
+    /// ));
+    /// #    Ok(())
+    /// # }
+    /// ```
+    pub fn decode_tracked_quantized<TR: edgefirst_tracker::Tracker<DetectBox>>(
+        &self,
+        tracker: &mut TR,
+        timestamp: u64,
+        outputs: &[ArrayViewDQuantized],
+        output_boxes: &mut Vec<DetectBox>,
+        output_masks: &mut Vec<Segmentation>,
+        output_tracks: &mut Vec<edgefirst_tracker::TrackInfo>,
+    ) -> Result<(), DecoderError> {
+        output_boxes.clear();
+        output_masks.clear();
+        output_tracks.clear();
+
+        // yolo segdet variants require special handling to separate boxes that come from decoding vs active tracks.
+        // Only boxes that come from decoding can be used for proto/mask generation.
+        match &self.model_type {
+            ModelType::YoloSegDet { boxes, protos } => self.decode_tracked_yolo_segdet_quantized(
+                tracker,
+                timestamp,
+                outputs,
+                boxes,
+                protos,
+                output_boxes,
+                output_masks,
+                output_tracks,
+            ),
+            ModelType::YoloSplitSegDet {
+                boxes,
+                scores,
+                mask_coeff,
+                protos,
+            } => self.decode_tracked_yolo_split_segdet_quantized(
+                tracker,
+                timestamp,
+                outputs,
+                boxes,
+                scores,
+                mask_coeff,
+                protos,
+                output_boxes,
+                output_masks,
+                output_tracks,
+            ),
+            ModelType::YoloEndToEndSegDet { boxes, protos } => self
+                .decode_tracked_yolo_end_to_end_segdet_quantized(
+                    tracker,
+                    timestamp,
+                    outputs,
+                    boxes,
+                    protos,
+                    output_boxes,
+                    output_masks,
+                    output_tracks,
+                ),
+            ModelType::YoloSplitEndToEndSegDet {
+                boxes,
+                scores,
+                classes,
+                mask_coeff,
+                protos,
+            } => self.decode_tracked_yolo_split_end_to_end_segdet_quantized(
+                tracker,
+                timestamp,
+                outputs,
+                boxes,
+                scores,
+                classes,
+                mask_coeff,
+                protos,
+                output_boxes,
+                output_masks,
+                output_tracks,
+            ),
+            _ => {
+                self.decode_quantized(outputs, output_boxes, output_masks)?;
+                Self::update_tracker(tracker, timestamp, output_boxes, output_tracks);
+                Ok(())
+            }
+        }
+    }
+
+    /// This function decodes floating point model outputs into detection boxes
+    /// and segmentation masks. Up to `output_boxes.capacity()` boxes and
+    /// masks will be decoded. The function clears the provided output
+    /// vectors before populating them with the decoded results.
+    ///
+    /// This function returns an `Error` if the provided outputs don't
+    /// match the configuration provided by the user when building the decoder.
+    ///
+    /// Any quantization information in the configuration will be ignored.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use edgefirst_decoder::{BoundingBox, DecoderBuilder, DetectBox, DecoderResult, configs, configs::{DecoderType, DecoderVersion}, dequantize_cpu, Quantization};
+    /// # use ndarray::Array3;
+    /// # fn main() -> DecoderResult<()> {
+    /// #   let out = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/yolov8s_80_classes.bin"));
+    /// #   let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
+    /// #   let mut out_dequant = vec![0.0_f64; 84 * 8400];
+    /// #   let quant = Quantization::new(0.0040811873, -123);
+    /// #   dequantize_cpu(out, quant, &mut out_dequant);
+    /// #   let model_output_f64 = Array3::from_shape_vec((1, 84, 8400), out_dequant)?.into_dyn();
+    ///    let decoder = DecoderBuilder::default()
+    ///     .with_config_yolo_det(configs::Detection {
+    ///         decoder: DecoderType::Ultralytics,
+    ///         quantization: None,
+    ///         shape: vec![1, 84, 8400],
+    ///         anchors: None,
+    ///         dshape: Vec::new(),
+    ///         normalized: Some(true),
+    ///     },
+    ///     Some(DecoderVersion::Yolo11))
+    ///     .with_score_threshold(0.25)
+    ///     .with_iou_threshold(0.7)
+    ///     .build()?;
+    ///
+    /// let mut output_boxes: Vec<_> = Vec::with_capacity(10);
+    /// let mut output_masks: Vec<_> = Vec::with_capacity(10);
+    /// let model_output_f64 = vec![model_output_f64.view().into()];
+    /// decoder.decode_float(&model_output_f64, &mut output_boxes, &mut output_masks)?;    
+    /// assert!(output_boxes[0].equal_within_delta(
+    ///        &DetectBox {
+    ///            bbox: BoundingBox {
+    ///                xmin: 0.5285137,
+    ///                ymin: 0.05305544,
+    ///                xmax: 0.87541467,
+    ///                ymax: 0.9998909,
+    ///            },
+    ///            score: 0.5591227,
+    ///            label: 0
+    ///        },
+    ///        1e-6
+    ///    ));
+    ///
+    /// #    Ok(())
+    /// # }
+    pub fn decode_tracked_float<TR: edgefirst_tracker::Tracker<DetectBox>, T>(
+        &self,
+        tracker: &mut TR,
+        timestamp: u64,
+        outputs: &[ArrayViewD<T>],
+        output_boxes: &mut Vec<DetectBox>,
+        output_masks: &mut Vec<Segmentation>,
+        output_tracks: &mut Vec<edgefirst_tracker::TrackInfo>,
+    ) -> Result<(), DecoderError>
+    where
+        T: Float + AsPrimitive<f32> + AsPrimitive<u8> + Send + Sync + 'static,
+        f32: AsPrimitive<T>,
+    {
+        output_boxes.clear();
+        output_masks.clear();
+        output_tracks.clear();
+        match &self.model_type {
+            ModelType::YoloSegDet { boxes, protos } => {
+                self.decode_tracked_yolo_segdet_float(
+                    tracker,
+                    timestamp,
+                    outputs,
+                    boxes,
+                    protos,
+                    output_boxes,
+                    output_masks,
+                    output_tracks,
+                )?;
+            }
+            ModelType::YoloSplitSegDet {
+                boxes,
+                scores,
+                mask_coeff,
+                protos,
+            } => {
+                self.decode_tracked_yolo_split_segdet_float(
+                    tracker,
+                    timestamp,
+                    outputs,
+                    boxes,
+                    scores,
+                    mask_coeff,
+                    protos,
+                    output_boxes,
+                    output_masks,
+                    output_tracks,
+                )?;
+            }
+            ModelType::YoloEndToEndSegDet { boxes, protos } => {
+                self.decode_tracked_yolo_end_to_end_segdet_float(
+                    tracker,
+                    timestamp,
+                    outputs,
+                    boxes,
+                    protos,
+                    output_boxes,
+                    output_masks,
+                    output_tracks,
+                )?;
+            }
+            ModelType::YoloSplitEndToEndSegDet {
+                boxes,
+                scores,
+                classes,
+                mask_coeff,
+                protos,
+            } => {
+                self.decode_tracked_yolo_split_end_to_end_segdet_float(
+                    tracker,
+                    timestamp,
+                    outputs,
+                    boxes,
+                    scores,
+                    classes,
+                    mask_coeff,
+                    protos,
+                    output_boxes,
+                    output_masks,
+                    output_tracks,
+                )?;
+            }
+            _ => {
+                self.decode_float(outputs, output_boxes, output_masks)?;
+                Self::update_tracker(tracker, timestamp, output_boxes, output_tracks);
+            }
+        }
+        Ok(())
+    }
+
+    /// Decodes quantized model outputs into detection boxes, returning raw
+    /// `ProtoData` for segmentation models instead of materialized masks.
+    ///
+    /// Returns `Ok(None)` for detection-only and ModelPack models (use
+    /// `decode_quantized` for those). Returns `Ok(Some(ProtoData))` for
+    /// YOLO segmentation models.
+    pub fn decode_tracked_quantized_proto<TR: edgefirst_tracker::Tracker<DetectBox>>(
+        &self,
+        tracker: &mut TR,
+        timestamp: u64,
+        outputs: &[ArrayViewDQuantized],
+        output_boxes: &mut Vec<DetectBox>,
+        output_tracks: &mut Vec<edgefirst_tracker::TrackInfo>,
+    ) -> Result<Option<ProtoData>, DecoderError> {
+        output_boxes.clear();
+        output_tracks.clear();
+        match &self.model_type {
+            // Detection-only and ModelPack variants: no proto data
+            ModelType::ModelPackSegDet { .. }
+            | ModelType::ModelPackSegDetSplit { .. }
+            | ModelType::ModelPackDet { .. }
+            | ModelType::ModelPackDetSplit { .. }
+            | ModelType::ModelPackSeg { .. }
+            | ModelType::YoloDet { .. }
+            | ModelType::YoloSplitDet { .. }
+            | ModelType::YoloEndToEndDet { .. }
+            | ModelType::YoloSplitEndToEndDet { .. } => Ok(None),
+
+            ModelType::YoloSegDet { boxes, protos } => {
+                let proto = self.decode_tracked_yolo_segdet_quantized_proto(
+                    tracker,
+                    timestamp,
+                    outputs,
+                    boxes,
+                    protos,
+                    output_boxes,
+                    output_tracks,
+                )?;
+                Ok(Some(proto))
+            }
+            ModelType::YoloSplitSegDet {
+                boxes,
+                scores,
+                mask_coeff,
+                protos,
+            } => {
+                let proto = self.decode_tracked_yolo_split_segdet_quantized_proto(
+                    tracker,
+                    timestamp,
+                    outputs,
+                    boxes,
+                    scores,
+                    mask_coeff,
+                    protos,
+                    output_boxes,
+                    output_tracks,
+                )?;
+                Ok(Some(proto))
+            }
+            ModelType::YoloEndToEndSegDet { boxes, protos } => {
+                let proto = self.decode_tracked_yolo_end_to_end_segdet_quantized_proto(
+                    tracker,
+                    timestamp,
+                    outputs,
+                    boxes,
+                    protos,
+                    output_boxes,
+                    output_tracks,
+                )?;
+                Ok(Some(proto))
+            }
+            ModelType::YoloSplitEndToEndSegDet {
+                boxes,
+                scores,
+                classes,
+                mask_coeff,
+                protos,
+            } => {
+                let proto = self.decode_tracked_yolo_split_end_to_end_segdet_quantized_proto(
+                    tracker,
+                    timestamp,
+                    outputs,
+                    boxes,
+                    scores,
+                    classes,
+                    mask_coeff,
+                    protos,
+                    output_boxes,
+                    output_tracks,
+                )?;
+                Ok(Some(proto))
+            }
+        }
+    }
+
+    /// Decodes floating-point model outputs into detection boxes, returning
+    /// raw `ProtoData` for segmentation models instead of materialized masks.
+    ///
+    /// Returns `Ok(None)` for detection-only and ModelPack models. Returns
+    /// `Ok(Some(ProtoData))` for YOLO segmentation models.
+    pub fn decode_tracked_float_proto<TR: edgefirst_tracker::Tracker<DetectBox>, T>(
+        &self,
+        tracker: &mut TR,
+        timestamp: u64,
+        outputs: &[ArrayViewD<T>],
+        output_boxes: &mut Vec<DetectBox>,
+        output_tracks: &mut Vec<edgefirst_tracker::TrackInfo>,
+    ) -> Result<Option<ProtoData>, DecoderError>
+    where
+        T: Float + AsPrimitive<f32> + AsPrimitive<u8> + Send + Sync + 'static,
+        f32: AsPrimitive<T>,
+    {
+        output_boxes.clear();
+        output_tracks.clear();
+        match &self.model_type {
+            // Detection-only and ModelPack variants: no proto data
+            ModelType::ModelPackSegDet { .. }
+            | ModelType::ModelPackSegDetSplit { .. }
+            | ModelType::ModelPackDet { .. }
+            | ModelType::ModelPackDetSplit { .. }
+            | ModelType::ModelPackSeg { .. }
+            | ModelType::YoloDet { .. }
+            | ModelType::YoloSplitDet { .. }
+            | ModelType::YoloEndToEndDet { .. }
+            | ModelType::YoloSplitEndToEndDet { .. } => Ok(None),
+
+            ModelType::YoloSegDet { boxes, protos } => {
+                let proto = self.decode_tracked_yolo_segdet_float_proto(
+                    tracker,
+                    timestamp,
+                    outputs,
+                    boxes,
+                    protos,
+                    output_boxes,
+                    output_tracks,
+                )?;
+                Ok(Some(proto))
+            }
+            ModelType::YoloSplitSegDet {
+                boxes,
+                scores,
+                mask_coeff,
+                protos,
+            } => {
+                let proto = self.decode_tracked_yolo_split_segdet_float_proto(
+                    tracker,
+                    timestamp,
+                    outputs,
+                    boxes,
+                    scores,
+                    mask_coeff,
+                    protos,
+                    output_boxes,
+                    output_tracks,
+                )?;
+                Ok(Some(proto))
+            }
+            ModelType::YoloEndToEndSegDet { boxes, protos } => {
+                let proto = self.decode_tracked_yolo_end_to_end_segdet_float_proto(
+                    tracker,
+                    timestamp,
+                    outputs,
+                    boxes,
+                    protos,
+                    output_boxes,
+                    output_tracks,
+                )?;
+                Ok(Some(proto))
+            }
+            ModelType::YoloSplitEndToEndSegDet {
+                boxes,
+                scores,
+                classes,
+                mask_coeff,
+                protos,
+            } => {
+                let proto = self.decode_tracked_yolo_split_end_to_end_segdet_float_proto(
+                    tracker,
+                    timestamp,
+                    outputs,
+                    boxes,
+                    scores,
+                    classes,
+                    mask_coeff,
+                    protos,
+                    output_boxes,
+                    output_tracks,
+                )?;
+                Ok(Some(proto))
+            }
+        }
+    }
+}
