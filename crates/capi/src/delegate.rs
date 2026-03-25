@@ -55,12 +55,20 @@ pub struct HalDmabufTensorInfo {
 impl Default for HalDmabufTensorInfo {
     fn default() -> Self {
         // Safety: HalDmabufTensorInfo is a #[repr(C)] plain-old-data struct
-        // used for FFI, and the C ABI contract explicitly requires callers
-        // to zero-initialize it with memset(info, 0, info_size) before use.
-        // A fully zeroed bit-pattern is therefore a valid "empty" state.
+        // used for FFI, and the C ABI contract for hal_dmabuf_get_tensor_info()
+        // requires implementations to zero-initialize `info` with
+        // memset(info, 0, info_size) before populating it. This Default
+        // mirrors that initialization, so a fully zeroed bit-pattern is a
+        // valid "empty" state.
         unsafe { std::mem::zeroed() }
     }
 }
+
+// Ensure the shape array length matches HAL_DMABUF_MAX_NDIM (the literal 8
+// in the struct is required by cbindgen, but must stay in sync with the const).
+const _: () = assert!(
+    std::mem::size_of::<[size_t; 8]>() == std::mem::size_of::<[size_t; HAL_DMABUF_MAX_NDIM]>()
+);
 
 // Compile-time layout assertion: 11 × size_t + 1 × c_int + 1 × HalDtype
 // = 11×8 + 4 + 4 = 96 bytes on LP64 with no internal padding.
