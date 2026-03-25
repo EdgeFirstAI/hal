@@ -1246,8 +1246,11 @@ pub unsafe extern "C" fn hal_segmentation_to_mask(
     };
 
     let mut map = try_or_null!(tensor.map(), libc::EIO);
-    map.as_mut_slice()
-        .copy_from_slice(mask_2d.as_slice().unwrap());
+    let slice = match mask_2d.as_slice() {
+        Some(s) => s,
+        None => return set_error_null(libc::EINVAL),
+    };
+    map.as_mut_slice().copy_from_slice(slice);
     map.unmap();
 
     Box::into_raw(Box::new(HalTensor {
@@ -1741,7 +1744,7 @@ pub unsafe extern "C" fn hal_decoder_decode_tracked(
     out_segmentations: *mut *mut HalSegmentationList,
     out_tracks: *mut *mut HalTrackInfoList,
 ) -> c_int {
-    check_null!(decoder, outputs, out_boxes);
+    check_null!(decoder, tracker, outputs, out_boxes);
 
     if num_outputs == 0 {
         return set_error(libc::EINVAL);
