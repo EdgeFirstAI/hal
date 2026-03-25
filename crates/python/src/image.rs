@@ -920,6 +920,7 @@ impl PyImageProcessor {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (dst, bbox, scores, classes, seg=vec![], background=None, opacity=1.0))]
     pub fn draw_masks(
         &mut self,
