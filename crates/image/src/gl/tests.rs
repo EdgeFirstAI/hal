@@ -1607,4 +1607,88 @@ mod gl_tests {
         };
         assert_pixels_match(contig_bytes, multi_bytes, 0);
     }
+
+    /// Compare fused GL proto rendering against hybrid (CPU materialize + GL overlay).
+    ///
+    /// Both paths should produce visually similar output. Differences arise from
+    /// bilinear interpolation (GPU vs CPU) and mask threshold rounding.
+    #[test]
+    fn test_proto_fused_vs_hybrid_ssim() {
+        use edgefirst_decoder::yolo::impl_yolo_segdet_quant_proto;
+        use edgefirst_decoder::{Nms, Quantization, XYWH};
+
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        // Load cached YOLOv8 seg model outputs
+        let boxes_raw: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_boxes_116x8400.bin"
+        ));
+        let boxes_i8 =
+            unsafe { std::slice::from_raw_parts(boxes_raw.as_ptr() as *const i8, boxes_raw.len()) };
+        let boxes = ndarray::Array2::from_shape_vec((116, 8400), boxes_i8.to_vec()).unwrap();
+
+        let protos_raw: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_protos_160x160x32.bin"
+        ));
+        let protos_i8 = unsafe {
+            std::slice::from_raw_parts(protos_raw.as_ptr() as *const i8, protos_raw.len())
+        };
+        let protos = ndarray::Array3::from_shape_vec((160, 160, 32), protos_i8.to_vec()).unwrap();
+
+        let quant_boxes = Quantization::new(0.019_484_945, 20);
+        let quant_protos = Quantization::new(0.020_889_873, -115);
+
+        let mut output_boxes = Vec::with_capacity(50);
+        let proto_data = impl_yolo_segdet_quant_proto::<XYWH, _, _>(
+            (boxes.view(), quant_boxes),
+            (protos.view(), quant_protos),
+            0.45,
+            0.45,
+            Some(Nms::ClassAgnostic),
+            &mut output_boxes,
+        );
+        assert!(!output_boxes.is_empty(), "No detections from model");
+
+        // Materialize masks on CPU for the hybrid path
+        let cpu_proc = crate::CPUProcessor::new();
+        let segmentation = cpu_proc
+            .materialize_segmentations(&output_boxes, &proto_data)
+            .unwrap();
+
+        // Create two identical RGBA canvases
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let mut dst_hybrid = TensorDyn::from(
+            edgefirst_tensor::Tensor::<u8>::image(640, 640, PixelFormat::Rgba, None).unwrap(),
+        );
+        let mut dst_fused = TensorDyn::from(
+            edgefirst_tensor::Tensor::<u8>::image(640, 640, PixelFormat::Rgba, None).unwrap(),
+        );
+
+        // Render via hybrid path (pre-decoded masks)
+        gl.draw_masks(
+            &mut dst_hybrid,
+            &output_boxes,
+            &segmentation,
+            Default::default(),
+        )
+        .unwrap();
+
+        // Render via fused GL proto path
+        gl.draw_masks_proto(
+            &mut dst_fused,
+            &output_boxes,
+            &proto_data,
+            Default::default(),
+        )
+        .unwrap();
+
+        // Compare — threshold 0.90 to allow bilinear interpolation differences
+        // between GPU proto rendering and CPU materialization
+        compare_images(&dst_hybrid, &dst_fused, 0.90, function!());
+    }
 }

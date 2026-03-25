@@ -191,6 +191,88 @@ fn bench_decode_masks(suite: &mut BenchSuite) {
 }
 
 // =============================================================================
+// proto_extraction: isolate extract_proto_data_quant cost
+// =============================================================================
+
+fn bench_proto_extraction(suite: &mut BenchSuite) {
+    println!("\n== proto_extraction: Extract ProtoData Cost ==\n");
+
+    let boxes = load_boxes_i8();
+    let protos = load_protos_i8();
+
+    // Run NMS once to get detection indices, then measure only the proto
+    // extraction (the copy/dequant we plan to optimize).
+    let mut warmup_boxes = Vec::with_capacity(50);
+    let _ = impl_yolo_segdet_quant_proto::<XYWH, _, _>(
+        (boxes.view(), QUANT_BOXES),
+        (protos.view(), QUANT_PROTOS),
+        SCORE_THRESHOLD,
+        IOU_THRESHOLD,
+        Some(Nms::ClassAgnostic),
+        &mut warmup_boxes,
+    );
+    let n_detect = warmup_boxes.len();
+    println!("  {n_detect} detections; measuring proto extraction (i8 copy + coeff dequant)\n");
+
+    let name = "proto_extraction";
+    let result = run_bench(name, WARMUP, ITERATIONS, || {
+        let mut output_boxes = Vec::with_capacity(50);
+        let _proto_data = impl_yolo_segdet_quant_proto::<XYWH, _, _>(
+            (boxes.view(), QUANT_BOXES),
+            (protos.view(), QUANT_PROTOS),
+            SCORE_THRESHOLD,
+            IOU_THRESHOLD,
+            Some(Nms::ClassAgnostic),
+            &mut output_boxes,
+        );
+    });
+    result.print_summary();
+    suite.record(&result);
+}
+
+// =============================================================================
+// draw_masks_proto/forced_opengl: pure GL path (no hybrid)
+// =============================================================================
+
+fn bench_draw_masks_proto_forced_opengl(suite: &mut BenchSuite) {
+    println!("\n== draw_masks_proto/forced_opengl: Pure GL Proto Path ==\n");
+
+    // Create a processor forced to OpenGL only (no hybrid fallback).
+    // SAFETY: set_var is not thread-safe, but benchmarks are single-threaded.
+    unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "opengl") };
+    let proc = ImageProcessor::new();
+    unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") };
+
+    let Ok(mut proc) = proc else {
+        println!("  [skipped: OpenGL ImageProcessor creation failed]");
+        return;
+    };
+
+    let (detect, proto_data) = decode_proto_data();
+    let n_detect = detect.len();
+    println!("  Decoded {n_detect} detections for benchmarking\n");
+
+    let name = "draw_masks_proto/forced_opengl";
+    let Ok(mut dst) = proc.create_image(OUTPUT_W, OUTPUT_H, PixelFormat::Rgba, DType::U8, None)
+    else {
+        println!("  {:50} [skipped: allocation failed]", name);
+        return;
+    };
+
+    if let Err(e) = proc.draw_masks_proto(&mut dst, &detect, &proto_data, Default::default()) {
+        println!("  {:50} [unsupported: {}]", name, e);
+        return;
+    }
+
+    let result = run_bench(name, WARMUP, ITERATIONS, || {
+        proc.draw_masks_proto(&mut dst, &detect, &proto_data, Default::default())
+            .unwrap();
+    });
+    result.print_summary();
+    suite.record(&result);
+}
+
+// =============================================================================
 // draw_masks: pre-decoded mask overlay
 // =============================================================================
 
@@ -327,8 +409,10 @@ fn main() {
     println!("  warmup={WARMUP}  iterations={ITERATIONS}");
 
     bench_decode_masks(&mut suite);
+    bench_proto_extraction(&mut suite);
     bench_draw_masks(&mut proc, &mut suite);
     bench_draw_masks_proto(&mut proc, &mut suite);
+    bench_draw_masks_proto_forced_opengl(&mut suite);
     bench_decode_masks_atlas(&mut proc, &mut suite);
     bench_hybrid_materialize_and_draw(&mut proc, &mut suite);
 

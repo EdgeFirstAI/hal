@@ -2172,6 +2172,79 @@ outputs:
         );
     }
 
+    // ── Proto Extraction Tests ───────────────────────────────────────
+
+    #[test]
+    fn test_extract_proto_data_quant_with_cached_model() {
+        use crate::yolo::impl_yolo_segdet_quant_proto;
+        use crate::{Nms, ProtoData, Quantization, XYWH};
+
+        // Load cached YOLOv8 segmentation model outputs
+        let boxes_raw = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_boxes_116x8400.bin"
+        ));
+        let boxes_i8 =
+            unsafe { std::slice::from_raw_parts(boxes_raw.as_ptr() as *const i8, boxes_raw.len()) };
+        let boxes = ndarray::Array2::from_shape_vec((116, 8400), boxes_i8.to_vec()).unwrap();
+
+        let protos_raw = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_protos_160x160x32.bin"
+        ));
+        let protos_i8 = unsafe {
+            std::slice::from_raw_parts(protos_raw.as_ptr() as *const i8, protos_raw.len())
+        };
+        let protos = ndarray::Array3::from_shape_vec((160, 160, 32), protos_i8.to_vec()).unwrap();
+
+        let quant_boxes = Quantization::new(0.019_484_945, 20);
+        let quant_protos = Quantization::new(0.020_889_873, -115);
+
+        let mut output_boxes = Vec::with_capacity(50);
+        let proto_data: ProtoData = impl_yolo_segdet_quant_proto::<XYWH, _, _>(
+            (boxes.view(), quant_boxes),
+            (protos.view(), quant_protos),
+            0.45,
+            0.45,
+            Some(Nms::ClassAgnostic),
+            &mut output_boxes,
+        );
+
+        // Verify detections are produced
+        assert!(
+            !output_boxes.is_empty(),
+            "Expected detections from cached model outputs"
+        );
+
+        // Verify proto data shape
+        let protos_shape = match &proto_data.protos {
+            crate::ProtoTensor::Quantized { protos, .. } => protos.shape().to_vec(),
+            crate::ProtoTensor::Float(arr) => arr.shape().to_vec(),
+        };
+        assert_eq!(protos_shape, [160, 160, 32], "Proto shape mismatch");
+
+        // Verify mask coefficients: one per detection, each length 32
+        assert_eq!(
+            proto_data.mask_coefficients.len(),
+            output_boxes.len(),
+            "mask_coefficients count must match detection count"
+        );
+        for (i, coeff) in proto_data.mask_coefficients.iter().enumerate() {
+            assert_eq!(
+                coeff.len(),
+                32,
+                "Detection {i} has {} coefficients, expected 32",
+                coeff.len()
+            );
+        }
+
+        // Verify proto tensor is quantized variant (input was i8)
+        assert!(
+            matches!(proto_data.protos, crate::ProtoTensor::Quantized { .. }),
+            "Expected Quantized proto tensor for i8 input"
+        );
+    }
+
     // ── YOLO 2-Way Split Segmentation Tests ──────────────────────────
 
     #[test]
