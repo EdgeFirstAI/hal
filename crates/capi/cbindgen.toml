@@ -45,6 +45,17 @@ extern "C" {
  * - All functions are thread-safe unless documented otherwise
  * - Tensor map operations require external synchronization when used concurrently
  */
+
+/**
+ * @brief Opaque delegate handle.
+ *
+ * Used by the delegate DMA-BUF API (hal_dmabuf_*) to reference an
+ * externally-owned TFLite delegate instance. The delegate lifetime
+ * is managed by the caller; the HAL never creates or destroys delegates.
+ *
+ * A future revision will formalize this as a proper abstraction.
+ */
+typedef void *hal_delegate_t;
 """
 
 trailer = """
@@ -86,6 +97,7 @@ item_types = ["enums", "structs", "unions", "typedefs", "opaque", "functions", "
 "HalTrackInfoList" = "hal_track_info_list"
 "HalTensorMap" = "hal_tensor_map"
 "HalPlaneDescriptor" = "hal_plane_descriptor"
+"HalDmabufTensorInfo" = "hal_dmabuf_tensor_info"
 "HalComputeBackend" = "hal_compute_backend"
 "HalLogLevel" = "hal_log_level"
 "HalLogCallback" = "hal_log_callback"

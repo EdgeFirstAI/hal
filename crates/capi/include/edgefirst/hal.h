@@ -33,6 +33,17 @@ extern "C" {
  * - Tensor map operations require external synchronization when used concurrently
  */
 
+/**
+ * @brief Opaque delegate handle.
+ *
+ * Used by the delegate DMA-BUF API (hal_dmabuf_*) to reference an
+ * externally-owned TFLite delegate instance. The delegate lifetime
+ * is managed by the caller; the HAL never creates or destroys delegates.
+ *
+ * A future revision will formalize this as a proper abstraction.
+ */
+typedef void *hal_delegate_t;
+
 
 /* Generated with cbindgen:0.29.2 */
 
@@ -44,6 +55,11 @@ extern "C" {
 #include <stdlib.h>
 #include <stddef.h>
 #include <stdio.h>
+
+/**
+ * Maximum number of dimensions in a delegate tensor shape.
+ */
+#define HAL_DMABUF_MAX_NDIM 8
 
 /**
  * Output type for model tensor outputs.
