@@ -87,52 +87,6 @@ pub use opengl_headless::Int8InterpolationMode;
 #[cfg(feature = "opengl")]
 pub use opengl_headless::{probe_egl_displays, EglDisplayInfo, EglDisplayKind};
 
-/// Result of rendering a single per-instance grayscale mask.
-///
-/// Contains the bounding-box region in output image coordinates and the
-/// raw uint8 pixel data (RED channel only, 0–255 representing sigmoid output).
-#[derive(Debug, Clone)]
-pub(crate) struct MaskResult {
-    /// X offset of the bbox region in the output image.
-    pub(crate) x: usize,
-    /// Y offset of the bbox region in the output image.
-    pub(crate) y: usize,
-    /// Width of the bbox region.
-    pub(crate) w: usize,
-    /// Height of the bbox region.
-    pub(crate) h: usize,
-    /// Grayscale pixel data (w * h bytes, row-major).
-    pub(crate) pixels: Vec<u8>,
-}
-
-/// Region metadata for a single detection within a compact mask atlas.
-///
-/// The atlas packs padded bounding-box strips vertically.  This struct
-/// records where each detection's strip lives in the atlas and how it
-/// maps back to the original output coordinate space.
-#[must_use]
-#[derive(Debug, Clone, Copy)]
-pub struct MaskRegion {
-    /// Row offset of this detection's strip in the atlas.
-    pub atlas_y_offset: usize,
-    /// Left edge of the padded bbox in output image coordinates.
-    pub padded_x: usize,
-    /// Top edge of the padded bbox in output image coordinates.
-    pub padded_y: usize,
-    /// Width of the padded bbox.
-    pub padded_w: usize,
-    /// Height of the padded bbox (= number of atlas rows for this strip).
-    pub padded_h: usize,
-    /// Original (unpadded) bbox left edge in output image coordinates.
-    pub bbox_x: usize,
-    /// Original (unpadded) bbox top edge in output image coordinates.
-    pub bbox_y: usize,
-    /// Original (unpadded) bbox width.
-    pub bbox_w: usize,
-    /// Original (unpadded) bbox height.
-    pub bbox_h: usize,
-}
-
 mod cpu;
 mod error;
 mod g2d;
@@ -474,28 +428,6 @@ pub trait ImageProcessorTrait {
         proto_data: &ProtoData,
         overlay: MaskOverlay<'_>,
     ) -> Result<()>;
-
-    /// Decode masks into a compact atlas buffer.
-    ///
-    /// Used internally by the Python/C `decode_masks` APIs. The atlas is a
-    /// compact vertical strip where each detection occupies a strip sized to
-    /// its padded bounding box (not the full output resolution).
-    ///
-    /// `output_width` and `output_height` define the coordinate space for
-    /// interpreting bounding boxes — individual mask regions are bbox-sized.
-    /// Mask pixels are binary: `255` = presence, `0` = background.
-    ///
-    /// Returns `(atlas_pixels, regions)` where `regions` describes each
-    /// detection's location and bbox within the atlas.
-    ///
-    /// G2D backend returns `NotImplemented`.
-    fn decode_masks_atlas(
-        &mut self,
-        detect: &[DetectBox],
-        proto_data: ProtoData,
-        output_width: usize,
-        output_height: usize,
-    ) -> Result<(Vec<u8>, Vec<MaskRegion>)>;
 
     /// Sets the colors used for rendering segmentation masks. Up to 20 colors
     /// can be set.
@@ -1510,72 +1442,6 @@ impl ImageProcessorTrait for ImageProcessor {
                     return Err(e);
                 }
             }
-        }
-        Err(Error::NoConverter)
-    }
-
-    fn decode_masks_atlas(
-        &mut self,
-        detect: &[DetectBox],
-        proto_data: ProtoData,
-        output_width: usize,
-        output_height: usize,
-    ) -> Result<(Vec<u8>, Vec<MaskRegion>)> {
-        if detect.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
-        }
-
-        // ── Forced backend: no fallback chain ────────────────────────
-        if let Some(forced) = self.forced_backend {
-            return match forced {
-                ForcedBackend::Cpu => {
-                    if let Some(cpu) = self.cpu.as_mut() {
-                        return cpu.decode_masks_atlas(
-                            detect,
-                            proto_data,
-                            output_width,
-                            output_height,
-                        );
-                    }
-                    Err(Error::ForcedBackendUnavailable("cpu".into()))
-                }
-                ForcedBackend::G2d => Err(Error::NotSupported(
-                    "g2d does not support decode_masks_atlas".into(),
-                )),
-                ForcedBackend::OpenGl => {
-                    #[cfg(target_os = "linux")]
-                    #[cfg(feature = "opengl")]
-                    if let Some(opengl) = self.opengl.as_mut() {
-                        return opengl.decode_masks_atlas(
-                            detect,
-                            proto_data,
-                            output_width,
-                            output_height,
-                        );
-                    }
-                    Err(Error::ForcedBackendUnavailable("opengl".into()))
-                }
-            };
-        }
-
-        #[cfg(target_os = "linux")]
-        #[cfg(feature = "opengl")]
-        {
-            let has_opengl = self.opengl.is_some();
-            if has_opengl {
-                let opengl = self.opengl.as_mut().unwrap();
-                match opengl.decode_masks_atlas(detect, proto_data, output_width, output_height) {
-                    Ok(r) => return Ok(r),
-                    Err(e) => {
-                        log::trace!("decode_masks_atlas didn't work with opengl: {e:?}");
-                        return Err(e);
-                    }
-                }
-            }
-        }
-        // CPU fallback: render per-detection masks and pack into compact atlas
-        if let Some(cpu) = self.cpu.as_mut() {
-            return cpu.decode_masks_atlas(detect, proto_data, output_width, output_height);
         }
         Err(Error::NoConverter)
     }

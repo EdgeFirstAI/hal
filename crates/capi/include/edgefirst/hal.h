@@ -1225,36 +1225,6 @@ int hal_decoder_draw_masks(const struct hal_decoder *decoder,
                            struct hal_detect_box_list **out_boxes);
 
 /**
- * Decode model outputs and return masks at a specified output resolution.
- *
- * Internally renders masks into a compact atlas and splits them into
- * individual per-detection segmentation results. The returned
- * `out_masks` is a segmentation list where each entry contains a
- * binary mask cropped to the detection's bounding box.
- *
- * @param decoder Decoder handle
- * @param processor Image processor handle
- * @param outputs Array of output tensor pointers
- * @param num_outputs Number of output tensors
- * @param output_width Target mask width
- * @param output_height Target mask height
- * @param out_boxes Output parameter for detection box list (caller must free)
- * @param out_masks Output parameter for segmentation list (caller must free)
- * @return 0 on success, -1 on error
- * @par Errors (errno):
- * - EINVAL: Invalid argument (NULL decoder/processor/outputs/out_boxes/out_masks)
- * - EIO: Decoding failed
- */
-int hal_decoder_decode_masks(const struct hal_decoder *decoder,
-                             struct hal_image_processor *processor,
-                             const struct hal_tensor *const *outputs,
-                             size_t num_outputs,
-                             size_t output_width,
-                             size_t output_height,
-                             struct hal_detect_box_list **out_boxes,
-                             struct hal_segmentation_list **out_masks);
-
-/**
  * Decode model outputs into tracked detection boxes and segmentation masks.
  *
  * Automatically selects the decoding path based on tensor dtype:

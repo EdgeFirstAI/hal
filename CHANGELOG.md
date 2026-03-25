@@ -71,6 +71,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transposes to `GL_TEXTURE_2D_ARRAY` via compute dispatch. 2.2–2.4×
   speedup on the fused GL proto path (imx8mp, imx95).
 
+### Removed
+
+- **`decode_masks` / `decode_masks_atlas` atlas-based mask readback path** —
+  removed the entire atlas decode pipeline which was too slow on embedded
+  targets (435 ms on imx8mp Vivante GC7000UL). This removes:
+  - `hal_decoder_decode_masks()` C API function
+  - `Decoder.decode_masks()` Python method and type stub
+  - `ImageProcessorTrait::decode_masks_atlas()` Rust trait method
+  - `MaskRegion` and `MaskResult` types
+  - Three GL logit-threshold shaders (`proto_mask_logit_*`)
+  - Mask FBO, PBO, and atlas rendering infrastructure in the GL backend
+  - `bench_decode_masks_atlas` benchmark
+
+  Use `draw_masks()` / `draw_masks_proto()` for GPU-accelerated mask
+  overlay, or `materialize_segmentations()` + `draw_masks()` for the
+  hybrid CPU decode path.
+
 ## [0.12.0] - 2026-03-24
 
 ### Added
