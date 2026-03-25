@@ -34,7 +34,7 @@ pub const HAL_DMABUF_MAX_NDIM: usize = 8;
 /// struct with memset(info, 0, info_size) before populating it, and
 /// only write fields whose offset + size fits within info_size.
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct HalDmabufTensorInfo {
     /// Buffer size in bytes.
     pub size: size_t,
@@ -54,14 +54,11 @@ pub struct HalDmabufTensorInfo {
 
 impl Default for HalDmabufTensorInfo {
     fn default() -> Self {
-        Self {
-            size: 0,
-            offset: 0,
-            shape: [0; HAL_DMABUF_MAX_NDIM],
-            ndim: 0,
-            fd: -1,
-            dtype: HalDtype::U8,
-        }
+        // Safety: HalDmabufTensorInfo is a #[repr(C)] plain-old-data struct
+        // used for FFI, and the C ABI contract explicitly requires callers
+        // to zero-initialize it with memset(info, 0, info_size) before use.
+        // A fully zeroed bit-pattern is therefore a valid "empty" state.
+        unsafe { std::mem::zeroed() }
     }
 }
 
