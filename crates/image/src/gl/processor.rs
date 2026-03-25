@@ -130,6 +130,12 @@ impl Drop for GLProcessorST {
                 if self.mask_atlas_pbo != 0 {
                     gls::gl::DeleteBuffers(1, &self.mask_atlas_pbo);
                 }
+                if self.proto_ssbo != 0 {
+                    gls::gl::DeleteBuffers(1, &self.proto_ssbo);
+                }
+                if let Some(program) = self.proto_repack_compute_program {
+                    gls::gl::DeleteProgram(program);
+                }
             }
         }
     }
@@ -1293,9 +1299,12 @@ impl GLProcessorST {
                 let mut dst_map = dst.map()?;
                 let bg_slice = bg_map.as_slice();
                 let dst_slice = dst_map.as_mut_slice();
-                if bg_slice.len() == dst_slice.len() {
-                    dst_slice.copy_from_slice(bg_slice);
+                if bg_slice.len() != dst_slice.len() {
+                    return Err(crate::Error::InvalidShape(
+                        "background buffer size does not match dst".into(),
+                    ));
                 }
+                dst_slice.copy_from_slice(bg_slice);
             }
         }
 
@@ -1450,9 +1459,12 @@ impl GLProcessorST {
                 let mut dst_map = dst.map()?;
                 let bg_slice = bg_map.as_slice();
                 let dst_slice = dst_map.as_mut_slice();
-                if bg_slice.len() == dst_slice.len() {
-                    dst_slice.copy_from_slice(bg_slice);
+                if bg_slice.len() != dst_slice.len() {
+                    return Err(crate::Error::InvalidShape(
+                        "background buffer size does not match dst".into(),
+                    ));
                 }
+                dst_slice.copy_from_slice(bg_slice);
             }
         }
 
@@ -4728,9 +4740,15 @@ impl GLProcessorST {
                 gls::gl::DispatchCompute(groups_x, groups_y, 1);
                 gls::gl::MemoryBarrier(gls::gl::TEXTURE_FETCH_BARRIER_BIT);
 
-                // Unbind SSBO and clear any pending GL errors from compute path
+                // Unbind SSBO and log any GL errors from compute dispatch
                 gls::gl::BindBuffer(gls::gl::SHADER_STORAGE_BUFFER, 0);
-                while gls::gl::GetError() != gls::gl::NO_ERROR {}
+                loop {
+                    let err = gls::gl::GetError();
+                    if err == gls::gl::NO_ERROR {
+                        break;
+                    }
+                    log::debug!("GL error after compute dispatch: 0x{err:x}");
+                }
             }
         } else {
             // === GLES 3.0 fallback: CPU repack ===
