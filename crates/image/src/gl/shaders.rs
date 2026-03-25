@@ -819,3 +819,50 @@ void main() {
 }
 "
 }
+
+/// HWC → layer-first (CHW) repack compute shader for int8 protos.
+///
+/// Reads proto data from an SSBO in row-major HWC layout `(H, W, num_protos)`.
+/// Writes to a `GL_R8I` `GL_TEXTURE_2D_ARRAY` with one proto per layer via
+/// `imageStore`. Each workgroup thread handles one `(x, y)` position and
+/// writes all `num_protos` layers.
+///
+/// The SSBO stores raw `i8` bytes packed as `int[]` (4 bytes per element).
+/// The shader extracts individual bytes and sign-extends them.
+///
+/// Requires GLES 3.1+.
+pub(super) fn generate_proto_repack_compute_shader() -> &'static str {
+    "\
+#version 310 es
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer ProtoSSBO {
+    int packed_data[];
+};
+
+layout(r32i, binding = 0) writeonly uniform highp iimage2DArray dst_tex;
+
+uniform int width;
+uniform int height;
+uniform int num_protos;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+
+    if (x >= width || y >= height) return;
+
+    int base = (y * width + x) * num_protos;
+
+    for (int k = 0; k < num_protos; k++) {
+        int byte_offset = base + k;
+        int word_idx = byte_offset >> 2;
+        int byte_idx = byte_offset & 3;
+        int word = packed_data[word_idx];
+        int val = (word >> (byte_idx * 8)) & 0xFF;
+        if (val >= 128) val -= 256;
+        imageStore(dst_tex, ivec3(x, y, k), ivec4(val, 0, 0, 0));
+    }
+}
+"
+}

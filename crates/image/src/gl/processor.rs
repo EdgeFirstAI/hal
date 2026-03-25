@@ -65,6 +65,12 @@ pub struct GLProcessorST {
     mask_fbo_height: usize,
     /// PBO buffer ID for atlas readback (0 = not allocated).
     mask_atlas_pbo: u32,
+    /// Compute shader program for HWC→CHW proto repack (GLES 3.1 only).
+    proto_repack_compute_program: Option<u32>,
+    /// SSBO for proto data upload (compute shader path).
+    proto_ssbo: u32,
+    /// Current allocated size of proto SSBO in bytes (0 = not allocated).
+    proto_ssbo_size: usize,
     vertex_buffer: Buffer,
     texture_buffer: Buffer,
     /// Persistent FBO for the convert() render path.
@@ -471,8 +477,32 @@ impl GLProcessorST {
             color_program,
             cached_opacity: f32::NAN, // sentinel: forces first set_opacity_uniform to initialize all shaders
             proto_tex_dims: (0, 0, 0, 0),
+            proto_repack_compute_program: None,
+            proto_ssbo: 0,
+            proto_ssbo_size: 0,
         };
         check_gl_error(function!(), line!())?;
+
+        // Compile compute shader for proto repack if GLES 3.1 is available.
+        // Enabled via EDGEFIRST_PROTO_COMPUTE=1 while validating on target GPUs.
+        let compute_enabled = converter.gl_context.has_compute
+            && std::env::var("EDGEFIRST_PROTO_COMPUTE")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+        if compute_enabled {
+            match Self::compile_compute_program(generate_proto_repack_compute_shader()) {
+                Ok(program) => {
+                    log::info!("Proto repack compute shader compiled successfully");
+                    converter.proto_repack_compute_program = Some(program);
+                    let mut ssbo = 0u32;
+                    unsafe { gls::gl::GenBuffers(1, &mut ssbo) };
+                    converter.proto_ssbo = ssbo;
+                }
+                Err(e) => {
+                    log::warn!("Proto repack compute shader failed: {e}; using CPU fallback");
+                }
+            }
+        }
 
         // Verify DMA-buf actually works (catches NVIDIA discrete GPUs where
         // EGLImage creation succeeds but rendered data is all zeros)
@@ -4624,27 +4654,106 @@ impl GLProcessorST {
             gls::gl::CLAMP_TO_EDGE as i32,
         );
 
-        // Protos are (H, W, num_protos) in row-major. We need to repack to
-        // layer-first layout: layer k = all (H, W) texels for proto k.
-        let mut tex_data = vec![0i8; height * width * num_protos];
-        for k in 0..num_protos {
-            for y in 0..height {
-                for x in 0..width {
-                    tex_data[k * height * width + y * width + x] = protos[[y, x, k]];
+        // Protos are (H, W, num_protos) in row-major HWC. The GL texture
+        // needs layer-first CHW (one proto per layer).
+        if let Some(compute_program) = self.proto_repack_compute_program {
+            // === GLES 3.1 compute shader path ===
+            // Upload HWC data as-is to SSBO, let GPU transpose via compute.
+            let data = protos.as_slice().expect("proto array must be contiguous");
+            let data_bytes = data.len();
+
+            // Allocate texture as R32I (required for imageStore in compute).
+            // Fragment shaders using isampler2DArray read integers correctly
+            // from either R8I or R32I via texelFetch.
+            let dims = (width, height, num_protos, gls::gl::R32I);
+            if dims != self.proto_tex_dims {
+                gls::tex_image3d::<i32>(
+                    texture_target,
+                    0,
+                    gls::gl::R32I as i32,
+                    width as i32,
+                    height as i32,
+                    num_protos as i32,
+                    0,
+                    gls::gl::RED_INTEGER,
+                    gls::gl::INT,
+                    None,
+                );
+                self.proto_tex_dims = dims;
+            }
+
+            unsafe {
+                // Upload HWC data to SSBO
+                gls::gl::BindBuffer(gls::gl::SHADER_STORAGE_BUFFER, self.proto_ssbo);
+                if data_bytes > self.proto_ssbo_size {
+                    gls::gl::BufferData(
+                        gls::gl::SHADER_STORAGE_BUFFER,
+                        data_bytes as isize,
+                        data.as_ptr() as *const std::ffi::c_void,
+                        gls::gl::STREAM_DRAW,
+                    );
+                    self.proto_ssbo_size = data_bytes;
+                } else {
+                    gls::gl::BufferSubData(
+                        gls::gl::SHADER_STORAGE_BUFFER,
+                        0,
+                        data_bytes as isize,
+                        data.as_ptr() as *const std::ffi::c_void,
+                    );
+                }
+                gls::gl::BindBufferBase(gls::gl::SHADER_STORAGE_BUFFER, 0, self.proto_ssbo);
+
+                // Bind texture as image for compute write (R32I for compatibility)
+                gls::gl::BindImageTexture(
+                    0,
+                    self.proto_texture.id,
+                    0,
+                    gls::gl::TRUE,
+                    0,
+                    gls::gl::WRITE_ONLY,
+                    gls::gl::R32I,
+                );
+
+                // Dispatch compute
+                gls::gl::UseProgram(compute_program);
+                let loc_w = gls::gl::GetUniformLocation(compute_program, c"width".as_ptr());
+                let loc_h = gls::gl::GetUniformLocation(compute_program, c"height".as_ptr());
+                let loc_np = gls::gl::GetUniformLocation(compute_program, c"num_protos".as_ptr());
+                gls::gl::Uniform1i(loc_w, width as i32);
+                gls::gl::Uniform1i(loc_h, height as i32);
+                gls::gl::Uniform1i(loc_np, num_protos as i32);
+
+                let groups_x = width.div_ceil(16) as u32;
+                let groups_y = height.div_ceil(16) as u32;
+                gls::gl::DispatchCompute(groups_x, groups_y, 1);
+                gls::gl::MemoryBarrier(gls::gl::TEXTURE_FETCH_BARRIER_BIT);
+
+                // Unbind SSBO and clear any pending GL errors from compute path
+                gls::gl::BindBuffer(gls::gl::SHADER_STORAGE_BUFFER, 0);
+                while gls::gl::GetError() != gls::gl::NO_ERROR {}
+            }
+        } else {
+            // === GLES 3.0 fallback: CPU repack ===
+            let mut tex_data = vec![0i8; height * width * num_protos];
+            for k in 0..num_protos {
+                for y in 0..height {
+                    for x in 0..width {
+                        tex_data[k * height * width + y * width + x] = protos[[y, x, k]];
+                    }
                 }
             }
-        }
 
-        self.upload_proto_texture(
-            texture_target,
-            gls::gl::R8I,
-            width,
-            height,
-            num_protos,
-            gls::gl::RED_INTEGER,
-            gls::gl::BYTE,
-            &tex_data,
-        );
+            self.upload_proto_texture(
+                texture_target,
+                gls::gl::R8I,
+                width,
+                height,
+                num_protos,
+                gls::gl::RED_INTEGER,
+                gls::gl::BYTE,
+                &tex_data,
+            );
+        }
 
         let proto_scale = quantization.scale;
         let proto_scaled_zp = -(quantization.zero_point as f32) * quantization.scale;
@@ -5010,6 +5119,42 @@ impl GLProcessorST {
 
         gls::disable(gls::gl::BLEND);
         Ok(())
+    }
+
+    /// Compile a GLES 3.1 compute shader program from source.
+    fn compile_compute_program(source: &str) -> Result<u32, Error> {
+        unsafe {
+            let cs = gls::gl::CreateShader(gls::gl::COMPUTE_SHADER);
+            if super::shaders::compile_shader_from_str(cs, source, "proto_repack_compute").is_err()
+            {
+                gls::gl::DeleteShader(cs);
+                return Err(Error::OpenGl("compute shader compile failed".into()));
+            }
+
+            let program = gls::gl::CreateProgram();
+            gls::gl::AttachShader(program, cs);
+            gls::gl::LinkProgram(program);
+
+            let mut linked: i32 = 0;
+            gls::gl::GetProgramiv(program, gls::gl::LINK_STATUS, &mut linked);
+            gls::gl::DeleteShader(cs);
+
+            if linked == 0 {
+                let mut log_len = 0;
+                gls::gl::GetProgramiv(program, gls::gl::INFO_LOG_LENGTH, &mut log_len);
+                let mut log_buf: Vec<u8> = vec![0; log_len as usize];
+                gls::gl::GetProgramInfoLog(
+                    program,
+                    log_len,
+                    std::ptr::null_mut(),
+                    log_buf.as_mut_ptr() as *mut std::ffi::c_char,
+                );
+                let msg = String::from_utf8_lossy(&log_buf);
+                gls::gl::DeleteProgram(program);
+                return Err(Error::OpenGl(format!("compute program link failed: {msg}")));
+            }
+            Ok(program)
+        }
     }
 
     /// Upload data to the proto `GL_TEXTURE_2D_ARRAY`, using `glTexSubImage3D`
