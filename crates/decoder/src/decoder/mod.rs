@@ -1079,6 +1079,23 @@ impl Decoder {
                 )?;
                 Ok(Some(proto))
             }
+            ModelType::YoloSegDet2Way {
+                boxes,
+                mask_coeff,
+                protos,
+            } => {
+                let proto = self.decode_tracked_yolo_segdet_2way_quantized_proto(
+                    tracker,
+                    timestamp,
+                    outputs,
+                    boxes,
+                    mask_coeff,
+                    protos,
+                    output_boxes,
+                    output_tracks,
+                )?;
+                Ok(Some(proto))
+            }
             ModelType::YoloEndToEndSegDet { boxes, protos } => {
                 let proto = self.decode_tracked_yolo_end_to_end_segdet_quantized_proto(
                     tracker,
@@ -1170,6 +1187,23 @@ impl Decoder {
                     outputs,
                     boxes,
                     scores,
+                    mask_coeff,
+                    protos,
+                    output_boxes,
+                    output_tracks,
+                )?;
+                Ok(Some(proto))
+            }
+            ModelType::YoloSegDet2Way {
+                boxes,
+                mask_coeff,
+                protos,
+            } => {
+                let proto = self.decode_tracked_yolo_segdet_2way_float_proto(
+                    tracker,
+                    timestamp,
+                    outputs,
+                    boxes,
                     mask_coeff,
                     protos,
                     output_boxes,

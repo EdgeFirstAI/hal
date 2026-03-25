@@ -1949,9 +1949,12 @@ pub unsafe extern "C" fn hal_decoder_decode_tracked_draw_masks(
         if let Some(proto_data) = proto_result {
             // Fused path: render directly from proto data
             try_or_errno!(
-                (*processor)
-                    .inner
-                    .draw_masks_proto(&mut (*dst).inner, &boxes, &proto_data),
+                (*processor).inner.draw_masks_proto(
+                    &mut (*dst).inner,
+                    &boxes,
+                    &proto_data,
+                    edgefirst_image::MaskOverlay::default()
+                ),
                 libc::EIO
             );
         } else {
@@ -1969,9 +1972,12 @@ pub unsafe extern "C" fn hal_decoder_decode_tracked_draw_masks(
                 libc::EIO
             );
             try_or_errno!(
-                (*processor)
-                    .inner
-                    .draw_masks(&mut (*dst).inner, &boxes, &masks),
+                (*processor).inner.draw_masks(
+                    &mut (*dst).inner,
+                    &boxes,
+                    &masks,
+                    edgefirst_image::MaskOverlay::default()
+                ),
                 libc::EIO
             );
         }
@@ -1991,9 +1997,12 @@ pub unsafe extern "C" fn hal_decoder_decode_tracked_draw_masks(
 
         if let Some(proto_data) = proto_result {
             try_or_errno!(
-                (*processor)
-                    .inner
-                    .draw_masks_proto(&mut (*dst).inner, &boxes, &proto_data),
+                (*processor).inner.draw_masks_proto(
+                    &mut (*dst).inner,
+                    &boxes,
+                    &proto_data,
+                    edgefirst_image::MaskOverlay::default()
+                ),
                 libc::EIO
             );
         } else {
@@ -2011,9 +2020,12 @@ pub unsafe extern "C" fn hal_decoder_decode_tracked_draw_masks(
                 return rc;
             }
             try_or_errno!(
-                (*processor)
-                    .inner
-                    .draw_masks(&mut (*dst).inner, &boxes, &masks),
+                (*processor).inner.draw_masks(
+                    &mut (*dst).inner,
+                    &boxes,
+                    &masks,
+                    edgefirst_image::MaskOverlay::default()
+                ),
                 libc::EIO
             );
         }
