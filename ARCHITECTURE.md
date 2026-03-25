@@ -1695,6 +1695,158 @@ The `edgefirstcameraadaptor` element detects multi-plane buffers
 
 This work was implemented under **EDGEAI-1107**.
 
+## Appendix B: Delegate DMA-BUF Framework
+
+### Purpose
+
+The Delegate DMA-BUF Framework defines an ABI contract for querying DMA-BUF
+tensor information from external TFLite delegates (e.g., NXP Neutron NPU).
+The HAL owns the type definitions; function implementations live in delegate
+integrators such as `edgefirst-tflite`.
+
+This enables a fully zero-copy pipeline from camera capture through NPU
+inference by allowing `hal_import_image()` to wrap delegate-owned DMA-BUF
+file descriptors as HAL tensors with full image attributes.
+
+### Zero-Copy Data Flow
+
+```
+Camera DMA-BUF
+  → hal_plane_descriptor (wraps camera_fd, stride, offset)
+  → hal_import_image(proc, camera_pd, NULL, width, height, format, dtype)
+  → HAL Tensor with image attributes (camera source)
+
+NPU input DMA-BUF (fd/shape from hal_dmabuf_get_tensor_info)
+  → hal_plane_descriptor (wraps npu_input_fd, stride, offset)
+  → hal_import_image(proc, npu_pd, NULL, model_width, model_height, format, dtype)
+  → HAL Tensor with image attributes (NPU destination)
+
+ImageProcessor::convert(camera_tensor, npu_tensor)
+  → DMA→DMA convert (resize, colorspace, letterbox)
+
+hal_dmabuf_sync_for_device(delegate, input_tensor_index)
+  → flush CPU caches so NPU can read
+
+NPU inference
+
+hal_dmabuf_sync_for_cpu(delegate, output_tensor_index) [optional]
+  → invalidate CPU caches so CPU sees NPU writes
+```
+
+Both camera and NPU input tensors are imported via `hal_import_image()` so
+that `convert()` has the pixel format, dimensions, stride, and plane metadata
+it requires. `hal_tensor_from_fd()` creates raw tensors without image
+attributes; to use such tensors as a `convert()` source or destination you
+must either import them as images (via `hal_import_image()`) or attach the
+required image metadata (for example with `hal_tensor_set_format()`).
+
+Output DMA-BUF access via `hal_dmabuf_get_tensor_info()` is optional and
+depends on the use case: useful when feeding outputs to GPU (e.g., mask
+rendering via OpenGL), but for CPU-side post-processing (YOLO decode, NMS)
+it is simpler to read tensor data directly since the decode will memcpy
+anyway.
+
+### Type Definitions
+
+**`hal_delegate_t`** — opaque handle for any delegate, defined as `void*`.
+A future revision will formalize this as a proper abstraction. The delegate
+lifetime is managed by the caller; the HAL never creates or destroys
+delegates.
+
+**`hal_dmabuf_tensor_info`** — describes a single delegate tensor's DMA-BUF:
+
+| Field   | Type                          | Description |
+|---------|-------------------------------|-------------|
+| `size`  | `size_t`                      | Buffer size in bytes (may exceed logical tensor size for padded buffers) |
+| `offset`| `size_t`                      | Byte offset within the DMA-BUF (for sub-allocated buffers) |
+| `shape` | `size_t[HAL_DMABUF_MAX_NDIM]` | Tensor dimensions (max 8) |
+| `ndim`  | `size_t`                      | Number of valid entries in `shape` |
+| `fd`    | `int`                         | DMA-BUF file descriptor (**borrowed** — do not close) |
+| `dtype` | `hal_dtype`                   | Element data type |
+
+Fields are ordered to eliminate padding on LP64 (`size_t` fields first,
+then smaller 4-byte fields). Total struct size: 96 bytes on LP64.
+
+### Expected Function Signatures
+
+These functions are **not implemented in the HAL**. They document the exact
+ABI that delegate integrators must export and that consumers probe via
+`dlsym`.
+
+```c
+/* Query whether the delegate supports DMA-BUF tensor access.
+ * Returns 1 if supported, 0 if not supported or on error.
+ * A NULL delegate pointer returns 0. */
+int hal_dmabuf_is_supported(hal_delegate_t delegate);
+
+/* Get DMA-BUF tensor info for a given tensor index.
+ * Returns 0 on success, -1 on error (sets errno).
+ *
+ * info_size enables forward-compatible versioning: pass
+ * sizeof(hal_dmabuf_tensor_info). Implementations zero-initialize
+ * with memset(info, 0, info_size) and only write fields whose
+ * offsetof + sizeof fits within info_size.
+ *
+ * Errno: EINVAL (bad args), ENOTSUP (no DMA-BUF support),
+ *        ERANGE (index out of range), EIO (internal failure) */
+int hal_dmabuf_get_tensor_info(hal_delegate_t delegate,
+                               int tensor_index,
+                               hal_dmabuf_tensor_info *info,
+                               size_t info_size);
+
+/* Flush CPU caches → device can read.
+ * Call after ImageProcessor::convert() into the input tensor,
+ * before invoking NPU inference.
+ * Returns 0 on success, -1 on error (sets errno).
+ * Errno: EINVAL, ERANGE, EIO */
+int hal_dmabuf_sync_for_device(hal_delegate_t delegate, int tensor_index);
+
+/* Invalidate CPU caches → CPU sees device writes.
+ * Call after NPU inference, before reading output tensor data.
+ * Returns 0 on success, -1 on error (sets errno).
+ * Errno: EINVAL, ERANGE, EIO */
+int hal_dmabuf_sync_for_cpu(hal_delegate_t delegate, int tensor_index);
+```
+
+`tensor_index` must be non-negative; negative values return -1 with
+`errno` set to `EINVAL`.
+
+### Integration Pattern
+
+1. `edgefirst-tflite` (or another delegate integrator) implements the four
+   functions above and exports them as public C symbols.
+2. Consumers probe for the symbols at runtime via `dlsym` on the delegate's
+   shared library.
+3. If `hal_dmabuf_is_supported()` returns 1, consumers call
+   `hal_dmabuf_get_tensor_info()` to obtain the DMA-BUF fd and shape for
+   each tensor of interest.
+4. The fd and metadata are passed to `hal_import_image()` to create a
+   HAL tensor with full image attributes for use with
+   `ImageProcessor::convert()`.
+
+### Lifecycle and Ownership
+
+- The **delegate** owns all DMA-BUF allocations. File descriptors returned
+  by `hal_dmabuf_get_tensor_info()` are borrowed — callers must not close
+  them.
+- Sync functions (`sync_for_device`, `sync_for_cpu`) wrap
+  `DMA_BUF_IOCTL_SYNC` and bracket hardware access. They must be called
+  at the correct points in the pipeline (see data flow above).
+- The delegate instance itself is created and destroyed by the caller
+  (e.g., via the TFLite C API). The HAL never manages delegate lifetime.
+
+### Thread Safety
+
+Delegate functions are not required to be thread-safe for concurrent calls
+on the same delegate instance. Callers must serialize access per delegate.
+Different delegate instances may be used concurrently from different threads.
+
+### Tracking
+
+- **Epic:** [EDGEAI-1185](https://au-zone.atlassian.net/browse/EDGEAI-1185) — NXP Neutron DMABUF Zero-Copy Support
+- **Type definitions:** [EDGEAI-1189](https://au-zone.atlassian.net/browse/EDGEAI-1189) — EdgeFirst HAL: formalize hal_dmabuf_* interface
+- **Implementation:** [EDGEAI-1190](https://au-zone.atlassian.net/browse/EDGEAI-1190) — edgefirst-tflite: update probing for hal_dmabuf_* symbols
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for:
