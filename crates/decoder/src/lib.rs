@@ -4888,6 +4888,7 @@ outputs:
         // no masks when the boxes are from tracker prediction without a matching detection
         assert!(protos.is_some_and(|x| x.mask_coefficients.is_empty()))
     }
+
     #[test]
     fn test_decoder_tracked_end_to_end_segdet_split_proto_float() {
         let score_threshold = 0.45;
