@@ -33,6 +33,17 @@ extern "C" {
  * - Tensor map operations require external synchronization when used concurrently
  */
 
+/**
+ * @brief Opaque delegate handle.
+ *
+ * Used by the delegate DMA-BUF API (hal_dmabuf_*) to reference an
+ * externally-owned TFLite delegate instance. The delegate lifetime
+ * is managed by the caller; the HAL never creates or destroys delegates.
+ *
+ * A future revision will formalize this as a proper abstraction.
+ */
+typedef void *hal_delegate_t;
+
 
 /* Generated with cbindgen:0.29.2 */
 
@@ -44,6 +55,11 @@ extern "C" {
 #include <stdlib.h>
 #include <stddef.h>
 #include <stdio.h>
+
+/**
+ * Maximum number of dimensions in a delegate tensor shape.
+ */
+#define HAL_DMABUF_MAX_NDIM 8
 
 /**
  * Output type for model tensor outputs.
@@ -700,6 +716,53 @@ typedef struct hal_track_info {
    */
   uint64_t last_updated;
 } hal_track_info;
+
+/**
+ * DMA-BUF tensor information returned by a delegate.
+ *
+ * Describes a single tensor's DMA-BUF allocation, including the file
+ * descriptor, buffer geometry, and element type. The fd is borrowed
+ * from the delegate and must NOT be closed by the caller.
+ *
+ * Fields are ordered to eliminate padding on LP64: all `size_t` fields
+ * first (8-byte aligned), then smaller `int` and enum fields (4 bytes
+ * each) at the end. Total size: 96 bytes on LP64.
+ *
+ * @par Versioning
+ * The companion hal_dmabuf_get_tensor_info() function accepts an
+ * info_size parameter so that the struct can grow in future versions
+ * without breaking ABI. Implementations must zero-initialize the
+ * struct with memset(info, 0, info_size) before populating it, and
+ * only write fields whose offset + size fits within info_size.
+ */
+typedef struct hal_dmabuf_tensor_info {
+  /**
+   * Buffer size in bytes.
+   */
+  size_t size;
+  /**
+   * Byte offset within the DMA-BUF.
+   */
+  size_t offset;
+  /**
+   * Tensor dimensions (up to HAL_DMABUF_MAX_NDIM).
+   *
+   * Uses a literal length so cbindgen can emit the array in the C header.
+   */
+  size_t shape[8];
+  /**
+   * Number of valid entries in `shape`.
+   */
+  size_t ndim;
+  /**
+   * DMA-BUF file descriptor (borrowed — do not close).
+   */
+  int fd;
+  /**
+   * Element data type.
+   */
+  enum hal_dtype dtype;
+} hal_dmabuf_tensor_info;
 
 /**
  * Create new decoder parameters.
