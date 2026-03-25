@@ -2892,6 +2892,118 @@ impl Decoder {
             |boxes, masks, protos, out, _| extract_proto_data_float(boxes, masks, protos, out),
         )
     }
+    /// Tracked 2-way split quantized decode (non-proto, full mask materialization).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn decode_tracked_yolo_segdet_2way_quantized<
+        TR: edgefirst_tracker::Tracker<DetectBox>,
+    >(
+        &self,
+        tracker: &mut TR,
+        timestamp: u64,
+        outputs: &[ArrayViewDQuantized],
+        detection: &configs::Detection,
+        mask_coeff: &configs::MaskCoefficients,
+        protos: &configs::Protos,
+        output_boxes: &mut Vec<DetectBox>,
+        output_masks: &mut Vec<Segmentation>,
+        output_tracks: &mut Vec<TrackInfo>,
+    ) -> Result<(), DecoderError> {
+        process_tracked_yolo_segmentation_2way!(
+            self,
+            tracker,
+            timestamp,
+            outputs,
+            detection,
+            mask_coeff,
+            protos,
+            output_boxes,
+            output_masks,
+            output_tracks,
+            |new_boxes, mask_t, quant_masks, protos_t, quant_protos, output_boxes, output_masks| {
+                impl_yolo_split_segdet_quant_process_masks::<_, _>(
+                    new_boxes,
+                    (mask_t, quant_masks),
+                    (protos_t, quant_protos),
+                    output_boxes,
+                    output_masks,
+                )
+            }
+        )
+    }
+
+    /// Tracked 2-way split float decode (non-proto, full mask materialization).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn decode_tracked_yolo_segdet_2way_float<
+        TR: edgefirst_tracker::Tracker<DetectBox>,
+        T,
+    >(
+        &self,
+        tracker: &mut TR,
+        timestamp: u64,
+        outputs: &[ArrayViewD<T>],
+        detection: &configs::Detection,
+        mask_coeff: &configs::MaskCoefficients,
+        protos: &configs::Protos,
+        output_boxes: &mut Vec<DetectBox>,
+        output_masks: &mut Vec<Segmentation>,
+        output_tracks: &mut Vec<TrackInfo>,
+    ) -> Result<(), DecoderError>
+    where
+        T: Float + AsPrimitive<f32> + Send + Sync + 'static,
+        f32: AsPrimitive<T>,
+    {
+        use crate::yolo::{
+            impl_yolo_segdet_get_boxes, impl_yolo_split_segdet_process_masks,
+            postprocess_yolo_split_segdet,
+        };
+
+        let mut skip = vec![];
+        let (det_tensor, ind) = Self::find_outputs_with_shape(&detection.shape, outputs, &skip)?;
+        let det_tensor = Self::swap_axes_if_needed(det_tensor, detection.into());
+        let det_tensor = det_tensor.slice(s![0, .., ..]);
+        skip.push(ind);
+
+        let (mask_tensor, ind) = Self::find_outputs_with_shape(&mask_coeff.shape, outputs, &skip)?;
+        let mask_tensor = Self::swap_axes_if_needed(mask_tensor, mask_coeff.into());
+        let mask_tensor = mask_tensor.slice(s![0, .., ..]);
+        skip.push(ind);
+
+        let (protos_tensor, _) = Self::find_outputs_with_shape(&protos.shape, outputs, &skip)?;
+        let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos.into());
+        let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
+        let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
+
+        // Slice combined detection into boxes and scores
+        let boxes_view = det_tensor.slice(s![..4, ..]);
+        let scores_view = det_tensor.slice(s![4.., ..]);
+
+        let (boxes_view, scores_view, mask_tensor) =
+            postprocess_yolo_split_segdet(boxes_view, scores_view, mask_tensor);
+        let boxes = impl_yolo_segdet_get_boxes::<XYWH, _, _>(
+            boxes_view,
+            scores_view,
+            self.score_threshold,
+            self.iou_threshold,
+            self.nms,
+            output_boxes.capacity(),
+        );
+
+        // Tracker integrates after NMS, before mask materialization
+        let (new_boxes, old_boxes) =
+            Self::update_tracker_yolo_segdet(tracker, timestamp, boxes, output_tracks);
+
+        impl_yolo_split_segdet_process_masks(
+            new_boxes,
+            mask_tensor,
+            protos_tensor,
+            output_boxes,
+            output_masks,
+        )?;
+
+        output_boxes.extend(old_boxes);
+        Ok(())
+    }
+
     /// Tracked 2-way split quantized proto decode.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn decode_tracked_yolo_segdet_2way_quantized_proto<

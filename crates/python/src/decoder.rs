@@ -999,9 +999,16 @@ impl PyDecoder {
         };
 
         // Render based on whether we got proto data or not
+        if let Some(bg) = &background {
+            if std::ptr::eq(&bg.0 as *const _, &dst.0 as *const _) {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "background must not be the same tensor as dst",
+                ));
+            }
+        }
         let overlay = edgefirst_hal::image::MaskOverlay {
             background: background.map(|b| &b.0),
-            opacity,
+            opacity: opacity.clamp(0.0, 1.0),
         };
         if let Ok(mut l) = processor.0.lock() {
             if let Some(proto_data) = proto_result {

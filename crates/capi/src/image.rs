@@ -807,9 +807,11 @@ pub unsafe extern "C" fn hal_image_processor_convert(
 /// @param dst Destination image tensor to draw onto
 /// @param detections Detection box list (can be NULL for segmentation-only)
 /// @param segmentations Segmentation list (can be NULL for detection-only)
+/// @param background Optional background image (NULL to draw over dst)
+/// @param opacity Mask opacity in [0.0, 1.0] (1.0 = fully opaque, clamped)
 /// @return 0 on success, -1 on error
 /// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL processor or dst)
+/// - EINVAL: Invalid argument (NULL processor or dst, or background == dst)
 /// - EIO: Drawing failed
 #[no_mangle]
 pub unsafe extern "C" fn hal_image_processor_draw_masks(
@@ -817,8 +819,14 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks(
     dst: *mut HalTensor,
     detections: *const HalDetectBoxList,
     segmentations: *const HalSegmentationList,
+    background: *const HalTensor,
+    opacity: f32,
 ) -> c_int {
     check_null!(processor, dst);
+
+    if !background.is_null() && background as *const _ == dst as *const _ {
+        return set_error(libc::EINVAL);
+    }
 
     let detect_slice = if detections.is_null() {
         &[]
@@ -832,12 +840,21 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks(
         unsafe { &(*segmentations).masks }.as_slice()
     };
 
+    let bg = if background.is_null() {
+        None
+    } else {
+        Some(&unsafe { &*background }.inner)
+    };
+
     try_or_errno!(
         unsafe { &mut (*processor) }.inner.draw_masks(
             &mut unsafe { &mut (*dst) }.inner,
             detect_slice,
             seg_slice,
-            edgefirst_image::MaskOverlay::default(),
+            edgefirst_image::MaskOverlay {
+                background: bg,
+                opacity: opacity.clamp(0.0, 1.0),
+            },
         ),
         libc::EIO
     );
@@ -1760,7 +1777,9 @@ mod tests {
                     std::ptr::null_mut(),
                     dst,
                     std::ptr::null(),
-                    std::ptr::null()
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    1.0,
                 ),
                 -1
             );
@@ -1771,7 +1790,9 @@ mod tests {
                     processor,
                     std::ptr::null_mut(),
                     std::ptr::null(),
-                    std::ptr::null()
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    1.0,
                 ),
                 -1
             );

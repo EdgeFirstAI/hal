@@ -1270,6 +1270,11 @@ impl GLProcessorST {
 
         // GPU-blit background into framebuffer if provided and DMA-capable
         if let Some((bg, bg_fmt)) = background {
+            if bg.width() != Some(dst_w) || bg.height() != Some(dst_h) {
+                return Err(crate::Error::InvalidShape(
+                    "background dimensions do not match dst".into(),
+                ));
+            }
             if is_dma && bg.memory() == TensorMemory::Dma {
                 gls::disable(gls::gl::BLEND);
                 let bg_egl = self.get_or_create_egl_image(CacheKind::Src, bg, bg_fmt)?;
@@ -1430,6 +1435,11 @@ impl GLProcessorST {
 
         // GPU-blit background into framebuffer if provided and DMA-capable
         if let Some((bg, bg_fmt)) = background {
+            if bg.width() != Some(dst_w) || bg.height() != Some(dst_h) {
+                return Err(crate::Error::InvalidShape(
+                    "background dimensions do not match dst".into(),
+                ));
+            }
             if is_dma && bg.memory() == TensorMemory::Dma {
                 gls::disable(gls::gl::BLEND);
                 let bg_egl = self.get_or_create_egl_image(CacheKind::Src, bg, bg_fmt)?;
@@ -4671,8 +4681,13 @@ impl GLProcessorST {
         if let Some(compute_program) = self.proto_repack_compute_program {
             // === GLES 3.1 compute shader path ===
             // Upload HWC data as-is to SSBO, let GPU transpose via compute.
-            let data = protos.as_slice().expect("proto array must be contiguous");
-            let data_bytes = data.len();
+            // Fall through to CPU repack if proto array is non-contiguous.
+            let data = match protos.as_slice() {
+                Some(s) => std::borrow::Cow::Borrowed(s),
+                None => std::borrow::Cow::Owned(protos.iter().copied().collect()),
+            };
+            // Pad to 4-byte boundary for SSBO int[] alignment
+            let data_bytes = (data.len() + 3) & !3;
 
             // Allocate texture as R32I (required for imageStore in compute).
             // Fragment shaders using isampler2DArray read integers correctly
@@ -4738,7 +4753,9 @@ impl GLProcessorST {
                 let groups_x = width.div_ceil(16) as u32;
                 let groups_y = height.div_ceil(16) as u32;
                 gls::gl::DispatchCompute(groups_x, groups_y, 1);
-                gls::gl::MemoryBarrier(gls::gl::TEXTURE_FETCH_BARRIER_BIT);
+                gls::gl::MemoryBarrier(
+                    gls::gl::TEXTURE_FETCH_BARRIER_BIT | gls::gl::SHADER_IMAGE_ACCESS_BARRIER_BIT,
+                );
 
                 // Unbind SSBO and log any GL errors from compute dispatch
                 gls::gl::BindBuffer(gls::gl::SHADER_STORAGE_BUFFER, 0);

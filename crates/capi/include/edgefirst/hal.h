@@ -1636,15 +1636,19 @@ int hal_image_processor_convert(struct hal_image_processor *processor,
  * @param dst Destination image tensor to draw onto
  * @param detections Detection box list (can be NULL for segmentation-only)
  * @param segmentations Segmentation list (can be NULL for detection-only)
+ * @param background Optional background image (NULL to draw over dst)
+ * @param opacity Mask opacity in [0.0, 1.0] (1.0 = fully opaque, clamped)
  * @return 0 on success, -1 on error
  * @par Errors (errno):
- * - EINVAL: Invalid argument (NULL processor or dst)
+ * - EINVAL: Invalid argument (NULL processor or dst, or background == dst)
  * - EIO: Drawing failed
  */
 int hal_image_processor_draw_masks(struct hal_image_processor *processor,
                                    struct hal_tensor *dst,
                                    const struct hal_detect_box_list *detections,
-                                   const struct hal_segmentation_list *segmentations);
+                                   const struct hal_segmentation_list *segmentations,
+                                   const struct hal_tensor *background,
+                                   float opacity);
 
 /**
  * Set class colors for segmentation rendering.
