@@ -11,6 +11,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 mod decoder;
+mod delegate;
 mod error;
 mod image;
 mod log;
@@ -18,6 +19,7 @@ mod tensor;
 mod tracker;
 
 pub use decoder::*;
+pub use delegate::*;
 pub use error::*;
 pub use image::*;
 pub use log::*;
