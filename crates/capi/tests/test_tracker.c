@@ -23,7 +23,7 @@ static void test_bytetrack_new_with_params(void) {
     TEST("bytetrack_new_with_params");
 
     struct hal_bytetrack* tracker = hal_bytetrack_new(
-        0.3f,   // track_thresh
+        0.3f,   // track_update
         0.8f,   // high_thresh
         0.2f,   // match_thresh
         30,     // frame_rate

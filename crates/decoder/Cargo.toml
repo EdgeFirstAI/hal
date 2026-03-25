@@ -14,11 +14,11 @@ documentation = "https://docs.rs/edgefirst-decoder"
 
 [features]
 #default = ["tracker"]
-#tracker = ["dep:edgefirst-tracker"]
+tracker = ["dep:edgefirst-tracker"]
 
 [dependencies]
 argminmax = { workspace = true }
-#edgefirst-tracker = { workspace = true, optional = true }
+edgefirst-tracker = { workspace = true, optional = true }
 env_logger = { workspace = true }
 fast-math = { workspace = true }
 log = { workspace = true }
@@ -33,6 +33,8 @@ serde_yaml = { workspace = true }
 [dev-dependencies]
 edgefirst-bench = { workspace = true }
 image = { workspace = true }
+rand = { workspace = true }
+rand_distr = { workspace = true }
 
 [[bench]]
 name = "decoder_benchmark"
