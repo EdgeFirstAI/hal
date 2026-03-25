@@ -42,6 +42,8 @@ pub struct GLProcessorST {
     color_program: GlProgram,
     /// Last opacity value set on shader uniforms (avoids redundant GL calls).
     cached_opacity: f32,
+    /// Allocated proto texture dimensions for SubImage3D fast path: (w, h, layers, internal_fmt).
+    proto_tex_dims: (usize, usize, usize, u32),
     /// Whether GL_OES_texture_float_linear is available (allows GL_LINEAR on R32F textures).
     has_float_linear: bool,
     /// Whether GL_EXT_texture_format_BGRA8888 is available (allows BGRA destinations).
@@ -468,6 +470,7 @@ impl GLProcessorST {
             proto_segmentation_program,
             color_program,
             cached_opacity: f32::NAN, // sentinel: forces first set_opacity_uniform to initialize all shaders
+            proto_tex_dims: (0, 0, 0, 0),
         };
         check_gl_error(function!(), line!())?;
 
@@ -4632,17 +4635,15 @@ impl GLProcessorST {
             }
         }
 
-        gls::tex_image3d(
+        self.upload_proto_texture(
             texture_target,
-            0,
-            gls::gl::R8I as i32,
-            width as i32,
-            height as i32,
-            num_protos as i32,
-            0,
+            gls::gl::R8I,
+            width,
+            height,
+            num_protos,
             gls::gl::RED_INTEGER,
             gls::gl::BYTE,
-            Some(&tex_data),
+            &tex_data,
         );
 
         let proto_scale = quantization.scale;
@@ -5009,6 +5010,54 @@ impl GLProcessorST {
 
         gls::disable(gls::gl::BLEND);
         Ok(())
+    }
+
+    /// Upload data to the proto `GL_TEXTURE_2D_ARRAY`, using `glTexSubImage3D`
+    /// when the texture dimensions haven't changed (avoids driver reallocation).
+    #[allow(clippy::too_many_arguments)]
+    fn upload_proto_texture<T: Copy>(
+        &mut self,
+        target: u32,
+        internal_fmt: u32,
+        w: usize,
+        h: usize,
+        layers: usize,
+        format: u32,
+        dtype: u32,
+        data: &[T],
+    ) {
+        let dims = (w, h, layers, internal_fmt);
+        if dims == self.proto_tex_dims {
+            unsafe {
+                gls::gl::TexSubImage3D(
+                    target,
+                    0,
+                    0,
+                    0,
+                    0,
+                    w as i32,
+                    h as i32,
+                    layers as i32,
+                    format,
+                    dtype,
+                    data.as_ptr() as *const std::ffi::c_void,
+                );
+            }
+        } else {
+            gls::tex_image3d(
+                target,
+                0,
+                internal_fmt as i32,
+                w as i32,
+                h as i32,
+                layers as i32,
+                0,
+                format,
+                dtype,
+                Some(data),
+            );
+            self.proto_tex_dims = dims;
+        }
     }
 
     /// Set the `opacity` uniform on all segmentation and color shader programs.

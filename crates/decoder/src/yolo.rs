@@ -1294,7 +1294,7 @@ fn extract_proto_data_float<
 /// shader can dequantize per-texel without CPU overhead.
 pub(crate) fn extract_proto_data_quant<
     MASK: PrimInt + AsPrimitive<f32> + Send + Sync,
-    PROTO: PrimInt + AsPrimitive<f32> + AsPrimitive<i8> + Send + Sync,
+    PROTO: PrimInt + AsPrimitive<f32> + AsPrimitive<i8> + Send + Sync + 'static,
 >(
     det_indices: Vec<(DetectBox, usize)>,
     mask_tensor: ArrayView2<MASK>,
@@ -1315,10 +1315,19 @@ pub(crate) fn extract_proto_data_quant<
         );
     }
     // Keep protos in raw int8 — GPU shader will dequantize per-texel.
-    let protos_i8 = protos.map(|v| {
-        let v_i8: i8 = v.as_();
-        v_i8
-    });
+    // When PROTO is already i8, use to_owned() for a flat memcpy instead of
+    // per-element as_() conversion.
+    let protos_i8 = if std::any::TypeId::of::<PROTO>() == std::any::TypeId::of::<i8>() {
+        // SAFETY: PROTO and i8 have identical size and layout when TypeId matches.
+        let view_i8 =
+            unsafe { &*(&protos as *const ArrayView3<'_, PROTO> as *const ArrayView3<'_, i8>) };
+        view_i8.to_owned()
+    } else {
+        protos.map(|v| {
+            let v_i8: i8 = v.as_();
+            v_i8
+        })
+    };
     ProtoData {
         mask_coefficients,
         protos: ProtoTensor::Quantized {

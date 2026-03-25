@@ -38,7 +38,7 @@ enum GLProcessorMessage {
     DrawMasksProto(
         SendablePtr<TensorDyn>,
         SendablePtr<DetectBox>,
-        Box<ProtoData>,
+        SendablePtr<ProtoData>,
         f32,                            // opacity
         Option<SendablePtr<TensorDyn>>, // background
         tokio::sync::oneshot::Sender<Result<(), Error>>,
@@ -289,10 +289,11 @@ impl GLProcessorThreaded {
                             let det =
                                 unsafe { std::slice::from_raw_parts(det.ptr.as_ptr(), det.len) };
                             let bg_ref = bg.map(|p| unsafe { &*p.ptr.as_ptr() });
+                            let proto_data = unsafe { proto_data.ptr.as_ref() };
                             gl_converter.draw_masks_proto(
                                 dst,
                                 det,
-                                &proto_data,
+                                proto_data,
                                 crate::MaskOverlay {
                                     background: bg_ref,
                                     opacity,
@@ -582,7 +583,10 @@ impl ImageProcessorTrait for GLProcessorThreaded {
                     ptr: NonNull::new(detect.as_ptr() as *mut DetectBox).unwrap(),
                     len: detect.len(),
                 },
-                Box::new(proto_data.clone()),
+                SendablePtr {
+                    ptr: NonNull::from(proto_data).cast::<ProtoData>(),
+                    len: 1,
+                },
                 overlay.opacity,
                 overlay.background.map(|bg| SendablePtr {
                     ptr: NonNull::from(bg).cast::<TensorDyn>(),
