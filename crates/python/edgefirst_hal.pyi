@@ -6,7 +6,6 @@ import sys
 
 """EdgeFirst HAL Python bindings."""
 
-
 class Nms(enum.Enum):
     """Non-Maximum Suppression mode for object detection.
 
@@ -16,7 +15,6 @@ class Nms(enum.Enum):
 
     ClassAgnostic: Nms
     ClassAware: Nms
-
 
 DetectionOutput = Tuple[
     npt.NDArray[np.float32], npt.NDArray[np.float32], npt.NDArray[np.uintp]
@@ -70,7 +68,6 @@ A tuple containing:
 - tracks: A list of TrackInfo objects containing tracking information for each detection.
 """
 
-
 class DecoderType(enum.Enum):
     """Decoder type — selects the post-processing algorithm family.
 
@@ -80,7 +77,6 @@ class DecoderType(enum.Enum):
 
     Ultralytics: DecoderType
     ModelPack: DecoderType
-
 
 class DecoderVersion(enum.Enum):
     """Decoder version for Ultralytics models.
@@ -100,7 +96,6 @@ class DecoderVersion(enum.Enum):
     """YOLO11 - anchor-free DFL decoder, requires external NMS."""
     Yolo26: DecoderVersion
     """YOLO26 - end-to-end model with embedded NMS (one-to-one matching heads)."""
-
 
 class DimName(enum.Enum):
     """Named dimension for model output tensors.
@@ -129,7 +124,6 @@ class DimName(enum.Enum):
     """Padding dimension."""
     BoxCoords: DimName
     """Box coordinate dimension (typically 4)."""
-
 
 class Output:
     """A model output configuration for programmatic decoder setup.
@@ -308,7 +302,6 @@ class Output:
         """
         ...
 
-
 class Decoder:
     def __init__(
         self,
@@ -423,8 +416,12 @@ class Decoder:
         ...
 
     def decode_tracked(
-            self, tracker: ByteTrack, timestamp_ns: int, model_output: List[np.ndarray],
-            max_boxes: int = 100) -> SegDetTrackedOutput:
+        self,
+        tracker: ByteTrack,
+        timestamp_ns: int,
+        model_output: List[np.ndarray],
+        max_boxes: int = 100,
+    ) -> SegDetTrackedOutput:
         """
         Decode model outputs into detection and segmentation results with tracking. When giving quantized
         tensors as input, the quantization parameters must be specified in the Decoder configuration.
@@ -677,7 +674,6 @@ class Decoder:
 
     @score_threshold.setter
     def score_threshold(self, value: float): ...
-
     @property
     def iou_threshold(self) -> float:
         """
@@ -688,7 +684,6 @@ class Decoder:
 
     @iou_threshold.setter
     def iou_threshold(self, value: float): ...
-
     @property
     def nms(self) -> Optional[Nms]:
         """
@@ -704,7 +699,6 @@ class Decoder:
         Returns True if normalized, False if pixel coordinates, or None if unknown.
         """
         ...
-
 
 class TensorMemory(enum.Enum):
     if sys.platform == "linux":
@@ -726,7 +720,6 @@ class TensorMemory(enum.Enum):
     """
     MEM: TensorMemory
     """Regular system memory allocation"""
-
 
 class Tensor:
     if sys.platform == "linux":
@@ -1012,7 +1005,6 @@ class Tensor:
         """Whether this image uses a planar pixel layout."""
         ...
 
-
 class TensorMap:
     def unmap(self) -> None: ...
     def view(self) -> memoryview: ...
@@ -1024,7 +1016,6 @@ class TensorMap:
     def __releasebuffer__(self, view) -> None: ...
     def __enter__(self) -> TensorMap: ...
     def __exit__(self, _exc_type, _exc_value, _traceback) -> None: ...
-
 
 class PixelFormat(enum.Enum):
     """Pixel format for image tensors."""
@@ -1063,7 +1054,6 @@ class PixelFormat(enum.Enum):
     def __init__(self, name: str) -> None:
         """Create a PixelFormat from a string name (e.g. 'RGBA', 'NV12', 'GREY')."""
         ...
-
 
 class Normalization(enum.Enum):
     DEFAULT: Normalization
@@ -1108,7 +1098,6 @@ class Normalization(enum.Enum):
     | `np.float64` | value             |
     """
 
-
 class Flip(enum.Enum):
     NoFlip: Flip
     """No flip"""
@@ -1116,7 +1105,6 @@ class Flip(enum.Enum):
     """Flip the image horizontally"""
     Vertical: Flip
     """Flip the image vertically"""
-
 
 class Rotation(enum.Enum):
     Rotate0: Rotation
@@ -1136,7 +1124,6 @@ class Rotation(enum.Enum):
         """Get the Rotation enum variant corresponding to the specified angle in degrees clockwise. Valid angles are 0, 90, 180, and 270."""
         ...
 
-
 class Rect:
     """A crop rectangle defined by its top-left corner (left, top) and its dimensions (width, height)."""
 
@@ -1149,7 +1136,6 @@ class Rect:
     def width(self) -> int: ...
     @property
     def height(self) -> int: ...
-
 
 class EglDisplayKind:
     """Identifies the type of EGL display used for headless OpenGL ES rendering.
@@ -1172,7 +1158,6 @@ class EglDisplayKind:
     PlatformDevice: EglDisplayKind
     Default: EglDisplayKind
 
-
 class EglDisplayInfo:
     """A validated, available EGL display discovered by probe_egl_displays()."""
 
@@ -1186,7 +1171,6 @@ class EglDisplayInfo:
         """Human-readable description for logging/diagnostics."""
         ...
 
-
 def probe_egl_displays() -> list[EglDisplayInfo]:
     """Probe for available EGL displays supporting headless OpenGL ES 3.0.
 
@@ -1199,7 +1183,6 @@ def probe_egl_displays() -> list[EglDisplayInfo]:
         RuntimeError: If libEGL.so.1 cannot be loaded.
     """
     ...
-
 
 class ImageProcessor:
     """Convert images between different formats, with optional rotation, flipping, and cropping."""
@@ -1368,14 +1351,15 @@ class ImageProcessor:
             mode: Interpolation mode string.
         """
 
-
 class TrackInfo:
-    def __init__(self,
-                 uuid: str,
-                 tracked_location: Tuple[float, float, float, float],
-                 count: int,
-                 created: int,
-                 last_updated: int) -> None:
+    def __init__(
+        self,
+        uuid: str,
+        tracked_location: Tuple[float, float, float, float],
+        count: int,
+        created: int,
+        last_updated: int,
+    ) -> None:
         """Information about a single tracked object."""
         ...
 
@@ -1404,14 +1388,14 @@ class TrackInfo:
         """The timestamp (in nanoseconds) when the track was last updated."""
         ...
 
-
-
 class ActiveTrackInfo:
-    def __init__(self,
-                 info: TrackInfo,
-                 bbox: Tuple[float, float, float, float],
-                 score: float,
-                 label: int) -> None:
+    def __init__(
+        self,
+        info: TrackInfo,
+        bbox: Tuple[float, float, float, float],
+        score: float,
+        label: int,
+    ) -> None:
         """Information about an actively tracked object."""
         ...
 
@@ -1425,9 +1409,10 @@ class ActiveTrackInfo:
         """The last bounding box, score, and class ID of the tracked object."""
         ...
 
-
 class ByteTrack:
-    def __init__(self, high_conf=0.7, iou=0.25, update=0.25, lifespan_ns=500_000_000) -> None:
+    def __init__(
+        self, high_conf=0.7, iou=0.25, update=0.25, lifespan_ns=500_000_000
+    ) -> None:
         """Create a new ByteTrack tracker."""
         ...
 

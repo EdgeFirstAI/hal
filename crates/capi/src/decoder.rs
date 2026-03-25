@@ -1449,6 +1449,10 @@ pub unsafe extern "C" fn hal_decoder_draw_masks(
         return set_error(libc::EINVAL);
     }
 
+    // Reject aliased background == dst (would create UB via &mut + & to same object)
+    if !background.is_null() && background as *const _ == dst as *const _ {
+        return set_error(libc::EINVAL);
+    }
     let bg = if background.is_null() {
         None
     } else {
@@ -1456,7 +1460,7 @@ pub unsafe extern "C" fn hal_decoder_draw_masks(
     };
     let overlay = edgefirst_image::MaskOverlay {
         background: bg,
-        opacity,
+        opacity: opacity.clamp(0.0, 1.0),
     };
 
     let outputs_slice = std::slice::from_raw_parts(outputs, num_outputs);

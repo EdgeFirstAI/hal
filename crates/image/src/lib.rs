@@ -275,7 +275,7 @@ impl<'a> MaskOverlay<'a> {
         }
         Ok(MaskOverlay {
             background: None,
-            opacity: self.opacity,
+            opacity: self.opacity.clamp(0.0, 1.0),
         })
     }
 }

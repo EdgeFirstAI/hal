@@ -867,6 +867,21 @@ impl Decoder {
                 output_masks,
                 output_tracks,
             ),
+            ModelType::YoloSegDet2Way {
+                boxes,
+                mask_coeff,
+                protos,
+            } => self.decode_tracked_yolo_segdet_2way_quantized(
+                tracker,
+                timestamp,
+                outputs,
+                boxes,
+                mask_coeff,
+                protos,
+                output_boxes,
+                output_masks,
+                output_tracks,
+            ),
             _ => {
                 self.decode_quantized(outputs, output_boxes, output_masks)?;
                 Self::update_tracker(tracker, timestamp, output_boxes, output_tracks);
@@ -1005,6 +1020,23 @@ impl Decoder {
                     boxes,
                     scores,
                     classes,
+                    mask_coeff,
+                    protos,
+                    output_boxes,
+                    output_masks,
+                    output_tracks,
+                )?;
+            }
+            ModelType::YoloSegDet2Way {
+                boxes,
+                mask_coeff,
+                protos,
+            } => {
+                self.decode_tracked_yolo_segdet_2way_float(
+                    tracker,
+                    timestamp,
+                    outputs,
+                    boxes,
                     mask_coeff,
                     protos,
                     output_boxes,

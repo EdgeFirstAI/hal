@@ -997,9 +997,16 @@ impl PyImageProcessor {
             .0
             .lock()
             .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
+        if let Some(bg) = &background {
+            if std::ptr::eq(&bg.0 as *const _, &dst.0 as *const _) {
+                return Err(Error::InvalidArg(
+                    "background must not be the same tensor as dst".to_string(),
+                ));
+            }
+        }
         let overlay = image::MaskOverlay {
             background: background.map(|b| &b.0),
-            opacity,
+            opacity: opacity.clamp(0.0, 1.0),
         };
         l.draw_masks(&mut dst.0, &detect, &seg, overlay)?;
         Ok(())
