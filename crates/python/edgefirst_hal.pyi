@@ -6,6 +6,7 @@ import sys
 
 """EdgeFirst HAL Python bindings."""
 
+
 class Nms(enum.Enum):
     """Non-Maximum Suppression mode for object detection.
 
@@ -15,6 +16,7 @@ class Nms(enum.Enum):
 
     ClassAgnostic: Nms
     ClassAware: Nms
+
 
 DetectionOutput = Tuple[
     npt.NDArray[np.float32], npt.NDArray[np.float32], npt.NDArray[np.uintp]
@@ -50,6 +52,25 @@ A tuple containing:
     Binary ``uint8`` where 255 = mask presence.
 """
 
+SegDetTrackedOutput = Tuple[
+    npt.NDArray[np.float32],
+    npt.NDArray[np.float32],
+    npt.NDArray[np.uintp],
+    List[npt.NDArray[np.uint8]],
+    List[TrackInfo],
+]
+"""
+Segmentation and Detection output type alias with tracking.
+A tuple containing:
+- boxes: A NumPy array of shape (N, 4) containing the bounding boxes in (x1, y1, x2, y2) format.
+- scores: A NumPy array of shape (N,) containing the confidence scores for each bounding box.
+- class_ids: A NumPy array of shape (N,) containing the class IDs for each bounding box.
+- masks: A list of NumPy arrays containing per-detection segmentation masks.
+  The exact shape depends on the method:
+- tracks: A list of TrackInfo objects containing tracking information for each detection.
+"""
+
+
 class DecoderType(enum.Enum):
     """Decoder type — selects the post-processing algorithm family.
 
@@ -59,6 +80,7 @@ class DecoderType(enum.Enum):
 
     Ultralytics: DecoderType
     ModelPack: DecoderType
+
 
 class DecoderVersion(enum.Enum):
     """Decoder version for Ultralytics models.
@@ -78,6 +100,7 @@ class DecoderVersion(enum.Enum):
     """YOLO11 - anchor-free DFL decoder, requires external NMS."""
     Yolo26: DecoderVersion
     """YOLO26 - end-to-end model with embedded NMS (one-to-one matching heads)."""
+
 
 class DimName(enum.Enum):
     """Named dimension for model output tensors.
@@ -106,6 +129,7 @@ class DimName(enum.Enum):
     """Padding dimension."""
     BoxCoords: DimName
     """Box coordinate dimension (typically 4)."""
+
 
 class Output:
     """A model output configuration for programmatic decoder setup.
@@ -284,6 +308,7 @@ class Output:
         """
         ...
 
+
 class Decoder:
     def __init__(
         self,
@@ -380,6 +405,28 @@ class Decoder:
     def decode(self, model_output: List[np.ndarray], max_boxes=100) -> SegDetOutput:
         """
         Decode model outputs into detection and segmentation results. When giving quantized
+        tensors as input, the quantization parameters must be specified in the Decoder configuration.
+
+        The accepted integer types are `np.uint8`, `np.int8`, `np.uint16`, `np.int16`, `np.uint32`, and `np.int32`.
+        Integer types can be mixed and matched across the different model outputs.
+
+        The accepted floating point types are `np.float16`, `np.float32` and `np.float64`. All outputs must be
+        the same floating point type.
+
+        Masks are returned at prototype resolution as 3D arrays of shape
+        ``(H, W, C)``. For instance segmentation models (e.g. YOLO) ``C=1``
+        — a binary per-instance mask (threshold at 128). For semantic
+        segmentation models (e.g. ModelPack) ``C=num_classes`` — per-pixel
+        class scores (use ``argmax`` over the last axis). Use
+        ``decode_masks()`` to get upsampled 2D binary masks.
+        """
+        ...
+
+    def decode_tracked(
+            self, tracker: ByteTrack, timestamp_ns: int, model_output: List[np.ndarray],
+            max_boxes: int = 100) -> SegDetTrackedOutput:
+        """
+        Decode model outputs into detection and segmentation results with tracking. When giving quantized
         tensors as input, the quantization parameters must be specified in the Decoder configuration.
 
         The accepted integer types are `np.uint8`, `np.int8`, `np.uint16`, `np.int16`, `np.uint32`, and `np.int32`.
@@ -630,6 +677,7 @@ class Decoder:
 
     @score_threshold.setter
     def score_threshold(self, value: float): ...
+
     @property
     def iou_threshold(self) -> float:
         """
@@ -640,6 +688,7 @@ class Decoder:
 
     @iou_threshold.setter
     def iou_threshold(self, value: float): ...
+
     @property
     def nms(self) -> Optional[Nms]:
         """
@@ -655,6 +704,7 @@ class Decoder:
         Returns True if normalized, False if pixel coordinates, or None if unknown.
         """
         ...
+
 
 class TensorMemory(enum.Enum):
     if sys.platform == "linux":
@@ -676,6 +726,7 @@ class TensorMemory(enum.Enum):
     """
     MEM: TensorMemory
     """Regular system memory allocation"""
+
 
 class Tensor:
     if sys.platform == "linux":
@@ -961,6 +1012,7 @@ class Tensor:
         """Whether this image uses a planar pixel layout."""
         ...
 
+
 class TensorMap:
     def unmap(self) -> None: ...
     def view(self) -> memoryview: ...
@@ -972,6 +1024,7 @@ class TensorMap:
     def __releasebuffer__(self, view) -> None: ...
     def __enter__(self) -> TensorMap: ...
     def __exit__(self, _exc_type, _exc_value, _traceback) -> None: ...
+
 
 class PixelFormat(enum.Enum):
     """Pixel format for image tensors."""
@@ -1010,6 +1063,7 @@ class PixelFormat(enum.Enum):
     def __init__(self, name: str) -> None:
         """Create a PixelFormat from a string name (e.g. 'RGBA', 'NV12', 'GREY')."""
         ...
+
 
 class Normalization(enum.Enum):
     DEFAULT: Normalization
@@ -1054,6 +1108,7 @@ class Normalization(enum.Enum):
     | `np.float64` | value             |
     """
 
+
 class Flip(enum.Enum):
     NoFlip: Flip
     """No flip"""
@@ -1061,6 +1116,7 @@ class Flip(enum.Enum):
     """Flip the image horizontally"""
     Vertical: Flip
     """Flip the image vertically"""
+
 
 class Rotation(enum.Enum):
     Rotate0: Rotation
@@ -1080,6 +1136,7 @@ class Rotation(enum.Enum):
         """Get the Rotation enum variant corresponding to the specified angle in degrees clockwise. Valid angles are 0, 90, 180, and 270."""
         ...
 
+
 class Rect:
     """A crop rectangle defined by its top-left corner (left, top) and its dimensions (width, height)."""
 
@@ -1092,6 +1149,7 @@ class Rect:
     def width(self) -> int: ...
     @property
     def height(self) -> int: ...
+
 
 class EglDisplayKind:
     """Identifies the type of EGL display used for headless OpenGL ES rendering.
@@ -1114,6 +1172,7 @@ class EglDisplayKind:
     PlatformDevice: EglDisplayKind
     Default: EglDisplayKind
 
+
 class EglDisplayInfo:
     """A validated, available EGL display discovered by probe_egl_displays()."""
 
@@ -1126,6 +1185,7 @@ class EglDisplayInfo:
     def description(self) -> str:
         """Human-readable description for logging/diagnostics."""
         ...
+
 
 def probe_egl_displays() -> list[EglDisplayInfo]:
     """Probe for available EGL displays supporting headless OpenGL ES 3.0.
@@ -1140,6 +1200,7 @@ def probe_egl_displays() -> list[EglDisplayInfo]:
     """
     ...
 
+
 class ImageProcessor:
     """Convert images between different formats, with optional rotation, flipping, and cropping."""
 
@@ -1152,6 +1213,7 @@ class ImageProcessor:
                 available displays. Ignored if EDGEFIRST_DISABLE_GL=1.
         """
         ...
+
     def draw_masks(
         self,
         dst: Tensor,
@@ -1304,5 +1366,86 @@ class ImageProcessor:
 
         Args:
             mode: Interpolation mode string.
+        """
+
+
+class TrackInfo:
+    def __init__(self,
+                 uuid: str,
+                 tracked_location: Tuple[float, float, float, float],
+                 count: int,
+                 created: int,
+                 last_updated: int) -> None:
+        """Information about a single tracked object."""
+        ...
+
+    @property
+    def uuid(self) -> str:
+        """The unique identifier for the tracked object."""
+        ...
+
+    @property
+    def tracked_location(self) -> Tuple[float, float, float, float]:
+        """The current bounding box of the tracked object in (x1, y1, x2, y2) format."""
+        ...
+
+    @property
+    def count(self) -> int:
+        """The number of consecutive frames the object has been tracked for."""
+        ...
+
+    @property
+    def created(self) -> int:
+        """The timestamp (in nanoseconds) when the track was created."""
+        ...
+
+    @property
+    def last_updated(self) -> int:
+        """The timestamp (in nanoseconds) when the track was last updated."""
+        ...
+
+
+
+class ActiveTrackInfo:
+    def __init__(self,
+                 info: TrackInfo,
+                 bbox: Tuple[float, float, float, float],
+                 score: float,
+                 label: int) -> None:
+        """Information about an actively tracked object."""
+        ...
+
+    @property
+    def info(self) -> TrackInfo:
+        """The information about the tracked object."""
+        ...
+
+    @property
+    def last_box(self) -> Tuple[Tuple[float, float, float, float], float, int]:
+        """The last bounding box, score, and class ID of the tracked object."""
+        ...
+
+
+class ByteTrack:
+    def __init__(self, high_conf=0.7, iou=0.25, update=0.25, lifespan_ns=500_000_000) -> None:
+        """Create a new ByteTrack tracker."""
+        ...
+
+    def update(
+        self,
+        boxes: npt.NDArray[np.float32],
+        scores: npt.NDArray[np.float32],
+        labels: npt.NDArray[np.uintp],
+        timestamp_ns: int,
+    ) -> List[Optional[TrackInfo]]:
+        """
+        Update the tracker with new detections for the current timestamp.
+        Returns a list of tracks corresponding to the input after the update.
+        """
+        ...
+
+    def get_active_tracks(self) -> List[ActiveTrackInfo]:
+        """
+        Get the list of currently active tracks.
         """
         ...
