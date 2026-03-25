@@ -728,13 +728,12 @@ typedef struct hal_track_info {
  * first (8-byte aligned), then smaller `int` and enum fields (4 bytes
  * each) at the end. Total size: 96 bytes on LP64.
  *
- * # Versioning
- *
- * The companion `hal_dmabuf_get_tensor_info()` function accepts an
- * `info_size` parameter so that the struct can grow in future versions
+ * @par Versioning
+ * The companion hal_dmabuf_get_tensor_info() function accepts an
+ * info_size parameter so that the struct can grow in future versions
  * without breaking ABI. Implementations must zero-initialize the
- * struct with `memset(info, 0, info_size)` before populating it, and
- * only write fields whose offset + size fits within `info_size`.
+ * struct with memset(info, 0, info_size) before populating it, and
+ * only write fields whose offset + size fits within info_size.
  */
 typedef struct hal_dmabuf_tensor_info {
   /**
@@ -746,7 +745,7 @@ typedef struct hal_dmabuf_tensor_info {
    */
   size_t offset;
   /**
-   * Tensor dimensions (up to [`HAL_DMABUF_MAX_NDIM`]).
+   * Tensor dimensions (up to HAL_DMABUF_MAX_NDIM).
    *
    * Uses a literal length so cbindgen can emit the array in the C header.
    */
