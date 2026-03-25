@@ -10,7 +10,7 @@ use crate::error::set_error;
 use crate::{check_null, check_null_ret_null};
 use edgefirst_decoder::DetectBox;
 use edgefirst_tracker::bytetrack::ByteTrack;
-use edgefirst_tracker::{DetectionBox, TrackInfo, Tracker};
+use edgefirst_tracker::{ByteTrackBuilder, TrackInfo, Tracker};
 use libc::{c_int, size_t};
 use uuid::Uuid;
 
@@ -44,37 +44,13 @@ impl From<&TrackInfo> for HalTrackInfo {
 
 /// Opaque ByteTrack tracker type.
 pub struct HalByteTrack {
-    inner: ByteTrack,
+    pub(crate) inner: ByteTrack<DetectBox>,
 }
 
 /// List of track info results.
+#[derive(Debug, Clone)]
 pub struct HalTrackInfoList {
-    tracks: Vec<TrackInfo>,
-}
-
-/// Internal wrapper to implement DetectionBox trait
-#[derive(Debug)]
-struct DetectBoxWrapper<'a> {
-    inner: &'a DetectBox,
-}
-
-impl<'a> DetectionBox for DetectBoxWrapper<'a> {
-    fn bbox(&self) -> [f32; 4] {
-        [
-            self.inner.bbox.xmin,
-            self.inner.bbox.ymin,
-            self.inner.bbox.xmax,
-            self.inner.bbox.ymax,
-        ]
-    }
-
-    fn score(&self) -> f32 {
-        self.inner.score
-    }
-
-    fn label(&self) -> usize {
-        self.inner.label
-    }
+    pub(crate) tracks: Vec<TrackInfo>,
 }
 
 // ============================================================================
@@ -83,8 +59,8 @@ impl<'a> DetectionBox for DetectBoxWrapper<'a> {
 
 /// Create a new ByteTrack tracker with specified parameters.
 ///
-/// @param track_thresh Score threshold for creating new tracks
-/// @param high_thresh High confidence threshold for first-pass matching
+/// @param track_update Smoothness threshold for track updates (high = more stable tracks, low = more responsive to changes)
+/// @param high_thresh High confidence threshold for first-pass matching and creating new tracks
 /// @param match_thresh IOU threshold for matching detections to tracks
 /// @param frame_rate Expected frame rate of the input video
 /// @param track_buffer Number of frames to keep lost tracks before deletion
@@ -93,16 +69,17 @@ impl<'a> DetectionBox for DetectBoxWrapper<'a> {
 /// - ENOMEM: Memory allocation failed
 #[no_mangle]
 pub extern "C" fn hal_bytetrack_new(
-    track_thresh: f32,
+    track_update: f32,
     high_thresh: f32,
     match_thresh: f32,
     frame_rate: c_int,
     track_buffer: c_int,
 ) -> *mut HalByteTrack {
-    let mut tracker = ByteTrack::new();
-    tracker.track_update = track_thresh;
-    tracker.track_high_conf = high_thresh;
-    tracker.track_iou = match_thresh;
+    let mut tracker = ByteTrackBuilder::new()
+        .track_update(track_update)
+        .track_high_conf(high_thresh)
+        .track_iou(match_thresh)
+        .build();
     // Convert frame rate and buffer to lifespan in nanoseconds
     // track_extra_lifespan = track_buffer frames * (1/frame_rate seconds/frame) * 1e9 ns/s
     if frame_rate > 0 {
@@ -116,7 +93,7 @@ pub extern "C" fn hal_bytetrack_new(
 /// Create a new ByteTrack tracker with default parameters.
 ///
 /// Default values:
-/// - track_thresh: 0.25
+/// - track_update: 0.25
 /// - high_thresh: 0.7
 /// - match_thresh: 0.25
 /// - track_extra_lifespan: 500ms
@@ -127,7 +104,7 @@ pub extern "C" fn hal_bytetrack_new(
 #[no_mangle]
 pub extern "C" fn hal_bytetrack_new_default() -> *mut HalByteTrack {
     Box::into_raw(Box::new(HalByteTrack {
-        inner: ByteTrack::new(),
+        inner: ByteTrackBuilder::new().build(),
     }))
 }
 
@@ -148,12 +125,8 @@ pub unsafe extern "C" fn hal_bytetrack_update(
     check_null_ret_null!(tracker, detections);
 
     let boxes = &(*detections).boxes;
-    let wrappers: Vec<DetectBoxWrapper> = boxes
-        .iter()
-        .map(|b| DetectBoxWrapper { inner: b })
-        .collect();
 
-    let results = (*tracker).inner.update(&wrappers, timestamp);
+    let results = (*tracker).inner.update(boxes, timestamp);
 
     // Collect non-None track infos
     let tracks: Vec<TrackInfo> = results.into_iter().flatten().collect();
@@ -173,7 +146,12 @@ pub unsafe extern "C" fn hal_bytetrack_get_active_tracks(
 ) -> *mut HalTrackInfoList {
     check_null_ret_null!(tracker);
 
-    let tracks = <ByteTrack as Tracker<DetectBoxWrapper>>::get_active_tracks(&(*tracker).inner);
+    let tracks = (*tracker)
+        .inner
+        .get_active_tracks()
+        .into_iter()
+        .map(|x| x.info)
+        .collect();
     Box::into_raw(Box::new(HalTrackInfoList { tracks }))
 }
 
