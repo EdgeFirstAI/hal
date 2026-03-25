@@ -30,6 +30,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`hal_decoder_draw_masks()` gains `background` and `opacity` params).
   All 7 GL fragment shaders updated with `uniform float opacity`.
 
+- **GLES 3.1 context upgrade** — EGL context creation now requests
+  GLES 3.1 (compute shaders) with automatic fallback to 3.0.
+
+### Changed
+
+- **`ImageProcessorTrait::draw_masks()` and `draw_masks_proto()`** gain a
+  new `overlay: MaskOverlay<'_>` parameter. Implementors must update their
+  trait impls. Pass `MaskOverlay::default()` for backward-compatible
+  behaviour.
+
+- **C API `hal_decoder_draw_masks()`** gains `background` (`const
+  hal_tensor*`, pass `NULL` for none) and `opacity` (`float`, pass `1.0`
+  for none) parameters before `out_boxes`. Existing C callers must update.
+
+### Performance
+
+- **Fused dequant+matmul kernel** for `materialize_segmentations()` —
+  computes `mask_coeff @ protos` directly from the i8 proto tensor without
+  allocating a 3.1 MB f32 copy. Includes fast sigmoid approximation
+  (~10× faster than libm `expf`) and 4-way loop unrolling.
+  Hybrid path speedup: 1.25–1.34× across all targets.
+
+- **Zero-copy i8 proto extraction** — `extract_proto_data_quant()` uses
+  `TypeId` specialization to avoid per-element `as_()` conversion when
+  the proto tensor is already `i8`; uses flat `to_owned()` memcpy instead.
+
+- **`SendablePtr` for `ProtoData`** in the GL threaded path — eliminates
+  an 819 KB–3.3 MB deep clone per frame.
+
+- **`glTexSubImage3D` fast path** — proto texture dimensions are tracked;
+  reuses the existing GL texture object when dimensions match (every frame
+  after the first), avoiding driver-side reallocation.
+
+- **Cached opacity uniform** — skips 28 redundant GL state changes per
+  frame on the default `opacity=1.0` path.
+
+- **GLES 3.1 compute shader for HWC→CHW proto repack** — opt-in via
+  `EDGEFIRST_PROTO_COMPUTE=1`. Uploads HWC i8 data to an SSBO and
+  transposes to `GL_TEXTURE_2D_ARRAY` via compute dispatch. 2.2–2.4×
+  speedup on the fused GL proto path (imx8mp, imx95).
+
 ## [0.12.0] - 2026-03-24
 
 ### Added
