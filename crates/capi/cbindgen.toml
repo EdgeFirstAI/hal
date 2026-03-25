@@ -71,7 +71,7 @@ sys_includes = ["stddef.h", "stdio.h"]
 no_includes = false
 
 [export]
-include = []
+include = ["HalDmabufTensorInfo"]
 exclude = []
 item_types = ["enums", "structs", "unions", "typedefs", "opaque", "functions", "constants"]
 

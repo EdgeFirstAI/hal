@@ -42,7 +42,9 @@ pub struct HalDmabufTensorInfo {
     /// Byte offset within the DMA-BUF.
     pub offset: size_t,
     /// Tensor dimensions (up to [`HAL_DMABUF_MAX_NDIM`]).
-    pub shape: [size_t; HAL_DMABUF_MAX_NDIM],
+    ///
+    /// Uses a literal length so cbindgen can emit the array in the C header.
+    pub shape: [size_t; 8],
     /// Number of valid entries in `shape`.
     pub ndim: size_t,
     /// DMA-BUF file descriptor (borrowed — do not close).
@@ -66,4 +68,5 @@ impl Default for HalDmabufTensorInfo {
 
 // Compile-time layout assertion: 11 × size_t + 1 × c_int + 1 × HalDtype
 // = 11×8 + 4 + 4 = 96 bytes on LP64 with no internal padding.
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<HalDmabufTensorInfo>() == 96);

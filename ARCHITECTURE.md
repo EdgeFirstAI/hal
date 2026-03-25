@@ -1712,11 +1712,13 @@ file descriptors as HAL tensors with full image attributes.
 
 ```
 Camera DMA-BUF
-  → hal_import_image(camera_fd, ..., width, height, format, dtype)
+  → hal_plane_descriptor (wraps camera_fd, stride, offset)
+  → hal_import_image(proc, camera_pd, NULL, width, height, format, dtype)
   → HAL Tensor with image attributes (camera source)
 
 NPU input DMA-BUF (fd/shape from hal_dmabuf_get_tensor_info)
-  → hal_import_image(npu_input_fd, ..., model_width, model_height, format, dtype)
+  → hal_plane_descriptor (wraps npu_input_fd, stride, offset)
+  → hal_import_image(proc, npu_pd, NULL, model_width, model_height, format, dtype)
   → HAL Tensor with image attributes (NPU destination)
 
 ImageProcessor::convert(camera_tensor, npu_tensor)
@@ -1733,9 +1735,10 @@ hal_dmabuf_sync_for_cpu(delegate, output_tensor_index) [optional]
 
 Both camera and NPU input tensors are imported via `hal_import_image()` so
 that `convert()` has the pixel format, dimensions, stride, and plane metadata
-it requires. This is mandatory — `hal_tensor_from_fd()` creates raw tensors
-without image attributes and cannot be used as a `convert()` source or
-destination.
+it requires. `hal_tensor_from_fd()` creates raw tensors without image
+attributes; to use such tensors as a `convert()` source or destination you
+must either import them as images (via `hal_import_image()`) or attach the
+required image metadata (for example with `hal_tensor_set_format()`).
 
 Output DMA-BUF access via `hal_dmabuf_get_tensor_info()` is optional and
 depends on the use case: useful when feeding outputs to GPU (e.g., mask
