@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::decoder::{convert_detect_box, PyDecoder, PyDetOutput};
+use crate::decoder::{convert_detect_box, PyDecoder};
 use crate::tensor::PyTensor;
+use crate::tracker::PyTrackInfo;
 use edgefirst_hal::{
     decoder::{BoundingBox, DetectBox, Segmentation},
     image::{self, Crop, Flip, ImageProcessorConfig, ImageProcessorTrait, Rect, Rotation},
@@ -1022,20 +1023,24 @@ impl PyImageProcessor {
     /// For detection-only models, this falls back to the standard rendering
     /// path.
     ///
-    /// Returns `(boxes, scores, classes)` — no mask arrays are returned.
+    /// When `tracker` is provided, object tracking is performed and the
+    /// return value includes a `tracks` list:
+    /// `(boxes, scores, classes, tracks)`.
+    ///
+    /// Without a tracker the return value is `(boxes, scores, classes)`.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (decoder, model_output, dst, max_boxes=100, background=None, opacity=1.0))]
+    #[pyo3(signature = (decoder, model_output, dst, tracker=None, timestamp=None, background=None, opacity=1.0))]
     pub fn draw_masks<'py>(
         &mut self,
         decoder: &PyDecoder,
         model_output: Vec<PyRef<'py, crate::tensor::PyTensor>>,
         dst: &mut PyTensor,
-        max_boxes: usize,
+        tracker: Option<&mut crate::tracker::PyByteTrack>,
+        timestamp: Option<u64>,
         background: Option<&PyTensor>,
         opacity: f32,
         py: Python<'py>,
-    ) -> PyResult<PyDetOutput<'py>> {
-        let _ = max_boxes; // capacity managed by ImageProcessor::draw_masks
+    ) -> PyResult<Py<PyAny>> {
         let tensor_refs: Vec<&edgefirst_hal::tensor::TensorDyn> =
             model_output.iter().map(|t| &t.0).collect();
 
@@ -1054,14 +1059,33 @@ impl PyImageProcessor {
             .0
             .lock()
             .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
-        let output_boxes = l
-            .draw_masks(&decoder.decoder, &tensor_refs, &mut dst.0, overlay)
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("draw_masks: {e:#?}"))
-            })?;
 
-        let (boxes, scores, classes) = convert_detect_box(py, &output_boxes);
-        Ok((boxes, scores, classes))
+        if let Some(t) = tracker {
+            let ts = timestamp.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos() as u64
+            });
+            let (output_boxes, output_tracks) = l
+                .draw_masks_tracked(&decoder.decoder, t, ts, &tensor_refs, &mut dst.0, overlay)
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("draw_masks_tracked: {e:#?}"))
+                })?;
+
+            let (boxes, scores, classes) = convert_detect_box(py, &output_boxes);
+            let tracks: Vec<PyTrackInfo> = output_tracks.into_iter().map(|ti| ti.into()).collect();
+            Ok((boxes, scores, classes, tracks).into_pyobject(py)?.into())
+        } else {
+            let output_boxes = l
+                .draw_masks(&decoder.decoder, &tensor_refs, &mut dst.0, overlay)
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("draw_masks: {e:#?}"))
+                })?;
+
+            let (boxes, scores, classes) = convert_detect_box(py, &output_boxes);
+            Ok((boxes, scores, classes).into_pyobject(py)?.into())
+        }
     }
 
     /// Create an image with the processor's optimal memory backend.

@@ -416,7 +416,7 @@ class Decoder:
     def decode_tracked(
         self,
         tracker: ByteTrack,
-        timestamp_ns: int,
+        timestamp: int,
         model_output: List[Tensor],
         max_boxes: int = 100,
     ) -> SegDetTrackedOutput:
@@ -435,148 +435,9 @@ class Decoder:
 
         Args:
             tracker: ByteTrack tracker instance.
-            timestamp_ns: Frame timestamp in nanoseconds.
+            timestamp: Frame timestamp in nanoseconds.
             model_output: List of HAL Tensor objects from model inference.
             max_boxes: Maximum number of detections to return (default: 100).
-        """
-        ...
-
-    @staticmethod
-    def decode_yolo_det(
-        model_output: Union[
-            npt.NDArray[np.uint8],
-            npt.NDArray[np.int8],
-            npt.NDArray[np.float32],
-            npt.NDArray[np.float64],
-        ],
-        quant_boxes: Tuple[float, int] = (1.0, 0),
-        score_threshold: float = 0.1,
-        iou_threshold: float = 0.7,
-        nms: Optional[Nms] = Nms.ClassAgnostic,
-        max_boxes: int = 100,
-    ) -> DetectionOutput:
-        """
-        Decode YOLO outputs into detection results. When giving float tensors as input, the quantization
-        parameters will be ignored.
-
-        The accepted types are `np.uint8`, `np.int8`, `np.float32` and `np.float64`. All outputs must be
-        the same type.
-
-        Args:
-            model_output: YOLO model output tensor.
-            quant_boxes: Quantization parameters (scale, zero_point) for boxes.
-            score_threshold: Minimum confidence score for detections.
-            iou_threshold: IoU threshold for non-maximum suppression.
-            nms: NMS mode - Nms.ClassAgnostic (default), Nms.ClassAware, or None to bypass NMS.
-            max_boxes: Maximum number of boxes to return.
-        """
-        ...
-
-    @staticmethod
-    def decode_yolo_segdet(
-        boxes: Union[
-            npt.NDArray[np.uint8], npt.NDArray[np.int8], npt.NDArray[np.float32]
-        ],
-        protos: Union[
-            npt.NDArray[np.uint8], npt.NDArray[np.int8], npt.NDArray[np.float32]
-        ],
-        quant_boxes: Tuple[float, int] = (1.0, 0),
-        quant_protos: Tuple[float, int] = (1.0, 0),
-        score_threshold: float = 0.1,
-        iou_threshold: float = 0.7,
-        nms: Optional[Nms] = Nms.ClassAgnostic,
-        max_boxes: int = 100,
-    ) -> SegDetOutput:
-        """
-        Decode YOLO outputs into detection segmentation results. When giving float tensors as input, the quantization
-        parameters will be ignored.
-
-        The accepted types are `np.uint8`, `np.int8`, `np.float32` and `np.float64`. All outputs must be
-        the same type.
-
-        Args:
-            boxes: YOLO box output tensor.
-            protos: YOLO proto output tensor.
-            quant_boxes: Quantization parameters (scale, zero_point) for boxes.
-            quant_protos: Quantization parameters (scale, zero_point) for protos.
-            score_threshold: Minimum confidence score for detections.
-            iou_threshold: IoU threshold for non-maximum suppression.
-            nms: NMS mode - Nms.ClassAgnostic (default), Nms.ClassAware, or None to bypass NMS.
-            max_boxes: Maximum number of boxes to return.
-        """
-        ...
-
-    @staticmethod
-    def decode_modelpack_det(
-        boxes: Union[
-            npt.NDArray[np.uint8], npt.NDArray[np.int8], npt.NDArray[np.float32]
-        ],
-        scores: Union[
-            npt.NDArray[np.uint8], npt.NDArray[np.int8], npt.NDArray[np.float32]
-        ],
-        quant_boxes: Tuple[float, int] = (1.0, 0),
-        quant_scores: Tuple[float, int] = (1.0, 0),
-        score_threshold: float = 0.1,
-        iou_threshold: float = 0.7,
-        max_boxes: int = 100,
-    ) -> DetectionOutput:
-        """
-        Decode ModelPack outputs into detection results. When giving float tensors as input, the quantization
-        parameters will be ignored.
-
-        The accepted types are `np.uint8`, `np.int8`, `np.float32` and `np.float64`. All outputs must be
-        the same type.
-        """
-        ...
-
-    @staticmethod
-    def decode_modelpack_det_split(
-        boxes: List[
-            Union[npt.NDArray[np.uint8], npt.NDArray[np.int8], npt.NDArray[np.float32]]
-        ],
-        anchors: List[List[List[float]]],
-        quant: List[Tuple[float, int]] = [],
-        score_threshold: float = 0.1,
-        iou_threshold: float = 0.7,
-        max_boxes: int = 100,
-    ) -> DetectionOutput:
-        """
-        Decode ModelPack outputs into detection results. When giving float tensors as input, the quantization
-        parameters will be ignored.
-
-        The accepted types are `np.uint8`, `np.int8`, `np.float32` and `np.float64`. All outputs must be
-        the same type.
-        """
-        ...
-
-    @staticmethod
-    def dequantize(
-        quantized: Union[
-            npt.NDArray[np.uint8],
-            npt.NDArray[np.int8],
-            npt.NDArray[np.uint16],
-            npt.NDArray[np.int16],
-            npt.NDArray[np.uint32],
-            npt.NDArray[np.int32],
-        ],
-        quant_boxes: Tuple[float, int],
-        dequant_into: Union[npt.NDArray[np.float32], npt.NDArray[np.float64]],
-    ) -> None:
-        """
-        Dequantize a quantized tensor into a floating point tensor.
-        The destination tensor must have the same shape as the input tensor.
-        """
-        ...
-
-    @staticmethod
-    def segmentation_to_mask(
-        segmentation: npt.NDArray[np.uint8],
-    ) -> npt.NDArray[np.uint8]:
-        """
-        Converts a 3D segmentation tensor into a 2D mask.
-
-        Raises:
-            ValueError: If the segmentation tensor has an invalid shape.
         """
         ...
 
@@ -1160,10 +1021,19 @@ class ImageProcessor:
         decoder: Decoder,
         model_output: List[Tensor],
         dst: Tensor,
-        max_boxes: int = 100,
+        tracker: Optional[ByteTrack] = None,
+        timestamp: Optional[int] = None,
         background: Optional[Tensor] = None,
         opacity: float = 1.0,
-    ) -> DetectionOutput:
+    ) -> Union[
+        DetectionOutput,
+        Tuple[
+            npt.NDArray[np.float32],
+            npt.NDArray[np.float32],
+            npt.NDArray[np.uintp],
+            List[TrackInfo],
+        ],
+    ]:
         """
         Decode model outputs and draw colored masks directly onto the
         destination image in a single fused call. This is the fastest path
@@ -1174,7 +1044,12 @@ class ImageProcessor:
         renderer which evaluates the mask at every output pixel. For
         detection-only models, this falls back to the standard drawing path.
 
-        Returns ``(boxes, scores, classes)`` -- no mask arrays are returned.
+        When ``tracker`` is provided, object tracking is performed and the
+        return value includes a ``tracks`` list:
+        ``(boxes, scores, classes, tracks)``. If ``timestamp`` is omitted,
+        the current system time in nanoseconds is used.
+
+        Without a tracker the return value is ``(boxes, scores, classes)``.
 
         Args:
             decoder: Decoder instance for interpreting model outputs.
@@ -1182,7 +1057,9 @@ class ImageProcessor:
             dst: Destination image tensor to draw onto. Must be ``RGBA`` or
                 ``RGB`` for CPU backend, or ``RGBA``/``BGRA``/``RGB`` for
                 OpenGL backend.
-            max_boxes: Maximum number of detections to return (default: 100).
+            tracker: Optional ByteTrack tracker for object tracking.
+            timestamp: Optional frame timestamp in nanoseconds. Only used
+                when ``tracker`` is provided. Defaults to current system time.
             background: Optional tensor to use as the compositing base instead
                 of ``dst``'s existing content. Must have the same dimensions
                 and format as ``dst``.
