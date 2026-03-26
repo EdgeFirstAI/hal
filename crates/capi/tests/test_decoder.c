@@ -730,7 +730,7 @@ static void test_decoder_tracked_end_to_end_segdet_split_proto(void) {
     struct hal_tensor* image = hal_tensor_new_image(400, 400, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
     ASSERT_NOT_NULL(image);
 
-    int rc = hal_image_processor_draw_masks_fused_tracked(
+    int rc = hal_image_processor_draw_masks_tracked(
         processor, decoder, tracker, 0, outputs, 5, image, NULL, 1.0f, &box_list, &track_list
     );
     
@@ -766,7 +766,7 @@ static void test_decoder_tracked_end_to_end_segdet_split_proto(void) {
     seg_list = NULL;
     track_list = NULL;
 
-    rc = hal_image_processor_draw_masks_fused_tracked(
+    rc = hal_image_processor_draw_masks_tracked(
         processor, decoder, tracker, 100000000 / 3, outputs, 5, image, NULL, 1.0f, &box_list, &track_list
     );
 

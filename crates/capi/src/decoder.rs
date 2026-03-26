@@ -2992,7 +2992,7 @@ outputs:
             let mut box_list: *mut HalDetectBoxList = std::ptr::null_mut();
             let mut track_list: *mut HalTrackInfoList = std::ptr::null_mut();
 
-            let rc = crate::image::hal_image_processor_draw_masks_fused_tracked(
+            let rc = crate::image::hal_image_processor_draw_masks_tracked(
                 processor,
                 decoder,
                 tracker,
@@ -3035,7 +3035,7 @@ outputs:
             box_list = std::ptr::null_mut();
             track_list = std::ptr::null_mut();
 
-            let rc = crate::image::hal_image_processor_draw_masks_fused_tracked(
+            let rc = crate::image::hal_image_processor_draw_masks_tracked(
                 processor,
                 decoder,
                 tracker,
@@ -3254,7 +3254,7 @@ outputs:
             let mut box_list: *mut HalDetectBoxList = std::ptr::null_mut();
             let mut track_list: *mut HalTrackInfoList = std::ptr::null_mut();
 
-            let rc = crate::image::hal_image_processor_draw_masks_fused_tracked(
+            let rc = crate::image::hal_image_processor_draw_masks_tracked(
                 processor,
                 decoder,
                 tracker,
@@ -3297,7 +3297,7 @@ outputs:
             box_list = std::ptr::null_mut();
             track_list = std::ptr::null_mut();
 
-            let rc = crate::image::hal_image_processor_draw_masks_fused_tracked(
+            let rc = crate::image::hal_image_processor_draw_masks_tracked(
                 processor,
                 decoder,
                 tracker,

@@ -559,8 +559,8 @@ The HAL provides two workflows for consuming these masks:
 
 | Workflow | Python | Rust | C | CPU | OpenGL | G2D |
 |----------|--------|------|---|:---:|:------:|:---:|
-| **Draw** — fused overlay onto image | `processor.draw_masks_fused()` | `draw_masks_proto()` | `hal_image_processor_draw_masks_fused()` | Yes | Yes | No |
-| **Draw pre-decoded** — draw already-decoded masks | `processor.draw_masks()` | `draw_masks()` | `hal_image_processor_draw_masks()` | Yes | Yes | No |
+| **Draw** — fused overlay onto image | `processor.draw_masks()` | `draw_masks_proto()` | `hal_image_processor_draw_masks()` | Yes | Yes | No |
+| **Draw pre-decoded** — draw already-decoded masks | `processor.draw_decoded_masks()` | `draw_masks()` | `hal_image_processor_draw_decoded_masks()` | Yes | Yes | No |
 
 > **G2D limitation:** The NXP G2D hardware accelerator does not support mask
 > rendering. On platforms where G2D is the primary image processor (e.g.
@@ -572,8 +572,8 @@ The HAL provides two workflows for consuming these masks:
 
 | Use case | Recommended API | Why |
 |----------|----------------|-----|
-| Overlay colored masks onto a display frame | `processor.draw_masks_fused()` | Fused path — masks never leave Rust/GPU, lowest latency |
-| Draw masks you already have (e.g. from a previous `decode()` call) | `processor.draw_masks()` | Accepts pre-decoded `(H, W, C)` mask arrays |
+| Overlay colored masks onto a display frame | `processor.draw_masks()` | Fused path — masks never leave Rust/GPU, lowest latency |
+| Draw masks you already have (e.g. from a previous `decode()` call) | `processor.draw_decoded_masks()` | Accepts pre-decoded `(H, W, C)` mask arrays |
 
 **Format requirements:**
 
@@ -1076,7 +1076,7 @@ on i.MX8/i.MX95 targets.
 Run: `cargo bench -p edgefirst-image --bench mask_benchmark`
 
 **Python benchmarks** (`tests/bench_decode_render.py`):
-- `decode() + draw_masks()` — 2-step path (decode to proto-res masks, then draw)
+- `decode() + draw_decoded_masks()` — 2-step path (decode to proto-res masks, then draw)
 - `draw_masks() [fused]` — single-call fused decode+draw path
 
 Run: `python tests/bench_decode_render.py [--iterations N] [--json results.json]`

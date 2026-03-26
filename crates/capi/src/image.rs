@@ -217,7 +217,7 @@ impl From<HalCrop> for Crop {
 ///
 /// The ImageProcessor handles format conversion with hardware acceleration when available.
 pub struct HalImageProcessor {
-    /// Accessible to other modules for fused draw_masks operations.
+    /// Accessible to other modules for draw_masks operations.
     pub(crate) inner: ImageProcessor,
 }
 
@@ -824,7 +824,7 @@ pub unsafe extern "C" fn hal_image_processor_convert(
 /// - EINVAL: Invalid argument (NULL processor or dst, or background == dst)
 /// - EIO: Drawing failed
 #[no_mangle]
-pub unsafe extern "C" fn hal_image_processor_draw_masks(
+pub unsafe extern "C" fn hal_image_processor_draw_decoded_masks(
     processor: *mut HalImageProcessor,
     dst: *mut HalTensor,
     detections: *const HalDetectBoxList,
@@ -875,7 +875,7 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks(
 ///
 /// This is the fused path: for segmentation models, prototype data is passed
 /// directly to the renderer without materializing intermediate mask arrays.
-/// For detection-only models, this falls back to decode + draw_masks.
+/// For detection-only models, this falls back to decode + draw_decoded_masks.
 ///
 /// @param processor Image processor handle
 /// @param decoder Decoder handle
@@ -890,7 +890,7 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks(
 /// - EINVAL: Invalid argument (NULL processor/decoder/outputs/dst/out_boxes)
 /// - EIO: Decoding or drawing failed
 #[no_mangle]
-pub unsafe extern "C" fn hal_image_processor_draw_masks_fused(
+pub unsafe extern "C" fn hal_image_processor_draw_masks(
     processor: *mut HalImageProcessor,
     decoder: *const HalDecoder,
     outputs: *const *const HalTensor,
@@ -1032,7 +1032,7 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks_fused(
 /// This is the fused tracked path: for segmentation models, prototype data is
 /// passed directly to the renderer without materializing intermediate mask
 /// arrays. Object tracking is applied to maintain identities across frames.
-/// For detection-only models, this falls back to tracked decode + draw_masks.
+/// For detection-only models, this falls back to tracked decode + draw_decoded_masks.
 ///
 /// @param processor Image processor handle
 /// @param decoder Decoder handle
@@ -1050,7 +1050,7 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks_fused(
 /// - EINVAL: Invalid argument (NULL processor/decoder/tracker/outputs/dst/out_boxes, or background == dst)
 /// - EIO: Decoding or drawing failed
 #[no_mangle]
-pub unsafe extern "C" fn hal_image_processor_draw_masks_fused_tracked(
+pub unsafe extern "C" fn hal_image_processor_draw_masks_tracked(
     processor: *mut HalImageProcessor,
     decoder: *const HalDecoder,
     tracker: *mut HalByteTrack,
@@ -1219,7 +1219,7 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks_fused_tracked(
 /// Set class colors for segmentation rendering.
 ///
 /// Colors are used when drawing segmentation masks via
-/// hal_image_processor_draw_masks(). Each color is an RGBA tuple.
+/// hal_image_processor_draw_decoded_masks(). Each color is an RGBA tuple.
 ///
 /// @param processor Image processor handle
 /// @param colors Pointer to array of RGBA color tuples ([u8; 4] per color)
@@ -2110,7 +2110,7 @@ mod tests {
     }
 
     #[test]
-    fn test_image_processor_draw_masks_null_params() {
+    fn test_image_processor_draw_decoded_masks_null_params() {
         unsafe {
             let processor = hal_image_processor_new();
             if processor.is_null() {
@@ -2128,7 +2128,7 @@ mod tests {
 
             // NULL processor
             assert_eq!(
-                hal_image_processor_draw_masks(
+                hal_image_processor_draw_decoded_masks(
                     std::ptr::null_mut(),
                     dst,
                     std::ptr::null(),
@@ -2141,7 +2141,7 @@ mod tests {
 
             // NULL dst
             assert_eq!(
-                hal_image_processor_draw_masks(
+                hal_image_processor_draw_decoded_masks(
                     processor,
                     std::ptr::null_mut(),
                     std::ptr::null(),

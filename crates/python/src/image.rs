@@ -926,7 +926,7 @@ impl PyImageProcessor {
 
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (dst, bbox, scores, classes, seg=vec![], background=None, opacity=1.0))]
-    pub fn draw_masks(
+    pub fn draw_decoded_masks(
         &mut self,
         dst: &mut PyTensor,
         bbox: PyReadonlyArray2<f32>,
@@ -1018,7 +1018,7 @@ impl PyImageProcessor {
 
     /// Decode model outputs and draw masks directly onto the destination
     /// image in a single call. Masks never leave Rust, eliminating the
-    /// Python round-trip overhead of `decode()` + `draw_masks()`.
+    /// Python round-trip overhead of `decode()` + `draw_decoded_masks()`.
     ///
     /// For segmentation models, prototype data is passed directly to the
     /// renderer without materializing intermediate mask arrays in Python.
@@ -1028,7 +1028,7 @@ impl PyImageProcessor {
     /// Returns `(boxes, scores, classes)` — no mask arrays are returned.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (decoder, model_output, dst, max_boxes=100, background=None, opacity=1.0))]
-    pub fn draw_masks_fused<'py>(
+    pub fn draw_masks<'py>(
         &mut self,
         decoder: &PyDecoder,
         model_output: ListOfReadOnlyArrayGenericDyn,
