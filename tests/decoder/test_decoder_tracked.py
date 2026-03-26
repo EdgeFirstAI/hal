@@ -5,12 +5,38 @@
 import edgefirst_hal
 import numpy as np
 
-from conftest import numpy_to_tensor
-
 
 def _t(arr):
     """Shorthand to convert a numpy array to a HAL Tensor."""
     return numpy_to_tensor(arr)
+
+
+def numpy_to_tensor(arr, mem=None):
+    import edgefirst_hal
+
+    dtype_map = {
+        "int8": "int8",
+        "uint8": "uint8",
+        "int16": "int16",
+        "uint16": "uint16",
+        "int32": "int32",
+        "uint32": "uint32",
+        "int64": "int64",
+        "uint64": "uint64",
+        "float32": "float32",
+        "float64": "float64",
+    }
+    import numpy as np
+
+    hal_dtype = dtype_map.get(str(arr.dtype))
+    if hal_dtype is None:
+        raise ValueError(f"Unsupported numpy dtype: {arr.dtype}")
+    arr = np.ascontiguousarray(arr)
+    tensor = edgefirst_hal.Tensor(list(arr.shape), dtype=hal_dtype, mem=mem)
+    with tensor.map() as m:
+        dst = np.frombuffer(m, dtype=arr.dtype).reshape(arr.shape)
+        np.copyto(dst, arr)
+    return tensor
 
 
 def test_tracker():
