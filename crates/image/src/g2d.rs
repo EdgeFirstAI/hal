@@ -180,7 +180,11 @@ impl G2DProcessor {
         }
 
         if let Some(crop_rect) = crop.dst_rect {
-            dst_surface.planes[0] += ((crop_rect.top * dst_surface.width as usize + crop_rect.left)
+            // stride is in pixels; multiply by bytes-per-pixel (== channels()
+            // for u8 data) to get the byte offset.  All G2D destination
+            // formats are packed, so channels() == bpp always holds here.
+            dst_surface.planes[0] += ((crop_rect.top * dst_surface.stride as usize
+                + crop_rect.left)
                 * dst_fmt.channels()) as u64;
 
             dst_surface.right = crop_rect.width as i32;
@@ -284,7 +288,12 @@ fn tensor_to_g2d_surface(img: &Tensor<u8>) -> Result<G2DSurface> {
 
     // NV12 is a two-plane format: Y plane followed by interleaved UV plane.
     // planes[0] = Y plane start, planes[1] = UV plane start (Y size = width * height)
+    //
+    // plane_offset is the byte offset within the DMA-BUF where pixel data
+    // starts.  G2D works with raw physical addresses so we must add the
+    // offset ourselves — the hardware has no concept of a per-plane offset.
     let base_addr = phys.address();
+    let luma_offset = img.plane_offset().unwrap_or(0) as u64;
     let planes = if fmt == PixelFormat::Nv12 {
         if img.is_multiplane() {
             // Multiplane: UV in separate DMA-BUF, get its physical address
@@ -293,22 +302,33 @@ fn tensor_to_g2d_surface(img: &Tensor<u8>) -> Result<G2DSurface> {
                 Error::NotImplemented("g2d multiplane chroma must be DMA-backed".to_string())
             })?;
             let uv_phys: G2DPhysical = chroma_dma.fd.as_raw_fd().try_into()?;
-            [base_addr, uv_phys.address(), 0]
+            let chroma_offset = img.chroma().and_then(|c| c.plane_offset()).unwrap_or(0) as u64;
+            [
+                base_addr + luma_offset,
+                uv_phys.address() + chroma_offset,
+                0,
+            ]
         } else {
             let w = img.width().unwrap();
             let h = img.height().unwrap();
             let stride = img.effective_row_stride().unwrap_or(w);
-            let offset = img.plane_offset().unwrap_or(0);
-            let uv_offset = (offset + stride * h) as u64;
-            [base_addr, base_addr + uv_offset, 0]
+            let uv_offset = (luma_offset as usize + stride * h) as u64;
+            [base_addr + luma_offset, base_addr + uv_offset, 0]
         }
     } else {
-        [base_addr, 0, 0]
+        [base_addr + luma_offset, 0, 0]
     };
 
     let w = img.width().unwrap();
     let h = img.height().unwrap();
     let fourcc = pixelfmt_to_fourcc(fmt);
+
+    // G2D stride is in pixels.  effective_row_stride() returns bytes, so
+    // divide by the bytes-per-pixel (channels for u8 data) to convert.
+    let stride_pixels = img
+        .effective_row_stride()
+        .map(|s| s / fmt.channels())
+        .unwrap_or(w);
 
     Ok(G2DSurface {
         planes,
@@ -317,7 +337,7 @@ fn tensor_to_g2d_surface(img: &Tensor<u8>) -> Result<G2DSurface> {
         top: 0,
         right: w as i32,
         bottom: h as i32,
-        stride: w as i32,
+        stride: stride_pixels as i32,
         width: w as i32,
         height: h as i32,
         blendfunc: 0,
@@ -1198,5 +1218,187 @@ mod g2d_tests {
             );
         }
         Ok(())
+    }
+
+    // =========================================================================
+    // tensor_to_g2d_surface offset & stride unit tests
+    //
+    // These tests verify that plane_offset and effective_row_stride are
+    // correctly propagated into the G2DSurface.  They require DMA memory
+    // but do NOT require G2D hardware — only the DMA_BUF_IOCTL_PHYS ioctl.
+    // =========================================================================
+
+    /// Helper: build a DMA-backed Tensor<u8> with an optional plane_offset
+    /// and an optional row stride, then return the G2DSurface.
+    fn surface_for(
+        width: usize,
+        height: usize,
+        fmt: PixelFormat,
+        offset: Option<usize>,
+        row_stride: Option<usize>,
+    ) -> Result<G2DSurface, crate::Error> {
+        use edgefirst_tensor::TensorMemory;
+        let mut t = Tensor::<u8>::image(width, height, fmt, Some(TensorMemory::Dma))?;
+        if let Some(o) = offset {
+            t.set_plane_offset(o);
+        }
+        if let Some(s) = row_stride {
+            t.set_row_stride_unchecked(s);
+        }
+        tensor_to_g2d_surface(&t)
+    }
+
+    #[test]
+    fn g2d_surface_single_plane_no_offset() {
+        if !is_dma_available() {
+            return;
+        }
+        let s = surface_for(640, 480, PixelFormat::Rgba, None, None).unwrap();
+        // planes[0] must be non-zero (valid physical address), no offset
+        assert_ne!(s.planes[0], 0);
+        assert_eq!(s.stride, 640);
+    }
+
+    #[test]
+    fn g2d_surface_single_plane_with_offset() {
+        if !is_dma_available() {
+            return;
+        }
+        use edgefirst_tensor::TensorMemory;
+        let mut t =
+            Tensor::<u8>::image(640, 480, PixelFormat::Rgba, Some(TensorMemory::Dma)).unwrap();
+        let s0 = tensor_to_g2d_surface(&t).unwrap();
+        t.set_plane_offset(4096);
+        let s1 = tensor_to_g2d_surface(&t).unwrap();
+        assert_eq!(s1.planes[0], s0.planes[0] + 4096);
+    }
+
+    #[test]
+    fn g2d_surface_single_plane_zero_offset() {
+        if !is_dma_available() {
+            return;
+        }
+        use edgefirst_tensor::TensorMemory;
+        let mut t =
+            Tensor::<u8>::image(640, 480, PixelFormat::Rgba, Some(TensorMemory::Dma)).unwrap();
+        let s_none = tensor_to_g2d_surface(&t).unwrap();
+        t.set_plane_offset(0);
+        let s_zero = tensor_to_g2d_surface(&t).unwrap();
+        // offset=0 should produce the same address as no offset
+        assert_eq!(s_none.planes[0], s_zero.planes[0]);
+    }
+
+    #[test]
+    fn g2d_surface_stride_rgba() {
+        if !is_dma_available() {
+            return;
+        }
+        // Default stride: width in pixels = 640
+        let s_default = surface_for(640, 480, PixelFormat::Rgba, None, None).unwrap();
+        assert_eq!(s_default.stride, 640);
+
+        // Custom stride: 2816 bytes / 4 channels = 704 pixels
+        let s_custom = surface_for(640, 480, PixelFormat::Rgba, None, Some(2816)).unwrap();
+        assert_eq!(s_custom.stride, 704);
+    }
+
+    #[test]
+    fn g2d_surface_stride_rgb() {
+        if !is_dma_available() {
+            return;
+        }
+        let s_default = surface_for(640, 480, PixelFormat::Rgb, None, None).unwrap();
+        assert_eq!(s_default.stride, 640);
+
+        // Padded: 1980 bytes / 3 channels = 660 pixels
+        let s_custom = surface_for(640, 480, PixelFormat::Rgb, None, Some(1980)).unwrap();
+        assert_eq!(s_custom.stride, 660);
+    }
+
+    #[test]
+    fn g2d_surface_stride_grey() {
+        if !is_dma_available() {
+            return;
+        }
+        // Grey (Y800) may not be supported by all G2D hardware versions
+        let s = match surface_for(640, 480, PixelFormat::Grey, None, Some(1024)) {
+            Ok(s) => s,
+            Err(crate::Error::G2D(..)) => return,
+            Err(e) => panic!("unexpected error: {e:?}"),
+        };
+        // Grey: 1 channel. stride in bytes = stride in pixels
+        assert_eq!(s.stride, 1024);
+    }
+
+    #[test]
+    fn g2d_surface_contiguous_nv12_offset() {
+        if !is_dma_available() {
+            return;
+        }
+        use edgefirst_tensor::TensorMemory;
+        let mut t =
+            Tensor::<u8>::image(640, 480, PixelFormat::Nv12, Some(TensorMemory::Dma)).unwrap();
+        let s0 = tensor_to_g2d_surface(&t).unwrap();
+
+        t.set_plane_offset(8192);
+        let s1 = tensor_to_g2d_surface(&t).unwrap();
+
+        // Luma plane should shift by offset
+        assert_eq!(s1.planes[0], s0.planes[0] + 8192);
+        // UV plane = base + offset + stride * height
+        // Without offset: UV = base + 640 * 480 = base + 307200
+        // With offset 8192: UV = base + 8192 + 640 * 480 = base + 315392
+        assert_eq!(s1.planes[1], s0.planes[1] + 8192);
+    }
+
+    #[test]
+    fn g2d_surface_contiguous_nv12_stride() {
+        if !is_dma_available() {
+            return;
+        }
+        // NV12: 1 byte per pixel for Y. stride 640 bytes = 640 pixels.
+        let s = surface_for(640, 480, PixelFormat::Nv12, None, None).unwrap();
+        assert_eq!(s.stride, 640);
+
+        // Padded stride: 1024 bytes = 1024 pixels (NV12 channels = 1)
+        let s_padded = surface_for(640, 480, PixelFormat::Nv12, None, Some(1024)).unwrap();
+        assert_eq!(s_padded.stride, 1024);
+    }
+
+    #[test]
+    fn g2d_surface_multiplane_nv12_offset() {
+        if !is_dma_available() {
+            return;
+        }
+        use edgefirst_tensor::TensorMemory;
+
+        // Create luma and chroma as separate DMA tensors
+        let mut luma =
+            Tensor::<u8>::new(&[480, 640], Some(TensorMemory::Dma), Some("luma")).unwrap();
+        let mut chroma =
+            Tensor::<u8>::new(&[240, 640], Some(TensorMemory::Dma), Some("chroma")).unwrap();
+
+        // Get baseline physical addresses with no offsets
+        let luma_base = {
+            let dma = luma.as_dma().unwrap();
+            let phys: G2DPhysical = dma.fd.as_raw_fd().try_into().unwrap();
+            phys.address()
+        };
+        let chroma_base = {
+            let dma = chroma.as_dma().unwrap();
+            let phys: G2DPhysical = dma.fd.as_raw_fd().try_into().unwrap();
+            phys.address()
+        };
+
+        // Set offsets and build multiplane tensor
+        luma.set_plane_offset(4096);
+        chroma.set_plane_offset(2048);
+        let combined = Tensor::<u8>::from_planes(luma, chroma, PixelFormat::Nv12).unwrap();
+        let s = tensor_to_g2d_surface(&combined).unwrap();
+
+        // Luma should include its offset
+        assert_eq!(s.planes[0], luma_base + 4096);
+        // Chroma should include its offset
+        assert_eq!(s.planes[1], chroma_base + 2048);
     }
 }
