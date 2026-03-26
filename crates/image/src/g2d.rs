@@ -230,7 +230,7 @@ impl ImageProcessorTrait for G2DProcessor {
         self.convert_impl(src, dst, rotation, flip, crop)
     }
 
-    fn draw_masks(
+    fn draw_decoded_masks(
         &mut self,
         _dst: &mut TensorDyn,
         _detect: &[crate::DetectBox],
@@ -242,7 +242,7 @@ impl ImageProcessorTrait for G2DProcessor {
         ))
     }
 
-    fn draw_masks_proto(
+    fn draw_proto_masks(
         &mut self,
         _dst: &mut TensorDyn,
         _detect: &[crate::DetectBox],

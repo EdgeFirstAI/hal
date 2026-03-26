@@ -27,7 +27,7 @@ enum GLProcessorMessage {
         Vec<[u8; 4]>,
         tokio::sync::oneshot::Sender<Result<(), Error>>,
     ),
-    DrawMasks(
+    DrawDecodedMasks(
         SendablePtr<TensorDyn>,
         SendablePtr<DetectBox>,
         SendablePtr<Segmentation>,
@@ -35,7 +35,7 @@ enum GLProcessorMessage {
         Option<SendablePtr<TensorDyn>>, // background
         tokio::sync::oneshot::Sender<Result<(), Error>>,
     ),
-    DrawMasksProto(
+    DrawProtoMasks(
         SendablePtr<TensorDyn>,
         SendablePtr<DetectBox>,
         SendablePtr<ProtoData>,
@@ -186,10 +186,10 @@ impl GLProcessorThreaded {
                         GLProcessorMessage::ImageConvert(.., resp) => {
                             let _ = resp.send(Err(poison_err));
                         }
-                        GLProcessorMessage::DrawMasks(.., resp) => {
+                        GLProcessorMessage::DrawDecodedMasks(.., resp) => {
                             let _ = resp.send(Err(poison_err));
                         }
-                        GLProcessorMessage::DrawMasksProto(.., resp) => {
+                        GLProcessorMessage::DrawProtoMasks(.., resp) => {
                             let _ = resp.send(Err(poison_err));
                         }
                         GLProcessorMessage::SetColors(_, resp) => {
@@ -232,8 +232,8 @@ impl GLProcessorThreaded {
                             }
                         });
                     }
-                    GLProcessorMessage::DrawMasks(mut dst, det, seg, opacity, bg, resp) => {
-                        // SAFETY: This is safe because the draw_masks() function waits for the
+                    GLProcessorMessage::DrawDecodedMasks(mut dst, det, seg, opacity, bg, resp) => {
+                        // SAFETY: This is safe because the draw_decoded_masks() function waits for the
                         // resp to be sent before dropping the borrow for dst, detect,
                         // segmentation, and background
                         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -243,7 +243,7 @@ impl GLProcessorThreaded {
                             let seg =
                                 unsafe { std::slice::from_raw_parts(seg.ptr.as_ptr(), seg.len) };
                             let bg_ref = bg.map(|p| unsafe { &*p.ptr.as_ptr() });
-                            gl_converter.draw_masks(
+                            gl_converter.draw_decoded_masks(
                                 dst,
                                 det,
                                 seg,
@@ -258,13 +258,13 @@ impl GLProcessorThreaded {
                             Err(e) => {
                                 poisoned = true;
                                 Err(crate::Error::Internal(format!(
-                                    "GL thread panicked during DrawMasks: {}",
+                                    "GL thread panicked during DrawDecodedMasks: {}",
                                     panic_message(e.as_ref()),
                                 )))
                             }
                         });
                     }
-                    GLProcessorMessage::DrawMasksProto(
+                    GLProcessorMessage::DrawProtoMasks(
                         mut dst,
                         det,
                         proto_data,
@@ -272,7 +272,7 @@ impl GLProcessorThreaded {
                         bg,
                         resp,
                     ) => {
-                        // SAFETY: Same safety invariant as DrawMasks — caller
+                        // SAFETY: Same safety invariant as DrawDecodedMasks — caller
                         // blocks on resp before dropping borrows.
                         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                             let dst = unsafe { dst.ptr.as_mut() };
@@ -280,7 +280,7 @@ impl GLProcessorThreaded {
                                 unsafe { std::slice::from_raw_parts(det.ptr.as_ptr(), det.len) };
                             let bg_ref = bg.map(|p| unsafe { &*p.ptr.as_ptr() });
                             let proto_data = unsafe { proto_data.ptr.as_ref() };
-                            gl_converter.draw_masks_proto(
+                            gl_converter.draw_proto_masks(
                                 dst,
                                 det,
                                 proto_data,
@@ -295,7 +295,7 @@ impl GLProcessorThreaded {
                             Err(e) => {
                                 poisoned = true;
                                 Err(crate::Error::Internal(format!(
-                                    "GL thread panicked during DrawMasksProto: {}",
+                                    "GL thread panicked during DrawProtoMasks: {}",
                                     panic_message(e.as_ref()),
                                 )))
                             }
@@ -488,7 +488,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
         })?
     }
 
-    fn draw_masks(
+    fn draw_decoded_masks(
         &mut self,
         dst: &mut TensorDyn,
         detect: &[crate::DetectBox],
@@ -499,7 +499,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
         self.sender
             .as_ref()
             .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
-            .blocking_send(GLProcessorMessage::DrawMasks(
+            .blocking_send(GLProcessorMessage::DrawDecodedMasks(
                 SendablePtr {
                     ptr: NonNull::from(dst),
                     len: 1,
@@ -525,7 +525,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
         })?
     }
 
-    fn draw_masks_proto(
+    fn draw_proto_masks(
         &mut self,
         dst: &mut TensorDyn,
         detect: &[DetectBox],
@@ -536,7 +536,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
         self.sender
             .as_ref()
             .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
-            .blocking_send(GLProcessorMessage::DrawMasksProto(
+            .blocking_send(GLProcessorMessage::DrawProtoMasks(
                 SendablePtr {
                     ptr: NonNull::from(dst),
                     len: 1,

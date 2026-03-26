@@ -217,7 +217,7 @@ impl From<HalCrop> for Crop {
 ///
 /// The ImageProcessor handles format conversion with hardware acceleration when available.
 pub struct HalImageProcessor {
-    /// Accessible to other modules for draw_masks operations.
+    /// Accessible to other modules for draw_decoded_masks / draw_proto_masks operations.
     pub(crate) inner: ImageProcessor,
 }
 
@@ -857,7 +857,7 @@ pub unsafe extern "C" fn hal_image_processor_draw_decoded_masks(
     };
 
     try_or_errno!(
-        unsafe { &mut (*processor) }.inner.draw_masks(
+        unsafe { &mut (*processor) }.inner.draw_decoded_masks(
             &mut unsafe { &mut (*dst) }.inner,
             detect_slice,
             seg_slice,
@@ -964,7 +964,7 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks(
         if let Some(proto_data) = proto_result {
             // Fused path: render directly from proto data
             try_or_errno!(
-                (*processor).inner.draw_masks_proto(
+                (*processor).inner.draw_proto_masks(
                     &mut (*dst).inner,
                     &boxes,
                     &proto_data,
@@ -973,7 +973,7 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks(
                 libc::EIO
             );
         } else {
-            // Detection-only fallback: full decode + draw_masks
+            // Detection-only fallback: full decode + draw_decoded_masks
             let mut masks: Vec<Segmentation> = Vec::new();
             try_or_errno!(
                 (*decoder)
@@ -984,7 +984,7 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks(
             try_or_errno!(
                 (*processor)
                     .inner
-                    .draw_masks(&mut (*dst).inner, &boxes, &masks, overlay),
+                    .draw_decoded_masks(&mut (*dst).inner, &boxes, &masks, overlay),
                 libc::EIO
             );
         }
@@ -998,7 +998,7 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks(
 
         if let Some(proto_data) = proto_result {
             try_or_errno!(
-                (*processor).inner.draw_masks_proto(
+                (*processor).inner.draw_proto_masks(
                     &mut (*dst).inner,
                     &boxes,
                     &proto_data,
@@ -1017,7 +1017,7 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks(
             try_or_errno!(
                 (*processor)
                     .inner
-                    .draw_masks(&mut (*dst).inner, &boxes, &masks, overlay),
+                    .draw_decoded_masks(&mut (*dst).inner, &boxes, &masks, overlay),
                 libc::EIO
             );
         }
@@ -1131,7 +1131,7 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks_tracked(
         if let Some(proto_data) = proto_result {
             // Fused path: render directly from proto data
             try_or_errno!(
-                (*processor).inner.draw_masks_proto(
+                (*processor).inner.draw_proto_masks(
                     &mut (*dst).inner,
                     &boxes,
                     &proto_data,
@@ -1140,7 +1140,7 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks_tracked(
                 libc::EIO
             );
         } else {
-            // Detection-only fallback: full tracked decode + draw_masks
+            // Detection-only fallback: full tracked decode + draw_decoded_masks
             let mut masks: Vec<Segmentation> = Vec::new();
             try_or_errno!(
                 (*decoder).inner.decode_tracked_float(
@@ -1156,7 +1156,7 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks_tracked(
             try_or_errno!(
                 (*processor)
                     .inner
-                    .draw_masks(&mut (*dst).inner, &boxes, &masks, overlay),
+                    .draw_decoded_masks(&mut (*dst).inner, &boxes, &masks, overlay),
                 libc::EIO
             );
         }
@@ -1176,7 +1176,7 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks_tracked(
 
         if let Some(proto_data) = proto_result {
             try_or_errno!(
-                (*processor).inner.draw_masks_proto(
+                (*processor).inner.draw_proto_masks(
                     &mut (*dst).inner,
                     &boxes,
                     &proto_data,
@@ -1201,7 +1201,7 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks_tracked(
             try_or_errno!(
                 (*processor)
                     .inner
-                    .draw_masks(&mut (*dst).inner, &boxes, &masks, overlay),
+                    .draw_decoded_masks(&mut (*dst).inner, &boxes, &masks, overlay),
                 libc::EIO
             );
         }

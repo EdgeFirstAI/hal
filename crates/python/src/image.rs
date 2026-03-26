@@ -1012,7 +1012,7 @@ impl PyImageProcessor {
             background: background.map(|b| &b.0),
             opacity: opacity.clamp(0.0, 1.0),
         };
-        l.draw_masks(&mut dst.0, &detect, &seg, overlay)?;
+        l.draw_decoded_masks(&mut dst.0, &detect, &seg, overlay)?;
         Ok(())
     }
 
@@ -1127,9 +1127,9 @@ impl PyImageProcessor {
             .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
         if let Some(proto_data) = proto_result {
             // Fused path: render directly from proto data (masks stay in Rust)
-            l.draw_masks_proto(&mut dst.0, &output_boxes, &proto_data, overlay)
+            l.draw_proto_masks(&mut dst.0, &output_boxes, &proto_data, overlay)
                 .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!("draw_masks_proto: {e:#?}"))
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("draw_proto_masks: {e:#?}"))
                 })?;
         } else {
             // Detection-only or unsupported model: fall back to standard decode + render
@@ -1200,9 +1200,9 @@ impl PyImageProcessor {
             if let Err(e) = result {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")));
             }
-            l.draw_masks(&mut dst.0, &output_boxes, &output_masks, overlay)
+            l.draw_decoded_masks(&mut dst.0, &output_boxes, &output_masks, overlay)
                 .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!("draw_masks: {e:#?}"))
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("draw_decoded_masks: {e:#?}"))
                 })?;
         }
 
