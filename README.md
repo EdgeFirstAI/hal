@@ -31,7 +31,7 @@ pip install edgefirst-hal
 #### Rust
 ```toml
 [dependencies]
-edgefirst-hal = "0.10"
+edgefirst-hal = "0.13"
 ```
 
 ### Basic Usage
@@ -779,7 +779,7 @@ The HAL includes dedicated benchmark binaries for measuring performance across p
 | `tensor_benchmark` | `edgefirst-tensor` | Tensor allocation and map/unmap latency across buffer types (Heap, SHM, DMA) |
 | `image_benchmark` | `edgefirst-image` | Low-level image operations: crop, flip, rotate, resize, draw |
 | `pipeline_benchmark` | `edgefirst-image` | Letterbox pipeline and format conversion (camera→model input) |
-| `mask_benchmark` | `edgefirst-image` | Mask rendering: draw_masks, draw_masks_proto, hybrid path |
+| `mask_benchmark` | `edgefirst-image` | Mask rendering: draw_decoded_masks, draw_proto_masks, hybrid path |
 | `opencv_benchmark` | `edgefirst-image` | OpenCV baseline comparison for same operations |
 | `decoder_benchmark` | `edgefirst-decoder` | YOLO detection/segmentation post-processing, NMS, dequantization |
 

@@ -17,8 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Protos` outputs are provided.  Supported in all decode paths (float,
   quantized, and proto variants).
 
-- **`MaskOverlay` compositing options** for `draw_masks()` and
-  `draw_masks_proto()` — new `overlay` parameter with two controls:
+- **`MaskOverlay` compositing options** for `draw_decoded_masks()` and
+  `draw_proto_masks()` — new `overlay` parameter with two controls:
   - `background: Option<&TensorDyn>` — when set, copies the background
     image into `dst` before compositing masks, allowing masks to be
     rendered over a separate frame.
@@ -36,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **`ImageProcessorTrait::draw_masks()` and `draw_masks_proto()`** gain a
+- **`ImageProcessorTrait::draw_decoded_masks()` and `draw_proto_masks()`** gain a
   new `overlay: MaskOverlay<'_>` parameter. Implementors must update their
   trait impls. Pass `MaskOverlay::default()` for backward-compatible
   behaviour.
@@ -48,11 +48,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     The method now accepts an optional `tracker=` keyword argument for
     tracked inference. `decoder.decode()` now accepts `List[Tensor]`
     (previously `List[np.ndarray]`).
-  - **C API**: `hal_decoder_draw_masks()` and `hal_decoder_draw_masks_tracked()`
+  - **C API**: `hal_decoder_draw_masks()` and `hal_decoder_decode_tracked_draw_masks()`
     removed. Use `hal_image_processor_draw_masks()` and
     `hal_image_processor_draw_masks_tracked()` (processor is now the
     first parameter).
-  - **Rust**: No change to the internal `ImageProcessorTrait` API.
+  - **Rust**: Trait methods were renamed (`draw_masks` → `draw_decoded_masks`,
+    `draw_masks_proto` → `draw_proto_masks`) and gained an `overlay` parameter.
 
 - **C API `hal_image_processor_draw_masks()`** gains `background`
   (`const hal_tensor*`, pass `NULL` for none) and `opacity` (`float`, pass
@@ -98,9 +99,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Mask FBO, PBO, and atlas rendering infrastructure in the GL backend
   - `bench_decode_masks_atlas` benchmark
 
-  Use `draw_masks()` / `draw_masks_proto()` for GPU-accelerated mask
-  overlay, or `materialize_segmentations()` + `draw_masks()` for the
-  hybrid CPU decode path.
+  Use `draw_proto_masks()` for GPU-accelerated mask overlay, or
+  `materialize_segmentations()` + `draw_decoded_masks()` for the hybrid
+  CPU decode path.
 
 - **Python static helper methods on `Decoder`** — the following static/class
   methods have been removed. Use the `Decoder` instance API instead:
@@ -189,6 +190,7 @@ shows before/after code for each one.
 // Use TensorDyn API instead. ArrayViewDQuantized is no longer part of the
 // public API surface.
 ```
+
 ## [0.13.1] - 2026-03-26
 
 ### Fixed

@@ -399,7 +399,7 @@ All CPU-only (decoder is not GPU-accelerated).
 
 **640×640 RGBA destination, ~2 detections (YOLOv8n-seg):**
 
-| Platform | Compute | Buffer | draw_masks (pre-decoded) | draw_masks_proto (fused) | hybrid_materialize_and_draw |
+| Platform | Compute | Buffer | draw_decoded_masks (pre-decoded) | draw_proto_masks (fused) | hybrid_materialize_and_draw |
 |----------|---------|--------|------------------------|------------------------|---------------------------|
 | imx8mp-frdm | GL | DMA | 2.6 ms | 5.9 ms | 5.9 ms |
 | imx8mp-frdm | CPU | Heap | 5.9 ms | 80.2 ms | 9.0 ms |
@@ -412,9 +412,9 @@ All CPU-only (decoder is not GPU-accelerated).
 
 **Hybrid Path Comparison (CPU materialize + GL overlay vs fused GPU):**
 
-The hybrid path decodes masks on CPU (`materialize_segmentations`) then overlays via GL (`draw_masks`). This is faster than fused GPU `draw_masks_proto` on all tested platforms. The auto-selection in `ImageProcessor::draw_masks_proto()` now prefers the hybrid path when both CPU and OpenGL backends are available.
+The hybrid path decodes masks on CPU (`materialize_segmentations`) then overlays via GL (`draw_decoded_masks`). This is faster than fused GPU `draw_proto_masks` on all tested platforms. The auto-selection in `ImageProcessor::draw_proto_masks()` now prefers the hybrid path when both CPU and OpenGL backends are available.
 
-| Platform | Full GPU (GL draw_masks_proto) | Hybrid (GL) | Speedup | Auto draw_masks_proto |
+| Platform | Full GPU (GL draw_proto_masks) | Hybrid (GL) | Speedup | Auto draw_proto_masks |
 |----------|-------------------------------|-------------|---------|----------------------|
 | imx8mp-frdm | 5.9 ms | 5.9 ms | **1.0×** | 5.9 ms |
 | imx95-frdm | 5.5 ms | 5.3 ms | **1.0×** | 5.5 ms |
@@ -607,7 +607,7 @@ The binary requires a DMA-heap device (`/dev/dma_heap/linux,cma` or `/dev/dma_he
 
 5. **x86-desktop OpenGL cannot import YUV textures** — NVIDIA PBO path does not support YUYV/NV12/VYUY source textures. OpenGL letterbox and convert benchmarks show "—" for YUV source formats on this platform.
 
-6. **imx95-frdm GL DMA-buf slower than PBO for letterbox** — v1.2 benchmarks labelled imx95-frdm GL as "DMA" but were actually running on PBO (EGL extension query bug caused DMA-buf roundtrip probe to fail). After fixing the extension query (v1.3), GL now uses true DMA-buf import. DMA-buf letterbox 1080p→640 YUYV→RGBA is 3.4ms vs 1.4ms on PBO — the DMA-buf import/export overhead exceeds PBO zero-copy bind. G2D improved (3.5ms from 3.9ms). Fused mask rendering (`draw_masks_proto`) dramatically improved: 5.2ms from 25.2ms (**4.8× faster**).
+6. **imx95-frdm GL DMA-buf slower than PBO for letterbox** — v1.2 benchmarks labelled imx95-frdm GL as "DMA" but were actually running on PBO (EGL extension query bug caused DMA-buf roundtrip probe to fail). After fixing the extension query (v1.3), GL now uses true DMA-buf import. DMA-buf letterbox 1080p→640 YUYV→RGBA is 3.4ms vs 1.4ms on PBO — the DMA-buf import/export overhead exceeds PBO zero-copy bind. G2D improved (3.5ms from 3.9ms). Fused mask rendering (`draw_proto_masks`) dramatically improved: 5.2ms from 25.2ms (**4.8× faster**).
 
 7. **BGRA framebuffer CPU byte-swap overhead** — BGRA textures as framebuffer attachments have GPU-dependent swizzle behavior (some implementations don't swizzle fragment shader output). Workaround uses RGBA format internally with CPU-side R↔B byte swaps on upload and readback. RGBA→BGRA conversion on imx95-frdm GL went from 3.4ms (v1.2 PBO, no swap needed) to 26.5ms (v1.3 DMA + CPU swap). CPU backend RGBA→BGRA is 24.5ms for reference.
 
