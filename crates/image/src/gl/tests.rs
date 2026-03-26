@@ -1907,4 +1907,388 @@ mod gl_tests {
             "GPU did not write at the RGB offset position — destination is still sentinel"
         );
     }
+
+    // ---------------------------------------------------------------
+    // Neutron-scenario tests: large buffer + large offset
+    //
+    // These replicate the geometry of the EDGEAI-1192 bug (Neutron NPU
+    // DMA-BUF at offset 3,450,400 in a 10 MB buffer) using standard
+    // dma_heap allocations so no NPU driver is needed.
+    // ---------------------------------------------------------------
+
+    /// Direct reproduction of the Neutron scenario: 640×640 RGB int8
+    /// destination at offset 3,450,400 inside a ~10 MB DMA buffer.
+    /// Exercises the two-pass `convert_to_packed_rgb` with `is_int8=true`.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_neutron_scenario_large_offset_rgb_int8() {
+        use edgefirst_tensor::PlaneDescriptor;
+        use std::os::fd::AsFd;
+
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        let total_size: usize = 10_276_864; // Neutron shared buffer size
+        let offset: usize = 3_450_400; // Neutron input tensor offset
+        let image_bytes: usize = 640 * 640 * 3; // RGB
+
+        let large_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::Dma), None) {
+            Ok(buf) => buf,
+            Err(_) => {
+                eprintln!(
+                    "SKIPPED: {} - cannot allocate {} MB DMA buffer",
+                    function!(),
+                    total_size / 1_048_576
+                );
+                return;
+            }
+        };
+        large_buf.map().unwrap().as_mut_slice().fill(0xAA);
+
+        let fd = large_buf.as_dma().unwrap().fd.as_fd();
+        let plane = PlaneDescriptor::new(fd).unwrap().with_offset(offset);
+        let proc = crate::ImageProcessor::new().unwrap();
+        let mut dst = proc
+            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::I8)
+            .unwrap();
+
+        let src = load_raw_image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Dma),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.nv12"
+            )),
+        )
+        .unwrap();
+
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap();
+
+        // Verify: sentinel intact before offset
+        let map = large_buf.map().unwrap();
+        let buf = map.as_slice();
+        let untouched = &buf[..offset];
+        assert!(
+            untouched.iter().all(|&b| b == 0xAA),
+            "GPU wrote before the offset boundary"
+        );
+
+        // Verify: rendered data at offset
+        let rendered = &buf[offset..offset + image_bytes];
+        assert!(
+            rendered.iter().any(|&b| b != 0xAA),
+            "GPU did not write at the offset position — destination is still sentinel"
+        );
+    }
+
+    /// Isolate two-pass vs single-pass: same large offset, RGBA U8
+    /// (single-pass EGLImage) vs RGB I8 (two-pass convert_to_packed_rgb).
+    /// If RGBA succeeds and RGB fails, the bug is in the two-pass path.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_neutron_scenario_rgba_vs_rgb_isolation() {
+        use edgefirst_tensor::PlaneDescriptor;
+        use std::os::fd::AsFd;
+
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        let total_size: usize = 10_276_864;
+        let offset: usize = 3_450_400;
+
+        let src = load_raw_image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Dma),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.nv12"
+            )),
+        )
+        .unwrap();
+
+        // --- RGBA U8 at large offset (single-pass path) ---
+        let rgba_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::Dma), None) {
+            Ok(buf) => buf,
+            Err(_) => {
+                eprintln!("SKIPPED: {} - cannot allocate DMA buffer", function!());
+                return;
+            }
+        };
+        rgba_buf.map().unwrap().as_mut_slice().fill(0xAA);
+
+        let fd = rgba_buf.as_dma().unwrap().fd.as_fd();
+        let plane = PlaneDescriptor::new(fd).unwrap().with_offset(offset);
+        let proc = crate::ImageProcessor::new().unwrap();
+        let mut dst_rgba = proc
+            .import_image(plane, None, 640, 640, PixelFormat::Rgba, DType::U8)
+            .unwrap();
+
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let rgba_result = gl.convert(
+            &src,
+            &mut dst_rgba,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        );
+        assert!(
+            rgba_result.is_ok(),
+            "RGBA U8 single-pass at large offset failed: {:?}",
+            rgba_result.err()
+        );
+
+        // --- RGB I8 at same large offset (two-pass path) ---
+        let rgb_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::Dma), None) {
+            Ok(buf) => buf,
+            Err(_) => {
+                eprintln!(
+                    "SKIPPED: {} - cannot allocate second DMA buffer",
+                    function!()
+                );
+                return;
+            }
+        };
+        rgb_buf.map().unwrap().as_mut_slice().fill(0xAA);
+
+        let fd = rgb_buf.as_dma().unwrap().fd.as_fd();
+        let plane = PlaneDescriptor::new(fd).unwrap().with_offset(offset);
+        let mut dst_rgb = proc
+            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::I8)
+            .unwrap();
+
+        let rgb_result = gl.convert(
+            &src,
+            &mut dst_rgb,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        );
+        assert!(
+            rgb_result.is_ok(),
+            "RGB I8 two-pass at large offset failed (RGBA succeeded): {:?}",
+            rgb_result.err()
+        );
+    }
+
+    /// Isolate int8 shader: same two-pass RGB path, but U8 vs I8 dtype.
+    /// If RGB U8 succeeds and RGB I8 fails, the int8 shader interacts
+    /// poorly with large-offset FBOs.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_neutron_scenario_rgb_u8_vs_int8() {
+        use edgefirst_tensor::PlaneDescriptor;
+        use std::os::fd::AsFd;
+
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        let total_size: usize = 10_276_864;
+        let offset: usize = 3_450_400;
+
+        let src = load_raw_image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Dma),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.nv12"
+            )),
+        )
+        .unwrap();
+
+        let proc = crate::ImageProcessor::new().unwrap();
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+
+        // --- RGB U8 at large offset (two-pass, packed_rgba8_program_2d) ---
+        let u8_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::Dma), None) {
+            Ok(buf) => buf,
+            Err(_) => {
+                eprintln!("SKIPPED: {} - cannot allocate DMA buffer", function!());
+                return;
+            }
+        };
+        u8_buf.map().unwrap().as_mut_slice().fill(0xAA);
+
+        let fd = u8_buf.as_dma().unwrap().fd.as_fd();
+        let plane = PlaneDescriptor::new(fd).unwrap().with_offset(offset);
+        let mut dst_u8 = proc
+            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::U8)
+            .unwrap();
+
+        let u8_result = gl.convert(
+            &src,
+            &mut dst_u8,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        );
+        assert!(
+            u8_result.is_ok(),
+            "RGB U8 two-pass at large offset failed: {:?}",
+            u8_result.err()
+        );
+
+        // --- RGB I8 at same large offset (two-pass, packed_rgba8_int8_program_2d) ---
+        let i8_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::Dma), None) {
+            Ok(buf) => buf,
+            Err(_) => {
+                eprintln!(
+                    "SKIPPED: {} - cannot allocate second DMA buffer",
+                    function!()
+                );
+                return;
+            }
+        };
+        i8_buf.map().unwrap().as_mut_slice().fill(0xAA);
+
+        let fd = i8_buf.as_dma().unwrap().fd.as_fd();
+        let plane = PlaneDescriptor::new(fd).unwrap().with_offset(offset);
+        let mut dst_i8 = proc
+            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::I8)
+            .unwrap();
+
+        let i8_result = gl.convert(
+            &src,
+            &mut dst_i8,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        );
+        assert!(
+            i8_result.is_ok(),
+            "RGB I8 two-pass at large offset failed (U8 succeeded): {:?}",
+            i8_result.err()
+        );
+    }
+
+    /// Check if Mali requires page-aligned EGL offsets. The Neutron offset
+    /// 3,450,400 is NOT page-aligned (3,450,400 % 4096 = 3488). Compare
+    /// against the nearest page-aligned offset below it.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_neutron_scenario_offset_alignment() {
+        use edgefirst_tensor::PlaneDescriptor;
+        use std::os::fd::AsFd;
+
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        let total_size: usize = 10_276_864;
+        let page_aligned_offset: usize = 3_448_832; // 842 * 4096
+        let neutron_offset: usize = 3_450_400; // actual Neutron offset
+
+        let src = load_raw_image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Dma),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.nv12"
+            )),
+        )
+        .unwrap();
+
+        let proc = crate::ImageProcessor::new().unwrap();
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+
+        // --- Page-aligned offset ---
+        let aligned_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::Dma), None) {
+            Ok(buf) => buf,
+            Err(_) => {
+                eprintln!("SKIPPED: {} - cannot allocate DMA buffer", function!());
+                return;
+            }
+        };
+        aligned_buf.map().unwrap().as_mut_slice().fill(0xAA);
+
+        let fd = aligned_buf.as_dma().unwrap().fd.as_fd();
+        let plane = PlaneDescriptor::new(fd)
+            .unwrap()
+            .with_offset(page_aligned_offset);
+        let mut dst_aligned = proc
+            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::I8)
+            .unwrap();
+
+        let aligned_result = gl.convert(
+            &src,
+            &mut dst_aligned,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        );
+        assert!(
+            aligned_result.is_ok(),
+            "Page-aligned offset {} failed: {:?}",
+            page_aligned_offset,
+            aligned_result.err()
+        );
+
+        // --- Non-page-aligned Neutron offset ---
+        let unaligned_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::Dma), None) {
+            Ok(buf) => buf,
+            Err(_) => {
+                eprintln!(
+                    "SKIPPED: {} - cannot allocate second DMA buffer",
+                    function!()
+                );
+                return;
+            }
+        };
+        unaligned_buf.map().unwrap().as_mut_slice().fill(0xAA);
+
+        let fd = unaligned_buf.as_dma().unwrap().fd.as_fd();
+        let plane = PlaneDescriptor::new(fd)
+            .unwrap()
+            .with_offset(neutron_offset);
+        let mut dst_unaligned = proc
+            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::I8)
+            .unwrap();
+
+        let unaligned_result = gl.convert(
+            &src,
+            &mut dst_unaligned,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        );
+        assert!(
+            unaligned_result.is_ok(),
+            "Non-page-aligned Neutron offset {} failed (page-aligned {} succeeded): {:?}",
+            neutron_offset,
+            page_aligned_offset,
+            unaligned_result.err()
+        );
+    }
 }

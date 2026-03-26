@@ -1542,35 +1542,26 @@ impl GLProcessorST {
         let dst_key = (luma_id, chroma_id);
 
         if self.last_bound_dst_egl != Some(dst_key) {
-            let dest_egl = self.get_or_create_egl_image(CacheKind::Dst, dst, dst_fmt)?;
+            // get_or_create_egl_image creates both the EGLImage and its
+            // backing renderbuffer (stored in the cache).
+            let _egl_handle = self.get_or_create_egl_image(CacheKind::Dst, dst, dst_fmt)?;
+            let rbo = self.cached_dst_renderbuffer(dst).ok_or_else(|| {
+                Error::Internal("Dst cache entry missing renderbuffer".to_owned())
+            })?;
             unsafe {
-                gls::gl::UseProgram(self.texture_program_yuv.id);
-                gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-                gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
-                gls::gl::TexParameteri(
-                    gls::gl::TEXTURE_2D,
-                    gls::gl::TEXTURE_MIN_FILTER,
-                    gls::gl::LINEAR as i32,
-                );
-                gls::gl::TexParameteri(
-                    gls::gl::TEXTURE_2D,
-                    gls::gl::TEXTURE_MAG_FILTER,
-                    gls::gl::LINEAR as i32,
-                );
-                gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, dest_egl.as_ptr());
-                gls::gl::FramebufferTexture2D(
+                gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
+                gls::gl::FramebufferRenderbuffer(
                     gls::gl::FRAMEBUFFER,
                     gls::gl::COLOR_ATTACHMENT0,
-                    gls::gl::TEXTURE_2D,
-                    self.render_texture.id,
-                    0,
+                    gls::gl::RENDERBUFFER,
+                    rbo,
                 );
                 check_gl_error(function!(), line!())?;
             }
             self.last_bound_dst_egl = Some(dst_key);
-            log::trace!("setup_renderbuffer_dma: bound new dst EGLImage id={luma_id:#x}");
+            log::trace!("setup_renderbuffer_dma: bound new dst renderbuffer id={luma_id:#x}");
         } else {
-            log::trace!("setup_renderbuffer_dma: reusing bound dst EGLImage id={luma_id:#x}");
+            log::trace!("setup_renderbuffer_dma: reusing bound dst renderbuffer id={luma_id:#x}");
         }
 
         unsafe {
@@ -2846,7 +2837,7 @@ impl GLProcessorST {
 
         // --- Pass 2: Pack intermediate RGBA → RGB DMA destination ---
         self.convert_fbo.bind();
-        let dest_egl = self.get_or_create_egl_image_rgb(
+        let _dest_egl = self.get_or_create_egl_image_rgb(
             dst,
             dst_fmt,
             render_w,
@@ -2854,26 +2845,16 @@ impl GLProcessorST {
             DrmFourcc::Abgr8888,
             4,
         )?;
+        let rbo = self.cached_dst_renderbuffer(dst).ok_or_else(|| {
+            Error::Internal("Dst cache entry missing renderbuffer (packed RGB)".to_owned())
+        })?;
         unsafe {
-            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MIN_FILTER,
-                gls::gl::NEAREST as i32,
-            );
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MAG_FILTER,
-                gls::gl::NEAREST as i32,
-            );
-            gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, dest_egl.as_ptr());
-            gls::gl::FramebufferTexture2D(
+            gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
+            gls::gl::FramebufferRenderbuffer(
                 gls::gl::FRAMEBUFFER,
                 gls::gl::COLOR_ATTACHMENT0,
-                gls::gl::TEXTURE_2D,
-                self.render_texture.id,
-                0,
+                gls::gl::RENDERBUFFER,
+                rbo,
             );
             check_gl_error(function!(), line!())?;
             gls::gl::Viewport(0, 0, render_w as i32, render_h as i32);
@@ -3910,6 +3891,26 @@ impl GLProcessorST {
         // want to have destroyed a valid cache entry for nothing.
         let egl_image_obj = self.create_image_from_dma2(img, img_fmt)?;
 
+        // Create a GL renderbuffer backed by this EGLImage for use as an FBO
+        // color attachment.  Renderbuffers work with all DMA-BUF buffer types
+        // (including kernel dma_alloc_attrs buffers that fail the texture path
+        // on some GPU drivers).
+        let rbo = if cache == CacheKind::Dst {
+            let mut rbo: u32 = 0;
+            unsafe {
+                gls::gl::GenRenderbuffers(1, &mut rbo);
+                gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
+                gls::gl::EGLImageTargetRenderbufferStorageOES(
+                    gls::gl::RENDERBUFFER,
+                    egl_image_obj.egl_image.as_ptr(),
+                );
+                check_gl_error(function!(), line!())?;
+            }
+            Some(rbo)
+        } else {
+            None
+        };
+
         // Invalidate binding state: we're inserting a new entry and may evict
         // the currently-bound one.
         match cache {
@@ -3933,11 +3934,22 @@ impl GLProcessorST {
             CachedEglImage {
                 egl_image: egl_image_obj,
                 guard,
-                renderbuffer: None,
+                renderbuffer: rbo,
                 last_used: ts,
             },
         );
         Ok(handle)
+    }
+
+    /// Look up the renderbuffer ID for a cached destination EGLImage.
+    fn cached_dst_renderbuffer(&self, img: &Tensor<u8>) -> Option<u32> {
+        let luma_id = img.buffer_identity().id();
+        let chroma_id = img.chroma().map(|t| t.buffer_identity().id());
+        let id = (luma_id, chroma_id);
+        self.dst_egl_cache
+            .entries
+            .get(&id)
+            .and_then(|entry| entry.renderbuffer)
     }
 
     /// Create an EGLImage from a DMA buffer with explicitly specified internal
@@ -4017,6 +4029,18 @@ impl GLProcessorST {
 
         let egl_image_obj = self.create_egl_image_with_dims(img, width, height, drm_format, bpp)?;
         let handle = egl_image_obj.egl_image;
+
+        let mut rbo: u32 = 0;
+        unsafe {
+            gls::gl::GenRenderbuffers(1, &mut rbo);
+            gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
+            gls::gl::EGLImageTargetRenderbufferStorageOES(
+                gls::gl::RENDERBUFFER,
+                egl_image_obj.egl_image.as_ptr(),
+            );
+            check_gl_error(function!(), line!())?;
+        }
+
         let guard = img.buffer_identity().weak();
         let ts = self.dst_egl_cache.next_timestamp();
         self.dst_egl_cache.entries.insert(
@@ -4024,7 +4048,7 @@ impl GLProcessorST {
             CachedEglImage {
                 egl_image: egl_image_obj,
                 guard,
-                renderbuffer: None,
+                renderbuffer: Some(rbo),
                 last_used: ts,
             },
         );
