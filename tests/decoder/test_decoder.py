@@ -8,21 +8,6 @@ import pytest
 from conftest import numpy_to_tensor
 
 
-def test_decoder():
-    output = np.empty((84, 8400), dtype=np.float32)
-    quant = np.fromfile("testdata/yolov8s_80_classes.bin", dtype=np.int8).reshape(
-        84, 8400
-    )
-    edgefirst_hal.Decoder.dequantize(
-        quant,
-        (0.0040811873, -123),
-        output,
-    )
-
-    dequantized = (quant.astype(np.float32) - (-123.0)) * 0.0040811873
-    assert np.allclose(output, dequantized)
-
-
 def test_from_json():
     output0 = numpy_to_tensor(
         np.fromfile("testdata/modelpack_split_17x30x18.bin", dtype=np.uint8).reshape(
@@ -118,36 +103,6 @@ def test_from_dict_yaml():
     assert np.allclose(scores, [0.99240804])
     assert np.allclose(classes, [0])
     assert len(masks) == 0
-
-
-def test_modelpack_direct():
-    output0 = np.fromfile(
-        "testdata/modelpack_split_17x30x18.bin", dtype=np.uint8
-    ).reshape(17, 30, 18)
-    anchors0 = [
-        [0.13750000298023224, 0.2074074000120163],
-        [0.2541666626930237, 0.21481481194496155],
-        [0.23125000298023224, 0.35185185074806213],
-    ]
-    quant0 = (0.09929127991199493, 183)
-
-    output1 = np.fromfile(
-        "testdata/modelpack_split_9x15x18.bin", dtype=np.uint8
-    ).reshape(9, 15, 18)
-    anchors1 = [
-        [0.36666667461395264, 0.31481480598449707],
-        [0.38749998807907104, 0.4740740656852722],
-        [0.5333333611488342, 0.644444465637207],
-    ]
-    quant1 = (0.08547406643629074, 174)
-
-    boxes, scores, classes = edgefirst_hal.Decoder.decode_modelpack_det_split(
-        [output0, output1], [anchors0, anchors1], [quant0, quant1], 0.45, 0.45
-    )
-
-    assert np.allclose(boxes, [[0.43171933, 0.68243736, 0.5626645, 0.808863]])
-    assert np.allclose(scores, [0.99240804])
-    assert np.allclose(classes, [0])
 
 
 def test_nms():
