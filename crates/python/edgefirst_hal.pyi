@@ -437,47 +437,6 @@ class Decoder:
         """
         ...
 
-    def draw_masks(
-        self,
-        model_output: List[np.ndarray],
-        processor: ImageProcessor,
-        dst: Tensor,
-        max_boxes: int = 100,
-        background: Optional[Tensor] = None,
-        opacity: float = 1.0,
-    ) -> DetectionOutput:
-        """
-        Decode model outputs and draw colored masks directly onto the
-        destination image in a single fused call. This is the fastest path
-        for visualization — masks never leave Rust/GPU, eliminating the
-        Python round-trip overhead of ``decode()`` + ``processor.draw_masks()``.
-
-        For segmentation models, prototype data is passed directly to the
-        renderer which evaluates the mask at every output pixel. For
-        detection-only models, this falls back to the standard drawing path.
-
-        Returns ``(boxes, scores, classes)`` — no mask arrays are returned.
-
-        Args:
-            model_output: List of model output tensors (same types as ``decode``).
-            processor: ImageProcessor instance for drawing.
-            dst: Destination image tensor to draw onto. Must be ``RGBA`` or
-                ``RGB`` for CPU backend, or ``RGBA``/``BGRA``/``RGB`` for
-                OpenGL backend.
-            max_boxes: Maximum number of detections to return (default: 100).
-            background: Optional tensor to use as the compositing base instead
-                of ``dst``'s existing content. Must have the same dimensions
-                and format as ``dst``.
-            opacity: Scales the alpha of rendered mask and box colors.
-                ``1.0`` (default) preserves the class color's alpha unchanged;
-                ``0.5`` makes overlays semi-transparent. Clamped to [0, 1].
-
-        Raises:
-            RuntimeError: If ``dst`` format is unsupported by the active backend,
-                or if the ImageProcessor uses G2D (mask rendering not supported).
-        """
-        ...
-
     @staticmethod
     def decode_yolo_det(
         model_output: Union[
@@ -1164,7 +1123,7 @@ class ImageProcessor:
         Draw detection boxes and optional segmentation masks onto ``dst``.
 
         This method draws pre-decoded results. For the fused decode+draw path
-        (recommended for most use cases), use ``Decoder.draw_masks()`` instead.
+        (recommended for most use cases), use ``draw_masks_fused()`` instead.
 
         Args:
             dst: Destination image. Must be ``RGBA`` or ``RGB`` for CPU backend,
@@ -1189,6 +1148,48 @@ class ImageProcessor:
             RuntimeError: If ``dst`` format is unsupported by the active backend.
             ValueError: If ``bbox``, ``scores``, ``classes`` lengths do not match,
                 or if ``bbox`` shape is not ``(N, 4)``.
+        """
+        ...
+
+    def draw_masks_fused(
+        self,
+        decoder: Decoder,
+        model_output: List[np.ndarray],
+        dst: Tensor,
+        max_boxes: int = 100,
+        background: Optional[Tensor] = None,
+        opacity: float = 1.0,
+    ) -> DetectionOutput:
+        """
+        Decode model outputs and draw colored masks directly onto the
+        destination image in a single fused call. This is the fastest path
+        for visualization -- masks never leave Rust/GPU, eliminating the
+        Python round-trip overhead of ``decode()`` + ``draw_masks()``.
+
+        For segmentation models, prototype data is passed directly to the
+        renderer which evaluates the mask at every output pixel. For
+        detection-only models, this falls back to the standard drawing path.
+
+        Returns ``(boxes, scores, classes)`` -- no mask arrays are returned.
+
+        Args:
+            decoder: Decoder instance for interpreting model outputs.
+            model_output: List of model output tensors (same types as
+                ``Decoder.decode``).
+            dst: Destination image tensor to draw onto. Must be ``RGBA`` or
+                ``RGB`` for CPU backend, or ``RGBA``/``BGRA``/``RGB`` for
+                OpenGL backend.
+            max_boxes: Maximum number of detections to return (default: 100).
+            background: Optional tensor to use as the compositing base instead
+                of ``dst``'s existing content. Must have the same dimensions
+                and format as ``dst``.
+            opacity: Scales the alpha of rendered mask and box colors.
+                ``1.0`` (default) preserves the class color's alpha unchanged;
+                ``0.5`` makes overlays semi-transparent. Clamped to [0, 1].
+
+        Raises:
+            RuntimeError: If ``dst`` format is unsupported by the active backend,
+                or if the ImageProcessor uses G2D (mask rendering not supported).
         """
         ...
 

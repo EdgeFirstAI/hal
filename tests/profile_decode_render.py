@@ -117,7 +117,7 @@ def main():
     print(f"Warming up ({args.warmup} iters)...", file=sys.stderr)
     for _ in range(args.warmup):
         if args.path == "fused":
-            decoder.draw_masks(outputs, processor, dst)
+            processor.draw_masks_fused(decoder, outputs, dst)
         else:
             boxes, scores, classes, masks = decoder.decode(outputs)
             processor.draw_masks(
@@ -130,7 +130,7 @@ def main():
 
     if args.path == "fused":
         for _ in range(args.iterations):
-            decoder.draw_masks(outputs, processor, dst)
+            processor.draw_masks_fused(decoder, outputs, dst)
     else:
         for _ in range(args.iterations):
             boxes, scores, classes, masks = decoder.decode(outputs)

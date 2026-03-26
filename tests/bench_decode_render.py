@@ -167,7 +167,7 @@ def bench_fused_path(decoder, processor, dst, outputs, n_iter):
     n_dets = 0
     for _ in range(n_iter):
         t0 = time.perf_counter()
-        boxes, scores, classes = decoder.draw_masks(outputs, processor, dst)
+        boxes, scores, classes = processor.draw_masks_fused(decoder, outputs, dst)
         elapsed = time.perf_counter() - t0
         times.append(elapsed * 1000)  # ms
         n_dets = len(boxes)
