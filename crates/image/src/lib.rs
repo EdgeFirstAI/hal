@@ -397,7 +397,7 @@ pub trait ImageProcessorTrait {
     /// `overlay` controls compositing: `background` replaces dst's base
     /// content; `opacity` scales mask alpha. Use `MaskOverlay::default()`
     /// for backward-compatible behaviour.
-    fn draw_masks(
+    fn draw_decoded_masks(
         &mut self,
         dst: &mut TensorDyn,
         detect: &[DetectBox],
@@ -418,10 +418,10 @@ pub trait ImageProcessorTrait {
     ///
     /// # Format requirements
     ///
-    /// Same as [`draw_masks`](Self::draw_masks). G2D returns `NotImplemented`.
+    /// Same as [`draw_decoded_masks`](Self::draw_decoded_masks). G2D returns `NotImplemented`.
     ///
-    /// `overlay` controls compositing — see [`draw_masks`](Self::draw_masks).
-    fn draw_masks_proto(
+    /// `overlay` controls compositing — see [`draw_decoded_masks`](Self::draw_decoded_masks).
+    fn draw_proto_masks(
         &mut self,
         dst: &mut TensorDyn,
         detect: &[DetectBox],
@@ -1232,7 +1232,7 @@ impl ImageProcessorTrait for ImageProcessor {
         Err(Error::NoConverter)
     }
 
-    fn draw_masks(
+    fn draw_decoded_masks(
         &mut self,
         dst: &mut TensorDyn,
         detect: &[DetectBox],
@@ -1252,19 +1252,19 @@ impl ImageProcessorTrait for ImageProcessor {
                     // CPU needs background pre-blitted
                     let overlay = overlay.apply_background(dst)?;
                     if let Some(cpu) = self.cpu.as_mut() {
-                        return cpu.draw_masks(dst, detect, segmentation, overlay);
+                        return cpu.draw_decoded_masks(dst, detect, segmentation, overlay);
                     }
                     Err(Error::ForcedBackendUnavailable("cpu".into()))
                 }
                 ForcedBackend::G2d => Err(Error::NotSupported(
-                    "g2d does not support draw_masks".into(),
+                    "g2d does not support draw_decoded_masks".into(),
                 )),
                 ForcedBackend::OpenGl => {
                     // GL handles background natively via GPU blit
                     #[cfg(target_os = "linux")]
                     #[cfg(feature = "opengl")]
                     if let Some(opengl) = self.opengl.as_mut() {
-                        return opengl.draw_masks(dst, detect, segmentation, overlay);
+                        return opengl.draw_decoded_masks(dst, detect, segmentation, overlay);
                     }
                     Err(Error::ForcedBackendUnavailable("opengl".into()))
                 }
@@ -1277,29 +1277,35 @@ impl ImageProcessorTrait for ImageProcessor {
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
         if let Some(opengl) = self.opengl.as_mut() {
-            log::trace!("draw_masks started with opengl in {:?}", start.elapsed());
-            match opengl.draw_masks(dst, detect, segmentation, overlay) {
+            log::trace!(
+                "draw_decoded_masks started with opengl in {:?}",
+                start.elapsed()
+            );
+            match opengl.draw_decoded_masks(dst, detect, segmentation, overlay) {
                 Ok(_) => {
-                    log::trace!("draw_masks with opengl in {:?}", start.elapsed());
+                    log::trace!("draw_decoded_masks with opengl in {:?}", start.elapsed());
                     return Ok(());
                 }
                 Err(e) => {
-                    log::trace!("draw_masks didn't work with opengl: {e:?}")
+                    log::trace!("draw_decoded_masks didn't work with opengl: {e:?}")
                 }
             }
         }
 
         // CPU fallback: blit background via memcpy before rendering
         let overlay = overlay.apply_background(dst)?;
-        log::trace!("draw_masks started with cpu in {:?}", start.elapsed());
+        log::trace!(
+            "draw_decoded_masks started with cpu in {:?}",
+            start.elapsed()
+        );
         if let Some(cpu) = self.cpu.as_mut() {
-            match cpu.draw_masks(dst, detect, segmentation, overlay) {
+            match cpu.draw_decoded_masks(dst, detect, segmentation, overlay) {
                 Ok(_) => {
-                    log::trace!("draw_masks with cpu in {:?}", start.elapsed());
+                    log::trace!("draw_decoded_masks with cpu in {:?}", start.elapsed());
                     return Ok(());
                 }
                 Err(e) => {
-                    log::trace!("draw_masks didn't work with cpu: {e:?}");
+                    log::trace!("draw_decoded_masks didn't work with cpu: {e:?}");
                     return Err(e);
                 }
             }
@@ -1307,7 +1313,7 @@ impl ImageProcessorTrait for ImageProcessor {
         Err(Error::NoConverter)
     }
 
-    fn draw_masks_proto(
+    fn draw_proto_masks(
         &mut self,
         dst: &mut TensorDyn,
         detect: &[DetectBox],
@@ -1326,18 +1332,18 @@ impl ImageProcessorTrait for ImageProcessor {
                 ForcedBackend::Cpu => {
                     let overlay = overlay.apply_background(dst)?;
                     if let Some(cpu) = self.cpu.as_mut() {
-                        return cpu.draw_masks_proto(dst, detect, proto_data, overlay);
+                        return cpu.draw_proto_masks(dst, detect, proto_data, overlay);
                     }
                     Err(Error::ForcedBackendUnavailable("cpu".into()))
                 }
                 ForcedBackend::G2d => Err(Error::NotSupported(
-                    "g2d does not support draw_masks_proto".into(),
+                    "g2d does not support draw_proto_masks".into(),
                 )),
                 ForcedBackend::OpenGl => {
                     #[cfg(target_os = "linux")]
                     #[cfg(feature = "opengl")]
                     if let Some(opengl) = self.opengl.as_mut() {
-                        return opengl.draw_masks_proto(dst, detect, proto_data, overlay);
+                        return opengl.draw_proto_masks(dst, detect, proto_data, overlay);
                     }
                     Err(Error::ForcedBackendUnavailable("opengl".into()))
                 }
@@ -1347,7 +1353,7 @@ impl ImageProcessorTrait for ImageProcessor {
         // skip G2D as it doesn't support rendering to image
 
         // Hybrid path: CPU materialize + GL overlay (benchmarked faster than
-        // full-GPU draw_masks_proto on all tested platforms: 27× on imx8mp,
+        // full-GPU draw_proto_masks on all tested platforms: 27× on imx8mp,
         // 4× on imx95, 2.5× on rpi5, 1.6× on x86).
         // GL handles background natively via GPU blit.
         #[cfg(target_os = "linux")]
@@ -1355,24 +1361,24 @@ impl ImageProcessorTrait for ImageProcessor {
         if let Some(opengl) = self.opengl.as_mut() {
             let Some(cpu) = self.cpu.as_ref() else {
                 return Err(Error::Internal(
-                    "draw_masks_proto requires CPU backend for hybrid path".into(),
+                    "draw_proto_masks requires CPU backend for hybrid path".into(),
                 ));
             };
             log::trace!(
-                "draw_masks_proto started with hybrid (cpu+opengl) in {:?}",
+                "draw_proto_masks started with hybrid (cpu+opengl) in {:?}",
                 start.elapsed()
             );
             let segmentation = cpu.materialize_segmentations(detect, proto_data)?;
-            match opengl.draw_masks(dst, detect, &segmentation, overlay) {
+            match opengl.draw_decoded_masks(dst, detect, &segmentation, overlay) {
                 Ok(_) => {
                     log::trace!(
-                        "draw_masks_proto with hybrid (cpu+opengl) in {:?}",
+                        "draw_proto_masks with hybrid (cpu+opengl) in {:?}",
                         start.elapsed()
                     );
                     return Ok(());
                 }
                 Err(e) => {
-                    log::trace!("draw_masks_proto hybrid path failed, falling back to cpu: {e:?}");
+                    log::trace!("draw_proto_masks hybrid path failed, falling back to cpu: {e:?}");
                 }
             }
         }
@@ -1381,11 +1387,11 @@ impl ImageProcessorTrait for ImageProcessor {
         let overlay = overlay.apply_background(dst)?;
         let Some(cpu) = self.cpu.as_mut() else {
             return Err(Error::Internal(
-                "draw_masks_proto requires CPU backend for fallback path".into(),
+                "draw_proto_masks requires CPU backend for fallback path".into(),
             ));
         };
-        log::trace!("draw_masks_proto started with cpu in {:?}", start.elapsed());
-        cpu.draw_masks_proto(dst, detect, proto_data, overlay)
+        log::trace!("draw_proto_masks started with cpu in {:?}", start.elapsed());
+        cpu.draw_proto_masks(dst, detect, proto_data, overlay)
     }
 
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<()> {
@@ -5215,7 +5221,7 @@ mod image_tests {
     // ========================================================================
 
     #[test]
-    fn test_draw_masks_proto_no_cpu_returns_error() {
+    fn test_draw_proto_masks_no_cpu_returns_error() {
         // Disable CPU backend to trigger the error path
         let original_cpu = std::env::var("EDGEFIRST_DISABLE_CPU").ok();
         unsafe { std::env::set_var("EDGEFIRST_DISABLE_CPU", "1") };
@@ -5266,15 +5272,15 @@ mod image_tests {
             protos: edgefirst_decoder::ProtoTensor::Float(ndarray::Array3::<f32>::zeros((8, 8, 4))),
         };
         let result =
-            converter.draw_masks_proto(&mut dst_dyn, &det, &proto_data, Default::default());
+            converter.draw_proto_masks(&mut dst_dyn, &det, &proto_data, Default::default());
         assert!(
             matches!(&result, Err(Error::Internal(s)) if s.contains("CPU backend")),
-            "draw_masks_proto without CPU should return Internal error: {result:?}"
+            "draw_proto_masks without CPU should return Internal error: {result:?}"
         );
     }
 
     #[test]
-    fn test_draw_masks_proto_cpu_fallback_works() {
+    fn test_draw_proto_masks_cpu_fallback_works() {
         // Force CPU-only backend to ensure the CPU fallback path executes
         let original = std::env::var("EDGEFIRST_FORCE_BACKEND").ok();
         unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "cpu") };
@@ -5311,7 +5317,7 @@ mod image_tests {
             protos: edgefirst_decoder::ProtoTensor::Float(ndarray::Array3::<f32>::zeros((8, 8, 4))),
         };
         let result =
-            converter.draw_masks_proto(&mut dst_dyn, &det, &proto_data, Default::default());
+            converter.draw_proto_masks(&mut dst_dyn, &det, &proto_data, Default::default());
         assert!(result.is_ok(), "CPU fallback path should work: {result:?}");
     }
 

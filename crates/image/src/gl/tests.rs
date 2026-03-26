@@ -60,7 +60,7 @@ mod gl_tests {
         let mut renderer = GLProcessorThreaded::new(None).unwrap();
         let mut image_dyn = image;
         renderer
-            .draw_masks(&mut image_dyn, &[], &[seg], Default::default())
+            .draw_decoded_masks(&mut image_dyn, &[], &[seg], Default::default())
             .unwrap();
     }
 
@@ -107,7 +107,7 @@ mod gl_tests {
         let mut renderer = GLProcessorThreaded::new(None).unwrap();
         let mut image_dyn = image;
         renderer
-            .draw_masks(&mut image_dyn, &[], &[seg], Default::default())
+            .draw_decoded_masks(&mut image_dyn, &[], &[seg], Default::default())
             .unwrap();
     }
 
@@ -161,7 +161,7 @@ mod gl_tests {
             .set_class_colors(&[[255, 255, 0, 233], [128, 128, 255, 100]])
             .unwrap();
         renderer
-            .draw_masks(&mut image_dyn, &[detect], &[seg], Default::default())
+            .draw_decoded_masks(&mut image_dyn, &[detect], &[seg], Default::default())
             .unwrap();
 
         let image = {
@@ -212,7 +212,7 @@ mod gl_tests {
             .set_class_colors(&[[255, 255, 0, 233], [128, 128, 255, 100]])
             .unwrap();
         renderer
-            .draw_masks(&mut image_dyn, &[detect], &[], Default::default())
+            .draw_decoded_masks(&mut image_dyn, &[detect], &[], Default::default())
             .unwrap();
     }
 
@@ -1114,14 +1114,14 @@ mod gl_tests {
         );
     }
 
-    /// Test draw_masks() with PixelFormat::Bgra destination (segmentation).
+    /// Test draw_decoded_masks() with PixelFormat::Bgra destination (segmentation).
     /// Draws the same masks to both PixelFormat::Rgba and PixelFormat::Bgra, then verifies R↔B swap.
     #[test]
-    fn test_draw_masks_bgra() {
+    fn test_draw_decoded_masks_bgra() {
         use edgefirst_decoder::Segmentation;
 
         if !is_opengl_available() {
-            eprintln!("SKIPPED: test_draw_masks_bgra - OpenGL not available");
+            eprintln!("SKIPPED: test_draw_decoded_masks_bgra - OpenGL not available");
             return;
         }
 
@@ -1159,7 +1159,7 @@ mod gl_tests {
         )
         .unwrap();
         let mut rgba_img_dyn = rgba_img;
-        gl.draw_masks(&mut rgba_img_dyn, &[], &[make_seg()], Default::default())
+        gl.draw_decoded_masks(&mut rgba_img_dyn, &[], &[make_seg()], Default::default())
             .unwrap();
 
         // Render to PixelFormat::Bgra (convert source to PixelFormat::Bgra first)
@@ -1190,7 +1190,7 @@ mod gl_tests {
             Crop::no_crop(),
         )
         .unwrap();
-        gl.draw_masks(&mut bgra_img_dyn, &[], &[make_seg()], Default::default())
+        gl.draw_decoded_masks(&mut bgra_img_dyn, &[], &[make_seg()], Default::default())
             .unwrap();
 
         // Verify PixelFormat::Bgra output matches PixelFormat::Rgba output with R↔B swapped
@@ -1207,21 +1207,21 @@ mod gl_tests {
             max_diff = max_diff.max((rc[2] as i32 - bc[0] as i32).abs()); // B
             max_diff = max_diff.max((rc[3] as i32 - bc[3] as i32).abs()); // A
         }
-        eprintln!("draw_masks PixelFormat::Bgra vs PixelFormat::Rgba max channel diff: {max_diff}");
+        eprintln!("draw_decoded_masks PixelFormat::Bgra vs PixelFormat::Rgba max channel diff: {max_diff}");
         assert!(
             max_diff <= 1,
-            "draw_masks PixelFormat::Bgra/PixelFormat::Rgba channel mismatch > 1: max_diff={max_diff}"
+            "draw_decoded_masks PixelFormat::Bgra/PixelFormat::Rgba channel mismatch > 1: max_diff={max_diff}"
         );
     }
 
-    /// Test draw_masks() with PixelFormat::Bgra destination using Mem memory (boxes).
+    /// Test draw_decoded_masks() with PixelFormat::Bgra destination using Mem memory (boxes).
     /// Draws same boxes to PixelFormat::Rgba and PixelFormat::Bgra, then verifies R↔B swap.
     #[test]
-    fn test_draw_masks_bgra_mem() {
+    fn test_draw_decoded_masks_bgra_mem() {
         use edgefirst_decoder::DetectBox;
 
         if !is_opengl_available() {
-            eprintln!("SKIPPED: test_draw_masks_bgra_mem - OpenGL not available");
+            eprintln!("SKIPPED: test_draw_decoded_masks_bgra_mem - OpenGL not available");
             return;
         }
 
@@ -1246,7 +1246,7 @@ mod gl_tests {
         )
         .unwrap();
         let mut rgba_img_dyn = rgba_img;
-        gl.draw_masks(&mut rgba_img_dyn, &[detect], &[], Default::default())
+        gl.draw_decoded_masks(&mut rgba_img_dyn, &[detect], &[], Default::default())
             .unwrap();
 
         // Render boxes to PixelFormat::Bgra
@@ -1277,7 +1277,7 @@ mod gl_tests {
             Crop::no_crop(),
         )
         .unwrap();
-        gl.draw_masks(&mut bgra_img_dyn, &[detect], &[], Default::default())
+        gl.draw_decoded_masks(&mut bgra_img_dyn, &[detect], &[], Default::default())
             .unwrap();
 
         // Verify PixelFormat::Bgra output matches PixelFormat::Rgba output with R↔B swapped
@@ -1294,11 +1294,11 @@ mod gl_tests {
             max_diff = max_diff.max((rc[3] as i32 - bc[3] as i32).abs());
         }
         eprintln!(
-            "draw_masks_mem PixelFormat::Bgra vs PixelFormat::Rgba max channel diff: {max_diff}"
+            "draw_decoded_masks_mem PixelFormat::Bgra vs PixelFormat::Rgba max channel diff: {max_diff}"
         );
         assert!(
             max_diff <= 1,
-            "draw_masks_mem PixelFormat::Bgra/PixelFormat::Rgba channel mismatch > 1: max_diff={max_diff}"
+            "draw_decoded_masks_mem PixelFormat::Bgra/PixelFormat::Rgba channel mismatch > 1: max_diff={max_diff}"
         );
     }
 
@@ -1318,7 +1318,7 @@ mod gl_tests {
         let mut image_dyn = image;
 
         // Render with empty detections and segmentations — should succeed trivially
-        let result = gl.draw_masks(&mut image_dyn, &[], &[], Default::default());
+        let result = gl.draw_decoded_masks(&mut image_dyn, &[], &[], Default::default());
         assert!(
             result.is_ok(),
             "GL mask render with empty data should succeed: {result:?}"
@@ -1670,7 +1670,7 @@ mod gl_tests {
         );
 
         // Render via hybrid path (pre-decoded masks)
-        gl.draw_masks(
+        gl.draw_decoded_masks(
             &mut dst_hybrid,
             &output_boxes,
             &segmentation,
@@ -1679,7 +1679,7 @@ mod gl_tests {
         .unwrap();
 
         // Render via fused GL proto path
-        gl.draw_masks_proto(
+        gl.draw_proto_masks(
             &mut dst_fused,
             &output_boxes,
             &proto_data,

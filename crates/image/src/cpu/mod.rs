@@ -328,7 +328,7 @@ impl ImageProcessorTrait for CPUProcessor {
         self.convert_impl(src, dst, rotation, flip, crop)
     }
 
-    fn draw_masks(
+    fn draw_decoded_masks(
         &mut self,
         dst: &mut TensorDyn,
         detect: &[DetectBox],
@@ -336,10 +336,10 @@ impl ImageProcessorTrait for CPUProcessor {
         overlay: crate::MaskOverlay<'_>,
     ) -> Result<()> {
         let dst = dst.as_u8_mut().ok_or(Error::NotAnImage)?;
-        self.draw_masks_impl(dst, detect, segmentation, overlay.opacity)
+        self.draw_decoded_masks_impl(dst, detect, segmentation, overlay.opacity)
     }
 
-    fn draw_masks_proto(
+    fn draw_proto_masks(
         &mut self,
         dst: &mut TensorDyn,
         detect: &[DetectBox],
@@ -347,7 +347,7 @@ impl ImageProcessorTrait for CPUProcessor {
         overlay: crate::MaskOverlay<'_>,
     ) -> Result<()> {
         let dst = dst.as_u8_mut().ok_or(Error::NotAnImage)?;
-        self.draw_masks_proto_impl(dst, detect, proto_data, overlay.opacity)
+        self.draw_proto_masks_impl(dst, detect, proto_data, overlay.opacity)
     }
 
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<()> {
@@ -569,7 +569,7 @@ impl CPUProcessor {
         Ok(())
     }
 
-    fn draw_masks_impl(
+    fn draw_decoded_masks_impl(
         &mut self,
         dst: &mut Tensor<u8>,
         detect: &[DetectBox],
@@ -583,7 +583,7 @@ impl CPUProcessor {
             ));
         }
 
-        let _timer = FunctionTimer::new("CPUProcessor::draw_masks");
+        let _timer = FunctionTimer::new("CPUProcessor::draw_decoded_masks");
 
         let dst_w = dst.width().unwrap();
         let dst_h = dst.height().unwrap();
@@ -631,7 +631,7 @@ impl CPUProcessor {
         Ok(())
     }
 
-    fn draw_masks_proto_impl(
+    fn draw_proto_masks_impl(
         &mut self,
         dst: &mut Tensor<u8>,
         detect: &[DetectBox],
@@ -645,7 +645,7 @@ impl CPUProcessor {
             ));
         }
 
-        let _timer = FunctionTimer::new("CPUProcessor::draw_masks_proto");
+        let _timer = FunctionTimer::new("CPUProcessor::draw_proto_masks");
 
         let dst_w = dst.width().unwrap();
         let dst_h = dst.height().unwrap();

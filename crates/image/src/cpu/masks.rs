@@ -211,9 +211,9 @@ impl CPUProcessor {
     ///
     /// This is the CPU-side decode step of the hybrid mask rendering path:
     /// call this to get pre-decoded masks, then pass them to
-    /// [`draw_masks`](crate::ImageProcessorTrait::draw_masks) for GPU overlay.
+    /// [`draw_decoded_masks`](crate::ImageProcessorTrait::draw_decoded_masks) for GPU overlay.
     /// Benchmarks show this hybrid path (CPU decode + GL overlay) is faster
-    /// than the fused GPU `draw_masks_proto` on all tested platforms.
+    /// than the fused GPU `draw_proto_masks` on all tested platforms.
     ///
     /// Optimized: fused dequantization + dot product avoids a 3.1MB f32
     /// allocation for the full proto tensor. Uses fast sigmoid approximation.

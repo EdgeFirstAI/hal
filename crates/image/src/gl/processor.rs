@@ -202,7 +202,7 @@ impl ImageProcessorTrait for GLProcessorST {
         )
     }
 
-    fn draw_masks(
+    fn draw_decoded_masks(
         &mut self,
         dst: &mut TensorDyn,
         detect: &[DetectBox],
@@ -211,10 +211,10 @@ impl ImageProcessorTrait for GLProcessorST {
     ) -> Result<(), crate::Error> {
         let bg = overlay.background.map(|bg| dyn_to_u8_src(bg)).transpose()?;
         let (dst_u8, dst_fmt, _is_int8) = dyn_to_u8_dst(dst)?;
-        self.draw_masks_impl(dst_u8, dst_fmt, detect, segmentation, overlay.opacity, bg)
+        self.draw_decoded_masks_impl(dst_u8, dst_fmt, detect, segmentation, overlay.opacity, bg)
     }
 
-    fn draw_masks_proto(
+    fn draw_proto_masks(
         &mut self,
         dst: &mut TensorDyn,
         detect: &[DetectBox],
@@ -223,7 +223,7 @@ impl ImageProcessorTrait for GLProcessorST {
     ) -> crate::Result<()> {
         let bg = overlay.background.map(|bg| dyn_to_u8_src(bg)).transpose()?;
         let (dst_u8, dst_fmt, _is_int8) = dyn_to_u8_dst(dst)?;
-        self.draw_masks_proto_impl(dst_u8, dst_fmt, detect, proto_data, overlay.opacity, bg)
+        self.draw_proto_masks_impl(dst_u8, dst_fmt, detect, proto_data, overlay.opacity, bg)
     }
 
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> crate::Result<()> {
@@ -686,7 +686,7 @@ impl GLProcessorST {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn draw_masks_impl(
+    pub(super) fn draw_decoded_masks_impl(
         &mut self,
         dst: &mut Tensor<u8>,
         dst_fmt: PixelFormat,
@@ -697,7 +697,7 @@ impl GLProcessorST {
     ) -> Result<(), crate::Error> {
         use crate::FunctionTimer;
 
-        let _timer = FunctionTimer::new("GLProcessorST::draw_masks");
+        let _timer = FunctionTimer::new("GLProcessorST::draw_decoded_masks");
         if !matches!(
             dst_fmt,
             PixelFormat::Rgba | PixelFormat::Bgra | PixelFormat::Rgb
@@ -851,7 +851,7 @@ impl GLProcessorST {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn draw_masks_proto_impl(
+    pub(super) fn draw_proto_masks_impl(
         &mut self,
         dst: &mut Tensor<u8>,
         dst_fmt: PixelFormat,
@@ -862,7 +862,7 @@ impl GLProcessorST {
     ) -> crate::Result<()> {
         use crate::FunctionTimer;
 
-        let _timer = FunctionTimer::new("GLProcessorST::draw_masks_proto");
+        let _timer = FunctionTimer::new("GLProcessorST::draw_proto_masks");
         if !matches!(
             dst_fmt,
             PixelFormat::Rgba | PixelFormat::Bgra | PixelFormat::Rgb
