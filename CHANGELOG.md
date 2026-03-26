@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-03-26
+
+### Fixed
+
+- DMA-BUF `plane_offset` not applied in G2D and OpenGL destination paths
+- Validate row stride is a multiple of bytes-per-pixel in G2D
+
 ## [0.13.0] - 2026-03-25
 
 ### Added
