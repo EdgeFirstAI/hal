@@ -27,9 +27,8 @@ pub struct Decoder {
     normalized: Option<bool>,
 }
 
-#[doc(hidden)]
 #[derive(Debug)]
-pub enum ArrayViewDQuantized<'a> {
+pub(crate) enum ArrayViewDQuantized<'a> {
     UInt8(ArrayViewD<'a, u8>),
     Int8(ArrayViewD<'a, i8>),
     UInt16(ArrayViewD<'a, u16>),
@@ -94,19 +93,7 @@ where
 
 impl<'a> ArrayViewDQuantized<'a> {
     /// Returns the shape of the underlying array.
-    ///
-    /// # Examples
-    /// ```rust
-    /// # use edgefirst_decoder::ArrayViewDQuantized;
-    /// # use ndarray::Array2;
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let arr = Array2::from_shape_vec((2, 3), vec![1u8, 2, 3, 4, 5, 6])?;
-    /// let view = ArrayViewDQuantized::from(arr.view().into_dyn());
-    /// assert_eq!(view.shape(), &[2, 3]);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn shape(&self) -> &[usize] {
+    pub(crate) fn shape(&self) -> &[usize] {
         match self {
             ArrayViewDQuantized::UInt8(a) => a.shape(),
             ArrayViewDQuantized::Int8(a) => a.shape(),
@@ -216,57 +203,10 @@ impl Decoder {
         self.normalized
     }
 
-    /// This function decodes quantized model outputs into detection boxes and
-    /// segmentation masks. The quantized outputs can be of u8, i8, u16, i16,
-    /// u32, or i32 types. Up to `output_boxes.capacity()` boxes and masks
-    /// will be decoded. The function clears the provided output vectors
-    /// before populating them with the decoded results.
-    ///
-    /// This function returns a `DecoderError` if the the provided outputs don't
-    /// match the configuration provided by the user when building the decoder.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use edgefirst_decoder::{BoundingBox, DecoderBuilder, DetectBox, DecoderResult};
-    /// # use ndarray::Array4;
-    /// # fn main() -> DecoderResult<()> {
-    /// #    let detect0 = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split_9x15x18.bin"));
-    /// #    let detect0 = ndarray::Array4::from_shape_vec((1, 9, 15, 18), detect0.to_vec())?;
-    /// #
-    /// #    let detect1 = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split_17x30x18.bin"));
-    /// #    let detect1 = ndarray::Array4::from_shape_vec((1, 17, 30, 18), detect1.to_vec())?;
-    /// #    let model_output = vec![
-    /// #        detect1.view().into_dyn().into(),
-    /// #        detect0.view().into_dyn().into(),
-    /// #    ];
-    /// let decoder = DecoderBuilder::default()
-    ///     .with_config_yaml_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split.yaml")).to_string())
-    ///     .with_score_threshold(0.45)
-    ///     .with_iou_threshold(0.45)
-    ///     .build()?;
-    ///
-    /// let mut output_boxes: Vec<_> = Vec::with_capacity(10);
-    /// let mut output_masks: Vec<_> = Vec::with_capacity(10);
-    /// decoder.decode_quantized(&model_output, &mut output_boxes, &mut output_masks)?;
-    /// assert!(output_boxes[0].equal_within_delta(
-    ///     &DetectBox {
-    ///         bbox: BoundingBox {
-    ///             xmin: 0.43171933,
-    ///             ymin: 0.68243736,
-    ///             xmax: 0.5626645,
-    ///             ymax: 0.808863,
-    ///         },
-    ///         score: 0.99240804,
-    ///         label: 0
-    ///     },
-    ///     1e-6
-    /// ));
-    /// #    Ok(())
-    /// # }
-    /// ```
-    #[doc(hidden)]
-    pub fn decode_quantized(
+    /// Decode quantized model outputs into detection boxes and segmentation
+    /// masks. The quantized outputs can be of u8, i8, u16, i16, u32, or i32
+    /// types. Clears the provided output vectors before populating them.
+    pub(crate) fn decode_quantized(
         &self,
         outputs: &[ArrayViewDQuantized],
         output_boxes: &mut Vec<DetectBox>,
@@ -379,64 +319,10 @@ impl Decoder {
         }
     }
 
-    /// This function decodes floating point model outputs into detection boxes
-    /// and segmentation masks. Up to `output_boxes.capacity()` boxes and
-    /// masks will be decoded. The function clears the provided output
-    /// vectors before populating them with the decoded results.
-    ///
-    /// This function returns an `Error` if the the provided outputs don't
-    /// match the configuration provided by the user when building the decoder.
-    ///
-    /// Any quantization information in the configuration will be ignored.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use edgefirst_decoder::{BoundingBox, DecoderBuilder, DetectBox, DecoderResult, configs, configs::{DecoderType, DecoderVersion}, dequantize_cpu, Quantization};
-    /// # use ndarray::Array3;
-    /// # fn main() -> DecoderResult<()> {
-    /// #   let out = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/yolov8s_80_classes.bin"));
-    /// #   let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
-    /// #   let mut out_dequant = vec![0.0_f64; 84 * 8400];
-    /// #   let quant = Quantization::new(0.0040811873, -123);
-    /// #   dequantize_cpu(out, quant, &mut out_dequant);
-    /// #   let model_output_f64 = Array3::from_shape_vec((1, 84, 8400), out_dequant)?.into_dyn();
-    ///    let decoder = DecoderBuilder::default()
-    ///     .with_config_yolo_det(configs::Detection {
-    ///         decoder: DecoderType::Ultralytics,
-    ///         quantization: None,
-    ///         shape: vec![1, 84, 8400],
-    ///         anchors: None,
-    ///         dshape: Vec::new(),
-    ///         normalized: Some(true),
-    ///     },
-    ///     Some(DecoderVersion::Yolo11))
-    ///     .with_score_threshold(0.25)
-    ///     .with_iou_threshold(0.7)
-    ///     .build()?;
-    ///
-    /// let mut output_boxes: Vec<_> = Vec::with_capacity(10);
-    /// let mut output_masks: Vec<_> = Vec::with_capacity(10);
-    /// let model_output_f64 = vec![model_output_f64.view().into()];
-    /// decoder.decode_float(&model_output_f64, &mut output_boxes, &mut output_masks)?;    
-    /// assert!(output_boxes[0].equal_within_delta(
-    ///        &DetectBox {
-    ///            bbox: BoundingBox {
-    ///                xmin: 0.5285137,
-    ///                ymin: 0.05305544,
-    ///                xmax: 0.87541467,
-    ///                ymax: 0.9998909,
-    ///            },
-    ///            score: 0.5591227,
-    ///            label: 0
-    ///        },
-    ///        1e-6
-    ///    ));
-    ///
-    /// #    Ok(())
-    /// # }
-    #[doc(hidden)]
-    pub fn decode_float<T>(
+    /// Decode floating point model outputs into detection boxes and
+    /// segmentation masks. Clears the provided output vectors before
+    /// populating them.
+    pub(crate) fn decode_float<T>(
         &self,
         outputs: &[ArrayViewD<T>],
         output_boxes: &mut Vec<DetectBox>,
@@ -565,8 +451,7 @@ impl Decoder {
     /// Returns `Ok(None)` for detection-only and ModelPack models (use
     /// `decode_quantized` for those). Returns `Ok(Some(ProtoData))` for
     /// YOLO segmentation models.
-    #[doc(hidden)]
-    pub fn decode_quantized_proto(
+    pub(crate) fn decode_quantized_proto(
         &self,
         outputs: &[ArrayViewDQuantized],
         output_boxes: &mut Vec<DetectBox>,
@@ -654,8 +539,7 @@ impl Decoder {
     ///
     /// Returns `Ok(None)` for detection-only and ModelPack models. Returns
     /// `Ok(Some(ProtoData))` for YOLO segmentation models.
-    #[doc(hidden)]
-    pub fn decode_float_proto<T>(
+    pub(crate) fn decode_float_proto<T>(
         &self,
         outputs: &[ArrayViewD<T>],
         output_boxes: &mut Vec<DetectBox>,
@@ -832,57 +716,10 @@ pub use edgefirst_tracker::Tracker;
 
 #[cfg(feature = "tracker")]
 impl Decoder {
-    /// This function decodes quantized model outputs into detection boxes and
-    /// segmentation masks. The quantized outputs can be of u8, i8, u16, i16,
-    /// u32, or i32 types. Up to `output_boxes.capacity()` boxes and masks
-    /// will be decoded. The function clears the provided output vectors
-    /// before populating them with the decoded results.
-    ///
-    /// This function returns a `DecoderError` if the the provided outputs don't
-    /// match the configuration provided by the user when building the decoder.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use edgefirst_decoder::{BoundingBox, DecoderBuilder, DetectBox, DecoderResult};
-    /// # use ndarray::Array4;
-    /// # fn main() -> DecoderResult<()> {
-    /// #    let detect0 = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split_9x15x18.bin"));
-    /// #    let detect0 = ndarray::Array4::from_shape_vec((1, 9, 15, 18), detect0.to_vec())?;
-    /// #
-    /// #    let detect1 = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split_17x30x18.bin"));
-    /// #    let detect1 = ndarray::Array4::from_shape_vec((1, 17, 30, 18), detect1.to_vec())?;
-    /// #    let model_output = vec![
-    /// #        detect1.view().into_dyn().into(),
-    /// #        detect0.view().into_dyn().into(),
-    /// #    ];
-    /// let decoder = DecoderBuilder::default()
-    ///     .with_config_yaml_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split.yaml")).to_string())
-    ///     .with_score_threshold(0.45)
-    ///     .with_iou_threshold(0.45)
-    ///     .build()?;
-    ///
-    /// let mut output_boxes: Vec<_> = Vec::with_capacity(10);
-    /// let mut output_masks: Vec<_> = Vec::with_capacity(10);
-    /// decoder.decode_quantized(&model_output, &mut output_boxes, &mut output_masks)?;
-    /// assert!(output_boxes[0].equal_within_delta(
-    ///     &DetectBox {
-    ///         bbox: BoundingBox {
-    ///             xmin: 0.43171933,
-    ///             ymin: 0.68243736,
-    ///             xmax: 0.5626645,
-    ///             ymax: 0.808863,
-    ///         },
-    ///         score: 0.99240804,
-    ///         label: 0
-    ///     },
-    ///     1e-6
-    /// ));
-    /// #    Ok(())
-    /// # }
-    /// ```
-    #[doc(hidden)]
-    pub fn decode_tracked_quantized<TR: edgefirst_tracker::Tracker<DetectBox>>(
+    /// Decode quantized model outputs into detection boxes and segmentation
+    /// masks with tracking. Clears the provided output vectors before
+    /// populating them.
+    pub(crate) fn decode_tracked_quantized<TR: edgefirst_tracker::Tracker<DetectBox>>(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -987,55 +824,7 @@ impl Decoder {
     /// match the configuration provided by the user when building the decoder.
     ///
     /// Any quantization information in the configuration will be ignored.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use edgefirst_decoder::{BoundingBox, DecoderBuilder, DetectBox, DecoderResult, configs, configs::{DecoderType, DecoderVersion}, dequantize_cpu, Quantization};
-    /// # use ndarray::Array3;
-    /// # fn main() -> DecoderResult<()> {
-    /// #   let out = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/yolov8s_80_classes.bin"));
-    /// #   let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
-    /// #   let mut out_dequant = vec![0.0_f64; 84 * 8400];
-    /// #   let quant = Quantization::new(0.0040811873, -123);
-    /// #   dequantize_cpu(out, quant, &mut out_dequant);
-    /// #   let model_output_f64 = Array3::from_shape_vec((1, 84, 8400), out_dequant)?.into_dyn();
-    ///    let decoder = DecoderBuilder::default()
-    ///     .with_config_yolo_det(configs::Detection {
-    ///         decoder: DecoderType::Ultralytics,
-    ///         quantization: None,
-    ///         shape: vec![1, 84, 8400],
-    ///         anchors: None,
-    ///         dshape: Vec::new(),
-    ///         normalized: Some(true),
-    ///     },
-    ///     Some(DecoderVersion::Yolo11))
-    ///     .with_score_threshold(0.25)
-    ///     .with_iou_threshold(0.7)
-    ///     .build()?;
-    ///
-    /// let mut output_boxes: Vec<_> = Vec::with_capacity(10);
-    /// let mut output_masks: Vec<_> = Vec::with_capacity(10);
-    /// let model_output_f64 = vec![model_output_f64.view().into()];
-    /// decoder.decode_float(&model_output_f64, &mut output_boxes, &mut output_masks)?;    
-    /// assert!(output_boxes[0].equal_within_delta(
-    ///        &DetectBox {
-    ///            bbox: BoundingBox {
-    ///                xmin: 0.5285137,
-    ///                ymin: 0.05305544,
-    ///                xmax: 0.87541467,
-    ///                ymax: 0.9998909,
-    ///            },
-    ///            score: 0.5591227,
-    ///            label: 0
-    ///        },
-    ///        1e-6
-    ///    ));
-    ///
-    /// #    Ok(())
-    /// # }
-    #[doc(hidden)]
-    pub fn decode_tracked_float<TR: edgefirst_tracker::Tracker<DetectBox>, T>(
+    pub(crate) fn decode_tracked_float<TR: edgefirst_tracker::Tracker<DetectBox>, T>(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -1147,8 +936,7 @@ impl Decoder {
     /// Returns `Ok(None)` for detection-only and ModelPack models (use
     /// `decode_quantized` for those). Returns `Ok(Some(ProtoData))` for
     /// YOLO segmentation models.
-    #[doc(hidden)]
-    pub fn decode_tracked_quantized_proto<TR: edgefirst_tracker::Tracker<DetectBox>>(
+    pub(crate) fn decode_tracked_quantized_proto<TR: edgefirst_tracker::Tracker<DetectBox>>(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -1259,8 +1047,7 @@ impl Decoder {
     ///
     /// Returns `Ok(None)` for detection-only and ModelPack models. Returns
     /// `Ok(Some(ProtoData))` for YOLO segmentation models.
-    #[doc(hidden)]
-    pub fn decode_tracked_float_proto<TR: edgefirst_tracker::Tracker<DetectBox>, T>(
+    pub(crate) fn decode_tracked_float_proto<TR: edgefirst_tracker::Tracker<DetectBox>, T>(
         &self,
         tracker: &mut TR,
         timestamp: u64,

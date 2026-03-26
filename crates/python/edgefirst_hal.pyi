@@ -393,22 +393,23 @@ class Decoder:
         """
         ...
 
-    def decode(self, model_output: List[np.ndarray], max_boxes=100) -> SegDetOutput:
+    def decode(self, model_output: List[Tensor], max_boxes: int = 100) -> SegDetOutput:
         """
-        Decode model outputs into detection and segmentation results. When giving quantized
-        tensors as input, the quantization parameters must be specified in the Decoder configuration.
+        Decode model outputs into detection and segmentation results.
 
-        The accepted integer types are `np.uint8`, `np.int8`, `np.uint16`, `np.int16`, `np.uint32`, and `np.int32`.
-        Integer types can be mixed and matched across the different model outputs.
-
-        The accepted floating point types are `np.float16`, `np.float32` and `np.float64`. All outputs must be
-        the same floating point type.
+        Accepts HAL Tensor objects directly from model inference. Quantization
+        parameters must be specified in the Decoder configuration when the
+        tensors contain quantized data.
 
         Masks are returned at prototype resolution as 3D arrays of shape
         ``(H, W, C)``. For instance segmentation models (e.g. YOLO) ``C=1``
-        — a binary per-instance mask (threshold at 128). For semantic
-        segmentation models (e.g. ModelPack) ``C=num_classes`` — per-pixel
+        -- a binary per-instance mask (threshold at 128). For semantic
+        segmentation models (e.g. ModelPack) ``C=num_classes`` -- per-pixel
         class scores (use ``argmax`` over the last axis).
+
+        Args:
+            model_output: List of HAL Tensor objects from model inference.
+            max_boxes: Maximum number of detections to return (default: 100).
         """
         ...
 
@@ -416,24 +417,27 @@ class Decoder:
         self,
         tracker: ByteTrack,
         timestamp_ns: int,
-        model_output: List[np.ndarray],
+        model_output: List[Tensor],
         max_boxes: int = 100,
     ) -> SegDetTrackedOutput:
         """
-        Decode model outputs into detection and segmentation results with tracking. When giving quantized
-        tensors as input, the quantization parameters must be specified in the Decoder configuration.
+        Decode model outputs into detection and segmentation results with tracking.
 
-        The accepted integer types are `np.uint8`, `np.int8`, `np.uint16`, `np.int16`, `np.uint32`, and `np.int32`.
-        Integer types can be mixed and matched across the different model outputs.
-
-        The accepted floating point types are `np.float16`, `np.float32` and `np.float64`. All outputs must be
-        the same floating point type.
+        Accepts HAL Tensor objects directly from model inference. Quantization
+        parameters must be specified in the Decoder configuration when the
+        tensors contain quantized data.
 
         Masks are returned at prototype resolution as 3D arrays of shape
         ``(H, W, C)``. For instance segmentation models (e.g. YOLO) ``C=1``
-        — a binary per-instance mask (threshold at 128). For semantic
-        segmentation models (e.g. ModelPack) ``C=num_classes`` — per-pixel
+        -- a binary per-instance mask (threshold at 128). For semantic
+        segmentation models (e.g. ModelPack) ``C=num_classes`` -- per-pixel
         class scores (use ``argmax`` over the last axis).
+
+        Args:
+            tracker: ByteTrack tracker instance.
+            timestamp_ns: Frame timestamp in nanoseconds.
+            model_output: List of HAL Tensor objects from model inference.
+            max_boxes: Maximum number of detections to return (default: 100).
         """
         ...
 
@@ -1154,7 +1158,7 @@ class ImageProcessor:
     def draw_masks(
         self,
         decoder: Decoder,
-        model_output: List[np.ndarray],
+        model_output: List[Tensor],
         dst: Tensor,
         max_boxes: int = 100,
         background: Optional[Tensor] = None,
@@ -1174,8 +1178,7 @@ class ImageProcessor:
 
         Args:
             decoder: Decoder instance for interpreting model outputs.
-            model_output: List of model output tensors (same types as
-                ``Decoder.decode``).
+            model_output: List of HAL Tensor objects from model inference.
             dst: Destination image tensor to draw onto. Must be ``RGBA`` or
                 ``RGB`` for CPU backend, or ``RGBA``/``BGRA``/``RGB`` for
                 OpenGL backend.

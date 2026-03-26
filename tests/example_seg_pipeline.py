@@ -197,6 +197,28 @@ def run_tflite(interp, input_data):
     return [interp.get_tensor(d["index"]) for d in interp.get_output_details()]
 
 
+def numpy_outputs_to_tensors(outputs):
+    """Convert a list of numpy arrays to HAL Tensors for decode/draw_masks."""
+    from edgefirst_hal import Tensor  # noqa: F811
+
+    dtype_map = {
+        np.dtype("int8"): "int8",
+        np.dtype("uint8"): "uint8",
+        np.dtype("float32"): "float32",
+        np.dtype("float64"): "float64",
+    }
+    tensors = []
+    for arr in outputs:
+        arr = np.ascontiguousarray(arr)
+        hal_dtype = dtype_map.get(arr.dtype, "float32")
+        t = Tensor(list(arr.shape), dtype=hal_dtype)
+        with t.map() as m:
+            dst = np.frombuffer(m, dtype=arr.dtype).reshape(arr.shape)
+            np.copyto(dst, arr)
+        tensors.append(t)
+    return tensors
+
+
 def sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
 
@@ -473,7 +495,7 @@ def run_hal_pipeline(image_path, metadata, interp, processor, save_path=None):
 
     # 3. Inference
     t0 = time.perf_counter()
-    outputs = run_tflite(interp, input_data)
+    outputs = numpy_outputs_to_tensors(run_tflite(interp, input_data))
     timings["inference"] = (time.perf_counter() - t0) * 1000
 
     # 4. Decode (HAL Rust decoder — NMS + mask computation)
@@ -529,7 +551,7 @@ def run_hal_pipeline_bench(image_path, metadata, interp, processor):
     timings["letterbox"] = (time.perf_counter() - t0) * 1000
 
     t0 = time.perf_counter()
-    outputs = run_tflite(interp, input_data)
+    outputs = numpy_outputs_to_tensors(run_tflite(interp, input_data))
     timings["inference"] = (time.perf_counter() - t0) * 1000
 
     t0 = time.perf_counter()

@@ -427,9 +427,8 @@ impl PyOutput {
 
 use ndarray::{Array1, Array2};
 use numpy::{
-    IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayDyn, PyArrayLikeDyn, PyArrayMethods,
-    PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArrayDyn, PyReadwriteArrayDyn, PyUntypedArray,
-    ToPyArray,
+    IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayDyn, PyArrayMethods, PyReadonlyArray2,
+    PyReadonlyArray3, PyReadonlyArrayDyn, PyReadwriteArrayDyn, PyUntypedArray, ToPyArray,
 };
 use pyo3::{
     pyclass, pymethods, types::PyAnyMethods, Bound, FromPyObject, PyAny, PyRef, PyResult, Python,
@@ -456,50 +455,6 @@ pub type PySegDetTrackedOutput<'py> = (
     Vec<Bound<'py, PyArray3<u8>>>,
     Vec<PyTrackInfo>,
 );
-
-#[derive(FromPyObject)]
-pub enum ArrayQuantized<'a> {
-    UInt8(PyReadonlyArrayDyn<'a, u8>),
-    Int8(PyReadonlyArrayDyn<'a, i8>),
-    UInt16(PyReadonlyArrayDyn<'a, u16>),
-    Int16(PyReadonlyArrayDyn<'a, i16>),
-    UInt32(PyReadonlyArrayDyn<'a, u32>),
-    Int32(PyReadonlyArrayDyn<'a, i32>),
-}
-
-#[derive(FromPyObject)]
-pub enum ListOfReadOnlyArrayGenericDyn<'py> {
-    Quantized(Vec<ArrayQuantized<'py>>),
-    Float16(Vec<WithInt32Array<'py, PyArrayF16_<'py>>>),
-    Float32(Vec<WithInt32Array<'py, PyArrayLikeDyn<'py, f32>>>),
-    Float64(Vec<WithInt32Array<'py, PyArrayLikeDyn<'py, f64>>>),
-}
-
-pub struct PyArrayF16_<'py> {
-    pub arr: PyReadonlyArrayDyn<'py, half::f16>,
-}
-
-impl<'py> FromPyObject<'py> for PyArrayF16_<'py> {
-    fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
-        if let Ok(array) = ob.downcast::<PyArrayDyn<half::f16>>() {
-            return Ok(Self {
-                arr: array.readonly(),
-            });
-        }
-        Err(pyo3::exceptions::PyRuntimeError::new_err(
-            "Could not parse array as f16 numpy array".to_string(),
-        ))
-    }
-}
-
-#[derive(FromPyObject)]
-pub enum WithInt32Array<'py, T>
-where
-    T: FromPyObject<'py>,
-{
-    Val(T),
-    Int32(PyArrayLikeDyn<'py, i32>),
-}
 
 #[derive(FromPyObject)]
 pub enum ListOfReadOnlyArrayGeneric3<'py> {
@@ -713,77 +668,17 @@ impl PyDecoder {
     #[pyo3(signature = (model_output, max_boxes=100))]
     pub fn decode<'py>(
         self_: PyRef<'py, Self>,
-        model_output: ListOfReadOnlyArrayGenericDyn,
+        model_output: Vec<PyRef<'py, crate::tensor::PyTensor>>,
         max_boxes: usize,
     ) -> PyResult<PySegDetOutput<'py>> {
+        let tensor_refs: Vec<&edgefirst_hal::tensor::TensorDyn> =
+            model_output.iter().map(|t| &t.0).collect();
         let mut output_boxes = Vec::with_capacity(max_boxes);
         let mut output_masks = Vec::with_capacity(max_boxes);
-        let result = match model_output {
-            ListOfReadOnlyArrayGenericDyn::Quantized(items) => {
-                let outputs = items
-                    .iter()
-                    .map(|x| match x {
-                        ArrayQuantized::UInt8(arr) => arr.as_array().into(),
-                        ArrayQuantized::Int8(arr) => arr.as_array().into(),
-                        ArrayQuantized::UInt16(arr) => arr.as_array().into(),
-                        ArrayQuantized::Int16(arr) => arr.as_array().into(),
-                        ArrayQuantized::UInt32(arr) => arr.as_array().into(),
-                        ArrayQuantized::Int32(arr) => arr.as_array().into(),
-                    })
-                    .collect::<Vec<_>>();
-                self_
-                    .decoder
-                    .decode_quantized(&outputs, &mut output_boxes, &mut output_masks)
-            }
-            ListOfReadOnlyArrayGenericDyn::Float16(items) => {
-                let outputs = items
-                    .iter()
-                    .filter_map(|x| match x {
-                        WithInt32Array::Val(x) => Some(x.arr.as_array()),
-                        WithInt32Array::Int32(_) => None,
-                    })
-                    .collect::<Vec<_>>();
-
-                let outputs = outputs
-                    .iter()
-                    .map(|arr| arr.map(|x| x.to_f32()))
-                    .collect::<Vec<_>>();
-                let output_views = outputs
-                    .iter()
-                    .map(|output| output.view())
-                    .collect::<Vec<_>>();
-                self_
-                    .decoder
-                    .decode_float(&output_views, &mut output_boxes, &mut output_masks)
-            }
-            ListOfReadOnlyArrayGenericDyn::Float32(items) => {
-                let outputs = items
-                    .iter()
-                    .filter_map(|x| match x {
-                        WithInt32Array::Val(x) => Some(x.as_array()),
-                        WithInt32Array::Int32(_) => None,
-                    })
-                    .collect::<Vec<_>>();
-                self_
-                    .decoder
-                    .decode_float(&outputs, &mut output_boxes, &mut output_masks)
-            }
-            ListOfReadOnlyArrayGenericDyn::Float64(items) => {
-                let outputs = items
-                    .iter()
-                    .filter_map(|x| match x {
-                        WithInt32Array::Val(x) => Some(x.as_array()),
-                        WithInt32Array::Int32(_) => None,
-                    })
-                    .collect::<Vec<_>>();
-                self_
-                    .decoder
-                    .decode_float(&outputs, &mut output_boxes, &mut output_masks)
-            }
-        };
-        if let Err(e) = result {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")));
-        }
+        self_
+            .decoder
+            .decode(&tensor_refs, &mut output_boxes, &mut output_masks)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))?;
         let py = self_.py();
         let (boxes, scores, classes) = convert_detect_box(py, &output_boxes);
         let masks = convert_seg_mask(py, &output_masks);
@@ -795,98 +690,25 @@ impl PyDecoder {
         self_: PyRef<'py, Self>,
         tracker: &mut PyByteTrack,
         timestamp: u64,
-        model_output: ListOfReadOnlyArrayGenericDyn,
+        model_output: Vec<PyRef<'py, crate::tensor::PyTensor>>,
         max_boxes: usize,
     ) -> PyResult<PySegDetTrackedOutput<'py>> {
+        let tensor_refs: Vec<&edgefirst_hal::tensor::TensorDyn> =
+            model_output.iter().map(|t| &t.0).collect();
         let mut output_boxes = Vec::with_capacity(max_boxes);
         let mut output_masks = Vec::with_capacity(max_boxes);
         let mut output_tracks = Vec::with_capacity(max_boxes);
-        let result = match model_output {
-            ListOfReadOnlyArrayGenericDyn::Quantized(items) => {
-                let outputs = items
-                    .iter()
-                    .map(|x| match x {
-                        ArrayQuantized::UInt8(arr) => arr.as_array().into(),
-                        ArrayQuantized::Int8(arr) => arr.as_array().into(),
-                        ArrayQuantized::UInt16(arr) => arr.as_array().into(),
-                        ArrayQuantized::Int16(arr) => arr.as_array().into(),
-                        ArrayQuantized::UInt32(arr) => arr.as_array().into(),
-                        ArrayQuantized::Int32(arr) => arr.as_array().into(),
-                    })
-                    .collect::<Vec<_>>();
-                self_.decoder.decode_tracked_quantized(
-                    tracker,
-                    timestamp,
-                    &outputs,
-                    &mut output_boxes,
-                    &mut output_masks,
-                    &mut output_tracks,
-                )
-            }
-            ListOfReadOnlyArrayGenericDyn::Float16(items) => {
-                let outputs = items
-                    .iter()
-                    .filter_map(|x| match x {
-                        WithInt32Array::Val(x) => Some(x.arr.as_array()),
-                        WithInt32Array::Int32(_) => None,
-                    })
-                    .collect::<Vec<_>>();
-
-                let outputs = outputs
-                    .iter()
-                    .map(|arr| arr.map(|x| x.to_f32()))
-                    .collect::<Vec<_>>();
-                let output_views = outputs
-                    .iter()
-                    .map(|output| output.view())
-                    .collect::<Vec<_>>();
-                self_.decoder.decode_tracked_float(
-                    tracker,
-                    timestamp,
-                    &output_views,
-                    &mut output_boxes,
-                    &mut output_masks,
-                    &mut output_tracks,
-                )
-            }
-            ListOfReadOnlyArrayGenericDyn::Float32(items) => {
-                let outputs = items
-                    .iter()
-                    .filter_map(|x| match x {
-                        WithInt32Array::Val(x) => Some(x.as_array()),
-                        WithInt32Array::Int32(_) => None,
-                    })
-                    .collect::<Vec<_>>();
-                self_.decoder.decode_tracked_float(
-                    tracker,
-                    timestamp,
-                    &outputs,
-                    &mut output_boxes,
-                    &mut output_masks,
-                    &mut output_tracks,
-                )
-            }
-            ListOfReadOnlyArrayGenericDyn::Float64(items) => {
-                let outputs = items
-                    .iter()
-                    .filter_map(|x| match x {
-                        WithInt32Array::Val(x) => Some(x.as_array()),
-                        WithInt32Array::Int32(_) => None,
-                    })
-                    .collect::<Vec<_>>();
-                self_.decoder.decode_tracked_float(
-                    tracker,
-                    timestamp,
-                    &outputs,
-                    &mut output_boxes,
-                    &mut output_masks,
-                    &mut output_tracks,
-                )
-            }
-        };
-        if let Err(e) = result {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")));
-        }
+        self_
+            .decoder
+            .decode_tracked(
+                tracker,
+                timestamp,
+                &tensor_refs,
+                &mut output_boxes,
+                &mut output_masks,
+                &mut output_tracks,
+            )
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))?;
         let py = self_.py();
         let (boxes, scores, classes) = convert_detect_box(py, &output_boxes);
         let masks = convert_seg_mask(py, &output_masks);

@@ -114,6 +114,26 @@ def generate_synthetic_outputs():
     return results
 
 
+def numpy_to_hal_tensors(arrays):
+    """Convert a list of numpy arrays to HAL Tensor objects."""
+    tensors = []
+    dtype_map = {
+        np.dtype("int8"): "int8",
+        np.dtype("uint8"): "uint8",
+        np.dtype("float32"): "float32",
+        np.dtype("float64"): "float64",
+    }
+    for arr in arrays:
+        arr = np.ascontiguousarray(arr)
+        hal_dtype = dtype_map.get(arr.dtype, "float32")
+        t = Tensor(list(arr.shape), dtype=hal_dtype)
+        with t.map() as m:
+            dst = np.frombuffer(m, dtype=arr.dtype).reshape(arr.shape)
+            np.copyto(dst, arr)
+        tensors.append(t)
+    return tensors
+
+
 def get_target_info():
     """Collect target identification for cross-target comparison."""
     info = {
@@ -308,12 +328,14 @@ def main():
             ]
         }
 
+    # --- Convert numpy outputs to HAL Tensors ---
+    print(f"\nOutput shapes: {[o.shape for o in outputs]}")
+    print(f"Output dtypes: {[o.dtype for o in outputs]}")
+    outputs = numpy_to_hal_tensors(outputs)
+
     # --- Create processor and image ---
     processor = ImageProcessor(egl_display=gpu_display)
     dst = Tensor.image(640, 640, PixelFormat.Rgba)
-
-    print(f"\nOutput shapes: {[o.shape for o in outputs]}")
-    print(f"Output dtypes: {[o.dtype for o in outputs]}")
     print(f"Iterations: {args.iterations} (warmup: {args.warmup})")
 
     # Determine interpolation modes to test

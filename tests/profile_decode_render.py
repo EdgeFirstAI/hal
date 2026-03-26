@@ -106,8 +106,22 @@ def main():
     print(f"EGL: {[str(d.kind) for d in displays]}", file=sys.stderr)
 
     metadata = extract_metadata(args.model)
-    outputs = get_model_outputs(args.model)
-    print(f"Outputs: {[o.shape for o in outputs]}", file=sys.stderr)
+    np_outputs = get_model_outputs(args.model)
+    print(f"Outputs: {[o.shape for o in np_outputs]}", file=sys.stderr)
+
+    # Convert numpy outputs to HAL Tensors
+    dtype_map = {
+        np.dtype("int8"): "int8",
+        np.dtype("uint8"): "uint8",
+        np.dtype("float32"): "float32",
+    }
+    outputs = []
+    for arr in np_outputs:
+        arr = np.ascontiguousarray(arr)
+        t = Tensor(list(arr.shape), dtype=dtype_map.get(arr.dtype, "float32"))
+        with t.map() as m:
+            np.copyto(np.frombuffer(m, dtype=arr.dtype).reshape(arr.shape), arr)
+        outputs.append(t)
 
     processor = ImageProcessor(egl_display=gpu_display)
     dst = Tensor.image(640, 640, PixelFormat.Rgba)
