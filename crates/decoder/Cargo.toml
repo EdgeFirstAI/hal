@@ -18,6 +18,7 @@ tracker = ["dep:edgefirst-tracker"]
 
 [dependencies]
 argminmax = { workspace = true }
+edgefirst-tensor = { workspace = true }
 edgefirst-tracker = { workspace = true, optional = true }
 env_logger = { workspace = true }
 fast-math = { workspace = true }
