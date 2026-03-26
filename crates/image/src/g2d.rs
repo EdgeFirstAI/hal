@@ -325,10 +325,18 @@ fn tensor_to_g2d_surface(img: &Tensor<u8>) -> Result<G2DSurface> {
 
     // G2D stride is in pixels.  effective_row_stride() returns bytes, so
     // divide by the bytes-per-pixel (channels for u8 data) to convert.
-    let stride_pixels = img
-        .effective_row_stride()
-        .map(|s| s / fmt.channels())
-        .unwrap_or(w);
+    let stride_pixels = match img.effective_row_stride() {
+        Some(s) => {
+            let channels = fmt.channels();
+            if s % channels != 0 {
+                return Err(Error::NotImplemented(
+                    "g2d requires row stride to be a multiple of bytes-per-pixel".to_string(),
+                ));
+            }
+            s / channels
+        }
+        None => w,
+    };
 
     Ok(G2DSurface {
         planes,
