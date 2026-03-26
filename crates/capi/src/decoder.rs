@@ -1250,9 +1250,10 @@ pub unsafe extern "C" fn hal_segmentation_list_free(list: *mut HalSegmentationLi
 /// @param num_outputs Number of output tensors
 /// @param out_boxes Output parameter for detection box list (caller must free)
 /// @param out_segmentations Output parameter for segmentation list (can be NULL; caller must free if non-NULL)
+/// @param out_tracks Output parameter for track info list (can be NULL; caller must free if non-NULL)
 /// @return 0 on success, -1 on error
 /// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL decoder/outputs/out_boxes, mixed dtypes)
+/// - EINVAL: Invalid argument (NULL decoder/tracker/outputs/out_boxes, mixed dtypes)
 /// - EIO: Decoding failed
 #[no_mangle]
 pub unsafe extern "C" fn hal_decoder_decode_tracked(

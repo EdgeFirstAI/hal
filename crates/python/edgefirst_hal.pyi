@@ -263,6 +263,21 @@ class Output:
         """
         ...
 
+    @staticmethod
+    def classes(
+        shape: Optional[List[int]] = None,
+        dshape: Optional[List[Tuple[DimName, int]]] = None,
+        decoder: DecoderType = DecoderType.Ultralytics,
+    ) -> Output:
+        """Create a classes output (class label indices for end-to-end split models).
+
+        Args:
+            shape: Anonymous integer dimensions (mutually exclusive with dshape).
+            dshape: Named dimensions (mutually exclusive with shape).
+            decoder: Decoder type (default: Ultralytics).
+        """
+        ...
+
     def with_quantization(self, scale: float, zero_point: int) -> Output:
         """Set quantization parameters for this output.
 

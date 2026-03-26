@@ -131,7 +131,7 @@ For segmentation models, the decoder provides two APIs for accessing mask protot
 - `decode_quantized_proto()` — returns raw quantized proto data and mask coefficients without materializing pixel masks
 - `decode_float_proto()` — returns float proto data and mask coefficients
 
-These are preferred when passing mask data to GPU rendering pipelines (e.g., `ImageProcessor::draw_masks_proto()`), as they avoid the CPU cost of materializing full-resolution masks.
+These are preferred when passing mask data to GPU rendering pipelines (e.g., `ImageProcessor::draw_proto_masks()`), as they avoid the CPU cost of materializing full-resolution masks.
 
 ```rust,ignore
 // GPU rendering path: decode proto data, pass to GL for fused rendering
@@ -140,7 +140,7 @@ let (detections, proto_data) = decoder.decode_quantized_proto(
 )?;
 
 // Pass proto_data directly to GPU for fused mask overlay
-processor.draw_masks_proto(&mut frame, &detections, &proto_data)?;
+processor.draw_proto_masks(&mut frame, &detections, &proto_data)?;
 ```
 
 ## Model Type Variants

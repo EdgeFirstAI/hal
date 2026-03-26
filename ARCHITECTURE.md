@@ -158,8 +158,8 @@ classDiagram
     class ImageProcessorTrait {
         <<trait>>
         +convert(src, dst, rotation, flip, crop)
-        +draw_masks(dst, detections, segmentations)
-        +draw_masks_proto(dst, detections, proto_data)
+        +draw_decoded_masks(dst, detections, segmentations)
+        +draw_proto_masks(dst, detections, proto_data)
         +set_class_colors(colors)
     }
 
@@ -482,7 +482,7 @@ with an explicit `nms` field (`ClassAgnostic` or `ClassAware`).
 For segmentation models, `decode_quantized_proto()` and `decode_float_proto()`
 return raw proto data and mask coefficients without materializing pixel masks.
 These are the preferred entry point for fused GPU rendering via
-`ImageProcessor::draw_masks_proto()`.
+`ImageProcessor::draw_proto_masks()`.
 
 **Architecture**:
 ```mermaid
@@ -559,8 +559,8 @@ The HAL provides two workflows for consuming these masks:
 
 | Workflow | Python | Rust | C | CPU | OpenGL | G2D |
 |----------|--------|------|---|:---:|:------:|:---:|
-| **Draw** — fused overlay onto image | `processor.draw_masks()` | `draw_masks_proto()` | `hal_image_processor_draw_masks()` | Yes | Yes | No |
-| **Draw pre-decoded** — draw already-decoded masks | `processor.draw_decoded_masks()` | `draw_masks()` | `hal_image_processor_draw_decoded_masks()` | Yes | Yes | No |
+| **Draw** — fused overlay onto image | `processor.draw_masks()` | `draw_proto_masks()` | `hal_image_processor_draw_masks()` | Yes | Yes | No |
+| **Draw pre-decoded** — draw already-decoded masks | `processor.draw_decoded_masks()` | `draw_decoded_masks()` | `hal_image_processor_draw_decoded_masks()` | Yes | Yes | No |
 
 > **G2D limitation:** The NXP G2D hardware accelerator does not support mask
 > rendering. On platforms where G2D is the primary image processor (e.g.
@@ -585,7 +585,7 @@ The HAL provides two workflows for consuming these masks:
 > quantization format. Use `mask_benchmark` for precise on-target measurements:
 > `cargo bench -p edgefirst-image --bench mask_benchmark`
 
-**Fused proto→pixel algorithm (`draw_masks_proto`)**
+**Fused proto→pixel algorithm (`draw_proto_masks`)**
 
 Instead of computing the matmul at proto resolution and upsampling the result,
 the fused path upsamples the proto field itself and evaluates the dot product at
@@ -616,7 +616,7 @@ between the two methods.
 
 **GPU implementation (OpenGL)**
 
-*Draw path (`draw_masks_proto`) — sigmoid shaders with alpha blending:*
+*Draw path (`draw_proto_masks`) — sigmoid shaders with alpha blending:*
 
 The fragment shader computes sigmoid(logit) and blends the detection color onto
 the framebuffer using `GL_SRC_ALPHA / GL_ONE_MINUS_SRC_ALPHA`.
@@ -708,7 +708,7 @@ flowchart LR
 
 ### Cross-Crate Dependencies
 
-The `edgefirst_image` crate depends on `edgefirst_decoder` for the `DetectBox`, `ProtoData`, and `Segmentation` types used in the mask rendering APIs (`draw_masks`, `draw_masks_proto`). This means the image crate imports decoder types but does not import the `Decoder` itself — it only needs the output data structures that describe detections and masks.
+The `edgefirst_image` crate depends on `edgefirst_decoder` for the `DetectBox`, `ProtoData`, and `Segmentation` types used in the mask rendering APIs (`draw_decoded_masks`, `draw_proto_masks`). This means the image crate imports decoder types but does not import the `Decoder` itself — it only needs the output data structures that describe detections and masks.
 
 ### 6. C API Bindings (`edgefirst-hal-capi`)
 
@@ -1071,7 +1071,7 @@ on i.MX8/i.MX95 targets.
 - `decode_masks/proto` — NMS + extract mask coefficients (no mask materialization)
 - `decode_masks/materialize` — NMS + extract proto data + materialize pixel masks on CPU
 - `draw_masks/{cpu,opengl}` — pre-decoded mask overlay
-- `draw_masks_proto/{cpu,opengl}` — fused proto→overlay
+- `draw_proto_masks/{cpu,opengl}` — fused proto→overlay
 
 Run: `cargo bench -p edgefirst-image --bench mask_benchmark`
 
