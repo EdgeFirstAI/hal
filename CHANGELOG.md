@@ -26,9 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     mask and bounding box color; `0.5` produces semi-transparent overlays.
 
   Available in Rust, Python (`background=None, opacity=1.0` keyword args
-  on `Decoder.draw_masks()` and `ImageProcessor.draw_masks()`), and C
-  (`hal_decoder_draw_masks()` gains `background` and `opacity` params).
-  All 7 GL fragment shaders updated with `uniform float opacity`.
+  on `ImageProcessor.draw_masks_fused()` and `ImageProcessor.draw_masks()`),
+  and C (`hal_image_processor_draw_masks_fused()` gains `background` and
+  `opacity` params). All 7 GL fragment shaders updated with `uniform float
+  opacity`.
 
 - **GLES 3.1 context upgrade** — EGL context creation now requests
   GLES 3.1 (compute shaders) with automatic fallback to 3.0.
@@ -40,9 +41,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trait impls. Pass `MaskOverlay::default()` for backward-compatible
   behaviour.
 
-- **C API `hal_decoder_draw_masks()`** gains `background` (`const
-  hal_tensor*`, pass `NULL` for none) and `opacity` (`float`, pass `1.0`
-  for none) parameters before `out_boxes`. Existing C callers must update.
+- **Fused `draw_masks` moved from Decoder to ImageProcessor** — the fused
+  decode+render path is now owned by ImageProcessor (which owns the GPU).
+  - **Python**: `Decoder.draw_masks()` removed. Use
+    `ImageProcessor.draw_masks_fused(decoder, model_output, dst, ...)`.
+  - **C API**: `hal_decoder_draw_masks()` and `hal_decoder_draw_masks_tracked()`
+    removed. Use `hal_image_processor_draw_masks_fused()` and
+    `hal_image_processor_draw_masks_fused_tracked()` (processor is now the
+    first parameter).
+  - **Rust**: No change to the internal `ImageProcessorTrait` API.
+
+- **C API `hal_image_processor_draw_masks_fused()`** gains `background`
+  (`const hal_tensor*`, pass `NULL` for none) and `opacity` (`float`, pass
+  `1.0` for none) parameters. Existing C callers must update.
 
 ### Performance
 

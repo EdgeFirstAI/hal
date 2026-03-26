@@ -1196,35 +1196,6 @@ const uint8_t *hal_segmentation_list_get_mask(const struct hal_segmentation_list
 void hal_segmentation_list_free(struct hal_segmentation_list *list);
 
 /**
- * Decode model outputs and draw masks directly onto a destination image.
- *
- * This is the fused path: for segmentation models, prototype data is passed
- * directly to the renderer without materializing intermediate mask arrays.
- * For detection-only models, this falls back to decode + draw_masks.
- *
- * @param decoder Decoder handle
- * @param processor Image processor handle
- * @param outputs Array of output tensor pointers
- * @param num_outputs Number of output tensors
- * @param dst Destination image to draw onto
- * @param background Optional background image (NULL to draw over dst)
- * @param opacity Mask opacity in [0.0, 1.0] (1.0 = fully opaque)
- * @param out_boxes Output parameter for detection box list (caller must free)
- * @return 0 on success, -1 on error
- * @par Errors (errno):
- * - EINVAL: Invalid argument (NULL decoder/processor/outputs/dst/out_boxes)
- * - EIO: Decoding or drawing failed
- */
-int hal_decoder_draw_masks(const struct hal_decoder *decoder,
-                           struct hal_image_processor *processor,
-                           const struct hal_tensor *const *outputs,
-                           size_t num_outputs,
-                           struct hal_tensor *dst,
-                           const struct hal_tensor *background,
-                           float opacity,
-                           struct hal_detect_box_list **out_boxes);
-
-/**
  * Decode model outputs into tracked detection boxes and segmentation masks.
  *
  * Automatically selects the decoding path based on tensor dtype:
@@ -1253,42 +1224,6 @@ int hal_decoder_decode_tracked(const struct hal_decoder *decoder,
                                struct hal_detect_box_list **out_boxes,
                                struct hal_segmentation_list **out_segmentations,
                                struct hal_track_info_list **out_tracks);
-
-/**
- * Decode tracked model outputs and draw masks directly onto a destination image.
- *
- * This is the fused tracked path: for segmentation models, prototype data is
- * passed directly to the renderer without materializing intermediate mask
- * arrays. Object tracking is applied to maintain identities across frames.
- * For detection-only models, this falls back to tracked decode + draw_masks.
- *
- * @param decoder Decoder handle
- * @param tracker Tracker handle for maintaining object identities across frames
- * @param timestamp Timestamp for the current frame (e.g., in nanoseconds)
- * @param processor Image processor handle
- * @param outputs Array of output tensor pointers
- * @param num_outputs Number of output tensors
- * @param dst Destination image to draw onto
- * @param background Optional background image (NULL to draw over dst)
- * @param opacity Mask opacity in [0.0, 1.0] (1.0 = fully opaque, clamped)
- * @param out_boxes Output parameter for detection box list (caller must free)
- * @param out_tracks Output parameter for track info list (can be NULL; caller must free if non-NULL)
- * @return 0 on success, -1 on error
- * @par Errors (errno):
- * - EINVAL: Invalid argument (NULL decoder/tracker/processor/outputs/dst/out_boxes, or background == dst)
- * - EIO: Decoding or drawing failed
- */
-int hal_decoder_draw_masks_tracked(const struct hal_decoder *decoder,
-                                   struct hal_bytetrack *tracker,
-                                   uint64_t timestamp,
-                                   struct hal_image_processor *processor,
-                                   const struct hal_tensor *const *outputs,
-                                   size_t num_outputs,
-                                   struct hal_tensor *dst,
-                                   const struct hal_tensor *background,
-                                   float opacity,
-                                   struct hal_detect_box_list **out_boxes,
-                                   struct hal_track_info_list **out_tracks);
 
 /**
  * Create a new rectangle.
@@ -1623,6 +1558,71 @@ int hal_image_processor_draw_masks(struct hal_image_processor *processor,
                                    const struct hal_segmentation_list *segmentations,
                                    const struct hal_tensor *background,
                                    float opacity);
+
+/**
+ * Decode model outputs and draw masks directly onto a destination image.
+ *
+ * This is the fused path: for segmentation models, prototype data is passed
+ * directly to the renderer without materializing intermediate mask arrays.
+ * For detection-only models, this falls back to decode + draw_masks.
+ *
+ * @param processor Image processor handle
+ * @param decoder Decoder handle
+ * @param outputs Array of output tensor pointers
+ * @param num_outputs Number of output tensors
+ * @param dst Destination image to draw onto
+ * @param background Optional background image (NULL to draw over dst)
+ * @param opacity Mask opacity in [0.0, 1.0] (1.0 = fully opaque)
+ * @param out_boxes Output parameter for detection box list (caller must free)
+ * @return 0 on success, -1 on error
+ * @par Errors (errno):
+ * - EINVAL: Invalid argument (NULL processor/decoder/outputs/dst/out_boxes)
+ * - EIO: Decoding or drawing failed
+ */
+int hal_image_processor_draw_masks_fused(struct hal_image_processor *processor,
+                                         const struct hal_decoder *decoder,
+                                         const struct hal_tensor *const *outputs,
+                                         size_t num_outputs,
+                                         struct hal_tensor *dst,
+                                         const struct hal_tensor *background,
+                                         float opacity,
+                                         struct hal_detect_box_list **out_boxes);
+
+/**
+ * Decode tracked model outputs and draw masks directly onto a destination image.
+ *
+ * This is the fused tracked path: for segmentation models, prototype data is
+ * passed directly to the renderer without materializing intermediate mask
+ * arrays. Object tracking is applied to maintain identities across frames.
+ * For detection-only models, this falls back to tracked decode + draw_masks.
+ *
+ * @param processor Image processor handle
+ * @param decoder Decoder handle
+ * @param tracker Tracker handle for maintaining object identities across frames
+ * @param timestamp Timestamp for the current frame (e.g., in nanoseconds)
+ * @param outputs Array of output tensor pointers
+ * @param num_outputs Number of output tensors
+ * @param dst Destination image to draw onto
+ * @param background Optional background image (NULL to draw over dst)
+ * @param opacity Mask opacity in [0.0, 1.0] (1.0 = fully opaque, clamped)
+ * @param out_boxes Output parameter for detection box list (caller must free)
+ * @param out_tracks Output parameter for track info list (can be NULL; caller must free if non-NULL)
+ * @return 0 on success, -1 on error
+ * @par Errors (errno):
+ * - EINVAL: Invalid argument (NULL processor/decoder/tracker/outputs/dst/out_boxes, or background == dst)
+ * - EIO: Decoding or drawing failed
+ */
+int hal_image_processor_draw_masks_fused_tracked(struct hal_image_processor *processor,
+                                                 const struct hal_decoder *decoder,
+                                                 struct hal_bytetrack *tracker,
+                                                 uint64_t timestamp,
+                                                 const struct hal_tensor *const *outputs,
+                                                 size_t num_outputs,
+                                                 struct hal_tensor *dst,
+                                                 const struct hal_tensor *background,
+                                                 float opacity,
+                                                 struct hal_detect_box_list **out_boxes,
+                                                 struct hal_track_info_list **out_tracks);
 
 /**
  * Set class colors for segmentation rendering.

@@ -7,7 +7,6 @@
 //! into detection boxes and segmentation masks.
 
 use crate::error::{set_error, set_error_null, str_to_c_string};
-use crate::image::HalImageProcessor;
 use crate::tensor::HalTensor;
 use crate::{
     check_null, check_null_ret_null, try_or_errno, try_or_null, HalByteTrack, HalTrackInfoList,
@@ -16,7 +15,6 @@ use edgefirst_decoder::{
     configs, configs::Nms, dequantize_cpu_chunked, segmentation_to_mask, ArrayViewDQuantized,
     ConfigOutput, Decoder, DecoderBuilder, DetectBox, ProtoData, Quantization, Segmentation,
 };
-use edgefirst_image::ImageProcessorTrait;
 use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait};
 use edgefirst_tracker::{ByteTrack, TrackInfo};
 use libc::{c_char, c_int, size_t};
@@ -295,7 +293,7 @@ pub struct HalDecoderParams {
 
 /// Opaque decoder type.
 pub struct HalDecoder {
-    inner: Decoder,
+    pub(crate) inner: Decoder,
 }
 
 /// List of detection boxes.
@@ -937,7 +935,7 @@ pub unsafe extern "C" fn hal_decoder_decode(
 ///
 /// Holds a mapped tensor of a specific integer type, keeping the map alive
 /// while `ArrayViewDQuantized` borrows from it.
-enum TypedMap {
+pub(crate) enum TypedMap {
     U8(edgefirst_tensor::TensorMap<u8>),
     I8(edgefirst_tensor::TensorMap<i8>),
     U16(edgefirst_tensor::TensorMap<u16>),
@@ -1022,7 +1020,7 @@ impl TypedMap {
 ///
 /// Returns `-1` with errno set on NULL tensor pointers, unsupported dtypes,
 /// or mapping failures.
-unsafe fn map_quantized_outputs(
+pub(crate) unsafe fn map_quantized_outputs(
     outputs_slice: &[*const HalTensor],
 ) -> Result<Vec<TypedMap>, c_int> {
     let mut maps: Vec<TypedMap> = Vec::with_capacity(outputs_slice.len());
@@ -1041,7 +1039,9 @@ unsafe fn map_quantized_outputs(
 /// # Errors
 ///
 /// Returns `-1` with `errno = EINVAL` if any view cannot be constructed.
-fn views_from_maps<'a>(maps: &'a [TypedMap]) -> Result<Vec<ArrayViewDQuantized<'a>>, c_int> {
+pub(crate) fn views_from_maps<'a>(
+    maps: &'a [TypedMap],
+) -> Result<Vec<ArrayViewDQuantized<'a>>, c_int> {
     let mut views: Vec<ArrayViewDQuantized<'a>> = Vec::with_capacity(maps.len());
     for map in maps {
         views.push(map.as_view()?);
@@ -1052,7 +1052,7 @@ fn views_from_maps<'a>(maps: &'a [TypedMap]) -> Result<Vec<ArrayViewDQuantized<'
 /// Inner helper for quantized decode to manage lifetimes.
 ///
 /// Returns Ok(()) on success or Err(-1) with errno set.
-unsafe fn decode_quantized_inner(
+pub(crate) unsafe fn decode_quantized_inner(
     decoder: &Decoder,
     outputs_slice: &[*const HalTensor],
     boxes: &mut Vec<DetectBox>,
@@ -1072,7 +1072,7 @@ unsafe fn decode_quantized_inner(
 /// Inner helper for quantized decode to manage lifetimes.
 ///
 /// Returns Ok(()) on success or Err(-1) with errno set.
-unsafe fn decode_tracked_quantized_inner(
+pub(crate) unsafe fn decode_tracked_quantized_inner(
     decoder: &Decoder,
     tracker: &mut ByteTrack<DetectBox>,
     timestamp: u64,
@@ -1087,6 +1087,43 @@ unsafe fn decode_tracked_quantized_inner(
     let views = views_from_maps(&maps)?;
     decoder
         .decode_tracked_quantized(tracker, timestamp, &views, boxes, masks, tracks)
+        .map_err(|_| {
+            set_error(libc::EIO);
+            -1
+        })
+}
+
+/// Inner helper for quantized proto decode to manage lifetimes.
+///
+/// Returns Ok(Some(ProtoData)) for seg models, Ok(None) for det-only.
+pub(crate) unsafe fn decode_quantized_proto_inner(
+    decoder: &Decoder,
+    outputs_slice: &[*const HalTensor],
+    boxes: &mut Vec<DetectBox>,
+) -> Result<Option<ProtoData>, c_int> {
+    let maps = map_quantized_outputs(outputs_slice)?;
+    let views = views_from_maps(&maps)?;
+    decoder.decode_quantized_proto(&views, boxes).map_err(|_| {
+        set_error(libc::EIO);
+        -1
+    })
+}
+
+/// Inner helper for tracked quantized proto decode to manage lifetimes.
+///
+/// Returns Ok(Some(ProtoData)) for seg models, Ok(None) for det-only.
+pub(crate) unsafe fn decode_tracked_quantized_proto_inner(
+    decoder: &Decoder,
+    tracker: &mut ByteTrack<DetectBox>,
+    timestamp: u64,
+    outputs_slice: &[*const HalTensor],
+    boxes: &mut Vec<DetectBox>,
+    tracks: &mut Vec<TrackInfo>,
+) -> Result<Option<ProtoData>, c_int> {
+    let maps = map_quantized_outputs(outputs_slice)?;
+    let views = views_from_maps(&maps)?;
+    decoder
+        .decode_tracked_quantized_proto(tracker, timestamp, &views, boxes, tracks)
         .map_err(|_| {
             set_error(libc::EIO);
             -1
@@ -1414,178 +1451,6 @@ pub unsafe extern "C" fn hal_segmentation_list_free(list: *mut HalSegmentationLi
     }
 }
 
-/// Decode model outputs and draw masks directly onto a destination image.
-///
-/// This is the fused path: for segmentation models, prototype data is passed
-/// directly to the renderer without materializing intermediate mask arrays.
-/// For detection-only models, this falls back to decode + draw_masks.
-///
-/// @param decoder Decoder handle
-/// @param processor Image processor handle
-/// @param outputs Array of output tensor pointers
-/// @param num_outputs Number of output tensors
-/// @param dst Destination image to draw onto
-/// @param background Optional background image (NULL to draw over dst)
-/// @param opacity Mask opacity in [0.0, 1.0] (1.0 = fully opaque)
-/// @param out_boxes Output parameter for detection box list (caller must free)
-/// @return 0 on success, -1 on error
-/// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL decoder/processor/outputs/dst/out_boxes)
-/// - EIO: Decoding or drawing failed
-#[no_mangle]
-pub unsafe extern "C" fn hal_decoder_draw_masks(
-    decoder: *const HalDecoder,
-    processor: *mut HalImageProcessor,
-    outputs: *const *const HalTensor,
-    num_outputs: size_t,
-    dst: *mut HalTensor,
-    background: *const HalTensor,
-    opacity: f32,
-    out_boxes: *mut *mut HalDetectBoxList,
-) -> c_int {
-    check_null!(decoder, processor, outputs, dst, out_boxes);
-
-    if num_outputs == 0 {
-        return set_error(libc::EINVAL);
-    }
-
-    // Reject aliased background == dst (would create UB via &mut + & to same object)
-    if !background.is_null() && background as *const _ == dst as *const _ {
-        return set_error(libc::EINVAL);
-    }
-    let bg = if background.is_null() {
-        None
-    } else {
-        Some(&unsafe { &*background }.inner)
-    };
-    let overlay = edgefirst_image::MaskOverlay {
-        background: bg,
-        opacity: opacity.clamp(0.0, 1.0),
-    };
-
-    let outputs_slice = std::slice::from_raw_parts(outputs, num_outputs);
-
-    if outputs_slice[0].is_null() {
-        return set_error(libc::EINVAL);
-    }
-    let is_float = matches!(unsafe { &*outputs_slice[0] }.inner, TensorDyn::F32(_));
-
-    let mut boxes: Vec<DetectBox> = Vec::with_capacity(100);
-
-    if is_float {
-        // Float path: try proto decode first
-        let mut maps = Vec::with_capacity(num_outputs);
-        for &tensor_ptr in outputs_slice {
-            if tensor_ptr.is_null() {
-                return set_error(libc::EINVAL);
-            }
-            match &unsafe { &*tensor_ptr }.inner {
-                TensorDyn::F32(t) => {
-                    let map = try_or_errno!(t.map(), libc::EIO);
-                    maps.push(map);
-                }
-                _ => return set_error(libc::EINVAL),
-            }
-        }
-
-        let mut views: Vec<ArrayViewD<'_, f32>> = Vec::with_capacity(num_outputs);
-        for map in &maps {
-            let shape = map.shape().to_vec();
-            let slice = map.as_slice();
-            let view = try_or_errno!(
-                ArrayViewD::from_shape(shape.as_slice(), slice),
-                libc::EINVAL
-            );
-            views.push(view);
-        }
-
-        let proto_result = try_or_errno!(
-            (*decoder).inner.decode_float_proto(&views, &mut boxes),
-            libc::EIO
-        );
-
-        if let Some(proto_data) = proto_result {
-            // Fused path: render directly from proto data
-            try_or_errno!(
-                (*processor).inner.draw_masks_proto(
-                    &mut (*dst).inner,
-                    &boxes,
-                    &proto_data,
-                    overlay
-                ),
-                libc::EIO
-            );
-        } else {
-            // Detection-only fallback: full decode + draw_masks
-            let mut masks: Vec<Segmentation> = Vec::new();
-            try_or_errno!(
-                (*decoder)
-                    .inner
-                    .decode_float(&views, &mut boxes, &mut masks),
-                libc::EIO
-            );
-            try_or_errno!(
-                (*processor)
-                    .inner
-                    .draw_masks(&mut (*dst).inner, &boxes, &masks, overlay),
-                libc::EIO
-            );
-        }
-    } else {
-        // Quantized path: try proto decode first
-        let proto_result =
-            match decode_quantized_proto_inner(&(*decoder).inner, outputs_slice, &mut boxes) {
-                Ok(proto) => proto,
-                Err(rc) => return rc,
-            };
-
-        if let Some(proto_data) = proto_result {
-            try_or_errno!(
-                (*processor).inner.draw_masks_proto(
-                    &mut (*dst).inner,
-                    &boxes,
-                    &proto_data,
-                    overlay
-                ),
-                libc::EIO
-            );
-        } else {
-            // Detection-only fallback
-            let mut masks: Vec<Segmentation> = Vec::new();
-            if let Err(rc) =
-                decode_quantized_inner(&(*decoder).inner, outputs_slice, &mut boxes, &mut masks)
-            {
-                return rc;
-            }
-            try_or_errno!(
-                (*processor)
-                    .inner
-                    .draw_masks(&mut (*dst).inner, &boxes, &masks, overlay),
-                libc::EIO
-            );
-        }
-    }
-
-    *out_boxes = Box::into_raw(Box::new(HalDetectBoxList { boxes }));
-    0
-}
-
-/// Inner helper for quantized proto decode to manage lifetimes.
-///
-/// Returns Ok(Some(ProtoData)) for seg models, Ok(None) for det-only.
-unsafe fn decode_quantized_proto_inner(
-    decoder: &Decoder,
-    outputs_slice: &[*const HalTensor],
-    boxes: &mut Vec<DetectBox>,
-) -> Result<Option<ProtoData>, c_int> {
-    let maps = map_quantized_outputs(outputs_slice)?;
-    let views = views_from_maps(&maps)?;
-    decoder.decode_quantized_proto(&views, boxes).map_err(|_| {
-        set_error(libc::EIO);
-        -1
-    })
-}
-
 /// Decode model outputs into tracked detection boxes and segmentation masks.
 ///
 /// Automatically selects the decoding path based on tensor dtype:
@@ -1687,216 +1552,6 @@ pub unsafe extern "C" fn hal_decoder_decode_tracked(
     if !out_segmentations.is_null() {
         *out_segmentations = Box::into_raw(Box::new(HalSegmentationList { masks }));
     }
-
-    if !out_tracks.is_null() {
-        *out_tracks = Box::into_raw(Box::new(HalTrackInfoList { tracks }));
-    }
-
-    0
-}
-
-/// Inner helper for tracked quantized proto decode to manage lifetimes.
-///
-/// Returns Ok(Some(ProtoData)) for seg models, Ok(None) for det-only.
-unsafe fn decode_tracked_quantized_proto_inner(
-    decoder: &Decoder,
-    tracker: &mut ByteTrack<DetectBox>,
-    timestamp: u64,
-    outputs_slice: &[*const HalTensor],
-    boxes: &mut Vec<DetectBox>,
-    tracks: &mut Vec<TrackInfo>,
-) -> Result<Option<ProtoData>, c_int> {
-    let maps = map_quantized_outputs(outputs_slice)?;
-    let views = views_from_maps(&maps)?;
-    decoder
-        .decode_tracked_quantized_proto(tracker, timestamp, &views, boxes, tracks)
-        .map_err(|_| {
-            set_error(libc::EIO);
-            -1
-        })
-}
-
-/// Decode tracked model outputs and draw masks directly onto a destination image.
-///
-/// This is the fused tracked path: for segmentation models, prototype data is
-/// passed directly to the renderer without materializing intermediate mask
-/// arrays. Object tracking is applied to maintain identities across frames.
-/// For detection-only models, this falls back to tracked decode + draw_masks.
-///
-/// @param decoder Decoder handle
-/// @param tracker Tracker handle for maintaining object identities across frames
-/// @param timestamp Timestamp for the current frame (e.g., in nanoseconds)
-/// @param processor Image processor handle
-/// @param outputs Array of output tensor pointers
-/// @param num_outputs Number of output tensors
-/// @param dst Destination image to draw onto
-/// @param background Optional background image (NULL to draw over dst)
-/// @param opacity Mask opacity in [0.0, 1.0] (1.0 = fully opaque, clamped)
-/// @param out_boxes Output parameter for detection box list (caller must free)
-/// @param out_tracks Output parameter for track info list (can be NULL; caller must free if non-NULL)
-/// @return 0 on success, -1 on error
-/// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL decoder/tracker/processor/outputs/dst/out_boxes, or background == dst)
-/// - EIO: Decoding or drawing failed
-#[no_mangle]
-pub unsafe extern "C" fn hal_decoder_draw_masks_tracked(
-    decoder: *const HalDecoder,
-    tracker: *mut HalByteTrack,
-    timestamp: u64,
-    processor: *mut HalImageProcessor,
-    outputs: *const *const HalTensor,
-    num_outputs: size_t,
-    dst: *mut HalTensor,
-    background: *const HalTensor,
-    opacity: f32,
-    out_boxes: *mut *mut HalDetectBoxList,
-    out_tracks: *mut *mut HalTrackInfoList,
-) -> c_int {
-    check_null!(decoder, tracker, processor, outputs, dst, out_boxes);
-
-    if num_outputs == 0 {
-        return set_error(libc::EINVAL);
-    }
-
-    // Reject aliased background == dst
-    if !background.is_null() && background as *const _ == dst as *const _ {
-        return set_error(libc::EINVAL);
-    }
-
-    let bg = if background.is_null() {
-        None
-    } else {
-        Some(&unsafe { &*background }.inner)
-    };
-    let overlay = edgefirst_image::MaskOverlay {
-        background: bg,
-        opacity: opacity.clamp(0.0, 1.0),
-    };
-
-    let outputs_slice = std::slice::from_raw_parts(outputs, num_outputs);
-    check_null!(outputs_slice[0]);
-
-    let is_float = matches!(unsafe { &*outputs_slice[0] }.inner, TensorDyn::F32(_));
-
-    let mut boxes: Vec<DetectBox> = Vec::with_capacity(100);
-    let mut tracks: Vec<TrackInfo> = Vec::new();
-
-    if is_float {
-        // Float path: try tracked proto decode first
-        let mut maps = Vec::with_capacity(num_outputs);
-        for &tensor_ptr in outputs_slice {
-            check_null!(tensor_ptr);
-            match &unsafe { &*tensor_ptr }.inner {
-                TensorDyn::F32(t) => {
-                    let map = try_or_errno!(t.map(), libc::EIO);
-                    maps.push(map);
-                }
-                _ => return set_error(libc::EINVAL),
-            }
-        }
-
-        let mut views: Vec<ArrayViewD<'_, f32>> = Vec::with_capacity(num_outputs);
-        for map in &maps {
-            let shape = map.shape().to_vec();
-            let slice = map.as_slice();
-            let view = try_or_errno!(
-                ArrayViewD::from_shape(shape.as_slice(), slice),
-                libc::EINVAL
-            );
-            views.push(view);
-        }
-
-        let proto_result = try_or_errno!(
-            (*decoder).inner.decode_tracked_float_proto(
-                &mut (*tracker).inner,
-                timestamp,
-                &views,
-                &mut boxes,
-                &mut tracks
-            ),
-            libc::EIO
-        );
-
-        if let Some(proto_data) = proto_result {
-            // Fused path: render directly from proto data
-            try_or_errno!(
-                (*processor).inner.draw_masks_proto(
-                    &mut (*dst).inner,
-                    &boxes,
-                    &proto_data,
-                    overlay
-                ),
-                libc::EIO
-            );
-        } else {
-            // Detection-only fallback: full tracked decode + draw_masks
-            let mut masks: Vec<Segmentation> = Vec::new();
-            try_or_errno!(
-                (*decoder).inner.decode_tracked_float(
-                    &mut (*tracker).inner,
-                    timestamp,
-                    &views,
-                    &mut boxes,
-                    &mut masks,
-                    &mut tracks
-                ),
-                libc::EIO
-            );
-            try_or_errno!(
-                (*processor)
-                    .inner
-                    .draw_masks(&mut (*dst).inner, &boxes, &masks, overlay),
-                libc::EIO
-            );
-        }
-    } else {
-        // Quantized path: try tracked proto decode first
-        let proto_result = match decode_tracked_quantized_proto_inner(
-            &(*decoder).inner,
-            &mut (*tracker).inner,
-            timestamp,
-            outputs_slice,
-            &mut boxes,
-            &mut tracks,
-        ) {
-            Ok(proto) => proto,
-            Err(rc) => return rc,
-        };
-
-        if let Some(proto_data) = proto_result {
-            try_or_errno!(
-                (*processor).inner.draw_masks_proto(
-                    &mut (*dst).inner,
-                    &boxes,
-                    &proto_data,
-                    overlay
-                ),
-                libc::EIO
-            );
-        } else {
-            // Detection-only fallback
-            let mut masks: Vec<Segmentation> = Vec::new();
-            if let Err(rc) = decode_tracked_quantized_inner(
-                &(*decoder).inner,
-                &mut (*tracker).inner,
-                timestamp,
-                outputs_slice,
-                &mut boxes,
-                &mut masks,
-                &mut tracks,
-            ) {
-                return rc;
-            }
-            try_or_errno!(
-                (*processor)
-                    .inner
-                    .draw_masks(&mut (*dst).inner, &boxes, &masks, overlay),
-                libc::EIO
-            );
-        }
-    }
-
-    *out_boxes = Box::into_raw(Box::new(HalDetectBoxList { boxes }));
 
     if !out_tracks.is_null() {
         *out_tracks = Box::into_raw(Box::new(HalTrackInfoList { tracks }));
@@ -3337,11 +2992,11 @@ outputs:
             let mut box_list: *mut HalDetectBoxList = std::ptr::null_mut();
             let mut track_list: *mut HalTrackInfoList = std::ptr::null_mut();
 
-            let rc = hal_decoder_draw_masks_tracked(
+            let rc = crate::image::hal_image_processor_draw_masks_fused_tracked(
+                processor,
                 decoder,
                 tracker,
                 0,
-                processor,
                 outputs.as_ptr(),
                 5,
                 image,
@@ -3380,11 +3035,11 @@ outputs:
             box_list = std::ptr::null_mut();
             track_list = std::ptr::null_mut();
 
-            let rc = hal_decoder_draw_masks_tracked(
+            let rc = crate::image::hal_image_processor_draw_masks_fused_tracked(
+                processor,
                 decoder,
                 tracker,
                 100_000_000 / 3,
-                processor,
                 outputs.as_ptr(),
                 5,
                 image,
@@ -3599,11 +3254,11 @@ outputs:
             let mut box_list: *mut HalDetectBoxList = std::ptr::null_mut();
             let mut track_list: *mut HalTrackInfoList = std::ptr::null_mut();
 
-            let rc = hal_decoder_draw_masks_tracked(
+            let rc = crate::image::hal_image_processor_draw_masks_fused_tracked(
+                processor,
                 decoder,
                 tracker,
                 0,
-                processor,
                 outputs.as_ptr(),
                 5,
                 image,
@@ -3642,11 +3297,11 @@ outputs:
             box_list = std::ptr::null_mut();
             track_list = std::ptr::null_mut();
 
-            let rc = hal_decoder_draw_masks_tracked(
+            let rc = crate::image::hal_image_processor_draw_masks_fused_tracked(
+                processor,
                 decoder,
                 tracker,
                 100_000_000 / 3,
-                processor,
                 outputs.as_ptr(),
                 5,
                 image,

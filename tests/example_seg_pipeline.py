@@ -536,7 +536,7 @@ def run_hal_pipeline_bench(image_path, metadata, interp, processor):
     render_dst = Tensor.image(640, 640, PixelFormat.Rgba)
     processor.convert(dst_rgb, render_dst)
     decoder = Decoder(metadata, score_threshold=0.25, iou_threshold=0.45)
-    decoder.draw_masks(outputs, processor, render_dst)
+    processor.draw_masks_fused(decoder, outputs, render_dst)
     timings["decode+render"] = (time.perf_counter() - t0) * 1000
 
     timings["total"] = sum(timings.values())
