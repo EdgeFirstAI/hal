@@ -629,6 +629,7 @@ dependencies = [
  "edgefirst-decoder",
  "edgefirst-gbm",
  "edgefirst-tensor",
+ "edgefirst-tracker",
  "enum_dispatch",
  "env_logger",
  "fast_image_resize",

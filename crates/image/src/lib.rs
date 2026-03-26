@@ -1106,6 +1106,89 @@ impl ImageProcessor {
             Ok(tensor)
         }
     }
+
+    /// Decode model outputs and draw segmentation masks onto `dst`.
+    ///
+    /// This is the primary mask rendering API. The processor decodes via the
+    /// provided [`Decoder`], selects the optimal rendering path (hybrid
+    /// CPU+GL or fused GPU), and composites masks onto `dst`.
+    ///
+    /// Returns the detected bounding boxes.
+    pub fn draw_masks(
+        &mut self,
+        decoder: &edgefirst_decoder::Decoder,
+        outputs: &[&TensorDyn],
+        dst: &mut TensorDyn,
+        overlay: MaskOverlay<'_>,
+    ) -> Result<Vec<DetectBox>> {
+        let mut output_boxes = Vec::with_capacity(100);
+
+        // Try proto path first (fused rendering without materializing masks)
+        let proto_result = decoder
+            .decode_proto(outputs, &mut output_boxes)
+            .map_err(|e| Error::Internal(format!("decode_proto: {e:#?}")))?;
+
+        if let Some(proto_data) = proto_result {
+            self.draw_proto_masks(dst, &output_boxes, &proto_data, overlay)?;
+        } else {
+            // Detection-only or unsupported model: full decode + render
+            let mut output_masks = Vec::with_capacity(100);
+            decoder
+                .decode(outputs, &mut output_boxes, &mut output_masks)
+                .map_err(|e| Error::Internal(format!("decode: {e:#?}")))?;
+            self.draw_decoded_masks(dst, &output_boxes, &output_masks, overlay)?;
+        }
+        Ok(output_boxes)
+    }
+
+    /// Decode tracked model outputs and draw segmentation masks onto `dst`.
+    ///
+    /// Like [`draw_masks`](Self::draw_masks) but integrates a tracker for
+    /// maintaining object identities across frames. The tracker runs after
+    /// NMS but before mask extraction.
+    ///
+    /// Returns detected boxes and track info.
+    #[cfg(feature = "tracker")]
+    pub fn draw_masks_tracked<TR: edgefirst_tracker::Tracker<DetectBox>>(
+        &mut self,
+        decoder: &edgefirst_decoder::Decoder,
+        tracker: &mut TR,
+        timestamp: u64,
+        outputs: &[&TensorDyn],
+        dst: &mut TensorDyn,
+        overlay: MaskOverlay<'_>,
+    ) -> Result<(Vec<DetectBox>, Vec<edgefirst_tracker::TrackInfo>)> {
+        let mut output_boxes = Vec::with_capacity(100);
+        let mut output_tracks = Vec::new();
+
+        let proto_result = decoder
+            .decode_proto_tracked(
+                tracker,
+                timestamp,
+                outputs,
+                &mut output_boxes,
+                &mut output_tracks,
+            )
+            .map_err(|e| Error::Internal(format!("decode_proto_tracked: {e:#?}")))?;
+
+        if let Some(proto_data) = proto_result {
+            self.draw_proto_masks(dst, &output_boxes, &proto_data, overlay)?;
+        } else {
+            let mut output_masks = Vec::with_capacity(100);
+            decoder
+                .decode_tracked(
+                    tracker,
+                    timestamp,
+                    outputs,
+                    &mut output_boxes,
+                    &mut output_masks,
+                    &mut output_tracks,
+                )
+                .map_err(|e| Error::Internal(format!("decode_tracked: {e:#?}")))?;
+            self.draw_decoded_masks(dst, &output_boxes, &output_masks, overlay)?;
+        }
+        Ok((output_boxes, output_tracks))
+    }
 }
 
 impl ImageProcessorTrait for ImageProcessor {
