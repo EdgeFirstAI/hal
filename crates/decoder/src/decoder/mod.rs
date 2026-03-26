@@ -157,6 +157,7 @@ macro_rules! with_quantized {
 mod builder;
 mod helpers;
 mod postprocess;
+mod tensor_bridge;
 mod tests;
 
 pub use builder::DecoderBuilder;
@@ -735,6 +736,87 @@ impl Decoder {
             }
         }
     }
+
+    // ========================================================================
+    // TensorDyn-based public API
+    // ========================================================================
+
+    /// Decode model outputs into detection boxes and segmentation masks.
+    ///
+    /// This is the primary decode API. Accepts `TensorDyn` outputs directly
+    /// from model inference. Automatically dispatches to quantized or float
+    /// paths based on the tensor dtype.
+    ///
+    /// # Arguments
+    ///
+    /// * `outputs` - Tensor outputs from model inference
+    /// * `output_boxes` - Destination for decoded detection boxes (cleared first)
+    /// * `output_masks` - Destination for decoded segmentation masks (cleared first)
+    ///
+    /// # Errors
+    ///
+    /// Returns `DecoderError` if tensor mapping fails, dtypes are unsupported,
+    /// or the outputs don't match the decoder's model configuration.
+    pub fn decode(
+        &self,
+        outputs: &[&edgefirst_tensor::TensorDyn],
+        output_boxes: &mut Vec<DetectBox>,
+        output_masks: &mut Vec<Segmentation>,
+    ) -> Result<(), DecoderError> {
+        let mapped = tensor_bridge::map_tensors(outputs)?;
+        match &mapped {
+            tensor_bridge::MappedOutputs::Quantized(maps) => {
+                let views = tensor_bridge::quantized_views(maps)?;
+                self.decode_quantized(&views, output_boxes, output_masks)
+            }
+            tensor_bridge::MappedOutputs::Float32(maps) => {
+                let views = tensor_bridge::f32_views(maps)?;
+                self.decode_float(&views, output_boxes, output_masks)
+            }
+            tensor_bridge::MappedOutputs::Float64(maps) => {
+                let views = tensor_bridge::f64_views(maps)?;
+                self.decode_float(&views, output_boxes, output_masks)
+            }
+        }
+    }
+
+    /// Decode model outputs into detection boxes, returning raw proto data
+    /// for segmentation models instead of materialized masks.
+    ///
+    /// Accepts `TensorDyn` outputs directly from model inference.
+    /// Returns `Ok(None)` for detection-only and ModelPack models.
+    /// Returns `Ok(Some(ProtoData))` for YOLO segmentation models.
+    ///
+    /// # Arguments
+    ///
+    /// * `outputs` - Tensor outputs from model inference
+    /// * `output_boxes` - Destination for decoded detection boxes (cleared first)
+    ///
+    /// # Errors
+    ///
+    /// Returns `DecoderError` if tensor mapping fails, dtypes are unsupported,
+    /// or the outputs don't match the decoder's model configuration.
+    pub fn decode_proto(
+        &self,
+        outputs: &[&edgefirst_tensor::TensorDyn],
+        output_boxes: &mut Vec<DetectBox>,
+    ) -> Result<Option<ProtoData>, DecoderError> {
+        let mapped = tensor_bridge::map_tensors(outputs)?;
+        match &mapped {
+            tensor_bridge::MappedOutputs::Quantized(maps) => {
+                let views = tensor_bridge::quantized_views(maps)?;
+                self.decode_quantized_proto(&views, output_boxes)
+            }
+            tensor_bridge::MappedOutputs::Float32(maps) => {
+                let views = tensor_bridge::f32_views(maps)?;
+                self.decode_float_proto(&views, output_boxes)
+            }
+            tensor_bridge::MappedOutputs::Float64(maps) => {
+                let views = tensor_bridge::f64_views(maps)?;
+                self.decode_float_proto(&views, output_boxes)
+            }
+        }
+    }
 }
 
 #[cfg(feature = "tracker")]
@@ -1275,6 +1357,138 @@ impl Decoder {
                     output_tracks,
                 )?;
                 Ok(Some(proto))
+            }
+        }
+    }
+
+    // ========================================================================
+    // TensorDyn-based tracked public API
+    // ========================================================================
+
+    /// Decode model outputs with tracking.
+    ///
+    /// Accepts `TensorDyn` outputs directly from model inference. Automatically
+    /// dispatches to quantized or float paths based on the tensor dtype, then
+    /// updates the tracker with the decoded boxes.
+    ///
+    /// # Arguments
+    ///
+    /// * `tracker` - The tracker instance to update
+    /// * `timestamp` - Current frame timestamp
+    /// * `outputs` - Tensor outputs from model inference
+    /// * `output_boxes` - Destination for decoded detection boxes (cleared first)
+    /// * `output_masks` - Destination for decoded segmentation masks (cleared first)
+    /// * `output_tracks` - Destination for track info (cleared first)
+    ///
+    /// # Errors
+    ///
+    /// Returns `DecoderError` if tensor mapping fails, dtypes are unsupported,
+    /// or the outputs don't match the decoder's model configuration.
+    pub fn decode_tracked<TR: edgefirst_tracker::Tracker<DetectBox>>(
+        &self,
+        tracker: &mut TR,
+        timestamp: u64,
+        outputs: &[&edgefirst_tensor::TensorDyn],
+        output_boxes: &mut Vec<DetectBox>,
+        output_masks: &mut Vec<Segmentation>,
+        output_tracks: &mut Vec<edgefirst_tracker::TrackInfo>,
+    ) -> Result<(), DecoderError> {
+        let mapped = tensor_bridge::map_tensors(outputs)?;
+        match &mapped {
+            tensor_bridge::MappedOutputs::Quantized(maps) => {
+                let views = tensor_bridge::quantized_views(maps)?;
+                self.decode_tracked_quantized(
+                    tracker,
+                    timestamp,
+                    &views,
+                    output_boxes,
+                    output_masks,
+                    output_tracks,
+                )
+            }
+            tensor_bridge::MappedOutputs::Float32(maps) => {
+                let views = tensor_bridge::f32_views(maps)?;
+                self.decode_tracked_float(
+                    tracker,
+                    timestamp,
+                    &views,
+                    output_boxes,
+                    output_masks,
+                    output_tracks,
+                )
+            }
+            tensor_bridge::MappedOutputs::Float64(maps) => {
+                let views = tensor_bridge::f64_views(maps)?;
+                self.decode_tracked_float(
+                    tracker,
+                    timestamp,
+                    &views,
+                    output_boxes,
+                    output_masks,
+                    output_tracks,
+                )
+            }
+        }
+    }
+
+    /// Decode model outputs with tracking, returning raw proto data for
+    /// segmentation models.
+    ///
+    /// Accepts `TensorDyn` outputs directly from model inference.
+    /// Returns `Ok(None)` for detection-only and ModelPack models.
+    /// Returns `Ok(Some(ProtoData))` for YOLO segmentation models.
+    ///
+    /// # Arguments
+    ///
+    /// * `tracker` - The tracker instance to update
+    /// * `timestamp` - Current frame timestamp
+    /// * `outputs` - Tensor outputs from model inference
+    /// * `output_boxes` - Destination for decoded detection boxes (cleared first)
+    /// * `output_tracks` - Destination for track info (cleared first)
+    ///
+    /// # Errors
+    ///
+    /// Returns `DecoderError` if tensor mapping fails, dtypes are unsupported,
+    /// or the outputs don't match the decoder's model configuration.
+    pub fn decode_proto_tracked<TR: edgefirst_tracker::Tracker<DetectBox>>(
+        &self,
+        tracker: &mut TR,
+        timestamp: u64,
+        outputs: &[&edgefirst_tensor::TensorDyn],
+        output_boxes: &mut Vec<DetectBox>,
+        output_tracks: &mut Vec<edgefirst_tracker::TrackInfo>,
+    ) -> Result<Option<ProtoData>, DecoderError> {
+        let mapped = tensor_bridge::map_tensors(outputs)?;
+        match &mapped {
+            tensor_bridge::MappedOutputs::Quantized(maps) => {
+                let views = tensor_bridge::quantized_views(maps)?;
+                self.decode_tracked_quantized_proto(
+                    tracker,
+                    timestamp,
+                    &views,
+                    output_boxes,
+                    output_tracks,
+                )
+            }
+            tensor_bridge::MappedOutputs::Float32(maps) => {
+                let views = tensor_bridge::f32_views(maps)?;
+                self.decode_tracked_float_proto(
+                    tracker,
+                    timestamp,
+                    &views,
+                    output_boxes,
+                    output_tracks,
+                )
+            }
+            tensor_bridge::MappedOutputs::Float64(maps) => {
+                let views = tensor_bridge::f64_views(maps)?;
+                self.decode_tracked_float_proto(
+                    tracker,
+                    timestamp,
+                    &views,
+                    output_boxes,
+                    output_tracks,
+                )
             }
         }
     }
