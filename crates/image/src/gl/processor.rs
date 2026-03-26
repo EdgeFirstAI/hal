@@ -3567,7 +3567,10 @@ impl GLProcessorST {
         })?;
         let fd = dma.fd.as_raw_fd();
 
-        let pitch = width * bpp;
+        // Use the tensor's stored stride when available (externally allocated
+        // buffers with row padding), otherwise compute the tightly-packed pitch.
+        let pitch = img.effective_row_stride().unwrap_or(width * bpp);
+        let offset = img.plane_offset().unwrap_or(0);
         let egl_img_attr = vec![
             egl_ext::LINUX_DRM_FOURCC as Attrib,
             drm_format as u32 as Attrib,
@@ -3578,7 +3581,7 @@ impl GLProcessorST {
             egl_ext::DMA_BUF_PLANE0_PITCH as Attrib,
             pitch as Attrib,
             egl_ext::DMA_BUF_PLANE0_OFFSET as Attrib,
-            0 as Attrib,
+            offset as Attrib,
             egl_ext::DMA_BUF_PLANE0_FD as Attrib,
             fd as Attrib,
             egl::IMAGE_PRESERVED as Attrib,
