@@ -5,17 +5,28 @@
 import edgefirst_hal
 import numpy as np
 
+from conftest import numpy_to_tensor
+
+
+def _t(arr):
+    """Shorthand to convert a numpy array to a HAL Tensor."""
+    return numpy_to_tensor(arr)
+
 
 def test_tracker():
     """
     Test basic tracking functionality.
     """
-    output0 = np.fromfile(
-        "testdata/modelpack_split_17x30x18.bin", dtype=np.uint8
-    ).reshape(1, 17, 30, 18)
-    output1 = np.fromfile(
-        "testdata/modelpack_split_9x15x18.bin", dtype=np.uint8
-    ).reshape(1, 9, 15, 18)
+    output0 = _t(
+        np.fromfile("testdata/modelpack_split_17x30x18.bin", dtype=np.uint8).reshape(
+            1, 17, 30, 18
+        )
+    )
+    output1 = _t(
+        np.fromfile("testdata/modelpack_split_9x15x18.bin", dtype=np.uint8).reshape(
+            1, 9, 15, 18
+        )
+    )
 
     config = open("testdata/modelpack_split.yaml").read()
     # default settings for tracker, but with 0.96 score threshold
@@ -34,12 +45,16 @@ def test_external_tracker_update():
     """
     Test that external updates to the tracker correctly influence the track states.
     """
-    output0 = np.fromfile(
-        "testdata/modelpack_split_17x30x18.bin", dtype=np.uint8
-    ).reshape(1, 17, 30, 18)
-    output1 = np.fromfile(
-        "testdata/modelpack_split_9x15x18.bin", dtype=np.uint8
-    ).reshape(1, 9, 15, 18)
+    output0 = _t(
+        np.fromfile("testdata/modelpack_split_17x30x18.bin", dtype=np.uint8).reshape(
+            1, 17, 30, 18
+        )
+    )
+    output1 = _t(
+        np.fromfile("testdata/modelpack_split_9x15x18.bin", dtype=np.uint8).reshape(
+            1, 9, 15, 18
+        )
+    )
 
     config = open("testdata/modelpack_split.yaml").read()
     # default settings for tracker, but with 0.96 score threshold
@@ -64,12 +79,14 @@ def test_yolo_seg():
     Test end-to-end tracked decoding with YOLO segmentation data.
     Verifies that masks are not generated for boxes that originate from tracker predictions
     """
-    output0 = np.fromfile("testdata/yolov8_boxes_116x8400.bin", dtype=np.uint8).reshape(
-        1, 116, 8400
-    )
-    output1 = np.fromfile(
+    output0_np = np.fromfile(
+        "testdata/yolov8_boxes_116x8400.bin", dtype=np.uint8
+    ).reshape(1, 116, 8400)
+    output1_np = np.fromfile(
         "testdata/yolov8_protos_160x160x32.bin", dtype=np.uint8
     ).reshape(1, 160, 160, 32)
+    output0 = _t(output0_np)
+    output1 = _t(output1_np)
     config = open("testdata/yolov8_seg.yaml").read()
     tracker = edgefirst_hal.ByteTrack(high_conf=0.2)
     decoder = edgefirst_hal.Decoder.new_from_yaml_str(config, 0.45, 0.45)
@@ -86,7 +103,7 @@ def test_yolo_seg():
     assert len(masks) == 2
 
     # clear boxes
-    output0_cleared = np.zeros_like(output0)
+    output0_cleared = _t(np.zeros_like(output0_np))
 
     # confirm no boxes when decoded normally
     boxes, scores, classes, masks = decoder.decode([output0_cleared, output1])
@@ -182,7 +199,9 @@ outputs:
     tracker = edgefirst_hal.ByteTrack(update=0.1, high_conf=0.3)
 
     # First frame - establish tracks
-    boxes, scores, classes, masks, tracks = decoder.decode_tracked(tracker, 0, [output])
+    boxes, scores, classes, masks, tracks = decoder.decode_tracked(
+        tracker, 0, [_t(output)]
+    )
     assert len(boxes) == 2
 
     expected_box0 = [0.5285137, 0.05305544, 0.87541467, 0.9998909]
@@ -210,7 +229,7 @@ outputs:
 
         timestamp = 100_000_000 * i // 3
         boxes, scores, classes, masks, tracks = decoder.decode_tracked(
-            tracker, timestamp, [out]
+            tracker, timestamp, [_t(out)]
         )
         assert len(boxes) == 2, f"Frame {i}: expected 2 boxes, got {len(boxes)}"
         assert np.allclose(boxes[0], expected_box0, atol=5e-3), (
@@ -242,7 +261,7 @@ def test_tracker_segdet_no_detection_prediction():
 
     # First frame - establish tracks
     boxes, scores, classes, masks, tracks = decoder.decode_tracked(
-        tracker, 0, [output0, output1]
+        tracker, 0, [_t(output0), _t(output1)]
     )
     assert len(boxes) == 2
     assert len(masks) == 2
@@ -257,7 +276,7 @@ def test_tracker_segdet_no_detection_prediction():
     output0_cleared[0, 4:84, :] = 0  # zero out scores
 
     boxes, scores, classes, masks, tracks = decoder.decode_tracked(
-        tracker, 100_000_000 // 3, [output0_cleared, output1]
+        tracker, 100_000_000 // 3, [_t(output0_cleared), _t(output1)]
     )
 
     # Tracker should predict forward with the last known boxes
@@ -295,7 +314,9 @@ outputs:
     tracker = edgefirst_hal.ByteTrack(update=0.1, high_conf=0.3)
 
     # First frame
-    boxes, scores, classes, masks, tracks = decoder.decode_tracked(tracker, 0, [output])
+    boxes, scores, classes, masks, tracks = decoder.decode_tracked(
+        tracker, 0, [_t(output)]
+    )
     assert len(boxes) == 2
 
     expected_box0 = [0.5285137, 0.05305544, 0.87541467, 0.9998909]
@@ -311,7 +332,7 @@ outputs:
 
         timestamp = 100_000_000 * i // 3
         boxes, scores, classes, masks, tracks = decoder.decode_tracked(
-            tracker, timestamp, [out]
+            tracker, timestamp, [_t(out)]
         )
         assert len(boxes) == 2, f"Frame {i}: expected 2 boxes, got {len(boxes)}"
     # After 100 frames of linear X motion (0.001 per frame = 0.1 total)
@@ -331,7 +352,7 @@ outputs:
     output_cleared[0, 4:, :] = -128  # minimum value for int8
 
     boxes, scores, classes, masks, tracks = decoder.decode_tracked(
-        tracker, 100_000_000 * 101 // 3, [output_cleared]
+        tracker, 100_000_000 * 101 // 3, [_t(output_cleared)]
     )
     # Tracker should still produce boxes from prediction
     assert len(boxes) == 2
@@ -367,7 +388,9 @@ outputs:
     tracker = edgefirst_hal.ByteTrack(update=0.1, high_conf=0.7)
 
     # First frame with detection
-    boxes, scores, classes, masks, tracks = decoder.decode_tracked(tracker, 0, [detect])
+    boxes, scores, classes, masks, tracks = decoder.decode_tracked(
+        tracker, 0, [_t(detect)]
+    )
     assert len(boxes) == 1
     assert np.allclose(boxes[0], [0.1234, 0.1234, 0.2345, 0.2345], atol=1e-3)
     assert np.isclose(scores[0], 0.9876, atol=1e-3)
@@ -378,7 +401,7 @@ outputs:
     detect_cleared[0, :, 4] = 0.0  # zero all scores
 
     boxes, scores, classes, masks, tracks = decoder.decode_tracked(
-        tracker, 100_000_000 // 3, [detect_cleared]
+        tracker, 100_000_000 // 3, [_t(detect_cleared)]
     )
     # Tracker should predict forward
     assert len(boxes) == 1
@@ -431,7 +454,7 @@ outputs:
 
     # First frame
     boxes, scores, classes, masks, tracks = decoder.decode_tracked(
-        tracker, 0, [detect, protos]
+        tracker, 0, [_t(detect), _t(protos)]
     )
     assert len(boxes) == 1
 
@@ -451,7 +474,7 @@ outputs:
     detect_cleared[0, :, 4] = 0
 
     boxes, scores, classes, masks, tracks = decoder.decode_tracked(
-        tracker, 100_000_000 // 3, [detect_cleared, protos]
+        tracker, 100_000_000 // 3, [_t(detect_cleared), _t(protos)]
     )
     assert len(boxes) == 1
     # No masks from tracker prediction
@@ -498,7 +521,7 @@ outputs:
     tracker = edgefirst_hal.ByteTrack(update=0.1, high_conf=0.7)
 
     boxes, scores, classes, masks, tracks = decoder.decode_tracked(
-        tracker, 0, [detect, protos]
+        tracker, 0, [_t(detect), _t(protos)]
     )
     assert len(boxes) == 1
     assert np.allclose(boxes[0], [0.1234, 0.1234, 0.2345, 0.2345], atol=1.0 / 160.0)
@@ -508,7 +531,7 @@ outputs:
     detect_cleared[0, :, 4] = 0.0
 
     boxes, scores, classes, masks, tracks = decoder.decode_tracked(
-        tracker, 100_000_000 // 3, [detect_cleared, protos]
+        tracker, 100_000_000 // 3, [_t(detect_cleared), _t(protos)]
     )
     assert len(boxes) == 1
     assert np.allclose(boxes[0], [0.1234, 0.1234, 0.2345, 0.2345], atol=1e-3)
@@ -586,7 +609,9 @@ outputs:
     tracker = edgefirst_hal.ByteTrack(update=0.1, high_conf=0.7)
 
     boxes, scores, classes, masks, tracks = decoder.decode_tracked(
-        tracker, 0, [boxes_arr, scores_arr, classes_arr, mask_arr, protos_arr]
+        tracker,
+        0,
+        [_t(boxes_arr), _t(scores_arr), _t(classes_arr), _t(mask_arr), _t(protos_arr)],
     )
     assert len(boxes) == 1
 
@@ -606,7 +631,13 @@ outputs:
     boxes, scores, classes, masks, tracks = decoder.decode_tracked(
         tracker,
         100_000_000 // 3,
-        [boxes_arr, scores_cleared, classes_arr, mask_arr, protos_arr],
+        [
+            _t(boxes_arr),
+            _t(scores_cleared),
+            _t(classes_arr),
+            _t(mask_arr),
+            _t(protos_arr),
+        ],
     )
     assert len(boxes) == 1
     assert masks == []
@@ -678,7 +709,9 @@ outputs:
     tracker = edgefirst_hal.ByteTrack(update=0.1, high_conf=0.7)
 
     boxes, scores, classes, masks, tracks = decoder.decode_tracked(
-        tracker, 0, [boxes_arr, scores_arr, classes_arr, mask_arr, protos_arr]
+        tracker,
+        0,
+        [_t(boxes_arr), _t(scores_arr), _t(classes_arr), _t(mask_arr), _t(protos_arr)],
     )
     assert len(boxes) == 1
     assert np.allclose(boxes[0], [0.1234, 0.1234, 0.2345, 0.2345], atol=1.0 / 160.0)
@@ -689,7 +722,13 @@ outputs:
     boxes, scores, classes, masks, tracks = decoder.decode_tracked(
         tracker,
         100_000_000 // 3,
-        [boxes_arr, scores_cleared, classes_arr, mask_arr, protos_arr],
+        [
+            _t(boxes_arr),
+            _t(scores_cleared),
+            _t(classes_arr),
+            _t(mask_arr),
+            _t(protos_arr),
+        ],
     )
     assert len(boxes) == 1
     assert np.allclose(boxes[0], [0.1234, 0.1234, 0.2345, 0.2345], atol=1e-3)
@@ -755,7 +794,7 @@ outputs:
     tracker = edgefirst_hal.ByteTrack(update=0.1, high_conf=0.7)
 
     boxes, scores, classes, masks, tracks = decoder.decode_tracked(
-        tracker, 0, [boxes_data, scores_data, mask_data, protos]
+        tracker, 0, [_t(boxes_data), _t(scores_data), _t(mask_data), _t(protos)]
     )
     assert len(boxes) == 2
 
@@ -768,7 +807,9 @@ outputs:
     scores_cleared = np.zeros_like(scores_data)
 
     boxes, scores, classes, masks, tracks = decoder.decode_tracked(
-        tracker, 100_000_000 // 3, [boxes_data, scores_cleared, mask_data, protos]
+        tracker,
+        100_000_000 // 3,
+        [_t(boxes_data), _t(scores_cleared), _t(mask_data), _t(protos)],
     )
 
     # Tracker predicts forward

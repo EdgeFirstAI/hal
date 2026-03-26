@@ -12,40 +12,37 @@ If you already know the model type and output formats, you can use the lower-lev
 
 
 ### Quick Example
-```rust
-# use edgefirst_decoder::{ DecoderBuilder, DecoderResult, configs::{self, DecoderVersion} };
-# fn main() -> DecoderResult<()> {
-// Create a decoder for a YOLOv8 model with quantized int8 output with 0.25 score threshold and 0.7 IOU threshold
-let decoder = DecoderBuilder::new()
-    .with_config_yolo_det(configs::Detection {
-        anchors: None,
-        decoder: configs::DecoderType::Ultralytics,
-        quantization: Some(configs::QuantTuple(0.012345, 26)),
-        shape: vec![1, 84, 8400],
-        dshape: Vec::new(),
-        normalized: Some(true),
-    },
-    Some(DecoderVersion::Yolov8))
-    .with_score_threshold(0.25)
-    .with_iou_threshold(0.7)
-    .build()?;
+```rust,no_run
+use edgefirst_decoder::{DecoderBuilder, DecoderResult, configs::{self, DecoderVersion}};
+use edgefirst_tensor::TensorDyn;
 
-// Get the model output from the model. Here we load it from a test data file for demonstration purposes.
-let model_output: Vec<i8> = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/yolov8s_80_classes.bin"))
-    .iter()
-    .map(|b| *b as i8)
-    .collect();
-let model_output_array = ndarray::Array3::from_shape_vec((1, 84, 8400), model_output)?;
+fn main() -> DecoderResult<()> {
+    // Create a decoder for a YOLOv8 model with quantized int8 output
+    let decoder = DecoderBuilder::new()
+        .with_config_yolo_det(configs::Detection {
+            anchors: None,
+            decoder: configs::DecoderType::Ultralytics,
+            quantization: Some(configs::QuantTuple(0.012345, 26)),
+            shape: vec![1, 84, 8400],
+            dshape: Vec::new(),
+            normalized: Some(true),
+        },
+        Some(DecoderVersion::Yolov8))
+        .with_score_threshold(0.25)
+        .with_iou_threshold(0.7)
+        .build()?;
 
-// THe capacity is used to determine the maximum number of detections to decode.
-let mut output_boxes: Vec<_> = Vec::with_capacity(10);
-let mut output_masks: Vec<_> = Vec::with_capacity(10);
+    // Get the model output tensors from inference
+    let model_output: Vec<TensorDyn> = vec![/* tensors from inference */];
+    let tensor_refs: Vec<&TensorDyn> = model_output.iter().collect();
 
-// Decode the quantized model output into detection boxes and segmentation masks
-// Because this model is a detection-only model, the `output_masks` vector will remain empty.
-decoder.decode_quantized(&[model_output_array.view().into()], &mut output_boxes, &mut output_masks)?;
-# Ok(())
-# }
+    let mut output_boxes = Vec::with_capacity(10);
+    let mut output_masks = Vec::with_capacity(10);
+
+    // Decode model output into detection boxes and segmentation masks
+    decoder.decode(&tensor_refs, &mut output_boxes, &mut output_masks)?;
+    Ok(())
+}
 ```
 
 # Overview
