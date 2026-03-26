@@ -27,6 +27,7 @@ pub struct Decoder {
     normalized: Option<bool>,
 }
 
+#[doc(hidden)]
 #[derive(Debug)]
 pub enum ArrayViewDQuantized<'a> {
     UInt8(ArrayViewD<'a, u8>),
@@ -264,6 +265,7 @@ impl Decoder {
     /// #    Ok(())
     /// # }
     /// ```
+    #[doc(hidden)]
     pub fn decode_quantized(
         &self,
         outputs: &[ArrayViewDQuantized],
@@ -433,6 +435,7 @@ impl Decoder {
     ///
     /// #    Ok(())
     /// # }
+    #[doc(hidden)]
     pub fn decode_float<T>(
         &self,
         outputs: &[ArrayViewD<T>],
@@ -562,6 +565,7 @@ impl Decoder {
     /// Returns `Ok(None)` for detection-only and ModelPack models (use
     /// `decode_quantized` for those). Returns `Ok(Some(ProtoData))` for
     /// YOLO segmentation models.
+    #[doc(hidden)]
     pub fn decode_quantized_proto(
         &self,
         outputs: &[ArrayViewDQuantized],
@@ -650,6 +654,7 @@ impl Decoder {
     ///
     /// Returns `Ok(None)` for detection-only and ModelPack models. Returns
     /// `Ok(Some(ProtoData))` for YOLO segmentation models.
+    #[doc(hidden)]
     pub fn decode_float_proto<T>(
         &self,
         outputs: &[ArrayViewD<T>],
@@ -876,6 +881,7 @@ impl Decoder {
     /// #    Ok(())
     /// # }
     /// ```
+    #[doc(hidden)]
     pub fn decode_tracked_quantized<TR: edgefirst_tracker::Tracker<DetectBox>>(
         &self,
         tracker: &mut TR,
@@ -1028,6 +1034,7 @@ impl Decoder {
     ///
     /// #    Ok(())
     /// # }
+    #[doc(hidden)]
     pub fn decode_tracked_float<TR: edgefirst_tracker::Tracker<DetectBox>, T>(
         &self,
         tracker: &mut TR,
@@ -1140,6 +1147,7 @@ impl Decoder {
     /// Returns `Ok(None)` for detection-only and ModelPack models (use
     /// `decode_quantized` for those). Returns `Ok(Some(ProtoData))` for
     /// YOLO segmentation models.
+    #[doc(hidden)]
     pub fn decode_tracked_quantized_proto<TR: edgefirst_tracker::Tracker<DetectBox>>(
         &self,
         tracker: &mut TR,
@@ -1251,6 +1259,7 @@ impl Decoder {
     ///
     /// Returns `Ok(None)` for detection-only and ModelPack models. Returns
     /// `Ok(Some(ProtoData))` for YOLO segmentation models.
+    #[doc(hidden)]
     pub fn decode_tracked_float_proto<TR: edgefirst_tracker::Tracker<DetectBox>, T>(
         &self,
         tracker: &mut TR,
