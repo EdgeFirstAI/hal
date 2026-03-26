@@ -1025,8 +1025,8 @@ struct hal_decoder *hal_decoder_new(const struct hal_decoder_params *params);
  * Decode model outputs into detection boxes and segmentation masks.
  *
  * Automatically selects the decoding path based on tensor dtype:
- * - f32 tensors → `decode_float` path
- * - Integer tensors (u8, i8, u16, i16, u32, i32) → `decode_quantized` path
+ * - f32 tensors -> float decode path
+ * - Integer tensors (u8, i8, u16, i16, u32, i32) -> quantized decode path
  *
  * All output tensors must be the same general category (all float or all integer).
  *
@@ -1199,8 +1199,8 @@ void hal_segmentation_list_free(struct hal_segmentation_list *list);
  * Decode model outputs into tracked detection boxes and segmentation masks.
  *
  * Automatically selects the decoding path based on tensor dtype:
- * - f32 tensors → `decode_tracked_float` path
- * - Integer tensors (u8, i8, u16, i16, u32, i32) → `decode_tracked_quantized` path
+ * - f32 tensors -> float decode path
+ * - Integer tensors (u8, i8, u16, i16, u32, i32) -> quantized decode path
  *
  * All output tensors must be the same general category (all float or all integer).
  *
