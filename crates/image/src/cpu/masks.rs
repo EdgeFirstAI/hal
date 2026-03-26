@@ -375,6 +375,10 @@ fn fused_dequant_dot_sigmoid_i8(
     roi_w: usize,
     num_protos: usize,
 ) -> ndarray::Array3<u8> {
+    debug_assert!(
+        protos.strides().iter().all(|&s| s >= 0),
+        "negative strides unsupported"
+    );
     // Pre-scale coefficients: coeff[k] * scale, so the inner loop is
     // just fma: acc += scaled_coeff[k] * (proto_i8 - zp)
     let scaled_coeff: Vec<f32> = coeff.iter().map(|&c| c * scale).collect();
@@ -402,6 +406,8 @@ fn fused_dequant_dot_sigmoid_i8(
             // Process 4 protos at a time for better ILP
             let chunks = num_protos / 4;
             for _ in 0..chunks {
+                // SAFETY: bounds are guaranteed by ROI clamping in the caller:
+                // y0+y < proto_h, x0+x < proto_w, k+3 < num_protos <= protos.shape()[2].
                 unsafe {
                     let p0 = *proto_ptr.add(base + k * proto_stride_k) as f32;
                     let p1 = *proto_ptr.add(base + (k + 1) * proto_stride_k) as f32;
@@ -416,6 +422,8 @@ fn fused_dequant_dot_sigmoid_i8(
             }
             // Remainder
             while k < num_protos {
+                // SAFETY: bounds are guaranteed by ROI clamping in the caller:
+                // y0+y < proto_h, x0+x < proto_w, k < num_protos <= protos.shape()[2].
                 unsafe {
                     let p = *proto_ptr.add(base + k * proto_stride_k) as f32;
                     acc += scaled_coeff[k] * p;
@@ -441,6 +449,10 @@ fn fused_dot_sigmoid_f32(
     roi_w: usize,
     num_protos: usize,
 ) -> ndarray::Array3<u8> {
+    debug_assert!(
+        protos.strides().iter().all(|&s| s >= 0),
+        "negative strides unsupported"
+    );
     let proto_stride_y = protos.strides()[0] as usize;
     let proto_stride_x = protos.strides()[1] as usize;
     let proto_stride_k = protos.strides()[2] as usize;
@@ -456,6 +468,8 @@ fn fused_dot_sigmoid_f32(
             let mut k = 0;
             let chunks = num_protos / 4;
             for _ in 0..chunks {
+                // SAFETY: bounds are guaranteed by ROI clamping in the caller:
+                // y0+y < proto_h, x0+x < proto_w, k+3 < num_protos <= protos.shape()[2].
                 unsafe {
                     let p0 = *proto_ptr.add(base + k * proto_stride_k);
                     let p1 = *proto_ptr.add(base + (k + 1) * proto_stride_k);
@@ -467,6 +481,8 @@ fn fused_dot_sigmoid_f32(
                 k += 4;
             }
             while k < num_protos {
+                // SAFETY: bounds are guaranteed by ROI clamping in the caller:
+                // y0+y < proto_h, x0+x < proto_w, k < num_protos <= protos.shape()[2].
                 unsafe {
                     let p = *proto_ptr.add(base + k * proto_stride_k);
                     acc += coeff[k] * p;
