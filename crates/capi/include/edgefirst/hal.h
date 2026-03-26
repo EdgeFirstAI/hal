@@ -1572,11 +1572,11 @@ int hal_image_processor_draw_decoded_masks(struct hal_image_processor *processor
  * @param num_outputs Number of output tensors
  * @param dst Destination image to draw onto
  * @param background Optional background image (NULL to draw over dst)
- * @param opacity Mask opacity in [0.0, 1.0] (1.0 = fully opaque)
+ * @param opacity Mask opacity, clamped to [0.0, 1.0] (1.0 = fully opaque)
  * @param out_boxes Output parameter for detection box list (caller must free)
  * @return 0 on success, -1 on error
  * @par Errors (errno):
- * - EINVAL: Invalid argument (NULL processor/decoder/outputs/dst/out_boxes)
+ * - EINVAL: Invalid argument (NULL processor/decoder/outputs/dst/out_boxes, or background == dst)
  * - EIO: Decoding or drawing failed
  */
 int hal_image_processor_draw_masks(struct hal_image_processor *processor,

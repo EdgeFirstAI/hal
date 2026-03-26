@@ -45,6 +45,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decode+render path is now owned by ImageProcessor (which owns the GPU).
   - **Python**: `Decoder.draw_masks()` removed. Use
     `ImageProcessor.draw_masks(decoder, model_output, dst, ...)`.
+    The method now accepts an optional `tracker=` keyword argument for
+    tracked inference. `decoder.decode()` now accepts `List[Tensor]`
+    (previously `List[np.ndarray]`).
   - **C API**: `hal_decoder_draw_masks()` and `hal_decoder_draw_masks_tracked()`
     removed. Use `hal_image_processor_draw_masks()` and
     `hal_image_processor_draw_masks_tracked()` (processor is now the
@@ -98,6 +101,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Use `draw_masks()` / `draw_masks_proto()` for GPU-accelerated mask
   overlay, or `materialize_segmentations()` + `draw_masks()` for the
   hybrid CPU decode path.
+
+- **Python static helper methods on `Decoder`** — the following static/class
+  methods have been removed. Use the `Decoder` instance API instead:
+  - `Decoder.decode_yolo_det()`
+  - `Decoder.decode_yolo_segdet()`
+  - `Decoder.decode_modelpack_det()`
+  - `Decoder.decode_modelpack_det_split()`
+  - `Decoder.dequantize()`
+  - `Decoder.segmentation_to_mask()`
+
+- **`ArrayViewDQuantized` made private** (`pub(crate)`) — use the `TensorDyn`
+  API for all decode inputs. Downstream crates that referenced
+  `ArrayViewDQuantized` directly must migrate to `TensorDyn`.
+
+### Migration Guide
+
+This section summarises all breaking changes introduced in this release and
+shows before/after code for each one.
+
+#### Python
+
+```python
+# --- decode() input type changed ---
+# Before: decoder.decode([np_array0, np_array1])
+# After:  decoder.decode([hal_tensor0, hal_tensor1])   # List[Tensor]
+
+# --- draw_masks moved from Decoder to ImageProcessor ---
+# Before: decoder.draw_masks(outputs, processor, dst)
+# After:  processor.draw_masks(decoder, outputs, dst)
+# With tracking:
+#         processor.draw_masks(decoder, outputs, dst, tracker=tracker)
+
+# --- decode_masks() removed ---
+# Before: decoder.decode_masks(outputs, processor)
+# After:  decoder.decode(outputs)  # mask data is part of the decode() result
+
+# --- Static methods removed ---
+# Before: Decoder.decode_yolo_det(outputs, ...)
+#         Decoder.decode_yolo_segdet(outputs, ...)
+#         Decoder.decode_modelpack_det(outputs, ...)
+#         Decoder.decode_modelpack_det_split(outputs, ...)
+#         Decoder.dequantize(tensor)
+#         Decoder.segmentation_to_mask(seg)
+# After:  Use the Decoder instance API:
+#         decoder = Decoder(config, score_threshold, iou_threshold)
+#         boxes, segs = decoder.decode(outputs)
+```
+
+#### C
+
+```c
+/* --- draw_masks moved to ImageProcessor --- */
+/* Before: hal_decoder_draw_masks(decoder, processor, outputs, n, dst, &boxes); */
+/* After:  hal_image_processor_draw_masks(processor, decoder, outputs, n, dst,
+                                          NULL, 1.0, &boxes);
+   (new background + opacity params; pass NULL and 1.0 for old behaviour)      */
+
+/* --- Tracked draw_masks also moved --- */
+/* Before: hal_decoder_decode_tracked_draw_masks(decoder, tracker, ts, processor, ...); */
+/* After:  hal_image_processor_draw_masks_tracked(processor, decoder, tracker, ts, ...); */
+
+/* --- decode_masks removed --- */
+/* Before: hal_decoder_decode_masks(decoder, processor, outputs, n, w, h,
+                                    &boxes, &masks);                            */
+/* After:  hal_decoder_decode(decoder, outputs, n, &boxes, &segs);             */
+```
+
+#### Rust
+
+```rust
+// --- Trait method renames (ImageProcessorTrait implementors) ---
+// draw_masks       → draw_decoded_masks
+// draw_masks_proto → draw_proto_masks
+// Both gain an `overlay: MaskOverlay<'_>` parameter.
+// Pass MaskOverlay::default() for backward-compatible behaviour.
+
+// --- New primary API on ImageProcessor ---
+// processor.draw_masks(&decoder, &outputs, &mut dst, overlay)
+
+// --- Decoder now accepts TensorDyn ---
+// Before: decoder.decode(&[&array_view_dquantized, ...], &mut boxes, &mut masks)
+// After:  decoder.decode(&[&tensor0, &tensor1], &mut boxes, &mut masks)
+// (previously required ArrayViewDQuantized / ArrayViewD<T>)
+
+// --- ArrayViewDQuantized is now pub(crate) ---
+// Use TensorDyn API instead. ArrayViewDQuantized is no longer part of the
+// public API surface.
+```
 
 ## [0.12.0] - 2026-03-24
 

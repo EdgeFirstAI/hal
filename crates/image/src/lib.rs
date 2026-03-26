@@ -1174,6 +1174,9 @@ impl ImageProcessor {
         if let Some(proto_data) = proto_result {
             self.draw_proto_masks(dst, &output_boxes, &proto_data, overlay)?;
         } else {
+            // Note: decode_proto_tracked returns None for detection-only/ModelPack
+            // models WITHOUT calling the tracker. The else branch below is the
+            // first (and only) tracker call for those model types.
             let mut output_masks = Vec::with_capacity(100);
             decoder
                 .decode_tracked(
