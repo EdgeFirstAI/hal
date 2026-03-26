@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark: draw_masks() fused path vs decode() + draw_masks() 2-step path.
+"""Benchmark: draw_masks() fused path vs decode() + draw_decoded_masks() 2-step path.
 
 Compares per-frame timing for YOLOv8n-seg INT8 TFLite outputs using the HAL
 decoder and image processor. Uses real TFLite model inference outputs when the
@@ -148,13 +148,15 @@ def compute_stats(times):
 
 
 def bench_old_path(decoder, processor, dst, outputs, n_iter):
-    """Benchmark: decode() + draw_masks() (2-step path)."""
+    """Benchmark: decode() + draw_decoded_masks() (2-step path)."""
     times = []
     n_dets = 0
     for _ in range(n_iter):
         t0 = time.perf_counter()
         boxes, scores, classes, masks = decoder.decode(outputs)
-        processor.draw_masks(dst, bbox=boxes, scores=scores, classes=classes, seg=masks)
+        processor.draw_decoded_masks(
+            dst, bbox=boxes, scores=scores, classes=classes, seg=masks
+        )
         elapsed = time.perf_counter() - t0
         times.append(elapsed * 1000)  # ms
         n_dets = len(boxes)
@@ -167,7 +169,7 @@ def bench_fused_path(decoder, processor, dst, outputs, n_iter):
     n_dets = 0
     for _ in range(n_iter):
         t0 = time.perf_counter()
-        boxes, scores, classes = processor.draw_masks_fused(decoder, outputs, dst)
+        boxes, scores, classes = processor.draw_masks(decoder, outputs, dst)
         elapsed = time.perf_counter() - t0
         times.append(elapsed * 1000)  # ms
         n_dets = len(boxes)
@@ -343,11 +345,11 @@ def main():
         )
 
         thresh_results["n_detections"] = old_dets
-        thresh_results["decode_draw_masks"] = compute_stats(old_times)
+        thresh_results["decode_draw_decoded_masks"] = compute_stats(old_times)
 
         print(f"\n  score_threshold={thresh} ({old_dets} detections):")
         print(f"  {'─' * 95}")
-        report("decode() + draw_masks()", old_times)
+        report("decode() + draw_decoded_masks()", old_times)
 
         if interp_modes:
             # Benchmark fused path for each interpolation mode

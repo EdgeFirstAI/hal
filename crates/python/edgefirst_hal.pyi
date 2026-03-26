@@ -1109,7 +1109,7 @@ class ImageProcessor:
         """
         ...
 
-    def draw_masks(
+    def draw_decoded_masks(
         self,
         dst: Tensor,
         bbox: npt.NDArray[np.float32],
@@ -1123,7 +1123,7 @@ class ImageProcessor:
         Draw detection boxes and optional segmentation masks onto ``dst``.
 
         This method draws pre-decoded results. For the fused decode+draw path
-        (recommended for most use cases), use ``draw_masks_fused()`` instead.
+        (recommended for most use cases), use ``draw_masks()`` instead.
 
         Args:
             dst: Destination image. Must be ``RGBA`` or ``RGB`` for CPU backend,
@@ -1151,7 +1151,7 @@ class ImageProcessor:
         """
         ...
 
-    def draw_masks_fused(
+    def draw_masks(
         self,
         decoder: Decoder,
         model_output: List[np.ndarray],
@@ -1164,7 +1164,7 @@ class ImageProcessor:
         Decode model outputs and draw colored masks directly onto the
         destination image in a single fused call. This is the fastest path
         for visualization -- masks never leave Rust/GPU, eliminating the
-        Python round-trip overhead of ``decode()`` + ``draw_masks()``.
+        Python round-trip overhead of ``decode()`` + ``draw_decoded_masks()``.
 
         For segmentation models, prototype data is passed directly to the
         renderer which evaluates the mask at every output pixel. For

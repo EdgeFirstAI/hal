@@ -94,7 +94,7 @@ def test_render():
     )
     converter = ImageProcessor()
     converter.set_class_colors([[255, 255, 0, 233], [128, 128, 255, 100]])
-    converter.draw_masks(
+    converter.draw_decoded_masks(
         dst,
         bbox=np.array([[0.59375, 0.25, 0.9375, 0.725]], dtype=np.float32),
         scores=np.array([0.9], dtype=np.float32),
