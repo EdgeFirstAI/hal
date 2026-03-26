@@ -1691,4 +1691,312 @@ mod gl_tests {
         // between GPU proto rendering and CPU materialization
         compare_images(&dst_hybrid, &dst_fused, 0.90, function!());
     }
+
+    // =========================================================================
+    // Destination DMA-BUF plane_offset tests
+    //
+    // These verify that create_egl_image_with_dims correctly passes
+    // plane_offset to EGL, so the GPU renders at the right position within
+    // a shared DMA-BUF (critical for NPU buffers where a single allocation
+    // serves the entire accelerator).
+    // =========================================================================
+
+    /// Regression: destination with explicit offset=0 must produce the same
+    /// output as a destination with no offset set.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_opengl_dst_offset_zero_regression() {
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        let src = load_raw_image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Dma),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.nv12"
+            )),
+        )
+        .unwrap();
+
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+
+        // Destination without offset
+        let dst_no_off = TensorDyn::image(
+            640,
+            480,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        let src_dyn = src;
+        let mut dst_no_off_dyn = dst_no_off;
+        gl.convert(
+            &src_dyn,
+            &mut dst_no_off_dyn,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        // Destination with explicit offset=0
+        let mut dst_zero =
+            Tensor::<u8>::image(640, 480, PixelFormat::Rgba, Some(TensorMemory::Dma)).unwrap();
+        dst_zero.set_plane_offset(0);
+        let mut dst_zero_dyn = TensorDyn::from(dst_zero);
+        gl.convert(
+            &src_dyn,
+            &mut dst_zero_dyn,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        let a = dst_no_off_dyn.as_u8().unwrap().map().unwrap();
+        let b = dst_zero_dyn.as_u8().unwrap().map().unwrap();
+        assert_pixels_match(a.as_slice(), b.as_slice(), 0);
+    }
+
+    /// Functional: allocate an oversized DMA buffer, import the second half
+    /// as a destination via PlaneDescriptor with offset, convert, and verify
+    /// the GPU wrote at the offset — not at byte 0.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_opengl_dst_nonzero_offset() {
+        use edgefirst_tensor::PlaneDescriptor;
+        use std::os::fd::AsFd;
+
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        let width = 640;
+        let height = 480;
+        let image_bytes = width * height * 4; // RGBA
+        let offset = image_bytes; // put image in the second half
+
+        // Allocate a DMA buffer twice the image size and fill with a sentinel
+        let large_buf =
+            Tensor::<u8>::new(&[image_bytes * 2], Some(TensorMemory::Dma), None).unwrap();
+        large_buf.map().unwrap().as_mut_slice().fill(0xAA);
+
+        // Import the second half as an RGBA destination via PlaneDescriptor
+        let fd = large_buf.as_dma().unwrap().fd.as_fd();
+        let plane = PlaneDescriptor::new(fd).unwrap().with_offset(offset);
+        let proc = crate::ImageProcessor::new().unwrap();
+        let mut dst = proc
+            .import_image(plane, None, width, height, PixelFormat::Rgba, DType::U8)
+            .unwrap();
+
+        // Source: NV12 camera frame
+        let src = load_raw_image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Dma),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.nv12"
+            )),
+        )
+        .unwrap();
+
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let src_dyn = src;
+        gl.convert(
+            &src_dyn,
+            &mut dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        // Verify: the first half (before offset) must still be our sentinel
+        let map = large_buf.map().unwrap();
+        let buf = map.as_slice();
+        let untouched = &buf[..offset];
+        assert!(
+            untouched.iter().all(|&b| b == 0xAA),
+            "GPU wrote before the offset boundary — offset not applied"
+        );
+
+        // Verify: the second half (at offset) should contain rendered data,
+        // not all sentinels
+        let rendered = &buf[offset..];
+        assert!(
+            rendered.iter().any(|&b| b != 0xAA),
+            "GPU did not write at the offset position — destination is still sentinel"
+        );
+    }
+
+    /// Destination with offset=0 via PlaneDescriptor import (same path as NPU
+    /// workflow) must produce identical output to a normal DMA allocation.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_opengl_dst_imported_offset_zero() {
+        use edgefirst_tensor::PlaneDescriptor;
+        use std::os::fd::AsFd;
+
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        let width = 640;
+        let height = 480;
+
+        let src = load_raw_image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Dma),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.nv12"
+            )),
+        )
+        .unwrap();
+
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+
+        // Reference: normal DMA destination
+        let dst_ref = TensorDyn::image(
+            width,
+            height,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        let src_dyn = src;
+        let mut dst_ref_dyn = dst_ref;
+        gl.convert(
+            &src_dyn,
+            &mut dst_ref_dyn,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        // Imported: PlaneDescriptor with offset=0
+        let dst_buf =
+            Tensor::<u8>::image(width, height, PixelFormat::Rgba, Some(TensorMemory::Dma)).unwrap();
+        let fd = dst_buf.as_dma().unwrap().fd.as_fd();
+        let plane = PlaneDescriptor::new(fd).unwrap().with_offset(0);
+        let proc = crate::ImageProcessor::new().unwrap();
+        let mut dst_imported = proc
+            .import_image(plane, None, width, height, PixelFormat::Rgba, DType::U8)
+            .unwrap();
+        gl.convert(
+            &src_dyn,
+            &mut dst_imported,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        let a = dst_ref_dyn.as_u8().unwrap().map().unwrap();
+        let b = dst_buf.map().unwrap();
+        assert_pixels_match(a.as_slice(), b.as_slice(), 1);
+    }
+
+    /// Functional: packed RGB destination with nonzero offset.  This exercises
+    /// `create_egl_image_with_dims` (the two-pass RGB pipeline), which was the
+    /// specific function that had the hardcoded offset=0 bug.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_opengl_dst_nonzero_offset_rgb() {
+        use edgefirst_tensor::PlaneDescriptor;
+        use std::os::fd::AsFd;
+
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        let width = 640;
+        let height = 480;
+        let image_bytes = width * height * 3; // RGB
+        let offset = image_bytes; // put image in the second half
+
+        // Allocate a DMA buffer twice the image size and fill with a sentinel
+        let large_buf =
+            Tensor::<u8>::new(&[image_bytes * 2], Some(TensorMemory::Dma), None).unwrap();
+        large_buf.map().unwrap().as_mut_slice().fill(0xAA);
+
+        // Import the second half as an RGB destination via PlaneDescriptor
+        let fd = large_buf.as_dma().unwrap().fd.as_fd();
+        let plane = PlaneDescriptor::new(fd).unwrap().with_offset(offset);
+        let proc = crate::ImageProcessor::new().unwrap();
+        let mut dst = proc
+            .import_image(plane, None, width, height, PixelFormat::Rgb, DType::U8)
+            .unwrap();
+
+        // Source: NV12 camera frame
+        let src = load_raw_image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Dma),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/camera720p.nv12"
+            )),
+        )
+        .unwrap();
+
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let src_dyn = src;
+        gl.convert(
+            &src_dyn,
+            &mut dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        // Verify: the first half (before offset) must still be our sentinel
+        let map = large_buf.map().unwrap();
+        let buf = map.as_slice();
+        let untouched = &buf[..offset];
+        assert!(
+            untouched.iter().all(|&b| b == 0xAA),
+            "GPU wrote before the offset boundary — RGB offset not applied"
+        );
+
+        // Verify: the second half (at offset) should contain rendered data
+        let rendered = &buf[offset..];
+        assert!(
+            rendered.iter().any(|&b| b != 0xAA),
+            "GPU did not write at the RGB offset position — destination is still sentinel"
+        );
+    }
 }
