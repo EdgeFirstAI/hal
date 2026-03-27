@@ -80,6 +80,10 @@ pub struct GLProcessorST {
     /// Whether the GPU is a Verisilicon/Vivante core (detected via GL_RENDERER).
     /// Used to block operations known to cause unrecoverable GPU hangs.
     is_vivante: bool,
+    /// Whether to use renderbuffer-backed EGLImages for DMA destinations.
+    /// Controlled by EDGEFIRST_OPENGL_RENDERSURFACE (1=enabled, 0/missing=disabled).
+    /// Renderbuffers are required on Mali/Neutron GPUs (i.MX 95) but break on Vivante (i.MX 8MP).
+    use_renderbuffer: bool,
     /// Intermediate RGBA texture for two-pass packed RGB conversion.
     /// Pass 1 renders YUYV/NV12→RGBA here; Pass 2 packs RGBA→RGB to DMA dest.
     packed_rgb_intermediate_tex: Texture,
@@ -453,6 +457,9 @@ impl GLProcessorST {
             last_bound_src_egl: None,
             bgra_warned: false,
             is_vivante,
+            use_renderbuffer: std::env::var("EDGEFIRST_OPENGL_RENDERSURFACE")
+                .map(|v| v == "1")
+                .unwrap_or(false),
             packed_rgb_intermediate_tex: Texture::new(),
             packed_rgb_fbo: FrameBuffer::new(),
             packed_rgb_intermediate_size: (0, 0),
@@ -463,6 +470,15 @@ impl GLProcessorST {
             color_program,
         };
         check_gl_error(function!(), line!())?;
+
+        log::debug!(
+            "GLProcessorST: DMA destination attachment mode: {}",
+            if converter.use_renderbuffer {
+                "renderbuffer (EDGEFIRST_OPENGL_RENDERSURFACE=1)"
+            } else {
+                "texture (default)"
+            }
+        );
 
         // Verify DMA-buf actually works (catches NVIDIA discrete GPUs where
         // EGLImage creation succeeds but rendered data is all zeros)
@@ -1542,26 +1558,47 @@ impl GLProcessorST {
         let dst_key = (luma_id, chroma_id);
 
         if self.last_bound_dst_egl != Some(dst_key) {
-            // get_or_create_egl_image creates both the EGLImage and its
-            // backing renderbuffer (stored in the cache).
-            let _egl_handle = self.get_or_create_egl_image(CacheKind::Dst, dst, dst_fmt)?;
-            let rbo = self.cached_dst_renderbuffer(dst).ok_or_else(|| {
-                Error::Internal("Dst cache entry missing renderbuffer".to_owned())
-            })?;
-            unsafe {
-                gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
-                gls::gl::FramebufferRenderbuffer(
-                    gls::gl::FRAMEBUFFER,
-                    gls::gl::COLOR_ATTACHMENT0,
-                    gls::gl::RENDERBUFFER,
-                    rbo,
-                );
-                check_gl_error(function!(), line!())?;
+            let dest_egl = self.get_or_create_egl_image(CacheKind::Dst, dst, dst_fmt)?;
+            match self.cached_dst_renderbuffer(dst) {
+                Some(rbo) => unsafe {
+                    gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
+                    gls::gl::FramebufferRenderbuffer(
+                        gls::gl::FRAMEBUFFER,
+                        gls::gl::COLOR_ATTACHMENT0,
+                        gls::gl::RENDERBUFFER,
+                        rbo,
+                    );
+                    check_gl_error(function!(), line!())?;
+                },
+                None => unsafe {
+                    gls::gl::UseProgram(self.texture_program_yuv.id);
+                    gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+                    gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
+                    gls::gl::TexParameteri(
+                        gls::gl::TEXTURE_2D,
+                        gls::gl::TEXTURE_MIN_FILTER,
+                        gls::gl::LINEAR as i32,
+                    );
+                    gls::gl::TexParameteri(
+                        gls::gl::TEXTURE_2D,
+                        gls::gl::TEXTURE_MAG_FILTER,
+                        gls::gl::LINEAR as i32,
+                    );
+                    gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, dest_egl.as_ptr());
+                    gls::gl::FramebufferTexture2D(
+                        gls::gl::FRAMEBUFFER,
+                        gls::gl::COLOR_ATTACHMENT0,
+                        gls::gl::TEXTURE_2D,
+                        self.render_texture.id,
+                        0,
+                    );
+                    check_gl_error(function!(), line!())?;
+                },
             }
             self.last_bound_dst_egl = Some(dst_key);
-            log::trace!("setup_renderbuffer_dma: bound new dst renderbuffer id={luma_id:#x}");
+            log::trace!("setup_renderbuffer_dma: bound new dst EGLImage id={luma_id:#x}");
         } else {
-            log::trace!("setup_renderbuffer_dma: reusing bound dst renderbuffer id={luma_id:#x}");
+            log::trace!("setup_renderbuffer_dma: reusing bound dst EGLImage id={luma_id:#x}");
         }
 
         unsafe {
@@ -2837,7 +2874,7 @@ impl GLProcessorST {
 
         // --- Pass 2: Pack intermediate RGBA → RGB DMA destination ---
         self.convert_fbo.bind();
-        let _dest_egl = self.get_or_create_egl_image_rgb(
+        let dest_egl = self.get_or_create_egl_image_rgb(
             dst,
             dst_fmt,
             render_w,
@@ -2845,17 +2882,40 @@ impl GLProcessorST {
             DrmFourcc::Abgr8888,
             4,
         )?;
-        let rbo = self.cached_dst_renderbuffer(dst).ok_or_else(|| {
-            Error::Internal("Dst cache entry missing renderbuffer (packed RGB)".to_owned())
-        })?;
         unsafe {
-            gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
-            gls::gl::FramebufferRenderbuffer(
-                gls::gl::FRAMEBUFFER,
-                gls::gl::COLOR_ATTACHMENT0,
-                gls::gl::RENDERBUFFER,
-                rbo,
-            );
+            match self.cached_dst_renderbuffer(dst) {
+                Some(rbo) => {
+                    gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
+                    gls::gl::FramebufferRenderbuffer(
+                        gls::gl::FRAMEBUFFER,
+                        gls::gl::COLOR_ATTACHMENT0,
+                        gls::gl::RENDERBUFFER,
+                        rbo,
+                    );
+                }
+                None => {
+                    gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+                    gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
+                    gls::gl::TexParameteri(
+                        gls::gl::TEXTURE_2D,
+                        gls::gl::TEXTURE_MIN_FILTER,
+                        gls::gl::NEAREST as i32,
+                    );
+                    gls::gl::TexParameteri(
+                        gls::gl::TEXTURE_2D,
+                        gls::gl::TEXTURE_MAG_FILTER,
+                        gls::gl::NEAREST as i32,
+                    );
+                    gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, dest_egl.as_ptr());
+                    gls::gl::FramebufferTexture2D(
+                        gls::gl::FRAMEBUFFER,
+                        gls::gl::COLOR_ATTACHMENT0,
+                        gls::gl::TEXTURE_2D,
+                        self.render_texture.id,
+                        0,
+                    );
+                }
+            }
             check_gl_error(function!(), line!())?;
             gls::gl::Viewport(0, 0, render_w as i32, render_h as i32);
         }
@@ -3891,11 +3951,11 @@ impl GLProcessorST {
         // want to have destroyed a valid cache entry for nothing.
         let egl_image_obj = self.create_image_from_dma2(img, img_fmt)?;
 
-        // Create a GL renderbuffer backed by this EGLImage for use as an FBO
-        // color attachment.  Renderbuffers work with all DMA-BUF buffer types
-        // (including kernel dma_alloc_attrs buffers that fail the texture path
-        // on some GPU drivers).
-        let rbo = if cache == CacheKind::Dst {
+        // Optionally create a GL renderbuffer backed by this EGLImage for use as an FBO
+        // color attachment.  Renderbuffers are required on Mali/Neutron GPUs (i.MX 95)
+        // but are not supported on all drivers (e.g. Vivante on i.MX 8MP).
+        // Enabled via EDGEFIRST_OPENGL_RENDERSURFACE=1; defaults to the texture path.
+        let rbo = if cache == CacheKind::Dst && self.use_renderbuffer {
             let mut rbo: u32 = 0;
             unsafe {
                 gls::gl::GenRenderbuffers(1, &mut rbo);
@@ -4030,16 +4090,21 @@ impl GLProcessorST {
         let egl_image_obj = self.create_egl_image_with_dims(img, width, height, drm_format, bpp)?;
         let handle = egl_image_obj.egl_image;
 
-        let mut rbo: u32 = 0;
-        unsafe {
-            gls::gl::GenRenderbuffers(1, &mut rbo);
-            gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
-            gls::gl::EGLImageTargetRenderbufferStorageOES(
-                gls::gl::RENDERBUFFER,
-                egl_image_obj.egl_image.as_ptr(),
-            );
-            check_gl_error(function!(), line!())?;
-        }
+        let rbo = if self.use_renderbuffer {
+            let mut rbo: u32 = 0;
+            unsafe {
+                gls::gl::GenRenderbuffers(1, &mut rbo);
+                gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
+                gls::gl::EGLImageTargetRenderbufferStorageOES(
+                    gls::gl::RENDERBUFFER,
+                    egl_image_obj.egl_image.as_ptr(),
+                );
+                check_gl_error(function!(), line!())?;
+            }
+            Some(rbo)
+        } else {
+            None
+        };
 
         let guard = img.buffer_identity().weak();
         let ts = self.dst_egl_cache.next_timestamp();
@@ -4048,7 +4113,7 @@ impl GLProcessorST {
             CachedEglImage {
                 egl_image: egl_image_obj,
                 guard,
-                renderbuffer: Some(rbo),
+                renderbuffer: rbo,
                 last_used: ts,
             },
         );

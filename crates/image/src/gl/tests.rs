@@ -211,7 +211,9 @@ mod gl_tests {
     }
 
     static GL_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // Helper function to check if OpenGL is available
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    static NEUTRON_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
     fn is_opengl_available() -> bool {
         #[cfg(all(target_os = "linux", feature = "opengl"))]
         {
@@ -222,6 +224,11 @@ mod gl_tests {
         {
             false
         }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn is_neutron_available() -> bool {
+        *NEUTRON_AVAILABLE.get_or_init(|| std::path::Path::new("/dev/neutron0").exists())
     }
 
     fn compare_images(img1: &TensorDyn, img2: &TensorDyn, threshold: f64, name: &str) {
@@ -1933,6 +1940,13 @@ mod gl_tests {
             eprintln!("SKIPPED: {} - OpenGL not available", function!());
             return;
         }
+        if !is_neutron_available() {
+            eprintln!(
+                "SKIPPED: {} - Neutron not available (/dev/neutron0 not found)",
+                function!()
+            );
+            return;
+        }
 
         let total_size: usize = 10_276_864; // Neutron shared buffer size
         let offset: usize = 3_450_400; // Neutron input tensor offset
@@ -2006,6 +2020,13 @@ mod gl_tests {
         }
         if !is_opengl_available() {
             eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+        if !is_neutron_available() {
+            eprintln!(
+                "SKIPPED: {} - Neutron not available (/dev/neutron0 not found)",
+                function!()
+            );
             return;
         }
 
@@ -2105,6 +2126,13 @@ mod gl_tests {
             eprintln!("SKIPPED: {} - OpenGL not available", function!());
             return;
         }
+        if !is_neutron_available() {
+            eprintln!(
+                "SKIPPED: {} - Neutron not available (/dev/neutron0 not found)",
+                function!()
+            );
+            return;
+        }
 
         let total_size: usize = 10_276_864;
         let offset: usize = 3_450_400;
@@ -2201,6 +2229,13 @@ mod gl_tests {
         }
         if !is_opengl_available() {
             eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+        if !is_neutron_available() {
+            eprintln!(
+                "SKIPPED: {} - Neutron not available (/dev/neutron0 not found)",
+                function!()
+            );
             return;
         }
 
