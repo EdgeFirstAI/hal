@@ -168,7 +168,11 @@ impl DrmAttachment {
     /// Import a DMA-buf fd through the GPU DRM driver to create a persistent
     /// `dma_buf_attach`. Returns `None` if `/dev/dri/renderD128` is not
     /// available (e.g. on non-GPU systems or in containers).
-    pub(crate) fn new(dma_buf_fd: &OwnedFd) -> Option<Self> {
+    /// If `imported` is true the fd came from an external source (e.g. a
+    /// Neutron NPU kernel driver) and a PRIME import failure is expected —
+    /// logged at DEBUG.  For self-allocated dma_heap buffers, failure is
+    /// unexpected and logged at WARN.
+    pub(crate) fn new(dma_buf_fd: &OwnedFd, imported: bool) -> Option<Self> {
         let drm_fd = shared_drm_fd()?;
 
         let mut prime = DrmPrimeHandle {
@@ -180,10 +184,12 @@ impl DrmAttachment {
         let ret =
             unsafe { libc::ioctl(drm_fd.as_raw_fd(), DRM_IOCTL_PRIME_FD_TO_HANDLE, &mut prime) };
         if ret == -1 {
-            log::debug!(
-                "DrmAttachment: PRIME_FD_TO_HANDLE failed: {}",
-                std::io::Error::last_os_error()
-            );
+            let err = std::io::Error::last_os_error();
+            if imported {
+                log::debug!("DrmAttachment: PRIME_FD_TO_HANDLE failed (imported fd): {err}");
+            } else {
+                log::warn!("DrmAttachment: PRIME_FD_TO_HANDLE failed: {err}");
+            }
             return None;
         }
 
