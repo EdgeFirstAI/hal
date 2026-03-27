@@ -828,7 +828,7 @@ pub unsafe extern "C" fn hal_image_processor_draw_decoded_masks(
 ) -> c_int {
     check_null!(processor, dst);
 
-    if !background.is_null() && background as *const _ == dst as *const _ {
+    if !background.is_null() && std::ptr::eq(background, dst as *const _) {
         return set_error(libc::EINVAL);
     }
 
@@ -901,7 +901,7 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks(
     }
 
     // Reject aliased background == dst (would create UB via &mut + & to same object)
-    if !background.is_null() && background as *const _ == dst as *const _ {
+    if !background.is_null() && std::ptr::eq(background, dst as *const _) {
         return set_error(libc::EINVAL);
     }
     let bg = if background.is_null() {
@@ -1002,7 +1002,7 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks_tracked(
     }
 
     // Reject aliased background == dst
-    if !background.is_null() && background as *const _ == dst as *const _ {
+    if !background.is_null() && std::ptr::eq(background, dst as *const _) {
         return set_error(libc::EINVAL);
     }
 
