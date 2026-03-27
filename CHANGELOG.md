@@ -195,7 +195,7 @@ shows before/after code for each one.
 
 ### Fixed
 
-- GL destination EGLImage now uses renderbuffer instead of texture for FBO attachment, fixing `GL_OUT_OF_MEMORY` (0x505) on non-dma_heap DMA-BUF buffers (e.g. Neutron NPU)
+- GL destination EGLImage renderbuffer path added to fix `GL_OUT_OF_MEMORY` (0x505) on non-dma_heap DMA-BUF buffers (e.g. Neutron NPU on i.MX 95). In 0.13.x the default remains the texture path for compatibility; set `EDGEFIRST_OPENGL_RENDERSURFACE=1` to opt in. This will become the automatic default on supported platforms in a future release after broader testing.
 - Allow CPU mapping of offset DMA tensors for G2D I8 post-processing at non-zero buffer offsets
 - DrmAttachment failure log level: warn for self-allocated buffers, debug for imported (external) buffers
 
