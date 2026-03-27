@@ -1783,11 +1783,11 @@ that cannot determine the shape should set `ndim = 0`.
 
 **`hal_camera_adaptor_format_info`** — describes a camera format adaptor:
 
-| Field             | Type      | Description |
-|-------------------|-----------|-------------|
-| `input_channels`  | `int`     | Number of input channels (e.g., 4 for RGBA) |
-| `output_channels` | `int`     | Number of output channels (e.g., 3 for RGB) |
-| `fourcc`          | `char[8]` | V4L2 FourCC string, NUL-terminated |
+| Field             | Type                       | Description |
+|-------------------|----------------------------|-------------|
+| `input_channels`  | `int`                      | Number of input channels (e.g., 4 for RGBA) |
+| `output_channels` | `int`                      | Number of output channels (e.g., 3 for RGB) |
+| `fourcc`          | `char[HAL_FOURCC_MAX_LEN]` | V4L2 FourCC string, NUL-terminated (ASCII, at most 4 bytes + NUL) |
 
 ### DMA-BUF Functions
 
