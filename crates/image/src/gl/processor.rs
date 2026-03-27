@@ -81,8 +81,11 @@ pub struct GLProcessorST {
     /// Used to block operations known to cause unrecoverable GPU hangs.
     is_vivante: bool,
     /// Whether to use renderbuffer-backed EGLImages for DMA destinations.
-    /// Controlled by EDGEFIRST_OPENGL_RENDERSURFACE (1=enabled, 0/missing=disabled).
-    /// Renderbuffers are required on Mali/Neutron GPUs (i.MX 95) but break on Vivante (i.MX 8MP).
+    ///
+    /// Set `EDGEFIRST_OPENGL_RENDERSURFACE=1` to enable (required on i.MX 95 / Mali-G310
+    /// with Neutron NPU DMA-BUF destinations). Defaults to `false` (texture path) for
+    /// 0.13.x compatibility with Vivante (i.MX 8MP). Will become the automatic default
+    /// on non-Vivante platforms in a future release after broader testing.
     use_renderbuffer: bool,
     /// Intermediate RGBA texture for two-pass packed RGB conversion.
     /// Pass 1 renders YUYV/NV12→RGBA here; Pass 2 packs RGBA→RGB to DMA dest.
