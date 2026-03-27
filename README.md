@@ -48,7 +48,7 @@ converter.convert(img, output)
 
 # Decode YOLO outputs (outputs are ef.Tensor objects, not np.ndarray)
 decoder = ef.Decoder(config, 0.5, 0.45)
-boxes, segs = decoder.decode([output0, output1])
+boxes, scores, classes, masks = decoder.decode([output0, output1])
 
 # Draw segmentation masks directly onto the destination image
 result = converter.create_image(640, 640, ef.PixelFormat.Rgb)
@@ -614,7 +614,7 @@ import edgefirst_hal
 decoder = edgefirst_hal.Decoder(config_dict, 0.5, 0.45)
 
 # Decode outputs (accepts List[Tensor]; automatically handles quantization)
-boxes, segs = decoder.decode([output0, output1])
+boxes, scores, classes, masks = decoder.decode([output0, output1])
 ```
 
 </details>
