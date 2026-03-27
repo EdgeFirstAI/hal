@@ -15,7 +15,7 @@
 //! specification including expected function signatures.
 
 use crate::tensor::HalDtype;
-use libc::{c_int, size_t};
+use libc::{c_char, c_int, size_t};
 
 /// Maximum number of dimensions in a delegate tensor shape.
 pub const HAL_DMABUF_MAX_NDIM: usize = 8;
@@ -78,7 +78,7 @@ const _: () = assert!(
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<HalDmabufTensorInfo>() == 96);
 
-/// Maximum length of a FourCC string in [`HalCameraAdaptorFormatInfo`].
+/// Maximum length of a FourCC string in hal_camera_adaptor_format_info.
 pub const HAL_FOURCC_MAX_LEN: usize = 8;
 
 /// Camera adaptor format information returned by a delegate.
@@ -97,9 +97,14 @@ pub struct HalCameraAdaptorFormatInfo {
     pub input_channels: c_int,
     /// Number of output channels (e.g., 3 for RGB).
     pub output_channels: c_int,
-    /// V4L2 FourCC string, NUL-terminated.
-    pub fourcc: [u8; 8],
+    /// V4L2 FourCC string, NUL-terminated (ASCII, at most 4 bytes + NUL).
+    pub fourcc: [c_char; HAL_FOURCC_MAX_LEN],
 }
+
+const _: () = assert!(
+    std::mem::size_of::<[c_char; HAL_FOURCC_MAX_LEN]>() == HAL_FOURCC_MAX_LEN,
+    "HAL_FOURCC_MAX_LEN must equal the fourcc array length"
+);
 
 impl Default for HalCameraAdaptorFormatInfo {
     fn default() -> Self {
