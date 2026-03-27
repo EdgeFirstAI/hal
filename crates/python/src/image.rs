@@ -1064,7 +1064,7 @@ impl PyImageProcessor {
             let ts = timestamp.unwrap_or_else(|| {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_nanos() as u64
             });
             let (output_boxes, output_tracks) = l

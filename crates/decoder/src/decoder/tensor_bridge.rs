@@ -108,14 +108,8 @@ fn map_float_tensors(
                     })?);
                 }
                 // Some models have mixed f32 + i32 outputs (e.g. count tensors).
-                // Skip non-f32 integer tensors silently; the decoder will index
-                // only the outputs it needs.
-                TensorDyn::I32(_)
-                | TensorDyn::U8(_)
-                | TensorDyn::I8(_)
-                | TensorDyn::U16(_)
-                | TensorDyn::I16(_)
-                | TensorDyn::U32(_) => continue,
+                // Skip i32 tensors silently; the decoder indexes only f32 outputs.
+                TensorDyn::I32(_) => continue,
                 _ => {
                     return Err(DecoderError::InvalidConfig(format!(
                         "mixed tensor types: expected f32, got {:?}",

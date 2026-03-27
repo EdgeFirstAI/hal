@@ -219,6 +219,11 @@ impl<'a> MaskOverlay<'a> {
                     "background shape does not match dst".into(),
                 ));
             }
+            if bg.format() != dst.format() {
+                return Err(Error::InvalidShape(
+                    "background pixel format does not match dst".into(),
+                ));
+            }
             let bg_u8 = bg.as_u8().ok_or(Error::NotAnImage)?;
             let dst_u8 = dst.as_u8_mut().ok_or(Error::NotAnImage)?;
             let bg_map = bg_u8.map()?;

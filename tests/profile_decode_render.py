@@ -113,12 +113,18 @@ def main():
     dtype_map = {
         np.dtype("int8"): "int8",
         np.dtype("uint8"): "uint8",
+        np.dtype("int16"): "int16",
+        np.dtype("int32"): "int32",
         np.dtype("float32"): "float32",
+        np.dtype("float64"): "float64",
     }
     outputs = []
     for arr in np_outputs:
         arr = np.ascontiguousarray(arr)
-        t = Tensor(list(arr.shape), dtype=dtype_map.get(arr.dtype, "float32"))
+        hal_dtype = dtype_map.get(arr.dtype)
+        if hal_dtype is None:
+            raise ValueError(f"Unsupported dtype {arr.dtype}; expected one of {list(dtype_map.keys())}")
+        t = Tensor(list(arr.shape), dtype=hal_dtype)
         with t.map() as m:
             np.copyto(np.frombuffer(m, dtype=arr.dtype).reshape(arr.shape), arr)
         outputs.append(t)
