@@ -228,7 +228,6 @@ impl GlContext {
             egl::CONTEXT_MINOR_VERSION,
             1,
             egl::NONE,
-            egl::NONE,
         ];
         let (ctx, has_compute) =
             match egl.create_context(display.as_display(), egl_ext::NO_CONFIG_KHR, None, &ctx_31) {
@@ -237,7 +236,7 @@ impl GlContext {
                     (ctx, true)
                 }
                 Err(_) => {
-                    let ctx_30 = [egl::CONTEXT_MAJOR_VERSION, 3, egl::NONE, egl::NONE];
+                    let ctx_30 = [egl::CONTEXT_MAJOR_VERSION, 3, egl::NONE];
                     let ctx = egl.create_context(
                         display.as_display(),
                         egl_ext::NO_CONFIG_KHR,
