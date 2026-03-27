@@ -4,7 +4,7 @@
 use super::resources::EglImage;
 
 /// Selects which EGLImage cache to use.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(super) enum CacheKind {
     Src,
     Dst,
