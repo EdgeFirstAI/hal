@@ -1700,13 +1700,19 @@ This work was implemented under **EDGEAI-1107**.
 ### Purpose
 
 The Delegate DMA-BUF Framework defines an ABI contract for querying DMA-BUF
-tensor information from external TFLite delegates (e.g., NXP Neutron NPU).
-The HAL owns the type definitions; function implementations live in delegate
-integrators such as `edgefirst-tflite`.
+tensor information from external TFLite delegates (e.g., NXP Neutron NPU,
+VxDelegate). The HAL owns the type definitions; function implementations
+live in delegate shared libraries.
 
-This enables a fully zero-copy pipeline from camera capture through NPU
-inference by allowing `hal_import_image()` to wrap delegate-owned DMA-BUF
-file descriptors as HAL tensors with full image attributes.
+The API is **query-only by design**: delegates own all DMA-BUF allocations
+internally. Consumers query tensor metadata (fd, shape, dtype) and
+synchronize caches — they never register, allocate, bind, or release
+buffers through this API.
+
+Each delegate ships a self-contained `hal_dmabuf.h` header with all type
+definitions and function declarations. Consumers do **not** need the full
+`edgefirst/hal.h` — they either include the delegate's header or load
+symbols via `dlsym`.
 
 ### Zero-Copy Data Flow
 
@@ -1749,9 +1755,13 @@ anyway.
 ### Type Definitions
 
 **`hal_delegate_t`** — opaque handle for any delegate, defined as `void*`.
-A future revision will formalize this as a proper abstraction. The delegate
-lifetime is managed by the caller; the HAL never creates or destroys
-delegates.
+Implementations receive this as a parameter and cast it internally to their
+concrete delegate type. The delegate lifetime is managed by the caller; the
+HAL never creates or destroys delegates.
+
+> **Important:** Exported function signatures **must** use `hal_delegate_t`
+> (`void*`), not `TfLiteDelegate*` or any other concrete type. This ensures
+> ABI compatibility across different delegate implementations.
 
 **`hal_dmabuf_tensor_info`** — describes a single delegate tensor's DMA-BUF:
 
@@ -1767,60 +1777,142 @@ delegates.
 Fields are ordered to eliminate padding on LP64 (`size_t` fields first,
 then smaller 4-byte fields). Total struct size: 96 bytes on LP64.
 
-### Expected Function Signatures
+All fields are **mandatory**. Implementations must populate `shape`, `ndim`,
+and `dtype` in addition to `fd`, `offset`, and `size`. An implementation
+that cannot determine the shape should set `ndim = 0`.
+
+**`hal_camera_adaptor_format_info`** — describes a camera format adaptor:
+
+| Field             | Type      | Description |
+|-------------------|-----------|-------------|
+| `input_channels`  | `int`     | Number of input channels (e.g., 4 for RGBA) |
+| `output_channels` | `int`     | Number of output channels (e.g., 3 for RGB) |
+| `fourcc`          | `char[8]` | V4L2 FourCC string, NUL-terminated |
+
+### DMA-BUF Functions
 
 These functions are **not implemented in the HAL**. They document the exact
-ABI that delegate integrators must export and that consumers probe via
-`dlsym`.
+ABI that delegate shared libraries must export and that consumers probe via
+`dlsym`. All exported symbols must use
+`__attribute__((visibility("default")))`.
 
 ```c
+/* Get the delegate's internal handle.
+ *
+ * When TFLite creates a delegate via TfLiteExternalDelegateCreate(), it
+ * wraps the real delegate in an opaque adapter. This function returns the
+ * inner delegate pointer that the hal_dmabuf_* functions expect.
+ *
+ * Returns the inner delegate handle, or NULL if no delegate has been
+ * created. */
+hal_delegate_t hal_dmabuf_get_instance(void);
+
 /* Query whether the delegate supports DMA-BUF tensor access.
- * Returns 1 if supported, 0 if not supported or on error.
- * A NULL delegate pointer returns 0. */
+ * Returns 1 if supported, 0 otherwise (including NULL delegate or error).
+ * This function does not set errno. */
 int hal_dmabuf_is_supported(hal_delegate_t delegate);
 
 /* Get DMA-BUF tensor info for a given tensor index.
  * Returns 0 on success, -1 on error (sets errno).
  *
  * info_size enables forward-compatible versioning: pass
- * sizeof(hal_dmabuf_tensor_info). Implementations zero-initialize
- * with memset(info, 0, info_size) and only write fields whose
- * offsetof + sizeof fits within info_size.
+ * sizeof(hal_dmabuf_tensor_info). Implementations must:
+ * 1. memset(info, 0, info_size) before populating
+ * 2. Only write fields whose offsetof + sizeof fits within info_size
  *
- * Errno: EINVAL (bad args), ENOTSUP (no DMA-BUF support),
- *        ERANGE (index out of range), EIO (internal failure) */
+ * Errno: EINVAL (NULL info, negative tensor_index, info_size too small),
+ *        ENOTSUP (DMA-BUF not supported),
+ *        ERANGE (tensor_index out of range),
+ *        EIO (DMA-BUF ioctl or internal failure) */
 int hal_dmabuf_get_tensor_info(hal_delegate_t delegate,
                                int tensor_index,
                                hal_dmabuf_tensor_info *info,
                                size_t info_size);
 
 /* Flush CPU caches → device can read.
- * Call after ImageProcessor::convert() into the input tensor,
- * before invoking NPU inference.
+ * Call after writing to an input tensor (e.g., via
+ * ImageProcessor::convert()), before invoking NPU inference.
  * Returns 0 on success, -1 on error (sets errno).
- * Errno: EINVAL, ERANGE, EIO */
+ * Errno: EINVAL (NULL delegate, negative tensor_index),
+ *        ERANGE (tensor_index out of range),
+ *        EIO (DMA-BUF ioctl failure) */
 int hal_dmabuf_sync_for_device(hal_delegate_t delegate, int tensor_index);
 
 /* Invalidate CPU caches → CPU sees device writes.
- * Call after NPU inference, before reading output tensor data.
+ * Call after NPU inference completes, before reading output tensor data.
  * Returns 0 on success, -1 on error (sets errno).
- * Errno: EINVAL, ERANGE, EIO */
+ * Errno: EINVAL (NULL delegate, negative tensor_index),
+ *        ERANGE (tensor_index out of range),
+ *        EIO (DMA-BUF ioctl failure) */
 int hal_dmabuf_sync_for_cpu(hal_delegate_t delegate, int tensor_index);
 ```
 
 `tensor_index` must be non-negative; negative values return -1 with
 `errno` set to `EINVAL`.
 
+### Camera Adaptor Functions
+
+Some delegates support NPU-accelerated format conversion (e.g., RGBA→RGB
+channel slicing, uint8→int8 quantization) that runs as part of the
+inference graph. These functions allow consumers to query format support
+without vendor-specific symbols.
+
+Format conversion is configured **before** graph compilation via delegate
+options (e.g., `DelegateOptions::option("camera_adaptor", "rgba")`), not
+through this query API.
+
+```c
+/* Check if the delegate supports a camera format adaptor.
+ * Returns 1 if the given format is supported, 0 otherwise.
+ * This function does not set errno.
+ *
+ * Delegates without camera adaptor support always return 0. */
+int hal_camera_adaptor_is_supported(hal_delegate_t delegate,
+                                    const char *format);
+
+/* Query camera adaptor format information.
+ * Returns 0 on success, -1 on error (sets errno).
+ *
+ * info_size enables forward-compatible versioning (same pattern as
+ * hal_dmabuf_get_tensor_info).
+ *
+ * Errno: EINVAL (NULL format or info),
+ *        ENOTSUP (format not supported by this delegate) */
+int hal_camera_adaptor_get_format_info(hal_delegate_t delegate,
+                                       const char *format,
+                                       hal_camera_adaptor_format_info *info,
+                                       size_t info_size);
+```
+
+### errno Requirements
+
+Implementations **must** set `errno` before returning -1. The following
+table specifies which errno values apply to each function:
+
+| Function | EINVAL | ENOTSUP | ERANGE | EIO |
+|----------|--------|---------|--------|-----|
+| `hal_dmabuf_get_tensor_info` | NULL info, negative index, info_size too small | DMA-BUF not supported | tensor_index out of range | ioctl or internal failure |
+| `hal_dmabuf_sync_for_device` | NULL delegate, negative index | — | tensor_index out of range | ioctl failure |
+| `hal_dmabuf_sync_for_cpu` | NULL delegate, negative index | — | tensor_index out of range | ioctl failure |
+| `hal_camera_adaptor_get_format_info` | NULL format or info | format not supported | — | — |
+
+Functions that return 1/0 (`hal_dmabuf_is_supported`,
+`hal_camera_adaptor_is_supported`) do **not** set errno.
+
 ### Integration Pattern
 
-1. `edgefirst-tflite` (or another delegate integrator) implements the four
-   functions above and exports them as public C symbols.
+1. The delegate shared library (e.g., `libvx_delegate.so`,
+   `libneutron_delegate.so`) implements the functions above and exports
+   them as public C symbols with default visibility.
 2. Consumers probe for the symbols at runtime via `dlsym` on the delegate's
    shared library.
-3. If `hal_dmabuf_is_supported()` returns 1, consumers call
+3. Consumers call `hal_dmabuf_get_instance()` to obtain the inner delegate
+   handle (needed when the delegate was created via
+   `TfLiteExternalDelegateCreate()`).
+4. If `hal_dmabuf_is_supported()` returns 1, consumers call
    `hal_dmabuf_get_tensor_info()` to obtain the DMA-BUF fd and shape for
    each tensor of interest.
-4. The fd and metadata are passed to `hal_import_image()` to create a
+5. The fd and metadata are passed to `hal_import_image()` to create a
    HAL tensor with full image attributes for use with
    `ImageProcessor::convert()`.
 
@@ -1834,6 +1926,13 @@ int hal_dmabuf_sync_for_cpu(hal_delegate_t delegate, int tensor_index);
   at the correct points in the pipeline (see data flow above).
 - The delegate instance itself is created and destroyed by the caller
   (e.g., via the TFLite C API). The HAL never manages delegate lifetime.
+
+### Symbol Visibility
+
+All exported `hal_dmabuf_*` and `hal_camera_adaptor_*` functions must be
+annotated with `__attribute__((visibility("default")))` to ensure they
+remain visible even when the delegate is compiled with
+`-fvisibility=hidden`.
 
 ### Thread Safety
 
