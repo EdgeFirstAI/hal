@@ -666,7 +666,7 @@ void main() {
 /// HWC → layer-first (CHW) repack compute shader for int8 protos.
 ///
 /// Reads proto data from an SSBO in row-major HWC layout `(H, W, num_protos)`.
-/// Writes to a `GL_R8I` `GL_TEXTURE_2D_ARRAY` with one proto per layer via
+/// Writes to a `GL_R32I` `GL_TEXTURE_2D_ARRAY` with one proto per layer via
 /// `imageStore`. Each workgroup thread handles one `(x, y)` position and
 /// writes all `num_protos` layers.
 ///

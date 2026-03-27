@@ -214,6 +214,11 @@ impl<'a> MaskOverlay<'a> {
     fn apply_background(&self, dst: &mut TensorDyn) -> Result<MaskOverlay<'static>> {
         use edgefirst_tensor::TensorMapTrait;
         if let Some(bg) = self.background {
+            if bg.shape() != dst.shape() {
+                return Err(Error::InvalidShape(
+                    "background shape does not match dst".into(),
+                ));
+            }
             let bg_u8 = bg.as_u8().ok_or(Error::NotAnImage)?;
             let dst_u8 = dst.as_u8_mut().ok_or(Error::NotAnImage)?;
             let bg_map = bg_u8.map()?;
