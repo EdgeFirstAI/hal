@@ -38,6 +38,14 @@ where
     /// May be larger than shape.product() * sizeof(T) for externally
     /// allocated buffers with row padding.
     buf_size: usize,
+    /// Byte offset into the DMA buffer where the tensor data begins.
+    /// Set via `Tensor::set_plane_offset` for sub-region imports.
+    pub(crate) mmap_offset: usize,
+    /// Whether this tensor was created via `from_fd()` (imported from an
+    /// external allocator).  Propagated through `try_clone()` so that DRM
+    /// PRIME import failures are logged at DEBUG rather than WARN.
+    #[cfg(target_os = "linux")]
+    is_imported: bool,
 }
 
 unsafe impl<T> Send for DmaTensor<T> where T: Num + Clone + fmt::Debug + Send + Sync {}
@@ -75,7 +83,7 @@ where
             logical_size
         };
 
-        let drm_attachment = crate::dmabuf::DrmAttachment::new(&dma_fd);
+        let drm_attachment = crate::dmabuf::DrmAttachment::new(&dma_fd, false);
 
         Ok(DmaTensor::<T> {
             name: name.to_owned(),
@@ -85,6 +93,8 @@ where
             _drm_attachment: drm_attachment,
             identity: crate::BufferIdentity::new(),
             buf_size,
+            mmap_offset: 0,
+            is_imported: false,
         })
     }
 
@@ -125,7 +135,7 @@ where
         };
 
         #[cfg(target_os = "linux")]
-        let drm_attachment = crate::dmabuf::DrmAttachment::new(&fd);
+        let drm_attachment = crate::dmabuf::DrmAttachment::new(&fd, true);
 
         Ok(DmaTensor {
             name: name.unwrap_or("").to_owned(),
@@ -136,6 +146,9 @@ where
             _drm_attachment: drm_attachment,
             identity: crate::BufferIdentity::new(),
             buf_size,
+            mmap_offset: 0,
+            #[cfg(target_os = "linux")]
+            is_imported: true,
         })
     }
 
@@ -177,6 +190,7 @@ where
             self.fd.try_clone()?,
             &self.shape,
             self.buf_size,
+            self.mmap_offset,
         )?))
     }
 
@@ -201,7 +215,7 @@ where
     pub fn try_clone(&self) -> Result<Self> {
         let fd = self.clone_fd()?;
         #[cfg(target_os = "linux")]
-        let drm_attachment = crate::dmabuf::DrmAttachment::new(&fd);
+        let drm_attachment = crate::dmabuf::DrmAttachment::new(&fd, self.is_imported);
         Ok(Self {
             name: self.name.clone(),
             fd,
@@ -211,6 +225,9 @@ where
             _drm_attachment: drm_attachment,
             identity: self.identity.clone(),
             buf_size: self.buf_size,
+            mmap_offset: self.mmap_offset,
+            #[cfg(target_os = "linux")]
+            is_imported: self.is_imported,
         })
     }
 }
@@ -225,6 +242,8 @@ where
     shape: Vec<usize>,
     /// Actual mmap'd size (may be > shape.product() * sizeof(T) for padded buffers).
     mmap_size: usize,
+    /// Byte offset into the mmap'd region where tensor data begins.
+    offset: usize,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -232,7 +251,7 @@ impl<T> DmaMap<T>
 where
     T: Num + Clone + fmt::Debug,
 {
-    pub fn new(fd: OwnedFd, shape: &[usize], buf_size: usize) -> Result<Self> {
+    pub fn new(fd: OwnedFd, shape: &[usize], buf_size: usize, offset: usize) -> Result<Self> {
         if shape.is_empty() {
             return Err(Error::InvalidSize(0));
         }
@@ -242,10 +261,33 @@ where
             return Err(Error::InvalidSize(0));
         }
 
-        // Use the buffer's actual size (from fstat at DmaTensor creation) to ensure
-        // mmap covers the full allocation, including any row padding from external
-        // allocators. as_slice() still uses the logical element count from shape.
-        let mmap_size = std::cmp::max(buf_size, logical_size);
+        // Use the buffer's actual size (from fstat at DmaTensor creation).
+        // as_slice() uses the logical element count from shape.
+        // When an offset is present (sub-region of a larger DMA-BUF), verify
+        // that offset + logical_size fits within the allocated buffer — mapping
+        // beyond buf_size would cause SIGBUS on access.
+        let total_needed = offset
+            .checked_add(logical_size)
+            .ok_or(Error::InvalidSize(0))?;
+        if total_needed > buf_size {
+            warn!(
+                "DmaMap: offset={} + logical_size={} = {} exceeds buf_size={} (fd={})",
+                offset,
+                logical_size,
+                total_needed,
+                buf_size,
+                fd.as_raw_fd()
+            );
+            return Err(Error::InvalidSize(total_needed));
+        }
+        if std::mem::size_of::<T>() > 1 && !offset.is_multiple_of(std::mem::align_of::<T>()) {
+            return Err(Error::InvalidOperation(format!(
+                "DmaMap: offset {} is not aligned to align_of::<T>()={}",
+                offset,
+                std::mem::align_of::<T>()
+            )));
+        }
+        let mmap_size = buf_size;
 
         #[cfg(target_os = "linux")]
         {
@@ -277,6 +319,7 @@ where
             fd,
             shape: shape.to_vec(),
             mmap_size,
+            offset,
             _marker: std::marker::PhantomData,
         })
     }
@@ -337,12 +380,14 @@ where
 
     fn as_slice(&self) -> &[T] {
         let ptr = self.ptr.lock().expect("Failed to lock DmaMap pointer");
-        unsafe { std::slice::from_raw_parts(ptr.as_ptr() as *const T, self.len()) }
+        let base = unsafe { (ptr.as_ptr() as *const u8).add(self.offset) as *const T };
+        unsafe { std::slice::from_raw_parts(base, self.len()) }
     }
 
     fn as_mut_slice(&mut self) -> &mut [T] {
         let ptr = self.ptr.lock().expect("Failed to lock DmaMap pointer");
-        unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr() as *mut T, self.len()) }
+        let base = unsafe { (ptr.as_ptr() as *mut u8).add(self.offset) as *mut T };
+        unsafe { std::slice::from_raw_parts_mut(base, self.len()) }
     }
 }
 
@@ -353,5 +398,124 @@ where
     fn drop(&mut self) {
         trace!("DmaMap dropped, unmapping memory");
         self.unmap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Returns a valid fd backed by /dev/null.  The new error paths in
+    /// DmaMap::new() all fire before any fd-specific syscall (mmap,
+    /// DMA_BUF_IOCTL_SYNC), so any readable fd is sufficient.
+    #[cfg(target_os = "linux")]
+    fn dummy_fd() -> std::os::fd::OwnedFd {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::io::IntoRawFd;
+        let f = std::fs::File::open("/dev/null").expect("open /dev/null");
+        unsafe { std::os::fd::OwnedFd::from_raw_fd(f.into_raw_fd()) }
+    }
+
+    /// offset + logical_size exceeds buf_size — must return InvalidSize.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_dma_map_offset_exceeds_buf_size() {
+        let fd = dummy_fd();
+        // shape=[4096] u8 → logical_size=4096; offset=4096 → total_needed=8192
+        // buf_size=4096 < 8192 → error
+        let result = DmaMap::<u8>::new(fd, &[4096], 4096, 4096);
+        match result {
+            Err(Error::InvalidSize(n)) => assert_eq!(n, 8192),
+            other => panic!("expected InvalidSize(8192), got {:?}", other),
+        }
+    }
+
+    /// Offset not aligned to align_of::<T>() — must return InvalidOperation.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_dma_map_misaligned_offset() {
+        let fd = dummy_fd();
+        // shape=[1024] u32 → logical_size=4096; offset=3 (not aligned to 4)
+        // buf_size=8192 so total_needed check passes; alignment check fires
+        let result = DmaMap::<u32>::new(fd, &[1024], 8192, 3);
+        assert!(
+            matches!(result, Err(Error::InvalidOperation(_))),
+            "expected InvalidOperation for misaligned offset, got {:?}",
+            result
+        );
+    }
+
+    /// offset + logical_size overflows usize — must return InvalidSize(0).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_dma_map_offset_overflow() {
+        let fd = dummy_fd();
+        // offset=usize::MAX, shape=[1] u8 → checked_add overflows
+        let result = DmaMap::<u8>::new(fd, &[1], usize::MAX, usize::MAX);
+        assert!(
+            matches!(result, Err(Error::InvalidSize(0))),
+            "expected InvalidSize(0) on overflow, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_dma_map_with_offset() {
+        use crate::{Tensor, TensorMapTrait, TensorMemory, TensorTrait};
+
+        // Skip if DMA heap not available
+        let total_size: usize = 4096 * 4; // 16KB
+        let offset: usize = 4096; // 4KB offset
+        let data_size: usize = 4096; // 4KB of data after offset
+
+        let large_buf = match Tensor::<u8>::new(&[total_size], Some(TensorMemory::Dma), None) {
+            Ok(buf) => buf,
+            Err(_) => {
+                eprintln!("SKIPPED: DMA not available");
+                return;
+            }
+        };
+
+        // Fill entire buffer with sentinel
+        {
+            let mut map = large_buf.map().unwrap();
+            map.as_mut_slice().fill(0xAA);
+        }
+
+        // Import at offset as a smaller tensor using clone_fd + set_plane_offset
+        let fd = large_buf.clone_fd().unwrap();
+        let mut offset_tensor = Tensor::<u8>::from_fd(fd, &[data_size], None).unwrap();
+        offset_tensor.set_plane_offset(offset);
+
+        // Map the offset tensor — should succeed (not rejected)
+        let mut map = offset_tensor.map().unwrap();
+        let slice = map.as_mut_slice();
+
+        // Should see the sentinel at the offset position
+        assert_eq!(slice.len(), data_size);
+        assert!(
+            slice.iter().all(|&b| b == 0xAA),
+            "Offset tensor map should see sentinel data at offset"
+        );
+
+        // Write different data at offset
+        slice.fill(0xBB);
+        drop(map);
+
+        // Verify via the original buffer: bytes before offset unchanged,
+        // bytes at offset are 0xBB
+        {
+            let map = large_buf.map().unwrap();
+            let buf = map.as_slice();
+            assert!(
+                buf[..offset].iter().all(|&b| b == 0xAA),
+                "Data before offset should be unchanged"
+            );
+            assert!(
+                buf[offset..offset + data_size].iter().all(|&b| b == 0xBB),
+                "Data at offset should be 0xBB"
+            );
+        }
     }
 }

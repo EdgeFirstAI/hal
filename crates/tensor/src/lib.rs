@@ -767,6 +767,10 @@ where
         if self.format != Some(format) {
             self.row_stride = None;
             self.plane_offset = None;
+            #[cfg(target_os = "linux")]
+            if let TensorStorage::Dma(ref mut dma) = self.storage {
+                dma.mmap_offset = 0;
+            }
         }
         self.format = Some(format);
         Ok(())
@@ -990,6 +994,10 @@ where
     /// since the offset is format-independent.
     pub fn set_plane_offset(&mut self, offset: usize) {
         self.plane_offset = Some(offset);
+        #[cfg(target_os = "linux")]
+        if let TensorStorage::Dma(ref mut dma) = self.storage {
+            dma.mmap_offset = offset;
+        }
     }
 
     /// Builder-style variant of [`set_plane_offset`](Self::set_plane_offset),
@@ -1096,6 +1104,10 @@ where
         self.format = None;
         self.row_stride = None;
         self.plane_offset = None;
+        #[cfg(target_os = "linux")]
+        if let TensorStorage::Dma(ref mut dma) = self.storage {
+            dma.mmap_offset = 0;
+        }
         Ok(())
     }
 
@@ -1105,9 +1117,19 @@ where
                 "CPU mapping of strided tensors is not supported; use GPU path only".into(),
             ));
         }
+        // Offset tensors are supported for DMA storage — DmaMap adjusts the
+        // mmap range and slice start position.  Non-DMA offset tensors are
+        // not meaningful (offset only applies to DMA-BUF sub-regions).
         if self.plane_offset.is_some_and(|o| o > 0) {
+            #[cfg(target_os = "linux")]
+            if !matches!(self.storage, TensorStorage::Dma(_)) {
+                return Err(Error::InvalidOperation(
+                    "plane offset only supported for DMA tensors".into(),
+                ));
+            }
+            #[cfg(not(target_os = "linux"))]
             return Err(Error::InvalidOperation(
-                "CPU mapping of offset tensors is not supported; use GPU path only".into(),
+                "plane offset only supported for DMA tensors".into(),
             ));
         }
         self.storage.map()

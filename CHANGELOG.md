@@ -191,6 +191,14 @@ shows before/after code for each one.
 // public API surface.
 ```
 
+## [0.13.2] - 2026-03-26
+
+### Fixed
+
+- GL destination EGLImage now uses renderbuffer instead of texture for FBO attachment, fixing `GL_OUT_OF_MEMORY` (0x505) on non-dma_heap DMA-BUF buffers (e.g. Neutron NPU)
+- Allow CPU mapping of offset DMA tensors for G2D I8 post-processing at non-zero buffer offsets
+- DrmAttachment failure log level: warn for self-allocated buffers, debug for imported (external) buffers
+
 ## [0.13.1] - 2026-03-26
 
 ### Fixed
