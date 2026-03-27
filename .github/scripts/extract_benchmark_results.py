@@ -132,17 +132,16 @@ def mask_table(data_dir: Path):
     """Print the mask rendering table for BENCHMARKS.md."""
     print_section("MASK RENDERING TABLE (for BENCHMARKS.md)")
 
-    print(f"  {'Platform':<16} {'Compute':<8} {'Buffer':<6} {'draw_masks':>12} {'draw_masks_proto':>18} {'decode_atlas':>14}")
-    print(f"  {'-' * 16} {'-' * 8} {'-' * 6} {'-' * 12} {'-' * 18} {'-' * 14}")
+    print(f"  {'Platform':<16} {'Compute':<8} {'Buffer':<6} {'draw_decoded_masks':>20} {'draw_proto_masks':>18}")
+    print(f"  {'-' * 16} {'-' * 8} {'-' * 6} {'-' * 20} {'-' * 18}")
 
     for platform, compute, buf, json_file in MASK_CONFIGS:
         data = load_json(data_dir, platform, json_file)
         if data is None:
             continue
-        dm = get_bench(data, "draw_masks")
-        dmp = get_bench(data, "draw_masks_proto")
-        dma = get_bench(data, "decode_masks_atlas")
-        print(f"  {platform:<16} {compute:<8} {buf:<6} {fmt_ms(dm):>12} {fmt_ms(dmp):>18} {fmt_ms(dma):>14}")
+        dm = get_bench(data, "draw_decoded_masks")
+        dmp = get_bench(data, "draw_proto_masks")
+        print(f"  {platform:<16} {compute:<8} {buf:<6} {fmt_ms(dm):>20} {fmt_ms(dmp):>18}")
 
 
 def decoder_table(data_dir: Path):

@@ -3,9 +3,8 @@
 
 //! Mask rendering benchmarks using a custom in-process harness.
 //!
-//! Benchmarks `draw_masks_proto` (fused proto→overlay), `decode_masks_atlas`
-//! (proto→pixel atlas), and `draw_masks` (pre-decoded mask overlay)
-//! for both CPU and OpenGL backends.
+//! Benchmarks `draw_proto_masks` (fused proto→overlay) and `draw_decoded_masks`
+//! (pre-decoded mask overlay) for both CPU and OpenGL backends.
 //!
 //! Uses the same fork-free `edgefirst-bench` harness as `pipeline_benchmark.rs`
 //! to avoid GPU driver crashes on i.MX8/i.MX95 targets.
@@ -66,7 +65,7 @@ fn load_protos_i8() -> ndarray::Array3<i8> {
     ndarray::Array3::from_shape_vec((160, 160, 32), bytes.to_vec()).unwrap()
 }
 
-/// Decode into ProtoData (for `draw_masks_proto` and `decode_masks_atlas` benchmarks).
+/// Decode into ProtoData (for `draw_proto_masks` benchmarks).
 fn decode_proto_data() -> (Vec<DetectBox>, ProtoData) {
     let boxes = load_boxes_i8();
     let protos = load_protos_i8();
@@ -85,7 +84,7 @@ fn decode_proto_data() -> (Vec<DetectBox>, ProtoData) {
 /// Materialize `Segmentation` masks from `ProtoData` with clamped bounding
 /// boxes. This bypasses the decoder's NORM_LIMIT check (which rejects boxes
 /// whose coordinates exceed 1.01) so we always get valid pre-decoded masks
-/// for benchmarking `draw_masks`.
+/// for benchmarking `draw_decoded_masks`.
 fn materialize_segmentations(detect: &[DetectBox], proto_data: &ProtoData) -> Vec<Segmentation> {
     let protos_f32 = proto_data.protos.as_f32();
     let proto_h = protos_f32.shape()[0];
@@ -150,7 +149,7 @@ fn bench_decode_masks(suite: &mut BenchSuite) {
     let protos = load_protos_i8();
 
     // Proto-only decode: NMS + extract mask coefficients (no mask materialization).
-    // This is the decode cost paid by the fused draw_masks_proto / decode_masks_atlas
+    // This is the decode cost paid by the fused draw_proto_masks
     // paths which let the renderer compute mask_coeff @ protos.
     {
         let name = "decode_masks/proto";
@@ -170,7 +169,7 @@ fn bench_decode_masks(suite: &mut BenchSuite) {
     }
 
     // Full decode: NMS + extract proto data + materialize pixel masks on CPU.
-    // This is the decode cost paid by the draw_masks path.
+    // This is the decode cost paid by the draw_decoded_masks path.
     {
         let name = "decode_masks/materialize";
         let result = run_bench(name, WARMUP, ITERATIONS, || {
@@ -191,61 +190,81 @@ fn bench_decode_masks(suite: &mut BenchSuite) {
 }
 
 // =============================================================================
-// draw_masks: pre-decoded mask overlay
+// proto_extraction: isolate extract_proto_data_quant cost
 // =============================================================================
 
-fn bench_draw_masks(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
-    println!("\n== draw_masks: Pre-decoded Mask Overlay ==\n");
+fn bench_proto_extraction(suite: &mut BenchSuite) {
+    println!("\n== proto_extraction: Extract ProtoData Cost ==\n");
 
-    let (detect, proto_data) = decode_proto_data();
-    let segmentation = materialize_segmentations(&detect, &proto_data);
-    let n_detect = detect.len();
-    println!("  Materialized {n_detect} detection masks for benchmarking\n");
+    let boxes = load_boxes_i8();
+    let protos = load_protos_i8();
 
-    let name = "draw_masks";
-    let Ok(mut dst) = proc.create_image(OUTPUT_W, OUTPUT_H, PixelFormat::Rgba, DType::U8, None)
-    else {
-        println!("  {:50} [skipped: allocation failed]", name);
-        return;
-    };
+    // Run NMS once to get detection indices, then measure only the proto
+    // extraction (the copy/dequant we plan to optimize).
+    let mut warmup_boxes = Vec::with_capacity(50);
+    let _ = impl_yolo_segdet_quant_proto::<XYWH, _, _>(
+        (boxes.view(), QUANT_BOXES),
+        (protos.view(), QUANT_PROTOS),
+        SCORE_THRESHOLD,
+        IOU_THRESHOLD,
+        Some(Nms::ClassAgnostic),
+        &mut warmup_boxes,
+    );
+    let n_detect = warmup_boxes.len();
+    println!("  {n_detect} detections; measuring proto extraction (i8 copy + coeff dequant)\n");
 
-    if let Err(e) = proc.draw_masks(&mut dst, &detect, &segmentation) {
-        println!("  {:50} [unsupported: {}]", name, e);
-        return;
-    }
-
+    let name = "proto_extraction";
     let result = run_bench(name, WARMUP, ITERATIONS, || {
-        proc.draw_masks(&mut dst, &detect, &segmentation).unwrap();
+        let mut output_boxes = Vec::with_capacity(50);
+        let _proto_data = impl_yolo_segdet_quant_proto::<XYWH, _, _>(
+            (boxes.view(), QUANT_BOXES),
+            (protos.view(), QUANT_PROTOS),
+            SCORE_THRESHOLD,
+            IOU_THRESHOLD,
+            Some(Nms::ClassAgnostic),
+            &mut output_boxes,
+        );
     });
     result.print_summary();
     suite.record(&result);
 }
 
 // =============================================================================
-// draw_masks_proto: fused proto → overlay
+// draw_proto_masks/forced_opengl: pure GL path (no hybrid)
 // =============================================================================
 
-fn bench_draw_masks_proto(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
-    println!("\n== draw_masks_proto: Fused Proto → Overlay ==\n");
+fn bench_draw_proto_masks_forced_opengl(suite: &mut BenchSuite) {
+    println!("\n== draw_proto_masks/forced_opengl: Pure GL Proto Path ==\n");
+
+    // Create a processor forced to OpenGL only (no hybrid fallback).
+    // SAFETY: set_var is not thread-safe, but benchmarks are single-threaded.
+    unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "opengl") };
+    let proc = ImageProcessor::new();
+    unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") };
+
+    let Ok(mut proc) = proc else {
+        println!("  [skipped: OpenGL ImageProcessor creation failed]");
+        return;
+    };
 
     let (detect, proto_data) = decode_proto_data();
     let n_detect = detect.len();
     println!("  Decoded {n_detect} detections for benchmarking\n");
 
-    let name = "draw_masks_proto";
+    let name = "draw_proto_masks/forced_opengl";
     let Ok(mut dst) = proc.create_image(OUTPUT_W, OUTPUT_H, PixelFormat::Rgba, DType::U8, None)
     else {
         println!("  {:50} [skipped: allocation failed]", name);
         return;
     };
 
-    if let Err(e) = proc.draw_masks_proto(&mut dst, &detect, &proto_data) {
+    if let Err(e) = proc.draw_proto_masks(&mut dst, &detect, &proto_data, Default::default()) {
         println!("  {:50} [unsupported: {}]", name, e);
         return;
     }
 
     let result = run_bench(name, WARMUP, ITERATIONS, || {
-        proc.draw_masks_proto(&mut dst, &detect, &proto_data)
+        proc.draw_proto_masks(&mut dst, &detect, &proto_data, Default::default())
             .unwrap();
     });
     result.print_summary();
@@ -253,26 +272,62 @@ fn bench_draw_masks_proto(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
 }
 
 // =============================================================================
-// decode_masks_atlas: proto → pixel atlas
+// draw_decoded_masks: pre-decoded mask overlay
 // =============================================================================
 
-fn bench_decode_masks_atlas(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
-    println!("\n== decode_masks_atlas: Proto → Pixel Atlas ==\n");
+fn bench_draw_decoded_masks(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
+    println!("\n== draw_decoded_masks: Pre-decoded Mask Overlay ==\n");
 
     let (detect, proto_data) = decode_proto_data();
+    let segmentation = materialize_segmentations(&detect, &proto_data);
     let n_detect = detect.len();
-    println!("  Decoded {n_detect} detections for benchmarking\n");
+    println!("  Materialized {n_detect} detection masks for benchmarking\n");
 
-    let name = "decode_masks_atlas";
-    // Note: proto_data.clone() is required because decode_masks_atlas consumes ProtoData by value.
-    if let Err(e) = proc.decode_masks_atlas(&detect, proto_data.clone(), OUTPUT_W, OUTPUT_H) {
+    let name = "draw_decoded_masks";
+    let Ok(mut dst) = proc.create_image(OUTPUT_W, OUTPUT_H, PixelFormat::Rgba, DType::U8, None)
+    else {
+        println!("  {:50} [skipped: allocation failed]", name);
+        return;
+    };
+
+    if let Err(e) = proc.draw_decoded_masks(&mut dst, &detect, &segmentation, Default::default()) {
         println!("  {:50} [unsupported: {}]", name, e);
         return;
     }
 
     let result = run_bench(name, WARMUP, ITERATIONS, || {
-        let _atlas = proc
-            .decode_masks_atlas(&detect, proto_data.clone(), OUTPUT_W, OUTPUT_H)
+        proc.draw_decoded_masks(&mut dst, &detect, &segmentation, Default::default())
+            .unwrap();
+    });
+    result.print_summary();
+    suite.record(&result);
+}
+
+// =============================================================================
+// draw_proto_masks: fused proto → overlay
+// =============================================================================
+
+fn bench_draw_proto_masks(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
+    println!("\n== draw_proto_masks: Fused Proto → Overlay ==\n");
+
+    let (detect, proto_data) = decode_proto_data();
+    let n_detect = detect.len();
+    println!("  Decoded {n_detect} detections for benchmarking\n");
+
+    let name = "draw_proto_masks";
+    let Ok(mut dst) = proc.create_image(OUTPUT_W, OUTPUT_H, PixelFormat::Rgba, DType::U8, None)
+    else {
+        println!("  {:50} [skipped: allocation failed]", name);
+        return;
+    };
+
+    if let Err(e) = proc.draw_proto_masks(&mut dst, &detect, &proto_data, Default::default()) {
+        println!("  {:50} [unsupported: {}]", name, e);
+        return;
+    }
+
+    let result = run_bench(name, WARMUP, ITERATIONS, || {
+        proc.draw_proto_masks(&mut dst, &detect, &proto_data, Default::default())
             .unwrap();
     });
     result.print_summary();
@@ -299,14 +354,15 @@ fn bench_hybrid_materialize_and_draw(proc: &mut ImageProcessor, suite: &mut Benc
 
     // Verify the hybrid path works before benchmarking.
     let segmentation = materialize_segmentations(&detect, &proto_data);
-    if let Err(e) = proc.draw_masks(&mut dst, &detect, &segmentation) {
+    if let Err(e) = proc.draw_decoded_masks(&mut dst, &detect, &segmentation, Default::default()) {
         println!("  {:50} [unsupported: {}]", name, e);
         return;
     }
 
     let result = run_bench(name, WARMUP, ITERATIONS, || {
         let segmentation = materialize_segmentations(&detect, &proto_data);
-        proc.draw_masks(&mut dst, &detect, &segmentation).unwrap();
+        proc.draw_decoded_masks(&mut dst, &detect, &segmentation, Default::default())
+            .unwrap();
     });
     result.print_summary();
     suite.record(&result);
@@ -325,9 +381,10 @@ fn main() {
     println!("  warmup={WARMUP}  iterations={ITERATIONS}");
 
     bench_decode_masks(&mut suite);
-    bench_draw_masks(&mut proc, &mut suite);
-    bench_draw_masks_proto(&mut proc, &mut suite);
-    bench_decode_masks_atlas(&mut proc, &mut suite);
+    bench_proto_extraction(&mut suite);
+    bench_draw_decoded_masks(&mut proc, &mut suite);
+    bench_draw_proto_masks(&mut proc, &mut suite);
+    bench_draw_proto_masks_forced_opengl(&mut suite);
     bench_hybrid_materialize_and_draw(&mut proc, &mut suite);
 
     suite.finish();

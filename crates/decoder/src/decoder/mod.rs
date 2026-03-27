@@ -28,7 +28,7 @@ pub struct Decoder {
 }
 
 #[derive(Debug)]
-pub enum ArrayViewDQuantized<'a> {
+pub(crate) enum ArrayViewDQuantized<'a> {
     UInt8(ArrayViewD<'a, u8>),
     Int8(ArrayViewD<'a, i8>),
     UInt16(ArrayViewD<'a, u16>),
@@ -93,19 +93,7 @@ where
 
 impl<'a> ArrayViewDQuantized<'a> {
     /// Returns the shape of the underlying array.
-    ///
-    /// # Examples
-    /// ```rust
-    /// # use edgefirst_decoder::ArrayViewDQuantized;
-    /// # use ndarray::Array2;
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let arr = Array2::from_shape_vec((2, 3), vec![1u8, 2, 3, 4, 5, 6])?;
-    /// let view = ArrayViewDQuantized::from(arr.view().into_dyn());
-    /// assert_eq!(view.shape(), &[2, 3]);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn shape(&self) -> &[usize] {
+    pub(crate) fn shape(&self) -> &[usize] {
         match self {
             ArrayViewDQuantized::UInt8(a) => a.shape(),
             ArrayViewDQuantized::Int8(a) => a.shape(),
@@ -157,6 +145,7 @@ macro_rules! with_quantized {
 mod builder;
 mod helpers;
 mod postprocess;
+mod tensor_bridge;
 mod tests;
 
 pub use builder::DecoderBuilder;
@@ -214,56 +203,10 @@ impl Decoder {
         self.normalized
     }
 
-    /// This function decodes quantized model outputs into detection boxes and
-    /// segmentation masks. The quantized outputs can be of u8, i8, u16, i16,
-    /// u32, or i32 types. Up to `output_boxes.capacity()` boxes and masks
-    /// will be decoded. The function clears the provided output vectors
-    /// before populating them with the decoded results.
-    ///
-    /// This function returns a `DecoderError` if the the provided outputs don't
-    /// match the configuration provided by the user when building the decoder.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use edgefirst_decoder::{BoundingBox, DecoderBuilder, DetectBox, DecoderResult};
-    /// # use ndarray::Array4;
-    /// # fn main() -> DecoderResult<()> {
-    /// #    let detect0 = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split_9x15x18.bin"));
-    /// #    let detect0 = ndarray::Array4::from_shape_vec((1, 9, 15, 18), detect0.to_vec())?;
-    /// #
-    /// #    let detect1 = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split_17x30x18.bin"));
-    /// #    let detect1 = ndarray::Array4::from_shape_vec((1, 17, 30, 18), detect1.to_vec())?;
-    /// #    let model_output = vec![
-    /// #        detect1.view().into_dyn().into(),
-    /// #        detect0.view().into_dyn().into(),
-    /// #    ];
-    /// let decoder = DecoderBuilder::default()
-    ///     .with_config_yaml_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split.yaml")).to_string())
-    ///     .with_score_threshold(0.45)
-    ///     .with_iou_threshold(0.45)
-    ///     .build()?;
-    ///
-    /// let mut output_boxes: Vec<_> = Vec::with_capacity(10);
-    /// let mut output_masks: Vec<_> = Vec::with_capacity(10);
-    /// decoder.decode_quantized(&model_output, &mut output_boxes, &mut output_masks)?;
-    /// assert!(output_boxes[0].equal_within_delta(
-    ///     &DetectBox {
-    ///         bbox: BoundingBox {
-    ///             xmin: 0.43171933,
-    ///             ymin: 0.68243736,
-    ///             xmax: 0.5626645,
-    ///             ymax: 0.808863,
-    ///         },
-    ///         score: 0.99240804,
-    ///         label: 0
-    ///     },
-    ///     1e-6
-    /// ));
-    /// #    Ok(())
-    /// # }
-    /// ```
-    pub fn decode_quantized(
+    /// Decode quantized model outputs into detection boxes and segmentation
+    /// masks. The quantized outputs can be of u8, i8, u16, i16, u32, or i32
+    /// types. Clears the provided output vectors before populating them.
+    pub(crate) fn decode_quantized(
         &self,
         outputs: &[ArrayViewDQuantized],
         output_boxes: &mut Vec<DetectBox>,
@@ -323,6 +266,18 @@ impl Decoder {
                 output_boxes,
                 output_masks,
             ),
+            ModelType::YoloSegDet2Way {
+                boxes,
+                mask_coeff,
+                protos,
+            } => self.decode_yolo_segdet_2way_quantized(
+                outputs,
+                boxes,
+                mask_coeff,
+                protos,
+                output_boxes,
+                output_masks,
+            ),
             ModelType::YoloEndToEndDet { boxes } => {
                 self.decode_yolo_end_to_end_det_quantized(outputs, boxes, output_boxes)
             }
@@ -364,63 +319,10 @@ impl Decoder {
         }
     }
 
-    /// This function decodes floating point model outputs into detection boxes
-    /// and segmentation masks. Up to `output_boxes.capacity()` boxes and
-    /// masks will be decoded. The function clears the provided output
-    /// vectors before populating them with the decoded results.
-    ///
-    /// This function returns an `Error` if the the provided outputs don't
-    /// match the configuration provided by the user when building the decoder.
-    ///
-    /// Any quantization information in the configuration will be ignored.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use edgefirst_decoder::{BoundingBox, DecoderBuilder, DetectBox, DecoderResult, configs, configs::{DecoderType, DecoderVersion}, dequantize_cpu, Quantization};
-    /// # use ndarray::Array3;
-    /// # fn main() -> DecoderResult<()> {
-    /// #   let out = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/yolov8s_80_classes.bin"));
-    /// #   let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
-    /// #   let mut out_dequant = vec![0.0_f64; 84 * 8400];
-    /// #   let quant = Quantization::new(0.0040811873, -123);
-    /// #   dequantize_cpu(out, quant, &mut out_dequant);
-    /// #   let model_output_f64 = Array3::from_shape_vec((1, 84, 8400), out_dequant)?.into_dyn();
-    ///    let decoder = DecoderBuilder::default()
-    ///     .with_config_yolo_det(configs::Detection {
-    ///         decoder: DecoderType::Ultralytics,
-    ///         quantization: None,
-    ///         shape: vec![1, 84, 8400],
-    ///         anchors: None,
-    ///         dshape: Vec::new(),
-    ///         normalized: Some(true),
-    ///     },
-    ///     Some(DecoderVersion::Yolo11))
-    ///     .with_score_threshold(0.25)
-    ///     .with_iou_threshold(0.7)
-    ///     .build()?;
-    ///
-    /// let mut output_boxes: Vec<_> = Vec::with_capacity(10);
-    /// let mut output_masks: Vec<_> = Vec::with_capacity(10);
-    /// let model_output_f64 = vec![model_output_f64.view().into()];
-    /// decoder.decode_float(&model_output_f64, &mut output_boxes, &mut output_masks)?;    
-    /// assert!(output_boxes[0].equal_within_delta(
-    ///        &DetectBox {
-    ///            bbox: BoundingBox {
-    ///                xmin: 0.5285137,
-    ///                ymin: 0.05305544,
-    ///                xmax: 0.87541467,
-    ///                ymax: 0.9998909,
-    ///            },
-    ///            score: 0.5591227,
-    ///            label: 0
-    ///        },
-    ///        1e-6
-    ///    ));
-    ///
-    /// #    Ok(())
-    /// # }
-    pub fn decode_float<T>(
+    /// Decode floating point model outputs into detection boxes and
+    /// segmentation masks. Clears the provided output vectors before
+    /// populating them.
+    pub(crate) fn decode_float<T>(
         &self,
         outputs: &[ArrayViewD<T>],
         output_boxes: &mut Vec<DetectBox>,
@@ -482,6 +384,20 @@ impl Decoder {
                     output_masks,
                 )?;
             }
+            ModelType::YoloSegDet2Way {
+                boxes,
+                mask_coeff,
+                protos,
+            } => {
+                self.decode_yolo_segdet_2way_float(
+                    outputs,
+                    boxes,
+                    mask_coeff,
+                    protos,
+                    output_boxes,
+                    output_masks,
+                )?;
+            }
             ModelType::YoloEndToEndDet { boxes } => {
                 self.decode_yolo_end_to_end_det_float(outputs, boxes, output_boxes)?;
             }
@@ -535,7 +451,7 @@ impl Decoder {
     /// Returns `Ok(None)` for detection-only and ModelPack models (use
     /// `decode_quantized` for those). Returns `Ok(Some(ProtoData))` for
     /// YOLO segmentation models.
-    pub fn decode_quantized_proto(
+    pub(crate) fn decode_quantized_proto(
         &self,
         outputs: &[ArrayViewDQuantized],
         output_boxes: &mut Vec<DetectBox>,
@@ -568,6 +484,20 @@ impl Decoder {
                     outputs,
                     boxes,
                     scores,
+                    mask_coeff,
+                    protos,
+                    output_boxes,
+                )?;
+                Ok(Some(proto))
+            }
+            ModelType::YoloSegDet2Way {
+                boxes,
+                mask_coeff,
+                protos,
+            } => {
+                let proto = self.decode_yolo_segdet_2way_quantized_proto(
+                    outputs,
+                    boxes,
                     mask_coeff,
                     protos,
                     output_boxes,
@@ -609,7 +539,7 @@ impl Decoder {
     ///
     /// Returns `Ok(None)` for detection-only and ModelPack models. Returns
     /// `Ok(Some(ProtoData))` for YOLO segmentation models.
-    pub fn decode_float_proto<T>(
+    pub(crate) fn decode_float_proto<T>(
         &self,
         outputs: &[ArrayViewD<T>],
         output_boxes: &mut Vec<DetectBox>,
@@ -652,6 +582,20 @@ impl Decoder {
                 )?;
                 Ok(Some(proto))
             }
+            ModelType::YoloSegDet2Way {
+                boxes,
+                mask_coeff,
+                protos,
+            } => {
+                let proto = self.decode_yolo_segdet_2way_float_proto(
+                    outputs,
+                    boxes,
+                    mask_coeff,
+                    protos,
+                    output_boxes,
+                )?;
+                Ok(Some(proto))
+            }
             ModelType::YoloEndToEndSegDet { boxes, protos } => {
                 let proto = self.decode_yolo_end_to_end_segdet_float_proto(
                     outputs,
@@ -681,6 +625,87 @@ impl Decoder {
             }
         }
     }
+
+    // ========================================================================
+    // TensorDyn-based public API
+    // ========================================================================
+
+    /// Decode model outputs into detection boxes and segmentation masks.
+    ///
+    /// This is the primary decode API. Accepts `TensorDyn` outputs directly
+    /// from model inference. Automatically dispatches to quantized or float
+    /// paths based on the tensor dtype.
+    ///
+    /// # Arguments
+    ///
+    /// * `outputs` - Tensor outputs from model inference
+    /// * `output_boxes` - Destination for decoded detection boxes (cleared first)
+    /// * `output_masks` - Destination for decoded segmentation masks (cleared first)
+    ///
+    /// # Errors
+    ///
+    /// Returns `DecoderError` if tensor mapping fails, dtypes are unsupported,
+    /// or the outputs don't match the decoder's model configuration.
+    pub fn decode(
+        &self,
+        outputs: &[&edgefirst_tensor::TensorDyn],
+        output_boxes: &mut Vec<DetectBox>,
+        output_masks: &mut Vec<Segmentation>,
+    ) -> Result<(), DecoderError> {
+        let mapped = tensor_bridge::map_tensors(outputs)?;
+        match &mapped {
+            tensor_bridge::MappedOutputs::Quantized(maps) => {
+                let views = tensor_bridge::quantized_views(maps)?;
+                self.decode_quantized(&views, output_boxes, output_masks)
+            }
+            tensor_bridge::MappedOutputs::Float32(maps) => {
+                let views = tensor_bridge::f32_views(maps)?;
+                self.decode_float(&views, output_boxes, output_masks)
+            }
+            tensor_bridge::MappedOutputs::Float64(maps) => {
+                let views = tensor_bridge::f64_views(maps)?;
+                self.decode_float(&views, output_boxes, output_masks)
+            }
+        }
+    }
+
+    /// Decode model outputs into detection boxes, returning raw proto data
+    /// for segmentation models instead of materialized masks.
+    ///
+    /// Accepts `TensorDyn` outputs directly from model inference.
+    /// Returns `Ok(None)` for detection-only and ModelPack models.
+    /// Returns `Ok(Some(ProtoData))` for YOLO segmentation models.
+    ///
+    /// # Arguments
+    ///
+    /// * `outputs` - Tensor outputs from model inference
+    /// * `output_boxes` - Destination for decoded detection boxes (cleared first)
+    ///
+    /// # Errors
+    ///
+    /// Returns `DecoderError` if tensor mapping fails, dtypes are unsupported,
+    /// or the outputs don't match the decoder's model configuration.
+    pub fn decode_proto(
+        &self,
+        outputs: &[&edgefirst_tensor::TensorDyn],
+        output_boxes: &mut Vec<DetectBox>,
+    ) -> Result<Option<ProtoData>, DecoderError> {
+        let mapped = tensor_bridge::map_tensors(outputs)?;
+        match &mapped {
+            tensor_bridge::MappedOutputs::Quantized(maps) => {
+                let views = tensor_bridge::quantized_views(maps)?;
+                self.decode_quantized_proto(&views, output_boxes)
+            }
+            tensor_bridge::MappedOutputs::Float32(maps) => {
+                let views = tensor_bridge::f32_views(maps)?;
+                self.decode_float_proto(&views, output_boxes)
+            }
+            tensor_bridge::MappedOutputs::Float64(maps) => {
+                let views = tensor_bridge::f64_views(maps)?;
+                self.decode_float_proto(&views, output_boxes)
+            }
+        }
+    }
 }
 
 #[cfg(feature = "tracker")]
@@ -691,56 +716,10 @@ pub use edgefirst_tracker::Tracker;
 
 #[cfg(feature = "tracker")]
 impl Decoder {
-    /// This function decodes quantized model outputs into detection boxes and
-    /// segmentation masks. The quantized outputs can be of u8, i8, u16, i16,
-    /// u32, or i32 types. Up to `output_boxes.capacity()` boxes and masks
-    /// will be decoded. The function clears the provided output vectors
-    /// before populating them with the decoded results.
-    ///
-    /// This function returns a `DecoderError` if the the provided outputs don't
-    /// match the configuration provided by the user when building the decoder.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use edgefirst_decoder::{BoundingBox, DecoderBuilder, DetectBox, DecoderResult};
-    /// # use ndarray::Array4;
-    /// # fn main() -> DecoderResult<()> {
-    /// #    let detect0 = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split_9x15x18.bin"));
-    /// #    let detect0 = ndarray::Array4::from_shape_vec((1, 9, 15, 18), detect0.to_vec())?;
-    /// #
-    /// #    let detect1 = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split_17x30x18.bin"));
-    /// #    let detect1 = ndarray::Array4::from_shape_vec((1, 17, 30, 18), detect1.to_vec())?;
-    /// #    let model_output = vec![
-    /// #        detect1.view().into_dyn().into(),
-    /// #        detect0.view().into_dyn().into(),
-    /// #    ];
-    /// let decoder = DecoderBuilder::default()
-    ///     .with_config_yaml_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split.yaml")).to_string())
-    ///     .with_score_threshold(0.45)
-    ///     .with_iou_threshold(0.45)
-    ///     .build()?;
-    ///
-    /// let mut output_boxes: Vec<_> = Vec::with_capacity(10);
-    /// let mut output_masks: Vec<_> = Vec::with_capacity(10);
-    /// decoder.decode_quantized(&model_output, &mut output_boxes, &mut output_masks)?;
-    /// assert!(output_boxes[0].equal_within_delta(
-    ///     &DetectBox {
-    ///         bbox: BoundingBox {
-    ///             xmin: 0.43171933,
-    ///             ymin: 0.68243736,
-    ///             xmax: 0.5626645,
-    ///             ymax: 0.808863,
-    ///         },
-    ///         score: 0.99240804,
-    ///         label: 0
-    ///     },
-    ///     1e-6
-    /// ));
-    /// #    Ok(())
-    /// # }
-    /// ```
-    pub fn decode_tracked_quantized<TR: edgefirst_tracker::Tracker<DetectBox>>(
+    /// Decode quantized model outputs into detection boxes and segmentation
+    /// masks with tracking. Clears the provided output vectors before
+    /// populating them.
+    pub(crate) fn decode_tracked_quantized<TR: edgefirst_tracker::Tracker<DetectBox>>(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -813,6 +792,21 @@ impl Decoder {
                 output_masks,
                 output_tracks,
             ),
+            ModelType::YoloSegDet2Way {
+                boxes,
+                mask_coeff,
+                protos,
+            } => self.decode_tracked_yolo_segdet_2way_quantized(
+                tracker,
+                timestamp,
+                outputs,
+                boxes,
+                mask_coeff,
+                protos,
+                output_boxes,
+                output_masks,
+                output_tracks,
+            ),
             _ => {
                 self.decode_quantized(outputs, output_boxes, output_masks)?;
                 Self::update_tracker(tracker, timestamp, output_boxes, output_tracks);
@@ -830,54 +824,7 @@ impl Decoder {
     /// match the configuration provided by the user when building the decoder.
     ///
     /// Any quantization information in the configuration will be ignored.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use edgefirst_decoder::{BoundingBox, DecoderBuilder, DetectBox, DecoderResult, configs, configs::{DecoderType, DecoderVersion}, dequantize_cpu, Quantization};
-    /// # use ndarray::Array3;
-    /// # fn main() -> DecoderResult<()> {
-    /// #   let out = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/yolov8s_80_classes.bin"));
-    /// #   let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
-    /// #   let mut out_dequant = vec![0.0_f64; 84 * 8400];
-    /// #   let quant = Quantization::new(0.0040811873, -123);
-    /// #   dequantize_cpu(out, quant, &mut out_dequant);
-    /// #   let model_output_f64 = Array3::from_shape_vec((1, 84, 8400), out_dequant)?.into_dyn();
-    ///    let decoder = DecoderBuilder::default()
-    ///     .with_config_yolo_det(configs::Detection {
-    ///         decoder: DecoderType::Ultralytics,
-    ///         quantization: None,
-    ///         shape: vec![1, 84, 8400],
-    ///         anchors: None,
-    ///         dshape: Vec::new(),
-    ///         normalized: Some(true),
-    ///     },
-    ///     Some(DecoderVersion::Yolo11))
-    ///     .with_score_threshold(0.25)
-    ///     .with_iou_threshold(0.7)
-    ///     .build()?;
-    ///
-    /// let mut output_boxes: Vec<_> = Vec::with_capacity(10);
-    /// let mut output_masks: Vec<_> = Vec::with_capacity(10);
-    /// let model_output_f64 = vec![model_output_f64.view().into()];
-    /// decoder.decode_float(&model_output_f64, &mut output_boxes, &mut output_masks)?;    
-    /// assert!(output_boxes[0].equal_within_delta(
-    ///        &DetectBox {
-    ///            bbox: BoundingBox {
-    ///                xmin: 0.5285137,
-    ///                ymin: 0.05305544,
-    ///                xmax: 0.87541467,
-    ///                ymax: 0.9998909,
-    ///            },
-    ///            score: 0.5591227,
-    ///            label: 0
-    ///        },
-    ///        1e-6
-    ///    ));
-    ///
-    /// #    Ok(())
-    /// # }
-    pub fn decode_tracked_float<TR: edgefirst_tracker::Tracker<DetectBox>, T>(
+    pub(crate) fn decode_tracked_float<TR: edgefirst_tracker::Tracker<DetectBox>, T>(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -958,6 +905,23 @@ impl Decoder {
                     output_tracks,
                 )?;
             }
+            ModelType::YoloSegDet2Way {
+                boxes,
+                mask_coeff,
+                protos,
+            } => {
+                self.decode_tracked_yolo_segdet_2way_float(
+                    tracker,
+                    timestamp,
+                    outputs,
+                    boxes,
+                    mask_coeff,
+                    protos,
+                    output_boxes,
+                    output_masks,
+                    output_tracks,
+                )?;
+            }
             _ => {
                 self.decode_float(outputs, output_boxes, output_masks)?;
                 Self::update_tracker(tracker, timestamp, output_boxes, output_tracks);
@@ -972,7 +936,7 @@ impl Decoder {
     /// Returns `Ok(None)` for detection-only and ModelPack models (use
     /// `decode_quantized` for those). Returns `Ok(Some(ProtoData))` for
     /// YOLO segmentation models.
-    pub fn decode_tracked_quantized_proto<TR: edgefirst_tracker::Tracker<DetectBox>>(
+    pub(crate) fn decode_tracked_quantized_proto<TR: edgefirst_tracker::Tracker<DetectBox>>(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -1025,6 +989,23 @@ impl Decoder {
                 )?;
                 Ok(Some(proto))
             }
+            ModelType::YoloSegDet2Way {
+                boxes,
+                mask_coeff,
+                protos,
+            } => {
+                let proto = self.decode_tracked_yolo_segdet_2way_quantized_proto(
+                    tracker,
+                    timestamp,
+                    outputs,
+                    boxes,
+                    mask_coeff,
+                    protos,
+                    output_boxes,
+                    output_tracks,
+                )?;
+                Ok(Some(proto))
+            }
             ModelType::YoloEndToEndSegDet { boxes, protos } => {
                 let proto = self.decode_tracked_yolo_end_to_end_segdet_quantized_proto(
                     tracker,
@@ -1066,7 +1047,7 @@ impl Decoder {
     ///
     /// Returns `Ok(None)` for detection-only and ModelPack models. Returns
     /// `Ok(Some(ProtoData))` for YOLO segmentation models.
-    pub fn decode_tracked_float_proto<TR: edgefirst_tracker::Tracker<DetectBox>, T>(
+    pub(crate) fn decode_tracked_float_proto<TR: edgefirst_tracker::Tracker<DetectBox>, T>(
         &self,
         tracker: &mut TR,
         timestamp: u64,
@@ -1123,6 +1104,23 @@ impl Decoder {
                 )?;
                 Ok(Some(proto))
             }
+            ModelType::YoloSegDet2Way {
+                boxes,
+                mask_coeff,
+                protos,
+            } => {
+                let proto = self.decode_tracked_yolo_segdet_2way_float_proto(
+                    tracker,
+                    timestamp,
+                    outputs,
+                    boxes,
+                    mask_coeff,
+                    protos,
+                    output_boxes,
+                    output_tracks,
+                )?;
+                Ok(Some(proto))
+            }
             ModelType::YoloEndToEndSegDet { boxes, protos } => {
                 let proto = self.decode_tracked_yolo_end_to_end_segdet_float_proto(
                     tracker,
@@ -1155,6 +1153,138 @@ impl Decoder {
                     output_tracks,
                 )?;
                 Ok(Some(proto))
+            }
+        }
+    }
+
+    // ========================================================================
+    // TensorDyn-based tracked public API
+    // ========================================================================
+
+    /// Decode model outputs with tracking.
+    ///
+    /// Accepts `TensorDyn` outputs directly from model inference. Automatically
+    /// dispatches to quantized or float paths based on the tensor dtype, then
+    /// updates the tracker with the decoded boxes.
+    ///
+    /// # Arguments
+    ///
+    /// * `tracker` - The tracker instance to update
+    /// * `timestamp` - Current frame timestamp
+    /// * `outputs` - Tensor outputs from model inference
+    /// * `output_boxes` - Destination for decoded detection boxes (cleared first)
+    /// * `output_masks` - Destination for decoded segmentation masks (cleared first)
+    /// * `output_tracks` - Destination for track info (cleared first)
+    ///
+    /// # Errors
+    ///
+    /// Returns `DecoderError` if tensor mapping fails, dtypes are unsupported,
+    /// or the outputs don't match the decoder's model configuration.
+    pub fn decode_tracked<TR: edgefirst_tracker::Tracker<DetectBox>>(
+        &self,
+        tracker: &mut TR,
+        timestamp: u64,
+        outputs: &[&edgefirst_tensor::TensorDyn],
+        output_boxes: &mut Vec<DetectBox>,
+        output_masks: &mut Vec<Segmentation>,
+        output_tracks: &mut Vec<edgefirst_tracker::TrackInfo>,
+    ) -> Result<(), DecoderError> {
+        let mapped = tensor_bridge::map_tensors(outputs)?;
+        match &mapped {
+            tensor_bridge::MappedOutputs::Quantized(maps) => {
+                let views = tensor_bridge::quantized_views(maps)?;
+                self.decode_tracked_quantized(
+                    tracker,
+                    timestamp,
+                    &views,
+                    output_boxes,
+                    output_masks,
+                    output_tracks,
+                )
+            }
+            tensor_bridge::MappedOutputs::Float32(maps) => {
+                let views = tensor_bridge::f32_views(maps)?;
+                self.decode_tracked_float(
+                    tracker,
+                    timestamp,
+                    &views,
+                    output_boxes,
+                    output_masks,
+                    output_tracks,
+                )
+            }
+            tensor_bridge::MappedOutputs::Float64(maps) => {
+                let views = tensor_bridge::f64_views(maps)?;
+                self.decode_tracked_float(
+                    tracker,
+                    timestamp,
+                    &views,
+                    output_boxes,
+                    output_masks,
+                    output_tracks,
+                )
+            }
+        }
+    }
+
+    /// Decode model outputs with tracking, returning raw proto data for
+    /// segmentation models.
+    ///
+    /// Accepts `TensorDyn` outputs directly from model inference.
+    /// Returns `Ok(None)` for detection-only and ModelPack models.
+    /// Returns `Ok(Some(ProtoData))` for YOLO segmentation models.
+    ///
+    /// # Arguments
+    ///
+    /// * `tracker` - The tracker instance to update
+    /// * `timestamp` - Current frame timestamp
+    /// * `outputs` - Tensor outputs from model inference
+    /// * `output_boxes` - Destination for decoded detection boxes (cleared first)
+    /// * `output_tracks` - Destination for track info (cleared first)
+    ///
+    /// # Errors
+    ///
+    /// Returns `DecoderError` if tensor mapping fails, dtypes are unsupported,
+    /// or the outputs don't match the decoder's model configuration.
+    pub fn decode_proto_tracked<TR: edgefirst_tracker::Tracker<DetectBox>>(
+        &self,
+        tracker: &mut TR,
+        timestamp: u64,
+        outputs: &[&edgefirst_tensor::TensorDyn],
+        output_boxes: &mut Vec<DetectBox>,
+        output_tracks: &mut Vec<edgefirst_tracker::TrackInfo>,
+    ) -> Result<Option<ProtoData>, DecoderError> {
+        let mapped = tensor_bridge::map_tensors(outputs)?;
+        match &mapped {
+            tensor_bridge::MappedOutputs::Quantized(maps) => {
+                let views = tensor_bridge::quantized_views(maps)?;
+                self.decode_tracked_quantized_proto(
+                    tracker,
+                    timestamp,
+                    &views,
+                    output_boxes,
+                    output_tracks,
+                )
+            }
+            tensor_bridge::MappedOutputs::Float32(maps) => {
+                let views = tensor_bridge::f32_views(maps)?;
+                self.decode_tracked_float_proto(
+                    tracker,
+                    timestamp,
+                    &views,
+                    output_boxes,
+                    output_tracks,
+                )
+            }
+            tensor_bridge::MappedOutputs::Float64(maps) => {
+                let views = tensor_bridge::f64_views(maps)?;
+                self.decode_tracked_float_proto(
+                    tracker,
+                    timestamp,
+                    &views,
+                    output_boxes,
+                    output_tracks,
+                )
             }
         }
     }

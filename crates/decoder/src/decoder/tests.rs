@@ -2171,4 +2171,347 @@ outputs:
             output_boxes.len()
         );
     }
+
+    // ── Proto Extraction Tests ───────────────────────────────────────
+
+    #[test]
+    fn test_extract_proto_data_quant_with_cached_model() {
+        use crate::yolo::impl_yolo_segdet_quant_proto;
+        use crate::{Nms, ProtoData, Quantization, XYWH};
+
+        // Load cached YOLOv8 segmentation model outputs
+        let boxes_raw = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_boxes_116x8400.bin"
+        ));
+        let boxes_i8 =
+            unsafe { std::slice::from_raw_parts(boxes_raw.as_ptr() as *const i8, boxes_raw.len()) };
+        let boxes = ndarray::Array2::from_shape_vec((116, 8400), boxes_i8.to_vec()).unwrap();
+
+        let protos_raw = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_protos_160x160x32.bin"
+        ));
+        let protos_i8 = unsafe {
+            std::slice::from_raw_parts(protos_raw.as_ptr() as *const i8, protos_raw.len())
+        };
+        let protos = ndarray::Array3::from_shape_vec((160, 160, 32), protos_i8.to_vec()).unwrap();
+
+        let quant_boxes = Quantization::new(0.019_484_945, 20);
+        let quant_protos = Quantization::new(0.020_889_873, -115);
+
+        let mut output_boxes = Vec::with_capacity(50);
+        let proto_data: ProtoData = impl_yolo_segdet_quant_proto::<XYWH, _, _>(
+            (boxes.view(), quant_boxes),
+            (protos.view(), quant_protos),
+            0.45,
+            0.45,
+            Some(Nms::ClassAgnostic),
+            &mut output_boxes,
+        );
+
+        // Verify detections are produced
+        assert!(
+            !output_boxes.is_empty(),
+            "Expected detections from cached model outputs"
+        );
+
+        // Verify proto data shape
+        let protos_shape = match &proto_data.protos {
+            crate::ProtoTensor::Quantized { protos, .. } => protos.shape().to_vec(),
+            crate::ProtoTensor::Float(arr) => arr.shape().to_vec(),
+        };
+        assert_eq!(protos_shape, [160, 160, 32], "Proto shape mismatch");
+
+        // Verify mask coefficients: one per detection, each length 32
+        assert_eq!(
+            proto_data.mask_coefficients.len(),
+            output_boxes.len(),
+            "mask_coefficients count must match detection count"
+        );
+        for (i, coeff) in proto_data.mask_coefficients.iter().enumerate() {
+            assert_eq!(
+                coeff.len(),
+                32,
+                "Detection {i} has {} coefficients, expected 32",
+                coeff.len()
+            );
+        }
+
+        // Verify proto tensor is quantized variant (input was i8)
+        assert!(
+            matches!(proto_data.protos, crate::ProtoTensor::Quantized { .. }),
+            "Expected Quantized proto tensor for i8 input"
+        );
+    }
+
+    // ── YOLO 2-Way Split Segmentation Tests ──────────────────────────
+
+    #[test]
+    fn test_yolo_segdet_2way_valid_with_dshape() {
+        let decoder = DecoderBuilder::new()
+            .with_config(ConfigOutputs {
+                outputs: vec![
+                    ConfigOutput::Detection(configs::Detection {
+                        decoder: DecoderType::Ultralytics,
+                        shape: vec![1, 84, 8400],
+                        quantization: None,
+                        dshape: vec![
+                            (DimName::Batch, 1),
+                            (DimName::NumFeatures, 84),
+                            (DimName::NumBoxes, 8400),
+                        ],
+                        normalized: Some(true),
+                        anchors: None,
+                    }),
+                    ConfigOutput::MaskCoefficients(configs::MaskCoefficients {
+                        decoder: DecoderType::Ultralytics,
+                        shape: vec![1, 32, 8400],
+                        quantization: None,
+                        dshape: vec![
+                            (DimName::Batch, 1),
+                            (DimName::NumProtos, 32),
+                            (DimName::NumBoxes, 8400),
+                        ],
+                    }),
+                    ConfigOutput::Protos(configs::Protos {
+                        decoder: DecoderType::Ultralytics,
+                        shape: vec![1, 160, 160, 32],
+                        quantization: None,
+                        dshape: vec![
+                            (DimName::Batch, 1),
+                            (DimName::Height, 160),
+                            (DimName::Width, 160),
+                            (DimName::NumProtos, 32),
+                        ],
+                    }),
+                ],
+                ..Default::default()
+            })
+            .build();
+        assert!(decoder.is_ok(), "Expected valid 2-way split: {decoder:?}");
+        let decoder = decoder.unwrap();
+        assert!(matches!(
+            decoder.model_type(),
+            ModelType::YoloSegDet2Way { .. }
+        ));
+    }
+
+    #[test]
+    fn test_yolo_segdet_2way_valid_no_dshape() {
+        let decoder = DecoderBuilder::new()
+            .with_config(ConfigOutputs {
+                outputs: vec![
+                    ConfigOutput::Detection(configs::Detection {
+                        decoder: DecoderType::Ultralytics,
+                        shape: vec![1, 84, 8400],
+                        quantization: None,
+                        dshape: vec![],
+                        normalized: Some(true),
+                        anchors: None,
+                    }),
+                    ConfigOutput::MaskCoefficients(configs::MaskCoefficients {
+                        decoder: DecoderType::Ultralytics,
+                        shape: vec![1, 32, 8400],
+                        quantization: None,
+                        dshape: vec![],
+                    }),
+                    ConfigOutput::Protos(configs::Protos {
+                        decoder: DecoderType::Ultralytics,
+                        shape: vec![1, 160, 160, 32],
+                        quantization: None,
+                        dshape: vec![],
+                    }),
+                ],
+                ..Default::default()
+            })
+            .build();
+        assert!(decoder.is_ok(), "Expected valid 2-way split: {decoder:?}");
+    }
+
+    #[test]
+    fn test_yolo_segdet_2way_invalid_detection_shape() {
+        let result = DecoderBuilder::new()
+            .with_config(ConfigOutputs {
+                outputs: vec![
+                    ConfigOutput::Detection(configs::Detection {
+                        decoder: DecoderType::Ultralytics,
+                        shape: vec![1, 84], // 2D — invalid
+                        quantization: None,
+                        dshape: vec![],
+                        normalized: Some(true),
+                        anchors: None,
+                    }),
+                    ConfigOutput::MaskCoefficients(configs::MaskCoefficients {
+                        decoder: DecoderType::Ultralytics,
+                        shape: vec![1, 32, 8400],
+                        quantization: None,
+                        dshape: vec![],
+                    }),
+                    ConfigOutput::Protos(configs::Protos {
+                        decoder: DecoderType::Ultralytics,
+                        shape: vec![1, 160, 160, 32],
+                        quantization: None,
+                        dshape: vec![],
+                    }),
+                ],
+                ..Default::default()
+            })
+            .build();
+        assert!(matches!(
+            result,
+            Err(DecoderError::InvalidConfig(s)) if s.starts_with("Invalid Yolo 2-Way Detection shape")
+        ));
+    }
+
+    #[test]
+    fn test_yolo_segdet_2way_num_boxes_mismatch() {
+        let result = DecoderBuilder::new()
+            .with_config(ConfigOutputs {
+                outputs: vec![
+                    ConfigOutput::Detection(configs::Detection {
+                        decoder: DecoderType::Ultralytics,
+                        shape: vec![1, 84, 8400],
+                        quantization: None,
+                        dshape: vec![],
+                        normalized: Some(true),
+                        anchors: None,
+                    }),
+                    ConfigOutput::MaskCoefficients(configs::MaskCoefficients {
+                        decoder: DecoderType::Ultralytics,
+                        shape: vec![1, 32, 1000], // mismatched N
+                        quantization: None,
+                        dshape: vec![],
+                    }),
+                    ConfigOutput::Protos(configs::Protos {
+                        decoder: DecoderType::Ultralytics,
+                        shape: vec![1, 160, 160, 32],
+                        quantization: None,
+                        dshape: vec![],
+                    }),
+                ],
+                ..Default::default()
+            })
+            .build();
+        assert!(matches!(
+            result,
+            Err(DecoderError::InvalidConfig(s)) if s.contains("num_boxes")
+        ));
+    }
+
+    #[test]
+    fn test_yolo_segdet_2way_proto_channel_mismatch() {
+        let result = DecoderBuilder::new()
+            .with_config(ConfigOutputs {
+                outputs: vec![
+                    ConfigOutput::Detection(configs::Detection {
+                        decoder: DecoderType::Ultralytics,
+                        shape: vec![1, 84, 8400],
+                        quantization: None,
+                        dshape: vec![],
+                        normalized: Some(true),
+                        anchors: None,
+                    }),
+                    ConfigOutput::MaskCoefficients(configs::MaskCoefficients {
+                        decoder: DecoderType::Ultralytics,
+                        shape: vec![1, 32, 8400],
+                        quantization: None,
+                        dshape: vec![],
+                    }),
+                    ConfigOutput::Protos(configs::Protos {
+                        decoder: DecoderType::Ultralytics,
+                        shape: vec![1, 160, 160, 16], // 16 != 32
+                        quantization: None,
+                        dshape: vec![],
+                    }),
+                ],
+                ..Default::default()
+            })
+            .build();
+        assert!(matches!(
+            result,
+            Err(DecoderError::InvalidConfig(s)) if s.contains("Protos channels")
+        ));
+    }
+
+    #[test]
+    fn test_yolo_segdet_2way_decode_float_roundtrip() {
+        // Build a 2-way split decoder: 80 classes, 32 protos
+        let decoder = DecoderBuilder::new()
+            .with_config(ConfigOutputs {
+                outputs: vec![
+                    ConfigOutput::Detection(configs::Detection {
+                        decoder: DecoderType::Ultralytics,
+                        shape: vec![1, 84, 8400],
+                        quantization: None,
+                        dshape: vec![
+                            (DimName::Batch, 1),
+                            (DimName::NumFeatures, 84),
+                            (DimName::NumBoxes, 8400),
+                        ],
+                        normalized: Some(true),
+                        anchors: None,
+                    }),
+                    ConfigOutput::MaskCoefficients(configs::MaskCoefficients {
+                        decoder: DecoderType::Ultralytics,
+                        shape: vec![1, 32, 8400],
+                        quantization: None,
+                        dshape: vec![
+                            (DimName::Batch, 1),
+                            (DimName::NumProtos, 32),
+                            (DimName::NumBoxes, 8400),
+                        ],
+                    }),
+                    ConfigOutput::Protos(configs::Protos {
+                        decoder: DecoderType::Ultralytics,
+                        shape: vec![1, 160, 160, 32],
+                        quantization: None,
+                        dshape: vec![
+                            (DimName::Batch, 1),
+                            (DimName::Height, 160),
+                            (DimName::Width, 160),
+                            (DimName::NumProtos, 32),
+                        ],
+                    }),
+                ],
+                ..Default::default()
+            })
+            .with_score_threshold(0.25)
+            .with_iou_threshold(0.7)
+            .build()
+            .unwrap();
+
+        // Use the reference yolov8s detection output, but strip mask_coefs
+        // (pretend they come from a separate tensor). Detection = [1,84,8400].
+        let out = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8s_80_classes.bin"
+        ));
+        let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
+
+        // Dequantize the reference detection output
+        let quant = crate::Quantization::new(0.0040811873, -123);
+        let mut out_f64 = vec![0.0_f64; 84 * 8400];
+        crate::dequantize_cpu(out, quant, &mut out_f64);
+        let det_arr = ndarray::Array3::from_shape_vec((1, 84, 8400), out_f64).unwrap();
+
+        // Create synthetic mask_coefs [1,32,8400] and protos [1,160,160,32]
+        // (all zeros — no real masks, but the decode path should not crash)
+        let mask_coefs = ndarray::Array3::<f64>::zeros((1, 32, 8400));
+        let protos = ndarray::Array4::<f64>::zeros((1, 160, 160, 32));
+
+        let outputs = [
+            det_arr.view().into_dyn(),
+            protos.view().into_dyn(),
+            mask_coefs.view().into_dyn(),
+        ];
+        let outputs: Vec<_> = outputs.iter().map(|x| x.view()).collect();
+
+        let mut output_boxes = Vec::with_capacity(100);
+        let mut output_masks = Vec::with_capacity(100);
+        let result = decoder.decode_float(&outputs, &mut output_boxes, &mut output_masks);
+        assert!(result.is_ok(), "decode_float failed: {result:?}");
+        // Should detect boxes (same as reference yolov8s test)
+        assert!(!output_boxes.is_empty(), "Expected detections");
+    }
 }

@@ -15,6 +15,7 @@ documentation = "https://docs.rs/edgefirst-image"
 [features]
 default = ["opengl"]
 opengl = ["dep:khronos-egl", "dep:gbm"]
+tracker = ["edgefirst-decoder/tracker", "dep:edgefirst-tracker"]
 opencv = ["dep:opencv"]
 g2d_test_formats = []
 dma_test_formats = []
@@ -42,6 +43,7 @@ yuv = { workspace = true }
 zune-jpeg = { workspace = true }
 zune-png = { workspace = true }
 edgefirst-decoder = { workspace = true }
+edgefirst-tracker = { workspace = true, optional = true }
 ndarray-stats = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

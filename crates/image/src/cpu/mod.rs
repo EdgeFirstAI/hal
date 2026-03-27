@@ -328,92 +328,26 @@ impl ImageProcessorTrait for CPUProcessor {
         self.convert_impl(src, dst, rotation, flip, crop)
     }
 
-    fn draw_masks(
+    fn draw_decoded_masks(
         &mut self,
         dst: &mut TensorDyn,
         detect: &[DetectBox],
         segmentation: &[Segmentation],
+        overlay: crate::MaskOverlay<'_>,
     ) -> Result<()> {
         let dst = dst.as_u8_mut().ok_or(Error::NotAnImage)?;
-        self.draw_masks_impl(dst, detect, segmentation)
+        self.draw_decoded_masks_impl(dst, detect, segmentation, overlay.opacity)
     }
 
-    fn draw_masks_proto(
+    fn draw_proto_masks(
         &mut self,
         dst: &mut TensorDyn,
         detect: &[DetectBox],
         proto_data: &ProtoData,
+        overlay: crate::MaskOverlay<'_>,
     ) -> Result<()> {
         let dst = dst.as_u8_mut().ok_or(Error::NotAnImage)?;
-        self.draw_masks_proto_impl(dst, detect, proto_data)
-    }
-
-    fn decode_masks_atlas(
-        &mut self,
-        detect: &[crate::DetectBox],
-        proto_data: crate::ProtoData,
-        output_width: usize,
-        output_height: usize,
-    ) -> Result<(Vec<u8>, Vec<crate::MaskRegion>)> {
-        use crate::FunctionTimer;
-
-        let _timer = FunctionTimer::new("CPUProcessor::decode_masks_atlas");
-
-        let padding = 4usize;
-
-        // Render per-detection masks via existing path
-        let mask_results =
-            self.render_masks_from_protos(detect, proto_data, output_width, output_height)?;
-
-        // Pack into compact atlas: each strip is padded bbox height
-        let ow = output_width as i32;
-        let oh = output_height as i32;
-        let pad = padding as i32;
-
-        let mut regions = Vec::with_capacity(mask_results.len());
-        let mut atlas_y = 0usize;
-
-        // Pre-compute regions
-        for mr in &mask_results {
-            let bx = mr.x as i32;
-            let by = mr.y as i32;
-            let bw = mr.w as i32;
-            let bh = mr.h as i32;
-            let padded_x = (bx - pad).max(0);
-            let padded_y = (by - pad).max(0);
-            let padded_w = ((bx + bw + pad).min(ow) - padded_x).max(1);
-            let padded_h = ((by + bh + pad).min(oh) - padded_y).max(1);
-            regions.push(crate::MaskRegion {
-                atlas_y_offset: atlas_y,
-                padded_x: padded_x as usize,
-                padded_y: padded_y as usize,
-                padded_w: padded_w as usize,
-                padded_h: padded_h as usize,
-                bbox_x: mr.x,
-                bbox_y: mr.y,
-                bbox_w: mr.w,
-                bbox_h: mr.h,
-            });
-            atlas_y += padded_h as usize;
-        }
-
-        let atlas_height = atlas_y;
-        let mut atlas = vec![0u8; output_width * atlas_height];
-
-        for (mr, region) in mask_results.iter().zip(regions.iter()) {
-            // Copy mask pixels into the atlas at the correct position
-            for row in 0..mr.h {
-                let dst_row = region.atlas_y_offset + (mr.y - region.padded_y) + row;
-                let dst_start = dst_row * output_width + mr.x;
-                let src_start = row * mr.w;
-                if dst_start + mr.w <= atlas.len() && src_start + mr.w <= mr.pixels.len() {
-                    atlas[dst_start..dst_start + mr.w]
-                        .copy_from_slice(&mr.pixels[src_start..src_start + mr.w]);
-                }
-            }
-        }
-
-        Ok((atlas, regions))
+        self.draw_proto_masks_impl(dst, detect, proto_data, overlay.opacity)
     }
 
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<()> {
@@ -635,11 +569,12 @@ impl CPUProcessor {
         Ok(())
     }
 
-    fn draw_masks_impl(
+    fn draw_decoded_masks_impl(
         &mut self,
         dst: &mut Tensor<u8>,
         detect: &[DetectBox],
         segmentation: &[Segmentation],
+        opacity: f32,
     ) -> Result<()> {
         let dst_fmt = dst.format().ok_or(Error::NotAnImage)?;
         if !matches!(dst_fmt, PixelFormat::Rgba | PixelFormat::Rgb) {
@@ -648,7 +583,7 @@ impl CPUProcessor {
             ));
         }
 
-        let _timer = FunctionTimer::new("CPUProcessor::draw_masks");
+        let _timer = FunctionTimer::new("CPUProcessor::draw_decoded_masks");
 
         let dst_w = dst.width().unwrap();
         let dst_h = dst.height().unwrap();
@@ -676,6 +611,7 @@ impl CPUProcessor {
                 dst_c,
                 dst_slice,
                 &segmentation[0],
+                opacity,
             )?;
         } else {
             for (seg, detect) in segmentation.iter().zip(detect) {
@@ -687,6 +623,7 @@ impl CPUProcessor {
                     dst_slice,
                     seg,
                     detect.label,
+                    opacity,
                 )?;
             }
         }
@@ -694,11 +631,12 @@ impl CPUProcessor {
         Ok(())
     }
 
-    fn draw_masks_proto_impl(
+    fn draw_proto_masks_impl(
         &mut self,
         dst: &mut Tensor<u8>,
         detect: &[DetectBox],
         proto_data: &ProtoData,
+        opacity: f32,
     ) -> Result<()> {
         let dst_fmt = dst.format().ok_or(Error::NotAnImage)?;
         if !matches!(dst_fmt, PixelFormat::Rgba | PixelFormat::Rgb) {
@@ -707,7 +645,7 @@ impl CPUProcessor {
             ));
         }
 
-        let _timer = FunctionTimer::new("CPUProcessor::draw_masks_proto");
+        let _timer = FunctionTimer::new("CPUProcessor::draw_proto_masks");
 
         let dst_w = dst.width().unwrap();
         let dst_h = dst.height().unwrap();
@@ -731,7 +669,11 @@ impl CPUProcessor {
 
         for (det, coeff) in detect.iter().zip(proto_data.mask_coefficients.iter()) {
             let color = self.colors[det.label % self.colors.len()];
-            let alpha = color[3] as u16;
+            let alpha = if opacity == 1.0 {
+                color[3] as u16
+            } else {
+                (color[3] as f32 * opacity).round() as u16
+            };
 
             // Pixel bounds of the detection in dst image space
             let start_x = (dst_w as f32 * det.bbox.xmin).round() as usize;

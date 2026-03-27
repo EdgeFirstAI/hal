@@ -549,6 +549,7 @@ version = "0.13.2"
 dependencies = [
  "argminmax",
  "edgefirst-bench",
+ "edgefirst-tensor",
  "edgefirst-tracker",
  "env_logger",
  "fast-math",
@@ -628,6 +629,7 @@ dependencies = [
  "edgefirst-decoder",
  "edgefirst-gbm",
  "edgefirst-tensor",
+ "edgefirst-tracker",
  "enum_dispatch",
  "env_logger",
  "fast_image_resize",

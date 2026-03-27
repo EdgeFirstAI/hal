@@ -6,28 +6,45 @@ import numpy as np
 import pytest
 
 
-def test_decoder():
-    output = np.empty((84, 8400), dtype=np.float32)
-    quant = np.fromfile("testdata/yolov8s_80_classes.bin", dtype=np.int8).reshape(
-        84, 8400
-    )
-    edgefirst_hal.Decoder.dequantize(
-        quant,
-        (0.0040811873, -123),
-        output,
-    )
+def numpy_to_tensor(arr, mem=None):
+    import edgefirst_hal
 
-    dequantized = (quant.astype(np.float32) - (-123.0)) * 0.0040811873
-    assert np.allclose(output, dequantized)
+    dtype_map = {
+        "int8": "int8",
+        "uint8": "uint8",
+        "int16": "int16",
+        "uint16": "uint16",
+        "int32": "int32",
+        "uint32": "uint32",
+        "int64": "int64",
+        "uint64": "uint64",
+        "float32": "float32",
+        "float64": "float64",
+    }
+    import numpy as np
+
+    hal_dtype = dtype_map.get(str(arr.dtype))
+    if hal_dtype is None:
+        raise ValueError(f"Unsupported numpy dtype: {arr.dtype}")
+    arr = np.ascontiguousarray(arr)
+    tensor = edgefirst_hal.Tensor(list(arr.shape), dtype=hal_dtype, mem=mem)
+    with tensor.map() as m:
+        dst = np.frombuffer(m, dtype=arr.dtype).reshape(arr.shape)
+        np.copyto(dst, arr)
+    return tensor
 
 
 def test_from_json():
-    output0 = np.fromfile(
-        "testdata/modelpack_split_17x30x18.bin", dtype=np.uint8
-    ).reshape(1, 17, 30, 18)
-    output1 = np.fromfile(
-        "testdata/modelpack_split_9x15x18.bin", dtype=np.uint8
-    ).reshape(1, 9, 15, 18)
+    output0 = numpy_to_tensor(
+        np.fromfile("testdata/modelpack_split_17x30x18.bin", dtype=np.uint8).reshape(
+            1, 17, 30, 18
+        )
+    )
+    output1 = numpy_to_tensor(
+        np.fromfile("testdata/modelpack_split_9x15x18.bin", dtype=np.uint8).reshape(
+            1, 9, 15, 18
+        )
+    )
 
     with open("testdata/modelpack_split.json") as f:
         config = f.read()
@@ -41,12 +58,16 @@ def test_from_json():
 
 
 def test_from_yaml():
-    output0 = np.fromfile(
-        "testdata/modelpack_split_17x30x18.bin", dtype=np.uint8
-    ).reshape(1, 17, 30, 18)
-    output1 = np.fromfile(
-        "testdata/modelpack_split_9x15x18.bin", dtype=np.uint8
-    ).reshape(1, 9, 15, 18)
+    output0 = numpy_to_tensor(
+        np.fromfile("testdata/modelpack_split_17x30x18.bin", dtype=np.uint8).reshape(
+            1, 17, 30, 18
+        )
+    )
+    output1 = numpy_to_tensor(
+        np.fromfile("testdata/modelpack_split_9x15x18.bin", dtype=np.uint8).reshape(
+            1, 9, 15, 18
+        )
+    )
     with open("testdata/modelpack_split.yaml") as f:
         config = f.read()
 
@@ -61,12 +82,16 @@ def test_from_yaml():
 def test_from_dict_json():
     import json
 
-    output0 = np.fromfile(
-        "testdata/modelpack_split_17x30x18.bin", dtype=np.uint8
-    ).reshape(1, 17, 30, 18)
-    output1 = np.fromfile(
-        "testdata/modelpack_split_9x15x18.bin", dtype=np.uint8
-    ).reshape(1, 9, 15, 18)
+    output0 = numpy_to_tensor(
+        np.fromfile("testdata/modelpack_split_17x30x18.bin", dtype=np.uint8).reshape(
+            1, 17, 30, 18
+        )
+    )
+    output1 = numpy_to_tensor(
+        np.fromfile("testdata/modelpack_split_9x15x18.bin", dtype=np.uint8).reshape(
+            1, 9, 15, 18
+        )
+    )
 
     with open("testdata/modelpack_split.json") as f:
         config = f.read()
@@ -83,12 +108,16 @@ def test_from_dict_json():
 def test_from_dict_yaml():
     yaml = pytest.importorskip("yaml")
 
-    output0 = np.fromfile(
-        "testdata/modelpack_split_17x30x18.bin", dtype=np.uint8
-    ).reshape(1, 17, 30, 18)
-    output1 = np.fromfile(
-        "testdata/modelpack_split_9x15x18.bin", dtype=np.uint8
-    ).reshape(1, 9, 15, 18)
+    output0 = numpy_to_tensor(
+        np.fromfile("testdata/modelpack_split_17x30x18.bin", dtype=np.uint8).reshape(
+            1, 17, 30, 18
+        )
+    )
+    output1 = numpy_to_tensor(
+        np.fromfile("testdata/modelpack_split_9x15x18.bin", dtype=np.uint8).reshape(
+            1, 9, 15, 18
+        )
+    )
 
     with open("testdata/modelpack_split.yaml") as f:
         config = f.read()
@@ -102,67 +131,19 @@ def test_from_dict_yaml():
     assert len(masks) == 0
 
 
-def test_modelpack_direct():
-    output0 = np.fromfile(
-        "testdata/modelpack_split_17x30x18.bin", dtype=np.uint8
-    ).reshape(17, 30, 18)
-    anchors0 = [
-        [0.13750000298023224, 0.2074074000120163],
-        [0.2541666626930237, 0.21481481194496155],
-        [0.23125000298023224, 0.35185185074806213],
-    ]
-    quant0 = (0.09929127991199493, 183)
-
-    output1 = np.fromfile(
-        "testdata/modelpack_split_9x15x18.bin", dtype=np.uint8
-    ).reshape(9, 15, 18)
-    anchors1 = [
-        [0.36666667461395264, 0.31481480598449707],
-        [0.38749998807907104, 0.4740740656852722],
-        [0.5333333611488342, 0.644444465637207],
-    ]
-    quant1 = (0.08547406643629074, 174)
-
-    boxes, scores, classes = edgefirst_hal.Decoder.decode_modelpack_det_split(
-        [output0, output1], [anchors0, anchors1], [quant0, quant1], 0.45, 0.45
-    )
-
-    assert np.allclose(boxes, [[0.43171933, 0.68243736, 0.5626645, 0.808863]])
-    assert np.allclose(scores, [0.99240804])
-    assert np.allclose(classes, [0])
-
-
-def test_filter_int32():
-    output0 = np.fromfile(
-        "testdata/modelpack_split_17x30x18.bin", dtype=np.uint8
-    ).reshape(1, 17, 30, 18)
-    output1 = np.fromfile(
-        "testdata/modelpack_split_9x15x18.bin", dtype=np.uint8
-    ).reshape(1, 9, 15, 18)
-    # this int32 array should be ignored by the decoder
-    int32_arr = np.zeros((100, 100), np.int32)
-
-    with open("testdata/modelpack_split.yaml") as f:
-        config = f.read()
-
-    decoder = edgefirst_hal.Decoder.new_from_yaml_str(config, 0.45, 0.45)
-    boxes, scores, classes, masks = decoder.decode([output0, output1, int32_arr])
-
-    assert np.allclose(boxes, [[0.43171933, 0.68243736, 0.5626645, 0.808863]])
-    assert np.allclose(scores, [0.99240804])
-    assert np.allclose(classes, [0])
-    assert len(masks) == 0
-
-
 def test_nms():
     tf = pytest.importorskip("tensorflow")
 
-    output0 = np.fromfile(
-        "testdata/modelpack_split_17x30x18.bin", dtype=np.uint8
-    ).reshape(1, 17, 30, 18)
-    output1 = np.fromfile(
-        "testdata/modelpack_split_9x15x18.bin", dtype=np.uint8
-    ).reshape(1, 9, 15, 18)
+    output0 = numpy_to_tensor(
+        np.fromfile("testdata/modelpack_split_17x30x18.bin", dtype=np.uint8).reshape(
+            1, 17, 30, 18
+        )
+    )
+    output1 = numpy_to_tensor(
+        np.fromfile("testdata/modelpack_split_9x15x18.bin", dtype=np.uint8).reshape(
+            1, 9, 15, 18
+        )
+    )
 
     with open("testdata/modelpack_split.yaml") as f:
         config = f.read()
@@ -189,7 +170,7 @@ def test_nms():
             decoder.score_threshold = score_threshold
             decoder.iou_threshold = iou_threshold
             hal_boxes, hal_scores, hal_classes, _ = decoder.decode(
-                [output0, output1], 100000
+                [output0, output1], 100_000
             )
 
             assert np.all(np.abs(hal_boxes - tf_boxes) < 1e-6)
@@ -218,8 +199,10 @@ def test_yolo_det():
         ],
     }
     decoder = edgefirst_hal.Decoder(config, 0.2, 0.7)
-    output = np.fromfile("testdata/yolov8s_80_classes.bin", dtype=np.int8).reshape(
-        1, 84, 8400
+    output = numpy_to_tensor(
+        np.fromfile("testdata/yolov8s_80_classes.bin", dtype=np.int8).reshape(
+            1, 84, 8400
+        )
     )
     boxes, scores, classes, masks = decoder.decode([output])
 
@@ -256,8 +239,10 @@ def test_context_switch():
             ],
         }
         decoder = edgefirst_hal.Decoder(config, 0.25, 0.7)
-        output = np.fromfile("testdata/yolov8s_80_classes.bin", dtype=np.int8).reshape(
-            1, 84, 8400
+        output = numpy_to_tensor(
+            np.fromfile("testdata/yolov8s_80_classes.bin", dtype=np.int8).reshape(
+                1, 84, 8400
+            )
         )
 
         for _ in range(100):
@@ -278,12 +263,16 @@ def test_context_switch():
             assert len(masks) == 0
 
     def modelpack_det_split():
-        output0 = np.fromfile(
-            "testdata/modelpack_split_17x30x18.bin", dtype=np.uint8
-        ).reshape(1, 17, 30, 18)
-        output1 = np.fromfile(
-            "testdata/modelpack_split_9x15x18.bin", dtype=np.uint8
-        ).reshape(1, 9, 15, 18)
+        output0 = numpy_to_tensor(
+            np.fromfile(
+                "testdata/modelpack_split_17x30x18.bin", dtype=np.uint8
+            ).reshape(1, 17, 30, 18)
+        )
+        output1 = numpy_to_tensor(
+            np.fromfile("testdata/modelpack_split_9x15x18.bin", dtype=np.uint8).reshape(
+                1, 9, 15, 18
+            )
+        )
 
         with open("testdata/modelpack_split.json") as f:
             config = f.read()
@@ -328,9 +317,11 @@ def test_new_from_outputs_yolov8():
         score_threshold=0.2,
         iou_threshold=0.7,
     )
-    model_output = np.fromfile(
-        "testdata/yolov8s_80_classes.bin", dtype=np.int8
-    ).reshape(1, 84, 8400)
+    model_output = numpy_to_tensor(
+        np.fromfile("testdata/yolov8s_80_classes.bin", dtype=np.int8).reshape(
+            1, 84, 8400
+        )
+    )
     boxes, scores, classes, masks = decoder.decode([model_output])
 
     assert np.allclose(
@@ -371,10 +362,12 @@ def test_new_from_outputs_yolov8_split():
         1, 84, 8400
     )
     dequantized = (raw.astype(np.float32) - (-123.0)) * 0.0040811873
-    boxes_tensor = dequantized[:, :4, :]
-    scores_tensor = dequantized[:, 4:, :]
+    boxes_arr = np.ascontiguousarray(dequantized[:, :4, :])
+    scores_arr = np.ascontiguousarray(dequantized[:, 4:, :])
 
-    boxes, scores, classes, masks = decoder.decode([boxes_tensor, scores_tensor])
+    boxes, scores, classes, masks = decoder.decode(
+        [numpy_to_tensor(boxes_arr), numpy_to_tensor(scores_arr)]
+    )
     assert len(boxes) > 0
     assert len(scores) > 0
     assert len(masks) == 0
@@ -390,9 +383,11 @@ def test_output_with_quantization():
         score_threshold=0.2,
         iou_threshold=0.7,
     )
-    model_output = np.fromfile(
-        "testdata/yolov8s_80_classes.bin", dtype=np.int8
-    ).reshape(1, 84, 8400)
+    model_output = numpy_to_tensor(
+        np.fromfile("testdata/yolov8s_80_classes.bin", dtype=np.int8).reshape(
+            1, 84, 8400
+        )
+    )
     boxes, scores, classes, masks = decoder.decode([model_output])
     # Should produce the same results as the dict-based config
     assert np.allclose(
@@ -419,9 +414,11 @@ def test_output_with_dshape():
         score_threshold=0.2,
         iou_threshold=0.7,
     )
-    model_output = np.fromfile(
-        "testdata/yolov8s_80_classes.bin", dtype=np.int8
-    ).reshape(1, 84, 8400)
+    model_output = numpy_to_tensor(
+        np.fromfile("testdata/yolov8s_80_classes.bin", dtype=np.int8).reshape(
+            1, 84, 8400
+        )
+    )
     boxes, scores, classes, masks = decoder.decode([model_output])
 
     assert np.allclose(
@@ -544,8 +541,10 @@ def test_yolo_det_int8_hal(benchmark):
         ],
     }
     decoder = edgefirst_hal.Decoder(config, 0.25, 0.7)
-    output = np.fromfile("testdata/yolov8s_80_classes.bin", dtype=np.int8).reshape(
-        1, 84, 8400
+    output = numpy_to_tensor(
+        np.fromfile("testdata/yolov8s_80_classes.bin", dtype=np.int8).reshape(
+            1, 84, 8400
+        )
     )
 
     def run_decode():

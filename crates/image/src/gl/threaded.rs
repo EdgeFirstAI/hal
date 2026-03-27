@@ -10,7 +10,7 @@ use tokio::sync::mpsc::{Sender, WeakSender};
 use super::processor::GLProcessorST;
 use super::shaders::check_gl_error;
 use super::{EglDisplayKind, Int8InterpolationMode, TransferBackend};
-use crate::{Crop, Error, Flip, ImageProcessorTrait, MaskRegion, Rotation};
+use crate::{Crop, Error, Flip, ImageProcessorTrait, Rotation};
 use edgefirst_tensor::TensorDyn;
 
 #[allow(clippy::type_complexity)]
@@ -27,28 +27,25 @@ enum GLProcessorMessage {
         Vec<[u8; 4]>,
         tokio::sync::oneshot::Sender<Result<(), Error>>,
     ),
-    DrawMasks(
+    DrawDecodedMasks(
         SendablePtr<TensorDyn>,
         SendablePtr<DetectBox>,
         SendablePtr<Segmentation>,
+        f32,                            // opacity
+        Option<SendablePtr<TensorDyn>>, // background
         tokio::sync::oneshot::Sender<Result<(), Error>>,
     ),
-    DrawMasksProto(
+    DrawProtoMasks(
         SendablePtr<TensorDyn>,
         SendablePtr<DetectBox>,
-        Box<ProtoData>,
+        SendablePtr<ProtoData>,
+        f32,                            // opacity
+        Option<SendablePtr<TensorDyn>>, // background
         tokio::sync::oneshot::Sender<Result<(), Error>>,
     ),
     SetInt8Interpolation(
         Int8InterpolationMode,
         tokio::sync::oneshot::Sender<Result<(), Error>>,
-    ),
-    DecodeMasksAtlas(
-        SendablePtr<DetectBox>,
-        Box<ProtoData>,
-        usize, // output_width
-        usize, // output_height
-        tokio::sync::oneshot::Sender<Result<(Vec<u8>, Vec<MaskRegion>), Error>>,
     ),
     PboCreate(
         usize, // buffer size in bytes
@@ -189,19 +186,16 @@ impl GLProcessorThreaded {
                         GLProcessorMessage::ImageConvert(.., resp) => {
                             let _ = resp.send(Err(poison_err));
                         }
-                        GLProcessorMessage::DrawMasks(.., resp) => {
+                        GLProcessorMessage::DrawDecodedMasks(.., resp) => {
                             let _ = resp.send(Err(poison_err));
                         }
-                        GLProcessorMessage::DrawMasksProto(.., resp) => {
+                        GLProcessorMessage::DrawProtoMasks(.., resp) => {
                             let _ = resp.send(Err(poison_err));
                         }
                         GLProcessorMessage::SetColors(_, resp) => {
                             let _ = resp.send(Err(poison_err));
                         }
                         GLProcessorMessage::SetInt8Interpolation(_, resp) => {
-                            let _ = resp.send(Err(poison_err));
-                        }
-                        GLProcessorMessage::DecodeMasksAtlas(.., resp) => {
                             let _ = resp.send(Err(poison_err));
                         }
                         GLProcessorMessage::PboCreate(_, resp) => {
@@ -238,44 +232,70 @@ impl GLProcessorThreaded {
                             }
                         });
                     }
-                    GLProcessorMessage::DrawMasks(mut dst, det, seg, resp) => {
-                        // SAFETY: This is safe because the draw_masks() function waits for the
-                        // resp to be sent before dropping the borrow for dst, detect, and
-                        // segmentation
+                    GLProcessorMessage::DrawDecodedMasks(mut dst, det, seg, opacity, bg, resp) => {
+                        // SAFETY: This is safe because the draw_decoded_masks() function waits for the
+                        // resp to be sent before dropping the borrow for dst, detect,
+                        // segmentation, and background
                         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                             let dst = unsafe { dst.ptr.as_mut() };
                             let det =
                                 unsafe { std::slice::from_raw_parts(det.ptr.as_ptr(), det.len) };
                             let seg =
                                 unsafe { std::slice::from_raw_parts(seg.ptr.as_ptr(), seg.len) };
-                            gl_converter.draw_masks(dst, det, seg)
+                            let bg_ref = bg.map(|p| unsafe { &*p.ptr.as_ptr() });
+                            gl_converter.draw_decoded_masks(
+                                dst,
+                                det,
+                                seg,
+                                crate::MaskOverlay {
+                                    background: bg_ref,
+                                    opacity,
+                                },
+                            )
                         }));
                         let _ = resp.send(match result {
                             Ok(res) => res,
                             Err(e) => {
                                 poisoned = true;
                                 Err(crate::Error::Internal(format!(
-                                    "GL thread panicked during DrawMasks: {}",
+                                    "GL thread panicked during DrawDecodedMasks: {}",
                                     panic_message(e.as_ref()),
                                 )))
                             }
                         });
                     }
-                    GLProcessorMessage::DrawMasksProto(mut dst, det, proto_data, resp) => {
-                        // SAFETY: Same safety invariant as DrawMasks — caller
+                    GLProcessorMessage::DrawProtoMasks(
+                        mut dst,
+                        det,
+                        proto_data,
+                        opacity,
+                        bg,
+                        resp,
+                    ) => {
+                        // SAFETY: Same safety invariant as DrawDecodedMasks — caller
                         // blocks on resp before dropping borrows.
                         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                             let dst = unsafe { dst.ptr.as_mut() };
                             let det =
                                 unsafe { std::slice::from_raw_parts(det.ptr.as_ptr(), det.len) };
-                            gl_converter.draw_masks_proto(dst, det, &proto_data)
+                            let bg_ref = bg.map(|p| unsafe { &*p.ptr.as_ptr() });
+                            let proto_data = unsafe { proto_data.ptr.as_ref() };
+                            gl_converter.draw_proto_masks(
+                                dst,
+                                det,
+                                proto_data,
+                                crate::MaskOverlay {
+                                    background: bg_ref,
+                                    opacity,
+                                },
+                            )
                         }));
                         let _ = resp.send(match result {
                             Ok(res) => res,
                             Err(e) => {
                                 poisoned = true;
                                 Err(crate::Error::Internal(format!(
-                                    "GL thread panicked during DrawMasksProto: {}",
+                                    "GL thread panicked during DrawProtoMasks: {}",
                                     panic_message(e.as_ref()),
                                 )))
                             }
@@ -307,34 +327,6 @@ impl GLProcessorThreaded {
                                 poisoned = true;
                                 Err(crate::Error::Internal(format!(
                                     "GL thread panicked during SetInt8Interpolation: {}",
-                                    panic_message(e.as_ref()),
-                                )))
-                            }
-                        });
-                    }
-                    GLProcessorMessage::DecodeMasksAtlas(
-                        det,
-                        proto_data,
-                        output_width,
-                        output_height,
-                        resp,
-                    ) => {
-                        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                            let det =
-                                unsafe { std::slice::from_raw_parts(det.ptr.as_ptr(), det.len) };
-                            gl_converter.decode_masks_atlas(
-                                det,
-                                &proto_data,
-                                output_width,
-                                output_height,
-                            )
-                        }));
-                        let _ = resp.send(match result {
-                            Ok(res) => res,
-                            Err(e) => {
-                                poisoned = true;
-                                Err(crate::Error::Internal(format!(
-                                    "GL thread panicked during DecodeMasksAtlas: {}",
                                     panic_message(e.as_ref()),
                                 )))
                             }
@@ -496,17 +488,18 @@ impl ImageProcessorTrait for GLProcessorThreaded {
         })?
     }
 
-    fn draw_masks(
+    fn draw_decoded_masks(
         &mut self,
         dst: &mut TensorDyn,
         detect: &[crate::DetectBox],
         segmentation: &[crate::Segmentation],
+        overlay: crate::MaskOverlay<'_>,
     ) -> crate::Result<()> {
         let (err_send, err_recv) = tokio::sync::oneshot::channel();
         self.sender
             .as_ref()
             .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
-            .blocking_send(GLProcessorMessage::DrawMasks(
+            .blocking_send(GLProcessorMessage::DrawDecodedMasks(
                 SendablePtr {
                     ptr: NonNull::from(dst),
                     len: 1,
@@ -519,6 +512,11 @@ impl ImageProcessorTrait for GLProcessorThreaded {
                     ptr: NonNull::new(segmentation.as_ptr() as *mut Segmentation).unwrap(),
                     len: segmentation.len(),
                 },
+                overlay.opacity,
+                overlay.background.map(|bg| SendablePtr {
+                    ptr: NonNull::from(bg).cast::<TensorDyn>(),
+                    len: 1,
+                }),
                 err_send,
             ))
             .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
@@ -527,17 +525,18 @@ impl ImageProcessorTrait for GLProcessorThreaded {
         })?
     }
 
-    fn draw_masks_proto(
+    fn draw_proto_masks(
         &mut self,
         dst: &mut TensorDyn,
         detect: &[DetectBox],
         proto_data: &ProtoData,
+        overlay: crate::MaskOverlay<'_>,
     ) -> crate::Result<()> {
         let (err_send, err_recv) = tokio::sync::oneshot::channel();
         self.sender
             .as_ref()
             .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
-            .blocking_send(GLProcessorMessage::DrawMasksProto(
+            .blocking_send(GLProcessorMessage::DrawProtoMasks(
                 SendablePtr {
                     ptr: NonNull::from(dst),
                     len: 1,
@@ -546,29 +545,21 @@ impl ImageProcessorTrait for GLProcessorThreaded {
                     ptr: NonNull::new(detect.as_ptr() as *mut DetectBox).unwrap(),
                     len: detect.len(),
                 },
-                Box::new(proto_data.clone()),
+                SendablePtr {
+                    ptr: NonNull::from(proto_data).cast::<ProtoData>(),
+                    len: 1,
+                },
+                overlay.opacity,
+                overlay.background.map(|bg| SendablePtr {
+                    ptr: NonNull::from(bg).cast::<TensorDyn>(),
+                    len: 1,
+                }),
                 err_send,
             ))
             .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
         err_recv.blocking_recv().map_err(|_| {
             Error::Internal("GL converter error messaging closed without update".to_string())
         })?
-    }
-
-    fn decode_masks_atlas(
-        &mut self,
-        detect: &[DetectBox],
-        proto_data: ProtoData,
-        output_width: usize,
-        output_height: usize,
-    ) -> crate::Result<(Vec<u8>, Vec<MaskRegion>)> {
-        GLProcessorThreaded::decode_masks_atlas(
-            self,
-            detect,
-            proto_data,
-            output_width,
-            output_height,
-        )
     }
 
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<(), crate::Error> {
@@ -597,38 +588,6 @@ impl GLProcessorThreaded {
             .blocking_send(GLProcessorMessage::SetInt8Interpolation(mode, err_send))
             .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
         err_recv.blocking_recv().map_err(|_| {
-            Error::Internal("GL converter error messaging closed without update".to_string())
-        })?
-    }
-
-    /// Decode all detection masks into a compact atlas via the GL thread.
-    ///
-    /// Returns `(atlas_pixels, regions)` where `atlas_pixels` is a contiguous
-    /// `Vec<u8>` of shape `[atlas_h, output_width]` (compact, bbox-sized strips)
-    /// and `regions` describes each detection's location within the atlas.
-    pub fn decode_masks_atlas(
-        &mut self,
-        detect: &[DetectBox],
-        proto_data: ProtoData,
-        output_width: usize,
-        output_height: usize,
-    ) -> Result<(Vec<u8>, Vec<MaskRegion>), crate::Error> {
-        let (resp_send, resp_recv) = tokio::sync::oneshot::channel();
-        self.sender
-            .as_ref()
-            .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
-            .blocking_send(GLProcessorMessage::DecodeMasksAtlas(
-                SendablePtr {
-                    ptr: NonNull::new(detect.as_ptr() as *mut DetectBox).unwrap(),
-                    len: detect.len(),
-                },
-                Box::new(proto_data),
-                output_width,
-                output_height,
-                resp_send,
-            ))
-            .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
-        resp_recv.blocking_recv().map_err(|_| {
             Error::Internal("GL converter error messaging closed without update".to_string())
         })?
     }

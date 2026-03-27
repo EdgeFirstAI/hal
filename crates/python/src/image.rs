@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::decoder::{convert_detect_box, PyDecoder};
 use crate::tensor::PyTensor;
+use crate::tracker::PyTrackInfo;
 use edgefirst_hal::{
     decoder::{BoundingBox, DetectBox, Segmentation},
     image::{self, Crop, Flip, ImageProcessorConfig, ImageProcessorTrait, Rect, Rotation},
@@ -920,14 +922,17 @@ impl PyImageProcessor {
         Ok(())
     }
 
-    #[pyo3(signature = (dst, bbox, scores, classes, seg=vec![]))]
-    pub fn draw_masks(
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (dst, bbox, scores, classes, seg=vec![], background=None, opacity=1.0))]
+    pub fn draw_decoded_masks(
         &mut self,
         dst: &mut PyTensor,
         bbox: PyReadonlyArray2<f32>,
         scores: PyReadonlyArray1<f32>,
         classes: PyReadonlyArray1<usize>,
         seg: Vec<PyReadonlyArray3<u8>>,
+        background: Option<&PyTensor>,
+        opacity: f32,
     ) -> Result<()> {
         if bbox.shape()[1] != 4 {
             return Err(Error::InvalidArg("bbox shape must be (N, 4)".to_string()));
@@ -994,8 +999,93 @@ impl PyImageProcessor {
             .0
             .lock()
             .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
-        l.draw_masks(&mut dst.0, &detect, &seg)?;
+        if let Some(bg) = &background {
+            if std::ptr::eq(&bg.0 as *const _, &dst.0 as *const _) {
+                return Err(Error::InvalidArg(
+                    "background must not be the same tensor as dst".to_string(),
+                ));
+            }
+        }
+        let overlay = image::MaskOverlay {
+            background: background.map(|b| &b.0),
+            opacity: opacity.clamp(0.0, 1.0),
+        };
+        l.draw_decoded_masks(&mut dst.0, &detect, &seg, overlay)?;
         Ok(())
+    }
+
+    /// Decode model outputs and draw masks directly onto the destination
+    /// image in a single call. Masks never leave Rust, eliminating the
+    /// Python round-trip overhead of `decode()` + `draw_decoded_masks()`.
+    ///
+    /// For segmentation models, prototype data is passed directly to the
+    /// renderer without materializing intermediate mask arrays in Python.
+    /// For detection-only models, this falls back to the standard rendering
+    /// path.
+    ///
+    /// When `tracker` is provided, object tracking is performed and the
+    /// return value includes a `tracks` list:
+    /// `(boxes, scores, classes, tracks)`.
+    ///
+    /// Without a tracker the return value is `(boxes, scores, classes)`.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (decoder, model_output, dst, tracker=None, timestamp=None, background=None, opacity=1.0))]
+    pub fn draw_masks<'py>(
+        &mut self,
+        decoder: &PyDecoder,
+        model_output: Vec<PyRef<'py, crate::tensor::PyTensor>>,
+        dst: &mut PyTensor,
+        tracker: Option<&mut crate::tracker::PyByteTrack>,
+        timestamp: Option<u64>,
+        background: Option<&PyTensor>,
+        opacity: f32,
+        py: Python<'py>,
+    ) -> PyResult<Py<PyAny>> {
+        let tensor_refs: Vec<&edgefirst_hal::tensor::TensorDyn> =
+            model_output.iter().map(|t| &t.0).collect();
+
+        if let Some(bg) = &background {
+            if std::ptr::eq(&bg.0 as *const _, &dst.0 as *const _) {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "background must not be the same tensor as dst",
+                ));
+            }
+        }
+        let overlay = image::MaskOverlay {
+            background: background.map(|b| &b.0),
+            opacity: opacity.clamp(0.0, 1.0),
+        };
+        let mut l = self
+            .0
+            .lock()
+            .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
+
+        if let Some(t) = tracker {
+            let ts = timestamp.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64
+            });
+            let (output_boxes, output_tracks) = l
+                .draw_masks_tracked(&decoder.decoder, t, ts, &tensor_refs, &mut dst.0, overlay)
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("draw_masks_tracked: {e:#?}"))
+                })?;
+
+            let (boxes, scores, classes) = convert_detect_box(py, &output_boxes);
+            let tracks: Vec<PyTrackInfo> = output_tracks.into_iter().map(|ti| ti.into()).collect();
+            Ok((boxes, scores, classes, tracks).into_pyobject(py)?.into())
+        } else {
+            let output_boxes = l
+                .draw_masks(&decoder.decoder, &tensor_refs, &mut dst.0, overlay)
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("draw_masks: {e:#?}"))
+                })?;
+
+            let (boxes, scores, classes) = convert_detect_box(py, &output_boxes);
+            Ok((boxes, scores, classes).into_pyobject(py)?.into())
+        }
     }
 
     /// Create an image with the processor's optimal memory backend.

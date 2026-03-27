@@ -234,37 +234,27 @@ impl ImageProcessorTrait for G2DProcessor {
         self.convert_impl(src, dst, rotation, flip, crop)
     }
 
-    fn draw_masks(
+    fn draw_decoded_masks(
         &mut self,
         _dst: &mut TensorDyn,
         _detect: &[crate::DetectBox],
         _segmentation: &[crate::Segmentation],
+        _overlay: crate::MaskOverlay<'_>,
     ) -> Result<()> {
         Err(Error::NotImplemented(
             "G2D does not support drawing detection or segmentation overlays".to_string(),
         ))
     }
 
-    fn draw_masks_proto(
+    fn draw_proto_masks(
         &mut self,
         _dst: &mut TensorDyn,
         _detect: &[crate::DetectBox],
         _proto_data: &crate::ProtoData,
+        _overlay: crate::MaskOverlay<'_>,
     ) -> Result<()> {
         Err(Error::NotImplemented(
             "G2D does not support drawing detection or segmentation overlays".to_string(),
-        ))
-    }
-
-    fn decode_masks_atlas(
-        &mut self,
-        _detect: &[crate::DetectBox],
-        _proto_data: crate::ProtoData,
-        _output_width: usize,
-        _output_height: usize,
-    ) -> Result<(Vec<u8>, Vec<crate::MaskRegion>)> {
-        Err(Error::NotImplemented(
-            "G2D does not support decoding mask atlas".to_string(),
         ))
     }
 

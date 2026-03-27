@@ -79,7 +79,7 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "path", choices=["fused", "2step", "masks"], help="Which path to profile"
+        "path", choices=["fused", "2step"], help="Which path to profile"
     )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument(
@@ -106,8 +106,28 @@ def main():
     print(f"EGL: {[str(d.kind) for d in displays]}", file=sys.stderr)
 
     metadata = extract_metadata(args.model)
-    outputs = get_model_outputs(args.model)
-    print(f"Outputs: {[o.shape for o in outputs]}", file=sys.stderr)
+    np_outputs = get_model_outputs(args.model)
+    print(f"Outputs: {[o.shape for o in np_outputs]}", file=sys.stderr)
+
+    # Convert numpy outputs to HAL Tensors
+    dtype_map = {
+        np.dtype("int8"): "int8",
+        np.dtype("uint8"): "uint8",
+        np.dtype("int16"): "int16",
+        np.dtype("int32"): "int32",
+        np.dtype("float32"): "float32",
+        np.dtype("float64"): "float64",
+    }
+    outputs = []
+    for arr in np_outputs:
+        arr = np.ascontiguousarray(arr)
+        hal_dtype = dtype_map.get(arr.dtype)
+        if hal_dtype is None:
+            raise ValueError(f"Unsupported dtype {arr.dtype}; expected one of {list(dtype_map.keys())}")
+        t = Tensor(list(arr.shape), dtype=hal_dtype)
+        with t.map() as m:
+            np.copyto(np.frombuffer(m, dtype=arr.dtype).reshape(arr.shape), arr)
+        outputs.append(t)
 
     processor = ImageProcessor(egl_display=gpu_display)
     dst = Tensor.image(640, 640, PixelFormat.Rgba)
@@ -117,14 +137,10 @@ def main():
     print(f"Warming up ({args.warmup} iters)...", file=sys.stderr)
     for _ in range(args.warmup):
         if args.path == "fused":
-            decoder.draw_masks(outputs, processor, dst)
-        elif args.path == "masks":
-            decoder.decode_masks(
-                outputs, processor, output_width=640, output_height=640
-            )
+            processor.draw_masks(decoder, outputs, dst)
         else:
             boxes, scores, classes, masks = decoder.decode(outputs)
-            processor.draw_masks(
+            processor.draw_decoded_masks(
                 dst, bbox=boxes, scores=scores, classes=classes, seg=masks
             )
 
@@ -134,16 +150,11 @@ def main():
 
     if args.path == "fused":
         for _ in range(args.iterations):
-            decoder.draw_masks(outputs, processor, dst)
-    elif args.path == "masks":
-        for _ in range(args.iterations):
-            decoder.decode_masks(
-                outputs, processor, output_width=640, output_height=640
-            )
+            processor.draw_masks(decoder, outputs, dst)
     else:
         for _ in range(args.iterations):
             boxes, scores, classes, masks = decoder.decode(outputs)
-            processor.draw_masks(
+            processor.draw_decoded_masks(
                 dst, bbox=boxes, scores=scores, classes=classes, seg=masks
             )
 

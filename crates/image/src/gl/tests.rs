@@ -59,7 +59,9 @@ mod gl_tests {
 
         let mut renderer = GLProcessorThreaded::new(None).unwrap();
         let mut image_dyn = image;
-        renderer.draw_masks(&mut image_dyn, &[], &[seg]).unwrap();
+        renderer
+            .draw_decoded_masks(&mut image_dyn, &[], &[seg], Default::default())
+            .unwrap();
     }
 
     #[test]
@@ -104,7 +106,9 @@ mod gl_tests {
 
         let mut renderer = GLProcessorThreaded::new(None).unwrap();
         let mut image_dyn = image;
-        renderer.draw_masks(&mut image_dyn, &[], &[seg]).unwrap();
+        renderer
+            .draw_decoded_masks(&mut image_dyn, &[], &[seg], Default::default())
+            .unwrap();
     }
 
     #[test]
@@ -157,7 +161,7 @@ mod gl_tests {
             .set_class_colors(&[[255, 255, 0, 233], [128, 128, 255, 100]])
             .unwrap();
         renderer
-            .draw_masks(&mut image_dyn, &[detect], &[seg])
+            .draw_decoded_masks(&mut image_dyn, &[detect], &[seg], Default::default())
             .unwrap();
 
         let image = {
@@ -207,7 +211,9 @@ mod gl_tests {
         renderer
             .set_class_colors(&[[255, 255, 0, 233], [128, 128, 255, 100]])
             .unwrap();
-        renderer.draw_masks(&mut image_dyn, &[detect], &[]).unwrap();
+        renderer
+            .draw_decoded_masks(&mut image_dyn, &[detect], &[], Default::default())
+            .unwrap();
     }
 
     static GL_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1121,14 +1127,14 @@ mod gl_tests {
         );
     }
 
-    /// Test draw_masks() with PixelFormat::Bgra destination (segmentation).
+    /// Test draw_decoded_masks() with PixelFormat::Bgra destination (segmentation).
     /// Draws the same masks to both PixelFormat::Rgba and PixelFormat::Bgra, then verifies R↔B swap.
     #[test]
-    fn test_draw_masks_bgra() {
+    fn test_draw_decoded_masks_bgra() {
         use edgefirst_decoder::Segmentation;
 
         if !is_opengl_available() {
-            eprintln!("SKIPPED: test_draw_masks_bgra - OpenGL not available");
+            eprintln!("SKIPPED: test_draw_decoded_masks_bgra - OpenGL not available");
             return;
         }
 
@@ -1166,7 +1172,7 @@ mod gl_tests {
         )
         .unwrap();
         let mut rgba_img_dyn = rgba_img;
-        gl.draw_masks(&mut rgba_img_dyn, &[], &[make_seg()])
+        gl.draw_decoded_masks(&mut rgba_img_dyn, &[], &[make_seg()], Default::default())
             .unwrap();
 
         // Render to PixelFormat::Bgra (convert source to PixelFormat::Bgra first)
@@ -1197,7 +1203,7 @@ mod gl_tests {
             Crop::no_crop(),
         )
         .unwrap();
-        gl.draw_masks(&mut bgra_img_dyn, &[], &[make_seg()])
+        gl.draw_decoded_masks(&mut bgra_img_dyn, &[], &[make_seg()], Default::default())
             .unwrap();
 
         // Verify PixelFormat::Bgra output matches PixelFormat::Rgba output with R↔B swapped
@@ -1214,21 +1220,21 @@ mod gl_tests {
             max_diff = max_diff.max((rc[2] as i32 - bc[0] as i32).abs()); // B
             max_diff = max_diff.max((rc[3] as i32 - bc[3] as i32).abs()); // A
         }
-        eprintln!("draw_masks PixelFormat::Bgra vs PixelFormat::Rgba max channel diff: {max_diff}");
+        eprintln!("draw_decoded_masks PixelFormat::Bgra vs PixelFormat::Rgba max channel diff: {max_diff}");
         assert!(
             max_diff <= 1,
-            "draw_masks PixelFormat::Bgra/PixelFormat::Rgba channel mismatch > 1: max_diff={max_diff}"
+            "draw_decoded_masks PixelFormat::Bgra/PixelFormat::Rgba channel mismatch > 1: max_diff={max_diff}"
         );
     }
 
-    /// Test draw_masks() with PixelFormat::Bgra destination using Mem memory (boxes).
+    /// Test draw_decoded_masks() with PixelFormat::Bgra destination using Mem memory (boxes).
     /// Draws same boxes to PixelFormat::Rgba and PixelFormat::Bgra, then verifies R↔B swap.
     #[test]
-    fn test_draw_masks_bgra_mem() {
+    fn test_draw_decoded_masks_bgra_mem() {
         use edgefirst_decoder::DetectBox;
 
         if !is_opengl_available() {
-            eprintln!("SKIPPED: test_draw_masks_bgra_mem - OpenGL not available");
+            eprintln!("SKIPPED: test_draw_decoded_masks_bgra_mem - OpenGL not available");
             return;
         }
 
@@ -1253,7 +1259,8 @@ mod gl_tests {
         )
         .unwrap();
         let mut rgba_img_dyn = rgba_img;
-        gl.draw_masks(&mut rgba_img_dyn, &[detect], &[]).unwrap();
+        gl.draw_decoded_masks(&mut rgba_img_dyn, &[detect], &[], Default::default())
+            .unwrap();
 
         // Render boxes to PixelFormat::Bgra
         let rgba_src = crate::load_image(
@@ -1283,7 +1290,8 @@ mod gl_tests {
             Crop::no_crop(),
         )
         .unwrap();
-        gl.draw_masks(&mut bgra_img_dyn, &[detect], &[]).unwrap();
+        gl.draw_decoded_masks(&mut bgra_img_dyn, &[detect], &[], Default::default())
+            .unwrap();
 
         // Verify PixelFormat::Bgra output matches PixelFormat::Rgba output with R↔B swapped
         let rgba_map = rgba_img_dyn.as_u8().unwrap().map().unwrap();
@@ -1299,11 +1307,11 @@ mod gl_tests {
             max_diff = max_diff.max((rc[3] as i32 - bc[3] as i32).abs());
         }
         eprintln!(
-            "draw_masks_mem PixelFormat::Bgra vs PixelFormat::Rgba max channel diff: {max_diff}"
+            "draw_decoded_masks_mem PixelFormat::Bgra vs PixelFormat::Rgba max channel diff: {max_diff}"
         );
         assert!(
             max_diff <= 1,
-            "draw_masks_mem PixelFormat::Bgra/PixelFormat::Rgba channel mismatch > 1: max_diff={max_diff}"
+            "draw_decoded_masks_mem PixelFormat::Bgra/PixelFormat::Rgba channel mismatch > 1: max_diff={max_diff}"
         );
     }
 
@@ -1323,7 +1331,7 @@ mod gl_tests {
         let mut image_dyn = image;
 
         // Render with empty detections and segmentations — should succeed trivially
-        let result = gl.draw_masks(&mut image_dyn, &[], &[]);
+        let result = gl.draw_decoded_masks(&mut image_dyn, &[], &[], Default::default());
         assert!(
             result.is_ok(),
             "GL mask render with empty data should succeed: {result:?}"
@@ -1611,6 +1619,90 @@ mod gl_tests {
             std::slice::from_raw_parts(map_multi.as_slice().as_ptr().cast(), map_multi.len())
         };
         assert_pixels_match(contig_bytes, multi_bytes, 0);
+    }
+
+    /// Compare fused GL proto rendering against hybrid (CPU materialize + GL overlay).
+    ///
+    /// Both paths should produce visually similar output. Differences arise from
+    /// bilinear interpolation (GPU vs CPU) and mask threshold rounding.
+    #[test]
+    fn test_proto_fused_vs_hybrid_ssim() {
+        use edgefirst_decoder::yolo::impl_yolo_segdet_quant_proto;
+        use edgefirst_decoder::{Nms, Quantization, XYWH};
+
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        // Load cached YOLOv8 seg model outputs
+        let boxes_raw: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_boxes_116x8400.bin"
+        ));
+        let boxes_i8 =
+            unsafe { std::slice::from_raw_parts(boxes_raw.as_ptr() as *const i8, boxes_raw.len()) };
+        let boxes = ndarray::Array2::from_shape_vec((116, 8400), boxes_i8.to_vec()).unwrap();
+
+        let protos_raw: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_protos_160x160x32.bin"
+        ));
+        let protos_i8 = unsafe {
+            std::slice::from_raw_parts(protos_raw.as_ptr() as *const i8, protos_raw.len())
+        };
+        let protos = ndarray::Array3::from_shape_vec((160, 160, 32), protos_i8.to_vec()).unwrap();
+
+        let quant_boxes = Quantization::new(0.019_484_945, 20);
+        let quant_protos = Quantization::new(0.020_889_873, -115);
+
+        let mut output_boxes = Vec::with_capacity(50);
+        let proto_data = impl_yolo_segdet_quant_proto::<XYWH, _, _>(
+            (boxes.view(), quant_boxes),
+            (protos.view(), quant_protos),
+            0.45,
+            0.45,
+            Some(Nms::ClassAgnostic),
+            &mut output_boxes,
+        );
+        assert!(!output_boxes.is_empty(), "No detections from model");
+
+        // Materialize masks on CPU for the hybrid path
+        let cpu_proc = crate::CPUProcessor::new();
+        let segmentation = cpu_proc
+            .materialize_segmentations(&output_boxes, &proto_data)
+            .unwrap();
+
+        // Create two identical RGBA canvases
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let mut dst_hybrid = TensorDyn::from(
+            edgefirst_tensor::Tensor::<u8>::image(640, 640, PixelFormat::Rgba, None).unwrap(),
+        );
+        let mut dst_fused = TensorDyn::from(
+            edgefirst_tensor::Tensor::<u8>::image(640, 640, PixelFormat::Rgba, None).unwrap(),
+        );
+
+        // Render via hybrid path (pre-decoded masks)
+        gl.draw_decoded_masks(
+            &mut dst_hybrid,
+            &output_boxes,
+            &segmentation,
+            Default::default(),
+        )
+        .unwrap();
+
+        // Render via fused GL proto path
+        gl.draw_proto_masks(
+            &mut dst_fused,
+            &output_boxes,
+            &proto_data,
+            Default::default(),
+        )
+        .unwrap();
+
+        // Compare — threshold 0.90 to allow bilinear interpolation differences
+        // between GPU proto rendering and CPU materialization
+        compare_images(&dst_hybrid, &dst_fused, 0.90, function!());
     }
 
     // =========================================================================

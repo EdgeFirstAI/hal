@@ -120,6 +120,8 @@ pub(super) struct GlContext {
     pub(super) transfer_backend: TransferBackend,
     pub(super) display: EglDisplayType,
     pub(super) ctx: egl::Context,
+    /// Whether the context is GLES 3.1+ (compute shaders available).
+    pub(super) has_compute: bool,
     /// Wrapped in ManuallyDrop because the khronos-egl Dynamic instance's
     /// Drop calls eglReleaseThread() which can panic during process shutdown
     /// if the EGL library has been partially unloaded. We drop it explicitly
@@ -219,13 +221,32 @@ impl GlContext {
         // No-config context: pass EGL_NO_CONFIG_KHR (null) instead of a
         // real config. The context is not bound to any specific framebuffer
         // format — it works with any FBO attachment format.
-        let context_attributes = [egl::CONTEXT_MAJOR_VERSION, 3, egl::NONE, egl::NONE];
-        let ctx = egl.create_context(
-            display.as_display(),
-            egl_ext::NO_CONFIG_KHR,
-            None,
-            &context_attributes,
-        )?;
+        // Try GLES 3.1 first (compute shaders), fall back to 3.0.
+        let ctx_31 = [
+            egl::CONTEXT_MAJOR_VERSION,
+            3,
+            egl::CONTEXT_MINOR_VERSION,
+            1,
+            egl::NONE,
+        ];
+        let (ctx, has_compute) =
+            match egl.create_context(display.as_display(), egl_ext::NO_CONFIG_KHR, None, &ctx_31) {
+                Ok(ctx) => {
+                    debug!("Created GLES 3.1 context (compute shaders available)");
+                    (ctx, true)
+                }
+                Err(_) => {
+                    let ctx_30 = [egl::CONTEXT_MAJOR_VERSION, 3, egl::NONE];
+                    let ctx = egl.create_context(
+                        display.as_display(),
+                        egl_ext::NO_CONFIG_KHR,
+                        None,
+                        &ctx_30,
+                    )?;
+                    debug!("Created GLES 3.0 context (no compute shaders)");
+                    (ctx, false)
+                }
+            };
         debug!("ctx: {ctx:?}");
 
         // Surfaceless context: no PBuffer surface needed. All rendering
@@ -241,6 +262,7 @@ impl GlContext {
         Ok(GlContext {
             display,
             ctx,
+            has_compute,
             egl: ManuallyDrop::new(egl),
             transfer_backend,
         })

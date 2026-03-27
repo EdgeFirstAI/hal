@@ -6,15 +6,19 @@
 //! This module provides image conversion and manipulation functions with
 //! support for hardware acceleration (G2D, OpenGL) when available.
 
-use crate::decoder::{HalDetectBoxList, HalSegmentationList};
+use crate::decoder::{HalDecoder, HalDetectBoxList, HalSegmentationList};
 use crate::error::{set_error, set_error_null};
 use crate::tensor::{HalDtype, HalTensor, HalTensorMemory};
-use crate::{check_null, check_null_ret_null, try_or_errno, try_or_null};
+use crate::{
+    check_null, check_null_ret_null, try_or_errno, try_or_null, HalByteTrack, HalTrackInfoList,
+};
+use edgefirst_decoder::{DetectBox, Segmentation};
 use edgefirst_image::{
     load_image, save_jpeg, ComputeBackend, Crop, Flip, ImageProcessor, ImageProcessorConfig,
     ImageProcessorTrait, Rect, Rotation,
 };
 use edgefirst_tensor::{PixelFormat, PixelLayout, TensorDyn, TensorMemory};
+use edgefirst_tracker::TrackInfo;
 use libc::{c_char, c_int, size_t};
 use std::ffi::CStr;
 
@@ -207,7 +211,7 @@ impl From<HalCrop> for Crop {
 ///
 /// The ImageProcessor handles format conversion with hardware acceleration when available.
 pub struct HalImageProcessor {
-    /// Accessible to `decoder.rs` for `hal_decoder_draw_masks()`.
+    /// Accessible to other modules for draw_decoded_masks / draw_proto_masks operations.
     pub(crate) inner: ImageProcessor,
 }
 
@@ -807,18 +811,26 @@ pub unsafe extern "C" fn hal_image_processor_convert(
 /// @param dst Destination image tensor to draw onto
 /// @param detections Detection box list (can be NULL for segmentation-only)
 /// @param segmentations Segmentation list (can be NULL for detection-only)
+/// @param background Optional background image (NULL to draw over dst)
+/// @param opacity Mask opacity in [0.0, 1.0] (1.0 = fully opaque, clamped)
 /// @return 0 on success, -1 on error
 /// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL processor or dst)
+/// - EINVAL: Invalid argument (NULL processor or dst, or background == dst)
 /// - EIO: Drawing failed
 #[no_mangle]
-pub unsafe extern "C" fn hal_image_processor_draw_masks(
+pub unsafe extern "C" fn hal_image_processor_draw_decoded_masks(
     processor: *mut HalImageProcessor,
     dst: *mut HalTensor,
     detections: *const HalDetectBoxList,
     segmentations: *const HalSegmentationList,
+    background: *const HalTensor,
+    opacity: f32,
 ) -> c_int {
     check_null!(processor, dst);
+
+    if !background.is_null() && std::ptr::eq(background, dst as *const _) {
+        return set_error(libc::EINVAL);
+    }
 
     let detect_slice = if detections.is_null() {
         &[]
@@ -832,21 +844,244 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks(
         unsafe { &(*segmentations).masks }.as_slice()
     };
 
+    let bg = if background.is_null() {
+        None
+    } else {
+        Some(&unsafe { &*background }.inner)
+    };
+
     try_or_errno!(
-        unsafe { &mut (*processor) }.inner.draw_masks(
+        unsafe { &mut (*processor) }.inner.draw_decoded_masks(
             &mut unsafe { &mut (*dst) }.inner,
             detect_slice,
             seg_slice,
+            edgefirst_image::MaskOverlay {
+                background: bg,
+                opacity: opacity.clamp(0.0, 1.0),
+            },
         ),
         libc::EIO
     );
     0
 }
 
+/// Decode model outputs and draw masks directly onto a destination image.
+///
+/// This is the fused path: for segmentation models, prototype data is passed
+/// directly to the renderer without materializing intermediate mask arrays.
+/// For detection-only models, this falls back to decode + draw_decoded_masks.
+///
+/// @param processor Image processor handle
+/// @param decoder Decoder handle
+/// @param outputs Array of output tensor pointers
+/// @param num_outputs Number of output tensors
+/// @param dst Destination image to draw onto
+/// @param background Optional background image (NULL to draw over dst)
+/// @param opacity Mask opacity, clamped to [0.0, 1.0] (1.0 = fully opaque)
+/// @param out_boxes Output parameter for detection box list (caller must free)
+/// @return 0 on success, -1 on error
+/// @par Errors (errno):
+/// - EINVAL: Invalid argument (NULL processor/decoder/outputs/dst/out_boxes, or background == dst)
+/// - EIO: Decoding or drawing failed
+#[no_mangle]
+pub unsafe extern "C" fn hal_image_processor_draw_masks(
+    processor: *mut HalImageProcessor,
+    decoder: *const HalDecoder,
+    outputs: *const *const HalTensor,
+    num_outputs: size_t,
+    dst: *mut HalTensor,
+    background: *const HalTensor,
+    opacity: f32,
+    out_boxes: *mut *mut HalDetectBoxList,
+) -> c_int {
+    check_null!(processor, decoder, outputs, dst, out_boxes);
+
+    if num_outputs == 0 {
+        return set_error(libc::EINVAL);
+    }
+
+    // Reject aliased background == dst (would create UB via &mut + & to same object)
+    if !background.is_null() && std::ptr::eq(background, dst as *const _) {
+        return set_error(libc::EINVAL);
+    }
+    let bg = if background.is_null() {
+        None
+    } else {
+        Some(&unsafe { &*background }.inner)
+    };
+    let overlay = edgefirst_image::MaskOverlay {
+        background: bg,
+        opacity: opacity.clamp(0.0, 1.0),
+    };
+
+    let outputs_slice = std::slice::from_raw_parts(outputs, num_outputs);
+
+    // Extract TensorDyn references from HalTensor pointers
+    let tensor_refs = match crate::decoder::extract_tensor_refs(outputs_slice) {
+        Ok(refs) => refs,
+        Err(rc) => return rc,
+    };
+
+    let mut boxes: Vec<DetectBox> = Vec::with_capacity(100);
+
+    // Try proto decode first (returns ProtoData for seg models, None for det-only)
+    let proto_result = try_or_errno!(
+        (*decoder).inner.decode_proto(&tensor_refs, &mut boxes),
+        libc::EIO
+    );
+
+    if let Some(proto_data) = proto_result {
+        // Fused path: render directly from proto data
+        try_or_errno!(
+            (*processor)
+                .inner
+                .draw_proto_masks(&mut (*dst).inner, &boxes, &proto_data, overlay),
+            libc::EIO
+        );
+    } else {
+        // Detection-only fallback: full decode + draw_decoded_masks
+        let mut masks: Vec<Segmentation> = Vec::new();
+        try_or_errno!(
+            (*decoder)
+                .inner
+                .decode(&tensor_refs, &mut boxes, &mut masks),
+            libc::EIO
+        );
+        try_or_errno!(
+            (*processor)
+                .inner
+                .draw_decoded_masks(&mut (*dst).inner, &boxes, &masks, overlay),
+            libc::EIO
+        );
+    }
+
+    *out_boxes = Box::into_raw(Box::new(HalDetectBoxList { boxes }));
+    0
+}
+
+/// Decode tracked model outputs and draw masks directly onto a destination image.
+///
+/// This is the fused tracked path: for segmentation models, prototype data is
+/// passed directly to the renderer without materializing intermediate mask
+/// arrays. Object tracking is applied to maintain identities across frames.
+/// For detection-only models, this falls back to tracked decode + draw_decoded_masks.
+///
+/// @param processor Image processor handle
+/// @param decoder Decoder handle
+/// @param tracker Tracker handle for maintaining object identities across frames
+/// @param timestamp Timestamp for the current frame (e.g., in nanoseconds)
+/// @param outputs Array of output tensor pointers
+/// @param num_outputs Number of output tensors
+/// @param dst Destination image to draw onto
+/// @param background Optional background image (NULL to draw over dst)
+/// @param opacity Mask opacity in [0.0, 1.0] (1.0 = fully opaque, clamped)
+/// @param out_boxes Output parameter for detection box list (caller must free)
+/// @param out_tracks Output parameter for track info list (can be NULL; caller must free if non-NULL)
+/// @return 0 on success, -1 on error
+/// @par Errors (errno):
+/// - EINVAL: Invalid argument (NULL processor/decoder/tracker/outputs/dst/out_boxes, or background == dst)
+/// - EIO: Decoding or drawing failed
+#[no_mangle]
+pub unsafe extern "C" fn hal_image_processor_draw_masks_tracked(
+    processor: *mut HalImageProcessor,
+    decoder: *const HalDecoder,
+    tracker: *mut HalByteTrack,
+    timestamp: u64,
+    outputs: *const *const HalTensor,
+    num_outputs: size_t,
+    dst: *mut HalTensor,
+    background: *const HalTensor,
+    opacity: f32,
+    out_boxes: *mut *mut HalDetectBoxList,
+    out_tracks: *mut *mut HalTrackInfoList,
+) -> c_int {
+    check_null!(processor, decoder, tracker, outputs, dst, out_boxes);
+
+    if num_outputs == 0 {
+        return set_error(libc::EINVAL);
+    }
+
+    // Reject aliased background == dst
+    if !background.is_null() && std::ptr::eq(background, dst as *const _) {
+        return set_error(libc::EINVAL);
+    }
+
+    let bg = if background.is_null() {
+        None
+    } else {
+        Some(&unsafe { &*background }.inner)
+    };
+    let overlay = edgefirst_image::MaskOverlay {
+        background: bg,
+        opacity: opacity.clamp(0.0, 1.0),
+    };
+
+    let outputs_slice = std::slice::from_raw_parts(outputs, num_outputs);
+
+    // Extract TensorDyn references from HalTensor pointers
+    let tensor_refs = match crate::decoder::extract_tensor_refs(outputs_slice) {
+        Ok(refs) => refs,
+        Err(rc) => return rc,
+    };
+
+    let mut boxes: Vec<DetectBox> = Vec::with_capacity(100);
+    let mut tracks: Vec<TrackInfo> = Vec::new();
+
+    // Try tracked proto decode first (returns ProtoData for seg models, None for det-only)
+    let proto_result = try_or_errno!(
+        (*decoder).inner.decode_proto_tracked(
+            &mut (*tracker).inner,
+            timestamp,
+            &tensor_refs,
+            &mut boxes,
+            &mut tracks
+        ),
+        libc::EIO
+    );
+
+    if let Some(proto_data) = proto_result {
+        // Fused path: render directly from proto data
+        try_or_errno!(
+            (*processor)
+                .inner
+                .draw_proto_masks(&mut (*dst).inner, &boxes, &proto_data, overlay),
+            libc::EIO
+        );
+    } else {
+        // Detection-only fallback: full tracked decode + draw_decoded_masks
+        let mut masks: Vec<Segmentation> = Vec::new();
+        try_or_errno!(
+            (*decoder).inner.decode_tracked(
+                &mut (*tracker).inner,
+                timestamp,
+                &tensor_refs,
+                &mut boxes,
+                &mut masks,
+                &mut tracks
+            ),
+            libc::EIO
+        );
+        try_or_errno!(
+            (*processor)
+                .inner
+                .draw_decoded_masks(&mut (*dst).inner, &boxes, &masks, overlay),
+            libc::EIO
+        );
+    }
+
+    *out_boxes = Box::into_raw(Box::new(HalDetectBoxList { boxes }));
+
+    if !out_tracks.is_null() {
+        *out_tracks = Box::into_raw(Box::new(HalTrackInfoList { tracks }));
+    }
+
+    0
+}
+
 /// Set class colors for segmentation rendering.
 ///
 /// Colors are used when drawing segmentation masks via
-/// hal_image_processor_draw_masks(). Each color is an RGBA tuple.
+/// hal_image_processor_draw_decoded_masks(). Each color is an RGBA tuple.
 ///
 /// @param processor Image processor handle
 /// @param colors Pointer to array of RGBA color tuples ([u8; 4] per color)
@@ -1737,7 +1972,7 @@ mod tests {
     }
 
     #[test]
-    fn test_image_processor_draw_masks_null_params() {
+    fn test_image_processor_draw_decoded_masks_null_params() {
         unsafe {
             let processor = hal_image_processor_new();
             if processor.is_null() {
@@ -1755,22 +1990,26 @@ mod tests {
 
             // NULL processor
             assert_eq!(
-                hal_image_processor_draw_masks(
+                hal_image_processor_draw_decoded_masks(
                     std::ptr::null_mut(),
                     dst,
                     std::ptr::null(),
-                    std::ptr::null()
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    1.0,
                 ),
                 -1
             );
 
             // NULL dst
             assert_eq!(
-                hal_image_processor_draw_masks(
+                hal_image_processor_draw_decoded_masks(
                     processor,
                     std::ptr::null_mut(),
                     std::ptr::null(),
-                    std::ptr::null()
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    1.0,
                 ),
                 -1
             );

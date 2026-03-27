@@ -16,7 +16,7 @@ documentation = "https://docs.rs/edgefirst-hal"
 default = ["ndarray", "opengl"]
 ndarray = ["edgefirst-tensor/ndarray"]
 opengl = ["edgefirst-image/opengl"]
-tracker = ["edgefirst-decoder/tracker", "edgefirst-tracker"]
+tracker = ["edgefirst-decoder/tracker", "edgefirst-image/tracker", "edgefirst-tracker"]
 
 [dependencies]
 edgefirst-decoder = { workspace = true }

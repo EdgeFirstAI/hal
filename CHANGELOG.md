@@ -7,6 +7,190 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **YOLO-SEG 2-way split decoder** (`ModelType::YoloSegDet2Way`) — supports
+  TFLite INT8 segmentation models with 3 outputs: a combined detection tensor
+  `[1, nc+4, N]` (boxes + scores), a separate mask-coefficient tensor
+  `[1, 32, N]`, and a prototype-mask tensor `[1, H/4, W/4, 32]`.  The
+  builder auto-selects this variant when `Detection` + `MaskCoefficients` +
+  `Protos` outputs are provided.  Supported in all decode paths (float,
+  quantized, and proto variants).
+
+- **`MaskOverlay` compositing options** for `draw_decoded_masks()` and
+  `draw_proto_masks()` — new `overlay` parameter with two controls:
+  - `background: Option<&TensorDyn>` — when set, copies the background
+    image into `dst` before compositing masks, allowing masks to be
+    rendered over a separate frame.
+  - `opacity: f32` (default `1.0`) — scales the alpha of every rendered
+    mask and bounding box color; `0.5` produces semi-transparent overlays.
+
+  Available in Rust, Python (`background=None, opacity=1.0` keyword args
+  on `ImageProcessor.draw_masks()` and `ImageProcessor.draw_decoded_masks()`),
+  and C (`hal_image_processor_draw_masks()` gains `background` and
+  `opacity` params). All 7 GL fragment shaders updated with `uniform float
+  opacity`.
+
+- **GLES 3.1 context upgrade** — EGL context creation now requests
+  GLES 3.1 (compute shaders) with automatic fallback to 3.0.
+
+### Changed
+
+- **`ImageProcessorTrait::draw_decoded_masks()` and `draw_proto_masks()`** gain a
+  new `overlay: MaskOverlay<'_>` parameter. Implementors must update their
+  trait impls. Pass `MaskOverlay::default()` for backward-compatible
+  behaviour.
+
+- **Fused `draw_masks` moved from Decoder to ImageProcessor** — the fused
+  decode+render path is now owned by ImageProcessor (which owns the GPU).
+  - **Python**: `Decoder.draw_masks()` removed. Use
+    `ImageProcessor.draw_masks(decoder, model_output, dst, ...)`.
+    The method now accepts an optional `tracker=` keyword argument for
+    tracked inference. `decoder.decode()` now accepts `List[Tensor]`
+    (previously `List[np.ndarray]`).
+  - **C API**: `hal_decoder_draw_masks()` and `hal_decoder_decode_tracked_draw_masks()`
+    removed. Use `hal_image_processor_draw_masks()` and
+    `hal_image_processor_draw_masks_tracked()` (processor is now the
+    first parameter).
+  - **Rust**: Trait methods were renamed (`draw_masks` → `draw_decoded_masks`,
+    `draw_masks_proto` → `draw_proto_masks`) and gained an `overlay` parameter.
+
+- **C API `hal_image_processor_draw_masks()`** gains `background`
+  (`const hal_tensor*`, pass `NULL` for none) and `opacity` (`float`, pass
+  `1.0` for none) parameters. Existing C callers must update.
+
+### Performance
+
+- **Fused dequant+matmul kernel** for `materialize_segmentations()` —
+  computes `mask_coeff @ protos` directly from the i8 proto tensor without
+  allocating a 3.1 MB f32 copy. Includes fast sigmoid approximation
+  (~10× faster than libm `expf`) and 4-way loop unrolling.
+  Hybrid path speedup: 1.25–1.34× across all targets.
+
+- **Zero-copy i8 proto extraction** — `extract_proto_data_quant()` uses
+  `TypeId` specialization to avoid per-element `as_()` conversion when
+  the proto tensor is already `i8`; uses flat `to_owned()` memcpy instead.
+
+- **`SendablePtr` for `ProtoData`** in the GL threaded path — eliminates
+  an 819 KB–3.3 MB deep clone per frame.
+
+- **`glTexSubImage3D` fast path** — proto texture dimensions are tracked;
+  reuses the existing GL texture object when dimensions match (every frame
+  after the first), avoiding driver-side reallocation.
+
+- **Cached opacity uniform** — skips 28 redundant GL state changes per
+  frame on the default `opacity=1.0` path.
+
+- **GLES 3.1 compute shader for HWC→CHW proto repack** — opt-in via
+  `EDGEFIRST_PROTO_COMPUTE=1`. Uploads HWC i8 data to an SSBO and
+  transposes to `GL_TEXTURE_2D_ARRAY` via compute dispatch. 2.2–2.4×
+  speedup on the fused GL proto path (imx8mp, imx95).
+
+### Removed
+
+- **`decode_masks` / `decode_masks_atlas` atlas-based mask readback path** —
+  removed the entire atlas decode pipeline which was too slow on embedded
+  targets (435 ms on imx8mp Vivante GC7000UL). This removes:
+  - `hal_decoder_decode_masks()` C API function
+  - `Decoder.decode_masks()` Python method and type stub
+  - `ImageProcessorTrait::decode_masks_atlas()` Rust trait method
+  - `MaskRegion` and `MaskResult` types
+  - Three GL logit-threshold shaders (`proto_mask_logit_*`)
+  - Mask FBO, PBO, and atlas rendering infrastructure in the GL backend
+  - `bench_decode_masks_atlas` benchmark
+
+  Use `draw_proto_masks()` for GPU-accelerated mask overlay, or
+  `materialize_segmentations()` + `draw_decoded_masks()` for the hybrid
+  CPU decode path.
+
+- **Python static helper methods on `Decoder`** — the following static/class
+  methods have been removed. Use the `Decoder` instance API instead:
+  - `Decoder.decode_yolo_det()`
+  - `Decoder.decode_yolo_segdet()`
+  - `Decoder.decode_modelpack_det()`
+  - `Decoder.decode_modelpack_det_split()`
+  - `Decoder.dequantize()`
+  - `Decoder.segmentation_to_mask()`
+
+- **`ArrayViewDQuantized` made private** (`pub(crate)`) — use the `TensorDyn`
+  API for all decode inputs. Downstream crates that referenced
+  `ArrayViewDQuantized` directly must migrate to `TensorDyn`.
+
+### Migration Guide
+
+This section summarises all breaking changes introduced in this release and
+shows before/after code for each one.
+
+#### Python
+
+```python
+# --- decode() input type changed ---
+# Before: decoder.decode([np_array0, np_array1])
+# After:  decoder.decode([hal_tensor0, hal_tensor1])   # List[Tensor]
+
+# --- draw_masks moved from Decoder to ImageProcessor ---
+# Before: decoder.draw_masks(outputs, processor, dst)
+# After:  processor.draw_masks(decoder, outputs, dst)
+# With tracking:
+#         processor.draw_masks(decoder, outputs, dst, tracker=tracker)
+
+# --- decode_masks() removed ---
+# Before: decoder.decode_masks(outputs, processor)
+# After:  decoder.decode(outputs)  # mask data is part of the decode() result
+
+# --- Static methods removed ---
+# Before: Decoder.decode_yolo_det(outputs, ...)
+#         Decoder.decode_yolo_segdet(outputs, ...)
+#         Decoder.decode_modelpack_det(outputs, ...)
+#         Decoder.decode_modelpack_det_split(outputs, ...)
+#         Decoder.dequantize(tensor)
+#         Decoder.segmentation_to_mask(seg)
+# After:  Use the Decoder instance API:
+#         decoder = Decoder(config, score_threshold, iou_threshold)
+#         boxes, segs = decoder.decode(outputs)
+```
+
+#### C
+
+```c
+/* --- draw_masks moved to ImageProcessor --- */
+/* Before: hal_decoder_draw_masks(decoder, processor, outputs, n, dst, &boxes); */
+/* After:  hal_image_processor_draw_masks(processor, decoder, outputs, n, dst,
+                                          NULL, 1.0, &boxes);
+   (new background + opacity params; pass NULL and 1.0 for old behaviour)      */
+
+/* --- Tracked draw_masks also moved --- */
+/* Before: hal_decoder_decode_tracked_draw_masks(decoder, tracker, ts, processor, ...); */
+/* After:  hal_image_processor_draw_masks_tracked(processor, decoder, tracker, ts, ...); */
+
+/* --- decode_masks removed --- */
+/* Before: hal_decoder_decode_masks(decoder, processor, outputs, n, w, h,
+                                    &boxes, &masks);                            */
+/* After:  hal_decoder_decode(decoder, outputs, n, &boxes, &segs);             */
+```
+
+#### Rust
+
+```rust
+// --- Trait method renames (ImageProcessorTrait implementors) ---
+// draw_masks       → draw_decoded_masks
+// draw_masks_proto → draw_proto_masks
+// Both gain an `overlay: MaskOverlay<'_>` parameter.
+// Pass MaskOverlay::default() for backward-compatible behaviour.
+
+// --- New primary API on ImageProcessor ---
+// processor.draw_masks(&decoder, &outputs, &mut dst, overlay)
+
+// --- Decoder now accepts TensorDyn ---
+// Before: decoder.decode(&[&array_view_dquantized, ...], &mut boxes, &mut masks)
+// After:  decoder.decode(&[&tensor0, &tensor1], &mut boxes, &mut masks)
+// (previously required ArrayViewDQuantized / ArrayViewD<T>)
+
+// --- ArrayViewDQuantized is now pub(crate) ---
+// Use TensorDyn API instead. ArrayViewDQuantized is no longer part of the
+// public API surface.
+```
+
 ## [0.13.2] - 2026-03-26
 
 ### Fixed

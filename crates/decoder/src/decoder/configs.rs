@@ -321,6 +321,17 @@ pub enum ModelType {
         mask_coeff: MaskCoefficients,
         protos: Protos,
     },
+    /// 2-way split YOLO segmentation detection.
+    /// Combined detection tensor (boxes + scores) with separate mask
+    /// coefficients and prototype masks.
+    /// - detection: [1, nc+4, N] — boxes and scores combined
+    /// - mask_coeff: [1, 32, N] — mask coefficients (separate tensor)
+    /// - protos: [1, H/4, W/4, 32] — prototype masks
+    YoloSegDet2Way {
+        boxes: Detection,
+        mask_coeff: MaskCoefficients,
+        protos: Protos,
+    },
     /// End-to-end YOLO detection (post-NMS output from model)
     /// Input shape: (1, N, 6+) where columns are [x1, y1, x2, y2, conf,
     /// class, ...]
