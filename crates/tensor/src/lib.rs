@@ -767,6 +767,10 @@ where
         if self.format != Some(format) {
             self.row_stride = None;
             self.plane_offset = None;
+            #[cfg(target_os = "linux")]
+            if let TensorStorage::Dma(ref mut dma) = self.storage {
+                dma.mmap_offset = 0;
+            }
         }
         self.format = Some(format);
         Ok(())
@@ -1100,6 +1104,10 @@ where
         self.format = None;
         self.row_stride = None;
         self.plane_offset = None;
+        #[cfg(target_os = "linux")]
+        if let TensorStorage::Dma(ref mut dma) = self.storage {
+            dma.mmap_offset = 0;
+        }
         Ok(())
     }
 
