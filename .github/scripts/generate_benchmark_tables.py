@@ -154,33 +154,32 @@ def gen_decoder_seg_table(data_dir: Path):
 
 def gen_mask_table(data_dir: Path):
     print("\n**640×640 RGBA destination, ~2 detections (YOLOv8n-seg):**\n")
-    print("| Platform | Compute | Buffer | draw_masks (pre-decoded) | draw_masks_proto (fused) | decode_masks_atlas | hybrid_materialize_and_draw |")
-    print("|----------|---------|--------|------------------------|------------------------|--------------------|---------------------------|")
+    print("| Platform | Compute | Buffer | draw_decoded_masks (pre-decoded) | draw_proto_masks (fused) | hybrid_materialize_and_draw |")
+    print("|----------|---------|--------|-------------------------------|------------------------|---------------------------|")
 
     for platform, compute, buf, jf in MASK_CONFIGS:
         data = load_json(data_dir, platform, jf)
-        dm = get_bench(data, "draw_masks")
-        dmp = get_bench(data, "draw_masks_proto")
-        dma = get_bench(data, "decode_masks_atlas")
+        dm = get_bench(data, "draw_decoded_masks")
+        dmp = get_bench(data, "draw_proto_masks")
         hybrid = get_bench(data, "hybrid_materialize_and_draw")
-        print(f"| {platform} | {compute} | {buf} | {fmt_us(dm)} | {fmt_us(dmp)} | {fmt_us(dma)} | {fmt_us(hybrid)} |")
+        print(f"| {platform} | {compute} | {buf} | {fmt_us(dm)} | {fmt_us(dmp)} | {fmt_us(hybrid)} |")
 
 
 def gen_hybrid_comparison_table(data_dir: Path):
     """Generate hybrid path comparison table (CPU materialize + GL overlay vs fused GPU)."""
     print("\n**Hybrid Path Comparison (CPU materialize + GL overlay vs fused GPU):**\n")
-    print("The hybrid path decodes masks on CPU (`materialize_segmentations`) then overlays via GL (`draw_masks`). This is faster than fused GPU `draw_masks_proto` on all tested platforms. The auto-selection in `ImageProcessor::draw_masks_proto()` now prefers the hybrid path when both CPU and OpenGL backends are available.\n")
-    print("| Platform | Full GPU (GL draw_masks_proto) | Hybrid (GL) | Speedup | Auto draw_masks_proto |")
+    print("The hybrid path decodes masks on CPU (`materialize_segmentations`) then overlays via GL (`draw_decoded_masks`). This is faster than fused GPU `draw_proto_masks` on all tested platforms. The auto-selection in `ImageProcessor::draw_proto_masks()` now prefers the hybrid path when both CPU and OpenGL backends are available.\n")
+    print("| Platform | Full GPU (GL draw_proto_masks) | Hybrid (GL) | Speedup | Auto draw_proto_masks |")
     print("|----------|-------------------------------|-------------|---------|----------------------|")
 
     for platform in PLATFORMS:
         gl_data = load_json(data_dir, platform, "mask-opengl")
         if gl_data is None:
             continue
-        gpu_fused = get_bench(gl_data, "draw_masks_proto")
+        gpu_fused = get_bench(gl_data, "draw_proto_masks")
         hybrid = get_bench(gl_data, "hybrid_materialize_and_draw")
         auto_data = load_json(data_dir, platform, "mask-auto")
-        auto_val = get_bench(auto_data, "draw_masks_proto") if auto_data else hybrid
+        auto_val = get_bench(auto_data, "draw_proto_masks") if auto_data else hybrid
         if gpu_fused is not None and hybrid is not None and hybrid > 0:
             speedup = gpu_fused / hybrid
             print(f"| {platform} | {fmt_us(gpu_fused)} | {fmt_us(hybrid)} | **{speedup:.1f}×** | {fmt_us(auto_val)} |")

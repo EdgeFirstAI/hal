@@ -22,7 +22,7 @@ use super::context::{egl_ext, GlContext};
 use super::resources::{Buffer, EglImage, FrameBuffer, GlProgram, Texture};
 use super::shaders::*;
 use super::{Int8InterpolationMode, RegionOfInterest, TransferBackend};
-use crate::{Crop, Error, Flip, ImageProcessorTrait, MaskRegion, Rect, Rotation, DEFAULT_COLORS};
+use crate::{Crop, Error, Flip, ImageProcessorTrait, Rect, Rotation, DEFAULT_COLORS};
 use edgefirst_tensor::TensorDyn;
 
 /// OpenGL single-threaded image converter.
@@ -40,6 +40,10 @@ pub struct GLProcessorST {
     proto_dequant_int8_program: GlProgram,
     proto_segmentation_f32_program: GlProgram,
     color_program: GlProgram,
+    /// Last opacity value set on shader uniforms (avoids redundant GL calls).
+    cached_opacity: f32,
+    /// Allocated proto texture dimensions for SubImage3D fast path: (w, h, layers, internal_fmt).
+    proto_tex_dims: (usize, usize, usize, u32),
     /// Whether GL_OES_texture_float_linear is available (allows GL_LINEAR on R32F textures).
     has_float_linear: bool,
     /// Whether GL_EXT_texture_format_BGRA8888 is available (allows BGRA destinations).
@@ -48,19 +52,12 @@ pub struct GLProcessorST {
     int8_interpolation_mode: Int8InterpolationMode,
     /// Intermediate FBO texture for two-pass int8 dequant path.
     proto_dequant_texture: Texture,
-    proto_mask_logit_int8_bilinear_program: GlProgram,
-    proto_mask_logit_int8_nearest_program: GlProgram,
-    proto_mask_logit_f32_program: GlProgram,
-    /// Dedicated FBO for mask rendering.
-    mask_fbo: u32,
-    /// R8 texture attached to mask_fbo.
-    mask_fbo_texture: u32,
-    /// Current allocated width of mask FBO texture.
-    mask_fbo_width: usize,
-    /// Current allocated height of mask FBO texture.
-    mask_fbo_height: usize,
-    /// PBO buffer ID for atlas readback (0 = not allocated).
-    mask_atlas_pbo: u32,
+    /// Compute shader program for HWC→CHW proto repack (GLES 3.1 only).
+    proto_repack_compute_program: Option<u32>,
+    /// SSBO for proto data upload (compute shader path).
+    proto_ssbo: u32,
+    /// Current allocated size of proto SSBO in bytes (0 = not allocated).
+    proto_ssbo_size: usize,
     vertex_buffer: Buffer,
     texture_buffer: Buffer,
     /// Persistent FBO for the convert() render path.
@@ -118,14 +115,11 @@ impl Drop for GLProcessorST {
     fn drop(&mut self) {
         unsafe {
             {
-                if self.mask_fbo != 0 {
-                    gls::gl::DeleteFramebuffers(1, &self.mask_fbo);
+                if self.proto_ssbo != 0 {
+                    gls::gl::DeleteBuffers(1, &self.proto_ssbo);
                 }
-                if self.mask_fbo_texture != 0 {
-                    gls::gl::DeleteTextures(1, &self.mask_fbo_texture);
-                }
-                if self.mask_atlas_pbo != 0 {
-                    gls::gl::DeleteBuffers(1, &self.mask_atlas_pbo);
+                if let Some(program) = self.proto_repack_compute_program {
+                    gls::gl::DeleteProgram(program);
                 }
             }
         }
@@ -215,34 +209,28 @@ impl ImageProcessorTrait for GLProcessorST {
         )
     }
 
-    fn draw_masks(
+    fn draw_decoded_masks(
         &mut self,
         dst: &mut TensorDyn,
         detect: &[DetectBox],
         segmentation: &[Segmentation],
+        overlay: crate::MaskOverlay<'_>,
     ) -> Result<(), crate::Error> {
+        let bg = overlay.background.map(|bg| dyn_to_u8_src(bg)).transpose()?;
         let (dst_u8, dst_fmt, _is_int8) = dyn_to_u8_dst(dst)?;
-        self.draw_masks_impl(dst_u8, dst_fmt, detect, segmentation)
+        self.draw_decoded_masks_impl(dst_u8, dst_fmt, detect, segmentation, overlay.opacity, bg)
     }
 
-    fn draw_masks_proto(
+    fn draw_proto_masks(
         &mut self,
         dst: &mut TensorDyn,
         detect: &[DetectBox],
         proto_data: &ProtoData,
+        overlay: crate::MaskOverlay<'_>,
     ) -> crate::Result<()> {
+        let bg = overlay.background.map(|bg| dyn_to_u8_src(bg)).transpose()?;
         let (dst_u8, dst_fmt, _is_int8) = dyn_to_u8_dst(dst)?;
-        self.draw_masks_proto_impl(dst_u8, dst_fmt, detect, proto_data)
-    }
-
-    fn decode_masks_atlas(
-        &mut self,
-        detect: &[DetectBox],
-        proto_data: ProtoData,
-        output_width: usize,
-        output_height: usize,
-    ) -> crate::Result<(Vec<u8>, Vec<MaskRegion>)> {
-        GLProcessorST::decode_masks_atlas(self, detect, &proto_data, output_width, output_height)
+        self.draw_proto_masks_impl(dst_u8, dst_fmt, detect, proto_data, overlay.opacity, bg)
     }
 
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> crate::Result<()> {
@@ -376,20 +364,6 @@ impl GLProcessorST {
         let color_program = GlProgram::new(generate_vertex_shader(), generate_color_shader())?;
         color_program.load_uniform_4fv(c"colors", &DEFAULT_COLORS)?;
 
-        // Binary logit-threshold mask shaders (atlas path — skip sigmoid)
-        let proto_mask_logit_int8_nearest_program = GlProgram::new(
-            generate_vertex_shader(),
-            generate_proto_mask_logit_shader_int8_nearest(),
-        )?;
-        let proto_mask_logit_int8_bilinear_program = GlProgram::new(
-            generate_vertex_shader(),
-            generate_proto_mask_logit_shader_int8_bilinear(),
-        )?;
-        let proto_mask_logit_f32_program = GlProgram::new(
-            generate_vertex_shader(),
-            generate_proto_mask_logit_shader_f32(),
-        )?;
-
         // Int8 variant of the existing planar RGB shader (for planar RGB int8 destinations).
         let texture_program_planar_int8 =
             GlProgram::new(generate_vertex_shader(), generate_planar_rgb_int8_shader())?;
@@ -443,14 +417,6 @@ impl GLProcessorST {
             has_bgra,
             int8_interpolation_mode: Int8InterpolationMode::Bilinear,
             proto_dequant_texture,
-            proto_mask_logit_int8_bilinear_program,
-            proto_mask_logit_int8_nearest_program,
-            proto_mask_logit_f32_program,
-            mask_fbo: 0,
-            mask_fbo_texture: 0,
-            mask_fbo_width: 0,
-            mask_fbo_height: 0,
-            mask_atlas_pbo: 0,
             vertex_buffer,
             texture_buffer,
             convert_fbo: FrameBuffer::new(),
@@ -471,8 +437,34 @@ impl GLProcessorST {
             instanced_segmentation_program,
             proto_segmentation_program,
             color_program,
+            cached_opacity: f32::NAN, // sentinel: forces first set_opacity_uniform to initialize all shaders
+            proto_tex_dims: (0, 0, 0, 0),
+            proto_repack_compute_program: None,
+            proto_ssbo: 0,
+            proto_ssbo_size: 0,
         };
         check_gl_error(function!(), line!())?;
+
+        // Compile compute shader for proto repack if GLES 3.1 is available.
+        // Enabled via EDGEFIRST_PROTO_COMPUTE=1 while validating on target GPUs.
+        let compute_enabled = converter.gl_context.has_compute
+            && std::env::var("EDGEFIRST_PROTO_COMPUTE")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+        if compute_enabled {
+            match Self::compile_compute_program(generate_proto_repack_compute_shader()) {
+                Ok(program) => {
+                    log::info!("Proto repack compute shader compiled successfully");
+                    converter.proto_repack_compute_program = Some(program);
+                    let mut ssbo = 0u32;
+                    unsafe { gls::gl::GenBuffers(1, &mut ssbo) };
+                    converter.proto_ssbo = ssbo;
+                }
+                Err(e) => {
+                    log::warn!("Proto repack compute shader failed: {e}; using CPU fallback");
+                }
+            }
+        }
 
         log::debug!(
             "GLProcessorST: DMA destination attachment mode: {}",
@@ -621,489 +613,10 @@ impl GLProcessorST {
         pass
     }
 
-    /// Compute padded bbox regions and atlas offsets for a set of detections.
-    ///
-    /// Returns the vector of `MaskRegion` with stacked atlas_y_offset values
-    /// and the total compact atlas height.
-    fn compute_atlas_regions(
-        detect: &[DetectBox],
-        output_width: usize,
-        output_height: usize,
-        padding: usize,
-    ) -> (Vec<MaskRegion>, usize) {
-        let ow = output_width as i32;
-        let oh = output_height as i32;
-        let owf = output_width as f32;
-        let ohf = output_height as f32;
-        let pad = padding as i32;
-
-        let mut regions = Vec::with_capacity(detect.len());
-        let mut atlas_y = 0usize;
-        for det in detect.iter() {
-            let bbox_x = (det.bbox.xmin * owf).round() as i32;
-            let bbox_y = (det.bbox.ymin * ohf).round() as i32;
-            let bbox_w = ((det.bbox.xmax - det.bbox.xmin) * owf).round() as i32;
-            let bbox_h = ((det.bbox.ymax - det.bbox.ymin) * ohf).round() as i32;
-            let bbox_x = bbox_x.max(0).min(ow);
-            let bbox_y = bbox_y.max(0).min(oh);
-            let bbox_w = bbox_w.max(1).min(ow - bbox_x);
-            let bbox_h = bbox_h.max(1).min(oh - bbox_y);
-
-            let padded_x = (bbox_x - pad).max(0);
-            let padded_y = (bbox_y - pad).max(0);
-            let padded_w = ((bbox_x + bbox_w + pad).min(ow) - padded_x).max(1);
-            let padded_h = ((bbox_y + bbox_h + pad).min(oh) - padded_y).max(1);
-
-            regions.push(MaskRegion {
-                atlas_y_offset: atlas_y,
-                padded_x: padded_x as usize,
-                padded_y: padded_y as usize,
-                padded_w: padded_w as usize,
-                padded_h: padded_h as usize,
-                bbox_x: bbox_x as usize,
-                bbox_y: bbox_y as usize,
-                bbox_w: bbox_w as usize,
-                bbox_h: bbox_h as usize,
-            });
-            atlas_y += padded_h as usize;
-        }
-        (regions, atlas_y)
-    }
-
     /// Sets the interpolation mode for int8 proto textures.
     pub fn set_int8_interpolation_mode(&mut self, mode: Int8InterpolationMode) {
         self.int8_interpolation_mode = mode;
         log::debug!("Int8 interpolation mode set to {:?}", mode);
-    }
-
-    /// Ensures the mask FBO + R8 texture are allocated at the given dimensions.
-    /// Creates or resizes the FBO and texture as needed.
-    fn ensure_mask_fbo(&mut self, width: usize, height: usize) -> crate::Result<()> {
-        if self.mask_fbo_width == width && self.mask_fbo_height == height && self.mask_fbo != 0 {
-            return Ok(());
-        }
-
-        // Create FBO if needed
-        if self.mask_fbo == 0 {
-            unsafe {
-                gls::gl::GenFramebuffers(1, &mut self.mask_fbo);
-            }
-        }
-        // Create texture if needed
-        if self.mask_fbo_texture == 0 {
-            unsafe {
-                gls::gl::GenTextures(1, &mut self.mask_fbo_texture);
-            }
-        }
-
-        // Allocate R8 texture
-        unsafe {
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.mask_fbo_texture);
-            gls::gl::TexImage2D(
-                gls::gl::TEXTURE_2D,
-                0,
-                gls::gl::R8 as i32,
-                width as i32,
-                height as i32,
-                0,
-                gls::gl::RED,
-                gls::gl::UNSIGNED_BYTE,
-                std::ptr::null(),
-            );
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MIN_FILTER,
-                gls::gl::NEAREST as i32,
-            );
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MAG_FILTER,
-                gls::gl::NEAREST as i32,
-            );
-        }
-
-        // Attach to FBO
-        unsafe {
-            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, self.mask_fbo);
-            gls::gl::FramebufferTexture2D(
-                gls::gl::FRAMEBUFFER,
-                gls::gl::COLOR_ATTACHMENT0,
-                gls::gl::TEXTURE_2D,
-                self.mask_fbo_texture,
-                0,
-            );
-            let status = gls::gl::CheckFramebufferStatus(gls::gl::FRAMEBUFFER);
-            if status != gls::gl::FRAMEBUFFER_COMPLETE {
-                return Err(crate::Error::OpenGl(format!(
-                    "Mask FBO incomplete: status=0x{status:X}"
-                )));
-            }
-            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
-        }
-
-        self.mask_fbo_width = width;
-        self.mask_fbo_height = height;
-        log::debug!("Mask FBO allocated at {width}x{height}");
-        Ok(())
-    }
-
-    /// Ensures the mask atlas FBO and PBO are allocated for the given total
-    /// atlas dimensions.  Unlike `ensure_mask_atlas`, the caller provides
-    /// the exact atlas height (e.g. sum of padded bbox heights).
-    fn ensure_mask_atlas_size(&mut self, width: usize, atlas_height: usize) -> crate::Result<()> {
-        if self.mask_fbo_width == width
-            && self.mask_fbo_height >= atlas_height
-            && self.mask_fbo != 0
-            && self.mask_atlas_pbo != 0
-        {
-            return Ok(());
-        }
-        self.ensure_mask_fbo(width, atlas_height)?;
-        let pbo_size = width * atlas_height;
-        unsafe {
-            if self.mask_atlas_pbo == 0 {
-                gls::gl::GenBuffers(1, &mut self.mask_atlas_pbo);
-            }
-            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, self.mask_atlas_pbo);
-            gls::gl::BufferData(
-                gls::gl::PIXEL_PACK_BUFFER,
-                pbo_size as isize,
-                std::ptr::null(),
-                gls::gl::DYNAMIC_READ,
-            );
-            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
-        }
-        Ok(())
-    }
-
-    /// Decode all detection masks into a single atlas texture and read back
-    /// as a contiguous buffer, with one PBO readback for all masks.
-    ///
-    /// Returns `(atlas_pixels, metadata)` where `atlas_pixels` is a contiguous
-    /// `Vec<u8>` of size `output_width * compact_atlas_height` (where
-    /// `compact_atlas_height` is the sum of padded bbox heights) and `metadata`
-    /// contains per-detection bbox info (with empty pixel vecs).
-    pub fn decode_masks_atlas(
-        &mut self,
-        detect: &[DetectBox],
-        proto_data: &ProtoData,
-        output_width: usize,
-        output_height: usize,
-    ) -> crate::Result<(Vec<u8>, Vec<MaskRegion>)> {
-        use crate::FunctionTimer;
-
-        let _timer = FunctionTimer::new("GLProcessorST::decode_masks_atlas");
-
-        if detect.is_empty() || proto_data.mask_coefficients.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
-        }
-
-        let padding = 4usize;
-
-        let (height, width, num_protos) = proto_data.protos.dim();
-        let texture_target = gls::gl::TEXTURE_2D_ARRAY;
-
-        // Pre-compute atlas regions and total height to size the FBO/PBO
-        let (regions, compact_atlas_height) =
-            Self::compute_atlas_regions(detect, output_width, output_height, padding);
-
-        // Save current FBO and viewport
-        let (saved_fbo, saved_viewport) = unsafe {
-            let mut fbo: i32 = 0;
-            gls::gl::GetIntegerv(gls::gl::FRAMEBUFFER_BINDING, &mut fbo);
-            let mut vp = [0i32; 4];
-            gls::gl::GetIntegerv(gls::gl::VIEWPORT, vp.as_mut_ptr());
-            (fbo as u32, vp)
-        };
-
-        // Ensure atlas FBO and PBO are allocated for the compact size
-        self.ensure_mask_atlas_size(output_width, compact_atlas_height)?;
-
-        // Upload proto texture array and select the logit-threshold shader
-        gls::active_texture(gls::gl::TEXTURE0);
-        gls::bind_texture(texture_target, self.proto_texture.id);
-        gls::tex_parameteri(
-            texture_target,
-            gls::gl::TEXTURE_MIN_FILTER,
-            gls::gl::NEAREST as i32,
-        );
-        gls::tex_parameteri(
-            texture_target,
-            gls::gl::TEXTURE_MAG_FILTER,
-            gls::gl::NEAREST as i32,
-        );
-        gls::tex_parameteri(
-            texture_target,
-            gls::gl::TEXTURE_WRAP_S,
-            gls::gl::CLAMP_TO_EDGE as i32,
-        );
-        gls::tex_parameteri(
-            texture_target,
-            gls::gl::TEXTURE_WRAP_T,
-            gls::gl::CLAMP_TO_EDGE as i32,
-        );
-
-        let atlas_result = match &proto_data.protos {
-            ProtoTensor::Quantized {
-                protos,
-                quantization,
-            } => {
-                let mut tex_data = vec![0i8; height * width * num_protos];
-                for k in 0..num_protos {
-                    for y in 0..height {
-                        for x in 0..width {
-                            tex_data[k * height * width + y * width + x] = protos[[y, x, k]];
-                        }
-                    }
-                }
-                gls::tex_image3d(
-                    texture_target,
-                    0,
-                    gls::gl::R8I as i32,
-                    width as i32,
-                    height as i32,
-                    num_protos as i32,
-                    0,
-                    gls::gl::RED_INTEGER,
-                    gls::gl::BYTE,
-                    Some(&tex_data),
-                );
-
-                let proto_scale = quantization.scale;
-                let proto_scaled_zp = -(quantization.zero_point as f32) * quantization.scale;
-
-                let program = match self.int8_interpolation_mode {
-                    Int8InterpolationMode::Nearest => &self.proto_mask_logit_int8_nearest_program,
-                    _ => &self.proto_mask_logit_int8_bilinear_program,
-                };
-                gls::use_program(program.id);
-                program.load_uniform_1i(c"num_protos", num_protos as i32)?;
-                program.load_uniform_1f(c"proto_scale", proto_scale)?;
-
-                self.render_mask_atlas_compact(
-                    program,
-                    regions,
-                    &proto_data.mask_coefficients,
-                    output_width,
-                    output_height,
-                    Some(proto_scaled_zp),
-                )
-            }
-            ProtoTensor::Float(protos_f32) => {
-                let mut tex_data = vec![0.0f32; height * width * num_protos];
-                for k in 0..num_protos {
-                    for y in 0..height {
-                        for x in 0..width {
-                            tex_data[k * height * width + y * width + x] = protos_f32[[y, x, k]];
-                        }
-                    }
-                }
-                gls::tex_image3d(
-                    texture_target,
-                    0,
-                    gls::gl::R32F as i32,
-                    width as i32,
-                    height as i32,
-                    num_protos as i32,
-                    0,
-                    gls::gl::RED,
-                    gls::gl::FLOAT,
-                    Some(&tex_data),
-                );
-                if self.has_float_linear {
-                    gls::tex_parameteri(
-                        texture_target,
-                        gls::gl::TEXTURE_MIN_FILTER,
-                        gls::gl::LINEAR as i32,
-                    );
-                    gls::tex_parameteri(
-                        texture_target,
-                        gls::gl::TEXTURE_MAG_FILTER,
-                        gls::gl::LINEAR as i32,
-                    );
-                }
-
-                let program = &self.proto_mask_logit_f32_program;
-                gls::use_program(program.id);
-                program.load_uniform_1i(c"num_protos", num_protos as i32)?;
-
-                self.render_mask_atlas_compact(
-                    program,
-                    regions,
-                    &proto_data.mask_coefficients,
-                    output_width,
-                    output_height,
-                    None,
-                )
-            }
-        };
-
-        // Restore previous FBO + viewport
-        unsafe {
-            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, saved_fbo);
-            gls::gl::Viewport(
-                saved_viewport[0],
-                saved_viewport[1],
-                saved_viewport[2],
-                saved_viewport[3],
-            );
-        }
-
-        let (atlas_pixels, regions) = atlas_result?;
-        Ok((atlas_pixels, regions))
-    }
-
-    /// Render all detection masks into a compact atlas where each strip is
-    /// sized to the padded bounding box, not the full output resolution.
-    ///
-    /// The atlas width equals `output_width`; each detection occupies a
-    /// horizontal strip whose height is the padded bbox height.  Strips are
-    /// stacked vertically.  A single PBO readback retrieves the entire atlas.
-    ///
-    /// Returns `(atlas_pixels, regions)` where `regions` describes each
-    /// detection's location within the atlas.
-    #[allow(clippy::too_many_arguments)]
-    fn render_mask_atlas_compact(
-        &self,
-        program: &GlProgram,
-        regions: Vec<MaskRegion>,
-        mask_coefficients: &[Vec<f32>],
-        output_width: usize,
-        output_height: usize,
-        proto_scaled_zp: Option<f32>,
-    ) -> crate::Result<(Vec<u8>, Vec<MaskRegion>)> {
-        if regions.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
-        }
-
-        let owf = output_width as f32;
-        let ohf = output_height as f32;
-
-        let atlas_height = regions.last().map_or(0, |r| r.atlas_y_offset + r.padded_h);
-        let ahf = atlas_height as f32;
-
-        unsafe {
-            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, self.mask_fbo);
-            gls::gl::Viewport(0, 0, output_width as i32, atlas_height as i32);
-            gls::gl::Disable(gls::gl::BLEND);
-            gls::gl::ClearColor(0.0, 0.0, 0.0, 0.0);
-            gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
-        }
-
-        if let Some(first_coeff) = mask_coefficients.first() {
-            if first_coeff.len() > 32 {
-                log::warn!(
-                    "render_mask_atlas_compact: {} mask coefficients exceeds shader \
-                     limit of 32 — coefficients will be truncated",
-                    first_coeff.len()
-                );
-            }
-        }
-
-        for (region, coeff) in regions.iter().zip(mask_coefficients.iter()) {
-            let mut packed_coeff = [[0.0f32; 4]; 8];
-            for (j, val) in coeff.iter().enumerate().take(32) {
-                packed_coeff[j / 4][j % 4] = *val;
-            }
-            program.load_uniform_4fv(c"mask_coeff", &packed_coeff)?;
-
-            // For int8 paths: upload precomputed coeff_sum * scaled_zp
-            if let Some(szp) = proto_scaled_zp {
-                let coeff_sum: f32 = coeff.iter().take(32).sum();
-                program.load_uniform_1f(c"coeff_sum_x_szp", coeff_sum * szp)?;
-            }
-
-            // The bbox quad position in the atlas:
-            // - X: the padded bbox horizontal position (same as in output coords)
-            // - Y: the strip's vertical offset in the atlas
-            let dst_left = region.padded_x as f32 / owf * 2.0 - 1.0;
-            let dst_right = (region.padded_x + region.padded_w) as f32 / owf * 2.0 - 1.0;
-            let dst_bottom = region.atlas_y_offset as f32 / ahf * 2.0 - 1.0;
-            let dst_top = (region.atlas_y_offset + region.padded_h) as f32 / ahf * 2.0 - 1.0;
-
-            // Proto texture coords map the padded bbox to proto space
-            let src_left = region.padded_x as f32 / owf;
-            let src_right = (region.padded_x + region.padded_w) as f32 / owf;
-            let src_bottom = region.padded_y as f32 / ohf;
-            let src_top = (region.padded_y + region.padded_h) as f32 / ohf;
-
-            unsafe {
-                gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
-                gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
-                let verts: [f32; 12] = [
-                    dst_left, dst_top, 0.0, dst_right, dst_top, 0.0, dst_right, dst_bottom, 0.0,
-                    dst_left, dst_bottom, 0.0,
-                ];
-                gls::gl::BufferSubData(
-                    gls::gl::ARRAY_BUFFER,
-                    0,
-                    (size_of::<f32>() * 12) as isize,
-                    verts.as_ptr() as *const c_void,
-                );
-
-                gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
-                gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
-                let tc: [f32; 8] = [
-                    src_left, src_top, src_right, src_top, src_right, src_bottom, src_left,
-                    src_bottom,
-                ];
-                gls::gl::BufferSubData(
-                    gls::gl::ARRAY_BUFFER,
-                    0,
-                    (size_of::<f32>() * 8) as isize,
-                    tc.as_ptr() as *const c_void,
-                );
-
-                let idx: [u32; 4] = [0, 1, 2, 3];
-                gls::gl::DrawElements(
-                    gls::gl::TRIANGLE_FAN,
-                    4,
-                    gls::gl::UNSIGNED_INT,
-                    idx.as_ptr() as *const c_void,
-                );
-            }
-        }
-
-        // Single readback for the compact atlas
-        let atlas_bytes = output_width * atlas_height;
-        let mut pixels = vec![0u8; atlas_bytes];
-
-        unsafe {
-            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, self.mask_atlas_pbo);
-            gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-            gls::gl::ReadnPixels(
-                0,
-                0,
-                output_width as i32,
-                atlas_height as i32,
-                gls::gl::RED,
-                gls::gl::UNSIGNED_BYTE,
-                atlas_bytes as i32,
-                std::ptr::null_mut(),
-            );
-            gls::gl::Finish();
-        }
-        check_gl_error(function!(), line!())?;
-
-        unsafe {
-            let ptr = gls::gl::MapBufferRange(
-                gls::gl::PIXEL_PACK_BUFFER,
-                0,
-                atlas_bytes as isize,
-                gls::gl::MAP_READ_BIT,
-            );
-            if ptr.is_null() {
-                gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
-                return Err(crate::Error::OpenGl(
-                    "Failed to map compact atlas PBO for readback".to_string(),
-                ));
-            }
-            std::ptr::copy_nonoverlapping(ptr as *const u8, pixels.as_mut_ptr(), atlas_bytes);
-            gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
-            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
-        }
-
-        Ok((pixels, regions))
     }
 
     // Internal methods operating on Tensor<u8> + PixelFormat directly.
@@ -1191,16 +704,19 @@ impl GLProcessorST {
         res
     }
 
-    pub(super) fn draw_masks_impl(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn draw_decoded_masks_impl(
         &mut self,
         dst: &mut Tensor<u8>,
         dst_fmt: PixelFormat,
         detect: &[DetectBox],
         segmentation: &[Segmentation],
+        opacity: f32,
+        background: Option<(&Tensor<u8>, PixelFormat)>,
     ) -> Result<(), crate::Error> {
         use crate::FunctionTimer;
 
-        let _timer = FunctionTimer::new("GLProcessorST::draw_masks");
+        let _timer = FunctionTimer::new("GLProcessorST::draw_decoded_masks");
         if !matches!(
             dst_fmt,
             PixelFormat::Rgba | PixelFormat::Bgra | PixelFormat::Rgb
@@ -1238,6 +754,51 @@ impl GLProcessorST {
             }
         };
 
+        // GPU-blit background into framebuffer if provided and DMA-capable
+        if let Some((bg, bg_fmt)) = background {
+            if bg.width() != Some(dst_w) || bg.height() != Some(dst_h) {
+                return Err(crate::Error::InvalidShape(
+                    "background dimensions do not match dst".into(),
+                ));
+            }
+            if is_dma && bg.memory() == TensorMemory::Dma {
+                gls::disable(gls::gl::BLEND);
+                let bg_egl = self.get_or_create_egl_image(CacheKind::Src, bg, bg_fmt)?;
+                self.draw_camera_texture_eglimage(
+                    bg,
+                    bg_fmt,
+                    bg_egl,
+                    RegionOfInterest {
+                        left: 0.0,
+                        top: 1.0,
+                        right: 1.0,
+                        bottom: 0.0,
+                    },
+                    RegionOfInterest {
+                        left: -1.0,
+                        top: 1.0,
+                        right: 1.0,
+                        bottom: -1.0,
+                    },
+                    0,
+                    crate::Flip::None,
+                )?;
+            } else {
+                // Non-DMA background: CPU blit fallback
+                use edgefirst_tensor::TensorMapTrait;
+                let bg_map = bg.map()?;
+                let mut dst_map = dst.map()?;
+                let bg_slice = bg_map.as_slice();
+                let dst_slice = dst_map.as_mut_slice();
+                if bg_slice.len() != dst_slice.len() {
+                    return Err(crate::Error::InvalidShape(
+                        "background buffer size does not match dst".into(),
+                    ));
+                }
+                dst_slice.copy_from_slice(bg_slice);
+            }
+        }
+
         gls::enable(gls::gl::BLEND);
         gls::blend_func_separate(
             gls::gl::SRC_ALPHA,
@@ -1246,6 +807,7 @@ impl GLProcessorST {
             gls::gl::ONE,
         );
 
+        self.set_opacity_uniform(opacity)?;
         self.render_box(dst_w, dst_h, detect)?;
         self.render_segmentation(detect, segmentation)?;
 
@@ -1307,16 +869,19 @@ impl GLProcessorST {
         Ok(())
     }
 
-    pub(super) fn draw_masks_proto_impl(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn draw_proto_masks_impl(
         &mut self,
         dst: &mut Tensor<u8>,
         dst_fmt: PixelFormat,
         detect: &[DetectBox],
         proto_data: &ProtoData,
+        opacity: f32,
+        background: Option<(&Tensor<u8>, PixelFormat)>,
     ) -> crate::Result<()> {
         use crate::FunctionTimer;
 
-        let _timer = FunctionTimer::new("GLProcessorST::draw_masks_proto");
+        let _timer = FunctionTimer::new("GLProcessorST::draw_proto_masks");
         if !matches!(
             dst_fmt,
             PixelFormat::Rgba | PixelFormat::Bgra | PixelFormat::Rgb
@@ -1354,6 +919,51 @@ impl GLProcessorST {
             }
         };
 
+        // GPU-blit background into framebuffer if provided and DMA-capable
+        if let Some((bg, bg_fmt)) = background {
+            if bg.width() != Some(dst_w) || bg.height() != Some(dst_h) {
+                return Err(crate::Error::InvalidShape(
+                    "background dimensions do not match dst".into(),
+                ));
+            }
+            if is_dma && bg.memory() == TensorMemory::Dma {
+                gls::disable(gls::gl::BLEND);
+                let bg_egl = self.get_or_create_egl_image(CacheKind::Src, bg, bg_fmt)?;
+                self.draw_camera_texture_eglimage(
+                    bg,
+                    bg_fmt,
+                    bg_egl,
+                    RegionOfInterest {
+                        left: 0.0,
+                        top: 1.0,
+                        right: 1.0,
+                        bottom: 0.0,
+                    },
+                    RegionOfInterest {
+                        left: -1.0,
+                        top: 1.0,
+                        right: 1.0,
+                        bottom: -1.0,
+                    },
+                    0,
+                    crate::Flip::None,
+                )?;
+            } else {
+                // Non-DMA background: CPU blit fallback
+                use edgefirst_tensor::TensorMapTrait;
+                let bg_map = bg.map()?;
+                let mut dst_map = dst.map()?;
+                let bg_slice = bg_map.as_slice();
+                let dst_slice = dst_map.as_mut_slice();
+                if bg_slice.len() != dst_slice.len() {
+                    return Err(crate::Error::InvalidShape(
+                        "background buffer size does not match dst".into(),
+                    ));
+                }
+                dst_slice.copy_from_slice(bg_slice);
+            }
+        }
+
         gls::enable(gls::gl::BLEND);
         gls::blend_func_separate(
             gls::gl::SRC_ALPHA,
@@ -1362,6 +972,7 @@ impl GLProcessorST {
             gls::gl::ONE,
         );
 
+        self.set_opacity_uniform(opacity)?;
         self.render_box(dst_w, dst_h, detect)?;
         self.render_proto_segmentation(detect, proto_data)?;
 
@@ -4633,29 +4244,119 @@ impl GLProcessorST {
             gls::gl::CLAMP_TO_EDGE as i32,
         );
 
-        // Protos are (H, W, num_protos) in row-major. We need to repack to
-        // layer-first layout: layer k = all (H, W) texels for proto k.
-        let mut tex_data = vec![0i8; height * width * num_protos];
-        for k in 0..num_protos {
-            for y in 0..height {
-                for x in 0..width {
-                    tex_data[k * height * width + y * width + x] = protos[[y, x, k]];
+        // Protos are (H, W, num_protos) in row-major HWC. The GL texture
+        // needs layer-first CHW (one proto per layer).
+        if let Some(compute_program) = self.proto_repack_compute_program {
+            // === GLES 3.1 compute shader path ===
+            // Upload HWC data as-is to SSBO, let GPU transpose via compute.
+            // Fall through to CPU repack if proto array is non-contiguous.
+            let data = match protos.as_slice() {
+                Some(s) => std::borrow::Cow::Borrowed(s),
+                None => std::borrow::Cow::Owned(protos.iter().copied().collect()),
+            };
+            // Pad to 4-byte boundary for SSBO int[] alignment
+            let data_bytes = (data.len() + 3) & !3;
+
+            // Allocate texture as R32I (required for imageStore in compute).
+            // Fragment shaders using isampler2DArray read integers correctly
+            // from either R8I or R32I via texelFetch.
+            let dims = (width, height, num_protos, gls::gl::R32I);
+            if dims != self.proto_tex_dims {
+                gls::tex_image3d::<i32>(
+                    texture_target,
+                    0,
+                    gls::gl::R32I as i32,
+                    width as i32,
+                    height as i32,
+                    num_protos as i32,
+                    0,
+                    gls::gl::RED_INTEGER,
+                    gls::gl::INT,
+                    None,
+                );
+                self.proto_tex_dims = dims;
+            }
+
+            unsafe {
+                // Upload HWC data to SSBO
+                gls::gl::BindBuffer(gls::gl::SHADER_STORAGE_BUFFER, self.proto_ssbo);
+                if data_bytes > self.proto_ssbo_size {
+                    gls::gl::BufferData(
+                        gls::gl::SHADER_STORAGE_BUFFER,
+                        data_bytes as isize,
+                        data.as_ptr() as *const std::ffi::c_void,
+                        gls::gl::STREAM_DRAW,
+                    );
+                    self.proto_ssbo_size = data_bytes;
+                } else {
+                    gls::gl::BufferSubData(
+                        gls::gl::SHADER_STORAGE_BUFFER,
+                        0,
+                        data_bytes as isize,
+                        data.as_ptr() as *const std::ffi::c_void,
+                    );
+                }
+                gls::gl::BindBufferBase(gls::gl::SHADER_STORAGE_BUFFER, 0, self.proto_ssbo);
+
+                // Bind texture as image for compute write (R32I for compatibility)
+                gls::gl::BindImageTexture(
+                    0,
+                    self.proto_texture.id,
+                    0,
+                    gls::gl::TRUE,
+                    0,
+                    gls::gl::WRITE_ONLY,
+                    gls::gl::R32I,
+                );
+
+                // Dispatch compute
+                gls::gl::UseProgram(compute_program);
+                let loc_w = gls::gl::GetUniformLocation(compute_program, c"width".as_ptr());
+                let loc_h = gls::gl::GetUniformLocation(compute_program, c"height".as_ptr());
+                let loc_np = gls::gl::GetUniformLocation(compute_program, c"num_protos".as_ptr());
+                gls::gl::Uniform1i(loc_w, width as i32);
+                gls::gl::Uniform1i(loc_h, height as i32);
+                gls::gl::Uniform1i(loc_np, num_protos as i32);
+
+                let groups_x = width.div_ceil(16) as u32;
+                let groups_y = height.div_ceil(16) as u32;
+                gls::gl::DispatchCompute(groups_x, groups_y, 1);
+                gls::gl::MemoryBarrier(
+                    gls::gl::TEXTURE_FETCH_BARRIER_BIT | gls::gl::SHADER_IMAGE_ACCESS_BARRIER_BIT,
+                );
+
+                // Unbind SSBO and log any GL errors from compute dispatch
+                gls::gl::BindBuffer(gls::gl::SHADER_STORAGE_BUFFER, 0);
+                loop {
+                    let err = gls::gl::GetError();
+                    if err == gls::gl::NO_ERROR {
+                        break;
+                    }
+                    log::debug!("GL error after compute dispatch: 0x{err:x}");
                 }
             }
-        }
+        } else {
+            // === GLES 3.0 fallback: CPU repack ===
+            let mut tex_data = vec![0i8; height * width * num_protos];
+            for k in 0..num_protos {
+                for y in 0..height {
+                    for x in 0..width {
+                        tex_data[k * height * width + y * width + x] = protos[[y, x, k]];
+                    }
+                }
+            }
 
-        gls::tex_image3d(
-            texture_target,
-            0,
-            gls::gl::R8I as i32,
-            width as i32,
-            height as i32,
-            num_protos as i32,
-            0,
-            gls::gl::RED_INTEGER,
-            gls::gl::BYTE,
-            Some(&tex_data),
-        );
+            self.upload_proto_texture(
+                texture_target,
+                gls::gl::R8I,
+                width,
+                height,
+                num_protos,
+                gls::gl::RED_INTEGER,
+                gls::gl::BYTE,
+                &tex_data,
+            );
+        }
 
         let proto_scale = quantization.scale;
         let proto_scaled_zp = -(quantization.zero_point as f32) * quantization.scale;
@@ -5020,6 +4721,111 @@ impl GLProcessorST {
         }
 
         gls::disable(gls::gl::BLEND);
+        Ok(())
+    }
+
+    /// Compile a GLES 3.1 compute shader program from source.
+    fn compile_compute_program(source: &str) -> Result<u32, Error> {
+        unsafe {
+            let cs = gls::gl::CreateShader(gls::gl::COMPUTE_SHADER);
+            if super::shaders::compile_shader_from_str(cs, source, "proto_repack_compute").is_err()
+            {
+                gls::gl::DeleteShader(cs);
+                return Err(Error::OpenGl("compute shader compile failed".into()));
+            }
+
+            let program = gls::gl::CreateProgram();
+            gls::gl::AttachShader(program, cs);
+            gls::gl::LinkProgram(program);
+
+            let mut linked: i32 = 0;
+            gls::gl::GetProgramiv(program, gls::gl::LINK_STATUS, &mut linked);
+            gls::gl::DeleteShader(cs);
+
+            if linked == 0 {
+                let mut log_len = 0;
+                gls::gl::GetProgramiv(program, gls::gl::INFO_LOG_LENGTH, &mut log_len);
+                let mut log_buf: Vec<u8> = vec![0; log_len as usize];
+                gls::gl::GetProgramInfoLog(
+                    program,
+                    log_len,
+                    std::ptr::null_mut(),
+                    log_buf.as_mut_ptr() as *mut std::ffi::c_char,
+                );
+                let msg = String::from_utf8_lossy(&log_buf);
+                gls::gl::DeleteProgram(program);
+                return Err(Error::OpenGl(format!("compute program link failed: {msg}")));
+            }
+            Ok(program)
+        }
+    }
+
+    /// Upload data to the proto `GL_TEXTURE_2D_ARRAY`, using `glTexSubImage3D`
+    /// when the texture dimensions haven't changed (avoids driver reallocation).
+    #[allow(clippy::too_many_arguments)]
+    fn upload_proto_texture<T: Copy>(
+        &mut self,
+        target: u32,
+        internal_fmt: u32,
+        w: usize,
+        h: usize,
+        layers: usize,
+        format: u32,
+        dtype: u32,
+        data: &[T],
+    ) {
+        let dims = (w, h, layers, internal_fmt);
+        if dims == self.proto_tex_dims {
+            unsafe {
+                gls::gl::TexSubImage3D(
+                    target,
+                    0,
+                    0,
+                    0,
+                    0,
+                    w as i32,
+                    h as i32,
+                    layers as i32,
+                    format,
+                    dtype,
+                    data.as_ptr() as *const std::ffi::c_void,
+                );
+            }
+        } else {
+            gls::tex_image3d(
+                target,
+                0,
+                internal_fmt as i32,
+                w as i32,
+                h as i32,
+                layers as i32,
+                0,
+                format,
+                dtype,
+                Some(data),
+            );
+            self.proto_tex_dims = dims;
+        }
+    }
+
+    /// Set the `opacity` uniform on all segmentation and color shader programs.
+    /// Skips GL calls entirely when opacity hasn't changed since the last call.
+    fn set_opacity_uniform(&mut self, opacity: f32) -> Result<(), Error> {
+        if (opacity - self.cached_opacity).abs() < f32::EPSILON {
+            return Ok(());
+        }
+        for program in [
+            &self.color_program,
+            &self.segmentation_program,
+            &self.instanced_segmentation_program,
+            &self.proto_segmentation_program,
+            &self.proto_segmentation_int8_nearest_program,
+            &self.proto_segmentation_int8_bilinear_program,
+            &self.proto_segmentation_f32_program,
+        ] {
+            program.load_uniform_1f(c"opacity", opacity)?;
+        }
+        self.cached_opacity = opacity;
         Ok(())
     }
 

@@ -1015,7 +1015,9 @@ mod cpu_tests {
         };
 
         let mut renderer = CPUProcessor::new();
-        renderer.draw_masks(&mut image_dyn, &[], &[seg]).unwrap();
+        renderer
+            .draw_decoded_masks(&mut image_dyn, &[], &[seg], Default::default())
+            .unwrap();
 
         let image = {
             let mut __t = image_dyn.into_u8().unwrap();
@@ -1071,7 +1073,7 @@ mod cpu_tests {
             .unwrap();
         assert_eq!(renderer.colors[1], [128, 128, 255, 100]);
         renderer
-            .draw_masks(&mut image_dyn, &[detect], &[seg])
+            .draw_decoded_masks(&mut image_dyn, &[detect], &[seg], Default::default())
             .unwrap();
         let image = {
             let mut __t = image_dyn.into_u8().unwrap();

@@ -197,6 +197,28 @@ def run_tflite(interp, input_data):
     return [interp.get_tensor(d["index"]) for d in interp.get_output_details()]
 
 
+def numpy_outputs_to_tensors(outputs):
+    """Convert a list of numpy arrays to HAL Tensors for decode/draw_masks."""
+    from edgefirst_hal import Tensor  # noqa: F811
+
+    dtype_map = {
+        np.dtype("int8"): "int8",
+        np.dtype("uint8"): "uint8",
+        np.dtype("float32"): "float32",
+        np.dtype("float64"): "float64",
+    }
+    tensors = []
+    for arr in outputs:
+        arr = np.ascontiguousarray(arr)
+        hal_dtype = dtype_map.get(arr.dtype, "float32")
+        t = Tensor(list(arr.shape), dtype=hal_dtype)
+        with t.map() as m:
+            dst = np.frombuffer(m, dtype=arr.dtype).reshape(arr.shape)
+            np.copyto(dst, arr)
+        tensors.append(t)
+    return tensors
+
+
 def sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
 
@@ -473,7 +495,7 @@ def run_hal_pipeline(image_path, metadata, interp, processor, save_path=None):
 
     # 3. Inference
     t0 = time.perf_counter()
-    outputs = run_tflite(interp, input_data)
+    outputs = numpy_outputs_to_tensors(run_tflite(interp, input_data))
     timings["inference"] = (time.perf_counter() - t0) * 1000
 
     # 4. Decode (HAL Rust decoder — NMS + mask computation)
@@ -504,7 +526,7 @@ def run_hal_pipeline(image_path, metadata, interp, processor, save_path=None):
 
 
 def run_hal_pipeline_bench(image_path, metadata, interp, processor):
-    """HAL pipeline using fused OpenGL draw_masks for benchmarking.
+    """HAL pipeline using OpenGL draw_masks for benchmarking.
 
     Returns elapsed_ms_dict (no visual output — uses HAL's built-in colors).
     """
@@ -529,14 +551,14 @@ def run_hal_pipeline_bench(image_path, metadata, interp, processor):
     timings["letterbox"] = (time.perf_counter() - t0) * 1000
 
     t0 = time.perf_counter()
-    outputs = run_tflite(interp, input_data)
+    outputs = numpy_outputs_to_tensors(run_tflite(interp, input_data))
     timings["inference"] = (time.perf_counter() - t0) * 1000
 
     t0 = time.perf_counter()
     render_dst = Tensor.image(640, 640, PixelFormat.Rgba)
     processor.convert(dst_rgb, render_dst)
     decoder = Decoder(metadata, score_threshold=0.25, iou_threshold=0.45)
-    decoder.draw_masks(outputs, processor, render_dst)
+    processor.draw_masks(decoder, outputs, render_dst)
     timings["decode+render"] = (time.perf_counter() - t0) * 1000
 
     timings["total"] = sum(timings.values())
@@ -662,7 +684,7 @@ def main():
             for stage, times in all_t.items():
                 report(f"hal/{stage}", times)
 
-            # Benchmark HAL fused draw_masks (OpenGL)
+            # Benchmark HAL draw_masks (OpenGL)
             print("\n--- HAL Pipeline (fused OpenGL decode+render) ---")
             for _ in range(args.warmup):
                 run_hal_pipeline_bench(args.image, metadata, interp, hal_processor)

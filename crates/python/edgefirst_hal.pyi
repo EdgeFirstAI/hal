@@ -6,7 +6,6 @@ import sys
 
 """EdgeFirst HAL Python bindings."""
 
-
 class Nms(enum.Enum):
     """Non-Maximum Suppression mode for object detection.
 
@@ -16,7 +15,6 @@ class Nms(enum.Enum):
 
     ClassAgnostic: Nms
     ClassAware: Nms
-
 
 DetectionOutput = Tuple[
     npt.NDArray[np.float32], npt.NDArray[np.float32], npt.NDArray[np.uintp]
@@ -48,8 +46,6 @@ A tuple containing:
     (threshold at 128). For semantic segmentation models (e.g. ModelPack)
     ``C=num_classes`` — per-pixel class scores (use ``argmax`` over ``C``
     to get the class index).
-  - ``decode_masks()``: shape ``(H, W)`` at the requested output resolution.
-    Binary ``uint8`` where 255 = mask presence.
 """
 
 SegDetTrackedOutput = Tuple[
@@ -70,7 +66,6 @@ A tuple containing:
 - tracks: A list of TrackInfo objects containing tracking information for each detection.
 """
 
-
 class DecoderType(enum.Enum):
     """Decoder type — selects the post-processing algorithm family.
 
@@ -80,7 +75,6 @@ class DecoderType(enum.Enum):
 
     Ultralytics: DecoderType
     ModelPack: DecoderType
-
 
 class DecoderVersion(enum.Enum):
     """Decoder version for Ultralytics models.
@@ -100,7 +94,6 @@ class DecoderVersion(enum.Enum):
     """YOLO11 - anchor-free DFL decoder, requires external NMS."""
     Yolo26: DecoderVersion
     """YOLO26 - end-to-end model with embedded NMS (one-to-one matching heads)."""
-
 
 class DimName(enum.Enum):
     """Named dimension for model output tensors.
@@ -129,7 +122,6 @@ class DimName(enum.Enum):
     """Padding dimension."""
     BoxCoords: DimName
     """Box coordinate dimension (typically 4)."""
-
 
 class Output:
     """A model output configuration for programmatic decoder setup.
@@ -271,6 +263,21 @@ class Output:
         """
         ...
 
+    @staticmethod
+    def classes(
+        shape: Optional[List[int]] = None,
+        dshape: Optional[List[Tuple[DimName, int]]] = None,
+        decoder: DecoderType = DecoderType.Ultralytics,
+    ) -> Output:
+        """Create a classes output (class label indices for end-to-end split models).
+
+        Args:
+            shape: Anonymous integer dimensions (mutually exclusive with dshape).
+            dshape: Named dimensions (mutually exclusive with shape).
+            decoder: Decoder type (default: Ultralytics).
+        """
+        ...
+
     def with_quantization(self, scale: float, zero_point: int) -> Output:
         """Set quantization parameters for this output.
 
@@ -307,7 +314,6 @@ class Output:
             ValueError: If called on an unsupported output type.
         """
         ...
-
 
 class Decoder:
     def __init__(
@@ -402,260 +408,51 @@ class Decoder:
         """
         ...
 
-    def decode(self, model_output: List[np.ndarray], max_boxes=100) -> SegDetOutput:
+    def decode(self, model_output: List[Tensor], max_boxes: int = 100) -> SegDetOutput:
         """
-        Decode model outputs into detection and segmentation results. When giving quantized
-        tensors as input, the quantization parameters must be specified in the Decoder configuration.
+        Decode model outputs into detection and segmentation results.
 
-        The accepted integer types are `np.uint8`, `np.int8`, `np.uint16`, `np.int16`, `np.uint32`, and `np.int32`.
-        Integer types can be mixed and matched across the different model outputs.
-
-        The accepted floating point types are `np.float16`, `np.float32` and `np.float64`. All outputs must be
-        the same floating point type.
+        Accepts HAL Tensor objects directly from model inference. Quantization
+        parameters must be specified in the Decoder configuration when the
+        tensors contain quantized data.
 
         Masks are returned at prototype resolution as 3D arrays of shape
         ``(H, W, C)``. For instance segmentation models (e.g. YOLO) ``C=1``
-        — a binary per-instance mask (threshold at 128). For semantic
-        segmentation models (e.g. ModelPack) ``C=num_classes`` — per-pixel
-        class scores (use ``argmax`` over the last axis). Use
-        ``decode_masks()`` to get upsampled 2D binary masks.
+        -- a binary per-instance mask (threshold at 128). For semantic
+        segmentation models (e.g. ModelPack) ``C=num_classes`` -- per-pixel
+        class scores (use ``argmax`` over the last axis).
+
+        Args:
+            model_output: List of HAL Tensor objects from model inference.
+            max_boxes: Maximum number of detections to return (default: 100).
         """
         ...
 
     def decode_tracked(
-            self, tracker: ByteTrack, timestamp_ns: int, model_output: List[np.ndarray],
-            max_boxes: int = 100) -> SegDetTrackedOutput:
+        self,
+        tracker: ByteTrack,
+        timestamp: int,
+        model_output: List[Tensor],
+        max_boxes: int = 100,
+    ) -> SegDetTrackedOutput:
         """
-        Decode model outputs into detection and segmentation results with tracking. When giving quantized
-        tensors as input, the quantization parameters must be specified in the Decoder configuration.
+        Decode model outputs into detection and segmentation results with tracking.
 
-        The accepted integer types are `np.uint8`, `np.int8`, `np.uint16`, `np.int16`, `np.uint32`, and `np.int32`.
-        Integer types can be mixed and matched across the different model outputs.
-
-        The accepted floating point types are `np.float16`, `np.float32` and `np.float64`. All outputs must be
-        the same floating point type.
+        Accepts HAL Tensor objects directly from model inference. Quantization
+        parameters must be specified in the Decoder configuration when the
+        tensors contain quantized data.
 
         Masks are returned at prototype resolution as 3D arrays of shape
         ``(H, W, C)``. For instance segmentation models (e.g. YOLO) ``C=1``
-        — a binary per-instance mask (threshold at 128). For semantic
-        segmentation models (e.g. ModelPack) ``C=num_classes`` — per-pixel
-        class scores (use ``argmax`` over the last axis). Use
-        ``decode_masks()`` to get upsampled 2D binary masks.
-        """
-        ...
-
-    def draw_masks(
-        self,
-        model_output: List[np.ndarray],
-        processor: ImageProcessor,
-        dst: Tensor,
-        max_boxes: int = 100,
-    ) -> DetectionOutput:
-        """
-        Decode model outputs and draw colored masks directly onto the
-        destination image in a single fused call. This is the fastest path
-        for visualization — masks never leave Rust/GPU, eliminating the
-        Python round-trip overhead of ``decode()`` + ``processor.draw_masks()``.
-
-        For segmentation models, prototype data is passed directly to the
-        renderer which evaluates the mask at every output pixel. For
-        detection-only models, this falls back to the standard drawing path.
-
-        Returns ``(boxes, scores, classes)`` — no mask arrays are returned.
-        Use ``decode_masks()`` if you need the raw mask pixels.
+        -- a binary per-instance mask (threshold at 128). For semantic
+        segmentation models (e.g. ModelPack) ``C=num_classes`` -- per-pixel
+        class scores (use ``argmax`` over the last axis).
 
         Args:
-            model_output: List of model output tensors (same types as ``decode``).
-            processor: ImageProcessor instance for drawing.
-            dst: Destination image tensor to draw onto. Must be ``RGBA`` or
-                ``RGB`` for CPU backend, or ``RGBA``/``BGRA``/``RGB`` for
-                OpenGL backend.
+            tracker: ByteTrack tracker instance.
+            timestamp: Frame timestamp in nanoseconds.
+            model_output: List of HAL Tensor objects from model inference.
             max_boxes: Maximum number of detections to return (default: 100).
-
-        Raises:
-            RuntimeError: If ``dst`` format is unsupported by the active backend,
-                or if the ImageProcessor uses G2D (mask rendering not supported).
-        """
-        ...
-
-    def decode_masks(
-        self,
-        model_output: List[np.ndarray],
-        processor: ImageProcessor,
-        output_width: int = 640,
-        output_height: int = 640,
-        max_boxes: int = 100,
-    ) -> SegDetOutput:
-        """
-        Decode model outputs and return per-detection binary masks.
-
-        Internally uses GPU atlas rendering when available (OpenGL), then
-        splits the atlas into individual per-detection mask arrays. Each mask
-        is a binary ``uint8`` array of shape ``(bbox_h, bbox_w)`` covering
-        the detection's bounding box region, where ``255`` = mask presence
-        and ``0`` = background. Threshold at ``> 127`` for boolean masks.
-
-        Use this method when you need the raw mask pixels for downstream
-        processing (tracking, area measurement, custom compositing). For
-        direct overlay onto a display frame, prefer ``draw_masks()`` which
-        avoids the Python round-trip.
-
-        Args:
-            model_output: List of model output tensors (same types as ``decode``).
-            processor: ImageProcessor instance for GPU-accelerated mask rendering.
-            output_width: Coordinate-space width for bounding box interpretation
-                (default: 640). This is **not** the per-mask array width — each
-                returned mask is sized to its detection's bounding box.
-            output_height: Coordinate-space height for bounding box interpretation
-                (default: 640). Typically matches the model input resolution.
-            max_boxes: Maximum number of detections to return (default: 100).
-
-        Returns:
-            ``(boxes, scores, classes, masks)`` where masks is a list of
-            ``ndarray[bbox_h, bbox_w]`` of ``uint8`` — one per detection.
-
-        Raises:
-            RuntimeError: If the ImageProcessor uses G2D (mask rendering not
-                supported on G2D). Use an OpenGL or CPU processor instead.
-        """
-        ...
-
-    @staticmethod
-    def decode_yolo_det(
-        model_output: Union[
-            npt.NDArray[np.uint8],
-            npt.NDArray[np.int8],
-            npt.NDArray[np.float32],
-            npt.NDArray[np.float64],
-        ],
-        quant_boxes: Tuple[float, int] = (1.0, 0),
-        score_threshold: float = 0.1,
-        iou_threshold: float = 0.7,
-        nms: Optional[Nms] = Nms.ClassAgnostic,
-        max_boxes: int = 100,
-    ) -> DetectionOutput:
-        """
-        Decode YOLO outputs into detection results. When giving float tensors as input, the quantization
-        parameters will be ignored.
-
-        The accepted types are `np.uint8`, `np.int8`, `np.float32` and `np.float64`. All outputs must be
-        the same type.
-
-        Args:
-            model_output: YOLO model output tensor.
-            quant_boxes: Quantization parameters (scale, zero_point) for boxes.
-            score_threshold: Minimum confidence score for detections.
-            iou_threshold: IoU threshold for non-maximum suppression.
-            nms: NMS mode - Nms.ClassAgnostic (default), Nms.ClassAware, or None to bypass NMS.
-            max_boxes: Maximum number of boxes to return.
-        """
-        ...
-
-    @staticmethod
-    def decode_yolo_segdet(
-        boxes: Union[
-            npt.NDArray[np.uint8], npt.NDArray[np.int8], npt.NDArray[np.float32]
-        ],
-        protos: Union[
-            npt.NDArray[np.uint8], npt.NDArray[np.int8], npt.NDArray[np.float32]
-        ],
-        quant_boxes: Tuple[float, int] = (1.0, 0),
-        quant_protos: Tuple[float, int] = (1.0, 0),
-        score_threshold: float = 0.1,
-        iou_threshold: float = 0.7,
-        nms: Optional[Nms] = Nms.ClassAgnostic,
-        max_boxes: int = 100,
-    ) -> SegDetOutput:
-        """
-        Decode YOLO outputs into detection segmentation results. When giving float tensors as input, the quantization
-        parameters will be ignored.
-
-        The accepted types are `np.uint8`, `np.int8`, `np.float32` and `np.float64`. All outputs must be
-        the same type.
-
-        Args:
-            boxes: YOLO box output tensor.
-            protos: YOLO proto output tensor.
-            quant_boxes: Quantization parameters (scale, zero_point) for boxes.
-            quant_protos: Quantization parameters (scale, zero_point) for protos.
-            score_threshold: Minimum confidence score for detections.
-            iou_threshold: IoU threshold for non-maximum suppression.
-            nms: NMS mode - Nms.ClassAgnostic (default), Nms.ClassAware, or None to bypass NMS.
-            max_boxes: Maximum number of boxes to return.
-        """
-        ...
-
-    @staticmethod
-    def decode_modelpack_det(
-        boxes: Union[
-            npt.NDArray[np.uint8], npt.NDArray[np.int8], npt.NDArray[np.float32]
-        ],
-        scores: Union[
-            npt.NDArray[np.uint8], npt.NDArray[np.int8], npt.NDArray[np.float32]
-        ],
-        quant_boxes: Tuple[float, int] = (1.0, 0),
-        quant_scores: Tuple[float, int] = (1.0, 0),
-        score_threshold: float = 0.1,
-        iou_threshold: float = 0.7,
-        max_boxes: int = 100,
-    ) -> DetectionOutput:
-        """
-        Decode ModelPack outputs into detection results. When giving float tensors as input, the quantization
-        parameters will be ignored.
-
-        The accepted types are `np.uint8`, `np.int8`, `np.float32` and `np.float64`. All outputs must be
-        the same type.
-        """
-        ...
-
-    @staticmethod
-    def decode_modelpack_det_split(
-        boxes: List[
-            Union[npt.NDArray[np.uint8], npt.NDArray[np.int8], npt.NDArray[np.float32]]
-        ],
-        anchors: List[List[List[float]]],
-        quant: List[Tuple[float, int]] = [],
-        score_threshold: float = 0.1,
-        iou_threshold: float = 0.7,
-        max_boxes: int = 100,
-    ) -> DetectionOutput:
-        """
-        Decode ModelPack outputs into detection results. When giving float tensors as input, the quantization
-        parameters will be ignored.
-
-        The accepted types are `np.uint8`, `np.int8`, `np.float32` and `np.float64`. All outputs must be
-        the same type.
-        """
-        ...
-
-    @staticmethod
-    def dequantize(
-        quantized: Union[
-            npt.NDArray[np.uint8],
-            npt.NDArray[np.int8],
-            npt.NDArray[np.uint16],
-            npt.NDArray[np.int16],
-            npt.NDArray[np.uint32],
-            npt.NDArray[np.int32],
-        ],
-        quant_boxes: Tuple[float, int],
-        dequant_into: Union[npt.NDArray[np.float32], npt.NDArray[np.float64]],
-    ) -> None:
-        """
-        Dequantize a quantized tensor into a floating point tensor.
-        The destination tensor must have the same shape as the input tensor.
-        """
-        ...
-
-    @staticmethod
-    def segmentation_to_mask(
-        segmentation: npt.NDArray[np.uint8],
-    ) -> npt.NDArray[np.uint8]:
-        """
-        Converts a 3D segmentation tensor into a 2D mask.
-
-        Raises:
-            ValueError: If the segmentation tensor has an invalid shape.
         """
         ...
 
@@ -669,7 +466,6 @@ class Decoder:
 
     @score_threshold.setter
     def score_threshold(self, value: float): ...
-
     @property
     def iou_threshold(self) -> float:
         """
@@ -680,7 +476,6 @@ class Decoder:
 
     @iou_threshold.setter
     def iou_threshold(self, value: float): ...
-
     @property
     def nms(self) -> Optional[Nms]:
         """
@@ -696,7 +491,6 @@ class Decoder:
         Returns True if normalized, False if pixel coordinates, or None if unknown.
         """
         ...
-
 
 class TensorMemory(enum.Enum):
     if sys.platform == "linux":
@@ -718,7 +512,6 @@ class TensorMemory(enum.Enum):
     """
     MEM: TensorMemory
     """Regular system memory allocation"""
-
 
 class Tensor:
     if sys.platform == "linux":
@@ -1004,7 +797,6 @@ class Tensor:
         """Whether this image uses a planar pixel layout."""
         ...
 
-
 class TensorMap:
     def unmap(self) -> None: ...
     def view(self) -> memoryview: ...
@@ -1016,7 +808,6 @@ class TensorMap:
     def __releasebuffer__(self, view) -> None: ...
     def __enter__(self) -> TensorMap: ...
     def __exit__(self, _exc_type, _exc_value, _traceback) -> None: ...
-
 
 class PixelFormat(enum.Enum):
     """Pixel format for image tensors."""
@@ -1055,7 +846,6 @@ class PixelFormat(enum.Enum):
     def __init__(self, name: str) -> None:
         """Create a PixelFormat from a string name (e.g. 'RGBA', 'NV12', 'GREY')."""
         ...
-
 
 class Normalization(enum.Enum):
     DEFAULT: Normalization
@@ -1100,7 +890,6 @@ class Normalization(enum.Enum):
     | `np.float64` | value             |
     """
 
-
 class Flip(enum.Enum):
     NoFlip: Flip
     """No flip"""
@@ -1108,7 +897,6 @@ class Flip(enum.Enum):
     """Flip the image horizontally"""
     Vertical: Flip
     """Flip the image vertically"""
-
 
 class Rotation(enum.Enum):
     Rotate0: Rotation
@@ -1128,7 +916,6 @@ class Rotation(enum.Enum):
         """Get the Rotation enum variant corresponding to the specified angle in degrees clockwise. Valid angles are 0, 90, 180, and 270."""
         ...
 
-
 class Rect:
     """A crop rectangle defined by its top-left corner (left, top) and its dimensions (width, height)."""
 
@@ -1141,7 +928,6 @@ class Rect:
     def width(self) -> int: ...
     @property
     def height(self) -> int: ...
-
 
 class EglDisplayKind:
     """Identifies the type of EGL display used for headless OpenGL ES rendering.
@@ -1164,7 +950,6 @@ class EglDisplayKind:
     PlatformDevice: EglDisplayKind
     Default: EglDisplayKind
 
-
 class EglDisplayInfo:
     """A validated, available EGL display discovered by probe_egl_displays()."""
 
@@ -1177,7 +962,6 @@ class EglDisplayInfo:
     def description(self) -> str:
         """Human-readable description for logging/diagnostics."""
         ...
-
 
 def probe_egl_displays() -> list[EglDisplayInfo]:
     """Probe for available EGL displays supporting headless OpenGL ES 3.0.
@@ -1192,7 +976,6 @@ def probe_egl_displays() -> list[EglDisplayInfo]:
     """
     ...
 
-
 class ImageProcessor:
     """Convert images between different formats, with optional rotation, flipping, and cropping."""
 
@@ -1206,19 +989,21 @@ class ImageProcessor:
         """
         ...
 
-    def draw_masks(
+    def draw_decoded_masks(
         self,
         dst: Tensor,
         bbox: npt.NDArray[np.float32],
         scores: npt.NDArray[np.float32],
         classes: npt.NDArray[np.uintp],
         seg: List[npt.NDArray[np.uint8]] = [],
+        background: Optional[Tensor] = None,
+        opacity: float = 1.0,
     ) -> None:
         """
         Draw detection boxes and optional segmentation masks onto ``dst``.
 
         This method draws pre-decoded results. For the fused decode+draw path
-        (recommended for most use cases), use ``Decoder.draw_masks()`` instead.
+        (recommended for most use cases), use ``draw_masks()`` instead.
 
         Args:
             dst: Destination image. Must be ``RGBA`` or ``RGB`` for CPU backend,
@@ -1232,11 +1017,74 @@ class ImageProcessor:
                 segmentation, e.g. YOLO), one mask per detection is expected
                 (``len(seg) <= len(bbox)``). When ``C > 1`` (semantic
                 segmentation, e.g. ModelPack), a single mask covers all classes.
+            background: Optional tensor to use as the compositing base instead
+                of ``dst``'s existing content. Must have the same dimensions
+                and format as ``dst``.
+            opacity: Scales the alpha of rendered mask and box colors.
+                ``1.0`` (default) preserves the class color's alpha unchanged;
+                ``0.5`` makes overlays semi-transparent. Clamped to [0, 1].
 
         Raises:
             RuntimeError: If ``dst`` format is unsupported by the active backend.
             ValueError: If ``bbox``, ``scores``, ``classes`` lengths do not match,
                 or if ``bbox`` shape is not ``(N, 4)``.
+        """
+        ...
+
+    def draw_masks(
+        self,
+        decoder: Decoder,
+        model_output: List[Tensor],
+        dst: Tensor,
+        tracker: Optional[ByteTrack] = None,
+        timestamp: Optional[int] = None,
+        background: Optional[Tensor] = None,
+        opacity: float = 1.0,
+    ) -> Union[
+        DetectionOutput,
+        Tuple[
+            npt.NDArray[np.float32],
+            npt.NDArray[np.float32],
+            npt.NDArray[np.uintp],
+            List[TrackInfo],
+        ],
+    ]:
+        """
+        Decode model outputs and draw colored masks directly onto the
+        destination image in a single fused call. This is the fastest path
+        for visualization -- masks never leave Rust/GPU, eliminating the
+        Python round-trip overhead of ``decode()`` + ``draw_decoded_masks()``.
+
+        For segmentation models, prototype data is passed directly to the
+        renderer which evaluates the mask at every output pixel. For
+        detection-only models, this falls back to the standard drawing path.
+
+        When ``tracker`` is provided, object tracking is performed and the
+        return value includes a ``tracks`` list:
+        ``(boxes, scores, classes, tracks)``. If ``timestamp`` is omitted,
+        the current system time in nanoseconds is used.
+
+        Without a tracker the return value is ``(boxes, scores, classes)``.
+
+        Args:
+            decoder: Decoder instance for interpreting model outputs.
+            model_output: List of HAL Tensor objects from model inference.
+            dst: Destination image tensor to draw onto. Must be ``RGBA`` or
+                ``RGB`` for CPU backend, or ``RGBA``/``BGRA``/``RGB`` for
+                OpenGL backend.
+            tracker: Optional ByteTrack tracker for object tracking.
+            timestamp: Optional frame timestamp in nanoseconds. Only used
+                when ``tracker`` is provided. Defaults to current system time.
+            background: Optional tensor to use as the compositing base instead
+                of ``dst``'s existing content. Must have the same dimensions
+                and format as ``dst``.
+            opacity: Scales the alpha of rendered mask and box colors.
+                ``1.0`` (default) preserves the class color's alpha unchanged;
+                ``0.5`` makes overlays semi-transparent. Clamped to [0, 1].
+
+        Raises:
+            RuntimeError: If ``dst`` format is unsupported by the active backend,
+                or if the ImageProcessor uses G2D (mask rendering not supported).
         """
         ...
 
@@ -1352,14 +1200,15 @@ class ImageProcessor:
             mode: Interpolation mode string.
         """
 
-
 class TrackInfo:
-    def __init__(self,
-                 uuid: str,
-                 tracked_location: Tuple[float, float, float, float],
-                 count: int,
-                 created: int,
-                 last_updated: int) -> None:
+    def __init__(
+        self,
+        uuid: str,
+        tracked_location: Tuple[float, float, float, float],
+        count: int,
+        created: int,
+        last_updated: int,
+    ) -> None:
         """Information about a single tracked object."""
         ...
 
@@ -1388,14 +1237,14 @@ class TrackInfo:
         """The timestamp (in nanoseconds) when the track was last updated."""
         ...
 
-
-
 class ActiveTrackInfo:
-    def __init__(self,
-                 info: TrackInfo,
-                 bbox: Tuple[float, float, float, float],
-                 score: float,
-                 label: int) -> None:
+    def __init__(
+        self,
+        info: TrackInfo,
+        bbox: Tuple[float, float, float, float],
+        score: float,
+        label: int,
+    ) -> None:
         """Information about an actively tracked object."""
         ...
 
@@ -1409,9 +1258,10 @@ class ActiveTrackInfo:
         """The last bounding box, score, and class ID of the tracked object."""
         ...
 
-
 class ByteTrack:
-    def __init__(self, high_conf=0.7, iou=0.25, update=0.25, lifespan_ns=500_000_000) -> None:
+    def __init__(
+        self, high_conf=0.7, iou=0.25, update=0.25, lifespan_ns=500_000_000
+    ) -> None:
         """Create a new ByteTrack tracker."""
         ...
 

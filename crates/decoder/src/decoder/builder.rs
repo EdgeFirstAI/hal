@@ -890,12 +890,25 @@ impl DecoderBuilder {
         }
 
         if let Some(boxes) = boxes {
-            if let Some(protos) = protos {
-                Self::verify_yolo_seg_det(&boxes, &protos)?;
-                Ok(ModelType::YoloSegDet { boxes, protos })
-            } else {
-                Self::verify_yolo_det(&boxes)?;
-                Ok(ModelType::YoloDet { boxes })
+            match (split_mask_coeff, protos) {
+                (Some(mask_coeff), Some(protos)) => {
+                    // 2-way split: combined detection + separate mask_coeff + protos
+                    Self::verify_yolo_seg_det_2way(&boxes, &mask_coeff, &protos)?;
+                    Ok(ModelType::YoloSegDet2Way {
+                        boxes,
+                        mask_coeff,
+                        protos,
+                    })
+                }
+                (_, Some(protos)) => {
+                    // Unsplit: mask_coefs embedded in detection tensor
+                    Self::verify_yolo_seg_det(&boxes, &protos)?;
+                    Ok(ModelType::YoloSegDet { boxes, protos })
+                }
+                _ => {
+                    Self::verify_yolo_det(&boxes)?;
+                    Ok(ModelType::YoloDet { boxes })
+                }
             }
         } else if let (Some(boxes), Some(scores)) = (split_boxes, split_scores) {
             if let (Some(mask_coeff), Some(protos)) = (split_mask_coeff, protos) {
@@ -1013,6 +1026,100 @@ impl DecoderBuilder {
             return Err(DecoderError::InvalidConfig(
                 "Yolo Segmentation Detection has zero classes".to_string(),
             ));
+        }
+
+        Ok(())
+    }
+
+    fn verify_yolo_seg_det_2way(
+        detection: &configs::Detection,
+        mask_coeff: &configs::MaskCoefficients,
+        protos: &configs::Protos,
+    ) -> Result<(), DecoderError> {
+        if detection.shape.len() != 3 {
+            return Err(DecoderError::InvalidConfig(format!(
+                "Invalid Yolo 2-Way Detection shape {:?}",
+                detection.shape
+            )));
+        }
+        if mask_coeff.shape.len() != 3 {
+            return Err(DecoderError::InvalidConfig(format!(
+                "Invalid Yolo 2-Way Mask Coefficients shape {:?}",
+                mask_coeff.shape
+            )));
+        }
+        if protos.shape.len() != 4 {
+            return Err(DecoderError::InvalidConfig(format!(
+                "Invalid Yolo 2-Way Protos shape {:?}",
+                protos.shape
+            )));
+        }
+
+        Self::verify_dshapes(
+            &detection.dshape,
+            &detection.shape,
+            "Detection",
+            &[DimName::Batch, DimName::NumFeatures, DimName::NumBoxes],
+        )?;
+        Self::verify_dshapes(
+            &mask_coeff.dshape,
+            &mask_coeff.shape,
+            "Mask Coefficients",
+            &[DimName::Batch, DimName::NumProtos, DimName::NumBoxes],
+        )?;
+        Self::verify_dshapes(
+            &protos.dshape,
+            &protos.shape,
+            "Protos",
+            &[
+                DimName::Batch,
+                DimName::Height,
+                DimName::Width,
+                DimName::NumProtos,
+            ],
+        )?;
+
+        // Validate num_boxes match between detection and mask_coeff
+        let det_num = Self::get_box_count(&detection.dshape).unwrap_or(detection.shape[2]);
+        let mask_num = Self::get_box_count(&mask_coeff.dshape).unwrap_or(mask_coeff.shape[2]);
+        if det_num != mask_num {
+            return Err(DecoderError::InvalidConfig(format!(
+                "Yolo 2-Way Detection num_boxes {} incompatible with Mask Coefficients num_boxes {}",
+                det_num, mask_num
+            )));
+        }
+
+        // Validate mask_coeff channels match protos channels
+        let mask_channels = if !mask_coeff.dshape.is_empty() {
+            Self::get_protos_count(&mask_coeff.dshape).ok_or_else(|| {
+                DecoderError::InvalidConfig(
+                    "Could not find num_protos in mask_coeff config".to_string(),
+                )
+            })?
+        } else {
+            mask_coeff.shape[1]
+        };
+        let proto_channels = if !protos.dshape.is_empty() {
+            Self::get_protos_count(&protos.dshape).ok_or_else(|| {
+                DecoderError::InvalidConfig(
+                    "Could not find num_protos in protos config".to_string(),
+                )
+            })?
+        } else {
+            protos.shape[1].min(protos.shape[3])
+        };
+        if mask_channels != proto_channels {
+            return Err(DecoderError::InvalidConfig(format!(
+                "Yolo 2-Way Protos channels {} incompatible with Mask Coefficients channels {}",
+                proto_channels, mask_channels
+            )));
+        }
+
+        // Validate detection has classes (nc+4 features, no mask_coefs embedded)
+        if !detection.dshape.is_empty() {
+            Self::get_class_count(&detection.dshape, None, None)?;
+        } else {
+            Self::get_class_count_no_dshape(detection.into(), None)?;
         }
 
         Ok(())

@@ -286,6 +286,7 @@ precision mediump sampler2DArray;
 uniform sampler2DArray tex;
 uniform vec4 colors[20];
 uniform int background_index;
+uniform float opacity;
 
 in vec3 fragPos;
 in vec2 tc;
@@ -326,7 +327,8 @@ void main() {
         discard;
     }
     max_ind = max_ind % 20;
-    color = colors[max_ind];
+    vec4 c = colors[max_ind];
+    color = vec4(c.rgb, c.a * opacity);
 }
 "
 }
@@ -338,6 +340,7 @@ precision mediump float;
 uniform sampler2D mask0;
 uniform vec4 colors[20];
 uniform int class_index;
+uniform float opacity;
 in vec3 fragPos;
 in vec2 tc;
 in vec4 fragColor;
@@ -349,7 +352,8 @@ void main() {
     if (arg == 0) {
         discard;
     }
-    color = colors[class_index % 20];
+    vec4 c = colors[class_index % 20];
+    color = vec4(c.rgb, c.a * opacity);
 }
 "
 }
@@ -365,6 +369,7 @@ uniform vec4 mask_coeff[8];        // 32 coefficients packed as 8 vec4s
 uniform vec4 colors[20];
 uniform int class_index;
 uniform int num_layers;
+uniform float opacity;
 
 in vec2 tc;
 out vec4 color;
@@ -377,7 +382,8 @@ void main() {
     }
     float mask = 1.0 / (1.0 + exp(-acc));  // sigmoid
     if (mask < 0.5) discard;
-    color = colors[class_index % 20];
+    vec4 c = colors[class_index % 20];
+    color = vec4(c.rgb, c.a * opacity);
 }
 "
 }
@@ -403,6 +409,7 @@ uniform int class_index;
 uniform int num_protos;
 uniform float proto_scale;
 uniform float proto_scaled_zp;      // -zero_point * scale
+uniform float opacity;
 
 in vec2 tc;
 out vec4 color;
@@ -420,7 +427,8 @@ void main() {
     }
     float mask = 1.0 / (1.0 + exp(-acc));
     if (mask < 0.5) discard;
-    color = colors[class_index % 20];
+    vec4 c = colors[class_index % 20];
+    color = vec4(c.rgb, c.a * opacity);
 }
 "
 }
@@ -445,6 +453,7 @@ uniform int class_index;
 uniform int num_protos;
 uniform float proto_scale;
 uniform float proto_scaled_zp;      // -zero_point * scale
+uniform float opacity;
 
 in vec2 tc;
 out vec4 color;
@@ -477,7 +486,8 @@ void main() {
     }
     float mask = 1.0 / (1.0 + exp(-acc));
     if (mask < 0.5) discard;
-    color = colors[class_index % 20];
+    vec4 c = colors[class_index % 20];
+    color = vec4(c.rgb, c.a * opacity);
 }
 "
 }
@@ -536,6 +546,7 @@ uniform vec4 mask_coeff[8];        // 32 coefficients packed as 8 vec4s
 uniform vec4 colors[20];
 uniform int class_index;
 uniform int num_protos;
+uniform float opacity;
 
 in vec2 tc;
 out vec4 color;
@@ -549,164 +560,8 @@ void main() {
     }
     float mask = 1.0 / (1.0 + exp(-acc));
     if (mask < 0.5) discard;
-    color = colors[class_index % 20];
-}
-"
-}
-
-/// Binary mask shader — int8, nearest-neighbor, logit threshold.
-///
-/// Outputs binary `acc > 0 ? 1.0 : 0.0` instead of `sigmoid(acc)`.  Avoids
-/// the `exp()` per fragment; used by `decode_masks_atlas` where only mask
-/// presence matters.
-pub(super) fn generate_proto_mask_logit_shader_int8_nearest() -> &'static str {
-    "\
-#version 300 es
-precision highp float;
-precision highp int;
-precision highp isampler2DArray;
-
-uniform isampler2DArray proto_tex;
-uniform vec4 mask_coeff[8];
-uniform int num_protos;
-uniform float proto_scale;
-uniform float coeff_sum_x_szp;
-
-in vec2 tc;
-out vec4 color;
-
-void main() {
-    ivec3 tex_size = textureSize(proto_tex, 0);
-    int ix = clamp(int(tc.x * float(tex_size.x)), 0, tex_size.x - 1);
-    int iy = clamp(int(tc.y * float(tex_size.y)), 0, tex_size.y - 1);
-
-    int groups = (num_protos + 3) / 4;
-    float acc = 0.0;
-    for (int i = 0; i < groups; i++) {
-        int base = i * 4;
-        vec4 raw = vec4(
-            float(texelFetch(proto_tex, ivec3(ix, iy, min(base, num_protos - 1)), 0).r),
-            float(texelFetch(proto_tex, ivec3(ix, iy, min(base + 1, num_protos - 1)), 0).r),
-            float(texelFetch(proto_tex, ivec3(ix, iy, min(base + 2, num_protos - 1)), 0).r),
-            float(texelFetch(proto_tex, ivec3(ix, iy, min(base + 3, num_protos - 1)), 0).r)
-        );
-        acc += dot(mask_coeff[i], raw);
-    }
-    float logit = acc * proto_scale + coeff_sum_x_szp;
-    float mask = logit > 0.0 ? 1.0 : 0.0;
-    color = vec4(mask, 0.0, 0.0, 1.0);
-}
-"
-}
-
-/// Binary mask shader — int8, shader-based bilinear interpolation, logit threshold.
-///
-/// Outputs binary `acc > 0 ? 1.0 : 0.0` instead of `sigmoid(acc)`.  Used by
-/// `decode_masks_atlas` for int8 models with bilinear interpolation.
-pub(super) fn generate_proto_mask_logit_shader_int8_bilinear() -> &'static str {
-    "\
-#version 300 es
-precision highp float;
-precision highp int;
-precision highp isampler2DArray;
-
-uniform isampler2DArray proto_tex;
-uniform vec4 mask_coeff[8];
-uniform int num_protos;
-uniform float proto_scale;
-uniform float coeff_sum_x_szp;
-
-in vec2 tc;
-out vec4 color;
-
-void main() {
-    ivec3 tex_size = textureSize(proto_tex, 0);
-    vec2 pos = tc * vec2(tex_size.xy) - 0.5;
-    vec2 f = fract(pos);
-    ivec2 p0 = ivec2(floor(pos));
-    ivec2 p1 = p0 + 1;
-    p0 = clamp(p0, ivec2(0), tex_size.xy - 1);
-    p1 = clamp(p1, ivec2(0), tex_size.xy - 1);
-
-    float w00 = (1.0 - f.x) * (1.0 - f.y);
-    float w10 = f.x * (1.0 - f.y);
-    float w01 = (1.0 - f.x) * f.y;
-    float w11 = f.x * f.y;
-
-    int groups = (num_protos + 3) / 4;
-    float acc = 0.0;
-    for (int i = 0; i < groups; i++) {
-        int base = i * 4;
-        int l0 = min(base, num_protos - 1);
-        int l1 = min(base + 1, num_protos - 1);
-        int l2 = min(base + 2, num_protos - 1);
-        int l3 = min(base + 3, num_protos - 1);
-        vec4 r00 = vec4(
-            float(texelFetch(proto_tex, ivec3(p0.x, p0.y, l0), 0).r),
-            float(texelFetch(proto_tex, ivec3(p0.x, p0.y, l1), 0).r),
-            float(texelFetch(proto_tex, ivec3(p0.x, p0.y, l2), 0).r),
-            float(texelFetch(proto_tex, ivec3(p0.x, p0.y, l3), 0).r)
-        );
-        vec4 r10 = vec4(
-            float(texelFetch(proto_tex, ivec3(p1.x, p0.y, l0), 0).r),
-            float(texelFetch(proto_tex, ivec3(p1.x, p0.y, l1), 0).r),
-            float(texelFetch(proto_tex, ivec3(p1.x, p0.y, l2), 0).r),
-            float(texelFetch(proto_tex, ivec3(p1.x, p0.y, l3), 0).r)
-        );
-        vec4 r01 = vec4(
-            float(texelFetch(proto_tex, ivec3(p0.x, p1.y, l0), 0).r),
-            float(texelFetch(proto_tex, ivec3(p0.x, p1.y, l1), 0).r),
-            float(texelFetch(proto_tex, ivec3(p0.x, p1.y, l2), 0).r),
-            float(texelFetch(proto_tex, ivec3(p0.x, p1.y, l3), 0).r)
-        );
-        vec4 r11 = vec4(
-            float(texelFetch(proto_tex, ivec3(p1.x, p1.y, l0), 0).r),
-            float(texelFetch(proto_tex, ivec3(p1.x, p1.y, l1), 0).r),
-            float(texelFetch(proto_tex, ivec3(p1.x, p1.y, l2), 0).r),
-            float(texelFetch(proto_tex, ivec3(p1.x, p1.y, l3), 0).r)
-        );
-        vec4 interp = r00 * w00 + r10 * w10 + r01 * w01 + r11 * w11;
-        acc += dot(mask_coeff[i], interp);
-    }
-    float logit = acc * proto_scale + coeff_sum_x_szp;
-    float mask = logit > 0.0 ? 1.0 : 0.0;
-    color = vec4(mask, 0.0, 0.0, 1.0);
-}
-"
-}
-
-/// Binary mask shader — f32 protos with hardware bilinear filtering, logit threshold.
-///
-/// Outputs binary `acc > 0 ? 1.0 : 0.0` instead of `sigmoid(acc)`.  Used by
-/// `decode_masks_atlas` for f32 models.
-pub(super) fn generate_proto_mask_logit_shader_f32() -> &'static str {
-    "\
-#version 300 es
-precision highp float;
-precision highp sampler2DArray;
-
-uniform sampler2DArray proto_tex;
-uniform vec4 mask_coeff[8];
-uniform int num_protos;
-
-in vec2 tc;
-out vec4 color;
-
-void main() {
-    int groups = (num_protos + 3) / 4;
-    float acc = 0.0;
-    for (int i = 0; i < groups; i++) {
-        int base = i * 4;
-        vec4 val = vec4(
-            texture(proto_tex, vec3(tc, float(min(base, num_protos - 1)))).r,
-            texture(proto_tex, vec3(tc, float(min(base + 1, num_protos - 1)))).r,
-            texture(proto_tex, vec3(tc, float(min(base + 2, num_protos - 1)))).r,
-            texture(proto_tex, vec3(tc, float(min(base + 3, num_protos - 1)))).r
-        );
-        acc += dot(mask_coeff[i], val);
-    }
-    float mask = acc > 0.0 ? 1.0 : 0.0;
-    color = vec4(mask, 0.0, 0.0, 1.0);
+    vec4 c = colors[class_index % 20];
+    color = vec4(c.rgb, c.a * opacity);
 }
 "
 }
@@ -717,11 +572,13 @@ pub(super) fn generate_color_shader() -> &'static str {
 precision mediump float;
 uniform vec4 colors[20];
 uniform int class_index;
+uniform float opacity;
 
 out vec4 color;
 void main() {
     int index = class_index % 20;
-    color = colors[index];
+    vec4 c = colors[index];
+    color = vec4(c.rgb, c.a * opacity);
 }
 "
 }
@@ -801,6 +658,53 @@ void main() {
         color = int8_bias(vec4(s0.g, s0.b, s1.r, s1.g));
     } else {
         color = int8_bias(vec4(s0.b, s1.r, s1.g, s1.b));
+    }
+}
+"
+}
+
+/// HWC → layer-first (CHW) repack compute shader for int8 protos.
+///
+/// Reads proto data from an SSBO in row-major HWC layout `(H, W, num_protos)`.
+/// Writes to a `GL_R32I` `GL_TEXTURE_2D_ARRAY` with one proto per layer via
+/// `imageStore`. Each workgroup thread handles one `(x, y)` position and
+/// writes all `num_protos` layers.
+///
+/// The SSBO stores raw `i8` bytes packed as `int[]` (4 bytes per element).
+/// The shader extracts individual bytes and sign-extends them.
+///
+/// Requires GLES 3.1+.
+pub(super) fn generate_proto_repack_compute_shader() -> &'static str {
+    "\
+#version 310 es
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer ProtoSSBO {
+    int packed_data[];
+};
+
+layout(r32i, binding = 0) writeonly uniform highp iimage2DArray dst_tex;
+
+uniform int width;
+uniform int height;
+uniform int num_protos;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+
+    if (x >= width || y >= height) return;
+
+    int base = (y * width + x) * num_protos;
+
+    for (int k = 0; k < num_protos; k++) {
+        int byte_offset = base + k;
+        int word_idx = byte_offset >> 2;
+        int byte_idx = byte_offset & 3;
+        int word = packed_data[word_idx];
+        int val = (word >> (byte_idx * 8)) & 0xFF;
+        if (val >= 128) val -= 256;
+        imageStore(dst_tex, ivec3(x, y, k), ivec4(val, 0, 0, 0));
     }
 }
 "

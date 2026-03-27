@@ -88,26 +88,18 @@ Note: Int8 variants (e.g. packed RGB int8, planar RGB int8) use `DType::I8` with
 
 Three rendering pipelines for YOLO instance segmentation masks:
 
-### Fused GPU Proto Path (`draw_masks_proto`)
+### Fused GPU Proto Path (`draw_proto_masks`)
 
 Computes `sigmoid(coefficients @ protos)` per-pixel in a fragment shader — no intermediate mask materialization. Preferred for real-time overlay.
 
 ```rust,ignore
 let (detections, proto_data) = decoder.decode_quantized_proto(&outputs)?;
-processor.draw_masks_proto(&mut frame, &detections, &proto_data)?;
+processor.draw_proto_masks(&mut frame, &detections, &proto_data)?;
 ```
 
 ### Hybrid CPU+GPU Path
 
 CPU materializes binary masks (`materialize_segmentations()`), then OpenGL overlays them. Auto-selected when both CPU and GL backends are available.
-
-### Atlas Decode Path (`decode_masks_atlas`)
-
-Renders all detection masks into a compact vertical strip atlas via GPU, reads back as uint8 arrays. Use when you need per-instance mask pixels for downstream processing.
-
-```rust,ignore
-let masks = processor.decode_masks_atlas(&detections, &proto_data, 640, 640)?;
-```
 
 ### Shader Variants
 

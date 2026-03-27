@@ -31,7 +31,7 @@ pip install edgefirst-hal
 #### Rust
 ```toml
 [dependencies]
-edgefirst-hal = "0.10"
+edgefirst-hal = "0.13"
 ```
 
 ### Basic Usage
@@ -46,9 +46,13 @@ converter = ef.ImageProcessor()
 output = converter.create_image(640, 640, ef.PixelFormat.Rgb)
 converter.convert(img, output)
 
-# Decode YOLO outputs
+# Decode YOLO outputs (outputs are ef.Tensor objects, not np.ndarray)
 decoder = ef.Decoder(config, 0.5, 0.45)
-boxes, scores, classes = decoder.decode([output0, output1])
+boxes, scores, classes, masks = decoder.decode([output0, output1])
+
+# Draw segmentation masks directly onto the destination image
+result = converter.create_image(640, 640, ef.PixelFormat.Rgb)
+converter.draw_masks(decoder, [output0, output1], result)
 ```
 
 #### Rust
@@ -605,13 +609,12 @@ output.normalize_to_numpy(output_array)
 
 ```python
 import edgefirst_hal
-import numpy as np
 
 # Create decoder from config dict or YAML
 decoder = edgefirst_hal.Decoder(config_dict, 0.5, 0.45)
 
-# Decode outputs (automatically handles quantization)
-boxes, scores, classes = decoder.decode([output0, output1])
+# Decode outputs (accepts List[Tensor]; automatically handles quantization)
+boxes, scores, classes, masks = decoder.decode([output0, output1])
 ```
 
 </details>
@@ -776,7 +779,7 @@ The HAL includes dedicated benchmark binaries for measuring performance across p
 | `tensor_benchmark` | `edgefirst-tensor` | Tensor allocation and map/unmap latency across buffer types (Heap, SHM, DMA) |
 | `image_benchmark` | `edgefirst-image` | Low-level image operations: crop, flip, rotate, resize, draw |
 | `pipeline_benchmark` | `edgefirst-image` | Letterbox pipeline and format conversion (camera→model input) |
-| `mask_benchmark` | `edgefirst-image` | Mask rendering: draw_masks, draw_masks_proto, decode_masks_atlas, hybrid path |
+| `mask_benchmark` | `edgefirst-image` | Mask rendering: draw_decoded_masks, draw_proto_masks, hybrid path |
 | `opencv_benchmark` | `edgefirst-image` | OpenCV baseline comparison for same operations |
 | `decoder_benchmark` | `edgefirst-decoder` | YOLO detection/segmentation post-processing, NMS, dequantization |
 
