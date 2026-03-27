@@ -226,6 +226,12 @@ mod gl_tests {
         }
     }
 
+    /// Returns true when running on an i.MX 95 board with Mali GPU.
+    ///
+    /// `/dev/neutron0` is used as a platform discriminator for i.MX 95 + Mali GPU,
+    /// not as a check for NPU functionality.  The Neutron-scenario tests exercise
+    /// large-offset DMA-BUF EGLImage imports that work on Mali but fail with
+    /// `EGL(BadAccess)` on Vivante (i.MX 8MP) — even without the NPU driver.
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn is_neutron_available() -> bool {
         *NEUTRON_AVAILABLE.get_or_init(|| std::path::Path::new("/dev/neutron0").exists())
@@ -1920,7 +1926,12 @@ mod gl_tests {
     //
     // These replicate the geometry of the EDGEAI-1192 bug (Neutron NPU
     // DMA-BUF at offset 3,450,400 in a 10 MB buffer) using standard
-    // dma_heap allocations so no NPU driver is needed.
+    // dma_heap allocations — no NPU driver required.
+    //
+    // The tests are gated on is_neutron_available() (/dev/neutron0) because
+    // the large-offset EGLImage import path works on Mali (i.MX 95) but
+    // fails with EGL(BadAccess) on Vivante (i.MX 8MP), confirmed by hardware
+    // testing.  The gate is a platform discriminator, not an NPU check.
     // ---------------------------------------------------------------
 
     /// Direct reproduction of the Neutron scenario: 640×640 RGB int8

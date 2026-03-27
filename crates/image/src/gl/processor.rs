@@ -3964,7 +3964,10 @@ impl GLProcessorST {
                     gls::gl::RENDERBUFFER,
                     egl_image_obj.egl_image.as_ptr(),
                 );
-                check_gl_error(function!(), line!())?;
+                if let Err(e) = check_gl_error(function!(), line!()) {
+                    gls::gl::DeleteRenderbuffers(1, &rbo);
+                    return Err(e);
+                }
             }
             Some(rbo)
         } else {
@@ -4099,7 +4102,10 @@ impl GLProcessorST {
                     gls::gl::RENDERBUFFER,
                     egl_image_obj.egl_image.as_ptr(),
                 );
-                check_gl_error(function!(), line!())?;
+                if let Err(e) = check_gl_error(function!(), line!()) {
+                    gls::gl::DeleteRenderbuffers(1, &rbo);
+                    return Err(e);
+                }
             }
             Some(rbo)
         } else {
