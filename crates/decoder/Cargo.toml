@@ -20,7 +20,6 @@ tracker = ["dep:edgefirst-tracker"]
 argminmax = { workspace = true }
 edgefirst-tensor = { workspace = true }
 edgefirst-tracker = { workspace = true, optional = true }
-env_logger = { workspace = true }
 fast-math = { workspace = true }
 log = { workspace = true }
 ndarray = { workspace = true }
@@ -33,6 +32,7 @@ serde_yaml = { workspace = true }
 
 [dev-dependencies]
 edgefirst-bench = { workspace = true }
+env_logger = { workspace = true }
 image = { workspace = true }
 rand = { workspace = true }
 rand_distr = { workspace = true }

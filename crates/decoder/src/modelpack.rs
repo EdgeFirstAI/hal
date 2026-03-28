@@ -153,8 +153,7 @@ pub fn decode_modelpack_split_float<D: AsPrimitive<f32>>(
 ///
 /// # Panics
 /// Panics if shapes don't match the expected dimensions.
-#[doc(hidden)]
-pub fn impl_modelpack_quant<
+pub(crate) fn impl_modelpack_quant<
     B: BBoxTypeTrait,
     BOX: PrimInt + AsPrimitive<f32> + Send + Sync,
     SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
@@ -170,7 +169,7 @@ pub fn impl_modelpack_quant<
     let (boxes_tensor, quant_boxes) = boxes;
     let (scores_tensor, quant_scores) = scores;
     let boxes = {
-        let score_threshold = quantize_score_threshold(score_threshold, quant_boxes);
+        let score_threshold = quantize_score_threshold(score_threshold, quant_scores);
         postprocess_boxes_quant::<B, _, _>(
             score_threshold,
             boxes_tensor,
@@ -194,8 +193,7 @@ pub fn impl_modelpack_quant<
 ///
 /// # Panics
 /// Panics if shapes don't match the expected dimensions.
-#[doc(hidden)]
-pub fn impl_modelpack_float<
+pub(crate) fn impl_modelpack_float<
     B: BBoxTypeTrait,
     BOX: Float + AsPrimitive<f32> + Send + Sync,
     SCORE: Float + AsPrimitive<f32> + Send + Sync,
@@ -226,8 +224,7 @@ pub fn impl_modelpack_float<
 ///
 /// # Panics
 /// Panics if shapes don't match the expected dimensions.
-#[doc(hidden)]
-pub fn impl_modelpack_split_quant<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
+pub(crate) fn impl_modelpack_split_quant<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
     outputs: &[ArrayView3<D>],
     configs: &[ModelPackDetectionConfig],
     score_threshold: f32,
@@ -257,8 +254,7 @@ pub fn impl_modelpack_split_quant<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
 ///
 /// # Panics
 /// Panics if shapes don't match the expected dimensions.
-#[doc(hidden)]
-pub fn impl_modelpack_split_float<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
+pub(crate) fn impl_modelpack_split_float<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
     outputs: &[ArrayView3<D>],
     configs: &[ModelPackDetectionConfig],
     score_threshold: f32,
@@ -282,8 +278,7 @@ pub fn impl_modelpack_split_float<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
 /// Post processes ModelPack split detection into detection boxes,
 /// filtering out any boxes below the score threshold. Returns the boxes and
 /// scores tensors. Boxes are in XYWH format.
-#[doc(hidden)]
-pub fn postprocess_modelpack_split_quant<T: AsPrimitive<f32>>(
+pub(crate) fn postprocess_modelpack_split_quant<T: AsPrimitive<f32>>(
     outputs: &[ArrayView3<T>],
     config: &[ModelPackDetectionConfig],
 ) -> (Array2<f32>, Array2<f32>) {
@@ -379,8 +374,7 @@ pub fn postprocess_modelpack_split_quant<T: AsPrimitive<f32>>(
 /// Post processes ModelPack split detection into detection boxes,
 /// filtering out any boxes below the score threshold. Returns the boxes and
 /// scores tensors. Boxes are in XYWH format.
-#[doc(hidden)]
-pub fn postprocess_modelpack_split_float<T: AsPrimitive<f32>>(
+pub(crate) fn postprocess_modelpack_split_float<T: AsPrimitive<f32>>(
     outputs: &[ArrayView3<T>],
     config: &[ModelPackDetectionConfig],
 ) -> (Array2<f32>, Array2<f32>) {
