@@ -25,7 +25,7 @@ use num_traits::Num;
 use edgefirst_bench::{run_bench, BenchSuite};
 
 const WARMUP: usize = 10;
-const ITERATIONS: usize = 200;
+const ITERATIONS: usize = 100;
 
 /// Size configs: [batch, height, width, channels]
 const SIZES: &[([usize; 4], &str)] = &[

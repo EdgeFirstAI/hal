@@ -17,7 +17,7 @@ use edgefirst_decoder::{
 use ndarray::s;
 
 const WARMUP: usize = 10;
-const ITERATIONS: usize = 200;
+const ITERATIONS: usize = 100;
 
 fn bench_yolo_quant(suite: &mut BenchSuite) {
     let score_threshold = 0.25;

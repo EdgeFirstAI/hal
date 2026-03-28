@@ -62,7 +62,7 @@ typedef void *hal_delegate_t;
 #define HAL_DMABUF_MAX_NDIM 8
 
 /**
- * Maximum length of a FourCC string in [`HalCameraAdaptorFormatInfo`].
+ * Maximum length of a FourCC string in hal_camera_adaptor_format_info.
  */
 #define HAL_FOURCC_MAX_LEN 8
 
@@ -790,9 +790,9 @@ typedef struct hal_camera_adaptor_format_info {
    */
   int output_channels;
   /**
-   * V4L2 FourCC string, NUL-terminated.
+   * V4L2 FourCC string, NUL-terminated (ASCII, at most 4 bytes + NUL).
    */
-  uint8_t fourcc[8];
+  char fourcc[HAL_FOURCC_MAX_LEN];
 } hal_camera_adaptor_format_info;
 
 /**

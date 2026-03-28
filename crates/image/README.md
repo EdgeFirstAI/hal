@@ -74,6 +74,7 @@ Note: Int8 variants (e.g. packed RGB int8, planar RGB int8) use `DType::I8` with
 
 - `opengl` (default) - Enable OpenGL backend on Linux
 - `decoder` (default) - Enable detection box rendering
+- `tracker` (optional) - Enable multi-object tracking support in `draw_masks_tracked()`. Requires `features = ["tracker"]` in your dependency declaration.
 
 ## Environment Variables
 
@@ -83,10 +84,56 @@ Note: Int8 variants (e.g. packed RGB int8, planar RGB int8) use `DType::I8` with
 - `EDGEFIRST_FORCE_BACKEND` — Force a single backend: `cpu`, `g2d`, or `opengl`. Disables fallback chain.
 - `EDGEFIRST_FORCE_TRANSFER` — Force GPU transfer method: `pbo` or `dmabuf`
 - `EDGEFIRST_TENSOR_FORCE_MEM` — Set to `1` to force heap memory (disables DMA/SHM)
+- `EDGEFIRST_OPENGL_RENDERSURFACE` — Set to `1` to use renderbuffer-backed EGLImages for DMA destinations. Required on i.MX 95 / Mali-G310 with Neutron NPU DMA-BUF destinations. Defaults to `0` (texture path).
+- `EDGEFIRST_PROTO_COMPUTE` — Set to `1` to enable the experimental GLES 3.1 compute shader path for proto repack. Requires GLES 3.1 hardware support.
 
 ## Segmentation Mask Rendering
 
 Three rendering pipelines for YOLO instance segmentation masks:
+
+### MaskOverlay
+
+`MaskOverlay` controls how segmentation masks are composited onto the destination image:
+
+```rust,ignore
+use edgefirst_image::MaskOverlay;
+
+// Default: no background replacement, full opacity
+let overlay = MaskOverlay::default();
+
+// With a background image and 50% transparent masks
+let overlay = MaskOverlay { background: Some(&bg_tensor), opacity: 0.5 };
+```
+
+Fields:
+- `background: Option<&TensorDyn>` — Optional tensor to blit into `dst` before drawing masks. Must match `dst`'s shape. `None` keeps the existing `dst` content.
+- `opacity: f32` — Scales mask alpha in the range `0.0` (invisible) to `1.0` (fully opaque, default).
+
+### draw_masks()
+
+Convenience method that decodes model outputs, runs NMS, and draws segmentation masks in a single call:
+
+```rust,ignore
+let boxes = processor.draw_masks(&decoder, &outputs, &mut frame, MaskOverlay::default())?;
+```
+
+### draw_masks_tracked()
+
+Like `draw_masks()` but integrates a `Tracker` for maintaining object identities across frames. The tracker runs after NMS but before mask extraction. Requires the `tracker` feature flag.
+
+```rust,ignore
+#[cfg(feature = "tracker")]
+let (boxes, tracks) = processor.draw_masks_tracked(
+    &decoder,
+    &mut tracker,
+    timestamp_ns,
+    &outputs,
+    &mut frame,
+    MaskOverlay::default(),
+)?;
+```
+
+Returns `(Vec<DetectBox>, Vec<TrackInfo>)`.
 
 ### Fused GPU Proto Path (`draw_proto_masks`)
 

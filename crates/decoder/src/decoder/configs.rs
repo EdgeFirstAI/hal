@@ -363,21 +363,3 @@ pub enum ModelType {
         protos: Protos,
     },
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DataType {
-    Raw = 0,
-    Int8 = 1,
-    UInt8 = 2,
-    Int16 = 3,
-    UInt16 = 4,
-    Float16 = 5,
-    Int32 = 6,
-    UInt32 = 7,
-    Float32 = 8,
-    Int64 = 9,
-    UInt64 = 10,
-    Float64 = 11,
-    String = 12,
-}

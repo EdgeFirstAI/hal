@@ -30,7 +30,7 @@ use edgefirst_tensor::{DType, PixelFormat};
 use ndarray::s;
 
 const WARMUP: usize = 10;
-const ITERATIONS: usize = 200;
+const ITERATIONS: usize = 100;
 
 // Quantization parameters from the YOLOv8 segmentation test model.
 const QUANT_BOXES: Quantization = Quantization {
