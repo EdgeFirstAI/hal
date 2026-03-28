@@ -586,7 +586,7 @@ pub(crate) fn postprocess_yolo_split_end_to_end_segdet<
 ///
 /// Expected shapes of inputs:
 /// - output: (4 + num_classes, num_boxes)
-pub fn impl_yolo_quant<B: BBoxTypeTrait, T: PrimInt + AsPrimitive<f32> + Send + Sync>(
+pub(crate) fn impl_yolo_quant<B: BBoxTypeTrait, T: PrimInt + AsPrimitive<f32> + Send + Sync>(
     output: (ArrayView2<T>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
@@ -620,7 +620,7 @@ pub fn impl_yolo_quant<B: BBoxTypeTrait, T: PrimInt + AsPrimitive<f32> + Send + 
 ///
 /// Expected shapes of inputs:
 /// - output: (4 + num_classes, num_boxes)
-pub fn impl_yolo_float<B: BBoxTypeTrait, T: Float + AsPrimitive<f32> + Send + Sync>(
+pub(crate) fn impl_yolo_float<B: BBoxTypeTrait, T: Float + AsPrimitive<f32> + Send + Sync>(
     output: ArrayView2<T>,
     score_threshold: f32,
     iou_threshold: f32,
@@ -649,7 +649,7 @@ pub fn impl_yolo_float<B: BBoxTypeTrait, T: Float + AsPrimitive<f32> + Send + Sy
 ///
 /// # Panics
 /// Panics if shapes don't match the expected dimensions.
-pub fn impl_yolo_split_quant<
+pub(crate) fn impl_yolo_split_quant<
     B: BBoxTypeTrait,
     BOX: PrimInt + AsPrimitive<f32> + Send + Sync,
     SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
@@ -695,7 +695,7 @@ pub fn impl_yolo_split_quant<
 ///
 /// # Panics
 /// Panics if shapes don't match the expected dimensions.
-pub fn impl_yolo_split_float<
+pub(crate) fn impl_yolo_split_float<
     B: BBoxTypeTrait,
     BOX: Float + AsPrimitive<f32> + Send + Sync,
     SCORE: Float + AsPrimitive<f32> + Send + Sync,
@@ -730,7 +730,7 @@ pub fn impl_yolo_split_float<
 ///
 /// # Errors
 /// Returns `DecoderError::InvalidShape` if bounding boxes are not normalized.
-pub fn impl_yolo_segdet_quant<
+pub(crate) fn impl_yolo_segdet_quant<
     B: BBoxTypeTrait,
     BOX: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
     PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
@@ -777,7 +777,7 @@ where
 ///
 /// # Panics
 /// Panics if shapes don't match the expected dimensions.
-pub fn impl_yolo_segdet_float<
+pub(crate) fn impl_yolo_segdet_float<
     B: BBoxTypeTrait,
     BOX: Float + AsPrimitive<f32> + Send + Sync,
     PROTO: Float + AsPrimitive<f32> + Send + Sync,
@@ -795,7 +795,7 @@ where
 {
     let num_protos = protos.dim().2;
     let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&boxes, num_protos);
-    let boxes = impl_yolo_segdet_get_boxes::<XYWH, _, _>(
+    let boxes = impl_yolo_segdet_get_boxes::<B, _, _>(
         boxes_tensor,
         scores_tensor,
         score_threshold,
@@ -958,7 +958,7 @@ pub(crate) fn impl_yolo_split_segdet_quant_process_masks<
 ///
 /// # Errors
 /// Returns `DecoderError::InvalidShape` if bounding boxes are not normalized.
-pub fn impl_yolo_split_segdet_quant<
+pub(crate) fn impl_yolo_split_segdet_quant<
     B: BBoxTypeTrait,
     BOX: PrimInt + AsPrimitive<f32> + Send + Sync,
     SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
@@ -1014,7 +1014,7 @@ where
 ///
 /// # Errors
 /// Returns `DecoderError::InvalidShape` if bounding boxes are not normalized.
-pub fn impl_yolo_split_segdet_float<
+pub(crate) fn impl_yolo_split_segdet_float<
     B: BBoxTypeTrait,
     BOX: Float + AsPrimitive<f32> + Send + Sync,
     SCORE: Float + AsPrimitive<f32> + Send + Sync,
@@ -1037,7 +1037,7 @@ where
     let (boxes_tensor, scores_tensor, mask_tensor) =
         postprocess_yolo_split_segdet(boxes_tensor, scores_tensor, mask_tensor);
 
-    let boxes = impl_yolo_segdet_get_boxes::<XYWH, _, _>(
+    let boxes = impl_yolo_segdet_get_boxes::<B, _, _>(
         boxes_tensor,
         scores_tensor,
         score_threshold,
@@ -1102,7 +1102,7 @@ where
 
 /// Proto-extraction variant of `impl_yolo_segdet_float`.
 /// Runs NMS but returns raw `ProtoData` instead of materialized masks.
-pub fn impl_yolo_segdet_float_proto<
+pub(crate) fn impl_yolo_segdet_float_proto<
     B: BBoxTypeTrait,
     BOX: Float + AsPrimitive<f32> + Send + Sync,
     PROTO: Float + AsPrimitive<f32> + Send + Sync,
@@ -1120,7 +1120,7 @@ where
     let num_protos = protos.dim().2;
     let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&boxes, num_protos);
 
-    let boxes = impl_yolo_segdet_get_boxes::<XYWH, _, _>(
+    let boxes = impl_yolo_segdet_get_boxes::<B, _, _>(
         boxes_tensor,
         scores_tensor,
         score_threshold,
@@ -1132,61 +1132,10 @@ where
     extract_proto_data_float(boxes, mask_tensor, protos, output_boxes)
 }
 
-/// Proto-extraction variant of `impl_yolo_split_segdet_quant`.
-/// Runs NMS but returns raw `ProtoData` instead of materialized masks.
-#[allow(clippy::too_many_arguments)]
-pub fn impl_yolo_split_segdet_quant_proto<
-    B: BBoxTypeTrait,
-    BOX: PrimInt + AsPrimitive<f32> + Send + Sync,
-    SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
-    MASK: PrimInt + AsPrimitive<f32> + Send + Sync,
-    PROTO: PrimInt + AsPrimitive<f32> + AsPrimitive<i8> + Send + Sync,
->(
-    boxes: (ArrayView2<BOX>, Quantization),
-    scores: (ArrayView2<SCORE>, Quantization),
-    mask_coeff: (ArrayView2<MASK>, Quantization),
-    protos: (ArrayView3<PROTO>, Quantization),
-    score_threshold: f32,
-    iou_threshold: f32,
-    nms: Option<Nms>,
-    output_boxes: &mut Vec<DetectBox>,
-) -> ProtoData
-where
-    f32: AsPrimitive<SCORE>,
-{
-    let (boxes_, scores_, mask_coeff_) =
-        postprocess_yolo_split_segdet(boxes.0, scores.0, mask_coeff.0);
-    let boxes = (boxes_, boxes.1);
-    let scores = (scores_, scores.1);
-    let mask_coeff = (mask_coeff_, mask_coeff.1);
-
-    let det_indices = impl_yolo_split_segdet_quant_get_boxes::<B, _, _>(
-        boxes,
-        scores,
-        score_threshold,
-        iou_threshold,
-        nms,
-        output_boxes.capacity(),
-    );
-
-    let (masks, quant_masks) = mask_coeff;
-    let masks = masks.reversed_axes();
-    let (protos_arr, quant_protos) = protos;
-
-    extract_proto_data_quant(
-        det_indices,
-        masks,
-        quant_masks,
-        protos_arr,
-        quant_protos,
-        output_boxes,
-    )
-}
-
 /// Proto-extraction variant of `impl_yolo_split_segdet_float`.
 /// Runs NMS but returns raw `ProtoData` instead of materialized masks.
 #[allow(clippy::too_many_arguments)]
-pub fn impl_yolo_split_segdet_float_proto<
+pub(crate) fn impl_yolo_split_segdet_float_proto<
     B: BBoxTypeTrait,
     BOX: Float + AsPrimitive<f32> + Send + Sync,
     SCORE: Float + AsPrimitive<f32> + Send + Sync,

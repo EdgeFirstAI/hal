@@ -123,7 +123,9 @@ def main():
         arr = np.ascontiguousarray(arr)
         hal_dtype = dtype_map.get(arr.dtype)
         if hal_dtype is None:
-            raise ValueError(f"Unsupported dtype {arr.dtype}; expected one of {list(dtype_map.keys())}")
+            raise ValueError(
+                f"Unsupported dtype {arr.dtype}; expected one of {list(dtype_map.keys())}"
+            )
         t = Tensor(list(arr.shape), dtype=hal_dtype)
         with t.map() as m:
             np.copyto(np.frombuffer(m, dtype=arr.dtype).reshape(arr.shape), arr)

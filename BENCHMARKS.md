@@ -1,8 +1,8 @@
 # EdgeFirst HAL - Benchmarks
 
-**Version:** 2.1
-**Last Updated:** March 23, 2026
-**Status:** Added C API preprocessing benchmark (`bench_preproc`) results for i.MX 95, i.MX 8MP, and x86 desktop; added tensor reuse impact analysis with quantified EGL cache penalties
+**Version:** 2.2
+**Last Updated:** March 27, 2026
+**Status:** Added date stamps to all benchmark sections; added image_benchmark to binary table; noted pending YoloSegDet2Way data; noted pending mask rendering optimization updates
 
 ---
 
@@ -110,6 +110,17 @@ All benchmarks use the `edgefirst-bench` custom harness which:
 
 See [README.md § Benchmarking](README.md#benchmarking) for full instructions on running benchmarks locally, cross-compiling for aarch64, and deploying to target platforms.
 
+### Benchmark Binaries
+
+| Binary | Crate | What It Measures |
+|--------|-------|-----------------|
+| `tensor_benchmark` | `edgefirst-tensor` | Tensor allocation and map/unmap latency across buffer types (Heap, SHM, DMA) |
+| `image_benchmark` | `edgefirst-image` | JPEG loading, format convert, resize operations across buffer backends |
+| `pipeline_benchmark` | `edgefirst-image` | Letterbox pipeline and format conversion (camera→model input) |
+| `mask_benchmark` | `edgefirst-image` | Mask rendering: draw_decoded_masks, draw_proto_masks, hybrid path |
+| `opencv_benchmark` | `edgefirst-image` | OpenCV baseline comparison for same operations |
+| `decoder_benchmark` | `edgefirst-decoder` | YOLO detection/segmentation post-processing, NMS, dequantization |
+
 JSON files are collected in `benchmarks/<platform>/` and processed by `.github/scripts/generate_benchmark_tables.py` to produce the tables in this document.
 
 ---
@@ -205,6 +216,8 @@ JSON files are collected in `benchmarks/<platform>/` and processed by `.github/s
 ## Benchmark Results
 
 ### Buffer Infrastructure
+
+**Data collected:** March 20, 2026
 
 #### Allocation Latency
 
@@ -350,6 +363,8 @@ The most critical benchmark: simulates a real camera-to-model preprocessing pipe
 
 ### Format Conversion (Same Size, No Resize)
 
+**Data collected:** March 20, 2026
+
 **1080p → 1080p:**
 
 | Platform | Compute | Buffer | YUYV→RGBA | YUYV→RGB | NV12→RGBA | RGB→RGBA | RGBA→BGRA | RGBA→GREY |
@@ -367,7 +382,11 @@ The most critical benchmark: simulates a real camera-to-model preprocessing pipe
 
 ### Decoder Post-Processing
 
+**Data collected:** March 20, 2026
+
 All CPU-only (decoder is not GPU-accelerated).
+
+> **Note:** `YoloSegDet2Way` (two-way split segmentation decoder) benchmark data is pending. Results will be added once the decoder is exercised on all target platforms.
 
 **YOLOv8 Detection (84×8400, 80 classes):**
 
@@ -396,6 +415,10 @@ All CPU-only (decoder is not GPU-accelerated).
 | x86-desktop | f32 | 850 us |
 
 ### Mask Rendering
+
+**Data collected:** March 20, 2026
+
+> **Note:** Numbers in this section will be updated after the upcoming release ships the fused dequant+matmul kernel and other mask rendering optimizations. Current figures reflect pre-optimization baselines.
 
 **640×640 RGBA destination, ~2 detections (YOLOv8n-seg):**
 
@@ -635,6 +658,7 @@ The binary requires a DMA-heap device (`/dev/dma_heap/linux,cma` or `/dev/dma_he
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 2.2 | 2026-03-27 | Add collection date stamps to all benchmark result sections; add image_benchmark to benchmark binary table; note pending YoloSegDet2Way benchmark data in decoder section; note pending mask rendering optimization updates |
 | 2.1 | 2026-03-23 | Add C API preprocessing benchmark (`bench_preproc`) results for i.MX 95-EVK (Mali), i.MX 8MP EVK-06 (Vivante), and x86 desktop (GTX 1080 PBO); add tensor reuse impact analysis (3.3× penalty on i.MX 95, 1.7× on i.MX 8MP, negligible on PBO); document buffer pool validation |
 | 2.0 | 2026-03-20 | TensorDyn unification: auto-backend priority changed to OpenGL→G2D→CPU; always use two-pass packed RGB (rgb_direct removed); added per-platform forced-backend comparison tables at 720p; added u8/i8 DType benchmark variants; replaced 8BPi with 8BPS_i8 naming |
 | 1.5 | 2026-03-18 | Remove stale Known Issue #3 (EDGEFIRST_FORCE_TRANSFER=pbo now implemented); documentation accuracy updates |

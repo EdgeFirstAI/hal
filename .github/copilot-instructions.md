@@ -642,7 +642,9 @@ See [README.md § Benchmarking](../README.md#benchmarking) for full instructions
 | `tensor_benchmark` | `edgefirst-tensor` | Allocation and map/unmap latency (Heap, SHM, DMA) |
 | `pipeline_benchmark` | `edgefirst-image` | Letterbox pipeline and format conversion |
 | `mask_benchmark` | `edgefirst-image` | Mask rendering paths (GL, CPU, hybrid) |
+| `image_benchmark` | `edgefirst-image` | JPEG loading, convert, and resize operations |
 | `decoder_benchmark` | `edgefirst-decoder` | YOLO post-processing, NMS, dequantization |
+| `opencv_benchmark` | `edgefirst-image` | Cross-library comparison (requires `--features opencv`) |
 
 **Key env vars:** `EDGEFIRST_FORCE_BACKEND={cpu,opengl,g2d}`, `EDGEFIRST_FORCE_TRANSFER=pbo`
 

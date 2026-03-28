@@ -151,6 +151,7 @@ The decoder automatically selects the appropriate model type based on the config
 |---------|---------|-------------|
 | `YoloDet` | 1 (detection) | Standard YOLO detection |
 | `YoloSegDet` | 2 (detection + protos) | YOLO detection + segmentation |
+| `YoloSegDet2Way` | 3 (detection + mask_coefs + protos) | YOLO segmentation with 2-way split output |
 | `YoloSplitDet` | 2 (boxes + scores) | Split-output detection |
 | `YoloSplitSegDet` | 4 (boxes + scores + mask_coeff + protos) | Split-output segmentation |
 | `YoloEndToEndDet` | 1 (detection) | End-to-end detection (post-NMS) |
@@ -162,6 +163,106 @@ The decoder automatically selects the appropriate model type based on the config
 | `ModelPackDetSplit` | N (detection layers) | ModelPack split detection |
 | `ModelPackSegDetSplit` | N+1 (detection layers + segmentation) | ModelPack split segmentation |
 | `ModelPackSeg` | 1 (segmentation) | ModelPack semantic segmentation |
+
+### YOLO-SEG 2-Way Split Format
+
+`YoloSegDet2Way` handles TFLite INT8 segmentation models that use a **2-way split** to separate mask coefficients from the combined detection output. Boxes and class scores remain merged — they share similar value ranges so splitting them yields no quantization benefit. Only mask coefficients (unbounded linear projection) need a separate quantization scale.
+
+#### Output Tensor Layout
+
+| Output | Name | Shape | Content |
+|--------|------|-------|---------|
+| `output0` | detection | `[1, nc+4, N]` | Boxes (4 channels) + class scores (nc channels), combined |
+| `output1` | protos | `[1, H/4, W/4, 32]` | Prototype masks (4D NHWC) |
+| `output2` | mask_coefs | `[1, 32, N]` | Mask coefficients per anchor |
+
+Where `N=8400` for 640×640 input (standard YOLO multi-scale anchors: 80×80 + 40×40 + 20×20).
+**COCO example** (nc=80): detection is `[1, 84, 8400]`, mask_coefs is `[1, 32, 8400]`, protos is `[1, 160, 160, 32]`.
+
+#### Output Identification by Shape
+
+The builder classifies the three outputs by shape alone:
+
+- **4D tensor** → protos (only protos are 4D)
+- **3D, feature_dim == 32** → mask_coefs
+- **3D, feature_dim != 32** → detection (nc+4 channels)
+
+The feature dimension is the smaller of the two non-batch dimensions (channels-first: `shape[1]`; channels-last: `shape[2]`).
+
+#### Edge Case: nc=28
+
+When `num_classes + 4 == 32`, the detection and mask_coefs feature dimensions collide, making shape-based classification ambiguous. In this case the split is **not performed** — the model exports 2 outputs (unsplit detection + protos) and is decoded as `YoloSegDet` instead.
+
+#### Auto-Selection
+
+The builder selects `YoloSegDet2Way` automatically when it detects exactly 3 outputs whose shapes match the pattern above (one 4D proto tensor, one 3D tensor with feature_dim=32, one 3D tensor with feature_dim≠32). No extra configuration is required.
+
+#### Backwards Compatibility
+
+Older 4-output models (separate boxes + scores + mask_coefs + protos, i.e., `YoloSplitSegDet`) remain supported. The decoder classifies by shape, not by output count.
+
+## Tracked Decoding
+
+The `tracker` feature adds `decode_tracked` to integrate object tracking directly into the decode step. Each decoded detection box is matched to a persistent track and assigned a stable UUID for the lifetime of the track.
+
+Enable the feature in `Cargo.toml`:
+
+```toml
+edgefirst-decoder = { version = "0.13", features = ["tracker"] }
+```
+
+### Usage
+
+```rust,ignore
+use edgefirst_decoder::{DecoderBuilder, DetectBox, Segmentation, TrackInfo};
+use edgefirst_decoder::Tracker; // re-exported from edgefirst-tracker
+use edgefirst_tracker::ByteTrackBuilder;
+
+let decoder = DecoderBuilder::new()
+    .with_score_threshold(0.25)
+    .with_iou_threshold(0.7)
+    .with_config_json_str(model_config_json)
+    .build()?;
+
+let mut tracker = ByteTrackBuilder::new()
+    .track_high_conf(0.5)
+    .track_update(0.1)
+    .build();
+
+let mut detections: Vec<DetectBox> = Vec::with_capacity(100);
+let mut masks: Vec<Segmentation> = Vec::with_capacity(100);
+let mut tracks: Vec<TrackInfo> = Vec::with_capacity(100);
+
+decoder.decode_tracked(
+    &mut tracker,
+    timestamp,          // u64 frame timestamp
+    &model_outputs,     // &[&TensorDyn]
+    &mut detections,
+    &mut masks,
+    &mut tracks,
+)?;
+
+// detections[i] and tracks[i] correspond to the same object
+for (det, track) in detections.iter().zip(tracks.iter()) {
+    println!(
+        "Track {} class {} score={:.2} at [{:.1}, {:.1}, {:.1}, {:.1}]",
+        track.uuid, det.label, det.score,
+        det.bbox.xmin, det.bbox.ymin, det.bbox.xmax, det.bbox.ymax,
+    );
+}
+```
+
+### TrackInfo Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `uuid` | `Uuid` | Stable unique identifier for the track |
+| `tracked_location` | `[f32; 4]` | Kalman-smoothed location in XYXY format |
+| `count` | `i32` | Number of times the track has been updated |
+| `created` | `u64` | Timestamp when the track was first created |
+| `last_updated` | `u64` | Timestamp of the most recent update |
+
+The `tracked_location` reflects the Kalman-filter prediction and may differ slightly from `det.bbox`, which is the raw decoded box before smoothing.
 
 ## License
 
