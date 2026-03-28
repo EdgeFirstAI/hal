@@ -1,7 +1,7 @@
 # EdgeFirst Hardware Abstraction Layer - Architecture
 
-**Version:** 2.9
-**Last Updated:** March 23, 2026
+**Version:** 3.0
+**Last Updated:** March 2026
 **Status:** Production
 **Audience:** Developers contributing to EdgeFirst HAL or integrating it into applications
 
@@ -343,6 +343,29 @@ The OpenGL processor selects a transfer backend at initialization time:
 
 The `PboOps` trait bridges the tensor crate and the GL thread: `PboTensor` holds a `WeakSender` to the GL thread channel. When the tensor needs to map/unmap/delete the PBO, it sends a message through this channel. The weak sender ensures PBO tensors don't prevent GL thread shutdown.
 
+**GLES 3.1 Context and Compute Shader Path**:
+
+At context creation time, the GL thread attempts to create a GLES 3.1 context
+first. If the driver does not support GLES 3.1, it falls back to GLES 3.0:
+
+```
+Try GLES 3.1  →  success: compute shaders available
+              →  failure: fall back to GLES 3.0 (no compute shaders)
+```
+
+When a GLES 3.1 context is active, an opt-in compute shader path is available for
+HWC→CHW proto tensor repack. Enable it by setting `EDGEFIRST_PROTO_COMPUTE=1`
+before launching the process:
+
+```sh
+EDGEFIRST_PROTO_COMPUTE=1 ./my_app
+```
+
+The compute shader performs the HWC→CHW layout transpose of the proto tensor on
+the GPU using an SSBO, avoiding a CPU-side copy. If compilation fails at runtime,
+the implementation logs a warning and falls back to the CPU repack path
+transparently — no API changes are required.
+
 **Why PBO matters**: On desktop Linux with NVIDIA GPUs, DMA-buf allocation
 succeeds (via `/dev/dma_heap/system`) but the NVIDIA EGL driver cannot import
 those buffers — the `verify_dma_buf_roundtrip()` check catches this at
@@ -447,6 +470,22 @@ changes are required from callers.
   - Mixed data type support (different types per input tensor)
 - **ModelPack** (Au-Zone proprietary format)
   - Detection with anchor-based decoding
+
+**`YoloSegDet2Way` Model Type**:
+
+TFLite INT8 segmentation models exported with 3 separate output tensors use the
+`YoloSegDet2Way` model type. The builder auto-selects this variant when 3 outputs
+are detected matching the expected shapes:
+
+| Tensor | Shape | Content |
+|--------|-------|---------|
+| detection | `[1, nc+4, N]` | Combined boxes and class scores |
+| mask_coeff | `[1, 32, N]` | Per-detection mask coefficients |
+| protos | `[1, H/4, W/4, 32]` | Prototype masks |
+
+This differs from the standard `YoloSegDet` variant (which combines boxes and
+mask coefficients into a single tensor). The builder auto-selects `YoloSegDet2Way`
+when the output count and shapes match the 3-tensor layout.
 
 **YOLO26 End-to-End Support**:
 
@@ -561,6 +600,39 @@ The HAL provides two workflows for consuming these masks:
 |----------|--------|------|---|:---:|:------:|:---:|
 | **Draw** — fused overlay onto image | `processor.draw_masks()` | `draw_proto_masks()` | `hal_image_processor_draw_masks()` | Yes | Yes | No |
 | **Draw pre-decoded** — draw already-decoded masks | `processor.draw_decoded_masks()` | `draw_decoded_masks()` | `hal_image_processor_draw_decoded_masks()` | Yes | Yes | No |
+| **Draw with tracking** — decode, track, and draw in one call | `processor.draw_masks_tracked()` | `draw_masks_tracked()` | `hal_image_processor_draw_masks_tracked()` | Yes | Yes | No |
+
+**`MaskOverlay` Parameters**:
+
+The `draw_decoded_masks` and `draw_proto_masks` methods (and `draw_masks_tracked`)
+accept a `MaskOverlay<'_>` struct controlling compositing behaviour:
+
+```rust
+pub struct MaskOverlay<'a> {
+    pub background: Option<&'a TensorDyn>,  // blit this image into dst before drawing masks
+    pub opacity: f32,                        // scale mask alpha; 1.0 = fully opaque
+}
+```
+
+Use the builder API to construct it:
+
+```rust
+// Default: no background blit, full opacity
+let overlay = MaskOverlay::default();
+
+// With a background frame and reduced opacity
+let overlay = MaskOverlay::new()
+    .with_background(&bg_tensor)
+    .with_opacity(0.7);
+```
+
+`draw_masks_tracked` combines decoding, tracking, and mask rendering in a single
+call, returning `(Vec<DetectBox>, Vec<TrackInfo>)`:
+
+```rust
+let (boxes, tracks) = processor.draw_masks_tracked(
+    &decoder, &mut tracker, timestamp, &outputs, &mut dst, overlay)?;
+```
 
 > **G2D limitation:** The NXP G2D hardware accelerator does not support mask
 > rendering. On platforms where G2D is the primary image processor (e.g.
@@ -726,10 +798,12 @@ The `edgefirst_image` crate depends on `edgefirst_decoder` for the `DetectBox`, 
 | File | Lines | Scope |
 |------|------:|-------|
 | `tensor.rs` | ~1,200 | Tensor create, map, reshape, fd sharing |
-| `image.rs` | ~1,800 | ImageProcessor, convert, draw |
-| `decoder.rs` | ~2,800 | Decoder create, decode detection/segmentation |
+| `image.rs` | ~2,600 | ImageProcessor, convert, draw |
+| `decoder.rs` | ~3,200 | Decoder create, decode detection/segmentation |
 | `tracker.rs` | ~300 | ByteTrack create, update |
 | `error.rs` | ~120 | Error handling utilities |
+| `delegate.rs` | ~200 | Delegate DMA-BUF ABI types and camera adaptor format info |
+| `log.rs` | ~50 | C-side logging configuration |
 
 ### 7. G2D FFI (`g2d-sys`)
 
@@ -759,7 +833,7 @@ use edgefirst_tensor::{PixelFormat, DType, TensorDyn};
 let bytes = std::fs::read("testdata/zidane.jpg")?;
 let input = load_image(&bytes, Some(PixelFormat::Rgb), None)?;
 
-// Create converter (auto-selects best backend: G2D, OpenGL, CPU)
+// Create converter (auto-selects best backend: OpenGL, G2D, CPU)
 let mut converter = ImageProcessor::new()?;
 
 // Create output buffer with optimal GPU memory (DMA > PBO > Mem)
@@ -772,18 +846,21 @@ converter.convert(&input, &mut output, Rotation::None, Flip::None, Crop::default
 ### Pattern 2: Detection Decoding
 
 ```rust
-use edgefirst_hal::decoder::Decoder;
-use std::collections::HashMap;
+use edgefirst_decoder::{Decoder, DetectBox, Segmentation};
+use edgefirst_tensor::TensorDyn;
 
-// Build decoder from configuration dictionary/JSON
-let config: HashMap<String, serde_json::Value> = 
-    serde_json::from_str(&config_json)?;
+// Build decoder from JSON configuration
+let decoder = DecoderBuilder::new()
+    .with_config_json_str(&config_json)?
+    .with_score_threshold(0.5)
+    .with_iou_threshold(0.45)
+    .build()?;
 
-let decoder = Decoder::new(config, 0.5, 0.45)?;  // score_thresh, iou_thresh
-
-// Decode model outputs (supports mixed types per tensor)
-let outputs = vec![boxes_tensor, scores_tensor];
-let (bboxes, scores, classes) = decoder.decode_detection(&outputs)?;
+// Decode model outputs into pre-allocated output vectors
+let mut output_boxes: Vec<DetectBox> = Vec::new();
+let mut output_masks: Vec<Segmentation> = Vec::new();
+let outputs: Vec<&TensorDyn> = vec![&boxes_tensor, &scores_tensor];
+decoder.decode(&outputs, &mut output_boxes, &mut output_masks)?;
 ```
 
 **Python Example**:
@@ -1586,7 +1663,7 @@ Several modules are significantly larger than typical Rust modules:
 | `image/src/gl/processor.rs` | ~4,600 | GPU rendering pipelines (convert, masks, atlas) |
 | `decoder/src/decoder/` (total) | ~7,000 | Config parsing, decode logic, postprocessing, tests |
 | `image/src/lib.rs` | ~5,500 | load_image, save_jpeg, ImageProcessor |
-| `capi/src/decoder.rs` | ~2,800 | C API decoder bindings |
+| `capi/src/decoder.rs` | ~3,200 | C API decoder bindings |
 
 ---
 

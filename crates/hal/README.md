@@ -57,6 +57,19 @@ processor.convert(&input, &mut output, Rotation::None, Flip::None, Crop::default
 | macOS | Mem | CPU |
 | Other Unix | SHM, Mem | CPU |
 
+## Feature Flags
+
+The following Cargo feature flags are available for `edgefirst-hal`:
+
+- `ndarray` (default) — Enable ndarray integration in the tensor crate. Allows converting tensors to/from `ndarray::Array`.
+- `opengl` (default) — Enable the OpenGL backend for hardware-accelerated image processing on Linux.
+- `tracker` (optional, not default) — Enable multi-object tracking support via ByteTrack. Enables `draw_masks_tracked()` in the image crate and `decode_tracked()` in the decoder crate. Requires explicit opt-in:
+
+  ```toml
+  [dependencies]
+  edgefirst-hal = { version = "...", features = ["tracker"] }
+  ```
+
 ## Python Bindings
 
 This library is also available as a Python package:

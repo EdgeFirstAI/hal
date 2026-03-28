@@ -133,6 +133,84 @@ decoder = ef.Decoder(
 boxes, scores, classes = decoder.decode([output_tensor])
 ```
 
+## Object Tracking
+
+`ByteTrack` is a multi-object tracker based on ByteTrack with Kalman filtering.
+It assigns consistent track IDs across frames.
+
+```python
+import edgefirst_hal as ef
+
+tracker = ef.ByteTrack(
+    high_conf=0.7,         # High-confidence detection threshold
+    iou=0.25,              # IoU threshold for association
+    update=0.25,           # Update/low-confidence threshold
+    lifespan_ns=500_000_000,  # Track lifespan without detection (nanoseconds)
+)
+
+# Decode and track in one call (returns boxes, scores, classes, masks, track_infos)
+boxes, scores, classes, masks, tracks = decoder.decode_tracked(
+    tracker, timestamp_ns, [output_tensor]
+)
+# masks is empty for detection-only models
+
+# Or query currently active tracks
+active = tracker.get_active_tracks()
+```
+
+## Segmentation Mask Rendering
+
+### draw_decoded_masks()
+
+Draw pre-decoded masks onto a destination image:
+
+```python
+processor.draw_decoded_masks(
+    dst,
+    bbox,           # numpy array [N, 4]
+    scores,         # numpy array [N]
+    classes,        # numpy array [N]
+    seg=[],         # list of segmentation arrays (optional)
+    background=None,  # optional background tensor to blit before drawing
+    opacity=1.0,    # mask alpha scale (0.0 – 1.0)
+)
+```
+
+### draw_masks()
+
+Decode model outputs and draw segmentation masks in a single call. Masks never
+leave Rust, eliminating the Python round-trip overhead of `decode()` +
+`draw_decoded_masks()`.
+
+Without a tracker, returns `(boxes, scores, classes)`. With a tracker, returns
+`(boxes, scores, classes, track_infos)`.
+
+```python
+import edgefirst_hal as ef
+
+processor = ef.ImageProcessor()
+tracker = ef.ByteTrack()
+
+# Without tracking
+boxes, scores, classes = processor.draw_masks(decoder, outputs, dst)
+
+# With overlay parameters
+boxes, scores, classes = processor.draw_masks(
+    decoder, outputs, dst,
+    background=bg_tensor,  # blit bg_tensor into dst before masks
+    opacity=0.7,           # semi-transparent masks
+)
+
+# With tracking (requires tracker= and timestamp=)
+import time
+ts = time.monotonic_ns()
+boxes, scores, classes, tracks = processor.draw_masks(
+    decoder, outputs, dst,
+    tracker=tracker,
+    timestamp=ts,
+)
+```
+
 ## Platform Support
 
 | Platform | GPU Acceleration | Memory Types |

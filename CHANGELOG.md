@@ -9,13 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`HalCameraAdaptorFormatInfo`** (EDGEAI-1189) — new struct added to the
+  camera adaptor delegate ABI that describes a camera adaptor's channel
+  mapping and V4L2 FourCC code: `input_channels` (`int`),
+  `output_channels` (`int`), and `fourcc` (`char[8]`, NUL-terminated V4L2
+  FourCC string, at most 4 bytes + NUL). Populated by the delegate's
+  `hal_camera_adaptor_get_format_info()` callback.
+
 - **YOLO-SEG 2-way split decoder** (`ModelType::YoloSegDet2Way`) — supports
   TFLite INT8 segmentation models with 3 outputs: a combined detection tensor
   `[1, nc+4, N]` (boxes + scores), a separate mask-coefficient tensor
   `[1, 32, N]`, and a prototype-mask tensor `[1, H/4, W/4, 32]`.  The
   builder auto-selects this variant when `Detection` + `MaskCoefficients` +
   `Protos` outputs are provided.  Supported in all decode paths (float,
-  quantized, and proto variants).
+  quantized, and proto variants), including all tracked decode paths
+  (`decode_tracked_quantized`, `decode_tracked_float`,
+  `decode_tracked_quantized_proto`, `decode_tracked_float_proto`, and the
+  public `decode_tracked` / `decode_proto_tracked` wrappers).
 
 - **`MaskOverlay` compositing options** for `draw_decoded_masks()` and
   `draw_proto_masks()` — new `overlay` parameter with two controls:
@@ -418,6 +428,15 @@ shows before/after code for each one.
 - **Dual Python wheel builds** (`abi3-py311` and `abi3-py38`). Python 3.11+
   users get zero-copy buffer protocol support; Python 3.8–3.10 users get a
   compatible fallback. Pip automatically selects the best wheel
+
+- **C logging API** (`hal_log_init_file`, `hal_log_init_callback`) —
+  two new C functions for initialising HAL logging from C/C++ callers.
+  `hal_log_init_file(FILE*, HalLogLevel)` writes formatted log lines to a
+  `FILE*` (typically `stderr`).
+  `hal_log_init_callback(HalLogCallback, void*, HalLogLevel)` routes
+  each log record to a user-supplied callback, enabling integration with
+  GStreamer, syslog, or other logging frameworks. Only the first call per
+  process takes effect; subsequent calls return `-1` with `errno = EALREADY`
 
 ### Fixed
 

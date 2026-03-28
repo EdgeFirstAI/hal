@@ -100,6 +100,7 @@ graph TB
         CAPI --> Tracker
 
         Image --> Tensor
+        Image --> Decoder
         Image --> G2D["G2D FFI (g2d-sys)<br/>NXP i.MX hardware acceleration"]
     end
 
@@ -547,6 +548,7 @@ let (bboxes, scores, classes) = decoder.decode_detection(&outputs)?;
 ### Multi-Frame Tracking
 
 ```rust
+// Requires: edgefirst-hal = { version = "0.13", features = ["tracker"] }
 use edgefirst_hal::tracker::{ByteTrack, Tracker, DetectionBox};
 
 let mut tracker = ByteTrack::default();
@@ -575,6 +577,21 @@ let fd = tensor.clone_fd()?;
 
 // Process B recreates tensor from fd
 let shared_tensor = Tensor::<u8>::from_fd(fd, &[1920, 1080, 3], None)?;
+```
+
+### Zero-Copy Import of External DMA-BUF
+
+```rust
+use edgefirst_image::{ImageProcessor, ImageProcessorTrait, Rotation, Flip, Crop};
+use edgefirst_tensor::{PixelFormat, DType, PlaneDescriptor};
+
+// Render directly into a DMA-BUF buffer owned by the NPU delegate.
+// No memcpy between HAL output and the delegate's input buffer.
+let mut processor = ImageProcessor::new()?;
+let pd = PlaneDescriptor::new(vx_fd.as_fd())?;  // dups fd — caller keeps ownership
+let mut dst = processor.import_image(pd, None, 640, 640, PixelFormat::Rgb, DType::U8)?;
+processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())?;
+// dst's backing memory IS vx_fd — no memcpy needed
 ```
 
 </details>
@@ -615,6 +632,30 @@ decoder = edgefirst_hal.Decoder(config_dict, 0.5, 0.45)
 
 # Decode outputs (accepts List[Tensor]; automatically handles quantization)
 boxes, scores, classes, masks = decoder.decode([output0, output1])
+```
+
+### Tracked Segmentation
+
+```python
+import time
+import edgefirst_hal as ef
+
+converter = ef.ImageProcessor()
+decoder = ef.Decoder(config_dict, 0.5, 0.45)
+tracker = ef.ByteTrack()
+
+dst = converter.create_image(640, 640, ef.PixelFormat.Rgb)
+
+for frame in video_frames:
+    converter.convert(frame, dst)
+    outputs = run_inference(dst)
+
+    # Draw segmentation masks with stable per-track colours.
+    # timestamp must be monotonic nanoseconds for correct track expiry.
+    converter.draw_masks(
+        decoder, outputs, dst,
+        tracker=tracker, timestamp=time.monotonic_ns()
+    )
 ```
 
 </details>
@@ -707,7 +748,7 @@ Consistent error handling throughout:
 
 ## Build System
 
-- **Workspace**: Cargo workspace with 7 crates
+- **Workspace**: Cargo workspace with 9 crates (tensor, image, decoder, tracker, hal, capi, python, bench, gpu-probe)
 - **Build Scripts**: Custom build.rs for PyO3 configuration
 - **Features**: Conditional compilation for hardware features
 - **Profiles**: Release, profiling, and debug profiles
@@ -728,6 +769,21 @@ pip install target/wheels/edgefirst_hal-*.whl
 ```
 
 **Note**: `maturin` is the recommended and standard way to build PyO3 Python extensions. It handles the complex linking requirements between Python and Rust automatically.
+
+## Environment Variables
+
+The HAL respects the following environment variables at runtime:
+
+| Variable | Description |
+|----------|-------------|
+| `EDGEFIRST_TENSOR_FORCE_MEM` | Set to `1` to force heap memory (disables DMA/SHM) |
+| `EDGEFIRST_DISABLE_G2D` | Disable G2D backend |
+| `EDGEFIRST_DISABLE_GL` | Disable OpenGL backend |
+| `EDGEFIRST_DISABLE_CPU` | Disable CPU backend |
+| `EDGEFIRST_FORCE_BACKEND` | Force a single backend: `cpu`, `g2d`, or `opengl`. Disables fallback chain. |
+| `EDGEFIRST_FORCE_TRANSFER` | Force GPU transfer method: `pbo` or `dmabuf` |
+| `EDGEFIRST_OPENGL_RENDERSURFACE` | Set to `1` to enable EGL renderbuffer path for non-dma_heap DMA-BUF buffers (i.MX 95 Neutron NPU) |
+| `EDGEFIRST_PROTO_COMPUTE` | Set to `1` to enable GLES 3.1 compute shader for HWC-to-CHW proto repack |
 
 ## Testing
 
@@ -813,7 +869,7 @@ cargo-zigbuild build --target aarch64-unknown-linux-gnu --release \
 
 ### Deploying to Targets
 
-SSH hostnames are configured in `~/.ssh/config`: `imx8mp-frdm`, `imx95-frdm`, `rpi5-hailo`
+SSH hostnames are configured in `~/.ssh/config`: `imx8mp-frdm`, `imx95-frdm`, `rpi5-hailo`, `jetson-orin-nano`, `maivin`
 
 ```bash
 # Copy benchmark binary to target
@@ -873,8 +929,11 @@ graph TD
     Python --> PyO3
     Python --> Numpy
     
-    Tracker[tracker<br/>standalone]
-    
+    Tracker[tracker<br/>optional]
+
+    Image -.->|tracker feature| Tracker
+    Decoder -.->|tracker feature| Tracker
+
     style EF fill:#fff4e1
     style Python fill:#e1f5ff
     style Tracker fill:#e8f5e9
@@ -944,4 +1003,4 @@ For security vulnerabilities, please see [SECURITY.md](SECURITY.md) or email sup
 
 Apache License 2.0 - see [LICENSE](LICENSE) for details.
 
-Copyright 2025 Au-Zone Technologies
+Copyright 2025-2026 Au-Zone Technologies
