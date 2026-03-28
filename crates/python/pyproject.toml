@@ -1,6 +1,6 @@
 [project]
 name = "edgefirst_hal"
-version = "0.13.2"
+version = "0.14.0"
 description = "Hardware Abstraction Layer for edge AI with zero-copy tensors, image processing, and YOLO decoding"
 readme = "README.md"
 requires-python = ">=3.8"
