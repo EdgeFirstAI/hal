@@ -82,6 +82,9 @@ TEST_TRACKER := $(BUILD_DIR)/test_tracker
 # Benchmark executables
 BENCH_PREPROC := $(BUILD_DIR)/bench_preproc
 
+# On-target Neutron DMA-BUF regression test (requires live delegate + model)
+TEST_NEUTRON_DMABUF := $(BUILD_DIR)/test_neutron_dmabuf
+
 # Default target
 .PHONY: all
 all: $(TEST_ALL)
@@ -123,6 +126,16 @@ $(TEST_TRACKER): $(BUILD_DIR)/test_tracker_standalone.o
 # Benchmark executable (standalone, does not use test_common.h)
 $(BENCH_PREPROC): bench_preproc.c | $(BUILD_DIR) check-lib
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS) $(LIBS)
+
+# On-target Neutron DMA-BUF regression test (standalone, requires TFLite + delegate)
+$(TEST_NEUTRON_DMABUF): test_neutron_dmabuf.c | $(BUILD_DIR) check-lib
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS) $(LIBS) -ldl
+
+# Build on-target Neutron DMA-BUF test
+.PHONY: test_neutron_dmabuf
+test_neutron_dmabuf: $(TEST_NEUTRON_DMABUF)
+	@echo "Built $(TEST_NEUTRON_DMABUF)"
+	@echo "Run on target: NEUTRON_ENABLE_ZERO_COPY=1 $(TEST_NEUTRON_DMABUF) <model.tflite>"
 
 # Run preprocessing benchmark
 .PHONY: bench
