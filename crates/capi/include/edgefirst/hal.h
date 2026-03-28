@@ -62,6 +62,11 @@ typedef void *hal_delegate_t;
 #define HAL_DMABUF_MAX_NDIM 8
 
 /**
+ * Maximum length of a FourCC string in [`HalCameraAdaptorFormatInfo`].
+ */
+#define HAL_FOURCC_MAX_LEN 8
+
+/**
  * Output type for model tensor outputs.
  *
  * Identifies the role of a model output tensor in the decoder pipeline.
@@ -763,6 +768,32 @@ typedef struct hal_dmabuf_tensor_info {
    */
   enum hal_dtype dtype;
 } hal_dmabuf_tensor_info;
+
+/**
+ * Camera adaptor format information returned by a delegate.
+ *
+ * Describes a camera format adaptor's channel mapping and V4L2 FourCC
+ * code. Used by consumers to negotiate upstream formats without
+ * vendor-specific symbols.
+ *
+ * @par Versioning
+ * The companion `hal_camera_adaptor_get_format_info()` function accepts
+ * an `info_size` parameter for forward-compatible struct growth.
+ */
+typedef struct hal_camera_adaptor_format_info {
+  /**
+   * Number of input channels (e.g., 4 for RGBA).
+   */
+  int input_channels;
+  /**
+   * Number of output channels (e.g., 3 for RGB).
+   */
+  int output_channels;
+  /**
+   * V4L2 FourCC string, NUL-terminated.
+   */
+  uint8_t fourcc[8];
+} hal_camera_adaptor_format_info;
 
 /**
  * Create new decoder parameters.

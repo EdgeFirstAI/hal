@@ -1,18 +1,21 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Delegate DMA-BUF API — shared type definitions.
+//! Delegate API — shared type definitions.
 //!
 //! This module defines the ABI contract for querying DMA-BUF tensor
-//! information from external TFLite delegates (e.g., NXP Neutron NPU).
+//! information and camera adaptor format support from external TFLite
+//! delegates (e.g., NXP Neutron NPU, VxDelegate).
+//!
 //! The HAL owns the type definitions; function implementations live in
-//! delegate integrators such as `edgefirst-tflite`.
+//! delegate shared libraries. Each delegate ships a self-contained
+//! `hal_dmabuf.h` header with these types.
 //!
 //! See ARCHITECTURE.md "Delegate DMA-BUF Framework" for the full
 //! specification including expected function signatures.
 
 use crate::tensor::HalDtype;
-use libc::{c_int, size_t};
+use libc::{c_char, c_int, size_t};
 
 /// Maximum number of dimensions in a delegate tensor shape.
 pub const HAL_DMABUF_MAX_NDIM: usize = 8;
@@ -74,3 +77,38 @@ const _: () = assert!(
 // = 11×8 + 4 + 4 = 96 bytes on LP64 with no internal padding.
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<HalDmabufTensorInfo>() == 96);
+
+/// Maximum length of a FourCC string in hal_camera_adaptor_format_info.
+pub const HAL_FOURCC_MAX_LEN: usize = 8;
+
+/// Camera adaptor format information returned by a delegate.
+///
+/// Describes a camera format adaptor's channel mapping and V4L2 FourCC
+/// code. Used by consumers to negotiate upstream formats without
+/// vendor-specific symbols.
+///
+/// @par Versioning
+/// The companion `hal_camera_adaptor_get_format_info()` function accepts
+/// an `info_size` parameter for forward-compatible struct growth.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct HalCameraAdaptorFormatInfo {
+    /// Number of input channels (e.g., 4 for RGBA).
+    pub input_channels: c_int,
+    /// Number of output channels (e.g., 3 for RGB).
+    pub output_channels: c_int,
+    /// V4L2 FourCC string, NUL-terminated (ASCII, at most 4 bytes + NUL).
+    pub fourcc: [c_char; HAL_FOURCC_MAX_LEN],
+}
+
+const _: () = assert!(
+    std::mem::size_of::<[c_char; HAL_FOURCC_MAX_LEN]>() == HAL_FOURCC_MAX_LEN,
+    "HAL_FOURCC_MAX_LEN must equal the fourcc array length"
+);
+
+impl Default for HalCameraAdaptorFormatInfo {
+    fn default() -> Self {
+        // SAFETY: All-zero is a valid empty state for this POD struct.
+        unsafe { std::mem::zeroed() }
+    }
+}

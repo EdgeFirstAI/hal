@@ -75,7 +75,7 @@ no_includes = false
 # only defines the type; implementations live in edgefirst-tflite), so
 # cbindgen would otherwise skip it. This list is additive — all other
 # types/functions are still emitted normally.
-include = ["HalDmabufTensorInfo"]
+include = ["HalDmabufTensorInfo", "HalCameraAdaptorFormatInfo"]
 exclude = []
 item_types = ["enums", "structs", "unions", "typedefs", "opaque", "functions", "constants"]
 
@@ -102,6 +102,7 @@ item_types = ["enums", "structs", "unions", "typedefs", "opaque", "functions", "
 "HalTensorMap" = "hal_tensor_map"
 "HalPlaneDescriptor" = "hal_plane_descriptor"
 "HalDmabufTensorInfo" = "hal_dmabuf_tensor_info"
+"HalCameraAdaptorFormatInfo" = "hal_camera_adaptor_format_info"
 "HalComputeBackend" = "hal_compute_backend"
 "HalLogLevel" = "hal_log_level"
 "HalLogCallback" = "hal_log_callback"
