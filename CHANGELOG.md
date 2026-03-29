@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-03-29
+
+### Added
+
+- **On-target Neutron DMA-BUF inference regression test** (`test_neutron_dmabuf_infer`) —
+  new C test that exercises the full HAL write → `hal_invoke()` → output
+  validation path over a live Neutron DMA-BUF, with a corresponding
+  `make test_neutron_dmabuf_infer` target. Requires
+  `NEUTRON_ENABLE_ZERO_COPY=1` and a real delegate + model on target.
+
+- **ARCHITECTURE.md Appendix C: DMA-BUF Identity and Tensor Caching** —
+  documents why DMA-BUF fd numbers are unreliable as cache keys (fd numbers
+  recycle across buffer pool cycles), `fstat(fd).st_ino` as the correct
+  stable identity, `(inode, offset)` keying for multi-plane buffers,
+  cache warm-up / steady-state behaviour table (i.MX 95 figures), and
+  the reference implementation pattern from `edgefirstcameraadaptor`.
+  Bumps ARCHITECTURE.md version 3.0 → 3.1.
+
+### Fixed
+
+- **`DmaTensor::from_fd()` skips DRM attachment for foreign (imported) fds** —
+  previously every `from_fd()` call attempted `DRM_IOCTL_PRIME_FD_TO_HANDLE`
+  on the imported fd. For fds exported by other kernel drivers (e.g. the
+  Neutron NPU), this ioctl fails because the fd is not owned by the DRM
+  device; the resulting error was silently ignored but added unnecessary ioctl
+  overhead on every import. Foreign fd cache coherency is the responsibility
+  of the exporting kernel driver. (`crates/tensor/src/dma.rs`)
+
+- **`DmaTensor::try_clone()` preserves imported/owned distinction** —
+  cloning an imported `DmaTensor` now consistently produces another imported
+  tensor (no DRM attachment), matching the semantics of `from_fd()`.
+
 ## [0.14.0] - 2026-03-28
 
 ### Added
