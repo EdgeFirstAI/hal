@@ -208,9 +208,12 @@ impl G2DProcessor {
         }
 
         // Apply XOR 0x80 for int8 output (u8→i8 bias conversion).
-        // map() triggers DMA_BUF_SYNC_START (cache invalidation) so CPU reads
-        // the G2D-written data correctly. The map drop triggers DMA_BUF_SYNC_END
-        // (cache flush) so downstream DMA consumers see the XOR'd data.
+        // map() issues DMA_BUF_IOCTL_SYNC(START) on the dst fd; for self-allocated
+        // CMA buffers this performs cache invalidation via the DrmAttachment.
+        // For foreign fds (e.g. the Neutron NPU DMA-BUF imported via from_fd()),
+        // the DrmAttachment is None and the sync ioctl is handled by the NPU driver.
+        // The map drop issues DMA_BUF_IOCTL_SYNC(END) so the NPU DMA engine sees
+        // the CPU-written XOR'd data on the next Invoke().
         if is_int8_dst {
             let start = Instant::now();
             let mut map = dst.map()?;

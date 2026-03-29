@@ -84,6 +84,7 @@ BENCH_PREPROC := $(BUILD_DIR)/bench_preproc
 
 # On-target Neutron DMA-BUF regression test (requires live delegate + model)
 TEST_NEUTRON_DMABUF := $(BUILD_DIR)/test_neutron_dmabuf
+TEST_NEUTRON_DMABUF_INFER := $(BUILD_DIR)/test_neutron_dmabuf_infer
 
 # Default target
 .PHONY: all
@@ -131,11 +132,20 @@ $(BENCH_PREPROC): bench_preproc.c | $(BUILD_DIR) check-lib
 $(TEST_NEUTRON_DMABUF): test_neutron_dmabuf.c | $(BUILD_DIR) check-lib
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS) $(LIBS) -ldl
 
+# On-target Neutron DMA-BUF inference test (HAL write → Invoke → validate output)
+$(TEST_NEUTRON_DMABUF_INFER): test_neutron_dmabuf_infer.c | $(BUILD_DIR) check-lib
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS) $(LIBS) -ldl
+
 # Build on-target Neutron DMA-BUF test
 .PHONY: test_neutron_dmabuf
 test_neutron_dmabuf: $(TEST_NEUTRON_DMABUF)
 	@echo "Built $(TEST_NEUTRON_DMABUF)"
 	@echo "Run on target: NEUTRON_ENABLE_ZERO_COPY=1 $(TEST_NEUTRON_DMABUF) <model.tflite>"
+
+.PHONY: test_neutron_dmabuf_infer
+test_neutron_dmabuf_infer: $(TEST_NEUTRON_DMABUF_INFER)
+	@echo "Built $(TEST_NEUTRON_DMABUF_INFER)"
+	@echo "Run on target: NEUTRON_ENABLE_ZERO_COPY=1 $(TEST_NEUTRON_DMABUF_INFER) <model.tflite> [delegate.so] [frame.nv12]"
 
 # Run preprocessing benchmark
 .PHONY: bench
