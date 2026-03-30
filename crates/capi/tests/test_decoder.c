@@ -731,7 +731,7 @@ static void test_decoder_tracked_end_to_end_segdet_split_proto(void) {
     ASSERT_NOT_NULL(image);
 
     int rc = hal_image_processor_draw_masks_tracked(
-        processor, decoder, tracker, 0, outputs, 5, image, NULL, 1.0f, &box_list, &track_list
+        processor, decoder, tracker, 0, outputs, 5, image, NULL, 1.0f, NULL, HAL_COLOR_MODE_CLASS, &box_list, &track_list
     );
     
     ASSERT_EQ(0, rc);
@@ -767,7 +767,7 @@ static void test_decoder_tracked_end_to_end_segdet_split_proto(void) {
     track_list = NULL;
 
     rc = hal_image_processor_draw_masks_tracked(
-        processor, decoder, tracker, 100000000 / 3, outputs, 5, image, NULL, 1.0f, &box_list, &track_list
+        processor, decoder, tracker, 100000000 / 3, outputs, 5, image, NULL, 1.0f, NULL, HAL_COLOR_MODE_CLASS, &box_list, &track_list
     );
 
     ASSERT_EQ(0, rc);
