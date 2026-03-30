@@ -7,6 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-03-30
+
+### Added
+
+- **Three-stage segmentation pipeline API** — new `materialize_masks()` on
+  `ImageProcessor` exposes CPU mask materialization as a first-class operation,
+  enabling `decode_proto` → `materialize_masks` → `draw_decoded_masks` with
+  user access to intermediate masks for analytics, IoU computation, or export.
+  Mask values are continuous sigmoid confidence (u8 0-255), not binary
+  thresholded. Exposed in Rust, Python (`ProtoData`, `ColorMode`,
+  `Decoder.decode_proto`, `ImageProcessor.materialize_masks`), and C
+  (`hal_decoder_decode_proto`, `hal_proto_data_free`,
+  `hal_image_processor_materialize_masks`, `hal_color_mode` enum) APIs.
+
+- **`ColorMode` enum** — controls whether mask colors are assigned by class
+  label (`Class`, default), detection index (`Instance`), or track ID
+  (`Track`). Added as parameter to `draw_decoded_masks`, `draw_masks`, and
+  `draw_masks_tracked` across all API layers.
+
+- **`letterbox` parameter** on `draw_decoded_masks`, `draw_masks`, and
+  `draw_masks_tracked` — enables letterbox coordinate unmapping directly in
+  the rendering step. Propagated through the GL threaded message channel.
+
+- **Jetson Orin Nano platform** — benchmark data collected and added to
+  BENCHMARKS.md; `benchmark_common.py` updated with platform configs.
+
+### Changed
+
+- **Per-texture EGL binding state tracking** — moved EGL binding cache keys
+  from three processor-level fields (`last_bound_dst_egl`,
+  `last_bound_draw_dst_egl`, `last_bound_src_egl`) onto the `Texture` struct
+  itself (`bound_egl_key`). Eliminates cross-path cache invalidation bugs,
+  reduces maintenance from 6 manual invalidation sites to 2 helper methods
+  (`invalidate_dst_textures`, `invalidate_src_textures`). Fixed latent bug
+  where `setup_renderbuffer_non_dma` / `setup_renderbuffer_from_pbo` could
+  skip necessary `EGLImageTargetTexture2DOES` calls after non-DMA → DMA
+  transition.
+
+- **`EglImageCache::sweep()` returns `bool`**, `evict_lru()` returns `bool`
+  and simplified (removed redundant nested `if let`).
+
+- **C API breaking changes** — `hal_image_processor_draw_decoded_masks`,
+  `hal_image_processor_draw_masks`, and `hal_image_processor_draw_masks_tracked`
+  gain `letterbox` and `color_mode` parameters. Callers must update call sites.
+
+- **BENCHMARKS.md v3.0** — refreshed all benchmarks across 5 platforms with
+  v0.15.0 code; hybrid path 1.4-14.2× faster than fused GPU on all platforms.
+
+### Fixed
+
+- **`decode_proto` for detection-only models** — `decode_quantized_proto`,
+  `decode_float_proto`, and both tracked variants now properly decode
+  detection boxes instead of returning empty `output_boxes` with `Ok(None)`.
+
+- **`Segmentation` doc comment** — corrected from "binary per-instance mask"
+  to "continuous sigmoid confidence values quantized to u8".
+
+- **`GLProcessorThreaded` letterbox propagation** — `DrawDecodedMasks` and
+  `DrawProtoMasks` message variants now carry the `letterbox` field instead
+  of hardcoding `None`.
+
+- **`test_disable_env_var` race condition** — saves/restores
+  `EDGEFIRST_FORCE_BACKEND` to prevent interference with parallel tests.
+
+- **C API `materialize_masks` error mapping** — `NoConverter` maps to
+  `ENOTSUP` instead of `EIO`.
+
 ## [0.14.1] - 2026-03-29
 
 ### Added

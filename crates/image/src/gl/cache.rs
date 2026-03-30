@@ -55,19 +55,21 @@ impl EglImageCache {
         self.access_counter
     }
 
-    /// Evict the least recently used entry.
-    pub(super) fn evict_lru(&mut self) {
+    /// Evict the least recently used entry. Returns `true` if an entry was evicted.
+    pub(super) fn evict_lru(&mut self) -> bool {
         if let Some((&evict_id, _)) = self.entries.iter().min_by_key(|(_, entry)| entry.last_used) {
-            if let Some(evicted) = self.entries.remove(&evict_id) {
-                if let Some(rbo) = evicted.renderbuffer {
-                    unsafe { gls::gl::DeleteRenderbuffers(1, &rbo) };
-                }
+            let evicted = self.entries.remove(&evict_id).expect("key just found");
+            if let Some(rbo) = evicted.renderbuffer {
+                unsafe { gls::gl::DeleteRenderbuffers(1, &rbo) };
             }
+            return true;
         }
+        false
     }
 
     /// Sweep dead entries (tensor dropped, Weak is dead).
-    pub(super) fn sweep(&mut self) {
+    /// Returns `true` if any entries were removed.
+    pub(super) fn sweep(&mut self) -> bool {
         let before = self.entries.len();
         self.entries.retain(|_id, entry| {
             let alive = entry.guard.upgrade().is_some();
@@ -82,6 +84,7 @@ impl EglImageCache {
         if swept > 0 {
             log::debug!("EglImageCache: swept {swept} dead entries");
         }
+        swept > 0
     }
 }
 

@@ -48,6 +48,7 @@ pub mod edgefirst_hal {
         m.add_class::<image::PyRect>()?;
         m.add_class::<image::PyRotation>()?;
         m.add_class::<image::PyFlip>()?;
+        m.add_class::<image::PyColorMode>()?;
         m.add_class::<image::PyImageProcessor>()?;
         m.add_class::<image::PyEglDisplayKind>()?;
         #[cfg(target_os = "linux")]
@@ -56,6 +57,7 @@ pub mod edgefirst_hal {
             m.add_function(wrap_pyfunction!(image::probe_egl_displays, m)?)?;
         }
         m.add_class::<decoder::PyDecoder>()?;
+        m.add_class::<decoder::PyProtoData>()?;
         m.add_class::<decoder::PyNms>()?;
         m.add_class::<decoder::PyDecoderType>()?;
         m.add_class::<decoder::PyDecoderVersion>()?;

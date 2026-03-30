@@ -448,9 +448,9 @@ impl Decoder {
     /// Decodes quantized model outputs into detection boxes, returning raw
     /// `ProtoData` for segmentation models instead of materialized masks.
     ///
-    /// Returns `Ok(None)` for detection-only and ModelPack models (use
-    /// `decode_quantized` for those). Returns `Ok(Some(ProtoData))` for
-    /// YOLO segmentation models.
+    /// Returns `Ok(None)` for detection-only and ModelPack models (detections
+    /// are still decoded into `output_boxes`). Returns `Ok(Some(ProtoData))`
+    /// for YOLO segmentation models.
     pub(crate) fn decode_quantized_proto(
         &self,
         outputs: &[ArrayViewDQuantized],
@@ -458,16 +458,51 @@ impl Decoder {
     ) -> Result<Option<ProtoData>, DecoderError> {
         output_boxes.clear();
         match &self.model_type {
-            // Detection-only and ModelPack variants: no proto data
-            ModelType::ModelPackSegDet { .. }
-            | ModelType::ModelPackSegDetSplit { .. }
-            | ModelType::ModelPackDet { .. }
-            | ModelType::ModelPackDetSplit { .. }
-            | ModelType::ModelPackSeg { .. }
-            | ModelType::YoloDet { .. }
-            | ModelType::YoloSplitDet { .. }
-            | ModelType::YoloEndToEndDet { .. }
-            | ModelType::YoloSplitEndToEndDet { .. } => Ok(None),
+            // Detection-only variants: decode boxes, return None for proto data.
+            ModelType::ModelPackDet { boxes, scores } => {
+                self.decode_modelpack_det_quantized(outputs, boxes, scores, output_boxes)?;
+                Ok(None)
+            }
+            ModelType::ModelPackDetSplit { detection } => {
+                self.decode_modelpack_det_split_quantized(outputs, detection, output_boxes)?;
+                Ok(None)
+            }
+            ModelType::YoloDet { boxes } => {
+                self.decode_yolo_det_quantized(outputs, boxes, output_boxes)?;
+                Ok(None)
+            }
+            ModelType::YoloSplitDet { boxes, scores } => {
+                self.decode_yolo_split_det_quantized(outputs, boxes, scores, output_boxes)?;
+                Ok(None)
+            }
+            ModelType::YoloEndToEndDet { boxes } => {
+                self.decode_yolo_end_to_end_det_quantized(outputs, boxes, output_boxes)?;
+                Ok(None)
+            }
+            ModelType::YoloSplitEndToEndDet {
+                boxes,
+                scores,
+                classes,
+            } => {
+                self.decode_yolo_split_end_to_end_det_quantized(
+                    outputs,
+                    boxes,
+                    scores,
+                    classes,
+                    output_boxes,
+                )?;
+                Ok(None)
+            }
+            // ModelPack seg/segdet variants have no YOLO proto data.
+            ModelType::ModelPackSegDet { boxes, scores, .. } => {
+                self.decode_modelpack_det_quantized(outputs, boxes, scores, output_boxes)?;
+                Ok(None)
+            }
+            ModelType::ModelPackSegDetSplit { detection, .. } => {
+                self.decode_modelpack_det_split_quantized(outputs, detection, output_boxes)?;
+                Ok(None)
+            }
+            ModelType::ModelPackSeg { .. } => Ok(None),
 
             ModelType::YoloSegDet { boxes, protos } => {
                 let proto =
@@ -537,8 +572,9 @@ impl Decoder {
     /// Decodes floating-point model outputs into detection boxes, returning
     /// raw `ProtoData` for segmentation models instead of materialized masks.
     ///
-    /// Returns `Ok(None)` for detection-only and ModelPack models. Returns
-    /// `Ok(Some(ProtoData))` for YOLO segmentation models.
+    /// Returns `Ok(None)` for detection-only and ModelPack models (detections
+    /// are still decoded into `output_boxes`). Returns `Ok(Some(ProtoData))`
+    /// for YOLO segmentation models.
     pub(crate) fn decode_float_proto<T>(
         &self,
         outputs: &[ArrayViewD<T>],
@@ -550,16 +586,51 @@ impl Decoder {
     {
         output_boxes.clear();
         match &self.model_type {
-            // Detection-only and ModelPack variants: no proto data
-            ModelType::ModelPackSegDet { .. }
-            | ModelType::ModelPackSegDetSplit { .. }
-            | ModelType::ModelPackDet { .. }
-            | ModelType::ModelPackDetSplit { .. }
-            | ModelType::ModelPackSeg { .. }
-            | ModelType::YoloDet { .. }
-            | ModelType::YoloSplitDet { .. }
-            | ModelType::YoloEndToEndDet { .. }
-            | ModelType::YoloSplitEndToEndDet { .. } => Ok(None),
+            // Detection-only variants: decode boxes, return None for proto data.
+            ModelType::ModelPackDet { boxes, scores } => {
+                self.decode_modelpack_det_float(outputs, boxes, scores, output_boxes)?;
+                Ok(None)
+            }
+            ModelType::ModelPackDetSplit { detection } => {
+                self.decode_modelpack_det_split_float(outputs, detection, output_boxes)?;
+                Ok(None)
+            }
+            ModelType::YoloDet { boxes } => {
+                self.decode_yolo_det_float(outputs, boxes, output_boxes)?;
+                Ok(None)
+            }
+            ModelType::YoloSplitDet { boxes, scores } => {
+                self.decode_yolo_split_det_float(outputs, boxes, scores, output_boxes)?;
+                Ok(None)
+            }
+            ModelType::YoloEndToEndDet { boxes } => {
+                self.decode_yolo_end_to_end_det_float(outputs, boxes, output_boxes)?;
+                Ok(None)
+            }
+            ModelType::YoloSplitEndToEndDet {
+                boxes,
+                scores,
+                classes,
+            } => {
+                self.decode_yolo_split_end_to_end_det_float(
+                    outputs,
+                    boxes,
+                    scores,
+                    classes,
+                    output_boxes,
+                )?;
+                Ok(None)
+            }
+            // ModelPack seg/segdet variants have no YOLO proto data.
+            ModelType::ModelPackSegDet { boxes, scores, .. } => {
+                self.decode_modelpack_det_float(outputs, boxes, scores, output_boxes)?;
+                Ok(None)
+            }
+            ModelType::ModelPackSegDetSplit { detection, .. } => {
+                self.decode_modelpack_det_split_float(outputs, detection, output_boxes)?;
+                Ok(None)
+            }
+            ModelType::ModelPackSeg { .. } => Ok(None),
 
             ModelType::YoloSegDet { boxes, protos } => {
                 let proto =
@@ -673,6 +744,7 @@ impl Decoder {
     /// for segmentation models instead of materialized masks.
     ///
     /// Accepts `TensorDyn` outputs directly from model inference.
+    /// Detections are always decoded into `output_boxes` regardless of model type.
     /// Returns `Ok(None)` for detection-only and ModelPack models.
     /// Returns `Ok(Some(ProtoData))` for YOLO segmentation models.
     ///
@@ -947,17 +1019,6 @@ impl Decoder {
         output_boxes.clear();
         output_tracks.clear();
         match &self.model_type {
-            // Detection-only and ModelPack variants: no proto data
-            ModelType::ModelPackSegDet { .. }
-            | ModelType::ModelPackSegDetSplit { .. }
-            | ModelType::ModelPackDet { .. }
-            | ModelType::ModelPackDetSplit { .. }
-            | ModelType::ModelPackSeg { .. }
-            | ModelType::YoloDet { .. }
-            | ModelType::YoloSplitDet { .. }
-            | ModelType::YoloEndToEndDet { .. }
-            | ModelType::YoloSplitEndToEndDet { .. } => Ok(None),
-
             ModelType::YoloSegDet { boxes, protos } => {
                 let proto = self.decode_tracked_yolo_segdet_quantized_proto(
                     tracker,
@@ -1039,12 +1100,20 @@ impl Decoder {
                 )?;
                 Ok(Some(proto))
             }
+            // Non-seg variants: decode boxes via the non-proto path, then track.
+            _ => {
+                let mut masks = Vec::new();
+                self.decode_quantized(outputs, output_boxes, &mut masks)?;
+                Self::update_tracker(tracker, timestamp, output_boxes, output_tracks);
+                Ok(None)
+            }
         }
     }
 
     /// Decodes floating-point model outputs into detection boxes, returning
     /// raw `ProtoData` for segmentation models instead of materialized masks.
     ///
+    /// Detections are always decoded into `output_boxes` regardless of model type.
     /// Returns `Ok(None)` for detection-only and ModelPack models. Returns
     /// `Ok(Some(ProtoData))` for YOLO segmentation models.
     pub(crate) fn decode_tracked_float_proto<TR: edgefirst_tracker::Tracker<DetectBox>, T>(
@@ -1062,17 +1131,6 @@ impl Decoder {
         output_boxes.clear();
         output_tracks.clear();
         match &self.model_type {
-            // Detection-only and ModelPack variants: no proto data
-            ModelType::ModelPackSegDet { .. }
-            | ModelType::ModelPackSegDetSplit { .. }
-            | ModelType::ModelPackDet { .. }
-            | ModelType::ModelPackDetSplit { .. }
-            | ModelType::ModelPackSeg { .. }
-            | ModelType::YoloDet { .. }
-            | ModelType::YoloSplitDet { .. }
-            | ModelType::YoloEndToEndDet { .. }
-            | ModelType::YoloSplitEndToEndDet { .. } => Ok(None),
-
             ModelType::YoloSegDet { boxes, protos } => {
                 let proto = self.decode_tracked_yolo_segdet_float_proto(
                     tracker,
@@ -1153,6 +1211,13 @@ impl Decoder {
                     output_tracks,
                 )?;
                 Ok(Some(proto))
+            }
+            // Non-seg variants: decode boxes via the non-proto path, then track.
+            _ => {
+                let mut masks = Vec::new();
+                self.decode_float(outputs, output_boxes, &mut masks)?;
+                Self::update_tracker(tracker, timestamp, output_boxes, output_tracks);
+                Ok(None)
             }
         }
     }

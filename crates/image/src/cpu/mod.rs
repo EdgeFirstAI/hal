@@ -336,7 +336,13 @@ impl ImageProcessorTrait for CPUProcessor {
         overlay: crate::MaskOverlay<'_>,
     ) -> Result<()> {
         let dst = dst.as_u8_mut().ok_or(Error::NotAnImage)?;
-        self.draw_decoded_masks_impl(dst, detect, segmentation, overlay.opacity)
+        self.draw_decoded_masks_impl(
+            dst,
+            detect,
+            segmentation,
+            overlay.opacity,
+            overlay.color_mode,
+        )
     }
 
     fn draw_proto_masks(
@@ -347,7 +353,14 @@ impl ImageProcessorTrait for CPUProcessor {
         overlay: crate::MaskOverlay<'_>,
     ) -> Result<()> {
         let dst = dst.as_u8_mut().ok_or(Error::NotAnImage)?;
-        self.draw_proto_masks_impl(dst, detect, proto_data, overlay.opacity)
+        self.draw_proto_masks_impl(
+            dst,
+            detect,
+            proto_data,
+            overlay.opacity,
+            overlay.letterbox,
+            overlay.color_mode,
+        )
     }
 
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<()> {
@@ -575,6 +588,7 @@ impl CPUProcessor {
         detect: &[DetectBox],
         segmentation: &[Segmentation],
         opacity: f32,
+        color_mode: crate::ColorMode,
     ) -> Result<()> {
         let dst_fmt = dst.format().ok_or(Error::NotAnImage)?;
         if !matches!(dst_fmt, PixelFormat::Rgba | PixelFormat::Rgb) {
@@ -593,7 +607,7 @@ impl CPUProcessor {
         let mut map = dst.map()?;
         let dst_slice = map.as_mut_slice();
 
-        self.render_box(dst_w, dst_h, dst_rs, dst_c, dst_slice, detect)?;
+        self.render_box(dst_w, dst_h, dst_rs, dst_c, dst_slice, detect, color_mode)?;
 
         if segmentation.is_empty() {
             return Ok(());
@@ -614,7 +628,8 @@ impl CPUProcessor {
                 opacity,
             )?;
         } else {
-            for (seg, detect) in segmentation.iter().zip(detect) {
+            for (idx, (seg, det)) in segmentation.iter().zip(detect).enumerate() {
+                let color_index = color_mode.index(idx, det.label);
                 self.render_yolo_segmentation(
                     dst_w,
                     dst_h,
@@ -622,7 +637,7 @@ impl CPUProcessor {
                     dst_c,
                     dst_slice,
                     seg,
-                    detect.label,
+                    color_index,
                     opacity,
                 )?;
             }
@@ -637,6 +652,8 @@ impl CPUProcessor {
         detect: &[DetectBox],
         proto_data: &ProtoData,
         opacity: f32,
+        letterbox: Option<[f32; 4]>,
+        color_mode: crate::ColorMode,
     ) -> Result<()> {
         let dst_fmt = dst.format().ok_or(Error::NotAnImage)?;
         if !matches!(dst_fmt, PixelFormat::Rgba | PixelFormat::Rgb) {
@@ -655,7 +672,9 @@ impl CPUProcessor {
         let mut map = dst.map()?;
         let dst_slice = map.as_mut_slice();
 
-        self.render_box(dst_w, dst_h, dst_rs, channels, dst_slice, detect)?;
+        self.render_box(
+            dst_w, dst_h, dst_rs, channels, dst_slice, detect, color_mode,
+        )?;
 
         if detect.is_empty() || proto_data.mask_coefficients.is_empty() {
             return Ok(());
@@ -667,15 +686,29 @@ impl CPUProcessor {
         let proto_w = protos.shape()[1];
         let num_protos = protos.shape()[2];
 
-        for (det, coeff) in detect.iter().zip(proto_data.mask_coefficients.iter()) {
-            let color = self.colors[det.label % self.colors.len()];
+        // Precompute letterbox scale/offset for output-pixel → proto-pixel mapping.
+        // Without letterbox: proto_x = (x / dst_w) * proto_w
+        // With letterbox [lx0,ly0,lx1,ly1]: proto_x = (lx0 + (x/dst_w)*(lx1-lx0)) * proto_w
+        let (lx0, lx_range, ly0, ly_range) = match letterbox {
+            Some([lx0, ly0, lx1, ly1]) => (lx0, lx1 - lx0, ly0, ly1 - ly0),
+            None => (0.0_f32, 1.0_f32, 0.0_f32, 1.0_f32),
+        };
+
+        for (idx, (det, coeff)) in detect
+            .iter()
+            .zip(proto_data.mask_coefficients.iter())
+            .enumerate()
+        {
+            let color_index = color_mode.index(idx, det.label);
+            let color = self.colors[color_index % self.colors.len()];
             let alpha = if opacity == 1.0 {
                 color[3] as u16
             } else {
                 (color[3] as f32 * opacity).round() as u16
             };
 
-            // Pixel bounds of the detection in dst image space
+            // `detect` has already been un-letterboxed by the caller (lib.rs),
+            // so bbox coords are in output-image-normalized space.
             let start_x = (dst_w as f32 * det.bbox.xmin).round() as usize;
             let start_y = (dst_h as f32 * det.bbox.ymin).round() as usize;
             let end_x = ((dst_w as f32 * det.bbox.xmax).round() as usize).min(dst_w);
@@ -683,9 +716,11 @@ impl CPUProcessor {
 
             for y in start_y..end_y {
                 for x in start_x..end_x {
-                    // Map pixel (x, y) to proto space
-                    let px = (x as f32 / dst_w as f32) * proto_w as f32 - 0.5;
-                    let py = (y as f32 / dst_h as f32) * proto_h as f32 - 0.5;
+                    // Map output pixel (x, y) → model-input-normalized → proto pixel.
+                    // When a letterbox was applied, output pixels map to a sub-region
+                    // of the model input; lx0/lx_range re-introduce that mapping.
+                    let px = (lx0 + (x as f32 / dst_w as f32) * lx_range) * proto_w as f32 - 0.5;
+                    let py = (ly0 + (y as f32 / dst_h as f32) * ly_range) * proto_h as f32 - 0.5;
 
                     // Bilinear interpolation + dot product
                     let acc = bilinear_dot(protos, coeff, num_protos, px, py, proto_w, proto_h);
