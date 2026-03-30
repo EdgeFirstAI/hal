@@ -63,15 +63,20 @@ pub struct GLProcessorST {
     /// Persistent FBO for the convert() render path.
     /// Created once, reused by re-attaching textures each frame.
     convert_fbo: FrameBuffer,
+    /// Persistent FBO for draw_decoded_masks / draw_proto_masks render path.
+    /// Separate from convert_fbo so EGLImage binding state is not shared
+    /// between convert and draw, avoiding redundant EGLImageTargetTexture2DOES
+    /// calls on every frame when both paths are used.
+    draw_fbo: FrameBuffer,
+    /// Texture used as FBO color attachment for draw operations (DMA path).
+    /// Separate from render_texture so EGLImageTargetTexture2DOES calls made
+    /// by convert do not invalidate the draw path's bound EGLImage, and
+    /// vice versa.
+    draw_render_texture: Texture,
     /// EGLImage cache for source DMA buffers.
     src_egl_cache: EglImageCache,
     /// EGLImage cache for destination DMA buffers.
     dst_egl_cache: EglImageCache,
-    /// Currently bound EGLImage key on render_texture (dst side).
-    /// Skip glEGLImageTargetTexture2DOES when unchanged.
-    last_bound_dst_egl: Option<EglCacheKey>,
-    /// Currently bound EGLImage key on camera_eglimage_texture (src side).
-    last_bound_src_egl: Option<EglCacheKey>,
     /// Whether the BGRA byte-swap workaround warning has been logged.
     bgra_warned: bool,
     /// Whether the GPU is a Verisilicon/Vivante core (detected via GL_RENDERER).
@@ -218,7 +223,15 @@ impl ImageProcessorTrait for GLProcessorST {
     ) -> Result<(), crate::Error> {
         let bg = overlay.background.map(|bg| dyn_to_u8_src(bg)).transpose()?;
         let (dst_u8, dst_fmt, _is_int8) = dyn_to_u8_dst(dst)?;
-        self.draw_decoded_masks_impl(dst_u8, dst_fmt, detect, segmentation, overlay.opacity, bg)
+        self.draw_decoded_masks_impl(
+            dst_u8,
+            dst_fmt,
+            detect,
+            segmentation,
+            overlay.opacity,
+            bg,
+            overlay.color_mode,
+        )
     }
 
     fn draw_proto_masks(
@@ -230,7 +243,15 @@ impl ImageProcessorTrait for GLProcessorST {
     ) -> crate::Result<()> {
         let bg = overlay.background.map(|bg| dyn_to_u8_src(bg)).transpose()?;
         let (dst_u8, dst_fmt, _is_int8) = dyn_to_u8_dst(dst)?;
-        self.draw_proto_masks_impl(dst_u8, dst_fmt, detect, proto_data, overlay.opacity, bg)
+        self.draw_proto_masks_impl(
+            dst_u8,
+            dst_fmt,
+            detect,
+            proto_data,
+            overlay.opacity,
+            bg,
+            overlay.color_mode,
+        )
     }
 
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> crate::Result<()> {
@@ -387,6 +408,7 @@ impl GLProcessorST {
         let camera_eglimage_texture = Texture::new();
         let camera_normal_texture = Texture::new();
         let render_texture = Texture::new();
+        let draw_render_texture = Texture::new();
         let segmentation_texture = Texture::new();
         let proto_texture = Texture::new();
         let proto_dequant_texture = Texture::new();
@@ -420,10 +442,10 @@ impl GLProcessorST {
             vertex_buffer,
             texture_buffer,
             convert_fbo: FrameBuffer::new(),
+            draw_fbo: FrameBuffer::new(),
+            draw_render_texture,
             src_egl_cache: EglImageCache::new(8),
             dst_egl_cache: EglImageCache::new(8),
-            last_bound_dst_egl: None,
-            last_bound_src_egl: None,
             bgra_warned: false,
             is_vivante,
             use_renderbuffer: std::env::var("EDGEFIRST_OPENGL_RENDERSURFACE")
@@ -713,6 +735,7 @@ impl GLProcessorST {
         segmentation: &[Segmentation],
         opacity: f32,
         background: Option<(&Tensor<u8>, PixelFormat)>,
+        color_mode: crate::ColorMode,
     ) -> Result<(), crate::Error> {
         use crate::FunctionTimer;
 
@@ -739,7 +762,7 @@ impl GLProcessorST {
         };
 
         let is_dma = match memory {
-            TensorMemory::Dma if self.setup_renderbuffer_dma(dst, dst_fmt).is_ok() => true,
+            TensorMemory::Dma if self.setup_draw_renderbuffer_dma(dst, dst_fmt).is_ok() => true,
             _ if pbo_buffer_id.is_some() => {
                 self.setup_renderbuffer_from_pbo(dst, dst_fmt, pbo_buffer_id.unwrap())?;
                 false
@@ -808,8 +831,8 @@ impl GLProcessorST {
         );
 
         self.set_opacity_uniform(opacity)?;
-        self.render_box(dst_w, dst_h, detect)?;
-        self.render_segmentation(detect, segmentation)?;
+        self.render_box(dst_w, dst_h, detect, color_mode)?;
+        self.render_segmentation(detect, segmentation, color_mode)?;
 
         gls::finish();
         if !is_dma {
@@ -878,6 +901,7 @@ impl GLProcessorST {
         proto_data: &ProtoData,
         opacity: f32,
         background: Option<(&Tensor<u8>, PixelFormat)>,
+        color_mode: crate::ColorMode,
     ) -> crate::Result<()> {
         use crate::FunctionTimer;
 
@@ -904,7 +928,7 @@ impl GLProcessorST {
         };
 
         let is_dma = match memory {
-            TensorMemory::Dma if self.setup_renderbuffer_dma(dst, dst_fmt).is_ok() => true,
+            TensorMemory::Dma if self.setup_draw_renderbuffer_dma(dst, dst_fmt).is_ok() => true,
             _ if pbo_buffer_id.is_some() => {
                 self.setup_renderbuffer_from_pbo(dst, dst_fmt, pbo_buffer_id.unwrap())?;
                 false
@@ -973,8 +997,8 @@ impl GLProcessorST {
         );
 
         self.set_opacity_uniform(opacity)?;
-        self.render_box(dst_w, dst_h, detect)?;
-        self.render_proto_segmentation(detect, proto_data)?;
+        self.render_box(dst_w, dst_h, detect, color_mode)?;
+        self.render_proto_segmentation(detect, proto_data, color_mode)?;
 
         gls::finish();
         if !is_dma {
@@ -1152,6 +1176,19 @@ impl GLProcessorST {
         Ok((has_float_linear, has_bgra, is_vivante, is_software_renderer))
     }
 
+    /// Invalidate EGL binding state on all destination textures.
+    /// Called when the dst EGLImage cache evicts or sweeps entries.
+    fn invalidate_dst_textures(&mut self) {
+        self.render_texture.invalidate_egl_binding();
+        self.draw_render_texture.invalidate_egl_binding();
+    }
+
+    /// Invalidate EGL binding state on all source textures.
+    /// Called when the src EGLImage cache evicts or sweeps entries.
+    fn invalidate_src_textures(&mut self) {
+        self.camera_eglimage_texture.invalidate_egl_binding();
+    }
+
     fn setup_renderbuffer_dma(
         &mut self,
         dst: &Tensor<u8>,
@@ -1171,34 +1208,36 @@ impl GLProcessorST {
         let chroma_id = dst.chroma().map(|t| t.buffer_identity().id());
         let dst_key = (luma_id, chroma_id);
 
-        if self.last_bound_dst_egl != Some(dst_key) {
-            let dest_egl = self.get_or_create_egl_image(CacheKind::Dst, dst, dst_fmt)?;
-            match self.cached_dst_renderbuffer(dst) {
-                Some(rbo) => unsafe {
-                    gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
-                    gls::gl::FramebufferRenderbuffer(
-                        gls::gl::FRAMEBUFFER,
-                        gls::gl::COLOR_ATTACHMENT0,
-                        gls::gl::RENDERBUFFER,
-                        rbo,
-                    );
-                    check_gl_error(function!(), line!())?;
-                },
-                None => unsafe {
-                    gls::gl::UseProgram(self.texture_program_yuv.id);
-                    gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-                    gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
-                    gls::gl::TexParameteri(
-                        gls::gl::TEXTURE_2D,
-                        gls::gl::TEXTURE_MIN_FILTER,
-                        gls::gl::LINEAR as i32,
-                    );
-                    gls::gl::TexParameteri(
-                        gls::gl::TEXTURE_2D,
-                        gls::gl::TEXTURE_MAG_FILTER,
-                        gls::gl::LINEAR as i32,
-                    );
-                    gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, dest_egl.as_ptr());
+        let dest_egl = self.get_or_create_egl_image(CacheKind::Dst, dst, dst_fmt)?;
+        match self.cached_dst_renderbuffer(dst) {
+            Some(rbo) => unsafe {
+                gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
+                gls::gl::FramebufferRenderbuffer(
+                    gls::gl::FRAMEBUFFER,
+                    gls::gl::COLOR_ATTACHMENT0,
+                    gls::gl::RENDERBUFFER,
+                    rbo,
+                );
+                check_gl_error(function!(), line!())?;
+            },
+            None => unsafe {
+                gls::gl::UseProgram(self.texture_program_yuv.id);
+                gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+                gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
+                gls::gl::TexParameteri(
+                    gls::gl::TEXTURE_2D,
+                    gls::gl::TEXTURE_MIN_FILTER,
+                    gls::gl::LINEAR as i32,
+                );
+                gls::gl::TexParameteri(
+                    gls::gl::TEXTURE_2D,
+                    gls::gl::TEXTURE_MAG_FILTER,
+                    gls::gl::LINEAR as i32,
+                );
+                if self
+                    .render_texture
+                    .bind_egl_image(dst_key, dest_egl.as_ptr())
+                {
                     gls::gl::FramebufferTexture2D(
                         gls::gl::FRAMEBUFFER,
                         gls::gl::COLOR_ATTACHMENT0,
@@ -1206,13 +1245,97 @@ impl GLProcessorST {
                         self.render_texture.id,
                         0,
                     );
-                    check_gl_error(function!(), line!())?;
-                },
-            }
-            self.last_bound_dst_egl = Some(dst_key);
-            log::trace!("setup_renderbuffer_dma: bound new dst EGLImage id={luma_id:#x}");
+                    log::trace!("setup_renderbuffer_dma: bound new dst EGLImage id={luma_id:#x}");
+                } else {
+                    log::trace!(
+                        "setup_renderbuffer_dma: reusing bound dst EGLImage id={luma_id:#x}"
+                    );
+                }
+                check_gl_error(function!(), line!())?;
+            },
+        }
+
+        unsafe {
+            gls::gl::Viewport(0, 0, width, height);
+        }
+        Ok(())
+    }
+
+    /// Variant of [`setup_renderbuffer_dma`] used exclusively by draw operations
+    /// (`draw_decoded_masks`, `draw_proto_masks`).
+    ///
+    /// Uses a dedicated FBO (`draw_fbo`) and texture (`draw_render_texture`) so
+    /// that `EGLImageTargetTexture2DOES` calls made during convert do not
+    /// invalidate the draw path's cached binding, and vice versa.  On Vivante
+    /// GC7000UL (texture path, `use_renderbuffer = false`) each
+    /// `EGLImageTargetTexture2DOES` call costs ~4–11 ms, so eliminating the
+    /// cross-path invalidation removes two redundant calls per frame when both
+    /// convert and draw are active.
+    fn setup_draw_renderbuffer_dma(
+        &mut self,
+        dst: &Tensor<u8>,
+        dst_fmt: PixelFormat,
+    ) -> crate::Result<()> {
+        self.draw_fbo.bind();
+        let dst_w = dst.width().ok_or(Error::NotAnImage)?;
+        let dst_h = dst.height().ok_or(Error::NotAnImage)?;
+
+        let (width, height) = if dst_fmt == PixelFormat::PlanarRgb {
+            (dst_w as i32, (dst_h * 3) as i32)
         } else {
-            log::trace!("setup_renderbuffer_dma: reusing bound dst EGLImage id={luma_id:#x}");
+            (dst_w as i32, dst_h as i32)
+        };
+
+        let luma_id = dst.buffer_identity().id();
+        let chroma_id = dst.chroma().map(|t| t.buffer_identity().id());
+        let dst_key = (luma_id, chroma_id);
+
+        let dest_egl = self.get_or_create_egl_image(CacheKind::Dst, dst, dst_fmt)?;
+        match self.cached_dst_renderbuffer(dst) {
+            Some(rbo) => unsafe {
+                gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
+                gls::gl::FramebufferRenderbuffer(
+                    gls::gl::FRAMEBUFFER,
+                    gls::gl::COLOR_ATTACHMENT0,
+                    gls::gl::RENDERBUFFER,
+                    rbo,
+                );
+                check_gl_error(function!(), line!())?;
+            },
+            None => unsafe {
+                gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+                gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.draw_render_texture.id);
+                gls::gl::TexParameteri(
+                    gls::gl::TEXTURE_2D,
+                    gls::gl::TEXTURE_MIN_FILTER,
+                    gls::gl::LINEAR as i32,
+                );
+                gls::gl::TexParameteri(
+                    gls::gl::TEXTURE_2D,
+                    gls::gl::TEXTURE_MAG_FILTER,
+                    gls::gl::LINEAR as i32,
+                );
+                if self
+                    .draw_render_texture
+                    .bind_egl_image(dst_key, dest_egl.as_ptr())
+                {
+                    gls::gl::FramebufferTexture2D(
+                        gls::gl::FRAMEBUFFER,
+                        gls::gl::COLOR_ATTACHMENT0,
+                        gls::gl::TEXTURE_2D,
+                        self.draw_render_texture.id,
+                        0,
+                    );
+                    log::trace!(
+                        "setup_draw_renderbuffer_dma: bound new dst EGLImage id={luma_id:#x}"
+                    );
+                } else {
+                    log::trace!(
+                        "setup_draw_renderbuffer_dma: reusing bound dst EGLImage id={luma_id:#x}"
+                    );
+                }
+                check_gl_error(function!(), line!())?;
+            },
         }
 
         unsafe {
@@ -1493,6 +1616,8 @@ impl GLProcessorST {
                 gls::gl::UNSIGNED_BYTE,
                 pixels,
             );
+            // TexImage2D overwrites any EGLImage binding on this texture.
+            self.render_texture.invalidate_egl_binding();
             check_gl_error(function!(), line!())?;
             gls::gl::FramebufferTexture2D(
                 gls::gl::FRAMEBUFFER,
@@ -1564,6 +1689,8 @@ impl GLProcessorST {
                 std::ptr::null(),
             );
             gls::gl::BindBuffer(gls::gl::PIXEL_UNPACK_BUFFER, 0);
+            // TexImage2D overwrites any EGLImage binding on this texture.
+            self.render_texture.invalidate_egl_binding();
 
             check_gl_error(function!(), line!())?;
             gls::gl::FramebufferTexture2D(
@@ -2412,9 +2539,14 @@ impl GLProcessorST {
             }
         }
 
+        let src_key = (
+            src.buffer_identity().id(),
+            src.chroma().map(|t| t.buffer_identity().id()),
+        );
         let src_egl = self.get_or_create_egl_image(CacheKind::Src, src, src_fmt)?;
 
         self.draw_camera_texture_to_rgb_planar(
+            src_key,
             src_egl,
             src_roi,
             dst_roi,
@@ -2810,7 +2942,8 @@ impl GLProcessorST {
 
     #[allow(clippy::too_many_arguments)]
     fn draw_camera_texture_to_rgb_planar(
-        &self,
+        &mut self,
+        src_key: EglCacheKey,
         egl_img: egl::Image,
         src_roi: RegionOfInterest,
         mut dst_roi: RegionOfInterest,
@@ -2860,8 +2993,21 @@ impl GLProcessorST {
                 gls::gl::CLAMP_TO_EDGE as i32,
             );
 
-            gls::egl_image_target_texture_2d_oes(texture_target, egl_img.as_ptr());
-            check_gl_error(function!(), line!())?;
+            if self
+                .camera_eglimage_texture
+                .bind_egl_image_external(src_key, egl_img.as_ptr())
+            {
+                check_gl_error(function!(), line!())?;
+                log::trace!(
+                    "draw_camera_planar: bound new src EGLImage id={:#x}",
+                    src_key.0
+                );
+            } else {
+                log::trace!(
+                    "draw_camera_planar: reusing bound src EGLImage id={:#x}",
+                    src_key.0
+                );
+            }
             let y_centers = if alpha {
                 vec![-3.0 / 4.0, -1.0 / 4.0, 1.0 / 4.0, 3.0 / 4.0]
             } else {
@@ -3253,10 +3399,11 @@ impl GLProcessorST {
                 }
             }
 
-            if self.last_bound_src_egl != Some(src_key) {
-                gls::egl_image_target_texture_2d_oes(texture_target, egl_img.as_ptr());
+            if self
+                .camera_eglimage_texture
+                .bind_egl_image_external(src_key, egl_img.as_ptr())
+            {
                 check_gl_error(function!(), line!())?;
-                self.last_bound_src_egl = Some(src_key);
                 log::trace!("draw_camera: bound new src EGLImage id={luma_id:#x}");
             } else {
                 log::trace!("draw_camera: reusing bound src EGLImage id={luma_id:#x}");
@@ -3527,20 +3674,16 @@ impl GLProcessorST {
         let id = (luma_id, chroma_id);
 
         // Sweep dead entries opportunistically before looking up.
-        // Invalidate binding state since sweep may remove the bound entry.
+        // Invalidate texture binding state since sweep may remove a bound entry.
         match cache {
             CacheKind::Src => {
-                let before = self.src_egl_cache.entries.len();
-                self.src_egl_cache.sweep();
-                if self.src_egl_cache.entries.len() < before {
-                    self.last_bound_src_egl = None;
+                if self.src_egl_cache.sweep() {
+                    self.invalidate_src_textures();
                 }
             }
             CacheKind::Dst => {
-                let before = self.dst_egl_cache.entries.len();
-                self.dst_egl_cache.sweep();
-                if self.dst_egl_cache.entries.len() < before {
-                    self.last_bound_dst_egl = None;
+                if self.dst_egl_cache.sweep() {
+                    self.invalidate_dst_textures();
                 }
             }
         }
@@ -3588,11 +3731,11 @@ impl GLProcessorST {
             None
         };
 
-        // Invalidate binding state: we're inserting a new entry and may evict
-        // the currently-bound one.
+        // Invalidate texture binding state: we're inserting a new entry and
+        // may evict the currently-bound one.
         match cache {
-            CacheKind::Src => self.last_bound_src_egl = None,
-            CacheKind::Dst => self.last_bound_dst_egl = None,
+            CacheKind::Src => self.invalidate_src_textures(),
+            CacheKind::Dst => self.invalidate_dst_textures(),
         }
 
         let handle = egl_image_obj.egl_image;
@@ -3682,10 +3825,8 @@ impl GLProcessorST {
         bpp: usize,
     ) -> Result<egl::Image, crate::Error> {
         let id = (img.buffer_identity().id(), None);
-        let before = self.dst_egl_cache.entries.len();
-        self.dst_egl_cache.sweep();
-        if self.dst_egl_cache.entries.len() < before {
-            self.last_bound_dst_egl = None;
+        if self.dst_egl_cache.sweep() {
+            self.invalidate_dst_textures();
         }
 
         let ts = self.dst_egl_cache.next_timestamp();
@@ -3697,8 +3838,8 @@ impl GLProcessorST {
         }
         self.dst_egl_cache.misses += 1;
         log::trace!("EglImageCache dst (RGB) miss: id={:#x}", id.0);
-        // Invalidate dst binding state on cache miss (new EGLImage creation).
-        self.last_bound_dst_egl = None;
+        // Invalidate dst texture binding state on cache miss (new EGLImage creation).
+        self.invalidate_dst_textures();
 
         if self.dst_egl_cache.entries.len() >= self.dst_egl_cache.capacity {
             self.dst_egl_cache.evict_lru();
@@ -3935,23 +4076,37 @@ impl GLProcessorST {
             gls::gl::CLAMP_TO_EDGE as i32,
         );
 
+        // Build a 1px zero-padded texture so bilinear interpolation blends
+        // smoothly to zero at the mask boundary (instead of clamping to the
+        // edge pixel value with GL_CLAMP_TO_EDGE).
+        let pad_w = width + 2;
+        let pad_h = height + 2;
+        let mut padded = vec![0u8; pad_w * pad_h];
+        for row in 0..height {
+            let src_start = row * width;
+            let dst_start = (row + 1) * pad_w + 1;
+            padded[dst_start..dst_start + width]
+                .copy_from_slice(&segmentation[src_start..src_start + width]);
+        }
+
         gls::tex_image2d(
             texture_target,
             0,
             format as i32,
-            width as i32,
-            height as i32,
+            pad_w as i32,
+            pad_h as i32,
             0,
             format,
             gls::gl::UNSIGNED_BYTE,
-            Some(segmentation),
+            Some(&padded),
         );
 
+        // Map UVs to the inner region, excluding the 1px zero border.
         let src_roi = RegionOfInterest {
-            left: 0.,
-            top: 1.,
-            right: 1.,
-            bottom: 0.,
+            left: 1.0 / pad_w as f32,
+            top: (height + 1) as f32 / pad_h as f32,
+            right: (width + 1) as f32 / pad_w as f32,
+            bottom: 1.0 / pad_h as f32,
         };
 
         unsafe {
@@ -4055,6 +4210,7 @@ impl GLProcessorST {
         &mut self,
         detect: &[DetectBox],
         proto_data: &ProtoData,
+        color_mode: crate::ColorMode,
     ) -> crate::Result<()> {
         if detect.is_empty() || proto_data.mask_coefficients.is_empty() {
             return Ok(());
@@ -4077,6 +4233,7 @@ impl GLProcessorST {
                     width,
                     num_protos,
                     texture_target,
+                    color_mode,
                 )?;
             }
             ProtoTensor::Float(protos_f32) => {
@@ -4089,6 +4246,7 @@ impl GLProcessorST {
                         width,
                         num_protos,
                         texture_target,
+                        color_mode,
                     )?;
                 } else {
                     // Fallback: repack to RGBA16F and use existing f16 shader
@@ -4100,6 +4258,7 @@ impl GLProcessorST {
                         width,
                         num_protos,
                         texture_target,
+                        color_mode,
                     )?;
                 }
             }
@@ -4116,17 +4275,19 @@ impl GLProcessorST {
         program: &GlProgram,
         detect: &[DetectBox],
         mask_coefficients: &[Vec<f32>],
+        color_mode: crate::ColorMode,
     ) -> crate::Result<()> {
         let cvt_screen_coord = |normalized: f32| normalized * 2.0 - 1.0;
 
-        for (det, coeff) in detect.iter().zip(mask_coefficients.iter()) {
+        for (idx, (det, coeff)) in detect.iter().zip(mask_coefficients.iter()).enumerate() {
+            let color_index = color_mode.index(idx, det.label);
             let mut packed_coeff = [[0.0f32; 4]; 8];
             for (i, val) in coeff.iter().enumerate().take(32) {
                 packed_coeff[i / 4][i % 4] = *val;
             }
 
             program.load_uniform_4fv(c"mask_coeff", &packed_coeff)?;
-            program.load_uniform_1i(c"class_index", det.label as i32)?;
+            program.load_uniform_1i(c"class_index", color_index as i32)?;
 
             let dst_roi = RegionOfInterest {
                 left: cvt_screen_coord(det.bbox.xmin),
@@ -4219,6 +4380,7 @@ impl GLProcessorST {
         width: usize,
         num_protos: usize,
         texture_target: u32,
+        color_mode: crate::ColorMode,
     ) -> crate::Result<()> {
         // Upload raw int8 protos as R8I texture array (1 proto per layer)
         gls::bind_texture(texture_target, self.proto_texture.id);
@@ -4368,7 +4530,7 @@ impl GLProcessorST {
                 program.load_uniform_1i(c"num_protos", num_protos as i32)?;
                 program.load_uniform_1f(c"proto_scale", proto_scale)?;
                 program.load_uniform_1f(c"proto_scaled_zp", proto_scaled_zp)?;
-                self.render_proto_detection_quads(program, detect, mask_coefficients)?;
+                self.render_proto_detection_quads(program, detect, mask_coefficients, color_mode)?;
             }
             Int8InterpolationMode::Bilinear => {
                 let program = &self.proto_segmentation_int8_bilinear_program;
@@ -4376,7 +4538,7 @@ impl GLProcessorST {
                 program.load_uniform_1i(c"num_protos", num_protos as i32)?;
                 program.load_uniform_1f(c"proto_scale", proto_scale)?;
                 program.load_uniform_1f(c"proto_scaled_zp", proto_scaled_zp)?;
-                self.render_proto_detection_quads(program, detect, mask_coefficients)?;
+                self.render_proto_detection_quads(program, detect, mask_coefficients, color_mode)?;
             }
             Int8InterpolationMode::TwoPass => {
                 self.render_proto_int8_two_pass(
@@ -4387,6 +4549,7 @@ impl GLProcessorST {
                     width,
                     num_protos,
                     texture_target,
+                    color_mode,
                 )?;
             }
         }
@@ -4406,6 +4569,7 @@ impl GLProcessorST {
         width: usize,
         num_protos: usize,
         texture_target: u32,
+        color_mode: crate::ColorMode,
     ) -> crate::Result<()> {
         let num_layers = num_protos.div_ceil(4);
 
@@ -4531,7 +4695,7 @@ impl GLProcessorST {
         gls::active_texture(gls::gl::TEXTURE0);
         gls::bind_texture(texture_target, self.proto_dequant_texture.id);
         program.load_uniform_1i(c"num_layers", num_layers as i32)?;
-        self.render_proto_detection_quads(program, detect, mask_coefficients)?;
+        self.render_proto_detection_quads(program, detect, mask_coefficients, color_mode)?;
 
         Ok(())
     }
@@ -4547,6 +4711,7 @@ impl GLProcessorST {
         width: usize,
         num_protos: usize,
         texture_target: u32,
+        color_mode: crate::ColorMode,
     ) -> crate::Result<()> {
         let program = &self.proto_segmentation_f32_program;
         gls::use_program(program.id);
@@ -4597,7 +4762,7 @@ impl GLProcessorST {
         );
 
         program.load_uniform_1i(c"num_protos", num_protos as i32)?;
-        self.render_proto_detection_quads(program, detect, mask_coefficients)?;
+        self.render_proto_detection_quads(program, detect, mask_coefficients, color_mode)?;
 
         Ok(())
     }
@@ -4615,6 +4780,7 @@ impl GLProcessorST {
         width: usize,
         num_protos: usize,
         texture_target: u32,
+        color_mode: crate::ColorMode,
     ) -> crate::Result<()> {
         let num_layers = num_protos.div_ceil(4);
         let (tex_data, _) = Self::repack_protos_to_rgba_f16(protos_f32);
@@ -4658,7 +4824,7 @@ impl GLProcessorST {
         );
 
         program.load_uniform_1i(c"num_layers", num_layers as i32)?;
-        self.render_proto_detection_quads(program, detect, mask_coefficients)?;
+        self.render_proto_detection_quads(program, detect, mask_coefficients, color_mode)?;
 
         Ok(())
     }
@@ -4667,6 +4833,7 @@ impl GLProcessorST {
         &mut self,
         detect: &[DetectBox],
         segmentation: &[Segmentation],
+        color_mode: crate::ColorMode,
     ) -> crate::Result<()> {
         if segmentation.is_empty() {
             return Ok(());
@@ -4698,7 +4865,8 @@ impl GLProcessorST {
                 ],
             )?;
         } else {
-            for (seg, det) in segmentation.iter().zip(detect) {
+            for (idx, (seg, det)) in segmentation.iter().zip(detect).enumerate() {
+                let color_index = color_mode.index(idx, det.label);
                 let dst_roi = RegionOfInterest {
                     left: cvt_screen_coord(seg.xmin),
                     top: cvt_screen_coord(seg.ymax),
@@ -4715,7 +4883,7 @@ impl GLProcessorST {
                     dst_roi,
                     slice,
                     [seg.segmentation.shape()[0], seg.segmentation.shape()[1]],
-                    det.label,
+                    color_index,
                 )?;
             }
         }
@@ -4834,14 +5002,16 @@ impl GLProcessorST {
         dst_w: usize,
         dst_h: usize,
         detect: &[DetectBox],
+        color_mode: crate::ColorMode,
     ) -> Result<(), Error> {
         unsafe {
             gls::gl::UseProgram(self.color_program.id);
             let rescale = |x: f32| x * 2.0 - 1.0;
             let thickness = 3.0;
-            for d in detect {
+            for (idx, d) in detect.iter().enumerate() {
+                let color_index = color_mode.index(idx, d.label);
                 self.color_program
-                    .load_uniform_1i(c"class_index", d.label as i32)?;
+                    .load_uniform_1i(c"class_index", color_index as i32)?;
                 gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
                 gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
                 let bbox: [f32; 4] = d.bbox.into();

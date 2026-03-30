@@ -6,7 +6,7 @@
 //! This module provides image conversion and manipulation functions with
 //! support for hardware acceleration (G2D, OpenGL) when available.
 
-use crate::decoder::{HalDecoder, HalDetectBoxList, HalSegmentationList};
+use crate::decoder::{HalDecoder, HalDetectBoxList, HalProtoData, HalSegmentationList};
 use crate::error::{set_error, set_error_null};
 use crate::tensor::{HalDtype, HalTensor, HalTensorMemory};
 use crate::{
@@ -21,6 +21,43 @@ use edgefirst_tensor::{PixelFormat, PixelLayout, TensorDyn, TensorMemory};
 use edgefirst_tracker::TrackInfo;
 use libc::{c_char, c_int, size_t};
 use std::ffi::CStr;
+
+/// Parse an optional letterbox pointer into `Option<[f32; 4]>`.
+///
+/// # Safety
+/// `ptr` must be NULL or point to at least 4 contiguous f32 values.
+unsafe fn parse_letterbox(ptr: *const f32) -> Option<[f32; 4]> {
+    if ptr.is_null() {
+        None
+    } else {
+        let lb = std::slice::from_raw_parts(ptr, 4);
+        Some([lb[0], lb[1], lb[2], lb[3]])
+    }
+}
+
+/// Build a `MaskOverlay` from raw C parameters.
+///
+/// # Safety
+/// - `background` must be NULL or a valid `HalTensor` pointer.
+/// - `letterbox` must be NULL or point to at least 4 contiguous f32 values.
+unsafe fn build_overlay<'a>(
+    background: *const HalTensor,
+    opacity: f32,
+    letterbox: *const f32,
+    color_mode: HalColorMode,
+) -> edgefirst_image::MaskOverlay<'a> {
+    let bg = if background.is_null() {
+        None
+    } else {
+        Some(&(*background).inner)
+    };
+    edgefirst_image::MaskOverlay {
+        background: bg,
+        opacity: opacity.clamp(0.0, 1.0),
+        letterbox: parse_letterbox(letterbox),
+        color_mode: color_mode.into(),
+    }
+}
 
 /// Image pixel format.
 #[repr(C)]
@@ -134,6 +171,28 @@ impl From<HalFlip> for Flip {
             HalFlip::None => Flip::None,
             HalFlip::Vertical => Flip::Vertical,
             HalFlip::Horizontal => Flip::Horizontal,
+        }
+    }
+}
+
+/// Controls how mask colors are assigned to detections.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HalColorMode {
+    /// Color chosen by class label (default, correct for semantic segmentation)
+    Class = 0,
+    /// Color chosen by detection index (unique color per instance)
+    Instance = 1,
+    /// Color chosen by track ID (use with object tracking)
+    Track = 2,
+}
+
+impl From<HalColorMode> for edgefirst_image::ColorMode {
+    fn from(mode: HalColorMode) -> Self {
+        match mode {
+            HalColorMode::Class => edgefirst_image::ColorMode::Class,
+            HalColorMode::Instance => edgefirst_image::ColorMode::Instance,
+            HalColorMode::Track => edgefirst_image::ColorMode::Track,
         }
     }
 }
@@ -813,6 +872,9 @@ pub unsafe extern "C" fn hal_image_processor_convert(
 /// @param segmentations Segmentation list (can be NULL for detection-only)
 /// @param background Optional background image (NULL to draw over dst)
 /// @param opacity Mask opacity in [0.0, 1.0] (1.0 = fully opaque, clamped)
+/// @param letterbox Optional letterbox coordinates [x0, y0, x1, y1] in normalized
+///        coordinates for mapping model-space boxes back to image space (NULL = no letterbox)
+/// @param color_mode How to assign colors to detections (HAL_COLOR_MODE_CLASS by default)
 /// @return 0 on success, -1 on error
 /// @par Errors (errno):
 /// - EINVAL: Invalid argument (NULL processor or dst, or background == dst)
@@ -825,6 +887,8 @@ pub unsafe extern "C" fn hal_image_processor_draw_decoded_masks(
     segmentations: *const HalSegmentationList,
     background: *const HalTensor,
     opacity: f32,
+    letterbox: *const f32,
+    color_mode: HalColorMode,
 ) -> c_int {
     check_null!(processor, dst);
 
@@ -844,25 +908,78 @@ pub unsafe extern "C" fn hal_image_processor_draw_decoded_masks(
         unsafe { &(*segmentations).masks }.as_slice()
     };
 
-    let bg = if background.is_null() {
-        None
-    } else {
-        Some(&unsafe { &*background }.inner)
-    };
+    let overlay = build_overlay(background, opacity, letterbox, color_mode);
 
     try_or_errno!(
         unsafe { &mut (*processor) }.inner.draw_decoded_masks(
             &mut unsafe { &mut (*dst) }.inner,
             detect_slice,
             seg_slice,
-            edgefirst_image::MaskOverlay {
-                background: bg,
-                opacity: opacity.clamp(0.0, 1.0),
-            },
+            overlay,
         ),
         libc::EIO
     );
     0
+}
+
+/// Materialize per-instance segmentation masks from prototype data.
+///
+/// Computes `mask_coeff @ protos` with sigmoid activation for each detection,
+/// producing compact masks at prototype resolution (e.g., 160×160 crops).
+/// Mask values are continuous sigmoid confidence quantized to uint8
+/// (0 = background, 255 = full confidence), NOT binary thresholded.
+///
+/// The returned segmentation list can be:
+/// - Inspected via `hal_segmentation_list_get_mask()` for analytics, IoU, etc.
+/// - Passed to `hal_image_processor_draw_decoded_masks()` for GPU rendering.
+///
+/// @note Calling `hal_decoder_decode_proto()` + `hal_image_processor_materialize_masks()`
+///       + `hal_image_processor_draw_decoded_masks()` separately prevents the HAL from
+///       using its internal fused optimization. For render-only use cases, prefer
+///       `hal_image_processor_draw_masks()` which is 1.6–27× faster on tested platforms.
+///
+/// @param processor Image processor handle
+/// @param detections Detection box list from `hal_decoder_decode_proto()`
+/// @param proto Prototype data from `hal_decoder_decode_proto()`
+/// @param letterbox Optional letterbox coordinates [x0, y0, x1, y1] in normalized
+///        coordinates (NULL = no letterbox correction)
+/// @return Segmentation list (caller must free with `hal_segmentation_list_free()`),
+///         or NULL on error
+/// @par Errors (errno):
+/// - EINVAL: Invalid argument (NULL processor/detections/proto)
+/// - ENOTSUP: CPU backend not available (required for mask materialization)
+/// - EIO: Materialization failed
+#[no_mangle]
+pub unsafe extern "C" fn hal_image_processor_materialize_masks(
+    processor: *mut HalImageProcessor,
+    detections: *const HalDetectBoxList,
+    proto: *const HalProtoData,
+    letterbox: *const f32,
+) -> *mut HalSegmentationList {
+    if processor.is_null() || detections.is_null() || proto.is_null() {
+        set_error(libc::EINVAL);
+        return std::ptr::null_mut();
+    }
+
+    let masks = match (*processor).inner.materialize_masks(
+        &(*detections).boxes,
+        &(*proto).inner,
+        parse_letterbox(letterbox),
+    ) {
+        Ok(m) => m,
+        Err(edgefirst_image::Error::NoConverter) => {
+            log::error!("hal_image_processor_materialize_masks: CPU backend not available");
+            set_error(libc::ENOTSUP);
+            return std::ptr::null_mut();
+        }
+        Err(e) => {
+            log::error!("hal_image_processor_materialize_masks: {e:#?}");
+            set_error(libc::EIO);
+            return std::ptr::null_mut();
+        }
+    };
+
+    Box::into_raw(Box::new(HalSegmentationList { masks }))
 }
 
 /// Decode model outputs and draw masks directly onto a destination image.
@@ -878,6 +995,9 @@ pub unsafe extern "C" fn hal_image_processor_draw_decoded_masks(
 /// @param dst Destination image to draw onto
 /// @param background Optional background image (NULL to draw over dst)
 /// @param opacity Mask opacity, clamped to [0.0, 1.0] (1.0 = fully opaque)
+/// @param letterbox Optional letterbox coordinates [x0, y0, x1, y1] in normalized
+///        coordinates (NULL = no letterbox correction)
+/// @param color_mode How to assign colors to detections (HAL_COLOR_MODE_CLASS by default)
 /// @param out_boxes Output parameter for detection box list (caller must free)
 /// @return 0 on success, -1 on error
 /// @par Errors (errno):
@@ -892,6 +1012,8 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks(
     dst: *mut HalTensor,
     background: *const HalTensor,
     opacity: f32,
+    letterbox: *const f32,
+    color_mode: HalColorMode,
     out_boxes: *mut *mut HalDetectBoxList,
 ) -> c_int {
     check_null!(processor, decoder, outputs, dst, out_boxes);
@@ -904,15 +1026,7 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks(
     if !background.is_null() && std::ptr::eq(background, dst as *const _) {
         return set_error(libc::EINVAL);
     }
-    let bg = if background.is_null() {
-        None
-    } else {
-        Some(&unsafe { &*background }.inner)
-    };
-    let overlay = edgefirst_image::MaskOverlay {
-        background: bg,
-        opacity: opacity.clamp(0.0, 1.0),
-    };
+    let overlay = build_overlay(background, opacity, letterbox, color_mode);
 
     let outputs_slice = std::slice::from_raw_parts(outputs, num_outputs);
 
@@ -975,6 +1089,9 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks(
 /// @param dst Destination image to draw onto
 /// @param background Optional background image (NULL to draw over dst)
 /// @param opacity Mask opacity in [0.0, 1.0] (1.0 = fully opaque, clamped)
+/// @param letterbox Optional letterbox coordinates [x0, y0, x1, y1] in normalized
+///        coordinates (NULL = no letterbox correction)
+/// @param color_mode How to assign colors to detections (HAL_COLOR_MODE_CLASS by default)
 /// @param out_boxes Output parameter for detection box list (caller must free)
 /// @param out_tracks Output parameter for track info list (can be NULL; caller must free if non-NULL)
 /// @return 0 on success, -1 on error
@@ -992,6 +1109,8 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks_tracked(
     dst: *mut HalTensor,
     background: *const HalTensor,
     opacity: f32,
+    letterbox: *const f32,
+    color_mode: HalColorMode,
     out_boxes: *mut *mut HalDetectBoxList,
     out_tracks: *mut *mut HalTrackInfoList,
 ) -> c_int {
@@ -1006,15 +1125,7 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks_tracked(
         return set_error(libc::EINVAL);
     }
 
-    let bg = if background.is_null() {
-        None
-    } else {
-        Some(&unsafe { &*background }.inner)
-    };
-    let overlay = edgefirst_image::MaskOverlay {
-        background: bg,
-        opacity: opacity.clamp(0.0, 1.0),
-    };
+    let overlay = build_overlay(background, opacity, letterbox, color_mode);
 
     let outputs_slice = std::slice::from_raw_parts(outputs, num_outputs);
 
@@ -1997,6 +2108,8 @@ mod tests {
                     std::ptr::null(),
                     std::ptr::null(),
                     1.0,
+                    std::ptr::null(),
+                    HalColorMode::Class,
                 ),
                 -1
             );
@@ -2010,6 +2123,8 @@ mod tests {
                     std::ptr::null(),
                     std::ptr::null(),
                     1.0,
+                    std::ptr::null(),
+                    HalColorMode::Class,
                 ),
                 -1
             );

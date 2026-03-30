@@ -179,7 +179,9 @@ mod gl_tests {
         )
         .unwrap();
 
-        compare_images(&image, &expected, 0.99, function!());
+        // Threshold 0.97: GPU-specific smoothstep anti-aliasing at mask edges
+        // produces small differences across platforms (x86 Mesa vs Vivante).
+        compare_images(&image, &expected, 0.97, function!());
     }
 
     #[test]
@@ -1670,7 +1672,7 @@ mod gl_tests {
         // Materialize masks on CPU for the hybrid path
         let cpu_proc = crate::CPUProcessor::new();
         let segmentation = cpu_proc
-            .materialize_segmentations(&output_boxes, &proto_data)
+            .materialize_segmentations(&output_boxes, &proto_data, None)
             .unwrap();
 
         // Create two identical RGBA canvases

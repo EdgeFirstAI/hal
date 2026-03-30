@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::decoder::{convert_detect_box, PyDecoder};
+use crate::decoder::{convert_detect_box, convert_seg_mask, PyDecoder, PyProtoData};
 use crate::tensor::PyTensor;
 use crate::tracker::PyTrackInfo;
 use edgefirst_hal::{
@@ -27,6 +27,35 @@ use std::{
 };
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Validate numpy bbox/scores/classes shapes and convert to `Vec<DetectBox>`.
+fn numpy_to_detect_boxes(
+    bbox: &PyReadonlyArray2<f32>,
+    scores: &PyReadonlyArray1<f32>,
+    classes: &PyReadonlyArray1<usize>,
+) -> Result<Vec<DetectBox>> {
+    if bbox.shape()[1] != 4 {
+        return Err(Error::InvalidArg("bbox shape must be (N, 4)".to_string()));
+    }
+    if bbox.shape()[0] != scores.shape()[0] || bbox.shape()[0] != classes.shape()[0] {
+        return Err(Error::InvalidArg(
+            "bbox, scores, classes must have the same length".to_string(),
+        ));
+    }
+    let bbox: ArrayView2<f32> = bbox.as_array();
+    let scores: ArrayView1<f32> = scores.as_array();
+    let classes: ArrayView1<usize> = classes.as_array();
+    Ok(Zip::from(bbox.rows())
+        .and(scores)
+        .and(classes)
+        .into_par_iter()
+        .map(|(b, s, c)| DetectBox {
+            bbox: BoundingBox::new(b[0], b[1], b[2], b[3]),
+            score: *s,
+            label: *c,
+        })
+        .collect())
+}
 
 #[derive(Debug)]
 pub enum Error {
@@ -923,7 +952,7 @@ impl PyImageProcessor {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (dst, bbox, scores, classes, seg=vec![], background=None, opacity=1.0))]
+    #[pyo3(signature = (dst, bbox, scores, classes, seg=vec![], background=None, opacity=1.0, letterbox=None, color_mode=PyColorMode::Class))]
     pub fn draw_decoded_masks(
         &mut self,
         dst: &mut PyTensor,
@@ -933,28 +962,10 @@ impl PyImageProcessor {
         seg: Vec<PyReadonlyArray3<u8>>,
         background: Option<&PyTensor>,
         opacity: f32,
+        letterbox: Option<[f32; 4]>,
+        color_mode: PyColorMode,
     ) -> Result<()> {
-        if bbox.shape()[1] != 4 {
-            return Err(Error::InvalidArg("bbox shape must be (N, 4)".to_string()));
-        }
-        if bbox.shape()[0] != scores.shape()[0] || bbox.shape()[0] != classes.shape()[0] {
-            return Err(Error::InvalidArg(
-                "bbox, scores, classes must have the same length".to_string(),
-            ));
-        }
-        let bbox: ArrayView2<f32> = bbox.as_array();
-        let scores: ArrayView1<f32> = scores.as_array();
-        let classes: ArrayView1<usize> = classes.as_array();
-        let detect = Zip::from(bbox.rows())
-            .and(scores)
-            .and(classes)
-            .into_par_iter()
-            .map(|(b, s, c)| DetectBox {
-                bbox: BoundingBox::new(b[0], b[1], b[2], b[3]),
-                score: *s,
-                label: *c,
-            })
-            .collect::<Vec<_>>();
+        let detect = numpy_to_detect_boxes(&bbox, &scores, &classes)?;
 
         let mut is_instance = false;
         for s in &seg {
@@ -1009,9 +1020,61 @@ impl PyImageProcessor {
         let overlay = image::MaskOverlay {
             background: background.map(|b| &b.0),
             opacity: opacity.clamp(0.0, 1.0),
+            letterbox,
+            color_mode: color_mode.into(),
         };
         l.draw_decoded_masks(&mut dst.0, &detect, &seg, overlay)?;
         Ok(())
+    }
+
+    /// Materialize per-instance segmentation masks from prototype data.
+    ///
+    /// Computes ``mask_coeff @ protos`` with sigmoid activation for each
+    /// detection, producing compact masks at prototype resolution (e.g.,
+    /// 160×160 crops). Mask values are **continuous sigmoid confidence**
+    /// quantized to uint8 (0 = background, 255 = full confidence), **not**
+    /// binary thresholded.
+    ///
+    /// The returned masks can be:
+    ///
+    /// - Inspected or exported for analytics, IoU computation, etc.
+    /// - Passed directly to :meth:`draw_decoded_masks` for GPU-interpolated
+    ///   rendering.
+    ///
+    /// .. note::
+    ///
+    ///     Calling ``materialize_masks`` + ``draw_decoded_masks`` separately
+    ///     prevents the HAL from using its internal fused optimization. For
+    ///     render-only use cases, prefer :meth:`draw_masks` which is 1.6–27×
+    ///     faster on tested platforms.
+    ///
+    /// :param bbox: detection boxes as (N, 4) float32 array (normalized xyxy)
+    /// :param scores: detection scores as (N,) float32 array
+    /// :param classes: class indices as (N,) array
+    /// :param proto_data: prototype data from :meth:`Decoder.decode_proto`
+    /// :param letterbox: optional letterbox region ``(x0, y0, x1, y1)`` in
+    ///     normalized coordinates, or ``None`` if no letterboxing was applied
+    /// :returns: list of (H, W, 1) uint8 numpy arrays with continuous sigmoid
+    ///     mask values
+    /// :rtype: list[numpy.ndarray]
+    #[pyo3(signature = (bbox, scores, classes, proto_data, letterbox=None))]
+    pub fn materialize_masks<'py>(
+        &self,
+        bbox: PyReadonlyArray2<f32>,
+        scores: PyReadonlyArray1<f32>,
+        classes: PyReadonlyArray1<usize>,
+        proto_data: &PyProtoData,
+        letterbox: Option<[f32; 4]>,
+        py: Python<'py>,
+    ) -> Result<Vec<Bound<'py, numpy::PyArray3<u8>>>> {
+        let detect = numpy_to_detect_boxes(&bbox, &scores, &classes)?;
+
+        let l = self
+            .0
+            .lock()
+            .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
+        let masks = l.materialize_masks(&detect, &proto_data.0, letterbox)?;
+        Ok(convert_seg_mask(py, &masks))
     }
 
     /// Decode model outputs and draw masks directly onto the destination
@@ -1029,7 +1092,7 @@ impl PyImageProcessor {
     ///
     /// Without a tracker the return value is `(boxes, scores, classes)`.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (decoder, model_output, dst, tracker=None, timestamp=None, background=None, opacity=1.0))]
+    #[pyo3(signature = (decoder, model_output, dst, tracker=None, timestamp=None, background=None, opacity=1.0, letterbox=None, color_mode=PyColorMode::Class))]
     pub fn draw_masks<'py>(
         &mut self,
         decoder: &PyDecoder,
@@ -1039,6 +1102,8 @@ impl PyImageProcessor {
         timestamp: Option<u64>,
         background: Option<&PyTensor>,
         opacity: f32,
+        letterbox: Option<[f32; 4]>,
+        color_mode: PyColorMode,
         py: Python<'py>,
     ) -> PyResult<Py<PyAny>> {
         let tensor_refs: Vec<&edgefirst_hal::tensor::TensorDyn> =
@@ -1054,6 +1119,8 @@ impl PyImageProcessor {
         let overlay = image::MaskOverlay {
             background: background.map(|b| &b.0),
             opacity: opacity.clamp(0.0, 1.0),
+            letterbox,
+            color_mode: color_mode.into(),
         };
         let mut l = self
             .0
@@ -1310,6 +1377,31 @@ impl From<PyRect> for Rect {
             top: val.top,
             width: val.width,
             height: val.height,
+        }
+    }
+}
+
+/// Controls how mask colors are assigned to detections.
+///
+/// - ``Class`` — color is chosen by class label (default, correct for semantic
+///   segmentation where colors carry class meaning)
+/// - ``Instance`` — color is chosen by detection index (each detected object
+///   gets a unique color regardless of class)
+/// - ``Track`` — color is chosen by track ID (use with object tracking)
+#[pyclass(name = "ColorMode", eq, eq_int)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PyColorMode {
+    Class = 0,
+    Instance = 1,
+    Track = 2,
+}
+
+impl From<PyColorMode> for image::ColorMode {
+    fn from(val: PyColorMode) -> Self {
+        match val {
+            PyColorMode::Class => image::ColorMode::Class,
+            PyColorMode::Instance => image::ColorMode::Instance,
+            PyColorMode::Track => image::ColorMode::Track,
         }
     }
 }

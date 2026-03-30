@@ -348,12 +348,12 @@ in vec4 fragColor;
 out vec4 color;
 void main() {
     float r0 = texture(mask0, tc).r;
-    int arg = int(r0>=0.5);
-    if (arg == 0) {
+    float edge = smoothstep(0.5, 0.65, r0);
+    if (edge <= 0.0) {
         discard;
     }
     vec4 c = colors[class_index % 20];
-    color = vec4(c.rgb, c.a * opacity);
+    color = vec4(c.rgb, c.a * edge * opacity);
 }
 "
 }

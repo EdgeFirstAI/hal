@@ -440,8 +440,10 @@ pub struct Segmentation {
     pub ymax: f32,
     /// 3D segmentation array of shape `(H, W, C)`.
     ///
-    /// For instance segmentation (e.g. YOLO): `C=1` — binary per-instance
-    /// mask where values >= 128 indicate object presence.
+    /// For instance segmentation (e.g. YOLO): `C=1` — per-instance mask with
+    /// continuous sigmoid confidence values quantized to u8 (0 = background,
+    /// 255 = full confidence). Renderers typically threshold at 128 (sigmoid
+    /// 0.5) or use smooth interpolation for anti-aliased edges.
     ///
     /// For semantic segmentation (e.g. ModelPack): `C=num_classes` — per-pixel
     /// class scores where the object class is the argmax index.
