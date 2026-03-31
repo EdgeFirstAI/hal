@@ -257,7 +257,9 @@ def tensor_from_fd_func(mem_type: TensorMemory):
         pytest.skip(f"{mem_type} memory not supported on this platform")
 
     for _ in range(100):
-        tensor_fd = Tensor.from_fd(original.fd, original.shape, original.dtype)
+        fd = original.fd  # .fd returns a dup — caller must close
+        tensor_fd = Tensor.from_fd(fd, original.shape, original.dtype)
+        os.close(fd)  # close the dup from .fd (from_fd dups again internally)
         with tensor_fd.map() as m:
             m[0] = 3
         del tensor_fd

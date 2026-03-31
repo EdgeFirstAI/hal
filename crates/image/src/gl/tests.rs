@@ -2431,4 +2431,211 @@ mod gl_tests {
             unaligned_result.err()
         );
     }
+
+    // =========================================================================
+    // PlaneDescriptor stride/offset integration tests for import_image
+    // =========================================================================
+
+    /// Baseline: import a tightly-packed RGBA DMA buffer with explicit stride
+    /// equal to width * 4. Verifies that import_image succeeds and the
+    /// returned tensor has the expected dimensions and format.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_import_image_rgba_with_stride() {
+        use edgefirst_tensor::PlaneDescriptor;
+
+        if !is_dma_available() {
+            eprintln!("SKIPPED: test_import_image_rgba_with_stride - DMA not available");
+            return;
+        }
+
+        let width: usize = 640;
+        let height: usize = 480;
+        let bpp: usize = 4; // RGBA
+        let stride = width * bpp; // 2560, tightly packed
+
+        // Allocate a DMA tensor large enough for the RGBA image
+        let buf = Tensor::<u8>::new(
+            &[height, width, bpp],
+            Some(TensorMemory::Dma),
+            Some("import_rgba_tight"),
+        );
+        let buf = match buf {
+            Ok(t) if t.memory() == TensorMemory::Dma => t,
+            _ => {
+                eprintln!("SKIPPED: test_import_image_rgba_with_stride - DMA alloc failed");
+                return;
+            }
+        };
+
+        let fd = buf.dmabuf().unwrap();
+        let plane = PlaneDescriptor::new(fd).unwrap().with_stride(stride);
+
+        let proc = crate::ImageProcessor::new().unwrap();
+        let imported = proc
+            .import_image(plane, None, width, height, PixelFormat::Rgba, DType::U8)
+            .unwrap();
+
+        assert_eq!(imported.width(), Some(width));
+        assert_eq!(imported.height(), Some(height));
+        assert_eq!(imported.format(), Some(PixelFormat::Rgba));
+        assert_eq!(imported.row_stride(), Some(stride));
+    }
+
+    /// Import an RGBA DMA buffer with a padded stride (64-byte aligned).
+    /// The stride is larger than width * bpp; import_image must accept
+    /// the padding and report the correct shape.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_import_image_rgba_padded_stride() {
+        use edgefirst_tensor::PlaneDescriptor;
+
+        if !is_dma_available() {
+            eprintln!("SKIPPED: test_import_image_rgba_padded_stride - DMA not available");
+            return;
+        }
+
+        let width: usize = 640;
+        let height: usize = 480;
+        let bpp: usize = 4;
+        // 64-byte aligned stride: ceil(640*4 / 64) * 64 = 2560 (already aligned)
+        // Use 128-byte alignment to get a genuinely padded stride.
+        let stride: usize = ((width * bpp + 127) / 128) * 128; // 2560 -> 2560 (already 128-aligned)
+                                                               // Force a wider stride to be sure it's padded
+        let stride = stride + 128; // 2688
+
+        // Allocate a DMA buffer large enough for the padded rows
+        let total_bytes = stride * height;
+        let buf = Tensor::<u8>::new(
+            &[total_bytes],
+            Some(TensorMemory::Dma),
+            Some("import_rgba_padded"),
+        );
+        let buf = match buf {
+            Ok(t) if t.memory() == TensorMemory::Dma => t,
+            _ => {
+                eprintln!("SKIPPED: test_import_image_rgba_padded_stride - DMA alloc failed");
+                return;
+            }
+        };
+
+        let fd = buf.dmabuf().unwrap();
+        let plane = PlaneDescriptor::new(fd).unwrap().with_stride(stride);
+
+        let proc = crate::ImageProcessor::new().unwrap();
+        let imported = proc
+            .import_image(plane, None, width, height, PixelFormat::Rgba, DType::U8)
+            .unwrap();
+
+        assert_eq!(imported.width(), Some(width));
+        assert_eq!(imported.height(), Some(height));
+        assert_eq!(imported.format(), Some(PixelFormat::Rgba));
+        assert_eq!(imported.row_stride(), Some(stride));
+    }
+
+    /// Import a DMA buffer as multiplane NV12 with explicit offsets.
+    /// The luma plane starts at offset 0 and the chroma plane starts at
+    /// height * stride. This mirrors the layout produced by V4L2 camera
+    /// drivers that expose NV12 as two separate planes sharing one fd.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_import_image_nv12_with_offset() {
+        use edgefirst_tensor::PlaneDescriptor;
+
+        if !is_dma_available() {
+            eprintln!("SKIPPED: test_import_image_nv12_with_offset - DMA not available");
+            return;
+        }
+
+        let width: usize = 640;
+        let height: usize = 480;
+        let stride: usize = 640; // NV12 luma stride = width (1 byte per pixel)
+        let luma_size = height * stride;
+        let chroma_h = height / 2;
+        let chroma_size = chroma_h * stride;
+        let total_bytes = luma_size + chroma_size;
+
+        // Single DMA buffer holding both luma and chroma planes
+        let buf = Tensor::<u8>::new(
+            &[total_bytes],
+            Some(TensorMemory::Dma),
+            Some("import_nv12_planes"),
+        );
+        let buf = match buf {
+            Ok(t) if t.memory() == TensorMemory::Dma => t,
+            _ => {
+                eprintln!("SKIPPED: test_import_image_nv12_with_offset - DMA alloc failed");
+                return;
+            }
+        };
+
+        let fd = buf.dmabuf().unwrap();
+        let luma_plane = PlaneDescriptor::new(fd)
+            .unwrap()
+            .with_stride(stride)
+            .with_offset(0);
+        let chroma_plane = PlaneDescriptor::new(fd)
+            .unwrap()
+            .with_stride(stride)
+            .with_offset(luma_size);
+
+        let proc = crate::ImageProcessor::new().unwrap();
+        let imported = proc
+            .import_image(
+                luma_plane,
+                Some(chroma_plane),
+                width,
+                height,
+                PixelFormat::Nv12,
+                DType::U8,
+            )
+            .unwrap();
+
+        assert_eq!(imported.width(), Some(width));
+        assert_eq!(imported.height(), Some(height));
+        assert_eq!(imported.format(), Some(PixelFormat::Nv12));
+    }
+
+    /// Attempt to import with a stride smaller than width * bpp.
+    /// import_image (via set_row_stride) must reject this with an error.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_import_image_stride_too_small() {
+        use edgefirst_tensor::PlaneDescriptor;
+
+        if !is_dma_available() {
+            eprintln!("SKIPPED: test_import_image_stride_too_small - DMA not available");
+            return;
+        }
+
+        let width: usize = 640;
+        let height: usize = 480;
+        let bpp: usize = 4;
+        let bad_stride = width * bpp - 1; // one byte too narrow
+
+        let buf = Tensor::<u8>::new(
+            &[height, width, bpp],
+            Some(TensorMemory::Dma),
+            Some("import_bad_stride"),
+        );
+        let buf = match buf {
+            Ok(t) if t.memory() == TensorMemory::Dma => t,
+            _ => {
+                eprintln!("SKIPPED: test_import_image_stride_too_small - DMA alloc failed");
+                return;
+            }
+        };
+
+        let fd = buf.dmabuf().unwrap();
+        let plane = PlaneDescriptor::new(fd).unwrap().with_stride(bad_stride);
+
+        let proc = crate::ImageProcessor::new().unwrap();
+        let result = proc.import_image(plane, None, width, height, PixelFormat::Rgba, DType::U8);
+
+        assert!(
+            result.is_err(),
+            "import_image should reject stride {bad_stride} < minimum {} for {width}x{height} RGBA",
+            width * bpp
+        );
+    }
 }
