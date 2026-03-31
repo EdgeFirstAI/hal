@@ -615,6 +615,64 @@ mod cpu_tests {
         )
     }
 
+    // ========================================================================
+    // VYUY conversion tests
+    // ========================================================================
+
+    #[test]
+    fn test_cpu_vyuy_to_grey() -> Result<()> {
+        generate_conversion_tests!(
+            PixelFormat::Vyuy,
+            "camera720p.vyuy",
+            PixelFormat::Grey,
+            "camera720p.y800"
+        )
+    }
+
+    #[test]
+    fn test_cpu_vyuy_to_planar_rgb() -> Result<()> {
+        generate_conversion_tests!(
+            PixelFormat::Vyuy,
+            "camera720p.vyuy",
+            PixelFormat::PlanarRgb,
+            "camera720p.8bps"
+        )
+    }
+
+    #[test]
+    fn test_cpu_vyuy_to_nv16() -> Result<()> {
+        generate_conversion_tests!(
+            PixelFormat::Vyuy,
+            "camera720p.vyuy",
+            PixelFormat::Nv16,
+            "camera720p.nv16"
+        )
+    }
+
+    // ========================================================================
+    // NV16 conversion tests
+    // ========================================================================
+
+    #[test]
+    fn test_cpu_nv16_to_rgb() -> Result<()> {
+        generate_conversion_tests!(
+            PixelFormat::Nv16,
+            "camera720p.nv16",
+            PixelFormat::Rgb,
+            "camera720p.rgb"
+        )
+    }
+
+    #[test]
+    fn test_cpu_nv16_to_rgba() -> Result<()> {
+        generate_conversion_tests!(
+            PixelFormat::Nv16,
+            "camera720p.nv16",
+            PixelFormat::Rgba,
+            "camera720p.rgba"
+        )
+    }
+
     #[test]
     fn test_cpu_nearest() -> Result<()> {
         // Load source

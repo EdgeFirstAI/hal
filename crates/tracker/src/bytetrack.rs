@@ -618,4 +618,356 @@ mod tests {
         assert!(tracker.tracklets.is_empty());
         assert_eq!(tracker.frame_count, 1);
     }
+
+    #[test]
+    fn test_two_stage_matching() {
+        // The core ByteTrack innovation: low-confidence detections are matched
+        // to existing tracklets in a second stage.
+        let mut tracker = ByteTrackBuilder::new().build();
+
+        // Frame 1: high-confidence detection creates a tracklet
+        let det1 = vec![MockDetection::new(0.2, 0.2, 0.4, 0.4, 0.9)];
+        let res1 = tracker.update(&det1, 1_000_000);
+        assert!(res1[0].is_some());
+        let uuid1 = res1[0].unwrap().uuid;
+        assert_eq!(tracker.tracklets.len(), 1);
+
+        // Frame 2: same location but low confidence (0.3, below track_high_conf=0.7).
+        // Second-stage matching should still associate it with the existing tracklet.
+        let det2 = vec![MockDetection::new(0.2, 0.2, 0.4, 0.4, 0.3)];
+        let res2 = tracker.update(&det2, 2_000_000);
+        assert!(
+            res2[0].is_some(),
+            "Low-conf detection should match existing tracklet via second stage"
+        );
+        assert_eq!(
+            res2[0].unwrap().uuid,
+            uuid1,
+            "Should match the same tracklet"
+        );
+        assert_eq!(
+            tracker.tracklets.len(),
+            1,
+            "No new tracklet should be created"
+        );
+        assert_eq!(
+            tracker.tracklets[0].count, 2,
+            "Tracklet count should increment"
+        );
+    }
+
+    #[test]
+    fn test_builder_track_extra_lifespan() {
+        let lifespan_default = 500_000_000; // 0.5 seconds (default)
+        let lifespan_extended = 2_000_000_000; // 2 seconds
+
+        let mut tracker_default: ByteTrack<MockDetection> = ByteTrackBuilder::new().build();
+        let mut tracker_extended: ByteTrack<MockDetection> = ByteTrackBuilder::new()
+            .track_extra_lifespan(lifespan_extended)
+            .build();
+
+        assert_eq!(tracker_default.track_extra_lifespan, lifespan_default);
+        assert_eq!(tracker_extended.track_extra_lifespan, lifespan_extended);
+
+        let ts_start = 1_000_000_000u64; // 1 second
+        let det = vec![MockDetection::new(0.2, 0.2, 0.4, 0.4, 0.9)];
+
+        tracker_default.update(&det, ts_start);
+        tracker_extended.update(&det, ts_start);
+        assert_eq!(tracker_default.tracklets.len(), 1);
+        assert_eq!(tracker_extended.tracklets.len(), 1);
+
+        // Advance to 1s + 1s = 2s. Default lifespan (0.5s) should have expired,
+        // extended lifespan (2s) should still be active.
+        let ts_after = ts_start + 1_000_000_000;
+        let empty: Vec<MockDetection> = vec![];
+        tracker_default.update(&empty, ts_after);
+        tracker_extended.update(&empty, ts_after);
+
+        assert!(
+            tracker_default.tracklets.is_empty(),
+            "Default tracker should have expired the tracklet"
+        );
+        assert_eq!(
+            tracker_extended.tracklets.len(),
+            1,
+            "Extended tracker should still have the tracklet"
+        );
+    }
+
+    #[test]
+    fn test_builder_track_high_conf() {
+        let mut tracker: ByteTrack<MockDetection> =
+            ByteTrackBuilder::new().track_high_conf(0.9).build();
+        assert_eq!(tracker.track_high_conf, 0.9);
+
+        // Detection with score 0.8 is below the 0.9 threshold
+        let det_low = vec![MockDetection::new(0.1, 0.1, 0.3, 0.3, 0.8)];
+        let res = tracker.update(&det_low, 1000);
+        assert!(
+            res[0].is_none(),
+            "Score 0.8 should not create a tracklet with threshold 0.9"
+        );
+        assert!(tracker.tracklets.is_empty());
+
+        // Detection with score 0.95 is above the 0.9 threshold
+        let det_high = vec![MockDetection::new(0.1, 0.1, 0.3, 0.3, 0.95)];
+        let res = tracker.update(&det_high, 2000);
+        assert!(
+            res[0].is_some(),
+            "Score 0.95 should create a tracklet with threshold 0.9"
+        );
+        assert_eq!(tracker.tracklets.len(), 1);
+    }
+
+    #[test]
+    fn test_builder_track_iou() {
+        // Tight IOU threshold: shifted detection should NOT match
+        let mut tracker: ByteTrack<MockDetection> = ByteTrackBuilder::new().track_iou(0.8).build();
+
+        // Frame 1: two well-separated detections
+        let det1 = vec![
+            MockDetection::new(0.1, 0.1, 0.3, 0.3, 0.9),
+            MockDetection::new(0.5, 0.5, 0.7, 0.7, 0.9),
+        ];
+        tracker.update(&det1, 1000);
+        assert_eq!(tracker.tracklets.len(), 2);
+
+        // Frame 2: shift the first detection slightly. With IOU threshold 0.8
+        // the overlap won't be enough for a match, so it creates a new tracklet.
+        let det2 = vec![
+            MockDetection::new(0.15, 0.15, 0.35, 0.35, 0.9),
+            MockDetection::new(0.5, 0.5, 0.7, 0.7, 0.9),
+        ];
+        let res2 = tracker.update(&det2, 2000);
+        assert_eq!(res2.len(), 2);
+
+        // The second detection (unchanged) should still match. The first (shifted)
+        // should fail the tight IOU threshold and create a new tracklet.
+        assert!(
+            tracker.tracklets.len() >= 3,
+            "Shifted detection should create a new tracklet with tight IOU threshold, got {} tracklets",
+            tracker.tracklets.len()
+        );
+    }
+
+    #[test]
+    fn test_degenerate_zero_area_box() {
+        // A zero-area box (xmin == xmax) should not panic
+        let mut tracker = ByteTrackBuilder::new().build();
+        let det = vec![
+            MockDetection::new(0.5, 0.1, 0.5, 0.3, 0.9), // zero width
+            MockDetection::new(0.1, 0.1, 0.3, 0.3, 0.9), // normal box
+        ];
+        let results = tracker.update(&det, 1000);
+        assert_eq!(results.len(), 2);
+
+        // IOU between a zero-area box and a normal box should be 0
+        let zero_box = [0.5, 0.1, 0.5, 0.3];
+        let normal_box = [0.1, 0.1, 0.3, 0.3];
+        let iou_val = iou(&zero_box, &normal_box);
+        assert!(
+            iou_val < EPSILON,
+            "IOU with a zero-area box should be ~0, got {iou_val}"
+        );
+    }
+
+    #[test]
+    fn test_degenerate_high_velocity() {
+        let mut tracker = ByteTrackBuilder::new().build();
+
+        // Frame 1: detection at top-left
+        let det1 = vec![MockDetection::new(0.1, 0.1, 0.2, 0.2, 0.9)];
+        let res1 = tracker.update(&det1, 1_000_000);
+        assert!(res1[0].is_some());
+        let uuid1 = res1[0].unwrap().uuid;
+        assert_eq!(tracker.tracklets.len(), 1);
+
+        // Frame 2: detection at bottom-right (huge displacement)
+        let det2 = vec![MockDetection::new(0.8, 0.8, 0.9, 0.9, 0.9)];
+        let res2 = tracker.update(&det2, 2_000_000);
+        assert!(res2[0].is_some());
+
+        // With default IOU threshold the far-away detection should not match;
+        // a new tracklet is created instead.
+        assert_eq!(
+            tracker.tracklets.len(),
+            2,
+            "Far-displaced detection should create a new tracklet"
+        );
+        assert_ne!(
+            res2[0].unwrap().uuid,
+            uuid1,
+            "New detection should have a different UUID"
+        );
+    }
+
+    #[test]
+    fn test_many_detections_100() {
+        let mut tracker = ByteTrackBuilder::new().build();
+
+        // Generate 100 non-overlapping small boxes spread across [0, 1]
+        let detections: Vec<MockDetection> = (0..100)
+            .map(|i| {
+                let x = (i % 10) as f32 * 0.1;
+                let y = (i / 10) as f32 * 0.1;
+                MockDetection::new(x, y, x + 0.05, y + 0.05, 0.9)
+            })
+            .collect();
+
+        let results = tracker.update(&detections, 1000);
+        assert_eq!(results.len(), 100);
+        assert!(
+            results.iter().all(|r| r.is_some()),
+            "All 100 high-confidence detections should create tracklets"
+        );
+        assert_eq!(
+            tracker.tracklets.len(),
+            100,
+            "Should have 100 active tracklets"
+        );
+    }
+
+    #[test]
+    fn test_tracklet_count_increments_each_frame() {
+        let mut tracker = ByteTrackBuilder::new().build();
+        let det = vec![MockDetection::new(0.2, 0.2, 0.4, 0.4, 0.9)];
+
+        for frame in 1..=5 {
+            tracker.update(&det, frame * 1000);
+        }
+
+        assert_eq!(tracker.tracklets.len(), 1);
+        assert_eq!(
+            tracker.tracklets[0].count, 5,
+            "Tracklet count should equal number of frames it was matched"
+        );
+    }
+
+    #[test]
+    fn test_tracklet_created_timestamp_preserved() {
+        let mut tracker = ByteTrackBuilder::new().build();
+        let det = vec![MockDetection::new(0.2, 0.2, 0.4, 0.4, 0.9)];
+
+        tracker.update(&det, 1000);
+        tracker.update(&det, 2000);
+        tracker.update(&det, 3000);
+
+        let active = tracker.get_active_tracks();
+        assert_eq!(active.len(), 1);
+        assert_eq!(
+            active[0].info.created, 1000,
+            "Created timestamp should remain at the first frame"
+        );
+        assert_eq!(
+            active[0].info.last_updated, 3000,
+            "Last updated should be the most recent frame"
+        );
+    }
+
+    #[test]
+    fn test_mixed_confidence_detections() {
+        // Mix of high and low confidence detections in a single frame
+        let mut tracker = ByteTrackBuilder::new().build();
+        let det = vec![
+            MockDetection::new(0.1, 0.1, 0.2, 0.2, 0.9),  // high
+            MockDetection::new(0.3, 0.3, 0.4, 0.4, 0.3),  // low
+            MockDetection::new(0.5, 0.5, 0.6, 0.6, 0.85), // high
+            MockDetection::new(0.7, 0.7, 0.8, 0.8, 0.1),  // low
+        ];
+
+        let results = tracker.update(&det, 1000);
+        assert_eq!(results.len(), 4);
+
+        // Only the high-confidence ones should create tracklets
+        assert!(
+            results[0].is_some(),
+            "High-conf detection should create tracklet"
+        );
+        assert!(
+            results[1].is_none(),
+            "Low-conf detection should not create tracklet"
+        );
+        assert!(
+            results[2].is_some(),
+            "High-conf detection should create tracklet"
+        );
+        assert!(
+            results[3].is_none(),
+            "Low-conf detection should not create tracklet"
+        );
+        assert_eq!(tracker.tracklets.len(), 2);
+    }
+
+    #[test]
+    fn test_iou_contained_box() {
+        // One box fully contains the other
+        let outer = [0.0, 0.0, 1.0, 1.0];
+        let inner = [0.25, 0.25, 0.75, 0.75];
+        let result = iou(&outer, &inner);
+        // inner area = 0.25, outer area = 1.0, intersection = 0.25, union = 1.0
+        assert!(
+            (result - 0.25).abs() < 0.01,
+            "IOU of contained box should be inner_area/outer_area = 0.25, got {result}"
+        );
+    }
+
+    #[test]
+    fn test_xyxy_to_xyah_square_box() {
+        // A square box should have aspect ratio 1.0
+        let square = [0.1, 0.2, 0.3, 0.4];
+        let xyah = xyxy_to_xyah(&square);
+        assert!((xyah[0] - 0.2).abs() < 1e-5, "Center x should be 0.2");
+        assert!((xyah[1] - 0.3).abs() < 1e-5, "Center y should be 0.3");
+        assert!(
+            (xyah[2] - 1.0).abs() < 1e-5,
+            "Aspect ratio of square should be 1.0"
+        );
+        assert!((xyah[3] - 0.2).abs() < 1e-5, "Height should be 0.2");
+    }
+
+    #[test]
+    fn test_frame_count_increments() {
+        let mut tracker = ByteTrackBuilder::new().build();
+        let empty: Vec<MockDetection> = vec![];
+
+        for _ in 0..10 {
+            tracker.update(&empty, 0);
+        }
+
+        assert_eq!(
+            tracker.frame_count, 10,
+            "Frame count should increment each update"
+        );
+    }
+
+    #[test]
+    fn test_tracklet_predicted_location_near_detection() {
+        let mut tracker = ByteTrackBuilder::new().build();
+        let det = vec![MockDetection::new(0.2, 0.2, 0.4, 0.4, 0.9)];
+        tracker.update(&det, 1000);
+
+        let pred = tracker.tracklets[0].get_predicted_location();
+        // The predicted location should be close to the original detection
+        assert!(
+            (pred[0] - 0.2).abs() < 0.1,
+            "Predicted xmin should be near 0.2, got {}",
+            pred[0]
+        );
+        assert!(
+            (pred[1] - 0.2).abs() < 0.1,
+            "Predicted ymin should be near 0.2, got {}",
+            pred[1]
+        );
+        assert!(
+            (pred[2] - 0.4).abs() < 0.1,
+            "Predicted xmax should be near 0.4, got {}",
+            pred[2]
+        );
+        assert!(
+            (pred[3] - 0.4).abs() < 0.1,
+            "Predicted ymax should be near 0.4, got {}",
+            pred[3]
+        );
+    }
 }

@@ -1533,6 +1533,68 @@ mod decoder_tests {
     }
 
     #[test]
+    fn test_dequant_ground_truth() {
+        // Formula: output = (input - zero_point) * scale
+        // Verify both dequantize_cpu and dequantize_cpu_chunked against hand-computed values.
+
+        // Case 1: scale=0.1, zero_point=-128 (from doc example)
+        let quant = Quantization::new(0.1, -128);
+        let input: Vec<i8> = vec![0, 127, -128, 64];
+        let mut output = vec![0.0f32; 4];
+        let mut output_chunked = vec![0.0f32; 4];
+        dequantize_cpu(&input, quant, &mut output);
+        dequantize_cpu_chunked(&input, quant, &mut output_chunked);
+        // (0 - (-128)) * 0.1 = 12.8
+        // (127 - (-128)) * 0.1 = 25.5
+        // (-128 - (-128)) * 0.1 = 0.0
+        // (64 - (-128)) * 0.1 = 19.2
+        let expected: Vec<f32> = vec![12.8, 25.5, 0.0, 19.2];
+        for (i, (&out, &exp)) in output.iter().zip(expected.iter()).enumerate() {
+            assert!((out - exp).abs() < 1e-5, "cpu[{i}]: {out} != {exp}");
+        }
+        for (i, (&out, &exp)) in output_chunked.iter().zip(expected.iter()).enumerate() {
+            assert!((out - exp).abs() < 1e-5, "chunked[{i}]: {out} != {exp}");
+        }
+
+        // Case 2: scale=1.0, zero_point=0 (identity-like)
+        let quant = Quantization::new(1.0, 0);
+        dequantize_cpu(&input, quant, &mut output);
+        dequantize_cpu_chunked(&input, quant, &mut output_chunked);
+        let expected: Vec<f32> = vec![0.0, 127.0, -128.0, 64.0];
+        assert_eq!(output, expected);
+        assert_eq!(output_chunked, expected);
+
+        // Case 3: scale=0.5, zero_point=0
+        let quant = Quantization::new(0.5, 0);
+        dequantize_cpu(&input, quant, &mut output);
+        dequantize_cpu_chunked(&input, quant, &mut output_chunked);
+        let expected: Vec<f32> = vec![0.0, 63.5, -64.0, 32.0];
+        assert_eq!(output, expected);
+        assert_eq!(output_chunked, expected);
+
+        // Case 4: i8 min/max boundaries with typical quantization params
+        let quant = Quantization::new(0.021287762, 31);
+        let input: Vec<i8> = vec![-128, -1, 0, 1, 31, 127];
+        let mut output = vec![0.0f32; 6];
+        let mut output_chunked = vec![0.0f32; 6];
+        dequantize_cpu(&input, quant, &mut output);
+        dequantize_cpu_chunked(&input, quant, &mut output_chunked);
+        for i in 0..6 {
+            let expected = (input[i] as f32 - 31.0) * 0.021287762;
+            assert!(
+                (output[i] - expected).abs() < 1e-5,
+                "cpu[{i}]: {} != {expected}",
+                output[i]
+            );
+            assert!(
+                (output_chunked[i] - expected).abs() < 1e-5,
+                "chunked[{i}]: {} != {expected}",
+                output_chunked[i]
+            );
+        }
+    }
+
+    #[test]
     fn test_decoder_yolo_det() {
         let score_threshold = 0.25;
         let iou_threshold = 0.7;

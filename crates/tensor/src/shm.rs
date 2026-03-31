@@ -240,3 +240,63 @@ where
         self.unmap();
     }
 }
+
+#[cfg(test)]
+#[cfg(unix)]
+mod tests {
+    use super::*;
+    use crate::{TensorMapTrait, TensorMemory, TensorTrait};
+
+    #[test]
+    fn test_new_valid_shape() {
+        let tensor = ShmTensor::<u8>::new(&[2, 3, 4], None).unwrap();
+        assert_eq!(tensor.shape(), &[2, 3, 4]);
+        assert_eq!(tensor.memory(), TensorMemory::Shm);
+        assert_eq!(tensor.len(), 24);
+        assert_eq!(tensor.size(), 24);
+    }
+
+    #[test]
+    fn test_map_read_write() {
+        let tensor = ShmTensor::<u8>::new(&[4, 4], None).unwrap();
+        let mut map = tensor.map().unwrap();
+        map.as_mut_slice()[0] = 10;
+        map.as_mut_slice()[5] = 20;
+        assert_eq!(map.as_slice()[0], 10);
+        assert_eq!(map.as_slice()[5], 20);
+        assert_eq!(map.as_slice()[1], 0);
+    }
+
+    #[test]
+    fn test_from_fd_roundtrip() {
+        // Create tensor A and write data into it.
+        let tensor_a = ShmTensor::<u8>::new(&[2, 4], None).unwrap();
+        {
+            let mut map_a = tensor_a.map().unwrap();
+            map_a.as_mut_slice()[0] = 0xAB;
+            map_a.as_mut_slice()[7] = 0xCD;
+        }
+
+        // Clone A's fd and create tensor B from it.
+        let fd = tensor_a.clone_fd().unwrap();
+        let tensor_b = ShmTensor::<u8>::from_fd(fd, &[2, 4], Some("clone")).unwrap();
+
+        // Verify B sees the same data (shared memory).
+        let map_b = tensor_b.map().unwrap();
+        assert_eq!(map_b.as_slice()[0], 0xAB);
+        assert_eq!(map_b.as_slice()[7], 0xCD);
+    }
+
+    #[test]
+    fn test_reshape() {
+        let mut tensor = ShmTensor::<u8>::new(&[3, 4], None).unwrap();
+        tensor.reshape(&[12]).unwrap();
+        assert_eq!(tensor.shape(), &[12]);
+        assert_eq!(tensor.len(), 12);
+
+        // Incompatible reshape should fail.
+        let result = tensor.reshape(&[7]);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), Error::ShapeMismatch(_)));
+    }
+}

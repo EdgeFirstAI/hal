@@ -185,3 +185,61 @@ where
         self.unmap();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{TensorMapTrait, TensorMemory, TensorTrait};
+
+    #[test]
+    fn test_new_valid_shape() {
+        let tensor = MemTensor::<u8>::new(&[2, 3, 4], Some("test")).unwrap();
+        assert_eq!(tensor.shape(), &[2, 3, 4]);
+        assert_eq!(tensor.memory(), TensorMemory::Mem);
+        assert_eq!(tensor.name(), "test");
+        assert_eq!(tensor.size(), 24);
+        assert_eq!(tensor.len(), 24);
+    }
+
+    #[test]
+    fn test_new_empty_shape_error() {
+        let result = MemTensor::<u8>::new(&[], Some("test"));
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), Error::InvalidSize(_)));
+    }
+
+    #[test]
+    fn test_new_zero_dim_error() {
+        let result = MemTensor::<u8>::new(&[2, 0, 4], Some("test"));
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), Error::InvalidSize(_)));
+    }
+
+    #[test]
+    fn test_map_read_write() {
+        let tensor = MemTensor::<u8>::new(&[2, 3], Some("rw")).unwrap();
+        let mut map = tensor.map().unwrap();
+        map.as_mut_slice()[0] = 42;
+        map.as_mut_slice()[1] = 99;
+        assert_eq!(map.as_slice()[0], 42);
+        assert_eq!(map.as_slice()[1], 99);
+        // Remaining elements should still be zero-initialized.
+        assert_eq!(map.as_slice()[2], 0);
+    }
+
+    #[test]
+    fn test_reshape_compatible() {
+        let mut tensor = MemTensor::<u8>::new(&[2, 3], None).unwrap();
+        tensor.reshape(&[6]).unwrap();
+        assert_eq!(tensor.shape(), &[6]);
+        assert_eq!(tensor.len(), 6);
+    }
+
+    #[test]
+    fn test_reshape_incompatible() {
+        let mut tensor = MemTensor::<u8>::new(&[2, 3], None).unwrap();
+        let result = tensor.reshape(&[7]);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), Error::ShapeMismatch(_)));
+    }
+}
