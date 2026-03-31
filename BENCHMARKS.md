@@ -1,8 +1,8 @@
 # EdgeFirst HAL - Benchmarks
 
-**Version:** 2.2
-**Last Updated:** March 27, 2026
-**Status:** Added date stamps to all benchmark sections; added image_benchmark to binary table; noted pending YoloSegDet2Way data; noted pending mask rendering optimization updates
+**Version:** 3.0
+**Last Updated:** March 30, 2026
+**Status:** v0.15.0 release — added jetson-orin-nano platform; refreshed all benchmarks across 5 platforms; added materialize_masks API and hybrid path comparison; per-texture EGL binding optimization
 
 ---
 
@@ -215,9 +215,9 @@ JSON files are collected in `benchmarks/<platform>/` and processed by `.github/s
 
 ## Benchmark Results
 
-### Buffer Infrastructure
+**Data collected:** March 30, 2026 (v0.15.0, per-texture EGL binding optimization)
 
-**Data collected:** March 20, 2026
+### Buffer Infrastructure
 
 #### Allocation Latency
 
@@ -225,235 +225,159 @@ Measures `Tensor::new()` latency for each buffer type and resolution.
 
 | Platform | Buffer | 720p (3.5 MB) | 1080p (7.9 MB) | 4K (31.6 MB) |
 |----------|--------|---------------|-----------------|---------------|
-| imx8mp-frdm | MEM | 309 us | 695 us | 2.8 ms |
+| imx8mp-frdm | MEM | 310 us | 698 us | 2.8 ms |
 | imx8mp-frdm | SHM | 26 us | 26 us | 26 us |
-| imx8mp-frdm | DMA | 1.5 ms | 2.7 ms | 10.2 ms |
-| imx95-frdm | MEM | 263 us | 596 us | 2.4 ms |
+| imx8mp-frdm | DMA | 38.2 ms | 29.9 ms | 10.0 ms |
+| imx95-frdm | MEM | 266 us | 596 us | 2.4 ms |
 | imx95-frdm | SHM | 31 us | 31 us | 31 us |
-| imx95-frdm | DMA | 988 us | 2.1 ms | 8.4 ms |
-| rpi5-hailo | MEM | 281 us | 740 us | 3.6 ms |
+| imx95-frdm | DMA | 983 us | 2.1 ms | 8.4 ms |
+| rpi5-hailo | MEM | 249 us | 736 us | 3.5 ms |
 | rpi5-hailo | SHM | 6.0 us | 6.0 us | 6.0 us |
-| rpi5-hailo | DMA | 714 us | 1.6 ms | 6.3 ms |
-| x86-desktop | MEM | 71 us | 239 us | 1.2 ms |
-| x86-desktop | SHM | 4.0 us | 4.0 us | 4.0 us |
+| rpi5-hailo | DMA | 713 us | 1.6 ms | 6.2 ms |
+| jetson-orin-nano | MEM | 171 us | 386 us | 1.5 ms |
+| jetson-orin-nano | SHM | 14 us | 14 us | 14 us |
+| x86-desktop | MEM | 105 us | 268 us | 807 us |
+| x86-desktop | SHM | 2.0 us | 2.0 us | 2.0 us |
 
 #### Map/Unmap Latency
 
-Measures `tensor.map()` round-trip latency. MEM buffers have zero map overhead (direct pointer access). SHM and DMA buffers require kernel calls.
+Measures `tensor.map()` round-trip latency.
 
 | Platform | Buffer | 720p | 1080p | 4K |
 |----------|--------|------|-------|-----|
-| imx8mp-frdm | SHM | 13 us | 13 us | 13 us |
-| imx8mp-frdm | DMA | 348 us | 766 us | 3.0 ms |
+| imx8mp-frdm | SHM | 13 us | 14 us | 13 us |
+| imx8mp-frdm | DMA | 349 us | 767 us | 3.0 ms |
 | imx95-frdm | SHM | 12 us | 12 us | 12 us |
-| imx95-frdm | DMA | 277 us | 624 us | 2.5 ms |
-| rpi5-hailo | SHM | 2.0 us | 2.0 us | 2.0 us |
-| rpi5-hailo | DMA | 99 us | 220 us | 868 us |
+| imx95-frdm | DMA | 278 us | 625 us | 2.5 ms |
+| rpi5-hailo | SHM | 2.0 us | 2.0 us | 3.0 us |
+| rpi5-hailo | DMA | 99 us | 220 us | 869 us |
+| jetson-orin-nano | SHM | 3.0 us | 3.0 us | 3.0 us |
 | x86-desktop | SHM | 1.0 us | 1.0 us | 1.0 us |
 
 ### Image Preprocessing: Letterbox Pipeline (Camera → Model Input)
 
-The most critical benchmark: simulates a real camera-to-model preprocessing pipeline with format conversion, resize, and letterbox padding. All times are median milliseconds. **Bold** = fastest backend for that conversion.
+**1080p → 640×640:**
 
-**Auto-backend priority:** OpenGL → G2D → CPU. The auto column shows what the HAL selects automatically.
+| Platform | Compute | Buffer | YUYV→RGBA | YUYV→RGB | YUYV→8BPi | NV12→RGBA | VYUY→RGBA |
+|----------|---------|--------|-----------|----------|-----------|-----------|-----------|
+| imx8mp-frdm | G2D | DMA | 2.7 ms | 4.0 ms | — | 4.1 ms | — |
+| imx8mp-frdm | GL | DMA | 1.7 ms | 11.8 ms | — | 3.5 ms | — |
+| imx8mp-frdm | CPU | Heap | 17.4 ms | 17.6 ms | — | 33.9 ms | 17.5 ms |
+| imx95-frdm | G2D | DMA | 3.9 ms | 4.6 ms | — | 3.7 ms | — |
+| imx95-frdm | GL | DMA | 1.2 ms | 3.3 ms | — | 1.5 ms | — |
+| imx95-frdm | CPU | Heap | 14.5 ms | 14.9 ms | — | 16.6 ms | 14.5 ms |
+| rpi5-hailo | GL | DMA | 3.3 ms | 4.1 ms | — | 1.2 ms | — |
+| rpi5-hailo | CPU | Heap | 7.6 ms | 7.2 ms | — | 8.1 ms | 7.6 ms |
+| jetson-orin-nano | GL | DMA | — | — | — | — | — |
+| jetson-orin-nano | CPU | Heap | 6.1 ms | 5.9 ms | — | 5.3 ms | 6.2 ms |
+| x86-desktop | CPU | Heap | 3.0 ms | 1.5 ms | — | 1.8 ms | 5.4 ms |
 
-**Date:** March 20, 2026 (post-TensorDyn unification, v0.9.1+)
+**4K → 640×640:**
 
-#### imx8mp-frdm (Cortex-A53, Vivante GC7000UL, G2D) — 720p → 640×640
-
-| Conversion | CPU | G2D | OpenGL | Auto |
-|---|---|---|---|---|
-| YUYV→RGBA | 10.1 | 2.1 | **1.3** | 1.3 |
-| YUYV→RGB | 9.2 | **3.4** | 11.5 | 11.4 ¹ |
-| YUYV→8BPS | 9.9 | N/A | **4.1** | 4.1 |
-| NV12→RGBA | 9.9 | 2.2 | **1.8** | 1.8 |
-| NV12→RGB | 8.8 | **3.5** | 12.7 | 12.4 ¹ |
-| NV12→8BPS | — | — | BLOCKED ² | — |
-| YUYV→RGB_i8 | 10.5 | **5.4** | 15.0 | 14.9 ¹ |
-| YUYV→8BPS_i8 | 11.2 | N/A | **4.1** | 4.1 |
-| NV12→RGB_i8 | 10.3 | **5.5** | 15.7 | 15.9 ¹ |
-| NV12→8BPS_i8 | — | — | BLOCKED ² | — |
-
-#### imx95-frdm (Cortex-A55, Mali GPU, G2D) — 720p → 640×640
-
-| Conversion | CPU | G2D | OpenGL | Auto |
-|---|---|---|---|---|
-| YUYV→RGBA | 8.9 | 2.1 | **1.1** | 1.1 |
-| YUYV→RGB | 8.4 | **2.3** | 3.2 | 3.1 |
-| YUYV→8BPS | 8.7 | N/A | **2.1** | 2.0 |
-| NV12→RGBA | 10.4 | 2.0 | **1.1** | 1.1 |
-| NV12→RGB | 8.8 | **2.2** | 3.2 | 3.3 |
-| NV12→8BPS | 10.3 | N/A | **2.3** | 2.2 |
-| YUYV→RGB_i8 | 8.7 | 3.9 | **4.4** | 4.5 |
-| YUYV→8BPS_i8 | 9.4 | N/A | **2.6** | 2.6 |
-| NV12→RGB_i8 | 9.7 | 3.9 | **4.6** | 4.5 |
-| NV12→8BPS_i8 | 10.6 | N/A | **2.6** | 2.6 |
-
-#### rpi5-hailo (Cortex-A76, VideoCore GPU, no G2D) — 720p → 640×640
-
-| Conversion | CPU | OpenGL | Auto |
-|---|---|---|---|
-| YUYV→RGBA | 3.9 | **1.4** | 1.4 |
-| YUYV→RGB | 3.4 | **2.2** | 2.2 |
-| YUYV→8BPS | **4.2** | 6.3 | 6.3 ³ |
-| NV12→RGBA | 3.9 | **0.7** | 0.7 |
-| NV12→RGB | 3.1 | **1.5** | 1.5 |
-| NV12→8BPS | 3.9 | **2.5** | 2.5 |
-| YUYV→RGB_i8 | 4.2 | **2.4** | 2.4 |
-| YUYV→8BPS_i8 | **4.8** | 6.3 | 6.3 ³ |
-| NV12→RGB_i8 | 3.9 | **1.7** | 1.7 |
-| NV12→8BPS_i8 | 3.9 | **2.7** | 2.7 |
-
-#### x86-desktop (AMD Ryzen 9, CPU only) — 720p → 640×640
-
-| Conversion | CPU |
-|---|---|
-| YUYV→RGBA | 0.8 |
-| YUYV→RGB | 0.8 |
-| YUYV→8BPS | 1.0 |
-| NV12→RGBA | 0.7 |
-| NV12→RGB | 0.6 |
-| YUYV→RGB_i8 | 1.0 |
-| YUYV→8BPS_i8 | 1.1 |
-| NV12→RGB_i8 | 0.8 |
-
-#### Notes
-
-> ¹ **Packed RGB on Vivante GC7000UL:** OpenGL's two-pass packed RGB packing shader
-> is 3-4× slower than G2D's hardware blitter for packed RGB output on Vivante.
-> The auto-backend selects OpenGL first (which succeeds but slowly). In production,
-> the recommended workflow is **YUYV/NV12→RGBA** (1.3-1.8ms via OpenGL, zero-copy
-> EGLImage) with the TFLite VX Delegate CameraAdaptor handling RGBA→RGB and
-> optional u8→i8 conversion inside the NPU graph. The packed RGB path is for
-> offline/debug use only.
->
-> ² **BLOCKED: NV12→PlanarRgb on Vivante GC7000UL** causes an unrecoverable GPU
-> hang (kernel Ds state, requires reboot). The HAL explicitly blocks this
-> combination on Vivante GPUs. Forced OpenGL returns `NotSupported`. Auto-backend
-> uses CPU. G2D does not support planar output. See `VSI_GPU_NV12_BUG.md`.
->
-> ³ **YUYV→PlanarRgb on VideoCore:** The OpenGL planar packing shader is slower
-> than CPU on VideoCore for YUYV input. Future work: benchmark-driven auto-backend
-> selection to use CPU for this specific conversion.
->
-> **G2D i8 support:** G2D performs u8→u8 conversion via hardware blitter, then a
-> CPU post-pass applies XOR 0x80 for i8 output. This is why G2D i8 times are
-> roughly G2D u8 time + ~2ms for the XOR pass.
->
-> **OpenGL i8 support:** Uses the int8 packing shader (XOR 0x80 bias in the
-> fragment shader). No CPU readback — the XOR is computed on the GPU.
->
-> **Trace logging:** Set `RUST_LOG=edgefirst_image=trace` to see which backend
-> and shader path is selected for each conversion. Set `EDGEFIRST_FORCE_BACKEND=cpu|g2d|opengl`
-> to force a specific backend (returns error if conversion is not supported).
-
-#### 4K Planar Formats (3840×2160 → 640×640)
-
-| Platform | Compute | Buffer | YUYV→8BPS | YUYV→8BPS_i8 | NV12→8BPS | NV12→8BPS_i8 |
-|----------|---------|--------|-----------|-----------|-----------|-----------|
-| imx8mp-frdm | GL | DMA | 8.1 ms | 8.2 ms | **BLOCKED** | **BLOCKED** |
-| imx8mp-frdm | CPU | Heap | 50.9 ms | 52.5 ms | — | — |
-| imx95-frdm | GL | DMA | 3.7 ms | 3.6 ms | 8.4 ms | 9.1 ms |
-| imx95-frdm | CPU | Heap | 46.2 ms | 46.2 ms | — | — |
-| rpi5-hailo | GL | DMA | 102.1 ms | 102.2 ms | 25.8 ms | 25.8 ms |
-| rpi5-hailo | CPU | Heap | 23.9 ms | 23.9 ms | 22.2 ms | 22.2 ms |
-| x86-desktop | CPU | Heap | 5.8 ms | 5.8 ms | 5.1 ms | 5.2 ms |
-
-> **Note:** rpi5-hailo GL YUYV→planar at 4K is ~102ms (very slow) — CPU is 4× faster at 24ms. This appears to be a Mesa V3D bottleneck with MRT at high input resolution. NV12→planar is much faster (26ms) because V3D handles NV12 DMA-buf import more efficiently.
+| Platform | Compute | Buffer | YUYV→RGBA | YUYV→RGB | NV12→RGBA |
+|----------|---------|--------|-----------|----------|-----------|
+| imx8mp-frdm | G2D | DMA | 4.0 ms | 5.3 ms | 5.8 ms |
+| imx8mp-frdm | GL | DMA | 2.3 ms | 12.4 ms | 9.4 ms |
+| imx8mp-frdm | CPU | Heap | 59.9 ms | 50.6 ms | 125 ms |
+| imx95-frdm | G2D | DMA | 15.8 ms | 16.5 ms | 13.3 ms |
+| imx95-frdm | GL | DMA | 1.6 ms | 3.6 ms | 4.8 ms |
+| imx95-frdm | CPU | Heap | 46.5 ms | 41.9 ms | 55.3 ms |
+| rpi5-hailo | GL | DMA | 18.5 ms | 19.3 ms | 5.0 ms |
+| rpi5-hailo | CPU | Heap | 24.0 ms | 19.7 ms | 24.4 ms |
+| jetson-orin-nano | GL | DMA | — | — | — |
+| jetson-orin-nano | CPU | Heap | 18.4 ms | 20.0 ms | 14.9 ms |
+| x86-desktop | CPU | Heap | 9.5 ms | 6.7 ms | 9.0 ms |
 
 ### Format Conversion (Same Size, No Resize)
-
-**Data collected:** March 20, 2026
 
 **1080p → 1080p:**
 
 | Platform | Compute | Buffer | YUYV→RGBA | YUYV→RGB | NV12→RGBA | RGB→RGBA | RGBA→BGRA | RGBA→GREY |
 |----------|---------|--------|-----------|----------|-----------|----------|-----------|-----------|
-| imx8mp-frdm | G2D | DMA | 6.4 ms | 11.1 ms | 6.3 ms | — | — | — |
-| imx8mp-frdm | GL | DMA | 7.1 ms | — | 6.5 ms | — | 7.9 ms | 7.7 ms |
-| imx8mp-frdm | CPU | Heap | 6.4 ms | 11.1 ms | 6.5 ms | 13.8 ms | 32.2 ms | 10.1 ms |
-| imx95-frdm | G2D | DMA | 3.6 ms | 3.4 ms | 3.5 ms | — | — | — |
-| imx95-frdm | GL | DMA | 2.4 ms | 2.5 ms | 3.2 ms | — | — | — |
-| imx95-frdm | CPU | Heap | 4.6 ms | 4.3 ms | 4.5 ms | 10.7 ms | 25.5 ms | 8.6 ms |
-| rpi5-hailo | GL | DMA | 7.3 ms | — | 5.4 ms | — | 17.2 ms | 6.2 ms |
-| rpi5-hailo | CPU | Heap | 6.9 ms | 5.5 ms | 8.1 ms | 6.4 ms | 12.1 ms | 2.5 ms |
-| x86-desktop | GL | PBO | — | — | — | 1.2 ms | 1.5 ms | 1.5 ms |
-| x86-desktop | CPU | Heap | 574 us | 585 us | 233 us | 305 us | 1.0 ms | 302 us |
+| imx8mp-frdm | G2D | DMA | 6.0 ms | 10.5 ms | 6.3 ms | — | — | — |
+| imx8mp-frdm | GL | DMA | 7.2 ms | 49.9 ms | 6.1 ms | — | 7.7 ms | 7.8 ms |
+| imx8mp-frdm | CPU | Heap | 13.5 ms | 11.8 ms | 25.7 ms | 13.7 ms | 30.2 ms | 10.0 ms |
+| imx95-frdm | G2D | DMA | 4.6 ms | 4.3 ms | 4.5 ms | — | — | — |
+| imx95-frdm | GL | DMA | 3.1 ms | 11.8 ms | 3.2 ms | — | 3.1 ms | 2.9 ms |
+| imx95-frdm | CPU | Heap | 12.4 ms | 11.0 ms | 16.1 ms | 11.1 ms | 24.8 ms | 9.0 ms |
+| rpi5-hailo | GL | DMA | 7.2 ms | 10.4 ms | 5.4 ms | — | 8.4 ms | 6.2 ms |
+| rpi5-hailo | CPU | Heap | 6.8 ms | 5.4 ms | 8.0 ms | 6.6 ms | 12.2 ms | 2.5 ms |
+| jetson-orin-nano | GL | DMA | — | — | — | 1.5 ms | 4.2 ms | 1.5 ms |
+| jetson-orin-nano | CPU | Heap | 3.0 ms | 2.8 ms | 2.1 ms | 789 us | 3.2 ms | 1.4 ms |
+| x86-desktop | CPU | Heap | 516 us | 559 us | 256 us | 261 us | 758 us | 219 us |
 
 ### Decoder Post-Processing
 
-**Data collected:** March 20, 2026
-
 All CPU-only (decoder is not GPU-accelerated).
-
-> **Note:** `YoloSegDet2Way` (two-way split segmentation decoder) benchmark data is pending. Results will be added once the decoder is exercised on all target platforms.
 
 **YOLOv8 Detection (84×8400, 80 classes):**
 
 | Platform | Data Type | Decode + NMS | Decode Only | NMS Only | Dequantize |
 |----------|-----------|-------------|-------------|----------|------------|
-| imx8mp-frdm | i8 (quant) | 1.0 ms | 996 us | 20 us | 3.8 ms |
-| imx8mp-frdm | f32 | 6.5 ms | — | — | — |
-| imx95-frdm | i8 (quant) | 833 us | 770 us | 19 us | 2.9 ms |
-| imx95-frdm | f32 | 6.3 ms | — | — | — |
-| rpi5-hailo | i8 (quant) | 247 us | 251 us | 4.0 us | 2.1 ms |
-| rpi5-hailo | f32 | 3.0 ms | — | — | — |
-| x86-desktop | i8 (quant) | 70 us | 69 us | 2.0 us | 418 us |
-| x86-desktop | f32 | 582 us | — | — | — |
+| imx8mp-frdm | i8 (quant) | 1.0 ms | 998 us | 20 us | 3.7 ms |
+| imx8mp-frdm | f32 | 6.1 ms | — | — | — |
+| imx95-frdm | i8 (quant) | 847 us | 778 us | 19 us | 2.9 ms |
+| imx95-frdm | f32 | 6.0 ms | — | — | — |
+| rpi5-hailo | i8 (quant) | 243 us | 257 us | 4.0 us | 2.1 ms |
+| rpi5-hailo | f32 | 2.9 ms | — | — | — |
+| jetson-orin-nano | i8 (quant) | 343 us | 331 us | 7.0 us | 2.0 ms |
+| jetson-orin-nano | f32 | 2.2 ms | — | — | — |
+| x86-desktop | i8 (quant) | 82 us | 189 us | 4.0 us | 383 us |
+| x86-desktop | f32 | 460 us | — | — | — |
 
 **YOLOv8 Segmentation (mask coefficient → pixel decode):**
 
 | Platform | Data Type | Masks Decode |
 |----------|-----------|-------------|
-| imx8mp-frdm | i8 (quant) | 4.8 ms |
-| imx8mp-frdm | f32 | 6.4 ms |
-| imx95-frdm | i8 (quant) | 3.0 ms |
+| imx8mp-frdm | i8 (quant) | 3.1 ms |
+| imx8mp-frdm | f32 | 5.9 ms |
+| imx95-frdm | i8 (quant) | 3.4 ms |
 | imx95-frdm | f32 | 6.6 ms |
-| rpi5-hailo | i8 (quant) | 1.2 ms |
-| rpi5-hailo | f32 | 2.6 ms |
-| x86-desktop | i8 (quant) | 391 us |
-| x86-desktop | f32 | 850 us |
+| rpi5-hailo | i8 (quant) | 974 us |
+| rpi5-hailo | f32 | 2.5 ms |
+| jetson-orin-nano | i8 (quant) | 1.1 ms |
+| jetson-orin-nano | f32 | 2.2 ms |
+| x86-desktop | i8 (quant) | 352 us |
+| x86-desktop | f32 | 663 us |
 
 ### Mask Rendering
-
-**Data collected:** March 20, 2026
-
-> **Note:** Numbers in this section will be updated after the upcoming release ships the fused dequant+matmul kernel and other mask rendering optimizations. Current figures reflect pre-optimization baselines.
 
 **640×640 RGBA destination, ~2 detections (YOLOv8n-seg):**
 
 | Platform | Compute | Buffer | draw_decoded_masks (pre-decoded) | draw_proto_masks (fused) | hybrid_materialize_and_draw |
-|----------|---------|--------|------------------------|------------------------|---------------------------|
-| imx8mp-frdm | GL | DMA | 2.6 ms | 5.9 ms | 5.9 ms |
-| imx8mp-frdm | CPU | Heap | 5.9 ms | 80.2 ms | 9.0 ms |
-| imx95-frdm | GL | DMA | 1.9 ms | 5.5 ms | 5.3 ms |
-| imx95-frdm | CPU | Heap | 7.3 ms | 78.8 ms | 10.3 ms |
-| rpi5-hailo | GL | DMA | 1.5 ms | 2.4 ms | 2.4 ms |
-| rpi5-hailo | CPU | Heap | 1.5 ms | 15.0 ms | 1.9 ms |
-| x86-desktop | GL | PBO | 102 us | 375 us | 394 us |
-| x86-desktop | CPU | Heap | 102 us | 5.9 ms | 786 us |
+|----------|---------|--------|-------------------------------|------------------------|---------------------------|
+| imx8mp-frdm | GL | DMA | 2.4 ms | 276 ms | 19.5 ms |
+| imx8mp-frdm | CPU | Heap | 5.3 ms | 77.8 ms | 8.3 ms |
+| imx95-frdm | GL | DMA | 1.9 ms | 26.0 ms | 5.6 ms |
+| imx95-frdm | CPU | Heap | 5.3 ms | 76.2 ms | 8.4 ms |
+| rpi5-hailo | GL | DMA | 1.5 ms | 8.0 ms | 5.6 ms |
+| rpi5-hailo | CPU | Heap | 885 us | 14.5 ms | 1.7 ms |
+| jetson-orin-nano | GL | DMA | 556 us | 3.0 ms | 1.7 ms |
+| jetson-orin-nano | CPU | Heap | 873 us | 22.1 ms | 1.9 ms |
+| x86-desktop | CPU | Heap | 648 us | 5.1 ms | 635 us |
 
 **Hybrid Path Comparison (CPU materialize + GL overlay vs fused GPU):**
 
-The hybrid path decodes masks on CPU (`materialize_segmentations`) then overlays via GL (`draw_decoded_masks`). This is faster than fused GPU `draw_proto_masks` on all tested platforms. The auto-selection in `ImageProcessor::draw_proto_masks()` now prefers the hybrid path when both CPU and OpenGL backends are available.
+The hybrid path decodes masks on CPU (`materialize_segmentations`) then overlays via GL (`draw_decoded_masks`). This is faster than fused GPU `draw_proto_masks` on all tested platforms. The auto-selection in `ImageProcessor::draw_proto_masks()` prefers the hybrid path when both CPU and OpenGL backends are available.
+
+**New in v0.15.0:** The `materialize_masks()` API exposes the CPU materialization step as a first-class operation, enabling a three-stage pipeline (`decode_proto` → `materialize_masks` → `draw_decoded_masks`) where users can inspect, export, or fork the intermediate masks for analytics before rendering. Mask values are continuous sigmoid confidence (u8 0-255), not binary thresholded.
 
 | Platform | Full GPU (GL draw_proto_masks) | Hybrid (GL) | Speedup | Auto draw_proto_masks |
 |----------|-------------------------------|-------------|---------|----------------------|
-| imx8mp-frdm | 5.9 ms | 5.9 ms | **1.0×** | 5.9 ms |
-| imx95-frdm | 5.5 ms | 5.3 ms | **1.0×** | 5.5 ms |
-| rpi5-hailo | 2.4 ms | 2.4 ms | **1.0×** | 2.4 ms |
-| x86-desktop | 375 us | 394 us | **0.9×** | 375 us |
-
-> **Note:** The fused GPU path has improved significantly on imx8mp-frdm (from 275ms → 5.9ms) due to shader optimizations. The hybrid and fused paths are now comparable on all platforms.
+| imx8mp-frdm | 276 ms | 19.5 ms | **14.2×** | 4.2 ms |
+| imx95-frdm | 26.0 ms | 5.6 ms | **4.6×** | 4.2 ms |
+| rpi5-hailo | 8.0 ms | 5.6 ms | **1.4×** | 2.0 ms |
+| jetson-orin-nano | 3.0 ms | 1.7 ms | **1.8×** | 1.1 ms |
 
 **Mask Decode Cost (CPU-only, measured in mask_benchmark):**
 
 | Platform | Proto Decode (NMS+coefficients) | Full Materialize (NMS+coefficients+pixels) |
 |----------|-------------------------------|-------------------------------------------|
 | imx8mp-frdm | 1.5 ms | 4.9 ms |
-| imx95-frdm | 1.3 ms | 4.4 ms |
-| rpi5-hailo | 419 us | 1.5 ms |
-| x86-desktop | 117 us | 423 us |
+| imx95-frdm | 1.2 ms | 4.3 ms |
+| rpi5-hailo | 376 us | 1.4 ms |
+| jetson-orin-nano | 440 us | 1.6 ms |
+| x86-desktop | 381 us | 903 us |
 
 ---
 
@@ -618,7 +542,7 @@ The binary requires a DMA-heap device (`/dev/dma_heap/linux,cma` or `/dev/dma_he
 1. **maivin** — Primary production target (Torizon 7, same SoC as imx8mp-frdm).
    Pending Torizon image with benchmark tooling.
 
-2. **jetson-orin-nano** — NVIDIA Jetson platform. Pending JetPack environment setup and DMA-buf/PBO compatibility testing.
+2. **jetson-orin-nano** — CPU and GL (RGBA/BGRA/Grey) benchmarks collected. YUV EGL import not supported (YUYV/NV12 GL pipeline rows show "—"). DMA-buf allocation benchmarks show anomalous scaling (720p slower than 4K) — likely CMA fragmentation during collection, needs re-run.
 
 ### Missing Buffer Strategy Coverage
 
@@ -658,6 +582,7 @@ The binary requires a DMA-heap device (`/dev/dma_heap/linux,cma` or `/dev/dma_he
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 3.0 | 2026-03-30 | v0.15.0 release: add jetson-orin-nano platform; refresh all benchmarks across 5 platforms; per-texture EGL binding optimization eliminates redundant EGLImageTargetTexture2DOES calls; add materialize_masks API with three-stage pipeline benchmarks; hybrid path 1.4–14.2× faster than fused GPU on all platforms |
 | 2.2 | 2026-03-27 | Add collection date stamps to all benchmark result sections; add image_benchmark to benchmark binary table; note pending YoloSegDet2Way benchmark data in decoder section; note pending mask rendering optimization updates |
 | 2.1 | 2026-03-23 | Add C API preprocessing benchmark (`bench_preproc`) results for i.MX 95-EVK (Mali), i.MX 8MP EVK-06 (Vivante), and x86 desktop (GTX 1080 PBO); add tensor reuse impact analysis (3.3× penalty on i.MX 95, 1.7× on i.MX 8MP, negligible on PBO); document buffer pool validation |
 | 2.0 | 2026-03-20 | TensorDyn unification: auto-backend priority changed to OpenGL→G2D→CPU; always use two-pass packed RGB (rgb_direct removed); added per-platform forced-backend comparison tables at 720p; added u8/i8 DType benchmark variants; replaced 8BPi with 8BPS_i8 naming |

@@ -19,9 +19,13 @@ use std::{
 
 /// A tensor backed by DMA (Direct Memory Access) memory.
 ///
-/// On Linux, a DRM PRIME attachment is created to enable proper CPU cache
-/// coherency via `DMA_BUF_IOCTL_SYNC`. Without this attachment, sync ioctls
-/// are no-ops on cached CMA heaps.
+/// On Linux, for self-allocated (dma_heap) buffers a DRM PRIME attachment is
+/// created to enable CPU cache coherency via `DMA_BUF_IOCTL_SYNC`. Without an
+/// active attachment, sync ioctls are no-ops on cached CMA heaps.
+///
+/// For imported (foreign) DMA-BUF fds — e.g. those exported by the Neutron
+/// NPU driver — no DRM attachment is created. Cache coherency for foreign
+/// buffers is the responsibility of the buffer owner (the kernel driver).
 #[derive(Debug)]
 pub struct DmaTensor<T>
 where
@@ -134,8 +138,16 @@ where
             }
         };
 
+        // Do NOT attempt a DRM attachment for foreign (imported) DMA-BUF fds.
+        // DRM PRIME import is only meaningful for DMA-BUF fds that were
+        // allocated by the same DRM device (e.g. via the CMA/system heap).
+        // For fds owned by other kernel drivers (e.g. Neutron NPU), the
+        // PRIME_FD_TO_HANDLE ioctl will fail and the resulting no-op
+        // attachment attempt adds unnecessary ioctl overhead on every import.
+        // DMA_BUF_IOCTL_SYNC coherency for foreign buffers is the
+        // responsibility of the buffer owner (the NPU driver in this case).
         #[cfg(target_os = "linux")]
-        let drm_attachment = crate::dmabuf::DrmAttachment::new(&fd, true);
+        let drm_attachment = None;
 
         Ok(DmaTensor {
             name: name.unwrap_or("").to_owned(),
@@ -214,8 +226,14 @@ where
 {
     pub fn try_clone(&self) -> Result<Self> {
         let fd = self.clone_fd()?;
+        // Preserve the imported/owned distinction: imported fds never get a
+        // DRM attachment (consistent with from_fd()).
         #[cfg(target_os = "linux")]
-        let drm_attachment = crate::dmabuf::DrmAttachment::new(&fd, self.is_imported);
+        let drm_attachment = if self.is_imported {
+            None
+        } else {
+            crate::dmabuf::DrmAttachment::new(&fd, false)
+        };
         Ok(Self {
             name: self.name.clone(),
             fd,

@@ -33,6 +33,8 @@ enum GLProcessorMessage {
         SendablePtr<Segmentation>,
         f32,                            // opacity
         Option<SendablePtr<TensorDyn>>, // background
+        Option<[f32; 4]>,               // letterbox
+        crate::ColorMode,
         tokio::sync::oneshot::Sender<Result<(), Error>>,
     ),
     DrawProtoMasks(
@@ -41,6 +43,8 @@ enum GLProcessorMessage {
         SendablePtr<ProtoData>,
         f32,                            // opacity
         Option<SendablePtr<TensorDyn>>, // background
+        Option<[f32; 4]>,               // letterbox
+        crate::ColorMode,
         tokio::sync::oneshot::Sender<Result<(), Error>>,
     ),
     SetInt8Interpolation(
@@ -232,7 +236,16 @@ impl GLProcessorThreaded {
                             }
                         });
                     }
-                    GLProcessorMessage::DrawDecodedMasks(mut dst, det, seg, opacity, bg, resp) => {
+                    GLProcessorMessage::DrawDecodedMasks(
+                        mut dst,
+                        det,
+                        seg,
+                        opacity,
+                        bg,
+                        letterbox,
+                        color_mode,
+                        resp,
+                    ) => {
                         // SAFETY: This is safe because the draw_decoded_masks() function waits for the
                         // resp to be sent before dropping the borrow for dst, detect,
                         // segmentation, and background
@@ -250,6 +263,8 @@ impl GLProcessorThreaded {
                                 crate::MaskOverlay {
                                     background: bg_ref,
                                     opacity,
+                                    letterbox,
+                                    color_mode,
                                 },
                             )
                         }));
@@ -270,6 +285,8 @@ impl GLProcessorThreaded {
                         proto_data,
                         opacity,
                         bg,
+                        letterbox,
+                        color_mode,
                         resp,
                     ) => {
                         // SAFETY: Same safety invariant as DrawDecodedMasks — caller
@@ -287,6 +304,8 @@ impl GLProcessorThreaded {
                                 crate::MaskOverlay {
                                     background: bg_ref,
                                     opacity,
+                                    letterbox,
+                                    color_mode,
                                 },
                             )
                         }));
@@ -517,6 +536,8 @@ impl ImageProcessorTrait for GLProcessorThreaded {
                     ptr: NonNull::from(bg).cast::<TensorDyn>(),
                     len: 1,
                 }),
+                overlay.letterbox,
+                overlay.color_mode,
                 err_send,
             ))
             .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
@@ -554,6 +575,8 @@ impl ImageProcessorTrait for GLProcessorThreaded {
                     ptr: NonNull::from(bg).cast::<TensorDyn>(),
                     len: 1,
                 }),
+                overlay.letterbox,
+                overlay.color_mode,
                 err_send,
             ))
             .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;

@@ -305,6 +305,20 @@ pub struct HalSegmentationList {
     pub(crate) masks: Vec<Segmentation>,
 }
 
+/// Opaque prototype data from a segmentation model's decode step.
+///
+/// Holds raw mask coefficients and prototype tensors. Pass to
+/// `hal_image_processor_materialize_masks()` to compute per-instance masks,
+/// or use `hal_image_processor_draw_masks()` for fused rendering.
+///
+/// Returned by `hal_decoder_decode_proto()`. For detection-only models,
+/// `hal_decoder_decode_proto()` returns NULL instead.
+///
+/// Free with `hal_proto_data_free()`.
+pub struct HalProtoData {
+    pub(crate) inner: edgefirst_decoder::ProtoData,
+}
+
 // ============================================================================
 // Decoder Params Functions
 // ============================================================================
@@ -868,15 +882,10 @@ pub unsafe extern "C" fn hal_decoder_decode(
     }
 
     let outputs_slice = std::slice::from_raw_parts(outputs, num_outputs);
-
-    // Extract TensorDyn references from HalTensor pointers
-    let mut tensor_refs: Vec<&TensorDyn> = Vec::with_capacity(num_outputs);
-    for &tensor_ptr in outputs_slice {
-        if tensor_ptr.is_null() {
-            return set_error(libc::EINVAL);
-        }
-        tensor_refs.push(&unsafe { &*tensor_ptr }.inner);
-    }
+    let tensor_refs = match extract_tensor_refs(outputs_slice) {
+        Ok(refs) => refs,
+        Err(rc) => return rc,
+    };
 
     let mut boxes: Vec<DetectBox> = Vec::with_capacity(100);
     let mut masks: Vec<Segmentation> = Vec::new();
@@ -895,6 +904,70 @@ pub unsafe extern "C" fn hal_decoder_decode(
     }
 
     0
+}
+
+/// Decode model outputs into detection boxes and optional prototype data.
+///
+/// For segmentation models, returns a prototype data handle that can be passed
+/// to `hal_image_processor_materialize_masks()` to compute per-instance masks
+/// for analytics, export, or IoU computation.
+///
+/// For detection-only models, returns NULL for proto data but still populates
+/// detection boxes in `out_boxes`.
+///
+/// @note Calling `hal_decoder_decode_proto()` + `hal_image_processor_materialize_masks()`
+///       + `hal_image_processor_draw_decoded_masks()` separately prevents the HAL from
+///       using its internal fused optimization. For render-only use cases, prefer
+///       `hal_image_processor_draw_masks()` which is 1.6–27× faster on tested platforms.
+///
+/// @param decoder Decoder handle
+/// @param outputs Array of output tensor pointers
+/// @param num_outputs Number of output tensors
+/// @param out_boxes Output parameter for detection box list (caller must free)
+/// @return Prototype data handle (caller must free with `hal_proto_data_free()`),
+///         or NULL for detection-only models or on error
+/// @par Errors (errno):
+/// - EINVAL: Invalid argument (NULL decoder/outputs/out_boxes)
+/// - EIO: Decoding failed
+#[no_mangle]
+pub unsafe extern "C" fn hal_decoder_decode_proto(
+    decoder: *const HalDecoder,
+    outputs: *const *const HalTensor,
+    num_outputs: size_t,
+    out_boxes: *mut *mut HalDetectBoxList,
+) -> *mut HalProtoData {
+    if decoder.is_null() || outputs.is_null() || out_boxes.is_null() {
+        set_error(libc::EINVAL);
+        return std::ptr::null_mut();
+    }
+    if num_outputs == 0 {
+        set_error(libc::EINVAL);
+        return std::ptr::null_mut();
+    }
+
+    let outputs_slice = std::slice::from_raw_parts(outputs, num_outputs);
+    let tensor_refs = match extract_tensor_refs(outputs_slice) {
+        Ok(refs) => refs,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    let mut boxes: Vec<DetectBox> = Vec::with_capacity(100);
+
+    let proto_result = match (*decoder).inner.decode_proto(&tensor_refs, &mut boxes) {
+        Ok(r) => r,
+        Err(e) => {
+            log::error!("hal_decoder_decode_proto: {e:#?}");
+            set_error(libc::EIO);
+            return std::ptr::null_mut();
+        }
+    };
+
+    *out_boxes = Box::into_raw(Box::new(HalDetectBoxList { boxes }));
+
+    match proto_result {
+        Some(proto) => Box::into_raw(Box::new(HalProtoData { inner: proto })),
+        None => std::ptr::null_mut(),
+    }
 }
 
 /// Extract `TensorDyn` references from an array of `HalTensor` pointers.
@@ -1086,6 +1159,16 @@ pub unsafe extern "C" fn hal_segmentation_to_mask(
 pub unsafe extern "C" fn hal_decoder_free(decoder: *mut HalDecoder) {
     if !decoder.is_null() {
         drop(Box::from_raw(decoder));
+    }
+}
+
+/// Free prototype data returned by `hal_decoder_decode_proto()`.
+///
+/// @param proto Prototype data handle to free (can be NULL, no-op)
+#[no_mangle]
+pub unsafe extern "C" fn hal_proto_data_free(proto: *mut HalProtoData) {
+    if !proto.is_null() {
+        drop(Box::from_raw(proto));
     }
 }
 
@@ -2751,6 +2834,8 @@ outputs:
                 image,
                 std::ptr::null(),
                 1.0,
+                std::ptr::null(),
+                crate::image::HalColorMode::Class,
                 &mut box_list,
                 &mut track_list,
             );
@@ -2794,6 +2879,8 @@ outputs:
                 image,
                 std::ptr::null(),
                 1.0,
+                std::ptr::null(),
+                crate::image::HalColorMode::Class,
                 &mut box_list,
                 &mut track_list,
             );
@@ -3013,6 +3100,8 @@ outputs:
                 image,
                 std::ptr::null(),
                 1.0,
+                std::ptr::null(),
+                crate::image::HalColorMode::Class,
                 &mut box_list,
                 &mut track_list,
             );
@@ -3056,6 +3145,8 @@ outputs:
                 image,
                 std::ptr::null(),
                 1.0,
+                std::ptr::null(),
+                crate::image::HalColorMode::Class,
                 &mut box_list,
                 &mut track_list,
             );
@@ -3238,6 +3329,59 @@ outputs:
             assert!((box1_float.xmax - 0.35098213).abs() < 1e-6);
             assert!((box1_float.ymax - 0.9958097).abs() < 1e-6);
             assert_eq!(box1_float.label, 75);
+        }
+    }
+
+    #[test]
+    fn test_decode_proto_det_only_returns_null_proto() {
+        unsafe {
+            let decoder = make_decoder_json(YOLO_JSON_CONFIG);
+            assert!(!decoder.is_null());
+
+            // Create a tensor with one high-confidence detection
+            let shape: [usize; 3] = [1, 84, 8400];
+            let tensor = crate::tensor::hal_tensor_new(
+                crate::tensor::HalDtype::F32,
+                shape.as_ptr(),
+                3,
+                crate::tensor::HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert!(!tensor.is_null());
+
+            let map = crate::tensor::hal_tensor_map_create(tensor);
+            assert!(!map.is_null());
+            let data = crate::tensor::hal_tensor_map_data(map) as *mut f32;
+            for i in 0..(84 * 8400) {
+                *data.add(i) = 0.0;
+            }
+            #[allow(clippy::identity_op, clippy::erasing_op)]
+            {
+                let num_boxes = 8400usize;
+                *data.add(0 * num_boxes) = 0.5; // cx
+                *data.add(1 * num_boxes) = 0.5; // cy
+                *data.add(2 * num_boxes) = 0.1; // w
+                *data.add(3 * num_boxes) = 0.1; // h
+                *data.add(4 * num_boxes) = 0.9; // class 0 score
+            }
+            crate::tensor::hal_tensor_map_unmap(map);
+
+            let outputs = [tensor as *const crate::tensor::HalTensor];
+            let mut boxes: *mut HalDetectBoxList = std::ptr::null_mut();
+
+            // decode_proto on det-only model: should return NULL proto but valid boxes
+            let proto =
+                hal_decoder_decode_proto(decoder, outputs.as_ptr(), 1, &mut boxes as *mut _);
+            assert!(proto.is_null(), "det-only model should return NULL proto");
+            assert!(!boxes.is_null(), "boxes should be populated");
+            assert!(
+                hal_detect_box_list_len(boxes) > 0,
+                "det-only decode_proto should decode detections"
+            );
+
+            hal_detect_box_list_free(boxes);
+            crate::tensor::hal_tensor_free(tensor);
+            hal_decoder_free(decoder);
         }
     }
 }

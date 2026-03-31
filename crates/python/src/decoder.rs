@@ -3,7 +3,8 @@
 
 use crate::tracker::{PyByteTrack, PyTrackInfo};
 use edgefirst_hal::decoder::{
-    configs, configs::Nms, ConfigOutput, Decoder, DecoderBuilder, DetectBox, Segmentation,
+    configs, configs::Nms, ConfigOutput, Decoder, DecoderBuilder, DetectBox, ProtoData,
+    Segmentation,
 };
 
 /// NMS (Non-Maximum Suppression) mode for filtering overlapping detections.
@@ -448,6 +449,28 @@ pub type PySegDetTrackedOutput<'py> = (
     Vec<PyTrackInfo>,
 );
 
+/// Opaque prototype data from a segmentation model's decode step.
+///
+/// Holds raw mask coefficients and prototype tensors produced by
+/// :meth:`Decoder.decode_proto`. Pass to
+/// :meth:`ImageProcessor.materialize_masks` to compute per-instance masks
+/// for analytics or export, or use :meth:`ImageProcessor.draw_masks` for
+/// fused GPU rendering instead.
+///
+/// For detection-only models, :meth:`Decoder.decode_proto` returns ``None``
+/// instead of a ``ProtoData`` instance.
+#[pyclass(name = "ProtoData")]
+pub struct PyProtoData(pub(crate) ProtoData);
+
+/// ``(boxes, scores, classes, proto_data)`` where ``proto_data`` is ``None``
+/// for detection-only models.
+pub type PyProtoDetOutput<'py> = (
+    Bound<'py, PyArray2<f32>>,
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<usize>>,
+    Option<PyProtoData>,
+);
+
 #[pyclass(name = "Decoder")]
 pub struct PyDecoder {
     pub(crate) decoder: Decoder,
@@ -620,6 +643,46 @@ impl PyDecoder {
         Ok((boxes, scores, classes, masks, tracks))
     }
 
+    /// Decode model outputs into detection boxes and optional prototype data.
+    ///
+    /// For segmentation models, returns a :class:`ProtoData` instance that can
+    /// be passed to :meth:`ImageProcessor.materialize_masks` to compute
+    /// per-instance masks for analytics, export, or IoU computation.
+    ///
+    /// For detection-only models, returns ``None`` for proto_data but still
+    /// populates detection boxes.
+    ///
+    /// .. note::
+    ///
+    ///     Calling ``decode_proto`` + ``materialize_masks`` +
+    ///     ``draw_decoded_masks`` separately prevents the HAL from using its
+    ///     internal fused optimization. For render-only use cases, prefer
+    ///     :meth:`ImageProcessor.draw_masks` which is 1.6–27× faster on tested
+    ///     platforms.
+    ///
+    /// :param model_output: list of output :class:`Tensor` from model inference
+    /// :param max_boxes: maximum number of detections to return
+    /// :returns: ``(boxes, scores, classes, proto_data)`` where ``proto_data``
+    ///     is ``None`` for detection-only models
+    /// :rtype: tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray, ProtoData | None]
+    #[pyo3(signature = (model_output, max_boxes=100))]
+    pub fn decode_proto<'py>(
+        self_: PyRef<'py, Self>,
+        model_output: Vec<PyRef<'py, crate::tensor::PyTensor>>,
+        max_boxes: usize,
+    ) -> PyResult<PyProtoDetOutput<'py>> {
+        let tensor_refs: Vec<&edgefirst_hal::tensor::TensorDyn> =
+            model_output.iter().map(|t| &t.0).collect();
+        let mut output_boxes = Vec::with_capacity(max_boxes);
+        let proto_data = self_
+            .decoder
+            .decode_proto(&tensor_refs, &mut output_boxes)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))?;
+        let py = self_.py();
+        let (boxes, scores, classes) = convert_detect_box(py, &output_boxes);
+        Ok((boxes, scores, classes, proto_data.map(PyProtoData)))
+    }
+
     #[getter(score_threshold)]
     fn get_score_threshold(&self) -> PyResult<f32> {
         Ok(self.decoder.score_threshold)
@@ -686,7 +749,7 @@ pub(crate) fn convert_detect_box<'py>(
     )
 }
 
-fn convert_seg_mask<'py>(
+pub(crate) fn convert_seg_mask<'py>(
     py: Python<'py>,
     output_masks: &[Segmentation],
 ) -> Vec<Bound<'py, PyArray3<u8>>> {

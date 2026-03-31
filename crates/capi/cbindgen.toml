@@ -104,6 +104,8 @@ item_types = ["enums", "structs", "unions", "typedefs", "opaque", "functions", "
 "HalDmabufTensorInfo" = "hal_dmabuf_tensor_info"
 "HalCameraAdaptorFormatInfo" = "hal_camera_adaptor_format_info"
 "HalComputeBackend" = "hal_compute_backend"
+"HalColorMode" = "hal_color_mode"
+"HalProtoData" = "hal_proto_data"
 "HalLogLevel" = "hal_log_level"
 "HalLogCallback" = "hal_log_callback"
 
