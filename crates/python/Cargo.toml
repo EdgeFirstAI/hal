@@ -6,7 +6,7 @@ authors.workspace = true
 description.workspace = true
 homepage.workspace = true
 repository.workspace = true
-readme.workspace = true
+readme = "README.md"
 license.workspace = true
 publish = false  # Python bindings only - distributed via PyPI, not crates.io
 
