@@ -330,13 +330,10 @@ mod gl_tests {
         )
         .expect("Image Comparison failed");
         if similarity.score < threshold {
-            // image1.save(format!("{name}_1.png"));
-            // image2.save(format!("{name}_2.png"));
-            similarity
-                .image
-                .to_color_map()
-                .save(format!("{name}.png"))
-                .unwrap();
+            // Best-effort save of diff image for debugging (may fail on CI
+            // where paths contain special characters or the fs is read-only).
+            let save_name = name.replace('\0', "_");
+            let _ = similarity.image.to_color_map().save(format!("{save_name}.png"));
             panic!(
                 "{name}: converted image and target image have similarity score too low: {} < {}",
                 similarity.score, threshold
