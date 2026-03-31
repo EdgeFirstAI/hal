@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Test parametrization overhaul (EDGEAI-1219)** — consolidated
+  repetitive test code via macros and parametrize decorators while
+  expanding coverage:
+  - Decoder: 16 tracked segdet tests collapsed into two macro families
+    (`real_data_tracked_test!`, `e2e_tracked_test!`), ~950 line reduction.
+  - Python: 10 dtype tests replaced with single `@pytest.mark.parametrize`
+    `test_dtype` function, ~250 line reduction.
+  - C API tests integrated into `make test` via new `test-capi` target.
+
+### Added
+
+- **Tracker test expansion** — 14 → 38 unit tests. New coverage for
+  ByteTrack two-stage matching, builder method effects, degenerate
+  inputs, 100-detection scaling. Kalman filter prediction accuracy,
+  numerical stability (1000 cycles), gating distance edge cases.
+
+- **MemTensor and ShmTensor unit tests** — both had zero tests. Added
+  new/map/reshape/error-path tests for MemTensor and
+  new/map/from_fd-roundtrip/reshape tests for ShmTensor.
+
+- **VYUY and NV16 format conversion tests** — added VYUY→Grey,
+  VYUY→PlanarRgb, VYUY→NV16, NV16→RGB, NV16→RGBA via existing
+  `generate_conversion_tests!` macro.
+
+- **Dequantization ground truth test** — `test_dequant_ground_truth`
+  verifies `dequantize_cpu` and `dequantize_cpu_chunked` against
+  hand-computed expected values for four (scale, zero_point) combinations
+  including i8 boundary values.
+
 ### Fixed
 
 - **Python `Tensor.from_fd()` double-close bug** — `from_fd` used
@@ -18,6 +49,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `try_clone_to_owned()`, matching the contract already used by
   `import_image` (Python) and `hal_tensor_from_fd` (C API). Updated
   `.pyi` stub to document the caller-retains-ownership contract.
+
+- **Unstable zero-copy perf assertions** — `test_dma_zero_copy_perf`
+  and `test_shm_zero_copy_perf` increased to 50 iterations with 1ms
+  noise floor and 1.5× margin to prevent flaky failures on fast
+  hardware.
 
 ## [0.15.0] - 2026-03-30
 
