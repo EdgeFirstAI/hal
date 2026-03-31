@@ -365,7 +365,7 @@ impl PyTensor {
     #[staticmethod]
     #[pyo3(signature = (fd, shape, dtype = "float32", name = None))]
     fn from_fd(fd: RawFd, shape: Vec<usize>, dtype: &str, name: Option<&str>) -> Result<Self> {
-        use std::os::fd::FromRawFd;
+        use std::os::fd::BorrowedFd;
         if fd < 0 {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -373,7 +373,9 @@ impl PyTensor {
             )));
         }
         let dt = parse_dtype(dtype)?;
-        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+        // Dup the fd — caller retains ownership of the original.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        let fd = borrowed.try_clone_to_owned()?;
         let tensor = TensorDyn::from_fd(fd, &shape, dt, name)?;
         Ok(PyTensor(tensor))
     }
