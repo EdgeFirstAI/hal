@@ -705,6 +705,7 @@ dependencies = [
  "pyo3",
  "pyo3-build-config",
  "pythonize",
+ "rayon",
  "rustc_version",
  "uuid",
 ]

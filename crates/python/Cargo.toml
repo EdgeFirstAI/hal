@@ -28,6 +28,7 @@ ndarray = { workspace = true }
 num-traits = { workspace = true }
 numpy = { workspace = true }
 pyo3 = { workspace = true, features = ["extension-module"] }
+rayon = { workspace = true }
 pythonize = { workspace = true }
 uuid = { workspace = true }
 

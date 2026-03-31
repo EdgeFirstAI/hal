@@ -333,16 +333,21 @@ fn map_tensor_dyn(t: &TensorDyn) -> tensor::Result<TensorMapT> {
 /// Type-matched copy from a numpy array into a `TensorDyn`.
 ///
 /// Downcasts the numpy array to the concrete element type matching the
-/// tensor's dtype, then copies via the typed `TensorMap` slice. Raises
-/// on dtype mismatch, byte-size mismatch, or non-contiguous input.
+/// tensor's dtype, then copies via the typed `TensorMap` slice.
+///
+/// - **Contiguous arrays** use a direct `copy_from_slice` (memcpy).
+/// - **Non-contiguous (strided) arrays** iterate in C-order via ndarray.
+/// - **Large copies** (≥256 KiB) use `rayon` parallel chunks/iteration.
+///
+/// Raises on dtype mismatch or element-count mismatch.
 fn copy_numpy_to_tensor_dyn(src: &Bound<'_, pyo3::types::PyAny>, tensor: &TensorDyn) -> Result<()> {
     use numpy::{PyArrayMethods, PyUntypedArrayMethods};
 
-    /// Inner helper: downcast numpy array to `PyArrayDyn<T>`, map the tensor,
-    /// and copy element-by-element via slices.
-    // The Num + Clone + Debug + Send + Sync bounds are required by
-    // Tensor<T> and TensorTrait<T>.  We add numpy::Element + Copy for
-    // the numpy downcast and the slice copy.
+    /// Threshold in elements above which copies are parallelized.
+    /// 256 KiB / sizeof(u8) = 262144; for f32 that's 65536 elements.
+    /// We use a byte threshold and convert per-type.
+    const PARALLEL_THRESHOLD_BYTES: usize = 256 * 1024;
+
     fn copy_typed<
         T: numpy::Element + Copy + num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
     >(
@@ -353,28 +358,54 @@ fn copy_numpy_to_tensor_dyn(src: &Bound<'_, pyo3::types::PyAny>, tensor: &Tensor
             .downcast::<numpy::PyArrayDyn<T>>()
             .map_err(|_| Error::Format("numpy dtype does not match tensor dtype".to_string()))?;
 
-        if !arr.is_c_contiguous() {
-            return Err(Error::Format(
-                "numpy array must be C-contiguous (try numpy.ascontiguousarray())".to_string(),
-            ));
-        }
-
         let readonly = arr.readonly();
-        let src_slice = readonly
-            .as_slice()
-            .map_err(|e| Error::Format(format!("failed to get numpy slice: {e}")))?;
+        let src_view = readonly.as_array();
 
         let tensor_len = tensor.len();
-        if src_slice.len() != tensor_len {
+        if src_view.len() != tensor_len {
             return Err(Error::Format(format!(
                 "element count mismatch: numpy array has {} elements but tensor has {tensor_len}",
-                src_slice.len()
+                src_view.len()
             )));
         }
 
         let mut map = tensor.map()?;
-        let dst_slice = map.as_mut_slice();
-        dst_slice.copy_from_slice(src_slice);
+        let dst = map.as_mut_slice();
+        let nbytes = tensor_len * std::mem::size_of::<T>();
+
+        if arr.is_c_contiguous() {
+            // Fast path: contiguous source → direct memcpy.
+            let src_slice = readonly.as_slice().expect("contiguous but as_slice failed");
+            if nbytes >= PARALLEL_THRESHOLD_BYTES {
+                use rayon::prelude::*;
+                let chunk = (tensor_len / rayon::current_num_threads()).max(1024);
+                dst.par_chunks_mut(chunk)
+                    .zip(src_slice.par_chunks(chunk))
+                    .for_each(|(d, s)| d.copy_from_slice(s));
+            } else {
+                dst.copy_from_slice(src_slice);
+            }
+        } else {
+            // Slow path: strided source → element-wise copy via ndarray iter.
+            if nbytes >= PARALLEL_THRESHOLD_BYTES {
+                // Materialize to a contiguous vec in parallel, then memcpy.
+                use rayon::prelude::*;
+                let contiguous: Vec<T> = src_view
+                    .as_standard_layout()
+                    .as_slice()
+                    .expect("standard_layout should be contiguous")
+                    .to_vec();
+                let chunk = (tensor_len / rayon::current_num_threads()).max(1024);
+                dst.par_chunks_mut(chunk)
+                    .zip(contiguous.par_chunks(chunk))
+                    .for_each(|(d, s)| d.copy_from_slice(s));
+            } else {
+                for (d, s) in dst.iter_mut().zip(src_view.iter()) {
+                    *d = *s;
+                }
+            }
+        }
+
         Ok(())
     }
 
