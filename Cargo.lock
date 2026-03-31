@@ -679,6 +679,7 @@ dependencies = [
 name = "edgefirst-tracker"
 version = "0.15.0"
 dependencies = [
+ "edgefirst-bench",
  "enum_dispatch",
  "lapjv",
  "log",

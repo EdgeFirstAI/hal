@@ -440,16 +440,6 @@ mod tests {
     use super::*;
     use crate::*;
 
-    impl MockDetection {
-        fn new(x1: f32, y1: f32, x2: f32, y2: f32, score: f32) -> Self {
-            Self {
-                bbox: [x1, y1, x2, y2],
-                score,
-                label: 0,
-            }
-        }
-    }
-
     #[test]
     fn test_vaalbox_xyah_roundtrip() {
         let box1 = [0.0134, 0.02135, 0.12438, 0.691];
@@ -502,7 +492,7 @@ mod tests {
     #[test]
     fn test_bytetrack_single_detection_creates_tracklet() {
         let mut tracker = ByteTrackBuilder::new().build();
-        let detections = vec![MockDetection::new(0.1, 0.1, 0.3, 0.3, 0.9)];
+        let detections = vec![MockDetection::new([0.1, 0.1, 0.3, 0.3], 0.9, 0)];
 
         let results = tracker.update(&detections, 1000);
 
@@ -519,7 +509,7 @@ mod tests {
     fn test_bytetrack_low_confidence_no_tracklet() {
         let mut tracker = ByteTrackBuilder::new().build();
         // Score below track_high_conf (0.7)
-        let detections = vec![MockDetection::new(0.1, 0.1, 0.3, 0.3, 0.5)];
+        let detections = vec![MockDetection::new([0.1, 0.1, 0.3, 0.3], 0.5, 0)];
 
         let results = tracker.update(&detections, 1000);
 
@@ -536,7 +526,7 @@ mod tests {
         let mut tracker = ByteTrackBuilder::new().build();
 
         // Frame 1: Create tracklet with a larger box that's easier to track
-        let det1 = vec![MockDetection::new(0.2, 0.2, 0.4, 0.4, 0.9)];
+        let det1 = vec![MockDetection::new([0.2, 0.2, 0.4, 0.4], 0.9, 0)];
         let res1 = tracker.update(&det1, 1000);
         assert!(res1[0].is_some());
         let uuid1 = res1[0].unwrap().uuid;
@@ -545,7 +535,7 @@ mod tests {
         assert_eq!(tracker.tracklets[0].count, 1);
 
         // Frame 2: Same location - should match existing tracklet
-        let det2 = vec![MockDetection::new(0.2, 0.2, 0.4, 0.4, 0.9)];
+        let det2 = vec![MockDetection::new([0.2, 0.2, 0.4, 0.4], 0.9, 0)];
         let res2 = tracker.update(&det2, 2000);
         assert!(res2[0].is_some());
         let info2 = res2[0].unwrap();
@@ -562,9 +552,9 @@ mod tests {
         let mut tracker = ByteTrackBuilder::new().build();
 
         let detections = vec![
-            MockDetection::new(0.1, 0.1, 0.2, 0.2, 0.9),
-            MockDetection::new(0.5, 0.5, 0.6, 0.6, 0.85),
-            MockDetection::new(0.8, 0.8, 0.9, 0.9, 0.95),
+            MockDetection::new([0.1, 0.1, 0.2, 0.2], 0.9, 0),
+            MockDetection::new([0.5, 0.5, 0.6, 0.6], 0.85, 0),
+            MockDetection::new([0.8, 0.8, 0.9, 0.9], 0.95, 0),
         ];
 
         let results = tracker.update(&detections, 1000);
@@ -580,7 +570,7 @@ mod tests {
         tracker.track_extra_lifespan = 1000; // 1 second
 
         // Create tracklet
-        let det1 = vec![MockDetection::new(0.1, 0.1, 0.3, 0.3, 0.9)];
+        let det1 = vec![MockDetection::new([0.1, 0.1, 0.3, 0.3], 0.9, 0)];
         tracker.update(&det1, 1000);
         assert_eq!(tracker.tracklets.len(), 1);
 
@@ -596,8 +586,8 @@ mod tests {
         let mut tracker = ByteTrackBuilder::new().build();
 
         let detections = vec![
-            MockDetection::new(0.1, 0.1, 0.2, 0.2, 0.9),
-            MockDetection::new(0.5, 0.5, 0.6, 0.6, 0.85),
+            MockDetection::new([0.1, 0.1, 0.2, 0.2], 0.9, 0),
+            MockDetection::new([0.5, 0.5, 0.6, 0.6], 0.85, 0),
         ];
         tracker.update(&detections, 1000);
 
@@ -626,7 +616,7 @@ mod tests {
         let mut tracker = ByteTrackBuilder::new().build();
 
         // Frame 1: high-confidence detection creates a tracklet
-        let det1 = vec![MockDetection::new(0.2, 0.2, 0.4, 0.4, 0.9)];
+        let det1 = vec![MockDetection::new([0.2, 0.2, 0.4, 0.4], 0.9, 0)];
         let res1 = tracker.update(&det1, 1_000_000);
         assert!(res1[0].is_some());
         let uuid1 = res1[0].unwrap().uuid;
@@ -634,7 +624,7 @@ mod tests {
 
         // Frame 2: same location but low confidence (0.3, below track_high_conf=0.7).
         // Second-stage matching should still associate it with the existing tracklet.
-        let det2 = vec![MockDetection::new(0.2, 0.2, 0.4, 0.4, 0.3)];
+        let det2 = vec![MockDetection::new([0.2, 0.2, 0.4, 0.4], 0.3, 0)];
         let res2 = tracker.update(&det2, 2_000_000);
         assert!(
             res2[0].is_some(),
@@ -670,7 +660,7 @@ mod tests {
         assert_eq!(tracker_extended.track_extra_lifespan, lifespan_extended);
 
         let ts_start = 1_000_000_000u64; // 1 second
-        let det = vec![MockDetection::new(0.2, 0.2, 0.4, 0.4, 0.9)];
+        let det = vec![MockDetection::new([0.2, 0.2, 0.4, 0.4], 0.9, 0)];
 
         tracker_default.update(&det, ts_start);
         tracker_extended.update(&det, ts_start);
@@ -702,7 +692,7 @@ mod tests {
         assert_eq!(tracker.track_high_conf, 0.9);
 
         // Detection with score 0.8 is below the 0.9 threshold
-        let det_low = vec![MockDetection::new(0.1, 0.1, 0.3, 0.3, 0.8)];
+        let det_low = vec![MockDetection::new([0.1, 0.1, 0.3, 0.3], 0.8, 0)];
         let res = tracker.update(&det_low, 1000);
         assert!(
             res[0].is_none(),
@@ -711,7 +701,7 @@ mod tests {
         assert!(tracker.tracklets.is_empty());
 
         // Detection with score 0.95 is above the 0.9 threshold
-        let det_high = vec![MockDetection::new(0.1, 0.1, 0.3, 0.3, 0.95)];
+        let det_high = vec![MockDetection::new([0.1, 0.1, 0.3, 0.3], 0.95, 0)];
         let res = tracker.update(&det_high, 2000);
         assert!(
             res[0].is_some(),
@@ -727,8 +717,8 @@ mod tests {
 
         // Frame 1: two well-separated detections
         let det1 = vec![
-            MockDetection::new(0.1, 0.1, 0.3, 0.3, 0.9),
-            MockDetection::new(0.5, 0.5, 0.7, 0.7, 0.9),
+            MockDetection::new([0.1, 0.1, 0.3, 0.3], 0.9, 0),
+            MockDetection::new([0.5, 0.5, 0.7, 0.7], 0.9, 0),
         ];
         tracker.update(&det1, 1000);
         assert_eq!(tracker.tracklets.len(), 2);
@@ -736,8 +726,8 @@ mod tests {
         // Frame 2: shift the first detection slightly. With IOU threshold 0.8
         // the overlap won't be enough for a match, so it creates a new tracklet.
         let det2 = vec![
-            MockDetection::new(0.15, 0.15, 0.35, 0.35, 0.9),
-            MockDetection::new(0.5, 0.5, 0.7, 0.7, 0.9),
+            MockDetection::new([0.15, 0.15, 0.35, 0.35], 0.9, 0),
+            MockDetection::new([0.5, 0.5, 0.7, 0.7], 0.9, 0),
         ];
         let res2 = tracker.update(&det2, 2000);
         assert_eq!(res2.len(), 2);
@@ -756,8 +746,8 @@ mod tests {
         // A zero-area box (xmin == xmax) should not panic
         let mut tracker = ByteTrackBuilder::new().build();
         let det = vec![
-            MockDetection::new(0.5, 0.1, 0.5, 0.3, 0.9), // zero width
-            MockDetection::new(0.1, 0.1, 0.3, 0.3, 0.9), // normal box
+            MockDetection::new([0.5, 0.1, 0.5, 0.3], 0.9, 0), // zero width
+            MockDetection::new([0.1, 0.1, 0.3, 0.3], 0.9, 0), // normal box
         ];
         let results = tracker.update(&det, 1000);
         assert_eq!(results.len(), 2);
@@ -777,14 +767,14 @@ mod tests {
         let mut tracker = ByteTrackBuilder::new().build();
 
         // Frame 1: detection at top-left
-        let det1 = vec![MockDetection::new(0.1, 0.1, 0.2, 0.2, 0.9)];
+        let det1 = vec![MockDetection::new([0.1, 0.1, 0.2, 0.2], 0.9, 0)];
         let res1 = tracker.update(&det1, 1_000_000);
         assert!(res1[0].is_some());
         let uuid1 = res1[0].unwrap().uuid;
         assert_eq!(tracker.tracklets.len(), 1);
 
         // Frame 2: detection at bottom-right (huge displacement)
-        let det2 = vec![MockDetection::new(0.8, 0.8, 0.9, 0.9, 0.9)];
+        let det2 = vec![MockDetection::new([0.8, 0.8, 0.9, 0.9], 0.9, 0)];
         let res2 = tracker.update(&det2, 2_000_000);
         assert!(res2[0].is_some());
 
@@ -811,7 +801,7 @@ mod tests {
             .map(|i| {
                 let x = (i % 10) as f32 * 0.1;
                 let y = (i / 10) as f32 * 0.1;
-                MockDetection::new(x, y, x + 0.05, y + 0.05, 0.9)
+                MockDetection::new([x, y, x + 0.05, y + 0.05], 0.9, 0)
             })
             .collect();
 
@@ -831,7 +821,7 @@ mod tests {
     #[test]
     fn test_tracklet_count_increments_each_frame() {
         let mut tracker = ByteTrackBuilder::new().build();
-        let det = vec![MockDetection::new(0.2, 0.2, 0.4, 0.4, 0.9)];
+        let det = vec![MockDetection::new([0.2, 0.2, 0.4, 0.4], 0.9, 0)];
 
         for frame in 1..=5 {
             tracker.update(&det, frame * 1000);
@@ -847,7 +837,7 @@ mod tests {
     #[test]
     fn test_tracklet_created_timestamp_preserved() {
         let mut tracker = ByteTrackBuilder::new().build();
-        let det = vec![MockDetection::new(0.2, 0.2, 0.4, 0.4, 0.9)];
+        let det = vec![MockDetection::new([0.2, 0.2, 0.4, 0.4], 0.9, 0)];
 
         tracker.update(&det, 1000);
         tracker.update(&det, 2000);
@@ -870,10 +860,10 @@ mod tests {
         // Mix of high and low confidence detections in a single frame
         let mut tracker = ByteTrackBuilder::new().build();
         let det = vec![
-            MockDetection::new(0.1, 0.1, 0.2, 0.2, 0.9),  // high
-            MockDetection::new(0.3, 0.3, 0.4, 0.4, 0.3),  // low
-            MockDetection::new(0.5, 0.5, 0.6, 0.6, 0.85), // high
-            MockDetection::new(0.7, 0.7, 0.8, 0.8, 0.1),  // low
+            MockDetection::new([0.1, 0.1, 0.2, 0.2], 0.9, 0), // high
+            MockDetection::new([0.3, 0.3, 0.4, 0.4], 0.3, 0), // low
+            MockDetection::new([0.5, 0.5, 0.6, 0.6], 0.85, 0), // high
+            MockDetection::new([0.7, 0.7, 0.8, 0.8], 0.1, 0), // low
         ];
 
         let results = tracker.update(&det, 1000);
@@ -944,7 +934,7 @@ mod tests {
     #[test]
     fn test_tracklet_predicted_location_near_detection() {
         let mut tracker = ByteTrackBuilder::new().build();
-        let det = vec![MockDetection::new(0.2, 0.2, 0.4, 0.4, 0.9)];
+        let det = vec![MockDetection::new([0.2, 0.2, 0.4, 0.4], 0.9, 0)];
         tracker.update(&det, 1000);
 
         let pred = tracker.tracklets[0].get_predicted_location();
