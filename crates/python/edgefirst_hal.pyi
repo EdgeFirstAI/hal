@@ -872,8 +872,13 @@ class Tensor:
         """Copy data from a numpy array into this tensor.
 
         Accepts any numpy dtype as long as it matches the tensor's dtype.
-        The total number of elements must match. The numpy array must be
-        C-contiguous.
+        The total number of elements must match. Both contiguous and
+        non-contiguous (strided) arrays are supported:
+
+        - **Contiguous arrays** use a direct memcpy (fastest).
+        - **Non-contiguous arrays** (slices, transposes) are copied
+          element-wise via the array's stride metadata.
+        - **Large copies** (≥256 KiB) are parallelized automatically.
 
         Example::
 
@@ -890,15 +895,20 @@ class Tensor:
             image = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
             tensor.from_numpy(image)
 
+            # Non-contiguous slice — works without ascontiguousarray()
+            big = np.zeros((1000, 1000), dtype=np.float32)
+            tensor = Tensor([500, 500], dtype="float32")
+            tensor.from_numpy(big[:500, :500])
+
         Args:
-            src: Source numpy array. Must be C-contiguous with a dtype
-                matching the tensor (e.g. ``float32`` tensor requires
-                ``np.float32`` array). Total element count must match.
+            src: Source numpy array. The dtype must match the tensor's
+                dtype (e.g. ``float32`` tensor requires ``np.float32``).
+                Total element count must match. Contiguous and strided
+                layouts are both accepted.
 
         Raises:
             RuntimeError: If the numpy dtype does not match the tensor
-                dtype, the element count differs, or the array is not
-                C-contiguous.
+                dtype, or the element count differs.
         """
         ...
 
