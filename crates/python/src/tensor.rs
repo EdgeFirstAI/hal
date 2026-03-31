@@ -351,7 +351,7 @@ fn copy_numpy_to_tensor_dyn(src: &Bound<'_, pyo3::types::PyAny>, tensor: &Tensor
     const PARALLEL_THRESHOLD_BYTES: usize = 256 * 1024;
 
     fn copy_typed<
-        T: numpy::Element + Copy + num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
+        T: numpy::Element + num_traits::Num + Copy + Clone + std::fmt::Debug + Send + Sync,
     >(
         src: &Bound<'_, pyo3::types::PyAny>,
         tensor: &tensor::Tensor<T>,
@@ -380,21 +380,28 @@ fn copy_numpy_to_tensor_dyn(src: &Bound<'_, pyo3::types::PyAny>, tensor: &Tensor
         let min_chunk = (4096 / std::mem::size_of::<T>()).max(1);
 
         if arr.is_c_contiguous() {
-            // Path 1: fully contiguous — single memcpy.
-            let src_slice = readonly.as_slice().expect("contiguous but as_slice failed");
-            // Release the GIL for the bulk copy — the readonly guard
-            // keeps the numpy buffer pinned and immutable.
-            py.detach(|| {
-                if parallel {
-                    use rayon::prelude::*;
-                    let chunk = (tensor_len / rayon::current_num_threads()).max(min_chunk);
-                    dst.par_chunks_mut(chunk)
-                        .zip(src_slice.par_chunks(chunk))
-                        .for_each(|(d, s)| d.copy_from_slice(s));
-                } else {
-                    dst.copy_from_slice(src_slice);
-                }
-            });
+            if let Ok(src_slice) = readonly.as_slice() {
+                // Path 1: fully contiguous — single memcpy.
+                py.detach(|| {
+                    if parallel {
+                        use rayon::prelude::*;
+                        let chunk = (tensor_len / rayon::current_num_threads()).max(min_chunk);
+                        dst.par_chunks_mut(chunk)
+                            .zip(src_slice.par_chunks(chunk))
+                            .for_each(|(d, s): (&mut [T], &[T])| d.copy_from_slice(s));
+                    } else {
+                        dst.copy_from_slice(src_slice);
+                    }
+                });
+            } else {
+                // C-contiguous but as_slice() failed (e.g., misaligned buffer).
+                // Fall back to element-wise copy.
+                py.detach(|| {
+                    for (d, &s) in dst.iter_mut().zip(src_view.iter()) {
+                        *d = s;
+                    }
+                });
+            }
         } else {
             // Non-contiguous: find the longest contiguous inner dimension.
             // Walk inward from the last axis: if stride[i] == product of
@@ -444,14 +451,19 @@ fn copy_numpy_to_tensor_dyn(src: &Bound<'_, pyo3::types::PyAny>, tensor: &Tensor
                     row_offsets.push(byte_off);
                 }
 
+                // Store base as usize for Send+Sync safety in rayon closures.
+                // The pointer is reconstructed inside each task. This is safe
+                // because the numpy readonly guard pins the source buffer for
+                // our entire scope.
                 let base_addr = src_view.as_ptr() as usize;
-                let copy_row = |dst_row: &mut [T], byte_off: isize| unsafe {
-                    let src_ptr = (base_addr as *const u8).offset(byte_off) as *const T;
-                    let src_row = std::slice::from_raw_parts(src_ptr, row_len);
-                    dst_row.copy_from_slice(src_row);
-                };
 
                 py.detach(|| {
+                    let copy_row = |dst_row: &mut [T], byte_off: isize| unsafe {
+                        let src_ptr = (base_addr as *const u8).offset(byte_off) as *const T;
+                        let src_row = std::slice::from_raw_parts(src_ptr, row_len);
+                        dst_row.copy_from_slice(src_row);
+                    };
+
                     if parallel {
                         use rayon::prelude::*;
                         dst.par_chunks_mut(row_len)
