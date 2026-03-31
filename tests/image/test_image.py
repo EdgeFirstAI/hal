@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from edgefirst_hal import (
+    ColorMode,
+    Decoder,
     ImageProcessor,
     Flip,
     PixelFormat,
@@ -332,3 +334,129 @@ def test_import_image_dma_success():
     )
     assert imported.width == 640
     assert imported.height == 480
+
+
+# ─── Mask rendering tests ────────────────────────────────────────
+
+
+def test_draw_decoded_masks_empty():
+    """draw_decoded_masks with zero detections should not crash."""
+    dst = Tensor.load("testdata/giraffe.jpg", PixelFormat.Rgba)
+    converter = ImageProcessor()
+    converter.draw_decoded_masks(
+        dst,
+        bbox=np.zeros((0, 4), dtype=np.float32),
+        scores=np.zeros((0,), dtype=np.float32),
+        classes=np.zeros((0,), dtype=np.uintp),
+    )
+    # Verify the image is untouched (no crash, pixels unchanged)
+    expected = load_image("testdata/giraffe.jpg", "RGBA")
+    with dst.map() as m:
+        img = np.array(m.view()).reshape((dst.height, dst.width, 4))
+        assert calculate_similarity_rms_u8(img, expected) > 0.99
+
+
+def test_draw_decoded_masks_multiple_boxes():
+    """draw_decoded_masks with multiple detections (boxes only, no seg)."""
+    dst = Tensor.load("testdata/giraffe.jpg", PixelFormat.Rgba)
+    converter = ImageProcessor()
+    converter.draw_decoded_masks(
+        dst,
+        bbox=np.array(
+            [
+                [0.1, 0.1, 0.3, 0.3],
+                [0.5, 0.5, 0.8, 0.8],
+                [0.2, 0.6, 0.4, 0.9],
+            ],
+            dtype=np.float32,
+        ),
+        scores=np.array([0.9, 0.8, 0.7], dtype=np.float32),
+        classes=np.array([0, 1, 2], dtype=np.uintp),
+    )
+    # Should render 3 boxes. We can't pixel-match without a reference,
+    # but verify it didn't crash and image was modified.
+    original = load_image("testdata/giraffe.jpg", "RGBA")
+    with dst.map() as m:
+        img = np.array(m.view()).reshape((dst.height, dst.width, 4))
+        # The image should be different from original (boxes drawn on it)
+        assert calculate_similarity_rms_u8(img, original) < 0.999
+
+
+def test_draw_decoded_masks_instance_color_mode():
+    """draw_decoded_masks with ColorMode.Instance assigns per-detection colors."""
+    dst = Tensor.load("testdata/giraffe.jpg", PixelFormat.Rgba)
+    converter = ImageProcessor()
+    # Two detections with same class but Instance coloring
+    converter.draw_decoded_masks(
+        dst,
+        bbox=np.array(
+            [[0.1, 0.1, 0.4, 0.4], [0.5, 0.5, 0.9, 0.9]],
+            dtype=np.float32,
+        ),
+        scores=np.array([0.9, 0.8], dtype=np.float32),
+        classes=np.array([0, 0], dtype=np.uintp),
+        color_mode=ColorMode.Instance,
+    )
+    # Verify it didn't crash and image was modified
+    original = load_image("testdata/giraffe.jpg", "RGBA")
+    with dst.map() as m:
+        img = np.array(m.view()).reshape((dst.height, dst.width, 4))
+        assert calculate_similarity_rms_u8(img, original) < 0.999
+
+
+def test_draw_decoded_masks_with_opacity():
+    """draw_decoded_masks with reduced opacity makes overlays more transparent."""
+    dst_full = Tensor.load("testdata/giraffe.jpg", PixelFormat.Rgba)
+    dst_half = Tensor.load("testdata/giraffe.jpg", PixelFormat.Rgba)
+    converter = ImageProcessor()
+    bbox = np.array([[0.1, 0.1, 0.9, 0.9]], dtype=np.float32)
+    scores = np.array([0.9], dtype=np.float32)
+    classes = np.array([0], dtype=np.uintp)
+
+    converter.draw_decoded_masks(dst_full, bbox=bbox, scores=scores, classes=classes, opacity=1.0)
+    converter.draw_decoded_masks(dst_half, bbox=bbox, scores=scores, classes=classes, opacity=0.3)
+
+    original = load_image("testdata/giraffe.jpg", "RGBA")
+    with dst_full.map() as m1, dst_half.map() as m2:
+        img_full = np.array(m1.view()).reshape((dst_full.height, dst_full.width, 4))
+        img_half = np.array(m2.view()).reshape((dst_half.height, dst_half.width, 4))
+        # Half-opacity result should be closer to the original than full-opacity
+        sim_full = calculate_similarity_rms_u8(img_full, original)
+        sim_half = calculate_similarity_rms_u8(img_half, original)
+        assert sim_half > sim_full
+
+
+def test_draw_masks_fused():
+    """draw_masks fused decode+render path with synthetic detection model output."""
+    config = """
+decoder_version: yolo26
+outputs:
+ - type: detection
+   decoder: ultralytics
+   shape: [1, 10, 6]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [num_features, 6]
+   normalized: true
+"""
+    decoder = Decoder.new_from_yaml_str(config, score_threshold=0.1, iou_threshold=0.7)
+
+    # Create a synthetic float detection tensor: 1 detection with box + score + class
+    data = np.zeros((1, 10, 6), dtype=np.float32)
+    data[0, 0, :] = [0.1, 0.1, 0.3, 0.3, 0.9, 2.0]  # box + score + class
+    model_output_tensor = Tensor([1, 10, 6], dtype="float32")
+    with model_output_tensor.map() as m:
+        buf = np.frombuffer(m.view(), dtype=np.float32).reshape((1, 10, 6))
+        buf[:] = data
+
+    dst = Tensor.load("testdata/giraffe.jpg", PixelFormat.Rgba)
+    converter = ImageProcessor()
+    result = converter.draw_masks(decoder, [model_output_tensor], dst)
+
+    # Should return (boxes, scores, classes)
+    assert len(result) == 3
+    boxes, scores, classes = result
+    assert boxes.shape[1] == 4
+    assert len(scores) == len(boxes)
+    assert len(classes) == len(boxes)

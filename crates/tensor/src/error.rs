@@ -51,3 +51,94 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_error_display() {
+        let e = Error::InvalidSize(0);
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("InvalidSize"),
+            "unexpected InvalidSize message: {msg}"
+        );
+
+        let e = Error::NotImplemented("foo".to_string());
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("NotImplemented") && msg.contains("foo"),
+            "unexpected NotImplemented message: {msg}"
+        );
+
+        let e = Error::ShapeMismatch("expected 3, got 4".to_string());
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("ShapeMismatch") && msg.contains("expected 3"),
+            "unexpected ShapeMismatch message: {msg}"
+        );
+
+        let e = Error::InvalidMemoryType("dma".to_string());
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("InvalidMemoryType") && msg.contains("dma"),
+            "unexpected InvalidMemoryType message: {msg}"
+        );
+
+        let e = Error::PboDisconnected;
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("PboDisconnected"),
+            "unexpected PboDisconnected message: {msg}"
+        );
+
+        let e = Error::PboMapped;
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("PboMapped"),
+            "unexpected PboMapped message: {msg}"
+        );
+
+        let e = Error::InvalidShape("bad shape".to_string());
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("InvalidShape") && msg.contains("bad shape"),
+            "unexpected InvalidShape message: {msg}"
+        );
+
+        let e = Error::InvalidArgument("negative".to_string());
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("InvalidArgument") && msg.contains("negative"),
+            "unexpected InvalidArgument message: {msg}"
+        );
+
+        let e = Error::InvalidOperation("read-only".to_string());
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("InvalidOperation") && msg.contains("read-only"),
+            "unexpected InvalidOperation message: {msg}"
+        );
+
+        let e = Error::IoError(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "file missing",
+        ));
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("IoError") && msg.contains("file missing"),
+            "unexpected IoError message: {msg}"
+        );
+    }
+}

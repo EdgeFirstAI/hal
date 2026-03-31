@@ -61,3 +61,51 @@ impl From<ndarray::ShapeError> for DecoderError {
         DecoderError::NDArrayShape(err)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_decoder_error_display() {
+        let e = DecoderError::Internal("something broke".to_string());
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("Internal") && msg.contains("something broke"),
+            "unexpected Internal message: {msg}"
+        );
+
+        let e = DecoderError::NotSupported("yolov99".to_string());
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("NotSupported") && msg.contains("yolov99"),
+            "unexpected NotSupported message: {msg}"
+        );
+
+        let e = DecoderError::InvalidShape("expected 3D".to_string());
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("InvalidShape") && msg.contains("expected 3D"),
+            "unexpected InvalidShape message: {msg}"
+        );
+
+        let e = DecoderError::NoConfig;
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("NoConfig"),
+            "unexpected NoConfig message: {msg}"
+        );
+
+        let e = DecoderError::InvalidConfig("missing field".to_string());
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("InvalidConfig") && msg.contains("missing field"),
+            "unexpected InvalidConfig message: {msg}"
+        );
+    }
+}
