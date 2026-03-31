@@ -2167,6 +2167,9 @@ outputs:
         // With all-zero input, no detections pass the score threshold.
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+        // Stale data (5 items) must be cleared. The all-zero quantized input
+        // may produce a small number of detections due to dequantization
+        // (zero_point=-123 → dequant(0) ≈ 0.49 which can pass threshold).
         assert!(
             output_boxes.len() < 5,
             "decode_quantized_proto should clear stale data: got {} items (was 5)",

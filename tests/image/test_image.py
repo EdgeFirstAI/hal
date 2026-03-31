@@ -105,9 +105,11 @@ def test_render():
     expected_cpu = load_image("testdata/output_render_cpu.jpg", "RGBA")
     with dst.map() as m:
         img = np.array(m.view()).reshape((dst.height, dst.width, 4))
+        # Threshold 0.97: GPU smoothstep anti-aliasing at mask edges produces
+        # small differences across platforms (x86 Mesa vs Vivante GC7000UL).
         assert (
-            calculate_similarity_rms_u8(img, expected_gl) > 0.99
-            or calculate_similarity_rms_u8(img, expected_cpu) > 0.99
+            calculate_similarity_rms_u8(img, expected_gl) > 0.97
+            or calculate_similarity_rms_u8(img, expected_cpu) > 0.97
         )
 
 
