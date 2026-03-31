@@ -168,7 +168,13 @@ impl GLProcessorThreaded {
         let (create_ctx_send, create_ctx_recv) = tokio::sync::oneshot::channel();
 
         let func = move || {
-            let mut gl_converter = match GLProcessorST::new(kind) {
+            let init_result = {
+                let _guard = super::context::GL_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                GLProcessorST::new(kind)
+            };
+            let mut gl_converter = match init_result {
                 Ok(gl) => gl,
                 Err(e) => {
                     let _ = create_ctx_send.send(Err(e));
@@ -178,6 +184,12 @@ impl GLProcessorThreaded {
             let _ = create_ctx_send.send(Ok(gl_converter.gl_context.transfer_backend));
             let mut poisoned = false;
             while let Some(msg) = recv.blocking_recv() {
+                // Serialize all GL operations across GLProcessorST instances.
+                // See `GL_MUTEX` doc comment in context.rs for rationale.
+                let _guard = super::context::GL_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+
                 // After a panic, the GL context is in an undefined state. Reject
                 // all subsequent messages with an error rather than risking wrong
                 // output or a GPU hang from corrupted GL state. This follows the
@@ -451,6 +463,11 @@ impl GLProcessorThreaded {
                     }
                 }
             }
+            // Explicitly drop under the mutex so EGL teardown is serialized.
+            let _guard = super::context::GL_MUTEX
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            drop(gl_converter);
         };
 
         // let handle = tokio::task::spawn(func());
