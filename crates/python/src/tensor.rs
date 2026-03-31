@@ -356,6 +356,7 @@ fn copy_numpy_to_tensor_dyn(src: &Bound<'_, pyo3::types::PyAny>, tensor: &Tensor
         src: &Bound<'_, pyo3::types::PyAny>,
         tensor: &tensor::Tensor<T>,
     ) -> Result<()> {
+        let py = src.py();
         let arr = src
             .downcast::<numpy::PyArrayDyn<T>>()
             .map_err(|_| Error::Format("numpy dtype does not match tensor dtype".to_string()))?;
@@ -375,19 +376,25 @@ fn copy_numpy_to_tensor_dyn(src: &Bound<'_, pyo3::types::PyAny>, tensor: &Tensor
         let dst = map.as_mut_slice();
         let nbytes = tensor_len * std::mem::size_of::<T>();
         let parallel = nbytes >= PARALLEL_THRESHOLD_BYTES;
+        // Minimum chunk: 4 KiB worth of elements (scales with element size).
+        let min_chunk = (4096 / std::mem::size_of::<T>()).max(1);
 
         if arr.is_c_contiguous() {
             // Path 1: fully contiguous — single memcpy.
             let src_slice = readonly.as_slice().expect("contiguous but as_slice failed");
-            if parallel {
-                use rayon::prelude::*;
-                let chunk = (tensor_len / rayon::current_num_threads()).max(1024);
-                dst.par_chunks_mut(chunk)
-                    .zip(src_slice.par_chunks(chunk))
-                    .for_each(|(d, s)| d.copy_from_slice(s));
-            } else {
-                dst.copy_from_slice(src_slice);
-            }
+            // Release the GIL for the bulk copy — the readonly guard
+            // keeps the numpy buffer pinned and immutable.
+            py.detach(|| {
+                if parallel {
+                    use rayon::prelude::*;
+                    let chunk = (tensor_len / rayon::current_num_threads()).max(min_chunk);
+                    dst.par_chunks_mut(chunk)
+                        .zip(src_slice.par_chunks(chunk))
+                        .for_each(|(d, s)| d.copy_from_slice(s));
+                } else {
+                    dst.copy_from_slice(src_slice);
+                }
+            });
         } else {
             // Non-contiguous: find the longest contiguous inner dimension.
             // Walk inward from the last axis: if stride[i] == product of
@@ -429,8 +436,6 @@ fn copy_numpy_to_tensor_dyn(src: &Bound<'_, pyo3::types::PyAny>, tensor: &Tensor
                 for row_idx in 0..n_rows {
                     let mut remaining = row_idx;
                     let mut byte_off: isize = 0;
-                    // Decompose row_idx into (coord_0, coord_1, ...) in
-                    // C-order (last outer dim varies fastest).
                     for dim in (0..outer_ndim).rev() {
                         let coord = remaining % outer_shape[dim];
                         remaining /= outer_shape[dim];
@@ -439,8 +444,6 @@ fn copy_numpy_to_tensor_dyn(src: &Bound<'_, pyo3::types::PyAny>, tensor: &Tensor
                     row_offsets.push(byte_off);
                 }
 
-                // Row copy closure — base_addr is a usize (Send+Sync
-                // safe), reconstructed to a pointer with signed offset.
                 let base_addr = src_view.as_ptr() as usize;
                 let copy_row = |dst_row: &mut [T], byte_off: isize| unsafe {
                     let src_ptr = (base_addr as *const u8).offset(byte_off) as *const T;
@@ -448,34 +451,43 @@ fn copy_numpy_to_tensor_dyn(src: &Bound<'_, pyo3::types::PyAny>, tensor: &Tensor
                     dst_row.copy_from_slice(src_row);
                 };
 
-                if parallel {
-                    use rayon::prelude::*;
-                    dst.par_chunks_mut(row_len)
-                        .zip(row_offsets.par_iter())
-                        .for_each(|(dst_row, &off)| copy_row(dst_row, off));
-                } else {
-                    for (dst_row, &off) in dst.chunks_mut(row_len).zip(row_offsets.iter()) {
-                        copy_row(dst_row, off);
+                py.detach(|| {
+                    if parallel {
+                        use rayon::prelude::*;
+                        dst.par_chunks_mut(row_len)
+                            .zip(row_offsets.par_iter())
+                            .for_each(|(dst_row, &off)| copy_row(dst_row, off));
+                    } else {
+                        for (dst_row, &off) in dst.chunks_mut(row_len).zip(row_offsets.iter()) {
+                            copy_row(dst_row, off);
+                        }
                     }
-                }
+                });
             } else {
-                // Path 3: fully strided (contig_elems == 1) or scalar —
-                // per-element copy. Parallel via rayon collect + memcpy for
-                // large arrays, sequential iter for small.
-                if parallel {
-                    use rayon::prelude::*;
-                    // Collect into a contiguous vec, then parallel copy out.
-                    // This is one allocation + one pass over the strided source,
-                    // plus one parallel memcpy — still a single copy of each element.
-                    let contiguous: Vec<T> = src_view.iter().copied().collect();
-                    let chunk = (tensor_len / rayon::current_num_threads()).max(1024);
-                    dst.par_chunks_mut(chunk)
-                        .zip(contiguous.par_chunks(chunk))
-                        .for_each(|(d, s)| d.copy_from_slice(s));
+                // Path 3: fully strided (contig_elems == 1) or scalar.
+                // Parallelize by slicing along the outermost axis so each
+                // rayon task iterates its own sub-view — no temp allocation.
+                if parallel && ndim > 0 && shape[0] > 1 {
+                    let n_outer = shape[0];
+                    let elems_per_outer = tensor_len / n_outer;
+
+                    py.detach(|| {
+                        use rayon::prelude::*;
+                        dst.par_chunks_mut(elems_per_outer).enumerate().for_each(
+                            |(i, dst_chunk)| {
+                                let sub = src_view.index_axis(ndarray::Axis(0), i);
+                                for (d, &s) in dst_chunk.iter_mut().zip(sub.iter()) {
+                                    *d = s;
+                                }
+                            },
+                        );
+                    });
                 } else {
-                    for (d, &s) in dst.iter_mut().zip(src_view.iter()) {
-                        *d = s;
-                    }
+                    py.detach(|| {
+                        for (d, &s) in dst.iter_mut().zip(src_view.iter()) {
+                            *d = s;
+                        }
+                    });
                 }
             }
         }
@@ -729,10 +741,12 @@ impl PyTensor {
 
     /// Copy data from a numpy array into this tensor.
     ///
-    /// Accepts any numpy dtype and shape as long as the total byte size
-    /// matches the tensor. The numpy array must be contiguous (C-order).
-    /// Raises ``RuntimeError`` on dtype mismatch, size mismatch, or if the
-    /// array is not contiguous.
+    /// Accepts any numpy dtype as long as it matches the tensor's dtype.
+    /// The total element count must match. Both contiguous and
+    /// non-contiguous (strided) arrays are supported. Large copies
+    /// (≥256 KiB) are parallelized automatically.
+    ///
+    /// Raises ``RuntimeError`` on dtype mismatch or element-count mismatch.
     fn from_numpy(&mut self, src: &Bound<'_, pyo3::types::PyAny>) -> Result<()> {
         copy_numpy_to_tensor_dyn(src, &self.0)
     }
