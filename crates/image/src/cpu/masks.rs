@@ -138,6 +138,7 @@ impl CPUProcessor {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn render_box(
         &mut self,
         dst_w: usize,
@@ -146,14 +147,15 @@ impl CPUProcessor {
         dst_c: usize,
         dst_slice: &mut [u8],
         detect: &[DetectBox],
+        color_mode: crate::ColorMode,
     ) -> Result<()> {
         const LINE_THICKNESS: usize = 3;
 
-        for d in detect {
+        for (idx, d) in detect.iter().enumerate() {
             use edgefirst_decoder::BoundingBox;
 
-            let label = d.label;
-            let [r, g, b, _] = self.colors[label % self.colors.len()];
+            let color_index = color_mode.index(idx, d.label);
+            let [r, g, b, _] = self.colors[color_index % self.colors.len()];
             let bbox = d.bbox.to_canonical();
             let bbox = BoundingBox {
                 xmin: bbox.xmin.clamp(0.0, 1.0),
@@ -221,6 +223,7 @@ impl CPUProcessor {
         &self,
         detect: &[crate::DetectBox],
         proto_data: &crate::ProtoData,
+        letterbox: Option<[f32; 4]>,
     ) -> crate::Result<Vec<edgefirst_decoder::Segmentation>> {
         use edgefirst_decoder::ProtoTensor;
 
@@ -236,15 +239,33 @@ impl CPUProcessor {
             ProtoTensor::Float(arr) => (arr.shape()[0], arr.shape()[1], arr.shape()[2]),
         };
 
+        // Precompute inverse letterbox scale for output-coord conversion.
+        let (lx0, inv_lw, ly0, inv_lh) = match letterbox {
+            Some([lx0, ly0, lx1, ly1]) => {
+                let lw = lx1 - lx0;
+                let lh = ly1 - ly0;
+                (
+                    lx0,
+                    if lw > 0.0 { 1.0 / lw } else { 1.0 },
+                    ly0,
+                    if lh > 0.0 { 1.0 / lh } else { 1.0 },
+                )
+            }
+            None => (0.0_f32, 1.0_f32, 0.0_f32, 1.0_f32),
+        };
+
         detect
             .iter()
             .zip(proto_data.mask_coefficients.iter())
             .map(|(det, coeff)| {
-                // Clamp bbox to [0, 1]
-                let xmin = det.bbox.xmin.clamp(0.0, 1.0);
-                let ymin = det.bbox.ymin.clamp(0.0, 1.0);
-                let xmax = det.bbox.xmax.clamp(0.0, 1.0);
-                let ymax = det.bbox.ymax.clamp(0.0, 1.0);
+                // Canonicalise bbox (swap min/max if inverted) then clamp to [0,1].
+                // Without canonicalisation a degenerate box (ymax < ymin) causes a
+                // near-zero ROI height after saturating_sub, making the mask invisible.
+                let bbox = det.bbox.to_canonical();
+                let xmin = bbox.xmin.clamp(0.0, 1.0);
+                let ymin = bbox.ymin.clamp(0.0, 1.0);
+                let xmax = bbox.xmax.clamp(0.0, 1.0);
+                let ymax = bbox.ymax.clamp(0.0, 1.0);
 
                 // Map to proto-space pixel coordinates (clamp to valid range)
                 let x0 = ((xmin * proto_w as f32) as usize).min(proto_w.saturating_sub(1));
@@ -280,11 +301,20 @@ impl CPUProcessor {
                     }
                 };
 
+                // Convert proto-space normalised coords to output-image-normalised
+                // coords by applying the inverse letterbox transform.  When no
+                // letterbox was used (lx0=0, inv_lw=1, ly0=0, inv_lh=1) this is a
+                // no-op and the coords are identical to the proto-normalised values.
+                let seg_xmin = ((x0 as f32 / proto_w as f32) - lx0) * inv_lw;
+                let seg_ymin = ((y0 as f32 / proto_h as f32) - ly0) * inv_lh;
+                let seg_xmax = ((x1 as f32 / proto_w as f32) - lx0) * inv_lw;
+                let seg_ymax = ((y1 as f32 / proto_h as f32) - ly0) * inv_lh;
+
                 Ok(edgefirst_decoder::Segmentation {
-                    xmin: x0 as f32 / proto_w as f32,
-                    ymin: y0 as f32 / proto_h as f32,
-                    xmax: x1 as f32 / proto_w as f32,
-                    ymax: y1 as f32 / proto_h as f32,
+                    xmin: seg_xmin.clamp(0.0, 1.0),
+                    ymin: seg_ymin.clamp(0.0, 1.0),
+                    xmax: seg_xmax.clamp(0.0, 1.0),
+                    ymax: seg_ymax.clamp(0.0, 1.0),
                     segmentation: mask,
                 })
             })

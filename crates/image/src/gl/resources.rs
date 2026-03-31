@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
+use super::cache::EglCacheKey;
 use super::context::{Egl, GlContext};
 use super::shaders::{check_gl_error, compile_shader_from_str};
 use khronos_egl as egl;
@@ -37,6 +38,10 @@ pub(super) struct Texture {
     pub(super) width: usize,
     pub(super) height: usize,
     pub(super) format: gls::gl::types::GLenum,
+    /// Which EGLImage (identified by buffer identity key) is currently bound
+    /// to this texture via `glEGLImageTargetTexture2DOES`. `None` means no
+    /// EGLImage is bound (or the binding has been invalidated).
+    bound_egl_key: Option<EglCacheKey>,
 }
 
 impl Default for Texture {
@@ -55,6 +60,7 @@ impl Texture {
             width: 0,
             height: 0,
             format: 0,
+            bound_egl_key: None,
         }
     }
 
@@ -88,6 +94,8 @@ impl Texture {
             self.format = format;
             self.width = width;
             self.height = height;
+            // TexImage2D reallocates the texture, invalidating any EGLImage binding.
+            self.bound_egl_key = None;
         } else {
             unsafe {
                 gls::gl::TexSubImage2D(
@@ -103,6 +111,53 @@ impl Texture {
                 );
             }
         }
+    }
+
+    /// Bind an EGLImage to this GL_TEXTURE_2D texture if the key differs from
+    /// what's already bound. Returns `true` if the bind was performed, `false`
+    /// if skipped (already bound).
+    ///
+    /// # Safety
+    /// Caller must ensure the texture is bound to the active texture unit and
+    /// `egl_image_ptr` is a valid EGL image handle.
+    pub(super) unsafe fn bind_egl_image(
+        &mut self,
+        key: EglCacheKey,
+        egl_image_ptr: *const c_void,
+    ) -> bool {
+        if self.bound_egl_key == Some(key) {
+            return false;
+        }
+        gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, egl_image_ptr);
+        self.bound_egl_key = Some(key);
+        true
+    }
+
+    /// Bind an EGLImage to this GL_TEXTURE_EXTERNAL_OES texture if the key
+    /// differs from what's already bound. Returns `true` if the bind was
+    /// performed, `false` if skipped.
+    ///
+    /// # Safety
+    /// Caller must ensure the texture is bound to the active texture unit and
+    /// `egl_image_ptr` is a valid EGL image handle.
+    pub(super) unsafe fn bind_egl_image_external(
+        &mut self,
+        key: EglCacheKey,
+        egl_image_ptr: *const c_void,
+    ) -> bool {
+        if self.bound_egl_key == Some(key) {
+            return false;
+        }
+        gls::egl_image_target_texture_2d_oes(gls::gl::TEXTURE_EXTERNAL_OES, egl_image_ptr);
+        self.bound_egl_key = Some(key);
+        true
+    }
+
+    /// Invalidate the cached EGL binding key. Must be called when the
+    /// EGLImage cache evicts the entry this texture was using, or when
+    /// `TexImage2D` overwrites the texture storage.
+    pub(super) fn invalidate_egl_binding(&mut self) {
+        self.bound_egl_key = None;
     }
 }
 

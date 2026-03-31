@@ -434,6 +434,24 @@ typedef enum hal_flip {
 } hal_flip;
 
 /**
+ * Controls how mask colors are assigned to detections.
+ */
+typedef enum hal_color_mode {
+  /**
+   * Color chosen by class label (default, correct for semantic segmentation)
+   */
+  HAL_COLOR_MODE_CLASS = 0,
+  /**
+   * Color chosen by detection index (unique color per instance)
+   */
+  HAL_COLOR_MODE_INSTANCE = 1,
+  /**
+   * Color chosen by track ID (use with object tracking)
+   */
+  HAL_COLOR_MODE_TRACK = 2,
+} hal_color_mode;
+
+/**
  * Log severity level.
  *
  * Maps 1:1 to Rust `log::Level`.
@@ -560,6 +578,20 @@ typedef struct hal_image_processor hal_image_processor;
  * @see hal_plane_descriptor_new, hal_import_image
  */
 typedef struct hal_plane_descriptor hal_plane_descriptor;
+
+/**
+ * Opaque prototype data from a segmentation model's decode step.
+ *
+ * Holds raw mask coefficients and prototype tensors. Pass to
+ * `hal_image_processor_materialize_masks()` to compute per-instance masks,
+ * or use `hal_image_processor_draw_masks()` for fused rendering.
+ *
+ * Returned by `hal_decoder_decode_proto()`. For detection-only models,
+ * `hal_decoder_decode_proto()` returns NULL instead.
+ *
+ * Free with `hal_proto_data_free()`.
+ */
+typedef struct hal_proto_data hal_proto_data;
 
 /**
  * List of segmentation results.
@@ -1078,6 +1110,36 @@ int hal_decoder_decode(const struct hal_decoder *decoder,
                        struct hal_segmentation_list **out_segmentations);
 
 /**
+ * Decode model outputs into detection boxes and optional prototype data.
+ *
+ * For segmentation models, returns a prototype data handle that can be passed
+ * to `hal_image_processor_materialize_masks()` to compute per-instance masks
+ * for analytics, export, or IoU computation.
+ *
+ * For detection-only models, returns NULL for proto data but still populates
+ * detection boxes in `out_boxes`.
+ *
+ * @note Calling `hal_decoder_decode_proto()` + `hal_image_processor_materialize_masks()`
+ *       + `hal_image_processor_draw_decoded_masks()` separately prevents the HAL from
+ *       using its internal fused optimization. For render-only use cases, prefer
+ *       `hal_image_processor_draw_masks()` which is 1.6–27× faster on tested platforms.
+ *
+ * @param decoder Decoder handle
+ * @param outputs Array of output tensor pointers
+ * @param num_outputs Number of output tensors
+ * @param out_boxes Output parameter for detection box list (caller must free)
+ * @return Prototype data handle (caller must free with `hal_proto_data_free()`),
+ *         or NULL for detection-only models or on error
+ * @par Errors (errno):
+ * - EINVAL: Invalid argument (NULL decoder/outputs/out_boxes)
+ * - EIO: Decoding failed
+ */
+struct hal_proto_data *hal_decoder_decode_proto(const struct hal_decoder *decoder,
+                                                const struct hal_tensor *const *outputs,
+                                                size_t num_outputs,
+                                                struct hal_detect_box_list **out_boxes);
+
+/**
  * Get the model type string from a decoder.
  *
  * Returns a human-readable string identifying the model type (e.g., "yolo_det",
@@ -1143,6 +1205,13 @@ struct hal_tensor *hal_segmentation_to_mask(const struct hal_segmentation_list *
  * @param decoder Decoder handle to free (can be NULL, no-op)
  */
 void hal_decoder_free(struct hal_decoder *decoder);
+
+/**
+ * Free prototype data returned by `hal_decoder_decode_proto()`.
+ *
+ * @param proto Prototype data handle to free (can be NULL, no-op)
+ */
+void hal_proto_data_free(struct hal_proto_data *proto);
 
 /**
  * Get the number of detections in a list.
@@ -1579,6 +1648,9 @@ int hal_image_processor_convert(struct hal_image_processor *processor,
  * @param segmentations Segmentation list (can be NULL for detection-only)
  * @param background Optional background image (NULL to draw over dst)
  * @param opacity Mask opacity in [0.0, 1.0] (1.0 = fully opaque, clamped)
+ * @param letterbox Optional letterbox coordinates [x0, y0, x1, y1] in normalized
+ *        coordinates for mapping model-space boxes back to image space (NULL = no letterbox)
+ * @param color_mode How to assign colors to detections (HAL_COLOR_MODE_CLASS by default)
  * @return 0 on success, -1 on error
  * @par Errors (errno):
  * - EINVAL: Invalid argument (NULL processor or dst, or background == dst)
@@ -1589,7 +1661,43 @@ int hal_image_processor_draw_decoded_masks(struct hal_image_processor *processor
                                            const struct hal_detect_box_list *detections,
                                            const struct hal_segmentation_list *segmentations,
                                            const struct hal_tensor *background,
-                                           float opacity);
+                                           float opacity,
+                                           const float *letterbox,
+                                           enum hal_color_mode color_mode);
+
+/**
+ * Materialize per-instance segmentation masks from prototype data.
+ *
+ * Computes `mask_coeff @ protos` with sigmoid activation for each detection,
+ * producing compact masks at prototype resolution (e.g., 160×160 crops).
+ * Mask values are continuous sigmoid confidence quantized to uint8
+ * (0 = background, 255 = full confidence), NOT binary thresholded.
+ *
+ * The returned segmentation list can be:
+ * - Inspected via `hal_segmentation_list_get_mask()` for analytics, IoU, etc.
+ * - Passed to `hal_image_processor_draw_decoded_masks()` for GPU rendering.
+ *
+ * @note Calling `hal_decoder_decode_proto()` + `hal_image_processor_materialize_masks()`
+ *       + `hal_image_processor_draw_decoded_masks()` separately prevents the HAL from
+ *       using its internal fused optimization. For render-only use cases, prefer
+ *       `hal_image_processor_draw_masks()` which is 1.6–27× faster on tested platforms.
+ *
+ * @param processor Image processor handle
+ * @param detections Detection box list from `hal_decoder_decode_proto()`
+ * @param proto Prototype data from `hal_decoder_decode_proto()`
+ * @param letterbox Optional letterbox coordinates [x0, y0, x1, y1] in normalized
+ *        coordinates (NULL = no letterbox correction)
+ * @return Segmentation list (caller must free with `hal_segmentation_list_free()`),
+ *         or NULL on error
+ * @par Errors (errno):
+ * - EINVAL: Invalid argument (NULL processor/detections/proto)
+ * - ENOTSUP: CPU backend not available (required for mask materialization)
+ * - EIO: Materialization failed
+ */
+struct hal_segmentation_list *hal_image_processor_materialize_masks(struct hal_image_processor *processor,
+                                                                    const struct hal_detect_box_list *detections,
+                                                                    const struct hal_proto_data *proto,
+                                                                    const float *letterbox);
 
 /**
  * Decode model outputs and draw masks directly onto a destination image.
@@ -1605,6 +1713,9 @@ int hal_image_processor_draw_decoded_masks(struct hal_image_processor *processor
  * @param dst Destination image to draw onto
  * @param background Optional background image (NULL to draw over dst)
  * @param opacity Mask opacity, clamped to [0.0, 1.0] (1.0 = fully opaque)
+ * @param letterbox Optional letterbox coordinates [x0, y0, x1, y1] in normalized
+ *        coordinates (NULL = no letterbox correction)
+ * @param color_mode How to assign colors to detections (HAL_COLOR_MODE_CLASS by default)
  * @param out_boxes Output parameter for detection box list (caller must free)
  * @return 0 on success, -1 on error
  * @par Errors (errno):
@@ -1618,6 +1729,8 @@ int hal_image_processor_draw_masks(struct hal_image_processor *processor,
                                    struct hal_tensor *dst,
                                    const struct hal_tensor *background,
                                    float opacity,
+                                   const float *letterbox,
+                                   enum hal_color_mode color_mode,
                                    struct hal_detect_box_list **out_boxes);
 
 /**
@@ -1637,6 +1750,9 @@ int hal_image_processor_draw_masks(struct hal_image_processor *processor,
  * @param dst Destination image to draw onto
  * @param background Optional background image (NULL to draw over dst)
  * @param opacity Mask opacity in [0.0, 1.0] (1.0 = fully opaque, clamped)
+ * @param letterbox Optional letterbox coordinates [x0, y0, x1, y1] in normalized
+ *        coordinates (NULL = no letterbox correction)
+ * @param color_mode How to assign colors to detections (HAL_COLOR_MODE_CLASS by default)
  * @param out_boxes Output parameter for detection box list (caller must free)
  * @param out_tracks Output parameter for track info list (can be NULL; caller must free if non-NULL)
  * @return 0 on success, -1 on error
@@ -1653,6 +1769,8 @@ int hal_image_processor_draw_masks_tracked(struct hal_image_processor *processor
                                            struct hal_tensor *dst,
                                            const struct hal_tensor *background,
                                            float opacity,
+                                           const float *letterbox,
+                                           enum hal_color_mode color_mode,
                                            struct hal_detect_box_list **out_boxes,
                                            struct hal_track_info_list **out_tracks);
 

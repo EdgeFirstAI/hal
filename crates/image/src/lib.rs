@@ -170,6 +170,36 @@ pub enum Flip {
     Horizontal = 2,
 }
 
+/// Controls how the color palette index is chosen for each detected object.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ColorMode {
+    /// Color is chosen by object class label (`det.label`). Default.
+    ///
+    /// Preserves backward compatibility and is correct for semantic
+    /// segmentation where colors carry class meaning.
+    #[default]
+    Class,
+    /// Color is chosen by instance order (loop index, zero-based).
+    ///
+    /// Each detected object gets a unique color regardless of class,
+    /// useful for instance segmentation.
+    Instance,
+    /// Color is chosen by track ID (future use; currently behaves like
+    /// [`Instance`](Self::Instance)).
+    Track,
+}
+
+impl ColorMode {
+    /// Return the palette index for a detection given its loop index and label.
+    #[inline]
+    pub fn index(self, idx: usize, label: usize) -> usize {
+        match self {
+            ColorMode::Class => label,
+            ColorMode::Instance | ColorMode::Track => idx,
+        }
+    }
+}
+
 /// Options for mask overlay rendering.
 ///
 /// Controls how segmentation masks are composited onto the destination image:
@@ -179,10 +209,23 @@ pub enum Flip {
 /// - `opacity`: scales the alpha of rendered mask colors. `1.0` (default)
 ///   preserves the class color's alpha unchanged; `0.5` makes masks
 ///   semi-transparent.
+/// - `color_mode`: controls whether colors are assigned by class label,
+///   instance index, or track ID. Defaults to [`ColorMode::Class`].
 #[derive(Debug, Clone, Copy)]
 pub struct MaskOverlay<'a> {
     pub background: Option<&'a TensorDyn>,
     pub opacity: f32,
+    /// Normalized letterbox region `[xmin, ymin, xmax, ymax]` in model-input
+    /// space that contains actual image content (the rest is padding).
+    ///
+    /// When set, bounding boxes and mask coordinates from the decoder (which
+    /// are in model-input normalized space) are mapped back to the original
+    /// image coordinate space before rendering.
+    ///
+    /// Use [`with_letterbox_crop`](Self::with_letterbox_crop) to compute this
+    /// from the [`Crop`] that was used in the model input [`convert`](crate::ImageProcessorTrait::convert) call.
+    pub letterbox: Option<[f32; 4]>,
+    pub color_mode: ColorMode,
 }
 
 impl Default for MaskOverlay<'_> {
@@ -190,6 +233,8 @@ impl Default for MaskOverlay<'_> {
         Self {
             background: None,
             opacity: 1.0,
+            letterbox: None,
+            color_mode: ColorMode::Class,
         }
     }
 }
@@ -206,6 +251,32 @@ impl<'a> MaskOverlay<'a> {
 
     pub fn with_opacity(mut self, opacity: f32) -> Self {
         self.opacity = opacity.clamp(0.0, 1.0);
+        self
+    }
+
+    pub fn with_color_mode(mut self, mode: ColorMode) -> Self {
+        self.color_mode = mode;
+        self
+    }
+
+    /// Set the letterbox transform from the [`Crop`] used when preparing the
+    /// model input, so that bounding boxes and masks are correctly mapped back
+    /// to the original image coordinate space during rendering.
+    ///
+    /// Pass the same `crop` that was given to
+    /// [`convert`](crate::ImageProcessorTrait::convert) along with the model
+    /// input dimensions (`model_w` × `model_h`).
+    ///
+    /// Has no effect when `crop.dst_rect` is `None` (no letterbox applied).
+    pub fn with_letterbox_crop(mut self, crop: &Crop, model_w: usize, model_h: usize) -> Self {
+        if let Some(r) = crop.dst_rect {
+            self.letterbox = Some([
+                r.left as f32 / model_w as f32,
+                r.top as f32 / model_h as f32,
+                (r.left + r.width) as f32 / model_w as f32,
+                (r.top + r.height) as f32 / model_h as f32,
+            ]);
+        }
         self
     }
 
@@ -240,7 +311,34 @@ impl<'a> MaskOverlay<'a> {
         Ok(MaskOverlay {
             background: None,
             opacity: self.opacity.clamp(0.0, 1.0),
+            letterbox: self.letterbox,
+            color_mode: self.color_mode,
         })
+    }
+}
+
+/// Apply the inverse letterbox transform to a bounding box.
+///
+/// `letterbox` is `[lx0, ly0, lx1, ly1]` — the normalized region of the model
+/// input that contains actual image content (output of
+/// [`MaskOverlay::with_letterbox_crop`]).
+///
+/// Converts model-input-normalized coords to output-image-normalized coords,
+/// clamped to `[0.0, 1.0]`. Also canonicalises the bbox (ensures xmin ≤ xmax).
+#[inline]
+fn unletter_bbox(bbox: DetectBox, lb: [f32; 4]) -> DetectBox {
+    let b = bbox.bbox.to_canonical();
+    let [lx0, ly0, lx1, ly1] = lb;
+    let inv_w = if lx1 > lx0 { 1.0 / (lx1 - lx0) } else { 1.0 };
+    let inv_h = if ly1 > ly0 { 1.0 / (ly1 - ly0) } else { 1.0 };
+    DetectBox {
+        bbox: edgefirst_decoder::BoundingBox {
+            xmin: ((b.xmin - lx0) * inv_w).clamp(0.0, 1.0),
+            ymin: ((b.ymin - ly0) * inv_h).clamp(0.0, 1.0),
+            xmax: ((b.xmax - lx0) * inv_w).clamp(0.0, 1.0),
+            ymax: ((b.ymax - ly0) * inv_h).clamp(0.0, 1.0),
+        },
+        ..bbox
     }
 }
 
@@ -1202,6 +1300,39 @@ impl ImageProcessor {
         }
         Ok((output_boxes, output_tracks))
     }
+
+    /// Materialize per-instance segmentation masks from raw prototype data.
+    ///
+    /// Computes `mask_coeff @ protos` with sigmoid activation for each detection,
+    /// producing compact masks at prototype resolution (e.g., 160×160 crops).
+    /// Mask values are continuous sigmoid confidence outputs quantized to u8
+    /// (0 = background, 255 = full confidence), NOT binary thresholded.
+    ///
+    /// The returned [`Vec<Segmentation>`] can be:
+    /// - Inspected or exported for analytics, IoU computation, etc.
+    /// - Passed directly to [`ImageProcessorTrait::draw_decoded_masks`] for
+    ///   GPU-interpolated rendering.
+    ///
+    /// # Performance Note
+    ///
+    /// Calling `materialize_masks` + `draw_decoded_masks` separately prevents
+    /// the HAL from using its internal fused optimization path. For render-only
+    /// use cases, prefer [`ImageProcessorTrait::draw_proto_masks`] which selects
+    /// the fastest path automatically (currently 1.6×–27× faster on tested
+    /// platforms). Use this method when you need access to the intermediate masks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NoConverter`] if the CPU backend is not available.
+    pub fn materialize_masks(
+        &self,
+        detect: &[DetectBox],
+        proto_data: &ProtoData,
+        letterbox: Option<[f32; 4]>,
+    ) -> Result<Vec<Segmentation>> {
+        let cpu = self.cpu.as_ref().ok_or(Error::NoConverter)?;
+        cpu.materialize_segmentations(detect, proto_data, letterbox)
+    }
 }
 
 impl ImageProcessorTrait for ImageProcessor {
@@ -1341,6 +1472,34 @@ impl ImageProcessorTrait for ImageProcessor {
             return Ok(());
         }
 
+        // Un-letterbox detect boxes and segmentation bboxes for rendering when
+        // a letterbox was applied to prepare the model input.
+        let lb_boxes: Vec<DetectBox>;
+        let lb_segs: Vec<Segmentation>;
+        let (detect, segmentation) = if let Some(lb) = overlay.letterbox {
+            lb_boxes = detect.iter().map(|&d| unletter_bbox(d, lb)).collect();
+            // Keep segmentation bboxes in sync with the transformed detect boxes
+            // when we have a 1:1 correspondence (instance segmentation).
+            lb_segs = if segmentation.len() == lb_boxes.len() {
+                segmentation
+                    .iter()
+                    .zip(lb_boxes.iter())
+                    .map(|(s, d)| Segmentation {
+                        xmin: d.bbox.xmin,
+                        ymin: d.bbox.ymin,
+                        xmax: d.bbox.xmax,
+                        ymax: d.bbox.ymax,
+                        segmentation: s.segmentation.clone(),
+                    })
+                    .collect()
+            } else {
+                segmentation.to_vec()
+            };
+            (lb_boxes.as_slice(), lb_segs.as_slice())
+        } else {
+            (detect, segmentation)
+        };
+
         // ── Forced backend: no fallback chain ────────────────────────
         if let Some(forced) = self.forced_backend {
             return match forced {
@@ -1422,13 +1581,26 @@ impl ImageProcessorTrait for ImageProcessor {
             return Ok(());
         }
 
+        // Un-letterbox detect boxes for rendering when a letterbox was applied
+        // to prepare the model input.  The original `detect` coords are still
+        // passed to `materialize_segmentations` (which needs model-space coords
+        // to correctly crop the proto tensor) alongside `overlay.letterbox` so
+        // it can emit `Segmentation` structs in output-image space.
+        let lb_boxes: Vec<DetectBox>;
+        let render_detect = if let Some(lb) = overlay.letterbox {
+            lb_boxes = detect.iter().map(|&d| unletter_bbox(d, lb)).collect();
+            lb_boxes.as_slice()
+        } else {
+            detect
+        };
+
         // ── Forced backend: no fallback chain ────────────────────────
         if let Some(forced) = self.forced_backend {
             return match forced {
                 ForcedBackend::Cpu => {
                     let overlay = overlay.apply_background(dst)?;
                     if let Some(cpu) = self.cpu.as_mut() {
-                        return cpu.draw_proto_masks(dst, detect, proto_data, overlay);
+                        return cpu.draw_proto_masks(dst, render_detect, proto_data, overlay);
                     }
                     Err(Error::ForcedBackendUnavailable("cpu".into()))
                 }
@@ -1439,7 +1611,7 @@ impl ImageProcessorTrait for ImageProcessor {
                     #[cfg(target_os = "linux")]
                     #[cfg(feature = "opengl")]
                     if let Some(opengl) = self.opengl.as_mut() {
-                        return opengl.draw_proto_masks(dst, detect, proto_data, overlay);
+                        return opengl.draw_proto_masks(dst, render_detect, proto_data, overlay);
                     }
                     Err(Error::ForcedBackendUnavailable("opengl".into()))
                 }
@@ -1464,8 +1636,9 @@ impl ImageProcessorTrait for ImageProcessor {
                 "draw_proto_masks started with hybrid (cpu+opengl) in {:?}",
                 start.elapsed()
             );
-            let segmentation = cpu.materialize_segmentations(detect, proto_data)?;
-            match opengl.draw_decoded_masks(dst, detect, &segmentation, overlay) {
+            let segmentation =
+                cpu.materialize_segmentations(detect, proto_data, overlay.letterbox)?;
+            match opengl.draw_decoded_masks(dst, render_detect, &segmentation, overlay) {
                 Ok(_) => {
                     log::trace!(
                         "draw_proto_masks with hybrid (cpu+opengl) in {:?}",
@@ -1487,7 +1660,7 @@ impl ImageProcessorTrait for ImageProcessor {
             ));
         };
         log::trace!("draw_proto_masks started with cpu in {:?}", start.elapsed());
-        cpu.draw_proto_masks(dst, detect, proto_data, overlay)
+        cpu.draw_proto_masks(dst, render_detect, proto_data, overlay)
     }
 
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<()> {
@@ -2106,6 +2279,12 @@ mod image_tests {
 
     #[test]
     fn test_disable_env_var() -> Result<(), Error> {
+        // EDGEFIRST_FORCE_BACKEND takes precedence over EDGEFIRST_DISABLE_*,
+        // so clear it for the duration of this test to avoid races with
+        // test_force_backend_cpu running in parallel.
+        let saved_force = std::env::var("EDGEFIRST_FORCE_BACKEND").ok();
+        unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") };
+
         #[cfg(target_os = "linux")]
         {
             let original = std::env::var("EDGEFIRST_DISABLE_G2D").ok();
@@ -2171,6 +2350,10 @@ mod image_tests {
         match original_g2d {
             Some(s) => unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", s) },
             None => unsafe { std::env::remove_var("EDGEFIRST_DISABLE_G2D") },
+        }
+        match saved_force {
+            Some(s) => unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", s) },
+            None => unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") },
         }
 
         Ok(())

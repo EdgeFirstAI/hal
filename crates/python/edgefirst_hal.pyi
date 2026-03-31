@@ -315,6 +315,20 @@ class Output:
         """
         ...
 
+class ProtoData:
+    """Opaque prototype data from a segmentation model's decode step.
+
+    Holds raw mask coefficients and prototype tensors. Pass to
+    :meth:`ImageProcessor.materialize_masks` to compute per-instance masks
+    for analytics or export, or use :meth:`ImageProcessor.draw_masks` for
+    fused GPU rendering instead.
+
+    For detection-only models, :meth:`Decoder.decode_proto` returns ``None``
+    instead of a ``ProtoData`` instance.
+    """
+
+    ...
+
 class Decoder:
     def __init__(
         self,
@@ -425,6 +439,41 @@ class Decoder:
         Args:
             model_output: List of HAL Tensor objects from model inference.
             max_boxes: Maximum number of detections to return (default: 100).
+        """
+        ...
+
+    def decode_proto(
+        self, model_output: List[Tensor], max_boxes: int = 100
+    ) -> Tuple[
+        npt.NDArray[np.float32],
+        npt.NDArray[np.float32],
+        npt.NDArray[np.uintp],
+        Optional[ProtoData],
+    ]:
+        """Decode model outputs into detection boxes and optional prototype data.
+
+        For segmentation models, returns a :class:`ProtoData` instance that can
+        be passed to :meth:`ImageProcessor.materialize_masks` to compute
+        per-instance masks for analytics, export, or IoU computation.
+
+        For detection-only models, returns ``None`` for proto_data but still
+        populates detection boxes.
+
+        .. note::
+
+            Calling ``decode_proto`` + ``materialize_masks`` +
+            ``draw_decoded_masks`` separately prevents the HAL from using its
+            internal fused optimization. For render-only use cases, prefer
+            :meth:`ImageProcessor.draw_masks` which is 1.6--27x faster on
+            tested platforms.
+
+        Args:
+            model_output: List of HAL Tensor objects from model inference.
+            max_boxes: Maximum number of detections to return (default: 100).
+
+        Returns:
+            ``(boxes, scores, classes, proto_data)`` where ``proto_data`` is
+            ``None`` for detection-only models.
         """
         ...
 
@@ -890,6 +939,16 @@ class Normalization(enum.Enum):
     | `np.float64` | value             |
     """
 
+class ColorMode(enum.Enum):
+    """Controls how mask colors are assigned to detections."""
+
+    Class: ColorMode
+    """Color chosen by class label (default, correct for semantic segmentation)"""
+    Instance: ColorMode
+    """Color chosen by detection index (unique color per instance)"""
+    Track: ColorMode
+    """Color chosen by track ID (use with object tracking)"""
+
 class Flip(enum.Enum):
     NoFlip: Flip
     """No flip"""
@@ -998,6 +1057,8 @@ class ImageProcessor:
         seg: List[npt.NDArray[np.uint8]] = [],
         background: Optional[Tensor] = None,
         opacity: float = 1.0,
+        letterbox: Optional[Tuple[float, float, float, float]] = None,
+        color_mode: ColorMode = ColorMode.Class,
     ) -> None:
         """
         Draw detection boxes and optional segmentation masks onto ``dst``.
@@ -1023,11 +1084,57 @@ class ImageProcessor:
             opacity: Scales the alpha of rendered mask and box colors.
                 ``1.0`` (default) preserves the class color's alpha unchanged;
                 ``0.5`` makes overlays semi-transparent. Clamped to [0, 1].
+            letterbox: Optional ``(x0, y0, x1, y1)`` letterbox region in
+                normalized coordinates for mapping model-space boxes back to
+                image space. ``None`` (default) means no letterbox correction.
+            color_mode: How to assign colors to detections.
+                ``ColorMode.Class`` (default) colors by class label,
+                ``ColorMode.Instance`` colors by detection index.
 
         Raises:
             RuntimeError: If ``dst`` format is unsupported by the active backend.
             ValueError: If ``bbox``, ``scores``, ``classes`` lengths do not match,
                 or if ``bbox`` shape is not ``(N, 4)``.
+        """
+        ...
+
+    def materialize_masks(
+        self,
+        bbox: npt.NDArray[np.float32],
+        scores: npt.NDArray[np.float32],
+        classes: npt.NDArray[np.uintp],
+        proto_data: ProtoData,
+        letterbox: Optional[Tuple[float, float, float, float]] = None,
+    ) -> List[npt.NDArray[np.uint8]]:
+        """Materialize per-instance segmentation masks from prototype data.
+
+        Computes ``mask_coeff @ protos`` with sigmoid activation for each
+        detection, producing compact masks at prototype resolution (e.g.,
+        160x160 crops). Mask values are **continuous sigmoid confidence**
+        quantized to uint8 (0 = background, 255 = full confidence), **not**
+        binary thresholded.
+
+        The returned masks can be inspected for analytics, IoU computation,
+        or export, and also passed to :meth:`draw_decoded_masks` for
+        GPU-interpolated rendering.
+
+        .. note::
+
+            Calling ``materialize_masks`` + ``draw_decoded_masks`` separately
+            prevents the HAL from using its internal fused optimization. For
+            render-only use cases, prefer :meth:`draw_masks` which is 1.6--27x
+            faster on tested platforms.
+
+        Args:
+            bbox: ``(N, 4)`` float32 array of normalized bounding boxes.
+            scores: ``(N,)`` float32 array of confidence scores.
+            classes: ``(N,)`` uintp array of class indices.
+            proto_data: Prototype data from :meth:`Decoder.decode_proto`.
+            letterbox: Optional ``(x0, y0, x1, y1)`` letterbox region in
+                normalized coordinates.
+
+        Returns:
+            List of ``(H, W, 1)`` uint8 arrays with continuous sigmoid values.
         """
         ...
 
@@ -1040,6 +1147,8 @@ class ImageProcessor:
         timestamp: Optional[int] = None,
         background: Optional[Tensor] = None,
         opacity: float = 1.0,
+        letterbox: Optional[Tuple[float, float, float, float]] = None,
+        color_mode: ColorMode = ColorMode.Class,
     ) -> Union[
         DetectionOutput,
         Tuple[
@@ -1081,6 +1190,12 @@ class ImageProcessor:
             opacity: Scales the alpha of rendered mask and box colors.
                 ``1.0`` (default) preserves the class color's alpha unchanged;
                 ``0.5`` makes overlays semi-transparent. Clamped to [0, 1].
+            letterbox: Optional ``(x0, y0, x1, y1)`` letterbox region in
+                normalized coordinates for mapping model-space boxes back to
+                image space. ``None`` (default) means no letterbox correction.
+            color_mode: How to assign colors to detections.
+                ``ColorMode.Class`` (default) colors by class label,
+                ``ColorMode.Instance`` colors by detection index.
 
         Raises:
             RuntimeError: If ``dst`` format is unsupported by the active backend,

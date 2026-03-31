@@ -67,7 +67,7 @@ def print_section(title: str):
 
 
 # Consistent platform ordering
-PLATFORMS = ["imx8mp-frdm", "imx95-frdm", "rpi5-hailo", "x86-desktop"]
+PLATFORMS = ["imx8mp-frdm", "imx95-frdm", "rpi5-hailo", "jetson-orin-nano", "x86-desktop"]
 
 # All compute backends for iteration
 ALL_BACKENDS = ["auto", "cpu", "g2d", "opengl"]
@@ -82,6 +82,8 @@ PIPELINE_CONFIGS = [
     ("imx95-frdm", "CPU", "Heap", "pipeline-cpu"),
     ("rpi5-hailo", "GL", "DMA", "pipeline-opengl"),
     ("rpi5-hailo", "CPU", "Heap", "pipeline-cpu"),
+    ("jetson-orin-nano", "GL", "DMA", "pipeline-opengl"),
+    ("jetson-orin-nano", "CPU", "Heap", "pipeline-cpu"),
     ("x86-desktop", "GL", "PBO", "pipeline-opengl"),
     ("x86-desktop", "CPU", "Heap", "pipeline-cpu"),
 ]
@@ -94,6 +96,8 @@ MASK_CONFIGS = [
     ("imx95-frdm", "CPU", "Heap", "mask-cpu"),
     ("rpi5-hailo", "GL", "DMA", "mask-opengl"),
     ("rpi5-hailo", "CPU", "Heap", "mask-cpu"),
+    ("jetson-orin-nano", "GL", "DMA", "mask-opengl"),
+    ("jetson-orin-nano", "CPU", "Heap", "mask-cpu"),
     ("x86-desktop", "GL", "PBO", "mask-opengl"),
     ("x86-desktop", "CPU", "Heap", "mask-cpu"),
 ]
@@ -103,5 +107,6 @@ TENSOR_CONFIGS = [
     ("imx8mp-frdm", ["mem", "shm", "dma"]),
     ("imx95-frdm", ["mem", "shm", "dma"]),
     ("rpi5-hailo", ["mem", "shm", "dma"]),
+    ("jetson-orin-nano", ["mem", "shm", "dma"]),
     ("x86-desktop", ["mem", "shm"]),
 ]

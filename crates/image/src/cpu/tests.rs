@@ -1687,7 +1687,7 @@ mod cpu_tests {
     fn test_materialize_empty_detections() {
         let cpu = CPUProcessor::new();
         let proto_data = make_proto_data(8, 8, 4, vec![vec![1.0; 4]]);
-        let result = cpu.materialize_segmentations(&[], &proto_data);
+        let result = cpu.materialize_segmentations(&[], &proto_data, None);
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
     }
@@ -1697,7 +1697,7 @@ mod cpu_tests {
         let cpu = CPUProcessor::new();
         let proto_data = make_proto_data(8, 8, 4, vec![]);
         let det = [make_detect_box(0.1, 0.1, 0.5, 0.5)];
-        let result = cpu.materialize_segmentations(&det, &proto_data);
+        let result = cpu.materialize_segmentations(&det, &proto_data, None);
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
     }
@@ -1707,7 +1707,7 @@ mod cpu_tests {
         let cpu = CPUProcessor::new();
         let proto_data = make_proto_data(8, 8, 4, vec![vec![0.5; 4]]);
         let det = [make_detect_box(0.1, 0.1, 0.5, 0.5)];
-        let result = cpu.materialize_segmentations(&det, &proto_data);
+        let result = cpu.materialize_segmentations(&det, &proto_data, None);
         assert!(result.is_ok());
         let segs = result.unwrap();
         assert_eq!(segs.len(), 1);
@@ -1722,7 +1722,7 @@ mod cpu_tests {
         let cpu = CPUProcessor::new();
         let proto_data = make_proto_data(8, 8, 4, vec![vec![0.5; 4]]);
         let det = [make_detect_box(0.5, 0.5, 1.0, 1.0)];
-        let result = cpu.materialize_segmentations(&det, &proto_data);
+        let result = cpu.materialize_segmentations(&det, &proto_data, None);
         assert!(
             result.is_ok(),
             "bbox at exact boundary (1.0) should not panic"
@@ -1736,7 +1736,7 @@ mod cpu_tests {
         let cpu = CPUProcessor::new();
         let proto_data = make_proto_data(8, 8, 4, vec![vec![0.5; 4]]);
         let det = [make_detect_box(-0.5, -0.5, 0.5, 0.5)];
-        let result = cpu.materialize_segmentations(&det, &proto_data);
+        let result = cpu.materialize_segmentations(&det, &proto_data, None);
         assert!(
             result.is_ok(),
             "negative coordinates should be clamped to 0"
@@ -1754,7 +1754,7 @@ mod cpu_tests {
         // Proto has 4 channels but coefficients have 6 elements — mismatch
         let proto_data = make_proto_data(8, 8, 4, vec![vec![0.5; 6]]);
         let det = [make_detect_box(0.1, 0.1, 0.5, 0.5)];
-        let result = cpu.materialize_segmentations(&det, &proto_data);
+        let result = cpu.materialize_segmentations(&det, &proto_data, None);
         assert!(
             result.is_err(),
             "mismatched coeff count vs proto channels should error"
@@ -1775,7 +1775,7 @@ mod cpu_tests {
             make_detect_box(0.5, 0.0, 1.0, 0.5),
             make_detect_box(0.0, 0.5, 0.5, 1.0),
         ];
-        let result = cpu.materialize_segmentations(&det, &proto_data);
+        let result = cpu.materialize_segmentations(&det, &proto_data, None);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 3);
     }
@@ -1786,7 +1786,7 @@ mod cpu_tests {
         let proto_data = make_proto_data(8, 8, 4, vec![vec![0.5; 4]]);
         // xmin == xmax → zero-width bbox
         let det = [make_detect_box(0.5, 0.1, 0.5, 0.5)];
-        let result = cpu.materialize_segmentations(&det, &proto_data);
+        let result = cpu.materialize_segmentations(&det, &proto_data, None);
         assert!(
             result.is_ok(),
             "zero-area bbox should return Ok with degenerate segmentation"

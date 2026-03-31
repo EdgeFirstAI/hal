@@ -1,6 +1,6 @@
 # EdgeFirst Hardware Abstraction Layer - Architecture
 
-**Version:** 3.0
+**Version:** 3.1
 **Last Updated:** March 2026
 **Status:** Production
 **Audience:** Developers contributing to EdgeFirst HAL or integrating it into applications
@@ -1988,6 +1988,133 @@ Different delegate instances may be used concurrently from different threads.
 - **Epic:** [EDGEAI-1185](https://au-zone.atlassian.net/browse/EDGEAI-1185) — NXP Neutron DMABUF Zero-Copy Support
 - **Type definitions:** [EDGEAI-1189](https://au-zone.atlassian.net/browse/EDGEAI-1189) — EdgeFirst HAL: formalize hal_dmabuf_* interface
 - **Implementation:** [EDGEAI-1190](https://au-zone.atlassian.net/browse/EDGEAI-1190) — edgefirst-tflite: update probing for hal_dmabuf_* symbols
+
+## Appendix C: DMA-BUF Identity and Tensor Caching
+
+### The Problem: fd Numbers Are Not Stable Buffer Identifiers
+
+A DMA-BUF is exported from the kernel as a file descriptor. Many callers
+assume that the same fd number means the same buffer, and use fd as the key
+for caching imported tensors (`hal_import_image`, EGL image creation, etc.).
+This assumption is **wrong** and leads to cache misses or incorrect cache
+hits.
+
+The lifecycle of a DMA-BUF fd in a typical GStreamer pipeline:
+
+1. A V4L2 decoder or libcamera source creates a buffer pool at startup,
+   exporting each DMA-BUF once (`VIDIOC_EXPBUF`). The fd numbers are stable
+   as long as the buffer pool exists.
+2. A GStreamer `GstBuffer` wraps the DMA-BUF fd in a `GstMemory` object.
+3. When the downstream element finishes with the buffer and unrefs it, the
+   `GstMemory` refcount may drop to zero, **closing the fd**.
+4. The upstream driver re-exports the buffer for the next frame, potentially
+   receiving a **different fd number** even though the underlying physical
+   buffer is the same.
+5. Any cache keyed by fd number will see a miss even though the buffer
+   content, EGL image, and GPU mapping are all identical to a previous frame.
+
+This fd recycling happens in practice with `v4l2h264dec`, `v4l2src`, and
+`libcamerasrc`. Pool sizes are bounded (typically 4–16 buffers), so fd
+numbers cycle through a small set, but there is no guarantee that a
+particular fd number always refers to the same physical buffer.
+
+### The Solution: DMA-BUF Inode as Stable Identity
+
+The Linux kernel identifies each `dma_buf` object with a unique inode in the
+anonymous inode filesystem. The inode is assigned when the DMA-BUF is
+created and remains constant for its lifetime, regardless of how many
+times it is exported or what fd numbers are assigned to it.
+
+Obtaining the inode:
+
+```c
+struct stat st;
+fstat(fd, &st);
+ino_t inode = st.st_ino;
+```
+
+This is a single cheap syscall on cache miss. For a 16-buffer pool, `fstat`
+is called exactly 16 times over the lifetime of the pipeline (once per
+unique buffer at first import). All subsequent frames are cache hits.
+
+Cache key design for multi-plane buffers:
+
+```c
+typedef struct {
+    ino_t inode;   /* identifies the dma_buf kernel object */
+    gsize offset;  /* byte offset within the DMA-BUF (NV12 planar) */
+} DmaBufCacheKey;
+```
+
+The `offset` is needed because a single DMA-BUF may contain multiple planes
+at different byte offsets (e.g., NV12 luma at offset 0, chroma at
+`stride * height`). The (inode, offset) pair uniquely identifies a plane.
+
+### Cache Warm-Up and Steady State
+
+Pool behaviour in practice:
+
+| Phase          | Frames      | EGL import | Preprocessing time (i.MX 95) |
+|----------------|-------------|------------|------------------------------|
+| Warm-up        | 1 – N       | Yes        | ~5–6 ms (import + GL)        |
+| Steady state   | N+1 onwards | No         | ~5–6 ms (GL only)            |
+
+Where N is the buffer pool depth (typically 9 for `v4l2h264dec` at 1080p
+with the NXP Amphion Wave5 VPU).
+
+The preprocessing time in steady state is dominated by the GL computation
+(resize + letterbox + colorspace + quantization on Mali-G310: ~5–6 ms at
+1920×1080 → 640×640 INT8), not the EGL import. However, the EGL import
+overhead does matter in low-latency or short-clip scenarios where the
+pipeline never fully warms up.
+
+### EGL Image Cache Inside HAL
+
+`hal_import_image()` internally maintains an EGL image cache keyed by DMA-BUF
+fd. When called with the same fd, it returns the cached EGL image without
+re-creating it.
+
+However, this HAL-internal cache **also suffers from fd recycling**: if the
+calling code frees the `hal_tensor*` and later calls `hal_import_image` with
+a different fd that refers to the same physical buffer, HAL creates a new EGL
+image — incurring the full import cost again and leaving a "swept dead entry"
+in the EGL cache log.
+
+The fix is at the **calling layer** (e.g., `edgefirstcameraadaptor`): maintain
+a cache of `hal_tensor*` objects keyed by (inode, offset), and never free
+them between frames. This ensures that `hal_import_image` is called exactly
+once per unique DMA-BUF over the lifetime of the pipeline.
+
+### Implementation in edgefirstcameraadaptor
+
+`edgefirstcameraadaptor` (EdgeFirst GStreamer plug-in) implements the
+inode-based cache as follows:
+
+```c
+typedef struct { ino_t inode; gsize offset; } InputCacheKey;
+
+/* On each input frame: */
+int fd = gst_dmabuf_memory_get_fd(mem);
+gsize offset = 0;
+gst_memory_get_sizes(mem, &offset, NULL);
+
+struct stat st;
+fstat(fd, &st);
+InputCacheKey key = { .inode = st.st_ino, .offset = offset };
+
+hal_tensor *tensor = g_hash_table_lookup(input_cache, &key);
+if (!tensor) {
+    /* First time seeing this buffer — import and cache */
+    tensor = hal_import_image(processor, pd, chroma, ...);
+    g_hash_table_insert(input_cache, g_memdup2(&key, sizeof key), tensor);
+}
+/* tensor is valid for the lifetime of the pipeline */
+```
+
+The cache is invalidated on `set_caps` (resolution or format change) and
+`stop` (pipeline teardown). It is never invalidated per-frame.
+
+---
 
 ## Contributing
 
