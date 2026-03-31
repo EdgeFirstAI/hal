@@ -95,6 +95,9 @@ fn probe_display_extensions(egl: &Egl, display: egl::Display) -> bool {
 /// Returns an error only if `libEGL.so.1` cannot be loaded. Individual
 /// display probe failures are silently skipped.
 pub fn probe_egl_displays() -> Result<Vec<EglDisplayInfo>, Error> {
+    // Serialize with all other EGL/GL operations — see `GL_MUTEX` doc comment.
+    let _guard = GL_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
     let egl: Egl = unsafe { Instance::<Dynamic<_, EGL1_4>>::load_required_from(get_egl_lib()?)? };
 
     let mut results = Vec::new();
