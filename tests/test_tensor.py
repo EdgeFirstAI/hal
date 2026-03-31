@@ -9,310 +9,51 @@ import pytest
 import gc
 
 
-def test_int8():
-    tensor = Tensor([1, 2, 3, 4, 5], dtype="int8")
-    assert tensor.size == 120
+# fmt: off
+DTYPE_PARAMS = [
+    # (dtype,     size, fmt, itemsize, val1,  val2)
+    ("int8",      120, "b",  1,       10,    -120),
+    ("uint8",     120, "B",  1,       10,    250),
+    ("int16",     240, "h",  2,       10,    -30000),
+    ("uint16",    240, "H",  2,       10,    60000),
+    ("int32",     480, "i",  4,       10,    -2000000000),
+    ("uint32",    480, "I",  4,       10,    4000000000),
+    ("int64",     960, "q",  8,       10,    -9000000000000000000),
+    ("uint64",    960, "Q",  8,       10,    18000000000000000000),
+    ("float32",   480, "f",  4,       10.0,  -2000000000.0),
+    ("float64",   960, "d",  8,       10.0,  -9000000000000000000.0),
+]
+# fmt: on
+
+
+@pytest.mark.parametrize("dtype,size,fmt,itemsize,val1,val2", DTYPE_PARAMS,
+                         ids=[p[0] for p in DTYPE_PARAMS])
+def test_dtype(dtype, size, fmt, itemsize, val1, val2):
+    tensor = Tensor([1, 2, 3, 4, 5], dtype=dtype)
+    assert tensor.size == size
     assert tensor.shape == [1, 2, 3, 4, 5]
-    assert tensor.dtype == "int8"
+    assert tensor.dtype == dtype
 
     with tensor.map() as m:
-        m[0] = 10
-        assert m[0] == 10
-        m[1] = -120
-        assert m[1] == -120
+        m[0] = val1
+        assert m[0] == val1
+        m[1] = val2
+        assert m[1] == val2
 
         if hasattr(m, "__getbuffer__"):
             with memoryview(m) as v:
-                assert v.format == "b"
+                assert v.format == fmt
                 assert v.ndim == 5
                 assert v.shape == (1, 2, 3, 4, 5)
-                assert v.itemsize == 1
-                assert v[0, 0, 0, 0, 0] == 10
-                assert v[0, 0, 0, 0, 1] == -120
+                assert v.itemsize == itemsize
+                assert v[0, 0, 0, 0, 0] == val1
+                assert v[0, 0, 0, 0, 1] == val2
             with pytest.raises(ValueError):
                 _ = v[0, 0, 0, 0, 0]
         else:
             n = np.frombuffer(m.view(), dtype=tensor.dtype).reshape(tensor.shape)
-            assert n[0, 0, 0, 0, 0] == 10
-            assert n[0, 0, 0, 0, 1] == -120
-    with pytest.raises(BufferError):
-        _ = m[0]
-
-
-def test_u8():
-    tensor = Tensor([1, 2, 3, 4, 5], dtype="uint8")
-    assert tensor.size == 120
-    assert tensor.shape == [1, 2, 3, 4, 5]
-    assert tensor.dtype == "uint8"
-
-    with tensor.map() as m:
-        m[0] = 10
-        assert m[0] == 10
-        m[1] = 250
-        assert m[1] == 250
-
-        if hasattr(m, "__getbuffer__"):
-            with memoryview(m) as v:
-                assert v.format == "B"
-                assert v.ndim == 5
-                assert v.shape == (1, 2, 3, 4, 5)
-                assert v.itemsize == 1
-                assert v[0, 0, 0, 0, 0] == 10
-                assert v[0, 0, 0, 0, 1] == 250
-            with pytest.raises(ValueError):
-                _ = v[0, 0, 0, 0, 0]
-        else:
-            n = np.frombuffer(m.view(), dtype=tensor.dtype).reshape(tensor.shape)
-            assert n[0, 0, 0, 0, 0] == 10
-            assert n[0, 0, 0, 0, 1] == 250
-    with pytest.raises(BufferError):
-        _ = m[0]
-
-
-def test_i16():
-    tensor = Tensor([1, 2, 3, 4, 5], dtype="int16")
-    assert tensor.size == 240
-    assert tensor.shape == [1, 2, 3, 4, 5]
-    assert tensor.dtype == "int16"
-
-    with tensor.map() as m:
-        m[0] = 10
-        assert m[0] == 10
-        m[1] = -30000
-        assert m[1] == -30000
-
-        if hasattr(m, "__getbuffer__"):
-            with memoryview(m) as v:
-                assert v.format == "h"
-                assert v.ndim == 5
-                assert v.shape == (1, 2, 3, 4, 5)
-                assert v.itemsize == 2
-                assert v[0, 0, 0, 0, 0] == 10
-                assert v[0, 0, 0, 0, 1] == -30000
-            with pytest.raises(ValueError):
-                _ = v[0, 0, 0, 0, 0]
-        else:
-            n = np.frombuffer(m.view(), dtype=tensor.dtype).reshape(tensor.shape)
-            assert n[0, 0, 0, 0, 0] == 10
-            assert n[0, 0, 0, 0, 1] == -30000
-    with pytest.raises(BufferError):
-        _ = m[0]
-
-
-def test_u16():
-    tensor = Tensor([1, 2, 3, 4, 5], dtype="uint16")
-    assert tensor.size == 240
-    assert tensor.shape == [1, 2, 3, 4, 5]
-    assert tensor.dtype == "uint16"
-
-    with tensor.map() as m:
-        m[0] = 10
-        assert m[0] == 10
-        m[1] = 60000
-        assert m[1] == 60000
-
-        if hasattr(m, "__getbuffer__"):
-            with memoryview(m) as v:
-                assert v.format == "H"
-                assert v.ndim == 5
-                assert v.shape == (1, 2, 3, 4, 5)
-                assert v.itemsize == 2
-                assert v[0, 0, 0, 0, 0] == 10
-                assert v[0, 0, 0, 0, 1] == 60000
-            with pytest.raises(ValueError):
-                _ = v[0, 0, 0, 0, 0]
-        else:
-            n = np.frombuffer(m.view(), dtype=tensor.dtype).reshape(tensor.shape)
-            assert n[0, 0, 0, 0, 0] == 10
-            assert n[0, 0, 0, 0, 1] == 60000
-    with pytest.raises(BufferError):
-        _ = m[0]
-
-
-def test_i32():
-    tensor = Tensor([1, 2, 3, 4, 5], dtype="int32")
-    assert tensor.size == 480
-    assert tensor.shape == [1, 2, 3, 4, 5]
-    assert tensor.dtype == "int32"
-
-    with tensor.map() as m:
-        m[0] = 10
-        assert m[0] == 10
-        m[1] = -2000000000
-        assert m[1] == -2000000000
-
-        if hasattr(m, "__getbuffer__"):
-            with memoryview(m) as v:
-                assert v.format == "i"
-                assert v.ndim == 5
-                assert v.shape == (1, 2, 3, 4, 5)
-                assert v.itemsize == 4
-                assert v[0, 0, 0, 0, 0] == 10
-                assert v[0, 0, 0, 0, 1] == -2000000000
-            with pytest.raises(ValueError):
-                _ = v[0, 0, 0, 0, 0]
-        else:
-            n = np.frombuffer(m.view(), dtype=tensor.dtype).reshape(tensor.shape)
-            assert n[0, 0, 0, 0, 0] == 10
-            assert n[0, 0, 0, 0, 1] == -2000000000
-    with pytest.raises(BufferError):
-        _ = m[0]
-
-
-def test_u32():
-    tensor = Tensor([1, 2, 3, 4, 5], dtype="uint32")
-    assert tensor.size == 480
-    assert tensor.shape == [1, 2, 3, 4, 5]
-    assert tensor.dtype == "uint32"
-
-    with tensor.map() as m:
-        m[0] = 10
-        assert m[0] == 10
-        m[1] = 4000000000
-        assert m[1] == 4000000000
-
-        if hasattr(m, "__getbuffer__"):
-            with memoryview(m) as v:
-                assert v.format == "I"
-                assert v.ndim == 5
-                assert v.shape == (1, 2, 3, 4, 5)
-                assert v.itemsize == 4
-                assert v[0, 0, 0, 0, 0] == 10
-                assert v[0, 0, 0, 0, 1] == 4000000000
-            with pytest.raises(ValueError):
-                _ = v[0, 0, 0, 0, 0]
-        else:
-            n = np.frombuffer(m.view(), dtype=tensor.dtype).reshape(tensor.shape)
-            assert n[0, 0, 0, 0, 0] == 10
-            assert n[0, 0, 0, 0, 1] == 4000000000
-    with pytest.raises(BufferError):
-        _ = m[0]
-
-
-def test_i64():
-    tensor = Tensor([1, 2, 3, 4, 5], dtype="int64")
-    assert tensor.size == 960
-    assert tensor.shape == [1, 2, 3, 4, 5]
-    assert tensor.dtype == "int64"
-
-    with tensor.map() as m:
-        m[0] = 10
-        assert m[0] == 10
-        m[1] = -9000000000000000000
-        assert m[1] == -9000000000000000000
-
-        if hasattr(m, "__getbuffer__"):
-            with memoryview(m) as v:
-                assert v.format == "q"
-                assert v.ndim == 5
-                assert v.shape == (1, 2, 3, 4, 5)
-                assert v.itemsize == 8
-                assert v[0, 0, 0, 0, 0] == 10
-                assert v[0, 0, 0, 0, 1] == -9000000000000000000
-            with pytest.raises(ValueError):
-                _ = v[0, 0, 0, 0, 0]
-        else:
-            n = np.frombuffer(m.view(), dtype=tensor.dtype).reshape(tensor.shape)
-            assert n[0, 0, 0, 0, 0] == 10
-            assert n[0, 0, 0, 0, 1] == -9000000000000000000
-    with pytest.raises(BufferError):
-        _ = m[0]
-
-
-def test_u64():
-    tensor = Tensor([1, 2, 3, 4, 5], dtype="uint64")
-    assert tensor.size == 960
-    assert tensor.shape == [1, 2, 3, 4, 5]
-    assert tensor.dtype == "uint64"
-
-    with tensor.map() as m:
-        m[0] = 10
-        assert m[0] == 10
-        m[1] = 18000000000000000000
-        assert m[1] == 18000000000000000000
-
-        if hasattr(m, "__getbuffer__"):
-            with memoryview(m) as v:
-                assert v.format == "Q"
-                assert v.ndim == 5
-                assert v.shape == (1, 2, 3, 4, 5)
-                assert v.itemsize == 8
-                assert v[0, 0, 0, 0, 0] == 10
-                assert v[0, 0, 0, 0, 1] == 18000000000000000000
-            with pytest.raises(ValueError):
-                _ = v[0, 0, 0, 0, 0]
-        else:
-            n = np.frombuffer(m.view(), dtype=tensor.dtype).reshape(tensor.shape)
-            assert n[0, 0, 0, 0, 0] == 10
-            assert n[0, 0, 0, 0, 1] == 18000000000000000000
-    with pytest.raises(BufferError):
-        _ = m[0]
-
-
-# TODO: Enable once f16 support is added.
-# def test_f16():
-#     tensor = Tensor([1.0, 2.0, 3.0, 4.0, 5.0], dtype='f16')
-#     assert tensor.size == 240
-#     assert tensor.shape == [1, 2, 3, 4, 5]
-#     assert tensor.dtype == 'f16'
-
-
-def test_f32():
-    tensor = Tensor([1, 2, 3, 4, 5], dtype="float32")
-    assert tensor.size == 480
-    assert tensor.shape == [1, 2, 3, 4, 5]
-    assert tensor.dtype == "float32"
-
-    with tensor.map() as m:
-        m[0] = 10.0
-        assert m[0] == 10.0
-        m[1] = -2000000000.0
-        assert m[1] == -2000000000.0
-
-        if hasattr(m, "__getbuffer__"):
-            with memoryview(m) as v:
-                assert v.format == "f"
-                assert v.ndim == 5
-                assert v.shape == (1, 2, 3, 4, 5)
-                assert v.itemsize == 4
-                assert v[0, 0, 0, 0, 0] == 10.0
-                assert v[0, 0, 0, 0, 1] == -2000000000.0
-            with pytest.raises(ValueError):
-                _ = v[0, 0, 0, 0, 0]
-        else:
-            n = np.frombuffer(m.view(), dtype=tensor.dtype).reshape(tensor.shape)
-            assert n[0, 0, 0, 0, 0] == 10.0
-            assert n[0, 0, 0, 0, 1] == -2000000000.0
-    with pytest.raises(BufferError):
-        _ = m[0]
-
-
-def test_f64():
-    tensor = Tensor([1, 2, 3, 4, 5], dtype="float64")
-    assert tensor.size == 960
-    assert tensor.shape == [1, 2, 3, 4, 5]
-    assert tensor.dtype == "float64"
-
-    with tensor.map() as m:
-        m[0] = 10.0
-        assert m[0] == 10.0
-        m[1] = -9000000000000000000.0
-        assert m[1] == -9000000000000000000.0
-
-        if hasattr(m, "__getbuffer__"):
-            with memoryview(m) as v:
-                assert v.format == "d"
-                assert v.ndim == 5
-                assert v.shape == (1, 2, 3, 4, 5)
-                assert v.itemsize == 8
-                assert v[0, 0, 0, 0, 0] == 10.0
-                assert v[0, 0, 0, 0, 1] == -9000000000000000000.0
-            with pytest.raises(ValueError):
-                _ = v[0, 0, 0, 0, 0]
-        else:
-            n = np.frombuffer(m.view(), dtype=tensor.dtype).reshape(tensor.shape)
-            assert n[0, 0, 0, 0, 0] == 10.0
-            assert n[0, 0, 0, 0, 1] == -9000000000000000000.0
+            assert n[0, 0, 0, 0, 0] == val1
+            assert n[0, 0, 0, 0, 1] == val2
     with pytest.raises(BufferError):
         _ = m[0]
 
