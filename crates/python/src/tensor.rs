@@ -399,7 +399,8 @@ fn copy_numpy_to_tensor_dyn(src: &Bound<'_, pyo3::types::PyAny>, tensor: &Tensor
 
             let mut contig_elems: usize = 1;
             for i in (0..ndim).rev() {
-                if strides[i] == contig_elems as isize {
+                // Size-1 dims are always contiguous regardless of stride.
+                if strides[i] == contig_elems as isize || shape[i] <= 1 {
                     contig_elems *= shape[i];
                 } else {
                     break;
@@ -413,15 +414,18 @@ fn copy_numpy_to_tensor_dyn(src: &Bound<'_, pyo3::types::PyAny>, tensor: &Tensor
                 let n_rows = tensor_len / contig_elems;
                 let row_len = contig_elems;
 
-                // Build byte offsets from the base pointer to the start of
-                // each contiguous row by walking the C-order iterator.
-                let base = src_view.as_ptr() as usize;
-                let mut row_offsets: Vec<usize> = Vec::with_capacity(n_rows);
+                // Build signed byte offsets from the base pointer to the
+                // start of each contiguous row. Signed offsets handle
+                // negative strides (e.g., arr[::-1]) where row pointers
+                // can precede the base pointer.
+                let base = src_view.as_ptr();
+                let mut row_offsets: Vec<isize> = Vec::with_capacity(n_rows);
                 {
                     let mut iter = src_view.iter();
                     for _ in 0..n_rows {
                         if let Some(first) = iter.next() {
-                            row_offsets.push(first as *const T as usize - base);
+                            let off = unsafe { (first as *const T).byte_offset_from(base) };
+                            row_offsets.push(off);
                             // Advance past the rest of this contiguous row.
                             for _ in 1..row_len {
                                 iter.next();
@@ -430,13 +434,12 @@ fn copy_numpy_to_tensor_dyn(src: &Bound<'_, pyo3::types::PyAny>, tensor: &Tensor
                     }
                 }
 
-                // Row copy closure — base is a usize (Send+Sync safe),
-                // reconstructed to a pointer inside each iteration.
-                let copy_row = |dst_row: &mut [T], byte_off: usize| unsafe {
-                    let src_row = std::slice::from_raw_parts(
-                        (base as *const u8).add(byte_off) as *const T,
-                        row_len,
-                    );
+                // Row copy closure — base_addr is a usize (Send+Sync
+                // safe), reconstructed to a pointer with signed offset.
+                let base_addr = base as usize;
+                let copy_row = |dst_row: &mut [T], byte_off: isize| unsafe {
+                    let src_ptr = (base_addr as *const u8).offset(byte_off) as *const T;
+                    let src_row = std::slice::from_raw_parts(src_ptr, row_len);
                     dst_row.copy_from_slice(src_row);
                 };
 
@@ -484,6 +487,7 @@ fn copy_numpy_to_tensor_dyn(src: &Bound<'_, pyo3::types::PyAny>, tensor: &Tensor
         TensorDyn::I32(t) => copy_typed::<i32>(src, t),
         TensorDyn::U64(t) => copy_typed::<u64>(src, t),
         TensorDyn::I64(t) => copy_typed::<i64>(src, t),
+        TensorDyn::F16(t) => copy_typed::<half::f16>(src, t),
         TensorDyn::F32(t) => copy_typed::<f32>(src, t),
         TensorDyn::F64(t) => copy_typed::<f64>(src, t),
         _ => Err(Error::UnsupportedDataType(format!(
