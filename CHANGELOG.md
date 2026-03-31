@@ -20,6 +20,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Tensor.from_numpy()` method** — type-safe copy from any numpy array
+  into a HAL tensor. Accepts all numeric dtypes (uint8 through float64
+  and float16). Supports contiguous, strided, and negative-stride arrays
+  with three optimized copy paths:
+  1. Fully contiguous → `copy_from_slice` (memcpy).
+  2. Strided outer with contiguous inner rows → row-by-row memcpy with
+     O(n_rows) stride-computed offsets (no element iteration).
+  3. Fully strided → per-element copy via ndarray iterator.
+  All paths release the GIL and parallelize via rayon above 256 KiB.
+
+- **Tracker benchmark** — `crates/tracker/benches/tracker_benchmark.rs`
+  measuring ByteTrack update latency (1/10/50/100 detections),
+  100-frame warm-state scenario, and isolated Kalman predict/update.
+
+- **import\_image benchmark** — DMA-BUF import at 1080p/4K resolutions
+  for RGBA and NV12 formats. Skips gracefully on non-DMA platforms.
+
+- **PlaneDescriptor stride/offset tests** — import\_image with padded
+  stride, aligned stride, NV12 multiplane with offset, stride-too-small
+  error case. All DMA-gated.
+
+- **Python mask rendering tests** — `draw_decoded_masks` with empty
+  input, multiple boxes, `ColorMode.Instance`, opacity scaling, and
+  `draw_masks` fused decode+render path.
+
+- **Error Display tests** — `TensorError`, `ImageError`, `DecoderError`
+  Display formatting verified for all constructible variants.
+
 - **Tracker test expansion** — 14 → 38 unit tests. New coverage for
   ByteTrack two-stage matching, builder method effects, degenerate
   inputs, 100-detection scaling. Kalman filter prediction accuracy,
@@ -54,6 +82,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `test_shm_zero_copy_perf` increased to 50 iterations with 1ms
   noise floor and 1.5× margin to prevent flaky failures on fast
   hardware.
+
+- **Python `.pyi` stub missing from PyPI wheels** — the type stub file
+  was excluded from wheels built with `maturin --sdist` because the
+  sdist did not include it. Added explicit `[tool.maturin] include` for
+  the `.pyi` file. Also fixed a README conflict in the sdist by
+  overriding the workspace readme with the crate-local one.
+
+- **fd leak in `from_fd` test** — `tensor_from_fd_func` now closes the
+  dup returned by `.fd` after passing it to `from_fd()`, matching the
+  caller-retains-ownership contract.
 
 ## [0.15.0] - 2026-03-30
 
