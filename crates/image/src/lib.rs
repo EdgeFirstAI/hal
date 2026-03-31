@@ -1472,14 +1472,32 @@ impl ImageProcessorTrait for ImageProcessor {
             return Ok(());
         }
 
-        // Un-letterbox detect boxes for rendering when a letterbox was applied
-        // to prepare the model input.
+        // Un-letterbox detect boxes and segmentation bboxes for rendering when
+        // a letterbox was applied to prepare the model input.
         let lb_boxes: Vec<DetectBox>;
-        let detect = if let Some(lb) = overlay.letterbox {
+        let lb_segs: Vec<Segmentation>;
+        let (detect, segmentation) = if let Some(lb) = overlay.letterbox {
             lb_boxes = detect.iter().map(|&d| unletter_bbox(d, lb)).collect();
-            lb_boxes.as_slice()
+            // Keep segmentation bboxes in sync with the transformed detect boxes
+            // when we have a 1:1 correspondence (instance segmentation).
+            lb_segs = if segmentation.len() == lb_boxes.len() {
+                segmentation
+                    .iter()
+                    .zip(lb_boxes.iter())
+                    .map(|(s, d)| Segmentation {
+                        xmin: d.bbox.xmin,
+                        ymin: d.bbox.ymin,
+                        xmax: d.bbox.xmax,
+                        ymax: d.bbox.ymax,
+                        segmentation: s.segmentation.clone(),
+                    })
+                    .collect()
+            } else {
+                segmentation.to_vec()
+            };
+            (lb_boxes.as_slice(), lb_segs.as_slice())
         } else {
-            detect
+            (detect, segmentation)
         };
 
         // ── Forced backend: no fallback chain ────────────────────────
