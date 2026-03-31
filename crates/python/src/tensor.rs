@@ -398,10 +398,12 @@ fn copy_numpy_to_tensor_dyn(src: &Bound<'_, pyo3::types::PyAny>, tensor: &Tensor
             let ndim = shape.len();
 
             let mut contig_elems: usize = 1;
+            let mut contig_dims: usize = 0;
             for i in (0..ndim).rev() {
                 // Size-1 dims are always contiguous regardless of stride.
                 if strides[i] == contig_elems as isize || shape[i] <= 1 {
                     contig_elems *= shape[i];
+                    contig_dims += 1;
                 } else {
                     break;
                 }
@@ -409,34 +411,37 @@ fn copy_numpy_to_tensor_dyn(src: &Bound<'_, pyo3::types::PyAny>, tensor: &Tensor
 
             if contig_elems > 1 && contig_elems < tensor_len {
                 // Path 2: strided outer, contiguous inner rows.
-                // Collect (src_row_ptr, dst_offset) pairs for each row,
-                // then copy — in parallel for large arrays.
+                // Compute row byte-offsets from strides in O(n_rows) —
+                // no element-level iteration needed.
                 let n_rows = tensor_len / contig_elems;
                 let row_len = contig_elems;
+                let elem_size = std::mem::size_of::<T>() as isize;
 
-                // Build signed byte offsets from the base pointer to the
-                // start of each contiguous row. Signed offsets handle
-                // negative strides (e.g., arr[::-1]) where row pointers
-                // can precede the base pointer.
-                let base = src_view.as_ptr();
+                // Outer dimensions are those NOT part of the contiguous tail.
+                let outer_ndim = ndim - contig_dims;
+                let outer_shape = &shape[..outer_ndim];
+                let outer_strides = &strides[..outer_ndim];
+
+                // Compute the signed byte offset for each row by decomposing
+                // the row index into a multi-index over the outer dimensions
+                // and taking the dot product with their byte strides.
                 let mut row_offsets: Vec<isize> = Vec::with_capacity(n_rows);
-                {
-                    let mut iter = src_view.iter();
-                    for _ in 0..n_rows {
-                        if let Some(first) = iter.next() {
-                            let off = unsafe { (first as *const T).byte_offset_from(base) };
-                            row_offsets.push(off);
-                            // Advance past the rest of this contiguous row.
-                            for _ in 1..row_len {
-                                iter.next();
-                            }
-                        }
+                for row_idx in 0..n_rows {
+                    let mut remaining = row_idx;
+                    let mut byte_off: isize = 0;
+                    // Decompose row_idx into (coord_0, coord_1, ...) in
+                    // C-order (last outer dim varies fastest).
+                    for dim in (0..outer_ndim).rev() {
+                        let coord = remaining % outer_shape[dim];
+                        remaining /= outer_shape[dim];
+                        byte_off += coord as isize * outer_strides[dim] * elem_size;
                     }
+                    row_offsets.push(byte_off);
                 }
 
                 // Row copy closure — base_addr is a usize (Send+Sync
                 // safe), reconstructed to a pointer with signed offset.
-                let base_addr = base as usize;
+                let base_addr = src_view.as_ptr() as usize;
                 let copy_row = |dst_row: &mut [T], byte_off: isize| unsafe {
                     let src_ptr = (base_addr as *const u8).offset(byte_off) as *const T;
                     let src_row = std::slice::from_raw_parts(src_ptr, row_len);
