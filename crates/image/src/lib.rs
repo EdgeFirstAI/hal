@@ -5633,4 +5633,115 @@ mod image_tests {
         assert_eq!(dst.width(), Some(640));
         assert_eq!(dst.height(), Some(640));
     }
+
+    /// Verify that creating multiple ImageProcessors on the same thread and
+    /// performing a resize on each does not deadlock or error.
+    ///
+    /// Uses automatic memory allocation (DMA → PBO → Mem fallback) so that
+    /// hardware backends (OpenGL, G2D) are exercised on capable targets.
+    #[test]
+    fn test_multiple_image_processors_same_thread() {
+        let mut processors: Vec<ImageProcessor> = (0..4)
+            .map(|_| ImageProcessor::new().expect("ImageProcessor::new() failed"))
+            .collect();
+
+        for proc in &mut processors {
+            let src = proc
+                .create_image(128, 128, PixelFormat::Rgb, DType::U8, None)
+                .expect("create src failed");
+            let mut dst = proc
+                .create_image(64, 64, PixelFormat::Rgb, DType::U8, None)
+                .expect("create dst failed");
+            proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+                .expect("convert failed");
+            assert_eq!(dst.width(), Some(64));
+            assert_eq!(dst.height(), Some(64));
+        }
+    }
+
+    /// Verify that creating ImageProcessors on separate threads and performing
+    /// a resize on each does not deadlock or error.
+    ///
+    /// Uses automatic memory allocation (DMA → PBO → Mem fallback) so that
+    /// hardware backends (OpenGL, G2D) are exercised on capable targets.
+    #[test]
+    fn test_multiple_image_processors_separate_threads() {
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    let mut proc = ImageProcessor::new().unwrap_or_else(|e| {
+                        panic!("ImageProcessor::new() failed on thread {i}: {e}")
+                    });
+                    let src = proc
+                        .create_image(128, 128, PixelFormat::Rgb, DType::U8, None)
+                        .unwrap_or_else(|e| panic!("create src failed on thread {i}: {e}"));
+                    let mut dst = proc
+                        .create_image(64, 64, PixelFormat::Rgb, DType::U8, None)
+                        .unwrap_or_else(|e| panic!("create dst failed on thread {i}: {e}"));
+                    proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+                        .unwrap_or_else(|e| panic!("convert failed on thread {i}: {e}"));
+                    assert_eq!(dst.width(), Some(64));
+                    assert_eq!(dst.height(), Some(64));
+                })
+            })
+            .collect();
+
+        for (i, h) in handles.into_iter().enumerate() {
+            h.join()
+                .unwrap_or_else(|e| panic!("thread {i} panicked: {e:?}"));
+        }
+    }
+
+    /// Verify that 4 fully-initialized ImageProcessors on separate threads can
+    /// all operate concurrently without deadlocking each other.
+    ///
+    /// All processors are created first, then a barrier synchronizes them so
+    /// they all start converting at the same instant — maximizing contention.
+    #[test]
+    fn test_image_processors_concurrent_operations() {
+        use std::sync::{Arc, Barrier};
+
+        const N: usize = 4;
+        const ROUNDS: usize = 10;
+        let barrier = Arc::new(Barrier::new(N));
+
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut proc = ImageProcessor::new().unwrap_or_else(|e| {
+                        panic!("ImageProcessor::new() failed on thread {i}: {e}")
+                    });
+
+                    // All threads wait here until every processor is initialized.
+                    barrier.wait();
+
+                    // Now all 4 hammer the GPU concurrently.
+                    for round in 0..ROUNDS {
+                        let src = proc
+                            .create_image(128, 128, PixelFormat::Rgb, DType::U8, None)
+                            .unwrap_or_else(|e| {
+                                panic!("create src failed on thread {i} round {round}: {e}")
+                            });
+                        let mut dst = proc
+                            .create_image(64, 64, PixelFormat::Rgb, DType::U8, None)
+                            .unwrap_or_else(|e| {
+                                panic!("create dst failed on thread {i} round {round}: {e}")
+                            });
+                        proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+                            .unwrap_or_else(|e| {
+                                panic!("convert failed on thread {i} round {round}: {e}")
+                            });
+                        assert_eq!(dst.width(), Some(64));
+                        assert_eq!(dst.height(), Some(64));
+                    }
+                })
+            })
+            .collect();
+
+        for (i, h) in handles.into_iter().enumerate() {
+            h.join()
+                .unwrap_or_else(|e| panic!("thread {i} panicked: {e:?}"));
+        }
+    }
 }
