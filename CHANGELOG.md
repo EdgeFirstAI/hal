@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Python `Tensor.from_fd()` double-close bug** — `from_fd` used
+  `OwnedFd::from_raw_fd()` which took ownership of the caller's fd. If
+  Python code called `os.close(fd)` afterward (the natural pattern), it
+  triggered a double-close; if the fd number was reused before the tensor
+  was dropped, the tensor would close an unrelated fd. Now dups the fd at
+  the FFI boundary via `BorrowedFd::borrow_raw()` +
+  `try_clone_to_owned()`, matching the contract already used by
+  `import_image` (Python) and `hal_tensor_from_fd` (C API). Updated
+  `.pyi` stub to document the caller-retains-ownership contract.
+
 ## [0.15.0] - 2026-03-30
 
 ### Added

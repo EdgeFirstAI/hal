@@ -622,8 +622,8 @@ class Tensor:
         Inspects the file descriptor to determine the appropriate tensor type
         (DMA or SHM) based on the device major and minor numbers.
 
-        This will take ownership of the file descriptor, and the file descriptor will 
-        be closed when the tensor is dropped.
+        The fd is ``dup()``'d immediately — the caller retains ownership
+        of the original fd and must close it when done.
         """
 
         @property
