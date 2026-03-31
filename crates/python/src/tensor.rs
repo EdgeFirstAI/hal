@@ -328,6 +328,74 @@ fn map_tensor_dyn(t: &TensorDyn) -> tensor::Result<TensorMapT> {
     }
 }
 
+// ─── numpy → tensor copy ────────────────────────────────────────────────────
+
+/// Type-matched copy from a numpy array into a `TensorDyn`.
+///
+/// Downcasts the numpy array to the concrete element type matching the
+/// tensor's dtype, then copies via the typed `TensorMap` slice. Raises
+/// on dtype mismatch, byte-size mismatch, or non-contiguous input.
+fn copy_numpy_to_tensor_dyn(src: &Bound<'_, pyo3::types::PyAny>, tensor: &TensorDyn) -> Result<()> {
+    use numpy::{PyArrayMethods, PyUntypedArrayMethods};
+
+    /// Inner helper: downcast numpy array to `PyArrayDyn<T>`, map the tensor,
+    /// and copy element-by-element via slices.
+    // The Num + Clone + Debug + Send + Sync bounds are required by
+    // Tensor<T> and TensorTrait<T>.  We add numpy::Element + Copy for
+    // the numpy downcast and the slice copy.
+    fn copy_typed<
+        T: numpy::Element + Copy + num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
+    >(
+        src: &Bound<'_, pyo3::types::PyAny>,
+        tensor: &tensor::Tensor<T>,
+    ) -> Result<()> {
+        let arr = src
+            .downcast::<numpy::PyArrayDyn<T>>()
+            .map_err(|_| Error::Format("numpy dtype does not match tensor dtype".to_string()))?;
+
+        if !arr.is_c_contiguous() {
+            return Err(Error::Format(
+                "numpy array must be C-contiguous (try numpy.ascontiguousarray())".to_string(),
+            ));
+        }
+
+        let readonly = arr.readonly();
+        let src_slice = readonly
+            .as_slice()
+            .map_err(|e| Error::Format(format!("failed to get numpy slice: {e}")))?;
+
+        let tensor_len = tensor.len();
+        if src_slice.len() != tensor_len {
+            return Err(Error::Format(format!(
+                "element count mismatch: numpy array has {} elements but tensor has {tensor_len}",
+                src_slice.len()
+            )));
+        }
+
+        let mut map = tensor.map()?;
+        let dst_slice = map.as_mut_slice();
+        dst_slice.copy_from_slice(src_slice);
+        Ok(())
+    }
+
+    match tensor {
+        TensorDyn::U8(t) => copy_typed::<u8>(src, t),
+        TensorDyn::I8(t) => copy_typed::<i8>(src, t),
+        TensorDyn::U16(t) => copy_typed::<u16>(src, t),
+        TensorDyn::I16(t) => copy_typed::<i16>(src, t),
+        TensorDyn::U32(t) => copy_typed::<u32>(src, t),
+        TensorDyn::I32(t) => copy_typed::<i32>(src, t),
+        TensorDyn::U64(t) => copy_typed::<u64>(src, t),
+        TensorDyn::I64(t) => copy_typed::<i64>(src, t),
+        TensorDyn::F32(t) => copy_typed::<f32>(src, t),
+        TensorDyn::F64(t) => copy_typed::<f64>(src, t),
+        _ => Err(Error::UnsupportedDataType(format!(
+            "tensor dtype {:?} not supported for from_numpy",
+            tensor.dtype()
+        ))),
+    }
+}
+
 // ─── PyTensor ───────────────────────────────────────────────────────────────
 
 #[pyclass(name = "Tensor", str)]
@@ -551,6 +619,16 @@ impl PyTensor {
     /// Copy data from a numpy array into this tensor.
     fn copy_from_numpy(&mut self, src: numpy::PyArrayLike3<u8>) -> Result<()> {
         Ok(crate::image::copy_numpy_to_tensor(&self.0, src)?)
+    }
+
+    /// Copy data from a numpy array into this tensor.
+    ///
+    /// Accepts any numpy dtype and shape as long as the total byte size
+    /// matches the tensor. The numpy array must be contiguous (C-order).
+    /// Raises ``RuntimeError`` on dtype mismatch, size mismatch, or if the
+    /// array is not contiguous.
+    fn from_numpy(&mut self, src: &Bound<'_, pyo3::types::PyAny>) -> Result<()> {
+        copy_numpy_to_tensor_dyn(src, &self.0)
     }
 }
 

@@ -729,8 +729,42 @@ class Tensor:
             """
             ...
 
-    def map(self) -> TensorMap: ...
-    """Returns a mapped view of the tensor data for direct access."""
+    def map(self) -> TensorMap:
+        """Map the tensor's memory for direct read/write access.
+
+        Returns a ``TensorMap`` context manager that exposes the raw buffer.
+        Use with a ``with`` statement to ensure the mapping is released.
+
+        Example — write a numpy array into a tensor::
+
+            import numpy as np
+            from edgefirst_hal import Tensor
+
+            tensor = Tensor([480, 640, 3], dtype="float32")
+            data = np.random.rand(480, 640, 3).astype(np.float32)
+
+            with tensor.map() as m:
+                # Wrap the raw buffer as a numpy array and copy into it
+                dst = np.frombuffer(m.view(), dtype=np.float32)
+                dst = dst.reshape(tensor.shape)
+                dst[:] = data
+
+        Example — read tensor data as numpy::
+
+            with tensor.map() as m:
+                arr = np.frombuffer(m.view(), dtype=np.float32)
+                arr = arr.reshape(tensor.shape)
+                print(arr.mean())
+
+        .. tip::
+
+            For bulk numpy-to-tensor copies, prefer :meth:`from_numpy` which
+            validates dtypes and handles the mapping internally.
+
+        Raises:
+            BufferError: If the tensor is already mapped or has been unmapped.
+        """
+        ...
 
     @staticmethod
     def image(
@@ -816,13 +850,55 @@ class Tensor:
         ...
 
     def copy_from_numpy(self, src: npt.NDArray[np.uint8]) -> None:
-        """Copy data from a numpy array into this tensor.
+        """Copy data from a uint8 numpy array into this image tensor.
 
-        The shape and data type of the numpy array must match the tensor's
-        format.
+        This is a convenience method for image tensors with pixel format
+        metadata. The numpy array must be ``uint8`` with shape
+        ``(height, width, channels)`` matching the tensor's format.
+
+        For general-purpose numpy-to-tensor copies with any dtype, use
+        :meth:`from_numpy` instead.
 
         Args:
-            src: Source numpy array.
+            src: Source ``uint8`` numpy array with shape ``(H, W, C)``.
+
+        Raises:
+            RuntimeError: If the tensor is not a ``uint8`` image tensor,
+                or if the array shape does not match.
+        """
+        ...
+
+    def from_numpy(self, src: npt.NDArray) -> None:
+        """Copy data from a numpy array into this tensor.
+
+        Accepts any numpy dtype as long as it matches the tensor's dtype.
+        The total number of elements must match. The numpy array must be
+        C-contiguous.
+
+        Example::
+
+            import numpy as np
+            from edgefirst_hal import Tensor
+
+            # float32 model output → float32 tensor
+            tensor = Tensor([1, 10, 6], dtype="float32")
+            output = model.run(input_data)  # returns np.float32 array
+            tensor.from_numpy(output.reshape(1, 10, 6))
+
+            # uint8 image → uint8 tensor
+            tensor = Tensor([480, 640, 3], dtype="uint8")
+            image = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+            tensor.from_numpy(image)
+
+        Args:
+            src: Source numpy array. Must be C-contiguous with a dtype
+                matching the tensor (e.g. ``float32`` tensor requires
+                ``np.float32`` array). Total element count must match.
+
+        Raises:
+            RuntimeError: If the numpy dtype does not match the tensor
+                dtype, the element count differs, or the array is not
+                C-contiguous.
         """
         ...
 
