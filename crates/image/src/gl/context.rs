@@ -9,12 +9,40 @@ use gbm::{
 };
 use khronos_egl::{self as egl, Attrib, Display, Dynamic, Instance, EGL1_4};
 use log::debug;
-use std::{ffi::c_void, mem::ManuallyDrop, rc::Rc, sync::OnceLock};
+use std::{
+    ffi::c_void,
+    mem::ManuallyDrop,
+    rc::Rc,
+    sync::{Mutex, OnceLock},
+};
 
 /// EGL library handle. Intentionally leaked (never dlclose'd) to avoid SIGBUS
 /// on process exit: GPU drivers may keep internal state that outlives explicit
 /// EGL cleanup, and dlclose can unmap memory still referenced by the driver.
 static EGL_LIB: OnceLock<&'static libloading::Library> = OnceLock::new();
+
+/// Global mutex that serializes **all** OpenGL and EGL operations across
+/// every `GLProcessorST` instance in the process.
+///
+/// Some GPU drivers (notably Vivante `galcore` on i.MX8M Plus) are not
+/// thread-safe for concurrent EGL/GL calls, even when each thread targets
+/// an independent EGL display and context. Concurrent access can corrupt
+/// driver-internal state, leading to deadlocks or SIGSEGV inside kernel
+/// ioctls. Broadcom V3D exhibits a milder variant where concurrent
+/// `eglTerminate` breaks display ref-counting.
+///
+/// This mutex is acquired by `GLProcessorThreaded` for **every** operation
+/// on its dedicated GL thread:
+/// - Initialization (`GLProcessorST::new` — EGL init, shader compilation,
+///   DMA-BUF verification)
+/// - Every message dispatch (convert, draw, PBO create/download, etc.)
+/// - Teardown (`GLProcessorST::drop` → `GlContext::drop`)
+///
+/// This ensures that only one GL thread interacts with the GPU driver at
+/// any given time. Multiple `ImageProcessor` instances remain usable from
+/// different application threads — their GL commands are simply serialized
+/// through this mutex rather than executed in parallel.
+pub(super) static GL_MUTEX: Mutex<()> = Mutex::new(());
 
 pub(super) fn get_egl_lib() -> Result<&'static libloading::Library, crate::Error> {
     if let Some(egl) = EGL_LIB.get() {
@@ -67,6 +95,9 @@ fn probe_display_extensions(egl: &Egl, display: egl::Display) -> bool {
 /// Returns an error only if `libEGL.so.1` cannot be loaded. Individual
 /// display probe failures are silently skipped.
 pub fn probe_egl_displays() -> Result<Vec<EglDisplayInfo>, Error> {
+    // Serialize with all other EGL/GL operations — see `GL_MUTEX` doc comment.
+    let _guard = GL_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
     let egl: Egl = unsafe { Instance::<Dynamic<_, EGL1_4>>::load_required_from(get_egl_lib()?)? };
 
     let mut results = Vec::new();
