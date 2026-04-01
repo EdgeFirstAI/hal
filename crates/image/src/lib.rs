@@ -2765,7 +2765,6 @@ mod image_tests {
     }
 
     #[test]
-    #[ignore] // Vivante GPU hangs with concurrent EGL contexts on i.MX8MP
     #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
     fn test_opengl_10_threads() {

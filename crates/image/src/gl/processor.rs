@@ -3645,7 +3645,7 @@ impl GLProcessorST {
     ) -> Result<EglImage, Error> {
         let image = GlContext::egl_create_image_with_fallback(
             &self.gl_context.egl,
-            self.gl_context.display.as_display(),
+            self.gl_context.display,
             unsafe { egl::Context::from_ptr(egl::NO_CONTEXT) },
             target,
             unsafe { egl::ClientBuffer::from_ptr(null_mut()) },
@@ -3653,7 +3653,7 @@ impl GLProcessorST {
         )?;
         Ok(EglImage {
             egl_image: image,
-            display: self.gl_context.display.as_display(),
+            display: self.gl_context.display,
             egl: Rc::clone(&self.gl_context.egl),
         })
     }
