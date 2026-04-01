@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-03-31
+
+### Fixed
+
+- **Multi-thread EGL/GL deadlock** — creating multiple `ImageProcessor`
+  instances on separate threads caused SIGSEGV and deadlocks on Vivante
+  `galcore` (i.MX8M Plus) and `EGL(NotInitialized)` errors on Broadcom V3D
+  (Raspberry Pi 5). Root cause: these GPU drivers are not thread-safe for
+  concurrent EGL/GL operations even with independent displays and contexts.
+  Added a global `GL_MUTEX` that serializes all OpenGL initialization,
+  command dispatch, and teardown across `GLProcessorST` instances. Mali-G310
+  (i.MX95) was unaffected but benefits from the safety guarantee.
+
+### Added
+
+- Three multi-thread GPU integration tests:
+  `test_multiple_image_processors_same_thread`,
+  `test_multiple_image_processors_separate_threads`, and
+  `test_image_processors_concurrent_operations` (barrier-synchronized
+  concurrent resize across 4 threads). Validated on Vivante GC7000UL,
+  Mali-G310, and Broadcom V3D 7.1.10.2.
+
+- `GL_MUTEX` documentation in ARCHITECTURE.md covering problem, solution,
+  per-driver behavior, and performance implications.
+
 ## [0.15.0] - 2026-03-30
 
 ### Added

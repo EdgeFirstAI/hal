@@ -1115,6 +1115,68 @@ prevent `dlclose`) and the `Rc<Egl>` wrapper (`ManuallyDrop` to prevent
 `eglReleaseThread`). These are lightweight Rust-side objects; the actual
 GPU/display resources are released by the explicit cleanup calls above.
 
+## GL Command Serialization (GL_MUTEX)
+
+### Problem
+
+Multiple `ImageProcessor` instances can coexist in the same process, each
+backed by a `GLProcessorThreaded` that spawns a dedicated OS thread with
+its own EGL display and GL context. While EGL and OpenGL ES specify that
+independent contexts on separate threads should not interfere, several
+embedded GPU drivers violate this assumption:
+
+- **Vivante `galcore` (i.MX8M Plus)**: Concurrent `eglInitialize`,
+  `eglCreateContext`, DMA-BUF import ioctls, and `eglTerminate` from
+  multiple threads corrupt driver-internal state, causing SIGSEGV
+  (null pointer dereference at offset 0x18 inside `galcore` ioctl) and
+  futex-based deadlocks. This affects both initialization and runtime
+  operations.
+
+- **Broadcom V3D 7.1.10.2 (Raspberry Pi 5)**: Concurrent `eglTerminate`
+  calls break the spec-required ref-counting, causing `EGL(NotInitialized)`
+  errors on surviving contexts. Subsequent GL operations (DMA-BUF roundtrip
+  verification) fail with GL error 0x502 (`GL_INVALID_OPERATION`).
+
+- **ARM Mali-G310 (i.MX95)**: No issues observed. The Panfrost driver
+  handles concurrent EGL/GL operations correctly.
+
+### Solution
+
+A global `GL_MUTEX` (`std::sync::Mutex<()>` in `crates/image/src/gl/context.rs`)
+serializes **all** EGL and GL operations across every `GLProcessorST` instance.
+The mutex is acquired in `GLProcessorThreaded`'s GL thread message loop at
+three points:
+
+1. **Initialization**: Wraps `GLProcessorST::new()` — EGL display creation,
+   context setup, shader compilation, and DMA-BUF roundtrip verification.
+2. **Message dispatch**: Wraps every incoming message (convert, draw masks,
+   PBO create/download, etc.) so that only one GL thread executes driver
+   calls at any time.
+3. **Teardown**: Wraps `GLProcessorST::drop()` → `GlContext::drop()` so
+   that `eglDestroyContext`/`eglTerminate` are serialized.
+
+The mutex uses `unwrap_or_else(|e| e.into_inner())` to recover from
+poisoning: if a prior GL operation panicked, subsequent operations on
+other instances can still proceed rather than propagating a poison error.
+
+### Performance Implications
+
+All GL operations are serialized — there is no concurrent GPU execution
+across `ImageProcessor` instances. This is acceptable because:
+
+- The primary use case (edge AI inference pipelines) typically uses a
+  single `ImageProcessor` per pipeline. Multiple instances exist mainly
+  in test scenarios or when multiple independent pipelines share a process.
+- GPU operations are already I/O-bound on embedded targets; the mutex
+  overhead (microseconds) is negligible compared to DMA transfers and
+  shader execution (milliseconds).
+- The alternative (concurrent GPU access) crashes on Vivante hardware,
+  which is a primary deployment target.
+
+Future work could relax this to init/teardown-only serialization if a
+driver is known to be safe for concurrent runtime operations (e.g., Mali),
+but the current approach prioritizes correctness across all targets.
+
 ## Testing with GPU Resources
 
 ### Single-Threaded Test Execution
