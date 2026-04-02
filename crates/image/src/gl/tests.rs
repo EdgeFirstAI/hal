@@ -547,6 +547,72 @@ mod gl_tests {
         }
     }
 
+    /// Validate that probe_egl_displays() populates the shared display and
+    /// that a subsequent GLProcessorThreaded::new() reuses it without
+    /// deadlocking.
+    #[test]
+    fn test_probe_then_create_gl_context() {
+        let displays = match probe_egl_displays() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - EGL not available: {e:?}", function!());
+                return;
+            }
+        };
+
+        if displays.is_empty() {
+            eprintln!("SKIPPED: {} - No EGL displays available", function!());
+            return;
+        }
+
+        eprintln!(
+            "Probed displays: {:?}",
+            displays.iter().map(|d| d.kind).collect::<Vec<_>>()
+        );
+
+        // Now create a GL processor — should reuse the shared display
+        let mut gl = match GLProcessorThreaded::new(None) {
+            Ok(gl) => gl,
+            Err(e) => {
+                eprintln!(
+                    "SKIPPED: {} - GLProcessorThreaded failed: {e:?}",
+                    function!()
+                );
+                return;
+            }
+        };
+
+        // Verify it works by doing a simple convert
+        let src = edgefirst_tensor::TensorDyn::image(
+            64,
+            64,
+            edgefirst_tensor::PixelFormat::Rgba,
+            edgefirst_tensor::DType::U8,
+            None,
+        )
+        .expect("create src failed");
+        let mut dst = edgefirst_tensor::TensorDyn::image(
+            32,
+            32,
+            edgefirst_tensor::PixelFormat::Rgba,
+            edgefirst_tensor::DType::U8,
+            None,
+        )
+        .expect("create dst failed");
+
+        gl.convert(
+            &src,
+            &mut dst,
+            crate::Rotation::None,
+            crate::Flip::None,
+            crate::Crop::default(),
+        )
+        .expect("convert failed");
+
+        assert_eq!(dst.width(), Some(32));
+        assert_eq!(dst.height(), Some(32));
+    }
+
     /// Validate that explicitly selecting each available display kind via
     /// GLProcessorThreaded::new(Some(kind)) succeeds and produces a working
     /// converter.

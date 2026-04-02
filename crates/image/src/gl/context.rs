@@ -9,12 +9,172 @@ use gbm::{
 };
 use khronos_egl::{self as egl, Attrib, Display, Dynamic, Instance, EGL1_4};
 use log::debug;
-use std::{ffi::c_void, mem::ManuallyDrop, rc::Rc, sync::OnceLock};
+use std::{
+    ffi::c_void,
+    mem::ManuallyDrop,
+    rc::Rc,
+    sync::{Mutex, OnceLock},
+};
 
 /// EGL library handle. Intentionally leaked (never dlclose'd) to avoid SIGBUS
 /// on process exit: GPU drivers may keep internal state that outlives explicit
 /// EGL cleanup, and dlclose can unmap memory still referenced by the driver.
 static EGL_LIB: OnceLock<&'static libloading::Library> = OnceLock::new();
+
+/// Global mutex that serializes **all** OpenGL and EGL operations across
+/// every `GLProcessorST` instance in the process.
+///
+/// Some GPU drivers (notably Vivante `galcore` on i.MX8M Plus) are not
+/// thread-safe for concurrent EGL/GL calls, even when each thread targets
+/// an independent EGL display and context. Concurrent access can corrupt
+/// driver-internal state, leading to deadlocks or SIGSEGV inside kernel
+/// ioctls. Broadcom V3D exhibits a milder variant where concurrent
+/// `eglTerminate` breaks display ref-counting.
+///
+/// This mutex is acquired by `GLProcessorThreaded` for **every** operation
+/// on its dedicated GL thread:
+/// - Initialization (`GLProcessorST::new` — EGL init, shader compilation,
+///   DMA-BUF verification)
+/// - Every message dispatch (convert, draw, PBO create/download, etc.)
+/// - Teardown (`GLProcessorST::drop` → `GlContext::drop`)
+///
+/// This ensures that only one GL thread interacts with the GPU driver at
+/// any given time. Multiple `ImageProcessor` instances remain usable from
+/// different application threads — their GL commands are simply serialized
+/// through this mutex rather than executed in parallel.
+pub(super) static GL_MUTEX: Mutex<()> = Mutex::new(());
+
+/// Shared EGL display — created once, reused by all `GlContext` instances.
+///
+/// On Vivante galcore (i.MX8M Plus), opening multiple DRM fds causes
+/// kernel-level deadlocks between the galcore and DRM ioctl paths. Sharing
+/// one display (and its backing GBM device / DRM fd) avoids the conflict.
+///
+/// The display is never terminated (intentional leak). Same pattern as
+/// `EGL_LIB` above and `SHARED_DRM_FD` in `crates/tensor/src/dmabuf.rs`.
+struct SharedEglDisplay {
+    display: egl::Display,
+    kind: EglDisplayKind,
+    transfer_backend: TransferBackend,
+    /// Kept alive — dropping the GBM device closes the DRM fd and
+    /// invalidates the EGL display.
+    _resources: SharedDisplayResources,
+}
+
+/// Backing resources that must outlive the EGL display.
+enum SharedDisplayResources {
+    Gbm(#[allow(dead_code)] Device<Card>),
+    PlatformDevice,
+    Default,
+}
+
+// SAFETY: SharedEglDisplay is only accessed under GL_MUTEX or OnceLock
+// initialization (which is itself synchronized). The egl::Display handle
+// is a raw pointer, but all EGL calls using it are serialized by GL_MUTEX.
+unsafe impl Send for SharedEglDisplay {}
+unsafe impl Sync for SharedEglDisplay {}
+
+static SHARED_DISPLAY: OnceLock<Result<SharedEglDisplay, String>> = OnceLock::new();
+
+/// Initialize the shared EGL display. Called once per process via `OnceLock`.
+///
+/// Probes display types in priority order (PlatformDevice → GBM → Default),
+/// initializes the first that works, and detects DMA-BUF support via
+/// display extension queries. No temporary GL context is created —
+/// Vivante galcore corrupts state on context create/destroy cycles.
+type DisplayFn = fn(&Egl) -> Result<EglDisplayType, crate::Error>;
+
+fn init_shared_display(
+    egl: &Rc<Egl>,
+    kind: Option<EglDisplayKind>,
+) -> Result<SharedEglDisplay, String> {
+    let display_fns: Vec<(EglDisplayKind, DisplayFn)> = if let Some(kind) = kind {
+        let f = match kind {
+            EglDisplayKind::Gbm => GlContext::egl_get_gbm_display as DisplayFn,
+            EglDisplayKind::PlatformDevice => GlContext::egl_get_platform_display_from_device,
+            EglDisplayKind::Default => GlContext::egl_get_default_display,
+        };
+        vec![(kind, f)]
+    } else {
+        vec![
+            (
+                EglDisplayKind::PlatformDevice,
+                GlContext::egl_get_platform_display_from_device as DisplayFn,
+            ),
+            (EglDisplayKind::Gbm, GlContext::egl_get_gbm_display),
+            (EglDisplayKind::Default, GlContext::egl_get_default_display),
+        ]
+    };
+
+    for (kind, display_fn) in display_fns {
+        let display_type = match display_fn(egl) {
+            Ok(d) => d,
+            Err(e) => {
+                log::debug!("Shared display: {kind} display creation failed: {e:?}");
+                continue;
+            }
+        };
+        let display = display_type.as_display();
+
+        if let Err(e) = egl.initialize(display) {
+            log::debug!("Shared display: eglInitialize failed for {kind}: {e:?}");
+            continue;
+        }
+
+        // Verify required extensions
+        let ext_str = match egl.query_string(Some(display), egl::EXTENSIONS) {
+            Ok(s) => s,
+            Err(e) => {
+                log::debug!("Shared display: eglQueryString failed for {kind}: {e:?}");
+                let _ = egl.terminate(display);
+                continue;
+            }
+        };
+        let exts = ext_str.to_string_lossy();
+        if !exts.contains("EGL_KHR_surfaceless_context")
+            || !exts.contains("EGL_KHR_no_config_context")
+        {
+            log::debug!("Shared display: {kind} missing required extensions");
+            let _ = egl.terminate(display);
+            continue;
+        }
+
+        if egl.bind_api(egl::OPENGL_ES_API).is_err() {
+            log::debug!("Shared display: eglBindApi failed for {kind}");
+            let _ = egl.terminate(display);
+            continue;
+        }
+
+        // Check DMA-BUF support (display extension query — no context needed)
+        let transfer_backend = if GlContext::egl_check_support_dma(egl, display).is_ok() {
+            TransferBackend::DmaBuf
+        } else {
+            TransferBackend::Sync
+        };
+
+        // Do NOT create a temporary context here to probe has_compute.
+        // On Vivante galcore, creating and destroying a context before
+        // the real one corrupts driver state and causes deadlocks.
+        // Each GlContext::new() will try GLES 3.1 → 3.0 itself.
+
+        let resources = match display_type {
+            EglDisplayType::Gbm(_, gbm) => SharedDisplayResources::Gbm(gbm),
+            EglDisplayType::PlatformDisplay(_) => SharedDisplayResources::PlatformDevice,
+            EglDisplayType::Default(_) => SharedDisplayResources::Default,
+        };
+
+        log::info!("Shared EGL display initialized: kind={kind}, transfer={transfer_backend:?}");
+
+        return Ok(SharedEglDisplay {
+            display,
+            kind,
+            transfer_backend,
+            _resources: resources,
+        });
+    }
+
+    Err("Could not initialize EGL with any known method".to_string())
+}
 
 pub(super) fn get_egl_lib() -> Result<&'static libloading::Library, crate::Error> {
     if let Some(egl) = EGL_LIB.get() {
@@ -29,36 +189,16 @@ pub(super) fn get_egl_lib() -> Result<&'static libloading::Library, crate::Error
 
 pub(super) type Egl = Instance<Dynamic<&'static libloading::Library, EGL1_4>>;
 
-/// Check whether an EGL display supports the surfaceless + no-config context
-/// extensions required by the HAL's FBO-based rendering pipeline.
-///
-/// Queries `eglQueryString(display, EGL_EXTENSIONS)` and checks for
-/// `EGL_KHR_surfaceless_context` and `EGL_KHR_no_config_context`.
-fn probe_display_extensions(egl: &Egl, display: egl::Display) -> bool {
-    let Ok(ext_str) = egl.query_string(Some(display), egl::EXTENSIONS) else {
-        return false;
-    };
-    let exts = ext_str.to_string_lossy();
-
-    let required = ["EGL_KHR_surfaceless_context", "EGL_KHR_no_config_context"];
-
-    for r in &required {
-        if !exts.contains(r) {
-            log::debug!("Display missing required extension: {r}");
-            return false;
-        }
-    }
-
-    egl.bind_api(egl::OPENGL_ES_API).is_ok()
-}
-
 /// Probe for available EGL displays supporting headless OpenGL ES 3.0.
 ///
-/// Returns validated displays in priority order (PlatformDevice, GBM,
-/// Default). Each display is validated with `eglInitialize` + extension
-/// checks for `EGL_KHR_surfaceless_context` and `EGL_KHR_no_config_context`.
-/// Probed state is cleaned up with `eglTerminate` — no EGL resources are
-/// left alive.
+/// When a shared display already exists (from a prior `GlContext::new()`
+/// call or earlier probe), returns only that display's kind. Opening
+/// additional DRM fds would risk galcore deadlocks on Vivante.
+///
+/// When no shared display exists, probes in priority order
+/// (PlatformDevice, GBM, Default) and caches the first successful
+/// display in `SHARED_DISPLAY` for future use. The display is
+/// intentionally never terminated (same leak pattern as `EGL_LIB`).
 ///
 /// An empty list means OpenGL is not available on this system.
 ///
@@ -67,58 +207,63 @@ fn probe_display_extensions(egl: &Egl, display: egl::Display) -> bool {
 /// Returns an error only if `libEGL.so.1` cannot be loaded. Individual
 /// display probe failures are silently skipped.
 pub fn probe_egl_displays() -> Result<Vec<EglDisplayInfo>, Error> {
+    // Serialize with all other EGL/GL operations — see `GL_MUTEX` doc comment.
+    let _guard = GL_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
     let egl: Egl = unsafe { Instance::<Dynamic<_, EGL1_4>>::load_required_from(get_egl_lib()?)? };
+
+    // If a shared display already exists, report only its kind.
+    // Opening additional DRM fds to probe other display types would
+    // deadlock galcore on Vivante when the shared display is alive.
+    if let Some(Ok(shared)) = SHARED_DISPLAY.get() {
+        let description = match shared.kind {
+            EglDisplayKind::PlatformDevice => {
+                "EGL platform device via EGL_EXT_device_enumeration".to_string()
+            }
+            EglDisplayKind::Gbm => "GBM via /dev/dri/renderD128".to_string(),
+            EglDisplayKind::Default => "EGL default display".to_string(),
+        };
+        return Ok(vec![EglDisplayInfo {
+            kind: shared.kind,
+            description,
+        }]);
+    }
+
+    // No shared display yet — safe to probe all types. The first
+    // successful probe populates SHARED_DISPLAY for future use.
+    let egl_rc: Rc<Egl> = Rc::new(egl);
+
+    // Try to initialize the shared display (probes in priority order).
+    // This populates SHARED_DISPLAY as a side effect.
+    let shared_result = SHARED_DISPLAY.get_or_init(|| init_shared_display(&egl_rc, None));
 
     let mut results = Vec::new();
 
-    // PlatformDevice first (zero external deps, works on NVIDIA + newer Vivante)
-    if let Ok(display_type) = GlContext::egl_get_platform_display_from_device(&egl) {
-        let display = display_type.as_display();
-        if egl.initialize(display).is_ok() {
-            if probe_display_extensions(&egl, display) {
-                results.push(EglDisplayInfo {
-                    kind: EglDisplayKind::PlatformDevice,
-                    description: "EGL platform device via EGL_EXT_device_enumeration".to_string(),
-                });
+    if let Ok(shared) = shared_result {
+        let description = match shared.kind {
+            EglDisplayKind::PlatformDevice => {
+                "EGL platform device via EGL_EXT_device_enumeration".to_string()
             }
-            let _ = egl.terminate(display);
-        }
+            EglDisplayKind::Gbm => "GBM via /dev/dri/renderD128".to_string(),
+            EglDisplayKind::Default => "EGL default display".to_string(),
+        };
+        results.push(EglDisplayInfo {
+            kind: shared.kind,
+            description,
+        });
     }
 
-    // GBM second (needed for Mali + old Vivante)
-    if let Ok(display_type) = GlContext::egl_get_gbm_display(&egl) {
-        let display = display_type.as_display();
-        if egl.initialize(display).is_ok() {
-            if probe_display_extensions(&egl, display) {
-                results.push(EglDisplayInfo {
-                    kind: EglDisplayKind::Gbm,
-                    description: "GBM via /dev/dri/renderD128".to_string(),
-                });
-            }
-            let _ = egl.terminate(display);
-        }
-    }
-
-    // Default last (needs compositor)
-    if let Ok(display_type) = GlContext::egl_get_default_display(&egl) {
-        let display = display_type.as_display();
-        if egl.initialize(display).is_ok() {
-            if probe_display_extensions(&egl, display) {
-                results.push(EglDisplayInfo {
-                    kind: EglDisplayKind::Default,
-                    description: "EGL default display".to_string(),
-                });
-            }
-            let _ = egl.terminate(display);
-        }
-    }
+    // Note: we intentionally do NOT probe additional display types here.
+    // The shared display is the only one that will be used, and probing
+    // others would open DRM fds that risk galcore deadlocks if a GL
+    // context is later created on the shared display.
 
     Ok(results)
 }
 
 pub(super) struct GlContext {
     pub(super) transfer_backend: TransferBackend,
-    pub(super) display: EglDisplayType,
+    pub(super) display: egl::Display,
     pub(super) ctx: egl::Context,
     /// Whether the context is GLES 3.1+ (compute shaders available).
     pub(super) has_compute: bool,
@@ -147,80 +292,34 @@ impl EglDisplayType {
 
 impl GlContext {
     pub(super) fn new(kind: Option<EglDisplayKind>) -> Result<GlContext, crate::Error> {
-        // Create an EGL API instance.
         let egl: Rc<Egl> =
             Rc::new(unsafe { Instance::<Dynamic<_, EGL1_4>>::load_required_from(get_egl_lib()?)? });
 
-        if let Some(kind) = kind {
-            // Specific display type requested — try only that one.
-            let display_fn = match kind {
-                EglDisplayKind::Gbm => Self::egl_get_gbm_display as fn(&Egl) -> _,
-                EglDisplayKind::PlatformDevice => Self::egl_get_platform_display_from_device,
-                EglDisplayKind::Default => Self::egl_get_default_display,
-            };
-            return Self::try_initialize_egl(egl, display_fn).map_err(|e| {
-                log::debug!("Failed to initialize EGL with {kind} display: {e:?}");
-                e
-            });
+        // Get or create the shared display
+        let shared = SHARED_DISPLAY
+            .get_or_init(|| init_shared_display(&egl, kind))
+            .as_ref()
+            .map_err(|e| Error::OpenGl(e.clone()))?;
+
+        // If caller requested a specific kind, verify it matches
+        if let Some(requested) = kind {
+            if requested != shared.kind {
+                return Err(Error::OpenGl(format!(
+                    "Requested EGL display kind {requested} but shared display is {} \
+                     (only one display type can be active per process to avoid \
+                     Vivante galcore deadlocks)",
+                    shared.kind,
+                )));
+            }
         }
 
-        // Try PlatformDevice first (zero external deps, works on NVIDIA + newer Vivante)
-        if let Ok(headless) =
-            Self::try_initialize_egl(egl.clone(), Self::egl_get_platform_display_from_device)
-        {
-            return Ok(headless);
-        } else {
-            log::debug!("Didn't initialize EGL with platform display from device enumeration");
-        }
+        let display = shared.display;
+        let transfer_backend = shared.transfer_backend;
 
-        // GBM second (needed for Mali + old Vivante that lack EGL_EXT_platform_device)
-        if let Ok(headless) = Self::try_initialize_egl(egl.clone(), Self::egl_get_gbm_display) {
-            return Ok(headless);
-        } else {
-            log::debug!("Didn't initialize EGL with GBM Display");
-        }
-
-        // Default display last (needs compositor)
-        if let Ok(headless) = Self::try_initialize_egl(egl.clone(), Self::egl_get_default_display) {
-            return Ok(headless);
-        } else {
-            log::debug!("Didn't initialize EGL with Default Display");
-        }
-
-        Err(Error::OpenGl(
-            "Could not initialize EGL with any known method".to_string(),
-        ))
-    }
-
-    fn try_initialize_egl(
-        egl: Rc<Egl>,
-        display_fn: impl Fn(&Egl) -> Result<EglDisplayType, crate::Error>,
-    ) -> Result<GlContext, crate::Error> {
-        let display = display_fn(&egl)?;
-        log::debug!("egl initialize with display: {:x?}", display.as_display());
-        egl.initialize(display.as_display())?;
-
-        // Verify required extensions for surfaceless + no-config context
-        let ext_str = egl.query_string(Some(display.as_display()), egl::EXTENSIONS)?;
-        let exts = ext_str.to_string_lossy();
-
-        if !exts.contains("EGL_KHR_surfaceless_context") {
-            return Err(crate::Error::GLVersion(
-                "EGL display does not support EGL_KHR_surfaceless_context".to_string(),
-            ));
-        }
-
-        if !exts.contains("EGL_KHR_no_config_context") {
-            return Err(crate::Error::GLVersion(
-                "EGL display does not support EGL_KHR_no_config_context".to_string(),
-            ));
-        }
-
+        // Bind API for this thread (required per EGL spec — thread-local state)
         egl.bind_api(egl::OPENGL_ES_API)?;
 
-        // No-config context: pass EGL_NO_CONFIG_KHR (null) instead of a
-        // real config. The context is not bound to any specific framebuffer
-        // format — it works with any FBO attachment format.
+        // Create a new GL context on the shared display.
         // Try GLES 3.1 first (compute shaders), fall back to 3.0.
         let ctx_31 = [
             egl::CONTEXT_MAJOR_VERSION,
@@ -230,35 +329,22 @@ impl GlContext {
             egl::NONE,
         ];
         let (ctx, has_compute) =
-            match egl.create_context(display.as_display(), egl_ext::NO_CONFIG_KHR, None, &ctx_31) {
+            match egl.create_context(display, egl_ext::NO_CONFIG_KHR, None, &ctx_31) {
                 Ok(ctx) => {
                     debug!("Created GLES 3.1 context (compute shaders available)");
                     (ctx, true)
                 }
                 Err(_) => {
                     let ctx_30 = [egl::CONTEXT_MAJOR_VERSION, 3, egl::NONE];
-                    let ctx = egl.create_context(
-                        display.as_display(),
-                        egl_ext::NO_CONFIG_KHR,
-                        None,
-                        &ctx_30,
-                    )?;
+                    let ctx = egl.create_context(display, egl_ext::NO_CONFIG_KHR, None, &ctx_30)?;
                     debug!("Created GLES 3.0 context (no compute shaders)");
                     (ctx, false)
                 }
             };
         debug!("ctx: {ctx:?}");
 
-        // Surfaceless context: no PBuffer surface needed. All rendering
-        // goes through FBOs backed by EGLImages.
-        egl.make_current(display.as_display(), None, None, Some(ctx))?;
+        egl.make_current(display, None, None, Some(ctx))?;
 
-        let has_dma_extensions = Self::egl_check_support_dma(&egl, display.as_display()).is_ok();
-        let transfer_backend = if has_dma_extensions {
-            TransferBackend::DmaBuf
-        } else {
-            TransferBackend::Sync
-        };
         Ok(GlContext {
             display,
             ctx,
@@ -488,26 +574,18 @@ impl GlContext {
 
 impl Drop for GlContext {
     fn drop(&mut self) {
-        // During process shutdown (e.g. Python interpreter exit), the EGL/GL
-        // shared libraries may already be partially unloaded, causing panics
-        // or heap corruption when calling cleanup functions. We suppress
-        // panic output and catch panics to prevent propagation.
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = self
-                .egl
-                .make_current(self.display.as_display(), None, None, None);
+            let _ = self.egl.make_current(self.display, None, None, None);
 
-            let _ = self
-                .egl
-                .destroy_context(self.display.as_display(), self.ctx);
+            let _ = self.egl.destroy_context(self.display, self.ctx);
 
-            // eglTerminate is ref-counted per the EGL spec: each eglInitialize
-            // increments a counter and each eglTerminate decrements it. The
-            // display is only truly torn down when the last reference is
-            // released. catch_unwind absorbs any driver-side misbehaviour.
-            let _ = self.egl.terminate(self.display.as_display());
+            // The EGL display is process-global (SharedEglDisplay in
+            // SHARED_DISPLAY) and intentionally never terminated. Calling
+            // eglTerminate here would tear down the display for all active
+            // GlContext instances. The display is leaked on process exit,
+            // same as EGL_LIB.
         }));
         std::panic::set_hook(prev_hook);
 
