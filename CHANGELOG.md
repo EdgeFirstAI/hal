@@ -93,6 +93,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dup returned by `.fd` after passing it to `from_fd()`, matching the
   caller-retains-ownership contract.
 
+## [0.15.2] - 2026-04-01
+
+### Fixed
+
+- **Vivante galcore kernel deadlock on multi-thread EGL init** — creating
+  multiple `ImageProcessor` instances with the OpenGL backend on separate
+  threads caused a kernel-level deadlock on Vivante GC7000UL (i.MX8M Plus).
+  Each `GlContext` opened a fresh DRM fd and created an independent EGL
+  display; galcore deadlocked when a second DRM fd was opened while the
+  first display was active. Fix: share a single EGL display (and its
+  backing GBM device / DRM fd) across all `GlContext` instances via a
+  process-wide `OnceLock<SharedEglDisplay>` singleton. The display is
+  intentionally never terminated (same leak pattern as `EGL_LIB` and
+  `SHARED_DRM_FD`). `GL_MUTEX` is retained for serializing GL operations.
+
+- **`probe_egl_displays()` galcore safety** — when a shared EGL display
+  already exists, `probe_egl_displays()` now returns only the cached
+  display kind instead of opening additional DRM fds (which would trigger
+  the galcore deadlock).
+
+### Changed
+
+- `GlContext` no longer owns the EGL display — the `display` field changed
+  from `EglDisplayType` (owned enum with GBM device) to `egl::Display`
+  (copyable handle from the shared singleton). `GlContext::drop` no longer
+  calls `eglTerminate`.
+
+### Added
+
+- `test_probe_then_create_gl_context` — validates that `probe_egl_displays()`
+  populates the shared display and subsequent `GLProcessorThreaded::new()`
+  reuses it.
+
+- Un-ignored `test_opengl_10_threads` — the shared display fix eliminates
+  the Vivante galcore deadlock that caused the hang.
+
+## [0.15.1] - 2026-03-31
+
+### Fixed
+
+- **Multi-thread EGL/GL deadlock** — creating multiple `ImageProcessor`
+  instances on separate threads caused SIGSEGV and deadlocks on Vivante
+  `galcore` (i.MX8M Plus) and `EGL(NotInitialized)` errors on Broadcom V3D
+  (Raspberry Pi 5). Root cause: these GPU drivers are not thread-safe for
+  concurrent EGL/GL operations even with independent displays and contexts.
+  Added a global `GL_MUTEX` that serializes all OpenGL initialization,
+  command dispatch, and teardown across `GLProcessorST` instances. Mali-G310
+  (i.MX95) was unaffected but benefits from the safety guarantee.
+
+### Added
+
+- Three multi-thread GPU integration tests:
+  `test_multiple_image_processors_same_thread`,
+  `test_multiple_image_processors_separate_threads`, and
+  `test_image_processors_concurrent_operations` (barrier-synchronized
+  concurrent resize across 4 threads). Validated on Vivante GC7000UL,
+  Mali-G310, and Broadcom V3D 7.1.10.2.
+
+- `GL_MUTEX` documentation in ARCHITECTURE.md covering problem, solution,
+  per-driver behavior, and performance implications.
+
 ## [0.15.0] - 2026-03-30
 
 ### Added
