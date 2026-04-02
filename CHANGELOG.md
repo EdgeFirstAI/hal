@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.2] - 2026-04-01
+
+### Fixed
+
+- **Vivante galcore kernel deadlock on multi-thread EGL init** — creating
+  multiple `ImageProcessor` instances with the OpenGL backend on separate
+  threads caused a kernel-level deadlock on Vivante GC7000UL (i.MX8M Plus).
+  Each `GlContext` opened a fresh DRM fd and created an independent EGL
+  display; galcore deadlocked when a second DRM fd was opened while the
+  first display was active. Fix: share a single EGL display (and its
+  backing GBM device / DRM fd) across all `GlContext` instances via a
+  process-wide `OnceLock<SharedEglDisplay>` singleton. The display is
+  intentionally never terminated (same leak pattern as `EGL_LIB` and
+  `SHARED_DRM_FD`). `GL_MUTEX` is retained for serializing GL operations.
+
+- **`probe_egl_displays()` galcore safety** — when a shared EGL display
+  already exists, `probe_egl_displays()` now returns only the cached
+  display kind instead of opening additional DRM fds (which would trigger
+  the galcore deadlock).
+
+### Changed
+
+- `GlContext` no longer owns the EGL display — the `display` field changed
+  from `EglDisplayType` (owned enum with GBM device) to `egl::Display`
+  (copyable handle from the shared singleton). `GlContext::drop` no longer
+  calls `eglTerminate`.
+
+### Added
+
+- `test_probe_then_create_gl_context` — validates that `probe_egl_displays()`
+  populates the shared display and subsequent `GLProcessorThreaded::new()`
+  reuses it.
+
+- Un-ignored `test_opengl_10_threads` — the shared display fix eliminates
+  the Vivante galcore deadlock that caused the hang.
+
 ## [0.15.1] - 2026-03-31
 
 ### Fixed
