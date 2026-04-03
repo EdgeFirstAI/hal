@@ -759,6 +759,7 @@ impl PyTensor {
     /// (≥256 KiB) are parallelized automatically.
     ///
     /// Raises ``RuntimeError`` on dtype mismatch or element-count mismatch.
+    #[allow(clippy::wrong_self_convention)]
     fn from_numpy(&mut self, src: &Bound<'_, pyo3::types::PyAny>) -> Result<()> {
         copy_numpy_to_tensor_dyn(src, &self.0)
     }
