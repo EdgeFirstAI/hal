@@ -502,27 +502,36 @@ fn run_hires_configs(
 fn bench_import(proc: &ImageProcessor, suite: &mut BenchSuite) {
     println!("\n== Import: import_image from DMA-BUF ==\n");
 
-    if !common::dma_available() {
-        println!("  Skipping import benchmarks: DMA not available");
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (proc, suite);
+        println!("  Skipping import benchmarks: DMA-BUF is Linux-only");
         return;
     }
 
-    let configs: &[(usize, usize, PixelFormat, &str)] = &[
-        (1920, 1080, PixelFormat::Rgba, "import/rgba/1080p"),
-        (1920, 1080, PixelFormat::Nv12, "import/nv12/1080p"),
-        (3840, 2160, PixelFormat::Rgba, "import/rgba/4k"),
-    ];
+    #[cfg(target_os = "linux")]
+    {
+        if !common::dma_available() {
+            println!("  Skipping import benchmarks: DMA not available");
+            return;
+        }
 
-    for &(w, h, fmt, name) in configs {
-        // Allocate a DMA-backed tensor to obtain a valid DMA-BUF fd.
-        let Ok(src_tensor) = TensorDyn::image(w, h, fmt, DType::U8, Some(TensorMemory::Dma)) else {
-            println!("  {:50} [skipped: DMA allocation failed]", name);
-            continue;
-        };
+        let configs: &[(usize, usize, PixelFormat, &str)] = &[
+            (1920, 1080, PixelFormat::Rgba, "import/rgba/1080p"),
+            (1920, 1080, PixelFormat::Nv12, "import/nv12/1080p"),
+            (3840, 2160, PixelFormat::Rgba, "import/rgba/4k"),
+        ];
 
-        // Pre-flight: verify import_image works with this configuration.
-        {
-            #[cfg(unix)]
+        for &(w, h, fmt, name) in configs {
+            // Allocate a DMA-backed tensor to obtain a valid DMA-BUF fd.
+            let Ok(src_tensor) =
+                TensorDyn::image(w, h, fmt, DType::U8, Some(TensorMemory::Dma))
+            else {
+                println!("  {:50} [skipped: DMA allocation failed]", name);
+                continue;
+            };
+
+            // Pre-flight: verify import_image works with this configuration.
             {
                 use edgefirst_tensor::PlaneDescriptor;
 
@@ -533,22 +542,14 @@ fn bench_import(proc: &ImageProcessor, suite: &mut BenchSuite) {
                     continue;
                 }
             }
-            #[cfg(not(unix))]
-            {
-                println!("  {:50} [skipped: not unix]", name);
-                continue;
-            }
-        }
 
-        let throughput = match fmt {
-            PixelFormat::Nv12 => (w * h * 3 / 2) as u64,
-            PixelFormat::Rgba => (w * h * 4) as u64,
-            _ => (w * h) as u64,
-        };
+            let throughput = match fmt {
+                PixelFormat::Nv12 => (w * h * 3 / 2) as u64,
+                PixelFormat::Rgba => (w * h * 4) as u64,
+                _ => (w * h) as u64,
+            };
 
-        let result = run_bench(name, WARMUP, ITERATIONS, || {
-            #[cfg(unix)]
-            {
+            let result = run_bench(name, WARMUP, ITERATIONS, || {
                 use edgefirst_tensor::PlaneDescriptor;
 
                 let fd = src_tensor.dmabuf().expect("dmabuf fd");
@@ -557,10 +558,10 @@ fn bench_import(proc: &ImageProcessor, suite: &mut BenchSuite) {
                     .import_image(pd, None, w, h, fmt, DType::U8)
                     .expect("import_image failed");
                 std::hint::black_box(img);
-            }
-        });
-        result.print_summary_with_throughput(throughput);
-        suite.record(&result);
+            });
+            result.print_summary_with_throughput(throughput);
+            suite.record(&result);
+        }
     }
 }
 
