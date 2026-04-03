@@ -24,7 +24,7 @@ use common::{find_testdata_path, format_name, get_test_data, run_bench, BenchCon
 use edgefirst_bench::BenchSuite;
 
 use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rotation};
-use edgefirst_tensor::{DType, PixelFormat, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait};
+use edgefirst_tensor::{DType, PixelFormat, TensorMapTrait, TensorMemory, TensorTrait};
 
 const WARMUP: usize = 10;
 const ITERATIONS: usize = 100;
@@ -506,11 +506,12 @@ fn bench_import(proc: &ImageProcessor, suite: &mut BenchSuite) {
     {
         let _ = (proc, suite);
         println!("  Skipping import benchmarks: DMA-BUF is Linux-only");
-        return;
     }
 
     #[cfg(target_os = "linux")]
     {
+        use edgefirst_tensor::{PlaneDescriptor, TensorDyn};
+
         if !common::dma_available() {
             println!("  Skipping import benchmarks: DMA not available");
             return;
@@ -532,15 +533,11 @@ fn bench_import(proc: &ImageProcessor, suite: &mut BenchSuite) {
             };
 
             // Pre-flight: verify import_image works with this configuration.
-            {
-                use edgefirst_tensor::PlaneDescriptor;
-
-                let fd = src_tensor.dmabuf().expect("dmabuf fd");
-                let pd = PlaneDescriptor::new(fd).expect("PlaneDescriptor");
-                if let Err(e) = proc.import_image(pd, None, w, h, fmt, DType::U8) {
-                    println!("  {:50} [unsupported: {}]", name, e);
-                    continue;
-                }
+            let fd = src_tensor.dmabuf().expect("dmabuf fd");
+            let pd = PlaneDescriptor::new(fd).expect("PlaneDescriptor");
+            if let Err(e) = proc.import_image(pd, None, w, h, fmt, DType::U8) {
+                println!("  {:50} [unsupported: {}]", name, e);
+                continue;
             }
 
             let throughput = match fmt {
@@ -550,8 +547,6 @@ fn bench_import(proc: &ImageProcessor, suite: &mut BenchSuite) {
             };
 
             let result = run_bench(name, WARMUP, ITERATIONS, || {
-                use edgefirst_tensor::PlaneDescriptor;
-
                 let fd = src_tensor.dmabuf().expect("dmabuf fd");
                 let pd = PlaneDescriptor::new(fd).expect("PlaneDescriptor");
                 let img = proc

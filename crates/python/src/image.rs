@@ -17,7 +17,7 @@ use ndarray::{
     ArrayView1, ArrayView2, ArrayView3, ArrayViewMut3, Zip,
 };
 use numpy::{
-    PyArrayLike3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, PyReadwriteArray3,
+    PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, PyReadwriteArray3,
     PyUntypedArrayMethods,
 };
 use pyo3::prelude::*;
@@ -309,38 +309,6 @@ pub(crate) fn normalize_tensor_to_numpy(
             is_rgba,
         ),
     }
-}
-
-/// Copy data from a numpy array into a tensor.
-/// Called from PyTensor.copy_from_numpy() in tensor.rs.
-pub(crate) fn copy_numpy_to_tensor(tensor_dyn: &TensorDyn, src: PyArrayLike3<u8>) -> Result<()> {
-    let src = src.as_array();
-    let tensor_u8 = tensor_dyn
-        .as_u8()
-        .ok_or_else(|| Error::Format("Tensor is not U8".to_string()))?;
-    let w = tensor_u8
-        .width()
-        .ok_or_else(|| Error::Format("not an image".to_string()))?;
-    let h = tensor_u8
-        .height()
-        .ok_or_else(|| Error::Format("not an image".to_string()))?;
-    let fmt = tensor_u8
-        .format()
-        .ok_or_else(|| Error::Format("not an image".to_string()))?;
-    let shape = [h, w, fmt.channels()];
-    if src.shape() != shape {
-        return Err(Error::Format(format!(
-            "Shape Mismatch: Expected {:?} but got {:?}",
-            shape,
-            src.shape()
-        )));
-    }
-
-    let mut map = tensor_u8.map()?;
-    let data = map.as_mut_slice();
-    let mut ndarray = ArrayViewMut3::from_shape(shape, data)?;
-    ndarray.assign(&src);
-    Ok(())
 }
 
 #[inline(always)]
