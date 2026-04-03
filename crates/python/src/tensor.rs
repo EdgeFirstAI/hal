@@ -747,11 +747,6 @@ impl PyTensor {
     }
 
     /// Copy data from a numpy array into this tensor.
-    fn copy_from_numpy(&mut self, src: numpy::PyArrayLike3<u8>) -> Result<()> {
-        Ok(crate::image::copy_numpy_to_tensor(&self.0, src)?)
-    }
-
-    /// Copy data from a numpy array into this tensor.
     ///
     /// Accepts any numpy dtype as long as it matches the tensor's dtype.
     /// The total element count must match. Both contiguous and

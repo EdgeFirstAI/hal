@@ -849,25 +849,6 @@ class Tensor:
         """
         ...
 
-    def copy_from_numpy(self, src: npt.NDArray[np.uint8]) -> None:
-        """Copy data from a uint8 numpy array into this image tensor.
-
-        This is a convenience method for image tensors with pixel format
-        metadata. The numpy array must be ``uint8`` with shape
-        ``(height, width, channels)`` matching the tensor's format.
-
-        For general-purpose numpy-to-tensor copies with any dtype, use
-        :meth:`from_numpy` instead.
-
-        Args:
-            src: Source ``uint8`` numpy array with shape ``(H, W, C)``.
-
-        Raises:
-            RuntimeError: If the tensor is not a ``uint8`` image tensor,
-                or if the array shape does not match.
-        """
-        ...
-
     def from_numpy(self, src: npt.NDArray) -> None:
         """Copy data from a numpy array into this tensor.
 

@@ -93,6 +93,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dup returned by `.fd` after passing it to `from_fd()`, matching the
   caller-retains-ownership contract.
 
+### Removed
+
+- **`Tensor.copy_from_numpy()`** — removed in favor of `from_numpy()`,
+  which is a strict superset supporting all numeric dtypes, arbitrary
+  tensor shapes, strided arrays, and GIL-released parallel copies.
+
 ## [0.15.2] - 2026-04-01
 
 ### Fixed
