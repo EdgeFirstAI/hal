@@ -525,8 +525,7 @@ fn bench_import(proc: &ImageProcessor, suite: &mut BenchSuite) {
 
         for &(w, h, fmt, name) in configs {
             // Allocate a DMA-backed tensor to obtain a valid DMA-BUF fd.
-            let Ok(src_tensor) =
-                TensorDyn::image(w, h, fmt, DType::U8, Some(TensorMemory::Dma))
+            let Ok(src_tensor) = TensorDyn::image(w, h, fmt, DType::U8, Some(TensorMemory::Dma))
             else {
                 println!("  {:50} [skipped: DMA allocation failed]", name);
                 continue;

@@ -17,8 +17,7 @@ use ndarray::{
     ArrayView1, ArrayView2, ArrayView3, ArrayViewMut3, Zip,
 };
 use numpy::{
-    PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, PyReadwriteArray3,
-    PyUntypedArrayMethods,
+    PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, PyReadwriteArray3, PyUntypedArrayMethods,
 };
 use pyo3::prelude::*;
 use std::{
