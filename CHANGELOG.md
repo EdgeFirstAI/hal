@@ -5,7 +5,99 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.16.0] - 2026-04-02
+
+### Changed
+
+- **Test parametrization overhaul (EDGEAI-1219)** — consolidated
+  repetitive test code via macros and parametrize decorators while
+  expanding coverage:
+  - Decoder: 16 tracked segdet tests collapsed into two macro families
+    (`real_data_tracked_test!`, `e2e_tracked_test!`), ~950 line reduction.
+  - Python: 10 dtype tests replaced with single `@pytest.mark.parametrize`
+    `test_dtype` function, ~250 line reduction.
+  - C API tests integrated into `make test` via new `test-capi` target.
+
+### Added
+
+- **`Tensor.from_numpy()` method** — type-safe copy from any numpy array
+  into a HAL tensor. Accepts all numeric dtypes (uint8 through float64
+  and float16). Supports contiguous, strided, and negative-stride arrays
+  with three optimized copy paths:
+  1. Fully contiguous → `copy_from_slice` (memcpy).
+  2. Strided outer with contiguous inner rows → row-by-row memcpy with
+     O(n_rows) stride-computed offsets (no element iteration).
+  3. Fully strided → per-element copy via ndarray iterator.
+  All paths release the GIL and parallelize via rayon above 256 KiB.
+
+- **Tracker benchmark** — `crates/tracker/benches/tracker_benchmark.rs`
+  measuring ByteTrack update latency (1/10/50/100 detections),
+  100-frame warm-state scenario, and isolated Kalman predict/update.
+
+- **import\_image benchmark** — DMA-BUF import at 1080p/4K resolutions
+  for RGBA and NV12 formats. Skips gracefully on non-DMA platforms.
+
+- **PlaneDescriptor stride/offset tests** — import\_image with padded
+  stride, aligned stride, NV12 multiplane with offset, stride-too-small
+  error case. All DMA-gated.
+
+- **Python mask rendering tests** — `draw_decoded_masks` with empty
+  input, multiple boxes, `ColorMode.Instance`, opacity scaling, and
+  `draw_masks` fused decode+render path.
+
+- **Error Display tests** — `TensorError`, `ImageError`, `DecoderError`
+  Display formatting verified for all constructible variants.
+
+- **Tracker test expansion** — 14 → 38 unit tests. New coverage for
+  ByteTrack two-stage matching, builder method effects, degenerate
+  inputs, 100-detection scaling. Kalman filter prediction accuracy,
+  numerical stability (1000 cycles), gating distance edge cases.
+
+- **MemTensor and ShmTensor unit tests** — both had zero tests. Added
+  new/map/reshape/error-path tests for MemTensor and
+  new/map/from_fd-roundtrip/reshape tests for ShmTensor.
+
+- **VYUY and NV16 format conversion tests** — added VYUY→Grey,
+  VYUY→PlanarRgb, VYUY→NV16, NV16→RGB, NV16→RGBA via existing
+  `generate_conversion_tests!` macro.
+
+- **Dequantization ground truth test** — `test_dequant_ground_truth`
+  verifies `dequantize_cpu` and `dequantize_cpu_chunked` against
+  hand-computed expected values for four (scale, zero_point) combinations
+  including i8 boundary values.
+
+### Fixed
+
+- **Python `Tensor.from_fd()` double-close bug** — `from_fd` used
+  `OwnedFd::from_raw_fd()` which took ownership of the caller's fd. If
+  Python code called `os.close(fd)` afterward (the natural pattern), it
+  triggered a double-close; if the fd number was reused before the tensor
+  was dropped, the tensor would close an unrelated fd. Now dups the fd at
+  the FFI boundary via `BorrowedFd::borrow_raw()` +
+  `try_clone_to_owned()`, matching the contract already used by
+  `import_image` (Python) and `hal_tensor_from_fd` (C API). Updated
+  `.pyi` stub to document the caller-retains-ownership contract.
+
+- **Unstable zero-copy perf assertions** — `test_dma_zero_copy_perf`
+  and `test_shm_zero_copy_perf` increased to 50 iterations with 1ms
+  noise floor and 1.5× margin to prevent flaky failures on fast
+  hardware.
+
+- **Python `.pyi` stub missing from PyPI wheels** — the type stub file
+  was excluded from wheels built with `maturin --sdist` because the
+  sdist did not include it. Added explicit `[tool.maturin] include` for
+  the `.pyi` file. Also fixed a README conflict in the sdist by
+  overriding the workspace readme with the crate-local one.
+
+- **fd leak in `from_fd` test** — `tensor_from_fd_func` now closes the
+  dup returned by `.fd` after passing it to `from_fd()`, matching the
+  caller-retains-ownership contract.
+
+### Removed
+
+- **`Tensor.copy_from_numpy()`** — removed in favor of `from_numpy()`,
+  which is a strict superset supporting all numeric dtypes, arbitrary
+  tensor shapes, strided arrays, and GIL-released parallel copies.
 
 ## [0.15.2] - 2026-04-01
 
