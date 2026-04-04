@@ -17,13 +17,14 @@ This guide consolidates all testing information for the EdgeFirst HAL project. T
 
 | Makefile Target  | What It Does                                              |
 |------------------|-----------------------------------------------------------|
-| `make test`      | Run all tests (Rust + Python) with coverage               |
-| `make test-rust` | Run Rust tests only with `cargo-llvm-cov nextest`         |
+| `make test`        | Run all tests (Rust + Python + C API) with coverage       |
+| `make test-rust`   | Run Rust tests only with `cargo-llvm-cov nextest`         |
 | `make test-python` | Run Python tests only with pytest (and slipcover if available) |
-| `make bench`     | Run Rust criterion benchmarks                             |
-| `make build`     | Build with coverage instrumentation (profiling profile)   |
+| `make test-capi`   | Build the C library and run C API integration tests       |
+| `make bench`       | Run Rust criterion benchmarks                             |
+| `make build`       | Build with coverage instrumentation (profiling profile)   |
 
-C API tests are built and run separately from `crates/capi/tests/` using their own Makefile.
+C API tests are also available individually from `crates/capi/tests/` using their own Makefile.
 
 ---
 
@@ -189,7 +190,7 @@ This constraint applies to CI (`test.yml`), the Makefile, and local development.
 ### Native Development (x86_64)
 
 ```bash
-# 1. Run the full test suite (Rust + Python) with coverage
+# 1. Run the full test suite (Rust + Python + C API) with coverage
 make test
 
 # 2. Run Rust tests only

@@ -622,8 +622,8 @@ class Tensor:
         Inspects the file descriptor to determine the appropriate tensor type
         (DMA or SHM) based on the device major and minor numbers.
 
-        This will take ownership of the file descriptor, and the file descriptor will 
-        be closed when the tensor is dropped.
+        The fd is ``dup()``'d immediately — the caller retains ownership
+        of the original fd and must close it when done.
         """
 
         @property
@@ -729,8 +729,42 @@ class Tensor:
             """
             ...
 
-    def map(self) -> TensorMap: ...
-    """Returns a mapped view of the tensor data for direct access."""
+    def map(self) -> TensorMap:
+        """Map the tensor's memory for direct read/write access.
+
+        Returns a ``TensorMap`` context manager that exposes the raw buffer.
+        Use with a ``with`` statement to ensure the mapping is released.
+
+        Example — write a numpy array into a tensor::
+
+            import numpy as np
+            from edgefirst_hal import Tensor
+
+            tensor = Tensor([480, 640, 3], dtype="float32")
+            data = np.random.rand(480, 640, 3).astype(np.float32)
+
+            with tensor.map() as m:
+                # Wrap the raw buffer as a numpy array and copy into it
+                dst = np.frombuffer(m.view(), dtype=np.float32)
+                dst = dst.reshape(tensor.shape)
+                dst[:] = data
+
+        Example — read tensor data as numpy::
+
+            with tensor.map() as m:
+                arr = np.frombuffer(m.view(), dtype=np.float32)
+                arr = arr.reshape(tensor.shape)
+                print(arr.mean())
+
+        .. tip::
+
+            For bulk numpy-to-tensor copies, prefer :meth:`from_numpy` which
+            validates dtypes and handles the mapping internally.
+
+        Raises:
+            BufferError: If the tensor is already mapped or has been unmapped.
+        """
+        ...
 
     @staticmethod
     def image(
@@ -815,14 +849,47 @@ class Tensor:
         """
         ...
 
-    def copy_from_numpy(self, src: npt.NDArray[np.uint8]) -> None:
+    def from_numpy(self, src: npt.NDArray) -> None:
         """Copy data from a numpy array into this tensor.
 
-        The shape and data type of the numpy array must match the tensor's
-        format.
+        Accepts any numpy dtype as long as it matches the tensor's dtype.
+        The total number of elements must match. Both contiguous and
+        non-contiguous (strided) arrays are supported:
+
+        - **Contiguous arrays** use a direct memcpy (fastest).
+        - **Non-contiguous arrays** (slices, transposes) are copied
+          element-wise via the array's stride metadata.
+        - **Large copies** (≥256 KiB) are parallelized automatically.
+
+        Example::
+
+            import numpy as np
+            from edgefirst_hal import Tensor
+
+            # float32 model output → float32 tensor
+            tensor = Tensor([1, 10, 6], dtype="float32")
+            output = model.run(input_data)  # returns np.float32 array
+            tensor.from_numpy(output.reshape(1, 10, 6))
+
+            # uint8 image → uint8 tensor
+            tensor = Tensor([480, 640, 3], dtype="uint8")
+            image = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+            tensor.from_numpy(image)
+
+            # Non-contiguous slice — works without ascontiguousarray()
+            big = np.zeros((1000, 1000), dtype=np.float32)
+            tensor = Tensor([500, 500], dtype="float32")
+            tensor.from_numpy(big[:500, :500])
 
         Args:
-            src: Source numpy array.
+            src: Source numpy array. The dtype must match the tensor's
+                dtype (e.g. ``float32`` tensor requires ``np.float32``).
+                Total element count must match. Contiguous and strided
+                layouts are both accepted.
+
+        Raises:
+            RuntimeError: If the numpy dtype does not match the tensor
+                dtype, or the element count differs.
         """
         ...
 

@@ -6,7 +6,7 @@ use std::fmt::Debug;
 pub use uuid::Uuid;
 pub mod bytetrack;
 pub use bytetrack::{ByteTrack, ByteTrackBuilder};
-mod kalman;
+pub mod kalman;
 
 pub trait DetectionBox: Debug + Clone {
     fn bbox(&self) -> [f32; 4];
@@ -21,6 +21,13 @@ pub struct MockDetection {
     bbox: [f32; 4],
     score: f32,
     label: usize,
+}
+
+impl MockDetection {
+    /// Creates a new mock detection with the given bounding box, score, and label.
+    pub fn new(bbox: [f32; 4], score: f32, label: usize) -> Self {
+        Self { bbox, score, label }
+    }
 }
 
 impl DetectionBox for MockDetection {

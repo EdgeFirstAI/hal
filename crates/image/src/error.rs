@@ -162,3 +162,126 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_image_error_display() {
+        let e = Error::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "file missing",
+        ));
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("Io") && msg.contains("file missing"),
+            "unexpected Io message: {msg}"
+        );
+
+        let e = Error::NotFound("texture.png".to_string());
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("NotFound") && msg.contains("texture.png"),
+            "unexpected NotFound message: {msg}"
+        );
+
+        let e = Error::Tensor(edgefirst_tensor::Error::InvalidSize(42));
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("Tensor") && msg.contains("InvalidSize"),
+            "unexpected Tensor message: {msg}"
+        );
+
+        let e = Error::NotImplemented("webp".to_string());
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("NotImplemented") && msg.contains("webp"),
+            "unexpected NotImplemented message: {msg}"
+        );
+
+        let e = Error::NotSupported("bmp format".to_string());
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("NotSupported") && msg.contains("bmp format"),
+            "unexpected NotSupported message: {msg}"
+        );
+
+        let e = Error::InvalidShape("wrong dims".to_string());
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("InvalidShape") && msg.contains("wrong dims"),
+            "unexpected InvalidShape message: {msg}"
+        );
+
+        let e = Error::GLVersion("4.5 required".to_string());
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("GLVersion") && msg.contains("4.5 required"),
+            "unexpected GLVersion message: {msg}"
+        );
+
+        let e = Error::OpenGl("shader compile failed".to_string());
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("OpenGl") && msg.contains("shader compile failed"),
+            "unexpected OpenGl message: {msg}"
+        );
+
+        let e = Error::Internal("unexpected state".to_string());
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("Internal") && msg.contains("unexpected state"),
+            "unexpected Internal message: {msg}"
+        );
+
+        let e = Error::CropInvalid("out of bounds".to_string());
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("CropInvalid") && msg.contains("out of bounds"),
+            "unexpected CropInvalid message: {msg}"
+        );
+
+        let e = Error::ForcedBackendUnavailable("g2d".to_string());
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("ForcedBackendUnavailable") && msg.contains("g2d"),
+            "unexpected ForcedBackendUnavailable message: {msg}"
+        );
+
+        let e = Error::NoConverter;
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("NoConverter"),
+            "unexpected NoConverter message: {msg}"
+        );
+
+        let e = Error::NotAnImage;
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("NotAnImage"),
+            "unexpected NotAnImage message: {msg}"
+        );
+
+        let e = Error::UnsupportedFormat("tiff".to_string());
+        let msg = e.to_string();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("UnsupportedFormat") && msg.contains("tiff"),
+            "unexpected UnsupportedFormat message: {msg}"
+        );
+    }
+}

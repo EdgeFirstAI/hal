@@ -22,7 +22,7 @@
 # - actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 (v4)
 # - dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b (stable)
 # - Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 (v2.8.2)
-# - taiki-e/install-action@493d7f216ecab2af0602481ce809ab2c72836fa1 (v2.62.62)
+# - taiki-e/install-action@d858f8113943481093e02986a7586a4819a3bfd6 (v2.71.2)
 # - SonarSource/sonarqube-scan-action@fd88b7d7ccbaefd23d8f36f73b59db7a3d246602 (v6.0.0)
 # - EnricoMi/publish-unit-test-result-action@34d7c956a59aed1bfebf31df77b8de55db9bbaaf (v2.21.0)
 #
@@ -187,7 +187,7 @@ jobs:
           cache-on-failure: true
 
       - name: Install cargo tools
-        uses: taiki-e/install-action@493d7f216ecab2af0602481ce809ab2c72836fa1  # v2.62.62
+        uses: taiki-e/install-action@d858f8113943481093e02986a7586a4819a3bfd6  # v2.71.2
         with:
           tool: cargo-llvm-cov@0.6.16,cargo-nextest
 
@@ -328,7 +328,7 @@ jobs:
           cache-on-failure: true
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@493d7f216ecab2af0602481ce809ab2c72836fa1  # v2.62.62
+        uses: taiki-e/install-action@d858f8113943481093e02986a7586a4819a3bfd6  # v2.71.2
         with:
           tool: cargo-nextest
 
@@ -424,7 +424,7 @@ jobs:
           cache-on-failure: true
 
       - name: Install cargo tools
-        uses: taiki-e/install-action@493d7f216ecab2af0602481ce809ab2c72836fa1  # v2.62.62
+        uses: taiki-e/install-action@d858f8113943481093e02986a7586a4819a3bfd6  # v2.71.2
         with:
           tool: cargo-llvm-cov@0.6.16,cargo-nextest
 

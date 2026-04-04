@@ -147,7 +147,7 @@ build-python:
 # ===========================================================================
 
 .PHONY: test
-test: test-rust test-python
+test: test-rust test-python test-capi
 	@echo ""
 	@echo "=================================================="
 	@echo "✓ All tests passed"
@@ -193,6 +193,13 @@ test-python:
 		python -m pytest $(TEST_DIR); \
 	fi
 	@echo "✓ Python tests passed"
+
+.PHONY: test-capi
+test-capi:
+	@echo "Running C API tests..."
+	@cargo build --release -p edgefirst-hal-capi
+	@$(MAKE) -C crates/capi/tests test
+	@echo "✓ C API tests passed"
 
 .PHONY: bench
 bench:
