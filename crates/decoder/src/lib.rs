@@ -2838,12 +2838,6 @@ mod decoder_tests {
         assert_eq!(decoder.normalized_boxes(), None);
     }
 
-    // ─── real-data test macro ────────────────────────────
-    //
-    // Generates tests that load i8 binary test data from testdata/ and
-    // exercise all (quant/float) × (combined/split) × (masks/proto)
-    // decoder paths.
-
     pub fn quantize_ndarray<T: PrimInt + 'static, D: Dimension, F: Float + AsPrimitive<T>>(
         input: ArrayView<F, D>,
         quant: Quantization,
@@ -2969,13 +2963,12 @@ mod decoder_tests {
             .unwrap()
     }
 
-    macro_rules! real_data_test {
-        ($name:ident, quantized, $layout:ident, $output:ident) => {
+    macro_rules! real_data_proto_test {
+        ($name:ident, quantized, $layout:ident) => {
             #[test]
             fn $name() {
                 use crate::configs::Nms;
                 let is_split = matches!(stringify!($layout), "split");
-                let is_proto = matches!(stringify!($output), "proto");
 
                 let score_threshold = 0.45;
                 let iou_threshold = 0.45;
@@ -3028,52 +3021,30 @@ mod decoder_tests {
                 let expected = real_data_expected_boxes();
                 let mut output_boxes = Vec::with_capacity(50);
 
-                if is_proto {
-                    let inputs: Vec<crate::decoder::ArrayViewDQuantized<'_>> = if is_split {
-                        vec![
-                            boxes_split.view().into(),
-                            scores_split.view().into(),
-                            mask_split.view().into(),
-                            protos_i8.view().into(),
-                        ]
-                    } else {
-                        vec![boxes_combined.view().into(), protos_i8.view().into()]
-                    };
-                    decoder
-                        .decode_quantized_proto(&inputs, &mut output_boxes)
-                        .unwrap();
-
-                    assert_eq!(output_boxes.len(), 2);
-                    assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
-                    assert!(output_boxes[1].equal_within_delta(&expected[1], 1.0 / 160.0));
+                let inputs: Vec<crate::decoder::ArrayViewDQuantized<'_>> = if is_split {
+                    vec![
+                        boxes_split.view().into(),
+                        scores_split.view().into(),
+                        mask_split.view().into(),
+                        protos_i8.view().into(),
+                    ]
                 } else {
-                    let mut output_masks = Vec::with_capacity(50);
-                    let inputs: Vec<crate::decoder::ArrayViewDQuantized<'_>> = if is_split {
-                        vec![
-                            boxes_split.view().into(),
-                            scores_split.view().into(),
-                            mask_split.view().into(),
-                            protos_i8.view().into(),
-                        ]
-                    } else {
-                        vec![boxes_combined.view().into(), protos_i8.view().into()]
-                    };
-                    decoder
-                        .decode_quantized(&inputs, &mut output_boxes, &mut output_masks)
-                        .unwrap();
+                    vec![boxes_combined.view().into(), protos_i8.view().into()]
+                };
+                decoder
+                    .decode_quantized_proto(&inputs, &mut output_boxes)
+                    .unwrap();
 
-                    assert_eq!(output_boxes.len(), 2);
-                    assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
-                    assert!(output_boxes[1].equal_within_delta(&expected[1], 1.0 / 160.0));
-                }
+                assert_eq!(output_boxes.len(), 2);
+                assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+                assert!(output_boxes[1].equal_within_delta(&expected[1], 1.0 / 160.0));
             }
         };
-        ($name:ident, float, $layout:ident, $output:ident) => {
+        ($name:ident, float, $layout:ident) => {
             #[test]
             fn $name() {
                 use crate::configs::Nms;
                 let is_split = matches!(stringify!($layout), "split");
-                let is_proto = matches!(stringify!($output), "proto");
 
                 let score_threshold = 0.45;
                 let iou_threshold = 0.45;
@@ -3130,58 +3101,34 @@ mod decoder_tests {
                 let expected = real_data_expected_boxes();
                 let mut output_boxes = Vec::with_capacity(50);
 
-                if is_proto {
-                    let inputs = if is_split {
-                        vec![
-                            boxes_split.view().into_dyn(),
-                            scores_split.view().into_dyn(),
-                            mask_split.view().into_dyn(),
-                            protos_f32.view().into_dyn(),
-                        ]
-                    } else {
-                        vec![
-                            boxes_combined.view().into_dyn(),
-                            protos_f32.view().into_dyn(),
-                        ]
-                    };
-                    decoder
-                        .decode_float_proto(&inputs, &mut output_boxes)
-                        .unwrap();
-
-                    assert_eq!(output_boxes.len(), 2);
-                    assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
-                    assert!(output_boxes[1].equal_within_delta(&expected[1], 1.0 / 160.0));
+                let inputs = if is_split {
+                    vec![
+                        boxes_split.view().into_dyn(),
+                        scores_split.view().into_dyn(),
+                        mask_split.view().into_dyn(),
+                        protos_f32.view().into_dyn(),
+                    ]
                 } else {
-                    let mut output_masks = Vec::with_capacity(50);
-                    let inputs = if is_split {
-                        vec![
-                            boxes_split.view().into_dyn(),
-                            scores_split.view().into_dyn(),
-                            mask_split.view().into_dyn(),
-                            protos_f32.view().into_dyn(),
-                        ]
-                    } else {
-                        vec![
-                            boxes_combined.view().into_dyn(),
-                            protos_f32.view().into_dyn(),
-                        ]
-                    };
-                    decoder
-                        .decode_float(&inputs, &mut output_boxes, &mut output_masks)
-                        .unwrap();
+                    vec![
+                        boxes_combined.view().into_dyn(),
+                        protos_f32.view().into_dyn(),
+                    ]
+                };
+                decoder
+                    .decode_float_proto(&inputs, &mut output_boxes)
+                    .unwrap();
 
-                    assert_eq!(output_boxes.len(), 2);
-                    assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
-                    assert!(output_boxes[1].equal_within_delta(&expected[1], 1.0 / 160.0));
-                }
+                assert_eq!(output_boxes.len(), 2);
+                assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+                assert!(output_boxes[1].equal_within_delta(&expected[1], 1.0 / 160.0));
             }
         };
     }
 
-    // ─── End-to-end test macro ────────────────────────────
-    //
-    // Generates tests with synthetic data to exercise all
-    // decode paths without needing real model output files.
+    real_data_proto_test!(test_decoder_segdet_proto, quantized, combined);
+    real_data_proto_test!(test_decoder_segdet_proto_float, float, combined);
+    real_data_proto_test!(test_decoder_segdet_split_proto, quantized, split);
+    real_data_proto_test!(test_decoder_segdet_split_proto_float, float, split);
 
     const E2E_COMBINED_DET_CONFIG: &str = "
 decoder_version: yolo26
@@ -3531,15 +3478,6 @@ outputs:
             }
         };
     }
-
-    real_data_test!(test_decoder_segdet, quantized, combined, masks);
-    real_data_test!(test_decoder_segdet_float, float, combined, masks);
-    real_data_test!(test_decoder_segdet_proto, quantized, combined, proto);
-    real_data_test!(test_decoder_segdet_proto_float, float, combined, proto);
-    real_data_test!(test_decoder_segdet_split, quantized, split, masks);
-    real_data_test!(test_decoder_segdet_split_float, float, split, masks);
-    real_data_test!(test_decoder_segdet_split_proto, quantized, split, proto);
-    real_data_test!(test_decoder_segdet_split_proto_float, float, split, proto);
 
     e2e_segdet_test!(test_decoder_end_to_end_segdet, quantized, combined, masks);
     e2e_segdet_test!(test_decoder_end_to_end_segdet_float, float, combined, masks);
