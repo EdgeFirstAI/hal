@@ -431,9 +431,9 @@ where
 /// Decodes split end-to-end YOLO detection outputs (post-NMS from model).
 ///
 /// Input shapes (after batch dim removed):
-/// - boxes: (N, 4) — xyxy pixel coordinates
-/// - scores: (N, 1) — confidence of the top class
-/// - classes: (N, 1) — class index of the top class
+/// - boxes: (4, N) — xyxy pixel coordinates
+/// - scores: (1, N) — confidence of the top class
+/// - classes: (1, N) — class index of the top class
 ///
 /// Boxes are output directly without NMS (model already applied NMS).
 pub fn decode_yolo_split_end_to_end_det_float<T: Float + AsPrimitive<f32>>(
@@ -443,14 +443,17 @@ pub fn decode_yolo_split_end_to_end_det_float<T: Float + AsPrimitive<f32>>(
     score_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
 ) -> Result<(), crate::DecoderError> {
-    let n = boxes.shape()[0];
-    if boxes.shape()[1] != 4 {
+    let n = boxes.shape()[1];
+    if boxes.shape()[0] != 4 {
         return Err(crate::DecoderError::InvalidShape(format!(
-            "Split end-to-end boxes must have 4 columns, got {}",
-            boxes.shape()[1]
+            "Split end-to-end boxes must have 4 rows, got {}",
+            boxes.shape()[0]
         )));
     }
     output_boxes.clear();
+
+    let (boxes, scores, classes) = postprocess_yolo_split_end_to_end_det(boxes, scores, &classes)?;
+
     for i in 0..n {
         let score: f32 = scores[[i, 0]].as_();
         if score < score_threshold {
@@ -467,7 +470,7 @@ pub fn decode_yolo_split_end_to_end_det_float<T: Float + AsPrimitive<f32>>(
                 ymax: boxes[[i, 3]].as_(),
             },
             score,
-            label: classes[[i, 0]].as_() as usize,
+            label: classes[i].as_() as usize,
         });
     }
     Ok(())
@@ -546,6 +549,35 @@ pub(crate) fn postprocess_yolo_end_to_end_segdet<'a, T>(
     Ok((boxes, scores, classes, mask_coeff))
 }
 
+/// Postprocess yolo split end to end segdet by reversing axes of boxes,
+/// scores, and flattening the class tensor.
+#[allow(clippy::type_complexity)]
+pub(crate) fn postprocess_yolo_split_end_to_end_det<'a, 'b, 'c, BOXES, SCORES, CLASS>(
+    boxes: ArrayView2<'a, BOXES>,
+    scores: ArrayView2<'b, SCORES>,
+    classes: &'c ArrayView2<CLASS>,
+) -> Result<
+    (
+        ArrayView2<'a, BOXES>,
+        ArrayView2<'b, SCORES>,
+        ArrayView1<'c, CLASS>,
+    ),
+    crate::DecoderError,
+> {
+    if boxes.shape()[0] != 4 {
+        return Err(crate::DecoderError::InvalidShape(format!(
+            "Split end-to-end boxes must have 4 columns, got {}",
+            boxes.shape()[0]
+        )));
+    }
+    let boxes = boxes.reversed_axes();
+    let scores = scores.reversed_axes();
+    let classes = classes.slice(s![0, ..]);
+    Ok((boxes, scores, classes))
+}
+
+/// Postprocess yolo split end to end segdet by reversing axes of boxes,
+/// scores, mask tensors and flattening the class tensor.
 #[allow(clippy::type_complexity)]
 pub(crate) fn postprocess_yolo_split_end_to_end_segdet<
     'a,
