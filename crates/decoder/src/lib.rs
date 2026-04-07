@@ -733,6 +733,7 @@ mod decoder_tests {
         },
         *,
     };
+    use edgefirst_tensor::{Tensor, TensorMapTrait, TensorTrait};
     use ndarray::Dimension;
     use ndarray::{array, s, Array2, Array3, Array4, Axis};
     use ndarray_stats::DeviationExt;
@@ -3653,6 +3654,201 @@ outputs:
     e2e_det_test!(test_decoder_end_to_end_combined_det_float, float, combined);
     e2e_det_test!(test_decoder_end_to_end_split_det, quantized, split);
     e2e_det_test!(test_decoder_end_to_end_split_det_float, float, split);
+
+    #[test]
+    fn test_decode_tensor() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+
+        let raw_boxes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_boxes_116x8400.bin"
+        ));
+        let raw_boxes =
+            unsafe { std::slice::from_raw_parts(raw_boxes.as_ptr() as *const i8, raw_boxes.len()) };
+        let boxes_i8: Tensor<i8> = Tensor::new(&[1, 116, 8400], None, None).unwrap();
+        boxes_i8
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(raw_boxes);
+        let boxes_i8 = boxes_i8.into();
+
+        let raw_protos = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_protos_160x160x32.bin"
+        ));
+        let raw_protos = unsafe {
+            std::slice::from_raw_parts(raw_protos.as_ptr() as *const i8, raw_protos.len())
+        };
+        let protos_i8: Tensor<i8> = Tensor::new(&[1, 160, 160, 32], None, None).unwrap();
+        protos_i8
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(raw_protos);
+        let protos_i8 = protos_i8.into();
+
+        let config_yaml = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_seg.yaml"
+        ));
+        let decoder = DecoderBuilder::default()
+            .with_config_yaml_str(config_yaml.to_string())
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .build()
+            .unwrap();
+
+        let expected = real_data_expected_boxes();
+        let mut output_boxes = Vec::with_capacity(50);
+
+        decoder
+            .decode(&[&boxes_i8, &protos_i8], &mut output_boxes, &mut Vec::new())
+            .unwrap();
+
+        assert_eq!(output_boxes.len(), 2);
+        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+        assert!(output_boxes[1].equal_within_delta(&expected[1], 1.0 / 160.0));
+    }
+
+    #[test]
+    fn test_decode_tensor_f32() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+
+        let quant_boxes = (0.021287762_f32, 31_i32);
+        let quant_protos = (0.02491162_f32, -117_i32);
+        let raw_boxes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_boxes_116x8400.bin"
+        ));
+        let raw_boxes =
+            unsafe { std::slice::from_raw_parts(raw_boxes.as_ptr() as *const i8, raw_boxes.len()) };
+        let mut raw_boxes_f32 = vec![0f32; raw_boxes.len()];
+        dequantize_cpu(raw_boxes, quant_boxes.into(), &mut raw_boxes_f32);
+        let boxes_f32: Tensor<f32> = Tensor::new(&[1, 116, 8400], None, None).unwrap();
+        boxes_f32
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(&raw_boxes_f32);
+        let boxes_f32 = boxes_f32.into();
+
+        let raw_protos = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_protos_160x160x32.bin"
+        ));
+        let raw_protos = unsafe {
+            std::slice::from_raw_parts(raw_protos.as_ptr() as *const i8, raw_protos.len())
+        };
+        let mut raw_protos_f32 = vec![0f32; raw_protos.len()];
+        dequantize_cpu(raw_protos, quant_protos.into(), &mut raw_protos_f32);
+        let protos_f32: Tensor<f32> = Tensor::new(&[1, 160, 160, 32], None, None).unwrap();
+        protos_f32
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(&raw_protos_f32);
+        let protos_f32 = protos_f32.into();
+
+        let config_yaml = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_seg.yaml"
+        ));
+        let decoder = DecoderBuilder::default()
+            .with_config_yaml_str(config_yaml.to_string())
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .build()
+            .unwrap();
+
+        let expected = real_data_expected_boxes();
+        let mut output_boxes = Vec::with_capacity(50);
+
+        decoder
+            .decode(
+                &[&boxes_f32, &protos_f32],
+                &mut output_boxes,
+                &mut Vec::new(),
+            )
+            .unwrap();
+
+        assert_eq!(output_boxes.len(), 2);
+        println!("Output box 0: {:?}", output_boxes[0]);
+        println!("Expected box 0: {:?}", expected[0]);
+        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+        assert!(output_boxes[1].equal_within_delta(&expected[1], 1.0 / 160.0));
+    }
+
+    #[test]
+    fn test_decode_tensor_f64() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+
+        let quant_boxes = (0.021287762_f32, 31_i32);
+        let quant_protos = (0.02491162_f32, -117_i32);
+        let raw_boxes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_boxes_116x8400.bin"
+        ));
+        let raw_boxes =
+            unsafe { std::slice::from_raw_parts(raw_boxes.as_ptr() as *const i8, raw_boxes.len()) };
+        let mut raw_boxes_f64 = vec![0f64; raw_boxes.len()];
+        dequantize_cpu(raw_boxes, quant_boxes.into(), &mut raw_boxes_f64);
+        let boxes_f64: Tensor<f64> = Tensor::new(&[1, 116, 8400], None, None).unwrap();
+        boxes_f64
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(&raw_boxes_f64);
+        let boxes_f64 = boxes_f64.into();
+
+        let raw_protos = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_protos_160x160x32.bin"
+        ));
+        let raw_protos = unsafe {
+            std::slice::from_raw_parts(raw_protos.as_ptr() as *const i8, raw_protos.len())
+        };
+        let mut raw_protos_f64 = vec![0f64; raw_protos.len()];
+        dequantize_cpu(raw_protos, quant_protos.into(), &mut raw_protos_f64);
+        let protos_f64: Tensor<f64> = Tensor::new(&[1, 160, 160, 32], None, None).unwrap();
+        protos_f64
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(&raw_protos_f64);
+        let protos_f64 = protos_f64.into();
+
+        let config_yaml = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_seg.yaml"
+        ));
+        let decoder = DecoderBuilder::default()
+            .with_config_yaml_str(config_yaml.to_string())
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .build()
+            .unwrap();
+
+        let expected = real_data_expected_boxes();
+        let mut output_boxes = Vec::with_capacity(50);
+
+        decoder
+            .decode(
+                &[&boxes_f64, &protos_f64],
+                &mut output_boxes,
+                &mut Vec::new(),
+            )
+            .unwrap();
+
+        assert_eq!(output_boxes.len(), 2);
+        println!("Output box 0: {:?}", output_boxes[0]);
+        println!("Expected box 0: {:?}", expected[0]);
+        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+        assert!(output_boxes[1].equal_within_delta(&expected[1], 1.0 / 160.0));
+    }
 }
 
 #[cfg(feature = "tracker")]
