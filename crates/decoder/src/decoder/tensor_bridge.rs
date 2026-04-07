@@ -79,15 +79,20 @@ pub(super) fn map_tensors(outputs: &[&TensorDyn]) -> Result<MappedOutputs, Decod
         return Err(DecoderError::InvalidConfig("no outputs".to_string()));
     }
 
-    // Determine the category from the first tensor
-    let first_dtype = outputs[0].dtype();
-    let is_float = matches!(
-        first_dtype,
-        edgefirst_tensor::DType::F32 | edgefirst_tensor::DType::F64
-    );
+    // Determine the category
+    let mut float_dtype = None;
+    for &t in outputs {
+        if matches!(
+            t.dtype(),
+            edgefirst_tensor::DType::F32 | edgefirst_tensor::DType::F64
+        ) {
+            float_dtype = Some(t.dtype());
+            break;
+        }
+    }
 
-    if is_float {
-        map_float_tensors(outputs, first_dtype)
+    if let Some(float_dtype) = float_dtype {
+        map_float_tensors(outputs, float_dtype)
     } else {
         map_quantized_tensors(outputs)
     }
@@ -330,9 +335,18 @@ mod tensor_bridge_tests {
     fn test_map_tensors_f32_with_i32_skipped() {
         // Mixed f32 + i32 is allowed: i32 tensors are silently skipped.
         let t1 = make_f32(&[1, 2], &[1.0, 2.0]);
-        let t2 = make_i32(&[1, 1], &[42]);
-        let t3 = make_f32(&[1, 3], &[3.0, 4.0, 5.0]);
+        let t2 = make_f32(&[1, 3], &[3.0, 4.0, 5.0]);
+        let t3 = make_i32(&[1, 1], &[42]);
         let mapped = tensor_bridge::map_tensors(&[&t1, &t2, &t3]).unwrap();
+        if let MappedOutputs::Float32(maps) = &mapped {
+            // The i32 tensor should be skipped
+            assert_eq!(maps.len(), 2);
+        } else {
+            panic!("expected MappedOutputs::Float32");
+        }
+
+        // check that order doesn't matter
+        let mapped = tensor_bridge::map_tensors(&[&t3, &t2, &t1]).unwrap();
         if let MappedOutputs::Float32(maps) = &mapped {
             // The i32 tensor should be skipped
             assert_eq!(maps.len(), 2);
