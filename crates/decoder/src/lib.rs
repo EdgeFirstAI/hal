@@ -3849,6 +3849,77 @@ outputs:
         assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
         assert!(output_boxes[1].equal_within_delta(&expected[1], 1.0 / 160.0));
     }
+
+    #[test]
+    fn test_decode_tensor_proto() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+
+        let raw_boxes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_boxes_116x8400.bin"
+        ));
+        let raw_boxes =
+            unsafe { std::slice::from_raw_parts(raw_boxes.as_ptr() as *const i8, raw_boxes.len()) };
+        let boxes_i8: Tensor<i8> = Tensor::new(&[1, 116, 8400], None, None).unwrap();
+        boxes_i8
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(raw_boxes);
+        let boxes_i8 = boxes_i8.into();
+
+        let raw_protos = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_protos_160x160x32.bin"
+        ));
+        let raw_protos = unsafe {
+            std::slice::from_raw_parts(raw_protos.as_ptr() as *const i8, raw_protos.len())
+        };
+        let protos_i8: Tensor<i8> = Tensor::new(&[1, 160, 160, 32], None, None).unwrap();
+        protos_i8
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(raw_protos);
+        let protos_i8 = protos_i8.into();
+
+        let config_yaml = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_seg.yaml"
+        ));
+        let decoder = DecoderBuilder::default()
+            .with_config_yaml_str(config_yaml.to_string())
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .build()
+            .unwrap();
+
+        let expected = real_data_expected_boxes();
+        let mut output_boxes = Vec::with_capacity(50);
+
+        let proto_data = decoder
+            .decode_proto(&[&boxes_i8, &protos_i8], &mut output_boxes)
+            .unwrap();
+
+        assert_eq!(output_boxes.len(), 2);
+        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+        assert!(output_boxes[1].equal_within_delta(&expected[1], 1.0 / 160.0));
+
+        let proto_data = proto_data.expect("segmentation model should return ProtoData");
+        assert_eq!(
+            proto_data.mask_coefficients.len(),
+            output_boxes.len(),
+            "mask_coefficients count must match detection count"
+        );
+        for coeff in &proto_data.mask_coefficients {
+            assert_eq!(
+                coeff.len(),
+                32,
+                "each detection should have 32 mask coefficients"
+            );
+        }
+    }
 }
 
 #[cfg(feature = "tracker")]
@@ -5151,6 +5222,516 @@ outputs:
     );
     e2e_tracked_test!(
         test_decoder_tracked_end_to_end_segdet_split_proto_float,
+        float,
+        split,
+        proto
+    );
+
+    // ─── End-to-end tracked TensorDyn test macro ────────────────────
+    //
+    // Same as e2e_tracked_test but wraps data in TensorDyn and exercises
+    // the public decode_tracked / decode_proto_tracked API.
+
+    macro_rules! e2e_tracked_tensor_test {
+        ($name:ident, quantized, $layout:ident, $output:ident) => {
+            #[test]
+            fn $name() {
+                use edgefirst_tensor::{Tensor, TensorMapTrait, TensorTrait};
+
+                let is_split = matches!(stringify!($layout), "split");
+                let is_proto = matches!(stringify!($output), "proto");
+
+                let score_threshold = 0.45;
+                let iou_threshold = 0.45;
+
+                let mut boxes = Array2::zeros((10, 4));
+                let mut scores = Array2::zeros((10, 1));
+                let mut classes = Array2::zeros((10, 1));
+                let mask = Array2::zeros((10, 32));
+                let protos_f64 = Array3::<f64>::zeros((160, 160, 32));
+                let protos_f64 = protos_f64.insert_axis(Axis(0));
+                let protos_quant = (1.0 / 255.0, 0.0);
+                let protos_u8: Array4<u8> =
+                    quantize_ndarray(protos_f64.view(), protos_quant.into());
+
+                boxes
+                    .slice_mut(s![0, ..])
+                    .assign(&array![0.1234, 0.1234, 0.2345, 0.2345]);
+                scores.slice_mut(s![0, ..]).assign(&array![0.9876]);
+                classes.slice_mut(s![0, ..]).assign(&array![2.0]);
+
+                let detect_quant = (2.0 / 255.0, 0.0);
+
+                let decoder = if is_split {
+                    DecoderBuilder::default()
+                        .with_config_yaml_str(E2E_SPLIT_CONFIG.to_string())
+                        .with_score_threshold(score_threshold)
+                        .with_iou_threshold(iou_threshold)
+                        .build()
+                        .unwrap()
+                } else {
+                    DecoderBuilder::default()
+                        .with_config_yaml_str(E2E_COMBINED_CONFIG.to_string())
+                        .with_score_threshold(score_threshold)
+                        .with_iou_threshold(iou_threshold)
+                        .build()
+                        .unwrap()
+                };
+
+                // Helper to wrap a u8 slice into a TensorDyn
+                let make_u8_tensor =
+                    |shape: &[usize], data: &[u8]| -> edgefirst_tensor::TensorDyn {
+                        let t = Tensor::<u8>::new(shape, None, None).unwrap();
+                        t.map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
+                        t.into()
+                    };
+
+                let expected = e2e_expected_boxes_quant();
+                let mut tracker = ByteTrackBuilder::new()
+                    .track_update(0.1)
+                    .track_high_conf(0.7)
+                    .build();
+                let mut output_boxes = Vec::with_capacity(50);
+                let mut output_tracks = Vec::with_capacity(50);
+
+                let protos_td = make_u8_tensor(protos_u8.shape(), protos_u8.as_slice().unwrap());
+
+                if is_split {
+                    let boxes = boxes.insert_axis(Axis(0));
+                    let scores = scores.insert_axis(Axis(0));
+                    let classes = classes.insert_axis(Axis(0));
+                    let mask = mask.insert_axis(Axis(0));
+
+                    let boxes_q: Array3<u8> = quantize_ndarray(boxes.view(), detect_quant.into());
+                    let mut scores_q: Array3<u8> =
+                        quantize_ndarray(scores.view(), detect_quant.into());
+                    let classes_q: Array3<u8> =
+                        quantize_ndarray(classes.view(), detect_quant.into());
+                    let mask_q: Array3<u8> = quantize_ndarray(mask.view(), detect_quant.into());
+
+                    let boxes_td = make_u8_tensor(boxes_q.shape(), boxes_q.as_slice().unwrap());
+                    let classes_td =
+                        make_u8_tensor(classes_q.shape(), classes_q.as_slice().unwrap());
+                    let mask_td = make_u8_tensor(mask_q.shape(), mask_q.as_slice().unwrap());
+
+                    if is_proto {
+                        let scores_td =
+                            make_u8_tensor(scores_q.shape(), scores_q.as_slice().unwrap());
+                        decoder
+                            .decode_proto_tracked(
+                                &mut tracker,
+                                0,
+                                &[&boxes_td, &scores_td, &classes_td, &mask_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+
+                        assert_eq!(output_boxes.len(), 1);
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+
+                        for score in scores_q.slice_mut(s![.., .., ..]).iter_mut() {
+                            *score = u8::MIN;
+                        }
+                        let scores_td =
+                            make_u8_tensor(scores_q.shape(), scores_q.as_slice().unwrap());
+                        let proto_result = decoder
+                            .decode_proto_tracked(
+                                &mut tracker,
+                                100_000_000 / 3,
+                                &[&boxes_td, &scores_td, &classes_td, &mask_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
+                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.is_empty()));
+                    } else {
+                        let scores_td =
+                            make_u8_tensor(scores_q.shape(), scores_q.as_slice().unwrap());
+                        let mut output_masks = Vec::with_capacity(50);
+                        decoder
+                            .decode_tracked(
+                                &mut tracker,
+                                0,
+                                &[&boxes_td, &scores_td, &classes_td, &mask_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_masks,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+
+                        assert_eq!(output_boxes.len(), 1);
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+
+                        for score in scores_q.slice_mut(s![.., .., ..]).iter_mut() {
+                            *score = u8::MIN;
+                        }
+                        let scores_td =
+                            make_u8_tensor(scores_q.shape(), scores_q.as_slice().unwrap());
+                        decoder
+                            .decode_tracked(
+                                &mut tracker,
+                                100_000_000 / 3,
+                                &[&boxes_td, &scores_td, &classes_td, &mask_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_masks,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
+                        assert!(output_masks.is_empty());
+                    }
+                } else {
+                    // Combined layout
+                    let detect = ndarray::concatenate![
+                        Axis(1),
+                        boxes.view(),
+                        scores.view(),
+                        classes.view(),
+                        mask.view()
+                    ];
+                    let detect = detect.insert_axis(Axis(0));
+                    assert_eq!(detect.shape(), &[1, 10, 38]);
+                    // Ensure contiguous layout after concatenation for as_slice()
+                    let detect =
+                        Array3::from_shape_vec(detect.raw_dim(), detect.iter().copied().collect())
+                            .unwrap();
+                    let mut detect_q: Array3<u8> =
+                        quantize_ndarray(detect.view(), detect_quant.into());
+
+                    if is_proto {
+                        let detect_td =
+                            make_u8_tensor(detect_q.shape(), detect_q.as_slice().unwrap());
+                        decoder
+                            .decode_proto_tracked(
+                                &mut tracker,
+                                0,
+                                &[&detect_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+
+                        assert_eq!(output_boxes.len(), 1);
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+
+                        for score in detect_q.slice_mut(s![.., .., 4]).iter_mut() {
+                            *score = u8::MIN;
+                        }
+                        let detect_td =
+                            make_u8_tensor(detect_q.shape(), detect_q.as_slice().unwrap());
+                        let proto_result = decoder
+                            .decode_proto_tracked(
+                                &mut tracker,
+                                100_000_000 / 3,
+                                &[&detect_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
+                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.is_empty()));
+                    } else {
+                        let detect_td =
+                            make_u8_tensor(detect_q.shape(), detect_q.as_slice().unwrap());
+                        let mut output_masks = Vec::with_capacity(50);
+                        decoder
+                            .decode_tracked(
+                                &mut tracker,
+                                0,
+                                &[&detect_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_masks,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+
+                        assert_eq!(output_boxes.len(), 1);
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+
+                        for score in detect_q.slice_mut(s![.., .., 4]).iter_mut() {
+                            *score = u8::MIN;
+                        }
+                        let detect_td =
+                            make_u8_tensor(detect_q.shape(), detect_q.as_slice().unwrap());
+                        decoder
+                            .decode_tracked(
+                                &mut tracker,
+                                100_000_000 / 3,
+                                &[&detect_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_masks,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
+                        assert!(output_masks.is_empty());
+                    }
+                }
+            }
+        };
+        ($name:ident, float, $layout:ident, $output:ident) => {
+            #[test]
+            fn $name() {
+                use edgefirst_tensor::{Tensor, TensorMapTrait, TensorTrait};
+
+                let is_split = matches!(stringify!($layout), "split");
+                let is_proto = matches!(stringify!($output), "proto");
+
+                let score_threshold = 0.45;
+                let iou_threshold = 0.45;
+
+                let mut boxes = Array2::zeros((10, 4));
+                let mut scores = Array2::zeros((10, 1));
+                let mut classes = Array2::zeros((10, 1));
+                let mask: Array2<f64> = Array2::zeros((10, 32));
+                let protos = Array3::<f64>::zeros((160, 160, 32));
+                let protos = protos.insert_axis(Axis(0));
+
+                boxes
+                    .slice_mut(s![0, ..])
+                    .assign(&array![0.1234, 0.1234, 0.2345, 0.2345]);
+                scores.slice_mut(s![0, ..]).assign(&array![0.9876]);
+                classes.slice_mut(s![0, ..]).assign(&array![2.0]);
+
+                let decoder = if is_split {
+                    DecoderBuilder::default()
+                        .with_config_yaml_str(E2E_SPLIT_CONFIG.to_string())
+                        .with_score_threshold(score_threshold)
+                        .with_iou_threshold(iou_threshold)
+                        .build()
+                        .unwrap()
+                } else {
+                    DecoderBuilder::default()
+                        .with_config_yaml_str(E2E_COMBINED_CONFIG.to_string())
+                        .with_score_threshold(score_threshold)
+                        .with_iou_threshold(iou_threshold)
+                        .build()
+                        .unwrap()
+                };
+
+                // Helper to wrap an f64 slice into a TensorDyn
+                let make_f64_tensor =
+                    |shape: &[usize], data: &[f64]| -> edgefirst_tensor::TensorDyn {
+                        let t = Tensor::<f64>::new(shape, None, None).unwrap();
+                        t.map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
+                        t.into()
+                    };
+
+                let expected = e2e_expected_boxes_float();
+                let mut tracker = ByteTrackBuilder::new()
+                    .track_update(0.1)
+                    .track_high_conf(0.7)
+                    .build();
+                let mut output_boxes = Vec::with_capacity(50);
+                let mut output_tracks = Vec::with_capacity(50);
+
+                let protos_td = make_f64_tensor(protos.shape(), protos.as_slice().unwrap());
+
+                if is_split {
+                    let boxes = boxes.insert_axis(Axis(0));
+                    let mut scores = scores.insert_axis(Axis(0));
+                    let classes = classes.insert_axis(Axis(0));
+                    let mask = mask.insert_axis(Axis(0));
+
+                    let boxes_td = make_f64_tensor(boxes.shape(), boxes.as_slice().unwrap());
+                    let classes_td = make_f64_tensor(classes.shape(), classes.as_slice().unwrap());
+                    let mask_td = make_f64_tensor(mask.shape(), mask.as_slice().unwrap());
+
+                    if is_proto {
+                        let scores_td = make_f64_tensor(scores.shape(), scores.as_slice().unwrap());
+                        decoder
+                            .decode_proto_tracked(
+                                &mut tracker,
+                                0,
+                                &[&boxes_td, &scores_td, &classes_td, &mask_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+
+                        assert_eq!(output_boxes.len(), 1);
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+
+                        for score in scores.slice_mut(s![.., .., ..]).iter_mut() {
+                            *score = 0.0;
+                        }
+                        let scores_td = make_f64_tensor(scores.shape(), scores.as_slice().unwrap());
+                        let proto_result = decoder
+                            .decode_proto_tracked(
+                                &mut tracker,
+                                100_000_000 / 3,
+                                &[&boxes_td, &scores_td, &classes_td, &mask_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
+                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.is_empty()));
+                    } else {
+                        let scores_td = make_f64_tensor(scores.shape(), scores.as_slice().unwrap());
+                        let mut output_masks = Vec::with_capacity(50);
+                        decoder
+                            .decode_tracked(
+                                &mut tracker,
+                                0,
+                                &[&boxes_td, &scores_td, &classes_td, &mask_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_masks,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+
+                        assert_eq!(output_boxes.len(), 1);
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+
+                        for score in scores.slice_mut(s![.., .., ..]).iter_mut() {
+                            *score = 0.0;
+                        }
+                        let scores_td = make_f64_tensor(scores.shape(), scores.as_slice().unwrap());
+                        decoder
+                            .decode_tracked(
+                                &mut tracker,
+                                100_000_000 / 3,
+                                &[&boxes_td, &scores_td, &classes_td, &mask_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_masks,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
+                        assert!(output_masks.is_empty());
+                    }
+                } else {
+                    // Combined layout
+                    let detect = ndarray::concatenate![
+                        Axis(1),
+                        boxes.view(),
+                        scores.view(),
+                        classes.view(),
+                        mask.view()
+                    ];
+                    let detect = detect.insert_axis(Axis(0));
+                    assert_eq!(detect.shape(), &[1, 10, 38]);
+                    // Ensure contiguous layout after concatenation for as_slice()
+                    let mut detect =
+                        Array3::from_shape_vec(detect.raw_dim(), detect.iter().copied().collect())
+                            .unwrap();
+
+                    if is_proto {
+                        let detect_td = make_f64_tensor(detect.shape(), detect.as_slice().unwrap());
+                        decoder
+                            .decode_proto_tracked(
+                                &mut tracker,
+                                0,
+                                &[&detect_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+
+                        assert_eq!(output_boxes.len(), 1);
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+
+                        for score in detect.slice_mut(s![.., .., 4]).iter_mut() {
+                            *score = 0.0;
+                        }
+                        let detect_td = make_f64_tensor(detect.shape(), detect.as_slice().unwrap());
+                        let proto_result = decoder
+                            .decode_proto_tracked(
+                                &mut tracker,
+                                100_000_000 / 3,
+                                &[&detect_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
+                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.is_empty()));
+                    } else {
+                        let detect_td = make_f64_tensor(detect.shape(), detect.as_slice().unwrap());
+                        let mut output_masks = Vec::with_capacity(50);
+                        decoder
+                            .decode_tracked(
+                                &mut tracker,
+                                0,
+                                &[&detect_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_masks,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+
+                        assert_eq!(output_boxes.len(), 1);
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+
+                        for score in detect.slice_mut(s![.., .., 4]).iter_mut() {
+                            *score = 0.0;
+                        }
+                        let detect_td = make_f64_tensor(detect.shape(), detect.as_slice().unwrap());
+                        decoder
+                            .decode_tracked(
+                                &mut tracker,
+                                100_000_000 / 3,
+                                &[&detect_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_masks,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
+                        assert!(output_masks.is_empty());
+                    }
+                }
+            }
+        };
+    }
+
+    e2e_tracked_tensor_test!(
+        test_decoder_tracked_tensor_end_to_end_segdet,
+        quantized,
+        combined,
+        masks
+    );
+    e2e_tracked_tensor_test!(
+        test_decoder_tracked_tensor_end_to_end_segdet_float,
+        float,
+        combined,
+        masks
+    );
+    e2e_tracked_tensor_test!(
+        test_decoder_tracked_tensor_end_to_end_segdet_proto,
+        quantized,
+        combined,
+        proto
+    );
+    e2e_tracked_tensor_test!(
+        test_decoder_tracked_tensor_end_to_end_segdet_proto_float,
+        float,
+        combined,
+        proto
+    );
+    e2e_tracked_tensor_test!(
+        test_decoder_tracked_tensor_end_to_end_segdet_split,
+        quantized,
+        split,
+        masks
+    );
+    e2e_tracked_tensor_test!(
+        test_decoder_tracked_tensor_end_to_end_segdet_split_float,
+        float,
+        split,
+        masks
+    );
+    e2e_tracked_tensor_test!(
+        test_decoder_tracked_tensor_end_to_end_segdet_split_proto,
+        quantized,
+        split,
+        proto
+    );
+    e2e_tracked_tensor_test!(
+        test_decoder_tracked_tensor_end_to_end_segdet_split_proto_float,
         float,
         split,
         proto
