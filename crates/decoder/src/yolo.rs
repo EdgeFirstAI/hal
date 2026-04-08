@@ -444,12 +444,7 @@ pub fn decode_yolo_split_end_to_end_det_float<T: Float + AsPrimitive<f32>>(
     output_boxes: &mut Vec<DetectBox>,
 ) -> Result<(), crate::DecoderError> {
     let n = boxes.shape()[1];
-    if boxes.shape()[0] != 4 {
-        return Err(crate::DecoderError::InvalidShape(format!(
-            "Split end-to-end boxes must have 4 rows, got {}",
-            boxes.shape()[0]
-        )));
-    }
+
     output_boxes.clear();
 
     let (boxes, scores, classes) = postprocess_yolo_split_end_to_end_det(boxes, scores, &classes)?;
@@ -549,8 +544,12 @@ pub(crate) fn postprocess_yolo_end_to_end_segdet<'a, T>(
     Ok((boxes, scores, classes, mask_coeff))
 }
 
-/// Postprocess yolo split end to end segdet by reversing axes of boxes,
+/// Postprocess yolo split end to end det by reversing axes of boxes,
 /// scores, and flattening the class tensor.
+/// Expected input shapes:
+/// - boxes: (4, N)
+/// - scores: (1, N)
+/// - classes: (1, N)
 #[allow(clippy::type_complexity)]
 pub(crate) fn postprocess_yolo_split_end_to_end_det<'a, 'b, 'c, BOXES, SCORES, CLASS>(
     boxes: ArrayView2<'a, BOXES>,
@@ -564,12 +563,44 @@ pub(crate) fn postprocess_yolo_split_end_to_end_det<'a, 'b, 'c, BOXES, SCORES, C
     ),
     crate::DecoderError,
 > {
+    let num_boxes = boxes.shape()[1];
     if boxes.shape()[0] != 4 {
         return Err(crate::DecoderError::InvalidShape(format!(
-            "Split end-to-end boxes must have 4 columns, got {}",
+            "Split end-to-end box_coords must be 4, got {}",
             boxes.shape()[0]
         )));
     }
+
+    if scores.shape()[0] != 1 {
+        return Err(crate::DecoderError::InvalidShape(format!(
+            "Split end-to-end scores num_classes must be 1, got {}",
+            scores.shape()[0]
+        )));
+    }
+
+    if classes.shape()[0] != 1 {
+        return Err(crate::DecoderError::InvalidShape(format!(
+            "Split end-to-end classes num_classes must be 1, got {}",
+            classes.shape()[0]
+        )));
+    }
+
+    if scores.shape()[1] != num_boxes {
+        return Err(crate::DecoderError::InvalidShape(format!(
+            "Split end-to-end scores must have same num_boxes as boxes ({}), got {}",
+            num_boxes,
+            scores.shape()[1]
+        )));
+    }
+
+    if classes.shape()[1] != num_boxes {
+        return Err(crate::DecoderError::InvalidShape(format!(
+            "Split end-to-end classes must have same num_boxes as boxes ({}), got {}",
+            num_boxes,
+            classes.shape()[1]
+        )));
+    }
+
     let boxes = boxes.reversed_axes();
     let scores = scores.reversed_axes();
     let classes = classes.slice(s![0, ..]);
@@ -602,12 +633,52 @@ pub(crate) fn postprocess_yolo_split_end_to_end_segdet<
     ),
     crate::DecoderError,
 > {
+    let num_boxes = boxes.shape()[1];
     if boxes.shape()[0] != 4 {
         return Err(crate::DecoderError::InvalidShape(format!(
-            "Split end-to-end boxes must have 4 columns, got {}",
+            "Split end-to-end box_coords must be 4, got {}",
             boxes.shape()[0]
         )));
     }
+
+    if scores.shape()[0] != 1 {
+        return Err(crate::DecoderError::InvalidShape(format!(
+            "Split end-to-end scores num_classes must be 1, got {}",
+            scores.shape()[0]
+        )));
+    }
+
+    if classes.shape()[0] != 1 {
+        return Err(crate::DecoderError::InvalidShape(format!(
+            "Split end-to-end classes num_classes must be 1, got {}",
+            classes.shape()[0]
+        )));
+    }
+
+    if scores.shape()[1] != num_boxes {
+        return Err(crate::DecoderError::InvalidShape(format!(
+            "Split end-to-end scores must have same num_boxes as boxes ({}), got {}",
+            num_boxes,
+            scores.shape()[1]
+        )));
+    }
+
+    if classes.shape()[1] != num_boxes {
+        return Err(crate::DecoderError::InvalidShape(format!(
+            "Split end-to-end classes must have same num_boxes as boxes ({}), got {}",
+            num_boxes,
+            classes.shape()[1]
+        )));
+    }
+
+    if mask_coeff.shape()[1] != num_boxes {
+        return Err(crate::DecoderError::InvalidShape(format!(
+            "Split end-to-end mask_coeff must have same num_boxes as boxes ({}), got {}",
+            num_boxes,
+            mask_coeff.shape()[1]
+        )));
+    }
+
     let boxes = boxes.reversed_axes();
     let scores = scores.reversed_axes();
     let classes = classes.slice(s![0, ..]);
