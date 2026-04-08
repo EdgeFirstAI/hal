@@ -733,8 +733,11 @@ mod decoder_tests {
         },
         *,
     };
-    use ndarray::{array, s, Array4};
+    use edgefirst_tensor::{Tensor, TensorMapTrait, TensorTrait};
+    use ndarray::Dimension;
+    use ndarray::{array, s, Array2, Array3, Array4, Axis};
     use ndarray_stats::DeviationExt;
+    use num_traits::{AsPrimitive, PrimInt};
 
     fn compare_outputs(
         boxes: (&[DetectBox], &[DetectBox]),
@@ -784,6 +787,35 @@ mod decoder_tests {
                 mean_sq_err * 100.0
             );
         }
+    }
+
+    // ─── Shared test data loaders ────────────────────────
+
+    fn load_yolov8_boxes() -> Array3<i8> {
+        let raw = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_boxes_116x8400.bin"
+        ));
+        let raw = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const i8, raw.len()) };
+        Array3::from_shape_vec((1, 116, 8400), raw.to_vec()).unwrap()
+    }
+
+    fn load_yolov8_protos() -> Array4<i8> {
+        let raw = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_protos_160x160x32.bin"
+        ));
+        let raw = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const i8, raw.len()) };
+        Array4::from_shape_vec((1, 160, 160, 32), raw.to_vec()).unwrap()
+    }
+
+    fn load_yolov8s_det() -> Array3<i8> {
+        let raw = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8s_80_classes.bin"
+        ));
+        let raw = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const i8, raw.len()) };
+        Array3::from_shape_vec((1, 84, 8400), raw.to_vec()).unwrap()
     }
 
     #[test]
@@ -1509,12 +1541,7 @@ mod decoder_tests {
 
     #[test]
     fn test_dequant_chunked() {
-        let out = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8s_80_classes.bin"
-        ));
-        let mut out =
-            unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) }.to_vec();
+        let mut out = load_yolov8s_det().into_raw_vec_and_offset().0;
         out.push(123); // make sure to test non multiple of 16 length
 
         let mut out_dequant = vec![0.0; 84 * 8400 + 1];
@@ -1598,12 +1625,7 @@ mod decoder_tests {
     fn test_decoder_yolo_det() {
         let score_threshold = 0.25;
         let iou_threshold = 0.7;
-        let out = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8s_80_classes.bin"
-        ));
-        let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
-        let out = Array3::from_shape_vec((1, 84, 8400), out.to_vec()).unwrap();
+        let out = load_yolov8s_det();
         let quant = (0.0040811873, -123).into();
 
         let decoder = DecoderBuilder::default()
@@ -1688,29 +1710,18 @@ mod decoder_tests {
     fn test_decoder_masks() {
         let score_threshold = 0.45;
         let iou_threshold = 0.45;
-        let boxes = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_boxes_116x8400.bin"
-        ));
-        let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
-        let boxes = ndarray::Array2::from_shape_vec((116, 8400), boxes.to_vec()).unwrap();
+        let boxes = load_yolov8_boxes();
         let quant_boxes = Quantization::new(0.021287761628627777, 31);
 
-        let protos = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_protos_160x160x32.bin"
-        ));
-        let protos =
-            unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
-        let protos = ndarray::Array3::from_shape_vec((160, 160, 32), protos.to_vec()).unwrap();
+        let protos = load_yolov8_protos();
         let quant_protos = Quantization::new(0.02491161972284317, -117);
         let protos = dequantize_ndarray::<_, _, f32>(protos.view(), quant_protos);
         let seg = dequantize_ndarray::<_, _, f32>(boxes.view(), quant_boxes);
         let mut output_boxes: Vec<_> = Vec::with_capacity(10);
         let mut output_masks: Vec<_> = Vec::with_capacity(10);
         decode_yolo_segdet_float(
-            seg.view(),
-            protos.view(),
+            seg.slice(s![0, .., ..]),
+            protos.slice(s![0, .., .., ..]),
             score_threshold,
             iou_threshold,
             Some(configs::Nms::ClassAgnostic),
@@ -1782,25 +1793,11 @@ mod decoder_tests {
         let iou_threshold = 0.45;
 
         // Load test data — boxes as [116, 8400]
-        let boxes_raw = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_boxes_116x8400.bin"
-        ));
-        let boxes_raw =
-            unsafe { std::slice::from_raw_parts(boxes_raw.as_ptr() as *const i8, boxes_raw.len()) };
-        let boxes_2d = ndarray::Array2::from_shape_vec((116, 8400), boxes_raw.to_vec()).unwrap();
+        let boxes_2d = load_yolov8_boxes().slice_move(s![0, .., ..]);
         let quant_boxes = Quantization::new(0.021287761628627777, 31);
 
         // Load protos as HWC [160, 160, 32] (file layout) then dequantize
-        let protos_raw = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_protos_160x160x32.bin"
-        ));
-        let protos_raw = unsafe {
-            std::slice::from_raw_parts(protos_raw.as_ptr() as *const i8, protos_raw.len())
-        };
-        let protos_hwc =
-            ndarray::Array3::from_shape_vec((160, 160, 32), protos_raw.to_vec()).unwrap();
+        let protos_hwc = load_yolov8_protos().slice_move(s![0, .., .., ..]);
         let quant_protos = Quantization::new(0.02491161972284317, -117);
         let protos_f32_hwc = dequantize_ndarray::<_, _, f32>(protos_hwc.view(), quant_protos);
 
@@ -1894,21 +1891,10 @@ mod decoder_tests {
     fn test_decoder_masks_i8() {
         let score_threshold = 0.45;
         let iou_threshold = 0.45;
-        let boxes = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_boxes_116x8400.bin"
-        ));
-        let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
-        let boxes = ndarray::Array3::from_shape_vec((1, 116, 8400), boxes.to_vec()).unwrap();
+        let boxes = load_yolov8_boxes();
         let quant_boxes = (0.021287761628627777, 31).into();
 
-        let protos = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_protos_160x160x32.bin"
-        ));
-        let protos =
-            unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
-        let protos = ndarray::Array4::from_shape_vec((1, 160, 160, 32), protos.to_vec()).unwrap();
+        let protos = load_yolov8_protos();
         let quant_protos = (0.02491161972284317, -117).into();
         let mut output_boxes: Vec<_> = Vec::with_capacity(500);
         let mut output_masks: Vec<_> = Vec::with_capacity(500);
@@ -2017,11 +2003,7 @@ mod decoder_tests {
     fn test_decoder_yolo_split() {
         let score_threshold = 0.45;
         let iou_threshold = 0.45;
-        let boxes = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_boxes_116x8400.bin"
-        ));
-        let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
+        let boxes = load_yolov8_boxes();
         let boxes: Vec<_> = boxes.iter().map(|x| *x as i16 * 256).collect();
         let boxes = ndarray::Array3::from_shape_vec((1, 116, 8400), boxes).unwrap();
 
@@ -2101,76 +2083,21 @@ mod decoder_tests {
     fn test_decoder_masks_config_mixed() {
         let score_threshold = 0.45;
         let iou_threshold = 0.45;
-        let boxes = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_boxes_116x8400.bin"
-        ));
-        let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
-        let boxes: Vec<_> = boxes.iter().map(|x| *x as i16 * 256).collect();
+        let boxes_raw = load_yolov8_boxes();
+        let boxes: Vec<_> = boxes_raw.iter().map(|x| *x as i16 * 256).collect();
         let boxes = ndarray::Array3::from_shape_vec((1, 116, 8400), boxes).unwrap();
 
-        let quant_boxes = Quantization::new(0.021287761628627777 / 256.0, 31 * 256);
+        let quant_boxes = (0.021287761628627777 / 256.0, 31 * 256);
 
-        let protos = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_protos_160x160x32.bin"
-        ));
-        let protos =
-            unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
-        let protos: Vec<_> = protos.to_vec();
-        let protos = ndarray::Array4::from_shape_vec((1, 160, 160, 32), protos.to_vec()).unwrap();
-        let quant_protos = Quantization::new(0.02491161972284317, -117);
+        let protos = load_yolov8_protos();
+        let quant_protos = (0.02491161972284317, -117);
 
-        let decoder = DecoderBuilder::default()
-            .with_config_yolo_split_segdet(
-                configs::Boxes {
-                    decoder: configs::DecoderType::Ultralytics,
-                    quantization: Some(QuantTuple(quant_boxes.scale, quant_boxes.zero_point)),
-                    shape: vec![1, 4, 8400],
-                    dshape: vec![
-                        (DimName::Batch, 1),
-                        (DimName::BoxCoords, 4),
-                        (DimName::NumBoxes, 8400),
-                    ],
-                    normalized: Some(true),
-                },
-                configs::Scores {
-                    decoder: configs::DecoderType::Ultralytics,
-                    quantization: Some(QuantTuple(quant_boxes.scale, quant_boxes.zero_point)),
-                    shape: vec![1, 80, 8400],
-                    dshape: vec![
-                        (DimName::Batch, 1),
-                        (DimName::NumClasses, 80),
-                        (DimName::NumBoxes, 8400),
-                    ],
-                },
-                configs::MaskCoefficients {
-                    decoder: configs::DecoderType::Ultralytics,
-                    quantization: Some(QuantTuple(quant_boxes.scale, quant_boxes.zero_point)),
-                    shape: vec![1, 32, 8400],
-                    dshape: vec![
-                        (DimName::Batch, 1),
-                        (DimName::NumProtos, 32),
-                        (DimName::NumBoxes, 8400),
-                    ],
-                },
-                configs::Protos {
-                    decoder: configs::DecoderType::Ultralytics,
-                    quantization: Some(QuantTuple(quant_protos.scale, quant_protos.zero_point)),
-                    shape: vec![1, 160, 160, 32],
-                    dshape: vec![
-                        (DimName::Batch, 1),
-                        (DimName::Height, 160),
-                        (DimName::Width, 160),
-                        (DimName::NumProtos, 32),
-                    ],
-                },
-            )
-            .with_score_threshold(score_threshold)
-            .with_iou_threshold(iou_threshold)
-            .build()
-            .unwrap();
-
+        let decoder = build_yolo_split_segdet_decoder(
+            score_threshold,
+            iou_threshold,
+            quant_boxes,
+            quant_protos,
+        );
         let mut output_boxes: Vec<_> = Vec::with_capacity(500);
         let mut output_masks: Vec<_> = Vec::with_capacity(500);
 
@@ -2187,8 +2114,8 @@ mod decoder_tests {
             )
             .unwrap();
 
-        let protos = dequantize_ndarray::<_, _, f32>(protos.view(), quant_protos);
-        let seg = dequantize_ndarray::<_, _, f32>(boxes.view(), quant_boxes);
+        let protos = dequantize_ndarray::<_, _, f32>(protos.view(), quant_protos.into());
+        let seg = dequantize_ndarray::<_, _, f32>(boxes.view(), quant_boxes.into());
         let mut output_boxes_f32: Vec<_> = Vec::with_capacity(500);
         let mut output_masks_f32: Vec<_> = Vec::with_capacity(500);
         decode_yolo_segdet_float(
@@ -2227,36 +2154,17 @@ mod decoder_tests {
         );
     }
 
-    #[test]
-    fn test_decoder_masks_config_i32() {
-        let score_threshold = 0.45;
-        let iou_threshold = 0.45;
-        let boxes = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_boxes_116x8400.bin"
-        ));
-        let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
-        let scale = 1 << 23;
-        let boxes: Vec<_> = boxes.iter().map(|x| *x as i32 * scale).collect();
-        let boxes = ndarray::Array3::from_shape_vec((1, 116, 8400), boxes).unwrap();
-
-        let quant_boxes = Quantization::new(0.021287761628627777 / scale as f32, 31 * scale);
-
-        let protos = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_protos_160x160x32.bin"
-        ));
-        let protos =
-            unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
-        let protos: Vec<_> = protos.iter().map(|x| *x as i32 * scale).collect();
-        let protos = ndarray::Array4::from_shape_vec((1, 160, 160, 32), protos.to_vec()).unwrap();
-        let quant_protos = Quantization::new(0.02491161972284317 / scale as f32, -117 * scale);
-
-        let decoder = DecoderBuilder::default()
+    fn build_yolo_split_segdet_decoder(
+        score_threshold: f32,
+        iou_threshold: f32,
+        quant_boxes: (f32, i32),
+        quant_protos: (f32, i32),
+    ) -> crate::Decoder {
+        DecoderBuilder::default()
             .with_config_yolo_split_segdet(
                 configs::Boxes {
                     decoder: configs::DecoderType::Ultralytics,
-                    quantization: Some(QuantTuple(quant_boxes.scale, quant_boxes.zero_point)),
+                    quantization: Some(quant_boxes.into()),
                     shape: vec![1, 4, 8400],
                     dshape: vec![
                         (DimName::Batch, 1),
@@ -2267,7 +2175,7 @@ mod decoder_tests {
                 },
                 configs::Scores {
                     decoder: configs::DecoderType::Ultralytics,
-                    quantization: Some(QuantTuple(quant_boxes.scale, quant_boxes.zero_point)),
+                    quantization: Some(quant_boxes.into()),
                     shape: vec![1, 80, 8400],
                     dshape: vec![
                         (DimName::Batch, 1),
@@ -2277,7 +2185,7 @@ mod decoder_tests {
                 },
                 configs::MaskCoefficients {
                     decoder: configs::DecoderType::Ultralytics,
-                    quantization: Some(QuantTuple(quant_boxes.scale, quant_boxes.zero_point)),
+                    quantization: Some(quant_boxes.into()),
                     shape: vec![1, 32, 8400],
                     dshape: vec![
                         (DimName::Batch, 1),
@@ -2287,7 +2195,7 @@ mod decoder_tests {
                 },
                 configs::Protos {
                     decoder: configs::DecoderType::Ultralytics,
-                    quantization: Some(QuantTuple(quant_protos.scale, quant_protos.zero_point)),
+                    quantization: Some(quant_protos.into()),
                     shape: vec![1, 160, 160, 32],
                     dshape: vec![
                         (DimName::Batch, 1),
@@ -2300,7 +2208,43 @@ mod decoder_tests {
             .with_score_threshold(score_threshold)
             .with_iou_threshold(iou_threshold)
             .build()
-            .unwrap();
+            .unwrap()
+    }
+
+    fn build_yolov8_seg_decoder(score_threshold: f32, iou_threshold: f32) -> crate::Decoder {
+        let config_yaml = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_seg.yaml"
+        ));
+        DecoderBuilder::default()
+            .with_config_yaml_str(config_yaml.to_string())
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .build()
+            .unwrap()
+    }
+    #[test]
+    fn test_decoder_masks_config_i32() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+        let boxes_raw = load_yolov8_boxes();
+        let scale = 1 << 23;
+        let boxes: Vec<_> = boxes_raw.iter().map(|x| *x as i32 * scale).collect();
+        let boxes = ndarray::Array3::from_shape_vec((1, 116, 8400), boxes).unwrap();
+
+        let quant_boxes = (0.021287761628627777 / scale as f32, 31 * scale);
+
+        let protos_raw = load_yolov8_protos();
+        let protos: Vec<_> = protos_raw.iter().map(|x| *x as i32 * scale).collect();
+        let protos = ndarray::Array4::from_shape_vec((1, 160, 160, 32), protos).unwrap();
+        let quant_protos = (0.02491161972284317 / scale as f32, -117 * scale);
+
+        let decoder = build_yolo_split_segdet_decoder(
+            score_threshold,
+            iou_threshold,
+            quant_boxes,
+            quant_protos,
+        );
 
         let mut output_boxes: Vec<_> = Vec::with_capacity(500);
         let mut output_masks: Vec<_> = Vec::with_capacity(500);
@@ -2318,8 +2262,8 @@ mod decoder_tests {
             )
             .unwrap();
 
-        let protos = dequantize_ndarray::<_, _, f32>(protos.view(), quant_protos);
-        let seg = dequantize_ndarray::<_, _, f32>(boxes.view(), quant_boxes);
+        let protos = dequantize_ndarray::<_, _, f32>(protos.view(), quant_protos.into());
+        let seg = dequantize_ndarray::<_, _, f32>(boxes.view(), quant_boxes.into());
         let mut output_boxes_f32: Vec<_> = Vec::with_capacity(500);
         let mut output_masks_f32: Vec<Segmentation> = Vec::with_capacity(500);
         decode_yolo_segdet_float(
@@ -2348,12 +2292,7 @@ mod decoder_tests {
         let yolo_det = || {
             let score_threshold = 0.25;
             let iou_threshold = 0.7;
-            let out = include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/yolov8s_80_classes.bin"
-            ));
-            let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
-            let out = Array3::from_shape_vec((1, 84, 8400), out.to_vec()).unwrap();
+            let out = load_yolov8s_det();
             let quant = (0.0040811873, -123).into();
 
             let decoder = DecoderBuilder::default()
@@ -2835,6 +2774,978 @@ mod decoder_tests {
 
         assert_eq!(decoder.normalized_boxes(), None);
     }
+
+    pub fn quantize_ndarray<T: PrimInt + 'static, D: Dimension, F: Float + AsPrimitive<T>>(
+        input: ArrayView<F, D>,
+        quant: Quantization,
+    ) -> Array<T, D>
+    where
+        i32: num_traits::AsPrimitive<F>,
+        f32: num_traits::AsPrimitive<F>,
+    {
+        let zero_point = quant.zero_point.as_();
+        let div_scale = F::one() / quant.scale.as_();
+        if zero_point != F::zero() {
+            input.mapv(|d| (d * div_scale + zero_point).round().as_())
+        } else {
+            input.mapv(|d| (d * div_scale).round().as_())
+        }
+    }
+
+    fn real_data_expected_boxes() -> [DetectBox; 2] {
+        [
+            DetectBox {
+                bbox: BoundingBox {
+                    xmin: 0.08515105,
+                    ymin: 0.7131401,
+                    xmax: 0.29802868,
+                    ymax: 0.8195788,
+                },
+                score: 0.91537374,
+                label: 23,
+            },
+            DetectBox {
+                bbox: BoundingBox {
+                    xmin: 0.59605736,
+                    ymin: 0.25545314,
+                    xmax: 0.93666154,
+                    ymax: 0.72378385,
+                },
+                score: 0.91537374,
+                label: 23,
+            },
+        ]
+    }
+
+    fn e2e_expected_boxes_quant() -> [DetectBox; 1] {
+        [DetectBox {
+            bbox: BoundingBox {
+                xmin: 0.12549022,
+                ymin: 0.12549022,
+                xmax: 0.23529413,
+                ymax: 0.23529413,
+            },
+            score: 0.98823535,
+            label: 2,
+        }]
+    }
+
+    fn e2e_expected_boxes_float() -> [DetectBox; 1] {
+        [DetectBox {
+            bbox: BoundingBox {
+                xmin: 0.1234,
+                ymin: 0.1234,
+                xmax: 0.2345,
+                ymax: 0.2345,
+            },
+            score: 0.9876,
+            label: 2,
+        }]
+    }
+
+    macro_rules! real_data_proto_test {
+        ($name:ident, quantized, $layout:ident) => {
+            #[test]
+            fn $name() {
+                let is_split = matches!(stringify!($layout), "split");
+
+                let score_threshold = 0.45;
+                let iou_threshold = 0.45;
+                let quant_boxes = (0.021287762_f32, 31_i32);
+                let quant_protos = (0.02491162_f32, -117_i32);
+
+                let raw_boxes = include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../testdata/yolov8_boxes_116x8400.bin"
+                ));
+                let raw_boxes = unsafe {
+                    std::slice::from_raw_parts(raw_boxes.as_ptr() as *const i8, raw_boxes.len())
+                };
+                let boxes_i8 =
+                    ndarray::Array3::from_shape_vec((1, 116, 8400), raw_boxes.to_vec()).unwrap();
+
+                let raw_protos = include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../testdata/yolov8_protos_160x160x32.bin"
+                ));
+                let raw_protos = unsafe {
+                    std::slice::from_raw_parts(raw_protos.as_ptr() as *const i8, raw_protos.len())
+                };
+                let protos_i8 =
+                    ndarray::Array4::from_shape_vec((1, 160, 160, 32), raw_protos.to_vec())
+                        .unwrap();
+
+                // Pre-split (unused for combined, but harmless)
+                let mask_split = boxes_i8.slice(s![.., 84.., ..]).to_owned();
+                let scores_split = boxes_i8.slice(s![.., 4..84, ..]).to_owned();
+                let boxes_split = boxes_i8.slice(s![.., ..4, ..]).to_owned();
+                let boxes_combined = boxes_i8;
+
+                let decoder = if is_split {
+                    build_yolo_split_segdet_decoder(
+                        score_threshold,
+                        iou_threshold,
+                        quant_boxes,
+                        quant_protos,
+                    )
+                } else {
+                    build_yolov8_seg_decoder(score_threshold, iou_threshold)
+                };
+
+                let expected = real_data_expected_boxes();
+                let mut output_boxes = Vec::with_capacity(50);
+
+                let inputs: Vec<crate::decoder::ArrayViewDQuantized<'_>> = if is_split {
+                    vec![
+                        boxes_split.view().into(),
+                        scores_split.view().into(),
+                        mask_split.view().into(),
+                        protos_i8.view().into(),
+                    ]
+                } else {
+                    vec![boxes_combined.view().into(), protos_i8.view().into()]
+                };
+                decoder
+                    .decode_quantized_proto(&inputs, &mut output_boxes)
+                    .unwrap();
+
+                assert_eq!(output_boxes.len(), 2);
+                assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+                assert!(output_boxes[1].equal_within_delta(&expected[1], 1.0 / 160.0));
+            }
+        };
+        ($name:ident, float, $layout:ident) => {
+            #[test]
+            fn $name() {
+                let is_split = matches!(stringify!($layout), "split");
+
+                let score_threshold = 0.45;
+                let iou_threshold = 0.45;
+                let quant_boxes = (0.021287762_f32, 31_i32);
+                let quant_protos = (0.02491162_f32, -117_i32);
+
+                let raw_boxes = include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../testdata/yolov8_boxes_116x8400.bin"
+                ));
+                let raw_boxes = unsafe {
+                    std::slice::from_raw_parts(raw_boxes.as_ptr() as *const i8, raw_boxes.len())
+                };
+                let boxes_i8 =
+                    ndarray::Array3::from_shape_vec((1, 116, 8400), raw_boxes.to_vec()).unwrap();
+                let boxes_f32: Array3<f32> =
+                    dequantize_ndarray(boxes_i8.view(), quant_boxes.into());
+
+                let raw_protos = include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../testdata/yolov8_protos_160x160x32.bin"
+                ));
+                let raw_protos = unsafe {
+                    std::slice::from_raw_parts(raw_protos.as_ptr() as *const i8, raw_protos.len())
+                };
+                let protos_i8 =
+                    ndarray::Array4::from_shape_vec((1, 160, 160, 32), raw_protos.to_vec())
+                        .unwrap();
+                let protos_f32: Array4<f32> =
+                    dequantize_ndarray(protos_i8.view(), quant_protos.into());
+
+                // Pre-split from dequantized data
+                let mask_split = boxes_f32.slice(s![.., 84.., ..]).to_owned();
+                let scores_split = boxes_f32.slice(s![.., 4..84, ..]).to_owned();
+                let boxes_split = boxes_f32.slice(s![.., ..4, ..]).to_owned();
+                let boxes_combined = boxes_f32;
+
+                let decoder = if is_split {
+                    build_yolo_split_segdet_decoder(
+                        score_threshold,
+                        iou_threshold,
+                        quant_boxes,
+                        quant_protos,
+                    )
+                } else {
+                    build_yolov8_seg_decoder(score_threshold, iou_threshold)
+                };
+
+                let expected = real_data_expected_boxes();
+                let mut output_boxes = Vec::with_capacity(50);
+
+                let inputs = if is_split {
+                    vec![
+                        boxes_split.view().into_dyn(),
+                        scores_split.view().into_dyn(),
+                        mask_split.view().into_dyn(),
+                        protos_f32.view().into_dyn(),
+                    ]
+                } else {
+                    vec![
+                        boxes_combined.view().into_dyn(),
+                        protos_f32.view().into_dyn(),
+                    ]
+                };
+                decoder
+                    .decode_float_proto(&inputs, &mut output_boxes)
+                    .unwrap();
+
+                assert_eq!(output_boxes.len(), 2);
+                assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+                assert!(output_boxes[1].equal_within_delta(&expected[1], 1.0 / 160.0));
+            }
+        };
+    }
+
+    real_data_proto_test!(test_decoder_segdet_proto, quantized, combined);
+    real_data_proto_test!(test_decoder_segdet_proto_float, float, combined);
+    real_data_proto_test!(test_decoder_segdet_split_proto, quantized, split);
+    real_data_proto_test!(test_decoder_segdet_split_proto_float, float, split);
+
+    const E2E_COMBINED_DET_CONFIG: &str = "
+decoder_version: yolo26
+outputs:
+ - type: detection
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 6]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [num_features, 6]
+   normalized: true
+";
+
+    const E2E_COMBINED_SEGDET_CONFIG: &str = "
+decoder_version: yolo26
+outputs:
+ - type: detection
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 38]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [num_features, 38]
+   normalized: true
+ - type: protos
+   decoder: ultralytics
+   quantization: [0.0039215686274509803921568627451, 128]
+   shape: [1, 160, 160, 32]
+   dshape:
+    - [batch, 1]
+    - [height, 160]
+    - [width, 160]
+    - [num_protos, 32]
+";
+
+    const E2E_SPLIT_DET_CONFIG: &str = "
+decoder_version: yolo26
+outputs:
+ - type: boxes
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 4]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [box_coords, 4]
+   normalized: true
+ - type: scores
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 1]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [num_classes, 1]
+ - type: classes
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 1]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [num_classes, 1]
+";
+
+    const E2E_SPLIT_SEGDET_CONFIG: &str = "
+decoder_version: yolo26
+outputs:
+ - type: boxes
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 4]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [box_coords, 4]
+   normalized: true
+ - type: scores
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 1]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [num_classes, 1]
+ - type: classes
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 1]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [num_classes, 1]
+ - type: mask_coefficients
+   decoder: ultralytics
+   quantization: [0.00784313725490196, 0]
+   shape: [1, 10, 32]
+   dshape:
+    - [batch, 1]
+    - [num_boxes, 10]
+    - [num_protos, 32]
+ - type: protos
+   decoder: ultralytics
+   quantization: [0.0039215686274509803921568627451, 128]
+   shape: [1, 160, 160, 32]
+   dshape:
+    - [batch, 1]
+    - [height, 160]
+    - [width, 160]
+    - [num_protos, 32]
+";
+
+    macro_rules! e2e_segdet_test {
+        ($name:ident, quantized, $layout:ident, $output:ident) => {
+            #[test]
+            fn $name() {
+                let is_split = matches!(stringify!($layout), "split");
+                let is_proto = matches!(stringify!($output), "proto");
+
+                let score_threshold = 0.45;
+                let iou_threshold = 0.45;
+
+                let mut boxes = Array2::zeros((10, 4));
+                let mut scores = Array2::zeros((10, 1));
+                let mut classes = Array2::zeros((10, 1));
+                let mask = Array2::zeros((10, 32));
+                let protos = Array3::<f64>::zeros((160, 160, 32));
+                let protos = protos.insert_axis(Axis(0));
+                let protos_quant = (1.0 / 255.0, 0.0);
+                let protos: Array4<u8> = quantize_ndarray(protos.view(), protos_quant.into());
+
+                boxes
+                    .slice_mut(s![0, ..])
+                    .assign(&array![0.1234, 0.1234, 0.2345, 0.2345]);
+                scores.slice_mut(s![0, ..]).assign(&array![0.9876]);
+                classes.slice_mut(s![0, ..]).assign(&array![2.0]);
+
+                let detect_quant = (2.0 / 255.0, 0.0);
+
+                let decoder = if is_split {
+                    DecoderBuilder::default()
+                        .with_config_yaml_str(E2E_SPLIT_SEGDET_CONFIG.to_string())
+                        .with_score_threshold(score_threshold)
+                        .with_iou_threshold(iou_threshold)
+                        .build()
+                        .unwrap()
+                } else {
+                    DecoderBuilder::default()
+                        .with_config_yaml_str(E2E_COMBINED_SEGDET_CONFIG.to_string())
+                        .with_score_threshold(score_threshold)
+                        .with_iou_threshold(iou_threshold)
+                        .build()
+                        .unwrap()
+                };
+
+                let expected = e2e_expected_boxes_quant();
+                let mut output_boxes = Vec::with_capacity(50);
+
+                if is_split {
+                    let boxes = boxes.insert_axis(Axis(0));
+                    let scores = scores.insert_axis(Axis(0));
+                    let classes = classes.insert_axis(Axis(0));
+                    let mask = mask.insert_axis(Axis(0));
+
+                    let boxes: Array3<u8> = quantize_ndarray(boxes.view(), detect_quant.into());
+                    let scores: Array3<u8> = quantize_ndarray(scores.view(), detect_quant.into());
+                    let classes: Array3<u8> = quantize_ndarray(classes.view(), detect_quant.into());
+                    let mask: Array3<u8> = quantize_ndarray(mask.view(), detect_quant.into());
+
+                    if is_proto {
+                        let inputs: Vec<crate::decoder::ArrayViewDQuantized<'_>> = vec![
+                            boxes.view().into(),
+                            scores.view().into(),
+                            classes.view().into(),
+                            mask.view().into(),
+                            protos.view().into(),
+                        ];
+                        decoder
+                            .decode_quantized_proto(&inputs, &mut output_boxes)
+                            .unwrap();
+
+                        assert_eq!(output_boxes.len(), 1);
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+                    } else {
+                        let mut output_masks = Vec::with_capacity(50);
+                        let inputs: Vec<crate::decoder::ArrayViewDQuantized<'_>> = vec![
+                            boxes.view().into(),
+                            scores.view().into(),
+                            classes.view().into(),
+                            mask.view().into(),
+                            protos.view().into(),
+                        ];
+                        decoder
+                            .decode_quantized(&inputs, &mut output_boxes, &mut output_masks)
+                            .unwrap();
+
+                        assert_eq!(output_boxes.len(), 1);
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+                    }
+                } else {
+                    // Combined layout
+                    let detect = ndarray::concatenate![
+                        Axis(1),
+                        boxes.view(),
+                        scores.view(),
+                        classes.view(),
+                        mask.view()
+                    ];
+                    let detect = detect.insert_axis(Axis(0));
+                    assert_eq!(detect.shape(), &[1, 10, 38]);
+                    let detect: Array3<u8> = quantize_ndarray(detect.view(), detect_quant.into());
+
+                    if is_proto {
+                        let inputs: Vec<crate::decoder::ArrayViewDQuantized<'_>> =
+                            vec![detect.view().into(), protos.view().into()];
+                        decoder
+                            .decode_quantized_proto(&inputs, &mut output_boxes)
+                            .unwrap();
+
+                        assert_eq!(output_boxes.len(), 1);
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+                    } else {
+                        let mut output_masks = Vec::with_capacity(50);
+                        let inputs: Vec<crate::decoder::ArrayViewDQuantized<'_>> =
+                            vec![detect.view().into(), protos.view().into()];
+                        decoder
+                            .decode_quantized(&inputs, &mut output_boxes, &mut output_masks)
+                            .unwrap();
+
+                        assert_eq!(output_boxes.len(), 1);
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+                    }
+                }
+            }
+        };
+        ($name:ident, float, $layout:ident, $output:ident) => {
+            #[test]
+            fn $name() {
+                let is_split = matches!(stringify!($layout), "split");
+                let is_proto = matches!(stringify!($output), "proto");
+
+                let score_threshold = 0.45;
+                let iou_threshold = 0.45;
+
+                let mut boxes = Array2::zeros((10, 4));
+                let mut scores = Array2::zeros((10, 1));
+                let mut classes = Array2::zeros((10, 1));
+                let mask: Array2<f64> = Array2::zeros((10, 32));
+                let protos = Array3::<f64>::zeros((160, 160, 32));
+                let protos = protos.insert_axis(Axis(0));
+
+                boxes
+                    .slice_mut(s![0, ..])
+                    .assign(&array![0.1234, 0.1234, 0.2345, 0.2345]);
+                scores.slice_mut(s![0, ..]).assign(&array![0.9876]);
+                classes.slice_mut(s![0, ..]).assign(&array![2.0]);
+
+                let decoder = if is_split {
+                    DecoderBuilder::default()
+                        .with_config_yaml_str(E2E_SPLIT_SEGDET_CONFIG.to_string())
+                        .with_score_threshold(score_threshold)
+                        .with_iou_threshold(iou_threshold)
+                        .build()
+                        .unwrap()
+                } else {
+                    DecoderBuilder::default()
+                        .with_config_yaml_str(E2E_COMBINED_SEGDET_CONFIG.to_string())
+                        .with_score_threshold(score_threshold)
+                        .with_iou_threshold(iou_threshold)
+                        .build()
+                        .unwrap()
+                };
+
+                let expected = e2e_expected_boxes_float();
+                let mut output_boxes = Vec::with_capacity(50);
+
+                if is_split {
+                    let boxes = boxes.insert_axis(Axis(0));
+                    let scores = scores.insert_axis(Axis(0));
+                    let classes = classes.insert_axis(Axis(0));
+                    let mask = mask.insert_axis(Axis(0));
+
+                    if is_proto {
+                        let inputs = vec![
+                            boxes.view().into_dyn(),
+                            scores.view().into_dyn(),
+                            classes.view().into_dyn(),
+                            mask.view().into_dyn(),
+                            protos.view().into_dyn(),
+                        ];
+                        decoder
+                            .decode_float_proto(&inputs, &mut output_boxes)
+                            .unwrap();
+
+                        assert_eq!(output_boxes.len(), 1);
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+                    } else {
+                        let mut output_masks = Vec::with_capacity(50);
+                        let inputs = vec![
+                            boxes.view().into_dyn(),
+                            scores.view().into_dyn(),
+                            classes.view().into_dyn(),
+                            mask.view().into_dyn(),
+                            protos.view().into_dyn(),
+                        ];
+                        decoder
+                            .decode_float(&inputs, &mut output_boxes, &mut output_masks)
+                            .unwrap();
+
+                        assert_eq!(output_boxes.len(), 1);
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+                    }
+                } else {
+                    // Combined layout
+                    let detect = ndarray::concatenate![
+                        Axis(1),
+                        boxes.view(),
+                        scores.view(),
+                        classes.view(),
+                        mask.view()
+                    ];
+                    let detect = detect.insert_axis(Axis(0));
+                    assert_eq!(detect.shape(), &[1, 10, 38]);
+
+                    if is_proto {
+                        let inputs = vec![detect.view().into_dyn(), protos.view().into_dyn()];
+                        decoder
+                            .decode_float_proto(&inputs, &mut output_boxes)
+                            .unwrap();
+
+                        assert_eq!(output_boxes.len(), 1);
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+                    } else {
+                        let mut output_masks = Vec::with_capacity(50);
+                        let inputs = vec![detect.view().into_dyn(), protos.view().into_dyn()];
+                        decoder
+                            .decode_float(&inputs, &mut output_boxes, &mut output_masks)
+                            .unwrap();
+
+                        assert_eq!(output_boxes.len(), 1);
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+                    }
+                }
+            }
+        };
+    }
+
+    e2e_segdet_test!(test_decoder_end_to_end_segdet, quantized, combined, masks);
+    e2e_segdet_test!(test_decoder_end_to_end_segdet_float, float, combined, masks);
+    e2e_segdet_test!(
+        test_decoder_end_to_end_segdet_proto,
+        quantized,
+        combined,
+        proto
+    );
+    e2e_segdet_test!(
+        test_decoder_end_to_end_segdet_proto_float,
+        float,
+        combined,
+        proto
+    );
+    e2e_segdet_test!(
+        test_decoder_end_to_end_segdet_split,
+        quantized,
+        split,
+        masks
+    );
+    e2e_segdet_test!(
+        test_decoder_end_to_end_segdet_split_float,
+        float,
+        split,
+        masks
+    );
+    e2e_segdet_test!(
+        test_decoder_end_to_end_segdet_split_proto,
+        quantized,
+        split,
+        proto
+    );
+    e2e_segdet_test!(
+        test_decoder_end_to_end_segdet_split_proto_float,
+        float,
+        split,
+        proto
+    );
+
+    macro_rules! e2e_det_test {
+        ($name:ident, quantized, $layout:ident) => {
+            #[test]
+            fn $name() {
+                let is_split = matches!(stringify!($layout), "split");
+
+                let score_threshold = 0.45;
+                let iou_threshold = 0.45;
+
+                let mut boxes = Array3::zeros((1, 10, 4));
+                let mut scores = Array3::zeros((1, 10, 1));
+                let mut classes = Array3::zeros((1, 10, 1));
+
+                boxes
+                    .slice_mut(s![0, 0, ..])
+                    .assign(&array![0.1234, 0.1234, 0.2345, 0.2345]);
+                scores.slice_mut(s![0, 0, ..]).assign(&array![0.9876]);
+                classes.slice_mut(s![0, 0, ..]).assign(&array![2.0]);
+
+                let detect_quant = (2.0 / 255.0, 0_i32);
+
+                let decoder = if is_split {
+                    DecoderBuilder::default()
+                        .with_config_yaml_str(E2E_SPLIT_DET_CONFIG.to_string())
+                        .with_score_threshold(score_threshold)
+                        .with_iou_threshold(iou_threshold)
+                        .build()
+                        .unwrap()
+                } else {
+                    DecoderBuilder::default()
+                        .with_config_yaml_str(E2E_COMBINED_DET_CONFIG.to_string())
+                        .with_score_threshold(score_threshold)
+                        .with_iou_threshold(iou_threshold)
+                        .build()
+                        .unwrap()
+                };
+
+                let expected = e2e_expected_boxes_quant();
+                let mut output_boxes = Vec::with_capacity(50);
+
+                if is_split {
+                    let boxes: Array<u8, _> = quantize_ndarray(boxes.view(), detect_quant.into());
+                    let scores: Array<u8, _> = quantize_ndarray(scores.view(), detect_quant.into());
+                    let classes: Array<u8, _> =
+                        quantize_ndarray(classes.view(), detect_quant.into());
+                    let inputs: Vec<crate::decoder::ArrayViewDQuantized<'_>> = vec![
+                        boxes.view().into(),
+                        scores.view().into(),
+                        classes.view().into(),
+                    ];
+                    decoder
+                        .decode_quantized(&inputs, &mut output_boxes, &mut Vec::new())
+                        .unwrap();
+                } else {
+                    let detect =
+                        ndarray::concatenate![Axis(2), boxes.view(), scores.view(), classes.view()];
+                    assert_eq!(detect.shape(), &[1, 10, 6]);
+                    let detect: Array3<u8> = quantize_ndarray(detect.view(), detect_quant.into());
+                    let inputs: Vec<crate::decoder::ArrayViewDQuantized<'_>> =
+                        vec![detect.view().into()];
+                    decoder
+                        .decode_quantized(&inputs, &mut output_boxes, &mut Vec::new())
+                        .unwrap();
+                }
+
+                assert_eq!(output_boxes.len(), 1);
+                assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
+            }
+        };
+        ($name:ident, float, $layout:ident) => {
+            #[test]
+            fn $name() {
+                let is_split = matches!(stringify!($layout), "split");
+
+                let score_threshold = 0.45;
+                let iou_threshold = 0.45;
+
+                let mut boxes = Array3::zeros((1, 10, 4));
+                let mut scores = Array3::zeros((1, 10, 1));
+                let mut classes = Array3::zeros((1, 10, 1));
+
+                boxes
+                    .slice_mut(s![0, 0, ..])
+                    .assign(&array![0.1234, 0.1234, 0.2345, 0.2345]);
+                scores.slice_mut(s![0, 0, ..]).assign(&array![0.9876]);
+                classes.slice_mut(s![0, 0, ..]).assign(&array![2.0]);
+
+                let decoder = if is_split {
+                    DecoderBuilder::default()
+                        .with_config_yaml_str(E2E_SPLIT_DET_CONFIG.to_string())
+                        .with_score_threshold(score_threshold)
+                        .with_iou_threshold(iou_threshold)
+                        .build()
+                        .unwrap()
+                } else {
+                    DecoderBuilder::default()
+                        .with_config_yaml_str(E2E_COMBINED_DET_CONFIG.to_string())
+                        .with_score_threshold(score_threshold)
+                        .with_iou_threshold(iou_threshold)
+                        .build()
+                        .unwrap()
+                };
+
+                let expected = e2e_expected_boxes_float();
+                let mut output_boxes = Vec::with_capacity(50);
+
+                if is_split {
+                    let inputs = vec![
+                        boxes.view().into_dyn(),
+                        scores.view().into_dyn(),
+                        classes.view().into_dyn(),
+                    ];
+                    decoder
+                        .decode_float(&inputs, &mut output_boxes, &mut Vec::new())
+                        .unwrap();
+                } else {
+                    let detect =
+                        ndarray::concatenate![Axis(2), boxes.view(), scores.view(), classes.view()];
+                    assert_eq!(detect.shape(), &[1, 10, 6]);
+                    let inputs = vec![detect.view().into_dyn()];
+                    decoder
+                        .decode_float(&inputs, &mut output_boxes, &mut Vec::new())
+                        .unwrap();
+                }
+
+                assert_eq!(output_boxes.len(), 1);
+                assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
+            }
+        };
+    }
+
+    e2e_det_test!(test_decoder_end_to_end_combined_det, quantized, combined);
+    e2e_det_test!(test_decoder_end_to_end_combined_det_float, float, combined);
+    e2e_det_test!(test_decoder_end_to_end_split_det, quantized, split);
+    e2e_det_test!(test_decoder_end_to_end_split_det_float, float, split);
+
+    #[test]
+    fn test_decode_tensor() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+
+        let raw_boxes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_boxes_116x8400.bin"
+        ));
+        let raw_boxes =
+            unsafe { std::slice::from_raw_parts(raw_boxes.as_ptr() as *const i8, raw_boxes.len()) };
+        let boxes_i8: Tensor<i8> = Tensor::new(&[1, 116, 8400], None, None).unwrap();
+        boxes_i8
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(raw_boxes);
+        let boxes_i8 = boxes_i8.into();
+
+        let raw_protos = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_protos_160x160x32.bin"
+        ));
+        let raw_protos = unsafe {
+            std::slice::from_raw_parts(raw_protos.as_ptr() as *const i8, raw_protos.len())
+        };
+        let protos_i8: Tensor<i8> = Tensor::new(&[1, 160, 160, 32], None, None).unwrap();
+        protos_i8
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(raw_protos);
+        let protos_i8 = protos_i8.into();
+
+        let decoder = build_yolov8_seg_decoder(score_threshold, iou_threshold);
+        let expected = real_data_expected_boxes();
+        let mut output_boxes = Vec::with_capacity(50);
+
+        decoder
+            .decode(&[&boxes_i8, &protos_i8], &mut output_boxes, &mut Vec::new())
+            .unwrap();
+
+        assert_eq!(output_boxes.len(), 2);
+        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+        assert!(output_boxes[1].equal_within_delta(&expected[1], 1.0 / 160.0));
+    }
+
+    #[test]
+    fn test_decode_tensor_f32() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+
+        let quant_boxes = (0.021287762_f32, 31_i32);
+        let quant_protos = (0.02491162_f32, -117_i32);
+        let raw_boxes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_boxes_116x8400.bin"
+        ));
+        let raw_boxes =
+            unsafe { std::slice::from_raw_parts(raw_boxes.as_ptr() as *const i8, raw_boxes.len()) };
+        let mut raw_boxes_f32 = vec![0f32; raw_boxes.len()];
+        dequantize_cpu(raw_boxes, quant_boxes.into(), &mut raw_boxes_f32);
+        let boxes_f32: Tensor<f32> = Tensor::new(&[1, 116, 8400], None, None).unwrap();
+        boxes_f32
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(&raw_boxes_f32);
+        let boxes_f32 = boxes_f32.into();
+
+        let raw_protos = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_protos_160x160x32.bin"
+        ));
+        let raw_protos = unsafe {
+            std::slice::from_raw_parts(raw_protos.as_ptr() as *const i8, raw_protos.len())
+        };
+        let mut raw_protos_f32 = vec![0f32; raw_protos.len()];
+        dequantize_cpu(raw_protos, quant_protos.into(), &mut raw_protos_f32);
+        let protos_f32: Tensor<f32> = Tensor::new(&[1, 160, 160, 32], None, None).unwrap();
+        protos_f32
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(&raw_protos_f32);
+        let protos_f32 = protos_f32.into();
+
+        let decoder = build_yolov8_seg_decoder(score_threshold, iou_threshold);
+
+        let expected = real_data_expected_boxes();
+        let mut output_boxes = Vec::with_capacity(50);
+
+        decoder
+            .decode(
+                &[&boxes_f32, &protos_f32],
+                &mut output_boxes,
+                &mut Vec::new(),
+            )
+            .unwrap();
+
+        assert_eq!(output_boxes.len(), 2);
+        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+        assert!(output_boxes[1].equal_within_delta(&expected[1], 1.0 / 160.0));
+    }
+
+    #[test]
+    fn test_decode_tensor_f64() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+
+        let quant_boxes = (0.021287762_f32, 31_i32);
+        let quant_protos = (0.02491162_f32, -117_i32);
+        let raw_boxes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_boxes_116x8400.bin"
+        ));
+        let raw_boxes =
+            unsafe { std::slice::from_raw_parts(raw_boxes.as_ptr() as *const i8, raw_boxes.len()) };
+        let mut raw_boxes_f64 = vec![0f64; raw_boxes.len()];
+        dequantize_cpu(raw_boxes, quant_boxes.into(), &mut raw_boxes_f64);
+        let boxes_f64: Tensor<f64> = Tensor::new(&[1, 116, 8400], None, None).unwrap();
+        boxes_f64
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(&raw_boxes_f64);
+        let boxes_f64 = boxes_f64.into();
+
+        let raw_protos = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_protos_160x160x32.bin"
+        ));
+        let raw_protos = unsafe {
+            std::slice::from_raw_parts(raw_protos.as_ptr() as *const i8, raw_protos.len())
+        };
+        let mut raw_protos_f64 = vec![0f64; raw_protos.len()];
+        dequantize_cpu(raw_protos, quant_protos.into(), &mut raw_protos_f64);
+        let protos_f64: Tensor<f64> = Tensor::new(&[1, 160, 160, 32], None, None).unwrap();
+        protos_f64
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(&raw_protos_f64);
+        let protos_f64 = protos_f64.into();
+
+        let decoder = build_yolov8_seg_decoder(score_threshold, iou_threshold);
+
+        let expected = real_data_expected_boxes();
+        let mut output_boxes = Vec::with_capacity(50);
+
+        decoder
+            .decode(
+                &[&boxes_f64, &protos_f64],
+                &mut output_boxes,
+                &mut Vec::new(),
+            )
+            .unwrap();
+
+        assert_eq!(output_boxes.len(), 2);
+        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+        assert!(output_boxes[1].equal_within_delta(&expected[1], 1.0 / 160.0));
+    }
+
+    #[test]
+    fn test_decode_tensor_proto() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+
+        let raw_boxes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_boxes_116x8400.bin"
+        ));
+        let raw_boxes =
+            unsafe { std::slice::from_raw_parts(raw_boxes.as_ptr() as *const i8, raw_boxes.len()) };
+        let boxes_i8: Tensor<i8> = Tensor::new(&[1, 116, 8400], None, None).unwrap();
+        boxes_i8
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(raw_boxes);
+        let boxes_i8 = boxes_i8.into();
+
+        let raw_protos = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_protos_160x160x32.bin"
+        ));
+        let raw_protos = unsafe {
+            std::slice::from_raw_parts(raw_protos.as_ptr() as *const i8, raw_protos.len())
+        };
+        let protos_i8: Tensor<i8> = Tensor::new(&[1, 160, 160, 32], None, None).unwrap();
+        protos_i8
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(raw_protos);
+        let protos_i8 = protos_i8.into();
+
+        let decoder = build_yolov8_seg_decoder(score_threshold, iou_threshold);
+
+        let expected = real_data_expected_boxes();
+        let mut output_boxes = Vec::with_capacity(50);
+
+        let proto_data = decoder
+            .decode_proto(&[&boxes_i8, &protos_i8], &mut output_boxes)
+            .unwrap();
+
+        assert_eq!(output_boxes.len(), 2);
+        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+        assert!(output_boxes[1].equal_within_delta(&expected[1], 1.0 / 160.0));
+
+        let proto_data = proto_data.expect("segmentation model should return ProtoData");
+        assert_eq!(
+            proto_data.mask_coefficients.len(),
+            output_boxes.len(),
+            "mask_coefficients count must match detection count"
+        );
+        for coeff in &proto_data.mask_coefficients {
+            assert_eq!(
+                coeff.len(),
+                32,
+                "each detection should have 32 mask coefficients"
+            );
+        }
+    }
 }
 
 #[cfg(feature = "tracker")]
@@ -3048,7 +3959,7 @@ mod decoder_tracked_tests {
         }]
     }
 
-    fn build_split_decoder(
+    fn build_yolo_split_segdet_decoder(
         score_threshold: f32,
         iou_threshold: f32,
         quant_boxes: (f32, i32),
@@ -3105,6 +4016,19 @@ mod decoder_tracked_tests {
             .unwrap()
     }
 
+    fn build_yolov8_seg_decoder(score_threshold: f32, iou_threshold: f32) -> crate::Decoder {
+        let config_yaml = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_seg.yaml"
+        ));
+        DecoderBuilder::default()
+            .with_config_yaml_str(config_yaml.to_string())
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .build()
+            .unwrap()
+    }
+
     // ─── Real-data tracked test macro ───────────────────────────────
     //
     // Generates tests that load i8 binary test data from testdata/ and
@@ -3115,7 +4039,6 @@ mod decoder_tracked_tests {
         ($name:ident, quantized, $layout:ident, $output:ident) => {
             #[test]
             fn $name() {
-                use crate::configs::Nms;
                 let is_split = matches!(stringify!($layout), "split");
                 let is_proto = matches!(stringify!($output), "proto");
 
@@ -3152,19 +4075,14 @@ mod decoder_tracked_tests {
                 let mut boxes_combined = boxes_i8;
 
                 let decoder = if is_split {
-                    build_split_decoder(score_threshold, iou_threshold, quant_boxes, quant_protos)
+                    build_yolo_split_segdet_decoder(
+                        score_threshold,
+                        iou_threshold,
+                        quant_boxes,
+                        quant_protos,
+                    )
                 } else {
-                    let config_yaml = include_str!(concat!(
-                        env!("CARGO_MANIFEST_DIR"),
-                        "/../../testdata/yolov8_seg.yaml"
-                    ));
-                    DecoderBuilder::default()
-                        .with_config_yaml_str(config_yaml.to_string())
-                        .with_score_threshold(score_threshold)
-                        .with_iou_threshold(iou_threshold)
-                        .with_nms(Some(Nms::ClassAgnostic))
-                        .build()
-                        .unwrap()
+                    build_yolov8_seg_decoder(score_threshold, iou_threshold)
                 };
 
                 let expected = real_data_expected_boxes();
@@ -3306,7 +4224,6 @@ mod decoder_tracked_tests {
         ($name:ident, float, $layout:ident, $output:ident) => {
             #[test]
             fn $name() {
-                use crate::configs::Nms;
                 let is_split = matches!(stringify!($layout), "split");
                 let is_proto = matches!(stringify!($output), "proto");
 
@@ -3345,19 +4262,14 @@ mod decoder_tracked_tests {
                 let mut boxes_combined = boxes_f32;
 
                 let decoder = if is_split {
-                    build_split_decoder(score_threshold, iou_threshold, quant_boxes, quant_protos)
+                    build_yolo_split_segdet_decoder(
+                        score_threshold,
+                        iou_threshold,
+                        quant_boxes,
+                        quant_protos,
+                    )
                 } else {
-                    let config_yaml = include_str!(concat!(
-                        env!("CARGO_MANIFEST_DIR"),
-                        "/../../testdata/yolov8_seg.yaml"
-                    ));
-                    DecoderBuilder::default()
-                        .with_config_yaml_str(config_yaml.to_string())
-                        .with_score_threshold(score_threshold)
-                        .with_iou_threshold(iou_threshold)
-                        .with_nms(Some(Nms::ClassAgnostic))
-                        .build()
-                        .unwrap()
+                    build_yolov8_seg_decoder(score_threshold, iou_threshold)
                 };
 
                 let expected = real_data_expected_boxes();
@@ -4137,6 +5049,516 @@ outputs:
     );
     e2e_tracked_test!(
         test_decoder_tracked_end_to_end_segdet_split_proto_float,
+        float,
+        split,
+        proto
+    );
+
+    // ─── End-to-end tracked TensorDyn test macro ────────────────────
+    //
+    // Same as e2e_tracked_test but wraps data in TensorDyn and exercises
+    // the public decode_tracked / decode_proto_tracked API.
+
+    macro_rules! e2e_tracked_tensor_test {
+        ($name:ident, quantized, $layout:ident, $output:ident) => {
+            #[test]
+            fn $name() {
+                use edgefirst_tensor::{Tensor, TensorMapTrait, TensorTrait};
+
+                let is_split = matches!(stringify!($layout), "split");
+                let is_proto = matches!(stringify!($output), "proto");
+
+                let score_threshold = 0.45;
+                let iou_threshold = 0.45;
+
+                let mut boxes = Array2::zeros((10, 4));
+                let mut scores = Array2::zeros((10, 1));
+                let mut classes = Array2::zeros((10, 1));
+                let mask = Array2::zeros((10, 32));
+                let protos_f64 = Array3::<f64>::zeros((160, 160, 32));
+                let protos_f64 = protos_f64.insert_axis(Axis(0));
+                let protos_quant = (1.0 / 255.0, 0.0);
+                let protos_u8: Array4<u8> =
+                    quantize_ndarray(protos_f64.view(), protos_quant.into());
+
+                boxes
+                    .slice_mut(s![0, ..])
+                    .assign(&array![0.1234, 0.1234, 0.2345, 0.2345]);
+                scores.slice_mut(s![0, ..]).assign(&array![0.9876]);
+                classes.slice_mut(s![0, ..]).assign(&array![2.0]);
+
+                let detect_quant = (2.0 / 255.0, 0.0);
+
+                let decoder = if is_split {
+                    DecoderBuilder::default()
+                        .with_config_yaml_str(E2E_SPLIT_CONFIG.to_string())
+                        .with_score_threshold(score_threshold)
+                        .with_iou_threshold(iou_threshold)
+                        .build()
+                        .unwrap()
+                } else {
+                    DecoderBuilder::default()
+                        .with_config_yaml_str(E2E_COMBINED_CONFIG.to_string())
+                        .with_score_threshold(score_threshold)
+                        .with_iou_threshold(iou_threshold)
+                        .build()
+                        .unwrap()
+                };
+
+                // Helper to wrap a u8 slice into a TensorDyn
+                let make_u8_tensor =
+                    |shape: &[usize], data: &[u8]| -> edgefirst_tensor::TensorDyn {
+                        let t = Tensor::<u8>::new(shape, None, None).unwrap();
+                        t.map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
+                        t.into()
+                    };
+
+                let expected = e2e_expected_boxes_quant();
+                let mut tracker = ByteTrackBuilder::new()
+                    .track_update(0.1)
+                    .track_high_conf(0.7)
+                    .build();
+                let mut output_boxes = Vec::with_capacity(50);
+                let mut output_tracks = Vec::with_capacity(50);
+
+                let protos_td = make_u8_tensor(protos_u8.shape(), protos_u8.as_slice().unwrap());
+
+                if is_split {
+                    let boxes = boxes.insert_axis(Axis(0));
+                    let scores = scores.insert_axis(Axis(0));
+                    let classes = classes.insert_axis(Axis(0));
+                    let mask = mask.insert_axis(Axis(0));
+
+                    let boxes_q: Array3<u8> = quantize_ndarray(boxes.view(), detect_quant.into());
+                    let mut scores_q: Array3<u8> =
+                        quantize_ndarray(scores.view(), detect_quant.into());
+                    let classes_q: Array3<u8> =
+                        quantize_ndarray(classes.view(), detect_quant.into());
+                    let mask_q: Array3<u8> = quantize_ndarray(mask.view(), detect_quant.into());
+
+                    let boxes_td = make_u8_tensor(boxes_q.shape(), boxes_q.as_slice().unwrap());
+                    let classes_td =
+                        make_u8_tensor(classes_q.shape(), classes_q.as_slice().unwrap());
+                    let mask_td = make_u8_tensor(mask_q.shape(), mask_q.as_slice().unwrap());
+
+                    if is_proto {
+                        let scores_td =
+                            make_u8_tensor(scores_q.shape(), scores_q.as_slice().unwrap());
+                        decoder
+                            .decode_proto_tracked(
+                                &mut tracker,
+                                0,
+                                &[&boxes_td, &scores_td, &classes_td, &mask_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+
+                        assert_eq!(output_boxes.len(), 1);
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+
+                        for score in scores_q.slice_mut(s![.., .., ..]).iter_mut() {
+                            *score = u8::MIN;
+                        }
+                        let scores_td =
+                            make_u8_tensor(scores_q.shape(), scores_q.as_slice().unwrap());
+                        let proto_result = decoder
+                            .decode_proto_tracked(
+                                &mut tracker,
+                                100_000_000 / 3,
+                                &[&boxes_td, &scores_td, &classes_td, &mask_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
+                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.is_empty()));
+                    } else {
+                        let scores_td =
+                            make_u8_tensor(scores_q.shape(), scores_q.as_slice().unwrap());
+                        let mut output_masks = Vec::with_capacity(50);
+                        decoder
+                            .decode_tracked(
+                                &mut tracker,
+                                0,
+                                &[&boxes_td, &scores_td, &classes_td, &mask_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_masks,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+
+                        assert_eq!(output_boxes.len(), 1);
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+
+                        for score in scores_q.slice_mut(s![.., .., ..]).iter_mut() {
+                            *score = u8::MIN;
+                        }
+                        let scores_td =
+                            make_u8_tensor(scores_q.shape(), scores_q.as_slice().unwrap());
+                        decoder
+                            .decode_tracked(
+                                &mut tracker,
+                                100_000_000 / 3,
+                                &[&boxes_td, &scores_td, &classes_td, &mask_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_masks,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
+                        assert!(output_masks.is_empty());
+                    }
+                } else {
+                    // Combined layout
+                    let detect = ndarray::concatenate![
+                        Axis(1),
+                        boxes.view(),
+                        scores.view(),
+                        classes.view(),
+                        mask.view()
+                    ];
+                    let detect = detect.insert_axis(Axis(0));
+                    assert_eq!(detect.shape(), &[1, 10, 38]);
+                    // Ensure contiguous layout after concatenation for as_slice()
+                    let detect =
+                        Array3::from_shape_vec(detect.raw_dim(), detect.iter().copied().collect())
+                            .unwrap();
+                    let mut detect_q: Array3<u8> =
+                        quantize_ndarray(detect.view(), detect_quant.into());
+
+                    if is_proto {
+                        let detect_td =
+                            make_u8_tensor(detect_q.shape(), detect_q.as_slice().unwrap());
+                        decoder
+                            .decode_proto_tracked(
+                                &mut tracker,
+                                0,
+                                &[&detect_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+
+                        assert_eq!(output_boxes.len(), 1);
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+
+                        for score in detect_q.slice_mut(s![.., .., 4]).iter_mut() {
+                            *score = u8::MIN;
+                        }
+                        let detect_td =
+                            make_u8_tensor(detect_q.shape(), detect_q.as_slice().unwrap());
+                        let proto_result = decoder
+                            .decode_proto_tracked(
+                                &mut tracker,
+                                100_000_000 / 3,
+                                &[&detect_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
+                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.is_empty()));
+                    } else {
+                        let detect_td =
+                            make_u8_tensor(detect_q.shape(), detect_q.as_slice().unwrap());
+                        let mut output_masks = Vec::with_capacity(50);
+                        decoder
+                            .decode_tracked(
+                                &mut tracker,
+                                0,
+                                &[&detect_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_masks,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+
+                        assert_eq!(output_boxes.len(), 1);
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+
+                        for score in detect_q.slice_mut(s![.., .., 4]).iter_mut() {
+                            *score = u8::MIN;
+                        }
+                        let detect_td =
+                            make_u8_tensor(detect_q.shape(), detect_q.as_slice().unwrap());
+                        decoder
+                            .decode_tracked(
+                                &mut tracker,
+                                100_000_000 / 3,
+                                &[&detect_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_masks,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
+                        assert!(output_masks.is_empty());
+                    }
+                }
+            }
+        };
+        ($name:ident, float, $layout:ident, $output:ident) => {
+            #[test]
+            fn $name() {
+                use edgefirst_tensor::{Tensor, TensorMapTrait, TensorTrait};
+
+                let is_split = matches!(stringify!($layout), "split");
+                let is_proto = matches!(stringify!($output), "proto");
+
+                let score_threshold = 0.45;
+                let iou_threshold = 0.45;
+
+                let mut boxes = Array2::zeros((10, 4));
+                let mut scores = Array2::zeros((10, 1));
+                let mut classes = Array2::zeros((10, 1));
+                let mask: Array2<f64> = Array2::zeros((10, 32));
+                let protos = Array3::<f64>::zeros((160, 160, 32));
+                let protos = protos.insert_axis(Axis(0));
+
+                boxes
+                    .slice_mut(s![0, ..])
+                    .assign(&array![0.1234, 0.1234, 0.2345, 0.2345]);
+                scores.slice_mut(s![0, ..]).assign(&array![0.9876]);
+                classes.slice_mut(s![0, ..]).assign(&array![2.0]);
+
+                let decoder = if is_split {
+                    DecoderBuilder::default()
+                        .with_config_yaml_str(E2E_SPLIT_CONFIG.to_string())
+                        .with_score_threshold(score_threshold)
+                        .with_iou_threshold(iou_threshold)
+                        .build()
+                        .unwrap()
+                } else {
+                    DecoderBuilder::default()
+                        .with_config_yaml_str(E2E_COMBINED_CONFIG.to_string())
+                        .with_score_threshold(score_threshold)
+                        .with_iou_threshold(iou_threshold)
+                        .build()
+                        .unwrap()
+                };
+
+                // Helper to wrap an f64 slice into a TensorDyn
+                let make_f64_tensor =
+                    |shape: &[usize], data: &[f64]| -> edgefirst_tensor::TensorDyn {
+                        let t = Tensor::<f64>::new(shape, None, None).unwrap();
+                        t.map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
+                        t.into()
+                    };
+
+                let expected = e2e_expected_boxes_float();
+                let mut tracker = ByteTrackBuilder::new()
+                    .track_update(0.1)
+                    .track_high_conf(0.7)
+                    .build();
+                let mut output_boxes = Vec::with_capacity(50);
+                let mut output_tracks = Vec::with_capacity(50);
+
+                let protos_td = make_f64_tensor(protos.shape(), protos.as_slice().unwrap());
+
+                if is_split {
+                    let boxes = boxes.insert_axis(Axis(0));
+                    let mut scores = scores.insert_axis(Axis(0));
+                    let classes = classes.insert_axis(Axis(0));
+                    let mask = mask.insert_axis(Axis(0));
+
+                    let boxes_td = make_f64_tensor(boxes.shape(), boxes.as_slice().unwrap());
+                    let classes_td = make_f64_tensor(classes.shape(), classes.as_slice().unwrap());
+                    let mask_td = make_f64_tensor(mask.shape(), mask.as_slice().unwrap());
+
+                    if is_proto {
+                        let scores_td = make_f64_tensor(scores.shape(), scores.as_slice().unwrap());
+                        decoder
+                            .decode_proto_tracked(
+                                &mut tracker,
+                                0,
+                                &[&boxes_td, &scores_td, &classes_td, &mask_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+
+                        assert_eq!(output_boxes.len(), 1);
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+
+                        for score in scores.slice_mut(s![.., .., ..]).iter_mut() {
+                            *score = 0.0;
+                        }
+                        let scores_td = make_f64_tensor(scores.shape(), scores.as_slice().unwrap());
+                        let proto_result = decoder
+                            .decode_proto_tracked(
+                                &mut tracker,
+                                100_000_000 / 3,
+                                &[&boxes_td, &scores_td, &classes_td, &mask_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
+                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.is_empty()));
+                    } else {
+                        let scores_td = make_f64_tensor(scores.shape(), scores.as_slice().unwrap());
+                        let mut output_masks = Vec::with_capacity(50);
+                        decoder
+                            .decode_tracked(
+                                &mut tracker,
+                                0,
+                                &[&boxes_td, &scores_td, &classes_td, &mask_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_masks,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+
+                        assert_eq!(output_boxes.len(), 1);
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+
+                        for score in scores.slice_mut(s![.., .., ..]).iter_mut() {
+                            *score = 0.0;
+                        }
+                        let scores_td = make_f64_tensor(scores.shape(), scores.as_slice().unwrap());
+                        decoder
+                            .decode_tracked(
+                                &mut tracker,
+                                100_000_000 / 3,
+                                &[&boxes_td, &scores_td, &classes_td, &mask_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_masks,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
+                        assert!(output_masks.is_empty());
+                    }
+                } else {
+                    // Combined layout
+                    let detect = ndarray::concatenate![
+                        Axis(1),
+                        boxes.view(),
+                        scores.view(),
+                        classes.view(),
+                        mask.view()
+                    ];
+                    let detect = detect.insert_axis(Axis(0));
+                    assert_eq!(detect.shape(), &[1, 10, 38]);
+                    // Ensure contiguous layout after concatenation for as_slice()
+                    let mut detect =
+                        Array3::from_shape_vec(detect.raw_dim(), detect.iter().copied().collect())
+                            .unwrap();
+
+                    if is_proto {
+                        let detect_td = make_f64_tensor(detect.shape(), detect.as_slice().unwrap());
+                        decoder
+                            .decode_proto_tracked(
+                                &mut tracker,
+                                0,
+                                &[&detect_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+
+                        assert_eq!(output_boxes.len(), 1);
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+
+                        for score in detect.slice_mut(s![.., .., 4]).iter_mut() {
+                            *score = 0.0;
+                        }
+                        let detect_td = make_f64_tensor(detect.shape(), detect.as_slice().unwrap());
+                        let proto_result = decoder
+                            .decode_proto_tracked(
+                                &mut tracker,
+                                100_000_000 / 3,
+                                &[&detect_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
+                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.is_empty()));
+                    } else {
+                        let detect_td = make_f64_tensor(detect.shape(), detect.as_slice().unwrap());
+                        let mut output_masks = Vec::with_capacity(50);
+                        decoder
+                            .decode_tracked(
+                                &mut tracker,
+                                0,
+                                &[&detect_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_masks,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+
+                        assert_eq!(output_boxes.len(), 1);
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
+
+                        for score in detect.slice_mut(s![.., .., 4]).iter_mut() {
+                            *score = 0.0;
+                        }
+                        let detect_td = make_f64_tensor(detect.shape(), detect.as_slice().unwrap());
+                        decoder
+                            .decode_tracked(
+                                &mut tracker,
+                                100_000_000 / 3,
+                                &[&detect_td, &protos_td],
+                                &mut output_boxes,
+                                &mut output_masks,
+                                &mut output_tracks,
+                            )
+                            .unwrap();
+                        assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
+                        assert!(output_masks.is_empty());
+                    }
+                }
+            }
+        };
+    }
+
+    e2e_tracked_tensor_test!(
+        test_decoder_tracked_tensor_end_to_end_segdet,
+        quantized,
+        combined,
+        masks
+    );
+    e2e_tracked_tensor_test!(
+        test_decoder_tracked_tensor_end_to_end_segdet_float,
+        float,
+        combined,
+        masks
+    );
+    e2e_tracked_tensor_test!(
+        test_decoder_tracked_tensor_end_to_end_segdet_proto,
+        quantized,
+        combined,
+        proto
+    );
+    e2e_tracked_tensor_test!(
+        test_decoder_tracked_tensor_end_to_end_segdet_proto_float,
+        float,
+        combined,
+        proto
+    );
+    e2e_tracked_tensor_test!(
+        test_decoder_tracked_tensor_end_to_end_segdet_split,
+        quantized,
+        split,
+        masks
+    );
+    e2e_tracked_tensor_test!(
+        test_decoder_tracked_tensor_end_to_end_segdet_split_float,
+        float,
+        split,
+        masks
+    );
+    e2e_tracked_tensor_test!(
+        test_decoder_tracked_tensor_end_to_end_segdet_split_proto,
+        quantized,
+        split,
+        proto
+    );
+    e2e_tracked_tensor_test!(
+        test_decoder_tracked_tensor_end_to_end_segdet_split_proto_float,
         float,
         split,
         proto
