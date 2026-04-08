@@ -789,6 +789,35 @@ mod decoder_tests {
         }
     }
 
+    // ─── Shared test data loaders ────────────────────────
+
+    fn load_yolov8_boxes() -> Array3<i8> {
+        let raw = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_boxes_116x8400.bin"
+        ));
+        let raw = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const i8, raw.len()) };
+        Array3::from_shape_vec((1, 116, 8400), raw.to_vec()).unwrap()
+    }
+
+    fn load_yolov8_protos() -> Array4<i8> {
+        let raw = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_protos_160x160x32.bin"
+        ));
+        let raw = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const i8, raw.len()) };
+        Array4::from_shape_vec((1, 160, 160, 32), raw.to_vec()).unwrap()
+    }
+
+    fn load_yolov8s_det() -> Array3<i8> {
+        let raw = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8s_80_classes.bin"
+        ));
+        let raw = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const i8, raw.len()) };
+        Array3::from_shape_vec((1, 84, 8400), raw.to_vec()).unwrap()
+    }
+
     #[test]
     fn test_decoder_modelpack() {
         let score_threshold = 0.45;
@@ -1512,12 +1541,7 @@ mod decoder_tests {
 
     #[test]
     fn test_dequant_chunked() {
-        let out = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8s_80_classes.bin"
-        ));
-        let mut out =
-            unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) }.to_vec();
+        let mut out = load_yolov8s_det().into_raw_vec_and_offset().0;
         out.push(123); // make sure to test non multiple of 16 length
 
         let mut out_dequant = vec![0.0; 84 * 8400 + 1];
@@ -1601,12 +1625,7 @@ mod decoder_tests {
     fn test_decoder_yolo_det() {
         let score_threshold = 0.25;
         let iou_threshold = 0.7;
-        let out = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8s_80_classes.bin"
-        ));
-        let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
-        let out = Array3::from_shape_vec((1, 84, 8400), out.to_vec()).unwrap();
+        let out = load_yolov8s_det();
         let quant = (0.0040811873, -123).into();
 
         let decoder = DecoderBuilder::default()
@@ -1691,29 +1710,18 @@ mod decoder_tests {
     fn test_decoder_masks() {
         let score_threshold = 0.45;
         let iou_threshold = 0.45;
-        let boxes = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_boxes_116x8400.bin"
-        ));
-        let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
-        let boxes = ndarray::Array2::from_shape_vec((116, 8400), boxes.to_vec()).unwrap();
+        let boxes = load_yolov8_boxes();
         let quant_boxes = Quantization::new(0.021287761628627777, 31);
 
-        let protos = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_protos_160x160x32.bin"
-        ));
-        let protos =
-            unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
-        let protos = ndarray::Array3::from_shape_vec((160, 160, 32), protos.to_vec()).unwrap();
+        let protos = load_yolov8_protos();
         let quant_protos = Quantization::new(0.02491161972284317, -117);
         let protos = dequantize_ndarray::<_, _, f32>(protos.view(), quant_protos);
         let seg = dequantize_ndarray::<_, _, f32>(boxes.view(), quant_boxes);
         let mut output_boxes: Vec<_> = Vec::with_capacity(10);
         let mut output_masks: Vec<_> = Vec::with_capacity(10);
         decode_yolo_segdet_float(
-            seg.view(),
-            protos.view(),
+            seg.slice(s![0, .., ..]),
+            protos.slice(s![0, .., .., ..]),
             score_threshold,
             iou_threshold,
             Some(configs::Nms::ClassAgnostic),
@@ -1785,25 +1793,11 @@ mod decoder_tests {
         let iou_threshold = 0.45;
 
         // Load test data — boxes as [116, 8400]
-        let boxes_raw = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_boxes_116x8400.bin"
-        ));
-        let boxes_raw =
-            unsafe { std::slice::from_raw_parts(boxes_raw.as_ptr() as *const i8, boxes_raw.len()) };
-        let boxes_2d = ndarray::Array2::from_shape_vec((116, 8400), boxes_raw.to_vec()).unwrap();
+        let boxes_2d = load_yolov8_boxes().slice_move(s![0, .., ..]);
         let quant_boxes = Quantization::new(0.021287761628627777, 31);
 
         // Load protos as HWC [160, 160, 32] (file layout) then dequantize
-        let protos_raw = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_protos_160x160x32.bin"
-        ));
-        let protos_raw = unsafe {
-            std::slice::from_raw_parts(protos_raw.as_ptr() as *const i8, protos_raw.len())
-        };
-        let protos_hwc =
-            ndarray::Array3::from_shape_vec((160, 160, 32), protos_raw.to_vec()).unwrap();
+        let protos_hwc = load_yolov8_protos().slice_move(s![0, .., .., ..]);
         let quant_protos = Quantization::new(0.02491161972284317, -117);
         let protos_f32_hwc = dequantize_ndarray::<_, _, f32>(protos_hwc.view(), quant_protos);
 
@@ -1897,21 +1891,10 @@ mod decoder_tests {
     fn test_decoder_masks_i8() {
         let score_threshold = 0.45;
         let iou_threshold = 0.45;
-        let boxes = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_boxes_116x8400.bin"
-        ));
-        let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
-        let boxes = ndarray::Array3::from_shape_vec((1, 116, 8400), boxes.to_vec()).unwrap();
+        let boxes = load_yolov8_boxes();
         let quant_boxes = (0.021287761628627777, 31).into();
 
-        let protos = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_protos_160x160x32.bin"
-        ));
-        let protos =
-            unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
-        let protos = ndarray::Array4::from_shape_vec((1, 160, 160, 32), protos.to_vec()).unwrap();
+        let protos = load_yolov8_protos();
         let quant_protos = (0.02491161972284317, -117).into();
         let mut output_boxes: Vec<_> = Vec::with_capacity(500);
         let mut output_masks: Vec<_> = Vec::with_capacity(500);
@@ -2020,11 +2003,7 @@ mod decoder_tests {
     fn test_decoder_yolo_split() {
         let score_threshold = 0.45;
         let iou_threshold = 0.45;
-        let boxes = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_boxes_116x8400.bin"
-        ));
-        let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
+        let boxes = load_yolov8_boxes();
         let boxes: Vec<_> = boxes.iter().map(|x| *x as i16 * 256).collect();
         let boxes = ndarray::Array3::from_shape_vec((1, 116, 8400), boxes).unwrap();
 
@@ -2104,76 +2083,21 @@ mod decoder_tests {
     fn test_decoder_masks_config_mixed() {
         let score_threshold = 0.45;
         let iou_threshold = 0.45;
-        let boxes = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_boxes_116x8400.bin"
-        ));
-        let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
-        let boxes: Vec<_> = boxes.iter().map(|x| *x as i16 * 256).collect();
+        let boxes_raw = load_yolov8_boxes();
+        let boxes: Vec<_> = boxes_raw.iter().map(|x| *x as i16 * 256).collect();
         let boxes = ndarray::Array3::from_shape_vec((1, 116, 8400), boxes).unwrap();
 
-        let quant_boxes = Quantization::new(0.021287761628627777 / 256.0, 31 * 256);
+        let quant_boxes = (0.021287761628627777 / 256.0, 31 * 256);
 
-        let protos = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_protos_160x160x32.bin"
-        ));
-        let protos =
-            unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
-        let protos: Vec<_> = protos.to_vec();
-        let protos = ndarray::Array4::from_shape_vec((1, 160, 160, 32), protos.to_vec()).unwrap();
-        let quant_protos = Quantization::new(0.02491161972284317, -117);
+        let protos = load_yolov8_protos();
+        let quant_protos = (0.02491161972284317, -117);
 
-        let decoder = DecoderBuilder::default()
-            .with_config_yolo_split_segdet(
-                configs::Boxes {
-                    decoder: configs::DecoderType::Ultralytics,
-                    quantization: Some(QuantTuple(quant_boxes.scale, quant_boxes.zero_point)),
-                    shape: vec![1, 4, 8400],
-                    dshape: vec![
-                        (DimName::Batch, 1),
-                        (DimName::BoxCoords, 4),
-                        (DimName::NumBoxes, 8400),
-                    ],
-                    normalized: Some(true),
-                },
-                configs::Scores {
-                    decoder: configs::DecoderType::Ultralytics,
-                    quantization: Some(QuantTuple(quant_boxes.scale, quant_boxes.zero_point)),
-                    shape: vec![1, 80, 8400],
-                    dshape: vec![
-                        (DimName::Batch, 1),
-                        (DimName::NumClasses, 80),
-                        (DimName::NumBoxes, 8400),
-                    ],
-                },
-                configs::MaskCoefficients {
-                    decoder: configs::DecoderType::Ultralytics,
-                    quantization: Some(QuantTuple(quant_boxes.scale, quant_boxes.zero_point)),
-                    shape: vec![1, 32, 8400],
-                    dshape: vec![
-                        (DimName::Batch, 1),
-                        (DimName::NumProtos, 32),
-                        (DimName::NumBoxes, 8400),
-                    ],
-                },
-                configs::Protos {
-                    decoder: configs::DecoderType::Ultralytics,
-                    quantization: Some(QuantTuple(quant_protos.scale, quant_protos.zero_point)),
-                    shape: vec![1, 160, 160, 32],
-                    dshape: vec![
-                        (DimName::Batch, 1),
-                        (DimName::Height, 160),
-                        (DimName::Width, 160),
-                        (DimName::NumProtos, 32),
-                    ],
-                },
-            )
-            .with_score_threshold(score_threshold)
-            .with_iou_threshold(iou_threshold)
-            .build()
-            .unwrap();
-
+        let decoder = build_yolo_split_segdet_decoder(
+            score_threshold,
+            iou_threshold,
+            quant_boxes,
+            quant_protos,
+        );
         let mut output_boxes: Vec<_> = Vec::with_capacity(500);
         let mut output_masks: Vec<_> = Vec::with_capacity(500);
 
@@ -2190,8 +2114,8 @@ mod decoder_tests {
             )
             .unwrap();
 
-        let protos = dequantize_ndarray::<_, _, f32>(protos.view(), quant_protos);
-        let seg = dequantize_ndarray::<_, _, f32>(boxes.view(), quant_boxes);
+        let protos = dequantize_ndarray::<_, _, f32>(protos.view(), quant_protos.into());
+        let seg = dequantize_ndarray::<_, _, f32>(boxes.view(), quant_boxes.into());
         let mut output_boxes_f32: Vec<_> = Vec::with_capacity(500);
         let mut output_masks_f32: Vec<_> = Vec::with_capacity(500);
         decode_yolo_segdet_float(
@@ -2230,36 +2154,17 @@ mod decoder_tests {
         );
     }
 
-    #[test]
-    fn test_decoder_masks_config_i32() {
-        let score_threshold = 0.45;
-        let iou_threshold = 0.45;
-        let boxes = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_boxes_116x8400.bin"
-        ));
-        let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
-        let scale = 1 << 23;
-        let boxes: Vec<_> = boxes.iter().map(|x| *x as i32 * scale).collect();
-        let boxes = ndarray::Array3::from_shape_vec((1, 116, 8400), boxes).unwrap();
-
-        let quant_boxes = Quantization::new(0.021287761628627777 / scale as f32, 31 * scale);
-
-        let protos = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_protos_160x160x32.bin"
-        ));
-        let protos =
-            unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
-        let protos: Vec<_> = protos.iter().map(|x| *x as i32 * scale).collect();
-        let protos = ndarray::Array4::from_shape_vec((1, 160, 160, 32), protos.to_vec()).unwrap();
-        let quant_protos = Quantization::new(0.02491161972284317 / scale as f32, -117 * scale);
-
-        let decoder = DecoderBuilder::default()
+    fn build_yolo_split_segdet_decoder(
+        score_threshold: f32,
+        iou_threshold: f32,
+        quant_boxes: (f32, i32),
+        quant_protos: (f32, i32),
+    ) -> crate::Decoder {
+        DecoderBuilder::default()
             .with_config_yolo_split_segdet(
                 configs::Boxes {
                     decoder: configs::DecoderType::Ultralytics,
-                    quantization: Some(QuantTuple(quant_boxes.scale, quant_boxes.zero_point)),
+                    quantization: Some(quant_boxes.into()),
                     shape: vec![1, 4, 8400],
                     dshape: vec![
                         (DimName::Batch, 1),
@@ -2270,7 +2175,7 @@ mod decoder_tests {
                 },
                 configs::Scores {
                     decoder: configs::DecoderType::Ultralytics,
-                    quantization: Some(QuantTuple(quant_boxes.scale, quant_boxes.zero_point)),
+                    quantization: Some(quant_boxes.into()),
                     shape: vec![1, 80, 8400],
                     dshape: vec![
                         (DimName::Batch, 1),
@@ -2280,7 +2185,7 @@ mod decoder_tests {
                 },
                 configs::MaskCoefficients {
                     decoder: configs::DecoderType::Ultralytics,
-                    quantization: Some(QuantTuple(quant_boxes.scale, quant_boxes.zero_point)),
+                    quantization: Some(quant_boxes.into()),
                     shape: vec![1, 32, 8400],
                     dshape: vec![
                         (DimName::Batch, 1),
@@ -2290,7 +2195,7 @@ mod decoder_tests {
                 },
                 configs::Protos {
                     decoder: configs::DecoderType::Ultralytics,
-                    quantization: Some(QuantTuple(quant_protos.scale, quant_protos.zero_point)),
+                    quantization: Some(quant_protos.into()),
                     shape: vec![1, 160, 160, 32],
                     dshape: vec![
                         (DimName::Batch, 1),
@@ -2303,7 +2208,43 @@ mod decoder_tests {
             .with_score_threshold(score_threshold)
             .with_iou_threshold(iou_threshold)
             .build()
-            .unwrap();
+            .unwrap()
+    }
+
+    fn build_yolov8_seg_decoder(score_threshold: f32, iou_threshold: f32) -> crate::Decoder {
+        let config_yaml = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_seg.yaml"
+        ));
+        DecoderBuilder::default()
+            .with_config_yaml_str(config_yaml.to_string())
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .build()
+            .unwrap()
+    }
+    #[test]
+    fn test_decoder_masks_config_i32() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+        let boxes_raw = load_yolov8_boxes();
+        let scale = 1 << 23;
+        let boxes: Vec<_> = boxes_raw.iter().map(|x| *x as i32 * scale).collect();
+        let boxes = ndarray::Array3::from_shape_vec((1, 116, 8400), boxes).unwrap();
+
+        let quant_boxes = (0.021287761628627777 / scale as f32, 31 * scale);
+
+        let protos_raw = load_yolov8_protos();
+        let protos: Vec<_> = protos_raw.iter().map(|x| *x as i32 * scale).collect();
+        let protos = ndarray::Array4::from_shape_vec((1, 160, 160, 32), protos).unwrap();
+        let quant_protos = (0.02491161972284317 / scale as f32, -117 * scale);
+
+        let decoder = build_yolo_split_segdet_decoder(
+            score_threshold,
+            iou_threshold,
+            quant_boxes,
+            quant_protos,
+        );
 
         let mut output_boxes: Vec<_> = Vec::with_capacity(500);
         let mut output_masks: Vec<_> = Vec::with_capacity(500);
@@ -2321,8 +2262,8 @@ mod decoder_tests {
             )
             .unwrap();
 
-        let protos = dequantize_ndarray::<_, _, f32>(protos.view(), quant_protos);
-        let seg = dequantize_ndarray::<_, _, f32>(boxes.view(), quant_boxes);
+        let protos = dequantize_ndarray::<_, _, f32>(protos.view(), quant_protos.into());
+        let seg = dequantize_ndarray::<_, _, f32>(boxes.view(), quant_boxes.into());
         let mut output_boxes_f32: Vec<_> = Vec::with_capacity(500);
         let mut output_masks_f32: Vec<Segmentation> = Vec::with_capacity(500);
         decode_yolo_segdet_float(
@@ -2351,12 +2292,7 @@ mod decoder_tests {
         let yolo_det = || {
             let score_threshold = 0.25;
             let iou_threshold = 0.7;
-            let out = include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/yolov8s_80_classes.bin"
-            ));
-            let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
-            let out = Array3::from_shape_vec((1, 84, 8400), out.to_vec()).unwrap();
+            let out = load_yolov8s_det();
             let quant = (0.0040811873, -123).into();
 
             let decoder = DecoderBuilder::default()
@@ -2907,68 +2843,10 @@ mod decoder_tests {
         }]
     }
 
-    fn build_split_decoder(
-        score_threshold: f32,
-        iou_threshold: f32,
-        quant_boxes: (f32, i32),
-        quant_protos: (f32, i32),
-    ) -> crate::Decoder {
-        DecoderBuilder::default()
-            .with_config_yolo_split_segdet(
-                configs::Boxes {
-                    decoder: configs::DecoderType::Ultralytics,
-                    quantization: Some(quant_boxes.into()),
-                    shape: vec![1, 4, 8400],
-                    dshape: vec![
-                        (DimName::Batch, 1),
-                        (DimName::BoxCoords, 4),
-                        (DimName::NumBoxes, 8400),
-                    ],
-                    normalized: Some(true),
-                },
-                configs::Scores {
-                    decoder: configs::DecoderType::Ultralytics,
-                    quantization: Some(quant_boxes.into()),
-                    shape: vec![1, 80, 8400],
-                    dshape: vec![
-                        (DimName::Batch, 1),
-                        (DimName::NumClasses, 80),
-                        (DimName::NumBoxes, 8400),
-                    ],
-                },
-                configs::MaskCoefficients {
-                    decoder: configs::DecoderType::Ultralytics,
-                    quantization: Some(quant_boxes.into()),
-                    shape: vec![1, 32, 8400],
-                    dshape: vec![
-                        (DimName::Batch, 1),
-                        (DimName::NumProtos, 32),
-                        (DimName::NumBoxes, 8400),
-                    ],
-                },
-                configs::Protos {
-                    decoder: configs::DecoderType::Ultralytics,
-                    quantization: Some(quant_protos.into()),
-                    shape: vec![1, 160, 160, 32],
-                    dshape: vec![
-                        (DimName::Batch, 1),
-                        (DimName::Height, 160),
-                        (DimName::Width, 160),
-                        (DimName::NumProtos, 32),
-                    ],
-                },
-            )
-            .with_score_threshold(score_threshold)
-            .with_iou_threshold(iou_threshold)
-            .build()
-            .unwrap()
-    }
-
     macro_rules! real_data_proto_test {
         ($name:ident, quantized, $layout:ident) => {
             #[test]
             fn $name() {
-                use crate::configs::Nms;
                 let is_split = matches!(stringify!($layout), "split");
 
                 let score_threshold = 0.45;
@@ -3004,19 +2882,14 @@ mod decoder_tests {
                 let boxes_combined = boxes_i8;
 
                 let decoder = if is_split {
-                    build_split_decoder(score_threshold, iou_threshold, quant_boxes, quant_protos)
+                    build_yolo_split_segdet_decoder(
+                        score_threshold,
+                        iou_threshold,
+                        quant_boxes,
+                        quant_protos,
+                    )
                 } else {
-                    let config_yaml = include_str!(concat!(
-                        env!("CARGO_MANIFEST_DIR"),
-                        "/../../testdata/yolov8_seg.yaml"
-                    ));
-                    DecoderBuilder::default()
-                        .with_config_yaml_str(config_yaml.to_string())
-                        .with_score_threshold(score_threshold)
-                        .with_iou_threshold(iou_threshold)
-                        .with_nms(Some(Nms::ClassAgnostic))
-                        .build()
-                        .unwrap()
+                    build_yolov8_seg_decoder(score_threshold, iou_threshold)
                 };
 
                 let expected = real_data_expected_boxes();
@@ -3044,7 +2917,6 @@ mod decoder_tests {
         ($name:ident, float, $layout:ident) => {
             #[test]
             fn $name() {
-                use crate::configs::Nms;
                 let is_split = matches!(stringify!($layout), "split");
 
                 let score_threshold = 0.45;
@@ -3084,19 +2956,14 @@ mod decoder_tests {
                 let boxes_combined = boxes_f32;
 
                 let decoder = if is_split {
-                    build_split_decoder(score_threshold, iou_threshold, quant_boxes, quant_protos)
+                    build_yolo_split_segdet_decoder(
+                        score_threshold,
+                        iou_threshold,
+                        quant_boxes,
+                        quant_protos,
+                    )
                 } else {
-                    let config_yaml = include_str!(concat!(
-                        env!("CARGO_MANIFEST_DIR"),
-                        "/../../testdata/yolov8_seg.yaml"
-                    ));
-                    DecoderBuilder::default()
-                        .with_config_yaml_str(config_yaml.to_string())
-                        .with_score_threshold(score_threshold)
-                        .with_iou_threshold(iou_threshold)
-                        .with_nms(Some(Nms::ClassAgnostic))
-                        .build()
-                        .unwrap()
+                    build_yolov8_seg_decoder(score_threshold, iou_threshold)
                 };
 
                 let expected = real_data_expected_boxes();
@@ -3689,17 +3556,7 @@ outputs:
             .copy_from_slice(raw_protos);
         let protos_i8 = protos_i8.into();
 
-        let config_yaml = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_seg.yaml"
-        ));
-        let decoder = DecoderBuilder::default()
-            .with_config_yaml_str(config_yaml.to_string())
-            .with_score_threshold(score_threshold)
-            .with_iou_threshold(iou_threshold)
-            .build()
-            .unwrap();
-
+        let decoder = build_yolov8_seg_decoder(score_threshold, iou_threshold);
         let expected = real_data_expected_boxes();
         let mut output_boxes = Vec::with_capacity(50);
 
@@ -3752,16 +3609,7 @@ outputs:
             .copy_from_slice(&raw_protos_f32);
         let protos_f32 = protos_f32.into();
 
-        let config_yaml = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_seg.yaml"
-        ));
-        let decoder = DecoderBuilder::default()
-            .with_config_yaml_str(config_yaml.to_string())
-            .with_score_threshold(score_threshold)
-            .with_iou_threshold(iou_threshold)
-            .build()
-            .unwrap();
+        let decoder = build_yolov8_seg_decoder(score_threshold, iou_threshold);
 
         let expected = real_data_expected_boxes();
         let mut output_boxes = Vec::with_capacity(50);
@@ -3819,16 +3667,7 @@ outputs:
             .copy_from_slice(&raw_protos_f64);
         let protos_f64 = protos_f64.into();
 
-        let config_yaml = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_seg.yaml"
-        ));
-        let decoder = DecoderBuilder::default()
-            .with_config_yaml_str(config_yaml.to_string())
-            .with_score_threshold(score_threshold)
-            .with_iou_threshold(iou_threshold)
-            .build()
-            .unwrap();
+        let decoder = build_yolov8_seg_decoder(score_threshold, iou_threshold);
 
         let expected = real_data_expected_boxes();
         let mut output_boxes = Vec::with_capacity(50);
@@ -3880,16 +3719,7 @@ outputs:
             .copy_from_slice(raw_protos);
         let protos_i8 = protos_i8.into();
 
-        let config_yaml = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_seg.yaml"
-        ));
-        let decoder = DecoderBuilder::default()
-            .with_config_yaml_str(config_yaml.to_string())
-            .with_score_threshold(score_threshold)
-            .with_iou_threshold(iou_threshold)
-            .build()
-            .unwrap();
+        let decoder = build_yolov8_seg_decoder(score_threshold, iou_threshold);
 
         let expected = real_data_expected_boxes();
         let mut output_boxes = Vec::with_capacity(50);
@@ -4129,7 +3959,7 @@ mod decoder_tracked_tests {
         }]
     }
 
-    fn build_split_decoder(
+    fn build_yolo_split_segdet_decoder(
         score_threshold: f32,
         iou_threshold: f32,
         quant_boxes: (f32, i32),
@@ -4186,6 +4016,19 @@ mod decoder_tracked_tests {
             .unwrap()
     }
 
+    fn build_yolov8_seg_decoder(score_threshold: f32, iou_threshold: f32) -> crate::Decoder {
+        let config_yaml = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_seg.yaml"
+        ));
+        DecoderBuilder::default()
+            .with_config_yaml_str(config_yaml.to_string())
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .build()
+            .unwrap()
+    }
+
     // ─── Real-data tracked test macro ───────────────────────────────
     //
     // Generates tests that load i8 binary test data from testdata/ and
@@ -4196,7 +4039,6 @@ mod decoder_tracked_tests {
         ($name:ident, quantized, $layout:ident, $output:ident) => {
             #[test]
             fn $name() {
-                use crate::configs::Nms;
                 let is_split = matches!(stringify!($layout), "split");
                 let is_proto = matches!(stringify!($output), "proto");
 
@@ -4233,19 +4075,14 @@ mod decoder_tracked_tests {
                 let mut boxes_combined = boxes_i8;
 
                 let decoder = if is_split {
-                    build_split_decoder(score_threshold, iou_threshold, quant_boxes, quant_protos)
+                    build_yolo_split_segdet_decoder(
+                        score_threshold,
+                        iou_threshold,
+                        quant_boxes,
+                        quant_protos,
+                    )
                 } else {
-                    let config_yaml = include_str!(concat!(
-                        env!("CARGO_MANIFEST_DIR"),
-                        "/../../testdata/yolov8_seg.yaml"
-                    ));
-                    DecoderBuilder::default()
-                        .with_config_yaml_str(config_yaml.to_string())
-                        .with_score_threshold(score_threshold)
-                        .with_iou_threshold(iou_threshold)
-                        .with_nms(Some(Nms::ClassAgnostic))
-                        .build()
-                        .unwrap()
+                    build_yolov8_seg_decoder(score_threshold, iou_threshold)
                 };
 
                 let expected = real_data_expected_boxes();
@@ -4387,7 +4224,6 @@ mod decoder_tracked_tests {
         ($name:ident, float, $layout:ident, $output:ident) => {
             #[test]
             fn $name() {
-                use crate::configs::Nms;
                 let is_split = matches!(stringify!($layout), "split");
                 let is_proto = matches!(stringify!($output), "proto");
 
@@ -4426,19 +4262,14 @@ mod decoder_tracked_tests {
                 let mut boxes_combined = boxes_f32;
 
                 let decoder = if is_split {
-                    build_split_decoder(score_threshold, iou_threshold, quant_boxes, quant_protos)
+                    build_yolo_split_segdet_decoder(
+                        score_threshold,
+                        iou_threshold,
+                        quant_boxes,
+                        quant_protos,
+                    )
                 } else {
-                    let config_yaml = include_str!(concat!(
-                        env!("CARGO_MANIFEST_DIR"),
-                        "/../../testdata/yolov8_seg.yaml"
-                    ));
-                    DecoderBuilder::default()
-                        .with_config_yaml_str(config_yaml.to_string())
-                        .with_score_threshold(score_threshold)
-                        .with_iou_threshold(iou_threshold)
-                        .with_nms(Some(Nms::ClassAgnostic))
-                        .build()
-                        .unwrap()
+                    build_yolov8_seg_decoder(score_threshold, iou_threshold)
                 };
 
                 let expected = real_data_expected_boxes();
