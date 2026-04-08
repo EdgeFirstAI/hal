@@ -22,6 +22,7 @@ macro_rules! function {
 
 mod cache;
 mod context;
+mod dma_import;
 mod processor;
 mod resources;
 mod shaders;

@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.1] - 2026-04-08
+
+### Added
+
+- **NV12 DMA-BUF plane configuration tests** — comprehensive test coverage
+  for all three NV12 EGL import scenarios: true multiplane (separate
+  DMA-BUFs, libcamera style), same-fd multiplane (dup'd fds with offset,
+  V4L2/GStreamer style), and contiguous single-fd (UV computed from luma
+  geometry). Includes 11 unit tests for `DmaImportAttrs` plane resolution
+  and EGL attribute serialization, plus 3 integration tests exercising the
+  full `import_image` → `eglCreateImage` → `convert()` render path.
+  Validated on Mali G310 (i.MX 95), Vivante GC7000UL (i.MX 8MP), and
+  V3D 7.1 (RPi5).
+
+### Changed
+
+- **Extracted `DmaImportAttrs` from EGL import path** — the plane
+  resolution and EGL attribute-building logic in `create_image_from_dma2`
+  is now a standalone `DmaImportAttrs` struct with `from_tensor()` and
+  `to_egl_attribs()` methods. This separates the testable attribute
+  construction from the actual `eglCreateImage` call. No public API
+  change; the struct is module-internal (`pub(super)`).
+
 ## [0.16.0] - 2026-04-02
 
 ### Changed
