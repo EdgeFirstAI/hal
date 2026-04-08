@@ -3775,8 +3775,6 @@ outputs:
             .unwrap();
 
         assert_eq!(output_boxes.len(), 2);
-        println!("Output box 0: {:?}", output_boxes[0]);
-        println!("Expected box 0: {:?}", expected[0]);
         assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
         assert!(output_boxes[1].equal_within_delta(&expected[1], 1.0 / 160.0));
     }
@@ -3844,8 +3842,6 @@ outputs:
             .unwrap();
 
         assert_eq!(output_boxes.len(), 2);
-        println!("Output box 0: {:?}", output_boxes[0]);
-        println!("Expected box 0: {:?}", expected[0]);
         assert!(output_boxes[0].equal_within_delta(&expected[0], 1.0 / 160.0));
         assert!(output_boxes[1].equal_within_delta(&expected[1], 1.0 / 160.0));
     }
