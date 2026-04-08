@@ -147,6 +147,32 @@ impl DmaImportAttrs {
                 // Contiguous NV12: UV stride matches Y stride
                 plane0_pitch
             };
+            // Validate that the chroma offset + required data fits within the
+            // chroma fd's buffer.  Catches client bugs where the wrong fd is
+            // used for the UV plane (e.g. Y-only fd with vmeta global offset)
+            // and produces a clear error instead of an opaque EGL(BadAlloc).
+            let chroma_h = height / 2;
+            let chroma_data = plane1_pitch.saturating_mul(chroma_h);
+            let required = uv_offset.saturating_add(chroma_data);
+            let buf_size = {
+                let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe { libc::fstat(plane1_fd, &mut stat) } == 0 && stat.st_size > 0 {
+                    Some(stat.st_size as usize)
+                } else {
+                    None
+                }
+            };
+            if let Some(sz) = buf_size {
+                if required > sz {
+                    return Err(Error::InvalidShape(format!(
+                        "NV12 chroma plane offset {uv_offset} + required {chroma_data} bytes \
+                         exceeds chroma fd buffer size {sz} — the chroma PlaneDescriptor \
+                         likely references the wrong fd (e.g. Y-only buffer with the \
+                         vmeta global offset instead of the UV buffer's own fd)",
+                    )));
+                }
+            }
+
             Some(DmaPlane1Attrs {
                 fd: plane1_fd,
                 pitch: plane1_pitch,
@@ -567,6 +593,61 @@ mod tests {
 
         assert_eq!(attrs.plane0_offset, luma_offset);
         assert_eq!(p1.offset, chroma_offset);
+    }
+
+    /// Oversized chroma offset: chroma offset at/past the buffer end.
+    ///
+    /// Reproduces the v4l2h264dec bug: the cameraadaptor passes the Y
+    /// plane's fd for the UV chroma descriptor with vmeta global offset
+    /// (stride × aligned_height).  The Y fd's buffer only covers the Y
+    /// plane, so the offset exceeds the buffer → must return a clear error
+    /// instead of passing through to EGL (which returns opaque BadAlloc).
+    #[test]
+    #[cfg(feature = "dma_test_formats")]
+    fn test_nv12_chroma_offset_exceeds_buffer() {
+        let width: usize = 1920;
+        let height: usize = 1088;
+        let stride: usize = 1920;
+        let y_size = stride * height; // 2,088,960 — also the vmeta global UV offset
+        let chroma_h = height / 2;
+        let _chroma_size = stride * chroma_h;
+
+        // Allocate a buffer sized for Y ONLY (not Y+UV)
+        let y_buf = match alloc_dma(y_size, "y_only_buf") {
+            Some(t) => t,
+            None => {
+                eprintln!("SKIPPED: test_nv12_chroma_offset_exceeds_buffer - DMA not available");
+                return;
+            }
+        };
+
+        let fd = y_buf.dmabuf().unwrap();
+        let luma_pd = PlaneDescriptor::new(fd)
+            .unwrap()
+            .with_stride(stride)
+            .with_offset(0);
+        // Bug scenario: chroma uses same fd as Y but with offset = y_size
+        let chroma_pd = PlaneDescriptor::new(fd)
+            .unwrap()
+            .with_stride(stride)
+            .with_offset(y_size);
+
+        let result = import_nv12(luma_pd, Some(chroma_pd), width, height);
+        // The import itself succeeds (just stores metadata)
+        let tensor = result.unwrap();
+        let tensor_u8 = tensor.as_u8().unwrap();
+
+        // from_tensor must detect that the chroma offset exceeds the buffer
+        let err = DmaImportAttrs::from_tensor(tensor_u8, PixelFormat::Nv12);
+        assert!(
+            err.is_err(),
+            "from_tensor must reject chroma offset {y_size} on a {y_size}-byte buffer"
+        );
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("exceeds chroma fd buffer size"),
+            "error must mention buffer size, got: {msg}"
+        );
     }
 
     // ─── to_egl_attribs tests ────────────────────────────────────────
