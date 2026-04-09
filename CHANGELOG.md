@@ -13,9 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for all three NV12 EGL import scenarios: true multiplane (separate
   DMA-BUFs, libcamera style), same-fd multiplane (dup'd fds with offset,
   V4L2/GStreamer style), and contiguous single-fd (UV computed from luma
-  geometry). Includes 11 unit tests for `DmaImportAttrs` plane resolution
-  and EGL attribute serialization, plus 3 integration tests exercising the
-  full `import_image` → `eglCreateImage` → `convert()` render path.
+  geometry). Unit tests verify `DmaImportAttrs` plane resolution and EGL
+  attribute serialization; integration tests exercise the full
+  `import_image` → `eglCreateImage` → `convert()` render path for each
+  scenario and compare pixel output against a contiguous NV12 reference.
   Validated on Mali G310 (i.MX 95), Vivante GC7000UL (i.MX 8MP), and
   V3D 7.1 (RPi5).
 
