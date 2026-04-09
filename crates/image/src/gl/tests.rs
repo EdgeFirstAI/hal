@@ -1536,6 +1536,136 @@ mod gl_tests {
         assert_pixels_match(map_contig.as_slice(), map_multi.as_slice(), 0);
     }
 
+    /// Same-fd multiplane NV12: both Y and UV planes live in the same
+    /// DMA-BUF, imported via `import_image` with two PlaneDescriptors that
+    /// share the same underlying fd (dup'd).  This mirrors V4L2 / GStreamer
+    /// pipelines where the camera driver exports a single DMA-BUF for both
+    /// planes with the chroma at an offset.
+    ///
+    /// Exercises the full eglCreateImage → convert() render path.
+    /// If this fails on one GPU but passes on others it is a driver
+    /// limitation; if it fails everywhere the HAL attribute construction
+    /// is wrong.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_same_fd_multiplane_nv12_to_rgba_opengl() {
+        use edgefirst_tensor::PlaneDescriptor;
+
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        let nv12_bytes: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/camera720p.nv12"
+        ));
+        let width: usize = 1280;
+        let height: usize = 720;
+        let stride: usize = width; // NV12 Y plane: 1 byte per pixel
+        let y_size = stride * height;
+        let uv_size = stride * (height / 2);
+        let total_bytes = y_size + uv_size;
+        assert_eq!(nv12_bytes.len(), total_bytes);
+
+        // Single DMA-BUF holding both planes contiguously
+        let buf = Tensor::<u8>::new(
+            &[total_bytes],
+            Some(TensorMemory::Dma),
+            Some("same_fd_nv12"),
+        );
+        let buf = match buf {
+            Ok(t) if t.memory() == TensorMemory::Dma => t,
+            _ => {
+                eprintln!("SKIPPED: {} - DMA alloc failed", function!());
+                return;
+            }
+        };
+        // Fill with real NV12 camera data
+        buf.map().unwrap().as_mut_slice()[..total_bytes].copy_from_slice(nv12_bytes);
+
+        // Import as multiplane: two PlaneDescriptors, same fd, different offsets
+        let fd = buf.dmabuf().unwrap();
+        let luma_pd = PlaneDescriptor::new(fd)
+            .unwrap()
+            .with_stride(stride)
+            .with_offset(0);
+        let chroma_pd = PlaneDescriptor::new(fd)
+            .unwrap()
+            .with_stride(stride)
+            .with_offset(y_size);
+
+        let proc = crate::ImageProcessor::new().unwrap();
+        let src = proc
+            .import_image(
+                luma_pd,
+                Some(chroma_pd),
+                width,
+                height,
+                PixelFormat::Nv12,
+                DType::U8,
+            )
+            .unwrap();
+        assert!(src.is_multiplane(), "must be multiplane after import");
+
+        // Also build contiguous reference for comparison
+        let src_contig = load_raw_image(
+            width,
+            height,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Dma),
+            nv12_bytes,
+        )
+        .unwrap();
+
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+
+        // Render same-fd multiplane through full EGL pipeline
+        let mut dst_same_fd = TensorDyn::image(
+            width,
+            height,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        gl.convert(
+            &src,
+            &mut dst_same_fd,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        // Render contiguous reference
+        let mut dst_contig = TensorDyn::image(
+            width,
+            height,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        gl.convert(
+            &src_contig,
+            &mut dst_contig,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        // Compare: same-fd multiplane and contiguous must produce identical pixels
+        let map_same = dst_same_fd.as_u8().unwrap().map().unwrap();
+        let map_contig = dst_contig.as_u8().unwrap().map().unwrap();
+        assert_pixels_match(map_same.as_slice(), map_contig.as_slice(), 0);
+    }
+
     /// Multiplane PixelFormat::Nv12 720p → packed PixelFormat::Rgb 640x640 with letterbox resize via GL.
     /// Validates the packing shader works with multiplane EGLImage source.
     #[test]
@@ -2660,6 +2790,238 @@ mod gl_tests {
         assert_eq!(imported.width(), Some(width));
         assert_eq!(imported.height(), Some(height));
         assert_eq!(imported.format(), Some(PixelFormat::Nv12));
+    }
+
+    /// True multiplane NV12 via `import_image` with separate DMA-BUFs
+    /// (libcamera style): full `import_image` → `eglCreateImage` →
+    /// `convert()` render path.  Compares pixel output against contiguous
+    /// NV12 → RGBA reference.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_import_image_nv12_true_multiplane() {
+        use edgefirst_tensor::PlaneDescriptor;
+
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        let nv12_bytes: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/camera720p.nv12"
+        ));
+        let width: usize = 1280;
+        let height: usize = 720;
+        let stride: usize = width;
+        let y_size = stride * height;
+        let uv_size = stride * (height / 2);
+        assert_eq!(nv12_bytes.len(), y_size + uv_size);
+
+        // Two separate DMA allocations filled with real NV12 data
+        let luma_buf = Tensor::<u8>::new(&[y_size], Some(TensorMemory::Dma), Some("true_mp_luma"));
+        let luma_buf = match luma_buf {
+            Ok(t) if t.memory() == TensorMemory::Dma => t,
+            _ => {
+                eprintln!("SKIPPED: {} - luma DMA alloc failed", function!());
+                return;
+            }
+        };
+        luma_buf.map().unwrap().as_mut_slice()[..y_size].copy_from_slice(&nv12_bytes[..y_size]);
+
+        let chroma_buf =
+            Tensor::<u8>::new(&[uv_size], Some(TensorMemory::Dma), Some("true_mp_chroma"));
+        let chroma_buf = match chroma_buf {
+            Ok(t) if t.memory() == TensorMemory::Dma => t,
+            _ => {
+                eprintln!("SKIPPED: {} - chroma DMA alloc failed", function!());
+                return;
+            }
+        };
+        chroma_buf.map().unwrap().as_mut_slice()[..uv_size].copy_from_slice(&nv12_bytes[y_size..]);
+
+        // Import via import_image with separate PlaneDescriptors
+        let luma_fd = luma_buf.dmabuf().unwrap();
+        let chroma_fd = chroma_buf.dmabuf().unwrap();
+        let luma_plane = PlaneDescriptor::new(luma_fd).unwrap().with_stride(stride);
+        let chroma_plane = PlaneDescriptor::new(chroma_fd).unwrap().with_stride(stride);
+
+        let proc = crate::ImageProcessor::new().unwrap();
+        let src = proc
+            .import_image(
+                luma_plane,
+                Some(chroma_plane),
+                width,
+                height,
+                PixelFormat::Nv12,
+                DType::U8,
+            )
+            .unwrap();
+        assert!(src.is_multiplane(), "must be multiplane after import");
+
+        // Build contiguous reference for pixel comparison
+        let src_contig = load_raw_image(
+            width,
+            height,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Dma),
+            nv12_bytes,
+        )
+        .unwrap();
+
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+
+        // Render true multiplane through full EGL pipeline
+        let mut dst_multi = TensorDyn::image(
+            width,
+            height,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        gl.convert(
+            &src,
+            &mut dst_multi,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        // Render contiguous reference
+        let mut dst_contig = TensorDyn::image(
+            width,
+            height,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        gl.convert(
+            &src_contig,
+            &mut dst_contig,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        // Compare: true multiplane and contiguous must produce identical pixels
+        let map_multi = dst_multi.as_u8().unwrap().map().unwrap();
+        let map_contig = dst_contig.as_u8().unwrap().map().unwrap();
+        assert_pixels_match(map_multi.as_slice(), map_contig.as_slice(), 0);
+    }
+
+    /// Contiguous single-fd NV12 via `import_image` (no chroma descriptor):
+    /// full `import_image` → `eglCreateImage` → `convert()` render path.
+    /// Compares pixel output against `load_raw_image` contiguous reference.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_import_image_nv12_contiguous() {
+        use edgefirst_tensor::PlaneDescriptor;
+
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        let nv12_bytes: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/camera720p.nv12"
+        ));
+        let width: usize = 1280;
+        let height: usize = 720;
+        let stride: usize = width;
+        let total_bytes = nv12_bytes.len();
+
+        // Single DMA buffer holding Y+UV contiguously
+        let buf = Tensor::<u8>::new(
+            &[total_bytes],
+            Some(TensorMemory::Dma),
+            Some("nv12_contiguous"),
+        );
+        let buf = match buf {
+            Ok(t) if t.memory() == TensorMemory::Dma => t,
+            _ => {
+                eprintln!("SKIPPED: {} - DMA alloc failed", function!());
+                return;
+            }
+        };
+        buf.map().unwrap().as_mut_slice()[..total_bytes].copy_from_slice(nv12_bytes);
+
+        // Import via import_image with NO chroma descriptor (contiguous path)
+        let fd = buf.dmabuf().unwrap();
+        let plane = PlaneDescriptor::new(fd).unwrap().with_stride(stride);
+
+        let proc = crate::ImageProcessor::new().unwrap();
+        let src = proc
+            .import_image(plane, None, width, height, PixelFormat::Nv12, DType::U8)
+            .unwrap();
+        assert!(
+            !src.is_multiplane(),
+            "contiguous NV12 must not be multiplane"
+        );
+
+        // Build reference via load_raw_image (same data, same contiguous layout)
+        let src_ref = load_raw_image(
+            width,
+            height,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Dma),
+            nv12_bytes,
+        )
+        .unwrap();
+
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+
+        // Render contiguous import_image path
+        let mut dst_imported = TensorDyn::image(
+            width,
+            height,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        gl.convert(
+            &src,
+            &mut dst_imported,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        // Render reference
+        let mut dst_ref = TensorDyn::image(
+            width,
+            height,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        gl.convert(
+            &src_ref,
+            &mut dst_ref,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        // Compare: import_image contiguous and load_raw_image must produce identical pixels
+        let map_imported = dst_imported.as_u8().unwrap().map().unwrap();
+        let map_ref = dst_ref.as_u8().unwrap().map().unwrap();
+        assert_pixels_match(map_imported.as_slice(), map_ref.as_slice(), 0);
     }
 
     /// Attempt to import with a stride smaller than width * bpp.
