@@ -54,11 +54,11 @@ jobs:
             maturin-deps: maturin[patchelf,zig]
           - name: windows
             runner: windows-latest
-            maturin-args: --sdist
+            maturin-args: ''
             maturin-deps: maturin
           - name: macos
             runner: macos-latest
-            maturin-args: --sdist
+            maturin-args: ''
             maturin-deps: maturin
 
     steps:
