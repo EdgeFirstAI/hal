@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.16.2] - 2026-04-10
+
+### Fixed
+
+- **C API release packaging — proper SOVERSION symlink chain.** The release
+  pipeline now ships the C shared library as a standard GNU/Linux versioned
+  symlink chain:
+
+  ```
+  libedgefirst_hal.so          → libedgefirst_hal.so.0
+  libedgefirst_hal.so.0        → libedgefirst_hal.so.0.16    (name matches DT_SONAME)
+  libedgefirst_hal.so.0.16     → libedgefirst_hal.so.0.16.2
+  libedgefirst_hal.so.0.16.2   (real file)
+  ```
+
+  Previously the release archive contained flat symlinks that all pointed
+  directly at the realname file instead of chaining through the MAJOR and
+  MAJOR.MINOR levels. `DT_SONAME` inside the ELF remains
+  `libedgefirst_hal.so.0` (major only), matching convention used by glibc,
+  OpenSSL, zlib, etc., so the dynamic linker resolves dependents through the
+  chain at runtime. The SOVERSION rationale is now documented in
+  `crates/capi/build.rs`.
+
 ## [0.16.1] - 2026-04-08
 
 ### Added

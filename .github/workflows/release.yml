@@ -149,13 +149,23 @@ jobs:
           # Copy header
           cp crates/capi/include/edgefirst/hal.h "${PKG_NAME}/include/edgefirst/"
 
-          # Copy shared library with versioned name and symlinks (GNU/Linux convention)
+          # Ship the shared library as a proper symlink chain following the
+          # standard GNU/Linux convention:
+          #
+          #   libedgefirst_hal.so                      → libedgefirst_hal.so.${MAJOR}
+          #   libedgefirst_hal.so.${MAJOR}             → libedgefirst_hal.so.${MAJOR}.${MINOR}
+          #   libedgefirst_hal.so.${MAJOR}.${MINOR}    → libedgefirst_hal.so.${MAJOR}.${MINOR}.${PATCH}
+          #   libedgefirst_hal.so.${MAJOR}.${MINOR}.${PATCH}   (real file)
+          #
+          # DT_SONAME inside the ELF is libedgefirst_hal.so.${MAJOR} (see
+          # crates/capi/build.rs), which matches the second-level symlink so
+          # the dynamic linker resolves through the chain at runtime.
           if [ -f "target/release/${{ matrix.lib_shared }}" ]; then
             if [[ "${{ matrix.target }}" == *-linux ]]; then
               cp "target/release/${{ matrix.lib_shared }}" "${PKG_NAME}/lib/libedgefirst_hal.so.${MAJOR}.${MINOR}.${PATCH}"
               ln -s "libedgefirst_hal.so.${MAJOR}.${MINOR}.${PATCH}" "${PKG_NAME}/lib/libedgefirst_hal.so.${MAJOR}.${MINOR}"
-              ln -s "libedgefirst_hal.so.${MAJOR}.${MINOR}.${PATCH}" "${PKG_NAME}/lib/libedgefirst_hal.so.${MAJOR}"
-              ln -s "libedgefirst_hal.so.${MAJOR}.${MINOR}.${PATCH}" "${PKG_NAME}/lib/libedgefirst_hal.so"
+              ln -s "libedgefirst_hal.so.${MAJOR}.${MINOR}"          "${PKG_NAME}/lib/libedgefirst_hal.so.${MAJOR}"
+              ln -s "libedgefirst_hal.so.${MAJOR}"                   "${PKG_NAME}/lib/libedgefirst_hal.so"
             else
               cp "target/release/${{ matrix.lib_shared }}" "${PKG_NAME}/lib/"
             fi
