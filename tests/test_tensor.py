@@ -26,8 +26,9 @@ DTYPE_PARAMS = [
 # fmt: on
 
 
-@pytest.mark.parametrize("dtype,size,fmt,itemsize,val1,val2", DTYPE_PARAMS,
-                         ids=[p[0] for p in DTYPE_PARAMS])
+@pytest.mark.parametrize(
+    "dtype,size,fmt,itemsize,val1,val2", DTYPE_PARAMS, ids=[p[0] for p in DTYPE_PARAMS]
+)
 def test_dtype(dtype, size, fmt, itemsize, val1, val2):
     tensor = Tensor([1, 2, 3, 4, 5], dtype=dtype)
     assert tensor.size == size
@@ -462,9 +463,7 @@ def test_from_numpy_large_transposed():
 
 def test_from_numpy_fortran_order():
     """Fortran-order (column-major) array: non-contiguous in C layout."""
-    arr = np.asfortranarray(
-        np.arange(1, 6 * 8 + 1, dtype="int32").reshape(6, 8)
-    )
+    arr = np.asfortranarray(np.arange(1, 6 * 8 + 1, dtype="int32").reshape(6, 8))
     assert not arr.flags["C_CONTIGUOUS"]
     t = Tensor(list(arr.shape), dtype="int32")
     t.from_numpy(arr)
