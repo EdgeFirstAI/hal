@@ -413,8 +413,12 @@ def test_draw_decoded_masks_with_opacity():
     scores = np.array([0.9], dtype=np.float32)
     classes = np.array([0], dtype=np.uintp)
 
-    converter.draw_decoded_masks(dst_full, bbox=bbox, scores=scores, classes=classes, opacity=1.0)
-    converter.draw_decoded_masks(dst_half, bbox=bbox, scores=scores, classes=classes, opacity=0.3)
+    converter.draw_decoded_masks(
+        dst_full, bbox=bbox, scores=scores, classes=classes, opacity=1.0
+    )
+    converter.draw_decoded_masks(
+        dst_half, bbox=bbox, scores=scores, classes=classes, opacity=0.3
+    )
 
     original = load_image("testdata/giraffe.jpg", "RGBA")
     with dst_full.map() as m1, dst_half.map() as m2:
