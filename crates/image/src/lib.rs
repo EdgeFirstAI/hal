@@ -61,6 +61,73 @@ and hardware acceleration. However, this will increase the performance of the CP
 */
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+/// Pitch alignment requirement for DMA-BUF tensors that may be imported as
+/// EGLImages by the GL backend. Mali Valhall (i.MX 95 / G310) rejects
+/// `eglCreateImageKHR` with `EGL_BAD_ALLOC` for any DMA-BUF whose row pitch
+/// is not a multiple of 64 bytes; Vivante GC7000UL (i.MX 8MP) accepts any
+/// pitch so the constant is harmless on that path. 64 is the smallest
+/// alignment that satisfies every embedded ARM GPU we ship to.
+///
+/// Applied automatically inside [`ImageProcessor::create_image`] when the
+/// allocation lands on `TensorMemory::Dma`. The user-requested width is
+/// rounded up so the resulting row stride satisfies this alignment; logical
+/// dimensions reported by [`TensorDyn::width`] are the rounded-up values.
+pub const GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES: usize = 64;
+
+/// Round `width` (in pixels) up so the resulting row stride
+/// `width * bpp` is a multiple of [`GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES`]
+/// AND a multiple of `bpp` (so the rounded width is an integer pixel count).
+///
+/// `bpp` must be the per-pixel byte count for the image's primary plane
+/// (e.g. 4 for RGBA8/BGRA8, 3 for RGB888, 1 for Grey/NV12-luma).
+pub(crate) fn align_width_for_gpu_pitch(width: usize, bpp: usize) -> usize {
+    if bpp == 0 || width == 0 {
+        return width;
+    }
+    // The minimum aligned stride must be a common multiple of both the
+    // GPU's pitch alignment and the per-pixel byte count. Using the LCM
+    // guarantees the rounded stride is an integer multiple of `bpp`, so
+    // `aligned_pitch / bpp` is a whole pixel count.
+    let lcm_alignment = num_integer_lcm(GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES, bpp);
+    let unaligned_pitch = width * bpp;
+    let aligned_pitch = unaligned_pitch.next_multiple_of(lcm_alignment);
+    aligned_pitch / bpp
+}
+
+fn num_integer_lcm(a: usize, b: usize) -> usize {
+    if a == 0 || b == 0 {
+        0
+    } else {
+        a / num_integer_gcd(a, b) * b
+    }
+}
+
+fn num_integer_gcd(a: usize, b: usize) -> usize {
+    if b == 0 {
+        a
+    } else {
+        num_integer_gcd(b, a % b)
+    }
+}
+
+/// Bytes-per-pixel for the primary plane of `format` at element size `elem`.
+/// Returns `None` for formats that don't have a single packed BPP (semi-planar
+/// chroma is handled separately).
+pub(crate) fn primary_plane_bpp(format: PixelFormat, elem: usize) -> Option<usize> {
+    use edgefirst_tensor::PixelLayout;
+    match format.layout() {
+        PixelLayout::Packed => Some(format.channels() * elem),
+        PixelLayout::Planar => Some(elem),
+        // For NV12/NV16 the luma plane is single-channel so the pitch
+        // matches `elem`; the chroma plane uses the same pitch in bytes
+        // (UV is half-width but two interleaved channels = same pitch).
+        PixelLayout::SemiPlanar => Some(elem),
+        // `PixelLayout` is non-exhaustive — fall through unaligned for
+        // any future variant we don't yet recognise.
+        _ => None,
+    }
+}
+
 use edgefirst_decoder::{DetectBox, ProtoData, Segmentation};
 use edgefirst_tensor::{
     DType, PixelFormat, PixelLayout, Tensor, TensorDyn, TensorMemory, TensorTrait as _,
@@ -926,9 +993,36 @@ impl ImageProcessor {
         dtype: DType,
         memory: Option<TensorMemory>,
     ) -> Result<TensorDyn> {
+        // Round the requested width up so that the resulting row stride
+        // satisfies the GPU's DMA-BUF EGLImage import alignment requirement.
+        // Mali Valhall (i.MX 95) rejects unaligned pitches with
+        // EGL_BAD_ALLOC, which would silently drop the GL backend onto the
+        // ~95 ms non-DMA fallback path. The padding only applies to DMA-
+        // backed allocations and is a no-op when the requested width
+        // already has an aligned pitch (the common case for sizes like
+        // 640, 1280, 1920, 3008, 3840).
+        let dma_width = match primary_plane_bpp(format, dtype.size()) {
+            Some(bpp) => align_width_for_gpu_pitch(width, bpp),
+            None => width,
+        };
+        if dma_width != width {
+            log::debug!(
+                "create_image: padded width {width} → {dma_width} for {format:?} \
+                 to satisfy {GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES}-byte GPU pitch \
+                 alignment"
+            );
+        }
+
         // If an explicit memory type is requested, honour it directly.
         if let Some(mem) = memory {
-            return Ok(TensorDyn::image(width, height, format, dtype, Some(mem))?);
+            // Only DMA allocations need pitch alignment; PBO and Mem use the
+            // user-requested width verbatim.
+            let alloc_width = if mem == TensorMemory::Dma {
+                dma_width
+            } else {
+                width
+            };
+            return Ok(TensorDyn::image(alloc_width, height, format, dtype, Some(mem))?);
         }
 
         // Try DMA first on Linux — skip only when GL has explicitly selected PBO
@@ -945,7 +1039,7 @@ impl ImageProcessor {
 
             if !gl_uses_pbo {
                 if let Ok(img) = TensorDyn::image(
-                    width,
+                    dma_width,
                     height,
                     format,
                     dtype,
@@ -2011,6 +2105,68 @@ const fn denorm<const M: usize, const N: usize>(a: [[f32; M]; N]) -> [[u8; M]; N
 }
 
 const DEFAULT_COLORS_U8: [[u8; 4]; 20] = denorm(DEFAULT_COLORS);
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod alignment_tests {
+    use super::*;
+
+    #[test]
+    fn align_width_rgba8_common_widths() {
+        // RGBA8 (bpp=4, lcm(64,4)=64, so width must round to multiple of 16 px).
+        assert_eq!(align_width_for_gpu_pitch(640, 4), 640); // 2560 byte pitch — already aligned
+        assert_eq!(align_width_for_gpu_pitch(1280, 4), 1280); // 5120
+        assert_eq!(align_width_for_gpu_pitch(1920, 4), 1920); // 7680
+        assert_eq!(align_width_for_gpu_pitch(3840, 4), 3840); // 15360
+        // crowd.png case from the imx95 investigation:
+        assert_eq!(align_width_for_gpu_pitch(3004, 4), 3008); // 12016 → 12032
+        assert_eq!(align_width_for_gpu_pitch(3000, 4), 3008); // 12000 → 12032
+        assert_eq!(align_width_for_gpu_pitch(17, 4), 32); // 68 → 128
+        assert_eq!(align_width_for_gpu_pitch(1, 4), 16); // 4 → 64
+    }
+
+    #[test]
+    fn align_width_rgb888_packed() {
+        // RGB888 (bpp=3, lcm(64,3)=192, so width must round to multiple of 64 px).
+        assert_eq!(align_width_for_gpu_pitch(64, 3), 64); // 192 byte pitch
+        assert_eq!(align_width_for_gpu_pitch(640, 3), 640); // 1920
+        assert_eq!(align_width_for_gpu_pitch(1, 3), 64); // 3 → 192
+        assert_eq!(align_width_for_gpu_pitch(65, 3), 128); // 195 → 384
+        // Verify the rounded width × bpp is a clean multiple of the LCM.
+        for w in [3004usize, 1281, 100, 17] {
+            let padded = align_width_for_gpu_pitch(w, 3);
+            assert!(padded >= w);
+            assert_eq!((padded * 3) % 64, 0);
+            assert_eq!((padded * 3) % 3, 0);
+        }
+    }
+
+    #[test]
+    fn align_width_grey_u8() {
+        // Grey (bpp=1, lcm(64,1)=64, so width must round to multiple of 64 px).
+        assert_eq!(align_width_for_gpu_pitch(64, 1), 64);
+        assert_eq!(align_width_for_gpu_pitch(640, 1), 640);
+        assert_eq!(align_width_for_gpu_pitch(1, 1), 64);
+        assert_eq!(align_width_for_gpu_pitch(65, 1), 128);
+    }
+
+    #[test]
+    fn align_width_zero_inputs() {
+        assert_eq!(align_width_for_gpu_pitch(0, 4), 0);
+        assert_eq!(align_width_for_gpu_pitch(640, 0), 640);
+    }
+
+    #[test]
+    fn primary_plane_bpp_known_formats() {
+        // Packed formats use channels × elem_size.
+        assert_eq!(primary_plane_bpp(PixelFormat::Rgba, 1), Some(4));
+        assert_eq!(primary_plane_bpp(PixelFormat::Bgra, 1), Some(4));
+        assert_eq!(primary_plane_bpp(PixelFormat::Rgb, 1), Some(3));
+        assert_eq!(primary_plane_bpp(PixelFormat::Grey, 1), Some(1));
+        // Semi-planar (NV12) reports the luma plane's bpp.
+        assert_eq!(primary_plane_bpp(PixelFormat::Nv12, 1), Some(1));
+    }
+}
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
