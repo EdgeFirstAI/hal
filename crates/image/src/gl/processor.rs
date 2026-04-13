@@ -131,6 +131,38 @@ impl Drop for GLProcessorST {
     }
 }
 
+/// Emit a warning the first time a draw operation falls back from the
+/// DMA-BUF fast path to the CPU readback fallback. The fast path is silent;
+/// the slow path is loud (once) so a regression — for example a tensor with
+/// a non-aligned pitch or a missing extension — does not silently degrade
+/// performance by 10–20× without anyone noticing.
+///
+/// The message includes the failing call site, the failing setup function,
+/// and the underlying error so the user can map it back to the root cause
+/// (commonly Mali's 64-byte pitch alignment requirement). Subsequent
+/// fallbacks are demoted to debug-level.
+fn warn_slow_path_once(call_site: &str, failing_setup: &str, err: &crate::Error) {
+    use std::sync::Once;
+    static SLOW_PATH_WARNED: Once = Once::new();
+    let mut emitted = false;
+    SLOW_PATH_WARNED.call_once(|| {
+        log::warn!(
+            "{call_site}: GL DMA-BUF fast path unavailable, falling back to CPU \
+             readback (10–20× slower). Cause: {failing_setup} returned {err:?}. \
+             On Mali Valhall (i.MX 95) this is usually because the destination \
+             tensor's row pitch is not 64-byte aligned — see \
+             `ImageProcessor::create_image` for automatic alignment. \
+             Subsequent fallbacks will be logged at debug level."
+        );
+        emitted = true;
+    });
+    if !emitted {
+        log::debug!(
+            "{call_site}: GL DMA-BUF fast path unavailable ({failing_setup}: {err:?})"
+        );
+    }
+}
+
 /// Reinterpret a `&mut Tensor<i8>` as `&mut Tensor<u8>`.
 ///
 /// # Safety
@@ -752,6 +784,14 @@ impl GLProcessorST {
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
         let memory = dst.memory();
+        // Trace logs are expensive to format (struct Debug, env reads). Gate
+        // on the global level filter so they're a single integer compare
+        // when trace logging is disabled.
+        if log::log_enabled!(log::Level::Trace) {
+            log::trace!(
+                "draw_decoded_masks: dst.memory()={memory:?} {dst_w}x{dst_h} fmt={dst_fmt:?}"
+            );
+        }
         let pbo_buffer_id = if memory == TensorMemory::Pbo {
             match dst.as_pbo() {
                 Some(p) if !p.is_mapped() => Some(p.buffer_id()),
@@ -762,12 +802,40 @@ impl GLProcessorST {
         };
 
         let is_dma = match memory {
-            TensorMemory::Dma if self.setup_draw_renderbuffer_dma(dst, dst_fmt).is_ok() => true,
+            TensorMemory::Dma => match self.setup_draw_renderbuffer_dma(dst, dst_fmt) {
+                Ok(()) => {
+                    if log::log_enabled!(log::Level::Trace) {
+                        log::trace!(
+                            "draw_decoded_masks: DMA fast path (setup_draw_renderbuffer_dma OK)"
+                        );
+                    }
+                    true
+                }
+                Err(e) => {
+                    warn_slow_path_once("draw_decoded_masks", "setup_draw_renderbuffer_dma", &e);
+                    if let Some(buffer_id) = pbo_buffer_id {
+                        self.setup_renderbuffer_from_pbo(dst, dst_fmt, buffer_id)?;
+                    } else {
+                        self.setup_renderbuffer_non_dma(
+                            dst,
+                            dst_fmt,
+                            Crop::new().with_dst_rect(Some(Rect::new(0, 0, 0, 0))),
+                        )?;
+                    }
+                    false
+                }
+            },
             _ if pbo_buffer_id.is_some() => {
+                if log::log_enabled!(log::Level::Trace) {
+                    log::trace!("draw_decoded_masks: PBO path");
+                }
                 self.setup_renderbuffer_from_pbo(dst, dst_fmt, pbo_buffer_id.unwrap())?;
                 false
             }
             _ => {
+                if log::log_enabled!(log::Level::Trace) {
+                    log::trace!("draw_decoded_masks: non-DMA fallback (memory={memory:?})");
+                }
                 self.setup_renderbuffer_non_dma(
                     dst,
                     dst_fmt,
@@ -918,6 +986,11 @@ impl GLProcessorST {
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
         let memory = dst.memory();
+        if log::log_enabled!(log::Level::Trace) {
+            log::trace!(
+                "draw_proto_masks: dst.memory()={memory:?} {dst_w}x{dst_h} fmt={dst_fmt:?}"
+            );
+        }
         let pbo_buffer_id = if memory == TensorMemory::Pbo {
             match dst.as_pbo() {
                 Some(p) if !p.is_mapped() => Some(p.buffer_id()),
@@ -928,12 +1001,40 @@ impl GLProcessorST {
         };
 
         let is_dma = match memory {
-            TensorMemory::Dma if self.setup_draw_renderbuffer_dma(dst, dst_fmt).is_ok() => true,
+            TensorMemory::Dma => match self.setup_draw_renderbuffer_dma(dst, dst_fmt) {
+                Ok(()) => {
+                    if log::log_enabled!(log::Level::Trace) {
+                        log::trace!(
+                            "draw_proto_masks: DMA fast path (setup_draw_renderbuffer_dma OK)"
+                        );
+                    }
+                    true
+                }
+                Err(e) => {
+                    warn_slow_path_once("draw_proto_masks", "setup_draw_renderbuffer_dma", &e);
+                    if let Some(buffer_id) = pbo_buffer_id {
+                        self.setup_renderbuffer_from_pbo(dst, dst_fmt, buffer_id)?;
+                    } else {
+                        self.setup_renderbuffer_non_dma(
+                            dst,
+                            dst_fmt,
+                            Crop::new().with_dst_rect(Some(Rect::new(0, 0, 0, 0))),
+                        )?;
+                    }
+                    false
+                }
+            },
             _ if pbo_buffer_id.is_some() => {
+                if log::log_enabled!(log::Level::Trace) {
+                    log::trace!("draw_proto_masks: PBO path");
+                }
                 self.setup_renderbuffer_from_pbo(dst, dst_fmt, pbo_buffer_id.unwrap())?;
                 false
             }
             _ => {
+                if log::log_enabled!(log::Level::Trace) {
+                    log::trace!("draw_proto_masks: non-DMA fallback (memory={memory:?})");
+                }
                 self.setup_renderbuffer_non_dma(
                     dst,
                     dst_fmt,
@@ -3890,24 +3991,17 @@ impl GLProcessorST {
         Ok(())
     }
 
-    fn render_yolo_segmentation(
-        &mut self,
-        dst_roi: RegionOfInterest,
-        segmentation: &[u8],
-        shape: [usize; 2],
-        class: usize,
-    ) -> Result<(), crate::Error> {
-        log::debug!("start render_yolo_segmentation");
-
-        let [height, width] = shape;
-
-        let format = gls::gl::RED;
+    /// Bind the instanced segmentation program and configure the persistent
+    /// mask texture for a batch of `render_yolo_segmentation` calls.
+    ///
+    /// Call once before the per-detection loop. Hoisting this out of
+    /// `render_yolo_segmentation` avoids N× redundant `glTexParameteri`,
+    /// `glUseProgram`, and `glBindTexture` calls per frame.
+    fn setup_yolo_segmentation_pass(&self) {
         let texture_target = gls::gl::TEXTURE_2D;
         gls::use_program(self.instanced_segmentation_program.id);
-        self.instanced_segmentation_program
-            .load_uniform_1i(c"class_index", class as i32)?;
-        gls::bind_texture(texture_target, self.segmentation_texture.id);
         gls::active_texture(gls::gl::TEXTURE0);
+        gls::bind_texture(texture_target, self.segmentation_texture.id);
         gls::tex_parameteri(
             texture_target,
             gls::gl::TEXTURE_MIN_FILTER,
@@ -3923,44 +4017,75 @@ impl GLProcessorST {
             gls::gl::TEXTURE_WRAP_S,
             gls::gl::CLAMP_TO_EDGE as i32,
         );
-
         gls::tex_parameteri(
             texture_target,
             gls::gl::TEXTURE_WRAP_T,
             gls::gl::CLAMP_TO_EDGE as i32,
         );
+    }
 
-        // Build a 1px zero-padded texture so bilinear interpolation blends
-        // smoothly to zero at the mask boundary (instead of clamping to the
-        // edge pixel value with GL_CLAMP_TO_EDGE).
-        let pad_w = width + 2;
-        let pad_h = height + 2;
-        let mut padded = vec![0u8; pad_w * pad_h];
-        for row in 0..height {
-            let src_start = row * width;
-            let dst_start = (row + 1) * pad_w + 1;
-            padded[dst_start..dst_start + width]
-                .copy_from_slice(&segmentation[src_start..src_start + width]);
-        }
+    /// Render a single pre-decoded YOLO segmentation mask as a coloured
+    /// overlay quad. The caller must invoke [`setup_yolo_segmentation_pass`]
+    /// once before the first call in a batch so the program, bound texture,
+    /// and texture parameters are already set.
+    ///
+    /// Each call uploads the mask via `glTexImage2D`, which implicitly
+    /// orphans the previous storage on most drivers. This avoids the
+    /// read-after-write hazard a persistent texture would introduce on
+    /// Vivante, which serialises every `glTexSubImage2D` against the still
+    /// in-flight previous draw and ends up slower than orphaning.
+    /// Compared with the original implementation we still drop the
+    /// per-instance CPU 1 px zero-pad copy — the shader's
+    /// `smoothstep(0.5, 0.65)` provides the edge antialiasing that the
+    /// padding used to proxy for, and texel-centre UVs keep bilinear
+    /// sampling strictly inside the uploaded mask region.
+    fn render_yolo_segmentation(
+        &mut self,
+        dst_roi: RegionOfInterest,
+        segmentation: &[u8],
+        shape: [usize; 2],
+        class: usize,
+    ) -> Result<(), crate::Error> {
+        let [height, width] = shape;
+        let texture_target = gls::gl::TEXTURE_2D;
 
+        // Per-instance allocation + upload, equivalent to the old code path
+        // but without the CPU pad copy. `glTexImage2D` here implicitly
+        // orphans the texture's previous backing store on Vivante / Mali —
+        // the in-flight previous draw keeps the old storage alive while
+        // the new mask uploads to fresh memory, preserving CPU/GPU
+        // parallelism.
         gls::tex_image2d(
             texture_target,
             0,
-            format as i32,
-            pad_w as i32,
-            pad_h as i32,
+            gls::gl::R8 as i32,
+            width as i32,
+            height as i32,
             0,
-            format,
+            gls::gl::RED,
             gls::gl::UNSIGNED_BYTE,
-            Some(&padded),
+            Some(segmentation),
         );
 
-        // Map UVs to the inner region, excluding the 1px zero border.
+        self.instanced_segmentation_program
+            .load_uniform_1i(c"class_index", class as i32)?;
+
+        // Texel-centre UVs: bilinear filtering returns the exact uploaded
+        // texel value at each corner of the quad, so no sampling reaches
+        // outside the mask data and no zero-padding border is needed.
+        let u_lo = 0.5 / width as f32;
+        let v_lo = 0.5 / height as f32;
+        let u_hi = (width as f32 - 0.5) / width as f32;
+        let v_hi = (height as f32 - 0.5) / height as f32;
+
+        // tc.y = 0 corresponds to mask row 0 (image top); NDC top of the quad
+        // (`dst_roi.top`, which holds `cvt_screen_coord(seg.ymax)`) renders
+        // image bottom, so the first two tex vertices get `v_hi`.
         let src_roi = RegionOfInterest {
-            left: 1.0 / pad_w as f32,
-            top: (height + 1) as f32 / pad_h as f32,
-            right: (width + 1) as f32 / pad_w as f32,
-            bottom: 1.0 / pad_h as f32,
+            left: u_lo,
+            top: v_hi,
+            right: u_hi,
+            bottom: v_lo,
         };
 
         unsafe {
@@ -4015,7 +4140,23 @@ impl GLProcessorST {
                 gls::gl::UNSIGNED_INT,
                 vertices_index.as_ptr() as *const c_void,
             );
-            gls::gl::Finish();
+
+            // Vivante (i.MX 8MP GC7000UL) regresses ~2× when many masks
+            // queue without periodic drains: the driver appears to enter
+            // a slow allocation path once its command buffer or texture
+            // orphan queue fills. An explicit `glFinish()` per instance
+            // matches the legacy behaviour and keeps the per-instance
+            // cost bounded.
+            //
+            // Mali Valhall (i.MX 95) is the opposite — `glFinish()` here
+            // forces a TBDR tile store-unload of the framebuffer per
+            // draw, which dominates the per-instance cost. Letting the
+            // pipeline batch into the single `gls::finish()` at the end
+            // of `draw_decoded_masks_impl` recovers ~30% on a 40-mask
+            // crowd scene.
+            if self.is_vivante {
+                gls::gl::Finish();
+            }
         }
 
         Ok(())
@@ -4719,6 +4860,12 @@ impl GLProcessorST {
                 ],
             )?;
         } else {
+            // Hoist program bind, texture bind, and texture parameter
+            // configuration out of the per-detection loop. These never
+            // change between masks, so a single setup call replaces
+            // ~5×N redundant GL state calls.
+            self.setup_yolo_segmentation_pass();
+
             for (idx, (seg, det)) in segmentation.iter().zip(detect).enumerate() {
                 let color_index = color_mode.index(idx, det.label);
                 let dst_roi = RegionOfInterest {
