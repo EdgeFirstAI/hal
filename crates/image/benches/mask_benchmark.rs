@@ -372,12 +372,14 @@ fn bench_hybrid_materialize_and_draw(proc: &mut ImageProcessor, suite: &mut Benc
 // Main
 // =============================================================================
 
-/// Diagnostic mode (gated on `MASK_BENCH_DIAG=1`) — bypass the timing loop,
-/// allocate a destination via `processor.create_image`, log its
-/// `dst.memory()` (so we know whether DMA actually worked), then call both
-/// `draw_decoded_masks` and `draw_proto_masks` once each and dump the
-/// rendered output to `/tmp/mask_decoded.rgba` and `/tmp/mask_proto.rgba`
-/// for visual verification.
+/// Diagnostic mode (enabled when `MASK_BENCH_DIAG=1`, `true`, or `yes`) —
+/// bypass the timing loop, allocate a destination via
+/// `processor.create_image`, log its `dst.memory()` (so we know whether DMA
+/// actually worked), then call both `draw_decoded_masks` and
+/// `draw_proto_masks` once each and dump the rendered output to
+/// `/tmp/mask_decoded.rgba` and `/tmp/mask_proto.rgba` for visual
+/// verification. Any other value of the env var (including `0` and `false`)
+/// leaves the bench in normal timing-loop mode.
 ///
 /// This is the diagnostic path for the "draw_decoded_masks doesn't modify
 /// the destination on i.MX 95" bug. It uses embedded test data so it
@@ -508,7 +510,10 @@ fn main() {
     let mut suite = BenchSuite::from_args();
     let mut proc = ImageProcessor::new().expect("Failed to create ImageProcessor");
 
-    if std::env::var("MASK_BENCH_DIAG").is_ok() {
+    let diag_enabled = std::env::var("MASK_BENCH_DIAG")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(false);
+    if diag_enabled {
         run_diagnostic(&mut proc);
         return;
     }

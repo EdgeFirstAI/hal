@@ -69,9 +69,10 @@ and hardware acceleration. However, this will increase the performance of the CP
 /// alignment that satisfies every embedded ARM GPU we ship to.
 ///
 /// Applied automatically inside [`ImageProcessor::create_image`] when the
-/// allocation lands on `TensorMemory::Dma`. The user-requested width is
-/// rounded up so the resulting row stride satisfies this alignment; logical
-/// dimensions reported by [`TensorDyn::width`] are the rounded-up values.
+/// allocation lands on `TensorMemory::Dma`. External callers that allocate
+/// their own DMA-BUF tensors (e.g. GStreamer plugins, video pipelines) can
+/// use [`align_width_for_gpu_pitch`] to compute a width whose resulting row
+/// stride satisfies this requirement.
 pub const GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES: usize = 64;
 
 /// Round `width` (in pixels) up so the resulting row stride
@@ -80,26 +81,96 @@ pub const GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES: usize = 64;
 ///
 /// `bpp` must be the per-pixel byte count for the image's primary plane
 /// (e.g. 4 for RGBA8/BGRA8, 3 for RGB888, 1 for Grey/NV12-luma).
-pub(crate) fn align_width_for_gpu_pitch(width: usize, bpp: usize) -> usize {
+///
+/// External callers — GStreamer plugins, video pipelines, anyone wrapping a
+/// foreign DMA-BUF — should call this when sizing the destination so that
+/// `eglCreateImageKHR` doesn't reject the import on Mali. Pre-aligned widths
+/// (640, 1280, 1920, 3008, 3840 …) round-trip unchanged; misaligned widths
+/// are bumped up to the next valid value.
+///
+/// # Overflow behaviour
+///
+/// All arithmetic is checked. If the alignment computation or the rounded
+/// width would overflow `usize`, the function logs a warning and returns the
+/// original `width` unchanged rather than wrapping or producing a smaller
+/// value. Callers can rely on the returned width being **at least** the
+/// requested width.
+///
+/// `bpp == 0` and `width == 0` short-circuit to return the input unchanged.
+///
+/// # Examples
+///
+/// ```
+/// use edgefirst_image::align_width_for_gpu_pitch;
+///
+/// // RGBA8 (bpp=4): width must round to a multiple of 16 pixels (64-byte stride).
+/// assert_eq!(align_width_for_gpu_pitch(1920, 4), 1920); // already aligned
+/// assert_eq!(align_width_for_gpu_pitch(3004, 4), 3008); // crowd.png case: +4 px
+/// assert_eq!(align_width_for_gpu_pitch(1281, 4), 1296); // +15 px
+///
+/// // RGB888 (bpp=3): width must round to a multiple of 64 pixels (192-byte stride).
+/// assert_eq!(align_width_for_gpu_pitch(640, 3), 640);
+/// assert_eq!(align_width_for_gpu_pitch(641, 3), 704);
+/// ```
+pub fn align_width_for_gpu_pitch(width: usize, bpp: usize) -> usize {
     if bpp == 0 || width == 0 {
         return width;
     }
+
     // The minimum aligned stride must be a common multiple of both the
     // GPU's pitch alignment and the per-pixel byte count. Using the LCM
     // guarantees the rounded stride is an integer multiple of `bpp`, so
-    // `aligned_pitch / bpp` is a whole pixel count.
-    let lcm_alignment = num_integer_lcm(GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES, bpp);
-    let unaligned_pitch = width * bpp;
-    let aligned_pitch = unaligned_pitch.next_multiple_of(lcm_alignment);
-    aligned_pitch / bpp
+    // converting back to a pixel count is exact.
+    //
+    // Compute the alignment in pixels (`width_alignment`) so we never need
+    // to multiply `width * bpp`, which is the only operation that could
+    // realistically overflow for large caller-supplied widths.
+    let Some(lcm_alignment) = checked_num_integer_lcm(GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES, bpp)
+    else {
+        log::warn!(
+            "align_width_for_gpu_pitch: lcm({GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES}, {bpp}) \
+             overflows usize, returning unaligned width {width}"
+        );
+        return width;
+    };
+    if lcm_alignment == 0 {
+        return width;
+    }
+
+    debug_assert_eq!(lcm_alignment % bpp, 0);
+    let width_alignment = lcm_alignment / bpp;
+    if width_alignment == 0 {
+        return width;
+    }
+
+    let remainder = width % width_alignment;
+    if remainder == 0 {
+        return width;
+    }
+
+    let pad = width_alignment - remainder;
+    match width.checked_add(pad) {
+        Some(aligned) => aligned,
+        None => {
+            log::warn!(
+                "align_width_for_gpu_pitch: width {width} + pad {pad} overflows usize, \
+                 returning unaligned (caller should use a smaller width or pre-aligned size)"
+            );
+            width
+        }
+    }
 }
 
-fn num_integer_lcm(a: usize, b: usize) -> usize {
+/// Overflow-safe least common multiple. Returns `None` when `(a / gcd) * b`
+/// would wrap.
+fn checked_num_integer_lcm(a: usize, b: usize) -> Option<usize> {
     if a == 0 || b == 0 {
-        0
-    } else {
-        a / num_integer_gcd(a, b) * b
+        return Some(0);
     }
+    let g = num_integer_gcd(a, b);
+    // a / g is exact (g divides a by definition) and at most a, so this
+    // division never panics. Only the subsequent multiply can overflow.
+    (a / g).checked_mul(b)
 }
 
 fn num_integer_gcd(a: usize, b: usize) -> usize {
@@ -112,8 +183,20 @@ fn num_integer_gcd(a: usize, b: usize) -> usize {
 
 /// Bytes-per-pixel for the primary plane of `format` at element size `elem`.
 /// Returns `None` for formats that don't have a single packed BPP (semi-planar
-/// chroma is handled separately).
-pub(crate) fn primary_plane_bpp(format: PixelFormat, elem: usize) -> Option<usize> {
+/// chroma is handled separately, returning the luma-plane bpp).
+///
+/// External callers can use this together with [`align_width_for_gpu_pitch`]
+/// to size their own DMA-BUFs without having to remember per-format BPPs:
+///
+/// ```
+/// use edgefirst_image::{align_width_for_gpu_pitch, primary_plane_bpp};
+/// use edgefirst_tensor::PixelFormat;
+///
+/// let bpp = primary_plane_bpp(PixelFormat::Rgba, 1).unwrap();
+/// let aligned = align_width_for_gpu_pitch(3004, bpp);
+/// assert_eq!(aligned, 3008);
+/// ```
+pub fn primary_plane_bpp(format: PixelFormat, elem: usize) -> Option<usize> {
     use edgefirst_tensor::PixelLayout;
     match format.layout() {
         PixelLayout::Packed => Some(format.channels() * elem),
@@ -2154,6 +2237,72 @@ mod alignment_tests {
     fn align_width_zero_inputs() {
         assert_eq!(align_width_for_gpu_pitch(0, 4), 0);
         assert_eq!(align_width_for_gpu_pitch(640, 0), 640);
+    }
+
+    #[test]
+    fn align_width_never_returns_smaller_than_input() {
+        // Spot-check the "returned width >= input width" contract across a
+        // range of values that would previously have hit `width * bpp`
+        // overflow paths.
+        for &bpp in &[1usize, 2, 3, 4, 8] {
+            for &w in &[
+                1usize,
+                17,
+                64,
+                65,
+                100,
+                1280,
+                1281,
+                1920,
+                3004,
+                3072,
+                3840,
+                usize::MAX / 8,
+                usize::MAX / 4,
+                usize::MAX / 2,
+                usize::MAX - 1,
+                usize::MAX,
+            ] {
+                let aligned = align_width_for_gpu_pitch(w, bpp);
+                assert!(
+                    aligned >= w,
+                    "align_width_for_gpu_pitch({w}, {bpp}) = {aligned} < {w}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn align_width_overflow_returns_unaligned_not_smaller() {
+        // For width values close to usize::MAX, padding up would wrap. The
+        // function must return the original width rather than wrapping or
+        // panicking. A pre-aligned width round-trips unchanged even at the
+        // extreme.
+        let aligned_extreme = usize::MAX - 15; // 16-pixel boundary for RGBA8
+        assert_eq!(align_width_for_gpu_pitch(aligned_extreme, 4), aligned_extreme);
+        // A misaligned extreme value cannot be rounded up — the function
+        // returns the original.
+        let misaligned_extreme = usize::MAX - 1;
+        let result = align_width_for_gpu_pitch(misaligned_extreme, 4);
+        assert!(
+            result == misaligned_extreme || result >= misaligned_extreme,
+            "extreme misaligned width must not be rounded down to {result}"
+        );
+    }
+
+    #[test]
+    fn checked_lcm_basic_and_overflow() {
+        assert_eq!(checked_num_integer_lcm(64, 4), Some(64));
+        assert_eq!(checked_num_integer_lcm(64, 3), Some(192));
+        assert_eq!(checked_num_integer_lcm(64, 1), Some(64));
+        assert_eq!(checked_num_integer_lcm(0, 4), Some(0));
+        assert_eq!(checked_num_integer_lcm(64, 0), Some(0));
+        // Coprime values whose product exceeds usize::MAX must return None.
+        assert_eq!(
+            checked_num_integer_lcm(usize::MAX, usize::MAX - 1),
+            None,
+            "coprime extreme values must overflow detect, not panic"
+        );
     }
 
     #[test]
