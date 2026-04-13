@@ -486,6 +486,11 @@ struct InstancedPath {
     unit_quad_vbo: u32,
     instance_vbo: u32,
     ebo: u32,
+    /// Pre-allocated host-side buffer for the per-instance attribute table.
+    /// Reused across `render()` calls so the timing loop doesn't pay for a
+    /// `Vec` allocation on every iteration. Capacity is fixed at construction
+    /// to `InstancedPath::capacity`.
+    instance_attrs: Vec<MaskInstanceAttr>,
 }
 
 impl InstancedPath {
@@ -633,6 +638,7 @@ impl InstancedPath {
                 unit_quad_vbo,
                 instance_vbo,
                 ebo,
+                instance_attrs: Vec::with_capacity(capacity as usize),
             })
         }
     }
@@ -642,11 +648,32 @@ impl InstancedPath {
     /// `flat_masks` must be a contiguous `(N, CELL_H, CELL_W)` buffer —
     /// the same layout the real `MaskPool` will use, so this matches the
     /// production cost.
-    fn render(&self, detections: &[Detection], flat_masks: &[u8]) {
+    ///
+    /// The per-instance attribute table is reused from `self.instance_attrs`
+    /// (pre-allocated to `capacity`) so the timing loop never pays for a
+    /// `Vec` allocation. `&mut self` is required for the in-place rebuild;
+    /// the GL draw is otherwise unchanged.
+    fn render(&mut self, detections: &[Detection], flat_masks: &[u8]) {
         assert!(detections.len() <= self.capacity as usize);
         let n = detections.len() as i32;
         let expected_bytes = (CELL_W * CELL_H * n) as usize;
         assert_eq!(flat_masks.len(), expected_bytes);
+
+        // Rebuild the instance attribute table in place. The pre-allocated
+        // capacity guarantees `extend` here never reallocates.
+        self.instance_attrs.clear();
+        self.instance_attrs.extend(detections.iter().enumerate().map(|(i, d)| {
+            MaskInstanceAttr {
+                bbox_ndc: d.bbox_ndc,
+                mask_extent: [1.0, 1.0], // POC: every mask fills its cell
+                layer: i as f32,
+                class_index: d.class_index as f32,
+            }
+        }));
+        debug_assert!(
+            self.instance_attrs.len() <= self.instance_attrs.capacity(),
+            "instance_attrs reallocated mid-frame — capacity sizing is wrong"
+        );
 
         unsafe {
             gls::gl::UseProgram(self.program);
@@ -670,24 +697,12 @@ impl InstancedPath {
                 flat_masks.as_ptr() as *const c_void,
             );
 
-            // Build per-instance attribute table.
-            let attrs: Vec<MaskInstanceAttr> = detections
-                .iter()
-                .enumerate()
-                .map(|(i, d)| MaskInstanceAttr {
-                    bbox_ndc: d.bbox_ndc,
-                    mask_extent: [1.0, 1.0], // POC: every mask fills its cell
-                    layer: i as f32,
-                    class_index: d.class_index as f32,
-                })
-                .collect();
-
             gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.instance_vbo);
             gls::gl::BufferSubData(
                 gls::gl::ARRAY_BUFFER,
                 0,
-                (std::mem::size_of::<MaskInstanceAttr>() * attrs.len()) as isize,
-                attrs.as_ptr() as *const c_void,
+                (std::mem::size_of::<MaskInstanceAttr>() * self.instance_attrs.len()) as isize,
+                self.instance_attrs.as_ptr() as *const c_void,
             );
 
             // VAO holds the attribute pointer state (set once at init).
@@ -737,7 +752,7 @@ fn read_back_fbo() -> Vec<u8> {
     buf
 }
 
-fn compare_paths(detections: &[Detection], masks: &[Vec<u8>], flat_masks: &[u8], baseline: &BaselinePath, instanced: &InstancedPath) -> (u32, u32) {
+fn compare_paths(detections: &[Detection], masks: &[Vec<u8>], flat_masks: &[u8], baseline: &BaselinePath, instanced: &mut InstancedPath) -> (u32, u32) {
     unsafe {
         // Render baseline
         gls::gl::ClearColor(0.0, 0.0, 0.0, 0.0);
@@ -813,7 +828,7 @@ pub fn run(_ctx: &GpuContext) -> Vec<BenchResult> {
         }
     };
     let max_capacity = *N_DETECT_SWEEP.iter().max().unwrap_or(&80);
-    let instanced = match InstancedPath::new(max_capacity) {
+    let mut instanced = match InstancedPath::new(max_capacity) {
         Ok(i) => i,
         Err(e) => {
             println!("  SKIP: instanced path init failed: {e}");
@@ -838,7 +853,8 @@ pub fn run(_ctx: &GpuContext) -> Vec<BenchResult> {
         let dets = synthesize_detections(10);
         let masks: Vec<Vec<u8>> = (0..10).map(synthesize_mask).collect();
         let flat_masks: Vec<u8> = masks.iter().flat_map(|m| m.iter().copied()).collect();
-        let (diff_px, max_diff) = compare_paths(&dets, &masks, &flat_masks, &baseline, &instanced);
+        let (diff_px, max_diff) =
+            compare_paths(&dets, &masks, &flat_masks, &baseline, &mut instanced);
         let total_px = (FBO_W * FBO_H) as u32;
         println!(
             "  Cross-validation at N=10: differing pixels = {} / {} ({:.1}%), max channel sum diff = {}",

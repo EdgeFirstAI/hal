@@ -74,10 +74,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `log::log_enabled!(Trace)` so the formatting cost is a single
   integer compare when trace logging is disabled.
 
-- **`align_width_for_gpu_pitch` and `GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES`**
-  public helpers in `edgefirst_image` for callers that need to allocate
-  GPU-import-compatible DMA-BUFs themselves (e.g. gstreamer plugins,
-  video pipelines).
+- **GPU pitch alignment helpers exposed to all language bindings** so
+  callers that allocate their own DMA-BUFs (GStreamer plugins, V4L2 ring
+  buffers, custom video pipelines) can size them to satisfy Mali's
+  64-byte requirement without having to hard-code the constant. The
+  helpers all delegate to a single overflow-safe Rust implementation
+  that returns the original width unchanged (with a warn-level log) if
+  the rounded value would overflow `usize`, so callers can rely on the
+  returned width being **at least** the requested width.
+
+  | Language | Symbols |
+  | --- | --- |
+  | Rust | `edgefirst_image::align_width_for_gpu_pitch`, `edgefirst_image::primary_plane_bpp`, `edgefirst_image::GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES` |
+  | C | `hal_align_width_for_gpu_pitch`, `hal_align_width_for_pixel_format`, `hal_gpu_dma_buf_pitch_alignment_bytes` |
+  | Python | `edgefirst_hal.align_width_for_gpu_pitch`, `edgefirst_hal.align_width_for_pixel_format`, `edgefirst_hal.gpu_dma_buf_pitch_alignment_bytes` |
+
+  The `*_for_pixel_format` variants in C and Python derive bytes-per-pixel
+  from a `HalPixelFormat`/`PyPixelFormat` + dtype so callers don't have
+  to remember per-format BPPs. Unit tests cover RGBA8/BGRA8, RGB888,
+  Grey/u8, NV12 luma, zero-input edge cases, and overflow-extreme widths
+  (up to `usize::MAX`).
 
 - **`mask_benchmark` diagnostic mode.** `MASK_BENCH_DIAG=1` bypasses the
   timing loop and runs a single `draw_decoded_masks` + `draw_proto_masks`
