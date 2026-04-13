@@ -7,6 +7,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.3] - 2026-04-13
+
+### Fixed
+
+- **Mali Valhall DMA-BUF pitch alignment (i.MX 95).** `eglCreateImageKHR`
+  on Mali Valhall (e.g. Mali-G310 on i.MX 95) rejects every DMA-BUF whose
+  row pitch is not a multiple of 64 bytes, returning `EGL_BAD_ALLOC`.
+  The HAL was gracefully falling through to the non-DMA CPU readback
+  path, which is 10–20× slower and indistinguishable from "DMA worked
+  but rendered nothing." This affected `draw_decoded_masks` and
+  `draw_proto_masks` on i.MX 95 for any canvas whose
+  `width × bytes_per_pixel` was not 64-aligned (e.g. crowd-scene canvases
+  at 3004×1688 RGBA8 → pitch 12016, 16-aligned, fail). Convert paths
+  were unaffected because their source buffers come from
+  libcamera/v4l2, which already align to the GPU's preferred pitch.
+
+  `ImageProcessor::create_image` now silently rounds the requested width
+  up so the resulting row stride satisfies
+  `GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES` (64) and an integer multiple of
+  the format's bytes-per-pixel. The padding only applies to DMA-backed
+  allocations and is a no-op for the common aligned widths (640, 1280,
+  1920, 3008, 3840). Vivante GC7000UL accepts every pitch and the
+  padding is harmless on that path. Verified on i.MX 95: crowd canvas
+  draw drops from 91 ms → 8.86 ms (~10× faster).
+
+### Performance
+
+- **`render_yolo_segmentation` per-instance overhead.** The hot inner
+  loop of `draw_decoded_masks` paid for four `glTexParameteri` calls,
+  a `Vec<u8>` heap allocation + 1 px CPU zero-pad copy, and a
+  `glFinish` after every draw. All four are now eliminated or hoisted
+  out of the per-instance loop:
+  - `setup_yolo_segmentation_pass` runs once before the batch and sets
+    program/texture/parameters.
+  - The CPU pad is gone; texel-centre UVs (`0.5/w` to `(w-0.5)/w`)
+    keep bilinear sampling strictly inside the uploaded mask region.
+    The fragment shader's existing `smoothstep(0.5, 0.65)` provides
+    the edge antialiasing the pad used to proxy for.
+  - Internal format switched from unsized `GL_RED` to sized `GL_R8`.
+  - `glFinish` per instance is now branched on `is_vivante`. Vivante's
+    immediate-mode driver regresses ~2× without the periodic drain;
+    Mali Valhall's TBDR pipeline regresses ~30% *with* it (every
+    flush forces a tile store-unload of the framebuffer). The split
+    lets each driver win.
+
+  Combined with the alignment fix above, the Kinara `yolov8.rs` example
+  on imx95 with `crowd.png` (39 detections) drops Draw stage from
+  135.89 ms → ~10 ms end-to-end. imx8mp Vivante crowd Draw is unchanged
+  at ~38 ms in this release; further improvement requires the Tier 2-a
+  mask pool work (separate effort).
+
+### Added
+
+- **One-time slow-path warning.** `draw_decoded_masks` and
+  `draw_proto_masks` now emit a single warn-level log the first time
+  they fall back from the DMA fast path to the CPU readback path,
+  identifying the call site, the failing setup function, and the
+  underlying error. The message specifically calls out Mali's 64-byte
+  pitch requirement so the next regression has a direct pointer at the
+  cause. Subsequent fallbacks are demoted to debug-level.
+
+- **Trace-level draw-path diagnostics.** Both draw entry points log at
+  `log::trace!` level when entering, and report which path was taken
+  (DMA fast path / PBO / non-DMA fallback). Gated on
+  `log::log_enabled!(Trace)` so the formatting cost is a single
+  integer compare when trace logging is disabled.
+
+- **`align_width_for_gpu_pitch` and `GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES`**
+  public helpers in `edgefirst_image` for callers that need to allocate
+  GPU-import-compatible DMA-BUFs themselves (e.g. gstreamer plugins,
+  video pipelines).
+
+- **`mask_benchmark` diagnostic mode.** `MASK_BENCH_DIAG=1` bypasses the
+  timing loop and runs a single `draw_decoded_masks` + `draw_proto_masks`
+  pair against a real DMA-allocated destination, dumps the rendered
+  bytes to `/tmp/mask_decoded.rgba` / `/tmp/mask_proto.rgba`, and reports
+  call latency. `MASK_BENCH_DST_W` and `MASK_BENCH_DST_H` env vars
+  override the canvas dimensions for reproducing arbitrary caller
+  sizing.
+
+- **`bench_mask_pool` POC bench in `gpu-probe`.** Standalone GL-only
+  proof-of-concept that compares the per-instance baseline against an
+  instanced `GL_TEXTURE_2D_ARRAY` + `glDrawElementsInstanced` path at
+  N ∈ {2, 5, 10, 20, 40, 80}. Includes pixel-level cross-validation and
+  a separate `readback_640x640_rgba8` measurement. Used for the Tier 2-a
+  mask pool design validation.
+
 ## [0.16.2] - 2026-04-10
 
 ### Fixed
