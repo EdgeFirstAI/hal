@@ -5,6 +5,7 @@ use edgefirst_bench as bench;
 mod bench_dma;
 mod bench_egl_image;
 mod bench_fbo;
+mod bench_mask_pool;
 mod bench_pipeline;
 mod bench_render;
 mod bench_rgb_direct;
@@ -71,6 +72,9 @@ fn main() {
         bench_fbo::run(&ctx);
         bench_texture::run(&ctx);
         bench_shader::run(&ctx);
+
+        // Tier 2-a mask pool POC: run unconditionally (no DMA-BUF dep yet).
+        bench_mask_pool::run(&ctx);
 
         if has_egl_image {
             bench_render::run(&ctx);
