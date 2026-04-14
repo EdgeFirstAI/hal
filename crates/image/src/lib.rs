@@ -2891,9 +2891,10 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     fn test_create_image_nv12_dma_non_aligned_width() {
         // Regression for C2: create_image must not apply stride padding to
-        // planar (non-Packed) formats. NV12 is planar, so the try_dma path
-        // should fall through to the plain TensorDyn::image allocation for
-        // any width, regardless of the 64-byte GPU pitch alignment.
+        // non-packed formats. NV12 is semi-planar (PixelLayout::SemiPlanar),
+        // so the try_dma path should fall through to the plain
+        // TensorDyn::image allocation for any width, regardless of the
+        // 64-byte GPU pitch alignment.
         let converter = ImageProcessor::new().unwrap();
 
         // 100 is intentionally not a multiple of 64 (the Mali pitch
