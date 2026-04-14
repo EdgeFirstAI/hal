@@ -490,16 +490,10 @@ where
         DmaTensor::<T>::new_with_byte_size(shape, byte_size, name).map(TensorStorage::Dma)
     }
 
-    #[cfg(not(target_os = "linux"))]
-    pub(crate) fn new_dma_with_byte_size(
-        _shape: &[usize],
-        _byte_size: usize,
-        _name: Option<&str>,
-    ) -> Result<Self> {
-        Err(crate::error::Error::NotImplemented(
-            "new_dma_with_byte_size requires Linux".to_owned(),
-        ))
-    }
+    // No non-Linux stub: the only caller (`Tensor::image_with_stride`)
+    // returns `NotImplemented` directly on non-Linux without ever
+    // reaching the storage layer, so defining a stub here would be
+    // dead code and fail the `-D warnings` clippy gate on macOS CI.
 
     /// Create a new tensor storage using the given file descriptor, shape,
     /// and optional name.
@@ -774,52 +768,68 @@ where
         row_stride_bytes: usize,
         memory: Option<TensorMemory>,
     ) -> Result<Self> {
-        if format.layout() != PixelLayout::Packed {
-            return Err(Error::NotImplemented(format!(
-                "Tensor::image_with_stride only supports packed pixel layouts, got {format:?}"
-            )));
+        // DMA backing (the only thing this constructor produces) is
+        // Linux-only. Bail out early on macOS/BSD/Windows before any of
+        // the validation-derived locals are constructed so the non-Linux
+        // build doesn't produce `unused variable` warnings under the
+        // workspace's `-D warnings` clippy gate.
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (width, height, format, row_stride_bytes, memory);
+            return Err(Error::NotImplemented(
+                "image_with_stride requires DMA support (Linux only)".to_owned(),
+            ));
         }
-        let elem = std::mem::size_of::<T>();
-        let min_stride = width
-            .checked_mul(format.channels())
-            .and_then(|p| p.checked_mul(elem))
-            .ok_or_else(|| {
-                Error::InvalidArgument(format!(
-                    "image_with_stride: width {width} × channels {} × sizeof::<T>={elem} \
-                     overflows usize",
-                    format.channels()
-                ))
-            })?;
-        if row_stride_bytes < min_stride {
-            return Err(Error::InvalidArgument(format!(
-                "image_with_stride: row_stride {row_stride_bytes} < minimum {min_stride} \
-                 ({width} px × {} ch × {elem} B)",
-                format.channels()
-            )));
-        }
-        let total_byte_size = row_stride_bytes.checked_mul(height).ok_or_else(|| {
-            Error::InvalidArgument(format!(
-                "image_with_stride: row_stride {row_stride_bytes} × height {height} overflows usize"
-            ))
-        })?;
 
-        let shape = vec![height, width, format.channels()];
-
-        let storage = match memory {
-            Some(TensorMemory::Dma) | None => {
-                TensorStorage::<T>::new_dma_with_byte_size(&shape, total_byte_size, None)?
-            }
-            Some(other) => {
+        #[cfg(target_os = "linux")]
+        {
+            if format.layout() != PixelLayout::Packed {
                 return Err(Error::NotImplemented(format!(
-                    "image_with_stride: only TensorMemory::Dma is supported, got {other:?}"
+                    "Tensor::image_with_stride only supports packed pixel layouts, got {format:?}"
                 )));
             }
-        };
+            let elem = std::mem::size_of::<T>();
+            let min_stride = width
+                .checked_mul(format.channels())
+                .and_then(|p| p.checked_mul(elem))
+                .ok_or_else(|| {
+                    Error::InvalidArgument(format!(
+                        "image_with_stride: width {width} × channels {} × sizeof::<T>={elem} \
+                         overflows usize",
+                        format.channels()
+                    ))
+                })?;
+            if row_stride_bytes < min_stride {
+                return Err(Error::InvalidArgument(format!(
+                    "image_with_stride: row_stride {row_stride_bytes} < minimum {min_stride} \
+                     ({width} px × {} ch × {elem} B)",
+                    format.channels()
+                )));
+            }
+            let total_byte_size = row_stride_bytes.checked_mul(height).ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "image_with_stride: row_stride {row_stride_bytes} × height {height} overflows usize"
+                ))
+            })?;
 
-        let mut t = Self::wrap(storage);
-        t.format = Some(format);
-        t.row_stride = Some(row_stride_bytes);
-        Ok(t)
+            let shape = vec![height, width, format.channels()];
+
+            let storage = match memory {
+                Some(TensorMemory::Dma) | None => {
+                    TensorStorage::<T>::new_dma_with_byte_size(&shape, total_byte_size, None)?
+                }
+                Some(other) => {
+                    return Err(Error::NotImplemented(format!(
+                        "image_with_stride: only TensorMemory::Dma is supported, got {other:?}"
+                    )));
+                }
+            };
+
+            let mut t = Self::wrap(storage);
+            t.format = Some(format);
+            t.row_stride = Some(row_stride_bytes);
+            Ok(t)
+        }
     }
 
     /// Attach format metadata to an existing tensor.
@@ -1230,38 +1240,47 @@ where
     }
 
     fn map(&self) -> Result<TensorMap<T>> {
+        // CPU mapping of strided tensors is allowed only when the HAL
+        // owns the underlying allocation — i.e. self-allocated DMA
+        // tensors with pitch padding added by `image_with_stride()`
+        // for GPU import alignment. In that case we know the buffer
+        // is exactly `row_stride × height` bytes (for packed formats)
+        // and callers that respect the stride can iterate rows
+        // correctly via `effective_row_stride()`.
+        //
+        // Foreign DMA-BUFs imported via `from_fd()` + `set_row_stride()`
+        // (the V4L2 / GStreamer case) are rejected: their layout comes
+        // from an external allocator and the HAL cannot validate what
+        // the caller expects the mapping to look like. Those tensors
+        // are intended for the GPU path only.
+        //
+        // The cfg split keeps `stride` from being an unused binding on
+        // non-Linux builds (the Linux branch is the only consumer).
+        #[cfg(target_os = "linux")]
         if let Some(stride) = self.row_stride {
-            // CPU mapping of strided tensors is allowed only when the HAL
-            // owns the underlying allocation — i.e. self-allocated DMA
-            // tensors with pitch padding added by `image_with_stride()`
-            // for GPU import alignment. In that case we know the buffer
-            // is exactly `row_stride × height` bytes (for packed
-            // formats) and callers that respect the stride can iterate
-            // rows correctly via `effective_row_stride()`.
-            //
-            // Foreign DMA-BUFs imported via `from_fd()` + `set_row_stride()`
-            // (the V4L2 / GStreamer case) are rejected: their layout comes
-            // from an external allocator and the HAL cannot validate what
-            // the caller expects the mapping to look like. Those tensors
-            // are intended for the GPU path only.
-            #[cfg(target_os = "linux")]
-            {
-                if let TensorStorage::Dma(dma) = &self.storage {
-                    if !dma.is_imported {
-                        // Self-allocated strided DMA tensor — expose the
-                        // full stride×height padded mmap via the override
-                        // constructor so callers can iterate rows with
-                        // `effective_row_stride()` without going past
-                        // the end of the returned slice.
-                        let height = self.height().unwrap_or(0);
-                        let total_bytes = stride.saturating_mul(height);
-                        return dma.map_with_byte_size(total_bytes).map(TensorMap::Dma);
-                    }
+            if let TensorStorage::Dma(dma) = &self.storage {
+                if !dma.is_imported {
+                    // Self-allocated strided DMA tensor — expose the
+                    // full stride×height padded mmap via the override
+                    // constructor so callers can iterate rows with
+                    // `effective_row_stride()` without going past
+                    // the end of the returned slice.
+                    let height = self.height().unwrap_or(0);
+                    let total_bytes = stride.saturating_mul(height);
+                    return dma.map_with_byte_size(total_bytes).map(TensorMap::Dma);
                 }
             }
             return Err(Error::InvalidOperation(
                 "CPU mapping of strided foreign tensors is not supported; \
                  use GPU path only"
+                    .into(),
+            ));
+        }
+        #[cfg(not(target_os = "linux"))]
+        if self.row_stride.is_some() {
+            return Err(Error::InvalidOperation(
+                "CPU mapping of strided tensors is not supported on this \
+                 platform (DMA backing is Linux-only)"
                     .into(),
             ));
         }
@@ -1626,8 +1645,10 @@ mod image_tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn image_tensor_with_stride_rejects_non_packed() {
-        // NV12 is SemiPlanar → not supported.
+        // NV12 is SemiPlanar → not supported. (Linux-only because
+        // `TensorMemory::Dma` itself is a Linux-only enum variant.)
         let err = Tensor::<u8>::image_with_stride(
             640,
             480,
