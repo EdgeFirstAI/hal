@@ -769,16 +769,20 @@ where
         memory: Option<TensorMemory>,
     ) -> Result<Self> {
         // DMA backing (the only thing this constructor produces) is
-        // Linux-only. Bail out early on macOS/BSD/Windows before any of
-        // the validation-derived locals are constructed so the non-Linux
-        // build doesn't produce `unused variable` warnings under the
-        // workspace's `-D warnings` clippy gate.
+        // Linux-only. On macOS/BSD/Windows the non-Linux block below is
+        // the only compiled body and returns `NotImplemented` directly;
+        // on Linux the non-Linux block is cfg-removed and the function
+        // falls through to the real validation + allocation path. Each
+        // target compiles exactly one of the two blocks, and the block
+        // serves as the function's tail expression in both cases — so
+        // neither needs an explicit `return` (avoids
+        // `clippy::needless_return` on the macOS CI gate).
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (width, height, format, row_stride_bytes, memory);
-            return Err(Error::NotImplemented(
+            Err(Error::NotImplemented(
                 "image_with_stride requires DMA support (Linux only)".to_owned(),
-            ));
+            ))
         }
 
         #[cfg(target_os = "linux")]
