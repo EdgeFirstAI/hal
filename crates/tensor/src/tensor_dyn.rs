@@ -367,6 +367,87 @@ impl TensorDyn {
             DType::F64 => Tensor::<f64>::image(width, height, format, memory).map(Self::F64),
         }
     }
+
+    /// Create a DMA-backed image tensor with an explicit row stride that
+    /// may exceed the natural `width * channels * sizeof(T)` pitch.
+    ///
+    /// See [`Tensor::image_with_stride`] for the detailed contract and
+    /// constraints. The TensorDyn wrapper dispatches to the appropriate
+    /// monomorphised `Tensor<T>` based on `dtype`.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use edgefirst_tensor::{TensorDyn, PixelFormat, DType, TensorMemory};
+    /// # fn main() -> edgefirst_tensor::Result<()> {
+    /// // Allocate a 3004×1688 RGBA8 canvas with 64-byte pitch alignment
+    /// // (12032 bytes per row instead of the natural 12016).
+    /// let img = TensorDyn::image_with_stride(
+    ///     3004, 1688,
+    ///     PixelFormat::Rgba, DType::U8,
+    ///     12032,
+    ///     Some(TensorMemory::Dma),
+    /// )?;
+    /// assert_eq!(img.width(), Some(3004));       // logical, unchanged
+    /// assert_eq!(img.effective_row_stride(), Some(12032)); // padded
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn image_with_stride(
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+        dtype: DType,
+        row_stride_bytes: usize,
+        memory: Option<TensorMemory>,
+    ) -> crate::Result<Self> {
+        match dtype {
+            DType::U8 => {
+                Tensor::<u8>::image_with_stride(width, height, format, row_stride_bytes, memory)
+                    .map(Self::U8)
+            }
+            DType::I8 => {
+                Tensor::<i8>::image_with_stride(width, height, format, row_stride_bytes, memory)
+                    .map(Self::I8)
+            }
+            DType::U16 => {
+                Tensor::<u16>::image_with_stride(width, height, format, row_stride_bytes, memory)
+                    .map(Self::U16)
+            }
+            DType::I16 => {
+                Tensor::<i16>::image_with_stride(width, height, format, row_stride_bytes, memory)
+                    .map(Self::I16)
+            }
+            DType::U32 => {
+                Tensor::<u32>::image_with_stride(width, height, format, row_stride_bytes, memory)
+                    .map(Self::U32)
+            }
+            DType::I32 => {
+                Tensor::<i32>::image_with_stride(width, height, format, row_stride_bytes, memory)
+                    .map(Self::I32)
+            }
+            DType::U64 => {
+                Tensor::<u64>::image_with_stride(width, height, format, row_stride_bytes, memory)
+                    .map(Self::U64)
+            }
+            DType::I64 => {
+                Tensor::<i64>::image_with_stride(width, height, format, row_stride_bytes, memory)
+                    .map(Self::I64)
+            }
+            DType::F16 => {
+                Tensor::<f16>::image_with_stride(width, height, format, row_stride_bytes, memory)
+                    .map(Self::F16)
+            }
+            DType::F32 => {
+                Tensor::<f32>::image_with_stride(width, height, format, row_stride_bytes, memory)
+                    .map(Self::F32)
+            }
+            DType::F64 => {
+                Tensor::<f64>::image_with_stride(width, height, format, row_stride_bytes, memory)
+                    .map(Self::F64)
+            }
+        }
+    }
 }
 
 // --- From impls ---

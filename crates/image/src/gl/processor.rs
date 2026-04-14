@@ -157,9 +157,7 @@ fn warn_slow_path_once(call_site: &str, failing_setup: &str, err: &crate::Error)
         emitted = true;
     });
     if !emitted {
-        log::debug!(
-            "{call_site}: GL DMA-BUF fast path unavailable ({failing_setup}: {err:?})"
-        );
+        log::debug!("{call_site}: GL DMA-BUF fast path unavailable ({failing_setup}: {err:?})");
     }
 }
 

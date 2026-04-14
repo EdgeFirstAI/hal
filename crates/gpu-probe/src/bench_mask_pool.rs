@@ -142,13 +142,26 @@ void main() {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_COLORS: [[f32; 4]; 20] = [
-    [0.0, 0.5, 0.0, 0.5], [1.0, 0.4, 0.0, 0.5], [0.5, 0.0, 0.5, 0.5],
-    [0.0, 0.5, 0.5, 0.5], [0.5, 0.5, 0.0, 0.5], [0.8, 0.0, 0.2, 0.5],
-    [0.2, 0.4, 0.8, 0.5], [0.4, 0.8, 0.2, 0.5], [0.8, 0.2, 0.6, 0.5],
-    [0.2, 0.8, 0.6, 0.5], [0.6, 0.2, 0.4, 0.5], [0.4, 0.2, 0.8, 0.5],
-    [0.6, 0.6, 0.2, 0.5], [0.2, 0.6, 0.6, 0.5], [0.8, 0.6, 0.2, 0.5],
-    [0.2, 0.4, 0.4, 0.5], [0.6, 0.4, 0.8, 0.5], [0.4, 0.6, 0.4, 0.5],
-    [0.8, 0.4, 0.4, 0.5], [0.4, 0.4, 0.6, 0.5],
+    [0.0, 0.5, 0.0, 0.5],
+    [1.0, 0.4, 0.0, 0.5],
+    [0.5, 0.0, 0.5, 0.5],
+    [0.0, 0.5, 0.5, 0.5],
+    [0.5, 0.5, 0.0, 0.5],
+    [0.8, 0.0, 0.2, 0.5],
+    [0.2, 0.4, 0.8, 0.5],
+    [0.4, 0.8, 0.2, 0.5],
+    [0.8, 0.2, 0.6, 0.5],
+    [0.2, 0.8, 0.6, 0.5],
+    [0.6, 0.2, 0.4, 0.5],
+    [0.4, 0.2, 0.8, 0.5],
+    [0.6, 0.6, 0.2, 0.5],
+    [0.2, 0.6, 0.6, 0.5],
+    [0.8, 0.6, 0.2, 0.5],
+    [0.2, 0.4, 0.4, 0.5],
+    [0.6, 0.4, 0.8, 0.5],
+    [0.4, 0.6, 0.4, 0.5],
+    [0.8, 0.4, 0.4, 0.5],
+    [0.4, 0.4, 0.6, 0.5],
 ];
 
 // ---------------------------------------------------------------------------
@@ -181,7 +194,7 @@ fn synthesize_mask(seed: u32) -> Vec<u8> {
 /// Build a synthetic detection layout: N quads scattered across the FBO,
 /// each ~80×80 pixels, deterministic positions.
 struct Detection {
-    bbox_ndc: [f32; 4],   // xmin ymin xmax ymax in NDC
+    bbox_ndc: [f32; 4], // xmin ymin xmax ymax in NDC
     class_index: u32,
 }
 
@@ -261,7 +274,9 @@ fn detect_vivante() -> bool {
         if r.is_null() {
             return false;
         }
-        let s = std::ffi::CStr::from_ptr(r as *const _).to_string_lossy().to_lowercase();
+        let s = std::ffi::CStr::from_ptr(r as *const _)
+            .to_string_lossy()
+            .to_lowercase();
         s.contains("vivante") || s.contains("gc7000") || s.contains("galcore")
     }
 }
@@ -290,17 +305,14 @@ impl BaselinePath {
         unsafe {
             // Set static uniforms (colors, opacity, mask0 sampler unit)
             gls::gl::UseProgram(program);
-            let colors_loc =
-                gls::gl::GetUniformLocation(program, c"colors".as_ptr());
+            let colors_loc = gls::gl::GetUniformLocation(program, c"colors".as_ptr());
             gls::gl::Uniform4fv(colors_loc, 20, DEFAULT_COLORS.as_flattened().as_ptr());
-            let opacity_loc =
-                gls::gl::GetUniformLocation(program, c"opacity".as_ptr());
+            let opacity_loc = gls::gl::GetUniformLocation(program, c"opacity".as_ptr());
             gls::gl::Uniform1f(opacity_loc, 1.0);
             let mask0_loc = gls::gl::GetUniformLocation(program, c"mask0".as_ptr());
             gls::gl::Uniform1i(mask0_loc, 0);
 
-            let class_index_loc =
-                gls::gl::GetUniformLocation(program, c"class_index".as_ptr());
+            let class_index_loc = gls::gl::GetUniformLocation(program, c"class_index".as_ptr());
 
             let mut tex = 0u32;
             gls::gl::GenTextures(1, &mut tex);
@@ -424,10 +436,18 @@ impl BaselinePath {
                 gls::gl::Uniform1i(self.class_index_loc, det.class_index as i32);
 
                 let verts: [f32; 12] = [
-                    det.bbox_ndc[0], det.bbox_ndc[3], 0.0,  // top-left  (NDC top = ymax)
-                    det.bbox_ndc[2], det.bbox_ndc[3], 0.0,  // top-right
-                    det.bbox_ndc[2], det.bbox_ndc[1], 0.0,  // bottom-right
-                    det.bbox_ndc[0], det.bbox_ndc[1], 0.0,  // bottom-left
+                    det.bbox_ndc[0],
+                    det.bbox_ndc[3],
+                    0.0, // top-left  (NDC top = ymax)
+                    det.bbox_ndc[2],
+                    det.bbox_ndc[3],
+                    0.0, // top-right
+                    det.bbox_ndc[2],
+                    det.bbox_ndc[1],
+                    0.0, // bottom-right
+                    det.bbox_ndc[0],
+                    det.bbox_ndc[1],
+                    0.0, // bottom-left
                 ];
                 gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer);
                 gls::gl::BufferSubData(
@@ -437,12 +457,7 @@ impl BaselinePath {
                     verts.as_ptr() as *const c_void,
                 );
 
-                gls::gl::DrawElements(
-                    gls::gl::TRIANGLE_FAN,
-                    4,
-                    gls::gl::UNSIGNED_INT,
-                    null(),
-                );
+                gls::gl::DrawElements(gls::gl::TRIANGLE_FAN, 4, gls::gl::UNSIGNED_INT, null());
 
                 if self.is_vivante {
                     gls::gl::Finish();
@@ -662,14 +677,15 @@ impl InstancedPath {
         // Rebuild the instance attribute table in place. The pre-allocated
         // capacity guarantees `extend` here never reallocates.
         self.instance_attrs.clear();
-        self.instance_attrs.extend(detections.iter().enumerate().map(|(i, d)| {
-            MaskInstanceAttr {
-                bbox_ndc: d.bbox_ndc,
-                mask_extent: [1.0, 1.0], // POC: every mask fills its cell
-                layer: i as f32,
-                class_index: d.class_index as f32,
-            }
-        }));
+        self.instance_attrs
+            .extend(detections.iter().enumerate().map(|(i, d)| {
+                MaskInstanceAttr {
+                    bbox_ndc: d.bbox_ndc,
+                    mask_extent: [1.0, 1.0], // POC: every mask fills its cell
+                    layer: i as f32,
+                    class_index: d.class_index as f32,
+                }
+            }));
         debug_assert!(
             self.instance_attrs.len() <= self.instance_attrs.capacity(),
             "instance_attrs reallocated mid-frame — capacity sizing is wrong"
@@ -752,7 +768,13 @@ fn read_back_fbo() -> Vec<u8> {
     buf
 }
 
-fn compare_paths(detections: &[Detection], masks: &[Vec<u8>], flat_masks: &[u8], baseline: &BaselinePath, instanced: &mut InstancedPath) -> (u32, u32) {
+fn compare_paths(
+    detections: &[Detection],
+    masks: &[Vec<u8>],
+    flat_masks: &[u8],
+    baseline: &BaselinePath,
+    instanced: &mut InstancedPath,
+) -> (u32, u32) {
     unsafe {
         // Render baseline
         gls::gl::ClearColor(0.0, 0.0, 0.0, 0.0);
@@ -778,16 +800,23 @@ fn compare_paths(detections: &[Detection], masks: &[Vec<u8>], flat_masks: &[u8],
         if let Ok(prefix) = std::env::var("MASK_POOL_DUMP") {
             let _ = std::fs::write(format!("{prefix}_baseline.rgba"), &img_a);
             let _ = std::fs::write(format!("{prefix}_instanced.rgba"), &img_b);
-            println!("  Dumped: {prefix}_baseline.rgba and {prefix}_instanced.rgba ({}x{})", FBO_W, FBO_H);
+            println!(
+                "  Dumped: {prefix}_baseline.rgba and {prefix}_instanced.rgba ({}x{})",
+                FBO_W, FBO_H
+            );
         }
 
-        // Count differing pixels and max channel diff
+        // Count differing pixels and max channel-sum diff across ALL
+        // four channels — mask shaders encode coverage primarily in
+        // alpha, so an RGB-only diff would miss a real divergence in
+        // transparency. Max theoretical per-pixel sum is 4 × 255 = 1020.
         let mut diff_pixels = 0u32;
         let mut max_diff = 0u32;
         for (a, b) in img_a.chunks_exact(4).zip(img_b.chunks_exact(4)) {
             let d = ((a[0] as i32 - b[0] as i32).abs()
                 + (a[1] as i32 - b[1] as i32).abs()
-                + (a[2] as i32 - b[2] as i32).abs()) as u32;
+                + (a[2] as i32 - b[2] as i32).abs()
+                + (a[3] as i32 - b[3] as i32).abs()) as u32;
             if d > 0 {
                 diff_pixels += 1;
                 if d > max_diff {
@@ -808,7 +837,11 @@ pub fn run(_ctx: &GpuContext) -> Vec<BenchResult> {
     let is_vivante = detect_vivante();
     println!(
         "  GPU: {}  cell={}x{}  fbo={}x{}",
-        if is_vivante { "Vivante (per-instance glFinish ON)" } else { "non-Vivante" },
+        if is_vivante {
+            "Vivante (per-instance glFinish ON)"
+        } else {
+            "non-Vivante"
+        },
         CELL_W,
         CELL_H,
         FBO_W,

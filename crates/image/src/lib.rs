@@ -161,6 +161,26 @@ pub fn align_width_for_gpu_pitch(width: usize, bpp: usize) -> usize {
     }
 }
 
+/// Round `min_pitch_bytes` up to the next multiple of
+/// [`GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES`]. Returns `None` if the rounded
+/// value would overflow `usize`. Returns `Some(0)` for input 0.
+///
+/// Used internally by [`ImageProcessor::create_image`] to compute the
+/// padded row stride for DMA-backed image allocations. External callers
+/// that need pixel-counted alignment (instead of raw byte pitch) should
+/// use [`align_width_for_gpu_pitch`] instead.
+pub(crate) fn align_pitch_bytes_to_gpu_alignment(min_pitch_bytes: usize) -> Option<usize> {
+    let alignment = GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES;
+    if min_pitch_bytes == 0 {
+        return Some(0);
+    }
+    let remainder = min_pitch_bytes % alignment;
+    if remainder == 0 {
+        return Some(min_pitch_bytes);
+    }
+    min_pitch_bytes.checked_add(alignment - remainder)
+}
+
 /// Overflow-safe least common multiple. Returns `None` when `(a / gcd) * b`
 /// would wrap.
 fn checked_num_integer_lcm(a: usize, b: usize) -> Option<usize> {
@@ -1065,6 +1085,30 @@ impl ImageProcessor {
     /// A [`TensorDyn`] backed by the highest-performance memory type
     /// available on this system.
     ///
+    /// # Pitch alignment for DMA-backed allocations
+    ///
+    /// DMA-BUF imports into the GL backend (Mali Valhall on i.MX 95
+    /// specifically) require every row pitch to be a multiple of
+    /// [`GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES`] (currently 64). When this
+    /// method lands on `TensorMemory::Dma`, the underlying allocation is
+    /// silently padded so the row stride satisfies that requirement.
+    ///
+    /// **The user-requested `width` is preserved** — `tensor.width()`
+    /// returns the same value you passed in. The padding is carried by
+    /// [`TensorDyn::row_stride`] / `effective_row_stride()`, which the
+    /// GL backend reads when importing the buffer as an EGLImage.
+    /// Callers that compute byte offsets from the tensor must use the
+    /// stride, not `width × bytes_per_pixel`; the CPU mapping spans the
+    /// full `stride × height` bytes.
+    ///
+    /// Pre-aligned widths (640, 1280, 1920, 3008, 3840 …) allocate
+    /// exactly `width × bpp × height` bytes with no padding. PBO and
+    /// Mem fallbacks never pad — they don't go through EGLImage import.
+    ///
+    /// See also [`align_width_for_gpu_pitch`] for an advisory helper
+    /// that external callers (GStreamer plugins, video pipelines) can
+    /// use to size their own DMA-BUFs for GL compatibility.
+    ///
     /// # Errors
     ///
     /// Returns an error if all allocation strategies fail.
@@ -1076,36 +1120,61 @@ impl ImageProcessor {
         dtype: DType,
         memory: Option<TensorMemory>,
     ) -> Result<TensorDyn> {
-        // Round the requested width up so that the resulting row stride
-        // satisfies the GPU's DMA-BUF EGLImage import alignment requirement.
-        // Mali Valhall (i.MX 95) rejects unaligned pitches with
-        // EGL_BAD_ALLOC, which would silently drop the GL backend onto the
-        // ~95 ms non-DMA fallback path. The padding only applies to DMA-
-        // backed allocations and is a no-op when the requested width
-        // already has an aligned pitch (the common case for sizes like
-        // 640, 1280, 1920, 3008, 3840).
-        let dma_width = match primary_plane_bpp(format, dtype.size()) {
-            Some(bpp) => align_width_for_gpu_pitch(width, bpp),
-            None => width,
+        // Compute the GPU-aligned row stride in bytes for this image.
+        // `None` means either the format has no defined primary-plane bpp
+        // (unknown future layout) or the stride calculation would overflow
+        // — in both cases we fall back to the natural layout via the plain
+        // `TensorDyn::image` constructor, and the slow-path warning inside
+        // `draw_*_masks` will fire if the subsequent GL import fails.
+        let dma_stride_bytes: Option<usize> = primary_plane_bpp(format, dtype.size())
+            .and_then(|bpp| width.checked_mul(bpp))
+            .and_then(align_pitch_bytes_to_gpu_alignment);
+
+        // Helper: allocate a DMA image, using the padded-stride constructor
+        // when the computed stride exceeds the natural pitch, otherwise the
+        // plain constructor (byte-identical result in the common case).
+        let try_dma = || -> Result<TensorDyn> {
+            match dma_stride_bytes {
+                Some(stride)
+                    if primary_plane_bpp(format, dtype.size())
+                        .and_then(|bpp| width.checked_mul(bpp))
+                        .is_some_and(|natural| stride > natural) =>
+                {
+                    log::debug!(
+                        "create_image: padding row stride for {format:?} {width}x{height} \
+                         from natural pitch to {stride} bytes for GPU alignment"
+                    );
+                    Ok(TensorDyn::image_with_stride(
+                        width,
+                        height,
+                        format,
+                        dtype,
+                        stride,
+                        Some(edgefirst_tensor::TensorMemory::Dma),
+                    )?)
+                }
+                _ => Ok(TensorDyn::image(
+                    width,
+                    height,
+                    format,
+                    dtype,
+                    Some(edgefirst_tensor::TensorMemory::Dma),
+                )?),
+            }
         };
-        if dma_width != width {
-            log::debug!(
-                "create_image: padded width {width} → {dma_width} for {format:?} \
-                 to satisfy {GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES}-byte GPU pitch \
-                 alignment"
-            );
-        }
 
         // If an explicit memory type is requested, honour it directly.
-        if let Some(mem) = memory {
-            // Only DMA allocations need pitch alignment; PBO and Mem use the
-            // user-requested width verbatim.
-            let alloc_width = if mem == TensorMemory::Dma {
-                dma_width
-            } else {
-                width
-            };
-            return Ok(TensorDyn::image(alloc_width, height, format, dtype, Some(mem))?);
+        // On Linux, `TensorMemory::Dma` gets the padded-stride treatment;
+        // other memory types take the user-requested width verbatim.
+        match memory {
+            #[cfg(target_os = "linux")]
+            Some(TensorMemory::Dma) => {
+                return try_dma();
+            }
+            Some(mem) => {
+                return Ok(TensorDyn::image(width, height, format, dtype, Some(mem))?);
+            }
+            None => {}
         }
 
         // Try DMA first on Linux — skip only when GL has explicitly selected PBO
@@ -1121,13 +1190,7 @@ impl ImageProcessor {
             let gl_uses_pbo = false;
 
             if !gl_uses_pbo {
-                if let Ok(img) = TensorDyn::image(
-                    dma_width,
-                    height,
-                    format,
-                    dtype,
-                    Some(edgefirst_tensor::TensorMemory::Dma),
-                ) {
+                if let Ok(img) = try_dma() {
                     return Ok(img);
                 }
             }
@@ -2201,7 +2264,7 @@ mod alignment_tests {
         assert_eq!(align_width_for_gpu_pitch(1280, 4), 1280); // 5120
         assert_eq!(align_width_for_gpu_pitch(1920, 4), 1920); // 7680
         assert_eq!(align_width_for_gpu_pitch(3840, 4), 3840); // 15360
-        // crowd.png case from the imx95 investigation:
+                                                              // crowd.png case from the imx95 investigation:
         assert_eq!(align_width_for_gpu_pitch(3004, 4), 3008); // 12016 → 12032
         assert_eq!(align_width_for_gpu_pitch(3000, 4), 3008); // 12000 → 12032
         assert_eq!(align_width_for_gpu_pitch(17, 4), 32); // 68 → 128
@@ -2215,7 +2278,7 @@ mod alignment_tests {
         assert_eq!(align_width_for_gpu_pitch(640, 3), 640); // 1920
         assert_eq!(align_width_for_gpu_pitch(1, 3), 64); // 3 → 192
         assert_eq!(align_width_for_gpu_pitch(65, 3), 128); // 195 → 384
-        // Verify the rounded width × bpp is a clean multiple of the LCM.
+                                                           // Verify the rounded width × bpp is a clean multiple of the LCM.
         for w in [3004usize, 1281, 100, 17] {
             let padded = align_width_for_gpu_pitch(w, 3);
             assert!(padded >= w);
@@ -2279,7 +2342,10 @@ mod alignment_tests {
         // panicking. A pre-aligned width round-trips unchanged even at the
         // extreme.
         let aligned_extreme = usize::MAX - 15; // 16-pixel boundary for RGBA8
-        assert_eq!(align_width_for_gpu_pitch(aligned_extreme, 4), aligned_extreme);
+        assert_eq!(
+            align_width_for_gpu_pitch(aligned_extreme, 4),
+            aligned_extreme
+        );
         // A misaligned extreme value cannot be rounded up — the function
         // returns the original.
         let misaligned_extreme = usize::MAX - 1;

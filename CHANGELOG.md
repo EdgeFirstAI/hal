@@ -23,14 +23,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   were unaffected because their source buffers come from
   libcamera/v4l2, which already align to the GPU's preferred pitch.
 
-  `ImageProcessor::create_image` now silently rounds the requested width
-  up so the resulting row stride satisfies
-  `GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES` (64) and an integer multiple of
-  the format's bytes-per-pixel. The padding only applies to DMA-backed
-  allocations and is a no-op for the common aligned widths (640, 1280,
-  1920, 3008, 3840). Vivante GC7000UL accepts every pitch and the
-  padding is harmless on that path. Verified on i.MX 95: crowd canvas
-  draw drops from 91 ms → 8.86 ms (~10× faster).
+  `ImageProcessor::create_image` now silently pads the **row stride**
+  (not the logical width) so the resulting DMA-BUF satisfies
+  `GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES` (64). Following the V4L2 / DRM
+  / GStreamer convention, the tensor's logical `width()` / `height()`
+  continue to report the user-requested values and the padding is
+  carried by `row_stride()` / `effective_row_stride()`. Callers that
+  iterate pixel rows must use the stride (not `width × bpp`) for row
+  offsets; the CPU mapping spans the full `stride × height` bytes.
+  Verified on i.MX 95: crowd canvas (3004×1688 RGBA8) draw drops from
+  91 ms → 9.26 ms (~10× faster), with `tensor.width() == 3004` and
+  `tensor.effective_row_stride() == 12032`.
+
+  New tensor primitives power this:
+  - `Tensor::image_with_stride(width, height, format, row_stride, memory)`
+    and `TensorDyn::image_with_stride(...)` allocate a DMA-backed
+    image with an explicit row stride that may exceed the natural
+    `width × channels × sizeof(T)` pitch. Currently DMA-only and
+    packed-formats-only.
+  - `DmaTensor::new_with_byte_size` decouples the allocation byte
+    count from `shape.product()` so the backing DMA-BUF can be sized
+    to `row_stride × height` bytes while the logical shape remains
+    `[height, width, channels]`.
+  - `DmaMap::new_with_byte_size` exposes the full padded mmap via
+    `as_slice()` / `as_mut_slice()` so CPU iteration respects the
+    stride without going past the end of the returned slice.
+  - `Tensor::map()` now allows CPU mapping of self-allocated strided
+    DMA tensors (previously rejected). Foreign strided imports
+    (`from_fd` + `set_row_stride`, the V4L2/GStreamer case) continue
+    to be GPU-only as before — the external allocator owns the layout
+    and HAL cannot validate CPU access expectations.
 
 ### Performance
 
