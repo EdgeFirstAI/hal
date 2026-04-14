@@ -169,6 +169,7 @@ pub fn align_width_for_gpu_pitch(width: usize, bpp: usize) -> usize {
 /// padded row stride for DMA-backed image allocations. External callers
 /// that need pixel-counted alignment (instead of raw byte pitch) should
 /// use [`align_width_for_gpu_pitch`] instead.
+#[cfg(target_os = "linux")]
 pub(crate) fn align_pitch_bytes_to_gpu_alignment(min_pitch_bytes: usize) -> Option<usize> {
     let alignment = GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES;
     if min_pitch_bytes == 0 {
@@ -1126,6 +1127,11 @@ impl ImageProcessor {
         // — in both cases we fall back to the natural layout via the plain
         // `TensorDyn::image` constructor, and the slow-path warning inside
         // `draw_*_masks` will fire if the subsequent GL import fails.
+        //
+        // DMA allocation is Linux-only (see `TensorMemory::Dma` cfg gate),
+        // so both the stride computation and the helper closure are gated
+        // accordingly — the callers below are already Linux-only.
+        #[cfg(target_os = "linux")]
         let dma_stride_bytes: Option<usize> = primary_plane_bpp(format, dtype.size())
             .and_then(|bpp| width.checked_mul(bpp))
             .and_then(align_pitch_bytes_to_gpu_alignment);
@@ -1133,6 +1139,7 @@ impl ImageProcessor {
         // Helper: allocate a DMA image, using the padded-stride constructor
         // when the computed stride exceeds the natural pitch, otherwise the
         // plain constructor (byte-identical result in the common case).
+        #[cfg(target_os = "linux")]
         let try_dma = || -> Result<TensorDyn> {
             match dma_stride_bytes {
                 Some(stride)
