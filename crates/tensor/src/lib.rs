@@ -473,6 +473,34 @@ where
         }
     }
 
+    /// Create a DMA-backed tensor storage with an explicit byte size that
+    /// may exceed `shape.product() * sizeof(T)`. Used for image tensors
+    /// with row-padded layouts (see `DmaTensor::new_with_byte_size`).
+    ///
+    /// This is intentionally DMA-only: padding is only meaningful for
+    /// buffers that will be imported as GPU textures via EGLImage. PBO,
+    /// Shm, and Mem storage doesn't benefit from pitch alignment and
+    /// shouldn't pay the memory cost.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn new_dma_with_byte_size(
+        shape: &[usize],
+        byte_size: usize,
+        name: Option<&str>,
+    ) -> Result<Self> {
+        DmaTensor::<T>::new_with_byte_size(shape, byte_size, name).map(TensorStorage::Dma)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn new_dma_with_byte_size(
+        _shape: &[usize],
+        _byte_size: usize,
+        _name: Option<&str>,
+    ) -> Result<Self> {
+        Err(crate::error::Error::NotImplemented(
+            "new_dma_with_byte_size requires Linux".to_owned(),
+        ))
+    }
+
     /// Create a new tensor storage using the given file descriptor, shape,
     /// and optional name.
     #[cfg(unix)]
@@ -701,6 +729,96 @@ where
         };
         let mut t = Self::new(&shape, memory, None)?;
         t.format = Some(format);
+        Ok(t)
+    }
+
+    /// Create a DMA-backed image tensor with an explicit row stride that
+    /// may exceed the natural `width * channels * sizeof(T)` pitch.
+    ///
+    /// Used for image tensors that need GPU pitch alignment padding: the
+    /// underlying DMA-BUF is sized to `row_stride * height` bytes, but
+    /// the tensor's logical shape stays at `[height, width, channels]`.
+    /// `width()` / `height()` / `shape()` continue to report the
+    /// user-requested values; the padding is visible only via
+    /// `row_stride()` / `effective_row_stride()` and is automatically
+    /// propagated to the GL backend's EGLImage import so Mali Valhall
+    /// accepts the buffer.
+    ///
+    /// # Supported formats
+    ///
+    /// Currently only **packed** pixel layouts (RGBA8, BGRA8, RGB888,
+    /// Grey, etc.) are supported — the formats the GL backend uses as
+    /// render destinations. Semi-planar formats (NV12, NV16) come from
+    /// external allocators (camera capture, video decoders) and are
+    /// imported via `TensorDyn::from_fd` + `set_row_stride`, which
+    /// already supports padded strides.
+    ///
+    /// # Supported memory
+    ///
+    /// Currently only `TensorMemory::Dma` is supported. PBO and Mem
+    /// storage don't go through EGLImage import so they don't need
+    /// pitch alignment; if you pass any other memory type this returns
+    /// `NotImplemented`. `None` (auto-select) is treated as `Dma`.
+    ///
+    /// # Errors
+    ///
+    /// - `InvalidArgument` if `row_stride_bytes < width * channels * sizeof(T)`
+    ///   (the requested stride would not fit a single row)
+    /// - `NotImplemented` for non-packed formats or non-DMA memory
+    /// - `IoError` if the DMA-heap allocation fails (propagated from
+    ///   `DmaTensor::new_with_byte_size`)
+    pub fn image_with_stride(
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+        row_stride_bytes: usize,
+        memory: Option<TensorMemory>,
+    ) -> Result<Self> {
+        if format.layout() != PixelLayout::Packed {
+            return Err(Error::NotImplemented(format!(
+                "Tensor::image_with_stride only supports packed pixel layouts, got {format:?}"
+            )));
+        }
+        let elem = std::mem::size_of::<T>();
+        let min_stride = width
+            .checked_mul(format.channels())
+            .and_then(|p| p.checked_mul(elem))
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "image_with_stride: width {width} × channels {} × sizeof::<T>={elem} \
+                     overflows usize",
+                    format.channels()
+                ))
+            })?;
+        if row_stride_bytes < min_stride {
+            return Err(Error::InvalidArgument(format!(
+                "image_with_stride: row_stride {row_stride_bytes} < minimum {min_stride} \
+                 ({width} px × {} ch × {elem} B)",
+                format.channels()
+            )));
+        }
+        let total_byte_size = row_stride_bytes.checked_mul(height).ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "image_with_stride: row_stride {row_stride_bytes} × height {height} overflows usize"
+            ))
+        })?;
+
+        let shape = vec![height, width, format.channels()];
+
+        let storage = match memory {
+            Some(TensorMemory::Dma) | None => {
+                TensorStorage::<T>::new_dma_with_byte_size(&shape, total_byte_size, None)?
+            }
+            Some(other) => {
+                return Err(Error::NotImplemented(format!(
+                    "image_with_stride: only TensorMemory::Dma is supported, got {other:?}"
+                )));
+            }
+        };
+
+        let mut t = Self::wrap(storage);
+        t.format = Some(format);
+        t.row_stride = Some(row_stride_bytes);
         Ok(t)
     }
 
@@ -1112,9 +1230,39 @@ where
     }
 
     fn map(&self) -> Result<TensorMap<T>> {
-        if self.row_stride.is_some() {
+        if let Some(stride) = self.row_stride {
+            // CPU mapping of strided tensors is allowed only when the HAL
+            // owns the underlying allocation — i.e. self-allocated DMA
+            // tensors with pitch padding added by `image_with_stride()`
+            // for GPU import alignment. In that case we know the buffer
+            // is exactly `row_stride × height` bytes (for packed
+            // formats) and callers that respect the stride can iterate
+            // rows correctly via `effective_row_stride()`.
+            //
+            // Foreign DMA-BUFs imported via `from_fd()` + `set_row_stride()`
+            // (the V4L2 / GStreamer case) are rejected: their layout comes
+            // from an external allocator and the HAL cannot validate what
+            // the caller expects the mapping to look like. Those tensors
+            // are intended for the GPU path only.
+            #[cfg(target_os = "linux")]
+            {
+                if let TensorStorage::Dma(dma) = &self.storage {
+                    if !dma.is_imported {
+                        // Self-allocated strided DMA tensor — expose the
+                        // full stride×height padded mmap via the override
+                        // constructor so callers can iterate rows with
+                        // `effective_row_stride()` without going past
+                        // the end of the returned slice.
+                        let height = self.height().unwrap_or(0);
+                        let total_bytes = stride.saturating_mul(height);
+                        return dma.map_with_byte_size(total_bytes).map(TensorMap::Dma);
+                    }
+                }
+            }
             return Err(Error::InvalidOperation(
-                "CPU mapping of strided tensors is not supported; use GPU path only".into(),
+                "CPU mapping of strided foreign tensors is not supported; \
+                 use GPU path only"
+                    .into(),
             ));
         }
         // Offset tensors are supported for DMA storage — DmaMap adjusts the
@@ -1364,6 +1512,130 @@ mod image_tests {
         // NV12: H*3/2 = 720
         assert_eq!(t.shape(), &[720, 640]);
         assert!(!t.is_multiplane());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn image_tensor_with_stride_preserves_logical_width() {
+        // Skip if DMA not available (e.g. sandboxed CI lacking dma_heap access).
+        if !is_dma_available() {
+            eprintln!("SKIPPED: DMA heap not available");
+            return;
+        }
+        // 3004×1688 RGBA8: natural pitch 12016, padded to 12032 (64-aligned).
+        let stride = 12032;
+        let t = Tensor::<u8>::image_with_stride(
+            3004,
+            1688,
+            PixelFormat::Rgba,
+            stride,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        // Logical dimensions unchanged by padding — this is the contract.
+        assert_eq!(t.width(), Some(3004));
+        assert_eq!(t.height(), Some(1688));
+        assert_eq!(t.shape(), &[1688, 3004, 4]);
+        // Stride is carried separately and reports the padded pitch.
+        assert_eq!(t.effective_row_stride(), Some(stride));
+        // Buffer is sized to stride × height so the full padded layout fits,
+        // and CPU map() works for self-allocated strided DMA tensors.
+        use crate::TensorMapTrait;
+        {
+            let map = t.map().unwrap();
+            assert!(
+                map.as_slice().len() >= stride * 1688,
+                "mapped buffer {} bytes < expected {}",
+                map.as_slice().len(),
+                stride * 1688
+            );
+        }
+        // CPU write access works too — iterate rows using the padded stride,
+        // touch only the active `width × bpp` region, verify it round-trips.
+        {
+            let mut map = t.map().unwrap();
+            let slice = map.as_mut_slice();
+            for y in 0..1688 {
+                let row_start = y * stride;
+                for x in 0..3004 {
+                    let p = row_start + x * 4;
+                    slice[p] = (y & 0xFF) as u8;
+                    slice[p + 1] = (x & 0xFF) as u8;
+                    slice[p + 2] = 0x42;
+                    slice[p + 3] = 0xFF;
+                }
+            }
+        }
+        {
+            let map = t.map().unwrap();
+            let slice = map.as_slice();
+            // Sample a few pixels to confirm the round-trip.
+            assert_eq!(slice[0], 0x00);
+            assert_eq!(slice[1], 0x00);
+            assert_eq!(slice[2], 0x42);
+            assert_eq!(slice[3], 0xFF);
+            let mid = 100 * stride + 50 * 4;
+            assert_eq!(slice[mid], 100);
+            assert_eq!(slice[mid + 1], 50);
+            assert_eq!(slice[mid + 2], 0x42);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn image_tensor_with_stride_rejects_foreign_strided_map() {
+        // A FOREIGN (imported via from_fd) DMA tensor with row_stride set
+        // should still refuse CPU mapping — external allocator owns the
+        // layout. This protects the V4L2 / GStreamer use case.
+        //
+        // We simulate a foreign import by wrapping our own allocation's
+        // fd via `from_fd` and calling set_row_stride manually. The
+        // `is_imported` flag on from_fd is true by construction.
+        if !is_dma_available() {
+            eprintln!("SKIPPED: DMA heap not available");
+            return;
+        }
+        // Allocate a backing buffer large enough for a 320×240 BGRA8 image.
+        let backing = Tensor::<u8>::new(&[240 * 320 * 4], Some(TensorMemory::Dma), None).unwrap();
+        let fd = backing.clone_fd().unwrap();
+        // Import it via from_fd — this marks is_imported=true.
+        let shape = [240usize, 320, 4];
+        let storage = TensorStorage::<u8>::from_fd(fd, &shape, None).unwrap();
+        let mut t = Tensor::<u8>::wrap(storage);
+        t.set_format(PixelFormat::Bgra).unwrap();
+        t.set_row_stride(320 * 4).unwrap(); // natural, but still marks it as strided
+        let err = t.map();
+        assert!(
+            matches!(err, Err(Error::InvalidOperation(_))),
+            "foreign strided map should error"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn image_tensor_with_stride_rejects_too_small_stride() {
+        // 640×480 RGBA8 natural pitch = 2560, request 2400 → should error.
+        let err = Tensor::<u8>::image_with_stride(
+            640,
+            480,
+            PixelFormat::Rgba,
+            2400,
+            Some(TensorMemory::Dma),
+        );
+        assert!(matches!(err, Err(Error::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn image_tensor_with_stride_rejects_non_packed() {
+        // NV12 is SemiPlanar → not supported.
+        let err = Tensor::<u8>::image_with_stride(
+            640,
+            480,
+            PixelFormat::Nv12,
+            640,
+            Some(TensorMemory::Dma),
+        );
+        assert!(matches!(err, Err(Error::NotImplemented(_))));
     }
 
     #[test]

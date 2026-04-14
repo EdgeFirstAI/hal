@@ -909,7 +909,10 @@ pub fn align_width_for_gpu_pitch(width: usize, bpp: usize) -> usize {
 ///
 /// :param width:  Image width in pixels
 /// :param format: Pixel format (e.g. ``PixelFormat.Rgba``)
-/// :param dtype:  Element data type as a string (``"uint8"``, ``"int8"``, etc.)
+/// :param dtype:  Element data type as a string. Same set of names accepted
+///                by :meth:`ImageProcessor.create_image` and the rest of
+///                the HAL Python API — ``"uint8"``, ``"int8"``, ``"uint16"``,
+///                ``"int16"``, ``"float16"``, ``"float32"``, etc.
 /// :return:       Aligned width in pixels (always >= ``width``)
 #[pyfunction]
 #[pyo3(signature = (width, format, dtype = "uint8"))]
@@ -919,15 +922,8 @@ pub fn align_width_for_pixel_format(
     dtype: &str,
 ) -> Result<usize> {
     let pf: PixelFormat = format.into();
-    let elem = match dtype {
-        "uint8" | "int8" | "u8" | "i8" => 1,
-        "uint16" | "int16" | "float16" | "u16" | "i16" | "f16" => 2,
-        "uint32" | "int32" | "float32" | "u32" | "i32" | "f32" => 4,
-        "uint64" | "int64" | "float64" | "u64" | "i64" | "f64" => 8,
-        _ => {
-            return Err(Error::InvalidArg(format!("unknown dtype: {dtype}")));
-        }
-    };
+    let dt = crate::tensor::parse_dtype(dtype).map_err(|e| Error::InvalidArg(e.to_string()))?;
+    let elem = dt.size();
     Ok(match image::primary_plane_bpp(pf, elem) {
         Some(bpp) => image::align_width_for_gpu_pitch(width, bpp),
         None => width,

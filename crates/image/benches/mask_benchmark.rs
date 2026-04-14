@@ -415,8 +415,24 @@ fn run_diagnostic(proc: &mut ImageProcessor) {
             return;
         }
     };
+    // Log the actual tensor dimensions and stride, not just what we
+    // requested — `create_image` silently pads the DMA row stride for
+    // GPU pitch alignment, and the diagnostic is meant to surface that
+    // difference so a mismatch is visible.
+    let actual_w = dst.width().unwrap_or(0);
+    let actual_h = dst.height().unwrap_or(0);
+    let actual_stride = dst.effective_row_stride().unwrap_or(0);
+    let natural_stride = actual_w * 4; // RGBA8
     println!("  dst.memory() = {:?}", dst.memory());
-    println!("  dst dims = {}x{}", dst_w, dst_h);
+    println!(
+        "  dst requested = {dst_w}x{dst_h}, actual = {actual_w}x{actual_h}, \
+         stride = {actual_stride} bytes (natural {natural_stride}, padded = {})",
+        if actual_stride > natural_stride {
+            "yes"
+        } else {
+            "no"
+        }
+    );
 
     // Pre-fill dst with a known sentinel so we can detect "untouched" buffers.
     {
@@ -438,7 +454,10 @@ fn run_diagnostic(proc: &mut ImageProcessor) {
     let t0 = std::time::Instant::now();
     let result = proc.draw_decoded_masks(&mut dst, &detect, &segmentation, Default::default());
     let elapsed = t0.elapsed();
-    println!("  call took {:.2} ms (DMA fast path < 10ms; non-DMA fallback ~95ms on Mali)", elapsed.as_secs_f64() * 1000.0);
+    println!(
+        "  call took {:.2} ms (DMA fast path < 10ms; non-DMA fallback ~95ms on Mali)",
+        elapsed.as_secs_f64() * 1000.0
+    );
     if let Err(e) = result {
         println!("  draw_decoded_masks ERROR: {e:?}");
     } else {
@@ -447,7 +466,12 @@ fn run_diagnostic(proc: &mut ImageProcessor) {
         let bytes = m.as_slice();
         let post_sum: u64 = bytes.iter().map(|b| *b as u64).sum();
         let unchanged = bytes.iter().all(|b| *b == 0x42);
-        let nonzero_alpha = bytes.iter().skip(3).step_by(4).filter(|b| **b > 0 && **b != 0x42).count();
+        let nonzero_alpha = bytes
+            .iter()
+            .skip(3)
+            .step_by(4)
+            .filter(|b| **b > 0 && **b != 0x42)
+            .count();
         println!("  pre_sum  = {pre_sum}");
         println!("  post_sum = {post_sum}");
         println!("  changed  = {}", !unchanged);
@@ -468,7 +492,20 @@ fn run_diagnostic(proc: &mut ImageProcessor) {
             return;
         }
     };
+    let actual_w2 = dst2.width().unwrap_or(0);
+    let actual_h2 = dst2.height().unwrap_or(0);
+    let actual_stride2 = dst2.effective_row_stride().unwrap_or(0);
+    let natural_stride2 = actual_w2 * 4; // RGBA8
     println!("  dst.memory() = {:?}", dst2.memory());
+    println!(
+        "  dst requested = {dst_w}x{dst_h}, actual = {actual_w2}x{actual_h2}, \
+         stride = {actual_stride2} bytes (natural {natural_stride2}, padded = {})",
+        if actual_stride2 > natural_stride2 {
+            "yes"
+        } else {
+            "no"
+        }
+    );
 
     {
         let t = dst2.as_u8_mut().expect("u8 dst2");
@@ -492,7 +529,12 @@ fn run_diagnostic(proc: &mut ImageProcessor) {
         let bytes = m.as_slice();
         let post_sum: u64 = bytes.iter().map(|b| *b as u64).sum();
         let unchanged = bytes.iter().all(|b| *b == 0x42);
-        let nonzero_alpha = bytes.iter().skip(3).step_by(4).filter(|b| **b > 0 && **b != 0x42).count();
+        let nonzero_alpha = bytes
+            .iter()
+            .skip(3)
+            .step_by(4)
+            .filter(|b| **b > 0 && **b != 0x42)
+            .count();
         println!("  post_sum = {post_sum}");
         println!("  changed  = {}", !unchanged);
         println!("  non-sentinel alpha pixels = {nonzero_alpha}");
