@@ -1102,6 +1102,56 @@ def probe_egl_displays() -> list[EglDisplayInfo]:
     """
     ...
 
+def align_width_for_gpu_pitch(width: int, bpp: int) -> int:
+    """Round ``width`` up so that ``width * bpp`` satisfies the GPU DMA-BUF
+    pitch alignment requirement (currently 64 bytes).
+
+    Use when allocating a DMA-BUF that will later be imported as an
+    EGLImage by HAL's GL backend (or by any GLES driver that requires
+    64-byte aligned pitches — currently Mali Valhall on i.MX 95).
+
+    Pre-aligned widths (640, 1280, 1920, 3008, 3840, …) round-trip
+    unchanged. Misaligned widths are bumped up to the next valid value.
+    Returns ``width`` unchanged if ``bpp == 0``, ``width == 0``, or if the
+    rounded value would overflow.
+
+    Args:
+        width: Image width in pixels.
+        bpp: Bytes per pixel for the primary plane (4 for RGBA8/BGRA8,
+            3 for RGB888, 1 for Grey/NV12-luma).
+
+    Returns:
+        Aligned width in pixels (always ``>= width``).
+    """
+    ...
+
+def align_width_for_pixel_format(
+    width: int,
+    format: PixelFormat,
+    dtype: str = "uint8",
+) -> int:
+    """Convenience wrapper that derives bytes-per-pixel from a pixel format
+    and dtype, then calls :func:`align_width_for_gpu_pitch`.
+
+    Args:
+        width: Image width in pixels.
+        format: Pixel format (e.g. ``PixelFormat.Rgba``).
+        dtype: Element data type as a string — same set accepted by
+            :meth:`ImageProcessor.create_image` (``"uint8"``, ``"int8"``,
+            ``"uint16"``, ``"float16"``, ``"float32"``, …).
+
+    Returns:
+        Aligned width in pixels (always ``>= width``).
+    """
+    ...
+
+def gpu_dma_buf_pitch_alignment_bytes() -> int:
+    """Required DMA-BUF row pitch alignment in bytes for GL backend imports
+    (currently 64). External callers that need to allocate their own
+    DMA-BUFs should size them so each row pitch is a multiple of this value.
+    """
+    ...
+
 class ImageProcessor:
     """Convert images between different formats, with optional rotation, flipping, and cropping."""
 

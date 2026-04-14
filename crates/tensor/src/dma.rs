@@ -412,7 +412,12 @@ where
     /// `Tensor::map()` for self-allocated strided DMA tensors so CPU
     /// iteration can respect `row_stride` without going past the end
     /// of the returned slice.
-    pub fn new_with_byte_size(
+    ///
+    /// Crate-private: the only caller is `Tensor::map()`, which already
+    /// performs the outer `stride × height <= buf_size - offset` check.
+    /// Keeping this API `pub(crate)` ensures an unchecked `byte_size`
+    /// can never be fed in from outside the crate.
+    pub(crate) fn new_with_byte_size(
         fd: OwnedFd,
         shape: &[usize],
         buf_size: usize,
@@ -464,6 +469,27 @@ where
                 std::mem::align_of::<T>()
             )));
         }
+
+        // Defense in depth: even though `new_with_byte_size` is crate-private
+        // and its callers validate upstream, verify the override is non-zero,
+        // sizeof::<T>()-aligned, and fits inside the mapped region. Any breach
+        // would otherwise turn into an out-of-bounds slice in `as_slice()`.
+        if let Some(byte_size) = byte_size_override {
+            if byte_size == 0 {
+                return Err(Error::InvalidSize(0));
+            }
+            let t_size = std::mem::size_of::<T>();
+            if t_size > 1 && !byte_size.is_multiple_of(t_size) {
+                return Err(Error::InvalidOperation(format!(
+                    "DmaMap: byte_size_override {byte_size} is not a multiple of sizeof::<T>()={t_size}"
+                )));
+            }
+            let available = buf_size.saturating_sub(offset);
+            if byte_size > available {
+                return Err(Error::InvalidSize(byte_size));
+            }
+        }
+
         let mmap_size = buf_size;
 
         #[cfg(target_os = "linux")]

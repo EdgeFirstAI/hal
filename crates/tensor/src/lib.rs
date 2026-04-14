@@ -1278,7 +1278,20 @@ where
                     // could otherwise request a slice larger than the
                     // underlying mmap — which would be undefined
                     // behaviour in `DmaMap::as_slice`.
-                    let height = self.height().unwrap_or(0);
+                    //
+                    // Refuse to map if `height()` can't be derived
+                    // (e.g. raw 2D tensors without a PixelFormat that
+                    // got a `row_stride` set via `set_row_stride_unchecked`).
+                    // Returning a 0-byte view would silently truncate
+                    // rather than surface the misuse.
+                    let height = self.height().ok_or_else(|| {
+                        Error::InvalidOperation(
+                            "Tensor::map: strided DMA mapping requires a PixelFormat \
+                             so height() can be derived; set a format before mapping \
+                             or clear row_stride for raw tensor access"
+                                .into(),
+                        )
+                    })?;
                     let total_bytes = stride.checked_mul(height).ok_or_else(|| {
                         Error::InvalidOperation(format!(
                             "Tensor::map: row_stride {stride} × height {height} overflows usize"

@@ -1316,8 +1316,9 @@ pub extern "C" fn hal_gpu_dma_buf_pitch_alignment_bytes() -> size_t {
 }
 
 /// Round `width` (in pixels) up so that `width * bpp` is a multiple of
-/// HAL_GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES (currently 64) **and** an integer
-/// pixel count for the given bytes-per-pixel.
+/// the value returned by hal_gpu_dma_buf_pitch_alignment_bytes()
+/// (currently 64) **and** an integer pixel count for the given
+/// bytes-per-pixel.
 ///
 /// Use this when allocating a DMA-BUF that will later be imported as an
 /// EGLImage by HAL's GL backend (or by any GLES driver that requires
