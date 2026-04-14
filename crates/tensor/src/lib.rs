@@ -1269,8 +1269,31 @@ where
                     // constructor so callers can iterate rows with
                     // `effective_row_stride()` without going past
                     // the end of the returned slice.
+                    //
+                    // Validate the requested mapping fits inside the
+                    // actual DMA-BUF. `set_row_stride()` is a public
+                    // API and only validates `stride >= min_stride`,
+                    // not `stride × height <= buf_size`, so a caller
+                    // that tampers with the stride after allocation
+                    // could otherwise request a slice larger than the
+                    // underlying mmap — which would be undefined
+                    // behaviour in `DmaMap::as_slice`.
                     let height = self.height().unwrap_or(0);
-                    let total_bytes = stride.saturating_mul(height);
+                    let total_bytes = stride.checked_mul(height).ok_or_else(|| {
+                        Error::InvalidOperation(format!(
+                            "Tensor::map: row_stride {stride} × height {height} overflows usize"
+                        ))
+                    })?;
+                    let available_bytes = dma.buf_size.saturating_sub(dma.mmap_offset);
+                    if total_bytes > available_bytes {
+                        return Err(Error::InvalidOperation(format!(
+                            "Tensor::map: strided mapping needs {total_bytes} bytes \
+                             but DMA buffer only has {available_bytes} available \
+                             (buf_size={}, mmap_offset={}, stride={stride}, height={height}); \
+                             the row_stride was likely set larger than the original allocation",
+                            dma.buf_size, dma.mmap_offset
+                        )));
+                    }
                     return dma.map_with_byte_size(total_bytes).map(TensorMap::Dma);
                 }
             }
@@ -1632,6 +1655,62 @@ mod image_tests {
             matches!(err, Err(Error::InvalidOperation(_))),
             "foreign strided map should error"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn image_tensor_with_stride_map_rejects_tampered_stride() {
+        // Round-3 PR feedback (C1): `set_row_stride` is public and only
+        // validates `stride >= min_stride`, not that the new stride × height
+        // fits the underlying buffer. A caller that tampers with the stride
+        // after allocation must not be able to coerce `Tensor::map()` into
+        // returning a slice larger than the backing mmap (that would be UB
+        // in `DmaMap::as_slice`).
+        if !is_dma_available() {
+            eprintln!("SKIPPED: DMA heap not available");
+            return;
+        }
+        // Allocate a 640×480 RGBA8 padded canvas (stride = 3072 = 768 px).
+        // Backing buffer is 3072 × 480 = 1,474,560 bytes.
+        let mut t = Tensor::<u8>::image_with_stride(
+            640,
+            480,
+            PixelFormat::Rgba,
+            3072,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        // Tamper: push the stride up to 4 × the original. This is >=
+        // min_stride (2560), so `set_row_stride` accepts it.
+        t.set_row_stride(12288).unwrap();
+        // Map must now refuse — 12288 × 480 = 5,898,240 > 1,474,560.
+        let err = t.map();
+        assert!(
+            matches!(err, Err(Error::InvalidOperation(_))),
+            "map() with oversized stride must return InvalidOperation"
+        );
+    }
+
+    #[test]
+    fn dma_tensor_new_with_byte_size_rejects_shape_overflow() {
+        // Round-3 PR feedback (C3): shape.product() * sizeof(T) must use
+        // checked arithmetic so a pathological shape can't wrap usize and
+        // make the byte_size-vs-logical-size comparison incorrect.
+        //
+        // This test only exercises the overflow rejection path, which is
+        // pure-Rust and doesn't touch dma_heap — safe to run on any target.
+        #[cfg(target_os = "linux")]
+        {
+            let err = crate::dma::DmaTensor::<u64>::new_with_byte_size(
+                &[usize::MAX, 2, 2],
+                usize::MAX,
+                None,
+            );
+            assert!(
+                matches!(err, Err(Error::InvalidArgument(_))),
+                "new_with_byte_size must detect shape.product() overflow"
+            );
+        }
     }
 
     #[test]

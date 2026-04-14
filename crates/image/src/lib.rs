@@ -1141,11 +1141,20 @@ impl ImageProcessor {
         // plain constructor (byte-identical result in the common case).
         #[cfg(target_os = "linux")]
         let try_dma = || -> Result<TensorDyn> {
+            // Stride padding is only meaningful for packed pixel layouts
+            // (RGBA8, BGRA8, RGB888, Grey) — the formats the GL backend
+            // renders into. Semi-planar (NV12, NV16) and planar (PlanarRgb,
+            // PlanarRgba) tensors go through `TensorDyn::image(...)` with
+            // their natural layout; they're imported from camera capture
+            // via `from_fd` far more often than allocated here, and
+            // `Tensor::image_with_stride` explicitly rejects them.
+            let packed = format.layout() == edgefirst_tensor::PixelLayout::Packed;
             match dma_stride_bytes {
                 Some(stride)
-                    if primary_plane_bpp(format, dtype.size())
-                        .and_then(|bpp| width.checked_mul(bpp))
-                        .is_some_and(|natural| stride > natural) =>
+                    if packed
+                        && primary_plane_bpp(format, dtype.size())
+                            .and_then(|bpp| width.checked_mul(bpp))
+                            .is_some_and(|natural| stride > natural) =>
                 {
                     log::debug!(
                         "create_image: padding row stride for {format:?} {width}x{height} \
@@ -2876,6 +2885,49 @@ mod image_tests {
                 Crop::no_crop(),
             )
             .unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_create_image_nv12_dma_non_aligned_width() {
+        // Regression for C2: create_image must not apply stride padding to
+        // planar (non-Packed) formats. NV12 is planar, so the try_dma path
+        // should fall through to the plain TensorDyn::image allocation for
+        // any width, regardless of the 64-byte GPU pitch alignment.
+        let converter = ImageProcessor::new().unwrap();
+
+        // 100 is intentionally not a multiple of 64 (the Mali pitch
+        // alignment) to prove that non-packed layouts do not take the
+        // stride-padded branch.
+        let result = converter.create_image(
+            100,
+            64,
+            PixelFormat::Nv12,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        );
+
+        match result {
+            Ok(img) => {
+                assert_eq!(img.width(), Some(100));
+                assert_eq!(img.height(), Some(64));
+                assert_eq!(img.format(), Some(PixelFormat::Nv12));
+                // Non-packed formats must never carry a row_stride override.
+                assert!(
+                    img.row_stride().is_none(),
+                    "NV12 must not be stride-padded by create_image",
+                );
+            }
+            Err(e) => {
+                // Accept skip on hosts without a dma-heap, but never the
+                // "NotImplemented" we used to return for non-packed layouts.
+                let msg = format!("{e}");
+                assert!(
+                    !msg.contains("image_with_stride"),
+                    "NV12 should not hit the stride-padded path: {msg}",
+                );
+            }
+        }
     }
 
     #[test]

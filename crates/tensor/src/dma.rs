@@ -41,7 +41,7 @@ where
     /// Actual buffer size in bytes (from fstat at creation time).
     /// May be larger than shape.product() * sizeof(T) for externally
     /// allocated buffers with row padding.
-    buf_size: usize,
+    pub(crate) buf_size: usize,
     /// Byte offset into the DMA buffer where the tensor data begins.
     /// Set via `Tensor::set_plane_offset` for sub-region imports.
     pub(crate) mmap_offset: usize,
@@ -255,7 +255,29 @@ where
         use log::debug;
         use nix::sys::stat::fstat;
 
-        let logical_size = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+        // Compute the logical byte size with checked arithmetic. A caller
+        // passing an absurdly large shape (or sizeof::<T> × product) must
+        // not silently wrap — the comparison below would then accept an
+        // allocation that's actually smaller than the logical size.
+        let logical_elems = shape
+            .iter()
+            .copied()
+            .try_fold(1usize, |acc, dim| acc.checked_mul(dim))
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "DmaTensor::new_with_byte_size: shape.product() overflows usize \
+                     (shape={shape:?})"
+                ))
+            })?;
+        let logical_size = logical_elems
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "DmaTensor::new_with_byte_size: logical_elems {logical_elems} × \
+                     sizeof::<T>={} overflows usize (shape={shape:?})",
+                    std::mem::size_of::<T>()
+                ))
+            })?;
         if byte_size < logical_size {
             return Err(Error::InvalidArgument(format!(
                 "DmaTensor::new_with_byte_size: byte_size {byte_size} < logical {logical_size} \
