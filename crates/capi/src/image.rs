@@ -1286,6 +1286,110 @@ pub unsafe extern "C" fn hal_image_processor_create_image(
 }
 
 // ============================================================================
+// GPU pitch alignment helpers
+// ============================================================================
+
+/// Pitch alignment in bytes that DMA-BUF EGLImage imports require on the
+/// GL backend.
+///
+/// Mali Valhall (e.g. Mali-G310 on i.MX 95) rejects `eglCreateImageKHR` with
+/// `EGL_BAD_ALLOC` for any DMA-BUF whose row pitch is not a multiple of this
+/// value. Vivante GC7000UL (i.MX 8MP) accepts arbitrary pitches but the
+/// requirement is harmless on that path.
+///
+/// External callers that allocate their own DMA-BUFs (GStreamer plugins,
+/// V4L2 ring buffers, custom video pipelines) should size those buffers so
+/// that `width * bytes_per_pixel` is a multiple of this constant — see
+/// hal_align_width_for_gpu_pitch() for a helper.
+///
+/// `hal_image_processor_create_image()` applies this alignment automatically
+/// when allocating DMA-backed image tensors; the constant is only relevant
+/// when the caller manages its own DMA-BUF allocations.
+///
+/// Returned as a function rather than a `#define` so the value stays in
+/// sync with the Rust source if the alignment requirement ever changes.
+///
+/// @return Required DMA-BUF row pitch alignment in bytes (currently 64)
+#[no_mangle]
+pub extern "C" fn hal_gpu_dma_buf_pitch_alignment_bytes() -> size_t {
+    edgefirst_image::GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES
+}
+
+/// Round `width` (in pixels) up so that `width * bpp` is a multiple of
+/// the value returned by hal_gpu_dma_buf_pitch_alignment_bytes()
+/// (currently 64) **and** an integer pixel count for the given
+/// bytes-per-pixel.
+///
+/// Use this when allocating a DMA-BUF that will later be imported as an
+/// EGLImage by HAL's GL backend (or by any GLES driver that requires
+/// 64-byte aligned pitches, which currently includes Mali Valhall on
+/// i.MX 95 / G310).
+///
+/// Pre-aligned widths (640, 1280, 1920, 3008, 3840, …) round-trip
+/// unchanged. Misaligned widths are bumped up to the next valid value.
+///
+/// `bpp` is the bytes-per-pixel for the primary plane:
+///  - RGBA8 / BGRA8: 4
+///  - RGB888:        3
+///  - Grey / NV12 luma: 1
+///
+/// @param width Image width in pixels
+/// @param bpp   Bytes per pixel for the primary plane
+/// @return Aligned width in pixels (always >= `width`). Returns `width`
+///         unchanged if `bpp == 0`, `width == 0`, or if the rounded value
+///         would overflow `size_t`.
+///
+/// @par Example
+/// @code{.c}
+/// // Allocate an RGBA8 DMA-BUF for a 3004×1688 canvas.
+/// // 3004 × 4 = 12016 bytes pitch, NOT 64-aligned, would fail on Mali.
+/// // After alignment: width = 3008, pitch = 12032 bytes (64-aligned).
+/// size_t aligned_w = hal_align_width_for_gpu_pitch(3004, 4);  // 3008
+/// size_t pitch = aligned_w * 4;                                // 12032
+/// size_t bytes = pitch * 1688;
+/// // ... allocate DMA-BUF of `bytes` bytes, then import via EGL.
+/// @endcode
+#[no_mangle]
+pub extern "C" fn hal_align_width_for_gpu_pitch(width: size_t, bpp: size_t) -> size_t {
+    edgefirst_image::align_width_for_gpu_pitch(width, bpp)
+}
+
+/// Convenience wrapper that derives `bpp` from a HAL pixel format and dtype,
+/// then calls hal_align_width_for_gpu_pitch().
+///
+/// Use this when you have a HalPixelFormat already (the common case for
+/// GStreamer plugins and other HAL clients). The wrapper handles the
+/// channels × element-size multiplication so callers don't need to remember
+/// per-format BPPs.
+///
+/// For semi-planar formats (NV12, NV16) this returns the alignment for the
+/// luma plane; the chroma plane has the same row pitch in bytes.
+///
+/// @param width  Image width in pixels
+/// @param format Pixel format
+/// @param dtype  Element data type
+/// @return Aligned width in pixels (always >= `width`). Returns `width`
+///         unchanged if the format / dtype combination has no defined BPP.
+#[no_mangle]
+pub extern "C" fn hal_align_width_for_pixel_format(
+    width: size_t,
+    format: HalPixelFormat,
+    dtype: HalDtype,
+) -> size_t {
+    let pf = format.to_pixel_format();
+    let elem = match dtype {
+        HalDtype::U8 | HalDtype::I8 => 1,
+        HalDtype::U16 | HalDtype::I16 | HalDtype::F16 => 2,
+        HalDtype::U32 | HalDtype::I32 | HalDtype::F32 => 4,
+        HalDtype::U64 | HalDtype::I64 | HalDtype::F64 => 8,
+    };
+    match edgefirst_image::primary_plane_bpp(pf, elem) {
+        Some(bpp) => edgefirst_image::align_width_for_gpu_pitch(width, bpp),
+        None => width,
+    }
+}
+
+// ============================================================================
 // Plane Descriptor + Image Import
 // ============================================================================
 

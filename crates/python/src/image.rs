@@ -870,6 +870,76 @@ pub fn probe_egl_displays() -> Result<Vec<PyEglDisplayInfo>> {
         .collect())
 }
 
+/// Round `width` (in pixels) up so that the resulting row stride
+/// (`width * bpp` bytes) satisfies the GPU's DMA-BUF EGLImage import
+/// alignment requirement.
+///
+/// Use this when allocating a DMA-BUF that will later be imported as an
+/// EGLImage by HAL's GL backend (or by any GLES driver that requires
+/// 64-byte aligned pitches — currently Mali Valhall on i.MX 95).
+///
+/// Pre-aligned widths (640, 1280, 1920, 3008, 3840, ...) round-trip
+/// unchanged. Misaligned widths are bumped up to the next valid value.
+///
+/// :param width: Image width in pixels
+/// :param bpp:   Bytes per pixel for the primary plane (4 for RGBA8/BGRA8,
+///               3 for RGB888, 1 for Grey/NV12-luma)
+/// :return:      Aligned width in pixels (always >= ``width``). Returns
+///               ``width`` unchanged if ``bpp == 0``, ``width == 0``, or
+///               if the rounded value would overflow.
+///
+/// :Example:
+///
+/// .. code-block:: python
+///
+///     from edgefirst_hal import align_width_for_gpu_pitch
+///     # crowd.png canvas: 3004 × 4 = 12016 bytes pitch, NOT 64-aligned.
+///     # Round up to 3008 → 12032 bytes pitch (64-aligned).
+///     aligned = align_width_for_gpu_pitch(3004, 4)
+///     assert aligned == 3008
+#[pyfunction]
+pub fn align_width_for_gpu_pitch(width: usize, bpp: usize) -> usize {
+    image::align_width_for_gpu_pitch(width, bpp)
+}
+
+/// Convenience wrapper that derives bytes-per-pixel from a pixel format and
+/// dtype, then calls :func:`align_width_for_gpu_pitch`.
+///
+/// Use this when you have a :class:`PixelFormat` already.
+///
+/// :param width:  Image width in pixels
+/// :param format: Pixel format (e.g. ``PixelFormat.Rgba``)
+/// :param dtype:  Element data type as a string. Same set of names accepted
+///                by :meth:`ImageProcessor.create_image` and the rest of
+///                the HAL Python API — ``"uint8"``, ``"int8"``, ``"uint16"``,
+///                ``"int16"``, ``"float16"``, ``"float32"``, etc.
+/// :return:       Aligned width in pixels (always >= ``width``)
+#[pyfunction]
+#[pyo3(signature = (width, format, dtype = "uint8"))]
+pub fn align_width_for_pixel_format(
+    width: usize,
+    format: PyPixelFormat,
+    dtype: &str,
+) -> Result<usize> {
+    let pf: PixelFormat = format.into();
+    let dt = crate::tensor::parse_dtype(dtype).map_err(|e| Error::InvalidArg(e.to_string()))?;
+    let elem = dt.size();
+    Ok(match image::primary_plane_bpp(pf, elem) {
+        Some(bpp) => image::align_width_for_gpu_pitch(width, bpp),
+        None => width,
+    })
+}
+
+/// Required DMA-BUF row pitch alignment in bytes for GL backend imports
+/// (currently 64). External callers that need to allocate their own
+/// DMA-BUFs should size them so each row pitch is a multiple of this value.
+///
+/// :return: Required pitch alignment in bytes (currently 64)
+#[pyfunction]
+pub fn gpu_dma_buf_pitch_alignment_bytes() -> usize {
+    image::GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES
+}
+
 #[pyclass(name = "ImageProcessor")]
 pub struct PyImageProcessor(pub(crate) Mutex<image::ImageProcessor>);
 

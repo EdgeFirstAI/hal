@@ -372,10 +372,193 @@ fn bench_hybrid_materialize_and_draw(proc: &mut ImageProcessor, suite: &mut Benc
 // Main
 // =============================================================================
 
+/// Diagnostic mode (enabled when `MASK_BENCH_DIAG=1`, `true`, or `yes`) —
+/// bypass the timing loop, allocate a destination via
+/// `processor.create_image`, log its `dst.memory()` (so we know whether DMA
+/// actually worked), then call both `draw_decoded_masks` and
+/// `draw_proto_masks` once each and dump the rendered output to
+/// `/tmp/mask_decoded.rgba` and `/tmp/mask_proto.rgba` for visual
+/// verification. Any other value of the env var (including `0` and `false`)
+/// leaves the bench in normal timing-loop mode.
+///
+/// This is the diagnostic path for the "draw_decoded_masks doesn't modify
+/// the destination on i.MX 95" bug. It uses embedded test data so it
+/// doesn't need the NPU and runs on any target the bench binary
+/// cross-compiles to.
+fn run_diagnostic(proc: &mut ImageProcessor) {
+    use edgefirst_tensor::{TensorMapTrait, TensorTrait};
+
+    // Diagnostic dst dims are configurable via env var so we can repro
+    // the imx95 Kinara example's setup which uses canvas = source image
+    // dimensions (e.g. 3004×1688 for crowd.png).
+    let dst_w: usize = std::env::var("MASK_BENCH_DST_W")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(OUTPUT_W);
+    let dst_h: usize = std::env::var("MASK_BENCH_DST_H")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(OUTPUT_H);
+
+    println!("\n== DIAGNOSTIC: draw_decoded_masks vs draw_proto_masks ==");
+    println!("  dst dims: {}x{}", dst_w, dst_h);
+    let (detect, proto_data) = decode_proto_data();
+    let segmentation = materialize_segmentations(&detect, &proto_data);
+    println!("  Detections: {}", detect.len());
+
+    // ---- draw_decoded_masks ----
+    println!("\n--- draw_decoded_masks ---");
+    let mut dst = match proc.create_image(dst_w, dst_h, PixelFormat::Rgba, DType::U8, None) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("  create_image failed: {e:?}");
+            return;
+        }
+    };
+    // Log the actual tensor dimensions and stride, not just what we
+    // requested — `create_image` silently pads the DMA row stride for
+    // GPU pitch alignment, and the diagnostic is meant to surface that
+    // difference so a mismatch is visible.
+    let actual_w = dst.width().unwrap_or(0);
+    let actual_h = dst.height().unwrap_or(0);
+    let actual_stride = dst.effective_row_stride().unwrap_or(0);
+    let natural_stride = actual_w * 4; // RGBA8
+    println!("  dst.memory() = {:?}", dst.memory());
+    println!(
+        "  dst requested = {dst_w}x{dst_h}, actual = {actual_w}x{actual_h}, \
+         stride = {actual_stride} bytes (natural {natural_stride}, padded = {})",
+        if actual_stride > natural_stride {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+
+    // Pre-fill dst with a known sentinel so we can detect "untouched" buffers.
+    {
+        let t = dst.as_u8_mut().expect("u8 dst");
+        let mut m = t.map().expect("map dst");
+        for px in m.as_mut_slice().chunks_exact_mut(4) {
+            px[0] = 0x42;
+            px[1] = 0x42;
+            px[2] = 0x42;
+            px[3] = 0x42;
+        }
+    }
+    let pre_sum: u64 = {
+        let t = dst.as_u8().expect("u8 dst");
+        let m = t.map().expect("map dst");
+        m.as_slice().iter().map(|b| *b as u64).sum()
+    };
+
+    let t0 = std::time::Instant::now();
+    let result = proc.draw_decoded_masks(&mut dst, &detect, &segmentation, Default::default());
+    let elapsed = t0.elapsed();
+    println!(
+        "  call took {:.2} ms (DMA fast path < 10ms; non-DMA fallback ~95ms on Mali)",
+        elapsed.as_secs_f64() * 1000.0
+    );
+    if let Err(e) = result {
+        println!("  draw_decoded_masks ERROR: {e:?}");
+    } else {
+        let t = dst.as_u8().expect("u8 dst");
+        let m = t.map().expect("map dst");
+        let bytes = m.as_slice();
+        let post_sum: u64 = bytes.iter().map(|b| *b as u64).sum();
+        let unchanged = bytes.iter().all(|b| *b == 0x42);
+        let nonzero_alpha = bytes
+            .iter()
+            .skip(3)
+            .step_by(4)
+            .filter(|b| **b > 0 && **b != 0x42)
+            .count();
+        println!("  pre_sum  = {pre_sum}");
+        println!("  post_sum = {post_sum}");
+        println!("  changed  = {}", !unchanged);
+        println!("  non-sentinel alpha pixels = {nonzero_alpha}");
+        if let Err(e) = std::fs::write("/tmp/mask_decoded.rgba", bytes) {
+            println!("  failed to dump /tmp/mask_decoded.rgba: {e:?}");
+        } else {
+            println!("  wrote /tmp/mask_decoded.rgba ({} bytes)", bytes.len());
+        }
+    }
+
+    // ---- draw_proto_masks (fused) ----
+    println!("\n--- draw_proto_masks (fused) ---");
+    let mut dst2 = match proc.create_image(dst_w, dst_h, PixelFormat::Rgba, DType::U8, None) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("  create_image failed: {e:?}");
+            return;
+        }
+    };
+    let actual_w2 = dst2.width().unwrap_or(0);
+    let actual_h2 = dst2.height().unwrap_or(0);
+    let actual_stride2 = dst2.effective_row_stride().unwrap_or(0);
+    let natural_stride2 = actual_w2 * 4; // RGBA8
+    println!("  dst.memory() = {:?}", dst2.memory());
+    println!(
+        "  dst requested = {dst_w}x{dst_h}, actual = {actual_w2}x{actual_h2}, \
+         stride = {actual_stride2} bytes (natural {natural_stride2}, padded = {})",
+        if actual_stride2 > natural_stride2 {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+
+    {
+        let t = dst2.as_u8_mut().expect("u8 dst2");
+        let mut m = t.map().expect("map dst2");
+        for px in m.as_mut_slice().chunks_exact_mut(4) {
+            px[0] = 0x42;
+            px[1] = 0x42;
+            px[2] = 0x42;
+            px[3] = 0x42;
+        }
+    }
+    let t0 = std::time::Instant::now();
+    let result = proc.draw_proto_masks(&mut dst2, &detect, &proto_data, Default::default());
+    let elapsed = t0.elapsed();
+    println!("  call took {:.2} ms", elapsed.as_secs_f64() * 1000.0);
+    if let Err(e) = result {
+        println!("  draw_proto_masks ERROR: {e:?}");
+    } else {
+        let t = dst2.as_u8().expect("u8 dst2");
+        let m = t.map().expect("map dst2");
+        let bytes = m.as_slice();
+        let post_sum: u64 = bytes.iter().map(|b| *b as u64).sum();
+        let unchanged = bytes.iter().all(|b| *b == 0x42);
+        let nonzero_alpha = bytes
+            .iter()
+            .skip(3)
+            .step_by(4)
+            .filter(|b| **b > 0 && **b != 0x42)
+            .count();
+        println!("  post_sum = {post_sum}");
+        println!("  changed  = {}", !unchanged);
+        println!("  non-sentinel alpha pixels = {nonzero_alpha}");
+        if let Err(e) = std::fs::write("/tmp/mask_proto.rgba", bytes) {
+            println!("  failed to dump /tmp/mask_proto.rgba: {e:?}");
+        } else {
+            println!("  wrote /tmp/mask_proto.rgba ({} bytes)", bytes.len());
+        }
+    }
+    println!();
+}
+
 fn main() {
     env_logger::init();
     let mut suite = BenchSuite::from_args();
     let mut proc = ImageProcessor::new().expect("Failed to create ImageProcessor");
+
+    let diag_enabled = std::env::var("MASK_BENCH_DIAG")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(false);
+    if diag_enabled {
+        run_diagnostic(&mut proc);
+        return;
+    }
 
     println!("Mask Rendering Benchmark — edgefirst-bench harness");
     println!("  warmup={WARMUP}  iterations={ITERATIONS}");
