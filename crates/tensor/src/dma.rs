@@ -41,15 +41,20 @@ where
     /// Actual buffer size in bytes (from fstat at creation time).
     /// May be larger than shape.product() * sizeof(T) for externally
     /// allocated buffers with row padding.
-    buf_size: usize,
+    pub(crate) buf_size: usize,
     /// Byte offset into the DMA buffer where the tensor data begins.
     /// Set via `Tensor::set_plane_offset` for sub-region imports.
     pub(crate) mmap_offset: usize,
     /// Whether this tensor was created via `from_fd()` (imported from an
     /// external allocator).  Propagated through `try_clone()` so that DRM
-    /// PRIME import failures are logged at DEBUG rather than WARN.
+    /// PRIME import failures are logged at DEBUG rather than WARN, and
+    /// used to gate CPU mapping of strided tensors: self-allocated DMA
+    /// tensors with pitch padding (via `new_with_byte_size`) are
+    /// mappable because HAL owns the layout, but foreign V4L2/GStreamer
+    /// strided imports are not — the external allocator defines the
+    /// layout and HAL cannot validate what the caller expects.
     #[cfg(target_os = "linux")]
-    is_imported: bool,
+    pub(crate) is_imported: bool,
 }
 
 unsafe impl<T> Send for DmaTensor<T> where T: Num + Clone + fmt::Debug + Send + Sync {}
@@ -224,6 +229,127 @@ impl<T> DmaTensor<T>
 where
     T: Num + Clone + Send + Sync + std::fmt::Debug + Send + Sync,
 {
+    /// Allocate a DMA-BUF with an explicit byte size that may exceed
+    /// `shape.product() * sizeof(T)`.
+    ///
+    /// Used for image tensors that need a row-padded layout so the
+    /// resulting DMA-BUF satisfies a downstream consumer's pitch
+    /// alignment requirement (e.g. Mali Valhall's 64-byte EGLImage
+    /// import rule). The `shape` field stores the **logical** dimensions
+    /// `[height, width, channels]`, so `Tensor::width()` / `height()` /
+    /// `shape()` continue to report the user-requested values; the
+    /// padding is carried separately by `Tensor::row_stride` and is
+    /// visible to the CPU mapping (which spans the full `byte_size`
+    /// bytes) but not to the logical shape.
+    ///
+    /// Errors:
+    /// - `InvalidArgument` if `byte_size < shape.product() * sizeof(T)`
+    ///   (the request would lose data)
+    /// - `IoError` if the DMA-heap allocation fails
+    #[cfg(target_os = "linux")]
+    pub(crate) fn new_with_byte_size(
+        shape: &[usize],
+        byte_size: usize,
+        name: Option<&str>,
+    ) -> Result<Self> {
+        use log::debug;
+        use nix::sys::stat::fstat;
+
+        // Compute the logical byte size with checked arithmetic. A caller
+        // passing an absurdly large shape (or sizeof::<T> × product) must
+        // not silently wrap — the comparison below would then accept an
+        // allocation that's actually smaller than the logical size.
+        let logical_elems = shape
+            .iter()
+            .copied()
+            .try_fold(1usize, |acc, dim| acc.checked_mul(dim))
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "DmaTensor::new_with_byte_size: shape.product() overflows usize \
+                     (shape={shape:?})"
+                ))
+            })?;
+        let logical_size = logical_elems
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "DmaTensor::new_with_byte_size: logical_elems {logical_elems} × \
+                     sizeof::<T>={} overflows usize (shape={shape:?})",
+                    std::mem::size_of::<T>()
+                ))
+            })?;
+        if byte_size < logical_size {
+            return Err(Error::InvalidArgument(format!(
+                "DmaTensor::new_with_byte_size: byte_size {byte_size} < logical {logical_size} \
+                 (shape={shape:?}, sizeof::<T>={})",
+                std::mem::size_of::<T>()
+            )));
+        }
+        let name = match name {
+            Some(name) => name.to_owned(),
+            None => {
+                let uuid = uuid::Uuid::new_v4().as_simple().to_string();
+                format!("/{}", &uuid[..16])
+            }
+        };
+
+        let heap = match dma_heap::Heap::new(dma_heap::HeapKind::Cma) {
+            Ok(heap) => heap,
+            Err(_) => dma_heap::Heap::new(dma_heap::HeapKind::System)?,
+        };
+
+        let dma_fd = heap.allocate(byte_size)?;
+        let stat = fstat(&dma_fd)?;
+        debug!("DMA padded memory stat: {stat:?}");
+        let buf_size = if stat.st_size > 0 {
+            std::cmp::max(stat.st_size as usize, byte_size)
+        } else {
+            byte_size
+        };
+
+        let drm_attachment = crate::dmabuf::DrmAttachment::new(&dma_fd, false);
+
+        Ok(DmaTensor::<T> {
+            name,
+            fd: dma_fd,
+            shape: shape.to_vec(),
+            _marker: std::marker::PhantomData,
+            _drm_attachment: drm_attachment,
+            identity: crate::BufferIdentity::new(),
+            buf_size,
+            mmap_offset: 0,
+            is_imported: false,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn new_with_byte_size(
+        _shape: &[usize],
+        _byte_size: usize,
+        _name: Option<&str>,
+    ) -> Result<Self> {
+        Err(Error::NotImplemented(
+            "DMA tensors are not supported on this platform".to_owned(),
+        ))
+    }
+
+    /// Map this DMA tensor with an explicit total byte size.
+    ///
+    /// Used by `Tensor::map()` for self-allocated strided tensors — the
+    /// returned `DmaMap` exposes the full `byte_size` bytes via
+    /// `as_slice()`/`as_mut_slice()`, not just the shape-derived logical
+    /// count. Callers are expected to iterate rows with
+    /// `Tensor::effective_row_stride()` so they don't read past the end.
+    pub(crate) fn map_with_byte_size(&self, byte_size: usize) -> Result<DmaMap<T>> {
+        DmaMap::new_with_byte_size(
+            self.fd.try_clone()?,
+            &self.shape,
+            self.buf_size,
+            self.mmap_offset,
+            byte_size,
+        )
+    }
+
     pub fn try_clone(&self) -> Result<Self> {
         let fd = self.clone_fd()?;
         // Preserve the imported/owned distinction: imported fds never get a
@@ -262,6 +388,14 @@ where
     mmap_size: usize,
     /// Byte offset into the mmap'd region where tensor data begins.
     offset: usize,
+    /// Optional override for `as_slice().len() * sizeof(T)`. When `None`,
+    /// `as_slice()` returns `shape.product()` elements (the traditional
+    /// logical view). When `Some(bytes)`, `as_slice()` returns `bytes /
+    /// sizeof(T)` elements, exposing the full padded buffer. Used for
+    /// self-allocated strided DMA tensors where the mmap'd region has
+    /// row-padding between logical rows and callers need to iterate via
+    /// `row_stride` rather than a packed `width * bpp` layout.
+    byte_size_override: Option<usize>,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -270,6 +404,36 @@ where
     T: Num + Clone + fmt::Debug,
 {
     pub fn new(fd: OwnedFd, shape: &[usize], buf_size: usize, offset: usize) -> Result<Self> {
+        Self::new_internal(fd, shape, buf_size, offset, None)
+    }
+
+    /// Construct a DmaMap whose `as_slice()` exposes the full padded
+    /// buffer rather than the shape-derived logical byte count. Used by
+    /// `Tensor::map()` for self-allocated strided DMA tensors so CPU
+    /// iteration can respect `row_stride` without going past the end
+    /// of the returned slice.
+    ///
+    /// Crate-private: the only caller is `Tensor::map()`, which already
+    /// performs the outer `stride × height <= buf_size - offset` check.
+    /// Keeping this API `pub(crate)` ensures an unchecked `byte_size`
+    /// can never be fed in from outside the crate.
+    pub(crate) fn new_with_byte_size(
+        fd: OwnedFd,
+        shape: &[usize],
+        buf_size: usize,
+        offset: usize,
+        byte_size: usize,
+    ) -> Result<Self> {
+        Self::new_internal(fd, shape, buf_size, offset, Some(byte_size))
+    }
+
+    fn new_internal(
+        fd: OwnedFd,
+        shape: &[usize],
+        buf_size: usize,
+        offset: usize,
+        byte_size_override: Option<usize>,
+    ) -> Result<Self> {
         if shape.is_empty() {
             return Err(Error::InvalidSize(0));
         }
@@ -305,6 +469,27 @@ where
                 std::mem::align_of::<T>()
             )));
         }
+
+        // Defense in depth: even though `new_with_byte_size` is crate-private
+        // and its callers validate upstream, verify the override is non-zero,
+        // sizeof::<T>()-aligned, and fits inside the mapped region. Any breach
+        // would otherwise turn into an out-of-bounds slice in `as_slice()`.
+        if let Some(byte_size) = byte_size_override {
+            if byte_size == 0 {
+                return Err(Error::InvalidSize(0));
+            }
+            let t_size = std::mem::size_of::<T>();
+            if t_size > 1 && !byte_size.is_multiple_of(t_size) {
+                return Err(Error::InvalidOperation(format!(
+                    "DmaMap: byte_size_override {byte_size} is not a multiple of sizeof::<T>()={t_size}"
+                )));
+            }
+            let available = buf_size.saturating_sub(offset);
+            if byte_size > available {
+                return Err(Error::InvalidSize(byte_size));
+            }
+        }
+
         let mmap_size = buf_size;
 
         #[cfg(target_os = "linux")]
@@ -338,6 +523,7 @@ where
             shape: shape.to_vec(),
             mmap_size,
             offset,
+            byte_size_override,
             _marker: std::marker::PhantomData,
         })
     }
@@ -399,13 +585,29 @@ where
     fn as_slice(&self) -> &[T] {
         let ptr = self.ptr.lock().expect("Failed to lock DmaMap pointer");
         let base = unsafe { (ptr.as_ptr() as *const u8).add(self.offset) as *const T };
-        unsafe { std::slice::from_raw_parts(base, self.len()) }
+        unsafe { std::slice::from_raw_parts(base, self.slice_len_elems()) }
     }
 
     fn as_mut_slice(&mut self) -> &mut [T] {
         let ptr = self.ptr.lock().expect("Failed to lock DmaMap pointer");
         let base = unsafe { (ptr.as_ptr() as *mut u8).add(self.offset) as *mut T };
-        unsafe { std::slice::from_raw_parts_mut(base, self.len()) }
+        unsafe { std::slice::from_raw_parts_mut(base, self.slice_len_elems()) }
+    }
+}
+
+impl<T> DmaMap<T>
+where
+    T: Num + Clone + fmt::Debug,
+{
+    /// Number of `T` elements exposed by `as_slice()`. Honours
+    /// `byte_size_override` when set (for strided tensors the caller
+    /// wants the full padded mmap exposed, not just `shape.product()`).
+    /// Falls back to the shape-derived logical element count.
+    fn slice_len_elems(&self) -> usize {
+        match self.byte_size_override {
+            Some(bytes) => bytes / std::mem::size_of::<T>(),
+            None => self.shape.iter().product(),
+        }
     }
 }
 

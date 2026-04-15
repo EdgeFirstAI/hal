@@ -7,6 +7,131 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.3] - 2026-04-13
+
+### Fixed
+
+- **Mali Valhall DMA-BUF pitch alignment (i.MX 95).** `eglCreateImageKHR`
+  on Mali Valhall (e.g. Mali-G310 on i.MX 95) rejects every DMA-BUF whose
+  row pitch is not a multiple of 64 bytes, returning `EGL_BAD_ALLOC`.
+  The HAL was gracefully falling through to the non-DMA CPU readback
+  path, which is 10–20× slower and indistinguishable from "DMA worked
+  but rendered nothing." This affected `draw_decoded_masks` and
+  `draw_proto_masks` on i.MX 95 for any canvas whose
+  `width × bytes_per_pixel` was not 64-aligned (e.g. crowd-scene canvases
+  at 3004×1688 RGBA8 → pitch 12016, 16-aligned, fail). Convert paths
+  were unaffected because their source buffers come from
+  libcamera/v4l2, which already align to the GPU's preferred pitch.
+
+  `ImageProcessor::create_image` now silently pads the **row stride**
+  (not the logical width) so the resulting DMA-BUF satisfies
+  `GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES` (64). Following the V4L2 / DRM
+  / GStreamer convention, the tensor's logical `width()` / `height()`
+  continue to report the user-requested values and the padding is
+  carried by `row_stride()` / `effective_row_stride()`. Callers that
+  iterate pixel rows must use the stride (not `width × bpp`) for row
+  offsets; the CPU mapping spans the full `stride × height` bytes.
+  Verified on i.MX 95: crowd canvas (3004×1688 RGBA8) draw drops from
+  91 ms → 9.26 ms (~10× faster), with `tensor.width() == 3004` and
+  `tensor.effective_row_stride() == 12032`.
+
+  New tensor primitives power this:
+  - `Tensor::image_with_stride(width, height, format, row_stride, memory)`
+    and `TensorDyn::image_with_stride(...)` allocate a DMA-backed
+    image with an explicit row stride that may exceed the natural
+    `width × channels × sizeof(T)` pitch. Currently DMA-only and
+    packed-formats-only.
+  - `DmaTensor::new_with_byte_size` decouples the allocation byte
+    count from `shape.product()` so the backing DMA-BUF can be sized
+    to `row_stride × height` bytes while the logical shape remains
+    `[height, width, channels]`.
+  - `DmaMap::new_with_byte_size` exposes the full padded mmap via
+    `as_slice()` / `as_mut_slice()` so CPU iteration respects the
+    stride without going past the end of the returned slice.
+  - `Tensor::map()` now allows CPU mapping of self-allocated strided
+    DMA tensors (previously rejected). Foreign strided imports
+    (`from_fd` + `set_row_stride`, the V4L2/GStreamer case) continue
+    to be GPU-only as before — the external allocator owns the layout
+    and HAL cannot validate CPU access expectations.
+
+### Performance
+
+- **`render_yolo_segmentation` per-instance overhead.** The hot inner
+  loop of `draw_decoded_masks` paid for four `glTexParameteri` calls,
+  a `Vec<u8>` heap allocation + 1 px CPU zero-pad copy, and a
+  `glFinish` after every draw. All four are now eliminated or hoisted
+  out of the per-instance loop:
+  - `setup_yolo_segmentation_pass` runs once before the batch and sets
+    program/texture/parameters.
+  - The CPU pad is gone; texel-centre UVs (`0.5/w` to `(w-0.5)/w`)
+    keep bilinear sampling strictly inside the uploaded mask region.
+    The fragment shader's existing `smoothstep(0.5, 0.65)` provides
+    the edge antialiasing the pad used to proxy for.
+  - Internal format switched from unsized `GL_RED` to sized `GL_R8`.
+  - `glFinish` per instance is now branched on `is_vivante`. Vivante's
+    immediate-mode driver regresses ~2× without the periodic drain;
+    Mali Valhall's TBDR pipeline regresses ~30% *with* it (every
+    flush forces a tile store-unload of the framebuffer). The split
+    lets each driver win.
+
+  Combined with the alignment fix above, the Kinara `yolov8.rs` example
+  on imx95 with `crowd.png` (39 detections) drops Draw stage from
+  135.89 ms → ~10 ms end-to-end. imx8mp Vivante crowd Draw is unchanged
+  at ~38 ms in this release; further improvement requires the Tier 2-a
+  mask pool work (separate effort).
+
+### Added
+
+- **One-time slow-path warning.** `draw_decoded_masks` and
+  `draw_proto_masks` now emit a single warn-level log the first time
+  they fall back from the DMA fast path to the CPU readback path,
+  identifying the call site, the failing setup function, and the
+  underlying error. The message specifically calls out Mali's 64-byte
+  pitch requirement so the next regression has a direct pointer at the
+  cause. Subsequent fallbacks are demoted to debug-level.
+
+- **Trace-level draw-path diagnostics.** Both draw entry points log at
+  `log::trace!` level when entering, and report which path was taken
+  (DMA fast path / PBO / non-DMA fallback). Gated on
+  `log::log_enabled!(Trace)` so the formatting cost is a single
+  integer compare when trace logging is disabled.
+
+- **GPU pitch alignment helpers exposed to all language bindings** so
+  callers that allocate their own DMA-BUFs (GStreamer plugins, V4L2 ring
+  buffers, custom video pipelines) can size them to satisfy Mali's
+  64-byte requirement without having to hard-code the constant. The
+  helpers all delegate to a single overflow-safe Rust implementation
+  that returns the original width unchanged (with a warn-level log) if
+  the rounded value would overflow `usize`, so callers can rely on the
+  returned width being **at least** the requested width.
+
+  | Language | Symbols |
+  | --- | --- |
+  | Rust | `edgefirst_image::align_width_for_gpu_pitch`, `edgefirst_image::primary_plane_bpp`, `edgefirst_image::GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES` |
+  | C | `hal_align_width_for_gpu_pitch`, `hal_align_width_for_pixel_format`, `hal_gpu_dma_buf_pitch_alignment_bytes` |
+  | Python | `edgefirst_hal.align_width_for_gpu_pitch`, `edgefirst_hal.align_width_for_pixel_format`, `edgefirst_hal.gpu_dma_buf_pitch_alignment_bytes` |
+
+  The `*_for_pixel_format` variants in C and Python derive bytes-per-pixel
+  from a `HalPixelFormat`/`PyPixelFormat` + dtype so callers don't have
+  to remember per-format BPPs. Unit tests cover RGBA8/BGRA8, RGB888,
+  Grey/u8, NV12 luma, zero-input edge cases, and overflow-extreme widths
+  (up to `usize::MAX`).
+
+- **`mask_benchmark` diagnostic mode.** `MASK_BENCH_DIAG=1` bypasses the
+  timing loop and runs a single `draw_decoded_masks` + `draw_proto_masks`
+  pair against a real DMA-allocated destination, dumps the rendered
+  bytes to `/tmp/mask_decoded.rgba` / `/tmp/mask_proto.rgba`, and reports
+  call latency. `MASK_BENCH_DST_W` and `MASK_BENCH_DST_H` env vars
+  override the canvas dimensions for reproducing arbitrary caller
+  sizing.
+
+- **`bench_mask_pool` POC bench in `gpu-probe`.** Standalone GL-only
+  proof-of-concept that compares the per-instance baseline against an
+  instanced `GL_TEXTURE_2D_ARRAY` + `glDrawElementsInstanced` path at
+  N ∈ {2, 5, 10, 20, 40, 80}. Includes pixel-level cross-validation and
+  a separate `readback_640x640_rgba8` measurement. Used for the Tier 2-a
+  mask pool design validation.
+
 ## [0.16.2] - 2026-04-10
 
 ### Fixed

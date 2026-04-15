@@ -51,6 +51,12 @@ pub mod edgefirst_hal {
         m.add_class::<image::PyColorMode>()?;
         m.add_class::<image::PyImageProcessor>()?;
         m.add_class::<image::PyEglDisplayKind>()?;
+        m.add_function(wrap_pyfunction!(image::align_width_for_gpu_pitch, m)?)?;
+        m.add_function(wrap_pyfunction!(image::align_width_for_pixel_format, m)?)?;
+        m.add_function(wrap_pyfunction!(
+            image::gpu_dma_buf_pitch_alignment_bytes,
+            m
+        )?)?;
         #[cfg(target_os = "linux")]
         {
             m.add_class::<image::PyEglDisplayInfo>()?;

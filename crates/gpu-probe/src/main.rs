@@ -5,6 +5,7 @@ use edgefirst_bench as bench;
 mod bench_dma;
 mod bench_egl_image;
 mod bench_fbo;
+mod bench_mask_pool;
 mod bench_pipeline;
 mod bench_render;
 mod bench_rgb_direct;
@@ -25,6 +26,7 @@ fn main() {
     let probe_only = std::env::args().any(|a| a == "--probe-only");
     let bench_only = std::env::args().any(|a| a == "--bench-only");
     let skip_pipeline = std::env::args().any(|a| a == "--skip-pipeline");
+    let skip_mask_pool = std::env::args().any(|a| a == "--skip-mask-pool");
 
     println!("gpu-probe: Low-level GPU platform exploration tool");
     println!("  arch: {}", std::env::consts::ARCH);
@@ -71,6 +73,16 @@ fn main() {
         bench_fbo::run(&ctx);
         bench_texture::run(&ctx);
         bench_shader::run(&ctx);
+
+        // Tier 2-a mask pool POC: adds ~10s of warmup/timing across the
+        // N ∈ {2,5,10,20,40,80} sweep, so gate it behind `--skip-mask-pool`
+        // for users who only want the existing probes/benches.
+        if !skip_mask_pool {
+            bench_mask_pool::run(&ctx);
+        } else {
+            println!("== Benchmark: Mask Pool POC (Tier 2-a) == SKIP (--skip-mask-pool)");
+            println!();
+        }
 
         if has_egl_image {
             bench_render::run(&ctx);
