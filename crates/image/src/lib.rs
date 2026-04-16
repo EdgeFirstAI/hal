@@ -1724,7 +1724,7 @@ impl ImageProcessorTrait for ImageProcessor {
     ) -> Result<()> {
         let start = Instant::now();
 
-        if detect.is_empty() && segmentation.is_empty() {
+        if detect.is_empty() && segmentation.is_empty() && overlay.background.is_none() {
             return Ok(());
         }
 
@@ -1834,6 +1834,11 @@ impl ImageProcessorTrait for ImageProcessor {
         let start = Instant::now();
 
         if detect.is_empty() {
+            // No detections — still render the background so the camera feed
+            // remains visible rather than showing a stale/black canvas.
+            if overlay.background.is_some() {
+                return self.draw_decoded_masks(dst, detect, &[], overlay);
+            }
             return Ok(());
         }
 
