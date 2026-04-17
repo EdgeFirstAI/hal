@@ -375,8 +375,12 @@ impl ColorMode {
 ///
 /// Controls how segmentation masks are composited onto the destination image:
 /// - `background`: when set, the background image is drawn first and masks
-///   are composited over it (result written to `dst`). When `None`, masks
-///   are composited directly over `dst`'s existing content.
+///   are composited over it (result written to `dst`). When `None`, `dst` is
+///   cleared to `0x00000000` (fully transparent) before masks are drawn.
+///   **`dst` is always fully overwritten — its prior contents are never
+///   preserved.** Callers who used to pre-load an image into `dst` before
+///   calling `draw_decoded_masks` / `draw_proto_masks` must now supply that
+///   image via `background` instead (behaviour changed in v0.16.4).
 /// - `opacity`: scales the alpha of rendered mask colors. `1.0` (default)
 ///   preserves the class color's alpha unchanged; `0.5` makes masks
 ///   semi-transparent.
@@ -384,6 +388,9 @@ impl ColorMode {
 ///   instance index, or track ID. Defaults to [`ColorMode::Class`].
 #[derive(Debug, Clone, Copy)]
 pub struct MaskOverlay<'a> {
+    /// Compositing source image. Must have the same dimensions and pixel
+    /// format as `dst`. When `Some`, the output is `background + masks`.
+    /// When `None`, `dst` is cleared to `0x00000000` before masks are drawn.
     pub background: Option<&'a TensorDyn>,
     pub opacity: f32,
     /// Normalized letterbox region `[xmin, ymin, xmax, ymax]` in model-input
@@ -415,6 +422,13 @@ impl<'a> MaskOverlay<'a> {
         Self::default()
     }
 
+    /// Set the compositing source image.
+    ///
+    /// `bg` must have the same dimensions and pixel format as the `dst` passed
+    /// to [`draw_decoded_masks`](crate::ImageProcessorTrait::draw_decoded_masks) /
+    /// [`draw_proto_masks`](crate::ImageProcessorTrait::draw_proto_masks).
+    /// The output will be `bg + masks`. Without a background, `dst` is cleared
+    /// to `0x00000000`.
     pub fn with_background(mut self, bg: &'a TensorDyn) -> Self {
         self.background = Some(bg);
         self
@@ -657,9 +671,26 @@ pub trait ImageProcessorTrait {
     ///
     /// An empty `segmentation` slice is valid — only bounding boxes are drawn.
     ///
-    /// `overlay` controls compositing: `background` replaces dst's base
-    /// content; `opacity` scales mask alpha. Use `MaskOverlay::default()`
-    /// for backward-compatible behaviour.
+    /// `overlay` controls compositing: `background` is the compositing source
+    /// (must match `dst` in size and format); `opacity` scales mask alpha.
+    ///
+    /// # Buffer aliasing
+    ///
+    /// `dst` and `overlay.background` must reference **distinct underlying
+    /// buffers**. An aliased pair returns [`Error::AliasedBuffers`] without
+    /// dispatching to any backend — the GL path would otherwise read and
+    /// write the same texture in a single draw, which is undefined behaviour
+    /// on most drivers. Aliasing is detected via
+    /// [`TensorDyn::aliases`](edgefirst_tensor::TensorDyn::aliases), which
+    /// catches both shared-allocation clones and separate imports over the
+    /// same dmabuf fd.
+    ///
+    /// # Migration from v0.16.3 and earlier
+    ///
+    /// Prior to v0.16.4 the call silently preserved `dst`'s contents on empty
+    /// detections. That invariant no longer holds — `dst` is always fully
+    /// written. Callers who pre-loaded an image into `dst` before calling this
+    /// function must now pass that image via `overlay.background` instead.
     fn draw_decoded_masks(
         &mut self,
         dst: &mut TensorDyn,
@@ -1711,6 +1742,14 @@ impl ImageProcessorTrait for ImageProcessor {
     ) -> Result<()> {
         let start = Instant::now();
 
+        if let Some(bg) = overlay.background {
+            if bg.aliases(dst) {
+                return Err(Error::AliasedBuffers(
+                    "background must not reference the same buffer as dst".to_string(),
+                ));
+            }
+        }
+
         // Un-letterbox detect boxes and segmentation bboxes for rendering when
         // a letterbox was applied to prepare the model input.
         let lb_boxes: Vec<DetectBox>;
@@ -1738,6 +1777,7 @@ impl ImageProcessorTrait for ImageProcessor {
         } else {
             (detect, segmentation)
         };
+        #[cfg(target_os = "linux")]
         let is_empty_frame = detect.is_empty() && segmentation.is_empty();
 
         // ── Forced backend: no fallback chain ────────────────────────
@@ -1841,6 +1881,14 @@ impl ImageProcessorTrait for ImageProcessor {
     ) -> Result<()> {
         let start = Instant::now();
 
+        if let Some(bg) = overlay.background {
+            if bg.aliases(dst) {
+                return Err(Error::AliasedBuffers(
+                    "background must not reference the same buffer as dst".to_string(),
+                ));
+            }
+        }
+
         // Un-letterbox detect boxes for rendering when a letterbox was applied
         // to prepare the model input.  The original `detect` coords are still
         // passed to `materialize_segmentations` (which needs model-space coords
@@ -1853,6 +1901,7 @@ impl ImageProcessorTrait for ImageProcessor {
         } else {
             detect
         };
+        #[cfg(target_os = "linux")]
         let is_empty_frame = detect.is_empty();
 
         // ── Forced backend: no fallback chain ────────────────────────
