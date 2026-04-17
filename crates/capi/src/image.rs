@@ -917,9 +917,15 @@ pub unsafe extern "C" fn hal_image_processor_draw_decoded_masks(
 ) -> c_int {
     check_null!(processor, dst);
 
-    // Buffer-aliasing (dst vs background) is validated inside draw_decoded_masks
-    // via TensorDyn::aliases, which catches separate HalTensor wrappers over
-    // one dmabuf fd that a raw pointer-pair check would miss.
+    // Reject same-HalTensor aliasing BEFORE `build_overlay` borrows
+    // background — otherwise we'd form `&(*bg).inner` and `&mut (*dst).inner`
+    // over the same object, which is UB at the Rust reference level before
+    // any runtime check can fire. `TensorDyn::aliases` inside
+    // `draw_decoded_masks` still catches the distinct-wrapper same-buffer
+    // case (separate HalTensor handles over one dmabuf fd).
+    if !background.is_null() && std::ptr::eq(background, dst as *const _) {
+        return set_error(libc::EINVAL);
+    }
 
     let detect_slice = if detections.is_null() {
         &[]
@@ -1055,8 +1061,13 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks(
         return set_error(libc::EINVAL);
     }
 
-    // Aliasing of dst vs background is validated by draw_{decoded,proto}_masks
-    // via TensorDyn::aliases (see draw_err_to_errno).
+    // Reject same-HalTensor aliasing before borrowing through build_overlay
+    // (UB guard — see hal_image_processor_draw_decoded_masks). TensorDyn::aliases
+    // in draw_{decoded,proto}_masks still catches the distinct-wrapper case.
+    if !background.is_null() && std::ptr::eq(background, dst as *const _) {
+        return set_error(libc::EINVAL);
+    }
+
     let overlay = build_overlay(background, opacity, letterbox, color_mode);
 
     let outputs_slice = std::slice::from_raw_parts(outputs, num_outputs);
@@ -1162,8 +1173,12 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks_tracked(
         return set_error(libc::EINVAL);
     }
 
-    // Aliasing of dst vs background is validated by draw_{decoded,proto}_masks
-    // via TensorDyn::aliases.
+    // Reject same-HalTensor aliasing before borrowing through build_overlay
+    // (UB guard — see hal_image_processor_draw_decoded_masks). TensorDyn::aliases
+    // in draw_{decoded,proto}_masks still catches the distinct-wrapper case.
+    if !background.is_null() && std::ptr::eq(background, dst as *const _) {
+        return set_error(libc::EINVAL);
+    }
     let overlay = build_overlay(background, opacity, letterbox, color_mode);
 
     let outputs_slice = std::slice::from_raw_parts(outputs, num_outputs);

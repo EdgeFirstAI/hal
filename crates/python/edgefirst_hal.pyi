@@ -1228,9 +1228,9 @@ class ImageProcessor:
 
         Raises:
             RuntimeError: If ``dst`` format is unsupported by the active
-                backend, or if ``background`` aliases ``dst``.
-            ValueError: If ``bbox``, ``scores``, ``classes`` lengths do not match,
-                or if ``bbox`` shape is not ``(N, 4)``.
+                backend, if ``background`` aliases ``dst``, if ``bbox``,
+                ``scores``, or ``classes`` lengths do not match, or if
+                ``bbox`` shape is not ``(N, 4)``.
         """
         ...
 
