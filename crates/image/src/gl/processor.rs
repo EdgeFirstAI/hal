@@ -843,7 +843,18 @@ impl GLProcessorST {
             }
         };
 
-        // GPU-blit background into framebuffer if provided and DMA-capable
+        // Write the base layer of the framebuffer *before* running mask
+        // passes.  The framebuffer's backing storage (DMA renderbuffer or
+        // render_texture) may contain stale pixels from a previous frame
+        // in a triple-buffered pipeline, so we always actively write it.
+        //
+        // - background + DMA: GPU-blit bg → renderbuffer via EGLImage
+        //   (zero-copy).
+        // - background + non-DMA: upload bg pixels into the render_texture
+        //   that backs the FBO (glTexImage2D). The CPU memcpy is into a
+        //   GL texture, not into the user's DMA buffer, so it's a pure
+        //   upload — not a cache-flushing mapped copy.
+        // - no background: glClear(0x00000000) on the framebuffer.
         if let Some((bg, bg_fmt)) = background {
             if bg.width() != Some(dst_w) || bg.height() != Some(dst_h) {
                 return Err(crate::Error::InvalidShape(
@@ -873,18 +884,19 @@ impl GLProcessorST {
                     crate::Flip::None,
                 )?;
             } else {
-                // Non-DMA background: CPU blit fallback
-                use edgefirst_tensor::TensorMapTrait;
-                let bg_map = bg.map()?;
-                let mut dst_map = dst.map()?;
-                let bg_slice = bg_map.as_slice();
-                let dst_slice = dst_map.as_mut_slice();
-                if bg_slice.len() != dst_slice.len() {
-                    return Err(crate::Error::InvalidShape(
-                        "background buffer size does not match dst".into(),
-                    ));
-                }
-                dst_slice.copy_from_slice(bg_slice);
+                // Non-DMA background: upload bg pixels into the
+                // render_texture attached to the FBO. Writing to dst
+                // directly would be wrong — the final readback later
+                // overwrites dst with the framebuffer contents, so we
+                // have to seed the framebuffer itself.
+                self.upload_pixels_to_render_texture(bg, bg_fmt, dst_w, dst_h)?;
+            }
+        } else {
+            // No background: actively clear the framebuffer so stale
+            // pixels from the previous frame do not leak into the output.
+            unsafe {
+                gls::gl::ClearColor(0.0, 0.0, 0.0, 0.0);
+                gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
             }
         }
 
@@ -1042,7 +1054,9 @@ impl GLProcessorST {
             }
         };
 
-        // GPU-blit background into framebuffer if provided and DMA-capable
+        // Write the base layer of the framebuffer before running mask
+        // passes. See `draw_decoded_masks_impl` for the rationale — we
+        // never assume dst is cleared on entry.
         if let Some((bg, bg_fmt)) = background {
             if bg.width() != Some(dst_w) || bg.height() != Some(dst_h) {
                 return Err(crate::Error::InvalidShape(
@@ -1072,18 +1086,12 @@ impl GLProcessorST {
                     crate::Flip::None,
                 )?;
             } else {
-                // Non-DMA background: CPU blit fallback
-                use edgefirst_tensor::TensorMapTrait;
-                let bg_map = bg.map()?;
-                let mut dst_map = dst.map()?;
-                let bg_slice = bg_map.as_slice();
-                let dst_slice = dst_map.as_mut_slice();
-                if bg_slice.len() != dst_slice.len() {
-                    return Err(crate::Error::InvalidShape(
-                        "background buffer size does not match dst".into(),
-                    ));
-                }
-                dst_slice.copy_from_slice(bg_slice);
+                self.upload_pixels_to_render_texture(bg, bg_fmt, dst_w, dst_h)?;
+            }
+        } else {
+            unsafe {
+                gls::gl::ClearColor(0.0, 0.0, 0.0, 0.0);
+                gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
             }
         }
 
@@ -1739,6 +1747,75 @@ impl GLProcessorST {
     /// directly from PBO memory without any CPU-side `map()` call. This avoids
     /// the deadlock that occurs when `setup_renderbuffer_non_dma` tries to
     /// `tensor.map()` a PBO on the GL thread.
+    /// Upload CPU-side pixel data into `self.render_texture` which is
+    /// attached as the FBO color attachment.  Used for the non-DMA
+    /// background path in `draw_decoded_masks_impl` /
+    /// `draw_proto_masks_impl`: the source buffer is a user-provided
+    /// tensor in plain memory, so we do a single CPU→GPU upload into the
+    /// texture rather than memcpying into the caller's dst (which the
+    /// final framebuffer readback would overwrite anyway).
+    ///
+    /// If the source is BGRA we byte-swap into a scratch buffer so the
+    /// RGBA-internal render target holds the correct pixels after the
+    /// later readback-time R↔B swap.
+    fn upload_pixels_to_render_texture(
+        &mut self,
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
+        dst_w: usize,
+        dst_h: usize,
+    ) -> crate::Result<()> {
+        use edgefirst_tensor::TensorMapTrait;
+        let map = src.map()?;
+        let src_slice = map.as_slice();
+        let format = match src_fmt {
+            PixelFormat::Rgb => gls::gl::RGB,
+            PixelFormat::Rgba | PixelFormat::Bgra => gls::gl::RGBA,
+            _ => {
+                return Err(crate::Error::NotSupported(format!(
+                    "non-DMA bg upload not supported for {src_fmt}",
+                )))
+            }
+        };
+        let swapped: Option<Vec<u8>> = if src_fmt == PixelFormat::Bgra {
+            let mut v = src_slice.to_vec();
+            for chunk in v.chunks_exact_mut(4) {
+                chunk.swap(0, 2);
+            }
+            Some(v)
+        } else {
+            None
+        };
+        let pixels = swapped.as_deref().unwrap_or(src_slice).as_ptr() as *const c_void;
+
+        unsafe {
+            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
+            gls::gl::TexImage2D(
+                gls::gl::TEXTURE_2D,
+                0,
+                format as i32,
+                dst_w as i32,
+                dst_h as i32,
+                0,
+                format,
+                gls::gl::UNSIGNED_BYTE,
+                pixels,
+            );
+            // TexImage2D invalidates any prior EGLImage binding.
+            self.render_texture.invalidate_egl_binding();
+            check_gl_error(function!(), line!())?;
+            gls::gl::FramebufferTexture2D(
+                gls::gl::FRAMEBUFFER,
+                gls::gl::COLOR_ATTACHMENT0,
+                gls::gl::TEXTURE_2D,
+                self.render_texture.id,
+                0,
+            );
+            check_gl_error(function!(), line!())?;
+        }
+        Ok(())
+    }
+
     fn setup_renderbuffer_from_pbo(
         &mut self,
         dst: &Tensor<u8>,

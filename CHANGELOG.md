@@ -11,12 +11,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Zero-detection background in draw_masks/draw_masks_proto.** When no
-  detections are present but a background is configured via `MaskOverlay`,
-  the background is now correctly blitted to the destination without
-  reaching backend-specific code paths. Previously the empty+background
-  case could hit `NotSupported` on G2D forced backend, or delegate
-  unnecessarily through `draw_decoded_masks`.
+- **`draw_decoded_masks` / `draw_proto_masks` now always produce the full
+  output frame.** Previously these functions returned `Ok(())` without
+  touching `dst` when the detection list was empty, silently relying on
+  the caller having pre-cleared the destination — an invariant that is
+  nowhere documented and false for recycled buffers in triple-buffered
+  display pipelines. The new contract writes `dst` in every case:
+
+  | detections | background | output                               |
+  |------------|------------|--------------------------------------|
+  | none       | none       | dst cleared to `0x00000000`          |
+  | none       | set        | dst ← background                     |
+  | set        | none       | masks drawn over cleared dst         |
+  | set        | set        | masks drawn over background          |
+
+- **Backend-native base-layer rendering.** Each backend now owns base
+  layer production with its appropriate hardware primitive:
+
+  - G2D: `g2d_clear` for empty-frame no-bg, `g2d_blit` for empty-frame
+    with bg. The prior release returned `NotImplemented` for every G2D
+    call, breaking forced-G2D entirely. G2D still returns
+    `NotImplemented` when detections/segmentations are present (no
+    rasterizer).
+  - OpenGL: `glClear(0)` when no bg; GPU DMA-BUF EGLImage blit when bg
+    is DMA-backed; direct `glTexImage2D` upload of bg into the render
+    texture when bg is non-DMA memory (previously the non-DMA path
+    memcpy'd bg into `dst`, which was then overwritten by the
+    subsequent framebuffer readback — a pre-existing latent bug).
+  - CPU: buffer fill / memcpy as the terminal fallback.
+
+- **Removed CPU `copy_from_slice` from the accelerated dispatch paths.**
+  The old `MaskOverlay::apply_background` helper memcpy'd the background
+  through a mapped DMA buffer before delegating to GL/CPU, defeating the
+  zero-copy architecture and forcing cache-maintenance ops on both
+  surfaces every zero-detection frame. The helper is deleted; GL and G2D
+  handle bg with hardware primitives, CPU handles it as a terminal
+  fallback only.
+
+- **Auto dispatch prefers G2D for empty frames.** A zero-detection frame
+  on a platform with G2D available now completes in a single `g2d_clear`
+  or `g2d_blit` op, avoiding GL renderbuffer setup + readback each frame
+  in a triple-buffered display loop.
+
+### Tests
+
+- Added a 4-scenario × 4-backend (auto, cpu, opengl, g2d) pixel-verified
+  test matrix. Every test pre-fills `dst` with a distinctive dirty
+  pattern so any lingering "caller must clear" assumption fails loudly.
+  Full suite passes on imx8mp-frdm (Vivante GC7000UL + G2D) and
+  imx95-frdm (Mali-G310 + G2D via DPU).
+
+- Updated `test_segmentation_yolo` (CPU + GL) to use
+  `MaskOverlay::with_background` instead of pre-loading the camera frame
+  into `dst`, matching the new output contract and the pattern used by
+  the C API / Python callers.
 
 ## [0.16.3] - 2026-04-13
 
