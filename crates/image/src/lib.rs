@@ -693,7 +693,8 @@ pub trait ImageProcessorTrait {
     ///
     /// `detect` and `proto_data.mask_coefficients` must have the same length
     /// (enforced by zip — excess entries are silently ignored). An empty
-    /// `detect` slice is valid and returns immediately after drawing nothing.
+    /// `detect` slice is valid: the background is applied (if set) and the
+    /// call returns `Ok(())` without touching any backend.
     ///
     /// # Format requirements
     ///
@@ -1724,7 +1725,10 @@ impl ImageProcessorTrait for ImageProcessor {
     ) -> Result<()> {
         let start = Instant::now();
 
-        if detect.is_empty() && segmentation.is_empty() && overlay.background.is_none() {
+        if detect.is_empty() && segmentation.is_empty() {
+            if overlay.background.is_some() {
+                overlay.apply_background(dst)?;
+            }
             return Ok(());
         }
 
@@ -1834,10 +1838,12 @@ impl ImageProcessorTrait for ImageProcessor {
         let start = Instant::now();
 
         if detect.is_empty() {
-            // No detections — still render the background so the camera feed
+            // No detections — still blit the background so the camera feed
             // remains visible rather than showing a stale/black canvas.
+            // Handle directly here instead of delegating to draw_decoded_masks
+            // to avoid hitting backend-specific errors (e.g. G2D NotSupported).
             if overlay.background.is_some() {
-                return self.draw_decoded_masks(dst, detect, &[], overlay);
+                overlay.apply_background(dst)?;
             }
             return Ok(());
         }
@@ -6033,6 +6039,126 @@ mod image_tests {
         let result =
             converter.draw_proto_masks(&mut dst_dyn, &det, &proto_data, Default::default());
         assert!(result.is_ok(), "CPU fallback path should work: {result:?}");
+    }
+
+    #[test]
+    fn test_draw_masks_zero_detections_with_background() {
+        // Verifies that draw_decoded_masks and draw_proto_masks correctly
+        // blit the background when there are zero detections, without
+        // reaching backend-specific code (which would fail on G2D).
+        let original = std::env::var("EDGEFIRST_FORCE_BACKEND").ok();
+        unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "cpu") };
+        let result = ImageProcessor::new();
+        match original {
+            Some(s) => unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", s) },
+            None => unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") },
+        }
+        let mut converter = result.unwrap();
+
+        // Create a destination (starts black/zero)
+        let mut dst = TensorDyn::image(
+            64,
+            64,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+        )
+        .unwrap();
+
+        // Create a non-zero background to confirm it gets blitted
+        let bg = TensorDyn::image(
+            64,
+            64,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+        )
+        .unwrap();
+        {
+            use edgefirst_tensor::TensorMapTrait;
+            let bg_u8 = bg.as_u8().unwrap();
+            let mut bg_map = bg_u8.map().unwrap();
+            bg_map.as_mut_slice().fill(42);
+        }
+
+        let overlay = MaskOverlay::new().with_background(&bg);
+
+        // ── draw_decoded_masks with empty detect + segmentation ──
+        let result = converter.draw_decoded_masks(&mut dst, &[], &[], overlay);
+        assert!(
+            result.is_ok(),
+            "draw_decoded_masks with empty detect+bg should succeed: {result:?}"
+        );
+        // Verify background was copied
+        {
+            use edgefirst_tensor::TensorMapTrait;
+            let dst_u8 = dst.as_u8().unwrap();
+            let dst_map = dst_u8.map().unwrap();
+            assert_eq!(
+                dst_map.as_slice()[0],
+                42,
+                "background should have been blitted to dst"
+            );
+        }
+
+        // Reset dst to zero for the proto test
+        {
+            use edgefirst_tensor::TensorMapTrait;
+            let dst_u8 = dst.as_u8_mut().unwrap();
+            let mut dst_map = dst_u8.map().unwrap();
+            dst_map.as_mut_slice().fill(0);
+        }
+
+        // ── draw_proto_masks with empty detect ──
+        let overlay = MaskOverlay::new().with_background(&bg);
+        let proto_data = ProtoData {
+            mask_coefficients: vec![],
+            protos: edgefirst_decoder::ProtoTensor::Float(ndarray::Array3::<f32>::zeros((8, 8, 4))),
+        };
+        let result = converter.draw_proto_masks(&mut dst, &[], &proto_data, overlay);
+        assert!(
+            result.is_ok(),
+            "draw_proto_masks with empty detect+bg should succeed: {result:?}"
+        );
+        {
+            use edgefirst_tensor::TensorMapTrait;
+            let dst_u8 = dst.as_u8().unwrap();
+            let dst_map = dst_u8.map().unwrap();
+            assert_eq!(
+                dst_map.as_slice()[0],
+                42,
+                "background should have been blitted to dst by draw_proto_masks"
+            );
+        }
+    }
+
+    #[test]
+    fn test_draw_masks_zero_detections_no_background() {
+        // Verifies that draw_decoded_masks returns Ok(()) without touching dst
+        // when there are no detections and no background.
+        let original = std::env::var("EDGEFIRST_FORCE_BACKEND").ok();
+        unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "cpu") };
+        let result = ImageProcessor::new();
+        match original {
+            Some(s) => unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", s) },
+            None => unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") },
+        }
+        let mut converter = result.unwrap();
+
+        let mut dst = TensorDyn::image(
+            64,
+            64,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+        )
+        .unwrap();
+
+        let result = converter.draw_decoded_masks(&mut dst, &[], &[], Default::default());
+        assert!(
+            result.is_ok(),
+            "draw_decoded_masks with empty detect+no bg should succeed: {result:?}"
+        );
     }
 
     #[test]

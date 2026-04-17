@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.4] - 2026-04-17
+
+### Fixed
+
+- **Zero-detection background in draw_masks/draw_masks_proto.** When no
+  detections are present but a background is configured via `MaskOverlay`,
+  the background is now correctly blitted to the destination without
+  reaching backend-specific code paths. Previously the empty+background
+  case could hit `NotSupported` on G2D forced backend, or delegate
+  unnecessarily through `draw_decoded_masks`.
+
 ## [0.16.3] - 2026-04-13
 
 ### Fixed
