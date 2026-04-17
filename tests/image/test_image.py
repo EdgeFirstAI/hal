@@ -90,18 +90,20 @@ def test_normalize():
 
 
 def test_render():
-    dst = Tensor.load("testdata/giraffe.jpg", PixelFormat.Rgba)
+    bg = Tensor.load("testdata/giraffe.jpg", PixelFormat.Rgba)
     seg = np.fromfile("testdata/yolov8_seg_crop_76x55.bin", dtype=np.uint8).reshape(
         (76, 55, 1)
     )
     converter = ImageProcessor()
     converter.set_class_colors([[255, 255, 0, 233], [128, 128, 255, 100]])
+    dst = converter.create_image(bg.width, bg.height, PixelFormat.Rgba)
     converter.draw_decoded_masks(
         dst,
         bbox=np.array([[0.59375, 0.25, 0.9375, 0.725]], dtype=np.float32),
         scores=np.array([0.9], dtype=np.float32),
         classes=np.array([1], dtype=np.uintp),
         seg=[seg],
+        background=bg,
     )
     expected_gl = load_image("testdata/output_render_gl.jpg", "RGBA")
     expected_cpu = load_image("testdata/output_render_cpu.jpg", "RGBA")
@@ -340,16 +342,18 @@ def test_import_image_dma_success():
 
 
 def test_draw_decoded_masks_empty():
-    """draw_decoded_masks with zero detections should not crash."""
-    dst = Tensor.load("testdata/giraffe.jpg", PixelFormat.Rgba)
+    """draw_decoded_masks with zero detections should produce background only."""
+    bg = Tensor.load("testdata/giraffe.jpg", PixelFormat.Rgba)
     converter = ImageProcessor()
+    dst = converter.create_image(bg.width, bg.height, PixelFormat.Rgba)
     converter.draw_decoded_masks(
         dst,
         bbox=np.zeros((0, 4), dtype=np.float32),
         scores=np.zeros((0,), dtype=np.float32),
         classes=np.zeros((0,), dtype=np.uintp),
+        background=bg,
     )
-    # Verify the image is untouched (no crash, pixels unchanged)
+    # Verify dst matches the background (no detections → bg only)
     expected = load_image("testdata/giraffe.jpg", "RGBA")
     with dst.map() as m:
         img = np.array(m.view()).reshape((dst.height, dst.width, 4))
