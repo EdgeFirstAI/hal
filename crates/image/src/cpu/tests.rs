@@ -1090,7 +1090,9 @@ mod cpu_tests {
         use edgefirst_decoder::Segmentation;
         use ndarray::Array3;
 
-        let image = crate::load_image(
+        // draw_decoded_masks fully writes dst: we must pass the camera
+        // frame as a background via MaskOverlay, not as the dst canvas.
+        let bg = crate::load_image(
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../testdata/giraffe.jpg"
@@ -1099,7 +1101,14 @@ mod cpu_tests {
             None,
         )
         .unwrap();
-        let mut image_dyn = image;
+        let mut dst = TensorDyn::image(
+            bg.width().unwrap(),
+            bg.height().unwrap(),
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+        )
+        .unwrap();
 
         let segmentation = Array3::from_shape_vec(
             (76, 55, 1),
@@ -1131,10 +1140,15 @@ mod cpu_tests {
             .unwrap();
         assert_eq!(renderer.colors[1], [128, 128, 255, 100]);
         renderer
-            .draw_decoded_masks(&mut image_dyn, &[detect], &[seg], Default::default())
+            .draw_decoded_masks(
+                &mut dst,
+                &[detect],
+                &[seg],
+                crate::MaskOverlay::new().with_background(&bg),
+            )
             .unwrap();
         let image = {
-            let mut __t = image_dyn.into_u8().unwrap();
+            let mut __t = dst.into_u8().unwrap();
             __t.set_format(PixelFormat::Rgba).unwrap();
             TensorDyn::from(__t)
         };
