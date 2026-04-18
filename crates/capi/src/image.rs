@@ -59,6 +59,15 @@ unsafe fn build_overlay<'a>(
     }
 }
 
+/// Map a draw-masks error to a POSIX errno. Aliased `background`/`dst`
+/// surfaces as `EINVAL`; everything else as `EIO`.
+fn draw_err_to_errno(e: &edgefirst_image::Error) -> libc::c_int {
+    match e {
+        edgefirst_image::Error::AliasedBuffers(_) => libc::EINVAL,
+        _ => libc::EIO,
+    }
+}
+
 /// Image pixel format.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -866,18 +875,34 @@ pub unsafe extern "C" fn hal_image_processor_convert(
 /// destination image tensor. Uses hardware acceleration (OpenGL) when available,
 /// falling back to CPU rendering.
 ///
+/// **Output contract:** `dst` is always fully written by this call — its prior
+/// contents are discarded.  The four cases are:
+///
+/// | detections | background | output                            |
+/// |------------|------------|-----------------------------------|
+/// | NULL       | NULL       | dst cleared to 0x00000000         |
+/// | NULL       | set        | dst <- background                 |
+/// | set        | NULL       | masks drawn over cleared dst      |
+/// | set        | set        | masks drawn over background       |
+///
+/// @note **Migrating from v0.16.3 or earlier:** if you populated `dst` with
+/// an image before calling this function, you must now pass that image as
+/// `background` instead; pre-loading `dst` is no longer effective.
+///
 /// @param processor Image processor handle
-/// @param dst Destination image tensor to draw onto
-/// @param detections Detection box list (can be NULL for segmentation-only)
-/// @param segmentations Segmentation list (can be NULL for detection-only)
-/// @param background Optional background image (NULL to draw over dst)
+/// @param dst Output image tensor (always fully written; prior contents discarded)
+/// @param detections Detection box list (NULL for no detections)
+/// @param segmentations Segmentation list (NULL for detection-only or no masks)
+/// @param background Optional compositing source — `dst` is written as
+///        `background + masks`. Pass NULL to clear `dst` to transparent.
+///        Must have the same dimensions and format as `dst`.
 /// @param opacity Mask opacity in [0.0, 1.0] (1.0 = fully opaque, clamped)
 /// @param letterbox Optional letterbox coordinates [x0, y0, x1, y1] in normalized
 ///        coordinates for mapping model-space boxes back to image space (NULL = no letterbox)
 /// @param color_mode How to assign colors to detections (HAL_COLOR_MODE_CLASS by default)
 /// @return 0 on success, -1 on error
 /// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL processor or dst, or background == dst)
+/// - EINVAL: Invalid argument (NULL processor or dst, or `background` aliases `dst` — they must reference distinct buffers)
 /// - EIO: Drawing failed
 #[no_mangle]
 pub unsafe extern "C" fn hal_image_processor_draw_decoded_masks(
@@ -892,6 +917,12 @@ pub unsafe extern "C" fn hal_image_processor_draw_decoded_masks(
 ) -> c_int {
     check_null!(processor, dst);
 
+    // Reject same-HalTensor aliasing BEFORE `build_overlay` borrows
+    // background — otherwise we'd form `&(*bg).inner` and `&mut (*dst).inner`
+    // over the same object, which is UB at the Rust reference level before
+    // any runtime check can fire. `TensorDyn::aliases` inside
+    // `draw_decoded_masks` still catches the distinct-wrapper same-buffer
+    // case (separate HalTensor handles over one dmabuf fd).
     if !background.is_null() && std::ptr::eq(background, dst as *const _) {
         return set_error(libc::EINVAL);
     }
@@ -910,15 +941,14 @@ pub unsafe extern "C" fn hal_image_processor_draw_decoded_masks(
 
     let overlay = build_overlay(background, opacity, letterbox, color_mode);
 
-    try_or_errno!(
-        unsafe { &mut (*processor) }.inner.draw_decoded_masks(
-            &mut unsafe { &mut (*dst) }.inner,
-            detect_slice,
-            seg_slice,
-            overlay,
-        ),
-        libc::EIO
-    );
+    if let Err(e) = unsafe { &mut (*processor) }.inner.draw_decoded_masks(
+        &mut unsafe { &mut (*dst) }.inner,
+        detect_slice,
+        seg_slice,
+        overlay,
+    ) {
+        return set_error(draw_err_to_errno(&e));
+    }
     0
 }
 
@@ -988,12 +1018,21 @@ pub unsafe extern "C" fn hal_image_processor_materialize_masks(
 /// directly to the renderer without materializing intermediate mask arrays.
 /// For detection-only models, this falls back to decode + draw_decoded_masks.
 ///
+/// **Output contract:** `dst` is always fully written by this call — its prior
+/// contents are discarded.  See `hal_image_processor_draw_decoded_masks` for
+/// the four-case detections × background matrix.
+///
+/// @note **Migrating from v0.16.3 or earlier:** if you populated `dst` before
+/// calling this function, pass that image as `background` instead.
+///
 /// @param processor Image processor handle
 /// @param decoder Decoder handle
 /// @param outputs Array of output tensor pointers
 /// @param num_outputs Number of output tensors
-/// @param dst Destination image to draw onto
-/// @param background Optional background image (NULL to draw over dst)
+/// @param dst Output image tensor (always fully written; prior contents discarded)
+/// @param background Optional compositing source — `dst` is written as
+///        `background + masks`. Pass NULL to clear `dst` to transparent.
+///        Must have the same dimensions and format as `dst`.
 /// @param opacity Mask opacity, clamped to [0.0, 1.0] (1.0 = fully opaque)
 /// @param letterbox Optional letterbox coordinates [x0, y0, x1, y1] in normalized
 ///        coordinates (NULL = no letterbox correction)
@@ -1001,7 +1040,7 @@ pub unsafe extern "C" fn hal_image_processor_materialize_masks(
 /// @param out_boxes Output parameter for detection box list (caller must free)
 /// @return 0 on success, -1 on error
 /// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL processor/decoder/outputs/dst/out_boxes, or background == dst)
+/// - EINVAL: Invalid argument (NULL processor/decoder/outputs/dst/out_boxes, or `background` aliases `dst` — they must reference distinct buffers)
 /// - EIO: Decoding or drawing failed
 #[no_mangle]
 pub unsafe extern "C" fn hal_image_processor_draw_masks(
@@ -1022,10 +1061,13 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks(
         return set_error(libc::EINVAL);
     }
 
-    // Reject aliased background == dst (would create UB via &mut + & to same object)
+    // Reject same-HalTensor aliasing before borrowing through build_overlay
+    // (UB guard — see hal_image_processor_draw_decoded_masks). TensorDyn::aliases
+    // in draw_{decoded,proto}_masks still catches the distinct-wrapper case.
     if !background.is_null() && std::ptr::eq(background, dst as *const _) {
         return set_error(libc::EINVAL);
     }
+
     let overlay = build_overlay(background, opacity, letterbox, color_mode);
 
     let outputs_slice = std::slice::from_raw_parts(outputs, num_outputs);
@@ -1046,12 +1088,13 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks(
 
     if let Some(proto_data) = proto_result {
         // Fused path: render directly from proto data
-        try_or_errno!(
+        if let Err(e) =
             (*processor)
                 .inner
-                .draw_proto_masks(&mut (*dst).inner, &boxes, &proto_data, overlay),
-            libc::EIO
-        );
+                .draw_proto_masks(&mut (*dst).inner, &boxes, &proto_data, overlay)
+        {
+            return set_error(draw_err_to_errno(&e));
+        }
     } else {
         // Detection-only fallback: full decode + draw_decoded_masks
         let mut masks: Vec<Segmentation> = Vec::new();
@@ -1061,12 +1104,13 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks(
                 .decode(&tensor_refs, &mut boxes, &mut masks),
             libc::EIO
         );
-        try_or_errno!(
+        if let Err(e) =
             (*processor)
                 .inner
-                .draw_decoded_masks(&mut (*dst).inner, &boxes, &masks, overlay),
-            libc::EIO
-        );
+                .draw_decoded_masks(&mut (*dst).inner, &boxes, &masks, overlay)
+        {
+            return set_error(draw_err_to_errno(&e));
+        }
     }
 
     *out_boxes = Box::into_raw(Box::new(HalDetectBoxList { boxes }));
@@ -1080,14 +1124,23 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks(
 /// arrays. Object tracking is applied to maintain identities across frames.
 /// For detection-only models, this falls back to tracked decode + draw_decoded_masks.
 ///
+/// **Output contract:** `dst` is always fully written by this call — its prior
+/// contents are discarded.  See `hal_image_processor_draw_decoded_masks` for
+/// the four-case detections × background matrix.
+///
+/// @note **Migrating from v0.16.3 or earlier:** if you populated `dst` before
+/// calling this function, pass that image as `background` instead.
+///
 /// @param processor Image processor handle
 /// @param decoder Decoder handle
 /// @param tracker Tracker handle for maintaining object identities across frames
 /// @param timestamp Timestamp for the current frame (e.g., in nanoseconds)
 /// @param outputs Array of output tensor pointers
 /// @param num_outputs Number of output tensors
-/// @param dst Destination image to draw onto
-/// @param background Optional background image (NULL to draw over dst)
+/// @param dst Output image tensor (always fully written; prior contents discarded)
+/// @param background Optional compositing source — `dst` is written as
+///        `background + masks`. Pass NULL to clear `dst` to transparent.
+///        Must have the same dimensions and format as `dst`.
 /// @param opacity Mask opacity in [0.0, 1.0] (1.0 = fully opaque, clamped)
 /// @param letterbox Optional letterbox coordinates [x0, y0, x1, y1] in normalized
 ///        coordinates (NULL = no letterbox correction)
@@ -1096,7 +1149,7 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks(
 /// @param out_tracks Output parameter for track info list (can be NULL; caller must free if non-NULL)
 /// @return 0 on success, -1 on error
 /// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL processor/decoder/tracker/outputs/dst/out_boxes, or background == dst)
+/// - EINVAL: Invalid argument (NULL processor/decoder/tracker/outputs/dst/out_boxes, or `background` aliases `dst` — they must reference distinct buffers)
 /// - EIO: Decoding or drawing failed
 #[no_mangle]
 pub unsafe extern "C" fn hal_image_processor_draw_masks_tracked(
@@ -1120,11 +1173,12 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks_tracked(
         return set_error(libc::EINVAL);
     }
 
-    // Reject aliased background == dst
+    // Reject same-HalTensor aliasing before borrowing through build_overlay
+    // (UB guard — see hal_image_processor_draw_decoded_masks). TensorDyn::aliases
+    // in draw_{decoded,proto}_masks still catches the distinct-wrapper case.
     if !background.is_null() && std::ptr::eq(background, dst as *const _) {
         return set_error(libc::EINVAL);
     }
-
     let overlay = build_overlay(background, opacity, letterbox, color_mode);
 
     let outputs_slice = std::slice::from_raw_parts(outputs, num_outputs);
@@ -1152,12 +1206,13 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks_tracked(
 
     if let Some(proto_data) = proto_result {
         // Fused path: render directly from proto data
-        try_or_errno!(
+        if let Err(e) =
             (*processor)
                 .inner
-                .draw_proto_masks(&mut (*dst).inner, &boxes, &proto_data, overlay),
-            libc::EIO
-        );
+                .draw_proto_masks(&mut (*dst).inner, &boxes, &proto_data, overlay)
+        {
+            return set_error(draw_err_to_errno(&e));
+        }
     } else {
         // Detection-only fallback: full tracked decode + draw_decoded_masks
         let mut masks: Vec<Segmentation> = Vec::new();
@@ -1172,12 +1227,13 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks_tracked(
             ),
             libc::EIO
         );
-        try_or_errno!(
+        if let Err(e) =
             (*processor)
                 .inner
-                .draw_decoded_masks(&mut (*dst).inner, &boxes, &masks, overlay),
-            libc::EIO
-        );
+                .draw_decoded_masks(&mut (*dst).inner, &boxes, &masks, overlay)
+        {
+            return set_error(draw_err_to_errno(&e));
+        }
     }
 
     *out_boxes = Box::into_raw(Box::new(HalDetectBoxList { boxes }));
