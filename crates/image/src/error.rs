@@ -20,6 +20,9 @@ pub enum Error {
     NotImplemented(String),
     NotSupported(String),
     InvalidShape(String),
+    /// Two tensor arguments that must be distinct reference the same
+    /// underlying buffer (e.g. `dst` and `background` in a draw call).
+    AliasedBuffers(String),
     #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
     EGL(khronos_egl::Error),

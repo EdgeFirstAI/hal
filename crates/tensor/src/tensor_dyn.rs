@@ -270,6 +270,53 @@ impl TensorDyn {
         dispatch!(self, is_multiplane)
     }
 
+    /// Return the [`BufferIdentity`](crate::BufferIdentity) of the underlying
+    /// allocation.
+    ///
+    /// Two `TensorDyn` values share a [`BufferIdentity::id`] iff they were
+    /// produced by cloning the same allocation (e.g. through
+    /// [`DmaTensor::try_clone`](crate::dma::DmaTensor::try_clone)). Separate
+    /// imports of the same physical buffer (e.g. two `from_fd` calls on the
+    /// same dmabuf fd) have **distinct** identities — use
+    /// [`aliases`](Self::aliases) if you need to detect that case.
+    pub fn buffer_identity(&self) -> &crate::BufferIdentity {
+        dispatch!(self, buffer_identity)
+    }
+
+    /// Return `true` if `self` and `other` reference the same underlying
+    /// buffer.
+    ///
+    /// This is the correct check for APIs that require distinct input and
+    /// output tensors (e.g. `ImageProcessor::draw_decoded_masks`, where
+    /// aliasing `dst` and `background` would cause the GL backend to read
+    /// and write the same texture — undefined behaviour on most drivers).
+    ///
+    /// Matching is conservative:
+    /// 1. Matching [`BufferIdentity::id`] → same buffer (always).
+    /// 2. Matching backing type + matching dmabuf fd number (Linux, DMA
+    ///    tensors only) → same buffer, even across separate `from_fd`
+    ///    imports in the same process.
+    ///
+    /// Two distinct `dup`'d fds pointing at the same kernel dma-buf are
+    /// **not** detected — there is no cheap way to resolve that without a
+    /// round-trip through the kernel.
+    pub fn aliases(&self, other: &Self) -> bool {
+        if self.buffer_identity().id() == other.buffer_identity().id() {
+            return true;
+        }
+        if self.memory() != other.memory() {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        if self.memory() == TensorMemory::Dma {
+            use std::os::fd::AsRawFd;
+            if let (Ok(a), Ok(b)) = (self.dmabuf(), other.dmabuf()) {
+                return a.as_raw_fd() == b.as_raw_fd();
+            }
+        }
+        false
+    }
+
     // --- Downcasting ---
 
     downcast_methods!(U8, u8, as_u8, as_u8_mut, into_u8);

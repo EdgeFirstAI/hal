@@ -375,8 +375,12 @@ impl ColorMode {
 ///
 /// Controls how segmentation masks are composited onto the destination image:
 /// - `background`: when set, the background image is drawn first and masks
-///   are composited over it (result written to `dst`). When `None`, masks
-///   are composited directly over `dst`'s existing content.
+///   are composited over it (result written to `dst`). When `None`, `dst` is
+///   cleared to `0x00000000` (fully transparent) before masks are drawn.
+///   **`dst` is always fully overwritten — its prior contents are never
+///   preserved.** Callers who used to pre-load an image into `dst` before
+///   calling `draw_decoded_masks` / `draw_proto_masks` must now supply that
+///   image via `background` instead (behaviour changed in v0.16.4).
 /// - `opacity`: scales the alpha of rendered mask colors. `1.0` (default)
 ///   preserves the class color's alpha unchanged; `0.5` makes masks
 ///   semi-transparent.
@@ -384,6 +388,9 @@ impl ColorMode {
 ///   instance index, or track ID. Defaults to [`ColorMode::Class`].
 #[derive(Debug, Clone, Copy)]
 pub struct MaskOverlay<'a> {
+    /// Compositing source image. Must have the same dimensions and pixel
+    /// format as `dst`. When `Some`, the output is `background + masks`.
+    /// When `None`, `dst` is cleared to `0x00000000` before masks are drawn.
     pub background: Option<&'a TensorDyn>,
     pub opacity: f32,
     /// Normalized letterbox region `[xmin, ymin, xmax, ymax]` in model-input
@@ -415,6 +422,13 @@ impl<'a> MaskOverlay<'a> {
         Self::default()
     }
 
+    /// Set the compositing source image.
+    ///
+    /// `bg` must have the same dimensions and pixel format as the `dst` passed
+    /// to [`draw_decoded_masks`](crate::ImageProcessorTrait::draw_decoded_masks) /
+    /// [`draw_proto_masks`](crate::ImageProcessorTrait::draw_proto_masks).
+    /// The output will be `bg + masks`. Without a background, `dst` is cleared
+    /// to `0x00000000`.
     pub fn with_background(mut self, bg: &'a TensorDyn) -> Self {
         self.background = Some(bg);
         self
@@ -449,42 +463,6 @@ impl<'a> MaskOverlay<'a> {
             ]);
         }
         self
-    }
-
-    /// Blit background into dst (if set) and return an overlay with
-    /// background cleared so backends don't need to handle it.
-    fn apply_background(&self, dst: &mut TensorDyn) -> Result<MaskOverlay<'static>> {
-        use edgefirst_tensor::TensorMapTrait;
-        if let Some(bg) = self.background {
-            if bg.shape() != dst.shape() {
-                return Err(Error::InvalidShape(
-                    "background shape does not match dst".into(),
-                ));
-            }
-            if bg.format() != dst.format() {
-                return Err(Error::InvalidShape(
-                    "background pixel format does not match dst".into(),
-                ));
-            }
-            let bg_u8 = bg.as_u8().ok_or(Error::NotAnImage)?;
-            let dst_u8 = dst.as_u8_mut().ok_or(Error::NotAnImage)?;
-            let bg_map = bg_u8.map()?;
-            let mut dst_map = dst_u8.map()?;
-            let bg_slice = bg_map.as_slice();
-            let dst_slice = dst_map.as_mut_slice();
-            if bg_slice.len() != dst_slice.len() {
-                return Err(Error::InvalidShape(
-                    "background buffer size does not match dst".into(),
-                ));
-            }
-            dst_slice.copy_from_slice(bg_slice);
-        }
-        Ok(MaskOverlay {
-            background: None,
-            opacity: self.opacity.clamp(0.0, 1.0),
-            letterbox: self.letterbox,
-            color_mode: self.color_mode,
-        })
     }
 }
 
@@ -669,13 +647,50 @@ pub trait ImageProcessorTrait {
     ///
     /// - CPU backend: `dst` must be `RGBA` or `RGB`.
     /// - OpenGL backend: `dst` must be `RGBA`, `BGRA`, or `RGB`.
-    /// - G2D backend: not implemented (returns `NotImplemented`).
+    /// - G2D backend: only produces the base frame (empty detections);
+    ///   returns `NotImplemented` when any detection or segmentation is
+    ///   supplied.
+    ///
+    /// # Output contract
+    ///
+    /// This function always fully writes `dst` — it never relies on the
+    /// caller having pre-cleared the destination. The four cases are:
+    ///
+    /// | detections | background | output                              |
+    /// |------------|------------|-------------------------------------|
+    /// | none       | none       | dst cleared to `0x00000000`         |
+    /// | none       | set        | dst ← background                    |
+    /// | set        | none       | masks drawn over cleared dst        |
+    /// | set        | set        | masks drawn over background         |
+    ///
+    /// Each backend implements this with its native primitives: G2D uses
+    /// `g2d_clear` / `g2d_blit`, OpenGL uses `glClear` / DMA-BUF GPU blit
+    /// plus the mask program, and CPU uses direct buffer fill / memcpy as
+    /// the terminal fallback. CPU-memcpy of DMA buffers is avoided on the
+    /// accelerated paths.
     ///
     /// An empty `segmentation` slice is valid — only bounding boxes are drawn.
     ///
-    /// `overlay` controls compositing: `background` replaces dst's base
-    /// content; `opacity` scales mask alpha. Use `MaskOverlay::default()`
-    /// for backward-compatible behaviour.
+    /// `overlay` controls compositing: `background` is the compositing source
+    /// (must match `dst` in size and format); `opacity` scales mask alpha.
+    ///
+    /// # Buffer aliasing
+    ///
+    /// `dst` and `overlay.background` must reference **distinct underlying
+    /// buffers**. An aliased pair returns [`Error::AliasedBuffers`] without
+    /// dispatching to any backend — the GL path would otherwise read and
+    /// write the same texture in a single draw, which is undefined behaviour
+    /// on most drivers. Aliasing is detected via
+    /// [`TensorDyn::aliases`](edgefirst_tensor::TensorDyn::aliases), which
+    /// catches both shared-allocation clones and separate imports over the
+    /// same dmabuf fd.
+    ///
+    /// # Migration from v0.16.3 and earlier
+    ///
+    /// Prior to v0.16.4 the call silently preserved `dst`'s contents on empty
+    /// detections. That invariant no longer holds — `dst` is always fully
+    /// written. Callers who pre-loaded an image into `dst` before calling this
+    /// function must now pass that image via `overlay.background` instead.
     fn draw_decoded_masks(
         &mut self,
         dst: &mut TensorDyn,
@@ -693,11 +708,14 @@ pub trait ImageProcessorTrait {
     ///
     /// `detect` and `proto_data.mask_coefficients` must have the same length
     /// (enforced by zip — excess entries are silently ignored). An empty
-    /// `detect` slice is valid and returns immediately after drawing nothing.
+    /// `detect` slice is valid and produces the base frame — cleared or
+    /// background-blitted — via the selected backend's native primitive.
     ///
-    /// # Format requirements
+    /// # Format requirements and output contract
     ///
-    /// Same as [`draw_decoded_masks`](Self::draw_decoded_masks). G2D returns `NotImplemented`.
+    /// Same as [`draw_decoded_masks`](Self::draw_decoded_masks), including
+    /// the "always fully writes dst" guarantee across all four
+    /// detection/background combinations.
     ///
     /// `overlay` controls compositing — see [`draw_decoded_masks`](Self::draw_decoded_masks).
     fn draw_proto_masks(
@@ -1724,8 +1742,12 @@ impl ImageProcessorTrait for ImageProcessor {
     ) -> Result<()> {
         let start = Instant::now();
 
-        if detect.is_empty() && segmentation.is_empty() {
-            return Ok(());
+        if let Some(bg) = overlay.background {
+            if bg.aliases(dst) {
+                return Err(Error::AliasedBuffers(
+                    "background must not reference the same buffer as dst".to_string(),
+                ));
+            }
         }
 
         // Un-letterbox detect boxes and segmentation bboxes for rendering when
@@ -1755,23 +1777,30 @@ impl ImageProcessorTrait for ImageProcessor {
         } else {
             (detect, segmentation)
         };
+        #[cfg(target_os = "linux")]
+        let is_empty_frame = detect.is_empty() && segmentation.is_empty();
 
         // ── Forced backend: no fallback chain ────────────────────────
         if let Some(forced) = self.forced_backend {
             return match forced {
                 ForcedBackend::Cpu => {
-                    // CPU needs background pre-blitted
-                    let overlay = overlay.apply_background(dst)?;
                     if let Some(cpu) = self.cpu.as_mut() {
                         return cpu.draw_decoded_masks(dst, detect, segmentation, overlay);
                     }
                     Err(Error::ForcedBackendUnavailable("cpu".into()))
                 }
-                ForcedBackend::G2d => Err(Error::NotSupported(
-                    "g2d does not support draw_decoded_masks".into(),
-                )),
+                ForcedBackend::G2d => {
+                    // G2D can only produce empty frames (clear / bg blit).
+                    // For populated frames it has no rasterizer — fail loudly.
+                    #[cfg(target_os = "linux")]
+                    if let Some(g2d) = self.g2d.as_mut() {
+                        return g2d.draw_decoded_masks(dst, detect, segmentation, overlay);
+                    }
+                    Err(Error::ForcedBackendUnavailable("g2d".into()))
+                }
                 ForcedBackend::OpenGl => {
-                    // GL handles background natively via GPU blit
+                    // GL handles background natively via GPU blit, and now
+                    // actively clears when there is no background.
                     #[cfg(target_os = "linux")]
                     #[cfg(feature = "opengl")]
                     if let Some(opengl) = self.opengl.as_mut() {
@@ -1782,9 +1811,30 @@ impl ImageProcessorTrait for ImageProcessor {
             };
         }
 
-        // skip G2D as it doesn't support rendering to image
+        // ── Auto dispatch ──────────────────────────────────────────
+        // Empty frames prefer G2D when available — a single g2d_clear or
+        // g2d_blit is the cheapest HW path to produce the correct output
+        // and avoids spinning up the GL pipeline every zero-detection
+        // frame in a triple-buffered display loop.
+        #[cfg(target_os = "linux")]
+        if is_empty_frame {
+            if let Some(g2d) = self.g2d.as_mut() {
+                match g2d.draw_decoded_masks(dst, detect, segmentation, overlay) {
+                    Ok(_) => {
+                        log::trace!(
+                            "draw_decoded_masks empty frame via g2d in {:?}",
+                            start.elapsed()
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => log::trace!("g2d empty-frame path unavailable: {e:?}"),
+                }
+            }
+        }
 
-        // GL path: pass overlay with background — GL will GPU-blit if DMA-BUF
+        // Populated frames (or G2D unavailable): GL first, CPU fallback.
+        // Both backends now own their own base-layer handling (bg blit
+        // or clear), so we hand the overlay through untouched.
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
         if let Some(opengl) = self.opengl.as_mut() {
@@ -1803,8 +1853,6 @@ impl ImageProcessorTrait for ImageProcessor {
             }
         }
 
-        // CPU fallback: blit background via memcpy before rendering
-        let overlay = overlay.apply_background(dst)?;
         log::trace!(
             "draw_decoded_masks started with cpu in {:?}",
             start.elapsed()
@@ -1833,8 +1881,12 @@ impl ImageProcessorTrait for ImageProcessor {
     ) -> Result<()> {
         let start = Instant::now();
 
-        if detect.is_empty() {
-            return Ok(());
+        if let Some(bg) = overlay.background {
+            if bg.aliases(dst) {
+                return Err(Error::AliasedBuffers(
+                    "background must not reference the same buffer as dst".to_string(),
+                ));
+            }
         }
 
         // Un-letterbox detect boxes for rendering when a letterbox was applied
@@ -1849,20 +1901,25 @@ impl ImageProcessorTrait for ImageProcessor {
         } else {
             detect
         };
+        #[cfg(target_os = "linux")]
+        let is_empty_frame = detect.is_empty();
 
         // ── Forced backend: no fallback chain ────────────────────────
         if let Some(forced) = self.forced_backend {
             return match forced {
                 ForcedBackend::Cpu => {
-                    let overlay = overlay.apply_background(dst)?;
                     if let Some(cpu) = self.cpu.as_mut() {
                         return cpu.draw_proto_masks(dst, render_detect, proto_data, overlay);
                     }
                     Err(Error::ForcedBackendUnavailable("cpu".into()))
                 }
-                ForcedBackend::G2d => Err(Error::NotSupported(
-                    "g2d does not support draw_proto_masks".into(),
-                )),
+                ForcedBackend::G2d => {
+                    #[cfg(target_os = "linux")]
+                    if let Some(g2d) = self.g2d.as_mut() {
+                        return g2d.draw_proto_masks(dst, render_detect, proto_data, overlay);
+                    }
+                    Err(Error::ForcedBackendUnavailable("g2d".into()))
+                }
                 ForcedBackend::OpenGl => {
                     #[cfg(target_os = "linux")]
                     #[cfg(feature = "opengl")]
@@ -1874,12 +1931,28 @@ impl ImageProcessorTrait for ImageProcessor {
             };
         }
 
-        // skip G2D as it doesn't support rendering to image
+        // ── Auto dispatch ──────────────────────────────────────────
+        // Empty frames: prefer G2D — cheapest HW path (clear or bg blit).
+        #[cfg(target_os = "linux")]
+        if is_empty_frame {
+            if let Some(g2d) = self.g2d.as_mut() {
+                match g2d.draw_proto_masks(dst, render_detect, proto_data, overlay) {
+                    Ok(_) => {
+                        log::trace!(
+                            "draw_proto_masks empty frame via g2d in {:?}",
+                            start.elapsed()
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => log::trace!("g2d empty-frame path unavailable: {e:?}"),
+                }
+            }
+        }
 
         // Hybrid path: CPU materialize + GL overlay (benchmarked faster than
         // full-GPU draw_proto_masks on all tested platforms: 27× on imx8mp,
         // 4× on imx95, 2.5× on rpi5, 1.6× on x86).
-        // GL handles background natively via GPU blit.
+        // GL owns its own bg-blit / glClear — we pass the overlay through.
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
         if let Some(opengl) = self.opengl.as_mut() {
@@ -1908,8 +1981,6 @@ impl ImageProcessorTrait for ImageProcessor {
             }
         }
 
-        // CPU-only fallback: blit background via memcpy
-        let overlay = overlay.apply_background(dst)?;
         let Some(cpu) = self.cpu.as_mut() else {
             return Err(Error::Internal(
                 "draw_proto_masks requires CPU backend for fallback path".into(),
@@ -6028,6 +6099,382 @@ mod image_tests {
         let result =
             converter.draw_proto_masks(&mut dst_dyn, &det, &proto_data, Default::default());
         assert!(result.is_ok(), "CPU fallback path should work: {result:?}");
+    }
+
+    // ============================================================
+    // draw_decoded_masks / draw_proto_masks — 4-scenario pixel-
+    // verified tests. Exercises each backend against the full
+    // output-contract matrix:
+    //
+    //   | detections | background | expected dst             |
+    //   |------------|------------|--------------------------|
+    //   | empty      | none       | fully cleared (0x00)     |
+    //   | empty      | set        | fully equal to bg        |
+    //   | set        | none       | cleared outside box +    |
+    //   |            |            | mask-coloured inside     |
+    //   | set        | set        | bg outside box + mask    |
+    //   |            |            | blended inside           |
+    //
+    // Every test pre-fills dst with a non-zero "dirty" pattern so
+    // that any silent `return Ok(())` leaks the pattern into the
+    // asserted output and fails loudly.
+    // ============================================================
+
+    /// Run `body` with `EDGEFIRST_FORCE_BACKEND` temporarily set (or
+    /// removed), restoring the prior value afterward. Tests are mutated
+    /// env-serialized via the process-wide `FORCE_BACKEND_MUTEX`.
+    fn with_force_backend<R>(value: Option<&str>, body: impl FnOnce() -> R) -> R {
+        use std::sync::{Mutex, MutexGuard, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard: MutexGuard<()> = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let original = std::env::var("EDGEFIRST_FORCE_BACKEND").ok();
+        match value {
+            Some(v) => unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", v) },
+            None => unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") },
+        }
+        let r = body();
+        match original {
+            Some(s) => unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", s) },
+            None => unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") },
+        }
+        r
+    }
+
+    /// Allocate an RGBA image tensor and pre-fill every byte with a
+    /// distinctive non-zero pattern. Any test that relies on the old
+    /// "dst is already cleared" assumption will see this pattern leak
+    /// through to the output and fail.
+    fn make_dirty_dst(w: usize, h: usize, mem: Option<TensorMemory>) -> TensorDyn {
+        let dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, mem).unwrap();
+        {
+            use edgefirst_tensor::TensorMapTrait;
+            let u8t = dst.as_u8().unwrap();
+            let mut map = u8t.map().unwrap();
+            for (i, b) in map.as_mut_slice().iter_mut().enumerate() {
+                *b = 0xA0u8.wrapping_add((i as u8) & 0x3F);
+            }
+        }
+        dst
+    }
+
+    /// Allocate an RGBA background filled with a constant colour.
+    fn make_bg(w: usize, h: usize, mem: Option<TensorMemory>, rgba: [u8; 4]) -> TensorDyn {
+        let bg = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, mem).unwrap();
+        {
+            use edgefirst_tensor::TensorMapTrait;
+            let u8t = bg.as_u8().unwrap();
+            let mut map = u8t.map().unwrap();
+            for chunk in map.as_mut_slice().chunks_exact_mut(4) {
+                chunk.copy_from_slice(&rgba);
+            }
+        }
+        bg
+    }
+
+    fn pixel_at(dst: &TensorDyn, x: usize, y: usize) -> [u8; 4] {
+        use edgefirst_tensor::TensorMapTrait;
+        let w = dst.width().unwrap();
+        let off = (y * w + x) * 4;
+        let u8t = dst.as_u8().unwrap();
+        let map = u8t.map().unwrap();
+        let s = map.as_slice();
+        [s[off], s[off + 1], s[off + 2], s[off + 3]]
+    }
+
+    fn assert_every_pixel_eq(dst: &TensorDyn, expected: [u8; 4], case: &str) {
+        use edgefirst_tensor::TensorMapTrait;
+        let u8t = dst.as_u8().unwrap();
+        let map = u8t.map().unwrap();
+        for (i, chunk) in map.as_slice().chunks_exact(4).enumerate() {
+            assert_eq!(
+                chunk, &expected,
+                "{case}: pixel idx {i} = {chunk:?}, expected {expected:?}"
+            );
+        }
+    }
+
+    /// Scenario 1: empty detections, empty segmentation, no background
+    /// → dst must be fully cleared to 0x00000000.
+    fn scenario_empty_no_bg(processor: &mut ImageProcessor, case: &str) {
+        let mut dst = make_dirty_dst(64, 64, None);
+        processor
+            .draw_decoded_masks(&mut dst, &[], &[], MaskOverlay::default())
+            .unwrap_or_else(|e| panic!("{case}/decoded_masks empty+no-bg failed: {e:?}"));
+        assert_every_pixel_eq(&dst, [0, 0, 0, 0], &format!("{case}/decoded"));
+
+        let mut dst = make_dirty_dst(64, 64, None);
+        let proto = ProtoData {
+            mask_coefficients: vec![],
+            protos: edgefirst_decoder::ProtoTensor::Float(ndarray::Array3::<f32>::zeros((8, 8, 4))),
+        };
+        processor
+            .draw_proto_masks(&mut dst, &[], &proto, MaskOverlay::default())
+            .unwrap_or_else(|e| panic!("{case}/proto_masks empty+no-bg failed: {e:?}"));
+        assert_every_pixel_eq(&dst, [0, 0, 0, 0], &format!("{case}/proto"));
+    }
+
+    /// Scenario 2: empty detections, empty segmentation, background set
+    /// → dst must be fully equal to bg.
+    fn scenario_empty_with_bg(processor: &mut ImageProcessor, case: &str) {
+        let bg_color = [42, 99, 200, 255];
+        let bg = make_bg(64, 64, None, bg_color);
+        let overlay = MaskOverlay::new().with_background(&bg);
+
+        let mut dst = make_dirty_dst(64, 64, None);
+        processor
+            .draw_decoded_masks(&mut dst, &[], &[], overlay)
+            .unwrap_or_else(|e| panic!("{case}/decoded_masks empty+bg failed: {e:?}"));
+        assert_every_pixel_eq(&dst, bg_color, &format!("{case}/decoded bg blit"));
+
+        let mut dst = make_dirty_dst(64, 64, None);
+        let proto = ProtoData {
+            mask_coefficients: vec![],
+            protos: edgefirst_decoder::ProtoTensor::Float(ndarray::Array3::<f32>::zeros((8, 8, 4))),
+        };
+        processor
+            .draw_proto_masks(&mut dst, &[], &proto, overlay)
+            .unwrap_or_else(|e| panic!("{case}/proto_masks empty+bg failed: {e:?}"));
+        assert_every_pixel_eq(&dst, bg_color, &format!("{case}/proto bg blit"));
+    }
+
+    /// Scenario 3: one detection with a fully-opaque segmentation fill,
+    /// no background → outside the box dst must be 0x00, inside it must
+    /// be a non-zero mask colour (the render_segmentation output).
+    fn scenario_detect_no_bg(processor: &mut ImageProcessor, case: &str) {
+        use edgefirst_decoder::Segmentation;
+        use ndarray::Array3;
+        processor
+            .set_class_colors(&[[200, 80, 40, 255]])
+            .expect("set_class_colors");
+
+        let detect = DetectBox {
+            bbox: [0.25, 0.25, 0.75, 0.75].into(),
+            score: 0.99,
+            label: 0,
+        };
+        let seg_arr = Array3::from_shape_fn((4, 4, 1), |_| 255u8);
+        let seg = Segmentation {
+            segmentation: seg_arr,
+            xmin: 0.25,
+            ymin: 0.25,
+            xmax: 0.75,
+            ymax: 0.75,
+        };
+
+        let mut dst = make_dirty_dst(64, 64, None);
+        processor
+            .draw_decoded_masks(&mut dst, &[detect], &[seg], MaskOverlay::default())
+            .unwrap_or_else(|e| panic!("{case}/decoded_masks detect+no-bg failed: {e:?}"));
+
+        // Outside the bbox (corner): must be cleared black.
+        let corner = pixel_at(&dst, 2, 2);
+        assert_eq!(
+            corner,
+            [0, 0, 0, 0],
+            "{case}/decoded: corner (2,2) leaked dirty pattern: {corner:?}"
+        );
+        // Inside the bbox (center): the mask colour must be visible.
+        // Any non-zero pixel is acceptable — exact rendering varies
+        // between backends (GL smoothstep, CPU nearest).
+        let center = pixel_at(&dst, 32, 32);
+        assert!(
+            center != [0, 0, 0, 0],
+            "{case}/decoded: center (32,32) was not coloured: {center:?}"
+        );
+    }
+
+    /// Scenario 4: detection + background. Outside the box must match
+    /// bg; inside the box must NOT match bg (mask blended on top).
+    fn scenario_detect_with_bg(processor: &mut ImageProcessor, case: &str) {
+        use edgefirst_decoder::Segmentation;
+        use ndarray::Array3;
+        processor
+            .set_class_colors(&[[200, 80, 40, 255]])
+            .expect("set_class_colors");
+        let bg_color = [10, 20, 30, 255];
+        let bg = make_bg(64, 64, None, bg_color);
+
+        let detect = DetectBox {
+            bbox: [0.25, 0.25, 0.75, 0.75].into(),
+            score: 0.99,
+            label: 0,
+        };
+        let seg_arr = Array3::from_shape_fn((4, 4, 1), |_| 255u8);
+        let seg = Segmentation {
+            segmentation: seg_arr,
+            xmin: 0.25,
+            ymin: 0.25,
+            xmax: 0.75,
+            ymax: 0.75,
+        };
+
+        let overlay = MaskOverlay::new().with_background(&bg);
+        let mut dst = make_dirty_dst(64, 64, None);
+        processor
+            .draw_decoded_masks(&mut dst, &[detect], &[seg], overlay)
+            .unwrap_or_else(|e| panic!("{case}/decoded_masks detect+bg failed: {e:?}"));
+
+        // Outside the bbox (corner): bg colour.
+        let corner = pixel_at(&dst, 2, 2);
+        assert_eq!(
+            corner, bg_color,
+            "{case}/decoded: corner (2,2) should show bg {bg_color:?} got {corner:?}"
+        );
+        // Inside the bbox (center): mask blended on bg, must differ from
+        // pure bg (alpha-blend with mask colour produces a distinct shade).
+        let center = pixel_at(&dst, 32, 32);
+        assert!(
+            center != bg_color,
+            "{case}/decoded: center (32,32) should differ from bg {bg_color:?}, got {center:?}"
+        );
+    }
+
+    /// Run all 4 scenarios against the processor. Skip gracefully if
+    /// construction fails (backend unavailable on this host).
+    fn run_all_scenarios(
+        force_backend: Option<&'static str>,
+        case: &'static str,
+        require_dma_for_bg: bool,
+    ) {
+        if require_dma_for_bg && !edgefirst_tensor::is_dma_available() {
+            eprintln!("SKIPPED: {case} — DMA not available on this host");
+            return;
+        }
+        let processor_result = with_force_backend(force_backend, ImageProcessor::new);
+        let mut processor = match processor_result {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("SKIPPED: {case} — backend init failed: {e:?}");
+                return;
+            }
+        };
+        scenario_empty_no_bg(&mut processor, case);
+        scenario_empty_with_bg(&mut processor, case);
+        scenario_detect_no_bg(&mut processor, case);
+        scenario_detect_with_bg(&mut processor, case);
+    }
+
+    #[test]
+    fn test_draw_masks_4_scenarios_cpu() {
+        run_all_scenarios(Some("cpu"), "cpu", false);
+    }
+
+    #[test]
+    fn test_draw_masks_4_scenarios_auto() {
+        run_all_scenarios(None, "auto", false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg(feature = "opengl")]
+    #[test]
+    fn test_draw_masks_4_scenarios_opengl() {
+        run_all_scenarios(Some("opengl"), "opengl", false);
+    }
+
+    /// G2D forced backend: exercises the zero-detection empty-frame
+    /// paths via `g2d_clear` and `g2d_blit`. Scenarios 3 and 4 (with
+    /// detections) expect `NotImplemented` since G2D has no rasterizer
+    /// for boxes / masks.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_draw_masks_zero_detection_g2d_forced() {
+        if !edgefirst_tensor::is_dma_available() {
+            eprintln!("SKIPPED: g2d forced — DMA not available on this host");
+            return;
+        }
+        let processor_result = with_force_backend(Some("g2d"), ImageProcessor::new);
+        let mut processor = match processor_result {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("SKIPPED: g2d forced — init failed: {e:?}");
+                return;
+            }
+        };
+
+        // Case 1: empty + no bg. G2D requires DMA-backed dst.
+        let mut dst = TensorDyn::image(
+            64,
+            64,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        {
+            use edgefirst_tensor::TensorMapTrait;
+            let u8t = dst.as_u8_mut().unwrap();
+            let mut map = u8t.map().unwrap();
+            map.as_mut_slice().fill(0xBB);
+        }
+        processor
+            .draw_decoded_masks(&mut dst, &[], &[], MaskOverlay::default())
+            .expect("g2d empty+no-bg");
+        assert_every_pixel_eq(&dst, [0, 0, 0, 0], "g2d/case1 cleared");
+
+        // Case 2: empty + bg. Both surfaces DMA-backed for g2d_blit.
+        let bg_color = [7, 11, 13, 255];
+        let bg = {
+            let t = TensorDyn::image(
+                64,
+                64,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::Dma),
+            )
+            .unwrap();
+            {
+                use edgefirst_tensor::TensorMapTrait;
+                let u8t = t.as_u8().unwrap();
+                let mut map = u8t.map().unwrap();
+                for chunk in map.as_mut_slice().chunks_exact_mut(4) {
+                    chunk.copy_from_slice(&bg_color);
+                }
+            }
+            t
+        };
+        let mut dst = TensorDyn::image(
+            64,
+            64,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        {
+            use edgefirst_tensor::TensorMapTrait;
+            let u8t = dst.as_u8_mut().unwrap();
+            let mut map = u8t.map().unwrap();
+            map.as_mut_slice().fill(0x55);
+        }
+        processor
+            .draw_decoded_masks(&mut dst, &[], &[], MaskOverlay::new().with_background(&bg))
+            .expect("g2d empty+bg");
+        assert_every_pixel_eq(&dst, bg_color, "g2d/case2 bg blit");
+
+        // Case 3 and 4: detect present — must return NotImplemented.
+        let detect = DetectBox {
+            bbox: [0.25, 0.25, 0.75, 0.75].into(),
+            score: 0.9,
+            label: 0,
+        };
+        let mut dst = TensorDyn::image(
+            64,
+            64,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        let err = processor
+            .draw_decoded_masks(&mut dst, &[detect], &[], MaskOverlay::default())
+            .expect_err("g2d must reject detect-present draw_decoded_masks");
+        assert!(
+            matches!(err, Error::NotImplemented(_)),
+            "g2d case3 wrong error: {err:?}"
+        );
     }
 
     #[test]

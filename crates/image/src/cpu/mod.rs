@@ -32,6 +32,51 @@ impl Default for CPUProcessor {
     }
 }
 
+/// Write the base layer of `dst` before mask rendering.
+///
+/// This is the terminal fallback: on CPU we have no 2D hardware, so a
+/// direct buffer write is the appropriate primitive. The invariant is that
+/// every call to the CPU draw_* entry points fully initialises dst — we
+/// never rely on "whatever was in the buffer" from the caller.
+///
+/// - `background == Some(bg)` → byte-for-byte copy bg → dst (after shape /
+///   format validation).
+/// - `background == None` → fill dst with 0x00 (transparent black).
+fn prepare_dst_base_cpu(dst: &mut TensorDyn, background: Option<&TensorDyn>) -> Result<()> {
+    match background {
+        Some(bg) => {
+            if bg.shape() != dst.shape() {
+                return Err(Error::InvalidShape(
+                    "background shape does not match dst".into(),
+                ));
+            }
+            if bg.format() != dst.format() {
+                return Err(Error::InvalidShape(
+                    "background pixel format does not match dst".into(),
+                ));
+            }
+            let bg_u8 = bg.as_u8().ok_or(Error::NotAnImage)?;
+            let dst_u8 = dst.as_u8_mut().ok_or(Error::NotAnImage)?;
+            let bg_map = bg_u8.map()?;
+            let mut dst_map = dst_u8.map()?;
+            let bg_slice = bg_map.as_slice();
+            let dst_slice = dst_map.as_mut_slice();
+            if bg_slice.len() != dst_slice.len() {
+                return Err(Error::InvalidShape(
+                    "background buffer size does not match dst".into(),
+                ));
+            }
+            dst_slice.copy_from_slice(bg_slice);
+        }
+        None => {
+            let dst_u8 = dst.as_u8_mut().ok_or(Error::NotAnImage)?;
+            let mut dst_map = dst_u8.map()?;
+            dst_map.as_mut_slice().fill(0);
+        }
+    }
+    Ok(())
+}
+
 /// Compute row stride for a packed-format Tensor<u8> image given its format.
 fn row_stride_for(width: usize, fmt: PixelFormat) -> usize {
     use edgefirst_tensor::PixelLayout;
@@ -335,6 +380,10 @@ impl ImageProcessorTrait for CPUProcessor {
         segmentation: &[Segmentation],
         overlay: crate::MaskOverlay<'_>,
     ) -> Result<()> {
+        // CPU is the terminal fallback — it must always produce the full
+        // output, never assume the caller cleared dst. Every call writes
+        // the base layer first (bg copy or zero fill) and then the masks.
+        prepare_dst_base_cpu(dst, overlay.background)?;
         let dst = dst.as_u8_mut().ok_or(Error::NotAnImage)?;
         self.draw_decoded_masks_impl(
             dst,
@@ -352,6 +401,7 @@ impl ImageProcessorTrait for CPUProcessor {
         proto_data: &ProtoData,
         overlay: crate::MaskOverlay<'_>,
     ) -> Result<()> {
+        prepare_dst_base_cpu(dst, overlay.background)?;
         let dst = dst.as_u8_mut().ok_or(Error::NotAnImage)?;
         self.draw_proto_masks_impl(
             dst,

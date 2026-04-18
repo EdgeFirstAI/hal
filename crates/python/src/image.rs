@@ -1047,13 +1047,9 @@ impl PyImageProcessor {
             .0
             .lock()
             .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
-        if let Some(bg) = &background {
-            if std::ptr::eq(&bg.0 as *const _, &dst.0 as *const _) {
-                return Err(Error::InvalidArg(
-                    "background must not be the same tensor as dst".to_string(),
-                ));
-            }
-        }
+        // Buffer-aliasing is validated inside draw_decoded_masks via
+        // TensorDyn::aliases (catches same-buffer across separate PyTensor
+        // wrappers — pointer-identity on the wrapper would miss that).
         let overlay = image::MaskOverlay {
             background: background.map(|b| &b.0),
             opacity: opacity.clamp(0.0, 1.0),
@@ -1146,13 +1142,9 @@ impl PyImageProcessor {
         let tensor_refs: Vec<&edgefirst_hal::tensor::TensorDyn> =
             model_output.iter().map(|t| &t.0).collect();
 
-        if let Some(bg) = &background {
-            if std::ptr::eq(&bg.0 as *const _, &dst.0 as *const _) {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "background must not be the same tensor as dst",
-                ));
-            }
-        }
+        // Buffer-aliasing is validated inside the draw_*_masks dispatch via
+        // TensorDyn::aliases; PyTensor wrapper-pointer equality is not
+        // sufficient (two wrappers can share one dmabuf).
         let overlay = image::MaskOverlay {
             background: background.map(|b| &b.0),
             opacity: opacity.clamp(0.0, 1.0),

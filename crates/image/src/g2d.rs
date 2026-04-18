@@ -239,26 +239,37 @@ impl ImageProcessorTrait for G2DProcessor {
 
     fn draw_decoded_masks(
         &mut self,
-        _dst: &mut TensorDyn,
-        _detect: &[crate::DetectBox],
-        _segmentation: &[crate::Segmentation],
-        _overlay: crate::MaskOverlay<'_>,
+        dst: &mut TensorDyn,
+        detect: &[crate::DetectBox],
+        segmentation: &[crate::Segmentation],
+        overlay: crate::MaskOverlay<'_>,
     ) -> Result<()> {
-        Err(Error::NotImplemented(
-            "G2D does not support drawing detection or segmentation overlays".to_string(),
-        ))
+        // G2D can produce the *frame* (background or cleared canvas) via
+        // hardware primitives — but has no rasterizer for boxes / masks.
+        // If detections are present, defer to another backend.
+        if !detect.is_empty() || !segmentation.is_empty() {
+            return Err(Error::NotImplemented(
+                "G2D does not support drawing detection or segmentation overlays".to_string(),
+            ));
+        }
+        draw_empty_frame_g2d(&mut self.g2d, dst, overlay.background)
     }
 
     fn draw_proto_masks(
         &mut self,
-        _dst: &mut TensorDyn,
-        _detect: &[crate::DetectBox],
+        dst: &mut TensorDyn,
+        detect: &[crate::DetectBox],
         _proto_data: &crate::ProtoData,
-        _overlay: crate::MaskOverlay<'_>,
+        overlay: crate::MaskOverlay<'_>,
     ) -> Result<()> {
-        Err(Error::NotImplemented(
-            "G2D does not support drawing detection or segmentation overlays".to_string(),
-        ))
+        // Same logic as draw_decoded_masks: G2D handles empty-detection
+        // frames (clear or blit background) via the 2D hardware.
+        if !detect.is_empty() {
+            return Err(Error::NotImplemented(
+                "G2D does not support drawing detection or segmentation overlays".to_string(),
+            ));
+        }
+        draw_empty_frame_g2d(&mut self.g2d, dst, overlay.background)
     }
 
     fn set_class_colors(&mut self, _: &[[u8; 4]]) -> Result<()> {
@@ -267,6 +278,87 @@ impl ImageProcessorTrait for G2DProcessor {
                 .to_string(),
         ))
     }
+}
+
+/// Produce the zero-detection frame on `dst` using G2D hardware ops.
+///
+/// `background == None` → `g2d_clear(dst, 0x00000000)` — actively fills the
+/// destination with transparent black using the 2D engine (no CPU touch).
+///
+/// `background == Some(bg)` → `g2d_blit(bg → dst)` — hardware copy of bg
+/// into dst. This is the "draw the cleared overlay onto the background"
+/// path; G2D has no pure copy primitive, so we use the blit engine with a
+/// 1:1 same-format surface pair, which is the hardware equivalent.
+///
+/// Both paths `finish()` before returning so dst is coherent for any
+/// downstream reader.
+fn draw_empty_frame_g2d(
+    g2d: &mut G2D,
+    dst_dyn: &mut TensorDyn,
+    background: Option<&TensorDyn>,
+) -> Result<()> {
+    if dst_dyn.dtype() != DType::U8 {
+        return Err(Error::NotSupported(
+            "G2D only supports u8 destination tensors".to_string(),
+        ));
+    }
+    let dst = dst_dyn.as_u8_mut().ok_or(Error::NotAnImage)?;
+
+    // DMA-only: G2D operates on physical addresses. A Mem-backed dst means
+    // we're on the wrong backend — surface a dispatch error so the caller
+    // can fall back.
+    if dst.as_dma().is_none() {
+        return Err(Error::NotImplemented(
+            "g2d only supports Dma memory".to_string(),
+        ));
+    }
+
+    let mut dst_surface = tensor_to_g2d_surface(dst)?;
+
+    match background {
+        None => {
+            // Case 1 — no background, no detections: hardware clear to
+            // transparent black. Every byte of dst is written by the 2D
+            // engine; no reliance on prior state.
+            let start = Instant::now();
+            g2d.clear(&mut dst_surface, [0, 0, 0, 0])?;
+            g2d.finish()?;
+            log::trace!("g2d clear (empty frame) takes {:?}", start.elapsed());
+        }
+        Some(bg_dyn) => {
+            // Case 2 — background, no detections: hardware blit bg → dst.
+            // Validate shape/format equivalence; if the caller handed us
+            // mismatched surfaces we return a structured error rather than
+            // silently producing wrong output.
+            if bg_dyn.shape() != dst.shape() {
+                return Err(Error::InvalidShape(
+                    "background shape does not match dst".into(),
+                ));
+            }
+            if bg_dyn.format() != dst.format() {
+                return Err(Error::InvalidShape(
+                    "background pixel format does not match dst".into(),
+                ));
+            }
+            if bg_dyn.dtype() != DType::U8 {
+                return Err(Error::NotSupported(
+                    "G2D only supports u8 background tensors".to_string(),
+                ));
+            }
+            let bg = bg_dyn.as_u8().ok_or(Error::NotAnImage)?;
+            if bg.as_dma().is_none() {
+                return Err(Error::NotImplemented(
+                    "g2d background must be Dma-backed".to_string(),
+                ));
+            }
+            let src_surface = tensor_to_g2d_surface(bg)?;
+            let start = Instant::now();
+            g2d.blit(&src_surface, &dst_surface)?;
+            g2d.finish()?;
+            log::trace!("g2d blit (bg→dst) takes {:?}", start.elapsed());
+        }
+    }
+    Ok(())
 }
 
 /// Build a `G2DSurface` from a `Tensor<u8>` that carries pixel-format metadata.

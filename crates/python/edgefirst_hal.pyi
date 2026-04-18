@@ -1183,9 +1183,21 @@ class ImageProcessor:
         This method draws pre-decoded results. For the fused decode+draw path
         (recommended for most use cases), use ``draw_masks()`` instead.
 
+        This function **always fully overwrites** ``dst`` — its prior contents
+        are discarded.  If ``background`` is provided the output is
+        ``background + masks``; otherwise ``dst`` is cleared to transparent
+        (``0x00000000``) before masks are drawn.
+
+        .. note::
+
+            **Migrating from v0.16.3 or earlier:** if you previously loaded an
+            image into ``dst`` before calling this function, you must now pass
+            that image via ``background=`` instead.
+
         Args:
-            dst: Destination image. Must be ``RGBA`` or ``RGB`` for CPU backend,
-                or ``RGBA``/``BGRA``/``RGB`` for OpenGL.
+            dst: Output image tensor (always fully written by this call). Must
+                be ``RGBA`` or ``RGB`` for the CPU backend, or
+                ``RGBA``/``BGRA``/``RGB`` for OpenGL.
             bbox: ``(N, 4)`` float32 array of normalized bounding boxes in
                 ``[x1, y1, x2, y2]`` format with values in ``[0, 1]``.
             scores: ``(N,)`` float32 array of confidence scores.
@@ -1195,9 +1207,15 @@ class ImageProcessor:
                 segmentation, e.g. YOLO), one mask per detection is expected
                 (``len(seg) <= len(bbox)``). When ``C > 1`` (semantic
                 segmentation, e.g. ModelPack), a single mask covers all classes.
-            background: Optional tensor to use as the compositing base instead
-                of ``dst``'s existing content. Must have the same dimensions
-                and format as ``dst``.
+                When empty and ``background`` is ``None``, ``dst`` is cleared to
+                transparent.
+            background: Optional compositing source. When provided, ``dst`` is
+                written as ``background + masks``. When ``None``, ``dst`` is
+                cleared to ``0x00000000`` before masks are drawn. Must have the
+                same dimensions and format as ``dst``, and must reference a
+                **distinct underlying buffer** — aliasing ``dst`` (directly or
+                via two ``Tensor`` wrappers over the same dmabuf fd) raises
+                ``RuntimeError``.
             opacity: Scales the alpha of rendered mask and box colors.
                 ``1.0`` (default) preserves the class color's alpha unchanged;
                 ``0.5`` makes overlays semi-transparent. Clamped to [0, 1].
@@ -1209,9 +1227,10 @@ class ImageProcessor:
                 ``ColorMode.Instance`` colors by detection index.
 
         Raises:
-            RuntimeError: If ``dst`` format is unsupported by the active backend.
-            ValueError: If ``bbox``, ``scores``, ``classes`` lengths do not match,
-                or if ``bbox`` shape is not ``(N, 4)``.
+            RuntimeError: If ``dst`` format is unsupported by the active
+                backend, if ``background`` aliases ``dst``, if ``bbox``,
+                ``scores``, or ``classes`` lengths do not match, or if
+                ``bbox`` shape is not ``(N, 4)``.
         """
         ...
 
@@ -1292,18 +1311,33 @@ class ImageProcessor:
 
         Without a tracker the return value is ``(boxes, scores, classes)``.
 
+        This function **always fully overwrites** ``dst`` — its prior contents
+        are discarded.  If ``background`` is provided the output is
+        ``background + masks``; otherwise ``dst`` is cleared to transparent
+        (``0x00000000``) before masks are drawn.
+
+        .. note::
+
+            **Migrating from v0.16.3 or earlier:** if you previously loaded an
+            image into ``dst`` before calling this function, you must now pass
+            that image via ``background=`` instead.
+
         Args:
             decoder: Decoder instance for interpreting model outputs.
             model_output: List of HAL Tensor objects from model inference.
-            dst: Destination image tensor to draw onto. Must be ``RGBA`` or
-                ``RGB`` for CPU backend, or ``RGBA``/``BGRA``/``RGB`` for
-                OpenGL backend.
+            dst: Output image tensor (always fully written by this call). Must
+                be ``RGBA`` or ``RGB`` for the CPU backend, or
+                ``RGBA``/``BGRA``/``RGB`` for OpenGL backend.
             tracker: Optional ByteTrack tracker for object tracking.
             timestamp: Optional frame timestamp in nanoseconds. Only used
                 when ``tracker`` is provided. Defaults to current system time.
-            background: Optional tensor to use as the compositing base instead
-                of ``dst``'s existing content. Must have the same dimensions
-                and format as ``dst``.
+            background: Optional compositing source. When provided, ``dst`` is
+                written as ``background + masks``. When ``None``, ``dst`` is
+                cleared to ``0x00000000`` before masks are drawn. Must have the
+                same dimensions and format as ``dst``, and must reference a
+                **distinct underlying buffer** — aliasing ``dst`` (directly or
+                via two ``Tensor`` wrappers over the same dmabuf fd) raises
+                ``RuntimeError``.
             opacity: Scales the alpha of rendered mask and box colors.
                 ``1.0`` (default) preserves the class color's alpha unchanged;
                 ``0.5`` makes overlays semi-transparent. Clamped to [0, 1].
@@ -1316,6 +1350,7 @@ class ImageProcessor:
 
         Raises:
             RuntimeError: If ``dst`` format is unsupported by the active backend,
+                or if ``background`` aliases ``dst``;
                 or if the ImageProcessor uses G2D (mask rendering not supported).
         """
         ...

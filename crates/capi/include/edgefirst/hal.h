@@ -1642,18 +1642,34 @@ int hal_image_processor_convert(struct hal_image_processor *processor,
  * destination image tensor. Uses hardware acceleration (OpenGL) when available,
  * falling back to CPU rendering.
  *
+ * **Output contract:** `dst` is always fully written by this call — its prior
+ * contents are discarded.  The four cases are:
+ *
+ * | detections | background | output                            |
+ * |------------|------------|-----------------------------------|
+ * | NULL       | NULL       | dst cleared to 0x00000000         |
+ * | NULL       | set        | dst <- background                 |
+ * | set        | NULL       | masks drawn over cleared dst      |
+ * | set        | set        | masks drawn over background       |
+ *
+ * @note **Migrating from v0.16.3 or earlier:** if you populated `dst` with
+ * an image before calling this function, you must now pass that image as
+ * `background` instead; pre-loading `dst` is no longer effective.
+ *
  * @param processor Image processor handle
- * @param dst Destination image tensor to draw onto
- * @param detections Detection box list (can be NULL for segmentation-only)
- * @param segmentations Segmentation list (can be NULL for detection-only)
- * @param background Optional background image (NULL to draw over dst)
+ * @param dst Output image tensor (always fully written; prior contents discarded)
+ * @param detections Detection box list (NULL for no detections)
+ * @param segmentations Segmentation list (NULL for detection-only or no masks)
+ * @param background Optional compositing source — `dst` is written as
+ *        `background + masks`. Pass NULL to clear `dst` to transparent.
+ *        Must have the same dimensions and format as `dst`.
  * @param opacity Mask opacity in [0.0, 1.0] (1.0 = fully opaque, clamped)
  * @param letterbox Optional letterbox coordinates [x0, y0, x1, y1] in normalized
  *        coordinates for mapping model-space boxes back to image space (NULL = no letterbox)
  * @param color_mode How to assign colors to detections (HAL_COLOR_MODE_CLASS by default)
  * @return 0 on success, -1 on error
  * @par Errors (errno):
- * - EINVAL: Invalid argument (NULL processor or dst, or background == dst)
+ * - EINVAL: Invalid argument (NULL processor or dst, or `background` aliases `dst` — they must reference distinct buffers)
  * - EIO: Drawing failed
  */
 int hal_image_processor_draw_decoded_masks(struct hal_image_processor *processor,
@@ -1706,12 +1722,21 @@ struct hal_segmentation_list *hal_image_processor_materialize_masks(struct hal_i
  * directly to the renderer without materializing intermediate mask arrays.
  * For detection-only models, this falls back to decode + draw_decoded_masks.
  *
+ * **Output contract:** `dst` is always fully written by this call — its prior
+ * contents are discarded.  See `hal_image_processor_draw_decoded_masks` for
+ * the four-case detections × background matrix.
+ *
+ * @note **Migrating from v0.16.3 or earlier:** if you populated `dst` before
+ * calling this function, pass that image as `background` instead.
+ *
  * @param processor Image processor handle
  * @param decoder Decoder handle
  * @param outputs Array of output tensor pointers
  * @param num_outputs Number of output tensors
- * @param dst Destination image to draw onto
- * @param background Optional background image (NULL to draw over dst)
+ * @param dst Output image tensor (always fully written; prior contents discarded)
+ * @param background Optional compositing source — `dst` is written as
+ *        `background + masks`. Pass NULL to clear `dst` to transparent.
+ *        Must have the same dimensions and format as `dst`.
  * @param opacity Mask opacity, clamped to [0.0, 1.0] (1.0 = fully opaque)
  * @param letterbox Optional letterbox coordinates [x0, y0, x1, y1] in normalized
  *        coordinates (NULL = no letterbox correction)
@@ -1719,7 +1744,7 @@ struct hal_segmentation_list *hal_image_processor_materialize_masks(struct hal_i
  * @param out_boxes Output parameter for detection box list (caller must free)
  * @return 0 on success, -1 on error
  * @par Errors (errno):
- * - EINVAL: Invalid argument (NULL processor/decoder/outputs/dst/out_boxes, or background == dst)
+ * - EINVAL: Invalid argument (NULL processor/decoder/outputs/dst/out_boxes, or `background` aliases `dst` — they must reference distinct buffers)
  * - EIO: Decoding or drawing failed
  */
 int hal_image_processor_draw_masks(struct hal_image_processor *processor,
@@ -1741,14 +1766,23 @@ int hal_image_processor_draw_masks(struct hal_image_processor *processor,
  * arrays. Object tracking is applied to maintain identities across frames.
  * For detection-only models, this falls back to tracked decode + draw_decoded_masks.
  *
+ * **Output contract:** `dst` is always fully written by this call — its prior
+ * contents are discarded.  See `hal_image_processor_draw_decoded_masks` for
+ * the four-case detections × background matrix.
+ *
+ * @note **Migrating from v0.16.3 or earlier:** if you populated `dst` before
+ * calling this function, pass that image as `background` instead.
+ *
  * @param processor Image processor handle
  * @param decoder Decoder handle
  * @param tracker Tracker handle for maintaining object identities across frames
  * @param timestamp Timestamp for the current frame (e.g., in nanoseconds)
  * @param outputs Array of output tensor pointers
  * @param num_outputs Number of output tensors
- * @param dst Destination image to draw onto
- * @param background Optional background image (NULL to draw over dst)
+ * @param dst Output image tensor (always fully written; prior contents discarded)
+ * @param background Optional compositing source — `dst` is written as
+ *        `background + masks`. Pass NULL to clear `dst` to transparent.
+ *        Must have the same dimensions and format as `dst`.
  * @param opacity Mask opacity in [0.0, 1.0] (1.0 = fully opaque, clamped)
  * @param letterbox Optional letterbox coordinates [x0, y0, x1, y1] in normalized
  *        coordinates (NULL = no letterbox correction)
@@ -1757,7 +1791,7 @@ int hal_image_processor_draw_masks(struct hal_image_processor *processor,
  * @param out_tracks Output parameter for track info list (can be NULL; caller must free if non-NULL)
  * @return 0 on success, -1 on error
  * @par Errors (errno):
- * - EINVAL: Invalid argument (NULL processor/decoder/tracker/outputs/dst/out_boxes, or background == dst)
+ * - EINVAL: Invalid argument (NULL processor/decoder/tracker/outputs/dst/out_boxes, or `background` aliases `dst` — they must reference distinct buffers)
  * - EIO: Decoding or drawing failed
  */
 int hal_image_processor_draw_masks_tracked(struct hal_image_processor *processor,
