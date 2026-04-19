@@ -5,7 +5,9 @@ use std::collections::HashSet;
 
 use super::config::ConfigOutputRef;
 use super::configs::{self, DecoderType, DecoderVersion, DimName, ModelType};
+use super::merge::DecodeProgram;
 use super::{ConfigOutput, ConfigOutputs, Decoder};
+use crate::schema::SchemaV2;
 use crate::DecoderError;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -23,6 +25,11 @@ enum ConfigSource {
     Yaml(String),
     Json(String),
     Config(ConfigOutputs),
+    /// Schema v2 metadata. During build the schema is either converted
+    /// to a legacy [`ConfigOutputs`] (flat case) or used to construct a
+    /// [`DecodeProgram`] that performs per-child dequant + merge at
+    /// decode time.
+    Schema(SchemaV2),
 }
 
 impl Default for DecoderBuilder {
@@ -139,6 +146,36 @@ impl DecoderBuilder {
     /// ```
     pub fn with_config(mut self, config: ConfigOutputs) -> Self {
         self.config_src.replace(ConfigSource::Config(config));
+        self
+    }
+
+    /// Configure the decoder from a schema v2 metadata document.
+    ///
+    /// Accepts a [`SchemaV2`] as produced by [`SchemaV2::parse_json`],
+    /// [`SchemaV2::parse_yaml`], [`SchemaV2::parse_file`], or
+    /// constructed programmatically. The builder validates the schema,
+    /// compiles a [`DecodeProgram`] for any split logical outputs
+    /// (per-scale or channel sub-splits), and downconverts the
+    /// logical-level semantics to the legacy [`ConfigOutputs`]
+    /// representation consumed by the existing decoder dispatch.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use edgefirst_decoder::{DecoderBuilder, DecoderResult};
+    /// use edgefirst_decoder::schema::SchemaV2;
+    ///
+    /// # fn main() -> DecoderResult<()> {
+    /// let schema = SchemaV2::parse_file("model/edgefirst.json")?;
+    /// let decoder = DecoderBuilder::new()
+    ///     .with_schema(schema)
+    ///     .with_score_threshold(0.25)
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_schema(mut self, schema: SchemaV2) -> Self {
+        self.config_src.replace(ConfigSource::Schema(schema));
         self
     }
 
@@ -742,10 +779,11 @@ impl DecoderBuilder {
     /// # }
     /// ```
     pub fn build(self) -> Result<Decoder, DecoderError> {
-        let config = match self.config_src {
-            Some(ConfigSource::Json(s)) => serde_json::from_str(&s)?,
-            Some(ConfigSource::Yaml(s)) => serde_yaml::from_str(&s)?,
-            Some(ConfigSource::Config(c)) => c,
+        let (config, decode_program) = match self.config_src {
+            Some(ConfigSource::Json(s)) => Self::build_from_schema(SchemaV2::parse_json(&s)?)?,
+            Some(ConfigSource::Yaml(s)) => Self::build_from_schema(SchemaV2::parse_yaml(&s)?)?,
+            Some(ConfigSource::Config(c)) => (c, None),
+            Some(ConfigSource::Schema(schema)) => Self::build_from_schema(schema)?,
             None => return Err(DecoderError::NoConfig),
         };
 
@@ -762,7 +800,27 @@ impl DecoderBuilder {
             score_threshold: self.score_threshold,
             nms,
             normalized,
+            decode_program,
         })
+    }
+
+    /// Validate a [`SchemaV2`] and lower it to the (legacy `ConfigOutputs`,
+    /// optional `DecodeProgram`) pair the rest of `build()` consumes.
+    ///
+    /// Centralises the v2 lowering so JSON, YAML, and direct
+    /// `with_schema` callers all go through the same validation and
+    /// merge-program construction. `SchemaV2::parse_json` /
+    /// `parse_yaml` already auto-detect v1 vs v2 input and return a v2
+    /// schema either way (v1 inputs are upgraded in memory via
+    /// `from_v1`), so this helper is the sole place that turns a
+    /// schema into builder-ready state.
+    fn build_from_schema(
+        schema: SchemaV2,
+    ) -> Result<(ConfigOutputs, Option<DecodeProgram>), DecoderError> {
+        schema.validate()?;
+        let program = DecodeProgram::try_from_schema(&schema)?;
+        let legacy = schema.to_legacy_config_outputs()?;
+        Ok((legacy, program))
     }
 
     /// Extracts the normalized flag from config outputs.

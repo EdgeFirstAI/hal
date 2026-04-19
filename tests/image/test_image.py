@@ -468,3 +468,64 @@ outputs:
     assert boxes.shape[1] == 4
     assert len(scores) == len(boxes)
     assert len(classes) == len(boxes)
+
+
+@pytest.mark.parametrize(
+    "width,height",
+    [
+        (105, 124),  # the original STRIDES_BUG.md repro
+        (100, 124),
+        (160, 80),
+        (200, 64),
+    ],
+)
+def test_from_numpy_grey_unaligned_width_stride_bug(width, height):
+    """Regression for STRIDES_BUG.md.
+
+    create_image() rounds the row pitch up to the GPU backend's
+    alignment (64-byte multiple on Mali Valhall, larger on some PBO
+    paths). Image.size still reports the *logical* width × height,
+    so a numpy array sized off Image.size used to mismatch the
+    underlying padded buffer and panic copy_from_slice. The fix
+    detects pitch-aligned destinations in from_numpy and routes
+    through a row-by-row copy.
+
+    The contract this asserts: a numpy array of shape (height, width)
+    matching Image.size must round-trip through from_numpy without
+    panicking, even when width is not 64-byte-aligned. Round-trip
+    via normalize_to_numpy verifies the row-by-row copy preserved
+    pixel data (no off-by-stride corruption).
+    """
+    converter = ImageProcessor()
+    img = converter.create_image(width, height, PixelFormat.Grey)
+
+    assert img.size == width * height, (
+        f"Image.size ({img.size}) must remain logical (w*h={width * height})"
+    )
+
+    # row_stride reports the actual row pitch in bytes (>= width for
+    # Grey since channels=1). On padding backends stride > width; on
+    # un-padded backends stride == width. Either way it must be at
+    # least the logical row width.
+    rs = img.row_stride
+    assert rs is not None and rs >= width, (
+        f"row_stride {rs} must be >= width {width}"
+    )
+
+    src = np.arange(width * height, dtype=np.uint8).reshape(height, width)
+    img.from_numpy(src)
+
+    # Round-trip verification: pull the raw buffer back and reshape
+    # using the queried stride. Each row's first `width` bytes must
+    # match the source; the trailing `stride - width` bytes are
+    # padding and may contain anything.
+    with img.map() as m:
+        raw = np.frombuffer(m.view(), dtype=np.uint8)
+    assert len(raw) == rs * height, (
+        f"backing buffer size {len(raw)} != row_stride*height {rs * height}"
+    )
+    rows = raw.reshape(height, rs)[:, :width]
+    assert np.array_equal(rows, src), (
+        f"round-trip mismatch for width={width}, stride={rs}: "
+        f"first-row mismatched bytes = {(rows[0] != src[0]).sum()}"
+    )
