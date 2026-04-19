@@ -7,6 +7,128 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Schema v2 metadata parser (`edgefirst_decoder::schema`).** New
+  data-only module implementing the two-layer logical/physical output
+  model from the updated `edgefirst.json` specification. Logical outputs
+  describe semantics (`encoding`, `score_format`, `normalized`,
+  `decoder`); physical children describe quantization mechanics
+  (`dtype`, per-channel `quantization`, `stride`, `scale_index`,
+  `activation_applied` / `activation_required`). At most one level of
+  nesting permitted. Supports all converter decompositions in the spec
+  (flat TFLite, ARA-2 `boxes_xy`/`boxes_wh`, Hailo per-scale per-FPN).
+
+- **Parse-time v1 compatibility shim.** `SchemaV2::parse_json` and
+  `SchemaV2::parse_yaml` auto-detect legacy metadata (missing
+  `schema_version` or `schema_version: 1`) and convert to v2 in memory,
+  so the internal decoder only ever sees v2. Files declaring a
+  `schema_version` higher than the supported maximum are rejected with
+  `DecoderError::NotSupported` instead of being silently parsed against
+  the wrong grammar. Rust callers can invoke `SchemaV2::from_v1`
+  directly when they already hold a deserialized v1 `ConfigOutputs`.
+
+- **Per-channel quantization support.** `schema::Quantization`
+  represents both per-tensor (scalar `scale`) and per-channel (array
+  `scale` with `axis`) quantization, matching the ONNX / TFLite
+  conventions. Deserializer accepts either scalar or array inline.
+
+- **Explicit `DType`, `Activation`, `BoxEncoding`, `ScoreFormat`
+  enums.** Replaces v1's inference-by-shape with explicit metadata so
+  that future schema changes (heterogeneous `reg_max`, per-level DFL
+  bins, new activations) do not require decoder dispatch changes.
+
+- **`DecoderBuilder::with_schema`.** New builder entry point that
+  accepts a `schema::SchemaV2` (parsed from file / JSON / YAML, or
+  constructed programmatically) and compiles it into a decoder.
+  Validates the schema, derives a `DecodeProgram` for any logical
+  outputs with physical children, and downconverts the logical-level
+  metadata to the legacy dispatch representation. Flat v2 schemas run
+  through the existing decode kernels unchanged; schemas with
+  `encoding: dfl` on boxes are rejected with `NotSupported` until the
+  dedicated DFL kernel lands.
+
+- **Physical → logical merge path at decode time.** `Decoder::decode`
+  now executes the compiled `DecodeProgram` when present,
+  dequantizing physical children with per-tensor `(scale, zp)` and
+  producing one `ArrayD<f32>` per logical output. Two merge
+  strategies implemented:
+  - `ChannelConcat` for channel sub-splits (ARA-2 `boxes_xy` /
+    `boxes_wh`): concat along the logical channel axis.
+  - `PerScale` for FPN per-scale splits: sort children stride-
+    ascending, permute each from its declared layout (NHWC or NCHW
+    per its own `dshape`) to canonical `(batch, features, H×W)`,
+    concat along the anchor axis, reshape/transpose into the
+    logical output shape.
+
+  Duplicate-shape sibling children (the ARA-2 case where `boxes_xy`
+  and `boxes_wh` share `[1, 2, 8400]`) are bound in declared child
+  order via a used-index list — callers pass tensors positionally in
+  schema traversal order until name-keyed decode lands.
+
+- **Schema-driven decoding rejects unsupported features early.**
+  `NotSupported`/`InvalidConfig` errors flagged at build time for:
+  DFL-encoded split boxes (DFL kernel pending), per-channel quant on
+  a split child, missing `dshape` on per-scale children, mixed
+  per-scale + channel sub-split decompositions on the same logical
+  output.
+
+- **ARA-2 DVM `padding` dim support.** Schema-v2 metadata emitted by
+  the ARA-2 converter declares a trailing `padding: 1` axis on most
+  logical outputs (e.g. `[1, 4, 8400, 1]` for boxes, `[1, 80, 8400,
+  1]` for scores). Both the legacy-config downconversion and the
+  merge-program execution now squeeze these axes deterministically
+  from `dshape`, so the legacy rank-3 dispatch sees the shapes it
+  expects. Verified against real `model.dvm` metadata from
+  `edgefirst-studio-ara2` INT8 and INT16 builds (round-trip parse,
+  validate, build, decode-smoke all pass).
+
+- **`DecoderBuilder::build` auto-detects schema v2 JSON / YAML.**
+  `with_config_json_str` and `with_config_yaml_str` (and therefore the
+  Python `Decoder.new_from_json_str` / `new_from_yaml_str` static
+  constructors) now route through `SchemaV2::parse_json` /
+  `parse_yaml`, so v2 metadata reaches the native `DecodeProgram` merge
+  path without a Python-side flattening pass. v1 metadata still builds
+  unchanged via the in-memory `from_v1` shim. Validators that previously
+  unpacked v2 `boxes_xy` / `boxes_wh` and re-quantized to a shared
+  scale on every frame can drop that work and pass the raw
+  `edgefirst.json` directly to the HAL.
+
+### Performance
+
+- **`MAX_NMS_CANDIDATES` pre-NMS top-K cap (Ultralytics-aligned, 30 000).**
+  At very low score thresholds (e.g. `t=0.01` on YOLOv8 with
+  8400 anchors × 80 classes), nearly the full 672 000-entry score grid
+  used to feed O(n²) NMS and a per-survivor 32×25 600 mask matmul,
+  producing minutes-per-frame decode times on dense images. Both the
+  float and quantized split-segdet paths now sort the above-threshold
+  candidate list by score and truncate to 30 000 before NMS. Default
+  thresholds (≥0.25) almost never reach the cap, so this is a
+  silent worst-case improvement, not a behaviour change.
+
+### Fixed
+
+- **`Tensor.from_numpy` panic on pitch-aligned destinations
+  (`STRIDES_BUG`).** When `ImageProcessor.create_image` allocates a
+  DMA-BUF or PBO buffer whose row stride is rounded up to a 64-byte
+  GPU alignment boundary, the mapped backing slice is longer than
+  `Image.size` (the logical `width × height × bpp`). The old
+  `from_numpy` did a single `copy_from_slice` from a numpy array
+  sized off `Image.size` and panicked on the length mismatch — which
+  triggered every time `edgefirst-validator` resized YOLOv8-seg
+  per-instance masks (mask widths come from box coordinates, almost
+  never 64-byte-aligned). `from_numpy` now detects pitch-aligned
+  destinations via `Tensor.row_stride`, copies row-by-row into the
+  padded buffer, and only raises on genuine shape/dtype mismatches.
+
+### Added
+
+- **`Tensor.row_stride` Python property.** Reports the actual row
+  pitch in bytes for image tensors. For images allocated via
+  `create_image`, this reflects any DMA pitch-alignment padding
+  applied to the row. Lets downstream code distinguish padded from
+  unpadded allocations without guessing.
+
 ## [0.16.4] - 2026-04-17
 
 ### Fixed

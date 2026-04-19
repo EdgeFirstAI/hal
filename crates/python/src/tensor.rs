@@ -374,10 +374,86 @@ fn copy_numpy_to_tensor_dyn(src: &Bound<'_, pyo3::types::PyAny>, tensor: &Tensor
 
         let mut map = tensor.map()?;
         let dst = map.as_mut_slice();
+        let dst_len = dst.len();
         let nbytes = tensor_len * std::mem::size_of::<T>();
         let parallel = nbytes >= PARALLEL_THRESHOLD_BYTES;
         // Minimum chunk: 4 KiB worth of elements (scales with element size).
         let min_chunk = (4096 / std::mem::size_of::<T>()).max(1);
+
+        // Destination-side stride padding (STRIDES_BUG.md): when
+        // `create_image` allocates a DMA-BUF or PBO buffer with GPU
+        // pitch alignment padding, `map()` exposes the full padded
+        // buffer (`stride × height` bytes) but the logical element
+        // count from shape is smaller (`width × channels × height`).
+        // A flat `copy_from_slice` would panic on the length
+        // mismatch. Detect this and copy row-by-row, placing
+        // `row_elems` logical pixels per row and skipping the
+        // padding bytes in the destination.
+        if dst_len > tensor_len {
+            let elem_sz = std::mem::size_of::<T>();
+            let stride_bytes = tensor.effective_row_stride().ok_or_else(|| {
+                Error::Format(format!(
+                    "destination buffer is padded ({dst_len} elems > {tensor_len} logical) \
+                     but tensor has no effective_row_stride"
+                ))
+            })?;
+            let height = tensor.height().ok_or_else(|| {
+                Error::Format("destination buffer is padded but tensor has no height".to_string())
+            })?;
+            if height == 0 || elem_sz == 0 {
+                return Ok(());
+            }
+            let dst_stride_elems = stride_bytes / elem_sz;
+            let row_elems = tensor_len / height;
+
+            if dst_stride_elems * height != dst_len || row_elems * height != tensor_len {
+                return Err(Error::Format(format!(
+                    "stride-padded copy: inconsistent dimensions: \
+                     dst_len={dst_len}, tensor_len={tensor_len}, height={height}, \
+                     dst_stride_elems={dst_stride_elems}, row_elems={row_elems}"
+                )));
+            }
+
+            if arr.is_c_contiguous() {
+                if let Ok(src_slice) = readonly.as_slice() {
+                    py.detach(|| {
+                        if parallel {
+                            use rayon::prelude::*;
+                            dst.par_chunks_mut(dst_stride_elems)
+                                .zip(src_slice.par_chunks(row_elems))
+                                .for_each(|(d, s)| d[..row_elems].copy_from_slice(s));
+                        } else {
+                            for row in 0..height {
+                                let s = row * row_elems;
+                                let d = row * dst_stride_elems;
+                                dst[d..d + row_elems].copy_from_slice(&src_slice[s..s + row_elems]);
+                            }
+                        }
+                    });
+                } else {
+                    py.detach(|| {
+                        let mut it = src_view.iter();
+                        for row in 0..height {
+                            let d = row * dst_stride_elems;
+                            for col in 0..row_elems {
+                                dst[d + col] = *it.next().unwrap();
+                            }
+                        }
+                    });
+                }
+            } else {
+                py.detach(|| {
+                    let mut it = src_view.iter();
+                    for row in 0..height {
+                        let d = row * dst_stride_elems;
+                        for col in 0..row_elems {
+                            dst[d + col] = *it.next().unwrap();
+                        }
+                    }
+                });
+            }
+            return Ok(());
+        }
 
         if arr.is_c_contiguous() {
             if let Ok(src_slice) = readonly.as_slice() {
@@ -718,6 +794,18 @@ impl PyTensor {
     #[getter]
     fn height(&self) -> Option<usize> {
         self.0.height()
+    }
+
+    /// Effective row stride in bytes, or ``None`` if unknown.
+    ///
+    /// For images allocated via ``ImageProcessor.create_image``, this
+    /// reflects any DMA pitch-alignment padding applied to the row.
+    /// Returns the explicit stride when set, otherwise computes
+    /// ``width × channels × sizeof(element)`` from the pixel format.
+    /// Returns ``None`` for non-image tensors without a pixel format.
+    #[getter]
+    fn row_stride(&self) -> Option<usize> {
+        self.0.effective_row_stride()
     }
 
     /// Whether this image uses a planar pixel layout.

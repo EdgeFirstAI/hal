@@ -43,7 +43,20 @@ mod decoder_builder_tests {
         let result = DecoderBuilder::new()
             .with_config_yaml_str(malformed_yaml)
             .build();
-        assert!(matches!(result, Err(DecoderError::Yaml(_))));
+        // build() now routes YAML through SchemaV2::parse_yaml which
+        // bridges to a serde_json::Value before deserialising as v1
+        // ConfigOutputs, so structurally-valid YAML that fails the v1
+        // schema check surfaces as a Json variant. Either Yaml (from
+        // the initial serde_yaml::from_str step) or Json (from the v1
+        // fallback) is acceptable here — the contract is "malformed
+        // config errors out".
+        assert!(
+            matches!(
+                result,
+                Err(DecoderError::Yaml(_)) | Err(DecoderError::Json(_))
+            ),
+            "expected Yaml or Json error, got {result:?}"
+        );
     }
 
     #[test]
@@ -2518,5 +2531,455 @@ outputs:
         assert!(result.is_ok(), "decode_float failed: {result:?}");
         // Should detect boxes (same as reference yolov8s test)
         assert!(!output_boxes.is_empty(), "Expected detections");
+    }
+
+    // =========================================================================
+    // Schema v2 `with_schema()` builder integration tests
+    // =========================================================================
+
+    mod schema_v2_builder {
+        use crate::schema::SchemaV2;
+        use crate::{DecoderBuilder, DecoderError};
+
+        #[test]
+        fn with_schema_flat_v2_builds() {
+            // A flat v2 schema (no children) should build a decoder
+            // identical to the v1 path.
+            let j = r#"{
+              "schema_version": 2,
+              "decoder_version": "yolov8",
+              "outputs": [
+                {"name": "boxes", "type": "boxes",
+                 "shape": [1, 4, 8400],
+                 "dshape": [{"batch":1},{"box_coords":4},{"num_boxes":8400}],
+                 "dtype": "int8",
+                 "quantization": {"scale": 0.00392, "zero_point": 0, "dtype": "int8"},
+                 "decoder": "ultralytics", "encoding": "direct", "normalized": true},
+                {"name": "scores", "type": "scores",
+                 "shape": [1, 80, 8400],
+                 "dshape": [{"batch":1},{"num_classes":80},{"num_boxes":8400}],
+                 "dtype": "int8",
+                 "quantization": {"scale": 0.00392, "zero_point": 0, "dtype": "int8"},
+                 "decoder": "ultralytics", "score_format": "per_class"}
+              ]
+            }"#;
+            let schema = SchemaV2::parse_json(j).unwrap();
+            let decoder = DecoderBuilder::new()
+                .with_schema(schema)
+                .with_score_threshold(0.25)
+                .build()
+                .unwrap();
+            assert!(
+                decoder.decode_program.is_none(),
+                "flat schema should have no merge program"
+            );
+            assert!(decoder.normalized_boxes() == Some(true));
+        }
+
+        #[test]
+        fn with_schema_v1_yaml_via_shim_builds() {
+            // Legacy v1 testdata parsed through the v2 shim and fed to
+            // the new builder should produce a working decoder.
+            let yaml = include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/yolov8_seg.yaml"
+            ));
+            let schema = SchemaV2::parse_yaml(yaml).unwrap();
+            let decoder = DecoderBuilder::new().with_schema(schema).build().unwrap();
+            assert!(decoder.decode_program.is_none());
+        }
+
+        #[test]
+        fn with_schema_rejects_dfl_flat() {
+            let j = r#"{
+              "schema_version": 2,
+              "decoder_version": "yolov8",
+              "outputs": [
+                {"name": "boxes", "type": "boxes",
+                 "shape": [1, 64, 8400],
+                 "dshape": [{"batch":1},{"num_features":64},{"num_boxes":8400}],
+                 "dtype": "int8",
+                 "quantization": {"scale": 0.00392, "zero_point": 0, "dtype": "int8"},
+                 "decoder": "ultralytics", "encoding": "dfl", "normalized": true},
+                {"name": "scores", "type": "scores",
+                 "shape": [1, 80, 8400],
+                 "dtype": "int8",
+                 "decoder": "ultralytics", "score_format": "per_class"}
+              ]
+            }"#;
+            let schema = SchemaV2::parse_json(j).unwrap();
+            let err = DecoderBuilder::new()
+                .with_schema(schema)
+                .build()
+                .unwrap_err();
+            assert!(
+                matches!(err, DecoderError::NotSupported(_)),
+                "expected NotSupported, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn with_schema_rejects_future_version() {
+            let j = r#"{"schema_version": 99, "outputs": []}"#;
+            let err = SchemaV2::parse_json(j).unwrap_err();
+            assert!(matches!(err, DecoderError::NotSupported(_)));
+        }
+
+        /// Construct a TensorDyn with the given values. Helper for the
+        /// end-to-end decode test below.
+        fn make_i16(shape: &[usize], values: &[i16]) -> edgefirst_tensor::TensorDyn {
+            use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait};
+            let t = Tensor::<i16>::new(shape, Some(TensorMemory::Mem), None).unwrap();
+            let mut m = t.map().unwrap();
+            m.as_mut_slice()[..values.len()].copy_from_slice(values);
+            drop(m);
+            TensorDyn::I16(t)
+        }
+
+        fn make_i8(shape: &[usize], values: &[i8]) -> edgefirst_tensor::TensorDyn {
+            use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait};
+            let t = Tensor::<i8>::new(shape, Some(TensorMemory::Mem), None).unwrap();
+            let mut m = t.map().unwrap();
+            m.as_mut_slice()[..values.len()].copy_from_slice(values);
+            drop(m);
+            TensorDyn::I8(t)
+        }
+
+        #[test]
+        fn with_schema_split_decode_end_to_end() {
+            // End-to-end: build a decoder from a v2 schema with a
+            // channel-sub-split boxes output, run `decode` on synthetic
+            // tensors, and verify at least one detection survives NMS
+            // given a single-anchor high score.
+            //
+            // Boxes: xy [1,2,3] i16 + wh [1,2,3] i16 → logical [1,4,3]
+            // Scores: [1,2,3] i8
+            let j = r#"{
+              "schema_version": 2,
+              "decoder_version": "yolov8",
+              "nms": "class_agnostic",
+              "outputs": [
+                {"name": "boxes", "type": "boxes",
+                 "shape": [1, 4, 3],
+                 "dshape": [{"batch":1},{"box_coords":4},{"num_boxes":3}],
+                 "decoder": "ultralytics", "encoding": "direct", "normalized": true,
+                 "outputs": [
+                   {"name": "xy", "type": "boxes_xy",
+                    "shape": [1, 2, 3],
+                    "dshape": [{"batch":1},{"box_coords":2},{"num_boxes":3}],
+                    "dtype": "int16",
+                    "quantization": {"scale": 1.0e-3, "zero_point": 0, "dtype": "int16"}},
+                   {"name": "wh", "type": "boxes_wh",
+                    "shape": [1, 2, 3],
+                    "dshape": [{"batch":1},{"box_coords":2},{"num_boxes":3}],
+                    "dtype": "int16",
+                    "quantization": {"scale": 1.0e-3, "zero_point": 0, "dtype": "int16"}}
+                 ]},
+                {"name": "scores", "type": "scores",
+                 "shape": [1, 2, 3],
+                 "dshape": [{"batch":1},{"num_classes":2},{"num_boxes":3}],
+                 "dtype": "int8",
+                 "quantization": {"scale": 0.008, "zero_point": 0, "dtype": "int8"},
+                 "decoder": "ultralytics", "score_format": "per_class"}
+              ]
+            }"#;
+            let schema = SchemaV2::parse_json(j).unwrap();
+            let decoder = DecoderBuilder::new()
+                .with_schema(schema)
+                .with_score_threshold(0.5)
+                .with_iou_threshold(0.5)
+                .build()
+                .unwrap();
+            assert!(decoder.decode_program.is_some());
+
+            // Three anchors, xywh normalized ~[0, 1].
+            // xy chan 0 = x-centres, chan 1 = y-centres.
+            // Anchor 0: center (0.4, 0.4), size (0.2, 0.2) — valid box
+            // Anchor 1: zero — will be filtered
+            // Anchor 2: zero — will be filtered
+            //
+            // xy quant scale 1e-3 → 400 * 1e-3 = 0.4
+            let xy = make_i16(
+                &[1, 2, 3],
+                &[
+                    400, 0, 0, // xc per anchor
+                    400, 0, 0, // yc per anchor
+                ],
+            );
+            let wh = make_i16(
+                &[1, 2, 3],
+                &[
+                    200, 0, 0, // w per anchor
+                    200, 0, 0, // h per anchor
+                ],
+            );
+            // Scores: class 0 for anchor 0 is 125 * 0.008 = 1.0 (high).
+            let scores = make_i8(
+                &[1, 2, 3],
+                &[
+                    125, 0, 0, // class 0 per anchor
+                    0, 0, 0, // class 1 per anchor
+                ],
+            );
+
+            let inputs: Vec<&edgefirst_tensor::TensorDyn> = vec![&xy, &wh, &scores];
+
+            // Verify merged tensors first (split from decode so we can
+            // isolate merge correctness from kernel correctness).
+            let prog = decoder.decode_program.as_ref().unwrap();
+            let merged = prog.execute(&inputs).unwrap();
+            assert_eq!(merged.len(), 2);
+            let merged_boxes = &merged[0];
+            let merged_scores = &merged[1];
+            assert_eq!(merged_boxes.shape(), &[1, 4, 3]);
+            assert_eq!(merged_scores.shape(), &[1, 2, 3]);
+            // Anchor 0, channel 0: xc = 0.4
+            assert!(
+                (merged_boxes[[0, 0, 0]] - 0.4).abs() < 1e-3,
+                "xc[0] = {}",
+                merged_boxes[[0, 0, 0]]
+            );
+            assert!(
+                (merged_scores[[0, 0, 0]] - 1.0).abs() < 1e-2,
+                "score[0][0] = {}",
+                merged_scores[[0, 0, 0]]
+            );
+
+            // NOTE: impl_yolo_split_float caps output to the caller's
+            // vector capacity; a zero-capacity vec drops all boxes.
+            let mut boxes = Vec::with_capacity(16);
+            let mut masks = Vec::with_capacity(0);
+            decoder
+                .decode(&inputs, &mut boxes, &mut masks)
+                .expect("decode failed");
+            assert_eq!(boxes.len(), 1, "expected exactly one surviving anchor");
+            let b = &boxes[0];
+            // label 0, score ~1.0
+            assert_eq!(b.label, 0);
+            assert!(b.score > 0.9, "score {:?} should be near 1.0", b.score);
+            // xywh(0.4, 0.4, 0.2, 0.2) → xyxy(0.3, 0.3, 0.5, 0.5)
+            assert!(
+                (b.bbox.xmin - 0.3).abs() < 1e-3 && (b.bbox.xmax - 0.5).abs() < 1e-3,
+                "unexpected xmin/xmax: {:?}",
+                b
+            );
+        }
+
+        #[test]
+        fn with_schema_real_ara2_int8_dvm() {
+            let json = include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/ara2_int8_edgefirst.json"
+            ));
+            let schema = SchemaV2::parse_json(json).unwrap();
+            schema.validate().unwrap();
+            let decoder = DecoderBuilder::new()
+                .with_schema(schema)
+                .with_score_threshold(0.25)
+                .build()
+                .expect("ARA-2 int8 DVM should build");
+            // ARA-2 has a split boxes logical, so a merge program must be
+            // attached.
+            assert!(
+                decoder.decode_program.is_some(),
+                "ARA-2 int8 DVM should produce a DecodeProgram (split boxes)"
+            );
+            assert_eq!(decoder.normalized_boxes(), Some(true));
+            assert_eq!(decoder.nms, Some(crate::configs::Nms::ClassAgnostic));
+        }
+
+        /// Smoke test: build an ARA-2 decoder from the real DVM metadata
+        /// and run `decode` against zero-filled synthetic tensors. The
+        /// test verifies the whole pipeline (parse → validate → plan →
+        /// dequant → merge → dispatch → NMS) executes without panicking,
+        /// which shakes out shape/layout/merge bugs that would otherwise
+        /// only surface on real hardware.
+        #[test]
+        fn with_schema_real_ara2_int8_dvm_decode_smoke() {
+            use edgefirst_tensor::{Tensor, TensorDyn, TensorMemory, TensorTrait};
+            let json = include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/ara2_int8_edgefirst.json"
+            ));
+            let schema = SchemaV2::parse_json(json).unwrap();
+            let decoder = DecoderBuilder::new()
+                .with_schema(schema)
+                .with_score_threshold(0.25)
+                .with_iou_threshold(0.5)
+                .build()
+                .unwrap();
+
+            fn zero_tensor_i8(shape: &[usize]) -> TensorDyn {
+                let t = Tensor::<i8>::new(shape, Some(TensorMemory::Mem), None).unwrap();
+                let _ = t.map().unwrap(); // default-zeroed
+                TensorDyn::I8(t)
+            }
+            fn zero_tensor_u8(shape: &[usize]) -> TensorDyn {
+                let t = Tensor::<u8>::new(shape, Some(TensorMemory::Mem), None).unwrap();
+                let _ = t.map().unwrap();
+                TensorDyn::U8(t)
+            }
+
+            // Shapes copied from the real edgefirst.json so binding by
+            // shape succeeds.
+            let xy = zero_tensor_i8(&[1, 2, 8400, 1]);
+            let wh = zero_tensor_i8(&[1, 2, 8400, 1]);
+            let scores = zero_tensor_u8(&[1, 80, 8400, 1]);
+            let mask_coefs = zero_tensor_i8(&[1, 32, 8400, 1]);
+            let protos = zero_tensor_i8(&[1, 32, 160, 160]);
+            let inputs: Vec<&TensorDyn> = vec![&xy, &wh, &scores, &mask_coefs, &protos];
+
+            let mut boxes = Vec::with_capacity(16);
+            let mut masks = Vec::with_capacity(16);
+            // All-zero quantized inputs produce near-zero dequantized
+            // scores (well under the 0.25 threshold), so the decoder
+            // should complete with no detections — but the pipeline
+            // itself must not panic.
+            decoder
+                .decode(&inputs, &mut boxes, &mut masks)
+                .expect("ARA-2 int8 decode on zero tensors");
+            assert_eq!(
+                boxes.len(),
+                0,
+                "zero-filled tensors should produce no detections above the 0.25 threshold"
+            );
+        }
+
+        #[test]
+        fn with_schema_real_ara2_int16_dvm() {
+            let json = include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/ara2_int16_edgefirst.json"
+            ));
+            let schema = SchemaV2::parse_json(json).unwrap();
+            schema.validate().unwrap();
+            let decoder = DecoderBuilder::new()
+                .with_schema(schema)
+                .with_score_threshold(0.25)
+                .build()
+                .expect("ARA-2 int16 DVM should build");
+            assert!(
+                decoder.decode_program.is_some(),
+                "ARA-2 int16 DVM should produce a DecodeProgram (split boxes)"
+            );
+        }
+
+        #[test]
+        fn with_schema_split_creates_decode_program() {
+            // Channel sub-split boxes (ARA-2 style): logical boxes with
+            // two children of shapes [1,3,3] + [1,1,3] → logical [1,4,3].
+            // Scores remain flat with shape matching split detection
+            // convention.
+            let j = r#"{
+              "schema_version": 2,
+              "decoder_version": "yolov8",
+              "outputs": [
+                {"name": "boxes", "type": "boxes",
+                 "shape": [1, 4, 3],
+                 "dshape": [{"batch":1},{"box_coords":4},{"num_boxes":3}],
+                 "decoder": "ultralytics", "encoding": "direct", "normalized": true,
+                 "outputs": [
+                   {"name": "xy", "type": "boxes_xy",
+                    "shape": [1, 3, 3],
+                    "dshape": [{"batch":1},{"box_coords":3},{"num_boxes":3}],
+                    "dtype": "int16",
+                    "quantization": {"scale": 3.1e-5, "zero_point": 0, "dtype": "int16"}},
+                   {"name": "wh", "type": "boxes_wh",
+                    "shape": [1, 1, 3],
+                    "dshape": [{"batch":1},{"box_coords":1},{"num_boxes":3}],
+                    "dtype": "int16",
+                    "quantization": {"scale": 3.2e-5, "zero_point": 0, "dtype": "int16"}}
+                 ]},
+                {"name": "scores", "type": "scores",
+                 "shape": [1, 2, 3],
+                 "dshape": [{"batch":1},{"num_classes":2},{"num_boxes":3}],
+                 "dtype": "int8",
+                 "quantization": {"scale": 0.00392, "zero_point": 0, "dtype": "int8"},
+                 "decoder": "ultralytics", "score_format": "per_class"}
+              ]
+            }"#;
+            let schema = SchemaV2::parse_json(j).unwrap();
+            let decoder = DecoderBuilder::new().with_schema(schema).build().unwrap();
+            assert!(
+                decoder.decode_program.is_some(),
+                "split schema should produce a DecodeProgram"
+            );
+        }
+
+        // =====================================================================
+        // `with_config_json_str` v2 auto-detect tests (the path used by the
+        // Python `Decoder.new_from_json_str` static constructor).
+        // =====================================================================
+
+        #[test]
+        fn json_str_v2_ara2_int16_builds() {
+            // Real ARA-2 int16 metadata fed through the JSON-string path
+            // must produce the same merge program the schema path
+            // produces. This is the validator's target API: pass the raw
+            // edgefirst.json string, get a decoder that handles the
+            // xy/wh sub-split natively.
+            let json = include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/ara2_int16_edgefirst.json"
+            ));
+            let decoder = DecoderBuilder::new()
+                .with_config_json_str(json.to_string())
+                .with_score_threshold(0.25)
+                .build()
+                .expect("ARA-2 int16 v2 JSON should build via with_config_json_str");
+            assert!(
+                decoder.decode_program.is_some(),
+                "split boxes must produce a DecodeProgram"
+            );
+            assert_eq!(decoder.normalized_boxes(), Some(true));
+        }
+
+        #[test]
+        fn json_str_v2_ara2_int8_builds() {
+            let json = include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/ara2_int8_edgefirst.json"
+            ));
+            let decoder = DecoderBuilder::new()
+                .with_config_json_str(json.to_string())
+                .with_score_threshold(0.25)
+                .build()
+                .expect("ARA-2 int8 v2 JSON should build via with_config_json_str");
+            assert!(decoder.decode_program.is_some());
+        }
+
+        #[test]
+        fn json_str_v1_legacy_still_builds() {
+            // Legacy v1 JSON must continue to build via the same path
+            // (the auto-detect must not regress v1 callers).
+            let json = include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/modelpack_split.json"
+            ));
+            let decoder = DecoderBuilder::new()
+                .with_config_json_str(json.to_string())
+                .build()
+                .expect("legacy v1 JSON must still build");
+            assert!(
+                decoder.decode_program.is_none(),
+                "v1 JSON should not produce a DecodeProgram"
+            );
+        }
+
+        #[test]
+        fn json_str_v2_future_version_rejected() {
+            // schema_version above MAX_SUPPORTED_SCHEMA_VERSION must
+            // surface as DecoderError::NotSupported rather than a serde
+            // error, so callers get a useful upgrade message.
+            let json = r#"{"schema_version": 99, "outputs": []}"#;
+            let err = DecoderBuilder::new()
+                .with_config_json_str(json.to_string())
+                .build()
+                .expect_err("future schema_version must be rejected");
+            assert!(
+                matches!(err, DecoderError::NotSupported(_)),
+                "expected NotSupported, got {err:?}"
+            );
+        }
     }
 }

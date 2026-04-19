@@ -73,6 +73,7 @@ pub mod byte;
 pub mod error;
 pub mod float;
 pub mod modelpack;
+pub mod schema;
 pub mod yolo;
 
 mod decoder;
