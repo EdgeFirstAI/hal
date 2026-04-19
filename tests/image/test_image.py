@@ -515,17 +515,22 @@ def test_from_numpy_grey_unaligned_width_stride_bug(width, height):
     src = np.arange(width * height, dtype=np.uint8).reshape(height, width)
     img.from_numpy(src)
 
-    # Round-trip verification: pull the raw buffer back and reshape
-    # using the queried stride. Each row's first `width` bytes must
-    # match the source; the trailing `stride - width` bytes are
-    # padding and may contain anything.
+    # Round-trip verification: pull the raw buffer back as a zero-copy
+    # numpy view and reshape using the queried stride. Each row's
+    # first `width` bytes must match the source; the trailing
+    # `stride - width` bytes are padding and may contain anything.
+    # The view aliases HAL's mapped DMA buffer, so every read — and
+    # every pytest assertion message generated from that read — must
+    # stay inside the `with` block; once __exit__ unmaps the buffer,
+    # touching the view (even via saferepr on failure) dangles.
     with img.map() as m:
         raw = np.frombuffer(m.view(), dtype=np.uint8)
-    assert len(raw) == rs * height, (
-        f"backing buffer size {len(raw)} != row_stride*height {rs * height}"
-    )
-    rows = raw.reshape(height, rs)[:, :width]
-    assert np.array_equal(rows, src), (
-        f"round-trip mismatch for width={width}, stride={rs}: "
-        f"first-row mismatched bytes = {(rows[0] != src[0]).sum()}"
-    )
+        assert len(raw) == rs * height, (
+            f"backing buffer size {len(raw)} != row_stride*height {rs * height}"
+        )
+        rows = raw.reshape(height, rs)[:, :width]
+        mismatches = int((rows != src).sum())
+        assert mismatches == 0, (
+            f"round-trip mismatch for width={width}, stride={rs}: "
+            f"{mismatches} byte(s) differ"
+        )

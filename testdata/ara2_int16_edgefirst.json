@@ -4,12 +4,6 @@
   "name": "yolov8n-seg-latest",
   "description": "YOLOv8n Segmentation with COCO",
   "author": "AuZone Technologies Inc",
-  "host": {
-    "studio_server": "test.edgefirst.studio",
-    "project_id": "",
-    "session": "t-264d",
-    "username": "sebastien"
-  },
   "dataset": {
     "name": "",
     "id": "ds-2bcd",

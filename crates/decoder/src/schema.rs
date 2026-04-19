@@ -675,23 +675,27 @@ impl SchemaV2 {
 
 impl SchemaV2 {
     /// Downconvert a v2 schema to a legacy [`ConfigOutputs`] for the
-    /// subset of v2 features that the existing v1 decoder understands.
+    /// v1 decoder dispatch path.
     ///
-    /// The flat subset maps 1:1:
-    /// - [`LogicalOutput`] with no children → one [`ConfigOutput`]
-    ///   variant selected by [`LogicalType`].
-    /// - Per-tensor scalar quantization → `QuantTuple(scale, zp)`.
-    /// - `decoder`, `anchors`, `normalized` copied verbatim.
+    /// Each [`LogicalOutput`] maps to one [`ConfigOutput`] variant
+    /// selected by [`LogicalType`]; per-tensor scalar quantization
+    /// becomes a `QuantTuple(scale, zp)`; and `decoder`, `anchors`,
+    /// `normalized` are copied verbatim.
+    ///
+    /// This conversion does **not** reject logical outputs that also
+    /// declare physical children (per-scale FPN splits, or channel
+    /// sub-splits such as ARA-2 `boxes_xy` / `boxes_wh`). The returned
+    /// legacy config captures the logical-level metadata, while the
+    /// physical-to-logical merge is handled separately by the
+    /// [`DecodeProgram`](crate::decoder::merge::DecodeProgram) that
+    /// [`DecoderBuilder::build`](crate::decoder::builder::DecoderBuilder::build)
+    /// compiles alongside this legacy config.
     ///
     /// Returns [`DecoderError::NotSupported`] when the schema uses
-    /// features the v1 decoder cannot express:
-    /// - Physical children (per-scale or channel sub-splits) — require
-    ///   the native v2 merge path.
-    /// - Per-channel quantization arrays.
-    /// - Explicit `activation_applied` / `activation_required` on
-    ///   children (not relevant in flat case; only errors for splits).
-    /// - `encoding: dfl` on a flat logical (the v1 decoder does not
-    ///   include a DFL kernel).
+    /// features the v1 decoder cannot express at the logical level:
+    /// - Per-channel quantization arrays on a logical output.
+    /// - `encoding: dfl` on a flat logical output (no physical
+    ///   children) — the HAL does not yet include a DFL decode kernel.
     pub fn to_legacy_config_outputs(&self) -> DecoderResult<ConfigOutputs> {
         let mut outputs = Vec::with_capacity(self.outputs.len());
         for logical in &self.outputs {
