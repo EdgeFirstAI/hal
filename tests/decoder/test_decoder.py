@@ -79,6 +79,34 @@ def test_from_yaml():
     assert len(masks) == 0
 
 
+def test_from_json_v2_ara2_int8():
+    # Schema v2 metadata for an ARA-2 YOLOv8-seg model. The boxes
+    # logical splits into xy + wh physical children with independent
+    # int8 quantization, so the HAL must compile a DecodeProgram and
+    # merge them at decode time. Zero-filled tensors dequantize to
+    # near-zero scores (well under 0.25) so the smoke test asserts
+    # the full parse → validate → plan → dequant → merge → dispatch
+    # pipeline runs without panicking and yields no detections.
+    with open("testdata/ara2_int8_edgefirst.json") as f:
+        config = f.read()
+
+    decoder = edgefirst_hal.Decoder.new_from_json_str(config, 0.25, 0.5)
+
+    xy = numpy_to_tensor(np.zeros((1, 2, 8400, 1), dtype=np.int8))
+    wh = numpy_to_tensor(np.zeros((1, 2, 8400, 1), dtype=np.int8))
+    scores = numpy_to_tensor(np.zeros((1, 80, 8400, 1), dtype=np.uint8))
+    mask_coefs = numpy_to_tensor(np.zeros((1, 32, 8400, 1), dtype=np.int8))
+    protos = numpy_to_tensor(np.zeros((1, 32, 160, 160), dtype=np.int8))
+
+    boxes, scores_out, classes, masks = decoder.decode(
+        [xy, wh, scores, mask_coefs, protos]
+    )
+    assert len(boxes) == 0
+    assert len(scores_out) == 0
+    assert len(classes) == 0
+    assert len(masks) == 0
+
+
 def test_from_dict_json():
     import json
 

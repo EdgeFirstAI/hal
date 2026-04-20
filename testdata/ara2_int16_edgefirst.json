@@ -1,0 +1,352 @@
+{
+  "schema_version": 2,
+  "decoder_version": "yolov8",
+  "name": "yolov8n-seg-latest",
+  "description": "YOLOv8n Segmentation with COCO",
+  "author": "AuZone Technologies Inc",
+  "dataset": {
+    "name": "",
+    "id": "ds-2bcd",
+    "classes": [
+      "person",
+      "bicycle",
+      "car",
+      "motorcycle",
+      "airplane",
+      "bus",
+      "train",
+      "truck",
+      "boat",
+      "traffic light",
+      "fire hydrant",
+      "stop sign",
+      "parking meter",
+      "bench",
+      "bird",
+      "cat",
+      "dog",
+      "horse",
+      "sheep",
+      "cow",
+      "elephant",
+      "bear",
+      "zebra",
+      "giraffe",
+      "backpack",
+      "umbrella",
+      "handbag",
+      "tie",
+      "suitcase",
+      "frisbee",
+      "skis",
+      "snowboard",
+      "sports ball",
+      "kite",
+      "baseball bat",
+      "baseball glove",
+      "skateboard",
+      "surfboard",
+      "tennis racket",
+      "bottle",
+      "wine glass",
+      "cup",
+      "fork",
+      "knife",
+      "spoon",
+      "bowl",
+      "banana",
+      "apple",
+      "sandwich",
+      "orange",
+      "broccoli",
+      "carrot",
+      "hot dog",
+      "pizza",
+      "donut",
+      "cake",
+      "chair",
+      "couch",
+      "potted plant",
+      "bed",
+      "dining table",
+      "toilet",
+      "tv",
+      "laptop",
+      "mouse",
+      "remote",
+      "keyboard",
+      "cell phone",
+      "microwave",
+      "oven",
+      "toaster",
+      "sink",
+      "refrigerator",
+      "book",
+      "clock",
+      "vase",
+      "scissors",
+      "teddy bear",
+      "hair drier",
+      "toothbrush"
+    ]
+  },
+  "input": {
+    "shape": [
+      1,
+      3,
+      640,
+      640
+    ],
+    "cameraadaptor": "rgb",
+    "input_channels": 3,
+    "output_channels": 3
+  },
+  "model": {
+    "name": "yolov8n-seg-latest-t-264d",
+    "version": "8.4.9+edgefirst-1.7.0",
+    "task": "segmentation",
+    "size": "nano",
+    "detection": false,
+    "segmentation": true,
+    "anchors": null,
+    "end2end": false
+  },
+  "validation": {
+    "iou": 0.7,
+    "score": 0.001,
+    "nms": "numpy",
+    "preprocessing": "letterbox",
+    "normalization": "unsigned"
+  },
+  "nms": "class_agnostic",
+  "calibration": "calibration-ds-2bcd-546a1b7e.safetensors",
+  "outputs": [
+    {
+      "name": "boxes",
+      "type": "boxes",
+      "shape": [
+        1,
+        4,
+        8400,
+        1
+      ],
+      "dshape": [
+        {
+          "batch": 1
+        },
+        {
+          "box_coords": 4
+        },
+        {
+          "num_boxes": 8400
+        },
+        {
+          "padding": 1
+        }
+      ],
+      "encoding": "direct",
+      "decoder": "ultralytics",
+      "normalized": true,
+      "outputs": [
+        {
+          "name": "_model_22_Div_1_output_0",
+          "type": "boxes_xy",
+          "shape": [
+            1,
+            2,
+            8400,
+            1
+          ],
+          "dshape": [
+            {
+              "batch": 1
+            },
+            {
+              "box_coords": 2
+            },
+            {
+              "num_boxes": 8400
+            },
+            {
+              "padding": 1
+            }
+          ],
+          "dtype": "int16",
+          "quantization": {
+            "scale": 3.211570583516732e-05,
+            "zero_point": 0,
+            "dtype": "int16"
+          }
+        },
+        {
+          "name": "_model_22_Sub_1_output_0",
+          "type": "boxes_wh",
+          "shape": [
+            1,
+            2,
+            8400,
+            1
+          ],
+          "dshape": [
+            {
+              "batch": 1
+            },
+            {
+              "box_coords": 2
+            },
+            {
+              "num_boxes": 8400
+            },
+            {
+              "padding": 1
+            }
+          ],
+          "dtype": "int16",
+          "quantization": {
+            "scale": 3.10288232867606e-05,
+            "zero_point": 0,
+            "dtype": "int16"
+          }
+        }
+      ]
+    },
+    {
+      "name": "_model_22_Sigmoid_output_0",
+      "shape": [
+        1,
+        80,
+        8400,
+        1
+      ],
+      "dtype": "uint8",
+      "type": "scores",
+      "quantization": {
+        "scale": 0.00390625,
+        "zero_point": 0,
+        "dtype": "uint8"
+      },
+      "dshape": [
+        {
+          "batch": 1
+        },
+        {
+          "num_classes": 80
+        },
+        {
+          "num_boxes": 8400
+        },
+        {
+          "padding": 1
+        }
+      ],
+      "decoder": "ultralytics",
+      "score_format": "per_class"
+    },
+    {
+      "name": "_model_22_Concat_2_output_0",
+      "shape": [
+        1,
+        32,
+        8400,
+        1
+      ],
+      "dtype": "int16",
+      "type": "mask_coefs",
+      "quantization": {
+        "scale": 0.00012486109335441142,
+        "zero_point": 0,
+        "dtype": "int16"
+      },
+      "dshape": [
+        {
+          "batch": 1
+        },
+        {
+          "num_protos": 32
+        },
+        {
+          "num_boxes": 8400
+        },
+        {
+          "padding": 1
+        }
+      ],
+      "decoder": "ultralytics"
+    },
+    {
+      "name": "output1",
+      "shape": [
+        1,
+        32,
+        160,
+        160
+      ],
+      "dtype": "int8",
+      "type": "protos",
+      "quantization": {
+        "scale": 0.03084384649991989,
+        "zero_point": -118,
+        "dtype": "int8"
+      },
+      "dshape": [
+        {
+          "batch": 1
+        },
+        {
+          "num_protos": 32
+        },
+        {
+          "height": 160
+        },
+        {
+          "width": 160
+        }
+      ]
+    }
+  ],
+  "compilation": {
+    "target": "ara-2",
+    "format": "dvm",
+    "hw_metadata": {
+      "input_size": 1228800,
+      "num_cps": 2,
+      "num_dlps": 8,
+      "output_size": 2096384,
+      "range_cps": [
+        10,
+        11
+      ],
+      "range_dlps": [
+        2,
+        9
+      ],
+      "scratch_size": 67328
+    },
+    "ppa": {
+      "ips": 224.39520263671875,
+      "power_mw": 2583.657958984375,
+      "cycles": 4010781,
+      "ddr_bw_mbps": 2086.677490234375,
+      "ddr_total_footprint_mb": 12.748779296875,
+      "l2_peak_memory_bytes": 3848608
+    }
+  },
+  "ara2": {
+    "version": "1.2.4",
+    "timestamp": "2026-04-18T17:13:18.012334+00:00",
+    "qmode": 9,
+    "target": "ara-2",
+    "ppa": {
+      "ips": 224.39520263671875,
+      "power_mw": 2583.657958984375,
+      "cycles": 4010781,
+      "ddr_bw_mbps": 2086.677490234375,
+      "ddr_total_footprint_mb": 12.748779296875,
+      "l2_peak_memory_bytes": 3848608
+    },
+    "int16_mode": "smart",
+    "splits_applied": [
+      "quantization_split"
+    ]
+  }
+}
