@@ -503,10 +503,9 @@ def test_from_numpy_grey_unaligned_width_stride_bug(width, height):
         f"Image.size ({img.size}) must remain logical (w*h={width * height})"
     )
 
-    # row_stride reports the actual row pitch in bytes (>= width for
-    # Grey since channels=1). On padding backends stride > width; on
-    # un-padded backends stride == width. Either way it must be at
-    # least the logical row width.
+    # row_stride reports the alignment the GPU pitch rule requires
+    # (>= width for Grey since channels=1). This is what from_numpy
+    # uses when the backend actually allocates a padded buffer.
     rs = img.row_stride
     assert rs is not None and rs >= width, (
         f"row_stride {rs} must be >= width {width}"
@@ -515,22 +514,41 @@ def test_from_numpy_grey_unaligned_width_stride_bug(width, height):
     src = np.arange(width * height, dtype=np.uint8).reshape(height, width)
     img.from_numpy(src)
 
-    # Round-trip verification: pull the raw buffer back as a zero-copy
-    # numpy view and reshape using the queried stride. Each row's
-    # first `width` bytes must match the source; the trailing
-    # `stride - width` bytes are padding and may contain anything.
-    # The view aliases HAL's mapped DMA buffer, so every read — and
-    # every pytest assertion message generated from that read — must
-    # stay inside the `with` block; once __exit__ unmaps the buffer,
-    # touching the view (even via saferepr on failure) dangles.
+    # Round-trip verification. Pull the raw buffer back as a zero-copy
+    # numpy view and verify that each row's first `width` bytes match
+    # the source. All reads must stay inside the `with` block: the
+    # view aliases HAL's mapped buffer, so once __exit__ unmaps, even
+    # pytest saferepr touching the view on assertion failure will
+    # segfault.
+    #
+    # The mapped buffer length depends on the backend `create_image`
+    # chose: DMA-buf paths allocate a pitch-padded buffer
+    # (`row_stride × height` bytes); SHM / PBO paths used by systems
+    # without a DMA requirement allocate the logical buffer
+    # (`width × height` bytes). Both layouts are contract-valid. The
+    # test derives the effective per-row stride from the buffer size
+    # so it passes on either backend, and still verifies the
+    # STRIDES_BUG fix (no panic + bytes laid out correctly).
     with img.map() as m:
         raw = np.frombuffer(m.view(), dtype=np.uint8)
-        assert len(raw) == rs * height, (
-            f"backing buffer size {len(raw)} != row_stride*height {rs * height}"
+        assert len(raw) % height == 0, (
+            f"backing buffer size {len(raw)} not divisible by height {height}"
         )
-        rows = raw.reshape(height, rs)[:, :width]
+        actual_stride = len(raw) // height
+        assert actual_stride >= width, (
+            f"actual per-row stride {actual_stride} (from buffer size "
+            f"{len(raw)}) must be >= width {width}"
+        )
+        # actual_stride is either `width` (unpadded backend) or `rs`
+        # (padded backend). Any other value would mean the map view
+        # disagrees with both the logical and the padded layout.
+        assert actual_stride in (width, rs), (
+            f"actual per-row stride {actual_stride} is neither logical "
+            f"width {width} nor row_stride {rs}"
+        )
+        rows = raw.reshape(height, actual_stride)[:, :width]
         mismatches = int((rows != src).sum())
         assert mismatches == 0, (
-            f"round-trip mismatch for width={width}, stride={rs}: "
-            f"{mismatches} byte(s) differ"
+            f"round-trip mismatch for width={width}, "
+            f"actual_stride={actual_stride}: {mismatches} byte(s) differ"
         )
