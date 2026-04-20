@@ -11,7 +11,7 @@ pub mod configs;
 
 use configs::ModelType;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Decoder {
     model_type: ModelType,
     pub iou_threshold: f32,
@@ -25,6 +25,24 @@ pub struct Decoder {
     /// - `None`: Unknown, caller must infer (e.g., check if any coordinate >
     ///   1.0)
     normalized: Option<bool>,
+    /// Schema v2 merge program. Present when the decoder was built from
+    /// a [`crate::schema::SchemaV2`] whose logical outputs carry
+    /// physical children. Absent for flat configurations (v1 and
+    /// flat-v2).
+    pub(crate) decode_program: Option<merge::DecodeProgram>,
+}
+
+impl PartialEq for Decoder {
+    fn eq(&self, other: &Self) -> bool {
+        // DecodeProgram has non-comparable embedded data; compare by
+        // the config-derived fields only.
+        self.model_type == other.model_type
+            && self.iou_threshold == other.iou_threshold
+            && self.score_threshold == other.score_threshold
+            && self.nms == other.nms
+            && self.normalized == other.normalized
+            && self.decode_program.is_some() == other.decode_program.is_some()
+    }
 }
 
 #[derive(Debug)]
@@ -144,6 +162,7 @@ macro_rules! with_quantized {
 
 mod builder;
 mod helpers;
+mod merge;
 mod postprocess;
 mod tensor_bridge;
 mod tests;
@@ -723,6 +742,14 @@ impl Decoder {
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
     ) -> Result<(), DecoderError> {
+        // Schema v2 merge path: dequantize physical children into
+        // logical float32 tensors, then feed through the float dispatch.
+        if let Some(program) = &self.decode_program {
+            let merged = program.execute(outputs)?;
+            let views: Vec<_> = merged.iter().map(|a| a.view()).collect();
+            return self.decode_float(&views, output_boxes, output_masks);
+        }
+
         let mapped = tensor_bridge::map_tensors(outputs)?;
         match &mapped {
             tensor_bridge::MappedOutputs::Quantized(maps) => {

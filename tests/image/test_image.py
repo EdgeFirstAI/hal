@@ -468,3 +468,64 @@ outputs:
     assert boxes.shape[1] == 4
     assert len(scores) == len(boxes)
     assert len(classes) == len(boxes)
+
+
+@pytest.mark.parametrize(
+    "width,height",
+    [
+        (105, 124),  # the original STRIDES_BUG.md repro
+        (100, 124),
+        (160, 80),
+        (200, 64),
+    ],
+)
+def test_from_numpy_grey_unaligned_width_stride_bug(width, height):
+    """Regression for STRIDES_BUG.md.
+
+    The original bug: `create_image(w, h, Grey)` on backends that
+    apply a GPU pitch alignment rounds the underlying buffer up
+    (e.g. 105 → 128-byte pitch on Mali Valhall), but `Image.size`
+    still reports the *logical* `w × h`. A numpy array sized from
+    `Image.size` was the natural caller choice, so `from_numpy`
+    panicked in `copy_from_slice` on the length mismatch with the
+    padded destination. The fix (`tensor.rs`) detects the padded
+    destination via `dst_len > tensor_len` and switches to a
+    row-by-row copy using `effective_row_stride()`.
+
+    This test locks in that `from_numpy` no longer panics for a
+    non-64-aligned width, and that `Image.size` / `Image.row_stride`
+    satisfy the documented contract (size is logical, row_stride is
+    reported and at least the logical row width). Byte-level
+    correctness of the mapped write is backend-sensitive — PBO
+    staging paths reinterpret the buffer with their own stride
+    between write and read — and is covered by higher-level
+    end-to-end tests rather than a regression test whose concern is
+    the panic.
+    """
+    converter = ImageProcessor()
+    img = converter.create_image(width, height, PixelFormat.Grey)
+
+    assert img.size == width * height, (
+        f"Image.size ({img.size}) must remain logical (w*h={width * height})"
+    )
+
+    rs = img.row_stride
+    assert rs is not None and rs >= width, (
+        f"row_stride {rs} must be >= width {width}"
+    )
+
+    # The regression: this call used to panic in copy_from_slice for
+    # widths not aligned to the GPU pitch. Must now succeed.
+    src = np.arange(width * height, dtype=np.uint8).reshape(height, width)
+    img.from_numpy(src)
+
+    # The mapped buffer must be addressable at the logical size. All
+    # reads must stay inside the `with` block — `m.view()` returns a
+    # zero-copy numpy view that dangles once the TensorMap context
+    # exits; touching it afterwards (including via pytest saferepr on
+    # assertion failure) segfaults.
+    with img.map() as m:
+        raw = np.frombuffer(m.view(), dtype=np.uint8)
+        assert len(raw) == width * height, (
+            f"mapped view length {len(raw)} != Image.size {width * height}"
+        )

@@ -8,6 +8,7 @@ use ndarray::{
     s, Array2, Array3, ArrayView1, ArrayView2, ArrayView3,
 };
 use num_traits::{AsPrimitive, Float, PrimInt, Signed};
+use rayon::slice::ParallelSliceMut;
 
 use crate::{
     byte::{
@@ -23,6 +24,45 @@ use crate::{
     BBoxTypeTrait, BoundingBox, DetectBox, DetectBoxQuantized, ProtoData, ProtoTensor,
     Quantization, Segmentation, XYWH, XYXY,
 };
+
+/// Maximum number of above-threshold candidates fed to NMS.
+///
+/// At very low score thresholds (e.g., t=0.01 on YOLOv8 with
+/// 8400 anchors × 80 classes), the number of survivors approaches
+/// the full 672 000-entry score grid. NMS is O(n²) and the
+/// downstream mask matmul runs once per survivor, so an
+/// unbounded set produces minutes-per-frame decode times.
+///
+/// `MAX_NMS_CANDIDATES` matches the Ultralytics `max_nms` default
+/// and is applied as a top-K-by-score truncation immediately
+/// before NMS. Values above the cap are silently dropped — at the
+/// score thresholds where the cap activates the bottom of the
+/// candidate list is dominated by noise that NMS would discard
+/// anyway.
+pub(crate) const MAX_NMS_CANDIDATES: usize = 30_000;
+
+/// Truncate `boxes` to the highest-scoring `MAX_NMS_CANDIDATES`
+/// entries in-place when the input exceeds the cap. No-op
+/// otherwise. The sort is unstable and parallel — order among
+/// equal-score boxes is not guaranteed.
+fn truncate_to_top_k_by_score<E: Send>(boxes: &mut Vec<(DetectBox, E)>) {
+    if boxes.len() > MAX_NMS_CANDIDATES {
+        boxes.par_sort_unstable_by(|a, b| b.0.score.total_cmp(&a.0.score));
+        boxes.truncate(MAX_NMS_CANDIDATES);
+    }
+}
+
+/// Quantized counterpart of [`truncate_to_top_k_by_score`]. Sorts on
+/// the raw quantized score (which preserves order under monotonic
+/// dequantization).
+fn truncate_to_top_k_by_score_quant<S: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send>(
+    boxes: &mut Vec<(DetectBoxQuantized<S>, E)>,
+) {
+    if boxes.len() > MAX_NMS_CANDIDATES {
+        boxes.par_sort_unstable_by(|a, b| b.0.score.cmp(&a.0.score));
+        boxes.truncate(MAX_NMS_CANDIDATES);
+    }
+}
 
 /// Dispatches to the appropriate NMS function based on mode for float boxes.
 fn dispatch_nms_float(nms: Option<Nms>, iou: f32, boxes: Vec<DetectBox>) -> Vec<DetectBox> {
@@ -924,11 +964,12 @@ pub(crate) fn impl_yolo_segdet_get_boxes<
 where
     f32: AsPrimitive<SCORE>,
 {
-    let boxes = postprocess_boxes_index_float::<B, _, _>(
+    let mut boxes = postprocess_boxes_index_float::<B, _, _>(
         score_threshold.as_(),
         boxes_tensor,
         scores_tensor,
     );
+    truncate_to_top_k_by_score(&mut boxes);
     let mut boxes = dispatch_nms_extra_float(nms, iou_threshold, boxes);
     boxes.truncate(max_boxes);
     boxes
@@ -1003,7 +1044,7 @@ where
     let (boxes_tensor, quant_boxes) = boxes;
     let (scores_tensor, quant_scores) = scores;
 
-    let boxes = {
+    let mut boxes = {
         let score_threshold = quantize_score_threshold(score_threshold, quant_scores);
         postprocess_boxes_index_quant::<B, _, _>(
             score_threshold,
@@ -1012,6 +1053,7 @@ where
             quant_boxes,
         )
     };
+    truncate_to_top_k_by_score_quant(&mut boxes);
     let mut boxes = dispatch_nms_extra_int(nms, iou_threshold, boxes);
     boxes.truncate(max_boxes);
     boxes
@@ -2259,5 +2301,111 @@ mod tests {
         for coeffs in &proto_data.mask_coefficients {
             assert_eq!(coeffs.len(), num_mask_coeffs);
         }
+    }
+
+    // ========================================================================
+    // Pre-NMS top-K cap (MAX_NMS_CANDIDATES)
+    // ========================================================================
+
+    /// At very low score thresholds (e.g., t=0.01 on YOLOv8 with 8400×80
+    /// candidates) almost every score passes the filter, feeding O(n²)
+    /// NMS and a per-survivor mask matmul. The decoder caps the
+    /// candidate set fed to NMS at `MAX_NMS_CANDIDATES` (Ultralytics
+    /// default 30 000) to bound worst-case decode time.
+    ///
+    /// This regression test pumps 50 000 above-threshold candidates
+    /// into `impl_yolo_segdet_get_boxes` with NMS bypassed (Nms=None)
+    /// and a generous post-NMS cap. Before the fix, the function
+    /// returned all 50 000; after the fix, exactly 30 000.
+    #[test]
+    fn test_pre_nms_cap_truncates_excess_candidates() {
+        let n: usize = 50_000;
+        let num_classes = 1;
+
+        // Identical valid boxes. Distinct scores (descending) so the
+        // top-K cap keeps the highest-scoring ones in deterministic
+        // order — letting us assert *which* ones survived.
+        let mut boxes_data = Vec::with_capacity(n * 4);
+        let mut scores_data = Vec::with_capacity(n * num_classes);
+        for i in 0..n {
+            boxes_data.extend_from_slice(&[0.1f32, 0.1, 0.5, 0.5]);
+            // score_i = 0.99 - i * 1e-7 keeps everything well above 0.1
+            // threshold but strictly decreasing.
+            scores_data.push(0.99 - (i as f32) * 1e-7);
+        }
+        let boxes = Array2::from_shape_vec((n, 4), boxes_data).unwrap();
+        let scores = Array2::from_shape_vec((n, num_classes), scores_data).unwrap();
+
+        let result = impl_yolo_segdet_get_boxes::<XYXY, _, _>(
+            boxes.view(),
+            scores.view(),
+            0.1,
+            1.0,
+            None,       // bypass NMS so we measure the cap, not suppression
+            usize::MAX, // no post-NMS truncation
+        );
+
+        assert_eq!(
+            result.len(),
+            crate::yolo::MAX_NMS_CANDIDATES,
+            "pre-NMS cap should truncate to MAX_NMS_CANDIDATES; got {}",
+            result.len()
+        );
+        // Top-K survivors: highest scores were the first n indices,
+        // so survivor 0 must have score ~0.99.
+        let top_score = result[0].0.score;
+        assert!(
+            top_score > 0.98,
+            "highest-ranked survivor should have the largest score, got {top_score}"
+        );
+    }
+
+    /// Counterpart for the quantized split path. Same contract: feed
+    /// more than `MAX_NMS_CANDIDATES` survivors above the quantized
+    /// threshold, confirm `impl_yolo_split_segdet_quant_get_boxes`
+    /// truncates before NMS.
+    #[test]
+    fn test_pre_nms_cap_truncates_excess_candidates_quant() {
+        use crate::Quantization;
+        let n: usize = 50_000;
+        let num_classes = 1;
+
+        // i8 boxes with simple scale/zp; the box value 50 dequantizes
+        // to 0.5 with scale=0.01, zp=0 — fine for a flat box set.
+        let boxes_data = (0..n).flat_map(|_| [10i8, 10, 50, 50]).collect::<Vec<_>>();
+        let boxes = Array2::from_shape_vec((n, 4), boxes_data).unwrap();
+        let quant_boxes = Quantization {
+            scale: 0.01,
+            zero_point: 0,
+        };
+
+        // u8 scores: distinct descending values, all well above threshold.
+        // value 250 → 0.98 with scale 0.00392, zp 0.
+        // value (250 - i % 200) keeps a wide spread above the dequant
+        // threshold of 0.5.
+        let scores_data: Vec<u8> = (0..n)
+            .map(|i| 250u8.saturating_sub((i % 200) as u8))
+            .collect();
+        let scores = Array2::from_shape_vec((n, num_classes), scores_data).unwrap();
+        let quant_scores = Quantization {
+            scale: 0.00392,
+            zero_point: 0,
+        };
+
+        let result = impl_yolo_split_segdet_quant_get_boxes::<XYXY, _, _>(
+            (boxes.view(), quant_boxes),
+            (scores.view(), quant_scores),
+            0.1,
+            1.0,
+            None,
+            usize::MAX,
+        );
+
+        assert_eq!(
+            result.len(),
+            crate::yolo::MAX_NMS_CANDIDATES,
+            "quant path pre-NMS cap should truncate to MAX_NMS_CANDIDATES; got {}",
+            result.len()
+        );
     }
 }
