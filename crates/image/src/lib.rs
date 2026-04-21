@@ -371,6 +371,42 @@ impl ColorMode {
     }
 }
 
+/// Controls the resolution and coordinate frame of masks produced by
+/// [`ImageProcessor::materialize_masks`].
+///
+/// - [`Proto`](Self::Proto) returns per-detection tiles at proto-plane
+///   resolution (e.g. 48×32 u8 for a typical COCO bbox on a 160×160 proto
+///   plane). This is the historical behavior of `materialize_masks` and the
+///   fastest path because no upsample runs inside HAL. Mask values are
+///   continuous sigmoid output quantized to `uint8 [0, 255]`.
+/// - [`Scaled`](Self::Scaled) returns per-detection tiles at caller-specified
+///   pixel resolution by upsampling the full proto plane once and cropping by
+///   bbox after sigmoid. The upsample uses bilinear interpolation with
+///   edge-clamp sampling — semantically equivalent to Ultralytics'
+///   `process_masks_retina` reference. When a `letterbox` is also passed to
+///   [`materialize_masks`], the inverse letterbox transform is applied during
+///   the upsample so mask pixels land in original-content coordinates
+///   (drop-in for overlay on the original image). Mask values are binary
+///   `uint8 {0, 255}` after thresholding sigmoid > 0.5 — interchangeable
+///   with `Proto` output via the same `> 127` test.
+///
+/// [`materialize_masks`]: ImageProcessor::materialize_masks
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum MaskResolution {
+    /// Per-detection tile at proto-plane resolution (default).
+    #[default]
+    Proto,
+    /// Per-detection tile at `(width, height)` pixel resolution in the
+    /// coordinate frame determined by the `letterbox` parameter of
+    /// [`ImageProcessor::materialize_masks`].
+    Scaled {
+        /// Target pixel width of the output coordinate frame.
+        width: u32,
+        /// Target pixel height of the output coordinate frame.
+        height: u32,
+    },
+}
+
 /// Options for mask overlay rendering.
 ///
 /// Controls how segmentation masks are composited onto the destination image:
@@ -1603,9 +1639,15 @@ impl ImageProcessor {
         detect: &[DetectBox],
         proto_data: &ProtoData,
         letterbox: Option<[f32; 4]>,
+        resolution: MaskResolution,
     ) -> Result<Vec<Segmentation>> {
         let cpu = self.cpu.as_ref().ok_or(Error::NoConverter)?;
-        cpu.materialize_segmentations(detect, proto_data, letterbox)
+        match resolution {
+            MaskResolution::Proto => cpu.materialize_segmentations(detect, proto_data, letterbox),
+            MaskResolution::Scaled { width, height } => {
+                cpu.materialize_scaled_segmentations(detect, proto_data, letterbox, width, height)
+            }
+        }
     }
 }
 
