@@ -49,6 +49,7 @@ pub mod edgefirst_hal {
         m.add_class::<image::PyRotation>()?;
         m.add_class::<image::PyFlip>()?;
         m.add_class::<image::PyColorMode>()?;
+        m.add_class::<image::PyMaskResolution>()?;
         m.add_class::<image::PyImageProcessor>()?;
         m.add_class::<image::PyEglDisplayKind>()?;
         m.add_function(wrap_pyfunction!(image::align_width_for_gpu_pitch, m)?)?;

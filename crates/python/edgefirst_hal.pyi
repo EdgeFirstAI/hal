@@ -1016,6 +1016,36 @@ class ColorMode(enum.Enum):
     Track: ColorMode
     """Color chosen by track ID (use with object tracking)"""
 
+class MaskResolution:
+    """Controls the resolution and coordinate frame of masks produced by
+    :meth:`ImageProcessor.materialize_masks`.
+
+    Construct via classmethods:
+
+    - ``MaskResolution.Proto()`` — per-detection tiles at proto-plane
+      resolution (historical default). Mask values are continuous sigmoid
+      ``uint8 [0, 255]``.
+    - ``MaskResolution.Scaled(width, height)`` — per-detection tiles at
+      caller-specified pixel resolution, produced by upsampling the full
+      proto plane once (correct edge-clamp bilinear) and cropping by bbox
+      after sigmoid. Mask values are binary ``uint8 {0, 255}`` —
+      interchangeable with the continuous sigmoid output via the same
+      ``> 127`` test. If a ``letterbox`` is also passed to
+      ``materialize_masks``, ``(width, height)`` are interpreted as
+      original-content pixel dims and the inverse letterbox transform is
+      applied during the upsample.
+    """
+
+    @classmethod
+    def Proto(cls) -> "MaskResolution":
+        """Per-detection tile at proto-plane resolution (default)."""
+        ...
+
+    @classmethod
+    def Scaled(cls, width: int, height: int) -> "MaskResolution":
+        """Per-detection tile at ``(width, height)`` pixel resolution."""
+        ...
+
 class Flip(enum.Enum):
     NoFlip: Flip
     """No flip"""
@@ -1241,14 +1271,24 @@ class ImageProcessor:
         classes: npt.NDArray[np.uintp],
         proto_data: ProtoData,
         letterbox: Optional[Tuple[float, float, float, float]] = None,
+        resolution: Optional[MaskResolution] = None,
     ) -> List[npt.NDArray[np.uint8]]:
         """Materialize per-instance segmentation masks from prototype data.
 
         Computes ``mask_coeff @ protos`` with sigmoid activation for each
-        detection, producing compact masks at prototype resolution (e.g.,
-        160x160 crops). Mask values are **continuous sigmoid confidence**
-        quantized to uint8 (0 = background, 255 = full confidence), **not**
-        binary thresholded.
+        detection. The ``resolution`` parameter selects the output shape
+        and value encoding:
+
+        - ``MaskResolution.Proto()`` (default when ``resolution`` is
+          ``None``): returns per-detection tiles at proto-plane resolution
+          with **continuous sigmoid** values in ``uint8 [0, 255]``.
+        - ``MaskResolution.Scaled(width, height)``: returns per-detection
+          tiles at ``(width, height)`` pixel resolution with **binary**
+          ``uint8 {0, 255}`` values (sigmoid > 0.5 threshold). The upsample
+          happens on the full proto plane with edge-clamp bilinear
+          sampling — correct by construction, unlike per-tile resize.
+          Drop-in replacement for the continuous output under the caller's
+          ``> 127`` threshold.
 
         The returned masks can be inspected for analytics, IoU computation,
         or export, and also passed to :meth:`draw_decoded_masks` for
@@ -1267,10 +1307,16 @@ class ImageProcessor:
             classes: ``(N,)`` uintp array of class indices.
             proto_data: Prototype data from :meth:`Decoder.decode_proto`.
             letterbox: Optional ``(x0, y0, x1, y1)`` letterbox region in
-                normalized coordinates.
+                normalized model-input coordinates. When set with
+                ``MaskResolution.Scaled``, ``(width, height)`` are
+                interpreted as original-content pixel dims and the inverse
+                letterbox transform is applied during the upsample.
+            resolution: Output resolution and encoding. Defaults to
+                :meth:`MaskResolution.Proto` when ``None``.
 
         Returns:
-            List of ``(H, W, 1)`` uint8 arrays with continuous sigmoid values.
+            List of ``(H, W, 1)`` uint8 arrays. Shape and encoding depend
+            on ``resolution`` — see above.
         """
         ...
 
