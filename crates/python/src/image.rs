@@ -6,7 +6,9 @@ use crate::tensor::PyTensor;
 use crate::tracker::PyTrackInfo;
 use edgefirst_hal::{
     decoder::{BoundingBox, DetectBox, Segmentation},
-    image::{self, Crop, Flip, ImageProcessorConfig, ImageProcessorTrait, Rect, Rotation},
+    image::{
+        self, Crop, Flip, ImageProcessorConfig, ImageProcessorTrait, MaskResolution, Rect, Rotation,
+    },
     tensor::{self as tensor, PixelFormat, TensorDyn, TensorMapTrait, TensorTrait},
 };
 
@@ -1087,10 +1089,19 @@ impl PyImageProcessor {
     /// :param proto_data: prototype data from :meth:`Decoder.decode_proto`
     /// :param letterbox: optional letterbox region ``(x0, y0, x1, y1)`` in
     ///     normalized coordinates, or ``None`` if no letterboxing was applied
-    /// :returns: list of (H, W, 1) uint8 numpy arrays with continuous sigmoid
-    ///     mask values
+    /// :param resolution: optional mask materialization mode. When ``None`` or
+    ///     :class:`MaskResolution.Proto`, returns per-detection tiles at
+    ///     proto-plane resolution with continuous sigmoid mask values. When
+    ///     :class:`MaskResolution.Scaled` ``(width, height)``, HAL upsamples
+    ///     the full proto plane once and returns per-detection tiles at the
+    ///     target resolution with binary mask values encoded as
+    ///     ``uint8 {0, 255}``. The same ``> 127`` threshold works for both.
+    /// :returns: list of ``(H, W, 1)`` uint8 numpy arrays. Contents depend on
+    ///     ``resolution``: continuous sigmoid values for ``Proto``, binary
+    ///     ``{0, 255}`` for ``Scaled``.
     /// :rtype: list[numpy.ndarray]
-    #[pyo3(signature = (bbox, scores, classes, proto_data, letterbox=None))]
+    #[pyo3(signature = (bbox, scores, classes, proto_data, letterbox=None, resolution=None))]
+    #[allow(clippy::too_many_arguments)]
     pub fn materialize_masks<'py>(
         &self,
         bbox: PyReadonlyArray2<f32>,
@@ -1098,15 +1109,16 @@ impl PyImageProcessor {
         classes: PyReadonlyArray1<usize>,
         proto_data: &PyProtoData,
         letterbox: Option<[f32; 4]>,
+        resolution: Option<PyMaskResolution>,
         py: Python<'py>,
     ) -> Result<Vec<Bound<'py, numpy::PyArray3<u8>>>> {
         let detect = numpy_to_detect_boxes(&bbox, &scores, &classes)?;
-
+        let resolution = resolution.map(|r| r.0).unwrap_or(MaskResolution::Proto);
         let l = self
             .0
             .lock()
             .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
-        let masks = l.materialize_masks(&detect, &proto_data.0, letterbox)?;
+        let masks = l.materialize_masks(&detect, &proto_data.0, letterbox, resolution)?;
         Ok(convert_seg_mask(py, &masks))
     }
 
@@ -1431,6 +1443,54 @@ impl From<PyColorMode> for image::ColorMode {
             PyColorMode::Class => image::ColorMode::Class,
             PyColorMode::Instance => image::ColorMode::Instance,
             PyColorMode::Track => image::ColorMode::Track,
+        }
+    }
+}
+
+/// Controls the resolution and coordinate frame of masks produced by
+/// :meth:`ImageProcessor.materialize_masks`.
+///
+/// Construct via classmethods:
+///
+/// - ``MaskResolution.Proto()`` — per-detection tiles at proto-plane
+///   resolution (historical default). Mask values are continuous sigmoid
+///   ``uint8 [0, 255]``.
+/// - ``MaskResolution.Scaled(width, height)`` — per-detection tiles at
+///   caller-specified pixel resolution, produced by upsampling the full
+///   proto plane once (correct edge-clamp bilinear) and cropping by bbox
+///   after sigmoid. Mask values are binary ``uint8 {0, 255}`` —
+///   interchangeable with the continuous sigmoid output via the same
+///   ``> 127`` test. If a ``letterbox`` is also passed to
+///   ``materialize_masks``, ``(width, height)`` are interpreted as
+///   original-content pixel dims and the inverse letterbox transform is
+///   applied during the upsample.
+#[pyclass(name = "MaskResolution")]
+#[derive(Debug, Clone, Copy)]
+pub struct PyMaskResolution(pub(crate) MaskResolution);
+
+#[pymethods]
+impl PyMaskResolution {
+    /// Per-detection tile at proto-plane resolution (default).
+    #[classmethod]
+    #[allow(non_snake_case)]
+    fn Proto(_cls: &Bound<'_, pyo3::types::PyType>) -> Self {
+        Self(MaskResolution::Proto)
+    }
+
+    /// Per-detection tile at ``(width, height)`` pixel resolution.
+    #[classmethod]
+    #[allow(non_snake_case)]
+    #[pyo3(signature = (width, height))]
+    fn Scaled(_cls: &Bound<'_, pyo3::types::PyType>, width: u32, height: u32) -> Self {
+        Self(MaskResolution::Scaled { width, height })
+    }
+
+    fn __repr__(&self) -> String {
+        match self.0 {
+            MaskResolution::Proto => "MaskResolution.Proto()".into(),
+            MaskResolution::Scaled { width, height } => {
+                format!("MaskResolution.Scaled(width={width}, height={height})")
+            }
         }
     }
 }

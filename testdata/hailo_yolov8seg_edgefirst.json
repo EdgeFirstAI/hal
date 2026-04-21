@@ -1,0 +1,283 @@
+{
+  "schema_version": 2,
+  "decoder_version": "yolov8",
+  "name": "yolov8n-seg-hailo-reference",
+  "description": "Hailo-8/8L YOLOv8-seg schema v2 reference fixture (strides 8/16/32, DFL boxes, sigmoid-applied scores, NHWC protos). Mirrors HAILORT_DECODER.md §198-250.",
+  "author": "AuZone Technologies Inc",
+  "dataset": {
+    "name": "coco",
+    "id": "ds-hailo-ref",
+    "classes": [
+      "person", "bicycle", "car", "motorcycle", "airplane",
+      "bus", "train", "truck", "boat", "traffic light",
+      "fire hydrant", "stop sign", "parking meter", "bench", "bird",
+      "cat", "dog", "horse", "sheep", "cow",
+      "elephant", "bear", "zebra", "giraffe", "backpack",
+      "umbrella", "handbag", "tie", "suitcase", "frisbee",
+      "skis", "snowboard", "sports ball", "kite", "baseball bat",
+      "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle",
+      "wine glass", "cup", "fork", "knife", "spoon",
+      "bowl", "banana", "apple", "sandwich", "orange",
+      "broccoli", "carrot", "hot dog", "pizza", "donut",
+      "cake", "chair", "couch", "potted plant", "bed",
+      "dining table", "toilet", "tv", "laptop", "mouse",
+      "remote", "keyboard", "cell phone", "microwave", "oven",
+      "toaster", "sink", "refrigerator", "book", "clock",
+      "vase", "scissors", "teddy bear", "hair drier", "toothbrush"
+    ]
+  },
+  "input": {
+    "shape": [1, 3, 640, 640],
+    "cameraadaptor": "rgb",
+    "input_channels": 3,
+    "output_channels": 3
+  },
+  "model": {
+    "name": "yolov8n-seg-hailo-reference",
+    "version": "8.4.9+edgefirst-1.7.0",
+    "task": "segmentation",
+    "size": "nano",
+    "detection": false,
+    "segmentation": true,
+    "anchors": null,
+    "end2end": false
+  },
+  "nms": "class_agnostic",
+  "outputs": [
+    {
+      "name": "boxes",
+      "type": "boxes",
+      "shape": [1, 4, 8400],
+      "dshape": [
+        {"batch": 1},
+        {"box_coords": 4},
+        {"num_boxes": 8400}
+      ],
+      "encoding": "dfl",
+      "decoder": "ultralytics",
+      "normalized": false,
+      "outputs": [
+        {
+          "name": "boxes_stride_8",
+          "type": "boxes",
+          "stride": 8,
+          "scale_index": 0,
+          "shape": [1, 80, 80, 64],
+          "dshape": [
+            {"batch": 1},
+            {"height": 80},
+            {"width": 80},
+            {"num_features": 64}
+          ],
+          "dtype": "uint8",
+          "quantization": {
+            "scale": 0.13012499,
+            "zero_point": 70,
+            "dtype": "uint8"
+          }
+        },
+        {
+          "name": "boxes_stride_16",
+          "type": "boxes",
+          "stride": 16,
+          "scale_index": 1,
+          "shape": [1, 40, 40, 64],
+          "dshape": [
+            {"batch": 1},
+            {"height": 40},
+            {"width": 40},
+            {"num_features": 64}
+          ],
+          "dtype": "uint8",
+          "quantization": {
+            "scale": 0.11984375,
+            "zero_point": 60,
+            "dtype": "uint8"
+          }
+        },
+        {
+          "name": "boxes_stride_32",
+          "type": "boxes",
+          "stride": 32,
+          "scale_index": 2,
+          "shape": [1, 20, 20, 64],
+          "dshape": [
+            {"batch": 1},
+            {"height": 20},
+            {"width": 20},
+            {"num_features": 64}
+          ],
+          "dtype": "uint8",
+          "quantization": {
+            "scale": 0.10931250,
+            "zero_point": 50,
+            "dtype": "uint8"
+          }
+        }
+      ]
+    },
+    {
+      "name": "scores",
+      "type": "scores",
+      "shape": [1, 80, 8400],
+      "dshape": [
+        {"batch": 1},
+        {"num_classes": 80},
+        {"num_boxes": 8400}
+      ],
+      "decoder": "ultralytics",
+      "score_format": "per_class",
+      "outputs": [
+        {
+          "name": "scores_stride_8",
+          "type": "scores",
+          "stride": 8,
+          "scale_index": 0,
+          "shape": [1, 80, 80, 80],
+          "dshape": [
+            {"batch": 1},
+            {"height": 80},
+            {"width": 80},
+            {"num_classes": 80}
+          ],
+          "dtype": "uint8",
+          "quantization": {
+            "scale": 0.00392157,
+            "zero_point": 0,
+            "dtype": "uint8"
+          },
+          "activation_applied": "sigmoid"
+        },
+        {
+          "name": "scores_stride_16",
+          "type": "scores",
+          "stride": 16,
+          "scale_index": 1,
+          "shape": [1, 40, 40, 80],
+          "dshape": [
+            {"batch": 1},
+            {"height": 40},
+            {"width": 40},
+            {"num_classes": 80}
+          ],
+          "dtype": "uint8",
+          "quantization": {
+            "scale": 0.00392157,
+            "zero_point": 0,
+            "dtype": "uint8"
+          },
+          "activation_applied": "sigmoid"
+        },
+        {
+          "name": "scores_stride_32",
+          "type": "scores",
+          "stride": 32,
+          "scale_index": 2,
+          "shape": [1, 20, 20, 80],
+          "dshape": [
+            {"batch": 1},
+            {"height": 20},
+            {"width": 20},
+            {"num_classes": 80}
+          ],
+          "dtype": "uint8",
+          "quantization": {
+            "scale": 0.00392157,
+            "zero_point": 0,
+            "dtype": "uint8"
+          },
+          "activation_applied": "sigmoid"
+        }
+      ]
+    },
+    {
+      "name": "mask_coefs",
+      "type": "mask_coefs",
+      "shape": [1, 32, 8400],
+      "dshape": [
+        {"batch": 1},
+        {"num_protos": 32},
+        {"num_boxes": 8400}
+      ],
+      "decoder": "ultralytics",
+      "outputs": [
+        {
+          "name": "mask_coefs_stride_8",
+          "type": "mask_coefs",
+          "stride": 8,
+          "scale_index": 0,
+          "shape": [1, 80, 80, 32],
+          "dshape": [
+            {"batch": 1},
+            {"height": 80},
+            {"width": 80},
+            {"num_protos": 32}
+          ],
+          "dtype": "uint8",
+          "quantization": {
+            "scale": 0.02547,
+            "zero_point": 32,
+            "dtype": "uint8"
+          }
+        },
+        {
+          "name": "mask_coefs_stride_16",
+          "type": "mask_coefs",
+          "stride": 16,
+          "scale_index": 1,
+          "shape": [1, 40, 40, 32],
+          "dshape": [
+            {"batch": 1},
+            {"height": 40},
+            {"width": 40},
+            {"num_protos": 32}
+          ],
+          "dtype": "uint8",
+          "quantization": {
+            "scale": 0.02547,
+            "zero_point": 32,
+            "dtype": "uint8"
+          }
+        },
+        {
+          "name": "mask_coefs_stride_32",
+          "type": "mask_coefs",
+          "stride": 32,
+          "scale_index": 2,
+          "shape": [1, 20, 20, 32],
+          "dshape": [
+            {"batch": 1},
+            {"height": 20},
+            {"width": 20},
+            {"num_protos": 32}
+          ],
+          "dtype": "uint8",
+          "quantization": {
+            "scale": 0.02547,
+            "zero_point": 32,
+            "dtype": "uint8"
+          }
+        }
+      ]
+    },
+    {
+      "name": "protos",
+      "type": "protos",
+      "shape": [1, 160, 160, 32],
+      "dshape": [
+        {"batch": 1},
+        {"height": 160},
+        {"width": 160},
+        {"num_protos": 32}
+      ],
+      "dtype": "uint8",
+      "quantization": {
+        "scale": 0.03084,
+        "zero_point": 10,
+        "dtype": "uint8"
+      },
+      "stride": 4,
+      "decoder": "ultralytics"
+    }
+  ]
+}

@@ -15,7 +15,7 @@ use crate::{
 use edgefirst_decoder::{DetectBox, Segmentation};
 use edgefirst_image::{
     load_image, save_jpeg, ComputeBackend, Crop, Flip, ImageProcessor, ImageProcessorConfig,
-    ImageProcessorTrait, Rect, Rotation,
+    ImageProcessorTrait, MaskResolution, Rect, Rotation,
 };
 use edgefirst_tensor::{PixelFormat, PixelLayout, TensorDyn, TensorMemory};
 use edgefirst_tracker::TrackInfo;
@@ -995,6 +995,7 @@ pub unsafe extern "C" fn hal_image_processor_materialize_masks(
         &(*detections).boxes,
         &(*proto).inner,
         parse_letterbox(letterbox),
+        MaskResolution::Proto,
     ) {
         Ok(m) => m,
         Err(edgefirst_image::Error::NoConverter) => {

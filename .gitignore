@@ -19,16 +19,13 @@ coverage.xml
 
 env.sh
 
-# Ignore Local Notes
-/AUDIT.md
-/STATUS.md
-/TODO.md
-/ARA2_DECODER.md
-/CODE_REVIEW.md
-/HAILORT_DECODER.md
-/NHWC_PROTOS.md
-/NORMALIZED_BOXES.md
-/STRIDES_BUG.md
+# Ignore Local Notes — local caches of JIRA-style issues/tasks that
+# avoid round-trips to the ticket system. Root-anchored so subcrates
+# are free to ship legitimate files with these prefixes.
+/TODO*.md
+/BUG*.md
+/FIX*.md
+/FEATURE*.md
 
 /SPS/
 /WP1/

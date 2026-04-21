@@ -2408,4 +2408,115 @@ mod tests {
             result.len()
         );
     }
+
+    /// Regression test for HAILORT_BUG.md — the YoloSegDet path
+    /// (combined `(4 + nc + nm, N)` detection tensor + separate protos)
+    /// must pair each surviving detection with the mask coefficient
+    /// row at the SAME anchor index the box came from. The validator
+    /// sees this path miss the pairing under schema-v2 Hailo inputs
+    /// (mAP collapse from 46.8 → 3.65 while mask IoU stays at 66.9,
+    /// the fingerprint of mask-to-detection misalignment).
+    ///
+    /// Construction: three anchors with distinct mask-coef signatures
+    /// that, after dot(coefs, protos) + sigmoid, produce HIGH vs LOW
+    /// mask pixel values. Two anchors survive (one high, one low); if
+    /// the mask row is looked up at the wrong index, the per-detection
+    /// mean mask value would cross the threshold and we catch it.
+    #[test]
+    fn segdet_combined_tensor_pairs_detection_with_matching_mask_row() {
+        let nc = 2; // num_classes
+        let nm = 2; // num_protos
+        let n = 3; // num_anchors
+        let feat = 4 + nc + nm; // 8
+
+        // Tensor layout: (8, 3) rows=features, cols=anchors.
+        // Row indices:  0..4 = xywh, 4..6 = scores, 6..8 = mask_coefs.
+        //
+        //         anchor 0 | anchor 1 | anchor 2
+        // xc       0.2      | 0.5      | 0.8
+        // yc       0.2      | 0.5      | 0.8
+        // w        0.1      | 0.1      | 0.1
+        // h        0.1      | 0.1      | 0.1
+        // s[0]     0.9      | 0.0      | 0.8   (class 0)
+        // s[1]     0.0      | 0.0      | 0.0   (class 1 — always loses)
+        // m[0]     3.0      | 0.0      | -3.0  (high for a0, low for a2)
+        // m[1]     3.0      | 0.0      | -3.0
+        //
+        // Proto[0] = Proto[1] = all-ones (8x8), so
+        //   mask(a0) = sigmoid(3 + 3) ≈ 0.9975 → 254
+        //   mask(a2) = sigmoid(-3 + -3) ≈ 0.0025 → 1
+        // 250-point gap makes any misalignment trivially detectable.
+        let mut data = vec![0.0f32; feat * n];
+        let set = |d: &mut [f32], r: usize, c: usize, v: f32| d[r * n + c] = v;
+        set(&mut data, 0, 0, 0.2);
+        set(&mut data, 1, 0, 0.2);
+        set(&mut data, 2, 0, 0.1);
+        set(&mut data, 3, 0, 0.1);
+        set(&mut data, 0, 1, 0.5);
+        set(&mut data, 1, 1, 0.5);
+        set(&mut data, 2, 1, 0.1);
+        set(&mut data, 3, 1, 0.1);
+        set(&mut data, 0, 2, 0.8);
+        set(&mut data, 1, 2, 0.8);
+        set(&mut data, 2, 2, 0.1);
+        set(&mut data, 3, 2, 0.1);
+        set(&mut data, 4, 0, 0.9);
+        set(&mut data, 4, 2, 0.8);
+        set(&mut data, 6, 0, 3.0);
+        set(&mut data, 7, 0, 3.0);
+        set(&mut data, 6, 2, -3.0);
+        set(&mut data, 7, 2, -3.0);
+
+        let output = Array2::from_shape_vec((feat, n), data).unwrap();
+        let protos = Array3::<f32>::from_elem((8, 8, nm), 1.0);
+
+        let mut boxes: Vec<DetectBox> = Vec::with_capacity(10);
+        let mut masks: Vec<Segmentation> = Vec::with_capacity(10);
+        decode_yolo_segdet_float(
+            output.view(),
+            protos.view(),
+            0.5,
+            0.5,
+            Some(Nms::ClassAgnostic),
+            &mut boxes,
+            &mut masks,
+        )
+        .unwrap();
+
+        assert_eq!(
+            boxes.len(),
+            2,
+            "two anchors above threshold should survive (a0 score=0.9, a2 score=0.8); got {}",
+            boxes.len()
+        );
+
+        // Build a (anchor_index → mask_mean) mapping from the results.
+        // Anchor 0 has centre (0.2, 0.2), anchor 2 has centre (0.8,
+        // 0.8). The DetectBox bbox is the post-XYWH-to-XYXY conversion
+        // of the original xywh; cropping inside protobox may shrink it,
+        // so match by centre (0.2 vs 0.8) rather than exact bbox.
+        for (b, m) in boxes.iter().zip(masks.iter()) {
+            let cx = (b.bbox.xmin + b.bbox.xmax) * 0.5;
+            let mean = {
+                let s = &m.segmentation;
+                let total: u32 = s.iter().map(|&v| v as u32).sum();
+                total as f32 / s.len() as f32
+            };
+            if cx < 0.3 {
+                // anchor 0 — expect HIGH mask values ≈ 254
+                assert!(
+                    mean > 200.0,
+                    "anchor 0 detection (centre {cx:.2}) should have high-value mask; got mean {mean}"
+                );
+            } else if cx > 0.7 {
+                // anchor 2 — expect LOW mask values ≈ 1
+                assert!(
+                    mean < 50.0,
+                    "anchor 2 detection (centre {cx:.2}) should have low-value mask; got mean {mean}"
+                );
+            } else {
+                panic!("unexpected detection centre {cx:.2}");
+            }
+        }
+    }
 }

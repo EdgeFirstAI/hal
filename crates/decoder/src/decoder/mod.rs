@@ -161,6 +161,7 @@ macro_rules! with_quantized {
 }
 
 mod builder;
+mod dfl;
 mod helpers;
 mod merge;
 mod postprocess;
