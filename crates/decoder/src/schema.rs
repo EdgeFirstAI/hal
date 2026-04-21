@@ -694,17 +694,32 @@ impl SchemaV2 {
     /// Returns [`DecoderError::NotSupported`] when the schema uses
     /// features the v1 decoder cannot express at the logical level:
     /// - Per-channel quantization arrays on a logical output.
-    /// - `encoding: dfl` on a flat logical output (no physical
-    ///   children) — the HAL does not yet include a DFL decode kernel.
+    /// - `encoding: dfl` on a **flat** logical output (no physical
+    ///   children). DFL combined with per-scale children is handled by
+    ///   the merge path (see [`crate::decoder::merge::DecodeProgram`])
+    ///   which decodes the distribution before producing the merged
+    ///   post-decode `(1, 4, total_anchors)` tensor the legacy decoder
+    ///   consumes.
     pub fn to_legacy_config_outputs(&self) -> DecoderResult<ConfigOutputs> {
         let mut outputs = Vec::with_capacity(self.outputs.len());
         for logical in &self.outputs {
-            if logical.type_ == LogicalType::Boxes && logical.encoding == Some(BoxEncoding::Dfl) {
+            // Flat DFL (no children) remains unsupported — the HAL has
+            // no path that applies softmax + dist2bbox to a single
+            // `(1, 4·reg_max, anchors)` tensor yet. DFL with per-scale
+            // children is decoded by the merge path, so we let it
+            // through here and rely on the merged logical shape (post-
+            // decode 4 channels) being valid for the legacy dispatch.
+            if logical.type_ == LogicalType::Boxes
+                && logical.encoding == Some(BoxEncoding::Dfl)
+                && logical.outputs.is_empty()
+            {
                 return Err(DecoderError::NotSupported(format!(
-                    "`boxes` output `{}` has `encoding: dfl`; the HAL \
-                     does not yet include a DFL decode kernel. Pre-decode \
-                     to 4 channels in the model graph (as TFLite does) or \
-                     wait for the HAL DFL kernel to land.",
+                    "`boxes` output `{}` has `encoding: dfl` on a flat \
+                     logical (no per-scale children); the HAL's DFL \
+                     decode kernel only runs inside the per-scale merge \
+                     path. Split the boxes output into per-FPN-level \
+                     children (Hailo convention) or pre-decode to 4 \
+                     channels in the model graph (TFLite convention).",
                     logical.name.as_deref().unwrap_or("<anonymous>"),
                 )));
             }

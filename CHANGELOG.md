@@ -9,6 +9,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`MaskResolution` enum and `resolution` parameter on
+  `ImageProcessor.materialize_masks`.** When set to
+  `MaskResolution.Scaled(width, height)`, HAL upsamples the full
+  proto plane once (correct edge-clamp bilinear) and returns
+  per-detection binary `uint8 {0, 255}` masks at the target
+  resolution — interchangeable with the existing continuous-sigmoid
+  Proto masks via the same `> 127` threshold. Letterbox-aware: when
+  `letterbox` is `Some`, `(width, height)` are interpreted as
+  original-content pixel dims and the inverse letterbox transform is
+  applied during upsample. Resolves the YOLOv8-seg mAP collapse
+  observed on Hailo+HAL when per-tile `ImageProcessor.convert()`
+  upsampling leaks edge activations across tile boundaries; callers
+  currently relying on `decode() + ImageProcessor.convert()` per-tile
+  resize should migrate to
+  `decode_proto() + materialize_masks(MaskResolution.Scaled)`.
+  Reference: EDGEAI-759.
+
+- **HailoRT split-output DFL decode support.** The schema-v2 `boxes`
+  logical output with `encoding: dfl` and per-scale physical children
+  is now accepted end-to-end. At compile time the decoder extracts
+  `reg_max` from the first child (validated uniform across children)
+  and pre-computes per-FPN-level anchor grids with the Ultralytics
+  `+0.5` centre offset; at decode time the per-scale merge runs a
+  numerically stable softmax + weighted-sum + `dist2bbox` per child,
+  collapsing the `4 × reg_max` feature axis to 4 xcycwh pixel-
+  coordinate channels before concat. The merged `(1, 4, total_anchors)`
+  tensor flows through the existing Ultralytics split-decoder
+  unchanged. Reference: `HAILORT_DECODER.md`, EDGEAI-759.
+
+- **DFL primitives module (`edgefirst_decoder::decoder::dfl`).**
+  Pure-function building blocks — `make_anchor_grid`, `dfl_bins`,
+  `softmax_inplace`, `decode_dfl_level` — operating on `&[f32]` so
+  they're trivially unit-testable and SIMD-ready. Seven unit tests
+  mirror validator-side pytest vectors (uniform/concentrated DFL
+  distributions, row-major anchor ordering, large-logit numerical
+  stability).
+
+- **Hailo YOLOv8-seg reference fixture
+  (`testdata/hailo_yolov8seg_edgefirst.json`).** Canonical schema-v2
+  example with three FPN scales (strides 8/16/32), DFL-encoded boxes,
+  sigmoid-pre-applied per-class scores, per-scale mask coefficients,
+  and NHWC protos. Used by end-to-end numerical-parity tests that
+  mirror `scripts/decode_hailo_split.py::test_synthetic` from
+  `edgefirst-validator @ feature/DE-823-hailort`.
+
 - **Schema v2 metadata parser (`edgefirst_decoder::schema`).** New
   data-only module implementing the two-layer logical/physical output
   model from the updated `edgefirst.json` specification. Logical outputs
@@ -45,8 +90,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   outputs with physical children, and downconverts the logical-level
   metadata to the legacy dispatch representation. Flat v2 schemas run
   through the existing decode kernels unchanged; schemas with
-  `encoding: dfl` on boxes are rejected with `NotSupported` until the
-  dedicated DFL kernel lands.
+  `encoding: dfl` combined with per-scale children are decoded by the
+  merge path (see the HailoRT DFL entry above). Flat DFL (no
+  children) remains unsupported — the HAL's DFL kernel only runs
+  inside the per-scale merge.
 
 - **Physical → logical merge path at decode time.** `Decoder::decode`
   now executes the compiled `DecodeProgram` when present,
@@ -68,10 +115,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Schema-driven decoding rejects unsupported features early.**
   `NotSupported`/`InvalidConfig` errors flagged at build time for:
-  DFL-encoded split boxes (DFL kernel pending), per-channel quant on
-  a split child, missing `dshape` on per-scale children, mixed
-  per-scale + channel sub-split decompositions on the same logical
-  output.
+  flat DFL-encoded boxes (no children — the HAL's DFL kernel only
+  runs inside the per-scale merge), heterogeneous `reg_max` across
+  FPN children, per-channel quant on a split child, missing
+  `dshape` on per-scale children, mixed per-scale + channel sub-
+  split decompositions on the same logical output.
 
 - **ARA-2 DVM `padding` dim support.** Schema-v2 metadata emitted by
   the ARA-2 converter declares a trailing `padding: 1` axis on most
