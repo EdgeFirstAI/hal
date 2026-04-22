@@ -453,9 +453,10 @@ pub struct Segmentation {
 
 /// Prototype tensor variants for fused decode+render pipelines.
 ///
-/// Carries either raw quantized data (to skip CPU dequantization and let the
-/// GPU shader dequantize) or dequantized f32 data (from float models or legacy
-/// paths).
+/// Carries one of:
+/// - raw quantized int8 data (the GPU shader dequantizes per-texel),
+/// - native f16 data (direct upload to an `RGBA16F` texture without widening),
+/// - dequantized f32 data (from f32 models or legacy paths).
 #[derive(Debug, Clone)]
 pub enum ProtoTensor {
     /// Raw int8 protos with quantization parameters — skip CPU dequantization.
@@ -465,7 +466,11 @@ pub enum ProtoTensor {
         protos: Array3<i8>,
         quantization: Quantization,
     },
-    /// Dequantized f32 protos (from float models or legacy path).
+    /// Native f16 protos (from TensorRT fp16 engines or GPU half-float
+    /// models). The GL seg renderer can upload these directly into an
+    /// `RGBA16F` texture without the extra f32→f16 repack step.
+    Float16(Array3<half::f16>),
+    /// Dequantized f32 protos (from f32 models or legacy path).
     Float(Array3<f32>),
 }
 
@@ -475,19 +480,29 @@ impl ProtoTensor {
         matches!(self, ProtoTensor::Quantized { .. })
     }
 
+    /// Returns `true` if this is the native f16 variant.
+    pub fn is_f16(&self) -> bool {
+        matches!(self, ProtoTensor::Float16(_))
+    }
+
     /// Returns the spatial dimensions `(height, width, num_protos)`.
     pub fn dim(&self) -> (usize, usize, usize) {
         match self {
             ProtoTensor::Quantized { protos, .. } => protos.dim(),
+            ProtoTensor::Float16(arr) => arr.dim(),
             ProtoTensor::Float(arr) => arr.dim(),
         }
     }
 
     /// Returns dequantized f32 protos. For the `Float` variant this is a
-    /// no-copy reference; for `Quantized` it allocates and dequantizes.
+    /// no-copy reference; for `Float16` and `Quantized` it allocates and
+    /// widens / dequantizes.
     pub fn as_f32(&self) -> std::borrow::Cow<'_, Array3<f32>> {
         match self {
             ProtoTensor::Float(arr) => std::borrow::Cow::Borrowed(arr),
+            ProtoTensor::Float16(arr) => {
+                std::borrow::Cow::Owned(arr.map(|&v| v.to_f32()))
+            }
             ProtoTensor::Quantized {
                 protos,
                 quantization,

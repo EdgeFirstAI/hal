@@ -236,6 +236,7 @@ impl CPUProcessor {
             ProtoTensor::Quantized { protos, .. } => {
                 (protos.shape()[0], protos.shape()[1], protos.shape()[2])
             }
+            ProtoTensor::Float16(arr) => (arr.shape()[0], arr.shape()[1], arr.shape()[2]),
             ProtoTensor::Float(arr) => (arr.shape()[0], arr.shape()[1], arr.shape()[2]),
         };
 
@@ -285,6 +286,12 @@ impl CPUProcessor {
 
                 // Fused dequant + dot product + sigmoid, directly producing u8 mask.
                 // Avoids allocating a full f32 proto tensor and the to_shape copy.
+                //
+                // For the `Float16` variant we currently widen lazily through
+                // `as_f32()` (one allocation per call, bounded by proto size).
+                // A dedicated fused f16 kernel would eliminate that allocation
+                // but would roughly double the kernel code size — defer until
+                // profiling shows the CPU mask path matters on fp16 engines.
                 let mask = match &proto_data.protos {
                     ProtoTensor::Quantized {
                         protos,
@@ -298,6 +305,10 @@ impl CPUProcessor {
                     }
                     ProtoTensor::Float(protos) => {
                         fused_dot_sigmoid_f32(protos, coeff, y0, x0, roi_h, roi_w, num_protos)
+                    }
+                    ProtoTensor::Float16(_) => {
+                        let widened = proto_data.protos.as_f32();
+                        fused_dot_sigmoid_f32(&widened, coeff, y0, x0, roi_h, roi_w, num_protos)
                     }
                 };
 
@@ -361,6 +372,19 @@ impl CPUProcessor {
                 width,
                 height,
             ),
+            ProtoTensor::Float16(_) => {
+                // Lazy widen — the Cow::Owned allocation is the same size as
+                // the f32 proto tensor we'd otherwise materialize ourselves.
+                let widened = proto_data.protos.as_f32();
+                scaled_segmentations_float(
+                    detect,
+                    &proto_data.mask_coefficients,
+                    &widened,
+                    letterbox,
+                    width,
+                    height,
+                )
+            }
             ProtoTensor::Quantized {
                 protos,
                 quantization,

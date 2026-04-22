@@ -4270,6 +4270,39 @@ impl GLProcessorST {
         (byte_buf, num_layers)
     }
 
+    /// Native-f16 variant of [`Self::repack_protos_to_rgba_f16`]: shuffles
+    /// already-f16 protos into RGBA-layer order without the f32→f16
+    /// conversion step. Used when the decoder produced
+    /// [`ProtoTensor::Float16`] from an fp16 inference engine.
+    fn repack_protos_f16_to_rgba_f16(
+        protos: &ndarray::Array3<half::f16>,
+    ) -> (Vec<u8>, usize) {
+        let (height, width, num_protos) = protos.dim();
+        let num_layers = num_protos.div_ceil(4);
+        let layer_stride = height * width * 4;
+        let mut buf = vec![0u16; layer_stride * num_layers];
+
+        for y in 0..height {
+            for x in 0..width {
+                for k in 0..num_layers * 4 {
+                    let val = if k < num_protos {
+                        protos[[y, x, k]]
+                    } else {
+                        half::f16::ZERO
+                    };
+                    let layer = k / 4;
+                    let channel = k % 4;
+                    buf[layer * layer_stride + y * width * 4 + x * 4 + channel] = val.to_bits();
+                }
+            }
+        }
+
+        let byte_buf = unsafe {
+            std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 2).to_vec()
+        };
+        (byte_buf, num_layers)
+    }
+
     /// Render YOLO proto segmentation masks using the fused GPU pipeline.
     ///
     /// Dispatches to the appropriate shader based on `ProtoTensor` variant:
@@ -4331,6 +4364,21 @@ impl GLProcessorST {
                         color_mode,
                     )?;
                 }
+            }
+            ProtoTensor::Float16(protos_f16) => {
+                // Native f16 protos from an fp16 engine — upload directly to
+                // RGBA16F without the f32→f16 conversion pass. Reuses the
+                // existing f16 shader path.
+                self.render_proto_segmentation_f16_native(
+                    detect,
+                    &proto_data.mask_coefficients,
+                    protos_f16,
+                    height,
+                    width,
+                    num_protos,
+                    texture_target,
+                    color_mode,
+                )?;
             }
         }
 
@@ -4854,6 +4902,69 @@ impl GLProcessorST {
     ) -> crate::Result<()> {
         let num_layers = num_protos.div_ceil(4);
         let (tex_data, _) = Self::repack_protos_to_rgba_f16(protos_f32);
+
+        let program = &self.proto_segmentation_program;
+        gls::use_program(program.id);
+        gls::bind_texture(texture_target, self.proto_texture.id);
+        gls::active_texture(gls::gl::TEXTURE0);
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_MIN_FILTER,
+            gls::gl::LINEAR as i32,
+        );
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_MAG_FILTER,
+            gls::gl::LINEAR as i32,
+        );
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_WRAP_S,
+            gls::gl::CLAMP_TO_EDGE as i32,
+        );
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_WRAP_T,
+            gls::gl::CLAMP_TO_EDGE as i32,
+        );
+
+        gls::tex_image3d(
+            texture_target,
+            0,
+            gls::gl::RGBA16F as i32,
+            width as i32,
+            height as i32,
+            num_layers as i32,
+            0,
+            gls::gl::RGBA,
+            gls::gl::HALF_FLOAT,
+            Some(&tex_data),
+        );
+
+        program.load_uniform_1i(c"num_layers", num_layers as i32)?;
+        self.render_proto_detection_quads(program, detect, mask_coefficients, color_mode)?;
+
+        Ok(())
+    }
+
+    /// Native-f16 variant of [`Self::render_proto_segmentation_f16`]: uploads
+    /// protos that are already in half-precision directly into `RGBA16F`
+    /// without a f32→f16 conversion pass. Used for `ProtoTensor::Float16`
+    /// from fp16 inference engines.
+    #[allow(clippy::too_many_arguments)]
+    fn render_proto_segmentation_f16_native(
+        &self,
+        detect: &[DetectBox],
+        mask_coefficients: &[Vec<f32>],
+        protos_f16: &ndarray::Array3<half::f16>,
+        height: usize,
+        width: usize,
+        num_protos: usize,
+        texture_target: u32,
+        color_mode: crate::ColorMode,
+    ) -> crate::Result<()> {
+        let num_layers = num_protos.div_ceil(4);
+        let (tex_data, _) = Self::repack_protos_f16_to_rgba_f16(protos_f16);
 
         let program = &self.proto_segmentation_program;
         gls::use_program(program.id);

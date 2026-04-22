@@ -522,9 +522,25 @@ fn find_unused_tensor_by_shape<'a>(
 
 /// Dequantize (if integer) or cast (if float) a TensorDyn to an owned
 /// `ArrayD<f32>` matching the tensor's shape.
+///
+/// Schema-v2 merge always widens to f32 because logical outputs may
+/// concatenate children of heterogeneous dtypes (e.g. an i8 physical child
+/// with a f32 sibling). This is the one place in the decoder where f16 is
+/// intentionally promoted rather than kept native.
 fn tensor_to_f32(t: &TensorDyn, quant: Option<Quantization>) -> DecoderResult<ArrayD<f32>> {
     let shape = t.shape().to_vec();
     match t {
+        TensorDyn::F16(tensor) => {
+            let m = tensor
+                .map()
+                .map_err(|e| DecoderError::Internal(format!("tensor map: {e}")))?;
+            // Vectorized f16 → f32 widening via the `half` crate.
+            use half::slice::HalfFloatSliceExt;
+            let total: usize = shape.iter().product();
+            let mut out = vec![0.0_f32; total];
+            m.as_slice().convert_to_f32_slice(&mut out);
+            Ok(Array::from_shape_vec(IxDyn(&shape), out)?)
+        }
         TensorDyn::F32(tensor) => {
             let m = tensor
                 .map()
@@ -960,6 +976,30 @@ mod tests {
         slice[..values.len()].copy_from_slice(values);
         drop(m);
         TensorDyn::F32(t)
+    }
+
+    fn make_f16_tensor(shape: &[usize], values: &[f32]) -> TensorDyn {
+        let t = Tensor::<half::f16>::new(shape, Some(TensorMemory::Mem), None).unwrap();
+        let mut m = t.map().unwrap();
+        let slice = m.as_mut_slice();
+        for (dst, &src) in slice.iter_mut().zip(values.iter()) {
+            *dst = half::f16::from_f32(src);
+        }
+        drop(m);
+        TensorDyn::F16(t)
+    }
+
+    #[test]
+    fn tensor_to_f32_widens_f16_natively() {
+        // Direct check of the schema-v2 merge helper: f16 values must be
+        // exactly widened to f32 via `half` crate conversion. Picks values
+        // representable exactly in both f16 and f32 so the comparison is
+        // bit-exact (no tolerance needed).
+        let t = make_f16_tensor(&[2, 3], &[1.0, -2.0, 0.5, 0.25, -0.125, 4.0]);
+        let arr = super::tensor_to_f32(&t, None).unwrap();
+        assert_eq!(arr.shape(), &[2, 3]);
+        let flat: Vec<f32> = arr.iter().copied().collect();
+        assert_eq!(flat, vec![1.0, -2.0, 0.5, 0.25, -0.125, 4.0]);
     }
 
     fn per_tensor_q(scale: f32, zp: i32, dt: DType) -> SchemaQuant {

@@ -553,6 +553,7 @@ dependencies = [
  "edgefirst-tracker",
  "env_logger",
  "fast-math",
+ "half",
  "image",
  "log",
  "ndarray 0.16.1",
