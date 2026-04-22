@@ -3402,4 +3402,33 @@ outputs:
             assert_eq!(protos_out.shape(), &[1, 160, 160, 32]);
         }
     }
+
+    // =========================================================================
+    // Legacy ConfigOutput serde tag vocabulary
+    // =========================================================================
+
+    mod config_output_serde {
+        use crate::ConfigOutput;
+
+        #[test]
+        fn mask_coefs_is_primary_spelling() {
+            // v2 spec vocabulary uses `mask_coefs`. The legacy ConfigOutput
+            // enum must accept it so that any consumer re-serialising through
+            // the legacy path (or feeding a v2-vocabulary dict into the
+            // legacy deserialiser) stays compatible.
+            let j = r#"{"type": "mask_coefs", "shape": [1, 32, 8400]}"#;
+            let parsed: ConfigOutput = serde_json::from_str(j).unwrap();
+            assert!(matches!(parsed, ConfigOutput::MaskCoefficients(_)));
+        }
+
+        #[test]
+        fn mask_coefficients_alias_still_accepted() {
+            // Legacy v1 spelling — required for backward compatibility with
+            // models already trained and stored before the v2 vocabulary
+            // landed.
+            let j = r#"{"type": "mask_coefficients", "shape": [1, 32, 8400]}"#;
+            let parsed: ConfigOutput = serde_json::from_str(j).unwrap();
+            assert!(matches!(parsed, ConfigOutput::MaskCoefficients(_)));
+        }
+    }
 }

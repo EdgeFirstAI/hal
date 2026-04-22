@@ -3,8 +3,8 @@
 
 use crate::tracker::{PyByteTrack, PyTrackInfo};
 use edgefirst_hal::decoder::{
-    configs, configs::Nms, ConfigOutput, Decoder, DecoderBuilder, DetectBox, ProtoData,
-    Segmentation,
+    configs, configs::Nms, schema::SchemaV2, ConfigOutput, ConfigOutputs, Decoder, DecoderBuilder,
+    DetectBox, ProtoData, Segmentation,
 };
 
 /// NMS (Non-Maximum Suppression) mode for filtering overlapping detections.
@@ -497,14 +497,33 @@ impl PyDecoder {
         iou_threshold: f32,
         nms: Option<PyNms>,
     ) -> PyResult<Self> {
-        let config = pythonize::depythonize(&config)?;
         let nms: Option<Nms> = nms.map(|py_nms| py_nms.into());
-        let decoder = DecoderBuilder::default()
+        let builder = DecoderBuilder::default()
             .with_score_threshold(score_threshold)
             .with_iou_threshold(iou_threshold)
-            .with_nms(nms)
-            .with_config(config)
-            .build();
+            .with_nms(nms);
+
+        // EDGEAI-1081: discriminate v2 vs legacy on the authoritative
+        // `schema_version` field. v2 dicts carry object-form quantization
+        // and spec-vocabulary type tags that the legacy `ConfigOutputs`
+        // deserialiser rejects; v1 (or version-less) dicts continue
+        // through the legacy path unchanged.
+        let value: serde_json::Value = pythonize::depythonize(&config)?;
+        let schema_version = value
+            .get("schema_version")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+
+        let decoder = if schema_version.is_some_and(|v| v >= 2) {
+            let schema = SchemaV2::from_json_value(value)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))?;
+            builder.with_schema(schema).build()
+        } else {
+            let legacy: ConfigOutputs = serde_json::from_value(value)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
+            builder.with_config(legacy).build()
+        };
+
         match decoder {
             Ok(decoder) => Ok(Self { decoder }),
             Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}"))),
