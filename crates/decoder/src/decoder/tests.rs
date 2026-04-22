@@ -2363,8 +2363,7 @@ outputs:
         set(&mut det_data, 7, 2, -3.0);
 
         let det_tensor: TensorDyn = {
-            let t =
-                Tensor::<half::f16>::new(&[1, FEAT, N], Some(TensorMemory::Mem), None).unwrap();
+            let t = Tensor::<half::f16>::new(&[1, FEAT, N], Some(TensorMemory::Mem), None).unwrap();
             {
                 let mut m = t.map().unwrap();
                 m.as_mut_slice().copy_from_slice(&det_data);
@@ -2374,12 +2373,8 @@ outputs:
 
         let proto_data = vec![half::f16::from_f32(1.0); NM * PH * PW];
         let protos_tensor: TensorDyn = {
-            let t = Tensor::<half::f16>::new(
-                &[1, NM, PH, PW],
-                Some(TensorMemory::Mem),
-                None,
-            )
-            .unwrap();
+            let t =
+                Tensor::<half::f16>::new(&[1, NM, PH, PW], Some(TensorMemory::Mem), None).unwrap();
             {
                 let mut m = t.map().unwrap();
                 m.as_mut_slice().copy_from_slice(&proto_data);

@@ -4274,9 +4274,7 @@ impl GLProcessorST {
     /// already-f16 protos into RGBA-layer order without the f32→f16
     /// conversion step. Used when the decoder produced
     /// [`ProtoTensor::Float16`] from an fp16 inference engine.
-    fn repack_protos_f16_to_rgba_f16(
-        protos: &ndarray::Array3<half::f16>,
-    ) -> (Vec<u8>, usize) {
+    fn repack_protos_f16_to_rgba_f16(protos: &ndarray::Array3<half::f16>) -> (Vec<u8>, usize) {
         let (height, width, num_protos) = protos.dim();
         let num_layers = num_protos.div_ceil(4);
         let layer_stride = height * width * 4;

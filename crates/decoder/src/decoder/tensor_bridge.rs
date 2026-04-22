@@ -577,7 +577,10 @@ mod tensor_bridge_tests {
 
     #[test]
     fn test_map_tensors_multiple_f16() {
-        let t1 = make_f16(&[1, 2], &[half::f16::from_f32(1.0), half::f16::from_f32(2.0)]);
+        let t1 = make_f16(
+            &[1, 2],
+            &[half::f16::from_f32(1.0), half::f16::from_f32(2.0)],
+        );
         let t2 = make_f16(
             &[1, 3],
             &[
@@ -598,7 +601,10 @@ mod tensor_bridge_tests {
     fn test_map_tensors_f16_with_i32_skipped() {
         // Mixed f16 + i32 is allowed: i32 tensors are silently skipped,
         // mirroring the f32 path (some models emit count/shape tensors as i32).
-        let t1 = make_f16(&[1, 2], &[half::f16::from_f32(1.0), half::f16::from_f32(2.0)]);
+        let t1 = make_f16(
+            &[1, 2],
+            &[half::f16::from_f32(1.0), half::f16::from_f32(2.0)],
+        );
         let t2 = make_i32(&[1, 1], &[42]);
         let mapped = tensor_bridge::map_tensors(&[&t1, &t2]).unwrap();
         if let MappedOutputs::Float16(maps) = &mapped {
@@ -610,7 +616,10 @@ mod tensor_bridge_tests {
 
     #[test]
     fn test_map_tensors_mixed_f16_f32_rejected() {
-        let t1 = make_f16(&[1, 2], &[half::f16::from_f32(1.0), half::f16::from_f32(2.0)]);
+        let t1 = make_f16(
+            &[1, 2],
+            &[half::f16::from_f32(1.0), half::f16::from_f32(2.0)],
+        );
         let t2 = make_f32(&[1, 2], &[3.0, 4.0]);
         let result = tensor_bridge::map_tensors(&[&t1, &t2]);
         assert!(result.is_err());
@@ -618,7 +627,10 @@ mod tensor_bridge_tests {
 
     #[test]
     fn test_map_tensors_mixed_f16_u8_rejected() {
-        let t1 = make_f16(&[1, 2], &[half::f16::from_f32(1.0), half::f16::from_f32(2.0)]);
+        let t1 = make_f16(
+            &[1, 2],
+            &[half::f16::from_f32(1.0), half::f16::from_f32(2.0)],
+        );
         let t2 = make_u8(&[1, 2], &[10, 20]);
         let result = tensor_bridge::map_tensors(&[&t1, &t2]);
         assert!(result.is_err());
