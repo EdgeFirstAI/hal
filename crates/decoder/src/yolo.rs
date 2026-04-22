@@ -21,8 +21,8 @@ use crate::{
         nms_class_aware_float, nms_extra_class_aware_float, nms_extra_float, nms_float,
         postprocess_boxes_float, postprocess_boxes_index_float,
     },
-    BBoxTypeTrait, BoundingBox, DetectBox, DetectBoxQuantized, ProtoData, ProtoTensor,
-    Quantization, Segmentation, XYWH, XYXY,
+    BBoxTypeTrait, BoundingBox, DetectBox, DetectBoxQuantized, IntoProtoTensor, ProtoData,
+    ProtoTensor, Quantization, Segmentation, XYWH, XYXY,
 };
 
 /// Maximum number of above-threshold candidates fed to NMS.
@@ -1250,7 +1250,7 @@ where
 pub(crate) fn impl_yolo_segdet_float_proto<
     B: BBoxTypeTrait,
     BOX: Float + AsPrimitive<f32> + Send + Sync,
-    PROTO: Float + AsPrimitive<f32> + Send + Sync,
+    PROTO: Float + AsPrimitive<f32> + Send + Sync + IntoProtoTensor,
 >(
     boxes: ArrayView2<BOX>,
     protos: ArrayView3<PROTO>,
@@ -1285,7 +1285,7 @@ pub(crate) fn impl_yolo_split_segdet_float_proto<
     BOX: Float + AsPrimitive<f32> + Send + Sync,
     SCORE: Float + AsPrimitive<f32> + Send + Sync,
     MASK: Float + AsPrimitive<f32> + Send + Sync,
-    PROTO: Float + AsPrimitive<f32> + Send + Sync,
+    PROTO: Float + AsPrimitive<f32> + Send + Sync + IntoProtoTensor,
 >(
     boxes_tensor: ArrayView2<BOX>,
     scores_tensor: ArrayView2<SCORE>,
@@ -1321,7 +1321,7 @@ pub fn decode_yolo_end_to_end_segdet_float_proto<T>(
     output_boxes: &mut Vec<DetectBox>,
 ) -> Result<ProtoData, crate::DecoderError>
 where
-    T: Float + AsPrimitive<f32> + Send + Sync + 'static,
+    T: Float + AsPrimitive<f32> + Send + Sync + IntoProtoTensor,
     f32: AsPrimitive<T>,
 {
     let (boxes, scores, classes, mask_coeff) =
@@ -1354,7 +1354,7 @@ pub fn decode_yolo_split_end_to_end_segdet_float_proto<T>(
     output_boxes: &mut Vec<DetectBox>,
 ) -> Result<ProtoData, crate::DecoderError>
 where
-    T: Float + AsPrimitive<f32> + Send + Sync + 'static,
+    T: Float + AsPrimitive<f32> + Send + Sync + IntoProtoTensor,
     f32: AsPrimitive<T>,
 {
     let (boxes, scores, classes, mask_coeff) =
@@ -1377,12 +1377,14 @@ where
 
 /// Helper: extract ProtoData from float mask coefficients + protos.
 ///
-/// When `PROTO` is `half::f16` the protos are kept native and wrapped in
-/// `ProtoTensor::Float16`, letting the GL seg renderer upload them directly
-/// into an `RGBA16F` texture without a redundant f32↔f16 round-trip.
+/// Selects the [`ProtoTensor`] variant by calling `PROTO::into_proto_tensor`
+/// — safe trait dispatch, no `unsafe` `ArrayView3<T>` layout casts, no
+/// `TypeId` checks. `PROTO = f16` yields `ProtoTensor::Float16` so the GL
+/// seg renderer can upload directly into `RGBA16F`; `f32`/`f64` widen to
+/// `ProtoTensor::Float(Array3<f32>)`.
 pub(super) fn extract_proto_data_float<
     MASK: Float + AsPrimitive<f32> + Send + Sync,
-    PROTO: Float + AsPrimitive<f32> + Send + Sync + 'static,
+    PROTO: Float + AsPrimitive<f32> + Send + Sync + IntoProtoTensor,
 >(
     det_indices: Vec<(DetectBox, usize)>,
     mask_tensor: ArrayView2<MASK>,
@@ -1396,22 +1398,9 @@ pub(super) fn extract_proto_data_float<
         let row = mask_tensor.row(idx);
         mask_coefficients.push(row.iter().map(|v| v.as_()).collect());
     }
-    // Keep native f16 protos as-is to skip the widening allocation on the
-    // TensorRT fp16 hot path. Safe layout-wise: PROTO and f16 have identical
-    // representation when TypeId matches.
-    if std::any::TypeId::of::<PROTO>() == std::any::TypeId::of::<half::f16>() {
-        let view_f16 = unsafe {
-            &*(&protos as *const ArrayView3<'_, PROTO> as *const ArrayView3<'_, half::f16>)
-        };
-        return ProtoData {
-            mask_coefficients,
-            protos: ProtoTensor::Float16(view_f16.to_owned()),
-        };
-    }
-    let protos_f32 = protos.map(|v| v.as_());
     ProtoData {
         mask_coefficients,
-        protos: ProtoTensor::Float(protos_f32),
+        protos: PROTO::into_proto_tensor(protos),
     }
 }
 

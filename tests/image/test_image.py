@@ -510,9 +510,7 @@ def test_from_numpy_grey_unaligned_width_stride_bug(width, height):
     )
 
     rs = img.row_stride
-    assert rs is not None and rs >= width, (
-        f"row_stride {rs} must be >= width {width}"
-    )
+    assert rs is not None and rs >= width, f"row_stride {rs} must be >= width {width}"
 
     # The regression: this call used to panic in copy_from_slice for
     # widths not aligned to the GPU pitch. Must now succeed.

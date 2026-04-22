@@ -451,6 +451,41 @@ pub struct Segmentation {
     pub segmentation: Array3<u8>,
 }
 
+/// Type-level dispatch from a generic `ArrayView3<T>` of float protos into
+/// the appropriate [`ProtoTensor`] variant.
+///
+/// Implemented for every float element type the decoder's generic
+/// `decode_float::<T>` pipeline may instantiate. Callers invoke
+/// `T::into_proto_tensor(view)` and let the compiler pick the right variant
+/// — no `TypeId` checks, no `unsafe` layout casts across `ArrayView3<T>`
+/// type parameters.
+pub trait IntoProtoTensor: Sized + 'static {
+    /// Build a [`ProtoTensor`] from a borrowed 3-D view. Implementations
+    /// copy the data into an owned `Array3` of the destination element type
+    /// (native for `f16`, widened to `f32` for `f32`/`f64`).
+    fn into_proto_tensor(arr: ndarray::ArrayView3<'_, Self>) -> ProtoTensor;
+}
+
+impl IntoProtoTensor for f32 {
+    fn into_proto_tensor(arr: ndarray::ArrayView3<'_, f32>) -> ProtoTensor {
+        ProtoTensor::Float(arr.to_owned())
+    }
+}
+
+impl IntoProtoTensor for f64 {
+    fn into_proto_tensor(arr: ndarray::ArrayView3<'_, f64>) -> ProtoTensor {
+        ProtoTensor::Float(arr.mapv(|v| v as f32))
+    }
+}
+
+impl IntoProtoTensor for half::f16 {
+    fn into_proto_tensor(arr: ndarray::ArrayView3<'_, half::f16>) -> ProtoTensor {
+        // Native f16 preserved for zero-copy upload to the GL `RGBA16F`
+        // seg shader (see `render_proto_segmentation_f16_native`).
+        ProtoTensor::Float16(arr.to_owned())
+    }
+}
+
 /// Prototype tensor variants for fused decode+render pipelines.
 ///
 /// Carries one of:
@@ -497,11 +532,31 @@ impl ProtoTensor {
     /// Returns dequantized f32 protos. For the `Float` variant this is a
     /// no-copy reference; for `Float16` and `Quantized` it allocates and
     /// widens / dequantizes.
+    ///
+    /// For `Float16` uses the vectorized `half::slice::HalfFloatSliceExt::
+    /// convert_to_f32_slice` path when the underlying array is in standard
+    /// contiguous layout; otherwise falls back to a stride-respecting
+    /// element-wise iterator.
     pub fn as_f32(&self) -> std::borrow::Cow<'_, Array3<f32>> {
         match self {
             ProtoTensor::Float(arr) => std::borrow::Cow::Borrowed(arr),
             ProtoTensor::Float16(arr) => {
-                std::borrow::Cow::Owned(arr.map(|&v| v.to_f32()))
+                use half::slice::HalfFloatSliceExt;
+                let mut out = vec![0.0_f32; arr.len()];
+                if let Some(src) = arr.as_slice() {
+                    // Standard-layout contiguous: vectorized widening (the
+                    // `half` crate exposes SIMD variants for AArch64 and SSE2
+                    // under this call).
+                    src.convert_to_f32_slice(&mut out);
+                } else {
+                    // Non-contiguous (sliced/transposed) — respect strides.
+                    for (dst, &src) in out.iter_mut().zip(arr.iter()) {
+                        *dst = src.to_f32();
+                    }
+                }
+                let widened = Array3::from_shape_vec(arr.raw_dim(), out)
+                    .expect("shape/len invariant preserved");
+                std::borrow::Cow::Owned(widened)
             }
             ProtoTensor::Quantized {
                 protos,
