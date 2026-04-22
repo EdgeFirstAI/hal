@@ -1376,9 +1376,13 @@ where
 }
 
 /// Helper: extract ProtoData from float mask coefficients + protos.
+///
+/// When `PROTO` is `half::f16` the protos are kept native and wrapped in
+/// `ProtoTensor::Float16`, letting the GL seg renderer upload them directly
+/// into an `RGBA16F` texture without a redundant f32↔f16 round-trip.
 pub(super) fn extract_proto_data_float<
     MASK: Float + AsPrimitive<f32> + Send + Sync,
-    PROTO: Float + AsPrimitive<f32> + Send + Sync,
+    PROTO: Float + AsPrimitive<f32> + Send + Sync + 'static,
 >(
     det_indices: Vec<(DetectBox, usize)>,
     mask_tensor: ArrayView2<MASK>,
@@ -1391,6 +1395,18 @@ pub(super) fn extract_proto_data_float<
         output_boxes.push(det);
         let row = mask_tensor.row(idx);
         mask_coefficients.push(row.iter().map(|v| v.as_()).collect());
+    }
+    // Keep native f16 protos as-is to skip the widening allocation on the
+    // TensorRT fp16 hot path. Safe layout-wise: PROTO and f16 have identical
+    // representation when TypeId matches.
+    if std::any::TypeId::of::<PROTO>() == std::any::TypeId::of::<half::f16>() {
+        let view_f16 = unsafe {
+            &*(&protos as *const ArrayView3<'_, PROTO> as *const ArrayView3<'_, half::f16>)
+        };
+        return ProtoData {
+            mask_coefficients,
+            protos: ProtoTensor::Float16(view_f16.to_owned()),
+        };
     }
     let protos_f32 = protos.map(|v| v.as_());
     ProtoData {

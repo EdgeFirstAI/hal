@@ -2300,6 +2300,136 @@ outputs:
         }
     }
 
+    /// f16 twin of `yolo_segdet_combined_detection_protos_full_stack_mask_alignment`.
+    /// Proves the Orin TensorRT fp16 engine path: decoder accepts native `F16`
+    /// tensors, the `decode_float::<f16>` instantiation handles NMS and
+    /// coefficient extraction, and segmentation masks are rendered correctly.
+    /// The same 0.95/0.85 scores and +3/−3 mask coefficients as the f32 test
+    /// produce the same near-saturating sigmoid outputs (the 10-bit f16
+    /// mantissa is lossless for these small magnitudes).
+    #[test]
+    fn yolo_segdet_combined_detection_protos_f16_full_stack() {
+        use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait};
+
+        const NC: usize = 2;
+        const NM: usize = 2;
+        const N: usize = 5;
+        const FEAT: usize = 4 + NC + NM;
+        const PH: usize = 8;
+        const PW: usize = 8;
+
+        let detection_cfg = configs::Detection {
+            decoder: DecoderType::Ultralytics,
+            quantization: None,
+            shape: vec![1, FEAT, N],
+            dshape: vec![],
+            anchors: None,
+            normalized: Some(true),
+        };
+        let protos_cfg = configs::Protos {
+            decoder: DecoderType::Ultralytics,
+            quantization: None,
+            shape: vec![1, NM, PH, PW],
+            dshape: vec![],
+        };
+
+        let decoder = DecoderBuilder::default()
+            .with_score_threshold(0.5)
+            .with_iou_threshold(0.5)
+            .with_nms(Some(configs::Nms::ClassAgnostic))
+            .add_output(ConfigOutput::Detection(detection_cfg))
+            .add_output(ConfigOutput::Protos(protos_cfg))
+            .build()
+            .expect("YoloSegDet f16 decoder must build");
+
+        // Build identical detection payload, but as half-precision floats.
+        let mut det_data = vec![half::f16::ZERO; FEAT * N];
+        let set = |d: &mut [half::f16], r: usize, c: usize, v: f32| {
+            d[r * N + c] = half::f16::from_f32(v);
+        };
+        set(&mut det_data, 0, 0, 0.2);
+        set(&mut det_data, 1, 0, 0.2);
+        set(&mut det_data, 2, 0, 0.1);
+        set(&mut det_data, 3, 0, 0.1);
+        set(&mut det_data, 0, 2, 0.8);
+        set(&mut det_data, 1, 2, 0.8);
+        set(&mut det_data, 2, 2, 0.1);
+        set(&mut det_data, 3, 2, 0.1);
+        set(&mut det_data, 4, 0, 0.95);
+        set(&mut det_data, 4, 2, 0.85);
+        set(&mut det_data, 6, 0, 3.0);
+        set(&mut det_data, 7, 0, 3.0);
+        set(&mut det_data, 6, 2, -3.0);
+        set(&mut det_data, 7, 2, -3.0);
+
+        let det_tensor: TensorDyn = {
+            let t =
+                Tensor::<half::f16>::new(&[1, FEAT, N], Some(TensorMemory::Mem), None).unwrap();
+            {
+                let mut m = t.map().unwrap();
+                m.as_mut_slice().copy_from_slice(&det_data);
+            }
+            TensorDyn::F16(t)
+        };
+
+        let proto_data = vec![half::f16::from_f32(1.0); NM * PH * PW];
+        let protos_tensor: TensorDyn = {
+            let t = Tensor::<half::f16>::new(
+                &[1, NM, PH, PW],
+                Some(TensorMemory::Mem),
+                None,
+            )
+            .unwrap();
+            {
+                let mut m = t.map().unwrap();
+                m.as_mut_slice().copy_from_slice(&proto_data);
+            }
+            TensorDyn::F16(t)
+        };
+
+        let inputs: Vec<&TensorDyn> = vec![&det_tensor, &protos_tensor];
+
+        // Path 1: decode() end-to-end with materialized masks.
+        let mut out_boxes: Vec<DetectBox> = Vec::with_capacity(10);
+        let mut out_masks: Vec<crate::Segmentation> = Vec::with_capacity(10);
+        decoder
+            .decode(&inputs, &mut out_boxes, &mut out_masks)
+            .expect("f16 YoloSegDet decode must succeed");
+        assert_eq!(out_boxes.len(), 2, "two anchors above 0.5 should survive");
+        assert_eq!(out_masks.len(), 2);
+
+        for (b, m) in out_boxes.iter().zip(out_masks.iter()) {
+            let cx = (b.bbox.xmin + b.bbox.xmax) * 0.5;
+            let mean: f32 = {
+                let s = &m.segmentation;
+                let total: u32 = s.iter().map(|&v| v as u32).sum();
+                total as f32 / s.len() as f32
+            };
+            if cx < 0.3 {
+                assert!(mean > 200.0, "anchor-0 f16 mask mean {mean}");
+            } else if cx > 0.7 {
+                assert!(mean < 50.0, "anchor-2 f16 mask mean {mean}");
+            } else {
+                panic!("unexpected f16 detection centre {cx:.2}");
+            }
+        }
+
+        // Path 2: decode_proto() produces a `ProtoTensor::Float16` variant
+        // (native f16 protos, no f32 widening on the decoder side).
+        let mut out_boxes2: Vec<DetectBox> = Vec::with_capacity(10);
+        let proto = decoder
+            .decode_proto(&inputs, &mut out_boxes2)
+            .expect("f16 decode_proto must succeed")
+            .expect("YoloSegDet produces ProtoData");
+        assert_eq!(out_boxes2.len(), 2);
+        assert!(
+            proto.protos.is_f16(),
+            "f16 inputs should yield ProtoTensor::Float16, got variant dim={:?}",
+            proto.protos.dim()
+        );
+        assert_eq!(proto.protos.dim(), (PH, PW, NM));
+    }
+
     #[test]
     fn test_dshape_dict_format() {
         // Spec produces array-of-single-key-dicts: [{"batch": 1}, {"num_features": 84}]
@@ -2509,6 +2639,7 @@ outputs:
         // Verify proto data shape
         let protos_shape = match &proto_data.protos {
             crate::ProtoTensor::Quantized { protos, .. } => protos.shape().to_vec(),
+            crate::ProtoTensor::Float16(arr) => arr.shape().to_vec(),
             crate::ProtoTensor::Float(arr) => arr.shape().to_vec(),
         };
         assert_eq!(protos_shape, [160, 160, 32], "Proto shape mismatch");
