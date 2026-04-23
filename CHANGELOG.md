@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Python `Decoder(dict)` constructor now accepts schema v2 metadata.**
+  `PyDecoder::new` previously routed every dict through the legacy
+  `ConfigOutputs` deserialiser, producing the misleading *"invalid type:
+  map, expected tuple struct QuantTuple"* error when given v2 documents
+  produced by `tflite-converter` ≥ v0.3.0. A smart constructor now
+  discriminates on the authoritative `schema_version` field: `>= 2`
+  routes to `DecoderBuilder::with_schema(SchemaV2)`, which supports
+  object-form quantization, per-channel quantization, split logical
+  outputs, and the full v2 type vocabulary. Legacy documents (no
+  `schema_version`, or `schema_version: 1`) continue through the
+  unchanged legacy path. The string constructors
+  (`new_from_json_str` / `new_from_yaml_str`) already went through the
+  v2 path; only the dict constructor was broken. Reference: EDGEAI-1081.
+
+### Changed
+
+- **`ConfigOutput::MaskCoefficients` serde tag renamed to `mask_coefs`
+  with `mask_coefficients` kept as a backward-compatible alias.** The v2
+  spec vocabulary uses `mask_coefs`; the legacy v1 spelling
+  (`mask_coefficients`) continues to parse unchanged so existing models
+  and fixtures are not affected.
+
 ## [0.17.0] - 2026-04-21
 
 ### Added
