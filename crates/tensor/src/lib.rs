@@ -187,6 +187,398 @@ impl fmt::Display for DType {
     }
 }
 
+// =============================================================================
+// Quantization metadata — type-gated to integer element types via sealed
+// `IntegerType` trait. Accessors on `Tensor<T>` only compile when `T` is
+// an integer type; calling them on `Tensor<f32>` / `Tensor<f16>` etc. is a
+// compile error, not a runtime one.
+// =============================================================================
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for u8 {}
+    impl Sealed for i8 {}
+    impl Sealed for u16 {}
+    impl Sealed for i16 {}
+    impl Sealed for u32 {}
+    impl Sealed for i32 {}
+    impl Sealed for u64 {}
+    impl Sealed for i64 {}
+    // Deliberately NOT implemented for f16 / f32 / f64.
+}
+
+/// Integer element types that may carry quantization metadata.
+///
+/// Sealed trait: implemented for `u8`, `i8`, `u16`, `i16`, `u32`, `i32`,
+/// `u64`, `i64`. Cannot be implemented downstream. Float element types
+/// (`half::f16`, `f32`, `f64`) are explicitly excluded — quantization
+/// metadata does not apply to float tensors per the edgefirst.json spec.
+pub trait IntegerType: sealed::Sealed {}
+impl IntegerType for u8 {}
+impl IntegerType for i8 {}
+impl IntegerType for u16 {}
+impl IntegerType for i16 {}
+impl IntegerType for u32 {}
+impl IntegerType for i32 {}
+impl IntegerType for u64 {}
+impl IntegerType for i64 {}
+
+/// Quantization parameters for an integer tensor.
+///
+/// Covers all four modes the edgefirst.json spec defines:
+///
+/// | Mode | `scale.len()` | `zero_point` | `axis` |
+/// |---|---|---|---|
+/// | Per-tensor symmetric | 1 | `None` | `None` |
+/// | Per-tensor asymmetric | 1 | `Some(len == 1)` | `None` |
+/// | Per-channel symmetric | >1 | `None` | `Some(c)` |
+/// | Per-channel asymmetric | >1 | `Some(len == scale.len())` | `Some(c)` |
+///
+/// The quantized storage type is carried on the parent [`Tensor<T>`]; this
+/// struct does not duplicate it. Construct via the four named constructors
+/// (the only public entry points); direct field mutation is not allowed so
+/// invalid combinations cannot be represented.
+///
+/// Dequantization formula:
+///
+/// ```text
+///   real_value = scale[c] × (quantized_value[c] - zero_point[c])
+/// ```
+///
+/// where `c` is the channel index (always `0` for per-tensor).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Quantization {
+    /// Per-tensor: `vec![scale]`. Per-channel: `vec![scale_0, scale_1, ...]`.
+    #[serde(deserialize_with = "deserialize_scalar_or_vec_f32")]
+    scale: Vec<f32>,
+
+    /// `None` means symmetric (zero-point is 0). `Some(vec)` must have the
+    /// same length as `scale`.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_opt_scalar_or_vec_i32",
+        skip_serializing_if = "Option::is_none"
+    )]
+    zero_point: Option<Vec<i32>>,
+
+    /// Channel axis for per-channel quantization. `Some(_)` iff
+    /// `scale.len() > 1`. Validated against the parent tensor's shape at
+    /// `set_quantization()` time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    axis: Option<usize>,
+}
+
+/// Semantic mode discriminant for hot-path kernel dispatch.
+///
+/// Obtain via [`Quantization::mode`] once at kernel entry; never inside a
+/// pixel-level loop. The enum is borrow-based so the hot kernel receives
+/// the scales / zero-points as slices without reallocation.
+#[derive(Debug, Clone, Copy)]
+pub enum QuantMode<'a> {
+    PerTensorSymmetric {
+        scale: f32,
+    },
+    PerTensor {
+        scale: f32,
+        zero_point: i32,
+    },
+    PerChannelSymmetric {
+        scales: &'a [f32],
+        axis: usize,
+    },
+    PerChannel {
+        scales: &'a [f32],
+        zero_points: &'a [i32],
+        axis: usize,
+    },
+}
+
+impl Quantization {
+    /// Per-tensor symmetric (zero_point = 0).
+    pub fn per_tensor_symmetric(scale: f32) -> Self {
+        Self {
+            scale: vec![scale],
+            zero_point: None,
+            axis: None,
+        }
+    }
+
+    /// Per-tensor asymmetric — the most common runtime shape.
+    pub fn per_tensor(scale: f32, zero_point: i32) -> Self {
+        Self {
+            scale: vec![scale],
+            zero_point: Some(vec![zero_point]),
+            axis: None,
+        }
+    }
+
+    /// Per-channel symmetric. Errors on empty `scales`.
+    pub fn per_channel_symmetric(scales: Vec<f32>, axis: usize) -> Result<Self> {
+        if scales.is_empty() {
+            return Err(Error::QuantizationInvalid {
+                field: "scale.len",
+                expected: "non-empty per-channel scales".to_string(),
+                got: "length 0".to_string(),
+            });
+        }
+        Ok(Self {
+            scale: scales,
+            zero_point: None,
+            axis: Some(axis),
+        })
+    }
+
+    /// Per-channel asymmetric. Errors on length mismatch between `scales`
+    /// and `zero_points`, or empty arrays.
+    pub fn per_channel(scales: Vec<f32>, zero_points: Vec<i32>, axis: usize) -> Result<Self> {
+        if scales.is_empty() {
+            return Err(Error::QuantizationInvalid {
+                field: "scale.len",
+                expected: "non-empty per-channel scales".to_string(),
+                got: "length 0".to_string(),
+            });
+        }
+        if scales.len() != zero_points.len() {
+            return Err(Error::QuantizationInvalid {
+                field: "zero_point.len",
+                expected: format!("length matches scale ({})", scales.len()),
+                got: format!("length {}", zero_points.len()),
+            });
+        }
+        Ok(Self {
+            scale: scales,
+            zero_point: Some(zero_points),
+            axis: Some(axis),
+        })
+    }
+
+    /// Borrow-based dispatch view. Match once at kernel entry.
+    pub fn mode(&self) -> QuantMode<'_> {
+        match (self.scale.len(), self.zero_point.as_deref(), self.axis) {
+            (1, None, _) => QuantMode::PerTensorSymmetric {
+                scale: self.scale[0],
+            },
+            (1, Some(zps), _) => QuantMode::PerTensor {
+                scale: self.scale[0],
+                zero_point: zps.first().copied().unwrap_or(0),
+            },
+            (_, None, Some(axis)) => QuantMode::PerChannelSymmetric {
+                scales: &self.scale,
+                axis,
+            },
+            (_, Some(zps), Some(axis)) => QuantMode::PerChannel {
+                scales: &self.scale,
+                zero_points: zps,
+                axis,
+            },
+            // The `validate()` path prevents constructing a
+            // per-channel Quantization without an axis, so the remaining
+            // pattern is unreachable in practice. Fall back to
+            // per-tensor symmetric using scale[0] to avoid panicking in
+            // release; debug builds assert.
+            _ => {
+                debug_assert!(
+                    false,
+                    "Quantization::mode: per-channel without axis is unreachable"
+                );
+                QuantMode::PerTensorSymmetric {
+                    scale: self.scale.first().copied().unwrap_or(1.0),
+                }
+            }
+        }
+    }
+
+    /// Returns `true` for per-tensor quantization (`scale.len() == 1`).
+    pub fn is_per_tensor(&self) -> bool {
+        self.scale.len() == 1
+    }
+
+    /// Returns `true` for per-channel quantization (`scale.len() > 1`).
+    pub fn is_per_channel(&self) -> bool {
+        self.scale.len() > 1
+    }
+
+    /// Returns `true` for symmetric quantization (no zero-point, or
+    /// zero-point vector of all zeros).
+    pub fn is_symmetric(&self) -> bool {
+        match &self.zero_point {
+            None => true,
+            Some(zps) => zps.iter().all(|&z| z == 0),
+        }
+    }
+
+    /// Borrow the scale array. Length 1 for per-tensor; `num_channels` for
+    /// per-channel.
+    pub fn scale(&self) -> &[f32] {
+        &self.scale
+    }
+
+    /// Borrow the zero-point array. `None` for symmetric.
+    pub fn zero_point(&self) -> Option<&[i32]> {
+        self.zero_point.as_deref()
+    }
+
+    /// Channel axis for per-channel quantization. `None` for per-tensor.
+    pub fn axis(&self) -> Option<usize> {
+        self.axis
+    }
+
+    /// Validate against a target tensor shape. Runs in
+    /// `Tensor::set_quantization()`. Catches:
+    ///   - `axis >= shape.len()` (axis out of range)
+    ///   - `scale.len() != shape[axis]` for per-channel
+    ///   - per-channel without axis (reject)
+    ///   - per-tensor with redundant axis (reject)
+    pub(crate) fn validate(&self, shape: &[usize]) -> Result<()> {
+        match (self.scale.len(), self.axis) {
+            (1, None) => Ok(()),
+            (1, Some(_)) => Err(Error::QuantizationInvalid {
+                field: "per_tensor_redundant_axis",
+                expected: "axis=None for per-tensor quantization".to_string(),
+                got: format!("axis={:?}", self.axis),
+            }),
+            (_, None) => Err(Error::QuantizationInvalid {
+                field: "per_channel_requires_axis",
+                expected: format!(
+                    "axis=Some(_) for per-channel quantization (scale.len={})",
+                    self.scale.len()
+                ),
+                got: "axis=None".to_string(),
+            }),
+            (n, Some(axis)) => {
+                if axis >= shape.len() {
+                    return Err(Error::QuantizationInvalid {
+                        field: "axis",
+                        expected: format!("axis < tensor rank ({})", shape.len()),
+                        got: format!("axis={axis}"),
+                    });
+                }
+                if shape[axis] != n {
+                    return Err(Error::QuantizationInvalid {
+                        field: "scale.len",
+                        expected: format!("length matches shape[{axis}] ({})", shape[axis]),
+                        got: format!("length {n}"),
+                    });
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl From<(f32, i32)> for Quantization {
+    /// Convenience construction from a `(scale, zero_point)` tuple. Matches
+    /// the legacy `QuantTuple` / `Quantization::new` calling convention so
+    /// existing `(0.1, -128).into()` sites keep working.
+    fn from((scale, zero_point): (f32, i32)) -> Self {
+        Self::per_tensor(scale, zero_point)
+    }
+}
+
+fn deserialize_scalar_or_vec_f32<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> std::result::Result<Vec<f32>, D::Error> {
+    use serde::de::{self, Visitor};
+    struct V;
+    impl<'de> Visitor<'de> for V {
+        type Value = Vec<f32>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("f32 or array of f32")
+        }
+        fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<Self::Value, E> {
+            Ok(vec![v as f32])
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<Self::Value, E> {
+            Ok(vec![v as f32])
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+        fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<Self::Value, E> {
+            Ok(vec![v as f32])
+        }
+        fn visit_seq<A: de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(1));
+            while let Some(x) = seq.next_element::<f32>()? {
+                out.push(x);
+            }
+            Ok(out)
+        }
+    }
+    de.deserialize_any(V)
+}
+
+fn deserialize_opt_scalar_or_vec_i32<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> std::result::Result<Option<Vec<i32>>, D::Error> {
+    use serde::de::{self, Visitor};
+    struct V;
+    impl<'de> Visitor<'de> for V {
+        type Value = Option<Vec<i32>>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("null, i32, or array of i32")
+        }
+        fn visit_none<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_some<D2: serde::Deserializer<'de>>(
+            self,
+            de: D2,
+        ) -> std::result::Result<Self::Value, D2::Error> {
+            struct Inner;
+            impl<'de> Visitor<'de> for Inner {
+                type Value = Vec<i32>;
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    f.write_str("i32 or array of i32")
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<Self::Value, E> {
+                    Ok(vec![v as i32])
+                }
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<Self::Value, E> {
+                    Ok(vec![v as i32])
+                }
+                fn visit_seq<A: de::SeqAccess<'de>>(
+                    self,
+                    mut seq: A,
+                ) -> std::result::Result<Self::Value, A::Error> {
+                    let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(1));
+                    while let Some(x) = seq.next_element::<i32>()? {
+                        out.push(x);
+                    }
+                    Ok(out)
+                }
+            }
+            de.deserialize_any(Inner).map(Some)
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<Self::Value, E> {
+            Ok(Some(vec![v as i32]))
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<Self::Value, E> {
+            Ok(Some(vec![v as i32]))
+        }
+        fn visit_seq<A: de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(1));
+            while let Some(x) = seq.next_element::<i32>()? {
+                out.push(x);
+            }
+            Ok(Some(out))
+        }
+    }
+    de.deserialize_option(V)
+}
+
 /// Monotonic counter for buffer identity IDs.
 static NEXT_BUFFER_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -643,6 +1035,10 @@ where
     /// Byte offset within the DMA-BUF where image data starts.
     /// `None` means offset 0 (data starts at the beginning of the buffer).
     plane_offset: Option<usize>,
+    /// Quantization metadata for integer-typed tensors. Public access is
+    /// gated by the `IntegerType` trait — `Tensor<f32>` etc. carry the
+    /// field for layout uniformity but have no way to read or write it.
+    pub(crate) quantization: Option<Quantization>,
 }
 
 impl<T> Tensor<T>
@@ -657,7 +1053,60 @@ where
             chroma: None,
             row_stride: None,
             plane_offset: None,
+            quantization: None,
         }
+    }
+
+    /// Construct a tensor from a row-major element slice + shape. Allocates a
+    /// new buffer (`TensorMemory::Mem`) and memcpys the contents; caller
+    /// retains ownership of the input slice.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidShape`] if `values.len() != shape.iter().product()`.
+    /// - Propagates any allocation error from [`Self::new`].
+    pub fn from_slice(values: &[T], shape: &[usize]) -> Result<Self>
+    where
+        T: Copy,
+    {
+        let expected: usize = shape.iter().product();
+        if values.len() != expected {
+            return Err(Error::InvalidShape(format!(
+                "from_slice: values.len()={} but shape product={expected} (shape={shape:?})",
+                values.len()
+            )));
+        }
+        let t = Self::new(shape, Some(TensorMemory::Mem), None)?;
+        {
+            let mut m = t.map()?;
+            m.as_mut_slice().copy_from_slice(values);
+        }
+        Ok(t)
+    }
+
+    /// Construct a tensor from a 3-D ndarray view. Respects strides — one
+    /// copy in all cases; contiguous views take a memcpy fast path.
+    ///
+    /// Only available when the `ndarray` feature is enabled.
+    #[cfg(feature = "ndarray")]
+    pub fn from_arrayview3(view: ndarray::ArrayView3<'_, T>) -> Result<Self>
+    where
+        T: Copy,
+    {
+        let (h, w, c) = view.dim();
+        let t = Self::new(&[h, w, c], Some(TensorMemory::Mem), None)?;
+        {
+            let mut m = t.map()?;
+            let dst = m.as_mut_slice();
+            if let Some(src) = view.as_slice() {
+                dst.copy_from_slice(src);
+            } else {
+                for (d, &s) in dst.iter_mut().zip(view.iter()) {
+                    *d = s;
+                }
+            }
+        }
+        Ok(t)
     }
 
     /// Create a new tensor with the given shape, memory type, and optional
@@ -1007,6 +1456,7 @@ where
             chroma: Some(Box::new(chroma)),
             row_stride: luma.row_stride,
             plane_offset: luma.plane_offset,
+            quantization: luma.quantization,
         })
     }
 
@@ -1186,7 +1636,42 @@ where
             chroma: None,
             row_stride: None,
             plane_offset: None,
+            quantization: None,
         }
+    }
+}
+
+// Quantization accessors — type-gated to integer element types via the
+// sealed `IntegerType` trait. Calling `.quantization()` on a `Tensor<f32>`
+// produces a compile error, not a runtime one.
+impl<T> Tensor<T>
+where
+    T: IntegerType + Num + Clone + fmt::Debug + Send + Sync,
+{
+    /// Quantization metadata for this tensor, if set.
+    pub fn quantization(&self) -> Option<&Quantization> {
+        self.quantization.as_ref()
+    }
+
+    /// Attach quantization metadata to this tensor. Validates against the
+    /// tensor's shape — returns [`Error::QuantizationInvalid`] on any
+    /// inconsistency (mismatched scale/zp lengths, out-of-range axis, etc.).
+    pub fn set_quantization(&mut self, q: Quantization) -> Result<()> {
+        q.validate(self.shape())?;
+        self.quantization = Some(q);
+        Ok(())
+    }
+
+    /// Builder-style variant of [`Self::set_quantization`]. Returns the
+    /// tensor unchanged on error (consumed + rebuilt).
+    pub fn with_quantization(mut self, q: Quantization) -> Result<Self> {
+        self.set_quantization(q)?;
+        Ok(self)
+    }
+
+    /// Clear any quantization metadata on this tensor.
+    pub fn clear_quantization(&mut self) {
+        self.quantization = None;
     }
 }
 
