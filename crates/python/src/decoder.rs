@@ -509,10 +509,16 @@ impl PyDecoder {
         // deserialiser rejects; v1 (or version-less) dicts continue
         // through the legacy path unchanged.
         let value: serde_json::Value = pythonize::depythonize(&config)?;
-        let schema_version = value
+        let schema_version: Option<u32> = value
             .get("schema_version")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32);
+            .cloned()
+            .map(serde_json::from_value::<u32>)
+            .transpose()
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "invalid schema_version: {e}"
+                ))
+            })?;
 
         let decoder = if schema_version.is_some_and(|v| v >= 2) {
             let schema = SchemaV2::from_json_value(value)

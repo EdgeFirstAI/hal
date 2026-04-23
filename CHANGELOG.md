@@ -21,8 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `schema_version`, or `schema_version: 1`) continue through the
   unchanged legacy path. The string constructors
   (`new_from_json_str` / `new_from_yaml_str`) already went through the
-  v2 path; only the dict constructor was broken. Reference: EDGEAI-1081,
-  `SCHEMA_V2_BUG.md`.
+  v2 path; only the dict constructor was broken. Reference: EDGEAI-1081.
 
 ### Changed
 
