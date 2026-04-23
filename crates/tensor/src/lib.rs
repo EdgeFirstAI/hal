@@ -2804,6 +2804,128 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------------
+    // Quantization — constructor validation + accessor correctness.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn test_quantization_per_tensor_constructors() {
+        let q = Quantization::per_tensor(0.1, -5);
+        assert!(q.is_per_tensor());
+        assert!(!q.is_per_channel());
+        assert!(!q.is_symmetric());
+        assert_eq!(q.scale(), &[0.1]);
+        assert_eq!(q.zero_point(), Some(&[-5][..]));
+
+        let qs = Quantization::per_tensor_symmetric(0.05);
+        assert!(qs.is_per_tensor());
+        assert!(qs.is_symmetric());
+        assert_eq!(qs.zero_point(), None);
+    }
+
+    #[test]
+    fn test_quantization_per_channel_constructors() {
+        let q = Quantization::per_channel(vec![0.1, 0.2, 0.3], vec![0, -1, 1], 2).unwrap();
+        assert!(q.is_per_channel());
+        assert!(!q.is_symmetric());
+        assert_eq!(q.axis(), Some(2));
+        assert_eq!(q.scale().len(), 3);
+
+        let qs = Quantization::per_channel_symmetric(vec![0.054, 0.089, 0.195], 0).unwrap();
+        assert!(qs.is_per_channel());
+        assert!(qs.is_symmetric());
+        assert_eq!(qs.axis(), Some(0));
+    }
+
+    #[test]
+    fn test_quantization_per_channel_length_mismatch_rejected() {
+        // len(scales) != len(zero_points) → rejected at construction.
+        let err = Quantization::per_channel(vec![0.1, 0.2], vec![0, 0, 0], 0).unwrap_err();
+        assert!(matches!(err, Error::QuantizationInvalid { .. }));
+    }
+
+    #[test]
+    fn test_quantization_per_channel_empty_rejected() {
+        let err = Quantization::per_channel_symmetric(vec![], 0).unwrap_err();
+        assert!(matches!(err, Error::QuantizationInvalid { .. }));
+    }
+
+    #[test]
+    fn test_quantization_mode_dispatch() {
+        let pt = Quantization::per_tensor(0.1, -5);
+        assert!(matches!(
+            pt.mode(),
+            QuantMode::PerTensor { scale, zero_point } if scale == 0.1 && zero_point == -5
+        ));
+
+        let pts = Quantization::per_tensor_symmetric(0.05);
+        assert!(matches!(
+            pts.mode(),
+            QuantMode::PerTensorSymmetric { scale } if scale == 0.05
+        ));
+
+        let pc = Quantization::per_channel(vec![0.1, 0.2], vec![0, -1], 2).unwrap();
+        assert!(matches!(
+            pc.mode(),
+            QuantMode::PerChannel { axis: 2, .. }
+        ));
+
+        let pcs = Quantization::per_channel_symmetric(vec![0.1, 0.2], 0).unwrap();
+        assert!(matches!(
+            pcs.mode(),
+            QuantMode::PerChannelSymmetric { axis: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn test_tensor_quantization_roundtrip_integer() {
+        let mut t = Tensor::<i8>::new(&[2, 3, 4], Some(TensorMemory::Mem), None).unwrap();
+        assert!(t.quantization().is_none());
+        t.set_quantization(Quantization::per_tensor(0.1, -5)).unwrap();
+        let q = t.quantization().unwrap();
+        assert_eq!(q.scale(), &[0.1]);
+        t.clear_quantization();
+        assert!(t.quantization().is_none());
+    }
+
+    #[test]
+    fn test_tensor_with_quantization_builder() {
+        let t = Tensor::<i8>::new(&[4, 4], Some(TensorMemory::Mem), None)
+            .unwrap()
+            .with_quantization(Quantization::per_tensor_symmetric(0.05))
+            .unwrap();
+        assert!(t.quantization().is_some());
+    }
+
+    #[test]
+    fn test_tensor_dyn_quantization_float_arm_returns_none() {
+        let t = Tensor::<f32>::new(&[2, 2], Some(TensorMemory::Mem), None).unwrap();
+        let td = TensorDyn::F32(t);
+        assert!(td.quantization().is_none());
+    }
+
+    #[test]
+    fn test_tensor_dyn_set_quantization_float_arm_errors() {
+        let t = Tensor::<f32>::new(&[2, 2], Some(TensorMemory::Mem), None).unwrap();
+        let mut td = TensorDyn::F32(t);
+        let err = td
+            .set_quantization(Quantization::per_tensor(0.1, 0))
+            .unwrap_err();
+        // float path returns a QuantizationInvalid error.
+        assert!(matches!(err, Error::QuantizationInvalid { .. }));
+    }
+
+    /// Compile-time type gate — calling `Tensor::<f32>::quantization()` must
+    /// fail to compile (the `IntegerType` trait bound is not satisfied by
+    /// `f32`). This doctest anchors the invariant.
+    ///
+    /// ```compile_fail
+    /// use edgefirst_tensor::{Tensor, TensorMemory};
+    /// let t = Tensor::<f32>::new(&[2, 2], Some(TensorMemory::Mem), None).unwrap();
+    /// let _ = t.quantization(); // compile error: f32 not IntegerType
+    /// ```
+    fn _compile_fail_doctest_anchor() {}
+
     // Any test that cares about the fd count must grab it exclusively.
     // Any tests which modifies the fd count by opening or closing fds must grab it
     // shared.
