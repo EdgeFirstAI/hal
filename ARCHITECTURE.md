@@ -516,6 +516,45 @@ with an explicit `nms` field (`ClassAgnostic` or `ClassAware`).
 - `Some(Nms::ClassAware)` — only suppress boxes sharing the same class label
 - `None` — bypass NMS entirely (auto-set for end-to-end models)
 
+**Output Tensor Physical-Order Contract** (EDGEAI-1288):
+
+Every output declared to the decoder — whether programmatically via
+`hal_decoder_params_add_output` / `DecoderBuilder`, or through YAML/JSON config
+— must have its `shape` and `dshape` fields listed in **physical memory order,
+outermost axis first, innermost axis last**. HAL derives C-contiguous strides
+from `shape` and wraps the raw buffer bytes with those strides; it never
+reorders bytes. When `dshape` is also supplied, HAL uses it to permute the
+stride tuple into the decoder's canonical logical order for the output role
+(e.g. `[batch, height, width, num_protos]` for protos); only the stride
+indices change, not the bytes.
+
+When `dshape` is omitted, HAL assumes `shape` is already in the decoder's
+canonical order for the role. This is appropriate for producers like
+Ultralytics ONNX/TFLite flat-detection, which emit outputs in the order the
+decoder kernels expect.
+
+Mis-declaring physical order (e.g. using NCHW dim names on an NHWC buffer)
+causes every element access to index the wrong byte. This was the root cause of
+two distinct production bugs: a vertical-stripe mask artifact on i.MX 8M Plus
+TFLite segmentation, and a coordinate mis-decode with Ara-2 anchor-first
+split-tensor boxes. HAL cannot detect the mismatch at runtime because it has no
+visibility into how the inference engine laid out the bytes.
+
+`DecoderBuilder::build` validates each output at construction time:
+- `dshape.len()` must equal `shape.len()` when `dshape` is present.
+- Each `dshape[i].size` must equal `shape[i]` — catches the common mistake of
+  declaring `dshape` in a different order than `shape`.
+- No axis name may appear twice within a single output's `dshape`.
+
+Common physical layouts by framework:
+
+| Framework | Typical proto layout | How to declare |
+|-----------|---------------------|----------------|
+| TFLite (NNStreamer) | `[1, H, W, C]` NHWC | `shape=[1,H,W,C]`, `dshape=[batch,height,width,num_protos]` |
+| ONNX / PyTorch | `[1, C, H, W]` NCHW | `shape=[1,C,H,W]`, `dshape=[batch,num_protos,height,width]` |
+| Ara-2 DVM | `[1, N, 1, 4]` anchor-first | `shape=[1,N,1,4]`, `dshape=[batch,num_boxes,padding,box_coords]` |
+| Ultralytics flat | already canonical | `shape=[1,C,N]`, `dshape` may be omitted |
+
 **Proto Mask API**:
 
 For segmentation models, `decode_quantized_proto()` and `decode_float_proto()`
