@@ -1734,11 +1734,26 @@ mod cpu_tests {
         num_protos: usize,
         coefficients: Vec<Vec<f32>>,
     ) -> crate::ProtoData {
+        use edgefirst_tensor::{Tensor, TensorDyn};
+        let n = coefficients.len().max(1);
+        let mut flat = Vec::with_capacity(n * num_protos);
+        if coefficients.is_empty() {
+            flat.resize(num_protos, 0.0_f32);
+        } else {
+            for row in &coefficients {
+                assert_eq!(row.len(), num_protos, "mask_coeff row len mismatch");
+                flat.extend_from_slice(row);
+            }
+        }
+        let coeff_t = Tensor::<f32>::from_slice(&flat, &[n, num_protos]).unwrap();
+        let protos_t = Tensor::<f32>::from_slice(
+            &vec![0.0_f32; proto_h * proto_w * num_protos],
+            &[proto_h, proto_w, num_protos],
+        )
+        .unwrap();
         crate::ProtoData {
-            mask_coefficients: coefficients,
-            protos: edgefirst_decoder::ProtoTensor::Float(ndarray::Array3::<f32>::zeros((
-                proto_h, proto_w, num_protos,
-            ))),
+            mask_coefficients: TensorDyn::F32(coeff_t),
+            protos: TensorDyn::F32(protos_t),
         }
     }
 

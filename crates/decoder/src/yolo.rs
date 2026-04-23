@@ -21,8 +21,8 @@ use crate::{
         nms_class_aware_float, nms_extra_class_aware_float, nms_extra_float, nms_float,
         postprocess_boxes_float, postprocess_boxes_index_float,
     },
-    BBoxTypeTrait, BoundingBox, DetectBox, DetectBoxQuantized, IntoProtoTensor, ProtoData,
-    ProtoTensor, Quantization, Segmentation, XYWH, XYXY,
+    BBoxTypeTrait, BoundingBox, DetectBox, DetectBoxQuantized, ProtoData, Quantization,
+    Segmentation, XYWH, XYXY,
 };
 
 /// Maximum number of above-threshold candidates fed to NMS.
@@ -1249,8 +1249,8 @@ where
 /// Runs NMS but returns raw `ProtoData` instead of materialized masks.
 pub(crate) fn impl_yolo_segdet_float_proto<
     B: BBoxTypeTrait,
-    BOX: Float + AsPrimitive<f32> + Send + Sync,
-    PROTO: Float + AsPrimitive<f32> + Send + Sync + IntoProtoTensor,
+    BOX: Float + AsPrimitive<f32> + Copy + Send + Sync + FloatProtoElem,
+    PROTO: Float + AsPrimitive<f32> + Copy + Send + Sync + FloatProtoElem,
 >(
     boxes: ArrayView2<BOX>,
     protos: ArrayView3<PROTO>,
@@ -1284,8 +1284,8 @@ pub(crate) fn impl_yolo_split_segdet_float_proto<
     B: BBoxTypeTrait,
     BOX: Float + AsPrimitive<f32> + Send + Sync,
     SCORE: Float + AsPrimitive<f32> + Send + Sync,
-    MASK: Float + AsPrimitive<f32> + Send + Sync,
-    PROTO: Float + AsPrimitive<f32> + Send + Sync + IntoProtoTensor,
+    MASK: Float + AsPrimitive<f32> + Copy + Send + Sync + FloatProtoElem,
+    PROTO: Float + AsPrimitive<f32> + Copy + Send + Sync + FloatProtoElem,
 >(
     boxes_tensor: ArrayView2<BOX>,
     scores_tensor: ArrayView2<SCORE>,
@@ -1321,7 +1321,7 @@ pub fn decode_yolo_end_to_end_segdet_float_proto<T>(
     output_boxes: &mut Vec<DetectBox>,
 ) -> Result<ProtoData, crate::DecoderError>
 where
-    T: Float + AsPrimitive<f32> + Send + Sync + IntoProtoTensor,
+    T: Float + AsPrimitive<f32> + Copy + Send + Sync + FloatProtoElem,
     f32: AsPrimitive<T>,
 {
     let (boxes, scores, classes, mask_coeff) =
@@ -1354,7 +1354,7 @@ pub fn decode_yolo_split_end_to_end_segdet_float_proto<T>(
     output_boxes: &mut Vec<DetectBox>,
 ) -> Result<ProtoData, crate::DecoderError>
 where
-    T: Float + AsPrimitive<f32> + Send + Sync + IntoProtoTensor,
+    T: Float + AsPrimitive<f32> + Copy + Send + Sync + FloatProtoElem,
     f32: AsPrimitive<T>,
 {
     let (boxes, scores, classes, mask_coeff) =
@@ -1377,38 +1377,51 @@ where
 
 /// Helper: extract ProtoData from float mask coefficients + protos.
 ///
-/// Selects the [`ProtoTensor`] variant by calling `PROTO::into_proto_tensor`
-/// — safe trait dispatch, no `unsafe` `ArrayView3<T>` layout casts, no
-/// `TypeId` checks. `PROTO = f16` yields `ProtoTensor::Float16` so the GL
-/// seg renderer can upload directly into `RGBA16F`; `f32`/`f64` widen to
-/// `ProtoTensor::Float(Array3<f32>)`.
+/// Builds [`ProtoData`] with both `protos` and `mask_coefficients` as
+/// [`edgefirst_tensor::TensorDyn`]. Preserves the native element type for
+/// `f16` and `f32`; narrows `f64` to `f32` (there is no native f64 kernel
+/// path). `mask_coefficients` shape is `[num_detections, num_protos]`.
 pub(super) fn extract_proto_data_float<
-    MASK: Float + AsPrimitive<f32> + Send + Sync,
-    PROTO: Float + AsPrimitive<f32> + Send + Sync + IntoProtoTensor,
+    MASK: Float + AsPrimitive<f32> + Copy + Send + Sync + FloatProtoElem,
+    PROTO: Float + AsPrimitive<f32> + Copy + Send + Sync + FloatProtoElem,
 >(
     det_indices: Vec<(DetectBox, usize)>,
     mask_tensor: ArrayView2<MASK>,
     protos: ArrayView3<PROTO>,
     output_boxes: &mut Vec<DetectBox>,
 ) -> ProtoData {
-    let mut mask_coefficients = Vec::with_capacity(det_indices.len());
+    let num_protos = mask_tensor.ncols();
+    let n = det_indices.len();
+
+    // Per-detection coefficients packed row-major into a contiguous buffer,
+    // preserving the source dtype. Shape: [N, num_protos].
+    let mut coeff_rows: Vec<MASK> = Vec::with_capacity(n * num_protos);
     output_boxes.clear();
     for (det, idx) in det_indices {
         output_boxes.push(det);
         let row = mask_tensor.row(idx);
-        mask_coefficients.push(row.iter().map(|v| v.as_()).collect());
+        coeff_rows.extend(row.iter().copied());
     }
+
+    let mask_coefficients = MASK::slice_into_tensor_dyn(&coeff_rows, &[n, num_protos])
+        .expect("allocating mask_coefficients TensorDyn");
+    let protos_tensor = PROTO::arrayview3_into_tensor_dyn(protos)
+        .expect("allocating protos TensorDyn");
+
     ProtoData {
         mask_coefficients,
-        protos: PROTO::into_proto_tensor(protos),
+        protos: protos_tensor,
     }
 }
 
 /// Helper: extract ProtoData from quantized mask coefficients + protos.
 ///
-/// Dequantizes mask coefficients to f32 (small — per-detection) but keeps
-/// protos in raw int8 form wrapped in `ProtoTensor::Quantized` so the GPU
-/// shader can dequantize per-texel without CPU overhead.
+/// Dequantizes mask coefficients to f32 at extraction (one-time cost on a
+/// `num_detections * num_protos` slice) and keeps protos in raw i8,
+/// attaching the dequantization params as
+/// [`edgefirst_tensor::Quantization::per_tensor`] metadata on the proto
+/// tensor. The GPU shader / CPU kernel reads `protos.quantization()` and
+/// dequantizes per-texel.
 pub(crate) fn extract_proto_data_quant<
     MASK: PrimInt + AsPrimitive<f32> + Send + Sync,
     PROTO: PrimInt + AsPrimitive<f32> + AsPrimitive<i8> + Send + Sync + 'static,
@@ -1420,37 +1433,138 @@ pub(crate) fn extract_proto_data_quant<
     quant_protos: Quantization,
     output_boxes: &mut Vec<DetectBox>,
 ) -> ProtoData {
-    let mut mask_coefficients = Vec::with_capacity(det_indices.len());
+    use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait};
+
+    let num_protos = mask_tensor.ncols();
+    let n = det_indices.len();
+    let mut coeff_f32 = Vec::<f32>::with_capacity(n * num_protos);
     output_boxes.clear();
     for (det, idx) in det_indices {
         output_boxes.push(det);
         let row = mask_tensor.row(idx);
-        mask_coefficients.push(
+        coeff_f32.extend(
             row.iter()
-                .map(|v| (v.as_() - quant_masks.zero_point as f32) * quant_masks.scale)
-                .collect(),
+                .map(|v| (v.as_() - quant_masks.zero_point as f32) * quant_masks.scale),
         );
     }
-    // Keep protos in raw int8 — GPU shader will dequantize per-texel.
-    // When PROTO is already i8, use to_owned() for a flat memcpy instead of
-    // per-element as_() conversion.
-    let protos_i8 = if std::any::TypeId::of::<PROTO>() == std::any::TypeId::of::<i8>() {
-        // SAFETY: PROTO and i8 have identical size and layout when TypeId matches.
-        let view_i8 =
-            unsafe { &*(&protos as *const ArrayView3<'_, PROTO> as *const ArrayView3<'_, i8>) };
-        view_i8.to_owned()
-    } else {
-        protos.map(|v| {
-            let v_i8: i8 = v.as_();
-            v_i8
-        })
-    };
+
+    let coeff_tensor = Tensor::<f32>::new(&[n, num_protos], Some(TensorMemory::Mem), None)
+        .expect("allocating mask_coefficients tensor");
+    {
+        let mut m = coeff_tensor
+            .map()
+            .expect("mapping mask_coefficients tensor");
+        m.as_mut_slice().copy_from_slice(&coeff_f32);
+    }
+    let mask_coefficients = TensorDyn::F32(coeff_tensor);
+
+    // Keep protos in raw i8 — consumers dequantize via protos.quantization().
+    // When PROTO is already i8, memcpy via to_owned(); else per-element as_().
+    let (h, w, k) = protos.dim();
+    let protos_tensor = Tensor::<i8>::new(&[h, w, k], Some(TensorMemory::Mem), None)
+        .expect("allocating protos tensor");
+    {
+        let mut m = protos_tensor.map().expect("mapping protos tensor");
+        let dst = m.as_mut_slice();
+        if std::any::TypeId::of::<PROTO>() == std::any::TypeId::of::<i8>() {
+            // SAFETY: PROTO == i8 checked via TypeId; cast slice view is
+            // size/alignment-compatible by construction.
+            let src: &[i8] = unsafe {
+                std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len())
+            };
+            if protos.is_standard_layout() {
+                dst.copy_from_slice(src);
+            } else {
+                for (d, s) in dst.iter_mut().zip(protos.iter()) {
+                    let v_i8: i8 = s.as_();
+                    *d = v_i8;
+                }
+            }
+        } else {
+            for (d, s) in dst.iter_mut().zip(protos.iter()) {
+                let v_i8: i8 = s.as_();
+                *d = v_i8;
+            }
+        }
+    }
+    let tensor_quant = edgefirst_tensor::Quantization::per_tensor(
+        quant_protos.scale,
+        quant_protos.zero_point,
+    );
+    let protos_tensor = protos_tensor
+        .with_quantization(tensor_quant)
+        .expect("per-tensor quantization on new Tensor<i8>");
+
     ProtoData {
         mask_coefficients,
-        protos: ProtoTensor::Quantized {
-            protos: protos_i8,
-            quantization: quant_protos,
-        },
+        protos: TensorDyn::I8(protos_tensor),
+    }
+}
+
+/// Per-float-dtype construction of a [`TensorDyn`] from a flat slice / 3-D
+/// `ArrayView`. Replaces the old `IntoProtoTensor` trait. Each implementor
+/// either passes its element type straight to `Tensor::from_slice` /
+/// `Tensor::from_arrayview3`, or narrows `f64` to `f32` (no native f64 kernel
+/// path exists).
+pub trait FloatProtoElem: Copy + 'static {
+    fn slice_into_tensor_dyn(
+        values: &[Self],
+        shape: &[usize],
+    ) -> edgefirst_tensor::Result<edgefirst_tensor::TensorDyn>;
+
+    fn arrayview3_into_tensor_dyn(
+        view: ArrayView3<'_, Self>,
+    ) -> edgefirst_tensor::Result<edgefirst_tensor::TensorDyn>;
+}
+
+impl FloatProtoElem for f32 {
+    fn slice_into_tensor_dyn(
+        values: &[f32],
+        shape: &[usize],
+    ) -> edgefirst_tensor::Result<edgefirst_tensor::TensorDyn> {
+        edgefirst_tensor::Tensor::<f32>::from_slice(values, shape)
+            .map(edgefirst_tensor::TensorDyn::F32)
+    }
+    fn arrayview3_into_tensor_dyn(
+        view: ArrayView3<'_, f32>,
+    ) -> edgefirst_tensor::Result<edgefirst_tensor::TensorDyn> {
+        edgefirst_tensor::Tensor::<f32>::from_arrayview3(view)
+            .map(edgefirst_tensor::TensorDyn::F32)
+    }
+}
+
+impl FloatProtoElem for half::f16 {
+    fn slice_into_tensor_dyn(
+        values: &[half::f16],
+        shape: &[usize],
+    ) -> edgefirst_tensor::Result<edgefirst_tensor::TensorDyn> {
+        edgefirst_tensor::Tensor::<half::f16>::from_slice(values, shape)
+            .map(edgefirst_tensor::TensorDyn::F16)
+    }
+    fn arrayview3_into_tensor_dyn(
+        view: ArrayView3<'_, half::f16>,
+    ) -> edgefirst_tensor::Result<edgefirst_tensor::TensorDyn> {
+        edgefirst_tensor::Tensor::<half::f16>::from_arrayview3(view)
+            .map(edgefirst_tensor::TensorDyn::F16)
+    }
+}
+
+impl FloatProtoElem for f64 {
+    fn slice_into_tensor_dyn(
+        values: &[f64],
+        shape: &[usize],
+    ) -> edgefirst_tensor::Result<edgefirst_tensor::TensorDyn> {
+        // Narrow to f32 — no native f64 kernel path.
+        let narrowed: Vec<f32> = values.iter().map(|&v| v as f32).collect();
+        edgefirst_tensor::Tensor::<f32>::from_slice(&narrowed, shape)
+            .map(edgefirst_tensor::TensorDyn::F32)
+    }
+    fn arrayview3_into_tensor_dyn(
+        view: ArrayView3<'_, f64>,
+    ) -> edgefirst_tensor::Result<edgefirst_tensor::TensorDyn> {
+        let narrowed: ndarray::Array3<f32> = view.mapv(|v| v as f32);
+        edgefirst_tensor::Tensor::<f32>::from_arrayview3(narrowed.view())
+            .map(edgefirst_tensor::TensorDyn::F32)
     }
 }
 
@@ -2301,11 +2415,10 @@ mod tests {
 
         // Should produce detections (NMS will collapse many overlapping boxes)
         assert!(!output_boxes.is_empty());
-        assert_eq!(proto_data.mask_coefficients.len(), output_boxes.len());
+        let coeffs_shape = proto_data.mask_coefficients.shape();
+        assert_eq!(coeffs_shape[0], output_boxes.len());
         // Each mask coefficient vector should have 32 elements
-        for coeffs in &proto_data.mask_coefficients {
-            assert_eq!(coeffs.len(), num_mask_coeffs);
-        }
+        assert_eq!(coeffs_shape[1], num_mask_coeffs);
     }
 
     // ========================================================================
