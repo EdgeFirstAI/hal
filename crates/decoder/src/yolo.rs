@@ -2397,8 +2397,10 @@ mod tests {
         }
         let boxes = ndarray::Array2::from_shape_vec((rows, num_proposals), data).unwrap();
 
-        // Protos must be in HWC order (decoder.rs protos_to_hwc converts
-        // before calling into these functions).
+        // Protos must be in HWC order. Under the HAL physical-order
+        // contract, callers declare shape+dshape matching producer memory
+        // and swap_axes_if_needed permutes the stride tuple into canonical
+        // [batch, height, width, num_protos] before this function sees it.
         let protos = ndarray::Array3::<f32>::zeros((160, 160, num_mask_coeffs));
 
         let mut output_boxes = Vec::with_capacity(300);

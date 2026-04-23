@@ -117,6 +117,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `edgefirst_tensor::Quantization`** via `TryFrom<&schema::Quantization>`,
   covering all four modes.
 
+- **`ConfigOutput::MaskCoefficients` serde tag renamed to `mask_coefs`
+  with `mask_coefficients` kept as a backward-compatible alias.** The v2
+  spec vocabulary uses `mask_coefs`; the legacy v1 spelling
+  (`mask_coefficients`) continues to parse unchanged so existing models
+  and fixtures are not affected.
+
+### Fixed
+
+- **Physical-order contract for `shape` / `dshape` in output configuration
+  (EDGEAI-1288).** Two production bugs — TFLite YOLOv8-seg vertical-stripe
+  mask corruption on i.MX 8M Plus and Ara-2 anchor-first split-tensor
+  mis-decode — were both caused by ambiguity in how `shape` and `dshape`
+  were interpreted relative to the producer's physical buffer layout. HAL
+  now enforces a single, explicit rule: **`shape` and `dshape` passed to
+  `hal_decoder_params_add_output` (or their YAML/JSON equivalents) must
+  be in physical memory order, outermost axis first.** HAL derives
+  C-contiguous strides from `shape` and wraps the buffer with those
+  strides directly; when `dshape` is present HAL uses it to permute the
+  stride tuple into the decoder's canonical logical order — no bytes are
+  moved. Callers who omit `dshape` assert that `shape` is already
+  canonical for the output role. The size-heuristic in `protos_to_hwc`
+  (which tried to infer NCHW vs NHWC from channel-count comparisons) has
+  been removed; producers with a non-canonical physical layout must now
+  declare it explicitly via `dshape`. Validation at
+  `DecoderBuilder::build` time catches size mismatches between `shape`
+  and `dshape` entries with a clear error. **Non-breaking for all
+  in-tree callers**, which already declared physical order; callers that
+  relied on the removed heuristic must add an explicit `dshape`.
+- **Python `Decoder(dict)` constructor now accepts schema v2 metadata.**
+  `PyDecoder::new` previously routed every dict through the legacy
+  `ConfigOutputs` deserialiser, producing the misleading *"invalid type:
+  map, expected tuple struct QuantTuple"* error when given v2 documents
+  produced by `tflite-converter` ≥ v0.3.0. A smart constructor now
+  discriminates on the authoritative `schema_version` field: `>= 2`
+  routes to `DecoderBuilder::with_schema(SchemaV2)`, which supports
+  object-form quantization, per-channel quantization, split logical
+  outputs, and the full v2 type vocabulary. Legacy documents (no
+  `schema_version`, or `schema_version: 1`) continue through the
+  unchanged legacy path. The string constructors
+  (`new_from_json_str` / `new_from_yaml_str`) already went through the
+  v2 path; only the dict constructor was broken. Reference: EDGEAI-1081.
+
 ### Not in this release
 
 - GL shader-side per-channel dequantization (CPU handles it; GL

@@ -123,7 +123,7 @@ mod decoder_builder_tests {
                         (DimName::Batch, 1),
                         (DimName::NumFeatures, 85),
                         (DimName::NumBoxes, 8400),
-                        (DimName::Batch, 1),
+                        (DimName::Padding, 1),
                     ],
                     normalized: Some(true),
                 },
@@ -207,7 +207,7 @@ mod decoder_builder_tests {
                         (DimName::Batch, 1),
                         (DimName::NumFeatures, 84),
                         (DimName::NumBoxes, 8400),
-                        (DimName::Batch, 1),
+                        (DimName::Padding, 1),
                     ],
                     normalized: Some(true),
                 },
@@ -274,7 +274,7 @@ mod decoder_builder_tests {
                         (DimName::Batch, 1),
                         (DimName::NumFeatures, 85),
                         (DimName::NumBoxes, 8400),
-                        (DimName::Batch, 1),
+                        (DimName::Padding, 1),
                     ],
                     normalized: Some(true),
                 },
@@ -318,7 +318,7 @@ mod decoder_builder_tests {
                         (DimName::NumProtos, 32),
                         (DimName::Height, 160),
                         (DimName::Width, 160),
-                        (DimName::Batch, 1),
+                        (DimName::Padding, 1),
                     ],
                     quantization: None,
                 },
@@ -357,7 +357,6 @@ mod decoder_builder_tests {
                 Some(DecoderVersion::Yolo11),
             )
             .build();
-        println!("{:?}", result);
         assert!(matches!(
             result, Err(DecoderError::InvalidConfig(s)) if s == "Invalid shape: Yolo num_features 36 must be greater than 36"));
     }
@@ -374,7 +373,7 @@ mod decoder_builder_tests {
                         (DimName::Batch, 1),
                         (DimName::BoxCoords, 4),
                         (DimName::NumBoxes, 8400),
-                        (DimName::Batch, 1),
+                        (DimName::Padding, 1),
                     ],
                     normalized: Some(true),
                 },
@@ -415,7 +414,7 @@ mod decoder_builder_tests {
                         (DimName::Batch, 1),
                         (DimName::NumClasses, 80),
                         (DimName::NumBoxes, 8400),
-                        (DimName::Batch, 1),
+                        (DimName::Padding, 1),
                     ],
                 },
             )
@@ -479,7 +478,7 @@ mod decoder_builder_tests {
             )
             .build();
         assert!(matches!(
-            result, Err(DecoderError::InvalidConfig(s)) if s.starts_with("BoxCoords dimension size must be 4")));
+            result, Err(DecoderError::InvalidConfig(s)) if s.contains("`box_coords` axis must have size 4")));
     }
 
     #[test]
@@ -494,7 +493,7 @@ mod decoder_builder_tests {
                         (DimName::Batch, 1),
                         (DimName::NumBoxes, 8400),
                         (DimName::BoxCoords, 4),
-                        (DimName::Batch, 1),
+                        (DimName::Padding, 1),
                     ],
                     normalized: Some(true),
                 },
@@ -557,7 +556,7 @@ mod decoder_builder_tests {
                         (DimName::Batch, 1),
                         (DimName::NumBoxes, 8400),
                         (DimName::NumClasses, 80),
-                        (DimName::Batch, 1),
+                        (DimName::Padding, 1),
                     ],
                 },
                 configs::MaskCoefficients {
@@ -618,7 +617,7 @@ mod decoder_builder_tests {
                         (DimName::Batch, 1),
                         (DimName::NumBoxes, 8400),
                         (DimName::NumProtos, 32),
-                        (DimName::Batch, 1),
+                        (DimName::Padding, 1),
                     ],
                 },
                 configs::Protos {
@@ -680,7 +679,7 @@ mod decoder_builder_tests {
                         (DimName::NumProtos, 32),
                         (DimName::Height, 160),
                         (DimName::Width, 160),
-                        (DimName::Batch, 1),
+                        (DimName::Padding, 1),
                     ],
                 },
             )
@@ -1039,7 +1038,7 @@ mod decoder_builder_tests {
             )
             .build();
         assert!(matches!(
-            result, Err(DecoderError::InvalidConfig(s)) if s == "Padding dimension size must be 1"));
+            result, Err(DecoderError::InvalidConfig(s)) if s.contains("`padding` axis must have size 1")));
 
         let result = DecoderBuilder::new()
             .with_config_modelpack_det(
@@ -1069,7 +1068,7 @@ mod decoder_builder_tests {
             .build();
 
         assert!(matches!(
-            result, Err(DecoderError::InvalidConfig(s)) if s == "BoxCoords dimension size must be 4"));
+            result, Err(DecoderError::InvalidConfig(s)) if s.contains("`box_coords` axis must have size 4")));
 
         let result = DecoderBuilder::new()
             .with_config_modelpack_det(
@@ -2052,6 +2051,8 @@ outputs:
             decoder: DecoderType::Ultralytics,
             quantization: Some(QuantTuple(1.0, 0)),
             shape: vec![1, FEAT, N],
+            // Shape is already canonical [batch, num_features, num_boxes];
+            // dshape omitted.
             dshape: vec![],
             anchors: None,
             normalized: Some(true),
@@ -2060,7 +2061,15 @@ outputs:
             decoder: DecoderType::Ultralytics,
             quantization: Some(QuantTuple(1.0, 0)),
             shape: vec![1, NM, PH, PW],
-            dshape: vec![],
+            // Physical CHW layout (producer writes channels-outer); HAL
+            // permutes to canonical HWC via swap_axes driven by this
+            // dshape.
+            dshape: vec![
+                (DimName::Batch, 1),
+                (DimName::NumProtos, NM),
+                (DimName::Height, PH),
+                (DimName::Width, PW),
+            ],
         };
 
         let decoder = DecoderBuilder::default()
@@ -2191,6 +2200,8 @@ outputs:
             decoder: DecoderType::Ultralytics,
             quantization: Some(QuantTuple(1.0, 0)),
             shape: vec![1, FEAT, N],
+            // Shape is already canonical [batch, num_features, num_boxes];
+            // dshape omitted.
             dshape: vec![],
             anchors: None,
             normalized: Some(true),
@@ -2199,7 +2210,15 @@ outputs:
             decoder: DecoderType::Ultralytics,
             quantization: Some(QuantTuple(1.0, 0)),
             shape: vec![1, NM, PH, PW],
-            dshape: vec![],
+            // Physical CHW layout (producer writes channels-outer); HAL
+            // permutes to canonical HWC via swap_axes driven by this
+            // dshape.
+            dshape: vec![
+                (DimName::Batch, 1),
+                (DimName::NumProtos, NM),
+                (DimName::Height, PH),
+                (DimName::Width, PW),
+            ],
         };
 
         let decoder = DecoderBuilder::default()
@@ -2330,7 +2349,15 @@ outputs:
             decoder: DecoderType::Ultralytics,
             quantization: None,
             shape: vec![1, NM, PH, PW],
-            dshape: vec![],
+            // Physical CHW (producer channels-outer); HAL permutes to canonical
+            // HWC via the dshape-driven stride permutation introduced in
+            // EDGEAI-1288.
+            dshape: vec![
+                (DimName::Batch, 1),
+                (DimName::NumProtos, NM),
+                (DimName::Height, PH),
+                (DimName::Width, PW),
+            ],
         };
 
         let decoder = DecoderBuilder::default()
@@ -3753,6 +3780,35 @@ outputs:
             // rendering is a separate concern (NHWC_PROTOS.md).
             let protos_out = &merged[3];
             assert_eq!(protos_out.shape(), &[1, 160, 160, 32]);
+        }
+    }
+
+    // =========================================================================
+    // Legacy ConfigOutput serde tag vocabulary
+    // =========================================================================
+
+    mod config_output_serde {
+        use crate::ConfigOutput;
+
+        #[test]
+        fn mask_coefs_is_primary_spelling() {
+            // v2 spec vocabulary uses `mask_coefs`. The legacy ConfigOutput
+            // enum must accept it so that any consumer re-serialising through
+            // the legacy path (or feeding a v2-vocabulary dict into the
+            // legacy deserialiser) stays compatible.
+            let j = r#"{"type": "mask_coefs", "shape": [1, 32, 8400]}"#;
+            let parsed: ConfigOutput = serde_json::from_str(j).unwrap();
+            assert!(matches!(parsed, ConfigOutput::MaskCoefficients(_)));
+        }
+
+        #[test]
+        fn mask_coefficients_alias_still_accepted() {
+            // Legacy v1 spelling — required for backward compatibility with
+            // models already trained and stored before the v2 vocabulary
+            // landed.
+            let j = r#"{"type": "mask_coefficients", "shape": [1, 32, 8400]}"#;
+            let parsed: ConfigOutput = serde_json::from_str(j).unwrap();
+            assert!(matches!(parsed, ConfigOutput::MaskCoefficients(_)));
         }
     }
 }
