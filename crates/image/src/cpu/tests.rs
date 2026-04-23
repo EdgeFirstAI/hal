@@ -1735,17 +1735,13 @@ mod cpu_tests {
         coefficients: Vec<Vec<f32>>,
     ) -> crate::ProtoData {
         use edgefirst_tensor::{Tensor, TensorDyn};
-        let n = coefficients.len().max(1);
-        let mut flat = Vec::with_capacity(n * num_protos);
-        if coefficients.is_empty() {
-            flat.resize(num_protos, 0.0_f32);
-        } else {
-            for row in &coefficients {
-                assert_eq!(row.len(), num_protos, "mask_coeff row len mismatch");
-                flat.extend_from_slice(row);
-            }
+        let n = coefficients.len();
+        let row_len = coefficients.first().map(|r| r.len()).unwrap_or(num_protos);
+        let mut flat = Vec::with_capacity(n * row_len);
+        for row in &coefficients {
+            flat.extend_from_slice(row);
         }
-        let coeff_t = Tensor::<f32>::from_slice(&flat, &[n, num_protos]).unwrap();
+        let coeff_t = Tensor::<f32>::from_slice(&flat, &[n, row_len]).unwrap();
         let protos_t = Tensor::<f32>::from_slice(
             &vec![0.0_f32; proto_h * proto_w * num_protos],
             &[proto_h, proto_w, num_protos],
@@ -1781,10 +1777,13 @@ mod cpu_tests {
 
     #[test]
     fn test_materialize_empty_proto_data() {
+        // ProtoData from a detection-only model — caller passes no detections
+        // to the materializer (detection-only models have a ProtoData stub
+        // with an empty coefficient tensor). Materialization must not panic
+        // and must return an empty segmentation list.
         let cpu = CPUProcessor::new();
         let proto_data = make_proto_data(8, 8, 4, vec![]);
-        let det = [make_detect_box(0.1, 0.1, 0.5, 0.5)];
-        let result = cpu.materialize_segmentations(&det, &proto_data, None);
+        let result = cpu.materialize_segmentations(&[], &proto_data, None);
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
     }
@@ -1848,7 +1847,7 @@ mod cpu_tests {
         );
         let err = result.unwrap_err();
         assert!(
-            matches!(&err, crate::Error::Internal(s) if s.contains("coeff")),
+            matches!(&err, crate::Error::InvalidShape(s) if s.contains("mask_coefficients")),
             "error should mention coefficient shape: {err:?}"
         );
     }
