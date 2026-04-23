@@ -1,24 +1,21 @@
 # EdgeFirst HAL workspace Cargo config.
 #
-# Target-feature flags enable native f16 instructions on platforms that
-# support them. Cortex-A53 (imx8mp) deliberately has no +fp16 entry — it
-# lacks FEAT_FP16 and would SIGILL on native f16 intrinsics.
+# IMPORTANT: target-feature flags that enable instructions beyond a
+# target's guaranteed-available baseline MUST NOT live here. The HAL
+# ships as a single binary per target, and baking e.g. `+f16c` or
+# `+fp16` into the default build would produce binaries that SIGILL on
+# older CPUs within the same target triple. Until the HAL gains runtime
+# CPU-feature detection + dynamic dispatch, the default build must stay
+# on the target's baseline ISA.
 #
-# Orin Nano (Cortex-A78AE) enables native ARMv8.2-FP16 via an explicit
-# target-cpu invocation (documented in docs/orin-build.md). A workspace-wide
-# +fp16 entry for aarch64 is unsafe because it would break imx8mp builds.
+# For local development on hosts that support richer ISAs (for example
+# benchmarking native fp16 on Orin Nano), developers set RUSTFLAGS
+# ad-hoc — see README.md § "Local fp16 / AVX build overrides" and
+# TESTING.md for the documented incantations.
 
-# x86_64 Linux: F16C (f16→f32 conversion) + FMA universally available on
-# Haswell (2013) and newer. Safe to bake in for dev / CI / distributed
-# Linux desktop binaries.
-[target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "target-feature=+f16c,+fma"]
-
-# x86_64 macOS: same as Linux — Haswell baseline is reasonable for Intel
-# Macs, and Apple Silicon builds use the aarch64-apple-darwin triple.
-[target.x86_64-apple-darwin]
-rustflags = ["-C", "target-feature=+f16c,+fma"]
-
-# aarch64 Apple Silicon (M-series): ARMv8.2+ with FEAT_FP16 guaranteed.
+# aarch64 Apple Silicon (M-series) is the one safe exception: every
+# M-series chip has ARMv8.2-FP16. Intel Macs build under the separate
+# `x86_64-apple-darwin` triple, so this entry cannot misfire on
+# non-FP16 hardware.
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "target-feature=+fp16"]
