@@ -470,23 +470,71 @@ pub unsafe extern "C" fn hal_decoder_params_set_config_file(
 /// output tensor description. The decoder resolves the model type
 /// automatically from the combination of outputs.
 ///
+/// @par Physical-order contract
+///
+/// @p shape and @p dims must be declared in **physical memory order**,
+/// outermost axis first, innermost axis last. HAL derives C-contiguous
+/// strides from @p shape and wraps the tensor bytes with those strides
+/// directly — the caller is responsible for declaring the order that
+/// matches the producer's buffer layout.
+///
+/// When the caller omits @p dims (passes NULL), HAL assumes the declared
+/// @p shape is already in the decoder's canonical order for the output
+/// role (e.g. `[batch, num_features, num_boxes]` for Ultralytics flat
+/// detection, `[batch, height, width, num_protos]` for protos). When
+/// @p dims is supplied, HAL uses role lookup on each dim name to permute
+/// the tensor view's stride tuple into canonical order — no bytes are
+/// moved.
+///
+/// Mis-declaring physical order (e.g. labelling NHWC bytes with NCHW
+/// dim names) causes every read to land at the wrong byte offset. This
+/// was the root cause of both the TFLite vertical-stripe segmentation
+/// mask bug on i.MX 8M Plus and the Ara-2 anchor-first split-tensor
+/// coordinate mis-decode. HAL cannot detect the mismatch at runtime
+/// because it has no visibility into the producer's actual stride
+/// pattern — the contract has to be right at declaration time.
+///
 /// @param params  Params handle
 /// @param type_   Output tensor role (scores, boxes, detection, etc.)
 /// @param decoder Framework that produced the model (ultralytics, modelpack)
-/// @param shape   Array of dimension sizes (length = ndim)
-/// @param dims    Array of dimension names (length = ndim), or NULL for
-///                unnamed dimensions. When non-NULL, named dimensions
-///                (dshape) are stored and shape is derived from them.
+/// @param shape   Dimension sizes in physical memory order, outermost
+///                axis first (length = @p ndim)
+/// @param dims    Dimension names in the same order as @p shape, or NULL
+///                when @p shape is already in the decoder's canonical
+///                order for the output role (length = @p ndim)
 /// @param ndim    Number of dimensions
 /// @return Output index (>= 0) on success, -1 on error (errno = EINVAL)
 ///
-/// @par Example
+/// @par Example — TFLite YOLOv8-seg protos (NHWC physical layout)
+/// @code{.c}
+/// // NNStreamer dim string "32:160:160:1" → physical [1, H, W, C]
+/// size_t shape[] = {1, 160, 160, 32};
+/// enum hal_dim_name dims[] = {HAL_DIM_NAME_BATCH, HAL_DIM_NAME_HEIGHT,
+///                              HAL_DIM_NAME_WIDTH, HAL_DIM_NAME_NUM_PROTOS};
+/// int idx = hal_decoder_params_add_output(params, HAL_OUTPUT_TYPE_PROTOS,
+///               HAL_DECODER_TYPE_ULTRALYTICS, shape, dims, 4);
+/// @endcode
+///
+/// @par Example — Ara-2 split-tensor boxes (anchor-first physical layout)
+/// @code{.c}
+/// // NNStreamer dim string "4:1:8400:1" → physical [1, num_boxes, 1, 4].
+/// // Squeeze the size-1 padding axis before calling add_output — the
+/// // programmatic path does not auto-squeeze; the JSON/YAML schema path
+/// // does. The remaining axes stay in physical (anchor-first) order.
+/// size_t shape[] = {1, 8400, 4};
+/// enum hal_dim_name dims[] = {HAL_DIM_NAME_BATCH, HAL_DIM_NAME_NUM_BOXES,
+///                              HAL_DIM_NAME_BOX_COORDS};
+/// int idx = hal_decoder_params_add_output(params, HAL_OUTPUT_TYPE_BOXES,
+///               HAL_DECODER_TYPE_ULTRALYTICS, shape, dims, 3);
+/// @endcode
+///
+/// @par Example — Canonical scores (dims omitted)
 /// @code{.c}
 /// size_t shape[] = {1, 80, 8400};
-/// enum hal_dim_name dims[] = {HAL_DIM_NAME_BATCH, HAL_DIM_NAME_NUM_CLASSES,
-///                              HAL_DIM_NAME_NUM_BOXES};
+/// // Shape is already in canonical [batch, num_classes, num_boxes] order
+/// // for Ultralytics scores; dims may be NULL.
 /// int idx = hal_decoder_params_add_output(params, HAL_OUTPUT_TYPE_SCORES,
-///               HAL_DECODER_TYPE_ULTRALYTICS, shape, dims, 3);
+///               HAL_DECODER_TYPE_ULTRALYTICS, shape, NULL, 3);
 /// @endcode
 ///
 /// @see hal_decoder_params_output_set_quantization

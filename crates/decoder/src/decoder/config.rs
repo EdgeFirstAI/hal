@@ -234,6 +234,21 @@ impl<'a> From<&'a configs::Classes> for ConfigOutputRef<'a> {
     }
 }
 
+impl<'a> From<&'a ConfigOutput> for ConfigOutputRef<'a> {
+    fn from(v: &'a ConfigOutput) -> ConfigOutputRef<'a> {
+        match v {
+            ConfigOutput::Detection(c) => ConfigOutputRef::Detection(c),
+            ConfigOutput::Mask(c) => ConfigOutputRef::Mask(c),
+            ConfigOutput::Segmentation(c) => ConfigOutputRef::Segmentation(c),
+            ConfigOutput::Protos(c) => ConfigOutputRef::Protos(c),
+            ConfigOutput::Scores(c) => ConfigOutputRef::Scores(c),
+            ConfigOutput::Boxes(c) => ConfigOutputRef::Boxes(c),
+            ConfigOutput::MaskCoefficients(c) => ConfigOutputRef::MaskCoefficients(c),
+            ConfigOutput::Classes(c) => ConfigOutputRef::Classes(c),
+        }
+    }
+}
+
 impl ConfigOutput {
     /// Returns the shape of the output.
     ///

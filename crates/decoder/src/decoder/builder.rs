@@ -787,6 +787,16 @@ impl DecoderBuilder {
             None => return Err(DecoderError::NoConfig),
         };
 
+        // Enforce the physical-order contract: when dshape is present
+        // it must describe the same axes as shape in the same order,
+        // listed from outermost to innermost. Ambiguous-layout roles
+        // (Protos, Boxes, Scores, MaskCoefficients, Classes, Detection)
+        // may still omit dshape when shape is already in the decoder's
+        // canonical order.
+        for output in &config.outputs {
+            Decoder::validate_output_layout(output.into())?;
+        }
+
         // Extract normalized flag from config outputs
         let normalized = Self::get_normalized(&config.outputs);
 
