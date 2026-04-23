@@ -159,6 +159,177 @@ def test_from_dict_yaml():
     assert len(masks) == 0
 
 
+def test_from_dict_v2_minimal():
+    """EDGEAI-1081: Schema v2 dict with object-style quantization must succeed.
+
+    Regression test for the blocker where `Decoder(dict)` routed v2 dicts
+    through the legacy `ConfigOutputs` deserializer, producing the
+    misleading "invalid type: map, expected tuple struct QuantTuple" error
+    because the legacy `QuantTuple(f32, i32)` expects a JSON array while
+    v2 prescribes `{"scale": ..., "zero_point": ..., "dtype": ...}`.
+    """
+    cfg = {
+        "schema_version": 2,
+        "decoder_version": "yolov8",
+        "nms": "class_agnostic",
+        "outputs": [
+            {
+                "name": "boxes",
+                "type": "boxes",
+                "shape": [1, 4, 8400],
+                "dshape": [{"batch": 1}, {"box_coords": 4}, {"num_boxes": 8400}],
+                "dtype": "int8",
+                "quantization": {
+                    "scale": 0.0262,
+                    "zero_point": 0,
+                    "dtype": "int8",
+                },
+                "decoder": "ultralytics",
+                "encoding": "direct",
+                "normalized": True,
+            },
+            {
+                "name": "scores",
+                "type": "scores",
+                "shape": [1, 80, 8400],
+                "dshape": [
+                    {"batch": 1},
+                    {"num_classes": 80},
+                    {"num_boxes": 8400},
+                ],
+                "dtype": "int8",
+                "quantization": {
+                    "scale": 0.00392,
+                    "zero_point": -128,
+                    "dtype": "int8",
+                },
+                "decoder": "ultralytics",
+                "score_format": "per_class",
+            },
+        ],
+    }
+    decoder = edgefirst_hal.Decoder(cfg)
+    assert decoder is not None
+
+
+def test_from_dict_v2_ara2_full_surface():
+    """EDGEAI-1081: Full v2 surface (per-channel quant, split xy/wh, mask_coefs).
+
+    Feeds the canonical ARA-2 fixture through the dict constructor. This
+    exercises the same DecodeProgram compilation path `new_from_json_str`
+    already covers via string, but via dict so the Python binding's smart
+    constructor is the one doing the heavy lifting.
+    """
+    import json
+
+    with open("testdata/ara2_int8_edgefirst.json") as f:
+        cfg = json.load(f)
+
+    decoder = edgefirst_hal.Decoder(cfg, 0.25, 0.5)
+
+    xy = numpy_to_tensor(np.zeros((1, 2, 8400, 1), dtype=np.int8))
+    wh = numpy_to_tensor(np.zeros((1, 2, 8400, 1), dtype=np.int8))
+    scores = numpy_to_tensor(np.zeros((1, 80, 8400, 1), dtype=np.uint8))
+    mask_coefs = numpy_to_tensor(np.zeros((1, 32, 8400, 1), dtype=np.int8))
+    protos = numpy_to_tensor(np.zeros((1, 32, 160, 160), dtype=np.int8))
+
+    boxes, scores_out, classes, masks = decoder.decode(
+        [xy, wh, scores, mask_coefs, protos]
+    )
+    assert len(boxes) == 0
+    assert len(scores_out) == 0
+    assert len(classes) == 0
+    assert len(masks) == 0
+
+
+def test_from_dict_v2_rejects_unsupported_schema_version():
+    """EDGEAI-1081: `schema_version` above MAX_SUPPORTED must be rejected.
+
+    Without version gating the document would silently fall through to the
+    legacy deserialiser and produce a confusing QuantTuple error. The
+    smart constructor must surface a NotSupported-shaped error instead.
+    """
+    cfg = {
+        "schema_version": 99,
+        "outputs": [
+            {"type": "boxes", "shape": [1, 4, 8400], "dtype": "int8"},
+        ],
+    }
+    with pytest.raises(Exception) as exc_info:
+        edgefirst_hal.Decoder(cfg)
+    msg = str(exc_info.value)
+    assert "QuantTuple" not in msg, f"v1 error leaked into v2 path: {msg}"
+    assert "99" in msg or "not supported" in msg.lower() or "NotSupported" in msg
+
+
+def test_from_dict_v2_mask_coefs_type_tag():
+    """EDGEAI-1081: v2 vocabulary 'mask_coefs' is accepted by the dict path.
+
+    The v2 spec defines the mask coefficients type as `mask_coefs`; the
+    legacy enum spelled it `mask_coefficients`. Both must continue to
+    parse — v2 as the primary tag, legacy as an alias.
+    """
+    cfg = {
+        "schema_version": 2,
+        "nms": "class_agnostic",
+        "decoder_version": "yolov8",
+        "outputs": [
+            {
+                "type": "boxes",
+                "shape": [1, 4, 8400],
+                "dshape": [
+                    {"batch": 1},
+                    {"box_coords": 4},
+                    {"num_boxes": 8400},
+                ],
+                "dtype": "int8",
+                "quantization": {"scale": 0.01, "zero_point": 0, "dtype": "int8"},
+                "decoder": "ultralytics",
+                "encoding": "direct",
+            },
+            {
+                "type": "scores",
+                "shape": [1, 80, 8400],
+                "dshape": [
+                    {"batch": 1},
+                    {"num_classes": 80},
+                    {"num_boxes": 8400},
+                ],
+                "dtype": "int8",
+                "quantization": {"scale": 0.01, "zero_point": 0, "dtype": "int8"},
+                "decoder": "ultralytics",
+                "score_format": "per_class",
+            },
+            {
+                "type": "mask_coefs",
+                "shape": [1, 32, 8400],
+                "dshape": [
+                    {"batch": 1},
+                    {"num_protos": 32},
+                    {"num_boxes": 8400},
+                ],
+                "dtype": "int8",
+                "quantization": {"scale": 0.01, "zero_point": 0, "dtype": "int8"},
+                "decoder": "ultralytics",
+            },
+            {
+                "type": "protos",
+                "shape": [1, 160, 160, 32],
+                "dshape": [
+                    {"batch": 1},
+                    {"height": 160},
+                    {"width": 160},
+                    {"num_protos": 32},
+                ],
+                "dtype": "int8",
+                "quantization": {"scale": 0.01, "zero_point": 0, "dtype": "int8"},
+            },
+        ],
+    }
+    decoder = edgefirst_hal.Decoder(cfg)
+    assert decoder is not None
+
+
 def test_nms():
     tf = pytest.importorskip("tensorflow")
 

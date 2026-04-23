@@ -707,6 +707,7 @@ dependencies = [
  "pythonize",
  "rayon",
  "rustc_version",
+ "serde_json",
  "uuid",
 ]
 
