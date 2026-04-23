@@ -694,6 +694,168 @@ pub unsafe extern "C" fn hal_tensor_map_unmap(map: *mut HalTensorMap) {
 }
 
 // ============================================================================
+// Quantization Metadata Functions
+// ============================================================================
+
+/// Quantization mode discriminant.
+///
+/// | Mode | Semantics |
+/// |---|---|
+/// | HAL_QUANT_PER_TENSOR_SYMMETRIC | single scale, zero point = 0 |
+/// | HAL_QUANT_PER_TENSOR | single scale, single zero point |
+/// | HAL_QUANT_PER_CHANNEL_SYMMETRIC | per-channel scales, zero point = 0 |
+/// | HAL_QUANT_PER_CHANNEL | per-channel scales + zero points |
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HalTensorQuantKind {
+    PerTensorSymmetric = 0,
+    PerTensor = 1,
+    PerChannelSymmetric = 2,
+    PerChannel = 3,
+}
+
+/// Opaque quantization metadata handle.
+///
+/// Borrowed from the parent `HalTensor` — lifetime is tied to the tensor.
+/// Obtain via `hal_tensor_quantization()`.
+pub struct HalTensorQuant {
+    inner: *const edgefirst_tensor::Quantization,
+}
+
+impl HalTensorQuant {
+    fn q(&self) -> &edgefirst_tensor::Quantization {
+        // SAFETY: `inner` was set from a reference into the parent HalTensor's
+        // TensorDyn. The caller contract ensures the HalTensorQuant handle
+        // is not used past its parent tensor's lifetime.
+        unsafe { &*self.inner }
+    }
+}
+
+/// Borrowed quantization metadata for an integer tensor.
+///
+/// Returns NULL when the tensor has no quantization set (e.g. float tensor
+/// or unquantized integer tensor). The returned handle must be freed with
+/// `hal_quantization_free()` — it is a small wrapper around a borrowed
+/// pointer into the parent tensor, so freeing it does not invalidate the
+/// underlying metadata.
+///
+/// @param tensor Tensor handle (may be NULL)
+/// @return Quantization handle, or NULL if none
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_quantization(
+    tensor: *const HalTensor,
+) -> *mut HalTensorQuant {
+    if tensor.is_null() {
+        return std::ptr::null_mut();
+    }
+    let t = unsafe { &*tensor };
+    match t.inner.quantization() {
+        Some(q) => Box::into_raw(Box::new(HalTensorQuant {
+            inner: q as *const _,
+        })),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Free a quantization handle returned by `hal_tensor_quantization()`.
+///
+/// This does not invalidate the underlying metadata (which lives on the
+/// parent tensor) — it only releases the wrapper.
+#[no_mangle]
+pub unsafe extern "C" fn hal_quantization_free(q: *mut HalTensorQuant) {
+    if !q.is_null() {
+        drop(unsafe { Box::from_raw(q) });
+    }
+}
+
+/// Discriminate the quantization mode.
+#[no_mangle]
+pub unsafe extern "C" fn hal_quantization_kind(
+    q: *const HalTensorQuant,
+) -> HalTensorQuantKind {
+    if q.is_null() {
+        return HalTensorQuantKind::PerTensor;
+    }
+    let q = unsafe { &*q }.q();
+    match (q.is_per_channel(), q.is_symmetric()) {
+        (false, true) => HalTensorQuantKind::PerTensorSymmetric,
+        (false, false) => HalTensorQuantKind::PerTensor,
+        (true, true) => HalTensorQuantKind::PerChannelSymmetric,
+        (true, false) => HalTensorQuantKind::PerChannel,
+    }
+}
+
+/// Number of scales (1 for per-tensor, num_channels for per-channel).
+#[no_mangle]
+pub unsafe extern "C" fn hal_quantization_scale_len(
+    q: *const HalTensorQuant,
+) -> size_t {
+    if q.is_null() {
+        return 0;
+    }
+    unsafe { &*q }.q().scale().len()
+}
+
+/// Read scale at index `i`. Returns 0.0 on out-of-bounds or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn hal_quantization_scale_at(
+    q: *const HalTensorQuant,
+    i: size_t,
+) -> f32 {
+    if q.is_null() {
+        return 0.0;
+    }
+    unsafe { &*q }.q().scale().get(i).copied().unwrap_or(0.0)
+}
+
+/// Read zero point at index `i`. Symmetric modes always return 0.
+/// Returns 0 on out-of-bounds or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn hal_quantization_zero_point_at(
+    q: *const HalTensorQuant,
+    i: size_t,
+) -> i32 {
+    if q.is_null() {
+        return 0;
+    }
+    let q = unsafe { &*q }.q();
+    match q.zero_point() {
+        None => 0,
+        Some(zps) if zps.len() == 1 => zps[0],
+        Some(zps) => zps.get(i).copied().unwrap_or(0),
+    }
+}
+
+/// Whether the quantization is symmetric (all zero points are 0).
+#[no_mangle]
+pub unsafe extern "C" fn hal_quantization_is_symmetric(
+    q: *const HalTensorQuant,
+) -> bool {
+    !q.is_null() && unsafe { &*q }.q().is_symmetric()
+}
+
+/// Retrieve the per-channel axis. Writes to `*axis_out` and returns
+/// `true` when per-channel; returns `false` for per-tensor (axis unused).
+#[no_mangle]
+pub unsafe extern "C" fn hal_quantization_axis(
+    q: *const HalTensorQuant,
+    axis_out: *mut size_t,
+) -> bool {
+    if q.is_null() {
+        return false;
+    }
+    match unsafe { &*q }.q().axis() {
+        Some(a) => {
+            if !axis_out.is_null() {
+                unsafe { *axis_out = a };
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+// ============================================================================
 #[cfg(test)]
 mod tests {
     use super::*;
