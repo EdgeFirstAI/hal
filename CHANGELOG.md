@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Physical-order contract for `shape` / `dshape` in output configuration
+  (EDGEAI-1288).** Two production bugs — TFLite YOLOv8-seg vertical-stripe
+  mask corruption on i.MX 8M Plus and Ara-2 anchor-first split-tensor
+  mis-decode — were both caused by ambiguity in how `shape` and `dshape`
+  were interpreted relative to the producer's physical buffer layout. HAL
+  now enforces a single, explicit rule: **`shape` and `dshape` passed to
+  `hal_decoder_params_add_output` (or their YAML/JSON equivalents) must
+  be in physical memory order, outermost axis first.** HAL derives
+  C-contiguous strides from `shape` and wraps the buffer with those
+  strides directly; when `dshape` is present HAL uses it to permute the
+  stride tuple into the decoder's canonical logical order — no bytes are
+  moved. Callers who omit `dshape` assert that `shape` is already
+  canonical for the output role. The size-heuristic in `protos_to_hwc`
+  (which tried to infer NCHW vs NHWC from channel-count comparisons) has
+  been removed; producers with a non-canonical physical layout must now
+  declare it explicitly via `dshape`. Validation at
+  `DecoderBuilder::build` time catches size mismatches between `shape`
+  and `dshape` entries with a clear error. **Non-breaking for all
+  in-tree callers**, which already declared physical order; callers that
+  relied on the removed heuristic must add an explicit `dshape`.
+
 ## [0.17.0] - 2026-04-21
 
 ### Added

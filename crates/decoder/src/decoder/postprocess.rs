@@ -247,7 +247,6 @@ impl Decoder {
 
                 let protos_tensor = Self::swap_axes_if_needed(p, protos.into());
                 let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-                let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
                 decode_yolo_segdet_quant(
                     (box_tensor, quant_boxes),
                     (protos_tensor, quant_protos),
@@ -376,7 +375,6 @@ impl Decoder {
 
                 let protos_tensor = Self::swap_axes_if_needed(p, protos.into());
                 let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-                let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
 
                 impl_yolo_split_segdet_quant_process_masks::<_, _>(
                     boxes,
@@ -451,7 +449,6 @@ impl Decoder {
 
                 let protos_tensor = Self::swap_axes_if_needed(p, protos.into());
                 let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-                let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
                 impl_yolo_split_segdet_quant_process_masks::<_, _>(
                     boxes,
                     (mask_tensor, quant_masks),
@@ -492,7 +489,6 @@ impl Decoder {
         let (protos_tensor, _) = Self::find_outputs_with_shape(&protos.shape, outputs, &skip)?;
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-        let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
 
         // Slice combined detection into boxes and scores
         let boxes_view = det_tensor.slice(s![..4, ..]);
@@ -652,7 +648,6 @@ impl Decoder {
 
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-        let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
         decode_yolo_segdet_float(
             boxes_tensor,
             protos_tensor,
@@ -731,7 +726,6 @@ impl Decoder {
         let (protos_tensor, _) = Self::find_outputs_with_shape(&protos.shape, outputs, &skip)?;
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-        let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
         decode_yolo_split_segdet_float(
             boxes_tensor,
             scores_tensor,
@@ -806,7 +800,6 @@ impl Decoder {
             Self::find_outputs_with_shape(&protos_config.shape, outputs, &[det_ind])?;
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos_config.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-        let protos_tensor = Self::protos_to_hwc(protos_tensor, protos_config);
 
         crate::yolo::decode_yolo_end_to_end_segdet_float(
             det_tensor,
@@ -973,7 +966,6 @@ impl Decoder {
             Self::find_outputs_with_shape(&protos_config.shape, outputs, &skip)?;
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos_config.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-        let protos_tensor = Self::protos_to_hwc(protos_tensor, protos_config);
 
         crate::yolo::decode_yolo_split_end_to_end_segdet_float(
             boxes_tensor,
@@ -1136,7 +1128,6 @@ impl Decoder {
 
                 let protos_tensor = Self::swap_axes_if_needed(p, protos.into());
                 let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-                let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
                 crate::yolo::impl_yolo_segdet_quant_proto::<XYWH, _, _>(
                     (box_tensor, quant_boxes),
                     (protos_tensor, quant_protos),
@@ -1168,7 +1159,6 @@ impl Decoder {
         let (protos_tensor, _) = Self::find_outputs_with_shape(&protos.shape, outputs, &[ind])?;
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-        let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
 
         Ok(crate::yolo::impl_yolo_segdet_float_proto::<XYWH, _, _>(
             boxes_tensor,
@@ -1255,7 +1245,6 @@ impl Decoder {
 
                 let protos_tensor = Self::swap_axes_if_needed(p, protos.into());
                 let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-                let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
 
                 crate::yolo::extract_proto_data_quant(
                     det_indices,
@@ -1303,7 +1292,6 @@ impl Decoder {
         let (protos_tensor, _) = Self::find_outputs_with_shape(&protos.shape, outputs, &skip)?;
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-        let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
 
         Ok(crate::yolo::impl_yolo_split_segdet_float_proto::<
             XYWH,
@@ -1384,7 +1372,6 @@ impl Decoder {
 
                 let protos_tensor = Self::swap_axes_if_needed(p, protos.into());
                 let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-                let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
 
                 crate::yolo::extract_proto_data_quant(
                     det_indices,
@@ -1427,7 +1414,6 @@ impl Decoder {
         let (protos_tensor, _) = Self::find_outputs_with_shape(&protos.shape, outputs, &skip)?;
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-        let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
 
         // Slice combined detection into boxes and scores
         let boxes_view = det_tensor.slice(s![..4, ..]);
@@ -1477,7 +1463,6 @@ impl Decoder {
             Self::find_outputs_with_shape(&protos_config.shape, outputs, &[det_ind])?;
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos_config.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-        let protos_tensor = Self::protos_to_hwc(protos_tensor, protos_config);
 
         crate::yolo::decode_yolo_end_to_end_segdet_float_proto(
             det_tensor,
@@ -1564,7 +1549,6 @@ impl Decoder {
             Self::find_outputs_with_shape(&protos_config.shape, outputs, &skip)?;
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos_config.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-        let protos_tensor = Self::protos_to_hwc(protos_tensor, protos_config);
 
         crate::yolo::decode_yolo_split_end_to_end_segdet_float_proto(
             boxes_tensor,
@@ -1685,9 +1669,12 @@ macro_rules! process_tracked_yolo_segmentation {
                 // Slice and reshape protos
                 let protos_tensor = Decoder::swap_axes_if_needed(p, $protos.into());
                 let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-                let protos_tensor = Decoder::protos_to_hwc(protos_tensor, $protos);
 
-                let num_protos = protos_tensor.dim().2;
+                // `shape()[2]` avoids `dim().2`, which requires the
+                // compiler to pin the view to `Ix3` — the removal of
+                // `protos_to_hwc` (whose signature forced `Ix3`) broke
+                // that inference path when the `tracker` feature is on.
+                let num_protos = protos_tensor.shape()[2];
 
                 // Split boxes/scores/masks
                 let (boxes_tensor, scores_tensor, mask_tensor) =
@@ -1814,7 +1801,6 @@ macro_rules! process_tracked_yolo_segmentation_split {
 
                 let protos_tensor = Decoder::swap_axes_if_needed(p, $protos.into());
                 let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-                let protos_tensor = Decoder::protos_to_hwc(protos_tensor, $protos);
 
                 // Extract mask data
                 $mask_body(
@@ -1909,7 +1895,6 @@ macro_rules! process_tracked_yolo_segmentation_2way {
 
                 let protos_tensor = Decoder::swap_axes_if_needed(p, $protos.into());
                 let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-                let protos_tensor = Decoder::protos_to_hwc(protos_tensor, $protos);
 
                 $mask_body(
                     new_boxes,
@@ -2045,9 +2030,8 @@ impl Decoder {
 
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-        let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
 
-        let num_protos = protos_tensor.dim().2;
+        let num_protos = protos_tensor.shape()[2];
         let (boxes_tensor, scores_tensor, mask_tensor) =
             postprocess_yolo_seg(&boxes_tensor, num_protos);
         let boxes = impl_yolo_segdet_get_boxes::<XYWH, _, _>(
@@ -2156,7 +2140,6 @@ impl Decoder {
         let (protos_tensor, _) = Self::find_outputs_with_shape(&protos.shape, outputs, &skip)?;
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-        let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
 
         let (boxes_tensor, scores_tensor, mask_tensor) =
             postprocess_yolo_split_segdet(boxes_tensor, scores_tensor, mask_tensor);
@@ -2271,10 +2254,9 @@ impl Decoder {
             Self::find_outputs_with_shape(&protos_config.shape, outputs, &[det_ind])?;
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos_config.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-        let protos_tensor = Self::protos_to_hwc(protos_tensor, protos_config);
 
         let (boxes, scores, classes, mask_coeff) =
-            postprocess_yolo_end_to_end_segdet(&det_tensor, protos_tensor.dim().2)?;
+            postprocess_yolo_end_to_end_segdet(&det_tensor, protos_tensor.shape()[2])?;
         let boxes = impl_yolo_end_to_end_segdet_get_boxes::<XYXY, _, _, _>(
             boxes,
             scores,
@@ -2517,7 +2499,6 @@ impl Decoder {
             Self::find_outputs_with_shape(&protos_config.shape, outputs, &skip)?;
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos_config.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-        let protos_tensor = Self::protos_to_hwc(protos_tensor, protos_config);
 
         let (boxes, scores, classes, mask_coeff) = postprocess_yolo_split_end_to_end_segdet(
             boxes_tensor,
@@ -2971,7 +2952,6 @@ impl Decoder {
         let (protos_tensor, _) = Self::find_outputs_with_shape(&protos.shape, outputs, &skip)?;
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-        let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
 
         // Slice combined detection into boxes and scores
         let boxes_view = det_tensor.slice(s![..4, ..]);
@@ -3090,7 +3070,6 @@ impl Decoder {
         let (protos_tensor, _) = Self::find_outputs_with_shape(&protos.shape, outputs, &skip)?;
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-        let protos_tensor = Self::protos_to_hwc(protos_tensor, protos);
 
         // Slice combined detection into boxes and scores
         let boxes_view = det_tensor.slice(s![..4, ..]);
