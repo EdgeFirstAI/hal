@@ -53,7 +53,7 @@ pub enum ConfigOutput {
     Scores(configs::Scores),
     #[serde(rename = "boxes")]
     Boxes(configs::Boxes),
-    #[serde(rename = "mask_coefficients")]
+    #[serde(rename = "mask_coefs", alias = "mask_coefficients")]
     MaskCoefficients(configs::MaskCoefficients),
     #[serde(rename = "classes")]
     Classes(configs::Classes),
