@@ -1867,6 +1867,132 @@ mod cpu_tests {
         assert_eq!(segs.len(), 1);
     }
 
+    /// Golden-byte anchor: runs the quantized decode + CPU mask materialization
+    /// end-to-end on the cached YOLOv8-seg fixture and asserts the first
+    /// detection's binarized u8 mask is bit-exact against a committed golden
+    /// file.
+    ///
+    /// Regression-protection intent: any refactor that changes the i8 fused
+    /// dequant+dot+sigmoid kernel, the NMS ordering, or the ROI coordinate
+    /// mapping will perturb the mask bytes and fail this test.
+    ///
+    /// Generating / refreshing the golden:
+    /// ```text
+    /// REGEN_GOLDEN=1 cargo test -p edgefirst-image --lib \
+    ///     test_materialize_golden_i8_cached_model
+    /// ```
+    /// writes `testdata/yolov8_mask0_160x160.bin` (or updates it). Commit
+    /// the resulting file; subsequent runs verify bit-exact.
+    #[test]
+    fn test_materialize_golden_i8_cached_model() {
+        use edgefirst_decoder::{
+            yolo::impl_yolo_segdet_quant_proto, DetectBox, Nms, ProtoData, Quantization, XYWH,
+        };
+
+        let boxes_raw = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_boxes_116x8400.bin"
+        ));
+        let boxes_i8 =
+            unsafe { std::slice::from_raw_parts(boxes_raw.as_ptr() as *const i8, boxes_raw.len()) };
+        let boxes = ndarray::Array2::from_shape_vec((116, 8400), boxes_i8.to_vec()).unwrap();
+
+        let protos_raw = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_protos_160x160x32.bin"
+        ));
+        let protos_i8 = unsafe {
+            std::slice::from_raw_parts(protos_raw.as_ptr() as *const i8, protos_raw.len())
+        };
+        let protos = ndarray::Array3::from_shape_vec((160, 160, 32), protos_i8.to_vec()).unwrap();
+
+        let quant_boxes = Quantization::new(0.019_484_945, 20);
+        let quant_protos = Quantization::new(0.020_889_873, -115);
+
+        let mut detections: Vec<DetectBox> = Vec::with_capacity(50);
+        let proto_data: ProtoData = impl_yolo_segdet_quant_proto::<XYWH, _, _>(
+            (boxes.view(), quant_boxes),
+            (protos.view(), quant_protos),
+            0.45,
+            0.45,
+            Some(Nms::ClassAgnostic),
+            &mut detections,
+        );
+        assert!(!detections.is_empty(), "fixture produced no detections");
+
+        let cpu = CPUProcessor::new();
+        let segs = cpu
+            .materialize_segmentations(&detections, &proto_data, None)
+            .expect("materialize_segmentations failed on cached fixture");
+        assert_eq!(segs.len(), detections.len());
+
+        // Serialize detection 0's binarized mask as a compact byte blob:
+        //   [u16 roi_h_le][u16 roi_w_le][roi_h * roi_w bytes of u8 mask data]
+        // (Channels dim is always 1; no need to store it.)
+        let det0_seg = &segs[0].segmentation;
+        let sh = det0_seg.shape();
+        assert_eq!(sh.len(), 3, "segmentation must be rank-3");
+        assert_eq!(sh[2], 1, "YOLO-seg mask has channel dim 1");
+        let roi_h = sh[0];
+        let roi_w = sh[1];
+        assert!(roi_h <= u16::MAX as usize && roi_w <= u16::MAX as usize);
+        let mut actual: Vec<u8> = Vec::with_capacity(4 + roi_h * roi_w);
+        actual.extend_from_slice(&(roi_h as u16).to_le_bytes());
+        actual.extend_from_slice(&(roi_w as u16).to_le_bytes());
+        let det0_contig = det0_seg.as_standard_layout();
+        actual.extend_from_slice(det0_contig.as_slice().expect("standard layout gives slice"));
+
+        let golden_path = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_mask0_160x160.bin"
+        ));
+
+        if std::env::var_os("REGEN_GOLDEN").is_some() {
+            std::fs::write(&golden_path, &actual).expect("could not write golden");
+            eprintln!(
+                "REGEN_GOLDEN: wrote {} bytes (roi_h={roi_h}, roi_w={roi_w}) to {}",
+                actual.len(),
+                golden_path.display()
+            );
+            return;
+        }
+
+        let expected = std::fs::read(&golden_path).unwrap_or_else(|e| {
+            panic!(
+                "missing golden at {}: {e}. Run \
+                 `REGEN_GOLDEN=1 cargo test test_materialize_golden_i8_cached_model` \
+                 once to create it, then commit the file.",
+                golden_path.display()
+            )
+        });
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "golden size mismatch: got {} bytes, expected {}",
+            actual.len(),
+            expected.len()
+        );
+        if actual != expected {
+            let mut first_diff = None;
+            for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                if a != e {
+                    first_diff = Some((i, *a, *e));
+                    break;
+                }
+            }
+            let total_diff = actual
+                .iter()
+                .zip(expected.iter())
+                .filter(|(a, e)| a != e)
+                .count();
+            panic!(
+                "golden mismatch — {total_diff}/{} bytes differ; first at {first_diff:?}. \
+                 If the change is intentional, verify visually and re-run with REGEN_GOLDEN=1.",
+                actual.len()
+            );
+        }
+    }
+
     // ── Multiplane PixelFormat::Nv12 tests ───────────────────────────────────────
 
     #[test]

@@ -2661,6 +2661,230 @@ outputs:
         );
     }
 
+    /// f32 sibling of `test_extract_proto_data_quant_with_cached_model`.
+    ///
+    /// Dequantizes the same cached i8 fixture to f32 using the model's
+    /// per-tensor quantization parameters, feeds it through the float
+    /// proto-extraction path, and asserts detection count + shape match the
+    /// quantized reference exactly. The dequantization is
+    /// `(v - zp) * scale` per-element; because both paths run NMS with the
+    /// same thresholds on numerically equivalent data, the surviving
+    /// detection set is identical.
+    ///
+    /// Regression anchor: any refactor that silently alters the f32 decode
+    /// path (e.g. the planned `ProtoData` → `TensorDyn` migration) fails
+    /// the count / shape / coefficient-length assertions before any
+    /// downstream mask materialization is touched.
+    #[test]
+    fn test_extract_proto_data_float_with_cached_model() {
+        use crate::yolo::{impl_yolo_segdet_float_proto, impl_yolo_segdet_quant_proto};
+        use crate::{Nms, ProtoData, Quantization, XYWH};
+
+        let boxes_raw = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_boxes_116x8400.bin"
+        ));
+        let boxes_i8 =
+            unsafe { std::slice::from_raw_parts(boxes_raw.as_ptr() as *const i8, boxes_raw.len()) };
+        let boxes = ndarray::Array2::from_shape_vec((116, 8400), boxes_i8.to_vec()).unwrap();
+
+        let protos_raw = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_protos_160x160x32.bin"
+        ));
+        let protos_i8 = unsafe {
+            std::slice::from_raw_parts(protos_raw.as_ptr() as *const i8, protos_raw.len())
+        };
+        let protos = ndarray::Array3::from_shape_vec((160, 160, 32), protos_i8.to_vec()).unwrap();
+
+        let quant_boxes = Quantization::new(0.019_484_945, 20);
+        let quant_protos = Quantization::new(0.020_889_873, -115);
+
+        // First: run the quantized reference to establish ground truth.
+        let mut ref_boxes = Vec::with_capacity(50);
+        let _ref_proto: ProtoData = impl_yolo_segdet_quant_proto::<XYWH, _, _>(
+            (boxes.view(), quant_boxes),
+            (protos.view(), quant_protos),
+            0.45,
+            0.45,
+            Some(Nms::ClassAgnostic),
+            &mut ref_boxes,
+        );
+        assert!(
+            !ref_boxes.is_empty(),
+            "reference (quant) decode produced no detections — fixture broken"
+        );
+
+        // Now dequantize to f32 and run the float path.
+        let boxes_f32 =
+            boxes.mapv(|v| (v as f32 - quant_boxes.zero_point as f32) * quant_boxes.scale);
+        let protos_f32 =
+            protos.mapv(|v| (v as f32 - quant_protos.zero_point as f32) * quant_protos.scale);
+
+        let mut output_boxes = Vec::with_capacity(50);
+        let proto_data: ProtoData = impl_yolo_segdet_float_proto::<XYWH, f32, f32>(
+            boxes_f32.view(),
+            protos_f32.view(),
+            0.45,
+            0.45,
+            Some(Nms::ClassAgnostic),
+            &mut output_boxes,
+        );
+
+        // Same detection count as the quantized reference.
+        assert_eq!(
+            output_boxes.len(),
+            ref_boxes.len(),
+            "f32 path produced {} detections; quant reference produced {}",
+            output_boxes.len(),
+            ref_boxes.len()
+        );
+
+        // Shape + coefficient-count invariants.
+        let protos_shape = match &proto_data.protos {
+            crate::ProtoTensor::Quantized { protos, .. } => protos.shape().to_vec(),
+            crate::ProtoTensor::Float16(arr) => arr.shape().to_vec(),
+            crate::ProtoTensor::Float(arr) => arr.shape().to_vec(),
+        };
+        assert_eq!(protos_shape, [160, 160, 32]);
+        assert_eq!(proto_data.mask_coefficients.len(), output_boxes.len());
+        for coeff in proto_data.mask_coefficients.iter() {
+            assert_eq!(coeff.len(), 32);
+        }
+
+        // f32 input → ProtoTensor::Float variant.
+        assert!(
+            matches!(proto_data.protos, crate::ProtoTensor::Float(_)),
+            "Expected ProtoTensor::Float for f32 input"
+        );
+
+        // Per-detection box-centre correspondence vs. quantized reference.
+        // Order is preserved by NMS (both sorted by score desc), so we can
+        // zip directly.
+        for (i, (q, f)) in ref_boxes.iter().zip(output_boxes.iter()).enumerate() {
+            let dcx = ((q.bbox.xmin + q.bbox.xmax) - (f.bbox.xmin + f.bbox.xmax)).abs() * 0.5;
+            let dcy = ((q.bbox.ymin + q.bbox.ymax) - (f.bbox.ymin + f.bbox.ymax)).abs() * 0.5;
+            assert!(
+                dcx < 5e-3 && dcy < 5e-3,
+                "det {i}: f32 centre drift from quant reference ({dcx:.4}, {dcy:.4}) \
+                 > 5e-3 — f32 / quantized paths should agree on dequant data"
+            );
+        }
+    }
+
+    /// f16 sibling — same fixture as the f32 test, but coefficients and
+    /// protos are narrowed from f32 to f16 before feeding the float decode
+    /// path. f16 has a 10-bit mantissa so scores near the NMS threshold can
+    /// flip, and post-NMS detection count may differ by ±2 from the
+    /// reference. The invariants we assert are:
+    ///
+    ///   - detection count within ±20% of the quantized reference,
+    ///   - per-detection bbox centre drift < 5e-3 for the intersection set,
+    ///   - coefficient tensor length equals `num_protos`,
+    ///   - `ProtoTensor::Float16` variant is returned.
+    #[test]
+    fn test_extract_proto_data_f16_with_cached_model() {
+        use crate::yolo::{impl_yolo_segdet_float_proto, impl_yolo_segdet_quant_proto};
+        use crate::{Nms, ProtoData, Quantization, XYWH};
+
+        let boxes_raw = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_boxes_116x8400.bin"
+        ));
+        let boxes_i8 =
+            unsafe { std::slice::from_raw_parts(boxes_raw.as_ptr() as *const i8, boxes_raw.len()) };
+        let boxes = ndarray::Array2::from_shape_vec((116, 8400), boxes_i8.to_vec()).unwrap();
+
+        let protos_raw = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_protos_160x160x32.bin"
+        ));
+        let protos_i8 = unsafe {
+            std::slice::from_raw_parts(protos_raw.as_ptr() as *const i8, protos_raw.len())
+        };
+        let protos = ndarray::Array3::from_shape_vec((160, 160, 32), protos_i8.to_vec()).unwrap();
+
+        let quant_boxes = Quantization::new(0.019_484_945, 20);
+        let quant_protos = Quantization::new(0.020_889_873, -115);
+
+        // Quantized reference.
+        let mut ref_boxes = Vec::with_capacity(50);
+        let _ref_proto: ProtoData = impl_yolo_segdet_quant_proto::<XYWH, _, _>(
+            (boxes.view(), quant_boxes),
+            (protos.view(), quant_protos),
+            0.45,
+            0.45,
+            Some(Nms::ClassAgnostic),
+            &mut ref_boxes,
+        );
+        assert!(!ref_boxes.is_empty());
+
+        // Dequantize to f32, then narrow to f16.
+        let boxes_f16 = boxes.mapv(|v| {
+            half::f16::from_f32((v as f32 - quant_boxes.zero_point as f32) * quant_boxes.scale)
+        });
+        let protos_f16 = protos.mapv(|v| {
+            half::f16::from_f32((v as f32 - quant_protos.zero_point as f32) * quant_protos.scale)
+        });
+
+        let mut output_boxes = Vec::with_capacity(50);
+        let proto_data: ProtoData = impl_yolo_segdet_float_proto::<XYWH, half::f16, half::f16>(
+            boxes_f16.view(),
+            protos_f16.view(),
+            0.45,
+            0.45,
+            Some(Nms::ClassAgnostic),
+            &mut output_boxes,
+        );
+
+        // Detection count within ±20% of quantized reference. Tolerance set
+        // generously because scores near the 0.45 threshold can flip with
+        // f16's 10-bit mantissa.
+        let ref_n = ref_boxes.len();
+        let got_n = output_boxes.len();
+        assert!(got_n > 0, "f16 path produced zero detections");
+        let tol = (ref_n as f32 * 0.2).ceil() as usize;
+        assert!(
+            got_n.abs_diff(ref_n) <= tol,
+            "f16 detection count {got_n} diverged from quant reference {ref_n} by > {tol} (20%)"
+        );
+
+        // Proto shape + coefficient vectors intact.
+        let protos_shape = match &proto_data.protos {
+            crate::ProtoTensor::Quantized { protos, .. } => protos.shape().to_vec(),
+            crate::ProtoTensor::Float16(arr) => arr.shape().to_vec(),
+            crate::ProtoTensor::Float(arr) => arr.shape().to_vec(),
+        };
+        assert_eq!(protos_shape, [160, 160, 32]);
+        assert_eq!(proto_data.mask_coefficients.len(), output_boxes.len());
+        for coeff in proto_data.mask_coefficients.iter() {
+            assert_eq!(coeff.len(), 32);
+        }
+
+        // f16 input → ProtoTensor::Float16 variant (native f16 preserved).
+        assert!(
+            matches!(proto_data.protos, crate::ProtoTensor::Float16(_)),
+            "Expected ProtoTensor::Float16 for f16 input"
+        );
+
+        // Centre-drift on the first min(ref_n, got_n) detections. Order is
+        // preserved by NMS when scores don't cross the threshold.
+        let n = ref_boxes.len().min(output_boxes.len());
+        for (i, (q, f)) in ref_boxes
+            .iter()
+            .zip(output_boxes.iter())
+            .take(n)
+            .enumerate()
+        {
+            let dcx = ((q.bbox.xmin + q.bbox.xmax) - (f.bbox.xmin + f.bbox.xmax)).abs() * 0.5;
+            let dcy = ((q.bbox.ymin + q.bbox.ymax) - (f.bbox.ymin + f.bbox.ymax)).abs() * 0.5;
+            assert!(
+                dcx < 5e-3 && dcy < 5e-3,
+                "det {i}: f16 centre drift ({dcx:.4}, {dcy:.4}) > 5e-3 vs. quant reference"
+            );
+        }
+    }
+
     // ── YOLO 2-Way Split Segmentation Tests ──────────────────────────
 
     #[test]
