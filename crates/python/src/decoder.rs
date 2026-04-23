@@ -515,9 +515,7 @@ impl PyDecoder {
             .map(serde_json::from_value::<u32>)
             .transpose()
             .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "invalid schema_version: {e}"
-                ))
+                pyo3::exceptions::PyRuntimeError::new_err(format!("invalid schema_version: {e}"))
             })?;
 
         let decoder = if schema_version.is_some_and(|v| v >= 2) {
