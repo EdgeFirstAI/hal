@@ -232,6 +232,109 @@ pub fn primary_plane_bpp(format: PixelFormat, elem: usize) -> Option<usize> {
     }
 }
 
+/// Return the GPU-aligned pitch in bytes when a DMA-backed image of
+/// `width × fmt` would need row-stride padding, or `None` when the
+/// natural pitch already satisfies `GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES`
+/// or the caller has explicitly requested non-DMA memory.
+///
+/// Mali G310 (i.MX 95) rejects `eglCreateImage` from DMA-BUFs whose
+/// `PLANE0_PITCH_EXT` is not a multiple of 64 bytes, surfacing as
+/// `EGL_BAD_ALLOC`. Decoders like [`load_jpeg`]/[`load_png`] use this
+/// helper to decide whether to route through the two-buffer padded
+/// decode path.
+#[cfg(target_os = "linux")]
+pub(crate) fn padded_dma_pitch_for(
+    fmt: PixelFormat,
+    width: usize,
+    memory: &Option<TensorMemory>,
+) -> Option<usize> {
+    // Only pad when caller wants DMA (explicit or default). Padding for a
+    // Mem/Shm tensor would be surprising and waste bytes.
+    if !matches!(memory, None | Some(TensorMemory::Dma)) {
+        return None;
+    }
+    // Padding only applies to packed layouts — `Tensor::image_with_stride`
+    // rejects semi-planar / planar formats, and those take their own
+    // per-plane pitches on import anyway.
+    if fmt.layout() != PixelLayout::Packed {
+        return None;
+    }
+    let bpp = primary_plane_bpp(fmt, 1)?;
+    let natural = width.checked_mul(bpp)?;
+    let aligned = align_pitch_bytes_to_gpu_alignment(natural)?;
+    if aligned > natural {
+        Some(aligned)
+    } else {
+        None
+    }
+}
+
+/// Row-copy a tightly-packed `src` tensor into a `dst` tensor that has a
+/// larger row stride (typically a DMA-BUF allocated with GPU-aligned pitch).
+///
+/// Both tensors must share the same width, height and pixel format. The
+/// bytes between the end of each source row and the next destination row
+/// are left untouched — EGL import doesn't read past the row's valid
+/// width, so the padding can remain whatever the allocator produced.
+#[cfg(target_os = "linux")]
+pub(crate) fn copy_packed_to_padded_dma(
+    src: &Tensor<u8>,
+    dst: &mut Tensor<u8>,
+) -> Result<()> {
+    let width = dst.width().ok_or(Error::NotAnImage)?;
+    let height = dst.height().ok_or(Error::NotAnImage)?;
+    let fmt = dst.format().ok_or(Error::NotAnImage)?;
+    let bpp = primary_plane_bpp(fmt, 1).ok_or_else(|| {
+        Error::NotSupported(format!(
+            "copy_packed_to_padded_dma: unknown bpp for {fmt:?}"
+        ))
+    })?;
+    let natural = width.checked_mul(bpp).ok_or_else(|| {
+        Error::Internal(format!(
+            "copy_packed_to_padded_dma: width {width} × bpp {bpp} overflows"
+        ))
+    })?;
+    let dst_stride = dst.effective_row_stride().ok_or_else(|| {
+        Error::Internal(
+            "copy_packed_to_padded_dma: dst has no effective row stride".into(),
+        )
+    })?;
+
+    // `TensorMap` derefs to `[T]`, which gives us the slice without
+    // needing to import the `TensorMapTrait` at this call site.
+    let src_map = src.map()?;
+    let src_bytes: &[u8] = &src_map;
+    let mut dst_map = dst.map()?;
+    let dst_bytes: &mut [u8] = &mut dst_map;
+
+    if src_bytes.len() < natural.checked_mul(height).unwrap_or(usize::MAX) {
+        return Err(Error::Internal(format!(
+            "copy_packed_to_padded_dma: src has {} bytes, need {} ({}x{} @ {} bpp)",
+            src_bytes.len(),
+            natural * height,
+            width,
+            height,
+            bpp,
+        )));
+    }
+    if dst_bytes.len() < dst_stride.checked_mul(height).unwrap_or(usize::MAX) {
+        return Err(Error::Internal(format!(
+            "copy_packed_to_padded_dma: dst has {} bytes, need {} ({} stride × {} rows)",
+            dst_bytes.len(),
+            dst_stride * height,
+            dst_stride,
+            height,
+        )));
+    }
+
+    for row in 0..height {
+        let s = row * natural;
+        let d = row * dst_stride;
+        dst_bytes[d..d + natural].copy_from_slice(&src_bytes[s..s + natural]);
+    }
+    Ok(())
+}
+
 use edgefirst_decoder::{DetectBox, ProtoData, Segmentation};
 use edgefirst_tensor::{
     DType, PixelFormat, PixelLayout, Tensor, TensorDyn, TensorMemory, TensorTrait as _,
@@ -283,6 +386,36 @@ fn rotate_flip_to_dyn(
         Rotation::None | Rotation::Rotate180 => (src_w, src_h),
         Rotation::Clockwise90 | Rotation::CounterClockwise90 => (src_h, src_w),
     };
+
+    // Rotate/flip into Mem staging then row-copy into padded DMA when the
+    // caller wants DMA and the destination width would produce an
+    // unaligned pitch (see [`padded_dma_pitch_for`]).
+    #[cfg(target_os = "linux")]
+    if let Some(aligned_pitch) = padded_dma_pitch_for(src_fmt, dst_w, &memory) {
+        let tmp = Tensor::<u8>::image(dst_w, dst_h, src_fmt, Some(TensorMemory::Mem))?;
+        let src_map = src.map()?;
+        let mut tmp_map = tmp.map()?;
+        CPUProcessor::flip_rotate_ndarray_pf(
+            &src_map,
+            &mut tmp_map,
+            dst_w,
+            dst_h,
+            channels,
+            rotation,
+            flip,
+        )?;
+        drop(tmp_map);
+        drop(src_map);
+        let mut dma = Tensor::<u8>::image_with_stride(
+            dst_w,
+            dst_h,
+            src_fmt,
+            aligned_pitch,
+            Some(TensorMemory::Dma),
+        )?;
+        copy_packed_to_padded_dma(&tmp, &mut dma)?;
+        return Ok(TensorDyn::from(dma));
+    }
 
     let dst = Tensor::<u8>::image(dst_w, dst_h, src_fmt, memory)?;
     let src_map = src.map()?;
@@ -2150,6 +2283,13 @@ fn colorspace_to_pixelfmt(cs: ColorSpace) -> Option<PixelFormat> {
 }
 
 /// Load a JPEG image from raw bytes and return a [`TensorDyn`].
+// TODO: evaluate replacing zune-jpeg with libjpeg-turbo (via `turbojpeg`
+// crate). `tjDecompress2` accepts an explicit `pitch` parameter, which
+// would let us decode directly into a pitch-padded DMA-BUF and drop the
+// Mem-staging + row-copy introduced below for Mali G310 pitch alignment.
+// Dropping zune-jpeg also gets us a 2-4× faster SIMD decode on AArch64.
+// Blockers: adds a C dep (mozjpeg-sys / libturbojpeg) to the build;
+// cross-compilation story needs validating with zigbuild.
 fn load_jpeg(
     image: &[u8],
     format: Option<PixelFormat>,
@@ -2187,6 +2327,34 @@ fn load_jpeg(
     let h = image_info.height as usize;
 
     if (rotation, flip) == (Rotation::None, Flip::None) {
+        // When caller wants DMA and the natural pitch would be rejected by
+        // the GPU's DMA-BUF import (Mali G310 needs 64-byte pitch), decode
+        // into a tightly-packed Mem staging buffer and row-copy into a
+        // pitch-padded DMA tensor. zune-jpeg has no stride-aware decode,
+        // so the Mem intermediate is unavoidable until we swap decoders
+        // (see TODO below).
+        #[cfg(target_os = "linux")]
+        if let Some(aligned_pitch) = padded_dma_pitch_for(dest_fmt, w, &memory) {
+            let staging = Tensor::<u8>::image(w, h, converted_fmt, Some(TensorMemory::Mem))?;
+            decoder.decode_into(&mut staging.map()?)?;
+            let packed = if converted_fmt != dest_fmt {
+                let mut tmp = Tensor::<u8>::image(w, h, dest_fmt, Some(TensorMemory::Mem))?;
+                CPUProcessor::convert_format_pf(&staging, &mut tmp, converted_fmt, dest_fmt)?;
+                tmp
+            } else {
+                staging
+            };
+            let mut dma = Tensor::<u8>::image_with_stride(
+                w,
+                h,
+                dest_fmt,
+                aligned_pitch,
+                Some(TensorMemory::Dma),
+            )?;
+            copy_packed_to_padded_dma(&packed, &mut dma)?;
+            return Ok(TensorDyn::from(dma));
+        }
+
         let mut img = Tensor::<u8>::image(w, h, dest_fmt, memory)?;
 
         if converted_fmt != dest_fmt {
@@ -2234,28 +2402,41 @@ fn load_png(
         .png_set_decode_animated(false);
     let mut decoder = PngDecoder::new_with_options(image, options);
     decoder.decode_headers()?;
-    let image_info = decoder.get_info().ok_or(Error::Internal(
-        "PNG did not return decoded image info".to_string(),
-    ))?;
-
-    let (rotation, flip) = image_info
-        .exif
-        .as_ref()
-        .map(|x| read_exif_orientation(x))
-        .unwrap_or((Rotation::None, Flip::None));
+    let (width, height, rotation, flip) = {
+        let image_info = decoder.get_info().ok_or(Error::Internal(
+            "PNG did not return decoded image info".to_string(),
+        ))?;
+        let (rotation, flip) = image_info
+            .exif
+            .as_ref()
+            .map(|x| read_exif_orientation(x))
+            .unwrap_or((Rotation::None, Flip::None));
+        (image_info.width, image_info.height, rotation, flip)
+    };
 
     if (rotation, flip) == (Rotation::None, Flip::None) {
-        let img = Tensor::<u8>::image(image_info.width, image_info.height, fmt, memory)?;
+        // Same pitch-padding treatment as load_jpeg — see comment there.
+        #[cfg(target_os = "linux")]
+        if let Some(aligned_pitch) = padded_dma_pitch_for(fmt, width, &memory) {
+            let staging = Tensor::<u8>::image(width, height, fmt, Some(TensorMemory::Mem))?;
+            decoder.decode_into(&mut staging.map()?)?;
+            let mut dma = Tensor::<u8>::image_with_stride(
+                width,
+                height,
+                fmt,
+                aligned_pitch,
+                Some(TensorMemory::Dma),
+            )?;
+            copy_packed_to_padded_dma(&staging, &mut dma)?;
+            return Ok(TensorDyn::from(dma));
+        }
+
+        let img = Tensor::<u8>::image(width, height, fmt, memory)?;
         decoder.decode_into(&mut img.map()?)?;
         return Ok(TensorDyn::from(img));
     }
 
-    let tmp = Tensor::<u8>::image(
-        image_info.width,
-        image_info.height,
-        fmt,
-        Some(TensorMemory::Mem),
-    )?;
+    let tmp = Tensor::<u8>::image(width, height, fmt, Some(TensorMemory::Mem))?;
     decoder.decode_into(&mut tmp.map()?)?;
 
     rotate_flip_to_dyn(&tmp, fmt, rotation, flip, memory)
