@@ -6092,7 +6092,8 @@ mod image_tests {
         let proto_data = {
             use edgefirst_tensor::{Tensor, TensorDyn};
             let coeff_t = Tensor::<f32>::from_slice(&[0.5_f32; 4], &[1, 4]).unwrap();
-            let protos_t = Tensor::<f32>::from_slice(&vec![0.0_f32; 8 * 8 * 4], &[8, 8, 4]).unwrap();
+            let protos_t =
+                Tensor::<f32>::from_slice(&vec![0.0_f32; 8 * 8 * 4], &[8, 8, 4]).unwrap();
             ProtoData {
                 mask_coefficients: TensorDyn::F32(coeff_t),
                 protos: TensorDyn::F32(protos_t),
@@ -6142,7 +6143,8 @@ mod image_tests {
         let proto_data = {
             use edgefirst_tensor::{Tensor, TensorDyn};
             let coeff_t = Tensor::<f32>::from_slice(&[0.5_f32; 4], &[1, 4]).unwrap();
-            let protos_t = Tensor::<f32>::from_slice(&vec![0.0_f32; 8 * 8 * 4], &[8, 8, 4]).unwrap();
+            let protos_t =
+                Tensor::<f32>::from_slice(&vec![0.0_f32; 8 * 8 * 4], &[8, 8, 4]).unwrap();
             ProtoData {
                 mask_coefficients: TensorDyn::F32(coeff_t),
                 protos: TensorDyn::F32(protos_t),
@@ -6262,7 +6264,8 @@ mod image_tests {
             use edgefirst_tensor::{Tensor, TensorDyn};
             // Placeholder (no detections); shape [1, 4] to keep the tensor well-formed.
             let coeff_t = Tensor::<f32>::from_slice(&[0.0_f32; 4], &[1, 4]).unwrap();
-            let protos_t = Tensor::<f32>::from_slice(&vec![0.0_f32; 8 * 8 * 4], &[8, 8, 4]).unwrap();
+            let protos_t =
+                Tensor::<f32>::from_slice(&vec![0.0_f32; 8 * 8 * 4], &[8, 8, 4]).unwrap();
             ProtoData {
                 mask_coefficients: TensorDyn::F32(coeff_t),
                 protos: TensorDyn::F32(protos_t),
@@ -6292,7 +6295,8 @@ mod image_tests {
             use edgefirst_tensor::{Tensor, TensorDyn};
             // Placeholder (no detections); shape [1, 4] to keep the tensor well-formed.
             let coeff_t = Tensor::<f32>::from_slice(&[0.0_f32; 4], &[1, 4]).unwrap();
-            let protos_t = Tensor::<f32>::from_slice(&vec![0.0_f32; 8 * 8 * 4], &[8, 8, 4]).unwrap();
+            let protos_t =
+                Tensor::<f32>::from_slice(&vec![0.0_f32; 8 * 8 * 4], &[8, 8, 4]).unwrap();
             ProtoData {
                 mask_coefficients: TensorDyn::F32(coeff_t),
                 protos: TensorDyn::F32(protos_t),

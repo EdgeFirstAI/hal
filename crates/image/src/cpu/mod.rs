@@ -776,20 +776,44 @@ impl CPUProcessor {
                 let t = proto_data.protos.as_f32().expect("F32");
                 let m = t.map()?;
                 self.draw_proto_masks_inner(
-                    dst_slice, dst_w, dst_h, dst_rs, channels, detect,
-                    m.as_slice(), &coeff_f32, proto_h, proto_w, num_protos,
-                    opacity, (lx0, lx_range, ly0, ly_range), color_mode,
-                    0.0_f32, |p: &f32, _| *p,
+                    dst_slice,
+                    dst_w,
+                    dst_h,
+                    dst_rs,
+                    channels,
+                    detect,
+                    m.as_slice(),
+                    &coeff_f32,
+                    proto_h,
+                    proto_w,
+                    num_protos,
+                    opacity,
+                    (lx0, lx_range, ly0, ly_range),
+                    color_mode,
+                    0.0_f32,
+                    |p: &f32, _| *p,
                 );
             }
             DType::F16 => {
                 let t = proto_data.protos.as_f16().expect("F16");
                 let m = t.map()?;
                 self.draw_proto_masks_inner(
-                    dst_slice, dst_w, dst_h, dst_rs, channels, detect,
-                    m.as_slice(), &coeff_f32, proto_h, proto_w, num_protos,
-                    opacity, (lx0, lx_range, ly0, ly_range), color_mode,
-                    0.0_f32, |p: &half::f16, _| p.to_f32(),
+                    dst_slice,
+                    dst_w,
+                    dst_h,
+                    dst_rs,
+                    channels,
+                    detect,
+                    m.as_slice(),
+                    &coeff_f32,
+                    proto_h,
+                    proto_w,
+                    num_protos,
+                    opacity,
+                    (lx0, lx_range, ly0, ly_range),
+                    color_mode,
+                    0.0_f32,
+                    |p: &half::f16, _| p.to_f32(),
                 );
             }
             DType::I8 => {
@@ -797,9 +821,7 @@ impl CPUProcessor {
                 let t = proto_data.protos.as_i8().expect("I8");
                 let m = t.map()?;
                 let quant = t.quantization().ok_or_else(|| {
-                    Error::InvalidShape(
-                        "I8 protos require quantization metadata".into(),
-                    )
+                    Error::InvalidShape("I8 protos require quantization metadata".into())
                 })?;
                 let (scale, zp) = match quant.mode() {
                     QuantMode::PerTensor { scale, zero_point } => (scale, zero_point as f32),
@@ -813,10 +835,22 @@ impl CPUProcessor {
                     }
                 };
                 self.draw_proto_masks_inner(
-                    dst_slice, dst_w, dst_h, dst_rs, channels, detect,
-                    m.as_slice(), &coeff_f32, proto_h, proto_w, num_protos,
-                    opacity, (lx0, lx_range, ly0, ly_range), color_mode,
-                    scale, move |p: &i8, _| (*p as f32) - zp,
+                    dst_slice,
+                    dst_w,
+                    dst_h,
+                    dst_rs,
+                    channels,
+                    detect,
+                    m.as_slice(),
+                    &coeff_f32,
+                    proto_h,
+                    proto_w,
+                    num_protos,
+                    opacity,
+                    (lx0, lx_range, ly0, ly_range),
+                    color_mode,
+                    scale,
+                    move |p: &i8, _| (*p as f32) - zp,
                 );
             }
             other => {
@@ -868,10 +902,8 @@ impl CPUProcessor {
 
             for y in start_y..end_y {
                 for x in start_x..end_x {
-                    let px =
-                        (lx0 + (x as f32 / dst_w as f32) * lx_range) * proto_w as f32 - 0.5;
-                    let py =
-                        (ly0 + (y as f32 / dst_h as f32) * ly_range) * proto_h as f32 - 0.5;
+                    let px = (lx0 + (x as f32 / dst_w as f32) * lx_range) * proto_w as f32 - 0.5;
+                    let py = (ly0 + (y as f32 / dst_h as f32) * ly_range) * proto_h as f32 - 0.5;
 
                     // Bilinear interpolation with per-load widening. Inline
                     // bilinear-sample since bilinear_dot_slice takes a
@@ -899,7 +931,11 @@ impl CPUProcessor {
                         let val = w00 * v00 + w10 * v10 + w01 * v01 + w11 * v11;
                         acc += coeff[p] * val;
                     }
-                    let final_acc = if acc_scale == 0.0 { acc } else { acc_scale * acc };
+                    let final_acc = if acc_scale == 0.0 {
+                        acc
+                    } else {
+                        acc_scale * acc
+                    };
                     // Pass-through: acc_scale=0.0 means "no scaling" (f32/f16
                     // native); non-zero means "apply scale once" (i8 with
                     // per-tensor quant).

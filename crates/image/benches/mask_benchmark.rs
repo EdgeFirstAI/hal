@@ -86,14 +86,51 @@ fn decode_proto_data() -> (Vec<DetectBox>, ProtoData) {
 /// whose coordinates exceed 1.01) so we always get valid pre-decoded masks
 /// for benchmarking `draw_decoded_masks`.
 fn materialize_segmentations(detect: &[DetectBox], proto_data: &ProtoData) -> Vec<Segmentation> {
-    let protos_f32 = proto_data.protos.as_f32();
-    let proto_h = protos_f32.shape()[0];
-    let proto_w = protos_f32.shape()[1];
-    let num_protos = protos_f32.shape()[2];
+    use edgefirst_tensor::{TensorDyn, TensorMapTrait, TensorTrait};
+    // Dequantize protos once to f32 for this benchmark (production uses the
+    // native per-dtype kernels in CPUProcessor::materialize_segmentations).
+    let proto_shape = proto_data.protos.shape().to_vec();
+    let (proto_h, proto_w, num_protos) = (proto_shape[0], proto_shape[1], proto_shape[2]);
+    let proto_map = match &proto_data.protos {
+        TensorDyn::I8(t) => {
+            let m = t.map().unwrap();
+            let (scale, zp) = match t.quantization() {
+                Some(q) => (q.scale()[0], q.zero_point().map_or(0, |z| z[0])),
+                None => (1.0, 0),
+            };
+            let data: Vec<f32> = m
+                .as_slice()
+                .iter()
+                .map(|v| (*v as f32 - zp as f32) * scale)
+                .collect();
+            ndarray::Array3::from_shape_vec((proto_h, proto_w, num_protos), data).unwrap()
+        }
+        TensorDyn::F32(t) => {
+            let m = t.map().unwrap();
+            ndarray::Array3::from_shape_vec((proto_h, proto_w, num_protos), m.as_slice().to_vec())
+                .unwrap()
+        }
+        other => panic!("unsupported proto dtype for benchmark: {:?}", other.dtype()),
+    };
+
+    // Flatten mask_coefficients: [N, num_protos] → one row per detection.
+    let coeff_rows: Vec<Vec<f32>> = match &proto_data.mask_coefficients {
+        TensorDyn::F32(t) => {
+            let m = t.map().unwrap();
+            let slice = m.as_slice();
+            (0..detect.len())
+                .map(|i| slice[i * num_protos..(i + 1) * num_protos].to_vec())
+                .collect()
+        }
+        other => panic!(
+            "unsupported mask_coeff dtype for benchmark: {:?}",
+            other.dtype()
+        ),
+    };
 
     detect
         .iter()
-        .zip(proto_data.mask_coefficients.iter())
+        .zip(coeff_rows.iter())
         .map(|(det, coeff)| {
             // Clamp bbox to [0, 1] to avoid NORM_LIMIT rejection
             let xmin = det.bbox.xmin.clamp(0.0, 1.0);
@@ -111,8 +148,8 @@ fn materialize_segmentations(detect: &[DetectBox], proto_data: &ProtoData) -> Ve
             let roi_h = y1.saturating_sub(y0).max(1);
 
             // Extract proto ROI and compute mask_coeff @ protos
-            let roi = protos_f32.slice(s![y0..y0 + roi_h, x0..x0 + roi_w, ..]);
-            let coeff_arr =
+            let roi = proto_map.slice(s![y0..y0 + roi_h, x0..x0 + roi_w, ..]);
+            let coeff_arr: ndarray::Array2<f32> =
                 ndarray::Array2::from_shape_vec((1, num_protos), coeff.clone()).unwrap();
             let protos_2d = roi
                 .to_shape((roi_h * roi_w, num_protos))

@@ -1407,8 +1407,8 @@ pub(super) fn extract_proto_data_float<
 
     let mask_coefficients = MASK::slice_into_tensor_dyn(&coeff_rows, &[n, num_protos])
         .expect("allocating mask_coefficients TensorDyn");
-    let protos_tensor = PROTO::arrayview3_into_tensor_dyn(protos)
-        .expect("allocating protos TensorDyn");
+    let protos_tensor =
+        PROTO::arrayview3_into_tensor_dyn(protos).expect("allocating protos TensorDyn");
 
     ProtoData {
         mask_coefficients,
@@ -1473,9 +1473,8 @@ pub(crate) fn extract_proto_data_quant<
         if std::any::TypeId::of::<PROTO>() == std::any::TypeId::of::<i8>() {
             // SAFETY: PROTO == i8 checked via TypeId; cast slice view is
             // size/alignment-compatible by construction.
-            let src: &[i8] = unsafe {
-                std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len())
-            };
+            let src: &[i8] =
+                unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
             if protos.is_standard_layout() {
                 dst.copy_from_slice(src);
             } else {
@@ -1491,10 +1490,8 @@ pub(crate) fn extract_proto_data_quant<
             }
         }
     }
-    let tensor_quant = edgefirst_tensor::Quantization::per_tensor(
-        quant_protos.scale,
-        quant_protos.zero_point,
-    );
+    let tensor_quant =
+        edgefirst_tensor::Quantization::per_tensor(quant_protos.scale, quant_protos.zero_point);
     let protos_tensor = protos_tensor
         .with_quantization(tensor_quant)
         .expect("per-tensor quantization on new Tensor<i8>");
@@ -1532,8 +1529,7 @@ impl FloatProtoElem for f32 {
     fn arrayview3_into_tensor_dyn(
         view: ArrayView3<'_, f32>,
     ) -> edgefirst_tensor::Result<edgefirst_tensor::TensorDyn> {
-        edgefirst_tensor::Tensor::<f32>::from_arrayview3(view)
-            .map(edgefirst_tensor::TensorDyn::F32)
+        edgefirst_tensor::Tensor::<f32>::from_arrayview3(view).map(edgefirst_tensor::TensorDyn::F32)
     }
 }
 

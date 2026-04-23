@@ -236,8 +236,7 @@ impl CPUProcessor {
                 "protos tensor must be rank-3, got {proto_shape:?}"
             )));
         }
-        let (proto_h, proto_w, num_protos) =
-            (proto_shape[0], proto_shape[1], proto_shape[2]);
+        let (proto_h, proto_w, num_protos) = (proto_shape[0], proto_shape[1], proto_shape[2]);
         let coeff_shape = proto_data.mask_coefficients.shape();
         if coeff_shape.len() != 2 || coeff_shape[1] != num_protos {
             return Err(crate::Error::InvalidShape(format!(
@@ -323,9 +322,7 @@ impl CPUProcessor {
                 DType::I8 => {
                     let t = proto_data.protos.as_i8().expect("dtype matched I8");
                     let quant = t.quantization().ok_or_else(|| {
-                        crate::Error::InvalidShape(
-                            "I8 protos require quantization metadata".into(),
-                        )
+                        crate::Error::InvalidShape("I8 protos require quantization metadata".into())
                     })?;
                     let m = t.map()?;
                     fused_dequant_dot_sigmoid_i8_slice(
@@ -434,8 +431,7 @@ impl CPUProcessor {
                 "protos tensor must be rank-3, got {proto_shape:?}"
             )));
         }
-        let (proto_h, proto_w, num_protos) =
-            (proto_shape[0], proto_shape[1], proto_shape[2]);
+        let (proto_h, proto_w, num_protos) = (proto_shape[0], proto_shape[1], proto_shape[2]);
         let coeff_shape = proto_data.mask_coefficients.shape();
         if coeff_shape.len() != 2 || coeff_shape[1] != num_protos {
             return Err(crate::Error::InvalidShape(format!(
@@ -501,9 +497,7 @@ impl CPUProcessor {
                 let t = proto_data.protos.as_i8().expect("I8");
                 let m = t.map()?;
                 let quant = t.quantization().ok_or_else(|| {
-                    crate::Error::InvalidShape(
-                        "I8 protos require quantization metadata".into(),
-                    )
+                    crate::Error::InvalidShape("I8 protos require quantization metadata".into())
                 })?;
                 scaled_segmentations_i8_slice(
                     detect,
@@ -575,8 +569,7 @@ fn fused_dequant_dot_sigmoid_i8_slice(
             for k in 0..num_protos {
                 scaled_coeff[k] = coeff[k] * scale;
             }
-            zp_offset = zero_point as f32
-                * scaled_coeff.iter().take(num_protos).sum::<f32>();
+            zp_offset = zero_point as f32 * scaled_coeff.iter().take(num_protos).sum::<f32>();
         }
         QuantMode::PerChannelSymmetric { scales, axis } => {
             if axis != 2 {
@@ -709,22 +702,28 @@ fn fused_dot_sigmoid_f16_slice(
     roi_w: usize,
     num_protos: usize,
 ) -> ndarray::Array3<u8> {
-    #[cfg(all(target_arch = "x86_64", target_feature = "f16c", target_feature = "fma"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "f16c",
+        target_feature = "fma"
+    ))]
     {
         // SAFETY: target-feature gates both `vcvtph2ps` and `vfmadd*ps`;
         // the caller's slice-bounds contract is identical to the scalar arm.
-        return unsafe {
+        unsafe {
             fused_dot_sigmoid_f16_slice_f16c(
                 protos, coeff, proto_h, proto_w, y0, x0, roi_h, roi_w, num_protos,
             )
-        };
+        }
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "f16c", target_feature = "fma")))]
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "f16c",
+        target_feature = "fma"
+    )))]
     {
         let _ = proto_h;
-        fused_dot_sigmoid_f16_slice_scalar(
-            protos, coeff, proto_w, y0, x0, roi_h, roi_w, num_protos,
-        )
+        fused_dot_sigmoid_f16_slice_scalar(protos, coeff, proto_w, y0, x0, roi_h, roi_w, num_protos)
     }
 }
 
@@ -757,10 +756,7 @@ fn fused_dot_sigmoid_f16_slice_scalar(
                 let p1 = protos[base + k + 1].to_f32();
                 let p2 = protos[base + k + 2].to_f32();
                 let p3 = protos[base + k + 3].to_f32();
-                acc += coeff[k] * p0
-                    + coeff[k + 1] * p1
-                    + coeff[k + 2] * p2
-                    + coeff[k + 3] * p3;
+                acc += coeff[k] * p0 + coeff[k + 1] * p1 + coeff[k + 2] * p2 + coeff[k + 3] * p3;
                 k += 4;
             }
             while k < num_protos {
@@ -785,7 +781,11 @@ fn fused_dot_sigmoid_f16_slice_scalar(
 /// `.cargo/config.toml` sets these target-features on `x86_64-unknown-linux-gnu`
 /// and `x86_64-apple-darwin`, making this function statically callable on
 /// those targets.
-#[cfg(all(target_arch = "x86_64", target_feature = "f16c", target_feature = "fma"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "f16c",
+    target_feature = "fma"
+))]
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "f16c,fma,avx")]
 unsafe fn fused_dot_sigmoid_f16_slice_f16c(
@@ -816,9 +816,11 @@ unsafe fn fused_dot_sigmoid_f16_slice_f16c(
             let mut acc_v = _mm256_setzero_ps();
             let mut k = 0;
             for _ in 0..chunks8 {
-                // Load 8 f16 (128 bits / 16 bytes) via u16-typed pointer.
-                let p_ptr =
-                    protos.as_ptr().add(base + k) as *const half::f16 as *const core::arch::x86_64::__m128i;
+                // Load 8 f16 (128 bits / 16 bytes) via a byte-level cast.
+                let p_ptr = protos
+                    .as_ptr()
+                    .add(base + k)
+                    .cast::<core::arch::x86_64::__m128i>();
                 let raw = _mm_loadu_si128(p_ptr);
                 let widened = _mm256_cvtph_ps(raw);
                 let coeffs_v = _mm256_loadu_ps(coeff.as_ptr().add(k));
@@ -848,6 +850,7 @@ unsafe fn fused_dot_sigmoid_f16_slice_f16c(
 
 // Scaled mask kernels — bilinear sample + sigmoid, binarized output.
 
+#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn bilinear_dot_slice<P: Copy>(
     protos: &[P],
@@ -1076,4 +1079,3 @@ fn fast_sigmoid(x: f32) -> f32 {
     let exp_neg_x = f32::from_bits(bits as u32);
     1.0 / (1.0 + exp_neg_x)
 }
-

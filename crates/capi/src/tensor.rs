@@ -742,9 +742,7 @@ impl HalTensorQuant {
 /// @param tensor Tensor handle (may be NULL)
 /// @return Quantization handle, or NULL if none
 #[no_mangle]
-pub unsafe extern "C" fn hal_tensor_quantization(
-    tensor: *const HalTensor,
-) -> *mut HalTensorQuant {
+pub unsafe extern "C" fn hal_tensor_quantization(tensor: *const HalTensor) -> *mut HalTensorQuant {
     if tensor.is_null() {
         return std::ptr::null_mut();
     }
@@ -770,9 +768,7 @@ pub unsafe extern "C" fn hal_quantization_free(q: *mut HalTensorQuant) {
 
 /// Discriminate the quantization mode.
 #[no_mangle]
-pub unsafe extern "C" fn hal_quantization_kind(
-    q: *const HalTensorQuant,
-) -> HalTensorQuantKind {
+pub unsafe extern "C" fn hal_quantization_kind(q: *const HalTensorQuant) -> HalTensorQuantKind {
     if q.is_null() {
         return HalTensorQuantKind::PerTensor;
     }
@@ -787,9 +783,7 @@ pub unsafe extern "C" fn hal_quantization_kind(
 
 /// Number of scales (1 for per-tensor, num_channels for per-channel).
 #[no_mangle]
-pub unsafe extern "C" fn hal_quantization_scale_len(
-    q: *const HalTensorQuant,
-) -> size_t {
+pub unsafe extern "C" fn hal_quantization_scale_len(q: *const HalTensorQuant) -> size_t {
     if q.is_null() {
         return 0;
     }
@@ -798,10 +792,7 @@ pub unsafe extern "C" fn hal_quantization_scale_len(
 
 /// Read scale at index `i`. Returns 0.0 on out-of-bounds or NULL.
 #[no_mangle]
-pub unsafe extern "C" fn hal_quantization_scale_at(
-    q: *const HalTensorQuant,
-    i: size_t,
-) -> f32 {
+pub unsafe extern "C" fn hal_quantization_scale_at(q: *const HalTensorQuant, i: size_t) -> f32 {
     if q.is_null() {
         return 0.0;
     }
@@ -828,9 +819,7 @@ pub unsafe extern "C" fn hal_quantization_zero_point_at(
 
 /// Whether the quantization is symmetric (all zero points are 0).
 #[no_mangle]
-pub unsafe extern "C" fn hal_quantization_is_symmetric(
-    q: *const HalTensorQuant,
-) -> bool {
+pub unsafe extern "C" fn hal_quantization_is_symmetric(q: *const HalTensorQuant) -> bool {
     !q.is_null() && unsafe { &*q }.q().is_symmetric()
 }
 
