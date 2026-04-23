@@ -548,15 +548,18 @@ fn fused_dequant_dot_sigmoid_i8_slice(
 ) -> crate::Result<ndarray::Array3<u8>> {
     use edgefirst_tensor::QuantMode;
     let stride_y = proto_w * num_protos;
-    // Precompute scaled coefficients + zp_offset on the stack. Supports
-    // per-tensor and per-channel; per-channel with axis != channel dim is
-    // rejected. num_protos ≤ 64 covers every real model.
-    if num_protos > 64 {
-        return Err(crate::Error::InvalidShape(format!(
-            "num_protos {num_protos} exceeds kernel limit 64"
-        )));
-    }
-    let mut scaled_coeff = [0.0_f32; 64];
+    // Precompute scaled coefficients + zp_offset. Stack scratch covers
+    // `num_protos ≤ 64` (every production model today); larger proto counts
+    // fall back to a single heap allocation per kernel call so the kernel
+    // does not silently reject valid-but-larger models.
+    let mut stack_scratch = [0.0_f32; 64];
+    let mut heap_scratch: Vec<f32>;
+    let scaled_coeff: &mut [f32] = if num_protos <= stack_scratch.len() {
+        &mut stack_scratch[..num_protos]
+    } else {
+        heap_scratch = vec![0.0_f32; num_protos];
+        heap_scratch.as_mut_slice()
+    };
     let zp_offset: f32;
     match quant.mode() {
         QuantMode::PerTensorSymmetric { scale } => {
@@ -573,8 +576,9 @@ fn fused_dequant_dot_sigmoid_i8_slice(
         }
         QuantMode::PerChannelSymmetric { scales, axis } => {
             if axis != 2 {
-                return Err(crate::Error::InvalidShape(format!(
-                    "per-channel quantization on axis {axis} not supported (expected 2)"
+                return Err(crate::Error::NotSupported(format!(
+                    "per-channel quantization on axis {axis} not supported \
+                     (only channel axis 2 is implemented on this kernel)"
                 )));
             }
             for k in 0..num_protos {
@@ -588,8 +592,9 @@ fn fused_dequant_dot_sigmoid_i8_slice(
             axis,
         } => {
             if axis != 2 {
-                return Err(crate::Error::InvalidShape(format!(
-                    "per-channel quantization on axis {axis} not supported (expected 2)"
+                return Err(crate::Error::NotSupported(format!(
+                    "per-channel quantization on axis {axis} not supported \
+                     (only channel axis 2 is implemented on this kernel)"
                 )));
             }
             for k in 0..num_protos {
@@ -964,7 +969,7 @@ fn scaled_segmentations_i8_slice(
         QuantMode::PerTensor { scale, zero_point } => (scale, zero_point as f32),
         QuantMode::PerTensorSymmetric { scale } => (scale, 0.0),
         QuantMode::PerChannel { axis, .. } | QuantMode::PerChannelSymmetric { axis, .. } => {
-            return Err(crate::Error::InvalidShape(format!(
+            return Err(crate::Error::NotSupported(format!(
                 "per-channel quantization (axis={axis}) on scaled seg path \
                  not yet supported"
             )));

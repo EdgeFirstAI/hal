@@ -4272,8 +4272,9 @@ impl GLProcessorST {
 
     /// Native-f16 variant of [`Self::repack_protos_to_rgba_f16`]: shuffles
     /// already-f16 protos into RGBA-layer order without the f32→f16
-    /// conversion step. Used when the decoder produced
-    /// [`ProtoTensor::Float16`] from an fp16 inference engine.
+    /// conversion step. Used when the decoder produced an fp16 proto
+    /// tensor — `TensorDyn::F16` in the current [`ProtoData`] representation
+    /// — from an fp16 inference engine.
     fn repack_protos_f16_to_rgba_f16(protos: &ndarray::Array3<half::f16>) -> (Vec<u8>, usize) {
         let (height, width, num_protos) = protos.dim();
         let num_layers = num_protos.div_ceil(4);
@@ -4303,10 +4304,13 @@ impl GLProcessorST {
 
     /// Render YOLO proto segmentation masks using the fused GPU pipeline.
     ///
-    /// Dispatches to the appropriate shader based on `ProtoTensor` variant:
-    /// - `Quantized`: uploads raw int8 as `GL_R8I`, dequantizes in shader
-    /// - `Float`: uploads as `GL_R32F` with hardware bilinear (if available),
-    ///   or falls back to f16 repack path
+    /// Dispatches on the proto tensor's runtime dtype via
+    /// [`edgefirst_tensor::TensorDyn::dtype`]:
+    /// - `I8`: uploads raw int8 as `GL_R8I`, dequantizes in shader (requires
+    ///   per-tensor [`edgefirst_tensor::Quantization`] on the proto tensor).
+    /// - `F32`: uploads as `GL_R32F` with hardware bilinear (if available),
+    ///   or falls back to the `RGBA16F` repack path for older drivers.
+    /// - `F16`: repacks natively into `RGBA16F` without a widening step.
     fn render_proto_segmentation(
         &mut self,
         detect: &[DetectBox],
@@ -4326,7 +4330,14 @@ impl GLProcessorST {
         }
         let (height, width, num_protos) = (proto_shape[0], proto_shape[1], proto_shape[2]);
         let coeff_shape = proto_data.mask_coefficients.shape();
-        if coeff_shape.len() != 2 || coeff_shape[1] != num_protos || coeff_shape[0] == 0 {
+        if coeff_shape.len() != 2 || coeff_shape[1] != num_protos {
+            return Err(crate::Error::InvalidShape(format!(
+                "mask_coefficients shape {coeff_shape:?} incompatible with protos \
+                 {proto_shape:?} (expected [N, {num_protos}])"
+            )));
+        }
+        // Genuine "no detections this frame" → nothing to render.
+        if coeff_shape[0] == 0 {
             return Ok(());
         }
         let texture_target = gls::gl::TEXTURE_2D_ARRAY;
@@ -5031,8 +5042,8 @@ impl GLProcessorST {
 
     /// Native-f16 variant of [`Self::render_proto_segmentation_f16`]: uploads
     /// protos that are already in half-precision directly into `RGBA16F`
-    /// without a f32→f16 conversion pass. Used for `ProtoTensor::Float16`
-    /// from fp16 inference engines.
+    /// without a f32→f16 conversion pass. Used for `TensorDyn::F16` proto
+    /// tensors produced by fp16 inference engines.
     #[allow(clippy::too_many_arguments)]
     fn render_proto_segmentation_f16_native(
         &self,

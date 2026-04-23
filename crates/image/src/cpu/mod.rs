@@ -828,7 +828,7 @@ impl CPUProcessor {
                     QuantMode::PerTensorSymmetric { scale } => (scale, 0.0),
                     QuantMode::PerChannel { axis, .. }
                     | QuantMode::PerChannelSymmetric { axis, .. } => {
-                        return Err(Error::InvalidShape(format!(
+                        return Err(Error::NotSupported(format!(
                             "per-channel quantization (axis={axis}) in draw_proto_masks \
                              CPU path not yet supported"
                         )));
