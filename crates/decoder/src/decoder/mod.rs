@@ -601,7 +601,7 @@ impl Decoder {
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<Option<ProtoData>, DecoderError>
     where
-        T: Float + AsPrimitive<f32> + AsPrimitive<u8> + Send + Sync + crate::IntoProtoTensor,
+        T: Float + AsPrimitive<f32> + AsPrimitive<u8> + Send + Sync + crate::yolo::FloatProtoElem,
         f32: AsPrimitive<T>,
     {
         output_boxes.clear();
@@ -1161,7 +1161,7 @@ impl Decoder {
         output_tracks: &mut Vec<edgefirst_tracker::TrackInfo>,
     ) -> Result<Option<ProtoData>, DecoderError>
     where
-        T: Float + AsPrimitive<f32> + AsPrimitive<u8> + Send + Sync + crate::IntoProtoTensor,
+        T: Float + AsPrimitive<f32> + AsPrimitive<u8> + Send + Sync + crate::yolo::FloatProtoElem,
         f32: AsPrimitive<T>,
     {
         output_boxes.clear();

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-use edgefirst_decoder::{DetectBox, ProtoData, ProtoTensor, Segmentation};
+use edgefirst_decoder::{DetectBox, ProtoData, Segmentation};
 use edgefirst_tensor::{
     PixelFormat, PixelLayout, Tensor, TensorMapTrait, TensorMemory, TensorTrait,
 };
@@ -4313,23 +4313,94 @@ impl GLProcessorST {
         proto_data: &ProtoData,
         color_mode: crate::ColorMode,
     ) -> crate::Result<()> {
-        if detect.is_empty() || proto_data.mask_coefficients.is_empty() {
+        use edgefirst_tensor::{DType, QuantMode, TensorMapTrait, TensorTrait};
+
+        if detect.is_empty() {
             return Ok(());
         }
-
-        let (height, width, num_protos) = proto_data.protos.dim();
+        let proto_shape = proto_data.protos.shape();
+        if proto_shape.len() != 3 {
+            return Err(crate::Error::InvalidShape(format!(
+                "protos tensor must be rank-3, got {proto_shape:?}"
+            )));
+        }
+        let (height, width, num_protos) =
+            (proto_shape[0], proto_shape[1], proto_shape[2]);
+        let coeff_shape = proto_data.mask_coefficients.shape();
+        if coeff_shape.len() != 2 || coeff_shape[1] != num_protos || coeff_shape[0] == 0 {
+            return Ok(());
+        }
         let texture_target = gls::gl::TEXTURE_2D_ARRAY;
 
-        match &proto_data.protos {
-            ProtoTensor::Quantized {
-                protos,
-                quantization,
-            } => {
+        // Widen coefficients to Vec<Vec<f32>> once for the GL uniform upload
+        // path. The GL shaders consume f32 uniforms regardless of source dtype.
+        let coeff_rows: Vec<Vec<f32>> = match proto_data.mask_coefficients.dtype() {
+            DType::F32 => {
+                let t = proto_data.mask_coefficients.as_f32().expect("F32");
+                let m = t.map()?;
+                let s = m.as_slice();
+                (0..coeff_shape[0])
+                    .map(|i| s[i * num_protos..(i + 1) * num_protos].to_vec())
+                    .collect()
+            }
+            DType::F16 => {
+                let t = proto_data.mask_coefficients.as_f16().expect("F16");
+                let m = t.map()?;
+                let s = m.as_slice();
+                (0..coeff_shape[0])
+                    .map(|i| {
+                        s[i * num_protos..(i + 1) * num_protos]
+                            .iter()
+                            .map(|v| v.to_f32())
+                            .collect()
+                    })
+                    .collect()
+            }
+            other => {
+                return Err(crate::Error::InvalidShape(format!(
+                    "mask_coefficients dtype {other:?} not supported on GL seg path"
+                )));
+            }
+        };
+
+        match proto_data.protos.dtype() {
+            DType::I8 => {
+                let t = proto_data.protos.as_i8().expect("I8");
+                let m = t.map()?;
+                let quant = t.quantization().ok_or_else(|| {
+                    crate::Error::InvalidShape(
+                        "I8 protos require quantization metadata".into(),
+                    )
+                })?;
+                // GL shader path: per-tensor quant only (shader uploads a
+                // single scale/zp uniform). Per-channel would require a
+                // shader rewrite — return NotSupported for now.
+                let (scale, zp) = match quant.mode() {
+                    QuantMode::PerTensor { scale, zero_point } => (scale, zero_point),
+                    QuantMode::PerTensorSymmetric { scale } => (scale, 0_i32),
+                    QuantMode::PerChannel { axis, .. }
+                    | QuantMode::PerChannelSymmetric { axis, .. } => {
+                        return Err(crate::Error::NotSupported(format!(
+                            "GL seg path: per-channel quantization (axis={axis}) \
+                             not yet supported — falls back to CPU in caller"
+                        )));
+                    }
+                };
+                // Rebuild an Array3<i8> view over the mapped slice for the
+                // existing shader-upload helper. Standard row-major layout.
+                let protos_arr = ndarray::ArrayView3::<i8>::from_shape(
+                    (height, width, num_protos),
+                    m.as_slice(),
+                )
+                .map_err(|e| crate::Error::InvalidShape(format!("{e}")))?
+                .to_owned();
+                let quantization =
+                    edgefirst_decoder::Quantization::new(scale, zp);
                 self.render_proto_segmentation_int8(
                     detect,
-                    &proto_data.mask_coefficients,
-                    protos,
-                    quantization,
+                    &coeff_rows,
+                    &protos_arr,
+                    &quantization,
                     height,
                     width,
                     num_protos,
@@ -4337,12 +4408,20 @@ impl GLProcessorST {
                     color_mode,
                 )?;
             }
-            ProtoTensor::Float(protos_f32) => {
+            DType::F32 => {
+                let t = proto_data.protos.as_f32().expect("F32");
+                let m = t.map()?;
+                let protos_arr = ndarray::ArrayView3::<f32>::from_shape(
+                    (height, width, num_protos),
+                    m.as_slice(),
+                )
+                .map_err(|e| crate::Error::InvalidShape(format!("{e}")))?
+                .to_owned();
                 if self.has_float_linear {
                     self.render_proto_segmentation_f32(
                         detect,
-                        &proto_data.mask_coefficients,
-                        protos_f32,
+                        &coeff_rows,
+                        &protos_arr,
                         height,
                         width,
                         num_protos,
@@ -4350,11 +4429,10 @@ impl GLProcessorST {
                         color_mode,
                     )?;
                 } else {
-                    // Fallback: repack to RGBA16F and use existing f16 shader
                     self.render_proto_segmentation_f16(
                         detect,
-                        &proto_data.mask_coefficients,
-                        protos_f32,
+                        &coeff_rows,
+                        &protos_arr,
                         height,
                         width,
                         num_protos,
@@ -4363,20 +4441,30 @@ impl GLProcessorST {
                     )?;
                 }
             }
-            ProtoTensor::Float16(protos_f16) => {
-                // Native f16 protos from an fp16 engine — upload directly to
-                // RGBA16F without the f32→f16 conversion pass. Reuses the
-                // existing f16 shader path.
+            DType::F16 => {
+                let t = proto_data.protos.as_f16().expect("F16");
+                let m = t.map()?;
+                let protos_arr = ndarray::ArrayView3::<half::f16>::from_shape(
+                    (height, width, num_protos),
+                    m.as_slice(),
+                )
+                .map_err(|e| crate::Error::InvalidShape(format!("{e}")))?
+                .to_owned();
                 self.render_proto_segmentation_f16_native(
                     detect,
-                    &proto_data.mask_coefficients,
-                    protos_f16,
+                    &coeff_rows,
+                    &protos_arr,
                     height,
                     width,
                     num_protos,
                     texture_target,
                     color_mode,
                 )?;
+            }
+            other => {
+                return Err(crate::Error::InvalidShape(format!(
+                    "GL seg path: proto dtype {other:?} not supported"
+                )));
             }
         }
 

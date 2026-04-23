@@ -451,136 +451,36 @@ pub struct Segmentation {
     pub segmentation: Array3<u8>,
 }
 
-/// Type-level dispatch from a generic `ArrayView3<T>` of float protos into
-/// the appropriate [`ProtoTensor`] variant.
-///
-/// Implemented for every float element type the decoder's generic
-/// `decode_float::<T>` pipeline may instantiate. Callers invoke
-/// `T::into_proto_tensor(view)` and let the compiler pick the right variant
-/// — no `TypeId` checks, no `unsafe` layout casts across `ArrayView3<T>`
-/// type parameters.
-pub trait IntoProtoTensor: Sized + 'static {
-    /// Build a [`ProtoTensor`] from a borrowed 3-D view. Implementations
-    /// copy the data into an owned `Array3` of the destination element type
-    /// (native for `f16`, widened to `f32` for `f32`/`f64`).
-    fn into_proto_tensor(arr: ndarray::ArrayView3<'_, Self>) -> ProtoTensor;
-}
-
-impl IntoProtoTensor for f32 {
-    fn into_proto_tensor(arr: ndarray::ArrayView3<'_, f32>) -> ProtoTensor {
-        ProtoTensor::Float(arr.to_owned())
-    }
-}
-
-impl IntoProtoTensor for f64 {
-    fn into_proto_tensor(arr: ndarray::ArrayView3<'_, f64>) -> ProtoTensor {
-        ProtoTensor::Float(arr.mapv(|v| v as f32))
-    }
-}
-
-impl IntoProtoTensor for half::f16 {
-    fn into_proto_tensor(arr: ndarray::ArrayView3<'_, half::f16>) -> ProtoTensor {
-        // Native f16 preserved for zero-copy upload to the GL `RGBA16F`
-        // seg shader (see `render_proto_segmentation_f16_native`).
-        ProtoTensor::Float16(arr.to_owned())
-    }
-}
-
-/// Prototype tensor variants for fused decode+render pipelines.
-///
-/// Carries one of:
-/// - raw quantized int8 data (the GPU shader dequantizes per-texel),
-/// - native f16 data (direct upload to an `RGBA16F` texture without widening),
-/// - dequantized f32 data (from f32 models or legacy paths).
-#[derive(Debug, Clone)]
-pub enum ProtoTensor {
-    /// Raw int8 protos with quantization parameters — skip CPU dequantization.
-    /// The GPU fragment shader will dequantize per-texel using the scale and
-    /// zero_point.
-    Quantized {
-        protos: Array3<i8>,
-        quantization: Quantization,
-    },
-    /// Native f16 protos (from TensorRT fp16 engines or GPU half-float
-    /// models). The GL seg renderer can upload these directly into an
-    /// `RGBA16F` texture without the extra f32→f16 repack step.
-    Float16(Array3<half::f16>),
-    /// Dequantized f32 protos (from f32 models or legacy path).
-    Float(Array3<f32>),
-}
-
-impl ProtoTensor {
-    /// Returns `true` if this is the quantized variant.
-    pub fn is_quantized(&self) -> bool {
-        matches!(self, ProtoTensor::Quantized { .. })
-    }
-
-    /// Returns `true` if this is the native f16 variant.
-    pub fn is_f16(&self) -> bool {
-        matches!(self, ProtoTensor::Float16(_))
-    }
-
-    /// Returns the spatial dimensions `(height, width, num_protos)`.
-    pub fn dim(&self) -> (usize, usize, usize) {
-        match self {
-            ProtoTensor::Quantized { protos, .. } => protos.dim(),
-            ProtoTensor::Float16(arr) => arr.dim(),
-            ProtoTensor::Float(arr) => arr.dim(),
-        }
-    }
-
-    /// Returns dequantized f32 protos. For the `Float` variant this is a
-    /// no-copy reference; for `Float16` and `Quantized` it allocates and
-    /// widens / dequantizes.
-    ///
-    /// For `Float16` uses the vectorized `half::slice::HalfFloatSliceExt::
-    /// convert_to_f32_slice` path when the underlying array is in standard
-    /// contiguous layout; otherwise falls back to a stride-respecting
-    /// element-wise iterator.
-    pub fn as_f32(&self) -> std::borrow::Cow<'_, Array3<f32>> {
-        match self {
-            ProtoTensor::Float(arr) => std::borrow::Cow::Borrowed(arr),
-            ProtoTensor::Float16(arr) => {
-                use half::slice::HalfFloatSliceExt;
-                let mut out = vec![0.0_f32; arr.len()];
-                if let Some(src) = arr.as_slice() {
-                    // Standard-layout contiguous: vectorized widening (the
-                    // `half` crate exposes SIMD variants for AArch64 and SSE2
-                    // under this call).
-                    src.convert_to_f32_slice(&mut out);
-                } else {
-                    // Non-contiguous (sliced/transposed) — respect strides.
-                    for (dst, &src) in out.iter_mut().zip(arr.iter()) {
-                        *dst = src.to_f32();
-                    }
-                }
-                let widened = Array3::from_shape_vec(arr.raw_dim(), out)
-                    .expect("shape/len invariant preserved");
-                std::borrow::Cow::Owned(widened)
-            }
-            ProtoTensor::Quantized {
-                protos,
-                quantization,
-            } => {
-                let scale = quantization.scale;
-                let zp = quantization.zero_point as f32;
-                std::borrow::Cow::Owned(protos.map(|&v| (v as f32 - zp) * scale))
-            }
-        }
-    }
-}
-
 /// Raw prototype data for fused decode+render pipelines.
 ///
 /// Holds post-NMS intermediate state before mask materialization, allowing the
 /// renderer to compute `mask_coeff @ protos` directly (e.g. in a GPU fragment
 /// shader) without materializing intermediate `Array3<u8>` masks.
-#[derive(Debug, Clone)]
+///
+/// Both fields are carried as [`TensorDyn`] so downstream consumers (Rust, C
+/// API, Python) get zero-copy typed access through the HAL's shared tensor
+/// infrastructure. Dtype policy:
+///
+/// | Source model | protos dtype | mask_coefficients dtype | protos.quantization |
+/// |---|---|---|---|
+/// | int8 quantized | [`TensorDyn::I8`] | [`TensorDyn::F32`] (dequantized) | `Some(q)` |
+/// | f32 | [`TensorDyn::F32`] | [`TensorDyn::F32`] | `None` |
+/// | f16 (TensorRT fp16) | [`TensorDyn::F16`] | [`TensorDyn::F16`] | `None` |
+/// | f64 (narrowed) | [`TensorDyn::F32`] | [`TensorDyn::F32`] | `None` |
+///
+/// Quantization metadata lives on the proto tensor itself via
+/// [`edgefirst_tensor::Tensor::quantization`] — float tensors cannot carry
+/// quantization (compile-time gated on the `IntegerType` sealed trait).
+///
+/// `TensorDyn` is not `Clone`, so neither is `ProtoData`. Consumers that need
+/// to share the proto buffer across threads should use `TensorDyn::clone_fd`
+/// / `dmabuf_clone` to dup the backing fd.
+#[derive(Debug)]
 pub struct ProtoData {
-    /// Mask coefficients per detection (each `Vec<f32>` has length `num_protos`).
-    pub mask_coefficients: Vec<Vec<f32>>,
-    /// Prototype tensor, shape `(proto_h, proto_w, num_protos)`.
-    pub protos: ProtoTensor,
+    /// Per-detection mask coefficients, shape `[num_detections, num_protos]`.
+    pub mask_coefficients: edgefirst_tensor::TensorDyn,
+    /// Prototype tensor, shape `[proto_h, proto_w, num_protos]`.
+    pub protos: edgefirst_tensor::TensorDyn,
 }
 
 /// Turns a DetectBoxQuantized into a DetectBox by dequantizing the score.
@@ -3804,18 +3704,16 @@ outputs:
         assert!(output_boxes[1].equal_within_delta(&expected[1], 1.0 / 160.0));
 
         let proto_data = proto_data.expect("segmentation model should return ProtoData");
+        let coeffs_shape = proto_data.mask_coefficients.shape();
         assert_eq!(
-            proto_data.mask_coefficients.len(),
+            coeffs_shape[0],
             output_boxes.len(),
             "mask_coefficients count must match detection count"
         );
-        for coeff in &proto_data.mask_coefficients {
-            assert_eq!(
-                coeff.len(),
-                32,
-                "each detection should have 32 mask coefficients"
-            );
-        }
+        assert_eq!(
+            coeffs_shape[1], 32,
+            "each detection should have 32 mask coefficients"
+        );
     }
 }
 
@@ -4225,7 +4123,7 @@ mod decoder_tracked_tests {
                     };
                     assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
                     assert!(output_boxes[1].equal_within_delta(&expected[1], 1e-6));
-                    assert!(proto_result.is_some_and(|x| x.mask_coefficients.is_empty()));
+                    assert!(proto_result.is_some_and(|x| x.mask_coefficients.shape()[0] == 0));
                 } else {
                     let mut output_masks = Vec::with_capacity(50);
                     {
@@ -4416,7 +4314,7 @@ mod decoder_tracked_tests {
                     };
                     assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
                     assert!(output_boxes[1].equal_within_delta(&expected[1], 1e-6));
-                    assert!(proto_result.is_some_and(|x| x.mask_coefficients.is_empty()));
+                    assert!(proto_result.is_some_and(|x| x.mask_coefficients.shape()[0] == 0));
                 } else {
                     let mut output_masks = Vec::with_capacity(50);
                     {
@@ -4702,7 +4600,7 @@ outputs:
                                 .unwrap()
                         };
                         assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
-                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.is_empty()));
+                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.shape()[0] == 0));
                     } else {
                         let mut output_masks = Vec::with_capacity(50);
                         {
@@ -4800,7 +4698,7 @@ outputs:
                                 .unwrap()
                         };
                         assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
-                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.is_empty()));
+                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.shape()[0] == 0));
                     } else {
                         let mut output_masks = Vec::with_capacity(50);
                         {
@@ -4939,7 +4837,7 @@ outputs:
                                 .unwrap()
                         };
                         assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
-                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.is_empty()));
+                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.shape()[0] == 0));
                     } else {
                         let mut output_masks = Vec::with_capacity(50);
                         {
@@ -5033,7 +4931,7 @@ outputs:
                                 .unwrap()
                         };
                         assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
-                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.is_empty()));
+                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.shape()[0] == 0));
                     } else {
                         let mut output_masks = Vec::with_capacity(50);
                         {
@@ -5243,7 +5141,7 @@ outputs:
                             )
                             .unwrap();
                         assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
-                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.is_empty()));
+                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.shape()[0] == 0));
                     } else {
                         let scores_td =
                             make_u8_tensor(scores_q.shape(), scores_q.as_slice().unwrap());
@@ -5329,7 +5227,7 @@ outputs:
                             )
                             .unwrap();
                         assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
-                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.is_empty()));
+                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.shape()[0] == 0));
                     } else {
                         let detect_td =
                             make_u8_tensor(detect_q.shape(), detect_q.as_slice().unwrap());
@@ -5466,7 +5364,7 @@ outputs:
                             )
                             .unwrap();
                         assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
-                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.is_empty()));
+                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.shape()[0] == 0));
                     } else {
                         let scores_td = make_f64_tensor(scores.shape(), scores.as_slice().unwrap());
                         let mut output_masks = Vec::with_capacity(50);
@@ -5546,7 +5444,7 @@ outputs:
                             )
                             .unwrap();
                         assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
-                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.is_empty()));
+                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.shape()[0] == 0));
                     } else {
                         let detect_td = make_f64_tensor(detect.shape(), detect.as_slice().unwrap());
                         let mut output_masks = Vec::with_capacity(50);

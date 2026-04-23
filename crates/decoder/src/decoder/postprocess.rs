@@ -20,7 +20,7 @@ use crate::{
         decode_yolo_split_det_float, decode_yolo_split_det_quant, decode_yolo_split_segdet_float,
         impl_yolo_split_segdet_quant_get_boxes, impl_yolo_split_segdet_quant_process_masks,
     },
-    DecoderError, DetectBox, IntoProtoTensor, ProtoData, Quantization, Segmentation, XYWH,
+    yolo::FloatProtoElem, DecoderError, DetectBox, ProtoData, Quantization, Segmentation, XYWH,
 };
 
 macro_rules! dequant_3d {
@@ -1158,7 +1158,7 @@ impl Decoder {
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<ProtoData, DecoderError>
     where
-        T: Float + AsPrimitive<f32> + Send + Sync + IntoProtoTensor,
+        T: Float + AsPrimitive<f32> + Send + Sync + FloatProtoElem,
         f32: AsPrimitive<T>,
     {
         let (boxes_tensor, ind) = Self::find_outputs_with_shape(&boxes.shape, outputs, &[])?;
@@ -1281,7 +1281,7 @@ impl Decoder {
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<ProtoData, DecoderError>
     where
-        T: Float + AsPrimitive<f32> + Send + Sync + IntoProtoTensor,
+        T: Float + AsPrimitive<f32> + Send + Sync + FloatProtoElem,
         f32: AsPrimitive<T>,
     {
         let mut skip = vec![];
@@ -1410,7 +1410,7 @@ impl Decoder {
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<ProtoData, DecoderError>
     where
-        T: Float + AsPrimitive<f32> + Send + Sync + IntoProtoTensor,
+        T: Float + AsPrimitive<f32> + Send + Sync + FloatProtoElem,
         f32: AsPrimitive<T>,
     {
         let mut skip = vec![];
@@ -1459,7 +1459,7 @@ impl Decoder {
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<ProtoData, DecoderError>
     where
-        T: Float + AsPrimitive<f32> + Send + Sync + IntoProtoTensor,
+        T: Float + AsPrimitive<f32> + Send + Sync + FloatProtoElem,
         f32: AsPrimitive<T>,
     {
         if outputs.len() < 2 {
@@ -1532,7 +1532,7 @@ impl Decoder {
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<ProtoData, DecoderError>
     where
-        T: Float + AsPrimitive<f32> + Send + Sync + IntoProtoTensor,
+        T: Float + AsPrimitive<f32> + Send + Sync + FloatProtoElem,
         f32: AsPrimitive<T>,
     {
         let mut skip = vec![];
@@ -2838,7 +2838,7 @@ impl Decoder {
         output_tracks: &mut Vec<TrackInfo>,
     ) -> Result<ProtoData, DecoderError>
     where
-        T: Float + AsPrimitive<f32> + Send + Sync + IntoProtoTensor,
+        T: Float + AsPrimitive<f32> + Send + Sync + FloatProtoElem,
         f32: AsPrimitive<T>,
     {
         use crate::yolo::extract_proto_data_float;
@@ -2873,7 +2873,7 @@ impl Decoder {
         output_tracks: &mut Vec<TrackInfo>,
     ) -> Result<ProtoData, DecoderError>
     where
-        T: Float + AsPrimitive<f32> + Send + Sync + IntoProtoTensor,
+        T: Float + AsPrimitive<f32> + Send + Sync + FloatProtoElem,
         f32: AsPrimitive<T>,
     {
         use crate::yolo::extract_proto_data_float;
@@ -3069,7 +3069,7 @@ impl Decoder {
         output_tracks: &mut Vec<TrackInfo>,
     ) -> Result<ProtoData, DecoderError>
     where
-        T: Float + AsPrimitive<f32> + Send + Sync + IntoProtoTensor,
+        T: Float + AsPrimitive<f32> + Send + Sync + FloatProtoElem,
         f32: AsPrimitive<T>,
     {
         use crate::yolo::{
@@ -3132,7 +3132,7 @@ impl Decoder {
         output_tracks: &mut Vec<TrackInfo>,
     ) -> Result<ProtoData, DecoderError>
     where
-        T: Float + AsPrimitive<f32> + Send + Sync + IntoProtoTensor,
+        T: Float + AsPrimitive<f32> + Send + Sync + FloatProtoElem,
         f32: AsPrimitive<T>,
     {
         use crate::yolo::extract_proto_data_float;
@@ -3200,7 +3200,7 @@ impl Decoder {
         output_tracks: &mut Vec<TrackInfo>,
     ) -> Result<ProtoData, DecoderError>
     where
-        T: Float + AsPrimitive<f32> + Send + Sync + IntoProtoTensor,
+        T: Float + AsPrimitive<f32> + Send + Sync + FloatProtoElem,
         f32: AsPrimitive<T>,
     {
         use crate::yolo::extract_proto_data_float;

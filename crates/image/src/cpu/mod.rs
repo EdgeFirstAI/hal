@@ -12,7 +12,8 @@ mod masks;
 mod resize;
 mod tests;
 
-use masks::bilinear_dot;
+// bilinear_dot removed — masks.rs now uses slice-native bilinear_dot_slice
+// closure-based kernel, invoked through the local dtype dispatch below.
 
 /// CPUConverter implements the ImageProcessor trait using the fallback CPU
 /// implementation for image processing.
@@ -726,29 +727,132 @@ impl CPUProcessor {
             dst_w, dst_h, dst_rs, channels, dst_slice, detect, color_mode,
         )?;
 
-        if detect.is_empty() || proto_data.mask_coefficients.is_empty() {
+        if detect.is_empty() {
+            return Ok(());
+        }
+        let proto_shape = proto_data.protos.shape();
+        if proto_shape.len() != 3 {
+            return Err(Error::InvalidShape(format!(
+                "protos tensor must be rank-3, got {proto_shape:?}"
+            )));
+        }
+        let proto_h = proto_shape[0];
+        let proto_w = proto_shape[1];
+        let num_protos = proto_shape[2];
+        let coeff_shape = proto_data.mask_coefficients.shape();
+        if coeff_shape.len() != 2 || coeff_shape[1] != num_protos || coeff_shape[0] == 0 {
             return Ok(());
         }
 
-        let protos_cow = proto_data.protos.as_f32();
-        let protos = protos_cow.as_ref();
-        let proto_h = protos.shape()[0];
-        let proto_w = protos.shape()[1];
-        let num_protos = protos.shape()[2];
+        // Widen coefficients to f32 once; shape [N, num_protos].
+        let coeff_f32: Vec<f32> = match proto_data.mask_coefficients.dtype() {
+            DType::F32 => {
+                let t = proto_data.mask_coefficients.as_f32().expect("F32");
+                let m = t.map()?;
+                m.as_slice().to_vec()
+            }
+            DType::F16 => {
+                let t = proto_data.mask_coefficients.as_f16().expect("F16");
+                let m = t.map()?;
+                m.as_slice().iter().map(|v| v.to_f32()).collect()
+            }
+            other => {
+                return Err(Error::InvalidShape(format!(
+                    "mask_coefficients dtype {other:?} not supported"
+                )));
+            }
+        };
 
         // Precompute letterbox scale/offset for output-pixel → proto-pixel mapping.
-        // Without letterbox: proto_x = (x / dst_w) * proto_w
-        // With letterbox [lx0,ly0,lx1,ly1]: proto_x = (lx0 + (x/dst_w)*(lx1-lx0)) * proto_w
         let (lx0, lx_range, ly0, ly_range) = match letterbox {
             Some([lx0, ly0, lx1, ly1]) => (lx0, lx1 - lx0, ly0, ly1 - ly0),
             None => (0.0_f32, 1.0_f32, 0.0_f32, 1.0_f32),
         };
 
-        for (idx, (det, coeff)) in detect
-            .iter()
-            .zip(proto_data.mask_coefficients.iter())
-            .enumerate()
-        {
+        // Per-dtype dispatch. Map protos once, call the inner draw loop
+        // with a dtype-specialized loader closure.
+        match proto_data.protos.dtype() {
+            DType::F32 => {
+                let t = proto_data.protos.as_f32().expect("F32");
+                let m = t.map()?;
+                self.draw_proto_masks_inner(
+                    dst_slice, dst_w, dst_h, dst_rs, channels, detect,
+                    m.as_slice(), &coeff_f32, proto_h, proto_w, num_protos,
+                    opacity, (lx0, lx_range, ly0, ly_range), color_mode,
+                    0.0_f32, |p: &f32, _| *p,
+                );
+            }
+            DType::F16 => {
+                let t = proto_data.protos.as_f16().expect("F16");
+                let m = t.map()?;
+                self.draw_proto_masks_inner(
+                    dst_slice, dst_w, dst_h, dst_rs, channels, detect,
+                    m.as_slice(), &coeff_f32, proto_h, proto_w, num_protos,
+                    opacity, (lx0, lx_range, ly0, ly_range), color_mode,
+                    0.0_f32, |p: &half::f16, _| p.to_f32(),
+                );
+            }
+            DType::I8 => {
+                use edgefirst_tensor::QuantMode;
+                let t = proto_data.protos.as_i8().expect("I8");
+                let m = t.map()?;
+                let quant = t.quantization().ok_or_else(|| {
+                    Error::InvalidShape(
+                        "I8 protos require quantization metadata".into(),
+                    )
+                })?;
+                let (scale, zp) = match quant.mode() {
+                    QuantMode::PerTensor { scale, zero_point } => (scale, zero_point as f32),
+                    QuantMode::PerTensorSymmetric { scale } => (scale, 0.0),
+                    QuantMode::PerChannel { axis, .. }
+                    | QuantMode::PerChannelSymmetric { axis, .. } => {
+                        return Err(Error::InvalidShape(format!(
+                            "per-channel quantization (axis={axis}) in draw_proto_masks \
+                             CPU path not yet supported"
+                        )));
+                    }
+                };
+                self.draw_proto_masks_inner(
+                    dst_slice, dst_w, dst_h, dst_rs, channels, detect,
+                    m.as_slice(), &coeff_f32, proto_h, proto_w, num_protos,
+                    opacity, (lx0, lx_range, ly0, ly_range), color_mode,
+                    scale, move |p: &i8, _| (*p as f32) - zp,
+                );
+            }
+            other => {
+                return Err(Error::InvalidShape(format!(
+                    "proto tensor dtype {other:?} not supported"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_proto_masks_inner<P: Copy>(
+        &self,
+        dst_slice: &mut [u8],
+        dst_w: usize,
+        dst_h: usize,
+        dst_rs: usize,
+        channels: usize,
+        detect: &[DetectBox],
+        protos: &[P],
+        coeff_all_f32: &[f32],
+        proto_h: usize,
+        proto_w: usize,
+        num_protos: usize,
+        opacity: f32,
+        letterbox_xy: (f32, f32, f32, f32),
+        color_mode: crate::ColorMode,
+        acc_scale: f32,
+        load_f32: impl Fn(&P, f32) -> f32 + Copy,
+    ) {
+        let (lx0, lx_range, ly0, ly_range) = letterbox_xy;
+        let stride_y = proto_w * num_protos;
+        for (idx, det) in detect.iter().enumerate() {
+            let coeff = &coeff_all_f32[idx * num_protos..(idx + 1) * num_protos];
             let color_index = color_mode.index(idx, det.label);
             let color = self.colors[color_index % self.colors.len()];
             let alpha = if opacity == 1.0 {
@@ -757,8 +861,6 @@ impl CPUProcessor {
                 (color[3] as f32 * opacity).round() as u16
             };
 
-            // `detect` has already been un-letterboxed by the caller (lib.rs),
-            // so bbox coords are in output-image-normalized space.
             let start_x = (dst_w as f32 * det.bbox.xmin).round() as usize;
             let start_y = (dst_h as f32 * det.bbox.ymin).round() as usize;
             let end_x = ((dst_w as f32 * det.bbox.xmax).round() as usize).min(dst_w);
@@ -766,22 +868,45 @@ impl CPUProcessor {
 
             for y in start_y..end_y {
                 for x in start_x..end_x {
-                    // Map output pixel (x, y) → model-input-normalized → proto pixel.
-                    // When a letterbox was applied, output pixels map to a sub-region
-                    // of the model input; lx0/lx_range re-introduce that mapping.
-                    let px = (lx0 + (x as f32 / dst_w as f32) * lx_range) * proto_w as f32 - 0.5;
-                    let py = (ly0 + (y as f32 / dst_h as f32) * ly_range) * proto_h as f32 - 0.5;
+                    let px =
+                        (lx0 + (x as f32 / dst_w as f32) * lx_range) * proto_w as f32 - 0.5;
+                    let py =
+                        (ly0 + (y as f32 / dst_h as f32) * ly_range) * proto_h as f32 - 0.5;
 
-                    // Bilinear interpolation + dot product
-                    let acc = bilinear_dot(protos, coeff, num_protos, px, py, proto_w, proto_h);
-
-                    // Sigmoid threshold
-                    let mask = 1.0 / (1.0 + (-acc).exp());
+                    // Bilinear interpolation with per-load widening. Inline
+                    // bilinear-sample since bilinear_dot_slice takes a
+                    // different closure shape (no `zp` arg).
+                    let x0 = (px.floor() as isize).clamp(0, proto_w as isize - 1) as usize;
+                    let y0 = (py.floor() as isize).clamp(0, proto_h as isize - 1) as usize;
+                    let x1 = (x0 + 1).min(proto_w - 1);
+                    let y1 = (y0 + 1).min(proto_h - 1);
+                    let fx = px - px.floor();
+                    let fy = py - py.floor();
+                    let w00 = (1.0 - fx) * (1.0 - fy);
+                    let w10 = fx * (1.0 - fy);
+                    let w01 = (1.0 - fx) * fy;
+                    let w11 = fx * fy;
+                    let b00 = y0 * stride_y + x0 * num_protos;
+                    let b10 = y0 * stride_y + x1 * num_protos;
+                    let b01 = y1 * stride_y + x0 * num_protos;
+                    let b11 = y1 * stride_y + x1 * num_protos;
+                    let mut acc = 0.0_f32;
+                    for p in 0..num_protos {
+                        let v00 = load_f32(&protos[b00 + p], 0.0);
+                        let v10 = load_f32(&protos[b10 + p], 0.0);
+                        let v01 = load_f32(&protos[b01 + p], 0.0);
+                        let v11 = load_f32(&protos[b11 + p], 0.0);
+                        let val = w00 * v00 + w10 * v10 + w01 * v01 + w11 * v11;
+                        acc += coeff[p] * val;
+                    }
+                    let final_acc = if acc_scale == 0.0 { acc } else { acc_scale * acc };
+                    // Pass-through: acc_scale=0.0 means "no scaling" (f32/f16
+                    // native); non-zero means "apply scale once" (i8 with
+                    // per-tensor quant).
+                    let mask = 1.0 / (1.0 + (-final_acc).exp());
                     if mask < 0.5 {
                         continue;
                     }
-
-                    // Alpha blend
                     let dst_index = y * dst_rs + x * channels;
                     for c in 0..3 {
                         dst_slice[dst_index + c] = ((color[c] as u16 * alpha
@@ -791,7 +916,5 @@ impl CPUProcessor {
                 }
             }
         }
-
-        Ok(())
     }
 }

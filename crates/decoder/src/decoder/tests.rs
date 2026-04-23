@@ -2409,20 +2409,27 @@ outputs:
             }
         }
 
-        // Path 2: decode_proto() produces a `ProtoTensor::Float16` variant
-        // (native f16 protos, no f32 widening on the decoder side).
+        // Path 2: decode_proto() produces TensorDyn::F16 protos (native f16,
+        // no widening on the decoder side) with matching F16 mask coefficients.
         let mut out_boxes2: Vec<DetectBox> = Vec::with_capacity(10);
         let proto = decoder
             .decode_proto(&inputs, &mut out_boxes2)
             .expect("f16 decode_proto must succeed")
             .expect("YoloSegDet produces ProtoData");
         assert_eq!(out_boxes2.len(), 2);
-        assert!(
-            proto.protos.is_f16(),
-            "f16 inputs should yield ProtoTensor::Float16, got variant dim={:?}",
-            proto.protos.dim()
+        assert_eq!(
+            proto.protos.dtype(),
+            edgefirst_tensor::DType::F16,
+            "f16 inputs should yield TensorDyn::F16 protos, got shape={:?}",
+            proto.protos.shape()
         );
-        assert_eq!(proto.protos.dim(), (PH, PW, NM));
+        assert_eq!(proto.protos.shape(), &[PH, PW, NM]);
+        assert_eq!(
+            proto.mask_coefficients.dtype(),
+            edgefirst_tensor::DType::F16,
+            "f16 input → f16 mask_coefficients"
+        );
+        assert_eq!(proto.mask_coefficients.shape(), &[out_boxes2.len(), NM]);
     }
 
     #[test]
@@ -2632,33 +2639,36 @@ outputs:
         );
 
         // Verify proto data shape
-        let protos_shape = match &proto_data.protos {
-            crate::ProtoTensor::Quantized { protos, .. } => protos.shape().to_vec(),
-            crate::ProtoTensor::Float16(arr) => arr.shape().to_vec(),
-            crate::ProtoTensor::Float(arr) => arr.shape().to_vec(),
-        };
-        assert_eq!(protos_shape, [160, 160, 32], "Proto shape mismatch");
-
-        // Verify mask coefficients: one per detection, each length 32
         assert_eq!(
-            proto_data.mask_coefficients.len(),
-            output_boxes.len(),
-            "mask_coefficients count must match detection count"
+            proto_data.protos.shape(),
+            &[160, 160, 32],
+            "Proto shape mismatch"
         );
-        for (i, coeff) in proto_data.mask_coefficients.iter().enumerate() {
-            assert_eq!(
-                coeff.len(),
-                32,
-                "Detection {i} has {} coefficients, expected 32",
-                coeff.len()
-            );
-        }
 
-        // Verify proto tensor is quantized variant (input was i8)
-        assert!(
-            matches!(proto_data.protos, crate::ProtoTensor::Quantized { .. }),
-            "Expected Quantized proto tensor for i8 input"
+        // Verify mask coefficients: shape [num_detections, num_protos],
+        // dtype F32 (dequantized at extraction).
+        assert_eq!(
+            proto_data.mask_coefficients.shape(),
+            &[output_boxes.len(), 32],
+            "mask_coefficients shape must be [N, num_protos]"
         );
+        assert_eq!(
+            proto_data.mask_coefficients.dtype(),
+            edgefirst_tensor::DType::F32,
+            "quantized extraction dequantizes coefficients to F32"
+        );
+
+        // Verify proto tensor is I8 (input was i8) with per-tensor quantization.
+        assert_eq!(
+            proto_data.protos.dtype(),
+            edgefirst_tensor::DType::I8,
+            "Expected TensorDyn::I8 for quantized model"
+        );
+        let quant = proto_data
+            .protos
+            .quantization()
+            .expect("quantized proto tensor carries quantization metadata");
+        assert!(quant.is_per_tensor(), "quantization should be per-tensor");
     }
 
     /// f32 sibling of `test_extract_proto_data_quant_with_cached_model`.
@@ -2741,21 +2751,17 @@ outputs:
         );
 
         // Shape + coefficient-count invariants.
-        let protos_shape = match &proto_data.protos {
-            crate::ProtoTensor::Quantized { protos, .. } => protos.shape().to_vec(),
-            crate::ProtoTensor::Float16(arr) => arr.shape().to_vec(),
-            crate::ProtoTensor::Float(arr) => arr.shape().to_vec(),
-        };
-        assert_eq!(protos_shape, [160, 160, 32]);
-        assert_eq!(proto_data.mask_coefficients.len(), output_boxes.len());
-        for coeff in proto_data.mask_coefficients.iter() {
-            assert_eq!(coeff.len(), 32);
-        }
+        assert_eq!(proto_data.protos.shape(), &[160, 160, 32]);
+        assert_eq!(
+            proto_data.mask_coefficients.shape(),
+            &[output_boxes.len(), 32]
+        );
 
-        // f32 input → ProtoTensor::Float variant.
-        assert!(
-            matches!(proto_data.protos, crate::ProtoTensor::Float(_)),
-            "Expected ProtoTensor::Float for f32 input"
+        // f32 input → TensorDyn::F32 protos + coefficients (dtype matches).
+        assert_eq!(proto_data.protos.dtype(), edgefirst_tensor::DType::F32);
+        assert_eq!(
+            proto_data.mask_coefficients.dtype(),
+            edgefirst_tensor::DType::F32
         );
 
         // Per-detection box-centre correspondence vs. quantized reference.
@@ -2849,22 +2855,19 @@ outputs:
             "f16 detection count {got_n} diverged from quant reference {ref_n} by > {tol} (20%)"
         );
 
-        // Proto shape + coefficient vectors intact.
-        let protos_shape = match &proto_data.protos {
-            crate::ProtoTensor::Quantized { protos, .. } => protos.shape().to_vec(),
-            crate::ProtoTensor::Float16(arr) => arr.shape().to_vec(),
-            crate::ProtoTensor::Float(arr) => arr.shape().to_vec(),
-        };
-        assert_eq!(protos_shape, [160, 160, 32]);
-        assert_eq!(proto_data.mask_coefficients.len(), output_boxes.len());
-        for coeff in proto_data.mask_coefficients.iter() {
-            assert_eq!(coeff.len(), 32);
-        }
+        // Proto shape + coefficient shape intact.
+        assert_eq!(proto_data.protos.shape(), &[160, 160, 32]);
+        assert_eq!(
+            proto_data.mask_coefficients.shape(),
+            &[output_boxes.len(), 32]
+        );
 
-        // f16 input → ProtoTensor::Float16 variant (native f16 preserved).
-        assert!(
-            matches!(proto_data.protos, crate::ProtoTensor::Float16(_)),
-            "Expected ProtoTensor::Float16 for f16 input"
+        // f16 input → TensorDyn::F16 for BOTH protos and coefficients
+        // (native f16 preserved end-to-end — no widening on the decoder side).
+        assert_eq!(proto_data.protos.dtype(), edgefirst_tensor::DType::F16);
+        assert_eq!(
+            proto_data.mask_coefficients.dtype(),
+            edgefirst_tensor::DType::F16
         );
 
         // Centre-drift on the first min(ref_n, got_n) detections. Order is
