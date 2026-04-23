@@ -1662,8 +1662,11 @@ where
         Ok(())
     }
 
-    /// Builder-style variant of [`Self::set_quantization`]. Returns the
-    /// tensor unchanged on error (consumed + rebuilt).
+    /// Builder-style variant of [`Self::set_quantization`]. Consumes `self`
+    /// and returns `Result<Self>` — on success yields the tensor with the
+    /// attached quantization; on validation failure returns
+    /// [`Error::QuantizationInvalid`] and drops `self` (the tensor is not
+    /// returned in the error arm).
     pub fn with_quantization(mut self, q: Quantization) -> Result<Self> {
         self.set_quantization(q)?;
         Ok(self)
