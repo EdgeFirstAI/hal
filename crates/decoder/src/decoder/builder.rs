@@ -787,11 +787,12 @@ impl DecoderBuilder {
             None => return Err(DecoderError::NoConfig),
         };
 
-        // Enforce the physical-order contract: every output's shape and
-        // dshape must describe the same axes in the same order, listed
-        // from outermost to innermost. Ambiguous-layout roles (Protos,
-        // Boxes, Scores, MaskCoefficients, Classes, Detection) require a
-        // non-empty dshape so the decoder can resolve role → axis.
+        // Enforce the physical-order contract: when dshape is present
+        // it must describe the same axes as shape in the same order,
+        // listed from outermost to innermost. Ambiguous-layout roles
+        // (Protos, Boxes, Scores, MaskCoefficients, Classes, Detection)
+        // may still omit dshape when shape is already in the decoder's
+        // canonical order.
         for output in &config.outputs {
             Decoder::validate_output_layout(output.into())?;
         }
