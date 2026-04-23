@@ -73,15 +73,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Python `ProtoData.take_protos()` and `take_mask_coefficients()`**
   consuming accessors returning `Optional[Tensor]`.
 
-- **Build configuration:** `.cargo/config.toml` enables `+f16c,+fma`
-  on x86_64-linux/darwin and `+fp16` on aarch64-apple-darwin. The
-  aarch64-linux default stays plain to keep Cortex-A53 (imx8mp) safe;
-  Orin builds opt in via `target-cpu=cortex-a78ae` per
-  `docs/orin-build.md`.
+- **Build configuration:** `.cargo/config.toml` enables `+fp16` on
+  `aarch64-apple-darwin` only (every Apple Silicon M-series chip has
+  FEAT_FP16; Intel Macs build under `x86_64-apple-darwin` which is
+  unaffected). All other targets keep their baseline ISA so a single
+  distributed binary stays portable across older CPUs within the same
+  triple. Developers benchmarking on hosts with richer ISAs (Orin fp16,
+  x86_64 F16C) opt in via `RUSTFLAGS` — see `README.md` and
+  `TESTING.md`. Runtime CPU-feature detection + dynamic dispatch for
+  broader enablement is deferred to a future release.
 
 - **`scripts/audit_f16_codegen.sh`** validates that the f16 kernel's
   release disassembly contains `fcvt` / `vcvtph2ps` (not
-  `__extendhfsf2`) on the target.
+  `__extendhfsf2`) on the target, for developers verifying a local
+  benchmarking build.
 
 ### Changed
 
@@ -164,9 +169,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GL shader-side per-channel dequantization (CPU handles it; GL
   returns `NotSupported`). Deferred pending a future ticket.
 - Continuous perf validation in CI. No FP16-capable CI runner is
-  available; local Orin benchmarks documented in the PR description.
+  available; local benchmarks are documented in `TESTING.md`.
   Tracked as EDGEAI-1247.
-- Runtime dispatch for x86_64 F16C (compile-time target-feature only).
+- Runtime CPU-feature detection + dynamic dispatch for richer ISAs
+  (aarch64 FEAT_FP16 on non-Apple, x86_64 F16C / FMA / AVX2). The
+  default build stays on each target's baseline ISA so a single
+  distributed binary remains portable; local benchmarking uses
+  `RUSTFLAGS` opt-in per `README.md` / `TESTING.md`. Dynamic dispatch
+  is the prerequisite for enabling these ISAs on shipped binaries.
 
 ## [0.17.0] - 2026-04-21
 

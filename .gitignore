@@ -28,6 +28,9 @@ env.sh
 /FEATURE*.md
 /SPS/
 /WP1/
+# Local-only planning / dev notes directory (never committed; use
+# crate-level docs.rs comments or CHANGELOG.md for shipped docs).
+/docs/
 *.profraw
 .remember
 
