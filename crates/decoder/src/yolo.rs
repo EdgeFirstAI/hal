@@ -1394,7 +1394,9 @@ pub(super) fn extract_proto_data_float<
     let n = det_indices.len();
 
     // Per-detection coefficients packed row-major into a contiguous buffer,
-    // preserving the source dtype. Shape: [N, num_protos].
+    // preserving the source dtype. Shape: [N, num_protos] — N=0 is permitted
+    // (tracker path emits no detections this frame) since Mem-backed tensors
+    // accept zero-element shapes as "empty collection" sentinels.
     let mut coeff_rows: Vec<MASK> = Vec::with_capacity(n * num_protos);
     output_boxes.clear();
     for (det, idx) in det_indices {
@@ -1448,9 +1450,11 @@ pub(crate) fn extract_proto_data_quant<
         );
     }
 
+    // Shape `[n, num_protos]` with n=0 is permitted (tracker path emits no
+    // fresh detections this frame) via the Mem-backed zero-size allowance.
     let coeff_tensor = Tensor::<f32>::new(&[n, num_protos], Some(TensorMemory::Mem), None)
         .expect("allocating mask_coefficients tensor");
-    {
+    if n > 0 {
         let mut m = coeff_tensor
             .map()
             .expect("mapping mask_coefficients tensor");

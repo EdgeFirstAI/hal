@@ -676,15 +676,67 @@ fn fused_dot_sigmoid_f32_slice(
     mask
 }
 
-/// Native-f16 fused kernel. Widens f16 → f32 at the FMA load site via
-/// `half::f16::to_f32()` — one instruction on ARMv8.2-FP16 / x86-F16C,
-/// soft helper elsewhere. Stage 8 will add explicit intrinsic variants
-/// gated on the relevant `target_feature`.
+/// Native-f16 fused kernel.
+///
+/// Three code paths, selected at compile time:
+///
+/// 1. **x86_64 + F16C + FMA** — explicit intrinsic kernel (`_mm256_cvtph_ps`
+///    8-lane f16→f32 widening, `_mm256_fmadd_ps` FMA). Guaranteed to use
+///    hardware f16 conversion, not LLVM's autovectorizer (which is unreliable
+///    for this pattern per rust-lang/stdarch #1349).
+///
+/// 2. **aarch64 + FP16** — scalar `half::f16::to_f32()` at the FMA site.
+///    LLVM lowers each `.to_f32()` to a single `fcvt` instruction when
+///    `target-feature=+fp16` is active (e.g. `target-cpu=cortex-a78ae`).
+///    The stable f16-typed NEON intrinsics (`vcvt_f32_f16`, `vld1q_f16`)
+///    require nightly as of this commit; the scalar path is equally
+///    efficient at this granularity.
+///
+/// 3. **Fallback (Cortex-A53, targets without FP16)** — same scalar code.
+///    `half::f16::to_f32()` lowers to `__extendhfsf2` soft-float helper,
+///    one call per proto load. Correctness-preserving; ~15 cycles/load
+///    vs. ~3 cycles for the hardware path. Documented in
+///    `docs/orin-build.md`.
 #[allow(clippy::too_many_arguments)]
 fn fused_dot_sigmoid_f16_slice(
     protos: &[half::f16],
     coeff: &[f32],
-    _proto_h: usize,
+    proto_h: usize,
+    proto_w: usize,
+    y0: usize,
+    x0: usize,
+    roi_h: usize,
+    roi_w: usize,
+    num_protos: usize,
+) -> ndarray::Array3<u8> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "f16c", target_feature = "fma"))]
+    {
+        // SAFETY: target-feature gates both `vcvtph2ps` and `vfmadd*ps`;
+        // the caller's slice-bounds contract is identical to the scalar arm.
+        return unsafe {
+            fused_dot_sigmoid_f16_slice_f16c(
+                protos, coeff, proto_h, proto_w, y0, x0, roi_h, roi_w, num_protos,
+            )
+        };
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "f16c", target_feature = "fma")))]
+    {
+        let _ = proto_h;
+        fused_dot_sigmoid_f16_slice_scalar(
+            protos, coeff, proto_w, y0, x0, roi_h, roi_w, num_protos,
+        )
+    }
+}
+
+/// Scalar native-f16 kernel. `half::f16::to_f32()` at the FMA site is
+/// lowered to a single `fcvt` (aarch64+fp16) or a single `vcvtps_ps`
+/// (x86_64+f16c) by LLVM, or to the soft-float helper `__extendhfsf2` on
+/// targets without FP16 hardware. Loop unrolled by 4 to give the scheduler
+/// room to overlap loads with FMAs.
+#[allow(clippy::too_many_arguments, dead_code)]
+fn fused_dot_sigmoid_f16_slice_scalar(
+    protos: &[half::f16],
+    coeff: &[f32],
     proto_w: usize,
     y0: usize,
     x0: usize,
@@ -715,6 +767,78 @@ fn fused_dot_sigmoid_f16_slice(
                 acc += coeff[k] * protos[base + k].to_f32();
                 k += 1;
             }
+            let sigmoid = fast_sigmoid(acc);
+            mask[[y, x, 0]] = (sigmoid * 255.0 + 0.5) as u8;
+        }
+    }
+    mask
+}
+
+/// x86_64 F16C + FMA explicit intrinsic kernel. Processes 8 f16 lanes per
+/// inner iteration via `_mm256_cvtph_ps` (8-lane f16→f32 widen) followed by
+/// `_mm256_fmadd_ps` (8-lane fused multiply-add). Horizontal reduce at the
+/// end of each pixel.
+///
+/// # Safety
+///
+/// Caller must ensure the target CPU supports F16C + FMA. The workspace's
+/// `.cargo/config.toml` sets these target-features on `x86_64-unknown-linux-gnu`
+/// and `x86_64-apple-darwin`, making this function statically callable on
+/// those targets.
+#[cfg(all(target_arch = "x86_64", target_feature = "f16c", target_feature = "fma"))]
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "f16c,fma,avx")]
+unsafe fn fused_dot_sigmoid_f16_slice_f16c(
+    protos: &[half::f16],
+    coeff: &[f32],
+    _proto_h: usize,
+    proto_w: usize,
+    y0: usize,
+    x0: usize,
+    roi_h: usize,
+    roi_w: usize,
+    num_protos: usize,
+) -> ndarray::Array3<u8> {
+    use core::arch::x86_64::{
+        _mm256_castps256_ps128, _mm256_cvtph_ps, _mm256_extractf128_ps, _mm256_fmadd_ps,
+        _mm256_loadu_ps, _mm256_setzero_ps, _mm_add_ps, _mm_cvtss_f32, _mm_hadd_ps,
+        _mm_loadu_si128,
+    };
+
+    let stride_y = proto_w * num_protos;
+    let chunks8 = num_protos / 8;
+    let tail = num_protos % 8;
+    let mut mask = ndarray::Array3::<u8>::zeros((roi_h, roi_w, 1));
+
+    for y in 0..roi_h {
+        for x in 0..roi_w {
+            let base = (y0 + y) * stride_y + (x0 + x) * num_protos;
+            let mut acc_v = _mm256_setzero_ps();
+            let mut k = 0;
+            for _ in 0..chunks8 {
+                // Load 8 f16 (128 bits / 16 bytes) via u16-typed pointer.
+                let p_ptr =
+                    protos.as_ptr().add(base + k) as *const half::f16 as *const core::arch::x86_64::__m128i;
+                let raw = _mm_loadu_si128(p_ptr);
+                let widened = _mm256_cvtph_ps(raw);
+                let coeffs_v = _mm256_loadu_ps(coeff.as_ptr().add(k));
+                acc_v = _mm256_fmadd_ps(coeffs_v, widened, acc_v);
+                k += 8;
+            }
+            // Horizontal reduce 8 → 1.
+            let lo = _mm256_castps256_ps128(acc_v);
+            let hi = _mm256_extractf128_ps::<1>(acc_v);
+            let sum4 = _mm_add_ps(lo, hi);
+            let sum2 = _mm_hadd_ps(sum4, sum4);
+            let sum1 = _mm_hadd_ps(sum2, sum2);
+            let mut acc = _mm_cvtss_f32(sum1);
+
+            // Scalar tail for num_protos % 8 (≤ 7 items).
+            while k < num_protos && k - chunks8 * 8 < tail {
+                acc += coeff[k] * protos[base + k].to_f32();
+                k += 1;
+            }
+
             let sigmoid = fast_sigmoid(acc);
             mask[[y, x, 0]] = (sigmoid * 255.0 + 0.5) as u8;
         }

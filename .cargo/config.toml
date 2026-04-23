@@ -1,0 +1,24 @@
+# EdgeFirst HAL workspace Cargo config.
+#
+# Target-feature flags enable native f16 instructions on platforms that
+# support them. Cortex-A53 (imx8mp) deliberately has no +fp16 entry — it
+# lacks FEAT_FP16 and would SIGILL on native f16 intrinsics.
+#
+# Orin Nano (Cortex-A78AE) enables native ARMv8.2-FP16 via an explicit
+# target-cpu invocation (documented in docs/orin-build.md). A workspace-wide
+# +fp16 entry for aarch64 is unsafe because it would break imx8mp builds.
+
+# x86_64 Linux: F16C (f16→f32 conversion) + FMA universally available on
+# Haswell (2013) and newer. Safe to bake in for dev / CI / distributed
+# Linux desktop binaries.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+f16c,+fma"]
+
+# x86_64 macOS: same as Linux — Haswell baseline is reasonable for Intel
+# Macs, and Apple Silicon builds use the aarch64-apple-darwin triple.
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "target-feature=+f16c,+fma"]
+
+# aarch64 Apple Silicon (M-series): ARMv8.2+ with FEAT_FP16 guaranteed.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-feature=+fp16"]
