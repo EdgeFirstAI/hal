@@ -26,10 +26,10 @@ env.sh
 /BUG*.md
 /FIX*.md
 /FEATURE*.md
-
 /SPS/
 /WP1/
 *.profraw
+.remember
 
 # Benchmark intermediate data (JSON results, logs)
 /benchmarks/
