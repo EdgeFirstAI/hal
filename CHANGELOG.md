@@ -7,6 +7,125 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Native f16 support for decoder output tensors.** The YOLO
+  segmentation decoder now accepts `Tensor<half::f16>` for proto
+  masks and mask coefficients natively, alongside the existing `f32`
+  and `i8+quantization` paths. Targets the Orin Nano TensorRT-fp16
+  engine (`yolo26x-seg-t-2592-fp16.engine`) and any future f16-output
+  model. On ARMv8.2-FP16 (Orin Cortex-A78AE) and x86_64+F16C
+  (Haswell+) the scalar kernel lowers `half::f16::to_f32()` to a
+  single `fcvt` / `vcvtph2ps`; x86_64 additionally gets an explicit
+  `_mm256_cvtph_ps` + `_mm256_fmadd_ps` intrinsic kernel for
+  deterministic 8-lane codegen. On Cortex-A53 (imx8mp, no FP16
+  hardware) the fallback path calls the soft-float `__extendhfsf2`
+  helper per proto load — correctness-preserving at reduced
+  throughput. Resolves EDGEAI-1244.
+
+- **`edgefirst_tensor::Quantization` as unified tensor-level
+  metadata.** Covers all four modes defined by the edgefirst.json
+  spec: per-tensor symmetric, per-tensor asymmetric, per-channel
+  symmetric, per-channel asymmetric. Fallible constructors
+  (`per_tensor`, `per_tensor_symmetric`, `per_channel`,
+  `per_channel_symmetric`) reject length-mismatched / empty inputs
+  at construction with structured `Error::QuantizationInvalid`.
+
+- **Type-gated quantization accessors on `Tensor<T>`.** The sealed
+  `IntegerType` trait restricts `Tensor::<T>::quantization()`,
+  `set_quantization()`, `with_quantization()`, `clear_quantization()`
+  to integer `T` (`u8/i8/u16/i16/u32/i32/u64/i64`). Float `T`
+  (`f16/f32/f64`) has no accessor — `Tensor::<f32>::quantization()`
+  fails to compile. A compile-fail doctest anchors the invariant.
+
+- **`QuantMode` dispatch enum** for kernel entry. Matches once at the
+  kernel boundary to pick a monomorphized inner kernel
+  (per-tensor vs. per-channel), avoiding `&Quantization` polymorphism
+  in hot loops.
+
+- **CPU mask kernel per-channel quantization support.** The fused
+  dequant + dot + sigmoid kernel handles per-channel scales on axis 2
+  (the channel dimension) in addition to per-tensor. Other
+  per-channel axes return `Error::NotSupported`.
+
+- **TensorDyn proto-data access through the C API.**
+  `hal_proto_data_take_protos()` and
+  `hal_proto_data_take_mask_coefficients()` transfer ownership of
+  each tensor out of a `HalProtoData*`. Subsequent calls for the
+  same field return NULL. Design motivated by `TensorDyn` not
+  implementing `Clone`.
+
+- **`HalTensorQuant` opaque handle** (C API) with accessors
+  `hal_quantization_{kind, scale_len, scale_at, zero_point_at,
+  is_symmetric, axis}`. Obtained via `hal_tensor_quantization()`;
+  returns NULL for float or unquantized integer tensors. Named
+  distinctly from the pre-existing flat `HalQuantization` struct
+  (legacy decoder-side scalar quantization plumbing).
+
+- **Python `Quantization` pyclass** with staticmethod constructors
+  and property accessors for all four modes.
+
+- **Python `Tensor.quantization` property and
+  `set_quantization_{per_tensor,per_tensor_symmetric,per_channel,
+  per_channel_symmetric}` / `clear_quantization` methods.** Float
+  tensors raise on set.
+
+- **Python `ProtoData.take_protos()` and `take_mask_coefficients()`**
+  consuming accessors returning `Optional[Tensor]`.
+
+- **Build configuration:** `.cargo/config.toml` enables `+f16c,+fma`
+  on x86_64-linux/darwin and `+fp16` on aarch64-apple-darwin. The
+  aarch64-linux default stays plain to keep Cortex-A53 (imx8mp) safe;
+  Orin builds opt in via `target-cpu=cortex-a78ae` per
+  `docs/orin-build.md`.
+
+- **`scripts/audit_f16_codegen.sh`** validates that the f16 kernel's
+  release disassembly contains `fcvt` / `vcvtph2ps` (not
+  `__extendhfsf2`) on the target.
+
+### Changed
+
+- **`ProtoData` now holds two `TensorDyn` fields** (`protos` and
+  `mask_coefficients`) instead of a custom `ProtoTensor` enum + flat
+  `Vec<Vec<f32>>` coefficient list. Deleted the `ProtoTensor` enum
+  and `IntoProtoTensor` trait — a single generic `FloatProtoElem`
+  impl chain now routes `f16 / f32 / f64` inputs through
+  `Tensor::from_slice` / `Tensor::from_arrayview3` without unsafe
+  TypeId casts. The quantized `i8` proto path attaches its per-tensor
+  quantization metadata via `Tensor::<i8>::with_quantization()`
+  directly.
+
+- **Mem-backed tensors accept zero-element shapes** (`[0, N]`). The
+  tracker path's genuine "no detections this frame" sentinel now
+  produces a zero-row coefficient tensor rather than a placeholder
+  1-row tensor. DMA-backed storage continues to reject zero-size.
+
+- **CPU mask kernels hoist tensor maps out of the per-detection
+  loop** (fixes the ~3-13 MB per-detection allocation flagged in
+  code review). `materialize_segmentations`,
+  `materialize_scaled_segmentations`, and `draw_proto_masks` dispatch
+  on `TensorDyn::dtype()` once and call slice-native kernels
+  (`fused_dequant_dot_sigmoid_i8_slice`, `fused_dot_sigmoid_f32_slice`,
+  `fused_dot_sigmoid_f16_slice`) for the inner work.
+
+- **GL renderer dispatches on `TensorDyn::dtype()`** and returns
+  `Error::NotSupported` for per-channel quantization (GL shader-side
+  per-channel is deferred). CPU path handles per-channel; callers
+  should fall back to CPU when the GL renderer rejects.
+
+- **Schema v2 `Quantization` now converts cleanly to
+  `edgefirst_tensor::Quantization`** via `TryFrom<&schema::Quantization>`,
+  covering all four modes.
+
+### Not in this release
+
+- GL shader-side per-channel dequantization (CPU handles it; GL
+  returns `NotSupported`). Deferred pending a future ticket.
+- Continuous perf validation in CI. No FP16-capable CI runner is
+  available; local Orin benchmarks documented in the PR description.
+  Tracked as EDGEAI-1247.
+- Runtime dispatch for x86_64 F16C (compile-time target-feature only).
+
 ## [0.17.0] - 2026-04-21
 
 ### Added

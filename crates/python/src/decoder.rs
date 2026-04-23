@@ -473,10 +473,7 @@ impl PyProtoData {
     /// Consumes the proto data's ``protos`` field — subsequent calls
     /// return ``None``.
     fn take_protos(&mut self) -> Option<crate::tensor::PyTensor> {
-        let taken = std::mem::replace(
-            &mut self.0.protos,
-            empty_sentinel_tensor_dyn(),
-        );
+        let taken = std::mem::replace(&mut self.0.protos, empty_sentinel_tensor_dyn());
         if is_empty_sentinel(&taken) {
             self.0.protos = taken;
             return None;
@@ -491,10 +488,7 @@ impl PyProtoData {
     /// Consumes the proto data's ``mask_coefficients`` field — subsequent
     /// calls return ``None``.
     fn take_mask_coefficients(&mut self) -> Option<crate::tensor::PyTensor> {
-        let taken = std::mem::replace(
-            &mut self.0.mask_coefficients,
-            empty_sentinel_tensor_dyn(),
-        );
+        let taken = std::mem::replace(&mut self.0.mask_coefficients, empty_sentinel_tensor_dyn());
         if is_empty_sentinel(&taken) {
             self.0.mask_coefficients = taken;
             return None;

@@ -933,13 +933,17 @@ impl PyQuantization {
     /// Construct per-tensor asymmetric quantization: single scale + zero point.
     #[staticmethod]
     fn per_tensor(scale: f32, zero_point: i32) -> Self {
-        Self(edgefirst_hal::tensor::Quantization::per_tensor(scale, zero_point))
+        Self(edgefirst_hal::tensor::Quantization::per_tensor(
+            scale, zero_point,
+        ))
     }
 
     /// Construct per-tensor symmetric quantization: single scale, zero point = 0.
     #[staticmethod]
     fn per_tensor_symmetric(scale: f32) -> Self {
-        Self(edgefirst_hal::tensor::Quantization::per_tensor_symmetric(scale))
+        Self(edgefirst_hal::tensor::Quantization::per_tensor_symmetric(
+            scale,
+        ))
     }
 
     /// Construct per-channel asymmetric quantization. Raises on length
@@ -956,9 +960,9 @@ impl PyQuantization {
     /// Construct per-channel symmetric quantization. Raises on empty scales.
     #[staticmethod]
     fn per_channel_symmetric(scales: Vec<f32>, axis: usize) -> Result<Self> {
-        Ok(Self(edgefirst_hal::tensor::Quantization::per_channel_symmetric(
-            scales, axis,
-        )?))
+        Ok(Self(
+            edgefirst_hal::tensor::Quantization::per_channel_symmetric(scales, axis)?,
+        ))
     }
 
     /// List of scale factors (length 1 for per-tensor, N for per-channel).

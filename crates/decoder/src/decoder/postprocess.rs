@@ -15,12 +15,13 @@ use crate::{
         decode_modelpack_det, decode_modelpack_float, decode_modelpack_split_float,
         ModelPackDetectionConfig,
     },
+    yolo::FloatProtoElem,
     yolo::{
         decode_yolo_det, decode_yolo_det_float, decode_yolo_segdet_float, decode_yolo_segdet_quant,
         decode_yolo_split_det_float, decode_yolo_split_det_quant, decode_yolo_split_segdet_float,
         impl_yolo_split_segdet_quant_get_boxes, impl_yolo_split_segdet_quant_process_masks,
     },
-    yolo::FloatProtoElem, DecoderError, DetectBox, ProtoData, Quantization, Segmentation, XYWH,
+    DecoderError, DetectBox, ProtoData, Quantization, Segmentation, XYWH,
 };
 
 macro_rules! dequant_3d {

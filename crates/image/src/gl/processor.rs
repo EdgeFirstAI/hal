@@ -4324,8 +4324,7 @@ impl GLProcessorST {
                 "protos tensor must be rank-3, got {proto_shape:?}"
             )));
         }
-        let (height, width, num_protos) =
-            (proto_shape[0], proto_shape[1], proto_shape[2]);
+        let (height, width, num_protos) = (proto_shape[0], proto_shape[1], proto_shape[2]);
         let coeff_shape = proto_data.mask_coefficients.shape();
         if coeff_shape.len() != 2 || coeff_shape[1] != num_protos || coeff_shape[0] == 0 {
             return Ok(());
@@ -4368,9 +4367,7 @@ impl GLProcessorST {
                 let t = proto_data.protos.as_i8().expect("I8");
                 let m = t.map()?;
                 let quant = t.quantization().ok_or_else(|| {
-                    crate::Error::InvalidShape(
-                        "I8 protos require quantization metadata".into(),
-                    )
+                    crate::Error::InvalidShape("I8 protos require quantization metadata".into())
                 })?;
                 // GL shader path: per-tensor quant only (shader uploads a
                 // single scale/zp uniform). Per-channel would require a
@@ -4394,8 +4391,7 @@ impl GLProcessorST {
                 )
                 .map_err(|e| crate::Error::InvalidShape(format!("{e}")))?
                 .to_owned();
-                let quantization =
-                    edgefirst_decoder::Quantization::new(scale, zp);
+                let quantization = edgefirst_decoder::Quantization::new(scale, zp);
                 self.render_proto_segmentation_int8(
                     detect,
                     &coeff_rows,

@@ -349,7 +349,6 @@ class ProtoData:
         """
         ...
 
-
 class Quantization:
     """Quantization parameters for an integer tensor.
 
@@ -367,7 +366,6 @@ class Quantization:
     ) -> Quantization: ...
     @staticmethod
     def per_channel_symmetric(scales: list[float], axis: int) -> Quantization: ...
-
     @property
     def scale(self) -> list[float]: ...
     @property

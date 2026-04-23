@@ -1186,9 +1186,7 @@ pub unsafe extern "C" fn hal_proto_data_free(proto: *mut HalProtoData) {
 /// @return Newly-owned tensor handle (caller must `hal_tensor_free()`),
 ///         or NULL if `proto` is NULL or protos have already been taken
 #[no_mangle]
-pub unsafe extern "C" fn hal_proto_data_take_protos(
-    proto: *mut HalProtoData,
-) -> *mut HalTensor {
+pub unsafe extern "C" fn hal_proto_data_take_protos(proto: *mut HalProtoData) -> *mut HalTensor {
     if proto.is_null() {
         return std::ptr::null_mut();
     }

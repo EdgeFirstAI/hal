@@ -2865,10 +2865,7 @@ mod tests {
         ));
 
         let pc = Quantization::per_channel(vec![0.1, 0.2], vec![0, -1], 2).unwrap();
-        assert!(matches!(
-            pc.mode(),
-            QuantMode::PerChannel { axis: 2, .. }
-        ));
+        assert!(matches!(pc.mode(), QuantMode::PerChannel { axis: 2, .. }));
 
         let pcs = Quantization::per_channel_symmetric(vec![0.1, 0.2], 0).unwrap();
         assert!(matches!(
@@ -2881,7 +2878,8 @@ mod tests {
     fn test_tensor_quantization_roundtrip_integer() {
         let mut t = Tensor::<i8>::new(&[2, 3, 4], Some(TensorMemory::Mem), None).unwrap();
         assert!(t.quantization().is_none());
-        t.set_quantization(Quantization::per_tensor(0.1, -5)).unwrap();
+        t.set_quantization(Quantization::per_tensor(0.1, -5))
+            .unwrap();
         let q = t.quantization().unwrap();
         assert_eq!(q.scale(), &[0.1]);
         t.clear_quantization();
