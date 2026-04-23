@@ -327,7 +327,59 @@ class ProtoData:
     instead of a ``ProtoData`` instance.
     """
 
-    ...
+    def take_protos(self) -> Optional[Tensor]:
+        """Take ownership of the prototype masks tensor.
+
+        Returns a Tensor with shape ``(H, W, num_protos)``. For quantized
+        models the returned tensor carries quantization metadata accessible
+        via the ``quantization`` property.
+
+        Consumes the proto data's ``protos`` field — subsequent calls
+        return ``None``.
+        """
+        ...
+
+    def take_mask_coefficients(self) -> Optional[Tensor]:
+        """Take ownership of the per-detection mask coefficients tensor.
+
+        Returns a Tensor with shape ``(num_detections, num_protos)``.
+
+        Consumes the proto data's ``mask_coefficients`` field — subsequent
+        calls return ``None``.
+        """
+        ...
+
+
+class Quantization:
+    """Quantization parameters for an integer tensor.
+
+    Four modes, matching the EdgeFirst model metadata spec:
+    per-tensor/per-channel × symmetric/asymmetric.
+    """
+
+    @staticmethod
+    def per_tensor(scale: float, zero_point: int) -> Quantization: ...
+    @staticmethod
+    def per_tensor_symmetric(scale: float) -> Quantization: ...
+    @staticmethod
+    def per_channel(
+        scales: list[float], zero_points: list[int], axis: int
+    ) -> Quantization: ...
+    @staticmethod
+    def per_channel_symmetric(scales: list[float], axis: int) -> Quantization: ...
+
+    @property
+    def scale(self) -> list[float]: ...
+    @property
+    def zero_point(self) -> Optional[list[int]]: ...
+    @property
+    def axis(self) -> Optional[int]: ...
+    @property
+    def is_per_tensor(self) -> bool: ...
+    @property
+    def is_per_channel(self) -> bool: ...
+    @property
+    def is_symmetric(self) -> bool: ...
 
 class Decoder:
     def __init__(
@@ -911,6 +963,37 @@ class Tensor:
     @property
     def is_planar(self) -> bool:
         """Whether this image uses a planar pixel layout."""
+        ...
+
+    @property
+    def quantization(self) -> Optional[Quantization]:
+        """Quantization metadata, or ``None`` for float tensors and
+        unquantized integer tensors."""
+        ...
+
+    def set_quantization_per_tensor(self, scale: float, zero_point: int) -> None:
+        """Attach per-tensor asymmetric quantization. Integer tensors only."""
+        ...
+
+    def set_quantization_per_tensor_symmetric(self, scale: float) -> None:
+        """Attach per-tensor symmetric quantization. Integer tensors only."""
+        ...
+
+    def set_quantization_per_channel(
+        self, scales: list[float], zero_points: list[int], axis: int
+    ) -> None:
+        """Attach per-channel asymmetric quantization. Integer tensors only.
+        Raises on length mismatch or invalid axis."""
+        ...
+
+    def set_quantization_per_channel_symmetric(
+        self, scales: list[float], axis: int
+    ) -> None:
+        """Attach per-channel symmetric quantization. Integer tensors only."""
+        ...
+
+    def clear_quantization(self) -> None:
+        """Remove any quantization metadata from this tensor."""
         ...
 
 class TensorMap:

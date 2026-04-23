@@ -462,6 +462,59 @@ pub type PySegDetTrackedOutput<'py> = (
 #[pyclass(name = "ProtoData")]
 pub struct PyProtoData(pub(crate) ProtoData);
 
+#[pymethods]
+impl PyProtoData {
+    /// Take ownership of the prototype masks tensor.
+    ///
+    /// Returns a Tensor with shape ``(H, W, num_protos)``. For quantized
+    /// models, the returned tensor carries quantization metadata
+    /// accessible via the ``quantization`` property.
+    ///
+    /// Consumes the proto data's ``protos`` field — subsequent calls
+    /// return ``None``.
+    fn take_protos(&mut self) -> Option<crate::tensor::PyTensor> {
+        let taken = std::mem::replace(
+            &mut self.0.protos,
+            empty_sentinel_tensor_dyn(),
+        );
+        if is_empty_sentinel(&taken) {
+            self.0.protos = taken;
+            return None;
+        }
+        Some(crate::tensor::PyTensor(taken))
+    }
+
+    /// Take ownership of the per-detection mask coefficients tensor.
+    ///
+    /// Returns a Tensor with shape ``(num_detections, num_protos)``.
+    ///
+    /// Consumes the proto data's ``mask_coefficients`` field — subsequent
+    /// calls return ``None``.
+    fn take_mask_coefficients(&mut self) -> Option<crate::tensor::PyTensor> {
+        let taken = std::mem::replace(
+            &mut self.0.mask_coefficients,
+            empty_sentinel_tensor_dyn(),
+        );
+        if is_empty_sentinel(&taken) {
+            self.0.mask_coefficients = taken;
+            return None;
+        }
+        Some(crate::tensor::PyTensor(taken))
+    }
+}
+
+fn empty_sentinel_tensor_dyn() -> edgefirst_hal::tensor::TensorDyn {
+    use edgefirst_hal::tensor::{Tensor, TensorDyn, TensorMemory};
+    let t = Tensor::<u8>::new(&[0], Some(TensorMemory::Mem), Some("__taken__"))
+        .expect("sentinel allocation never fails");
+    TensorDyn::U8(t)
+}
+
+fn is_empty_sentinel(t: &edgefirst_hal::tensor::TensorDyn) -> bool {
+    use edgefirst_hal::tensor::TensorDyn;
+    matches!(t, TensorDyn::U8(_)) && t.shape() == [0] && t.name() == "__taken__"
+}
+
 /// ``(boxes, scores, classes, proto_data)`` where ``proto_data`` is ``None``
 /// for detection-only models.
 pub type PyProtoDetOutput<'py> = (
