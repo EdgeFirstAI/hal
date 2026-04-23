@@ -1754,10 +1754,15 @@ mod decoder_tests {
         );
     }
 
-    /// Regression test: config-driven path with NCHW protos (no dshape).
-    /// Simulates YOLOv8-seg ONNX outputs where protos are (1, 32, 160, 160)
-    /// and the YAML config has no dshape field — the exact scenario from
-    /// hal_mask_matmul_bug.md.
+    /// Regression test: config-driven path with physically-NCHW protos.
+    /// Simulates YOLOv8-seg ONNX outputs where the producer emits protos
+    /// as `(1, 32, 160, 160)` in CHW memory order — the caller declares
+    /// shape and dshape matching that physical order and HAL permutes to
+    /// canonical HWC via `swap_axes_if_needed`.
+    ///
+    /// This is the counterpart to the NHWC-producer case (TFLite /
+    /// Ara-2) where shape+dshape are `(1, 160, 160, 32)` +
+    /// `[batch, height, width, num_protos]` and no reordering is needed.
     #[test]
     fn test_decoder_masks_nchw_protos() {
         let score_threshold = 0.45;
@@ -1788,22 +1793,32 @@ mod decoder_tests {
         .unwrap();
         assert_eq!(ref_boxes.len(), 2);
 
-        // ---- Config-driven path: NCHW protos, no dshape ----
-        // Permute protos to NCHW [1, 32, 160, 160] as an ONNX model would output
-        let protos_f32_chw = protos_f32_hwc.permuted_axes([2, 0, 1]); // [32, 160, 160]
+        // ---- Config-driven path: NCHW protos declared in physical order ----
+        // Permute the HWC test data to CHW memory order — this is what an
+        // ONNX-style producer would emit into the tensor buffer.
+        // `to_owned` materialises a C-contiguous Array3<f32> with CHW
+        // strides, matching a producer that writes channels-outer.
+        let protos_f32_chw_view = protos_f32_hwc.view().permuted_axes([2, 0, 1]); // [32, 160, 160]
+        let protos_f32_chw = protos_f32_chw_view.to_owned();
         let protos_nchw = protos_f32_chw.insert_axis(ndarray::Axis(0)); // [1, 32, 160, 160]
 
         // Build boxes as [1, 116, 8400] f32
         let seg_3d = seg.insert_axis(ndarray::Axis(0)); // [1, 116, 8400]
 
-        // Build decoder from config with no dshape on protos
+        // Declare shape and dshape in physical memory order (outermost
+        // first). `swap_axes_if_needed` uses dshape role lookup to
+        // permute the stride tuple into canonical HWC.
         let decoder = DecoderBuilder::default()
             .with_config_yolo_segdet(
                 configs::Detection {
                     decoder: configs::DecoderType::Ultralytics,
                     quantization: None,
                     shape: vec![1, 116, 8400],
-                    dshape: vec![],
+                    dshape: vec![
+                        (configs::DimName::Batch, 1),
+                        (configs::DimName::NumFeatures, 116),
+                        (configs::DimName::NumBoxes, 8400),
+                    ],
                     normalized: Some(true),
                     anchors: None,
                 },
@@ -1811,7 +1826,12 @@ mod decoder_tests {
                     decoder: configs::DecoderType::Ultralytics,
                     quantization: None,
                     shape: vec![1, 32, 160, 160],
-                    dshape: vec![], // No dshape — simulates YAML without dshape
+                    dshape: vec![
+                        (configs::DimName::Batch, 1),
+                        (configs::DimName::NumProtos, 32),
+                        (configs::DimName::Height, 160),
+                        (configs::DimName::Width, 160),
+                    ],
                 },
                 None, // decoder version
             )
@@ -3714,6 +3734,561 @@ outputs:
             coeffs_shape[1], 32,
             "each detection should have 32 mask coefficients"
         );
+    }
+
+    // =========================================================================
+    // Physical-order contract regression tests
+    //
+    // These cover the TFLite VX-delegate vertical-stripe mask bug and the
+    // Ara-2-via-overlay anchor-first split-tensor bug. The core claim:
+    // declaring shape+dshape in physical memory order produces correct
+    // strides at wrap time, and `swap_axes_if_needed` permutes the stride
+    // tuple into canonical logical order without touching bytes.
+    // =========================================================================
+
+    /// TFLite YOLOv8-seg protos arrive as physically-NHWC bytes with
+    /// NNStreamer dim string `"32:160:160:1"` (innermost-first). The
+    /// overlay's 2026-04-22 workaround declares `[1, 160, 160, 32]` with
+    /// dshape `[batch, height, width, num_protos]` — shape matches
+    /// physical order, so no permutation is needed and the view is
+    /// already in canonical HWC after the batch-dim slice. This test
+    /// confirms that path matches the reference (direct-HWC) decode.
+    #[test]
+    fn test_physical_order_tflite_nhwc_protos() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+
+        // Load HWC protos and dequantize to f32.
+        let protos_hwc = load_yolov8_protos().slice_move(s![0, .., .., ..]);
+        let quant_protos = Quantization::new(0.02491161972284317, -117);
+        let protos_f32_hwc = dequantize_ndarray::<_, _, f32>(protos_hwc.view(), quant_protos);
+
+        let boxes_2d = load_yolov8_boxes().slice_move(s![0, .., ..]);
+        let quant_boxes = Quantization::new(0.021287761628627777, 31);
+        let seg = dequantize_ndarray::<_, _, f32>(boxes_2d.view(), quant_boxes);
+
+        // Reference: direct call with canonical HWC protos.
+        let mut ref_boxes: Vec<_> = Vec::with_capacity(10);
+        let mut ref_masks: Vec<_> = Vec::with_capacity(10);
+        decode_yolo_segdet_float(
+            seg.view(),
+            protos_f32_hwc.view(),
+            score_threshold,
+            iou_threshold,
+            Some(configs::Nms::ClassAgnostic),
+            &mut ref_boxes,
+            &mut ref_masks,
+        )
+        .unwrap();
+
+        // Build the same protos as a 4D NHWC tensor and feed it through
+        // the config-driven path with dshape in physical order.
+        let protos_nhwc = protos_f32_hwc.clone().insert_axis(Axis(0)); // [1, 160, 160, 32]
+        let seg_3d = seg.insert_axis(Axis(0)); // [1, 116, 8400]
+
+        let decoder = DecoderBuilder::default()
+            .with_config_yolo_segdet(
+                configs::Detection {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: None,
+                    shape: vec![1, 116, 8400],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumFeatures, 116),
+                        (DimName::NumBoxes, 8400),
+                    ],
+                    normalized: Some(true),
+                    anchors: None,
+                },
+                configs::Protos {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: None,
+                    shape: vec![1, 160, 160, 32],
+                    // Physical NHWC — matches the TFLite buffer layout.
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::Height, 160),
+                        (DimName::Width, 160),
+                        (DimName::NumProtos, 32),
+                    ],
+                },
+                None,
+            )
+            .with_score_threshold(score_threshold)
+            .with_iou_threshold(iou_threshold)
+            .build()
+            .expect("config with NHWC protos dshape must build");
+
+        let mut cfg_boxes = Vec::with_capacity(10);
+        let mut cfg_masks = Vec::with_capacity(10);
+        decoder
+            .decode_float(
+                &[seg_3d.view().into_dyn(), protos_nhwc.view().into_dyn()],
+                &mut cfg_boxes,
+                &mut cfg_masks,
+            )
+            .unwrap();
+
+        assert_eq!(cfg_boxes.len(), ref_boxes.len(), "box count mismatch");
+        for (c, r) in cfg_boxes.iter().zip(&ref_boxes) {
+            assert!(
+                c.equal_within_delta(r, 0.01),
+                "NHWC-declared box does not match reference: {c:?} vs {r:?}"
+            );
+        }
+        for (cm, rm) in cfg_masks.iter().zip(&ref_masks) {
+            let cm_arr = segmentation_to_mask(cm.segmentation.view()).unwrap();
+            let rm_arr = segmentation_to_mask(rm.segmentation.view()).unwrap();
+            assert_eq!(
+                cm_arr, rm_arr,
+                "NHWC-declared mask must match reference pixel-for-pixel"
+            );
+        }
+    }
+
+    /// Ara-2 split-tensor boxes arrive physically anchor-first: NNStreamer
+    /// dim string `"4:1:8400:1"` means innermost axis is 4 (coords), next
+    /// is 1 (padding), next is 8400 (anchors), outermost is 1 (batch).
+    /// The correct physical-order declaration is `[1, 8400, 1, 4]` with
+    /// dshape `[batch, num_boxes, padding, box_coords]`. This test
+    /// confirms that declaration produces the same decoded boxes as the
+    /// canonical features-first TFLite declaration over the same logical
+    /// data.
+    #[test]
+    fn test_physical_order_ara2_anchor_first_split_boxes() {
+        use configs::{Boxes, Scores};
+
+        // Build synthetic boxes data in features-first canonical layout:
+        // shape [1, 4, 8400] with one detection at anchor 42.
+        const N: usize = 8400;
+        let mut boxes_canonical = Array3::<f32>::zeros((1, 4, N));
+        let target_anchor = 42usize;
+        boxes_canonical[[0, 0, target_anchor]] = 0.4; // xc
+        boxes_canonical[[0, 1, target_anchor]] = 0.5; // yc
+        boxes_canonical[[0, 2, target_anchor]] = 0.2; // w
+        boxes_canonical[[0, 3, target_anchor]] = 0.2; // h
+
+        // Scores: one class at 0.9 for the same anchor.
+        let mut scores_canonical = Array3::<f32>::zeros((1, 80, N));
+        scores_canonical[[0, 0, target_anchor]] = 0.9;
+
+        // Reference: canonical (features-first) shape declaration.
+        let ref_decoder = DecoderBuilder::default()
+            .with_config_yolo_split_det(
+                Boxes {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: None,
+                    shape: vec![1, 4, N],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::BoxCoords, 4),
+                        (DimName::NumBoxes, N),
+                    ],
+                    normalized: Some(true),
+                },
+                Scores {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: None,
+                    shape: vec![1, 80, N],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumClasses, 80),
+                        (DimName::NumBoxes, N),
+                    ],
+                },
+            )
+            .with_score_threshold(0.5)
+            .with_iou_threshold(0.5)
+            .with_nms(Some(configs::Nms::ClassAgnostic))
+            .build()
+            .expect("reference canonical split decoder must build");
+
+        let mut ref_boxes = Vec::with_capacity(4);
+        let mut ref_masks = Vec::with_capacity(0);
+        ref_decoder
+            .decode_float(
+                &[
+                    boxes_canonical.view().into_dyn(),
+                    scores_canonical.view().into_dyn(),
+                ],
+                &mut ref_boxes,
+                &mut ref_masks,
+            )
+            .unwrap();
+        assert_eq!(ref_boxes.len(), 1, "reference should produce one box");
+
+        // Ara-2 physical layout: transpose axes 1↔2 so the innermost
+        // axis is BoxCoords / NumClasses. Materialise to get a
+        // C-contiguous Array3 with strides matching the physical order
+        // the Ara-2 backend would write into the tensor.
+        let boxes_ara2 = boxes_canonical.view().permuted_axes([0, 2, 1]).to_owned(); // [1, 8400, 4]
+        let scores_ara2 = scores_canonical.view().permuted_axes([0, 2, 1]).to_owned(); // [1, 8400, 80]
+
+        let ara2_decoder = DecoderBuilder::default()
+            .with_config_yolo_split_det(
+                Boxes {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: None,
+                    shape: vec![1, N, 4],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, N),
+                        (DimName::BoxCoords, 4),
+                    ],
+                    normalized: Some(true),
+                },
+                Scores {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: None,
+                    shape: vec![1, N, 80],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumBoxes, N),
+                        (DimName::NumClasses, 80),
+                    ],
+                },
+            )
+            .with_score_threshold(0.5)
+            .with_iou_threshold(0.5)
+            .with_nms(Some(configs::Nms::ClassAgnostic))
+            .build()
+            .expect("Ara-2 anchor-first decoder must build");
+
+        let mut ara2_boxes = Vec::with_capacity(4);
+        let mut ara2_masks = Vec::with_capacity(0);
+        ara2_decoder
+            .decode_float(
+                &[boxes_ara2.view().into_dyn(), scores_ara2.view().into_dyn()],
+                &mut ara2_boxes,
+                &mut ara2_masks,
+            )
+            .unwrap();
+
+        assert_eq!(
+            ara2_boxes.len(),
+            ref_boxes.len(),
+            "Ara-2 anchor-first declaration must produce the same number \
+             of boxes as the canonical features-first reference"
+        );
+        for (a, r) in ara2_boxes.iter().zip(&ref_boxes) {
+            assert!(
+                a.equal_within_delta(r, 1e-4),
+                "Ara-2 box differs from reference: {a:?} vs {r:?}"
+            );
+        }
+    }
+
+    /// Dshape whose per-axis sizes disagree with shape (the exact
+    /// failure mode that caused the TFLite stripe bug — shape declared
+    /// in one order, dshape in another) is rejected with a clear error.
+    #[test]
+    fn test_physical_order_rejects_shape_dshape_mismatch() {
+        let result = DecoderBuilder::default()
+            .with_config_yolo_segdet(
+                configs::Detection {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: None,
+                    shape: vec![1, 116, 8400],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumFeatures, 116),
+                        (DimName::NumBoxes, 8400),
+                    ],
+                    normalized: Some(true),
+                    anchors: None,
+                },
+                configs::Protos {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: None,
+                    // Shape in NCHW order...
+                    shape: vec![1, 32, 160, 160],
+                    // ...but dshape in NHWC order — the sizes don't line
+                    // up positionally (dshape[1]=160 vs shape[1]=32).
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::Height, 160),
+                        (DimName::Width, 160),
+                        (DimName::NumProtos, 32),
+                    ],
+                },
+                None,
+            )
+            .build();
+
+        match result {
+            Err(DecoderError::InvalidConfig(msg)) => {
+                assert!(
+                    msg.contains("does not match shape"),
+                    "expected shape/dshape size mismatch error, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    /// Duplicate dim name in dshape is rejected (two axes mapping to the
+    /// same canonical slot would break the permutation).
+    #[test]
+    fn test_physical_order_rejects_duplicate_dshape_axis() {
+        let result = DecoderBuilder::default()
+            .with_config_yolo_split_det(
+                configs::Boxes {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: None,
+                    shape: vec![1, 4, 8400],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::BoxCoords, 4),
+                        (DimName::BoxCoords, 4), // duplicate (size matches shape[2]=8400? no)
+                    ],
+                    normalized: Some(true),
+                },
+                configs::Scores {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: None,
+                    shape: vec![1, 80, 8400],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumClasses, 80),
+                        (DimName::NumBoxes, 8400),
+                    ],
+                },
+            )
+            .build();
+
+        // Shape[2] = 8400 ≠ dshape[2] size 4, so the positional-mismatch
+        // check fires first — which is fine: any mis-shaped dshape
+        // should be rejected. Check for either error as long as it's a
+        // clear InvalidConfig.
+        match result {
+            Err(DecoderError::InvalidConfig(msg)) => {
+                assert!(
+                    msg.contains("appears at both index") || msg.contains("does not match shape"),
+                    "expected positional or duplicate-axis error, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+
+        // Separate case: size-consistent duplicate to exercise the
+        // duplicate-axis code path explicitly. Use `Batch` (no size
+        // constraint, can repeat with size 1 against a shape that
+        // carries two singleton dims).
+        let result = DecoderBuilder::default()
+            .with_config_yolo_split_det(
+                configs::Boxes {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: None,
+                    shape: vec![1, 1, 4, 8400],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::Batch, 1), // duplicate, sizes match
+                        (DimName::BoxCoords, 4),
+                        (DimName::NumBoxes, 8400),
+                    ],
+                    normalized: Some(true),
+                },
+                configs::Scores {
+                    decoder: configs::DecoderType::Ultralytics,
+                    quantization: None,
+                    shape: vec![1, 80, 8400],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::NumClasses, 80),
+                        (DimName::NumBoxes, 8400),
+                    ],
+                },
+            )
+            .build();
+        match result {
+            Err(DecoderError::InvalidConfig(msg)) => {
+                assert!(
+                    msg.contains("appears at both index"),
+                    "expected duplicate-axis error, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    /// Canonical (dshape-omitted) high-level decode produces the same
+    /// numeric result as the dshape-populated form. This closes a
+    /// coverage gap flagged during review: dshape omission had been
+    /// exercised only at the builder level, not through the full
+    /// `decode_float` pipeline.
+    #[test]
+    fn test_physical_order_dshape_omitted_decodes_numerically() {
+        let score_threshold = 0.45;
+        let iou_threshold = 0.45;
+
+        let protos_hwc = load_yolov8_protos().slice_move(s![0, .., .., ..]);
+        let quant_protos = Quantization::new(0.02491161972284317, -117);
+        let protos_f32_hwc = dequantize_ndarray::<_, _, f32>(protos_hwc.view(), quant_protos);
+
+        let boxes_2d = load_yolov8_boxes().slice_move(s![0, .., ..]);
+        let quant_boxes = Quantization::new(0.021287761628627777, 31);
+        let seg = dequantize_ndarray::<_, _, f32>(boxes_2d.view(), quant_boxes);
+
+        let protos_nhwc = protos_f32_hwc.clone().insert_axis(Axis(0));
+        let seg_3d = seg.insert_axis(Axis(0));
+
+        let build_decoder = |det_dshape: Vec<(DimName, usize)>,
+                             proto_dshape: Vec<(DimName, usize)>| {
+            DecoderBuilder::default()
+                .with_config_yolo_segdet(
+                    configs::Detection {
+                        decoder: configs::DecoderType::Ultralytics,
+                        quantization: None,
+                        shape: vec![1, 116, 8400],
+                        dshape: det_dshape,
+                        normalized: Some(true),
+                        anchors: None,
+                    },
+                    configs::Protos {
+                        decoder: configs::DecoderType::Ultralytics,
+                        quantization: None,
+                        shape: vec![1, 160, 160, 32],
+                        dshape: proto_dshape,
+                    },
+                    None,
+                )
+                .with_score_threshold(score_threshold)
+                .with_iou_threshold(iou_threshold)
+                .build()
+                .unwrap()
+        };
+
+        // Baseline: dshape populated in physical order.
+        let dshaped = build_decoder(
+            vec![
+                (DimName::Batch, 1),
+                (DimName::NumFeatures, 116),
+                (DimName::NumBoxes, 8400),
+            ],
+            vec![
+                (DimName::Batch, 1),
+                (DimName::Height, 160),
+                (DimName::Width, 160),
+                (DimName::NumProtos, 32),
+            ],
+        );
+        let mut dshaped_boxes = Vec::new();
+        let mut dshaped_masks = Vec::new();
+        dshaped
+            .decode_float(
+                &[seg_3d.view().into_dyn(), protos_nhwc.view().into_dyn()],
+                &mut dshaped_boxes,
+                &mut dshaped_masks,
+            )
+            .unwrap();
+
+        // Variant: dshape omitted — caller asserts shape is already in
+        // the decoder's canonical order.
+        let bare = build_decoder(vec![], vec![]);
+        let mut bare_boxes = Vec::new();
+        let mut bare_masks = Vec::new();
+        bare.decode_float(
+            &[seg_3d.view().into_dyn(), protos_nhwc.view().into_dyn()],
+            &mut bare_boxes,
+            &mut bare_masks,
+        )
+        .unwrap();
+
+        assert_eq!(bare_boxes.len(), dshaped_boxes.len());
+        for (b, d) in bare_boxes.iter().zip(&dshaped_boxes) {
+            assert!(
+                b.equal_within_delta(d, 1e-4),
+                "dshape-omitted box {b:?} differs from dshape-populated {d:?}"
+            );
+        }
+        for (bm, dm) in bare_masks.iter().zip(&dshaped_masks) {
+            let bm_arr = segmentation_to_mask(bm.segmentation.view()).unwrap();
+            let dm_arr = segmentation_to_mask(dm.segmentation.view()).unwrap();
+            assert_eq!(
+                bm_arr, dm_arr,
+                "dshape-omitted mask must match dshape-populated pixel-for-pixel"
+            );
+        }
+    }
+
+    /// 4D anchor-first boxes schema with a trailing `padding` axis — the
+    /// exact Ara-2 DVM shape (`"4:1:8400:1"` innermost-first = physical
+    /// `[1, 8400, 1, 4]`). Exercises the schema path's
+    /// `squeeze_padding_dims`: the caller declares a 4D physical-order
+    /// layout including `padding`, HAL squeezes the size-1 axis during
+    /// `to_legacy_config_outputs`, and the decoder sees the resulting
+    /// 3D shape. Callers feed HAL a 3D squeezed view of the same bytes.
+    /// Complements the 3D `test_physical_order_ara2_anchor_first_split_boxes`
+    /// which exercises the programmatic-builder path.
+    #[test]
+    fn test_physical_order_ara2_4d_anchor_first_with_padding() {
+        // Build synthetic data in anchor-first 3D layout (the shape HAL
+        // actually operates on after squeezing). The 4D-with-padding
+        // declaration in the schema is a producer-side convention; the
+        // caller is expected to present HAL with a squeezed view.
+        const N: usize = 8400;
+        let mut boxes = Array3::<f32>::zeros((1, N, 4));
+        let target = 42usize;
+        boxes[[0, target, 0]] = 0.4;
+        boxes[[0, target, 1]] = 0.5;
+        boxes[[0, target, 2]] = 0.2;
+        boxes[[0, target, 3]] = 0.2;
+        let mut scores = Array3::<f32>::zeros((1, N, 80));
+        scores[[0, target, 0]] = 0.9;
+
+        // Schema JSON declares shape+dshape in physical anchor-first
+        // order including padding — mirrors `ara2_int8_edgefirst.json`'s
+        // feature-first declaration but with the axes in physical
+        // anchor-first order. `to_legacy_config_outputs` squeezes
+        // padding before the decoder's rank-3 verification.
+        let json = r#"{
+          "schema_version": 2,
+          "decoder_version": "yolov8",
+          "nms": "class_agnostic",
+          "outputs": [
+            {"name": "boxes", "type": "boxes",
+             "shape": [1, 8400, 1, 4],
+             "dshape": [{"batch":1},{"num_boxes":8400},{"padding":1},{"box_coords":4}],
+             "encoding": "direct",
+             "decoder": "ultralytics",
+             "normalized": true},
+            {"name": "scores", "type": "scores",
+             "shape": [1, 8400, 1, 80],
+             "dshape": [{"batch":1},{"num_boxes":8400},{"padding":1},{"num_classes":80}],
+             "decoder": "ultralytics",
+             "score_format": "per_class"}
+          ]
+        }"#;
+        let decoder = DecoderBuilder::default()
+            .with_config_json_str(json.to_string())
+            .with_score_threshold(0.5)
+            .with_iou_threshold(0.5)
+            .build()
+            .expect("4D anchor-first schema should build via squeeze_padding_dims");
+
+        let mut out_boxes = Vec::with_capacity(4);
+        let mut out_masks = Vec::with_capacity(0);
+        decoder
+            .decode_float(
+                &[boxes.view().into_dyn(), scores.view().into_dyn()],
+                &mut out_boxes,
+                &mut out_masks,
+            )
+            .unwrap();
+
+        assert_eq!(
+            out_boxes.len(),
+            1,
+            "4D anchor-first with padding should decode exactly one box from the seeded anchor"
+        );
+        let b = &out_boxes[0];
+        // xywh(0.4, 0.5, 0.2, 0.2) → xyxy(0.3, 0.4, 0.5, 0.6)
+        assert!((b.bbox.xmin - 0.3).abs() < 1e-3, "xmin wrong: {b:?}");
+        assert!((b.bbox.ymin - 0.4).abs() < 1e-3, "ymin wrong: {b:?}");
+        assert!((b.bbox.xmax - 0.5).abs() < 1e-3, "xmax wrong: {b:?}");
+        assert!((b.bbox.ymax - 0.6).abs() < 1e-3, "ymax wrong: {b:?}");
+        assert_eq!(b.label, 0);
+        assert!(b.score > 0.85, "score {}: {b:?}", b.score);
     }
 }
 

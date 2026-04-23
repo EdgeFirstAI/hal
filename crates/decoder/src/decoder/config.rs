@@ -53,7 +53,7 @@ pub enum ConfigOutput {
     Scores(configs::Scores),
     #[serde(rename = "boxes")]
     Boxes(configs::Boxes),
-    #[serde(rename = "mask_coefficients")]
+    #[serde(rename = "mask_coefs", alias = "mask_coefficients")]
     MaskCoefficients(configs::MaskCoefficients),
     #[serde(rename = "classes")]
     Classes(configs::Classes),
@@ -231,6 +231,21 @@ impl<'a> From<&'a configs::MaskCoefficients> for ConfigOutputRef<'a> {
 impl<'a> From<&'a configs::Classes> for ConfigOutputRef<'a> {
     fn from(v: &'a configs::Classes) -> ConfigOutputRef<'a> {
         ConfigOutputRef::Classes(v)
+    }
+}
+
+impl<'a> From<&'a ConfigOutput> for ConfigOutputRef<'a> {
+    fn from(v: &'a ConfigOutput) -> ConfigOutputRef<'a> {
+        match v {
+            ConfigOutput::Detection(c) => ConfigOutputRef::Detection(c),
+            ConfigOutput::Mask(c) => ConfigOutputRef::Mask(c),
+            ConfigOutput::Segmentation(c) => ConfigOutputRef::Segmentation(c),
+            ConfigOutput::Protos(c) => ConfigOutputRef::Protos(c),
+            ConfigOutput::Scores(c) => ConfigOutputRef::Scores(c),
+            ConfigOutput::Boxes(c) => ConfigOutputRef::Boxes(c),
+            ConfigOutput::MaskCoefficients(c) => ConfigOutputRef::MaskCoefficients(c),
+            ConfigOutput::Classes(c) => ConfigOutputRef::Classes(c),
+        }
     }
 }
 
