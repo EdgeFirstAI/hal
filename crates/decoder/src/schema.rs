@@ -1097,6 +1097,12 @@ pub(crate) fn squeeze_padding_dims(
     shape: Vec<usize>,
     dshape: Vec<(DimName, usize)>,
 ) -> (Vec<usize>, Vec<(DimName, usize)>) {
+    // dshape is `#[serde(default)]`; a logical output without named dims
+    // arrives here with an empty dshape. `zip` would stop at the shorter
+    // iterator and silently truncate shape to `[]`, so short-circuit.
+    if dshape.is_empty() {
+        return (shape, dshape);
+    }
     let keep: Vec<bool> = dshape
         .iter()
         .map(|(n, _)| !matches!(n, DimName::Padding))
@@ -1958,5 +1964,46 @@ outputs:
         let schema = SchemaV2::parse_yaml(yaml).unwrap();
         assert_eq!(schema.schema_version, 2);
         assert_eq!(schema.outputs[0].score_format, Some(ScoreFormat::PerClass));
+    }
+
+    // ─── squeeze_padding_dims / to_legacy_config_outputs regressions ────
+
+    #[test]
+    fn squeeze_padding_dims_preserves_shape_when_dshape_absent() {
+        // Empty dshape must pass shape through untouched. The previous
+        // `zip` implementation silently truncated to `[]`, which made
+        // every v2 logical output without named dims arrive at the legacy
+        // verifier with `shape: []` and fail rank checks.
+        let (shape, dshape) = squeeze_padding_dims(vec![1, 4, 8400], vec![]);
+        assert_eq!(shape, vec![1, 4, 8400]);
+        assert!(dshape.is_empty());
+    }
+
+    #[test]
+    fn to_legacy_preserves_shape_for_v2_split_boxes_without_dshape() {
+        // Regression: `Decoder({...v2 split boxes, shape:[1,4,8400], no dshape...})`
+        // used to fail with `Invalid Yolo Split Boxes shape []` because
+        // `squeeze_padding_dims` truncated shape when dshape was empty.
+        let j = r#"{
+          "schema_version": 2,
+          "outputs": [
+            {"name":"boxes","type":"boxes","shape":[1,4,8400],
+             "dtype":"float32","decoder":"ultralytics","encoding":"direct"},
+            {"name":"scores","type":"scores","shape":[1,80,8400],
+             "dtype":"float32","decoder":"ultralytics","score_format":"per_class"}
+          ]
+        }"#;
+        let schema = SchemaV2::parse_json(j).unwrap();
+        let legacy = schema.to_legacy_config_outputs().expect("lowers cleanly");
+        let boxes = match &legacy.outputs[0] {
+            crate::ConfigOutput::Boxes(b) => b,
+            other => panic!("expected Boxes, got {other:?}"),
+        };
+        assert_eq!(boxes.shape, vec![1, 4, 8400]);
+        let scores = match &legacy.outputs[1] {
+            crate::ConfigOutput::Scores(s) => s,
+            other => panic!("expected Scores, got {other:?}"),
+        };
+        assert_eq!(scores.shape, vec![1, 80, 8400]);
     }
 }
