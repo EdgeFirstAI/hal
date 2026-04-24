@@ -126,8 +126,9 @@ impl MaskScratch {
         }
         let a = ndarray::ArrayView2::from_shape((n, num_protos), &self.coeffs)
             .expect("coeffs buffer matches (N, K)");
-        let b = ndarray::ArrayView2::from_shape((hw, num_protos), &self.dequant[..dequant_required])
-            .expect("dequant buffer matches (HW, K)");
+        let b =
+            ndarray::ArrayView2::from_shape((hw, num_protos), &self.dequant[..dequant_required])
+                .expect("dequant buffer matches (HW, K)");
         let mut c =
             ndarray::ArrayViewMut2::from_shape((n, hw), &mut self.logits[..logits_required])
                 .expect("logits buffer matches (N, HW)");
@@ -479,12 +480,7 @@ impl CPUProcessor {
         if detect.len() < min_n {
             materialize_segmentations_fused(detect, proto_data, letterbox)
         } else {
-            materialize_segmentations_batched(
-                &mut self.mask_scratch,
-                detect,
-                proto_data,
-                letterbox,
-            )
+            materialize_segmentations_batched(&mut self.mask_scratch, detect, proto_data, letterbox)
         }
     }
 
@@ -751,7 +747,8 @@ fn scaled_segmentations_batched(
                 lw,
                 ly0,
                 lh,
-                tile.as_slice_mut().expect("Array3<u8>::zeros is contiguous"),
+                tile.as_slice_mut()
+                    .expect("Array3<u8>::zeros is contiguous"),
             );
 
             Ok(edgefirst_decoder::Segmentation {
@@ -793,8 +790,8 @@ fn fill_scaled_tile(
     {
         unsafe {
             fill_scaled_tile_neon(
-                plane, proto_w, proto_h, px0, py0, bbox_w, bbox_h, out_w, out_h, lx0, lw, ly0,
-                lh, tile,
+                plane, proto_w, proto_h, px0, py0, bbox_w, bbox_h, out_w, out_h, lx0, lw, ly0, lh,
+                tile,
             )
         };
         return;
@@ -977,10 +974,7 @@ unsafe fn fill_scaled_tile_neon(
             let v_u8 = vqmovn_u16(vcombine_u16(v_u16, vdup_n_u16(0)));
             // Store the low 4 lanes as one 32-bit write.
             let out = vget_lane_u32::<0>(vreinterpret_u32_u8(v_u8));
-            core::ptr::write_unaligned(
-                tile.as_mut_ptr().add(tile_row_off + xi) as *mut u32,
-                out,
-            );
+            core::ptr::write_unaligned(tile.as_mut_ptr().add(tile_row_off + xi) as *mut u32, out);
             xi += 4;
         }
 

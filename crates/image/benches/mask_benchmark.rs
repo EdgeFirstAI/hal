@@ -569,7 +569,11 @@ fn bench_materialize_masks_sweep(suite: &mut BenchSuite) {
 
     // Perturb the base bboxes slightly so they don't all overlap identically
     // (avoids hitting a degenerate cache-hot case).
-    fn replicated_dataset(n: usize, base_detect: &[DetectBox], base_proto: &ProtoData) -> (Vec<DetectBox>, ProtoData) {
+    fn replicated_dataset(
+        n: usize,
+        base_detect: &[DetectBox],
+        base_proto: &ProtoData,
+    ) -> (Vec<DetectBox>, ProtoData) {
         let mut out_detect = Vec::with_capacity(n);
         let mut out_coeffs = Vec::with_capacity(n);
         for i in 0..n {
