@@ -277,10 +277,7 @@ pub(crate) fn padded_dma_pitch_for(
 /// are left untouched — EGL import doesn't read past the row's valid
 /// width, so the padding can remain whatever the allocator produced.
 #[cfg(target_os = "linux")]
-pub(crate) fn copy_packed_to_padded_dma(
-    src: &Tensor<u8>,
-    dst: &mut Tensor<u8>,
-) -> Result<()> {
+pub(crate) fn copy_packed_to_padded_dma(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
     let width = dst.width().ok_or(Error::NotAnImage)?;
     let height = dst.height().ok_or(Error::NotAnImage)?;
     let fmt = dst.format().ok_or(Error::NotAnImage)?;
@@ -295,9 +292,7 @@ pub(crate) fn copy_packed_to_padded_dma(
         ))
     })?;
     let dst_stride = dst.effective_row_stride().ok_or_else(|| {
-        Error::Internal(
-            "copy_packed_to_padded_dma: dst has no effective row stride".into(),
-        )
+        Error::Internal("copy_packed_to_padded_dma: dst has no effective row stride".into())
     })?;
 
     // `TensorMap` derefs to `[T]`, which gives us the slice without
@@ -307,7 +302,7 @@ pub(crate) fn copy_packed_to_padded_dma(
     let mut dst_map = dst.map()?;
     let dst_bytes: &mut [u8] = &mut dst_map;
 
-    if src_bytes.len() < natural.checked_mul(height).unwrap_or(usize::MAX) {
+    if src_bytes.len() < natural.saturating_mul(height) {
         return Err(Error::Internal(format!(
             "copy_packed_to_padded_dma: src has {} bytes, need {} ({}x{} @ {} bpp)",
             src_bytes.len(),
@@ -317,7 +312,7 @@ pub(crate) fn copy_packed_to_padded_dma(
             bpp,
         )));
     }
-    if dst_bytes.len() < dst_stride.checked_mul(height).unwrap_or(usize::MAX) {
+    if dst_bytes.len() < dst_stride.saturating_mul(height) {
         return Err(Error::Internal(format!(
             "copy_packed_to_padded_dma: dst has {} bytes, need {} ({} stride × {} rows)",
             dst_bytes.len(),
@@ -2466,16 +2461,14 @@ fn load_png(
         }
         grey
     } else {
-        let staging =
-            Tensor::<u8>::image(width, height, decoded_fmt, Some(TensorMemory::Mem))?;
+        let staging = Tensor::<u8>::image(width, height, decoded_fmt, Some(TensorMemory::Mem))?;
         decoder.decode_into(&mut staging.map()?)?;
         staging
     };
 
     // Optional CPU format conversion before the final memory placement.
     let packed = if decoded_fmt != dest_fmt {
-        let mut tmp =
-            Tensor::<u8>::image(width, height, dest_fmt, Some(TensorMemory::Mem))?;
+        let mut tmp = Tensor::<u8>::image(width, height, dest_fmt, Some(TensorMemory::Mem))?;
         CPUProcessor::convert_format_pf(&staging, &mut tmp, decoded_fmt, dest_fmt)?;
         tmp
     } else {
@@ -3479,7 +3472,12 @@ mod image_tests {
         let mut out = Vec::new();
         let encoder = jpeg_encoder::Encoder::new(&mut out, 85);
         encoder
-            .encode(&bytes, width as u16, height as u16, jpeg_encoder::ColorType::Rgb)
+            .encode(
+                &bytes,
+                width as u16,
+                height as u16,
+                jpeg_encoder::ColorType::Rgb,
+            )
             .expect("jpeg-encoder must succeed on trivial input");
         out
     }
@@ -3532,16 +3530,21 @@ mod image_tests {
         // byte-identical inputs. `with_config(backend=Cpu)` forces the
         // CPU-only processor regardless of which backends the host has
         // available.
-        let src_cpu = crate::load_jpeg(&jpeg, Some(PixelFormat::Rgba), Some(TensorMemory::Mem))
-            .unwrap();
+        let src_cpu =
+            crate::load_jpeg(&jpeg, Some(PixelFormat::Rgba), Some(TensorMemory::Mem)).unwrap();
         let mut cpu_proc = ImageProcessor::with_config(ImageProcessorConfig {
             backend: ComputeBackend::Cpu,
             ..Default::default()
         })
         .unwrap();
-        let cpu_dst =
-            TensorDyn::image(640, 640, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Mem))
-                .unwrap();
+        let cpu_dst = TensorDyn::image(
+            640,
+            640,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+        )
+        .unwrap();
         let (r_cpu, _src_cpu, cpu_dst) = convert_img(
             &mut cpu_proc,
             src_cpu,
@@ -3582,17 +3585,23 @@ mod image_tests {
             let loaded = crate::load_jpeg(&jpeg, Some(PixelFormat::Rgba), None).unwrap();
             let natural = (w as usize) * 4;
             let aligned = crate::align_pitch_bytes_to_gpu_alignment(natural).unwrap();
-            assert!(aligned > natural, "test sanity: width {w} should be unaligned");
-            let stride = loaded.row_stride().expect(
-                "padded DMA path must set an explicit row_stride — regression if None",
+            assert!(
+                aligned > natural,
+                "test sanity: width {w} should be unaligned"
             );
+            let stride = loaded
+                .row_stride()
+                .expect("padded DMA path must set an explicit row_stride — regression if None");
             assert_eq!(
                 stride, aligned,
                 "width {w}: expected padded stride {aligned}, got {stride} \
                  (regression: pitch-padding branch skipped?)"
             );
             let eff = loaded.effective_row_stride().unwrap();
-            assert_eq!(eff, aligned, "effective_row_stride must match stored stride");
+            assert_eq!(
+                eff, aligned,
+                "effective_row_stride must match stored stride"
+            );
             assert_eq!(loaded.width(), Some(w as usize));
             assert_eq!(loaded.height(), Some(333));
         }
