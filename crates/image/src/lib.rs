@@ -2381,65 +2381,143 @@ fn load_jpeg(
 }
 
 /// Load a PNG image from raw bytes and return a [`TensorDyn`].
+///
+/// Supports the same destination formats as the CPU backend's format
+/// converter (`Rgb`, `Rgba`, `Bgra`, `Grey`, etc.). Earlier revisions only
+/// accepted `Rgb`/`Rgba`; greyscale PNGs decoded to `Grey` now work through
+/// the same pitch-aware DMA path as JPEG. LumaA PNGs are normalised to
+/// `Grey` inline (alpha stripped) before going through the shared CPU
+/// converter.
 fn load_png(
     image: &[u8],
     format: Option<PixelFormat>,
     memory: Option<TensorMemory>,
 ) -> Result<TensorDyn> {
-    let fmt = format.unwrap_or(PixelFormat::Rgb);
-    let alpha = match fmt {
-        PixelFormat::Rgb => false,
-        PixelFormat::Rgba => true,
-        _ => {
-            return Err(Error::NotImplemented(
-                "Unsupported image format".to_string(),
-            ));
-        }
-    };
+    let dest_fmt = format.unwrap_or(PixelFormat::Rgb);
 
+    // Decode with add_alpha=false — any alpha upgrade/strip happens via
+    // the CPU converter downstream so we share one code path with
+    // load_jpeg instead of duplicating promotion logic here.
     let options = DecoderOptions::default()
-        .png_set_add_alpha_channel(alpha)
+        .png_set_add_alpha_channel(false)
         .png_set_decode_animated(false);
     let mut decoder = PngDecoder::new_with_options(image, options);
     decoder.decode_headers()?;
+
     let (width, height, rotation, flip) = {
-        let image_info = decoder.get_info().ok_or(Error::Internal(
-            "PNG did not return decoded image info".to_string(),
-        ))?;
-        let (rotation, flip) = image_info
+        let info = decoder
+            .get_info()
+            .ok_or_else(|| Error::Internal("PNG did not return decoded image info".to_string()))?;
+        let (rot, flip) = info
             .exif
             .as_ref()
             .map(|x| read_exif_orientation(x))
             .unwrap_or((Rotation::None, Flip::None));
-        (image_info.width, image_info.height, rotation, flip)
+        (info.width, info.height, rot, flip)
     };
 
-    if (rotation, flip) == (Rotation::None, Flip::None) {
-        // Same pitch-padding treatment as load_jpeg — see comment there.
-        #[cfg(target_os = "linux")]
-        if let Some(aligned_pitch) = padded_dma_pitch_for(fmt, width, &memory) {
-            let staging = Tensor::<u8>::image(width, height, fmt, Some(TensorMemory::Mem))?;
-            decoder.decode_into(&mut staging.map()?)?;
-            let mut dma = Tensor::<u8>::image_with_stride(
-                width,
-                height,
-                fmt,
-                aligned_pitch,
-                Some(TensorMemory::Dma),
-            )?;
-            copy_packed_to_padded_dma(&staging, &mut dma)?;
-            return Ok(TensorDyn::from(dma));
+    // Map the decoder's native colorspace onto a PixelFormat that the CPU
+    // converter understands. LumaA has no direct PixelFormat variant so we
+    // decode as LumaA and then strip alpha inline to get Grey.
+    let decoder_cs = decoder
+        .get_colorspace()
+        .ok_or_else(|| Error::Internal("PNG decoder did not return colorspace".to_string()))?;
+    let (decoded_fmt, strip_luma_alpha) = match decoder_cs {
+        ColorSpace::Luma => (PixelFormat::Grey, false),
+        ColorSpace::LumaA => (PixelFormat::Grey, true),
+        ColorSpace::RGB => (PixelFormat::Rgb, false),
+        ColorSpace::RGBA => (PixelFormat::Rgba, false),
+        other => {
+            return Err(Error::NotSupported(format!(
+                "PNG decoder produced unsupported colorspace {other:?}"
+            )));
         }
+    };
 
-        let img = Tensor::<u8>::image(width, height, fmt, memory)?;
-        decoder.decode_into(&mut img.map()?)?;
-        return Ok(TensorDyn::from(img));
+    // Reject destinations the CPU converter can't reach from the decoder's
+    // output so callers get a precise error rather than a downstream map
+    // failure. (`Grey → Grey` / `Rgb → Rgb` / etc. are identity pairs and
+    // are always valid.)
+    if decoded_fmt != dest_fmt
+        && !crate::cpu::CPUProcessor::support_conversion_pf(decoded_fmt, dest_fmt)
+    {
+        return Err(Error::NotSupported(format!(
+            "load_png: cannot convert decoder output {decoded_fmt:?} to {dest_fmt:?}"
+        )));
     }
 
-    let tmp = Tensor::<u8>::image(width, height, fmt, Some(TensorMemory::Mem))?;
-    decoder.decode_into(&mut tmp.map()?)?;
+    // Decode into a Mem staging buffer in the decoder's native format. For
+    // LumaA we allocate an extra byte-pair-per-pixel buffer since our Tensor
+    // API only knows 1-channel (Grey); after decode we compact to Grey.
+    let staging = if strip_luma_alpha {
+        // LumaA is 2 bytes per pixel in the raw decode; allocate a flat
+        // Tensor large enough to hold it, then compact to Grey in place.
+        let raw = Tensor::<u8>::new(&[height, width, 2], Some(TensorMemory::Mem), None)?;
+        decoder.decode_into(&mut raw.map()?)?;
+        let grey = Tensor::<u8>::image(width, height, PixelFormat::Grey, Some(TensorMemory::Mem))?;
+        {
+            let raw_map = raw.map()?;
+            let mut grey_map = grey.map()?;
+            let raw_bytes: &[u8] = &raw_map;
+            let grey_bytes: &mut [u8] = &mut grey_map;
+            for (pair, out) in raw_bytes.chunks_exact(2).zip(grey_bytes.iter_mut()) {
+                *out = pair[0];
+            }
+        }
+        grey
+    } else {
+        let staging =
+            Tensor::<u8>::image(width, height, decoded_fmt, Some(TensorMemory::Mem))?;
+        decoder.decode_into(&mut staging.map()?)?;
+        staging
+    };
 
-    rotate_flip_to_dyn(&tmp, fmt, rotation, flip, memory)
+    // Optional CPU format conversion before the final memory placement.
+    let packed = if decoded_fmt != dest_fmt {
+        let mut tmp =
+            Tensor::<u8>::image(width, height, dest_fmt, Some(TensorMemory::Mem))?;
+        CPUProcessor::convert_format_pf(&staging, &mut tmp, decoded_fmt, dest_fmt)?;
+        tmp
+    } else {
+        staging
+    };
+
+    if (rotation, flip) != (Rotation::None, Flip::None) {
+        return rotate_flip_to_dyn(&packed, dest_fmt, rotation, flip, memory);
+    }
+
+    // Final placement. When the caller wants DMA and the natural pitch
+    // would be rejected by the GPU's DMA-BUF import (see
+    // `padded_dma_pitch_for`), allocate a pitch-padded DMA tensor and
+    // row-copy. Otherwise allocate in the requested memory domain and
+    // linear-copy — or, when the caller asked for Mem, just return the
+    // staging tensor directly.
+    #[cfg(target_os = "linux")]
+    if let Some(aligned_pitch) = padded_dma_pitch_for(dest_fmt, width, &memory) {
+        let mut dma = Tensor::<u8>::image_with_stride(
+            width,
+            height,
+            dest_fmt,
+            aligned_pitch,
+            Some(TensorMemory::Dma),
+        )?;
+        copy_packed_to_padded_dma(&packed, &mut dma)?;
+        return Ok(TensorDyn::from(dma));
+    }
+
+    if matches!(memory, Some(TensorMemory::Mem)) {
+        return Ok(TensorDyn::from(packed));
+    }
+    // DMA (default on Linux) or Shm with naturally-aligned pitch.
+    let out = Tensor::<u8>::image(width, height, dest_fmt, memory)?;
+    {
+        let src_map = packed.map()?;
+        let mut dst_map = out.map()?;
+        let src_bytes: &[u8] = &src_map;
+        let dst_bytes: &mut [u8] = &mut dst_map;
+        dst_bytes.copy_from_slice(src_bytes);
+    }
+    Ok(TensorDyn::from(out))
 }
 
 /// Load an image from raw bytes (JPEG or PNG) and return a [`TensorDyn`].
@@ -3382,6 +3460,107 @@ mod image_tests {
         result.unwrap();
 
         compare_images(&loaded, &cpu_dst, 0.98, function!());
+    }
+
+    // Synthesise a small greyscale PNG in memory at `(width, height)` with a
+    // deterministic ramp pattern so multiple tests can cross-check output
+    // without bundling an extra fixture file.
+    fn make_grey_png(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity((width * height) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                bytes.push(((x + y) & 0xFF) as u8);
+            }
+        }
+        let img = image::GrayImage::from_vec(width, height, bytes).unwrap();
+        let mut buf = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        buf
+    }
+
+    /// Greyscale PNG with a width that forces a pitch-misaligned natural
+    /// row stride (612 bytes is not a multiple of the 64-byte GPU pitch
+    /// alignment) must still load via the pitch-padded DMA path. Gated on
+    /// DMA availability because `image_with_stride` is DMA-only.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_load_png_grey_misaligned_width_dma() {
+        use edgefirst_tensor::is_dma_available;
+        if !is_dma_available() {
+            eprintln!("SKIPPED: test_load_png_grey_misaligned_width_dma — DMA not available");
+            return;
+        }
+        let png = make_grey_png(612, 388);
+        let loaded = crate::load_png(&png, Some(PixelFormat::Grey), None).unwrap();
+        assert_eq!(loaded.width(), Some(612));
+        assert_eq!(loaded.height(), Some(388));
+        assert_eq!(loaded.format(), Some(PixelFormat::Grey));
+
+        // Round-trip pixels — natural-pitch DMA-BUFs pad the stride so we
+        // must indirect through row_stride() rather than assume width.
+        let map = loaded.as_u8().unwrap().map().unwrap();
+        let stride = loaded.row_stride().unwrap_or(612);
+        assert!(stride >= 612);
+        let bytes: &[u8] = &map;
+        for y in 0..388usize {
+            for x in 0..612usize {
+                let expected = ((x + y) & 0xFF) as u8;
+                let got = bytes[y * stride + x];
+                assert_eq!(
+                    got, expected,
+                    "grey png mismatch at ({x},{y}): got {got} expected {expected}"
+                );
+            }
+        }
+    }
+
+    /// Greyscale PNG loaded with explicit Mem backing — runs on any
+    /// platform (no DMA permission requirement) and covers the
+    /// decoder-native Luma → Grey no-conversion path.
+    #[test]
+    fn test_load_png_grey_mem() {
+        use edgefirst_tensor::TensorMemory;
+        let png = make_grey_png(612, 100);
+        let loaded =
+            crate::load_png(&png, Some(PixelFormat::Grey), Some(TensorMemory::Mem)).unwrap();
+        assert_eq!(loaded.width(), Some(612));
+        assert_eq!(loaded.height(), Some(100));
+        assert_eq!(loaded.format(), Some(PixelFormat::Grey));
+        let map = loaded.as_u8().unwrap().map().unwrap();
+        let bytes: &[u8] = &map;
+        // Mem allocation uses the natural pitch — 612 bytes per row, exact.
+        assert_eq!(bytes.len(), 612 * 100);
+        for y in 0..100 {
+            for x in 0..612 {
+                assert_eq!(bytes[y * 612 + x], ((x + y) & 0xFF) as u8);
+            }
+        }
+    }
+
+    /// Greyscale PNG decoded into RGB — exercises the decoder-colorspace
+    /// mismatch path (Luma → Rgb via CPU converter). Uses Mem memory to
+    /// stay portable to host-side test environments.
+    #[test]
+    fn test_load_png_grey_to_rgb_mem() {
+        use edgefirst_tensor::TensorMemory;
+        let png = make_grey_png(620, 240);
+        let loaded =
+            crate::load_png(&png, Some(PixelFormat::Rgb), Some(TensorMemory::Mem)).unwrap();
+        assert_eq!(loaded.width(), Some(620));
+        assert_eq!(loaded.height(), Some(240));
+        assert_eq!(loaded.format(), Some(PixelFormat::Rgb));
+
+        // Greyscale promoted to RGB replicates luma into each channel.
+        let map = loaded.as_u8().unwrap().map().unwrap();
+        let bytes: &[u8] = &map;
+        for (x, y) in [(0usize, 0usize), (100, 50), (619, 239)] {
+            let expected = ((x + y) & 0xFF) as u8;
+            let off = (y * 620 + x) * 3;
+            assert_eq!(bytes[off], expected, "R@{x},{y}");
+            assert_eq!(bytes[off + 1], expected, "G@{x},{y}");
+            assert_eq!(bytes[off + 2], expected, "B@{x},{y}");
+        }
     }
 
     #[test]
