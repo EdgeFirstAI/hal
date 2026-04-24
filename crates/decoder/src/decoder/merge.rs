@@ -228,7 +228,7 @@ fn plan_per_scale(logical: &LogicalOutput) -> DecoderResult<LogicalMerge> {
     // based on common YOLO conventions (batch, features, boxes).
     let (feature_axis_logical, box_axis_logical) = logical_per_scale_axes(logical)?;
 
-    let dfl = if logical.type_ == LogicalType::Boxes
+    let dfl = if logical.type_ == Some(LogicalType::Boxes)
         && logical.encoding == Some(schema::BoxEncoding::Dfl)
     {
         Some(plan_dfl(logical, &children)?)
@@ -978,7 +978,7 @@ mod tests {
             schema_version: 2,
             outputs: vec![LogicalOutput {
                 name: Some("boxes".into()),
-                type_: LogicalType::Boxes,
+                type_: Some(LogicalType::Boxes),
                 shape: vec![1, 4, 8400],
                 dshape: vec![
                     (DimName::Batch, 1),
@@ -1006,7 +1006,7 @@ mod tests {
         // ARA-2 style: boxes_xy + boxes_wh → [1, 4, 3]
         let boxes_logical = LogicalOutput {
             name: Some("boxes".into()),
-            type_: LogicalType::Boxes,
+            type_: Some(LogicalType::Boxes),
             shape: vec![1, 4, 3],
             dshape: vec![
                 (DimName::Batch, 1),
@@ -1137,7 +1137,7 @@ mod tests {
             schema_version: 2,
             outputs: vec![LogicalOutput {
                 name: Some("boxes".into()),
-                type_: LogicalType::Boxes,
+                type_: Some(LogicalType::Boxes),
                 shape: vec![1, 4, 5],
                 dshape: vec![
                     (DimName::Batch, 1),
@@ -1238,7 +1238,7 @@ mod tests {
             outputs: vec![
                 LogicalOutput {
                     name: Some("boxes".into()),
-                    type_: LogicalType::Boxes,
+                    type_: Some(LogicalType::Boxes),
                     shape: vec![1, 4, 3],
                     dshape: vec![
                         (DimName::Batch, 1),
@@ -1258,7 +1258,7 @@ mod tests {
                 // Force at least one split to enable DecodeProgram
                 LogicalOutput {
                     name: Some("scores".into()),
-                    type_: LogicalType::Scores,
+                    type_: Some(LogicalType::Scores),
                     shape: vec![1, 2, 3],
                     dshape: vec![
                         (DimName::Batch, 1),
@@ -1345,7 +1345,7 @@ mod tests {
             schema_version: 2,
             outputs: vec![LogicalOutput {
                 name: Some("boxes".into()),
-                type_: LogicalType::Boxes,
+                type_: Some(LogicalType::Boxes),
                 // Post-decode logical shape: 4 xcycwh channels × 6400
                 // anchors (single 80×80 FPN level in this minimal case).
                 shape: vec![1, 4, 6400],
@@ -1403,7 +1403,7 @@ mod tests {
             schema_version: 2,
             outputs: vec![LogicalOutput {
                 name: Some("boxes".into()),
-                type_: LogicalType::Boxes,
+                type_: Some(LogicalType::Boxes),
                 shape: vec![1, 4, 5],
                 dshape: vec![
                     (DimName::Batch, 1),
@@ -1515,7 +1515,7 @@ mod tests {
             schema_version: 2,
             outputs: vec![LogicalOutput {
                 name: Some("boxes".into()),
-                type_: LogicalType::Boxes,
+                type_: Some(LogicalType::Boxes),
                 shape: vec![1, 4, 5],
                 dshape: vec![
                     (DimName::Batch, 1),
@@ -1606,7 +1606,7 @@ mod tests {
             outputs: vec![
                 LogicalOutput {
                     name: Some("scores".into()),
-                    type_: LogicalType::Scores,
+                    type_: Some(LogicalType::Scores),
                     shape: vec![1, 1, 3],
                     dshape: vec![
                         (DimName::Batch, 1),
@@ -1628,7 +1628,7 @@ mod tests {
                     // branch actually runs (try_from_schema short-circuits
                     // when nothing needs merging).
                     name: Some("boxes".into()),
-                    type_: LogicalType::Boxes,
+                    type_: Some(LogicalType::Boxes),
                     shape: vec![1, 4, 3],
                     dshape: vec![
                         (DimName::Batch, 1),
