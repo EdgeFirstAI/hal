@@ -549,8 +549,9 @@ fn run_diagnostic(proc: &mut ImageProcessor) {
 
 /// Sweep `materialize_masks` cost across realistic detection counts on the
 /// actual `CPUProcessor` API (not the bench-local helper). The batched-GEMM
-/// path activates at `N >= 3`; sizes 8/16/32/64/100 bracket typical COCO
-/// validation loads (pycocotools `max_det=100`).
+/// path activates at `N >= 16` for proto resolution and `N >= 2` for scaled
+/// resolution; sizes 8/16/32/64/100 bracket typical COCO validation loads
+/// (pycocotools `max_det=100`).
 fn bench_materialize_masks_sweep(suite: &mut BenchSuite) {
     use edgefirst_image::CPUProcessor;
 
