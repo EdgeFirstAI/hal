@@ -21,6 +21,10 @@ pub struct CPUProcessor {
     resizer: fast_image_resize::Resizer,
     options: fast_image_resize::ResizeOptions,
     colors: [[u8; 4]; 20],
+    /// Reusable scratch buffers for `materialize_masks` batched-GEMM path.
+    /// Grown with `reserve` across calls so validation loops amortise the
+    /// dequant-protos + logits allocations over all frames.
+    pub(crate) mask_scratch: masks::MaskScratch,
 }
 
 unsafe impl Send for CPUProcessor {}
@@ -135,6 +139,7 @@ impl CPUProcessor {
             resizer,
             options,
             colors: crate::DEFAULT_COLORS_U8,
+            mask_scratch: masks::MaskScratch::default(),
         }
     }
 
@@ -149,6 +154,7 @@ impl CPUProcessor {
             resizer,
             options,
             colors: crate::DEFAULT_COLORS_U8,
+            mask_scratch: masks::MaskScratch::default(),
         }
     }
 

@@ -4,7 +4,146 @@
 use super::CPUProcessor;
 use crate::Result;
 use edgefirst_decoder::{DetectBox, Segmentation};
-use ndarray::Axis;
+use ndarray::{linalg::general_mat_mul, Array3, Axis};
+use rayon::prelude::*;
+
+/// Reusable scratch buffers for the batched `materialize_masks` path.
+///
+/// Held on [`CPUProcessor`] so repeated calls (e.g. COCO validation) reuse
+/// the dequantised-protos and logits allocations. All buffers grow with
+/// `resize` (which reuses capacity) rather than being reallocated.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MaskScratch {
+    /// Dequantised protos flattened to `(H*W, K)` row-major.
+    dequant: Vec<f32>,
+    /// Detection mask coefficients packed to `(N, K)` row-major for GEMM.
+    coeffs: Vec<f32>,
+    /// GEMM output `(N, H*W)` row-major — one logit plane per detection.
+    logits: Vec<f32>,
+}
+
+impl MaskScratch {
+    /// Compute per-detection logit planes `(N, H*W)` at proto resolution via
+    /// a single GEMM. Returns a view into the internal buffer so per-detection
+    /// post-processing can read it without copying.
+    ///
+    /// Shape contract:
+    /// - `coeffs`: slice of `N` coefficient vectors, each length `K`.
+    /// - `protos`: `(H, W, K)` float or `(H, W, K)` i8 + quantization.
+    /// - Returns `(N, H*W)` f32 logits (pre-sigmoid).
+    fn compute_logits(
+        &mut self,
+        coeffs: &[Vec<f32>],
+        protos: &edgefirst_decoder::ProtoTensor,
+        proto_h: usize,
+        proto_w: usize,
+        num_protos: usize,
+    ) -> Result<()> {
+        use edgefirst_decoder::ProtoTensor;
+
+        let n = coeffs.len();
+        let hw = proto_h * proto_w;
+
+        // Pack coefficients into contiguous (N, K). Reject early if any
+        // detection has the wrong coefficient count — cheaper to check here
+        // than per-pixel later.
+        self.coeffs.clear();
+        self.coeffs.reserve(n * num_protos);
+        for coeff in coeffs {
+            if coeff.len() != num_protos {
+                return Err(crate::Error::Internal(format!(
+                    "mask coeff length {} != proto channels {num_protos}",
+                    coeff.len()
+                )));
+            }
+            self.coeffs.extend_from_slice(coeff);
+        }
+
+        // Dequantise protos into (H*W, K) row-major. For Float protos we
+        // still copy to guarantee a contiguous (H*W, K) layout regardless of
+        // the source tensor's stride (ndarray protos may arrive with a
+        // non-standard layout from the decoder's tensor_bridge).
+        self.dequant.clear();
+        self.dequant.resize(hw * num_protos, 0.0);
+        match protos {
+            ProtoTensor::Float(arr) => {
+                let src = arr.view();
+                let dst = &mut self.dequant;
+                // (H, W, K) → (H*W, K) row-major
+                for y in 0..proto_h {
+                    for x in 0..proto_w {
+                        let row = (y * proto_w + x) * num_protos;
+                        for k in 0..num_protos {
+                            dst[row + k] = src[[y, x, k]];
+                        }
+                    }
+                }
+            }
+            ProtoTensor::Quantized {
+                protos,
+                quantization,
+            } => {
+                let scale = quantization.scale;
+                let zp = quantization.zero_point as f32;
+                let src = protos.view();
+                let dst = &mut self.dequant;
+                for y in 0..proto_h {
+                    for x in 0..proto_w {
+                        let row = (y * proto_w + x) * num_protos;
+                        for k in 0..num_protos {
+                            dst[row + k] = (src[[y, x, k]] as f32 - zp) * scale;
+                        }
+                    }
+                }
+            }
+        }
+
+        // GEMM: logits (N, HW) = coeffs (N, K) · dequant.T (K, HW)
+        // We build views over the scratch buffers — no extra allocation.
+        self.logits.clear();
+        self.logits.resize(n * hw, 0.0);
+        let a = ndarray::ArrayView2::from_shape((n, num_protos), &self.coeffs)
+            .expect("coeffs buffer matches (N, K)");
+        let b = ndarray::ArrayView2::from_shape((hw, num_protos), &self.dequant)
+            .expect("dequant buffer matches (HW, K)");
+        let mut c = ndarray::ArrayViewMut2::from_shape((n, hw), &mut self.logits)
+            .expect("logits buffer matches (N, HW)");
+        // `b.t()` is a view — no copy — giving us (K, HW).
+        general_mat_mul(1.0, &a, &b.t(), 0.0, &mut c);
+
+        Ok(())
+    }
+
+    /// Read-only view of the last computed logits as `(N, H*W)`.
+    fn logits(&self, n: usize, hw: usize) -> &[f32] {
+        debug_assert_eq!(self.logits.len(), n * hw);
+        &self.logits[..n * hw]
+    }
+}
+
+/// For `MaskResolution::Proto`, the per-detection ROI kernel only touches
+/// the bbox's worth of proto pixels. The batched path dequantises and
+/// GEMMs over the *entire* proto plane regardless of bbox size, so it
+/// only wins once the per-detection work exceeds the up-front full-plane
+/// cost. Measured crossover: `N ~= 16` on Cortex-A55, `N ~= 12` on x86.
+/// Picked conservatively at 16 to avoid regressions on embedded targets
+/// at the cost of a small miss at the crossover on desktop.
+const BATCHED_GEMM_MIN_N_PROTO: usize = 16;
+
+/// For `MaskResolution::Scaled`, the per-detection work is an
+/// `out_w × out_h × K` bilinear+dot+sigmoid loop (multi-ms per detection
+/// at 640×640), so the GEMM amortises cleanly across detections. At
+/// `N=1` on Cortex-A55 the batched full-plane dequant+GEMM slightly
+/// overshoots the single-detection scalar work, so the threshold is 2.
+const BATCHED_GEMM_MIN_N_SCALED: usize = 2;
+
+/// Development/benchmarking toggle: force `materialize_masks` to always use
+/// the legacy per-detection fused kernels, bypassing the batched-GEMM path.
+/// Set `EDGEFIRST_LEGACY_MATERIALIZE=1` to enable. Intended for A/B
+/// profiling only — production callers should never set it.
+fn legacy_materialize_forced() -> bool {
+    std::env::var_os("EDGEFIRST_LEGACY_MATERIALIZE").is_some()
+}
 
 impl CPUProcessor {
     #[allow(clippy::too_many_arguments)]
@@ -217,108 +356,38 @@ impl CPUProcessor {
     /// Benchmarks show this hybrid path (CPU decode + GL overlay) is faster
     /// than the fused GPU `draw_proto_masks` on all tested platforms.
     ///
-    /// Optimized: fused dequantization + dot product avoids a 3.1MB f32
-    /// allocation for the full proto tensor. Uses fast sigmoid approximation.
+    /// Optimized path:
+    /// - `N >= BATCHED_GEMM_MIN_N`: one `(N, K) × (K, H*W)` GEMM via
+    ///   `ndarray`'s `matrixmultiply` backend (SIMD-vectorised) shared across
+    ///   all detections; per-detection tile assembly is rayon-parallel using
+    ///   `MaskScratch` buffers pooled on `CPUProcessor`.
+    /// - `N < BATCHED_GEMM_MIN_N`: per-detection fused dequant+dot+sigmoid
+    ///   (the original path) — avoids the 3.1MB dequant allocation when the
+    ///   GEMM savings can't amortise it.
     pub fn materialize_segmentations(
-        &self,
+        &mut self,
         detect: &[crate::DetectBox],
         proto_data: &crate::ProtoData,
         letterbox: Option<[f32; 4]>,
     ) -> crate::Result<Vec<edgefirst_decoder::Segmentation>> {
-        use edgefirst_decoder::ProtoTensor;
-
         if detect.is_empty() || proto_data.mask_coefficients.is_empty() {
             return Ok(Vec::new());
         }
-
-        // Extract proto tensor metadata for the fused kernel.
-        let (proto_h, proto_w, num_protos) = match &proto_data.protos {
-            ProtoTensor::Quantized { protos, .. } => {
-                (protos.shape()[0], protos.shape()[1], protos.shape()[2])
-            }
-            ProtoTensor::Float(arr) => (arr.shape()[0], arr.shape()[1], arr.shape()[2]),
+        let min_n = if legacy_materialize_forced() {
+            usize::MAX
+        } else {
+            BATCHED_GEMM_MIN_N_PROTO
         };
-
-        // Precompute inverse letterbox scale for output-coord conversion.
-        let (lx0, inv_lw, ly0, inv_lh) = match letterbox {
-            Some([lx0, ly0, lx1, ly1]) => {
-                let lw = lx1 - lx0;
-                let lh = ly1 - ly0;
-                (
-                    lx0,
-                    if lw > 0.0 { 1.0 / lw } else { 1.0 },
-                    ly0,
-                    if lh > 0.0 { 1.0 / lh } else { 1.0 },
-                )
-            }
-            None => (0.0_f32, 1.0_f32, 0.0_f32, 1.0_f32),
-        };
-
-        detect
-            .iter()
-            .zip(proto_data.mask_coefficients.iter())
-            .map(|(det, coeff)| {
-                // Canonicalise bbox (swap min/max if inverted) then clamp to [0,1].
-                // Without canonicalisation a degenerate box (ymax < ymin) causes a
-                // near-zero ROI height after saturating_sub, making the mask invisible.
-                let bbox = det.bbox.to_canonical();
-                let xmin = bbox.xmin.clamp(0.0, 1.0);
-                let ymin = bbox.ymin.clamp(0.0, 1.0);
-                let xmax = bbox.xmax.clamp(0.0, 1.0);
-                let ymax = bbox.ymax.clamp(0.0, 1.0);
-
-                // Map to proto-space pixel coordinates (clamp to valid range)
-                let x0 = ((xmin * proto_w as f32) as usize).min(proto_w.saturating_sub(1));
-                let y0 = ((ymin * proto_h as f32) as usize).min(proto_h.saturating_sub(1));
-                let x1 = ((xmax * proto_w as f32).ceil() as usize).min(proto_w);
-                let y1 = ((ymax * proto_h as f32).ceil() as usize).min(proto_h);
-
-                let roi_w = x1.saturating_sub(x0).max(1);
-                let roi_h = y1.saturating_sub(y0).max(1);
-
-                if coeff.len() != num_protos {
-                    return Err(crate::Error::Internal(format!(
-                        "mask coeff length {} != proto channels {num_protos}",
-                        coeff.len()
-                    )));
-                }
-
-                // Fused dequant + dot product + sigmoid, directly producing u8 mask.
-                // Avoids allocating a full f32 proto tensor and the to_shape copy.
-                let mask = match &proto_data.protos {
-                    ProtoTensor::Quantized {
-                        protos,
-                        quantization,
-                    } => {
-                        let scale = quantization.scale;
-                        let zp = quantization.zero_point as f32;
-                        fused_dequant_dot_sigmoid_i8(
-                            protos, coeff, scale, zp, y0, x0, roi_h, roi_w, num_protos,
-                        )
-                    }
-                    ProtoTensor::Float(protos) => {
-                        fused_dot_sigmoid_f32(protos, coeff, y0, x0, roi_h, roi_w, num_protos)
-                    }
-                };
-
-                // Convert proto-space normalised coords to output-image-normalised
-                // coords by applying the inverse letterbox transform.  When no
-                // letterbox was used (lx0=0, inv_lw=1, ly0=0, inv_lh=1) this is a
-                // no-op and the coords are identical to the proto-normalised values.
-                let seg_xmin = ((x0 as f32 / proto_w as f32) - lx0) * inv_lw;
-                let seg_ymin = ((y0 as f32 / proto_h as f32) - ly0) * inv_lh;
-                let seg_xmax = ((x1 as f32 / proto_w as f32) - lx0) * inv_lw;
-                let seg_ymax = ((y1 as f32 / proto_h as f32) - ly0) * inv_lh;
-
-                Ok(edgefirst_decoder::Segmentation {
-                    xmin: seg_xmin.clamp(0.0, 1.0),
-                    ymin: seg_ymin.clamp(0.0, 1.0),
-                    xmax: seg_xmax.clamp(0.0, 1.0),
-                    ymax: seg_ymax.clamp(0.0, 1.0),
-                    segmentation: mask,
-                })
-            })
-            .collect::<crate::Result<Vec<_>>>()
+        if detect.len() < min_n {
+            materialize_segmentations_fused(detect, proto_data, letterbox)
+        } else {
+            materialize_segmentations_batched(
+                &mut self.mask_scratch,
+                detect,
+                proto_data,
+                letterbox,
+            )
+        }
     }
 
     /// Produce per-detection masks at `(width, height)` pixel resolution by
@@ -334,7 +403,7 @@ impl CPUProcessor {
     /// Used by [`ImageProcessor::materialize_masks`] when the caller selects
     /// [`MaskResolution::Scaled`](crate::MaskResolution::Scaled).
     pub fn materialize_scaled_segmentations(
-        &self,
+        &mut self,
         detect: &[crate::DetectBox],
         proto_data: &crate::ProtoData,
         letterbox: Option<[f32; 4]>,
@@ -350,6 +419,17 @@ impl CPUProcessor {
             return Err(crate::Error::InvalidShape(
                 "Scaled mask width/height must be positive".into(),
             ));
+        }
+
+        if !legacy_materialize_forced() && detect.len() >= BATCHED_GEMM_MIN_N_SCALED {
+            return scaled_segmentations_batched(
+                &mut self.mask_scratch,
+                detect,
+                proto_data,
+                letterbox,
+                width,
+                height,
+            );
         }
 
         match &proto_data.protos {
@@ -375,6 +455,300 @@ impl CPUProcessor {
             ),
         }
     }
+}
+
+// =========================================================================
+// Batched-GEMM paths (shared dequant + single matmul + rayon per-detection)
+// =========================================================================
+
+fn proto_shape(protos: &edgefirst_decoder::ProtoTensor) -> (usize, usize, usize) {
+    use edgefirst_decoder::ProtoTensor;
+    match protos {
+        ProtoTensor::Quantized { protos, .. } => {
+            (protos.shape()[0], protos.shape()[1], protos.shape()[2])
+        }
+        ProtoTensor::Float(arr) => (arr.shape()[0], arr.shape()[1], arr.shape()[2]),
+    }
+}
+
+/// Small-N fused path: exactly the pre-batched implementation, retained for
+/// the `N < BATCHED_GEMM_MIN_N` case where the up-front dequant cost would
+/// dominate the per-detection work.
+fn materialize_segmentations_fused(
+    detect: &[crate::DetectBox],
+    proto_data: &crate::ProtoData,
+    letterbox: Option<[f32; 4]>,
+) -> crate::Result<Vec<edgefirst_decoder::Segmentation>> {
+    use edgefirst_decoder::ProtoTensor;
+
+    let (proto_h, proto_w, num_protos) = proto_shape(&proto_data.protos);
+    let (lx0, inv_lw, ly0, inv_lh) = inv_letterbox(letterbox);
+
+    detect
+        .iter()
+        .zip(proto_data.mask_coefficients.iter())
+        .map(|(det, coeff)| {
+            let (x0, y0, x1, y1) = bbox_to_proto_roi(det, proto_w, proto_h);
+            let roi_w = x1.saturating_sub(x0).max(1);
+            let roi_h = y1.saturating_sub(y0).max(1);
+
+            if coeff.len() != num_protos {
+                return Err(crate::Error::Internal(format!(
+                    "mask coeff length {} != proto channels {num_protos}",
+                    coeff.len()
+                )));
+            }
+
+            let mask = match &proto_data.protos {
+                ProtoTensor::Quantized {
+                    protos,
+                    quantization,
+                } => fused_dequant_dot_sigmoid_i8(
+                    protos,
+                    coeff,
+                    quantization.scale,
+                    quantization.zero_point as f32,
+                    y0,
+                    x0,
+                    roi_h,
+                    roi_w,
+                    num_protos,
+                ),
+                ProtoTensor::Float(protos) => {
+                    fused_dot_sigmoid_f32(protos, coeff, y0, x0, roi_h, roi_w, num_protos)
+                }
+            };
+
+            Ok(proto_roi_to_segmentation(
+                mask, x0, y0, x1, y1, proto_w, proto_h, lx0, inv_lw, ly0, inv_lh,
+            ))
+        })
+        .collect::<crate::Result<Vec<_>>>()
+}
+
+/// Batched path for `MaskResolution::Proto`: one GEMM, then rayon-parallel
+/// ROI crop + sigmoid+quantize per detection.
+fn materialize_segmentations_batched(
+    scratch: &mut MaskScratch,
+    detect: &[crate::DetectBox],
+    proto_data: &crate::ProtoData,
+    letterbox: Option<[f32; 4]>,
+) -> crate::Result<Vec<edgefirst_decoder::Segmentation>> {
+    let (proto_h, proto_w, num_protos) = proto_shape(&proto_data.protos);
+    let hw = proto_h * proto_w;
+    let n = detect.len();
+
+    // One GEMM across all detections.
+    scratch.compute_logits(
+        &proto_data.mask_coefficients,
+        &proto_data.protos,
+        proto_h,
+        proto_w,
+        num_protos,
+    )?;
+
+    // Precompute inverse letterbox transform (shared across workers).
+    let (lx0, inv_lw, ly0, inv_lh) = inv_letterbox(letterbox);
+
+    // Shared read-only view of the logits buffer across rayon workers.
+    let logits: &[f32] = scratch.logits(n, hw);
+
+    detect
+        .par_iter()
+        .enumerate()
+        .map(|(i, det)| {
+            let (x0, y0, x1, y1) = bbox_to_proto_roi(det, proto_w, proto_h);
+            let roi_w = x1.saturating_sub(x0).max(1);
+            let roi_h = y1.saturating_sub(y0).max(1);
+            let row = &logits[i * hw..(i + 1) * hw];
+
+            let mut mask = Array3::<u8>::zeros((roi_h, roi_w, 1));
+            for yi in 0..roi_h {
+                let src_row_start = (y0 + yi) * proto_w + x0;
+                let src_row = &row[src_row_start..src_row_start + roi_w];
+                for (xi, &logit) in src_row.iter().enumerate() {
+                    let s = fast_sigmoid(logit);
+                    mask[[yi, xi, 0]] = (s * 255.0 + 0.5) as u8;
+                }
+            }
+
+            Ok(proto_roi_to_segmentation(
+                mask, x0, y0, x1, y1, proto_w, proto_h, lx0, inv_lw, ly0, inv_lh,
+            ))
+        })
+        .collect::<crate::Result<Vec<_>>>()
+}
+
+/// Batched path for `MaskResolution::Scaled`: GEMM at proto resolution, then
+/// per-detection bilinear-upsample the (pre-sigmoid) logits into the bbox
+/// tile at output resolution, threshold, and emit binary {0, 255} mask.
+fn scaled_segmentations_batched(
+    scratch: &mut MaskScratch,
+    detect: &[crate::DetectBox],
+    proto_data: &crate::ProtoData,
+    letterbox: Option<[f32; 4]>,
+    width: u32,
+    height: u32,
+) -> crate::Result<Vec<edgefirst_decoder::Segmentation>> {
+    let (proto_h, proto_w, num_protos) = proto_shape(&proto_data.protos);
+    let hw = proto_h * proto_w;
+    let n = detect.len();
+
+    scratch.compute_logits(
+        &proto_data.mask_coefficients,
+        &proto_data.protos,
+        proto_h,
+        proto_w,
+        num_protos,
+    )?;
+
+    // letterbox semantics match `scaled_segmentations_float` / `_quant_i8`.
+    let (lx0, lw, ly0, lh) = match letterbox {
+        Some([lx0, ly0, lx1, ly1]) => {
+            let lw = (lx1 - lx0).max(f32::EPSILON);
+            let lh = (ly1 - ly0).max(f32::EPSILON);
+            (lx0, lw, ly0, lh)
+        }
+        None => (0.0_f32, 1.0_f32, 0.0_f32, 1.0_f32),
+    };
+    let out_w = width as usize;
+    let out_h = height as usize;
+
+    let logits: &[f32] = scratch.logits(n, hw);
+
+    detect
+        .par_iter()
+        .enumerate()
+        .map(|(i, det)| {
+            let bbox = det.bbox.to_canonical();
+            let xmin = ((bbox.xmin - lx0) / lw).clamp(0.0, 1.0);
+            let ymin = ((bbox.ymin - ly0) / lh).clamp(0.0, 1.0);
+            let xmax = ((bbox.xmax - lx0) / lw).clamp(0.0, 1.0);
+            let ymax = ((bbox.ymax - ly0) / lh).clamp(0.0, 1.0);
+
+            let px0 = (xmin * out_w as f32).round() as usize;
+            let py0 = (ymin * out_h as f32).round() as usize;
+            let px1 = ((xmax * out_w as f32).round() as usize).min(out_w);
+            let py1 = ((ymax * out_h as f32).round() as usize).min(out_h);
+            let bbox_w = px1.saturating_sub(px0).max(1);
+            let bbox_h = py1.saturating_sub(py0).max(1);
+
+            let mut tile = Array3::<u8>::zeros((bbox_h, bbox_w, 1));
+            let row = &logits[i * hw..(i + 1) * hw];
+
+            // Bilinear sample the logit plane at output resolution, then
+            // sigmoid + threshold. Output pixel → model-input normalized →
+            // proto-plane texel (same math as `scaled_segmentations_float`).
+            for yi in 0..bbox_h {
+                let py = (py0 + yi) as f32;
+                let model_y_norm = ly0 + (py + 0.5) / out_h as f32 * lh;
+                let sample_y = model_y_norm * proto_h as f32 - 0.5;
+                for xi in 0..bbox_w {
+                    let px = (px0 + xi) as f32;
+                    let model_x_norm = lx0 + (px + 0.5) / out_w as f32 * lw;
+                    let sample_x = model_x_norm * proto_w as f32 - 0.5;
+                    let acc = bilinear_sample_plane(row, sample_x, sample_y, proto_w, proto_h);
+                    let sigmoid = fast_sigmoid(acc);
+                    tile[[yi, xi, 0]] = if sigmoid > 0.5 { 255 } else { 0 };
+                }
+            }
+
+            Ok(edgefirst_decoder::Segmentation {
+                xmin,
+                ymin,
+                xmax,
+                ymax,
+                segmentation: tile,
+            })
+        })
+        .collect::<crate::Result<Vec<_>>>()
+}
+
+/// Inverse letterbox factors for mapping from model-input normalized
+/// coordinates to output-content normalized coordinates. `None` → identity.
+fn inv_letterbox(letterbox: Option<[f32; 4]>) -> (f32, f32, f32, f32) {
+    match letterbox {
+        Some([lx0, ly0, lx1, ly1]) => {
+            let lw = lx1 - lx0;
+            let lh = ly1 - ly0;
+            (
+                lx0,
+                if lw > 0.0 { 1.0 / lw } else { 1.0 },
+                ly0,
+                if lh > 0.0 { 1.0 / lh } else { 1.0 },
+            )
+        }
+        None => (0.0_f32, 1.0_f32, 0.0_f32, 1.0_f32),
+    }
+}
+
+/// Canonicalise `det.bbox`, clamp to `[0, 1]`, and map into proto-pixel
+/// coordinates. Returns `(x0, y0, x1, y1)` with `x1/y1` inclusive of the
+/// ceil'd max so `x1 - x0` gives the ROI width.
+fn bbox_to_proto_roi(
+    det: &crate::DetectBox,
+    proto_w: usize,
+    proto_h: usize,
+) -> (usize, usize, usize, usize) {
+    let bbox = det.bbox.to_canonical();
+    let xmin = bbox.xmin.clamp(0.0, 1.0);
+    let ymin = bbox.ymin.clamp(0.0, 1.0);
+    let xmax = bbox.xmax.clamp(0.0, 1.0);
+    let ymax = bbox.ymax.clamp(0.0, 1.0);
+    let x0 = ((xmin * proto_w as f32) as usize).min(proto_w.saturating_sub(1));
+    let y0 = ((ymin * proto_h as f32) as usize).min(proto_h.saturating_sub(1));
+    let x1 = ((xmax * proto_w as f32).ceil() as usize).min(proto_w);
+    let y1 = ((ymax * proto_h as f32).ceil() as usize).min(proto_h);
+    (x0, y0, x1, y1)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn proto_roi_to_segmentation(
+    mask: ndarray::Array3<u8>,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+    proto_w: usize,
+    proto_h: usize,
+    lx0: f32,
+    inv_lw: f32,
+    ly0: f32,
+    inv_lh: f32,
+) -> edgefirst_decoder::Segmentation {
+    let seg_xmin = ((x0 as f32 / proto_w as f32) - lx0) * inv_lw;
+    let seg_ymin = ((y0 as f32 / proto_h as f32) - ly0) * inv_lh;
+    let seg_xmax = ((x1 as f32 / proto_w as f32) - lx0) * inv_lw;
+    let seg_ymax = ((y1 as f32 / proto_h as f32) - ly0) * inv_lh;
+    edgefirst_decoder::Segmentation {
+        xmin: seg_xmin.clamp(0.0, 1.0),
+        ymin: seg_ymin.clamp(0.0, 1.0),
+        xmax: seg_xmax.clamp(0.0, 1.0),
+        ymax: seg_ymax.clamp(0.0, 1.0),
+        segmentation: mask,
+    }
+}
+
+/// Bilinear sample a flat `(H * W)` plane at subpixel `(px, py)`. Out-of-bounds
+/// samples clamp to the plane's edge — matches `bilinear_dot_quant_i8`'s
+/// implicit boundary handling.
+#[inline]
+fn bilinear_sample_plane(plane: &[f32], px: f32, py: f32, w: usize, h: usize) -> f32 {
+    let x0 = (px.floor() as isize).clamp(0, w as isize - 1) as usize;
+    let y0 = (py.floor() as isize).clamp(0, h as isize - 1) as usize;
+    let x1 = (x0 + 1).min(w - 1);
+    let y1 = (y0 + 1).min(h - 1);
+    let fx = px - px.floor();
+    let fy = py - py.floor();
+    let w00 = (1.0 - fx) * (1.0 - fy);
+    let w10 = fx * (1.0 - fy);
+    let w01 = (1.0 - fx) * fy;
+    let w11 = fx * fy;
+    let v00 = plane[y0 * w + x0];
+    let v10 = plane[y0 * w + x1];
+    let v01 = plane[y1 * w + x0];
+    let v11 = plane[y1 * w + x1];
+    w00 * v00 + w10 * v10 + w01 * v01 + w11 * v11
 }
 
 fn scaled_segmentations_float(
@@ -834,7 +1208,7 @@ mod scaled_tests {
 
     #[test]
     fn scaled_central_bbox_produces_foreground_blob() {
-        let cpu = make_cpu();
+        let mut cpu = make_cpu();
         let proto_data = synthetic_proto_data(16, 16, 4);
 
         // bbox covers the centre 50% of the plane.
@@ -901,7 +1275,7 @@ mod scaled_tests {
             label: 0,
         }];
 
-        let cpu = make_cpu();
+        let mut cpu = make_cpu();
         let out = cpu
             .materialize_scaled_segmentations(&detect, &proto_data, None, 640, 640)
             .unwrap();
@@ -967,7 +1341,7 @@ mod scaled_tests {
     /// coordinate frame.
     #[test]
     fn scaled_letterbox_original_content_coords() {
-        let cpu = make_cpu();
+        let mut cpu = make_cpu();
         let proto_data = synthetic_proto_data(16, 16, 4);
 
         // Bbox in *model-input* normalized coords — the frame used by the
@@ -1066,7 +1440,7 @@ mod scaled_tests {
             label: 0,
         }];
 
-        let cpu = make_cpu();
+        let mut cpu = make_cpu();
         let out_f = cpu
             .materialize_scaled_segmentations(&detect, &pd_float, None, 320, 320)
             .unwrap();
@@ -1084,5 +1458,159 @@ mod scaled_tests {
             mismatches < total / 200,
             "quantized and float diverged at {mismatches}/{total} pixels (>0.5%)"
         );
+    }
+
+    // ─── Batched-GEMM path regression tests ───────────────────────────────
+
+    /// Build a `ProtoData` + detection list large enough to trigger the
+    /// batched GEMM path (`N >= BATCHED_GEMM_MIN_N`) with realistic 160×160
+    /// proto dims and 32 channels. Deterministic via seeded LCG so output
+    /// is reproducible across runs.
+    fn realistic_proto_data(n: usize) -> (Vec<DetectBox>, ProtoData) {
+        let mut rng_seed: u32 = 0xABCD_0001;
+        let mut next = || -> f32 {
+            rng_seed = rng_seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (rng_seed as f32) / (u32::MAX as f32) * 2.0 - 1.0
+        };
+        let proto_h = 160;
+        let proto_w = 160;
+        let num_protos = 32;
+        let mut protos = Array3::<f32>::zeros((proto_h, proto_w, num_protos));
+        for y in 0..proto_h {
+            for x in 0..proto_w {
+                for k in 0..num_protos {
+                    protos[[y, x, k]] = next() * 3.0;
+                }
+            }
+        }
+        let mask_coefficients: Vec<Vec<f32>> = (0..n)
+            .map(|_| (0..num_protos).map(|_| next()).collect())
+            .collect();
+        let detect: Vec<DetectBox> = (0..n)
+            .map(|i| {
+                let t = i as f32 / n as f32;
+                DetectBox {
+                    bbox: BoundingBox::new(0.1 + 0.6 * t, 0.15, 0.3 + 0.6 * t, 0.85),
+                    score: 0.9,
+                    label: 0,
+                }
+            })
+            .collect();
+        let proto_data = ProtoData {
+            mask_coefficients,
+            protos: ProtoTensor::Float(protos),
+        };
+        (detect, proto_data)
+    }
+
+    /// `MaskResolution::Proto` batched path must match the fused path to
+    /// within the tolerance of `fast_sigmoid`'s ~1.1% approximation error.
+    /// Both paths share the same kernel math, so any larger divergence
+    /// means the batched GEMM or ROI-crop mapping is wrong.
+    #[test]
+    fn batched_proto_matches_fused_reference_at_n_equals_5() {
+        // Use N=16+ so the batched-GEMM path (threshold 16) actually fires.
+        let (detect, proto_data) = realistic_proto_data(16);
+        debug_assert!(detect.len() >= BATCHED_GEMM_MIN_N_PROTO);
+
+        // Batched path via the public entry point.
+        let mut cpu = make_cpu();
+        let out_batched = cpu
+            .materialize_segmentations(&detect, &proto_data, None)
+            .unwrap();
+
+        // Fused reference path via the small-N helper (bypasses the
+        // BATCHED_GEMM_MIN_N dispatch in the public method).
+        let out_fused = materialize_segmentations_fused(&detect, &proto_data, None).unwrap();
+
+        assert_eq!(out_batched.len(), out_fused.len());
+        for (b, f) in out_batched.iter().zip(out_fused.iter()) {
+            assert_eq!(b.segmentation.shape(), f.segmentation.shape());
+            // Count pixels differing by more than the u8-quant tolerance
+            // (fast_sigmoid error ~1.1% ⇒ ~3 u8 units at the decision band).
+            let mut mismatches = 0usize;
+            for (a, c) in b.segmentation.iter().zip(f.segmentation.iter()) {
+                if (*a as i32 - *c as i32).abs() > 3 {
+                    mismatches += 1;
+                }
+            }
+            let total = b.segmentation.len();
+            assert!(
+                mismatches < total / 100,
+                "batched vs fused diverged at {mismatches}/{total} pixels (>1%)"
+            );
+        }
+    }
+
+    /// `MaskResolution::Scaled` batched path must match the per-detection
+    /// non-batched path within the binary-threshold tolerance.
+    #[test]
+    fn batched_scaled_matches_unbatched_reference_at_n_equals_5() {
+        // Use N=16+ so the batched-GEMM path (threshold 16) actually fires.
+        let (detect, proto_data) = realistic_proto_data(16);
+        debug_assert!(detect.len() >= BATCHED_GEMM_MIN_N_PROTO);
+
+        let mut cpu = make_cpu();
+        let out_batched = cpu
+            .materialize_scaled_segmentations(&detect, &proto_data, None, 320, 320)
+            .unwrap();
+
+        // Reference: call the per-detection helper directly. ProtoData is
+        // Float so `scaled_segmentations_float` is the right reference.
+        let protos = match &proto_data.protos {
+            ProtoTensor::Float(p) => p,
+            _ => unreachable!("test fixture uses Float protos"),
+        };
+        let out_ref = scaled_segmentations_float(
+            &detect,
+            &proto_data.mask_coefficients,
+            protos,
+            None,
+            320,
+            320,
+        )
+        .unwrap();
+
+        assert_eq!(out_batched.len(), out_ref.len());
+        for (b, r) in out_batched.iter().zip(out_ref.iter()) {
+            assert_eq!(b.segmentation.shape(), r.segmentation.shape());
+            let mut mismatches = 0usize;
+            for (a, c) in b.segmentation.iter().zip(r.segmentation.iter()) {
+                if *a != *c {
+                    mismatches += 1;
+                }
+            }
+            let total = b.segmentation.len();
+            // Binary masks — tolerate up to 2% boundary pixel differences
+            // due to sigmoid approximation at the decision band.
+            assert!(
+                mismatches < total / 50,
+                "batched vs ref scaled diverged at {mismatches}/{total} pixels (>2%)"
+            );
+        }
+    }
+
+    /// MaskScratch buffers must be reused (capacity ≥ previous call) rather
+    /// than reallocated each call. Regression guard for the pooling
+    /// contract that validation loops depend on.
+    #[test]
+    fn mask_scratch_reuses_buffers_across_calls() {
+        // N must be >= BATCHED_GEMM_MIN_N_PROTO so the batched path fires
+        // and populates the scratch buffers.
+        let (detect, proto_data) = realistic_proto_data(BATCHED_GEMM_MIN_N_PROTO);
+        let mut cpu = make_cpu();
+        cpu.materialize_segmentations(&detect, &proto_data, None)
+            .unwrap();
+        let cap_dequant = cpu.mask_scratch.dequant.capacity();
+        let cap_coeffs = cpu.mask_scratch.coeffs.capacity();
+        let cap_logits = cpu.mask_scratch.logits.capacity();
+        assert!(cap_dequant > 0 && cap_coeffs > 0 && cap_logits > 0);
+
+        // Second call with identical shape must reuse capacity.
+        cpu.materialize_segmentations(&detect, &proto_data, None)
+            .unwrap();
+        assert_eq!(cpu.mask_scratch.dequant.capacity(), cap_dequant);
+        assert_eq!(cpu.mask_scratch.coeffs.capacity(), cap_coeffs);
+        assert_eq!(cpu.mask_scratch.logits.capacity(), cap_logits);
     }
 }
