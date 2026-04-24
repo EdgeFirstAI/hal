@@ -134,9 +134,18 @@ pub struct LogicalOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 
-    /// Semantic type.
-    #[serde(rename = "type")]
-    pub type_: LogicalType,
+    /// Semantic type. `None` marks the output as "additional" — carried in
+    /// the schema for completeness (e.g. diagnostic or auxiliary tensors)
+    /// but not participating in decoder dispatch. See
+    /// [`SchemaV2::to_legacy_config_outputs`] for how typeless outputs are
+    /// filtered out of the legacy config, and the module docs for when to
+    /// use this vs. a recognised [`LogicalType`] variant.
+    #[serde(
+        rename = "type",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub type_: Option<LogicalType>,
 
     /// Reconstructed logical shape (what the fallback dequant+merge path
     /// produces).
@@ -703,13 +712,21 @@ impl SchemaV2 {
     pub fn to_legacy_config_outputs(&self) -> DecoderResult<ConfigOutputs> {
         let mut outputs = Vec::with_capacity(self.outputs.len());
         for logical in &self.outputs {
+            // Typeless logical outputs are carried for round-tripping
+            // but are not required for decoding. Skip them — the decoder
+            // builder will surface its own "missing required output"
+            // error if a decode-critical role (e.g. `boxes`) is absent,
+            // which is more actionable than a serde "missing type" error.
+            if logical.type_.is_none() {
+                continue;
+            }
             // Flat DFL (no children) remains unsupported — the HAL has
             // no path that applies softmax + dist2bbox to a single
             // `(1, 4·reg_max, anchors)` tensor yet. DFL with per-scale
             // children is decoded by the merge path, so we let it
             // through here and rely on the merged logical shape (post-
             // decode 4 channels) being valid for the legacy dispatch.
-            if logical.type_ == LogicalType::Boxes
+            if logical.type_ == Some(LogicalType::Boxes)
                 && logical.encoding == Some(BoxEncoding::Dfl)
                 && logical.outputs.is_empty()
             {
@@ -825,7 +842,7 @@ fn validate_logical(logical: &LogicalOutput) -> DecoderResult<()> {
 
     // DFL boxes: every child's feature axis must be divisible by 4
     // (otherwise `reg_max` is not an integer).
-    if logical.type_ == LogicalType::Boxes && logical.encoding == Some(BoxEncoding::Dfl) {
+    if logical.type_ == Some(LogicalType::Boxes) && logical.encoding == Some(BoxEncoding::Dfl) {
         for child in &logical.outputs {
             if let Some(feat) = last_feature_axis(child) {
                 if feat % 4 != 0 {
@@ -888,7 +905,7 @@ fn logical_from_v1(v1: &ConfigOutput) -> DecoderResult<LogicalOutput> {
             };
             Ok(LogicalOutput {
                 name: None,
-                type_: LogicalType::Detection,
+                type_: Some(LogicalType::Detection),
                 shape: d.shape.clone(),
                 dshape: d.dshape.clone(),
                 decoder: Some(DecoderKind::from_v1(d.decoder)),
@@ -904,7 +921,7 @@ fn logical_from_v1(v1: &ConfigOutput) -> DecoderResult<LogicalOutput> {
         }
         ConfigOutput::Boxes(b) => Ok(LogicalOutput {
             name: None,
-            type_: LogicalType::Boxes,
+            type_: Some(LogicalType::Boxes),
             shape: b.shape.clone(),
             dshape: b.dshape.clone(),
             decoder: Some(DecoderKind::from_v1(b.decoder)),
@@ -922,7 +939,7 @@ fn logical_from_v1(v1: &ConfigOutput) -> DecoderResult<LogicalOutput> {
         }),
         ConfigOutput::Scores(s) => Ok(LogicalOutput {
             name: None,
-            type_: LogicalType::Scores,
+            type_: Some(LogicalType::Scores),
             shape: s.shape.clone(),
             dshape: s.dshape.clone(),
             decoder: Some(DecoderKind::from_v1(s.decoder)),
@@ -940,7 +957,7 @@ fn logical_from_v1(v1: &ConfigOutput) -> DecoderResult<LogicalOutput> {
         }),
         ConfigOutput::Protos(p) => Ok(LogicalOutput {
             name: None,
-            type_: LogicalType::Protos,
+            type_: Some(LogicalType::Protos),
             shape: p.shape.clone(),
             dshape: p.dshape.clone(),
             // protos are consumed directly; decoder field is informational.
@@ -956,7 +973,7 @@ fn logical_from_v1(v1: &ConfigOutput) -> DecoderResult<LogicalOutput> {
         }),
         ConfigOutput::MaskCoefficients(m) => Ok(LogicalOutput {
             name: None,
-            type_: LogicalType::MaskCoefs,
+            type_: Some(LogicalType::MaskCoefs),
             shape: m.shape.clone(),
             dshape: m.dshape.clone(),
             decoder: Some(DecoderKind::from_v1(m.decoder)),
@@ -971,7 +988,7 @@ fn logical_from_v1(v1: &ConfigOutput) -> DecoderResult<LogicalOutput> {
         }),
         ConfigOutput::Segmentation(seg) => Ok(LogicalOutput {
             name: None,
-            type_: LogicalType::Segmentation,
+            type_: Some(LogicalType::Segmentation),
             shape: seg.shape.clone(),
             dshape: seg.dshape.clone(),
             decoder: Some(DecoderKind::from_v1(seg.decoder)),
@@ -986,7 +1003,7 @@ fn logical_from_v1(v1: &ConfigOutput) -> DecoderResult<LogicalOutput> {
         }),
         ConfigOutput::Mask(m) => Ok(LogicalOutput {
             name: None,
-            type_: LogicalType::Masks,
+            type_: Some(LogicalType::Masks),
             shape: m.shape.clone(),
             dshape: m.dshape.clone(),
             decoder: Some(DecoderKind::from_v1(m.decoder)),
@@ -1001,7 +1018,7 @@ fn logical_from_v1(v1: &ConfigOutput) -> DecoderResult<LogicalOutput> {
         }),
         ConfigOutput::Classes(c) => Ok(LogicalOutput {
             name: None,
-            type_: LogicalType::Classes,
+            type_: Some(LogicalType::Classes),
             shape: c.shape.clone(),
             dshape: c.dshape.clone(),
             decoder: Some(DecoderKind::from_v1(c.decoder)),
@@ -1150,7 +1167,18 @@ fn logical_to_legacy_config_output(logical: &LogicalOutput) -> DecoderResult<Con
     // axis (ARA-2).
     let (shape, dshape) = squeeze_padding_dims(logical.shape.clone(), logical.dshape.clone());
 
-    Ok(match logical.type_ {
+    let ty = logical.type_.ok_or_else(|| {
+        // Defense-in-depth: `to_legacy_config_outputs` already filters
+        // typeless outputs, so reaching here means a new caller added a
+        // bypass. Surface it as an internal error rather than panicking.
+        DecoderError::InvalidConfig(format!(
+            "logical output `{}` has no type; typeless outputs should be \
+             filtered before legacy conversion",
+            logical.name.as_deref().unwrap_or("<anonymous>")
+        ))
+    })?;
+
+    Ok(match ty {
         LogicalType::Boxes => ConfigOutput::Boxes(configs::Boxes {
             decoder,
             quantization,
@@ -1213,7 +1241,7 @@ fn logical_to_legacy_config_output(logical: &LogicalOutput) -> DecoderResult<Con
             return Err(DecoderError::NotSupported(format!(
                 "logical type {:?} has no legacy v1 equivalent; use the \
                  native v2 decoder path",
-                logical.type_
+                ty
             )));
         }
     })
@@ -1319,7 +1347,7 @@ mod tests {
           "normalized": true
         }"#;
         let lo: LogicalOutput = serde_json::from_str(j).unwrap();
-        assert_eq!(lo.type_, LogicalType::Boxes);
+        assert_eq!(lo.type_, Some(LogicalType::Boxes));
         assert_eq!(lo.encoding, Some(BoxEncoding::Dfl));
         assert_eq!(lo.normalized, Some(true));
         assert!(!lo.is_split());
@@ -1431,7 +1459,7 @@ mod tests {
         let s: SchemaV2 = serde_json::from_str(j).unwrap();
         assert_eq!(s.decoder_version, Some(DecoderVersion::Yolo26));
         assert!(s.decoder_version.unwrap().is_end_to_end());
-        assert_eq!(s.outputs[0].type_, LogicalType::Detections);
+        assert_eq!(s.outputs[0].type_, Some(LogicalType::Detections));
         assert_eq!(s.outputs[0].normalized, Some(false));
         assert!(s.nms.is_none());
     }
@@ -1476,7 +1504,7 @@ mod tests {
           }]
         }"#;
         let lo: LogicalOutput = serde_json::from_str(j).unwrap();
-        assert_eq!(lo.type_, LogicalType::Objectness);
+        assert_eq!(lo.type_, Some(LogicalType::Objectness));
         assert_eq!(lo.outputs[0].activation_applied, Some(Activation::Sigmoid));
     }
 
@@ -1492,7 +1520,7 @@ mod tests {
           "stride": 4
         }"#;
         let lo: LogicalOutput = serde_json::from_str(j).unwrap();
-        assert_eq!(lo.type_, LogicalType::Protos);
+        assert_eq!(lo.type_, Some(LogicalType::Protos));
         assert!(lo.decoder.is_none());
         assert_eq!(lo.stride, Some(Stride::Square(4)));
     }
@@ -1555,7 +1583,7 @@ mod tests {
             }),
             outputs: vec![LogicalOutput {
                 name: Some("boxes".into()),
-                type_: LogicalType::Boxes,
+                type_: Some(LogicalType::Boxes),
                 shape: vec![1, 4, 8400],
                 dshape: vec![],
                 decoder: Some(DecoderKind::Ultralytics),
@@ -1589,7 +1617,7 @@ mod tests {
         assert_eq!(schema.outputs.len(), 2);
         // First output: Detection [1, 116, 8400]
         let det = &schema.outputs[0];
-        assert_eq!(det.type_, LogicalType::Detection);
+        assert_eq!(det.type_, Some(LogicalType::Detection));
         assert_eq!(det.shape, vec![1, 116, 8400]);
         assert_eq!(det.decoder, Some(DecoderKind::Ultralytics));
         assert_eq!(det.encoding, Some(BoxEncoding::Direct));
@@ -1599,7 +1627,7 @@ mod tests {
         assert_eq!(q.zero_point, Some(vec![31]));
         // Second output: Protos [1, 160, 160, 32]
         let protos = &schema.outputs[1];
-        assert_eq!(protos.type_, LogicalType::Protos);
+        assert_eq!(protos.type_, Some(LogicalType::Protos));
         assert_eq!(protos.shape, vec![1, 160, 160, 32]);
     }
 
@@ -1614,7 +1642,7 @@ mod tests {
         assert_eq!(schema.outputs.len(), 2);
         // Both are ModelPack anchor detection with anchors
         for out in &schema.outputs {
-            assert_eq!(out.type_, LogicalType::Detection);
+            assert_eq!(out.type_, Some(LogicalType::Detection));
             assert_eq!(out.decoder, Some(DecoderKind::ModelPack));
             assert_eq!(out.encoding, Some(BoxEncoding::Anchor));
             assert_eq!(out.anchors.as_ref().map(|a| a.len()), Some(3));
@@ -1637,7 +1665,7 @@ mod tests {
         }"#;
         let schema = SchemaV2::parse_json(j).unwrap();
         assert_eq!(schema.schema_version, 2);
-        assert_eq!(schema.outputs[0].type_, LogicalType::Boxes);
+        assert_eq!(schema.outputs[0].type_, Some(LogicalType::Boxes));
     }
 
     #[test]
@@ -1667,8 +1695,8 @@ mod tests {
         let schema = SchemaV2::parse_json(j).expect("v1 legacy parse");
         assert_eq!(schema.schema_version, 2); // converted
         assert_eq!(schema.outputs.len(), 2);
-        assert_eq!(schema.outputs[0].type_, LogicalType::Boxes);
-        assert_eq!(schema.outputs[1].type_, LogicalType::Scores);
+        assert_eq!(schema.outputs[0].type_, Some(LogicalType::Boxes));
+        assert_eq!(schema.outputs[1].type_, Some(LogicalType::Scores));
         // default score_format assumed on v1→v2
         assert_eq!(schema.outputs[1].score_format, Some(ScoreFormat::PerClass));
     }
@@ -1694,6 +1722,138 @@ mod tests {
         assert_eq!(q.scale, vec![0.01]);
         assert_eq!(q.zero_point, Some(vec![5]));
         assert_eq!(q.dtype, None); // v1 did not carry dtype
+    }
+
+    /// Outputs declared without a `type` field must parse successfully
+    /// and round-trip to JSON without introducing a synthetic type.
+    /// The metadata v2 spec lists `type` as required on both logical
+    /// and physical levels, but the HAL tolerates typeless logical
+    /// outputs as "additional" (auxiliary / diagnostic) tensors that
+    /// do not participate in decoder dispatch.
+    #[test]
+    fn typeless_logical_output_parses_and_roundtrips() {
+        let j = r#"{
+            "schema_version": 2,
+            "outputs": [
+                {
+                    "name": "extra_telemetry",
+                    "shape": [1, 16]
+                },
+                {
+                    "name": "boxes",
+                    "type": "boxes",
+                    "shape": [1, 4, 8400]
+                }
+            ]
+        }"#;
+        let schema: SchemaV2 = serde_json::from_str(j).unwrap();
+        assert_eq!(schema.outputs.len(), 2);
+        assert_eq!(schema.outputs[0].type_, None);
+        assert_eq!(
+            schema.outputs[0].name.as_deref(),
+            Some("extra_telemetry")
+        );
+        assert_eq!(schema.outputs[1].type_, Some(LogicalType::Boxes));
+
+        // Typeless output must not serialize a `type` field.
+        let round = serde_json::to_string(&schema).unwrap();
+        let first_obj = round
+            .split("\"outputs\":[")
+            .nth(1)
+            .and_then(|s| s.split("}").next())
+            .expect("outputs array");
+        assert!(
+            !first_obj.contains("\"type\""),
+            "typeless output must not serialize a `type` field, got: {first_obj}"
+        );
+    }
+
+    /// Typeless logical outputs are filtered out of the legacy
+    /// ConfigOutputs — they carry no decoder role and the legacy
+    /// builder can't represent them. A schema with typeless extras
+    /// plus a recognised `boxes` role must lower to a legacy config
+    /// containing only the `boxes` entry.
+    #[test]
+    fn typeless_outputs_filtered_from_legacy_config() {
+        let schema = SchemaV2 {
+            schema_version: 2,
+            input: None,
+            outputs: vec![
+                LogicalOutput {
+                    name: Some("diagnostic_histogram".into()),
+                    type_: None,
+                    shape: vec![1, 256],
+                    dshape: vec![],
+                    decoder: None,
+                    encoding: None,
+                    score_format: None,
+                    normalized: None,
+                    anchors: None,
+                    stride: None,
+                    dtype: None,
+                    quantization: None,
+                    outputs: vec![],
+                },
+                LogicalOutput {
+                    name: Some("boxes".into()),
+                    type_: Some(LogicalType::Boxes),
+                    shape: vec![1, 4, 8400],
+                    dshape: vec![],
+                    decoder: Some(DecoderKind::Ultralytics),
+                    encoding: Some(BoxEncoding::Direct),
+                    score_format: None,
+                    normalized: Some(true),
+                    anchors: None,
+                    stride: None,
+                    dtype: None,
+                    quantization: None,
+                    outputs: vec![],
+                },
+            ],
+            nms: None,
+            decoder_version: None,
+        };
+        let legacy = schema.to_legacy_config_outputs().unwrap();
+        assert_eq!(
+            legacy.outputs.len(),
+            1,
+            "typeless output must be filtered from legacy config"
+        );
+        assert!(
+            matches!(legacy.outputs[0], ConfigOutput::Boxes(_)),
+            "only the typed `boxes` output should survive lowering"
+        );
+    }
+
+    /// A schema that contains no typed outputs (all typeless) lowers
+    /// to an empty legacy config. The decoder builder then surfaces
+    /// its own "No outputs found in config" error — meaningful,
+    /// decoder-centric, not a serde-level "missing field type".
+    #[test]
+    fn all_typeless_schema_produces_empty_legacy_config() {
+        let schema = SchemaV2 {
+            schema_version: 2,
+            input: None,
+            outputs: vec![LogicalOutput {
+                name: Some("aux".into()),
+                type_: None,
+                shape: vec![1, 8],
+                dshape: vec![],
+                decoder: None,
+                encoding: None,
+                score_format: None,
+                normalized: None,
+                anchors: None,
+                stride: None,
+                dtype: None,
+                quantization: None,
+                outputs: vec![],
+            }],
+            nms: None,
+            decoder_version: None,
+        };
+        let legacy = schema.to_legacy_config_outputs().unwrap();
+        assert!(legacy.outputs.is_empty());
     }
 
     #[test]
@@ -1895,7 +2055,7 @@ mod tests {
         // Four logical outputs: boxes (split xy/wh), scores, mask_coefs, protos.
         assert_eq!(schema.outputs.len(), 4);
         let boxes = &schema.outputs[0];
-        assert_eq!(boxes.type_, LogicalType::Boxes);
+        assert_eq!(boxes.type_, Some(LogicalType::Boxes));
         assert_eq!(boxes.encoding, Some(BoxEncoding::Direct));
         assert_eq!(boxes.normalized, Some(true));
         assert_eq!(boxes.shape, vec![1, 4, 8400, 1]); // 4D with padding
@@ -1909,16 +2069,16 @@ mod tests {
         assert_eq!(q_xy.zero_point_at(0), -122);
 
         let scores = &schema.outputs[1];
-        assert_eq!(scores.type_, LogicalType::Scores);
+        assert_eq!(scores.type_, Some(LogicalType::Scores));
         assert_eq!(scores.score_format, Some(ScoreFormat::PerClass));
         assert_eq!(scores.shape, vec![1, 80, 8400, 1]);
 
         let mask_coefs = &schema.outputs[2];
-        assert_eq!(mask_coefs.type_, LogicalType::MaskCoefs);
+        assert_eq!(mask_coefs.type_, Some(LogicalType::MaskCoefs));
         assert_eq!(mask_coefs.shape, vec![1, 32, 8400, 1]);
 
         let protos = &schema.outputs[3];
-        assert_eq!(protos.type_, LogicalType::Protos);
+        assert_eq!(protos.type_, Some(LogicalType::Protos));
         assert_eq!(protos.shape, vec![1, 32, 160, 160]);
 
         // Schema-level validation passes.
