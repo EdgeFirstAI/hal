@@ -455,11 +455,11 @@ impl CPUProcessor {
     /// than the fused GPU `draw_proto_masks` on all tested platforms.
     ///
     /// Optimized path:
-    /// - `N >= BATCHED_GEMM_MIN_N`: one `(N, K) × (K, H*W)` GEMM via
+    /// - `N >= BATCHED_GEMM_MIN_N_PROTO`: one `(N, K) × (K, H*W)` GEMM via
     ///   `ndarray`'s `matrixmultiply` backend (SIMD-vectorised) shared across
     ///   all detections; per-detection tile assembly is rayon-parallel using
     ///   `MaskScratch` buffers pooled on `CPUProcessor`.
-    /// - `N < BATCHED_GEMM_MIN_N`: per-detection fused dequant+dot+sigmoid
+    /// - `N < BATCHED_GEMM_MIN_N_PROTO`: per-detection fused dequant+dot+sigmoid
     ///   (the original path) — avoids the 3.1MB dequant allocation when the
     ///   GEMM savings can't amortise it.
     pub fn materialize_segmentations(
@@ -1835,8 +1835,8 @@ mod scaled_tests {
     /// Both paths share the same kernel math, so any larger divergence
     /// means the batched GEMM or ROI-crop mapping is wrong.
     #[test]
-    fn batched_proto_matches_fused_reference_at_n_equals_5() {
-        // Use N=16+ so the batched-GEMM path (threshold 16) actually fires.
+    fn batched_proto_matches_fused_reference_at_n_equals_16() {
+        // N=16 == BATCHED_GEMM_MIN_N_PROTO, so the batched-GEMM path fires.
         let (detect, proto_data) = realistic_proto_data(16);
         debug_assert!(detect.len() >= BATCHED_GEMM_MIN_N_PROTO);
 
@@ -1872,10 +1872,11 @@ mod scaled_tests {
     /// `MaskResolution::Scaled` batched path must match the per-detection
     /// non-batched path within the binary-threshold tolerance.
     #[test]
-    fn batched_scaled_matches_unbatched_reference_at_n_equals_5() {
-        // Use N=16+ so the batched-GEMM path (threshold 16) actually fires.
+    fn batched_scaled_matches_unbatched_reference_at_n_equals_16() {
+        // N=16 > BATCHED_GEMM_MIN_N_SCALED (2), so the batched path fires.
+        // Kept at 16 so both scaled and proto regressions share one fixture.
         let (detect, proto_data) = realistic_proto_data(16);
-        debug_assert!(detect.len() >= BATCHED_GEMM_MIN_N_PROTO);
+        debug_assert!(detect.len() >= BATCHED_GEMM_MIN_N_SCALED);
 
         let mut cpu = make_cpu();
         let out_batched = cpu
