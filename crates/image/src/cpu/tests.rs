@@ -1757,7 +1757,7 @@ mod cpu_tests {
 
     #[test]
     fn test_materialize_empty_detections() {
-        let cpu = CPUProcessor::new();
+        let mut cpu = CPUProcessor::new();
         let proto_data = make_proto_data(8, 8, 4, vec![vec![1.0; 4]]);
         let result = cpu.materialize_segmentations(&[], &proto_data, None);
         assert!(result.is_ok());
@@ -1766,7 +1766,7 @@ mod cpu_tests {
 
     #[test]
     fn test_materialize_empty_proto_data() {
-        let cpu = CPUProcessor::new();
+        let mut cpu = CPUProcessor::new();
         let proto_data = make_proto_data(8, 8, 4, vec![]);
         let det = [make_detect_box(0.1, 0.1, 0.5, 0.5)];
         let result = cpu.materialize_segmentations(&det, &proto_data, None);
@@ -1776,7 +1776,7 @@ mod cpu_tests {
 
     #[test]
     fn test_materialize_single_detection() {
-        let cpu = CPUProcessor::new();
+        let mut cpu = CPUProcessor::new();
         let proto_data = make_proto_data(8, 8, 4, vec![vec![0.5; 4]]);
         let det = [make_detect_box(0.1, 0.1, 0.5, 0.5)];
         let result = cpu.materialize_segmentations(&det, &proto_data, None);
@@ -1791,7 +1791,7 @@ mod cpu_tests {
 
     #[test]
     fn test_materialize_bbox_edge_one() {
-        let cpu = CPUProcessor::new();
+        let mut cpu = CPUProcessor::new();
         let proto_data = make_proto_data(8, 8, 4, vec![vec![0.5; 4]]);
         let det = [make_detect_box(0.5, 0.5, 1.0, 1.0)];
         let result = cpu.materialize_segmentations(&det, &proto_data, None);
@@ -1805,7 +1805,7 @@ mod cpu_tests {
 
     #[test]
     fn test_materialize_bbox_negative_clamp() {
-        let cpu = CPUProcessor::new();
+        let mut cpu = CPUProcessor::new();
         let proto_data = make_proto_data(8, 8, 4, vec![vec![0.5; 4]]);
         let det = [make_detect_box(-0.5, -0.5, 0.5, 0.5)];
         let result = cpu.materialize_segmentations(&det, &proto_data, None);
@@ -1822,7 +1822,7 @@ mod cpu_tests {
 
     #[test]
     fn test_materialize_invalid_coeff_shape() {
-        let cpu = CPUProcessor::new();
+        let mut cpu = CPUProcessor::new();
         // Proto has 4 channels but coefficients have 6 elements — mismatch
         let proto_data = make_proto_data(8, 8, 4, vec![vec![0.5; 6]]);
         let det = [make_detect_box(0.1, 0.1, 0.5, 0.5)];
@@ -1840,7 +1840,7 @@ mod cpu_tests {
 
     #[test]
     fn test_materialize_multiple_detections() {
-        let cpu = CPUProcessor::new();
+        let mut cpu = CPUProcessor::new();
         let proto_data = make_proto_data(8, 8, 4, vec![vec![0.5; 4], vec![0.3; 4], vec![0.1; 4]]);
         let det = [
             make_detect_box(0.0, 0.0, 0.5, 0.5),
@@ -1854,7 +1854,7 @@ mod cpu_tests {
 
     #[test]
     fn test_materialize_zero_area_bbox() {
-        let cpu = CPUProcessor::new();
+        let mut cpu = CPUProcessor::new();
         let proto_data = make_proto_data(8, 8, 4, vec![vec![0.5; 4]]);
         // xmin == xmax → zero-width bbox
         let det = [make_detect_box(0.5, 0.1, 0.5, 0.5)];

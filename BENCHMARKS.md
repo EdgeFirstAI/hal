@@ -1,8 +1,8 @@
 # EdgeFirst HAL - Benchmarks
 
-**Version:** 3.0
-**Last Updated:** March 30, 2026
-**Status:** v0.15.0 release — added jetson-orin-nano platform; refreshed all benchmarks across 5 platforms; added materialize_masks API and hybrid path comparison; per-texture EGL binding optimization
+**Version:** 3.1
+**Last Updated:** April 23, 2026
+**Status:** `materialize_masks` batched-GEMM path: scaled 640×640 wins 1.7–45× at N=2–100, proto wins 1.0–2.7× at N≥32 across imx8mp-frdm, imx95-frdm, rpi5-hailo, x86-desktop
 
 ---
 
@@ -379,6 +379,72 @@ The hybrid path decodes masks on CPU (`materialize_segmentations`) then overlays
 | jetson-orin-nano | 440 us | 1.6 ms |
 | x86-desktop | 381 us | 903 us |
 
+### materialize_masks Batched-GEMM Optimisation
+
+`ImageProcessor::materialize_masks` previously ran a per-detection scalar
+kernel (per-pixel bilinear sample + K-wide dot + sigmoid). The validation
+workload — COCO-style with `max_det=100` at low score thresholds — degraded
+linearly with the detection count, dominating the HAL output stage.
+
+The new path:
+
+- **Single batched GEMM** at proto resolution: `coeffs (N, K) · protos.T (K, H·W)`
+  via `ndarray::linalg::general_mat_mul` (backed by `matrixmultiply` —
+  pure-Rust SIMD, no new deps). Runs once per frame regardless of N.
+- **Rayon-parallel per-detection finalisation**: each worker reads its row
+  of the logits buffer, applies `fast_sigmoid` (Proto resolution) or
+  `fast_sigmoid` + bilinear upsample (Scaled resolution), and emits the
+  final `Segmentation`.
+- **Pooled scratch**: `MaskScratch` on `CPUProcessor` reuses the
+  dequantised-protos and logits buffers across calls — validation loops
+  amortise allocations over all frames.
+- **Fused fallback** retained for small N where the batched up-front cost
+  outweighs the per-detection savings:
+  - `MaskResolution::Proto`: batched at `N >= 16`
+  - `MaskResolution::Scaled`: batched at `N >= 2`
+
+Measured A/B in `mask_benchmark` (`materialize_masks/{proto_res,scaled_640x640}`)
+with the env-gated `EDGEFIRST_LEGACY_MATERIALIZE=1` toggle.
+
+**MaskResolution::Proto (median, ms; legacy → batched):**
+
+| Platform | N=8 | N=16 | N=32 | N=64 | N=100 |
+|----------|-----|------|------|------|-------|
+| imx8mp-frdm  (4× A53)   | 5.9→5.9   (1.00×) | 11.7→13.2 (0.89×) | 23.3→17.7 (1.32×) | 46.6→27.4 (1.70×) | 72.7→38.8 (1.87×) |
+| imx95-frdm   (6× A55)   | 6.0→5.9   (1.02×) | 11.8→11.5 (1.03×) | 23.5→16.3 (1.44×) | 46.9→25.7 (1.83×) | 73.2→36.8 (1.99×) |
+| rpi5-hailo   (4× A76)   | 1.5→1.9   (0.79×) | 3.0→2.7   (1.11×) | 6.0→4.0   (1.50×) | 11.9→6.7  (1.78×) | 18.6→9.7  (1.92×) |
+| x86-desktop  (20-core)  | 0.56→0.59 (0.95×) | 1.1→1.1   (1.00×) | 2.3→1.9   (1.21×) | 4.5→1.8   (2.50×) | 7.0→2.6   (2.69×) |
+
+**MaskResolution::Scaled 640×640 (median, ms; legacy → batched):**
+
+| Platform | N=2 | N=8 | N=16 | N=32 | N=64 | N=100 |
+|----------|-----|-----|------|------|------|-------|
+| imx8mp-frdm  (4× A53)   | 29.8→18.0 (1.66×) | 115.5→22.1 (5.23×)  | 229.7→33.1 (6.94×)  | 458.0→55.8 (8.21×)  | 914.6→101.5 (9.01×)  | **1400→153** (**9.13×**)  |
+| imx95-frdm   (6× A55)   | 29.8→17.3 (1.72×) | 115.5→18.2 (6.35×)  | 229.7→27.9 (8.23×)  | 458.2→43.6 (10.51×) | 915.0→77.0  (11.88×) | **1400→114** (**12.28×**) |
+| rpi5-hailo   (4× A76)   | 9.7→3.8   (2.55×) | 37.6→5.2   (7.23×)  | 74.8→8.1   (9.23×)  | 149.2→14.7 (10.15×) | 298.0→27.3 (10.92×) | **466→42**   (**10.95×**) |
+| x86-desktop  (20-core)  | 9.6→3.5   (2.74×) | 37.2→2.2   (16.91×) | 74.0→2.5   (29.60×) | 147.9→4.0  (36.98×) | 295.0→6.9  (42.75×) | **461→10**   (**44.74×**) |
+
+**Notes:**
+
+- The Proto path gains less than the Scaled path because its per-detection
+  ROI kernel only touches `bbox_area × K` pixels — small at any N. The
+  batched path always pays a full-plane `H × W × K` dequant + GEMM, so it
+  only wins once aggregate ROI work exceeds that fixed cost.
+- The Scaled path gains massively because the legacy kernel did
+  `bbox_area × K × 4` ops per detection at output resolution (the ×4 from
+  bilinear). The batched path does the heavy K-wide dot at proto resolution
+  (160×160 = 25,600 vs 640×640 = 409,600 sample points → 16× fewer
+  dot-product ops) and reduces the per-detection work to a cheap
+  `bbox_area` bilinear upsample on the flat logit plane.
+- The Proto regression at N=8 on rpi5-hailo (0.79×) and N=16 on
+  imx8mp-frdm (0.89×) sit just above each platform's crossover. The
+  threshold of 16 is a conservative cross-platform compromise; A76 and x86
+  benefit from a lower threshold, A53 prefers a higher one. Tunable via
+  the `BATCHED_GEMM_MIN_N_PROTO` constant.
+- The Scaled path is a clear win on every tested platform from N=2
+  upward, scaling cleanly to ~9–45× at N=100 depending on cache hierarchy
+  and SIMD width.
+
 ---
 
 ## C API Preprocessing Benchmark (`bench_preproc`)
@@ -582,6 +648,7 @@ The binary requires a DMA-heap device (`/dev/dma_heap/linux,cma` or `/dev/dma_he
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 3.1 | 2026-04-23 | `materialize_masks` batched-GEMM path: single GEMM at proto resolution + rayon-parallel per-detection finalisation + pooled `MaskScratch` buffers. Scaled 640×640 wins 1.7–45× across N=2–100; Proto wins 1.0–2.7× at N≥32. Cross-platform A/B measured on imx8mp-frdm, imx95-frdm, rpi5-hailo, x86-desktop |
 | 3.0 | 2026-03-30 | v0.15.0 release: add jetson-orin-nano platform; refresh all benchmarks across 5 platforms; per-texture EGL binding optimization eliminates redundant EGLImageTargetTexture2DOES calls; add materialize_masks API with three-stage pipeline benchmarks; hybrid path 1.4–14.2× faster than fused GPU on all platforms |
 | 2.2 | 2026-03-27 | Add collection date stamps to all benchmark result sections; add image_benchmark to benchmark binary table; note pending YoloSegDet2Way benchmark data in decoder section; note pending mask rendering optimization updates |
 | 2.1 | 2026-03-23 | Add C API preprocessing benchmark (`bench_preproc`) results for i.MX 95-EVK (Mali), i.MX 8MP EVK-06 (Vivante), and x86 desktop (GTX 1080 PBO); add tensor reuse impact analysis (3.3× penalty on i.MX 95, 1.7× on i.MX 8MP, negligible on PBO); document buffer pool validation |
