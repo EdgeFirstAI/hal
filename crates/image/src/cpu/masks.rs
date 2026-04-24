@@ -471,6 +471,14 @@ impl CPUProcessor {
         if detect.is_empty() || proto_data.mask_coefficients.is_empty() {
             return Ok(Vec::new());
         }
+        if detect.len() != proto_data.mask_coefficients.len() {
+            return Err(crate::Error::InvalidShape(format!(
+                "materialize_segmentations: detect.len() ({}) must match \
+                 mask_coefficients.len() ({})",
+                detect.len(),
+                proto_data.mask_coefficients.len()
+            )));
+        }
         let min_n = if legacy_materialize_forced() {
             usize::MAX
         } else {
@@ -507,6 +515,14 @@ impl CPUProcessor {
 
         if detect.is_empty() || proto_data.mask_coefficients.is_empty() {
             return Ok(Vec::new());
+        }
+        if detect.len() != proto_data.mask_coefficients.len() {
+            return Err(crate::Error::InvalidShape(format!(
+                "materialize_scaled_segmentations: detect.len() ({}) must match \
+                 mask_coefficients.len() ({})",
+                detect.len(),
+                proto_data.mask_coefficients.len()
+            )));
         }
         if width == 0 || height == 0 {
             return Err(crate::Error::InvalidShape(

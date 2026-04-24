@@ -281,6 +281,15 @@ pub(crate) fn copy_packed_to_padded_dma(src: &Tensor<u8>, dst: &mut Tensor<u8>) 
     let width = dst.width().ok_or(Error::NotAnImage)?;
     let height = dst.height().ok_or(Error::NotAnImage)?;
     let fmt = dst.format().ok_or(Error::NotAnImage)?;
+    let src_width = src.width().ok_or(Error::NotAnImage)?;
+    let src_height = src.height().ok_or(Error::NotAnImage)?;
+    let src_fmt = src.format().ok_or(Error::NotAnImage)?;
+    if src_width != width || src_height != height || src_fmt != fmt {
+        return Err(Error::Internal(format!(
+            "copy_packed_to_padded_dma: src and dst image metadata must match \
+             (src: {src_width}x{src_height} {src_fmt:?}, dst: {width}x{height} {fmt:?})"
+        )));
+    }
     let bpp = primary_plane_bpp(fmt, 1).ok_or_else(|| {
         Error::NotSupported(format!(
             "copy_packed_to_padded_dma: unknown bpp for {fmt:?}"
