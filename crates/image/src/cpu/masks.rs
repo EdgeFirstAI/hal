@@ -190,7 +190,6 @@ fn dequant_i8_to_f32(src: &[i8], dst: &mut [f32], zp: f32, scale: f32) {
         // armv7 where NEON is optional). The SIMD path itself only uses
         // intrinsics that are in the base aarch64 NEON ISA.
         unsafe { dequant_i8_to_f32_neon(src, dst, zp, scale) };
-        return;
     }
 
     #[cfg(not(target_arch = "aarch64"))]
@@ -794,7 +793,6 @@ fn fill_scaled_tile(
                 tile,
             )
         };
-        return;
     }
 
     #[cfg(not(target_arch = "aarch64"))]

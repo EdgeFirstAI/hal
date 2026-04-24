@@ -3460,6 +3460,7 @@ mod image_tests {
     /// compiled without its JPEG feature). Used to exercise the decoder /
     /// pitch-padding paths for arbitrary dimensions without having to bundle
     /// a fixture file per test size.
+    #[cfg(target_os = "linux")]
     fn make_rgb_jpeg(width: u32, height: u32) -> Vec<u8> {
         let mut bytes = Vec::with_capacity((width * height * 3) as usize);
         for y in 0..height {
