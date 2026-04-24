@@ -581,8 +581,8 @@ fn proto_shape(protos: &edgefirst_decoder::ProtoTensor) -> (usize, usize, usize)
 }
 
 /// Small-N fused path: exactly the pre-batched implementation, retained for
-/// the `N < BATCHED_GEMM_MIN_N` case where the up-front dequant cost would
-/// dominate the per-detection work.
+/// the `N < BATCHED_GEMM_MIN_N_PROTO` case where the up-front dequant cost
+/// would dominate the per-detection work.
 fn materialize_segmentations_fused(
     detect: &[crate::DetectBox],
     proto_data: &crate::ProtoData,
@@ -1806,7 +1806,7 @@ mod scaled_tests {
     // ─── Batched-GEMM path regression tests ───────────────────────────────
 
     /// Build a `ProtoData` + detection list large enough to trigger the
-    /// batched GEMM path (`N >= BATCHED_GEMM_MIN_N`) with realistic 160×160
+    /// batched GEMM path (`N >= BATCHED_GEMM_MIN_N_PROTO`) with realistic 160×160
     /// proto dims and 32 channels. Deterministic via seeded LCG so output
     /// is reproducible across runs.
     fn realistic_proto_data(n: usize) -> (Vec<DetectBox>, ProtoData) {
@@ -1863,7 +1863,7 @@ mod scaled_tests {
             .unwrap();
 
         // Fused reference path via the small-N helper (bypasses the
-        // BATCHED_GEMM_MIN_N dispatch in the public method).
+        // BATCHED_GEMM_MIN_N_PROTO dispatch in the public method).
         let out_fused = materialize_segmentations_fused(&detect, &proto_data, None).unwrap();
 
         assert_eq!(out_batched.len(), out_fused.len());

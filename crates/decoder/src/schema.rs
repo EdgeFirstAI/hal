@@ -140,11 +140,7 @@ pub struct LogicalOutput {
     /// [`SchemaV2::to_legacy_config_outputs`] for how typeless outputs are
     /// filtered out of the legacy config, and the module docs for when to
     /// use this vs. a recognised [`LogicalType`] variant.
-    #[serde(
-        rename = "type",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
     pub type_: Option<LogicalType>,
 
     /// Reconstructed logical shape (what the fallback dequant+merge path
@@ -233,11 +229,7 @@ pub struct PhysicalOutput {
     /// during merging, but is not used to disambiguate against typed
     /// siblings. Useful when a converter emits extra per-scale tensors
     /// the HAL has no semantic for but the user manages downstream.
-    #[serde(
-        rename = "type",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
     pub type_: Option<PhysicalType>,
 
     /// Physical tensor shape.
@@ -1765,10 +1757,7 @@ mod tests {
         let schema: SchemaV2 = serde_json::from_str(j).unwrap();
         assert_eq!(schema.outputs.len(), 2);
         assert_eq!(schema.outputs[0].type_, None);
-        assert_eq!(
-            schema.outputs[0].name.as_deref(),
-            Some("extra_telemetry")
-        );
+        assert_eq!(schema.outputs[0].name.as_deref(), Some("extra_telemetry"));
         assert_eq!(schema.outputs[1].type_, Some(LogicalType::Boxes));
 
         // Typeless output must not serialize a `type` field.
