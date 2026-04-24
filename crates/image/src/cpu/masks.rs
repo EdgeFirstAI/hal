@@ -63,12 +63,20 @@ impl MaskScratch {
         // still copy to guarantee a contiguous (H*W, K) layout regardless of
         // the source tensor's stride (ndarray protos may arrive with a
         // non-standard layout from the decoder's tensor_bridge).
-        self.dequant.clear();
-        self.dequant.resize(hw * num_protos, 0.0);
+        //
+        // Only grow the buffer when needed — the dequant and GEMM loops
+        // below overwrite every element in `0..required`, so we can reuse
+        // whatever stale data is past `0..required` from previous calls
+        // and skip the per-frame memset that otherwise costs ~0.5% on
+        // i.MX 95 validation runs.
+        let dequant_required = hw * num_protos;
+        if self.dequant.len() < dequant_required {
+            self.dequant.resize(dequant_required, 0.0);
+        }
         match protos {
             ProtoTensor::Float(arr) => {
                 let src = arr.view();
-                let dst = &mut self.dequant;
+                let dst = &mut self.dequant[..dequant_required];
                 // (H, W, K) → (H*W, K) row-major
                 for y in 0..proto_h {
                     for x in 0..proto_w {
@@ -86,7 +94,7 @@ impl MaskScratch {
                 let scale = quantization.scale;
                 let zp = quantization.zero_point as f32;
                 let src = protos.view();
-                let dst = &mut self.dequant;
+                let dst = &mut self.dequant[..dequant_required];
                 for y in 0..proto_h {
                     for x in 0..proto_w {
                         let row = (y * proto_w + x) * num_protos;
@@ -100,14 +108,20 @@ impl MaskScratch {
 
         // GEMM: logits (N, HW) = coeffs (N, K) · dequant.T (K, HW)
         // We build views over the scratch buffers — no extra allocation.
-        self.logits.clear();
-        self.logits.resize(n * hw, 0.0);
+        // Same grow-only discipline: GEMM with beta=0.0 writes every
+        // element in `0..logits_required`; anything past that is stale
+        // but ignored by `logits()`.
+        let logits_required = n * hw;
+        if self.logits.len() < logits_required {
+            self.logits.resize(logits_required, 0.0);
+        }
         let a = ndarray::ArrayView2::from_shape((n, num_protos), &self.coeffs)
             .expect("coeffs buffer matches (N, K)");
-        let b = ndarray::ArrayView2::from_shape((hw, num_protos), &self.dequant)
+        let b = ndarray::ArrayView2::from_shape((hw, num_protos), &self.dequant[..dequant_required])
             .expect("dequant buffer matches (HW, K)");
-        let mut c = ndarray::ArrayViewMut2::from_shape((n, hw), &mut self.logits)
-            .expect("logits buffer matches (N, HW)");
+        let mut c =
+            ndarray::ArrayViewMut2::from_shape((n, hw), &mut self.logits[..logits_required])
+                .expect("logits buffer matches (N, HW)");
         // `b.t()` is a view — no copy — giving us (K, HW).
         general_mat_mul(1.0, &a, &b.t(), 0.0, &mut c);
 
@@ -115,8 +129,12 @@ impl MaskScratch {
     }
 
     /// Read-only view of the last computed logits as `(N, H*W)`.
+    ///
+    /// The buffer may be larger than `n * hw` because we grow the Vec
+    /// only when required and leave stale trailing data to avoid a
+    /// per-frame memset — callers only read the first `n * hw` entries.
     fn logits(&self, n: usize, hw: usize) -> &[f32] {
-        debug_assert_eq!(self.logits.len(), n * hw);
+        debug_assert!(self.logits.len() >= n * hw);
         &self.logits[..n * hw]
     }
 }
@@ -648,8 +666,11 @@ fn scaled_segmentations_batched(
                     let model_x_norm = lx0 + (px + 0.5) / out_w as f32 * lw;
                     let sample_x = model_x_norm * proto_w as f32 - 0.5;
                     let acc = bilinear_sample_plane(row, sample_x, sample_y, proto_w, proto_h);
-                    let sigmoid = fast_sigmoid(acc);
-                    tile[[yi, xi, 0]] = if sigmoid > 0.5 { 255 } else { 0 };
+                    // Scaled masks threshold at sigmoid > 0.5, which is
+                    // monotonically equivalent to `acc > 0` — skip the
+                    // fast_sigmoid call entirely (was ~15-20% of total
+                    // runtime on i.MX 95 from the fdiv in 1/(1+exp(-x))).
+                    tile[[yi, xi, 0]] = if acc > 0.0 { 255 } else { 0 };
                 }
             }
 
@@ -825,8 +846,8 @@ fn scaled_segmentations_float(
                     let acc = bilinear_dot(
                         protos, coeff, num_protos, sample_x, sample_y, proto_w, proto_h,
                     );
-                    let sigmoid = fast_sigmoid(acc);
-                    tile[[yi, xi, 0]] = if sigmoid > 0.5 { 255 } else { 0 };
+                    // sigmoid(x) > 0.5  ⟺  x > 0 (sigmoid is monotonic).
+                    tile[[yi, xi, 0]] = if acc > 0.0 { 255 } else { 0 };
                 }
             }
 
@@ -874,7 +895,9 @@ fn scaled_segmentations_quant_i8(
 
     let out_w = width as usize;
     let out_h = height as usize;
-    let scale = quant.scale;
+    // `scale` is no longer needed: the scaled-mask threshold collapses to
+    // `acc > 0` regardless of the positive scale factor (see below).
+    let _ = quant.scale;
     let zp = quant.zero_point as f32;
 
     detect
@@ -914,8 +937,9 @@ fn scaled_segmentations_quant_i8(
                     let acc = bilinear_dot_quant_i8(
                         protos, coeff, num_protos, sample_x, sample_y, proto_w, proto_h, zp,
                     );
-                    let sigmoid = fast_sigmoid(scale * acc);
-                    tile[[yi, xi, 0]] = if sigmoid > 0.5 { 255 } else { 0 };
+                    // sigmoid(scale * acc) > 0.5  ⟺  scale * acc > 0  ⟺  acc > 0
+                    // (quantization scale is always positive).
+                    tile[[yi, xi, 0]] = if acc > 0.0 { 255 } else { 0 };
                 }
             }
 
