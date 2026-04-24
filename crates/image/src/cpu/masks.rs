@@ -73,16 +73,22 @@ impl MaskScratch {
         if self.dequant.len() < dequant_required {
             self.dequant.resize(dequant_required, 0.0);
         }
+        let dst = &mut self.dequant[..dequant_required];
         match protos {
             ProtoTensor::Float(arr) => {
-                let src = arr.view();
-                let dst = &mut self.dequant[..dequant_required];
-                // (H, W, K) → (H*W, K) row-major
-                for y in 0..proto_h {
-                    for x in 0..proto_w {
-                        let row = (y * proto_w + x) * num_protos;
-                        for k in 0..num_protos {
-                            dst[row + k] = src[[y, x, k]];
+                // Fast path: standard-layout (H, W, K) with K innermost is
+                // already contiguous row-major and matches our dst layout
+                // byte-for-byte — avoid the per-element indexing overhead.
+                if let Some(src_slice) = arr.as_slice() {
+                    dst.copy_from_slice(src_slice);
+                } else {
+                    let src = arr.view();
+                    for y in 0..proto_h {
+                        for x in 0..proto_w {
+                            let row = (y * proto_w + x) * num_protos;
+                            for k in 0..num_protos {
+                                dst[row + k] = src[[y, x, k]];
+                            }
                         }
                     }
                 }
@@ -93,13 +99,16 @@ impl MaskScratch {
             } => {
                 let scale = quantization.scale;
                 let zp = quantization.zero_point as f32;
-                let src = protos.view();
-                let dst = &mut self.dequant[..dequant_required];
-                for y in 0..proto_h {
-                    for x in 0..proto_w {
-                        let row = (y * proto_w + x) * num_protos;
-                        for k in 0..num_protos {
-                            dst[row + k] = (src[[y, x, k]] as f32 - zp) * scale;
+                if let Some(src_slice) = protos.as_slice() {
+                    dequant_i8_to_f32(src_slice, dst, zp, scale);
+                } else {
+                    let src = protos.view();
+                    for y in 0..proto_h {
+                        for x in 0..proto_w {
+                            let row = (y * proto_w + x) * num_protos;
+                            for k in 0..num_protos {
+                                dst[row + k] = (src[[y, x, k]] as f32 - zp) * scale;
+                            }
                         }
                     }
                 }
@@ -161,6 +170,77 @@ const BATCHED_GEMM_MIN_N_SCALED: usize = 2;
 /// profiling only — production callers should never set it.
 fn legacy_materialize_forced() -> bool {
     std::env::var_os("EDGEFIRST_LEGACY_MATERIALIZE").is_some()
+}
+
+/// Dequantise a contiguous i8 slice into a contiguous f32 slice of the same
+/// length: `dst[i] = (src[i] as f32 - zp) * scale`.
+///
+/// On aarch64 this dispatches to the NEON path below (16 elements per
+/// iteration via a cascade of `sxtl`, `scvtf`, `fsub`, `fmul`); on other
+/// architectures the compiler typically auto-vectorises the scalar
+/// fallback well enough that this function is not the bottleneck.
+#[inline]
+fn dequant_i8_to_f32(src: &[i8], dst: &mut [f32], zp: f32, scale: f32) {
+    debug_assert_eq!(src.len(), dst.len());
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Safe: target_arch=aarch64 guarantees NEON is available (unlike
+        // armv7 where NEON is optional). The SIMD path itself only uses
+        // intrinsics that are in the base aarch64 NEON ISA.
+        unsafe { dequant_i8_to_f32_neon(src, dst, zp, scale) };
+        return;
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        for (s, d) in src.iter().zip(dst.iter_mut()) {
+            *d = (*s as f32 - zp) * scale;
+        }
+    }
+}
+
+/// NEON cascade: 16 i8 → 16 f32 per iteration.
+///
+///   sxtl   i8 → i16   (16→8 halves × 2)
+///   sxtl   i16 → i32  (8→4 quarters × 4)
+///   scvtf  i32 → f32  (× 4)
+///   fsub   -= zp
+///   fmul   *= scale
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dequant_i8_to_f32_neon(src: &[i8], dst: &mut [f32], zp: f32, scale: f32) {
+    use core::arch::aarch64::*;
+
+    let zp_v = vdupq_n_f32(zp);
+    let scale_v = vdupq_n_f32(scale);
+
+    let n = src.len();
+    let chunks = n / 16;
+    let mut i = 0;
+    for _ in 0..chunks {
+        let v_i8 = vld1q_s8(src.as_ptr().add(i));
+        let v_i16_lo = vmovl_s8(vget_low_s8(v_i8));
+        let v_i16_hi = vmovl_s8(vget_high_s8(v_i8));
+        let v_i32_0 = vmovl_s16(vget_low_s16(v_i16_lo));
+        let v_i32_1 = vmovl_s16(vget_high_s16(v_i16_lo));
+        let v_i32_2 = vmovl_s16(vget_low_s16(v_i16_hi));
+        let v_i32_3 = vmovl_s16(vget_high_s16(v_i16_hi));
+        let v_f0 = vmulq_f32(vsubq_f32(vcvtq_f32_s32(v_i32_0), zp_v), scale_v);
+        let v_f1 = vmulq_f32(vsubq_f32(vcvtq_f32_s32(v_i32_1), zp_v), scale_v);
+        let v_f2 = vmulq_f32(vsubq_f32(vcvtq_f32_s32(v_i32_2), zp_v), scale_v);
+        let v_f3 = vmulq_f32(vsubq_f32(vcvtq_f32_s32(v_i32_3), zp_v), scale_v);
+        vst1q_f32(dst.as_mut_ptr().add(i), v_f0);
+        vst1q_f32(dst.as_mut_ptr().add(i + 4), v_f1);
+        vst1q_f32(dst.as_mut_ptr().add(i + 8), v_f2);
+        vst1q_f32(dst.as_mut_ptr().add(i + 12), v_f3);
+        i += 16;
+    }
+    // Scalar tail for n % 16 remainder.
+    while i < n {
+        *dst.get_unchecked_mut(i) = (*src.get_unchecked(i) as f32 - zp) * scale;
+        i += 1;
+    }
 }
 
 impl CPUProcessor {
@@ -655,24 +735,24 @@ fn scaled_segmentations_batched(
             let row = &logits[i * hw..(i + 1) * hw];
 
             // Bilinear sample the logit plane at output resolution, then
-            // sigmoid + threshold. Output pixel → model-input normalized →
-            // proto-plane texel (same math as `scaled_segmentations_float`).
-            for yi in 0..bbox_h {
-                let py = (py0 + yi) as f32;
-                let model_y_norm = ly0 + (py + 0.5) / out_h as f32 * lh;
-                let sample_y = model_y_norm * proto_h as f32 - 0.5;
-                for xi in 0..bbox_w {
-                    let px = (px0 + xi) as f32;
-                    let model_x_norm = lx0 + (px + 0.5) / out_w as f32 * lw;
-                    let sample_x = model_x_norm * proto_w as f32 - 0.5;
-                    let acc = bilinear_sample_plane(row, sample_x, sample_y, proto_w, proto_h);
-                    // Scaled masks threshold at sigmoid > 0.5, which is
-                    // monotonically equivalent to `acc > 0` — skip the
-                    // fast_sigmoid call entirely (was ~15-20% of total
-                    // runtime on i.MX 95 from the fdiv in 1/(1+exp(-x))).
-                    tile[[yi, xi, 0]] = if acc > 0.0 { 255 } else { 0 };
-                }
-            }
+            // threshold at `acc > 0`. Dispatches to a NEON-vectorised
+            // inner kernel on aarch64; scalar fallback elsewhere.
+            fill_scaled_tile(
+                row,
+                proto_w,
+                proto_h,
+                px0,
+                py0,
+                bbox_w,
+                bbox_h,
+                out_w,
+                out_h,
+                lx0,
+                lw,
+                ly0,
+                lh,
+                tile.as_slice_mut().expect("Array3<u8>::zeros is contiguous"),
+            );
 
             Ok(edgefirst_decoder::Segmentation {
                 xmin,
@@ -683,6 +763,237 @@ fn scaled_segmentations_batched(
             })
         })
         .collect::<crate::Result<Vec<_>>>()
+}
+
+/// Fill a `bbox_h × bbox_w` u8 tile by bilinear-sampling a flat logit plane
+/// and thresholding at `acc > 0` (scaled-mask convention).
+///
+/// `tile` is a contiguous `bbox_h * bbox_w` slice in row-major order.
+#[allow(clippy::too_many_arguments)]
+fn fill_scaled_tile(
+    plane: &[f32],
+    proto_w: usize,
+    proto_h: usize,
+    px0: usize,
+    py0: usize,
+    bbox_w: usize,
+    bbox_h: usize,
+    out_w: usize,
+    out_h: usize,
+    lx0: f32,
+    lw: f32,
+    ly0: f32,
+    lh: f32,
+    tile: &mut [u8],
+) {
+    debug_assert_eq!(tile.len(), bbox_h * bbox_w);
+    debug_assert_eq!(plane.len(), proto_h * proto_w);
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe {
+            fill_scaled_tile_neon(
+                plane, proto_w, proto_h, px0, py0, bbox_w, bbox_h, out_w, out_h, lx0, lw, ly0,
+                lh, tile,
+            )
+        };
+        return;
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let proto_wf = proto_w as f32;
+        let proto_hf = proto_h as f32;
+        let out_wf = out_w as f32;
+        let out_hf = out_h as f32;
+        for yi in 0..bbox_h {
+            let py = (py0 + yi) as f32;
+            let model_y_norm = ly0 + (py + 0.5) / out_hf * lh;
+            let sample_y = model_y_norm * proto_hf - 0.5;
+            for xi in 0..bbox_w {
+                let px = (px0 + xi) as f32;
+                let model_x_norm = lx0 + (px + 0.5) / out_wf * lw;
+                let sample_x = model_x_norm * proto_wf - 0.5;
+                let acc = bilinear_sample_plane(plane, sample_x, sample_y, proto_w, proto_h);
+                tile[yi * bbox_w + xi] = if acc > 0.0 { 255 } else { 0 };
+            }
+        }
+    }
+}
+
+/// NEON-vectorised `fill_scaled_tile`.
+///
+/// Strategy: process 4 output pixels per iteration along the `xi` axis.
+/// The `y`-related state (sample_y, y0, y1, fy) is scalar — shared across
+/// all 4 xi in a row. The 4-wide inner loop vectorises the px→sample_x
+/// chain, bilinear-weight computation, corner fetch (via 4× scalar loads
+/// assembled into a NEON register), bilinear accumulation, and the
+/// `acc > 0 → {0, 255}` compare-and-pack.
+///
+/// Gather is the single non-vectorisable op: pre-SVE NEON has no native
+/// gather, so each of the 4 corners (v00, v10, v01, v11) costs 4 scalar
+/// loads that the CPU issues into the load pipe. Still a net win because
+/// the arithmetic (roughly 2/3 of the original scalar work) goes 4-wide.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fill_scaled_tile_neon(
+    plane: &[f32],
+    proto_w: usize,
+    proto_h: usize,
+    px0: usize,
+    py0: usize,
+    bbox_w: usize,
+    bbox_h: usize,
+    out_w: usize,
+    out_h: usize,
+    lx0: f32,
+    lw: f32,
+    ly0: f32,
+    lh: f32,
+    tile: &mut [u8],
+) {
+    use core::arch::aarch64::*;
+
+    // Precompute scalar constants reused across the whole tile.
+    let proto_wf = proto_w as f32;
+    let proto_hf = proto_h as f32;
+    let inv_out_w = 1.0_f32 / out_w as f32;
+    let inv_out_h = 1.0_f32 / out_h as f32;
+    let proto_w_max_i32 = (proto_w as i32) - 1;
+    let proto_h_max_i32 = (proto_h as i32) - 1;
+
+    // x-offset lane pattern for the 4-wide SIMD sweep: xi + [0, 1, 2, 3]
+    let lane_offsets = [0.0_f32, 1.0, 2.0, 3.0];
+    let v_lane_offsets = vld1q_f32(lane_offsets.as_ptr());
+
+    // Broadcast constants.
+    let v_lx0 = vdupq_n_f32(lx0);
+    let v_lw_over_outw = vdupq_n_f32(lw * inv_out_w);
+    let v_proto_wf = vdupq_n_f32(proto_wf);
+    let v_half = vdupq_n_f32(0.5);
+    let v_neg_half = vdupq_n_f32(-0.5);
+    let v_one = vdupq_n_f32(1.0);
+    let v_zero = vdupq_n_f32(0.0);
+    let v_proto_w_max = vdupq_n_s32(proto_w_max_i32);
+    let v_zero_i32 = vdupq_n_s32(0);
+    let v_mask_byte = vdupq_n_u32(0xFF);
+
+    let plane_ptr = plane.as_ptr();
+
+    for yi in 0..bbox_h {
+        // Scalar y state shared across all xi in this row.
+        let py = (py0 + yi) as f32;
+        let model_y_norm = ly0 + (py + 0.5) * inv_out_h * lh;
+        let sample_y = model_y_norm * proto_hf - 0.5;
+        let y0_i32 = sample_y.floor() as i32;
+        let y0 = y0_i32.clamp(0, proto_h_max_i32) as usize;
+        let y1 = (y0 + 1).min(proto_h.saturating_sub(1));
+        let fy = sample_y - sample_y.floor();
+        let one_minus_fy = 1.0 - fy;
+        let v_fy = vdupq_n_f32(fy);
+        let v_one_minus_fy = vdupq_n_f32(one_minus_fy);
+        let y0_row = y0 * proto_w;
+        let y1_row = y1 * proto_w;
+        let tile_row_off = yi * bbox_w;
+
+        let mut xi = 0;
+        // Main SIMD loop: 4 output pixels per iteration.
+        while xi + 4 <= bbox_w {
+            // px = px0 + xi + [0, 1, 2, 3]
+            let v_xi_base = vdupq_n_f32((px0 + xi) as f32);
+            let v_px = vaddq_f32(v_xi_base, v_lane_offsets);
+            // model_x = lx0 + (px + 0.5) * (lw / out_w)
+            let v_model_x = vfmaq_f32(v_lx0, vaddq_f32(v_px, v_half), v_lw_over_outw);
+            // sample_x = model_x * proto_w - 0.5
+            let v_sample_x = vfmaq_f32(v_neg_half, v_model_x, v_proto_wf);
+            // floor(sample_x) → int32, clamp to [0, proto_w-1]; also keep float floor for fx
+            let v_floor = vrndmq_f32(v_sample_x); // round toward -inf
+            let v_fx = vsubq_f32(v_sample_x, v_floor);
+            let v_x0_raw = vcvtq_s32_f32(v_floor);
+            let v_x0 = vminq_s32(vmaxq_s32(v_x0_raw, v_zero_i32), v_proto_w_max);
+            let v_x1 = vminq_s32(vaddq_s32(v_x0, vdupq_n_s32(1)), v_proto_w_max);
+            // Weights: w00 = (1-fx)(1-fy), w10 = fx(1-fy), w01 = (1-fx)fy, w11 = fx*fy
+            let v_one_minus_fx = vsubq_f32(v_one, v_fx);
+            let v_w00 = vmulq_f32(v_one_minus_fx, v_one_minus_fy);
+            let v_w10 = vmulq_f32(v_fx, v_one_minus_fy);
+            let v_w01 = vmulq_f32(v_one_minus_fx, v_fy);
+            let v_w11 = vmulq_f32(v_fx, v_fy);
+
+            // Extract the 4 x0 / x1 indices as usize for the gather.
+            // Using vgetq_lane_s32 keeps the values in GP regs for the
+            // address math below.
+            let x0_0 = vgetq_lane_s32(v_x0, 0) as usize;
+            let x0_1 = vgetq_lane_s32(v_x0, 1) as usize;
+            let x0_2 = vgetq_lane_s32(v_x0, 2) as usize;
+            let x0_3 = vgetq_lane_s32(v_x0, 3) as usize;
+            let x1_0 = vgetq_lane_s32(v_x1, 0) as usize;
+            let x1_1 = vgetq_lane_s32(v_x1, 1) as usize;
+            let x1_2 = vgetq_lane_s32(v_x1, 2) as usize;
+            let x1_3 = vgetq_lane_s32(v_x1, 3) as usize;
+
+            // Gather the 4 corners — no native NEON gather; scalar loads
+            // land in regular f32 regs then get packed into a NEON vector.
+            let v00_arr = [
+                *plane_ptr.add(y0_row + x0_0),
+                *plane_ptr.add(y0_row + x0_1),
+                *plane_ptr.add(y0_row + x0_2),
+                *plane_ptr.add(y0_row + x0_3),
+            ];
+            let v10_arr = [
+                *plane_ptr.add(y0_row + x1_0),
+                *plane_ptr.add(y0_row + x1_1),
+                *plane_ptr.add(y0_row + x1_2),
+                *plane_ptr.add(y0_row + x1_3),
+            ];
+            let v01_arr = [
+                *plane_ptr.add(y1_row + x0_0),
+                *plane_ptr.add(y1_row + x0_1),
+                *plane_ptr.add(y1_row + x0_2),
+                *plane_ptr.add(y1_row + x0_3),
+            ];
+            let v11_arr = [
+                *plane_ptr.add(y1_row + x1_0),
+                *plane_ptr.add(y1_row + x1_1),
+                *plane_ptr.add(y1_row + x1_2),
+                *plane_ptr.add(y1_row + x1_3),
+            ];
+            let v_v00 = vld1q_f32(v00_arr.as_ptr());
+            let v_v10 = vld1q_f32(v10_arr.as_ptr());
+            let v_v01 = vld1q_f32(v01_arr.as_ptr());
+            let v_v11 = vld1q_f32(v11_arr.as_ptr());
+
+            // acc = w00*v00 + w10*v10 + w01*v01 + w11*v11 (FMA chain)
+            let mut v_acc = vmulq_f32(v_w00, v_v00);
+            v_acc = vfmaq_f32(v_acc, v_w10, v_v10);
+            v_acc = vfmaq_f32(v_acc, v_w01, v_v01);
+            v_acc = vfmaq_f32(v_acc, v_w11, v_v11);
+
+            // Threshold: (acc > 0) → 0xFFFFFFFF, else 0; mask with 0xFF, pack.
+            let v_gt = vcgtq_f32(v_acc, v_zero); // u32x4 of 0 or -1
+            let v_bytes_u32 = vandq_u32(v_gt, v_mask_byte);
+            // Narrow u32x4 → u16x4, zero-combine → u16x8, narrow → u8x8, keep low 4 bytes.
+            let v_u16 = vqmovn_u32(v_bytes_u32);
+            let v_u8 = vqmovn_u16(vcombine_u16(v_u16, vdup_n_u16(0)));
+            // Store the low 4 lanes as one 32-bit write.
+            let out = vget_lane_u32::<0>(vreinterpret_u32_u8(v_u8));
+            core::ptr::write_unaligned(
+                tile.as_mut_ptr().add(tile_row_off + xi) as *mut u32,
+                out,
+            );
+            xi += 4;
+        }
+
+        // Scalar tail for bbox_w % 4.
+        while xi < bbox_w {
+            let px = (px0 + xi) as f32;
+            let model_x_norm = lx0 + (px + 0.5) * inv_out_w * lw;
+            let sample_x = model_x_norm * proto_wf - 0.5;
+            let acc = bilinear_sample_plane(plane, sample_x, sample_y, proto_w, proto_h);
+            *tile.get_unchecked_mut(tile_row_off + xi) = if acc > 0.0 { 255 } else { 0 };
+            xi += 1;
+        }
+    }
 }
 
 /// Inverse letterbox factors for mapping from model-input normalized
