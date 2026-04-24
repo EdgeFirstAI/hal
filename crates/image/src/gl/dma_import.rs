@@ -85,7 +85,27 @@ impl DmaImportAttrs {
                 }
             }
         } else {
-            if !src_w.is_multiple_of(4) {
+            // For 3-bpp (Rgb) and 1-bpp (Grey) packed formats the natural
+            // row pitch is `width * bpp`, which is only 4-byte aligned
+            // when `width % 4 == 0`. EGL DMA-BUF import via
+            // `eglCreateImage` requires word-aligned row reads on every
+            // tested platform (Mali G310, Vivante GC7000UL, V3D, Tegra),
+            // so we keep the blanket width%4 check for those.
+            //
+            // 4-bpp packed formats (Rgba, Bgra) have a row pitch of
+            // `width * 4` which is trivially 4-byte aligned at any width.
+            // The DRM fourcc spec (ABGR8888 / ARGB8888) imposes no
+            // pixel-alignment requirement on top of pitch alignment, and
+            // these drivers accept arbitrary widths as long as the
+            // 64-byte pitch padding (handled by `padded_dma_pitch_for`)
+            // is applied. Letting these through unlocks the zero-copy
+            // EGL path for dataset-loader widths like 375 / 427 / 443 —
+            // empirically verified on imx8mp-frdm, imx95-frdm,
+            // rpi5-hailo, and orin-nano. If a driver fails the import,
+            // `egl_create_image_with_fallback` downgrades to the CPU
+            // texture upload path with a one-shot slow-path warning.
+            let needs_width_mod_4 = !matches!(src_fmt, PixelFormat::Rgba | PixelFormat::Bgra);
+            if needs_width_mod_4 && !src_w.is_multiple_of(4) {
                 return Err(Error::NotSupported(format!(
                     "EGLImage requires width divisible by 4 for {src_fmt}, got {src_w}"
                 )));
@@ -839,5 +859,118 @@ mod tests {
             stride * height,
             width * height,
         );
+    }
+
+    // ─── Width-alignment pre-check (from_tensor) regression tests ───────
+
+    /// RGBA at a non-4-aligned width (e.g. 375, 427, 443) must pass the
+    /// `DmaImportAttrs::from_tensor` pre-check — RGBA's natural pitch is
+    /// `width × 4` which is always 4-byte aligned at any width, and the
+    /// DRM fourcc ABGR8888 spec imposes no pixel-alignment requirement.
+    ///
+    /// This unlocks the zero-copy EGL path for dataset-loader widths that
+    /// previously fell back to CPU texture upload.
+    #[cfg(feature = "dma_test_formats")]
+    #[test]
+    fn test_from_tensor_accepts_non_4_aligned_rgba() {
+        if !is_dma_available() {
+            eprintln!("SKIPPED: test_from_tensor_accepts_non_4_aligned_rgba — DMA not available");
+            return;
+        }
+        use crate::{align_pitch_bytes_to_gpu_alignment, primary_plane_bpp};
+        for &w in &[375usize, 427, 443] {
+            let bpp = primary_plane_bpp(PixelFormat::Rgba, 1).unwrap();
+            let aligned = align_pitch_bytes_to_gpu_alignment(w * bpp).unwrap();
+            let t = match Tensor::<u8>::image_with_stride(
+                w,
+                64,
+                PixelFormat::Rgba,
+                aligned,
+                Some(edgefirst_tensor::TensorMemory::Dma),
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("SKIPPED: image_with_stride failed at width {w}: {e}");
+                    return;
+                }
+            };
+            let attrs = DmaImportAttrs::from_tensor(&t, PixelFormat::Rgba).unwrap_or_else(|e| {
+                panic!(
+                    "RGBA width {w} must pass the pre-check; got {e}. \
+                     Width%4 is not required for 4-bpp packed formats."
+                )
+            });
+            assert_eq!(attrs.width, w);
+            assert_eq!(attrs.plane0_pitch, aligned);
+        }
+    }
+
+    /// BGRA must also accept non-4-aligned widths (same reasoning as RGBA —
+    /// 4-bpp packed, pitch always 4-byte aligned).
+    #[cfg(feature = "dma_test_formats")]
+    #[test]
+    fn test_from_tensor_accepts_non_4_aligned_bgra() {
+        if !is_dma_available() {
+            eprintln!("SKIPPED: test_from_tensor_accepts_non_4_aligned_bgra — DMA not available");
+            return;
+        }
+        use crate::{align_pitch_bytes_to_gpu_alignment, primary_plane_bpp};
+        let bpp = primary_plane_bpp(PixelFormat::Bgra, 1).unwrap();
+        let aligned = align_pitch_bytes_to_gpu_alignment(375 * bpp).unwrap();
+        let t = match Tensor::<u8>::image_with_stride(
+            375,
+            64,
+            PixelFormat::Bgra,
+            aligned,
+            Some(edgefirst_tensor::TensorMemory::Dma),
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("SKIPPED: image_with_stride failed: {e}");
+                return;
+            }
+        };
+        DmaImportAttrs::from_tensor(&t, PixelFormat::Bgra)
+            .expect("BGRA width 375 must pass the pre-check");
+    }
+
+    /// 3-bpp (Rgb) still requires width%4 — its natural pitch is
+    /// `width × 3`, which is 4-byte aligned only when `width % 4 == 0`.
+    #[test]
+    fn test_from_tensor_rejects_non_4_aligned_rgb() {
+        // We need a tensor with width=375 to hit the pre-check. Mem-backed
+        // works for this — from_tensor only reads width/height/memory
+        // metadata and the pre-check fires before the DMA fd lookup.
+        let t = Tensor::<u8>::image(
+            375,
+            64,
+            PixelFormat::Rgb,
+            Some(edgefirst_tensor::TensorMemory::Mem),
+        )
+        .unwrap();
+        let err = DmaImportAttrs::from_tensor(&t, PixelFormat::Rgb)
+            .expect_err("RGB width 375 must still be rejected");
+        match err {
+            crate::Error::NotSupported(msg) => {
+                assert!(msg.contains("divisible by 4"), "got: {msg}");
+            }
+            other => panic!("expected NotSupported, got {other:?}"),
+        }
+    }
+
+    /// 1-bpp (Grey) likewise still requires width%4 — natural pitch is
+    /// `width × 1`, which is 4-byte aligned only when `width % 4 == 0`.
+    #[test]
+    fn test_from_tensor_rejects_non_4_aligned_grey() {
+        let t = Tensor::<u8>::image(
+            375,
+            64,
+            PixelFormat::Grey,
+            Some(edgefirst_tensor::TensorMemory::Mem),
+        )
+        .unwrap();
+        let err = DmaImportAttrs::from_tensor(&t, PixelFormat::Grey)
+            .expect_err("Grey width 375 must still be rejected");
+        assert!(matches!(err, crate::Error::NotSupported(_)));
     }
 }
