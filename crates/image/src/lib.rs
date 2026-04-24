@@ -3462,6 +3462,142 @@ mod image_tests {
         compare_images(&loaded, &cpu_dst, 0.98, function!());
     }
 
+    /// Synthesise an RGB JPEG with a deterministic pattern at `(width, height)`
+    /// using the workspace's `jpeg-encoder` crate (the `image` crate is
+    /// compiled without its JPEG feature). Used to exercise the decoder /
+    /// pitch-padding paths for arbitrary dimensions without having to bundle
+    /// a fixture file per test size.
+    fn make_rgb_jpeg(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity((width * height * 3) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                bytes.push(((x + y) & 0xFF) as u8);
+                bytes.push(((x.wrapping_mul(3)) & 0xFF) as u8);
+                bytes.push(((y.wrapping_mul(5)) & 0xFF) as u8);
+            }
+        }
+        let mut out = Vec::new();
+        let encoder = jpeg_encoder::Encoder::new(&mut out, 85);
+        encoder
+            .encode(&bytes, width as u16, height as u16, jpeg_encoder::ColorType::Rgb)
+            .expect("jpeg-encoder must succeed on trivial input");
+        out
+    }
+
+    /// End-to-end: a 375×333 RGBA JPEG (width NOT divisible by 4) loaded
+    /// via the pitch-padded DMA path and letterboxed through the GL
+    /// backend must produce correct output. Before the Rgba/Bgra
+    /// width%4 relaxation in `DmaImportAttrs::from_tensor`, this case
+    /// failed the pre-check and forced a CPU texture upload fallback;
+    /// with the relaxation, EGL import succeeds at the driver level and
+    /// the GL fast path runs. Output correctness is checked against a
+    /// CPU reference (convert ran with `EDGEFIRST_FORCE_BACKEND=cpu`).
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[cfg(feature = "opengl")]
+    fn test_convert_rgba_non_4_aligned_width_end_to_end() {
+        use edgefirst_tensor::is_dma_available;
+        if !is_dma_available() {
+            eprintln!(
+                "SKIPPED: test_convert_rgba_non_4_aligned_width_end_to_end — DMA not available"
+            );
+            return;
+        }
+        // 375 is the canonical failure width from dataset loaders —
+        // 375 * 4 = 1500 bytes/row, pitch-padded to 1536. Width%4 = 3,
+        // so the old pre-check rejected it; new code accepts it.
+        let jpeg = make_rgb_jpeg(375, 333);
+        let src_gl = crate::load_jpeg(&jpeg, Some(PixelFormat::Rgba), None).unwrap();
+        assert_eq!(src_gl.width(), Some(375));
+        // Row stride must still be pitch-padded (separate concern from width).
+        let stride = src_gl.row_stride().unwrap();
+        assert_eq!(stride, 1536, "expected padded pitch 1536, got {stride}");
+
+        // GL-backed convert into a pitch-aligned 640×640 Rgba dest.
+        let mut gl_proc = ImageProcessor::new().unwrap();
+        let gl_dst = gl_proc
+            .create_image(640, 640, PixelFormat::Rgba, DType::U8, None)
+            .unwrap();
+        let (r_gl, _src_gl, gl_dst) = convert_img(
+            &mut gl_proc,
+            src_gl,
+            gl_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        );
+        r_gl.expect("GL-backed convert must succeed for 375x333 Rgba src");
+
+        // CPU reference via a fresh load so the two paths start from
+        // byte-identical inputs. `with_config(backend=Cpu)` forces the
+        // CPU-only processor regardless of which backends the host has
+        // available.
+        let src_cpu = crate::load_jpeg(&jpeg, Some(PixelFormat::Rgba), Some(TensorMemory::Mem))
+            .unwrap();
+        let mut cpu_proc = ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::Cpu,
+            ..Default::default()
+        })
+        .unwrap();
+        let cpu_dst =
+            TensorDyn::image(640, 640, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Mem))
+                .unwrap();
+        let (r_cpu, _src_cpu, cpu_dst) = convert_img(
+            &mut cpu_proc,
+            src_cpu,
+            cpu_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        );
+        r_cpu.unwrap();
+
+        // Structural similarity: the GL path may have gone through EGL
+        // import OR fallen back to CPU texture upload — either way, the
+        // output must match the CPU reference closely.
+        compare_images(&gl_dst, &cpu_dst, 0.95, function!());
+    }
+
+    /// Regression lock: loading a JPEG at a non-64-aligned RGBA pitch (e.g.
+    /// 500×333 → natural pitch 2000, needs to be padded to 2048) must go
+    /// through `image_with_stride` and set `row_stride()` / `effective_row_stride()`
+    /// to the padded value. The earlier pitch-padding commit fixed this in
+    /// `load_jpeg`; a regression would surface as `row_stride == None` or
+    /// `effective_row_stride == 2000`.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_load_jpeg_rgba_non_aligned_pitch_padded_dma() {
+        use edgefirst_tensor::is_dma_available;
+        if !is_dma_available() {
+            eprintln!(
+                "SKIPPED: test_load_jpeg_rgba_non_aligned_pitch_padded_dma — DMA not available"
+            );
+            return;
+        }
+        // Widths that force a non-64-aligned natural RGBA pitch. All three
+        // are divisible by 4 so the EGL width-alignment pre-check passes.
+        // The pitch-padding fix is what makes these importable at all.
+        for &w in &[500u32, 612, 428] {
+            let jpeg = make_rgb_jpeg(w, 333);
+            let loaded = crate::load_jpeg(&jpeg, Some(PixelFormat::Rgba), None).unwrap();
+            let natural = (w as usize) * 4;
+            let aligned = crate::align_pitch_bytes_to_gpu_alignment(natural).unwrap();
+            assert!(aligned > natural, "test sanity: width {w} should be unaligned");
+            let stride = loaded.row_stride().expect(
+                "padded DMA path must set an explicit row_stride — regression if None",
+            );
+            assert_eq!(
+                stride, aligned,
+                "width {w}: expected padded stride {aligned}, got {stride} \
+                 (regression: pitch-padding branch skipped?)"
+            );
+            let eff = loaded.effective_row_stride().unwrap();
+            assert_eq!(eff, aligned, "effective_row_stride must match stored stride");
+            assert_eq!(loaded.width(), Some(w as usize));
+            assert_eq!(loaded.height(), Some(333));
+        }
+    }
+
     // Synthesise a small greyscale PNG in memory at `(width, height)` with a
     // deterministic ramp pattern so multiple tests can cross-check output
     // without bundling an extra fixture file.
