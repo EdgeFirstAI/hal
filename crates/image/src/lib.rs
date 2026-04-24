@@ -1635,13 +1635,13 @@ impl ImageProcessor {
     ///
     /// Returns [`Error::NoConverter`] if the CPU backend is not available.
     pub fn materialize_masks(
-        &self,
+        &mut self,
         detect: &[DetectBox],
         proto_data: &ProtoData,
         letterbox: Option<[f32; 4]>,
         resolution: MaskResolution,
     ) -> Result<Vec<Segmentation>> {
-        let cpu = self.cpu.as_ref().ok_or(Error::NoConverter)?;
+        let cpu = self.cpu.as_mut().ok_or(Error::NoConverter)?;
         match resolution {
             MaskResolution::Proto => cpu.materialize_segmentations(detect, proto_data, letterbox),
             MaskResolution::Scaled { width, height } => {
@@ -1995,30 +1995,37 @@ impl ImageProcessorTrait for ImageProcessor {
         // full-GPU draw_proto_masks on all tested platforms: 27× on imx8mp,
         // 4× on imx95, 2.5× on rpi5, 1.6× on x86).
         // GL owns its own bg-blit / glClear — we pass the overlay through.
+        //
+        // CPU materialize needs `&mut` for its MaskScratch buffers; GL also
+        // needs `&mut`. The CPU borrow is scoped to its block so the
+        // subsequent GL borrow is free to take over `self`.
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
-        if let Some(opengl) = self.opengl.as_mut() {
-            let Some(cpu) = self.cpu.as_ref() else {
-                return Err(Error::Internal(
-                    "draw_proto_masks requires CPU backend for hybrid path".into(),
-                ));
-            };
-            log::trace!(
-                "draw_proto_masks started with hybrid (cpu+opengl) in {:?}",
-                start.elapsed()
-            );
-            let segmentation =
-                cpu.materialize_segmentations(detect, proto_data, overlay.letterbox)?;
-            match opengl.draw_decoded_masks(dst, render_detect, &segmentation, overlay) {
-                Ok(_) => {
+        if let (Some(_), Some(_)) = (self.cpu.as_ref(), self.opengl.as_ref()) {
+            let segmentation = match self.cpu.as_mut() {
+                Some(cpu) => {
                     log::trace!(
-                        "draw_proto_masks with hybrid (cpu+opengl) in {:?}",
+                        "draw_proto_masks started with hybrid (cpu+opengl) in {:?}",
                         start.elapsed()
                     );
-                    return Ok(());
+                    cpu.materialize_segmentations(detect, proto_data, overlay.letterbox)?
                 }
-                Err(e) => {
-                    log::trace!("draw_proto_masks hybrid path failed, falling back to cpu: {e:?}");
+                None => unreachable!("cpu presence checked above"),
+            };
+            if let Some(opengl) = self.opengl.as_mut() {
+                match opengl.draw_decoded_masks(dst, render_detect, &segmentation, overlay) {
+                    Ok(_) => {
+                        log::trace!(
+                            "draw_proto_masks with hybrid (cpu+opengl) in {:?}",
+                            start.elapsed()
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        log::trace!(
+                            "draw_proto_masks hybrid path failed, falling back to cpu: {e:?}"
+                        );
+                    }
                 }
             }
         }
