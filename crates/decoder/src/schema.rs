@@ -228,9 +228,17 @@ pub struct PhysicalOutput {
     pub name: String,
 
     /// Semantic type. Matches the parent's type or declares a sub-split
-    /// such as `boxes_xy` or `boxes_wh`.
-    #[serde(rename = "type")]
-    pub type_: PhysicalType,
+    /// such as `boxes_xy` or `boxes_wh`. `None` marks the child as
+    /// type-opaque: it still binds to a physical tensor by `name`/`shape`
+    /// during merging, but is not used to disambiguate against typed
+    /// siblings. Useful when a converter emits extra per-scale tensors
+    /// the HAL has no semantic for but the user manages downstream.
+    #[serde(
+        rename = "type",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub type_: Option<PhysicalType>,
 
     /// Physical tensor shape.
     pub shape: Vec<usize>,
@@ -813,9 +821,17 @@ fn validate_logical(logical: &LogicalOutput) -> DecoderResult<()> {
     // Uniqueness of physical child shapes *within the same type* — two
     // children with distinct types (e.g. ARA-2 `boxes_xy` + `boxes_wh`)
     // may legitimately share shape, since type disambiguates the binding.
+    //
+    // Typeless children are excluded from this check: shape uniqueness
+    // only matters when we need to bind a tensor by type+shape, and
+    // typeless children are treated as opaque passthrough — name-based
+    // binding still disambiguates them from each other.
     for (i, a) in logical.outputs.iter().enumerate() {
         for b in &logical.outputs[i + 1..] {
-            if a.shape == b.shape && a.type_ == b.type_ {
+            let (Some(ta), Some(tb)) = (a.type_, b.type_) else {
+                continue;
+            };
+            if a.shape == b.shape && ta == tb {
                 return Err(DecoderError::InvalidConfig(format!(
                     "physical children `{}` and `{}` share shape {:?} and \
                      type; tensor binding cannot be resolved",
@@ -1377,7 +1393,7 @@ mod tests {
         assert_eq!(lo.outputs.len(), 1);
         let child = &lo.outputs[0];
         assert_eq!(child.name, "boxes_0");
-        assert_eq!(child.type_, PhysicalType::Boxes);
+        assert_eq!(child.type_, Some(PhysicalType::Boxes));
         assert_eq!(child.stride, Some(Stride::Square(8)));
         assert_eq!(child.scale_index, Some(0));
         assert_eq!(child.dtype, DType::Uint8);
@@ -1410,8 +1426,8 @@ mod tests {
         let lo: LogicalOutput = serde_json::from_str(j).unwrap();
         assert_eq!(lo.encoding, Some(BoxEncoding::Direct));
         assert_eq!(lo.outputs.len(), 2);
-        assert_eq!(lo.outputs[0].type_, PhysicalType::BoxesXy);
-        assert_eq!(lo.outputs[1].type_, PhysicalType::BoxesWh);
+        assert_eq!(lo.outputs[0].type_, Some(PhysicalType::BoxesXy));
+        assert_eq!(lo.outputs[1].type_, Some(PhysicalType::BoxesWh));
         assert!(lo.outputs[0].stride.is_none());
         assert!(lo.outputs[1].stride.is_none());
     }
@@ -1856,6 +1872,69 @@ mod tests {
         assert!(legacy.outputs.is_empty());
     }
 
+    /// Physical children may also omit `type`. The schema parses, the
+    /// output round-trips without a synthetic `type` field, and the
+    /// uniqueness check doesn't flag a typeless child sharing shape
+    /// with a typed sibling (the type disambiguator is absent, but we
+    /// don't bind typeless children by type anyway).
+    #[test]
+    fn typeless_physical_child_parses_and_skips_uniqueness() {
+        let j = r#"{
+            "name": "boxes",
+            "type": "boxes",
+            "shape": [1, 8400, 4],
+            "outputs": [
+                {
+                    "name": "boxes_xy",
+                    "type": "boxes_xy",
+                    "shape": [1, 8400, 2],
+                    "dtype": "float32"
+                },
+                {
+                    "name": "aux_user_managed",
+                    "shape": [1, 8400, 2],
+                    "dtype": "float32"
+                }
+            ]
+        }"#;
+        let lo: LogicalOutput = serde_json::from_str(j).unwrap();
+        assert_eq!(lo.outputs.len(), 2);
+        assert_eq!(lo.outputs[0].type_, Some(PhysicalType::BoxesXy));
+        assert_eq!(lo.outputs[1].type_, None);
+
+        // Wrap in a minimal schema so we can call validate().
+        // BoxesXy and the typeless child share shape `[1, 8400, 2]`;
+        // the uniqueness check must not treat this as a conflict.
+        let schema = SchemaV2 {
+            schema_version: 2,
+            input: None,
+            outputs: vec![lo],
+            nms: None,
+            decoder_version: None,
+        };
+        schema.validate().expect(
+            "typed + typeless children with equal shape must not trigger \
+             uniqueness error",
+        );
+
+        // Serialization skips `type` on the typeless child.
+        let s = serde_json::to_string(&schema).unwrap();
+        assert!(
+            s.contains("\"aux_user_managed\""),
+            "typeless child must survive round-trip: {s}"
+        );
+        // Locate the typeless child's JSON object and confirm no `type` key.
+        let aux_obj = s
+            .split("\"aux_user_managed\"")
+            .nth(1)
+            .and_then(|s| s.split('}').next())
+            .unwrap_or("");
+        assert!(
+            !aux_obj.contains("\"type\""),
+            "typeless child must not serialize `type`, got: {aux_obj}"
+        );
+    }
+
     #[test]
     fn from_v1_modelpack_anchor_detection_maps_encoding() {
         let v1 = ConfigOutputs {
@@ -2060,8 +2139,8 @@ mod tests {
         assert_eq!(boxes.normalized, Some(true));
         assert_eq!(boxes.shape, vec![1, 4, 8400, 1]); // 4D with padding
         assert_eq!(boxes.outputs.len(), 2);
-        assert_eq!(boxes.outputs[0].type_, PhysicalType::BoxesXy);
-        assert_eq!(boxes.outputs[1].type_, PhysicalType::BoxesWh);
+        assert_eq!(boxes.outputs[0].type_, Some(PhysicalType::BoxesXy));
+        assert_eq!(boxes.outputs[1].type_, Some(PhysicalType::BoxesWh));
         // xy quant: scale 0.004177791997790337, zp -122, int8
         let q_xy = boxes.outputs[0].quantization.as_ref().unwrap();
         assert_eq!(q_xy.dtype, Some(DType::Int8));
