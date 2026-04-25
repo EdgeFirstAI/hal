@@ -30,6 +30,30 @@ LLVM_COV_PROFILE := --cargo-profile profiling
 # Rust features (all except opencv, which requires libclang at build time)
 RUST_FEATURES := --features opengl,ndarray
 
+# Python interpreter name for maturin -i (cross-compile requires a versioned
+# name like 'python3.10' because maturin parses major.minor from the filename
+# — it cannot execute a target-arch Python to introspect its ABI).
+PYTHON_INTERPRETER := $(shell \
+	if [ -x venv/bin/python ]; then \
+		venv/bin/python -c "import sys; print(f'python{sys.version_info.major}.{sys.version_info.minor}')"; \
+	elif command -v python3 >/dev/null 2>&1; then \
+		python3 -c "import sys; print(f'python{sys.version_info.major}.{sys.version_info.minor}')"; \
+	fi)
+
+# Target triple for cross-compilation. Empty value means a native build.
+#   make wheel                                    # native wheel
+#   make TARGET=aarch64-unknown-linux-gnu wheel   # cross-compile via zig
+TARGET ?=
+
+# Optional abi3 stable-ABI version (py38, py311, ...). When set, selects the
+# matching 'abi3-<PYABI>' feature in crates/python/Cargo.toml and produces a
+# version-agnostic wheel (tagged cp<abi>-abi3) usable by any CPython at or
+# above that minimum. Empty value produces a wheel tagged for the interpreter
+# chosen by -i (e.g. cp310-cp310).
+#   make PYABI=py38 wheel                         # abi3 wheel, Python 3.8+
+#   make TARGET=aarch64-unknown-linux-gnu PYABI=py311 wheel
+PYABI ?=
+
 # ===========================================================================
 # STANDARD TARGETS
 # ===========================================================================
@@ -45,6 +69,10 @@ help:
 	@echo ""
 	@echo "  Building & Testing:"
 	@echo "    make build          - Build with coverage instrumentation (profiling profile)"
+	@echo "    make wheel          - Build Python wheel (release, zig + manylinux2014)"
+	@echo "                          Options:"
+	@echo "                            TARGET=<triple>  cross-compile (e.g. aarch64-unknown-linux-gnu)"
+	@echo "                            PYABI=py38|py311 produce an abi3 wheel (stable ABI)"
 	@echo "    make test           - Run all tests with coverage"
 	@echo "    make test-rust      - Run Rust tests only"
 	@echo "    make test-python    - Run Python tests only"
@@ -141,6 +169,37 @@ build-python:
 		exit 1; \
 	fi
 	@echo "✓ Python bindings built"
+
+.PHONY: wheel
+wheel:
+	@if [ ! -x "venv/bin/maturin" ] && ! command -v maturin >/dev/null 2>&1; then \
+		echo "ERROR: maturin not found (see README.md for installation)"; \
+		exit 1; \
+	fi
+	@if ! command -v zig >/dev/null 2>&1; then \
+		echo "ERROR: zig not found (required for --zig manylinux2014 compliance)"; \
+		exit 1; \
+	fi
+	@if [ -z "$(PYTHON_INTERPRETER)" ]; then \
+		echo "ERROR: could not detect Python interpreter (expected venv/bin/python or python3 on PATH)"; \
+		exit 1; \
+	fi
+	@echo "Building Python wheel (release, manylinux2014)..."
+	@echo "  target: $(if $(TARGET),$(TARGET),native)"
+	@echo "  abi:    $(if $(PYABI),abi3-$(PYABI),$(PYTHON_INTERPRETER))"
+	@if [ -f "venv/bin/activate" ]; then \
+		. venv/bin/activate && \
+			maturin build --release --zig --compatibility manylinux2014 \
+				$(if $(TARGET),--target $(TARGET)) \
+				-m $(PYTHON_CRATE)/Cargo.toml -i $(PYTHON_INTERPRETER) \
+				$(if $(PYABI),--features abi3-$(PYABI)); \
+	else \
+		maturin build --release --zig --compatibility manylinux2014 \
+			$(if $(TARGET),--target $(TARGET)) \
+			-m $(PYTHON_CRATE)/Cargo.toml -i $(PYTHON_INTERPRETER) \
+			$(if $(PYABI),--features abi3-$(PYABI)); \
+	fi
+	@echo "✓ Wheel built in target/wheels/"
 
 # ===========================================================================
 # TESTING

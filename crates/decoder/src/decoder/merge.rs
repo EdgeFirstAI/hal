@@ -150,14 +150,25 @@ impl DecodeProgram {
     /// legacy decode path directly. Returns an error if the schema
     /// uses unsupported features (per-channel quantization, missing
     /// dshape, DFL encoding on split boxes).
+    ///
+    /// Typeless logical outputs are skipped: they're carried in the
+    /// schema as user-managed / auxiliary tensors and do not participate
+    /// in decoder dispatch. The returned program emits one merged
+    /// tensor per *typed* logical output in schema order — this keeps
+    /// it aligned with [`SchemaV2::to_legacy_config_outputs`], which
+    /// applies the same filter.
     pub fn try_from_schema(schema: &SchemaV2) -> DecoderResult<Option<Self>> {
-        let needs_merge = schema.outputs.iter().any(|l| !l.outputs.is_empty());
+        let needs_merge = schema
+            .outputs
+            .iter()
+            .any(|l| l.type_.is_some() && !l.outputs.is_empty());
         if !needs_merge {
             return Ok(None);
         }
         let merges = schema
             .outputs
             .iter()
+            .filter(|l| l.type_.is_some())
             .map(plan_logical)
             .collect::<DecoderResult<Vec<_>>>()?;
         Ok(Some(Self { merges }))
@@ -228,7 +239,7 @@ fn plan_per_scale(logical: &LogicalOutput) -> DecoderResult<LogicalMerge> {
     // based on common YOLO conventions (batch, features, boxes).
     let (feature_axis_logical, box_axis_logical) = logical_per_scale_axes(logical)?;
 
-    let dfl = if logical.type_ == LogicalType::Boxes
+    let dfl = if logical.type_ == Some(LogicalType::Boxes)
         && logical.encoding == Some(schema::BoxEncoding::Dfl)
     {
         Some(plan_dfl(logical, &children)?)
@@ -1011,6 +1022,95 @@ mod tests {
         }
     }
 
+    /// Typeless logical outputs are filtered from the DecodeProgram,
+    /// keeping it aligned with `to_legacy_config_outputs` (which applies
+    /// the same filter). Without this, `decode()` would pass N merged
+    /// tensors to a decode path expecting N-k — corrupting downstream
+    /// decoding when a user adds a custom output alongside a decoded
+    /// YOLO model.
+    #[test]
+    fn typeless_logical_not_included_in_decode_program() {
+        let schema = SchemaV2 {
+            schema_version: 2,
+            outputs: vec![
+                // User-managed: no type, flat.
+                LogicalOutput {
+                    name: Some("user_custom".into()),
+                    type_: None,
+                    shape: vec![1, 32],
+                    dshape: vec![],
+                    decoder: None,
+                    encoding: None,
+                    score_format: None,
+                    normalized: None,
+                    anchors: None,
+                    stride: None,
+                    dtype: None,
+                    quantization: None,
+                    outputs: vec![],
+                },
+                // Typed boxes with a single merged child (triggers program).
+                LogicalOutput {
+                    name: Some("boxes".into()),
+                    type_: Some(LogicalType::Boxes),
+                    shape: vec![1, 4, 3],
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::BoxCoords, 4),
+                        (DimName::NumBoxes, 3),
+                    ],
+                    decoder: Some(DecoderKind::Ultralytics),
+                    encoding: Some(BoxEncoding::Direct),
+                    score_format: None,
+                    normalized: Some(true),
+                    anchors: None,
+                    stride: None,
+                    dtype: None,
+                    quantization: None,
+                    outputs: vec![PhysicalOutput {
+                        name: "boxes_raw".into(),
+                        type_: Some(PhysicalType::Boxes),
+                        shape: vec![1, 4, 3],
+                        dshape: vec![
+                            (DimName::Batch, 1),
+                            (DimName::BoxCoords, 4),
+                            (DimName::NumBoxes, 3),
+                        ],
+                        dtype: DType::Float32,
+                        quantization: None,
+                        stride: None,
+                        scale_index: None,
+                        activation_applied: None,
+                        activation_required: None,
+                    }],
+                },
+            ],
+            ..Default::default()
+        };
+
+        let program = DecodeProgram::try_from_schema(&schema)
+            .unwrap()
+            .expect("typed boxes has children → program must be Some");
+
+        // Legacy config filters typeless outputs; the program must
+        // apply the identical filter so positional alignment holds.
+        let legacy = schema.to_legacy_config_outputs().unwrap();
+        assert_eq!(legacy.outputs.len(), 1);
+
+        // Program emits one merged tensor (for the typed `boxes`), not
+        // two (which would include the user_custom placeholder).
+        let boxes_tensor = make_f32_tensor(&[1, 4, 3], &[1.0; 12]);
+        let inputs: Vec<&TensorDyn> = vec![&boxes_tensor];
+        let merged = program.execute(&inputs).unwrap();
+        assert_eq!(
+            merged.len(),
+            1,
+            "decode program must emit one tensor per typed logical, not \
+             per schema-order logical (would otherwise misalign with \
+             legacy ConfigOutputs passed to decode_float)"
+        );
+    }
+
     #[test]
     fn flat_schema_has_no_decode_program() {
         // Logical outputs with no children => no merge needed.
@@ -1018,7 +1118,7 @@ mod tests {
             schema_version: 2,
             outputs: vec![LogicalOutput {
                 name: Some("boxes".into()),
-                type_: LogicalType::Boxes,
+                type_: Some(LogicalType::Boxes),
                 shape: vec![1, 4, 8400],
                 dshape: vec![
                     (DimName::Batch, 1),
@@ -1046,7 +1146,7 @@ mod tests {
         // ARA-2 style: boxes_xy + boxes_wh → [1, 4, 3]
         let boxes_logical = LogicalOutput {
             name: Some("boxes".into()),
-            type_: LogicalType::Boxes,
+            type_: Some(LogicalType::Boxes),
             shape: vec![1, 4, 3],
             dshape: vec![
                 (DimName::Batch, 1),
@@ -1064,7 +1164,7 @@ mod tests {
             outputs: vec![
                 PhysicalOutput {
                     name: "xy".into(),
-                    type_: PhysicalType::BoxesXy,
+                    type_: Some(PhysicalType::BoxesXy),
                     shape: vec![1, 2, 3],
                     dshape: vec![
                         (DimName::Batch, 1),
@@ -1080,7 +1180,7 @@ mod tests {
                 },
                 PhysicalOutput {
                     name: "wh".into(),
-                    type_: PhysicalType::BoxesWh,
+                    type_: Some(PhysicalType::BoxesWh),
                     shape: vec![1, 2, 3],
                     dshape: vec![
                         (DimName::Batch, 1),
@@ -1112,7 +1212,7 @@ mod tests {
             outputs: vec![
                 PhysicalOutput {
                     name: "xy".into(),
-                    type_: PhysicalType::BoxesXy,
+                    type_: Some(PhysicalType::BoxesXy),
                     shape: vec![1, 1, 3],
                     dshape: vec![
                         (DimName::Batch, 1),
@@ -1128,7 +1228,7 @@ mod tests {
                 },
                 PhysicalOutput {
                     name: "wh".into(),
-                    type_: PhysicalType::BoxesWh,
+                    type_: Some(PhysicalType::BoxesWh),
                     shape: vec![1, 2, 3],
                     dshape: vec![
                         (DimName::Batch, 1),
@@ -1177,7 +1277,7 @@ mod tests {
             schema_version: 2,
             outputs: vec![LogicalOutput {
                 name: Some("boxes".into()),
-                type_: LogicalType::Boxes,
+                type_: Some(LogicalType::Boxes),
                 shape: vec![1, 4, 5],
                 dshape: vec![
                     (DimName::Batch, 1),
@@ -1195,7 +1295,7 @@ mod tests {
                 outputs: vec![
                     PhysicalOutput {
                         name: "b0".into(),
-                        type_: PhysicalType::Boxes,
+                        type_: Some(PhysicalType::Boxes),
                         // NHWC [1, 2, 2, 4]: 4 anchors at stride 8
                         shape: vec![1, 2, 2, 4],
                         dshape: vec![
@@ -1213,7 +1313,7 @@ mod tests {
                     },
                     PhysicalOutput {
                         name: "b1".into(),
-                        type_: PhysicalType::Boxes,
+                        type_: Some(PhysicalType::Boxes),
                         // NHWC [1, 1, 1, 4]: 1 anchor at stride 16
                         shape: vec![1, 1, 1, 4],
                         dshape: vec![
@@ -1278,7 +1378,7 @@ mod tests {
             outputs: vec![
                 LogicalOutput {
                     name: Some("boxes".into()),
-                    type_: LogicalType::Boxes,
+                    type_: Some(LogicalType::Boxes),
                     shape: vec![1, 4, 3],
                     dshape: vec![
                         (DimName::Batch, 1),
@@ -1298,7 +1398,7 @@ mod tests {
                 // Force at least one split to enable DecodeProgram
                 LogicalOutput {
                     name: Some("scores".into()),
-                    type_: LogicalType::Scores,
+                    type_: Some(LogicalType::Scores),
                     shape: vec![1, 2, 3],
                     dshape: vec![
                         (DimName::Batch, 1),
@@ -1316,7 +1416,7 @@ mod tests {
                     outputs: vec![
                         PhysicalOutput {
                             name: "s0".into(),
-                            type_: PhysicalType::Scores,
+                            type_: Some(PhysicalType::Scores),
                             shape: vec![1, 1, 3],
                             dshape: vec![
                                 (DimName::Batch, 1),
@@ -1332,7 +1432,7 @@ mod tests {
                         },
                         PhysicalOutput {
                             name: "s1".into(),
-                            type_: PhysicalType::Scores,
+                            type_: Some(PhysicalType::Scores),
                             shape: vec![1, 1, 3],
                             dshape: vec![
                                 (DimName::Batch, 1),
@@ -1385,7 +1485,7 @@ mod tests {
             schema_version: 2,
             outputs: vec![LogicalOutput {
                 name: Some("boxes".into()),
-                type_: LogicalType::Boxes,
+                type_: Some(LogicalType::Boxes),
                 // Post-decode logical shape: 4 xcycwh channels × 6400
                 // anchors (single 80×80 FPN level in this minimal case).
                 shape: vec![1, 4, 6400],
@@ -1404,7 +1504,7 @@ mod tests {
                 quantization: None,
                 outputs: vec![PhysicalOutput {
                     name: "b0".into(),
-                    type_: PhysicalType::Boxes,
+                    type_: Some(PhysicalType::Boxes),
                     shape: vec![1, 80, 80, 64],
                     dshape: vec![
                         (DimName::Batch, 1),
@@ -1443,7 +1543,7 @@ mod tests {
             schema_version: 2,
             outputs: vec![LogicalOutput {
                 name: Some("boxes".into()),
-                type_: LogicalType::Boxes,
+                type_: Some(LogicalType::Boxes),
                 shape: vec![1, 4, 5],
                 dshape: vec![
                     (DimName::Batch, 1),
@@ -1461,7 +1561,7 @@ mod tests {
                 outputs: vec![
                     PhysicalOutput {
                         name: "b0".into(),
-                        type_: PhysicalType::Boxes,
+                        type_: Some(PhysicalType::Boxes),
                         shape: vec![1, 2, 2, 16],
                         dshape: vec![
                             (DimName::Batch, 1),
@@ -1478,7 +1578,7 @@ mod tests {
                     },
                     PhysicalOutput {
                         name: "b1".into(),
-                        type_: PhysicalType::Boxes,
+                        type_: Some(PhysicalType::Boxes),
                         shape: vec![1, 1, 1, 16],
                         dshape: vec![
                             (DimName::Batch, 1),
@@ -1555,7 +1655,7 @@ mod tests {
             schema_version: 2,
             outputs: vec![LogicalOutput {
                 name: Some("boxes".into()),
-                type_: LogicalType::Boxes,
+                type_: Some(LogicalType::Boxes),
                 shape: vec![1, 4, 5],
                 dshape: vec![
                     (DimName::Batch, 1),
@@ -1574,7 +1674,7 @@ mod tests {
                 outputs: vec![
                     PhysicalOutput {
                         name: "b_big".into(),
-                        type_: PhysicalType::Boxes,
+                        type_: Some(PhysicalType::Boxes),
                         shape: vec![1, 1, 1, 16],
                         dshape: vec![
                             (DimName::Batch, 1),
@@ -1591,7 +1691,7 @@ mod tests {
                     },
                     PhysicalOutput {
                         name: "b_small".into(),
-                        type_: PhysicalType::Boxes,
+                        type_: Some(PhysicalType::Boxes),
                         shape: vec![1, 2, 2, 16],
                         dshape: vec![
                             (DimName::Batch, 1),
@@ -1646,7 +1746,7 @@ mod tests {
             outputs: vec![
                 LogicalOutput {
                     name: Some("scores".into()),
-                    type_: LogicalType::Scores,
+                    type_: Some(LogicalType::Scores),
                     shape: vec![1, 1, 3],
                     dshape: vec![
                         (DimName::Batch, 1),
@@ -1668,7 +1768,7 @@ mod tests {
                     // branch actually runs (try_from_schema short-circuits
                     // when nothing needs merging).
                     name: Some("boxes".into()),
-                    type_: LogicalType::Boxes,
+                    type_: Some(LogicalType::Boxes),
                     shape: vec![1, 4, 3],
                     dshape: vec![
                         (DimName::Batch, 1),
@@ -1686,7 +1786,7 @@ mod tests {
                     outputs: vec![
                         PhysicalOutput {
                             name: "b0".into(),
-                            type_: PhysicalType::BoxesXy,
+                            type_: Some(PhysicalType::BoxesXy),
                             shape: vec![1, 2, 3],
                             dshape: vec![
                                 (DimName::Batch, 1),
@@ -1702,7 +1802,7 @@ mod tests {
                         },
                         PhysicalOutput {
                             name: "b1".into(),
-                            type_: PhysicalType::BoxesWh,
+                            type_: Some(PhysicalType::BoxesWh),
                             shape: vec![1, 2, 3],
                             dshape: vec![
                                 (DimName::Batch, 1),
