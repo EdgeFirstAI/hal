@@ -1137,7 +1137,7 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks(
 /// @param dst Destination image (RGBA, must not alias `background`)
 /// @param detections Detection box list from `hal_decoder_decode_proto()`
 /// @param proto Prototype data from `hal_decoder_decode_proto()`
-/// @param background Optional source image to composite under masks (NULL = clear to black)
+/// @param background Optional source image to composite under masks (NULL = clear to transparent black)
 /// @param opacity Mask opacity (0.0 = transparent, 1.0 = opaque)
 /// @param letterbox Optional letterbox coordinates [x0, y0, x1, y1] in normalized
 ///        coordinates (NULL = no letterbox correction)
