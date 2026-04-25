@@ -549,8 +549,9 @@ fn run_diagnostic(proc: &mut ImageProcessor) {
 
 /// Sweep `materialize_masks` cost across realistic detection counts on the
 /// actual `CPUProcessor` API (not the bench-local helper). The batched-GEMM
-/// path activates at `N >= 3`; sizes 8/16/32/64/100 bracket typical COCO
-/// validation loads (pycocotools `max_det=100`).
+/// path activates at `N >= 16` for proto resolution and `N >= 2` for scaled
+/// resolution; sizes 8/16/32/64/100 bracket typical COCO validation loads
+/// (pycocotools `max_det=100`).
 fn bench_materialize_masks_sweep(suite: &mut BenchSuite) {
     use edgefirst_image::CPUProcessor;
 
@@ -569,7 +570,11 @@ fn bench_materialize_masks_sweep(suite: &mut BenchSuite) {
 
     // Perturb the base bboxes slightly so they don't all overlap identically
     // (avoids hitting a degenerate cache-hot case).
-    fn replicated_dataset(n: usize, base_detect: &[DetectBox], base_proto: &ProtoData) -> (Vec<DetectBox>, ProtoData) {
+    fn replicated_dataset(
+        n: usize,
+        base_detect: &[DetectBox],
+        base_proto: &ProtoData,
+    ) -> (Vec<DetectBox>, ProtoData) {
         let mut out_detect = Vec::with_capacity(n);
         let mut out_coeffs = Vec::with_capacity(n);
         for i in 0..n {
