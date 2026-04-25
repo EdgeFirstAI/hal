@@ -790,6 +790,14 @@ impl Decoder {
         outputs: &[&edgefirst_tensor::TensorDyn],
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<Option<ProtoData>, DecoderError> {
+        // Schema v2 merge path: dequantize physical children into
+        // logical float32 tensors, then feed through the float dispatch.
+        if let Some(program) = &self.decode_program {
+            let merged = program.execute(outputs)?;
+            let views: Vec<_> = merged.iter().map(|a| a.view()).collect();
+            return self.decode_float_proto(&views, output_boxes);
+        }
+
         let mapped = tensor_bridge::map_tensors(outputs)?;
         match &mapped {
             tensor_bridge::MappedOutputs::Quantized(maps) => {
