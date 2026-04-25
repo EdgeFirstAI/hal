@@ -547,6 +547,100 @@ fn run_diagnostic(proc: &mut ImageProcessor) {
     println!();
 }
 
+/// Sweep `materialize_masks` cost across realistic detection counts on the
+/// actual `CPUProcessor` API (not the bench-local helper). The batched-GEMM
+/// path activates at `N >= 16` for proto resolution and `N >= 2` for scaled
+/// resolution; sizes 8/16/32/64/100 bracket typical COCO validation loads
+/// (pycocotools `max_det=100`).
+fn bench_materialize_masks_sweep(suite: &mut BenchSuite) {
+    use edgefirst_image::CPUProcessor;
+
+    println!("\n== materialize_masks: N-sweep (CPUProcessor API) ==\n");
+    println!("  Exercises the real materialize_masks path; sizes span the");
+    println!("  validation workload that dominates HAL output time.\n");
+
+    // Get 2 real detections with NMS applied, then replicate them to fill
+    // the desired N. Each replicated detection gets its own coefficient
+    // vector (cloned) so the GEMM path sees N independent mask planes.
+    let (base_detect, base_proto) = decode_proto_data();
+    if base_detect.is_empty() {
+        println!("  [skipped: no detections from fixture]\n");
+        return;
+    }
+
+    // Perturb the base bboxes slightly so they don't all overlap identically
+    // (avoids hitting a degenerate cache-hot case).
+    fn replicated_dataset(
+        n: usize,
+        base_detect: &[DetectBox],
+        base_proto: &ProtoData,
+    ) -> (Vec<DetectBox>, ProtoData) {
+        let mut out_detect = Vec::with_capacity(n);
+        let mut out_coeffs = Vec::with_capacity(n);
+        for i in 0..n {
+            let src = &base_detect[i % base_detect.len()];
+            let src_coeff = &base_proto.mask_coefficients[i % base_proto.mask_coefficients.len()];
+            let t = (i as f32 / n as f32) * 0.3;
+            let bbox = src.bbox;
+            out_detect.push(DetectBox {
+                bbox: edgefirst_decoder::BoundingBox::new(
+                    (bbox.xmin + t * 0.1).clamp(0.0, 0.9),
+                    (bbox.ymin + t * 0.1).clamp(0.0, 0.9),
+                    (bbox.xmax - t * 0.1).max(bbox.xmin + 0.05),
+                    (bbox.ymax - t * 0.1).max(bbox.ymin + 0.05),
+                ),
+                score: src.score,
+                label: src.label,
+            });
+            out_coeffs.push(src_coeff.clone());
+        }
+        // Clone the proto tensor so the inner loop doesn't race.
+        let protos = match &base_proto.protos {
+            edgefirst_decoder::ProtoTensor::Float(a) => {
+                edgefirst_decoder::ProtoTensor::Float(a.clone())
+            }
+            edgefirst_decoder::ProtoTensor::Quantized {
+                protos,
+                quantization,
+            } => edgefirst_decoder::ProtoTensor::Quantized {
+                protos: protos.clone(),
+                quantization: *quantization,
+            },
+        };
+        (
+            out_detect,
+            ProtoData {
+                mask_coefficients: out_coeffs,
+                protos,
+            },
+        )
+    }
+
+    for &n in &[1usize, 2, 3, 8, 16, 32, 64, 100] {
+        let (detect, proto_data) = replicated_dataset(n, &base_detect, &base_proto);
+
+        let mut cpu = CPUProcessor::new();
+        let name = format!("materialize_masks/proto_res/N={n}");
+        let result = run_bench(&name, WARMUP, ITERATIONS, || {
+            let _ = cpu
+                .materialize_segmentations(&detect, &proto_data, None)
+                .unwrap();
+        });
+        result.print_summary();
+        suite.record(&result);
+
+        let mut cpu_scaled = CPUProcessor::new();
+        let name_scaled = format!("materialize_masks/scaled_640x640/N={n}");
+        let result = run_bench(&name_scaled, WARMUP, ITERATIONS, || {
+            let _ = cpu_scaled
+                .materialize_scaled_segmentations(&detect, &proto_data, None, 640, 640)
+                .unwrap();
+        });
+        result.print_summary();
+        suite.record(&result);
+    }
+}
+
 fn main() {
     env_logger::init();
     let mut suite = BenchSuite::from_args();
@@ -569,6 +663,7 @@ fn main() {
     bench_draw_proto_masks(&mut proc, &mut suite);
     bench_draw_proto_masks_forced_opengl(&mut suite);
     bench_hybrid_materialize_and_draw(&mut proc, &mut suite);
+    bench_materialize_masks_sweep(&mut suite);
 
     suite.finish();
     println!("\nDone.");

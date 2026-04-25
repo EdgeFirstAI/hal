@@ -1114,7 +1114,7 @@ impl PyImageProcessor {
     ) -> Result<Vec<Bound<'py, numpy::PyArray3<u8>>>> {
         let detect = numpy_to_detect_boxes(&bbox, &scores, &classes)?;
         let resolution = resolution.map(|r| r.0).unwrap_or(MaskResolution::Proto);
-        let l = self
+        let mut l = self
             .0
             .lock()
             .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
