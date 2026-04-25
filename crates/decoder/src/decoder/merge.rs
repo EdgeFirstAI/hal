@@ -465,8 +465,7 @@ fn execute_merge(
             quant,
             ..
         } => {
-            let t = find_unused_tensor_by_shape(inputs, shape, used)?;
-            let mut arr = tensor_to_f32(t, *quant)?;
+            let mut arr = find_and_dequantize(inputs, shape, *quant, used)?;
             for &ax in padding_axes {
                 if ax < arr.ndim() && arr.shape()[ax] == 1 {
                     arr = arr.remove_axis(Axis(ax));
@@ -529,6 +528,101 @@ fn find_unused_tensor_by_shape<'a>(
          bound tensors are excluded; pass inputs in schema child order, \
          or use name-keyed decode once available)"
     )))
+}
+
+/// Find tensor by shape, dequantize to f32, and transpose to match the
+/// expected shape if needed.
+///
+/// Tries exact shape match first. When that fails (common in GStreamer /
+/// NNStreamer pipelines where the framework reports dimensions in
+/// innermost-first order while the v2 schema uses standard row-major
+/// shapes), falls back to element-count matching with axis permutation.
+///
+/// The permutation is derived by matching dimension sizes between the
+/// tensor's natural shape and the expected shape. When the tensor has
+/// fewer dimensions (e.g. trailing unit dims were stripped), it is
+/// padded with trailing 1s before matching.
+fn find_and_dequantize(
+    inputs: &[&TensorDyn],
+    expected_shape: &[usize],
+    quant: Option<Quantization>,
+    used: &mut Vec<usize>,
+) -> DecoderResult<ArrayD<f32>> {
+    // Fast path: exact shape match
+    if let Ok(t) = find_unused_tensor_by_shape(inputs, expected_shape, used) {
+        return tensor_to_f32(t, quant);
+    }
+
+    // Fallback: element-count match with axis permutation
+    let expected_count: usize = expected_shape.iter().product();
+    for (i, t) in inputs.iter().enumerate() {
+        if used.contains(&i) {
+            continue;
+        }
+        let count: usize = t.shape().iter().product();
+        if count != expected_count {
+            continue;
+        }
+        // Pad tensor shape with trailing 1s to match expected ndim
+        let mut padded_shape = t.shape().to_vec();
+        while padded_shape.len() < expected_shape.len() {
+            padded_shape.push(1);
+        }
+        if let Some(perm) = find_axis_permutation(&padded_shape, expected_shape) {
+            used.push(i);
+            let arr = tensor_to_f32(t, quant)?;
+            // Reshape to padded ndim (adds trailing unit dims, no data move)
+            let mut arr = if arr.ndim() < expected_shape.len() {
+                arr.into_shape_with_order(IxDyn(&padded_shape))
+                    .map_err(DecoderError::NDArrayShape)?
+            } else {
+                arr
+            };
+            // Transpose axes to match expected shape. permuted_axes
+            // reorders strides (zero-copy view), then as_standard_layout
+            // produces a C-contiguous copy with data in the new order.
+            arr = arr.permuted_axes(IxDyn(&perm));
+            arr = arr.as_standard_layout().to_owned();
+            debug_assert_eq!(arr.shape(), expected_shape);
+            return Ok(arr);
+        }
+    }
+
+    Err(DecoderError::InvalidShape(format!(
+        "no remaining input tensor matches shape {expected_shape:?} \
+         (tried exact match and element-count + permutation; already \
+         bound tensors are excluded)"
+    )))
+}
+
+/// Find the axis permutation that transforms `from` into `to`.
+///
+/// Returns `None` if no permutation exists (different multiset of
+/// dimension sizes or different lengths). When repeated dimension
+/// sizes occur (e.g. 160×160 spatial dims), they are matched in order
+/// which preserves their relative axis positions.
+fn find_axis_permutation(from: &[usize], to: &[usize]) -> Option<Vec<usize>> {
+    if from.len() != to.len() {
+        return None;
+    }
+    let n = from.len();
+    let mut perm = vec![0usize; n];
+    let mut bound = vec![false; n];
+    for (i, &target_dim) in to.iter().enumerate() {
+        let mut found = false;
+        for (j, &source_dim) in from.iter().enumerate() {
+            if !bound[j] && source_dim == target_dim {
+                perm[i] = j;
+                bound[j] = true;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return None;
+        }
+    }
+    Some(perm)
 }
 
 /// Dequantize (if integer) or cast (if float) a TensorDyn to an owned
@@ -622,8 +716,12 @@ fn execute_channel_concat(
 ) -> DecoderResult<ArrayD<f32>> {
     let mut parts = Vec::with_capacity(children.len());
     for child in children {
-        let t = find_unused_tensor_by_shape(inputs, &child.shape, used)?;
-        parts.push(tensor_to_f32(t, child.quant)?);
+        parts.push(find_and_dequantize(
+            inputs,
+            &child.shape,
+            child.quant,
+            used,
+        )?);
     }
     let views: Vec<_> = parts.iter().map(|a| a.view()).collect();
     let mut merged =
@@ -674,8 +772,7 @@ fn execute_per_scale(
     let mut feature_count: Option<usize> = None;
     let mut batch: Option<usize> = None;
     for (idx, child) in children.iter().enumerate() {
-        let t = find_unused_tensor_by_shape(inputs, &child.shape, used)?;
-        let arr = tensor_to_f32(t, child.quant)?;
+        let arr = find_and_dequantize(inputs, &child.shape, child.quant, used)?;
         let (b, features, part) = child_to_batch_feature_spatial(arr, child)?;
         match batch {
             None => batch = Some(b),
@@ -1843,5 +1940,125 @@ mod tests {
             "{}",
             scores_out[[0, 0, 2]]
         );
+    }
+
+    // ------------------------------------------------------------------
+    // find_and_dequantize: permutation-aware fallback tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn find_and_dequantize_exact_match_preferred() {
+        // When the tensor shape matches exactly, no permutation is applied.
+        let t = make_f32_tensor(&[1, 3, 4], &[1.0; 12]);
+        let inputs: Vec<&TensorDyn> = vec![&t];
+        let mut used = Vec::new();
+        let arr = find_and_dequantize(&inputs, &[1, 3, 4], None, &mut used).unwrap();
+        assert_eq!(arr.shape(), &[1, 3, 4]);
+        assert_eq!(used, vec![0]);
+    }
+
+    #[test]
+    fn find_and_dequantize_permuted_nchw_to_nhwc() {
+        // Tensor is NCHW [1, 3, 2, 2] but expected is NHWC [1, 2, 2, 3].
+        // The fallback should detect the axis permutation and transpose.
+        //
+        // Data in C-contiguous NCHW order (channel-major):
+        //   C0: [[1, 2], [3, 4]]
+        //   C1: [[5, 6], [7, 8]]
+        //   C2: [[9, 10], [11, 12]]
+        let t = make_f32_tensor(
+            &[1, 3, 2, 2],
+            &[
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+            ],
+        );
+        let inputs: Vec<&TensorDyn> = vec![&t];
+        let mut used = Vec::new();
+        let arr = find_and_dequantize(&inputs, &[1, 2, 2, 3], None, &mut used).unwrap();
+        assert_eq!(arr.shape(), &[1, 2, 2, 3]);
+        // After NCHW→NHWC, pixel (0,0) should have channels [1, 5, 9],
+        // pixel (0,1) should be [2, 6, 10], etc.
+        assert_eq!(arr[[0, 0, 0, 0]], 1.0);
+        assert_eq!(arr[[0, 0, 0, 1]], 5.0);
+        assert_eq!(arr[[0, 0, 0, 2]], 9.0);
+        assert_eq!(arr[[0, 0, 1, 0]], 2.0);
+        assert_eq!(arr[[0, 0, 1, 1]], 6.0);
+        assert_eq!(arr[[0, 0, 1, 2]], 10.0);
+        assert_eq!(arr[[0, 1, 0, 0]], 3.0);
+        assert_eq!(arr[[0, 1, 0, 1]], 7.0);
+        assert_eq!(arr[[0, 1, 0, 2]], 11.0);
+    }
+
+    #[test]
+    fn find_and_dequantize_stripped_trailing_unit_dim() {
+        // Tensor reported as [1, 6] (trailing unit dim stripped) but
+        // expected shape is [1, 6, 1]. The fallback should pad with
+        // trailing 1s and find an identity permutation.
+        let t = make_f32_tensor(&[1, 6], &[10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
+        let inputs: Vec<&TensorDyn> = vec![&t];
+        let mut used = Vec::new();
+        let arr = find_and_dequantize(&inputs, &[1, 6, 1], None, &mut used).unwrap();
+        assert_eq!(arr.shape(), &[1, 6, 1]);
+        assert_eq!(arr[[0, 0, 0]], 10.0);
+        assert_eq!(arr[[0, 5, 0]], 60.0);
+    }
+
+    #[test]
+    fn find_and_dequantize_skips_already_used() {
+        // Two tensors with same element count; the first is already
+        // consumed so the fallback must select the second.
+        let t0 = make_f32_tensor(&[2, 3], &[0.0; 6]);
+        let t1 = make_f32_tensor(&[3, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let inputs: Vec<&TensorDyn> = vec![&t0, &t1];
+        let mut used = vec![0]; // t0 already consumed
+        let arr = find_and_dequantize(&inputs, &[2, 3], None, &mut used).unwrap();
+        assert_eq!(arr.shape(), &[2, 3]);
+        assert!(used.contains(&1));
+        // t1 is [3, 2] permuted to [2, 3]: rows of t1 become columns
+        assert_eq!(arr[[0, 0]], 1.0);
+        assert_eq!(arr[[0, 1]], 3.0);
+        assert_eq!(arr[[0, 2]], 5.0);
+        assert_eq!(arr[[1, 0]], 2.0);
+        assert_eq!(arr[[1, 1]], 4.0);
+        assert_eq!(arr[[1, 2]], 6.0);
+    }
+
+    #[test]
+    fn find_and_dequantize_no_match_returns_error() {
+        // Element count doesn't match any candidate.
+        let t = make_f32_tensor(&[2, 5], &[0.0; 10]);
+        let inputs: Vec<&TensorDyn> = vec![&t];
+        let mut used = Vec::new();
+        let result = find_and_dequantize(&inputs, &[3, 4], None, &mut used);
+        assert!(result.is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // find_axis_permutation unit tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn find_axis_permutation_identity() {
+        let perm = find_axis_permutation(&[1, 3, 4], &[1, 3, 4]);
+        assert_eq!(perm, Some(vec![0, 1, 2]));
+    }
+
+    #[test]
+    fn find_axis_permutation_nchw_to_nhwc() {
+        // NCHW [1, 3, 2, 2] → NHWC [1, 2, 2, 3]
+        // Perm should map: out[0]=in[0], out[1]=in[2], out[2]=in[3], out[3]=in[1]
+        let perm = find_axis_permutation(&[1, 3, 2, 2], &[1, 2, 2, 3]);
+        assert_eq!(perm, Some(vec![0, 2, 3, 1]));
+    }
+
+    #[test]
+    fn find_axis_permutation_no_match() {
+        // Different dimension multisets
+        assert_eq!(find_axis_permutation(&[1, 3, 4], &[1, 4, 5]), None);
+    }
+
+    #[test]
+    fn find_axis_permutation_different_lengths() {
+        assert_eq!(find_axis_permutation(&[1, 3], &[1, 3, 1]), None);
     }
 }
