@@ -6,6 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+## [0.18.0] - 2026-04-25
 
 ### Added
 
@@ -88,6 +89,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `__extendhfsf2`) on the target, for developers verifying a local
   benchmarking build.
 
+- **Batched-GEMM `materialize_masks` path** for COCO-style validation
+  workloads (high `max_det`, low score threshold). A single batched
+  GEMM at proto resolution
+  (`coeffs (N, K) · protos.T (K, H·W)`) replaces the per-detection
+  scalar kernel via `ndarray::linalg::general_mat_mul`
+  (`matrixmultiply` backend, no new deps), with rayon-parallel
+  per-detection finalisation and a `MaskScratch` pool on
+  `CPUProcessor` to amortise the ~3 MB f32 dequant across frames.
+  Per-detection fused kernels remain the small-N fallback (Proto
+  N ≥ 16, Scaled N ≥ 2). Cross-platform A/B at N=100 scaled
+  640×640: imx8mp 1.4 s → 153 ms (9.1×), imx95 1.4 s → 114 ms
+  (12.3×), rpi5-hailo 466 ms → 42 ms (10.9×), x86 desktop 461 ms
+  → 10 ms (44.7×). Full table in `BENCHMARKS.md`.
+
+- **NEON kernels for the scaled-resolution mask path on aarch64.**
+  `fill_scaled_tile_neon` processes 4 output pixels per iteration
+  along the bbox row (4-wide `vld1q_f32` corner gather, FMA
+  bilinear, `u32x4 → u16x4 → u8x4` pack); `dequant_i8_to_f32_neon`
+  converts 16 i8 → 16 f32 per iteration with the standard
+  `sxtl/scvtf/fsub/fmul` cascade. Dispatch fast-path skips ndarray
+  indexing via `Array::as_slice()`; the float branch collapses to a
+  single `copy_from_slice`. Non-aarch64 keeps the scalar path.
+  Stacked on the batched-GEMM win, this brings i.MX 95 N=100 scaled
+  640×640 from 1400 ms → 44 ms — a cumulative **31×** speedup.
+
+- **Schema v2 logical *and* physical outputs may omit `type`.**
+  `LogicalOutput.type_` and `PhysicalOutput.type_` are now
+  `Option<*Type>` with `#[serde(default, skip_serializing_if =
+  "Option::is_none")]`. Typeless outputs are carried in the schema
+  for round-trip but filtered out of the legacy `ConfigOutputs`
+  produced by `to_legacy_config_outputs`, and skipped by
+  `DecodeProgram::try_from_schema` so the merge path stays aligned
+  with the legacy outputs the decoder consumes. Encodes the design
+  principle "decoders find the outputs they know about; they
+  shouldn't care about outputs they don't, as long as they can
+  capture the ones they require." Models that ship auxiliary
+  / diagnostic tensors alongside the YOLO heads now parse without
+  pre-emptive serde errors. Five regression tests cover the parse,
+  round-trip, filter, and physical-uniqueness-skip behaviours.
+
+- **`load_png` now accepts any converter-reachable destination
+  format.** Greyscale PNGs (Luma) load directly as
+  `PixelFormat::Grey`; LumaA is normalised inline (alpha stripped);
+  RGB ↔ Grey, Grey → Rgba/Bgra, etc. dispatch through
+  `CPUProcessor::convert_format_pf`. Previously `load_png` rejected
+  anything other than Rgb/Rgba with `NotImplemented`, forcing
+  callers off PNG for greyscale inputs. JPEG already supported Grey.
+
+- **`make wheel` target builds release Python wheels via maturin
+  with `--zig` and `--compatibility manylinux2014`.** `TARGET=<triple>`
+  selects cross-compile targets; `PYABI=py38|py311` produces an
+  abi3 stable-ABI wheel using the existing features in
+  `crates/python/Cargo.toml`.
+
+- **`hal_image_processor_draw_proto_masks` C API.** Fused GPU-
+  accelerated proto-mask rendering: takes pre-decoded boxes and raw
+  `HalProtoData*` from the decoder and computes
+  `mask_coeff @ protos` at full output resolution via the GLES 3.1
+  compute-shader path with bilinear sampling. Lets
+  `edgefirstoverlay`'s fused rendering path skip the intermediate
+  160×160 materialize + upscale.
+
 ### Changed
 
 - **`ProtoData` now holds two `TensorDyn` fields** (`protos` and
@@ -128,6 +191,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`mask_coefficients`) continues to parse unchanged so existing models
   and fixtures are not affected.
 
+- **`ImageProcessor::materialize_masks` and
+  `CPUProcessor::materialize_{segmentations,scaled_segmentations}`
+  now take `&mut self`** so the batched-GEMM path can hold its
+  `MaskScratch` borrow across the call. **Source-breaking for
+  Rust callers that hold `ImageProcessor` / `CPUProcessor` by shared
+  reference.** Python and C API call sites are unchanged. The
+  `draw_proto_masks` hybrid path was updated so the CPU borrow is
+  scoped before the GL borrow.
+
+- **`load_jpeg`, `load_png`, and `rotate_flip_to_dyn` pad row stride
+  to GPU alignment when materialising into DMA storage on Linux.**
+  Mali G310 (i.MX 95) rejects `eglCreateImage` from DMA-BUFs whose
+  `PLANE0_PITCH_EXT` is not a multiple of 64 bytes, surfacing as
+  `EGL_BAD_ALLOC` and silently falling back to CPU texture upload
+  (~2× slowdown on COCO validation). The decoder now stages the
+  image into a tightly-packed Mem buffer at natural pitch then
+  row-copies into a pitch-padded DMA tensor allocated via
+  `Tensor::image_with_stride`. Shared helpers
+  `padded_dma_pitch_for` and `copy_packed_to_padded_dma` cover both
+  load paths plus the EXIF rotate/flip fixup. Non-Linux targets and
+  callers requesting non-DMA memory take the natural-pitch fast
+  path unchanged.
+
+- **`DmaImportAttrs::from_tensor` accepts non-4-aligned widths for
+  4-bpp packed formats (`Rgba`, `Bgra`).** The pre-existing
+  `width % 4 == 0` check was rejecting dataset-loader widths like
+  375 / 427 / 443 even though their natural pitch (`width × 4`)
+  is trivially 4-byte aligned and the DRM `ABGR8888`/`ARGB8888`
+  fourcc spec imposes no pixel-alignment requirement. The check
+  remains in force for `Rgb` (3 bpp) and `Grey` (1 bpp) where the
+  natural pitch only word-aligns at multiples of 4. Verified
+  end-to-end on Vivante GC7000UL (imx8mp), Mali G310 (imx95), V3D
+  7.1 (rpi5-hailo), and Tegra (orin-nano).
+
+- **Scaled-resolution mask kernel skips redundant work.**
+  `scaled_segmentations_*` thresholds at `sigmoid > 0.5`, which is
+  monotonically equivalent to `acc > 0` — the
+  `fast_sigmoid` call (and the i8 path's positive-`scale` multiply)
+  is dropped. `MaskScratch::compute_logits` now grows its dequant /
+  logits buffers on demand instead of `Vec::resize(n, 0.0)` every
+  frame, since the buffers are immediately overwritten by the
+  dequant loop and the GEMM (`beta=0.0`). On i.MX 95 these two
+  changes amount to a further 12–17 % win on the scaled path.
+
+- **GL and CPU mask kernels reclassify per-channel-on-non-channel-axis
+  rejections from `InvalidShape` to `NotSupported`,** and the
+  `num_protos > 64` path in `fused_dequant_dot_sigmoid_i8_slice` now
+  allocates a heap scratch buffer instead of erroring. Production
+  models stay within the stack-scratch fast path; larger models work
+  correctly at slightly higher per-call cost.
+
+- **GL `render_proto_segmentation` no longer rebuilds
+  `Vec<Vec<f32>>` mask coefficients or `to_owned()` clones the
+  proto tensor on every frame.** Sub-helpers
+  (`render_proto_detection_quads`,
+  `render_proto_segmentation_{int8,f32,f16,f16_native}`,
+  `render_proto_int8_two_pass`, and the two `repack_protos_*`
+  helpers) take flat `&[f32]` coefficients with a `num_protos`
+  stride and `ndarray::ArrayView3<'_, T>` for protos. F32 coeffs +
+  F32 protos: zero hot-path heap allocations. F16 coeffs widen
+  once into a flat `Vec<f32>`.
+
+- **Schema v2 → legacy lowering rejects malformed
+  `Quantization::Deserialize` shapes.** `Quantization::validate()`
+  now defends against constructors bypassed via `Deserialize`:
+  empty `scale`, per-tensor with multi-element `zero_point`, and
+  per-channel with `zero_point.len() != scale.len()` are all
+  rejected with structured `Error::QuantizationInvalid`.
+
 ### Fixed
 
 - **Physical-order contract for `shape` / `dshape` in output configuration
@@ -163,6 +295,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged legacy path. The string constructors
   (`new_from_json_str` / `new_from_yaml_str`) already went through the
   v2 path; only the dict constructor was broken. Reference: EDGEAI-1081.
+
+- **Schema v2 `shape` no longer truncates to `[]` when `dshape` is
+  omitted.** `squeeze_padding_dims` zipped `shape` against a `keep`
+  mask derived from `dshape`. With `dshape` defaulting to empty
+  (its `#[serde(default)]` representation for logical outputs that
+  omit named dims), `zip` returned an empty iterator and silently
+  produced `shape = []`, which then failed `verify_yolo_split_*`
+  rank checks with the misleading `Invalid Yolo Split Boxes shape
+  []`. The bug only surfaced via `Decoder({...})` and the JSON/YAML
+  constructors that lower v2 → legacy; `Decoder.new_from_outputs`
+  bypassed the lowering and worked. Two regression tests anchor the
+  helper directly and the integration path through
+  `to_legacy_config_outputs`.
+
+- **`materialize_segmentations` / `materialize_scaled_segmentations`
+  now return `Error::InvalidShape` when `detect.len() !=
+  mask_coefficients.len()`,** replacing the fused path's silent
+  `zip` truncation and pre-empting the `scratch.logits(N, HW)`
+  slice panic in the batched path.
+
+- **`copy_packed_to_padded_dma` validates `src` / `dst` width /
+  height / format up front and uses `saturating_mul` consistently
+  in error format strings.** The bounds check itself was already
+  saturating, but the error path re-multiplied with `*` and
+  panicked in debug builds on overflow, turning an intended `Err`
+  return into a panic during error reporting.
+
+- **`padded_dma_pitch_for(memory: None)` now respects
+  `is_dma_available()`.** Previously the helper treated `None` as
+  "caller wants DMA" and routed `load_jpeg` / `load_png` /
+  `rotate_flip_to_dyn` into the pitch-padded DMA path
+  unconditionally. On Linux systems where DMA isn't available
+  (sandboxed CI, missing `/dev/dma_heap`, permission-denied
+  containers), this forced `image_with_stride(..., None)` to fail
+  allocating DMA instead of falling back to SHM/Mem like
+  `image(..., None)` does.
+
+- **`draw_proto_masks_impl` no longer silently returns `Ok(())`
+  on shape mismatch.** Rank or `num_protos` mismatch on
+  `mask_coefficients` now surfaces `Error::InvalidShape`; only
+  the genuine "no detections this frame" case
+  (`coeff_shape[0] == 0`) short-circuits to `Ok(())`. Matches the
+  GL renderer's behaviour.
+
+- **`PyDecoder::new` schema_version parsing surfaces overflow,
+  negatives, and non-numeric values as a Python `RuntimeError:
+  invalid schema_version: ...`** instead of silently truncating
+  via `as_u64()` + `as u32` or being mapped to `None`.
+  `serde_json::from_value::<u32>` does the typed parse directly.
+
+- **Ara-2 CHW dimension ordering in v2 schema merge program.** The
+  Ara-2 `tensor_filter` reports physical-tensor dimensions in native
+  CHW order rather than NNStreamer's innermost-first convention,
+  which caused exact-shape matching in the merge program to miss
+  matches and surface as `EIO` errors on v2 schema models with
+  protos. Two fixes: (1) `decode_proto()` now also runs the merge
+  program when one is compiled (previously only `decode()` did);
+  (2) `find_and_dequantize` falls back to element-count matching
+  with axis-permutation detection (`find_axis_permutation`) when
+  exact-shape lookup fails, transposing the matched tensor into
+  the expected layout before dequantization. `execute_merge`,
+  `execute_channel_concat`, and `execute_per_scale` use the
+  permutation-aware lookup. All 286 existing decoder tests still
+  pass; new unit tests cover identity / NCHW↔NHWC / stripped-unit-
+  dim / already-used-tensor / no-match cases.
 
 ### Not in this release
 
