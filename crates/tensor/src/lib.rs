@@ -425,11 +425,49 @@ impl Quantization {
 
     /// Validate against a target tensor shape. Runs in
     /// `Tensor::set_quantization()`. Catches:
+    ///   - empty `scale` (reject — must declare at least one factor)
+    ///   - `zero_point` length inconsistent with `scale` (reject —
+    ///     per-tensor must have len 1, per-channel must match `scale.len`)
     ///   - `axis >= shape.len()` (axis out of range)
     ///   - `scale.len() != shape[axis]` for per-channel
     ///   - per-channel without axis (reject)
     ///   - per-tensor with redundant axis (reject)
     pub(crate) fn validate(&self, shape: &[usize]) -> Result<()> {
+        // `Quantization` is `Deserialize`, so malformed JSON like
+        // `{"scale": [], "zero_point": []}` could otherwise produce an
+        // ill-defined value that confuses `mode()` selection and the
+        // per-channel kernels' indexing.
+        if self.scale.is_empty() {
+            return Err(Error::QuantizationInvalid {
+                field: "scale.len",
+                expected: ">= 1".to_string(),
+                got: "0".to_string(),
+            });
+        }
+        if let Some(zps) = self.zero_point.as_ref() {
+            // Per-tensor: scale.len() == 1 and zero_point.len() must == 1.
+            // Per-channel: zero_point.len() must == scale.len().
+            let expected = if self.scale.len() == 1 {
+                1
+            } else {
+                self.scale.len()
+            };
+            if zps.len() != expected {
+                return Err(Error::QuantizationInvalid {
+                    field: "zero_point.len",
+                    expected: format!(
+                        "{expected} (matching {})",
+                        if self.scale.len() == 1 {
+                            "per-tensor scale"
+                        } else {
+                            "per-channel scale.len"
+                        }
+                    ),
+                    got: format!("length {}", zps.len()),
+                });
+            }
+        }
+
         match (self.scale.len(), self.axis) {
             (1, None) => Ok(()),
             (1, Some(_)) => Err(Error::QuantizationInvalid {
@@ -2851,6 +2889,42 @@ mod tests {
     fn test_quantization_per_channel_empty_rejected() {
         let err = Quantization::per_channel_symmetric(vec![], 0).unwrap_err();
         assert!(matches!(err, Error::QuantizationInvalid { .. }));
+    }
+
+    /// Constructors guard scale/zero_point length invariants, but
+    /// `Quantization` is `Deserialize`, so malformed JSON (e.g. an
+    /// empty `scale` array, or `zero_point` length that disagrees with
+    /// `scale`) bypasses the constructor checks. `set_quantization`
+    /// must reject these via `validate()` so they don't poison
+    /// downstream `mode()` selection or per-channel kernel indexing.
+    #[test]
+    fn test_quantization_validate_rejects_malformed_deserialize() {
+        let mut t = Tensor::<i8>::new(&[1, 1, 4], Some(TensorMemory::Mem), None).unwrap();
+
+        // Empty scale array: must be rejected.
+        let q: Quantization = serde_json::from_str(r#"{"scale": []}"#).unwrap();
+        assert!(matches!(
+            t.set_quantization(q).unwrap_err(),
+            Error::QuantizationInvalid { .. }
+        ));
+
+        // Per-tensor with multi-element zero_point: must be rejected.
+        let q: Quantization =
+            serde_json::from_str(r#"{"scale": 0.1, "zero_point": [0, 0, 0]}"#).unwrap();
+        assert!(matches!(
+            t.set_quantization(q).unwrap_err(),
+            Error::QuantizationInvalid { .. }
+        ));
+
+        // Per-channel zero_point length != scale length: must be rejected.
+        let q: Quantization = serde_json::from_str(
+            r#"{"scale": [0.1, 0.2, 0.3, 0.4], "zero_point": [0, 0], "axis": 2}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            t.set_quantization(q).unwrap_err(),
+            Error::QuantizationInvalid { .. }
+        ));
     }
 
     #[test]

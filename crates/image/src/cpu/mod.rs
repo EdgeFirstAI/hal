@@ -740,8 +740,20 @@ impl CPUProcessor {
         let proto_w = proto_shape[1];
         let num_protos = proto_shape[2];
         let coeff_shape = proto_data.mask_coefficients.shape();
-        if coeff_shape.len() != 2 || coeff_shape[1] != num_protos || coeff_shape[0] == 0 {
+        if coeff_shape.len() != 2 {
+            return Err(Error::InvalidShape(format!(
+                "mask_coefficients tensor must be rank-2, got {coeff_shape:?}"
+            )));
+        }
+        // Genuine "no detections this frame" → nothing to render.
+        if coeff_shape[0] == 0 {
             return Ok(());
+        }
+        if coeff_shape[1] != num_protos {
+            return Err(Error::InvalidShape(format!(
+                "mask_coefficients second dimension must match num_protos \
+                 ({num_protos}), got {coeff_shape:?}"
+            )));
         }
 
         // Widen coefficients to f32 once; shape [N, num_protos].
