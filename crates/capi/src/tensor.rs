@@ -701,10 +701,10 @@ pub unsafe extern "C" fn hal_tensor_map_unmap(map: *mut HalTensorMap) {
 ///
 /// | Mode | Semantics |
 /// |---|---|
-/// | HAL_QUANT_PER_TENSOR_SYMMETRIC | single scale, zero point = 0 |
-/// | HAL_QUANT_PER_TENSOR | single scale, single zero point |
-/// | HAL_QUANT_PER_CHANNEL_SYMMETRIC | per-channel scales, zero point = 0 |
-/// | HAL_QUANT_PER_CHANNEL | per-channel scales + zero points |
+/// | HAL_TENSOR_QUANT_KIND_PER_TENSOR_SYMMETRIC | single scale, zero point = 0 |
+/// | HAL_TENSOR_QUANT_KIND_PER_TENSOR | single scale, single zero point |
+/// | HAL_TENSOR_QUANT_KIND_PER_CHANNEL_SYMMETRIC | per-channel scales, zero point = 0 |
+/// | HAL_TENSOR_QUANT_KIND_PER_CHANNEL | per-channel scales + zero points |
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HalTensorQuantKind {

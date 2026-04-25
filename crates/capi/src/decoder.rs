@@ -1274,9 +1274,10 @@ pub unsafe extern "C" fn hal_proto_data_take_mask_coefficients(
     Box::into_raw(Box::new(HalTensor { inner: taken }))
 }
 
-/// A 1-element `u8` sentinel used by the `take_*` accessors to mark a
-/// tensor field as already-taken. The `is_empty_sentinel` check matches
-/// on dtype + shape + name so legitimate small tensors are not confused.
+/// A zero-length `u8` sentinel (shape `[0]`) used by the `take_*` accessors
+/// to mark a tensor field as already-taken. The `is_empty_sentinel` check
+/// matches on dtype + shape + name so legitimate small tensors aren't
+/// confused with the sentinel.
 fn empty_tensor_dyn() -> edgefirst_tensor::TensorDyn {
     use edgefirst_tensor::{Tensor, TensorDyn, TensorMemory};
     let t = Tensor::<u8>::new(&[0], Some(TensorMemory::Mem), Some("__taken__"))

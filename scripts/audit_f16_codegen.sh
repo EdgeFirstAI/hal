@@ -41,8 +41,12 @@ esac
 echo "==> Auditing $SYMBOL on $TARGET"
 echo "==> Expected instructions: $EXPECTED_INSTRS"
 
-TMP_ASM=$(mktemp --suffix=.asm)
-trap "rm -f $TMP_ASM" EXIT
+# Portable temp file with a stable suffix — BSD `mktemp` (macOS default) does
+# not support `--suffix=`, so allocate the temp first then rename.
+TMP_BASE=$(mktemp)
+TMP_ASM="${TMP_BASE}.asm"
+mv "$TMP_BASE" "$TMP_ASM"
+trap 'rm -f -- "$TMP_ASM"' EXIT
 
 cargo asm --release --target "$TARGET" -p edgefirst-image \
     --lib "$SYMBOL" > "$TMP_ASM" 2>/dev/null || {
@@ -51,9 +55,9 @@ cargo asm --release --target "$TARGET" -p edgefirst-image \
     exit 1
 }
 
-if grep -q '__extendhfsf2\|__truncsfhf2' "$TMP_ASM"; then
+if grep -qE '__extendhfsf2|__truncsfhf2' "$TMP_ASM"; then
     echo "FAIL: soft-float helper found in $SYMBOL disassembly"
-    grep -n '__extendhfsf2\|__truncsfhf2' "$TMP_ASM" | head -5
+    grep -nE '__extendhfsf2|__truncsfhf2' "$TMP_ASM" | head -5
     echo ""
     echo "Check that the correct target-cpu or target-feature is set in RUSTFLAGS."
     exit 1
