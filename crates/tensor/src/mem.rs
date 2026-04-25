@@ -36,14 +36,14 @@ where
             return Err(Error::InvalidSize(0));
         }
 
-        let size = shape.iter().product::<usize>() * std::mem::size_of::<T>();
-        if size == 0 {
-            return Err(Error::InvalidSize(0));
-        }
+        // Zero-element shapes (e.g. `[0, num_protos]`) are permitted — they
+        // represent genuine "no detections this frame" sentinels produced by
+        // the tracker path. DMA-backed storage cannot represent them; Mem
+        // storage can (empty Vec).
+        let element_count: usize = shape.iter().product();
+        let data = vec![T::zero(); element_count];
 
         let name = name.unwrap_or("mem_tensor").to_owned();
-        let data = vec![T::zero(); size / std::mem::size_of::<T>()];
-
         Ok(MemTensor {
             name,
             shape: shape.to_vec(),
@@ -209,10 +209,15 @@ mod tests {
     }
 
     #[test]
-    fn test_new_zero_dim_error() {
-        let result = MemTensor::<u8>::new(&[2, 0, 4], Some("test"));
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), Error::InvalidSize(_)));
+    fn test_new_zero_dim_is_accepted() {
+        // Zero-element shapes are intentionally permitted on Mem-backed
+        // tensors: they represent "empty collection" sentinels (e.g.
+        // `[0, num_protos]` when a tracker emits no fresh detections).
+        // DMA-backed storage still rejects them.
+        let result = MemTensor::<u8>::new(&[2, 0, 4], Some("test")).unwrap();
+        assert_eq!(result.shape(), &[2, 0, 4]);
+        assert_eq!(result.size(), 0);
+        assert_eq!(result.len(), 0);
     }
 
     #[test]

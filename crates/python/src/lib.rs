@@ -43,6 +43,7 @@ pub mod edgefirst_hal {
 
         m.add_class::<tensor::PyTensor>()?;
         m.add_class::<tensor::PyTensorMemory>()?;
+        m.add_class::<tensor::PyQuantization>()?;
         m.add_class::<image::PyPixelFormat>()?;
         m.add_class::<image::Normalization>()?;
         m.add_class::<image::PyRect>()?;

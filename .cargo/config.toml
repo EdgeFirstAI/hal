@@ -1,0 +1,21 @@
+# EdgeFirst HAL workspace Cargo config.
+#
+# IMPORTANT: target-feature flags that enable instructions beyond a
+# target's guaranteed-available baseline MUST NOT live here. The HAL
+# ships as a single binary per target, and baking e.g. `+f16c` or
+# `+fp16` into the default build would produce binaries that SIGILL on
+# older CPUs within the same target triple. Until the HAL gains runtime
+# CPU-feature detection + dynamic dispatch, the default build must stay
+# on the target's baseline ISA.
+#
+# For local development on hosts that support richer ISAs (for example
+# benchmarking native fp16 on Orin Nano), developers set RUSTFLAGS
+# ad-hoc — see README.md § "Local fp16 / AVX build overrides" and
+# TESTING.md for the documented incantations.
+
+# aarch64 Apple Silicon (M-series) is the one safe exception: every
+# M-series chip has ARMv8.2-FP16. Intel Macs build under the separate
+# `x86_64-apple-darwin` triple, so this entry cannot misfire on
+# non-FP16 hardware.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-feature=+fp16"]

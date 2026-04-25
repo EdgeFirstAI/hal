@@ -846,6 +846,157 @@ impl PyTensor {
     fn from_numpy(&mut self, src: &Bound<'_, pyo3::types::PyAny>) -> Result<()> {
         copy_numpy_to_tensor_dyn(src, &self.0)
     }
+
+    /// Quantization metadata, or ``None`` for float tensors and
+    /// integer tensors without quantization attached.
+    #[getter]
+    fn quantization(&self) -> Option<PyQuantization> {
+        self.0.quantization().cloned().map(PyQuantization)
+    }
+
+    /// Attach per-tensor asymmetric quantization. Integer tensors only.
+    fn set_quantization_per_tensor(&mut self, scale: f32, zero_point: i32) -> Result<()> {
+        let q = edgefirst_hal::tensor::Quantization::per_tensor(scale, zero_point);
+        Ok(self.0.set_quantization(q)?)
+    }
+
+    /// Attach per-tensor symmetric quantization. Integer tensors only.
+    fn set_quantization_per_tensor_symmetric(&mut self, scale: f32) -> Result<()> {
+        let q = edgefirst_hal::tensor::Quantization::per_tensor_symmetric(scale);
+        Ok(self.0.set_quantization(q)?)
+    }
+
+    /// Attach per-channel asymmetric quantization. Integer tensors only.
+    /// Raises on ``len(scales) != len(zero_points)`` or invalid ``axis``.
+    fn set_quantization_per_channel(
+        &mut self,
+        scales: Vec<f32>,
+        zero_points: Vec<i32>,
+        axis: usize,
+    ) -> Result<()> {
+        let q = edgefirst_hal::tensor::Quantization::per_channel(scales, zero_points, axis)?;
+        Ok(self.0.set_quantization(q)?)
+    }
+
+    /// Attach per-channel symmetric quantization. Integer tensors only.
+    fn set_quantization_per_channel_symmetric(
+        &mut self,
+        scales: Vec<f32>,
+        axis: usize,
+    ) -> Result<()> {
+        let q = edgefirst_hal::tensor::Quantization::per_channel_symmetric(scales, axis)?;
+        Ok(self.0.set_quantization(q)?)
+    }
+
+    /// Remove any quantization metadata from this tensor.
+    fn clear_quantization(&mut self) {
+        self.0.clear_quantization();
+    }
+}
+
+// ─── PyQuantization ─────────────────────────────────────────────────────────
+
+/// Quantization parameters for an integer tensor.
+///
+/// Four modes are supported, matching the EdgeFirst model metadata spec:
+/// per-tensor symmetric, per-tensor asymmetric, per-channel symmetric, and
+/// per-channel asymmetric. Construct via the ``per_tensor`` /
+/// ``per_tensor_symmetric`` / ``per_channel`` / ``per_channel_symmetric``
+/// static methods.
+#[pyclass(name = "Quantization", str)]
+#[derive(Clone)]
+pub struct PyQuantization(pub(crate) edgefirst_hal::tensor::Quantization);
+
+impl Display for PyQuantization {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0.is_per_channel() {
+            write!(
+                f,
+                "Quantization(per_channel, num_scales={}, symmetric={}, axis={:?})",
+                self.0.scale().len(),
+                self.0.is_symmetric(),
+                self.0.axis(),
+            )
+        } else {
+            write!(
+                f,
+                "Quantization(per_tensor, scale={:?}, symmetric={})",
+                self.0.scale(),
+                self.0.is_symmetric(),
+            )
+        }
+    }
+}
+
+#[pymethods]
+impl PyQuantization {
+    /// Construct per-tensor asymmetric quantization: single scale + zero point.
+    #[staticmethod]
+    fn per_tensor(scale: f32, zero_point: i32) -> Self {
+        Self(edgefirst_hal::tensor::Quantization::per_tensor(
+            scale, zero_point,
+        ))
+    }
+
+    /// Construct per-tensor symmetric quantization: single scale, zero point = 0.
+    #[staticmethod]
+    fn per_tensor_symmetric(scale: f32) -> Self {
+        Self(edgefirst_hal::tensor::Quantization::per_tensor_symmetric(
+            scale,
+        ))
+    }
+
+    /// Construct per-channel asymmetric quantization. Raises on length
+    /// mismatch between ``scales`` and ``zero_points``, or empty inputs.
+    #[staticmethod]
+    fn per_channel(scales: Vec<f32>, zero_points: Vec<i32>, axis: usize) -> Result<Self> {
+        Ok(Self(edgefirst_hal::tensor::Quantization::per_channel(
+            scales,
+            zero_points,
+            axis,
+        )?))
+    }
+
+    /// Construct per-channel symmetric quantization. Raises on empty scales.
+    #[staticmethod]
+    fn per_channel_symmetric(scales: Vec<f32>, axis: usize) -> Result<Self> {
+        Ok(Self(
+            edgefirst_hal::tensor::Quantization::per_channel_symmetric(scales, axis)?,
+        ))
+    }
+
+    /// List of scale factors (length 1 for per-tensor, N for per-channel).
+    #[getter]
+    fn scale(&self) -> Vec<f32> {
+        self.0.scale().to_vec()
+    }
+
+    /// List of zero points, or ``None`` for symmetric quantization.
+    #[getter]
+    fn zero_point(&self) -> Option<Vec<i32>> {
+        self.0.zero_point().map(<[i32]>::to_vec)
+    }
+
+    /// Channel axis for per-channel quantization, or ``None`` for per-tensor.
+    #[getter]
+    fn axis(&self) -> Option<usize> {
+        self.0.axis()
+    }
+
+    #[getter]
+    fn is_per_tensor(&self) -> bool {
+        self.0.is_per_tensor()
+    }
+
+    #[getter]
+    fn is_per_channel(&self) -> bool {
+        self.0.is_per_channel()
+    }
+
+    #[getter]
+    fn is_symmetric(&self) -> bool {
+        self.0.is_symmetric()
+    }
 }
 
 // ─── PyTensorMap ────────────────────────────────────────────────────────────

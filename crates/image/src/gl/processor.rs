@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-use edgefirst_decoder::{DetectBox, ProtoData, ProtoTensor, Segmentation};
+use edgefirst_decoder::{DetectBox, ProtoData, Segmentation};
 use edgefirst_tensor::{
     PixelFormat, PixelLayout, Tensor, TensorMapTrait, TensorMemory, TensorTrait,
 };
@@ -4241,7 +4241,7 @@ impl GLProcessorST {
     /// suitable for upload to a GL_TEXTURE_2D_ARRAY with GL_RGBA16F.
     ///
     /// Returns `(repacked_bytes, num_layers)` where each layer is H*W*4 half-floats.
-    fn repack_protos_to_rgba_f16(protos: &ndarray::Array3<f32>) -> (Vec<u8>, usize) {
+    fn repack_protos_to_rgba_f16(protos: ndarray::ArrayView3<'_, f32>) -> (Vec<u8>, usize) {
         let (height, width, num_protos) = protos.dim();
         let num_layers = num_protos.div_ceil(4);
         // Each layer is H*W*4 half-floats, each half-float is 2 bytes
@@ -4270,35 +4270,145 @@ impl GLProcessorST {
         (byte_buf, num_layers)
     }
 
+    /// Native-f16 variant of [`Self::repack_protos_to_rgba_f16`]: shuffles
+    /// already-f16 protos into RGBA-layer order without the f32→f16
+    /// conversion step. Used when the decoder produced an fp16 proto
+    /// tensor — `TensorDyn::F16` in the current [`ProtoData`] representation
+    /// — from an fp16 inference engine.
+    fn repack_protos_f16_to_rgba_f16(
+        protos: ndarray::ArrayView3<'_, half::f16>,
+    ) -> (Vec<u8>, usize) {
+        let (height, width, num_protos) = protos.dim();
+        let num_layers = num_protos.div_ceil(4);
+        let layer_stride = height * width * 4;
+        let mut buf = vec![0u16; layer_stride * num_layers];
+
+        for y in 0..height {
+            for x in 0..width {
+                for k in 0..num_layers * 4 {
+                    let val = if k < num_protos {
+                        protos[[y, x, k]]
+                    } else {
+                        half::f16::ZERO
+                    };
+                    let layer = k / 4;
+                    let channel = k % 4;
+                    buf[layer * layer_stride + y * width * 4 + x * 4 + channel] = val.to_bits();
+                }
+            }
+        }
+
+        let byte_buf = unsafe {
+            std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 2).to_vec()
+        };
+        (byte_buf, num_layers)
+    }
+
     /// Render YOLO proto segmentation masks using the fused GPU pipeline.
     ///
-    /// Dispatches to the appropriate shader based on `ProtoTensor` variant:
-    /// - `Quantized`: uploads raw int8 as `GL_R8I`, dequantizes in shader
-    /// - `Float`: uploads as `GL_R32F` with hardware bilinear (if available),
-    ///   or falls back to f16 repack path
+    /// Dispatches on the proto tensor's runtime dtype via
+    /// [`edgefirst_tensor::TensorDyn::dtype`]:
+    /// - `I8`: uploads raw int8 as `GL_R8I`, dequantizes in shader (requires
+    ///   per-tensor [`edgefirst_tensor::Quantization`] on the proto tensor).
+    /// - `F32`: uploads as `GL_R32F` with hardware bilinear (if available),
+    ///   or falls back to the `RGBA16F` repack path for older drivers.
+    /// - `F16`: repacks natively into `RGBA16F` without a widening step.
     fn render_proto_segmentation(
         &mut self,
         detect: &[DetectBox],
         proto_data: &ProtoData,
         color_mode: crate::ColorMode,
     ) -> crate::Result<()> {
-        if detect.is_empty() || proto_data.mask_coefficients.is_empty() {
+        use edgefirst_tensor::{DType, QuantMode, TensorMapTrait, TensorTrait};
+
+        if detect.is_empty() {
             return Ok(());
         }
-
-        let (height, width, num_protos) = proto_data.protos.dim();
+        let proto_shape = proto_data.protos.shape();
+        if proto_shape.len() != 3 {
+            return Err(crate::Error::InvalidShape(format!(
+                "protos tensor must be rank-3, got {proto_shape:?}"
+            )));
+        }
+        let (height, width, num_protos) = (proto_shape[0], proto_shape[1], proto_shape[2]);
+        let coeff_shape = proto_data.mask_coefficients.shape();
+        if coeff_shape.len() != 2 || coeff_shape[1] != num_protos {
+            return Err(crate::Error::InvalidShape(format!(
+                "mask_coefficients shape {coeff_shape:?} incompatible with protos \
+                 {proto_shape:?} (expected [N, {num_protos}])"
+            )));
+        }
+        // Genuine "no detections this frame" → nothing to render.
+        if coeff_shape[0] == 0 {
+            return Ok(());
+        }
         let texture_target = gls::gl::TEXTURE_2D_ARRAY;
 
-        match &proto_data.protos {
-            ProtoTensor::Quantized {
-                protos,
-                quantization,
-            } => {
+        // Coefficient slice for the GL uniform upload path. The shaders
+        // consume f32 regardless of source dtype, but we hold the F32 case
+        // as a borrowed slice (no allocation) and only widen for F16. The
+        // `Cow<[f32]>` lets both arms share a single downstream pass.
+        //
+        // The F16 widening is one flat `Vec<f32>`, replacing the prior
+        // `Vec<Vec<f32>>` (one inner Vec per detection) — avoids N small
+        // heap allocations per frame on the hot path.
+        let mc_map_f32;
+        let mc_map_f16;
+        let coeff_widen_f16: Vec<f32>;
+        let coeff_slice: &[f32] = match proto_data.mask_coefficients.dtype() {
+            DType::F32 => {
+                let t = proto_data.mask_coefficients.as_f32().expect("F32");
+                mc_map_f32 = t.map()?;
+                mc_map_f32.as_slice()
+            }
+            DType::F16 => {
+                let t = proto_data.mask_coefficients.as_f16().expect("F16");
+                mc_map_f16 = t.map()?;
+                coeff_widen_f16 = mc_map_f16.as_slice().iter().map(|v| v.to_f32()).collect();
+                &coeff_widen_f16[..]
+            }
+            other => {
+                return Err(crate::Error::InvalidShape(format!(
+                    "mask_coefficients dtype {other:?} not supported on GL seg path"
+                )));
+            }
+        };
+
+        // Each proto-dtype arm holds its `TensorMap` for the duration of the
+        // GL upload and passes an `ArrayView3` borrowed from the mapped slice
+        // to the helper — no per-frame `to_owned()` clone of the proto tensor.
+        match proto_data.protos.dtype() {
+            DType::I8 => {
+                let t = proto_data.protos.as_i8().expect("I8");
+                let m = t.map()?;
+                let quant = t.quantization().ok_or_else(|| {
+                    crate::Error::InvalidShape("I8 protos require quantization metadata".into())
+                })?;
+                // GL shader path: per-tensor quant only (shader uploads a
+                // single scale/zp uniform). Per-channel would require a
+                // shader rewrite — return NotSupported for now.
+                let (scale, zp) = match quant.mode() {
+                    QuantMode::PerTensor { scale, zero_point } => (scale, zero_point),
+                    QuantMode::PerTensorSymmetric { scale } => (scale, 0_i32),
+                    QuantMode::PerChannel { axis, .. }
+                    | QuantMode::PerChannelSymmetric { axis, .. } => {
+                        return Err(crate::Error::NotSupported(format!(
+                            "GL seg path: per-channel quantization (axis={axis}) \
+                             not yet supported — falls back to CPU in caller"
+                        )));
+                    }
+                };
+                let protos_view = ndarray::ArrayView3::<i8>::from_shape(
+                    (height, width, num_protos),
+                    m.as_slice(),
+                )
+                .map_err(|e| crate::Error::InvalidShape(format!("{e}")))?;
+                let quantization = edgefirst_decoder::Quantization::new(scale, zp);
                 self.render_proto_segmentation_int8(
                     detect,
-                    &proto_data.mask_coefficients,
-                    protos,
-                    quantization,
+                    coeff_slice,
+                    protos_view,
+                    &quantization,
                     height,
                     width,
                     num_protos,
@@ -4306,12 +4416,19 @@ impl GLProcessorST {
                     color_mode,
                 )?;
             }
-            ProtoTensor::Float(protos_f32) => {
+            DType::F32 => {
+                let t = proto_data.protos.as_f32().expect("F32");
+                let m = t.map()?;
+                let protos_view = ndarray::ArrayView3::<f32>::from_shape(
+                    (height, width, num_protos),
+                    m.as_slice(),
+                )
+                .map_err(|e| crate::Error::InvalidShape(format!("{e}")))?;
                 if self.has_float_linear {
                     self.render_proto_segmentation_f32(
                         detect,
-                        &proto_data.mask_coefficients,
-                        protos_f32,
+                        coeff_slice,
+                        protos_view,
                         height,
                         width,
                         num_protos,
@@ -4319,11 +4436,10 @@ impl GLProcessorST {
                         color_mode,
                     )?;
                 } else {
-                    // Fallback: repack to RGBA16F and use existing f16 shader
                     self.render_proto_segmentation_f16(
                         detect,
-                        &proto_data.mask_coefficients,
-                        protos_f32,
+                        coeff_slice,
+                        protos_view,
                         height,
                         width,
                         num_protos,
@@ -4331,6 +4447,30 @@ impl GLProcessorST {
                         color_mode,
                     )?;
                 }
+            }
+            DType::F16 => {
+                let t = proto_data.protos.as_f16().expect("F16");
+                let m = t.map()?;
+                let protos_view = ndarray::ArrayView3::<half::f16>::from_shape(
+                    (height, width, num_protos),
+                    m.as_slice(),
+                )
+                .map_err(|e| crate::Error::InvalidShape(format!("{e}")))?;
+                self.render_proto_segmentation_f16_native(
+                    detect,
+                    coeff_slice,
+                    protos_view,
+                    height,
+                    width,
+                    num_protos,
+                    texture_target,
+                    color_mode,
+                )?;
+            }
+            other => {
+                return Err(crate::Error::InvalidShape(format!(
+                    "GL seg path: proto dtype {other:?} not supported"
+                )));
             }
         }
 
@@ -4344,12 +4484,21 @@ impl GLProcessorST {
         &self,
         program: &GlProgram,
         detect: &[DetectBox],
-        mask_coefficients: &[Vec<f32>],
+        mask_coefficients: &[f32],
+        num_protos: usize,
         color_mode: crate::ColorMode,
     ) -> crate::Result<()> {
         let cvt_screen_coord = |normalized: f32| normalized * 2.0 - 1.0;
 
-        for (idx, (det, coeff)) in detect.iter().zip(mask_coefficients.iter()).enumerate() {
+        // Stride the flat `mask_coefficients` buffer by `num_protos` so we
+        // get one slice per detection. `chunks_exact` requires the total
+        // length to be a multiple of `num_protos`; the dispatcher already
+        // validates `coeff_shape == [N, num_protos]` upstream.
+        for (idx, (det, coeff)) in detect
+            .iter()
+            .zip(mask_coefficients.chunks_exact(num_protos))
+            .enumerate()
+        {
             let color_index = color_mode.index(idx, det.label);
             let mut packed_coeff = [[0.0f32; 4]; 8];
             for (i, val) in coeff.iter().enumerate().take(32) {
@@ -4443,8 +4592,8 @@ impl GLProcessorST {
     fn render_proto_segmentation_int8(
         &mut self,
         detect: &[DetectBox],
-        mask_coefficients: &[Vec<f32>],
-        protos: &ndarray::Array3<i8>,
+        mask_coefficients: &[f32],
+        protos: ndarray::ArrayView3<'_, i8>,
         quantization: &edgefirst_decoder::Quantization,
         height: usize,
         width: usize,
@@ -4600,7 +4749,13 @@ impl GLProcessorST {
                 program.load_uniform_1i(c"num_protos", num_protos as i32)?;
                 program.load_uniform_1f(c"proto_scale", proto_scale)?;
                 program.load_uniform_1f(c"proto_scaled_zp", proto_scaled_zp)?;
-                self.render_proto_detection_quads(program, detect, mask_coefficients, color_mode)?;
+                self.render_proto_detection_quads(
+                    program,
+                    detect,
+                    mask_coefficients,
+                    num_protos,
+                    color_mode,
+                )?;
             }
             Int8InterpolationMode::Bilinear => {
                 let program = &self.proto_segmentation_int8_bilinear_program;
@@ -4608,7 +4763,13 @@ impl GLProcessorST {
                 program.load_uniform_1i(c"num_protos", num_protos as i32)?;
                 program.load_uniform_1f(c"proto_scale", proto_scale)?;
                 program.load_uniform_1f(c"proto_scaled_zp", proto_scaled_zp)?;
-                self.render_proto_detection_quads(program, detect, mask_coefficients, color_mode)?;
+                self.render_proto_detection_quads(
+                    program,
+                    detect,
+                    mask_coefficients,
+                    num_protos,
+                    color_mode,
+                )?;
             }
             Int8InterpolationMode::TwoPass => {
                 self.render_proto_int8_two_pass(
@@ -4633,7 +4794,7 @@ impl GLProcessorST {
     fn render_proto_int8_two_pass(
         &self,
         detect: &[DetectBox],
-        mask_coefficients: &[Vec<f32>],
+        mask_coefficients: &[f32],
         quantization: &edgefirst_decoder::Quantization,
         height: usize,
         width: usize,
@@ -4765,7 +4926,13 @@ impl GLProcessorST {
         gls::active_texture(gls::gl::TEXTURE0);
         gls::bind_texture(texture_target, self.proto_dequant_texture.id);
         program.load_uniform_1i(c"num_layers", num_layers as i32)?;
-        self.render_proto_detection_quads(program, detect, mask_coefficients, color_mode)?;
+        self.render_proto_detection_quads(
+            program,
+            detect,
+            mask_coefficients,
+            num_protos,
+            color_mode,
+        )?;
 
         Ok(())
     }
@@ -4775,8 +4942,8 @@ impl GLProcessorST {
     fn render_proto_segmentation_f32(
         &self,
         detect: &[DetectBox],
-        mask_coefficients: &[Vec<f32>],
-        protos_f32: &ndarray::Array3<f32>,
+        mask_coefficients: &[f32],
+        protos_f32: ndarray::ArrayView3<'_, f32>,
         height: usize,
         width: usize,
         num_protos: usize,
@@ -4832,7 +4999,13 @@ impl GLProcessorST {
         );
 
         program.load_uniform_1i(c"num_protos", num_protos as i32)?;
-        self.render_proto_detection_quads(program, detect, mask_coefficients, color_mode)?;
+        self.render_proto_detection_quads(
+            program,
+            detect,
+            mask_coefficients,
+            num_protos,
+            color_mode,
+        )?;
 
         Ok(())
     }
@@ -4844,8 +5017,8 @@ impl GLProcessorST {
     fn render_proto_segmentation_f16(
         &self,
         detect: &[DetectBox],
-        mask_coefficients: &[Vec<f32>],
-        protos_f32: &ndarray::Array3<f32>,
+        mask_coefficients: &[f32],
+        protos_f32: ndarray::ArrayView3<'_, f32>,
         height: usize,
         width: usize,
         num_protos: usize,
@@ -4894,7 +5067,82 @@ impl GLProcessorST {
         );
 
         program.load_uniform_1i(c"num_layers", num_layers as i32)?;
-        self.render_proto_detection_quads(program, detect, mask_coefficients, color_mode)?;
+        self.render_proto_detection_quads(
+            program,
+            detect,
+            mask_coefficients,
+            num_protos,
+            color_mode,
+        )?;
+
+        Ok(())
+    }
+
+    /// Native-f16 variant of [`Self::render_proto_segmentation_f16`]: uploads
+    /// protos that are already in half-precision directly into `RGBA16F`
+    /// without a f32→f16 conversion pass. Used for `TensorDyn::F16` proto
+    /// tensors produced by fp16 inference engines.
+    #[allow(clippy::too_many_arguments)]
+    fn render_proto_segmentation_f16_native(
+        &self,
+        detect: &[DetectBox],
+        mask_coefficients: &[f32],
+        protos_f16: ndarray::ArrayView3<'_, half::f16>,
+        height: usize,
+        width: usize,
+        num_protos: usize,
+        texture_target: u32,
+        color_mode: crate::ColorMode,
+    ) -> crate::Result<()> {
+        let num_layers = num_protos.div_ceil(4);
+        let (tex_data, _) = Self::repack_protos_f16_to_rgba_f16(protos_f16);
+
+        let program = &self.proto_segmentation_program;
+        gls::use_program(program.id);
+        gls::bind_texture(texture_target, self.proto_texture.id);
+        gls::active_texture(gls::gl::TEXTURE0);
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_MIN_FILTER,
+            gls::gl::LINEAR as i32,
+        );
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_MAG_FILTER,
+            gls::gl::LINEAR as i32,
+        );
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_WRAP_S,
+            gls::gl::CLAMP_TO_EDGE as i32,
+        );
+        gls::tex_parameteri(
+            texture_target,
+            gls::gl::TEXTURE_WRAP_T,
+            gls::gl::CLAMP_TO_EDGE as i32,
+        );
+
+        gls::tex_image3d(
+            texture_target,
+            0,
+            gls::gl::RGBA16F as i32,
+            width as i32,
+            height as i32,
+            num_layers as i32,
+            0,
+            gls::gl::RGBA,
+            gls::gl::HALF_FLOAT,
+            Some(&tex_data),
+        );
+
+        program.load_uniform_1i(c"num_layers", num_layers as i32)?;
+        self.render_proto_detection_quads(
+            program,
+            detect,
+            mask_coefficients,
+            num_protos,
+            color_mode,
+        )?;
 
         Ok(())
     }

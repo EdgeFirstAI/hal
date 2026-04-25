@@ -347,6 +347,51 @@ impl Quantization {
     }
 }
 
+/// Convert a schema-level `Quantization` (which also carries the quantized
+/// `dtype`) into the tensor-crate `edgefirst_tensor::Quantization` attached
+/// to a `Tensor<T>` at runtime. The `dtype` field is dropped — the tensor's
+/// `T` supplies the storage element type directly.
+///
+/// Returns `Err` on any length-mismatch / axis-out-of-range condition; the
+/// schema's `Quantization::validate_shape` has looser rules (accepts absent
+/// axis on per-channel) that the tensor crate does not. Callers should prefer
+/// the v2 parse path which normalizes.
+impl TryFrom<&Quantization> for edgefirst_tensor::Quantization {
+    type Error = edgefirst_tensor::Error;
+
+    fn try_from(q: &Quantization) -> Result<Self, Self::Error> {
+        match (q.scale.as_slice(), q.zero_point.as_deref(), q.axis) {
+            // Per-tensor symmetric: single scale, no zp, no axis.
+            ([scale], None, None) => Ok(Self::per_tensor_symmetric(*scale)),
+            // Per-tensor asymmetric: single scale, single zp.
+            ([scale], Some([zp]), None) => Ok(Self::per_tensor(*scale, *zp)),
+            // Per-tensor asymmetric with redundant axis — treat as per-tensor.
+            ([scale], Some([zp]), Some(_)) => Ok(Self::per_tensor(*scale, *zp)),
+            ([scale], None, Some(_)) => Ok(Self::per_tensor_symmetric(*scale)),
+            // Per-channel — axis required.
+            (scales, None, Some(axis)) if scales.len() > 1 => {
+                Self::per_channel_symmetric(scales.to_vec(), axis)
+            }
+            (scales, Some(zps), Some(axis)) if scales.len() > 1 => {
+                Self::per_channel(scales.to_vec(), zps.to_vec(), axis)
+            }
+            // Per-channel without axis — invalid.
+            (scales, _, None) if scales.len() > 1 => {
+                Err(edgefirst_tensor::Error::QuantizationInvalid {
+                    field: "axis",
+                    expected: "Some(axis) for per-channel".into(),
+                    got: "None".into(),
+                })
+            }
+            _ => Err(edgefirst_tensor::Error::QuantizationInvalid {
+                field: "scale",
+                expected: "non-empty".into(),
+                got: format!("len={}", q.scale.len()),
+            }),
+        }
+    }
+}
+
 /// Accept a scalar or a JSON array when deserializing a `Vec<f32>`.
 fn deserialize_scalar_or_vec_f32<'de, D>(de: D) -> Result<Vec<f32>, D::Error>
 where
@@ -1339,6 +1384,78 @@ mod tests {
         let q: Quantization = serde_json::from_str(j).unwrap();
         assert!(q.is_symmetric());
         assert_eq!(q.zero_point_at(0), 0);
+    }
+
+    #[test]
+    fn quantization_to_tensor_per_tensor_asymmetric() {
+        let q = Quantization {
+            scale: vec![0.1],
+            zero_point: Some(vec![-5]),
+            axis: None,
+            dtype: Some(DType::Int8),
+        };
+        let t: edgefirst_tensor::Quantization = (&q).try_into().unwrap();
+        assert!(t.is_per_tensor());
+        assert!(!t.is_symmetric());
+        assert_eq!(t.scale(), &[0.1]);
+        assert_eq!(t.zero_point(), Some(&[-5][..]));
+    }
+
+    #[test]
+    fn quantization_to_tensor_per_tensor_symmetric() {
+        let q = Quantization {
+            scale: vec![0.05],
+            zero_point: None,
+            axis: None,
+            dtype: Some(DType::Int8),
+        };
+        let t: edgefirst_tensor::Quantization = (&q).try_into().unwrap();
+        assert!(t.is_per_tensor());
+        assert!(t.is_symmetric());
+    }
+
+    #[test]
+    fn quantization_to_tensor_per_channel_asymmetric() {
+        let q = Quantization {
+            scale: vec![0.1, 0.2, 0.3],
+            zero_point: Some(vec![-1, 0, 1]),
+            axis: Some(2),
+            dtype: Some(DType::Int8),
+        };
+        let t: edgefirst_tensor::Quantization = (&q).try_into().unwrap();
+        assert!(t.is_per_channel());
+        assert_eq!(t.axis(), Some(2));
+        assert_eq!(t.scale().len(), 3);
+        assert_eq!(t.zero_point().map(|z| z.len()), Some(3));
+    }
+
+    #[test]
+    fn quantization_to_tensor_per_channel_symmetric() {
+        let q = Quantization {
+            scale: vec![0.054, 0.089, 0.195],
+            zero_point: None,
+            axis: Some(0),
+            dtype: Some(DType::Int8),
+        };
+        let t: edgefirst_tensor::Quantization = (&q).try_into().unwrap();
+        assert!(t.is_per_channel());
+        assert!(t.is_symmetric());
+        assert_eq!(t.axis(), Some(0));
+    }
+
+    #[test]
+    fn quantization_to_tensor_per_channel_missing_axis_errors() {
+        let q = Quantization {
+            scale: vec![0.1, 0.2, 0.3],
+            zero_point: None,
+            axis: None,
+            dtype: None,
+        };
+        let err = edgefirst_tensor::Quantization::try_from(&q).unwrap_err();
+        assert!(matches!(
+            err,
+            edgefirst_tensor::Error::QuantizationInvalid { .. }
+        ));
     }
 
     #[test]

@@ -451,66 +451,36 @@ pub struct Segmentation {
     pub segmentation: Array3<u8>,
 }
 
-/// Prototype tensor variants for fused decode+render pipelines.
-///
-/// Carries either raw quantized data (to skip CPU dequantization and let the
-/// GPU shader dequantize) or dequantized f32 data (from float models or legacy
-/// paths).
-#[derive(Debug, Clone)]
-pub enum ProtoTensor {
-    /// Raw int8 protos with quantization parameters — skip CPU dequantization.
-    /// The GPU fragment shader will dequantize per-texel using the scale and
-    /// zero_point.
-    Quantized {
-        protos: Array3<i8>,
-        quantization: Quantization,
-    },
-    /// Dequantized f32 protos (from float models or legacy path).
-    Float(Array3<f32>),
-}
-
-impl ProtoTensor {
-    /// Returns `true` if this is the quantized variant.
-    pub fn is_quantized(&self) -> bool {
-        matches!(self, ProtoTensor::Quantized { .. })
-    }
-
-    /// Returns the spatial dimensions `(height, width, num_protos)`.
-    pub fn dim(&self) -> (usize, usize, usize) {
-        match self {
-            ProtoTensor::Quantized { protos, .. } => protos.dim(),
-            ProtoTensor::Float(arr) => arr.dim(),
-        }
-    }
-
-    /// Returns dequantized f32 protos. For the `Float` variant this is a
-    /// no-copy reference; for `Quantized` it allocates and dequantizes.
-    pub fn as_f32(&self) -> std::borrow::Cow<'_, Array3<f32>> {
-        match self {
-            ProtoTensor::Float(arr) => std::borrow::Cow::Borrowed(arr),
-            ProtoTensor::Quantized {
-                protos,
-                quantization,
-            } => {
-                let scale = quantization.scale;
-                let zp = quantization.zero_point as f32;
-                std::borrow::Cow::Owned(protos.map(|&v| (v as f32 - zp) * scale))
-            }
-        }
-    }
-}
-
 /// Raw prototype data for fused decode+render pipelines.
 ///
 /// Holds post-NMS intermediate state before mask materialization, allowing the
 /// renderer to compute `mask_coeff @ protos` directly (e.g. in a GPU fragment
 /// shader) without materializing intermediate `Array3<u8>` masks.
-#[derive(Debug, Clone)]
+///
+/// Both fields are carried as [`TensorDyn`] so downstream consumers (Rust, C
+/// API, Python) get zero-copy typed access through the HAL's shared tensor
+/// infrastructure. Dtype policy:
+///
+/// | Source model | protos dtype | mask_coefficients dtype | protos.quantization |
+/// |---|---|---|---|
+/// | int8 quantized | [`TensorDyn::I8`] | [`TensorDyn::F32`] (dequantized) | `Some(q)` |
+/// | f32 | [`TensorDyn::F32`] | [`TensorDyn::F32`] | `None` |
+/// | f16 (TensorRT fp16) | [`TensorDyn::F16`] | [`TensorDyn::F16`] | `None` |
+/// | f64 (narrowed) | [`TensorDyn::F32`] | [`TensorDyn::F32`] | `None` |
+///
+/// Quantization metadata lives on the proto tensor itself via
+/// [`edgefirst_tensor::Tensor::quantization`] — float tensors cannot carry
+/// quantization (compile-time gated on the `IntegerType` sealed trait).
+///
+/// `TensorDyn` is not `Clone`, so neither is `ProtoData`. Consumers that need
+/// to share the proto buffer across threads should use `TensorDyn::clone_fd`
+/// / `dmabuf_clone` to dup the backing fd.
+#[derive(Debug)]
 pub struct ProtoData {
-    /// Mask coefficients per detection (each `Vec<f32>` has length `num_protos`).
-    pub mask_coefficients: Vec<Vec<f32>>,
-    /// Prototype tensor, shape `(proto_h, proto_w, num_protos)`.
-    pub protos: ProtoTensor,
+    /// Per-detection mask coefficients, shape `[num_detections, num_protos]`.
+    pub mask_coefficients: edgefirst_tensor::TensorDyn,
+    /// Prototype tensor, shape `[proto_h, proto_w, num_protos]`.
+    pub protos: edgefirst_tensor::TensorDyn,
 }
 
 /// Turns a DetectBoxQuantized into a DetectBox by dequantizing the score.
@@ -3754,18 +3724,16 @@ outputs:
         assert!(output_boxes[1].equal_within_delta(&expected[1], 1.0 / 160.0));
 
         let proto_data = proto_data.expect("segmentation model should return ProtoData");
+        let coeffs_shape = proto_data.mask_coefficients.shape();
         assert_eq!(
-            proto_data.mask_coefficients.len(),
+            coeffs_shape[0],
             output_boxes.len(),
             "mask_coefficients count must match detection count"
         );
-        for coeff in &proto_data.mask_coefficients {
-            assert_eq!(
-                coeff.len(),
-                32,
-                "each detection should have 32 mask coefficients"
-            );
-        }
+        assert_eq!(
+            coeffs_shape[1], 32,
+            "each detection should have 32 mask coefficients"
+        );
     }
 
     // =========================================================================
@@ -4730,7 +4698,7 @@ mod decoder_tracked_tests {
                     };
                     assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
                     assert!(output_boxes[1].equal_within_delta(&expected[1], 1e-6));
-                    assert!(proto_result.is_some_and(|x| x.mask_coefficients.is_empty()));
+                    assert!(proto_result.is_some_and(|x| x.mask_coefficients.shape()[0] == 0));
                 } else {
                     let mut output_masks = Vec::with_capacity(50);
                     {
@@ -4921,7 +4889,7 @@ mod decoder_tracked_tests {
                     };
                     assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
                     assert!(output_boxes[1].equal_within_delta(&expected[1], 1e-6));
-                    assert!(proto_result.is_some_and(|x| x.mask_coefficients.is_empty()));
+                    assert!(proto_result.is_some_and(|x| x.mask_coefficients.shape()[0] == 0));
                 } else {
                     let mut output_masks = Vec::with_capacity(50);
                     {
@@ -5207,7 +5175,7 @@ outputs:
                                 .unwrap()
                         };
                         assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
-                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.is_empty()));
+                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.shape()[0] == 0));
                     } else {
                         let mut output_masks = Vec::with_capacity(50);
                         {
@@ -5305,7 +5273,7 @@ outputs:
                                 .unwrap()
                         };
                         assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
-                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.is_empty()));
+                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.shape()[0] == 0));
                     } else {
                         let mut output_masks = Vec::with_capacity(50);
                         {
@@ -5444,7 +5412,7 @@ outputs:
                                 .unwrap()
                         };
                         assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
-                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.is_empty()));
+                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.shape()[0] == 0));
                     } else {
                         let mut output_masks = Vec::with_capacity(50);
                         {
@@ -5538,7 +5506,7 @@ outputs:
                                 .unwrap()
                         };
                         assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
-                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.is_empty()));
+                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.shape()[0] == 0));
                     } else {
                         let mut output_masks = Vec::with_capacity(50);
                         {
@@ -5748,7 +5716,7 @@ outputs:
                             )
                             .unwrap();
                         assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
-                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.is_empty()));
+                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.shape()[0] == 0));
                     } else {
                         let scores_td =
                             make_u8_tensor(scores_q.shape(), scores_q.as_slice().unwrap());
@@ -5834,7 +5802,7 @@ outputs:
                             )
                             .unwrap();
                         assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
-                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.is_empty()));
+                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.shape()[0] == 0));
                     } else {
                         let detect_td =
                             make_u8_tensor(detect_q.shape(), detect_q.as_slice().unwrap());
@@ -5971,7 +5939,7 @@ outputs:
                             )
                             .unwrap();
                         assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
-                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.is_empty()));
+                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.shape()[0] == 0));
                     } else {
                         let scores_td = make_f64_tensor(scores.shape(), scores.as_slice().unwrap());
                         let mut output_masks = Vec::with_capacity(50);
@@ -6051,7 +6019,7 @@ outputs:
                             )
                             .unwrap();
                         assert!(output_boxes[0].equal_within_delta(&expected[0], 1e-6));
-                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.is_empty()));
+                        assert!(proto_result.is_some_and(|x| x.mask_coefficients.shape()[0] == 0));
                     } else {
                         let detect_td = make_f64_tensor(detect.shape(), detect.as_slice().unwrap());
                         let mut output_masks = Vec::with_capacity(50);

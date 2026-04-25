@@ -601,7 +601,7 @@ impl Decoder {
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<Option<ProtoData>, DecoderError>
     where
-        T: Float + AsPrimitive<f32> + AsPrimitive<u8> + Send + Sync + 'static,
+        T: Float + AsPrimitive<f32> + AsPrimitive<u8> + Send + Sync + crate::yolo::FloatProtoElem,
         f32: AsPrimitive<T>,
     {
         output_boxes.clear();
@@ -757,6 +757,10 @@ impl Decoder {
                 let views = tensor_bridge::quantized_views(maps)?;
                 self.decode_quantized(&views, output_boxes, output_masks)
             }
+            tensor_bridge::MappedOutputs::Float16(maps) => {
+                let views = tensor_bridge::f16_views(maps)?;
+                self.decode_float(&views, output_boxes, output_masks)
+            }
             tensor_bridge::MappedOutputs::Float32(maps) => {
                 let views = tensor_bridge::f32_views(maps)?;
                 self.decode_float(&views, output_boxes, output_masks)
@@ -795,6 +799,10 @@ impl Decoder {
             tensor_bridge::MappedOutputs::Quantized(maps) => {
                 let views = tensor_bridge::quantized_views(maps)?;
                 self.decode_quantized_proto(&views, output_boxes)
+            }
+            tensor_bridge::MappedOutputs::Float16(maps) => {
+                let views = tensor_bridge::f16_views(maps)?;
+                self.decode_float_proto(&views, output_boxes)
             }
             tensor_bridge::MappedOutputs::Float32(maps) => {
                 let views = tensor_bridge::f32_views(maps)?;
@@ -1153,7 +1161,7 @@ impl Decoder {
         output_tracks: &mut Vec<edgefirst_tracker::TrackInfo>,
     ) -> Result<Option<ProtoData>, DecoderError>
     where
-        T: Float + AsPrimitive<f32> + AsPrimitive<u8> + Send + Sync + 'static,
+        T: Float + AsPrimitive<f32> + AsPrimitive<u8> + Send + Sync + crate::yolo::FloatProtoElem,
         f32: AsPrimitive<T>,
     {
         output_boxes.clear();
@@ -1295,6 +1303,17 @@ impl Decoder {
                     output_tracks,
                 )
             }
+            tensor_bridge::MappedOutputs::Float16(maps) => {
+                let views = tensor_bridge::f16_views(maps)?;
+                self.decode_tracked_float(
+                    tracker,
+                    timestamp,
+                    &views,
+                    output_boxes,
+                    output_masks,
+                    output_tracks,
+                )
+            }
             tensor_bridge::MappedOutputs::Float32(maps) => {
                 let views = tensor_bridge::f32_views(maps)?;
                 self.decode_tracked_float(
@@ -1352,6 +1371,16 @@ impl Decoder {
             tensor_bridge::MappedOutputs::Quantized(maps) => {
                 let views = tensor_bridge::quantized_views(maps)?;
                 self.decode_tracked_quantized_proto(
+                    tracker,
+                    timestamp,
+                    &views,
+                    output_boxes,
+                    output_tracks,
+                )
+            }
+            tensor_bridge::MappedOutputs::Float16(maps) => {
+                let views = tensor_bridge::f16_views(maps)?;
+                self.decode_tracked_float_proto(
                     tracker,
                     timestamp,
                     &views,
