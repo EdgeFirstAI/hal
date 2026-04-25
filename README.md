@@ -503,6 +503,40 @@ falls back to PBO or heap memory with no API change required.
 | Generic x86_64 | Mesa (llvmpipe/iris) | DMA-buf or PBO | Depends on driver DMA-buf support |
 | No GPU / macOS | N/A | Mem | CPU fallback, still functional |
 
+### Local fp16 / AVX build overrides
+
+The default HAL binary is built to the target triple's guaranteed
+baseline ISA so that a single distributed binary runs on every CPU
+within that triple. Richer ISAs (ARMv8.2-FP16, x86_64 F16C/FMA/AVX2)
+are **not** enabled by default; until the HAL gains runtime
+CPU-feature detection with dynamic dispatch, baking them in would
+SIGILL on older CPUs.
+
+Developers benchmarking on hosts that do support these features can
+enable them ad-hoc via `RUSTFLAGS`. Example incantations:
+
+```bash
+# Orin Nano (Cortex-A78AE — ARMv8.2-FP16 + dotprod + lse):
+RUSTFLAGS="-C target-cpu=cortex-a78ae" cargo build --release \
+    --target aarch64-unknown-linux-gnu --workspace
+
+# Generic aarch64 with FEAT_FP16 (do NOT use on Cortex-A53 / imx8mp):
+RUSTFLAGS="-C target-feature=+fp16" cargo build --release \
+    --target aarch64-unknown-linux-gnu -p edgefirst-image
+
+# x86_64 Haswell+ (F16C + FMA + AVX2):
+RUSTFLAGS="-C target-feature=+f16c,+fma,+avx2" cargo build --release \
+    -p edgefirst-image
+```
+
+When these flags are active, the f16 mask kernel at
+`crates/image/src/cpu/masks.rs` compiles to native widening
+instructions (`fcvt` on aarch64, `vcvtph2ps` on x86_64) and — on
+x86_64 with `+f16c,+fma` — an explicit 8-lane `_mm256_cvtph_ps +
+_mm256_fmadd_ps` intrinsic path is also enabled via cfg gate. The
+helper `scripts/audit_f16_codegen.sh` disassembles a release build
+of the kernel and confirms native instructions are emitted.
+
 ## Advanced Examples
 
 <details>

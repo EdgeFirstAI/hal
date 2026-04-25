@@ -317,6 +317,37 @@ static void test_tensor_clone_fd_mem_fails(void) {
 }
 
 // =============================================================================
+// Quantization Metadata Tests
+// =============================================================================
+
+static void test_tensor_quantization_float_returns_null(void) {
+    TEST("tensor_quantization_float_returns_null");
+
+    size_t shape[] = {2, 2};
+    struct hal_tensor* t = hal_tensor_new(HAL_DTYPE_F32, shape, 2, HAL_TENSOR_MEMORY_MEM, NULL);
+    ASSERT_NOT_NULL(t);
+    // Float tensors never carry quantization.
+    ASSERT_EQ(NULL, hal_tensor_quantization(t));
+    hal_tensor_free(t);
+    TEST_PASS();
+}
+
+static void test_tensor_quantization_null_input(void) {
+    TEST("tensor_quantization_null_input");
+
+    ASSERT_EQ(NULL, hal_tensor_quantization(NULL));
+    ASSERT_EQ(0, hal_quantization_scale_len(NULL));
+    ASSERT_EQ(0.0f, hal_quantization_scale_at(NULL, 0));
+    ASSERT_EQ(0, hal_quantization_zero_point_at(NULL, 0));
+    ASSERT_EQ(false, hal_quantization_is_symmetric(NULL));
+    size_t axis = 999;
+    ASSERT_EQ(false, hal_quantization_axis(NULL, &axis));
+    // Must be safe to free NULL.
+    hal_quantization_free(NULL);
+    TEST_PASS();
+}
+
+// =============================================================================
 // Main Test Runner
 // =============================================================================
 
@@ -340,6 +371,10 @@ void run_tensor_tests(void) {
     // DMA tests (Linux-specific)
     test_tensor_dma_memory();
     test_tensor_clone_fd_mem_fails();
+
+    // Quantization accessor tests
+    test_tensor_quantization_float_returns_null();
+    test_tensor_quantization_null_input();
 }
 
 #ifdef TEST_TENSOR_STANDALONE

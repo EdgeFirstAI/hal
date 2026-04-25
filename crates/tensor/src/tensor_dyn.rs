@@ -223,6 +223,66 @@ impl TensorDyn {
         self
     }
 
+    /// Quantization metadata. Returns `None` for float variants (F16, F32,
+    /// F64) — quantization does not apply to floating-point tensors.
+    /// Otherwise delegates to the typed `Tensor<T>::quantization()` accessor.
+    pub fn quantization(&self) -> Option<&crate::Quantization> {
+        match self {
+            Self::U8(t) => t.quantization(),
+            Self::I8(t) => t.quantization(),
+            Self::U16(t) => t.quantization(),
+            Self::I16(t) => t.quantization(),
+            Self::U32(t) => t.quantization(),
+            Self::I32(t) => t.quantization(),
+            Self::U64(t) => t.quantization(),
+            Self::I64(t) => t.quantization(),
+            Self::F16(_) | Self::F32(_) | Self::F64(_) => None,
+        }
+    }
+
+    /// Attach quantization metadata. Fails on float variants with
+    /// [`Error::QuantizationInvalid`]; delegates to the typed setter for
+    /// integer variants.
+    pub fn set_quantization(&mut self, q: crate::Quantization) -> crate::Result<()> {
+        match self {
+            Self::U8(t) => t.set_quantization(q),
+            Self::I8(t) => t.set_quantization(q),
+            Self::U16(t) => t.set_quantization(q),
+            Self::I16(t) => t.set_quantization(q),
+            Self::U32(t) => t.set_quantization(q),
+            Self::I32(t) => t.set_quantization(q),
+            Self::U64(t) => t.set_quantization(q),
+            Self::I64(t) => t.set_quantization(q),
+            Self::F16(_) | Self::F32(_) | Self::F64(_) => Err(crate::Error::QuantizationInvalid {
+                field: "dtype_is_integer",
+                expected: "integer tensor dtype (u8/i8/u16/i16/u32/i32/u64/i64)".to_string(),
+                got: format!("{:?}", self.dtype()),
+            }),
+        }
+    }
+
+    /// Builder-style variant of [`Self::set_quantization`]. Consumes self
+    /// and returns it with quantization applied (or the original error).
+    pub fn with_quantization(mut self, q: crate::Quantization) -> crate::Result<Self> {
+        self.set_quantization(q)?;
+        Ok(self)
+    }
+
+    /// Clear any quantization metadata. No-op on float variants.
+    pub fn clear_quantization(&mut self) {
+        match self {
+            Self::U8(t) => t.clear_quantization(),
+            Self::I8(t) => t.clear_quantization(),
+            Self::U16(t) => t.clear_quantization(),
+            Self::I16(t) => t.clear_quantization(),
+            Self::U32(t) => t.clear_quantization(),
+            Self::I32(t) => t.clear_quantization(),
+            Self::U64(t) => t.clear_quantization(),
+            Self::I64(t) => t.clear_quantization(),
+            Self::F16(_) | Self::F32(_) | Self::F64(_) => {}
+        }
+    }
+
     /// Clone the file descriptor associated with this tensor.
     #[cfg(unix)]
     pub fn clone_fd(&self) -> crate::Result<std::os::fd::OwnedFd> {

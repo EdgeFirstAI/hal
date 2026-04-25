@@ -25,8 +25,9 @@ use common::{run_bench, BenchSuite};
 
 use edgefirst_decoder::yolo::impl_yolo_segdet_quant_proto;
 use edgefirst_decoder::{DetectBox, Nms, ProtoData, Quantization, Segmentation, XYWH};
-use edgefirst_image::{ImageProcessor, ImageProcessorTrait};
-use edgefirst_tensor::{DType, PixelFormat};
+use edgefirst_image::{CPUProcessor, ImageProcessor, ImageProcessorTrait, MaskResolution};
+use edgefirst_tensor::{DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait, TensorTrait};
+use half::f16;
 use ndarray::s;
 
 const WARMUP: usize = 10;
@@ -86,14 +87,51 @@ fn decode_proto_data() -> (Vec<DetectBox>, ProtoData) {
 /// whose coordinates exceed 1.01) so we always get valid pre-decoded masks
 /// for benchmarking `draw_decoded_masks`.
 fn materialize_segmentations(detect: &[DetectBox], proto_data: &ProtoData) -> Vec<Segmentation> {
-    let protos_f32 = proto_data.protos.as_f32();
-    let proto_h = protos_f32.shape()[0];
-    let proto_w = protos_f32.shape()[1];
-    let num_protos = protos_f32.shape()[2];
+    use edgefirst_tensor::{TensorDyn, TensorMapTrait, TensorTrait};
+    // Dequantize protos once to f32 for this benchmark (production uses the
+    // native per-dtype kernels in CPUProcessor::materialize_segmentations).
+    let proto_shape = proto_data.protos.shape().to_vec();
+    let (proto_h, proto_w, num_protos) = (proto_shape[0], proto_shape[1], proto_shape[2]);
+    let proto_map = match &proto_data.protos {
+        TensorDyn::I8(t) => {
+            let m = t.map().unwrap();
+            let (scale, zp) = match t.quantization() {
+                Some(q) => (q.scale()[0], q.zero_point().map_or(0, |z| z[0])),
+                None => (1.0, 0),
+            };
+            let data: Vec<f32> = m
+                .as_slice()
+                .iter()
+                .map(|v| (*v as f32 - zp as f32) * scale)
+                .collect();
+            ndarray::Array3::from_shape_vec((proto_h, proto_w, num_protos), data).unwrap()
+        }
+        TensorDyn::F32(t) => {
+            let m = t.map().unwrap();
+            ndarray::Array3::from_shape_vec((proto_h, proto_w, num_protos), m.as_slice().to_vec())
+                .unwrap()
+        }
+        other => panic!("unsupported proto dtype for benchmark: {:?}", other.dtype()),
+    };
+
+    // Flatten mask_coefficients: [N, num_protos] → one row per detection.
+    let coeff_rows: Vec<Vec<f32>> = match &proto_data.mask_coefficients {
+        TensorDyn::F32(t) => {
+            let m = t.map().unwrap();
+            let slice = m.as_slice();
+            (0..detect.len())
+                .map(|i| slice[i * num_protos..(i + 1) * num_protos].to_vec())
+                .collect()
+        }
+        other => panic!(
+            "unsupported mask_coeff dtype for benchmark: {:?}",
+            other.dtype()
+        ),
+    };
 
     detect
         .iter()
-        .zip(proto_data.mask_coefficients.iter())
+        .zip(coeff_rows.iter())
         .map(|(det, coeff)| {
             // Clamp bbox to [0, 1] to avoid NORM_LIMIT rejection
             let xmin = det.bbox.xmin.clamp(0.0, 1.0);
@@ -111,8 +149,8 @@ fn materialize_segmentations(detect: &[DetectBox], proto_data: &ProtoData) -> Ve
             let roi_h = y1.saturating_sub(y0).max(1);
 
             // Extract proto ROI and compute mask_coeff @ protos
-            let roi = protos_f32.slice(s![y0..y0 + roi_h, x0..x0 + roi_w, ..]);
-            let coeff_arr =
+            let roi = proto_map.slice(s![y0..y0 + roi_h, x0..x0 + roi_w, ..]);
+            let coeff_arr: ndarray::Array2<f32> =
                 ndarray::Array2::from_shape_vec((1, num_protos), coeff.clone()).unwrap();
             let protos_2d = roi
                 .to_shape((roi_h * roi_w, num_protos))
@@ -136,6 +174,169 @@ fn materialize_segmentations(detect: &[DetectBox], proto_data: &ProtoData) -> Ve
             }
         })
         .collect()
+}
+
+// =============================================================================
+// dtype_dispatch: compare f32 vs f16 mask materialization paths
+//
+// Builds a `ProtoData` once from the i8 fixture (NMS produces ~30-50 detections
+// at our threshold), widens both `protos` and `mask_coefficients` into f32 and
+// f16 TensorDyn variants, and times `materialize_segmentations` (proto-res)
+// and `materialize_scaled_segmentations` (640×640) through each dispatch.
+//
+// On builds with `-C target-cpu=cortex-a78ae` (or `-C target-feature=+fp16`),
+// the f16 inner loop emits native ARMv8.2 `fcvt`/FMA instructions with single-
+// precision accumulators; on baseline aarch64 builds the same loop falls back
+// to soft-float `__extendhfsf2` calls per element. Comparing the two builds
+// quantifies the fp16 codegen win on Tegra Orin / Cortex-A78AE-class cores.
+// =============================================================================
+
+fn build_proto_dtypes(detect: &[DetectBox], proto_data_i8: &ProtoData) -> (ProtoData, ProtoData) {
+    // Widen the i8 protos and mask coefficients to f32 once (this matches what
+    // the i8 path does internally per-pixel; we hoist it so the f32/f16 bench
+    // measures only the materialize kernel, not the dequant).
+    let proto_h: usize;
+    let proto_w: usize;
+    let num_protos: usize;
+    let protos_f32_vec: Vec<f32> = match &proto_data_i8.protos {
+        TensorDyn::I8(t) => {
+            let shape = TensorTrait::shape(t);
+            proto_h = shape[0];
+            proto_w = shape[1];
+            num_protos = shape[2];
+            let q = t.quantization().expect("i8 protos must carry quant");
+            let scale = q.scale()[0];
+            let zp = q.zero_point().map(|z| z[0]).unwrap_or(0) as f32;
+            let m = t.map().unwrap();
+            m.as_slice()
+                .iter()
+                .map(|v| (*v as f32 - zp) * scale)
+                .collect()
+        }
+        _ => panic!("expected i8 protos in fixture"),
+    };
+
+    let n_det = detect.len();
+    let coeffs_f32_vec: Vec<f32> = match &proto_data_i8.mask_coefficients {
+        TensorDyn::F32(t) => {
+            let m = t.map().unwrap();
+            m.as_slice().to_vec()
+        }
+        TensorDyn::F16(t) => {
+            let m = t.map().unwrap();
+            m.as_slice().iter().map(|v: &f16| v.to_f32()).collect()
+        }
+        _ => panic!("unexpected coefficient dtype"),
+    };
+
+    let proto_shape = [proto_h, proto_w, num_protos];
+    let coeff_shape = [n_det, num_protos];
+
+    let f32_protos = Tensor::<f32>::from_slice(&protos_f32_vec, &proto_shape).unwrap();
+    let f32_coeffs = Tensor::<f32>::from_slice(&coeffs_f32_vec, &coeff_shape).unwrap();
+    let proto_f32 = ProtoData {
+        mask_coefficients: TensorDyn::F32(f32_coeffs),
+        protos: TensorDyn::F32(f32_protos),
+    };
+
+    let protos_f16_vec: Vec<f16> = protos_f32_vec.iter().map(|v| f16::from_f32(*v)).collect();
+    let coeffs_f16_vec: Vec<f16> = coeffs_f32_vec.iter().map(|v| f16::from_f32(*v)).collect();
+    let f16_protos = Tensor::<f16>::from_slice(&protos_f16_vec, &proto_shape).unwrap();
+    let f16_coeffs = Tensor::<f16>::from_slice(&coeffs_f16_vec, &coeff_shape).unwrap();
+    let proto_f16 = ProtoData {
+        mask_coefficients: TensorDyn::F16(f16_coeffs),
+        protos: TensorDyn::F16(f16_protos),
+    };
+
+    (proto_f32, proto_f16)
+}
+
+fn bench_materialize_dtype(suite: &mut BenchSuite) {
+    println!("\n== materialize_masks: dtype dispatch (f32 vs f16) ==\n");
+    println!("  Same workload through fused_*_f32_slice and fused_*_f16_slice.");
+    println!("  f16 codegen depends on RUSTFLAGS — `-C target-cpu=cortex-a78ae`");
+    println!("  enables ARMv8.2-FP16 native instructions; baseline aarch64 emits");
+    println!("  soft-float helpers per element.\n");
+
+    let (detect, proto_data_i8) = decode_proto_data();
+    if detect.is_empty() {
+        println!("  [skipped: no detections from fixture]\n");
+        return;
+    }
+    println!("  N = {} detections (post-NMS)\n", detect.len());
+
+    let (proto_f32, proto_f16) = build_proto_dtypes(&detect, &proto_data_i8);
+    let cpu = CPUProcessor::new();
+
+    // Proto-resolution materialize (160×160 per detection).
+    {
+        let name = "materialize_masks/proto_res/i8";
+        let result = run_bench(name, WARMUP, ITERATIONS, || {
+            let _ = cpu
+                .materialize_segmentations(&detect, &proto_data_i8, None)
+                .unwrap();
+        });
+        result.print_summary();
+        suite.record(&result);
+    }
+    {
+        let name = "materialize_masks/proto_res/f32";
+        let result = run_bench(name, WARMUP, ITERATIONS, || {
+            let _ = cpu
+                .materialize_segmentations(&detect, &proto_f32, None)
+                .unwrap();
+        });
+        result.print_summary();
+        suite.record(&result);
+    }
+    {
+        let name = "materialize_masks/proto_res/f16";
+        let result = run_bench(name, WARMUP, ITERATIONS, || {
+            let _ = cpu
+                .materialize_segmentations(&detect, &proto_f16, None)
+                .unwrap();
+        });
+        result.print_summary();
+        suite.record(&result);
+    }
+
+    // Scaled-resolution materialize (640×640 per detection — the COCO-validation
+    // critical path; this is where the f16 codegen difference shows up most).
+    {
+        let name = "materialize_masks/scaled_640x640/i8";
+        let result = run_bench(name, WARMUP, ITERATIONS, || {
+            let _ = cpu
+                .materialize_scaled_segmentations(&detect, &proto_data_i8, None, 640, 640)
+                .unwrap();
+        });
+        result.print_summary();
+        suite.record(&result);
+    }
+    {
+        let name = "materialize_masks/scaled_640x640/f32";
+        let result = run_bench(name, WARMUP, ITERATIONS, || {
+            let _ = cpu
+                .materialize_scaled_segmentations(&detect, &proto_f32, None, 640, 640)
+                .unwrap();
+        });
+        result.print_summary();
+        suite.record(&result);
+    }
+    {
+        let name = "materialize_masks/scaled_640x640/f16";
+        let result = run_bench(name, WARMUP, ITERATIONS, || {
+            let _ = cpu
+                .materialize_scaled_segmentations(&detect, &proto_f16, None, 640, 640)
+                .unwrap();
+        });
+        result.print_summary();
+        suite.record(&result);
+    }
+
+    // Reference the unused MaskResolution import to avoid a warning when
+    // the helper above is rewritten — currently materialize_segmentations
+    // implies Proto and materialize_scaled_segmentations implies Scaled.
+    let _ = MaskResolution::Proto;
 }
 
 // =============================================================================
@@ -547,99 +748,6 @@ fn run_diagnostic(proc: &mut ImageProcessor) {
     println!();
 }
 
-/// Sweep `materialize_masks` cost across realistic detection counts on the
-/// actual `CPUProcessor` API (not the bench-local helper). The batched-GEMM
-/// path activates at `N >= 3`; sizes 8/16/32/64/100 bracket typical COCO
-/// validation loads (pycocotools `max_det=100`).
-fn bench_materialize_masks_sweep(suite: &mut BenchSuite) {
-    use edgefirst_image::CPUProcessor;
-
-    println!("\n== materialize_masks: N-sweep (CPUProcessor API) ==\n");
-    println!("  Exercises the real materialize_masks path; sizes span the");
-    println!("  validation workload that dominates HAL output time.\n");
-
-    // Get 2 real detections with NMS applied, then replicate them to fill
-    // the desired N. Each replicated detection gets its own coefficient
-    // vector (cloned) so the GEMM path sees N independent mask planes.
-    let (base_detect, base_proto) = decode_proto_data();
-    if base_detect.is_empty() {
-        println!("  [skipped: no detections from fixture]\n");
-        return;
-    }
-
-    // Perturb the base bboxes slightly so they don't all overlap identically
-    // (avoids hitting a degenerate cache-hot case).
-    fn replicated_dataset(
-        n: usize,
-        base_detect: &[DetectBox],
-        base_proto: &ProtoData,
-    ) -> (Vec<DetectBox>, ProtoData) {
-        let mut out_detect = Vec::with_capacity(n);
-        let mut out_coeffs = Vec::with_capacity(n);
-        for i in 0..n {
-            let src = &base_detect[i % base_detect.len()];
-            let src_coeff = &base_proto.mask_coefficients[i % base_proto.mask_coefficients.len()];
-            let t = (i as f32 / n as f32) * 0.3;
-            let bbox = src.bbox;
-            out_detect.push(DetectBox {
-                bbox: edgefirst_decoder::BoundingBox::new(
-                    (bbox.xmin + t * 0.1).clamp(0.0, 0.9),
-                    (bbox.ymin + t * 0.1).clamp(0.0, 0.9),
-                    (bbox.xmax - t * 0.1).max(bbox.xmin + 0.05),
-                    (bbox.ymax - t * 0.1).max(bbox.ymin + 0.05),
-                ),
-                score: src.score,
-                label: src.label,
-            });
-            out_coeffs.push(src_coeff.clone());
-        }
-        // Clone the proto tensor so the inner loop doesn't race.
-        let protos = match &base_proto.protos {
-            edgefirst_decoder::ProtoTensor::Float(a) => {
-                edgefirst_decoder::ProtoTensor::Float(a.clone())
-            }
-            edgefirst_decoder::ProtoTensor::Quantized {
-                protos,
-                quantization,
-            } => edgefirst_decoder::ProtoTensor::Quantized {
-                protos: protos.clone(),
-                quantization: *quantization,
-            },
-        };
-        (
-            out_detect,
-            ProtoData {
-                mask_coefficients: out_coeffs,
-                protos,
-            },
-        )
-    }
-
-    for &n in &[1usize, 2, 3, 8, 16, 32, 64, 100] {
-        let (detect, proto_data) = replicated_dataset(n, &base_detect, &base_proto);
-
-        let mut cpu = CPUProcessor::new();
-        let name = format!("materialize_masks/proto_res/N={n}");
-        let result = run_bench(&name, WARMUP, ITERATIONS, || {
-            let _ = cpu
-                .materialize_segmentations(&detect, &proto_data, None)
-                .unwrap();
-        });
-        result.print_summary();
-        suite.record(&result);
-
-        let mut cpu_scaled = CPUProcessor::new();
-        let name_scaled = format!("materialize_masks/scaled_640x640/N={n}");
-        let result = run_bench(&name_scaled, WARMUP, ITERATIONS, || {
-            let _ = cpu_scaled
-                .materialize_scaled_segmentations(&detect, &proto_data, None, 640, 640)
-                .unwrap();
-        });
-        result.print_summary();
-        suite.record(&result);
-    }
-}
-
 fn main() {
     env_logger::init();
     let mut suite = BenchSuite::from_args();
@@ -656,13 +764,13 @@ fn main() {
     println!("Mask Rendering Benchmark — edgefirst-bench harness");
     println!("  warmup={WARMUP}  iterations={ITERATIONS}");
 
+    bench_materialize_dtype(&mut suite);
     bench_decode_masks(&mut suite);
     bench_proto_extraction(&mut suite);
     bench_draw_decoded_masks(&mut proc, &mut suite);
     bench_draw_proto_masks(&mut proc, &mut suite);
     bench_draw_proto_masks_forced_opengl(&mut suite);
     bench_hybrid_materialize_and_draw(&mut proc, &mut suite);
-    bench_materialize_masks_sweep(&mut suite);
 
     suite.finish();
     println!("\nDone.");

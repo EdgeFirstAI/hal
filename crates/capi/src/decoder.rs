@@ -1220,6 +1220,76 @@ pub unsafe extern "C" fn hal_proto_data_free(proto: *mut HalProtoData) {
     }
 }
 
+/// Take ownership of the proto tensor from a prototype data handle.
+///
+/// Shape `[H, W, num_protos]`. For quantized models, the returned tensor
+/// carries its quantization metadata (accessible via
+/// `hal_tensor_quantization()`).
+///
+/// After calling this, subsequent calls for protos on the same handle
+/// return NULL. The proto data handle itself must still be freed via
+/// `hal_proto_data_free()`.
+///
+/// @param proto Prototype data handle (may be NULL)
+/// @return Newly-owned tensor handle (caller must `hal_tensor_free()`),
+///         or NULL if `proto` is NULL or protos have already been taken
+#[no_mangle]
+pub unsafe extern "C" fn hal_proto_data_take_protos(proto: *mut HalProtoData) -> *mut HalTensor {
+    if proto.is_null() {
+        return std::ptr::null_mut();
+    }
+    let proto = unsafe { &mut *proto };
+    let taken = std::mem::replace(&mut proto.inner.protos, empty_tensor_dyn());
+    if is_empty_sentinel(&taken) {
+        // Already taken — put the sentinel back and return NULL.
+        proto.inner.protos = taken;
+        return std::ptr::null_mut();
+    }
+    Box::into_raw(Box::new(HalTensor { inner: taken }))
+}
+
+/// Take ownership of the mask-coefficients tensor from a prototype data handle.
+///
+/// Shape `[num_detections, num_protos]`.
+///
+/// Same semantics as `hal_proto_data_take_protos()`: subsequent calls
+/// return NULL once taken.
+///
+/// @param proto Prototype data handle (may be NULL)
+/// @return Newly-owned tensor handle (caller must `hal_tensor_free()`),
+///         or NULL if `proto` is NULL or mask_coefficients have been taken
+#[no_mangle]
+pub unsafe extern "C" fn hal_proto_data_take_mask_coefficients(
+    proto: *mut HalProtoData,
+) -> *mut HalTensor {
+    if proto.is_null() {
+        return std::ptr::null_mut();
+    }
+    let proto = unsafe { &mut *proto };
+    let taken = std::mem::replace(&mut proto.inner.mask_coefficients, empty_tensor_dyn());
+    if is_empty_sentinel(&taken) {
+        proto.inner.mask_coefficients = taken;
+        return std::ptr::null_mut();
+    }
+    Box::into_raw(Box::new(HalTensor { inner: taken }))
+}
+
+/// A zero-length `u8` sentinel (shape `[0]`) used by the `take_*` accessors
+/// to mark a tensor field as already-taken. The `is_empty_sentinel` check
+/// matches on dtype + shape + name so legitimate small tensors aren't
+/// confused with the sentinel.
+fn empty_tensor_dyn() -> edgefirst_tensor::TensorDyn {
+    use edgefirst_tensor::{Tensor, TensorDyn, TensorMemory};
+    let t = Tensor::<u8>::new(&[0], Some(TensorMemory::Mem), Some("__taken__"))
+        .expect("sentinel allocation never fails");
+    TensorDyn::U8(t)
+}
+
+fn is_empty_sentinel(t: &edgefirst_tensor::TensorDyn) -> bool {
+    use edgefirst_tensor::TensorDyn;
+    matches!(t, TensorDyn::U8(_)) && t.shape() == [0] && t.name() == "__taken__"
+}
+
 // ============================================================================
 // Detection Box List Functions
 // ============================================================================

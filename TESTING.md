@@ -240,6 +240,36 @@ Use environment variables to isolate tests to specific backends:
 | `EDGEFIRST_FORCE_BACKEND=cpu` | Force CPU-only image processing |
 | `EDGEFIRST_FORCE_BACKEND=opengl` | Force OpenGL backend |
 | `EDGEFIRST_FORCE_BACKEND=g2d` | Force G2D backend |
+
+### Benchmarking native fp16 paths (local only)
+
+The default build does **not** enable `+fp16` (aarch64) or `+f16c`
+(x86_64) — distributed HAL binaries stay on each target triple's
+baseline ISA so they run on older CPUs within the same triple.
+Benchmarks that need to exercise the native f16 mask kernel
+(`fused_dot_sigmoid_f16_slice`) must set `RUSTFLAGS` explicitly on
+the host that supports the extension.
+
+```bash
+# Orin Nano (Cortex-A78AE):
+RUSTFLAGS="-C target-cpu=cortex-a78ae" \
+    cargo bench -p edgefirst-image --bench mask_benchmark
+
+# Generic aarch64 with FEAT_FP16 (verify the host first —
+# imx8mp / Cortex-A53 will SIGILL):
+RUSTFLAGS="-C target-feature=+fp16" \
+    cargo bench -p edgefirst-image --bench mask_benchmark
+
+# x86_64 Haswell+ (enables the explicit _mm256_cvtph_ps intrinsic
+# kernel in addition to the scalar path):
+RUSTFLAGS="-C target-feature=+f16c,+fma,+avx2" \
+    cargo bench -p edgefirst-image --bench mask_benchmark
+```
+
+Verify the release build actually compiled to native instructions
+(not the soft-float `__extendhfsf2` helper) via
+`scripts/audit_f16_codegen.sh <target-triple>`. Requires
+`cargo install cargo-show-asm`.
 | `EDGEFIRST_DISABLE_GL=1` | Disable OpenGL even when hardware is present |
 | `EDGEFIRST_DISABLE_G2D=1` | Disable G2D even when hardware is present |
 
