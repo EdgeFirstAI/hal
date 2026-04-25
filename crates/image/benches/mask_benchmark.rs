@@ -25,8 +25,9 @@ use common::{run_bench, BenchSuite};
 
 use edgefirst_decoder::yolo::impl_yolo_segdet_quant_proto;
 use edgefirst_decoder::{DetectBox, Nms, ProtoData, Quantization, Segmentation, XYWH};
-use edgefirst_image::{ImageProcessor, ImageProcessorTrait};
-use edgefirst_tensor::{DType, PixelFormat};
+use edgefirst_image::{CPUProcessor, ImageProcessor, ImageProcessorTrait, MaskResolution};
+use edgefirst_tensor::{DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait, TensorTrait};
+use half::f16;
 use ndarray::s;
 
 const WARMUP: usize = 10;
@@ -173,6 +174,169 @@ fn materialize_segmentations(detect: &[DetectBox], proto_data: &ProtoData) -> Ve
             }
         })
         .collect()
+}
+
+// =============================================================================
+// dtype_dispatch: compare f32 vs f16 mask materialization paths
+//
+// Builds a `ProtoData` once from the i8 fixture (NMS produces ~30-50 detections
+// at our threshold), widens both `protos` and `mask_coefficients` into f32 and
+// f16 TensorDyn variants, and times `materialize_segmentations` (proto-res)
+// and `materialize_scaled_segmentations` (640×640) through each dispatch.
+//
+// On builds with `-C target-cpu=cortex-a78ae` (or `-C target-feature=+fp16`),
+// the f16 inner loop emits native ARMv8.2 `fcvt`/FMA instructions with single-
+// precision accumulators; on baseline aarch64 builds the same loop falls back
+// to soft-float `__extendhfsf2` calls per element. Comparing the two builds
+// quantifies the fp16 codegen win on Tegra Orin / Cortex-A78AE-class cores.
+// =============================================================================
+
+fn build_proto_dtypes(detect: &[DetectBox], proto_data_i8: &ProtoData) -> (ProtoData, ProtoData) {
+    // Widen the i8 protos and mask coefficients to f32 once (this matches what
+    // the i8 path does internally per-pixel; we hoist it so the f32/f16 bench
+    // measures only the materialize kernel, not the dequant).
+    let proto_h: usize;
+    let proto_w: usize;
+    let num_protos: usize;
+    let protos_f32_vec: Vec<f32> = match &proto_data_i8.protos {
+        TensorDyn::I8(t) => {
+            let shape = TensorTrait::shape(t);
+            proto_h = shape[0];
+            proto_w = shape[1];
+            num_protos = shape[2];
+            let q = t.quantization().expect("i8 protos must carry quant");
+            let scale = q.scale()[0];
+            let zp = q.zero_point().map(|z| z[0]).unwrap_or(0) as f32;
+            let m = t.map().unwrap();
+            m.as_slice()
+                .iter()
+                .map(|v| (*v as f32 - zp) * scale)
+                .collect()
+        }
+        _ => panic!("expected i8 protos in fixture"),
+    };
+
+    let n_det = detect.len();
+    let coeffs_f32_vec: Vec<f32> = match &proto_data_i8.mask_coefficients {
+        TensorDyn::F32(t) => {
+            let m = t.map().unwrap();
+            m.as_slice().to_vec()
+        }
+        TensorDyn::F16(t) => {
+            let m = t.map().unwrap();
+            m.as_slice().iter().map(|v: &f16| v.to_f32()).collect()
+        }
+        _ => panic!("unexpected coefficient dtype"),
+    };
+
+    let proto_shape = [proto_h, proto_w, num_protos];
+    let coeff_shape = [n_det, num_protos];
+
+    let f32_protos = Tensor::<f32>::from_slice(&protos_f32_vec, &proto_shape).unwrap();
+    let f32_coeffs = Tensor::<f32>::from_slice(&coeffs_f32_vec, &coeff_shape).unwrap();
+    let proto_f32 = ProtoData {
+        mask_coefficients: TensorDyn::F32(f32_coeffs),
+        protos: TensorDyn::F32(f32_protos),
+    };
+
+    let protos_f16_vec: Vec<f16> = protos_f32_vec.iter().map(|v| f16::from_f32(*v)).collect();
+    let coeffs_f16_vec: Vec<f16> = coeffs_f32_vec.iter().map(|v| f16::from_f32(*v)).collect();
+    let f16_protos = Tensor::<f16>::from_slice(&protos_f16_vec, &proto_shape).unwrap();
+    let f16_coeffs = Tensor::<f16>::from_slice(&coeffs_f16_vec, &coeff_shape).unwrap();
+    let proto_f16 = ProtoData {
+        mask_coefficients: TensorDyn::F16(f16_coeffs),
+        protos: TensorDyn::F16(f16_protos),
+    };
+
+    (proto_f32, proto_f16)
+}
+
+fn bench_materialize_dtype(suite: &mut BenchSuite) {
+    println!("\n== materialize_masks: dtype dispatch (f32 vs f16) ==\n");
+    println!("  Same workload through fused_*_f32_slice and fused_*_f16_slice.");
+    println!("  f16 codegen depends on RUSTFLAGS — `-C target-cpu=cortex-a78ae`");
+    println!("  enables ARMv8.2-FP16 native instructions; baseline aarch64 emits");
+    println!("  soft-float helpers per element.\n");
+
+    let (detect, proto_data_i8) = decode_proto_data();
+    if detect.is_empty() {
+        println!("  [skipped: no detections from fixture]\n");
+        return;
+    }
+    println!("  N = {} detections (post-NMS)\n", detect.len());
+
+    let (proto_f32, proto_f16) = build_proto_dtypes(&detect, &proto_data_i8);
+    let cpu = CPUProcessor::new();
+
+    // Proto-resolution materialize (160×160 per detection).
+    {
+        let name = "materialize_masks/proto_res/i8";
+        let result = run_bench(name, WARMUP, ITERATIONS, || {
+            let _ = cpu
+                .materialize_segmentations(&detect, &proto_data_i8, None)
+                .unwrap();
+        });
+        result.print_summary();
+        suite.record(&result);
+    }
+    {
+        let name = "materialize_masks/proto_res/f32";
+        let result = run_bench(name, WARMUP, ITERATIONS, || {
+            let _ = cpu
+                .materialize_segmentations(&detect, &proto_f32, None)
+                .unwrap();
+        });
+        result.print_summary();
+        suite.record(&result);
+    }
+    {
+        let name = "materialize_masks/proto_res/f16";
+        let result = run_bench(name, WARMUP, ITERATIONS, || {
+            let _ = cpu
+                .materialize_segmentations(&detect, &proto_f16, None)
+                .unwrap();
+        });
+        result.print_summary();
+        suite.record(&result);
+    }
+
+    // Scaled-resolution materialize (640×640 per detection — the COCO-validation
+    // critical path; this is where the f16 codegen difference shows up most).
+    {
+        let name = "materialize_masks/scaled_640x640/i8";
+        let result = run_bench(name, WARMUP, ITERATIONS, || {
+            let _ = cpu
+                .materialize_scaled_segmentations(&detect, &proto_data_i8, None, 640, 640)
+                .unwrap();
+        });
+        result.print_summary();
+        suite.record(&result);
+    }
+    {
+        let name = "materialize_masks/scaled_640x640/f32";
+        let result = run_bench(name, WARMUP, ITERATIONS, || {
+            let _ = cpu
+                .materialize_scaled_segmentations(&detect, &proto_f32, None, 640, 640)
+                .unwrap();
+        });
+        result.print_summary();
+        suite.record(&result);
+    }
+    {
+        let name = "materialize_masks/scaled_640x640/f16";
+        let result = run_bench(name, WARMUP, ITERATIONS, || {
+            let _ = cpu
+                .materialize_scaled_segmentations(&detect, &proto_f16, None, 640, 640)
+                .unwrap();
+        });
+        result.print_summary();
+        suite.record(&result);
+    }
+
+    // Reference the unused MaskResolution import to avoid a warning when
+    // the helper above is rewritten — currently materialize_segmentations
+    // implies Proto and materialize_scaled_segmentations implies Scaled.
+    let _ = MaskResolution::Proto;
 }
 
 // =============================================================================
@@ -600,6 +764,7 @@ fn main() {
     println!("Mask Rendering Benchmark — edgefirst-bench harness");
     println!("  warmup={WARMUP}  iterations={ITERATIONS}");
 
+    bench_materialize_dtype(&mut suite);
     bench_decode_masks(&mut suite);
     bench_proto_extraction(&mut suite);
     bench_draw_decoded_masks(&mut proc, &mut suite);
