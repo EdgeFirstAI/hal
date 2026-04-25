@@ -1958,7 +1958,7 @@ mod tests {
     }
 
     #[test]
-    fn find_and_dequantize_permuted_nhwc_to_nchw() {
+    fn find_and_dequantize_permuted_nchw_to_nhwc() {
         // Tensor is NCHW [1, 3, 2, 2] but expected is NHWC [1, 2, 2, 3].
         // The fallback should detect the axis permutation and transpose.
         //
@@ -2044,7 +2044,7 @@ mod tests {
     }
 
     #[test]
-    fn find_axis_permutation_nhwc_to_nchw() {
+    fn find_axis_permutation_nchw_to_nhwc() {
         // NCHW [1, 3, 2, 2] → NHWC [1, 2, 2, 3]
         // Perm should map: out[0]=in[0], out[1]=in[2], out[2]=in[3], out[3]=in[1]
         let perm = find_axis_permutation(&[1, 3, 2, 2], &[1, 2, 2, 3]);
