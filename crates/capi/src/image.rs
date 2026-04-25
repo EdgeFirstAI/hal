@@ -1118,6 +1118,65 @@ pub unsafe extern "C" fn hal_image_processor_draw_masks(
     0
 }
 
+/// Draw segmentation masks from pre-decoded boxes and prototype data.
+///
+/// This is the split version of `hal_image_processor_draw_masks()`: the caller
+/// has already called `hal_decoder_decode_proto()` to obtain boxes and proto data,
+/// and now wants to render masks onto a destination image using the GPU-accelerated
+/// proto path.
+///
+/// This avoids re-decoding when the same inference results need to be rendered
+/// onto multiple video frames (e.g., in a dual-pad overlay element where tensors
+/// and video arrive asynchronously at different rates).
+///
+/// **Output contract:** `dst` is always fully written by this call — its prior
+/// contents are discarded.  See `hal_image_processor_draw_decoded_masks` for
+/// the four-case detections × background matrix.
+///
+/// @param processor Image processor handle
+/// @param dst Destination image (RGBA, must not alias `background`)
+/// @param detections Detection box list from `hal_decoder_decode_proto()`
+/// @param proto Prototype data from `hal_decoder_decode_proto()`
+/// @param background Optional source image to composite under masks (NULL = clear to transparent black)
+/// @param opacity Mask opacity (0.0 = transparent, 1.0 = opaque)
+/// @param letterbox Optional letterbox coordinates [x0, y0, x1, y1] in normalized
+///        coordinates (NULL = no letterbox correction)
+/// @param color_mode How to assign colors to detections (HAL_COLOR_MODE_CLASS by default)
+/// @return 0 on success, -1 on error
+/// @par Errors (errno):
+/// - EINVAL: Invalid argument (NULL processor/dst/detections/proto, or `background` aliases `dst`)
+/// - EIO: Rendering failed
+#[no_mangle]
+pub unsafe extern "C" fn hal_image_processor_draw_proto_masks(
+    processor: *mut HalImageProcessor,
+    dst: *mut HalTensor,
+    detections: *const HalDetectBoxList,
+    proto: *const HalProtoData,
+    background: *const HalTensor,
+    opacity: f32,
+    letterbox: *const f32,
+    color_mode: HalColorMode,
+) -> c_int {
+    check_null!(processor, dst, detections, proto);
+
+    // Reject same-HalTensor aliasing before borrowing through build_overlay
+    if !background.is_null() && std::ptr::eq(background, dst as *const _) {
+        return set_error(libc::EINVAL);
+    }
+
+    let overlay = build_overlay(background, opacity, letterbox, color_mode);
+
+    if let Err(e) = (*processor).inner.draw_proto_masks(
+        &mut (*dst).inner,
+        &(*detections).boxes,
+        &(*proto).inner,
+        overlay,
+    ) {
+        return set_error(draw_err_to_errno(&e));
+    }
+    0
+}
+
 /// Decode tracked model outputs and draw masks directly onto a destination image.
 ///
 /// This is the fused tracked path: for segmentation models, prototype data is
