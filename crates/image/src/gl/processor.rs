@@ -4241,7 +4241,7 @@ impl GLProcessorST {
     /// suitable for upload to a GL_TEXTURE_2D_ARRAY with GL_RGBA16F.
     ///
     /// Returns `(repacked_bytes, num_layers)` where each layer is H*W*4 half-floats.
-    fn repack_protos_to_rgba_f16(protos: &ndarray::Array3<f32>) -> (Vec<u8>, usize) {
+    fn repack_protos_to_rgba_f16(protos: ndarray::ArrayView3<'_, f32>) -> (Vec<u8>, usize) {
         let (height, width, num_protos) = protos.dim();
         let num_layers = num_protos.div_ceil(4);
         // Each layer is H*W*4 half-floats, each half-float is 2 bytes
@@ -4275,7 +4275,9 @@ impl GLProcessorST {
     /// conversion step. Used when the decoder produced an fp16 proto
     /// tensor — `TensorDyn::F16` in the current [`ProtoData`] representation
     /// — from an fp16 inference engine.
-    fn repack_protos_f16_to_rgba_f16(protos: &ndarray::Array3<half::f16>) -> (Vec<u8>, usize) {
+    fn repack_protos_f16_to_rgba_f16(
+        protos: ndarray::ArrayView3<'_, half::f16>,
+    ) -> (Vec<u8>, usize) {
         let (height, width, num_protos) = protos.dim();
         let num_layers = num_protos.div_ceil(4);
         let layer_stride = height * width * 4;
@@ -4342,29 +4344,28 @@ impl GLProcessorST {
         }
         let texture_target = gls::gl::TEXTURE_2D_ARRAY;
 
-        // Widen coefficients to Vec<Vec<f32>> once for the GL uniform upload
-        // path. The GL shaders consume f32 uniforms regardless of source dtype.
-        let coeff_rows: Vec<Vec<f32>> = match proto_data.mask_coefficients.dtype() {
+        // Coefficient slice for the GL uniform upload path. The shaders
+        // consume f32 regardless of source dtype, but we hold the F32 case
+        // as a borrowed slice (no allocation) and only widen for F16. The
+        // `Cow<[f32]>` lets both arms share a single downstream pass.
+        //
+        // The F16 widening is one flat `Vec<f32>`, replacing the prior
+        // `Vec<Vec<f32>>` (one inner Vec per detection) — avoids N small
+        // heap allocations per frame on the hot path.
+        let mc_map_f32;
+        let mc_map_f16;
+        let coeff_widen_f16: Vec<f32>;
+        let coeff_slice: &[f32] = match proto_data.mask_coefficients.dtype() {
             DType::F32 => {
                 let t = proto_data.mask_coefficients.as_f32().expect("F32");
-                let m = t.map()?;
-                let s = m.as_slice();
-                (0..coeff_shape[0])
-                    .map(|i| s[i * num_protos..(i + 1) * num_protos].to_vec())
-                    .collect()
+                mc_map_f32 = t.map()?;
+                mc_map_f32.as_slice()
             }
             DType::F16 => {
                 let t = proto_data.mask_coefficients.as_f16().expect("F16");
-                let m = t.map()?;
-                let s = m.as_slice();
-                (0..coeff_shape[0])
-                    .map(|i| {
-                        s[i * num_protos..(i + 1) * num_protos]
-                            .iter()
-                            .map(|v| v.to_f32())
-                            .collect()
-                    })
-                    .collect()
+                mc_map_f16 = t.map()?;
+                coeff_widen_f16 = mc_map_f16.as_slice().iter().map(|v| v.to_f32()).collect();
+                &coeff_widen_f16[..]
             }
             other => {
                 return Err(crate::Error::InvalidShape(format!(
@@ -4373,6 +4374,9 @@ impl GLProcessorST {
             }
         };
 
+        // Each proto-dtype arm holds its `TensorMap` for the duration of the
+        // GL upload and passes an `ArrayView3` borrowed from the mapped slice
+        // to the helper — no per-frame `to_owned()` clone of the proto tensor.
         match proto_data.protos.dtype() {
             DType::I8 => {
                 let t = proto_data.protos.as_i8().expect("I8");
@@ -4394,19 +4398,16 @@ impl GLProcessorST {
                         )));
                     }
                 };
-                // Rebuild an Array3<i8> view over the mapped slice for the
-                // existing shader-upload helper. Standard row-major layout.
-                let protos_arr = ndarray::ArrayView3::<i8>::from_shape(
+                let protos_view = ndarray::ArrayView3::<i8>::from_shape(
                     (height, width, num_protos),
                     m.as_slice(),
                 )
-                .map_err(|e| crate::Error::InvalidShape(format!("{e}")))?
-                .to_owned();
+                .map_err(|e| crate::Error::InvalidShape(format!("{e}")))?;
                 let quantization = edgefirst_decoder::Quantization::new(scale, zp);
                 self.render_proto_segmentation_int8(
                     detect,
-                    &coeff_rows,
-                    &protos_arr,
+                    coeff_slice,
+                    protos_view,
                     &quantization,
                     height,
                     width,
@@ -4418,17 +4419,16 @@ impl GLProcessorST {
             DType::F32 => {
                 let t = proto_data.protos.as_f32().expect("F32");
                 let m = t.map()?;
-                let protos_arr = ndarray::ArrayView3::<f32>::from_shape(
+                let protos_view = ndarray::ArrayView3::<f32>::from_shape(
                     (height, width, num_protos),
                     m.as_slice(),
                 )
-                .map_err(|e| crate::Error::InvalidShape(format!("{e}")))?
-                .to_owned();
+                .map_err(|e| crate::Error::InvalidShape(format!("{e}")))?;
                 if self.has_float_linear {
                     self.render_proto_segmentation_f32(
                         detect,
-                        &coeff_rows,
-                        &protos_arr,
+                        coeff_slice,
+                        protos_view,
                         height,
                         width,
                         num_protos,
@@ -4438,8 +4438,8 @@ impl GLProcessorST {
                 } else {
                     self.render_proto_segmentation_f16(
                         detect,
-                        &coeff_rows,
-                        &protos_arr,
+                        coeff_slice,
+                        protos_view,
                         height,
                         width,
                         num_protos,
@@ -4451,16 +4451,15 @@ impl GLProcessorST {
             DType::F16 => {
                 let t = proto_data.protos.as_f16().expect("F16");
                 let m = t.map()?;
-                let protos_arr = ndarray::ArrayView3::<half::f16>::from_shape(
+                let protos_view = ndarray::ArrayView3::<half::f16>::from_shape(
                     (height, width, num_protos),
                     m.as_slice(),
                 )
-                .map_err(|e| crate::Error::InvalidShape(format!("{e}")))?
-                .to_owned();
+                .map_err(|e| crate::Error::InvalidShape(format!("{e}")))?;
                 self.render_proto_segmentation_f16_native(
                     detect,
-                    &coeff_rows,
-                    &protos_arr,
+                    coeff_slice,
+                    protos_view,
                     height,
                     width,
                     num_protos,
@@ -4485,12 +4484,21 @@ impl GLProcessorST {
         &self,
         program: &GlProgram,
         detect: &[DetectBox],
-        mask_coefficients: &[Vec<f32>],
+        mask_coefficients: &[f32],
+        num_protos: usize,
         color_mode: crate::ColorMode,
     ) -> crate::Result<()> {
         let cvt_screen_coord = |normalized: f32| normalized * 2.0 - 1.0;
 
-        for (idx, (det, coeff)) in detect.iter().zip(mask_coefficients.iter()).enumerate() {
+        // Stride the flat `mask_coefficients` buffer by `num_protos` so we
+        // get one slice per detection. `chunks_exact` requires the total
+        // length to be a multiple of `num_protos`; the dispatcher already
+        // validates `coeff_shape == [N, num_protos]` upstream.
+        for (idx, (det, coeff)) in detect
+            .iter()
+            .zip(mask_coefficients.chunks_exact(num_protos))
+            .enumerate()
+        {
             let color_index = color_mode.index(idx, det.label);
             let mut packed_coeff = [[0.0f32; 4]; 8];
             for (i, val) in coeff.iter().enumerate().take(32) {
@@ -4584,8 +4592,8 @@ impl GLProcessorST {
     fn render_proto_segmentation_int8(
         &mut self,
         detect: &[DetectBox],
-        mask_coefficients: &[Vec<f32>],
-        protos: &ndarray::Array3<i8>,
+        mask_coefficients: &[f32],
+        protos: ndarray::ArrayView3<'_, i8>,
         quantization: &edgefirst_decoder::Quantization,
         height: usize,
         width: usize,
@@ -4741,7 +4749,13 @@ impl GLProcessorST {
                 program.load_uniform_1i(c"num_protos", num_protos as i32)?;
                 program.load_uniform_1f(c"proto_scale", proto_scale)?;
                 program.load_uniform_1f(c"proto_scaled_zp", proto_scaled_zp)?;
-                self.render_proto_detection_quads(program, detect, mask_coefficients, color_mode)?;
+                self.render_proto_detection_quads(
+                    program,
+                    detect,
+                    mask_coefficients,
+                    num_protos,
+                    color_mode,
+                )?;
             }
             Int8InterpolationMode::Bilinear => {
                 let program = &self.proto_segmentation_int8_bilinear_program;
@@ -4749,7 +4763,13 @@ impl GLProcessorST {
                 program.load_uniform_1i(c"num_protos", num_protos as i32)?;
                 program.load_uniform_1f(c"proto_scale", proto_scale)?;
                 program.load_uniform_1f(c"proto_scaled_zp", proto_scaled_zp)?;
-                self.render_proto_detection_quads(program, detect, mask_coefficients, color_mode)?;
+                self.render_proto_detection_quads(
+                    program,
+                    detect,
+                    mask_coefficients,
+                    num_protos,
+                    color_mode,
+                )?;
             }
             Int8InterpolationMode::TwoPass => {
                 self.render_proto_int8_two_pass(
@@ -4774,7 +4794,7 @@ impl GLProcessorST {
     fn render_proto_int8_two_pass(
         &self,
         detect: &[DetectBox],
-        mask_coefficients: &[Vec<f32>],
+        mask_coefficients: &[f32],
         quantization: &edgefirst_decoder::Quantization,
         height: usize,
         width: usize,
@@ -4906,7 +4926,13 @@ impl GLProcessorST {
         gls::active_texture(gls::gl::TEXTURE0);
         gls::bind_texture(texture_target, self.proto_dequant_texture.id);
         program.load_uniform_1i(c"num_layers", num_layers as i32)?;
-        self.render_proto_detection_quads(program, detect, mask_coefficients, color_mode)?;
+        self.render_proto_detection_quads(
+            program,
+            detect,
+            mask_coefficients,
+            num_protos,
+            color_mode,
+        )?;
 
         Ok(())
     }
@@ -4916,8 +4942,8 @@ impl GLProcessorST {
     fn render_proto_segmentation_f32(
         &self,
         detect: &[DetectBox],
-        mask_coefficients: &[Vec<f32>],
-        protos_f32: &ndarray::Array3<f32>,
+        mask_coefficients: &[f32],
+        protos_f32: ndarray::ArrayView3<'_, f32>,
         height: usize,
         width: usize,
         num_protos: usize,
@@ -4973,7 +4999,13 @@ impl GLProcessorST {
         );
 
         program.load_uniform_1i(c"num_protos", num_protos as i32)?;
-        self.render_proto_detection_quads(program, detect, mask_coefficients, color_mode)?;
+        self.render_proto_detection_quads(
+            program,
+            detect,
+            mask_coefficients,
+            num_protos,
+            color_mode,
+        )?;
 
         Ok(())
     }
@@ -4985,8 +5017,8 @@ impl GLProcessorST {
     fn render_proto_segmentation_f16(
         &self,
         detect: &[DetectBox],
-        mask_coefficients: &[Vec<f32>],
-        protos_f32: &ndarray::Array3<f32>,
+        mask_coefficients: &[f32],
+        protos_f32: ndarray::ArrayView3<'_, f32>,
         height: usize,
         width: usize,
         num_protos: usize,
@@ -5035,7 +5067,13 @@ impl GLProcessorST {
         );
 
         program.load_uniform_1i(c"num_layers", num_layers as i32)?;
-        self.render_proto_detection_quads(program, detect, mask_coefficients, color_mode)?;
+        self.render_proto_detection_quads(
+            program,
+            detect,
+            mask_coefficients,
+            num_protos,
+            color_mode,
+        )?;
 
         Ok(())
     }
@@ -5048,8 +5086,8 @@ impl GLProcessorST {
     fn render_proto_segmentation_f16_native(
         &self,
         detect: &[DetectBox],
-        mask_coefficients: &[Vec<f32>],
-        protos_f16: &ndarray::Array3<half::f16>,
+        mask_coefficients: &[f32],
+        protos_f16: ndarray::ArrayView3<'_, half::f16>,
         height: usize,
         width: usize,
         num_protos: usize,
@@ -5098,7 +5136,13 @@ impl GLProcessorST {
         );
 
         program.load_uniform_1i(c"num_layers", num_layers as i32)?;
-        self.render_proto_detection_quads(program, detect, mask_coefficients, color_mode)?;
+        self.render_proto_detection_quads(
+            program,
+            detect,
+            mask_coefficients,
+            num_protos,
+            color_mode,
+        )?;
 
         Ok(())
     }
