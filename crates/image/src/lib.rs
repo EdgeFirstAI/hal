@@ -6679,9 +6679,15 @@ mod image_tests {
             score: 0.9,
             label: 0,
         }];
-        let proto_data = ProtoData {
-            mask_coefficients: vec![vec![0.5; 4]],
-            protos: edgefirst_decoder::ProtoTensor::Float(ndarray::Array3::<f32>::zeros((8, 8, 4))),
+        let proto_data = {
+            use edgefirst_tensor::{Tensor, TensorDyn};
+            let coeff_t = Tensor::<f32>::from_slice(&[0.5_f32; 4], &[1, 4]).unwrap();
+            let protos_t =
+                Tensor::<f32>::from_slice(&vec![0.0_f32; 8 * 8 * 4], &[8, 8, 4]).unwrap();
+            ProtoData {
+                mask_coefficients: TensorDyn::F32(coeff_t),
+                protos: TensorDyn::F32(protos_t),
+            }
         };
         let result =
             converter.draw_proto_masks(&mut dst_dyn, &det, &proto_data, Default::default());
@@ -6724,9 +6730,15 @@ mod image_tests {
             score: 0.9,
             label: 0,
         }];
-        let proto_data = ProtoData {
-            mask_coefficients: vec![vec![0.5; 4]],
-            protos: edgefirst_decoder::ProtoTensor::Float(ndarray::Array3::<f32>::zeros((8, 8, 4))),
+        let proto_data = {
+            use edgefirst_tensor::{Tensor, TensorDyn};
+            let coeff_t = Tensor::<f32>::from_slice(&[0.5_f32; 4], &[1, 4]).unwrap();
+            let protos_t =
+                Tensor::<f32>::from_slice(&vec![0.0_f32; 8 * 8 * 4], &[8, 8, 4]).unwrap();
+            ProtoData {
+                mask_coefficients: TensorDyn::F32(coeff_t),
+                protos: TensorDyn::F32(protos_t),
+            }
         };
         let result =
             converter.draw_proto_masks(&mut dst_dyn, &det, &proto_data, Default::default());
@@ -6838,9 +6850,16 @@ mod image_tests {
         assert_every_pixel_eq(&dst, [0, 0, 0, 0], &format!("{case}/decoded"));
 
         let mut dst = make_dirty_dst(64, 64, None);
-        let proto = ProtoData {
-            mask_coefficients: vec![],
-            protos: edgefirst_decoder::ProtoTensor::Float(ndarray::Array3::<f32>::zeros((8, 8, 4))),
+        let proto = {
+            use edgefirst_tensor::{Tensor, TensorDyn};
+            // Placeholder (no detections); shape [1, 4] to keep the tensor well-formed.
+            let coeff_t = Tensor::<f32>::from_slice(&[0.0_f32; 4], &[1, 4]).unwrap();
+            let protos_t =
+                Tensor::<f32>::from_slice(&vec![0.0_f32; 8 * 8 * 4], &[8, 8, 4]).unwrap();
+            ProtoData {
+                mask_coefficients: TensorDyn::F32(coeff_t),
+                protos: TensorDyn::F32(protos_t),
+            }
         };
         processor
             .draw_proto_masks(&mut dst, &[], &proto, MaskOverlay::default())
@@ -6862,9 +6881,16 @@ mod image_tests {
         assert_every_pixel_eq(&dst, bg_color, &format!("{case}/decoded bg blit"));
 
         let mut dst = make_dirty_dst(64, 64, None);
-        let proto = ProtoData {
-            mask_coefficients: vec![],
-            protos: edgefirst_decoder::ProtoTensor::Float(ndarray::Array3::<f32>::zeros((8, 8, 4))),
+        let proto = {
+            use edgefirst_tensor::{Tensor, TensorDyn};
+            // Placeholder (no detections); shape [1, 4] to keep the tensor well-formed.
+            let coeff_t = Tensor::<f32>::from_slice(&[0.0_f32; 4], &[1, 4]).unwrap();
+            let protos_t =
+                Tensor::<f32>::from_slice(&vec![0.0_f32; 8 * 8 * 4], &[8, 8, 4]).unwrap();
+            ProtoData {
+                mask_coefficients: TensorDyn::F32(coeff_t),
+                protos: TensorDyn::F32(protos_t),
+            }
         };
         processor
             .draw_proto_masks(&mut dst, &[], &proto, overlay)

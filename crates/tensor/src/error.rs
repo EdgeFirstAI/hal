@@ -23,6 +23,19 @@ pub enum Error {
     InvalidShape(String),
     InvalidArgument(String),
     InvalidOperation(String),
+    /// Structured quantization-invariant failure. Round-trippable through
+    /// the C and Python boundaries so callers can diagnose which field
+    /// failed without parsing strings.
+    QuantizationInvalid {
+        /// Which invariant failed: `"scale.len"`, `"zero_point.len"`,
+        /// `"axis"`, `"per_channel_requires_axis"`,
+        /// `"per_tensor_redundant_axis"`, `"dtype_is_integer"`.
+        field: &'static str,
+        /// What the validator expected, e.g. `"length matches scale (48)"`.
+        expected: String,
+        /// What was observed, e.g. `"length 32"`.
+        got: String,
+    },
 }
 
 impl From<std::io::Error> for Error {
