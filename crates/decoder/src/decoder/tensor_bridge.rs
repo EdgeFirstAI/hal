@@ -8,6 +8,7 @@
 //! ndarray views that the existing decode methods consume.
 
 use edgefirst_tensor::{TensorDyn, TensorMap, TensorMapTrait, TensorTrait};
+use half::f16;
 use ndarray::ArrayViewD;
 
 use super::ArrayViewDQuantized;
@@ -20,6 +21,8 @@ use crate::DecoderError;
 pub(super) enum MappedOutputs {
     /// All outputs are integer types (u8, i8, u16, i16, u32, i32).
     Quantized(Vec<QuantizedMap>),
+    /// All outputs are f16 (TensorRT fp16, GPU half-float models).
+    Float16(Vec<TensorMap<f16>>),
     /// All outputs are f32.
     Float32(Vec<TensorMap<f32>>),
     /// All outputs are f64.
@@ -63,9 +66,10 @@ impl QuantizedMap {
 /// (integer) or floating-point.
 ///
 /// All integer types (u8, i8, u16, i16, u32, i32) are grouped as quantized.
-/// Float types (f32, f64) are grouped by precision. Mixed float/integer
-/// inputs are an error, except that i32 tensors mixed with f32 are allowed
-/// (some models produce mixed outputs where shape/count tensors are i32).
+/// Float types (f16, f32, f64) are grouped by precision. Mixed float/integer
+/// inputs are an error, except that i32 tensors mixed with a float dtype are
+/// allowed (some models produce mixed outputs where shape/count tensors are
+/// i32).
 ///
 /// # Errors
 ///
@@ -73,7 +77,7 @@ impl QuantizedMap {
 /// - The output slice is empty
 /// - Tensor memory mapping fails
 /// - Tensor types are mixed in an unsupported way
-/// - An unsupported dtype is encountered (u64, i64, f16)
+/// - An unsupported dtype is encountered (u64, i64)
 pub(super) fn map_tensors(outputs: &[&TensorDyn]) -> Result<MappedOutputs, DecoderError> {
     if outputs.is_empty() {
         return Err(DecoderError::InvalidConfig("no outputs".to_string()));
@@ -84,7 +88,9 @@ pub(super) fn map_tensors(outputs: &[&TensorDyn]) -> Result<MappedOutputs, Decod
     for &t in outputs {
         if matches!(
             t.dtype(),
-            edgefirst_tensor::DType::F32 | edgefirst_tensor::DType::F64
+            edgefirst_tensor::DType::F16
+                | edgefirst_tensor::DType::F32
+                | edgefirst_tensor::DType::F64
         ) {
             float_dtype = Some(t.dtype());
             break;
@@ -98,51 +104,76 @@ pub(super) fn map_tensors(outputs: &[&TensorDyn]) -> Result<MappedOutputs, Decod
     }
 }
 
-/// Map all outputs as float tensors (f32 or f64).
+/// Map all outputs as float tensors (f16, f32, or f64).
 fn map_float_tensors(
     outputs: &[&TensorDyn],
     first_dtype: edgefirst_tensor::DType,
 ) -> Result<MappedOutputs, DecoderError> {
-    if first_dtype == edgefirst_tensor::DType::F32 {
-        let mut maps = Vec::with_capacity(outputs.len());
-        for &t in outputs {
-            match t {
-                TensorDyn::F32(tensor) => {
-                    maps.push(tensor.map().map_err(|e| {
-                        DecoderError::InvalidConfig(format!("tensor map failed: {e}"))
-                    })?);
-                }
-                // Some models have mixed f32 + i32 outputs (e.g. count tensors).
-                // Skip i32 tensors silently; the decoder indexes only f32 outputs.
-                TensorDyn::I32(_) => continue,
-                _ => {
-                    return Err(DecoderError::InvalidConfig(format!(
-                        "mixed tensor types: expected f32, got {:?}",
-                        t.dtype()
-                    )));
-                }
-            }
-        }
-        Ok(MappedOutputs::Float32(maps))
-    } else {
-        // f64
-        let mut maps = Vec::with_capacity(outputs.len());
-        for &t in outputs {
-            match t {
-                TensorDyn::F64(tensor) => {
-                    maps.push(tensor.map().map_err(|e| {
-                        DecoderError::InvalidConfig(format!("tensor map failed: {e}"))
-                    })?);
-                }
-                _ => {
-                    return Err(DecoderError::InvalidConfig(format!(
-                        "mixed tensor types: expected f64, got {:?}",
-                        t.dtype()
-                    )));
+    match first_dtype {
+        edgefirst_tensor::DType::F16 => {
+            let mut maps = Vec::with_capacity(outputs.len());
+            for &t in outputs {
+                match t {
+                    TensorDyn::F16(tensor) => {
+                        maps.push(tensor.map().map_err(|e| {
+                            DecoderError::InvalidConfig(format!("tensor map failed: {e}"))
+                        })?);
+                    }
+                    // Mixed f16 + i32 is allowed: skip i32 tensors silently
+                    // (matches the f32 path's handling of count/shape tensors).
+                    TensorDyn::I32(_) => continue,
+                    _ => {
+                        return Err(DecoderError::InvalidConfig(format!(
+                            "mixed tensor types: expected f16, got {:?}",
+                            t.dtype()
+                        )));
+                    }
                 }
             }
+            Ok(MappedOutputs::Float16(maps))
         }
-        Ok(MappedOutputs::Float64(maps))
+        edgefirst_tensor::DType::F32 => {
+            let mut maps = Vec::with_capacity(outputs.len());
+            for &t in outputs {
+                match t {
+                    TensorDyn::F32(tensor) => {
+                        maps.push(tensor.map().map_err(|e| {
+                            DecoderError::InvalidConfig(format!("tensor map failed: {e}"))
+                        })?);
+                    }
+                    // Some models have mixed f32 + i32 outputs (e.g. count tensors).
+                    // Skip i32 tensors silently; the decoder indexes only f32 outputs.
+                    TensorDyn::I32(_) => continue,
+                    _ => {
+                        return Err(DecoderError::InvalidConfig(format!(
+                            "mixed tensor types: expected f32, got {:?}",
+                            t.dtype()
+                        )));
+                    }
+                }
+            }
+            Ok(MappedOutputs::Float32(maps))
+        }
+        edgefirst_tensor::DType::F64 => {
+            let mut maps = Vec::with_capacity(outputs.len());
+            for &t in outputs {
+                match t {
+                    TensorDyn::F64(tensor) => {
+                        maps.push(tensor.map().map_err(|e| {
+                            DecoderError::InvalidConfig(format!("tensor map failed: {e}"))
+                        })?);
+                    }
+                    _ => {
+                        return Err(DecoderError::InvalidConfig(format!(
+                            "mixed tensor types: expected f64, got {:?}",
+                            t.dtype()
+                        )));
+                    }
+                }
+            }
+            Ok(MappedOutputs::Float64(maps))
+        }
+        _ => unreachable!("map_float_tensors called with non-float dtype {first_dtype:?}"),
     }
 }
 
@@ -200,6 +231,17 @@ pub(super) fn quantized_views(
     maps.iter().map(|m| m.as_view()).collect()
 }
 
+/// Convert a slice of `TensorMap<f16>` into `ArrayViewD<f16>` views.
+pub(super) fn f16_views(maps: &[TensorMap<f16>]) -> Result<Vec<ArrayViewD<'_, f16>>, DecoderError> {
+    maps.iter()
+        .map(|m| {
+            let shape = m.shape().to_vec();
+            ArrayViewD::from_shape(shape.as_slice(), m.as_slice())
+                .map_err(|e| DecoderError::InvalidConfig(format!("tensor shape: {e}")))
+        })
+        .collect()
+}
+
 /// Convert a slice of `TensorMap<f32>` into `ArrayViewD<f32>` views.
 pub(super) fn f32_views(maps: &[TensorMap<f32>]) -> Result<Vec<ArrayViewD<'_, f32>>, DecoderError> {
     maps.iter()
@@ -250,6 +292,14 @@ mod tensor_bridge_tests {
     make_tensor_fn!(make_i32, i32, I32);
     make_tensor_fn!(make_f32, f32, F32);
     make_tensor_fn!(make_f64, f64, F64);
+
+    fn make_f16(shape: &[usize], values: &[half::f16]) -> TensorDyn {
+        let t = Tensor::<half::f16>::new(shape, Some(TensorMemory::Mem), None).unwrap();
+        let mut m = t.map().unwrap();
+        m.as_mut_slice()[..values.len()].copy_from_slice(values);
+        drop(m);
+        TensorDyn::F16(t)
+    }
 
     // ─── map_tensors tests ───────────────────────────────
 
@@ -502,7 +552,112 @@ mod tensor_bridge_tests {
         };
     }
 
-    test_map_tensors_rejected!(test_map_tensors_f16_rejected, DType::F16);
     test_map_tensors_rejected!(test_map_tensors_u64_rejected, DType::U64);
     test_map_tensors_rejected!(test_map_tensors_i64_rejected, DType::I64);
+
+    // ─── f16 acceptance tests ───────────────────────────
+
+    #[test]
+    fn test_map_tensors_single_f16() {
+        let t = make_f16(
+            &[1, 3],
+            &[
+                half::f16::from_f32(1.0),
+                half::f16::from_f32(2.5),
+                half::f16::from_f32(3.75),
+            ],
+        );
+        let mapped = tensor_bridge::map_tensors(&[&t]).unwrap();
+        if let MappedOutputs::Float16(maps) = &mapped {
+            assert_eq!(maps.len(), 1);
+        } else {
+            panic!("expected MappedOutputs::Float16");
+        }
+    }
+
+    #[test]
+    fn test_map_tensors_multiple_f16() {
+        let t1 = make_f16(
+            &[1, 2],
+            &[half::f16::from_f32(1.0), half::f16::from_f32(2.0)],
+        );
+        let t2 = make_f16(
+            &[1, 3],
+            &[
+                half::f16::from_f32(3.0),
+                half::f16::from_f32(4.0),
+                half::f16::from_f32(5.0),
+            ],
+        );
+        let mapped = tensor_bridge::map_tensors(&[&t1, &t2]).unwrap();
+        if let MappedOutputs::Float16(maps) = &mapped {
+            assert_eq!(maps.len(), 2);
+        } else {
+            panic!("expected MappedOutputs::Float16");
+        }
+    }
+
+    #[test]
+    fn test_map_tensors_f16_with_i32_skipped() {
+        // Mixed f16 + i32 is allowed: i32 tensors are silently skipped,
+        // mirroring the f32 path (some models emit count/shape tensors as i32).
+        let t1 = make_f16(
+            &[1, 2],
+            &[half::f16::from_f32(1.0), half::f16::from_f32(2.0)],
+        );
+        let t2 = make_i32(&[1, 1], &[42]);
+        let mapped = tensor_bridge::map_tensors(&[&t1, &t2]).unwrap();
+        if let MappedOutputs::Float16(maps) = &mapped {
+            assert_eq!(maps.len(), 1);
+        } else {
+            panic!("expected MappedOutputs::Float16");
+        }
+    }
+
+    #[test]
+    fn test_map_tensors_mixed_f16_f32_rejected() {
+        let t1 = make_f16(
+            &[1, 2],
+            &[half::f16::from_f32(1.0), half::f16::from_f32(2.0)],
+        );
+        let t2 = make_f32(&[1, 2], &[3.0, 4.0]);
+        let result = tensor_bridge::map_tensors(&[&t1, &t2]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_map_tensors_mixed_f16_u8_rejected() {
+        let t1 = make_f16(
+            &[1, 2],
+            &[half::f16::from_f32(1.0), half::f16::from_f32(2.0)],
+        );
+        let t2 = make_u8(&[1, 2], &[10, 20]);
+        let result = tensor_bridge::map_tensors(&[&t1, &t2]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_f16_views_data() {
+        let t = make_f16(
+            &[1, 2, 3],
+            &[
+                half::f16::from_f32(1.0),
+                half::f16::from_f32(2.0),
+                half::f16::from_f32(3.0),
+                half::f16::from_f32(4.0),
+                half::f16::from_f32(5.0),
+                half::f16::from_f32(6.0),
+            ],
+        );
+        let mapped = tensor_bridge::map_tensors(&[&t]).unwrap();
+        if let MappedOutputs::Float16(maps) = &mapped {
+            let views = tensor_bridge::f16_views(maps).unwrap();
+            assert_eq!(views.len(), 1);
+            assert_eq!(views[0].shape(), &[1, 2, 3]);
+            assert_eq!(views[0][[0, 0, 0]], half::f16::from_f32(1.0));
+            assert_eq!(views[0][[0, 1, 2]], half::f16::from_f32(6.0));
+        } else {
+            panic!("expected Float16");
+        }
+    }
 }

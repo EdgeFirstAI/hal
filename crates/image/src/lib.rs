@@ -248,10 +248,19 @@ pub(crate) fn padded_dma_pitch_for(
     width: usize,
     memory: &Option<TensorMemory>,
 ) -> Option<usize> {
-    // Only pad when caller wants DMA (explicit or default). Padding for a
-    // Mem/Shm tensor would be surprising and waste bytes.
-    if !matches!(memory, None | Some(TensorMemory::Dma)) {
-        return None;
+    // Only pad when the caller explicitly requested DMA, or when they
+    // left memory selection to the allocator AND DMA is actually
+    // available. `Tensor::image_with_stride(..., None)` always routes
+    // through DMA allocation, so treating `None` as "DMA wanted"
+    // unconditionally would convert a normally-working image load into
+    // a hard failure on systems where DMA is unavailable (sandboxed
+    // CI, missing `/dev/dma_heap`, permission-denied containers) —
+    // whereas `Tensor::image(..., None)` would have fallen back to
+    // SHM/Mem there.
+    match memory {
+        Some(TensorMemory::Dma) => {}
+        None if edgefirst_tensor::is_dma_available() => {}
+        _ => return None,
     }
     // Padding only applies to packed layouts — `Tensor::image_with_stride`
     // rejects semi-planar / planar formats, and those take their own
@@ -281,6 +290,15 @@ pub(crate) fn copy_packed_to_padded_dma(src: &Tensor<u8>, dst: &mut Tensor<u8>) 
     let width = dst.width().ok_or(Error::NotAnImage)?;
     let height = dst.height().ok_or(Error::NotAnImage)?;
     let fmt = dst.format().ok_or(Error::NotAnImage)?;
+    let src_width = src.width().ok_or(Error::NotAnImage)?;
+    let src_height = src.height().ok_or(Error::NotAnImage)?;
+    let src_fmt = src.format().ok_or(Error::NotAnImage)?;
+    if src_width != width || src_height != height || src_fmt != fmt {
+        return Err(Error::Internal(format!(
+            "copy_packed_to_padded_dma: src and dst image metadata must match \
+             (src: {src_width}x{src_height} {src_fmt:?}, dst: {width}x{height} {fmt:?})"
+        )));
+    }
     let bpp = primary_plane_bpp(fmt, 1).ok_or_else(|| {
         Error::NotSupported(format!(
             "copy_packed_to_padded_dma: unknown bpp for {fmt:?}"
@@ -306,7 +324,7 @@ pub(crate) fn copy_packed_to_padded_dma(src: &Tensor<u8>, dst: &mut Tensor<u8>) 
         return Err(Error::Internal(format!(
             "copy_packed_to_padded_dma: src has {} bytes, need {} ({}x{} @ {} bpp)",
             src_bytes.len(),
-            natural * height,
+            natural.saturating_mul(height),
             width,
             height,
             bpp,
@@ -316,7 +334,7 @@ pub(crate) fn copy_packed_to_padded_dma(src: &Tensor<u8>, dst: &mut Tensor<u8>) 
         return Err(Error::Internal(format!(
             "copy_packed_to_padded_dma: dst has {} bytes, need {} ({} stride × {} rows)",
             dst_bytes.len(),
-            dst_stride * height,
+            dst_stride.saturating_mul(height),
             dst_stride,
             height,
         )));
@@ -3460,6 +3478,7 @@ mod image_tests {
     /// compiled without its JPEG feature). Used to exercise the decoder /
     /// pitch-padding paths for arbitrary dimensions without having to bundle
     /// a fixture file per test size.
+    #[cfg(target_os = "linux")]
     fn make_rgb_jpeg(width: u32, height: u32) -> Vec<u8> {
         let mut bytes = Vec::with_capacity((width * height * 3) as usize);
         for y in 0..height {
@@ -3604,6 +3623,65 @@ mod image_tests {
             );
             assert_eq!(loaded.width(), Some(w as usize));
             assert_eq!(loaded.height(), Some(333));
+        }
+    }
+
+    /// `padded_dma_pitch_for` must respect the caller's memory choice and
+    /// must NOT route into the pitch-padded DMA path when the caller left
+    /// the choice to the allocator (`None`) but DMA is unavailable on the
+    /// host. The padded path requires `image_with_stride`, which always
+    /// allocates DMA — taking it on a system without `/dev/dma_heap`
+    /// would convert a normally-working image load into a hard failure
+    /// (since `Tensor::image(..., None)` would have fallen back to
+    /// SHM/Mem).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_padded_dma_pitch_for_respects_memory_choice() {
+        use edgefirst_tensor::{is_dma_available, TensorMemory};
+
+        // 500×4 = 2000 → padded to 2048 by GPU alignment. Use it for
+        // every case so any "no padding" answer is unambiguous.
+        let unaligned_w = 500;
+
+        // Caller asks for Mem / Shm: never pad, regardless of DMA.
+        assert_eq!(
+            crate::padded_dma_pitch_for(PixelFormat::Rgba, unaligned_w, &Some(TensorMemory::Mem),),
+            None,
+            "Mem must never trigger DMA padding"
+        );
+        assert_eq!(
+            crate::padded_dma_pitch_for(PixelFormat::Rgba, unaligned_w, &Some(TensorMemory::Shm),),
+            None,
+            "Shm must never trigger DMA padding"
+        );
+
+        // Caller explicitly asks for DMA: always pad if width needs it.
+        // Even if the runtime can't actually allocate DMA, the caller
+        // owns that decision and the resulting allocation error is
+        // their problem, not ours.
+        assert_eq!(
+            crate::padded_dma_pitch_for(PixelFormat::Rgba, unaligned_w, &Some(TensorMemory::Dma),),
+            Some(2048),
+            "explicit Dma must pad regardless of runtime DMA availability"
+        );
+
+        // Caller leaves it to the allocator: behaviour depends on
+        // host-runtime DMA availability. This is the case the fix
+        // guards against.
+        let none_result = crate::padded_dma_pitch_for(PixelFormat::Rgba, unaligned_w, &None);
+        if is_dma_available() {
+            assert_eq!(
+                none_result,
+                Some(2048),
+                "memory=None + DMA available → pad (will route through DMA)"
+            );
+        } else {
+            assert_eq!(
+                none_result, None,
+                "memory=None + DMA unavailable → must NOT pad (would force \
+                 image_with_stride into a DMA-only allocation that fails). \
+                 Regression: padded_dma_pitch_for ignored is_dma_available()."
+            );
         }
     }
 
@@ -6601,9 +6679,15 @@ mod image_tests {
             score: 0.9,
             label: 0,
         }];
-        let proto_data = ProtoData {
-            mask_coefficients: vec![vec![0.5; 4]],
-            protos: edgefirst_decoder::ProtoTensor::Float(ndarray::Array3::<f32>::zeros((8, 8, 4))),
+        let proto_data = {
+            use edgefirst_tensor::{Tensor, TensorDyn};
+            let coeff_t = Tensor::<f32>::from_slice(&[0.5_f32; 4], &[1, 4]).unwrap();
+            let protos_t =
+                Tensor::<f32>::from_slice(&vec![0.0_f32; 8 * 8 * 4], &[8, 8, 4]).unwrap();
+            ProtoData {
+                mask_coefficients: TensorDyn::F32(coeff_t),
+                protos: TensorDyn::F32(protos_t),
+            }
         };
         let result =
             converter.draw_proto_masks(&mut dst_dyn, &det, &proto_data, Default::default());
@@ -6646,9 +6730,15 @@ mod image_tests {
             score: 0.9,
             label: 0,
         }];
-        let proto_data = ProtoData {
-            mask_coefficients: vec![vec![0.5; 4]],
-            protos: edgefirst_decoder::ProtoTensor::Float(ndarray::Array3::<f32>::zeros((8, 8, 4))),
+        let proto_data = {
+            use edgefirst_tensor::{Tensor, TensorDyn};
+            let coeff_t = Tensor::<f32>::from_slice(&[0.5_f32; 4], &[1, 4]).unwrap();
+            let protos_t =
+                Tensor::<f32>::from_slice(&vec![0.0_f32; 8 * 8 * 4], &[8, 8, 4]).unwrap();
+            ProtoData {
+                mask_coefficients: TensorDyn::F32(coeff_t),
+                protos: TensorDyn::F32(protos_t),
+            }
         };
         let result =
             converter.draw_proto_masks(&mut dst_dyn, &det, &proto_data, Default::default());
@@ -6760,9 +6850,16 @@ mod image_tests {
         assert_every_pixel_eq(&dst, [0, 0, 0, 0], &format!("{case}/decoded"));
 
         let mut dst = make_dirty_dst(64, 64, None);
-        let proto = ProtoData {
-            mask_coefficients: vec![],
-            protos: edgefirst_decoder::ProtoTensor::Float(ndarray::Array3::<f32>::zeros((8, 8, 4))),
+        let proto = {
+            use edgefirst_tensor::{Tensor, TensorDyn};
+            // Placeholder (no detections); shape [1, 4] to keep the tensor well-formed.
+            let coeff_t = Tensor::<f32>::from_slice(&[0.0_f32; 4], &[1, 4]).unwrap();
+            let protos_t =
+                Tensor::<f32>::from_slice(&vec![0.0_f32; 8 * 8 * 4], &[8, 8, 4]).unwrap();
+            ProtoData {
+                mask_coefficients: TensorDyn::F32(coeff_t),
+                protos: TensorDyn::F32(protos_t),
+            }
         };
         processor
             .draw_proto_masks(&mut dst, &[], &proto, MaskOverlay::default())
@@ -6784,9 +6881,16 @@ mod image_tests {
         assert_every_pixel_eq(&dst, bg_color, &format!("{case}/decoded bg blit"));
 
         let mut dst = make_dirty_dst(64, 64, None);
-        let proto = ProtoData {
-            mask_coefficients: vec![],
-            protos: edgefirst_decoder::ProtoTensor::Float(ndarray::Array3::<f32>::zeros((8, 8, 4))),
+        let proto = {
+            use edgefirst_tensor::{Tensor, TensorDyn};
+            // Placeholder (no detections); shape [1, 4] to keep the tensor well-formed.
+            let coeff_t = Tensor::<f32>::from_slice(&[0.0_f32; 4], &[1, 4]).unwrap();
+            let protos_t =
+                Tensor::<f32>::from_slice(&vec![0.0_f32; 8 * 8 * 4], &[8, 8, 4]).unwrap();
+            ProtoData {
+                mask_coefficients: TensorDyn::F32(coeff_t),
+                protos: TensorDyn::F32(protos_t),
+            }
         };
         processor
             .draw_proto_masks(&mut dst, &[], &proto, overlay)

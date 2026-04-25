@@ -21,6 +21,7 @@ argminmax = { workspace = true }
 edgefirst-tensor = { workspace = true }
 edgefirst-tracker = { workspace = true, optional = true }
 fast-math = { workspace = true }
+half = { workspace = true }
 log = { workspace = true }
 ndarray = { workspace = true }
 ndarray-stats = { workspace = true }

@@ -1880,7 +1880,7 @@ mod gl_tests {
         assert!(!output_boxes.is_empty(), "No detections from model");
 
         // Materialize masks on CPU for the hybrid path
-        let mut cpu_proc = crate::CPUProcessor::new();
+        let cpu_proc = crate::CPUProcessor::new();
         let segmentation = cpu_proc
             .materialize_segmentations(&output_boxes, &proto_data, None)
             .unwrap();

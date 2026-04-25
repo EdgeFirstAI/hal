@@ -480,6 +480,23 @@ typedef enum hal_log_level {
 } hal_log_level;
 
 /**
+ * Quantization mode discriminant.
+ *
+ * | Mode | Semantics |
+ * |---|---|
+ * | HAL_TENSOR_QUANT_KIND_PER_TENSOR_SYMMETRIC | single scale, zero point = 0 |
+ * | HAL_TENSOR_QUANT_KIND_PER_TENSOR | single scale, single zero point |
+ * | HAL_TENSOR_QUANT_KIND_PER_CHANNEL_SYMMETRIC | per-channel scales, zero point = 0 |
+ * | HAL_TENSOR_QUANT_KIND_PER_CHANNEL | per-channel scales + zero points |
+ */
+typedef enum HalTensorQuantKind {
+  HAL_TENSOR_QUANT_KIND_PER_TENSOR_SYMMETRIC = 0,
+  HAL_TENSOR_QUANT_KIND_PER_TENSOR = 1,
+  HAL_TENSOR_QUANT_KIND_PER_CHANNEL_SYMMETRIC = 2,
+  HAL_TENSOR_QUANT_KIND_PER_CHANNEL = 3,
+} HalTensorQuantKind;
+
+/**
  * Opaque ByteTrack tracker type.
  */
 typedef struct hal_bytetrack hal_bytetrack;
@@ -611,6 +628,14 @@ typedef struct hal_tensor hal_tensor;
  * This is an opaque type - use hal_tensor_map_* functions to interact with it.
  */
 typedef struct hal_tensor_map hal_tensor_map;
+
+/**
+ * Opaque quantization metadata handle.
+ *
+ * Borrowed from the parent `HalTensor` — lifetime is tied to the tensor.
+ * Obtain via `hal_tensor_quantization()`.
+ */
+typedef struct HalTensorQuant HalTensorQuant;
 
 /**
  * List of track info results.
@@ -1260,6 +1285,37 @@ void hal_decoder_free(struct hal_decoder *decoder);
  * @param proto Prototype data handle to free (can be NULL, no-op)
  */
 void hal_proto_data_free(struct hal_proto_data *proto);
+
+/**
+ * Take ownership of the proto tensor from a prototype data handle.
+ *
+ * Shape `[H, W, num_protos]`. For quantized models, the returned tensor
+ * carries its quantization metadata (accessible via
+ * `hal_tensor_quantization()`).
+ *
+ * After calling this, subsequent calls for protos on the same handle
+ * return NULL. The proto data handle itself must still be freed via
+ * `hal_proto_data_free()`.
+ *
+ * @param proto Prototype data handle (may be NULL)
+ * @return Newly-owned tensor handle (caller must `hal_tensor_free()`),
+ *         or NULL if `proto` is NULL or protos have already been taken
+ */
+struct hal_tensor *hal_proto_data_take_protos(struct hal_proto_data *proto);
+
+/**
+ * Take ownership of the mask-coefficients tensor from a prototype data handle.
+ *
+ * Shape `[num_detections, num_protos]`.
+ *
+ * Same semantics as `hal_proto_data_take_protos()`: subsequent calls
+ * return NULL once taken.
+ *
+ * @param proto Prototype data handle (may be NULL)
+ * @return Newly-owned tensor handle (caller must `hal_tensor_free()`),
+ *         or NULL if `proto` is NULL or mask_coefficients have been taken
+ */
+struct hal_tensor *hal_proto_data_take_mask_coefficients(struct hal_proto_data *proto);
 
 /**
  * Get the number of detections in a list.
@@ -2445,6 +2501,60 @@ size_t hal_tensor_map_size(const struct hal_tensor_map *map);
  * @param map Tensor map handle to unmap (can be NULL, no-op)
  */
 void hal_tensor_map_unmap(struct hal_tensor_map *map);
+
+/**
+ * Borrowed quantization metadata for an integer tensor.
+ *
+ * Returns NULL when the tensor has no quantization set (e.g. float tensor
+ * or unquantized integer tensor). The returned handle must be freed with
+ * `hal_quantization_free()` — it is a small wrapper around a borrowed
+ * pointer into the parent tensor, so freeing it does not invalidate the
+ * underlying metadata.
+ *
+ * @param tensor Tensor handle (may be NULL)
+ * @return Quantization handle, or NULL if none
+ */
+struct HalTensorQuant *hal_tensor_quantization(const struct hal_tensor *tensor);
+
+/**
+ * Free a quantization handle returned by `hal_tensor_quantization()`.
+ *
+ * This does not invalidate the underlying metadata (which lives on the
+ * parent tensor) — it only releases the wrapper.
+ */
+void hal_quantization_free(struct HalTensorQuant *q);
+
+/**
+ * Discriminate the quantization mode.
+ */
+enum HalTensorQuantKind hal_quantization_kind(const struct HalTensorQuant *q);
+
+/**
+ * Number of scales (1 for per-tensor, num_channels for per-channel).
+ */
+size_t hal_quantization_scale_len(const struct HalTensorQuant *q);
+
+/**
+ * Read scale at index `i`. Returns 0.0 on out-of-bounds or NULL.
+ */
+float hal_quantization_scale_at(const struct HalTensorQuant *q, size_t i);
+
+/**
+ * Read zero point at index `i`. Symmetric modes always return 0.
+ * Returns 0 on out-of-bounds or NULL.
+ */
+int32_t hal_quantization_zero_point_at(const struct HalTensorQuant *q, size_t i);
+
+/**
+ * Whether the quantization is symmetric (all zero points are 0).
+ */
+bool hal_quantization_is_symmetric(const struct HalTensorQuant *q);
+
+/**
+ * Retrieve the per-channel axis. Writes to `*axis_out` and returns
+ * `true` when per-channel; returns `false` for per-tensor (axis unused).
+ */
+bool hal_quantization_axis(const struct HalTensorQuant *q, size_t *axis_out);
 
 /**
  * Create a new ByteTrack tracker with specified parameters.
