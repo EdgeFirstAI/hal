@@ -454,8 +454,7 @@ fn execute_merge(
             quant,
             ..
         } => {
-            let t = find_unused_tensor_by_shape(inputs, shape, used)?;
-            let mut arr = tensor_to_f32(t, *quant)?;
+            let mut arr = find_and_dequantize(inputs, shape, *quant, used)?;
             for &ax in padding_axes {
                 if ax < arr.ndim() && arr.shape()[ax] == 1 {
                     arr = arr.remove_axis(Axis(ax));
@@ -518,6 +517,101 @@ fn find_unused_tensor_by_shape<'a>(
          bound tensors are excluded; pass inputs in schema child order, \
          or use name-keyed decode once available)"
     )))
+}
+
+/// Find tensor by shape, dequantize to f32, and transpose to match the
+/// expected shape if needed.
+///
+/// Tries exact shape match first. When that fails (common in GStreamer /
+/// NNStreamer pipelines where the framework reports dimensions in
+/// innermost-first order while the v2 schema uses standard row-major
+/// shapes), falls back to element-count matching with axis permutation.
+///
+/// The permutation is derived by matching dimension sizes between the
+/// tensor's natural shape and the expected shape. When the tensor has
+/// fewer dimensions (e.g. trailing unit dims were stripped), it is
+/// padded with trailing 1s before matching.
+fn find_and_dequantize(
+    inputs: &[&TensorDyn],
+    expected_shape: &[usize],
+    quant: Option<Quantization>,
+    used: &mut Vec<usize>,
+) -> DecoderResult<ArrayD<f32>> {
+    // Fast path: exact shape match
+    if let Ok(t) = find_unused_tensor_by_shape(inputs, expected_shape, used) {
+        return tensor_to_f32(t, quant);
+    }
+
+    // Fallback: element-count match with axis permutation
+    let expected_count: usize = expected_shape.iter().product();
+    for (i, t) in inputs.iter().enumerate() {
+        if used.contains(&i) {
+            continue;
+        }
+        let count: usize = t.shape().iter().product();
+        if count != expected_count {
+            continue;
+        }
+        // Pad tensor shape with trailing 1s to match expected ndim
+        let mut padded_shape = t.shape().to_vec();
+        while padded_shape.len() < expected_shape.len() {
+            padded_shape.push(1);
+        }
+        if let Some(perm) = find_axis_permutation(&padded_shape, expected_shape) {
+            used.push(i);
+            let arr = tensor_to_f32(t, quant)?;
+            // Reshape to padded ndim (adds trailing unit dims, no data move)
+            let mut arr = if arr.ndim() < expected_shape.len() {
+                arr.into_shape_with_order(IxDyn(&padded_shape))
+                    .map_err(DecoderError::NDArrayShape)?
+            } else {
+                arr
+            };
+            // Transpose axes to match expected shape. permuted_axes
+            // reorders strides (zero-copy view), then as_standard_layout
+            // produces a C-contiguous copy with data in the new order.
+            arr = arr.permuted_axes(IxDyn(&perm));
+            arr = arr.as_standard_layout().to_owned();
+            debug_assert_eq!(arr.shape(), expected_shape);
+            return Ok(arr);
+        }
+    }
+
+    Err(DecoderError::InvalidShape(format!(
+        "no remaining input tensor matches shape {expected_shape:?} \
+         (tried exact match and element-count + permutation; already \
+         bound tensors are excluded)"
+    )))
+}
+
+/// Find the axis permutation that transforms `from` into `to`.
+///
+/// Returns `None` if no permutation exists (different multiset of
+/// dimension sizes or different lengths). When repeated dimension
+/// sizes occur (e.g. 160×160 spatial dims), they are matched in order
+/// which preserves their relative axis positions.
+fn find_axis_permutation(from: &[usize], to: &[usize]) -> Option<Vec<usize>> {
+    if from.len() != to.len() {
+        return None;
+    }
+    let n = from.len();
+    let mut perm = vec![0usize; n];
+    let mut bound = vec![false; n];
+    for (i, &target_dim) in to.iter().enumerate() {
+        let mut found = false;
+        for (j, &source_dim) in from.iter().enumerate() {
+            if !bound[j] && source_dim == target_dim {
+                perm[i] = j;
+                bound[j] = true;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return None;
+        }
+    }
+    Some(perm)
 }
 
 /// Dequantize (if integer) or cast (if float) a TensorDyn to an owned
@@ -595,8 +689,7 @@ fn execute_channel_concat(
 ) -> DecoderResult<ArrayD<f32>> {
     let mut parts = Vec::with_capacity(children.len());
     for child in children {
-        let t = find_unused_tensor_by_shape(inputs, &child.shape, used)?;
-        parts.push(tensor_to_f32(t, child.quant)?);
+        parts.push(find_and_dequantize(inputs, &child.shape, child.quant, used)?);
     }
     let views: Vec<_> = parts.iter().map(|a| a.view()).collect();
     let mut merged =
@@ -647,8 +740,7 @@ fn execute_per_scale(
     let mut feature_count: Option<usize> = None;
     let mut batch: Option<usize> = None;
     for (idx, child) in children.iter().enumerate() {
-        let t = find_unused_tensor_by_shape(inputs, &child.shape, used)?;
-        let arr = tensor_to_f32(t, child.quant)?;
+        let arr = find_and_dequantize(inputs, &child.shape, child.quant, used)?;
         let (b, features, part) = child_to_batch_feature_spatial(arr, child)?;
         match batch {
             None => batch = Some(b),
