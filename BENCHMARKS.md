@@ -12,6 +12,50 @@ This document tracks EdgeFirst HAL performance across target platforms. It serve
 
 The benchmarking strategy tests **all compute backends** (CPU, OpenGL, G2D) with **all applicable buffer strategies** (DMA-buf, PBO, Sync) on every platform, including forcing non-default buffer paths on platforms that would normally prefer a different strategy. This ensures the full fallback chain is exercised and performance characteristics are understood for every deployment scenario.
 
+## Optimization Performance Reference
+
+This section is the **benchmark-level reference** for the
+[Optimization Guide in README.md](README.md#optimization-guide). The README
+states the rules, [ARCHITECTURE.md] explains the mechanism behind each rule,
+and the table below quantifies the cost of breaking it on each platform.
+
+| Rule (from README) | Benchmark | Cost when broken |
+|--------------------|-----------|------------------|
+| Reuse tensors across frames | [§ Tensor Reuse Impact](#tensor-reuse-impact) | i.MX 95 (Mali): **3.3×**; i.MX 8MP (Vivante): **1.7×**; x86 PBO: 1.0× |
+| Cache imported camera tensors by inode | [§ Tensor Reuse Impact](#tensor-reuse-impact) (recreate variant); see also [ARCHITECTURE.md § Appendix C][arch-appendix-c] | Equivalent to recreating the source tensor every frame: 3.5 ms penalty per `convert()` on i.MX 95; 2.2 ms on i.MX 8MP |
+| Allocate via `ImageProcessor::create_image()` | [§ Image Preprocessing: Letterbox Pipeline](#image-preprocessing-letterbox-pipeline-camera--model-input) | Forced wrong-backend transfer adds the cost of a `glTexSubImage2D` upload (≈full conversion time) on every frame |
+| Build the decoder once | [§ Decoder Post-Processing](#decoder-post-processing) | Decoder construction parses the model schema and allocates working buffers — cost depends on output schema complexity |
+| One `ImageProcessor` per pipeline thread | [ARCHITECTURE.md § GL Command Serialization (GL_MUTEX)][gl-mutex] | Concurrent `convert()` calls serialize through a global mutex; effective throughput drops to single-threaded regardless of core count |
+| Native CPU feature builds (Rule 6) | [§ materialize_masks Batched-GEMM Optimisation](#materialize_masks-batched-gemm-optimisation) | Soft-float f16 helpers (`__extendhfsf2`) are measurably slower than native `fcvt` / `vcvtph2ps` on the mask kernel hot path; the exact factor depends on vector width and CPU. Verify with `scripts/audit_f16_codegen.sh`. |
+
+[ARCHITECTURE.md]: ARCHITECTURE.md
+[gl-mutex]: ARCHITECTURE.md#gl-command-serialization-gl_mutex
+[arch-appendix-c]: ARCHITECTURE.md#appendix-c-dma-buf-identity-and-tensor-caching
+
+### How to Reproduce the Numbers
+
+The empirical penalties above all come from `bench_preproc` (the C
+preprocessing benchmark). It deliberately measures three variants of the
+same pipeline:
+
+| Variant | What it does | Maps to README rule |
+|---------|--------------|--------------------|
+| `reuse` | Single source tensor held alive for all 100 frames | Rule 1 followed |
+| `recreate` | Source tensor freed and reallocated every frame | Rule 1 broken (or Rule 3 broken with fd recycling) |
+| `pool` | Round-robin through 4 pre-allocated source tensors | Rule 1 followed with multiple in-flight buffers (V4L2 pool simulation) |
+
+`pool` matches `reuse` to within 4% on every embedded platform, confirming
+that the EGL image cache scales correctly with pool depth. `recreate` is
+the failure mode that an inode-keyed cache (Rule 3) prevents.
+
+See [§ Running `bench_preproc`](#running-bench_preproc) below for the
+build and deployment commands. See [TESTING.md § Validating Optimizations][test-opt]
+for how to verify your own integration follows each rule.
+
+[test-opt]: TESTING.md#validating-optimizations
+
+---
+
 ## Benchmarking Strategy
 
 ### Compute Backends
@@ -583,7 +627,7 @@ On i.MX 8MP, where the per-convert budget is already tighter due to Vivante driv
 
 ```bash
 # Cross-compile for aarch64
-cargo-zigbuild zigbuild --target aarch64-unknown-linux-gnu --release -p edgefirst-capi
+cargo-zigbuild zigbuild --target aarch64-unknown-linux-gnu --release -p edgefirst-hal-capi
 
 # The C benchmark is built by the capi crate's build.rs; the binary is at:
 #   target/aarch64-unknown-linux-gnu/release/bench_preproc

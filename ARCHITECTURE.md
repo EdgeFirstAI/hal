@@ -1267,6 +1267,22 @@ Run: `perf record -F 997 --call-graph dwarf -- python tests/profile_decode_rende
 
 ## Performance Considerations
 
+This section is the **architecture-level reference** for the
+[Optimization Guide in README.md][readme-opt]. The README states the rules;
+this section explains why each rule exists and what fails when it is broken.
+
+| Rule (from README) | Why it matters at the architecture level |
+|--------------------|------------------------------------------|
+| Reuse tensors across frames | Each new tensor allocates a fresh `BufferIdentity` (monotonic atomic counter, see `crates/tensor/src/lib.rs::BufferIdentity`). The EGL image cache is keyed by `(BufferIdentity.id, chroma_id)` (see `crates/image/src/gl/cache.rs::EglCacheKey`). New ID → cache miss → full `eglCreateImageKHR` import. See [§ C API Performance Recommendations](#c-api-performance-recommendations-dma-buf--egl-path) below. |
+| Allocate via `ImageProcessor::create_image()` | The processor selects DMA-buf, PBO, or heap based on a runtime GPU probe at `ImageProcessor::new()` time. Bypassing this with `Tensor::new(memory=...)` forces a slow transfer path on every `convert()`. See [§ Memory Allocation Strategy](#memory-allocation-strategy). |
+| Cache imported camera tensors by inode | DMA-BUF fd numbers are recycled across V4L2 / libcamera buffer pools. The inode is the only stable identifier for the underlying `dma_buf` kernel object. See [§ Appendix C — DMA-BUF Identity and Tensor Caching](#appendix-c-dma-buf-identity-and-tensor-caching). |
+| Build the decoder once | `DecoderBuilder` parses the model output schema, resolves quantization parameters, and allocates internal working buffers. See [§ Decoder Optimization](#decoder-optimization). |
+| One `ImageProcessor` per pipeline | Each instance owns an EGL display, a GL thread, and per-thread caches. Multiple instances serialize on the global `GL_MUTEX`. See [§ GL Command Serialization (GL_MUTEX)](#gl-command-serialization-gl_mutex). |
+| Native CPU feature builds (Rule 6) | Not an architectural pattern — a build-time concern. `RUSTFLAGS` controls whether the f16 mask kernel at `crates/image/src/cpu/masks.rs` compiles to native widening instructions or to the soft-float `__extendhfsf2` helper. Distributed binaries stay on the target triple's baseline ISA so a single binary runs on every CPU within that triple; benchmark hosts opt in via `RUSTFLAGS` overrides. See [README.md § Rule 6][readme-rule6]. |
+
+[readme-opt]: README.md#optimization-guide
+[readme-rule6]: README.md#rule-6--local-fp16--avx-build-overrides
+
 ### Memory Allocation Strategy
 
 The choice of memory type significantly impacts performance depending on the workload:
