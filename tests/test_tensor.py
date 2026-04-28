@@ -461,6 +461,79 @@ def test_from_numpy_large_transposed():
     assert np.array_equal(result, src)
 
 
+def test_from_numpy_hailort_shape():
+    """Path 3 regression: (1, 116, 8400) transposed view of a (1, 8400, 116)
+    contiguous backing buffer — the layout HailoRT returns natively. Before
+    the np.ascontiguousarray fast path this case was ~12× slower than the
+    contiguous baseline; this test asserts correctness and is paired with
+    the perf sanity check below.
+    """
+    backing = np.arange(1 * 8400 * 116, dtype="float32").reshape(1, 8400, 116)
+    src = backing.transpose(0, 2, 1)  # shape (1, 116, 8400), non-contiguous
+    assert not src.flags["C_CONTIGUOUS"]
+    assert src.shape == (1, 116, 8400)
+
+    t = Tensor(list(src.shape), dtype="float32")
+    t.from_numpy(src)
+    result = _read_tensor(t, "float32")
+    assert np.array_equal(result, src)
+
+
+def test_from_numpy_hailort_shape_perf_sanity():
+    """Path 3 perf sanity: the internal fast path for a strided HailoRT-shape
+    source must be no slower than the manual `np.ascontiguousarray` + contiguous
+    `from_numpy` workaround.
+
+    Prior to this fix the strided path was ~12× slower than the workaround on
+    rpi5-hailo (27 ms vs 6.5 ms) because it fell back to per-element strided
+    iteration. With the np.ascontiguousarray fast path the two are within
+    measurement noise of each other (the internal path skips one Python
+    round-trip but does the same numpy materialization work).
+
+    The test is wall-clock based and skipped under coverage instrumentation
+    where timings are not representative.
+    """
+    import os
+    import time
+
+    if os.environ.get("LLVM_PROFILE_FILE") or os.environ.get("CARGO_LLVM_COV"):
+        pytest.skip("perf sanity skipped under coverage instrumentation")
+
+    backing = np.arange(1 * 8400 * 116, dtype="float32").reshape(1, 8400, 116)
+    strided = backing.transpose(0, 2, 1)  # (1, 116, 8400)
+
+    t = Tensor(list(strided.shape), dtype="float32")
+
+    # Warm up both code paths.
+    for _ in range(5):
+        t.from_numpy(strided)
+        t.from_numpy(np.ascontiguousarray(strided))
+
+    n = 30
+
+    # Internal fast path — passes the strided view directly.
+    start = time.perf_counter()
+    for _ in range(n):
+        t.from_numpy(strided)
+    fast_ms = (time.perf_counter() - start) * 1000.0 / n
+
+    # Manual workaround — caller pre-applies np.ascontiguousarray.
+    start = time.perf_counter()
+    for _ in range(n):
+        t.from_numpy(np.ascontiguousarray(strided))
+    manual_ms = (time.perf_counter() - start) * 1000.0 / n
+
+    # Allow up to 1.5× slack for measurement noise. A regression to
+    # per-element iteration would make this ratio ≥ 10×.
+    ratio = fast_ms / max(manual_ms, 1e-6)
+    assert ratio < 1.5, (
+        f"strided fast path is {ratio:.2f}× slower than the manual "
+        f"np.ascontiguousarray workaround (fast={fast_ms:.2f} ms, "
+        f"manual={manual_ms:.2f} ms). Has from_numpy reverted to "
+        f"per-element strided iteration?"
+    )
+
+
 def test_from_numpy_fortran_order():
     """Fortran-order (column-major) array: non-contiguous in C layout."""
     arr = np.asfortranarray(np.arange(1, 6 * 8 + 1, dtype="int32").reshape(6, 8))
