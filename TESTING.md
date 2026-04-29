@@ -240,6 +240,14 @@ Use environment variables to isolate tests to specific backends:
 | `EDGEFIRST_FORCE_BACKEND=cpu` | Force CPU-only image processing |
 | `EDGEFIRST_FORCE_BACKEND=opengl` | Force OpenGL backend |
 | `EDGEFIRST_FORCE_BACKEND=g2d` | Force G2D backend |
+| `EDGEFIRST_DISABLE_GL=1` | Disable OpenGL even when hardware is present |
+| `EDGEFIRST_DISABLE_G2D=1` | Disable G2D even when hardware is present |
+
+Example — run tests without any GPU backend:
+
+```bash
+EDGEFIRST_DISABLE_GL=1 EDGEFIRST_DISABLE_G2D=1 cargo test --workspace -- --test-threads=1
+```
 
 ### Benchmarking native fp16 paths (local only)
 
@@ -270,14 +278,6 @@ Verify the release build actually compiled to native instructions
 (not the soft-float `__extendhfsf2` helper) via
 `scripts/audit_f16_codegen.sh <target-triple>`. Requires
 `cargo install cargo-show-asm`.
-| `EDGEFIRST_DISABLE_GL=1` | Disable OpenGL even when hardware is present |
-| `EDGEFIRST_DISABLE_G2D=1` | Disable G2D even when hardware is present |
-
-Example — run tests without any GPU backend:
-
-```bash
-EDGEFIRST_DISABLE_GL=1 EDGEFIRST_DISABLE_G2D=1 cargo test --workspace -- --test-threads=1
-```
 
 ---
 
@@ -315,6 +315,137 @@ ssh user@target 'cd /tmp/hal-tests && ./edgefirst_image-<hash> --test-threads=1'
 ```
 
 The `--test-threads=1` flag is mandatory on target hardware for the same reasons as local development — the CMA pool exhaustion risk is higher on embedded boards with limited memory.
+
+---
+
+## Validating Optimizations
+
+This section is the **testing-level reference** for the
+[Optimization Guide in README.md](README.md#optimization-guide). Each rule
+in that guide has a corresponding way to verify your integration follows
+it; this section documents those verification techniques.
+
+### Verifying EGL Image Cache Hits
+
+The OpenGL backend's EGL image cache emits a summary log line at process
+shutdown. Run any test or benchmark with `RUST_LOG=edgefirst_image=debug`:
+
+```bash
+RUST_LOG=edgefirst_image=debug \
+    cargo test -p edgefirst-image --test ... -- --test-threads=1 2>&1 | tee cache.log
+```
+
+Look for the final line:
+
+```text
+EglImageCache stats: 999 hits, 1 misses, 1 entries remaining
+```
+
+A correctly-tuned camera pipeline reaches steady state with **misses ≈ pool
+depth** (one miss per unique physical buffer) and **hits ≈ frame count**.
+If `misses` grows linearly with frame count, the calling code is creating
+new tensor objects per frame — review the cache key (Rule 3 in the
+Optimization Guide).
+
+The cache also logs `EglImageCache: swept N dead entries` when tensors are
+dropped while their entries are still in the cache. Frequent sweeps in a
+steady-state pipeline are a sign of leaked or churned tensor objects.
+
+### Verifying Backend Selection
+
+The active backend is logged at `info` level when `ImageProcessor::new()`
+succeeds:
+
+```text
+Shared EGL display initialized: kind=Wayland, transfer=DmaBuf
+```
+
+The `transfer=` field reports `DmaBuf`, `Pbo`, or `Sync` — these correspond
+to the three rows in the README *Platform GPU Support* table. To confirm a
+specific backend is being exercised, set the corresponding environment
+variable from the table below and re-run with `RUST_LOG=info`.
+
+| Variable | Effect | Use to verify |
+|----------|--------|---------------|
+| `EDGEFIRST_FORCE_BACKEND=cpu` | CPU only — no GPU code path | Code paths that should never crash without a GPU |
+| `EDGEFIRST_FORCE_BACKEND=opengl` | OpenGL only — no G2D, no CPU fallback | GL backend correctness |
+| `EDGEFIRST_FORCE_BACKEND=g2d` | G2D only — fails on non-i.MX | G2D-specific format pairs |
+| `EDGEFIRST_FORCE_TRANSFER=pbo` | PBO transfers even when DMA-buf is available | PBO path on Linux with DMA-buf hardware |
+| `EDGEFIRST_FORCE_TRANSFER=dmabuf` | DMA-buf transfers; fails if EGLImage import fails | DMA-buf path on systems where it normally falls back |
+| `EDGEFIRST_FORCE_TRANSFER=sync` | Memcpy upload/readback via `glTexImage2D` / `glReadnPixels` | Non-zero-copy baseline; useful for measuring the cost of the fast paths |
+| `EDGEFIRST_TENSOR_FORCE_MEM=1` | Forces heap tensors; disables DMA / SHM | Pure-CPU regression baseline |
+
+### Regression Testing for Tensor Reuse
+
+To catch regressions where a caller starts allocating a tensor per frame,
+gate the test on the cache miss count reported in the `EglImageCache stats`
+log line. The pattern below is illustrative — the `alloc_count()` accessor
+is **not** a stable public API. In practice, capture the log output and
+parse the `H hits, M misses` summary, or use the `bench_preproc` reuse
+variant (see below) as the regression baseline.
+
+```rust
+// Illustrative — alloc_count() is shown for clarity, not as a real API.
+// In a real test, parse the EglImageCache stats log line instead.
+#[test]
+fn test_steady_state_no_realloc() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let mut proc = ImageProcessor::new().unwrap();
+    let mut dst = proc.create_image(640, 640, PixelFormat::Rgb,
+                                    DType::U8, None).unwrap();
+    let src = load_image(&fixture_bytes(), Some(PixelFormat::Rgb), None).unwrap();
+
+    // Warm-up
+    proc.convert(&src, &mut dst,
+                 Rotation::None, Flip::None, Crop::default()).unwrap();
+
+    // Steady state — every iteration must hit the EGL image cache.
+    for _ in 0..100 {
+        proc.convert(&src, &mut dst,
+                     Rotation::None, Flip::None, Crop::default()).unwrap();
+    }
+    // Drop `proc` to flush the EglImageCache stats log line. Assert in the
+    // test harness that misses == 1 (the warm-up) by parsing the log.
+}
+```
+
+For the C API, `bench_preproc` (in `crates/capi/tests/bench_preproc.c`) is
+the reference reproduction of the allocate-once / reuse-every-frame pattern
+and serves as both a benchmark and a regression test.
+
+### Verifying the Inode-Keyed Cache (V4L2 / libcamera Integrations)
+
+When integrating the HAL into a pipeline that consumes V4L2 or libcamera
+buffers, write an integration test that simulates fd recycling:
+
+1. Open a single `dma_buf` and obtain two distinct fd numbers via `dup()`.
+2. Import the first fd into HAL, run a `convert()`, and capture the EGL
+   cache miss count.
+3. Close the first fd, then import the *second* fd (which refers to the
+   same physical buffer).
+4. Run `convert()` again. If the calling code uses an inode-keyed cache,
+   it returns the existing tensor and the miss count does not increase.
+   If it uses an fd-keyed cache or skips caching entirely, the miss count
+   grows by one.
+
+The Au-Zone GStreamer elements ship with this regression test in their
+own test suite; downstream integrators should write the equivalent for
+their pipeline.
+
+### Quantifying Native CPU Feature Builds
+
+When benchmarking with `RUSTFLAGS="-C target-feature=+fp16"` (or `+f16c` on
+x86_64), confirm the kernel actually compiled to native instructions
+rather than the soft-float helper:
+
+```bash
+scripts/audit_f16_codegen.sh aarch64-unknown-linux-gnu
+```
+
+The script disassembles a release build and fails if `__extendhfsf2` is
+present (soft-float fallback) or if `fcvt` / `vcvtph2ps` is absent. See
+[§ Benchmarking native fp16 paths](#benchmarking-native-fp16-paths-local-only)
+above for the full workflow.
 
 ---
 
