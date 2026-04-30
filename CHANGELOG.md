@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+### Changed
+
+- **`Tensor.from_numpy()` fast path for fully-strided sources.** A numpy
+  view that is non-contiguous *and* has no contiguous trailing
+  dimension (e.g. `(1, 116, 8400)` produced by `arr.transpose(0, 2, 1)`
+  on a `(1, 8400, 116)` backing buffer — the layout HailoRT returns
+  natively) previously fell back to per-element strided iteration in
+  Path 3. On rpi5-hailo this measured ~27 ms/call versus ~6.5 ms when
+  the caller pre-applied `np.ascontiguousarray()`. Path 3 now performs
+  that materialization internally via `np.ascontiguousarray()`, whose
+  vectorized C strided→contig pass is dramatically faster than
+  ndarray's stride-respecting iterator. Callers that maintained a
+  manual `np.ascontiguousarray(...)` workaround can now drop it; the
+  fast path is automatic.
+
 ## [0.18.0] - 2026-04-25
 
 ### Added
