@@ -5,6 +5,7 @@ use super::CPUProcessor;
 use crate::Result;
 use edgefirst_decoder::{DetectBox, Segmentation};
 use ndarray::Axis;
+use rayon::prelude::*;
 
 impl CPUProcessor {
     #[allow(clippy::too_many_arguments)]
@@ -301,98 +302,79 @@ impl CPUProcessor {
             }
         };
 
-        let per_detection = |i: usize,
-                             det: &crate::DetectBox|
-         -> crate::Result<edgefirst_decoder::Segmentation> {
-            let coeff = &coeff_f32_slice[i * num_protos..(i + 1) * num_protos];
-
-            let bbox = det.bbox.to_canonical();
-            let xmin = bbox.xmin.clamp(0.0, 1.0);
-            let ymin = bbox.ymin.clamp(0.0, 1.0);
-            let xmax = bbox.xmax.clamp(0.0, 1.0);
-            let ymax = bbox.ymax.clamp(0.0, 1.0);
-            let x0 = ((xmin * proto_w as f32) as usize).min(proto_w.saturating_sub(1));
-            let y0 = ((ymin * proto_h as f32) as usize).min(proto_h.saturating_sub(1));
-            let x1 = ((xmax * proto_w as f32).ceil() as usize).min(proto_w);
-            let y1 = ((ymax * proto_h as f32).ceil() as usize).min(proto_h);
-            let roi_w = x1.saturating_sub(x0).max(1);
-            let roi_h = y1.saturating_sub(y0).max(1);
-
-            let mask = match proto_data.protos.dtype() {
-                DType::I8 => {
-                    let t = proto_data.protos.as_i8().expect("dtype matched I8");
-                    let quant = t.quantization().ok_or_else(|| {
-                        crate::Error::InvalidShape("I8 protos require quantization metadata".into())
-                    })?;
-                    let m = t.map()?;
-                    fused_dequant_dot_sigmoid_i8_slice(
-                        m.as_slice(),
-                        coeff,
-                        quant,
-                        proto_h,
-                        proto_w,
-                        y0,
-                        x0,
-                        roi_h,
-                        roi_w,
-                        num_protos,
-                    )?
-                }
-                DType::F32 => {
-                    let t = proto_data.protos.as_f32().expect("dtype matched F32");
-                    let m = t.map()?;
-                    fused_dot_sigmoid_f32_slice(
-                        m.as_slice(),
-                        coeff,
-                        proto_h,
-                        proto_w,
-                        y0,
-                        x0,
-                        roi_h,
-                        roi_w,
-                        num_protos,
-                    )
-                }
-                DType::F16 => {
-                    let t = proto_data.protos.as_f16().expect("dtype matched F16");
-                    let m = t.map()?;
-                    fused_dot_sigmoid_f16_slice(
-                        m.as_slice(),
-                        coeff,
-                        proto_h,
-                        proto_w,
-                        y0,
-                        x0,
-                        roi_h,
-                        roi_w,
-                        num_protos,
-                    )
-                }
-                other => {
-                    return Err(crate::Error::InvalidShape(format!(
-                        "proto tensor dtype {other:?} not supported"
-                    )));
-                }
-            };
-
-            let seg_xmin = ((x0 as f32 / proto_w as f32) - lx0) * inv_lw;
-            let seg_ymin = ((y0 as f32 / proto_h as f32) - ly0) * inv_lh;
-            let seg_xmax = ((x1 as f32 / proto_w as f32) - lx0) * inv_lw;
-            let seg_ymax = ((y1 as f32 / proto_h as f32) - ly0) * inv_lh;
-            Ok(edgefirst_decoder::Segmentation {
-                xmin: seg_xmin.clamp(0.0, 1.0),
-                ymin: seg_ymin.clamp(0.0, 1.0),
-                xmax: seg_xmax.clamp(0.0, 1.0),
-                ymax: seg_ymax.clamp(0.0, 1.0),
-                segmentation: mask,
-            })
-        };
-
-        detect
-            .iter()
-            .enumerate()
-            .map(|(i, det)| per_detection(i, det))
-            .collect()
+        // Hoist the proto tensor map() out of the per-detection loop so the
+        // map-guard is acquired once. Then dispatch per-dtype via a helper
+        // that runs the per-detection kernels in parallel across detections
+        // via rayon. This restores the parallelism that PR #54 added and
+        // PR #51 (EDGEAI-1244 f16 refactor) inadvertently removed.
+        match proto_data.protos.dtype() {
+            DType::I8 => {
+                let t = proto_data.protos.as_i8().expect("dtype matched I8");
+                let quant = t.quantization().ok_or_else(|| {
+                    crate::Error::InvalidShape("I8 protos require quantization metadata".into())
+                })?;
+                let m = t.map()?;
+                let protos_slice = m.as_slice();
+                detect
+                    .par_iter()
+                    .enumerate()
+                    .map(|(i, det)| {
+                        let coeff = &coeff_f32_slice[i * num_protos..(i + 1) * num_protos];
+                        let (x0, y0, x1, y1, roi_w, roi_h) =
+                            bbox_to_proto_roi(det, proto_w, proto_h);
+                        let mask = fused_dequant_dot_sigmoid_i8_slice(
+                            protos_slice, coeff, quant, proto_h, proto_w, y0, x0,
+                            roi_h, roi_w, num_protos,
+                        )?;
+                        Ok(seg_from_roi(mask, x0, y0, x1, y1, proto_w, proto_h,
+                                         lx0, inv_lw, ly0, inv_lh))
+                    })
+                    .collect()
+            }
+            DType::F32 => {
+                let t = proto_data.protos.as_f32().expect("dtype matched F32");
+                let m = t.map()?;
+                let protos_slice = m.as_slice();
+                detect
+                    .par_iter()
+                    .enumerate()
+                    .map(|(i, det)| {
+                        let coeff = &coeff_f32_slice[i * num_protos..(i + 1) * num_protos];
+                        let (x0, y0, x1, y1, roi_w, roi_h) =
+                            bbox_to_proto_roi(det, proto_w, proto_h);
+                        let mask = fused_dot_sigmoid_f32_slice(
+                            protos_slice, coeff, proto_h, proto_w, y0, x0,
+                            roi_h, roi_w, num_protos,
+                        );
+                        Ok(seg_from_roi(mask, x0, y0, x1, y1, proto_w, proto_h,
+                                         lx0, inv_lw, ly0, inv_lh))
+                    })
+                    .collect()
+            }
+            DType::F16 => {
+                let t = proto_data.protos.as_f16().expect("dtype matched F16");
+                let m = t.map()?;
+                let protos_slice = m.as_slice();
+                detect
+                    .par_iter()
+                    .enumerate()
+                    .map(|(i, det)| {
+                        let coeff = &coeff_f32_slice[i * num_protos..(i + 1) * num_protos];
+                        let (x0, y0, x1, y1, roi_w, roi_h) =
+                            bbox_to_proto_roi(det, proto_w, proto_h);
+                        let mask = fused_dot_sigmoid_f16_slice(
+                            protos_slice, coeff, proto_h, proto_w, y0, x0,
+                            roi_h, roi_w, num_protos,
+                        );
+                        Ok(seg_from_roi(mask, x0, y0, x1, y1, proto_w, proto_h,
+                                         lx0, inv_lw, ly0, inv_lh))
+                    })
+                    .collect()
+            }
+            other => Err(crate::Error::InvalidShape(format!(
+                "proto tensor dtype {other:?} not supported"
+            ))),
+        }
     }
 
     /// Produce per-detection masks at `(width, height)` pixel resolution by
@@ -532,6 +514,58 @@ impl CPUProcessor {
 // becomes a soft-float helper. Stage 8 adds explicit intrinsic kernels
 // gated by `#[cfg(target_feature = "fp16")]` / `+f16c`.
 // =============================================================================
+
+/// Map a detection bbox in normalised letterboxed coords to its ROI in
+/// the proto plane (floor xmin/ymin, ceil xmax/ymax, clamp to plane bounds).
+/// Returns `(x0, y0, x1, y1, roi_w, roi_h)` where roi_w/h are guaranteed ≥ 1.
+fn bbox_to_proto_roi(
+    det: &DetectBox,
+    proto_w: usize,
+    proto_h: usize,
+) -> (usize, usize, usize, usize, usize, usize) {
+    let bbox = det.bbox.to_canonical();
+    let xmin = bbox.xmin.clamp(0.0, 1.0);
+    let ymin = bbox.ymin.clamp(0.0, 1.0);
+    let xmax = bbox.xmax.clamp(0.0, 1.0);
+    let ymax = bbox.ymax.clamp(0.0, 1.0);
+    let x0 = ((xmin * proto_w as f32) as usize).min(proto_w.saturating_sub(1));
+    let y0 = ((ymin * proto_h as f32) as usize).min(proto_h.saturating_sub(1));
+    let x1 = ((xmax * proto_w as f32).ceil() as usize).min(proto_w);
+    let y1 = ((ymax * proto_h as f32).ceil() as usize).min(proto_h);
+    let roi_w = x1.saturating_sub(x0).max(1);
+    let roi_h = y1.saturating_sub(y0).max(1);
+    (x0, y0, x1, y1, roi_w, roi_h)
+}
+
+/// Build a `Segmentation` from a per-detection mask + the ROI bounds in
+/// proto coords. Applies the inverse letterbox transform to express the
+/// segmentation bbox in original-image-content normalised space.
+#[allow(clippy::too_many_arguments)]
+fn seg_from_roi(
+    mask: ndarray::Array3<u8>,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+    proto_w: usize,
+    proto_h: usize,
+    lx0: f32,
+    inv_lw: f32,
+    ly0: f32,
+    inv_lh: f32,
+) -> edgefirst_decoder::Segmentation {
+    let seg_xmin = ((x0 as f32 / proto_w as f32) - lx0) * inv_lw;
+    let seg_ymin = ((y0 as f32 / proto_h as f32) - ly0) * inv_lh;
+    let seg_xmax = ((x1 as f32 / proto_w as f32) - lx0) * inv_lw;
+    let seg_ymax = ((y1 as f32 / proto_h as f32) - ly0) * inv_lh;
+    edgefirst_decoder::Segmentation {
+        xmin: seg_xmin.clamp(0.0, 1.0),
+        ymin: seg_ymin.clamp(0.0, 1.0),
+        xmax: seg_xmax.clamp(0.0, 1.0),
+        ymax: seg_ymax.clamp(0.0, 1.0),
+        segmentation: mask,
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 fn fused_dequant_dot_sigmoid_i8_slice(
@@ -991,7 +1025,7 @@ fn scaled_segmentations_i8_slice(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn scaled_run<P: Copy>(
+fn scaled_run<P: Copy + Sync>(
     detect: &[crate::DetectBox],
     coeff_all: &[f32],
     protos: &[P],
@@ -1002,7 +1036,7 @@ fn scaled_run<P: Copy>(
     width: u32,
     height: u32,
     acc_scale: f32,
-    load_f32: impl Fn(&P, f32) -> f32 + Copy,
+    load_f32: impl Fn(&P, f32) -> f32 + Copy + Sync,
 ) -> crate::Result<Vec<edgefirst_decoder::Segmentation>> {
     let (lx0, lw, ly0, lh) = match letterbox {
         Some([lx0, ly0, lx1, ly1]) => {
@@ -1016,8 +1050,29 @@ fn scaled_run<P: Copy>(
     let out_h = height as usize;
     let stride_y = proto_w * num_protos;
 
+    // Parallelise across detections. Each detection produces an
+    // independent ndarray::Array3<u8> tile from a read-only proto slice +
+    // its own coeff slice; no shared mutable state.
+    //
+    // Algorithm (restores the spirit of PR #54's batched-GEMM optimisation
+    // that PR #51's f16 dispatch refactor inadvertently removed):
+    //
+    //   1. Map the output bbox back to a proto-plane ROI (with 1-px margin
+    //      so the bilinear sampling at the output edges has neighbours).
+    //   2. Precompute *f32 logits* at every proto pixel inside that ROI by
+    //      doing a single K-wide dot product per proto pixel — once, not
+    //      once per output pixel.
+    //   3. For each output pixel, bilinear-interpolate the scalar f32 logit
+    //      from the 4 surrounding proto-roi pixels, apply sigmoid, and
+    //      threshold to {0, 255}.
+    //
+    // For typical YOLO-seg: proto_roi ~ 30×30 = 900 px × K=32 = 28.8K dot
+    // ops vs the legacy "bilinear sample then dot at every output pixel"
+    // which costs bbox_h × bbox_w × 4 × K = ~1.3M ops at 100×100 output
+    // bbox. ~45× fewer FMAs at this size; the bilinear upsample of a
+    // scalar plane (no inner K loop) is comparatively negligible.
     detect
-        .iter()
+        .par_iter()
         .enumerate()
         .map(|(i, det)| {
             let coeff = &coeff_all[i * num_protos..(i + 1) * num_protos];
@@ -1032,27 +1087,78 @@ fn scaled_run<P: Copy>(
             let py1 = ((ymax * out_h as f32).round() as usize).min(out_h);
             let bbox_w = px1.saturating_sub(px0).max(1);
             let bbox_h = py1.saturating_sub(py0).max(1);
+
+            // Step 1 — proto-plane ROI for this detection's output bbox.
+            // Map the four output bbox corners back to proto coords and
+            // expand by 1 pixel in each direction so the bilinear sampler
+            // at the bbox boundary has both neighbours.
+            let sample_x_at = |px: f32| -> f32 {
+                let model_x_norm = lx0 + (px + 0.5) / out_w as f32 * lw;
+                model_x_norm * proto_w as f32 - 0.5
+            };
+            let sample_y_at = |py: f32| -> f32 {
+                let model_y_norm = ly0 + (py + 0.5) / out_h as f32 * lh;
+                model_y_norm * proto_h as f32 - 0.5
+            };
+            let s_x_min = sample_x_at(px0 as f32);
+            let s_x_max = sample_x_at((px1 as f32) - 1.0);
+            let s_y_min = sample_y_at(py0 as f32);
+            let s_y_max = sample_y_at((py1 as f32) - 1.0);
+            // Floor min, ceil max+1 to include both bilinear neighbours.
+            let proto_x0 = (s_x_min.floor() as isize).max(0).min(proto_w as isize) as usize;
+            let proto_x1 = ((s_x_max.ceil() as isize) + 1)
+                .max(0)
+                .min(proto_w as isize) as usize;
+            let proto_y0 = (s_y_min.floor() as isize).max(0).min(proto_h as isize) as usize;
+            let proto_y1 = ((s_y_max.ceil() as isize) + 1)
+                .max(0)
+                .min(proto_h as isize) as usize;
+            let roi_w = proto_x1.saturating_sub(proto_x0).max(1);
+            let roi_h = proto_y1.saturating_sub(proto_y0).max(1);
+
+            // Step 2 — precompute f32 logits at every proto-roi pixel.
+            // logits[(py - proto_y0) * roi_w + (px - proto_x0)] = dot(coeff, proto[py, px, :])
+            let mut logits = vec![0.0_f32; roi_h * roi_w];
+            for ly_idx in 0..roi_h {
+                let py = proto_y0 + ly_idx;
+                let row_base = py * stride_y + proto_x0 * num_protos;
+                for lx_idx in 0..roi_w {
+                    let pix_base = row_base + lx_idx * num_protos;
+                    let mut acc = 0.0_f32;
+                    for k in 0..num_protos {
+                        acc += coeff[k] * load_f32(&protos[pix_base + k], 0.0);
+                    }
+                    logits[ly_idx * roi_w + lx_idx] = acc_scale * acc;
+                }
+            }
+
+            // Step 3 — bilinear upsample logits → output bbox, sigmoid + threshold.
             let mut tile = ndarray::Array3::<u8>::zeros((bbox_h, bbox_w, 1));
             for yi in 0..bbox_h {
-                let py = (py0 + yi) as f32;
-                let model_y_norm = ly0 + (py + 0.5) / out_h as f32 * lh;
-                let sample_y = model_y_norm * proto_h as f32 - 0.5;
+                let py_o = (py0 + yi) as f32;
+                let sample_y = sample_y_at(py_o) - proto_y0 as f32;
+                let y_floor = sample_y.floor();
+                let y_lo = (y_floor as isize).max(0) as usize;
+                let y_hi = (y_lo + 1).min(roi_h - 1);
+                let y_frac = (sample_y - y_floor).clamp(0.0, 1.0);
+                let row_lo = &logits[y_lo * roi_w..y_lo * roi_w + roi_w];
+                let row_hi = &logits[y_hi * roi_w..y_hi * roi_w + roi_w];
                 for xi in 0..bbox_w {
-                    let px = (px0 + xi) as f32;
-                    let model_x_norm = lx0 + (px + 0.5) / out_w as f32 * lw;
-                    let sample_x = model_x_norm * proto_w as f32 - 0.5;
-                    let acc = bilinear_dot_slice(
-                        protos,
-                        stride_y,
-                        num_protos,
-                        coeff,
-                        sample_x,
-                        sample_y,
-                        proto_w,
-                        proto_h,
-                        |p: &P| load_f32(p, 0.0),
-                    );
-                    let sigmoid = fast_sigmoid(acc_scale * acc);
+                    let px_o = (px0 + xi) as f32;
+                    let sample_x = sample_x_at(px_o) - proto_x0 as f32;
+                    let x_floor = sample_x.floor();
+                    let x_lo = (x_floor as isize).max(0) as usize;
+                    let x_hi = (x_lo + 1).min(roi_w - 1);
+                    let x_frac = (sample_x - x_floor).clamp(0.0, 1.0);
+                    // Bilinear interp on the scalar logit plane.
+                    let l00 = row_lo[x_lo];
+                    let l01 = row_lo[x_hi];
+                    let l10 = row_hi[x_lo];
+                    let l11 = row_hi[x_hi];
+                    let l0 = l00 + (l01 - l00) * x_frac;
+                    let l1 = l10 + (l11 - l10) * x_frac;
+                    let logit = l0 + (l1 - l0) * y_frac;
+                    let sigmoid = fast_sigmoid(logit);
                     tile[[yi, xi, 0]] = if sigmoid > 0.5 { 255 } else { 0 };
                 }
             }
