@@ -432,6 +432,47 @@ The Au-Zone GStreamer elements ship with this regression test in their
 own test suite; downstream integrators should write the equivalent for
 their pipeline.
 
+### Verifying the `from_numpy` Strided Fast-Path
+
+Rule 7 in the [Optimization Guide](README.md#rule-7--numpy-interop-pass-arrays-straight-to-from_numpy)
+asserts that callers should not pre-apply `np.ascontiguousarray()` —
+HAL handles strided sources internally. Two regression tests in
+`tests/test_tensor.py` pin this:
+
+| Test | What it verifies |
+|---|---|
+| `test_from_numpy_hailort_shape` | Correctness on the HailoRT-shaped `(1, 116, 8400)` f32 transposed view (Path 3 of `copy_numpy_to_tensor_dyn`). The destination tensor matches the source values element-by-element. |
+| `test_from_numpy_hailort_shape_perf_sanity` | Perf bound: the automatic fast path runs no more than 1.5× the manual `np.ascontiguousarray + from_numpy(contig)` workaround. Prior to PR #58 the ratio was ≈ 10×. |
+
+Both tests are in the standard Python suite and run in CI. If the
+perf-sanity test fails, suspect a regression in `numpy.ascontiguousarray`
+behaviour or in the Path-3 dispatch logic in `crates/python/src/tensor.rs`.
+
+### Verifying `MaskResolution` Selection in COCO Validators
+
+Rule 8 in the [Optimization Guide](README.md#rule-8--choose-the-correct-maskresolution-for-your-evaluation)
+asserts that COCO / IoU evaluation must use `MaskResolution::Scaled`,
+not the default `Proto`. Downstream validators should pin this with a
+small assertion at the materialize call site:
+
+```python
+masks = proc.materialize_masks(
+    boxes, scores, classes, proto_data,
+    letterbox=letterbox_norm,
+    resolution=hal.MaskResolution.Scaled(orig_w, orig_h),
+)
+# Smoke-check the contract: tile shape (h, w, 1) uint8 at
+# orig-image resolution, binary {0, 255} after upsample-then-threshold.
+assert masks[0].shape[2] == 1
+assert masks[0].dtype == np.uint8
+```
+
+If a validator's mask-mAP regresses against a numpy / ONNX reference,
+inspect this call first — the most common cause is calling
+`materialize_masks` with no `resolution` argument (defaults to `Proto`)
+and then thresholding the proto-resolution sigmoid in caller code
+before resizing, which produces blocky binary edges.
+
 ### Quantifying Native CPU Feature Builds
 
 When benchmarking with `RUSTFLAGS="-C target-feature=+fp16"` (or `+f16c` on

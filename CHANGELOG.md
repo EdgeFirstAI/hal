@@ -22,6 +22,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   manual `np.ascontiguousarray(...)` workaround can now drop it; the
   fast path is automatic.
 
+### Documentation
+
+- **Optimization Guide refresh: NumPy interop and `MaskResolution`
+  doctrine.** The cross-document Optimization Guide gains two new
+  rules and matching cost-table rows:
+  - **Rule 7 — NumPy interop:** pass numpy arrays straight to
+    `Tensor.from_numpy()`; do not pre-`ascontiguousarray()`. Documents
+    the three internal paths (`copy_numpy_to_tensor_dyn`), the narrow
+    case where pre-materialising still helps (a single strided view
+    fed many times), and the rpi5-hailo numbers (≈ 6.5 ms automatic
+    fast path vs ≈ 27 ms legacy element-wise loop).
+  - **Rule 8 — `MaskResolution` selection:** for COCO / IoU evaluation
+    use `MaskResolution::Scaled(orig_w, orig_h)`. The default
+    `MaskResolution::Proto` returns continuous sigmoid values at proto
+    resolution; if a downstream caller thresholds those *before*
+    upsampling (the natural-looking but wrong order), edges become
+    blocky and mask mAP regresses by 0.04–0.05 absolute on YOLOv8-seg
+    / `coco128-seg`. `Scaled` performs the upsample inside HAL's
+    batched-GEMM kernel and thresholds afterwards.
+  Touches `README.md` (rule table + Rule 7/8 sections),
+  `BENCHMARKS.md` (cost table + NumPy Interop Fast-Path section),
+  `ARCHITECTURE.md` (three-path strategy under Python Bindings), and
+  `TESTING.md` (validation pointers to `test_from_numpy_hailort_shape`
+  and `MaskResolution.Scaled` smoke checks).
+
 ## [0.18.0] - 2026-04-25
 
 ### Added

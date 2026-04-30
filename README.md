@@ -423,6 +423,8 @@ rule exists, and [TESTING.md] for how to verify your integration follows it.
 | Cache imported camera tensors by **inode**, not by fd | v4l2 / libcamera recycle fd numbers across a small buffer pool; an fd-keyed cache misses on every frame even when the physical buffer is the same | Full EGL re-import per frame (≈0.5–1.5 ms on Vivante, multiplied by source + chroma planes) |
 | Build `Decoder` once, decode many | Decoder construction parses model metadata and allocates working buffers | Parse + alloc cost per frame |
 | Construct one `ImageProcessor` per pipeline | Each instance owns its own GL context and EGL display | Multiple GL contexts contend on `GL_MUTEX`; see ARCHITECTURE.md |
+| Pass numpy arrays straight to `Tensor.from_numpy()` — do not pre-`ascontiguousarray()` | HAL detects strided sources and materialises via numpy's vectorized C strided→contig pass; a manual workaround above HAL adds a redundant copy | A redundant `np.ascontiguousarray` pre-copy on every call (size-dependent; e.g. ≈1.5 ms per call on a `(1, 116, 8400)` f32 view on rpi5-hailo) |
+| For COCO/IoU evaluation use `MaskResolution::Scaled(orig_w, orig_h)`, not `Proto` | `Scaled` upsamples the continuous-sigmoid proto plane *before* thresholding (clean edges); `Proto` returns continuous values but most callers threshold-then-resize, which produces blocky binary edges and lossy mAP | Mask mAP regression of up to 0.04–0.05 absolute (model- and dataset-dependent) when `Proto` is thresholded then nearest-upsampled |
 
 > [!IMPORTANT]
 > The single most common performance bug is calling
@@ -723,6 +725,94 @@ x86_64 with `+f16c,+fma` — an explicit 8-lane `_mm256_cvtph_ps +
 _mm256_fmadd_ps` intrinsic path is also enabled via cfg gate. The
 helper `scripts/audit_f16_codegen.sh` disassembles a release build
 of the kernel and confirms native instructions are emitted.
+
+### Rule 7 — NumPy interop: pass arrays straight to `from_numpy()`
+
+`Tensor.from_numpy()` (and the implicit copy from numpy arrays passed
+to `Decoder.decode_proto()` etc.) handles strided / non-contiguous
+sources internally. Callers should **not** maintain a manual
+`np.ascontiguousarray()` workaround — it wastes a copy.
+
+The Python binding's `copy_numpy_to_tensor_dyn` selects one of three
+paths based on the source array's layout:
+
+| Source layout | Path | Cost |
+|---|---|---|
+| **Fully contiguous** | Single `copy_from_slice` (memcpy), rayon-parallel ≥ 256 KiB | Lower bound |
+| **Strided with contiguous inner rows** (e.g. column slice, sub-volume, negative stride) | Per-row memcpy iterating outer dimensions | ≈ same as fully contiguous |
+| **Fully strided** (e.g. transposed view, every-other-element) | Internal `np.ascontiguousarray()` materialisation, then Path 1 memcpy | ≈ 4× the contiguous cost |
+
+The fully-strided case is the one that bites users in practice — it
+matches the layout HailoRT returns natively (a `(1, channels, anchors)`
+f32 view obtained by `arr.transpose(0, 2, 1)` over a `(1, anchors,
+channels)` backing buffer). On `rpi5-hailo` with `(1, 116, 8400)` f32,
+the legacy element-wise iteration ran ≈ 27 ms / call; the current
+fast path runs ≈ 6.5 ms / call — close to the manual
+`np.ascontiguousarray + from_numpy(contig)` workaround that callers
+used to maintain.
+
+```python
+# Wrong (post-PR #58): adds an extra copy above HAL.
+arr_contig = np.ascontiguousarray(arr_strided)
+tensor.from_numpy(arr_contig)
+
+# Right: HAL detects the strided layout and materialises internally.
+tensor.from_numpy(arr_strided)
+```
+
+**Narrow case where pre-materialising still helps:** if the same
+strided view is fed into HAL many times in a tight loop (e.g. reusing
+a transposed numpy intermediary across frames), pre-`ascontiguousarray`
+*once outside the loop* amortises the strided→contig cost. Inside the
+loop, just call `from_numpy()` on the cached contiguous array. This
+is rare in practice.
+
+This was previously a footgun because the legacy Path 3 iterated
+element-by-element over the strided view, which broke vectorisation
+and incurred stride arithmetic per load. The fix landed in PR #58.
+The regression tests in `tests/test_tensor.py` (`test_from_numpy_hailort_shape`,
+`test_from_numpy_hailort_shape_perf_sanity`) pin the behaviour and
+the perf bound (≤ 1.5× slower than the manual workaround).
+
+### Rule 8 — Choose the correct `MaskResolution` for your evaluation
+
+`ImageProcessor.materialize_masks()` accepts a `MaskResolution`
+parameter that controls **where the sigmoid threshold is applied**
+along the materialisation pipeline. The choice changes both the
+output dtype and the achievable mask-mAP:
+
+| Mode | Output | Sigmoid → threshold pipeline | When to use |
+|---|---|---|---|
+| `MaskResolution::Proto` (default) | `(roi_h, roi_w, 1)` u8 — **continuous sigmoid** [0, 255] at 160×160 proto resolution | dot → sigmoid → emit (no threshold) | Real-time visualisation where downstream code already does its own scale-aware thresholding, or when you specifically want continuous confidence values |
+| `MaskResolution::Scaled { width, height }` | `(roi_h, roi_w, 1)` u8 — **binary** {0, 255} at the requested resolution | dot → sigmoid → upsample to `(width, height)` → threshold (`>127`) | All COCO / IoU / mAP evaluation. Upsample-then-threshold preserves sub-proto-cell precision; the alternative (threshold-at-160 then upsample the binary mask) produces blocky 4-pixel-aligned edges and a measurable mAP regression |
+
+```python
+# Wrong: threshold then upsample → lossy edges, mAP regression.
+tiles_proto = proc.materialize_masks(boxes, scores, classes, proto_data,
+                                     letterbox=letterbox_norm)  # default = Proto
+for tile, box in zip(tiles_proto, boxes):
+    binary_proto = (tile[:, :, 0] > 127).astype(np.uint8)         # threshold first
+    canvas[y:y+h, x:x+w] = cv2.resize(binary_proto, (W, H),
+                                       interpolation=cv2.INTER_NEAREST)  # upsample binary
+
+# Right: HAL upsamples-then-thresholds inside its batched-GEMM kernel.
+tiles_scaled = proc.materialize_masks(boxes, scores, classes, proto_data,
+                                       letterbox=letterbox_norm,
+                                       resolution=hal.MaskResolution.Scaled(W, H))
+for tile, box in zip(tiles_scaled, boxes):
+    canvas[y:y+h, x:x+w] = (tile[:, :, 0] > 127).astype(np.uint8)  # already at orig res
+```
+
+The `Scaled` path goes through the batched-GEMM materialiser added in
+0.18.0 (PR #54). At N ≥ 16 detections it amortises a single GEMM at
+proto resolution across all detections, then upsamples per-detection
+in rayon-parallel — so it is *both* more accurate than threshold-then-
+resize and faster than per-detection scalar work in caller code.
+
+> [!TIP]
+> If you are seeing a mask-mAP gap between your HAL-based validator
+> and a reference (ONNX / numpy) implementation, this rule is almost
+> always the first thing to check.
 
 ### Where to Go Next
 
