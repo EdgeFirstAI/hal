@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **Restore `materialize_masks` parallelism + logit-precompute (regressed
+  by PR #51).** PR #54 originally added rayon `par_iter` across
+  detections plus a batched-GEMM-style precompute that hoisted the
+  K-wide dot-product out of the per-output-pixel inner loop. PR #51
+  (EDGEAI-1244 f16 dispatch refactor) inadvertently rewrote both
+  `materialize_segmentations` (Proto) and `materialize_scaled_segmentations`
+  (Scaled) to use serial `.iter()` and per-output-pixel bilinear-sample-
+  then-dot, silently dropping both optimisations. Restoring them:
+  - `materialize_segmentations`: rayon parallel across detections, with
+    the proto-tensor `map()` guard acquired once per call instead of
+    once per detection.
+  - `materialize_scaled_segmentations`: rayon parallel across detections
+    plus a per-detection logit-precompute pass — for each detection,
+    compute f32 logits at every proto-plane ROI pixel via a single
+    K-wide dot, then bilinear-interpolate the scalar logit at every
+    output pixel before applying sigmoid + threshold. Crucially the
+    bilinear upsample still operates on continuous logits, not on the
+    sigmoid-quantised u8, so accuracy is preserved.
+  Measured on imx8mp-frdm with the corrected ara2-validator on
+  coco128-seg (N=119 avg detections per image, max_det=300,
+  score_threshold=0.001):
+    `materialize_hal` mean **569 ms → 33 ms (17× faster)**;
+    mask mAP unchanged at 0.3220 (vs the dvapi/numpy reference's 0.3221
+    — 0.0001 absolute drift).
+
 ### Changed
 
 - **`Tensor.from_numpy()` fast path for fully-strided sources.** A numpy
