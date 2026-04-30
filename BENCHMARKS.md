@@ -27,6 +27,8 @@ and the table below quantifies the cost of breaking it on each platform.
 | Build the decoder once | [§ Decoder Post-Processing](#decoder-post-processing) | Decoder construction parses the model schema and allocates working buffers — cost depends on output schema complexity |
 | One `ImageProcessor` per pipeline thread | [ARCHITECTURE.md § GL Command Serialization (GL_MUTEX)][gl-mutex] | Concurrent `convert()` calls serialize through a global mutex; effective throughput drops to single-threaded regardless of core count |
 | Native CPU feature builds (Rule 6) | [§ materialize_masks Batched-GEMM Optimisation](#materialize_masks-batched-gemm-optimisation) | Soft-float f16 helpers (`__extendhfsf2`) are measurably slower than native `fcvt` / `vcvtph2ps` on the mask kernel hot path; the exact factor depends on vector width and CPU. Verify with `scripts/audit_f16_codegen.sh`. |
+| Pass numpy arrays straight to `from_numpy()` (Rule 7) | [§ NumPy Interop Fast-Path](#numpy-interop-fast-path) | A redundant `np.ascontiguousarray` pre-copy on every call. Sized example: `(1, 116, 8400)` f32 transposed view on rpi5-hailo runs ≈ 6.5 ms in HAL's automatic fast path vs ≈ 27 ms in the legacy element-wise loop (4× faster); pre-applying `ascontiguousarray` above HAL adds a redundant copy of the same magnitude. |
+| Use `MaskResolution::Scaled` for COCO eval (Rule 8) | [§ materialize_masks Batched-GEMM Optimisation](#materialize_masks-batched-gemm-optimisation) | Threshold-then-upsample (`Proto` followed by binary `cv2.resize`) regresses mask mAP by 0.04–0.05 absolute on YOLOv8-seg / `coco128-seg`. The `Scaled` path is also faster at N ≥ 16 because the batched GEMM amortises across detections instead of being repeated per-detection in caller code. |
 
 [ARCHITECTURE.md]: ARCHITECTURE.md
 [gl-mutex]: ARCHITECTURE.md#gl-command-serialization-gl_mutex
@@ -488,6 +490,44 @@ with the env-gated `EDGEFIRST_LEGACY_MATERIALIZE=1` toggle.
 - The Scaled path is a clear win on every tested platform from N=2
   upward, scaling cleanly to ~9–45× at N=100 depending on cache hierarchy
   and SIMD width.
+
+### NumPy Interop Fast-Path
+
+`Tensor.from_numpy()` (and the implicit numpy → HAL conversions used by
+`Decoder.decode_proto()` and friends) selects one of three paths in
+`copy_numpy_to_tensor_dyn` (`crates/python/src/tensor.rs:339`) based on
+the source array's strides:
+
+| Path | Source layout | Strategy |
+|---|---|---|
+| 1 | Fully contiguous | Single `copy_from_slice` (memcpy), rayon-parallel ≥ 256 KiB |
+| 2 | Strided with contiguous inner rows | Per-row memcpy iterating outer dimensions |
+| 3 | Fully strided (no contiguous inner row) | Internal `np.ascontiguousarray()` materialisation, then Path 1 memcpy |
+
+The Path 3 pattern matches the layout HailoRT returns natively: a
+`(1, channels, anchors)` view obtained by `arr.transpose(0, 2, 1)`
+over a `(1, anchors, channels)` backing buffer. Prior to PR #58, the
+Path 3 branch iterated element-by-element over the strided ndarray
+view, which broke vectorisation and incurred stride arithmetic per
+load. The fix calls `np.ascontiguousarray()` internally, which uses
+numpy's vectorized C strided→contig pass, then falls back to the
+Path 1 memcpy.
+
+**rpi5-hailo, `(1, 116, 8400)` f32 transposed view:**
+
+| Variant | Time per call | Ratio vs fast path |
+|---|---|---|
+| Manual `np.ascontiguousarray + from_numpy(contig)` (legacy workaround) | ≈ 6.5 ms | 1.00× (baseline) |
+| `from_numpy(strided)` automatic fast path (PR #58) | ≈ 6.5 ms | 1.0–1.5× (perf-sanity test bound) |
+| `from_numpy(strided)` legacy element-wise loop | ≈ 27 ms | ≈ 4× slower |
+
+**Implication for callers:** drop manual `np.ascontiguousarray()`
+workarounds — the fast path is automatic. Pre-applying it above HAL
+adds a redundant copy.
+
+The behaviour is pinned by `test_from_numpy_hailort_shape` (correctness)
+and `test_from_numpy_hailort_shape_perf_sanity` (≤ 1.5× slower than the
+manual workaround) in `tests/test_tensor.py`.
 
 ---
 

@@ -817,6 +817,27 @@ flowchart LR
     style HW fill:#90ee90
 ```
 
+**NumPy → Tensor Copy Strategy** (`crates/python/src/tensor.rs`,
+`copy_numpy_to_tensor_dyn`): the binding inspects the source array's
+strides and dispatches to one of three paths to balance copy cost
+against allocation overhead:
+
+| Path | Source layout | Strategy | Cost |
+|---|---|---|---|
+| 1 | Fully contiguous | `copy_from_slice` (memcpy), rayon-parallel ≥ 256 KiB | Lower bound — no allocation |
+| 2 | Strided with contiguous inner rows (column slice, sub-volume, negative stride) | Per-row memcpy, iterate outer dimensions | Within ≈ 5 % of Path 1 for typical row sizes |
+| 3 | Fully strided (transposed view, every-other-element) | Internal `np.ascontiguousarray()` (numpy's vectorised C strided→contig pass), then Path 1 memcpy | ≈ 4× Path 1 — but ≈ 4× faster than the legacy element-wise iteration the binding used to do here |
+
+Path 3 is the case that bit early users: a HailoRT output naturally
+arrives as `arr.transpose(0, 2, 1)` over a `(1, anchors, channels)`
+buffer, which has no contiguous inner row. The legacy element-wise
+loop incurred stride arithmetic and broke vectorisation. PR #58
+replaced it with the `np.ascontiguousarray` materialisation path.
+Callers therefore no longer need to maintain a manual
+`np.ascontiguousarray()` workaround above HAL — see
+[README § Rule 7](README.md#rule-7--numpy-interop-pass-arrays-straight-to-from_numpy)
+for the user-facing rule.
+
 ### Cross-Crate Dependencies
 
 The `edgefirst_image` crate depends on `edgefirst_decoder` for the `DetectBox`, `ProtoData`, and `Segmentation` types used in the mask rendering APIs (`draw_decoded_masks`, `draw_proto_masks`). This means the image crate imports decoder types but does not import the `Decoder` itself — it only needs the output data structures that describe detections and masks.
