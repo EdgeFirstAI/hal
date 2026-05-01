@@ -1734,7 +1734,24 @@ mod cpu_tests {
         num_protos: usize,
         coefficients: Vec<Vec<f32>>,
     ) -> crate::ProtoData {
+        make_proto_data_with_values(
+            proto_h,
+            proto_w,
+            num_protos,
+            vec![0.0_f32; proto_h * proto_w * num_protos],
+            coefficients,
+        )
+    }
+
+    fn make_proto_data_with_values(
+        proto_h: usize,
+        proto_w: usize,
+        num_protos: usize,
+        proto_values: Vec<f32>,
+        coefficients: Vec<Vec<f32>>,
+    ) -> crate::ProtoData {
         use edgefirst_tensor::{Tensor, TensorDyn};
+        assert_eq!(proto_values.len(), proto_h * proto_w * num_protos);
         let n = coefficients.len();
         let row_len = coefficients.first().map(|r| r.len()).unwrap_or(num_protos);
         let mut flat = Vec::with_capacity(n * row_len);
@@ -1742,11 +1759,8 @@ mod cpu_tests {
             flat.extend_from_slice(row);
         }
         let coeff_t = Tensor::<f32>::from_slice(&flat, &[n, row_len]).unwrap();
-        let protos_t = Tensor::<f32>::from_slice(
-            &vec![0.0_f32; proto_h * proto_w * num_protos],
-            &[proto_h, proto_w, num_protos],
-        )
-        .unwrap();
+        let protos_t =
+            Tensor::<f32>::from_slice(&proto_values, &[proto_h, proto_w, num_protos]).unwrap();
         crate::ProtoData {
             mask_coefficients: TensorDyn::F32(coeff_t),
             protos: TensorDyn::F32(protos_t),
@@ -1879,6 +1893,74 @@ mod cpu_tests {
         );
         let segs = result.unwrap();
         assert_eq!(segs.len(), 1);
+    }
+
+    #[test]
+    fn test_materialize_scaled_invalid_coeff_rows() {
+        let cpu = CPUProcessor::new();
+        let proto_data = make_proto_data(8, 8, 4, vec![vec![0.5; 4]]);
+        let det = [
+            make_detect_box(0.1, 0.1, 0.5, 0.5),
+            make_detect_box(0.5, 0.5, 0.9, 0.9),
+        ];
+        let result = cpu.materialize_scaled_segmentations(&det, &proto_data, None, 64, 64);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, crate::Error::Internal(s) if s.contains("mask_coefficients rows")),
+            "error should report coefficient rows vs detection count mismatch: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_materialize_scaled_bbox_edge_one() {
+        let cpu = CPUProcessor::new();
+        let proto_data = make_proto_data_with_values(8, 8, 1, vec![1.0_f32; 64], vec![vec![1.0]]);
+        let det = [make_detect_box(0.5, 0.5, 1.0, 1.0)];
+        let segs = cpu
+            .materialize_scaled_segmentations(&det, &proto_data, None, 64, 64)
+            .expect("bbox at exact boundary (1.0) should be handled on scaled path");
+        assert_eq!(segs.len(), 1);
+        let shape = segs[0].segmentation.shape();
+        assert!(shape[0] > 0 && shape[1] > 0);
+        assert_eq!(shape[2], 1);
+        assert!(
+            segs[0]
+                .segmentation
+                .iter()
+                .all(|&v| matches!(v, 0_u8 | 255_u8)),
+            "scaled path output must remain binarized u8"
+        );
+    }
+
+    #[test]
+    fn test_materialize_scaled_letterbox_mapping() {
+        let cpu = CPUProcessor::new();
+        let proto_data = make_proto_data_with_values(8, 8, 1, vec![1.0_f32; 64], vec![vec![1.0]]);
+        let det = [make_detect_box(0.25, 0.1, 0.75, 0.9)];
+        let segs = cpu
+            .materialize_scaled_segmentations(
+                &det,
+                &proto_data,
+                Some([0.25, 0.1, 0.75, 0.9]),
+                16,
+                10,
+            )
+            .expect("scaled path with letterbox should succeed");
+        assert_eq!(segs.len(), 1);
+        let seg = &segs[0];
+        assert!((seg.xmin - 0.0).abs() < 1e-6);
+        assert!((seg.ymin - 0.0).abs() < 1e-6);
+        assert!((seg.xmax - 1.0).abs() < 1e-6);
+        assert!((seg.ymax - 1.0).abs() < 1e-6);
+        let shape = seg.segmentation.shape();
+        assert_eq!(shape[0], 10);
+        assert_eq!(shape[1], 16);
+        assert_eq!(shape[2], 1);
+        assert!(
+            seg.segmentation.iter().all(|&v| v == 255),
+            "positive logits should remain foreground after scaled letterbox mapping"
+        );
     }
 
     /// Golden-byte anchor: runs the quantized decode + CPU mask materialization

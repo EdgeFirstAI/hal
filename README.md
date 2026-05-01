@@ -423,6 +423,7 @@ rule exists, and [TESTING.md] for how to verify your integration follows it.
 | Cache imported camera tensors by **inode**, not by fd | v4l2 / libcamera recycle fd numbers across a small buffer pool; an fd-keyed cache misses on every frame even when the physical buffer is the same | Full EGL re-import per frame (≈0.5–1.5 ms on Vivante, multiplied by source + chroma planes) |
 | Build `Decoder` once, decode many | Decoder construction parses model metadata and allocates working buffers | Parse + alloc cost per frame |
 | Construct one `ImageProcessor` per pipeline | Each instance owns its own GL context and EGL display | Multiple GL contexts contend on `GL_MUTEX`; see ARCHITECTURE.md |
+| Use native fp16 / AVX build overrides only on CPUs that support them | These flags unlock native widening/vector paths for local perf testing | Unsupported targets may fail to build or hit illegal instructions; portability loss |
 | Pass numpy arrays straight to `Tensor.from_numpy()` — do not pre-`ascontiguousarray()` | HAL detects strided sources and materialises via numpy's vectorized C strided→contig pass; a manual workaround above HAL adds a redundant copy | A redundant `np.ascontiguousarray` pre-copy on every call (size-dependent; e.g. ≈1.5 ms per call on a `(1, 116, 8400)` f32 view on rpi5-hailo) |
 | For COCO/IoU evaluation use `MaskResolution::Scaled(orig_w, orig_h)`, not `Proto` | `Scaled` upsamples the continuous-sigmoid proto plane *before* thresholding (clean edges); `Proto` returns continuous values but most callers threshold-then-resize, which produces blocky binary edges and lossy mAP | Mask mAP regression of up to 0.04–0.05 absolute (model- and dataset-dependent) when `Proto` is thresholded then nearest-upsampled |
 
@@ -584,6 +585,7 @@ lookup-or-import flow on every dequeued frame:
 
 ```c
 #include <sys/stat.h>
+#include <stdio.h>
 
 typedef struct {
     ino_t inode;
@@ -592,15 +594,27 @@ typedef struct {
 
 /* On each input frame: */
 struct stat st;
-fstat(fd, &st);
+if (fstat(fd, &st) != 0) {
+    perror("fstat");
+    continue;  /* skip this frame */
+}
 BufferKey key = { .inode = st.st_ino, .offset = plane_offset };
 
 struct hal_tensor *tensor = lookup_tensor(cache, &key);
 if (!tensor) {
     /* First time seeing this physical buffer — import once. */
     struct hal_plane_descriptor *pd = hal_plane_descriptor_new(fd);
+    if (!pd) {
+        perror("hal_plane_descriptor_new");
+        continue;
+    }
     tensor = hal_import_image(proc, pd, NULL, w, h,
                               HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+    /* pd is consumed by hal_import_image(), even on failure. */
+    if (!tensor) {
+        fprintf(stderr, "hal_import_image failed\n");
+        continue;
+    }
     insert_tensor(cache, &key, tensor);
 }
 /* Reuse `tensor` for this frame; do NOT free it between frames. */
@@ -609,9 +623,11 @@ hal_image_processor_convert(proc, tensor, dst, /* ... */);
 
 ```python
 import os
+from typing import Dict, Tuple
+import edgefirst_hal as ef
 
 # (inode, offset) -> ef.Tensor
-buffer_cache: dict[tuple[int, int], ef.Tensor] = {}
+buffer_cache: Dict[Tuple[int, int], ef.Tensor] = {}
 
 def get_or_import(proc, fd, offset, width, height, fmt):
     key = (os.fstat(fd).st_ino, offset)
@@ -652,7 +668,7 @@ use edgefirst_hal::tensor::TensorDyn;
 // Build once, outside the inference loop. The builder parses the model's
 // output schema and allocates internal working buffers at .build() time.
 let decoder = DecoderBuilder::default()
-    .with_config_yaml_str(config_yaml)
+    .with_config_yaml_str(config_yaml.to_string())
     .with_score_threshold(0.5)
     .with_iou_threshold(0.45)
     .build()?;
@@ -687,10 +703,11 @@ GL mutex. Construct one per pipeline (or one per worker thread for parallel
 pipelines) and share it across all `convert()`, `draw_*()`, and
 `create_image()` calls.
 
-`ImageProcessor` is `Send` but **not** `Sync`: you can move it between
-threads but you cannot call it concurrently from multiple threads. For
-parallel inference workers, give each worker its own `ImageProcessor` and
-its own output tensor.
+`ImageProcessor` is `Send + Sync`, so it can be moved or shared across
+threads. Concurrent use of a single shared instance is still discouraged:
+operations can serialize on `GL_MUTEX`, and per-worker ownership gives more
+predictable cache behavior. For parallel inference workers, give each worker
+its own `ImageProcessor` and its own output tensor.
 
 ### Rule 6 — Local fp16 / AVX build overrides
 
@@ -867,7 +884,7 @@ use edgefirst_hal::tensor::TensorDyn;
 // Build decoder from a YAML config string (or use other with_config_*
 // methods to build from a parsed schema).
 let decoder = DecoderBuilder::default()
-    .with_config_yaml_str(config_yaml)
+    .with_config_yaml_str(config_yaml.to_string())
     .with_score_threshold(0.5)
     .with_iou_threshold(0.45)
     .build()?;
@@ -1046,7 +1063,7 @@ is documented in [ARCHITECTURE.md] § Performance Considerations.
 Thread safety of major types:
 - `Tensor<T>`: `Send + Sync` — safe to share across threads
 - `TensorDyn`: `Send + Sync` — thread-safe
-- `ImageProcessor`: `Send` but **not** `Sync` — create one per thread (GPU contexts are thread-local)
+- `ImageProcessor`: `Send + Sync` — thread-safe to move/share, but per-thread ownership is still recommended for predictable performance
 - `Decoder`: `Send + Sync` — thread-safe for read operations
 
 ## Error Handling
