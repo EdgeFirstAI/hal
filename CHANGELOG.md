@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **Restore `materialize_masks` parallelism + logit-precompute (regressed
+  by PR #51).** PR #54 originally added rayon `par_iter` across
+  detections plus a batched-GEMM-style precompute that hoisted the
+  K-wide dot-product out of the per-output-pixel inner loop. PR #51
+  (EDGEAI-1244 f16 dispatch refactor) inadvertently rewrote both
+  `materialize_segmentations` (Proto) and `materialize_scaled_segmentations`
+  (Scaled) to use serial `.iter()` and per-output-pixel bilinear-sample-
+  then-dot, silently dropping both optimisations. Restoring them:
+  - `materialize_segmentations`: rayon parallel across detections, with
+    the proto-tensor `map()` guard acquired once per call instead of
+    once per detection.
+  - `materialize_scaled_segmentations`: rayon parallel across detections
+    plus a per-detection logit-precompute pass — for each detection,
+    compute f32 logits at every proto-plane ROI pixel via a single
+    K-wide dot, then bilinear-interpolate the scalar logit at every
+    output pixel before applying sigmoid + threshold. Crucially the
+    bilinear upsample still operates on continuous logits, not on the
+    sigmoid-quantised u8, so accuracy is preserved.
+  Measured on imx8mp-frdm with the corrected ara2-validator on
+  coco128-seg (N=119 avg detections per image, max_det=300,
+  score_threshold=0.001):
+    `materialize_hal` mean **569 ms → 33 ms (17× faster)**;
+    mask mAP unchanged at 0.3220 (vs the dvapi/numpy reference's 0.3221
+    — 0.0001 absolute drift).
+
 ### Changed
 
 - **`Tensor.from_numpy()` fast path for fully-strided sources.** A numpy
@@ -21,6 +48,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ndarray's stride-respecting iterator. Callers that maintained a
   manual `np.ascontiguousarray(...)` workaround can now drop it; the
   fast path is automatic.
+
+### Documentation
+
+- **Optimization Guide refresh: NumPy interop and `MaskResolution`
+  doctrine.** The cross-document Optimization Guide gains two new
+  rules and matching cost-table rows:
+  - **Rule 7 — NumPy interop:** pass numpy arrays straight to
+    `Tensor.from_numpy()`; do not pre-`ascontiguousarray()`. Documents
+    the three internal paths (`copy_numpy_to_tensor_dyn`), the narrow
+    case where pre-materialising still helps (a single strided view
+    fed many times), and the rpi5-hailo numbers (≈ 6.5 ms automatic
+    fast path vs ≈ 27 ms legacy element-wise loop).
+  - **Rule 8 — `MaskResolution` selection:** for COCO / IoU evaluation
+    use `MaskResolution::Scaled(orig_w, orig_h)`. The default
+    `MaskResolution::Proto` returns continuous sigmoid values at proto
+    resolution; if a downstream caller thresholds those *before*
+    upsampling (the natural-looking but wrong order), edges become
+    blocky and mask mAP regresses by 0.04–0.05 absolute on YOLOv8-seg
+    / `coco128-seg`. `Scaled` performs the upsample inside HAL's
+    batched-GEMM kernel and thresholds afterwards.
+  Touches `README.md` (rule table + Rule 7/8 sections),
+  `BENCHMARKS.md` (cost table + NumPy Interop Fast-Path section),
+  `ARCHITECTURE.md` (three-path strategy under Python Bindings), and
+  `TESTING.md` (validation pointers to `test_from_numpy_hailort_shape`
+  and `MaskResolution.Scaled` smoke checks).
 
 ## [0.18.0] - 2026-04-25
 
