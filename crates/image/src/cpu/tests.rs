@@ -1963,6 +1963,22 @@ mod cpu_tests {
         );
     }
 
+    #[test]
+    fn test_materialize_scaled_out_of_range_letterbox_no_panic() {
+        let cpu = CPUProcessor::new();
+        let proto_data = make_proto_data_with_values(8, 8, 1, vec![1.0_f32; 64], vec![vec![1.0]]);
+        let det = [make_detect_box(0.95, 0.95, 1.0, 1.0)];
+        // Deliberately out-of-range letterbox values: this used to drive
+        // proto_x0/proto_y0 to the exclusive upper bound and panic in scaled_run.
+        let segs = cpu
+            .materialize_scaled_segmentations(&det, &proto_data, Some([1.2, 1.2, 1.4, 1.4]), 32, 32)
+            .expect("scaled path should clamp ROI starts and avoid OOB panics");
+        assert_eq!(segs.len(), 1);
+        let shape = segs[0].segmentation.shape();
+        assert!(shape[0] > 0 && shape[1] > 0);
+        assert_eq!(shape[2], 1);
+    }
+
     /// Golden-byte anchor: runs the quantized decode + CPU mask materialization
     /// end-to-end on the cached YOLOv8-seg fixture and asserts the first
     /// detection's binarized u8 mask is bit-exact against a committed golden
