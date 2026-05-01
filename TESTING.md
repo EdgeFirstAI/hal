@@ -360,10 +360,18 @@ succeeds:
 Shared EGL display initialized: kind=Wayland, transfer=DmaBuf
 ```
 
-The `transfer=` field reports `DmaBuf`, `Pbo`, or `Sync` — these correspond
-to the three rows in the README *Platform GPU Support* table. To confirm a
-specific backend is being exercised, set the corresponding environment
-variable from the table below and re-run with `RUST_LOG=info`.
+This `transfer=` field is the **initial EGL display capability probe** and
+reports only `DmaBuf` or `Sync`. The effective transfer backend used for
+conversions (after `Sync -> Pbo` upgrade and any `EDGEFIRST_FORCE_TRANSFER`
+override) is logged when the GL converter is created:
+
+```text
+GLConverter created (transfer=Pbo)
+```
+
+To confirm the final backend being exercised, set the corresponding
+environment variable from the table below and re-run with
+`RUST_LOG=edgefirst_image=debug`.
 
 | Variable | Effect | Use to verify |
 |----------|--------|---------------|

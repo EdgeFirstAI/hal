@@ -323,11 +323,20 @@ impl CPUProcessor {
                         let (x0, y0, x1, y1, roi_w, roi_h) =
                             bbox_to_proto_roi(det, proto_w, proto_h);
                         let mask = fused_dequant_dot_sigmoid_i8_slice(
-                            protos_slice, coeff, quant, proto_h, proto_w, y0, x0,
-                            roi_h, roi_w, num_protos,
+                            protos_slice,
+                            coeff,
+                            quant,
+                            proto_h,
+                            proto_w,
+                            y0,
+                            x0,
+                            roi_h,
+                            roi_w,
+                            num_protos,
                         )?;
-                        Ok(seg_from_roi(mask, x0, y0, x1, y1, proto_w, proto_h,
-                                         lx0, inv_lw, ly0, inv_lh))
+                        Ok(seg_from_roi(
+                            mask, x0, y0, x1, y1, proto_w, proto_h, lx0, inv_lw, ly0, inv_lh,
+                        ))
                     })
                     .collect()
             }
@@ -343,11 +352,19 @@ impl CPUProcessor {
                         let (x0, y0, x1, y1, roi_w, roi_h) =
                             bbox_to_proto_roi(det, proto_w, proto_h);
                         let mask = fused_dot_sigmoid_f32_slice(
-                            protos_slice, coeff, proto_h, proto_w, y0, x0,
-                            roi_h, roi_w, num_protos,
+                            protos_slice,
+                            coeff,
+                            proto_h,
+                            proto_w,
+                            y0,
+                            x0,
+                            roi_h,
+                            roi_w,
+                            num_protos,
                         );
-                        Ok(seg_from_roi(mask, x0, y0, x1, y1, proto_w, proto_h,
-                                         lx0, inv_lw, ly0, inv_lh))
+                        Ok(seg_from_roi(
+                            mask, x0, y0, x1, y1, proto_w, proto_h, lx0, inv_lw, ly0, inv_lh,
+                        ))
                     })
                     .collect()
             }
@@ -363,11 +380,19 @@ impl CPUProcessor {
                         let (x0, y0, x1, y1, roi_w, roi_h) =
                             bbox_to_proto_roi(det, proto_w, proto_h);
                         let mask = fused_dot_sigmoid_f16_slice(
-                            protos_slice, coeff, proto_h, proto_w, y0, x0,
-                            roi_h, roi_w, num_protos,
+                            protos_slice,
+                            coeff,
+                            proto_h,
+                            proto_w,
+                            y0,
+                            x0,
+                            roi_h,
+                            roi_w,
+                            num_protos,
                         );
-                        Ok(seg_from_roi(mask, x0, y0, x1, y1, proto_w, proto_h,
-                                         lx0, inv_lw, ly0, inv_lh))
+                        Ok(seg_from_roi(
+                            mask, x0, y0, x1, y1, proto_w, proto_h, lx0, inv_lw, ly0, inv_lh,
+                        ))
                     })
                     .collect()
             }
@@ -423,6 +448,13 @@ impl CPUProcessor {
         }
         if coeff_shape[0] == 0 {
             return Ok(Vec::new());
+        }
+        if coeff_shape[0] != detect.len() {
+            return Err(crate::Error::Internal(format!(
+                "mask_coefficients rows {} != detection count {}",
+                coeff_shape[0],
+                detect.len()
+            )));
         }
 
         // Widen coefficients to f32 once for the scaled-sample inner loop.
@@ -887,47 +919,6 @@ unsafe fn fused_dot_sigmoid_f16_slice_f16c(
     mask
 }
 
-// Scaled mask kernels — bilinear sample + sigmoid, binarized output.
-
-#[allow(clippy::too_many_arguments)]
-#[inline(always)]
-fn bilinear_dot_slice<P: Copy>(
-    protos: &[P],
-    stride_y: usize,
-    num_protos: usize,
-    coeff: &[f32],
-    px: f32,
-    py: f32,
-    proto_w: usize,
-    proto_h: usize,
-    load_f32: impl Fn(&P) -> f32,
-) -> f32 {
-    let x0 = (px.floor() as isize).clamp(0, proto_w as isize - 1) as usize;
-    let y0 = (py.floor() as isize).clamp(0, proto_h as isize - 1) as usize;
-    let x1 = (x0 + 1).min(proto_w - 1);
-    let y1 = (y0 + 1).min(proto_h - 1);
-    let fx = px - px.floor();
-    let fy = py - py.floor();
-    let w00 = (1.0 - fx) * (1.0 - fy);
-    let w10 = fx * (1.0 - fy);
-    let w01 = (1.0 - fx) * fy;
-    let w11 = fx * fy;
-    let b00 = y0 * stride_y + x0 * num_protos;
-    let b10 = y0 * stride_y + x1 * num_protos;
-    let b01 = y1 * stride_y + x0 * num_protos;
-    let b11 = y1 * stride_y + x1 * num_protos;
-    let mut acc = 0.0_f32;
-    for p in 0..num_protos {
-        let v00 = load_f32(&protos[b00 + p]);
-        let v10 = load_f32(&protos[b10 + p]);
-        let v01 = load_f32(&protos[b01 + p]);
-        let v11 = load_f32(&protos[b11 + p]);
-        let val = w00 * v00 + w10 * v10 + w01 * v01 + w11 * v11;
-        acc += coeff[p] * val;
-    }
-    acc
-}
-
 #[allow(clippy::too_many_arguments)]
 fn scaled_segmentations_f32_slice(
     detect: &[crate::DetectBox],
@@ -998,7 +989,7 @@ fn scaled_segmentations_i8_slice(
     use edgefirst_tensor::QuantMode;
     // Only per-tensor quantization supported on the scaled-path CPU kernel
     // today. Per-channel fits naturally into a future extension (would need
-    // to pass per-channel scaled coefficients into bilinear_dot_slice).
+    // per-channel scaled coefficients in scaled_run's dot-product precompute).
     let (scale, zp) = match quant.mode() {
         QuantMode::PerTensor { scale, zero_point } => (scale, zero_point as f32),
         QuantMode::PerTensorSymmetric { scale } => (scale, 0.0),
@@ -1106,13 +1097,9 @@ fn scaled_run<P: Copy + Sync>(
             let s_y_max = sample_y_at((py1 as f32) - 1.0);
             // Floor min, ceil max+1 to include both bilinear neighbours.
             let proto_x0 = (s_x_min.floor() as isize).max(0).min(proto_w as isize) as usize;
-            let proto_x1 = ((s_x_max.ceil() as isize) + 1)
-                .max(0)
-                .min(proto_w as isize) as usize;
+            let proto_x1 = ((s_x_max.ceil() as isize) + 1).max(0).min(proto_w as isize) as usize;
             let proto_y0 = (s_y_min.floor() as isize).max(0).min(proto_h as isize) as usize;
-            let proto_y1 = ((s_y_max.ceil() as isize) + 1)
-                .max(0)
-                .min(proto_h as isize) as usize;
+            let proto_y1 = ((s_y_max.ceil() as isize) + 1).max(0).min(proto_h as isize) as usize;
             let roi_w = proto_x1.saturating_sub(proto_x0).max(1);
             let roi_h = proto_y1.saturating_sub(proto_y0).max(1);
 
