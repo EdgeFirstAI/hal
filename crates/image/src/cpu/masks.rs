@@ -1096,9 +1096,15 @@ fn scaled_run<P: Copy + Sync>(
             let s_y_min = sample_y_at(py0 as f32);
             let s_y_max = sample_y_at((py1 as f32) - 1.0);
             // Floor min, ceil max+1 to include both bilinear neighbours.
-            let proto_x0 = (s_x_min.floor() as isize).max(0).min(proto_w as isize) as usize;
+            // Start indices are used as direct bases into `protos`, so clamp
+            // them to the last valid index, not to the exclusive upper bound.
+            let proto_x0 = (s_x_min.floor() as isize)
+                .max(0)
+                .min(proto_w.saturating_sub(1) as isize) as usize;
             let proto_x1 = ((s_x_max.ceil() as isize) + 1).max(0).min(proto_w as isize) as usize;
-            let proto_y0 = (s_y_min.floor() as isize).max(0).min(proto_h as isize) as usize;
+            let proto_y0 = (s_y_min.floor() as isize)
+                .max(0)
+                .min(proto_h.saturating_sub(1) as isize) as usize;
             let proto_y1 = ((s_y_max.ceil() as isize) + 1).max(0).min(proto_h as isize) as usize;
             let roi_w = proto_x1.saturating_sub(proto_x0).max(1);
             let roi_h = proto_y1.saturating_sub(proto_y0).max(1);
@@ -1125,7 +1131,9 @@ fn scaled_run<P: Copy + Sync>(
                 let py_o = (py0 + yi) as f32;
                 let sample_y = sample_y_at(py_o) - proto_y0 as f32;
                 let y_floor = sample_y.floor();
-                let y_lo = (y_floor as isize).max(0) as usize;
+                let y_lo = (y_floor as isize)
+                    .max(0)
+                    .min(roi_h.saturating_sub(1) as isize) as usize;
                 let y_hi = (y_lo + 1).min(roi_h - 1);
                 let y_frac = (sample_y - y_floor).clamp(0.0, 1.0);
                 let row_lo = &logits[y_lo * roi_w..y_lo * roi_w + roi_w];
@@ -1134,7 +1142,10 @@ fn scaled_run<P: Copy + Sync>(
                     let px_o = (px0 + xi) as f32;
                     let sample_x = sample_x_at(px_o) - proto_x0 as f32;
                     let x_floor = sample_x.floor();
-                    let x_lo = (x_floor as isize).max(0) as usize;
+                    let x_lo = (x_floor as isize)
+                        .max(0)
+                        .min(roi_w.saturating_sub(1) as isize)
+                        as usize;
                     let x_hi = (x_lo + 1).min(roi_w - 1);
                     let x_frac = (sample_x - x_floor).clamp(0.0, 1.0);
                     // Bilinear interp on the scalar logit plane.
