@@ -2105,6 +2105,292 @@ mod cpu_tests {
         }
     }
 
+    // ── i8×i8 integer mask decode path tests ─────────────────────────────────────
+
+    /// Build a ProtoData with I8 protos and I8 coefficients (with quantization).
+    fn make_proto_data_i8(
+        proto_h: usize,
+        proto_w: usize,
+        num_protos: usize,
+        proto_values: Vec<i8>,
+        proto_scale: f32,
+        proto_zp: i32,
+        coeff_values: Vec<i8>,
+        coeff_scale: f32,
+        coeff_zp: i32,
+        num_detections: usize,
+    ) -> crate::ProtoData {
+        use edgefirst_tensor::{Quantization, Tensor, TensorDyn};
+        assert_eq!(proto_values.len(), proto_h * proto_w * num_protos);
+        assert_eq!(coeff_values.len(), num_detections * num_protos);
+
+        let mut protos_t =
+            Tensor::<i8>::from_slice(&proto_values, &[proto_h, proto_w, num_protos]).unwrap();
+        protos_t
+            .set_quantization(Quantization::per_tensor(proto_scale, proto_zp))
+            .unwrap();
+
+        let mut coeff_t =
+            Tensor::<i8>::from_slice(&coeff_values, &[num_detections, num_protos]).unwrap();
+        coeff_t
+            .set_quantization(Quantization::per_tensor(coeff_scale, coeff_zp))
+            .unwrap();
+
+        crate::ProtoData {
+            mask_coefficients: TensorDyn::I8(coeff_t),
+            protos: TensorDyn::I8(protos_t),
+        }
+    }
+
+    #[test]
+    fn test_materialize_scaled_i8_i8_basic() {
+        // Uniform positive protos + positive coefficients → all-255 mask.
+        let proto_h = 4;
+        let proto_w = 4;
+        let num_protos = 2;
+        let proto_values = vec![10_i8; proto_h * proto_w * num_protos];
+        let coeff_values = vec![10_i8; num_protos];
+        let proto_data = make_proto_data_i8(
+            proto_h,
+            proto_w,
+            num_protos,
+            proto_values,
+            0.1,
+            0,
+            coeff_values,
+            0.1,
+            0,
+            1,
+        );
+        let det = [make_detect_box(0.1, 0.1, 0.9, 0.9)];
+        let cpu = CPUProcessor::new();
+        let segs = cpu
+            .materialize_scaled_segmentations(&det, &proto_data, None, 16, 16)
+            .expect("i8×i8 scaled path should succeed");
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].segmentation.shape()[2], 1);
+        // All protos positive, all coeffs positive → dot products positive
+        // → all mask pixels should be 255.
+        assert!(
+            segs[0].segmentation.iter().all(|&v| v == 255),
+            "uniform positive protos+coeffs should produce all-255 mask"
+        );
+    }
+
+    #[test]
+    fn test_materialize_scaled_i8_i8_all_negative() {
+        // Positive protos with negative coefficients → all-0 mask.
+        let proto_h = 4;
+        let proto_w = 4;
+        let num_protos = 2;
+        let proto_values = vec![10_i8; proto_h * proto_w * num_protos];
+        let coeff_values = vec![-10_i8; num_protos];
+        let proto_data = make_proto_data_i8(
+            proto_h,
+            proto_w,
+            num_protos,
+            proto_values,
+            0.1,
+            0,
+            coeff_values,
+            0.1,
+            0,
+            1,
+        );
+        let det = [make_detect_box(0.1, 0.1, 0.9, 0.9)];
+        let cpu = CPUProcessor::new();
+        let segs = cpu
+            .materialize_scaled_segmentations(&det, &proto_data, None, 16, 16)
+            .expect("i8×i8 scaled path should succeed");
+        assert_eq!(segs.len(), 1);
+        // Negative dot products → all mask pixels should be 0.
+        assert!(
+            segs[0].segmentation.iter().all(|&v| v == 0),
+            "positive protos + negative coeffs should produce all-0 mask"
+        );
+    }
+
+    #[test]
+    fn test_materialize_scaled_i8_i8_mixed_sign_boundary() {
+        // Create a proto field where the left half is positive, right half
+        // is negative. This exercises the bilinear boundary interpolation
+        // code (the non-shortcut path).
+        let proto_h = 4;
+        let proto_w = 4;
+        let num_protos = 1;
+        let mut proto_values = Vec::with_capacity(proto_h * proto_w * num_protos);
+        for _y in 0..proto_h {
+            for x in 0..proto_w {
+                proto_values.push(if x < proto_w / 2 { 50_i8 } else { -50_i8 });
+            }
+        }
+        let coeff_values = vec![1_i8]; // identity coefficient
+        let proto_data = make_proto_data_i8(
+            proto_h,
+            proto_w,
+            num_protos,
+            proto_values,
+            0.1,
+            0,
+            coeff_values,
+            0.1,
+            0,
+            1,
+        );
+        let det = [make_detect_box(0.0, 0.0, 1.0, 1.0)];
+        let cpu = CPUProcessor::new();
+        let segs = cpu
+            .materialize_scaled_segmentations(&det, &proto_data, None, 16, 16)
+            .expect("i8×i8 with mixed-sign protos should succeed");
+        assert_eq!(segs.len(), 1);
+        let mask = &segs[0].segmentation;
+        // Mask should have both 0 and 255 values (left half ≈ 255, right ≈ 0).
+        let has_255 = mask.iter().any(|&v| v == 255);
+        let has_0 = mask.iter().any(|&v| v == 0);
+        assert!(
+            has_255 && has_0,
+            "mixed-sign proto field should produce mixed mask"
+        );
+        // All values should be binarized.
+        assert!(
+            mask.iter().all(|&v| v == 0 || v == 255),
+            "mask must be binarized (0 or 255)"
+        );
+    }
+
+    #[test]
+    fn test_materialize_scaled_i8_i8_with_zero_points() {
+        // Test that zero-point correction is applied correctly.
+        // Protos with zp=-5, coeffs with zp=3.
+        let proto_h = 4;
+        let proto_w = 4;
+        let num_protos = 2;
+        // Raw proto values are 10, dequantized = (10 - (-5)) * 0.1 = 1.5
+        let proto_values = vec![10_i8; proto_h * proto_w * num_protos];
+        // Raw coeff values are 10, dequantized = (10 - 3) * 0.1 = 0.7
+        // Both positive → dot product positive → mask = 255
+        let coeff_values = vec![10_i8; num_protos];
+        let proto_data = make_proto_data_i8(
+            proto_h,
+            proto_w,
+            num_protos,
+            proto_values,
+            0.1,
+            -5,
+            coeff_values,
+            0.1,
+            3,
+            1,
+        );
+        let det = [make_detect_box(0.1, 0.1, 0.9, 0.9)];
+        let cpu = CPUProcessor::new();
+        let segs = cpu
+            .materialize_scaled_segmentations(&det, &proto_data, None, 16, 16)
+            .expect("i8×i8 with zero-points should succeed");
+        assert_eq!(segs.len(), 1);
+        // Dequantized values are both positive → all 255.
+        assert!(
+            segs[0].segmentation.iter().all(|&v| v == 255),
+            "positive dequantized values should produce all-255 mask"
+        );
+    }
+
+    #[test]
+    fn test_materialize_scaled_i8_i8_parity_with_float() {
+        // Compare i8×i8 integer path output against the f32 fallback path
+        // using symmetric quantization (zp=0) so the results should match exactly.
+        let proto_h = 8;
+        let proto_w = 8;
+        let num_protos = 4;
+
+        // Generate a structured proto field with varied values.
+        let mut proto_i8 = Vec::with_capacity(proto_h * proto_w * num_protos);
+        for y in 0..proto_h {
+            for x in 0..proto_w {
+                for k in 0..num_protos {
+                    let v = ((y as i32 * 7 + x as i32 * 13 + k as i32 * 3) % 127) as i8 - 60;
+                    proto_i8.push(v);
+                }
+            }
+        }
+
+        let coeff_i8: Vec<i8> = (0..num_protos).map(|k| (k as i8 * 10 + 5)).collect();
+
+        // Build f32 versions (symmetric quant, zp=0, scale=1.0).
+        let proto_f32: Vec<f32> = proto_i8.iter().map(|&v| v as f32).collect();
+        let coeff_f32: Vec<f32> = coeff_i8.iter().map(|&v| v as f32).collect();
+
+        let proto_data_f32 =
+            make_proto_data_with_values(proto_h, proto_w, num_protos, proto_f32, vec![coeff_f32]);
+        let proto_data_i8 = make_proto_data_i8(
+            proto_h, proto_w, num_protos, proto_i8, 1.0, 0, coeff_i8, 1.0, 0, 1,
+        );
+
+        let det = [make_detect_box(0.05, 0.05, 0.95, 0.95)];
+        let cpu = CPUProcessor::new();
+
+        let segs_f32 = cpu
+            .materialize_scaled_segmentations(&det, &proto_data_f32, None, 32, 32)
+            .expect("f32 path");
+        let segs_i8 = cpu
+            .materialize_scaled_segmentations(&det, &proto_data_i8, None, 32, 32)
+            .expect("i8 path");
+
+        assert_eq!(segs_f32.len(), 1);
+        assert_eq!(segs_i8.len(), 1);
+        assert_eq!(
+            segs_f32[0].segmentation.shape(),
+            segs_i8[0].segmentation.shape(),
+            "i8 and f32 paths should produce same-shaped masks"
+        );
+
+        // With symmetric quantization (zp=0, scale=1.0), the sign of the
+        // dot product is identical, so binarized masks must match exactly.
+        let f32_mask: Vec<u8> = segs_f32[0].segmentation.iter().copied().collect();
+        let i8_mask: Vec<u8> = segs_i8[0].segmentation.iter().copied().collect();
+        assert_eq!(
+            f32_mask, i8_mask,
+            "i8×i8 integer path must produce identical binarized mask as f32 path (symmetric quant)"
+        );
+    }
+
+    #[test]
+    fn test_materialize_scaled_i8_i8_multiple_detections() {
+        let proto_h = 4;
+        let proto_w = 4;
+        let num_protos = 2;
+        let proto_values = vec![10_i8; proto_h * proto_w * num_protos];
+        // Two detections: one positive, one negative.
+        let mut coeff_values = Vec::with_capacity(2 * num_protos);
+        coeff_values.extend_from_slice(&[10_i8, 10]); // det 0: positive
+        coeff_values.extend_from_slice(&[-10_i8, -10]); // det 1: negative
+        let proto_data = make_proto_data_i8(
+            proto_h,
+            proto_w,
+            num_protos,
+            proto_values,
+            0.1,
+            0,
+            coeff_values,
+            0.1,
+            0,
+            2,
+        );
+        let det = [
+            make_detect_box(0.1, 0.1, 0.5, 0.5),
+            make_detect_box(0.5, 0.5, 0.9, 0.9),
+        ];
+        let cpu = CPUProcessor::new();
+        let segs = cpu
+            .materialize_scaled_segmentations(&det, &proto_data, None, 16, 16)
+            .expect("multiple detections i8×i8 should succeed");
+        assert_eq!(segs.len(), 2);
+        // Det 0: positive coeffs → all 255.
+        assert!(segs[0].segmentation.iter().all(|&v| v == 255));
+        // Det 1: negative coeffs → all 0.
+        assert!(segs[1].segmentation.iter().all(|&v| v == 0));
+    }
+
     // ── Multiplane PixelFormat::Nv12 tests ───────────────────────────────────────
 
     #[test]

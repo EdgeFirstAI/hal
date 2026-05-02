@@ -306,7 +306,11 @@ impl CPUProcessor {
                     let (scale, zp) = match q.mode() {
                         QuantMode::PerTensor { scale, zero_point } => (scale, zero_point as f32),
                         QuantMode::PerTensorSymmetric { scale } => (scale, 0.0),
-                        _ => (1.0, 0.0),
+                        other => {
+                            return Err(crate::Error::NotSupported(format!(
+                                "I8 mask_coefficients quantization mode {other:?} not supported"
+                            )));
+                        }
                     };
                     m.as_slice()
                         .iter()
@@ -1208,6 +1212,7 @@ unsafe fn dot_i8_neon_dotprod(coeff: *const i8, proto: *const i8, n: usize) -> i
 /// Separated into its own function so the compiler inlines the sdot asm fully.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn compute_logits_dotprod(
     logits: &mut [i32],
     coeff: &[i8],
@@ -1245,6 +1250,7 @@ fn compute_logits_dotprod(
 /// Separated into its own function so the compiler inlines the NEON code fully.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn compute_logits_base(
     logits: &mut [i32],
     coeff: &[i8],
@@ -1487,11 +1493,11 @@ fn scaled_segmentations_i8_i8(
                     // Sign-shortcut: if all 4 corners have the same sign,
                     // the bilinear interpolation (positive-weight combination)
                     // preserves that sign. Skip arithmetic for ~80% of pixels.
-                    if (tl | tr | bl | br) < 0 {
+                    if (tl & tr & bl & br) < 0 {
                         // All negative → output 0 (already zero).
                         continue;
                     }
-                    if (tl & tr & bl & br) > 0 {
+                    if tl > 0 && tr > 0 && bl > 0 && br > 0 {
                         // All strictly positive → output 255.
                         out_row[xi] = 255;
                         continue;
@@ -1621,10 +1627,11 @@ fn scaled_run<P: Copy + Sync>(
             // `acc_scale * interp(logits) > 0 ⟺ interp(logits) > 0` when
             // acc_scale > 0. We therefore skip the per-pixel `acc_scale *`
             // multiply entirely, storing raw dot products.
-            debug_assert!(
-                acc_scale.is_finite() && acc_scale > 0.0,
-                "acc_scale must be positive for logit > 0 threshold (got {acc_scale})"
-            );
+            if !acc_scale.is_finite() || acc_scale <= 0.0 {
+                return Err(crate::Error::NotSupported(format!(
+                    "acc_scale must be finite and positive for sign-threshold optimization (got {acc_scale})"
+                )));
+            }
             let _ = acc_scale; // Scale-invariant: only sign matters.
             let mut logits = vec![0.0_f32; roi_h * roi_w];
             for ly_idx in 0..roi_h {
