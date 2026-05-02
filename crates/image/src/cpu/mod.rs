@@ -768,6 +768,24 @@ impl CPUProcessor {
                 let m = t.map()?;
                 m.as_slice().iter().map(|v| v.to_f32()).collect()
             }
+            DType::I8 => {
+                let t = proto_data.mask_coefficients.as_i8().expect("I8");
+                let m = t.map()?;
+                if let Some(q) = t.quantization() {
+                    use edgefirst_tensor::QuantMode;
+                    let (scale, zp) = match q.mode() {
+                        QuantMode::PerTensor { scale, zero_point } => (scale, zero_point as f32),
+                        QuantMode::PerTensorSymmetric { scale } => (scale, 0.0),
+                        _ => (1.0, 0.0),
+                    };
+                    m.as_slice()
+                        .iter()
+                        .map(|&v| (v as f32 - zp) * scale)
+                        .collect()
+                } else {
+                    m.as_slice().iter().map(|&v| v as f32).collect()
+                }
+            }
             other => {
                 return Err(Error::InvalidShape(format!(
                     "mask_coefficients dtype {other:?} not supported"
