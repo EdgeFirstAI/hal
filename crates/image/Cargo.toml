@@ -55,6 +55,7 @@ gbm = { workspace = true, optional = true }
 edgefirst-bench = { workspace = true }
 image = { workspace = true }
 image-compare = { workspace = true }
+safetensors = { workspace = true }
 
 [[bench]]
 name = "image_benchmark"
@@ -66,6 +67,10 @@ harness = false
 
 [[bench]]
 name = "mask_benchmark"
+harness = false
+
+[[bench]]
+name = "mask_decode_benchmark"
 harness = false
 
 [[bench]]

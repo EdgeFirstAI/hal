@@ -4354,7 +4354,9 @@ impl GLProcessorST {
         // heap allocations per frame on the hot path.
         let mc_map_f32;
         let mc_map_f16;
+        let mc_map_i8;
         let coeff_widen_f16: Vec<f32>;
+        let coeff_widen_i8: Vec<f32>;
         let coeff_slice: &[f32] = match proto_data.mask_coefficients.dtype() {
             DType::F32 => {
                 let t = proto_data.mask_coefficients.as_f32().expect("F32");
@@ -4366,6 +4368,26 @@ impl GLProcessorST {
                 mc_map_f16 = t.map()?;
                 coeff_widen_f16 = mc_map_f16.as_slice().iter().map(|v| v.to_f32()).collect();
                 &coeff_widen_f16[..]
+            }
+            DType::I8 => {
+                let t = proto_data.mask_coefficients.as_i8().expect("I8");
+                mc_map_i8 = t.map()?;
+                coeff_widen_i8 = if let Some(q) = t.quantization() {
+                    use edgefirst_tensor::QuantMode;
+                    let (scale, zp) = match q.mode() {
+                        QuantMode::PerTensor { scale, zero_point } => (scale, zero_point as f32),
+                        QuantMode::PerTensorSymmetric { scale } => (scale, 0.0),
+                        _ => (1.0, 0.0),
+                    };
+                    mc_map_i8
+                        .as_slice()
+                        .iter()
+                        .map(|&v| (v as f32 - zp) * scale)
+                        .collect()
+                } else {
+                    mc_map_i8.as_slice().iter().map(|&v| v as f32).collect()
+                };
+                &coeff_widen_i8[..]
             }
             other => {
                 return Err(crate::Error::InvalidShape(format!(
