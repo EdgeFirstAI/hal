@@ -776,7 +776,11 @@ impl CPUProcessor {
                     let (scale, zp) = match q.mode() {
                         QuantMode::PerTensor { scale, zero_point } => (scale, zero_point as f32),
                         QuantMode::PerTensorSymmetric { scale } => (scale, 0.0),
-                        _ => (1.0, 0.0),
+                        other => {
+                            return Err(Error::NotSupported(format!(
+                                "I8 mask_coefficients quantization mode {other:?} not supported"
+                            )));
+                        }
                     };
                     m.as_slice()
                         .iter()
