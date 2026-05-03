@@ -2673,7 +2673,7 @@ outputs:
         );
 
         // Verify mask coefficients: shape [num_detections, num_protos],
-        // dtype F32 (dequantized at extraction).
+        // dtype I8 (kept raw with quantization metadata).
         assert_eq!(
             proto_data.mask_coefficients.shape(),
             &[output_boxes.len(), 32],
@@ -2681,8 +2681,17 @@ outputs:
         );
         assert_eq!(
             proto_data.mask_coefficients.dtype(),
-            edgefirst_tensor::DType::F32,
-            "quantized extraction dequantizes coefficients to F32"
+            edgefirst_tensor::DType::I8,
+            "quantized extraction keeps coefficients as raw I8"
+        );
+        // Verify coefficients carry quantization metadata.
+        let coeff_quant = proto_data
+            .mask_coefficients
+            .quantization()
+            .expect("I8 mask_coefficients must carry quantization metadata");
+        assert!(
+            coeff_quant.is_per_tensor(),
+            "coeff quantization should be per-tensor"
         );
 
         // Verify proto tensor is I8 (input was i8) with per-tensor quantization.

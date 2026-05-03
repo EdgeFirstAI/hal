@@ -1201,7 +1201,13 @@ where
 /// Runs NMS but returns raw `ProtoData` instead of materialized masks.
 pub fn impl_yolo_segdet_quant_proto<
     B: BBoxTypeTrait,
-    BOX: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
+    BOX: PrimInt
+        + AsPrimitive<i64>
+        + AsPrimitive<i128>
+        + AsPrimitive<f32>
+        + AsPrimitive<i8>
+        + Send
+        + Sync,
     PROTO: PrimInt
         + AsPrimitive<i64>
         + AsPrimitive<i128>
@@ -1425,7 +1431,7 @@ pub(super) fn extract_proto_data_float<
 /// tensor. The GPU shader / CPU kernel reads `protos.quantization()` and
 /// dequantizes per-texel.
 pub(crate) fn extract_proto_data_quant<
-    MASK: PrimInt + AsPrimitive<f32> + Send + Sync,
+    MASK: PrimInt + AsPrimitive<f32> + AsPrimitive<i8> + Send + Sync,
     PROTO: PrimInt + AsPrimitive<f32> + AsPrimitive<i8> + Send + Sync + 'static,
 >(
     det_indices: Vec<(DetectBox, usize)>,
@@ -1439,28 +1445,37 @@ pub(crate) fn extract_proto_data_quant<
 
     let num_protos = mask_tensor.ncols();
     let n = det_indices.len();
-    let mut coeff_f32 = Vec::<f32>::with_capacity(n * num_protos);
+
+    // Keep mask coefficients in raw i8 with quantization metadata attached.
+    // Consumers that need f32 can dequantize on the fly; the scaled-path
+    // integer kernel uses raw i8 directly for i8×i8→i32 dot products.
+    let mut coeff_i8 = Vec::<i8>::with_capacity(n * num_protos);
     output_boxes.clear();
     for (det, idx) in det_indices {
         output_boxes.push(det);
         let row = mask_tensor.row(idx);
-        coeff_f32.extend(
-            row.iter()
-                .map(|v| (v.as_() - quant_masks.zero_point as f32) * quant_masks.scale),
-        );
+        coeff_i8.extend(row.iter().map(|v| {
+            let v_i8: i8 = v.as_();
+            v_i8
+        }));
     }
 
     // Shape `[n, num_protos]` with n=0 is permitted (tracker path emits no
     // fresh detections this frame) via the Mem-backed zero-size allowance.
-    let coeff_tensor = Tensor::<f32>::new(&[n, num_protos], Some(TensorMemory::Mem), None)
+    let coeff_tensor = Tensor::<i8>::new(&[n, num_protos], Some(TensorMemory::Mem), None)
         .expect("allocating mask_coefficients tensor");
     if n > 0 {
         let mut m = coeff_tensor
             .map()
             .expect("mapping mask_coefficients tensor");
-        m.as_mut_slice().copy_from_slice(&coeff_f32);
+        m.as_mut_slice().copy_from_slice(&coeff_i8);
     }
-    let mask_coefficients = TensorDyn::F32(coeff_tensor);
+    let coeff_quant =
+        edgefirst_tensor::Quantization::per_tensor(quant_masks.scale, quant_masks.zero_point);
+    let coeff_tensor = coeff_tensor
+        .with_quantization(coeff_quant)
+        .expect("per-tensor quantization on mask coefficients");
+    let mask_coefficients = TensorDyn::I8(coeff_tensor);
 
     // Keep protos in raw i8 — consumers dequantize via protos.quantization().
     // When PROTO is already i8, memcpy via to_owned(); else per-element as_().
