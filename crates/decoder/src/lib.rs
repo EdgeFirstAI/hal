@@ -463,7 +463,7 @@ pub struct Segmentation {
 ///
 /// | Source model | protos dtype | mask_coefficients dtype | protos.quantization |
 /// |---|---|---|---|
-/// | int8 quantized | [`TensorDyn::I8`] | [`TensorDyn::F32`] (dequantized) | `Some(q)` |
+/// | int8 quantized | [`TensorDyn::I8`] | [`TensorDyn::I8`] (raw + quantization) | `Some(q)` |
 /// | f32 | [`TensorDyn::F32`] | [`TensorDyn::F32`] | `None` |
 /// | f16 (TensorRT fp16) | [`TensorDyn::F16`] | [`TensorDyn::F16`] | `None` |
 /// | f64 (narrowed) | [`TensorDyn::F32`] | [`TensorDyn::F32`] | `None` |

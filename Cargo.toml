@@ -76,6 +76,7 @@ uuid = { version = "1.22.0", features = ["v4"] }
 yuv = { version = "0.8.12", features = ["fast_mode"] }
 zune-jpeg = "0.4.21"
 zune-png = "0.4.10"
+safetensors = "0.4"
 
 [profile.release]
 opt-level = 3
