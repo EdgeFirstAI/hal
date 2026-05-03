@@ -2108,16 +2108,15 @@ mod cpu_tests {
     // ── i8×i8 integer mask decode path tests ─────────────────────────────────────
 
     /// Build a ProtoData with I8 protos and I8 coefficients (with quantization).
+    #[allow(clippy::too_many_arguments)]
     fn make_proto_data_i8(
         proto_h: usize,
         proto_w: usize,
         num_protos: usize,
         proto_values: Vec<i8>,
-        proto_scale: f32,
-        proto_zp: i32,
+        proto_quant: (f32, i32),
         coeff_values: Vec<i8>,
-        coeff_scale: f32,
-        coeff_zp: i32,
+        coeff_quant: (f32, i32),
         num_detections: usize,
     ) -> crate::ProtoData {
         use edgefirst_tensor::{Quantization, Tensor, TensorDyn};
@@ -2127,13 +2126,13 @@ mod cpu_tests {
         let mut protos_t =
             Tensor::<i8>::from_slice(&proto_values, &[proto_h, proto_w, num_protos]).unwrap();
         protos_t
-            .set_quantization(Quantization::per_tensor(proto_scale, proto_zp))
+            .set_quantization(Quantization::per_tensor(proto_quant.0, proto_quant.1))
             .unwrap();
 
         let mut coeff_t =
             Tensor::<i8>::from_slice(&coeff_values, &[num_detections, num_protos]).unwrap();
         coeff_t
-            .set_quantization(Quantization::per_tensor(coeff_scale, coeff_zp))
+            .set_quantization(Quantization::per_tensor(coeff_quant.0, coeff_quant.1))
             .unwrap();
 
         crate::ProtoData {
@@ -2155,11 +2154,9 @@ mod cpu_tests {
             proto_w,
             num_protos,
             proto_values,
-            0.1,
-            0,
+            (0.1, 0),
             coeff_values,
-            0.1,
-            0,
+            (0.1, 0),
             1,
         );
         let det = [make_detect_box(0.1, 0.1, 0.9, 0.9)];
@@ -2190,11 +2187,9 @@ mod cpu_tests {
             proto_w,
             num_protos,
             proto_values,
-            0.1,
-            0,
+            (0.1, 0),
             coeff_values,
-            0.1,
-            0,
+            (0.1, 0),
             1,
         );
         let det = [make_detect_box(0.1, 0.1, 0.9, 0.9)];
@@ -2230,11 +2225,9 @@ mod cpu_tests {
             proto_w,
             num_protos,
             proto_values,
-            0.1,
-            0,
+            (0.1, 0),
             coeff_values,
-            0.1,
-            0,
+            (0.1, 0),
             1,
         );
         let det = [make_detect_box(0.0, 0.0, 1.0, 1.0)];
@@ -2275,11 +2268,9 @@ mod cpu_tests {
             proto_w,
             num_protos,
             proto_values,
-            0.1,
-            -5,
+            (0.1, -5),
             coeff_values,
-            0.1,
-            3,
+            (0.1, 3),
             1,
         );
         let det = [make_detect_box(0.1, 0.1, 0.9, 0.9)];
@@ -2314,7 +2305,7 @@ mod cpu_tests {
             }
         }
 
-        let coeff_i8: Vec<i8> = (0..num_protos).map(|k| (k as i8 * 10 + 5)).collect();
+        let coeff_i8: Vec<i8> = (0..num_protos).map(|k| k as i8 * 10 + 5).collect();
 
         // Build f32 versions (symmetric quant, zp=0, scale=1.0).
         let proto_f32: Vec<f32> = proto_i8.iter().map(|&v| v as f32).collect();
@@ -2323,7 +2314,14 @@ mod cpu_tests {
         let proto_data_f32 =
             make_proto_data_with_values(proto_h, proto_w, num_protos, proto_f32, vec![coeff_f32]);
         let proto_data_i8 = make_proto_data_i8(
-            proto_h, proto_w, num_protos, proto_i8, 1.0, 0, coeff_i8, 1.0, 0, 1,
+            proto_h,
+            proto_w,
+            num_protos,
+            proto_i8,
+            (1.0, 0),
+            coeff_i8,
+            (1.0, 0),
+            1,
         );
 
         let det = [make_detect_box(0.05, 0.05, 0.95, 0.95)];
@@ -2369,11 +2367,9 @@ mod cpu_tests {
             proto_w,
             num_protos,
             proto_values,
-            0.1,
-            0,
+            (0.1, 0),
             coeff_values,
-            0.1,
-            0,
+            (0.1, 0),
             2,
         );
         let det = [
