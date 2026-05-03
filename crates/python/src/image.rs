@@ -1091,14 +1091,13 @@ impl PyImageProcessor {
     ///     normalized coordinates, or ``None`` if no letterboxing was applied
     /// :param resolution: optional mask materialization mode. When ``None`` or
     ///     :class:`MaskResolution.Proto`, returns per-detection tiles at
-    ///     proto-plane resolution with continuous sigmoid mask values. When
+    ///     proto-plane resolution with binary mask values ``{0, 255}``. When
     ///     :class:`MaskResolution.Scaled` ``(width, height)``, HAL upsamples
     ///     the full proto plane once and returns per-detection tiles at the
-    ///     target resolution with binary mask values encoded as
-    ///     ``uint8 {0, 255}``. The same ``> 127`` threshold works for both.
-    /// :returns: list of ``(H, W, 1)`` uint8 numpy arrays. Contents depend on
-    ///     ``resolution``: continuous sigmoid values for ``Proto``, binary
-    ///     ``{0, 255}`` for ``Scaled``.
+    ///     target resolution with binary mask values ``{0, 255}``.
+    ///     Both modes use ``> 127`` as the threshold convention.
+    /// :returns: list of ``(H, W, 1)`` uint8 numpy arrays with binary
+    ///     ``{0, 255}`` mask values.
     /// :rtype: list[numpy.ndarray]
     #[pyo3(signature = (bbox, scores, classes, proto_data, letterbox=None, resolution=None))]
     #[allow(clippy::too_many_arguments)]
