@@ -271,6 +271,44 @@ impl CPUProcessor {
             None => (0.0_f32, 1.0_f32, 0.0_f32, 1.0_f32),
         };
 
+        // Fast integer path: when both coefficients and protos are I8 with
+        // per-tensor quantization, use the all-integer kernel (same dot
+        // product infrastructure as the scaled path, but at proto resolution
+        // without bilinear upsampling). Output is binary {0, 255}.
+        if proto_data.mask_coefficients.dtype() == DType::I8
+            && proto_data.protos.dtype() == DType::I8
+        {
+            let coeff_t = proto_data
+                .mask_coefficients
+                .as_i8()
+                .expect("I8 coefficients");
+            let coeff_m = coeff_t.map()?;
+            let coeff_quant = coeff_t.quantization().ok_or_else(|| {
+                crate::Error::InvalidShape(
+                    "I8 mask_coefficients require quantization metadata".into(),
+                )
+            })?;
+            let proto_t = proto_data.protos.as_i8().expect("I8 protos");
+            let proto_m = proto_t.map()?;
+            let proto_quant = proto_t.quantization().ok_or_else(|| {
+                crate::Error::InvalidShape("I8 protos require quantization metadata".into())
+            })?;
+            return proto_segmentations_i8_i8(
+                detect,
+                coeff_m.as_slice(),
+                coeff_quant,
+                proto_m.as_slice(),
+                proto_quant,
+                proto_h,
+                proto_w,
+                num_protos,
+                lx0,
+                inv_lw,
+                ly0,
+                inv_lh,
+            );
+        }
+
         // Coefficients may be F32 (from f32 models), F16 (from fp16 models),
         // or I8 (from quantized models — kept raw with quantization). For the
         // mask kernel we always need an f32 view (the multiply-accumulate is
@@ -348,7 +386,7 @@ impl CPUProcessor {
                         let coeff = &coeff_f32_slice[i * num_protos..(i + 1) * num_protos];
                         let (x0, y0, x1, y1, roi_w, roi_h) =
                             bbox_to_proto_roi(det, proto_w, proto_h);
-                        let mask = fused_dequant_dot_sigmoid_i8_slice(
+                        let mask = fused_dequant_dot_sign_i8_slice(
                             protos_slice,
                             coeff,
                             quant,
@@ -377,7 +415,7 @@ impl CPUProcessor {
                         let coeff = &coeff_f32_slice[i * num_protos..(i + 1) * num_protos];
                         let (x0, y0, x1, y1, roi_w, roi_h) =
                             bbox_to_proto_roi(det, proto_w, proto_h);
-                        let mask = fused_dot_sigmoid_f32_slice(
+                        let mask = fused_dot_sign_f32_slice(
                             protos_slice,
                             coeff,
                             proto_h,
@@ -405,7 +443,7 @@ impl CPUProcessor {
                         let coeff = &coeff_f32_slice[i * num_protos..(i + 1) * num_protos];
                         let (x0, y0, x1, y1, roi_w, roi_h) =
                             bbox_to_proto_roi(det, proto_w, proto_h);
-                        let mask = fused_dot_sigmoid_f16_slice(
+                        let mask = fused_dot_sign_f16_slice(
                             protos_slice,
                             coeff,
                             proto_h,
@@ -685,8 +723,265 @@ fn seg_from_roi(
     }
 }
 
+// =============================================================================
+// Integer-domain proto-resolution kernel: i8 coefficients × i8 protos → i32
+// → sign threshold → binary {0, 255}.
+//
+// Reuses the same dot product infrastructure as the scaled path (NEON sdot on
+// A55+, smull+sadalp on A53, scalar fallback on x86). Since proto-resolution
+// produces masks at the native proto grid (~30×30 per ROI), there is no
+// bilinear upsampling — just a direct sign threshold per pixel.
+// =============================================================================
+
+/// Proto-resolution mask materialization using integer-domain math.
+///
+/// For each detection, computes the i8×i8 dot product at every proto-ROI pixel,
+/// applies the zero-point correction, and thresholds at sign(logit) → {0, 255}.
 #[allow(clippy::too_many_arguments)]
-fn fused_dequant_dot_sigmoid_i8_slice(
+fn proto_segmentations_i8_i8(
+    detect: &[crate::DetectBox],
+    coeff_all: &[i8],
+    coeff_quant: &edgefirst_tensor::Quantization,
+    protos: &[i8],
+    proto_quant: &edgefirst_tensor::Quantization,
+    proto_h: usize,
+    proto_w: usize,
+    num_protos: usize,
+    lx0: f32,
+    inv_lw: f32,
+    ly0: f32,
+    inv_lh: f32,
+) -> crate::Result<Vec<edgefirst_decoder::Segmentation>> {
+    use edgefirst_tensor::QuantMode;
+
+    let zp_c: i32 = match coeff_quant.mode() {
+        QuantMode::PerTensor { zero_point, .. } => zero_point,
+        QuantMode::PerTensorSymmetric { .. } => 0,
+        _ => {
+            return Err(crate::Error::NotSupported(
+                "per-channel coeff quantization not supported on proto-res i8 path".into(),
+            ))
+        }
+    };
+    let zp_p: i32 = match proto_quant.mode() {
+        QuantMode::PerTensor { zero_point, .. } => zero_point,
+        QuantMode::PerTensorSymmetric { .. } => 0,
+        _ => {
+            return Err(crate::Error::NotSupported(
+                "per-channel proto quantization not supported on proto-res i8 path".into(),
+            ))
+        }
+    };
+
+    let stride_y = proto_w * num_protos;
+
+    // Precompute per-pixel proto sums for zero-point correction.
+    let proto_sums: Vec<i32> = if zp_c != 0 {
+        (0..proto_h * proto_w)
+            .map(|px_idx| {
+                let base = px_idx * num_protos;
+                protos[base..base + num_protos]
+                    .iter()
+                    .map(|&v| v as i32)
+                    .sum()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    #[cfg(target_arch = "aarch64")]
+    let use_dotprod = std::arch::is_aarch64_feature_detected!("dotprod");
+
+    detect
+        .par_iter()
+        .enumerate()
+        .map(|(i, det)| {
+            let coeff = &coeff_all[i * num_protos..(i + 1) * num_protos];
+            let (x0, y0, x1, y1, roi_w, roi_h) = bbox_to_proto_roi(det, proto_w, proto_h);
+
+            // Per-detection bias: zp_p·Σc_raw - N·zp_c·zp_p
+            let coeff_sum: i32 = coeff.iter().map(|&c| c as i32).sum();
+            let bias = zp_p * coeff_sum - (num_protos as i32) * zp_c * zp_p;
+
+            let mut mask_buf = vec![0u8; roi_h * roi_w];
+
+            #[cfg(target_arch = "aarch64")]
+            {
+                if use_dotprod {
+                    for ly in 0..roi_h {
+                        let py = y0 + ly;
+                        let row_base = py * stride_y + x0 * num_protos;
+                        for lx in 0..roi_w {
+                            let pix_base = row_base + lx * num_protos;
+                            let proto_px = &protos[pix_base..pix_base + num_protos];
+                            let raw_dot = unsafe {
+                                dot_i8_neon_dotprod(coeff.as_ptr(), proto_px.as_ptr(), num_protos)
+                            };
+                            let correction = if zp_c != 0 {
+                                zp_c * proto_sums[py * proto_w + x0 + lx]
+                            } else {
+                                0
+                            };
+                            let logit = raw_dot - correction - bias;
+                            if logit > 0 {
+                                mask_buf[ly * roi_w + lx] = 255;
+                            }
+                        }
+                    }
+                } else {
+                    for ly in 0..roi_h {
+                        let py = y0 + ly;
+                        let row_base = py * stride_y + x0 * num_protos;
+                        for lx in 0..roi_w {
+                            let pix_base = row_base + lx * num_protos;
+                            let proto_px = &protos[pix_base..pix_base + num_protos];
+                            let raw_dot = unsafe {
+                                dot_i8_neon_base(coeff.as_ptr(), proto_px.as_ptr(), num_protos)
+                            };
+                            let correction = if zp_c != 0 {
+                                zp_c * proto_sums[py * proto_w + x0 + lx]
+                            } else {
+                                0
+                            };
+                            let logit = raw_dot - correction - bias;
+                            if logit > 0 {
+                                mask_buf[ly * roi_w + lx] = 255;
+                            }
+                        }
+                    }
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                for ly in 0..roi_h {
+                    let py = y0 + ly;
+                    let row_base = py * stride_y + x0 * num_protos;
+                    for lx in 0..roi_w {
+                        let pix_base = row_base + lx * num_protos;
+                        let proto_px = &protos[pix_base..pix_base + num_protos];
+                        let raw_dot = dot_i8_scalar(coeff, proto_px, num_protos);
+                        let correction = if zp_c != 0 {
+                            zp_c * proto_sums[py * proto_w + x0 + lx]
+                        } else {
+                            0
+                        };
+                        let logit = raw_dot - correction - bias;
+                        if logit > 0 {
+                            mask_buf[ly * roi_w + lx] = 255;
+                        }
+                    }
+                }
+            }
+
+            let mask = ndarray::Array3::from_shape_vec((roi_h, roi_w, 1), mask_buf)
+                .expect("mask_buf length matches roi_h * roi_w");
+            Ok(seg_from_roi(
+                mask, x0, y0, x1, y1, proto_w, proto_h, lx0, inv_lw, ly0, inv_lh,
+            ))
+        })
+        .collect()
+}
+
+// =============================================================================
+// Sign-threshold proto-resolution kernels (f32/f16/i8 protos with f32 coeffs).
+//
+// These replace the sigmoid-computing kernels for the non-i8×i8 fallback paths.
+// Since downstream always thresholds at > 127, computing sigmoid is wasteful;
+// sign(dot) > 0 ⟺ sigmoid(dot) > 0.5 gives the same binary result.
+// =============================================================================
+
+/// f32 protos × f32 coefficients → sign threshold → binary {0, 255}.
+#[allow(clippy::too_many_arguments)]
+fn fused_dot_sign_f32_slice(
+    protos: &[f32],
+    coeff: &[f32],
+    _proto_h: usize,
+    proto_w: usize,
+    y0: usize,
+    x0: usize,
+    roi_h: usize,
+    roi_w: usize,
+    num_protos: usize,
+) -> ndarray::Array3<u8> {
+    let stride_y = proto_w * num_protos;
+    let mut mask_buf = vec![0u8; roi_h * roi_w];
+    for y in 0..roi_h {
+        let row_base = (y0 + y) * stride_y + x0 * num_protos;
+        let out_row = &mut mask_buf[y * roi_w..(y + 1) * roi_w];
+        for (x, out_px) in out_row.iter_mut().enumerate() {
+            let base = row_base + x * num_protos;
+            let mut acc = 0.0_f32;
+            let mut k = 0;
+            let chunks = num_protos / 4;
+            for _ in 0..chunks {
+                acc += coeff[k] * protos[base + k]
+                    + coeff[k + 1] * protos[base + k + 1]
+                    + coeff[k + 2] * protos[base + k + 2]
+                    + coeff[k + 3] * protos[base + k + 3];
+                k += 4;
+            }
+            while k < num_protos {
+                acc += coeff[k] * protos[base + k];
+                k += 1;
+            }
+            if acc > 0.0 {
+                *out_px = 255;
+            }
+        }
+    }
+    ndarray::Array3::from_shape_vec((roi_h, roi_w, 1), mask_buf)
+        .expect("mask_buf length matches roi_h * roi_w")
+}
+
+/// f16 protos × f32 coefficients → sign threshold → binary {0, 255}.
+#[allow(clippy::too_many_arguments)]
+fn fused_dot_sign_f16_slice(
+    protos: &[half::f16],
+    coeff: &[f32],
+    _proto_h: usize,
+    proto_w: usize,
+    y0: usize,
+    x0: usize,
+    roi_h: usize,
+    roi_w: usize,
+    num_protos: usize,
+) -> ndarray::Array3<u8> {
+    let stride_y = proto_w * num_protos;
+    let mut mask_buf = vec![0u8; roi_h * roi_w];
+    for y in 0..roi_h {
+        let row_base = (y0 + y) * stride_y + x0 * num_protos;
+        let out_row = &mut mask_buf[y * roi_w..(y + 1) * roi_w];
+        for (x, out_px) in out_row.iter_mut().enumerate() {
+            let base = row_base + x * num_protos;
+            let mut acc = 0.0_f32;
+            let mut k = 0;
+            let chunks = num_protos / 4;
+            for _ in 0..chunks {
+                acc += coeff[k] * protos[base + k].to_f32()
+                    + coeff[k + 1] * protos[base + k + 1].to_f32()
+                    + coeff[k + 2] * protos[base + k + 2].to_f32()
+                    + coeff[k + 3] * protos[base + k + 3].to_f32();
+                k += 4;
+            }
+            while k < num_protos {
+                acc += coeff[k] * protos[base + k].to_f32();
+                k += 1;
+            }
+            if acc > 0.0 {
+                *out_px = 255;
+            }
+        }
+    }
+    ndarray::Array3::from_shape_vec((roi_h, roi_w, 1), mask_buf)
+        .expect("mask_buf length matches roi_h * roi_w")
+}
+
+/// i8 protos (with quant) × f32 coefficients → sign threshold → binary {0, 255}.
+/// Fallback for per-channel quant or mixed-dtype cases where the i8×i8 fast path
+/// doesn't apply.
+#[allow(clippy::too_many_arguments)]
+fn fused_dequant_dot_sign_i8_slice(
     protos: &[i8],
     coeff: &[f32],
     quant: &edgefirst_tensor::Quantization,
@@ -700,10 +995,8 @@ fn fused_dequant_dot_sigmoid_i8_slice(
 ) -> crate::Result<ndarray::Array3<u8>> {
     use edgefirst_tensor::QuantMode;
     let stride_y = proto_w * num_protos;
-    // Precompute scaled coefficients + zp_offset. Stack scratch covers
-    // `num_protos ≤ 64` (every production model today); larger proto counts
-    // fall back to a single heap allocation per kernel call so the kernel
-    // does not silently reject valid-but-larger models.
+
+    // Precompute scaled coefficients + zp_offset (same as the old sigmoid kernel).
     let mut stack_scratch = [0.0_f32; 64];
     let mut heap_scratch: Vec<f32>;
     let scaled_coeff: &mut [f32] = if num_protos <= stack_scratch.len() {
@@ -758,10 +1051,12 @@ fn fused_dequant_dot_sigmoid_i8_slice(
         }
     }
 
-    let mut mask = ndarray::Array3::<u8>::zeros((roi_h, roi_w, 1));
+    let mut mask_buf = vec![0u8; roi_h * roi_w];
     for y in 0..roi_h {
-        for x in 0..roi_w {
-            let base = (y0 + y) * stride_y + (x0 + x) * num_protos;
+        let row_base = (y0 + y) * stride_y + (x0) * num_protos;
+        let out_row = &mut mask_buf[y * roi_w..(y + 1) * roi_w];
+        for (x, out_px) in out_row.iter_mut().enumerate() {
+            let base = row_base + x * num_protos;
             let mut acc = 0.0_f32;
             let mut k = 0;
             let chunks = num_protos / 4;
@@ -780,229 +1075,13 @@ fn fused_dequant_dot_sigmoid_i8_slice(
                 acc += scaled_coeff[k] * protos[base + k] as f32;
                 k += 1;
             }
-            acc -= zp_offset;
-            let sigmoid = fast_sigmoid(acc);
-            mask[[y, x, 0]] = (sigmoid * 255.0 + 0.5) as u8;
+            if acc > zp_offset {
+                *out_px = 255;
+            }
         }
     }
-    Ok(mask)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn fused_dot_sigmoid_f32_slice(
-    protos: &[f32],
-    coeff: &[f32],
-    _proto_h: usize,
-    proto_w: usize,
-    y0: usize,
-    x0: usize,
-    roi_h: usize,
-    roi_w: usize,
-    num_protos: usize,
-) -> ndarray::Array3<u8> {
-    let stride_y = proto_w * num_protos;
-    let mut mask = ndarray::Array3::<u8>::zeros((roi_h, roi_w, 1));
-    for y in 0..roi_h {
-        for x in 0..roi_w {
-            let base = (y0 + y) * stride_y + (x0 + x) * num_protos;
-            let mut acc = 0.0_f32;
-            let mut k = 0;
-            let chunks = num_protos / 4;
-            for _ in 0..chunks {
-                acc += coeff[k] * protos[base + k]
-                    + coeff[k + 1] * protos[base + k + 1]
-                    + coeff[k + 2] * protos[base + k + 2]
-                    + coeff[k + 3] * protos[base + k + 3];
-                k += 4;
-            }
-            while k < num_protos {
-                acc += coeff[k] * protos[base + k];
-                k += 1;
-            }
-            let sigmoid = fast_sigmoid(acc);
-            mask[[y, x, 0]] = (sigmoid * 255.0 + 0.5) as u8;
-        }
-    }
-    mask
-}
-
-/// Native-f16 fused kernel.
-///
-/// Three code paths, selected at compile time:
-///
-/// 1. **x86_64 + F16C + FMA** — explicit intrinsic kernel (`_mm256_cvtph_ps`
-///    8-lane f16→f32 widening, `_mm256_fmadd_ps` FMA). Guaranteed to use
-///    hardware f16 conversion, not LLVM's autovectorizer (which is unreliable
-///    for this pattern per rust-lang/stdarch #1349).
-///
-/// 2. **aarch64 + FP16** — scalar `half::f16::to_f32()` at the FMA site.
-///    LLVM lowers each `.to_f32()` to a single `fcvt` instruction when
-///    `target-feature=+fp16` is active (e.g. `target-cpu=cortex-a78ae`).
-///    The stable f16-typed NEON intrinsics (`vcvt_f32_f16`, `vld1q_f16`)
-///    require nightly as of this commit; the scalar path is equally
-///    efficient at this granularity.
-///
-/// 3. **Fallback (Cortex-A53, targets without FP16)** — same scalar code.
-///    `half::f16::to_f32()` lowers to `__extendhfsf2` soft-float helper,
-///    one call per proto load. Correctness-preserving; ~15 cycles/load
-///    vs. ~3 cycles for the hardware path. Documented in
-///    `docs/orin-build.md`.
-#[allow(clippy::too_many_arguments)]
-fn fused_dot_sigmoid_f16_slice(
-    protos: &[half::f16],
-    coeff: &[f32],
-    proto_h: usize,
-    proto_w: usize,
-    y0: usize,
-    x0: usize,
-    roi_h: usize,
-    roi_w: usize,
-    num_protos: usize,
-) -> ndarray::Array3<u8> {
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "f16c",
-        target_feature = "fma"
-    ))]
-    {
-        // SAFETY: target-feature gates both `vcvtph2ps` and `vfmadd*ps`;
-        // the caller's slice-bounds contract is identical to the scalar arm.
-        unsafe {
-            fused_dot_sigmoid_f16_slice_f16c(
-                protos, coeff, proto_h, proto_w, y0, x0, roi_h, roi_w, num_protos,
-            )
-        }
-    }
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "f16c",
-        target_feature = "fma"
-    )))]
-    {
-        let _ = proto_h;
-        fused_dot_sigmoid_f16_slice_scalar(protos, coeff, proto_w, y0, x0, roi_h, roi_w, num_protos)
-    }
-}
-
-/// Scalar native-f16 kernel. `half::f16::to_f32()` at the FMA site is
-/// lowered to a single `fcvt` (aarch64+fp16) or a single `vcvtps_ps`
-/// (x86_64+f16c) by LLVM, or to the soft-float helper `__extendhfsf2` on
-/// targets without FP16 hardware. Loop unrolled by 4 to give the scheduler
-/// room to overlap loads with FMAs.
-#[allow(clippy::too_many_arguments, dead_code)]
-fn fused_dot_sigmoid_f16_slice_scalar(
-    protos: &[half::f16],
-    coeff: &[f32],
-    proto_w: usize,
-    y0: usize,
-    x0: usize,
-    roi_h: usize,
-    roi_w: usize,
-    num_protos: usize,
-) -> ndarray::Array3<u8> {
-    let stride_y = proto_w * num_protos;
-    let mut mask = ndarray::Array3::<u8>::zeros((roi_h, roi_w, 1));
-    for y in 0..roi_h {
-        for x in 0..roi_w {
-            let base = (y0 + y) * stride_y + (x0 + x) * num_protos;
-            let mut acc = 0.0_f32;
-            let mut k = 0;
-            let chunks = num_protos / 4;
-            for _ in 0..chunks {
-                let p0 = protos[base + k].to_f32();
-                let p1 = protos[base + k + 1].to_f32();
-                let p2 = protos[base + k + 2].to_f32();
-                let p3 = protos[base + k + 3].to_f32();
-                acc += coeff[k] * p0 + coeff[k + 1] * p1 + coeff[k + 2] * p2 + coeff[k + 3] * p3;
-                k += 4;
-            }
-            while k < num_protos {
-                acc += coeff[k] * protos[base + k].to_f32();
-                k += 1;
-            }
-            let sigmoid = fast_sigmoid(acc);
-            mask[[y, x, 0]] = (sigmoid * 255.0 + 0.5) as u8;
-        }
-    }
-    mask
-}
-
-/// x86_64 F16C + FMA explicit intrinsic kernel. Processes 8 f16 lanes per
-/// inner iteration via `_mm256_cvtph_ps` (8-lane f16→f32 widen) followed by
-/// `_mm256_fmadd_ps` (8-lane fused multiply-add). Horizontal reduce at the
-/// end of each pixel.
-///
-/// # Safety
-///
-/// Caller must ensure the target CPU supports F16C + FMA. The workspace's
-/// `.cargo/config.toml` sets these target-features on `x86_64-unknown-linux-gnu`
-/// and `x86_64-apple-darwin`, making this function statically callable on
-/// those targets.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "f16c",
-    target_feature = "fma"
-))]
-#[allow(clippy::too_many_arguments)]
-#[target_feature(enable = "f16c,fma,avx")]
-unsafe fn fused_dot_sigmoid_f16_slice_f16c(
-    protos: &[half::f16],
-    coeff: &[f32],
-    _proto_h: usize,
-    proto_w: usize,
-    y0: usize,
-    x0: usize,
-    roi_h: usize,
-    roi_w: usize,
-    num_protos: usize,
-) -> ndarray::Array3<u8> {
-    use core::arch::x86_64::{
-        _mm256_castps256_ps128, _mm256_cvtph_ps, _mm256_extractf128_ps, _mm256_fmadd_ps,
-        _mm256_loadu_ps, _mm256_setzero_ps, _mm_add_ps, _mm_cvtss_f32, _mm_hadd_ps,
-        _mm_loadu_si128,
-    };
-
-    let stride_y = proto_w * num_protos;
-    let chunks8 = num_protos / 8;
-    let tail = num_protos % 8;
-    let mut mask = ndarray::Array3::<u8>::zeros((roi_h, roi_w, 1));
-
-    for y in 0..roi_h {
-        for x in 0..roi_w {
-            let base = (y0 + y) * stride_y + (x0 + x) * num_protos;
-            let mut acc_v = _mm256_setzero_ps();
-            let mut k = 0;
-            for _ in 0..chunks8 {
-                // Load 8 f16 (128 bits / 16 bytes) via a byte-level cast.
-                let p_ptr = protos
-                    .as_ptr()
-                    .add(base + k)
-                    .cast::<core::arch::x86_64::__m128i>();
-                let raw = _mm_loadu_si128(p_ptr);
-                let widened = _mm256_cvtph_ps(raw);
-                let coeffs_v = _mm256_loadu_ps(coeff.as_ptr().add(k));
-                acc_v = _mm256_fmadd_ps(coeffs_v, widened, acc_v);
-                k += 8;
-            }
-            // Horizontal reduce 8 → 1.
-            let lo = _mm256_castps256_ps128(acc_v);
-            let hi = _mm256_extractf128_ps::<1>(acc_v);
-            let sum4 = _mm_add_ps(lo, hi);
-            let sum2 = _mm_hadd_ps(sum4, sum4);
-            let sum1 = _mm_hadd_ps(sum2, sum2);
-            let mut acc = _mm_cvtss_f32(sum1);
-
-            // Scalar tail for num_protos % 8 (≤ 7 items).
-            while k < num_protos && k - chunks8 * 8 < tail {
-                acc += coeff[k] * protos[base + k].to_f32();
-                k += 1;
-            }
-
-            let sigmoid = fast_sigmoid(acc);
-            mask[[y, x, 0]] = (sigmoid * 255.0 + 0.5) as u8;
-        }
-    }
-    mask
+    Ok(ndarray::Array3::from_shape_vec((roi_h, roi_w, 1), mask_buf)
+        .expect("mask_buf length matches roi_h * roi_w"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1661,8 +1740,8 @@ fn scaled_run<P: Copy + Sync>(
             // Step 3 — bilinear upsample logits → binary mask.
             //
             // O1: sigmoid(x) > 0.5 ⟺ x > 0 (sigmoid is strictly monotonic,
-            // and acc_scale > 0 preserves sign). Eliminates ~15 cycles/pixel
-            // from the fast_sigmoid approximation.
+            // and acc_scale > 0 preserves sign). The sign threshold replaces
+            // the old fast_sigmoid approximation, saving ~15 cycles/pixel.
             //
             // O5: Pre-compute bilinear sample coordinates. sample_x_at /
             // sample_y_at depend only on pixel index, not on logit values.
@@ -1715,22 +1794,4 @@ fn scaled_run<P: Copy + Sync>(
             })
         })
         .collect()
-}
-
-fn fast_sigmoid(x: f32) -> f32 {
-    if x >= 16.0 {
-        return 1.0;
-    }
-    if x <= -16.0 {
-        return 0.0;
-    }
-    // Fast exp(-x) via bit manipulation (Schraudolph's algorithm).
-    // f32 bits: 2^23 * log2(e) * x + (127 << 23) approximates exp(x).
-    const A: f32 = (1u32 << 23) as f32; // 8388608.0
-    const B: f32 = A * std::f32::consts::LOG2_E; // A / ln(2)
-    const C: u32 = 127 << 23; // exponent bias
-    let neg_x = -x;
-    let bits = (B * neg_x) as i32 + C as i32;
-    let exp_neg_x = f32::from_bits(bits as u32);
-    1.0 / (1.0 + exp_neg_x)
 }
