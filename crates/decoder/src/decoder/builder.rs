@@ -60,7 +60,7 @@ impl Default for DecoderBuilder {
             iou_threshold: 0.5,
             score_threshold: 0.5,
             nms: Some(configs::Nms::ClassAgnostic),
-            pre_nms_top_k: 3000,
+            pre_nms_top_k: 300,
             max_det: 300,
         }
     }
@@ -771,7 +771,7 @@ impl DecoderBuilder {
     /// dramatically reducing the O(N²) NMS cost when many low-confidence
     /// proposals pass the threshold (common with mAP eval at 0.001).
     ///
-    /// Default: 3000.
+    /// Default: 300 (matches Ultralytics `max_det`).
     ///
     /// # Examples
     /// ```rust

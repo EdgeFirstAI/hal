@@ -587,7 +587,7 @@ class Decoder:
     def pre_nms_top_k(self) -> int:
         """
         Maximum candidates fed into NMS after score filtering.
-        Uses O(N) partial sort to cap O(N²) NMS cost. Default: 3000.
+        Uses O(N) partial sort to cap O(N²) NMS cost. Default: 300.
         """
         ...
 
