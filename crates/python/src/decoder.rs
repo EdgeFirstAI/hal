@@ -783,7 +783,7 @@ impl PyDecoder {
     }
 
     /// Maximum number of candidates fed into NMS after score filtering.
-    /// Uses O(N) partial sort to reduce O(N²) NMS cost. Default: 3000.
+    /// Uses O(N) partial sort to reduce O(N²) NMS cost. Default: 300.
     #[getter(pre_nms_top_k)]
     fn get_pre_nms_top_k(&self) -> usize {
         self.decoder.pre_nms_top_k

@@ -644,6 +644,25 @@ fn bench_nms_decode(suite: &mut BenchSuite) {
     result.print_summary();
     suite.record(&result);
 
+    // Pre-NMS top-K=300 (default — matches Ultralytics max_det=300)
+    let name = "nms_decode/topk_300";
+    let result = run_bench(name, WARMUP, ITERATIONS, || {
+        let mut output_boxes = Vec::with_capacity(300);
+        let proto_data = impl_yolo_segdet_quant_proto::<XYWH, _, _>(
+            (boxes.view(), QUANT_BOXES),
+            (protos.view(), QUANT_PROTOS),
+            SCORE_THRESHOLD,
+            IOU_THRESHOLD,
+            Some(Nms::ClassAgnostic),
+            300,
+            300,
+            &mut output_boxes,
+        );
+        std::hint::black_box((&output_boxes, &proto_data));
+    });
+    result.print_summary();
+    suite.record(&result);
+
     // Isolate: just score filtering + box decode (no NMS)
     let name = "nms_decode/score_filter_only";
     let result = run_bench(name, WARMUP, ITERATIONS, || {
