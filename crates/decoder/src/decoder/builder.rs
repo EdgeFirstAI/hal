@@ -18,6 +18,8 @@ pub struct DecoderBuilder {
     /// NMS mode: Some(mode) applies NMS, None bypasses NMS (for end-to-end
     /// models)
     nms: Option<configs::Nms>,
+    pre_nms_top_k: usize,
+    max_det: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -58,6 +60,8 @@ impl Default for DecoderBuilder {
             iou_threshold: 0.5,
             score_threshold: 0.5,
             nms: Some(configs::Nms::ClassAgnostic),
+            pre_nms_top_k: 3000,
+            max_det: 300,
         }
     }
 }
@@ -762,6 +766,54 @@ impl DecoderBuilder {
         self
     }
 
+    /// Sets the maximum number of candidate boxes fed into NMS after score
+    /// filtering.  Uses partial sort (O(N)) to select the top-K candidates,
+    /// dramatically reducing the O(N²) NMS cost when many low-confidence
+    /// proposals pass the threshold (common with mAP eval at 0.001).
+    ///
+    /// Default: 3000.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
+    /// # fn main() -> DecoderResult<()> {
+    /// # let config_json = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split.json")).to_string();
+    /// let decoder = DecoderBuilder::new()
+    ///     .with_config_json_str(config_json)
+    ///     .with_pre_nms_top_k(1000)
+    ///     .build()?;
+    /// assert_eq!(decoder.pre_nms_top_k, 1000);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_pre_nms_top_k(mut self, pre_nms_top_k: usize) -> Self {
+        self.pre_nms_top_k = pre_nms_top_k;
+        self
+    }
+
+    /// Sets the maximum number of detections returned after NMS.
+    /// Matches the Ultralytics `max_det` parameter.
+    ///
+    /// Default: 300.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
+    /// # fn main() -> DecoderResult<()> {
+    /// # let config_json = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split.json")).to_string();
+    /// let decoder = DecoderBuilder::new()
+    ///     .with_config_json_str(config_json)
+    ///     .with_max_det(100)
+    ///     .build()?;
+    /// assert_eq!(decoder.max_det, 100);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_max_det(mut self, max_det: usize) -> Self {
+        self.max_det = max_det;
+        self
+    }
+
     /// Builds the decoder with the given settings. If the config is a JSON or
     /// YAML string, this will deserialize the JSON or YAML and then parse the
     /// configuration information.
@@ -809,6 +861,8 @@ impl DecoderBuilder {
             iou_threshold: self.iou_threshold,
             score_threshold: self.score_threshold,
             nms,
+            pre_nms_top_k: self.pre_nms_top_k,
+            max_det: self.max_det,
             normalized,
             decode_program,
         })

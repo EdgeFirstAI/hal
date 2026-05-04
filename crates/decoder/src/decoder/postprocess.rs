@@ -363,7 +363,8 @@ impl Decoder {
                     self.score_threshold,
                     self.iou_threshold,
                     self.nms,
-                    output_boxes.capacity(),
+                    self.pre_nms_top_k,
+                    self.max_det,
                 )
             })
         });
@@ -438,7 +439,8 @@ impl Decoder {
                 self.score_threshold,
                 self.iou_threshold,
                 self.nms,
-                output_boxes.capacity(),
+                self.pre_nms_top_k,
+                self.max_det,
             )
         });
 
@@ -1135,6 +1137,8 @@ impl Decoder {
                     self.score_threshold,
                     self.iou_threshold,
                     self.nms,
+                    self.pre_nms_top_k,
+                    self.max_det,
                     output_boxes,
                 )
             })
@@ -1167,6 +1171,8 @@ impl Decoder {
             self.score_threshold,
             self.iou_threshold,
             self.nms,
+            self.pre_nms_top_k,
+            self.max_det,
             output_boxes,
         ))
     }
@@ -1232,7 +1238,8 @@ impl Decoder {
                     self.score_threshold,
                     self.iou_threshold,
                     self.nms,
-                    output_boxes.capacity(),
+                    self.pre_nms_top_k,
+                    self.max_det,
                 )
             })
         });
@@ -1308,6 +1315,8 @@ impl Decoder {
             self.score_threshold,
             self.iou_threshold,
             self.nms,
+            self.pre_nms_top_k,
+            self.max_det,
             output_boxes,
         ))
     }
@@ -1360,7 +1369,8 @@ impl Decoder {
                 self.score_threshold,
                 self.iou_threshold,
                 self.nms,
-                output_boxes.capacity(),
+                self.pre_nms_top_k,
+                self.max_det,
             )
         });
 
@@ -1434,6 +1444,8 @@ impl Decoder {
             self.score_threshold,
             self.iou_threshold,
             self.nms,
+            self.pre_nms_top_k,
+            self.max_det,
             output_boxes,
         ))
     }
@@ -1688,7 +1700,8 @@ macro_rules! process_tracked_yolo_segmentation {
                     $self.score_threshold,
                     $self.iou_threshold,
                     $self.nms,
-                    $output_boxes.capacity(),
+                    $self.pre_nms_top_k,
+                    $self.max_det,
                 );
 
                 // Update tracker logic
@@ -1786,7 +1799,8 @@ macro_rules! process_tracked_yolo_segmentation_split {
                     $self.score_threshold,
                     $self.iou_threshold,
                     $self.nms,
-                    $output_boxes.capacity(),
+                    $self.pre_nms_top_k,
+                    $self.max_det,
                 )
             })
         });
@@ -1879,7 +1893,8 @@ macro_rules! process_tracked_yolo_segmentation_2way {
                 $self.score_threshold,
                 $self.iou_threshold,
                 $self.nms,
-                $output_boxes.capacity(),
+                $self.pre_nms_top_k,
+                $self.max_det,
             )
         });
 
@@ -2041,7 +2056,8 @@ impl Decoder {
             self.score_threshold,
             self.iou_threshold,
             self.nms,
-            output_boxes.capacity(),
+            self.pre_nms_top_k,
+            self.max_det,
         );
 
         let (new_boxes, old_boxes) =
@@ -2150,7 +2166,8 @@ impl Decoder {
             self.score_threshold,
             self.iou_threshold,
             self.nms,
-            output_boxes.capacity(),
+            self.pre_nms_top_k,
+            self.max_det,
         );
 
         let (new_boxes, old_boxes) =
@@ -2263,7 +2280,7 @@ impl Decoder {
             scores,
             classes,
             self.score_threshold,
-            output_boxes.capacity(),
+            self.max_det,
         );
 
         let (new_boxes, old_boxes) =
@@ -2377,7 +2394,7 @@ impl Decoder {
             scores,
             classes,
             self.score_threshold,
-            output_boxes.capacity(),
+            self.max_det,
         );
 
         let (new_boxes, old_boxes) =
@@ -2512,7 +2529,7 @@ impl Decoder {
             scores,
             classes,
             self.score_threshold,
-            output_boxes.capacity(),
+            self.max_det,
         );
 
         let (new_boxes, old_boxes) =
@@ -2661,7 +2678,7 @@ impl Decoder {
             scores,
             classes,
             self.score_threshold,
-            output_boxes.capacity(),
+            self.max_det,
         );
 
         let (new_boxes, old_boxes) =
@@ -2966,7 +2983,8 @@ impl Decoder {
             self.score_threshold,
             self.iou_threshold,
             self.nms,
-            output_boxes.capacity(),
+            self.pre_nms_top_k,
+            self.max_det,
         );
 
         // Tracker integrates after NMS, before mask materialization
@@ -3084,7 +3102,8 @@ impl Decoder {
             self.score_threshold,
             self.iou_threshold,
             self.nms,
-            output_boxes.capacity(),
+            self.pre_nms_top_k,
+            self.max_det,
         );
 
         // Tracker integrates before mask extraction

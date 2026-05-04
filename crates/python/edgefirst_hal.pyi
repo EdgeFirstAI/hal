@@ -584,6 +584,25 @@ class Decoder:
         ...
 
     @property
+    def pre_nms_top_k(self) -> int:
+        """
+        Maximum candidates fed into NMS after score filtering.
+        Uses O(N) partial sort to cap O(N²) NMS cost. Default: 3000.
+        """
+        ...
+
+    @pre_nms_top_k.setter
+    def pre_nms_top_k(self, value: int): ...
+    @property
+    def max_det(self) -> int:
+        """
+        Maximum detections returned after NMS. Default: 300.
+        """
+        ...
+
+    @max_det.setter
+    def max_det(self, value: int): ...
+    @property
     def normalized_boxes(self) -> Optional[bool]:
         """
         Whether decoded bounding boxes are normalized to [0, 1] range.

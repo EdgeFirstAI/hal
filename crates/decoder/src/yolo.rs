@@ -8,7 +8,6 @@ use ndarray::{
     s, Array2, Array3, ArrayView1, ArrayView2, ArrayView3,
 };
 use num_traits::{AsPrimitive, Float, PrimInt, Signed};
-use rayon::slice::ParallelSliceMut;
 
 use crate::{
     byte::{
@@ -39,28 +38,28 @@ use crate::{
 /// score thresholds where the cap activates the bottom of the
 /// candidate list is dominated by noise that NMS would discard
 /// anyway.
-pub(crate) const MAX_NMS_CANDIDATES: usize = 30_000;
+pub const MAX_NMS_CANDIDATES: usize = 30_000;
 
-/// Truncate `boxes` to the highest-scoring `MAX_NMS_CANDIDATES`
-/// entries in-place when the input exceeds the cap. No-op
-/// otherwise. The sort is unstable and parallel — order among
-/// equal-score boxes is not guaranteed.
-fn truncate_to_top_k_by_score<E: Send>(boxes: &mut Vec<(DetectBox, E)>) {
-    if boxes.len() > MAX_NMS_CANDIDATES {
-        boxes.par_sort_unstable_by(|a, b| b.0.score.total_cmp(&a.0.score));
-        boxes.truncate(MAX_NMS_CANDIDATES);
+/// Truncate `boxes` to the highest-scoring `top_k` entries in-place when the
+/// input exceeds the cap. Uses partial sort (O(N)) via `select_nth_unstable_by`
+/// to avoid full O(N log N) sort. No-op when input length ≤ `top_k`.
+fn truncate_to_top_k_by_score<E: Send>(boxes: &mut Vec<(DetectBox, E)>, top_k: usize) {
+    if boxes.len() > top_k {
+        boxes.select_nth_unstable_by(top_k, |a, b| b.0.score.total_cmp(&a.0.score));
+        boxes.truncate(top_k);
     }
 }
 
 /// Quantized counterpart of [`truncate_to_top_k_by_score`]. Sorts on
 /// the raw quantized score (which preserves order under monotonic
-/// dequantization).
+/// dequantization). Uses partial sort (O(N)) via `select_nth_unstable_by`.
 fn truncate_to_top_k_by_score_quant<S: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send>(
     boxes: &mut Vec<(DetectBoxQuantized<S>, E)>,
+    top_k: usize,
 ) {
-    if boxes.len() > MAX_NMS_CANDIDATES {
-        boxes.par_sort_unstable_by(|a, b| b.0.score.cmp(&a.0.score));
-        boxes.truncate(MAX_NMS_CANDIDATES);
+    if boxes.len() > top_k {
+        boxes.select_nth_unstable_by(top_k, |a, b| b.0.score.cmp(&a.0.score));
+        boxes.truncate(top_k);
     }
 }
 
@@ -899,6 +898,7 @@ where
         score_threshold,
         iou_threshold,
         nms,
+        MAX_NMS_CANDIDATES,
         output_boxes.capacity(),
     );
 
@@ -944,6 +944,7 @@ where
         score_threshold,
         iou_threshold,
         nms,
+        MAX_NMS_CANDIDATES,
         output_boxes.capacity(),
     );
     impl_yolo_split_segdet_process_masks(boxes, mask_tensor, protos, output_boxes, output_masks)
@@ -959,7 +960,8 @@ pub(crate) fn impl_yolo_segdet_get_boxes<
     score_threshold: f32,
     iou_threshold: f32,
     nms: Option<Nms>,
-    max_boxes: usize,
+    pre_nms_top_k: usize,
+    max_det: usize,
 ) -> Vec<(DetectBox, usize)>
 where
     f32: AsPrimitive<SCORE>,
@@ -969,9 +971,9 @@ where
         boxes_tensor,
         scores_tensor,
     );
-    truncate_to_top_k_by_score(&mut boxes);
+    truncate_to_top_k_by_score(&mut boxes, pre_nms_top_k);
     let mut boxes = dispatch_nms_extra_float(nms, iou_threshold, boxes);
-    boxes.truncate(max_boxes);
+    boxes.truncate(max_det);
     boxes
 }
 
@@ -1036,7 +1038,8 @@ pub(crate) fn impl_yolo_split_segdet_quant_get_boxes<
     score_threshold: f32,
     iou_threshold: f32,
     nms: Option<Nms>,
-    max_boxes: usize,
+    pre_nms_top_k: usize,
+    max_det: usize,
 ) -> Vec<(DetectBox, usize)>
 where
     f32: AsPrimitive<SCORE>,
@@ -1053,9 +1056,9 @@ where
             quant_boxes,
         )
     };
-    truncate_to_top_k_by_score_quant(&mut boxes);
+    truncate_to_top_k_by_score_quant(&mut boxes, pre_nms_top_k);
     let mut boxes = dispatch_nms_extra_int(nms, iou_threshold, boxes);
-    boxes.truncate(max_boxes);
+    boxes.truncate(max_det);
     boxes
         .into_iter()
         .map(|(b, i)| (dequant_detect_box(&b, quant_scores), i))
@@ -1135,6 +1138,7 @@ where
         score_threshold,
         iou_threshold,
         nms,
+        MAX_NMS_CANDIDATES,
         output_boxes.capacity(),
     );
 
@@ -1188,6 +1192,7 @@ where
         score_threshold,
         iou_threshold,
         nms,
+        MAX_NMS_CANDIDATES,
         output_boxes.capacity(),
     );
     impl_yolo_split_segdet_process_masks(boxes, mask_tensor, protos, output_boxes, output_masks)
@@ -1199,6 +1204,7 @@ where
 
 /// Proto-extraction variant of `impl_yolo_segdet_quant`.
 /// Runs NMS but returns raw `ProtoData` instead of materialized masks.
+#[allow(clippy::too_many_arguments)]
 pub fn impl_yolo_segdet_quant_proto<
     B: BBoxTypeTrait,
     BOX: PrimInt
@@ -1221,6 +1227,8 @@ pub fn impl_yolo_segdet_quant_proto<
     score_threshold: f32,
     iou_threshold: f32,
     nms: Option<Nms>,
+    pre_nms_top_k: usize,
+    max_det: usize,
     output_boxes: &mut Vec<DetectBox>,
 ) -> ProtoData
 where
@@ -1238,7 +1246,8 @@ where
         score_threshold,
         iou_threshold,
         nms,
-        output_boxes.capacity(),
+        pre_nms_top_k,
+        max_det,
     );
 
     extract_proto_data_quant(
@@ -1253,6 +1262,7 @@ where
 
 /// Proto-extraction variant of `impl_yolo_segdet_float`.
 /// Runs NMS but returns raw `ProtoData` instead of materialized masks.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn impl_yolo_segdet_float_proto<
     B: BBoxTypeTrait,
     BOX: Float + AsPrimitive<f32> + Copy + Send + Sync + FloatProtoElem,
@@ -1263,6 +1273,8 @@ pub(crate) fn impl_yolo_segdet_float_proto<
     score_threshold: f32,
     iou_threshold: f32,
     nms: Option<Nms>,
+    pre_nms_top_k: usize,
+    max_det: usize,
     output_boxes: &mut Vec<DetectBox>,
 ) -> ProtoData
 where
@@ -1277,7 +1289,8 @@ where
         score_threshold,
         iou_threshold,
         nms,
-        output_boxes.capacity(),
+        pre_nms_top_k,
+        max_det,
     );
 
     extract_proto_data_float(boxes, mask_tensor, protos, output_boxes)
@@ -1300,6 +1313,8 @@ pub(crate) fn impl_yolo_split_segdet_float_proto<
     score_threshold: f32,
     iou_threshold: f32,
     nms: Option<Nms>,
+    pre_nms_top_k: usize,
+    max_det: usize,
     output_boxes: &mut Vec<DetectBox>,
 ) -> ProtoData
 where
@@ -1313,7 +1328,8 @@ where
         score_threshold,
         iou_threshold,
         nms,
-        output_boxes.capacity(),
+        pre_nms_top_k,
+        max_det,
     );
 
     extract_proto_data_float(det_indices, mask_tensor, protos, output_boxes)
@@ -2427,6 +2443,8 @@ mod tests {
             0.5,
             0.7,
             Some(Nms::default()),
+            MAX_NMS_CANDIDATES,
+            300,
             &mut output_boxes,
         );
 
@@ -2476,8 +2494,9 @@ mod tests {
             scores.view(),
             0.1,
             1.0,
-            None,       // bypass NMS so we measure the cap, not suppression
-            usize::MAX, // no post-NMS truncation
+            None,                            // bypass NMS so we measure the cap, not suppression
+            crate::yolo::MAX_NMS_CANDIDATES, // pre_nms_top_k
+            usize::MAX,                      // no post-NMS truncation
         );
 
         assert_eq!(
@@ -2533,7 +2552,8 @@ mod tests {
             0.1,
             1.0,
             None,
-            usize::MAX,
+            crate::yolo::MAX_NMS_CANDIDATES, // pre_nms_top_k
+            usize::MAX,                      // no post-NMS truncation
         );
 
         assert_eq!(

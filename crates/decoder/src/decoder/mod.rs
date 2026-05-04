@@ -19,6 +19,15 @@ pub struct Decoder {
     /// NMS mode: Some(mode) applies NMS, None bypasses NMS (for end-to-end
     /// models)
     pub nms: Option<configs::Nms>,
+    /// Maximum number of candidate boxes fed into NMS after score filtering.
+    /// Reduces O(N²) NMS cost when many low-confidence proposals pass the
+    /// threshold (common during COCO mAP evaluation with threshold ≈ 0.001).
+    /// Candidates are ranked by score; only the top `pre_nms_top_k` proceed
+    /// to NMS.  Default: 3000.
+    pub pre_nms_top_k: usize,
+    /// Maximum number of detections returned after NMS. Matches the
+    /// Ultralytics `max_det` parameter.  Default: 300.
+    pub max_det: usize,
     /// Whether decoded boxes are in normalized [0,1] coordinates.
     /// - `Some(true)`: Coordinates in [0,1] range
     /// - `Some(false)`: Pixel coordinates
@@ -40,6 +49,8 @@ impl PartialEq for Decoder {
             && self.iou_threshold == other.iou_threshold
             && self.score_threshold == other.score_threshold
             && self.nms == other.nms
+            && self.pre_nms_top_k == other.pre_nms_top_k
+            && self.max_det == other.max_det
             && self.normalized == other.normalized
             && self.decode_program.is_some() == other.decode_program.is_some()
     }

@@ -1,15 +1,44 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(target_arch = "aarch64")]
+use crate::arg_max_i8;
 use crate::{
     arg_max, float::jaccard, BBoxTypeTrait, BoundingBox, DetectBoxQuantized, Quantization,
 };
 use ndarray::{
     parallel::prelude::{IntoParallelIterator, ParallelIterator as _},
-    Array1, ArrayView2, Zip,
+    Array1, ArrayView1, ArrayView2, Zip,
 };
 use num_traits::{AsPrimitive, PrimInt};
 use rayon::slice::ParallelSliceMut;
+
+/// Fast argmax dispatching to NEON-optimized path for i8 on aarch64.
+#[inline(always)]
+fn fast_arg_max<T: PrimInt + Copy>(score: ArrayView1<T>) -> (T, usize) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Check if this is an i8 slice and contiguous.
+        if std::mem::size_of::<T>() == 1 && score.as_slice().is_some() {
+            let slice = score.as_slice().unwrap();
+            // Safety: T is i8 when size_of::<T>() == 1 and PrimInt.
+            // PrimInt covers i8, u8, i16, etc. We only want to use the
+            // i8 NEON path for signed i8.
+            let ptr = slice.as_ptr() as *const i8;
+            let i8_slice = unsafe { std::slice::from_raw_parts(ptr, slice.len()) };
+            // Only valid for signed i8 (not u8). Check sign bit behavior:
+            // PrimInt for i8 means min_value() is negative.
+            if T::min_value() < T::zero() {
+                let (max_val, idx) = arg_max_i8(i8_slice);
+                // Safety: transmute i8 back to T (they have the same size and
+                // representation for i8).
+                let result: T = unsafe { std::mem::transmute_copy(&max_val) };
+                return (result, idx);
+            }
+        }
+    }
+    arg_max(score)
+}
 
 /// Post processes boxes and scores tensors into quantized detection boxes,
 /// filtering out any boxes below the score threshold. The boxes tensor
@@ -32,7 +61,7 @@ pub fn postprocess_boxes_quant<
         .and(boxes.rows())
         .into_par_iter()
         .filter_map(|(score, bbox)| {
-            let (score_, label) = arg_max(score);
+            let (score_, label) = fast_arg_max(score);
             if score_ < threshold {
                 return None;
             }
@@ -73,7 +102,7 @@ pub fn postprocess_boxes_index_quant<
         .and(&indices)
         .into_par_iter()
         .filter_map(|(score, bbox, index)| {
-            let (score_, label) = arg_max(score);
+            let (score_, label) = fast_arg_max(score);
             if score_ < threshold {
                 return None;
             }
