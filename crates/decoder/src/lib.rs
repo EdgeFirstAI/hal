@@ -691,6 +691,61 @@ fn arg_max<T: PartialOrd + Copy>(score: ArrayView1<T>) -> (T, usize) {
             }
         })
 }
+
+/// NEON-accelerated argmax for i8 slices on aarch64.
+///
+/// Finds the maximum value and its index (last index wins on ties, matching
+/// the semantics of [`arg_max`]).  Falls back to the scalar implementation
+/// on non-aarch64 targets or when the slice is too short to benefit from NEON.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn arg_max_i8(scores: &[i8]) -> (i8, usize) {
+    use std::arch::aarch64::*;
+
+    let n = scores.len();
+    if n < 16 {
+        // Scalar fallback for very short slices.
+        let mut max = scores[0];
+        let mut idx = 0;
+        for (i, &s) in scores.iter().enumerate().skip(1) {
+            if s >= max {
+                max = s;
+                idx = i;
+            }
+        }
+        return (max, idx);
+    }
+
+    unsafe {
+        // Phase 1: Find the global max value using NEON horizontal max.
+        let chunks = n / 16;
+        let mut vmax = vld1q_s8(scores.as_ptr());
+        for i in 1..chunks {
+            let v = vld1q_s8(scores.as_ptr().add(i * 16));
+            vmax = vmaxq_s8(vmax, v);
+        }
+        let global_max = vmaxvq_s8(vmax);
+
+        // Handle remainder with scalar
+        let remainder_start = chunks * 16;
+        let mut final_max = global_max;
+        for &s in &scores[remainder_start..] {
+            if s > final_max {
+                final_max = s;
+            }
+        }
+
+        // Phase 2: Find the LAST index of `final_max` (preserves tie semantics).
+        // Scan backwards for the last occurrence.
+        let mut idx = 0;
+        for i in (0..n).rev() {
+            if scores[i] == final_max {
+                idx = i;
+                break;
+            }
+        }
+        (final_max, idx)
+    }
+}
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod decoder_tests {

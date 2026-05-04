@@ -782,6 +782,32 @@ impl PyDecoder {
         self.decoder.nms.map(|nms| nms.into())
     }
 
+    /// Maximum number of candidates fed into NMS after score filtering.
+    /// Uses O(N) partial sort to reduce O(N²) NMS cost. Default: 3000.
+    #[getter(pre_nms_top_k)]
+    fn get_pre_nms_top_k(&self) -> usize {
+        self.decoder.pre_nms_top_k
+    }
+
+    #[setter(pre_nms_top_k)]
+    fn set_pre_nms_top_k(&mut self, value: usize) -> PyResult<()> {
+        self.decoder.pre_nms_top_k = value;
+        Ok(())
+    }
+
+    /// Maximum number of detections returned after NMS.
+    /// Matches the Ultralytics max_det parameter. Default: 300.
+    #[getter(max_det)]
+    fn get_max_det(&self) -> usize {
+        self.decoder.max_det
+    }
+
+    #[setter(max_det)]
+    fn set_max_det(&mut self, value: usize) -> PyResult<()> {
+        self.decoder.max_det = value;
+        Ok(())
+    }
+
     /// Returns the box coordinate format if known from the model config.
     ///
     /// - `True`: Boxes are in normalized [0,1] coordinates
