@@ -814,7 +814,7 @@ impl Decoder {
         }
 
         let mapped = tensor_bridge::map_tensors(outputs)?;
-        match &mapped {
+        let result = match &mapped {
             tensor_bridge::MappedOutputs::Quantized(maps) => {
                 let views = tensor_bridge::quantized_views(maps)?;
                 self.decode_quantized_proto(&views, output_boxes)
@@ -831,7 +831,8 @@ impl Decoder {
                 let views = tensor_bridge::f64_views(maps)?;
                 self.decode_float_proto(&views, output_boxes)
             }
-        }
+        };
+        result
     }
 }
 
