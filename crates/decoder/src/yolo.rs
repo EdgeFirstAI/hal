@@ -1047,6 +1047,7 @@ where
     let (boxes_tensor, quant_boxes) = boxes;
     let (scores_tensor, quant_scores) = scores;
 
+    let t_start = std::time::Instant::now();
     let mut boxes = {
         let score_threshold = quantize_score_threshold(score_threshold, quant_scores);
         postprocess_boxes_index_quant::<B, _, _>(
@@ -1059,10 +1060,17 @@ where
     truncate_to_top_k_by_score_quant(&mut boxes, pre_nms_top_k);
     let mut boxes = dispatch_nms_extra_int(nms, iou_threshold, boxes);
     boxes.truncate(max_det);
-    boxes
+    let result: Vec<_> = boxes
         .into_iter()
         .map(|(b, i)| (dequant_detect_box(&b, quant_scores), i))
-        .collect()
+        .collect();
+    let t_end = std::time::Instant::now();
+    log::trace!(
+        "get_boxes: {:.2}ms ({} detections)",
+        t_end.duration_since(t_start).as_secs_f64() * 1000.0,
+        result.len(),
+    );
+    result
 }
 
 pub(crate) fn impl_yolo_split_segdet_quant_process_masks<
@@ -1504,10 +1512,40 @@ pub(crate) fn extract_proto_data_quant<
         if std::any::TypeId::of::<PROTO>() == std::any::TypeId::of::<i8>() {
             // SAFETY: PROTO == i8 checked via TypeId; cast slice view is
             // size/alignment-compatible by construction.
-            let src: &[i8] =
-                unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
             if protos.is_standard_layout() {
+                let src: &[i8] = unsafe {
+                    std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len())
+                };
                 dst.copy_from_slice(src);
+            } else if protos.ndim() == 3 && protos.strides()[2] > 1 {
+                // Transposed DMA-BUF view (NCHW reinterpreted as NHWC via stride
+                // swap). The backing store is physically [k, h, w] contiguous.
+                // Strategy: first bulk-copy the entire DMA-BUF sequentially into
+                // heap, then transpose NCHW→NHWC entirely in cacheable memory.
+                // This avoids the L2 thrashing that plane-by-plane scattered writes
+                // cause (output buffer = 819KB >> L2 = 256KB on A55).
+                let total = h * w * k;
+                let hw = h * w;
+                // SAFETY: The ArrayView was constructed from a contiguous slice of
+                // `total` elements. as_ptr() points to the base of that slice.
+                let src: &[i8] =
+                    unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, total) };
+                // Sequential DMA-BUF read → heap copy (~0.4ms for 819KB).
+                let heap_copy = src.to_vec();
+
+                // Tiled NCHW→NHWC transpose in heap memory.
+                // Process TILE pixels at a time so the write-target fits in L1.
+                const TILE: usize = 256;
+                for pixel_start in (0..hw).step_by(TILE) {
+                    let pixel_end = (pixel_start + TILE).min(hw);
+                    let dst_tile = &mut dst[pixel_start * k..pixel_end * k];
+                    for c in 0..k {
+                        let plane_chunk = &heap_copy[c * hw + pixel_start..c * hw + pixel_end];
+                        for (i, &val) in plane_chunk.iter().enumerate() {
+                            dst_tile[i * k + c] = val;
+                        }
+                    }
+                }
             } else {
                 for (d, s) in dst.iter_mut().zip(protos.iter()) {
                     let v_i8: i8 = s.as_();
