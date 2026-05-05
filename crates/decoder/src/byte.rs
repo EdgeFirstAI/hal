@@ -176,10 +176,25 @@ fn postprocess_boxes_quant_column_major<
 ) -> Vec<DetectBoxQuantized<Scores>> {
     let (n_candidates, n_classes) = scores.dim();
 
-    assert!(
-        n_classes <= 255,
-        "column-major argmax requires <= 255 classes"
-    );
+    // Column-major NEON path uses u8 class indices; fall back for >255 classes.
+    if n_classes > 255 {
+        return Zip::from(scores.rows())
+            .and(boxes.rows())
+            .into_par_iter()
+            .filter_map(|(score, bbox)| {
+                let (score_, label) = fast_arg_max(score);
+                if score_ < threshold {
+                    return None;
+                }
+                let bbox_quant = B::ndarray_to_xyxy_dequant(bbox.view(), quant_boxes);
+                Some(DetectBoxQuantized {
+                    label,
+                    score: score_,
+                    bbox: BoundingBox::from(bbox_quant),
+                })
+            })
+            .collect();
+    }
     let mut max_scores = vec![Scores::min_value(); n_candidates];
     let mut max_classes = vec![0u8; n_candidates];
 
@@ -350,10 +365,30 @@ fn postprocess_boxes_index_quant_column_major<
 
     // Phase 1: Column-based argmax — sequential reads over contiguous columns.
     // Use u8 for class indices (max 255 classes) for optimal NEON vectorization.
-    assert!(
-        n_classes <= 255,
-        "column-major argmax requires <= 255 classes"
-    );
+    // Fall back to row-major path for models with >255 classes.
+    if n_classes > 255 {
+        let indices: Array1<usize> = (0..n_candidates).collect();
+        return Zip::from(scores.rows())
+            .and(boxes.rows())
+            .and(&indices)
+            .into_par_iter()
+            .filter_map(|(score, bbox, index)| {
+                let (score_, label) = fast_arg_max(score);
+                if score_ < threshold {
+                    return None;
+                }
+                let bbox_quant = B::ndarray_to_xyxy_dequant(bbox.view(), quant_boxes);
+                Some((
+                    DetectBoxQuantized {
+                        label,
+                        score: score_,
+                        bbox: BoundingBox::from(bbox_quant),
+                    },
+                    *index,
+                ))
+            })
+            .collect();
+    }
     let mut max_scores = vec![Scores::min_value(); n_candidates];
     let mut max_classes = vec![0u8; n_candidates];
     for class_idx in 0..n_classes {

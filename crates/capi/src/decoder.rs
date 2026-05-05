@@ -1222,9 +1222,13 @@ pub unsafe extern "C" fn hal_proto_data_free(proto: *mut HalProtoData) {
 
 /// Take ownership of the proto tensor from a prototype data handle.
 ///
-/// Shape `[H, W, num_protos]`. For quantized models, the returned tensor
-/// carries its quantization metadata (accessible via
-/// `hal_tensor_quantization()`).
+/// Shape depends on the layout returned by `hal_proto_data_layout()`:
+///
+/// - `HAL_PROTO_LAYOUT_NHWC` (0): shape is `[H, W, num_protos]`
+/// - `HAL_PROTO_LAYOUT_NCHW` (1): shape is `[num_protos, H, W]`
+///
+/// For quantized models, the returned tensor carries its quantization
+/// metadata (accessible via `hal_tensor_quantization()`).
 ///
 /// After calling this, subsequent calls for protos on the same handle
 /// return NULL. The proto data handle itself must still be freed via
@@ -1272,6 +1276,33 @@ pub unsafe extern "C" fn hal_proto_data_take_mask_coefficients(
         return std::ptr::null_mut();
     }
     Box::into_raw(Box::new(HalTensor { inner: taken }))
+}
+
+/// Proto tensor layout constants for `hal_proto_data_layout()`.
+pub const HAL_PROTO_LAYOUT_NHWC: i32 = 0;
+/// Proto tensor layout constants for `hal_proto_data_layout()`.
+pub const HAL_PROTO_LAYOUT_NCHW: i32 = 1;
+
+/// Query the physical memory layout of the prototype tensor.
+///
+/// Returns `HAL_PROTO_LAYOUT_NHWC` (0) when the proto tensor shape is
+/// `[H, W, num_protos]`, or `HAL_PROTO_LAYOUT_NCHW` (1) when the shape
+/// is `[num_protos, H, W]`.
+///
+/// Use this to interpret the tensor returned by `hal_proto_data_take_protos()`.
+///
+/// @param proto Prototype data handle (may be NULL)
+/// @return Layout constant, or -1 if `proto` is NULL
+#[no_mangle]
+pub unsafe extern "C" fn hal_proto_data_layout(proto: *const HalProtoData) -> i32 {
+    if proto.is_null() {
+        return -1;
+    }
+    let proto = unsafe { &*proto };
+    match proto.inner.layout {
+        edgefirst_decoder::ProtoLayout::Nhwc => HAL_PROTO_LAYOUT_NHWC,
+        edgefirst_decoder::ProtoLayout::Nchw => HAL_PROTO_LAYOUT_NCHW,
+    }
 }
 
 /// A zero-length `u8` sentinel (shape `[0]`) used by the `take_*` accessors

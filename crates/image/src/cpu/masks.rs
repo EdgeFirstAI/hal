@@ -290,6 +290,8 @@ impl CPUProcessor {
         // per-tensor quantization, use the all-integer kernel (same dot
         // product infrastructure as the scaled path, but at proto resolution
         // without bilinear upsampling). Output is binary {0, 255}.
+        // Falls through to the general f32 dequant path for per-channel
+        // quantization or other unsupported modes.
         if proto_data.mask_coefficients.dtype() == DType::I8
             && proto_data.protos.dtype() == DType::I8
         {
@@ -308,7 +310,7 @@ impl CPUProcessor {
             let proto_quant = proto_t.quantization().ok_or_else(|| {
                 crate::Error::InvalidShape("I8 protos require quantization metadata".into())
             })?;
-            return proto_segmentations_i8_i8(
+            match proto_segmentations_i8_i8(
                 detect,
                 coeff_m.as_slice(),
                 coeff_quant,
@@ -322,13 +324,28 @@ impl CPUProcessor {
                 ly0,
                 inv_lh,
                 proto_data.layout,
-            );
+            ) {
+                Ok(result) => return Ok(result),
+                Err(crate::Error::NotSupported(_)) => {
+                    // Fall through to the general f32 dequant path below for
+                    // per-channel quantization and other unsupported modes.
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         // Coefficients may be F32 (from f32 models), F16 (from fp16 models),
         // or I8 (from quantized models — kept raw with quantization). For the
         // mask kernel we always need an f32 view (the multiply-accumulate is
         // done in f32 for precision). Map once and widen once outside the loop.
+        // NCHW layout is only supported in the i8×i8 integer fast path above
+        // with per-tensor quantization. Reject here for all other combinations.
+        if proto_data.layout == edgefirst_decoder::ProtoLayout::Nchw {
+            return Err(crate::Error::NotSupported(
+                "NCHW proto layout requires I8 protos and coefficients with per-tensor quantization"
+                    .into(),
+            ));
+        }
         let coeff_f32_storage: Vec<f32>;
         let coeff_f32_slice: &[f32] = match proto_data.mask_coefficients.dtype() {
             DType::F32 => {
@@ -557,6 +574,8 @@ impl CPUProcessor {
         // Fast integer path: when both coefficients and protos are I8, use
         // the all-integer kernel (i8×i8→i32 dot product, sign-shortcut
         // bilinear). No floating-point conversion at all.
+        // Falls through to the general f32 dequant path for per-channel
+        // quantization or other unsupported modes.
         if proto_data.mask_coefficients.dtype() == DType::I8
             && proto_data.protos.dtype() == DType::I8
         {
@@ -575,7 +594,7 @@ impl CPUProcessor {
             let proto_quant = proto_t.quantization().ok_or_else(|| {
                 crate::Error::InvalidShape("I8 protos require quantization metadata".into())
             })?;
-            return scaled_segmentations_i8_i8(
+            match scaled_segmentations_i8_i8(
                 detect,
                 coeff_m.as_slice(),
                 coeff_quant,
@@ -588,10 +607,25 @@ impl CPUProcessor {
                 width,
                 height,
                 proto_data.layout,
-            );
+            ) {
+                Ok(result) => return Ok(result),
+                Err(crate::Error::NotSupported(_)) => {
+                    // Fall through to the general f32 dequant path below for
+                    // per-channel quantization and other unsupported modes.
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         // Fallback: widen coefficients to f32 for the float-path kernels.
+        // NCHW layout is only supported in the i8×i8 integer fast path above
+        // with per-tensor quantization. Reject here for all other combinations.
+        if proto_data.layout == edgefirst_decoder::ProtoLayout::Nchw {
+            return Err(crate::Error::NotSupported(
+                "NCHW proto layout requires I8 protos and coefficients with per-tensor quantization"
+                    .into(),
+            ));
+        }
         let coeff_f32: Vec<f32> = match proto_data.mask_coefficients.dtype() {
             DType::F32 => {
                 let t = proto_data.mask_coefficients.as_f32().expect("F32");
@@ -1030,11 +1064,51 @@ fn fused_dot_sign_f32_slice(
 }
 
 /// f16 protos × f32 coefficients → sign threshold → binary {0, 255}.
+///
+/// Two code paths:
+///
+/// 1. **x86_64 + F16C + FMA** — explicit intrinsic kernel using
+///    `_mm256_cvtph_ps` (8-lane f16→f32 widening) + `_mm256_fmadd_ps`.
+///
+/// 2. **Scalar fallback** — loop-unrolled by 4 with `half::f16::to_f32()`.
 #[allow(clippy::too_many_arguments)]
 fn fused_dot_sign_f16_slice(
     protos: &[half::f16],
     coeff: &[f32],
     _proto_h: usize,
+    proto_w: usize,
+    y0: usize,
+    x0: usize,
+    roi_h: usize,
+    roi_w: usize,
+    num_protos: usize,
+) -> ndarray::Array3<u8> {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "f16c",
+        target_feature = "fma"
+    ))]
+    {
+        // SAFETY: target-feature gates guarantee F16C + FMA support.
+        unsafe {
+            fused_dot_sign_f16_slice_f16c(protos, coeff, proto_w, y0, x0, roi_h, roi_w, num_protos)
+        }
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "f16c",
+        target_feature = "fma"
+    )))]
+    {
+        fused_dot_sign_f16_slice_scalar(protos, coeff, proto_w, y0, x0, roi_h, roi_w, num_protos)
+    }
+}
+
+/// Scalar f16 sign-threshold kernel — loop-unrolled by 4.
+#[allow(clippy::too_many_arguments)]
+fn fused_dot_sign_f16_slice_scalar(
+    protos: &[half::f16],
+    coeff: &[f32],
     proto_w: usize,
     y0: usize,
     x0: usize,
@@ -1063,6 +1137,83 @@ fn fused_dot_sign_f16_slice(
                 acc += coeff[k] * protos[base + k].to_f32();
                 k += 1;
             }
+            if acc > 0.0 {
+                *out_px = 255;
+            }
+        }
+    }
+    ndarray::Array3::from_shape_vec((roi_h, roi_w, 1), mask_buf)
+        .expect("mask_buf length matches roi_h * roi_w")
+}
+
+/// x86_64 F16C + FMA intrinsic kernel for f16 sign-threshold.
+///
+/// Uses `_mm256_cvtph_ps` for hardware 8-lane f16→f32 widening and
+/// `_mm256_fmadd_ps` for fused multiply-add. Only the sign of the
+/// accumulated dot product is checked (no sigmoid needed).
+///
+/// # Safety
+///
+/// Caller must ensure the target CPU supports F16C + FMA.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "f16c",
+    target_feature = "fma"
+))]
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "f16c,fma,avx")]
+unsafe fn fused_dot_sign_f16_slice_f16c(
+    protos: &[half::f16],
+    coeff: &[f32],
+    proto_w: usize,
+    y0: usize,
+    x0: usize,
+    roi_h: usize,
+    roi_w: usize,
+    num_protos: usize,
+) -> ndarray::Array3<u8> {
+    use core::arch::x86_64::{
+        _mm256_castps256_ps128, _mm256_cvtph_ps, _mm256_extractf128_ps, _mm256_fmadd_ps,
+        _mm256_loadu_ps, _mm256_setzero_ps, _mm_add_ps, _mm_cvtss_f32, _mm_hadd_ps,
+        _mm_loadu_si128,
+    };
+
+    let stride_y = proto_w * num_protos;
+    let chunks8 = num_protos / 8;
+    let mut mask_buf = vec![0u8; roi_h * roi_w];
+
+    for y in 0..roi_h {
+        let row_base = (y0 + y) * stride_y + x0 * num_protos;
+        let out_row = &mut mask_buf[y * roi_w..(y + 1) * roi_w];
+        for (x, out_px) in out_row.iter_mut().enumerate() {
+            let base = row_base + x * num_protos;
+            let mut acc_v = _mm256_setzero_ps();
+            let mut k = 0;
+            for _ in 0..chunks8 {
+                let p_ptr = protos
+                    .as_ptr()
+                    .add(base + k)
+                    .cast::<core::arch::x86_64::__m128i>();
+                let raw = _mm_loadu_si128(p_ptr);
+                let widened = _mm256_cvtph_ps(raw);
+                let coeffs_v = _mm256_loadu_ps(coeff.as_ptr().add(k));
+                acc_v = _mm256_fmadd_ps(coeffs_v, widened, acc_v);
+                k += 8;
+            }
+            // Horizontal reduce 8 → 1.
+            let lo = _mm256_castps256_ps128(acc_v);
+            let hi = _mm256_extractf128_ps::<1>(acc_v);
+            let sum4 = _mm_add_ps(lo, hi);
+            let sum2 = _mm_hadd_ps(sum4, sum4);
+            let sum1 = _mm_hadd_ps(sum2, sum2);
+            let mut acc = _mm_cvtss_f32(sum1);
+
+            // Scalar tail for num_protos % 8.
+            while k < num_protos {
+                acc += coeff[k] * protos[base + k].to_f32();
+                k += 1;
+            }
+
             if acc > 0.0 {
                 *out_px = 255;
             }
