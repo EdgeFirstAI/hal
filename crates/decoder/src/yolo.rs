@@ -971,9 +971,12 @@ where
         boxes_tensor,
         scores_tensor,
     );
-    truncate_to_top_k_by_score(&mut boxes, pre_nms_top_k);
+    if nms.is_some() {
+        truncate_to_top_k_by_score(&mut boxes, pre_nms_top_k);
+    }
     let mut boxes = dispatch_nms_extra_float(nms, iou_threshold, boxes);
     boxes.truncate(max_det);
+    boxes.sort_unstable_by(|a, b| b.0.score.total_cmp(&a.0.score));
     boxes
 }
 
@@ -1057,13 +1060,16 @@ where
             quant_boxes,
         )
     };
-    truncate_to_top_k_by_score_quant(&mut boxes, pre_nms_top_k);
+    if nms.is_some() {
+        truncate_to_top_k_by_score_quant(&mut boxes, pre_nms_top_k);
+    }
     let mut boxes = dispatch_nms_extra_int(nms, iou_threshold, boxes);
     boxes.truncate(max_det);
-    let result: Vec<_> = boxes
+    let mut result: Vec<_> = boxes
         .into_iter()
         .map(|(b, i)| (dequant_detect_box(&b, quant_scores), i))
         .collect();
+    result.sort_unstable_by(|a, b| b.0.score.total_cmp(&a.0.score));
     let t_end = std::time::Instant::now();
     log::trace!(
         "get_boxes: {:.2}ms ({} detections)",
@@ -1507,32 +1513,13 @@ pub(crate) fn extract_proto_data_quant<
     // transposing. The mask materialisation kernels dispatch on the layout.
     let (h, w, k) = protos.dim();
 
-    // Lazy extraction: if no detections survived NMS, return a minimal
-    // ProtoData without copying the 819KB proto tensor at all.
-    if n == 0 {
-        let tensor_quant =
-            edgefirst_tensor::Quantization::per_tensor(quant_protos.scale, quant_protos.zero_point);
-        // Empty protos with valid shape metadata so consumers can still
-        // inspect proto_h/proto_w/num_protos without panicking.
-        let empty_tensor = Tensor::<i8>::new(&[h, w, k], Some(TensorMemory::Mem), None)
-            .expect("allocating empty protos tensor");
-        let empty_tensor = empty_tensor
-            .with_quantization(tensor_quant)
-            .expect("per-tensor quantization on empty protos");
-        return ProtoData {
-            mask_coefficients,
-            protos: TensorDyn::I8(empty_tensor),
-            layout: ProtoLayout::Nhwc,
-        };
-    }
-
     // Determine physical layout and copy strategy.
     let (proto_shape, proto_layout) =
         if std::any::TypeId::of::<PROTO>() == std::any::TypeId::of::<i8>() {
             if protos.is_standard_layout() {
                 // Already NHWC [H, W, K] in contiguous memory.
                 (&[h, w, k][..], ProtoLayout::Nhwc)
-            } else if protos.ndim() == 3 && protos.strides()[2] > 1 {
+            } else if protos.ndim() == 3 && protos.strides() == [w as isize, 1, (h * w) as isize] {
                 // NCHW reinterpreted as NHWC via stride swap. Physical storage
                 // is [K, H, W] contiguous. Keep in NCHW — eliminates the costly
                 // 3.1ms transpose entirely.
@@ -1558,7 +1545,7 @@ pub(crate) fn extract_proto_data_quant<
                     std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len())
                 };
                 dst.copy_from_slice(src);
-            } else if protos.ndim() == 3 && protos.strides()[2] > 1 {
+            } else if protos.ndim() == 3 && protos.strides() == [w as isize, 1, (h * w) as isize] {
                 // NCHW physical layout — sequential copy WITHOUT transpose.
                 // This saves ~3.1ms on A53/A55 by avoiding the tiled
                 // NCHW→NHWC transpose of the 819KB proto buffer.
@@ -2554,8 +2541,8 @@ mod tests {
             boxes.view(),
             scores.view(),
             0.1,
-            1.0,
-            None,                            // bypass NMS so we measure the cap, not suppression
+            1.0,                             // IoU 1.0 → NMS suppresses nothing
+            Some(Nms::ClassAgnostic),        // NMS enabled so pre_nms_top_k applies
             crate::yolo::MAX_NMS_CANDIDATES, // pre_nms_top_k
             usize::MAX,                      // no post-NMS truncation
         );
@@ -2611,8 +2598,8 @@ mod tests {
             (boxes.view(), quant_boxes),
             (scores.view(), quant_scores),
             0.1,
-            1.0,
-            None,
+            1.0,                             // IoU 1.0 → NMS suppresses nothing
+            Some(Nms::ClassAgnostic),        // NMS enabled so pre_nms_top_k applies
             crate::yolo::MAX_NMS_CANDIDATES, // pre_nms_top_k
             usize::MAX,                      // no post-NMS truncation
         );

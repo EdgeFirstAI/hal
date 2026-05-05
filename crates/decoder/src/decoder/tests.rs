@@ -3830,4 +3830,84 @@ outputs:
             assert!(matches!(parsed, ConfigOutput::MaskCoefficients(_)));
         }
     }
+
+    /// Verify that a transposed `[K, H, W]` proto array (viewed as `[H, W, K]`
+    /// via `permuted_axes`) is detected as NCHW layout and copied correctly
+    /// without transposing.
+    #[test]
+    fn test_extract_proto_nchw_layout_detection() {
+        use crate::yolo::impl_yolo_segdet_quant_proto;
+        use crate::{Nms, ProtoLayout, Quantization, XYWH};
+
+        let boxes_raw = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_boxes_116x8400.bin"
+        ));
+        let boxes_i8 =
+            unsafe { std::slice::from_raw_parts(boxes_raw.as_ptr() as *const i8, boxes_raw.len()) };
+        let boxes = ndarray::Array2::from_shape_vec((116, 8400), boxes_i8.to_vec()).unwrap();
+
+        // Create protos in physical NCHW layout [K, H, W] then view as [H, W, K].
+        let (k, h, w) = (32, 160, 160);
+        let protos_raw = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/yolov8_protos_160x160x32.bin"
+        ));
+        let protos_i8 = unsafe {
+            std::slice::from_raw_parts(protos_raw.as_ptr() as *const i8, protos_raw.len())
+        };
+        // Create as [K, H, W] physical layout, then permute axes to [H, W, K].
+        // This mimics what DMA-BUF model outputs look like when the model
+        // produces NCHW protos that are axis-swapped at the ndarray level.
+        let protos_nchw = ndarray::Array3::from_shape_vec((k, h, w), protos_i8.to_vec()).unwrap();
+        let protos_hwk = protos_nchw.view().permuted_axes([1, 2, 0]);
+
+        // Verify the strides match our NCHW detection pattern [w, 1, h*w].
+        assert_eq!(
+            protos_hwk.strides(),
+            &[w as isize, 1, (h * w) as isize],
+            "permuted view should have NCHW strides"
+        );
+
+        let quant_boxes = Quantization::new(0.019_484_945, 20);
+        let quant_protos = Quantization::new(0.020_889_873, -115);
+
+        let mut output_boxes = Vec::with_capacity(50);
+        let proto_data = impl_yolo_segdet_quant_proto::<XYWH, _, _>(
+            (boxes.view(), quant_boxes),
+            (protos_hwk, quant_protos),
+            0.45,
+            0.45,
+            Some(Nms::ClassAgnostic),
+            crate::yolo::MAX_NMS_CANDIDATES,
+            300,
+            &mut output_boxes,
+        );
+
+        // NCHW layout should be detected.
+        assert_eq!(
+            proto_data.layout,
+            ProtoLayout::Nchw,
+            "Expected NCHW layout detection for transposed view"
+        );
+
+        // Proto tensor shape should be [K, H, W] (NCHW).
+        assert_eq!(
+            proto_data.protos.shape(),
+            &[k, h, w],
+            "NCHW proto shape should be [K, H, W]"
+        );
+
+        // Verify detections still produced (same model data).
+        assert!(
+            !output_boxes.is_empty(),
+            "Expected detections from NCHW proto path"
+        );
+
+        // Verify mask coefficients shape.
+        assert_eq!(
+            proto_data.mask_coefficients.shape(),
+            &[output_boxes.len(), k],
+        );
+    }
 }
