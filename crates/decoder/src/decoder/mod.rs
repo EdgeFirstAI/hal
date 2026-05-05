@@ -24,9 +24,15 @@ pub struct Decoder {
     /// threshold (common during COCO mAP evaluation with threshold ≈ 0.001).
     /// Candidates are ranked by score; only the top `pre_nms_top_k` proceed
     /// to NMS.  Default: 300.  Ignored when `nms` is `None`.
+    ///
+    /// Applies to segmentation decode paths only. Detection-only models use
+    /// `output_boxes.capacity()` as their implicit output limit.
     pub pre_nms_top_k: usize,
     /// Maximum number of detections returned after NMS. Matches the
     /// Ultralytics `max_det` parameter.  Default: 300.
+    ///
+    /// Applies to segmentation decode paths only. Detection-only models are
+    /// bounded by `output_boxes.capacity()`.
     pub max_det: usize,
     /// Whether decoded boxes are in normalized [0,1] coordinates.
     /// - `Some(true)`: Coordinates in [0,1] range

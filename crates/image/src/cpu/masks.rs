@@ -283,6 +283,8 @@ impl CPUProcessor {
         // per-tensor quantization, use the all-integer kernel (same dot
         // product infrastructure as the scaled path, but at proto resolution
         // without bilinear upsampling). Output is binary {0, 255}.
+        // Falls through to the general f32 dequant path for per-channel
+        // quantization or other unsupported modes.
         if proto_data.mask_coefficients.dtype() == DType::I8
             && proto_data.protos.dtype() == DType::I8
         {
@@ -301,7 +303,7 @@ impl CPUProcessor {
             let proto_quant = proto_t.quantization().ok_or_else(|| {
                 crate::Error::InvalidShape("I8 protos require quantization metadata".into())
             })?;
-            return proto_segmentations_i8_i8(
+            match proto_segmentations_i8_i8(
                 detect,
                 coeff_m.as_slice(),
                 coeff_quant,
@@ -315,17 +317,26 @@ impl CPUProcessor {
                 ly0,
                 inv_lh,
                 proto_data.layout,
-            );
+            ) {
+                Ok(result) => return Ok(result),
+                Err(crate::Error::NotSupported(_)) => {
+                    // Fall through to the general f32 dequant path below for
+                    // per-channel quantization and other unsupported modes.
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         // Coefficients may be F32 (from f32 models), F16 (from fp16 models),
         // or I8 (from quantized models — kept raw with quantization). For the
         // mask kernel we always need an f32 view (the multiply-accumulate is
         // done in f32 for precision). Map once and widen once outside the loop.
-        // NCHW layout is only supported in the i8×i8 integer fast path above.
+        // NCHW layout is only supported in the i8×i8 integer fast path above
+        // with per-tensor quantization. Reject here for all other combinations.
         if proto_data.layout == edgefirst_decoder::ProtoLayout::Nchw {
             return Err(crate::Error::NotSupported(
-                "NCHW proto layout requires both protos and mask_coefficients to be I8".into(),
+                "NCHW proto layout requires I8 protos and coefficients with per-tensor quantization"
+                    .into(),
             ));
         }
         let coeff_f32_storage: Vec<f32>;
@@ -547,6 +558,8 @@ impl CPUProcessor {
         // Fast integer path: when both coefficients and protos are I8, use
         // the all-integer kernel (i8×i8→i32 dot product, sign-shortcut
         // bilinear). No floating-point conversion at all.
+        // Falls through to the general f32 dequant path for per-channel
+        // quantization or other unsupported modes.
         if proto_data.mask_coefficients.dtype() == DType::I8
             && proto_data.protos.dtype() == DType::I8
         {
@@ -565,7 +578,7 @@ impl CPUProcessor {
             let proto_quant = proto_t.quantization().ok_or_else(|| {
                 crate::Error::InvalidShape("I8 protos require quantization metadata".into())
             })?;
-            return scaled_segmentations_i8_i8(
+            match scaled_segmentations_i8_i8(
                 detect,
                 coeff_m.as_slice(),
                 coeff_quant,
@@ -578,14 +591,23 @@ impl CPUProcessor {
                 width,
                 height,
                 proto_data.layout,
-            );
+            ) {
+                Ok(result) => return Ok(result),
+                Err(crate::Error::NotSupported(_)) => {
+                    // Fall through to the general f32 dequant path below for
+                    // per-channel quantization and other unsupported modes.
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         // Fallback: widen coefficients to f32 for the float-path kernels.
-        // NCHW layout is only supported in the i8×i8 integer fast path above.
+        // NCHW layout is only supported in the i8×i8 integer fast path above
+        // with per-tensor quantization. Reject here for all other combinations.
         if proto_data.layout == edgefirst_decoder::ProtoLayout::Nchw {
             return Err(crate::Error::NotSupported(
-                "NCHW proto layout requires both protos and mask_coefficients to be I8".into(),
+                "NCHW proto layout requires I8 protos and coefficients with per-tensor quantization"
+                    .into(),
             ));
         }
         let coeff_f32: Vec<f32> = match proto_data.mask_coefficients.dtype() {
