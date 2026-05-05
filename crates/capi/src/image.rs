@@ -954,10 +954,10 @@ pub unsafe extern "C" fn hal_image_processor_draw_decoded_masks(
 
 /// Materialize per-instance segmentation masks from prototype data.
 ///
-/// Computes `mask_coeff @ protos` with sigmoid activation for each detection,
-/// producing compact masks at prototype resolution (e.g., 160×160 crops).
-/// Mask values are continuous sigmoid confidence quantized to uint8
-/// (0 = background, 255 = full confidence), NOT binary thresholded.
+/// Computes `mask_coeff @ protos` for each detection, producing compact
+/// binary masks at prototype resolution (e.g., 160×160 crops).
+/// Mask values are binary uint8 {0, 255} — pixels where the dot product
+/// is positive are foreground (255), otherwise background (0).
 ///
 /// The returned segmentation list can be:
 /// - Inspected via `hal_segmentation_list_get_mask()` for analytics, IoU, etc.

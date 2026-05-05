@@ -23,7 +23,7 @@ pub struct Decoder {
     /// Reduces O(N²) NMS cost when many low-confidence proposals pass the
     /// threshold (common during COCO mAP evaluation with threshold ≈ 0.001).
     /// Candidates are ranked by score; only the top `pre_nms_top_k` proceed
-    /// to NMS.  Default: 3000.
+    /// to NMS.  Default: 300.  Ignored when `nms` is `None`.
     pub pre_nms_top_k: usize,
     /// Maximum number of detections returned after NMS. Matches the
     /// Ultralytics `max_det` parameter.  Default: 300.

@@ -327,12 +327,26 @@ class ProtoData:
     instead of a ``ProtoData`` instance.
     """
 
+    @property
+    def layout(self) -> str:
+        """Physical memory layout of the prototype tensor.
+
+        Returns ``"nhwc"`` when protos shape is ``(H, W, K)`` or ``"nchw"``
+        when shape is ``(K, H, W)``. Use this to interpret the tensor returned
+        by :meth:`take_protos`.
+        """
+        ...
+
     def take_protos(self) -> Optional[Tensor]:
         """Take ownership of the prototype masks tensor.
 
-        Returns a Tensor with shape ``(H, W, num_protos)``. For quantized
-        models the returned tensor carries quantization metadata accessible
-        via the ``quantization`` property.
+        Returns a Tensor whose shape depends on :attr:`layout`:
+
+        - ``"nhwc"``: shape is ``(H, W, num_protos)``
+        - ``"nchw"``: shape is ``(num_protos, H, W)``
+
+        For quantized models the returned tensor carries quantization metadata
+        accessible via the ``quantization`` property.
 
         Consumes the proto data's ``protos`` field — subsequent calls
         return ``None``.

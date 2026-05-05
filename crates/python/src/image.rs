@@ -1064,11 +1064,10 @@ impl PyImageProcessor {
 
     /// Materialize per-instance segmentation masks from prototype data.
     ///
-    /// Computes ``mask_coeff @ protos`` with sigmoid activation for each
-    /// detection, producing compact masks at prototype resolution (e.g.,
-    /// 160×160 crops). Mask values are **continuous sigmoid confidence**
-    /// quantized to uint8 (0 = background, 255 = full confidence), **not**
-    /// binary thresholded.
+    /// Computes ``mask_coeff @ protos`` for each detection, producing compact
+    /// binary masks at prototype resolution (e.g., 160×160 crops). Mask values
+    /// are **binary** ``uint8 {0, 255}`` — pixels where the dot product is
+    /// positive are foreground (255), otherwise background (0).
     ///
     /// The returned masks can be:
     ///
@@ -1452,17 +1451,15 @@ impl From<PyColorMode> for image::ColorMode {
 /// Construct via classmethods:
 ///
 /// - ``MaskResolution.Proto()`` — per-detection tiles at proto-plane
-///   resolution (historical default). Mask values are continuous sigmoid
-///   ``uint8 [0, 255]``.
+///   resolution (historical default). Mask values are binary ``uint8 {0, 255}``.
 /// - ``MaskResolution.Scaled(width, height)`` — per-detection tiles at
 ///   caller-specified pixel resolution, produced by upsampling the full
-///   proto plane once (correct edge-clamp bilinear) and cropping by bbox
-///   after sigmoid. Mask values are binary ``uint8 {0, 255}`` —
-///   interchangeable with the continuous sigmoid output via the same
-///   ``> 127`` test. If a ``letterbox`` is also passed to
-///   ``materialize_masks``, ``(width, height)`` are interpreted as
-///   original-content pixel dims and the inverse letterbox transform is
-///   applied during the upsample.
+///   proto plane once (correct edge-clamp bilinear) and cropping by bbox.
+///   Mask values are binary ``uint8 {0, 255}``.
+///   Both modes use ``> 127`` as the threshold convention. If a ``letterbox``
+///   is also passed to ``materialize_masks``, ``(width, height)`` are
+///   interpreted as original-content pixel dims and the inverse letterbox
+///   transform is applied during the upsample.
 #[pyclass(name = "MaskResolution")]
 #[derive(Debug, Clone, Copy)]
 pub struct PyMaskResolution(pub(crate) MaskResolution);
