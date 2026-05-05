@@ -228,6 +228,13 @@ impl CPUProcessor {
     ) -> crate::Result<Vec<edgefirst_decoder::Segmentation>> {
         use edgefirst_tensor::{DType, TensorMapTrait, TensorTrait};
 
+        let _span = tracing::trace_span!(
+            "materialize_masks",
+            mode = "proto",
+            n_detections = detect.len(),
+        )
+        .entered();
+
         if detect.is_empty() {
             return Ok(Vec::new());
         }
@@ -496,6 +503,15 @@ impl CPUProcessor {
         height: u32,
     ) -> crate::Result<Vec<edgefirst_decoder::Segmentation>> {
         use edgefirst_tensor::{DType, TensorMapTrait, TensorTrait};
+
+        let _span = tracing::trace_span!(
+            "materialize_masks",
+            mode = "scaled",
+            n_detections = detect.len(),
+            width,
+            height,
+        )
+        .entered();
 
         if detect.is_empty() {
             return Ok(Vec::new());

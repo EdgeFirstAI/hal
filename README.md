@@ -1234,6 +1234,111 @@ python3 .github/scripts/generate_benchmark_tables.py --data-dir benchmarks/
 
 This prints markdown tables to stdout. Copy the relevant sections into [BENCHMARKS.md](BENCHMARKS.md), which contains the full results and analysis.
 
+## Performance Tracing
+
+The HAL includes built-in instrumentation for capturing detailed performance
+traces of decode and mask operations. Traces are written in Chrome JSON format
+and can be viewed in [Perfetto UI](https://ui.perfetto.dev/).
+
+### How It Works
+
+Library crates (`edgefirst-decoder`, `edgefirst-image`) emit `tracing` spans on
+hot paths. These spans have **zero overhead** when tracing is not active — each
+span site compiles to a single relaxed atomic load that short-circuits when no
+subscriber is installed.
+
+When a trace session is started via the API, a subscriber records all span
+enter/exit events with timestamps and structured metadata (detection counts,
+proto dimensions, layout, etc.) to a Chrome JSON file.
+
+### Instrumented Spans
+
+| Span | Location | Fields |
+|------|----------|--------|
+| `decode` | Decode pipeline | `n_candidates`, `n_after_topk`, `n_after_nms`, `n_detections` |
+| `score_filter` | Score threshold + argmax | — |
+| `top_k` | Pre-NMS top-K filter | `k` |
+| `nms` | Class-aware NMS | — |
+| `box_dequant` | Final box dequantization | `n` |
+| `extract_proto` | Proto tensor extraction | `n`, `num_protos`, `layout` |
+| `materialize_masks` | Mask materialization | `mode`, `n_detections`, `width`, `height` |
+
+### Enabling Tracing
+
+The tracing subscriber is gated behind the `tracing` Cargo feature on the
+`edgefirst-hal`, `edgefirst-hal-capi`, and `edgefirst_hal` (Python) crates.
+The instrumentation spans are always compiled (zero-cost), but the capture
+infrastructure is opt-in.
+
+#### Python
+
+Build the wheel with the `tracing` feature:
+
+```bash
+maturin build --release -m crates/python/Cargo.toml --features tracing
+```
+
+Use in code:
+
+```python
+import edgefirst_hal as hal
+
+with hal.Tracing("/tmp/trace.json"):
+    # ... run inference pipeline ...
+    pass
+# Trace file is ready — open in https://ui.perfetto.dev/
+```
+
+#### Rust
+
+Add the feature to your dependency:
+
+```toml
+[dependencies]
+edgefirst-hal = { version = "0.18", features = ["tracing"] }
+```
+
+```rust
+use edgefirst_hal::trace::{start_tracing, stop_tracing};
+
+start_tracing("/tmp/trace.json").expect("start tracing");
+// ... inference pipeline ...
+stop_tracing(); // flushes and closes the trace file
+```
+
+#### C
+
+Build with the `tracing` feature:
+
+```bash
+cargo build -p edgefirst-hal-capi --features tracing --release
+```
+
+```c
+#include <edgefirst/hal.h>
+
+hal_start_tracing("/tmp/trace.json");
+// ... inference pipeline ...
+hal_stop_tracing();
+```
+
+### Viewing Traces
+
+1. Open [ui.perfetto.dev](https://ui.perfetto.dev/)
+2. Drag the generated `.json` file onto the page
+3. Navigate the timeline to see decode and mask spans with timing and metadata
+
+Each span appears as a slice on the timeline. Click a slice to see its
+structured fields (detection counts, proto layout, etc.) in the "Current
+Selection" panel.
+
+### Limitations
+
+- Only one trace session per process lifetime (Rust global subscriber model)
+- Rayon worker thread spans are not automatically parented to the calling span
+- The `log::*` output (via `env_logger` / C callback logger) operates
+  independently from trace capture — both can be active simultaneously
+
 ## Dependencies
 
 ### Key External Dependencies

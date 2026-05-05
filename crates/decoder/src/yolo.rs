@@ -1047,8 +1047,17 @@ where
     let (boxes_tensor, quant_boxes) = boxes;
     let (scores_tensor, quant_scores) = scores;
 
-    let t_start = std::time::Instant::now();
+    let span = tracing::trace_span!(
+        "decode",
+        n_candidates = tracing::field::Empty,
+        n_after_topk = tracing::field::Empty,
+        n_after_nms = tracing::field::Empty,
+        n_detections = tracing::field::Empty,
+    );
+    let _guard = span.enter();
+
     let mut boxes = {
+        let _s = tracing::trace_span!("score_filter").entered();
         let score_threshold = quantize_score_threshold(score_threshold, quant_scores);
         postprocess_boxes_index_quant::<B, _, _>(
             score_threshold,
@@ -1057,19 +1066,30 @@ where
             quant_boxes,
         )
     };
-    truncate_to_top_k_by_score_quant(&mut boxes, pre_nms_top_k);
-    let mut boxes = dispatch_nms_extra_int(nms, iou_threshold, boxes);
+    span.record("n_candidates", boxes.len());
+
+    {
+        let _s = tracing::trace_span!("top_k", k = pre_nms_top_k).entered();
+        truncate_to_top_k_by_score_quant(&mut boxes, pre_nms_top_k);
+    }
+    span.record("n_after_topk", boxes.len());
+
+    let mut boxes = {
+        let _s = tracing::trace_span!("nms").entered();
+        dispatch_nms_extra_int(nms, iou_threshold, boxes)
+    };
+    span.record("n_after_nms", boxes.len());
+
     boxes.truncate(max_det);
-    let result: Vec<_> = boxes
-        .into_iter()
-        .map(|(b, i)| (dequant_detect_box(&b, quant_scores), i))
-        .collect();
-    let t_end = std::time::Instant::now();
-    log::trace!(
-        "get_boxes: {:.2}ms ({} detections)",
-        t_end.duration_since(t_start).as_secs_f64() * 1000.0,
-        result.len(),
-    );
+    let result: Vec<_> = {
+        let _s = tracing::trace_span!("box_dequant", n = boxes.len()).entered();
+        boxes
+            .into_iter()
+            .map(|(b, i)| (dequant_detect_box(&b, quant_scores), i))
+            .collect()
+    };
+    span.record("n_detections", result.len());
+
     result
 }
 
@@ -1468,8 +1488,17 @@ pub(crate) fn extract_proto_data_quant<
 ) -> ProtoData {
     use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait};
 
+    let span = tracing::trace_span!(
+        "extract_proto",
+        n = det_indices.len(),
+        num_protos = tracing::field::Empty,
+        layout = tracing::field::Empty,
+    );
+    let _guard = span.enter();
+
     let num_protos = mask_tensor.ncols();
     let n = det_indices.len();
+    span.record("num_protos", num_protos);
 
     // Keep mask coefficients in raw i8 with quantization metadata attached.
     // Consumers that need f32 can dequantize on the fly; the scaled-path
@@ -1586,6 +1615,8 @@ pub(crate) fn extract_proto_data_quant<
     let protos_tensor = protos_tensor
         .with_quantization(tensor_quant)
         .expect("per-tensor quantization on new Tensor<i8>");
+
+    span.record("layout", format!("{:?}", proto_layout).as_str());
 
     ProtoData {
         mask_coefficients,
