@@ -57,6 +57,16 @@ typedef void *hal_delegate_t;
 #include <stdio.h>
 
 /**
+ * Proto tensor layout constants for `hal_proto_data_layout()`.
+ */
+#define HAL_PROTO_LAYOUT_NHWC 0
+
+/**
+ * Proto tensor layout constants for `hal_proto_data_layout()`.
+ */
+#define HAL_PROTO_LAYOUT_NCHW 1
+
+/**
  * Maximum number of dimensions in a delegate tensor shape.
  */
 #define HAL_DMABUF_MAX_NDIM 8
@@ -1289,9 +1299,13 @@ void hal_proto_data_free(struct hal_proto_data *proto);
 /**
  * Take ownership of the proto tensor from a prototype data handle.
  *
- * Shape `[H, W, num_protos]`. For quantized models, the returned tensor
- * carries its quantization metadata (accessible via
- * `hal_tensor_quantization()`).
+ * Shape depends on the layout returned by `hal_proto_data_layout()`:
+ *
+ * - `HAL_PROTO_LAYOUT_NHWC` (0): shape is `[H, W, num_protos]`
+ * - `HAL_PROTO_LAYOUT_NCHW` (1): shape is `[num_protos, H, W]`
+ *
+ * For quantized models, the returned tensor carries its quantization
+ * metadata (accessible via `hal_tensor_quantization()`).
  *
  * After calling this, subsequent calls for protos on the same handle
  * return NULL. The proto data handle itself must still be freed via
@@ -1316,6 +1330,20 @@ struct hal_tensor *hal_proto_data_take_protos(struct hal_proto_data *proto);
  *         or NULL if `proto` is NULL or mask_coefficients have been taken
  */
 struct hal_tensor *hal_proto_data_take_mask_coefficients(struct hal_proto_data *proto);
+
+/**
+ * Query the physical memory layout of the prototype tensor.
+ *
+ * Returns `HAL_PROTO_LAYOUT_NHWC` (0) when the proto tensor shape is
+ * `[H, W, num_protos]`, or `HAL_PROTO_LAYOUT_NCHW` (1) when the shape
+ * is `[num_protos, H, W]`.
+ *
+ * Use this to interpret the tensor returned by `hal_proto_data_take_protos()`.
+ *
+ * @param proto Prototype data handle (may be NULL)
+ * @return Layout constant, or -1 if `proto` is NULL
+ */
+int32_t hal_proto_data_layout(const struct hal_proto_data *proto);
 
 /**
  * Get the number of detections in a list.
@@ -1788,10 +1816,10 @@ int hal_image_processor_draw_decoded_masks(struct hal_image_processor *processor
 /**
  * Materialize per-instance segmentation masks from prototype data.
  *
- * Computes `mask_coeff @ protos` with sigmoid activation for each detection,
- * producing compact masks at prototype resolution (e.g., 160×160 crops).
- * Mask values are continuous sigmoid confidence quantized to uint8
- * (0 = background, 255 = full confidence), NOT binary thresholded.
+ * Computes `mask_coeff @ protos` for each detection, producing compact
+ * binary masks at prototype resolution (e.g., 160×160 crops).
+ * Mask values are binary uint8 {0, 255} — pixels where the dot product
+ * is positive are foreground (255), otherwise background (0).
  *
  * The returned segmentation list can be:
  * - Inspected via `hal_segmentation_list_get_mask()` for analytics, IoU, etc.

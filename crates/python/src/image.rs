@@ -1064,11 +1064,10 @@ impl PyImageProcessor {
 
     /// Materialize per-instance segmentation masks from prototype data.
     ///
-    /// Computes ``mask_coeff @ protos`` with sigmoid activation for each
-    /// detection, producing compact masks at prototype resolution (e.g.,
-    /// 160×160 crops). Mask values are **continuous sigmoid confidence**
-    /// quantized to uint8 (0 = background, 255 = full confidence), **not**
-    /// binary thresholded.
+    /// Computes ``mask_coeff @ protos`` for each detection, producing compact
+    /// binary masks at prototype resolution (e.g., 160×160 crops). Mask values
+    /// are **binary** ``uint8 {0, 255}`` — pixels where the dot product is
+    /// positive are foreground (255), otherwise background (0).
     ///
     /// The returned masks can be:
     ///
@@ -1091,14 +1090,13 @@ impl PyImageProcessor {
     ///     normalized coordinates, or ``None`` if no letterboxing was applied
     /// :param resolution: optional mask materialization mode. When ``None`` or
     ///     :class:`MaskResolution.Proto`, returns per-detection tiles at
-    ///     proto-plane resolution with continuous sigmoid mask values. When
+    ///     proto-plane resolution with binary mask values ``{0, 255}``. When
     ///     :class:`MaskResolution.Scaled` ``(width, height)``, HAL upsamples
     ///     the full proto plane once and returns per-detection tiles at the
-    ///     target resolution with binary mask values encoded as
-    ///     ``uint8 {0, 255}``. The same ``> 127`` threshold works for both.
-    /// :returns: list of ``(H, W, 1)`` uint8 numpy arrays. Contents depend on
-    ///     ``resolution``: continuous sigmoid values for ``Proto``, binary
-    ///     ``{0, 255}`` for ``Scaled``.
+    ///     target resolution with binary mask values ``{0, 255}``.
+    ///     Both modes use ``> 127`` as the threshold convention.
+    /// :returns: list of ``(H, W, 1)`` uint8 numpy arrays with binary
+    ///     ``{0, 255}`` mask values.
     /// :rtype: list[numpy.ndarray]
     #[pyo3(signature = (bbox, scores, classes, proto_data, letterbox=None, resolution=None))]
     #[allow(clippy::too_many_arguments)]
@@ -1453,17 +1451,15 @@ impl From<PyColorMode> for image::ColorMode {
 /// Construct via classmethods:
 ///
 /// - ``MaskResolution.Proto()`` — per-detection tiles at proto-plane
-///   resolution (historical default). Mask values are continuous sigmoid
-///   ``uint8 [0, 255]``.
+///   resolution (historical default). Mask values are binary ``uint8 {0, 255}``.
 /// - ``MaskResolution.Scaled(width, height)`` — per-detection tiles at
 ///   caller-specified pixel resolution, produced by upsampling the full
-///   proto plane once (correct edge-clamp bilinear) and cropping by bbox
-///   after sigmoid. Mask values are binary ``uint8 {0, 255}`` —
-///   interchangeable with the continuous sigmoid output via the same
-///   ``> 127`` test. If a ``letterbox`` is also passed to
-///   ``materialize_masks``, ``(width, height)`` are interpreted as
-///   original-content pixel dims and the inverse letterbox transform is
-///   applied during the upsample.
+///   proto plane once (correct edge-clamp bilinear) and cropping by bbox.
+///   Mask values are binary ``uint8 {0, 255}``.
+///   Both modes use ``> 127`` as the threshold convention. If a ``letterbox``
+///   is also passed to ``materialize_masks``, ``(width, height)`` are
+///   interpreted as original-content pixel dims and the inverse letterbox
+///   transform is applied during the upsample.
 #[pyclass(name = "MaskResolution")]
 #[derive(Debug, Clone, Copy)]
 pub struct PyMaskResolution(pub(crate) MaskResolution);

@@ -1875,6 +1875,8 @@ mod gl_tests {
             0.45,
             0.45,
             Some(Nms::ClassAgnostic),
+            edgefirst_decoder::yolo::MAX_NMS_CANDIDATES,
+            300,
             &mut output_boxes,
         );
         assert!(!output_boxes.is_empty(), "No detections from model");

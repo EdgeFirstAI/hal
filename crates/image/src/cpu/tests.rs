@@ -1764,6 +1764,7 @@ mod cpu_tests {
         crate::ProtoData {
             mask_coefficients: TensorDyn::F32(coeff_t),
             protos: TensorDyn::F32(protos_t),
+            layout: edgefirst_decoder::ProtoLayout::Nhwc,
         }
     }
 
@@ -1979,9 +1980,280 @@ mod cpu_tests {
         assert_eq!(shape[2], 1);
     }
 
+    #[test]
+    fn test_materialize_nchw_i8_produces_correct_mask() {
+        // Verify that materialize_segmentations handles NCHW layout correctly.
+        // Proto data is stored as [K, H, W] (NCHW physical) with K=2, H=4, W=4.
+        // Channel 0 filled with +10, channel 1 filled with -10.
+        // Coefficient [+1, +1] → dot > 0 for all pixels (positive + negative = 0,
+        // but with symmetric scale the sum should still be evaluated correctly).
+        // Use coefficients [1, 0] to select only channel 0 → all positive → 255.
+        use edgefirst_tensor::{Quantization, Tensor, TensorDyn};
+        let cpu = CPUProcessor::new();
+        let (proto_h, proto_w, num_protos) = (4, 4, 2);
+        // NCHW physical: [K=2, H=4, W=4] → flat = [ch0 16 values, ch1 16 values]
+        let mut proto_values = vec![0_i8; num_protos * proto_h * proto_w];
+        // Channel 0: all +10, Channel 1: all -10
+        for i in 0..proto_h * proto_w {
+            proto_values[i] = 10; // channel 0
+            proto_values[proto_h * proto_w + i] = -10; // channel 1
+        }
+        let mut protos_t =
+            Tensor::<i8>::from_slice(&proto_values, &[num_protos, proto_h, proto_w]).unwrap();
+        protos_t
+            .set_quantization(Quantization::per_tensor(0.1, 0))
+            .unwrap();
+        // Coefficient selects channel 0 only: [+1, 0] (raw i8 with scale=1.0)
+        let coeff_values = vec![1_i8, 0_i8];
+        let mut coeff_t = Tensor::<i8>::from_slice(&coeff_values, &[1, num_protos]).unwrap();
+        coeff_t
+            .set_quantization(Quantization::per_tensor(1.0, 0))
+            .unwrap();
+        let proto_data = crate::ProtoData {
+            mask_coefficients: TensorDyn::I8(coeff_t),
+            protos: TensorDyn::I8(protos_t),
+            layout: edgefirst_decoder::ProtoLayout::Nchw,
+        };
+        let det = [make_detect_box(0.0, 0.0, 1.0, 1.0)];
+        let segs = cpu
+            .materialize_segmentations(&det, &proto_data, None)
+            .expect("NCHW i8 proto layout should be handled");
+        assert_eq!(segs.len(), 1);
+        // All pixels should be 255 (positive dot product from channel 0)
+        assert!(
+            segs[0].segmentation.iter().all(|&v| v == 255),
+            "NCHW proto with positive channel selected should yield all-255 mask"
+        );
+    }
+
+    #[test]
+    fn test_materialize_nchw_float_rejected() {
+        // NCHW layout with non-i8 protos should return NotSupported error.
+        use edgefirst_tensor::{Tensor, TensorDyn};
+        let cpu = CPUProcessor::new();
+        let proto_values = vec![1.0_f32; 2 * 4 * 4];
+        let protos_t = Tensor::<f32>::from_slice(&proto_values, &[2, 4, 4]).unwrap();
+        let coeff_values = vec![1.0_f32; 2];
+        let coeff_t = Tensor::<f32>::from_slice(&coeff_values, &[1, 2]).unwrap();
+        let proto_data = crate::ProtoData {
+            mask_coefficients: TensorDyn::F32(coeff_t),
+            protos: TensorDyn::F32(protos_t),
+            layout: edgefirst_decoder::ProtoLayout::Nchw,
+        };
+        let det = [make_detect_box(0.0, 0.0, 1.0, 1.0)];
+        let result = cpu.materialize_segmentations(&det, &proto_data, None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, crate::Error::NotSupported(s) if s.contains("NCHW")),
+            "NCHW with non-i8 protos should return NotSupported: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_materialize_scaled_nchw_float_rejected() {
+        // NCHW layout with non-i8 protos on the scaled path should also error.
+        use edgefirst_tensor::{Tensor, TensorDyn};
+        let cpu = CPUProcessor::new();
+        let proto_values = vec![1.0_f32; 2 * 4 * 4];
+        let protos_t = Tensor::<f32>::from_slice(&proto_values, &[2, 4, 4]).unwrap();
+        let coeff_values = vec![1.0_f32; 2];
+        let coeff_t = Tensor::<f32>::from_slice(&coeff_values, &[1, 2]).unwrap();
+        let proto_data = crate::ProtoData {
+            mask_coefficients: TensorDyn::F32(coeff_t),
+            protos: TensorDyn::F32(protos_t),
+            layout: edgefirst_decoder::ProtoLayout::Nchw,
+        };
+        let det = [make_detect_box(0.1, 0.1, 0.9, 0.9)];
+        let result = cpu.materialize_scaled_segmentations(&det, &proto_data, None, 64, 64);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, crate::Error::NotSupported(s) if s.contains("NCHW")),
+            "NCHW with non-i8 protos should return NotSupported: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_materialize_scaled_nchw_i8_produces_correct_mask() {
+        // Verify that the scaled path handles NCHW i8 layout correctly.
+        use edgefirst_tensor::{Quantization, Tensor, TensorDyn};
+        let cpu = CPUProcessor::new();
+        let (proto_h, proto_w, num_protos) = (4, 4, 2);
+        // NCHW physical: [K=2, H=4, W=4]
+        let mut proto_values = vec![0_i8; num_protos * proto_h * proto_w];
+        // Channel 0: all +10, Channel 1: all -10
+        for i in 0..proto_h * proto_w {
+            proto_values[i] = 10;
+            proto_values[proto_h * proto_w + i] = -10;
+        }
+        let mut protos_t =
+            Tensor::<i8>::from_slice(&proto_values, &[num_protos, proto_h, proto_w]).unwrap();
+        protos_t
+            .set_quantization(Quantization::per_tensor(0.1, 0))
+            .unwrap();
+        // Coefficient selects channel 0 only: [+1, 0]
+        let coeff_values = vec![1_i8, 0_i8];
+        let mut coeff_t = Tensor::<i8>::from_slice(&coeff_values, &[1, num_protos]).unwrap();
+        coeff_t
+            .set_quantization(Quantization::per_tensor(1.0, 0))
+            .unwrap();
+        let proto_data = crate::ProtoData {
+            mask_coefficients: TensorDyn::I8(coeff_t),
+            protos: TensorDyn::I8(protos_t),
+            layout: edgefirst_decoder::ProtoLayout::Nchw,
+        };
+        let det = [make_detect_box(0.0, 0.0, 1.0, 1.0)];
+        let segs = cpu
+            .materialize_scaled_segmentations(&det, &proto_data, None, 16, 16)
+            .expect("NCHW i8 scaled path should succeed");
+        assert_eq!(segs.len(), 1);
+        // All pixels should be 255 (positive dot product from channel 0)
+        assert!(
+            segs[0].segmentation.iter().all(|&v| v == 255),
+            "NCHW i8 scaled path with positive channel should yield all-255 mask"
+        );
+    }
+
+    #[test]
+    fn test_materialize_nchw_i8_asymmetric_quantization() {
+        // Verify that NCHW i8 kernel handles non-zero zero-points correctly.
+        // Asymmetric quantization: real_value = (raw - zero_point) * scale
+        // Proto: zp=5, scale=0.1 → raw 15 means (15-5)*0.1 = 1.0
+        // Coeff: zp=10, scale=0.5 → raw 12 means (12-10)*0.5 = 1.0
+        //
+        // With K=2 channels: proto ch0=15 (→1.0), proto ch1=5 (→0.0)
+        // coeff = [12, 10] (→[1.0, 0.0])
+        // dot = 1.0*1.0 + 0.0*0.0 = 1.0 > 0 → mask = 255
+        use edgefirst_tensor::{Quantization, Tensor, TensorDyn};
+        let cpu = CPUProcessor::new();
+        let (proto_h, proto_w, num_protos) = (4, 4, 2);
+
+        // NCHW physical: [K=2, H=4, W=4]
+        let mut proto_values = vec![0_i8; num_protos * proto_h * proto_w];
+        let proto_zp: i8 = 5;
+        // Channel 0: raw = 15 → dequant = (15-5)*0.1 = 1.0
+        // Channel 1: raw = 5 → dequant = (5-5)*0.1 = 0.0
+        for i in 0..proto_h * proto_w {
+            proto_values[i] = 15; // channel 0
+            proto_values[proto_h * proto_w + i] = proto_zp; // channel 1 (at zero-point)
+        }
+        let mut protos_t =
+            Tensor::<i8>::from_slice(&proto_values, &[num_protos, proto_h, proto_w]).unwrap();
+        protos_t
+            .set_quantization(Quantization::per_tensor(0.1, proto_zp as i32))
+            .unwrap();
+
+        // Coefficient: zp=10, scale=0.5
+        // raw=[12, 10] → dequant=[(12-10)*0.5, (10-10)*0.5] = [1.0, 0.0]
+        let coeff_zp: i8 = 10;
+        let coeff_values = vec![12_i8, coeff_zp];
+        let mut coeff_t = Tensor::<i8>::from_slice(&coeff_values, &[1, num_protos]).unwrap();
+        coeff_t
+            .set_quantization(Quantization::per_tensor(0.5, coeff_zp as i32))
+            .unwrap();
+
+        let proto_data = crate::ProtoData {
+            mask_coefficients: TensorDyn::I8(coeff_t),
+            protos: TensorDyn::I8(protos_t),
+            layout: edgefirst_decoder::ProtoLayout::Nchw,
+        };
+        let det = [make_detect_box(0.0, 0.0, 1.0, 1.0)];
+        let segs = cpu
+            .materialize_segmentations(&det, &proto_data, None)
+            .expect("NCHW i8 asymmetric quantization should succeed");
+        assert_eq!(segs.len(), 1);
+        // Dot product = 1.0 > 0 → all 255
+        assert!(
+            segs[0].segmentation.iter().all(|&v| v == 255),
+            "NCHW i8 with non-zero zero-points: positive dot should yield all-255"
+        );
+
+        // Now test case where dot < 0: use coeff that selects a negative channel.
+        // coeff raw=[10, 12] → dequant=[0.0, 1.0]; ch1 is at zero_point → 0.0
+        // dot = 1.0*0.0 + 0.0*1.0 = 0.0 → NOT > 0 → mask = 0
+        let coeff_neg = vec![coeff_zp, 12_i8]; // selects channel 1 which is zero
+        let mut coeff_t_neg = Tensor::<i8>::from_slice(&coeff_neg, &[1, num_protos]).unwrap();
+        coeff_t_neg
+            .set_quantization(Quantization::per_tensor(0.5, coeff_zp as i32))
+            .unwrap();
+
+        // Recreate protos tensor (Tensor doesn't implement Clone)
+        let mut protos_t2 =
+            Tensor::<i8>::from_slice(&proto_values, &[num_protos, proto_h, proto_w]).unwrap();
+        protos_t2
+            .set_quantization(Quantization::per_tensor(0.1, proto_zp as i32))
+            .unwrap();
+
+        let proto_data_neg = crate::ProtoData {
+            mask_coefficients: TensorDyn::I8(coeff_t_neg),
+            protos: TensorDyn::I8(protos_t2),
+            layout: edgefirst_decoder::ProtoLayout::Nchw,
+        };
+        let segs_neg = cpu
+            .materialize_segmentations(&det, &proto_data_neg, None)
+            .expect("NCHW i8 asymmetric: zero-dot case");
+        assert_eq!(segs_neg.len(), 1);
+        // dot = 0 → NOT > 0 → mask should be 0
+        assert!(
+            segs_neg[0].segmentation.iter().all(|&v| v == 0),
+            "NCHW i8 with non-zero zero-points: zero dot should yield all-0"
+        );
+    }
+
+    #[test]
+    fn test_materialize_per_channel_i8_falls_through_to_f32() {
+        // Verify that I8 protos with per-channel quantization fall through
+        // from the i8×i8 fast path to the general f32 dequant path.
+        // This tests the regression fix: previously the i8 fast path returned
+        // NotSupported without falling back.
+        use edgefirst_tensor::{Quantization, Tensor, TensorDyn};
+        let cpu = CPUProcessor::new();
+        let (proto_h, proto_w, num_protos) = (4, 4, 2);
+
+        // NHWC protos: [H, W, K] = [4, 4, 2]
+        // Channel 0: all +10, Channel 1: all -10
+        let mut proto_values = vec![0_i8; proto_h * proto_w * num_protos];
+        for y in 0..proto_h {
+            for x in 0..proto_w {
+                let base = (y * proto_w + x) * num_protos;
+                proto_values[base] = 10; // channel 0
+                proto_values[base + 1] = -10; // channel 1
+            }
+        }
+        let mut protos_t =
+            Tensor::<i8>::from_slice(&proto_values, &[proto_h, proto_w, num_protos]).unwrap();
+        // Per-channel symmetric quantization on axis 2 (channel axis).
+        let scales = vec![0.1_f32; num_protos];
+        protos_t
+            .set_quantization(Quantization::per_channel_symmetric(scales, 2).unwrap())
+            .unwrap();
+
+        // Per-tensor coeff: [1, 0] → selects channel 0 only
+        let coeff_values = vec![1_i8, 0_i8];
+        let mut coeff_t = Tensor::<i8>::from_slice(&coeff_values, &[1, num_protos]).unwrap();
+        coeff_t
+            .set_quantization(Quantization::per_tensor(1.0, 0))
+            .unwrap();
+
+        let proto_data = crate::ProtoData {
+            mask_coefficients: TensorDyn::I8(coeff_t),
+            protos: TensorDyn::I8(protos_t),
+            layout: edgefirst_decoder::ProtoLayout::Nhwc,
+        };
+        let det = [make_detect_box(0.0, 0.0, 1.0, 1.0)];
+        let segs = cpu
+            .materialize_segmentations(&det, &proto_data, None)
+            .expect("per-channel I8 protos should fall through to f32 path");
+        assert_eq!(segs.len(), 1);
+        // Channel 0 is positive (10 * 0.1 = 1.0), coeff selects it → dot > 0 → 255
+        assert!(
+            segs[0].segmentation.iter().all(|&v| v == 255),
+            "per-channel i8 fallback: positive dot should yield all-255"
+        );
+    }
+
     /// Golden-byte anchor: runs the quantized decode + CPU mask materialization
-    /// end-to-end on the cached YOLOv8-seg fixture and asserts the first
-    /// detection's binarized u8 mask is bit-exact against a committed golden
     /// file.
     ///
     /// Regression-protection intent: any refactor that changes the i8 fused
@@ -2028,6 +2300,8 @@ mod cpu_tests {
             0.45,
             0.45,
             Some(Nms::ClassAgnostic),
+            edgefirst_decoder::yolo::MAX_NMS_CANDIDATES,
+            300,
             &mut detections,
         );
         assert!(!detections.is_empty(), "fixture produced no detections");
@@ -2138,6 +2412,7 @@ mod cpu_tests {
         crate::ProtoData {
             mask_coefficients: TensorDyn::I8(coeff_t),
             protos: TensorDyn::I8(protos_t),
+            layout: edgefirst_decoder::ProtoLayout::Nhwc,
         }
     }
 
