@@ -183,6 +183,8 @@ where
         score_threshold,
         iou_threshold,
         nms,
+        MAX_NMS_CANDIDATES,
+        output_boxes.capacity(),
         output_boxes,
         output_masks,
     )
@@ -218,6 +220,8 @@ where
         score_threshold,
         iou_threshold,
         nms,
+        MAX_NMS_CANDIDATES,
+        output_boxes.capacity(),
         output_boxes,
         output_masks,
     )
@@ -872,6 +876,7 @@ pub(crate) fn impl_yolo_split_float<
 ///
 /// # Errors
 /// Returns `DecoderError::InvalidShape` if bounding boxes are not normalized.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn impl_yolo_segdet_quant<
     B: BBoxTypeTrait,
     BOX: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
@@ -882,6 +887,8 @@ pub(crate) fn impl_yolo_segdet_quant<
     score_threshold: f32,
     iou_threshold: f32,
     nms: Option<Nms>,
+    pre_nms_top_k: usize,
+    max_det: usize,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
 ) -> Result<(), crate::DecoderError>
@@ -898,8 +905,8 @@ where
         score_threshold,
         iou_threshold,
         nms,
-        MAX_NMS_CANDIDATES,
-        output_boxes.capacity(),
+        pre_nms_top_k,
+        max_det,
     );
 
     impl_yolo_split_segdet_quant_process_masks::<_, _>(
@@ -920,6 +927,7 @@ where
 ///
 /// # Panics
 /// Panics if shapes don't match the expected dimensions.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn impl_yolo_segdet_float<
     B: BBoxTypeTrait,
     BOX: Float + AsPrimitive<f32> + Send + Sync,
@@ -930,6 +938,8 @@ pub(crate) fn impl_yolo_segdet_float<
     score_threshold: f32,
     iou_threshold: f32,
     nms: Option<Nms>,
+    pre_nms_top_k: usize,
+    max_det: usize,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
 ) -> Result<(), crate::DecoderError>
@@ -944,8 +954,8 @@ where
         score_threshold,
         iou_threshold,
         nms,
-        MAX_NMS_CANDIDATES,
-        output_boxes.capacity(),
+        pre_nms_top_k,
+        max_det,
     );
     impl_yolo_split_segdet_process_masks(boxes, mask_tensor, protos, output_boxes, output_masks)
 }
@@ -975,8 +985,8 @@ where
         truncate_to_top_k_by_score(&mut boxes, pre_nms_top_k);
     }
     let mut boxes = dispatch_nms_extra_float(nms, iou_threshold, boxes);
-    boxes.truncate(max_det);
     boxes.sort_unstable_by(|a, b| b.0.score.total_cmp(&a.0.score));
+    boxes.truncate(max_det);
     boxes
 }
 
@@ -1064,12 +1074,13 @@ where
         truncate_to_top_k_by_score_quant(&mut boxes, pre_nms_top_k);
     }
     let mut boxes = dispatch_nms_extra_int(nms, iou_threshold, boxes);
+    // Sort by score descending before truncation to keep top-scoring detections.
+    boxes.sort_unstable_by(|a, b| b.0.score.cmp(&a.0.score));
     boxes.truncate(max_det);
-    let mut result: Vec<_> = boxes
+    let result: Vec<_> = boxes
         .into_iter()
         .map(|(b, i)| (dequant_detect_box(&b, quant_scores), i))
         .collect();
-    result.sort_unstable_by(|a, b| b.0.score.total_cmp(&a.0.score));
     let t_end = std::time::Instant::now();
     log::trace!(
         "get_boxes: {:.2}ms ({} detections)",
@@ -1478,11 +1489,13 @@ pub(crate) fn extract_proto_data_quant<
     let n = det_indices.len();
 
     // Fast path: when no detections survive NMS, skip the expensive proto
-    // tensor copy (819KB for 160×160×32). Return a valid but minimal
-    // ProtoData with zero-row coefficients and a placeholder proto tensor.
+    // tensor copy (819KB for 160×160×32). Allocate with the correct shape
+    // (preserving the documented ProtoData.protos shape contract) but skip
+    // copying from the source tensor — the zeroed allocation is sufficient
+    // since materialize_masks early-returns on empty detect slices.
     if n == 0 {
         output_boxes.clear();
-        let (_h, _w, k) = protos.dim();
+        let (h, w, k) = protos.dim();
         let coeff_tensor = Tensor::<i8>::new(&[0, num_protos], Some(TensorMemory::Mem), None)
             .expect("allocating empty mask_coefficients tensor");
         let coeff_quant =
@@ -1490,11 +1503,7 @@ pub(crate) fn extract_proto_data_quant<
         let coeff_tensor = coeff_tensor
             .with_quantization(coeff_quant)
             .expect("per-tensor quantization on mask coefficients");
-        // Minimal proto placeholder — shape [1,1,K] (32 bytes) instead of
-        // the full [H,W,K] (819KB). With 0 coefficients no consumer will
-        // index into the proto data; materialize_masks early-returns on
-        // empty detect slices.
-        let protos_tensor = Tensor::<i8>::new(&[1, 1, k], Some(TensorMemory::Mem), None)
+        let protos_tensor = Tensor::<i8>::new(&[h, w, k], Some(TensorMemory::Mem), None)
             .expect("allocating protos tensor");
         let tensor_quant =
             edgefirst_tensor::Quantization::per_tensor(quant_protos.scale, quant_protos.zero_point);

@@ -2073,8 +2073,49 @@ mod cpu_tests {
             "NCHW with non-i8 protos should return NotSupported: {err:?}"
         );
     }
-    /// end-to-end on the cached YOLOv8-seg fixture and asserts the first
-    /// detection's binarized u8 mask is bit-exact against a committed golden
+
+    #[test]
+    fn test_materialize_scaled_nchw_i8_produces_correct_mask() {
+        // Verify that the scaled path handles NCHW i8 layout correctly.
+        use edgefirst_tensor::{Quantization, Tensor, TensorDyn};
+        let cpu = CPUProcessor::new();
+        let (proto_h, proto_w, num_protos) = (4, 4, 2);
+        // NCHW physical: [K=2, H=4, W=4]
+        let mut proto_values = vec![0_i8; num_protos * proto_h * proto_w];
+        // Channel 0: all +10, Channel 1: all -10
+        for i in 0..proto_h * proto_w {
+            proto_values[i] = 10;
+            proto_values[proto_h * proto_w + i] = -10;
+        }
+        let mut protos_t =
+            Tensor::<i8>::from_slice(&proto_values, &[num_protos, proto_h, proto_w]).unwrap();
+        protos_t
+            .set_quantization(Quantization::per_tensor(0.1, 0))
+            .unwrap();
+        // Coefficient selects channel 0 only: [+1, 0]
+        let coeff_values = vec![1_i8, 0_i8];
+        let mut coeff_t = Tensor::<i8>::from_slice(&coeff_values, &[1, num_protos]).unwrap();
+        coeff_t
+            .set_quantization(Quantization::per_tensor(1.0, 0))
+            .unwrap();
+        let proto_data = crate::ProtoData {
+            mask_coefficients: TensorDyn::I8(coeff_t),
+            protos: TensorDyn::I8(protos_t),
+            layout: edgefirst_decoder::ProtoLayout::Nchw,
+        };
+        let det = [make_detect_box(0.0, 0.0, 1.0, 1.0)];
+        let segs = cpu
+            .materialize_scaled_segmentations(&det, &proto_data, None, 16, 16)
+            .expect("NCHW i8 scaled path should succeed");
+        assert_eq!(segs.len(), 1);
+        // All pixels should be 255 (positive dot product from channel 0)
+        assert!(
+            segs[0].segmentation.iter().all(|&v| v == 255),
+            "NCHW i8 scaled path with positive channel should yield all-255 mask"
+        );
+    }
+
+    /// Golden-byte anchor: runs the quantized decode + CPU mask materialization
     /// file.
     ///
     /// Regression-protection intent: any refactor that changes the i8 fused
