@@ -7,8 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.19.0] - 2026-05-05
-
 ### Breaking Changes
 
 - **`MaskResolution::Proto` now returns binary `{0, 255}` masks** instead of

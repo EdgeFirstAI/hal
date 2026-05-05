@@ -322,6 +322,12 @@ impl CPUProcessor {
         // or I8 (from quantized models — kept raw with quantization). For the
         // mask kernel we always need an f32 view (the multiply-accumulate is
         // done in f32 for precision). Map once and widen once outside the loop.
+        // NCHW layout is only supported in the i8×i8 integer fast path above.
+        if proto_data.layout == edgefirst_decoder::ProtoLayout::Nchw {
+            return Err(crate::Error::NotSupported(
+                "NCHW proto layout requires both protos and mask_coefficients to be I8".into(),
+            ));
+        }
         let coeff_f32_storage: Vec<f32>;
         let coeff_f32_slice: &[f32] = match proto_data.mask_coefficients.dtype() {
             DType::F32 => {
@@ -576,6 +582,12 @@ impl CPUProcessor {
         }
 
         // Fallback: widen coefficients to f32 for the float-path kernels.
+        // NCHW layout is only supported in the i8×i8 integer fast path above.
+        if proto_data.layout == edgefirst_decoder::ProtoLayout::Nchw {
+            return Err(crate::Error::NotSupported(
+                "NCHW proto layout requires both protos and mask_coefficients to be I8".into(),
+            ));
+        }
         let coeff_f32: Vec<f32> = match proto_data.mask_coefficients.dtype() {
             DType::F32 => {
                 let t = proto_data.mask_coefficients.as_f32().expect("F32");

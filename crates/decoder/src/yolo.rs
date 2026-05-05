@@ -1477,6 +1477,37 @@ pub(crate) fn extract_proto_data_quant<
     let num_protos = mask_tensor.ncols();
     let n = det_indices.len();
 
+    // Fast path: when no detections survive NMS, skip the expensive proto
+    // tensor copy (819KB for 160×160×32). Return a valid but minimal
+    // ProtoData with zero-row coefficients and a placeholder proto tensor.
+    if n == 0 {
+        output_boxes.clear();
+        let (_h, _w, k) = protos.dim();
+        let coeff_tensor = Tensor::<i8>::new(&[0, num_protos], Some(TensorMemory::Mem), None)
+            .expect("allocating empty mask_coefficients tensor");
+        let coeff_quant =
+            edgefirst_tensor::Quantization::per_tensor(quant_masks.scale, quant_masks.zero_point);
+        let coeff_tensor = coeff_tensor
+            .with_quantization(coeff_quant)
+            .expect("per-tensor quantization on mask coefficients");
+        // Minimal proto placeholder — shape [1,1,K] (32 bytes) instead of
+        // the full [H,W,K] (819KB). With 0 coefficients no consumer will
+        // index into the proto data; materialize_masks early-returns on
+        // empty detect slices.
+        let protos_tensor = Tensor::<i8>::new(&[1, 1, k], Some(TensorMemory::Mem), None)
+            .expect("allocating protos tensor");
+        let tensor_quant =
+            edgefirst_tensor::Quantization::per_tensor(quant_protos.scale, quant_protos.zero_point);
+        let protos_tensor = protos_tensor
+            .with_quantization(tensor_quant)
+            .expect("per-tensor quantization on protos tensor");
+        return ProtoData {
+            mask_coefficients: TensorDyn::I8(coeff_tensor),
+            protos: TensorDyn::I8(protos_tensor),
+            layout: ProtoLayout::Nhwc,
+        };
+    }
+
     // Keep mask coefficients in raw i8 with quantization metadata attached.
     // Consumers that need f32 can dequantize on the fly; the scaled-path
     // integer kernel uses raw i8 directly for i8×i8→i32 dot products.

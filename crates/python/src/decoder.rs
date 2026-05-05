@@ -770,7 +770,9 @@ impl PyDecoder {
             .decoder
             .decode_proto(&tensor_refs, &mut output_boxes)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))?;
-        output_boxes.truncate(max_boxes);
+        // Note: output_boxes and proto_data.mask_coefficients must stay in sync
+        // (same row count). Truncation here would break materialize_masks.
+        // The decoder's max_det (default 300) already caps output count.
         let py = self_.py();
         let (boxes, scores, classes) = convert_detect_box(py, &output_boxes);
         Ok((boxes, scores, classes, proto_data.map(PyProtoData)))
