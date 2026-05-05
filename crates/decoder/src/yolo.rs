@@ -20,8 +20,8 @@ use crate::{
         nms_class_aware_float, nms_extra_class_aware_float, nms_extra_float, nms_float,
         postprocess_boxes_float, postprocess_boxes_index_float,
     },
-    BBoxTypeTrait, BoundingBox, DetectBox, DetectBoxQuantized, ProtoData, Quantization,
-    Segmentation, XYWH, XYXY,
+    BBoxTypeTrait, BoundingBox, DetectBox, DetectBoxQuantized, ProtoData, ProtoLayout,
+    Quantization, Segmentation, XYWH, XYXY,
 };
 
 /// Maximum number of above-threshold candidates fed to NMS.
@@ -1443,6 +1443,7 @@ pub(super) fn extract_proto_data_float<
     ProtoData {
         mask_coefficients,
         protos: protos_tensor,
+        layout: ProtoLayout::Nhwc,
     }
 }
 
@@ -1502,9 +1503,49 @@ pub(crate) fn extract_proto_data_quant<
     let mask_coefficients = TensorDyn::I8(coeff_tensor);
 
     // Keep protos in raw i8 — consumers dequantize via protos.quantization().
-    // When PROTO is already i8, memcpy via to_owned(); else per-element as_().
+    // When PROTO is already i8, detect layout and copy efficiently without
+    // transposing. The mask materialisation kernels dispatch on the layout.
     let (h, w, k) = protos.dim();
-    let protos_tensor = Tensor::<i8>::new(&[h, w, k], Some(TensorMemory::Mem), None)
+
+    // Lazy extraction: if no detections survived NMS, return a minimal
+    // ProtoData without copying the 819KB proto tensor at all.
+    if n == 0 {
+        let tensor_quant =
+            edgefirst_tensor::Quantization::per_tensor(quant_protos.scale, quant_protos.zero_point);
+        // Empty protos with valid shape metadata so consumers can still
+        // inspect proto_h/proto_w/num_protos without panicking.
+        let empty_tensor = Tensor::<i8>::new(&[h, w, k], Some(TensorMemory::Mem), None)
+            .expect("allocating empty protos tensor");
+        let empty_tensor = empty_tensor
+            .with_quantization(tensor_quant)
+            .expect("per-tensor quantization on empty protos");
+        return ProtoData {
+            mask_coefficients,
+            protos: TensorDyn::I8(empty_tensor),
+            layout: ProtoLayout::Nhwc,
+        };
+    }
+
+    // Determine physical layout and copy strategy.
+    let (proto_shape, proto_layout) =
+        if std::any::TypeId::of::<PROTO>() == std::any::TypeId::of::<i8>() {
+            if protos.is_standard_layout() {
+                // Already NHWC [H, W, K] in contiguous memory.
+                (&[h, w, k][..], ProtoLayout::Nhwc)
+            } else if protos.ndim() == 3 && protos.strides()[2] > 1 {
+                // NCHW reinterpreted as NHWC via stride swap. Physical storage
+                // is [K, H, W] contiguous. Keep in NCHW — eliminates the costly
+                // 3.1ms transpose entirely.
+                (&[k, h, w][..], ProtoLayout::Nchw)
+            } else {
+                // Unknown layout — fall back to iter copy as NHWC.
+                (&[h, w, k][..], ProtoLayout::Nhwc)
+            }
+        } else {
+            (&[h, w, k][..], ProtoLayout::Nhwc)
+        };
+
+    let protos_tensor = Tensor::<i8>::new(proto_shape, Some(TensorMemory::Mem), None)
         .expect("allocating protos tensor");
     {
         let mut m = protos_tensor.map().expect("mapping protos tensor");
@@ -1518,34 +1559,15 @@ pub(crate) fn extract_proto_data_quant<
                 };
                 dst.copy_from_slice(src);
             } else if protos.ndim() == 3 && protos.strides()[2] > 1 {
-                // Transposed DMA-BUF view (NCHW reinterpreted as NHWC via stride
-                // swap). The backing store is physically [k, h, w] contiguous.
-                // Strategy: first bulk-copy the entire DMA-BUF sequentially into
-                // heap, then transpose NCHW→NHWC entirely in cacheable memory.
-                // This avoids the L2 thrashing that plane-by-plane scattered writes
-                // cause (output buffer = 819KB >> L2 = 256KB on A55).
+                // NCHW physical layout — sequential copy WITHOUT transpose.
+                // This saves ~3.1ms on A53/A55 by avoiding the tiled
+                // NCHW→NHWC transpose of the 819KB proto buffer.
                 let total = h * w * k;
-                let hw = h * w;
-                // SAFETY: The ArrayView was constructed from a contiguous slice of
+                // SAFETY: ArrayView was constructed from a contiguous slice of
                 // `total` elements. as_ptr() points to the base of that slice.
                 let src: &[i8] =
                     unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, total) };
-                // Sequential DMA-BUF read → heap copy (~0.4ms for 819KB).
-                let heap_copy = src.to_vec();
-
-                // Tiled NCHW→NHWC transpose in heap memory.
-                // Process TILE pixels at a time so the write-target fits in L1.
-                const TILE: usize = 256;
-                for pixel_start in (0..hw).step_by(TILE) {
-                    let pixel_end = (pixel_start + TILE).min(hw);
-                    let dst_tile = &mut dst[pixel_start * k..pixel_end * k];
-                    for c in 0..k {
-                        let plane_chunk = &heap_copy[c * hw + pixel_start..c * hw + pixel_end];
-                        for (i, &val) in plane_chunk.iter().enumerate() {
-                            dst_tile[i * k + c] = val;
-                        }
-                    }
-                }
+                dst.copy_from_slice(src);
             } else {
                 for (d, s) in dst.iter_mut().zip(protos.iter()) {
                     let v_i8: i8 = s.as_();
@@ -1568,6 +1590,7 @@ pub(crate) fn extract_proto_data_quant<
     ProtoData {
         mask_coefficients,
         protos: TensorDyn::I8(protos_tensor),
+        layout: proto_layout,
     }
 }
 
