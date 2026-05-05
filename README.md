@@ -425,7 +425,7 @@ rule exists, and [TESTING.md] for how to verify your integration follows it.
 | Construct one `ImageProcessor` per pipeline | Each instance owns its own GL context and EGL display | Multiple GL contexts contend on `GL_MUTEX`; see ARCHITECTURE.md |
 | Use native fp16 / AVX build overrides only on CPUs that support them | These flags unlock native widening/vector paths for local perf testing | Unsupported targets may fail to build or hit illegal instructions; portability loss |
 | Pass numpy arrays straight to `Tensor.from_numpy()` — do not pre-`ascontiguousarray()` | HAL detects strided sources and materialises via numpy's vectorized C strided→contig pass; a manual workaround above HAL adds a redundant copy | A redundant `np.ascontiguousarray` pre-copy on every call (size-dependent; e.g. ≈1.5 ms per call on a `(1, 116, 8400)` f32 view on rpi5-hailo) |
-| For COCO/IoU evaluation use `MaskResolution::Scaled(orig_w, orig_h)`, not `Proto` | `Scaled` upsamples the continuous-sigmoid proto plane *before* thresholding (clean edges); `Proto` returns continuous values but most callers threshold-then-resize, which produces blocky binary edges and lossy mAP | Mask mAP regression of up to 0.04–0.05 absolute (model- and dataset-dependent) when `Proto` is thresholded then nearest-upsampled |
+| For COCO/IoU evaluation use `MaskResolution::Scaled(orig_w, orig_h)`, not `Proto` | `Scaled` upsamples the proto plane *before* thresholding at full output resolution (clean sub-pixel edges); `Proto` thresholds at proto resolution (160×160) then callers typically nearest-upsample, producing blocky edges | Mask mAP regression of up to 0.04–0.05 absolute (model- and dataset-dependent) when `Proto` is nearest-upsampled |
 
 > [!IMPORTANT]
 > The single most common performance bug is calling
@@ -794,13 +794,11 @@ the perf bound (≤ 1.5× slower than the manual workaround).
 ### Rule 8 — Choose the correct `MaskResolution` for your evaluation
 
 `ImageProcessor.materialize_masks()` accepts a `MaskResolution`
-parameter that controls **where the sigmoid threshold is applied**
-along the materialisation pipeline. The choice changes both the
-output dtype and the achievable mask-mAP:
+parameter that controls the output resolution and pipeline:
 
-| Mode | Output | Sigmoid → threshold pipeline | When to use |
+| Mode | Output | Pipeline | When to use |
 |---|---|---|---|
-| `MaskResolution::Proto` (default) | `(roi_h, roi_w, 1)` u8 — **continuous sigmoid** [0, 255] at 160×160 proto resolution | dot → sigmoid → emit (no threshold) | Real-time visualisation where downstream code already does its own scale-aware thresholding, or when you specifically want continuous confidence values |
+| `MaskResolution::Proto` (default) | `(roi_h, roi_w, 1)` u8 — **binary** {0, 255} at 160×160 proto resolution | dot → sign threshold → emit | Real-time visualisation, rendering, or when proto-resolution binary masks suffice |
 | `MaskResolution::Scaled { width, height }` | `(roi_h, roi_w, 1)` u8 — **binary** {0, 255} at the requested resolution | dot → sigmoid → upsample to `(width, height)` → threshold (`>127`) | All COCO / IoU / mAP evaluation. Upsample-then-threshold preserves sub-proto-cell precision; the alternative (threshold-at-160 then upsample the binary mask) produces blocky 4-pixel-aligned edges and a measurable mAP regression |
 
 ```python
