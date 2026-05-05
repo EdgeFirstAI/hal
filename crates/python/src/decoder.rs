@@ -4,7 +4,7 @@
 use crate::tracker::{PyByteTrack, PyTrackInfo};
 use edgefirst_hal::decoder::{
     configs, configs::Nms, schema::SchemaV2, ConfigOutput, ConfigOutputs, Decoder, DecoderBuilder,
-    DetectBox, ProtoData, Segmentation,
+    DetectBox, ProtoData, ProtoLayout, Segmentation,
 };
 
 /// NMS (Non-Maximum Suppression) mode for filtering overlapping detections.
@@ -466,8 +466,12 @@ pub struct PyProtoData(pub(crate) ProtoData);
 impl PyProtoData {
     /// Take ownership of the prototype masks tensor.
     ///
-    /// Returns a Tensor with shape ``(H, W, num_protos)``. For quantized
-    /// models, the returned tensor carries quantization metadata
+    /// Returns a Tensor whose shape depends on :attr:`layout`:
+    ///
+    /// - ``"nhwc"``: shape is ``(H, W, num_protos)``
+    /// - ``"nchw"``: shape is ``(num_protos, H, W)``
+    ///
+    /// For quantized models, the returned tensor carries quantization metadata
     /// accessible via the ``quantization`` property.
     ///
     /// Consumes the proto data's ``protos`` field — subsequent calls
@@ -494,6 +498,19 @@ impl PyProtoData {
             return None;
         }
         Some(crate::tensor::PyTensor(taken))
+    }
+
+    /// Physical memory layout of the prototype tensor.
+    ///
+    /// Returns ``"nhwc"`` when protos shape is ``(H, W, K)`` or ``"nchw"``
+    /// when shape is ``(K, H, W)``. Use this to interpret the tensor returned
+    /// by :meth:`take_protos`.
+    #[getter]
+    fn layout(&self) -> &'static str {
+        match self.0.layout {
+            ProtoLayout::Nhwc => "nhwc",
+            ProtoLayout::Nchw => "nchw",
+        }
     }
 }
 
@@ -676,6 +693,8 @@ impl PyDecoder {
             .decoder
             .decode(&tensor_refs, &mut output_boxes, &mut output_masks)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))?;
+        output_boxes.truncate(max_boxes);
+        output_masks.truncate(max_boxes);
         let py = self_.py();
         let (boxes, scores, classes) = convert_detect_box(py, &output_boxes);
         let masks = convert_seg_mask(py, &output_masks);
@@ -706,6 +725,9 @@ impl PyDecoder {
                 &mut output_tracks,
             )
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))?;
+        output_boxes.truncate(max_boxes);
+        output_masks.truncate(max_boxes);
+        output_tracks.truncate(max_boxes);
         let py = self_.py();
         let (boxes, scores, classes) = convert_detect_box(py, &output_boxes);
         let masks = convert_seg_mask(py, &output_masks);
@@ -748,6 +770,9 @@ impl PyDecoder {
             .decoder
             .decode_proto(&tensor_refs, &mut output_boxes)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))?;
+        // Note: output_boxes and proto_data.mask_coefficients must stay in sync
+        // (same row count). Truncation here would break materialize_masks.
+        // The decoder's max_det (default 300) already caps output count.
         let py = self_.py();
         let (boxes, scores, classes) = convert_detect_box(py, &output_boxes);
         Ok((boxes, scores, classes, proto_data.map(PyProtoData)))
@@ -780,6 +805,32 @@ impl PyDecoder {
     #[getter(nms)]
     fn get_nms(&self) -> Option<PyNms> {
         self.decoder.nms.map(|nms| nms.into())
+    }
+
+    /// Maximum number of candidates fed into NMS after score filtering.
+    /// Uses O(N) partial sort to reduce O(N²) NMS cost. Default: 300.
+    #[getter(pre_nms_top_k)]
+    fn get_pre_nms_top_k(&self) -> usize {
+        self.decoder.pre_nms_top_k
+    }
+
+    #[setter(pre_nms_top_k)]
+    fn set_pre_nms_top_k(&mut self, value: usize) -> PyResult<()> {
+        self.decoder.pre_nms_top_k = value;
+        Ok(())
+    }
+
+    /// Maximum number of detections returned after NMS.
+    /// Matches the Ultralytics max_det parameter. Default: 300.
+    #[getter(max_det)]
+    fn get_max_det(&self) -> usize {
+        self.decoder.max_det
+    }
+
+    #[setter(max_det)]
+    fn set_max_det(&mut self, value: usize) -> PyResult<()> {
+        self.decoder.max_det = value;
+        Ok(())
     }
 
     /// Returns the box coordinate format if known from the model config.

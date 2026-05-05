@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-use edgefirst_decoder::{DetectBox, ProtoData, Segmentation};
+use edgefirst_decoder::{DetectBox, ProtoData, ProtoLayout, Segmentation};
 use edgefirst_tensor::{
     PixelFormat, PixelLayout, Tensor, TensorMapTrait, TensorMemory, TensorTrait,
 };
@@ -4330,7 +4330,11 @@ impl GLProcessorST {
                 "protos tensor must be rank-3, got {proto_shape:?}"
             )));
         }
-        let (height, width, num_protos) = (proto_shape[0], proto_shape[1], proto_shape[2]);
+        // Interpret shape based on physical layout.
+        let (height, width, num_protos) = match proto_data.layout {
+            ProtoLayout::Nhwc => (proto_shape[0], proto_shape[1], proto_shape[2]),
+            ProtoLayout::Nchw => (proto_shape[1], proto_shape[2], proto_shape[0]),
+        };
         let coeff_shape = proto_data.mask_coefficients.shape();
         if coeff_shape.len() != 2 || coeff_shape[1] != num_protos {
             return Err(crate::Error::InvalidShape(format!(
@@ -4399,6 +4403,17 @@ impl GLProcessorST {
                 )));
             }
         };
+
+        // The GL shader upload path assumes NHWC layout for ArrayView3 creation.
+        // NCHW protos would require a transpose to NHWC before texture upload —
+        // return NotSupported so the caller falls back to the CPU path.
+        if proto_data.layout == ProtoLayout::Nchw {
+            return Err(crate::Error::NotSupported(
+                "GL segmentation path does not yet support NCHW proto layout; \
+                 caller should use CPU fallback"
+                    .into(),
+            ));
+        }
 
         // Each proto-dtype arm holds its `TensorMap` for the duration of the
         // GL upload and passes an `ArrayView3` borrowed from the mapped slice

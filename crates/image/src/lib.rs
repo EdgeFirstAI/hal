@@ -348,6 +348,8 @@ pub(crate) fn copy_packed_to_padded_dma(src: &Tensor<u8>, dst: &mut Tensor<u8>) 
     Ok(())
 }
 
+#[cfg(test)]
+use edgefirst_decoder::ProtoLayout;
 use edgefirst_decoder::{DetectBox, ProtoData, Segmentation};
 use edgefirst_tensor::{
     DType, PixelFormat, PixelLayout, Tensor, TensorDyn, TensorMemory, TensorTrait as _,
@@ -6687,6 +6689,7 @@ mod image_tests {
             ProtoData {
                 mask_coefficients: TensorDyn::F32(coeff_t),
                 protos: TensorDyn::F32(protos_t),
+                layout: ProtoLayout::Nhwc,
             }
         };
         let result =
@@ -6738,6 +6741,7 @@ mod image_tests {
             ProtoData {
                 mask_coefficients: TensorDyn::F32(coeff_t),
                 protos: TensorDyn::F32(protos_t),
+                layout: ProtoLayout::Nhwc,
             }
         };
         let result =
@@ -6859,6 +6863,7 @@ mod image_tests {
             ProtoData {
                 mask_coefficients: TensorDyn::F32(coeff_t),
                 protos: TensorDyn::F32(protos_t),
+                layout: ProtoLayout::Nhwc,
             }
         };
         processor
@@ -6890,6 +6895,7 @@ mod image_tests {
             ProtoData {
                 mask_coefficients: TensorDyn::F32(coeff_t),
                 protos: TensorDyn::F32(protos_t),
+                layout: ProtoLayout::Nhwc,
             }
         };
         processor

@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- **`MaskResolution::Proto` and `MaskResolution::Scaled` now return binary
+  `{0, 255}` masks** instead of continuous sigmoid `[0, 255]` values. The
+  sign-threshold optimization (`dot > 0 → 255`) gives the same segmentation
+  result as `sigmoid(dot) > 0.5` but eliminates the sigmoid computation
+  entirely. Callers that relied on intermediate confidence values should apply
+  custom sigmoid to the raw `ProtoData` tensor (via `decode_proto()`).
+- **`impl_yolo_segdet_quant_proto` and `impl_yolo_split_segdet_quant_get_boxes`**
+  gained `pre_nms_top_k` and `max_det` parameters. Downstream Rust callers
+  using these internal APIs must update their call sites.
+- **`ProtoData.protos` shape depends on layout.** When
+  `ProtoData.layout == ProtoLayout::Nchw`, the tensor shape is
+  `[num_protos, H, W]` instead of `[H, W, num_protos]`. Python callers should
+  check the new `ProtoData.layout` property; C callers should use
+  `hal_proto_data_layout()`.
+
+### Added
+
+- `ProtoData.layout` property in Python and `hal_proto_data_layout()` in C API
+  to query proto tensor memory layout (NHWC vs NCHW).
+- Pre-NMS top-K filtering (`Decoder.pre_nms_top_k`) to reduce O(N²) NMS cost.
+  Default: 300. Skipped when `nms=None` (bypass mode).
+- `Decoder.max_det` to cap post-NMS output count (default: 300, matches
+  Ultralytics convention).
+- NEON-accelerated column-major argmax for quantized score tensors on aarch64,
+  with automatic fallback to row-major for models with > 255 classes.
+- NCHW proto layout detection — skips the 3.1 ms NCHW→NHWC transpose on
+  Cortex-A53/A55 when the model outputs protos in channel-first order.
+- x86_64 F16C+FMA vectorized kernel for f16 proto mask materialization
+  (sign-threshold variant).
+
+### Changed
+
+- `pre_nms_top_k` is now ignored when `nms=None` (NMS bypass mode preserves
+  all above-threshold candidates).
+- Detection output is always sorted by descending score after NMS for
+  deterministic ordering.
+- Python `max_boxes` parameter now enforces a hard output limit (truncates
+  boxes, masks, and tracks to `max_boxes` after decode).
+- `decode_proto()` allocates proto tensors with the correct shape and layout
+  even when zero detections survive NMS (previously the shape did not reflect
+  the model's physical layout for NCHW protos).
+- Column-major argmax gracefully falls back to row-major when models have
+  > 255 classes (previously panicked with an assertion failure).
+
+### Fixed
+
+- NCHW stride detection now uses exact stride matching `[W, 1, H*W]` instead
+  of the overly broad `strides()[2] > 1` check that could misclassify
+  arbitrary strided views as contiguous NCHW buffers.
+
 ## [0.18.1] - 2026-05-01
 
 ### Performance

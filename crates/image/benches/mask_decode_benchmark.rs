@@ -35,7 +35,7 @@ mod common;
 use common::{run_bench, BenchSuite};
 
 use edgefirst_decoder::yolo::impl_yolo_segdet_quant_proto;
-use edgefirst_decoder::{DetectBox, Nms, ProtoData, Quantization, XYWH};
+use edgefirst_decoder::{DetectBox, Nms, ProtoData, ProtoLayout, Quantization, XYWH};
 use edgefirst_image::CPUProcessor;
 use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorTrait};
 
@@ -100,6 +100,8 @@ fn decode_from_fixtures() -> (Vec<DetectBox>, ProtoData) {
         SCORE_THRESHOLD,
         IOU_THRESHOLD,
         Some(Nms::ClassAgnostic),
+        edgefirst_decoder::yolo::MAX_NMS_CANDIDATES,
+        300,
         &mut output_boxes,
     );
     (output_boxes, proto_data)
@@ -216,6 +218,7 @@ fn load_from_safetensors(path: &Path) -> Result<(Vec<DetectBox>, ProtoData), Str
     let proto_data = ProtoData {
         mask_coefficients,
         protos: TensorDyn::I8(protos_tensor),
+        layout: ProtoLayout::Nhwc,
     };
 
     Ok((detect, proto_data))
@@ -497,6 +500,7 @@ fn bench_detection_count_scaling(suite: &mut BenchSuite) {
         let proto_data = ProtoData {
             mask_coefficients: TensorDyn::I8(coeff_tensor),
             protos: TensorDyn::I8(protos_tensor),
+            layout: ProtoLayout::Nhwc,
         };
 
         let name = format!("scaled_640x480/N={n}");
@@ -559,6 +563,128 @@ fn bench_phase_breakdown(suite: &mut BenchSuite) {
     suite.record(&result);
 }
 
+/// Benchmark the NMS decode phase (score filter + NMS + proto extraction).
+/// This matches the `nms_decode` portion of the user's pipeline when called
+/// with COCO-eval score_threshold=0.001.
+fn bench_nms_decode(suite: &mut BenchSuite) {
+    println!("\n== nms_decode: score filter + NMS + proto extraction ==\n");
+
+    let boxes = load_boxes_i8();
+    let protos = load_protos_i8();
+    let n_proposals = boxes.dim().1;
+    let n_classes = boxes.dim().0 - 4 - 32; // 80
+
+    println!(
+        "  Tensor: [{}, {n_proposals}] I8 ({n_classes} classes + 4 box + 32 mask)",
+        boxes.dim().0
+    );
+    println!(
+        "  Protos: [{}, {}, {}] I8",
+        protos.dim().0,
+        protos.dim().1,
+        protos.dim().2
+    );
+    println!("  score_threshold={SCORE_THRESHOLD}, iou_threshold={IOU_THRESHOLD}");
+    println!();
+
+    // Full decode (argmax + NMS + proto extraction)
+    let name = "nms_decode/full_0.001";
+    let result = run_bench(name, WARMUP, ITERATIONS, || {
+        let mut output_boxes = Vec::with_capacity(300);
+        let proto_data = impl_yolo_segdet_quant_proto::<XYWH, _, _>(
+            (boxes.view(), QUANT_BOXES),
+            (protos.view(), QUANT_PROTOS),
+            SCORE_THRESHOLD,
+            IOU_THRESHOLD,
+            Some(Nms::ClassAgnostic),
+            edgefirst_decoder::yolo::MAX_NMS_CANDIDATES,
+            300,
+            &mut output_boxes,
+        );
+        std::hint::black_box((&output_boxes, &proto_data));
+    });
+    let (detect, _) = decode_from_fixtures();
+    println!("  Survivors after NMS: {} detections", detect.len());
+    result.print_summary();
+    suite.record(&result);
+
+    // With typical inference threshold (0.25)
+    let name = "nms_decode/full_0.25";
+    let result = run_bench(name, WARMUP, ITERATIONS, || {
+        let mut output_boxes = Vec::with_capacity(300);
+        let proto_data = impl_yolo_segdet_quant_proto::<XYWH, _, _>(
+            (boxes.view(), QUANT_BOXES),
+            (protos.view(), QUANT_PROTOS),
+            0.25,
+            IOU_THRESHOLD,
+            Some(Nms::ClassAgnostic),
+            edgefirst_decoder::yolo::MAX_NMS_CANDIDATES,
+            300,
+            &mut output_boxes,
+        );
+        std::hint::black_box((&output_boxes, &proto_data));
+    });
+    result.print_summary();
+    suite.record(&result);
+
+    // Pre-NMS top-K=3000 (the key optimization: reduces NMS from O(8400²) to O(3000²))
+    let name = "nms_decode/topk_3000";
+    let result = run_bench(name, WARMUP, ITERATIONS, || {
+        let mut output_boxes = Vec::with_capacity(300);
+        let proto_data = impl_yolo_segdet_quant_proto::<XYWH, _, _>(
+            (boxes.view(), QUANT_BOXES),
+            (protos.view(), QUANT_PROTOS),
+            SCORE_THRESHOLD,
+            IOU_THRESHOLD,
+            Some(Nms::ClassAgnostic),
+            3000,
+            300,
+            &mut output_boxes,
+        );
+        std::hint::black_box((&output_boxes, &proto_data));
+    });
+    result.print_summary();
+    suite.record(&result);
+
+    // Pre-NMS top-K=300 (default — matches Ultralytics max_det=300)
+    let name = "nms_decode/topk_300";
+    let result = run_bench(name, WARMUP, ITERATIONS, || {
+        let mut output_boxes = Vec::with_capacity(300);
+        let proto_data = impl_yolo_segdet_quant_proto::<XYWH, _, _>(
+            (boxes.view(), QUANT_BOXES),
+            (protos.view(), QUANT_PROTOS),
+            SCORE_THRESHOLD,
+            IOU_THRESHOLD,
+            Some(Nms::ClassAgnostic),
+            300,
+            300,
+            &mut output_boxes,
+        );
+        std::hint::black_box((&output_boxes, &proto_data));
+    });
+    result.print_summary();
+    suite.record(&result);
+
+    // Isolate: just score filtering + box decode (no NMS)
+    let name = "nms_decode/score_filter_only";
+    let result = run_bench(name, WARMUP, ITERATIONS, || {
+        let mut output_boxes = Vec::with_capacity(300);
+        let proto_data = impl_yolo_segdet_quant_proto::<XYWH, _, _>(
+            (boxes.view(), QUANT_BOXES),
+            (protos.view(), QUANT_PROTOS),
+            SCORE_THRESHOLD,
+            IOU_THRESHOLD,
+            None, // bypass NMS
+            edgefirst_decoder::yolo::MAX_NMS_CANDIDATES,
+            300,
+            &mut output_boxes,
+        );
+        std::hint::black_box((&output_boxes, &proto_data));
+    });
+    result.print_summary();
+    suite.record(&result);
+}
+
 fn main() {
     let mut suite = BenchSuite::from_args();
 
@@ -574,6 +700,7 @@ fn main() {
         return;
     }
 
+    bench_nms_decode(&mut suite);
     bench_scaled_materialize(&mut suite);
     bench_detection_count_scaling(&mut suite);
     bench_phase_breakdown(&mut suite);
