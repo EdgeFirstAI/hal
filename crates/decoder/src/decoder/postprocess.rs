@@ -256,7 +256,7 @@ impl Decoder {
                     self.iou_threshold,
                     self.nms,
                     self.pre_nms_top_k,
-                    self.max_det,
+                    self.max_det.min(output_boxes.capacity()),
                     output_boxes,
                     output_masks,
                 )
@@ -661,7 +661,7 @@ impl Decoder {
             self.iou_threshold,
             self.nms,
             self.pre_nms_top_k,
-            self.max_det,
+            self.max_det.min(output_boxes.capacity()),
             output_boxes,
             output_masks,
         )

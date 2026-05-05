@@ -9,11 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
-- **`MaskResolution::Proto` now returns binary `{0, 255}` masks** instead of
-  continuous sigmoid `[0, 255]` values. The sign-threshold optimization
-  (`dot > 0 → 255`) gives the same segmentation result as `sigmoid(dot) > 0.5`
-  but eliminates the sigmoid computation entirely. Callers that relied on
-  intermediate confidence values should use `MaskResolution::Scaled` instead.
+- **`MaskResolution::Proto` and `MaskResolution::Scaled` now return binary
+  `{0, 255}` masks** instead of continuous sigmoid `[0, 255]` values. The
+  sign-threshold optimization (`dot > 0 → 255`) gives the same segmentation
+  result as `sigmoid(dot) > 0.5` but eliminates the sigmoid computation
+  entirely. Callers that relied on intermediate confidence values should apply
+  custom sigmoid to the raw `ProtoData` tensor (via `decode_proto()`).
 - **`impl_yolo_segdet_quant_proto` and `impl_yolo_split_segdet_quant_get_boxes`**
   gained `pre_nms_top_k` and `max_det` parameters. Downstream Rust callers
   using these internal APIs must update their call sites.
@@ -46,8 +47,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deterministic ordering.
 - Python `max_boxes` parameter now enforces a hard output limit (truncates
   boxes, masks, and tracks to `max_boxes` after decode).
-- `decode_proto()` now always copies the actual model proto tensor, even when
-  zero detections survive NMS (previously fabricated a zero-filled tensor).
+- `decode_proto()` allocates proto tensors with the correct shape and layout
+  even when zero detections survive NMS (previously the shape did not reflect
+  the model's physical layout for NCHW protos).
 - Column-major argmax gracefully falls back to row-major when models have
   > 255 classes (previously panicked with an assertion failure).
 
