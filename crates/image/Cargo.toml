@@ -39,6 +39,7 @@ ndarray = { workspace = true }
 opencv = { workspace = true, optional = true }
 rayon = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 yuv = { workspace = true }
 zune-jpeg = { workspace = true }
 zune-png = { workspace = true }
