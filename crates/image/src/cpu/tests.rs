@@ -1764,6 +1764,7 @@ mod cpu_tests {
         crate::ProtoData {
             mask_coefficients: TensorDyn::F32(coeff_t),
             protos: TensorDyn::F32(protos_t),
+            layout: edgefirst_decoder::ProtoLayout::Nhwc,
         }
     }
 
@@ -2140,6 +2141,7 @@ mod cpu_tests {
         crate::ProtoData {
             mask_coefficients: TensorDyn::I8(coeff_t),
             protos: TensorDyn::I8(protos_t),
+            layout: edgefirst_decoder::ProtoLayout::Nhwc,
         }
     }
 

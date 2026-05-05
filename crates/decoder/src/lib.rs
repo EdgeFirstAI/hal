@@ -451,6 +451,23 @@ pub struct Segmentation {
     pub segmentation: Array3<u8>,
 }
 
+/// Memory layout of the prototype tensor within [`ProtoData`].
+///
+/// Models may output protos in either channel-last (NHWC) or channel-first
+/// (NCHW) layout. The mask materialisation kernels dispatch on this field to
+/// avoid a costly per-frame transpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtoLayout {
+    /// Channel-last: tensor shape is `[H, W, K]`, contiguous along K.
+    /// This is the traditional layout produced by the `extract_proto_data`
+    /// path after transposing from NCHW model outputs.
+    Nhwc,
+    /// Channel-first: tensor shape is `[K, H, W]`, each channel plane is
+    /// contiguous. Skipping the NCHW→NHWC transpose saves ~3 ms per frame
+    /// on Cortex-A53/A55 targets (819 KB for 32×160×160 protos).
+    Nchw,
+}
+
 /// Raw prototype data for fused decode+render pipelines.
 ///
 /// Holds post-NMS intermediate state before mask materialization, allowing the
@@ -479,8 +496,13 @@ pub struct Segmentation {
 pub struct ProtoData {
     /// Per-detection mask coefficients, shape `[num_detections, num_protos]`.
     pub mask_coefficients: edgefirst_tensor::TensorDyn,
-    /// Prototype tensor, shape `[proto_h, proto_w, num_protos]`.
+    /// Prototype tensor.
+    ///
+    /// - When `layout == ProtoLayout::Nhwc`: shape is `[proto_h, proto_w, num_protos]`.
+    /// - When `layout == ProtoLayout::Nchw`: shape is `[num_protos, proto_h, proto_w]`.
     pub protos: edgefirst_tensor::TensorDyn,
+    /// Physical memory layout of the `protos` tensor.
+    pub layout: ProtoLayout,
 }
 
 /// Turns a DetectBoxQuantized into a DetectBox by dequantizing the score.

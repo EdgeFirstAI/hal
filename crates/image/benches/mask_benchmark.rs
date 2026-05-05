@@ -24,7 +24,7 @@ mod common;
 use common::{run_bench, BenchSuite};
 
 use edgefirst_decoder::yolo::impl_yolo_segdet_quant_proto;
-use edgefirst_decoder::{DetectBox, Nms, ProtoData, Quantization, Segmentation, XYWH};
+use edgefirst_decoder::{DetectBox, Nms, ProtoData, ProtoLayout, Quantization, Segmentation, XYWH};
 use edgefirst_image::{CPUProcessor, ImageProcessor, ImageProcessorTrait, MaskResolution};
 use edgefirst_tensor::{DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait, TensorTrait};
 use half::f16;
@@ -239,6 +239,7 @@ fn build_proto_dtypes(detect: &[DetectBox], proto_data_i8: &ProtoData) -> (Proto
     let proto_f32 = ProtoData {
         mask_coefficients: TensorDyn::F32(f32_coeffs),
         protos: TensorDyn::F32(f32_protos),
+        layout: ProtoLayout::Nhwc,
     };
 
     let protos_f16_vec: Vec<f16> = protos_f32_vec.iter().map(|v| f16::from_f32(*v)).collect();
@@ -248,6 +249,7 @@ fn build_proto_dtypes(detect: &[DetectBox], proto_data_i8: &ProtoData) -> (Proto
     let proto_f16 = ProtoData {
         mask_coefficients: TensorDyn::F16(f16_coeffs),
         protos: TensorDyn::F16(f16_protos),
+        layout: ProtoLayout::Nhwc,
     };
 
     (proto_f32, proto_f16)

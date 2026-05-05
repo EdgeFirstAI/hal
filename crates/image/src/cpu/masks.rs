@@ -237,7 +237,15 @@ impl CPUProcessor {
                 "protos tensor must be rank-3, got {proto_shape:?}"
             )));
         }
-        let (proto_h, proto_w, num_protos) = (proto_shape[0], proto_shape[1], proto_shape[2]);
+        // Interpret shape based on physical layout.
+        let (proto_h, proto_w, num_protos) = match proto_data.layout {
+            edgefirst_decoder::ProtoLayout::Nhwc => {
+                (proto_shape[0], proto_shape[1], proto_shape[2])
+            }
+            edgefirst_decoder::ProtoLayout::Nchw => {
+                (proto_shape[1], proto_shape[2], proto_shape[0])
+            }
+        };
         let coeff_shape = proto_data.mask_coefficients.shape();
         if coeff_shape.len() != 2 || coeff_shape[1] != num_protos {
             return Err(crate::Error::InvalidShape(format!(
@@ -306,6 +314,7 @@ impl CPUProcessor {
                 inv_lw,
                 ly0,
                 inv_lh,
+                proto_data.layout,
             );
         }
 
@@ -502,7 +511,15 @@ impl CPUProcessor {
                 "protos tensor must be rank-3, got {proto_shape:?}"
             )));
         }
-        let (proto_h, proto_w, num_protos) = (proto_shape[0], proto_shape[1], proto_shape[2]);
+        // Interpret shape based on physical layout.
+        let (proto_h, proto_w, num_protos) = match proto_data.layout {
+            edgefirst_decoder::ProtoLayout::Nhwc => {
+                (proto_shape[0], proto_shape[1], proto_shape[2])
+            }
+            edgefirst_decoder::ProtoLayout::Nchw => {
+                (proto_shape[1], proto_shape[2], proto_shape[0])
+            }
+        };
         let coeff_shape = proto_data.mask_coefficients.shape();
         if coeff_shape.len() != 2 || coeff_shape[1] != num_protos {
             return Err(crate::Error::InvalidShape(format!(
@@ -554,6 +571,7 @@ impl CPUProcessor {
                 letterbox,
                 width,
                 height,
+                proto_data.layout,
             );
         }
 
@@ -737,6 +755,7 @@ fn seg_from_roi(
 ///
 /// For each detection, computes the i8×i8 dot product at every proto-ROI pixel,
 /// applies the zero-point correction, and thresholds at sign(logit) → {0, 255}.
+/// Supports both NHWC and NCHW proto layouts.
 #[allow(clippy::too_many_arguments)]
 fn proto_segmentations_i8_i8(
     detect: &[crate::DetectBox],
@@ -751,6 +770,7 @@ fn proto_segmentations_i8_i8(
     inv_lw: f32,
     ly0: f32,
     inv_lh: f32,
+    layout: edgefirst_decoder::ProtoLayout,
 ) -> crate::Result<Vec<edgefirst_decoder::Segmentation>> {
     use edgefirst_tensor::QuantMode;
 
@@ -773,19 +793,31 @@ fn proto_segmentations_i8_i8(
         }
     };
 
-    let stride_y = proto_w * num_protos;
+    let hw = proto_h * proto_w;
 
     // Precompute per-pixel proto sums for zero-point correction.
     let proto_sums: Vec<i32> = if zp_c != 0 {
-        (0..proto_h * proto_w)
-            .map(|px_idx| {
-                let base = px_idx * num_protos;
-                protos[base..base + num_protos]
-                    .iter()
-                    .map(|&v| v as i32)
-                    .sum()
-            })
-            .collect()
+        match layout {
+            edgefirst_decoder::ProtoLayout::Nhwc => (0..hw)
+                .map(|px_idx| {
+                    let base = px_idx * num_protos;
+                    protos[base..base + num_protos]
+                        .iter()
+                        .map(|&v| v as i32)
+                        .sum()
+                })
+                .collect(),
+            edgefirst_decoder::ProtoLayout::Nchw => {
+                let mut sums = vec![0i32; hw];
+                for c in 0..num_protos {
+                    let plane = &protos[c * hw..];
+                    for (px, s) in sums.iter_mut().enumerate() {
+                        *s += plane[px] as i32;
+                    }
+                }
+                sums
+            }
+        }
     } else {
         Vec::new()
     };
@@ -806,69 +838,116 @@ fn proto_segmentations_i8_i8(
 
             let mut mask_buf = vec![0u8; roi_h * roi_w];
 
-            #[cfg(target_arch = "aarch64")]
-            {
-                if use_dotprod {
-                    for ly in 0..roi_h {
-                        let py = y0 + ly;
-                        let row_base = py * stride_y + x0 * num_protos;
-                        for lx in 0..roi_w {
-                            let pix_base = row_base + lx * num_protos;
-                            let proto_px = &protos[pix_base..pix_base + num_protos];
-                            let raw_dot = unsafe {
-                                dot_i8_neon_dotprod(coeff.as_ptr(), proto_px.as_ptr(), num_protos)
-                            };
-                            let correction = if zp_c != 0 {
-                                zp_c * proto_sums[py * proto_w + x0 + lx]
-                            } else {
-                                0
-                            };
-                            let logit = raw_dot - correction - bias;
-                            if logit > 0 {
-                                mask_buf[ly * roi_w + lx] = 255;
+            match layout {
+                edgefirst_decoder::ProtoLayout::Nhwc => {
+                    let stride_y = proto_w * num_protos;
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        if use_dotprod {
+                            for ly in 0..roi_h {
+                                let py = y0 + ly;
+                                let row_base = py * stride_y + x0 * num_protos;
+                                for lx in 0..roi_w {
+                                    let pix_base = row_base + lx * num_protos;
+                                    let proto_px = &protos[pix_base..pix_base + num_protos];
+                                    let raw_dot = unsafe {
+                                        dot_i8_neon_dotprod(
+                                            coeff.as_ptr(),
+                                            proto_px.as_ptr(),
+                                            num_protos,
+                                        )
+                                    };
+                                    let correction = if zp_c != 0 {
+                                        zp_c * proto_sums[py * proto_w + x0 + lx]
+                                    } else {
+                                        0
+                                    };
+                                    let logit = raw_dot - correction - bias;
+                                    if logit > 0 {
+                                        mask_buf[ly * roi_w + lx] = 255;
+                                    }
+                                }
+                            }
+                        } else {
+                            for ly in 0..roi_h {
+                                let py = y0 + ly;
+                                let row_base = py * stride_y + x0 * num_protos;
+                                for lx in 0..roi_w {
+                                    let pix_base = row_base + lx * num_protos;
+                                    let proto_px = &protos[pix_base..pix_base + num_protos];
+                                    let raw_dot = unsafe {
+                                        dot_i8_neon_base(
+                                            coeff.as_ptr(),
+                                            proto_px.as_ptr(),
+                                            num_protos,
+                                        )
+                                    };
+                                    let correction = if zp_c != 0 {
+                                        zp_c * proto_sums[py * proto_w + x0 + lx]
+                                    } else {
+                                        0
+                                    };
+                                    let logit = raw_dot - correction - bias;
+                                    if logit > 0 {
+                                        mask_buf[ly * roi_w + lx] = 255;
+                                    }
+                                }
                             }
                         }
                     }
-                } else {
-                    for ly in 0..roi_h {
-                        let py = y0 + ly;
-                        let row_base = py * stride_y + x0 * num_protos;
-                        for lx in 0..roi_w {
-                            let pix_base = row_base + lx * num_protos;
-                            let proto_px = &protos[pix_base..pix_base + num_protos];
-                            let raw_dot = unsafe {
-                                dot_i8_neon_base(coeff.as_ptr(), proto_px.as_ptr(), num_protos)
-                            };
-                            let correction = if zp_c != 0 {
-                                zp_c * proto_sums[py * proto_w + x0 + lx]
-                            } else {
-                                0
-                            };
-                            let logit = raw_dot - correction - bias;
-                            if logit > 0 {
-                                mask_buf[ly * roi_w + lx] = 255;
+                    #[cfg(not(target_arch = "aarch64"))]
+                    {
+                        for ly in 0..roi_h {
+                            let py = y0 + ly;
+                            let row_base = py * stride_y + x0 * num_protos;
+                            for lx in 0..roi_w {
+                                let pix_base = row_base + lx * num_protos;
+                                let proto_px = &protos[pix_base..pix_base + num_protos];
+                                let raw_dot = dot_i8_scalar(coeff, proto_px, num_protos);
+                                let correction = if zp_c != 0 {
+                                    zp_c * proto_sums[py * proto_w + x0 + lx]
+                                } else {
+                                    0
+                                };
+                                let logit = raw_dot - correction - bias;
+                                if logit > 0 {
+                                    mask_buf[ly * roi_w + lx] = 255;
+                                }
                             }
                         }
                     }
                 }
-            }
-            #[cfg(not(target_arch = "aarch64"))]
-            {
-                for ly in 0..roi_h {
-                    let py = y0 + ly;
-                    let row_base = py * stride_y + x0 * num_protos;
-                    for lx in 0..roi_w {
-                        let pix_base = row_base + lx * num_protos;
-                        let proto_px = &protos[pix_base..pix_base + num_protos];
-                        let raw_dot = dot_i8_scalar(coeff, proto_px, num_protos);
-                        let correction = if zp_c != 0 {
-                            zp_c * proto_sums[py * proto_w + x0 + lx]
-                        } else {
-                            0
-                        };
-                        let logit = raw_dot - correction - bias;
-                        if logit > 0 {
-                            mask_buf[ly * roi_w + lx] = 255;
+                edgefirst_decoder::ProtoLayout::Nchw => {
+                    // Channel-major accumulation: for each channel, accumulate
+                    // coeff[c] * proto[c, py, px] across the ROI. Each channel
+                    // plane is contiguous, giving excellent sequential read access.
+                    let mut accum = vec![0i32; roi_h * roi_w];
+                    for c in 0..num_protos {
+                        let plane = &protos[c * hw..];
+                        let coeff_c = coeff[c] as i32;
+                        for ly in 0..roi_h {
+                            let py = y0 + ly;
+                            let row_start = py * proto_w + x0;
+                            let out_row_start = ly * roi_w;
+                            for lx in 0..roi_w {
+                                accum[out_row_start + lx] += coeff_c * plane[row_start + lx] as i32;
+                            }
+                        }
+                    }
+                    // Apply zero-point correction and threshold.
+                    for ly in 0..roi_h {
+                        let py = y0 + ly;
+                        for lx in 0..roi_w {
+                            let idx = ly * roi_w + lx;
+                            let correction = if zp_c != 0 {
+                                zp_c * proto_sums[py * proto_w + x0 + lx]
+                            } else {
+                                0
+                            };
+                            let logit = accum[idx] - correction - bias;
+                            if logit > 0 {
+                                mask_buf[idx] = 255;
+                            }
                         }
                     }
                 }
@@ -1376,6 +1455,7 @@ fn scaled_segmentations_i8_i8(
     letterbox: Option<[f32; 4]>,
     width: u32,
     height: u32,
+    layout: edgefirst_decoder::ProtoLayout,
 ) -> crate::Result<Vec<edgefirst_decoder::Segmentation>> {
     use edgefirst_tensor::QuantMode;
 
@@ -1408,20 +1488,32 @@ fn scaled_segmentations_i8_i8(
     };
     let out_w = width as usize;
     let out_h = height as usize;
-    let stride_y = proto_w * num_protos;
+    let hw = proto_h * proto_w;
 
     // Precompute proto_sum for the entire proto tensor (zero-point correction).
     let proto_sums: Vec<i32> = if zp_c != 0 {
-        (0..proto_h * proto_w)
-            .map(|px_idx| {
-                let base = px_idx * num_protos;
-                let mut s: i32 = 0;
-                for k in 0..num_protos {
-                    s += protos[base + k] as i32;
+        match layout {
+            edgefirst_decoder::ProtoLayout::Nhwc => (0..hw)
+                .map(|px_idx| {
+                    let base = px_idx * num_protos;
+                    let mut s: i32 = 0;
+                    for k in 0..num_protos {
+                        s += protos[base + k] as i32;
+                    }
+                    s
+                })
+                .collect(),
+            edgefirst_decoder::ProtoLayout::Nchw => {
+                let mut sums = vec![0i32; hw];
+                for c in 0..num_protos {
+                    let plane = &protos[c * hw..];
+                    for (px, s) in sums.iter_mut().enumerate() {
+                        *s += plane[px] as i32;
+                    }
                 }
-                s
-            })
-            .collect()
+                sums
+            }
+        }
     } else {
         Vec::new()
     };
@@ -1429,6 +1521,9 @@ fn scaled_segmentations_i8_i8(
     // Detect dotprod support once, outside the hot loop.
     #[cfg(target_arch = "aarch64")]
     let use_dotprod = std::arch::is_aarch64_feature_detected!("dotprod");
+
+    // For NHWC layout, stride for row navigation.
+    let stride_y = proto_w * num_protos;
 
     detect
         .par_iter()
@@ -1477,57 +1572,90 @@ fn scaled_segmentations_i8_i8(
 
             // Step 2: Compute i32 logits at each proto-ROI pixel.
             let mut logits = vec![0_i32; roi_h * roi_w];
-            #[cfg(target_arch = "aarch64")]
-            {
-                if use_dotprod {
-                    compute_logits_dotprod(
-                        &mut logits,
-                        coeff,
-                        protos,
-                        &proto_sums,
-                        proto_w,
-                        proto_x0,
-                        proto_y0,
-                        roi_w,
-                        roi_h,
-                        stride_y,
-                        num_protos,
-                        zp_c,
-                        bias,
-                    );
-                } else {
-                    compute_logits_base(
-                        &mut logits,
-                        coeff,
-                        protos,
-                        &proto_sums,
-                        proto_w,
-                        proto_x0,
-                        proto_y0,
-                        roi_w,
-                        roi_h,
-                        stride_y,
-                        num_protos,
-                        zp_c,
-                        bias,
-                    );
-                }
-            }
-            #[cfg(not(target_arch = "aarch64"))]
-            {
-                for ly_idx in 0..roi_h {
-                    let py = proto_y0 + ly_idx;
-                    let row_base = py * stride_y + proto_x0 * num_protos;
-                    for lx_idx in 0..roi_w {
-                        let pix_base = row_base + lx_idx * num_protos;
-                        let proto_px = &protos[pix_base..pix_base + num_protos];
-                        let raw_dot = dot_i8_scalar(coeff, proto_px, num_protos);
-                        let correction = if zp_c != 0 {
-                            zp_c * proto_sums[py * proto_w + proto_x0 + lx_idx]
+            match layout {
+                edgefirst_decoder::ProtoLayout::Nhwc => {
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        if use_dotprod {
+                            compute_logits_dotprod(
+                                &mut logits,
+                                coeff,
+                                protos,
+                                &proto_sums,
+                                proto_w,
+                                proto_x0,
+                                proto_y0,
+                                roi_w,
+                                roi_h,
+                                stride_y,
+                                num_protos,
+                                zp_c,
+                                bias,
+                            );
                         } else {
-                            0
-                        };
-                        logits[ly_idx * roi_w + lx_idx] = raw_dot - correction - bias;
+                            compute_logits_base(
+                                &mut logits,
+                                coeff,
+                                protos,
+                                &proto_sums,
+                                proto_w,
+                                proto_x0,
+                                proto_y0,
+                                roi_w,
+                                roi_h,
+                                stride_y,
+                                num_protos,
+                                zp_c,
+                                bias,
+                            );
+                        }
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    {
+                        for ly_idx in 0..roi_h {
+                            let py = proto_y0 + ly_idx;
+                            let row_base = py * stride_y + proto_x0 * num_protos;
+                            for lx_idx in 0..roi_w {
+                                let pix_base = row_base + lx_idx * num_protos;
+                                let proto_px = &protos[pix_base..pix_base + num_protos];
+                                let raw_dot = dot_i8_scalar(coeff, proto_px, num_protos);
+                                let correction = if zp_c != 0 {
+                                    zp_c * proto_sums[py * proto_w + proto_x0 + lx_idx]
+                                } else {
+                                    0
+                                };
+                                logits[ly_idx * roi_w + lx_idx] = raw_dot - correction - bias;
+                            }
+                        }
+                    }
+                }
+                edgefirst_decoder::ProtoLayout::Nchw => {
+                    // Channel-major accumulation: contiguous reads per channel plane.
+                    for c in 0..num_protos {
+                        let plane = &protos[c * hw..];
+                        let coeff_c = coeff[c] as i32;
+                        for ly_idx in 0..roi_h {
+                            let py = proto_y0 + ly_idx;
+                            let row_start = py * proto_w + proto_x0;
+                            let out_row_start = ly_idx * roi_w;
+                            for lx_idx in 0..roi_w {
+                                logits[out_row_start + lx_idx] +=
+                                    coeff_c * plane[row_start + lx_idx] as i32;
+                            }
+                        }
+                    }
+                    // Apply zero-point correction and per-detection bias.
+                    for ly_idx in 0..roi_h {
+                        let py = proto_y0 + ly_idx;
+                        for lx_idx in 0..roi_w {
+                            let idx = ly_idx * roi_w + lx_idx;
+                            let correction = if zp_c != 0 {
+                                zp_c * proto_sums[py * proto_w + proto_x0 + lx_idx]
+                            } else {
+                                0
+                            };
+                            logits[idx] -= correction + bias;
+                        }
                     }
                 }
             }

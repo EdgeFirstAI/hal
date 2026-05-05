@@ -35,7 +35,7 @@ mod common;
 use common::{run_bench, BenchSuite};
 
 use edgefirst_decoder::yolo::impl_yolo_segdet_quant_proto;
-use edgefirst_decoder::{DetectBox, Nms, ProtoData, Quantization, XYWH};
+use edgefirst_decoder::{DetectBox, Nms, ProtoData, ProtoLayout, Quantization, XYWH};
 use edgefirst_image::CPUProcessor;
 use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorTrait};
 
@@ -218,6 +218,7 @@ fn load_from_safetensors(path: &Path) -> Result<(Vec<DetectBox>, ProtoData), Str
     let proto_data = ProtoData {
         mask_coefficients,
         protos: TensorDyn::I8(protos_tensor),
+        layout: ProtoLayout::Nhwc,
     };
 
     Ok((detect, proto_data))
@@ -499,6 +500,7 @@ fn bench_detection_count_scaling(suite: &mut BenchSuite) {
         let proto_data = ProtoData {
             mask_coefficients: TensorDyn::I8(coeff_tensor),
             protos: TensorDyn::I8(protos_tensor),
+            layout: ProtoLayout::Nhwc,
         };
 
         let name = format!("scaled_640x480/N={n}");
