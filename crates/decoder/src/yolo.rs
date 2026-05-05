@@ -1017,12 +1017,18 @@ pub(crate) fn impl_yolo_split_segdet_process_masks<
     MASK: Float + AsPrimitive<f32> + Send + Sync,
     PROTO: Float + AsPrimitive<f32> + Send + Sync,
 >(
-    boxes: Vec<(DetectBox, usize)>,
+    mut boxes: Vec<(DetectBox, usize)>,
     masks_tensor: ArrayView2<MASK>,
     protos_tensor: ArrayView3<PROTO>,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
 ) -> Result<(), crate::DecoderError> {
+    // Respect output capacity as a hard limit to avoid computing excess masks.
+    let cap = output_boxes.capacity();
+    if cap > 0 && boxes.len() > cap {
+        boxes.truncate(cap);
+    }
+
     let boxes = decode_segdet_f32(boxes, masks_tensor, protos_tensor)?;
     output_boxes.clear();
     output_masks.clear();
@@ -1094,7 +1100,7 @@ pub(crate) fn impl_yolo_split_segdet_quant_process_masks<
     MASK: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
     PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
 >(
-    boxes: Vec<(DetectBox, usize)>,
+    mut boxes: Vec<(DetectBox, usize)>,
     mask_coeff: (ArrayView2<MASK>, Quantization),
     protos: (ArrayView3<PROTO>, Quantization),
     output_boxes: &mut Vec<DetectBox>,
@@ -1102,6 +1108,12 @@ pub(crate) fn impl_yolo_split_segdet_quant_process_masks<
 ) -> Result<(), crate::DecoderError> {
     let (masks, quant_masks) = mask_coeff;
     let (protos, quant_protos) = protos;
+
+    // Respect output capacity as a hard limit to avoid computing excess masks.
+    let cap = output_boxes.capacity();
+    if cap > 0 && boxes.len() > cap {
+        boxes.truncate(cap);
+    }
 
     let boxes = decode_segdet_quant(boxes, masks, protos, quant_masks, quant_protos)?;
     output_boxes.clear();
@@ -1496,6 +1508,22 @@ pub(crate) fn extract_proto_data_quant<
     if n == 0 {
         output_boxes.clear();
         let (h, w, k) = protos.dim();
+
+        // Detect physical layout (same logic as the normal path).
+        let (proto_shape, proto_layout) = if std::any::TypeId::of::<PROTO>()
+            == std::any::TypeId::of::<i8>()
+        {
+            if protos.is_standard_layout() {
+                (&[h, w, k][..], ProtoLayout::Nhwc)
+            } else if protos.ndim() == 3 && protos.strides() == [w as isize, 1, (h * w) as isize] {
+                (&[k, h, w][..], ProtoLayout::Nchw)
+            } else {
+                (&[h, w, k][..], ProtoLayout::Nhwc)
+            }
+        } else {
+            (&[h, w, k][..], ProtoLayout::Nhwc)
+        };
+
         let coeff_tensor = Tensor::<i8>::new(&[0, num_protos], Some(TensorMemory::Mem), None)
             .expect("allocating empty mask_coefficients tensor");
         let coeff_quant =
@@ -1503,7 +1531,7 @@ pub(crate) fn extract_proto_data_quant<
         let coeff_tensor = coeff_tensor
             .with_quantization(coeff_quant)
             .expect("per-tensor quantization on mask coefficients");
-        let protos_tensor = Tensor::<i8>::new(&[h, w, k], Some(TensorMemory::Mem), None)
+        let protos_tensor = Tensor::<i8>::new(proto_shape, Some(TensorMemory::Mem), None)
             .expect("allocating protos tensor");
         let tensor_quant =
             edgefirst_tensor::Quantization::per_tensor(quant_protos.scale, quant_protos.zero_point);
@@ -1513,7 +1541,7 @@ pub(crate) fn extract_proto_data_quant<
         return ProtoData {
             mask_coefficients: TensorDyn::I8(coeff_tensor),
             protos: TensorDyn::I8(protos_tensor),
-            layout: ProtoLayout::Nhwc,
+            layout: proto_layout,
         };
     }
 

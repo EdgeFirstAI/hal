@@ -2115,6 +2115,92 @@ mod cpu_tests {
         );
     }
 
+    #[test]
+    fn test_materialize_nchw_i8_asymmetric_quantization() {
+        // Verify that NCHW i8 kernel handles non-zero zero-points correctly.
+        // Asymmetric quantization: real_value = (raw - zero_point) * scale
+        // Proto: zp=5, scale=0.1 → raw 15 means (15-5)*0.1 = 1.0
+        // Coeff: zp=10, scale=0.5 → raw 12 means (12-10)*0.5 = 1.0
+        //
+        // With K=2 channels: proto ch0=15 (→1.0), proto ch1=5 (→0.0)
+        // coeff = [12, 10] (→[1.0, 0.0])
+        // dot = 1.0*1.0 + 0.0*0.0 = 1.0 > 0 → mask = 255
+        use edgefirst_tensor::{Quantization, Tensor, TensorDyn};
+        let cpu = CPUProcessor::new();
+        let (proto_h, proto_w, num_protos) = (4, 4, 2);
+
+        // NCHW physical: [K=2, H=4, W=4]
+        let mut proto_values = vec![0_i8; num_protos * proto_h * proto_w];
+        let proto_zp: i8 = 5;
+        // Channel 0: raw = 15 → dequant = (15-5)*0.1 = 1.0
+        // Channel 1: raw = 5 → dequant = (5-5)*0.1 = 0.0
+        for i in 0..proto_h * proto_w {
+            proto_values[i] = 15; // channel 0
+            proto_values[proto_h * proto_w + i] = proto_zp; // channel 1 (at zero-point)
+        }
+        let mut protos_t =
+            Tensor::<i8>::from_slice(&proto_values, &[num_protos, proto_h, proto_w]).unwrap();
+        protos_t
+            .set_quantization(Quantization::per_tensor(0.1, proto_zp as i32))
+            .unwrap();
+
+        // Coefficient: zp=10, scale=0.5
+        // raw=[12, 10] → dequant=[(12-10)*0.5, (10-10)*0.5] = [1.0, 0.0]
+        let coeff_zp: i8 = 10;
+        let coeff_values = vec![12_i8, coeff_zp];
+        let mut coeff_t = Tensor::<i8>::from_slice(&coeff_values, &[1, num_protos]).unwrap();
+        coeff_t
+            .set_quantization(Quantization::per_tensor(0.5, coeff_zp as i32))
+            .unwrap();
+
+        let proto_data = crate::ProtoData {
+            mask_coefficients: TensorDyn::I8(coeff_t),
+            protos: TensorDyn::I8(protos_t),
+            layout: edgefirst_decoder::ProtoLayout::Nchw,
+        };
+        let det = [make_detect_box(0.0, 0.0, 1.0, 1.0)];
+        let segs = cpu
+            .materialize_segmentations(&det, &proto_data, None)
+            .expect("NCHW i8 asymmetric quantization should succeed");
+        assert_eq!(segs.len(), 1);
+        // Dot product = 1.0 > 0 → all 255
+        assert!(
+            segs[0].segmentation.iter().all(|&v| v == 255),
+            "NCHW i8 with non-zero zero-points: positive dot should yield all-255"
+        );
+
+        // Now test case where dot < 0: use coeff that selects a negative channel.
+        // coeff raw=[10, 12] → dequant=[0.0, 1.0]; ch1 is at zero_point → 0.0
+        // dot = 1.0*0.0 + 0.0*1.0 = 0.0 → NOT > 0 → mask = 0
+        let coeff_neg = vec![coeff_zp, 12_i8]; // selects channel 1 which is zero
+        let mut coeff_t_neg = Tensor::<i8>::from_slice(&coeff_neg, &[1, num_protos]).unwrap();
+        coeff_t_neg
+            .set_quantization(Quantization::per_tensor(0.5, coeff_zp as i32))
+            .unwrap();
+
+        // Recreate protos tensor (Tensor doesn't implement Clone)
+        let mut protos_t2 =
+            Tensor::<i8>::from_slice(&proto_values, &[num_protos, proto_h, proto_w]).unwrap();
+        protos_t2
+            .set_quantization(Quantization::per_tensor(0.1, proto_zp as i32))
+            .unwrap();
+
+        let proto_data_neg = crate::ProtoData {
+            mask_coefficients: TensorDyn::I8(coeff_t_neg),
+            protos: TensorDyn::I8(protos_t2),
+            layout: edgefirst_decoder::ProtoLayout::Nchw,
+        };
+        let segs_neg = cpu
+            .materialize_segmentations(&det, &proto_data_neg, None)
+            .expect("NCHW i8 asymmetric: zero-dot case");
+        assert_eq!(segs_neg.len(), 1);
+        // dot = 0 → NOT > 0 → mask should be 0
+        assert!(
+            segs_neg[0].segmentation.iter().all(|&v| v == 0),
+            "NCHW i8 with non-zero zero-points: zero dot should yield all-0"
+        );
+    }
+
     /// Golden-byte anchor: runs the quantized decode + CPU mask materialization
     /// file.
     ///
