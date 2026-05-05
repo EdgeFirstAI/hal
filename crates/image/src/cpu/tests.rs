@@ -2201,6 +2201,58 @@ mod cpu_tests {
         );
     }
 
+    #[test]
+    fn test_materialize_per_channel_i8_falls_through_to_f32() {
+        // Verify that I8 protos with per-channel quantization fall through
+        // from the i8×i8 fast path to the general f32 dequant path.
+        // This tests the regression fix: previously the i8 fast path returned
+        // NotSupported without falling back.
+        use edgefirst_tensor::{Quantization, Tensor, TensorDyn};
+        let cpu = CPUProcessor::new();
+        let (proto_h, proto_w, num_protos) = (4, 4, 2);
+
+        // NHWC protos: [H, W, K] = [4, 4, 2]
+        // Channel 0: all +10, Channel 1: all -10
+        let mut proto_values = vec![0_i8; proto_h * proto_w * num_protos];
+        for y in 0..proto_h {
+            for x in 0..proto_w {
+                let base = (y * proto_w + x) * num_protos;
+                proto_values[base] = 10; // channel 0
+                proto_values[base + 1] = -10; // channel 1
+            }
+        }
+        let mut protos_t =
+            Tensor::<i8>::from_slice(&proto_values, &[proto_h, proto_w, num_protos]).unwrap();
+        // Per-channel symmetric quantization on axis 2 (channel axis).
+        let scales = vec![0.1_f32; num_protos];
+        protos_t
+            .set_quantization(Quantization::per_channel_symmetric(scales, 2).unwrap())
+            .unwrap();
+
+        // Per-tensor coeff: [1, 0] → selects channel 0 only
+        let coeff_values = vec![1_i8, 0_i8];
+        let mut coeff_t = Tensor::<i8>::from_slice(&coeff_values, &[1, num_protos]).unwrap();
+        coeff_t
+            .set_quantization(Quantization::per_tensor(1.0, 0))
+            .unwrap();
+
+        let proto_data = crate::ProtoData {
+            mask_coefficients: TensorDyn::I8(coeff_t),
+            protos: TensorDyn::I8(protos_t),
+            layout: edgefirst_decoder::ProtoLayout::Nhwc,
+        };
+        let det = [make_detect_box(0.0, 0.0, 1.0, 1.0)];
+        let segs = cpu
+            .materialize_segmentations(&det, &proto_data, None)
+            .expect("per-channel I8 protos should fall through to f32 path");
+        assert_eq!(segs.len(), 1);
+        // Channel 0 is positive (10 * 0.1 = 1.0), coeff selects it → dot > 0 → 255
+        assert!(
+            segs[0].segmentation.iter().all(|&v| v == 255),
+            "per-channel i8 fallback: positive dot should yield all-255"
+        );
+    }
+
     /// Golden-byte anchor: runs the quantized decode + CPU mask materialization
     /// file.
     ///
