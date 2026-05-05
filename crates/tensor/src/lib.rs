@@ -1172,6 +1172,13 @@ where
     /// # }
     /// ```
     pub fn new(shape: &[usize], memory: Option<TensorMemory>, name: Option<&str>) -> Result<Self> {
+        let _span = tracing::trace_span!(
+            "tensor_alloc",
+            ?shape,
+            memory = ?memory,
+            dtype = std::any::type_name::<T>(),
+        )
+        .entered();
         TensorStorage::new(shape, memory, name).map(Self::wrap)
     }
 
@@ -1770,6 +1777,11 @@ where
     }
 
     fn map(&self) -> Result<TensorMap<T>> {
+        let _span = tracing::trace_span!(
+            "tensor_map",
+            memory = ?self.storage.memory(),
+        )
+        .entered();
         // CPU mapping of strided tensors is allowed only when the HAL
         // owns the underlying allocation — i.e. self-allocated DMA
         // tensors with pitch padding added by `image_with_stride()`

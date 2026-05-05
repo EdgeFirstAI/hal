@@ -345,6 +345,14 @@ where
     T: DetectionBox,
 {
     fn update(&mut self, boxes: &[T], timestamp: u64) -> Vec<Option<TrackInfo>> {
+        let span = tracing::trace_span!(
+            "tracker_update",
+            n_detections = boxes.len(),
+            n_tracklets = self.tracklets.len(),
+            timestamp,
+        );
+        let _enter = span.enter();
+
         self.frame_count += 1;
 
         // Identify high-confidence detections
@@ -361,10 +369,14 @@ where
 
         // First pass: match high-confidence detections
         if !self.tracklets.is_empty() {
+            let _s = tracing::trace_span!("predict").entered();
             for track in &mut self.tracklets {
                 track.filter.predict();
             }
+        }
 
+        if !self.tracklets.is_empty() {
+            let _s = tracing::trace_span!("match_high_conf").entered();
             let costs = self.compute_costs(
                 boxes,
                 self.track_high_conf,
@@ -388,6 +400,7 @@ where
 
         // Second pass: match remaining tracklets to low-confidence detections
         if !self.tracklets.is_empty() {
+            let _s = tracing::trace_span!("match_low_conf").entered();
             let costs = self.compute_costs(boxes, 0.0, self.track_iou, &matched, &tracked);
             if let Ok(ans) = lapjv(&costs) {
                 self.process_assignments(

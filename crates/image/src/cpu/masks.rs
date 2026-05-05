@@ -824,6 +824,16 @@ fn proto_segmentations_i8_i8(
 ) -> crate::Result<Vec<edgefirst_decoder::Segmentation>> {
     use edgefirst_tensor::QuantMode;
 
+    let _span = tracing::trace_span!(
+        "mask_i8_fastpath",
+        n = detect.len(),
+        proto_h,
+        proto_w,
+        num_protos,
+        ?layout,
+    )
+    .entered();
+
     let zp_c: i32 = match coeff_quant.mode() {
         QuantMode::PerTensor { zero_point, .. } => zero_point,
         QuantMode::PerTensorSymmetric { .. } => 0,
@@ -1625,6 +1635,18 @@ fn scaled_segmentations_i8_i8(
     layout: edgefirst_decoder::ProtoLayout,
 ) -> crate::Result<Vec<edgefirst_decoder::Segmentation>> {
     use edgefirst_tensor::QuantMode;
+
+    let _span = tracing::trace_span!(
+        "mask_i8_fastpath",
+        n = detect.len(),
+        proto_h,
+        proto_w,
+        num_protos,
+        width,
+        height,
+        ?layout,
+    )
+    .entered();
 
     let zp_c: i32 = match coeff_quant.mode() {
         QuantMode::PerTensor { zero_point, .. } => zero_point,

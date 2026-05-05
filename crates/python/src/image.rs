@@ -975,6 +975,7 @@ impl PyImageProcessor {
         dst_crop: Option<PyRect>,
         dst_color: Option<[u8; 4]>,
     ) -> Result<()> {
+        let _span = tracing::trace_span!("py_convert").entered();
         let rotation = rotation.into();
         let flip = flip.into();
         let crop = Crop {
@@ -1110,6 +1111,7 @@ impl PyImageProcessor {
         resolution: Option<PyMaskResolution>,
         py: Python<'py>,
     ) -> Result<Vec<Bound<'py, numpy::PyArray3<u8>>>> {
+        let _span = tracing::trace_span!("py_materialize_masks").entered();
         let detect = numpy_to_detect_boxes(&bbox, &scores, &classes)?;
         let resolution = resolution.map(|r| r.0).unwrap_or(MaskResolution::Proto);
         let mut l = self
@@ -1149,6 +1151,12 @@ impl PyImageProcessor {
         color_mode: PyColorMode,
         py: Python<'py>,
     ) -> PyResult<Py<PyAny>> {
+        let _span = tracing::trace_span!(
+            "py_draw_masks",
+            n_tensors = model_output.len(),
+            tracked = tracker.is_some(),
+        )
+        .entered();
         let tensor_refs: Vec<&edgefirst_hal::tensor::TensorDyn> =
             model_output.iter().map(|t| &t.0).collect();
 
