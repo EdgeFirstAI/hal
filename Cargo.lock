@@ -679,6 +679,7 @@ dependencies = [
  "procfs",
  "serde",
  "serde_json",
+ "tracing",
  "uuid",
 ]
 
@@ -693,6 +694,7 @@ dependencies = [
  "nalgebra 0.32.6",
  "ndarray 0.16.1",
  "num-traits",
+ "tracing",
  "uuid",
 ]
 
@@ -715,6 +717,7 @@ dependencies = [
  "rayon",
  "rustc_version",
  "serde_json",
+ "tracing",
  "uuid",
 ]
 
