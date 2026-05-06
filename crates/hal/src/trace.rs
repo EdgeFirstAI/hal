@@ -55,6 +55,7 @@
 //! hal_stop_tracing(); // flushes trace file
 //! ```
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use tracing_chrome::FlushGuard;
@@ -63,12 +64,19 @@ use tracing_subscriber::prelude::*;
 /// Global flush guard for the active trace session.
 static GUARD: Mutex<Option<FlushGuard>> = Mutex::new(None);
 
+/// Tracks whether a session has ever been started (remains true after stop).
+static SESSION_USED: AtomicBool = AtomicBool::new(false);
+
 /// Errors from tracing operations.
 #[derive(Debug)]
 pub enum TracingError {
     /// A trace capture session is already active.
     AlreadyActive,
-    /// Failed to install the global subscriber (another was already set).
+    /// The single-use trace session was already started and stopped.
+    /// Only one session per process lifetime is supported.
+    SessionExhausted,
+    /// Failed to install the global subscriber (another was already set
+    /// by user code outside the HAL).
     SubscriberInstallFailed(String),
 }
 
@@ -76,6 +84,10 @@ impl std::fmt::Display for TracingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::AlreadyActive => write!(f, "trace capture already active"),
+            Self::SessionExhausted => write!(
+                f,
+                "trace session already used (only one session per process lifetime)"
+            ),
             Self::SubscriberInstallFailed(e) => {
                 write!(f, "failed to install tracing subscriber: {e}")
             }
@@ -91,17 +103,23 @@ impl std::error::Error for TracingError {}
 /// The trace file is created immediately. All `tracing::trace_span!` spans
 /// emitted by HAL crates will be recorded until [`stop_tracing`] is called.
 ///
-/// Only one session per process lifetime is supported.
+/// Only one session per process lifetime is supported (a limitation of
+/// Rust's global subscriber model).
 ///
 /// # Errors
 ///
-/// Returns [`TracingError::AlreadyActive`] if already capturing.
-/// Returns [`TracingError::SubscriberInstallFailed`] if another subscriber
-/// was previously installed by user code.
+/// Returns [`TracingError::AlreadyActive`] if a session is currently capturing.
+/// Returns [`TracingError::SessionExhausted`] if a session was previously
+/// started and stopped (the global subscriber cannot be replaced).
+/// Returns [`TracingError::SubscriberInstallFailed`] if another tracing
+/// subscriber was installed by user code outside the HAL.
 pub fn start_tracing(path: &str) -> Result<(), TracingError> {
-    let mut lock = GUARD.lock().unwrap();
+    let mut lock = GUARD.lock().unwrap_or_else(|e| e.into_inner());
     if lock.is_some() {
         return Err(TracingError::AlreadyActive);
+    }
+    if SESSION_USED.load(Ordering::Relaxed) {
+        return Err(TracingError::SessionExhausted);
     }
 
     // Build chrome layer writing to the specified file.
@@ -117,6 +135,7 @@ pub fn start_tracing(path: &str) -> Result<(), TracingError> {
     tracing::subscriber::set_global_default(subscriber)
         .map_err(|e| TracingError::SubscriberInstallFailed(e.to_string()))?;
 
+    SESSION_USED.store(true, Ordering::Relaxed);
     *lock = Some(guard);
     Ok(())
 }
@@ -126,14 +145,14 @@ pub fn start_tracing(path: &str) -> Result<(), TracingError> {
 /// No-op if no session is active. After this call the trace file is complete
 /// and can be loaded into <https://ui.perfetto.dev/>.
 pub fn stop_tracing() {
-    let mut lock = GUARD.lock().unwrap();
+    let mut lock = GUARD.lock().unwrap_or_else(|e| e.into_inner());
     // Dropping the FlushGuard flushes remaining spans and closes the file.
     lock.take();
 }
 
 /// Returns `true` if a trace capture session is currently active.
 pub fn is_tracing_active() -> bool {
-    GUARD.lock().unwrap().is_some()
+    GUARD.lock().unwrap_or_else(|e| e.into_inner()).is_some()
 }
 
 #[cfg(test)]
@@ -178,11 +197,11 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(!content.is_empty(), "trace file should not be empty");
 
-        // Third start fails because global subscriber is already installed
+        // Third start fails because session was already used
         let err = start_tracing(path_str).unwrap_err();
         assert!(
-            matches!(err, TracingError::SubscriberInstallFailed(_)),
-            "expected SubscriberInstallFailed, got: {err:?}"
+            matches!(err, TracingError::SessionExhausted),
+            "expected SessionExhausted, got: {err:?}"
         );
 
         // Clean up

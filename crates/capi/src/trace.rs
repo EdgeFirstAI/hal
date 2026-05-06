@@ -44,7 +44,7 @@ use libc::{c_char, c_int};
 /// @return 0 on success, -1 on error
 /// @par Errors (errno):
 /// - EINVAL:   `path` is NULL or not valid UTF-8
-/// - EALREADY: a trace session is already active or was previously stopped
+/// - EALREADY: a trace session is already active or was previously started and stopped
 /// - ENOTSUP: another tracing subscriber was already installed by user code
 /// - ENOSYS:  tracing support not compiled in (built without `tracing` feature)
 ///
@@ -77,7 +77,8 @@ pub unsafe extern "C" fn hal_start_tracing(path: *const c_char) -> c_int {
         };
         match edgefirst_hal::trace::start_tracing(path_str) {
             Ok(()) => 0,
-            Err(edgefirst_hal::trace::TracingError::AlreadyActive) => {
+            Err(edgefirst_hal::trace::TracingError::AlreadyActive)
+            | Err(edgefirst_hal::trace::TracingError::SessionExhausted) => {
                 errno::set_errno(errno::Errno(libc::EALREADY));
                 -1
             }

@@ -1241,9 +1241,9 @@ and can be viewed in [Perfetto UI](https://ui.perfetto.dev/).
 ### How It Works
 
 Library crates (`edgefirst-decoder`, `edgefirst-image`) emit `tracing` spans on
-hot paths. These spans have **zero overhead** when tracing is not active — each
-span site compiles to a single relaxed atomic load that short-circuits when no
-subscriber is installed.
+hot paths. These spans have **near-zero overhead** when tracing is not active —
+each span site compiles to a single relaxed atomic load that short-circuits when
+no subscriber is installed.
 
 When a trace session is started via the API, a subscriber records all span
 enter/exit events with timestamps and structured metadata (detection counts,
@@ -1263,20 +1263,14 @@ proto dimensions, layout, etc.) to a Chrome JSON file.
 
 ### Enabling Tracing
 
-The tracing subscriber is gated behind the `tracing` Cargo feature on the
-`edgefirst-hal`, `edgefirst-hal-capi`, and `edgefirst_hal` (Python) crates.
-The instrumentation spans are always compiled (zero-cost), but the capture
-infrastructure is opt-in.
+The tracing infrastructure is included by default in all crate builds
+(`edgefirst-hal`, `edgefirst-hal-capi`, `edgefirst_hal` Python). No traces are
+captured until the application explicitly starts a session via the API — the
+runtime overhead is near-zero until then. The `tracing` Cargo feature can be
+disabled with `--no-default-features` to remove the capture infrastructure
+entirely (the span sites remain compiled but become true no-ops).
 
 #### Python
-
-Build the wheel with the `tracing` feature:
-
-```bash
-maturin build --release -m crates/python/Cargo.toml --features tracing
-```
-
-Use in code:
 
 ```python
 import edgefirst_hal as hal
@@ -1289,13 +1283,6 @@ with hal.Tracing("/tmp/trace.json"):
 
 #### Rust
 
-Add the feature to your dependency:
-
-```toml
-[dependencies]
-edgefirst-hal = { version = "0.18", features = ["tracing"] }
-```
-
 ```rust
 use edgefirst_hal::trace::{start_tracing, stop_tracing};
 
@@ -1305,12 +1292,6 @@ stop_tracing(); // flushes and closes the trace file
 ```
 
 #### C
-
-Build with the `tracing` feature:
-
-```bash
-cargo build -p edgefirst-hal-capi --features tracing --release
-```
 
 ```c
 #include <edgefirst/hal.h>

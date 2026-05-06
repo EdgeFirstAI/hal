@@ -2598,7 +2598,7 @@ bool hal_quantization_axis(const struct HalTensorQuant *q, size_t *axis_out);
  * @return 0 on success, -1 on error
  * @par Errors (errno):
  * - EINVAL:   `path` is NULL or not valid UTF-8
- * - EALREADY: a trace session is already active or was previously stopped
+ * - EALREADY: a trace session is already active or was previously started and stopped
  * - ENOTSUP: another tracing subscriber was already installed by user code
  * - ENOSYS:  tracing support not compiled in (built without `tracing` feature)
  *
