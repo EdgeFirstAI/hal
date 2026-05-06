@@ -1724,11 +1724,13 @@ class Tracing:
     https://ui.perfetto.dev/.
 
     Only one trace session per process lifetime is supported.  The tracing
-    spans are always compiled into the library but have zero overhead (a single
-    atomic load) until a session is started via this API.
+    spans are always compiled into the library but have near-zero overhead
+    (a single atomic load) until a session is started via this API.
 
-    Build requirement: the ``tracing`` feature must be enabled when building
-    the wheel (``maturin build --features tracing``).
+    The ``tracing`` feature is enabled by default in all builds.  It can be
+    removed with ``--no-default-features`` if the capture infrastructure is
+    not needed (span sites remain compiled at near-zero overhead but cannot
+    be activated for capture).
 
     Usage as context manager (recommended):
 

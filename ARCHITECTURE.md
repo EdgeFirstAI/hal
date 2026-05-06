@@ -1027,6 +1027,182 @@ Raw FFI bindings are wrapped in safe Rust types that enforce correct usage at co
 
 Python wrapper types use a `Py` prefix (e.g., `PyTensor`, `PyPixelFormat`) to clearly distinguish them from their Rust counterparts. The Python `Tensor` class wraps `TensorDyn` internally. This convention makes it explicit which types are Python-facing and which are internal Rust types.
 
+## Performance Tracing Architecture
+
+### Overview
+
+The HAL provides built-in instrumentation for performance analysis using the
+[`tracing`](https://docs.rs/tracing) ecosystem. All library crates emit
+structured span events on hot paths, which can be captured to Chrome JSON trace
+files for visualization in [Perfetto UI](https://ui.perfetto.dev/).
+
+### Design Goals
+
+1. **Near-zero cost when disabled** — no heap allocations, no formatting, no
+   function calls on the hot path when no subscriber is active.
+2. **Always compiled in** — span sites are present in all builds; only the
+   capture infrastructure (subscriber + file writer) is feature-gated.
+3. **Language-agnostic capture API** — Rust, Python, and C callers all use
+   the same underlying mechanism.
+4. **One process, one session** — simplifies the subscriber model and avoids
+   runtime complexity from dynamic subscriber management.
+
+### Zero-Cost Implementation
+
+The `tracing` crate's `trace_span!` macro compiles each span site to:
+
+```text
+static CALLSITE: DefaultCallsite = ...;  // registered once at first use
+if INTEREST.load(Relaxed) != NEVER {     // single atomic load — the "hot path"
+    // subscriber is interested → create span, record fields
+} else {
+    Span::none()                         // disabled span — no work done
+}
+```
+
+When no subscriber is installed (the default state), the interest cache is
+`NEVER` and the entire span creation is skipped. Key properties:
+
+- **No heap allocation**: Field values use `tracing::field::debug(&val)` which
+  stores a reference; actual `Debug` formatting is deferred to the subscriber's
+  record method and only executes when actively tracing.
+- **No string formatting**: The `?field` syntax in `trace_span!` wraps values
+  lazily — the `Display`/`Debug` impl is never called when disabled.
+- **No function calls**: The macro inlines to a single `Relaxed` atomic load
+  followed by a branch-not-taken.
+- **Span.record() guard**: For fields recorded after span creation (e.g.,
+  detection counts computed mid-function), `Span::record()` checks
+  `is_disabled()` and returns immediately when no subscriber cares.
+
+### Span Naming Conventions
+
+| Prefix | Meaning | Example |
+|--------|---------|---------|
+| (none) | Core algorithm phase | `decode`, `nms`, `score_filter` |
+| `cpu_` | CPU backend operation | `cpu_format_convert`, `cpu_resize` |
+| `gl_` | OpenGL backend operation | `gl_convert`, `gl_pass1_to_rgba` |
+| `g2d_` | G2D hardware backend | `g2d_convert` |
+| `py_` | Python binding entry point | `py_decode`, `py_convert` |
+| `gl_pass1_`/`gl_pass2_` | Multi-pass GL sub-operation | `gl_pass1_to_rgba`, `gl_pass2_pack_rgb` |
+
+Field conventions:
+- `n` or `n_*` — counts (detections, candidates, tracks)
+- `mode` — algorithm variant (float/quant, proto/scaled)
+- `*_fmt` — pixel format enum value
+- `*_memory` — tensor memory backend (Dma/Shm/Mem)
+- `layout` — data layout (nhwc/nchw)
+- `pass` — multi-pass identifier (pre_resize/post_resize/direct)
+
+### Crate Layering
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                  Application Code                         │
+├─────────────────────────────────────────────────────────┤
+│  edgefirst-hal (subscriber install, start/stop API)      │
+│  ┌─ tracing-chrome (Chrome JSON writer)                  │
+│  └─ tracing-subscriber (subscriber registry)             │
+├─────────────────────────────────────────────────────────┤
+│  edgefirst-decoder   │ edgefirst-image  │ edgefirst-     │
+│  (decode spans)      │ (convert spans)  │ tracker        │
+│                      │                  │ (update spans) │
+├──────────────────────┴──────────────────┴────────────────┤
+│  edgefirst-tensor (alloc/map spans)                      │
+├─────────────────────────────────────────────────────────┤
+│  tracing crate (span macros, callsite interest cache)    │
+└─────────────────────────────────────────────────────────┘
+```
+
+- **Inner crates** (tensor, image, decoder, tracker) depend on `tracing` as a
+  **required** (non-optional) dependency. The span macros are always compiled.
+  Cost when disabled: one `Relaxed` atomic load per span site.
+- **Top-level crate** (`edgefirst-hal`) gates `tracing-chrome` and
+  `tracing-subscriber` behind the `tracing` feature (default on). These
+  provide the capture infrastructure — the subscriber that actually writes
+  the Chrome JSON file.
+- **Binding crates** (Python, C API) forward the feature flag and provide
+  language-appropriate start/stop APIs.
+
+### Subscriber Model
+
+The HAL uses Rust's **global subscriber** model (`set_global_default`):
+
+- Only one subscriber per process lifetime (Rust's `tracing` design constraint).
+- `start_tracing(path)` installs a Chrome JSON subscriber on first call.
+- `stop_tracing()` drops the `FlushGuard`, flushing buffered spans to disk.
+- After stop, the subscriber remains installed but the guard is gone — a second
+  `start_tracing()` returns `TracingError::SessionExhausted`.
+- If user code installs its own subscriber before calling `start_tracing()`,
+  the HAL returns `TracingError::SubscriberInstallFailed`.
+
+This single-session model is acceptable for profiling workflows where one trace
+per process run is the norm. Applications needing multiple trace files should
+run separate processes.
+
+### Error Handling
+
+The tracing API uses poison-resistant mutex access
+(`unwrap_or_else(|e| e.into_inner())`) to ensure that a panic in one thread
+doesn't permanently poison the tracing state and crash the entire process.
+
+Error variants:
+- `AlreadyActive` — a session is currently capturing
+- `SessionExhausted` — a session was previously started and stopped
+- `SubscriberInstallFailed` — another subscriber was already installed
+
+### Multi-Pass Pipeline Visibility
+
+Image conversion operations that use multiple internal passes emit per-pass
+spans to reveal the breakdown:
+
+**CPU 3-pass pipeline** (format → resize → format):
+```
+image_convert
+└─ cpu_format_convert (pass="pre_resize", from=Nv12, to=Rgb)
+└─ cpu_resize
+└─ cpu_format_convert (pass="post_resize", from=Rgb, to=Rgba)
+```
+
+**OpenGL 2-pass packed RGB**:
+```
+gl_convert
+└─ gl_pass1_to_rgba (dst_w=640, dst_h=480)
+└─ gl_pass2_pack_rgb (render_w=640, render_h=480)
+```
+
+**OpenGL 2-pass Vivante workaround** (NV12→Planar):
+```
+gl_convert
+└─ gl_pass1_to_rgba (dst_w=640, dst_h=480)
+└─ gl_pass2_to_planar (dst_w=640, dst_h=480)
+```
+
+Spans within a multi-pass sequence are non-overlapping — the first pass guard
+is explicitly dropped before the second pass span is entered, producing clean
+sequential slices in the Perfetto timeline.
+
+### Relationship to perf and Benchmarks
+
+The trace instrumentation complements (but does not replace) hardware
+performance counters and microbenchmarks:
+
+| Tool | What It Shows | When to Use |
+|------|---------------|-------------|
+| HAL Tracing | Span-level timing, pipeline structure, per-call metadata | Understanding pipeline structure, finding which stage is slow |
+| `perf record` | Instruction-level CPU hotspots, cache misses, branch mispredictions | Optimizing within a single span (e.g., mask matmul kernel) |
+| HAL Benchmarks | Statistical timing (mean/p95/p99) across many iterations | Measuring improvement from optimizations |
+
+**Recommended workflow** for performance analysis:
+1. Run with HAL tracing to identify the slow span(s)
+2. Use `perf record` targeting the specific operation to find CPU hotspots
+3. Optimize the hotspot
+4. Re-run benchmarks to quantify the improvement
+5. Re-run tracing to confirm the span duration decreased
+
+See [BENCHMARKS.md](BENCHMARKS.md) for benchmark infrastructure details and
+[README.md § Performance Tracing](README.md#performance-tracing) for the
+complete span reference table.
+
 ## EGL/GL Resource Cleanup at Process Shutdown
 
 ### Problem
