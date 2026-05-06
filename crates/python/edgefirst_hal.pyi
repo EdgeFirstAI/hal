@@ -1770,9 +1770,13 @@ class Tracing:
         Installs a process-wide tracing subscriber and begins recording
         spans to the configured file.
 
+        Only one trace session per process lifetime is supported. Once
+        started and stopped, subsequent calls will raise RuntimeError.
+
         Raises:
-            RuntimeError: If a trace session is already active or was
-                previously stopped (only one session per process).
+            RuntimeError: If a trace session is already active, was
+                previously started and stopped (only one session per
+                process lifetime), or if tracing support was not compiled in.
         """
         ...
 
