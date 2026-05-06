@@ -1056,6 +1056,10 @@ The rules for getting the best performance are summarized in the
 rationale (memory backends, image processing strategy, decoder internals)
 is documented in [ARCHITECTURE.md] § Performance Considerations.
 
+Use [Performance Tracing](#performance-tracing) to capture Perfetto traces
+and identify bottlenecks in your pipeline. The trace spans directly correspond
+to the operations described in the optimization rules.
+
 ## Thread Safety
 
 Thread safety of major types:
@@ -1235,31 +1239,77 @@ This prints markdown tables to stdout. Copy the relevant sections into [BENCHMAR
 ## Performance Tracing
 
 The HAL includes built-in instrumentation for capturing detailed performance
-traces of decode and mask operations. Traces are written in Chrome JSON format
+traces across all processing stages. Traces are written in Chrome JSON format
 and can be viewed in [Perfetto UI](https://ui.perfetto.dev/).
 
 ### How It Works
 
-Library crates (`edgefirst-decoder`, `edgefirst-image`) emit `tracing` spans on
-hot paths. These spans have **near-zero overhead** when tracing is not active —
-each span site compiles to a single relaxed atomic load that short-circuits when
-no subscriber is installed.
+All HAL library crates (`edgefirst-decoder`, `edgefirst-image`,
+`edgefirst-tensor`, `edgefirst-tracker`) emit `tracing` spans on hot paths.
+These spans have **near-zero overhead** when tracing is not active — each span
+site compiles to a single relaxed atomic load that short-circuits when no
+subscriber is installed. No heap allocations, no string formatting, and no
+function calls occur on the hot path when tracing is disabled.
 
-When a trace session is started via the API, a subscriber records all span
-enter/exit events with timestamps and structured metadata (detection counts,
-proto dimensions, layout, etc.) to a Chrome JSON file.
+When a trace session is started via the API, a Chrome JSON subscriber records
+all span enter/exit events with high-resolution timestamps and structured
+metadata (detection counts, proto dimensions, format conversions, memory types,
+etc.) to a file. The resulting trace can be loaded into
+[ui.perfetto.dev](https://ui.perfetto.dev/) for interactive timeline analysis.
 
 ### Instrumented Spans
 
-| Span | Location | Fields |
-|------|----------|--------|
-| `decode` | Decode pipeline | `n_candidates`, `n_after_topk`, `n_after_nms`, `n_detections` |
-| `score_filter` | Score threshold + argmax | — |
-| `top_k` | Pre-NMS top-K filter | `k` |
-| `nms` | Class-aware NMS | — |
-| `box_dequant` | Final box dequantization | `n` |
-| `extract_proto` | Proto tensor extraction | `n`, `num_protos`, `layout` |
-| `materialize_masks` | Mask materialization | `mode`, `n_detections`, `width`, `height` |
+The following spans provide full visibility into HAL processing pipelines:
+
+#### Decode Pipeline
+
+| Span | Crate | Fields |
+|------|-------|--------|
+| `decode` | decoder | `mode` (quant_det/float_det/split_quant_det/split_float_det) |
+| `score_filter` | decoder | — |
+| `top_k` | decoder | `k` |
+| `nms` | decoder | — |
+| `box_dequant` | decoder | `n` |
+| `extract_proto` | decoder | `n`, `num_protos`, `layout` |
+| `process_masks` | decoder | `n`, `mode` (float/quant) |
+
+#### Image Processing
+
+| Span | Crate | Fields |
+|------|-------|--------|
+| `image_convert` | image | `src_fmt`, `dst_fmt`, `src_memory`, `dst_memory`, `rotation`, `flip` |
+| `cpu_format_convert` | image | `from`, `to`, `pass` (pre_resize/post_resize/direct) |
+| `cpu_resize` | image | — |
+| `gl_convert` | image | `src_fmt`, `dst_fmt`, `is_int8`, `src_memory`, `dst_memory` |
+| `gl_pass1_to_rgba` | image | `dst_w`, `dst_h` |
+| `gl_pass2_pack_rgb` | image | `render_w`, `render_h` |
+| `gl_pass2_to_planar` | image | `dst_w`, `dst_h` |
+| `g2d_convert` | image | `src_fmt`, `dst_fmt` |
+| `draw_masks` | image | `n_detections`, `n_segmentations` |
+| `materialize_masks` | image | `mode`, `n_detections`, `width`, `height` |
+| `mask_i8_fastpath` | image | `n`, `proto_h`, `proto_w`, `num_protos`, `layout` |
+
+#### Tensor & Tracker
+
+| Span | Crate | Fields |
+|------|-------|--------|
+| `tensor_alloc` | tensor | `shape`, `memory`, `dtype` |
+| `tensor_map` | tensor | `memory` |
+| `tracker_update` | tracker | `n_detections`, `n_tracks` |
+| `predict` | tracker | — |
+| `match_high_conf` | tracker | — |
+| `match_low_conf` | tracker | — |
+
+#### Python Entry Points
+
+| Span | Crate | Fields |
+|------|-------|--------|
+| `py_decode` | python | `n_tensors`, `max_boxes` |
+| `py_decode_tracked` | python | `n_tensors`, `max_boxes` |
+| `py_decode_proto` | python | `n_tensors`, `max_boxes` |
+| `py_convert` | python | — |
+| `py_materialize_masks` | python | — |
+| `py_draw_masks` | python | — |
 
 ### Enabling Tracing
 
@@ -1310,6 +1360,32 @@ hal_stop_tracing();
 Each span appears as a slice on the timeline. Click a slice to see its
 structured fields (detection counts, proto layout, etc.) in the "Current
 Selection" panel.
+
+### Using Traces for Optimization
+
+The trace instrumentation is designed to complement the optimization rules in
+the [Optimization Guide](#optimization-guide) above and the benchmark data in
+[BENCHMARKS.md]:
+
+1. **Identify bottlenecks**: Run your pipeline with tracing enabled to see
+   which spans dominate. Common findings:
+   - `extract_proto` taking >3 ms → model outputs NCHW protos but HAL is
+     transposing (check `layout` field)
+   - `cpu_format_convert` appearing twice → intermediate format conversion
+     steps (consider matching src/dst formats)
+   - `tensor_alloc` appearing per-frame → tensors not being reused (Rule 1)
+
+2. **Validate optimization rules**: After applying a rule from the guide,
+   re-run with tracing to confirm the expected spans disappear or shrink.
+
+3. **Cross-reference with perf**: For CPU-bound spans (mask materialization,
+   NMS), combine trace data with `perf record` to identify instruction-level
+   hotspots within each span. See [BENCHMARKS.md § Measurement Methodology]
+   for the recommended workflow.
+
+4. **Multi-pass pipeline visibility**: The per-pass spans (`cpu_format_convert`
+   with `pass` field, `gl_pass1_*`/`gl_pass2_*`) reveal the internal breakdown
+   of image conversion operations that would otherwise appear as a single block.
 
 ### Limitations
 

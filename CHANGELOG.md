@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-05-05
+
 ### Breaking Changes
 
 - **`MaskResolution::Proto` and `MaskResolution::Scaled` now return binary
@@ -26,6 +28,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Comprehensive tracing instrumentation** across all HAL crates for
+  Perfetto/Chrome JSON profiling. Spans cover decode pipeline, mask
+  materialization, image conversion (per-pass), tracker update, tensor
+  allocation, and Python/C entry points. Enabled by default; near-zero
+  overhead (single atomic load per span site) when no subscriber is active.
+- `hal.Tracing(path)` Python context manager and `hal_start_tracing()` /
+  `hal_stop_tracing()` C API for capturing trace sessions viewable at
+  <https://ui.perfetto.dev/>.
+- `TracingError::SessionExhausted` variant to distinguish "session already
+  used" from "currently active" and "user-installed subscriber" errors.
 - `ProtoData.layout` property in Python and `hal_proto_data_layout()` in C API
   to query proto tensor memory layout (NHWC vs NCHW).
 - Pre-NMS top-K filtering (`Decoder.pre_nms_top_k`) to reduce O(N²) NMS cost.
@@ -41,6 +53,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `tracing` Cargo feature is now enabled by default in `edgefirst-hal`,
+  `edgefirst-hal-capi`, and the Python crate. Trace capture remains opt-in
+  at runtime (call `start_tracing()` to begin recording).
+- C API tracing functions (`hal_start_tracing`, `hal_stop_tracing`,
+  `hal_is_tracing_active`) are always exported regardless of feature flags;
+  return `ENOSYS` when compiled without `tracing` feature.
+- Python `Tracing` class is always available; raises `RuntimeError` when
+  tracing feature is not compiled in.
 - `pre_nms_top_k` is now ignored when `nms=None` (NMS bypass mode preserves
   all above-threshold candidates).
 - Detection output is always sorted by descending score after NMS for
@@ -58,6 +78,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - NCHW stride detection now uses exact stride matching `[W, 1, H*W]` instead
   of the overly broad `strides()[2] > 1` check that could misclassify
   arbitrary strided views as contiguous NCHW buffers.
+- Mutex poisoning in tracing API no longer causes process-wide panics
+  (uses `unwrap_or_else(|e| e.into_inner())` recovery pattern).
 
 ## [0.18.1] - 2026-05-01
 
