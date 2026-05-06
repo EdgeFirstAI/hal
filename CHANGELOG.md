@@ -108,6 +108,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DecoderBuilder::with_max_det`); capacity is purely an allocation
   hint. Previously, callers passing `Vec::new()` (capacity 0) silently
   received zero detections (EDGEAI-1302).
+- `Decoder::decode()` no longer overwrites post-NMS bbox coordinates
+  with the proto-grid-quantized roi from `protobox`. Returned bboxes
+  are now bit-identical to those `Decoder::decode_proto()` produces
+  for the same input. Previously, `decode()` snapped every coordinate
+  to a `1/160` grid, producing bit-identical duplicates on cluttered
+  scenes and corrupting same-class IoU evaluation (EDGEAI-1304).
 
 ## [0.19.0] - 2026-05-05
 

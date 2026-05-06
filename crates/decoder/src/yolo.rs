@@ -1838,10 +1838,12 @@ fn decode_segdet_f32<
     }
     boxes
         .into_par_iter()
-        .map(|mut b| {
+        .map(|b| {
             let ind = b.1;
-            let (protos, roi) = protobox(&protos, &b.0.bbox)?;
-            b.0.bbox = roi;
+            // `protobox` returns the cropped proto slice for `make_segmentation`;
+            // its `roi` is the bbox snapped to the 1/proto-grid step and would
+            // overwrite the precise post-NMS bbox the caller expects (EDGEAI-1304).
+            let (protos, _roi) = protobox(&protos, &b.0.bbox)?;
             Ok((b.0, make_segmentation(masks.row(ind), protos.view())))
         })
         .collect()
@@ -1871,10 +1873,11 @@ pub(crate) fn decode_segdet_quant<
     let total_bits = MASK::zero().count_zeros() + PROTO::zero().count_zeros() + 5; // 32 protos is 2^5
     boxes
         .into_iter()
-        .map(|mut b| {
+        .map(|b| {
             let i = b.1;
-            let (protos, roi) = protobox(&protos, &b.0.bbox.to_canonical())?;
-            b.0.bbox = roi;
+            // See EDGEAI-1304: `roi` is the proto-grid-snapped crop region used
+            // only by `make_segmentation`; the caller's bbox stays untouched.
+            let (protos, _roi) = protobox(&protos, &b.0.bbox.to_canonical())?;
             let seg = match total_bits {
                 0..=64 => make_segmentation_quant::<MASK, PROTO, i64>(
                     masks.row(i),
