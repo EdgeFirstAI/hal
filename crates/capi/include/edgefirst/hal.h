@@ -2599,6 +2599,8 @@ bool hal_quantization_axis(const struct HalTensorQuant *q, size_t *axis_out);
  * @par Errors (errno):
  * - EINVAL:   `path` is NULL or not valid UTF-8
  * - EALREADY: a trace session is already active or was previously stopped
+ * - ENOTSUP: another tracing subscriber was already installed by user code
+ * - ENOSYS:  tracing support not compiled in (built without `tracing` feature)
  *
  * @par Example
  * @code{.c}
@@ -2613,7 +2615,8 @@ int hal_start_tracing(const char *path);
  * Stop trace capture and flush all buffered spans to the output file.
  *
  * After this call the trace file is complete and can be loaded into
- * https://ui.perfetto.dev/. No-op if no session is active.
+ * https://ui.perfetto.dev/. No-op if no session is active or if tracing
+ * support is not compiled in.
  *
  * @par Example
  * @code{.c}
@@ -2627,7 +2630,7 @@ void hal_stop_tracing(void);
 /**
  * Check whether a trace capture session is currently active.
  *
- * @return 1 if tracing is active, 0 otherwise
+ * @return 1 if tracing is active, 0 otherwise (always 0 if tracing not compiled in)
  */
 int hal_is_tracing_active(void);
 

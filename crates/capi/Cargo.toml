@@ -17,7 +17,7 @@ crate-type = ["staticlib", "cdylib"]
 name = "edgefirst_hal"
 
 [features]
-default = []
+default = ["tracing"]
 tracing = ["edgefirst-hal/tracing"]
 
 [dependencies]

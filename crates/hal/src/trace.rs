@@ -135,3 +135,57 @@ pub fn stop_tracing() {
 pub fn is_tracing_active() -> bool {
     GUARD.lock().unwrap().is_some()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    // Single test because the global subscriber is per-process lifetime.
+    #[test]
+    fn test_trace_lifecycle() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("hal_test_trace_lifecycle.json");
+        let path_str = path.to_str().unwrap();
+
+        // Clean up any previous test artifact
+        let _ = std::fs::remove_file(&path);
+
+        assert!(!is_tracing_active());
+
+        // First start should succeed
+        start_tracing(path_str).expect("start_tracing should succeed");
+        assert!(is_tracing_active());
+
+        // Second start while active should fail with AlreadyActive
+        let err = start_tracing(path_str).unwrap_err();
+        assert!(
+            matches!(err, TracingError::AlreadyActive),
+            "expected AlreadyActive, got: {err:?}"
+        );
+
+        // Emit a span to ensure the file gets content
+        {
+            let _span = tracing::trace_span!("test_span", key = "value").entered();
+        }
+
+        // Stop should deactivate
+        stop_tracing();
+        assert!(!is_tracing_active());
+
+        // Trace file should exist with content
+        assert!(Path::new(path_str).exists());
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.is_empty(), "trace file should not be empty");
+
+        // Third start fails because global subscriber is already installed
+        let err = start_tracing(path_str).unwrap_err();
+        assert!(
+            matches!(err, TracingError::SubscriberInstallFailed(_)),
+            "expected SubscriberInstallFailed, got: {err:?}"
+        );
+
+        // Clean up
+        let _ = std::fs::remove_file(&path);
+    }
+}

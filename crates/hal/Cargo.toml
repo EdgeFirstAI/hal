@@ -13,7 +13,7 @@ categories = ["multimedia::images", "science", "embedded"]
 documentation = "https://docs.rs/edgefirst-hal"
 
 [features]
-default = ["ndarray", "opengl"]
+default = ["ndarray", "opengl", "tracing"]
 ndarray = ["edgefirst-tensor/ndarray"]
 opengl = ["edgefirst-image/opengl"]
 tracker = ["edgefirst-decoder/tracker", "edgefirst-image/tracker", "edgefirst-tracker"]
