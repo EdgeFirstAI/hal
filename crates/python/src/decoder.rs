@@ -679,6 +679,14 @@ impl PyDecoder {
         }
     }
 
+    /// Decode model outputs into (boxes, scores, classes, masks) tuples.
+    ///
+    /// `max_boxes` is a per-call **post-truncate cap** layered on top of
+    /// the decoder's own `max_det` (default 300, set via the builder or
+    /// `Decoder.max_det`). The smaller of the two wins. `max_boxes` also
+    /// pre-allocates the output `Vec` capacity, but capacity itself is
+    /// never used as a semantic bound by the underlying Rust decoder
+    /// (see EDGEAI-1302).
     #[pyo3(signature = (model_output, max_boxes=100))]
     pub fn decode<'py>(
         self_: PyRef<'py, Self>,
@@ -762,7 +770,11 @@ impl PyDecoder {
     ///     platforms.
     ///
     /// :param model_output: list of output :class:`Tensor` from model inference
-    /// :param max_boxes: maximum number of detections to return
+    /// :param max_boxes: pre-allocates ``output_boxes`` capacity. Acts as
+    ///     a per-call upper bound only inasmuch as it sizes the buffer;
+    ///     the actual detection-count cap is the decoder's
+    ///     :attr:`~Decoder.max_det` (default 300, see ``EDGEAI-1302``).
+    ///     Buffer capacity itself is never consulted by the Rust decoder.
     /// :returns: ``(boxes, scores, classes, proto_data)`` where ``proto_data``
     ///     is ``None`` for detection-only models
     /// :rtype: tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray, ProtoData | None]

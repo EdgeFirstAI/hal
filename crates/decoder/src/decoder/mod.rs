@@ -793,6 +793,16 @@ impl Decoder {
     /// * `output_boxes` - Destination for decoded detection boxes (cleared first)
     /// * `output_masks` - Destination for decoded segmentation masks (cleared first)
     ///
+    /// # `output_boxes` / `output_masks` capacity
+    ///
+    /// The capacity of the supplied `Vec`s is **only** an allocation hint —
+    /// it is **not** a cap on the number of detections returned. The
+    /// post-NMS detection count is bounded by [`Decoder::max_det`] (set
+    /// via [`DecoderBuilder::with_max_det`], default `300`). Passing
+    /// `Vec::new()` (capacity 0) returns up to `max_det` detections;
+    /// pre-allocating with [`Vec::with_capacity`] only avoids the
+    /// reallocation when the decoder grows the buffer.
+    ///
     /// # Errors
     ///
     /// Returns `DecoderError` if tensor mapping fails, dtypes are unsupported,
@@ -863,6 +873,14 @@ impl Decoder {
     ///
     /// * `outputs` - Tensor outputs from model inference
     /// * `output_boxes` - Destination for decoded detection boxes (cleared first)
+    ///
+    /// # `output_boxes` capacity
+    ///
+    /// The capacity of `output_boxes` is **only** an allocation hint — it
+    /// is **not** a cap on the number of detections returned. The
+    /// post-NMS detection count is bounded by [`Decoder::max_det`] (set
+    /// via [`DecoderBuilder::with_max_det`], default `300`). Passing
+    /// `Vec::new()` (capacity 0) returns up to `max_det` detections.
     ///
     /// # Errors
     ///

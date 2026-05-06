@@ -102,6 +102,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failed at plan time.
 - Per-scale TFLite schemas no longer require validator NumPy-NMS
   fallback; the HAL handles them natively.
+- `Decoder::decode()` and `Decoder::decode_proto()` no longer treat
+  `output_boxes.capacity()` as a `max_det` cap. The post-NMS detection
+  count is now bounded only by `Decoder::max_det` (default 300, set via
+  `DecoderBuilder::with_max_det`); capacity is purely an allocation
+  hint. Previously, callers passing `Vec::new()` (capacity 0) silently
+  received zero detections (EDGEAI-1302).
 
 ## [0.19.0] - 2026-05-05
 
