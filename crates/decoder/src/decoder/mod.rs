@@ -11,7 +11,7 @@ pub mod configs;
 
 use configs::ModelType;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Decoder {
     model_type: ModelType,
     pub iou_threshold: f32,
@@ -45,12 +45,17 @@ pub struct Decoder {
     /// physical children. Absent for flat configurations (v1 and
     /// flat-v2).
     pub(crate) decode_program: Option<merge::DecodeProgram>,
+    /// Per-scale fast path. Constructed at build time from a schema-v2
+    /// document with per-scale children. Wrapped in `Mutex` because
+    /// `Decoder::decode_proto` and `Decoder::decode` are `&self` but
+    /// the per-scale buffers are mutated per-frame.
+    pub(crate) per_scale: Option<std::sync::Mutex<crate::per_scale::PerScaleDecoder>>,
 }
 
 impl PartialEq for Decoder {
     fn eq(&self, other: &Self) -> bool {
-        // DecodeProgram has non-comparable embedded data; compare by
-        // the config-derived fields only.
+        // DecodeProgram and PerScaleDecoder have non-comparable embedded
+        // data; compare by the config-derived fields only.
         self.model_type == other.model_type
             && self.iou_threshold == other.iou_threshold
             && self.score_threshold == other.score_threshold
@@ -59,6 +64,29 @@ impl PartialEq for Decoder {
             && self.max_det == other.max_det
             && self.normalized == other.normalized
             && self.decode_program.is_some() == other.decode_program.is_some()
+            && self.per_scale.is_some() == other.per_scale.is_some()
+    }
+}
+
+impl Clone for Decoder {
+    /// Cloning a `Decoder` preserves the legacy decode path
+    /// (`decode_program`) but drops the per-scale fast path:
+    /// `PerScaleDecoder` owns mutable per-frame scratch buffers and is
+    /// not `Clone`. Decoders built from a per-scale schema should be
+    /// rebuilt via [`DecoderBuilder`] rather than cloned to preserve the
+    /// fast path; cloning is intended for tests and rare configs.
+    fn clone(&self) -> Self {
+        Self {
+            model_type: self.model_type.clone(),
+            iou_threshold: self.iou_threshold,
+            score_threshold: self.score_threshold,
+            nms: self.nms,
+            pre_nms_top_k: self.pre_nms_top_k,
+            max_det: self.max_det,
+            normalized: self.normalized,
+            decode_program: self.decode_program.clone(),
+            per_scale: None,
+        }
     }
 }
 
@@ -181,6 +209,7 @@ mod builder;
 mod dfl;
 mod helpers;
 mod merge;
+mod per_scale_bridge;
 mod postprocess;
 mod tensor_bridge;
 mod tests;
@@ -353,6 +382,9 @@ impl Decoder {
                 output_boxes,
                 output_masks,
             ),
+            ModelType::PerScale => Err(DecoderError::Internal(
+                "per-scale path must be intercepted before ModelType dispatch".into(),
+            )),
         }
     }
 
@@ -477,6 +509,11 @@ impl Decoder {
                     output_boxes,
                     output_masks,
                 )?;
+            }
+            ModelType::PerScale => {
+                return Err(DecoderError::Internal(
+                    "per-scale path must be intercepted before ModelType dispatch".into(),
+                ));
             }
         }
         Ok(())
@@ -603,6 +640,9 @@ impl Decoder {
                 )?;
                 Ok(Some(proto))
             }
+            ModelType::PerScale => Err(DecoderError::Internal(
+                "per-scale path must be intercepted before ModelType dispatch".into(),
+            )),
         }
     }
 
@@ -731,6 +771,9 @@ impl Decoder {
                 )?;
                 Ok(Some(proto))
             }
+            ModelType::PerScale => Err(DecoderError::Internal(
+                "per-scale path must be intercepted before ModelType dispatch".into(),
+            )),
         }
     }
 
@@ -760,6 +803,25 @@ impl Decoder {
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
     ) -> Result<(), DecoderError> {
+        // Per-scale fast path — selected at builder time when the schema
+        // declares per-scale children with DFL or LTRB encoding.
+        if let Some(per_scale_mutex) = &self.per_scale {
+            let mut ps = per_scale_mutex
+                .lock()
+                .map_err(|e| DecoderError::Internal(format!("per_scale mutex poisoned: {e}")))?;
+            let decoded = ps.run(outputs)?;
+            return per_scale_bridge::per_scale_to_masks(
+                &decoded,
+                output_boxes,
+                output_masks,
+                self.iou_threshold,
+                self.score_threshold,
+                self.nms,
+                self.pre_nms_top_k,
+                self.max_det,
+            );
+        }
+
         // Schema v2 merge path: dequantize physical children into
         // logical float32 tensors, then feed through the float dispatch.
         if let Some(program) = &self.decode_program {
@@ -811,6 +873,24 @@ impl Decoder {
         outputs: &[&edgefirst_tensor::TensorDyn],
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<Option<ProtoData>, DecoderError> {
+        // Per-scale fast path — selected at builder time when the schema
+        // declares per-scale children with DFL or LTRB encoding.
+        if let Some(per_scale_mutex) = &self.per_scale {
+            let mut ps = per_scale_mutex
+                .lock()
+                .map_err(|e| DecoderError::Internal(format!("per_scale mutex poisoned: {e}")))?;
+            let decoded = ps.run(outputs)?;
+            return per_scale_bridge::per_scale_to_proto_data(
+                &decoded,
+                output_boxes,
+                self.iou_threshold,
+                self.score_threshold,
+                self.nms,
+                self.pre_nms_top_k,
+                self.max_det,
+            );
+        }
+
         // Schema v2 merge path: dequantize physical children into
         // logical float32 tensors, then feed through the float dispatch.
         if let Some(program) = &self.decode_program {
@@ -839,6 +919,35 @@ impl Decoder {
             }
         };
         result
+    }
+
+    /// Run the per-scale pipeline and return pre-NMS buffers as owned f32.
+    ///
+    /// Test-only entry point used by the parity-fixture tests to compare
+    /// HAL stage output against the NumPy reference's stage output
+    /// without NMS ordering noise. Returns an error if the decoder
+    /// isn't configured for per-scale decoding.
+    #[doc(hidden)]
+    pub fn _testing_run_per_scale_pre_nms(
+        &self,
+        outputs: &[&edgefirst_tensor::TensorDyn],
+    ) -> Result<crate::per_scale::PreNmsCapture, crate::error::DecoderError> {
+        let mutex = self.per_scale.as_ref().ok_or_else(|| {
+            crate::error::DecoderError::Internal("decoder not configured for per-scale".into())
+        })?;
+        let mut ps = mutex.lock().map_err(|e| {
+            crate::error::DecoderError::Internal(format!("per_scale mutex poisoned: {e}"))
+        })?;
+        // Drop the borrowed view immediately so we can reborrow buffers below.
+        {
+            ps.run(outputs)?;
+        }
+        let total_anchors = ps.plan.total_anchors;
+        let num_classes = ps.plan.num_classes;
+        let num_mc = ps.plan.num_mask_coefs;
+        Ok(ps
+            .buffers
+            .snapshot_owned_f32(total_anchors, num_classes, num_mc))
     }
 }
 
@@ -1316,6 +1425,16 @@ impl Decoder {
         output_masks: &mut Vec<Segmentation>,
         output_tracks: &mut Vec<edgefirst_tracker::TrackInfo>,
     ) -> Result<(), DecoderError> {
+        // Per-scale fast path: route via the basic decode then update the
+        // tracker. Phase 1 keeps the tracker integration simple; per-frame
+        // decoupling between detection and tracking is preserved.
+        if self.per_scale.is_some() {
+            output_tracks.clear();
+            self.decode(outputs, output_boxes, output_masks)?;
+            Self::update_tracker(tracker, timestamp, output_boxes, output_tracks);
+            return Ok(());
+        }
+
         let mapped = tensor_bridge::map_tensors(outputs)?;
         match &mapped {
             tensor_bridge::MappedOutputs::Quantized(maps) => {
@@ -1392,6 +1511,15 @@ impl Decoder {
         output_boxes: &mut Vec<DetectBox>,
         output_tracks: &mut Vec<edgefirst_tracker::TrackInfo>,
     ) -> Result<Option<ProtoData>, DecoderError> {
+        // Per-scale fast path: route via the basic decode_proto then
+        // update the tracker on the resulting boxes.
+        if self.per_scale.is_some() {
+            output_tracks.clear();
+            let proto = self.decode_proto(outputs, output_boxes)?;
+            Self::update_tracker(tracker, timestamp, output_boxes, output_tracks);
+            return Ok(proto);
+        }
+
         let mapped = tensor_bridge::map_tensors(outputs)?;
         match &mapped {
             tensor_bridge::MappedOutputs::Quantized(maps) => {

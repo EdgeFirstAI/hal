@@ -201,6 +201,27 @@ pub struct LogicalOutput {
     /// permitted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outputs: Vec<PhysicalOutput>,
+
+    /// Activation already applied by the model graph or runtime. The
+    /// HAL must NOT re-apply an activation declared here.
+    ///
+    /// On per-scale models the converter writes this on the logical
+    /// parent (e.g. `scores.activation_applied = sigmoid`) when the
+    /// model graph already includes the activation; the per-physical
+    /// children inherit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_applied: Option<Activation>,
+
+    /// Activation NOT yet applied. The HAL MUST apply the declared
+    /// activation before consuming the tensor.
+    ///
+    /// On per-scale models the converter writes this on the logical
+    /// parent (e.g. `scores.activation_required = sigmoid`) when the
+    /// score-activation step was stripped from the model graph and
+    /// must be re-applied by the runtime; per-physical children
+    /// inherit the parent's declaration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_required: Option<Activation>,
 }
 
 impl LogicalOutput {
@@ -516,6 +537,7 @@ pub enum BoxEncoding {
     Dfl,
     /// Direct 4-channel coordinates, already decoded (YOLO26,
     /// ARA-2 post-split).
+    #[serde(alias = "ltrb")]
     Direct,
     /// Anchor-based grid offsets with sigmoid + anchor-scale transform
     /// per cell (YOLOv5, SSD MobileNet, ModelPack).
@@ -970,6 +992,8 @@ fn logical_from_v1(v1: &ConfigOutput) -> DecoderResult<LogicalOutput> {
                 dtype: None,
                 quantization: quantization_from_v1(d.quantization),
                 outputs: Vec::new(),
+                activation_applied: None,
+                activation_required: None,
             })
         }
         ConfigOutput::Boxes(b) => Ok(LogicalOutput {
@@ -989,6 +1013,8 @@ fn logical_from_v1(v1: &ConfigOutput) -> DecoderResult<LogicalOutput> {
             dtype: None,
             quantization: quantization_from_v1(b.quantization),
             outputs: Vec::new(),
+            activation_applied: None,
+            activation_required: None,
         }),
         ConfigOutput::Scores(s) => Ok(LogicalOutput {
             name: None,
@@ -1007,6 +1033,8 @@ fn logical_from_v1(v1: &ConfigOutput) -> DecoderResult<LogicalOutput> {
             dtype: None,
             quantization: quantization_from_v1(s.quantization),
             outputs: Vec::new(),
+            activation_applied: None,
+            activation_required: None,
         }),
         ConfigOutput::Protos(p) => Ok(LogicalOutput {
             name: None,
@@ -1023,6 +1051,8 @@ fn logical_from_v1(v1: &ConfigOutput) -> DecoderResult<LogicalOutput> {
             dtype: None,
             quantization: quantization_from_v1(p.quantization),
             outputs: Vec::new(),
+            activation_applied: None,
+            activation_required: None,
         }),
         ConfigOutput::MaskCoefficients(m) => Ok(LogicalOutput {
             name: None,
@@ -1038,6 +1068,8 @@ fn logical_from_v1(v1: &ConfigOutput) -> DecoderResult<LogicalOutput> {
             dtype: None,
             quantization: quantization_from_v1(m.quantization),
             outputs: Vec::new(),
+            activation_applied: None,
+            activation_required: None,
         }),
         ConfigOutput::Segmentation(seg) => Ok(LogicalOutput {
             name: None,
@@ -1053,6 +1085,8 @@ fn logical_from_v1(v1: &ConfigOutput) -> DecoderResult<LogicalOutput> {
             dtype: None,
             quantization: quantization_from_v1(seg.quantization),
             outputs: Vec::new(),
+            activation_applied: None,
+            activation_required: None,
         }),
         ConfigOutput::Mask(m) => Ok(LogicalOutput {
             name: None,
@@ -1068,6 +1102,8 @@ fn logical_from_v1(v1: &ConfigOutput) -> DecoderResult<LogicalOutput> {
             dtype: None,
             quantization: quantization_from_v1(m.quantization),
             outputs: Vec::new(),
+            activation_applied: None,
+            activation_required: None,
         }),
         ConfigOutput::Classes(c) => Ok(LogicalOutput {
             name: None,
@@ -1083,6 +1119,8 @@ fn logical_from_v1(v1: &ConfigOutput) -> DecoderResult<LogicalOutput> {
             dtype: None,
             quantization: quantization_from_v1(c.quantization),
             outputs: Vec::new(),
+            activation_applied: None,
+            activation_required: None,
         }),
     }
 }
@@ -1310,6 +1348,31 @@ mod tests {
         let s = SchemaV2::default();
         assert_eq!(s.schema_version, 2);
         assert!(s.outputs.is_empty());
+    }
+
+    #[test]
+    fn fixtures_round_trip_through_serde() {
+        let yolov8 = include_str!("../../../testdata/per_scale/synthetic_yolov8n_schema.json");
+        let _: super::SchemaV2 = serde_json::from_str(yolov8).expect("yolov8n fixture must parse");
+
+        let yolo26 = include_str!("../../../testdata/per_scale/synthetic_yolo26n_schema.json");
+        let _: super::SchemaV2 = serde_json::from_str(yolo26).expect("yolo26n fixture must parse");
+
+        let flat = include_str!("../../../testdata/per_scale/synthetic_flat_schema.json");
+        let _: super::SchemaV2 = serde_json::from_str(flat).expect("flat fixture must parse");
+    }
+
+    #[test]
+    fn box_encoding_accepts_ltrb_alias_for_direct() {
+        let dfl: BoxEncoding = serde_json::from_str("\"dfl\"").unwrap();
+        assert_eq!(dfl, BoxEncoding::Dfl);
+
+        let direct: BoxEncoding = serde_json::from_str("\"direct\"").unwrap();
+        assert_eq!(direct, BoxEncoding::Direct);
+
+        // yolo26 metadata uses "ltrb" — must deserialise to Direct.
+        let ltrb: BoxEncoding = serde_json::from_str("\"ltrb\"").unwrap();
+        assert_eq!(ltrb, BoxEncoding::Direct);
     }
 
     #[test]
@@ -1720,6 +1783,8 @@ mod tests {
                 dtype: Some(DType::Float32),
                 quantization: None,
                 outputs: vec![],
+                activation_applied: None,
+                activation_required: None,
             }],
             nms: Some(NmsMode::ClassAgnostic),
             decoder_version: Some(DecoderVersion::Yolov8),
@@ -1915,6 +1980,8 @@ mod tests {
                     dtype: None,
                     quantization: None,
                     outputs: vec![],
+                    activation_applied: None,
+                    activation_required: None,
                 },
                 LogicalOutput {
                     name: Some("boxes".into()),
@@ -1930,6 +1997,8 @@ mod tests {
                     dtype: None,
                     quantization: None,
                     outputs: vec![],
+                    activation_applied: None,
+                    activation_required: None,
                 },
             ],
             nms: None,
@@ -1970,6 +2039,8 @@ mod tests {
                 dtype: None,
                 quantization: None,
                 outputs: vec![],
+                activation_applied: None,
+                activation_required: None,
             }],
             nms: None,
             decoder_version: None,

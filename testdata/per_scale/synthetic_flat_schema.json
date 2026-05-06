@@ -1,0 +1,33 @@
+{
+  "schema_version": 2,
+  "decoder_version": "yolov8",
+  "nms": "class_agnostic",
+  "input": {
+    "shape": [1, 640, 640, 3],
+    "dshape": [{"batch": 1}, {"height": 640}, {"width": 640}, {"num_features": 3}],
+    "cameraadaptor": "rgb"
+  },
+  "outputs": [
+    {
+      "name": "boxes",
+      "type": "boxes",
+      "shape": [1, 4, 8400],
+      "dshape": [{"batch": 1}, {"box_coords": 4}, {"num_boxes": 8400}],
+      "encoding": "direct",
+      "decoder": "ultralytics",
+      "normalized": true,
+      "dtype": "int8",
+      "quantization": {"scale": 0.00392, "zero_point": 0, "dtype": "int8"}
+    },
+    {
+      "name": "scores",
+      "type": "scores",
+      "shape": [1, 80, 8400],
+      "dshape": [{"batch": 1}, {"num_classes": 80}, {"num_boxes": 8400}],
+      "decoder": "ultralytics",
+      "score_format": "per_class",
+      "dtype": "int8",
+      "quantization": {"scale": 0.00392, "zero_point": -128, "dtype": "int8"}
+    }
+  ]
+}

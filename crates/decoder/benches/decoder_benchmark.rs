@@ -9,11 +9,14 @@ use edgefirst_decoder::{
     dequant_detect_box, dequantize_cpu, dequantize_cpu_chunked, dequantize_ndarray,
     float::{nms_float, postprocess_boxes_float},
     modelpack::{decode_modelpack_det, decode_modelpack_split_quant, ModelPackDetectionConfig},
+    per_scale::DecodeDtype,
+    schema::SchemaV2,
     yolo::{
         decode_yolo_det, decode_yolo_det_float, decode_yolo_segdet_float, decode_yolo_segdet_quant,
     },
-    Nms, Quantization, XYWH,
+    DecoderBuilder, Nms, Quantization, XYWH,
 };
+use edgefirst_tensor::{Quantization as TQ, Tensor, TensorDyn, TensorMemory};
 use ndarray::s;
 
 const WARMUP: usize = 10;
@@ -427,6 +430,240 @@ fn bench_masks_i8(suite: &mut BenchSuite) {
     suite.record(&result);
 }
 
+/// Build a per-scale-capable decoder for benchmarking, plus the 6
+/// zero-int8 input tensors (3 box levels + 3 score levels) with
+/// attached quantization.
+///
+/// Schema: yolov8n-style 3-level DFL detection-only (no mc, no
+/// protos). Detection-only avoids the legacy validator's mc/protos
+/// dshape requirements while still exercising the full DFL kernel
+/// path on a realistic 8400-anchor workload.
+fn build_dfl_per_scale_bench_inputs(
+    out_dtype: DecodeDtype,
+) -> (edgefirst_decoder::Decoder, Vec<TensorDyn>) {
+    let schema_json = r#"{
+        "schema_version": 2,
+        "nms": "class_agnostic",
+        "input": {
+            "shape": [1, 640, 640, 3],
+            "dshape": [{"batch": 1}, {"height": 640}, {"width": 640}, {"num_features": 3}],
+            "cameraadaptor": "rgb"
+        },
+        "outputs": [
+            {
+                "name": "boxes", "type": "boxes",
+                "shape": [1, 4, 8400],
+                "dshape": [{"batch": 1}, {"box_coords": 4}, {"num_boxes": 8400}],
+                "encoding": "dfl", "decoder": "ultralytics", "normalized": true,
+                "outputs": [
+                    {"name": "boxes_0", "type": "boxes", "stride": 8, "scale_index": 0,
+                     "shape": [1, 80, 80, 64], "dshape": [{"batch": 1}, {"height": 80}, {"width": 80}, {"num_features": 64}],
+                     "dtype": "int8", "quantization": {"scale": 0.1, "zero_point": 0, "dtype": "int8"}},
+                    {"name": "boxes_1", "type": "boxes", "stride": 16, "scale_index": 1,
+                     "shape": [1, 40, 40, 64], "dshape": [{"batch": 1}, {"height": 40}, {"width": 40}, {"num_features": 64}],
+                     "dtype": "int8", "quantization": {"scale": 0.1, "zero_point": 0, "dtype": "int8"}},
+                    {"name": "boxes_2", "type": "boxes", "stride": 32, "scale_index": 2,
+                     "shape": [1, 20, 20, 64], "dshape": [{"batch": 1}, {"height": 20}, {"width": 20}, {"num_features": 64}],
+                     "dtype": "int8", "quantization": {"scale": 0.1, "zero_point": 0, "dtype": "int8"}}
+                ]
+            },
+            {
+                "name": "scores", "type": "scores",
+                "shape": [1, 80, 8400],
+                "dshape": [{"batch": 1}, {"num_classes": 80}, {"num_boxes": 8400}],
+                "score_format": "per_class", "decoder": "ultralytics",
+                "outputs": [
+                    {"name": "scores_0", "type": "scores", "stride": 8, "scale_index": 0,
+                     "shape": [1, 80, 80, 80], "dshape": [{"batch": 1}, {"height": 80}, {"width": 80}, {"num_classes": 80}],
+                     "activation_required": "sigmoid",
+                     "dtype": "int8", "quantization": {"scale": 0.1, "zero_point": 0, "dtype": "int8"}},
+                    {"name": "scores_1", "type": "scores", "stride": 16, "scale_index": 1,
+                     "shape": [1, 40, 40, 80], "dshape": [{"batch": 1}, {"height": 40}, {"width": 40}, {"num_classes": 80}],
+                     "activation_required": "sigmoid",
+                     "dtype": "int8", "quantization": {"scale": 0.1, "zero_point": 0, "dtype": "int8"}},
+                    {"name": "scores_2", "type": "scores", "stride": 32, "scale_index": 2,
+                     "shape": [1, 20, 20, 80], "dshape": [{"batch": 1}, {"height": 20}, {"width": 20}, {"num_classes": 80}],
+                     "activation_required": "sigmoid",
+                     "dtype": "int8", "quantization": {"scale": 0.1, "zero_point": 0, "dtype": "int8"}}
+                ]
+            }
+        ]
+    }"#;
+    let schema: SchemaV2 = serde_json::from_str(schema_json).expect("schema parse");
+
+    let decoder = DecoderBuilder::default()
+        .with_schema(schema)
+        .with_decode_dtype(out_dtype)
+        .with_iou_threshold(0.7)
+        .with_score_threshold(0.25)
+        .with_nms(Some(Nms::ClassAgnostic))
+        .build()
+        .expect("decoder build");
+
+    let shapes: [&[usize]; 6] = [
+        &[1, 80, 80, 64],
+        &[1, 80, 80, 80],
+        &[1, 40, 40, 64],
+        &[1, 40, 40, 80],
+        &[1, 20, 20, 64],
+        &[1, 20, 20, 80],
+    ];
+    let tensors: Vec<TensorDyn> = shapes
+        .iter()
+        .map(|s| {
+            let mut t = Tensor::<i8>::new(s, Some(TensorMemory::Mem), None).unwrap();
+            t.set_quantization(TQ::per_tensor(0.1, 0)).unwrap();
+            TensorDyn::I8(t)
+        })
+        .collect();
+
+    (decoder, tensors)
+}
+
+/// Build LTRB variant of the same bench setup. Detection-only, 3 levels,
+/// 4-channel boxes (yolo26 style).
+fn build_ltrb_per_scale_bench_inputs(
+    out_dtype: DecodeDtype,
+) -> (edgefirst_decoder::Decoder, Vec<TensorDyn>) {
+    let schema_json = r#"{
+        "schema_version": 2,
+        "nms": "class_agnostic",
+        "input": {
+            "shape": [1, 640, 640, 3],
+            "dshape": [{"batch": 1}, {"height": 640}, {"width": 640}, {"num_features": 3}],
+            "cameraadaptor": "rgb"
+        },
+        "outputs": [
+            {
+                "name": "boxes", "type": "boxes",
+                "shape": [1, 4, 8400],
+                "dshape": [{"batch": 1}, {"box_coords": 4}, {"num_boxes": 8400}],
+                "encoding": "ltrb", "decoder": "ultralytics", "normalized": true,
+                "outputs": [
+                    {"name": "boxes_0", "type": "boxes", "stride": 8, "scale_index": 0,
+                     "shape": [1, 80, 80, 4], "dshape": [{"batch": 1}, {"height": 80}, {"width": 80}, {"box_coords": 4}],
+                     "dtype": "int8", "quantization": {"scale": 0.1, "zero_point": 0, "dtype": "int8"}},
+                    {"name": "boxes_1", "type": "boxes", "stride": 16, "scale_index": 1,
+                     "shape": [1, 40, 40, 4], "dshape": [{"batch": 1}, {"height": 40}, {"width": 40}, {"box_coords": 4}],
+                     "dtype": "int8", "quantization": {"scale": 0.1, "zero_point": 0, "dtype": "int8"}},
+                    {"name": "boxes_2", "type": "boxes", "stride": 32, "scale_index": 2,
+                     "shape": [1, 20, 20, 4], "dshape": [{"batch": 1}, {"height": 20}, {"width": 20}, {"box_coords": 4}],
+                     "dtype": "int8", "quantization": {"scale": 0.1, "zero_point": 0, "dtype": "int8"}}
+                ]
+            },
+            {
+                "name": "scores", "type": "scores",
+                "shape": [1, 80, 8400],
+                "dshape": [{"batch": 1}, {"num_classes": 80}, {"num_boxes": 8400}],
+                "score_format": "per_class", "decoder": "ultralytics",
+                "outputs": [
+                    {"name": "scores_0", "type": "scores", "stride": 8, "scale_index": 0,
+                     "shape": [1, 80, 80, 80], "dshape": [{"batch": 1}, {"height": 80}, {"width": 80}, {"num_classes": 80}],
+                     "activation_required": "sigmoid",
+                     "dtype": "int8", "quantization": {"scale": 0.1, "zero_point": 0, "dtype": "int8"}},
+                    {"name": "scores_1", "type": "scores", "stride": 16, "scale_index": 1,
+                     "shape": [1, 40, 40, 80], "dshape": [{"batch": 1}, {"height": 40}, {"width": 40}, {"num_classes": 80}],
+                     "activation_required": "sigmoid",
+                     "dtype": "int8", "quantization": {"scale": 0.1, "zero_point": 0, "dtype": "int8"}},
+                    {"name": "scores_2", "type": "scores", "stride": 32, "scale_index": 2,
+                     "shape": [1, 20, 20, 80], "dshape": [{"batch": 1}, {"height": 20}, {"width": 20}, {"num_classes": 80}],
+                     "activation_required": "sigmoid",
+                     "dtype": "int8", "quantization": {"scale": 0.1, "zero_point": 0, "dtype": "int8"}}
+                ]
+            }
+        ]
+    }"#;
+    let schema: SchemaV2 = serde_json::from_str(schema_json).expect("schema parse");
+
+    let decoder = DecoderBuilder::default()
+        .with_schema(schema)
+        .with_decode_dtype(out_dtype)
+        .with_iou_threshold(0.7)
+        .with_score_threshold(0.25)
+        .with_nms(Some(Nms::ClassAgnostic))
+        .build()
+        .expect("decoder build");
+
+    let shapes: [&[usize]; 6] = [
+        &[1, 80, 80, 4],
+        &[1, 80, 80, 80],
+        &[1, 40, 40, 4],
+        &[1, 40, 40, 80],
+        &[1, 20, 20, 4],
+        &[1, 20, 20, 80],
+    ];
+    let tensors: Vec<TensorDyn> = shapes
+        .iter()
+        .map(|s| {
+            let mut t = Tensor::<i8>::new(s, Some(TensorMemory::Mem), None).unwrap();
+            t.set_quantization(TQ::per_tensor(0.1, 0)).unwrap();
+            TensorDyn::I8(t)
+        })
+        .collect();
+
+    (decoder, tensors)
+}
+
+fn bench_per_scale_dfl_i8_to_f32(suite: &mut BenchSuite) {
+    let (decoder, tensors) = build_dfl_per_scale_bench_inputs(DecodeDtype::F32);
+    let inputs: Vec<&TensorDyn> = tensors.iter().collect();
+
+    let result = run_bench(
+        "decoder/per_scale/dfl_i8_to_f32",
+        WARMUP,
+        ITERATIONS,
+        || {
+            let mut output_boxes = Vec::with_capacity(50);
+            let mut masks = Vec::new();
+            decoder
+                .decode(&inputs, &mut output_boxes, &mut masks)
+                .unwrap();
+        },
+    );
+    result.print_summary();
+    suite.record(&result);
+}
+
+fn bench_per_scale_dfl_i8_to_f16(suite: &mut BenchSuite) {
+    let (decoder, tensors) = build_dfl_per_scale_bench_inputs(DecodeDtype::F16);
+    let inputs: Vec<&TensorDyn> = tensors.iter().collect();
+
+    let result = run_bench(
+        "decoder/per_scale/dfl_i8_to_f16",
+        WARMUP,
+        ITERATIONS,
+        || {
+            let mut output_boxes = Vec::with_capacity(50);
+            let mut masks = Vec::new();
+            decoder
+                .decode(&inputs, &mut output_boxes, &mut masks)
+                .unwrap();
+        },
+    );
+    result.print_summary();
+    suite.record(&result);
+}
+
+fn bench_per_scale_ltrb_i8_to_f32(suite: &mut BenchSuite) {
+    let (decoder, tensors) = build_ltrb_per_scale_bench_inputs(DecodeDtype::F32);
+    let inputs: Vec<&TensorDyn> = tensors.iter().collect();
+
+    let result = run_bench(
+        "decoder/per_scale/ltrb_i8_to_f32",
+        WARMUP,
+        ITERATIONS,
+        || {
+            let mut output_boxes = Vec::with_capacity(50);
+            let mut masks = Vec::new();
+            decoder
+                .decode(&inputs, &mut output_boxes, &mut masks)
+                .unwrap();
+        },
+    );
+    result.print_summary();
+    suite.record(&result);
+}
+
 fn main() {
     env_logger::init();
 
@@ -460,6 +697,11 @@ fn main() {
     println!("\n== Masks ==\n");
     bench_masks_f32(&mut suite);
     bench_masks_i8(&mut suite);
+
+    println!("\n== Per-Scale ==\n");
+    bench_per_scale_dfl_i8_to_f32(&mut suite);
+    bench_per_scale_dfl_i8_to_f16(&mut suite);
+    bench_per_scale_ltrb_i8_to_f32(&mut suite);
 
     suite.finish();
     println!("\nDone.");

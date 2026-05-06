@@ -73,6 +73,7 @@ pub mod byte;
 pub mod error;
 pub mod float;
 pub mod modelpack;
+pub mod per_scale;
 pub mod schema;
 pub mod yolo;
 
@@ -81,6 +82,7 @@ pub use decoder::*;
 
 pub use configs::{DecoderVersion, Nms};
 pub use error::{DecoderError, DecoderResult};
+pub use per_scale::DecodeDtype;
 
 use crate::{
     decoder::configs::QuantTuple, modelpack::modelpack_segmentation_to_mask,
@@ -238,6 +240,24 @@ impl Quantization {
     /// ```
     pub fn new(scale: f32, zero_point: i32) -> Self {
         Self { scale, zero_point }
+    }
+
+    /// Returns a quantization that's a no-op: scale=1.0, zero_point=0.
+    ///
+    /// Used by the per-scale pipeline as a sentinel for float-to-float
+    /// passthrough cells where no affine transform is required.
+    /// # Examples
+    /// ```
+    /// # use edgefirst_decoder::Quantization;
+    /// let quant = Quantization::identity();
+    /// assert_eq!(quant.scale, 1.0);
+    /// assert_eq!(quant.zero_point, 0);
+    /// ```
+    pub fn identity() -> Self {
+        Self {
+            scale: 1.0,
+            zero_point: 0,
+        }
     }
 }
 
