@@ -685,6 +685,8 @@ impl PyDecoder {
         model_output: Vec<PyRef<'py, crate::tensor::PyTensor>>,
         max_boxes: usize,
     ) -> PyResult<PySegDetOutput<'py>> {
+        let _span =
+            tracing::trace_span!("py_decode", n_tensors = model_output.len(), max_boxes).entered();
         let tensor_refs: Vec<&edgefirst_hal::tensor::TensorDyn> =
             model_output.iter().map(|t| &t.0).collect();
         let mut output_boxes = Vec::with_capacity(max_boxes);
@@ -709,6 +711,13 @@ impl PyDecoder {
         model_output: Vec<PyRef<'py, crate::tensor::PyTensor>>,
         max_boxes: usize,
     ) -> PyResult<PySegDetTrackedOutput<'py>> {
+        let _span = tracing::trace_span!(
+            "py_decode_tracked",
+            n_tensors = model_output.len(),
+            max_boxes,
+            timestamp,
+        )
+        .entered();
         let tensor_refs: Vec<&edgefirst_hal::tensor::TensorDyn> =
             model_output.iter().map(|t| &t.0).collect();
         let mut output_boxes = Vec::with_capacity(max_boxes);
@@ -763,6 +772,9 @@ impl PyDecoder {
         model_output: Vec<PyRef<'py, crate::tensor::PyTensor>>,
         max_boxes: usize,
     ) -> PyResult<PyProtoDetOutput<'py>> {
+        let _span =
+            tracing::trace_span!("py_decode_proto", n_tensors = model_output.len(), max_boxes,)
+                .entered();
         let tensor_refs: Vec<&edgefirst_hal::tensor::TensorDyn> =
             model_output.iter().map(|t| &t.0).collect();
         let mut output_boxes = Vec::with_capacity(max_boxes);

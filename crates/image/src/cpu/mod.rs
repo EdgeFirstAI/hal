@@ -586,6 +586,13 @@ impl CPUProcessor {
         let tmp;
         let tmp_fmt;
         if intermediate != src_fmt {
+            let _s = tracing::trace_span!(
+                "cpu_format_convert",
+                from = ?src_fmt,
+                to = ?intermediate,
+                pass = "pre_resize",
+            )
+            .entered();
             tmp_buffer = Tensor::<u8>::image(src_w, src_h, intermediate, Some(TensorMemory::Mem))?;
 
             Self::convert_format_pf(src, &mut tmp_buffer, src_fmt, intermediate)?;
@@ -599,8 +606,16 @@ impl CPUProcessor {
         // format must be RGB/RGBA/GREY
         debug_assert!(matches!(tmp_fmt, Rgb | Rgba | Grey));
         if tmp_fmt == dst_fmt {
+            let _s = tracing::trace_span!("cpu_resize").entered();
             self.resize_flip_rotate_pf(tmp, dst, dst_fmt, rotation, flip, crop)?;
         } else if !need_resize_flip_rotation {
+            let _s = tracing::trace_span!(
+                "cpu_format_convert",
+                from = ?tmp_fmt,
+                to = ?dst_fmt,
+                pass = "direct",
+            )
+            .entered();
             Self::convert_format_pf(tmp, dst, tmp_fmt, dst_fmt)?;
         } else {
             let mut tmp2 = Tensor::<u8>::image(dst_w, dst_h, tmp_fmt, Some(TensorMemory::Mem))?;
@@ -615,8 +630,20 @@ impl CPUProcessor {
             {
                 Self::convert_format_pf(dst, &mut tmp2, dst_fmt, tmp_fmt)?;
             }
-            self.resize_flip_rotate_pf(tmp, &mut tmp2, tmp_fmt, rotation, flip, crop)?;
-            Self::convert_format_pf(&tmp2, dst, tmp_fmt, dst_fmt)?;
+            {
+                let _s = tracing::trace_span!("cpu_resize").entered();
+                self.resize_flip_rotate_pf(tmp, &mut tmp2, tmp_fmt, rotation, flip, crop)?;
+            }
+            {
+                let _s = tracing::trace_span!(
+                    "cpu_format_convert",
+                    from = ?tmp_fmt,
+                    to = ?dst_fmt,
+                    pass = "post_resize",
+                )
+                .entered();
+                Self::convert_format_pf(&tmp2, dst, tmp_fmt, dst_fmt)?;
+            }
         }
         if let (Some(dst_rect), Some(dst_color)) = (crop.dst_rect, crop.dst_color) {
             let full_rect = Rect {

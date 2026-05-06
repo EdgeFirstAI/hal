@@ -685,6 +685,15 @@ impl GLProcessorST {
         flip: Flip,
         crop: Crop,
     ) -> crate::Result<()> {
+        let _span = tracing::trace_span!(
+            "gl_convert",
+            ?src_fmt,
+            ?dst_fmt,
+            is_int8,
+            src_memory = ?src.memory(),
+            dst_memory = ?dst.memory(),
+        )
+        .entered();
         if !Self::check_src_format_supported(self.gl_context.transfer_backend, src, src_fmt) {
             if src_fmt == PixelFormat::Vyuy
                 && self.gl_context.transfer_backend.is_dma()
@@ -2776,6 +2785,7 @@ impl GLProcessorST {
         );
 
         // --- Pass 1: Render source → intermediate RGBA texture ---
+        let _pass1 = tracing::trace_span!("gl_pass1_to_rgba", dst_w, dst_h).entered();
         self.ensure_packed_rgb_intermediate(dst_w, dst_h)?;
         self.packed_rgb_fbo.bind();
         unsafe {
@@ -2793,8 +2803,10 @@ impl GLProcessorST {
         // It uses dst only for width/height in ROI coordinate math.
         // Handles: source binding (DMA EGLImage or upload), crop, letterbox, rotation, flip.
         self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)?;
+        drop(_pass1);
 
         // --- Pass 2: Pack intermediate RGBA → RGB DMA destination ---
+        let _pass2 = tracing::trace_span!("gl_pass2_pack_rgb", render_w, render_h).entered();
         self.convert_fbo.bind();
         let dest_egl = self.get_or_create_egl_image_rgb(
             dst,
@@ -2920,6 +2932,7 @@ impl GLProcessorST {
 
         // --- Pass 1: NV12→RGBA into intermediate texture ---
         // No int8 bias here — bias is applied in pass 2's planar shader.
+        let _pass1 = tracing::trace_span!("gl_pass1_to_rgba", dst_w, dst_h).entered();
         self.ensure_packed_rgb_intermediate(dst_w, dst_h)?;
         self.packed_rgb_fbo.bind();
         unsafe {
@@ -2938,11 +2951,13 @@ impl GLProcessorST {
         // output format is RGBA because we bound packed_rgb_fbo above. dst is used only for
         // width/height in ROI coordinate math.
         self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)?;
+        drop(_pass1);
 
         // --- Pass 2: RGBA→PlanarRgb to DMA destination ---
         // setup_renderbuffer_dma rebinds convert_fbo with the DMA destination EGLImage,
         // replacing packed_rgb_fbo that was active during pass 1. It also sets the viewport
         // to (dst_w, dst_h * 3) for the tall R8 planar renderbuffer.
+        let _pass2 = tracing::trace_span!("gl_pass2_to_planar", dst_w, dst_h).entered();
         self.setup_renderbuffer_dma(dst, dst_fmt)?;
 
         // Bias letterbox clear color for int8 — glClear bypasses the shader.

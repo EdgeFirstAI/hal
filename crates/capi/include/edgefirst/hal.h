@@ -2585,6 +2585,56 @@ bool hal_quantization_is_symmetric(const struct HalTensorQuant *q);
 bool hal_quantization_axis(const struct HalTensorQuant *q, size_t *axis_out);
 
 /**
+ * Start trace capture, writing Chrome JSON to the file at `path`.
+ *
+ * Installs a process-wide tracing subscriber that records all HAL internal
+ * spans (decode sub-steps, mask materialization, etc.) to the specified file.
+ * The trace can be viewed at https://ui.perfetto.dev/ after calling
+ * `hal_stop_tracing()`.
+ *
+ * Only one trace session per process lifetime is supported.
+ *
+ * @param path  Null-terminated UTF-8 file path for the trace output
+ * @return 0 on success, -1 on error
+ * @par Errors (errno):
+ * - EINVAL:   `path` is NULL or not valid UTF-8
+ * - EALREADY: a trace session is already active or was previously started and stopped
+ * - ENOTSUP: another tracing subscriber was already installed by user code
+ * - ENOSYS:  tracing support not compiled in (built without `tracing` feature)
+ *
+ * @par Example
+ * @code{.c}
+ * hal_start_tracing("/tmp/trace.json");
+ * // ... inference pipeline ...
+ * hal_stop_tracing();
+ * @endcode
+ */
+int hal_start_tracing(const char *path);
+
+/**
+ * Stop trace capture and flush all buffered spans to the output file.
+ *
+ * After this call the trace file is complete and can be loaded into
+ * https://ui.perfetto.dev/. No-op if no session is active or if tracing
+ * support is not compiled in.
+ *
+ * @par Example
+ * @code{.c}
+ * hal_start_tracing("/tmp/trace.json");
+ * // ... work ...
+ * hal_stop_tracing();  // flushes and finalizes the trace file
+ * @endcode
+ */
+void hal_stop_tracing(void);
+
+/**
+ * Check whether a trace capture session is currently active.
+ *
+ * @return 1 if tracing is active, 0 otherwise (always 0 if tracing not compiled in)
+ */
+int hal_is_tracing_active(void);
+
+/**
  * Create a new ByteTrack tracker with specified parameters.
  *
  * @param track_update Smoothness threshold for track updates (high = more stable tracks, low = more responsive to changes)

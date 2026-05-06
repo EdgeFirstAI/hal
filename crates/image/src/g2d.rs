@@ -60,6 +60,12 @@ impl G2DProcessor {
         flip: Flip,
         crop: Crop,
     ) -> Result<()> {
+        let _span = tracing::trace_span!(
+            "g2d_convert",
+            src_fmt = ?src_dyn.format(),
+            dst_fmt = ?dst_dyn.format(),
+        )
+        .entered();
         if log::log_enabled!(log::Level::Trace) {
             log::trace!(
                 "G2D convert: {:?}({:?}/{:?}) → {:?}({:?}/{:?})",

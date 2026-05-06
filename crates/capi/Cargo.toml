@@ -16,6 +16,10 @@ publish = false  # C library - distributed via GitHub Releases, not crates.io
 crate-type = ["staticlib", "cdylib"]
 name = "edgefirst_hal"
 
+[features]
+default = ["tracing"]
+tracing = ["edgefirst-hal/tracing"]
+
 [dependencies]
 edgefirst-hal = { workspace = true }
 edgefirst-tensor = { workspace = true }

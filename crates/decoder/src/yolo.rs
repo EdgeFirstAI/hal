@@ -741,6 +741,7 @@ pub(crate) fn impl_yolo_quant<B: BBoxTypeTrait, T: PrimInt + AsPrimitive<f32> + 
 ) where
     f32: AsPrimitive<T>,
 {
+    let _span = tracing::trace_span!("decode", mode = "quant_det").entered();
     let (boxes, quant_boxes) = output;
     let (boxes_tensor, scores_tensor) = postprocess_yolo(&boxes);
 
@@ -775,6 +776,7 @@ pub(crate) fn impl_yolo_float<B: BBoxTypeTrait, T: Float + AsPrimitive<f32> + Se
 ) where
     f32: AsPrimitive<T>,
 {
+    let _span = tracing::trace_span!("decode", mode = "float_det").entered();
     let (boxes_tensor, scores_tensor) = postprocess_yolo(&output);
     let boxes =
         postprocess_boxes_float::<B, _, _>(score_threshold.as_(), boxes_tensor, scores_tensor);
@@ -809,6 +811,7 @@ pub(crate) fn impl_yolo_split_quant<
 ) where
     f32: AsPrimitive<SCORE>,
 {
+    let _span = tracing::trace_span!("decode", mode = "split_quant_det").entered();
     let (boxes_tensor, quant_boxes) = boxes;
     let (scores_tensor, quant_scores) = scores;
 
@@ -855,6 +858,7 @@ pub(crate) fn impl_yolo_split_float<
 ) where
     f32: AsPrimitive<SCORE>,
 {
+    let _span = tracing::trace_span!("decode", mode = "split_float_det").entered();
     let boxes_tensor = boxes_tensor.reversed_axes();
     let scores_tensor = scores_tensor.reversed_axes();
     let boxes =
@@ -976,17 +980,37 @@ pub(crate) fn impl_yolo_segdet_get_boxes<
 where
     f32: AsPrimitive<SCORE>,
 {
-    let mut boxes = postprocess_boxes_index_float::<B, _, _>(
-        score_threshold.as_(),
-        boxes_tensor,
-        scores_tensor,
+    let span = tracing::trace_span!(
+        "decode",
+        n_candidates = tracing::field::Empty,
+        n_after_topk = tracing::field::Empty,
+        n_after_nms = tracing::field::Empty,
+        n_detections = tracing::field::Empty,
     );
+    let _guard = span.enter();
+
+    let mut boxes = {
+        let _s = tracing::trace_span!("score_filter").entered();
+        postprocess_boxes_index_float::<B, _, _>(score_threshold.as_(), boxes_tensor, scores_tensor)
+    };
+    span.record("n_candidates", boxes.len());
+
     if nms.is_some() {
+        let _s = tracing::trace_span!("top_k", k = pre_nms_top_k).entered();
         truncate_to_top_k_by_score(&mut boxes, pre_nms_top_k);
     }
-    let mut boxes = dispatch_nms_extra_float(nms, iou_threshold, boxes);
+    span.record("n_after_topk", boxes.len());
+
+    let mut boxes = {
+        let _s = tracing::trace_span!("nms").entered();
+        dispatch_nms_extra_float(nms, iou_threshold, boxes)
+    };
+    span.record("n_after_nms", boxes.len());
+
     boxes.sort_unstable_by(|a, b| b.0.score.total_cmp(&a.0.score));
     boxes.truncate(max_det);
+    span.record("n_detections", boxes.len());
+
     boxes
 }
 
@@ -1023,6 +1047,7 @@ pub(crate) fn impl_yolo_split_segdet_process_masks<
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
 ) -> Result<(), crate::DecoderError> {
+    let _span = tracing::trace_span!("process_masks", n = boxes.len(), mode = "float").entered();
     // Respect output capacity as a hard limit to avoid computing excess masks.
     let cap = output_boxes.capacity();
     if cap > 0 && boxes.len() > cap {
@@ -1066,8 +1091,17 @@ where
     let (boxes_tensor, quant_boxes) = boxes;
     let (scores_tensor, quant_scores) = scores;
 
-    let t_start = std::time::Instant::now();
+    let span = tracing::trace_span!(
+        "decode",
+        n_candidates = tracing::field::Empty,
+        n_after_topk = tracing::field::Empty,
+        n_after_nms = tracing::field::Empty,
+        n_detections = tracing::field::Empty,
+    );
+    let _guard = span.enter();
+
     let mut boxes = {
+        let _s = tracing::trace_span!("score_filter").entered();
         let score_threshold = quantize_score_threshold(score_threshold, quant_scores);
         postprocess_boxes_index_quant::<B, _, _>(
             score_threshold,
@@ -1076,23 +1110,32 @@ where
             quant_boxes,
         )
     };
+    span.record("n_candidates", boxes.len());
+
     if nms.is_some() {
+        let _s = tracing::trace_span!("top_k", k = pre_nms_top_k).entered();
         truncate_to_top_k_by_score_quant(&mut boxes, pre_nms_top_k);
     }
-    let mut boxes = dispatch_nms_extra_int(nms, iou_threshold, boxes);
+    span.record("n_after_topk", boxes.len());
+
+    let mut boxes = {
+        let _s = tracing::trace_span!("nms").entered();
+        dispatch_nms_extra_int(nms, iou_threshold, boxes)
+    };
+    span.record("n_after_nms", boxes.len());
+
     // Sort by score descending before truncation to keep top-scoring detections.
     boxes.sort_unstable_by(|a, b| b.0.score.cmp(&a.0.score));
     boxes.truncate(max_det);
-    let result: Vec<_> = boxes
-        .into_iter()
-        .map(|(b, i)| (dequant_detect_box(&b, quant_scores), i))
-        .collect();
-    let t_end = std::time::Instant::now();
-    log::trace!(
-        "get_boxes: {:.2}ms ({} detections)",
-        t_end.duration_since(t_start).as_secs_f64() * 1000.0,
-        result.len(),
-    );
+    let result: Vec<_> = {
+        let _s = tracing::trace_span!("box_dequant", n = boxes.len()).entered();
+        boxes
+            .into_iter()
+            .map(|(b, i)| (dequant_detect_box(&b, quant_scores), i))
+            .collect()
+    };
+    span.record("n_detections", result.len());
+
     result
 }
 
@@ -1106,6 +1149,7 @@ pub(crate) fn impl_yolo_split_segdet_quant_process_masks<
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
 ) -> Result<(), crate::DecoderError> {
+    let _span = tracing::trace_span!("process_masks", n = boxes.len(), mode = "quant").entered();
     let (masks, quant_masks) = mask_coeff;
     let (protos, quant_protos) = protos;
 
@@ -1449,6 +1493,14 @@ pub(super) fn extract_proto_data_float<
     protos: ArrayView3<PROTO>,
     output_boxes: &mut Vec<DetectBox>,
 ) -> ProtoData {
+    let _span = tracing::trace_span!(
+        "extract_proto",
+        n = det_indices.len(),
+        num_protos = mask_tensor.ncols(),
+        layout = "nhwc",
+    )
+    .entered();
+
     let num_protos = mask_tensor.ncols();
     let n = det_indices.len();
 
@@ -1497,8 +1549,17 @@ pub(crate) fn extract_proto_data_quant<
 ) -> ProtoData {
     use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait};
 
+    let span = tracing::trace_span!(
+        "extract_proto",
+        n = det_indices.len(),
+        num_protos = tracing::field::Empty,
+        layout = tracing::field::Empty,
+    );
+    let _guard = span.enter();
+
     let num_protos = mask_tensor.ncols();
     let n = det_indices.len();
+    span.record("num_protos", num_protos);
 
     // Fast path: when no detections survive NMS, skip the expensive proto
     // tensor copy (819KB for 160×160×32). Allocate with the correct shape
@@ -1641,6 +1702,8 @@ pub(crate) fn extract_proto_data_quant<
     let protos_tensor = protos_tensor
         .with_quantization(tensor_quant)
         .expect("per-tensor quantization on new Tensor<i8>");
+
+    span.record("layout", tracing::field::debug(&proto_layout));
 
     ProtoData {
         mask_coefficients,
