@@ -1729,7 +1729,8 @@ class Tracing:
 
     The ``tracing`` feature is enabled by default in all builds.  It can be
     removed with ``--no-default-features`` if the capture infrastructure is
-    not needed (span sites remain compiled but become true no-ops).
+    not needed (span sites remain compiled at near-zero overhead but cannot
+    be activated for capture).
 
     Usage as context manager (recommended):
 
