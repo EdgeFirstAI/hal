@@ -1715,3 +1715,78 @@ class ByteTrack:
         Get the list of currently active tracks.
         """
         ...
+
+class Tracing:
+    """Trace capture context manager for Perfetto/Chrome JSON output.
+
+    Records internal HAL tracing spans (decode sub-steps, mask materialization,
+    proto extraction, etc.) to a Chrome JSON file viewable at
+    https://ui.perfetto.dev/.
+
+    Only one trace session per process lifetime is supported.  The tracing
+    spans are always compiled into the library but have zero overhead (a single
+    atomic load) until a session is started via this API.
+
+    Build requirement: the ``tracing`` feature must be enabled when building
+    the wheel (``maturin build --features tracing``).
+
+    Usage as context manager (recommended):
+
+    .. code-block:: python
+
+        import edgefirst_hal as hal
+
+        with hal.Tracing("/tmp/trace.json"):
+            # ... inference pipeline ...
+            pass
+        # trace file is flushed and closed on __exit__
+
+    Usage with explicit start/stop:
+
+    .. code-block:: python
+
+        guard = hal.Tracing("/tmp/trace.json")
+        guard.start()
+        # ... inference pipeline ...
+        guard.stop()  # flushes trace file
+
+    The resulting JSON file can be dragged into https://ui.perfetto.dev/ to
+    visualize the timeline of decode and mask operations with per-span metadata
+    (detection counts, proto dimensions, layout, etc.).
+    """
+
+    def __init__(self, path: str) -> None:
+        """Create a tracing session targeting the given output file path.
+
+        Args:
+            path: File path for the Chrome JSON trace output. The file is
+                created on :meth:`start` (or ``__enter__``).
+        """
+        ...
+
+    def start(self) -> None:
+        """Start trace capture.
+
+        Installs a process-wide tracing subscriber and begins recording
+        spans to the configured file.
+
+        Only one trace session per process lifetime is supported. Once
+        started and stopped, subsequent calls will raise RuntimeError.
+
+        Raises:
+            RuntimeError: If a trace session is already active, was
+                previously started and stopped (only one session per
+                process lifetime), or if tracing support was not compiled in.
+        """
+        ...
+
+    def stop(self) -> None:
+        """Stop trace capture and flush the trace file.
+
+        After this call the trace file is complete and ready for viewing.
+        No-op if not currently active.
+        """
+        ...
+
+    def __enter__(self) -> "Tracing": ...
+    def __exit__(self, *args: object) -> bool: ...

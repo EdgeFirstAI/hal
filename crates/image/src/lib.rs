@@ -1816,6 +1816,16 @@ impl ImageProcessorTrait for ImageProcessor {
         let start = Instant::now();
         let src_fmt = src.format();
         let dst_fmt = dst.format();
+        let _span = tracing::trace_span!(
+            "image_convert",
+            ?src_fmt,
+            ?dst_fmt,
+            src_memory = ?src.memory(),
+            dst_memory = ?dst.memory(),
+            ?rotation,
+            ?flip,
+        )
+        .entered();
         log::trace!(
             "convert: {src_fmt:?}({:?}/{:?}) → {dst_fmt:?}({:?}/{:?}), \
              rotation={rotation:?}, flip={flip:?}, backend={:?}",
@@ -1930,6 +1940,12 @@ impl ImageProcessorTrait for ImageProcessor {
         segmentation: &[Segmentation],
         overlay: MaskOverlay<'_>,
     ) -> Result<()> {
+        let _span = tracing::trace_span!(
+            "draw_masks",
+            n_detections = detect.len(),
+            n_segmentations = segmentation.len(),
+        )
+        .entered();
         let start = Instant::now();
 
         if let Some(bg) = overlay.background {

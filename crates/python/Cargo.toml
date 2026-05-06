@@ -14,9 +14,10 @@ publish = false  # Python bindings only - distributed via PyPI, not crates.io
 crate-type = ["cdylib"]
 
 [features]
-default = []
+default = ["tracing"]
 abi3-py38 = ["pyo3/abi3-py38"]
 abi3-py311 = ["pyo3/abi3-py311"]
+tracing = ["edgefirst-hal/tracing"]
 
 [dependencies]
 edgefirst-hal = { workspace = true, features = ["tracker"] }
@@ -31,6 +32,7 @@ pyo3 = { workspace = true, features = ["extension-module"] }
 rayon = { workspace = true }
 pythonize = { workspace = true }
 serde_json = { workspace = true }
+tracing = { workspace = true }
 uuid = { workspace = true }
 
 [build-dependencies]

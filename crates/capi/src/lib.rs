@@ -16,6 +16,7 @@ mod error;
 mod image;
 mod log;
 mod tensor;
+mod trace;
 mod tracker;
 
 pub use decoder::*;
@@ -24,4 +25,6 @@ pub use error::*;
 pub use image::*;
 pub use log::*;
 pub use tensor::*;
+#[cfg(feature = "tracing")]
+pub use trace::*;
 pub use tracker::*;
