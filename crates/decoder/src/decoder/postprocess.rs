@@ -242,6 +242,12 @@ impl Decoder {
             .map(Quantization::from)
             .unwrap_or_default();
 
+        // Reserve up-front so the post-NMS push doesn't reallocate. The
+        // detection-count cap is `self.max_det` only — caller-provided
+        // capacity is an allocation hint, not a semantic bound (see
+        // `Decoder::decode` rustdoc and EDGEAI-1302).
+        output_boxes.reserve(self.max_det.saturating_sub(output_boxes.len()));
+        output_masks.reserve(self.max_det.saturating_sub(output_masks.len()));
         with_quantized!(boxes_tensor, b, {
             with_quantized!(protos_tensor, p, {
                 let box_tensor = Self::swap_axes_if_needed(b, boxes.into());
@@ -256,7 +262,7 @@ impl Decoder {
                     self.iou_threshold,
                     self.nms,
                     self.pre_nms_top_k,
-                    self.max_det.min(output_boxes.capacity()),
+                    self.max_det,
                     output_boxes,
                     output_masks,
                 )
@@ -654,6 +660,10 @@ impl Decoder {
 
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
+        // Reserve up-front; capacity is an allocation hint, not a cap
+        // (see `Decoder::decode` rustdoc and EDGEAI-1302).
+        output_boxes.reserve(self.max_det.saturating_sub(output_boxes.len()));
+        output_masks.reserve(self.max_det.saturating_sub(output_masks.len()));
         impl_yolo_segdet_float::<XYWH, _, _>(
             boxes_tensor,
             protos_tensor,
@@ -661,7 +671,7 @@ impl Decoder {
             self.iou_threshold,
             self.nms,
             self.pre_nms_top_k,
-            self.max_det.min(output_boxes.capacity()),
+            self.max_det,
             output_boxes,
             output_masks,
         )
