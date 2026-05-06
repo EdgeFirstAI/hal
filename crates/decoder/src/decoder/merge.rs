@@ -87,14 +87,23 @@ enum LogicalMerge {
     /// extent. Concatenate along the logical anchor / box axis after
     /// flattening each child's H×W.
     PerScale {
+        // TODO HAL-Phase3: legacy PerScale arm to be removed; the
+        // executor body now loud-fails and these fields are constructed
+        // by `plan_per_scale` only for the legacy path, which the
+        // per-scale subsystem now claims at builder time.
+        #[allow(dead_code)]
         children: Vec<PhysicalBinding>,
+        #[allow(dead_code)]
         logical_shape: Vec<usize>,
+        #[allow(dead_code)]
         feature_axis_logical: usize,
+        #[allow(dead_code)]
         box_axis_logical: usize,
         /// When `Some`, the feature axis is `4 × reg_max` DFL logits
         /// and the executor applies per-level DFL decode (softmax,
         /// weighted sum, `dist2bbox`) before concat, collapsing the
         /// feature axis to 4 xcycwh pixel-coordinate channels.
+        #[allow(dead_code)]
         dfl: Option<DflConfig>,
     },
     /// Children share a common anchor axis and differ along the channel
@@ -124,6 +133,7 @@ struct PhysicalBinding {
 /// Pre-computed DFL decode state for a logical `boxes` output with
 /// `encoding: dfl` and per-scale children. Produced at plan time so
 /// the per-frame path never allocates anchor grids.
+#[allow(dead_code)] // TODO HAL-Phase3: legacy PerScale arm to be removed
 #[derive(Debug, Clone)]
 pub(crate) struct DflConfig {
     pub(crate) reg_max: usize,
@@ -132,6 +142,7 @@ pub(crate) struct DflConfig {
     grids: Vec<DflChildGrid>,
 }
 
+#[allow(dead_code)] // TODO HAL-Phase3: legacy PerScale arm to be removed
 #[derive(Debug, Clone)]
 struct DflChildGrid {
     stride: f32,
@@ -226,6 +237,7 @@ fn plan_logical(logical: &LogicalOutput) -> DecoderResult<LogicalMerge> {
     }
 }
 
+#[allow(dead_code)] // TODO HAL-Phase3: legacy PerScale arm to be removed
 fn plan_per_scale(logical: &LogicalOutput) -> DecoderResult<LogicalMerge> {
     let mut children = logical
         .outputs
@@ -265,6 +277,7 @@ fn plan_per_scale(logical: &LogicalOutput) -> DecoderResult<LogicalMerge> {
 /// per-frame decode starts reading bogus strides. See
 /// `HAILORT_DECODER.md` §"Open Questions" for the heterogeneous
 /// `reg_max` future work.
+#[allow(dead_code)] // TODO HAL-Phase3: legacy PerScale arm to be removed
 fn plan_dfl(logical: &LogicalOutput, children: &[PhysicalBinding]) -> DecoderResult<DflConfig> {
     let first_feat = child_feature_count(&children[0])?;
     if first_feat == 0 || first_feat % 4 != 0 {
@@ -304,6 +317,7 @@ fn plan_dfl(logical: &LogicalOutput, children: &[PhysicalBinding]) -> DecoderRes
     Ok(DflConfig { reg_max, grids })
 }
 
+#[allow(dead_code)] // TODO HAL-Phase3: legacy PerScale arm to be removed
 fn child_feature_count(child: &PhysicalBinding) -> DecoderResult<usize> {
     for (i, (name, _)) in child.dshape.iter().enumerate() {
         if matches!(
@@ -323,6 +337,7 @@ fn child_feature_count(child: &PhysicalBinding) -> DecoderResult<usize> {
     )))
 }
 
+#[allow(dead_code)] // TODO HAL-Phase3: legacy PerScale arm to be removed
 fn child_hw(child: &PhysicalBinding) -> DecoderResult<(usize, usize)> {
     let mut h = None;
     let mut w = None;
@@ -486,21 +501,12 @@ fn execute_merge(
             padding_axes,
             used,
         ),
-        LogicalMerge::PerScale {
-            children,
-            logical_shape,
-            feature_axis_logical,
-            box_axis_logical,
-            dfl,
-        } => execute_per_scale(
-            inputs,
-            children,
-            logical_shape,
-            *feature_axis_logical,
-            *box_axis_logical,
-            dfl.as_ref(),
-            used,
-        ),
+        LogicalMerge::PerScale { .. } => Err(DecoderError::Internal(
+            "merge.rs::LogicalMerge::PerScale was reached; per-scale schemas must be \
+             claimed by per_scale::PerScalePlan::try_from_schema. This indicates capability \
+             detection let a per-scale schema through to the legacy path — file a bug."
+                .into(),
+        )),
     }
 }
 
@@ -753,6 +759,7 @@ fn execute_channel_concat(
 ///
 /// Concatenate parts along the anchor axis (stride-ascending order was
 /// set at plan time), then reshape to `logical_shape`.
+#[allow(dead_code)] // TODO HAL-Phase3: legacy PerScale arm to be removed
 fn execute_per_scale(
     inputs: &[&TensorDyn],
     children: &[PhysicalBinding],
@@ -816,6 +823,7 @@ fn execute_per_scale(
 /// Apply per-level DFL decode to one child's `(batch, 4 × reg_max, N)`
 /// tensor, producing a `(batch, 4, N)` tensor of xcycwh pixel
 /// coordinates.
+#[allow(dead_code)] // TODO HAL-Phase3: legacy PerScale arm to be removed
 fn dfl_decode_child(
     part: Array3<f32>,
     cfg: &DflConfig,
@@ -879,6 +887,7 @@ fn dfl_decode_child(
 ///
 /// Returns the materialised `Array3<f32>` along with the batch and
 /// feature dimensions for cross-child consistency checks.
+#[allow(dead_code)] // TODO HAL-Phase3: legacy PerScale arm to be removed
 fn child_to_batch_feature_spatial(
     arr: ArrayD<f32>,
     child: &PhysicalBinding,
@@ -1145,6 +1154,8 @@ mod tests {
                     dtype: None,
                     quantization: None,
                     outputs: vec![],
+                    activation_applied: None,
+                    activation_required: None,
                 },
                 // Typed boxes with a single merged child (triggers program).
                 LogicalOutput {
@@ -1180,6 +1191,8 @@ mod tests {
                         activation_applied: None,
                         activation_required: None,
                     }],
+                    activation_applied: None,
+                    activation_required: None,
                 },
             ],
             ..Default::default()
@@ -1231,6 +1244,8 @@ mod tests {
                 dtype: Some(DType::Float32),
                 quantization: None,
                 outputs: vec![],
+                activation_applied: None,
+                activation_required: None,
             }],
             ..Default::default()
         };
@@ -1292,6 +1307,8 @@ mod tests {
                     activation_required: None,
                 },
             ],
+            activation_applied: None,
+            activation_required: None,
         };
         // Two i16 tensors with the same shape: the merge path binds by
         // shape, so the first match is used for the first child. To keep
@@ -1367,6 +1384,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "TODO HAL-Phase3: legacy PerScale arm to be removed; tests should be migrated to per_scale subsystem"]
     fn per_scale_merge_nhwc_to_nchw() {
         // Boxes split per-scale, NHWC children → (1, 4, total) logical NCHW.
         // Strides 8 + 16: spatial sizes 4 + 1 = 5 anchors, 4 features each.
@@ -1427,6 +1445,8 @@ mod tests {
                         activation_required: None,
                     },
                 ],
+                activation_applied: None,
+                activation_required: None,
             }],
             ..Default::default()
         };
@@ -1491,6 +1511,8 @@ mod tests {
                     dtype: Some(DType::Float32),
                     quantization: None,
                     outputs: vec![],
+                    activation_applied: None,
+                    activation_required: None,
                 },
                 // Force at least one split to enable DecodeProgram
                 LogicalOutput {
@@ -1544,6 +1566,8 @@ mod tests {
                             activation_required: None,
                         },
                     ],
+                    activation_applied: None,
+                    activation_required: None,
                 },
             ],
             ..Default::default()
@@ -1616,6 +1640,8 @@ mod tests {
                     activation_applied: None,
                     activation_required: None,
                 }],
+                activation_applied: None,
+                activation_required: None,
             }],
             ..Default::default()
         };
@@ -1624,6 +1650,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "TODO HAL-Phase3: legacy PerScale arm to be removed; tests should be migrated to per_scale subsystem"]
     fn per_scale_dfl_merge_produces_4ch_pixel_coordinates() {
         // Two FPN levels, reg_max=4 (feature axis = 16 per child):
         //   stride  8 @ 2×2  → 4 anchors
@@ -1691,6 +1718,8 @@ mod tests {
                         activation_required: None,
                     },
                 ],
+                activation_applied: None,
+                activation_required: None,
             }],
             ..Default::default()
         };
@@ -1742,6 +1771,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "TODO HAL-Phase3: legacy PerScale arm to be removed; tests should be migrated to per_scale subsystem"]
     fn dfl_children_declared_out_of_stride_order_are_sorted_ascending() {
         // Validator-parity: the merged output must place stride-8
         // anchors before stride-16 anchors regardless of the order
@@ -1804,6 +1834,8 @@ mod tests {
                         activation_required: None,
                     },
                 ],
+                activation_applied: None,
+                activation_required: None,
             }],
             ..Default::default()
         };
@@ -1859,6 +1891,8 @@ mod tests {
                     dtype: Some(DType::Uint8),
                     quantization: Some(per_tensor_q(0.130, 70, DType::Uint8)),
                     outputs: vec![],
+                    activation_applied: None,
+                    activation_required: None,
                 },
                 LogicalOutput {
                     // Second logical forces a DecodeProgram so the Direct
@@ -1914,6 +1948,8 @@ mod tests {
                             activation_required: None,
                         },
                     ],
+                    activation_applied: None,
+                    activation_required: None,
                 },
             ],
             ..Default::default()

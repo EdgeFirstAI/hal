@@ -5,7 +5,103 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.20.0] - 2026-05-06
+
+### Added
+
+- New `per_scale` decoder subsystem for schema-v2 per-scale models.
+  Supports DFL (yolov8 / yolo11) and LTRB (yolo26) box encodings, all
+  combinations of i8/u8/i16/u16/f16/f32 inputs and f32/f16 outputs.
+  Selected automatically when the schema declares per-scale children;
+  legacy `merge::PerScale` path is deprecated and errors loudly.
+- Per-scale subsystem now supports both **NHWC and NCHW children** via
+  named-axis dshape lookup. NCHW children are transposed to a per-dtype
+  scratch buffer (`LayoutScratch`) before the existing NHWC kernel
+  dispatch, keeping kernel coverage uniform for Phase 2 NEON.
+- **NEON 16x16 byte tile transpose** for the NCHW → NHWC scratch
+  step, replacing the scalar walk for `u8` / `i8` inputs when
+  `c >= 16` and `h*w >= 16`. Uses the canonical 4-stage TRN1/TRN2
+  pattern (`.16b` → `.8h` → `.4s` → `.2d`) to permute a 16-byte tile
+  in registers. Targets the Ara-240 NCHW path; NHWC inputs (TFLite,
+  the canonical fixtures) skip the transpose entirely and are
+  unaffected.
+- **Phase 2-A NEON (Tier 1) kernels** for the per-scale subsystem on
+  aarch64. Adds `kernels::neon_baseline` with NEON i8/u8/i16/u16 → f32
+  dequant primitives (FMA-fused affine), NEON sigmoid f32 (vbslq
+  blend), and NEON softmax f32 (3-pass max/exp/normalize). All
+  `BoxLevelDispatch` / `ScoreLevelDispatch` / `MaskCoefDispatch` /
+  `ProtoDispatch` enums carry `*NeonBase` variants; `select()` picks
+  NEON when `CpuFeatures::neon_baseline` is true. Bit-correct against
+  scalar oracle within 1-2 ulp envelope.
+- **Polynomial NEON `expf` (f32, 4-lane)** replaces lane-extract
+  scalar libm `expf` in NEON sigmoid + softmax. Cephes 5-degree
+  minimax with split-`ln2` range reduction and IEEE-754 exponent-bit
+  injection of `2^k`. Profiling revealed libm `expf` was 58% of
+  decode time on Cortex-A53 — the polynomial drops decode 74 ms →
+  37 ms (50%) on imx8mp-evk with mAP unchanged at 0.417.
+- **Polynomial NEON `expf` (f16, 8-lane)** for ARMv8.2-A
+  Cortex-A55+ targets (i.MX95, RPi5, Jetson Orin). Uses
+  `.arch_extension fp16` inline-asm escape hatch since Rust 1.94
+  stable does not expose the FP16 NEON intrinsics. New
+  `*NeonFp16` dispatch tier sits above `NeonBase`; selected when
+  `CpuFeatures::neon_fp16` is detected. Inputs clamped to ±10 to
+  keep `2^k` injection inside f16's 5-bit-exponent range. Drops
+  imx95-evk decode 29.5 ms → 23.5 ms (-20%) on top of the f32
+  polynomial.
+- **Per-level rayon parallelization** for the per-scale pipeline.
+  Each FPN level's box / score / mc work runs on a separate thread;
+  the heaviest level (index 0, 80x80 grid) runs on the calling
+  thread to avoid one round-trip barrier. Level-scoped disjoint
+  slices are pre-split via iterative `split_at_mut`. Activates only
+  when all levels are NHWC (NCHW would need per-level scratch).
+  Drops imx8mp 36.9 ms → 30.8 ms (Cortex-A53, 4 cores) and
+  imx95 23.5 ms → 20.5 ms (Cortex-A55, 6 cores).
+- **End-to-end Phase 2 speedups** vs original libm scalar `expf`:
+  imx8mp-evk 74.4 ms → 30.8 ms (2.42×); imx95-evk ~60 ms →
+  20.5 ms (~2.93×). coco128 box mAP@[0.5:0.95] holds at 0.417
+  across all variants (within rounding of the FP32 reference).
+- **Perfetto / Chrome-trace spans** throughout the per-scale
+  subsystem: `per_scale_decode`, `resolve_bindings`, per-level
+  `level`, and per-role `box` / `score` / `mc` / `protos`. Drove
+  the Phase 2 hotspot analysis.
+- `DecoderBuilder::with_decode_dtype` for choosing f32 or f16 outputs
+  through the per-scale pipeline.
+- `per_scale::apply_schema_quant` helper that walks a schema-v2
+  document and attaches per-tensor `Quantization` to integer input
+  tensors via shape match.  Use when the upstream inference layer
+  hasn't already attached quantization metadata.
+- `EDGEFIRST_DECODER_FORCE_KERNEL` env var for forcing the decoder's
+  kernel tier (`scalar`, `neon`/`neon_baseline`; `neon_fp16` and
+  `neon_dotprod` are recognised but not yet wired to kernels).
+- New `BoxEncoding::Direct` serde alias `"ltrb"` so yolo26 schemas
+  (which declare `"encoding": "ltrb"`) deserialize correctly.
+- Per-scale baseline benchmarks (`decoder/per_scale/dfl_i8_to_f32`,
+  `dfl_i8_to_f16`, `ltrb_i8_to_f32`) in `decoder_benchmark`.
+- `testdata/decoder/<model>.safetensors` reference fixtures backed by
+  git-lfs (`yolov8n-seg`, `yolo11n-seg`, `yolo26n-seg`), with
+  `scripts/decoder_generate_fixture.py` for regeneration. Each fixture
+  bundles raw int8 outputs, per-stage NumPy reference intermediates,
+  post-NMS detections, the patched schema (with `dshape` synthesized
+  on logical parents), and a Markdown narrative under
+  `__metadata__["documentation_md"]`. New parity tests in
+  `crates/decoder/tests/per_scale_parity.rs` (smoke / end-to-end /
+  pre-NMS) consume the fixtures via `tests/common/per_scale_fixture.rs`
+  and the `Decoder::_testing_run_per_scale_pre_nms` capture entry
+  point.
+
+### Changed
+
+- Per-scale schemas now apply sigmoid activation on score logits when
+  the schema declares `activation_required: sigmoid` on the per-scale
+  children (previously omitted by `merge.rs::execute_per_scale`).
+
+### Fixed
+
+- yolo26 LTRB-encoded per-scale boxes now decode correctly. Previously
+  `merge.rs::plan_dfl` only handled DFL encoding and yolo26 schemas
+  failed at plan time.
+- Per-scale TFLite schemas no longer require validator NumPy-NMS
+  fallback; the HAL handles them natively.
 
 ## [0.19.0] - 2026-05-05
 

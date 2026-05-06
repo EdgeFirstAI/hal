@@ -7,6 +7,7 @@ use super::config::ConfigOutputRef;
 use super::configs::{self, DecoderType, DecoderVersion, DimName, ModelType};
 use super::merge::DecodeProgram;
 use super::{ConfigOutput, ConfigOutputs, Decoder};
+use crate::per_scale::{DecodeDtype, PerScalePlan};
 use crate::schema::SchemaV2;
 use crate::DecoderError;
 
@@ -18,6 +19,10 @@ pub struct DecoderBuilder {
     /// NMS mode: Some(mode) applies NMS, None bypasses NMS (for end-to-end
     /// models)
     nms: Option<configs::Nms>,
+    /// Output dtype for the per-scale fast path. Has no effect on
+    /// schemas without per-scale children (which use the legacy decode
+    /// path).
+    decode_dtype: DecodeDtype,
     pre_nms_top_k: usize,
     max_det: usize,
 }
@@ -60,6 +65,7 @@ impl Default for DecoderBuilder {
             iou_threshold: 0.5,
             score_threshold: 0.5,
             nms: Some(configs::Nms::ClassAgnostic),
+            decode_dtype: DecodeDtype::F32,
             pre_nms_top_k: 300,
             max_det: 300,
         }
@@ -180,6 +186,33 @@ impl DecoderBuilder {
     /// ```
     pub fn with_schema(mut self, schema: SchemaV2) -> Self {
         self.config_src.replace(ConfigSource::Schema(schema));
+        self
+    }
+
+    /// Choose the output dtype for the per-scale decoder pipeline.
+    ///
+    /// Defaults to [`DecodeDtype::F32`]. Has no effect on schemas
+    /// without per-scale children (which use the legacy decode path).
+    /// `F16` saves ~2× memory bandwidth at the cost of 10-bit mantissa
+    /// precision; empirically safe for YOLO-family models.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use edgefirst_decoder::{DecodeDtype, DecoderBuilder, DecoderResult};
+    /// use edgefirst_decoder::schema::SchemaV2;
+    ///
+    /// # fn main() -> DecoderResult<()> {
+    /// let schema = SchemaV2::parse_file("model/edgefirst.json")?;
+    /// let decoder = DecoderBuilder::new()
+    ///     .with_schema(schema)
+    ///     .with_decode_dtype(DecodeDtype::F32)
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_decode_dtype(mut self, dtype: DecodeDtype) -> Self {
+        self.decode_dtype = dtype;
         self
     }
 
@@ -831,11 +864,16 @@ impl DecoderBuilder {
     /// # }
     /// ```
     pub fn build(self) -> Result<Decoder, DecoderError> {
-        let (config, decode_program) = match self.config_src {
-            Some(ConfigSource::Json(s)) => Self::build_from_schema(SchemaV2::parse_json(&s)?)?,
-            Some(ConfigSource::Yaml(s)) => Self::build_from_schema(SchemaV2::parse_yaml(&s)?)?,
-            Some(ConfigSource::Config(c)) => (c, None),
-            Some(ConfigSource::Schema(schema)) => Self::build_from_schema(schema)?,
+        let decode_dtype = self.decode_dtype;
+        let (config, decode_program, per_scale_plan) = match self.config_src {
+            Some(ConfigSource::Json(s)) => {
+                Self::build_from_schema(SchemaV2::parse_json(&s)?, decode_dtype)?
+            }
+            Some(ConfigSource::Yaml(s)) => {
+                Self::build_from_schema(SchemaV2::parse_yaml(&s)?, decode_dtype)?
+            }
+            Some(ConfigSource::Config(c)) => (c, None, None),
+            Some(ConfigSource::Schema(schema)) => Self::build_from_schema(schema, decode_dtype)?,
             None => return Err(DecoderError::NoConfig),
         };
 
@@ -849,12 +887,44 @@ impl DecoderBuilder {
             Decoder::validate_output_layout(output.into())?;
         }
 
-        // Extract normalized flag from config outputs
-        let normalized = Self::get_normalized(&config.outputs);
+        // Extract normalized flag from config outputs.
+        //
+        // The per-scale subsystem (DFL/LTRB → dist2bbox → sigmoid) emits
+        // boxes in pixel coordinates by design — `(grid + dist) * stride`
+        // — independently of any `normalized: true` annotation in the
+        // schema. The schema's `normalized` flag describes the model's
+        // training-time convention, not the runtime output coord space
+        // for this code path. Override to `Some(false)` when the
+        // per-scale path is active so `Decoder::normalized_boxes()`
+        // matches what `decode_proto`/`decode` actually produce; the
+        // legacy / non-per-scale paths still honor the schema flag.
+        let normalized = if per_scale_plan.is_some() {
+            Some(false)
+        } else {
+            Self::get_normalized(&config.outputs)
+        };
 
         // Use NMS from config if present, otherwise use builder's NMS setting
         let nms = config.nms.or(self.nms);
-        let model_type = Self::get_model_type(config)?;
+        // When the per-scale path is active, the per_scale subsystem owns
+        // model decoding entirely — `decode` / `decode_proto` short-circuit
+        // on `per_scale.is_some()` before reading `model_type`. Skip the
+        // legacy ModelType validation, which otherwise rejects per-scale
+        // schemas that carry `decoder_version: yolo26` (an
+        // "end-to-end" hint) but use the per-scale split outputs rather
+        // than the end-to-end split-output shape the legacy validator
+        // expects. We keep a placeholder `ModelType` so the field remains
+        // valid; it is dead state for per-scale Decoders.
+        let model_type = if per_scale_plan.is_some() {
+            // Drop the un-needed config; the per-scale subsystem owns it.
+            drop(config);
+            ModelType::PerScale
+        } else {
+            Self::get_model_type(config)?
+        };
+
+        let per_scale = per_scale_plan
+            .map(|plan| std::sync::Mutex::new(crate::per_scale::PerScaleDecoder::new(plan)));
 
         Ok(Decoder {
             model_type,
@@ -865,26 +935,30 @@ impl DecoderBuilder {
             max_det: self.max_det,
             normalized,
             decode_program,
+            per_scale,
         })
     }
 
     /// Validate a [`SchemaV2`] and lower it to the (legacy `ConfigOutputs`,
-    /// optional `DecodeProgram`) pair the rest of `build()` consumes.
+    /// optional `DecodeProgram`, optional `PerScalePlan`) tuple the rest
+    /// of `build()` consumes.
     ///
     /// Centralises the v2 lowering so JSON, YAML, and direct
-    /// `with_schema` callers all go through the same validation and
-    /// merge-program construction. `SchemaV2::parse_json` /
-    /// `parse_yaml` already auto-detect v1 vs v2 input and return a v2
+    /// `with_schema` callers all go through the same validation,
+    /// merge-program, and per-scale plan construction. `SchemaV2::parse_json`
+    /// / `parse_yaml` already auto-detect v1 vs v2 input and return a v2
     /// schema either way (v1 inputs are upgraded in memory via
     /// `from_v1`), so this helper is the sole place that turns a
     /// schema into builder-ready state.
     fn build_from_schema(
         schema: SchemaV2,
-    ) -> Result<(ConfigOutputs, Option<DecodeProgram>), DecoderError> {
+        decode_dtype: DecodeDtype,
+    ) -> Result<(ConfigOutputs, Option<DecodeProgram>, Option<PerScalePlan>), DecoderError> {
         schema.validate()?;
         let program = DecodeProgram::try_from_schema(&schema)?;
+        let per_scale = PerScalePlan::try_from_schema(&schema, decode_dtype)?;
         let legacy = schema.to_legacy_config_outputs()?;
-        Ok((legacy, program))
+        Ok((legacy, program, per_scale))
     }
 
     /// Extracts the normalized flag from config outputs.
