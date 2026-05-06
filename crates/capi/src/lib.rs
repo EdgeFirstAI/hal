@@ -16,7 +16,6 @@ mod error;
 mod image;
 mod log;
 mod tensor;
-#[cfg(feature = "tracing")]
 mod trace;
 mod tracker;
 

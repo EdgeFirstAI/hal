@@ -76,7 +76,6 @@ pub mod edgefirst_hal {
         m.add_class::<tracker::PyByteTrack>()?;
         m.add_class::<tracker::PyActiveTrackInfo>()?;
 
-        #[cfg(feature = "tracing")]
         m.add_class::<PyTracing>()?;
 
         Ok(())
@@ -121,14 +120,16 @@ pub mod edgefirst_hal {
     /// # ... work ...
     /// guard.stop()
     /// ```
-    #[cfg(feature = "tracing")]
+    ///
+    /// Note: Raises RuntimeError if tracing support was not compiled in
+    /// (built without the `tracing` feature).
     #[pyclass(name = "Tracing")]
+    #[allow(dead_code)]
     struct PyTracing {
         path: String,
         active: bool,
     }
 
-    #[cfg(feature = "tracing")]
     #[pymethods]
     impl PyTracing {
         #[new]
@@ -141,16 +142,30 @@ pub mod edgefirst_hal {
 
         /// Start trace capture.
         fn start(&mut self) -> PyResult<()> {
-            ::edgefirst_hal::trace::start_tracing(&self.path)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-            self.active = true;
-            Ok(())
+            #[cfg(not(feature = "tracing"))]
+            {
+                Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "tracing support not compiled in (built without 'tracing' feature)",
+                ))
+            }
+            #[cfg(feature = "tracing")]
+            {
+                ::edgefirst_hal::trace::start_tracing(&self.path)
+                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                self.active = true;
+                Ok(())
+            }
         }
 
         /// Stop trace capture and flush the trace file.
         fn stop(&mut self) {
+            #[cfg(feature = "tracing")]
             if self.active {
                 ::edgefirst_hal::trace::stop_tracing();
+                self.active = false;
+            }
+            #[cfg(not(feature = "tracing"))]
+            {
                 self.active = false;
             }
         }

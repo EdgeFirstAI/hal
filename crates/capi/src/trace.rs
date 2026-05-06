@@ -23,10 +23,11 @@
 //! // Trace file is now ready to load in https://ui.perfetto.dev/
 //! ```
 //!
-//! # Build Requirements
+//! # Build Configuration
 //!
-//! The tracing API is only available when the `tracing` feature is enabled
-//! at compile time. Without this feature, these functions are not exported.
+//! The tracing feature is enabled by default. When compiled without the
+//! `tracing` feature, these functions remain available but return `ENOSYS`
+//! to indicate profiling support is not compiled in.
 
 use libc::{c_char, c_int};
 
@@ -44,6 +45,8 @@ use libc::{c_char, c_int};
 /// @par Errors (errno):
 /// - EINVAL:   `path` is NULL or not valid UTF-8
 /// - EALREADY: a trace session is already active or was previously stopped
+/// - ENOTSUP: another tracing subscriber was already installed by user code
+/// - ENOSYS:  tracing support not compiled in (built without `tracing` feature)
 ///
 /// @par Example
 /// @code{.c}
@@ -51,25 +54,37 @@ use libc::{c_char, c_int};
 /// // ... inference pipeline ...
 /// hal_stop_tracing();
 /// @endcode
-#[cfg(feature = "tracing")]
 #[no_mangle]
 pub unsafe extern "C" fn hal_start_tracing(path: *const c_char) -> c_int {
-    if path.is_null() {
-        errno::set_errno(errno::Errno(libc::EINVAL));
-        return -1;
+    #[cfg(not(feature = "tracing"))]
+    {
+        let _ = path;
+        errno::set_errno(errno::Errno(libc::ENOSYS));
+        -1
     }
-    let path_str = match std::ffi::CStr::from_ptr(path).to_str() {
-        Ok(s) => s,
-        Err(_) => {
+    #[cfg(feature = "tracing")]
+    {
+        if path.is_null() {
             errno::set_errno(errno::Errno(libc::EINVAL));
             return -1;
         }
-    };
-    match edgefirst_hal::trace::start_tracing(path_str) {
-        Ok(()) => 0,
-        Err(_) => {
-            errno::set_errno(errno::Errno(libc::EALREADY));
-            -1
+        let path_str = match std::ffi::CStr::from_ptr(path).to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                errno::set_errno(errno::Errno(libc::EINVAL));
+                return -1;
+            }
+        };
+        match edgefirst_hal::trace::start_tracing(path_str) {
+            Ok(()) => 0,
+            Err(edgefirst_hal::trace::TracingError::AlreadyActive) => {
+                errno::set_errno(errno::Errno(libc::EALREADY));
+                -1
+            }
+            Err(edgefirst_hal::trace::TracingError::SubscriberInstallFailed(_)) => {
+                errno::set_errno(errno::Errno(libc::ENOTSUP));
+                -1
+            }
         }
     }
 }
@@ -77,7 +92,8 @@ pub unsafe extern "C" fn hal_start_tracing(path: *const c_char) -> c_int {
 /// Stop trace capture and flush all buffered spans to the output file.
 ///
 /// After this call the trace file is complete and can be loaded into
-/// https://ui.perfetto.dev/. No-op if no session is active.
+/// https://ui.perfetto.dev/. No-op if no session is active or if tracing
+/// support is not compiled in.
 ///
 /// @par Example
 /// @code{.c}
@@ -85,21 +101,22 @@ pub unsafe extern "C" fn hal_start_tracing(path: *const c_char) -> c_int {
 /// // ... work ...
 /// hal_stop_tracing();  // flushes and finalizes the trace file
 /// @endcode
-#[cfg(feature = "tracing")]
 #[no_mangle]
 pub extern "C" fn hal_stop_tracing() {
+    #[cfg(feature = "tracing")]
     edgefirst_hal::trace::stop_tracing();
 }
 
 /// Check whether a trace capture session is currently active.
 ///
-/// @return 1 if tracing is active, 0 otherwise
-#[cfg(feature = "tracing")]
+/// @return 1 if tracing is active, 0 otherwise (always 0 if tracing not compiled in)
 #[no_mangle]
 pub extern "C" fn hal_is_tracing_active() -> c_int {
-    if edgefirst_hal::trace::is_tracing_active() {
-        1
-    } else {
-        0
+    #[cfg(feature = "tracing")]
+    {
+        if edgefirst_hal::trace::is_tracing_active() {
+            return 1;
+        }
     }
+    0
 }

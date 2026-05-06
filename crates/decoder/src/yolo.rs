@@ -1703,7 +1703,7 @@ pub(crate) fn extract_proto_data_quant<
         .with_quantization(tensor_quant)
         .expect("per-tensor quantization on new Tensor<i8>");
 
-    span.record("layout", format!("{:?}", proto_layout).as_str());
+    span.record("layout", tracing::field::debug(&proto_layout));
 
     ProtoData {
         mask_coefficients,
