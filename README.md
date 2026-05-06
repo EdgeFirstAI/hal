@@ -1263,8 +1263,8 @@ The following spans provide full visibility into HAL processing pipelines:
 
 #### Decode Pipeline
 
-| Span | Crate | Fields |
-|------|-------|--------|
+| Span | Component | Fields |
+|------|-----------|--------|
 | `decode` | decoder | `mode` (quant_det/float_det/split_quant_det/split_float_det) |
 | `score_filter` | decoder | — |
 | `top_k` | decoder | `k` |
@@ -1275,8 +1275,8 @@ The following spans provide full visibility into HAL processing pipelines:
 
 #### Image Processing
 
-| Span | Crate | Fields |
-|------|-------|--------|
+| Span | Component | Fields |
+|------|-----------|--------|
 | `image_convert` | image | `src_fmt`, `dst_fmt`, `src_memory`, `dst_memory`, `rotation`, `flip` |
 | `cpu_format_convert` | image | `from`, `to`, `pass` (pre_resize/post_resize/direct) |
 | `cpu_resize` | image | — |
@@ -1291,8 +1291,8 @@ The following spans provide full visibility into HAL processing pipelines:
 
 #### Tensor & Tracker
 
-| Span | Crate | Fields |
-|------|-------|--------|
+| Span | Component | Fields |
+|------|-----------|--------|
 | `tensor_alloc` | tensor | `shape`, `memory`, `dtype` |
 | `tensor_map` | tensor | `memory` |
 | `tracker_update` | tracker | `n_detections`, `n_tracks` |
@@ -1302,8 +1302,8 @@ The following spans provide full visibility into HAL processing pipelines:
 
 #### Python Entry Points
 
-| Span | Crate | Fields |
-|------|-------|--------|
+| Span | Component | Fields |
+|------|-----------|--------|
 | `py_decode` | python | `n_tensors`, `max_boxes` |
 | `py_decode_tracked` | python | `n_tensors`, `max_boxes` |
 | `py_decode_proto` | python | `n_tensors`, `max_boxes` |
@@ -1380,7 +1380,8 @@ the [Optimization Guide](#optimization-guide) above and the benchmark data in
 
 3. **Cross-reference with perf**: For CPU-bound spans (mask materialization,
    NMS), combine trace data with `perf record` to identify instruction-level
-   hotspots within each span. See [BENCHMARKS.md § Measurement Methodology]
+   hotspots within each span. See
+   [BENCHMARKS.md § Measurement Methodology](BENCHMARKS.md#measurement-methodology)
    for the recommended workflow.
 
 4. **Multi-pass pipeline visibility**: The per-pass spans (`cpu_format_convert`

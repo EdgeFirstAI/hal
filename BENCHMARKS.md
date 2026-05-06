@@ -153,9 +153,9 @@ All benchmarks use the `edgefirst-bench` custom harness which:
 > **Tip:** Use the HAL's built-in [Performance Tracing](README.md#performance-tracing)
 > to capture per-call timing in your actual pipeline. Benchmarks measure
 > isolated operations; traces reveal how those operations compose and where
-> time is spent in real workloads. See [ARCHITECTURE.md § Performance Tracing
-> Architecture](ARCHITECTURE.md#performance-tracing-architecture) for the
-> recommended perf + tracing workflow.
+> time is spent in real workloads. See
+> [ARCHITECTURE.md § Performance Tracing Architecture](ARCHITECTURE.md#performance-tracing-architecture)
+> for the recommended perf + tracing workflow.
 
 ---
 

@@ -1083,7 +1083,7 @@ When no subscriber is installed (the default state), the interest cache is
 | `gl_` | OpenGL backend operation | `gl_convert`, `gl_pass1_to_rgba` |
 | `g2d_` | G2D hardware backend | `g2d_convert` |
 | `py_` | Python binding entry point | `py_decode`, `py_convert` |
-| `pass1_`/`pass2_` | Multi-pass sub-operation | `gl_pass1_to_rgba`, `gl_pass2_pack_rgb` |
+| `gl_pass1_`/`gl_pass2_` | Multi-pass GL sub-operation | `gl_pass1_to_rgba`, `gl_pass2_pack_rgb` |
 
 Field conventions:
 - `n` or `n_*` — counts (detections, candidates, tracks)
