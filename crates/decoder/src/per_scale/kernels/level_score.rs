@@ -80,11 +80,12 @@ impl_score_level_f16!(decode_score_level_f32_to_f16, f32, dequant_f32_to_f16);
 // NEON-baseline (Tier 1) score level kernels
 //
 // Same shape as the scalar variants above but call the NEON dequant
-// primitives in `kernels::neon_baseline`. Sigmoid still goes through
-// the scalar `sigmoid_slice_f32` at this milestone — NEON sigmoid lands
-// in task N-7 and replaces the activation step in-place. The dequant is
-// the bandwidth-bound part of the score path; getting it onto NEON
-// captures the bulk of the speedup before sigmoid is parallelized.
+// primitives in `kernels::neon_baseline`, AND use NEON sigmoid for the
+// activation step (`sigmoid_slice_f32_neon` / `sigmoid_slice_f16_neon`,
+// see the `$sigmoid` macro parameter). Both the dequant and the
+// sigmoid are NEON-vectorised at this point; the polynomial NEON
+// `expf` (Phase 2-A `N-13`) backs the sigmoid for the bulk of the
+// speedup over the original scalar libm path.
 // ────────────────────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "aarch64")]

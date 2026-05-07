@@ -109,11 +109,18 @@ involved. They stay where they are.
 | `yolo11n_seg_per_scale_*` | yolo11n-seg | (same triplet) |
 | `yolo26n_seg_per_scale_*` | yolo26n-seg | (same triplet, LTRB encoding) |
 
-The 9 fixture-backed tests are currently `#[ignore]`'d because of a
-known HAL bug producing only ~2-3 post-NMS detections. The pre-NMS
-parity tests pass for the DFL fixtures already, narrowing the bug to
-the post-decode NMS bridge layer. Run with `--include-ignored` to
-exercise the framework-validation acceptance criteria:
+The fixture-backed parity tests now run as part of the standard
+suite — the post-decode NMS bridge bug that originally forced them
+to be `#[ignore]`'d was fixed in the per-scale subsystem rollout.
+Two `#[ignore]`-gated tests remain: external Python-only smoke
+fixtures that don't exercise the HAL decode path. Everything else
+runs by default with:
+
+```bash
+cargo test -p edgefirst-decoder --test per_scale_parity
+```
+
+To include the Python-only smoke tests as well:
 
 ```bash
 cargo test -p edgefirst-decoder --test per_scale_parity --include-ignored

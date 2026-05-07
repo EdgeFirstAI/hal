@@ -883,6 +883,8 @@ impl Decoder {
                 self.nms,
                 self.pre_nms_top_k,
                 self.max_det,
+                self.normalized,
+                self.input_dims,
             );
         }
 
@@ -960,6 +962,8 @@ impl Decoder {
                 self.nms,
                 self.pre_nms_top_k,
                 self.max_det,
+                self.normalized,
+                self.input_dims,
             );
         }
 

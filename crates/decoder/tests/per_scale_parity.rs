@@ -248,24 +248,26 @@ fn synthetic_ltrb_one_anchor_zero_input_gives_zero_box_at_centre() {
     // Box at centre (4, 4), zero-size after dist2bbox.
     // The bridge feeds XYWH (xc, yc, w, h) into impl_yolo_segdet_get_boxes which
     // converts to XYXY: xmin=xc-w/2, ymin=yc-h/2, xmax=xc+w/2, ymax=yc+h/2.
-    // For zero w/h: xmin = xmax = 4, ymin = ymax = 4.
+    // For zero w/h pixel-space: xmin = xmax = 4, ymin = ymax = 4.
+    // EDGEAI-1303: per_scale path normalizes by input dims (8x8 here),
+    // so the user-facing bbox is 4/8 = 0.5 across all corners.
     assert!(
-        (det.bbox.xmin - 4.0).abs() < 1e-3,
+        (det.bbox.xmin - 0.5).abs() < 1e-3,
         "xmin = {}",
         det.bbox.xmin
     );
     assert!(
-        (det.bbox.ymin - 4.0).abs() < 1e-3,
+        (det.bbox.ymin - 0.5).abs() < 1e-3,
         "ymin = {}",
         det.bbox.ymin
     );
     assert!(
-        (det.bbox.xmax - 4.0).abs() < 1e-3,
+        (det.bbox.xmax - 0.5).abs() < 1e-3,
         "xmax = {}",
         det.bbox.xmax
     );
     assert!(
-        (det.bbox.ymax - 4.0).abs() < 1e-3,
+        (det.bbox.ymax - 0.5).abs() < 1e-3,
         "ymax = {}",
         det.bbox.ymax
     );
@@ -323,23 +325,27 @@ fn synthetic_ltrb_distances_produce_expected_box() {
 
     assert_eq!(output_boxes.len(), 1);
     let det = &output_boxes[0];
+    // EDGEAI-1303: per_scale path normalizes by input dims (8x8 here).
+    // Pixel-space (-4, -4, 28, 28) → normalized (-0.5, -0.5, 3.5, 3.5).
+    // YOLO can predict boxes outside the canvas for objects near the
+    // border; the normalization preserves that out-of-range information.
     assert!(
-        (det.bbox.xmin - (-4.0)).abs() < 1e-2,
+        (det.bbox.xmin - (-0.5)).abs() < 1e-2,
         "xmin = {}",
         det.bbox.xmin
     );
     assert!(
-        (det.bbox.xmax - 28.0).abs() < 1e-2,
+        (det.bbox.xmax - 3.5).abs() < 1e-2,
         "xmax = {}",
         det.bbox.xmax
     );
     assert!(
-        (det.bbox.ymin - (-4.0)).abs() < 1e-2,
+        (det.bbox.ymin - (-0.5)).abs() < 1e-2,
         "ymin = {}",
         det.bbox.ymin
     );
     assert!(
-        (det.bbox.ymax - 28.0).abs() < 1e-2,
+        (det.bbox.ymax - 3.5).abs() < 1e-2,
         "ymax = {}",
         det.bbox.ymax
     );
@@ -1241,6 +1247,23 @@ fn decode_with_nms(
     decoder
         .decode_proto(&inputs, &mut boxes)
         .unwrap_or_else(|e| panic!("{model_label}: decode_proto: {e}"));
+    // EDGEAI-1303: HAL now emits normalized [0, 1] bboxes from the
+    // per-scale path (per `per_scale_to_proto_data`'s
+    // `maybe_normalize_boxes_in_place` call). The existing
+    // safetensors fixtures store *pixel-space* reference coords from
+    // the pre-fix Python pipeline, so convert HAL output back to
+    // pixel space here for the IoU comparison. The HAL output is
+    // semantically correct; only the parity test needs unit
+    // alignment.
+    if let Some((w, h)) = decoder.input_dims() {
+        let (w, h) = (w as f32, h as f32);
+        for b in &mut boxes {
+            b.bbox.xmin *= w;
+            b.bbox.ymin *= h;
+            b.bbox.xmax *= w;
+            b.bbox.ymax *= h;
+        }
+    }
     boxes
 }
 
@@ -1445,6 +1468,89 @@ fn yolov8n_seg_per_scale_smoke_detection_count() {
         "yolov8n-seg per-scale produced {n} detections, expected ≥ {}",
         fix.expected_count_min
     );
+}
+
+/// Per-scale `decode()` (the fused mask-materialisation entrypoint)
+/// must succeed end-to-end for a real-model fixture and emit one
+/// `Segmentation` per `DetectBox`. Regression test for the missing
+/// `maybe_normalize_boxes_in_place` step in `per_scale_to_masks`
+/// flagged by Copilot's review of PR #63 — the per-scale path emits
+/// pixel-space coords by design, and `protobox` would reject them
+/// with `InvalidShape("…un-normalized…")` without normalization.
+#[test]
+fn yolov8n_seg_per_scale_decode_with_masks_succeeds() {
+    use edgefirst_decoder::per_scale::DecodeDtype;
+    use edgefirst_decoder::{schema::SchemaV2, DecoderBuilder, DetectBox, Nms, Segmentation};
+
+    let path = fixture_path("yolov8n-seg.safetensors");
+    let fix = match common::per_scale_fixture::PerScaleFixture::load(&path) {
+        Ok(f) => f,
+        Err(common::per_scale_fixture::FixtureError::NotPresent(_)) => {
+            eprintln!("skip: fixture {path:?} not present (run `git lfs pull`)");
+            return;
+        }
+        Err(e) => panic!("fixture load failed: {e}"),
+    };
+    let schema: SchemaV2 = serde_json::from_str(fix.schema_json())
+        .expect("fixture schema_json must parse as SchemaV2");
+    let nms = fix.nms_config();
+    let decoder = DecoderBuilder::default()
+        .with_schema(schema)
+        .with_decode_dtype(DecodeDtype::F32)
+        .with_iou_threshold(nms.iou_threshold)
+        .with_score_threshold(nms.score_threshold)
+        .with_nms(Some(Nms::ClassAware))
+        .build()
+        .expect("build decoder");
+
+    // Sanity: schema-derived input_dims must be present for normalization
+    // to take effect (per-scale builder forces normalized = Some(false)).
+    assert_eq!(decoder.normalized_boxes(), Some(false));
+    assert!(
+        decoder.input_dims().is_some(),
+        "yolov8n-seg fixture schema must declare input dims so the \
+         per-scale bridge can normalize pixel-space boxes (EDGEAI-1303)"
+    );
+
+    let owned_tensors = fix.build_tensors_with_quant().expect("build tensors");
+    let inputs: Vec<&edgefirst_tensor::TensorDyn> = owned_tensors.iter().collect();
+
+    let mut output_boxes: Vec<DetectBox> = Vec::with_capacity(300);
+    let mut output_masks: Vec<Segmentation> = Vec::with_capacity(300);
+    decoder
+        .decode(&inputs, &mut output_boxes, &mut output_masks)
+        .expect("per-scale decode() must succeed end-to-end with masks");
+
+    let n_boxes = output_boxes.len();
+    let n_masks = output_masks.len();
+    assert_eq!(
+        n_boxes, n_masks,
+        "decode() must emit one Segmentation per DetectBox; got {n_boxes} boxes, {n_masks} masks"
+    );
+    assert!(
+        n_boxes >= fix.expected_count_min as usize,
+        "yolov8n-seg per-scale decode() produced {n_boxes} detections, expected ≥ {}",
+        fix.expected_count_min
+    );
+
+    // Boxes must be in roughly-normalized range — proves the bridge's
+    // EDGEAI-1303 normalization step ran. YOLO can predict boxes that
+    // extend slightly past the image edge for objects near the border,
+    // so allow a small tolerance below 0 / above 1; the original
+    // pixel-space coords would be in [0, ~640] which is far outside
+    // this tolerance.
+    let in_norm_range = |v: f32| (-0.05..=1.05).contains(&v);
+    for b in &output_boxes {
+        assert!(
+            in_norm_range(b.bbox.xmin)
+                && in_norm_range(b.bbox.ymin)
+                && in_norm_range(b.bbox.xmax)
+                && in_norm_range(b.bbox.ymax),
+            "per-scale decode() bbox {:?} not in normalized range — \
+             per_scale_to_masks did not normalize pixel-space coords",
+            b.bbox
+        );
+    }
 }
 
 #[test]

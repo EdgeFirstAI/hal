@@ -34,6 +34,17 @@ struct WidenedF32 {
     nm: usize,
 }
 
+// TODO(0.21.0): widen_to_f32 unconditionally copies — even when the
+// per-scale buffer is already f32, the `to_vec()` / `to_owned()` calls
+// allocate. For seg models the protos copy is the biggest waste
+// (32×160×160 f32 ≈ 3.2 MB per decode). The architectural fix is to
+// hold borrowed views in `WidenedF32` (e.g. `Cow<'a, [f32]>` for
+// boxes/scores/mask_coefs and `ArrayView3<'a, f32>` for protos) and
+// only allocate on the f16→f32 widening path. Deferred because the
+// downstream `impl_yolo_split_segdet_process_masks` and
+// `extract_proto_data_float` paths each copy again, so a single-site
+// fix only captures part of the win — the full refactor is a chained
+// lifetime-plumbing exercise. Per Copilot review on PR #63.
 fn widen_to_f32(decoded: &DecodedOutputsRef<'_>) -> WidenedF32 {
     let n = decoded.total_anchors;
     let nc = decoded.num_classes;
@@ -72,6 +83,7 @@ fn widen_to_f32(decoded: &DecodedOutputsRef<'_>) -> WidenedF32 {
 
 /// Bridge: per-scale outputs → optional `ProtoData`, with `output_boxes`
 /// populated post-NMS. Mirrors the contract of `decode_proto`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn per_scale_to_proto_data(
     decoded: &DecodedOutputsRef<'_>,
     output_boxes: &mut Vec<DetectBox>,
@@ -80,6 +92,8 @@ pub(super) fn per_scale_to_proto_data(
     nms_mode: Option<Nms>,
     pre_nms_top_k: usize,
     max_det: usize,
+    normalized: Option<bool>,
+    input_dims: Option<(usize, usize)>,
 ) -> Result<Option<ProtoData>, DecoderError> {
     let WidenedF32 {
         boxes,
@@ -98,7 +112,7 @@ pub(super) fn per_scale_to_proto_data(
 
     output_boxes.clear();
 
-    let det_indices = impl_yolo_segdet_get_boxes::<XYWH, _, _>(
+    let mut det_indices = impl_yolo_segdet_get_boxes::<XYWH, _, _>(
         boxes_view,
         scores_view,
         score_threshold,
@@ -107,6 +121,10 @@ pub(super) fn per_scale_to_proto_data(
         pre_nms_top_k,
         max_det,
     );
+    // Per-scale `dist2bbox_anchor_*` emits pixel-space coords by design.
+    // Apply EDGEAI-1303 normalization so output bboxes land in the
+    // canonical [0, 1] range expected by Decoder callers.
+    crate::yolo::maybe_normalize_boxes_in_place(&mut det_indices, normalized, input_dims);
 
     match (mask_coefs.as_ref(), protos.as_ref()) {
         (Some(mc), Some(pr)) => {
@@ -139,6 +157,8 @@ pub(super) fn per_scale_to_masks(
     nms_mode: Option<Nms>,
     pre_nms_top_k: usize,
     max_det: usize,
+    normalized: Option<bool>,
+    input_dims: Option<(usize, usize)>,
 ) -> Result<(), DecoderError> {
     let WidenedF32 {
         boxes,
@@ -158,7 +178,7 @@ pub(super) fn per_scale_to_masks(
     output_boxes.clear();
     output_masks.clear();
 
-    let det_indices = impl_yolo_segdet_get_boxes::<XYWH, _, _>(
+    let mut det_indices = impl_yolo_segdet_get_boxes::<XYWH, _, _>(
         boxes_view,
         scores_view,
         score_threshold,
@@ -167,6 +187,11 @@ pub(super) fn per_scale_to_masks(
         pre_nms_top_k,
         max_det,
     );
+    // Per-scale `dist2bbox_anchor_*` emits pixel-space coords by design.
+    // Normalize before mask processing so `protobox` sees [0, 1] coords
+    // and the returned bboxes match the contract of `Decoder::decode`
+    // (EDGEAI-1303 + Copilot review feedback on PR #63).
+    crate::yolo::maybe_normalize_boxes_in_place(&mut det_indices, normalized, input_dims);
 
     match (mask_coefs.as_ref(), protos.as_ref()) {
         (Some(mc), Some(pr)) => {

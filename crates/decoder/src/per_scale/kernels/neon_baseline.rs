@@ -1221,8 +1221,14 @@ mod tests {
         // f16 polynomial expf has ~1% relative error in exp(r) — wider
         // envelope than the 8 ulp f32 path, so we test relative diff
         // instead of ulp count.
-        // Range [-15, 15] (the clamp envelope). Tests both branches of
-        // the input split + the upper-clamp / lower-clamp saturation.
+        //
+        // The kernel clamps inputs to ±10 (see `expf_neon_f32x8_via_f16`'s
+        // own comment) to keep `k = round(x * log2_e)` in [-14, 14], strictly
+        // inside f16's 5-bit-exponent + bias-15 range. Inputs outside that
+        // envelope saturate to exp(±10). The oracle below mirrors that
+        // saturation so the test exercises the whole [-15, 15] input range
+        // (including the saturating boundary) without expecting precision
+        // the kernel never claimed.
         let cases: Vec<f32> = (-30..=30).map(|i| i as f32 * 0.5).collect();
         for chunk in cases.chunks(8) {
             if chunk.len() < 8 {
@@ -1237,7 +1243,7 @@ mod tests {
                 vst1q_f32(out.as_mut_ptr().add(4), out_hi);
             }
             for (i, &x) in chunk.iter().enumerate() {
-                let oracle = x.clamp(-15.0, 15.0).exp();
+                let oracle = x.clamp(-10.0, 10.0).exp();
                 let abs_err = (out[i] - oracle).abs();
                 let rel_err = abs_err / oracle.max(1e-6);
                 // 2% relative or 1e-4 absolute — accommodates f16's 10-bit
