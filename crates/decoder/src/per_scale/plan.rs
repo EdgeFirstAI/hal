@@ -638,10 +638,17 @@ mod tests {
             .unwrap()
             .unwrap();
         use crate::per_scale::kernels::dispatch::BoxLevelDispatch;
-        assert!(matches!(
-            plan.box_dispatch,
-            BoxLevelDispatch::DflI8ToF32Scalar
-        ));
+        // Tier-aware: scalar host picks `DflI8ToF32Scalar`, aarch64
+        // hosts pick `DflI8ToF32NeonBase` (or `*NeonFp16` on A55+).
+        // The test asserts shape (DFL i8 → f32), not the SIMD tier.
+        // NEON variants are aarch64-only; gate the arms accordingly.
+        let ok = match plan.box_dispatch {
+            BoxLevelDispatch::DflI8ToF32Scalar => true,
+            #[cfg(target_arch = "aarch64")]
+            BoxLevelDispatch::DflI8ToF32NeonBase | BoxLevelDispatch::DflI8ToF32NeonFp16 => true,
+            _ => false,
+        };
+        assert!(ok, "unexpected dispatch: {:?}", plan.box_dispatch);
         assert!(plan.mc_dispatch.is_some());
         assert!(plan.proto_dispatch.is_some());
     }
@@ -653,9 +660,14 @@ mod tests {
             .unwrap()
             .unwrap();
         use crate::per_scale::kernels::dispatch::BoxLevelDispatch;
-        assert!(matches!(
-            plan.box_dispatch,
-            BoxLevelDispatch::LtrbI8ToF32Scalar
-        ));
+        // Tier-aware: see sibling test above. NEON variants are
+        // aarch64-only; LTRB has no FP16 variant by design.
+        let ok = match plan.box_dispatch {
+            BoxLevelDispatch::LtrbI8ToF32Scalar => true,
+            #[cfg(target_arch = "aarch64")]
+            BoxLevelDispatch::LtrbI8ToF32NeonBase => true,
+            _ => false,
+        };
+        assert!(ok, "unexpected dispatch: {:?}", plan.box_dispatch);
     }
 }

@@ -192,6 +192,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Known Limitations
 
+- **`per_scale_bridge::widen_to_f32` allocates per-frame even when
+  buffers are already `f32`.** For segmentation models the proto
+  tensor copy (32×160×160 f32 ≈ 3.2 MB) is the largest single source
+  of waste in the per-scale → legacy bridge. The architectural fix
+  is to make `WidenedF32` hold borrowed views (`Cow<'a, [f32]>`,
+  `ArrayView3<'a, f32>`) and only allocate on the f16→f32 widening
+  path. Deferred to 0.21.0 because the downstream
+  `impl_yolo_split_segdet_process_masks` and `extract_proto_data_float`
+  paths also copy, so a single-site fix only captures part of the
+  win — the full refactor is a chained lifetime-plumbing exercise.
 - **`max_boxes` / `max_det` API surface is inconsistent across
   language bindings** and will need a unified pass before the next
   minor release. The current state per language:
