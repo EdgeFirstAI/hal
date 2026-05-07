@@ -11,6 +11,36 @@ use crate::per_scale::{DecodeDtype, PerScalePlan};
 use crate::schema::SchemaV2;
 use crate::DecoderError;
 
+/// Extract `(width, height)` from a schema [`crate::schema::InputSpec`].
+///
+/// Prefers named dims (`DimName::Width` / `DimName::Height`) when the
+/// `dshape` is populated, falling back to the NHWC convention
+/// (`shape[1] = H, shape[2] = W`) for 4-element shapes. Returns `None`
+/// for any other shape arity — the decoder treats that as "input dims
+/// unknown" and skips the EDGEAI-1303 normalization path.
+fn input_dims_from_spec(input: &crate::schema::InputSpec) -> Option<(usize, usize)> {
+    use crate::configs::DimName;
+    let mut h = None;
+    let mut w = None;
+    for (i, (name, _)) in input.dshape.iter().enumerate() {
+        match name {
+            DimName::Height => h = Some(input.shape[i]),
+            DimName::Width => w = Some(input.shape[i]),
+            _ => {}
+        }
+    }
+    if h.is_none() && w.is_none() && input.shape.len() == 4 {
+        // NHWC default: [N, H, W, C]. Mirrors the per-scale `extract_hw`
+        // fallback (`crates/decoder/src/per_scale/plan.rs::extract_hw`).
+        h = Some(input.shape[1]);
+        w = Some(input.shape[2]);
+    }
+    match (w, h) {
+        (Some(w), Some(h)) => Some((w, h)),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecoderBuilder {
     config_src: Option<ConfigSource>,
@@ -865,14 +895,14 @@ impl DecoderBuilder {
     /// ```
     pub fn build(self) -> Result<Decoder, DecoderError> {
         let decode_dtype = self.decode_dtype;
-        let (config, decode_program, per_scale_plan) = match self.config_src {
+        let (config, decode_program, per_scale_plan, input_dims) = match self.config_src {
             Some(ConfigSource::Json(s)) => {
                 Self::build_from_schema(SchemaV2::parse_json(&s)?, decode_dtype)?
             }
             Some(ConfigSource::Yaml(s)) => {
                 Self::build_from_schema(SchemaV2::parse_yaml(&s)?, decode_dtype)?
             }
-            Some(ConfigSource::Config(c)) => (c, None, None),
+            Some(ConfigSource::Config(c)) => (c, None, None, None),
             Some(ConfigSource::Schema(schema)) => Self::build_from_schema(schema, decode_dtype)?,
             None => return Err(DecoderError::NoConfig),
         };
@@ -934,6 +964,7 @@ impl DecoderBuilder {
             pre_nms_top_k: self.pre_nms_top_k,
             max_det: self.max_det,
             normalized,
+            input_dims,
             decode_program,
             per_scale,
         })
@@ -950,15 +981,29 @@ impl DecoderBuilder {
     /// schema either way (v1 inputs are upgraded in memory via
     /// `from_v1`), so this helper is the sole place that turns a
     /// schema into builder-ready state.
+    #[allow(clippy::type_complexity)]
     fn build_from_schema(
         schema: SchemaV2,
         decode_dtype: DecodeDtype,
-    ) -> Result<(ConfigOutputs, Option<DecodeProgram>, Option<PerScalePlan>), DecoderError> {
+    ) -> Result<
+        (
+            ConfigOutputs,
+            Option<DecodeProgram>,
+            Option<PerScalePlan>,
+            Option<(usize, usize)>,
+        ),
+        DecoderError,
+    > {
         schema.validate()?;
         let program = DecodeProgram::try_from_schema(&schema)?;
         let per_scale = PerScalePlan::try_from_schema(&schema, decode_dtype)?;
+        // Extract model input (W, H) from `input.shape`/`dshape`. Used by
+        // the legacy decode path to honour `normalized: false` (see
+        // EDGEAI-1303). `None` is fine when the schema omits the input
+        // spec — the decoder falls back to the protobox `>2.0` reject.
+        let input_dims = schema.input.as_ref().and_then(input_dims_from_spec);
         let legacy = schema.to_legacy_config_outputs()?;
-        Ok((legacy, program, per_scale))
+        Ok((legacy, program, per_scale, input_dims))
     }
 
     /// Extracts the normalized flag from config outputs.

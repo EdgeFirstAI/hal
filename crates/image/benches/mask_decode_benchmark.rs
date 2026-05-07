@@ -102,6 +102,8 @@ fn decode_from_fixtures() -> (Vec<DetectBox>, ProtoData) {
         Some(Nms::ClassAgnostic),
         edgefirst_decoder::yolo::MAX_NMS_CANDIDATES,
         300,
+        None,
+        None,
         &mut output_boxes,
     );
     (output_boxes, proto_data)
@@ -599,6 +601,8 @@ fn bench_nms_decode(suite: &mut BenchSuite) {
             Some(Nms::ClassAgnostic),
             edgefirst_decoder::yolo::MAX_NMS_CANDIDATES,
             300,
+            None,
+            None,
             &mut output_boxes,
         );
         std::hint::black_box((&output_boxes, &proto_data));
@@ -620,6 +624,8 @@ fn bench_nms_decode(suite: &mut BenchSuite) {
             Some(Nms::ClassAgnostic),
             edgefirst_decoder::yolo::MAX_NMS_CANDIDATES,
             300,
+            None,
+            None,
             &mut output_boxes,
         );
         std::hint::black_box((&output_boxes, &proto_data));
@@ -639,6 +645,8 @@ fn bench_nms_decode(suite: &mut BenchSuite) {
             Some(Nms::ClassAgnostic),
             3000,
             300,
+            None,
+            None,
             &mut output_boxes,
         );
         std::hint::black_box((&output_boxes, &proto_data));
@@ -658,6 +666,8 @@ fn bench_nms_decode(suite: &mut BenchSuite) {
             Some(Nms::ClassAgnostic),
             300,
             300,
+            None,
+            None,
             &mut output_boxes,
         );
         std::hint::black_box((&output_boxes, &proto_data));
@@ -677,6 +687,8 @@ fn bench_nms_decode(suite: &mut BenchSuite) {
             None, // bypass NMS
             edgefirst_decoder::yolo::MAX_NMS_CANDIDATES,
             300,
+            None,
+            None,
             &mut output_boxes,
         );
         std::hint::black_box((&output_boxes, &proto_data));

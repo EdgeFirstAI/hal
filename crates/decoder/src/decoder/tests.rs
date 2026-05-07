@@ -2895,6 +2895,8 @@ outputs:
             Some(Nms::ClassAgnostic),
             crate::yolo::MAX_NMS_CANDIDATES,
             300,
+            None,
+            None,
             &mut output_boxes,
         );
 
@@ -2995,6 +2997,8 @@ outputs:
             Some(Nms::ClassAgnostic),
             crate::yolo::MAX_NMS_CANDIDATES,
             300,
+            None,
+            None,
             &mut ref_boxes,
         );
         assert!(
@@ -3017,6 +3021,8 @@ outputs:
             Some(Nms::ClassAgnostic),
             crate::yolo::MAX_NMS_CANDIDATES,
             300,
+            None,
+            None,
             &mut output_boxes,
         );
 
@@ -3102,6 +3108,8 @@ outputs:
             Some(Nms::ClassAgnostic),
             crate::yolo::MAX_NMS_CANDIDATES,
             300,
+            None,
+            None,
             &mut ref_boxes,
         );
         assert!(!ref_boxes.is_empty());
@@ -3123,6 +3131,8 @@ outputs:
             Some(Nms::ClassAgnostic),
             crate::yolo::MAX_NMS_CANDIDATES,
             300,
+            None,
+            None,
             &mut output_boxes,
         );
 
@@ -4119,6 +4129,8 @@ outputs:
             Some(Nms::ClassAgnostic),
             crate::yolo::MAX_NMS_CANDIDATES,
             300,
+            None,
+            None,
             &mut output_boxes,
         );
 
@@ -4190,6 +4202,8 @@ outputs:
             Some(Nms::ClassAgnostic),
             crate::yolo::MAX_NMS_CANDIDATES,
             300,
+            None,
+            None,
             &mut output_boxes,
         );
 

@@ -1176,6 +1176,12 @@ struct hal_decoder *hal_decoder_new(const struct hal_decoder_params *params);
  *
  * All output tensors must be the same general category (all float or all integer).
  *
+ * The number of detections returned is bounded by the decoder's `max_det`
+ * (set on the builder via `hal_decoder_params_set_max_det`, default 300);
+ * the internal `Vec::capacity()` of `out_boxes` / `out_segmentations` is
+ * only an allocation hint and is never used as a semantic cap. See the
+ * Rust `Decoder::decode` rustdoc and EDGEAI-1302 for details.
+ *
  * @param decoder Decoder handle
  * @param outputs Array of output tensor pointers
  * @param num_outputs Number of output tensors
@@ -1206,6 +1212,11 @@ int hal_decoder_decode(const struct hal_decoder *decoder,
  *       + `hal_image_processor_draw_decoded_masks()` separately prevents the HAL from
  *       using its internal fused optimization. For render-only use cases, prefer
  *       `hal_image_processor_draw_masks()` which is 1.6–27× faster on tested platforms.
+ *
+ * The number of detections returned is bounded by the decoder's `max_det`
+ * (set on the builder via `hal_decoder_params_set_max_det`, default 300);
+ * the internal `Vec::capacity()` of `out_boxes` is only an allocation hint
+ * and is never used as a semantic cap. See EDGEAI-1302.
  *
  * @param decoder Decoder handle
  * @param outputs Array of output tensor pointers

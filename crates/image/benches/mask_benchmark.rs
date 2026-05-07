@@ -79,6 +79,8 @@ fn decode_proto_data() -> (Vec<DetectBox>, ProtoData) {
         Some(Nms::ClassAgnostic),
         edgefirst_decoder::yolo::MAX_NMS_CANDIDATES,
         300,
+        None,
+        None,
         &mut output_boxes,
     );
     (output_boxes, proto_data)
@@ -368,6 +370,8 @@ fn bench_decode_masks(suite: &mut BenchSuite) {
                 Some(Nms::ClassAgnostic),
                 edgefirst_decoder::yolo::MAX_NMS_CANDIDATES,
                 300,
+                None,
+                None,
                 &mut output_boxes,
             );
         });
@@ -389,6 +393,8 @@ fn bench_decode_masks(suite: &mut BenchSuite) {
                 Some(Nms::ClassAgnostic),
                 edgefirst_decoder::yolo::MAX_NMS_CANDIDATES,
                 300,
+                None,
+                None,
                 &mut output_boxes,
             );
             let _seg = materialize_segmentations(&output_boxes, &proto_data);
@@ -419,6 +425,8 @@ fn bench_proto_extraction(suite: &mut BenchSuite) {
         Some(Nms::ClassAgnostic),
         edgefirst_decoder::yolo::MAX_NMS_CANDIDATES,
         300,
+        None,
+        None,
         &mut warmup_boxes,
     );
     let n_detect = warmup_boxes.len();
@@ -435,6 +443,8 @@ fn bench_proto_extraction(suite: &mut BenchSuite) {
             Some(Nms::ClassAgnostic),
             edgefirst_decoder::yolo::MAX_NMS_CANDIDATES,
             300,
+            None,
+            None,
             &mut output_boxes,
         );
     });

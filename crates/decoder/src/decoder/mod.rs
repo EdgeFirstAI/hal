@@ -40,6 +40,14 @@ pub struct Decoder {
     /// - `None`: Unknown, caller must infer (e.g., check if any coordinate >
     ///   1.0)
     normalized: Option<bool>,
+    /// Model input spatial dimensions `(width, height)`, captured from
+    /// the schema's `input.shape` / `input.dshape` at builder time.
+    /// Required to honour `normalized: false`: pixel-space box coords
+    /// emitted by the model are divided by these dimensions before NMS
+    /// so the post-NMS bbox is in `[0, 1]`. `None` when no schema input
+    /// spec is available — the legacy >2.0 reject in `protobox` then
+    /// preserves the previous safety net (EDGEAI-1303).
+    input_dims: Option<(usize, usize)>,
     /// Schema v2 merge program. Present when the decoder was built from
     /// a [`crate::schema::SchemaV2`] whose logical outputs carry
     /// physical children. Absent for flat configurations (v1 and
@@ -63,6 +71,7 @@ impl PartialEq for Decoder {
             && self.pre_nms_top_k == other.pre_nms_top_k
             && self.max_det == other.max_det
             && self.normalized == other.normalized
+            && self.input_dims == other.input_dims
             && self.decode_program.is_some() == other.decode_program.is_some()
             && self.per_scale.is_some() == other.per_scale.is_some()
     }
@@ -84,6 +93,7 @@ impl Clone for Decoder {
             pre_nms_top_k: self.pre_nms_top_k,
             max_det: self.max_det,
             normalized: self.normalized,
+            input_dims: self.input_dims,
             decode_program: self.decode_program.clone(),
             per_scale: None,
         }
@@ -267,6 +277,16 @@ impl Decoder {
     /// ```
     pub fn normalized_boxes(&self) -> Option<bool> {
         self.normalized
+    }
+
+    /// Model input dimensions `(width, height)` captured from the
+    /// schema's `input.shape` / `input.dshape`, or `None` when the
+    /// schema did not declare an input spec (e.g. flat YAML configs
+    /// built by hand). Used by the decoder to convert pixel-space box
+    /// coordinates (`normalized: false`) into the canonical `[0, 1]`
+    /// range before NMS and proto cropping. See EDGEAI-1303.
+    pub fn input_dims(&self) -> Option<(usize, usize)> {
+        self.input_dims
     }
 
     /// Decode quantized model outputs into detection boxes and segmentation
