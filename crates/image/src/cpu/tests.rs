@@ -2269,9 +2269,8 @@ mod cpu_tests {
     /// the resulting file; subsequent runs verify bit-exact.
     #[test]
     fn test_materialize_golden_i8_cached_model() {
-        use edgefirst_decoder::{
-            yolo::impl_yolo_segdet_quant_proto, DetectBox, Nms, ProtoData, Quantization, XYWH,
-        };
+        use edgefirst_decoder::{configs, ConfigOutput, DecoderBuilder, DetectBox, Nms, ProtoData};
+        use edgefirst_tensor::{Tensor, TensorDyn};
 
         let boxes_raw = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -2279,7 +2278,9 @@ mod cpu_tests {
         ));
         let boxes_i8 =
             unsafe { std::slice::from_raw_parts(boxes_raw.as_ptr() as *const i8, boxes_raw.len()) };
-        let boxes = ndarray::Array2::from_shape_vec((116, 8400), boxes_i8.to_vec()).unwrap();
+        let boxes_tensor = TensorDyn::I8(
+            Tensor::<i8>::from_slice(boxes_i8, &[1, 116, 8400]).expect("boxes tensor"),
+        );
 
         let protos_raw = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -2288,22 +2289,39 @@ mod cpu_tests {
         let protos_i8 = unsafe {
             std::slice::from_raw_parts(protos_raw.as_ptr() as *const i8, protos_raw.len())
         };
-        let protos = ndarray::Array3::from_shape_vec((160, 160, 32), protos_i8.to_vec()).unwrap();
-
-        let quant_boxes = Quantization::new(0.019_484_945, 20);
-        let quant_protos = Quantization::new(0.020_889_873, -115);
-
-        let mut detections: Vec<DetectBox> = Vec::with_capacity(50);
-        let proto_data: ProtoData = impl_yolo_segdet_quant_proto::<XYWH, _, _>(
-            (boxes.view(), quant_boxes),
-            (protos.view(), quant_protos),
-            0.45,
-            0.45,
-            Some(Nms::ClassAgnostic),
-            edgefirst_decoder::yolo::MAX_NMS_CANDIDATES,
-            300,
-            &mut detections,
+        let protos_tensor = TensorDyn::I8(
+            Tensor::<i8>::from_slice(protos_i8, &[1, 160, 160, 32]).expect("protos tensor"),
         );
+
+        let detection_cfg = configs::Detection {
+            decoder: configs::DecoderType::Ultralytics,
+            quantization: Some(configs::QuantTuple(0.019_484_945, 20)),
+            shape: vec![1, 116, 8400],
+            dshape: vec![],
+            anchors: None,
+            normalized: Some(true),
+        };
+        let protos_cfg = configs::Protos {
+            decoder: configs::DecoderType::Ultralytics,
+            quantization: Some(configs::QuantTuple(0.020_889_873, -115)),
+            shape: vec![1, 160, 160, 32],
+            dshape: vec![],
+        };
+        let decoder = DecoderBuilder::default()
+            .with_score_threshold(0.45)
+            .with_iou_threshold(0.45)
+            .with_nms(Some(Nms::ClassAgnostic))
+            .add_output(ConfigOutput::Detection(detection_cfg))
+            .add_output(ConfigOutput::Protos(protos_cfg))
+            .build()
+            .expect("yolov8-seg golden decoder must build");
+
+        let inputs: Vec<&TensorDyn> = vec![&boxes_tensor, &protos_tensor];
+        let mut detections: Vec<DetectBox> = Vec::with_capacity(50);
+        let proto_data: ProtoData = decoder
+            .decode_proto(&inputs, &mut detections)
+            .expect("decode_proto must succeed")
+            .expect("yolov8-seg config produces ProtoData");
         assert!(!detections.is_empty(), "fixture produced no detections");
 
         let cpu = CPUProcessor::new();

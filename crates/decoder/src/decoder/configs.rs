@@ -362,4 +362,10 @@ pub enum ModelType {
         mask_coeff: MaskCoefficients,
         protos: Protos,
     },
+    /// Per-scale (physical-output-decomposition) YOLO model. The
+    /// per-scale subsystem (`crates/decoder/src/per_scale/`) owns
+    /// model decoding entirely; this variant exists as a marker so the
+    /// `Decoder::model_type` field has a sensible value for per-scale
+    /// Decoders that bypass the legacy `ModelType`-driven dispatch.
+    PerScale,
 }

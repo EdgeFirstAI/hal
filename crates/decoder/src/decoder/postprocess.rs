@@ -18,9 +18,8 @@ use crate::{
     yolo::FloatProtoElem,
     yolo::{
         decode_yolo_det, decode_yolo_det_float, decode_yolo_split_det_float,
-        decode_yolo_split_det_quant, decode_yolo_split_segdet_float, impl_yolo_segdet_float,
-        impl_yolo_segdet_quant, impl_yolo_split_segdet_quant_get_boxes,
-        impl_yolo_split_segdet_quant_process_masks,
+        decode_yolo_split_det_quant, impl_yolo_segdet_float, impl_yolo_segdet_quant,
+        impl_yolo_split_segdet_quant_get_boxes, impl_yolo_split_segdet_quant_process_masks,
     },
     DecoderError, DetectBox, ProtoData, Quantization, Segmentation, XYWH,
 };
@@ -242,6 +241,12 @@ impl Decoder {
             .map(Quantization::from)
             .unwrap_or_default();
 
+        // Reserve up-front so the post-NMS push doesn't reallocate. The
+        // detection-count cap is `self.max_det` only — caller-provided
+        // capacity is an allocation hint, not a semantic bound (see
+        // `Decoder::decode` rustdoc and EDGEAI-1302).
+        output_boxes.reserve(self.max_det.saturating_sub(output_boxes.len()));
+        output_masks.reserve(self.max_det.saturating_sub(output_masks.len()));
         with_quantized!(boxes_tensor, b, {
             with_quantized!(protos_tensor, p, {
                 let box_tensor = Self::swap_axes_if_needed(b, boxes.into());
@@ -256,7 +261,9 @@ impl Decoder {
                     self.iou_threshold,
                     self.nms,
                     self.pre_nms_top_k,
-                    self.max_det.min(output_boxes.capacity()),
+                    self.max_det,
+                    self.normalized,
+                    self.input_dims,
                     output_boxes,
                     output_masks,
                 )
@@ -350,7 +357,7 @@ impl Decoder {
         let (protos_tensor, _) =
             Self::find_outputs_with_shape_quantized(&protos.shape, outputs, &skip)?;
 
-        let boxes = with_quantized!(boxes_tensor, b, {
+        let mut boxes = with_quantized!(boxes_tensor, b, {
             with_quantized!(scores_tensor, s, {
                 let boxes_tensor = Self::swap_axes_if_needed(b, boxes.into());
                 let boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
@@ -371,6 +378,7 @@ impl Decoder {
                 )
             })
         });
+        crate::yolo::maybe_normalize_boxes_in_place(&mut boxes, self.normalized, self.input_dims);
 
         with_quantized!(mask_tensor, m, {
             with_quantized!(protos_tensor, p, {
@@ -431,7 +439,7 @@ impl Decoder {
 
         // Phase 1: Slice combined detection into boxes[0:4] and scores[4:],
         // run NMS. Both slices share the detection tensor's quantization.
-        let boxes = with_quantized!(det_tensor, d, {
+        let mut boxes = with_quantized!(det_tensor, d, {
             let det = Self::swap_axes_if_needed(d, detection.into());
             let det = det.slice(s![0, .., ..]);
             let boxes_view = det.slice(s![..4, ..]);
@@ -446,6 +454,7 @@ impl Decoder {
                 self.max_det,
             )
         });
+        crate::yolo::maybe_normalize_boxes_in_place(&mut boxes, self.normalized, self.input_dims);
 
         // Phase 2: Process masks with separate mask_coeff tensor.
         with_quantized!(mask_tensor, m, {
@@ -500,7 +509,7 @@ impl Decoder {
         let boxes_view = det_tensor.slice(s![..4, ..]);
         let scores_view = det_tensor.slice(s![4.., ..]);
 
-        decode_yolo_split_segdet_float(
+        crate::yolo::impl_yolo_split_segdet_float::<XYWH, _, _, _, _>(
             boxes_view,
             scores_view,
             mask_tensor,
@@ -508,6 +517,10 @@ impl Decoder {
             self.score_threshold,
             self.iou_threshold,
             self.nms,
+            self.pre_nms_top_k,
+            self.max_det,
+            self.normalized,
+            self.input_dims,
             output_boxes,
             output_masks,
         )
@@ -654,6 +667,10 @@ impl Decoder {
 
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
+        // Reserve up-front; capacity is an allocation hint, not a cap
+        // (see `Decoder::decode` rustdoc and EDGEAI-1302).
+        output_boxes.reserve(self.max_det.saturating_sub(output_boxes.len()));
+        output_masks.reserve(self.max_det.saturating_sub(output_masks.len()));
         impl_yolo_segdet_float::<XYWH, _, _>(
             boxes_tensor,
             protos_tensor,
@@ -661,7 +678,9 @@ impl Decoder {
             self.iou_threshold,
             self.nms,
             self.pre_nms_top_k,
-            self.max_det.min(output_boxes.capacity()),
+            self.max_det,
+            self.normalized,
+            self.input_dims,
             output_boxes,
             output_masks,
         )
@@ -734,7 +753,7 @@ impl Decoder {
         let (protos_tensor, _) = Self::find_outputs_with_shape(&protos.shape, outputs, &skip)?;
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-        decode_yolo_split_segdet_float(
+        crate::yolo::impl_yolo_split_segdet_float::<XYWH, _, _, _, _>(
             boxes_tensor,
             scores_tensor,
             mask_tensor,
@@ -742,6 +761,10 @@ impl Decoder {
             self.score_threshold,
             self.iou_threshold,
             self.nms,
+            self.pre_nms_top_k,
+            self.max_det,
+            self.normalized,
+            self.input_dims,
             output_boxes,
             output_masks,
         )
@@ -1144,6 +1167,8 @@ impl Decoder {
                     self.nms,
                     self.pre_nms_top_k,
                     self.max_det,
+                    self.normalized,
+                    self.input_dims,
                     output_boxes,
                 )
             })
@@ -1178,6 +1203,8 @@ impl Decoder {
             self.nms,
             self.pre_nms_top_k,
             self.max_det,
+            self.normalized,
+            self.input_dims,
             output_boxes,
         ))
     }

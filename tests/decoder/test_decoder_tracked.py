@@ -121,7 +121,14 @@ def test_yolo_seg():
     )
     assert np.allclose(
         boxes,
-        [[0.08125, 0.7125, 0.3, 0.825], [0.59375, 0.25, 0.9375, 0.725]],
+        # Post-NMS bbox values (un-snapped, EDGEAI-1304); pre-fix the
+        # decoder snapped these to multiples of 1/160. The Segmentation
+        # struct's xmin/ymin/xmax/ymax (separate from these `boxes`)
+        # still describe the proto-grid-aligned mask region.
+        [
+            [0.08515104, 0.7131401, 0.29802868, 0.8195788],
+            [0.59605736, 0.2554531, 0.93666154, 0.72378385],
+        ],
         atol=1e-5,
     )
     last_updates = [track.last_updated for track in tracks]
@@ -142,10 +149,15 @@ def test_yolo_seg():
         tracker, 200_000_000, [output0_cleared, output1]
     )
 
-    # we should have two boxes from the tracker, but no masks since the tracker doesn't know how to update masks coefficients
+    # we should have two boxes from the tracker, but no masks since the tracker doesn't know how to update masks coefficients.
+    # Tracker-predicted boxes inherit the un-snapped post-NMS values
+    # from the previous frame; atol=1e-2 absorbs the predicted drift.
     assert np.allclose(
         boxes,
-        [[0.08125, 0.7125, 0.3, 0.825], [0.59375, 0.25, 0.9375, 0.725]],
+        [
+            [0.08515104, 0.7131401, 0.29802868, 0.8195788],
+            [0.59605736, 0.2554531, 0.93666154, 0.72378385],
+        ],
         atol=1e-2,
     )
     last_updates = [track.last_updated for track in tracks]
@@ -157,7 +169,14 @@ def test_yolo_seg():
     )
     assert np.allclose(
         boxes,
-        [[0.08125, 0.7125, 0.3, 0.825], [0.59375, 0.25, 0.9375, 0.725]],
+        # Post-NMS bbox values (un-snapped, EDGEAI-1304); pre-fix the
+        # decoder snapped these to multiples of 1/160. The Segmentation
+        # struct's xmin/ymin/xmax/ymax (separate from these `boxes`)
+        # still describe the proto-grid-aligned mask region.
+        [
+            [0.08515104, 0.7131401, 0.29802868, 0.8195788],
+            [0.59605736, 0.2554531, 0.93666154, 0.72378385],
+        ],
         atol=1e-5,
     )
     last_updates = [track.last_updated for track in tracks]
